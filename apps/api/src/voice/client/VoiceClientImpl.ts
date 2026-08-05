@@ -11,7 +11,7 @@ import { ExternalMediaHandler } from "./ExternalMediaHandler";
 import { GrpcClientHandler } from "./GrpcClientHandler";
 import { SpeechHandler } from "./SpeechHandler";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 class VoiceClientImpl implements VoiceClient {
 	config: VoiceClientConfig;

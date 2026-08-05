@@ -48,4 +48,11 @@ type DeepgramSttConfig = {
 	};
 };
 
-export { DeepgramModel, DeepgramSttConfig, GoogleSttConfig, SpeechResult, StreamSpeech, SttConfig };
+export {
+	DeepgramModel,
+	type DeepgramSttConfig,
+	type GoogleSttConfig,
+	type SpeechResult,
+	type StreamSpeech,
+	type SttConfig,
+};

@@ -1,9 +1,12 @@
+import * as Context from "effect/Context";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import { CALL_DETAIL_RECORD_MEASUREMENT, INFLUXDB_CALLS_BUCKET } from "@optimiq-voice/common";
 import { upsertDefaultUser } from "@optimiq-voice/identity";
-import { Context, Effect, Layer, Schema } from "../../node_modules/effect/dist/index.js";
-import { identityConfig } from "../core/identityConfig.js";
-import runServices from "../core/runServices.js";
-import { upsertDefaultPeer } from "../core/upsertDefaultPeer.js";
+import { identityConfig } from "../core/identityConfig";
+import runServices from "../core/runServices";
+import { upsertDefaultPeer } from "../core/upsertDefaultPeer";
 import {
 	INFLUXDB_ORG,
 	INFLUXDB_TOKEN,
@@ -12,10 +15,10 @@ import {
 	OWNER_EMAIL,
 	OWNER_NAME,
 	OWNER_PASSWORD,
-} from "../envs.js";
-import { createInfluxDbPub } from "../events/createInfluxDbPub.js";
-import { watchNats } from "../events/nats.js";
-import { transformEvent } from "../events/transformEvent.js";
+} from "../envs";
+import { createInfluxDbPub } from "../events/createInfluxDbPub";
+import { watchNats } from "../events/nats";
+import { transformEvent } from "../events/transformEvent";
 
 export class RuntimeError extends Schema.TaggedErrorClass<RuntimeError>()("RuntimeError", {
 	operation: Schema.String,

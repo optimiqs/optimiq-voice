@@ -106,7 +106,8 @@ try {
 	]);
 	locked = true;
 	await applyLegacyMigrations(client);
-	await migrate(drizzle(client), {
+	// drizzle 1.0 dropped the positional `drizzle(client)` overload; the client is a config field.
+	await migrate(drizzle({ client }), {
 		migrationsFolder: drizzleMigrationsFolder,
 		migrationsSchema: databaseSchema,
 		migrationsTable: "__drizzle_migrations_api",

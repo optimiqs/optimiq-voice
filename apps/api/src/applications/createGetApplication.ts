@@ -6,7 +6,7 @@ import { withErrorHandlingAndValidationAndAccess } from "../utils/withErrorHandl
 import { createGetFnUtil } from "./createGetFnUtil";
 import { applicationWithEncodedStruct } from "./utils/applicationWithEncodedStruct";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 function createGetApplication(db: Database) {
 	const getFn = createGetFnUtil(db);

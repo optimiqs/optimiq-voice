@@ -5,7 +5,7 @@ import { getLogger } from "@optimiq-voice/logger";
 
 type VerbHandler = (request: VerbRequest) => Promise<void>;
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 function withErrorHandling(fn: VerbHandler) {
 	return async (request: VerbRequest) => {

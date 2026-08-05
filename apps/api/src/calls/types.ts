@@ -42,12 +42,12 @@ type TrackCallSubscriber = {
 };
 
 export {
-	CallPublisher,
-	CallStream,
-	CreateCallRequest,
-	GetCallRequest,
-	ListCallsRequest,
-	ListCallsResponse,
-	TrackCallResponse,
-	TrackCallSubscriber,
+	type CallPublisher,
+	type CallStream,
+	type CreateCallRequest,
+	type GetCallRequest,
+	type ListCallsRequest,
+	type ListCallsResponse,
+	type TrackCallResponse,
+	type TrackCallSubscriber,
 };

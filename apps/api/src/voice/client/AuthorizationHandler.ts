@@ -4,7 +4,7 @@ import { VoiceClientConfig } from "@optimiq-voice/common";
 import { getLogger } from "@optimiq-voice/logger";
 import { AUTHZ_SERVICE_ENABLED, AUTHZ_SERVICE_HOST, AUTHZ_SERVICE_PORT } from "../../envs";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 class AuthorizationHandler {
 	private config: VoiceClientConfig;

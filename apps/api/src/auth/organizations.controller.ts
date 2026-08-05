@@ -1,9 +1,9 @@
 import { Controller, Get, Inject, Param, ParseUUIDPipe, UseGuards } from "@nestjs/common";
-import { AuthService, type OrganizationView } from "./auth.service.mjs";
-import { RequirePermissions } from "./require-permissions.decorator.mjs";
-import { RequirePermissionsGuard } from "./require-permissions.guard.mjs";
-import { Session } from "./session.decorator.mjs";
-import type { OrganizationMemberSummary } from "./auth.repository.mjs";
+import { AuthService, type OrganizationView } from "./auth.service";
+import { RequirePermissions } from "./require-permissions.decorator";
+import { RequirePermissionsGuard } from "./require-permissions.guard";
+import { Session } from "./session.decorator";
+import type { OrganizationMemberSummary } from "./auth.repository";
 import type { AppSession } from "@optimiq-voice/auth";
 
 /**

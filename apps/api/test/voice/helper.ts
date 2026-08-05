@@ -55,4 +55,11 @@ function getCreateVoiceClient(sandbox: SinonSandbox) {
 	});
 }
 
-export { getAriStub, getCreateVoiceClient };
+/**
+ * Previously imported from `@optimiq-voice/voice/test/helpers`, which apps/api does not depend
+ * on — the specifier only ever resolved by accident and broke the suite outright once the
+ * package layout changed. It is a fixture constant, so it lives with the other apps/api fixtures.
+ */
+const mediaSessionRef = "848b8803-7106-48b7-b820-515b05c40d6b";
+
+export { getAriStub, getCreateVoiceClient, mediaSessionRef };

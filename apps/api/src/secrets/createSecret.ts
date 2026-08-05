@@ -9,7 +9,7 @@ import { getLogger } from "@optimiq-voice/logger";
 import { BaseApiObject, CreateSecretRequest } from "@optimiq-voice/types";
 import { Database } from "../core/db";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 function createSecret(db: Database) {
 	const fn = async (

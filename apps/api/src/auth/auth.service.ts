@@ -1,9 +1,9 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { getActiveOrganizationId, hasPermission } from "@optimiq-voice/auth";
-import { MissingPermissionException, NoActiveOrganizationException } from "./auth.errors.mjs";
-import { AUTH_REPOSITORY } from "./auth.tokens.mjs";
-import { resolveRolePermissions } from "./role-permissions.mjs";
-import type { AuthRepository, OrganizationMemberSummary } from "./auth.repository.mjs";
+import { MissingPermissionException, NoActiveOrganizationException } from "./auth.errors";
+import { AUTH_REPOSITORY } from "./auth.tokens";
+import { resolveRolePermissions } from "./role-permissions";
+import type { AuthRepository, OrganizationMemberSummary } from "./auth.repository";
 import type { AppSession, Permission } from "@optimiq-voice/auth";
 
 export interface ResolvedAccess {

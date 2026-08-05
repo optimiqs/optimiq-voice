@@ -2,7 +2,7 @@ import { Readable } from "stream";
 import { getLogger } from "@optimiq-voice/logger";
 import { textChunksByFirstNaturalPause } from "../../handlers/utils/textChunksByFirstNaturalPause";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 /**
  * Creates a readable stream that processes text in chunks for better streaming performance.

@@ -8,7 +8,7 @@ import { convertUlawToPCM16 } from "./utils/convertUlawToPCM16";
 import { createChunkedSynthesisStream } from "./utils/createChunkedSynthesisStream";
 import { streamToBuffer } from "./utils/streamToBuffer";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 const ENGINE_NAME = "tts.elevenlabs";
 
 class ElevenLabs extends AbstractTextToSpeech<typeof ENGINE_NAME> {

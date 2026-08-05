@@ -11,4 +11,4 @@ type IntegrationsContainer = {
 
 type CreateContainer = (appRef: string) => Promise<IntegrationsContainer>;
 
-export { CreateContainer, IntegrationsContainer };
+export { type CreateContainer, type IntegrationsContainer };

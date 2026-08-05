@@ -1,8 +1,8 @@
 import { type Auth, createAuth } from "@optimiq-voice/auth";
 import { createDatabaseClient, type DatabaseClient } from "@optimiq-voice/db";
-import { createLoggingEmailDelivery } from "./auth-email.delivery.mjs";
-import { type AuthSliceConfig, resolveAuthSliceConfig } from "./auth.config.mjs";
-import { type AuthRepository, createAuthRepository } from "./auth.repository.mjs";
+import { createLoggingEmailDelivery } from "./auth-email.delivery";
+import { type AuthSliceConfig, resolveAuthSliceConfig } from "./auth.config";
+import { type AuthRepository, createAuthRepository } from "./auth.repository";
 
 /**
  * The composed better-auth runtime: the database client it owns, the instance itself and the

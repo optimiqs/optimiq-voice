@@ -5,7 +5,7 @@ import { Deepgram, ENGINE_NAME as DEEPGRAM_ENGINE_NAME } from "./Deepgram";
 import { ENGINE_NAME as ELEVEN_LABS_ENGINE_NAME, ElevenLabs } from "./ElevenLabs";
 import { Google, ENGINE_NAME as GOOGLE_ENGINE_NAME } from "./Google";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 type EngineConstructor<T> = new (options: T) => AbstractTextToSpeech<string>;
 

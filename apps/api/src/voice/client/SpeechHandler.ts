@@ -6,7 +6,7 @@ import { AudioStream } from "@optimiq-voice/streams";
 import { SpeechResult } from "../stt/types";
 import { AriEvent, SpeechToText, TextToSpeech } from "../types";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 class SpeechHandler {
 	private tts: TextToSpeech;

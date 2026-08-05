@@ -14,7 +14,7 @@ type OptimiqVoiceEvent = {
 	data: Record<string, unknown>;
 };
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 function createInfluxDbPub(config) {
 	const { url, token, org, bucket } = config;
@@ -50,4 +50,4 @@ function createInfluxDbPub(config) {
 	};
 }
 
-export { OptimiqVoiceEvent, InfluxDbPub, createInfluxDbPub };
+export { type OptimiqVoiceEvent, type InfluxDbPub, createInfluxDbPub };

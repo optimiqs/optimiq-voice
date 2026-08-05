@@ -8,7 +8,7 @@ export class RuntimeHostService implements OnApplicationBootstrap, OnApplication
 	private handle: RuntimeHandle | undefined;
 
 	async onApplicationBootstrap() {
-		const { runApiRuntime } = await import("./app-runtime.mjs");
+		const { runApiRuntime } = await import("./app-runtime");
 		this.handle = await runApiRuntime();
 	}
 

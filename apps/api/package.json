@@ -3,20 +3,25 @@
 	"version": "0.22.3",
 	"description": "API for Optimiq Voice",
 	"license": "MIT",
-	"main": "dist/index",
-	"types": "dist/index",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./src/index.ts",
 	"directories": {
 		"src": "src",
 		"test": "test"
 	},
 	"scripts": {
 		"prebuild": "rimraf ./dist tsconfig.tsbuildinfo tsconfig.build.tsbuildinfo",
-		"build": "tsc -b tsconfig.build.json && tsc -p src/auth/tsconfig.json",
+		"build": "tsc -p tsconfig.build.json && node ../../.scripts/rewrite-esm-specifiers.mjs",
 		"clean": "rimraf ./dist node_modules tsconfig.tsbuildinfo tsconfig.build.tsbuildinfo",
 		"db:deploy": "node scripts/db-provision.mjs",
 		"db:generate": "drizzle-kit generate --config drizzle.config.ts",
 		"start:dev": "nodemon --exec tsx --watch src src/main.ts",
-		"verify:auth": "tsx scripts/verify-auth-slice.mts"
+		"pretest": "bash ../../.scripts/gen-keypair.sh",
+		"test": "cross-env LOGS_LEVEL=none NODE_ENV=development API_IDENTITY_PRIVATE_KEY_PATH=.keys/private.pem API_IDENTITY_PUBLIC_KEY_PATH=.keys/public.pem mocha \"test/**/*.test.ts\"",
+		"typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.strict.json --noEmit",
+		"verify:auth": "tsx scripts/verify-auth-slice.ts",
+		"verify:call-token": "tsx scripts/verify-call-token.ts"
 	},
 	"bin": {
 		"optimiq-voice": "./dist/index.js"
@@ -44,9 +49,10 @@
 		"ari-client": "2.2.0",
 		"better-auth": "catalog:",
 		"dotenv": "16.6.1",
-		"drizzle-orm": "0.45.2",
+		"drizzle-orm": "catalog:",
 		"elevenlabs": "1.59.0",
 		"grpc-health-check": "2.1.0",
+		"jose": "catalog:",
 		"jsonwebtoken": "9.0.3",
 		"jwt-decode": "4.0.0",
 		"microsoft-cognitiveservices-speech-sdk": "1.50.0",
@@ -84,6 +90,9 @@
 		"@types/jsonwebtoken": "9.0.10",
 		"@types/uuid": "10.0.0",
 		"@types/validator": "13.15.10",
-		"drizzle-kit": "0.31.10"
+		"cross-env": "7.0.3",
+		"drizzle-kit": "catalog:",
+		"mocha": "11.7.6",
+		"tsx": "4.22.4"
 	}
 }

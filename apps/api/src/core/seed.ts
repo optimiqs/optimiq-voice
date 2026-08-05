@@ -1,7 +1,7 @@
 import { getLogger } from "@optimiq-voice/logger";
 import { db } from "./db";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 async function main() {
 	await db.product.upsert({

@@ -1,42 +1,35 @@
 {
-	"extends": "../../tsconfig.json",
+	// The tooling-facing project: `tsc --noEmit` (typecheck), `tsx` (start:dev, scripts) and
+	// `mocha --import tsx` all resolve this one. It therefore has to `include` every file any of
+	// them can reach — src, test, scripts and the drizzle-kit config — because `tsx` applies a
+	// tsconfig's compiler options only to files its `include`/`exclude` match.
+	//
+	// The emitting project is `tsconfig.build.json`, which narrows `include` to `src` and sets
+	// `rootDir`. See `plans/reference/oikos-conventions.md` §8.
+	"extends": "../../tsconfig.base.json",
 	"compilerOptions": {
-		"outDir": "dist",
-		"rootDir": "src",
-		"experimentalDecorators": true,
-		"emitDecoratorMetadata": true,
-		"useDefineForClassFields": false
+		"outDir": "./dist",
+		"noEmit": true,
+		// `@types/bun` (the oikos default) is not installed here: apps/api runs on Node and its
+		// tests run on mocha, so the ambient globals it needs are Node's plus mocha's.
+		"types": ["node", "mocha"],
+
+		// --- The legacy strictness contract, carried over verbatim -------------------------------
+		//
+		// This migration changes apps/api's MODULE system (CommonJS → ES modules, node → bundler
+		// resolution), not its type-strictness contract. The ~180 pre-existing files were written
+		// against the repository-root tsconfig, which had `noImplicitAny: false` and left
+		// `strictNullChecks` off; turning `strict` on for them surfaces ~170 errors that are a
+		// separate, behaviour-touching cleanup.
+		//
+		// `tsconfig.strict.json` keeps the full oikos contract over the code that was written
+		// against it (the auth slice, the Effect runtime, the verification scripts), so new code
+		// does not inherit the relaxation. `pnpm typecheck` runs both projects.
+		"strict": false,
+		"strictNullChecks": false,
+		"noImplicitAny": false,
+		"strictBindCallApply": false
 	},
-	"references": [
-		{
-			"path": "../../packages/identity"
-		},
-		{
-			"path": "../../packages/authz"
-		},
-		{
-			"path": "../../packages/logger"
-		},
-		{
-			"path": "../../packages/common"
-		},
-		{
-			"path": "../../packages/types"
-		},
-		{
-			"path": "../../packages/streams"
-		},
-		{
-			"path": "../autopilot"
-		},
-		{
-			"path": "../../packages/sipnet"
-		}
-	],
-	// This file stays the broad, tooling-facing project: `tsx` (start:dev, scripts) resolves ONE
-	// tsconfig from the working directory and only applies its compiler options to files that
-	// match `include`/`exclude`, so excluding the auth slice here would strip
-	// `experimentalDecorators` from it at runtime. The build-only exclusion lives in
-	// `tsconfig.build.json`; the slice's own compiler options live in `src/auth/tsconfig.json`.
-	"exclude": ["node_modules", "dist", "test", "drizzle.config.ts"]
+	"include": ["src/**/*", "test/**/*", "scripts/**/*", "drizzle.config.ts"],
+	"exclude": ["node_modules", "dist"]
 }

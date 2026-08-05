@@ -11,7 +11,7 @@ import { getLogger } from "@optimiq-voice/logger";
 import { ListSecretsRequest, ListSecretsResponse } from "@optimiq-voice/types";
 import { Database } from "../core/db";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 function listSecrets(db: Database) {
 	const fn = async (

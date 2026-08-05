@@ -4,7 +4,7 @@ import { getLogger } from "@optimiq-voice/logger";
 import { AriEvent } from "../types";
 import { createExternalMediaConfig } from "../utils/createExternalMediaConfig";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 class ExternalMediaHandler {
 	private ari: Client;

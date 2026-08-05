@@ -15,7 +15,7 @@ import { createCreateContainer } from "./integrations";
 import { AriEvent } from "./types";
 import { VoiceDispatcher } from "./VoiceDispatcher";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 const connection = {
 	host: ASTERISK_ARI_PROXY_URL.split("//")[1].split(":")[0],

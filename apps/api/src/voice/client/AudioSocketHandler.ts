@@ -4,7 +4,7 @@ import { getLogger } from "@optimiq-voice/logger";
 import { AudioSocket, AudioStream } from "@optimiq-voice/streams";
 import { transcribeOnConnection } from "../transcribeOnConnection";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 class AudioSocketHandler {
 	private audioSocket: AudioSocket;

@@ -139,8 +139,7 @@ async function main(): Promise<void> {
 	await import("reflect-metadata");
 	const { NestFactory } = await import("@nestjs/core");
 	const { FastifyAdapter } = await import("@nestjs/platform-fastify");
-	const { createApiRootModule, registerAuthTransport } =
-		await import("../src/auth/auth-bootstrap.mjs");
+	const { createApiRootModule, registerAuthTransport } = await import("../src/auth/auth-bootstrap");
 	const { createPostgresClient } = await import("@optimiq-voice/db");
 
 	const sql = createPostgresClient({

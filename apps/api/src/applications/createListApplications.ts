@@ -10,7 +10,7 @@ import { ListApplicationsRequest, ListApplicationsResponse } from "@optimiq-voic
 import { Database } from "../core/db";
 import { applicationWithEncodedStruct } from "./utils/applicationWithEncodedStruct";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 function createListApplications(db: Database) {
 	const listApplications = async (

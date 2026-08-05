@@ -10,7 +10,7 @@ import {
 } from "../envs";
 import { CreateCallRequest } from "./types";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 type CallManagerConfig = {
 	natsUrl: string;

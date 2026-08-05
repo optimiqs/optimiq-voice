@@ -14,7 +14,7 @@ import { getLogger } from "@optimiq-voice/logger";
 import { CLOAK_ENCRYPTION_KEY } from "../envs";
 import * as schema from "./db/schema";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 const DATABASE_ALREADY_EXISTS = "DATABASE_ALREADY_EXISTS" as const;
 const DATABASE_NOT_FOUND = "DATABASE_NOT_FOUND" as const;
@@ -90,10 +90,14 @@ type FindManySecretArgs = {
 	cursor?: { ref: string };
 };
 
-type DrizzleExecutor = Pick<
-	NodePgDatabase<typeof schema>,
-	"delete" | "insert" | "select" | "update"
->;
+/**
+ * drizzle 1.0 parameterises `NodePgDatabase` by the *relations* graph rather than by the table
+ * map, so the handle type is `NodePgDatabase<typeof schema.relations>`. The query-builder methods
+ * this facade uses (`select` / `insert` / `update` / `delete`) are unchanged.
+ */
+type ApiDatabase = NodePgDatabase<typeof schema.relations>;
+
+type DrizzleExecutor = Pick<ApiDatabase, "delete" | "insert" | "select" | "update">;
 
 type ApplicationDelegate = {
 	create(args: { data: ApplicationData }): Promise<Application>;
@@ -318,7 +322,7 @@ function applicationValues(data: ApplicationData) {
 
 function createDatabase(
 	executor: DrizzleExecutor,
-	root: NodePgDatabase<typeof schema>,
+	root: ApiDatabase,
 	close: () => Promise<void>,
 	inTransaction = false,
 ): Database {
@@ -639,15 +643,17 @@ function createServiceDelegate(
 }
 
 const pool = new Pool(getPoolConfig(process.env.API_DATABASE_URL as string));
-const drizzleDb = drizzle(pool, { schema });
+// drizzle 1.0 dropped the `(client, config)` positional overload: the client is now a field of
+// the single config object, and relational metadata arrives as `relations`, not `schema`.
+const drizzleDb = drizzle({ client: pool, relations: schema.relations });
 const db = createDatabase(drizzleDb, drizzleDb, () => pool.end());
 
 export {
-	Application,
-	ApplicationResult,
+	type Application,
+	type ApplicationResult,
 	DATABASE_ALREADY_EXISTS,
 	DATABASE_NOT_FOUND,
-	Database,
+	type Database,
 	DatabaseError,
 	db,
 };

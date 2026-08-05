@@ -1,18 +1,19 @@
 import { type INestApplication, Module, type Type } from "@nestjs/common";
-import { registerAuthHttp } from "./auth-http.plugin.mjs";
-import { isAuthSliceConfigured } from "./auth.config.mjs";
-import { AuthModule } from "./auth.module.mjs";
-import { AUTH_PLATFORM } from "./auth.tokens.mjs";
-import type { AuthHttpServer } from "./auth-http.plugin.mjs";
-import type { AuthPlatform } from "./auth.platform.mjs";
+import { registerAuthHttp } from "./auth-http.plugin";
+import { isAuthSliceConfigured } from "./auth.config";
+import { AuthModule } from "./auth.module";
+import { AUTH_PLATFORM } from "./auth.tokens";
+import type { AuthHttpServer } from "./auth-http.plugin";
+import type { AuthPlatform } from "./auth.platform";
 
 /**
- * The ES-module entry point of the auth slice.
+ * The entry point of the auth slice — what `src/main.ts` imports.
  *
- * `apps/api` still compiles to CommonJS, so `src/main.ts` reaches this file through
- * `src/auth/auth-esm.bridge.ts` (one dynamic import) instead of a static one. Everything above
- * this line is ordinary Nest wiring; the boundary exists only until apps/api adopts the oikos
- * tsconfig. See `src/auth/tsconfig.json`.
+ * Historically this was reached through a CommonJS → ES-module bridge, because `apps/api`
+ * compiled to CommonJS while the slice had to compile with `moduleResolution: bundler` to see
+ * `@optimiq-voice/{auth,db,config}`. `apps/api` is now an ES-module package on the oikos
+ * tsconfig, so the bridge, the slice's own `tsconfig.json` and the `.mts` split are all gone and
+ * this is an ordinary module.
  */
 
 export { isAuthSliceConfigured as isAuthSliceEnabled };
@@ -20,8 +21,8 @@ export { isAuthSliceConfigured as isAuthSliceEnabled };
 /**
  * Builds the root module: the existing `AppModule` plus the auth slice.
  *
- * `AppModule` cannot list `AuthModule` in its `imports` because one is CommonJS and the other is
- * an ES module, so composition happens here, where both are already loaded.
+ * Composition happens here rather than in `AppModule`'s `imports` so that the slice can be
+ * omitted entirely when it is not configured, and so `verify-auth-slice.ts` can mount it alone.
  */
 export function createApiRootModule(baseModules: readonly Type<unknown>[]): Type<unknown> {
 	class ApiRootModule {}

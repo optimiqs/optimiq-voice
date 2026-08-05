@@ -32,4 +32,10 @@ type AzureTTSConfig = {
 	};
 };
 
-export { SynthOptions, AzureTTSConfig, DeepgramTtsConfig, ElevenLabsTtsConfig, GoogleTtsConfig };
+export {
+	type SynthOptions,
+	type AzureTTSConfig,
+	type DeepgramTtsConfig,
+	type ElevenLabsTtsConfig,
+	type GoogleTtsConfig,
+};

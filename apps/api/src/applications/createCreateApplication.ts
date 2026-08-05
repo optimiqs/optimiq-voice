@@ -11,7 +11,7 @@ import { Database } from "../core/db";
 import { convertToApplicationData } from "./utils/convertToApplicationData";
 import { validOrThrow } from "./validation/validOrThrow";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 function createCreateApplication(db: Database) {
 	const createApplication = async (

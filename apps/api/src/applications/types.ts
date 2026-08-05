@@ -30,4 +30,4 @@ type ApplicationData = {
 
 type TestTokenConfiguration = Omit<CreateTestTokenResponse, "token">;
 
-export { ApplicationData, TestTokenConfiguration };
+export { type ApplicationData, type TestTokenConfiguration };

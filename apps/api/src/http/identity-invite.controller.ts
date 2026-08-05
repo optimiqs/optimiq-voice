@@ -4,7 +4,7 @@ import { getLogger } from "@optimiq-voice/logger";
 import { identityConfig } from "../core/identityConfig";
 import { APP_URL } from "../envs";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 @Controller("api/identity")
 export class IdentityInviteController {

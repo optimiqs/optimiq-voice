@@ -12,7 +12,7 @@ import { createGetFnUtil } from "./createGetFnUtil";
 import { convertToApplicationData } from "./utils/convertToApplicationData";
 import { validOrThrow } from "./validation/validOrThrow";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 function createUpdateApplication(db: Database) {
 	const getFn = createGetFnUtil(db);

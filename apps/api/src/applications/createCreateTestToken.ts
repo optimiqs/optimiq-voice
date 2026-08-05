@@ -8,7 +8,7 @@ import { CreateTestTokenResponse } from "@optimiq-voice/types";
 import { IDENTITY_PRIVATE_KEY } from "../envs";
 import { TestTokenConfiguration } from "./types";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 function createCreateTestToken(config: TestTokenConfiguration) {
 	const createApplication = async (

@@ -4,7 +4,9 @@ import dotenv from "dotenv";
 import { assertEnvsAreSet } from "@optimiq-voice/common";
 
 if (process.env.NODE_ENV === "development") {
-	dotenv.config({ path: join(__dirname, "..", "..", "..", ".env") });
+	// `import.meta.dirname` is the ES-module replacement for `__dirname`; it resolves to
+	// `apps/api/src` under tsx and `apps/api/dist` after a build — the repository root either way.
+	dotenv.config({ path: join(import.meta.dirname, "..", "..", "..", ".env") });
 }
 
 const e = process.env;

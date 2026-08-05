@@ -21,7 +21,7 @@ import {
 import { AriEvent as AE, ChannelVar, VoiceClient } from "./types";
 import { createGetChannelVarWithoutThrow } from "./utils";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 type CreateVoiceClient = (params: {
 	ari: Client;

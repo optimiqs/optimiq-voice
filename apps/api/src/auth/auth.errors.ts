@@ -5,7 +5,7 @@ import type { Permission } from "@optimiq-voice/auth";
  * HTTP-boundary failures for the auth slice.
  *
  * `…Exception` extends `HttpException` and is only ever thrown at or above the controller/guard
- * boundary; `…Failure` (see `auth.config.mts`, `auth.repository.mts`) stays inside the slice.
+ * boundary; `…Failure` (see `auth.config.ts`, `auth.repository.ts`) stays inside the slice.
  */
 
 export class UnauthenticatedRequestException extends UnauthorizedException {

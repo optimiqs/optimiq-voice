@@ -1,0 +1,21 @@
+{
+	// The oikos strictness contract, applied to the part of apps/api that was written against it.
+	//
+	// `tsconfig.json` relaxes `strict` for the ~180 legacy files inherited from the CommonJS era
+	// (see the note there). This project restores it for everything added during the P0/P1 work so
+	// that new code cannot quietly regress. Grow the `include` list as legacy directories are
+	// brought up to strict; when it covers `src/**/*`, delete this file and drop the relaxation
+	// from `tsconfig.json`.
+	//
+	// `src/runtime/` is deliberately NOT listed: it imports `src/core/` and `src/envs.ts`, which
+	// would drag the whole legacy graph into this program.
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"strict": true,
+		"strictNullChecks": true,
+		"noImplicitAny": true,
+		"strictBindCallApply": true,
+		"strictPropertyInitialization": false
+	},
+	"include": ["src/auth/**/*", "scripts/**/*"]
+}

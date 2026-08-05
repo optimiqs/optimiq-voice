@@ -4,7 +4,6 @@ import { expect } from "chai";
 import chaiAsPromised from "chai-as-promised";
 import { createSandbox } from "sinon";
 import sinonChai from "sinon-chai";
-import { VoiceClientImpl } from "../../src/voice/client/VoiceClientImpl";
 import { CreateContainer } from "../../src/voice/integrations/types";
 import { AbstractTextToSpeech } from "../../src/voice/tts/AbstractTextToSpeech";
 import { ChannelVar } from "../../src/voice/types";
@@ -22,7 +21,13 @@ describe("@voice/createVoiceClient", function () {
 
 	it("should create a voice client", async function () {
 		// Arrange
+		// Both the factory and the class it returns are pulled in through the same dynamic import
+		// graph on purpose. Under `mocha --import tsx` a module reached by a hoisted static import
+		// and the same module reached by `await import(...)` are evaluated into two separate
+		// registries, so a statically imported `VoiceClientImpl` would never be the constructor the
+		// factory actually used and `instanceOf` would fail.
 		const { createCreateVoiceClient } = await import("../../src/voice/createCreateVoiceClient");
+		const { VoiceClientImpl } = await import("../../src/voice/client/VoiceClientImpl");
 
 		const createContainer = async (appRef: string) => {
 			return {
@@ -66,7 +71,6 @@ describe("@voice/createVoiceClient", function () {
 		// Act
 		const voiceClient = await createCreateVoiceClient(
 			createContainer as unknown as CreateContainer,
-			null,
 		)({
 			ari: {} as Client,
 			event,

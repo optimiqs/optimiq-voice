@@ -1,6 +1,6 @@
 import { createParamDecorator, type ExecutionContext } from "@nestjs/common";
-import { getSession } from "./app-session.mjs";
-import { UnauthenticatedRequestException } from "./auth.errors.mjs";
+import { getSession } from "./app-session";
+import { UnauthenticatedRequestException } from "./auth.errors";
 import type { AppSession } from "@optimiq-voice/auth";
 
 /**

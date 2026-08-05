@@ -1,7 +1,7 @@
 import { Logger } from "@nestjs/common";
 import { fromNodeHeaders } from "better-auth/node";
-import { type RawAuthSession, setSessionOnRequest, toAppSession } from "./app-session.mjs";
-import type { AuthPlatform } from "./auth.platform.mjs";
+import { type RawAuthSession, setSessionOnRequest, toAppSession } from "./app-session";
+import type { AuthPlatform } from "./auth.platform";
 
 /**
  * The better-auth HTTP mount and the session `preHandler` hook.

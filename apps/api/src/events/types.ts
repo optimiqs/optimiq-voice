@@ -9,4 +9,4 @@ type RegisterEvent = {
 
 type NatsEventCallback = (registerEvent: Record<string, unknown>) => void;
 
-export { NatsEventCallback, RegisterEvent };
+export { type NatsEventCallback, type RegisterEvent };

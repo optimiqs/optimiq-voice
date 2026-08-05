@@ -13,7 +13,7 @@ import { Database } from "../core/db";
 import { notFoundError } from "../core/notFoundError";
 import { CallPublisher } from "./types";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 function createCall(db: Database, publisher: CallPublisher) {
 	const fn = async (

@@ -3,7 +3,7 @@ import { z } from "zod";
 import { fromError } from "zod-validation-error";
 import { getLogger } from "@optimiq-voice/logger";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 const integrationsConfigSchema = z.array(
 	z.object({

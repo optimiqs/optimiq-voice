@@ -6,14 +6,13 @@ import sinon, { createSandbox, match } from "sinon";
 import sinonChai from "sinon-chai";
 /* eslint-disable new-cap */
 import { DialRecordDirection, DialStatus, STASIS_APP_NAME } from "@optimiq-voice/common";
-import { mediaSessionRef } from "@optimiq-voice/voice/test/helpers";
 import { ASTERISK_SYSTEM_DOMAIN, ASTERISK_TRUNK } from "../../src/envs";
 import { createHandleDialEventsWithVoiceClient } from "../../src/utils";
 import { createDialHandler } from "../../src/voice/handlers/dial/createDialHandler";
 import { handleChannelLeftBridge } from "../../src/voice/handlers/dial/handleChannelLeftBridge";
 import { handleStasisStart } from "../../src/voice/handlers/dial/handleStasisStart";
 import { AriEvent, VoiceClient } from "../../src/voice/types";
-import { getAriStub, getCreateVoiceClient } from "./helper";
+import { getAriStub, getCreateVoiceClient, mediaSessionRef } from "./helper";
 
 chai.use(chaiAsPromised);
 chai.use(sinonChai);

@@ -7,7 +7,7 @@ import { CallStream, TrackCallResponse } from "./types";
 
 const FINAL_STATUSES = [DialStatus.BUSY, DialStatus.FAILED, DialStatus.NOANSWER];
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 function createTrackCall(nc: NatsConnection) {
 	const trackingCallsMap = new Map<string, CallStream>();

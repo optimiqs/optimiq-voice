@@ -1,7 +1,7 @@
 import { StreamEvent, VoiceSessionStreamServer } from "@optimiq-voice/common";
 import { getLogger } from "@optimiq-voice/logger";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 const SERVICE_DEFINITION = {
 	serviceName: "Voice",

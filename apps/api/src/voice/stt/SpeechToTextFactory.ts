@@ -4,7 +4,7 @@ import { Deepgram, ENGINE_NAME as DEEPGRAM_ENGINE_NAME } from "./Deepgram";
 import { Google, ENGINE_NAME as GOOGLE_ENGINE_NAME } from "./Google";
 import { SttConfig } from "./types";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 type EngineConstructor<T extends SttConfig = SttConfig> = new (
 	options: T,

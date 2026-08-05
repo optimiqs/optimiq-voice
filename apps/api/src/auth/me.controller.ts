@@ -1,8 +1,8 @@
 import { Controller, Get, Inject, UseGuards } from "@nestjs/common";
-import { AuthService, type SessionOverview } from "./auth.service.mjs";
-import { RequirePermissions } from "./require-permissions.decorator.mjs";
-import { RequirePermissionsGuard } from "./require-permissions.guard.mjs";
-import { Session } from "./session.decorator.mjs";
+import { AuthService, type SessionOverview } from "./auth.service";
+import { RequirePermissions } from "./require-permissions.decorator";
+import { RequirePermissionsGuard } from "./require-permissions.guard";
+import { Session } from "./session.decorator";
 import type { AppSession } from "@optimiq-voice/auth";
 
 /** Who the caller is, which organization they are acting in and what that grants them. */

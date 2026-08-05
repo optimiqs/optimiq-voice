@@ -1,10 +1,11 @@
 import { Inject, Module, type OnApplicationShutdown } from "@nestjs/common";
-import { type AuthPlatform, createAuthPlatform } from "./auth.platform.mjs";
-import { AuthService } from "./auth.service.mjs";
-import { AUTH_PLATFORM, AUTH_REPOSITORY } from "./auth.tokens.mjs";
-import { MeController } from "./me.controller.mjs";
-import { OrganizationsController } from "./organizations.controller.mjs";
-import { RequirePermissionsGuard } from "./require-permissions.guard.mjs";
+import { type AuthPlatform, createAuthPlatform } from "./auth.platform";
+import { AuthService } from "./auth.service";
+import { AUTH_PLATFORM, AUTH_REPOSITORY } from "./auth.tokens";
+import { CallTokenService } from "./call-token.service";
+import { MeController } from "./me.controller";
+import { OrganizationsController } from "./organizations.controller";
+import { RequirePermissionsGuard } from "./require-permissions.guard";
 
 /**
  * The better-auth feature slice.
@@ -22,9 +23,10 @@ import { RequirePermissionsGuard } from "./require-permissions.guard.mjs";
 			inject: [AUTH_PLATFORM],
 		},
 		AuthService,
+		CallTokenService,
 		RequirePermissionsGuard,
 	],
-	exports: [AUTH_PLATFORM, AUTH_REPOSITORY, AuthService, RequirePermissionsGuard],
+	exports: [AUTH_PLATFORM, AUTH_REPOSITORY, AuthService, CallTokenService, RequirePermissionsGuard],
 })
 export class AuthModule implements OnApplicationShutdown {
 	constructor(@Inject(AUTH_PLATFORM) private readonly platform: AuthPlatform) {}

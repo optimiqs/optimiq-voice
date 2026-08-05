@@ -27,7 +27,7 @@ import { allowList } from "./allowList";
 import loadServices from "./loadServices";
 import services from "./services";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 const authorization = createAuthInterceptor(IDENTITY_PUBLIC_KEY, allowList);
 const checkMethodAuthorized = createCheckMethodAuthorized(
@@ -96,4 +96,4 @@ async function runServices(): Promise<RunningServices> {
 }
 
 export default runServices;
-export { RunningServices };
+export { type RunningServices };

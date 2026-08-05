@@ -1,14 +1,14 @@
 import { type CanActivate, type ExecutionContext, Inject, Injectable } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
 import { hasPermission, type Permission } from "@optimiq-voice/auth";
-import { getSession, setSessionOnRequest, withResolvedAccess } from "./app-session.mjs";
+import { getSession, setSessionOnRequest, withResolvedAccess } from "./app-session";
 import {
 	MissingPermissionException,
 	NoActiveOrganizationException,
 	UnauthenticatedRequestException,
-} from "./auth.errors.mjs";
-import { AuthService } from "./auth.service.mjs";
-import { REQUIRE_PERMISSIONS_METADATA } from "./require-permissions.decorator.mjs";
+} from "./auth.errors";
+import { AuthService } from "./auth.service";
+import { REQUIRE_PERMISSIONS_METADATA } from "./require-permissions.decorator";
 
 /**
  * Opt-in authorization guard for `@RequirePermissions(...)`.

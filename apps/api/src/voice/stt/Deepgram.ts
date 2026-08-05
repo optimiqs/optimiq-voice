@@ -1,23 +1,21 @@
 import { Stream } from "stream";
+// `@deepgram/sdk` ships CommonJS under `main` with no `exports` map. Node's ES-module loader
+// resolves that fine and the named exports survive the CJS lexer, so the historical
+// `require("@deepgram/sdk")` escape hatch is no longer needed.
+import { createClient, type DeepgramClient, LiveTranscriptionEvents } from "@deepgram/sdk";
 import * as z from "zod";
 import { Messages, VoiceLanguage } from "@optimiq-voice/common";
 import { getLogger } from "@optimiq-voice/logger";
 import { SpeechToText } from "../types";
 import { AbstractSpeechToText } from "./AbstractSpeechToText";
 import { DeepgramModel, DeepgramSttConfig, SpeechResult, StreamSpeech } from "./types";
-const {
-	DeepgramClient,
-	LiveTranscriptionEvents,
-	createClient,
-	// eslint-disable-next-line @typescript-eslint/no-var-requires
-} = require("@deepgram/sdk"); // Why Deepgram :(
 
 const ENGINE_NAME = "stt.deepgram";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 class Deepgram extends AbstractSpeechToText<typeof ENGINE_NAME> implements SpeechToText {
-	client: typeof DeepgramClient;
+	client: DeepgramClient;
 	engineConfig: DeepgramSttConfig;
 	readonly engineName = ENGINE_NAME;
 
@@ -50,7 +48,7 @@ class Deepgram extends AbstractSpeechToText<typeof ENGINE_NAME> implements Speec
 			out.emit("error", new Error("Speech recognition service error"));
 
 			try {
-				connection.destroy();
+				connection.disconnect();
 			} catch (destroyErr) {
 				logger.error("error destroying connection", { destroyErr });
 			}
@@ -93,7 +91,12 @@ class Deepgram extends AbstractSpeechToText<typeof ENGINE_NAME> implements Speec
 
 				const responseTime =
 					words.length > 0
-						? (words.reduce((acc: number, word: any) => acc + (word.end - word.start), 0) * 1000) /
+						? (words.reduce(
+								(acc: number, word: { start: number; end: number }) =>
+									acc + (word.end - word.start),
+								0,
+							) *
+								1000) /
 							words.length
 						: 0;
 
@@ -167,7 +170,7 @@ class Deepgram extends AbstractSpeechToText<typeof ENGINE_NAME> implements Speec
 			out.emit("end");
 
 			try {
-				connection.destroy();
+				connection.disconnect();
 			} catch (destroyErr) {
 				logger.warn("error destroying connection", { destroyErr });
 			}
@@ -175,7 +178,7 @@ class Deepgram extends AbstractSpeechToText<typeof ENGINE_NAME> implements Speec
 
 		stream.on("end", () => {
 			try {
-				connection.destroy();
+				connection.disconnect();
 			} catch (err) {
 				logger.error("error destroying connection on stream end", { err });
 			}
@@ -209,7 +212,7 @@ class Deepgram extends AbstractSpeechToText<typeof ENGINE_NAME> implements Speec
 						});
 
 						resolve(result);
-						connection.destroy();
+						connection.disconnect();
 					}
 				});
 
@@ -221,7 +224,7 @@ class Deepgram extends AbstractSpeechToText<typeof ENGINE_NAME> implements Speec
 
 			stream.on("end", () => {
 				try {
-					connection.destroy();
+					connection.disconnect();
 				} catch (destroyErr) {
 					logger.error("error destroying connection", { destroyErr });
 				}
@@ -229,7 +232,7 @@ class Deepgram extends AbstractSpeechToText<typeof ENGINE_NAME> implements Speec
 
 			stream.on("error", (err) => {
 				try {
-					connection.destroy();
+					connection.disconnect();
 				} catch (destroyErr) {
 					logger.error("error destroying connection", { destroyErr });
 				}

@@ -7,7 +7,7 @@ import { SynthOptions } from "./types";
 import { createErrorStream } from "./utils/createErrorStream";
 import { isSsml } from "./utils/isSsml";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 abstract class AbstractTextToSpeech<E, S extends SynthOptions = SynthOptions> {
 	abstract readonly engineName: E;

@@ -3,7 +3,7 @@ import { getLogger } from "@optimiq-voice/logger";
 import { CALLS_CREATE_SUBJECT } from "../envs";
 import { CreateCallRequest } from "./types";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 async function createCallPublisher(natsUrl: string) {
 	logger.verbose("connecting to nats", { natsUrl });

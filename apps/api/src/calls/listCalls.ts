@@ -10,7 +10,7 @@ import { getLogger } from "@optimiq-voice/logger";
 import { ListCallsRequest, ListCallsResponse } from "@optimiq-voice/types";
 import { createFetchCalls } from "./createFetchCalls";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 function listCalls(influx: InfluxDBClient) {
 	const fetchCalls = createFetchCalls(influx);

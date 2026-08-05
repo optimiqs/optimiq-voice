@@ -1,4 +1,4 @@
-import { relations } from "drizzle-orm";
+import { defineRelations } from "drizzle-orm";
 import {
 	foreignKey,
 	index,
@@ -162,64 +162,84 @@ const secrets = pgTable(
 	],
 );
 
-const applicationsRelations = relations(applications, ({ one }) => ({
-	textToSpeech: one(textToSpeechServices),
-	speechToText: one(speechToTextServices),
-	intelligence: one(intelligenceServices),
-}));
+const tables = {
+	applications,
+	intelligenceServices,
+	products,
+	secrets,
+	speechToTextServices,
+	textToSpeechServices,
+};
 
-const textToSpeechServicesRelations = relations(textToSpeechServices, ({ one }) => ({
-	application: one(applications, {
-		fields: [textToSpeechServices.applicationRef],
-		references: [applications.ref],
-	}),
-	product: one(products, {
-		fields: [textToSpeechServices.productRef],
-		references: [products.ref],
-	}),
-}));
-
-const speechToTextServicesRelations = relations(speechToTextServices, ({ one }) => ({
-	application: one(applications, {
-		fields: [speechToTextServices.applicationRef],
-		references: [applications.ref],
-	}),
-	product: one(products, {
-		fields: [speechToTextServices.productRef],
-		references: [products.ref],
-	}),
-}));
-
-const intelligenceServicesRelations = relations(intelligenceServices, ({ one }) => ({
-	application: one(applications, {
-		fields: [intelligenceServices.applicationRef],
-		references: [applications.ref],
-	}),
-	product: one(products, {
-		fields: [intelligenceServices.productRef],
-		references: [products.ref],
-	}),
-}));
-
-const productsRelations = relations(products, ({ many }) => ({
-	textToSpeech: many(textToSpeechServices),
-	speechToText: many(speechToTextServices),
-	intelligence: many(intelligenceServices),
+/**
+ * drizzle 1.0 replaced the per-table `relations(table, ({ one, many }) => …)` helpers with a
+ * single `defineRelations(schema, (r) => …)` graph, and `drizzle()` now takes that graph as
+ * `relations` rather than the table map as `schema`. Both sides of every edge are declared here
+ * (drizzle 1.0 no longer infers the inverse from a foreign key), which is why the one-to-one
+ * service relations now spell out `from`/`to` in both directions.
+ */
+const relations = defineRelations(tables, (r) => ({
+	applications: {
+		textToSpeech: r.one.textToSpeechServices({
+			from: r.applications.ref,
+			to: r.textToSpeechServices.applicationRef,
+		}),
+		speechToText: r.one.speechToTextServices({
+			from: r.applications.ref,
+			to: r.speechToTextServices.applicationRef,
+		}),
+		intelligence: r.one.intelligenceServices({
+			from: r.applications.ref,
+			to: r.intelligenceServices.applicationRef,
+		}),
+	},
+	textToSpeechServices: {
+		application: r.one.applications({
+			from: r.textToSpeechServices.applicationRef,
+			to: r.applications.ref,
+		}),
+		product: r.one.products({
+			from: r.textToSpeechServices.productRef,
+			to: r.products.ref,
+		}),
+	},
+	speechToTextServices: {
+		application: r.one.applications({
+			from: r.speechToTextServices.applicationRef,
+			to: r.applications.ref,
+		}),
+		product: r.one.products({
+			from: r.speechToTextServices.productRef,
+			to: r.products.ref,
+		}),
+	},
+	intelligenceServices: {
+		application: r.one.applications({
+			from: r.intelligenceServices.applicationRef,
+			to: r.applications.ref,
+		}),
+		product: r.one.products({
+			from: r.intelligenceServices.productRef,
+			to: r.products.ref,
+		}),
+	},
+	products: {
+		textToSpeech: r.many.textToSpeechServices(),
+		speechToText: r.many.speechToTextServices(),
+		intelligence: r.many.intelligenceServices(),
+	},
 }));
 
 export {
 	applicationType,
 	applications,
-	applicationsRelations,
 	intelligenceServices,
-	intelligenceServicesRelations,
 	products,
-	productsRelations,
 	productType,
 	productVendor,
+	relations,
 	secrets,
 	speechToTextServices,
-	speechToTextServicesRelations,
+	tables,
 	textToSpeechServices,
-	textToSpeechServicesRelations,
 };

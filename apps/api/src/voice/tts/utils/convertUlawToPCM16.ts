@@ -1,9 +1,19 @@
+import { createRequire } from "node:module";
 import { Readable } from "stream";
-import { WaveFile } from "wavefile";
 import { getLogger } from "@optimiq-voice/logger";
 import { streamToBuffer } from "./streamToBuffer";
+import type * as Wavefile from "wavefile";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+/**
+ * `wavefile` is CommonJS-only and assigns its exports in a shape Node's CJS named-export
+ * detection cannot see — `await import("wavefile")` yields `{ default }` and nothing else, and a
+ * default import does not statically exist either. `createRequire` gets the real `module.exports`
+ * without guessing at an interop shape.
+ */
+const require = createRequire(import.meta.url);
+const { WaveFile } = require("wavefile") as typeof Wavefile;
+
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 /**
  * Converts a ulaw stream to PCM 16-bit at 8kHz

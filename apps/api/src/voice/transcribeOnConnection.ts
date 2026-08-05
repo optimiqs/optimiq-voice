@@ -2,7 +2,7 @@ import { Stream } from "stream";
 import { getLogger } from "@optimiq-voice/logger";
 import { AudioStream } from "@optimiq-voice/streams";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 function transcribeOnConnection(stream: Stream) {
 	return async (_, res: AudioStream) => {

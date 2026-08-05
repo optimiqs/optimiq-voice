@@ -1,16 +1,21 @@
 # Identity Service Removal — Cutover Plan
 
 **Date:** 2026-08-05 · **Phase:** written in P0, executed in P1 · **Status:** Step 1 (additive
-mount) is **DONE**; Steps 2-9 not started. No identity code has been removed or changed.
+mount) is **DONE** and its three blocking findings are **RESOLVED**; Step 4 item 1 (the per-call
+token) is **DONE, additive**. Steps 2, 3, 5-9 not started. No identity code has been removed or
+changed.
 
 The custom RS256 gRPC identity service is retired and replaced by **better-auth 1.6.23**
 (`packages/auth`) on the **base database** (`packages/db`). This document enumerates everything
 that currently depends on identity and the ordered steps to remove each.
 
-> **Only Step 1 has been executed** (2026-08-05): better-auth is mounted in `apps/api` alongside
-> the existing gRPC identity path. `apps/identity`, `packages/identity`,
-> `packages/identity-client`, `packages/common/src/identity/` and the `fnidentity` database are
-> all still in place and untouched. See "Step 1 implementation notes" below.
+> **Executed so far** (2026-08-05): better-auth is mounted in `apps/api` alongside the existing
+> gRPC identity path; `apps/api` has been migrated to the oikos ES-module toolchain and to
+> `drizzle-orm@1.0.0-rc.4`, which unblocks Steps 3 and 5; a per-call token minter verifiable
+> against `/api/auth/jwks` exists but is **not** on the live call path. `apps/identity`,
+> `packages/identity`, `packages/identity-client`, `packages/common/src/identity/` and the
+> `fnidentity` database are all still in place and untouched. See "Step 1 implementation notes"
+> and "Step 1.5" below.
 
 ---
 
@@ -219,36 +224,26 @@ used — it writes to the raw `ServerResponse` behind Fastify's back and would b
 lifecycle hooks (`onSend` security headers, `Cache-Control: no-store`). `fromNodeHeaders` from
 the same module _is_ used, for both the handler and the session hook.
 
-**Three findings that will shape the remaining steps:**
+**Three findings that shaped the remaining steps** (1 and 2 are now RESOLVED — see Step 1.5):
 
-1. **`apps/api` cannot import the P0 packages.** It still compiles with the repository-root
-   tsconfig (`module: commonjs`, `moduleResolution: node`). That resolver predates `exports`
-   maps, so `@optimiq-voice/{auth,db,config}` — ESM packages that publish `types` as source —
-   are unresolvable, and their sources use extension-less relative imports that only
-   `moduleResolution: bundler` accepts (`TS2835`). The slice is therefore compiled as a separate
-   ES-module program (`src/auth/tsconfig.json`, `module: preserve` + `moduleResolution:
-bundler`) emitting `dist/auth/*.mjs`, and `main.ts` crosses the boundary once through
-   `src/auth/auth-esm.bridge.ts` (a dynamic import, lowered to `require()`, which Node ≥22.12
-   answers for synchronous ESM graphs — verified). **Migrating `apps/api` to the oikos tsconfig
-   is now a prerequisite for Steps 3-5**, which touch handlers all over the CommonJS half.
-   When it happens, delete `auth-esm.bridge.ts`, `src/auth/tsconfig.json` and
-   `tsconfig.build.json`, and rename `*.mts` → `*.ts`.
-   - Corollary: the build-only exclusion lives in `tsconfig.build.json`, not `tsconfig.json`,
-     because `tsx` resolves one tsconfig from the working directory and applies its compiler
-     options only to files its `include`/`exclude` match — excluding the slice in
-     `tsconfig.json` silently strips `experimentalDecorators` from it under `start:dev`.
-2. **Two Drizzle majors coexist in `apps/api`.** The app pins `drizzle-orm@0.45.2` for the legacy
-   telephony schema; `@optimiq-voice/{auth,db}` are on `1.0.0-rc.4`. Queries in the slice
-   therefore go through better-auth's own adapter (`auth.$context.adapter`, model names not
-   table objects) instead of a Drizzle handle. Step 5 (RLS + `withTenantScope`) cannot start
-   until `apps/api` is on `drizzle-orm@1.0.0-rc.4`.
-3. **`member.role` → permissions is ambiguous.** better-auth stores `owner` / `admin` / `member`,
-   while `SYSTEM_ROLE_TEMPLATES` has five ids (`owner`, `admin`, `manager`, `agent`, `user`).
-   `role-permissions.mts` resolves an exact template id first, otherwise the **least privileged**
-   template with that `membershipRole` — so a bare `member` gets the `user` template (11
-   permissions), never `manager`. A real role assignment (`member.role = "manager"`) needs the
-   organization plugin's `roles`/access-control configuration; until then only 3 of the 5
-   templates are reachable. Decide in Step 3.
+1. ~~**`apps/api` cannot import the P0 packages.**~~ **RESOLVED 2026-08-05.** `apps/api` compiled
+   with the repository-root tsconfig (`module: commonjs`, `moduleResolution: node`), whose
+   resolver predates `exports` maps, so `@optimiq-voice/{auth,db,config}` were unresolvable and
+   their extension-less relative imports raised `TS2835`. The slice was therefore a separate
+   ES-module program (`src/auth/tsconfig.json`) emitting `dist/auth/*.mjs`, crossed once through
+   `src/auth/auth-esm.bridge.ts`. `apps/api` is now an ES-module package on the oikos tsconfig;
+   the bridge, the slice tsconfig and the `.mts` split are deleted.
+2. ~~**Two Drizzle majors coexist in `apps/api`.**~~ **RESOLVED 2026-08-05.** `apps/api` is on
+   `drizzle-orm@1.0.0-rc.4` (`catalog:`) like `@optimiq-voice/{auth,db}`. Step 5 (RLS +
+   `withTenantScope`) is unblocked. The auth slice still reads through better-auth's own adapter
+   (`auth.$context.adapter`); moving it to a Drizzle handle is optional now, not forced.
+3. **`member.role` → permissions is ambiguous.** **STILL OPEN — blocked on `packages/auth`.**
+   better-auth stores `owner` / `admin` / `member`, while `SYSTEM_ROLE_TEMPLATES` has five ids
+   (`owner`, `admin`, `manager`, `agent`, `user`). `role-permissions.ts` resolves an exact
+   template id first, otherwise the **least privileged** template with that `membershipRole` — so
+   a bare `member` gets the `user` template (11 permissions), never `manager`. A real role
+   assignment (`member.role = "manager"`) needs the organization plugin's `roles`/access-control
+   configuration, and `CreateAuthOptions` does not expose it. See "Step 4 blocker" below.
 
 Smaller notes:
 
@@ -261,6 +256,158 @@ Smaller notes:
 - The guard resolves the membership row on every protected request. Cache it on the session
   (or stamp the role alongside `activeOrganizationId`) before this reaches real traffic.
 - `.env.example` / `.env.example.dev` / `compose*.yaml` were **not** touched — that is Step 8.
+
+### Step 1.5 — `apps/api` modernization (ESM · unified slice · drizzle 1.0) — **DONE 2026-08-05**
+
+Findings 1 and 2 above were prerequisites for Steps 3-5. All three pieces landed together.
+
+#### 1.5.a ES modules and the oikos tsconfig
+
+- `apps/api/package.json` is `"type": "module"`, `main` `./dist/index.js`.
+- `tsconfig.json` extends `../../tsconfig.base.json` (`module: preserve`, `moduleResolution:
+bundler`, ES2022, decorators). It `include`s `src`, `test`, `scripts` and `drizzle.config.ts`
+  because `tsx` and `mocha --import tsx` resolve exactly one tsconfig from the working directory
+  and apply it only to matching files.
+- `tsconfig.build.json` narrows to `src` and emits; `build` is
+  `tsc -p tsconfig.build.json && node ../../.scripts/rewrite-esm-specifiers.mjs`, the same
+  two-step build `packages/db` and `packages/auth` use. Relative specifiers stay extension-less
+  in source; the rewrite script appends `.js` in `dist`.
+- Project references are gone — `tsc -b` became `tsc -p`. Dependency ordering is turbo's
+  `build.dependsOn: ["^build"]`, which already covered it.
+- **Strictness is deliberately unchanged.** `tsconfig.base.json` sets `strict: true`; the ~180
+  files inherited from the CommonJS era were written against a config with `noImplicitAny: false`
+  and no `strictNullChecks`, and turning it on surfaces ~170 errors that are a separate,
+  behaviour-touching cleanup. `tsconfig.json` therefore re-relaxes
+  `strict` / `strictNullChecks` / `noImplicitAny` / `strictBindCallApply`, and a second project
+  **`tsconfig.strict.json`** keeps the full oikos contract over `src/auth/**` and `scripts/**` —
+  the code that was written against it — so new code cannot regress. `pnpm typecheck` runs both.
+  Grow `tsconfig.strict.json`'s `include` directory by directory; delete it once it covers `src`.
+  (`src/runtime/**` is not in it: it imports `src/core/`, which drags in the whole legacy graph.)
+- Node-only globals ported: `__filename` → `import.meta.filename` (52 sites, all `getLogger`
+  calls), `__dirname` → `import.meta.dirname` (`src/envs.ts`, the root `.env` lookup).
+- `isolatedModules` forced 34 type re-exports to `export type` across 10 files.
+
+**CJS interop, audited exhaustively.** Every bare specifier in the *emitted* `dist/**/*.js` (i.e.
+every binding that survives type elision) was imported under Node's ES-module loader and its
+bindings checked. Exactly four packages needed anything:
+
+| package                | problem                                                          | fix                                                                       |
+| ---------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `@routr/sdk`           | `module.exports = { default: {...} }`; Node ignores `__esModule` | unwrap `.default` explicitly in `src/core/upsertDefaultPeer.ts`            |
+| `wavefile`             | no detectable named **or** default export                        | `createRequire(import.meta.url)` in `src/voice/tts/utils/convertUlawToPCM16.ts` |
+| `@deepgram/sdk`        | was `require()`d behind an `any`                                 | real named import; surfaced a live bug (below)                            |
+| everything else (44)   | none                                                             | —                                                                          |
+
+The proto-generated CommonJS in `@optimiq-voice/common` loads correctly under Node ESM — verified
+by booting `tsx src/main.ts` and watching all 11 gRPC services register.
+
+#### 1.5.b The auth slice is unified
+
+`src/auth/*.mts` → `*.ts`; `src/auth/tsconfig.json` and `src/auth/auth-esm.bridge.ts` deleted;
+`main.ts` now statically imports `./auth/auth-bootstrap`. `src/runtime/app-runtime.mts` → `.ts`
+and its `../../node_modules/effect/dist/index.js` escape hatch became ordinary
+`effect/{Context,Effect,Layer,Schema}` sub-path imports. `scripts/verify-auth-slice.mts` →
+`.ts`. Behaviour is identical: **`verify:auth` still passes 26/26.**
+
+#### 1.5.c drizzle-orm 0.45.2 → 1.0.0-rc.4 (`catalog:`), drizzle-kit likewise
+
+Drizzle usage in `apps/api` is confined to `src/core/db.ts`, `src/core/db/schema.ts`,
+`drizzle.config.ts` and `scripts/db-provision.mjs`; every caller goes through the Prisma-shaped
+`db.*` facade, whose call signatures are unchanged. Three API changes mattered:
+
+1. **`relations()` → `defineRelations()`.** The per-table helpers are gone from the root export
+   (they survive at `drizzle-orm/_relations` for compatibility). `schema.ts` now exports a
+   `tables` map and one `relations` graph built with `defineRelations(tables, (r) => …)`. drizzle
+   1.0 no longer infers the inverse side of a relation, so both directions are spelled out with
+   `from`/`to`.
+2. **`drizzle(pool, { schema })` → `drizzle({ client: pool, relations })`.** The positional
+   `(client, config)` overload is gone, and relational metadata is passed as `relations`, not
+   `schema`.
+3. **`NodePgDatabase<typeof schema>` → `NodePgDatabase<typeof schema.relations>`.** The generic
+   parameter is the relations graph now, not the table map. `select` / `insert` / `update` /
+   `delete` / `transaction` / `onConflictDoUpdate` / `.returning()` are all unchanged, so the
+   ~600 lines of facade body needed no edits.
+
+**The migration folder had to be converted too, and the conversion is production-safe.**
+drizzle-orm 1.0's migrator refuses a `drizzle/meta/_journal.json` outright
+(`"We detected that you have old drizzle-kit migration folders"`), and it reads
+`drizzle/<YYYYMMDDHHMMSS>_<name>/migration.sql` instead of `drizzle/NNNN_<name>.sql`.
+`drizzle-kit up` performed the conversion:
+
+```
+apps/api/drizzle/0000_baseline.sql          →  apps/api/drizzle/20260805032410_baseline/migration.sql
+apps/api/drizzle/meta/0000_snapshot.json    →  apps/api/drizzle/20260805032410_baseline/snapshot.json  (v7 → v8)
+apps/api/drizzle/meta/_journal.json         →  deleted (the folder name carries the timestamp)
+```
+
+`migration.sql` is **byte-identical** to the old `0000_baseline.sql`, and the folder timestamp
+`20260805032410` reproduces the journal's `when: 1785900250156` exactly
+(`Date.UTC(...) === 1785900250000 === trunc(when)`). Both matter, because drizzle 1.0 ships a
+first-class upgrade for an existing `__drizzle_migrations_api` table
+(`drizzle-orm/up-migrations/pg.js`): it matches each pre-1.0 row to a local migration by
+`created_at` millis (hash as the tiebreak), adds the `name` / `applied_at` columns and backfills
+`name`. Verified end to end against real PostgreSQL:
+
+1. fresh database → `db:deploy` applies the baseline, 8 tables, one row named
+   `20260805032410_baseline`;
+2. that row rewound to the pre-1.0 shape (`name` / `applied_at` dropped, `created_at` restored to
+   `1785900250156`) → `db:deploy` **upgrades the table in place, re-applies no DDL**;
+3. a third `db:deploy` is a no-op.
+
+`apps/api/scripts/db-provision.mjs` needed one edit for the same reason as `db.ts`:
+`drizzle(client)` → `drizzle({ client })`.
+
+> ⚠️ **Known artifact — the next `db:generate` will not be empty.** drizzle-kit 1.0 diffs the
+> converted snapshot against the schema and emits four cosmetic
+> `ALTER COLUMN … SET DATA TYPE timestamp(3)` statements for
+> `applications.{created_at,updated_at}` and `secrets.{created_at,updated_at}` — the v7→v8 snapshot
+> conversion represents `timestamp(…, { precision: 3 })` differently than 1.0's own serializer.
+> **There is no structural drift**: no table, column, index, constraint or enum differs, which
+> also confirms the `defineRelations` rewrite changed no DDL. Two options, decide before the next
+> schema change: (a) accept one no-op normalization migration so the snapshot becomes honest —
+> costs a table rewrite lock on two tables; (b) hand-correct the `timestamp` entries in
+> `20260805032410_baseline/snapshot.json`. It was deliberately **not** generated here.
+
+#### 1.5.d Test suite
+
+Kept on **mocha** rather than migrated to `bun:test`: the 30 spec files are dense in
+`chai` + `sinon-chai` assertions and a framework swap would have been pure churn on top of an
+already large module migration. `apps/api/.mocharc.json` (`--import tsx`) plus a `test` script
+make `pnpm --filter @optimiq-voice/api test` self-contained. **50 passing, 2 pending** (up from
+44 — `test/voice/dialHandler.test.ts` was dead before, see below).
+
+Three test-level repairs, all pre-existing breakage rather than migration fallout:
+
+- `test/voice/dialHandler.test.ts` imported `@optimiq-voice/voice/test/helpers`, a package
+  `apps/api` does not depend on. The whole file threw at load and took the suite with it. The
+  import was one fixture constant; it now lives in `test/voice/helper.ts`.
+- `test/voice/createVoiceClient.test.ts` called `createCreateVoiceClient(container, null)` — an
+  arity error, invisible because the old `tsconfig.json` **excluded `test/`** from the program.
+- The same file's `instanceOf` assertion: under `mocha --import tsx`, a module reached by a
+  hoisted static import and the same module reached by `await import(...)` are evaluated into two
+  separate registries, so the statically imported class was never the constructor the factory
+  used. Both are now pulled from the same dynamic graph. **This affects assertions only** —
+  plain `node --import tsx` does not exhibit it, and neither does the built `dist`.
+
+#### 1.5.e Bugs found and fixed while porting
+
+- **`src/voice/stt/Deepgram.ts` never closed its websocket.** All six teardown paths called
+  `connection.destroy()`, which does not exist on `ListenLiveClient`; five were wrapped in a
+  `try/catch` that logged "error destroying connection" every time, and the sixth
+  (after `resolve()` in `transcribe`) was unguarded. Now `connection.disconnect()`. This was
+  invisible while the SDK was imported through `require()` behind an implicit `any`.
+
+#### 1.5.f Bugs found and NOT fixed (owned elsewhere / out of scope)
+
+- `packages/common/src/utils/assertEnvsAreSet.ts` calls `process.exit(1)` after `logger.error`.
+  With `LOGS_LEVEL=none` the process dies silently with no output at all — the failure mode when
+  the root `.env` is missing is a bare exit code 1 from any test run. It should throw.
+- `apps/api` reads three paths relative to the **process working directory**
+  (`API_IDENTITY_{PRIVATE,PUBLIC}_KEY_PATH`, `API_INTEGRATIONS_FILE`), so any script whose cwd is
+  `apps/api` rather than the repository root cannot find them. The `test` script pins them
+  explicitly; `start:dev` still inherits whatever the root `.env` says.
+- `config/integrations.json` is referenced by `.env.example.dev` but only
+  `config/integrations.example.json` exists, so a fresh checkout cannot boot the runtime.
 
 ### Step 2 — Data migration `fnidentity` → base DB
 
@@ -289,13 +436,135 @@ Smaller notes:
 
 ### Step 4 — Per-call and service tokens
 
-1. Replace `createGenerateCallAccessToken` with the better-auth jwt plugin: a short-lived
-   (`30s`) token whose payload carries `organizationId` and the application ref.
-2. `packages/voice/src/VoiceServer.ts`: replace `getPublicKey` over gRPC with JWKS verification
-   via `jose.createRemoteJWKSet(new URL("/api/auth/jwks", AUTH_URL))`.
-3. `apps/autopilot`: keep consuming `sessionToken`; only the verification path changes.
-   Retire `AUTOPILOT_SKIP_IDENTITY` in favour of the standard auth env.
-4. **Gate:** an inbound call reaches an autopilot application end to end with the new token.
+- [x] 1. Replace `createGenerateCallAccessToken` with the better-auth jwt plugin: a short-lived
+      (`30s`) token whose payload carries `organizationId` and the application ref.
+      **DONE 2026-08-05, ADDITIVE — the live call path is untouched.**
+- [ ] 2. `packages/voice/src/VoiceServer.ts`: replace `getPublicKey` over gRPC with JWKS verification
+      via `jose.createRemoteJWKSet(new URL("/api/auth/jwks", AUTH_URL))`.
+- [ ] 3. `apps/autopilot`: keep consuming `sessionToken`; only the verification path changes.
+      Retire `AUTOPILOT_SKIP_IDENTITY` in favour of the standard auth env.
+- [ ] 4. **Gate:** an inbound call reaches an autopilot application end to end with the new token.
+
+#### Step 4 item 1 — what shipped
+
+`apps/api/src/auth/call-token.service.ts`. Minting goes through **`auth.api.signJWT`**, a
+`serverOnly` endpoint of better-auth's jwt plugin that signs an arbitrary payload with the active
+JWKS key — no session, no HTTP round trip. The plugin's `definePayload` hook is deliberately not
+used: it derives claims from a session, and a call has none.
+
+Surface:
+
+- `buildCallAccessTokenClaims(request)` — pure, throws `CallAccessTokenScopeError` if any of
+  `organizationId` / `appRef` / `callRef` is blank.
+- `createCallAccessTokenMinter(platform)` — the closure form.
+- `CallTokenService` — the Nest provider, exported from `AuthModule`.
+
+**Claim mapping.** The payload is a strict superset of the identity-era one, so `packages/voice`
+can move to JWKS verification without simultaneously moving off the `access[]` shape:
+
+| legacy `createGenerateCallAccessToken`           | new                                                |
+| ------------------------------------------------ | -------------------------------------------------- |
+| `iss` = `API_IDENTITY_ISSUER`                    | `iss` = the jwt plugin's issuer (`AUTH_URL`)       |
+| `sub` = `appRef`                                 | `sub` = `appRef` — **unchanged**                   |
+| `aud` = `API_IDENTITY_AUDIENCE`                  | `aud` = `"optimiq-voice/voice"`                    |
+| `tokenUse: "access"`                             | `tokenUse: "access"` — **unchanged**               |
+| `accessKeyId` = workspace `WO…` key              | `accessKeyId` = `organization.id` (same slot)      |
+| `access: [{ accessKeyId, role: "VOICE_SERVICE" }]` | same shape, organization id inside               |
+| —                                                | `organizationId` — the canonical tenant claim      |
+| —                                                | `appRef` — explicit, no longer only in `sub`       |
+| —                                                | `callRef` — **new**, binds the token to one call   |
+| `iat` (stamped by `jsonwebtoken`)                | `iat` stamped explicitly (the plugin sets only `exp`) |
+| RS256 with `.keys/private.pem`                   | the jwks key (EdDSA by default), published at `/api/auth/jwks` |
+| `expiresIn: "30s"`                               | `"30s"` — **unchanged**                            |
+
+`accessKeyId` and `access[]` deliberately carry the organization id during coexistence: every
+consumer of them (`hasAccess`, `tokenHasAccessKeyId` in `packages/common/src/identity/`) only
+compares them for equality against the tenant identifier on the wire, so the value changes and
+the shape does not. Both claims die with `packages/common/src/identity/` in Step 9.
+
+**Verification.**
+
+- `apps/api/test/auth/callTokenClaims.test.ts` — pins the claim contract, no I/O.
+- `pnpm --filter @optimiq-voice/api verify:call-token` — **18/18**. Boots the slice against real
+  PostgreSQL, mints a token, fetches `GET /api/auth/jwks`, verifies with
+  `jose.createLocalJWKSet` + `jwtVerify`, asserts every claim, and proves a re-signed payload is
+  rejected. This is exactly the verification item 2 will put in `VoiceServer.ts`.
+  (It reuses `verify-auth-slice.ts`'s `AUTH_SECRET` on purpose: the jwt plugin encrypts the JWKS
+  private key with it, so two scripts against one database must agree.)
+
+**What item 2 needs.** `VoiceServer.ts` currently calls `getPublicKey(config.identityAddress)`
+over gRPC and hands the PEM to `createAuthInterceptor`. Replace with
+`createRemoteJWKSet(new URL("/api/auth/jwks", AUTH_URL))` and `jwtVerify(token, jwks, { audience:
+"optimiq-voice/voice" })`; read the tenant from `organizationId` rather than `access[0].accessKeyId`.
+Then flip `apps/api/src/voice/createCreateVoiceClient.ts` from
+`createGenerateCallAccessToken(identityConfig)` to `CallTokenService.createCallAccessToken(...)`,
+which additionally requires threading `callRef` (already in scope there) and the organization id
+(available only after Step 2's `accessKeyId → organization.id` mapping exists).
+
+#### Step 4 blocker — role access control lives in `packages/auth`, which is not exposed
+
+Finding 3 above (only 3 of the 5 `SYSTEM_ROLE_TEMPLATES` are reachable) **cannot be fixed from
+`apps/api`.** `createAuth(options)` in `packages/auth/src/auth.ts` hard-codes its `plugins` array
+and constructs `organization({ creatorRole, invitationExpiresIn, … })` internally.
+`CreateAuthOptions` exposes no `ac`, no `roles`, and no plugin override, and the composed `Auth`
+instance freezes its plugin options at `betterAuth()` time — so there is no runtime escape hatch
+either. `apps/api` passing anything is impossible today.
+
+Ironically the building block already exists and is already exported:
+`buildAccessControlStatements(permissions)` in `packages/auth/src/permissions.ts` reshapes the
+flat registry into better-auth's `{ resource: ["action", "action.scope"] }` statement form. It is
+referenced by nothing.
+
+**Exact change `packages/auth` must make** (owner: whoever holds `packages/auth`):
+
+1. Add to `CreateAuthOptions`:
+   ```ts
+   /** Registers the five SYSTEM_ROLE_TEMPLATES with the organization plugin's access control. */
+   readonly organizationRoles?: boolean | { readonly creatorRole?: SystemRoleId };
+   ```
+2. In `createAuth`, when it is set, build the access controller from the registry and pass it to
+   the organization plugin. Both options exist in better-auth 1.6.23 —
+   `OrganizationOptions.ac?: AccessControl` and `roles?: Record<string, Role>`
+   (`dist/plugins/organization/types.d.mts:58-62`), with `createAccessControl` exported from
+   `better-auth/plugins/access` and the plugin's own statements from
+   `better-auth/plugins/organization/access` (`defaultStatements`, `defaultRoles`,
+   `ownerAc`, `adminAc`, `memberAc`):
+   ```ts
+   import { createAccessControl } from "better-auth/plugins/access";
+   import { defaultStatements, defaultRoles } from "better-auth/plugins/organization/access";
+
+   // MERGE, do not replace: the plugin's own `organization` / `member` / `invitation` / `ac`
+   // statements gate its built-in endpoints. Dropping them breaks invitations.
+   const ac = createAccessControl({
+     ...defaultStatements,
+     ...buildAccessControlStatements(),
+   });
+   const roles = {
+     ...defaultRoles,
+     ...Object.fromEntries(
+       SYSTEM_ROLE_TEMPLATES.map((t) => [
+         t.id,
+         ac.newRole({
+           ...(defaultRoles[t.membershipRole]?.statements ?? {}),
+           ...buildAccessControlStatements(t.permissions),
+         }),
+       ]),
+     ),
+   };
+   organization({ ac, roles, creatorRole: "owner", /* existing options */ })
+   ```
+3. Keep `creatorRole: "owner"`, so `verify:auth` check 4 ("me reports the owner role — owner")
+   is unaffected, and keep `owner` / `admin` / `member` resolvable so existing rows keep working
+   — note `member` is a plugin default with no `SYSTEM_ROLE_TEMPLATES` counterpart, which is
+   exactly why `role-permissions.ts` keeps its least-privilege fallback.
+4. Spec: assert every `SYSTEM_ROLE_TEMPLATES` id is a key of the composed `roles`; assert
+   `buildAccessControlStatements(PERMISSIONS)` round-trips (every entry in `PERMISSIONS` appears
+   in exactly one `resource: [action]` pair); assert `defaultStatements` keys survive the merge.
+
+Once that lands, `apps/api/src/auth/role-permissions.ts` needs **no change** — its step 1 already
+resolves an exact template id, so `member.role = "manager"` starts working the moment the
+organization plugin will accept that value, and the least-privilege fallback stays as the guard
+against unknown roles.
 
 ### Step 5 — Enable RLS on org-scoped tables
 

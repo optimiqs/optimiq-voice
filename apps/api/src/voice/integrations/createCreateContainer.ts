@@ -15,7 +15,7 @@ import { getSttConfig } from "./getSttConfig";
 import { getTtsConfig } from "./getTtsConfig";
 import { IntegrationsContainer } from "./types";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 function createCreateContainer(db: Database, pathToIntegrations: string) {
 	logger.verbose("loading integrations config", { pathToIntegrations });

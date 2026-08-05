@@ -9,7 +9,7 @@ import { CreateContainer } from "./integrations/types";
 import { ChannelVar, VoiceClient } from "./types";
 import { createGetChannelVarWithoutThrow } from "./utils/createGetChannelVarWithoutThrow";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 const generateCallAccessToken = createGenerateCallAccessToken(identityConfig);
 

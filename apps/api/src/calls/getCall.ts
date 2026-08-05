@@ -12,7 +12,7 @@ import { notFoundError } from "../core/notFoundError";
 import { createFetchSingleCall } from "./createFetchSingleCall";
 import { GetCallRequest } from "./types";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 function getCall(influx: InfluxDBClient) {
 	const fetchSingleCall = createFetchSingleCall(influx);

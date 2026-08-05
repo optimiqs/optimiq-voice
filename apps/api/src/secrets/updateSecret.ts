@@ -6,7 +6,7 @@ import { Database } from "../core/db";
 import { withErrorHandlingAndValidationAndAccess } from "../utils/withErrorHandlingAndValidationAndAccess";
 import { createGetFnUtil } from "./createGetFnUtil";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 function updateSecret(db: Database) {
 	const getFn = createGetFnUtil(db);

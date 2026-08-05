@@ -1,0 +1,5 @@
+{
+	"node-option": ["import=tsx"],
+	"timeout": 30000,
+	"ignore": ["**/node_modules/**", "**/*.integration.test.ts"]
+}

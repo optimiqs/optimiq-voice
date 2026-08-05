@@ -2,7 +2,7 @@ import { connect } from "nats";
 import { getLogger } from "@optimiq-voice/logger";
 import { NatsEventCallback } from "./types";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 const ROUTR_CALL_SUBJECT = "routr.call.*";
 

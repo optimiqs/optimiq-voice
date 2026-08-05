@@ -5,7 +5,7 @@ import { BaseApiObject } from "@optimiq-voice/types";
 import { Database } from "../core/db";
 import { createGetFnUtil } from "./createGetFnUtil";
 
-const logger = getLogger({ service: "api", filePath: __filename });
+const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 function createDeleteApplication(db: Database) {
 	const getFn = createGetFnUtil(db);
