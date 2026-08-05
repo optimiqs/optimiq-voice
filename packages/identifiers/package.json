@@ -1,0 +1,35 @@
+{
+	"name": "@optimiq-voice/identifiers",
+	"version": "0.1.0",
+	"description": "UUID v7 entity identifiers for Optimiq Voice",
+	"license": "MIT",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./src/index.ts",
+	"exports": {
+		".": {
+			"types": "./src/index.ts",
+			"default": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/optimiqs/optimiq-voice.git"
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json && node ../../.scripts/rewrite-esm-specifiers.mjs",
+		"clean": "rimraf ./dist",
+		"test": "bun test src",
+		"typecheck": "tsc -p tsconfig.json --noEmit"
+	},
+	"dependencies": {
+		"uuid": "catalog:"
+	},
+	"devDependencies": {
+		"@types/bun": "catalog:",
+		"typescript": "^5.9.3"
+	}
+}

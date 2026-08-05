@@ -1,0 +1,44 @@
+{
+	"name": "@optimiq-voice/effect-runtime",
+	"version": "0.1.0",
+	"description": "Effect <-> NestJS runtime seam for Optimiq Voice",
+	"license": "MIT",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./src/index.ts",
+	"exports": {
+		".": {
+			"types": "./src/index.ts",
+			"default": "./dist/index.js"
+		},
+		"./testing": {
+			"types": "./src/testing/index.ts",
+			"default": "./dist/testing/index.js"
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/optimiqs/optimiq-voice.git"
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json && node ../../.scripts/rewrite-esm-specifiers.mjs",
+		"clean": "rimraf ./dist",
+		"test": "bun test src",
+		"typecheck": "tsc -p tsconfig.json --noEmit"
+	},
+	"dependencies": {
+		"@nestjs/common": "catalog:",
+		"@optimiq-voice/config": "workspace:*",
+		"@optimiq-voice/logging": "workspace:*",
+		"effect": "catalog:"
+	},
+	"devDependencies": {
+		"@types/bun": "catalog:",
+		"reflect-metadata": "catalog:",
+		"rxjs": "catalog:",
+		"typescript": "^5.9.3"
+	}
+}

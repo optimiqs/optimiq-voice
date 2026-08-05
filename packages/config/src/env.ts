@@ -1,0 +1,335 @@
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+import { config } from "dotenv";
+import * as z from "zod";
+import { assertEnvInvariants } from "./env-invariants";
+import { requireUnknownRecord } from "./unknown-value";
+
+/**
+ * Strict boolean parser for env vars.
+ * `z.coerce.boolean()` uses `Boolean(value)` and would treat the string "false" as truthy.
+ */
+const booleanString = z.union([
+	z.boolean(),
+	z.stringbool({ truthy: ["true", "1"], falsy: ["false", "0", ""] }),
+]);
+
+const optionalString = z.preprocess(
+	(value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+	z.string().optional(),
+);
+
+const optionalUrl = z.preprocess(
+	(value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+	z.url().optional(),
+);
+
+/**
+ * Any URI with a scheme — `nats://`, `postgresql://`, `ws://`, `amqp://`. `z.url()` is too
+ * narrow for the transport URLs this platform speaks.
+ */
+const optionalUri = z.preprocess(
+	(value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+	z
+		.string()
+		.regex(/^[a-z][a-z0-9+.-]*:\/\//iu, "must be a URI with a scheme (e.g. nats://host:4222)")
+		.optional(),
+);
+
+const port = (fallback: number) => z.coerce.number().int().min(1).max(65535).default(fallback);
+
+const optionalE164 = z.preprocess(
+	(value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+	z
+		.string()
+		.regex(/^\+[1-9]\d{1,14}$/u, "must be E.164 (e.g. +14155552671)")
+		.optional(),
+);
+
+/** The single dotenv file is the repository root `.env`. Nothing above the repo is read. */
+const findEnvPath = (filename: string): string | null => {
+	const baseDir = import.meta.dirname;
+	const searchPaths = [
+		resolve(baseDir, "../../../", filename),
+		resolve(baseDir, "../../", filename),
+	];
+
+	for (const fullPath of searchPaths) {
+		if (existsSync(fullPath)) {
+			return fullPath;
+		}
+	}
+	return null;
+};
+
+const rootEnvPath = findEnvPath(".env");
+
+if (rootEnvPath) {
+	config({ path: rootEnvPath, quiet: true });
+}
+
+type AppEnvPrimitive = string | number | boolean | null;
+type BunEnvRuntime = {
+	env?: Record<string, string | undefined>;
+};
+
+/** Hydration never overwrites an already-set variable: real process env always wins. */
+const setEnvIfMissing = (key: string, value: string): void => {
+	if (process.env[key]?.trim()) {
+		return;
+	}
+
+	process.env[key] = value;
+
+	const bunRuntime = (globalThis as typeof globalThis & { Bun?: BunEnvRuntime }).Bun;
+	if (bunRuntime?.env) {
+		bunRuntime.env[key] = value;
+	}
+};
+
+const isAppEnvPrimitive = (value: unknown): value is AppEnvPrimitive => {
+	return (
+		typeof value === "string" ||
+		typeof value === "number" ||
+		typeof value === "boolean" ||
+		value === null
+	);
+};
+
+const stripEnvValueQuotes = (value: string): string => {
+	if (value.length < 2) {
+		return value;
+	}
+	const first = value[0];
+	const last = value[value.length - 1];
+	if ((first === '"' || first === "'") && first === last) {
+		return value.slice(1, -1);
+	}
+	return value;
+};
+
+const tryHydrateEnvFromJsonObject = (trimmed: string): boolean => {
+	if (!(trimmed.startsWith("{") && trimmed.endsWith("}"))) {
+		return false;
+	}
+
+	try {
+		const parsed = JSON.parse(trimmed) as unknown;
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			return false;
+		}
+
+		for (const [key, value] of Object.entries(requireUnknownRecord(parsed))) {
+			if (!key.trim()) {
+				continue;
+			}
+			if (isAppEnvPrimitive(value)) {
+				setEnvIfMissing(key, String(value));
+			}
+		}
+
+		return true;
+	} catch {
+		return false;
+	}
+};
+
+const hydrateEnvFromKeyValueLines = (trimmed: string): void => {
+	for (const line of trimmed.split("\n")) {
+		const statement = line.trim();
+		if (!statement || statement.startsWith("#")) {
+			continue;
+		}
+		const separatorIndex = statement.indexOf("=");
+		if (separatorIndex <= 0) {
+			continue;
+		}
+		const key = statement.slice(0, separatorIndex).trim();
+		const value = stripEnvValueQuotes(statement.slice(separatorIndex + 1).trim());
+		if (!key) {
+			continue;
+		}
+		setEnvIfMissing(key, value);
+	}
+};
+
+/**
+ * `APP_ENV_CONTENT` carries a whole environment from a secret manager as either a JSON
+ * object or a dotenv-formatted string. Only unset keys are hydrated.
+ */
+const hydrateEnvFromAppEnvContent = (raw: string): void => {
+	const trimmed = raw.trim();
+	if (!trimmed) {
+		return;
+	}
+
+	if (tryHydrateEnvFromJsonObject(trimmed)) {
+		return;
+	}
+
+	hydrateEnvFromKeyValueLines(trimmed);
+};
+
+const appEnvContent = process.env.APP_ENV_CONTENT;
+
+if (typeof appEnvContent === "string" && appEnvContent.trim()) {
+	hydrateEnvFromAppEnvContent(appEnvContent);
+}
+
+const envSchema = z.object({
+	// ---- Process ------------------------------------------------------------------------
+	NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+	TZ: optionalString,
+	APP_VERSION: z.string().default("0.0.0"),
+	BUILD_ID: z.string().default("dev"),
+	APP_ENV_CONTENT: z.string().optional(),
+	LOG_LEVEL: z.enum(["trace", "debug", "info", "warn", "error", "fatal", "silent"]).optional(),
+	LOG_PRETTY: optionalString,
+	EFFECT_OBSERVABILITY_LOG_LEVEL: z
+		.enum(["trace", "debug", "info", "warn", "error", "fatal", "none"])
+		.default("info"),
+
+	// ---- Platform placeholders (canonical names for the rebuilt services) -----------------
+	DATABASE_URL: optionalUri,
+	NATS_URL: optionalUri,
+	AUTH_SECRET: z.string().min(32).optional(),
+	AUTH_URL: optionalUrl,
+	AUTH_COOKIE_DOMAIN: optionalString,
+	AUTH_COOKIE_SAMESITE: z.enum(["strict", "lax", "none"]).optional(),
+	AUTH_ISSUER: optionalString,
+	AUTH_SESSION_TTL_SECONDS: z.coerce.number().int().min(60).max(2_592_000).default(86_400),
+
+	// ---- API server ----------------------------------------------------------------------
+	API_APP_URL: optionalUrl,
+	API_ASTERISK_ARI_PROXY_URL: optionalUrl,
+	API_ASTERISK_ARI_SECRET: optionalString,
+	API_ASTERISK_ARI_USERNAME: z.string().default("ari"),
+	API_AUTHZ_SERVICE_ENABLED: booleanString.default(false),
+	API_AUTHZ_SERVICE_HOST: optionalString,
+	API_AUTHZ_SERVICE_METHODS: optionalString,
+	API_AUTHZ_SERVICE_PORT: port(50071),
+	API_CLOAK_ENCRYPTION_KEY: optionalString,
+	API_DATABASE_URL: optionalUri,
+	API_IDENTITY_DATABASE_URL: optionalUri,
+	API_IDENTITY_ISSUER: optionalString,
+	API_IDENTITY_OAUTH2_GITHUB_CLIENT_ID: optionalString,
+	API_IDENTITY_OAUTH2_GITHUB_CLIENT_SECRET: optionalString,
+	API_IDENTITY_OAUTH2_GITHUB_ENABLED: booleanString.default(false),
+	API_IDENTITY_WORKSPACE_INVITE_FAIL_URL: optionalUrl,
+	API_IDENTITY_WORKSPACE_INVITE_URL: optionalUrl,
+	API_IDENTITY_WORKSPACE_INVITE_EXPIRATION: z.string().default("1d"),
+	API_IDENTITY_CONTACT_VERIFICATION_REQUIRED: booleanString.default(false),
+	API_IDENTITY_TWO_FACTOR_AUTHENTICATION_REQUIRED: booleanString.default(false),
+	API_INFLUXDB_INIT_ORG: optionalString,
+	API_INFLUXDB_INIT_PASSWORD: optionalString,
+	API_INFLUXDB_INIT_TOKEN: optionalString,
+	API_INFLUXDB_INIT_USERNAME: optionalString,
+	API_INFLUXDB_URL: optionalUrl,
+	API_LOGS_FORMAT: z.enum(["json", "pretty", "none"]).default("json"),
+	API_LOGS_LEVEL: optionalString,
+	API_LOGS_TRANSPORT: optionalString,
+	API_NATS_URL: optionalUri,
+	API_OWNER_EMAIL: z.email().optional(),
+	API_OWNER_NAME: optionalString,
+	API_OWNER_PASSWORD: optionalString,
+	API_ROOT_DOMAIN: optionalString,
+	API_SMTP_AUTH_PASS: optionalString,
+	API_SMTP_AUTH_USER: optionalString,
+	API_SMTP_HOST: optionalString,
+	API_SMTP_PORT: port(587),
+	API_SMTP_SECURE: booleanString.default(true),
+	API_SMTP_SENDER: optionalString,
+	API_SIGNALING_SERVER: optionalUri,
+	API_TWILIO_ACCOUNT_SID: optionalString,
+	API_TWILIO_AUTH_TOKEN: optionalString,
+	API_TWILIO_PHONE_NUMBER: optionalE164,
+
+	// ---- Autopilot -----------------------------------------------------------------------
+	AUTOPILOT_AWS_S3_ACCESS_KEY_ID: optionalString,
+	AUTOPILOT_AWS_S3_ENDPOINT: optionalUrl,
+	AUTOPILOT_AWS_S3_REGION: z.string().default("us-east-1"),
+	AUTOPILOT_AWS_S3_SECRET_ACCESS_KEY: optionalString,
+	AUTOPILOT_CONVERSATION_PROVIDER: z.enum(["api", "file"]).default("api"),
+	AUTOPILOT_CONVERSATION_PROVIDER_FILE: optionalString,
+	AUTOPILOT_INTEGRATIONS_FILE: optionalString,
+	AUTOPILOT_KNOWLEDGE_BASE_ENABLED: booleanString.default(false),
+	AUTOPILOT_LOGS_FORMAT: optionalString,
+	AUTOPILOT_LOGS_LEVEL: optionalString,
+	AUTOPILOT_LOGS_TRANSPORT: optionalString,
+	AUTOPILOT_OPENAI_API_KEY: optionalString,
+	AUTOPILOT_UNSTRUCTURED_API_KEY: optionalString,
+	AUTOPILOT_UNSTRUCTURED_API_URL: optionalUrl,
+
+	// ---- Routr (SIP signaling) -----------------------------------------------------------
+	ROUTR_DATABASE_URL: optionalUri,
+	ROUTR_EXTERNAL_ADDRS: optionalString,
+	ROUTR_LOGS_FORMAT: optionalString,
+	ROUTR_LOGS_LEVEL: optionalString,
+	ROUTR_LOGS_TRANSPORT: optionalString,
+	ROUTR_NATS_PUBLISHER_ENABLED: booleanString.default(true),
+	ROUTR_NATS_PUBLISHER_URL: optionalUri,
+	ROUTR_RTPENGINE_HOST: optionalString,
+
+	// ---- Asterisk (media / application server) -------------------------------------------
+	ASTERISK_ARI_PROXY_URL: optionalUrl,
+	ASTERISK_ARI_SECRET: optionalString,
+	ASTERISK_ARI_USERNAME: z.string().default("ari"),
+	ASTERISK_CODECS: z.string().default("g722,ulaw,alaw"),
+	ASTERISK_DTMF_MODE: z
+		.enum(["auto", "auto_info", "inband", "info", "rfc4733"])
+		.default("auto_info"),
+	ASTERISK_RTP_PORT_END: port(20000),
+	ASTERISK_RTP_PORT_START: port(10000),
+	ASTERISK_SIPPROXY_HOST: optionalString,
+	ASTERISK_SIPPROXY_PORT: port(5060),
+	ASTERISK_SIPPROXY_SECRET: optionalString,
+	ASTERISK_SIPPROXY_USERNAME: z.string().default("voice"),
+
+	// ---- RTP engine ----------------------------------------------------------------------
+	RTPENGINE_PORT_MAX: port(20000),
+	RTPENGINE_PORT_MIN: port(10000),
+	RTPENGINE_PUBLIC_IP: optionalString,
+
+	// ---- InfluxDB (CDR / metrics) --------------------------------------------------------
+	INFLUXDB_INIT_ORG: optionalString,
+	INFLUXDB_INIT_PASSWORD: optionalString,
+	INFLUXDB_INIT_TOKEN: optionalString,
+	INFLUXDB_INIT_USERNAME: optionalString,
+
+	// ---- Postgres ------------------------------------------------------------------------
+	POSTGRES_PASSWORD: optionalString,
+	POSTGRES_USER: optionalString,
+});
+
+const envSource: NodeJS.ProcessEnv = { ...process.env };
+
+/**
+ * The canonical transport names are DATABASE_URL / NATS_URL. Existing deployments still ship
+ * the API_-prefixed names, so those act as the transitional fallback.
+ */
+envSource.DATABASE_URL ??= envSource.API_DATABASE_URL;
+envSource.NATS_URL ??= envSource.API_NATS_URL;
+
+const parsedEnv = envSchema.safeParse(envSource);
+
+if (!parsedEnv.success) {
+	const formattedErrors = JSON.stringify(z.treeifyError(parsedEnv.error));
+	throw new Error(`Invalid environment variables: ${formattedErrors}`);
+}
+
+const env = parsedEnv.data;
+
+assertEnvInvariants(env);
+
+export { env };
+
+export const getEnvVar = (key: string): string | undefined => {
+	const value = envSource[key];
+	return typeof value === "string" ? value : undefined;
+};
+
+export const getEnvEntries = (): [string, string][] => {
+	return Object.entries(envSource).filter(
+		(entry): entry is [string, string] => typeof entry[1] === "string",
+	);
+};
