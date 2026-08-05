@@ -4,7 +4,7 @@
 
 [![publish to docker hub](https://github.com/optimiqs/optimiq-voice/actions/workflows/release.yaml/badge.svg)](https://github.com/optimiqs/optimiq-voice/actions/workflows/release.yaml)
 
-This repository contains a dockerized distribution of Asterisk PBX 16 for use in [Optimiq Voice](https://github.com/optimiqs/optimiq-voice). For more documentation on how Optimiq Voice images are constructed and how to work with them, please see the [documentation](https://github.com/optimiqs/optimiq-voice).
+This repository contains a dockerized distribution of Asterisk PBX 22 (LTS, supported until 2028) for use in [Optimiq Voice](https://github.com/optimiqs/optimiq-voice). For more documentation on how Optimiq Voice images are constructed and how to work with them, please see the [documentation](https://github.com/optimiqs/optimiq-voice).
 
 ## Available Versions
 
@@ -58,13 +58,23 @@ Environment variables are used in the entry point script to render configuration
 - `SIP_BINDADDR` - Where to listen for SIP traffic. Defaults to `0.0.0.0:6060`
 - `RTP_PORT_START` - Lower limit of the RTP port range. **Required**
 - `RTP_PORT_END` - Upper limit of the RTP port range. **Required**
-- `DTMF_MODE` - DTMF mode. Defaults to `auto_info`
-- `CODECS` - Comma separated list of codecs. Defaults to `ulaw,alaw,gsm,g722`
+- `DTMF_MODE` - DTMF mode. Defaults to `rfc2833`
+- `CODECS` - Comma separated list of codecs. Defaults to `g722,ulaw,alaw,gsm`
 - `HTTP_BINDADDR` - Where to listen for HTTP traffic. Defaults to `0.0.0.0`
 
 ## Exposed ports
 
 - `6060` - Default SIP port
+- `8088` - ARI / HTTP port (see `http.conf`)
+
+## Asterisk version
+
+The image is built on `alpine:3.24`, which ships Asterisk `22.9.0` in `main`.
+Asterisk 22 is the current LTS branch (security fixes through 2028). Alpine
+branches older than 3.24 still carry Asterisk 20, so do not downgrade the base
+image. Since Alpine 3.22 the Asterisk data directory lives under
+`/usr/share/asterisk` rather than `/var/lib/asterisk`; `config/asterisk.conf`
+pins `astdatadir` accordingly.
 
 ## Volumes
 
