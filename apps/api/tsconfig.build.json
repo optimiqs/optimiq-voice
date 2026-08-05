@@ -1,0 +1,39 @@
+{
+	// The CommonJS build of apps/api.
+	//
+	// It is identical to `tsconfig.json` except that it drops `src/auth/**/*.mts` — the
+	// better-auth slice, which needs `moduleResolution: bundler` and is built separately by
+	// `src/auth/tsconfig.json`. The split exists because `tsx` applies the working directory's
+	// tsconfig only to files its `include`/`exclude` match, so the exclusion cannot live in
+	// `tsconfig.json` without breaking `start:dev`.
+	//
+	// `references` is not inherited through `extends`, so it is repeated here.
+	"extends": "./tsconfig.json",
+	"references": [
+		{
+			"path": "../../packages/identity"
+		},
+		{
+			"path": "../../packages/authz"
+		},
+		{
+			"path": "../../packages/logger"
+		},
+		{
+			"path": "../../packages/common"
+		},
+		{
+			"path": "../../packages/types"
+		},
+		{
+			"path": "../../packages/streams"
+		},
+		{
+			"path": "../autopilot"
+		},
+		{
+			"path": "../../packages/sipnet"
+		}
+	],
+	"exclude": ["node_modules", "dist", "test", "scripts", "drizzle.config.ts", "src/auth/**/*.mts"]
+}

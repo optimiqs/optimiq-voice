@@ -33,5 +33,10 @@
 			"path": "../../packages/sipnet"
 		}
 	],
+	// This file stays the broad, tooling-facing project: `tsx` (start:dev, scripts) resolves ONE
+	// tsconfig from the working directory and only applies its compiler options to files that
+	// match `include`/`exclude`, so excluding the auth slice here would strip
+	// `experimentalDecorators` from it at runtime. The build-only exclusion lives in
+	// `tsconfig.build.json`; the slice's own compiler options live in `src/auth/tsconfig.json`.
 	"exclude": ["node_modules", "dist", "test", "drizzle.config.ts"]
 }

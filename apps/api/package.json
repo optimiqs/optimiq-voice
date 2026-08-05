@@ -10,12 +10,13 @@
 		"test": "test"
 	},
 	"scripts": {
-		"prebuild": "rimraf ./dist tsconfig.tsbuildinfo",
-		"build": "tsc -b tsconfig.json",
-		"clean": "rimraf ./dist node_modules tsconfig.tsbuildinfo",
+		"prebuild": "rimraf ./dist tsconfig.tsbuildinfo tsconfig.build.tsbuildinfo",
+		"build": "tsc -b tsconfig.build.json && tsc -p src/auth/tsconfig.json",
+		"clean": "rimraf ./dist node_modules tsconfig.tsbuildinfo tsconfig.build.tsbuildinfo",
 		"db:deploy": "node scripts/db-provision.mjs",
 		"db:generate": "drizzle-kit generate --config drizzle.config.ts",
-		"start:dev": "nodemon --exec tsx --watch src src/main.ts"
+		"start:dev": "nodemon --exec tsx --watch src src/main.ts",
+		"verify:auth": "tsx scripts/verify-auth-slice.mts"
 	},
 	"bin": {
 		"optimiq-voice": "./dist/index.js"
@@ -23,9 +24,12 @@
 	"dependencies": {
 		"@47ng/cloak": "1.2.0",
 		"@deepgram/sdk": "3.13.0",
+		"@optimiq-voice/auth": "workspace:*",
 		"@optimiq-voice/authz": "workspace:^",
 		"@optimiq-voice/autopilot": "workspace:^",
 		"@optimiq-voice/common": "workspace:^",
+		"@optimiq-voice/config": "workspace:*",
+		"@optimiq-voice/db": "workspace:*",
 		"@optimiq-voice/identity": "workspace:^",
 		"@optimiq-voice/logger": "workspace:^",
 		"@optimiq-voice/sipnet": "workspace:^",
@@ -38,6 +42,7 @@
 		"@routr/common": "2.13.20",
 		"@routr/sdk": "2.13.20",
 		"ari-client": "2.2.0",
+		"better-auth": "catalog:",
 		"dotenv": "16.6.1",
 		"drizzle-orm": "0.45.2",
 		"elevenlabs": "1.59.0",
@@ -50,6 +55,7 @@
 		"pb-util": "1.0.3",
 		"pg": "8.22.0",
 		"pick-port": "2.2.0",
+		"postgres": "catalog:",
 		"uuid": "11.1.1",
 		"validator": "13.15.26",
 		"wait-port": "1.1.0",

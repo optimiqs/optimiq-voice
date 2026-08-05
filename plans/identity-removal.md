@@ -1,14 +1,16 @@
 # Identity Service Removal — Cutover Plan
 
-**Date:** 2026-08-05 · **Phase:** written in P0, executed in P1 · **Status:** PLAN ONLY — no identity code has been touched.
+**Date:** 2026-08-05 · **Phase:** written in P0, executed in P1 · **Status:** Step 1 (additive
+mount) is **DONE**; Steps 2-9 not started. No identity code has been removed or changed.
 
 The custom RS256 gRPC identity service is retired and replaced by **better-auth 1.6.23**
 (`packages/auth`) on the **base database** (`packages/db`). This document enumerates everything
 that currently depends on identity and the ordered steps to remove each.
 
-> **Nothing in this plan has been executed.** `apps/identity`, `packages/identity`,
+> **Only Step 1 has been executed** (2026-08-05): better-auth is mounted in `apps/api` alongside
+> the existing gRPC identity path. `apps/identity`, `packages/identity`,
 > `packages/identity-client`, `packages/common/src/identity/` and the `fnidentity` database are
-> all still in place and untouched.
+> all still in place and untouched. See "Step 1 implementation notes" below.
 
 ---
 
@@ -165,18 +167,100 @@ and rewrite those JSONB values into a real `organization_id` column before RLS c
 - [ ] Decide the JWT algorithm for the **Routr connect token** (see Step 6 — this gates the
       key retirement, not the auth cutover).
 
-### Step 1 — Mount better-auth in `apps/api` (additive, nothing removed)
+### Step 1 — Mount better-auth in `apps/api` (additive, nothing removed) — **DONE 2026-08-05**
 
-1. Add `@optimiq-voice/auth` + `@optimiq-voice/db` to `apps/api`.
-2. Create the base-DB client (`createDatabaseClient`) and call `createAuth({ database: adminDb, … })`,
-   wiring `email.sendVerification|sendReset|sendInvite` to the existing SMTP helpers in
-   `apps/api/src/core/`.
-3. Implement `SessionOrganizationRepository.findMembership` over the `member` table and pass it
-   as `organizationRepository` so `session.activeOrganizationId` is stamped on session create.
-4. Mount the handler on Fastify at `/api/auth/*` (`auth.handler(request)`).
-5. Run `packages/db` migrations in the api container (`bun run scripts/migrate.ts --expected-stage <stage>`).
-6. **Gate:** sign up, verify email, sign in, create organization, invite + accept, issue an API
-   key, fetch `/api/auth/jwks` and `/api/auth/token`.
+- [x] 1. Add `@optimiq-voice/auth` + `@optimiq-voice/db` to `apps/api` (also `@optimiq-voice/config`,
+      `better-auth`, `postgres`).
+- [x] 2. Create the base-DB client (`createDatabaseClient`) and call `createAuth({ database: adminDb, … })`.
+      **Email delivery is a console/log STUB** (`src/auth/auth-email.delivery.mts`) — the SMTP helpers in
+      `apps/api/src/core/` are not wired yet. Carried into Step 8.
+- [x] 3. `SessionOrganizationRepository.findMembership` (`src/auth/auth.repository.mts`) passed as
+      `organizationRepository`; `session.activeOrganizationId` is stamped on session create — verified.
+- [x] 4. Mount the handler on Fastify at `/api/auth/*` (`auth.handler(request)`).
+- [ ] 5. Run `packages/db` migrations in the api container (`bun run scripts/migrate.ts --expected-stage <stage>`).
+      Not started — `apps/api/Dockerfile` and `compose*.yaml` are untouched (belongs with Step 8).
+- [x] 6. **Gate** — `pnpm --filter @optimiq-voice/api verify:auth` (26/26 checks, real Postgres 17):
+      sign up → session cookie → `/api/v1/me` → create organization → `/api/v1/me` with the org →
+      `/api/v1/organizations` → invite + accept → re-sign-in proves the session hook → guard 403 for a
+      `member`, 200 for the `owner` → 401 anonymous → `/api/auth/jwks` served.
+      **Not yet exercised:** API-key issuance and `/api/auth/token` (deferred to Step 4), and
+      email verification by clicking the link (delivery is stubbed; the gate flips
+      `user.email_verified` directly to reach the invitation flow).
+
+Also delivered early, out of Step 3: `@RequirePermissions(...)` + `RequirePermissionsGuard`
+(item 3 of Step 3). It is **opt-in only** (`@UseGuards(RequirePermissionsGuard)` per controller),
+never global — the gRPC `createAuthInterceptor` path is untouched and both coexist.
+
+#### Step 1 implementation notes
+
+**What was built** (`apps/api/src/auth/`, all additive):
+
+| File                                                                 | Role                                                                                   |
+| -------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `auth.config.mts`                                                    | Env → `AuthSliceConfig`, entirely from `@optimiq-voice/config`                         |
+| `auth-email.delivery.mts`                                            | **STUB** logging delivery                                                              |
+| `auth.repository.mts`                                                | Membership / organization / member reads                                               |
+| `role-permissions.mts`                                               | `member.role` → `SYSTEM_ROLE_TEMPLATES` → `Permission[]`                               |
+| `auth.platform.mts`                                                  | `createDatabaseClient` + `createAuth` + repository, owns the pool                      |
+| `app-session.mts`                                                    | The only place a session is written to / read from the request                         |
+| `auth-http.plugin.mts`                                               | `/api/auth/*` route + session `preHandler` hook                                        |
+| `auth.service.mts`                                                   | Transport-agnostic reads (takes `AppSession`, never a request)                         |
+| `require-permissions.{decorator,guard}.mts`, `session.decorator.mts` | `@RequirePermissions()`, `@Session()`                                                  |
+| `me.controller.mts`, `organizations.controller.mts`                  | `GET /api/v1/me`, `GET /api/v1/organizations`, `GET /api/v1/organizations/:id/members` |
+| `auth.module.mts`, `auth-bootstrap.mts`, `index.mts`                 | Nest module + the ESM entry point `main.ts` loads                                      |
+| `auth-esm.bridge.ts`                                                 | The one CommonJS → ESM hop (see below)                                                 |
+
+**Mount mechanism.** A raw Fastify route `/api/auth/*` registered on the instance returned by
+`app.getHttpAdapter().getInstance()` in `main.ts`, _after_ `NestFactory.create` and _before_
+`listen`. The handler converts the Fastify request into a WHATWG `Request`, calls
+`auth.handler(request)` and writes the `Response` back (`getSetCookie()` is used so multiple
+`Set-Cookie` headers survive). `toNodeHandler` from `better-auth/node` is deliberately **not**
+used — it writes to the raw `ServerResponse` behind Fastify's back and would bypass reply
+lifecycle hooks (`onSend` security headers, `Cache-Control: no-store`). `fromNodeHeaders` from
+the same module _is_ used, for both the handler and the session hook.
+
+**Three findings that will shape the remaining steps:**
+
+1. **`apps/api` cannot import the P0 packages.** It still compiles with the repository-root
+   tsconfig (`module: commonjs`, `moduleResolution: node`). That resolver predates `exports`
+   maps, so `@optimiq-voice/{auth,db,config}` — ESM packages that publish `types` as source —
+   are unresolvable, and their sources use extension-less relative imports that only
+   `moduleResolution: bundler` accepts (`TS2835`). The slice is therefore compiled as a separate
+   ES-module program (`src/auth/tsconfig.json`, `module: preserve` + `moduleResolution:
+bundler`) emitting `dist/auth/*.mjs`, and `main.ts` crosses the boundary once through
+   `src/auth/auth-esm.bridge.ts` (a dynamic import, lowered to `require()`, which Node ≥22.12
+   answers for synchronous ESM graphs — verified). **Migrating `apps/api` to the oikos tsconfig
+   is now a prerequisite for Steps 3-5**, which touch handlers all over the CommonJS half.
+   When it happens, delete `auth-esm.bridge.ts`, `src/auth/tsconfig.json` and
+   `tsconfig.build.json`, and rename `*.mts` → `*.ts`.
+   - Corollary: the build-only exclusion lives in `tsconfig.build.json`, not `tsconfig.json`,
+     because `tsx` resolves one tsconfig from the working directory and applies its compiler
+     options only to files its `include`/`exclude` match — excluding the slice in
+     `tsconfig.json` silently strips `experimentalDecorators` from it under `start:dev`.
+2. **Two Drizzle majors coexist in `apps/api`.** The app pins `drizzle-orm@0.45.2` for the legacy
+   telephony schema; `@optimiq-voice/{auth,db}` are on `1.0.0-rc.4`. Queries in the slice
+   therefore go through better-auth's own adapter (`auth.$context.adapter`, model names not
+   table objects) instead of a Drizzle handle. Step 5 (RLS + `withTenantScope`) cannot start
+   until `apps/api` is on `drizzle-orm@1.0.0-rc.4`.
+3. **`member.role` → permissions is ambiguous.** better-auth stores `owner` / `admin` / `member`,
+   while `SYSTEM_ROLE_TEMPLATES` has five ids (`owner`, `admin`, `manager`, `agent`, `user`).
+   `role-permissions.mts` resolves an exact template id first, otherwise the **least privileged**
+   template with that `membershipRole` — so a bare `member` gets the `user` template (11
+   permissions), never `manager`. A real role assignment (`member.role = "manager"`) needs the
+   organization plugin's `roles`/access-control configuration; until then only 3 of the 5
+   templates are reachable. Decide in Step 3.
+
+Smaller notes:
+
+- `packages/config` names the base URL **`AUTH_URL`**, not `AUTH_BASE_URL`. The slice reads
+  `DATABASE_URL`, `AUTH_SECRET`, `AUTH_URL`, `AUTH_COOKIE_DOMAIN`, `AUTH_COOKIE_SAMESITE`,
+  `AUTH_SESSION_TTL_SECONDS` and `API_APP_URL`; it adds no env parsing of its own. When all
+  three of the first are absent the slice does not mount and the API boots exactly as before.
+- `requireEmailVerification` and `rateLimit` are enabled **only** when `NODE_ENV=production`,
+  because email delivery is still a stub. Both revert to unconditional once §2 SMTP is wired.
+- The guard resolves the membership row on every protected request. Cache it on the session
+  (or stamp the role alongside `activeOrganizationId`) before this reaches real traffic.
+- `.env.example` / `.env.example.dev` / `compose*.yaml` were **not** touched — that is Step 8.
 
 ### Step 2 — Data migration `fnidentity` → base DB
 

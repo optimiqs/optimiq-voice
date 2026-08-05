@@ -1,0 +1,30 @@
+{
+	// The `auth` feature slice is compiled as a separate ES-module program.
+	//
+	// `apps/api` still targets the legacy CommonJS toolchain (`module: commonjs`,
+	// `moduleResolution: node`) inherited from the repository root tsconfig. That resolver
+	// predates `exports` maps, so it cannot see the types of the P0 packages
+	// (`@optimiq-voice/{auth,db,config}` are ESM and publish `types` as source), and
+	// `packages/*/src` uses extension-less relative imports that only
+	// `moduleResolution: bundler` accepts.
+	//
+	// Rather than migrate the whole app (a separate, much larger cutover step), the auth slice
+	// gets the oikos compiler settings and emits `.mjs` into `dist/auth/`. `main.ts` crosses the
+	// boundary once, through `auth-esm.bridge.ts`.
+	//
+	// It lives here rather than in `apps/api/` so that tsx/bun (which resolve the nearest
+	// tsconfig honouring `include`/`exclude`) apply these options to the slice in development.
+	//
+	// DELETE THIS FILE when apps/api moves to the oikos tsconfig; the slice then compiles with
+	// the rest of the app and `auth-esm.bridge.ts` becomes a plain import.
+	"extends": "../../../../tsconfig.base.json",
+	"compilerOptions": {
+		"outDir": "../../dist/auth",
+		"rootDir": ".",
+		"module": "preserve",
+		"moduleResolution": "bundler",
+		"types": ["node"],
+		"noEmitOnError": true
+	},
+	"include": ["**/*.mts"]
+}
