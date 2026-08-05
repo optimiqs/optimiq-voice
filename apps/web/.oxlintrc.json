@@ -1,0 +1,61 @@
+{
+	"$schema": "../../node_modules/oxlint/configuration_schema.json",
+	"extends": ["../../.oxlintrc.json"],
+	"plugins": ["eslint", "typescript", "oxc", "import", "react", "jsx-a11y", "nextjs"],
+	"env": {
+		"browser": true,
+		"es2024": true,
+		"node": true
+	},
+	"rules": {
+		"react/rules-of-hooks": "error",
+		"react/exhaustive-deps": "warn",
+		"react/jsx-no-useless-fragment": ["error", { "allowExpressions": true }],
+		"react/no-danger": "error",
+		"react/no-array-index-key": "off",
+
+		"nextjs/no-async-client-component": "error",
+		"nextjs/no-html-link-for-pages": "error",
+		"nextjs/no-img-element": "error",
+		"nextjs/no-head-element": "error",
+		"nextjs/no-sync-scripts": "error",
+		"nextjs/no-typos": "error",
+		"nextjs/inline-script-id": "error",
+
+		"jsx-a11y/anchor-has-content": "error",
+		"jsx-a11y/heading-has-content": "error",
+		"jsx-a11y/click-events-have-key-events": "error",
+		"jsx-a11y/no-static-element-interactions": "error",
+		"jsx-a11y/label-has-associated-control": "off",
+		"jsx-a11y/no-autofocus": "off",
+
+		"typescript/no-explicit-any": "error",
+		"typescript/consistent-type-imports": ["error", { "disallowTypeAnnotations": false }],
+		"typescript/consistent-type-definitions": ["error", "interface"],
+
+		"no-unused-vars": [
+			"error",
+			{
+				"argsIgnorePattern": "^_",
+				"varsIgnorePattern": "^_",
+				"ignoreRestSiblings": true,
+				"caughtErrors": "none"
+			}
+		],
+		"curly": "error"
+	},
+	"overrides": [
+		{
+			"files": ["lib/permissions.generated.ts"],
+			"rules": {
+				"typescript/consistent-type-definitions": "off"
+			}
+		},
+		{
+			"files": ["components/ui/card.tsx"],
+			"rules": {
+				"jsx-a11y/heading-has-content": "off"
+			}
+		}
+	]
+}

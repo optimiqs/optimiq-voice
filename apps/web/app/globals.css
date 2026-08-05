@@ -1,0 +1,211 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/*
+ * Tailwind v4, CSS-first.
+ *
+ * Two layers, and components may only ever touch the second:
+ *   1. raw palette   — `--palette-*`, OKLCH, declared once per theme in `:root` / `.dark`
+ *   2. semantic role — `--color-*`, what the token MEANS ("surface", "danger"), never what it
+ *      looks like
+ *
+ * A component that writes `dark:bg-slate-800` has hard-coded a theme decision in the wrong place
+ * and breaks the moment a third theme (or a tenant brand) exists. Use `bg-surface`; the theme
+ * decides. `next-themes` toggles the `.dark` class on <html>, which is what `@custom-variant`
+ * below keys off.
+ *
+ * Interaction convention (from oikos-care-web): `hover:bg-hover` / `hover:bg-hover-strong` are
+ * TRANSIENT feedback; `bg-accent` / `bg-muted` mark a PERSISTENT selected state. Mixing them
+ * makes a hovered row indistinguishable from the selected one.
+ */
+
+@custom-variant dark (&:is(.dark *));
+@custom-variant pointer-fine (@media (pointer: fine));
+
+:root {
+	--palette-white: oklch(1 0 0);
+	--palette-neutral-25: oklch(0.99 0.002 260);
+	--palette-neutral-50: oklch(0.975 0.003 260);
+	--palette-neutral-100: oklch(0.955 0.005 260);
+	--palette-neutral-200: oklch(0.915 0.007 260);
+	--palette-neutral-300: oklch(0.86 0.009 260);
+	--palette-neutral-400: oklch(0.7 0.014 260);
+	--palette-neutral-500: oklch(0.58 0.016 260);
+	--palette-neutral-600: oklch(0.48 0.018 260);
+	--palette-neutral-700: oklch(0.38 0.018 260);
+	--palette-neutral-800: oklch(0.26 0.016 260);
+	--palette-neutral-900: oklch(0.19 0.014 260);
+	--palette-neutral-950: oklch(0.14 0.012 260);
+
+	--palette-brand-100: oklch(0.93 0.045 250);
+	--palette-brand-300: oklch(0.78 0.11 250);
+	--palette-brand-500: oklch(0.58 0.17 250);
+	--palette-brand-600: oklch(0.52 0.17 250);
+	--palette-brand-700: oklch(0.45 0.15 250);
+
+	--palette-danger-100: oklch(0.94 0.04 25);
+	--palette-danger-500: oklch(0.58 0.2 25);
+	--palette-danger-600: oklch(0.52 0.2 25);
+
+	--palette-success-100: oklch(0.94 0.05 150);
+	--palette-success-500: oklch(0.6 0.14 150);
+
+	--palette-warning-100: oklch(0.95 0.06 85);
+	--palette-warning-500: oklch(0.72 0.14 70);
+
+	/* Semantic roles — light */
+	--role-canvas: var(--palette-neutral-50);
+	--role-surface: var(--palette-white);
+	--role-surface-raised: var(--palette-white);
+	--role-sidebar: var(--palette-neutral-25);
+	--role-border: var(--palette-neutral-200);
+	--role-border-strong: var(--palette-neutral-300);
+	--role-foreground: var(--palette-neutral-900);
+	--role-muted-foreground: var(--palette-neutral-600);
+	--role-subtle-foreground: var(--palette-neutral-500);
+	--role-hover: var(--palette-neutral-100);
+	--role-hover-strong: var(--palette-neutral-200);
+	--role-muted: var(--palette-neutral-100);
+	--role-accent: var(--palette-brand-100);
+	--role-accent-foreground: var(--palette-brand-700);
+	--role-primary: var(--palette-brand-600);
+	--role-primary-hover: var(--palette-brand-700);
+	--role-primary-foreground: var(--palette-white);
+	--role-danger: var(--palette-danger-600);
+	--role-danger-hover: var(--palette-danger-500);
+	--role-danger-foreground: var(--palette-white);
+	--role-danger-subtle: var(--palette-danger-100);
+	--role-success: var(--palette-success-500);
+	--role-success-subtle: var(--palette-success-100);
+	--role-warning: var(--palette-warning-500);
+	--role-warning-subtle: var(--palette-warning-100);
+	--role-ring: var(--palette-brand-500);
+	--role-overlay: oklch(0.19 0.014 260 / 0.45);
+
+	--shadow-raised: 0 1px 2px oklch(0.19 0.014 260 / 0.06), 0 1px 3px oklch(0.19 0.014 260 / 0.08);
+	--shadow-overlay:
+		0 10px 30px oklch(0.19 0.014 260 / 0.14), 0 2px 8px oklch(0.19 0.014 260 / 0.08);
+	--shadow-popover: 0 6px 20px oklch(0.19 0.014 260 / 0.12);
+
+	--motion-fast: 120ms;
+	--motion-base: 180ms;
+	--motion-slow: 260ms;
+	--ease-standard: cubic-bezier(0.2, 0, 0, 1);
+	--ease-emphasized: cubic-bezier(0.3, 0, 0, 1);
+}
+
+.dark {
+	--role-canvas: var(--palette-neutral-950);
+	--role-surface: var(--palette-neutral-900);
+	--role-surface-raised: var(--palette-neutral-800);
+	--role-sidebar: var(--palette-neutral-950);
+	--role-border: oklch(1 0 0 / 0.1);
+	--role-border-strong: oklch(1 0 0 / 0.18);
+	--role-foreground: var(--palette-neutral-50);
+	--role-muted-foreground: var(--palette-neutral-400);
+	--role-subtle-foreground: var(--palette-neutral-500);
+	--role-hover: oklch(1 0 0 / 0.06);
+	--role-hover-strong: oklch(1 0 0 / 0.11);
+	--role-muted: oklch(1 0 0 / 0.05);
+	--role-accent: oklch(0.58 0.17 250 / 0.22);
+	--role-accent-foreground: var(--palette-brand-300);
+	--role-primary: var(--palette-brand-500);
+	--role-primary-hover: var(--palette-brand-600);
+	--role-primary-foreground: var(--palette-white);
+	--role-danger: var(--palette-danger-500);
+	--role-danger-hover: var(--palette-danger-600);
+	--role-danger-foreground: var(--palette-white);
+	--role-danger-subtle: oklch(0.58 0.2 25 / 0.2);
+	--role-success-subtle: oklch(0.6 0.14 150 / 0.2);
+	--role-warning-subtle: oklch(0.72 0.14 70 / 0.2);
+	--role-overlay: oklch(0.1 0.01 260 / 0.65);
+
+	--shadow-raised: 0 1px 2px oklch(0 0 0 / 0.4);
+	--shadow-overlay: 0 10px 30px oklch(0 0 0 / 0.55), 0 2px 8px oklch(0 0 0 / 0.4);
+	--shadow-popover: 0 6px 20px oklch(0 0 0 / 0.5);
+}
+
+@theme inline {
+	--color-canvas: var(--role-canvas);
+	--color-surface: var(--role-surface);
+	--color-surface-raised: var(--role-surface-raised);
+	--color-sidebar: var(--role-sidebar);
+	--color-border: var(--role-border);
+	--color-border-strong: var(--role-border-strong);
+	--color-foreground: var(--role-foreground);
+	--color-muted-foreground: var(--role-muted-foreground);
+	--color-subtle-foreground: var(--role-subtle-foreground);
+	--color-hover: var(--role-hover);
+	--color-hover-strong: var(--role-hover-strong);
+	--color-muted: var(--role-muted);
+	--color-accent: var(--role-accent);
+	--color-accent-foreground: var(--role-accent-foreground);
+	--color-primary: var(--role-primary);
+	--color-primary-hover: var(--role-primary-hover);
+	--color-primary-foreground: var(--role-primary-foreground);
+	--color-danger: var(--role-danger);
+	--color-danger-hover: var(--role-danger-hover);
+	--color-danger-foreground: var(--role-danger-foreground);
+	--color-danger-subtle: var(--role-danger-subtle);
+	--color-success: var(--role-success);
+	--color-success-subtle: var(--role-success-subtle);
+	--color-warning: var(--role-warning);
+	--color-warning-subtle: var(--role-warning-subtle);
+	--color-ring: var(--role-ring);
+	--color-overlay: var(--role-overlay);
+
+	--shadow-raised: var(--shadow-raised);
+	--shadow-overlay: var(--shadow-overlay);
+	--shadow-popover: var(--shadow-popover);
+
+	--font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+	--font-mono: var(--font-geist-mono), ui-monospace, "SF Mono", monospace;
+
+	--radius-field: 0.5rem;
+	--radius-panel: 0.75rem;
+}
+
+@layer base {
+	* {
+		border-color: var(--color-border);
+	}
+
+	html {
+		color-scheme: light;
+	}
+
+	html.dark {
+		color-scheme: dark;
+	}
+
+	body {
+		background-color: var(--color-canvas);
+		color: var(--color-foreground);
+		-webkit-font-smoothing: antialiased;
+		text-rendering: optimizeLegibility;
+	}
+
+	/*
+	 * Digits in call durations, extension numbers and CDR tables must not shift width between
+	 * renders — this is a phone system, columns of numbers are the whole product.
+	 */
+	table,
+	[data-tabular] {
+		font-variant-numeric: tabular-nums;
+	}
+
+	:focus-visible {
+		outline: 2px solid var(--color-ring);
+		outline-offset: 2px;
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		*,
+		*::before,
+		*::after {
+			animation-duration: 0.01ms !important;
+			animation-iteration-count: 1 !important;
+			transition-duration: 0.01ms !important;
+		}
+	}
+}

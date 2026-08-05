@@ -1,0 +1,24 @@
+{
+	"extends": "../../tsconfig.base.json",
+	"compilerOptions": {
+		"lib": ["ESNext", "DOM", "DOM.Iterable"],
+		"types": ["bun"],
+		"jsx": "preserve",
+		"module": "esnext",
+		"moduleResolution": "bundler",
+		"noEmit": true,
+		"allowJs": true,
+		"incremental": true,
+		"emitDecoratorMetadata": false,
+		"experimentalDecorators": false,
+		"sourceMap": false,
+		"verbatimModuleSyntax": true,
+		"noUncheckedIndexedAccess": true,
+		"paths": {
+			"~/*": ["./*"]
+		},
+		"plugins": [{ "name": "next" }]
+	},
+	"include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+	"exclude": ["node_modules", ".next", "out"]
+}

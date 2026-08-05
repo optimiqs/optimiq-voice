@@ -1,0 +1,56 @@
+{
+	"name": "@optimiq-voice/web",
+	"version": "0.1.0",
+	"description": "Optimiq Voice admin — Next.js 16 app router frontend",
+	"license": "MIT",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"build": "pnpm run codegen && next build",
+		"clean": "rimraf .next node_modules tsconfig.tsbuildinfo",
+		"codegen": "tsx scripts/sync-permissions.ts",
+		"codegen:check": "tsx scripts/sync-permissions.ts --check",
+		"dev": "next dev --port 3100",
+		"start": "next start --port 3100",
+		"test": "bun test",
+		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"smoke": "tsx scripts/smoke-auth-flow.ts"
+	},
+	"dependencies": {
+		"@base-ui/react": "catalog:",
+		"@better-auth/api-key": "catalog:",
+		"@tanstack/react-form": "catalog:",
+		"@tanstack/react-query": "catalog:",
+		"@tanstack/react-table": "catalog:",
+		"better-auth": "catalog:",
+		"class-variance-authority": "catalog:",
+		"clsx": "catalog:",
+		"date-fns": "catalog:",
+		"next": "catalog:",
+		"next-themes": "catalog:",
+		"nuqs": "catalog:",
+		"react": "catalog:",
+		"react-dom": "catalog:",
+		"sonner": "catalog:",
+		"tailwind-merge": "catalog:",
+		"zod": "catalog:",
+		"zustand": "catalog:"
+	},
+	"devDependencies": {
+		"@optimiq-voice/auth": "workspace:*",
+		"@tailwindcss/postcss": "catalog:",
+		"@tanstack/react-query-devtools": "catalog:",
+		"@types/bun": "catalog:",
+		"@types/react": "catalog:",
+		"@types/react-dom": "catalog:",
+		"rimraf": "6.1.3",
+		"tailwindcss": "catalog:",
+		"tsx": "4.22.4",
+		"tw-animate-css": "catalog:",
+		"typescript": "^5.9.3"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/optimiqs/optimiq-voice.git"
+	}
+}

@@ -34,6 +34,8 @@
 		"**/.nx/**",
 		"**/coverage/**",
 		"**/generated/**",
+		"**/*.generated.*",
+		"**/.next/**",
 		"**/drizzle/**",
 		"**/migrations/**",
 		"**/public/**",
