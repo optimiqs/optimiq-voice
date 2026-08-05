@@ -7,6 +7,14 @@ linkWorkspacePackages: false
 saveWorkspaceProtocol: rolling
 injectWorkspacePackages: false
 
+# drizzle-kit imports drizzle-orm internals but does not declare it, so it would resolve the
+# legacy 0.45.2 hoisted at the repository root instead of the importer's pinned version.
+# Declaring the peer makes pnpm link the drizzle-orm each consumer actually depends on.
+packageExtensions:
+  drizzle-kit:
+    peerDependencies:
+      drizzle-orm: "*"
+
 onlyBuiltDependencies:
   - core-js-pure
   - esbuild
@@ -78,3 +86,48 @@ allowBuilds:
   protoc-gen-grpc-web: true
   protoc-gen-js: true
   sharp: true
+
+# Pinned dependency catalog (oikos-care conventions; see plans/reference/oikos-conventions.md)
+catalog:
+  effect: 4.0.0-beta.83
+  "@effect/sql-pg": 4.0.0-beta.83
+  "@effect/language-service": 0.86.2
+  drizzle-orm: 1.0.0-rc.4
+  drizzle-kit: 1.0.0-rc.4
+  "@nestjs/common": ^11.1.19
+  "@nestjs/core": ^11.1.19
+  "@nestjs/testing": ^11.1.19
+  "@nestjs/platform-fastify": ^11.1.28
+  "@nestjs/throttler": ^6.5.0
+  fastify: ^5.8.5
+  class-validator: ^0.14.3
+  class-transformer: ^0.5.1
+  reflect-metadata: ^0.2.2
+  rxjs: ^7.8.2
+  zod: ^4.4.3
+  jose: ^6.1.3
+  uuid: 11.1.1
+  nanoid: ^5.1.6
+  better-auth: 1.6.23
+  # better-auth 1.6.x ships the API-key plugin as a separate package; these are its
+  # declared peers, pinned so packages/auth resolves the exact same instances as better-auth.
+  "@better-auth/api-key": 1.6.23
+  "@better-auth/core": 1.6.23
+  "@better-auth/utils": 0.4.2
+  better-call: 1.3.7
+  pg: ^8.20.0
+  postgres: ^3.4.8
+  "@types/pg": ^8.16.0
+  nats: ^2.29.3
+  pino: ^9.13.1
+  pino-pretty: ^13.0.0
+  "@sentry/nestjs": ^10.39.0
+  libphonenumber-js: ^1.12.34
+  lru-cache: ^11.2.4
+  dotenv: ^17.2.3
+  "@types/bun": ^1.3.13
+  supertest: ^7.2.2
+  "@types/supertest": ^6.0.3
+
+overrides:
+  effect: 4.0.0-beta.83

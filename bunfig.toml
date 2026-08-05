@@ -1,0 +1,14 @@
+# Bun runtime + test configuration for the ESM/strict packages
+# (packages/{identifiers,config,logging,effect-runtime} and everything built on them).
+#
+# reflect-metadata must be preloaded before any NestJS decorator is evaluated,
+# otherwise `emitDecoratorMetadata` output throws at class-definition time.
+
+[run]
+silent = false
+preload = ["reflect-metadata"]
+
+[test]
+coverage = false
+coverageReporter = ["text", "lcov"]
+preload = ["reflect-metadata"]

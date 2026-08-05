@@ -1,0 +1,38 @@
+{
+	"$schema": "https://raw.githubusercontent.com/Effect-TS/language-service/refs/heads/main/schema.json",
+	"compilerOptions": {
+		"lib": ["ESNext", "DOM"],
+		"types": ["bun"],
+		"module": "preserve",
+		"target": "ES2022",
+		"moduleResolution": "bundler",
+		"moduleDetection": "force",
+		"jsx": "react-jsx",
+		"resolveJsonModule": true,
+		"esModuleInterop": true,
+		"isolatedModules": true,
+		"declaration": false,
+		"declarationMap": false,
+		"removeComments": true,
+		"emitDecoratorMetadata": true,
+		"experimentalDecorators": true,
+		"allowSyntheticDefaultImports": true,
+		"sourceMap": true,
+		"incremental": false,
+		"skipLibCheck": true,
+		"strict": true,
+		"strictNullChecks": true,
+		"noImplicitAny": true,
+		"strictBindCallApply": true,
+		"strictPropertyInitialization": false,
+		"forceConsistentCasingInFileNames": true,
+		"noFallthroughCasesInSwitch": true,
+		"useDefineForClassFields": false,
+		"composite": false,
+		"plugins": [
+			{
+				"name": "@effect/language-service"
+			}
+		]
+	}
+}
