@@ -1,0 +1,51 @@
+{
+	"name": "@optimiq-voice/auth",
+	"version": "0.1.0",
+	"description": "better-auth composition, session/organization helpers and the Optimiq Voice permission registry",
+	"license": "MIT",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./src/index.ts",
+	"exports": {
+		".": {
+			"types": "./src/index.ts",
+			"default": "./dist/index.js"
+		},
+		"./permissions": {
+			"types": "./src/permissions.ts",
+			"default": "./dist/permissions.js"
+		},
+		"./schema": {
+			"types": "./src/schema.ts",
+			"default": "./dist/schema.js"
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/optimiqs/optimiq-voice.git"
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json && node ../../.scripts/rewrite-esm-specifiers.mjs",
+		"clean": "rimraf ./dist",
+		"test": "bun test src",
+		"typecheck": "tsc -p tsconfig.json --noEmit"
+	},
+	"dependencies": {
+		"@better-auth/api-key": "catalog:",
+		"@better-auth/core": "catalog:",
+		"@better-auth/utils": "catalog:",
+		"@optimiq-voice/db": "workspace:*",
+		"@optimiq-voice/identifiers": "workspace:*",
+		"better-auth": "catalog:",
+		"better-call": "catalog:",
+		"drizzle-orm": "catalog:"
+	},
+	"devDependencies": {
+		"@types/bun": "catalog:",
+		"postgres": "catalog:",
+		"typescript": "^5.9.3"
+	}
+}

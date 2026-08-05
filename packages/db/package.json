@@ -1,0 +1,55 @@
+{
+	"name": "@optimiq-voice/db",
+	"version": "0.1.0",
+	"description": "Base database package for Optimiq Voice: schema primitives, tenant RLS wrappers, preflight harness and the auth schema journal",
+	"license": "MIT",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./src/index.ts",
+	"exports": {
+		".": {
+			"types": "./src/index.ts",
+			"default": "./dist/index.js"
+		},
+		"./schema": {
+			"types": "./src/schema/index.ts",
+			"default": "./dist/schema/index.js"
+		},
+		"./schema/auth": {
+			"types": "./src/schema/auth/index.ts",
+			"default": "./dist/schema/auth/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"drizzle"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/optimiqs/optimiq-voice.git"
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json && node ../../.scripts/rewrite-esm-specifiers.mjs",
+		"clean": "rimraf ./dist",
+		"db:check": "drizzle-kit check --config drizzle.config.ts",
+		"db:generate": "drizzle-kit generate --config drizzle.config.ts",
+		"db:migrate": "bun run scripts/migrate.ts --expected-stage development",
+		"db:migrate:production": "bun run scripts/migrate.ts --expected-stage production",
+		"db:migrate:staging": "bun run scripts/migrate.ts --expected-stage staging",
+		"db:migrate:test": "bun run scripts/migrate.ts --expected-stage test",
+		"db:preflight:tenant-rls": "bun run scripts/tenant-rls-preflight.ts",
+		"test": "bun test src",
+		"typecheck": "tsc -p tsconfig.json --noEmit"
+	},
+	"dependencies": {
+		"@optimiq-voice/identifiers": "workspace:*",
+		"drizzle-orm": "catalog:",
+		"effect": "catalog:",
+		"postgres": "catalog:"
+	},
+	"devDependencies": {
+		"@types/bun": "catalog:",
+		"drizzle-kit": "catalog:",
+		"typescript": "^5.9.3"
+	}
+}
