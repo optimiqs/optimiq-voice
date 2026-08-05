@@ -1,0 +1,42 @@
+{
+	"name": "@optimiq-voice/events",
+	"version": "0.1.0",
+	"description": "NATS backbone contract package for Optimiq Voice: versioned subject taxonomy, Zod event schemas, and JetStream stream / KV bucket definitions as declarative config",
+	"license": "MIT",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./src/index.ts",
+	"exports": {
+		".": {
+			"types": "./src/index.ts",
+			"default": "./dist/index.js"
+		},
+		"./schemas": {
+			"types": "./src/schemas/index.ts",
+			"default": "./dist/schemas/index.js"
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/optimiqs/optimiq-voice.git"
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json && node ../../.scripts/rewrite-esm-specifiers.mjs",
+		"clean": "rimraf ./dist",
+		"test": "bun test src",
+		"test:integration": "RUN_NATS_INTEGRATION_TESTS=true bun test src --max-concurrency 1",
+		"typecheck": "tsc -p tsconfig.json --noEmit"
+	},
+	"dependencies": {
+		"@optimiq-voice/identifiers": "workspace:*",
+		"nats": "catalog:",
+		"zod": "catalog:"
+	},
+	"devDependencies": {
+		"@types/bun": "catalog:",
+		"typescript": "^5.9.3"
+	}
+}

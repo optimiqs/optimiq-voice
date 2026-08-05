@@ -1,0 +1,97 @@
+/**
+ * `@optimiq-voice/events` — the NATS backbone CONTRACT package (plan §3.5).
+ *
+ * Contains: the versioned subject taxonomy, the Zod schema for every subject's payload, the
+ * JetStream stream and KV bucket definitions as declarative config, and pure helpers to build,
+ * parse and validate against them.
+ *
+ * Contains NO client code. Applications wire transport themselves — NestJS `ClientsModule` /
+ * `@EventPattern` / `@MessagePattern` over the NATS transport for events and request-reply, and
+ * the raw `nats` JetStream API where a durable consumer or a KV bucket is genuinely needed, using
+ * the definitions exported here.
+ */
+
+export { EventValidationError, UnknownEventSubjectError, validationErrorFrom } from "./errors";
+export * from "./schemas/index";
+export {
+	AGENT_STATE_KV,
+	assertStreamCompatible,
+	AUDIT_STREAM,
+	CALLS_STREAM,
+	CDR_STREAM,
+	CHANNELS_KV,
+	ensureKvBuckets,
+	ensureStreams,
+	EVENT_STREAMS,
+	isStreamNotFoundError,
+	KV_BUCKETS,
+	kvKeyFor,
+	kvOptionsFor,
+	millisToNanos,
+	nanosToMillis,
+	PRESENCE_KV,
+	PROVISION_STREAM,
+	QUEUES_STREAM,
+	REGISTRATIONS_KV,
+	REGISTRATIONS_STREAM,
+	ROUTING_CACHE_KV,
+	STREAM_SUBJECT_ROOTS,
+	StreamDefinitionConflictError,
+	streamConfigFor,
+	streamNeedsUpdate,
+	streamUpdateConfigFor,
+	withReplicas,
+	type DiscardPolicyName,
+	type EnsureAction,
+	type EnsureKvOutcome,
+	type EnsureStreamOutcome,
+	type KvBucketDefinition,
+	type KvOptionsInput,
+	type RetentionPolicyName,
+	type StorageTypeName,
+	type StreamConfigInput,
+	type StreamConfigSnapshot,
+	type StreamDefinition,
+} from "./streams";
+export {
+	aorSubjectToken,
+	CALL_EVENTS,
+	EVENT_FAMILIES,
+	eventFamilyForSubject,
+	isCallEvent,
+	isEventName,
+	isQueueEvent,
+	isRegistrationEvent,
+	isSubjectToken,
+	matchesSubject,
+	parseSubject,
+	parseSubjectOrThrow,
+	QUEUE_EVENTS,
+	QUEUE_SCOPE_ALL,
+	REGISTRATION_EVENTS,
+	RPC_SUBJECTS,
+	SUBJECT_ROOTS,
+	SUBJECT_VERSION,
+	subjectFilterFor,
+	subjectFor,
+	SubjectTokenError,
+	UnknownSubjectError,
+	type CallEvent,
+	type EventFamily,
+	type ParsedSubject,
+	type QueueEvent,
+	type RegistrationEvent,
+} from "./subjects";
+export {
+	anyEventSchema,
+	EVENT_SCHEMAS_BY_FAMILY,
+	eventSchemaForSubject,
+	safeValidateEvent,
+	validateEvent,
+	validateEventOfFamily,
+	type AnyEventEnvelope,
+	type EventEnvelopeOfFamily,
+	type EventSchemasByFamily,
+	type ValidateEventOptions,
+	type ValidateEventResult,
+} from "./validate";
