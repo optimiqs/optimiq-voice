@@ -7,12 +7,24 @@ export {
 	withResolvedAccess,
 } from "./app-session";
 export {
+	API_KEY_HEADER,
+	API_KEY_MEMBERSHIP_ROLE,
+	API_KEY_PRINCIPAL_ROLE,
 	AUTH_ROUTE_PREFIX,
 	type AuthHttpServer,
+	createApiKeySessionResolver,
 	registerAuthHttp,
 	registerAuthRoutes,
 	registerSessionHook,
 } from "./auth-http.plugin";
+export {
+	AuthRuntimeUnavailableError,
+	type AuthRuntimeHandle,
+	clearAuthRuntime,
+	getAuthRuntime,
+	publishAuthRuntime,
+	requireAuthRuntime,
+} from "./auth-platform.registry";
 export {
 	AuthConfigurationFailure,
 	type AuthSliceConfig,
@@ -39,7 +51,12 @@ export {
 	type ResolvedAccess,
 	type SessionOverview,
 } from "./auth.service";
-export { AUTH_PLATFORM, AUTH_REPOSITORY } from "./auth.tokens";
+export { AUTH_LEGACY_ACCESS_KEYS, AUTH_PLATFORM, AUTH_REPOSITORY } from "./auth.tokens";
+export {
+	createLegacyAccessKeyRepository,
+	type LegacyAccessKeyRepository,
+	UnmappedAccessKeyError,
+} from "./legacy-access-key.repository";
 export {
 	buildCallAccessTokenClaims,
 	CALL_TOKEN_AUDIENCE,

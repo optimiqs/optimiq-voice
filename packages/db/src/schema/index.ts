@@ -20,3 +20,4 @@ export {
 	user,
 	verification,
 } from "./auth/index";
+export { legacyUserAccount, legacyWorkspaceOrganization } from "./legacy/index";

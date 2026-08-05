@@ -1,9 +1,14 @@
 import { Inject, Module, type OnApplicationShutdown } from "@nestjs/common";
 import { APP_GUARD } from "@nestjs/core";
+import { clearAuthRuntime, publishAuthRuntime } from "./auth-platform.registry";
 import { type AuthPlatform, createAuthPlatform } from "./auth.platform";
 import { AuthService } from "./auth.service";
-import { AUTH_PLATFORM, AUTH_REPOSITORY } from "./auth.tokens";
+import { AUTH_LEGACY_ACCESS_KEYS, AUTH_PLATFORM, AUTH_REPOSITORY } from "./auth.tokens";
 import { CallTokenService } from "./call-token.service";
+import {
+	createLegacyAccessKeyRepository,
+	type LegacyAccessKeyRepository,
+} from "./legacy-access-key.repository";
 import { MeController } from "./me.controller";
 import { OrganizationsController } from "./organizations.controller";
 import { RequirePermissionsGuard } from "./require-permissions.guard";
@@ -29,18 +34,39 @@ import { RequirePermissionsGuard } from "./require-permissions.guard";
 			useFactory: (platform: AuthPlatform) => platform.repository,
 			inject: [AUTH_PLATFORM],
 		},
+		{
+			provide: AUTH_LEGACY_ACCESS_KEYS,
+			useFactory: (platform: AuthPlatform) => createLegacyAccessKeyRepository(platform),
+			inject: [AUTH_PLATFORM],
+		},
 		AuthService,
 		CallTokenService,
 		RequirePermissionsGuard,
 		{ provide: APP_GUARD, useExisting: RequirePermissionsGuard },
 	],
-	exports: [AUTH_PLATFORM, AUTH_REPOSITORY, AuthService, CallTokenService, RequirePermissionsGuard],
+	exports: [
+		AUTH_PLATFORM,
+		AUTH_REPOSITORY,
+		AUTH_LEGACY_ACCESS_KEYS,
+		AuthService,
+		CallTokenService,
+		RequirePermissionsGuard,
+	],
 })
 export class AuthModule implements OnApplicationShutdown {
-	constructor(@Inject(AUTH_PLATFORM) private readonly platform: AuthPlatform) {}
+	constructor(
+		@Inject(AUTH_PLATFORM) private readonly platform: AuthPlatform,
+		@Inject(AUTH_LEGACY_ACCESS_KEYS) legacyAccessKeys: LegacyAccessKeyRepository,
+	) {
+		// The ARI dispatcher and the gRPC servers are started by `RuntimeHostService`, outside the
+		// Nest container, and identity-removal Step 4 item 4 mints per-call tokens there. See
+		// `auth-platform.registry.ts` for why this seam exists and when it dies.
+		publishAuthRuntime({ platform: this.platform, legacyAccessKeys });
+	}
 
 	/** The slice owns its postgres pool, so shutdown is deterministic instead of process-exit. */
 	async onApplicationShutdown(): Promise<void> {
+		clearAuthRuntime();
 		await this.platform.close();
 	}
 }

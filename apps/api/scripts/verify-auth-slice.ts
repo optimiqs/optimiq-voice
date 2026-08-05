@@ -105,6 +105,27 @@ async function request(
 	return { status: response.status, body };
 }
 
+/** `request`, but with explicit headers instead of a cookie jar — for `x-api-key` callers. */
+async function requestWithHeaders(
+	baseUrl: string,
+	method: string,
+	path: string,
+	headers: Record<string, string>,
+): Promise<JsonResponse> {
+	const response = await fetch(`${baseUrl}${path}`, {
+		method,
+		headers: { accept: "application/json", ...headers },
+	});
+	const text = await response.text();
+	let body: unknown = null;
+	try {
+		body = text.length > 0 ? JSON.parse(text) : null;
+	} catch {
+		// Non-JSON responses are reported verbatim.
+	}
+	return { status: response.status, body };
+}
+
 function field(value: unknown, key: string): unknown {
 	return typeof value === "object" && value !== null
 		? (value as Record<string, unknown>)[key]
@@ -483,6 +504,97 @@ async function main(): Promise<void> {
 			bogusRole.status >= 400,
 			`status ${bogusRole.status}`,
 		);
+		// --- 14. x-api-key becomes a tenant-scoped session -------------------------------------
+		//
+		// The Step 3 blocker: `@better-auth/api-key` refuses to promote a key into a session unless
+		// it references a USER, and `packages/auth` deliberately configures
+		// `references: "organization"`. `auth-http.plugin.ts` resolves the key explicitly instead
+		// (the plan's recommended option (a)). This section proves the whole path over real HTTP.
+		console.log("14. x-api-key authenticates as the organization");
+		const createdKey = await request(baseUrl, "POST", "/api/auth/api-key/create", {
+			jar: ownerJar,
+			// `references: "organization"` makes `organizationId` mandatory on this endpoint
+			// (`@better-auth/api-key` dist/index.mjs:739): the key belongs to the tenant, and the
+			// caller's `organization.apikey.create` permission is checked against it.
+			body: { name: `verify-${RUN_ID}`, organizationId },
+		});
+		check(
+			"an organization-scoped API key can be created",
+			createdKey.status === 200,
+			`status ${createdKey.status}`,
+		);
+		const apiKeySecret = asString(field(createdKey.body, "key"));
+		check("the created key is returned once, in full", apiKeySecret.length > 0);
+		check(
+			"the key references the organization, not the creator",
+			asString(field(createdKey.body, "referenceId")) === organizationId,
+			asString(field(createdKey.body, "referenceId")),
+		);
+
+		if (apiKeySecret) {
+			const keyMe = await requestWithHeaders(baseUrl, "GET", "/api/v1/me", {
+				"x-api-key": apiKeySecret,
+			});
+			check("x-api-key alone resolves a session", keyMe.status === 200, `status ${keyMe.status}`);
+			check(
+				"the session is scoped to the key's organization",
+				asString(field(field(keyMe.body, "activeOrganization"), "id")) === organizationId,
+			);
+			check(
+				"the key acts as admin, not owner",
+				asString(field(keyMe.body, "role")) === "admin",
+				asString(field(keyMe.body, "role")),
+			);
+			check(
+				"the key is not mistaken for a person",
+				asString(field(field(keyMe.body, "user"), "email")) === "",
+			);
+
+			const keyMembers = await requestWithHeaders(
+				baseUrl,
+				"GET",
+				`/api/v1/organizations/${organizationId}/members`,
+				{ "x-api-key": apiKeySecret },
+			);
+			check(
+				"a permission-guarded route accepts the key",
+				keyMembers.status === 200,
+				`status ${keyMembers.status}`,
+			);
+
+			// The cross-tenant gate (Step 3 item 5) on the surface that can carry it today: the
+			// key's tenant comes from `referenceId`, so another organization's id is refused even
+			// though the caller is authenticated.
+			const otherOrganizationId = "019fd3c2-dead-76be-a6b3-b0f1914e39b6";
+			const crossTenant = await requestWithHeaders(
+				baseUrl,
+				"GET",
+				`/api/v1/organizations/${otherOrganizationId}/members`,
+				{ "x-api-key": apiKeySecret },
+			);
+			check(
+				"a cross-tenant read is refused for an API key",
+				crossTenant.status === 403 || crossTenant.status === 404,
+				`status ${crossTenant.status}`,
+			);
+
+			const crossTenantCookie = await request(
+				baseUrl,
+				"GET",
+				`/api/v1/organizations/${otherOrganizationId}/members`,
+				{ jar: ownerJar },
+			);
+			check(
+				"a cross-tenant read is refused for a session cookie",
+				crossTenantCookie.status === 403 || crossTenantCookie.status === 404,
+				`status ${crossTenantCookie.status}`,
+			);
+
+			const forgedKey = await requestWithHeaders(baseUrl, "GET", "/api/v1/me", {
+				"x-api-key": `${apiKeySecret.slice(0, -1)}${apiKeySecret.endsWith("a") ? "b" : "a"}`,
+			});
+			check("a tampered key is refused", forgedKey.status === 401, `status ${forgedKey.status}`);
+		}
 	} finally {
 		console.log("\ncleaning up");
 		try {

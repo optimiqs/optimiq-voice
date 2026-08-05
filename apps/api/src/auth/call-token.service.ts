@@ -8,13 +8,19 @@ import {
 } from "./call-token.claims";
 
 /**
- * Per-call access tokens minted by better-auth's jwt plugin (identity-removal Step 4, additive).
+ * Per-call access tokens minted by better-auth's jwt plugin (identity-removal Step 4).
  *
  * The claim contract lives in `call-token.claims.ts`; this file is only the signing adapter.
  *
- * NOTHING CALLS THIS ON THE LIVE CALL PATH YET. `src/voice/createCreateVoiceClient.ts` still uses
- * the identity signer; swapping it over is gated on `packages/voice/src/VoiceServer.ts` verifying
- * through JWKS instead of `getPublicKey`. See `plans/identity-removal.md` Step 4.
+ * **This is the live call path** as of Step 4 item 4: `src/voice/createCreateVoiceClient.ts` calls
+ * `createCallAccessTokenMinter` for every inbound call, and `packages/voice` verifies the result
+ * against `/api/auth/jwks`. The identity signer (`createGenerateCallAccessToken`, RS256 over
+ * `.keys/private.pem`) has no callers left.
+ *
+ * Two entry points, deliberately: `CallTokenService` for anything Nest constructs, and the bare
+ * `createCallAccessTokenMinter(platform)` closure for the ARI dispatcher, which is started by
+ * `RuntimeHostService` outside the container and reaches the platform through
+ * `auth-platform.registry.ts`.
  */
 
 /**

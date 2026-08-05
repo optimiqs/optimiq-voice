@@ -57,6 +57,23 @@ export class AuthService {
 			return { organizationId: null, role: null, permissions: [] };
 		}
 
+		/*
+		 * A role already on the session is authoritative and skips the membership lookup.
+		 *
+		 * This is not a cache — it is how a principal that has no `member` row is represented. An
+		 * `x-api-key` caller is a TENANT principal (`references: "organization"`), so
+		 * `auth-http.plugin.ts` stamps the role the key acts with when it synthesises the session
+		 * and there is nothing in `member` to look up. Cookie and bearer sessions never carry it,
+		 * so their path is unchanged.
+		 */
+		if (session.activeOrganizationRole) {
+			return {
+				organizationId,
+				role: session.activeOrganizationRole,
+				permissions: resolveRolePermissions(session.activeOrganizationRole),
+			};
+		}
+
 		const membership = await this.repository.findMembership(session.user.id, organizationId);
 		if (!membership) {
 			return { organizationId, role: null, permissions: [] };
@@ -126,18 +143,44 @@ export class AuthService {
 		session: AppSession,
 		required: Permission,
 	): Promise<readonly OrganizationMemberSummary[]> {
-		if (organizationId.trim().length === 0) {
-			throw new NoActiveOrganizationException();
-		}
-
-		const membership = await this.repository.findMembership(session.user.id, organizationId);
-		if (!membership) {
-			throw new NoActiveOrganizationException();
-		}
-		if (!hasPermission(resolveRolePermissions(membership.role), required)) {
+		const role = await this.resolveRoleIn(organizationId, session);
+		if (!hasPermission(resolveRolePermissions(role), required)) {
 			throw new MissingPermissionException([required]);
 		}
 
 		return await this.repository.listMembers(organizationId);
+	}
+
+	/**
+	 * The caller's role in a **requested** organization — the cross-tenant gate.
+	 *
+	 * Deliberately not read from `session.activeOrganizationId`: an org-scoped route takes the
+	 * organization from the path, so it has to be re-authorized rather than assumed. Two principal
+	 * kinds, one rule ("prove you belong to the organization you asked for"):
+	 *
+	 * - **user principals** (cookie, bearer) — re-read the `member` row, so a member removed from
+	 *   an organization loses access on the very next request rather than at session refresh;
+	 * - **tenant principals** (`x-api-key`) — there is no `member` row to read. The tenant comes
+	 *   from the key's `referenceId`, which the caller cannot influence, so the check is that the
+	 *   requested organization IS that one.
+	 */
+	private async resolveRoleIn(organizationId: string, session: AppSession): Promise<string> {
+		const requested = organizationId.trim();
+		if (requested.length === 0) {
+			throw new NoActiveOrganizationException();
+		}
+
+		if (session.activeOrganizationRole) {
+			if (getActiveOrganizationId(session) !== requested) {
+				throw new NoActiveOrganizationException();
+			}
+			return session.activeOrganizationRole;
+		}
+
+		const membership = await this.repository.findMembership(session.user.id, requested);
+		if (!membership) {
+			throw new NoActiveOrganizationException();
+		}
+		return membership.role;
 	}
 }

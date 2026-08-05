@@ -118,6 +118,20 @@ export interface DatabaseClient {
 	 * go through {@link TenantDatabaseClient.withTenantScope}.
 	 */
 	readonly adminDb: AdminDatabase;
+	/**
+	 * The postgres.js pool `adminDb` is built on, shared rather than duplicated.
+	 *
+	 * Exposed for the narrow case where a consumer in another workspace package must issue SQL
+	 * against this database without crossing a Drizzle *type* boundary. pnpm resolves
+	 * `drizzle-orm` once per distinct peer set, so a table object built in this package and an
+	 * `eq()` imported in `apps/api` can be structurally identical yet nominally incompatible;
+	 * `postgres` has a single instance, so this handle does not have that problem.
+	 *
+	 * Same contract as {@link DatabaseClient.adminDb}: untenanted, bypasses row-level security,
+	 * correct only for migrations, tooling and platform-global tables. Tenant-scoped work goes
+	 * through `withTenantTransaction`.
+	 */
+	readonly client: postgres.Sql;
 	readonly guardrails: PostgresRuntimeGuardrails;
 	readonly checkConnection: () => Promise<void>;
 	readonly close: () => Promise<void>;
@@ -129,6 +143,7 @@ export function createDatabaseClient(options: DatabaseClientOptions): DatabaseCl
 	const adminDb = drizzle({ client });
 	return {
 		adminDb,
+		client,
 		guardrails,
 		checkConnection: async () => {
 			await adminDb.execute(sql`select 1`);
