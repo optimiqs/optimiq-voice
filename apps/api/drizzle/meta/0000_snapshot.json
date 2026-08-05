@@ -1,0 +1,597 @@
+{
+  "id": "750e18ca-244a-4bdd-9de9-d792d7feb633",
+  "prevId": "00000000-0000-0000-0000-000000000000",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "public.applications": {
+      "name": "applications",
+      "schema": "",
+      "columns": {
+        "ref": {
+          "name": "ref",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "access_key_id": {
+          "name": "access_key_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "varchar(255)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "type": {
+          "name": "type",
+          "type": "application_types",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "endpoint": {
+          "name": "endpoint",
+          "type": "varchar(255)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp (3)",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp (3)",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "applications_access_key_id_idx": {
+          "name": "applications_access_key_id_idx",
+          "columns": [
+            {
+              "expression": "access_key_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "hash",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.intelligence_services": {
+      "name": "intelligence_services",
+      "schema": "",
+      "columns": {
+        "ref": {
+          "name": "ref",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "config": {
+          "name": "config",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "credentials_hash": {
+          "name": "credentials_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "application_ref": {
+          "name": "application_ref",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "product_ref": {
+          "name": "product_ref",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "intelligence_services_application_ref_key": {
+          "name": "intelligence_services_application_ref_key",
+          "columns": [
+            {
+              "expression": "application_ref",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "intelligence_services_application_ref_idx": {
+          "name": "intelligence_services_application_ref_idx",
+          "columns": [
+            {
+              "expression": "application_ref",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "hash",
+          "with": {}
+        },
+        "intelligence_services_product_ref_idx": {
+          "name": "intelligence_services_product_ref_idx",
+          "columns": [
+            {
+              "expression": "product_ref",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "hash",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "intelligence_services_application_ref_fkey": {
+          "name": "intelligence_services_application_ref_fkey",
+          "tableFrom": "intelligence_services",
+          "tableTo": "applications",
+          "columnsFrom": [
+            "application_ref"
+          ],
+          "columnsTo": [
+            "ref"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        },
+        "intelligence_services_product_ref_fkey": {
+          "name": "intelligence_services_product_ref_fkey",
+          "tableFrom": "intelligence_services",
+          "tableTo": "products",
+          "columnsFrom": [
+            "product_ref"
+          ],
+          "columnsTo": [
+            "ref"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.products": {
+      "name": "products",
+      "schema": "",
+      "columns": {
+        "ref": {
+          "name": "ref",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "vendor": {
+          "name": "vendor",
+          "type": "product_vendors",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "type": {
+          "name": "type",
+          "type": "product_types",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.secrets": {
+      "name": "secrets",
+      "schema": "",
+      "columns": {
+        "ref": {
+          "name": "ref",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "access_key_id": {
+          "name": "access_key_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "secret_hash": {
+          "name": "secret_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp (3)",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp (3)",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "secrets_access_key_id_idx": {
+          "name": "secrets_access_key_id_idx",
+          "columns": [
+            {
+              "expression": "access_key_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "hash",
+          "with": {}
+        },
+        "secrets_name_idx": {
+          "name": "secrets_name_idx",
+          "columns": [
+            {
+              "expression": "name",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "hash",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.stt_services": {
+      "name": "stt_services",
+      "schema": "",
+      "columns": {
+        "ref": {
+          "name": "ref",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "config": {
+          "name": "config",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "credentials_hash": {
+          "name": "credentials_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "application_ref": {
+          "name": "application_ref",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "product_ref": {
+          "name": "product_ref",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "stt_services_application_ref_key": {
+          "name": "stt_services_application_ref_key",
+          "columns": [
+            {
+              "expression": "application_ref",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "stt_services_application_ref_idx": {
+          "name": "stt_services_application_ref_idx",
+          "columns": [
+            {
+              "expression": "application_ref",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "hash",
+          "with": {}
+        },
+        "stt_services_product_ref_idx": {
+          "name": "stt_services_product_ref_idx",
+          "columns": [
+            {
+              "expression": "product_ref",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "hash",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "stt_services_application_ref_fkey": {
+          "name": "stt_services_application_ref_fkey",
+          "tableFrom": "stt_services",
+          "tableTo": "applications",
+          "columnsFrom": [
+            "application_ref"
+          ],
+          "columnsTo": [
+            "ref"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        },
+        "stt_services_product_ref_fkey": {
+          "name": "stt_services_product_ref_fkey",
+          "tableFrom": "stt_services",
+          "tableTo": "products",
+          "columnsFrom": [
+            "product_ref"
+          ],
+          "columnsTo": [
+            "ref"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.tts_services": {
+      "name": "tts_services",
+      "schema": "",
+      "columns": {
+        "ref": {
+          "name": "ref",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "config": {
+          "name": "config",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "credentials_hash": {
+          "name": "credentials_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "application_ref": {
+          "name": "application_ref",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "product_ref": {
+          "name": "product_ref",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "tts_services_application_ref_key": {
+          "name": "tts_services_application_ref_key",
+          "columns": [
+            {
+              "expression": "application_ref",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "tts_services_application_ref_idx": {
+          "name": "tts_services_application_ref_idx",
+          "columns": [
+            {
+              "expression": "application_ref",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "hash",
+          "with": {}
+        },
+        "tts_services_product_ref_idx": {
+          "name": "tts_services_product_ref_idx",
+          "columns": [
+            {
+              "expression": "product_ref",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "hash",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "tts_services_application_ref_fkey": {
+          "name": "tts_services_application_ref_fkey",
+          "tableFrom": "tts_services",
+          "tableTo": "applications",
+          "columnsFrom": [
+            "application_ref"
+          ],
+          "columnsTo": [
+            "ref"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        },
+        "tts_services_product_ref_fkey": {
+          "name": "tts_services_product_ref_fkey",
+          "tableFrom": "tts_services",
+          "tableTo": "products",
+          "columnsFrom": [
+            "product_ref"
+          ],
+          "columnsTo": [
+            "ref"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    }
+  },
+  "enums": {
+    "public.application_types": {
+      "name": "application_types",
+      "schema": "public",
+      "values": [
+        "EXTERNAL",
+        "AUTOPILOT"
+      ]
+    },
+    "public.product_types": {
+      "name": "product_types",
+      "schema": "public",
+      "values": [
+        "TTS",
+        "STT",
+        "LLM"
+      ]
+    },
+    "public.product_vendors": {
+      "name": "product_vendors",
+      "schema": "public",
+      "values": [
+        "GOOGLE",
+        "MICROSOFT",
+        "AMAZON",
+        "DEEPGRAM",
+        "IBM",
+        "RASA",
+        "OPENAI",
+        "GROQ",
+        "ANTHROPIC",
+        "ELEVEN_LABS",
+        "GENERIC"
+      ]
+    }
+  },
+  "schemas": {},
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "views": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}

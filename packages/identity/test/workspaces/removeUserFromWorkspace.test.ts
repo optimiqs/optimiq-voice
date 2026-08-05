@@ -1,0 +1,103 @@
+import * as grpc from "@grpc/grpc-js";
+import * as chai from "chai";
+import { expect } from "chai";
+import chaiAsPromised from "chai-as-promised";
+import { createSandbox } from "sinon";
+import sinonChai from "sinon-chai";
+import { Role } from "@optimiq-voice/types";
+import { Database } from "../../src/db";
+import { TEST_TOKEN } from "../utils";
+
+chai.use(chaiAsPromised);
+chai.use(sinonChai);
+const sandbox = createSandbox();
+
+describe("@identity[workspace/removeUserFromWorkspace]", function () {
+  afterEach(function () {
+    return sandbox.restore();
+  });
+
+  it("should remove a user from a workspace", async function () {
+    // Arrange
+    const metadata = new grpc.Metadata();
+    metadata.set("token", TEST_TOKEN);
+    const userRef = "635c0cd8-8125-483d-b467-05c53ce2cd31";
+
+    const call = {
+      metadata,
+      request: {
+        workspaceRef: "123",
+        userRef
+      }
+    };
+
+    const db = {
+      workspaceMember: {
+        findFirst: sandbox.stub().resolves({ ref: "123" }),
+        delete: sandbox.stub().resolves({ ref: "123" })
+      },
+      workspace: {
+        findUnique: sandbox.stub().resolves({
+          ref: "123",
+          accessKeyId: "GRahn02s8tgdfghz72vb0fz538qpb5z35p",
+          ownerRef: userRef,
+          members: [{ userRef, role: Role.WORKSPACE_ADMIN }]
+        })
+      }
+    } as unknown as Database;
+
+    const { createRemoveUserFromWorkspace } =
+      await import("../../src/workspaces/createRemoveUserFromWorkspace");
+
+    // Act
+    const response = await new Promise((resolve, reject) => {
+      createRemoveUserFromWorkspace(db)(call, (error, response) => {
+        if (error) return reject(error);
+        resolve(response);
+      });
+    });
+
+    // Assert
+    expect(response).to.deep.equal({ ref: "123" });
+  });
+
+  it("should throw a permission denied error", async function () {
+    // Arrange
+    const metadata = new grpc.Metadata();
+    metadata.set("token", TEST_TOKEN);
+    const userRef = "635c0cd8-8125-483d-b467-05c53ce2cd30";
+
+    const call = {
+      metadata,
+      request: {
+        userRef
+      }
+    };
+
+    const db = {
+      workspace: {
+        findUnique: sandbox.stub().resolves({
+          ownerRef: "another-user-id",
+          members: [{ userId: "another-user-id", role: Role.USER }]
+        })
+      },
+      workspaceMember: {
+        findFirst: sandbox.stub().resolves({ ref: "123" }),
+        delete: sandbox.stub().resolves({ ref: "123" })
+      }
+    } as unknown as Database;
+
+    const { createRemoveUserFromWorkspace } =
+      await import("../../src/workspaces/createRemoveUserFromWorkspace");
+
+    // Act
+    // FIXME: This should be a promise
+    await createRemoveUserFromWorkspace(db)(call, (error) => {
+      // Assert
+      expect(error).to.deep.equal({
+        code: grpc.status.PERMISSION_DENIED,
+        message: "Only admins or owners can remove users from a workspace"
+      });
+    });
+  });
+});

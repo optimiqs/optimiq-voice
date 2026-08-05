@@ -1,0 +1,28 @@
+import { Validators as V } from "@optimiq-voice/common";
+import { getLogger } from "@optimiq-voice/logger";
+import { BaseApiObject, Secret } from "@optimiq-voice/types";
+import { Database } from "../core/db";
+import { withErrorHandlingAndValidationAndAccess } from "../utils/withErrorHandlingAndValidationAndAccess";
+import { createGetFnUtil } from "./createGetFnUtil";
+
+const logger = getLogger({ service: "api", filePath: __filename });
+
+function getSecret(db: Database) {
+  const getFn = createGetFnUtil(db);
+
+  const fn = async (call: { request: BaseApiObject }): Promise<Secret> => {
+    const { ref } = call.request;
+
+    logger.verbose("call to getSecret", { ref });
+
+    return await getFn(ref);
+  };
+
+  return withErrorHandlingAndValidationAndAccess(
+    fn,
+    (ref: string) => getFn(ref),
+    V.emptySchema
+  );
+}
+
+export { getSecret };

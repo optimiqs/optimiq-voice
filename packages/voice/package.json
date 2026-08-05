@@ -1,0 +1,40 @@
+{
+  "name": "@optimiq-voice/voice",
+  "version": "0.22.3",
+  "description": "Voice Server for Optimiq Voice",
+  "license": "MIT",
+  "main": "dist/index",
+  "types": "dist/index",
+  "directories": {
+    "src": "src",
+    "test": "test"
+  },
+  "scripts": {
+    "prebuild": "rimraf ./dist tsconfig.tsbuildinfo",
+    "build": "tsc -b tsconfig.json",
+    "clean": "rimraf ./dist node_modules tsconfig.tsbuildinfo",
+    "generate:readme": "node ../../.scripts/gen-readme.cjs",
+    "start:dev": "nodemon --exec tsx --watch src src/demo.ts"
+  },
+  "bin": {
+    "optimiq-voice": "./dist/index.js"
+  },
+  "dependencies": {
+    "@optimiq-voice/common": "workspace:^",
+    "@optimiq-voice/identity": "workspace:^",
+    "@optimiq-voice/logger": "workspace:^",
+    "@grpc/grpc-js": "1.10.12",
+    "deepmerge": "4.3.1",
+    "grpc-health-check": "2.1.0",
+    "pb-util": "1.0.3",
+    "zod": "3.25.76",
+    "zod-validation-error": "3.5.4"
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/optimiqs/optimiq-voice.git"
+  }
+}

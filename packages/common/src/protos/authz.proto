@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package optimiq_voice.authz.v1beta2;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/empty.proto";
+
+import "voice.proto";
+
+// Authentication service definition
+service Authz {
+  // Check if a user has permission to perform an action
+  rpc CheckSessionAuthorized (optimiq_voice.voice.v1beta2.CreateSessionRequest) returns (CheckSessionAuthorizedResponse) {}
+  // Check if a given accessKeyId has permission to access a method
+  rpc CheckMethodAuthorized (CheckMethodAuthorizedRequest) returns (CheckMethodAuthorizedResponse) {}
+  // Add billing meter event to an account
+  rpc AddBillingMeterEvent (AddBillingMeterEventRequest) returns (google.protobuf.Empty) {}
+}
+
+// Response message for the CheckVoiceRequestAuthorized method
+message CheckSessionAuthorizedResponse {
+  // The authorization server will look for one or more parameters in the request
+  // to determine if the request is authorized. If the request is authorized, the
+  // response will have the value true.
+  bool authorized = 1;
+}
+
+// Request message for the CheckMethodAuthorized method
+message CheckMethodAuthorizedRequest {
+  // The accessKeyId to check
+  string accessKeyId = 1;
+  // The method to check
+  string method = 2;
+}
+
+// Response message for the CheckMethodAuthorized method
+message CheckMethodAuthorizedResponse {
+  // The authorization server will check the accessKeyId and method to determine if
+  // the request is authorized. If the request is authorized, the response will have
+  // the value true.
+  bool authorized = 1;
+}
+
+// Request message for the ChargeAccount method
+message AddBillingMeterEventRequest {
+  // The accessKeyId to charge
+  string accessKeyId = 1;
+  // The payload for the event
+  google.protobuf.Struct payload = 2;
+}

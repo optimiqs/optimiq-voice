@@ -1,0 +1,45 @@
+{
+  "name": "@optimiq-voice/common",
+  "version": "0.22.3",
+  "description": "Common library for Optimiq Voice projects",
+  "license": "MIT",
+  "main": "dist/index",
+  "types": "dist/index",
+  "directories": {
+    "src": "src",
+    "test": "test"
+  },
+  "scripts": {
+    "prebuild": "rimraf ./dist tsconfig.tsbuildinfo",
+    "build": "tsc -b tsconfig.json",
+    "postbuild": "cp -a src/protos dist",
+    "clean": "rimraf ./dist node_modules tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "@optimiq-voice/logger": "workspace:^",
+    "@optimiq-voice/types": "workspace:^",
+    "@grpc/grpc-js": "1.10.12",
+    "@grpc/proto-loader": "0.7.15",
+    "@influxdata/influxdb-client": "1.35.0",
+    "dotenv": "16.6.1",
+    "grpc-health-check": "2.1.0",
+    "handlebars": "4.7.9",
+    "jsonwebtoken": "9.0.3",
+    "jwt-decode": "4.0.0",
+    "nodemailer": "6.10.1",
+    "pb-util": "1.0.3",
+    "twilio": "5.12.2",
+    "validator": "13.15.26",
+    "zod-validation-error": "3.5.4"
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/optimiqs/optimiq-voice.git"
+  },
+  "devDependencies": {
+    "@types/nodemailer": "6.4.23"
+  }
+}

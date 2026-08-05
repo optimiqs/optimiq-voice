@@ -1,0 +1,45 @@
+name: unit tests
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "apps/**"
+      - "packages/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - ".env.example.dev"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.20.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.x"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies and build
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Run unit tests
+        run: |
+          # FIXME: This is a workaround to prevent the unit tests from failing
+          cp .env.example.dev .env
+          sed -i "s|AUTOPILOT_INTEGRATIONS_FILE=.*|AUTOPILOT_INTEGRATIONS_FILE=./config/integrations.example.json|g" .env
+
+          pnpm run test

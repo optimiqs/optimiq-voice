@@ -1,0 +1,121 @@
+{
+  "name": "optimiq-voice",
+  "version": "independent",
+  "private": true,
+  "description": "The complete calling system for modern businesses",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/optimiqs/optimiq-voice.git"
+  },
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index",
+  "types": "dist/index",
+  "directories": {
+    "test": "test",
+    "src": "src"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "turbo run build",
+    "postbuild": "pnpm run copy:hbstemplates",
+    "bump:version": "rimraf apps/**/.lerna-changed-buster-* packages/**/.lerna-changed-buster-* && lerna exec -- touch .lerna-changed-buster-$RANDOM",
+    "check:updates": "lerna exec -- pnpm dlx npm-check-updates",
+    "clean": "rimraf apps/**/dist packages/**/dist apps/**/node_modules packages/**/node_modules node_modules .turbo",
+    "copy:hbstemplates": "node .scripts/copy-hbs.cjs",
+    "db:generate": "pnpm --filter @optimiq-voice/api run db:generate && pnpm --filter @optimiq-voice/identity run db:generate",
+    "db:migrate": "pnpm --filter @optimiq-voice/api run db:deploy && pnpm --filter @optimiq-voice/identity run db:deploy",
+    "db:seed": "tsx apps/api/src/core/seed.ts",
+    "format": "oxfmt \"apps/**/src/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}\" \"packages/**/src/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}\"",
+    "generate:keypair": ".scripts/gen-keypair.sh",
+    "generate:protos": ".scripts/gen-code-proto.sh",
+    "postgenerate:protos": "turbo run build",
+    "generate:readme": "lerna run generate:readme && git add apps/**/README.md packages/**/README.md",
+    "integration": "cross-env LOGS_LEVEL=none NODE_ENV=development mocha --slow 50000 --timeout 10000 'apps/**/node.integration.ts' 'apps/**/*.integration.test.ts' 'packages/**/node.integration.ts' 'packages/**/*.integration.test.ts'",
+    "preintegration:web": "pnpm exec playwright install && pnpm exec playwright install-deps",
+    "integration:web": "web-test-runner --node-resolve --playwright --browsers chromium webkit firefox",
+    "lint": "oxlint .",
+    "lint:fix": "oxlint . --fix",
+    "prepare": "husky",
+    "release": "lerna publish --yes --no-git-reset --dist-tag latest $(./.scripts/next-release.sh) --message \"chore(release): publish %s [skip ci]\"",
+    "release:frompackages": "lerna publish from-package",
+    "release:prerelease": "lerna publish --dist-tag next",
+    "prestart:services": "pnpm run generate:keypair",
+    "start:api": "cross-env NODE_ENV=development LOGS_LEVEL=verbose pnpm --filter @optimiq-voice/api run start:dev",
+    "start:audiosocket": "cross-env NODE_ENV=development LOGS_LEVEL=verbose pnpm --filter @optimiq-voice/streams run start:dev",
+    "start:authz": "cross-env NODE_ENV=development LOGS_LEVEL=verbose pnpm --filter @optimiq-voice/authz run start:dev",
+    "start:autopilot": "cross-env NODE_ENV=development AUTOPILOT_CONVERSATION_PROVIDER=file AUTOPILOT_CONVERSATION_PROVIDER_FILE=$(pwd)/config/assistant.json LOGS_LEVEL=verbose pnpm --filter @optimiq-voice/autopilot run start:dev",
+    "start:dashboard": "cross-env NODE_ENV=development pnpm --filter @optimiq-voice/dashboard run dev",
+    "start:mcp": "cross-env NODE_ENV=development LOGS_LEVEL=verbose pnpm --filter @optimiq-voice/mcp run start:dev",
+    "start:oauth2-demo": "pnpm --filter @optimiq-voice/sdk run start:oauth2-demo",
+    "start:sdk-demo": "pnpm --filter @optimiq-voice/sdk run start:demo",
+    "start:services": "cross-env docker compose -f compose.yaml -f compose.dev.yaml up routr nats envoy influxdb postgres adminer mailhog rtpengine asterisk -d --remove-orphans",
+    "start:storybook": "cross-env NODE_ENV=development pnpm --filter @optimiq-voice/dashboard run storybook",
+    "start:voice": "cross-env NODE_ENV=development LOGS_LEVEL=verbose pnpm --filter @optimiq-voice/voice run start:dev",
+    "stop:services": "cross-env docker compose -f compose.yaml -f compose.dev.yaml down",
+    "pretest": ".scripts/check-preconditions.sh && pnpm run generate:keypair",
+    "test": "cross-env LOGS_LEVEL=none NODE_ENV=development mocha --timeout 30000 --ignore 'apps/**/*.integration.test.ts' --ignore 'packages/**/*.integration.test.ts' 'apps/!(dashboard)/**/*.test.ts' 'packages/**/*.test.ts'",
+    "typecheck": "turbo run typecheck",
+    "format:check": "oxfmt --check \"apps/**/src/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}\" \"packages/**/src/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}\""
+  },
+  "nodemonConfig": {
+    "exec": "tsx",
+    "ext": "ts",
+    "ignore": "**/*.d.ts",
+    "watch": [
+      "apps/**",
+      "packages/**"
+    ]
+  },
+  "dependencies": {
+    "xstate": "5.17.3"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "19.8.1",
+    "@commitlint/config-conventional": "19.8.1",
+    "@types/chai": "5.2.3",
+    "@types/chai-as-promised": "8.0.2",
+    "@types/mocha": "10.0.10",
+    "@types/node": "20.19.35",
+    "@types/pg": "8.20.4",
+    "@types/sinon": "17.0.4",
+    "@types/sinon-chai": "4.0.0",
+    "chai-as-promised": "8.0.2",
+    "cross-env": "7.0.3",
+    "drizzle-orm": "0.45.2",
+    "grpc_tools_node_protoc_ts": "5.3.3",
+    "grpc-tools": "1.13.1",
+    "husky": "9.1.7",
+    "jsdoc-to-markdown": "8.0.3",
+    "lerna": "9.0.7",
+    "mocha": "11.7.6",
+    "nodemon": "3.1.14",
+    "nx": "22.7.5",
+    "protoc-gen-grpc-web": "1.5.0",
+    "protoc-gen-js": "3.21.4-4",
+    "rimraf": "6.1.3",
+    "sinon": "19.0.5",
+    "sinon-chai": "4.0.1",
+    "tsx": "4.22.4",
+    "turbo": "2.10.8",
+    "chai": "5.3.3",
+    "fs-extra": "10.1.0",
+    "lint-staged": "17.3.0",
+    "oxfmt": "0.62.0",
+    "oxlint": "1.77.0",
+    "protoc": "29.3.0",
+    "typescript": "^5.9.3"
+  },
+  "optionalDependencies": {
+    "@rollup/rollup-linux-arm64-gnu": "4.59.0",
+    "@rollup/rollup-linux-arm64-musl": "4.59.0",
+    "@rollup/rollup-linux-x64-gnu": "4.59.0",
+    "@rollup/rollup-linux-x64-musl": "4.59.0"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "packageManager": "pnpm@11.20.0"
+}

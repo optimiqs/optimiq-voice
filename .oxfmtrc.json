@@ -1,0 +1,48 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "semi": true,
+  "trailingComma": "none",
+  "singleQuote": false,
+  "printWidth": 80,
+  "bracketSpacing": true,
+  "useTabs": false,
+  "tabWidth": 2,
+  "sortPackageJson": false,
+  "sortImports": {
+    "groups": [
+      "builtin",
+      "external",
+      ["internal", "subpath"],
+      ["parent", "sibling", "index"],
+      "style",
+      "unknown",
+      "type"
+    ],
+    "internalPattern": ["~/", "@design-system/", "@optimiq-voice/"],
+    "order": "asc",
+    "ignoreCase": true,
+    "newlinesBetween": false,
+    "partitionByComment": false,
+    "partitionByNewline": false,
+    "sortSideEffects": false
+  },
+  "ignorePatterns": [
+    "**/dist/**",
+    "**/build/**",
+    "**/.react-router/**",
+    "**/.turbo/**",
+    "**/.nx/**",
+    "**/coverage/**",
+    "**/generated/**",
+    "**/drizzle/**",
+    "**/migrations/**",
+    "**/public/**",
+    "**/*.min.js",
+    "**/*.onnx",
+    "**/*.proto",
+    "**/*.hbs",
+    ".husky/**",
+    ".scripts/**",
+    "packages/identity-client/proto/**"
+  ]
+}

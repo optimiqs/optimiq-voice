@@ -1,0 +1,54 @@
+{
+  "name": "@optimiq-voice/identity",
+  "version": "0.22.3",
+  "description": "Identity service for Optimiq Voice",
+  "license": "MIT",
+  "main": "dist/index",
+  "types": "dist/index",
+  "directories": {
+    "src": "src",
+    "test": "test"
+  },
+  "scripts": {
+    "prebuild": "rimraf ./dist tsconfig.tsbuildinfo",
+    "build": "tsc -b tsconfig.json",
+    "start": "node dist/server/index.js",
+    "db:deploy": "node scripts/db-provision.mjs",
+    "db:generate": "drizzle-kit generate --config drizzle.config.ts",
+    "clean": "rimraf ./dist node_modules tsconfig.tsbuildinfo"
+  },
+  "bin": {
+    "optimiq-voice": "./dist/index.js",
+    "optimiq-voice-identity": "./dist/server/index.js"
+  },
+  "dependencies": {
+    "@47ng/cloak": "1.2.0",
+    "@optimiq-voice/common": "workspace:^",
+    "@optimiq-voice/logger": "workspace:^",
+    "@optimiq-voice/types": "workspace:^",
+    "@grpc/grpc-js": "1.10.12",
+    "drizzle-orm": "0.45.2",
+    "fastify": "5.11.2",
+    "grpc-health-check": "2.1.0",
+    "jsonwebtoken": "9.0.3",
+    "jwt-decode": "4.0.0",
+    "nanoid": "3.3.12",
+    "pg": "8.22.0",
+    "zod": "3.25.76",
+    "zod-validation-error": "3.5.4"
+  },
+  "files": [
+    "dist",
+    "drizzle",
+    "migrations",
+    "scripts"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/optimiqs/optimiq-voice.git"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "9.0.10",
+    "drizzle-kit": "0.31.10"
+  }
+}

@@ -1,0 +1,80 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+sharedWorkspaceLockfile: true
+linkWorkspacePackages: false
+saveWorkspaceProtocol: rolling
+injectWorkspacePackages: false
+
+onlyBuiltDependencies:
+  - core-js-pure
+  - esbuild
+  - grpc-tools
+  - nx
+  - onnxruntime-node
+  - protobufjs
+  - protoc-gen-grpc-web
+  - protoc-gen-js
+  - sharp
+  - unrs-resolver
+
+minimumReleaseAgeExclude:
+  - "@aws-sdk/checksums@3.1000.26"
+  - "@aws-sdk/client-s3@3.1103.0"
+  - "@aws-sdk/core@3.977.6"
+  - "@aws-sdk/credential-provider-env@3.972.67"
+  - "@aws-sdk/credential-provider-http@3.972.69"
+  - "@aws-sdk/credential-provider-ini@3.973.12"
+  - "@aws-sdk/credential-provider-login@3.972.74"
+  - "@aws-sdk/credential-provider-node@3.972.78"
+  - "@aws-sdk/credential-provider-process@3.972.67"
+  - "@aws-sdk/credential-provider-sso@3.973.11"
+  - "@aws-sdk/credential-provider-web-identity@3.972.73"
+  - "@aws-sdk/middleware-sdk-s3@3.972.72"
+  - "@aws-sdk/nested-clients@3.997.41"
+  - "@aws-sdk/token-providers@3.1103.0"
+  - "@langchain/anthropic@1.5.3"
+  - "@mui/core-downloads-tracker@9.3.0"
+  - "@mui/icons-material@9.3.0"
+  - "@mui/material@9.3.0"
+  - "@mui/private-theming@9.3.0"
+  - "@mui/styled-engine@9.3.0"
+  - "@mui/system@9.3.0"
+  - "@mui/types@9.3.0"
+  - "@mui/utils@9.3.0"
+  - "@nx/nx-darwin-arm64@23.2.0-canary.20260804-c3b7f1e"
+  - "@nx/nx-darwin-x64@23.2.0-canary.20260804-c3b7f1e"
+  - "@nx/nx-freebsd-x64@23.2.0-canary.20260804-c3b7f1e"
+  - "@nx/nx-linux-arm-gnueabihf@23.2.0-canary.20260804-c3b7f1e"
+  - "@nx/nx-linux-arm64-gnu@23.2.0-canary.20260804-c3b7f1e"
+  - "@nx/nx-linux-arm64-musl@23.2.0-canary.20260804-c3b7f1e"
+  - "@nx/nx-linux-x64-gnu@23.2.0-canary.20260804-c3b7f1e"
+  - "@nx/nx-linux-x64-musl@23.2.0-canary.20260804-c3b7f1e"
+  - "@nx/nx-win32-arm64-msvc@23.2.0-canary.20260804-c3b7f1e"
+  - "@nx/nx-win32-x64-msvc@23.2.0-canary.20260804-c3b7f1e"
+  - "@rxjs/observable-polyfill@9.0.0-beta.0"
+  - "@types/pg@8.20.4"
+  - "@typescript/typescript-darwin-arm64@7.1.0-dev.20260805.1"
+  - "@typescript/typescript-darwin-x64@7.1.0-dev.20260805.1"
+  - "@typescript/typescript-linux-arm64@7.1.0-dev.20260805.1"
+  - "@typescript/typescript-linux-arm@7.1.0-dev.20260805.1"
+  - "@typescript/typescript-linux-x64@7.1.0-dev.20260805.1"
+  - "@typescript/typescript-win32-arm64@7.1.0-dev.20260805.1"
+  - "@typescript/typescript-win32-x64@7.1.0-dev.20260805.1"
+  - nx@23.2.0-canary.20260804-c3b7f1e
+  - rxjs@9.0.0-beta.0
+  - tsx@4.23.7
+  - typescript@7.1.0-dev.20260805.1
+
+allowBuilds:
+  core-js-pure: true
+  esbuild: true
+  grpc-tools: true
+  msgpackr-extract: true
+  nx: true
+  onnxruntime-node: true
+  protobufjs: true
+  protoc-gen-grpc-web: true
+  protoc-gen-js: true
+  sharp: true

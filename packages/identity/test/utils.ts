@@ -1,0 +1,14 @@
+import { generateKeyPairSync } from "node:crypto";
+
+const TEST_TOKEN =
+  "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2Zvbm9zdGVyLmxvY2FsIiwic3ViIjoiNjM1YzBjZDgtODEyNS00ODNkLWI0NjctMDVjNTNjZTJjZDMxIiwiYXVkIjoiYXBpIiwidG9rZW5Vc2UiOiJhY2Nlc3MiLCJhY2Nlc3NLZXlJZCI6IlVTMTR3ajhxNnFsaXJ3MzMxZ2Zzd3VzZmJsaWU2aDc4dXoiLCJhY2Nlc3MiOlt7ImFjY2Vzc0tleUlkIjoiR1JhaG4wMnM4dGdkZmdoejcydmIwZno1MzhxcGI1ejM1cCIsInJvbGUiOiJPV05FUiJ9LHsiYWNjZXNzS2V5SWQiOiJHUmtnYmY4YW1pbnl3dWV2dXBiZHB4bDYzNmtjM2N5YmhvIiwicm9sZSI6Ik9XTkVSIn1dLCJpYXQiOjE3MTQ0MzM3MzZ9.eG6UEe8nBncu1I8TtytG5bModK42JxuSLCK74eLzUb-7MLowza8ZSfoHPHSPu5j1Wy_nj8NWa1u1SvqTfW-8inoL8Y_Mawl_u9zSM09Co85RQOI_bj7huGB7v0UECLfKyd7cAo_9wGB9TDDDX5Qo66bQz49hu_8zed8e6RzJXYRC5-5TBlyYdw3o7yHUXL5t8tFxDhT7U61kg0eVjPPZCAUiyohK74Zxdv1Z9RCfWTt9kUYXReqOUvhAFzL5Um5KwNdRnWwFRz_3-Msui2axAsZ6ztGoAvw_GhdlAminGEq7FILVCh6OHeOESAYo-qreAANmbwfBS8qNsglTiPAUEw";
+
+const TEST_UUID = "635c0cd8-8125-483d-b467-05c53ce2cd31";
+
+const { privateKey: TEST_PRIVATE_KEY } = generateKeyPairSync("rsa", {
+  modulusLength: 2048,
+  privateKeyEncoding: { format: "pem", type: "pkcs8" },
+  publicKeyEncoding: { format: "pem", type: "spki" }
+});
+
+export { TEST_PRIVATE_KEY, TEST_TOKEN, TEST_UUID };

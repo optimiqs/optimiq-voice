@@ -1,0 +1,33 @@
+{
+  "name": "@optimiq-voice/streams",
+  "version": "0.22.0",
+  "description": "Core support for Optimiq Voice Streams",
+  "license": "MIT",
+  "main": "dist/index",
+  "types": "dist/index",
+  "directories": {
+    "src": "src",
+    "test": "test"
+  },
+  "scripts": {
+    "prebuild": "rimraf ./dist tsconfig.tsbuildinfo",
+    "build": "tsc -b tsconfig.json",
+    "clean": "rimraf ./dist node_modules tsconfig.tsbuildinfo",
+    "generate:readme": "node ../../.scripts/gen-readme.cjs",
+    "start:dev": "nodemon --exec tsx --watch src src/example.ts"
+  },
+  "dependencies": {
+    "@optimiq-voice/logger": "workspace:^",
+    "uuid": "11.1.1"
+  },
+  "devDependencies": {
+    "@types/uuid": "10.0.0"
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/optimiqs/optimiq-voice.git"
+  }
+}
