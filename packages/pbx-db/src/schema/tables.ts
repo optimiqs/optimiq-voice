@@ -1,0 +1,68 @@
+import { conference, parkLot } from "./conferences-schema";
+import { device, deviceKey, deviceLine, deviceProfile, deviceProfileKey } from "./devices-schema";
+import { emergencyAddress } from "./emergency-schema";
+import { extension, extensionUser } from "./extensions-schema";
+import { callBlockRule, featureCode } from "./features-schema";
+import { ivrMenu, ivrMenuOption } from "./ivr-schema";
+import { mohClass, prompt } from "./media-schema";
+import { phoneNumber } from "./numbers-schema";
+import { queue, queueAgent, queueTier } from "./queues-schema";
+import { ringGroup, ringGroupDestination } from "./ring-groups-schema";
+import { inboundRoute, outboundRoute } from "./routing-schema";
+import { auditLog, sipAclEntry } from "./security-schema";
+import { orgSetting, userSetting } from "./settings-schema";
+import { timeCondition, timeConditionRule } from "./time-conditions-schema";
+import { trunk } from "./trunks-schema";
+import {
+	voicemailBox,
+	voicemailGreeting,
+	voicemailMessage,
+	voicemailOption,
+} from "./voicemail-schema";
+
+/**
+ * Every table in the telephony bounded context, keyed by its TypeScript name.
+ *
+ * This is the object `defineRelations` and the relational query builder consume; it is also the
+ * single list the RLS preflight plan is derived from, so a table added here without a policy
+ * fails preflight instead of silently shipping unprotected.
+ */
+export const pbxTables = {
+	auditLog,
+	callBlockRule,
+	conference,
+	device,
+	deviceKey,
+	deviceLine,
+	deviceProfile,
+	deviceProfileKey,
+	emergencyAddress,
+	extension,
+	extensionUser,
+	featureCode,
+	inboundRoute,
+	ivrMenu,
+	ivrMenuOption,
+	mohClass,
+	orgSetting,
+	outboundRoute,
+	parkLot,
+	phoneNumber,
+	prompt,
+	queue,
+	queueAgent,
+	queueTier,
+	ringGroup,
+	ringGroupDestination,
+	sipAclEntry,
+	timeCondition,
+	timeConditionRule,
+	trunk,
+	userSetting,
+	voicemailBox,
+	voicemailGreeting,
+	voicemailMessage,
+	voicemailOption,
+} as const;
+
+export type PbxTables = typeof pbxTables;
