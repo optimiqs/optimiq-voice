@@ -1,4 +1,5 @@
 import { Inject, Module, type OnApplicationShutdown } from "@nestjs/common";
+import { APP_GUARD } from "@nestjs/core";
 import { type AuthPlatform, createAuthPlatform } from "./auth.platform";
 import { AuthService } from "./auth.service";
 import { AUTH_PLATFORM, AUTH_REPOSITORY } from "./auth.tokens";
@@ -10,8 +11,14 @@ import { RequirePermissionsGuard } from "./require-permissions.guard";
 /**
  * The better-auth feature slice.
  *
- * Purely additive: it adds `/api/auth/*`, the session hook and the first REST resources without
- * touching the gRPC identity path, which keeps working unchanged until identity-removal Step 3.
+ * It adds `/api/auth/*`, the session hook, the first REST resources and — since identity-removal
+ * Step 3 — the **global** session guard over every Nest HTTP route. The gRPC identity path is
+ * still untouched: `RuntimeHostService` starts those servers outside Nest and they keep
+ * authenticating through `createAuthInterceptor` until Step 2 lands the tenant mapping.
+ *
+ * The guard is registered here rather than in `main.ts` so that it exists exactly when the slice
+ * does: an environment without `DATABASE_URL` / `AUTH_SECRET` / `AUTH_URL` boots `AppModule`
+ * alone and behaves precisely as it did before.
  */
 @Module({
 	controllers: [MeController, OrganizationsController],
@@ -25,6 +32,7 @@ import { RequirePermissionsGuard } from "./require-permissions.guard";
 		AuthService,
 		CallTokenService,
 		RequirePermissionsGuard,
+		{ provide: APP_GUARD, useExisting: RequirePermissionsGuard },
 	],
 	exports: [AUTH_PLATFORM, AUTH_REPOSITORY, AuthService, CallTokenService, RequirePermissionsGuard],
 })

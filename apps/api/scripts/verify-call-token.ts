@@ -6,10 +6,17 @@
  *
  * It boots the auth slice alone against a real PostgreSQL, mints a per-call token through
  * `CallTokenService`, fetches the published JWKS over HTTP and verifies the token against it with
- * `jose` — the exact verification `packages/voice/src/VoiceServer.ts` will perform once it stops
- * fetching the identity public key over gRPC (Step 4, item 2).
+ * `jose`.
  *
- * Deliberately separate from `verify:auth`: that gate is pinned at 26/26 checks.
+ * Section 6 then runs the **real** verifier from `@optimiq-voice/voice` —
+ * `createCallTokenVerifier`, the one `VoiceServer` hands to its gRPC interceptor — against the
+ * live `/api/auth/jwks` endpoint. That closes Step 4's loop at the level this environment can
+ * reach: the minter in `apps/api` and the verifier in `packages/voice` agree on a token, with no
+ * identity service, no `.keys/*.pem` and no gRPC `getPublicKey` round trip anywhere in the path.
+ * The plan's full gate (an inbound call reaching an autopilot application) additionally needs
+ * Asterisk and Routr, which are not available here.
+ *
+ * Deliberately separate from `verify:auth`.
  */
 
 import { createServer } from "node:net";
@@ -150,6 +157,55 @@ async function main(): Promise<void> {
 			rejected = true;
 		}
 		check("a re-signed payload fails verification", rejected);
+
+		// -----------------------------------------------------------------------------------------
+		// 6. The real packages/voice verifier, over real HTTP (identity-removal Step 4, item 2)
+		// -----------------------------------------------------------------------------------------
+		console.log("6. verify through packages/voice's createCallTokenVerifier");
+		const { createCallTokenVerifier, CallTokenVerificationError } =
+			await import("@optimiq-voice/voice");
+
+		const verifyCallToken = createCallTokenVerifier({ authUrl: baseUrl });
+		const claims = await verifyCallToken(token);
+		check("the voice verifier accepts a freshly minted token", true);
+		check(
+			"it reads the tenant from organizationId, not from a client header",
+			claims.organizationId === ORGANIZATION_ID,
+			claims.organizationId,
+		);
+		check("it reads the application ref", claims.appRef === APP_REF, claims.appRef);
+		check("it reads the call binding", claims.callRef === CALL_REF, String(claims.callRef));
+
+		async function rejects(name: string, run: () => Promise<unknown>): Promise<void> {
+			let error: unknown;
+			try {
+				await run();
+			} catch (caught) {
+				error = caught;
+			}
+			check(name, error instanceof CallTokenVerificationError, error ? "rejected" : "ACCEPTED");
+		}
+
+		await rejects("it rejects a missing token", async () => await verifyCallToken(undefined));
+		await rejects("it rejects a garbage token", async () => await verifyCallToken("not.a.jwt"));
+		await rejects("it rejects a re-signed payload", async () => await verifyCallToken(forged));
+		await rejects(
+			"it rejects a token minted for another audience",
+			async () =>
+				await createCallTokenVerifier({ authUrl: baseUrl, audience: "optimiq-voice/other" })(token),
+		);
+
+		check(
+			"the verifier refuses to be built without an AUTH_URL",
+			(() => {
+				try {
+					createCallTokenVerifier({ authUrl: "  " });
+					return false;
+				} catch {
+					return true;
+				}
+			})(),
+		);
 	} finally {
 		console.log("\ncleaning up");
 		await app.close();

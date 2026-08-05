@@ -1,4 +1,12 @@
 export {
+	buildOrganizationAccessControl,
+	buildOrganizationStatements,
+	DEFAULT_ORGANIZATION_CREATOR_ROLE,
+	ORGANIZATION_PLUGIN_RESOURCES,
+	type OrganizationAccessControl,
+	organizationRoleIds,
+} from "./access-control";
+export {
 	type Auth,
 	type AuthApi,
 	type AuthCookieOptions,

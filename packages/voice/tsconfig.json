@@ -2,7 +2,14 @@
 	"extends": "../../tsconfig.json",
 	"compilerOptions": {
 		"outDir": "dist",
-		"rootDir": "src"
+		"rootDir": "src",
+		// `jose@6` is ESM-only and publishes its types through an `exports` map, which the root
+		// tsconfig's `moduleResolution: node` (node10) resolver predates. `node16` reads the map,
+		// and because this package has no `"type": "module"` it still EMITS CommonJS — with one
+		// difference that `callTokenVerifier.ts` depends on: `import()` is left intact rather than
+		// downlevelled to `require`, so jose is genuinely loaded as ESM at runtime.
+		"module": "node16",
+		"moduleResolution": "node16"
 	},
 	"references": [
 		{

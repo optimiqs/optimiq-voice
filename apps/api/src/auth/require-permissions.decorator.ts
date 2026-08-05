@@ -6,9 +6,11 @@ export const REQUIRE_PERMISSIONS_METADATA = "optimiq-voice:require-permissions";
 /**
  * Declares the permissions a handler requires.
  *
- * - absent          — the guard lets the request through (routes are not implicitly protected)
- * - `()`            — an authenticated session is required, no permission check
+ * - absent           — an authenticated session is required (the global guard denies by default)
+ * - `()`             — the same thing, said explicitly
  * - `(…permissions)` — an authenticated session with an active organization that grants all of them
+ *
+ * To let a route through anonymously, use `@PublicRoute()`.
  *
  * Permissions come from `PERMISSIONS` in `@optimiq-voice/auth`, so a typo is a compile error.
  */

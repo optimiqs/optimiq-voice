@@ -7,6 +7,7 @@ import {
 	ORGANIZATION_MEMBERSHIP_ROLES,
 	SESSION_COOKIE_CACHE_VERSION,
 } from "./auth";
+import { SYSTEM_ROLE_IDS } from "./permissions";
 import { authSchema } from "./schema";
 
 /**
@@ -19,7 +20,7 @@ const email: AuthEmailDelivery = {
 	sendInvite: () => Promise.resolve(),
 };
 
-function buildAuth() {
+function buildAuth(overrides: Partial<Parameters<typeof createAuth>[0]> = {}) {
 	const client = postgres("postgresql://auth:auth@127.0.0.1:1/optimiq_voice_spec", { max: 1 });
 	return createAuth({
 		database: drizzle({ client }),
@@ -28,7 +29,23 @@ function buildAuth() {
 		appURL: "https://app.optimiq.example",
 		email,
 		trustedOrigins: ["https://app.optimiq.example"],
+		...overrides,
 	});
+}
+
+/** The composed plugin object keeps the options it was constructed with. */
+function organizationPluginOptions(auth: ReturnType<typeof createAuth>): {
+	ac?: unknown;
+	roles?: Record<string, unknown>;
+	creatorRole?: string;
+} {
+	const plugins = auth.options.plugins as { id: string; options?: unknown }[];
+	const plugin = plugins.find((candidate) => candidate.id === "organization");
+	return (plugin?.options ?? {}) as {
+		ac?: unknown;
+		roles?: Record<string, unknown>;
+		creatorRole?: string;
+	};
 }
 
 describe("createAuth", () => {
@@ -96,5 +113,39 @@ describe("createAuth", () => {
 
 	it("documents the better-auth membership roles our templates map onto", () => {
 		expect([...ORGANIZATION_MEMBERSHIP_ROLES]).toEqual(["owner", "admin", "member"]);
+	});
+
+	it("registers the system role templates with the organization plugin by default", () => {
+		const options = organizationPluginOptions(auth);
+		expect(options.ac).toBeDefined();
+		for (const id of SYSTEM_ROLE_IDS) {
+			expect(Object.keys(options.roles ?? {})).toContain(id);
+		}
+	});
+
+	it("keeps better-auth's own roles alongside them, so invitations keep working", () => {
+		const roles = Object.keys(organizationPluginOptions(auth).roles ?? {});
+		for (const id of ORGANIZATION_MEMBERSHIP_ROLES) {
+			expect(roles).toContain(id);
+		}
+	});
+
+	it("creates organizations with an owner", () => {
+		expect(organizationPluginOptions(auth).creatorRole).toBe("owner");
+	});
+
+	it("lets the creator role be overridden without losing the access control", () => {
+		const custom = buildAuth({ organizationRoles: { creatorRole: "admin" } });
+		const options = organizationPluginOptions(custom);
+		expect(options.creatorRole).toBe("admin");
+		expect(options.ac).toBeDefined();
+	});
+
+	it("falls back to better-auth's three built-in roles when opted out", () => {
+		const plain = buildAuth({ organizationRoles: false });
+		const options = organizationPluginOptions(plain);
+		expect(options.ac).toBeUndefined();
+		expect(options.roles).toBeUndefined();
+		expect(options.creatorRole).toBe("owner");
 	});
 });

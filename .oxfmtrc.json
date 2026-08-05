@@ -42,7 +42,6 @@
 		"**/*.proto",
 		"**/*.hbs",
 		".husky/**",
-		".scripts/**",
-		"packages/identity-client/proto/**"
+		".scripts/**"
 	]
 }

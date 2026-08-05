@@ -52,6 +52,7 @@ export {
 export { CallTokenService, createCallAccessTokenMinter } from "./call-token.service";
 export { MeController } from "./me.controller";
 export { OrganizationsController } from "./organizations.controller";
+export { PUBLIC_ROUTE_METADATA, PublicRoute } from "./public-route.decorator";
 export { REQUIRE_PERMISSIONS_METADATA, RequirePermissions } from "./require-permissions.decorator";
 export { RequirePermissionsGuard } from "./require-permissions.guard";
 export { resolveRolePermissions, resolveRoleTemplate } from "./role-permissions";

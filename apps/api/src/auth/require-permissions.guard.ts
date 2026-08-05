@@ -8,17 +8,27 @@ import {
 	UnauthenticatedRequestException,
 } from "./auth.errors";
 import { AuthService } from "./auth.service";
+import { PUBLIC_ROUTE_METADATA } from "./public-route.decorator";
 import { REQUIRE_PERMISSIONS_METADATA } from "./require-permissions.decorator";
 
 /**
- * Opt-in authorization guard for `@RequirePermissions(...)`.
+ * The global session and authorization guard (identity-removal Step 3).
  *
- * It is NOT registered globally: the gRPC surface still authenticates through
- * `createAuthInterceptor`, and the two paths coexist until identity-removal Step 3. Apply it per
- * controller with `@UseGuards(RequirePermissionsGuard)`.
+ * Registered once as an `APP_GUARD` by `AuthModule`, so it covers every Nest HTTP route in
+ * `apps/api` — including routes added later, which is the whole point. It replaces the gRPC-era
+ * `createAuthInterceptor` for the HTTP surface; the gRPC servers `RuntimeHostService` starts are
+ * untouched and still authenticate through `packages/common/src/identity/` until Step 2 supplies
+ * the `accessKeyId → organization.id` mapping those call sites need.
  *
- * Guard-then-execute order: session → active organization → permission. Each failure has its own
- * exception so the client can tell "sign in" from "pick an organization" from "not allowed".
+ * **Deny by default.** A route with no metadata at all requires an authenticated session. Opting
+ * out is explicit and auditable via `@PublicRoute()`.
+ *
+ * Guard-then-execute order: public → session → active organization → permission. Each failure has
+ * its own exception so a client can tell "sign in" from "pick an organization" from "not allowed".
+ *
+ * The caller was resolved once per request by the Fastify `preHandler` hook in
+ * `auth-http.plugin.ts` (`auth.api.getSession`, which accepts the session cookie and the bearer
+ * plugin's `Authorization: Bearer <token>`). This guard never touches a header itself.
  */
 @Injectable()
 export class RequirePermissionsGuard implements CanActivate {
@@ -28,13 +38,22 @@ export class RequirePermissionsGuard implements CanActivate {
 	) {}
 
 	async canActivate(context: ExecutionContext): Promise<boolean> {
-		const required = this.reflector.getAllAndOverride<readonly Permission[] | undefined>(
-			REQUIRE_PERMISSIONS_METADATA,
-			[context.getHandler(), context.getClass()],
-		);
-		if (required === undefined) {
+		if (
+			this.reflector.getAllAndOverride<boolean | undefined>(PUBLIC_ROUTE_METADATA, [
+				context.getHandler(),
+				context.getClass(),
+			]) === true
+		) {
 			return true;
 		}
+
+		// Absent metadata means "authenticated, no permission required" — the deny-by-default half
+		// of the contract. `@RequirePermissions()` with no arguments says the same thing explicitly.
+		const required =
+			this.reflector.getAllAndOverride<readonly Permission[] | undefined>(
+				REQUIRE_PERMISSIONS_METADATA,
+				[context.getHandler(), context.getClass()],
+			) ?? [];
 
 		const request = context.switchToHttp().getRequest<unknown>();
 		const session = getSession(request);

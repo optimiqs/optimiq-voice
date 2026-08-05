@@ -3,8 +3,13 @@ import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { admin, bearer, jwt, openAPI, organization, twoFactor } from "better-auth/plugins";
 import { createEntityId } from "@optimiq-voice/identifiers";
+import {
+	buildOrganizationAccessControl,
+	DEFAULT_ORGANIZATION_CREATOR_ROLE,
+} from "./access-control";
 import { authSchema } from "./schema";
 import { createSessionOrganizationHook, type SessionOrganizationRepository } from "./session";
+import type { SystemRoleId } from "./permissions";
 
 /**
  * better-auth 1.6.23 composition for Optimiq Voice.
@@ -106,6 +111,13 @@ export interface CreateAuthOptions {
 	/** Serves the auth OpenAPI document at `/api/auth/reference`. */
 	readonly openApiEnabled?: boolean;
 	readonly requireEmailVerification?: boolean;
+	/**
+	 * Registers the five `SYSTEM_ROLE_TEMPLATES` with the organization plugin's access control,
+	 * making `manager` / `agent` / `user` assignable as `member.role` alongside better-auth's own
+	 * `owner` / `admin` / `member`. Enabled by default — turning it off restores the plugin's
+	 * three built-in roles and nothing else.
+	 */
+	readonly organizationRoles?: boolean | { readonly creatorRole?: SystemRoleId };
 }
 
 function resolveKeyPairConfig(algorithm: NonNullable<AuthJwtOptions["algorithm"]>) {
@@ -160,7 +172,8 @@ function buildJwtPluginOptions(options: AuthJwtOptions | undefined) {
  * Composes the better-auth instance.
  *
  * Plugin roles:
- * - `organization` — the tenant model (organizations, members, invitations, owner/admin/member)
+ * - `organization` — the tenant model (organizations, members, invitations) with the five
+ *   `SYSTEM_ROLE_TEMPLATES` registered as access-control roles (see `./access-control.ts`)
  * - `apiKey`       — organization-scoped programmatic credentials (`@better-auth/api-key`)
  * - `admin`        — platform-operator surface: ban, impersonate, list users
  * - `twoFactor`    — TOTP + backup codes
@@ -173,6 +186,12 @@ export function createAuth(options: CreateAuthOptions) {
 	const organizationHook = options.organizationRepository
 		? createSessionOrganizationHook(options.organizationRepository)
 		: undefined;
+
+	const rolesOption = options.organizationRoles ?? true;
+	const accessControl = rolesOption === false ? undefined : buildOrganizationAccessControl();
+	const creatorRole =
+		(typeof rolesOption === "object" ? rolesOption.creatorRole : undefined) ??
+		DEFAULT_ORGANIZATION_CREATOR_ROLE;
 
 	return betterAuth({
 		appName: options.appName ?? "Optimiq Voice",
@@ -253,7 +272,8 @@ export function createAuth(options: CreateAuthOptions) {
 
 		plugins: [
 			organization({
-				creatorRole: "owner",
+				creatorRole,
+				...(accessControl ? { ac: accessControl.ac, roles: accessControl.roles } : {}),
 				invitationExpiresIn:
 					options.invitationExpiresInSeconds ?? DEFAULT_INVITATION_EXPIRES_IN_SECONDS,
 				requireEmailVerificationOnInvitation: true,

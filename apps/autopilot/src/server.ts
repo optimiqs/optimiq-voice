@@ -1,8 +1,6 @@
 #!/usr/bin/env node
 
-import { NODE_ENV, SKIP_IDENTITY } from "./envs";
+import { AUTH_URL, SKIP_TOKEN_VERIFICATION } from "./envs";
 import { startVoiceServer } from "./voiceServerSetup";
 
-const skipIdentity = NODE_ENV === "development" || SKIP_IDENTITY;
-
-startVoiceServer(skipIdentity);
+startVoiceServer({ authUrl: AUTH_URL, skipTokenVerification: SKIP_TOKEN_VERIFICATION });

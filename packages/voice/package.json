@@ -21,11 +21,11 @@
 	},
 	"dependencies": {
 		"@optimiq-voice/common": "workspace:^",
-		"@optimiq-voice/identity": "workspace:^",
 		"@optimiq-voice/logger": "workspace:^",
 		"@grpc/grpc-js": "1.10.12",
 		"deepmerge": "4.3.1",
 		"grpc-health-check": "2.1.0",
+		"jose": "catalog:",
 		"pb-util": "1.0.3",
 		"zod": "3.25.76",
 		"zod-validation-error": "3.5.4"

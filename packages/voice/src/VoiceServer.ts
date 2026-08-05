@@ -1,20 +1,18 @@
 import * as grpc from "@grpc/grpc-js";
 import merge from "deepmerge";
 import { HealthImplementation } from "grpc-health-check";
-import {
-	createAuthInterceptor,
-	getPublicKey,
-	getServerCredentials,
-	GRPC_SERVING_STATUS,
-	statusMap,
-} from "@optimiq-voice/common";
+import { getServerCredentials, GRPC_SERVING_STATUS, statusMap } from "@optimiq-voice/common";
 import { getLogger } from "@optimiq-voice/logger";
+import { createCallTokenVerifier } from "./callTokenVerifier";
+import { createJwksAuthInterceptor } from "./createJwksAuthInterceptor";
 import { createSession } from "./createSession";
 import { defaultServerConfig } from "./defaultServerConfig";
 import { serviceDefinition } from "./serviceDefinition";
 import { ServerConfig, VoiceHandler } from "./types";
 
 const logger = getLogger({ service: "voice", filePath: __filename });
+
+const HEALTH_CHECK_PATH = "/grpc.health.v1.Health/Check";
 
 export default class VoiceServer {
 	config: ServerConfig;
@@ -29,18 +27,24 @@ export default class VoiceServer {
 
 			let server: grpc.Server;
 
-			if (this.config.skipIdentity) {
+			if (this.config.skipTokenVerification) {
+				// Development only. `apps/autopilot` sets it exclusively when NODE_ENV=development and
+				// no AUTH_URL is configured; every other combination fails closed below.
+				logger.warn("voice server is accepting UNAUTHENTICATED calls (token verification off)");
 				server = new grpc.Server();
 			} else {
-				// Get the public key from the identity service
-				const response = await getPublicKey(this.config.identityAddress);
-
-				const authorization = createAuthInterceptor(response.publicKey, [
-					"/grpc.health.v1.Health/Check",
-				]);
+				/**
+				 * Identity-removal Step 4, item 2. This used to be
+				 * `await getPublicKey(this.config.identityAddress)` — a gRPC call to the identity
+				 * service whose RS256 PEM was handed to `createAuthInterceptor`. Tokens are now
+				 * verified against the JWKS better-auth publishes, so there is no start-up dependency
+				 * on any other service: the first call fetches the keys, and `createRemoteJWKSet`
+				 * caches them and refetches on rotation.
+				 */
+				const verify = createCallTokenVerifier({ authUrl: this.config.authUrl ?? "" });
 
 				server = new grpc.Server({
-					interceptors: [authorization],
+					interceptors: [createJwksAuthInterceptor(verify, [HEALTH_CHECK_PATH])],
 				});
 			}
 
@@ -58,11 +62,7 @@ export default class VoiceServer {
 				logger.info(`started voice server @ ${this.config.bind}, port=${this.config.port}`);
 			});
 		} catch (err) {
-			if (err.code === grpc.status.UNAVAILABLE) {
-				logger.error("failed to connect to identity service");
-			} else {
-				logger.error("failed to start voice server", err);
-			}
+			logger.error("failed to start voice server", err);
 			process.exit(1);
 		}
 	}

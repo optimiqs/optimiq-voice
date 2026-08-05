@@ -1,7 +1,6 @@
-import { Controller, Get, Inject, Param, ParseUUIDPipe, UseGuards } from "@nestjs/common";
+import { Controller, Get, Inject, Param, ParseUUIDPipe } from "@nestjs/common";
 import { AuthService, type OrganizationView } from "./auth.service";
 import { RequirePermissions } from "./require-permissions.decorator";
-import { RequirePermissionsGuard } from "./require-permissions.guard";
 import { Session } from "./session.decorator";
 import type { OrganizationMemberSummary } from "./auth.repository";
 import type { AppSession } from "@optimiq-voice/auth";
@@ -13,7 +12,6 @@ import type { AppSession } from "@optimiq-voice/auth";
  * `/api/auth/organization/*`; this controller only reads.
  */
 @Controller("api/v1/organizations")
-@UseGuards(RequirePermissionsGuard)
 export class OrganizationsController {
 	constructor(@Inject(AuthService) private readonly authService: AuthService) {}
 

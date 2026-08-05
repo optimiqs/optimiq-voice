@@ -30,7 +30,19 @@ export const INTEGRATIONS_FILE = e.AUTOPILOT_INTEGRATIONS_FILE
 	? e.AUTOPILOT_INTEGRATIONS_FILE
 	: "/opt/optimiq-voice/integrations.json";
 export const OPENAI_API_KEY = e.AUTOPILOT_OPENAI_API_KEY;
-export const SKIP_IDENTITY = e.AUTOPILOT_SKIP_IDENTITY === "true";
+/**
+ * Origin of the API publishing `/api/auth/jwks` — the standard `AUTH_URL` from
+ * `packages/config`, not an autopilot-specific name. The voice server verifies every inbound
+ * per-call token against it (identity-removal Step 4, items 2 and 3).
+ */
+export const AUTH_URL = e.AUTH_URL ?? "";
+/**
+ * Replaces `AUTOPILOT_SKIP_IDENTITY`, which was a standalone opt-out that also disabled
+ * authentication in production if it was ever set there. Verification is now skipped only when
+ * this is a development process AND no `AUTH_URL` is configured; anything else fails closed,
+ * because `VoiceServer` refuses to start without one.
+ */
+export const SKIP_TOKEN_VERIFICATION = NODE_ENV === "development" && AUTH_URL.length === 0;
 export const RECORDING_BASE_URL = e.AUTOPILOT_RECORDING_BASE_URL
 	? e.AUTOPILOT_RECORDING_BASE_URL
 	: "http://localhost:9876/api/recordings";

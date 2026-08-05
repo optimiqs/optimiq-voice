@@ -6,7 +6,6 @@ import {
 	Validators as V,
 	withErrorHandlingAndValidation,
 } from "@optimiq-voice/common";
-import {} from "@optimiq-voice/identity";
 import { getLogger } from "@optimiq-voice/logger";
 import { ListSecretsRequest, ListSecretsResponse } from "@optimiq-voice/types";
 import { Database } from "../core/db";

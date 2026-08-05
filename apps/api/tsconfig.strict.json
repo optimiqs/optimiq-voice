@@ -17,5 +17,5 @@
 		"strictBindCallApply": true,
 		"strictPropertyInitialization": false
 	},
-	"include": ["src/auth/**/*", "scripts/**/*"]
+	"include": ["src/auth/**/*", "scripts/**/*", "test/auth/**/*"]
 }

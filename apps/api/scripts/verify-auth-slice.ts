@@ -362,6 +362,127 @@ async function main(): Promise<void> {
 		console.log("10. better-auth surface");
 		const jwks = await request(baseUrl, "GET", "/api/auth/jwks");
 		check("/api/auth/jwks is served", jwks.status === 200, `status ${jwks.status}`);
+
+		// --- 11. the SYSTEM_ROLE_TEMPLATES are assignable organization roles ------------------------
+		//
+		// Before `packages/auth` registered the templates with the organization plugin's access
+		// control, `update-member-role` rejected anything outside better-auth's own owner / admin /
+		// member with `ROLE_NOT_FOUND`
+		// (`dist/plugins/organization/routes/crud-members.mjs:258`), so `manager` / `agent` / `user`
+		// were unreachable and every plain `member` fell back to the least privileged template.
+		console.log("11. role templates — promote the member to manager");
+		const membersBeforePromotion = await request(
+			baseUrl,
+			"GET",
+			`/api/v1/organizations/${organizationId}/members`,
+			{ jar: ownerJar },
+		);
+		const memberRow = (
+			Array.isArray(field(membersBeforePromotion.body, "data"))
+				? (field(membersBeforePromotion.body, "data") as unknown[])
+				: []
+		).find((entry) => asString(field(entry, "email")) === memberEmail);
+		const memberId = asString(field(memberRow, "id"));
+		check("the invited member is listed", memberId.length > 0, memberId);
+
+		const promoteToManager = await request(
+			baseUrl,
+			"POST",
+			"/api/auth/organization/update-member-role",
+			{ jar: ownerJar, body: { memberId, role: "manager", organizationId } },
+		);
+		check(
+			"manager is an assignable organization role",
+			promoteToManager.status === 200,
+			`status ${promoteToManager.status} ${
+				promoteToManager.status === 200 ? "" : JSON.stringify(promoteToManager.body)
+			}`,
+		);
+
+		const meManager = await request(baseUrl, "GET", "/api/v1/me", { jar: memberJar });
+		const managerPermissions = asStringArray(field(meManager.body, "permissions"));
+		check(
+			"me reports the manager role",
+			asString(field(meManager.body, "role")) === "manager",
+			asString(field(meManager.body, "role")),
+		);
+		check(
+			"the guard resolves the manager template, not the least-privileged fallback",
+			managerPermissions.includes("extensions.write") &&
+				managerPermissions.includes("queues.write"),
+			`${managerPermissions.length} permissions`,
+		);
+		check(
+			"manager stops short of the owner template",
+			!managerPermissions.includes("secrets.read") && !managerPermissions.includes("trunks.write"),
+		);
+
+		const managerMembers = await request(
+			baseUrl,
+			"GET",
+			`/api/v1/organizations/${organizationId}/members`,
+			{ jar: memberJar },
+		);
+		check(
+			"manager gets 200 on the members.read route the bare member was refused",
+			managerMembers.status === 200,
+			`status ${managerMembers.status}`,
+		);
+
+		console.log("12. role templates — demote the member to agent");
+		const demoteToAgent = await request(
+			baseUrl,
+			"POST",
+			"/api/auth/organization/update-member-role",
+			{ jar: ownerJar, body: { memberId, role: "agent", organizationId } },
+		);
+		check(
+			"agent is an assignable organization role",
+			demoteToAgent.status === 200,
+			`status ${demoteToAgent.status} ${
+				demoteToAgent.status === 200 ? "" : JSON.stringify(demoteToAgent.body)
+			}`,
+		);
+
+		const meAgent = await request(baseUrl, "GET", "/api/v1/me", { jar: memberJar });
+		const agentPermissions = asStringArray(field(meAgent.body, "permissions"));
+		check(
+			"me reports the agent role",
+			asString(field(meAgent.body, "role")) === "agent",
+			asString(field(meAgent.body, "role")),
+		);
+		check(
+			"the guard resolves the agent template",
+			agentPermissions.includes("queues.join.own") && agentPermissions.includes("queues.monitor"),
+			`${agentPermissions.length} permissions`,
+		);
+		check(
+			"agent does not inherit the manager template",
+			!agentPermissions.includes("extensions.write"),
+		);
+
+		const agentMembers = await request(
+			baseUrl,
+			"GET",
+			`/api/v1/organizations/${organizationId}/members`,
+			{ jar: memberJar },
+		);
+		check(
+			"agent is refused the members.read route",
+			agentMembers.status === 403,
+			`status ${agentMembers.status}`,
+		);
+
+		console.log("13. role templates — an unregistered role is still refused");
+		const bogusRole = await request(baseUrl, "POST", "/api/auth/organization/update-member-role", {
+			jar: ownerJar,
+			body: { memberId, role: "supervisor", organizationId },
+		});
+		check(
+			"a role outside the registry is rejected",
+			bogusRole.status >= 400,
+			`status ${bogusRole.status}`,
+		);
 	} finally {
 		console.log("\ncleaning up");
 		try {

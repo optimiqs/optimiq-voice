@@ -1,9 +1,10 @@
 # Identity Service Removal — Cutover Plan
 
 **Date:** 2026-08-05 · **Phase:** written in P0, executed in P1 · **Status:** Step 1 (additive
-mount) is **DONE** and its three blocking findings are **RESOLVED**; Step 4 item 1 (the per-call
-token) is **DONE, additive**. Steps 2, 3, 5-9 not started. No identity code has been removed or
-changed.
+mount) is **DONE** and all three of its blocking findings are **RESOLVED**; Step 3 is **DONE for
+the HTTP surface** (the rest is blocked on Step 2); Step 4 items 1-3 are **DONE**, item 4 is
+proven at verify-script level. Step 2 not started; **Step 5 is blocked on Step 2** (see the
+blocker note there). Steps 6-9 not started.
 
 The custom RS256 gRPC identity service is retired and replaced by **better-auth 1.6.23**
 (`packages/auth`) on the **base database** (`packages/db`). This document enumerates everything
@@ -11,11 +12,15 @@ that currently depends on identity and the ordered steps to remove each.
 
 > **Executed so far** (2026-08-05): better-auth is mounted in `apps/api` alongside the existing
 > gRPC identity path; `apps/api` has been migrated to the oikos ES-module toolchain and to
-> `drizzle-orm@1.0.0-rc.4`, which unblocks Steps 3 and 5; a per-call token minter verifiable
-> against `/api/auth/jwks` exists but is **not** on the live call path. `apps/identity`,
-> `packages/identity`, `packages/identity-client`, `packages/common/src/identity/` and the
-> `fnidentity` database are all still in place and untouched. See "Step 1 implementation notes"
-> and "Step 1.5" below.
+> `drizzle-orm@1.0.0-rc.4`; the five `SYSTEM_ROLE_TEMPLATES` are registered with better-auth's
+> organization access control, so `manager` / `agent` / `user` are assignable roles; the session
+> guard is **global and deny-by-default** over every Nest HTTP route in `apps/api`; and
+> `packages/voice` verifies per-call tokens against `/api/auth/jwks` instead of fetching an RS256
+> public key from the identity service over gRPC. `packages/identity-client` is **deleted**
+> (it had zero consumers). `apps/identity`, `packages/identity`, `packages/common/src/identity/`
+> and the `fnidentity` database are still in place — the gRPC servers `RuntimeHostService` starts
+> continue to authenticate through them. See "Step 1 implementation notes", "Step 1.5" and the
+> per-step notes below.
 
 ---
 
@@ -184,17 +189,23 @@ and rewrite those JSONB values into a real `organization_id` column before RLS c
 - [x] 4. Mount the handler on Fastify at `/api/auth/*` (`auth.handler(request)`).
 - [ ] 5. Run `packages/db` migrations in the api container (`bun run scripts/migrate.ts --expected-stage <stage>`).
       Not started — `apps/api/Dockerfile` and `compose*.yaml` are untouched (belongs with Step 8).
-- [x] 6. **Gate** — `pnpm --filter @optimiq-voice/api verify:auth` (26/26 checks, real Postgres 17):
+- [x] 6. **Gate** — `pnpm --filter @optimiq-voice/api verify:auth` (**38/38** checks as of
+      2026-08-05, 26 originally; real Postgres 17):
       sign up → session cookie → `/api/v1/me` → create organization → `/api/v1/me` with the org →
       `/api/v1/organizations` → invite + accept → re-sign-in proves the session hook → guard 403 for a
-      `member`, 200 for the `owner` → 401 anonymous → `/api/auth/jwks` served.
-      **Not yet exercised:** API-key issuance and `/api/auth/token` (deferred to Step 4), and
-      email verification by clicking the link (delivery is stubbed; the gate flips
+      `member`, 200 for the `owner` → 401 anonymous → `/api/auth/jwks` served → **(added with the
+      role AC, checks 27-38)** promote the member to `manager` through
+      `/api/auth/organization/update-member-role`, assert `/api/v1/me` reports `manager` with 43
+      permissions and that the guard now returns 200 on the `members.read` route the bare member
+      was refused; demote to `agent`, assert 15 permissions and 403 again; assert an unregistered
+      role id is still rejected.
+      **Not yet exercised:** API-key issuance and `/api/auth/token` (see the api-key blocker in
+      Step 3), and email verification by clicking the link (delivery is stubbed; the gate flips
       `user.email_verified` directly to reach the invitation flow).
 
 Also delivered early, out of Step 3: `@RequirePermissions(...)` + `RequirePermissionsGuard`
-(item 3 of Step 3). It is **opt-in only** (`@UseGuards(RequirePermissionsGuard)` per controller),
-never global — the gRPC `createAuthInterceptor` path is untouched and both coexist.
+(item 3 of Step 3). It was opt-in per controller at that point; it is **global and deny-by-default**
+as of Step 3 — see below.
 
 #### Step 1 implementation notes
 
@@ -237,13 +248,13 @@ the same module _is_ used, for both the handler and the session hook.
    `drizzle-orm@1.0.0-rc.4` (`catalog:`) like `@optimiq-voice/{auth,db}`. Step 5 (RLS +
    `withTenantScope`) is unblocked. The auth slice still reads through better-auth's own adapter
    (`auth.$context.adapter`); moving it to a Drizzle handle is optional now, not forced.
-3. **`member.role` → permissions is ambiguous.** **STILL OPEN — blocked on `packages/auth`.**
-   better-auth stores `owner` / `admin` / `member`, while `SYSTEM_ROLE_TEMPLATES` has five ids
-   (`owner`, `admin`, `manager`, `agent`, `user`). `role-permissions.ts` resolves an exact
-   template id first, otherwise the **least privileged** template with that `membershipRole` — so
-   a bare `member` gets the `user` template (11 permissions), never `manager`. A real role
-   assignment (`member.role = "manager"`) needs the organization plugin's `roles`/access-control
-   configuration, and `CreateAuthOptions` does not expose it. See "Step 4 blocker" below.
+3. ~~**`member.role` → permissions is ambiguous.**~~ **RESOLVED 2026-08-05.** better-auth stored
+   only `owner` / `admin` / `member`, while `SYSTEM_ROLE_TEMPLATES` has five ids, so
+   `role-permissions.ts`'s least-privilege fallback meant a bare `member` could only ever be the
+   `user` template (11 permissions). `packages/auth` now registers all five templates with the
+   organization plugin's access control (`src/access-control.ts`), so `manager` / `agent` / `user`
+   are assignable and resolve to their own templates. `role-permissions.ts` needed **no change**,
+   exactly as predicted. See "Step 4 blocker — RESOLVED" below.
 
 Smaller notes:
 
@@ -420,30 +431,104 @@ Three test-level repairs, all pre-existing breakage rather than migration fallou
 4. **Gate:** every existing user can sign in with their existing password; every workspace has
    exactly one owner.
 
-### Step 3 — Replace `createAuthInterceptor` with a session guard
+### Step 3 — Replace `createAuthInterceptor` with a session guard — **HTTP SURFACE DONE 2026-08-05**
 
-1. New `apps/api` guard: resolve the caller in order — session cookie → `Authorization: Bearer`
-   (bearer plugin) → `x-api-key` (apiKey plugin). Produce an `AppSession`.
-2. `requireActiveOrganizationId(session)` supplies the tenant id; **delete
-   `getAccessKeyIdFromCall`** — the tenant is never again read from a client-supplied header.
-3. Implement `@RequirePermissions(...)` over `PERMISSIONS` / `SYSTEM_ROLE_TEMPLATES`, replacing
-   `roles.ts`, `hasAccess.ts`, `workspaceResourceAccess`, `workspaceResourceOwnerOrAdminAccess`.
-4. Replace `withAccess` / `hasAccessToResource` in `apps/api` (3 sites) and `packages/sipnet`
-   (3 sites) with RLS scoping — and note that the _existence-implies-access_ defect disappears
-   for free, because an out-of-tenant row is simply invisible.
-5. **Gate:** the 17 direct `getAccessKeyIdFromCall` call sites are gone; a cross-tenant request
-   returns 404/403 in an integration test.
+- [x] 1. New `apps/api` guard: resolve the caller in order — session cookie →
+      `Authorization: Bearer` (bearer plugin) → `x-api-key` (apiKey plugin). Produce an
+      `AppSession`. **Cookie and bearer are done** (both are handled inside
+      `auth.api.getSession`, which the Fastify `preHandler` hook in `auth-http.plugin.ts` calls
+      once per request). **`x-api-key` is BLOCKED — see the api-key blocker below.**
+- [x] 2. ~~`requireActiveOrganizationId(session)` supplies the tenant id~~ — done on the HTTP
+      surface: the guard reads the tenant from `session.activeOrganizationId` and the voice
+      server's interceptor now stamps the organization id from a signed claim
+      (`ORGANIZATION_METADATA_KEY`) rather than trusting the caller. **Deleting
+      `getAccessKeyIdFromCall` is BLOCKED on Step 2** — the 17 gRPC call sites scope queries by
+      the `WO…` access key that telephony rows still store, and there is no
+      `accessKeyId → organization.id` mapping to swap them onto.
+- [x] 3. Implement `@RequirePermissions(...)` over `PERMISSIONS` / `SYSTEM_ROLE_TEMPLATES`.
+      Delivered early in Step 1, made **global and deny-by-default** here. `roles.ts`,
+      `hasAccess.ts`, `workspaceResourceAccess` and `workspaceResourceOwnerOrAdminAccess` are
+      still referenced by the gRPC interceptor and die with it in Step 9.
+- [ ] 4. Replace `withAccess` / `hasAccessToResource` in `apps/api` (3 sites) and `packages/sipnet`
+      (3 sites) with RLS scoping. **BLOCKED on Steps 2 and 5** (no tenant column exists yet). The
+      _existence-implies-access_ defect therefore also still stands.
+- [ ] 5. **Gate:** the 17 direct `getAccessKeyIdFromCall` call sites are gone; a cross-tenant
+      request returns 404/403 in an integration test. **BLOCKED on Step 2.**
+
+#### Step 3 — what shipped (HTTP surface)
+
+`RequirePermissionsGuard` is registered once as an `APP_GUARD` by `AuthModule`, so it covers every
+Nest HTTP route in `apps/api`, including ones added later. Three changes make that safe:
+
+| before                                                      | after                                                                    |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `@UseGuards(RequirePermissionsGuard)` per controller         | one `{ provide: APP_GUARD, useExisting: RequirePermissionsGuard }`        |
+| no `@RequirePermissions` metadata ⇒ **route is open**        | no metadata ⇒ **an authenticated session is required**                    |
+| no way to declare a route anonymous                          | `@PublicRoute()` (`src/auth/public-route.decorator.ts`), explicit and greppable |
+
+Registering it in `AuthModule` rather than `main.ts` keeps the existing escape hatch intact: an
+environment without `DATABASE_URL` / `AUTH_SECRET` / `AUTH_URL` boots `AppModule` alone and behaves
+exactly as before. The `/api/auth/*` routes are raw Fastify routes registered outside Nest's
+router, so they never reach a guard.
+
+Two pre-existing routes were audited and marked `@PublicRoute()` with the reason at the call site:
+
+- `GET /api/identity/accept-invite` — the link in an invitation email, clicked by someone with no
+  session. The `token` query parameter is the credential. Dies in Step 9.
+- `GET /api/recordings/:id` — **anonymous, and not safe.** `apps/autopilot` builds
+  `${AUTOPILOT_RECORDING_BASE_URL}/<appRef>_<mediaSessionRef>.wav`
+  (`src/handleVoiceRequest.ts:134`) and posts it to a customer's `eventsHook` webhook, so the
+  fetcher is a third party with no session; guarding it would break every conversation-ended
+  webhook. `resolve()` + the `dirname` check stop path traversal, but nothing stops enumeration.
+  **Follow-up (not part of this cutover): mint a signed, expiring URL alongside the recording.**
+
+Verification: `apps/api/test/auth/requirePermissionsGuard.test.ts` (7 cases — public bypass,
+anonymous denial of an undecorated route, authenticated pass, missing organization, insufficient
+role, sufficient role + resolved-access stamping, unscoped-grant-covers-scoped) plus
+`verify:auth`'s live 401/403/200 checks.
+
+#### Step 3 blocker — `x-api-key` cannot become a session with `references: "organization"`
+
+`@better-auth/api-key@1.6.23` promotes an API key into a session in a `before` hook, but only for
+keys that reference a **user**:
+
+```js
+// dist/index.mjs:2353-2356
+if ((config.references ?? "user") !== "user") {
+  throw APIError.from("UNAUTHORIZED", API_KEY_ERROR_CODES.INVALID_REFERENCE_ID_FROM_API_KEY);
+}
+const user = await ctx.context.internalAdapter.findUserById(apiKey.referenceId);
+```
+
+`packages/auth` configures `apiKey({ references: "organization" })` deliberately — keys belong to
+the organization, not to whoever created them — so `auth.api.getSession` with an `x-api-key`
+header **throws 401** instead of producing a session. Options, to decide before Step 7 (the SDK
+and CLI move to API-key auth):
+
+- (a) resolve the key explicitly with `auth.api.verifyApiKey` in the session hook and synthesise an
+  `AppSession` whose `activeOrganizationId` is the key's `referenceId` — no plugin change, and it
+  is the shape the API actually wants (a key is a tenant principal, not a user principal);
+- (b) switch to `references: "user"` and carry the organization in key metadata — loses the
+  cascade-on-organization-delete and re-introduces "keys belong to a person";
+- (c) upstream a `references: "organization"` session path.
+
+**Recommendation: (a).** It keeps the data model and is ~30 lines in `auth-http.plugin.ts`.
 
 ### Step 4 — Per-call and service tokens
 
 - [x] 1. Replace `createGenerateCallAccessToken` with the better-auth jwt plugin: a short-lived
       (`30s`) token whose payload carries `organizationId` and the application ref.
       **DONE 2026-08-05, ADDITIVE — the live call path is untouched.**
-- [ ] 2. `packages/voice/src/VoiceServer.ts`: replace `getPublicKey` over gRPC with JWKS verification
-      via `jose.createRemoteJWKSet(new URL("/api/auth/jwks", AUTH_URL))`.
-- [ ] 3. `apps/autopilot`: keep consuming `sessionToken`; only the verification path changes.
-      Retire `AUTOPILOT_SKIP_IDENTITY` in favour of the standard auth env.
+- [x] 2. `packages/voice/src/VoiceServer.ts`: replace `getPublicKey` over gRPC with JWKS verification
+      via `jose.createRemoteJWKSet(new URL("/api/auth/jwks", AUTH_URL))`. **DONE 2026-08-05.**
+- [x] 3. `apps/autopilot`: keep consuming `sessionToken`; only the verification path changes.
+      Retire `AUTOPILOT_SKIP_IDENTITY` in favour of the standard auth env. **DONE 2026-08-05.**
 - [ ] 4. **Gate:** an inbound call reaches an autopilot application end to end with the new token.
+      **PARTIAL — proven at verify-script level, not live.** `verify:call-token` (27/27) mints a token with
+      the `apps/api` slice and verifies it with the *actual* `createCallTokenVerifier` from
+      `@optimiq-voice/voice` against the live `/api/auth/jwks`. The live half additionally needs
+      Asterisk + Routr and the `accessKeyId → organization.id` mapping from Step 2 (see "what
+      still gates the live call path" below).
 
 #### Step 4 item 1 — what shipped
 
@@ -492,81 +577,87 @@ the shape does not. Both claims die with `packages/common/src/identity/` in Step
   (It reuses `verify-auth-slice.ts`'s `AUTH_SECRET` on purpose: the jwt plugin encrypts the JWKS
   private key with it, so two scripts against one database must agree.)
 
-**What item 2 needs.** `VoiceServer.ts` currently calls `getPublicKey(config.identityAddress)`
-over gRPC and hands the PEM to `createAuthInterceptor`. Replace with
-`createRemoteJWKSet(new URL("/api/auth/jwks", AUTH_URL))` and `jwtVerify(token, jwks, { audience:
-"optimiq-voice/voice" })`; read the tenant from `organizationId` rather than `access[0].accessKeyId`.
-Then flip `apps/api/src/voice/createCreateVoiceClient.ts` from
-`createGenerateCallAccessToken(identityConfig)` to `CallTokenService.createCallAccessToken(...)`,
-which additionally requires threading `callRef` (already in scope there) and the organization id
-(available only after Step 2's `accessKeyId → organization.id` mapping exists).
+#### Step 4 items 2 and 3 — what shipped (2026-08-05)
 
-#### Step 4 blocker — role access control lives in `packages/auth`, which is not exposed
+`packages/voice/src/callTokenVerifier.ts` (the logic) and
+`packages/voice/src/createJwksAuthInterceptor.ts` (the gRPC adapter) replace
+`getPublicKey(config.identityAddress)` + `createAuthInterceptor`. `getPublicKey` now has **zero
+consumers**; `@optimiq-voice/identity` is gone from `packages/voice/package.json`.
 
-Finding 3 above (only 3 of the 5 `SYSTEM_ROLE_TEMPLATES` are reachable) **cannot be fixed from
-`apps/api`.** `createAuth(options)` in `packages/auth/src/auth.ts` hard-codes its `plugins` array
-and constructs `organization({ creatorRole, invitationExpiresIn, … })` internally.
-`CreateAuthOptions` exposes no `ac`, no `roles`, and no plugin override, and the composed `Auth`
-instance freezes its plugin options at `betterAuth()` time — so there is no runtime escape hatch
-either. `apps/api` passing anything is impossible today.
+| before                                                             | after                                                              |
+| ------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `getPublicKey(identityAddress)` gRPC round trip at server start     | nothing at start; `createRemoteJWKSet` fetches on first call and caches |
+| RS256 PEM from `.keys/public.pem` via the identity service          | whatever `/api/auth/jwks` publishes (EdDSA by default), rotation-aware |
+| `ServerConfig.identityAddress` (default `api.optimiq.health`)       | `ServerConfig.authUrl`, **no default** — misconfiguration fails closed |
+| `ServerConfig.skipIdentity` / `AUTOPILOT_SKIP_IDENTITY`             | `ServerConfig.skipTokenVerification`, set only when `NODE_ENV=development` **and** no `AUTH_URL` |
+| tenant read from the client-supplied `accesskeyid` metadata key     | tenant read from the signed `organizationId` claim and **stamped onto** `organizationid` metadata, overwriting the caller |
+| `hasAccess(decoded, path)` against `roles.ts`                       | none — one method, and `aud: "optimiq-voice/voice"` on a 30 s per-call token IS the decision |
 
-Ironically the building block already exists and is already exported:
-`buildAccessControlStatements(permissions)` in `packages/auth/src/permissions.ts` reshapes the
-flat registry into better-auth's `{ resource: ["action", "action.scope"] }` statement form. It is
-referenced by nothing.
+Two mechanical notes worth keeping:
 
-**Exact change `packages/auth` must make** (owner: whoever holds `packages/auth`):
+- **Verification is asynchronous now.** The identity-era interceptor could decide synchronously
+  because it already held the PEM. `createJwksAuthInterceptor` defers the decision inside
+  `onReceiveMetadata`: the call does not reach the handler until `next(metadata)` runs, and a
+  rejection ends it with `UNAUTHENTICATED` first.
+- **`jose@6` is ESM-only and `packages/voice` emits CommonJS.** Its tsconfig moved to
+  `module: node16` / `moduleResolution: node16`, which reads jose's `exports` map for types and —
+  because the package has no `"type": "module"` — still emits CommonJS, with `import()` left
+  intact rather than downlevelled to `require`. jose is therefore genuinely loaded as ESM at
+  runtime (verified against the built `dist`). A static import would be TS1479; the type-only
+  import carries `with { "resolution-mode": "import" }` for the same reason.
 
-1. Add to `CreateAuthOptions`:
-   ```ts
-   /** Registers the five SYSTEM_ROLE_TEMPLATES with the organization plugin's access control. */
-   readonly organizationRoles?: boolean | { readonly creatorRole?: SystemRoleId };
-   ```
-2. In `createAuth`, when it is set, build the access controller from the registry and pass it to
-   the organization plugin. Both options exist in better-auth 1.6.23 —
-   `OrganizationOptions.ac?: AccessControl` and `roles?: Record<string, Role>`
-   (`dist/plugins/organization/types.d.mts:58-62`), with `createAccessControl` exported from
-   `better-auth/plugins/access` and the plugin's own statements from
-   `better-auth/plugins/organization/access` (`defaultStatements`, `defaultRoles`,
-   `ownerAc`, `adminAc`, `memberAc`):
-   ```ts
-   import { createAccessControl } from "better-auth/plugins/access";
-   import { defaultStatements, defaultRoles } from "better-auth/plugins/organization/access";
+`apps/autopilot` keeps consuming `sessionToken` unchanged (`loadAssistantFromAPI.ts` still replays
+it into `Applications/GetApplication`); only `envs.ts`, `server.ts` and `voiceServerSetup.ts`
+moved to `AUTH_URL`.
 
-   // MERGE, do not replace: the plugin's own `organization` / `member` / `invitation` / `ac`
-   // statements gate its built-in endpoints. Dropping them breaks invitations.
-   const ac = createAccessControl({
-     ...defaultStatements,
-     ...buildAccessControlStatements(),
-   });
-   const roles = {
-     ...defaultRoles,
-     ...Object.fromEntries(
-       SYSTEM_ROLE_TEMPLATES.map((t) => [
-         t.id,
-         ac.newRole({
-           ...(defaultRoles[t.membershipRole]?.statements ?? {}),
-           ...buildAccessControlStatements(t.permissions),
-         }),
-       ]),
-     ),
-   };
-   organization({ ac, roles, creatorRole: "owner", /* existing options */ })
-   ```
-3. Keep `creatorRole: "owner"`, so `verify:auth` check 4 ("me reports the owner role — owner")
-   is unaffected, and keep `owner` / `admin` / `member` resolvable so existing rows keep working
-   — note `member` is a plugin default with no `SYSTEM_ROLE_TEMPLATES` counterpart, which is
-   exactly why `role-permissions.ts` keeps its least-privilege fallback.
-4. Spec: assert every `SYSTEM_ROLE_TEMPLATES` id is a key of the composed `roles`; assert
-   `buildAccessControlStatements(PERMISSIONS)` round-trips (every entry in `PERMISSIONS` appears
-   in exactly one `resource: [action]` pair); assert `defaultStatements` keys survive the merge.
+**Gate, run 2026-08-05:** `pnpm --filter @optimiq-voice/api verify:call-token` → **27/27** (18
+before). Section 6 boots the auth slice, mints a token, then runs
+`createCallTokenVerifier({ authUrl })` — the real one `VoiceServer` uses — over real HTTP against
+the live JWKS: accepts the fresh token and reads `organizationId` / `appRef` / `callRef`; rejects a
+missing token, a garbage token, a re-signed payload and a wrong audience; and refuses to be
+constructed without an `AUTH_URL`.
 
-Once that lands, `apps/api/src/auth/role-permissions.ts` needs **no change** — its step 1 already
-resolves an exact template id, so `member.role = "manager"` starts working the moment the
-organization plugin will accept that value, and the least-privilege fallback stays as the guard
-against unknown roles.
+**What still gates the live call path (item 4).** `apps/api/src/voice/createCreateVoiceClient.ts`
+still mints with `createGenerateCallAccessToken(identityConfig)`. Flipping it to
+`CallTokenService.createCallAccessToken(...)` needs the organization id, which only exists after
+Step 2's `accessKeyId → organization.id` mapping (`callRef` is already in scope there). Until then
+the voice server verifies tokens the API does not yet mint, so `apps/autopilot` must keep running
+with `skipTokenVerification` **or** the flip must land together with Step 2. Do not deploy the two
+halves separately.
 
-### Step 5 — Enable RLS on org-scoped tables
+#### Step 4 blocker — role access control in `packages/auth` — **RESOLVED 2026-08-05**
+
+Finding 3 (only 3 of the 5 `SYSTEM_ROLE_TEMPLATES` reachable) could not be fixed from `apps/api`,
+because `createAuth` hard-coded its `plugins` array. It is fixed in `packages/auth` as the plan
+prescribed:
+
+- `packages/auth/src/access-control.ts` — `buildOrganizationStatements()` merges
+  `defaultStatements` with `buildAccessControlStatements()` (which was, until now, referenced by
+  nothing) and **hard-errors on a resource collision**; `buildOrganizationAccessControl()` builds
+  the `AccessControl` and a roles map that starts from `defaultRoles` and layers each template on
+  top of the plugin statements its `membershipRole` already carried.
+- `CreateAuthOptions.organizationRoles?: boolean | { creatorRole?: SystemRoleId }`, **default
+  enabled**. `organizationRoles: false` restores better-auth's three built-ins verbatim.
+- `creatorRole` stays `"owner"`, and `owner` / `admin` / `member` all stay resolvable.
+
+The merge is not cosmetic: better-auth resolves roles as `options.roles || defaultRoles`
+(`dist/plugins/organization/has-permission.mjs:7`) — a **replacement**. A roles map built only
+from the registry would leave `owner` without `invitation: ["create"]` and break invitations.
+Specs assert `defaultStatements` survives the merge and that `owner`/`admin` keep
+`invitation.create` while `manager`/`agent` do not.
+
+The unlock is concrete: `invite-member` and `update-member-role` validate the requested role
+against `Object.keys(defaultRoles) ∪ Object.keys(options.roles)`
+(`dist/plugins/organization/routes/crud-members.mjs:258`, `crud-invites.mjs:104-122`) and returned
+`ROLE_NOT_FOUND: manager` before this landed — a failure reproduced and then fixed inside
+`verify:auth` (checks 27-38). `apps/api/src/auth/role-permissions.ts` needed **no change**, as
+predicted: `manager` resolves to 43 permissions and `agent` to 15, instead of both falling back to
+`user`'s 11.
+
+Coverage: `packages/auth` bun specs **170** (151 before) — `access-control.spec.ts` is new (14
+cases) and `auth.spec.ts` gained 5 composition assertions.
+
+### Step 5 — Enable RLS on org-scoped tables — **BLOCKED ON STEP 2** (assessed 2026-08-05)
 
 1. Add `organization_id uuid not null` to every telephony table; backfill from the Step 2
    mapping table via `extended->>'accessKeyId'`; drop the JSONB `accessKeyId`.
@@ -574,6 +665,33 @@ against unknown roles.
 3. Wire `assertTenantRlsPreflight` into `apps/api` boot **before** the server is created.
 4. Route every org-scoped repository through `withTenantScope`.
 5. **Gate:** `db:preflight:tenant-rls` is clean; the tenant-RLS integration spec passes.
+
+> **Blocker, recorded 2026-08-05.** `drizzle-orm@1.0.0-rc.4` in `apps/api` (Step 1.5.c) unblocked
+> the *toolchain*, not the *data*. Every item above is still gated:
+>
+> - **Item 1 is gated by sequencing rule 2.** `apps/api`'s two org-owned tables (`applications`,
+>   `secrets`) carry `access_key_id text`, and there is no `accessKeyId → organization.id` mapping
+>   to backfill from — that table is Step 2, which has not started. Adding
+>   `organization_id uuid not null` before the mapping exists means either a lockout or a fake
+>   backfill. (Note the plan's §2.10 describes an `extended` JSONB column; that shape is the
+>   sipnet/Routr rows, not `apps/api`'s own schema. Both need the same mapping.)
+> - **Item 2 has no home yet.** `pbx_tenant_tls` belongs to the PBX bounded-context database.
+>   `packages/db` is the *base* package and deliberately owns only the auth tables plus the
+>   generic tenant primitives (`tenant-role.ts`, `tenant-scope.ts`, `tenant-transaction.ts`,
+>   `rls-preflight.ts`); its single migration is `20260805195722_auth_baseline` and it declares no
+>   `pgRole`/`pgPolicy` at all. `packages/pbx-db` is referenced by the root `db:generate` /
+>   `db:migrate` scripts but does not exist in the workspace.
+> - **Item 4 has nothing to route.** `apps/api` has no org-scoped repositories; every caller goes
+>   through the Prisma-shaped `db.*` facade in `src/core/db.ts`, keyed on `accessKeyId`. Those
+>   become repositories in the P1 slice rewrite, not here.
+> - **Item 5 cannot run.** `packages/db/package.json` declares
+>   `"db:preflight:tenant-rls": "bun run scripts/tenant-rls-preflight.ts"` but
+>   `packages/db/scripts/` contains only `migrate.ts` — the preflight script is missing. Write it
+>   (it is a thin wrapper over the exported `runTenantRlsPreflight` +
+>   `createPostgresTenantRlsIntrospector`) as the first task of this step.
+>
+> **Do Step 2 first.** Nothing here is worth forcing ahead of it: rule 2 exists precisely so a bad
+> backfill is recoverable rather than a lockout.
 
 ### Step 6 — SIP connect token / key retirement (independent track)
 
@@ -619,8 +737,9 @@ against unknown roles.
 ```
 apps/identity/                                   # Dockerfile only; not in compose
 packages/identity/                               # incl. drizzle/, migrations/, scripts/, 19 tests
-packages/identity-client/                        # zero consumers today
+packages/identity-client/                        # DELETED 2026-08-05
 packages/common/src/identity/                    # 12 files: interceptor, roles, token utils
+                                                 #   getPublicKey.ts already has zero consumers
 packages/common/src/protos/identity.proto
 packages/types/src/identity.types.ts             # + its re-export in packages/types/src/index.ts
 packages/sdk/src/generated/{node,web}/identity*  # regenerated surface
@@ -629,8 +748,9 @@ packages/sdk/src/client/{TokenRefresherNode,TokenRefresherWeb,isJwtExpired}.ts
 .github/workflows/publish-identity.yaml
 .github/workflows/release.yaml                   # remove the publish-identity job + its needs entry (:122-126, :139)
 .scripts/gen-code-proto.sh                       # remove the identity_pb / IdentityServiceClientPb targets (:26, :44)
-.oxfmtrc.json                                    # remove the packages/identity-client/proto/** ignore entry
-packages/{voice,sipnet}/package.json             # remove the @optimiq-voice/identity dependency
+.oxfmtrc.json                                    # DONE 2026-08-05 (identity-client ignore removed)
+packages/sipnet/package.json                     # remove the @optimiq-voice/identity dependency
+                                                 #   (packages/voice: DONE 2026-08-05)
 apps/api/src/core/identityConfig.ts
 apps/api/src/http/identity-invite.controller.ts  # replaced by better-auth accept-invitation
 openspec/changes/{identity-client,identity-standalone-service}/  # archive
@@ -655,9 +775,42 @@ Deprecate (do not delete) the published npm packages `@optimiq-voice/identity@0.
    `packages/identity` deletion is cosmetic by comparison.
 5. Every step ends with an explicit gate; no step ships without it.
 
-## 5. Cheap wins available immediately (no cutover required)
+## 5. Cheap wins — **ALL TAKEN 2026-08-05**
 
-- Remove `@optimiq-voice/identity` from `packages/voice/package.json` — it is never imported.
-- Remove the empty `import {} from "@optimiq-voice/identity";` in
-  `apps/api/src/secrets/listSecrets.ts:9`.
-- `packages/identity-client` can be deleted at any time: zero consumers, zero lockfile importers.
+- [x] Remove `@optimiq-voice/identity` from `packages/voice/package.json` — it is never imported.
+- [x] Remove the empty `import {} from "@optimiq-voice/identity";` in
+      `apps/api/src/secrets/listSecrets.ts:9`.
+- [x] Delete `packages/identity-client` (zero consumers, zero lockfile importers) and its
+      `.oxfmtrc.json` ignore entry. Its `openspec/changes/identity-client/` archive and the
+      `.lerna-changed-buster-249` marker remain on the Step 9 list.
+
+The root `package.json` `db:generate` / `db:migrate` still fan out to `@optimiq-voice/identity`;
+that is Step 8 item 4 and is deliberately **not** done here — the `fnidentity` database must stay
+provisioned until the Step 2 backfill is verified in every environment.
+
+## 6. Bugs and gaps found during the cutover
+
+Fixed:
+
+- **`packages/common/src/utils/assertEnvsAreSet.ts` called `process.exit(1)`** after `logger.error`,
+  so with `LOGS_LEVEL=none` — every test run — a missing root `.env` produced exit code 1 and no
+  output at all. It now throws `MissingEnvironmentError` and reports **all** missing variables
+  rather than only the first. All five call sites are module-level (`apps/api/src/envs.ts`,
+  `apps/autopilot/src/envs.ts`, `apps/mcp/src/env.ts`); none catch it, so the process still dies —
+  it just says why now.
+
+Open, out of scope here:
+
+- **`config/integrations.json` does not exist.** `.env.example.dev:51` (`API_INTEGRATIONS_FILE`)
+  and `:84` (`AUTOPILOT_INTEGRATIONS_FILE`) both point at it, but only
+  `config/integrations.example.json` is committed, so a fresh checkout cannot boot the runtime —
+  `assertFileExists(INTEGRATIONS_FILE)` in `apps/autopilot/src/envs.ts` kills the process. Fix by
+  copying the example in a `postinstall`/bootstrap step or by pointing the example env at
+  `integrations.example.json`. **Not created here** — the file is environment-specific.
+- **`GET /api/recordings/:id` is anonymous and enumerable.** See the Step 3 notes; it needs a
+  signed expiring URL, which is a media-pipeline change.
+- **`packages/db/scripts/tenant-rls-preflight.ts` is missing** although `db:preflight:tenant-rls`
+  invokes it. See the Step 5 blocker.
+- **`apps/api` reads `API_IDENTITY_{PRIVATE,PUBLIC}_KEY_PATH` and `API_INTEGRATIONS_FILE` relative
+  to the process working directory**, so any script whose cwd is `apps/api` rather than the
+  repository root cannot find them (carried over from Step 1.5.f).
