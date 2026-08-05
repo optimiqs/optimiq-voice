@@ -1,0 +1,16 @@
+{
+	// The tooling-facing project: `tsc --noEmit` (typecheck), `bun test` and `tsx` all resolve
+	// this one, so it includes everything they can reach. The emitting project is
+	// `tsconfig.build.json`, which narrows to `src` and sets `rootDir`.
+	//
+	// Full oikos strictness (`plans/reference/oikos-conventions.md` §8) — deliberately NOT the
+	// relaxed contract `apps/api` carries for its ~180 pre-oikos files. Nothing here predates the
+	// convention, so nothing here gets the exemption.
+	"extends": "../../tsconfig.base.json",
+	"compilerOptions": {
+		"outDir": "./dist",
+		"noEmit": true
+	},
+	"include": ["src/**/*", "test/**/*"],
+	"exclude": ["node_modules", "dist"]
+}

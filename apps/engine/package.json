@@ -1,0 +1,49 @@
+{
+	"name": "@optimiq-voice/engine",
+	"version": "0.1.0",
+	"private": true,
+	"description": "The Optimiq Voice call engine: ARI-driven channel orchestration, the session-protocol verb executor, typed NATS call events, live channel state in JetStream KV and per-leg CDR emission",
+	"license": "MIT",
+	"type": "module",
+	"main": "./dist/main.js",
+	"types": "./src/main.ts",
+	"files": [
+		"dist"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/optimiqs/optimiq-voice.git"
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json && node ../../.scripts/rewrite-esm-specifiers.mjs",
+		"clean": "rimraf ./dist",
+		"start": "node dist/main.js",
+		"start:dev": "tsx watch src/main.ts",
+		"test": "bun test src",
+		"test:integration": "RUN_ENGINE_INTEGRATION_TESTS=true bun test test --max-concurrency 1",
+		"typecheck": "tsc -p tsconfig.json --noEmit"
+	},
+	"dependencies": {
+		"@nestjs/common": "catalog:",
+		"@nestjs/core": "catalog:",
+		"@nestjs/microservices": "catalog:",
+		"@nestjs/platform-fastify": "catalog:",
+		"@optimiq-voice/config": "workspace:*",
+		"@optimiq-voice/effect-runtime": "workspace:*",
+		"@optimiq-voice/events": "workspace:*",
+		"@optimiq-voice/identifiers": "workspace:*",
+		"@optimiq-voice/logging": "workspace:*",
+		"@optimiq-voice/media-ari": "workspace:*",
+		"@optimiq-voice/telephony": "workspace:*",
+		"effect": "catalog:",
+		"fastify": "catalog:",
+		"nats": "catalog:",
+		"reflect-metadata": "catalog:",
+		"rxjs": "catalog:",
+		"zod": "catalog:"
+	},
+	"devDependencies": {
+		"@types/bun": "catalog:",
+		"typescript": "^5.9.3"
+	}
+}
