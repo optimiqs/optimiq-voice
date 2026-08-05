@@ -4,6 +4,4 @@ export * from "./createGetUserByWorkspaceAccessKeyId";
 export * from "./createGetUserByAccessKeyId";
 export * from "./generateAccessKeyId";
 export * from "./getAccessKeyIdFromToken";
-export * from "./hasAccessToResource";
 export * from "./createUpdateMembershipStatus";
-export * from "./withAccess";

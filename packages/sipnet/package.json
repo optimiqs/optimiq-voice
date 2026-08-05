@@ -19,7 +19,6 @@
 	},
 	"dependencies": {
 		"@optimiq-voice/common": "workspace:^",
-		"@optimiq-voice/identity": "workspace:^",
 		"@optimiq-voice/logger": "workspace:^",
 		"@optimiq-voice/types": "workspace:^",
 		"@grpc/grpc-js": "1.10.12",

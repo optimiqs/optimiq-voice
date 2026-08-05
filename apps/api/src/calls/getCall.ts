@@ -1,6 +1,6 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
 import {
-	getAccessKeyIdFromCall,
+	findTenantAccessKeyInCall,
+	getOrganizationIdFromCall,
 	GrpcErrorMessage,
 	InfluxDBClient,
 	Validators as V,
@@ -25,11 +25,13 @@ function getCall(influx: InfluxDBClient) {
 	) => {
 		const { ref } = call.request;
 
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const organizationId = getOrganizationIdFromCall(call);
 
-		logger.verbose("call to getCall", { accessKeyId, ref });
+		const legacyAccessKeyId = findTenantAccessKeyInCall(call);
 
-		const response = await fetchSingleCall(accessKeyId, ref);
+		logger.verbose("call to getCall", { organizationId, ref });
+
+		const response = await fetchSingleCall([organizationId, legacyAccessKeyId], ref);
 
 		if (!response) {
 			throw notFoundError(`Call not found: ${ref}`);

@@ -1,5 +1,5 @@
 import { ServerInterceptingCall, status } from "@grpc/grpc-js";
-import { createInterceptingCall, getAccessKeyIdFromCall } from "@optimiq-voice/common";
+import { createInterceptingCall, findOrganizationIdInCall } from "@optimiq-voice/common";
 import { getLogger } from "@optimiq-voice/logger";
 import { AuthzClient } from "./client/AuthzClient";
 import { CheckMethodAuthorizedRequest } from "./types";
@@ -40,28 +40,44 @@ function createCheckMethodAuthorized(authzServer: string, methods: string[]) {
 			return call;
 		}
 
-		const accessKeyId = getAccessKeyIdFromCall(call);
-
-		logger.verbose("checking if method is authorized", { method, accessKeyId });
-
 		return new ServerInterceptingCall(call, {
 			start: async (next) => {
+				// Read lazily, not in the interceptor body: the tenancy interceptor resolves the
+				// organization asynchronously and stamps it on the shared `Metadata` instance, so a
+				// read taken while the interceptor chain is still being built would see nothing.
+				// `runServices` therefore installs this one AFTER the tenancy interceptor.
+				const organizationId = findOrganizationIdInCall(call);
+
+				logger.verbose("checking if method is authorized", { method, organizationId });
+
+				if (!organizationId) {
+					logger.verbose("refusing an unscoped call", { method });
+					createInterceptingCall({
+						call,
+						code: status.PERMISSION_DENIED,
+						details: `Method unauthorized`,
+					});
+					return;
+				}
+
 				try {
 					const authorized = await authz.checkMethodAuthorized({
-						accessKeyId,
+						// The wire field keeps its name during coexistence; the VALUE is the
+						// organization id now, matching every other tenant claim since Step 4.
+						accessKeyId: organizationId,
 						method,
 					} as CheckMethodAuthorizedRequest);
 
 					logger.verbose("the status of the method authorization", {
 						method,
-						accessKeyId,
+						organizationId,
 						authorized,
 					});
 
 					if (!authorized) {
 						logger.verbose("method unauthorized by external service", {
 							method,
-							accessKeyId,
+							organizationId,
 						});
 						createInterceptingCall({
 							call,
@@ -75,7 +91,7 @@ function createCheckMethodAuthorized(authzServer: string, methods: string[]) {
 				} catch (error) {
 					logger.error("error checking if method is authorized", {
 						method,
-						accessKeyId,
+						organizationId,
 						error,
 					});
 

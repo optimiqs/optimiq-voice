@@ -1,6 +1,5 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
 import {
-	getAccessKeyIdFromCall,
+	getOrganizationIdFromCall,
 	GrpcErrorMessage,
 	Validators as V,
 	withErrorHandlingAndValidation,
@@ -17,9 +16,9 @@ function updateAcl(api: AclsApi) {
 	) => {
 		const { request } = call;
 
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const organizationId = getOrganizationIdFromCall(call);
 
-		logger.verbose("call to updateAcl", { ...request, accessKeyId });
+		logger.verbose("call to updateAcl", { ...request, organizationId });
 
 		const response = await api.updateAcl({ ...request, deny: ["0.0.0.0/0"] });
 

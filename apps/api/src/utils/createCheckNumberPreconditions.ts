@@ -1,16 +1,19 @@
 import { status } from "@grpc/grpc-js";
 import { GrpcError } from "@optimiq-voice/common";
+import { NumberPreconditionsCheck } from "@optimiq-voice/common";
 import { Database } from "../core/db";
 
-function createCheckNumberPreconditions(db: Database) {
-	return async function checkNumberPreconditions({ appRef, accessKeyId }) {
+function createCheckNumberPreconditions(db: Database): NumberPreconditionsCheck {
+	return async function checkNumberPreconditions({ appRef }, organizationId) {
 		// You can have a Number without an Application but it must exist
 		if (!appRef) {
 			return;
 		}
 
-		const app = await db.application.findUnique({
-			where: { ref: appRef, accessKeyId },
+		// Scoped: another tenant's application ref is invisible here, so pointing a number at it
+		// fails the precondition instead of silently succeeding.
+		const app = await db.forOrganization(organizationId).application.findUnique({
+			where: { ref: appRef },
 		});
 
 		if (!app) {

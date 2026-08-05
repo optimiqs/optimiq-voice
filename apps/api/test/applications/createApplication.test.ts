@@ -6,7 +6,7 @@ import { createSandbox } from "sinon";
 import sinonChai from "sinon-chai";
 import { DatabaseErrorCode } from "@optimiq-voice/common";
 import { ApplicationType } from "@optimiq-voice/types";
-import { TEST_TOKEN } from "../utils";
+import { createTestCallMetadata, TEST_ORGANIZATION_ID } from "../utils";
 import type { Database } from "../../src/core/db";
 
 chai.use(chaiAsPromised);
@@ -22,13 +22,16 @@ describe("@applications/createApplication", function () {
 		// Arrange
 		const { createCreateApplication } =
 			await import("../../src/applications/createCreateApplication");
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		const metadata = createTestCallMetadata();
 
-		const applications = {
+		const tenantDb = {
 			application: {
 				create: sandbox.stub().resolves({ ref: "123" }),
 			},
+		};
+
+		const applications = {
+			forOrganization: sandbox.stub().returns(tenantDb),
 		} as unknown as Database;
 
 		const call = {
@@ -47,12 +50,15 @@ describe("@applications/createApplication", function () {
 
 		// Assert
 		expect(callback).to.have.been.calledOnceWithExactly(null, { ref: "123" });
+		expect(applications.forOrganization).to.have.been.calledOnceWithExactly(TEST_ORGANIZATION_ID);
+		expect(tenantDb.application.create).to.have.been.calledWithMatch({
+			data: { organizationId: TEST_ORGANIZATION_ID },
+		});
 	});
 
 	it("should throw an error if the application already exists", async function () {
 		// Arrange
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		const metadata = createTestCallMetadata();
 
 		const call = {
 			metadata,
@@ -64,9 +70,11 @@ describe("@applications/createApplication", function () {
 		};
 
 		const db = {
-			application: {
-				create: sandbox.stub().throws({ code: DatabaseErrorCode.RECORD_ALREADY_EXISTS }),
-			},
+			forOrganization: sandbox.stub().returns({
+				application: {
+					create: sandbox.stub().throws({ code: DatabaseErrorCode.RECORD_ALREADY_EXISTS }),
+				},
+			}),
 		} as unknown as Database;
 
 		const { createCreateApplication } =

@@ -1,7 +1,7 @@
 import { status as GRPCStatus, ServerInterceptingCall } from "@grpc/grpc-js";
 import { customAlphabet } from "nanoid";
 import {
-	getAccessKeyIdFromCall,
+	getTenantAccessKeyFromCall,
 	getTokenFromCall,
 	GrpcErrorMessage,
 	Validators as V,
@@ -68,7 +68,7 @@ function createInviteUserToWorkspace(
 	) => {
 		const token = getTokenFromCall(call as unknown as ServerInterceptingCall);
 		const adminRef = getUserRefFromToken(token);
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const accessKeyId = getTenantAccessKeyFromCall(call);
 
 		const workspace = await db.workspace.findUnique({
 			where: {

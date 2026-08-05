@@ -1,10 +1,9 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
 import { Struct, struct } from "pb-util";
 import { z } from "zod";
 import {
 	assistantSchema,
 	findIntegrationsCredentials,
-	getAccessKeyIdFromCall,
+	getOrganizationIdFromCall,
 	IntegrationConfig,
 } from "@optimiq-voice/common";
 import { getLogger } from "@optimiq-voice/logger";
@@ -30,10 +29,10 @@ function createEvaluateIntelligence(integrations: IntegrationConfig[]) {
 		const { request } = call;
 		const { intelligence } = request;
 
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const organizationId = getOrganizationIdFromCall(call);
 
 		logger.verbose("call to evaluateIntelligence", {
-			accessKeyId,
+			organizationId,
 			llmProductRef: intelligence.productRef,
 			evalLlmProductRef: "llm.openai",
 		});

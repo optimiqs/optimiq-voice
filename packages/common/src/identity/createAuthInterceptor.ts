@@ -1,8 +1,7 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
+import { Metadata, ServerInterceptingCall } from "@grpc/grpc-js";
 import { getLogger } from "@optimiq-voice/logger";
 import { decodeToken } from "./decodeToken";
 import { permissionDeniedError, unauthenticatedError } from "./errors";
-import { getAccessKeyIdFromCall } from "./getAccessKeyIdFromCall";
 import { getTokenFromCall } from "./getTokenFromCall";
 import { hasAccess } from "./hasAccess";
 import { isValidToken } from "./isValidToken";
@@ -11,6 +10,23 @@ import { tokenHasAccessKeyId } from "./tokenHasAccessKeyId";
 import { Access, TokenUseEnum } from "./types";
 
 const logger = getLogger({ service: "common", filePath: __filename });
+
+/**
+ * The **client-supplied** `accesskeyid` header.
+ *
+ * This used to be the exported `getAccessKeyIdFromCall`, which 18 handlers across five packages
+ * called to scope their queries. Identity-removal Step 3 item 2 deleted that export: the tenant is
+ * now derived from the verified token and stamped by `createTenancyInterceptor`, and handlers read
+ * it through `getOrganizationIdFromCall` / `getTenantAccessKeyFromCall` in `src/tenancy/`.
+ *
+ * It survives here, private and unexported, only because this interceptor's `tokenHasAccessKeyId`
+ * cross-check runs BEFORE the tenancy interceptor overwrites the header, so at this point it is
+ * still what the caller sent — which is exactly what that check is meant to compare against. This
+ * whole module is deleted in Step 9 (sequencing rule 4).
+ */
+function readRequestedAccessKeyId(call: ServerInterceptingCall): string | undefined {
+	return (call as unknown as { metadata: Metadata }).metadata.getMap()["accesskeyid"]?.toString();
+}
 
 /**
  * This function is a gRPC interceptor that checks if the request is valid
@@ -34,7 +50,7 @@ function createAuthInterceptor(identityPublicKey: string, publicPath: string[]) 
 	return (methodDefinition: { path: string }, call: ServerInterceptingCall) => {
 		const { path } = methodDefinition;
 
-		const accessKeyId = getAccessKeyIdFromCall(call);
+		const accessKeyId = readRequestedAccessKeyId(call);
 
 		logger.verbose("intercepting api call to path", { accessKeyId, path });
 

@@ -1,11 +1,10 @@
-import * as grpc from "@grpc/grpc-js";
 import * as chai from "chai";
 import { expect } from "chai";
 import chaiAsPromised from "chai-as-promised";
 import { createSandbox } from "sinon";
 import sinonChai from "sinon-chai";
 import { Database } from "../../src/core/db";
-import { TEST_TOKEN } from "../utils";
+import { createTestCallMetadata, TEST_ORGANIZATION_ID } from "../utils";
 
 chai.use(chaiAsPromised);
 chai.use(sinonChai);
@@ -18,8 +17,7 @@ describe("@applications/listApplications", function () {
 
 	it("should list applications", async function () {
 		// Arrange
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		const metadata = createTestCallMetadata();
 
 		const call = {
 			metadata,
@@ -33,16 +31,20 @@ describe("@applications/listApplications", function () {
 			{
 				ref: "123",
 				name: "My Application",
-				accessKeyId: "GRahn02s8tgdfghz72vb0fz538qpb5z35p",
+				organizationId: TEST_ORGANIZATION_ID,
 				createdAt: new Date(),
 				updatedAt: new Date(),
 			},
 		];
 
-		const db = {
+		const tenantDb = {
 			application: {
 				findMany: sandbox.stub().resolves(applications),
 			},
+		};
+
+		const db = {
+			forOrganization: sandbox.stub().returns(tenantDb),
 		} as unknown as Database;
 
 		const { createListApplications } =
@@ -57,6 +59,10 @@ describe("@applications/listApplications", function () {
 		});
 
 		// Assert
+		expect(db.forOrganization).to.have.been.calledOnceWithExactly(TEST_ORGANIZATION_ID);
+		expect(tenantDb.application.findMany).to.have.been.calledWithMatch({
+			where: { organizationId: TEST_ORGANIZATION_ID },
+		});
 		expect(response).has.property("items").to.be.an("array").to.have.lengthOf(1);
 		// When items.length < pageSize, we're on the last page, so nextPageToken should be empty string
 		expect(response).has.property("nextPageToken").to.equal("");
@@ -64,8 +70,7 @@ describe("@applications/listApplications", function () {
 
 	it("should return nextPageToken when page is full", async function () {
 		// Arrange
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		const metadata = createTestCallMetadata();
 
 		const call = {
 			metadata,
@@ -80,23 +85,25 @@ describe("@applications/listApplications", function () {
 			{
 				ref: "app-1",
 				name: "Application 1",
-				accessKeyId: "GRahn02s8tgdfghz72vb0fz538qpb5z35p",
+				organizationId: TEST_ORGANIZATION_ID,
 				createdAt: new Date(),
 				updatedAt: new Date(),
 			},
 			{
 				ref: "app-2",
 				name: "Application 2",
-				accessKeyId: "GRahn02s8tgdfghz72vb0fz538qpb5z35p",
+				organizationId: TEST_ORGANIZATION_ID,
 				createdAt: new Date(),
 				updatedAt: new Date(),
 			},
 		];
 
 		const db = {
-			application: {
-				findMany: sandbox.stub().resolves(applications),
-			},
+			forOrganization: sandbox.stub().returns({
+				application: {
+					findMany: sandbox.stub().resolves(applications),
+				},
+			}),
 		} as unknown as Database;
 
 		const { createListApplications } =
@@ -118,8 +125,7 @@ describe("@applications/listApplications", function () {
 
 	it("should return an empty array if no applications found", async function () {
 		// Arrange
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		const metadata = createTestCallMetadata();
 
 		const call = {
 			metadata,
@@ -130,9 +136,11 @@ describe("@applications/listApplications", function () {
 		};
 
 		const db = {
-			application: {
-				findMany: sandbox.stub().resolves([]),
-			},
+			forOrganization: sandbox.stub().returns({
+				application: {
+					findMany: sandbox.stub().resolves([]),
+				},
+			}),
 		} as unknown as Database;
 
 		const { createListApplications } =

@@ -6,6 +6,7 @@ import sinonChai from "sinon-chai";
 import { InfluxDBClient } from "@optimiq-voice/common";
 /* eslint-disable prettier/prettier */
 import { CallType, CallStatus } from "@optimiq-voice/types";
+import { TEST_ACCESS_KEY_ID, TEST_ORGANIZATION_ID } from "../utils";
 
 chai.use(chaiAsPromised);
 chai.use(sinonChai);
@@ -19,7 +20,7 @@ describe("@calls/fetchCalls", function () {
 	it("should fetch calls from influxdb with no filters", async function () {
 		// Arrange
 		const { createFetchCalls } = await import("../../src/calls/createFetchCalls");
-		const accessKeyId = "accessKeyId";
+		const accessKeyId = TEST_ORGANIZATION_ID;
 		const items = [
 			{
 				ref: "01",
@@ -40,7 +41,9 @@ describe("@calls/fetchCalls", function () {
 		const fetchCalls = createFetchCalls(influxdb);
 
 		// Act
-		const result = await fetchCalls(accessKeyId, {});
+		// The CDR tag is filtered against the *set* of tenant ids — the organization id plus, for a
+		// tenant whose history predates the cutover, its legacy `WO…` key.
+		const result = await fetchCalls([accessKeyId], {});
 
 		// Assert
 		expect(result).to.deep.equal({
@@ -52,7 +55,7 @@ describe("@calls/fetchCalls", function () {
 	it("should fetch calls from influxdb with filters", async function () {
 		// Arrange
 		const { createFetchCalls } = await import("../../src/calls/createFetchCalls");
-		const accessKeyId = "accessKeyId";
+		const accessKeyId = TEST_ORGANIZATION_ID;
 		const type = CallType.API_ORIGINATED;
 		const from = "+1234567890";
 		const to = "+1234567891";
@@ -80,7 +83,7 @@ describe("@calls/fetchCalls", function () {
 		const fetchCalls = createFetchCalls(influxdb);
 
 		// Act
-		await fetchCalls(accessKeyId, {
+		await fetchCalls([accessKeyId, TEST_ACCESS_KEY_ID], {
 			after: "2024-01-01T00:00:00.000Z",
 			before: "2024-01-02T23:00:00.000Z",
 			type,
@@ -101,7 +104,9 @@ describe("@calls/fetchCalls", function () {
 		expect(queryStr).to.include("group()");
 		expect(queryStr).to.include('sort(columns: ["startedAtParsed"], desc: true)');
 		expect(queryStr).to.include("limit(n: 50)");
-		expect(queryStr).to.include(`and r.accessKeyId == "${accessKeyId}"`);
+		expect(queryStr).to.include(
+			`and contains(value: r.accessKeyId, set: ["${accessKeyId}","${TEST_ACCESS_KEY_ID}"])`,
+		);
 		expect(queryStr).to.include(`and r.type == "${type}"`);
 		expect(queryStr).to.include(`and r.from == "${from}"`);
 		expect(queryStr).to.include(`and r.to == "${to}"`);

@@ -1,5 +1,8 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
-import { getAccessKeyIdFromCall, GrpcErrorMessage, Validators as V } from "@optimiq-voice/common";
+import {
+	getTenantAccessKeyFromCall,
+	GrpcErrorMessage,
+	Validators as V,
+} from "@optimiq-voice/common";
 import { getLogger } from "@optimiq-voice/logger";
 import { CreateApiKeyRequest, CreateApiKeyResponse } from "@optimiq-voice/types";
 import { Database } from "../db";
@@ -14,7 +17,7 @@ function createCreateApiKey(db: Database) {
 		call: { request: CreateApiKeyRequest },
 		callback: (error: GrpcErrorMessage, response?: CreateApiKeyResponse) => void,
 	) => {
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const accessKeyId = getTenantAccessKeyFromCall(call);
 
 		const { request } = call;
 		const { role, expiresAt } = request;

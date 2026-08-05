@@ -1,4 +1,5 @@
 import {
+	getOrganizationIdFromCall,
 	GrpcErrorMessage,
 	NumberPreconditionsCheck,
 	Validators as V,
@@ -17,8 +18,8 @@ function updateNumber(api: NumbersApi, checkNumberPreconditions: NumberPrecondit
 	) => {
 		const { request } = call;
 
-		// Validates that the appRef or agentAor exists in the system
-		await checkNumberPreconditions(request);
+		// Validates that the appRef or agentAor exists in the system, within this tenant
+		await checkNumberPreconditions(request, getOrganizationIdFromCall(call));
 
 		logger.verbose("call to updateNumber", { ...request });
 

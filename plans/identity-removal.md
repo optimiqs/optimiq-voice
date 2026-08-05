@@ -1,9 +1,8 @@
 # Identity Service Removal — Cutover Plan
 
-**Date:** 2026-08-05 · **Phase:** written in P0, executed in P1 · **Status:** Steps 1, 1.5, **2**
-and 4 are **DONE**; Step 3 is **DONE for the HTTP surface including `x-api-key`** (the gRPC
-handlers remain, now blocked on Step 5 rather than Step 2); Step 5 item 5 (the preflight script)
-is **DONE**, items 1-4 remain; Steps 6-9 not started, with their gates restated below.
+**Date:** 2026-08-05 · **Phase:** written in P0, executed in P1 · **Status:** Steps 1, 1.5, **2**,
+**3**, 4 and **5** are **DONE**; Step 6 is settled (recommendation (b) adopted); Steps 7-9 not
+started, with their gates restated below.
 
 The custom RS256 gRPC identity service is retired and replaced by **better-auth 1.6.23**
 (`packages/auth`) on the **base database** (`packages/db`). This document enumerates everything
@@ -17,9 +16,19 @@ that currently depends on identity and the ordered steps to remove each.
 > bearer token; `packages/voice` verifies per-call tokens against `/api/auth/jwks`; **the legacy
 > `fnidentity` dataset migrates into better-auth organizations** (Step 2) and **`apps/api` mints
 > every per-call token with better-auth** (Step 4 item 4) — the identity signer has no callers
-> left on the call path. `packages/identity-client` is **deleted**. `apps/identity`,
-> `packages/identity`, `packages/common/src/identity/` and the `fnidentity` database are still in
-> place — the gRPC servers `RuntimeHostService` starts continue to authenticate through them.
+> left on the call path.
+>
+> **New (Step 5, and the Step 3 remainder it unblocked).** Every telephony table in the `apps/api`
+> database carries `organization_id uuid not null`, backfilled from the Step 2 ledger and enforced
+> by PostgreSQL row-level security under a non-inheriting `api_tenant_tls` role; the boot sequence
+> refuses to start if that contract has drifted. `getAccessKeyIdFromCall` — the client-supplied
+> tenant header 18 handlers filtered by — **is deleted**, along with `withAccess` and
+> `hasAccessToResource` and their _existence-implies-access_ defect. The tenant on the gRPC wire is
+> now derived from the verified token and stamped by the server.
+>
+> `packages/identity-client` is **deleted**. `apps/identity`, `packages/identity`,
+> `packages/common/src/identity/` and the `fnidentity` database are still in place — the gRPC
+> servers `RuntimeHostService` starts continue to authenticate through them.
 
 ---
 
@@ -78,12 +87,14 @@ container**.
 4. Authorization gate: `hasAccess(decoded, path)` against the role tables in
    `packages/common/src/identity/roles.ts`, then `tokenHasAccessKeyId(token, accessKeyId)` for
    paths in `workspaceResourceAccess` (50+) / `workspaceResourceOwnerOrAdminAccess` (4).
-5. Per-resource ownership: `withAccess` → `hasAccessToResource` compares the token's
-   `access[].accessKeyId` list to the resource's `extended.accessKeyId` JSONB column.
-   **Known defect: if the resource does not exist, access is ALLOWED**
-   (`packages/identity/src/utils/hasAccessToResource.ts:26`).
-6. 17 handlers additionally call `getAccessKeyIdFromCall(call)` directly to scope list/create
-   queries (`apps/api` ×10, `packages/sipnet` ×6, `packages/authz` ×1, `apps/autopilot` ×1).
+5. ~~Per-resource ownership: `withAccess` → `hasAccessToResource`~~ — **DELETED 2026-08-05**
+   (Step 3 item 4). It compared the token's `access[].accessKeyId` list to the resource's
+   `extended.accessKeyId` JSONB column, and opened with `if (!extended) return true`, so a missing
+   resource GRANTED access (`packages/identity/src/utils/hasAccessToResource.ts:26`). Both files
+   are gone; see Step 3 item 4 for what replaced them.
+6. ~~18 handlers additionally call `getAccessKeyIdFromCall(call)`~~ — **DELETED 2026-08-05**
+   (Step 3 item 2). The count was 18, not 17: `apps/api` ×10, `packages/sipnet` ×6,
+   `packages/authz` ×1, `apps/autopilot` ×1, plus 6 inside `packages/identity` itself.
 
 `packages/voice/src/VoiceServer.ts:36` is the only consumer of `getPublicKey.ts` — it fetches
 the identity public key over gRPC at startup (`config.identityAddress`, default
@@ -367,16 +378,16 @@ first-class upgrade for an existing `__drizzle_migrations_api` table
 `apps/api/scripts/db-provision.mjs` needed one edit for the same reason as `db.ts`:
 `drizzle(client)` → `drizzle({ client })`.
 
-> ⚠️ **Known artifact — the next `db:generate` will not be empty.** drizzle-kit 1.0 diffs the
-> converted snapshot against the schema and emits four cosmetic
-> `ALTER COLUMN … SET DATA TYPE timestamp(3)` statements for
+> ⚠️ ~~**Known artifact — the next `db:generate` will not be empty.**~~ **RESOLVED 2026-08-05,
+> option (b).** drizzle-kit 1.0 diffed the converted snapshot against the schema and emitted four
+> cosmetic `ALTER COLUMN … SET DATA TYPE timestamp(3)` statements for
 > `applications.{created_at,updated_at}` and `secrets.{created_at,updated_at}` — the v7→v8 snapshot
-> conversion represents `timestamp(…, { precision: 3 })` differently than 1.0's own serializer.
-> **There is no structural drift**: no table, column, index, constraint or enum differs, which
-> also confirms the `defineRelations` rewrite changed no DDL. Two options, decide before the next
-> schema change: (a) accept one no-op normalization migration so the snapshot becomes honest —
-> costs a table rewrite lock on two tables; (b) hand-correct the `timestamp` entries in
-> `20260805032410_baseline/snapshot.json`. It was deliberately **not** generated here.
+> conversion wrote `"timestamp (3)"` where 1.0's own serializer writes `"timestamp(3)"`. There was
+> no structural drift, which also confirmed the `defineRelations` rewrite changed no DDL. The four
+> entries in `20260805032410_baseline/snapshot.json` were hand-corrected (option (b)) rather than
+> taking option (a)'s no-op normalization migration, which would have cost a table rewrite lock on
+> the two busiest tables for zero change. Step 5's `db:generate` then emitted exactly the
+> `organization_id` columns and nothing else — which is how the fix was verified.
 
 #### 1.5.d Test suite
 
@@ -502,50 +513,108 @@ through `auth.api.verifyApiKey`, which is the only way to know the migration's l
 re-implementation of `defaultKeyHasher` agrees with the plugin's. Local run: 5 users (5 sign-ins,
 0 resets required), 3 organizations (3 with exactly one owner), 5 members, 1 invitation, 1 api key.
 
-### Step 3 — Replace `createAuthInterceptor` with a session guard — **HTTP SURFACE DONE 2026-08-05**
+### Step 3 — Replace `createAuthInterceptor` with a session guard — **DONE 2026-08-05**
 
 - [x] 1. New `apps/api` guard: resolve the caller in order — session cookie →
       `Authorization: Bearer` (bearer plugin) → `x-api-key` (apiKey plugin). **All three are done.**
       Cookie and bearer are handled inside `auth.api.getSession`; `x-api-key` is resolved
       explicitly by `createApiKeySessionResolver` (see the ex-blocker below, now RESOLVED).
-- [x] 2. `requireActiveOrganizationId(session)` supplies the tenant id on the HTTP surface, and
-      the voice server's interceptor stamps the organization id from a signed claim
-      (`ORGANIZATION_METADATA_KEY`) rather than trusting the caller. **Deleting
-      `getAccessKeyIdFromCall` is still open — the blocker MOVED from Step 2 to Step 5**, see
-      below.
+- [x] 2. `requireActiveOrganizationId(session)` supplies the tenant id on the HTTP surface; the
+      voice server's interceptor stamps the organization id from a signed claim
+      (`ORGANIZATION_METADATA_KEY`); and **`getAccessKeyIdFromCall` is deleted** — the gRPC surface
+      now gets the same treatment from `apps/api/src/core/createTenancyInterceptor.ts`. See
+      "Step 3 items 2/4/5 — what shipped" below.
 - [x] 3. `@RequirePermissions(...)` over `PERMISSIONS` / `SYSTEM_ROLE_TEMPLATES`, **global and
       deny-by-default**.
-- [ ] 4. Replace `withAccess` / `hasAccessToResource` in `apps/api` (3 sites) and `packages/sipnet`
-      (3 sites) with RLS scoping. **BLOCKED on Step 5** (Step 2 no longer blocks it). The
-      _existence-implies-access_ defect therefore still stands.
-- [x] 5. **Gate (HTTP half):** a cross-tenant request returns 403. `verify:auth` checks 14 assert
-      it for **both** principal kinds — an `x-api-key` caller and a session cookie asking for a
-      different organization's members both get 403. **The gRPC half is open with item 2.**
+- [x] 4. `withAccess` / `hasAccessToResource` are **deleted**. `apps/api`'s 3 sites moved to RLS
+      scoping (`db.forOrganization(...)`); `packages/sipnet`'s 3 sites moved to
+      `withTenantResourceAccess`, which cannot use RLS because those rows live in **Routr's**
+      database. The _existence-implies-access_ defect is closed in both.
+- [x] 5. **Gate:** a cross-tenant request is refused. `verify:auth` checks 14 assert it on the
+      HTTP surface for **both** principal kinds (403 for an `x-api-key` caller and for a session
+      cookie asking for a different organization's members). The gRPC half is asserted by
+      `verify:tenancy` section 5 — the owning tenant reads its own application, another tenant
+      reading the same ref gets `null` — and by `test/core/tenancyInterceptor.test.ts`.
 
-#### Step 3 items 2 / 4 / 5 — where the block actually is now (assessed 2026-08-05)
+#### Step 3 items 2 / 4 / 5 — what shipped (2026-08-05)
 
-Step 2 has landed, so the reason recorded here previously ("there is no `accessKeyId →
-organization.id` mapping to swap them onto") no longer applies. The mapping exists
-(`legacy_workspace_organization`) and `src/auth/legacy-access-key.repository.ts` reads it in both
-directions. What replaced it is a **data** block, not a mapping block:
+The block recorded here previously was a **data** block: the 18 direct `getAccessKeyIdFromCall`
+sites did not merely _read_ a tenant id, they **filtered rows by it**, and
+`applications.access_key_id` / `secrets.access_key_id` still held the `WO…` string. Step 5 item 1
+rewrote those columns, so the swap could finally happen without emptying every list query — and
+`verify:tenancy` proves it did not, by running the pre-rewrite SQL and the rewritten facade side
+by side for every tenant.
 
-- The 17 direct `getAccessKeyIdFromCall` sites (`apps/api` ×10 — `calls/`, `secrets/`,
-  `applications/`; `packages/sipnet` ×6; `packages/authz` ×1; `apps/autopilot` ×1) do not merely
-  _read_ a tenant id, they **filter rows by it**: `applications.access_key_id`,
-  `secrets.access_key_id` and the sipnet resources' `extended->>'accessKeyId'` all still store the
-  `WO…` string. Swapping the call sites to an organization id without first rewriting those
-  columns turns every list query into an empty result. That rewrite is Step 5 item 1.
-- Sequencing rule 4 also applies: `getAccessKeyIdFromCall` lives in
-  `packages/common/src/identity/` alongside `createAuthInterceptor`, which
-  `apps/api/src/core/runServices.ts` still installs on all 11 gRPC services. That module is
-  deleted **last**, in Step 9.
+**The tenant is no longer client-supplied.** `apps/api/src/core/createTenancyInterceptor.ts` is
+installed on every gRPC service after `createAuthInterceptor`. It reads the token, resolves the
+organization, and `metadata.set`s it — overwriting whatever arrived on the wire — exactly as
+`packages/voice`'s `createJwksAuthInterceptor` has done since Step 4 item 2.
 
-**Do Step 5 item 1 next.** It is the single remaining unblock for the whole gRPC surface. Nothing
-was forced ahead of it here: adding `organization_id uuid not null` to `applications` / `secrets`
-was deliberately NOT done in this pass because `API_DATABASE_URL` on the development machine
-points at a database that is not provisioned (`:5432/optimiq-voice` — only `:5433` is running,
-holding `optimiq`, `optimiq_pbx`, `optimiq_cdr`, `fnidentity`), so a `NOT NULL` column plus
-backfill could not have been executed or verified even once. Provision that database first.
+| token shape                            | tenant claim                         | resolution           |
+| -------------------------------------- | ------------------------------------ | -------------------- |
+| better-auth per-call token (Step 4)    | `organizationId`                     | used directly        |
+| better-auth token, legacy claim slot   | `accessKeyId` = an `organization.id` | used directly        |
+| legacy identity token (SDK, CLI, dash) | `access[].accessKeyId` = a `WO…` key | Step 2 ledger lookup |
+
+The third row is why the interceptor is asynchronous — the decision is deferred inside
+`onReceiveMetadata`, so the call does not reach a handler until `proceed(metadata)` runs.
+`LegacyAccessKeyRepository` memoises both directions, so it is a map hit after the first call for
+a tenant.
+
+**The cross-tenant gate.** A caller may still send `accesskeyid` (every released SDK does). It is
+no longer trusted, but it is not ignored: if it resolves to a different organization than the token
+does, the call is refused with `PERMISSION_DENIED` rather than quietly served against the token's
+tenant. Same posture `AuthService.resolveRoleIn` takes on the HTTP surface for an `x-api-key`
+principal. A token with no resolvable tenant ends the call — there is deliberately no unscoped
+fallback, because the identity-era behaviour (`accessKeyId === undefined` passed straight into a
+`where`) _was_ the cross-tenant read.
+
+**Two vocabularies, one source.** `packages/common/src/tenancy/` is a new directory —
+**not** `src/identity/`, which is deleted wholesale in Step 9 (sequencing rule 4). It exports:
+
+| symbol                       | meaning                                                            |
+| ---------------------------- | ------------------------------------------------------------------ |
+| `getOrganizationIdFromCall`  | the canonical tenant. Throws rather than returning `undefined`.    |
+| `getTenantAccessKeyFromCall` | the server-resolved `WO…` key, falling back to the organization id |
+| `stamp*` / `find*`           | what the interceptor writes, and the non-throwing reads            |
+
+The second one exists because two consumers still speak the legacy vocabulary and **neither is a
+table this migration owns**: Routr verifies the SIP/WebRTC connect token `createCreateTestToken`
+signs and matches it against `extended.accessKeyId` on its own rows, and `packages/sipnet` reads
+and writes those same rows. Step 6 recommendation (b) — adopted — keeps the SIP edge out of this
+migration; Routr's JSONB is rewritten when `apps/sipd` replaces it in Phase 6. For a tenant created
+after the cutover there is no `WO…` key and both helpers return the organization id, so the two
+vocabularies converge and sipnet needs no second code path.
+
+**`withAccess` is gone, and so is its defect.** It is replaced by two different things, because
+the two groups of resources are not alike:
+
+| resource                                  | before                               | after                                                            |
+| ----------------------------------------- | ------------------------------------ | ---------------------------------------------------------------- |
+| `apps/api` applications / secrets         | `withAccess` + `hasAccessToResource` | `db.forOrganization(orgId)` — PostgreSQL RLS decides visibility  |
+| `packages/sipnet` agents/domains/trunks/… | same                                 | `withTenantResourceAccess` — explicit check, Routr owns the rows |
+
+For the first group the row is not "found but refused"; outside the tenant's transaction scope it
+**does not exist**, so `getFn` raises the ordinary `NOT_FOUND` and enumeration is closed as a side
+effect. For the second, RLS is unavailable, so the check stays in application code — but a resource
+with no recorded owner, or one that cannot be read, is now **refused** rather than allowed, and it
+compares against the key resolved from the _verified_ token rather than `jwtDecode`'s output.
+
+**Deleted this pass:** `packages/common/src/identity/getAccessKeyIdFromCall.ts`,
+`packages/identity/src/utils/withAccess.ts`,
+`packages/identity/src/utils/hasAccessToResource.ts`, and the `@optimiq-voice/identity` dependency
+
+- tsconfig project reference from `packages/sipnet`. `createAuthInterceptor` keeps a **private,
+  unexported** copy of the header read, because its `tokenHasAccessKeyId` cross-check runs _before_
+  the tenancy interceptor overwrites the header, which is precisely what that check wants to compare
+  against. It dies with the module in Step 9.
+
+**One behaviour change worth knowing.** `packages/authz`'s `createCheckMethodAuthorized` now reads
+the organization **lazily, inside `start`**, rather than in the interceptor body: the tenancy
+interceptor resolves asynchronously and stamps the shared `Metadata` instance, so a read taken
+while the interceptor chain is still being built would see nothing. `runServices` therefore
+installs it after the tenancy interceptor, and an unscoped call is denied rather than passed
+through. `AUTHZ_SERVICE_ENABLED` is off by default.
 
 #### Step 3 — what shipped (HTTP surface)
 
@@ -798,16 +867,17 @@ predicted: `manager` resolves to 43 permissions and `agent` to 15, instead of bo
 Coverage: `packages/auth` bun specs **170** (151 before) — `access-control.spec.ts` is new (14
 cases) and `auth.spec.ts` gained 5 composition assertions.
 
-### Step 5 — Enable RLS on org-scoped tables — item 5 **DONE**, items 1-4 open (reassessed 2026-08-05)
+### Step 5 — Enable RLS on org-scoped tables — **DONE 2026-08-05**
 
-1. [ ] Add `organization_id uuid not null` to every telephony table; backfill from the Step 2
-       mapping via `extended->>'accessKeyId'` / `access_key_id`; drop the legacy column.
-2. [ ] Create the tenant role, per-table policies (`tenantOrganizationScope`) and grants for the
-       `apps/api` database. **Already true for `packages/pbx-db` and `packages/cdr-db`** — see the
-       correction below.
-3. [ ] Wire `assertTenantRlsPreflight` into `apps/api` boot **before** the server is created.
-4. [ ] Route every org-scoped repository through `withTenantScope`.
-5. [x] **Gate:** `db:preflight:tenant-rls` runs and is clean.
+1. [x] Add `organization_id uuid not null` to every telephony table; backfill from the Step 2
+       mapping via `extended->>'accessKeyId'` / `access_key_id`. **The legacy column is kept for
+       now** — see "Why `access_key_id` is not dropped yet" below; it dies in Step 9 with the
+       ledger.
+2. [x] Create the tenant role, per-table policies (`tenantOrganizationScope`) and grants for the
+       `apps/api` database. (Already true for `packages/pbx-db` and `packages/cdr-db`.)
+3. [x] Wire `assertTenantRlsPreflight` into `apps/api` boot **before** the server is created.
+4. [x] Route every org-scoped repository through `withTenantScope`.
+5. [x] **Gate:** `db:preflight:tenant-rls` runs and is clean — now for three databases, not two.
 
 #### Correction — `packages/pbx-db` exists, and its RLS is live
 
@@ -821,12 +891,8 @@ Verified 2026-08-05 against the local stack:
   (`20260805204846_pbx_baseline`, `20260805204916_pbx_tenant_grants`).
 - The live `optimiq_pbx` database on `:5433` has **35 tables**, the `pbx_tenant_tls` role and 36
   policies. `optimiq_cdr` has `cdr_tenant_tls` and 3 tenant tables.
-- Both pass the new preflight: `expected 35 / introspected 35 / errors []` and
+- Both pass the preflight: `expected 35 / introspected 35 / errors []` and
   `expected 3 / introspected 3 / errors []`.
-
-So item 2 has a home for the PBX and CDR contexts and is **already satisfied there**. What is
-missing is the `apps/api` database — the legacy telephony schema (`applications`, `secrets`,
-`tts_services`, …) — which has no tenant role, no policies and no `organization_id` column.
 
 #### Item 5 — what shipped
 
@@ -862,20 +928,168 @@ Two design notes:
 policy on them would make the very lookups that resolve a session unrunnable. The two Step 2
 `legacy_*` mapping tables are likewise platform-global and die in Step 9.
 
-#### What still gates items 1-4
+#### The environment that was missing — provisioned 2026-08-05
 
-- **The `apps/api` database is not provisioned on this machine.** `API_DATABASE_URL` points at
-  `postgresql://…@localhost:5432/optimiq-voice`; only `:5433` is running, holding `optimiq`
-  (auth), `optimiq_pbx`, `optimiq_cdr` and `fnidentity`. A `NOT NULL` tenant column plus backfill
-  could not be executed or verified even once, and adding an untested `NOT NULL` migration to the
-  path that every list query runs through is exactly the lockout sequencing rule 2 exists to
-  prevent. **Provision it, then do item 1** — the Step 2 mapping it needs is now in place and
-  `legacy_workspace_organization` is the join.
-- **Item 4 still has nothing to route.** `apps/api` has no org-scoped repositories; every caller
-  goes through the Prisma-shaped `db.*` facade in `src/core/db.ts`, keyed on `accessKeyId`. Those
-  become repositories in the P1 slice rewrite.
-- Item 1 is also the unblock for **Step 3 items 2, 4 and 5** (see the note there). It is now the
-  single highest-value remaining task in this plan.
+The `apps/api` database did not exist on this machine, which is why items 1-4 were blocked.
+`optimiq-voice` now lives on the same `:5433` container as `optimiq` (base), `optimiq_pbx`,
+`optimiq_cdr` and `fnidentity`; `node scripts/db-provision.mjs` applies the four legacy Prisma
+migrations plus the drizzle folder. The fixture set is a two-step chain, so it is a function of the
+Step 2 machinery rather than a second constant that can drift:
+
+```
+API_CLOAK_ENCRYPTION_KEY=… migrate:identity -- --seed-fixtures   # 3 tenants in the ledger
+backfill:tenancy -- --seed-fixtures                              # 6 applications, 6 tts, 6 secrets
+```
+
+#### Item 1 — the column rewrite, in three phases
+
+Sequencing rule 2 says data before enforcement, and the reason `NOT NULL` cannot simply be declared
+is that **the mapping lives in a different database**. `legacy_workspace_organization` is in the
+base database better-auth owns; a drizzle migration for `apps/api` has one connection and no way to
+reach it. So the join happens in application code that holds both, and the constraint is a separate
+phase behind a guard:
+
+| phase | artifact                                                   | what it does                                                          |
+| ----- | ---------------------------------------------------------- | --------------------------------------------------------------------- |
+| 1     | `drizzle/20260805225315_tenancy_organization_id/`          | adds `organization_id uuid` **nullable** + a btree index, to 5 tables |
+| 2     | `scripts/backfill-tenancy-organization-id.ts`              | joins the ledger, writes the column                                   |
+| 3     | `drizzle/20260805225550_tenancy_organization_id_not_null/` | **guarded** `SET NOT NULL`                                            |
+
+Phase 3's guard is the mechanical form of the rule. It counts NULLs per table in a `DO` block and
+`RAISE EXCEPTION`s with the exact command to run. On a fresh install there are no rows, so it is
+trivially satisfied and lands through the ordinary deploy path; on an existing install with
+un-backfilled rows the **deploy fails there**, loudly, with phase 1 still committed so the backfill
+can proceed and the deploy be retried. It deliberately does **not** no-op when rows remain — a
+silent skip would ship an unenforced tenant column, which is the outcome the whole sequence exists
+to prevent. `--finalize` on the backfill applies the same `ALTER` (idempotent) after verifying, so
+the operator path is `db:deploy` → `backfill:tenancy --finalize` → `db:deploy`.
+
+**Five tables, not two.** `applications` and `secrets` carry the tenant themselves; `tts_services`,
+`stt_services` and `intelligence_services` hang off an application by `application_ref` and
+inherit it, which is why the backfill has a source pass and a derived pass in that order.
+`products` is excluded on purpose: it is a platform-global catalogue seeded at boot by the owning
+principal, it has no tenant, and it gets neither a grant nor a policy.
+
+**Backfill properties** (the contract Step 2's migration established, kept):
+
+- **Transactional**, with `--dry-run` as the same code path plus a forced rollback.
+- **Rerunnable** — only `organization_id is null` rows are considered; a second run reports
+  `alreadyScoped` and writes nothing. Verified by running it twice.
+- **Never guesses.** `scripts/tenancy/plan.ts` is the I/O-free rule set and it is total:
+  `mapped` (ledger hit), `self` (the value is already a _known_ organization id — a row written
+  after the cutover), `blank`, `unmapped`. A well-formed uuid that is not a known organization is
+  **unmapped**, not accepted, so a stray value cannot become a tenant nobody can administer. An
+  unresolved row stays NULL, is counted and is printed, and blocks `--finalize`.
+- **Additive** — `access_key_id` is untouched.
+
+**Why `access_key_id` is not dropped yet.** The plan's item 1 said "drop the legacy column". Doing
+that now would break three things that are explicitly out of Step 5's scope: the SIP connect token
+Routr verifies (Step 6 recommendation (b)), `packages/sipnet`'s reads of Routr's `extended` JSONB,
+and the `legacy_workspace_organization` ledger's usefulness for re-deriving the backfill in another
+environment (§ Step 9 already says the ledger must outlive the rewrite for exactly this reason).
+It is on the Step 9 list instead. Rows written after the cutover store the **organization id** in
+`access_key_id`, the same coexistence trick Step 4 applied to the token's `accessKeyId` claim, so
+the column is a legacy artifact rather than a second source of truth.
+
+#### Items 2 and 3 — the RLS posture for `apps/api`
+
+`api_tenant_tls`, `NOINHERIT`, one `<table>_tenant_isolation` policy per table, `USING` and
+`WITH CHECK` both `organization_id = nullif(current_setting('api_tenant_tls.organization_id',
+true), '')::uuid`. Identical in shape to `packages/pbx-db`, and asserted by the same shared
+introspector. `drizzle/20260805225715_api_tenant_rls/` is generated from `src/core/db/schema.ts`;
+`drizzle/20260805225800_api_tenant_grants/` is hand-written because privileges cannot be expressed
+in a Drizzle schema.
+
+Three deliberate departures from the pbx precedent:
+
+1. **`CREATE ROLE` is wrapped in an existence check.** PostgreSQL roles are _cluster_-wide while
+   migrations are per-database, so two `apps/api` databases in one cluster (staging plus a restore)
+   would otherwise fail the second deploy on a role that already exists and is already correct.
+2. **The role and the policy predicate are rebuilt from string helpers, not imported as objects.**
+   `apps/api` pulls in `pg` / `@types/pg` and `packages/db` does not, so pnpm resolves two separate
+   (structurally identical, nominally incompatible) instances of `drizzle-orm@1.0.0-rc.4` — the
+   same gotcha `legacy-access-key.repository.ts` documented. Handing a `pgRole()` built by one to a
+   `pgPolicy({ to })` imported from the other is a type error, and drizzle-kit would be serialising
+   an object from a foreign registry. Only `createTenantDatabaseContext` / `buildTenantScopeSql`
+   cross the boundary, because they are pure functions over strings; `src/core/db/tenant.ts` holds
+   the rebuild and `test/core/tenantContext.test.ts` pins the two representations together so they
+   cannot drift.
+3. **`forceRowSecurity` stays false.** The migration principal owns these tables and must keep
+   bypassing RLS, or migrations and the `products` seed could not run.
+
+Item 3 is `assertTenantRlsPreflight` in `main.ts`, **before `NestFactory.create`**. A policy that
+silently failed to apply looks exactly like one that works, until the day it does not; booting is
+the last moment that can be turned into a refusal to start rather than a leak.
+
+#### Item 4 — what "route every org-scoped repository through `withTenantScope`" turned into
+
+The note here previously said item 4 "still has nothing to route", because `apps/api` has no
+repositories — every caller goes through the Prisma-shaped `db.*` facade in `src/core/db.ts`. That
+was true, and it stayed true; what changed is that the facade now has a tenant-scoped door:
+
+```ts
+db.forOrganization(organizationId).application.findMany({ where: { organizationId }, … })
+```
+
+`forOrganization` returns a `TenantDatabase` — a `Pick` of the facade that **omits `product`**,
+because a tenant transaction must not touch the platform-global catalogue and the type should say
+so before PostgreSQL does. Each delegate method opens its own transaction, issues
+`set local role api_tenant_tls` and `set_config(..., true)`, and runs the existing facade body
+inside it. Per-call rather than a long-lived scoped handle: a gRPC handler does one or two reads,
+and a transaction that outlived the statement would pin a pool connection for the whole request.
+Both statements are transaction-scoped, so a pooled connection is restored on commit or rollback
+and one tenant's scope can never leak into the next checkout.
+
+The explicit `where: { organizationId }` filters are kept alongside RLS rather than replaced by it.
+They are what `verify:tenancy` compares against the pre-rewrite SQL; RLS is the enforcement that
+does not depend on anyone remembering to write them.
+
+**A consequence worth stating.** `createGetFnUtil` in both `applications/` and `secrets/` now takes
+`(organizationId, ref)`. Outside the tenant's scope the row is genuinely absent, so a cross-tenant
+`GET` / `UPDATE` / `DELETE` raises `NOT_FOUND` rather than `PERMISSION_DENIED`. That is not a
+downgrade — it is what closes enumeration, and it is the same answer a caller gets for a ref that
+never existed.
+
+**And one deletion the Step 4 notes predicted.** `IntegrationsContainer` carries `organizationId`
+straight from `applications.organization_id` now, so `createCreateVoiceClient`'s per-call ledger
+round trip — and the `UnmappedAccessKeyError` it could raise — is gone from the inbound-call path.
+
+#### Gate — `verify:tenancy` **22/22**
+
+`pnpm --filter @optimiq-voice/api verify:tenancy` is the new gate, and its core is a **before/after
+list-parity proof** rather than an assertion:
+
+- the **legacy** query shape is reproduced in raw SQL exactly as `src/core/db.ts` wrote it before
+  this step (`where access_key_id = $1`, same paging);
+- the **new** shape goes through the real, rewritten facade, including `forOrganization(...)`, so
+  it runs as `api_tenant_tls` under row-level security;
+- for every tenant in the ledger, on a full page and on a partial page, the two must agree.
+
+Sections 4 and 5 then prove the half parity cannot: the tenant role sees exactly its own rows
+(2 of 6 per tenant on the local fixtures), an **unscoped** tenant transaction sees **zero** — a
+denial, never a leak — a foreign ref reads back as `null` rather than "found but refused", and a
+blank organization id is refused before a transaction opens.
+
+One thing the gate deliberately does **not** assert: that a partial page returns the _same_ row
+before and after. Neither query has an `ORDER BY` on the non-cursor path (recorded in §6), so two
+executions may legitimately differ; what must hold, and is asserted, is that every row on the page
+belongs to the tenant that asked for it.
+
+#### The three-phase sequence, exercised on throwaway databases
+
+Asserting the guard's behaviour is not the same as running it, so both paths were run end to end
+against real PostgreSQL and then dropped:
+
+| scenario                                                | result                                                                                  |
+| ------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| **fresh install** — empty database, `db:deploy`         | all 5 migrations apply in one pass; `organization_id` lands `NOT NULL`                  |
+| **existing install** — one row with an unmigrated `WO…` | deploy **fails at phase 3**; phases 1-2 stay committed (2 rows in the migrations table) |
+| `backfill:tenancy --finalize` on that database          | refuses: `applications: 1 row(s) have an access_key_id that maps to no organization`    |
+| after remediating the row, backfill, then `db:deploy`   | `mapped=1`, deploy completes, 5 migrations recorded                                     |
+
+That is the whole point of splitting the constraint out of the migration that declares it: the bad
+case is a failed deploy with the remediation command in the error, and it is recoverable by running
+that command.
 
 ### Step 6 — SIP connect token / key retirement (independent track)
 
@@ -928,9 +1142,13 @@ the `API_IDENTITY_*` block. This is the only reason `apps/api` still depends on 
 > **Not started (2026-08-05).** Item 4 (`db:generate` / `db:migrate` point at `@optimiq-voice/db`
 > only) and item 5 (drop `fnidentity`) share one precondition, stated in §5: _the Step 2 backfill
 > must be verified in every environment_. It is verified in exactly one — this development stack —
-> so the `fnidentity` fan-out in the root `package.json` deliberately stays. The sequence is:
-> provision the `apps/api` database (see Step 5), run `migrate:identity` and
-> `verify:identity-migration` in each environment, **then** items 3-5 in one change.
+> so the `fnidentity` fan-out in the root `package.json` deliberately stays.
+>
+> **The per-environment sequence is now longer, and its order matters.** Provisioning the `apps/api`
+> database is done here (Step 5), but every other environment must run, in this order:
+> `db:deploy` (phase 1 lands, phase 3 fails loudly if there are rows) → `migrate:identity` →
+> `verify:identity-migration` → `backfill:tenancy --dry-run` → `backfill:tenancy --finalize` →
+> `db:deploy` → `verify:tenancy`. Only **then** items 3-5 of this step, in one change.
 >
 > Item 2 must keep `API_IDENTITY_PRIVATE_KEY_PATH` / `API_IDENTITY_PUBLIC_KEY_PATH` — see the
 > Step 6 note; every other `API_IDENTITY_*` variable in §2.7 is now unreferenced by the auth path.
@@ -962,8 +1180,8 @@ packages/sdk/src/client/{TokenRefresherNode,TokenRefresherWeb,isJwtExpired}.ts
 .github/workflows/release.yaml                   # remove the publish-identity job + its needs entry (:122-126, :139)
 .scripts/gen-code-proto.sh                       # remove the identity_pb / IdentityServiceClientPb targets (:26, :44)
 .oxfmtrc.json                                    # DONE 2026-08-05 (identity-client ignore removed)
-packages/sipnet/package.json                     # remove the @optimiq-voice/identity dependency
-                                                 #   (packages/voice: DONE 2026-08-05)
+packages/sipnet/package.json                     # DONE 2026-08-05 (dependency + tsconfig project
+                                                 #   reference removed; packages/voice DONE too)
 apps/api/src/core/identityConfig.ts
 apps/api/src/http/identity-invite.controller.ts  # replaced by better-auth accept-invitation
 openspec/changes/{identity-client,identity-standalone-service}/  # archive
@@ -975,7 +1193,20 @@ apps/api/scripts/identity-migration/             # + migrate-identity-to-organiz
 apps/api/scripts/verify-identity-migration.ts    #   verify-identity-migration.ts
 apps/api/src/auth/legacy-access-key.repository.ts
 apps/api/src/auth/auth-platform.registry.ts      # only once the voice path is a Nest feature slice
+
+# added 2026-08-05 — the Step 5 coexistence artifacts
+applications.access_key_id  /  secrets.access_key_id   # a `drop column` migration in apps/api;
+                                                 #   see "Why access_key_id is not dropped yet"
+apps/api/scripts/tenancy/ + backfill-tenancy-organization-id.ts   # the backfill and its rules
+packages/common/src/tenancy/getTenantAccessKeyFromCall            # dies with Routr (Phase 6),
+packages/sipnet/src/resources/withTenantResourceAccess.ts         #   NOT with fnidentity
 ```
+
+**Two different clocks.** The `legacy_*` tables and the backfill machinery die with `fnidentity`.
+`getTenantAccessKeyFromCall` and `withTenantResourceAccess` die with **Routr**, in Phase 6, because
+what they serve is Routr's `extended.accessKeyId` JSONB and the SIP connect token — neither of
+which this migration owns (Step 6, recommendation (b)). Deleting them on the `fnidentity` clock
+would break the SIP edge.
 
 The `legacy_*` tables need a `drop table` migration in `packages/db`, not just a source deletion.
 Do it only after Step 5 item 1 has rewritten every telephony row to carry `organization_id` — the
@@ -993,7 +1224,12 @@ Deprecate (do not delete) the published npm packages `@optimiq-voice/identity@0.
    file changes. Both auth paths coexist for at least one deploy.
 2. **Data before enforcement.** The `accessKeyId → organization.id` mapping (Step 2) must exist
    before the tenant column backfill (Step 5); RLS is enabled last so a bad backfill is
-   recoverable rather than a lockout.
+   recoverable rather than a lockout. **Made mechanical 2026-08-05:** the tenant column lands
+   nullable in one migration, is backfilled by a script that can reach both databases, and only
+   then does a _separate, guarded_ migration apply `NOT NULL` — failing the deploy with the exact
+   remediation command rather than either skipping silently or locking anyone out. The same rule is
+   why the 18 `getAccessKeyIdFromCall` sites could not be swapped until the columns were rewritten:
+   swapping first would have turned every list query into an empty result.
 3. **The SIP connect token is not part of this migration** (Step 6, recommendation (b)). It is
    the only thing forcing RSA-2048 on the system and it dies with Routr.
 4. **`packages/common/src/identity/` is deleted last.** It is the actual auth implementation; the
@@ -1024,8 +1260,33 @@ Fixed:
   `apps/autopilot/src/envs.ts`, `apps/mcp/src/env.ts`); none catch it, so the process still dies —
   it just says why now.
 
+Also fixed, as a consequence of Step 3 item 4:
+
+- **`hasAccessToResource` granted access to a resource that did not exist**
+  (`if (!extended) return true`). Both call paths are rewritten: `apps/api`'s resources are behind
+  row-level security, so a foreign ref is genuinely absent; `packages/sipnet`'s
+  `withTenantResourceAccess` **refuses** a resource with no recorded owner and one that cannot be
+  read. `withAccess.ts` and `hasAccessToResource.ts` are deleted.
+
 Open, out of scope here:
 
+- **`findMany` has no `ORDER BY` on the non-cursor path.** `db.application.findMany` /
+  `db.secret.findMany` order results only when a `cursor` is supplied, so a `take` smaller than the
+  result set returns an arbitrary page and paging without a cursor is not stable. Pre-existing —
+  the rewrite reproduced it exactly rather than changing behaviour under cover of a tenancy change
+  — and it is why `verify:tenancy`'s partial-page check asserts containment rather than equality.
+  Fix with `orderBy(asc(ref))` on both branches; it needs its own before/after check because it
+  changes which rows a client sees on page 1.
+- **A `ZodError` from `validOrThrow` surfaces as `INTERNAL` (13), not `INVALID_ARGUMENT` (3).**
+  `createCreateApplication` and `createUpdateApplication` compose bare `withErrorHandling` rather
+  than `withErrorHandlingAndValidation`, so the error reaches `handleError` unmapped. Pre-existing;
+  found while updating the handler tests.
+- **The InfluxDB CDR measurement's `accessKeyId` tag spans the cutover.** Points written before
+  Step 4 flipped the minter carry the `WO…` key; points written after carry the organization id.
+  `createFetchCalls` / `createFetchSingleCall` therefore filter on **both** values
+  (`contains(value: r.accessKeyId, set: [...])`), which keeps a tenant's call history whole without
+  rewriting a time-series store. InfluxDB is not one of the telephony tables Step 5 item 1 covers;
+  if the dual filter is ever removed, history predating Step 4 disappears.
 - **`config/integrations.json` does not exist.** `.env.example.dev:51` (`API_INTEGRATIONS_FILE`)
   and `:84` (`AUTOPILOT_INTEGRATIONS_FILE`) both point at it, but only
   `config/integrations.example.json` is committed, so a fresh checkout cannot boot the runtime —
@@ -1044,30 +1305,59 @@ Open, out of scope here:
 
 ## 7. Gate status (last run 2026-08-05, local stack on `:5433`)
 
-| gate                          | command                                                                                                                                                            | result                             |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------- |
-| api build                     | `pnpm --filter @optimiq-voice/api build`                                                                                                                           | pass                               |
-| api typecheck (both projects) | `pnpm --filter @optimiq-voice/api typecheck`                                                                                                                       | pass                               |
-| api unit tests                | `pnpm --filter @optimiq-voice/api test`                                                                                                                            | **95 passing**, 2 pending (was 50) |
-| auth slice                    | `DATABASE_URL=… pnpm --filter @optimiq-voice/api verify:auth`                                                                                                      | **49/49** (was 38)                 |
-| per-call token                | `DATABASE_URL=… pnpm --filter @optimiq-voice/api verify:call-token`                                                                                                | **27/27**                          |
-| **Step 2 data migration**     | `DATABASE_URL=… IDENTITY_DATABASE_URL=… API_CLOAK_ENCRYPTION_KEY=… pnpm --filter @optimiq-voice/api verify:identity-migration`                                     | **19/19** (new)                    |
-| `packages/auth`               | `pnpm --filter @optimiq-voice/auth test`                                                                                                                           | 170 pass                           |
-| `packages/db`                 | `pnpm --filter @optimiq-voice/db test`                                                                                                                             | **93 pass**                        |
-| tenant RLS — pbx              | `bun run scripts/tenant-rls-preflight.ts --plan-module ../../pbx-db/src/rls-preflight-plan --plan-export PBX_TENANT_RLS_PLAN --url …/optimiq_pbx --require-tables` | `ok`, 35/35                        |
-| tenant RLS — cdr              | `… --plan-module ../../cdr-db/src/rls-preflight-plan --url …/optimiq_cdr --require-tables`                                                                         | `ok`, 3/3                          |
-| repo                          | `pnpm exec turbo run build typecheck --filter='!@optimiq-voice/web'`                                                                                               | 40/40                              |
-| lint / format                 | `oxlint --disable-nested-config --deny-warnings <touched>` · `oxfmt --check <touched>`                                                                             | clean                              |
+| gate                          | command                                                                                                                                                            | result                              |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------- |
+| api build                     | `pnpm --filter @optimiq-voice/api build`                                                                                                                           | pass                                |
+| api typecheck (both projects) | `pnpm --filter @optimiq-voice/api typecheck`                                                                                                                       | pass                                |
+| api unit tests                | `pnpm --filter @optimiq-voice/api test`                                                                                                                            | **142 passing**, 2 pending (was 95) |
+| auth slice                    | `DATABASE_URL=… pnpm --filter @optimiq-voice/api verify:auth`                                                                                                      | **49/49** (was 38)                  |
+| per-call token                | `DATABASE_URL=… pnpm --filter @optimiq-voice/api verify:call-token`                                                                                                | **27/27**                           |
+| **Step 2 data migration**     | `DATABASE_URL=… IDENTITY_DATABASE_URL=… API_CLOAK_ENCRYPTION_KEY=… pnpm --filter @optimiq-voice/api verify:identity-migration`                                     | **19/19**                           |
+| **Step 5 tenancy + parity**   | `API_DATABASE_URL=… DATABASE_URL=… pnpm --filter @optimiq-voice/api verify:tenancy`                                                                                | **22/22** (new)                     |
+| `packages/auth`               | `pnpm --filter @optimiq-voice/auth test`                                                                                                                           | 170 pass                            |
+| `packages/db`                 | `pnpm --filter @optimiq-voice/db test`                                                                                                                             | **93 pass**                         |
+| tenant RLS — pbx              | `bun run scripts/tenant-rls-preflight.ts --plan-module ../../pbx-db/src/rls-preflight-plan --plan-export PBX_TENANT_RLS_PLAN --url …/optimiq_pbx --require-tables` | `ok`, 35/35                         |
+| tenant RLS — cdr              | `… --plan-module ../../cdr-db/src/rls-preflight-plan --url …/optimiq_cdr --require-tables`                                                                         | `ok`, 3/3                           |
+| **tenant RLS — api**          | `… --plan-module ../../../apps/api/src/core/db/rls-preflight-plan --plan-export API_TENANT_RLS_PLAN --url …/optimiq-voice --require-tables`                        | `ok`, 5/5 (new)                     |
+| repo                          | `pnpm exec turbo run build typecheck --filter='!@optimiq-voice/web' --filter='!@optimiq-voice/routing'`                                                            | 40/40                               |
+| lint / format                 | `oxlint --disable-nested-config --deny-warnings <touched>` · `oxfmt --check <touched>`                                                                             | clean                               |
 
 `@optimiq-voice/web` is excluded: it is being built in a parallel workstream and its typecheck is
 red for reasons unrelated to this cutover (`invite-member-dialog.tsx`, `lib/auth-client.ts`,
-`next.config.ts`).
+`next.config.ts`). `@optimiq-voice/routing` is excluded for the same reason — it is a new,
+still-untracked package from the telephony workstream whose only dependency is
+`@optimiq-voice/telephony`, and its `src/cache.ts:168` typecheck failure predates and is untouched
+by this work.
+
+**Provisioning the local `apps/api` database from scratch**, for anyone reproducing the Step 5
+gates:
+
+```bash
+psql -h localhost -p 5433 -U optimiq -d postgres -c 'CREATE DATABASE "optimiq-voice"'
+cd apps/api
+export API_DATABASE_URL=postgresql://optimiq:optimiq@localhost:5433/optimiq-voice
+export DATABASE_URL=postgresql://optimiq:optimiq@localhost:5433/optimiq
+node scripts/db-provision.mjs                                   # all five migrations
+API_CLOAK_ENCRYPTION_KEY=<from root .env> \
+  pnpm exec tsx scripts/migrate-identity-to-organizations.ts --seed-fixtures
+pnpm exec tsx scripts/backfill-tenancy-organization-id.ts --seed-fixtures
+pnpm exec tsx scripts/verify-tenancy-backfill.ts                # 22/22
+```
+
+Export `API_CLOAK_ENCRYPTION_KEY` on its own rather than sourcing the whole root `.env` — the
+verify scripts are self-configuring and a full `.env` overrides the placeholders they set.
 
 **Residual gates that need infrastructure this environment does not have**
 
 1. **Step 4 item 4, the SIP leg** — an inbound call through Asterisk + Routr reaching an autopilot
    application. Everything up to the SIP boundary is proven by `verify:call-token` (27/27, the
    real `packages/voice` verifier over live HTTP) and the three `createVoiceClient` cases.
-2. **Step 5 items 1-4** — the `apps/api` database (`API_DATABASE_URL` → `:5432/optimiq-voice`) is
-   not provisioned here, so the tenant column and its backfill cannot be executed or verified.
-3. **Step 8 items 4-5** — "verified in every environment"; verified in one.
+2. **Step 8 items 4-5** — "verified in every environment"; verified in one. Step 5's backfill has
+   the same shape of residual: the column rewrite is proven against a three-tenant fixture set on
+   this stack, and each other environment must run the sequence in the Step 8 note before its
+   `NOT NULL` migration will pass.
+3. **The gRPC surface has not been exercised end to end by a real client.** `verify:tenancy` and
+   the unit specs cover the tenant resolution, the cross-tenant gate and the query rewrite, but no
+   released SDK/CLI/dashboard build has been pointed at the rewritten interceptor chain. That
+   matters most for the ordering constraint recorded in Step 3 (`tenancy` must precede
+   `checkMethodAuthorized`) and for `AUTHZ_SERVICE_ENABLED=true`, which is off by default here.

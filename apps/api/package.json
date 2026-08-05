@@ -11,19 +11,21 @@
 		"test": "test"
 	},
 	"scripts": {
-		"prebuild": "rimraf ./dist tsconfig.tsbuildinfo tsconfig.build.tsbuildinfo",
+		"backfill:tenancy": "tsx scripts/backfill-tenancy-organization-id.ts",
 		"build": "tsc -p tsconfig.build.json && node ../../.scripts/rewrite-esm-specifiers.mjs",
 		"clean": "rimraf ./dist node_modules tsconfig.tsbuildinfo tsconfig.build.tsbuildinfo",
 		"db:deploy": "node scripts/db-provision.mjs",
 		"db:generate": "drizzle-kit generate --config drizzle.config.ts",
 		"migrate:identity": "tsx scripts/migrate-identity-to-organizations.ts",
-		"verify:identity-migration": "tsx scripts/verify-identity-migration.ts",
-		"start:dev": "nodemon --exec tsx --watch src src/main.ts",
+		"prebuild": "rimraf ./dist tsconfig.tsbuildinfo tsconfig.build.tsbuildinfo",
 		"pretest": "bash ../../.scripts/gen-keypair.sh",
+		"start:dev": "nodemon --exec tsx --watch src src/main.ts",
 		"test": "cross-env LOGS_LEVEL=none NODE_ENV=development API_IDENTITY_PRIVATE_KEY_PATH=.keys/private.pem API_IDENTITY_PUBLIC_KEY_PATH=.keys/public.pem mocha \"test/**/*.test.ts\"",
 		"typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.strict.json --noEmit",
 		"verify:auth": "tsx scripts/verify-auth-slice.ts",
-		"verify:call-token": "tsx scripts/verify-call-token.ts"
+		"verify:call-token": "tsx scripts/verify-call-token.ts",
+		"verify:identity-migration": "tsx scripts/verify-identity-migration.ts",
+		"verify:tenancy": "tsx scripts/verify-tenancy-backfill.ts"
 	},
 	"bin": {
 		"optimiq-voice": "./dist/index.js"

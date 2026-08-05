@@ -1,7 +1,7 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
 import { z } from "zod";
 import {
-	getAccessKeyIdFromCall,
+	getOrganizationIdFromCall,
+	getTenantAccessKeyFromCall,
 	GrpcErrorMessage,
 	withErrorHandlingAndValidation,
 } from "@optimiq-voice/common";
@@ -16,9 +16,12 @@ function createResource<T, R, U>(api: U, resource: string, schema: z.ZodSchema) 
 	) => {
 		const { request } = call;
 
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const organizationId = getOrganizationIdFromCall(call);
 
-		logger.verbose(`call to create${resource}`, { ...request, accessKeyId });
+		// Routr owns this row; see the note in `numbers/createNumber.ts`.
+		const accessKeyId = getTenantAccessKeyFromCall(call);
+
+		logger.verbose(`call to create${resource}`, { ...request, organizationId });
 
 		const response = await api[`create${resource}`]({
 			...request,

@@ -19,10 +19,11 @@ const channelId = "channel-id";
  *
  * `createCreateVoiceClient` mints the per-call token through better-auth since identity-removal
  * Step 4 item 4, and reaches the platform through `auth-platform.registry.ts` because the ARI
- * dispatcher is started outside the Nest container. Only two things are exercised here: the
- * `accessKeyId → organization.id` lookup and `auth.api.signJWT`.
+ * dispatcher is started outside the Nest container. Only `auth.api.signJWT` is exercised here:
+ * since Step 5 item 1 the application row carries `organization_id`, so `createContainer` yields
+ * the tenant directly and the ledger lookup this factory used to make on every call is gone.
  */
-function fakeAuthRuntime(organizationId: string | null) {
+function fakeAuthRuntime() {
 	const signed: Record<string, unknown>[] = [];
 	return {
 		signed,
@@ -36,11 +37,6 @@ function fakeAuthRuntime(organizationId: string | null) {
 						},
 					},
 				},
-			},
-			legacyAccessKeys: {
-				findOrganizationId: async () => organizationId,
-				findAccessKeyId: async () => null,
-				invalidate: () => {},
 			},
 		},
 	};
@@ -65,13 +61,13 @@ describe("@voice/createVoiceClient", function () {
 		const { publishAuthRuntime } = await import("../../src/auth/auth-platform.registry");
 
 		const organizationId = "019fd3c2-0203-76be-a6b3-b0f1914e39b6";
-		const runtime = fakeAuthRuntime(organizationId);
+		const runtime = fakeAuthRuntime();
 		publishAuthRuntime(runtime.handle as never);
 
 		const createContainer = async (appRef: string) => {
 			return {
 				ref: appRef,
-				accessKeyId: "access-key-id",
+				organizationId,
 				endpoint: "app-endpoint",
 				tts: {} as unknown as AbstractTextToSpeech<unknown>,
 				stt: {} as unknown as AbstractTextToSpeech<unknown>,
@@ -118,8 +114,9 @@ describe("@voice/createVoiceClient", function () {
 
 		// Assert
 		expect(voiceClient).to.be.an.instanceOf(VoiceClientImpl);
-		// Step 4 item 4: the token comes from better-auth, and it carries the ORGANIZATION as the
-		// tenant claim rather than the legacy `WO…` access key the container still returns.
+		// Step 4 item 4: the token comes from better-auth and carries the ORGANIZATION as the tenant
+		// claim. Since Step 5 item 1 the container supplies it straight from
+		// `applications.organization_id`, with no ledger translation in between.
 		expect(runtime.signed).to.have.lengthOf(1);
 		expect(runtime.signed[0]).to.include({
 			organizationId,
@@ -146,18 +143,19 @@ describe("@voice/createVoiceClient", function () {
 		});
 	});
 
-	it("refuses to place a call when the access key was never migrated", async function () {
-		// Fail closed: with no `accessKeyId → organization.id` mapping there is no tenant claim to
-		// put on the token, and there is no identity signer left to fall back to.
+	it("refuses to place a call when the container yields no tenant", async function () {
+		// Fail closed. `applications.organization_id` is NOT NULL as of Step 5 item 1, so this is
+		// unreachable through the real `createContainer` — which is the point: if it ever becomes
+		// reachable, no token is minted and no call is placed.
 		const { createCreateVoiceClient } = await import("../../src/voice/createCreateVoiceClient");
 		const { publishAuthRuntime } = await import("../../src/auth/auth-platform.registry");
-		const { UnmappedAccessKeyError } = await import("../../src/auth/legacy-access-key.repository");
+		const { CallAccessTokenScopeError } = await import("../../src/auth/call-token.claims");
 
-		publishAuthRuntime(fakeAuthRuntime(null).handle as never);
+		publishAuthRuntime(fakeAuthRuntime().handle as never);
 
 		const createContainer = async (appRef: string) => ({
 			ref: appRef,
-			accessKeyId: "WOnever-migrated",
+			organizationId: "",
 			endpoint: "app-endpoint",
 			tts: {} as unknown as AbstractTextToSpeech<unknown>,
 			stt: {} as unknown as AbstractTextToSpeech<unknown>,
@@ -176,7 +174,7 @@ describe("@voice/createVoiceClient", function () {
 				} as unknown as StasisStart,
 				channel,
 			}),
-		).to.be.rejectedWith(UnmappedAccessKeyError);
+		).to.be.rejectedWith(CallAccessTokenScopeError);
 	});
 
 	it("refuses to place a call when the auth slice is not mounted", async function () {
@@ -187,7 +185,7 @@ describe("@voice/createVoiceClient", function () {
 
 		const createContainer = async (appRef: string) => ({
 			ref: appRef,
-			accessKeyId: "WOsomething",
+			organizationId: "019fd41e-e73c-73fc-8fa9-b5512fecd859",
 			endpoint: "app-endpoint",
 			tts: {} as unknown as AbstractTextToSpeech<unknown>,
 			stt: {} as unknown as AbstractTextToSpeech<unknown>,

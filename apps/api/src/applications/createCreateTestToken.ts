@@ -1,8 +1,12 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
 import { status } from "@grpc/grpc-js";
 import jwt from "jsonwebtoken";
 import { v4 as uuidv4 } from "uuid";
-import { getAccessKeyIdFromCall, GrpcErrorMessage, withErrorHandling } from "@optimiq-voice/common";
+import {
+	getOrganizationIdFromCall,
+	getTenantAccessKeyFromCall,
+	GrpcErrorMessage,
+	withErrorHandling,
+} from "@optimiq-voice/common";
 import { getLogger } from "@optimiq-voice/logger";
 import { CreateTestTokenResponse } from "@optimiq-voice/types";
 import { IDENTITY_PRIVATE_KEY } from "../envs";
@@ -15,9 +19,15 @@ function createCreateTestToken(config: TestTokenConfiguration) {
 		call: unknown,
 		callback: (error: GrpcErrorMessage, response?: CreateTestTokenResponse) => void,
 	) => {
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const organizationId = getOrganizationIdFromCall(call);
+		// Routr verifies this token and matches it against `extended.accessKeyId` on its own rows,
+		// which this migration does not rewrite (Step 6 recommendation (b): the SIP edge is out of
+		// scope and dies with Routr). The server-resolved legacy key is therefore what goes in —
+		// it falls back to the organization id for a tenant that never had one.
+		const accessKeyId = getTenantAccessKeyFromCall(call);
 
 		logger.verbose("call to createTestToken", {
+			organizationId,
 			accessKeyId,
 		});
 

@@ -6,13 +6,14 @@ import {
 	parseCloakedString,
 	parseKeySync,
 } from "@47ng/cloak";
-import { and, asc, eq, gte, inArray } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, sql } from "drizzle-orm";
 import { drizzle, NodePgDatabase } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { v4 as uuidv4 } from "uuid";
 import { getLogger } from "@optimiq-voice/logger";
 import { CLOAK_ENCRYPTION_KEY } from "../envs";
 import * as schema from "./db/schema";
+import { API_TENANT_ORGANIZATION_SETTING, API_TENANT_ROLE_NAME } from "./db/tenant";
 
 const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
@@ -47,7 +48,7 @@ type ServiceCreate = {
 };
 
 type ApplicationData = Partial<Pick<Application, "ref" | "name" | "type" | "endpoint">> & {
-	accessKeyId?: string;
+	organizationId?: string;
 	textToSpeech?: ServiceCreate;
 	speechToText?: ServiceCreate;
 	intelligence?: ServiceCreate;
@@ -66,12 +67,12 @@ type ApplicationResult = Application & {
 };
 
 type FindUniqueApplicationArgs = {
-	where: { ref: string; accessKeyId?: string };
+	where: { ref: string; organizationId?: string };
 	include?: ApplicationInclude;
 };
 
 type FindManyApplicationArgs = {
-	where: { accessKeyId: string };
+	where: { organizationId: string };
 	include?: ApplicationInclude;
 	take: number;
 	skip?: number;
@@ -80,11 +81,11 @@ type FindManyApplicationArgs = {
 
 type SecretData = Partial<Pick<Secret, "name" | "secret">> & {
 	ref?: string;
-	accessKeyId?: string;
+	organizationId?: string;
 };
 
 type FindManySecretArgs = {
-	where: { accessKeyId: string };
+	where: { organizationId: string };
 	take: number;
 	skip?: number;
 	cursor?: { ref: string };
@@ -105,7 +106,7 @@ type ApplicationDelegate = {
 	findMany(args: FindManyApplicationArgs): Promise<ApplicationResult[]>;
 	findUnique(args: FindUniqueApplicationArgs): Promise<ApplicationResult | null>;
 	update(args: {
-		where: { ref: string; accessKeyId?: string };
+		where: { ref: string; organizationId?: string };
 		data: ApplicationData;
 	}): Promise<Application>;
 };
@@ -132,6 +133,22 @@ type ProductDelegate = {
 	}): Promise<Product>;
 };
 
+/**
+ * The organization-scoped half of {@link Database} — identity-removal **Step 5 item 4**.
+ *
+ * `product` is absent because the product catalogue is platform-global: it is seeded at boot by
+ * the owning principal, carries no `organization_id`, and has neither a grant nor a policy for
+ * `api_tenant_tls`. A tenant transaction that touched it would be denied by PostgreSQL, so the
+ * type refuses it first.
+ */
+type TenantDatabase = Pick<
+	Database,
+	"application" | "secret" | "textToSpeech" | "speechToText" | "intelligence"
+> & {
+	readonly organizationId: string;
+	transaction<T>(callback: (database: TenantDatabase) => Promise<T>): Promise<T>;
+};
+
 type Database = {
 	application: ApplicationDelegate;
 	secret: SecretDelegate;
@@ -140,8 +157,32 @@ type Database = {
 	intelligence: ServiceDelegate;
 	product: ProductDelegate;
 	transaction<T>(callback: (database: Database) => Promise<T>): Promise<T>;
+	/**
+	 * Every statement runs inside one transaction that has dropped into `api_tenant_tls` and
+	 * published `organizationId` as a transaction-local setting, so row-level security — not
+	 * application code — decides what is visible.
+	 */
+	forOrganization(organizationId: string): TenantDatabase;
 	close(): Promise<void>;
 };
+
+/** Raised when tenant-scoped work is attempted without a usable organization id. */
+class TenantScopeError extends Error {
+	readonly _tag = "TenantScopeError" as const;
+
+	constructor() {
+		super("Tenant-scoped database work requires a non-empty organization id.");
+		this.name = "TenantScopeError";
+	}
+}
+
+function requireOrganizationId(organizationId: string | undefined | null): string {
+	const trimmed = (organizationId ?? "").trim();
+	if (trimmed.length === 0) {
+		throw new TenantScopeError();
+	}
+	return trimmed;
+}
 
 const encryptionKey = parseKeySync(CLOAK_ENCRYPTION_KEY);
 const decryptionKeys = Array.from(
@@ -221,11 +262,11 @@ function getPoolConfig(databaseUrl: string) {
 	};
 }
 
-function applicationConditions(where: { ref: string; accessKeyId?: string }) {
-	return where.accessKeyId
+function applicationConditions(where: { ref: string; organizationId?: string }) {
+	return where.organizationId
 		? and(
 				eq(schema.applications.ref, where.ref),
-				eq(schema.applications.accessKeyId, where.accessKeyId),
+				eq(schema.applications.organizationId, where.organizationId),
 			)
 		: eq(schema.applications.ref, where.ref);
 }
@@ -294,6 +335,7 @@ async function insertService(
 		| typeof schema.speechToTextServices
 		| typeof schema.intelligenceServices,
 	applicationRef: string,
+	organizationId: string,
 	relation?: ServiceCreate,
 ) {
 	if (!relation) {
@@ -304,16 +346,27 @@ async function insertService(
 	await executor.insert(table).values({
 		ref: create.ref ?? uuidv4(),
 		applicationRef,
+		organizationId,
 		productRef: create.productRef,
 		config: create.config,
 		credentials: encrypt(create.credentials),
 	});
 }
 
+/**
+ * `access_key_id` is still `not null` during the coexistence period (it is dropped in Step 9,
+ * with the mapping ledger that is the sole record of which `WO…` key became which organization),
+ * so a row written after the cutover has to put *something* there. It stores the organization id,
+ * exactly as the per-call token's `accessKeyId` claim does since Step 4 — the value changes, the
+ * shape does not, and `resolveOrganizationId` in `scripts/tenancy/plan.ts` recognises it as
+ * already-scoped so a later backfill pass is a no-op on these rows.
+ */
 function applicationValues(data: ApplicationData) {
 	return {
 		...(data.ref !== undefined ? { ref: data.ref } : {}),
-		...(data.accessKeyId !== undefined ? { accessKeyId: data.accessKeyId } : {}),
+		...(data.organizationId !== undefined
+			? { organizationId: data.organizationId, accessKeyId: data.organizationId }
+			: {}),
 		...(data.name !== undefined ? { name: data.name } : {}),
 		...(data.type !== undefined ? { type: data.type } : {}),
 		...(data.endpoint !== undefined ? { endpoint: data.endpoint } : {}),
@@ -348,6 +401,9 @@ function createDatabase(
 	};
 
 	const database: Database = {
+		forOrganization(organizationId) {
+			return createTenantDatabase(root, requireOrganizationId(organizationId));
+		},
 		application: {
 			async create({ data }) {
 				if (!inTransaction) {
@@ -356,19 +412,39 @@ function createDatabase(
 
 				try {
 					const ref = data.ref ?? uuidv4();
+					const organizationId = requireOrganizationId(data.organizationId);
 					const [application] = await executor
 						.insert(schema.applications)
 						.values({
 							ref,
-							accessKeyId: data.accessKeyId,
+							organizationId,
+							accessKeyId: organizationId,
 							name: data.name,
 							type: data.type,
 							endpoint: data.endpoint,
 						})
 						.returning();
-					await insertService(executor, schema.textToSpeechServices, ref, data.textToSpeech);
-					await insertService(executor, schema.speechToTextServices, ref, data.speechToText);
-					await insertService(executor, schema.intelligenceServices, ref, data.intelligence);
+					await insertService(
+						executor,
+						schema.textToSpeechServices,
+						ref,
+						organizationId,
+						data.textToSpeech,
+					);
+					await insertService(
+						executor,
+						schema.speechToTextServices,
+						ref,
+						organizationId,
+						data.speechToText,
+					);
+					await insertService(
+						executor,
+						schema.intelligenceServices,
+						ref,
+						organizationId,
+						data.intelligence,
+					);
 					return application;
 				} catch (error) {
 					return normalizeError(error);
@@ -405,7 +481,7 @@ function createDatabase(
 							.from(schema.applications)
 							.where(
 								and(
-									eq(schema.applications.accessKeyId, args.where.accessKeyId),
+									eq(schema.applications.organizationId, args.where.organizationId),
 									gte(schema.applications.ref, cursor.ref),
 								),
 							)
@@ -416,7 +492,7 @@ function createDatabase(
 						rows = await executor
 							.select()
 							.from(schema.applications)
-							.where(eq(schema.applications.accessKeyId, args.where.accessKeyId))
+							.where(eq(schema.applications.organizationId, args.where.organizationId))
 							.limit(args.take)
 							.offset(args.skip ?? 0);
 					}
@@ -459,18 +535,21 @@ function createDatabase(
 						executor,
 						schema.textToSpeechServices,
 						application.ref,
+						application.organizationId,
 						data.textToSpeech,
 					);
 					await insertService(
 						executor,
 						schema.speechToTextServices,
 						application.ref,
+						application.organizationId,
 						data.speechToText,
 					);
 					await insertService(
 						executor,
 						schema.intelligenceServices,
 						application.ref,
+						application.organizationId,
 						data.intelligence,
 					);
 					return application;
@@ -482,11 +561,14 @@ function createDatabase(
 		secret: {
 			async create({ data }) {
 				try {
+					const organizationId = requireOrganizationId(data.organizationId);
 					const [secret] = await executor
 						.insert(schema.secrets)
 						.values({
 							ref: data.ref ?? uuidv4(),
-							accessKeyId: data.accessKeyId,
+							organizationId,
+							// See `applicationValues` — the legacy column carries the organization id.
+							accessKeyId: organizationId,
 							name: data.name,
 							secret: encrypt(data.secret),
 						})
@@ -527,7 +609,7 @@ function createDatabase(
 							.from(schema.secrets)
 							.where(
 								and(
-									eq(schema.secrets.accessKeyId, args.where.accessKeyId),
+									eq(schema.secrets.organizationId, args.where.organizationId),
 									gte(schema.secrets.ref, cursor.ref),
 								),
 							)
@@ -538,7 +620,7 @@ function createDatabase(
 						rows = await executor
 							.select()
 							.from(schema.secrets)
-							.where(eq(schema.secrets.accessKeyId, args.where.accessKeyId))
+							.where(eq(schema.secrets.organizationId, args.where.organizationId))
 							.limit(args.take)
 							.offset(args.skip ?? 0);
 					}
@@ -620,6 +702,93 @@ function createDatabase(
 	return database;
 }
 
+/**
+ * Opens a transaction, drops into the tenant role and publishes the organization id, then hands
+ * the transaction to `work`.
+ *
+ * `set local role` and `set_config(..., true)` are both transaction-scoped, so a pooled connection
+ * is restored on commit or rollback and one tenant's scope can never leak into the next checkout.
+ *
+ * This reimplements `withTenantTransaction` from `@optimiq-voice/db` rather than calling it, for
+ * the reason spelled out in `src/core/db/tenant.ts`: `apps/api` and `packages/db` resolve
+ * different `drizzle-orm@1.0.0-rc.4` instances, so an `SQL` fragment built there cannot be handed
+ * to `execute` here. `test/core/tenantContext.test.ts` pins the two statement shapes together.
+ */
+async function withTenantScope<T>(
+	root: ApiDatabase,
+	organizationId: string,
+	work: (executor: DrizzleExecutor) => Promise<T>,
+): Promise<T> {
+	try {
+		return await root.transaction(async (transaction) => {
+			await transaction.execute(sql`set local role ${sql.identifier(API_TENANT_ROLE_NAME)}`);
+			await transaction.execute(
+				sql`select set_config(${API_TENANT_ORGANIZATION_SETTING}, ${organizationId}, true)`,
+			);
+			return await work(transaction as unknown as DrizzleExecutor);
+		});
+	} catch (error) {
+		return normalizeError(error);
+	}
+}
+
+/**
+ * Wraps each delegate method of {@link Database} in its own tenant transaction.
+ *
+ * Delegating per call rather than holding a long-lived scoped handle is deliberate: a gRPC
+ * handler does one or two reads, and a transaction that outlives the statement would pin a pool
+ * connection for the whole request.
+ */
+function createTenantDatabase(root: ApiDatabase, organizationId: string): TenantDatabase {
+	const scoped = <T>(work: (database: Database) => Promise<T>): Promise<T> =>
+		withTenantScope(root, organizationId, (executor) =>
+			work(createDatabase(executor, root, async () => undefined, true)),
+		);
+
+	const tenantDatabase: TenantDatabase = {
+		organizationId,
+		application: {
+			create: (args) => scoped((database) => database.application.create(args)),
+			delete: (args) => scoped((database) => database.application.delete(args)),
+			findMany: (args) => scoped((database) => database.application.findMany(args)),
+			findUnique: (args) => scoped((database) => database.application.findUnique(args)),
+			update: (args) => scoped((database) => database.application.update(args)),
+		},
+		secret: {
+			create: (args) => scoped((database) => database.secret.create(args)),
+			delete: (args) => scoped((database) => database.secret.delete(args)),
+			findMany: (args) => scoped((database) => database.secret.findMany(args)),
+			findUnique: (args) => scoped((database) => database.secret.findUnique(args)),
+			update: (args) => scoped((database) => database.secret.update(args)),
+		},
+		textToSpeech: {
+			deleteMany: (args) => scoped((database) => database.textToSpeech.deleteMany(args)),
+		},
+		speechToText: {
+			deleteMany: (args) => scoped((database) => database.speechToText.deleteMany(args)),
+		},
+		intelligence: {
+			deleteMany: (args) => scoped((database) => database.intelligence.deleteMany(args)),
+		},
+		transaction: (callback) =>
+			withTenantScope(root, organizationId, (executor) => {
+				const inner = createDatabase(executor, root, async () => undefined, true);
+				return callback({
+					...tenantDatabase,
+					organizationId,
+					application: inner.application,
+					secret: inner.secret,
+					textToSpeech: inner.textToSpeech,
+					speechToText: inner.speechToText,
+					intelligence: inner.intelligence,
+					transaction: (nested) => nested(tenantDatabase),
+				});
+			}),
+	};
+
+	return tenantDatabase;
+}
+
 function createServiceDelegate(
 	executor: DrizzleExecutor,
 	table:
@@ -656,4 +825,6 @@ export {
 	type Database,
 	DatabaseError,
 	db,
+	type TenantDatabase,
+	TenantScopeError,
 };

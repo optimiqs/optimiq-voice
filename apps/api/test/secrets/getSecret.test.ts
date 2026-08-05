@@ -5,7 +5,7 @@ import chaiAsPromised from "chai-as-promised";
 import { createSandbox } from "sinon";
 import sinonChai from "sinon-chai";
 import { Database } from "../../src/core/db";
-import { TEST_TOKEN } from "../utils";
+import { createTestCallMetadata, TEST_ORGANIZATION_ID } from "../utils";
 
 chai.use(chaiAsPromised);
 chai.use(sinonChai);
@@ -18,8 +18,7 @@ describe("@secrets/getSecret", function () {
 
 	it("should get a secret by id", async function () {
 		// Arrange
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		const metadata = createTestCallMetadata();
 
 		const call = {
 			metadata,
@@ -30,16 +29,20 @@ describe("@secrets/getSecret", function () {
 
 		const secret = {
 			ref: "123",
-			accessKeyId: "GRahn02s8tgdfghz72vb0fz538qpb5z35p",
+			organizationId: TEST_ORGANIZATION_ID,
 			name: "My Secret",
 			secret: "123456",
 		};
 
-		const db = {
+		const tenantDb = {
 			secret: {
 				delete: sandbox.stub().resolves({ ref: secret.ref }),
 				findUnique: sandbox.stub().resolves(secret),
 			},
+		};
+
+		const db = {
+			forOrganization: sandbox.stub().returns(tenantDb),
 		} as unknown as Database;
 
 		const { getSecret } = await import("../../src/secrets/getSecret");
@@ -53,7 +56,10 @@ describe("@secrets/getSecret", function () {
 		});
 
 		// Assert
-		expect(db.secret.findUnique).to.have.been.calledTwice;
+		// `withAccess` used to make a second, unscoped read of the same row before the handler ran.
+		// The tenant-scoped read is now the whole of the ownership check, so there is exactly one.
+		expect(tenantDb.secret.findUnique).to.have.been.calledOnce;
+		expect(db.forOrganization).to.have.been.calledWithExactly(TEST_ORGANIZATION_ID);
 		expect(response).have.property("ref", secret.ref);
 		expect(response).have.property("name", secret.name);
 		expect(response).have.property("secret", secret.secret);
@@ -61,8 +67,9 @@ describe("@secrets/getSecret", function () {
 
 	it("should throw an error if the secret is not found", async function () {
 		// Arrange
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		// Also the foreign-tenant case: row-level security hides another tenant's row, so the
+		// scoped read resolves `null` and NOT_FOUND is indistinguishable from PERMISSION_DENIED.
+		const metadata = createTestCallMetadata();
 
 		const call = {
 			metadata,
@@ -72,9 +79,11 @@ describe("@secrets/getSecret", function () {
 		};
 
 		const db = {
-			secret: {
-				findUnique: sandbox.stub().resolves(null),
-			},
+			forOrganization: sandbox.stub().returns({
+				secret: {
+					findUnique: sandbox.stub().resolves(null),
+				},
+			}),
 		} as unknown as Database;
 
 		const { getSecret } = await import("../../src/secrets/getSecret");

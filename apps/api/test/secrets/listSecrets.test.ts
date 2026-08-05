@@ -1,11 +1,10 @@
-import * as grpc from "@grpc/grpc-js";
 import * as chai from "chai";
 import { expect } from "chai";
 import chaiAsPromised from "chai-as-promised";
 import { createSandbox } from "sinon";
 import sinonChai from "sinon-chai";
 import { Database } from "../../src/core/db";
-import { TEST_TOKEN } from "../utils";
+import { createTestCallMetadata, TEST_ORGANIZATION_ID } from "../utils";
 
 chai.use(chaiAsPromised);
 chai.use(sinonChai);
@@ -18,8 +17,7 @@ describe("@secrets/listSecrets", function () {
 
 	it("should return a list of secrets", async function () {
 		// Arrange
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		const metadata = createTestCallMetadata();
 
 		const call = {
 			metadata,
@@ -34,16 +32,20 @@ describe("@secrets/listSecrets", function () {
 				ref: "123",
 				name: "My Secret",
 				secret: "123456",
-				accessKeyId: "GRahn02s8tgdfghz72vb0fz538qpb5z35p",
+				organizationId: TEST_ORGANIZATION_ID,
 				createdAt: new Date(),
 				updatedAt: new Date(),
 			},
 		];
 
-		const db = {
+		const tenantDb = {
 			secret: {
 				findMany: sandbox.stub().resolves(secrets),
 			},
+		};
+
+		const db = {
+			forOrganization: sandbox.stub().returns(tenantDb),
 		} as unknown as Database;
 
 		const { listSecrets } = await import("../../src/secrets/listSecrets");
@@ -57,6 +59,10 @@ describe("@secrets/listSecrets", function () {
 		});
 
 		// Assert
+		expect(db.forOrganization).to.have.been.calledOnceWithExactly(TEST_ORGANIZATION_ID);
+		expect(tenantDb.secret.findMany).to.have.been.calledWithMatch({
+			where: { organizationId: TEST_ORGANIZATION_ID },
+		});
 		expect(response).has.property("items").to.be.an("array").to.have.lengthOf(1);
 		// When items.length < pageSize, we're on the last page, so nextPageToken should be empty string
 		expect(response).has.property("nextPageToken").to.equal("");
@@ -64,8 +70,7 @@ describe("@secrets/listSecrets", function () {
 
 	it("should return nextPageToken when page is full", async function () {
 		// Arrange
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		const metadata = createTestCallMetadata();
 
 		const call = {
 			metadata,
@@ -81,7 +86,7 @@ describe("@secrets/listSecrets", function () {
 				ref: "secret-1",
 				name: "Secret 1",
 				secret: "value1",
-				accessKeyId: "GRahn02s8tgdfghz72vb0fz538qpb5z35p",
+				organizationId: TEST_ORGANIZATION_ID,
 				createdAt: new Date(),
 				updatedAt: new Date(),
 			},
@@ -89,16 +94,18 @@ describe("@secrets/listSecrets", function () {
 				ref: "secret-2",
 				name: "Secret 2",
 				secret: "value2",
-				accessKeyId: "GRahn02s8tgdfghz72vb0fz538qpb5z35p",
+				organizationId: TEST_ORGANIZATION_ID,
 				createdAt: new Date(),
 				updatedAt: new Date(),
 			},
 		];
 
 		const db = {
-			secret: {
-				findMany: sandbox.stub().resolves(secrets),
-			},
+			forOrganization: sandbox.stub().returns({
+				secret: {
+					findMany: sandbox.stub().resolves(secrets),
+				},
+			}),
 		} as unknown as Database;
 
 		const { listSecrets } = await import("../../src/secrets/listSecrets");
@@ -119,8 +126,7 @@ describe("@secrets/listSecrets", function () {
 
 	it("should return an empty array if no secrets found", async function () {
 		// Arrange
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		const metadata = createTestCallMetadata();
 
 		const call = {
 			metadata,
@@ -131,9 +137,11 @@ describe("@secrets/listSecrets", function () {
 		};
 
 		const db = {
-			secret: {
-				findMany: sandbox.stub().resolves([]),
-			},
+			forOrganization: sandbox.stub().returns({
+				secret: {
+					findMany: sandbox.stub().resolves([]),
+				},
+			}),
 		} as unknown as Database;
 
 		const { listSecrets } = await import("../../src/secrets/listSecrets");

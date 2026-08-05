@@ -1,6 +1,6 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
 import {
-	getAccessKeyIdFromCall,
+	getOrganizationIdFromCall,
+	getTenantAccessKeyFromCall,
 	GrpcErrorMessage,
 	Validators as V,
 	withErrorHandlingAndValidation,
@@ -24,9 +24,12 @@ function listResources<T, R, U>(api: U, resource: string) {
 
 		const res = resource === "Credentials" ? "Credential" : resource;
 
-		logger.verbose(`call to list${res}s`, { request });
+		// Routr owns these rows; see the note in `numbers/createNumber.ts`. Reading and writing
+		// through the same server-resolved key is what keeps list results stable across the cutover.
+		const organizationId = getOrganizationIdFromCall(call);
+		const accessKeyId = getTenantAccessKeyFromCall(call);
 
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		logger.verbose(`call to list${res}s`, { request, organizationId });
 
 		const requestWithPageToken = request as {
 			pageToken?: string;

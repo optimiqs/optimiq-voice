@@ -1,6 +1,5 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
 import {
-	getAccessKeyIdFromCall,
+	getOrganizationIdFromCall,
 	GrpcErrorMessage,
 	Validators as V,
 	withErrorHandlingAndValidation,
@@ -17,17 +16,17 @@ function createSecret(db: Database) {
 		callback: (error: GrpcErrorMessage, response?: BaseApiObject) => void,
 	) => {
 		const { name, secret } = call.request;
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const organizationId = getOrganizationIdFromCall(call);
 
 		logger.verbose("call to createSecret", {
-			accessKeyId,
+			organizationId,
 		});
 
-		const result = await db.secret.create({
+		const result = await db.forOrganization(organizationId).secret.create({
 			data: {
 				name,
 				secret,
-				accessKeyId,
+				organizationId,
 			},
 		});
 

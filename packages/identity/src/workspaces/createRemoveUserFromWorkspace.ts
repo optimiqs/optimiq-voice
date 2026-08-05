@@ -1,6 +1,6 @@
 import { status as GRPCStatus, ServerInterceptingCall } from "@grpc/grpc-js";
 import {
-	getAccessKeyIdFromCall,
+	getTenantAccessKeyFromCall,
 	getTokenFromCall,
 	GrpcErrorMessage,
 	Validators as V,
@@ -26,7 +26,7 @@ function createRemoveUserFromWorkspace(db: Database) {
 		const { userRef } = request;
 
 		const token = getTokenFromCall(call as unknown as ServerInterceptingCall);
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const accessKeyId = getTenantAccessKeyFromCall(call);
 		const adminRef = getUserRefFromToken(token);
 		const workspace = await db.workspace.findUnique({
 			where: {

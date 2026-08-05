@@ -1,4 +1,4 @@
-import { Validators as V } from "@optimiq-voice/common";
+import { getOrganizationIdFromCall, Validators as V } from "@optimiq-voice/common";
 import { getLogger } from "@optimiq-voice/logger";
 import { BaseApiObject, Secret } from "@optimiq-voice/types";
 import { Database } from "../core/db";
@@ -12,13 +12,14 @@ function getSecret(db: Database) {
 
 	const fn = async (call: { request: BaseApiObject }): Promise<Secret> => {
 		const { ref } = call.request;
+		const organizationId = getOrganizationIdFromCall(call);
 
-		logger.verbose("call to getSecret", { ref });
+		logger.verbose("call to getSecret", { organizationId, ref });
 
-		return await getFn(ref);
+		return await getFn(organizationId, ref);
 	};
 
-	return withErrorHandlingAndValidationAndAccess(fn, (ref: string) => getFn(ref), V.emptySchema);
+	return withErrorHandlingAndValidationAndAccess(fn, V.emptySchema);
 }
 
 export { getSecret };

@@ -1,6 +1,6 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
 import {
-	getAccessKeyIdFromCall,
+	getOrganizationIdFromCall,
+	getTenantAccessKeyFromCall,
 	GrpcErrorMessage,
 	Validators as V,
 	withErrorHandlingAndValidation,
@@ -17,9 +17,12 @@ function createAcl(api: AclsApi) {
 	) => {
 		const { request } = call;
 
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const organizationId = getOrganizationIdFromCall(call);
 
-		logger.verbose("call to createAcl", { ...request, accessKeyId });
+		// Routr owns this row; see the note in `numbers/createNumber.ts`.
+		const accessKeyId = getTenantAccessKeyFromCall(call);
+
+		logger.verbose("call to createAcl", { ...request, organizationId });
 
 		const response = await api.createAcl({
 			...request,

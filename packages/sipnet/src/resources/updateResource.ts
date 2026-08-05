@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { withErrorHandlingAndValidation } from "@optimiq-voice/common";
-import { withAccess } from "@optimiq-voice/identity";
 import { getLogger } from "@optimiq-voice/logger";
+import { withTenantResourceAccess } from "./withTenantResourceAccess";
 
 const logger = getLogger({ service: "sipnet", filePath: __filename });
 
@@ -15,7 +15,7 @@ function updateResource<T, R, U>(api: U, resource: string, schema: z.ZodSchema) 
 	};
 
 	return withErrorHandlingAndValidation(
-		withAccess(fn, (ref: string) => api[`get${resource}`](ref)),
+		withTenantResourceAccess(fn, (ref: string) => api[`get${resource}`](ref), resource),
 		schema,
 	);
 }

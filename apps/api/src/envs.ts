@@ -106,6 +106,9 @@ export const IDENTITY_WORKSPACE_INVITE_URL = e.API_IDENTITY_WORKSPACE_INVITE_URL
 
 export const IDENTITY_DATABASE_URL = e.API_IDENTITY_DATABASE_URL;
 
+/** The telephony database. Named without the `API_` prefix to match `packages/db`'s vocabulary. */
+export const DATABASE_URL = e.API_DATABASE_URL;
+
 if (e.API_IDENTITY_OAUTH2_GITHUB_ENABLED === "true") {
 	assertEnvsAreSet([
 		"API_IDENTITY_OAUTH2_GITHUB_CLIENT_ID",

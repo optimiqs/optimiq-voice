@@ -3,7 +3,6 @@ import { v4 as uuidv4 } from "uuid";
 import { getLogger } from "@optimiq-voice/logger";
 import { requireAuthRuntime } from "../auth/auth-platform.registry";
 import { createCallAccessTokenMinter } from "../auth/call-token.service";
-import { UnmappedAccessKeyError } from "../auth/legacy-access-key.repository";
 import { mapCallDirectionToEnum } from "../events/mapCallDirectionToEnum";
 import { VoiceClientImpl } from "./client";
 import { CreateContainer } from "./integrations/types";
@@ -22,14 +21,14 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
  * together on purpose — the plan is explicit that deploying them separately leaves the voice
  * server verifying tokens the API does not mint.
  *
- * `createContainer(appRef)` still yields the legacy `WO…` access key, because
- * `applications.access_key_id` is not rewritten until Step 5. It is translated to the tenant's
- * `organization.id` through the Step 2 mapping, so the token carries a real tenant claim instead
- * of a legacy string. When Step 5 lands, `createContainer` returns the organization id directly
- * and the lookup below is deleted.
+ * `createContainer(appRef)` returns the tenant directly as of **Step 5 item 1**: the application
+ * row carries `organization_id`, so the ledger round trip this function used to make on every
+ * inbound call — `legacyAccessKeys.findOrganizationId(accessKeyId)`, and the
+ * `UnmappedAccessKeyError` it could raise — is gone. This is precisely the deletion the Step 4
+ * note here predicted.
  *
- * **Fail closed.** No auth slice, or an access key that was never migrated, means no token and no
- * call — there is no unauthenticated fallback. `skipTokenVerification` on the voice side stays a
+ * **Fail closed.** No auth slice means no token and no call — there is no unauthenticated
+ * fallback. `skipTokenVerification` on the voice side stays a
  * development-only escape hatch (`NODE_ENV=development` **and** no `AUTH_URL`); with this flip an
  * integration environment no longer needs it, because the API mints what the voice server
  * verifies.
@@ -58,13 +57,9 @@ function createCreateVoiceClient(createContainer: CreateContainer) {
 		const callRefFromChannel = (await getChannelVar(ChannelVar.CALL_REF))?.value;
 		const callRef = callRefFromChannel || uuidv4();
 
-		const { accessKeyId, endpoint, tts, stt } = await createContainer(appRef);
+		const { organizationId, endpoint, tts, stt } = await createContainer(appRef);
 
-		const { platform, legacyAccessKeys } = requireAuthRuntime("the per-call access token");
-		const organizationId = await legacyAccessKeys.findOrganizationId(accessKeyId);
-		if (!organizationId) {
-			throw new UnmappedAccessKeyError(accessKeyId);
-		}
+		const { platform } = requireAuthRuntime("the per-call access token");
 
 		const sessionToken = await createCallAccessTokenMinter(platform)({
 			organizationId,

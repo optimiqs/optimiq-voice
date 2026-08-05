@@ -1,10 +1,8 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
 import {
 	AUTOPILOT_SPECIAL_LOCAL_ADDRESS,
-	getAccessKeyIdFromCall,
+	getOrganizationIdFromCall,
 	withErrorHandling,
 } from "@optimiq-voice/common";
-import { withAccess } from "@optimiq-voice/identity";
 import { getLogger } from "@optimiq-voice/logger";
 import { ApplicationType, UpdateApplicationRequest } from "@optimiq-voice/types";
 import { Database } from "../core/db";
@@ -21,7 +19,19 @@ function createUpdateApplication(db: Database) {
 		const { request } = call;
 		const { type, ref: applicationRef } = request;
 
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const organizationId = getOrganizationIdFromCall(call);
+
+		/**
+		 * Ownership first, deliberately.
+		 *
+		 * Outside this tenant's scope the row does not exist, so this raises `NOT_FOUND` before
+		 * anything else runs. It replaces `withAccess`, whose `hasAccessToResource` granted access
+		 * when the resource was missing — and `withAccess` also happened to run before validation,
+		 * so keeping that order preserves the property that matters: a caller probing for someone
+		 * else's ref learns exactly one thing, `NOT_FOUND`, and never gets a validation message
+		 * that would confirm the request reached the resource.
+		 */
+		await getFn(organizationId, applicationRef);
 
 		if (type === ApplicationType.AUTOPILOT && !request.endpoint) {
 			logger.verbose("setting default endpoint for autopilot application", {
@@ -33,11 +43,11 @@ function createUpdateApplication(db: Database) {
 		validOrThrow(request);
 
 		logger.verbose("call to updateApplication", {
-			accessKeyId,
+			organizationId,
 			type,
 		});
 
-		await db.transaction(async (transaction) => {
+		await db.forOrganization(organizationId).transaction(async (transaction) => {
 			await transaction.textToSpeech.deleteMany({
 				where: {
 					applicationRef,
@@ -56,7 +66,7 @@ function createUpdateApplication(db: Database) {
 			await transaction.application.update({
 				where: {
 					ref: applicationRef,
-					accessKeyId,
+					organizationId,
 				},
 				data: convertToApplicationData(request),
 			});
@@ -65,7 +75,14 @@ function createUpdateApplication(db: Database) {
 		return { ref: applicationRef };
 	};
 
-	return withErrorHandling(withAccess(updateApplication, (ref: string) => getFn(ref)));
+	return withErrorHandling(
+		async (
+			call: { request: UpdateApplicationRequest },
+			callback: (error?: unknown, response?: unknown) => void,
+		) => {
+			callback(null, await updateApplication(call));
+		},
+	);
 }
 
 export { createUpdateApplication };

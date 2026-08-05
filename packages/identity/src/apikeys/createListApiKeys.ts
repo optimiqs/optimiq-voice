@@ -1,5 +1,8 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
-import { getAccessKeyIdFromCall, GrpcErrorMessage, Validators as V } from "@optimiq-voice/common";
+import {
+	getTenantAccessKeyFromCall,
+	GrpcErrorMessage,
+	Validators as V,
+} from "@optimiq-voice/common";
 import { getLogger } from "@optimiq-voice/logger";
 import { ListApiKeysRequest, ListApiKeysResponse, Role } from "@optimiq-voice/types";
 import { Database } from "../db";
@@ -14,7 +17,7 @@ function createListApiKeys(db: Database) {
 	) => {
 		const { pageSize, pageToken } = call.request;
 
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const accessKeyId = getTenantAccessKeyFromCall(call);
 
 		logger.verbose("list keys for workspace", { accessKeyId });
 

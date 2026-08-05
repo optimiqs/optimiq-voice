@@ -1,6 +1,6 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
 import {
-	getAccessKeyIdFromCall,
+	findTenantAccessKeyInCall,
+	getOrganizationIdFromCall,
 	GrpcErrorMessage,
 	InfluxDBClient,
 	Validators as V,
@@ -23,11 +23,13 @@ function listCalls(influx: InfluxDBClient) {
 	) => {
 		const { request } = call;
 
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const organizationId = getOrganizationIdFromCall(call);
 
-		logger.verbose("call to listCalls", { request, accessKeyId });
+		const legacyAccessKeyId = findTenantAccessKeyInCall(call);
 
-		const result = await fetchCalls(accessKeyId, request);
+		logger.verbose("call to listCalls", { request, organizationId });
+
+		const result = await fetchCalls([organizationId, legacyAccessKeyId], request);
 
 		callback(null, result);
 	};

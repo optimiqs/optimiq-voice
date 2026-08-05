@@ -1,5 +1,4 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
-import { getAccessKeyIdFromCall, Validators as V } from "@optimiq-voice/common";
+import { getOrganizationIdFromCall, Validators as V } from "@optimiq-voice/common";
 import { getLogger } from "@optimiq-voice/logger";
 import { UpdateSecretRequest } from "@optimiq-voice/types";
 import { Database } from "../core/db";
@@ -14,13 +13,15 @@ function updateSecret(db: Database) {
 	const fn = async (call: { request: UpdateSecretRequest }) => {
 		const { name, secret } = call.request;
 
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const organizationId = getOrganizationIdFromCall(call);
 
 		logger.verbose("call to updateSecret", {
-			accessKeyId,
+			organizationId,
 		});
 
-		await db.secret.update({
+		// Ownership check: outside this tenant's scope the row does not exist.
+		await getFn(organizationId, call.request.ref);
+		await db.forOrganization(organizationId).secret.update({
 			where: { ref: call.request.ref },
 			data: {
 				name,
@@ -31,11 +32,7 @@ function updateSecret(db: Database) {
 		return { ref: call.request.ref };
 	};
 
-	return withErrorHandlingAndValidationAndAccess(
-		fn,
-		(ref: string) => getFn(ref),
-		V.listRequestSchema,
-	);
+	return withErrorHandlingAndValidationAndAccess(fn, V.listRequestSchema);
 }
 
 export { updateSecret };

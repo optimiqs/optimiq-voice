@@ -1,15 +1,50 @@
-import { defineRelations } from "drizzle-orm";
+import { defineRelations, sql } from "drizzle-orm";
 import {
 	foreignKey,
 	index,
 	jsonb,
 	pgEnum,
+	pgPolicy,
+	pgRole,
 	pgTable,
 	text,
 	timestamp,
 	uniqueIndex,
+	uuid,
 	varchar,
 } from "drizzle-orm/pg-core";
+import { API_TENANT_ROLE_NAME, API_TENANT_SCOPE_SQL } from "./tenant";
+
+/**
+ * Identity-removal **Step 5 item 2** — the tenant role and the per-table isolation policies for
+ * this database, mirroring what `packages/pbx-db` already does for `optimiq_pbx`.
+ *
+ * The role is NOINHERIT, so `set local role api_tenant_tls` drops every privilege the connecting
+ * principal holds; the grants migration is therefore the complete list of what a tenant
+ * transaction can reach, and these policies narrow each grant to one organization.
+ *
+ * The policy NAME is load-bearing: `createPostgresTenantRlsIntrospector` in `@optimiq-voice/db`
+ * asserts `<table>_tenant_isolation` exists as a PERMISSIVE `FOR ALL` policy granted to the role
+ * whose USING and WITH CHECK both mention the setting. `db:preflight:tenant-rls` and the boot
+ * preflight both fail if any of that drifts.
+ */
+const apiTenantRole = pgRole(API_TENANT_ROLE_NAME, {
+	createDb: false,
+	createRole: false,
+	inherit: false,
+});
+
+const apiTenantScope = sql.raw(API_TENANT_SCOPE_SQL);
+
+function tenantIsolationPolicy(tableName: string) {
+	return pgPolicy(`${tableName}_tenant_isolation`, {
+		as: "permissive",
+		for: "all",
+		to: apiTenantRole,
+		using: apiTenantScope,
+		withCheck: apiTenantScope,
+	});
+}
 
 const applicationType = pgEnum("application_types", ["EXTERNAL", "AUTOPILOT"]);
 const productType = pgEnum("product_types", ["TTS", "STT", "LLM"]);
@@ -32,6 +67,7 @@ const applications = pgTable(
 	{
 		ref: text("ref").primaryKey(),
 		accessKeyId: text("access_key_id").notNull(),
+		organizationId: uuid("organization_id").notNull(),
 		name: varchar("name", { length: 255 }).notNull(),
 		type: applicationType("type").notNull(),
 		endpoint: varchar("endpoint", { length: 255 }).notNull(),
@@ -42,7 +78,11 @@ const applications = pgTable(
 			.defaultNow()
 			.notNull(),
 	},
-	(table) => [index("applications_access_key_id_idx").using("hash", table.accessKeyId)],
+	(table) => [
+		index("applications_access_key_id_idx").using("hash", table.accessKeyId),
+		index("applications_organization_id_idx").on(table.organizationId),
+		tenantIsolationPolicy("applications"),
+	],
 );
 
 const products = pgTable("products", {
@@ -58,6 +98,7 @@ const textToSpeechServices = pgTable(
 		ref: text("ref").primaryKey(),
 		config: jsonb("config").notNull(),
 		credentials: text("credentials_hash"),
+		organizationId: uuid("organization_id").notNull(),
 		applicationRef: text("application_ref").notNull(),
 		productRef: text("product_ref").notNull(),
 	},
@@ -79,6 +120,8 @@ const textToSpeechServices = pgTable(
 		uniqueIndex("tts_services_application_ref_key").on(table.applicationRef),
 		index("tts_services_application_ref_idx").using("hash", table.applicationRef),
 		index("tts_services_product_ref_idx").using("hash", table.productRef),
+		index("tts_services_organization_id_idx").on(table.organizationId),
+		tenantIsolationPolicy("tts_services"),
 	],
 );
 
@@ -88,6 +131,7 @@ const speechToTextServices = pgTable(
 		ref: text("ref").primaryKey(),
 		config: jsonb("config").notNull(),
 		credentials: text("credentials_hash"),
+		organizationId: uuid("organization_id").notNull(),
 		applicationRef: text("application_ref").notNull(),
 		productRef: text("product_ref").notNull(),
 	},
@@ -109,6 +153,8 @@ const speechToTextServices = pgTable(
 		uniqueIndex("stt_services_application_ref_key").on(table.applicationRef),
 		index("stt_services_application_ref_idx").using("hash", table.applicationRef),
 		index("stt_services_product_ref_idx").using("hash", table.productRef),
+		index("stt_services_organization_id_idx").on(table.organizationId),
+		tenantIsolationPolicy("stt_services"),
 	],
 );
 
@@ -118,6 +164,7 @@ const intelligenceServices = pgTable(
 		ref: text("ref").primaryKey(),
 		config: jsonb("config").notNull(),
 		credentials: text("credentials_hash"),
+		organizationId: uuid("organization_id").notNull(),
 		applicationRef: text("application_ref").notNull(),
 		productRef: text("product_ref").notNull(),
 	},
@@ -139,6 +186,8 @@ const intelligenceServices = pgTable(
 		uniqueIndex("intelligence_services_application_ref_key").on(table.applicationRef),
 		index("intelligence_services_application_ref_idx").using("hash", table.applicationRef),
 		index("intelligence_services_product_ref_idx").using("hash", table.productRef),
+		index("intelligence_services_organization_id_idx").on(table.organizationId),
+		tenantIsolationPolicy("intelligence_services"),
 	],
 );
 
@@ -147,6 +196,7 @@ const secrets = pgTable(
 	{
 		ref: text("ref").primaryKey(),
 		accessKeyId: text("access_key_id").notNull(),
+		organizationId: uuid("organization_id").notNull(),
 		name: text("name").notNull(),
 		secret: text("secret_hash").notNull(),
 		createdAt: timestamp("created_at", { precision: 3, withTimezone: false })
@@ -159,6 +209,8 @@ const secrets = pgTable(
 	(table) => [
 		index("secrets_access_key_id_idx").using("hash", table.accessKeyId),
 		index("secrets_name_idx").using("hash", table.name),
+		index("secrets_organization_id_idx").on(table.organizationId),
+		tenantIsolationPolicy("secrets"),
 	],
 );
 
@@ -231,6 +283,9 @@ const relations = defineRelations(tables, (r) => ({
 }));
 
 export {
+	API_TENANT_ROLE_NAME,
+	API_TENANT_SCOPE_SQL,
+	apiTenantRole,
 	applicationType,
 	applications,
 	intelligenceServices,

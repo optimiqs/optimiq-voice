@@ -9,6 +9,13 @@
 	//
 	// `src/runtime/` is deliberately NOT listed: it imports `src/core/` and `src/envs.ts`, which
 	// would drag the whole legacy graph into this program.
+	//
+	// `scripts/verify-tenancy-backfill.ts` is excluded for exactly that reason and no other: it is
+	// the one script that imports the real `src/core/db.ts` facade, which is the point of the gate
+	// (it compares the LIVE query path against the pre-rewrite SQL, so a re-implementation would
+	// prove nothing). `src/core/db.ts` predates the strictness contract — its `data` partials are
+	// written against columns drizzle types as non-nullable — and bringing it up is the `src/core`
+	// step of growing this list, not a prerequisite for the gate. Delete this exclusion then.
 	"extends": "./tsconfig.json",
 	"compilerOptions": {
 		"strict": true,
@@ -17,5 +24,6 @@
 		"strictBindCallApply": true,
 		"strictPropertyInitialization": false
 	},
-	"include": ["src/auth/**/*", "scripts/**/*", "test/auth/**/*"]
+	"include": ["src/auth/**/*", "scripts/**/*", "test/auth/**/*"],
+	"exclude": ["scripts/verify-tenancy-backfill.ts"]
 }

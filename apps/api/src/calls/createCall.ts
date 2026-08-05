@@ -1,8 +1,7 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
 import { struct } from "pb-util";
 import { v4 as uuidv4 } from "uuid";
 import {
-	getAccessKeyIdFromCall,
+	getOrganizationIdFromCall,
 	GrpcErrorMessage,
 	Validators as V,
 	withErrorHandlingAndValidation,
@@ -29,10 +28,10 @@ function createCall(db: Database, publisher: CallPublisher) {
 
 		logger.verbose("call to createCall", { ...request, ref });
 
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const organizationId = getOrganizationIdFromCall(call);
 
-		const app = await db.application.findUnique({
-			where: { ref: appRef, accessKeyId },
+		const app = await db.forOrganization(organizationId).application.findUnique({
+			where: { ref: appRef },
 		});
 
 		if (!app) {
@@ -44,7 +43,9 @@ function createCall(db: Database, publisher: CallPublisher) {
 			from,
 			to,
 			appRef,
-			accessKeyId,
+			// The wire field keeps its name during coexistence; the VALUE is the organization id,
+			// matching what the per-call token has carried since Step 4. Renamed in Step 9.
+			accessKeyId: organizationId,
 			timeout: timeout || 30,
 			metadata: effectiveMetadata,
 		});

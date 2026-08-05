@@ -1,6 +1,5 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
 import {
-	getAccessKeyIdFromCall,
+	getOrganizationIdFromCall,
 	GrpcErrorMessage,
 	Validators as V,
 	withErrorHandlingAndValidation,
@@ -21,16 +20,16 @@ function createListApplications(db: Database) {
 	) => {
 		const { pageSize, pageToken } = call.request;
 
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const organizationId = getOrganizationIdFromCall(call);
 
-		logger.verbose("call to getApplication", {
-			accessKeyId,
+		logger.verbose("call to listApplications", {
+			organizationId,
 			pageSize,
 			pageToken,
 		});
 
-		const result = await db.application.findMany({
-			where: { accessKeyId },
+		const result = await db.forOrganization(organizationId).application.findMany({
+			where: { organizationId },
 			include: {
 				textToSpeech: true,
 				speechToText: true,

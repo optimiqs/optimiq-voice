@@ -1,7 +1,6 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
 import {
 	AUTOPILOT_SPECIAL_LOCAL_ADDRESS,
-	getAccessKeyIdFromCall,
+	getOrganizationIdFromCall,
 	GrpcErrorMessage,
 	withErrorHandling,
 } from "@optimiq-voice/common";
@@ -21,10 +20,10 @@ function createCreateApplication(db: Database) {
 		const { request } = call;
 		const { type } = request;
 
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const organizationId = getOrganizationIdFromCall(call);
 
 		logger.verbose("call to createApplication", {
-			accessKeyId,
+			organizationId,
 			type,
 		});
 
@@ -37,10 +36,10 @@ function createCreateApplication(db: Database) {
 
 		validOrThrow(request);
 
-		const result = await db.application.create({
+		const result = await db.forOrganization(organizationId).application.create({
 			data: {
 				...convertToApplicationData(request),
-				accessKeyId,
+				organizationId,
 			},
 		});
 

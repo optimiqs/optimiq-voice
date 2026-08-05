@@ -1,5 +1,8 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
-import { getAccessKeyIdFromCall, GrpcErrorMessage, Validators as V } from "@optimiq-voice/common";
+import {
+	getTenantAccessKeyFromCall,
+	GrpcErrorMessage,
+	Validators as V,
+} from "@optimiq-voice/common";
 import { datesMapper } from "@optimiq-voice/common";
 import { getLogger } from "@optimiq-voice/logger";
 import {
@@ -19,7 +22,7 @@ function createListWorkspaceMembers(db: Database) {
 		callback: (error?: GrpcErrorMessage, response?: ListWorkspaceMembersResponse) => void,
 	) => {
 		const { pageSize, pageToken } = call.request;
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const accessKeyId = getTenantAccessKeyFromCall(call);
 
 		logger.verbose("list workspace members", { accessKeyId });
 

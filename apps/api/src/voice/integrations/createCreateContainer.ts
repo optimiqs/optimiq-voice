@@ -54,7 +54,7 @@ function createCreateContainer(db: Database, pathToIntegrations: string) {
 
 		return {
 			ref: appRef,
-			accessKeyId: app.accessKeyId,
+			organizationId: app.organizationId,
 			endpoint: actualEndpoint,
 			tts,
 			stt,

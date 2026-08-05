@@ -2,6 +2,7 @@ import "reflect-metadata";
 import { Type } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { FastifyAdapter, NestFastifyApplication } from "@nestjs/platform-fastify";
+import { assertTenantRlsPreflight } from "@optimiq-voice/db";
 import { getLogger } from "@optimiq-voice/logger";
 import { AppModule } from "./app.module";
 import {
@@ -9,11 +10,31 @@ import {
 	isAuthSliceEnabled,
 	registerAuthTransport,
 } from "./auth/auth-bootstrap";
-import { HTTP_BRIDGE_PORT } from "./envs";
+import { API_TENANT_RLS_PLAN, createApiTenantRlsIntrospector } from "./core/db/rls-preflight-plan";
+import { DATABASE_URL, HTTP_BRIDGE_PORT } from "./envs";
 
 const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 async function bootstrap() {
+	/**
+	 * Identity-removal **Step 5 item 3** — assert the telephony database's tenant contract before
+	 * anything can serve a request.
+	 *
+	 * The tenant role, its grants and the per-table policies are the only thing standing between
+	 * two tenants once `db.forOrganization(...)` is in the read path, and a policy that silently
+	 * failed to apply looks exactly like one that works until the day it does not. Booting is the
+	 * last moment a misconfiguration can be turned into a refusal to start rather than a leak, so
+	 * it runs here, before `NestFactory.create`.
+	 */
+	const preflight = await assertTenantRlsPreflight(
+		API_TENANT_RLS_PLAN,
+		createApiTenantRlsIntrospector(DATABASE_URL),
+	);
+	logger.info("tenant RLS preflight passed", {
+		role: API_TENANT_RLS_PLAN.roleName,
+		tables: preflight.tables.length,
+	});
+
 	/**
 	 * The better-auth slice is additive and optional: an environment without `DATABASE_URL` /
 	 * `AUTH_SECRET` / `AUTH_URL` still boots the gRPC identity path exactly as before.

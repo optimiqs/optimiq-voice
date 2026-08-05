@@ -1,4 +1,4 @@
-import { Validators as V } from "@optimiq-voice/common";
+import { getOrganizationIdFromCall, Validators as V } from "@optimiq-voice/common";
 import { getLogger } from "@optimiq-voice/logger";
 import { Application, BaseApiObject } from "@optimiq-voice/types";
 import { Database } from "../core/db";
@@ -13,19 +13,16 @@ function createGetApplication(db: Database) {
 
 	const getApplication = async (call: { request: BaseApiObject }): Promise<Application> => {
 		const { ref } = call.request;
+		const organizationId = getOrganizationIdFromCall(call);
 
-		logger.verbose("call to getApplication", { ref });
+		logger.verbose("call to getApplication", { organizationId, ref });
 
-		const result = await getFn(ref);
+		const result = await getFn(organizationId, ref);
 
 		return result ? applicationWithEncodedStruct(result) : null;
 	};
 
-	return withErrorHandlingAndValidationAndAccess(
-		getApplication,
-		(ref: string) => getFn(ref),
-		V.emptySchema,
-	);
+	return withErrorHandlingAndValidationAndAccess(getApplication, V.emptySchema);
 }
 
 export { createGetApplication };

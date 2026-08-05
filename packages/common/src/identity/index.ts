@@ -1,7 +1,6 @@
 export * from "./createAuthInterceptor";
 export * from "./decodeToken";
 export * from "./getPublicKey";
-export * from "./getAccessKeyIdFromCall";
 export * from "./getTokenFromCall";
 export * from "./hasAccess";
 export * from "./isValidToken";

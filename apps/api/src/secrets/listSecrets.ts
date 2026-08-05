@@ -1,7 +1,6 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
 import {
 	datesMapper,
-	getAccessKeyIdFromCall,
+	getOrganizationIdFromCall,
 	GrpcErrorMessage,
 	Validators as V,
 	withErrorHandlingAndValidation,
@@ -21,17 +20,17 @@ function listSecrets(db: Database) {
 	) => {
 		const { pageSize, pageToken } = call.request;
 
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		const organizationId = getOrganizationIdFromCall(call);
 
-		logger.verbose("call to getSecret", {
-			accessKeyId,
+		logger.verbose("call to listSecrets", {
+			organizationId,
 			pageSize,
 			pageToken,
 		});
 
 		const result = (
-			await db.secret.findMany({
-				where: { accessKeyId },
+			await db.forOrganization(organizationId).secret.findMany({
+				where: { organizationId },
 				take: pageSize,
 				skip: pageToken ? 1 : 0,
 				cursor: pageToken ? { ref: pageToken } : undefined,

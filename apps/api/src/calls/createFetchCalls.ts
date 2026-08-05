@@ -10,10 +10,25 @@ import { CallDetailRecord, ListCallsRequest, ListCallsResponse } from "@optimiq-
 const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 function createFetchCalls(influxdb: InfluxDBClient) {
-	return async (accessKeyId: string, request: ListCallsRequest): Promise<ListCallsResponse> => {
+	/**
+	 * `tenantIds` is the organization id plus, when the tenant had one, the legacy `WO…` key.
+	 *
+	 * The CDR measurement's `accessKeyId` tag has carried the organization id since Step 4 flipped
+	 * the per-call minter, but points written before that carry the workspace key. Filtering on
+	 * both is what makes "the same rows before and after" true for a tenant whose history spans
+	 * the cutover; InfluxDB is a time-series store, not one of the telephony tables Step 5 item 1
+	 * rewrites, so there is nothing to backfill there.
+	 */
+	return async (
+		tenantIds: readonly (string | undefined)[],
+		request: ListCallsRequest,
+	): Promise<ListCallsResponse> => {
 		const { after, before, type, from, to, status, pageSize, pageToken } = request;
 
-		const accessKeyIdFilter = accessKeyId ? flux`and r.accessKeyId == "${accessKeyId}"` : flux``;
+		const tenants = [...new Set(tenantIds.filter((id): id is string => Boolean(id)))];
+		const accessKeyIdFilter = tenants.length
+			? flux`and contains(value: r.accessKeyId, set: ${tenants})`
+			: flux``;
 		const typeFilter = type ? flux`and r.type == "${type}"` : flux``;
 		const fromFilter = from ? flux`and r.from == "${from}"` : flux``;
 		const toFilter = to ? flux`and r.to == "${to}"` : flux``;
@@ -47,7 +62,7 @@ function createFetchCalls(influxdb: InfluxDBClient) {
       ${limit}`;
 
 		logger.verbose("list calls request", {
-			accessKeyId,
+			tenants,
 			after,
 			before,
 			query: query.toString(),

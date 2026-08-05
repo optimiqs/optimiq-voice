@@ -1,6 +1,6 @@
-import { ServerInterceptingCall } from "@grpc/grpc-js";
 import {
-	getAccessKeyIdFromCall,
+	getOrganizationIdFromCall,
+	getTenantAccessKeyFromCall,
 	GrpcErrorMessage,
 	Validators as V,
 	withErrorHandlingAndValidation,
@@ -25,9 +25,11 @@ function listNumbers(api: NumbersApi) {
 	) => {
 		const { request } = call;
 
-		logger.verbose("call to listNumbers", { ...request });
+		// Routr owns these rows; see the note in `createNumber.ts`.
+		const organizationId = getOrganizationIdFromCall(call);
+		const accessKeyId = getTenantAccessKeyFromCall(call);
 
-		const accessKeyId = getAccessKeyIdFromCall(call as unknown as ServerInterceptingCall);
+		logger.verbose("call to listNumbers", { ...request, organizationId });
 
 		const requestWithPageToken = request as {
 			pageToken?: string;

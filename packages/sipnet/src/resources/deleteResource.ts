@@ -1,6 +1,6 @@
 import { Validators as V, withErrorHandlingAndValidation } from "@optimiq-voice/common";
-import { withAccess } from "@optimiq-voice/identity";
 import { getLogger } from "@optimiq-voice/logger";
+import { withTenantResourceAccess } from "./withTenantResourceAccess";
 
 const logger = getLogger({ service: "sipnet", filePath: __filename });
 
@@ -16,7 +16,7 @@ function deleteResource<T, R, U>(api: U, resource: string) {
 	};
 
 	return withErrorHandlingAndValidation(
-		withAccess(fn, (ref: string) => api[`get${resource}`](ref)),
+		withTenantResourceAccess(fn, (ref: string) => api[`get${resource}`](ref), resource),
 		V.emptySchema,
 	);
 }
