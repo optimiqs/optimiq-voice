@@ -16,7 +16,7 @@ export {
 	type ExtendedHangupCause,
 	type HangupCause,
 	type Q850HangupCause,
-} from "./hangup-causes";
+} from "@optimiq-voice/telephony";
 export {
 	addMonths,
 	assertPartitionedCdrTable,

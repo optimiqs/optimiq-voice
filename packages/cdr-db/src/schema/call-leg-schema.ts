@@ -19,8 +19,8 @@ import {
 	uuidEntityId,
 	uuidV7EntityId,
 } from "@optimiq-voice/db";
+import { HANGUP_CAUSES, type HangupCause } from "@optimiq-voice/telephony";
 import { cdrTenantContext } from "../cdr-context";
-import { HANGUP_CAUSES } from "../hangup-causes";
 import {
 	CALL_DESTINATION_TYPES,
 	CALL_DIRECTIONS,
@@ -35,7 +35,6 @@ import {
 	type HangupSide,
 	type TranscriptionStatus,
 } from "./enums";
-import type { HangupCause } from "../hangup-causes";
 
 /** `check (col in ('a','b'))` from an `as const` tuple, quoted safely for DDL. */
 function inTuple(column: string, values: readonly string[]): ReturnType<typeof sql.raw> {

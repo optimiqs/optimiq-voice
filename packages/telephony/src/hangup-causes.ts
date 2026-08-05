@@ -1,13 +1,19 @@
 /**
  * Hangup-cause taxonomy — Q.850 named subset plus the FreeSWITCH extensions.
  *
- * Frozen source of truth: `plans/reference/freeswitch-capabilities.md` §6
- * ("Full Q.850 (1–127) plus extensions"). Routing keys off these names — outbound-route
- * failover, `continue_on_fail` cause lists and CDR disposition all read them — so the names
- * and codes are reproduced verbatim and are pinned by `hangup-causes.spec.ts`. Renaming a
- * member is a breaking change for every stored CDR row.
+ * **This module is the canonical home of the taxonomy.** It lives in the pure domain package
+ * because three unrelated consumers key off it — the routing executor (outbound-route failover
+ * and `continueOnCauses` lists), the session protocol (`hangup` verb + hangup events) and the CDR
+ * writer — and a domain rule must not be owned by a database package. `@optimiq-voice/cdr-db`
+ * re-exports these symbols so that stored `call_legs.hangup_cause` values and the routing keys can
+ * never drift apart; do not edit a second copy.
  *
- * Only the Q.850 points a softswitch actually emits are named (45 of the 1–127 range);
+ * Frozen source of truth: `plans/reference/freeswitch-capabilities.md` §6
+ * ("Full Q.850 (1–127) plus extensions"). The names and codes are reproduced verbatim and are
+ * pinned by `hangup-causes.spec.ts`. Renaming a member is a breaking change for every stored CDR
+ * row; re-coding one silently changes outbound failover.
+ *
+ * Only the Q.850 points a softswitch actually emits are named (49 of the 1–127 range);
  * anything else that arrives from a carrier is stored as its numeric code on
  * `call_legs.hangup_cause_code` with `hangup_cause = "NORMAL_UNSPECIFIED"`.
  */

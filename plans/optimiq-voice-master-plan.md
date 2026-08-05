@@ -172,6 +172,7 @@ DELETED: apps/freeswitch, apps/fusionpbx, apps/asterisk→(replaced by infra/ast
 - **KV buckets** (ephemeral truth, TTL where apt): `registrations` (AOR→contacts), `channels` (live channel state for engine failover/drain), `presence` (BLF/device state), `agent-state`, `routing-cache` (compiled routing artifacts w/ invalidation by key — the FusionPBX contract, done properly).
 - **Request-reply (NATS services API)**: `rpc.routing.resolve` (engine→api routing lookups on cache miss), `rpc.media.*` (engine→mediad commands post-Asterisk), `rpc.authz.check`. Versioned subjects (`.v1`).
 - **Contracts in `packages/events`**: every subject's payload is a Zod schema (TS) + generated Go structs (single source: JSON Schema emitted from Zod; CI checks cross-language drift). No untyped publishes — lint-enforced.
+- **Client layer (owner decision 2026-08-05): no custom NATS framework.** `packages/events` is a pure contracts package (subjects, Zod schemas, declarative JetStream stream/KV bucket definitions, thin pure helpers + idempotent `ensureStreams`/`ensureKvBuckets` applicators). App-side wiring uses NestJS's built-in NATS transport (`@nestjs/microservices` + `nats` catalog version) for core request-reply and events; apps that need JetStream durability or KV use the raw `nats` JetStream/KV API directly against the declarative definitions.
 - Ordering/idempotency: per-call subject ordering via JetStream; consumers idempotent by event UUID v7; exactly-once not assumed.
 
 ---

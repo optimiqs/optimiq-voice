@@ -18,6 +18,9 @@ import {
  * The taxonomy is a stored value domain and a routing key: renaming a member rewrites the meaning
  * of every historical CDR row, and re-coding one silently changes outbound failover. These specs
  * pin `plans/reference/freeswitch-capabilities.md` §6 so that never happens by accident.
+ *
+ * They live here, next to the canonical definition, and travel with it — `@optimiq-voice/cdr-db`
+ * re-exports the module rather than keeping a parallel copy.
  */
 describe("hangup-cause taxonomy", () => {
 	it("is the Q.850 subset followed by the FreeSWITCH extensions, with no duplicates", () => {

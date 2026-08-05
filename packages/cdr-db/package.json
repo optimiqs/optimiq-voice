@@ -43,6 +43,7 @@
 	"dependencies": {
 		"@optimiq-voice/db": "workspace:*",
 		"@optimiq-voice/identifiers": "workspace:*",
+		"@optimiq-voice/telephony": "workspace:*",
 		"drizzle-orm": "catalog:",
 		"postgres": "catalog:"
 	},
