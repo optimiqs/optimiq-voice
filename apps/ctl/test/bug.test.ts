@@ -10,15 +10,15 @@ chai.use(sinonChai);
 const sandbox = createSandbox();
 
 describe("@ctl[bug]", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("ensures it contains the issue reporting link", async function () {
-    const { stdout } = await runCommand("bug");
-    expect(stdout).to.contain("Please report bugs to the link below");
-    expect(stdout).to.contain(
-      "https://github.com/optimiqs/optimiq-voice/issues/new?assignees=&labels=bug&projects=&template=bug_report.yaml&title=%5BBUG%5D%3A+"
-    );
-  });
+	it("ensures it contains the issue reporting link", async function () {
+		const { stdout } = await runCommand("bug");
+		expect(stdout).to.contain("Please report bugs to the link below");
+		expect(stdout).to.contain(
+			"https://github.com/optimiqs/optimiq-voice/issues/new?assignees=&labels=bug&projects=&template=bug_report.yaml&title=%5BBUG%5D%3A+",
+		);
+	});
 });

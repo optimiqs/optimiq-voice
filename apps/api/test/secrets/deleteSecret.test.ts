@@ -12,41 +12,41 @@ chai.use(sinonChai);
 const sandbox = createSandbox();
 
 describe("@secrets/deleteSecret", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should delete a secret", async function () {
-    // Arrange
-    const metadata = new grpc.Metadata();
-    metadata.set("token", TEST_TOKEN);
+	it("should delete a secret", async function () {
+		// Arrange
+		const metadata = new grpc.Metadata();
+		metadata.set("token", TEST_TOKEN);
 
-    const call = {
-      metadata,
-      request: {
-        ref: "123"
-      }
-    };
+		const call = {
+			metadata,
+			request: {
+				ref: "123",
+			},
+		};
 
-    const res = {
-      ref: "123"
-    };
+		const res = {
+			ref: "123",
+		};
 
-    const db = {
-      secret: {
-        delete: sandbox.stub().resolves(res),
-        findUnique: sandbox.stub().resolves({
-          accessKeyId: "GRahn02s8tgdfghz72vb0fz538qpb5z35p"
-        })
-      }
-    } as unknown as Database;
+		const db = {
+			secret: {
+				delete: sandbox.stub().resolves(res),
+				findUnique: sandbox.stub().resolves({
+					accessKeyId: "GRahn02s8tgdfghz72vb0fz538qpb5z35p",
+				}),
+			},
+		} as unknown as Database;
 
-    const { deleteSecret } = await import("../../src/secrets/deleteSecret");
+		const { deleteSecret } = await import("../../src/secrets/deleteSecret");
 
-    // Act
-    await deleteSecret(db)(call, (_, response) => {
-      // Assert
-      expect(response).to.have.property("ref", "123");
-    });
-  });
+		// Act
+		await deleteSecret(db)(call, (_, response) => {
+			// Assert
+			expect(response).to.have.property("ref", "123");
+		});
+	});
 });

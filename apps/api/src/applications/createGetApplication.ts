@@ -9,25 +9,23 @@ import { applicationWithEncodedStruct } from "./utils/applicationWithEncodedStru
 const logger = getLogger({ service: "api", filePath: __filename });
 
 function createGetApplication(db: Database) {
-  const getFn = createGetFnUtil(db);
+	const getFn = createGetFnUtil(db);
 
-  const getApplication = async (call: {
-    request: BaseApiObject;
-  }): Promise<Application> => {
-    const { ref } = call.request;
+	const getApplication = async (call: { request: BaseApiObject }): Promise<Application> => {
+		const { ref } = call.request;
 
-    logger.verbose("call to getApplication", { ref });
+		logger.verbose("call to getApplication", { ref });
 
-    const result = await getFn(ref);
+		const result = await getFn(ref);
 
-    return result ? applicationWithEncodedStruct(result) : null;
-  };
+		return result ? applicationWithEncodedStruct(result) : null;
+	};
 
-  return withErrorHandlingAndValidationAndAccess(
-    getApplication,
-    (ref: string) => getFn(ref),
-    V.emptySchema
-  );
+	return withErrorHandlingAndValidationAndAccess(
+		getApplication,
+		(ref: string) => getFn(ref),
+		V.emptySchema,
+	);
 }
 
 export { createGetApplication };

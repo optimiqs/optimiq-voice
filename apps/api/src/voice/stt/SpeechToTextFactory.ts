@@ -7,30 +7,27 @@ import { SttConfig } from "./types";
 const logger = getLogger({ service: "api", filePath: __filename });
 
 type EngineConstructor<T extends SttConfig = SttConfig> = new (
-  options: T
+	options: T,
 ) => AbstractSpeechToText<string>;
 
 class SpeechToTextFactory {
-  private static engines: Map<string, EngineConstructor> = new Map();
+	private static engines: Map<string, EngineConstructor> = new Map();
 
-  static registerEngine<T extends SttConfig>(
-    name: string,
-    ctor: EngineConstructor<T>
-  ) {
-    logger.verbose("registering stt engine", { name });
-    this.engines.set(name, ctor);
-  }
+	static registerEngine<T extends SttConfig>(name: string, ctor: EngineConstructor<T>) {
+		logger.verbose("registering stt engine", { name });
+		this.engines.set(name, ctor);
+	}
 
-  static getEngine<T extends SttConfig>(
-    engineName: string,
-    config: T
-  ): AbstractSpeechToText<string> {
-    const EngineConstructor = this.engines.get(engineName);
-    if (!EngineConstructor) {
-      throw new Error(`Engine ${engineName} not found`);
-    }
-    return new EngineConstructor(config);
-  }
+	static getEngine<T extends SttConfig>(
+		engineName: string,
+		config: T,
+	): AbstractSpeechToText<string> {
+		const EngineConstructor = this.engines.get(engineName);
+		if (!EngineConstructor) {
+			throw new Error(`Engine ${engineName} not found`);
+		}
+		return new EngineConstructor(config);
+	}
 }
 
 // Register engines

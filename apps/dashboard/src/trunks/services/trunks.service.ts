@@ -1,9 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
 import {
-  type Trunk as Resource,
-  type CreateTrunkRequest as ResourceCreateRequest,
-  type ListTrunksRequest as ResourceListRequest,
-  type UpdateTrunkRequest as ResourceUpdateRequest
+	type Trunk as Resource,
+	type CreateTrunkRequest as ResourceCreateRequest,
+	type ListTrunksRequest as ResourceListRequest,
+	type UpdateTrunkRequest as ResourceUpdateRequest,
 } from "@optimiq-voice/types";
 import { useOptimisticCreateResource } from "~/core/hooks/use-optimistic-create-resource";
 import { useOptimisticDeleteResource } from "~/core/hooks/use-optimistic-delete-resource";
@@ -35,19 +35,19 @@ export const RESOURCE_QUERY_KEY = ["resource:trunk"];
  * @returns A React Query object containing trunk data and query metadata.
  */
 export const useTrunks = (params?: ResourceListRequest) => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const { data, ...rest } = useQuery({
-    queryKey: [...COLLECTION_QUERY_KEY, workspaceId, params],
-    queryFn: async () => await sdk.trunks.listTrunks({ ...params })
-  });
+	const { data, ...rest } = useQuery({
+		queryKey: [...COLLECTION_QUERY_KEY, workspaceId, params],
+		queryFn: async () => await sdk.trunks.listTrunks({ ...params }),
+	});
 
-  return {
-    data: data?.items || [],
-    nextPageToken: data?.nextPageToken,
-    ...rest
-  };
+	return {
+		data: data?.items || [],
+		nextPageToken: data?.nextPageToken,
+		...rest,
+	};
 };
 
 /**
@@ -64,16 +64,16 @@ export const useTrunks = (params?: ResourceListRequest) => {
  * @returns A React Query result object containing the trunk and metadata.
  */
 export const useTrunk = (ref: string) => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const { data = null, ...rest } = useQuery({
-    queryKey: [...RESOURCE_QUERY_KEY, workspaceId, ref],
-    queryFn: async () => sdk.trunks.getTrunk(ref),
-    enabled: !!ref
-  });
+	const { data = null, ...rest } = useQuery({
+		queryKey: [...RESOURCE_QUERY_KEY, workspaceId, ref],
+		queryFn: async () => sdk.trunks.getTrunk(ref),
+		enabled: !!ref,
+	});
 
-  return { data, ...rest };
+	return { data, ...rest };
 };
 
 /**
@@ -88,17 +88,17 @@ export const useTrunk = (ref: string) => {
  * @returns A mutation object that can be used to trigger the creation.
  */
 export const useCreateTrunk = () => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
-  const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
+	const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
+	const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
 
-  return useOptimisticCreateResource<Resource, ResourceCreateRequest>(
-    (req) => sdk.trunks.createTrunk(req),
-    COLLECTION_KEY,
-    RESOURCE_KEY
-  );
+	return useOptimisticCreateResource<Resource, ResourceCreateRequest>(
+		(req) => sdk.trunks.createTrunk(req),
+		COLLECTION_KEY,
+		RESOURCE_KEY,
+	);
 };
 
 /**
@@ -113,17 +113,17 @@ export const useCreateTrunk = () => {
  * @returns A mutation object for updating an trunk.
  */
 export const useUpdateTrunk = () => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
-  const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
+	const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
+	const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
 
-  return useOptimisticUpdateResource<Resource, ResourceUpdateRequest>(
-    (req) => sdk.trunks.updateTrunk(req),
-    COLLECTION_KEY,
-    RESOURCE_KEY
-  );
+	return useOptimisticUpdateResource<Resource, ResourceUpdateRequest>(
+		(req) => sdk.trunks.updateTrunk(req),
+		COLLECTION_KEY,
+		RESOURCE_KEY,
+	);
 };
 
 /**
@@ -137,15 +137,15 @@ export const useUpdateTrunk = () => {
  * @returns A mutation object for deleting an trunk.
  */
 export const useDeleteTrunk = () => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
-  const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
+	const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
+	const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
 
-  return useOptimisticDeleteResource(
-    (ref) => sdk.trunks.deleteTrunk(ref),
-    COLLECTION_KEY,
-    RESOURCE_KEY
-  );
+	return useOptimisticDeleteResource(
+		(ref) => sdk.trunks.deleteTrunk(ref),
+		COLLECTION_KEY,
+		RESOURCE_KEY,
+	);
 };

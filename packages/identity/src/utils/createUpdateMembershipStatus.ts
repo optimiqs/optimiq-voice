@@ -5,32 +5,29 @@ import { createDatabaseClient } from "../db";
 import { IdentityConfig } from "../exchanges";
 
 function createUpdateMembershipStatus(identityConfig: IdentityConfig) {
-  return async function pdateMembershipStatus(token: string): Promise<void> {
-    if (!isValidToken(token, identityConfig.privateKey)) {
-      throw new Error("Invalid token");
-    }
+	return async function pdateMembershipStatus(token: string): Promise<void> {
+		if (!isValidToken(token, identityConfig.privateKey)) {
+			throw new Error("Invalid token");
+		}
 
-    const { memberRef } = jwtDecode(token) as { memberRef: string };
+		const { memberRef } = jwtDecode(token) as { memberRef: string };
 
-    const db = createDatabaseClient(
-      identityConfig.dbUrl,
-      identityConfig.encryptionKey
-    );
+		const db = createDatabaseClient(identityConfig.dbUrl, identityConfig.encryptionKey);
 
-    try {
-      await db.workspaceMember.update({
-        where: {
-          ref: memberRef
-        },
-        data: {
-          status: WorkspaceMemberStatus.ACTIVE,
-          updatedAt: new Date()
-        }
-      });
-    } finally {
-      await db.close();
-    }
-  };
+		try {
+			await db.workspaceMember.update({
+				where: {
+					ref: memberRef,
+				},
+				data: {
+					status: WorkspaceMemberStatus.ACTIVE,
+					updatedAt: new Date(),
+				},
+			});
+		} finally {
+			await db.close();
+		}
+	};
 }
 
 export { createUpdateMembershipStatus };

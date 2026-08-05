@@ -13,30 +13,30 @@ const sandbox = createSandbox();
 const channelId = "channel-id";
 
 describe("@voice/handler/Answer", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should handle an Answer command", async function () {
-    // Arrange
-    const ari = getAriStub(sandbox);
+	it("should handle an Answer command", async function () {
+		// Arrange
+		const ari = getAriStub(sandbox);
 
-    const createVoiceClient = getCreateVoiceClient(sandbox);
+		const createVoiceClient = getCreateVoiceClient(sandbox);
 
-    const verbRequest = {
-      mediaSessionRef: channelId
-    };
+		const verbRequest = {
+			mediaSessionRef: channelId,
+		};
 
-    // Act
-    await createAnswerHandler(ari, createVoiceClient())(verbRequest);
+		// Act
+		await createAnswerHandler(ari, createVoiceClient())(verbRequest);
 
-    // Assert
-    expect(ari.channels.answer).to.have.been.calledOnce;
-    expect(createVoiceClient().sendResponse).to.have.been.calledOnce;
-    expect(createVoiceClient().sendResponse).to.have.been.calledWith({
-      answerResponse: {
-        mediaSessionRef: verbRequest.mediaSessionRef
-      }
-    });
-  });
+		// Assert
+		expect(ari.channels.answer).to.have.been.calledOnce;
+		expect(createVoiceClient().sendResponse).to.have.been.calledOnce;
+		expect(createVoiceClient().sendResponse).to.have.been.calledWith({
+			answerResponse: {
+				mediaSessionRef: verbRequest.mediaSessionRef,
+			},
+		});
+	});
 });

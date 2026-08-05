@@ -11,25 +11,25 @@ import { createUpdateApplication } from "./createUpdateApplication";
 import { TestTokenConfiguration } from "./types";
 
 function buildService(db: Database, testTokenConfig: TestTokenConfiguration) {
-  const integrations = getIntegrationsFromFile(INTEGRATIONS_FILE);
+	const integrations = getIntegrationsFromFile(INTEGRATIONS_FILE);
 
-  return {
-    definition: {
-      serviceName: "Applications",
-      pckg: "applications",
-      version: "v1beta2",
-      proto: "applications.proto"
-    },
-    handlers: {
-      createApplication: createCreateApplication(db),
-      getApplication: createGetApplication(db),
-      listApplications: createListApplications(db),
-      deleteApplication: createDeleteApplication(db),
-      updateApplication: createUpdateApplication(db),
-      evaluateIntelligence: createEvaluateIntelligence(integrations),
-      createTestToken: createCreateTestToken(testTokenConfig)
-    }
-  };
+	return {
+		definition: {
+			serviceName: "Applications",
+			pckg: "applications",
+			version: "v1beta2",
+			proto: "applications.proto",
+		},
+		handlers: {
+			createApplication: createCreateApplication(db),
+			getApplication: createGetApplication(db),
+			listApplications: createListApplications(db),
+			deleteApplication: createDeleteApplication(db),
+			updateApplication: createUpdateApplication(db),
+			evaluateIntelligence: createEvaluateIntelligence(integrations),
+			createTestToken: createCreateTestToken(testTokenConfig),
+		},
+	};
 }
 
 export { buildService };

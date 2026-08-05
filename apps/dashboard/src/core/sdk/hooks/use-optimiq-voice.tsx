@@ -9,15 +9,13 @@ import { OptimiqVoiceContext } from "../stores/optimiq-voice.store";
  * @returns The current value of the Optimiq Voice context.
  */
 const useOptimiqVoiceContext = () => {
-  const context = useContext(OptimiqVoiceContext);
+	const context = useContext(OptimiqVoiceContext);
 
-  if (!context) {
-    throw new Error(
-      "Oops! You need to be inside a <OptimiqVoiceProvider /> to use this hook."
-    );
-  }
+	if (!context) {
+		throw new Error("Oops! You need to be inside a <OptimiqVoiceProvider /> to use this hook.");
+	}
 
-  return context;
+	return context;
 };
 
 /**
@@ -31,13 +29,13 @@ const useOptimiqVoiceContext = () => {
  *          authentication helpers, and SDK modules.
  */
 export const useOptimiqVoice = () => {
-  const { client, sdk, ...rest } = useOptimiqVoiceContext();
+	const { client, sdk, ...rest } = useOptimiqVoiceContext();
 
-  if (!client || !sdk) {
-    throw new Error(
-      "Oops! The Optimiq Voice client is not available. Please check your configuration."
-    );
-  }
+	if (!client || !sdk) {
+		throw new Error(
+			"Oops! The Optimiq Voice client is not available. Please check your configuration.",
+		);
+	}
 
-  return { client, sdk, ...rest };
+	return { client, sdk, ...rest };
 };

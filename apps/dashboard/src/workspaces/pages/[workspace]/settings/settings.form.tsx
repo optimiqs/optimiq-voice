@@ -4,12 +4,7 @@ import { useForm } from "react-hook-form";
 import { useNavigate } from "react-router";
 import { z } from "zod";
 import { useAuth } from "~/auth/hooks/use-auth";
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem
-} from "~/core/components/design-system/forms";
+import { Form, FormControl, FormField, FormItem } from "~/core/components/design-system/forms";
 import { FormRoot } from "~/core/components/design-system/forms/form-root";
 import { Input } from "~/core/components/design-system/ui/input/input";
 import { Select } from "~/core/components/design-system/ui/select/select";
@@ -24,8 +19,8 @@ import { TIMEZONES } from "./settings.const";
  * Defines the expected fields and their types.
  */
 export const schema = z.object({
-  name: z.string().nonempty(),
-  timezone: z.string().nonempty()
+	name: z.string().nonempty(),
+	timezone: z.string().nonempty(),
 });
 
 /** Type inferred from the Zod schema. */
@@ -37,7 +32,7 @@ export type Schema = z.infer<typeof schema>;
  * @property {function} [onFormSubmit] - Optional callback executed after successful form submission.
  */
 export interface WorkspaceSettingsProps extends React.PropsWithChildren {
-  onFormSubmit?: (data: Schema) => void;
+	onFormSubmit?: (data: Schema) => void;
 }
 
 /**
@@ -49,112 +44,106 @@ export interface WorkspaceSettingsProps extends React.PropsWithChildren {
  * @param {WorkspaceSettingsProps} props - Props including an optional onFormSubmit callback.
  * @returns {JSX.Element} The rendered workspace settings form.
  */
-export function WorkspaceSettingsForm({
-  onFormSubmit
-}: WorkspaceSettingsProps) {
-  /** Retrieves the current workspace from the auth context. */
-  const { currentWorkspace } = useAuth();
+export function WorkspaceSettingsForm({ onFormSubmit }: WorkspaceSettingsProps) {
+	/** Retrieves the current workspace from the auth context. */
+	const { currentWorkspace } = useAuth();
 
-  /** Mutation hook to update the workspace on the server. */
-  const { mutate, isPending } = useUpdateWorkspace();
+	/** Mutation hook to update the workspace on the server. */
+	const { mutate, isPending } = useUpdateWorkspace();
 
-  /** Initializes react-hook-form with validation and default values. */
-  const form = useForm<Schema>({
-    resolver: zodResolver(schema),
-    defaultValues: currentWorkspace || {
-      name: "",
-      timezone: "UTC"
-    },
-    mode: "onChange"
-  });
+	/** Initializes react-hook-form with validation and default values. */
+	const form = useForm<Schema>({
+		resolver: zodResolver(schema),
+		defaultValues: currentWorkspace || {
+			name: "",
+			timezone: "UTC",
+		},
+		mode: "onChange",
+	});
 
-  /**
-   * Handles form submission:
-   * - Validates workspace existence
-   * - Calls mutate to update the workspace
-   * - Displays success or error toasts
-   * - Calls onFormSubmit if provided
-   */
-  const onSubmit = useCallback(
-    async (data: Schema) => {
-      try {
-        if (!currentWorkspace) {
-          toast(
-            "Oops! We are unable to find your workspace :( Please try again later."
-          );
-          return;
-        }
+	/**
+	 * Handles form submission:
+	 * - Validates workspace existence
+	 * - Calls mutate to update the workspace
+	 * - Displays success or error toasts
+	 * - Calls onFormSubmit if provided
+	 */
+	const onSubmit = useCallback(
+		async (data: Schema) => {
+			try {
+				if (!currentWorkspace) {
+					toast("Oops! We are unable to find your workspace :( Please try again later.");
+					return;
+				}
 
-        const { ref } = currentWorkspace;
+				const { ref } = currentWorkspace;
 
-        mutate({ ref, ...data });
-        toast("Ahoy! Your workspace has been updated successfully");
+				mutate({ ref, ...data });
+				toast("Ahoy! Your workspace has been updated successfully");
 
-        if (onFormSubmit) {
-          onFormSubmit(data);
-        }
-      } catch (error) {
-        toast(getErrorMessage(error));
-      }
-    },
-    [currentWorkspace, mutate, onFormSubmit]
-  );
+				if (onFormSubmit) {
+					onFormSubmit(data);
+				}
+			} catch (error) {
+				toast(getErrorMessage(error));
+			}
+		},
+		[currentWorkspace, mutate, onFormSubmit],
+	);
 
-  /** Hook to navigate to another page if workspace is not found. */
-  const navigate = useNavigate();
+	/** Hook to navigate to another page if workspace is not found. */
+	const navigate = useNavigate();
 
-  /** Sync form state with FormContext */
-  useFormContextSync(form, onSubmit);
+	/** Sync form state with FormContext */
+	useFormContextSync(form, onSubmit);
 
-  /**
-   * Effect that redirects the user if currentWorkspace is undefined.
-   */
-  useEffect(() => {
-    if (!currentWorkspace) {
-      toast(
-        "Oops! We are unable to find your workspace :( Please try again later."
-      );
-      navigate("/");
-    }
-  }, [currentWorkspace, navigate]);
+	/**
+	 * Effect that redirects the user if currentWorkspace is undefined.
+	 */
+	useEffect(() => {
+		if (!currentWorkspace) {
+			toast("Oops! We are unable to find your workspace :( Please try again later.");
+			navigate("/");
+		}
+	}, [currentWorkspace, navigate]);
 
-  /**
-   * Renders the workspace settings form with inputs for name and timezone.
-   */
-  return (
-    <Form {...form}>
-      <FormRoot onSubmit={form.handleSubmit(onSubmit)}>
-        {/* Workspace Name Input */}
-        <FormField
-          control={form.control}
-          name="name"
-          render={({ field }) => (
-            <FormItem>
-              <FormControl>
-                <Input
-                  type="text"
-                  label="Workspace Name"
-                  supportingText="Please enter your full name"
-                  {...field}
-                />
-              </FormControl>
-            </FormItem>
-          )}
-        />
+	/**
+	 * Renders the workspace settings form with inputs for name and timezone.
+	 */
+	return (
+		<Form {...form}>
+			<FormRoot onSubmit={form.handleSubmit(onSubmit)}>
+				{/* Workspace Name Input */}
+				<FormField
+					control={form.control}
+					name="name"
+					render={({ field }) => (
+						<FormItem>
+							<FormControl>
+								<Input
+									type="text"
+									label="Workspace Name"
+									supportingText="Please enter your full name"
+									{...field}
+								/>
+							</FormControl>
+						</FormItem>
+					)}
+				/>
 
-        {/* Timezone Select Input */}
-        <FormField
-          control={form.control}
-          name="timezone"
-          render={({ field }) => (
-            <FormItem>
-              <FormControl>
-                <Select label="Timezone" options={TIMEZONES} {...field} />
-              </FormControl>
-            </FormItem>
-          )}
-        />
-      </FormRoot>
-    </Form>
-  );
+				{/* Timezone Select Input */}
+				<FormField
+					control={form.control}
+					name="timezone"
+					render={({ field }) => (
+						<FormItem>
+							<FormControl>
+								<Select label="Timezone" options={TIMEZONES} {...field} />
+							</FormControl>
+						</FormItem>
+					)}
+				/>
+			</FormRoot>
+		</Form>
+	);
 }

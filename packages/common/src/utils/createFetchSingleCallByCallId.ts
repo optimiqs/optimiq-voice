@@ -1,16 +1,11 @@
 import { flux } from "@influxdata/influxdb-client";
 import { CallDetailRecord } from "@optimiq-voice/types";
-import {
-  CALL_DETAIL_RECORD_MEASUREMENT,
-  INFLUXDB_CALLS_BUCKET
-} from "../constants";
+import { CALL_DETAIL_RECORD_MEASUREMENT, INFLUXDB_CALLS_BUCKET } from "../constants";
 import { InfluxDBClient } from "./types";
 
 function createFetchSingleCallByCallId(influxdb: InfluxDBClient) {
-  return async function fetchSingleCallByCallId(
-    callId: string
-  ): Promise<CallDetailRecord> {
-    const query = flux`from(bucket: "${INFLUXDB_CALLS_BUCKET}")
+	return async function fetchSingleCallByCallId(callId: string): Promise<CallDetailRecord> {
+		const query = flux`from(bucket: "${INFLUXDB_CALLS_BUCKET}")
       |> range(start: -365d)
       |> pivot(rowKey: ["callId"], columnKey: ["_field"], valueColumn: "_value")
       |> map(fn: (r) => ({
@@ -22,10 +17,10 @@ function createFetchSingleCallByCallId(influxdb: InfluxDBClient) {
       |> sort(columns: ["_time"], desc: true)
       |> limit(n: 1)`;
 
-    const items = (await influxdb.collectRows(query)) as CallDetailRecord[];
+		const items = (await influxdb.collectRows(query)) as CallDetailRecord[];
 
-    return items.length > 0 ? items[0] : null;
-  };
+		return items.length > 0 ? items[0] : null;
+	};
 }
 
 export { createFetchSingleCallByCallId };

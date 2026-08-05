@@ -8,35 +8,35 @@ import type { ColumnDef } from "@tanstack/react-table";
  * This configuration enables sorting, filtering, and custom rendering in table UIs.
  */
 export const columns: ColumnDef<Credentials>[] = [
-  {
-    /**
-     * Unique identifier column for the credential.
-     *
-     * Typically a UUID or internal reference string, used for identifying
-     * the row uniquely within the table and backend systems.
-     */
-    id: "ref",
-    header: "Ref",
-    accessorKey: "ref"
-  },
-  {
-    /**
-     * Human-readable name of the credential.
-     *
-     * Often used by users to identify a credential easily in the UI.
-     */
-    id: "name",
-    header: "Name",
-    accessorKey: "name"
-  },
-  {
-    /**
-     * Username associated with the credential.
-     *
-     * This helps track which username is using this credential.
-     */
-    id: "username",
-    header: "Username",
-    accessorKey: "username"
-  }
+	{
+		/**
+		 * Unique identifier column for the credential.
+		 *
+		 * Typically a UUID or internal reference string, used for identifying
+		 * the row uniquely within the table and backend systems.
+		 */
+		id: "ref",
+		header: "Ref",
+		accessorKey: "ref",
+	},
+	{
+		/**
+		 * Human-readable name of the credential.
+		 *
+		 * Often used by users to identify a credential easily in the UI.
+		 */
+		id: "name",
+		header: "Name",
+		accessorKey: "name",
+	},
+	{
+		/**
+		 * Username associated with the credential.
+		 *
+		 * This helps track which username is using this credential.
+		 */
+		id: "username",
+		header: "Username",
+		accessorKey: "username",
+	},
 ];

@@ -14,7 +14,7 @@ import type { Route } from "./+types/login.page";
  * @returns Array of meta objects for the page.
  */
 export function meta(_: Route.MetaArgs) {
-  return [{ title: "Log In | Optimiq Voice" }];
+	return [{ title: "Log In | Optimiq Voice" }];
 }
 
 /** Re-exports the action function for form submission handling. */
@@ -30,47 +30,37 @@ export { action } from "./login.action";
  * Integrates React Hook Form for validation and react-router submit for form handling.
  */
 export default function LoginPage() {
-  /** react-router hook to submit form data using the `post` method. */
-  const submit = useSubmit();
+	/** react-router hook to submit form data using the `post` method. */
+	const submit = useSubmit();
 
-  /**
-   * Memoized submit handler for the login form.
-   * Uses react-router's `submit` to trigger the action defined for the route.
-   *
-   * @param data - The validated form data.
-   */
-  const onSubmit = useCallback(
-    (data: Schema) => submit(data, { method: "post", viewTransition: true }),
-    [submit]
-  );
+	/**
+	 * Memoized submit handler for the login form.
+	 * Uses react-router's `submit` to trigger the action defined for the route.
+	 *
+	 * @param data - The validated form data.
+	 */
+	const onSubmit = useCallback(
+		(data: Schema) => submit(data, { method: "post", viewTransition: true }),
+		[submit],
+	);
 
-  /**
-   * Handler for GitHub authentication (currently not implemented).
-   * Displays a toast message as a placeholder.
-   */
-  const onGithubAuth = useCallback(async () => {
-    window.location.href = getGithubSigninUrl();
-  }, []);
+	/**
+	 * Handler for GitHub authentication (currently not implemented).
+	 * Displays a toast message as a placeholder.
+	 */
+	const onGithubAuth = useCallback(async () => {
+		window.location.href = getGithubSigninUrl();
+	}, []);
 
-  return (
-    <Box
-      width="100%"
-      maxWidth="440px"
-      gap="40px"
-      display="flex"
-      flexDirection="column"
-    >
-      {/* Page title */}
-      <Typography
-        variant="heading-large"
-        color="base.03"
-        sx={{ textAlign: "center" }}
-      >
-        Sign In
-      </Typography>
+	return (
+		<Box width="100%" maxWidth="440px" gap="40px" display="flex" flexDirection="column">
+			{/* Page title */}
+			<Typography variant="heading-large" color="base.03" sx={{ textAlign: "center" }}>
+				Sign In
+			</Typography>
 
-      {/* Login form */}
-      <LoginForm {...{ onSubmit, onGithubAuth }} />
-    </Box>
-  );
+			{/* Login form */}
+			<LoginForm {...{ onSubmit, onGithubAuth }} />
+		</Box>
+	);
 }

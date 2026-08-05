@@ -3,18 +3,18 @@ import { createBodyForVerificationMessage } from "./createBodyForVerificationMes
 import { VerificationParams } from "./types";
 
 async function sendVerificationMessage(
-  sendSms: (params: SmsParams) => Promise<void>,
-  request: VerificationParams
+	sendSms: (params: SmsParams) => Promise<void>,
+	request: VerificationParams,
 ) {
-  const { recipient, verificationCode, templateDir } = request;
+	const { recipient, verificationCode, templateDir } = request;
 
-  await sendSms({
-    to: recipient,
-    body: createBodyForVerificationMessage({
-      templateDir,
-      verificationCode
-    })
-  });
+	await sendSms({
+		to: recipient,
+		body: createBodyForVerificationMessage({
+			templateDir,
+			verificationCode,
+		}),
+	});
 }
 
 export { sendVerificationMessage };

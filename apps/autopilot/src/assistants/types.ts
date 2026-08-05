@@ -1,8 +1,8 @@
 import { z } from "zod";
 import {
-  assistantSchema,
-  conversationSettingsSchema,
-  languageModelConfigSchema
+	assistantSchema,
+	conversationSettingsSchema,
+	languageModelConfigSchema,
 } from "@optimiq-voice/common";
 
 type ConversationSettings = z.infer<typeof conversationSettingsSchema>;

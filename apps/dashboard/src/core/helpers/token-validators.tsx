@@ -1,10 +1,7 @@
 import { jwtDecode } from "jwt-decode";
 import { Logger } from "../shared/logger";
 import type { SDK } from "../sdk/client/optimiq-voice.client";
-import type {
-  CookieSession,
-  Session
-} from "~/auth/services/sessions/session.interfaces";
+import type { CookieSession, Session } from "~/auth/services/sessions/session.interfaces";
 
 /**
  * Checks whether a given JWT token has expired.
@@ -13,18 +10,18 @@ import type {
  * @returns `true` if the token is expired or invalid; otherwise `false`.
  */
 export function isTokenExpired(token: string): boolean {
-  if (!token) return true;
+	if (!token) return true;
 
-  const decodedToken = jwtDecode(token) as { exp: number };
-  const currentTime = Date.now() / 1000;
+	const decodedToken = jwtDecode(token) as { exp: number };
+	const currentTime = Date.now() / 1000;
 
-  Logger.debug("[Optimiq Voice Token Validator] Checking token expiration", {
-    token: token.substring(0, 20) + "...",
-    exp: decodedToken.exp,
-    currentTime
-  });
+	Logger.debug("[Optimiq Voice Token Validator] Checking token expiration", {
+		token: token.substring(0, 20) + "...",
+		exp: decodedToken.exp,
+		currentTime,
+	});
 
-  return decodedToken.exp < currentTime;
+	return decodedToken.exp < currentTime;
 }
 
 /**
@@ -40,25 +37,18 @@ export function isTokenExpired(token: string): boolean {
  *          Otherwise, returns the original session.
  * @throws An error if the refresh token is expired.
  */
-export async function refreshSession(
-  session: CookieSession,
-  client: SDK.Client
-) {
-  const { refreshToken } = session;
+export async function refreshSession(session: CookieSession, client: SDK.Client) {
+	const { refreshToken } = session;
 
-  if (isTokenExpired(refreshToken)) {
-    Logger.debug(
-      "[Optimiq Voice Refresh Session] Refresh token expired. Refreshing..."
-    );
-    throw new Error("Oops! Your session has expired.");
-  }
+	if (isTokenExpired(refreshToken)) {
+		Logger.debug("[Optimiq Voice Refresh Session] Refresh token expired. Refreshing...");
+		throw new Error("Oops! Your session has expired.");
+	}
 
-  Logger.debug(
-    "[Optimiq Voice Refresh Session] Refreshing session with existing refresh token"
-  );
-  await client.loginWithRefreshToken(refreshToken);
+	Logger.debug("[Optimiq Voice Refresh Session] Refreshing session with existing refresh token");
+	await client.loginWithRefreshToken(refreshToken);
 
-  return client.getRefreshToken();
+	return client.getRefreshToken();
 }
 
 /**
@@ -73,26 +63,24 @@ export async function refreshSession(
  * @throws An error if the refresh token is expired.
  */
 export async function refreshClientSession(
-  session: CookieSession,
-  client: SDK.WebClient
+	session: CookieSession,
+	client: SDK.WebClient,
 ): Promise<Session> {
-  const { refreshToken } = session;
+	const { refreshToken } = session;
 
-  if (isTokenExpired(refreshToken)) {
-    Logger.debug(
-      "[Optimiq Voice Refresh Client Session] Refresh token expired. Refreshing..."
-    );
-    throw new Error("Oops! Your session has expired.");
-  }
+	if (isTokenExpired(refreshToken)) {
+		Logger.debug("[Optimiq Voice Refresh Client Session] Refresh token expired. Refreshing...");
+		throw new Error("Oops! Your session has expired.");
+	}
 
-  Logger.debug(
-    "[Optimiq Voice Refresh Client Session] Refreshing client session with existing refresh token"
-  );
-  await client.loginWithRefreshToken(refreshToken);
+	Logger.debug(
+		"[Optimiq Voice Refresh Client Session] Refreshing client session with existing refresh token",
+	);
+	await client.loginWithRefreshToken(refreshToken);
 
-  return {
-    accessToken: client.getAccessToken(),
-    refreshToken: client.getRefreshToken(),
-    idToken: client.getIdToken()
-  };
+	return {
+		accessToken: client.getAccessToken(),
+		refreshToken: client.getRefreshToken(),
+		idToken: client.getIdToken(),
+	};
 }

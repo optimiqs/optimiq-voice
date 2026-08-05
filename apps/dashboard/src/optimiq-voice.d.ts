@@ -7,10 +7,10 @@
  * @TODO: Remove this file when the Optimiq Voice Client is available in the browser.
  */
 declare module "@optimiq-voice/sdk/dist/web/index.esm.js" {
-  import * as SDK from "@optimiq-voice/sdk";
+	import * as SDK from "@optimiq-voice/sdk";
 
-  export class WebClient extends SDK.Client {}
-  export * from "@optimiq-voice/sdk";
+	export class WebClient extends SDK.Client {}
+	export * from "@optimiq-voice/sdk";
 }
 
 /**
@@ -20,8 +20,8 @@ declare module "@optimiq-voice/sdk/dist/web/index.esm.js" {
  * create a new instance of the Optimiq Voice Client for Node.
  */
 declare module "@optimiq-voice/sdk/dist/node/node.js" {
-  import * as SDK from "@optimiq-voice/sdk";
+	import * as SDK from "@optimiq-voice/sdk";
 
-  export class Client extends SDK.Client {}
-  export * from "@optimiq-voice/sdk";
+	export class Client extends SDK.Client {}
+	export * from "@optimiq-voice/sdk";
 }

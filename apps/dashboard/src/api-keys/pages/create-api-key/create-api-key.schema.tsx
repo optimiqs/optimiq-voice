@@ -11,11 +11,11 @@ import { Role } from "@optimiq-voice/types";
  * - role: Required string representing the apiKey's role.
  */
 export const schema = z.object({
-  /** Unique identifier for the apiKey (optional). */
-  ref: z.string().nullish(),
+	/** Unique identifier for the apiKey (optional). */
+	ref: z.string().nullish(),
 
-  /** Human-friendly name for the apiKey (required). */
-  role: z.nativeEnum(Role)
+	/** Human-friendly name for the apiKey (required). */
+	role: z.nativeEnum(Role),
 });
 
 /**

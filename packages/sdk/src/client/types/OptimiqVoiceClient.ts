@@ -10,20 +10,20 @@ import { SecretsClient } from "./SecretsClient";
 import { TrunksClient } from "./TrunksClient";
 
 interface OptimiqVoiceClient {
-  getAccessToken(): string;
-  getAccessKeyId(): string;
-  getApplicationsClient(): ApplicationsClient;
-  getCallsClient(): CallsClient;
-  getIdentityClient(): IdentityClient;
-  getSecretsClient(): SecretsClient;
-  getAgentsClient(): AgentsClient;
-  getNumbersClient(): NumbersClient;
-  getCredentialsClient(): CredentialsClient;
-  getDomainsClient(): DomainsClient;
-  getTrunksClient(): TrunksClient;
-  getAclsClient(): AclsClient;
-  getMetadata(): unknown;
-  refreshToken(): Promise<void>;
+	getAccessToken(): string;
+	getAccessKeyId(): string;
+	getApplicationsClient(): ApplicationsClient;
+	getCallsClient(): CallsClient;
+	getIdentityClient(): IdentityClient;
+	getSecretsClient(): SecretsClient;
+	getAgentsClient(): AgentsClient;
+	getNumbersClient(): NumbersClient;
+	getCredentialsClient(): CredentialsClient;
+	getDomainsClient(): DomainsClient;
+	getTrunksClient(): TrunksClient;
+	getAclsClient(): AclsClient;
+	getMetadata(): unknown;
+	refreshToken(): Promise<void>;
 }
 
 export { OptimiqVoiceClient };

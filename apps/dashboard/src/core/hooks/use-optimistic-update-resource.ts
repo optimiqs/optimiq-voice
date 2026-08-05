@@ -1,8 +1,8 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
-  updateResourceInCache,
-  updateSingleResourceInCache,
-  type BaseApiObject
+	updateResourceInCache,
+	updateSingleResourceInCache,
+	type BaseApiObject,
 } from "../providers/query-client/manage-resource-cache.helper";
 import { Logger } from "../shared/logger";
 import type { ListResponse } from "@optimiq-voice/types";
@@ -23,123 +23,113 @@ import type { ListResponse } from "@optimiq-voice/types";
  * @returns A React Query mutation object with `mutate`, `status`, and callbacks configured for optimistic updates.
  */
 export function useOptimisticUpdateResource<
-  TData extends BaseApiObject,
-  TVariables extends BaseApiObject
+	TData extends BaseApiObject,
+	TVariables extends BaseApiObject,
 >(
-  updateFn: (data: TVariables) => Promise<BaseApiObject>,
-  collectionKey: unknown[],
-  resourceKey: unknown[]
+	updateFn: (data: TVariables) => Promise<BaseApiObject>,
+	collectionKey: unknown[],
+	resourceKey: unknown[],
 ) {
-  const queryClient = useQueryClient();
+	const queryClient = useQueryClient();
 
-  return useMutation<
-    TData, // The type of the mutation result.
-    unknown, // The error type (not specified).
-    TVariables, // The type of the variables passed to the mutation.
-    {
-      previousList: ListResponse<TData> | undefined; // Cached collection state for rollback.
-      previousItem: TData | undefined; // Cached single item state for rollback.
-    }
-  >({
-    /**
-     * The main mutation function that sends an update request to the backend.
-     * Merges the original request data with the server response and updates the timestamp.
-     *
-     * @param request - The data used to update the resource.
-     * @returns The final merged and updated resource object.
-     */
-    mutationFn: async (request: TVariables): Promise<TData> => {
-      const updated = await updateFn(request);
+	return useMutation<
+		TData, // The type of the mutation result.
+		unknown, // The error type (not specified).
+		TVariables, // The type of the variables passed to the mutation.
+		{
+			previousList: ListResponse<TData> | undefined; // Cached collection state for rollback.
+			previousItem: TData | undefined; // Cached single item state for rollback.
+		}
+	>({
+		/**
+		 * The main mutation function that sends an update request to the backend.
+		 * Merges the original request data with the server response and updates the timestamp.
+		 *
+		 * @param request - The data used to update the resource.
+		 * @returns The final merged and updated resource object.
+		 */
+		mutationFn: async (request: TVariables): Promise<TData> => {
+			const updated = await updateFn(request);
 
-      return {
-        ...request,
-        ...updated,
-        updatedAt: new Date()
-      } as unknown as TData;
-    },
+			return {
+				...request,
+				...updated,
+				updatedAt: new Date(),
+			} as unknown as TData;
+		},
 
-    /**
-     * Called immediately before the mutation function runs.
-     * Saves current cache state and performs an optimistic update on both the list and item views.
-     *
-     * @param resource - The resource update payload.
-     * @returns An object containing the previous cache states for rollback purposes.
-     */
-    onMutate: async (resource: TVariables) => {
-      await queryClient.cancelQueries({ queryKey: collectionKey });
+		/**
+		 * Called immediately before the mutation function runs.
+		 * Saves current cache state and performs an optimistic update on both the list and item views.
+		 *
+		 * @param resource - The resource update payload.
+		 * @returns An object containing the previous cache states for rollback purposes.
+		 */
+		onMutate: async (resource: TVariables) => {
+			await queryClient.cancelQueries({ queryKey: collectionKey });
 
-      Logger.debug(
-        "[useOptimisticUpdateResource] Updating optimistic resource: ",
-        collectionKey
-      );
+			Logger.debug("[useOptimisticUpdateResource] Updating optimistic resource: ", collectionKey);
 
-      const previousList =
-        queryClient.getQueryData<ListResponse<TData>>(collectionKey);
-      const previousItem = queryClient.getQueryData<TData>([
-        ...resourceKey,
-        resource.ref
-      ]);
+			const previousList = queryClient.getQueryData<ListResponse<TData>>(collectionKey);
+			const previousItem = queryClient.getQueryData<TData>([...resourceKey, resource.ref]);
 
-      updateResourceInCache(queryClient, collectionKey, resource);
-      updateSingleResourceInCache(queryClient, resourceKey, resource);
+			updateResourceInCache(queryClient, collectionKey, resource);
+			updateSingleResourceInCache(queryClient, resourceKey, resource);
 
-      return { previousList, previousItem };
-    },
+			return { previousList, previousItem };
+		},
 
-    /**
-     * Called if the mutation fails.
-     * Restores the cache to its previous state using data saved during `onMutate`.
-     *
-     * @param _err - The error thrown by the mutation.
-     * @param _vars - The variables passed to the mutation (not used here).
-     * @param context - The rollback context returned from `onMutate`.
-     */
-    onError: (_err, _vars, context) => {
-      Logger.debug("[useOptimisticUpdateResource] Rollback on error");
+		/**
+		 * Called if the mutation fails.
+		 * Restores the cache to its previous state using data saved during `onMutate`.
+		 *
+		 * @param _err - The error thrown by the mutation.
+		 * @param _vars - The variables passed to the mutation (not used here).
+		 * @param context - The rollback context returned from `onMutate`.
+		 */
+		onError: (_err, _vars, context) => {
+			Logger.debug("[useOptimisticUpdateResource] Rollback on error");
 
-      if (context?.previousList) {
-        Logger.debug("[useOptimisticUpdateResource] Restoring previous list");
-        queryClient.setQueryData<ListResponse<TData>>(
-          collectionKey,
-          context.previousList
-        );
-      }
+			if (context?.previousList) {
+				Logger.debug("[useOptimisticUpdateResource] Restoring previous list");
+				queryClient.setQueryData<ListResponse<TData>>(collectionKey, context.previousList);
+			}
 
-      if (context?.previousItem) {
-        Logger.debug("[useOptimisticUpdateResource] Restoring previous item");
-        queryClient.setQueryData<TData>(
-          [...resourceKey, context.previousItem.ref],
-          context.previousItem
-        );
-      }
-    },
+			if (context?.previousItem) {
+				Logger.debug("[useOptimisticUpdateResource] Restoring previous item");
+				queryClient.setQueryData<TData>(
+					[...resourceKey, context.previousItem.ref],
+					context.previousItem,
+				);
+			}
+		},
 
-    /**
-     * Called when the mutation succeeds.
-     * Ensures the cache is updated with the confirmed resource from the server.
-     *
-     * @param resource - The updated resource returned by the server.
-     */
-    onSuccess: (resource) => {
-      Logger.debug("[useOptimisticUpdateResource] Update successful");
-      updateResourceInCache(queryClient, collectionKey, resource);
-      updateSingleResourceInCache(queryClient, resourceKey, resource);
-    },
+		/**
+		 * Called when the mutation succeeds.
+		 * Ensures the cache is updated with the confirmed resource from the server.
+		 *
+		 * @param resource - The updated resource returned by the server.
+		 */
+		onSuccess: (resource) => {
+			Logger.debug("[useOptimisticUpdateResource] Update successful");
+			updateResourceInCache(queryClient, collectionKey, resource);
+			updateSingleResourceInCache(queryClient, resourceKey, resource);
+		},
 
-    /**
-     * Called after the mutation completes (regardless of success or failure).
-     * Invalidates related queries to ensure fresh data from the server.
-     *
-     * @param _data - The data returned by the mutation.
-     * @param _error - Any error that occurred during the mutation.
-     * @param variables - The variables originally passed to the mutation.
-     */
-    onSettled: (_data, _error, variables) => {
-      Logger.debug("[useOptimisticUpdateResource] Mutation settled");
-      queryClient.invalidateQueries({ queryKey: collectionKey });
-      queryClient.invalidateQueries({
-        queryKey: [...resourceKey, variables.ref]
-      });
-    }
-  });
+		/**
+		 * Called after the mutation completes (regardless of success or failure).
+		 * Invalidates related queries to ensure fresh data from the server.
+		 *
+		 * @param _data - The data returned by the mutation.
+		 * @param _error - Any error that occurred during the mutation.
+		 * @param variables - The variables originally passed to the mutation.
+		 */
+		onSettled: (_data, _error, variables) => {
+			Logger.debug("[useOptimisticUpdateResource] Mutation settled");
+			queryClient.invalidateQueries({ queryKey: collectionKey });
+			queryClient.invalidateQueries({
+				queryKey: [...resourceKey, variables.ref],
+			});
+		},
+	});
 }

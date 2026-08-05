@@ -16,14 +16,14 @@ import type { Route } from "./+types/create-trunk.page";
  * @returns An array of metadata objects for the page.
  */
 export function meta(_: Route.MetaArgs) {
-  return [
-    { title: "Create New SIP Trunk | Optimiq Voice" },
-    {
-      name: "description",
-      content:
-        "A VoIP Provider is a resource within the Optimiq Voice network that handles PSTN connectivity."
-    }
-  ];
+	return [
+		{ title: "Create New SIP Trunk | Optimiq Voice" },
+		{
+			name: "description",
+			content:
+				"A VoIP Provider is a resource within the Optimiq Voice network that handles PSTN connectivity.",
+		},
+	];
 }
 
 /**
@@ -38,31 +38,31 @@ export function meta(_: Route.MetaArgs) {
  * @returns {JSX.Element} The rendered Create Trunk page.
  */
 export default function CreateTrunk() {
-  /** Custom hook to create a trunk via API with optimistic updates. */
-  const { onGoBack, onSave } = useCreateTrunk();
+	/** Custom hook to create a trunk via API with optimistic updates. */
+	const { onGoBack, onSave } = useCreateTrunk();
 
-  /**
-   * Renders the Create Trunk page layout.
-   */
-  return (
-    <FormProvider>
-      <Page variant="form">
-        <PageHeader
-          title="Create New SIP Trunk"
-          description="A VoIP Provider is a resource within the Optimiq Voice network that handles PSTN connectivity."
-          onBack={{ label: "Back to trunks", onClick: onGoBack }}
-          actions={
-            <FormSubmitButton size="small" loadingText="Saving...">
-              Save SIP Trunk
-            </FormSubmitButton>
-          }
-        />
+	/**
+	 * Renders the Create Trunk page layout.
+	 */
+	return (
+		<FormProvider>
+			<Page variant="form">
+				<PageHeader
+					title="Create New SIP Trunk"
+					description="A VoIP Provider is a resource within the Optimiq Voice network that handles PSTN connectivity."
+					onBack={{ label: "Back to trunks", onClick: onGoBack }}
+					actions={
+						<FormSubmitButton size="small" loadingText="Saving...">
+							Save SIP Trunk
+						</FormSubmitButton>
+					}
+				/>
 
-        {/* Form container with a max width for readability and consistent layout */}
-        <Box sx={{ maxWidth: "440px" }}>
-          <CreateTrunkForm onSubmit={onSave} />
-        </Box>
-      </Page>
-    </FormProvider>
-  );
+				{/* Form container with a max width for readability and consistent layout */}
+				<Box sx={{ maxWidth: "440px" }}>
+					<CreateTrunkForm onSubmit={onSave} />
+				</Box>
+			</Page>
+		</FormProvider>
+	);
 }

@@ -8,8 +8,8 @@ import { Typography } from "../design-system/ui/typography/typography";
  * This component accepts all standard HTML div attributes plus a required label.
  */
 export interface ModalTriggerProps extends React.HTMLAttributes<HTMLDivElement> {
-  /** Text label displayed next to the icon inside the trigger. */
-  label: string;
+	/** Text label displayed next to the icon inside the trigger. */
+	label: string;
 }
 
 /**
@@ -32,35 +32,35 @@ export interface ModalTriggerProps extends React.HTMLAttributes<HTMLDivElement> 
  * @returns {JSX.Element} A styled button-like element for triggering a modal.
  */
 export const ModalTrigger = ({ label, ...props }: ModalTriggerProps) => {
-  return (
-    <Box
-      component="div"
-      role="button"
-      {...props}
-      sx={{
-        display: "flex",
-        alignItems: "center",
-        gap: "8px",
-        cursor: "pointer",
-        color: "base.03",
-        fontSize: "16px",
-        minHeight: "24px"
-      }}
-    >
-      {/* Leading Icon */}
-      <Icon name="Add" fontSize="inherit" />
+	return (
+		<Box
+			component="div"
+			role="button"
+			{...props}
+			sx={{
+				display: "flex",
+				alignItems: "center",
+				gap: "8px",
+				cursor: "pointer",
+				color: "base.03",
+				fontSize: "16px",
+				minHeight: "24px",
+			}}
+		>
+			{/* Leading Icon */}
+			<Icon name="Add" fontSize="inherit" />
 
-      {/* Label with underline styling */}
-      <Typography
-        variant="body-micro"
-        sx={{
-          fontWeight: "400 !important",
-          textDecoration: "underline",
-          color: "base.03"
-        }}
-      >
-        {label}
-      </Typography>
-    </Box>
-  );
+			{/* Label with underline styling */}
+			<Typography
+				variant="body-micro"
+				sx={{
+					fontWeight: "400 !important",
+					textDecoration: "underline",
+					color: "base.03",
+				}}
+			>
+				{label}
+			</Typography>
+		</Box>
+	);
 };

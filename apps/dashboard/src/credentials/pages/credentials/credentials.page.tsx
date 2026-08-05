@@ -5,10 +5,7 @@ import { Page } from "~/core/components/general/page/page";
 import { useResourceTable } from "~/core/hooks/use-resource-table";
 import { PAGE_SIZE } from "~/core/shared/page-sizes.const";
 import { useWorkspaceId } from "~/workspaces/hooks/use-workspace-id";
-import {
-  useCredentials,
-  useDeleteCredential
-} from "../../services/credentials.service";
+import { useCredentials, useDeleteCredential } from "../../services/credentials.service";
 import { columns } from "./credentials.columns";
 import { CREDENTIALS_SEARCHABLE_FIELDS } from "./credentials.const";
 import { CredentialsPageHeader } from "./credentials.page-header";
@@ -24,14 +21,13 @@ import type { Credentials } from "@optimiq-voice/types";
  * @returns An array of metadata objects for the page.
  */
 export function meta(_: Route.MetaArgs) {
-  return [
-    { title: "Credentials | Optimiq Voice" },
-    {
-      name: "description",
-      content:
-        "Manage the credentials used to authenticate your Agents and Trunks."
-    }
-  ];
+	return [
+		{ title: "Credentials | Optimiq Voice" },
+		{
+			name: "description",
+			content: "Manage the credentials used to authenticate your Agents and Trunks.",
+		},
+	];
 }
 
 /**
@@ -43,110 +39,108 @@ export function meta(_: Route.MetaArgs) {
  * @returns {JSX.Element} The rendered Credentials page.
  */
 export default function CredentialsList() {
-  /** Hook to navigate programmatically within the application. */
-  const navigate = useNavigate();
+	/** Hook to navigate programmatically within the application. */
+	const navigate = useNavigate();
 
-  /** Retrieves the current workspace ID for API calls and navigation. */
-  const workspaceId = useWorkspaceId();
+	/** Retrieves the current workspace ID for API calls and navigation. */
+	const workspaceId = useWorkspaceId();
 
-  /** State to hold the current pagination token used to fetch a specific page of data. */
-  const [pageToken, setPageToken] = useState<string | undefined>(undefined);
+	/** State to hold the current pagination token used to fetch a specific page of data. */
+	const [pageToken, setPageToken] = useState<string | undefined>(undefined);
 
-  /** Fetch credentials data using the current page token and page size. */
-  const { data, nextPageToken, isLoading } = useCredentials({
-    pageSize: PAGE_SIZE,
-    pageToken
-  });
+	/** Fetch credentials data using the current page token and page size. */
+	const { data, nextPageToken, isLoading } = useCredentials({
+		pageSize: PAGE_SIZE,
+		pageToken,
+	});
 
-  /** Hook to delete a credential via the API. */
-  const { mutate: deleteCredential } = useDeleteCredential();
+	/** Hook to delete a credential via the API. */
+	const { mutate: deleteCredential } = useDeleteCredential();
 
-  /**
-   * Custom hook for table management:
-   * - Handles search functionality
-   * - Handles pagination (next/prev pages)
-   * - Handles deletion of selected rows
-   * - Integrates with UI components
-   */
-  const {
-    filteredData,
-    searchBy,
-    setSearchBy,
-    handleNextPage,
-    handlePrevPage,
-    handleSearch,
-    handleDelete,
-    prevTokens
-  } = useResourceTable({
-    data,
-    pageSize: PAGE_SIZE,
-    pageToken,
-    setPageToken,
-    deleteResource: deleteCredential,
-    searchableFields: CREDENTIALS_SEARCHABLE_FIELDS,
-    defaultSearchBy: "name"
-  });
+	/**
+	 * Custom hook for table management:
+	 * - Handles search functionality
+	 * - Handles pagination (next/prev pages)
+	 * - Handles deletion of selected rows
+	 * - Integrates with UI components
+	 */
+	const {
+		filteredData,
+		searchBy,
+		setSearchBy,
+		handleNextPage,
+		handlePrevPage,
+		handleSearch,
+		handleDelete,
+		prevTokens,
+	} = useResourceTable({
+		data,
+		pageSize: PAGE_SIZE,
+		pageToken,
+		setPageToken,
+		deleteResource: deleteCredential,
+		searchableFields: CREDENTIALS_SEARCHABLE_FIELDS,
+		defaultSearchBy: "name",
+	});
 
-  /**
-   * Callback function to handle editing a selected credential.
-   *
-   * Navigates to the edit page for the selected credential.
-   * Uses view transitions for a smoother user experience.
-   * @param ref - The reference of the credential to edit.
-   * @param {ICredential} ref - The credential object containing the reference.
-   * @returns {void}
-   */
-  const onEditSelected = useCallback(({ ref }: Credentials) => {
-    navigate(`/workspaces/${workspaceId}/sip-network/credentials/${ref}/edit`, {
-      viewTransition: true
-    });
-  }, []);
+	/**
+	 * Callback function to handle editing a selected credential.
+	 *
+	 * Navigates to the edit page for the selected credential.
+	 * Uses view transitions for a smoother user experience.
+	 * @param ref - The reference of the credential to edit.
+	 * @param {ICredential} ref - The credential object containing the reference.
+	 * @returns {void}
+	 */
+	const onEditSelected = useCallback(({ ref }: Credentials) => {
+		navigate(`/workspaces/${workspaceId}/sip-network/credentials/${ref}/edit`, {
+			viewTransition: true,
+		});
+	}, []);
 
-  /**
-   * Renders the Credentials page, including a header and a DataTable.
-   */
-  return (
-    <Page>
-      <CredentialsPageHeader />
+	/**
+	 * Renders the Credentials page, including a header and a DataTable.
+	 */
+	return (
+		<Page>
+			<CredentialsPageHeader />
 
-      <DataTable
-        /** Indicates loading state during data fetch. */
-        isLoading={isLoading}
-        /** Data displayed in the table, filtered by search input. */
-        data={filteredData}
-        /** Column definitions for each table column. */
-        columns={columns}
-        /** Function to determine the unique row ID for each record. */
-        getRowId={(row) => row.ref}
-        /** The currently selected search field (e.g., "ref", "name"). */
-        searchBy={searchBy}
-        /** List of available searchable fields presented to the user. */
-        searchableFields={CREDENTIALS_SEARCHABLE_FIELDS}
-        /** Credential of rows displayed per page. */
-        pageSize={PAGE_SIZE}
-        /** Pagination configuration: total rows, next and previous tokens. */
-        pagination={{
-          total: filteredData.length,
-          nextToken: nextPageToken,
-          prevToken: prevTokens.length
-            ? prevTokens[prevTokens.length - 1]
-            : null
-        }}
-        /** Handler for navigating to the next page. */
-        onNextPage={() => handleNextPage(nextPageToken)}
-        /** Handler for navigating to the previous page. */
-        onPrevPage={handlePrevPage}
-        /** Handler for updating the search input. */
-        onSearch={handleSearch}
-        /** Handler for changing the search field selection. */
-        onSearchByFieldChange={setSearchBy}
-        /** Handler for deleting selected rows. */
-        onDeleteSelected={handleDelete}
-        /** Handler for editing selected rows (currently shows a toast). */
-        onEditSelected={onEditSelected}
-        /** Handler for clicking on a row to navigate to edit page. */
-        onRowClick={onEditSelected}
-      />
-    </Page>
-  );
+			<DataTable
+				/** Indicates loading state during data fetch. */
+				isLoading={isLoading}
+				/** Data displayed in the table, filtered by search input. */
+				data={filteredData}
+				/** Column definitions for each table column. */
+				columns={columns}
+				/** Function to determine the unique row ID for each record. */
+				getRowId={(row) => row.ref}
+				/** The currently selected search field (e.g., "ref", "name"). */
+				searchBy={searchBy}
+				/** List of available searchable fields presented to the user. */
+				searchableFields={CREDENTIALS_SEARCHABLE_FIELDS}
+				/** Credential of rows displayed per page. */
+				pageSize={PAGE_SIZE}
+				/** Pagination configuration: total rows, next and previous tokens. */
+				pagination={{
+					total: filteredData.length,
+					nextToken: nextPageToken,
+					prevToken: prevTokens.length ? prevTokens[prevTokens.length - 1] : null,
+				}}
+				/** Handler for navigating to the next page. */
+				onNextPage={() => handleNextPage(nextPageToken)}
+				/** Handler for navigating to the previous page. */
+				onPrevPage={handlePrevPage}
+				/** Handler for updating the search input. */
+				onSearch={handleSearch}
+				/** Handler for changing the search field selection. */
+				onSearchByFieldChange={setSearchBy}
+				/** Handler for deleting selected rows. */
+				onDeleteSelected={handleDelete}
+				/** Handler for editing selected rows (currently shows a toast). */
+				onEditSelected={onEditSelected}
+				/** Handler for clicking on a row to navigate to edit page. */
+				onRowClick={onEditSelected}
+			/>
+		</Page>
+	);
 }

@@ -2,12 +2,7 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { useCallback } from "react";
 import { useForm, type UseFormReturn } from "react-hook-form";
 import { z } from "zod";
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem
-} from "~/core/components/design-system/forms";
+import { Form, FormControl, FormField, FormItem } from "~/core/components/design-system/forms";
 import { FormRoot } from "~/core/components/design-system/forms/form-root";
 import { Input } from "~/core/components/design-system/ui/input/input";
 import { LoginFormActions } from "./login.actions";
@@ -19,8 +14,8 @@ import { LoginFormActions } from "./login.actions";
  *  - password has at least 8 characters.
  */
 export const schema = z.object({
-  email: z.string().nonempty(),
-  password: z.string().nonempty()
+	email: z.string().nonempty(),
+	password: z.string().nonempty(),
 });
 
 /**
@@ -42,17 +37,17 @@ export type Form = UseFormReturn<Schema>;
  * Props interface for the LoginForm component.
  */
 export interface LoginFormProps extends React.PropsWithChildren {
-  /**
-   * Called when the form is successfully submitted and validated.
-   * @param data - The validated form data.
-   * @param form - The hook-form instance.
-   */
-  onSubmit: (data: Schema, form: Form) => Promise<void>;
+	/**
+	 * Called when the form is successfully submitted and validated.
+	 * @param data - The validated form data.
+	 * @param form - The hook-form instance.
+	 */
+	onSubmit: (data: Schema, form: Form) => Promise<void>;
 
-  /**
-   * Called when the user clicks on the GitHub login button.
-   */
-  onGithubAuth: () => Promise<void>;
+	/**
+	 * Called when the user clicks on the GitHub login button.
+	 */
+	onGithubAuth: () => Promise<void>;
 }
 
 /**
@@ -64,80 +59,77 @@ export interface LoginFormProps extends React.PropsWithChildren {
  * @param onGithubAuth - Function to handle GitHub authentication.
  */
 export function LoginForm({ onSubmit, onGithubAuth }: LoginFormProps) {
-  /** Initializes react-hook-form with validation resolver and default values. */
-  const form = useForm<Schema>({
-    resolver,
-    defaultValues: {
-      email: "",
-      password: ""
-    },
-    mode: "onChange"
-  });
+	/** Initializes react-hook-form with validation resolver and default values. */
+	const form = useForm<Schema>({
+		resolver,
+		defaultValues: {
+			email: "",
+			password: "",
+		},
+		mode: "onChange",
+	});
 
-  /**
-   * Memoized submit handler that passes the validated data to the onSubmit prop.
-   */
-  const onSubmitForm = useCallback(
-    async (data: Schema) => onSubmit(data, form),
-    [onSubmit, form]
-  );
+	/**
+	 * Memoized submit handler that passes the validated data to the onSubmit prop.
+	 */
+	const onSubmitForm = useCallback(async (data: Schema) => onSubmit(data, form), [onSubmit, form]);
 
-  return (
-    <Form {...form}>
-      <FormRoot onSubmit={form.handleSubmit(onSubmitForm)}>
-        {/* Email field */}
-        <FormField
-          control={form.control}
-          name="email"
-          render={({ field }) => (
-            <FormItem>
-              <FormControl>
-                <Input
-                  type="email"
-                  label="Email Address"
-                  supportingText="Please enter your email address"
-                  {...field}
-                  onChange={(e) => {
-                    field.onChange(e);
-                    // Clear any manual errors when user starts typing
-                    if (form.formState.errors.email?.type === "manual") {
-                      form.clearErrors("email");
-                    }
-                  }}
-                />
-              </FormControl>
-            </FormItem>
-          )}
-        />
+	return (
+		<Form {...form}>
+			<FormRoot onSubmit={form.handleSubmit(onSubmitForm)}>
+				{/* Email field */}
+				<FormField
+					control={form.control}
+					name="email"
+					render={({ field }) => (
+						<FormItem>
+							<FormControl>
+								<Input
+									type="email"
+									label="Email Address"
+									supportingText="Please enter your email address"
+									{...field}
+									onChange={(e) => {
+										field.onChange(e);
+										// Clear any manual errors when user starts typing
+										if (form.formState.errors.email?.type === "manual") {
+											form.clearErrors("email");
+										}
+									}}
+								/>
+							</FormControl>
+						</FormItem>
+					)}
+				/>
 
-        {/* Password field */}
-        <FormField
-          control={form.control}
-          name="password"
-          render={({ field }) => (
-            <FormItem>
-              <FormControl>
-                <Input
-                  type="password"
-                  label="Password"
-                  supportingText="Please enter your password"
-                  {...field}
-                  onChange={(e) => {
-                    field.onChange(e);
-                    // Clear any manual errors when user starts typing
-                    if (form.formState.errors.email?.type === "manual") {
-                      form.clearErrors("email");
-                    }
-                  }}
-                />
-              </FormControl>
-            </FormItem>
-          )}
-        />
+				{/* Password field */}
+				<FormField
+					control={form.control}
+					name="password"
+					render={({ field }) => (
+						<FormItem>
+							<FormControl>
+								<Input
+									type="password"
+									label="Password"
+									supportingText="Please enter your password"
+									{...field}
+									onChange={(e) => {
+										field.onChange(e);
+										// Clear any manual errors when user starts typing
+										if (form.formState.errors.email?.type === "manual") {
+											form.clearErrors("email");
+										}
+									}}
+								/>
+							</FormControl>
+						</FormItem>
+					)}
+				/>
 
-        {/* Form actions: submit and GitHub auth */}
-        <LoginFormActions {...{ form, onGithubAuth }} />
-      </FormRoot>
-    </Form>
-  );
+				{/* Form actions: submit and GitHub auth */}
+				<LoginFormActions {...{ form, onGithubAuth }} />
+			</FormRoot>
+		</Form>
+	);
 }

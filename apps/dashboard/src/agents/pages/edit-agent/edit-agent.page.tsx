@@ -24,14 +24,14 @@ import type { Route } from "./+types/edit-agent.page";
  * @returns {Array} Metadata objects for the page.
  */
 export function meta(_: Route.MetaArgs) {
-  return [
-    { title: "Edit Agent | Optimiq Voice" },
-    {
-      name: "description",
-      content:
-        "A SIP Agent represents a user or device that connects to your SIP Domain using VoIP."
-    }
-  ];
+	return [
+		{ title: "Edit Agent | Optimiq Voice" },
+		{
+			name: "description",
+			content:
+				"A SIP Agent represents a user or device that connects to your SIP Domain using VoIP.",
+		},
+	];
 }
 
 /**
@@ -45,115 +45,115 @@ export function meta(_: Route.MetaArgs) {
  * @returns {JSX.Element} The rendered Edit Agent page.
  */
 export default function EditAgent() {
-  /** Retrieves the current workspace ID for building navigation paths. */
-  const workspaceId = useWorkspaceId();
+	/** Retrieves the current workspace ID for building navigation paths. */
+	const workspaceId = useWorkspaceId();
 
-  /** Extracts the agent reference from the URL parameters. */
-  const { ref } = useParams();
+	/** Extracts the agent reference from the URL parameters. */
+	const { ref } = useParams();
 
-  /**
-   * Ensures the agent reference is provided.
-   *
-   * This value should never be null or undefined, as it is required
-   * to fetch and update the agent data.
-   */
-  if (!ref) {
-    throw new Error("Agent reference is required");
-  }
+	/**
+	 * Ensures the agent reference is provided.
+	 *
+	 * This value should never be null or undefined, as it is required
+	 * to fetch and update the agent data.
+	 */
+	if (!ref) {
+		throw new Error("Agent reference is required");
+	}
 
-  /** Fetches the existing agent details for editing. */
-  const { data, isLoading } = useAgent(ref);
+	/** Fetches the existing agent details for editing. */
+	const { data, isLoading } = useAgent(ref);
 
-  /** Hook to programmatically navigate between pages. */
-  const navigate = useNavigate();
+	/** Hook to programmatically navigate between pages. */
+	const navigate = useNavigate();
 
-  /**
-   * Handler for navigating back to the agents page.
-   * Uses `viewTransition` for smoother transitions.
-   */
-  const onGoBack = useCallback(() => {
-    navigate(`/workspaces/${workspaceId}/sip-network/agents`, {
-      viewTransition: true
-    });
-  }, [navigate, workspaceId]);
+	/**
+	 * Handler for navigating back to the agents page.
+	 * Uses `viewTransition` for smoother transitions.
+	 */
+	const onGoBack = useCallback(() => {
+		navigate(`/workspaces/${workspaceId}/sip-network/agents`, {
+			viewTransition: true,
+		});
+	}, [navigate, workspaceId]);
 
-  /** Custom hook to handle agent updates via the API. */
-  const { mutateAsync } = useUpdateAgent();
+	/** Custom hook to handle agent updates via the API. */
+	const { mutateAsync } = useUpdateAgent();
 
-  /**
-   * Handler called after form submission.
-   * Updates the agent, shows a toast, and navigates back to the agents page.
-   *
-   * @param {Schema} data - The validated form data.
-   */
-  const onSave = useCallback(
-    async (data: Schema) => {
-      try {
-        await mutateAsync({ ...data, ref });
-        toast("Agent updated successfully!");
-        onGoBack();
-      } catch (error) {
-        toast(getErrorMessage(error));
-      }
-    },
-    [mutateAsync, ref, onGoBack]
-  );
+	/**
+	 * Handler called after form submission.
+	 * Updates the agent, shows a toast, and navigates back to the agents page.
+	 *
+	 * @param {Schema} data - The validated form data.
+	 */
+	const onSave = useCallback(
+		async (data: Schema) => {
+			try {
+				await mutateAsync({ ...data, ref });
+				toast("Agent updated successfully!");
+				onGoBack();
+			} catch (error) {
+				toast(getErrorMessage(error));
+			}
+		},
+		[mutateAsync, ref, onGoBack],
+	);
 
-  /**
-   * Effect that ensures the user is redirected if the agent does not exist.
-   * Shows an error toast and navigates back to the agents page.
-   */
-  useEffect(() => {
-    if (!isLoading && !data) {
-      toast("Oops! You are trying to edit a agent that does not exist.");
-      onGoBack();
-    }
-  }, [isLoading, data, onGoBack]);
+	/**
+	 * Effect that ensures the user is redirected if the agent does not exist.
+	 * Shows an error toast and navigates back to the agents page.
+	 */
+	useEffect(() => {
+		if (!isLoading && !data) {
+			toast("Oops! You are trying to edit a agent that does not exist.");
+			onGoBack();
+		}
+	}, [isLoading, data, onGoBack]);
 
-  /**
-   * Shows a loading indicator while fetching the agent data.
-   */
-  if (isLoading || !data) {
-    return <Splash message="Loading agent details..." />;
-  }
+	/**
+	 * Shows a loading indicator while fetching the agent data.
+	 */
+	if (isLoading || !data) {
+		return <Splash message="Loading agent details..." />;
+	}
 
-  // Transform the data to match the form schema
-  const transformedData = {
-    ...data,
-    domainRef: data.domain?.ref,
-    credentialsRef: data.credentials?.ref
-  };
+	// Transform the data to match the form schema
+	const transformedData = {
+		...data,
+		domainRef: data.domain?.ref,
+		credentialsRef: data.credentials?.ref,
+	};
 
-  /**
-   * Renders the Edit Agent page layout.
-   */
-  return (
-    <FormProvider>
-      <Page variant="form">
-        <PageHeader
-          title="Edit Agent"
-          description="SIP Agents in the same Domain can call each other with Voice Over IP using a Software Phone (e.g Zoiper)"
-          onBack={{ label: "Back to agents", onClick: onGoBack }}
-          actions={
-            <FormSubmitButton size="small" loadingText="Saving...">
-              Save Agent
-            </FormSubmitButton>
-          }
-        />
+	/**
+	 * Renders the Edit Agent page layout.
+	 */
+	return (
+		<FormProvider>
+			<Page variant="form">
+				<PageHeader
+					title="Edit Agent"
+					description="SIP Agents in the same Domain can call each other with Voice Over IP using a Software Phone (e.g Zoiper)"
+					onBack={{ label: "Back to agents", onClick: onGoBack }}
+					actions={
+						<FormSubmitButton size="small" loadingText="Saving...">
+							Save Agent
+						</FormSubmitButton>
+					}
+				/>
 
-        {/* Form container with a max width for readability and consistent layout */}
-        <Box sx={{ maxWidth: "440px" }}>
-          <CreateAgentForm
-            onSubmit={onSave}
-            initialValues={{
-              maxContacts: 10,
-              expires: 3600,
-              ...transformedData
-            }}
-            isEdit={true}
-          />
-        </Box>
-      </Page>
-    </FormProvider>
-  );
+				{/* Form container with a max width for readability and consistent layout */}
+				<Box sx={{ maxWidth: "440px" }}>
+					<CreateAgentForm
+						onSubmit={onSave}
+						initialValues={{
+							maxContacts: 10,
+							expires: 3600,
+							...transformedData,
+						}}
+						isEdit={true}
+					/>
+				</Box>
+			</Page>
+		</FormProvider>
+	);
 }

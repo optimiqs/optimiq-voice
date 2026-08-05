@@ -1,7 +1,4 @@
-import {
-  Validators as V,
-  withErrorHandlingAndValidation
-} from "@optimiq-voice/common";
+import { Validators as V, withErrorHandlingAndValidation } from "@optimiq-voice/common";
 import { withAccess } from "@optimiq-voice/identity";
 import { getLogger } from "@optimiq-voice/logger";
 import { BaseApiObject } from "@optimiq-voice/types";
@@ -11,24 +8,22 @@ import { createGetFnUtil } from "./createGetFnUtil";
 const logger = getLogger({ service: "api", filePath: __filename });
 
 function createDeleteApplication(db: Database) {
-  const getFn = createGetFnUtil(db);
+	const getFn = createGetFnUtil(db);
 
-  const deleteApplication = async (call: {
-    request: BaseApiObject;
-  }): Promise<BaseApiObject> => {
-    const { ref } = call.request;
+	const deleteApplication = async (call: { request: BaseApiObject }): Promise<BaseApiObject> => {
+		const { ref } = call.request;
 
-    logger.verbose("call to deleteApplication", { ref });
+		logger.verbose("call to deleteApplication", { ref });
 
-    await db.application.delete({ where: { ref } });
+		await db.application.delete({ where: { ref } });
 
-    return { ref };
-  };
+		return { ref };
+	};
 
-  return withErrorHandlingAndValidation(
-    withAccess(deleteApplication, (ref: string) => getFn(ref)),
-    V.emptySchema
-  );
+	return withErrorHandlingAndValidation(
+		withAccess(deleteApplication, (ref: string) => getFn(ref)),
+		V.emptySchema,
+	);
 }
 
 export { createDeleteApplication };

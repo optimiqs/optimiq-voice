@@ -13,39 +13,36 @@ chai.use(sinonChai);
 const sandbox = createSandbox();
 
 describe("@sipnet[resources/deleteResource]", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should delete a sipnet resource", async function () {
-    // Arrange
-    const { deleteResource } = await import("../src/resources/deleteResource");
-    const metadata = new grpc.Metadata();
-    metadata.set("token", TEST_TOKEN);
+	it("should delete a sipnet resource", async function () {
+		// Arrange
+		const { deleteResource } = await import("../src/resources/deleteResource");
+		const metadata = new grpc.Metadata();
+		metadata.set("token", TEST_TOKEN);
 
-    const domains = {
-      deleteDomain: sandbox.stub().resolves({ ref: "123" }),
-      getDomain: getExtendedFieldsHelper(sandbox)
-    } as unknown as DomainsApi;
+		const domains = {
+			deleteDomain: sandbox.stub().resolves({ ref: "123" }),
+			getDomain: getExtendedFieldsHelper(sandbox),
+		} as unknown as DomainsApi;
 
-    const call = {
-      metadata,
-      request: {
-        ref: "123"
-      }
-    };
+		const call = {
+			metadata,
+			request: {
+				ref: "123",
+			},
+		};
 
-    const callback = sandbox.stub();
-    const deleteD = deleteResource<Domain, BaseApiObject, DomainsApi>(
-      domains,
-      "Domain"
-    );
+		const callback = sandbox.stub();
+		const deleteD = deleteResource<Domain, BaseApiObject, DomainsApi>(domains, "Domain");
 
-    // Act
-    await deleteD(call, callback);
+		// Act
+		await deleteD(call, callback);
 
-    // Assert
-    expect(callback).to.have.been.calledOnce;
-    expect(callback).to.have.been.calledWith(null, { ref: "123" });
-  });
+		// Assert
+		expect(callback).to.have.been.calledOnce;
+		expect(callback).to.have.been.calledWith(null, { ref: "123" });
+	});
 });

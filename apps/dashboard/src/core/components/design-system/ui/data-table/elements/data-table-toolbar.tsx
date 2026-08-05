@@ -6,22 +6,22 @@ import { DataTableToolbarSelection } from "./data-table-toolbar-selection";
 import { DataTableToolbarElement } from "./data-table.styles";
 
 export const DataTableToolbar = () => {
-  const { features } = useDataTable();
+	const { features } = useDataTable();
 
-  if (!features.includes("filters") && !features.includes("selection")) {
-    return null;
-  }
+	if (!features.includes("filters") && !features.includes("selection")) {
+		return null;
+	}
 
-  return (
-    <DataTableToolbarElement>
-      <Box display="flex" gap="12px" alignItems="center">
-        <DataTableToolbarSelection />
-        <DataTableToolbarFilters />
-      </Box>
+	return (
+		<DataTableToolbarElement>
+			<Box display="flex" gap="12px" alignItems="center">
+				<DataTableToolbarSelection />
+				<DataTableToolbarFilters />
+			</Box>
 
-      <Box display="flex" gap={2} alignItems="center">
-        <DataTableToolbarPagination />
-      </Box>
-    </DataTableToolbarElement>
-  );
+			<Box display="flex" gap={2} alignItems="center">
+				<DataTableToolbarPagination />
+			</Box>
+		</DataTableToolbarElement>
+	);
 };

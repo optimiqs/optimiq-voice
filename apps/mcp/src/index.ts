@@ -10,32 +10,32 @@ import { registerTools } from "./tools/index";
 const logger = getLogger({ service: "mcp", filePath: __filename });
 
 async function main() {
-  // Read package.json using fs module
-  const packageJsonPath = join(__dirname, "..", "package.json");
-  const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+	// Read package.json using fs module
+	const packageJsonPath = join(__dirname, "..", "package.json");
+	const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
 
-  logger.info(`starting Optimiq Voice MCP Server v${packageJson.version}`);
+	logger.info(`starting Optimiq Voice MCP Server v${packageJson.version}`);
 
-  const server = new McpServer({
-    name: "Optimiq Voice MCP Server",
-    version: packageJson.version
-  });
+	const server = new McpServer({
+		name: "Optimiq Voice MCP Server",
+		version: packageJson.version,
+	});
 
-  // Register all prompts
-  registerPrompts(server);
-  logger.verbose("prompts registered successfully");
+	// Register all prompts
+	registerPrompts(server);
+	logger.verbose("prompts registered successfully");
 
-  // Register all tools
-  await registerTools(server);
-  logger.verbose("tools registered successfully");
+	// Register all tools
+	await registerTools(server);
+	logger.verbose("tools registered successfully");
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+	const transport = new StdioServerTransport();
+	await server.connect(transport);
 
-  logger.info("server connected and ready to accept requests");
+	logger.info("server connected and ready to accept requests");
 }
 
 main().catch((error) => {
-  logger.error("failed to start MCP server", { error: error.message });
-  process.exit(1);
+	logger.error("failed to start MCP server", { error: error.message });
+	process.exit(1);
 });

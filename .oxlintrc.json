@@ -1,46 +1,46 @@
 {
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["eslint", "typescript", "unicorn", "oxc", "import"],
-  "categories": {
-    "correctness": "error"
-  },
-  "env": {
-    "builtin": true,
-    "node": true
-  },
-  "rules": {
-    "no-unused-vars": [
-      "error",
-      {
-        "argsIgnorePattern": "^_",
-        "caughtErrors": "none"
-      }
-    ],
-    "@typescript-eslint/explicit-module-boundary-types": "off",
-    "@typescript-eslint/no-explicit-any": "warn",
-    "@typescript-eslint/ban-ts-comment": "warn",
-    "@typescript-eslint/no-unnecessary-parameter-property-assignment": "off",
-    "unicorn/no-new-array": "off"
-  },
-  "ignorePatterns": [
-    "**/dist/**",
-    "**/build/**",
-    "**/node_modules/**",
-    "**/.react-router/**",
-    "**/.turbo/**",
-    "**/*.d.ts",
-    "**/bin/**",
-    ".scripts/**",
-    "apps/dashboard/**",
-    "**/test/**",
-    "**/*.test.ts",
-    "**/*.test.tsx",
-    "**/*.integration.ts",
-    "**/*.integration.test.ts",
-    "**/*.proto",
-    "**/generated/**",
-    "**/drizzle/**",
-    "**/migrations/**",
-    "**/public/**"
-  ]
+	"$schema": "./node_modules/oxlint/configuration_schema.json",
+	"plugins": ["eslint", "typescript", "unicorn", "oxc", "import"],
+	"categories": {
+		"correctness": "error"
+	},
+	"env": {
+		"builtin": true,
+		"node": true
+	},
+	"rules": {
+		"no-unused-vars": [
+			"error",
+			{
+				"argsIgnorePattern": "^_",
+				"caughtErrors": "none"
+			}
+		],
+		"@typescript-eslint/explicit-module-boundary-types": "off",
+		"@typescript-eslint/no-explicit-any": "warn",
+		"@typescript-eslint/ban-ts-comment": "warn",
+		"@typescript-eslint/no-unnecessary-parameter-property-assignment": "off",
+		"unicorn/no-new-array": "off"
+	},
+	"ignorePatterns": [
+		"**/dist/**",
+		"**/build/**",
+		"**/node_modules/**",
+		"**/.react-router/**",
+		"**/.turbo/**",
+		"**/*.d.ts",
+		"**/bin/**",
+		".scripts/**",
+		"apps/dashboard/**",
+		"**/test/**",
+		"**/*.test.ts",
+		"**/*.test.tsx",
+		"**/*.integration.ts",
+		"**/*.integration.test.ts",
+		"**/*.proto",
+		"**/generated/**",
+		"**/drizzle/**",
+		"**/migrations/**",
+		"**/public/**"
+	]
 }

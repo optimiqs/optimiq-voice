@@ -2,16 +2,11 @@ import { CheckboxRoot } from "./checkbox-root";
 import { type CheckboxProps, CheckboxLabel } from "./checkbox.styles";
 
 export const Checkbox = (props: CheckboxProps) => {
-  const { children, ...checkboxProps } = props;
+	const { children, ...checkboxProps } = props;
 
-  if (children === undefined) {
-    return <CheckboxRoot {...checkboxProps} />;
-  }
+	if (children === undefined) {
+		return <CheckboxRoot {...checkboxProps} />;
+	}
 
-  return (
-    <CheckboxLabel
-      control={<CheckboxRoot {...checkboxProps} />}
-      label={children}
-    />
-  );
+	return <CheckboxLabel control={<CheckboxRoot {...checkboxProps} />} label={children} />;
 };

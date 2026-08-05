@@ -9,26 +9,20 @@ import { GoogleParams } from "./types";
 const LANGUAGE_MODEL_NAME = "llm.google";
 
 class Google extends AbstractLanguageModel {
-  constructor(
-    params: GoogleParams,
-    voice: Voice,
-    telephonyContext: TelephonyContext
-  ) {
-    const model = new ChatGoogleGenerativeAI({
-      ...params
-    }).bindTools(
-      params.tools.map(convertToolToLangchainTool)
-    ) as unknown as BaseChatModel;
+	constructor(params: GoogleParams, voice: Voice, telephonyContext: TelephonyContext) {
+		const model = new ChatGoogleGenerativeAI({
+			...params,
+		}).bindTools(params.tools.map(convertToolToLangchainTool)) as unknown as BaseChatModel;
 
-    super(
-      {
-        ...params,
-        model
-      },
-      voice,
-      telephonyContext
-    );
-  }
+		super(
+			{
+				...params,
+				model,
+			},
+			voice,
+			telephonyContext,
+		);
+	}
 }
 
 export { Google, LANGUAGE_MODEL_NAME };

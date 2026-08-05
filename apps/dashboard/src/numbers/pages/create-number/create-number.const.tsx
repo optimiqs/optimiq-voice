@@ -8,17 +8,17 @@ import { countryIsoCodes } from "~/core/shared/countries";
  * used to populate dropdowns or select inputs in the UI.
  */
 export const COUNTRIES = countryIsoCodes.map(({ name, value }) => ({
-  /**
-   * Human-readable name of the country.
-   * This is what users will see in dropdowns or selection lists.
-   */
-  label: name,
+	/**
+	 * Human-readable name of the country.
+	 * This is what users will see in dropdowns or selection lists.
+	 */
+	label: name,
 
-  /**
-   * ISO code of the country.
-   * Used for backend processing and validation.
-   */
-  value
+	/**
+	 * ISO code of the country.
+	 * Used for backend processing and validation.
+	 */
+	value,
 }));
 
 /**
@@ -28,57 +28,57 @@ export const COUNTRIES = countryIsoCodes.map(({ name, value }) => ({
  * all necessary properties are initialized to avoid uncontrolled state errors.
  */
 export const NUMBERS_DEFAULT_INITIAL_VALUES = {
-  /**
-   * Unique identifier reference for the number.
-   * Typically assigned by the backend upon creation.
-   */
-  ref: null,
+	/**
+	 * Unique identifier reference for the number.
+	 * Typically assigned by the backend upon creation.
+	 */
+	ref: null,
 
-  /**
-   * Human-readable name of the number.
-   * Used to identify the number in the UI.
-   */
-  name: "",
+	/**
+	 * Human-readable name of the number.
+	 * Used to identify the number in the UI.
+	 */
+	name: "",
 
-  /**
-   * Reference to the trunk configuration associated with the number.
-   * Links the number to a specific SIP trunk for routing.
-   */
-  trunkRef: "",
+	/**
+	 * Reference to the trunk configuration associated with the number.
+	 * Links the number to a specific SIP trunk for routing.
+	 */
+	trunkRef: "",
 
-  /**
-   * Country where the number is registered or assigned.
-   * This is a textual representation (e.g., "USA", "CAN").
-   */
-  country: "",
+	/**
+	 * Country where the number is registered or assigned.
+	 * This is a textual representation (e.g., "USA", "CAN").
+	 */
+	country: "",
 
-  /**
-   * ISO country code for the number.
-   * Typically a 2-letter or 3-letter standardized code.
-   */
-  countryIsoCode: "",
+	/**
+	 * ISO country code for the number.
+	 * Typically a 2-letter or 3-letter standardized code.
+	 */
+	countryIsoCode: "",
 
-  /**
-   * City where the number is assigned.
-   * Provides additional location context.
-   */
-  city: "",
+	/**
+	 * City where the number is assigned.
+	 * Provides additional location context.
+	 */
+	city: "",
 
-  /**
-   * The SIP or telephone URL for the number.
-   * Used for routing calls.
-   */
-  telUrl: "",
+	/**
+	 * The SIP or telephone URL for the number.
+	 * Used for routing calls.
+	 */
+	telUrl: "",
 
-  /**
-   * Reference to the application associated with this number.
-   * Useful for linking numbers to specific services or features.
-   */
-  appRef: "",
+	/**
+	 * Reference to the application associated with this number.
+	 * Useful for linking numbers to specific services or features.
+	 */
+	appRef: "",
 
-  /**
-   * Agent AOR (Address of Record).
-   * Represents the SIP endpoint or user that handles calls to this number.
-   */
-  agentAor: ""
+	/**
+	 * Agent AOR (Address of Record).
+	 * Represents the SIP endpoint or user that handles calls to this number.
+	 */
+	agentAor: "",
 };

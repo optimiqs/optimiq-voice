@@ -1,22 +1,22 @@
 import { ContactType } from "@optimiq-voice/types";
 import {
-  ContactType as ContactTypePB,
-  ExchangeApiKeyRequest as ExchangeApiKeyRequestPB,
-  ExchangeCredentialsRequest as ExchangeCredentialsRequestPB,
-  ExchangeCredentialsResponse as ExchangeCredentialsResponsePB,
-  ExchangeOauth2CodeRequest as ExchangeOauth2CodeRequestPB,
-  ExchangeOauth2CodeResponse as ExchangeOauth2CodeResponsePB,
-  ExchangeRefreshTokenRequest as ExchangeRefreshTokenRequestPB,
-  SendVerificationCodeRequest as SendVerificationCodeRequestPB,
-  VerifyCodeRequest as VerifyCodeRequestPB
+	ContactType as ContactTypePB,
+	ExchangeApiKeyRequest as ExchangeApiKeyRequestPB,
+	ExchangeCredentialsRequest as ExchangeCredentialsRequestPB,
+	ExchangeCredentialsResponse as ExchangeCredentialsResponsePB,
+	ExchangeOauth2CodeRequest as ExchangeOauth2CodeRequestPB,
+	ExchangeOauth2CodeResponse as ExchangeOauth2CodeResponsePB,
+	ExchangeRefreshTokenRequest as ExchangeRefreshTokenRequestPB,
+	SendVerificationCodeRequest as SendVerificationCodeRequestPB,
+	VerifyCodeRequest as VerifyCodeRequestPB,
 } from "../generated/node/identity_pb";
 import { makeRpcRequest } from "./makeRpcRequest";
 import {
-  ApplicationsClient,
-  CallsClient,
-  OptimiqVoiceClient,
-  IdentityClient,
-  SecretsClient
+	ApplicationsClient,
+	CallsClient,
+	OptimiqVoiceClient,
+	IdentityClient,
+	SecretsClient,
 } from "./types";
 import { AclsClient } from "./types/AclsClient";
 import { AgentsClient } from "./types/AgentsClient";
@@ -26,210 +26,196 @@ import { NumbersClient } from "./types/NumbersClient";
 import { TrunksClient } from "./types/TrunksClient";
 
 abstract class AbstractClient implements OptimiqVoiceClient {
-  protected accessKeyId: string;
-  protected _accessToken: string;
-  protected _refreshToken: string;
-  protected _idToken: string;
-  protected identityClient: IdentityClient;
+	protected accessKeyId: string;
+	protected _accessToken: string;
+	protected _refreshToken: string;
+	protected _idToken: string;
+	protected identityClient: IdentityClient;
 
-  constructor(config: { accessKeyId: string; identityClient: IdentityClient }) {
-    this.accessKeyId = config.accessKeyId;
-    this.identityClient = config.identityClient;
-    this._accessToken = "";
-    this._refreshToken = "";
-    this._idToken = "";
-  }
+	constructor(config: { accessKeyId: string; identityClient: IdentityClient }) {
+		this.accessKeyId = config.accessKeyId;
+		this.identityClient = config.identityClient;
+		this._accessToken = "";
+		this._refreshToken = "";
+		this._idToken = "";
+	}
 
-  async login(
-    username: string,
-    password: string,
-    twoFactorCode?: string
-  ): Promise<void> {
-    const { refreshToken, accessToken, idToken } = await makeRpcRequest<
-      ExchangeCredentialsRequestPB,
-      ExchangeCredentialsResponsePB,
-      { username: string; password: string; twoFactorCode?: string },
-      { refreshToken: string; accessToken: string; idToken: string }
-    >({
-      method: this.identityClient.exchangeCredentials.bind(this.identityClient),
-      requestPBObjectConstructor: ExchangeCredentialsRequestPB,
-      metadata: {},
-      request: {
-        username,
-        password,
-        twoFactorCode
-      }
-    });
+	async login(username: string, password: string, twoFactorCode?: string): Promise<void> {
+		const { refreshToken, accessToken, idToken } = await makeRpcRequest<
+			ExchangeCredentialsRequestPB,
+			ExchangeCredentialsResponsePB,
+			{ username: string; password: string; twoFactorCode?: string },
+			{ refreshToken: string; accessToken: string; idToken: string }
+		>({
+			method: this.identityClient.exchangeCredentials.bind(this.identityClient),
+			requestPBObjectConstructor: ExchangeCredentialsRequestPB,
+			metadata: {},
+			request: {
+				username,
+				password,
+				twoFactorCode,
+			},
+		});
 
-    this._refreshToken = refreshToken;
-    this._accessToken = accessToken;
-    this._idToken = idToken;
-  }
+		this._refreshToken = refreshToken;
+		this._accessToken = accessToken;
+		this._idToken = idToken;
+	}
 
-  logout() {
-    this._refreshToken = "";
-    this._accessToken = "";
-    this._idToken = "";
-  }
+	logout() {
+		this._refreshToken = "";
+		this._accessToken = "";
+		this._idToken = "";
+	}
 
-  async loginWithRefreshToken(refreshToken: string): Promise<void> {
-    const {
-      accessToken,
-      refreshToken: newRefreshToken,
-      idToken
-    } = await makeRpcRequest<
-      ExchangeRefreshTokenRequestPB,
-      ExchangeCredentialsResponsePB,
-      { refreshToken: string },
-      { accessToken: string; refreshToken: string; idToken: string }
-    >({
-      method: this.identityClient.exchangeRefreshToken.bind(
-        this.identityClient
-      ),
-      requestPBObjectConstructor: ExchangeRefreshTokenRequestPB,
-      metadata: {},
-      request: {
-        refreshToken
-      }
-    });
+	async loginWithRefreshToken(refreshToken: string): Promise<void> {
+		const {
+			accessToken,
+			refreshToken: newRefreshToken,
+			idToken,
+		} = await makeRpcRequest<
+			ExchangeRefreshTokenRequestPB,
+			ExchangeCredentialsResponsePB,
+			{ refreshToken: string },
+			{ accessToken: string; refreshToken: string; idToken: string }
+		>({
+			method: this.identityClient.exchangeRefreshToken.bind(this.identityClient),
+			requestPBObjectConstructor: ExchangeRefreshTokenRequestPB,
+			metadata: {},
+			request: {
+				refreshToken,
+			},
+		});
 
-    this._refreshToken = newRefreshToken;
-    this._accessToken = accessToken;
-    this._idToken = idToken;
-  }
+		this._refreshToken = newRefreshToken;
+		this._accessToken = accessToken;
+		this._idToken = idToken;
+	}
 
-  async loginWithApiKey(
-    accessKeyId: string,
-    accessKeySecret: string
-  ): Promise<void> {
-    const { refreshToken, accessToken } = await makeRpcRequest<
-      ExchangeApiKeyRequestPB,
-      ExchangeCredentialsResponsePB,
-      { accessKeySecret: string; accessKeyId: string },
-      { refreshToken: string; accessToken: string }
-    >({
-      method: this.identityClient.exchangeApiKey.bind(this.identityClient),
-      requestPBObjectConstructor: ExchangeApiKeyRequestPB,
-      metadata: {},
-      request: {
-        accessKeyId,
-        accessKeySecret
-      }
-    });
+	async loginWithApiKey(accessKeyId: string, accessKeySecret: string): Promise<void> {
+		const { refreshToken, accessToken } = await makeRpcRequest<
+			ExchangeApiKeyRequestPB,
+			ExchangeCredentialsResponsePB,
+			{ accessKeySecret: string; accessKeyId: string },
+			{ refreshToken: string; accessToken: string }
+		>({
+			method: this.identityClient.exchangeApiKey.bind(this.identityClient),
+			requestPBObjectConstructor: ExchangeApiKeyRequestPB,
+			metadata: {},
+			request: {
+				accessKeyId,
+				accessKeySecret,
+			},
+		});
 
-    this._refreshToken = refreshToken;
-    this._accessToken = accessToken;
-  }
+		this._refreshToken = refreshToken;
+		this._accessToken = accessToken;
+	}
 
-  async loginWithOauth2Code(provider: "GITHUB", code: string): Promise<void> {
-    const { refreshToken, accessToken, idToken } = await makeRpcRequest<
-      ExchangeOauth2CodeRequestPB,
-      ExchangeOauth2CodeResponsePB,
-      { provider: "GITHUB"; code: string },
-      { refreshToken: string; accessToken: string; idToken: string }
-    >({
-      method: this.identityClient.exchangeOauth2Code.bind(this.identityClient),
-      requestPBObjectConstructor: ExchangeOauth2CodeRequestPB,
-      metadata: {},
-      request: {
-        provider,
-        code
-      },
-      enumMapping: [["provider", ExchangeOauth2CodeRequestPB.Oauth2Provider]]
-    });
+	async loginWithOauth2Code(provider: "GITHUB", code: string): Promise<void> {
+		const { refreshToken, accessToken, idToken } = await makeRpcRequest<
+			ExchangeOauth2CodeRequestPB,
+			ExchangeOauth2CodeResponsePB,
+			{ provider: "GITHUB"; code: string },
+			{ refreshToken: string; accessToken: string; idToken: string }
+		>({
+			method: this.identityClient.exchangeOauth2Code.bind(this.identityClient),
+			requestPBObjectConstructor: ExchangeOauth2CodeRequestPB,
+			metadata: {},
+			request: {
+				provider,
+				code,
+			},
+			enumMapping: [["provider", ExchangeOauth2CodeRequestPB.Oauth2Provider]],
+		});
 
-    this._refreshToken = refreshToken;
-    this._accessToken = accessToken;
-    this._idToken = idToken;
-  }
+		this._refreshToken = refreshToken;
+		this._accessToken = accessToken;
+		this._idToken = idToken;
+	}
 
-  setAccessToken(accessToken: string) {
-    this._accessToken = accessToken;
-  }
+	setAccessToken(accessToken: string) {
+		this._accessToken = accessToken;
+	}
 
-  async sendVerificationCode(
-    contactType: ContactType,
-    value: string
-  ): Promise<void> {
-    return makeRpcRequest<
-      SendVerificationCodeRequestPB,
-      null,
-      { contactType: ContactType; value: string },
-      never
-    >({
-      method: this.identityClient.sendVerificationCode.bind(
-        this.identityClient
-      ),
-      requestPBObjectConstructor: SendVerificationCodeRequestPB,
-      metadata: {},
-      request: {
-        contactType,
-        value
-      },
-      enumMapping: [["contactType", ContactTypePB]]
-    });
-  }
+	async sendVerificationCode(contactType: ContactType, value: string): Promise<void> {
+		return makeRpcRequest<
+			SendVerificationCodeRequestPB,
+			null,
+			{ contactType: ContactType; value: string },
+			never
+		>({
+			method: this.identityClient.sendVerificationCode.bind(this.identityClient),
+			requestPBObjectConstructor: SendVerificationCodeRequestPB,
+			metadata: {},
+			request: {
+				contactType,
+				value,
+			},
+			enumMapping: [["contactType", ContactTypePB]],
+		});
+	}
 
-  async verifyCode(request: {
-    username: string;
-    contactType: ContactType;
-    value: string;
-    verificationCode: string;
-  }): Promise<void> {
-    return makeRpcRequest<
-      VerifyCodeRequestPB,
-      null,
-      {
-        username: string;
-        contactType: ContactType;
-        value: string;
-        verificationCode: string;
-      },
-      never
-    >({
-      method: this.identityClient.verifyCode.bind(this.identityClient),
-      requestPBObjectConstructor: VerifyCodeRequestPB,
-      metadata: {},
-      request,
-      enumMapping: [["contactType", ContactTypePB]]
-    });
-  }
+	async verifyCode(request: {
+		username: string;
+		contactType: ContactType;
+		value: string;
+		verificationCode: string;
+	}): Promise<void> {
+		return makeRpcRequest<
+			VerifyCodeRequestPB,
+			null,
+			{
+				username: string;
+				contactType: ContactType;
+				value: string;
+				verificationCode: string;
+			},
+			never
+		>({
+			method: this.identityClient.verifyCode.bind(this.identityClient),
+			requestPBObjectConstructor: VerifyCodeRequestPB,
+			metadata: {},
+			request,
+			enumMapping: [["contactType", ContactTypePB]],
+		});
+	}
 
-  async refreshToken(): Promise<void> {
-    return this.loginWithRefreshToken(this._refreshToken);
-  }
+	async refreshToken(): Promise<void> {
+		return this.loginWithRefreshToken(this._refreshToken);
+	}
 
-  getAccessKeyId(): string {
-    return this.accessKeyId;
-  }
+	getAccessKeyId(): string {
+		return this.accessKeyId;
+	}
 
-  setAccessKeyId(accessKeyId: string) {
-    this.accessKeyId = accessKeyId;
-  }
+	setAccessKeyId(accessKeyId: string) {
+		this.accessKeyId = accessKeyId;
+	}
 
-  getAccessToken(): string {
-    return this._accessToken;
-  }
+	getAccessToken(): string {
+		return this._accessToken;
+	}
 
-  getRefreshToken(): string {
-    return this._refreshToken;
-  }
+	getRefreshToken(): string {
+		return this._refreshToken;
+	}
 
-  getIdToken(): string {
-    return this._idToken;
-  }
+	getIdToken(): string {
+		return this._idToken;
+	}
 
-  abstract getMetadata(): unknown;
-  abstract getApplicationsClient(): ApplicationsClient;
-  abstract getIdentityClient(): IdentityClient;
-  abstract getSecretsClient(): SecretsClient;
-  abstract getAgentsClient(): AgentsClient;
-  abstract getNumbersClient(): NumbersClient;
-  abstract getCredentialsClient(): CredentialsClient;
-  abstract getDomainsClient(): DomainsClient;
-  abstract getTrunksClient(): TrunksClient;
-  abstract getAclsClient(): AclsClient;
-  abstract getCallsClient(): CallsClient;
+	abstract getMetadata(): unknown;
+	abstract getApplicationsClient(): ApplicationsClient;
+	abstract getIdentityClient(): IdentityClient;
+	abstract getSecretsClient(): SecretsClient;
+	abstract getAgentsClient(): AgentsClient;
+	abstract getNumbersClient(): NumbersClient;
+	abstract getCredentialsClient(): CredentialsClient;
+	abstract getDomainsClient(): DomainsClient;
+	abstract getTrunksClient(): TrunksClient;
+	abstract getAclsClient(): AclsClient;
+	abstract getCallsClient(): CallsClient;
 }
 
 export { AbstractClient };

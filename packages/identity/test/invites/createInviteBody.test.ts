@@ -11,54 +11,54 @@ const sandbox = createSandbox();
 const WORKSPACE_NAME = "My Workspace";
 
 describe("@identity[invites/createInviteBody]", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should create a new invite body", async function () {
-    // Arrange
-    const params = {
-      isExistingUser: false,
-      workspaceName: WORKSPACE_NAME,
-      oneTimePassword: "123456",
-      inviteUrl: "http://example.com?token=jwt"
-    };
+	it("should create a new invite body", async function () {
+		// Arrange
+		const params = {
+			isExistingUser: false,
+			workspaceName: WORKSPACE_NAME,
+			oneTimePassword: "123456",
+			inviteUrl: "http://example.com?token=jwt",
+		};
 
-    const { createInviteBody } =
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      require("../../src/invites/createInviteBody");
+		const { createInviteBody } =
+			// eslint-disable-next-line @typescript-eslint/no-var-requires
+			require("../../src/invites/createInviteBody");
 
-    // Act
-    const result = createInviteBody(params);
+		// Act
+		const result = createInviteBody(params);
 
-    // Assert
-    expect(result).to.be.a("string");
-    expect(result).to.contain("You have been invited to join the workspace");
-    expect(result).to.contain(WORKSPACE_NAME);
-    expect(result).to.contain("http://example.com?token&#x3D;jwt");
-    expect(result).to.contain("123456");
-  });
+		// Assert
+		expect(result).to.be.a("string");
+		expect(result).to.contain("You have been invited to join the workspace");
+		expect(result).to.contain(WORKSPACE_NAME);
+		expect(result).to.contain("http://example.com?token&#x3D;jwt");
+		expect(result).to.contain("123456");
+	});
 
-  it("should create a existing invite body", async function () {
-    // Arrange
-    const params = {
-      isExistingUser: true,
-      workspaceName: WORKSPACE_NAME,
-      inviteUrl: "http://example.com?token=jwt",
-      oneTimePassword: "123456"
-    };
+	it("should create a existing invite body", async function () {
+		// Arrange
+		const params = {
+			isExistingUser: true,
+			workspaceName: WORKSPACE_NAME,
+			inviteUrl: "http://example.com?token=jwt",
+			oneTimePassword: "123456",
+		};
 
-    const { createInviteBody } =
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      require("../../src/invites/createInviteBody");
-    // Act
-    const result = createInviteBody(params);
+		const { createInviteBody } =
+			// eslint-disable-next-line @typescript-eslint/no-var-requires
+			require("../../src/invites/createInviteBody");
+		// Act
+		const result = createInviteBody(params);
 
-    // Assert
-    expect(result).to.be.a("string");
-    expect(result).to.contain("You have been invited to join the workspace");
-    expect(result).to.contain(WORKSPACE_NAME);
-    expect(result).to.contain("http://example.com?token&#x3D;jwt");
-    expect(result).to.not.contain("123456");
-  });
+		// Assert
+		expect(result).to.be.a("string");
+		expect(result).to.contain("You have been invited to join the workspace");
+		expect(result).to.contain(WORKSPACE_NAME);
+		expect(result).to.contain("http://example.com?token&#x3D;jwt");
+		expect(result).to.not.contain("123456");
+	});
 });

@@ -3,13 +3,9 @@ import { AutopilotContext } from "../types";
 
 const logger = getLogger({ service: "autopilot", filePath: __filename });
 
-export const announceIdleTimeout = async ({
-  context
-}: {
-  context: AutopilotContext;
-}) => {
-  logger.verbose("called the announceIdleTimeout action", {
-    idleMessage: context.idleMessage
-  });
-  await context.voice.say(context.idleMessage);
+export const announceIdleTimeout = async ({ context }: { context: AutopilotContext }) => {
+	logger.verbose("called the announceIdleTimeout action", {
+		idleMessage: context.idleMessage,
+	});
+	await context.voice.say(context.idleMessage);
 };

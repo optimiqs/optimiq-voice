@@ -7,25 +7,25 @@ import { withErrorHandlingAndValidation } from "../utils/withDatabaseErrorHandli
 const logger = getLogger({ service: "identity", filePath: __filename });
 
 function createDeleteApiKey(db: Database) {
-  const deleteApiKey = async (
-    call: { request: BaseApiObject },
-    callback: (error: GrpcErrorMessage, response?: BaseApiObject) => void
-  ) => {
-    const { request } = call;
-    const { ref } = request;
+	const deleteApiKey = async (
+		call: { request: BaseApiObject },
+		callback: (error: GrpcErrorMessage, response?: BaseApiObject) => void,
+	) => {
+		const { request } = call;
+		const { ref } = request;
 
-    logger.info("deleting ApiKey", { ref });
+		logger.info("deleting ApiKey", { ref });
 
-    await db.apiKey.delete({
-      where: {
-        ref
-      }
-    });
+		await db.apiKey.delete({
+			where: {
+				ref,
+			},
+		});
 
-    callback(null, { ref });
-  };
+		callback(null, { ref });
+	};
 
-  return withErrorHandlingAndValidation(deleteApiKey, V.emptySchema);
+	return withErrorHandlingAndValidation(deleteApiKey, V.emptySchema);
 }
 
 export { createDeleteApiKey };

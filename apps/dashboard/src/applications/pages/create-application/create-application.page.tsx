@@ -11,14 +11,14 @@ import type { Route } from "./+types/create-application.page";
  * @returns Array of meta objects for the page.
  */
 export function meta(_: Route.MetaArgs) {
-  return [
-    { title: "Voice Applications | Optimiq Voice" },
-    {
-      name: "description",
-      content:
-        "An Application defines how your Voice AI behaves. Use Autopilot for LLM-based agents or External for custom logic."
-    }
-  ];
+	return [
+		{ title: "Voice Applications | Optimiq Voice" },
+		{
+			name: "description",
+			content:
+				"An Application defines how your Voice AI behaves. Use Autopilot for LLM-based agents or External for custom logic.",
+		},
+	];
 }
 
 /**
@@ -29,11 +29,11 @@ export function meta(_: Route.MetaArgs) {
  *  - Save and Test Call actions.
  */
 export default function CreateApplication() {
-  return (
-    <ApplicationProvider>
-      <FormProvider>
-        <CreateApplicationContainer />
-      </FormProvider>
-    </ApplicationProvider>
-  );
+	return (
+		<ApplicationProvider>
+			<FormProvider>
+				<CreateApplicationContainer />
+			</FormProvider>
+		</ApplicationProvider>
+	);
 }

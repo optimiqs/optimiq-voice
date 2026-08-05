@@ -11,5 +11,4 @@ export const APP_REF_HEADER = "x-app-ref";
 export const ROUTR_DEFAULT_PEER_AOR = "sip:voice@default";
 export const AUTOPILOT_SPECIAL_LOCAL_ADDRESS = "autopilot.optimiq-voice.local";
 export const AUTOPILOT_INTERNAL_ADDRESS = "autopilot:50061";
-export const WELCOME_DEMO_SPECIAL_LOCAL_ADDRESS =
-  "welcome.demo.optimiq-voice.local";
+export const WELCOME_DEMO_SPECIAL_LOCAL_ADDRESS = "welcome.demo.optimiq-voice.local";

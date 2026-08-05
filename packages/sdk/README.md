@@ -49,7 +49,7 @@ Directly in the browser:
 ```html
 <script src="https://unpkg.com/@optimiq-voice/sdk"></script>
 <script>
-  // You can now use the SDK
+	// You can now use the SDK
 </script>
 ```
 
@@ -66,8 +66,8 @@ const SDK = require("@optimiq-voice/sdk");
 const ACCESS_KEY_ID = "WO00000000000000000000000000000000";
 const ENDPOINT = "api.optimiq.health";
 const client = new SDK.Client({
-  accessKeyId: ACCESS_KEY_ID,
-  endpoint: ENDPOINT
+	accessKeyId: ACCESS_KEY_ID,
+	endpoint: ENDPOINT,
 });
 ```
 
@@ -91,13 +91,13 @@ const username = "admin@optimiq-voice.local";
 const password = "changeme";
 
 async function main() {
-  await client.login(username, password);
-  const applications = new SDK.Applications(client);
-  await applications.createApplication({
-    name: "MyApp",
-    type: "EXTERNAL",
-    endpoint: "localhost:50061" // Your app's endpoint
-  });
+	await client.login(username, password);
+	const applications = new SDK.Applications(client);
+	await applications.createApplication({
+		name: "MyApp",
+		type: "EXTERNAL",
+		endpoint: "localhost:50061", // Your app's endpoint
+	});
 }
 
 main().catch(console.error);
@@ -160,26 +160,26 @@ Constructs a new Acls object.
 const SDK = require("@optimiq-voice/sdk");
 
 async function main(request) {
-  const apiKey = "your-api-key";
-  const apiSecret = "your-api-secret";
-  const accessKeyId = "WO00000000000000000000000000000000";
+	const apiKey = "your-api-key";
+	const apiSecret = "your-api-secret";
+	const accessKeyId = "WO00000000000000000000000000000000";
 
-  try {
-    const client = SDK.Client({ accessKeyId });
-    await client.loginWithApiKey(apiKey, apiSecret);
+	try {
+		const client = SDK.Client({ accessKeyId });
+		await client.loginWithApiKey(apiKey, apiSecret);
 
-    const acls = new SDK.Acls(client);
-    const response = await acls.createAcl(request);
+		const acls = new SDK.Acls(client);
+		const response = await acls.createAcl(request);
 
-    console.log(response); // successful response
-  } catch (e) {
-    console.error(e); // an error occurred
-  }
+		console.log(response); // successful response
+	} catch (e) {
+		console.error(e); // an error occurred
+	}
 }
 
 const request = {
-  name: "My ACL",
-  allow: ["47.132.130.31"] // Allow only this IP
+	name: "My ACL",
+	allow: ["47.132.130.31"], // Allow only this IP
 };
 
 main(request);
@@ -206,14 +206,14 @@ Creates a new Acl in the Workspace.
 const acls = new SDK.Acls(client); // Existing client object
 
 const request = {
-  name: "My ACL",
-  allow: ["47.132.130.31"] // Allow only this IP
+	name: "My ACL",
+	allow: ["47.132.130.31"], // Allow only this IP
 };
 
 acls
-  .createAcl(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.createAcl(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Acls+getAcl"></a>
@@ -237,9 +237,9 @@ const acls = new SDK.Acls(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 acls
-  .getAcl(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.getAcl(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Acls+updateAcl"></a>
@@ -264,15 +264,15 @@ Updates an existing Acl in the Workspace.
 const acls = new SDK.Acls(client); // Existing client object
 
 const request = {
-  ref: "00000000-0000-0000-0000-000000000000",
-  name: "My ACL",
-  allow: ["47.132.130.31"] // Allow only this IP
+	ref: "00000000-0000-0000-0000-000000000000",
+	name: "My ACL",
+	allow: ["47.132.130.31"], // Allow only this IP
 };
 
 acls
-  .updateAcl(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.updateAcl(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Acls+listAcls"></a>
@@ -296,14 +296,14 @@ Retrieves a list of Acls from a Workspace.
 const acls = new SDK.Acls(client); // Existing client object
 
 const request = {
-  pageSize: 10,
-  pageToken: "00000000-0000-0000-0000-000000000000"
+	pageSize: 10,
+	pageToken: "00000000-0000-0000-0000-000000000000",
 };
 
 acls
-  .listAcls(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.listAcls(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Acls+deleteAcl"></a>
@@ -328,9 +328,9 @@ const acls = new SDK.Acls(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 acls
-  .deleteAcl(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.deleteAcl(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Agents"></a>
@@ -460,9 +460,9 @@ const agents = new SDK.Agents(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 agents
-  .getAgent(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.getAgent(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Agents+updateAgent"></a>
@@ -525,14 +525,14 @@ Retrieves a list of Agents from a Workspace.
 const agents = new SDK.Agents(client); // Existing client object
 
 const request = {
-  pageSize: 10,
-  pageToken: "00000000-0000-0000-0000-000000000000"
+	pageSize: 10,
+	pageToken: "00000000-0000-0000-0000-000000000000",
 };
 
 agents
-  .listAgents(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.listAgents(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Agents+deleteAgent"></a>
@@ -557,9 +557,9 @@ const agents = new SDK.Agents(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 agents
-  .deleteAgent(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.deleteAgent(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="ApiKeys"></a>
@@ -599,25 +599,25 @@ Constructs a new ApiKeys object.
 const SDK = require("@optimiq-voice/sdk");
 
 async function main(request) {
-  const apiKey = "your-api-key";
-  const apiSecret = "your-api-secret";
-  const accessKeyId = "WO00000000000000000000000000000000";
+	const apiKey = "your-api-key";
+	const apiSecret = "your-api-secret";
+	const accessKeyId = "WO00000000000000000000000000000000";
 
-  try {
-    const client = SDK.Client({ accessKeyId });
-    await client.loginWithApiKey(apiKey, apiSecret);
+	try {
+		const client = SDK.Client({ accessKeyId });
+		await client.loginWithApiKey(apiKey, apiSecret);
 
-    const apiKeys = new SDK.ApiKeys(client);
-    const response = await apiKeys.createApiKey(request);
+		const apiKeys = new SDK.ApiKeys(client);
+		const response = await apiKeys.createApiKey(request);
 
-    console.log(response); // successful response
-  } catch (e) {
-    console.error(e); // an error occurred
-  }
+		console.log(response); // successful response
+	} catch (e) {
+		console.error(e); // an error occurred
+	}
 }
 
 const request = {
-  role: "WORKSPACE_ADMIN"
+	role: "WORKSPACE_ADMIN",
 };
 
 main(request);
@@ -643,13 +643,13 @@ Creates a new ApiKey for a Workspace.
 const apiKeys = new SDK.ApiKeys(client); // Existing client object
 
 const request = {
-  role: "WORKSPACE_ADMIN"
+	role: "WORKSPACE_ADMIN",
 };
 
 apiKeys
-  .createApiKey(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.createApiKey(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="ApiKeys+regenerateApiKey"></a>
@@ -674,9 +674,9 @@ const apiKeys = new SDK.ApiKeys(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 apiKeys
-  .regenerateApiKey(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.regenerateApiKey(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="ApiKeys+listApiKeys"></a>
@@ -700,14 +700,14 @@ Retrieves a list of ApiKeys from a Workspace.
 const apiKeys = new SDK.ApiKeys(client); // Existing client object
 
 const request = {
-  pageSize: 10,
-  pageToken: "00000000-0000-0000-0000-000000000000"
+	pageSize: 10,
+	pageToken: "00000000-0000-0000-0000-000000000000",
 };
 
 apiKeys
-  .listApiKeys(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.listApiKeys(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="ApiKeys+deleteApiKey"></a>
@@ -732,9 +732,9 @@ const apiKeys = new SDK.ApiKeys(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 apiKeys
-  .deleteApiKey(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.deleteApiKey(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Applications"></a>
@@ -776,40 +776,40 @@ Constructs a new Applications object.
 const SDK = require("@optimiq-voice/sdk");
 
 async function main(request) {
-  const apiKey = "your-api-key";
-  const apiSecret = "your-api-secret";
-  const accessKeyId = "WO00000000000000000000000000000000";
+	const apiKey = "your-api-key";
+	const apiSecret = "your-api-secret";
+	const accessKeyId = "WO00000000000000000000000000000000";
 
-  try {
-    const client = SDK.Client({ accessKeyId });
-    await client.loginWithApiKey(apiKey, apiSecret);
+	try {
+		const client = SDK.Client({ accessKeyId });
+		await client.loginWithApiKey(apiKey, apiSecret);
 
-    const apps = new SDK.Applications(client);
-    const response = await apps.createApplication(request);
+		const apps = new SDK.Applications(client);
+		const response = await apps.createApplication(request);
 
-    console.log(response); // successful response
-  } catch (e) {
-    console.error(e); // an error occurred
-  }
+		console.log(response); // successful response
+	} catch (e) {
+		console.error(e); // an error occurred
+	}
 }
 
 const request = {
-  name: "My application",
-  type: "EXTERNAL",
-  endpoint: "welcome.demo.optimiq-voice.local", // Built-in demo application
-  speechToText: {
-    productRef: "stt.deepgram",
-    config: {
-      model: "nova-2",
-      languageCode: "en-US"
-    }
-  },
-  textToSpeech: {
-    productRef: "tts.elevenlabs",
-    config: {
-      voice: "lrTWbMInQjSJ9q5ywFKP"
-    }
-  }
+	name: "My application",
+	type: "EXTERNAL",
+	endpoint: "welcome.demo.optimiq-voice.local", // Built-in demo application
+	speechToText: {
+		productRef: "stt.deepgram",
+		config: {
+			model: "nova-2",
+			languageCode: "en-US",
+		},
+	},
+	textToSpeech: {
+		productRef: "tts.elevenlabs",
+		config: {
+			voice: "lrTWbMInQjSJ9q5ywFKP",
+		},
+	},
 };
 
 main(request);
@@ -846,27 +846,27 @@ Creates a new Application in Optimiq Voice. The only required fields are the nam
 const apps = new SDK.Applications(client); // Existing client object
 
 const request = {
-  name: "My application",
-  type: "EXTERNAL",
-  endpoint: "welcome.demo.optimiq-voice.local", // Built-in demo application
-  speechToText: {
-    productRef: "stt.deepgram",
-    config: {
-      languageCode: "en-US"
-    }
-  },
-  textToSpeech: {
-    productRef: "tts.elevenlabs",
-    config: {
-      voice: "lrTWbMInQjSJ9q5ywFKP"
-    }
-  }
+	name: "My application",
+	type: "EXTERNAL",
+	endpoint: "welcome.demo.optimiq-voice.local", // Built-in demo application
+	speechToText: {
+		productRef: "stt.deepgram",
+		config: {
+			languageCode: "en-US",
+		},
+	},
+	textToSpeech: {
+		productRef: "tts.elevenlabs",
+		config: {
+			voice: "lrTWbMInQjSJ9q5ywFKP",
+		},
+	},
 };
 
 apps
-  .createApplication(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.createApplication(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Applications+getApplication"></a>
@@ -890,9 +890,9 @@ const apps = new SDK.Applications(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 apps
-  .getApplication(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.getApplication(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Applications+updateApplication"></a>
@@ -926,15 +926,15 @@ Updates an existing application in Optimiq Voice.
 const apps = new SDK.Applications(client); // Existing client object
 
 const request = {
-  ref: "00000000-0000-0000-0000-000000000000",
-  name: "My application",
-  endpoint: "welcome.demo.optimiq-voice.local" // Built-in demo application
+	ref: "00000000-0000-0000-0000-000000000000",
+	name: "My application",
+	endpoint: "welcome.demo.optimiq-voice.local", // Built-in demo application
 };
 
 apps
-  .updateApplication(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.updateApplication(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Applications+listApplications"></a>
@@ -958,14 +958,14 @@ Retrieves a list of Applications from Optimiq Voice.
 const apps = new SDK.Applications(client); // Existing client object
 
 const request = {
-  pageSize: 10,
-  pageToken: "00000000-0000-0000-0000-000000000000"
+	pageSize: 10,
+	pageToken: "00000000-0000-0000-0000-000000000000",
 };
 
 apps
-  .listApplications(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.listApplications(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Applications+deleteApplication"></a>
@@ -990,9 +990,9 @@ const apps = new SDK.Applications(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 apps
-  .deleteApplication(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.deleteApplication(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Applications+evaluateIntelligence"></a>
@@ -1016,56 +1016,55 @@ Evaluates the intelligence of an application.
 const apps = new SDK.Applications(client); // Existing client object
 
 const request = {
-  intelligence: {
-    productRef: "llm.groq",
-    config: {
-      conversationSettings: {
-        firstMessage: "Hello, how can I help you today?",
-        systemPrompt: "You are a helpful assistant.",
-        systemErrorMessage:
-          "I'm sorry, I didn't catch that. Can you say that again?",
-        goodbyeMessage: "Thank you for calling. Have a great day!",
-        languageModel: {
-          provider: "openai",
-          model: "gpt-4o"
-        },
-        testCases: {
-          evalsLanguageModel: {
-            provider: "openai",
-            model: "gpt-4o"
-          },
-          scenarios: [
-            {
-              ref: "Scenario 1",
-              description: "Scenario 1 description",
-              telephonyContext: {
-                callDirection: "FROM_PSTN",
-                ingressNumber: "1234567890",
-                callerNumber: "1234567890"
-              },
-              conversation: [
-                {
-                  userInput: "Hello, how can I help you today?",
-                  expected: {
-                    text: {
-                      type: "EXACT",
-                      response: "Hello, how can I help you today?"
-                    }
-                  }
-                }
-              ]
-            }
-          ]
-        }
-      }
-    }
-  }
+	intelligence: {
+		productRef: "llm.groq",
+		config: {
+			conversationSettings: {
+				firstMessage: "Hello, how can I help you today?",
+				systemPrompt: "You are a helpful assistant.",
+				systemErrorMessage: "I'm sorry, I didn't catch that. Can you say that again?",
+				goodbyeMessage: "Thank you for calling. Have a great day!",
+				languageModel: {
+					provider: "openai",
+					model: "gpt-4o",
+				},
+				testCases: {
+					evalsLanguageModel: {
+						provider: "openai",
+						model: "gpt-4o",
+					},
+					scenarios: [
+						{
+							ref: "Scenario 1",
+							description: "Scenario 1 description",
+							telephonyContext: {
+								callDirection: "FROM_PSTN",
+								ingressNumber: "1234567890",
+								callerNumber: "1234567890",
+							},
+							conversation: [
+								{
+									userInput: "Hello, how can I help you today?",
+									expected: {
+										text: {
+											type: "EXACT",
+											response: "Hello, how can I help you today?",
+										},
+									},
+								},
+							],
+						},
+					],
+				},
+			},
+		},
+	},
 };
 
 apps
-  .evaluateIntelligence(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.evaluateIntelligence(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Calls"></a>
@@ -1104,27 +1103,27 @@ Constructs a new Calls object.
 const SDK = require("@optimiq-voice/sdk");
 
 async function main(request) {
-  const apiKey = "your-api-key";
-  const apiSecret = "your-api-secret";
-  const accessKeyId = "WO00000000000000000000000000000000";
+	const apiKey = "your-api-key";
+	const apiSecret = "your-api-secret";
+	const accessKeyId = "WO00000000000000000000000000000000";
 
-  try {
-    const client = SDK.Client({ accessKeyId });
-    await client.loginWithApiKey(apiKey, apiSecret);
+	try {
+		const client = SDK.Client({ accessKeyId });
+		await client.loginWithApiKey(apiKey, apiSecret);
 
-    const calls = new SDK.Calls(client);
-    const response = await calls.createCall(request);
+		const calls = new SDK.Calls(client);
+		const response = await calls.createCall(request);
 
-    console.log(response); // successful response
-  } catch (e) {
-    console.error(e); // an error occurred
-  }
+		console.log(response); // successful response
+	} catch (e) {
+		console.error(e); // an error occurred
+	}
 }
 
 const request = {
-  from: "+18287854037",
-  to: "+17853178070",
-  appRef: "00000000-0000-0000-0000-000000000000"
+	from: "+18287854037",
+	to: "+17853178070",
+	appRef: "00000000-0000-0000-0000-000000000000",
 };
 
 main(request);
@@ -1155,14 +1154,14 @@ Creates a new Call in the Workspace.
 const calls = new SDK.Calls(client); // Existing client object
 
 const request = {
-  from: "+18287854037",
-  to: "+17853178070",
-  appRef: "00000000-0000-0000-0000-000000000000",
-  timeout: 30,
-  metadata: {
-    name: "John Doe",
-    preferredLanguage: "en-US"
-  }
+	from: "+18287854037",
+	to: "+17853178070",
+	appRef: "00000000-0000-0000-0000-000000000000",
+	timeout: 30,
+	metadata: {
+		name: "John Doe",
+		preferredLanguage: "en-US",
+	},
 };
 
 const response = await calls.createCall(request);
@@ -1171,7 +1170,7 @@ const { ref, statusStream } = response;
 console.log(ref); // Call reference
 
 for await (const status of statusStream) {
-  console.log(status); // Streamed status
+	console.log(status); // Streamed status
 }
 ```
 
@@ -1196,9 +1195,9 @@ const calls = new SDK.Calls(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 calls
-  .getCall(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.getCall(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Calls+listCalls"></a>
@@ -1222,14 +1221,14 @@ Retrieves a list of Calls from a Workspace.
 const calls = new SDK.Calls(client); // Existing client object
 
 const request = {
-  pageSize: 10,
-  pageToken: "00000000-0000-0000-0000-000000000000"
+	pageSize: 10,
+	pageToken: "00000000-0000-0000-0000-000000000000",
 };
 
 calls
-  .listCalls(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.listCalls(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Credentials"></a>
@@ -1270,27 +1269,27 @@ Constructs a new Credentials object.
 const SDK = require("@optimiq-voice/sdk");
 
 async function main(request) {
-  const apiKey = "your-api-key";
-  const apiSecret = "your-api-secret";
-  const accessKeyId = "WO00000000000000000000000000000000";
+	const apiKey = "your-api-key";
+	const apiSecret = "your-api-secret";
+	const accessKeyId = "WO00000000000000000000000000000000";
 
-  try {
-    const client = SDK.Client({ accessKeyId });
-    await client.loginWithApiKey(apiKey, apiSecret);
+	try {
+		const client = SDK.Client({ accessKeyId });
+		await client.loginWithApiKey(apiKey, apiSecret);
 
-    const credentials = new SDK.Credentials(client);
-    const response = await apiKeys.createCredentials(request);
+		const credentials = new SDK.Credentials(client);
+		const response = await apiKeys.createCredentials(request);
 
-    console.log(response); // successful response
-  } catch (e) {
-    console.error(e); // an error occurred
-  }
+		console.log(response); // successful response
+	} catch (e) {
+		console.error(e); // an error occurred
+	}
 }
 
 const request = {
-  name: "My Credentials",
-  username: "myusername",
-  password: "mysecret"
+	name: "My Credentials",
+	username: "myusername",
+	password: "mysecret",
 };
 
 main(request);
@@ -1318,15 +1317,15 @@ Creates a new set of Credentials in the Workspace.
 const credentials = new SDK.Credentials(client); // Existing client object
 
 const request = {
-  name: "My Credentials",
-  username: "myusername",
-  password: "mysecret"
+	name: "My Credentials",
+	username: "myusername",
+	password: "mysecret",
 };
 
 credentials
-  .createCredentials(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.createCredentials(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Credentials+getCredentials"></a>
@@ -1350,9 +1349,9 @@ const credentials = new SDK.Credentials(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 credentials
-  .getCredentials(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.getCredentials(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Credentials+updateCredentials"></a>
@@ -1377,15 +1376,15 @@ Updates an existing set of Credentials in the Workspace.
 const credentials = new SDK.Credentials(client); // Existing client object
 
 const request = {
-  ref: "00000000-0000-0000-0000-000000000000",
-  name: "My Credentials",
-  password: "mysecret"
+	ref: "00000000-0000-0000-0000-000000000000",
+	name: "My Credentials",
+	password: "mysecret",
 };
 
 credentials
-  .updateCredentials(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.updateCredentials(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Credentials+listCredentials"></a>
@@ -1409,14 +1408,14 @@ Retrieves a list of Credentials from a Workspace.
 const credentials = new SDK.Credentials(client); // Existing client object
 
 const request = {
-  pageSize: 10,
-  pageToken: "00000000-0000-0000-0000-000000000000"
+	pageSize: 10,
+	pageToken: "00000000-0000-0000-0000-000000000000",
 };
 
 credentials
-  .listCredentials(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.listCredentials(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Credentials+deleteCredentials"></a>
@@ -1441,9 +1440,9 @@ const credentials = new SDK.Credentials(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 credentials
-  .deleteCredentials(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.deleteCredentials(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Domains"></a>
@@ -1484,26 +1483,26 @@ Constructs a new Domains object.
 const SDK = require("@optimiq-voice/sdk");
 
 async function main(request) {
-  const apiKey = "your-api-key";
-  const apiSecret = "your-api-secret";
-  const accessKeyId = "WO00000000000000000000000000000000";
+	const apiKey = "your-api-key";
+	const apiSecret = "your-api-secret";
+	const accessKeyId = "WO00000000000000000000000000000000";
 
-  try {
-    const client = SDK.Client({ accessKeyId });
-    await client.loginWithApiKey(apiKey, apiSecret);
+	try {
+		const client = SDK.Client({ accessKeyId });
+		await client.loginWithApiKey(apiKey, apiSecret);
 
-    const domains = new SDK.Domains(client);
-    const response = await domains.createDomain(request);
+		const domains = new SDK.Domains(client);
+		const response = await domains.createDomain(request);
 
-    console.log(response); // successful response
-  } catch (e) {
-    console.error(e); // an error occurred
-  }
+		console.log(response); // successful response
+	} catch (e) {
+		console.error(e); // an error occurred
+	}
 }
 
 const request = {
-  name: "My Domain",
-  domainUri: "sip.project.optimiq.health"
+	name: "My Domain",
+	domainUri: "sip.project.optimiq.health",
 };
 
 main(request);
@@ -1534,14 +1533,14 @@ Creates a new Domain in the Workspace.
 const domains = new SDK.Domains(client); // Existing client object
 
 const request = {
-  name: "My Domain",
-  domainUri: "sip.project.optimiq.health"
+	name: "My Domain",
+	domainUri: "sip.project.optimiq.health",
 };
 
 domains
-  .createDomain(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.createDomain(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Domains+getDomain"></a>
@@ -1565,9 +1564,9 @@ const domains = new SDK.Domains(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 domains
-  .getDomain(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.getDomain(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Domains+updateDomain"></a>
@@ -1596,14 +1595,14 @@ Updates an existing Domain in the Workspace.
 const domains = new SDK.Domains(client); // Existing client object
 
 const request = {
-  ref: "00000000-0000-0000-0000-000000000000",
-  accessControlListRef: "00000000-0000-0000-0000-000000000001"
+	ref: "00000000-0000-0000-0000-000000000000",
+	accessControlListRef: "00000000-0000-0000-0000-000000000001",
 };
 
 domains
-  .updateDomain(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.updateDomain(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Domains+listDomains"></a>
@@ -1627,14 +1626,14 @@ Retrieves a list of Domains from a Workspace.
 const domains = new SDK.Domains(client); // Existing client object
 
 const request = {
-  pageSize: 10,
-  pageToken: "00000000-0000-0000-0000-000000000000"
+	pageSize: 10,
+	pageToken: "00000000-0000-0000-0000-000000000000",
 };
 
 domains
-  .listDomains(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.listDomains(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Domains+deleteDomain"></a>
@@ -1659,9 +1658,9 @@ const domains = new SDK.Domains(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 domains
-  .deleteDomain(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.deleteDomain(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Numbers"></a>
@@ -1702,29 +1701,29 @@ Constructs a new Numbers object.
 const SDK = require("@optimiq-voice/sdk");
 
 async function main(request) {
-  const apiKey = "your-api-key";
-  const apiSecret = "your-api-secret";
-  const accessKeyId = "WO00000000000000000000000000000000";
+	const apiKey = "your-api-key";
+	const apiSecret = "your-api-secret";
+	const accessKeyId = "WO00000000000000000000000000000000";
 
-  try {
-    const client = SDK.Client({ accessKeyId });
-    await client.loginWithApiKey(apiKey, apiSecret);
+	try {
+		const client = SDK.Client({ accessKeyId });
+		await client.loginWithApiKey(apiKey, apiSecret);
 
-    const numbers = new SDK.Numbers(client);
-    const response = await numbers.createNumber(request);
+		const numbers = new SDK.Numbers(client);
+		const response = await numbers.createNumber(request);
 
-    console.log(response); // successful response
-  } catch (e) {
-    console.error(e); // an error occurred
-  }
+		console.log(response); // successful response
+	} catch (e) {
+		console.error(e); // an error occurred
+	}
 }
 
 const request = {
-  name: "My Number",
-  telUrl: "tel:+17853178070",
-  city: "Asheville",
-  country: "United States",
-  countryIsoCode: "US"
+	name: "My Number",
+	telUrl: "tel:+17853178070",
+	city: "Asheville",
+	country: "United States",
+	countryIsoCode: "US",
 };
 
 main(request);
@@ -1754,17 +1753,17 @@ Creates a new Number in the Workspace.
 const numbers = new SDK.Numbers(client); // Existing client object
 
 const request = {
-  name: "My Number",
-  telUrl: "tel:+17853178070",
-  city: "Asheville",
-  country: "United States",
-  countryIsoCode: "US"
+	name: "My Number",
+	telUrl: "tel:+17853178070",
+	city: "Asheville",
+	country: "United States",
+	countryIsoCode: "US",
 };
 
 numbers
-  .createNumber(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.createNumber(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Numbers+getNumber"></a>
@@ -1788,9 +1787,9 @@ const numbers = new SDK.Numbers(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 numbers
-  .getNumber(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.getNumber(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Numbers+updateNumber"></a>
@@ -1814,14 +1813,14 @@ Updates an existing Number in the Workspace.
 const numbers = new SDK.Numbers(client); // Existing client object
 
 const request = {
-  ref: "00000000-0000-0000-0000-000000000000",
-  name: "My Number"
+	ref: "00000000-0000-0000-0000-000000000000",
+	name: "My Number",
 };
 
 numbers
-  .updateNumber(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.updateNumber(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Numbers+listNumbers"></a>
@@ -1845,14 +1844,14 @@ Retrieves a list of Numbers from a Workspace.
 const numbers = new SDK.Numbers(client); // Existing client object
 
 const request = {
-  pageSize: 10,
-  pageToken: "00000000-0000-0000-0000-000000000000"
+	pageSize: 10,
+	pageToken: "00000000-0000-0000-0000-000000000000",
 };
 
 numbers
-  .listNumbers(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.listNumbers(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Numbers+deleteNumber"></a>
@@ -1877,9 +1876,9 @@ const numbers = new SDK.Numbers(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 numbers
-  .deleteNumber(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.deleteNumber(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Secrets"></a>
@@ -1920,26 +1919,26 @@ Constructs a new Secrets object.
 const SDK = require("@optimiq-voice/sdk");
 
 async function main(request) {
-  const apiKey = "your-api-key";
-  const apiSecret = "your-api-secret";
-  const accessKeyId = "WO00000000000000000000000000000000";
+	const apiKey = "your-api-key";
+	const apiSecret = "your-api-secret";
+	const accessKeyId = "WO00000000000000000000000000000000";
 
-  try {
-    const client = SDK.Client({ accessKeyId });
-    await client.loginWithApiKey(apiKey, apiSecret);
+	try {
+		const client = SDK.Client({ accessKeyId });
+		await client.loginWithApiKey(apiKey, apiSecret);
 
-    const secrets = new SDK.Secrets(client);
-    const response = await secrets.creteSecret(request);
+		const secrets = new SDK.Secrets(client);
+		const response = await secrets.creteSecret(request);
 
-    console.log(response); // successful response
-  } catch (e) {
-    console.error(e); // an error occurred
-  }
+		console.log(response); // successful response
+	} catch (e) {
+		console.error(e); // an error occurred
+	}
 }
 
 const request = {
-  name: "FRIENDLY_NAME",
-  secret: "mysecret"
+	name: "FRIENDLY_NAME",
+	secret: "mysecret",
 };
 
 main(request);
@@ -1966,14 +1965,14 @@ Creates a new Secret in the Workspace.
 const secrets = new SDK.Secrets(client); // Existing client object
 
 const request = {
-  name: "FRIENDLY_NAME",
-  secret: "mysecret"
+	name: "FRIENDLY_NAME",
+	secret: "mysecret",
 };
 
 secrets
-  .createSecret(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.createSecret(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Secrets+getSecret"></a>
@@ -1997,9 +1996,9 @@ const secrets = new SDK.Secrets(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 secrets
-  .getSecret(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.getSecret(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Secrets+updateSecret"></a>
@@ -2024,14 +2023,14 @@ Updates an existing Secret in the Workspace.
 const secrets = new SDK.Secrets(client); // Existing client object
 
 const request = {
-  ref: "00000000-0000-0000-0000-000000000000",
-  secret: "mysecret"
+	ref: "00000000-0000-0000-0000-000000000000",
+	secret: "mysecret",
 };
 
 secrets
-  .updateSecret(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.updateSecret(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Secrets+listSecrets"></a>
@@ -2055,14 +2054,14 @@ Retrieves a list of Secrets from a Workspace.
 const secrets = new SDK.Secrets(client); // Existing client object
 
 const request = {
-  pageSize: 10,
-  pageToken: "00000000-0000-0000-0000-000000000000"
+	pageSize: 10,
+	pageToken: "00000000-0000-0000-0000-000000000000",
 };
 
 secrets
-  .listSecrets(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.listSecrets(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Secrets+deleteSecret"></a>
@@ -2087,9 +2086,9 @@ const secrets = new SDK.Secrets(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 secrets
-  .deleteSecret(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.deleteSecret(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Trunks"></a>
@@ -2130,26 +2129,26 @@ Constructs a new Trunks object.
 const SDK = require("@optimiq-voice/sdk");
 
 async function main(request) {
-  const apiKey = "your-api-key";
-  const apiSecret = "your-api-secret";
-  const accessKeyId = "WO00000000000000000000000000000000";
+	const apiKey = "your-api-key";
+	const apiSecret = "your-api-secret";
+	const accessKeyId = "WO00000000000000000000000000000000";
 
-  try {
-    const client = SDK.Client({ accessKeyId });
-    await client.loginWithApiKey(apiKey, apiSecret);
+	try {
+		const client = SDK.Client({ accessKeyId });
+		await client.loginWithApiKey(apiKey, apiSecret);
 
-    const trunks = new SDK.Trunks(client);
-    const response = await trunks.createTrunk(request);
+		const trunks = new SDK.Trunks(client);
+		const response = await trunks.createTrunk(request);
 
-    console.log(response); // successful response
-  } catch (e) {
-    console.error(e); // an error occurred
-  }
+		console.log(response); // successful response
+	} catch (e) {
+		console.error(e); // an error occurred
+	}
 }
 
 const request = {
-  name: "My Trunk",
-  inboundUri: "sip.company.optimiq.health"
+	name: "My Trunk",
+	inboundUri: "sip.company.optimiq.health",
 };
 
 main(request);
@@ -2229,9 +2228,9 @@ const trunks = new SDK.Trunks(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 trunks
-  .getTrunk(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.getTrunk(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Trunks+updateTrunk"></a>
@@ -2308,14 +2307,14 @@ Retrieves a list of Trunks from a Workspace.
 const trunks = new SDK.Trunks(client); // Existing client object
 
 const request = {
-  pageSize: 10,
-  pageToken: "00000000-0000-0000-0000-000000000000"
+	pageSize: 10,
+	pageToken: "00000000-0000-0000-0000-000000000000",
 };
 
 trunks
-  .listTrunks(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.listTrunks(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Trunks+deleteTrunk"></a>
@@ -2340,9 +2339,9 @@ const trunks = new SDK.Trunks(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 trunks
-  .deleteTrunk(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.deleteTrunk(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Users"></a>
@@ -2388,16 +2387,16 @@ const client = SDK.Client();
 const users = new SDK.Users(client);
 
 const request = {
-  name: "John Doe",
-  email: "john.doe@example.com",
-  password: "password",
-  avatar: "https://example.com/avatar.jpg"
+	name: "John Doe",
+	email: "john.doe@example.com",
+	password: "password",
+	avatar: "https://example.com/avatar.jpg",
 };
 
 users
-  .createUser(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.createUser(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Users+createUser"></a>
@@ -2423,16 +2422,16 @@ Creates a new User in the Workspace.
 const users = new SDK.Users(client); // Existing client object
 
 const request = {
-  name: "John Doe",
-  email: "john.doe@example.com",
-  password: "password",
-  avatar: "https://example.com/avatar.jpg"
+	name: "John Doe",
+	email: "john.doe@example.com",
+	password: "password",
+	avatar: "https://example.com/avatar.jpg",
 };
 
 users
-  .createUser(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.createUser(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Users+createUserWithOauth2Code"></a>
@@ -2455,13 +2454,13 @@ Create a new User using an OAuth2 code and return the id, access, and refresh to
 const users = new SDK.Users(client); // Existing client object
 
 const request = {
-  code: "fd4d78beb31aa25b93de"
+	code: "fd4d78beb31aa25b93de",
 };
 
 users
-  .createUserWithOauth2Code(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.createUserWithOauth2Code(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Users+getUser"></a>
@@ -2485,9 +2484,9 @@ const users = new SDK.Users(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 users
-  .getUser(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.getUser(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Users+updateUser"></a>
@@ -2513,16 +2512,16 @@ Updates an existing User in the Workspace.
 const users = new SDK.Users(client); // Existing client object
 
 const request = {
-  ref: "00000000-0000-0000-0000-000000000000",
-  name: "John Doe",
-  password: "password",
-  avatar: "https://example.com/avatar.jpg"
+	ref: "00000000-0000-0000-0000-000000000000",
+	name: "John Doe",
+	password: "password",
+	avatar: "https://example.com/avatar.jpg",
 };
 
 users
-  .updateUser(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.updateUser(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Users+sendResetPasswordCode"></a>
@@ -2546,14 +2545,14 @@ Sends a reset password code to the User.
 const users = new SDK.Users(client); // Existing client object
 
 const request = {
-  username: "john.doe@example.com",
-  resetPasswordUrl: "https://example.com/reset-password"
+	username: "john.doe@example.com",
+	resetPasswordUrl: "https://example.com/reset-password",
 };
 
 users
-  .sendResetPasswordCode(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.sendResetPasswordCode(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Users+resetPassword"></a>
@@ -2578,15 +2577,15 @@ Resets the password of the User.
 const users = new SDK.Users(client); // Existing client object
 
 const request = {
-  username: "john.doe@example.com",
-  password: "password",
-  verificationCode: "123456"
+	username: "john.doe@example.com",
+	password: "password",
+	verificationCode: "123456",
 };
 
 users
-  .resetPassword(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.resetPassword(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Users+deleteUser"></a>
@@ -2611,9 +2610,9 @@ const users = new SDK.Users(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 users
-  .deleteUser(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.deleteUser(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Workspaces"></a>
@@ -2658,25 +2657,25 @@ Constructs a new Workspaces object.
 const SDK = require("@optimiq-voice/sdk");
 
 async function main(request) {
-  const apiKey = "your-api-key";
-  const apiSecret = "your-api-secret";
-  const accessKeyId = "WO00000000000000000000000000000000";
+	const apiKey = "your-api-key";
+	const apiSecret = "your-api-secret";
+	const accessKeyId = "WO00000000000000000000000000000000";
 
-  try {
-    const client = SDK.Client({ accessKeyId });
-    await client.loginWithApiKey(apiKey, apiSecret);
+	try {
+		const client = SDK.Client({ accessKeyId });
+		await client.loginWithApiKey(apiKey, apiSecret);
 
-    const workspaces = new SDK.Workspaces(client);
-    const response = await workspaces.createWorkspace(request);
+		const workspaces = new SDK.Workspaces(client);
+		const response = await workspaces.createWorkspace(request);
 
-    console.log(response); // successful response
-  } catch (e) {
-    console.error(e); // an error occurred
-  }
+		console.log(response); // successful response
+	} catch (e) {
+		console.error(e); // an error occurred
+	}
 }
 
 const request = {
-  name: "My Workspace"
+	name: "My Workspace",
 };
 
 main(request);
@@ -2702,13 +2701,13 @@ Creates a new Workspace in the system.
 const workspaces = new SDK.Workspaces(client); // Existing client object
 
 const request = {
-  name: "My Workspace"
+	name: "My Workspace",
 };
 
 workspaces
-  .createWorkspace(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.createWorkspace(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Workspaces+getWorkspace"></a>
@@ -2732,9 +2731,9 @@ const workspaces = new SDK.Workspaces(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 workspaces
-  .getWorkspace(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.getWorkspace(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Workspaces+updateWorkspace"></a>
@@ -2758,14 +2757,14 @@ Updates an existing Workspace in the system.
 const workspaces = new SDK.Workspaces(client); // Existing client object
 
 const request = {
-  ref: "00000000-0000-0000-0000-000000000000",
-  name: "My Workspace"
+	ref: "00000000-0000-0000-0000-000000000000",
+	name: "My Workspace",
 };
 
 workspaces
-  .updateWorkspace(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.updateWorkspace(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Workspaces+deleteWorkspace"></a>
@@ -2790,9 +2789,9 @@ const workspaces = new SDK.Workspaces(client); // Existing client object
 const ref = "00000000-0000-0000-0000-000000000000";
 
 workspaces
-  .deleteWorkspace(ref)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.deleteWorkspace(ref)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Workspaces+listWorkspaces"></a>
@@ -2809,9 +2808,9 @@ Retrieves a list of all Workspaces for the logged in user.
 const workspaces = new SDK.Workspaces(client); // Existing client object
 
 workspaces
-  .listWorkspaces()
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.listWorkspaces()
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Workspaces+inviteUserToWorkspace"></a>
@@ -2836,16 +2835,16 @@ Invites a User to a Workspace.
 const workspaces = new SDK.Workspaces(client); // Existing client object
 
 const request = {
-  workspaceRef: "00000000-0000-0000-0000-000000000000",
-  email: "jane.doe@example.com",
-  role: "WORKSPACE_MEMBER",
-  password: "password" // Temporary password for the User. Leave empty to generate a random password
+	workspaceRef: "00000000-0000-0000-0000-000000000000",
+	email: "jane.doe@example.com",
+	role: "WORKSPACE_MEMBER",
+	password: "password", // Temporary password for the User. Leave empty to generate a random password
 };
 
 workspaces
-  .inviteUserToWorkspace(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.inviteUserToWorkspace(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Workspaces+resendWorkspaceMembershipInvitation"></a>
@@ -2895,14 +2894,14 @@ List the members of a Workspace
 const workspaces = new SDK.Workspaces(client); // Existing client object
 
 const request = {
-  pageSize: 10,
-  pageToken: "00000000-0000-0000-0000-000000000000"
+	pageSize: 10,
+	pageToken: "00000000-0000-0000-0000-000000000000",
 };
 
 workspaces
-  .listWorkspaceMembers(request)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.listWorkspaceMembers(request)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```
 
 <a name="Workspaces+removeUserFromWorkspace"></a>
@@ -2926,7 +2925,7 @@ const workspaces = new SDK.Workspaces(client); // Existing client object
 const userRef = "00000000-0000-0000-0000-000000000000";
 
 workspaces
-  .removeUserFromWorkspace(userRef)
-  .then(console.log) // successful response
-  .catch(console.error); // an error occurred
+	.removeUserFromWorkspace(userRef)
+	.then(console.log) // successful response
+	.catch(console.error); // an error occurred
 ```

@@ -130,14 +130,7 @@ jobs:
 
   manual-approval:
     name: Manual Approval for Release Finalization
-    needs:
-      [
-        build,
-        publish-api,
-        publish-autopilot,
-        publish-dashboard,
-        publish-identity
-      ]
+    needs: [build, publish-api, publish-autopilot, publish-dashboard, publish-identity]
     if: needs.build.outputs.RELEASE != 'none'
     runs-on: ubuntu-latest
     environment: release-approval

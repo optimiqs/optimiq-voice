@@ -8,15 +8,13 @@ import { AuthenticatedContext } from "../stores/authenticated.store";
  * @returns The current authentication context value.
  */
 const useAuthContext = () => {
-  const context = useContext(AuthenticatedContext);
+	const context = useContext(AuthenticatedContext);
 
-  if (!context) {
-    throw new Error(
-      "Oops! You need to be inside an <AuthenticatedProvider /> to use this hook."
-    );
-  }
+	if (!context) {
+		throw new Error("Oops! You need to be inside an <AuthenticatedProvider /> to use this hook.");
+	}
 
-  return context;
+	return context;
 };
 
 /**
@@ -27,11 +25,11 @@ const useAuthContext = () => {
  * @returns An object containing the authenticated user and additional context.
  */
 export const useAuth = () => {
-  const { user, ...rest } = useAuthContext();
+	const { user, ...rest } = useAuthContext();
 
-  if (!user) {
-    throw new Error("Oops! You need to be authenticated to use this hook.");
-  }
+	if (!user) {
+		throw new Error("Oops! You need to be authenticated to use this hook.");
+	}
 
-  return { user, ...rest };
+	return { user, ...rest };
 };

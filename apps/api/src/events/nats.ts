@@ -7,11 +7,11 @@ const logger = getLogger({ service: "api", filePath: __filename });
 const ROUTR_CALL_SUBJECT = "routr.call.*";
 
 async function streamEvents(subscription, callback: NatsEventCallback) {
-  // eslint-disable-next-line no-loops/no-loops
-  for await (const m of subscription) {
-    const messageStr = m.data.toString();
-    callback({ ...JSON.parse(messageStr) });
-  }
+	// eslint-disable-next-line no-loops/no-loops
+	for await (const m of subscription) {
+		const messageStr = m.data.toString();
+		callback({ ...JSON.parse(messageStr) });
+	}
 }
 
 /**
@@ -22,27 +22,27 @@ async function streamEvents(subscription, callback: NatsEventCallback) {
  * @return {void}
  */
 async function watchNats(natsUrl: string, callback: NatsEventCallback) {
-  const connection = await connect({
-    servers: natsUrl,
-    maxReconnectAttempts: -1
-  });
-  const subscription = connection.subscribe(ROUTR_CALL_SUBJECT);
+	const connection = await connect({
+		servers: natsUrl,
+		maxReconnectAttempts: -1,
+	});
+	const subscription = connection.subscribe(ROUTR_CALL_SUBJECT);
 
-  logger.verbose("connected to nats", { natsUrl });
-  logger.verbose("subscribed to subjects", {
-    subjects: [ROUTR_CALL_SUBJECT]
-  });
+	logger.verbose("connected to nats", { natsUrl });
+	logger.verbose("subscribed to subjects", {
+		subjects: [ROUTR_CALL_SUBJECT],
+	});
 
-  void streamEvents(subscription, callback).catch((error) => {
-    logger.error("NATS event stream failed", error);
-  });
+	void streamEvents(subscription, callback).catch((error) => {
+		logger.error("NATS event stream failed", error);
+	});
 
-  return {
-    close: async () => {
-      subscription.unsubscribe();
-      await connection.drain();
-    }
-  };
+	return {
+		close: async () => {
+			subscription.unsubscribe();
+			await connection.drain();
+		},
+	};
 }
 
 export { watchNats };

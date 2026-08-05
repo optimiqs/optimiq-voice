@@ -1,8 +1,4 @@
 {
-  "node-option": [
-    "import=tsx"
-  ],
-  "ignore": [
-    "**/node_modules/**"
-  ]
+	"node-option": ["import=tsx"],
+	"ignore": ["**/node_modules/**"]
 }

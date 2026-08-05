@@ -1,23 +1,18 @@
 import { Stack, Box } from "@mui/material";
 import { useCallback, useMemo, useEffect } from "react";
 import { useForm } from "react-hook-form";
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem
-} from "~/core/components/design-system/forms";
+import { Form, FormControl, FormField, FormItem } from "~/core/components/design-system/forms";
 import { Button } from "~/core/components/design-system/ui/button/button";
 import { Input } from "~/core/components/design-system/ui/input/input";
 import { Modal } from "~/core/components/design-system/ui/modal/modal";
 import { Typography } from "~/core/components/design-system/ui/typography/typography";
 
 export interface DeleteWorkspaceDialogProps {
-  open: boolean;
-  onClose: () => void;
-  onConfirm: () => void;
-  workspaceName?: string;
-  isDeleting?: boolean;
+	open: boolean;
+	onClose: () => void;
+	onConfirm: () => void;
+	workspaceName?: string;
+	isDeleting?: boolean;
 }
 
 /**
@@ -30,125 +25,116 @@ export interface DeleteWorkspaceDialogProps {
  * @returns {JSX.Element} The rendered confirmation dialog.
  */
 export function DeleteWorkspaceDialog({
-  open,
-  onClose,
-  onConfirm,
-  workspaceName,
-  isDeleting = false
+	open,
+	onClose,
+	onConfirm,
+	workspaceName,
+	isDeleting = false,
 }: DeleteWorkspaceDialogProps) {
-  /** Form to handle the confirmation input */
-  const form = useForm<{ confirmation: string }>({
-    defaultValues: {
-      confirmation: ""
-    },
-    mode: "onChange"
-  });
+	/** Form to handle the confirmation input */
+	const form = useForm<{ confirmation: string }>({
+		defaultValues: {
+			confirmation: "",
+		},
+		mode: "onChange",
+	});
 
-  /** Watch the confirmation field value */
-  const confirmationValue = form.watch("confirmation");
+	/** Watch the confirmation field value */
+	const confirmationValue = form.watch("confirmation");
 
-  /** Reset form when dialog opens/closes */
-  useEffect(() => {
-    if (!open) {
-      form.reset({ confirmation: "" });
-    }
-  }, [open, form]);
+	/** Reset form when dialog opens/closes */
+	useEffect(() => {
+		if (!open) {
+			form.reset({ confirmation: "" });
+		}
+	}, [open, form]);
 
-  /** Check if the confirmation text matches "DELETE" exactly */
-  const isConfirmationValid = useMemo(() => {
-    return confirmationValue.trim().toUpperCase() === "DELETE";
-  }, [confirmationValue]);
+	/** Check if the confirmation text matches "DELETE" exactly */
+	const isConfirmationValid = useMemo(() => {
+		return confirmationValue.trim().toUpperCase() === "DELETE";
+	}, [confirmationValue]);
 
-  const handleConfirm = useCallback(() => {
-    if (isConfirmationValid) {
-      onConfirm();
-    }
-  }, [onConfirm, isConfirmationValid]);
+	const handleConfirm = useCallback(() => {
+		if (isConfirmationValid) {
+			onConfirm();
+		}
+	}, [onConfirm, isConfirmationValid]);
 
-  return (
-    <Modal
-      open={open}
-      onClose={onClose}
-      title="Delete Workspace"
-      maxWidth="sm"
-      hideCloseButton={isDeleting}
-    >
-      <Stack spacing={3}>
-        <Box>
-          <Typography variant="body-small" color="base.03" sx={{ mb: 2 }}>
-            Are you sure you want to delete{" "}
-            {workspaceName ? (
-              <strong>{workspaceName}</strong>
-            ) : (
-              "this workspace"
-            )}
-            ? This action cannot be undone.
-          </Typography>
+	return (
+		<Modal
+			open={open}
+			onClose={onClose}
+			title="Delete Workspace"
+			maxWidth="sm"
+			hideCloseButton={isDeleting}
+		>
+			<Stack spacing={3}>
+				<Box>
+					<Typography variant="body-small" color="base.03" sx={{ mb: 2 }}>
+						Are you sure you want to delete{" "}
+						{workspaceName ? <strong>{workspaceName}</strong> : "this workspace"}? This action
+						cannot be undone.
+					</Typography>
 
-          <Typography variant="body-small">
-            <strong>Warning:</strong> Deleting this workspace will permanently
-            remove all associated data, including:
-          </Typography>
+					<Typography variant="body-small">
+						<strong>Warning:</strong> Deleting this workspace will permanently remove all associated
+						data, including:
+					</Typography>
 
-          <Box component="ul" sx={{ mt: 2, pl: 2, mb: 0 }}>
-            <Typography variant="body-small" color="base.03" sx={{ mb: 0.5 }}>
-              - All applications and configurations
-            </Typography>
-            <Typography variant="body-small" color="base.03" sx={{ mb: 0.5 }}>
-              - All API keys and credentials
-            </Typography>
-            <Typography variant="body-small" color="base.03">
-              - All call history and analytics
-            </Typography>
-          </Box>
-        </Box>
+					<Box component="ul" sx={{ mt: 2, pl: 2, mb: 0 }}>
+						<Typography variant="body-small" color="base.03" sx={{ mb: 0.5 }}>
+							- All applications and configurations
+						</Typography>
+						<Typography variant="body-small" color="base.03" sx={{ mb: 0.5 }}>
+							- All API keys and credentials
+						</Typography>
+						<Typography variant="body-small" color="base.03">
+							- All call history and analytics
+						</Typography>
+					</Box>
+				</Box>
 
-        {/* Confirmation input */}
-        <Box>
-          <Typography variant="body-small" color="base.03" sx={{ mb: 1.5 }}>
-            To confirm, type <strong>DELETE</strong> below:
-          </Typography>
-          <Form {...form}>
-            <FormField
-              control={form.control}
-              name="confirmation"
-              render={({ field }) => (
-                <FormItem>
-                  <FormControl>
-                    <Input
-                      type="text"
-                      placeholder="DELETE"
-                      disabled={isDeleting}
-                      size="small"
-                      autoFocus
-                      {...field}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
-          </Form>
-        </Box>
+				{/* Confirmation input */}
+				<Box>
+					<Typography variant="body-small" color="base.03" sx={{ mb: 1.5 }}>
+						To confirm, type <strong>DELETE</strong> below:
+					</Typography>
+					<Form {...form}>
+						<FormField
+							control={form.control}
+							name="confirmation"
+							render={({ field }) => (
+								<FormItem>
+									<FormControl>
+										<Input
+											type="text"
+											placeholder="DELETE"
+											disabled={isDeleting}
+											size="small"
+											autoFocus
+											{...field}
+										/>
+									</FormControl>
+								</FormItem>
+							)}
+						/>
+					</Form>
+				</Box>
 
-        <Stack direction="row" spacing={2} justifyContent="flex-end">
-          <Button
-            variant="outlined"
-            onClick={onClose}
-            disabled={isDeleting}
-            size="small"
-          >
-            Cancel
-          </Button>
-          <Button
-            onClick={handleConfirm}
-            disabled={isDeleting || !isConfirmationValid}
-            size="small"
-            danger
-          >
-            {isDeleting ? "Deleting..." : "Delete Workspace"}
-          </Button>
-        </Stack>
-      </Stack>
-    </Modal>
-  );
+				<Stack direction="row" spacing={2} justifyContent="flex-end">
+					<Button variant="outlined" onClick={onClose} disabled={isDeleting} size="small">
+						Cancel
+					</Button>
+					<Button
+						onClick={handleConfirm}
+						disabled={isDeleting || !isConfirmationValid}
+						size="small"
+						danger
+					>
+						{isDeleting ? "Deleting..." : "Delete Workspace"}
+					</Button>
+				</Stack>
+			</Stack>
+		</Modal>
+	);
 }

@@ -2,12 +2,7 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { useCallback } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem
-} from "~/core/components/design-system/forms";
+import { Form, FormControl, FormField, FormItem } from "~/core/components/design-system/forms";
 import { FormRoot } from "~/core/components/design-system/forms/form-root";
 import { Button } from "~/core/components/design-system/ui/button/button";
 import { Input } from "~/core/components/design-system/ui/input/input";
@@ -23,22 +18,22 @@ import { useNumbers } from "~/numbers/services/numbers.service";
  * - The type is either "allow" or "deny".
  */
 export const schema = z.object({
-  /**
-   * The egress rule itself.
-   *
-   * Required — defines the condition for outbound calls (e.g., "0.0.0.0/0").
-   */
-  rule: z
-    .string()
-    .regex(/^[^:]+$/, "Rule cannot contain ':' character")
-    .nonempty("Rule is required"),
+	/**
+	 * The egress rule itself.
+	 *
+	 * Required — defines the condition for outbound calls (e.g., "0.0.0.0/0").
+	 */
+	rule: z
+		.string()
+		.regex(/^[^:]+$/, "Rule cannot contain ':' character")
+		.nonempty("Rule is required"),
 
-  /**
-   * Reference to the number enforcing this egress rule.
-   *
-   * Required — must point to an existing number in the system.
-   */
-  numberRef: z.string().nonempty("Number Reference is required")
+	/**
+	 * Reference to the number enforcing this egress rule.
+	 *
+	 * Required — must point to an existing number in the system.
+	 */
+	numberRef: z.string().nonempty("Number Reference is required"),
 });
 
 /**
@@ -56,9 +51,9 @@ export type Schema = z.infer<typeof schema>;
  * @property {(data: Schema) => void} onFormSubmit - Function triggered when the form is successfully submitted.
  */
 export interface ModalProps {
-  isOpen: boolean;
-  onClose: () => void;
-  onFormSubmit: (data: Schema) => void;
+	isOpen: boolean;
+	onClose: () => void;
+	onFormSubmit: (data: Schema) => void;
 }
 
 /**
@@ -74,103 +69,89 @@ export interface ModalProps {
  * @param {ModalProps} props - The component props controlling visibility and form behavior.
  * @returns {JSX.Element} The rendered modal containing the rule creation form.
  */
-export const CreateRuleModal = ({
-  isOpen,
-  onClose,
-  onFormSubmit
-}: ModalProps) => {
-  const { data: numbers, isLoading: isNumbersLoading } = useNumbers();
+export const CreateRuleModal = ({ isOpen, onClose, onFormSubmit }: ModalProps) => {
+	const { data: numbers, isLoading: isNumbersLoading } = useNumbers();
 
-  /**
-   * Initializes React Hook Form with Zod validation and default values.
-   */
-  const form = useForm<Schema>({
-    resolver: zodResolver(schema),
-    defaultValues: {
-      rule: "",
-      numberRef: ""
-    },
-    mode: "onChange"
-  });
+	/**
+	 * Initializes React Hook Form with Zod validation and default values.
+	 */
+	const form = useForm<Schema>({
+		resolver: zodResolver(schema),
+		defaultValues: {
+			rule: "",
+			numberRef: "",
+		},
+		mode: "onChange",
+	});
 
-  /**
-   * Handles the form submission.
-   *
-   * Calls the parent-provided onFormSubmit function with the validated data,
-   * closes the modal, and resets the form after a short delay to avoid visual flicker.
-   *
-   * @param {Schema} data - The validated form data.
-   */
-  const onSubmit = useCallback(
-    (data: Schema) => {
-      onFormSubmit(data);
-      onClose(); // Close the modal
-      setTimeout(() => {
-        form.reset(); // Reset the form state after closing the modal
-      }, 100); // Slight delay to ensure the modal is closed before resetting
-    },
-    [onFormSubmit, onClose, form]
-  );
+	/**
+	 * Handles the form submission.
+	 *
+	 * Calls the parent-provided onFormSubmit function with the validated data,
+	 * closes the modal, and resets the form after a short delay to avoid visual flicker.
+	 *
+	 * @param {Schema} data - The validated form data.
+	 */
+	const onSubmit = useCallback(
+		(data: Schema) => {
+			onFormSubmit(data);
+			onClose(); // Close the modal
+			setTimeout(() => {
+				form.reset(); // Reset the form state after closing the modal
+			}, 100); // Slight delay to ensure the modal is closed before resetting
+		},
+		[onFormSubmit, onClose, form],
+	);
 
-  return (
-    <Modal open={isOpen} onClose={onClose} title="Create New Rule">
-      <Form {...form}>
-        <FormRoot onSubmit={form.handleSubmit(onSubmit)}>
-          <FormField
-            control={form.control}
-            name="rule"
-            render={({ field }) => (
-              <FormItem>
-                <FormControl>
-                  <Input
-                    type="text"
-                    label="Rule"
-                    placeholder="(e.g. .*)"
-                    {...field}
-                  />
-                </FormControl>
-              </FormItem>
-            )}
-          />
+	return (
+		<Modal open={isOpen} onClose={onClose} title="Create New Rule">
+			<Form {...form}>
+				<FormRoot onSubmit={form.handleSubmit(onSubmit)}>
+					<FormField
+						control={form.control}
+						name="rule"
+						render={({ field }) => (
+							<FormItem>
+								<FormControl>
+									<Input type="text" label="Rule" placeholder="(e.g. .*)" {...field} />
+								</FormControl>
+							</FormItem>
+						)}
+					/>
 
-          <FormField
-            control={form.control}
-            name="numberRef"
-            render={({ field }) => (
-              <FormItem>
-                <FormControl>
-                  <Select
-                    label="Select Outbound Number"
-                    options={numbers.map(({ ref, name }) => ({
-                      value: ref,
-                      label: name
-                    }))}
-                    disabled={isNumbersLoading || numbers.length === 0}
-                    placeholder={
-                      isNumbersLoading
-                        ? "Loading numbers..."
-                        : numbers.length === 0
-                          ? "No numbers found. Please create a Number first."
-                          : ""
-                    }
-                    {...field}
-                  />
-                </FormControl>
-              </FormItem>
-            )}
-          />
+					<FormField
+						control={form.control}
+						name="numberRef"
+						render={({ field }) => (
+							<FormItem>
+								<FormControl>
+									<Select
+										label="Select Outbound Number"
+										options={numbers.map(({ ref, name }) => ({
+											value: ref,
+											label: name,
+										}))}
+										disabled={isNumbersLoading || numbers.length === 0}
+										placeholder={
+											isNumbersLoading
+												? "Loading numbers..."
+												: numbers.length === 0
+													? "No numbers found. Please create a Number first."
+													: ""
+										}
+										{...field}
+									/>
+								</FormControl>
+							</FormItem>
+						)}
+					/>
 
-          {/* Submit Button */}
-          <Button
-            type="submit"
-            disabled={!form.formState.isValid}
-            isFullWidth
-            size="small"
-          >
-            Save Rule
-          </Button>
-        </FormRoot>
-      </Form>
-    </Modal>
-  );
+					{/* Submit Button */}
+					<Button type="submit" disabled={!form.formState.isValid} isFullWidth size="small">
+						Save Rule
+					</Button>
+				</FormRoot>
+			</Form>
+		</Modal>
+	);
 };

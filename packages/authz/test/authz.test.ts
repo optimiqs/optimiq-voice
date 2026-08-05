@@ -10,9 +10,9 @@ chai.use(sinonChai);
 const sandbox = createSandbox();
 
 describe("@authz", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("needs tests", async function () {});
+	it("needs tests", async function () {});
 });

@@ -9,39 +9,39 @@ chai.use(sinonChai);
 const sandbox = createSandbox();
 
 describe("@api[common/notifications/compileTemplate]", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should compile a template", async function () {
-    // Arrange
-    const { compileTemplate } =
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      require("../../src/notifications/compileTemplate");
+	it("should compile a template", async function () {
+		// Arrange
+		const { compileTemplate } =
+			// eslint-disable-next-line @typescript-eslint/no-var-requires
+			require("../../src/notifications/compileTemplate");
 
-    const fsStub = sandbox.replace(
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      require("fs"),
-      "existsSync",
-      sandbox.stub().returns(true)
-    );
+		const fsStub = sandbox.replace(
+			// eslint-disable-next-line @typescript-eslint/no-var-requires
+			require("fs"),
+			"existsSync",
+			sandbox.stub().returns(true),
+		);
 
-    sandbox.replace(
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      require("fs"),
-      "readFileSync",
-      sandbox.stub().returns("Hello {{name}}!")
-    );
+		sandbox.replace(
+			// eslint-disable-next-line @typescript-eslint/no-var-requires
+			require("fs"),
+			"readFileSync",
+			sandbox.stub().returns("Hello {{name}}!"),
+		);
 
-    // Act
-    const result = compileTemplate({
-      filePath: "path/to/template.hbs",
-      data: { name: "World" }
-    });
+		// Act
+		const result = compileTemplate({
+			filePath: "path/to/template.hbs",
+			data: { name: "World" },
+		});
 
-    // Assert
-    expect(result).to.equal("Hello World!");
-    expect(fsStub).to.have.been.calledOnce;
-    expect(fsStub).to.have.been.calledWith("path/to/template.hbs");
-  });
+		// Assert
+		expect(result).to.equal("Hello World!");
+		expect(fsStub).to.have.been.calledOnce;
+		expect(fsStub).to.have.been.calledWith("path/to/template.hbs");
+	});
 });

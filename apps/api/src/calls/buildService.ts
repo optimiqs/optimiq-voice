@@ -9,23 +9,23 @@ import { getCall } from "./getCall";
 import { listCalls } from "./listCalls";
 
 async function buildService(influxdb: InfluxDBClient) {
-  const callPublisher = await createCallPublisher(NATS_URL);
-  const nc = await connect({ servers: NATS_URL, maxReconnectAttempts: -1 });
+	const callPublisher = await createCallPublisher(NATS_URL);
+	const nc = await connect({ servers: NATS_URL, maxReconnectAttempts: -1 });
 
-  return {
-    definition: {
-      serviceName: "Calls",
-      pckg: "calls",
-      version: "v1beta2",
-      proto: "calls.proto"
-    },
-    handlers: {
-      createCall: createCall(db, callPublisher),
-      listCalls: listCalls(influxdb),
-      getCall: getCall(influxdb),
-      trackCall: createTrackCall(nc)
-    }
-  };
+	return {
+		definition: {
+			serviceName: "Calls",
+			pckg: "calls",
+			version: "v1beta2",
+			proto: "calls.proto",
+		},
+		handlers: {
+			createCall: createCall(db, callPublisher),
+			listCalls: listCalls(influxdb),
+			getCall: getCall(influxdb),
+			trackCall: createTrackCall(nc),
+		},
+	};
 }
 
 export { buildService };

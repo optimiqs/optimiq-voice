@@ -1,9 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  type Application as Resource,
-  type CreateApplicationRequest as ResourceCreateRequest,
-  type ListApplicationsRequest as ResourceListRequest,
-  type UpdateApplicationRequest as ResourceUpdateRequest
+	type Application as Resource,
+	type CreateApplicationRequest as ResourceCreateRequest,
+	type ListApplicationsRequest as ResourceListRequest,
+	type UpdateApplicationRequest as ResourceUpdateRequest,
 } from "@optimiq-voice/types";
 import { useOptimisticDeleteResource } from "~/core/hooks/use-optimistic-delete-resource";
 import { useOptimisticUpdateResource } from "~/core/hooks/use-optimistic-update-resource";
@@ -11,12 +11,12 @@ import { useOptimiqVoice } from "~/core/sdk/hooks/use-optimiq-voice";
 import { useWorkspaceId } from "~/workspaces/hooks/use-workspace-id";
 
 export interface IApplicationTokenResponse {
-  token: string;
-  domain: string;
-  displayName: string;
-  signalingServer: string;
-  targetAor: string;
-  username: string;
+	token: string;
+	domain: string;
+	displayName: string;
+	signalingServer: string;
+	targetAor: string;
+	username: string;
 }
 
 /**
@@ -43,19 +43,19 @@ export const RESOURCE_QUERY_KEY = ["resource:application"];
  * @returns A React Query object containing application data and query metadata.
  */
 export const useApplications = (params?: ResourceListRequest) => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const { data, ...rest } = useQuery({
-    queryKey: [...COLLECTION_QUERY_KEY, workspaceId, params],
-    queryFn: async () => await sdk.applications.listApplications({ ...params })
-  });
+	const { data, ...rest } = useQuery({
+		queryKey: [...COLLECTION_QUERY_KEY, workspaceId, params],
+		queryFn: async () => await sdk.applications.listApplications({ ...params }),
+	});
 
-  return {
-    data: data?.items || [],
-    nextPageToken: data?.nextPageToken,
-    ...rest
-  };
+	return {
+		data: data?.items || [],
+		nextPageToken: data?.nextPageToken,
+		...rest,
+	};
 };
 
 /**
@@ -70,19 +70,19 @@ export const useApplications = (params?: ResourceListRequest) => {
  * @returns A React Query object containing the test token data and metadata.
  */
 export const useApplicationTestToken = () => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  return useQuery({
-    queryKey: ["application-test-tokens", workspaceId],
-    queryFn: async () => {
-      const data = await sdk.applications.createTestToken();
+	return useQuery({
+		queryKey: ["application-test-tokens", workspaceId],
+		queryFn: async () => {
+			const data = await sdk.applications.createTestToken();
 
-      return data as IApplicationTokenResponse;
-    },
-    // 30 minutes
-    staleTime: 30 * 60 * 1000
-  });
+			return data as IApplicationTokenResponse;
+		},
+		// 30 minutes
+		staleTime: 30 * 60 * 1000,
+	});
 };
 
 /**
@@ -99,16 +99,16 @@ export const useApplicationTestToken = () => {
  * @returns A React Query result object containing the application and metadata.
  */
 export const useApplication = (ref: string) => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const { data = null, ...rest } = useQuery({
-    queryKey: [...RESOURCE_QUERY_KEY, workspaceId, ref],
-    queryFn: async () => sdk.applications.getApplication(ref),
-    enabled: !!ref
-  });
+	const { data = null, ...rest } = useQuery({
+		queryKey: [...RESOURCE_QUERY_KEY, workspaceId, ref],
+		queryFn: async () => sdk.applications.getApplication(ref),
+		enabled: !!ref,
+	});
 
-  return { data, ...rest };
+	return { data, ...rest };
 };
 
 /**
@@ -123,20 +123,19 @@ export const useApplication = (ref: string) => {
  * @returns A mutation object that can be used to trigger the creation.
  */
 export const useCreateApplication = () => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
-  const queryClient = useQueryClient();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
+	const queryClient = useQueryClient();
 
-  const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
+	const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
 
-  return useMutation({
-    mutationFn: (req: ResourceCreateRequest) =>
-      sdk.applications.createApplication(req),
-    onSuccess: () => {
-      // Invalidate the collection query to refresh the list
-      queryClient.invalidateQueries({ queryKey: COLLECTION_KEY });
-    }
-  });
+	return useMutation({
+		mutationFn: (req: ResourceCreateRequest) => sdk.applications.createApplication(req),
+		onSuccess: () => {
+			// Invalidate the collection query to refresh the list
+			queryClient.invalidateQueries({ queryKey: COLLECTION_KEY });
+		},
+	});
 };
 
 /**
@@ -151,17 +150,17 @@ export const useCreateApplication = () => {
  * @returns A mutation object for updating an application.
  */
 export const useUpdateApplication = () => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
-  const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
+	const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
+	const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
 
-  return useOptimisticUpdateResource<Resource, ResourceUpdateRequest>(
-    (req) => sdk.applications.updateApplication(req),
-    COLLECTION_KEY,
-    RESOURCE_KEY
-  );
+	return useOptimisticUpdateResource<Resource, ResourceUpdateRequest>(
+		(req) => sdk.applications.updateApplication(req),
+		COLLECTION_KEY,
+		RESOURCE_KEY,
+	);
 };
 
 /**
@@ -175,15 +174,15 @@ export const useUpdateApplication = () => {
  * @returns A mutation object for deleting an application.
  */
 export const useDeleteApplication = () => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
-  const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
+	const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
+	const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
 
-  return useOptimisticDeleteResource(
-    (ref) => sdk.applications.deleteApplication(ref),
-    COLLECTION_KEY,
-    RESOURCE_KEY
-  );
+	return useOptimisticDeleteResource(
+		(ref) => sdk.applications.deleteApplication(ref),
+		COLLECTION_KEY,
+		RESOURCE_KEY,
+	);
 };

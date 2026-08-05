@@ -2,100 +2,100 @@ import { FormControl, Select } from "@mui/material";
 import { styled } from "@mui/material/styles";
 
 export const SelectRoot = styled(Select)(({ theme }) => ({
-  "&.MuiInputBase-root, &.MuiOutlinedInput-root, &.MuiSelect-root": {
-    backgroundColor: "transparent"
-  },
-  "& .MuiInputBase-root": {
-    minHeight: "42px",
-    height: "auto",
-    backgroundColor: "transparent"
-  },
-  "& .MuiOutlinedInput-input": {
-    backgroundColor: "transparent",
-    padding: "16.5px 14px"
-  },
-  "& .MuiSelect-select": {
-    backgroundColor: "transparent",
-    minHeight: "24px !important",
-    fontSize: "12px",
-    fontFamily: "'Poppins', sans-serif",
-    fontWeight: 400,
-    lineHeight: "normal",
-    letterSpacing: "0.12px",
-    display: "flex",
-    alignItems: "center",
-    flexWrap: "wrap",
-    gap: "4px",
-    padding: "8px 14px",
-    "& .MuiChip-root": {
-      margin: "2px",
-      pointerEvents: "auto",
-      "& .MuiChip-deleteIcon": {
-        pointerEvents: "auto",
-        cursor: "pointer",
-        "&:hover": {
-          color: theme.palette.error.main
-        }
-      }
-    }
-  },
-  "& .MuiOutlinedInput-notchedOutline": {
-    borderColor: theme.palette.base["05"],
-    borderWidth: "1px",
-    borderRadius: "4px"
-  },
-  "&:hover .MuiOutlinedInput-notchedOutline": {
-    borderColor: theme.palette.brand.main
-  },
-  "&.Mui-focused .MuiOutlinedInput-notchedOutline": {
-    borderColor: theme.palette.brand.main,
-    borderWidth: "2px"
-  },
-  "& .MuiInputLabel-root": {
-    transform: "translate(14px, 16px) scale(1)",
-    fontFamily: "'Poppins', sans-serif",
-    fontWeight: 500,
-    color: theme.palette.brand.main,
-    "&.MuiInputLabel-shrink": {
-      transform: "translate(14px, -9px) scale(0.75)"
-    }
-  },
-  "&.Mui-focused .MuiInputLabel-root": {
-    color: theme.palette.brand.main
-  },
-  "& + .MuiMenu-paper": {
-    marginTop: "4px",
-    "& .MuiMenuItem-root": {
-      fontSize: "12px",
-      fontFamily: "'Poppins', sans-serif",
-      padding: "6px 14px",
-      minHeight: "32px"
-    }
-  },
-  "& .MuiFormHelperText-root": {
-    fontFamily: "'Poppins', sans-serif",
-    fontSize: "10px",
-    fontWeight: 500,
-    lineHeight: "normal",
-    letterSpacing: "0.12px",
-    marginTop: "4px",
-    marginLeft: "3px",
-    color: theme.palette.brand.main
-  },
-  "& .MuiInputAdornment-root": {
-    color: theme.palette.brand.main,
-    marginRight: "8px",
-    "& .MuiSvgIcon-root": {
-      fontSize: "20px"
-    }
-  }
+	"&.MuiInputBase-root, &.MuiOutlinedInput-root, &.MuiSelect-root": {
+		backgroundColor: "transparent",
+	},
+	"& .MuiInputBase-root": {
+		minHeight: "42px",
+		height: "auto",
+		backgroundColor: "transparent",
+	},
+	"& .MuiOutlinedInput-input": {
+		backgroundColor: "transparent",
+		padding: "16.5px 14px",
+	},
+	"& .MuiSelect-select": {
+		backgroundColor: "transparent",
+		minHeight: "24px !important",
+		fontSize: "12px",
+		fontFamily: "'Poppins', sans-serif",
+		fontWeight: 400,
+		lineHeight: "normal",
+		letterSpacing: "0.12px",
+		display: "flex",
+		alignItems: "center",
+		flexWrap: "wrap",
+		gap: "4px",
+		padding: "8px 14px",
+		"& .MuiChip-root": {
+			margin: "2px",
+			pointerEvents: "auto",
+			"& .MuiChip-deleteIcon": {
+				pointerEvents: "auto",
+				cursor: "pointer",
+				"&:hover": {
+					color: theme.palette.error.main,
+				},
+			},
+		},
+	},
+	"& .MuiOutlinedInput-notchedOutline": {
+		borderColor: theme.palette.base["05"],
+		borderWidth: "1px",
+		borderRadius: "4px",
+	},
+	"&:hover .MuiOutlinedInput-notchedOutline": {
+		borderColor: theme.palette.brand.main,
+	},
+	"&.Mui-focused .MuiOutlinedInput-notchedOutline": {
+		borderColor: theme.palette.brand.main,
+		borderWidth: "2px",
+	},
+	"& .MuiInputLabel-root": {
+		transform: "translate(14px, 16px) scale(1)",
+		fontFamily: "'Poppins', sans-serif",
+		fontWeight: 500,
+		color: theme.palette.brand.main,
+		"&.MuiInputLabel-shrink": {
+			transform: "translate(14px, -9px) scale(0.75)",
+		},
+	},
+	"&.Mui-focused .MuiInputLabel-root": {
+		color: theme.palette.brand.main,
+	},
+	"& + .MuiMenu-paper": {
+		marginTop: "4px",
+		"& .MuiMenuItem-root": {
+			fontSize: "12px",
+			fontFamily: "'Poppins', sans-serif",
+			padding: "6px 14px",
+			minHeight: "32px",
+		},
+	},
+	"& .MuiFormHelperText-root": {
+		fontFamily: "'Poppins', sans-serif",
+		fontSize: "10px",
+		fontWeight: 500,
+		lineHeight: "normal",
+		letterSpacing: "0.12px",
+		marginTop: "4px",
+		marginLeft: "3px",
+		color: theme.palette.brand.main,
+	},
+	"& .MuiInputAdornment-root": {
+		color: theme.palette.brand.main,
+		marginRight: "8px",
+		"& .MuiSvgIcon-root": {
+			fontSize: "20px",
+		},
+	},
 }));
 
 export const StyledFormControl = styled(FormControl)(({ theme }) => ({
-  "& .MuiInputLabel-root": {
-    color: theme.palette.text.primary
-  },
-  "& .MuiFormHelperText-root": {
-    color: theme.palette.text.secondary
-  }
+	"& .MuiInputLabel-root": {
+		color: theme.palette.text.primary,
+	},
+	"& .MuiFormHelperText-root": {
+		color: theme.palette.text.secondary,
+	},
 }));

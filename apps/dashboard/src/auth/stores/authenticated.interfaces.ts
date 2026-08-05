@@ -6,26 +6,26 @@ import type { Workspace } from "@optimiq-voice/types";
  * Represents an authenticated user in the application.
  */
 export interface AuthenticatedUser {
-  /**
-   * Unique identifier for the user.
-   */
-  id: string;
+	/**
+	 * Unique identifier for the user.
+	 */
+	id: string;
 
-  /**
-   * Full name of the user.
-   */
-  name: string;
+	/**
+	 * Full name of the user.
+	 */
+	name: string;
 
-  /**
-   * Email address of the user.
-   */
-  email: string;
+	/**
+	 * Email address of the user.
+	 */
+	email: string;
 
-  /**
-   * Optional avatar URL for the user.
-   * This can be used to display a profile picture in the UI.
-   */
-  avatar?: string;
+	/**
+	 * Optional avatar URL for the user.
+	 * This can be used to display a profile picture in the UI.
+	 */
+	avatar?: string;
 }
 
 /**
@@ -35,26 +35,26 @@ export interface AuthenticatedUser {
  * throughout the application after authentication has occurred.
  */
 export interface AuthenticatedProviderProps {
-  /**
-   * React children to render within the provider.
-   */
-  children: React.ReactNode;
+	/**
+	 * React children to render within the provider.
+	 */
+	children: React.ReactNode;
 
-  /**
-   * If the user is first logging in, this prop can be used to set the initial
-   * cookie session. This is useful for initializing the session state before
-   * the user is fully authenticated.
-   *
-   * @defaultValue undefined
-   *
-   * @example
-   * ```tsx
-   * <AuthenticatedProvider initialSession={{ refreshToken: "abc123" }}>
-   *   <App />
-   * </AuthenticatedProvider>
-   * ```
-   */
-  initialSession?: CookieSession;
+	/**
+	 * If the user is first logging in, this prop can be used to set the initial
+	 * cookie session. This is useful for initializing the session state before
+	 * the user is fully authenticated.
+	 *
+	 * @defaultValue undefined
+	 *
+	 * @example
+	 * ```tsx
+	 * <AuthenticatedProvider initialSession={{ refreshToken: "abc123" }}>
+	 *   <App />
+	 * </AuthenticatedProvider>
+	 * ```
+	 */
+	initialSession?: CookieSession;
 }
 
 /**
@@ -62,42 +62,42 @@ export interface AuthenticatedProviderProps {
  * workspace-related state and utilities.
  */
 export interface AuthenticatedContextValue {
-  /**
-   * The currently authenticated user.
-   */
-  user: AuthenticatedUser | null;
+	/**
+	 * The currently authenticated user.
+	 */
+	user: AuthenticatedUser | null;
 
-  /**
-   * Function to update the authenticated user in the context.
-   *
-   * @param user - The new user object to set.
-   */
-  setUser: (user: AuthenticatedUser) => void;
+	/**
+	 * Function to update the authenticated user in the context.
+	 *
+	 * @param user - The new user object to set.
+	 */
+	setUser: (user: AuthenticatedUser) => void;
 
-  /**
-   * List of workspaces available to the user.
-   */
-  workspaces: Workspace[];
+	/**
+	 * List of workspaces available to the user.
+	 */
+	workspaces: Workspace[];
 
-  /**
-   * The currently selected workspace in the application context.
-   */
-  currentWorkspace: Workspace | null;
+	/**
+	 * The currently selected workspace in the application context.
+	 */
+	currentWorkspace: Workspace | null;
 
-  /**
-   * Function to change the currently selected workspace.
-   *
-   * @param workspace - The workspace to set as current.
-   */
-  setCurrentWorkspace: (workspace: Workspace) => void;
+	/**
+	 * Function to change the currently selected workspace.
+	 *
+	 * @param workspace - The workspace to set as current.
+	 */
+	setCurrentWorkspace: (workspace: Workspace) => void;
 
-  /**
-   * Callback function to handle changes in the current workspace.
-   *
-   * This is typically used to trigger side effects or updates when the
-   * workspace changes, such as re-fetching data or updating UI components.
-   *
-   * @param workspaceId - The ID of the workspace that has changed.
-   */
-  onWorkspaceChange: (workspaceId: string) => void;
+	/**
+	 * Callback function to handle changes in the current workspace.
+	 *
+	 * This is typically used to trigger side effects or updates when the
+	 * workspace changes, such as re-fetching data or updating UI components.
+	 *
+	 * @param workspaceId - The ID of the workspace that has changed.
+	 */
+	onWorkspaceChange: (workspaceId: string) => void;
 }

@@ -8,8 +8,8 @@ import { CreateWorkspaceForm } from "./create-workspace.form";
  * @property {() => void} onClose - Function to close the modal.
  */
 export interface ModalProps {
-  isOpen: boolean;
-  onClose: () => void;
+	isOpen: boolean;
+	onClose: () => void;
 }
 
 /**
@@ -22,9 +22,9 @@ export interface ModalProps {
  * @returns {JSX.Element} The rendered modal with the workspace creation form.
  */
 export const CreateWorkspaceModal = ({ isOpen, onClose }: ModalProps) => {
-  return (
-    <Modal open={isOpen} onClose={onClose} title="Create workspace">
-      <CreateWorkspaceForm onFormSubmit={onClose} />
-    </Modal>
-  );
+	return (
+		<Modal open={isOpen} onClose={onClose} title="Create workspace">
+			<CreateWorkspaceForm onFormSubmit={onClose} />
+		</Modal>
+	);
 };

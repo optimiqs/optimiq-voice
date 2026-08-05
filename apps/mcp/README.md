@@ -60,17 +60,17 @@ Add the following to your `claude_desktop_config.json`:
 
 ```json
 {
-  "mcpServers": {
-    "optimiq-voice": {
-      "command": "npx",
-      "args": ["-y", "@optimiq-voice/mcp"],
-      "env": {
-        "MCP_WORKSPACE_ACCESS_KEY_ID": "your-workspace-access-key-id",
-        "MCP_APIKEY_ACCESS_KEY_ID": "your-apikey-access-key-id",
-        "MCP_APIKEY_ACCESS_KEY_SECRET": "your-apikey-access-key-secret"
-      }
-    }
-  }
+	"mcpServers": {
+		"optimiq-voice": {
+			"command": "npx",
+			"args": ["-y", "@optimiq-voice/mcp"],
+			"env": {
+				"MCP_WORKSPACE_ACCESS_KEY_ID": "your-workspace-access-key-id",
+				"MCP_APIKEY_ACCESS_KEY_ID": "your-apikey-access-key-id",
+				"MCP_APIKEY_ACCESS_KEY_SECRET": "your-apikey-access-key-secret"
+			}
+		}
+	}
 }
 ```
 
@@ -78,28 +78,28 @@ Add the following to your `claude_desktop_config.json`:
 
 ```json
 {
-  "mcpServers": {
-    "optimiq-voice": {
-      "command": "docker",
-      "args": [
-        "run",
-        "-i",
-        "--rm",
-        "-e",
-        "MCP_WORKSPACE_ACCESS_KEY_ID",
-        "-e",
-        "MCP_APIKEY_ACCESS_KEY_ID",
-        "-e",
-        "MCP_APIKEY_ACCESS_KEY_SECRET",
-        "optimiq-voice/mcp"
-      ],
-      "env": {
-        "MCP_WORKSPACE_ACCESS_KEY_ID": "your-workspace-access-key-id",
-        "MCP_APIKEY_ACCESS_KEY_ID": "your-apikey-access-key-id",
-        "MCP_APIKEY_ACCESS_KEY_SECRET": "your-apikey-access-key-secret"
-      }
-    }
-  }
+	"mcpServers": {
+		"optimiq-voice": {
+			"command": "docker",
+			"args": [
+				"run",
+				"-i",
+				"--rm",
+				"-e",
+				"MCP_WORKSPACE_ACCESS_KEY_ID",
+				"-e",
+				"MCP_APIKEY_ACCESS_KEY_ID",
+				"-e",
+				"MCP_APIKEY_ACCESS_KEY_SECRET",
+				"optimiq-voice/mcp"
+			],
+			"env": {
+				"MCP_WORKSPACE_ACCESS_KEY_ID": "your-workspace-access-key-id",
+				"MCP_APIKEY_ACCESS_KEY_ID": "your-apikey-access-key-id",
+				"MCP_APIKEY_ACCESS_KEY_SECRET": "your-apikey-access-key-secret"
+			}
+		}
+	}
 }
 ```
 

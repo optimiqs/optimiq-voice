@@ -10,44 +10,44 @@ import { useWorkspaceId } from "~/workspaces/hooks/use-workspace-id";
  * Displays the page title, description, and a button to create a new domain.
  */
 export function DomainsPageHeader() {
-  /** Provides navigation functionality from react-router. */
-  const navigate = useNavigate();
+	/** Provides navigation functionality from react-router. */
+	const navigate = useNavigate();
 
-  /** Retrieves the current workspace ID from context or hook. */
-  const workspaceId = useWorkspaceId();
+	/** Retrieves the current workspace ID from context or hook. */
+	const workspaceId = useWorkspaceId();
 
-  /**
-   * Navigates to the domain creation page for the current workspace.
-   * Wrapped in useCallback for memoization and performance optimization.
-   */
-  const onCreateNewDomain = useCallback(() => {
-    navigate(`/workspaces/${workspaceId}/sip-network/domains/create`, {
-      viewTransition: true // Enables smooth page transition animations
-    });
-  }, [navigate, workspaceId]);
+	/**
+	 * Navigates to the domain creation page for the current workspace.
+	 * Wrapped in useCallback for memoization and performance optimization.
+	 */
+	const onCreateNewDomain = useCallback(() => {
+		navigate(`/workspaces/${workspaceId}/sip-network/domains/create`, {
+			viewTransition: true, // Enables smooth page transition animations
+		});
+	}, [navigate, workspaceId]);
 
-  return (
-    <PageHeader
-      title="Domains"
-      description="Group SIP Agents under a domain (e.g., office, home) to simplify internal VoIP routing."
-      actions={
-        <Button
-          variant="outlined"
-          size="small"
-          onClick={onCreateNewDomain}
-          endIcon={
-            <Icon
-              name="Add"
-              sx={{
-                fontSize: "16px !important",
-                color: "inherit"
-              }}
-            />
-          }
-        >
-          Create New Domain
-        </Button>
-      }
-    />
-  );
+	return (
+		<PageHeader
+			title="Domains"
+			description="Group SIP Agents under a domain (e.g., office, home) to simplify internal VoIP routing."
+			actions={
+				<Button
+					variant="outlined"
+					size="small"
+					onClick={onCreateNewDomain}
+					endIcon={
+						<Icon
+							name="Add"
+							sx={{
+								fontSize: "16px !important",
+								color: "inherit",
+							}}
+						/>
+					}
+				>
+					Create New Domain
+				</Button>
+			}
+		/>
+	);
 }

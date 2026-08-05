@@ -1,27 +1,27 @@
 {
-  "name": "@optimiq-voice/logger",
-  "version": "0.22.0",
-  "description": "Logger module",
-  "license": "MIT",
-  "main": "dist/index",
-  "types": "dist/index",
-  "scripts": {
-    "prebuild": "rimraf ./dist tsconfig.tsbuildinfo",
-    "build": "tsc -b tsconfig.json"
-  },
-  "directories": {
-    "src": "src",
-    "test": "test"
-  },
-  "files": [
-    "dist"
-  ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/optimiqs/optimiq-voice.git"
-  },
-  "dependencies": {
-    "fluent-logger": "3.4.1",
-    "winston": "3.19.0"
-  }
+	"name": "@optimiq-voice/logger",
+	"version": "0.22.0",
+	"description": "Logger module",
+	"license": "MIT",
+	"main": "dist/index",
+	"types": "dist/index",
+	"scripts": {
+		"prebuild": "rimraf ./dist tsconfig.tsbuildinfo",
+		"build": "tsc -b tsconfig.json"
+	},
+	"directories": {
+		"src": "src",
+		"test": "test"
+	},
+	"files": [
+		"dist"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/optimiqs/optimiq-voice.git"
+	},
+	"dependencies": {
+		"fluent-logger": "3.4.1",
+		"winston": "3.19.0"
+	}
 }

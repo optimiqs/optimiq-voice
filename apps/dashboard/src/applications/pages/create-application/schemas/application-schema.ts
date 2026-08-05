@@ -7,50 +7,47 @@ import { languageModelConfigSchema } from "./language-model-config-schema";
 import type { UseFormReturn } from "react-hook-form";
 
 export const schema = z
-  .object({
-    ref: z.string().nullish(),
-    name: z.string().nonempty(),
-    type: z.nativeEnum(ApplicationType),
-    endpoint: z.string().optional(),
-    textToSpeech: z
-      .object({
-        productRef: z.string(),
-        config: z.object({
-          voice: z.string().optional()
-        })
-      })
-      .optional(),
-    speechToText: z
-      .object({
-        productRef: z.string(),
-        config: z.object({
-          model: z.string(),
-          languageCode: z.string()
-        })
-      })
-      .optional(),
-    intelligence: z
-      .object({
-        productRef: z.string(),
-        config: z.object({
-          conversationSettings: conversationSettingsSchema,
-          languageModel: languageModelConfigSchema,
-          eventsHook: eventsHookSchema.optional()
-        })
-      })
-      .optional()
-  })
-  // For AUTOPILOT applications, textToSpeech and speechToText are required
-  .refine(
-    (data) =>
-      !(
-        data.type === ApplicationType.AUTOPILOT &&
-        (!data.textToSpeech || !data.speechToText)
-      ),
-    {
-      message: "TTS and STT are required for AUTOPILOT"
-    }
-  );
+	.object({
+		ref: z.string().nullish(),
+		name: z.string().nonempty(),
+		type: z.nativeEnum(ApplicationType),
+		endpoint: z.string().optional(),
+		textToSpeech: z
+			.object({
+				productRef: z.string(),
+				config: z.object({
+					voice: z.string().optional(),
+				}),
+			})
+			.optional(),
+		speechToText: z
+			.object({
+				productRef: z.string(),
+				config: z.object({
+					model: z.string(),
+					languageCode: z.string(),
+				}),
+			})
+			.optional(),
+		intelligence: z
+			.object({
+				productRef: z.string(),
+				config: z.object({
+					conversationSettings: conversationSettingsSchema,
+					languageModel: languageModelConfigSchema,
+					eventsHook: eventsHookSchema.optional(),
+				}),
+			})
+			.optional(),
+	})
+	// For AUTOPILOT applications, textToSpeech and speechToText are required
+	.refine(
+		(data) =>
+			!(data.type === ApplicationType.AUTOPILOT && (!data.textToSpeech || !data.speechToText)),
+		{
+			message: "TTS and STT are required for AUTOPILOT",
+		},
+	);
 
 /** Resolver to integrate Zod schema validation with React Hook Form. */
 export const resolver = zodResolver(schema);

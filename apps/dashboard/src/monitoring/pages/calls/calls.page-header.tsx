@@ -15,10 +15,10 @@ import type { CallDetailRecord } from "@optimiq-voice/types";
  * - Output filename
  */
 const csvConfig = mkConfig({
-  fieldSeparator: ",",
-  decimalSeparator: ".",
-  useKeysAsHeaders: true,
-  filename: "optimiq-voice-call-logs"
+	fieldSeparator: ",",
+	decimalSeparator: ".",
+	useKeysAsHeaders: true,
+	filename: "optimiq-voice-call-logs",
 });
 
 /**
@@ -33,63 +33,51 @@ const csvConfig = mkConfig({
  * @returns {JSX.Element} The rendered page header component.
  */
 export function CallsPageHeader({
-  data,
-  isLoading
+	data,
+	isLoading,
 }: {
-  data: CallDetailRecord[];
-  isLoading: boolean;
+	data: CallDetailRecord[];
+	isLoading: boolean;
 }) {
-  /**
-   * Handles exporting the call logs as a CSV file.
-   *
-   * - Normalizes date fields to ISO strings.
-   * - Generates a CSV using the configured options.
-   * - Initiates download of the generated CSV file.
-   * - Displays a toast if there are no call logs to export.
-   */
-  const handleExportData = useCallback(() => {
-    if (!data || data.length === 0) {
-      toast(
-        "Oops! No call logs to export. Start making calls to generate logs."
-      );
-      return;
-    }
+	/**
+	 * Handles exporting the call logs as a CSV file.
+	 *
+	 * - Normalizes date fields to ISO strings.
+	 * - Generates a CSV using the configured options.
+	 * - Initiates download of the generated CSV file.
+	 * - Displays a toast if there are no call logs to export.
+	 */
+	const handleExportData = useCallback(() => {
+		if (!data || data.length === 0) {
+			toast("Oops! No call logs to export. Start making calls to generate logs.");
+			return;
+		}
 
-    // Normalize date fields to ISO strings to ensure consistency in the exported CSV.
-    const normalizedData = data.map((record) => ({
-      ...record,
-      startedAt:
-        record.startedAt instanceof Date
-          ? record.startedAt.toISOString()
-          : record.startedAt,
-      endedAt:
-        record.endedAt instanceof Date
-          ? record.endedAt.toISOString()
-          : record.endedAt
-    }));
+		// Normalize date fields to ISO strings to ensure consistency in the exported CSV.
+		const normalizedData = data.map((record) => ({
+			...record,
+			startedAt:
+				record.startedAt instanceof Date ? record.startedAt.toISOString() : record.startedAt,
+			endedAt: record.endedAt instanceof Date ? record.endedAt.toISOString() : record.endedAt,
+		}));
 
-    // Generate and download the CSV file.
-    const csv = generateCsv(csvConfig)(normalizedData);
-    download(csvConfig)(csv);
-  }, [data]);
+		// Generate and download the CSV file.
+		const csv = generateCsv(csvConfig)(normalizedData);
+		download(csvConfig)(csv);
+	}, [data]);
 
-  /**
-   * Renders the page header component.
-   */
-  return (
-    <PageHeader
-      title="Monitoring / Call Logs"
-      description="View and inspect call logs generated in this workspace."
-      actions={
-        <Button
-          variant="outlined"
-          size="small"
-          onClick={handleExportData}
-          disabled={isLoading}
-        >
-          {isLoading ? "Loading calls..." : "Export to CSV"}
-        </Button>
-      }
-    />
-  );
+	/**
+	 * Renders the page header component.
+	 */
+	return (
+		<PageHeader
+			title="Monitoring / Call Logs"
+			description="View and inspect call logs generated in this workspace."
+			actions={
+				<Button variant="outlined" size="small" onClick={handleExportData} disabled={isLoading}>
+					{isLoading ? "Loading calls..." : "Export to CSV"}
+				</Button>
+			}
+		/>
+	);
 }

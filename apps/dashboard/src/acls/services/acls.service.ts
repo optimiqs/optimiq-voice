@@ -1,9 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
 import {
-  type Acl as Resource,
-  type CreateAclRequest as ResourceCreateRequest,
-  type ListAclsRequest as ResourceListRequest,
-  type UpdateAclRequest as ResourceUpdateRequest
+	type Acl as Resource,
+	type CreateAclRequest as ResourceCreateRequest,
+	type ListAclsRequest as ResourceListRequest,
+	type UpdateAclRequest as ResourceUpdateRequest,
 } from "@optimiq-voice/types";
 import { useOptimisticCreateResource } from "~/core/hooks/use-optimistic-create-resource";
 import { useOptimisticDeleteResource } from "~/core/hooks/use-optimistic-delete-resource";
@@ -35,19 +35,19 @@ export const RESOURCE_QUERY_KEY = ["resource:acl"];
  * @returns A React Query object containing acl data and query metadata.
  */
 export const useAcls = (params?: ResourceListRequest) => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const { data, ...rest } = useQuery({
-    queryKey: [...COLLECTION_QUERY_KEY, workspaceId, params],
-    queryFn: async () => await sdk.acls.listAcls({ ...params })
-  });
+	const { data, ...rest } = useQuery({
+		queryKey: [...COLLECTION_QUERY_KEY, workspaceId, params],
+		queryFn: async () => await sdk.acls.listAcls({ ...params }),
+	});
 
-  return {
-    data: data?.items || [],
-    nextPageToken: data?.nextPageToken,
-    ...rest
-  };
+	return {
+		data: data?.items || [],
+		nextPageToken: data?.nextPageToken,
+		...rest,
+	};
 };
 
 /**
@@ -64,16 +64,16 @@ export const useAcls = (params?: ResourceListRequest) => {
  * @returns A React Query result object containing the acl and metadata.
  */
 export const useAcl = (ref: string) => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const { data = null, ...rest } = useQuery({
-    queryKey: [...RESOURCE_QUERY_KEY, workspaceId, ref],
-    queryFn: async () => sdk.acls.getAcl(ref),
-    enabled: !!ref
-  });
+	const { data = null, ...rest } = useQuery({
+		queryKey: [...RESOURCE_QUERY_KEY, workspaceId, ref],
+		queryFn: async () => sdk.acls.getAcl(ref),
+		enabled: !!ref,
+	});
 
-  return { data, ...rest };
+	return { data, ...rest };
 };
 
 /**
@@ -88,16 +88,17 @@ export const useAcl = (ref: string) => {
  * @returns A mutation object that can be used to trigger the creation.
  */
 export const useCreateAcl = () => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
-  const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
+	const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
+	const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
 
-  return useOptimisticCreateResource<
-    Resource,
-    ResourceCreateRequest & { deny: string[] }
-  >((req) => sdk.acls.createAcl(req), COLLECTION_KEY, RESOURCE_KEY);
+	return useOptimisticCreateResource<Resource, ResourceCreateRequest & { deny: string[] }>(
+		(req) => sdk.acls.createAcl(req),
+		COLLECTION_KEY,
+		RESOURCE_KEY,
+	);
 };
 
 /**
@@ -112,17 +113,17 @@ export const useCreateAcl = () => {
  * @returns A mutation object for updating an acl.
  */
 export const useUpdateAcl = () => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
-  const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
+	const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
+	const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
 
-  return useOptimisticUpdateResource<Resource, ResourceUpdateRequest>(
-    (req) => sdk.acls.updateAcl(req),
-    COLLECTION_KEY,
-    RESOURCE_KEY
-  );
+	return useOptimisticUpdateResource<Resource, ResourceUpdateRequest>(
+		(req) => sdk.acls.updateAcl(req),
+		COLLECTION_KEY,
+		RESOURCE_KEY,
+	);
 };
 
 /**
@@ -136,15 +137,15 @@ export const useUpdateAcl = () => {
  * @returns A mutation object for deleting an acl.
  */
 export const useDeleteAcl = () => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
-  const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
+	const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
+	const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
 
-  return useOptimisticDeleteResource(
-    (ref) => sdk.acls.deleteAcl(ref),
-    COLLECTION_KEY,
-    RESOURCE_KEY
-  );
+	return useOptimisticDeleteResource(
+		(ref) => sdk.acls.deleteAcl(ref),
+		COLLECTION_KEY,
+		RESOURCE_KEY,
+	);
 };

@@ -179,8 +179,8 @@ intelligence:
           description: Test inquiry about types of accounts available
           telephonyContext:
             callDirection: FROM_PSTN
-            ingressNumber: '+18091234567'
-            callerNumber: '+18091234567'
+            ingressNumber: "+18091234567"
+            callerNumber: "+18091234567"
           conversation:
             - userInput: "Hola, me gustaría saber qué tipos de cuentas tienen"
               expected:
@@ -192,78 +192,78 @@ intelligence:
                 text:
                   type: SIMILAR
                   response: "La Cuenta de Ahorro en US$ es ideal para ahorrar en dólares estadounidenses. Es perfecta para quienes reciben remesas o tienen ingresos en divisas. Permite realizar depósitos y retiros en dólares, y genera intereses sobre el saldo. También incluye acceso a Banco Vimenca en Línea y todos nuestros servicios digitales. ¿Te gustaría saber más sobre los requisitos para abrirla?"
-        
+
         - ref: savings-account-benefits
           description: Test inquiry about savings account benefits
           telephonyContext:
             callDirection: FROM_PSTN
-            ingressNumber: '+18091234567'
-            callerNumber: '+18091234567'
+            ingressNumber: "+18091234567"
+            callerNumber: "+18091234567"
           conversation:
             - userInput: "¿Qué beneficios tiene la cuenta de ahorro en pesos?"
               expected:
                 text:
                   type: SIMILAR
                   response: "La Cuenta de Ahorro en RD$ es ideal para ahorrar dinero en pesos dominicanos. Permite realizar depósitos y retiros, genera intereses sobre el saldo, y te da acceso a Banco Vimenca en Línea, pagos y transferencias vía LBTR y ACH, y todos nuestros servicios digitales. ¿Te gustaría saber más sobre esta cuenta?"
-        
+
         - ref: account-requirements-inquiry
           description: Test inquiry about account opening requirements
           telephonyContext:
             callDirection: FROM_PSTN
-            ingressNumber: '+18091234567'
-            callerNumber: '+18091234567'
+            ingressNumber: "+18091234567"
+            callerNumber: "+18091234567"
           conversation:
             - userInput: "¿Qué necesito para abrir una cuenta de ahorro?"
               expected:
                 text:
                   type: SIMILAR
                   response: "Para abrir una Cuenta de Ahorro en Banco Vimenca, generalmente necesitas tu cédula de identidad, comprobante de ingresos o referencias, un depósito inicial, y completar la información personal requerida. Los requisitos específicos y el monto del depósito inicial pueden variar. Te recomiendo contactar directamente a Banco Vimenca al 809-533-1400 o visitar una de nuestras sucursales para obtener información detallada y actualizada. ¿Hay algo más sobre Banca Personal en lo que pueda ayudarte?"
-        
+
         - ref: account-comparison
           description: Test comparison between different account types
           telephonyContext:
             callDirection: FROM_PSTN
-            ingressNumber: '+18091234567'
-            callerNumber: '+18091234567'
+            ingressNumber: "+18091234567"
+            callerNumber: "+18091234567"
           conversation:
             - userInput: "¿Cuál es la diferencia entre cuenta corriente y cuenta de ahorro?"
               expected:
                 text:
                   type: SIMILAR
                   response: "La Cuenta de Ahorro está diseñada principalmente para ahorrar dinero y generar intereses sobre el saldo. La Cuenta Corriente es ideal para realizar transacciones diarias, manejar pagos y recibir depósitos, con acceso a cheques y servicios bancarios básicos. ¿Te gustaría saber más sobre alguna de estas opciones?"
-        
+
         - ref: certificate-of-deposit-inquiry
           description: Test inquiry about certificates of deposit
           telephonyContext:
             callDirection: FROM_PSTN
-            ingressNumber: '+18091234567'
-            callerNumber: '+18091234567'
+            ingressNumber: "+18091234567"
+            callerNumber: "+18091234567"
           conversation:
             - userInput: "¿Qué son los certificados de depósito?"
               expected:
                 text:
                   type: SIMILAR
                   response: "Los Certificados de Depósito son productos de inversión a plazo fijo que ofrecemos en pesos dominicanos y dólares estadounidenses. Ofrecen tasas de interés fijas y son ideales para inversiones a mediano y largo plazo. Los plazos pueden variar según el monto y las condiciones. ¿Te gustaría saber más sobre este producto?"
-        
+
         - ref: account-balance-redirection
           description: Test redirection for account balance inquiry
           telephonyContext:
             callDirection: FROM_PSTN
-            ingressNumber: '+18091234567'
-            callerNumber: '+18091234567'
+            ingressNumber: "+18091234567"
+            callerNumber: "+18091234567"
           conversation:
             - userInput: "Quiero consultar el balance de mi cuenta"
               expected:
                 text:
                   type: SIMILAR
                   response: "Para consultar el balance de tu cuenta existente, te recomiendo acceder a Banco Vimenca en Línea o contactar al servicio al cliente al 809-533-1400. ¿Hay algo más sobre Banca Personal en lo que pueda ayudarte?"
-        
+
         - ref: conversation-termination
           description: Test proper conversation termination
           telephonyContext:
             callDirection: FROM_PSTN
-            ingressNumber: '+18091234567'
-            callerNumber: '+18091234567'
+            ingressNumber: "+18091234567"
+            callerNumber: "+18091234567"
           conversation:
             - userInput: "Hola, ¿puedes ayudarme?"
               expected:
@@ -278,4 +278,3 @@ intelligence:
                 tools:
                   - tool: hangup
                     parameters: {}
-

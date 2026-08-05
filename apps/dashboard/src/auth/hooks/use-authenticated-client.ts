@@ -14,37 +14,37 @@ import type { CookieSession } from "../services/sessions/session.interfaces";
  * @returns {OptimiqVoiceClient} - The authenticated Optimiq Voice client instance.
  */
 export const useAuthenticatedClient = (initialSession?: CookieSession) => {
-  /** Retrieves the Optimiq Voice client and the authenticate method from the hook. */
-  const { client, authenticate } = useOptimiqVoice();
+	/** Retrieves the Optimiq Voice client and the authenticate method from the hook. */
+	const { client, authenticate } = useOptimiqVoice();
 
-  /** Navigation hook to redirect the user if authentication fails. */
-  const navigate = useNavigate();
+	/** Navigation hook to redirect the user if authentication fails. */
+	const navigate = useNavigate();
 
-  /**
-   * Attempts to authenticate the client using the initial session if no ID token is present.
-   *
-   * This runs only when the initial session or client changes, ensuring that
-   * the client is authenticated when a valid session is provided.
-   */
-  useEffect(() => {
-    if (initialSession && !client.getIdToken()) {
-      authenticate(initialSession)
-        .then(() => {
-          Logger.debug(
-            "[useAuthenticatedClient()] Client authenticated successfully with initial session."
-          );
-        })
-        .catch((error) => {
-          Logger.error(
-            "[useAuthenticatedClient()] Failed to authenticate client with initial session:",
-            error
-          );
+	/**
+	 * Attempts to authenticate the client using the initial session if no ID token is present.
+	 *
+	 * This runs only when the initial session or client changes, ensuring that
+	 * the client is authenticated when a valid session is provided.
+	 */
+	useEffect(() => {
+		if (initialSession && !client.getIdToken()) {
+			authenticate(initialSession)
+				.then(() => {
+					Logger.debug(
+						"[useAuthenticatedClient()] Client authenticated successfully with initial session.",
+					);
+				})
+				.catch((error) => {
+					Logger.error(
+						"[useAuthenticatedClient()] Failed to authenticate client with initial session:",
+						error,
+					);
 
-          navigate("/auth/logout?auto_logout=true");
-        });
-    }
-  }, [client, initialSession, authenticate]);
+					navigate("/auth/logout?auto_logout=true");
+				});
+		}
+	}, [client, initialSession, authenticate]);
 
-  /** Returns the authenticated (or unauthenticated) Optimiq Voice client instance. */
-  return client;
+	/** Returns the authenticated (or unauthenticated) Optimiq Voice client instance. */
+	return client;
 };

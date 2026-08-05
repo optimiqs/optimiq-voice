@@ -20,12 +20,10 @@ import { OPTIMIQ_VOICE_CLIENT_CONFIG } from "../stores/optimiq-voice.config";
  * @returns {Client} An instance of the Optimiq Voice WebClient, ready for use in browser-based applications.
  */
 export const getClient = () => {
-  Logger.debug(
-    "[optimiq-voice.client] Creating Optimiq Voice WebClient instance"
-  );
+	Logger.debug("[optimiq-voice.client] Creating Optimiq Voice WebClient instance");
 
-  const optimiqVoiceClient = new SDK.WebClient(OPTIMIQ_VOICE_CLIENT_CONFIG);
-  return optimiqVoiceClient;
+	const optimiqVoiceClient = new SDK.WebClient(OPTIMIQ_VOICE_CLIENT_CONFIG);
+	return optimiqVoiceClient;
 };
 
 /**

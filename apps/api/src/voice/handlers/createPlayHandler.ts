@@ -6,26 +6,26 @@ import { awaitForPlaybackFinished } from "./utils/awaitForPlaybackFinished";
 import { withErrorHandling } from "./utils/withErrorHandling";
 
 function createPlayHandler(ari: Client, voiceClient: VoiceClient) {
-  return withErrorHandling(async (request: PlayRequest) => {
-    const { mediaSessionRef } = request;
+	return withErrorHandling(async (request: PlayRequest) => {
+		const { mediaSessionRef } = request;
 
-    const playbackRef = request.playbackRef || nanoid(10);
+		const playbackRef = request.playbackRef || nanoid(10);
 
-    await ari.channels.play({
-      channelId: mediaSessionRef,
-      media: `sound:${request.url}`,
-      playbackId: playbackRef
-    });
+		await ari.channels.play({
+			channelId: mediaSessionRef,
+			media: `sound:${request.url}`,
+			playbackId: playbackRef,
+		});
 
-    await awaitForPlaybackFinished(ari, playbackRef);
+		await awaitForPlaybackFinished(ari, playbackRef);
 
-    voiceClient.sendResponse({
-      playResponse: {
-        mediaSessionRef,
-        playbackRef
-      }
-    });
-  });
+		voiceClient.sendResponse({
+			playResponse: {
+				mediaSessionRef,
+				playbackRef,
+			},
+		});
+	});
 }
 
 export { createPlayHandler };

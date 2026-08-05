@@ -14,70 +14,64 @@ const sandbox = createSandbox();
 const channelId = "channel-id";
 
 describe("@voice/handler/PlaybackControl", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should handle a PlaybackControl command", async function () {
-    // Arrange
-    const ari = getAriStub(sandbox);
+	it("should handle a PlaybackControl command", async function () {
+		// Arrange
+		const ari = getAriStub(sandbox);
 
-    const createVoiceClient = getCreateVoiceClient(sandbox);
+		const createVoiceClient = getCreateVoiceClient(sandbox);
 
-    const playbackControlRequest = {
-      playbackRef: "playback-id",
-      mediaSessionRef: channelId,
-      action: PlaybackControlAction.FORWARD
-    };
+		const playbackControlRequest = {
+			playbackRef: "playback-id",
+			mediaSessionRef: channelId,
+			action: PlaybackControlAction.FORWARD,
+		};
 
-    // Act
-    await createPlaybackControlHandler(
-      ari,
-      createVoiceClient()
-    )(playbackControlRequest);
+		// Act
+		await createPlaybackControlHandler(ari, createVoiceClient())(playbackControlRequest);
 
-    // Assert
-    expect(ari.playbacks.control).to.have.been.calledOnce;
-    expect(createVoiceClient().sendResponse).to.have.been.calledOnce;
-    expect(createVoiceClient().sendResponse).to.have.been.calledWith({
-      playbackControlResponse: {
-        mediaSessionRef: playbackControlRequest.mediaSessionRef
-      }
-    });
-    expect(ari.playbacks.control).to.have.been.calledWith({
-      playbackId: playbackControlRequest.playbackRef,
-      operation: playbackControlRequest.action
-    });
-  });
+		// Assert
+		expect(ari.playbacks.control).to.have.been.calledOnce;
+		expect(createVoiceClient().sendResponse).to.have.been.calledOnce;
+		expect(createVoiceClient().sendResponse).to.have.been.calledWith({
+			playbackControlResponse: {
+				mediaSessionRef: playbackControlRequest.mediaSessionRef,
+			},
+		});
+		expect(ari.playbacks.control).to.have.been.calledWith({
+			playbackId: playbackControlRequest.playbackRef,
+			operation: playbackControlRequest.action,
+		});
+	});
 
-  it("should handle a STOP PlaybackControl command", async function () {
-    // Arrange
-    const ari = getAriStub(sandbox);
+	it("should handle a STOP PlaybackControl command", async function () {
+		// Arrange
+		const ari = getAriStub(sandbox);
 
-    const createVoiceClient = getCreateVoiceClient(sandbox);
+		const createVoiceClient = getCreateVoiceClient(sandbox);
 
-    const playbackControlRequest = {
-      playbackRef: "playback-id",
-      mediaSessionRef: channelId,
-      action: PlaybackControlAction.STOP
-    };
+		const playbackControlRequest = {
+			playbackRef: "playback-id",
+			mediaSessionRef: channelId,
+			action: PlaybackControlAction.STOP,
+		};
 
-    // Act
-    await createPlaybackControlHandler(
-      ari,
-      createVoiceClient()
-    )(playbackControlRequest);
+		// Act
+		await createPlaybackControlHandler(ari, createVoiceClient())(playbackControlRequest);
 
-    // Assert
-    expect(ari.playbacks.stop).to.have.been.calledOnce;
-    expect(createVoiceClient().sendResponse).to.have.been.calledOnce;
-    expect(createVoiceClient().sendResponse).to.have.been.calledWith({
-      playbackControlResponse: {
-        mediaSessionRef: playbackControlRequest.mediaSessionRef
-      }
-    });
-    expect(ari.playbacks.stop).to.have.been.calledWith({
-      playbackId: playbackControlRequest.playbackRef
-    });
-  });
+		// Assert
+		expect(ari.playbacks.stop).to.have.been.calledOnce;
+		expect(createVoiceClient().sendResponse).to.have.been.calledOnce;
+		expect(createVoiceClient().sendResponse).to.have.been.calledWith({
+			playbackControlResponse: {
+				mediaSessionRef: playbackControlRequest.mediaSessionRef,
+			},
+		});
+		expect(ari.playbacks.stop).to.have.been.calledWith({
+			playbackId: playbackControlRequest.playbackRef,
+		});
+	});
 });

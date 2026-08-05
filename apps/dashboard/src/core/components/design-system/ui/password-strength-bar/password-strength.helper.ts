@@ -7,26 +7,26 @@ export type PasswordStrength = "weak" | "fair" | "strong";
  * @returns PasswordStrength - 'weak', 'fair', or 'strong'
  */
 export function assessPasswordStrength(password: string): PasswordStrength {
-  if (!password || password.length < 8) {
-    return "weak";
-  }
+	if (!password || password.length < 8) {
+		return "weak";
+	}
 
-  let score = 0;
+	let score = 0;
 
-  // Length contribution
-  if (password.length >= 12) score += 2;
-  else if (password.length >= 8) score += 1;
+	// Length contribution
+	if (password.length >= 12) score += 2;
+	else if (password.length >= 8) score += 1;
 
-  // Character variety contribution
-  if (/[a-z]/.test(password)) score += 1; // lowercase
-  if (/[A-Z]/.test(password)) score += 1; // uppercase
-  if (/\d/.test(password)) score += 1; // numbers
-  if (/[^a-zA-Z0-9]/.test(password)) score += 1; // special characters
+	// Character variety contribution
+	if (/[a-z]/.test(password)) score += 1; // lowercase
+	if (/[A-Z]/.test(password)) score += 1; // uppercase
+	if (/\d/.test(password)) score += 1; // numbers
+	if (/[^a-zA-Z0-9]/.test(password)) score += 1; // special characters
 
-  // Determine strength based on score
-  if (score >= 5) return "strong";
-  if (score >= 3) return "fair";
-  return "weak";
+	// Determine strength based on score
+	if (score >= 5) return "strong";
+	if (score >= 3) return "fair";
+	return "weak";
 }
 
 /**
@@ -36,24 +36,24 @@ export function assessPasswordStrength(password: string): PasswordStrength {
  * @returns A number between 0 and 100 representing password strength
  */
 export function getPasswordStrengthScore(password: string): number {
-  if (!password || password.length < 8) {
-    return 0;
-  }
+	if (!password || password.length < 8) {
+		return 0;
+	}
 
-  let score = 0;
+	let score = 0;
 
-  // Length contribution (max 30 points)
-  if (password.length >= 16) score += 30;
-  else if (password.length >= 12) score += 25;
-  else if (password.length >= 8) score += 20;
+	// Length contribution (max 30 points)
+	if (password.length >= 16) score += 30;
+	else if (password.length >= 12) score += 25;
+	else if (password.length >= 8) score += 20;
 
-  // Character variety contribution (max 70 points)
-  if (/[a-z]/.test(password)) score += 15; // lowercase
-  if (/[A-Z]/.test(password)) score += 15; // uppercase
-  if (/\d/.test(password)) score += 15; // numbers
-  if (/[^a-zA-Z0-9]/.test(password)) score += 25; // special characters (weighted higher)
+	// Character variety contribution (max 70 points)
+	if (/[a-z]/.test(password)) score += 15; // lowercase
+	if (/[A-Z]/.test(password)) score += 15; // uppercase
+	if (/\d/.test(password)) score += 15; // numbers
+	if (/[^a-zA-Z0-9]/.test(password)) score += 25; // special characters (weighted higher)
 
-  return Math.min(score, 100);
+	return Math.min(score, 100);
 }
 
 /**
@@ -63,14 +63,14 @@ export function getPasswordStrengthScore(password: string): number {
  * @returns A hex color value
  */
 export function getPasswordStrengthColor(strength: PasswordStrength): string {
-  switch (strength) {
-    case "strong":
-      return "#10b981"; // green-500
-    case "fair":
-      return "#f59e0b"; // amber-500
-    case "weak":
-      return "#ef4444"; // red-500
-    default:
-      return "#6b7280"; // gray-500
-  }
+	switch (strength) {
+		case "strong":
+			return "#10b981"; // green-500
+		case "fair":
+			return "#f59e0b"; // amber-500
+		case "weak":
+			return "#ef4444"; // red-500
+		default:
+			return "#6b7280"; // gray-500
+	}
 }

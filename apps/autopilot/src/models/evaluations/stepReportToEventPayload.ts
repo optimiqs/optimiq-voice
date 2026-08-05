@@ -1,23 +1,19 @@
-import {
-  ExpectedTextType,
-  StepEvaluationReport,
-  ToolEvaluationReport
-} from "@optimiq-voice/types";
+import { ExpectedTextType, StepEvaluationReport, ToolEvaluationReport } from "@optimiq-voice/types";
 
 const EVALUATION_TYPE_TO_NUM: Record<string, number> = {
-  [ExpectedTextType.EXACT]: 0,
-  [ExpectedTextType.SIMILAR]: 1
+	[ExpectedTextType.EXACT]: 0,
+	[ExpectedTextType.SIMILAR]: 1,
 };
 
 function toolReportToPayload(t: ToolEvaluationReport): Record<string, unknown> {
-  return {
-    expectedTool: t.expectedTool,
-    actualTool: t.actualTool,
-    passed: t.passed,
-    expectedParameters: t.expectedParameters,
-    actualParameters: t.actualParameters,
-    errorMessage: t.errorMessage ?? ""
-  };
+	return {
+		expectedTool: t.expectedTool,
+		actualTool: t.actualTool,
+		passed: t.passed,
+		expectedParameters: t.expectedParameters,
+		actualParameters: t.actualParameters,
+		errorMessage: t.errorMessage ?? "",
+	};
 }
 
 /**
@@ -25,43 +21,41 @@ function toolReportToPayload(t: ToolEvaluationReport): Record<string, unknown> {
  * (camelCase, evaluationType as number for proto).
  */
 export function stepReportToEventPayload(
-  scenarioRef: string,
-  report: StepEvaluationReport
+	scenarioRef: string,
+	report: StepEvaluationReport,
 ): Record<string, unknown> {
-  return {
-    stepResult: {
-      scenarioRef,
-      report: {
-        humanInput: report.humanInput,
-        expectedResponse: report.expectedResponse,
-        aiResponse: report.aiResponse,
-        evaluationType: EVALUATION_TYPE_TO_NUM[report.evaluationType] ?? 0,
-        passed: report.passed,
-        errorMessage: report.errorMessage ?? "",
-        toolEvaluations: (report.toolEvaluations ?? []).map(toolReportToPayload)
-      }
-    }
-  };
+	return {
+		stepResult: {
+			scenarioRef,
+			report: {
+				humanInput: report.humanInput,
+				expectedResponse: report.expectedResponse,
+				aiResponse: report.aiResponse,
+				evaluationType: EVALUATION_TYPE_TO_NUM[report.evaluationType] ?? 0,
+				passed: report.passed,
+				errorMessage: report.errorMessage ?? "",
+				toolEvaluations: (report.toolEvaluations ?? []).map(toolReportToPayload),
+			},
+		},
+	};
 }
 
 export function scenarioSummaryToEventPayload(
-  scenarioRef: string,
-  overallPassed: boolean
+	scenarioRef: string,
+	overallPassed: boolean,
 ): Record<string, unknown> {
-  return {
-    scenarioSummary: {
-      scenarioRef,
-      overallPassed
-    }
-  };
+	return {
+		scenarioSummary: {
+			scenarioRef,
+			overallPassed,
+		},
+	};
 }
 
-export function evalErrorToEventPayload(
-  message: string
-): Record<string, unknown> {
-  return {
-    evalError: {
-      message
-    }
-  };
+export function evalErrorToEventPayload(message: string): Record<string, unknown> {
+	return {
+		evalError: {
+			message,
+		},
+	};
 }

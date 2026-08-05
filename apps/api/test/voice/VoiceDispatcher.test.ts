@@ -12,38 +12,38 @@ chai.use(sinonChai);
 const sandbox = createSandbox();
 
 describe("@voice/handler/VoiceDispatcher", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should create a VoiceDispatcher", async function () {
-    // Arrange
-    const { VoiceDispatcher } = await import("../../src/voice/VoiceDispatcher");
-    const ari = getAriStub(sandbox);
-    const nc = {} as unknown as NatsConnection;
-    const createVoiceClient = sandbox.stub();
-    const voiceDispatcher = new VoiceDispatcher(ari, nc, createVoiceClient);
+	it("should create a VoiceDispatcher", async function () {
+		// Arrange
+		const { VoiceDispatcher } = await import("../../src/voice/VoiceDispatcher");
+		const ari = getAriStub(sandbox);
+		const nc = {} as unknown as NatsConnection;
+		const createVoiceClient = sandbox.stub();
+		const voiceDispatcher = new VoiceDispatcher(ari, nc, createVoiceClient);
 
-    // Act
-    voiceDispatcher.start();
+		// Act
+		voiceDispatcher.start();
 
-    // Assert
-    expect(ari.on).to.have.been.called.calledThrice;
-    expect(ari.on).to.have.been.calledWith(
-      AriEvent.STASIS_START,
-      match.func.and(
-        match(function (fn) {
-          return fn.name === "bound handleStasisStart";
-        })
-      )
-    );
-    expect(ari.on).to.have.been.calledWith(
-      AriEvent.STASIS_END,
-      match.func.and(
-        match(function (fn) {
-          return fn.name === "bound handleStasisEnd";
-        })
-      )
-    );
-  });
+		// Assert
+		expect(ari.on).to.have.been.called.calledThrice;
+		expect(ari.on).to.have.been.calledWith(
+			AriEvent.STASIS_START,
+			match.func.and(
+				match(function (fn) {
+					return fn.name === "bound handleStasisStart";
+				}),
+			),
+		);
+		expect(ari.on).to.have.been.calledWith(
+			AriEvent.STASIS_END,
+			match.func.and(
+				match(function (fn) {
+					return fn.name === "bound handleStasisEnd";
+				}),
+			),
+		);
+	});
 });

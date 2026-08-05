@@ -19,66 +19,66 @@ import { useSipTestCall } from "./use-sip";
  * - `onTestCall()`: Function to initiate the test call (with auto-connect if needed).
  */
 export const useApplicationTestCall = () => {
-  /** Disable the test button temporarily to prevent double clicks. */
-  const [isLoadingCall, setIsLoadingCall] = useState(false);
+	/** Disable the test button temporarily to prevent double clicks. */
+	const [isLoadingCall, setIsLoadingCall] = useState(false);
 
-  /** Get current application reference from context. */
-  const {
-    application: { ref: appRef }
-  } = useApplicationContext();
+	/** Get current application reference from context. */
+	const {
+		application: { ref: appRef },
+	} = useApplicationContext();
 
-  /** SIP call control and state from internal hook. */
-  const {
-    audioRef,
-    state: { isConnected, isCalling, isAnswered },
-    connect,
-    call,
-    close
-  } = useSipTestCall();
+	/** SIP call control and state from internal hook. */
+	const {
+		audioRef,
+		state: { isConnected, isCalling, isAnswered },
+		connect,
+		call,
+		close,
+	} = useSipTestCall();
 
-  /**
-   * onTestCall
-   *
-   * @description
-   * Handles logic to initiate a SIP test call for the current application.
-   * Ensures the application is saved, then connects and calls.
-   */
-  const onTestCall = useCallback(async () => {
-    if (!appRef) {
-      toast("Please complete the application and save it before testing.");
-      return;
-    }
+	/**
+	 * onTestCall
+	 *
+	 * @description
+	 * Handles logic to initiate a SIP test call for the current application.
+	 * Ensures the application is saved, then connects and calls.
+	 */
+	const onTestCall = useCallback(async () => {
+		if (!appRef) {
+			toast("Please complete the application and save it before testing.");
+			return;
+		}
 
-    try {
-      setIsLoadingCall(true);
-      toast("Initiating test call...");
+		try {
+			setIsLoadingCall(true);
+			toast("Initiating test call...");
 
-      // Ensure connection to SIP server before making a call
-      if (!isConnected) await connect();
+			// Ensure connection to SIP server before making a call
+			if (!isConnected) await connect();
 
-      await call(appRef);
-    } catch (err) {
-      toast(getErrorMessage(err));
-    } finally {
-      setIsLoadingCall(false);
-    }
-  }, [appRef, connect, call, isConnected]);
+			await call(appRef);
+		} catch (err) {
+			toast(getErrorMessage(err));
+		} finally {
+			setIsLoadingCall(false);
+		}
+	}, [appRef, connect, call, isConnected]);
 
-  /**
-   * Cleanup SIP session and disconnect audio stream when unmounting.
-   */
-  useEffect(() => {
-    return () => {
-      close();
-    };
-  }, [close]);
+	/**
+	 * Cleanup SIP session and disconnect audio stream when unmounting.
+	 */
+	useEffect(() => {
+		return () => {
+			close();
+		};
+	}, [close]);
 
-  return {
-    audioRef,
-    isLoadingCall,
-    isCalling,
-    isAnswered,
-    onTestCall,
-    hangup: close
-  };
+	return {
+		audioRef,
+		isLoadingCall,
+		isCalling,
+		isAnswered,
+		onTestCall,
+		hangup: close,
+	};
 };

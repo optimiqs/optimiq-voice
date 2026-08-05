@@ -16,14 +16,14 @@ import type { Route } from "./+types/create-acl.page";
  * @returns An array of metadata objects for the page.
  */
 export function meta(_: Route.MetaArgs) {
-  return [
-    { title: "Create New ACL | Optimiq Voice" },
-    {
-      name: "description",
-      content:
-        "An ACL defines IP-based rules to allow or deny access to your voice infrastructure."
-    }
-  ];
+	return [
+		{ title: "Create New ACL | Optimiq Voice" },
+		{
+			name: "description",
+			content:
+				"An ACL defines IP-based rules to allow or deny access to your voice infrastructure.",
+		},
+	];
 }
 
 /**
@@ -38,35 +38,35 @@ export function meta(_: Route.MetaArgs) {
  * @returns {JSX.Element} The rendered Create Acl page.
  */
 export default function CreateAcl() {
-  /** Custom hook to create a acl via API with optimistic updates. */
-  const { onGoBack, onSave } = useCreateAcl();
+	/** Custom hook to create a acl via API with optimistic updates. */
+	const { onGoBack, onSave } = useCreateAcl();
 
-  /**
-   * Renders the Create Acl page layout.
-   */
-  return (
-    <FormProvider>
-      <Page variant="form">
-        <PageHeader
-          title="Create New ACL"
-          description="An ACL defines IP-based rules to allow or deny access to your voice infrastructure."
-          onBack={{ label: "Back to ACLs", onClick: onGoBack }}
-          actions={
-            <FormSubmitButton size="small" loadingText="Saving...">
-              Save Acl
-            </FormSubmitButton>
-          }
-        />
+	/**
+	 * Renders the Create Acl page layout.
+	 */
+	return (
+		<FormProvider>
+			<Page variant="form">
+				<PageHeader
+					title="Create New ACL"
+					description="An ACL defines IP-based rules to allow or deny access to your voice infrastructure."
+					onBack={{ label: "Back to ACLs", onClick: onGoBack }}
+					actions={
+						<FormSubmitButton size="small" loadingText="Saving...">
+							Save Acl
+						</FormSubmitButton>
+					}
+				/>
 
-        {/* Form container with a max width for readability and consistent layout */}
-        <Box sx={{ maxWidth: "440px" }}>
-          <CreateAclForm
-            onSubmit={async (data) => {
-              onSave(data);
-            }}
-          />
-        </Box>
-      </Page>
-    </FormProvider>
-  );
+				{/* Form container with a max width for readability and consistent layout */}
+				<Box sx={{ maxWidth: "440px" }}>
+					<CreateAclForm
+						onSubmit={async (data) => {
+							onSave(data);
+						}}
+					/>
+				</Box>
+			</Page>
+		</FormProvider>
+	);
 }

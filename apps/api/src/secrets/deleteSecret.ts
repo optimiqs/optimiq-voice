@@ -8,25 +8,19 @@ import { createGetFnUtil } from "./createGetFnUtil";
 const logger = getLogger({ service: "api", filePath: __filename });
 
 function deleteSecret(db: Database) {
-  const getFn = createGetFnUtil(db);
+	const getFn = createGetFnUtil(db);
 
-  const fn = async (call: {
-    request: BaseApiObject;
-  }): Promise<BaseApiObject> => {
-    const { ref } = call.request;
+	const fn = async (call: { request: BaseApiObject }): Promise<BaseApiObject> => {
+		const { ref } = call.request;
 
-    logger.verbose("call to deleteSecret", { ref });
+		logger.verbose("call to deleteSecret", { ref });
 
-    await db.secret.delete({ where: { ref } });
+		await db.secret.delete({ where: { ref } });
 
-    return { ref };
-  };
+		return { ref };
+	};
 
-  return withErrorHandlingAndValidationAndAccess(
-    fn,
-    (ref: string) => getFn(ref),
-    V.emptySchema
-  );
+	return withErrorHandlingAndValidationAndAccess(fn, (ref: string) => getFn(ref), V.emptySchema);
 }
 
 export { deleteSecret };

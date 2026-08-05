@@ -12,39 +12,38 @@ chai.use(sinonChai);
 const sandbox = createSandbox();
 
 describe("@identity[apikeys/deleteApiKey]", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should delete an ApiKey", async function () {
-    // Arrange
-    const metadata = new grpc.Metadata();
-    metadata.set("token", TEST_TOKEN);
+	it("should delete an ApiKey", async function () {
+		// Arrange
+		const metadata = new grpc.Metadata();
+		metadata.set("token", TEST_TOKEN);
 
-    const call = {
-      metadata,
-      request: {
-        ref: "123"
-      }
-    };
+		const call = {
+			metadata,
+			request: {
+				ref: "123",
+			},
+		};
 
-    const res = {
-      ref: "123"
-    };
+		const res = {
+			ref: "123",
+		};
 
-    const db = {
-      apiKey: {
-        delete: sandbox.stub().resolves(res)
-      }
-    } as unknown as Database;
+		const db = {
+			apiKey: {
+				delete: sandbox.stub().resolves(res),
+			},
+		} as unknown as Database;
 
-    const { createDeleteApiKey } =
-      await import("../../src/apikeys/createDeleteApiKey");
+		const { createDeleteApiKey } = await import("../../src/apikeys/createDeleteApiKey");
 
-    // Act
-    await createDeleteApiKey(db)(call, (error, response) => {
-      // Assert
-      expect(response).to.have.property("ref", "123");
-    });
-  });
+		// Act
+		await createDeleteApiKey(db)(call, (error, response) => {
+			// Assert
+			expect(response).to.have.property("ref", "123");
+		});
+	});
 });

@@ -6,10 +6,6 @@ import { createCallPrompt } from "./createCallPrompt";
  * @param server The MCP server instance
  */
 export function registerPrompts(server: McpServer) {
-  // Register the createCallPrompt
-  server.prompt(
-    "create_call_prompt",
-    "A predefined prompt for creating a call",
-    createCallPrompt
-  );
+	// Register the createCallPrompt
+	server.prompt("create_call_prompt", "A predefined prompt for creating a call", createCallPrompt);
 }

@@ -4,12 +4,7 @@ import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { useAuth } from "~/auth/hooks/use-auth";
 import { useUpdateUser } from "~/auth/services/auth.service";
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem
-} from "~/core/components/design-system/forms";
+import { Form, FormControl, FormField, FormItem } from "~/core/components/design-system/forms";
 import { FormRoot } from "~/core/components/design-system/forms/form-root";
 import { Input } from "~/core/components/design-system/ui/input/input";
 import { PasswordStrengthBar } from "~/core/components/design-system/ui/password-strength-bar";
@@ -24,11 +19,11 @@ import { useFormContextSync } from "~/core/hooks/use-form-context-sync";
  * Defines the expected fields and their types.
  */
 export const schema = z.object({
-  name: z.string().nonempty(),
-  email: z.string().email(),
-  password: z.string().optional(),
-  confirmPassword: z.string().optional(),
-  avatar: z.string().optional()
+	name: z.string().nonempty(),
+	email: z.string().email(),
+	password: z.string().optional(),
+	confirmPassword: z.string().optional(),
+	avatar: z.string().optional(),
 });
 
 /** Type inferred from the Zod schema. */
@@ -40,7 +35,7 @@ export type Schema = z.infer<typeof schema>;
  * @property {function} [onFormSubmit] - Optional callback executed after successful form submission.
  */
 export interface PersonalSettingsProps extends React.PropsWithChildren {
-  onFormSubmit?: (data: Schema) => void;
+	onFormSubmit?: (data: Schema) => void;
 }
 
 /**
@@ -53,159 +48,159 @@ export interface PersonalSettingsProps extends React.PropsWithChildren {
  * @returns {JSX.Element} The rendered personal settings form.
  */
 export function PersonalSettingsForm({ onFormSubmit }: PersonalSettingsProps) {
-  const { user, setUser } = useAuth();
+	const { user, setUser } = useAuth();
 
-  /** Mutation hook to update the workspace on the server. */
-  const { mutate, isPending } = useUpdateUser();
+	/** Mutation hook to update the workspace on the server. */
+	const { mutate, isPending } = useUpdateUser();
 
-  /** Initializes react-hook-form with validation and default values. */
-  const form = useForm<Schema>({
-    resolver: zodResolver(schema),
-    defaultValues: {
-      password: "",
-      confirmPassword: "",
-      avatar: "",
-      ...user
-    },
-    mode: "onChange"
-  });
+	/** Initializes react-hook-form with validation and default values. */
+	const form = useForm<Schema>({
+		resolver: zodResolver(schema),
+		defaultValues: {
+			password: "",
+			confirmPassword: "",
+			avatar: "",
+			...user,
+		},
+		mode: "onChange",
+	});
 
-  const watchPassword = form.watch("password");
+	const watchPassword = form.watch("password");
 
-  /**
-   * Handles form submission:
-   * - Validates workspace existence
-   * - Calls mutate to update the workspace
-   * - Displays success or error toasts
-   * - Calls onFormSubmit if provided
-   */
-  const onSubmit = useCallback(
-    async ({ password, confirmPassword, ...data }: Schema) => {
-      try {
-        if (password && password !== confirmPassword) {
-          form.setError("confirmPassword", {
-            type: "manual",
-            message: "Passwords do not match"
-          });
-          return;
-        }
+	/**
+	 * Handles form submission:
+	 * - Validates workspace existence
+	 * - Calls mutate to update the workspace
+	 * - Displays success or error toasts
+	 * - Calls onFormSubmit if provided
+	 */
+	const onSubmit = useCallback(
+		async ({ password, confirmPassword, ...data }: Schema) => {
+			try {
+				if (password && password !== confirmPassword) {
+					form.setError("confirmPassword", {
+						type: "manual",
+						message: "Passwords do not match",
+					});
+					return;
+				}
 
-        const { id: ref } = user;
-        mutate({ ref, password, ...data });
-        setUser({ ...user, ...data });
-        form.reset({ ...data, password: "", confirmPassword: "" });
+				const { id: ref } = user;
+				mutate({ ref, password, ...data });
+				setUser({ ...user, ...data });
+				form.reset({ ...data, password: "", confirmPassword: "" });
 
-        toast("Ahoy! Your profile has been updated successfully.");
+				toast("Ahoy! Your profile has been updated successfully.");
 
-        if (onFormSubmit) {
-          onFormSubmit(data);
-        }
-      } catch (error) {
-        toast(getErrorMessage(error));
-      }
-    },
-    [mutate, onFormSubmit, user, form, setUser]
-  );
+				if (onFormSubmit) {
+					onFormSubmit(data);
+				}
+			} catch (error) {
+				toast(getErrorMessage(error));
+			}
+		},
+		[mutate, onFormSubmit, user, form, setUser],
+	);
 
-  /** Sync form state with FormContext */
-  useFormContextSync(form, onSubmit);
+	/** Sync form state with FormContext */
+	useFormContextSync(form, onSubmit);
 
-  /**
-   * Renders the workspace profile form with inputs for name and timezone.
-   */
-  return (
-    <Form {...form}>
-      <FormRoot onSubmit={form.handleSubmit(onSubmit)}>
-        <FormField
-          control={form.control}
-          name="name"
-          render={({ field }) => (
-            <FormItem>
-              <FormControl>
-                <Input type="text" label="Full Name" {...field} />
-              </FormControl>
-            </FormItem>
-          )}
-        />
-        <FormField
-          control={form.control}
-          name="email"
-          render={({ field }) => (
-            <FormItem>
-              <FormControl>
-                <Input type="email" label="Email Address" disabled {...field} />
-              </FormControl>
-            </FormItem>
-          )}
-        />
+	/**
+	 * Renders the workspace profile form with inputs for name and timezone.
+	 */
+	return (
+		<Form {...form}>
+			<FormRoot onSubmit={form.handleSubmit(onSubmit)}>
+				<FormField
+					control={form.control}
+					name="name"
+					render={({ field }) => (
+						<FormItem>
+							<FormControl>
+								<Input type="text" label="Full Name" {...field} />
+							</FormControl>
+						</FormItem>
+					)}
+				/>
+				<FormField
+					control={form.control}
+					name="email"
+					render={({ field }) => (
+						<FormItem>
+							<FormControl>
+								<Input type="email" label="Email Address" disabled {...field} />
+							</FormControl>
+						</FormItem>
+					)}
+				/>
 
-        <Typography variant="body-large" sx={{ mt: 2 }}>
-          Change Password
-        </Typography>
+				<Typography variant="body-large" sx={{ mt: 2 }}>
+					Change Password
+				</Typography>
 
-        <FormField
-          control={form.control}
-          name="password"
-          render={({ field }) => (
-            <FormItem>
-              <FormControl>
-                <Input
-                  type="password"
-                  label="New Password"
-                  placeholder="Enter new password"
-                  {...field}
-                />
-                <PasswordStrengthBar password={watchPassword || ""} />
-              </FormControl>
-            </FormItem>
-          )}
-        />
+				<FormField
+					control={form.control}
+					name="password"
+					render={({ field }) => (
+						<FormItem>
+							<FormControl>
+								<Input
+									type="password"
+									label="New Password"
+									placeholder="Enter new password"
+									{...field}
+								/>
+								<PasswordStrengthBar password={watchPassword || ""} />
+							</FormControl>
+						</FormItem>
+					)}
+				/>
 
-        <FormField
-          control={form.control}
-          name="confirmPassword"
-          render={({ field }) => (
-            <FormItem>
-              <FormControl>
-                <Input
-                  type="password"
-                  label="Confirm Password"
-                  placeholder="Re-enter new password"
-                  {...field}
-                />
-              </FormControl>
-            </FormItem>
-          )}
-        />
+				<FormField
+					control={form.control}
+					name="confirmPassword"
+					render={({ field }) => (
+						<FormItem>
+							<FormControl>
+								<Input
+									type="password"
+									label="Confirm Password"
+									placeholder="Re-enter new password"
+									{...field}
+								/>
+							</FormControl>
+						</FormItem>
+					)}
+				/>
 
-        <Typography variant="body-large" sx={{ mt: 2 }}>
-          Avatar
-        </Typography>
+				<Typography variant="body-large" sx={{ mt: 2 }}>
+					Avatar
+				</Typography>
 
-        <FormField
-          control={form.control}
-          name="avatar"
-          render={({ field }) => (
-            <FormItem>
-              <FormControl>
-                <Input
-                  type="text"
-                  label="Avatar URL"
-                  placeholder="https://example.com/avatar.png"
-                  supportingText="This will be used as your profile picture."
-                  {...field}
-                />
-              </FormControl>
-            </FormItem>
-          )}
-        />
+				<FormField
+					control={form.control}
+					name="avatar"
+					render={({ field }) => (
+						<FormItem>
+							<FormControl>
+								<Input
+									type="text"
+									label="Avatar URL"
+									placeholder="https://example.com/avatar.png"
+									supportingText="This will be used as your profile picture."
+									{...field}
+								/>
+							</FormControl>
+						</FormItem>
+					)}
+				/>
 
-        <Typography variant="body-large" sx={{ mt: 2 }}>
-          Appearance
-        </Typography>
+				<Typography variant="body-large" sx={{ mt: 2 }}>
+					Appearance
+				</Typography>
 
-        <ThemeSwitch />
-      </FormRoot>
-    </Form>
-  );
+				<ThemeSwitch />
+			</FormRoot>
+		</Form>
+	);
 }

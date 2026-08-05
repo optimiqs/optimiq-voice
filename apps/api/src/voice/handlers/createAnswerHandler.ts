@@ -4,17 +4,17 @@ import { VoiceClient } from "../types";
 import { withErrorHandling } from "./utils/withErrorHandling";
 
 function createAnswerHandler(ari: Client, voiceClient: VoiceClient) {
-  return withErrorHandling(async (request: VerbRequest) => {
-    const { mediaSessionRef } = request;
+	return withErrorHandling(async (request: VerbRequest) => {
+		const { mediaSessionRef } = request;
 
-    await ari.channels.answer({ channelId: mediaSessionRef });
+		await ari.channels.answer({ channelId: mediaSessionRef });
 
-    voiceClient.sendResponse({
-      answerResponse: {
-        mediaSessionRef
-      }
-    });
-  });
+		voiceClient.sendResponse({
+			answerResponse: {
+				mediaSessionRef,
+			},
+		});
+	});
 }
 
 export { createAnswerHandler };

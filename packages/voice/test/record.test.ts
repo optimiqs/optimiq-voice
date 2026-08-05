@@ -11,35 +11,35 @@ chai.use(sinonChai);
 const sandbox = createSandbox();
 
 describe("@voice/verbs/record", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should record a call", async function () {
-    // Arrange
-    const { Record } = await import("../src/verbs");
+	it("should record a call", async function () {
+		// Arrange
+		const { Record } = await import("../src/verbs");
 
-    const voice = getVoiceObject(sandbox, "recordResponse");
+		const voice = getVoiceObject(sandbox, "recordResponse");
 
-    const record = new Record(voiceRequest, voice);
+		const record = new Record(voiceRequest, voice);
 
-    const recordRequest: RecordRequest = {
-      mediaSessionRef,
-      maxDuration: 10,
-      maxSilence: 5,
-      beep: true
-    };
+		const recordRequest: RecordRequest = {
+			mediaSessionRef,
+			maxDuration: 10,
+			maxSilence: 5,
+			beep: true,
+		};
 
-    // Act
-    await record.run(recordRequest);
+		// Act
+		await record.run(recordRequest);
 
-    // Assert
-    expect(voice.removeListener).to.have.been.calledOnce;
-    expect(voice.on).to.have.been.calledOnce;
-    expect(voice.on).to.have.been.calledWith("data", match.func);
-    expect(voice.write).to.have.been.calledOnce;
-    expect(voice.write).to.have.been.calledWith({
-      recordRequest
-    });
-  });
+		// Assert
+		expect(voice.removeListener).to.have.been.calledOnce;
+		expect(voice.on).to.have.been.calledOnce;
+		expect(voice.on).to.have.been.calledWith("data", match.func);
+		expect(voice.write).to.have.been.calledOnce;
+		expect(voice.write).to.have.been.calledWith({
+			recordRequest,
+		});
+	});
 });

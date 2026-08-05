@@ -6,17 +6,17 @@ import { CreateCallRequest } from "./types";
 const logger = getLogger({ service: "api", filePath: __filename });
 
 async function createCallPublisher(natsUrl: string) {
-  logger.verbose("connecting to nats", { natsUrl });
+	logger.verbose("connecting to nats", { natsUrl });
 
-  const nc = await connect({ servers: natsUrl, maxReconnectAttempts: -1 });
+	const nc = await connect({ servers: natsUrl, maxReconnectAttempts: -1 });
 
-  return {
-    publishCall: async (request: CreateCallRequest & { ref: string }) => {
-      logger.verbose("publishing call", { ref: request.ref });
+	return {
+		publishCall: async (request: CreateCallRequest & { ref: string }) => {
+			logger.verbose("publishing call", { ref: request.ref });
 
-      nc.publish(CALLS_CREATE_SUBJECT, JSON.stringify(request));
-    }
-  };
+			nc.publish(CALLS_CREATE_SUBJECT, JSON.stringify(request));
+		},
+	};
 }
 
 export { createCallPublisher };

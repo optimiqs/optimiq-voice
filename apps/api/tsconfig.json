@@ -1,37 +1,37 @@
 {
-  "extends": "../../tsconfig.json",
-  "compilerOptions": {
-    "outDir": "dist",
-    "rootDir": "src",
-    "experimentalDecorators": true,
-    "emitDecoratorMetadata": true,
-    "useDefineForClassFields": false
-  },
-  "references": [
-    {
-      "path": "../../packages/identity"
-    },
-    {
-      "path": "../../packages/authz"
-    },
-    {
-      "path": "../../packages/logger"
-    },
-    {
-      "path": "../../packages/common"
-    },
-    {
-      "path": "../../packages/types"
-    },
-    {
-      "path": "../../packages/streams"
-    },
-    {
-      "path": "../autopilot"
-    },
-    {
-      "path": "../../packages/sipnet"
-    }
-  ],
-  "exclude": ["node_modules", "dist", "test", "drizzle.config.ts"]
+	"extends": "../../tsconfig.json",
+	"compilerOptions": {
+		"outDir": "dist",
+		"rootDir": "src",
+		"experimentalDecorators": true,
+		"emitDecoratorMetadata": true,
+		"useDefineForClassFields": false
+	},
+	"references": [
+		{
+			"path": "../../packages/identity"
+		},
+		{
+			"path": "../../packages/authz"
+		},
+		{
+			"path": "../../packages/logger"
+		},
+		{
+			"path": "../../packages/common"
+		},
+		{
+			"path": "../../packages/types"
+		},
+		{
+			"path": "../../packages/streams"
+		},
+		{
+			"path": "../autopilot"
+		},
+		{
+			"path": "../../packages/sipnet"
+		}
+	],
+	"exclude": ["node_modules", "dist", "test", "drizzle.config.ts"]
 }

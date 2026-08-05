@@ -16,14 +16,14 @@ import type { Route } from "./+types/create-secret.page";
  * @returns An array of metadata objects for the page.
  */
 export function meta(_: Route.MetaArgs) {
-  return [
-    { title: "Secrets | Optimiq Voice" },
-    {
-      name: "description",
-      content:
-        "Secrets are encrypted variables available to your apps and APIs within the current workspace."
-    }
-  ];
+	return [
+		{ title: "Secrets | Optimiq Voice" },
+		{
+			name: "description",
+			content:
+				"Secrets are encrypted variables available to your apps and APIs within the current workspace.",
+		},
+	];
 }
 
 /**
@@ -38,31 +38,31 @@ export function meta(_: Route.MetaArgs) {
  * @returns {JSX.Element} The rendered Create Secret page.
  */
 export default function CreateSecret() {
-  /** Custom hook to create a secret via API with optimistic updates. */
-  const { onGoBack, onSave } = useCreateSecret();
+	/** Custom hook to create a secret via API with optimistic updates. */
+	const { onGoBack, onSave } = useCreateSecret();
 
-  /**
-   * Renders the Create Secret page layout.
-   */
-  return (
-    <FormProvider>
-      <Page variant="form">
-        <PageHeader
-          title="Create New Secret"
-          description="Secrets are encrypted variables available to your apps and APIs within the current workspace."
-          onBack={{ label: "Back to secrets", onClick: onGoBack }}
-          actions={
-            <FormSubmitButton size="small" loadingText="Saving...">
-              Save Secret
-            </FormSubmitButton>
-          }
-        />
+	/**
+	 * Renders the Create Secret page layout.
+	 */
+	return (
+		<FormProvider>
+			<Page variant="form">
+				<PageHeader
+					title="Create New Secret"
+					description="Secrets are encrypted variables available to your apps and APIs within the current workspace."
+					onBack={{ label: "Back to secrets", onClick: onGoBack }}
+					actions={
+						<FormSubmitButton size="small" loadingText="Saving...">
+							Save Secret
+						</FormSubmitButton>
+					}
+				/>
 
-        {/* Form container with a max width for readability and consistent layout */}
-        <Box sx={{ maxWidth: "440px" }}>
-          <CreateSecretForm onSubmit={onSave} />
-        </Box>
-      </Page>
-    </FormProvider>
-  );
+				{/* Form container with a max width for readability and consistent layout */}
+				<Box sx={{ maxWidth: "440px" }}>
+					<CreateSecretForm onSubmit={onSave} />
+				</Box>
+			</Page>
+		</FormProvider>
+	);
 }

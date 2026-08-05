@@ -5,46 +5,45 @@ import * as SDK from "@optimiq-voice/sdk";
 import { AuthenticatedCommand } from "../../AuthenticatedCommand";
 
 export default class Get extends AuthenticatedCommand<typeof Get> {
-  static override readonly description =
-    "retrieve details of an Application by reference";
-  static override readonly examples = ["<%= config.bin %> <%= command.id %>"];
-  static override readonly args = {
-    ref: Args.string({
-      description: "The Application to show details about",
-      required: true
-    })
-  };
+	static override readonly description = "retrieve details of an Application by reference";
+	static override readonly examples = ["<%= config.bin %> <%= command.id %>"];
+	static override readonly args = {
+		ref: Args.string({
+			description: "The Application to show details about",
+			required: true,
+		}),
+	};
 
-  public async run(): Promise<void> {
-    const { args } = await this.parse(Get);
-    const client = await this.createSdkClient();
-    const applications = new SDK.Applications(client);
+	public async run(): Promise<void> {
+		const { args } = await this.parse(Get);
+		const client = await this.createSdkClient();
+		const applications = new SDK.Applications(client);
 
-    const response = await applications.getApplication(args.ref);
+		const response = await applications.getApplication(args.ref);
 
-    const ui = cliui({ width: 200 });
+		const ui = cliui({ width: 200 });
 
-    // STT or none of productRef is undefined
-    const stt = response.speechToText?.productRef
-      ? response.speechToText?.productRef.replace("stt.", "")
-      : "none";
-    const tts = response.textToSpeech?.productRef
-      ? response.textToSpeech?.productRef.replace("tts.", "")
-      : "none";
+		// STT or none of productRef is undefined
+		const stt = response.speechToText?.productRef
+			? response.speechToText?.productRef.replace("stt.", "")
+			: "none";
+		const tts = response.textToSpeech?.productRef
+			? response.textToSpeech?.productRef.replace("tts.", "")
+			: "none";
 
-    ui.div(
-      "APPLICATION DETAILS\n" +
-        "------------------\n" +
-        `NAME: \t${response.name}\n` +
-        `REF: \t${response.ref}\n` +
-        `STT: \t${stt}\n` +
-        `TTS: \t${tts}\n` +
-        `TYPE: \t${response.type}\n` +
-        `ENDPOINT: \t${response.endpoint}\n` +
-        `CREATED: \t${moment(response.createdAt).format("YYYY-MM-DD HH:mm:ss")}\n` +
-        `UPDATED: \t${moment(response.updatedAt).format("YYYY-MM-DD HH:mm:ss")}`
-    );
+		ui.div(
+			"APPLICATION DETAILS\n" +
+				"------------------\n" +
+				`NAME: \t${response.name}\n` +
+				`REF: \t${response.ref}\n` +
+				`STT: \t${stt}\n` +
+				`TTS: \t${tts}\n` +
+				`TYPE: \t${response.type}\n` +
+				`ENDPOINT: \t${response.endpoint}\n` +
+				`CREATED: \t${moment(response.createdAt).format("YYYY-MM-DD HH:mm:ss")}\n` +
+				`UPDATED: \t${moment(response.updatedAt).format("YYYY-MM-DD HH:mm:ss")}`,
+		);
 
-    this.log(ui.toString());
-  }
+		this.log(ui.toString());
+	}
 }

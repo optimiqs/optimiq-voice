@@ -1,28 +1,22 @@
-import {
-  Injectable,
-  OnApplicationBootstrap,
-  OnApplicationShutdown
-} from "@nestjs/common";
+import { Injectable, OnApplicationBootstrap, OnApplicationShutdown } from "@nestjs/common";
 type RuntimeHandle = {
-  close(): Promise<void>;
+	close(): Promise<void>;
 };
 
 @Injectable()
-export class RuntimeHostService
-  implements OnApplicationBootstrap, OnApplicationShutdown
-{
-  private handle: RuntimeHandle | undefined;
+export class RuntimeHostService implements OnApplicationBootstrap, OnApplicationShutdown {
+	private handle: RuntimeHandle | undefined;
 
-  async onApplicationBootstrap() {
-    const { runApiRuntime } = await import("./app-runtime.mjs");
-    this.handle = await runApiRuntime();
-  }
+	async onApplicationBootstrap() {
+		const { runApiRuntime } = await import("./app-runtime.mjs");
+		this.handle = await runApiRuntime();
+	}
 
-  async onApplicationShutdown() {
-    if (!this.handle) {
-      return;
-    }
+	async onApplicationShutdown() {
+		if (!this.handle) {
+			return;
+		}
 
-    await this.handle.close();
-  }
+		await this.handle.close();
+	}
 }

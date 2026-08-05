@@ -23,14 +23,13 @@ import type { Route } from "./+types/create-number.page";
  * @returns An array of metadata objects for the page.
  */
 export function meta(_: Route.MetaArgs) {
-  return [
-    { title: "Numbers | Optimiq Voice" },
-    {
-      name: "description",
-      content:
-        "A Number is a PSTN phone number that can be used to make or receive calls."
-    }
-  ];
+	return [
+		{ title: "Numbers | Optimiq Voice" },
+		{
+			name: "description",
+			content: "A Number is a PSTN phone number that can be used to make or receive calls.",
+		},
+	];
 }
 
 /**
@@ -45,77 +44,77 @@ export function meta(_: Route.MetaArgs) {
  * @returns {JSX.Element} The rendered Create Number page.
  */
 export default function CreateNumber() {
-  /** Retrieves the current workspace ID for building navigation paths. */
-  const workspaceId = useWorkspaceId();
+	/** Retrieves the current workspace ID for building navigation paths. */
+	const workspaceId = useWorkspaceId();
 
-  /** Hook to programmatically navigate between pages. */
-  const navigate = useNavigate();
+	/** Hook to programmatically navigate between pages. */
+	const navigate = useNavigate();
 
-  /**
-   * Handler for navigating back to the workspace numbers page.
-   * Uses view transitions for smoother page transitions (if supported).
-   */
-  const onGoBack = useCallback(() => {
-    navigate(`/workspaces/${workspaceId}/sip-network/numbers`, {
-      viewTransition: true
-    });
-  }, [navigate, workspaceId]);
+	/**
+	 * Handler for navigating back to the workspace numbers page.
+	 * Uses view transitions for smoother page transitions (if supported).
+	 */
+	const onGoBack = useCallback(() => {
+		navigate(`/workspaces/${workspaceId}/sip-network/numbers`, {
+			viewTransition: true,
+		});
+	}, [navigate, workspaceId]);
 
-  /** Custom hook to create a number via API with optimistic updates. */
-  const { mutateAsync } = useCreateNumber();
+	/** Custom hook to create a number via API with optimistic updates. */
+	const { mutateAsync } = useCreateNumber();
 
-  /**
-   * Handler called after form submission.
-   * Submits the data, shows a toast, and navigates back to the numbers page.
-   *
-   * @param {Schema} data - The validated form data from the form component.
-   */
-  const onSave = useCallback(
-    async ({ country: countryIsoCode, ...data }: Schema) => {
-      try {
-        const country = COUNTRIES.find(({ value }) => value === countryIsoCode);
+	/**
+	 * Handler called after form submission.
+	 * Submits the data, shows a toast, and navigates back to the numbers page.
+	 *
+	 * @param {Schema} data - The validated form data from the form component.
+	 */
+	const onSave = useCallback(
+		async ({ country: countryIsoCode, ...data }: Schema) => {
+			try {
+				const country = COUNTRIES.find(({ value }) => value === countryIsoCode);
 
-        if (!country) {
-          toast("Oops! Invalid country selected.");
-          return;
-        }
+				if (!country) {
+					toast("Oops! Invalid country selected.");
+					return;
+				}
 
-        await mutateAsync({
-          ...nonEmptyValues(data),
-          country: country.label,
-          countryIsoCode
-        });
-        toast("Number created successfully!");
-        onGoBack();
-      } catch (error) {
-        toast(getErrorMessage(error));
-      }
-    },
-    [mutateAsync, onGoBack]
-  );
+				await mutateAsync({
+					...nonEmptyValues(data),
+					country: country.label,
+					countryIsoCode,
+				});
+				toast("Number created successfully!");
+				onGoBack();
+			} catch (error) {
+				toast(getErrorMessage(error));
+			}
+		},
+		[mutateAsync, onGoBack],
+	);
 
-  /**
-   * Renders the Create Number page layout.
-   */
-  return (
-    <FormProvider>
-      <Page variant="form">
-        <PageHeader
-          title="Create New Number"
-          description="A Number is a PSTN phone number that can be used to make or receive calls."
-          onBack={{ label: "Back to numbers", onClick: onGoBack }}
-          actions={
-            <FormSubmitButton size="small" loadingText="Saving...">
-              Save Number
-            </FormSubmitButton>
-          }
-        />
+	/**
+	 * Renders the Create Number page layout.
+	 */
+	return (
+		<FormProvider>
+			<Page variant="form">
+				<PageHeader
+					title="Create New Number"
+					description="A Number is a PSTN phone number that can be used to make or receive calls."
+					onBack={{ label: "Back to numbers", onClick: onGoBack }}
+					actions={
+						<FormSubmitButton size="small" loadingText="Saving...">
+							Save Number
+						</FormSubmitButton>
+					}
+				/>
 
-        {/* Form container with a max width for readability and consistent layout */}
-        <Box sx={{ maxWidth: "440px" }}>
-          <CreateNumberForm onSubmit={onSave} />
-        </Box>
-      </Page>
-    </FormProvider>
-  );
+				{/* Form container with a max width for readability and consistent layout */}
+				<Box sx={{ maxWidth: "440px" }}>
+					<CreateNumberForm onSubmit={onSave} />
+				</Box>
+			</Page>
+		</FormProvider>
+	);
 }

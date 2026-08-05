@@ -16,10 +16,10 @@ import type { ColumnDef } from "@tanstack/react-table";
  * @property {boolean} canDelete - Whether the current user can delete members (admin only).
  */
 export interface ActionsCellProps {
-  member: WorkspaceMemberDTO;
-  onSendEmail: (member: WorkspaceMemberDTO) => void;
-  onDelete: (member: WorkspaceMemberDTO) => void;
-  canDelete: boolean;
+	member: WorkspaceMemberDTO;
+	onSendEmail: (member: WorkspaceMemberDTO) => void;
+	onDelete: (member: WorkspaceMemberDTO) => void;
+	canDelete: boolean;
 }
 
 /**
@@ -30,65 +30,60 @@ export interface ActionsCellProps {
  * @param {ActionsCellProps} props - Props containing the member and event handlers.
  * @returns {JSX.Element} The rendered action cell.
  */
-export const ActionsCell = ({
-  member,
-  onSendEmail,
-  onDelete,
-  canDelete
-}: ActionsCellProps) => {
-  /** Check if the member's status is pending, allowing email to be resent. */
-  const isPending = member.status === "PENDING";
+export const ActionsCell = ({ member, onSendEmail, onDelete, canDelete }: ActionsCellProps) => {
+	/** Check if the member's status is pending, allowing email to be resent. */
+	const isPending = member.status === "PENDING";
 
-  /**
-   * Handles clicking the resend email icon.
-   * Only triggers if the member is pending.
-   */
-  const handleSendEmail = useCallback(() => {
-    if (isPending) {
-      onSendEmail(member);
-    }
-  }, [isPending, member, onSendEmail]);
+	/**
+	 * Handles clicking the resend email icon.
+	 * Only triggers if the member is pending.
+	 */
+	const handleSendEmail = useCallback(() => {
+		if (isPending) {
+			onSendEmail(member);
+		}
+	}, [isPending, member, onSendEmail]);
 
-  /**
-   * Renders the icons with tooltips.
-   * The email icon is enabled only if the member is pending.
-   */
-  return (
-    <Stack direction="row" gap="4px" alignItems="center" width="100%">
-      <Tooltip title="Resend invitation" placement="bottom">
-        <span>
-          <Icon
-            name="Email"
-            sx={{
-              fontSize: "16px",
-              color: "base.04",
-              opacity: isPending ? 1 : 0.5,
-              cursor: isPending ? "pointer" : "not-allowed",
-              pointerEvents: isPending ? "auto" : "none"
-            }}
-            onClick={handleSendEmail}
-          />
-        </span>
-      </Tooltip>
+	/**
+	 * Renders the icons with tooltips.
+	 * The email icon is enabled only if the member is pending.
+	 */
+	return (
+		<Stack direction="row" gap="4px" alignItems="center" width="100%">
+			<Tooltip title="Resend invitation" placement="bottom">
+				<span>
+					<Icon
+						name="Email"
+						sx={{
+							fontSize: "16px",
+							color: "base.04",
+							opacity: isPending ? 1 : 0.5,
+							cursor: isPending ? "pointer" : "not-allowed",
+							pointerEvents: isPending ? "auto" : "none",
+						}}
+						onClick={handleSendEmail}
+					/>
+				</span>
+			</Tooltip>
 
-      {canDelete && (
-        <Tooltip title="Delete member" placement="bottom">
-          <span>
-            <Icon
-              name="Delete"
-              fontSize="small"
-              onClick={() => onDelete(member)}
-              sx={{
-                fontSize: "16px",
-                color: "base.04",
-                cursor: "pointer"
-              }}
-            />
-          </span>
-        </Tooltip>
-      )}
-    </Stack>
-  );
+			{canDelete && (
+				<Tooltip title="Delete member" placement="bottom">
+					<span>
+						<Icon
+							name="Delete"
+							fontSize="small"
+							onClick={() => onDelete(member)}
+							sx={{
+								fontSize: "16px",
+								color: "base.04",
+								cursor: "pointer",
+							}}
+						/>
+					</span>
+				</Tooltip>
+			)}
+		</Stack>
+	);
 };
 
 /**
@@ -103,58 +98,58 @@ export const ActionsCell = ({
  * @returns {ColumnDef<WorkspaceMemberDTO>[]} The columns configuration.
  */
 export const getColumns = (
-  onDelete: (member: WorkspaceMemberDTO) => void,
-  onSendEmail: (member: WorkspaceMemberDTO) => void,
-  canDelete: boolean
+	onDelete: (member: WorkspaceMemberDTO) => void,
+	onSendEmail: (member: WorkspaceMemberDTO) => void,
+	canDelete: boolean,
 ): ColumnDef<WorkspaceMemberDTO>[] => [
-  {
-    id: "name",
-    accessorKey: "name",
-    header: "NAME",
-    enableSorting: false,
-    cell: ({ row: { original: member } }) => member.name
-  },
-  {
-    id: "email",
-    accessorKey: "email",
-    header: "EMAIL",
-    enableSorting: false,
-    cell: ({ row: { original: member } }) => member.email
-  },
-  {
-    id: "role",
-    header: "ROLE",
-    enableSorting: false,
-    cell: ({ row: { original: member } }) => ROLE_LABELS[member.role]
-  },
-  {
-    id: "dateAdded",
-    header: "DATE ADDED",
-    enableSorting: false,
-    cell: ({ row: { original: member } }) =>
-      member.createdAt.toLocaleDateString("es-US", {
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit"
-      })
-  },
-  {
-    id: "status",
-    header: "STATUS",
-    enableSorting: false,
-    cell: ({ row: { original: member } }) => STATUS_LABELS[member.status]
-  },
-  {
-    id: "actions",
-    header: "ACTIONS",
-    enableSorting: false,
-    cell: ({ row: { original: member } }) => (
-      <ActionsCell
-        member={member}
-        onSendEmail={onSendEmail}
-        onDelete={onDelete}
-        canDelete={canDelete}
-      />
-    )
-  }
+	{
+		id: "name",
+		accessorKey: "name",
+		header: "NAME",
+		enableSorting: false,
+		cell: ({ row: { original: member } }) => member.name,
+	},
+	{
+		id: "email",
+		accessorKey: "email",
+		header: "EMAIL",
+		enableSorting: false,
+		cell: ({ row: { original: member } }) => member.email,
+	},
+	{
+		id: "role",
+		header: "ROLE",
+		enableSorting: false,
+		cell: ({ row: { original: member } }) => ROLE_LABELS[member.role],
+	},
+	{
+		id: "dateAdded",
+		header: "DATE ADDED",
+		enableSorting: false,
+		cell: ({ row: { original: member } }) =>
+			member.createdAt.toLocaleDateString("es-US", {
+				year: "numeric",
+				month: "2-digit",
+				day: "2-digit",
+			}),
+	},
+	{
+		id: "status",
+		header: "STATUS",
+		enableSorting: false,
+		cell: ({ row: { original: member } }) => STATUS_LABELS[member.status],
+	},
+	{
+		id: "actions",
+		header: "ACTIONS",
+		enableSorting: false,
+		cell: ({ row: { original: member } }) => (
+			<ActionsCell
+				member={member}
+				onSendEmail={onSendEmail}
+				onDelete={onDelete}
+				canDelete={canDelete}
+			/>
+		),
+	},
 ];

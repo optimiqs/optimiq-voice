@@ -24,13 +24,13 @@ import type { Route } from "./+types/edit-secret.page";
  * @returns {Array} Metadata objects for the page.
  */
 export function meta(_: Route.MetaArgs) {
-  return [
-    { title: "Secrets | Optimiq Voice" },
-    {
-      name: "description",
-      content: "Edit a secret to protect your domains, peers, and trunks."
-    }
-  ];
+	return [
+		{ title: "Secrets | Optimiq Voice" },
+		{
+			name: "description",
+			content: "Edit a secret to protect your domains, peers, and trunks.",
+		},
+	];
 }
 
 /**
@@ -44,104 +44,104 @@ export function meta(_: Route.MetaArgs) {
  * @returns {JSX.Element} The rendered Edit Secret page.
  */
 export default function EditSecret() {
-  /** Retrieves the current workspace ID for building navigation paths. */
-  const workspaceId = useWorkspaceId();
+	/** Retrieves the current workspace ID for building navigation paths. */
+	const workspaceId = useWorkspaceId();
 
-  /** Extracts the secret reference from the URL parameters. */
-  const { ref } = useParams();
+	/** Extracts the secret reference from the URL parameters. */
+	const { ref } = useParams();
 
-  /**
-   * Ensures the secret reference is provided.
-   *
-   * This value should never be null or undefined, as it is required
-   * to fetch and update the secret data.
-   */
-  if (!ref) {
-    throw new Error("Secret reference is required");
-  }
+	/**
+	 * Ensures the secret reference is provided.
+	 *
+	 * This value should never be null or undefined, as it is required
+	 * to fetch and update the secret data.
+	 */
+	if (!ref) {
+		throw new Error("Secret reference is required");
+	}
 
-  /** Fetches the existing secret details for editing. */
-  const { data, isLoading } = useSecret(ref);
+	/** Fetches the existing secret details for editing. */
+	const { data, isLoading } = useSecret(ref);
 
-  /** Hook to programmatically navigate between pages. */
-  const navigate = useNavigate();
+	/** Hook to programmatically navigate between pages. */
+	const navigate = useNavigate();
 
-  /**
-   * Handler for navigating back to the secrets page.
-   * Uses `viewTransition` for smoother transitions.
-   */
-  const onGoBack = useCallback(() => {
-    navigate(`/workspaces/${workspaceId}/secrets`, {
-      viewTransition: true
-    });
-  }, [navigate, workspaceId]);
+	/**
+	 * Handler for navigating back to the secrets page.
+	 * Uses `viewTransition` for smoother transitions.
+	 */
+	const onGoBack = useCallback(() => {
+		navigate(`/workspaces/${workspaceId}/secrets`, {
+			viewTransition: true,
+		});
+	}, [navigate, workspaceId]);
 
-  /** Custom hook to handle secret updates via the API. */
-  const { mutate } = useUpdateSecret();
+	/** Custom hook to handle secret updates via the API. */
+	const { mutate } = useUpdateSecret();
 
-  /**
-   * Handler called after form submission.
-   * Updates the secret, shows a toast, and navigates back to the secrets page.
-   *
-   * @param {Schema} data - The validated form data.
-   */
-  const onSave = useCallback(
-    async (data: Schema) => {
-      try {
-        mutate({ ...data, ref });
-        toast("Secret updated successfully!");
-        onGoBack();
-      } catch (error) {
-        toast(getErrorMessage(error));
-      }
-    },
-    [mutate, ref, onGoBack]
-  );
+	/**
+	 * Handler called after form submission.
+	 * Updates the secret, shows a toast, and navigates back to the secrets page.
+	 *
+	 * @param {Schema} data - The validated form data.
+	 */
+	const onSave = useCallback(
+		async (data: Schema) => {
+			try {
+				mutate({ ...data, ref });
+				toast("Secret updated successfully!");
+				onGoBack();
+			} catch (error) {
+				toast(getErrorMessage(error));
+			}
+		},
+		[mutate, ref, onGoBack],
+	);
 
-  /**
-   * Effect that ensures the user is redirected if the secret does not exist.
-   * Shows an error toast and navigates back to the secrets page.
-   */
-  useEffect(() => {
-    if (!isLoading && !data) {
-      toast("Oops! You are trying to edit a secret that does not exist.");
-      onGoBack();
-    }
-  }, [isLoading, data, onGoBack]);
+	/**
+	 * Effect that ensures the user is redirected if the secret does not exist.
+	 * Shows an error toast and navigates back to the secrets page.
+	 */
+	useEffect(() => {
+		if (!isLoading && !data) {
+			toast("Oops! You are trying to edit a secret that does not exist.");
+			onGoBack();
+		}
+	}, [isLoading, data, onGoBack]);
 
-  /**
-   * Shows a loading indicator while fetching the secret data.
-   */
-  if (isLoading || !data) {
-    return <Splash message="Loading secret details..." />;
-  }
+	/**
+	 * Shows a loading indicator while fetching the secret data.
+	 */
+	if (isLoading || !data) {
+		return <Splash message="Loading secret details..." />;
+	}
 
-  /**
-   * Renders the Edit Secret page layout.
-   */
-  return (
-    <FormProvider>
-      <Page variant="form">
-        <PageHeader
-          title="Edit Secret"
-          description="Secrets are encrypted variables available to your apps and APIs within the current workspace."
-          onBack={{ label: "Back to secrets", onClick: onGoBack }}
-          actions={
-            <FormSubmitButton size="small" loadingText="Saving...">
-              Save Secret
-            </FormSubmitButton>
-          }
-        />
+	/**
+	 * Renders the Edit Secret page layout.
+	 */
+	return (
+		<FormProvider>
+			<Page variant="form">
+				<PageHeader
+					title="Edit Secret"
+					description="Secrets are encrypted variables available to your apps and APIs within the current workspace."
+					onBack={{ label: "Back to secrets", onClick: onGoBack }}
+					actions={
+						<FormSubmitButton size="small" loadingText="Saving...">
+							Save Secret
+						</FormSubmitButton>
+					}
+				/>
 
-        {/* Form container with a max width for readability and consistent layout */}
-        <Box sx={{ maxWidth: "440px" }}>
-          <CreateSecretForm
-            onSubmit={onSave}
-            initialValues={{ ...data, type: "text" }}
-            isEdit={true}
-          />
-        </Box>
-      </Page>
-    </FormProvider>
-  );
+				{/* Form container with a max width for readability and consistent layout */}
+				<Box sx={{ maxWidth: "440px" }}>
+					<CreateSecretForm
+						onSubmit={onSave}
+						initialValues={{ ...data, type: "text" }}
+						isEdit={true}
+					/>
+				</Box>
+			</Page>
+		</FormProvider>
+	);
 }

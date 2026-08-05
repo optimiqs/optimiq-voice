@@ -13,63 +13,63 @@ import { useWorkspaceId } from "~/workspaces/hooks/use-workspace-id";
  * including a button to invite new members and a back navigation link.
  */
 export function MembersPageHeader() {
-  /**
-   * Local state to control the visibility of the InviteMemberModal.
-   */
-  const [isInviteMemberModalOpen, setInviteMemberModalOpen] = useState(false);
+	/**
+	 * Local state to control the visibility of the InviteMemberModal.
+	 */
+	const [isInviteMemberModalOpen, setInviteMemberModalOpen] = useState(false);
 
-  /**
-   * React Router hook to programmatically navigate between routes.
-   */
-  const navigate = useNavigate();
+	/**
+	 * React Router hook to programmatically navigate between routes.
+	 */
+	const navigate = useNavigate();
 
-  /**
-   * Retrieves the current workspace ID from the URL params.
-   */
-  const workspaceId = useWorkspaceId();
+	/**
+	 * Retrieves the current workspace ID from the URL params.
+	 */
+	const workspaceId = useWorkspaceId();
 
-  /**
-   * Handler for the back button click.
-   * Navigates the user back to the workspace overview page.
-   */
-  const onClick = useCallback(() => {
-    navigate(`/workspaces/${workspaceId}`, { viewTransition: true });
-  }, [navigate, workspaceId]);
+	/**
+	 * Handler for the back button click.
+	 * Navigates the user back to the workspace overview page.
+	 */
+	const onClick = useCallback(() => {
+		navigate(`/workspaces/${workspaceId}`, { viewTransition: true });
+	}, [navigate, workspaceId]);
 
-  /**
-   * Renders the PageHeader component with an "Invite New Member" button,
-   * along with the InviteMemberModal for adding new members.
-   */
-  return (
-    <>
-      <PageHeader
-        title="Workspace Members"
-        actions={
-          <Button
-            variant="outlined"
-            size="small"
-            onClick={() => setInviteMemberModalOpen(true)}
-            endIcon={
-              <Icon
-                name="Add"
-                sx={{
-                  fontSize: "16px !important",
-                  color: "inherit"
-                }}
-              />
-            }
-          >
-            Invite New Member
-          </Button>
-        }
-        onBack={{ label: "Back to overview", onClick }}
-      />
+	/**
+	 * Renders the PageHeader component with an "Invite New Member" button,
+	 * along with the InviteMemberModal for adding new members.
+	 */
+	return (
+		<>
+			<PageHeader
+				title="Workspace Members"
+				actions={
+					<Button
+						variant="outlined"
+						size="small"
+						onClick={() => setInviteMemberModalOpen(true)}
+						endIcon={
+							<Icon
+								name="Add"
+								sx={{
+									fontSize: "16px !important",
+									color: "inherit",
+								}}
+							/>
+						}
+					>
+						Invite New Member
+					</Button>
+				}
+				onBack={{ label: "Back to overview", onClick }}
+			/>
 
-      {/* Modal for inviting new workspace members */}
-      <InviteMemberModal
-        isOpen={isInviteMemberModalOpen}
-        onClose={() => setInviteMemberModalOpen(false)}
-      />
-    </>
-  );
+			{/* Modal for inviting new workspace members */}
+			<InviteMemberModal
+				isOpen={isInviteMemberModalOpen}
+				onClose={() => setInviteMemberModalOpen(false)}
+			/>
+		</>
+	);
 }

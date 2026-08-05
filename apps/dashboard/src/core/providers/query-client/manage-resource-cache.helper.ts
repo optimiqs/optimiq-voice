@@ -5,15 +5,15 @@ import { Logger } from "~/core/shared/logger";
  * Base interface for API objects that includes a `ref` property.
  */
 export interface BaseApiObject {
-  ref: string;
+	ref: string;
 }
 
 /**
  * Interface for paginated list requests.
  */
 export interface ListResponse<T> {
-  items: T[];
-  nextPageToken?: string;
+	items: T[];
+	nextPageToken?: string;
 }
 
 /**
@@ -24,20 +24,20 @@ export interface ListResponse<T> {
  * @param item - The new resource item to append
  */
 export function appendResourceToCache<T extends BaseApiObject>(
-  queryClient: QueryClient,
-  key: unknown[],
-  item: T
+	queryClient: QueryClient,
+	key: unknown[],
+	item: T,
 ) {
-  Logger.debug("[appendResourceToCache] Appending to cache:", { key });
+	Logger.debug("[appendResourceToCache] Appending to cache:", { key });
 
-  queryClient.setQueryData<ListResponse<T>>(key, (old) => {
-    if (!old?.items) return { items: [item] };
+	queryClient.setQueryData<ListResponse<T>>(key, (old) => {
+		if (!old?.items) return { items: [item] };
 
-    return {
-      ...old,
-      items: [item, ...old.items]
-    };
-  });
+		return {
+			...old,
+			items: [item, ...old.items],
+		};
+	});
 }
 
 /**
@@ -48,20 +48,20 @@ export function appendResourceToCache<T extends BaseApiObject>(
  * @param item - The updated resource item
  */
 export function updateResourceInCache<T extends BaseApiObject>(
-  queryClient: QueryClient,
-  key: unknown[],
-  item: T
+	queryClient: QueryClient,
+	key: unknown[],
+	item: T,
 ) {
-  Logger.debug("[updateResourceInCache] Updating cache:", { key });
+	Logger.debug("[updateResourceInCache] Updating cache:", { key });
 
-  queryClient.setQueryData<ListResponse<T>>(key, (old) => {
-    if (!old?.items) return old;
+	queryClient.setQueryData<ListResponse<T>>(key, (old) => {
+		if (!old?.items) return old;
 
-    return {
-      ...old,
-      items: old.items.map((i) => (i.ref === item.ref ? { ...i, ...item } : i))
-    };
-  });
+		return {
+			...old,
+			items: old.items.map((i) => (i.ref === item.ref ? { ...i, ...item } : i)),
+		};
+	});
 }
 
 /**
@@ -72,20 +72,20 @@ export function updateResourceInCache<T extends BaseApiObject>(
  * @param ref - The `ref` of the resource item to delete
  */
 export function deleteResourceFromCache<T extends BaseApiObject>(
-  queryClient: QueryClient,
-  key: unknown[],
-  ref: string
+	queryClient: QueryClient,
+	key: unknown[],
+	ref: string,
 ) {
-  Logger.debug("[deleteResourceFromCache] Deleting from cache:", { key, ref });
+	Logger.debug("[deleteResourceFromCache] Deleting from cache:", { key, ref });
 
-  queryClient.setQueryData<ListResponse<T>>(key, (old) => {
-    if (!old?.items) return old;
+	queryClient.setQueryData<ListResponse<T>>(key, (old) => {
+		if (!old?.items) return old;
 
-    return {
-      ...old,
-      items: old.items.filter((i) => i.ref !== ref)
-    };
-  });
+		return {
+			...old,
+			items: old.items.filter((i) => i.ref !== ref),
+		};
+	});
 }
 
 /**
@@ -96,9 +96,9 @@ export function deleteResourceFromCache<T extends BaseApiObject>(
  * @param item - The updated resource object (must include `ref`)
  */
 export function updateSingleResourceInCache<T extends { ref: string }>(
-  queryClient: QueryClient,
-  key: unknown[],
-  item: T
+	queryClient: QueryClient,
+	key: unknown[],
+	item: T,
 ) {
-  queryClient.setQueryData<T>([...key, item.ref], item);
+	queryClient.setQueryData<T>([...key, item.ref], item);
 }

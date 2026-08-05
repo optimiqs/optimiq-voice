@@ -12,17 +12,17 @@ import { z } from "zod";
  * - password: Optional password field validated by PASSWORD_SCHEMA.
  */
 export const schema = z.object({
-  /** Unique identifier for the credential (optional). */
-  ref: z.string().nullish(),
+	/** Unique identifier for the credential (optional). */
+	ref: z.string().nullish(),
 
-  /** Human-friendly name for the credential (required). */
-  name: z.string().nonempty("Friendly Name is required"),
+	/** Human-friendly name for the credential (required). */
+	name: z.string().nonempty("Friendly Name is required"),
 
-  /** Username associated with the credential (required). */
-  username: z.string().nonempty("Username is required"),
+	/** Username associated with the credential (required). */
+	username: z.string().nonempty("Username is required"),
 
-  /** Password field validated by PASSWORD_SCHEMA (optional). */
-  password: z.string().nonempty()
+	/** Password field validated by PASSWORD_SCHEMA (optional). */
+	password: z.string().nonempty(),
 });
 
 /**

@@ -21,17 +21,17 @@ export const COLLECTION_QUERY_KEY = ["collection:calls"];
  * @returns A React Query object containing call data and query metadata.
  */
 export const useCalls = (params?: ResourceListRequest) => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const { data, ...rest } = useQuery({
-    queryKey: [...COLLECTION_QUERY_KEY, workspaceId, params],
-    queryFn: async () => await sdk.calls.listCalls({ ...params })
-  });
+	const { data, ...rest } = useQuery({
+		queryKey: [...COLLECTION_QUERY_KEY, workspaceId, params],
+		queryFn: async () => await sdk.calls.listCalls({ ...params }),
+	});
 
-  return {
-    data: data?.items || [],
-    nextPageToken: data?.nextPageToken,
-    ...rest
-  };
+	return {
+		data: data?.items || [],
+		nextPageToken: data?.nextPageToken,
+		...rest,
+	};
 };

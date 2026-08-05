@@ -1,18 +1,17 @@
 import { TelephonyContext } from ".";
 
 function createSystemPrompt(params: {
-  firstMessage?: string;
-  systemPrompt: string;
-  telephonyContext: TelephonyContext;
+	firstMessage?: string;
+	systemPrompt: string;
+	telephonyContext: TelephonyContext;
 }) {
-  const { firstMessage: firstMessageFromSystem, systemPrompt } = params;
-  const { ingressNumber, callerNumber, callDirection, metadata } =
-    params.telephonyContext;
-  const additionalParameters = Object.entries(metadata ?? {})
-    .map(([key, value]) => `- ${key}: ${value}`)
-    .join("\n");
+	const { firstMessage: firstMessageFromSystem, systemPrompt } = params;
+	const { ingressNumber, callerNumber, callDirection, metadata } = params.telephonyContext;
+	const additionalParameters = Object.entries(metadata ?? {})
+		.map(([key, value]) => `- ${key}: ${value}`)
+		.join("\n");
 
-  return `
+	return `
 ${systemPrompt}
 
 [Context Information]
@@ -26,10 +25,10 @@ ${systemPrompt}
 - Call Direction: ${callDirection}
 
 ${
-  additionalParameters
-    ? `[Additional Parameters (metadata)]
+	additionalParameters
+		? `[Additional Parameters (metadata)]
 ${additionalParameters}`
-    : ""
+		: ""
 }
   `;
 }

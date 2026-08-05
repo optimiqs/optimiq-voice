@@ -1,9 +1,9 @@
 import { createCookieSessionStorage, redirect } from "react-router";
 import type {
-  CookieSession,
-  RequiredSessionRequest,
-  SessionFlashData,
-  SessionRequest
+	CookieSession,
+	RequiredSessionRequest,
+	SessionFlashData,
+	SessionRequest,
 } from "./session.interfaces";
 
 /**
@@ -18,35 +18,35 @@ const SESSION_SECRET = process.env.SERVER_DASHBOARD_SESSION_SECRET as string;
 const SESSION_IS_SECURE = Boolean(process.env.NODE_ENV === "production");
 
 const {
-  getSession: getSessionCookie,
-  commitSession,
-  destroySession
+	getSession: getSessionCookie,
+	commitSession,
+	destroySession,
 } = createCookieSessionStorage<CookieSession, SessionFlashData>({
-  cookie: {
-    name: SESSION_IS_SECURE ? "__Secure-Session" : "__Session",
-    /**
-     * Prevent client-side JavaScript from accessing the cookie.
-     */
-    httpOnly: true,
-    /**
-     * Cookie is available for the entire application.
-     */
-    path: "/",
-    /**
-     * Helps prevent CSRF while allowing navigation from external sites.
-     *
-     */
-    sameSite: "lax",
-    /**
-     * Used to sign and verify the integrity of the cookie.
-     * example: "openssl rand -base64 32"
-     */
-    secrets: [SESSION_SECRET],
-    /**
-     * Ensures cookies are sent only over HTTPS in production.
-     */
-    secure: SESSION_IS_SECURE
-  }
+	cookie: {
+		name: SESSION_IS_SECURE ? "__Secure-Session" : "__Session",
+		/**
+		 * Prevent client-side JavaScript from accessing the cookie.
+		 */
+		httpOnly: true,
+		/**
+		 * Cookie is available for the entire application.
+		 */
+		path: "/",
+		/**
+		 * Helps prevent CSRF while allowing navigation from external sites.
+		 *
+		 */
+		sameSite: "lax",
+		/**
+		 * Used to sign and verify the integrity of the cookie.
+		 * example: "openssl rand -base64 32"
+		 */
+		secrets: [SESSION_SECRET],
+		/**
+		 * Ensures cookies are sent only over HTTPS in production.
+		 */
+		secure: SESSION_IS_SECURE,
+	},
 });
 
 /**
@@ -55,22 +55,20 @@ const {
  * @param headers - Cookie header from the HTTP request
  * @returns An object containing session data (if present) and authentication status
  */
-export const getSession = async (
-  headers: string | null
-): Promise<SessionRequest> => {
-  const session = await getSessionCookie(headers);
+export const getSession = async (headers: string | null): Promise<SessionRequest> => {
+	const session = await getSessionCookie(headers);
 
-  const isAuthenticated = Boolean(session.get("refreshToken"));
+	const isAuthenticated = Boolean(session.get("refreshToken"));
 
-  if (!isAuthenticated) {
-    return { session: null, isAuthenticated };
-  }
+	if (!isAuthenticated) {
+		return { session: null, isAuthenticated };
+	}
 
-  const sessionData: CookieSession = {
-    refreshToken: String(session.get("refreshToken"))
-  };
+	const sessionData: CookieSession = {
+		refreshToken: String(session.get("refreshToken")),
+	};
 
-  return { session: sessionData, isAuthenticated };
+	return { session: sessionData, isAuthenticated };
 };
 
 /**
@@ -81,30 +79,30 @@ export const getSession = async (
  * @returns A strongly typed session and auth status
  */
 export const getRequiredSession = async (
-  headers: string | null
+	headers: string | null,
 ): Promise<RequiredSessionRequest> => {
-  const { session, ...rest } = await getSession(headers);
+	const { session, ...rest } = await getSession(headers);
 
-  /**
-   * Retrieve raw session for cookie destruction in case of redirection.
-   */
-  const sessionCookie = await getSessionCookie(headers);
+	/**
+	 * Retrieve raw session for cookie destruction in case of redirection.
+	 */
+	const sessionCookie = await getSessionCookie(headers);
 
-  /**
-   * If session is missing, redirect to login and clear existing cookie.
-   * This is important to prevent unauthorized access to protected routes.
-   * The session is destroyed to ensure that the user cannot access any
-   * protected resources without re-authenticating.
-   */
-  if (!session) {
-    throw redirect("/auth/login", {
-      headers: {
-        "Set-Cookie": await destroySession(sessionCookie)
-      }
-    });
-  }
+	/**
+	 * If session is missing, redirect to login and clear existing cookie.
+	 * This is important to prevent unauthorized access to protected routes.
+	 * The session is destroyed to ensure that the user cannot access any
+	 * protected resources without re-authenticating.
+	 */
+	if (!session) {
+		throw redirect("/auth/login", {
+			headers: {
+				"Set-Cookie": await destroySession(sessionCookie),
+			},
+		});
+	}
 
-  return { session, ...rest };
+	return { session, ...rest };
 };
 
 /**
@@ -118,19 +116,17 @@ export const getRequiredSession = async (
  * @returns null if the user is unauthenticated
  * @throws Redirects to the home page if the user is authenticated
  */
-export const getUnauthenticatedSession = async (
-  headers: string | null
-): Promise<null> => {
-  const { isAuthenticated } = await getSession(headers);
+export const getUnauthenticatedSession = async (headers: string | null): Promise<null> => {
+	const { isAuthenticated } = await getSession(headers);
 
-  /**
-   * Redirect authenticated users away from login/registration pages.
-   */
-  if (isAuthenticated) {
-    throw redirect("/");
-  }
+	/**
+	 * Redirect authenticated users away from login/registration pages.
+	 */
+	if (isAuthenticated) {
+		throw redirect("/");
+	}
 
-  return null;
+	return null;
 };
 
 /**

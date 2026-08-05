@@ -24,7 +24,7 @@ export const shouldRevalidate = () => true;
  * @returns null if user is not authenticated; otherwise redirects
  */
 export async function loader({ request }: Route.LoaderArgs) {
-  return await getUnauthenticatedSession(request.headers.get("Cookie"));
+	return await getUnauthenticatedSession(request.headers.get("Cookie"));
 }
 
 /**
@@ -36,17 +36,17 @@ export async function loader({ request }: Route.LoaderArgs) {
  * Note: Authenticated users are redirected away from this layout via the loader.
  */
 export default function AuthenticationFlowLayout() {
-  return (
-    <LayoutRoot>
-      {/* Header with app branding or navigation (minimal) */}
-      <LayoutHeader />
+	return (
+		<LayoutRoot>
+			{/* Header with app branding or navigation (minimal) */}
+			<LayoutHeader />
 
-      {/* Content area where authentication routes are rendered */}
-      <LayoutContent>
-        <Outlet />
-      </LayoutContent>
-    </LayoutRoot>
-  );
+			{/* Content area where authentication routes are rendered */}
+			<LayoutContent>
+				<Outlet />
+			</LayoutContent>
+		</LayoutRoot>
+	);
 }
 
 /**
@@ -54,11 +54,11 @@ export default function AuthenticationFlowLayout() {
  * Vertically centers the content and ensures full viewport height.
  */
 export const LayoutRoot = styled(Box)(() => ({
-  display: "flex",
-  flexDirection: "column",
-  flexGrow: 1,
-  height: "100%",
-  overflow: "auto"
+	display: "flex",
+	flexDirection: "column",
+	flexGrow: 1,
+	height: "100%",
+	overflow: "auto",
 }));
 
 /**
@@ -66,11 +66,11 @@ export const LayoutRoot = styled(Box)(() => ({
  * Uses padding for spacing, and fills available vertical space.
  */
 export const LayoutContent = styled("div")(({ theme }) => ({
-  display: "flex",
-  flexDirection: "column",
-  alignItems: "center",
-  justifyContent: "center",
-  padding: "80px 40px",
-  backgroundColor: theme.palette.bg.app,
-  flexGrow: 1
+	display: "flex",
+	flexDirection: "column",
+	alignItems: "center",
+	justifyContent: "center",
+	padding: "80px 40px",
+	backgroundColor: theme.palette.bg.app,
+	flexGrow: 1,
 }));

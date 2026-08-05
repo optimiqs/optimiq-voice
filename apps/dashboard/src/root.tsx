@@ -1,10 +1,10 @@
 import {
-  isRouteErrorResponse,
-  Links,
-  Meta,
-  Outlet,
-  Scripts,
-  ScrollRestoration
+	isRouteErrorResponse,
+	Links,
+	Meta,
+	Outlet,
+	Scripts,
+	ScrollRestoration,
 } from "react-router";
 import { ErrorLayout } from "./core/components/general/error-boundary/error-boundary";
 import { Splash } from "./core/components/general/splash/splash";
@@ -23,21 +23,21 @@ import type React from "react";
  * and a stylesheet link to the Google Fonts stylesheet.
  */
 export const links: Route.LinksFunction = () => [
-  { rel: "preconnect", href: "https://fonts.googleapis.com" },
-  {
-    rel: "preconnect",
-    href: "https://fonts.gstatic.com",
-    crossOrigin: "anonymous"
-  },
-  {
-    rel: "stylesheet",
-    href: "https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600&display=swap"
-  },
-  {
-    rel: "stylesheet",
-    href: "https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@100..700&display=swap"
-  },
-  { rel: "stylesheet", href: stylesheet }
+	{ rel: "preconnect", href: "https://fonts.googleapis.com" },
+	{
+		rel: "preconnect",
+		href: "https://fonts.gstatic.com",
+		crossOrigin: "anonymous",
+	},
+	{
+		rel: "stylesheet",
+		href: "https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600&display=swap",
+	},
+	{
+		rel: "stylesheet",
+		href: "https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@100..700&display=swap",
+	},
+	{ rel: "stylesheet", href: stylesheet },
 ];
 
 /**
@@ -47,7 +47,7 @@ export const links: Route.LinksFunction = () => [
  * In this case, we are adding a title and description meta tag.
  */
 export function meta() {
-  return metadata();
+	return metadata();
 }
 
 /**
@@ -79,7 +79,7 @@ export { rootAuthLoader as loader } from "./auth/services/sessions/auth.loader.s
  * while the app is hydrating.
  */
 export function HydrateFallback() {
-  return <Splash message="Loading Optimiq Voice Dashboard..." />;
+	return <Splash message="Loading Optimiq Voice Dashboard..." />;
 }
 
 /**
@@ -92,26 +92,23 @@ export function HydrateFallback() {
  * to wrap the children of the app.
  */
 export function Layout({ children }: { children: React.ReactNode }) {
-  return (
-    <html lang="en" translate="no" suppressHydrationWarning>
-      <head>
-        <meta charSet="utf-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <meta name="google" content="notranslate" />
-        <meta
-          name="format-detection"
-          content="telephone=no, date=no, email=no, address=no"
-        />
-        <Meta />
-        <Links />
-      </head>
-      <body>
-        <Providers>{children}</Providers>
-        <ScrollRestoration />
-        <Scripts />
-      </body>
-    </html>
-  );
+	return (
+		<html lang="en" translate="no" suppressHydrationWarning>
+			<head>
+				<meta charSet="utf-8" />
+				<meta name="viewport" content="width=device-width, initial-scale=1" />
+				<meta name="google" content="notranslate" />
+				<meta name="format-detection" content="telephone=no, date=no, email=no, address=no" />
+				<Meta />
+				<Links />
+			</head>
+			<body>
+				<Providers>{children}</Providers>
+				<ScrollRestoration />
+				<Scripts />
+			</body>
+		</html>
+	);
 }
 
 /**
@@ -123,11 +120,11 @@ export function Layout({ children }: { children: React.ReactNode }) {
  * which is used to render the child routes of the app.
  */
 export default function App({ loaderData: { session } }: Route.ComponentProps) {
-  return (
-    <OptimiqVoiceProvider initialSession={session}>
-      <Outlet />
-    </OptimiqVoiceProvider>
-  );
+	return (
+		<OptimiqVoiceProvider initialSession={session}>
+			<Outlet />
+		</OptimiqVoiceProvider>
+	);
 }
 
 /**
@@ -139,7 +136,7 @@ export default function App({ loaderData: { session } }: Route.ComponentProps) {
  * which is used to render the error page of the app.
  */
 export function ErrorBoundary({ error }: Route.ErrorBoundaryProps) {
-  const code = isRouteErrorResponse(error) ? error.status : 500;
+	const code = isRouteErrorResponse(error) ? error.status : 500;
 
-  return <ErrorLayout errorCode={code} />;
+	return <ErrorLayout errorCode={code} />;
 }

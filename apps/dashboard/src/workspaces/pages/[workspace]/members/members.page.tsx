@@ -11,8 +11,8 @@ import { Logger } from "~/core/shared/logger";
 import { PAGE_SIZE } from "~/core/shared/page-sizes.const";
 import { useWorkspaceId } from "~/workspaces/hooks/use-workspace-id";
 import {
-  useWorkspaceRemoveMember,
-  useWorkspaceResendInvite
+	useWorkspaceRemoveMember,
+	useWorkspaceResendInvite,
 } from "~/workspaces/services/workspaces.service";
 import { getColumns } from "./members.columns";
 import { MembersPageHeader } from "./members.page-header";
@@ -28,13 +28,13 @@ import type { WorkspaceMemberDTO } from "./members.interfaces";
  * @returns {Array} An array containing the page metadata.
  */
 export function meta(_: Route.MetaArgs) {
-  return [
-    { title: "Workspace Members | Optimiq Voice" },
-    {
-      name: "description",
-      content: "Manage your workspace members and their permissions."
-    }
-  ];
+	return [
+		{ title: "Workspace Members | Optimiq Voice" },
+		{
+			name: "description",
+			content: "Manage your workspace members and their permissions.",
+		},
+	];
 }
 
 /**
@@ -47,167 +47,165 @@ export function meta(_: Route.MetaArgs) {
  * @returns {JSX.Element} The rendered members page.
  */
 export default function Members() {
-  /** Retrieves the current workspace ID from the URL params. */
-  const workspaceId = useWorkspaceId();
+	/** Retrieves the current workspace ID from the URL params. */
+	const workspaceId = useWorkspaceId();
 
-  /** Get the authenticated user context */
-  const { user, currentWorkspace } = useAuth();
+	/** Get the authenticated user context */
+	const { user, currentWorkspace } = useAuth();
 
-  /** State to hold the current pagination token used to fetch a specific page of data. */
-  const [pageToken, setPageToken] = useState<string | undefined>(undefined);
+	/** State to hold the current pagination token used to fetch a specific page of data. */
+	const [pageToken, setPageToken] = useState<string | undefined>(undefined);
 
-  /** Fetches workspace members using the page size and token for pagination. */
-  const { data, nextPageToken, isLoading } = useUsers({
-    pageSize: PAGE_SIZE,
-    pageToken
-  });
+	/** Fetches workspace members using the page size and token for pagination. */
+	const { data, nextPageToken, isLoading } = useUsers({
+		pageSize: PAGE_SIZE,
+		pageToken,
+	});
 
-  const { mutate: resend } = useWorkspaceResendInvite();
-  const { mutate: removeUser } = useWorkspaceRemoveMember();
+	const { mutate: resend } = useWorkspaceResendInvite();
+	const { mutate: removeUser } = useWorkspaceRemoveMember();
 
-  /** Determine if the current user can delete members (admin or owner only) */
-  const canDeleteMembers = useMemo(() => {
-    if (!user || !data) return false;
+	/** Determine if the current user can delete members (admin or owner only) */
+	const canDeleteMembers = useMemo(() => {
+		if (!user || !data) return false;
 
-    // Find the current user in the members list
-    const currentUserMember = data.find((member) => member.userRef === user.id);
+		// Find the current user in the members list
+		const currentUserMember = data.find((member) => member.userRef === user.id);
 
-    // If the user is found in the members list, check their role
-    if (currentUserMember) {
-      // Only workspace admins and owners can delete members
-      return (
-        currentUserMember.role === Role.WORKSPACE_ADMIN ||
-        currentUserMember.role === Role.WORKSPACE_OWNER
-      );
-    }
+		// If the user is found in the members list, check their role
+		if (currentUserMember) {
+			// Only workspace admins and owners can delete members
+			return (
+				currentUserMember.role === Role.WORKSPACE_ADMIN ||
+				currentUserMember.role === Role.WORKSPACE_OWNER
+			);
+		}
 
-    // If the user is not in the members list, check if they are the workspace owner
-    // The API doesn't return the owner as part of the members list
-    if (currentWorkspace && currentWorkspace.ownerRef === user.id) {
-      return true;
-    }
+		// If the user is not in the members list, check if they are the workspace owner
+		// The API doesn't return the owner as part of the members list
+		if (currentWorkspace && currentWorkspace.ownerRef === user.id) {
+			return true;
+		}
 
-    return false;
-  }, [user, data, currentWorkspace]);
+		return false;
+	}, [user, data, currentWorkspace]);
 
-  /**
-   * Handler for deleting a member (placeholder).
-   * Currently shows a toast indicating the feature is not implemented yet.
-   *
-   * @param {WorkspaceMemberDTO} member - The member to delete.
-   */
-  const onDelete = useCallback(
-    ({ userRef }: WorkspaceMemberDTO) => {
-      try {
-        if (window.confirm("Are you sure you want to remove this member?")) {
-          removeUser(userRef);
-          toast("The member has been removed successfully");
-        }
-      } catch (error) {
-        Logger.error("Failed to remove member", error);
-        toast(getErrorMessage(error));
-      }
-    },
-    [removeUser]
-  );
+	/**
+	 * Handler for deleting a member (placeholder).
+	 * Currently shows a toast indicating the feature is not implemented yet.
+	 *
+	 * @param {WorkspaceMemberDTO} member - The member to delete.
+	 */
+	const onDelete = useCallback(
+		({ userRef }: WorkspaceMemberDTO) => {
+			try {
+				if (window.confirm("Are you sure you want to remove this member?")) {
+					removeUser(userRef);
+					toast("The member has been removed successfully");
+				}
+			} catch (error) {
+				Logger.error("Failed to remove member", error);
+				toast(getErrorMessage(error));
+			}
+		},
+		[removeUser],
+	);
 
-  /**
-   * Handler for sending an email to a member (placeholder).
-   * Currently shows a toast indicating the feature is not implemented yet.
-   *
-   * @param {WorkspaceMemberDTO} member - The member to email.
-   */
-  const onSendEmail = useCallback(
-    async ({ userRef }: WorkspaceMemberDTO) => {
-      try {
-        resend(userRef);
-        toast("The invitation has been resent successfully");
-      } catch (error) {
-        toast(getErrorMessage(error));
-      }
-    },
-    [resend]
-  );
+	/**
+	 * Handler for sending an email to a member (placeholder).
+	 * Currently shows a toast indicating the feature is not implemented yet.
+	 *
+	 * @param {WorkspaceMemberDTO} member - The member to email.
+	 */
+	const onSendEmail = useCallback(
+		async ({ userRef }: WorkspaceMemberDTO) => {
+			try {
+				resend(userRef);
+				toast("The invitation has been resent successfully");
+			} catch (error) {
+				toast(getErrorMessage(error));
+			}
+		},
+		[resend],
+	);
 
-  /** Memoized column definitions to avoid unnecessary re-renders. */
-  const columns = useMemo(
-    () => getColumns(onDelete, onSendEmail, canDeleteMembers),
-    [onDelete, onSendEmail, canDeleteMembers]
-  );
+	/** Memoized column definitions to avoid unnecessary re-renders. */
+	const columns = useMemo(
+		() => getColumns(onDelete, onSendEmail, canDeleteMembers),
+		[onDelete, onSendEmail, canDeleteMembers],
+	);
 
-  /**
-   * Custom hook for table management:
-   * - Handles search functionality
-   * - Handles filtering
-   * - Handles pagination (next/prev pages)
-   * - Handles deletion of selected rows
-   */
-  const {
-    searchBy,
-    setSearchBy,
-    handleNextPage,
-    handlePrevPage,
-    handleSearch,
-    handleDelete,
-    prevTokens
-  } = useResourceTable({
-    data,
-    pageSize: PAGE_SIZE,
-    pageToken,
-    setPageToken,
-    deleteResource: () => {
-      // Placeholder delete implementation
-      return Promise.resolve({ ref: "" });
-    },
-    searchableFields: [], // Specify searchable fields if needed
-    defaultSearchBy: "name"
-  });
+	/**
+	 * Custom hook for table management:
+	 * - Handles search functionality
+	 * - Handles filtering
+	 * - Handles pagination (next/prev pages)
+	 * - Handles deletion of selected rows
+	 */
+	const {
+		searchBy,
+		setSearchBy,
+		handleNextPage,
+		handlePrevPage,
+		handleSearch,
+		handleDelete,
+		prevTokens,
+	} = useResourceTable({
+		data,
+		pageSize: PAGE_SIZE,
+		pageToken,
+		setPageToken,
+		deleteResource: () => {
+			// Placeholder delete implementation
+			return Promise.resolve({ ref: "" });
+		},
+		searchableFields: [], // Specify searchable fields if needed
+		defaultSearchBy: "name",
+	});
 
-  /**
-   * Renders the members page with a header and a data table.
-   */
-  return (
-    <Page variant="form">
-      <MembersPageHeader />
+	/**
+	 * Renders the members page with a header and a data table.
+	 */
+	return (
+		<Page variant="form">
+			<MembersPageHeader />
 
-      <DataTable
-        variant="compact"
-        /** Displays loading state when data is being fetched. */
-        isLoading={isLoading}
-        /** Data to be displayed in the table (filtered based on search). */
-        data={data}
-        /** Column definitions for the table. */
-        columns={columns}
-        /** Function to get a unique row ID for each record. */
-        getRowId={(row) => row.ref}
-        /** Current field selected for searching. */
-        searchBy={searchBy}
-        /** List of searchable fields displayed in the UI. */
-        searchableFields={[]} // Define as needed
-        /** Number of rows per page. */
-        pageSize={PAGE_SIZE}
-        /** Pagination controls for next/prev pages. */
-        pagination={{
-          total: data.length,
-          nextToken: nextPageToken,
-          prevToken: prevTokens.length
-            ? prevTokens[prevTokens.length - 1]
-            : null
-        }}
-        /** Handler for navigating to the next page. */
-        onNextPage={() => handleNextPage(nextPageToken)}
-        /** Handler for navigating to the previous page. */
-        onPrevPage={handlePrevPage}
-        /** Handler for updating the search term. */
-        onSearch={handleSearch}
-        /** Handler for changing the search field. */
-        onSearchByFieldChange={setSearchBy}
-        /** Handler for deleting selected rows. */
-        onDeleteSelected={handleDelete}
-        /** Handler for editing selected rows (currently shows a toast). */
-        onEditSelected={(row) => toast(`Edit: ${row.name}`)}
-        features={["pagination"]}
-      />
-    </Page>
-  );
+			<DataTable
+				variant="compact"
+				/** Displays loading state when data is being fetched. */
+				isLoading={isLoading}
+				/** Data to be displayed in the table (filtered based on search). */
+				data={data}
+				/** Column definitions for the table. */
+				columns={columns}
+				/** Function to get a unique row ID for each record. */
+				getRowId={(row) => row.ref}
+				/** Current field selected for searching. */
+				searchBy={searchBy}
+				/** List of searchable fields displayed in the UI. */
+				searchableFields={[]} // Define as needed
+				/** Number of rows per page. */
+				pageSize={PAGE_SIZE}
+				/** Pagination controls for next/prev pages. */
+				pagination={{
+					total: data.length,
+					nextToken: nextPageToken,
+					prevToken: prevTokens.length ? prevTokens[prevTokens.length - 1] : null,
+				}}
+				/** Handler for navigating to the next page. */
+				onNextPage={() => handleNextPage(nextPageToken)}
+				/** Handler for navigating to the previous page. */
+				onPrevPage={handlePrevPage}
+				/** Handler for updating the search term. */
+				onSearch={handleSearch}
+				/** Handler for changing the search field. */
+				onSearchByFieldChange={setSearchBy}
+				/** Handler for deleting selected rows. */
+				onDeleteSelected={handleDelete}
+				/** Handler for editing selected rows (currently shows a toast). */
+				onEditSelected={(row) => toast(`Edit: ${row.name}`)}
+				features={["pagination"]}
+			/>
+		</Page>
+	);
 }

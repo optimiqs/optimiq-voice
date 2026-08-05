@@ -1,11 +1,11 @@
 import { buildIdentityService } from "@optimiq-voice/identity";
 import {
-  buildAclsService,
-  buildAgentsService,
-  buildCredentialsService,
-  buildDomainsService,
-  buildNumbersService,
-  buildTrunksService
+	buildAclsService,
+	buildAgentsService,
+	buildCredentialsService,
+	buildDomainsService,
+	buildNumbersService,
+	buildTrunksService,
 } from "@optimiq-voice/sipnet";
 import { buildApplicationsService } from "../applications";
 import { buildCallsService } from "../calls";
@@ -26,25 +26,22 @@ const agentsService = buildAgentsService(routrConfig);
 const domainsService = buildDomainsService(routrConfig);
 const credentialsService = buildCredentialsService(routrConfig);
 const trunksService = buildTrunksService(routrConfig);
-const numbersService = buildNumbersService(
-  routrConfig,
-  createCheckNumberPreconditions(db)
-);
+const numbersService = buildNumbersService(routrConfig, createCheckNumberPreconditions(db));
 const aclsService = buildAclsService(routrConfig);
 const welcomeDemoService = buildWelcomeDemoService();
 
 const services = Promise.all([
-  applicationsService,
-  secretsService,
-  callsService,
-  identityService,
-  agentsService,
-  credentialsService,
-  aclsService,
-  numbersService,
-  trunksService,
-  domainsService,
-  welcomeDemoService
+	applicationsService,
+	secretsService,
+	callsService,
+	identityService,
+	agentsService,
+	credentialsService,
+	aclsService,
+	numbersService,
+	trunksService,
+	domainsService,
+	welcomeDemoService,
 ]);
 
 export default services;

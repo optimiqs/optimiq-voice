@@ -5,11 +5,7 @@ import chaiAsPromised from "chai-as-promised";
 import sinon, { createSandbox, match } from "sinon";
 import sinonChai from "sinon-chai";
 /* eslint-disable new-cap */
-import {
-  DialRecordDirection,
-  DialStatus,
-  STASIS_APP_NAME
-} from "@optimiq-voice/common";
+import { DialRecordDirection, DialStatus, STASIS_APP_NAME } from "@optimiq-voice/common";
 import { mediaSessionRef } from "@optimiq-voice/voice/test/helpers";
 import { ASTERISK_SYSTEM_DOMAIN, ASTERISK_TRUNK } from "../../src/envs";
 import { createHandleDialEventsWithVoiceClient } from "../../src/utils";
@@ -24,168 +20,151 @@ chai.use(sinonChai);
 const sandbox = createSandbox();
 
 describe("@voice/handler/Dial", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should dial a number", async function () {
-    // Arrange
-    const ari = getAriStub(sandbox);
-    const createVoiceClient = getCreateVoiceClient(sandbox);
+	it("should dial a number", async function () {
+		// Arrange
+		const ari = getAriStub(sandbox);
+		const createVoiceClient = getCreateVoiceClient(sandbox);
 
-    const request = {
-      mediaSessionRef: "mediaSessionRef",
-      destination: "destination",
-      timeout: 30
-    };
+		const request = {
+			mediaSessionRef: "mediaSessionRef",
+			destination: "destination",
+			timeout: 30,
+		};
 
-    await createDialHandler(ari, createVoiceClient())(request);
+		await createDialHandler(ari, createVoiceClient())(request);
 
-    const channelStub = ari.Channel as unknown as sinon.SinonStub;
+		const channelStub = ari.Channel as unknown as sinon.SinonStub;
 
-    expect(ari.bridges.create).to.have.been.calledOnce;
-    expect(ari.Channel).to.have.been.calledOnce;
-    expect(channelStub.returnValues[0].originate).to.have.been.calledOnce;
-    expect(channelStub.returnValues[0].originate).to.have.been.calledWith({
-      app: STASIS_APP_NAME,
-      endpoint: `PJSIP/${ASTERISK_TRUNK}/sip:${request.destination}@${ASTERISK_SYSTEM_DOMAIN}`,
-      timeout: request.timeout,
-      variables: {
-        "PJSIP_HEADER(add,X-Call-Ref)": match.string,
-        "PJSIP_HEADER(add,X-Dod-Number)": "value",
-        "PJSIP_HEADER(add,X-Is-Api-Originated-Type)": "true"
-      }
-    });
-    expect(channelStub.returnValues[0].once).to.have.been.calledWith(
-      AriEvent.STASIS_START
-    );
-    expect(channelStub.returnValues[0].once).to.have.been.calledWith(
-      AriEvent.CHANNEL_LEFT_BRIDGE
-    );
-    expect(channelStub.returnValues[0].once).to.have.been.calledWith(
-      AriEvent.STASIS_END
-    );
-    expect(channelStub.returnValues[0].on).to.have.been.calledWith(
-      AriEvent.DIAL
-    );
-    expect(createVoiceClient().sendResponse).to.have.been.calledWith({
-      dialResponse: {
-        status: DialStatus.TRYING
-      }
-    });
-  });
+		expect(ari.bridges.create).to.have.been.calledOnce;
+		expect(ari.Channel).to.have.been.calledOnce;
+		expect(channelStub.returnValues[0].originate).to.have.been.calledOnce;
+		expect(channelStub.returnValues[0].originate).to.have.been.calledWith({
+			app: STASIS_APP_NAME,
+			endpoint: `PJSIP/${ASTERISK_TRUNK}/sip:${request.destination}@${ASTERISK_SYSTEM_DOMAIN}`,
+			timeout: request.timeout,
+			variables: {
+				"PJSIP_HEADER(add,X-Call-Ref)": match.string,
+				"PJSIP_HEADER(add,X-Dod-Number)": "value",
+				"PJSIP_HEADER(add,X-Is-Api-Originated-Type)": "true",
+			},
+		});
+		expect(channelStub.returnValues[0].once).to.have.been.calledWith(AriEvent.STASIS_START);
+		expect(channelStub.returnValues[0].once).to.have.been.calledWith(AriEvent.CHANNEL_LEFT_BRIDGE);
+		expect(channelStub.returnValues[0].once).to.have.been.calledWith(AriEvent.STASIS_END);
+		expect(channelStub.returnValues[0].on).to.have.been.calledWith(AriEvent.DIAL);
+		expect(createVoiceClient().sendResponse).to.have.been.calledWith({
+			dialResponse: {
+				status: DialStatus.TRYING,
+			},
+		});
+	});
 
-  it("should handle channel left bridge", async function () {
-    // Arrange
-    const ari = getAriStub(sandbox);
+	it("should handle channel left bridge", async function () {
+		// Arrange
+		const ari = getAriStub(sandbox);
 
-    const bridge = {
-      addChannel: sandbox.stub(),
-      destroy: sandbox.stub()
-    } as unknown as Bridge;
+		const bridge = {
+			addChannel: sandbox.stub(),
+			destroy: sandbox.stub(),
+		} as unknown as Bridge;
 
-    const dialed = ari.Channel();
+		const dialed = ari.Channel();
 
-    // Act
-    await handleChannelLeftBridge({ bridge, dialed })();
+		// Act
+		await handleChannelLeftBridge({ bridge, dialed })();
 
-    // Assert
-    expect(dialed.hangup).to.have.been.calledOnce;
-    expect(bridge.destroy).to.have.been.calledOnce;
-  });
+		// Assert
+		expect(dialed.hangup).to.have.been.calledOnce;
+		expect(bridge.destroy).to.have.been.calledOnce;
+	});
 
-  it("should handle dial events (Channel Unavailable)", async function () {
-    // Arrange
-    const voiceClient = {
-      sendResponse: sandbox.stub()
-    };
+	it("should handle dial events (Channel Unavailable)", async function () {
+		// Arrange
+		const voiceClient = {
+			sendResponse: sandbox.stub(),
+		};
 
-    const event = {
-      dialstatus: "CHANUNAVAIL"
-    };
+		const event = {
+			dialstatus: "CHANUNAVAIL",
+		};
 
-    // Act
-    await createHandleDialEventsWithVoiceClient(
-      voiceClient as unknown as VoiceClient
-    )(event);
+		// Act
+		await createHandleDialEventsWithVoiceClient(voiceClient as unknown as VoiceClient)(event);
 
-    // Assert
-    expect(voiceClient.sendResponse).to.have.been.calledOnce;
-    expect(voiceClient.sendResponse).to.have.been.calledWith({
-      dialResponse: {
-        status: DialStatus.FAILED
-      }
-    });
-  });
+		// Assert
+		expect(voiceClient.sendResponse).to.have.been.calledOnce;
+		expect(voiceClient.sendResponse).to.have.been.calledWith({
+			dialResponse: {
+				status: DialStatus.FAILED,
+			},
+		});
+	});
 
-  it("should handle dial events (Progress)", async function () {
-    // Arrange
-    const voiceClient = {
-      sendResponse: sandbox.stub()
-    };
+	it("should handle dial events (Progress)", async function () {
+		// Arrange
+		const voiceClient = {
+			sendResponse: sandbox.stub(),
+		};
 
-    const event = {
-      dialstatus: "PROGRESS"
-    };
+		const event = {
+			dialstatus: "PROGRESS",
+		};
 
-    // Act
-    await createHandleDialEventsWithVoiceClient(
-      voiceClient as unknown as VoiceClient
-    )(event);
+		// Act
+		await createHandleDialEventsWithVoiceClient(voiceClient as unknown as VoiceClient)(event);
 
-    // Assert
-    expect(voiceClient.sendResponse).to.have.been.calledOnce;
-    expect(voiceClient.sendResponse).to.have.been.calledWith({
-      dialResponse: {
-        status: DialStatus.PROGRESS
-      }
-    });
-  });
+		// Assert
+		expect(voiceClient.sendResponse).to.have.been.calledOnce;
+		expect(voiceClient.sendResponse).to.have.been.calledWith({
+			dialResponse: {
+				status: DialStatus.PROGRESS,
+			},
+		});
+	});
 
-  it("should handle dial events (Ignore event)", async function () {
-    // Arrange
-    const voiceClient = {
-      sendResponse: sandbox.stub()
-    };
+	it("should handle dial events (Ignore event)", async function () {
+		// Arrange
+		const voiceClient = {
+			sendResponse: sandbox.stub(),
+		};
 
-    const event = {
-      dialstatus: "X"
-    };
+		const event = {
+			dialstatus: "X",
+		};
 
-    // Act
-    await createHandleDialEventsWithVoiceClient(
-      voiceClient as unknown as VoiceClient
-    )(event);
+		// Act
+		await createHandleDialEventsWithVoiceClient(voiceClient as unknown as VoiceClient)(event);
 
-    // Assert
-    expect(voiceClient.sendResponse).to.not.have.been.called;
-  });
+		// Assert
+		expect(voiceClient.sendResponse).to.not.have.been.called;
+	});
 
-  it("should handle stasis start", async function () {
-    // Arrange
-    const ari = getAriStub(sandbox) as unknown as Client;
+	it("should handle stasis start", async function () {
+		// Arrange
+		const ari = getAriStub(sandbox) as unknown as Client;
 
-    const request = {
-      mediaSessionRef,
-      recordDirection: DialRecordDirection.IN,
-      destination: "destination"
-    };
+		const request = {
+			mediaSessionRef,
+			recordDirection: DialRecordDirection.IN,
+			destination: "destination",
+		};
 
-    const bridge = {
-      addChannel: sandbox.stub()
-    } as unknown as Bridge;
+		const bridge = {
+			addChannel: sandbox.stub(),
+		} as unknown as Bridge;
 
-    const dialed = ari.Channel();
+		const dialed = ari.Channel();
 
-    // Act
-    await handleStasisStart({ ari, request, bridge, dialed })(
-      undefined,
-      ari.Channel()
-    );
+		// Act
+		await handleStasisStart({ ari, request, bridge, dialed })(undefined, ari.Channel());
 
-    // Assert
-    expect(bridge.addChannel).to.have.been.calledOnce;
-    expect(bridge.addChannel).to.have.been.calledWith({ channel: dialed.id });
-    expect(dialed.hangup).to.not.have.been.called;
-  });
+		// Assert
+		expect(bridge.addChannel).to.have.been.calledOnce;
+		expect(bridge.addChannel).to.have.been.calledWith({ channel: dialed.id });
+		expect(dialed.hangup).to.not.have.been.called;
+	});
 });

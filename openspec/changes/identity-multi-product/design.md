@@ -21,45 +21,45 @@ Instance-level settings are shared; everything identity-facing is per realm.
 ```jsonc
 // Identity SERVICE config
 {
-  "database": { "url": "postgresql://…/identity" },
-  "encryptionKey": "k1.aesgcm256.…", // field-encryption at rest, instance-wide
-  "server": { "port": 50051 },
-  "realms": [
-    {
-      "ref": "qcobro",
-      "name": "QCobro",
-      "issuer": "https://identity.qcobro.com",
-      "audience": "qcobro",
-      "keys": {
-        // per-realm RS256 key pair
-        "privateKeyPath": "/etc/identity/realms/qcobro/private.pem",
-        "publicKeyPath": "/etc/identity/realms/qcobro/public.pem"
-      },
-      "tokens": {
-        "accessTokenExpiresIn": "15m",
-        "refreshTokenExpiresIn": "30d",
-        "idTokenExpiresIn": "15m"
-      },
-      "security": {
-        "contactVerificationRequired": true,
-        "twoFactorAuthenticationRequired": false
-      },
-      "invite": {
-        "url": "https://app.qcobro.com/accept-invite",
-        "failUrl": "…",
-        "expiration": "2d"
-      },
-      "smtp": {
-        "host": "…",
-        "port": 587,
-        "secure": true,
-        "sender": "QCobro <no-reply@qcobro.com>",
-        "auth": { "user": "apikey", "pass": "…" }
-      }
-      // "oauth2": { … optional per-realm providers … }
-    }
-    // … additional realms (e.g. "optimiq-voice") …
-  ]
+	"database": { "url": "postgresql://…/identity" },
+	"encryptionKey": "k1.aesgcm256.…", // field-encryption at rest, instance-wide
+	"server": { "port": 50051 },
+	"realms": [
+		{
+			"ref": "qcobro",
+			"name": "QCobro",
+			"issuer": "https://identity.qcobro.com",
+			"audience": "qcobro",
+			"keys": {
+				// per-realm RS256 key pair
+				"privateKeyPath": "/etc/identity/realms/qcobro/private.pem",
+				"publicKeyPath": "/etc/identity/realms/qcobro/public.pem",
+			},
+			"tokens": {
+				"accessTokenExpiresIn": "15m",
+				"refreshTokenExpiresIn": "30d",
+				"idTokenExpiresIn": "15m",
+			},
+			"security": {
+				"contactVerificationRequired": true,
+				"twoFactorAuthenticationRequired": false,
+			},
+			"invite": {
+				"url": "https://app.qcobro.com/accept-invite",
+				"failUrl": "…",
+				"expiration": "2d",
+			},
+			"smtp": {
+				"host": "…",
+				"port": 587,
+				"secure": true,
+				"sender": "QCobro <no-reply@qcobro.com>",
+				"auth": { "user": "apikey", "pass": "…" },
+			},
+			// "oauth2": { … optional per-realm providers … }
+		},
+		// … additional realms (e.g. "optimiq-voice") …
+	],
 }
 ```
 

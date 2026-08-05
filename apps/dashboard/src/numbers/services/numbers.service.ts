@@ -1,9 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
 import {
-  type INumber as Resource,
-  type CreateNumberRequest as ResourceCreateRequest,
-  type ListNumbersRequest as ResourceListRequest,
-  type UpdateNumberRequest as ResourceUpdateRequest
+	type INumber as Resource,
+	type CreateNumberRequest as ResourceCreateRequest,
+	type ListNumbersRequest as ResourceListRequest,
+	type UpdateNumberRequest as ResourceUpdateRequest,
 } from "@optimiq-voice/types";
 import { useOptimisticCreateResource } from "~/core/hooks/use-optimistic-create-resource";
 import { useOptimisticDeleteResource } from "~/core/hooks/use-optimistic-delete-resource";
@@ -35,19 +35,19 @@ export const RESOURCE_QUERY_KEY = ["resource:number"];
  * @returns A React Query object containing number data and query metadata.
  */
 export const useNumbers = (params?: ResourceListRequest) => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const { data, ...rest } = useQuery({
-    queryKey: [...COLLECTION_QUERY_KEY, workspaceId, params],
-    queryFn: async () => await sdk.numbers.listNumbers({ ...params })
-  });
+	const { data, ...rest } = useQuery({
+		queryKey: [...COLLECTION_QUERY_KEY, workspaceId, params],
+		queryFn: async () => await sdk.numbers.listNumbers({ ...params }),
+	});
 
-  return {
-    data: data?.items || [],
-    nextPageToken: data?.nextPageToken,
-    ...rest
-  };
+	return {
+		data: data?.items || [],
+		nextPageToken: data?.nextPageToken,
+		...rest,
+	};
 };
 
 /**
@@ -64,16 +64,16 @@ export const useNumbers = (params?: ResourceListRequest) => {
  * @returns A React Query result object containing the number and metadata.
  */
 export const useNumber = (ref: string) => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const { data = null, ...rest } = useQuery({
-    queryKey: [...RESOURCE_QUERY_KEY, workspaceId, ref],
-    queryFn: async () => sdk.numbers.getNumber(ref),
-    enabled: !!ref
-  });
+	const { data = null, ...rest } = useQuery({
+		queryKey: [...RESOURCE_QUERY_KEY, workspaceId, ref],
+		queryFn: async () => sdk.numbers.getNumber(ref),
+		enabled: !!ref,
+	});
 
-  return { data, ...rest };
+	return { data, ...rest };
 };
 
 /**
@@ -88,17 +88,17 @@ export const useNumber = (ref: string) => {
  * @returns A mutation object that can be used to trigger the creation.
  */
 export const useCreateNumber = () => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
-  const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
+	const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
+	const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
 
-  return useOptimisticCreateResource<Resource, ResourceCreateRequest>(
-    (req) => sdk.numbers.createNumber(req),
-    COLLECTION_KEY,
-    RESOURCE_KEY
-  );
+	return useOptimisticCreateResource<Resource, ResourceCreateRequest>(
+		(req) => sdk.numbers.createNumber(req),
+		COLLECTION_KEY,
+		RESOURCE_KEY,
+	);
 };
 
 /**
@@ -113,17 +113,17 @@ export const useCreateNumber = () => {
  * @returns A mutation object for updating an number.
  */
 export const useUpdateNumber = () => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
-  const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
+	const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
+	const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
 
-  return useOptimisticUpdateResource<Resource, ResourceUpdateRequest>(
-    (req) => sdk.numbers.updateNumber(req),
-    COLLECTION_KEY,
-    RESOURCE_KEY
-  );
+	return useOptimisticUpdateResource<Resource, ResourceUpdateRequest>(
+		(req) => sdk.numbers.updateNumber(req),
+		COLLECTION_KEY,
+		RESOURCE_KEY,
+	);
 };
 
 /**
@@ -137,15 +137,15 @@ export const useUpdateNumber = () => {
  * @returns A mutation object for deleting an number.
  */
 export const useDeleteNumber = () => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
-  const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
+	const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
+	const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
 
-  return useOptimisticDeleteResource(
-    (ref) => sdk.numbers.deleteNumber(ref),
-    COLLECTION_KEY,
-    RESOURCE_KEY
-  );
+	return useOptimisticDeleteResource(
+		(ref) => sdk.numbers.deleteNumber(ref),
+		COLLECTION_KEY,
+		RESOURCE_KEY,
+	);
 };

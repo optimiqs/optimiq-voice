@@ -1,9 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
 import {
-  type Secret as Resource,
-  type CreateSecretRequest as ResourceCreateRequest,
-  type ListSecretsRequest as ResourceListRequest,
-  type UpdateSecretRequest as ResourceUpdateRequest
+	type Secret as Resource,
+	type CreateSecretRequest as ResourceCreateRequest,
+	type ListSecretsRequest as ResourceListRequest,
+	type UpdateSecretRequest as ResourceUpdateRequest,
 } from "@optimiq-voice/types";
 import { useOptimisticCreateResource } from "~/core/hooks/use-optimistic-create-resource";
 import { useOptimisticDeleteResource } from "~/core/hooks/use-optimistic-delete-resource";
@@ -35,19 +35,19 @@ export const RESOURCE_QUERY_KEY = ["resource:secret"];
  * @returns A React Query object containing secret data and query metadata.
  */
 export const useSecrets = (params?: ResourceListRequest) => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const { data, ...rest } = useQuery({
-    queryKey: [...COLLECTION_QUERY_KEY, workspaceId, params],
-    queryFn: async () => await sdk.secrets.listSecrets({ ...params })
-  });
+	const { data, ...rest } = useQuery({
+		queryKey: [...COLLECTION_QUERY_KEY, workspaceId, params],
+		queryFn: async () => await sdk.secrets.listSecrets({ ...params }),
+	});
 
-  return {
-    data: data?.items || [],
-    nextPageToken: data?.nextPageToken,
-    ...rest
-  };
+	return {
+		data: data?.items || [],
+		nextPageToken: data?.nextPageToken,
+		...rest,
+	};
 };
 
 /**
@@ -64,16 +64,16 @@ export const useSecrets = (params?: ResourceListRequest) => {
  * @returns A React Query result object containing the secret and metadata.
  */
 export const useSecret = (ref: string) => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const { data = null, ...rest } = useQuery({
-    queryKey: [...RESOURCE_QUERY_KEY, workspaceId, ref],
-    queryFn: async () => sdk.secrets.getSecret(ref),
-    enabled: !!ref
-  });
+	const { data = null, ...rest } = useQuery({
+		queryKey: [...RESOURCE_QUERY_KEY, workspaceId, ref],
+		queryFn: async () => sdk.secrets.getSecret(ref),
+		enabled: !!ref,
+	});
 
-  return { data, ...rest };
+	return { data, ...rest };
 };
 
 /**
@@ -88,17 +88,17 @@ export const useSecret = (ref: string) => {
  * @returns A mutation object that can be used to trigger the creation.
  */
 export const useCreateSecret = () => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
-  const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
+	const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
+	const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
 
-  return useOptimisticCreateResource<Resource, ResourceCreateRequest>(
-    (req) => sdk.secrets.createSecret(req),
-    COLLECTION_KEY,
-    RESOURCE_KEY
-  );
+	return useOptimisticCreateResource<Resource, ResourceCreateRequest>(
+		(req) => sdk.secrets.createSecret(req),
+		COLLECTION_KEY,
+		RESOURCE_KEY,
+	);
 };
 
 /**
@@ -113,17 +113,17 @@ export const useCreateSecret = () => {
  * @returns A mutation object for updating an secret.
  */
 export const useUpdateSecret = () => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
-  const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
+	const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
+	const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
 
-  return useOptimisticUpdateResource<Resource, ResourceUpdateRequest>(
-    (req) => sdk.secrets.updateSecret(req),
-    COLLECTION_KEY,
-    RESOURCE_KEY
-  );
+	return useOptimisticUpdateResource<Resource, ResourceUpdateRequest>(
+		(req) => sdk.secrets.updateSecret(req),
+		COLLECTION_KEY,
+		RESOURCE_KEY,
+	);
 };
 
 /**
@@ -137,15 +137,15 @@ export const useUpdateSecret = () => {
  * @returns A mutation object for deleting an secret.
  */
 export const useDeleteSecret = () => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
-  const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
+	const COLLECTION_KEY = [...COLLECTION_QUERY_KEY, workspaceId];
+	const RESOURCE_KEY = [...RESOURCE_QUERY_KEY, workspaceId];
 
-  return useOptimisticDeleteResource(
-    (ref) => sdk.secrets.deleteSecret(ref),
-    COLLECTION_KEY,
-    RESOURCE_KEY
-  );
+	return useOptimisticDeleteResource(
+		(ref) => sdk.secrets.deleteSecret(ref),
+		COLLECTION_KEY,
+		RESOURCE_KEY,
+	);
 };

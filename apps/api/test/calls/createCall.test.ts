@@ -13,52 +13,52 @@ chai.use(sinonChai);
 const sandbox = createSandbox();
 
 describe("@calls/createCall", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should create a call", async function () {
-    // Arrange
-    const { createCall } = await import("../../src/calls/createCall");
-    const metadata = new Metadata();
-    metadata.set("token", TEST_TOKEN);
-    const publisher = {
-      publishCall: sandbox.stub()
-    };
-    const call = {
-      metadata,
-      request: {
-        from: "+1234567890",
-        to: "+1234567891",
-        appRef: TEST_UUID
-      }
-    };
+	it("should create a call", async function () {
+		// Arrange
+		const { createCall } = await import("../../src/calls/createCall");
+		const metadata = new Metadata();
+		metadata.set("token", TEST_TOKEN);
+		const publisher = {
+			publishCall: sandbox.stub(),
+		};
+		const call = {
+			metadata,
+			request: {
+				from: "+1234567890",
+				to: "+1234567891",
+				appRef: TEST_UUID,
+			},
+		};
 
-    const application = {
-      ref: TEST_UUID,
-      name: "My Application",
-      endpoint: "example.com:50051",
-      accessKeyId: "GRahn02s8tgdfghz72vb0fz538qpb5z35p",
-      createdAt: new Date(),
-      updatedAt: new Date()
-    };
+		const application = {
+			ref: TEST_UUID,
+			name: "My Application",
+			endpoint: "example.com:50051",
+			accessKeyId: "GRahn02s8tgdfghz72vb0fz538qpb5z35p",
+			createdAt: new Date(),
+			updatedAt: new Date(),
+		};
 
-    const applications = {
-      application: {
-        findUnique: sandbox.stub().resolves(application)
-      }
-    } as unknown as Database;
+		const applications = {
+			application: {
+				findUnique: sandbox.stub().resolves(application),
+			},
+		} as unknown as Database;
 
-    // Act
-    await createCall(applications, publisher)(call, sandbox.stub());
+		// Act
+		await createCall(applications, publisher)(call, sandbox.stub());
 
-    // Assert
-    expect(publisher.publishCall).to.have.been.calledOnce;
-    expect(applications.application.findUnique).to.have.been.calledOnce;
-    expect(publisher.publishCall).to.have.been.calledWithMatch({
-      from: "+1234567890",
-      to: "+1234567891",
-      appRef: TEST_UUID
-    });
-  });
+		// Assert
+		expect(publisher.publishCall).to.have.been.calledOnce;
+		expect(applications.application.findUnique).to.have.been.calledOnce;
+		expect(publisher.publishCall).to.have.been.calledWithMatch({
+			from: "+1234567890",
+			to: "+1234567891",
+			appRef: TEST_UUID,
+		});
+	});
 });

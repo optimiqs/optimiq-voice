@@ -4,20 +4,20 @@ import { VoiceClient } from "../types";
 import { withErrorHandling } from "./utils/withErrorHandling";
 
 function createMuteHandler(ari: Client, voiceClient: VoiceClient) {
-  return withErrorHandling(async (request: MuteRequest) => {
-    const { mediaSessionRef, direction } = request;
+	return withErrorHandling(async (request: MuteRequest) => {
+		const { mediaSessionRef, direction } = request;
 
-    await ari.channels.mute({
-      channelId: mediaSessionRef,
-      direction
-    });
+		await ari.channels.mute({
+			channelId: mediaSessionRef,
+			direction,
+		});
 
-    voiceClient.sendResponse({
-      muteResponse: {
-        mediaSessionRef
-      }
-    });
-  });
+		voiceClient.sendResponse({
+			muteResponse: {
+				mediaSessionRef,
+			},
+		});
+	});
 }
 
 export { createMuteHandler };

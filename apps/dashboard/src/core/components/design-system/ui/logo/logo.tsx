@@ -2,9 +2,9 @@ import { LogoLarge } from "./logo-large";
 import { LogoSmall } from "./logo-small";
 
 export interface LogoProps {
-  size?: "micro" | "large";
+	size?: "micro" | "large";
 }
 
 export function Logo({ size = "large" }: LogoProps) {
-  return size === "large" ? <LogoLarge /> : <LogoSmall />;
+	return size === "large" ? <LogoLarge /> : <LogoSmall />;
 }

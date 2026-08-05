@@ -1,51 +1,51 @@
 import { BaseApiObject, ListResponse } from "./common";
 
 enum CallType {
-  SIP_ORIGINATED = "SIP_ORIGINATED",
-  API_ORIGINATED = "API_ORIGINATED"
+	SIP_ORIGINATED = "SIP_ORIGINATED",
+	API_ORIGINATED = "API_ORIGINATED",
 }
 
 enum CallStatus {
-  NORMAL_CLEARING = "NORMAL_CLEARING",
-  CALL_REJECTED = "CALL_REJECTED",
-  UNALLOCATED = "UNALLOCATED",
-  NO_USER_RESPONSE = "NO_USER_RESPONSE",
-  NO_ROUTE_DESTINATION = "NO_ROUTE_DESTINATION",
-  NO_ANSWER = "NO_ANSWER",
-  USER_BUSY = "USER_BUSY",
-  NOT_ACCEPTABLE_HERE = "NOT_ACCEPTABLE_HERE",
-  SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE",
-  INVALID_NUMBER_FORMAT = "INVALID_NUMBER_FORMAT"
+	NORMAL_CLEARING = "NORMAL_CLEARING",
+	CALL_REJECTED = "CALL_REJECTED",
+	UNALLOCATED = "UNALLOCATED",
+	NO_USER_RESPONSE = "NO_USER_RESPONSE",
+	NO_ROUTE_DESTINATION = "NO_ROUTE_DESTINATION",
+	NO_ANSWER = "NO_ANSWER",
+	USER_BUSY = "USER_BUSY",
+	NOT_ACCEPTABLE_HERE = "NOT_ACCEPTABLE_HERE",
+	SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE",
+	INVALID_NUMBER_FORMAT = "INVALID_NUMBER_FORMAT",
 }
 
 enum CallDirection {
-  FROM_PSTN = "FROM_PSTN",
-  TO_PSTN = "TO_PSTN",
-  INTRA_NETWORK = "INTRA_NETWORK"
+	FROM_PSTN = "FROM_PSTN",
+	TO_PSTN = "TO_PSTN",
+	INTRA_NETWORK = "INTRA_NETWORK",
 }
 
 type CallDetailRecord = {
-  ref: string;
-  accessKeyId: string;
-  status: CallStatus;
-  type: CallType;
-  from: string;
-  to: string;
-  duration: number;
-  direction: CallDirection;
-  startedAt: Date;
-  endedAt: Date;
+	ref: string;
+	accessKeyId: string;
+	status: CallStatus;
+	type: CallType;
+	from: string;
+	to: string;
+	duration: number;
+	direction: CallDirection;
+	startedAt: Date;
+	endedAt: Date;
 };
 
 type ListCallsRequest = {
-  after?: string;
-  before?: string;
-  type?: CallType;
-  status?: CallStatus;
-  from?: string;
-  to?: string;
-  pageSize?: number;
-  pageToken?: string;
+	after?: string;
+	before?: string;
+	type?: CallType;
+	status?: CallStatus;
+	from?: string;
+	to?: string;
+	pageSize?: number;
+	pageToken?: string;
 };
 
 type ListCallsResponse = ListResponse<CallDetailRecord>;
@@ -53,37 +53,37 @@ type ListCallsResponse = ListResponse<CallDetailRecord>;
 // If appRef is not provided, we will use the application associated
 // with the 'from' number
 type CreateCallRequest = {
-  from: string;
-  to: string;
-  appRef?: string;
-  timeout?: number;
-  metadata?: Record<string, unknown>;
+	from: string;
+	to: string;
+	appRef?: string;
+	timeout?: number;
+	metadata?: Record<string, unknown>;
 };
 
 type CallPublisher = {
-  publishCall: (event: CreateCallRequest & BaseApiObject) => void;
+	publishCall: (event: CreateCallRequest & BaseApiObject) => void;
 };
 
 type TrackCallResponse = {
-  ref: string;
-  status: CallStatus;
+	ref: string;
+	status: CallStatus;
 };
 
 type TrackCallSubscriber = {
-  events: {
-    on: (event: string, cb: (data: TrackCallResponse | Error) => void) => void;
-  };
+	events: {
+		on: (event: string, cb: (data: TrackCallResponse | Error) => void) => void;
+	};
 };
 
 export {
-  CallDetailRecord,
-  CallDirection,
-  CallPublisher,
-  CallStatus,
-  CallType,
-  CreateCallRequest,
-  ListCallsRequest,
-  ListCallsResponse,
-  TrackCallResponse,
-  TrackCallSubscriber
+	CallDetailRecord,
+	CallDirection,
+	CallPublisher,
+	CallStatus,
+	CallType,
+	CreateCallRequest,
+	ListCallsRequest,
+	ListCallsResponse,
+	TrackCallResponse,
+	TrackCallSubscriber,
 };

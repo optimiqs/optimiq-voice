@@ -1,40 +1,40 @@
 import { create } from "@storybook/theming/create";
 
 export default create({
-  base: "light",
-  // Typography
-  fontBase: '"Open Sans", sans-serif',
-  fontCode: "monospace",
+	base: "light",
+	// Typography
+	fontBase: '"Open Sans", sans-serif',
+	fontCode: "monospace",
 
-  brandTitle: "Optimiq Voice Design System",
-  brandUrl: "https://optimiq.health",
-  brandImage: "/images/logo.svg",
-  brandTarget: "_self",
+	brandTitle: "Optimiq Voice Design System",
+	brandUrl: "https://optimiq.health",
+	brandImage: "/images/logo.svg",
+	brandTarget: "_self",
 
-  // Primary colors
-  colorPrimary: "#39e19e",
-  colorSecondary: "#053204",
+	// Primary colors
+	colorPrimary: "#39e19e",
+	colorSecondary: "#053204",
 
-  // UI
-  appBg: "#ffffff",
-  appContentBg: "#ffffff",
-  appPreviewBg: "#ffffff",
-  appBorderColor: "#10162F",
-  appBorderRadius: 4,
+	// UI
+	appBg: "#ffffff",
+	appContentBg: "#ffffff",
+	appPreviewBg: "#ffffff",
+	appBorderColor: "#10162F",
+	appBorderRadius: 4,
 
-  // Text colors
-  textColor: "#053204",
-  textInverseColor: "#ffffff",
+	// Text colors
+	textColor: "#053204",
+	textInverseColor: "#ffffff",
 
-  // Toolbar default and active colors
-  barTextColor: "#053204",
-  barSelectedColor: "#053204",
-  barHoverColor: "#39e19e",
-  barBg: "#ffffff",
+	// Toolbar default and active colors
+	barTextColor: "#053204",
+	barSelectedColor: "#053204",
+	barHoverColor: "#39e19e",
+	barBg: "#ffffff",
 
-  // Form colors
-  inputBg: "#ffffff",
-  inputBorder: "#10162F",
-  inputTextColor: "#053204",
-  inputBorderRadius: 2
+	// Form colors
+	inputBg: "#ffffff",
+	inputBorder: "#10162F",
+	inputTextColor: "#053204",
+	inputBorderRadius: 2,
 });

@@ -14,11 +14,9 @@ The interface is defined as follows:
 
 ```typescript
 type AuthzHandler = {
-  checkSessionAuthorized(request: VoiceRequest): Promise<boolean>;
-  checkMethodAuthorized(
-    request: CheckMethodAuthorizedRequest
-  ): Promise<boolean>;
-  addBillingMeterEvent(request: AddBillingMeterEventRequest): Promise<void>;
+	checkSessionAuthorized(request: VoiceRequest): Promise<boolean>;
+	checkMethodAuthorized(request: CheckMethodAuthorizedRequest): Promise<boolean>;
+	addBillingMeterEvent(request: AddBillingMeterEventRequest): Promise<void>;
 };
 ```
 

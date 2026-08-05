@@ -14,31 +14,31 @@ const sandbox = createSandbox();
 const channelId = "channel-id";
 
 describe("@voice/handler/Unmute", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should handle a Unmute command", async function () {
-    // Arrange
-    const ari = getAriStub(sandbox);
+	it("should handle a Unmute command", async function () {
+		// Arrange
+		const ari = getAriStub(sandbox);
 
-    const createVoiceClient = getCreateVoiceClient(sandbox);
+		const createVoiceClient = getCreateVoiceClient(sandbox);
 
-    const unmuteRequest = {
-      mediaSessionRef: channelId,
-      direction: MuteDirection.BOTH
-    };
+		const unmuteRequest = {
+			mediaSessionRef: channelId,
+			direction: MuteDirection.BOTH,
+		};
 
-    // Act
-    await createUnmuteHandler(ari, createVoiceClient())(unmuteRequest);
+		// Act
+		await createUnmuteHandler(ari, createVoiceClient())(unmuteRequest);
 
-    // Assert
-    expect(createVoiceClient().sendResponse).to.have.been.calledOnce;
-    expect(ari.channels.unmute).to.have.been.calledOnce;
-    expect(ari.channels.unmute).to.have.been.calledWith({
-      channelId,
-      direction: unmuteRequest.direction
-    });
-    expect(ari.channels.mute).to.not.have.been.called;
-  });
+		// Assert
+		expect(createVoiceClient().sendResponse).to.have.been.calledOnce;
+		expect(ari.channels.unmute).to.have.been.calledOnce;
+		expect(ari.channels.unmute).to.have.been.calledWith({
+			channelId,
+			direction: unmuteRequest.direction,
+		});
+		expect(ari.channels.mute).to.not.have.been.called;
+	});
 });

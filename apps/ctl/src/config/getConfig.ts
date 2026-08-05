@@ -3,14 +3,14 @@ import { WorkspaceConfig } from "./types";
 // import { workspaceConfigSchema } from "./validations";
 
 function getConfig(path: string): WorkspaceConfig[] {
-  if (!fs.existsSync(path)) {
-    return [];
-  }
+	if (!fs.existsSync(path)) {
+		return [];
+	}
 
-  const data = fs.readFileSync(path, "utf8");
-  // workspaceConfigSchema.parse(config);
+	const data = fs.readFileSync(path, "utf8");
+	// workspaceConfigSchema.parse(config);
 
-  return JSON.parse(data) as WorkspaceConfig[];
+	return JSON.parse(data) as WorkspaceConfig[];
 }
 
 export { getConfig };

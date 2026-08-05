@@ -12,50 +12,47 @@ chai.use(sinonChai);
 const sandbox = createSandbox();
 
 describe("@voice/handler/StreamHeader", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should handle the StreamGather command", async function () {
-    // Arrange
-    const createVoiceClient = getCreateVoiceClient(sandbox);
+	it("should handle the StreamGather command", async function () {
+		// Arrange
+		const createVoiceClient = getCreateVoiceClient(sandbox);
 
-    const streamGatherRequest = {
-      mediaSessionRef: "mediaSessionRef",
-      source: "speech"
-    };
+		const streamGatherRequest = {
+			mediaSessionRef: "mediaSessionRef",
+			source: "speech",
+		};
 
-    const voiceClient = createVoiceClient();
+		const voiceClient = createVoiceClient();
 
-    // Act
-    await createStreamGatherHandler(voiceClient)(streamGatherRequest);
+		// Act
+		await createStreamGatherHandler(voiceClient)(streamGatherRequest);
 
-    // Assert
-    expect(voiceClient.startSpeechGather).to.have.been.calledOnce;
-    expect(voiceClient.startSpeechGather).to.have.been.calledWith(match.func);
-    expect(voiceClient.startDtmfGather).to.not.have.been.called;
-  });
+		// Assert
+		expect(voiceClient.startSpeechGather).to.have.been.calledOnce;
+		expect(voiceClient.startSpeechGather).to.have.been.calledWith(match.func);
+		expect(voiceClient.startDtmfGather).to.not.have.been.called;
+	});
 
-  it("should handle the StreamGather command with DTMF", async function () {
-    // Arrange
-    const createVoiceClient = getCreateVoiceClient(sandbox);
+	it("should handle the StreamGather command with DTMF", async function () {
+		// Arrange
+		const createVoiceClient = getCreateVoiceClient(sandbox);
 
-    const streamGatherRequest = {
-      mediaSessionRef: "mediaSessionRef",
-      source: StreamGatherSource.SPEECH_AND_DTMF
-    };
+		const streamGatherRequest = {
+			mediaSessionRef: "mediaSessionRef",
+			source: StreamGatherSource.SPEECH_AND_DTMF,
+		};
 
-    const voiceClient = createVoiceClient();
+		const voiceClient = createVoiceClient();
 
-    // Act
-    await createStreamGatherHandler(voiceClient)(streamGatherRequest);
+		// Act
+		await createStreamGatherHandler(voiceClient)(streamGatherRequest);
 
-    // Assert
-    expect(voiceClient.startDtmfGather).to.have.been.calledOnce;
-    expect(voiceClient.startDtmfGather).to.have.been.calledWith(
-      "mediaSessionRef",
-      match.func
-    );
-    expect(voiceClient.startSpeechGather).to.have.been.calledOnce;
-  });
+		// Assert
+		expect(voiceClient.startDtmfGather).to.have.been.calledOnce;
+		expect(voiceClient.startDtmfGather).to.have.been.calledWith("mediaSessionRef", match.func);
+		expect(voiceClient.startSpeechGather).to.have.been.calledOnce;
+	});
 });

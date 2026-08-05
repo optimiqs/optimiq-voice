@@ -1,9 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  type InviteUserToWorkspaceRequest,
-  type Workspace as Resource,
-  type CreateWorkspaceRequest as ResourceCreateRequest,
-  type UpdateWorkspaceRequest as ResourceUpdateRequest
+	type InviteUserToWorkspaceRequest,
+	type Workspace as Resource,
+	type CreateWorkspaceRequest as ResourceCreateRequest,
+	type UpdateWorkspaceRequest as ResourceUpdateRequest,
 } from "@optimiq-voice/types";
 import { COLLECTION_QUERY_KEY as USER_COLLECTION_QUERY_KEY } from "~/auth/services/auth.service";
 import { useOptimisticCreateResource } from "~/core/hooks/use-optimistic-create-resource";
@@ -35,19 +35,19 @@ export const RESOURCE_QUERY_KEY = ["resource:workspace"];
  * @returns A React Query object containing workspace data and query metadata.
  */
 export const useWorkspaces = () => {
-  const { sdk } = useOptimiqVoice();
+	const { sdk } = useOptimiqVoice();
 
-  const { data, ...rest } = useQuery({
-    queryKey: COLLECTION_QUERY_KEY,
-    queryFn: async () => await sdk.workspaces.listWorkspaces(),
-    staleTime: 1000 * 60 * 60 // 1 hour
-  });
+	const { data, ...rest } = useQuery({
+		queryKey: COLLECTION_QUERY_KEY,
+		queryFn: async () => await sdk.workspaces.listWorkspaces(),
+		staleTime: 1000 * 60 * 60, // 1 hour
+	});
 
-  return {
-    data: data?.items || [],
-    nextPageToken: data?.nextPageToken,
-    ...rest
-  };
+	return {
+		data: data?.items || [],
+		nextPageToken: data?.nextPageToken,
+		...rest,
+	};
 };
 
 /**
@@ -64,15 +64,15 @@ export const useWorkspaces = () => {
  * @returns A React Query result object containing the workspace and metadata.
  */
 export const useWorkspace = (ref: string) => {
-  const { sdk } = useOptimiqVoice();
+	const { sdk } = useOptimiqVoice();
 
-  const { data = null, ...rest } = useQuery({
-    queryKey: [...RESOURCE_QUERY_KEY, ref],
-    queryFn: async () => sdk.workspaces.getWorkspace(ref),
-    enabled: !!ref
-  });
+	const { data = null, ...rest } = useQuery({
+		queryKey: [...RESOURCE_QUERY_KEY, ref],
+		queryFn: async () => sdk.workspaces.getWorkspace(ref),
+		enabled: !!ref,
+	});
 
-  return { data, ...rest };
+	return { data, ...rest };
 };
 
 /**
@@ -87,13 +87,13 @@ export const useWorkspace = (ref: string) => {
  * @returns A mutation object that can be used to trigger the creation.
  */
 export const useCreateWorkspace = () => {
-  const { sdk } = useOptimiqVoice();
+	const { sdk } = useOptimiqVoice();
 
-  return useOptimisticCreateResource<Resource, ResourceCreateRequest>(
-    (req) => sdk.workspaces.createWorkspace(req),
-    COLLECTION_QUERY_KEY,
-    RESOURCE_QUERY_KEY
-  );
+	return useOptimisticCreateResource<Resource, ResourceCreateRequest>(
+		(req) => sdk.workspaces.createWorkspace(req),
+		COLLECTION_QUERY_KEY,
+		RESOURCE_QUERY_KEY,
+	);
 };
 
 /**
@@ -108,13 +108,13 @@ export const useCreateWorkspace = () => {
  * @returns A mutation object for updating an workspace.
  */
 export const useUpdateWorkspace = () => {
-  const { sdk } = useOptimiqVoice();
+	const { sdk } = useOptimiqVoice();
 
-  return useOptimisticUpdateResource<Resource, ResourceUpdateRequest>(
-    (req) => sdk.workspaces.updateWorkspace(req),
-    COLLECTION_QUERY_KEY,
-    RESOURCE_QUERY_KEY
-  );
+	return useOptimisticUpdateResource<Resource, ResourceUpdateRequest>(
+		(req) => sdk.workspaces.updateWorkspace(req),
+		COLLECTION_QUERY_KEY,
+		RESOURCE_QUERY_KEY,
+	);
 };
 
 /**
@@ -128,13 +128,13 @@ export const useUpdateWorkspace = () => {
  * @returns A mutation object for deleting an workspace.
  */
 export const useDeleteWorkspace = () => {
-  const { sdk } = useOptimiqVoice();
+	const { sdk } = useOptimiqVoice();
 
-  return useOptimisticDeleteResource(
-    (ref) => sdk.workspaces.deleteWorkspace(ref),
-    COLLECTION_QUERY_KEY,
-    RESOURCE_QUERY_KEY
-  );
+	return useOptimisticDeleteResource(
+		(ref) => sdk.workspaces.deleteWorkspace(ref),
+		COLLECTION_QUERY_KEY,
+		RESOURCE_QUERY_KEY,
+	);
 };
 
 /**
@@ -146,44 +146,42 @@ export const useDeleteWorkspace = () => {
  * @returns A mutation object that can be used to trigger the invitation process.
  */
 export const useInviteWorkspace = () => {
-  const { sdk } = useOptimiqVoice();
-  const queryClient = useQueryClient();
+	const { sdk } = useOptimiqVoice();
+	const queryClient = useQueryClient();
 
-  return useMutation({
-    mutationFn: (req: Omit<InviteUserToWorkspaceRequest, "password">) =>
-      sdk.workspaces.inviteUserToWorkspace({ ...req, password: "" }),
-    onSuccess: () => {
-      // Invalidate the workspaces list to ensure the cache is fresh
-      queryClient.invalidateQueries({ queryKey: USER_COLLECTION_QUERY_KEY });
-    }
-  });
+	return useMutation({
+		mutationFn: (req: Omit<InviteUserToWorkspaceRequest, "password">) =>
+			sdk.workspaces.inviteUserToWorkspace({ ...req, password: "" }),
+		onSuccess: () => {
+			// Invalidate the workspaces list to ensure the cache is fresh
+			queryClient.invalidateQueries({ queryKey: USER_COLLECTION_QUERY_KEY });
+		},
+	});
 };
 
 export const useWorkspaceResendInvite = () => {
-  const { sdk } = useOptimiqVoice();
-  const queryClient = useQueryClient();
+	const { sdk } = useOptimiqVoice();
+	const queryClient = useQueryClient();
 
-  return useMutation({
-    mutationFn: (userRef: string) =>
-      sdk.workspaces.resendWorkspaceMembershipInvitation(userRef),
-    onSuccess: () => {
-      // Invalidate the workspaces list to ensure the cache is fresh
-      queryClient.invalidateQueries({ queryKey: USER_COLLECTION_QUERY_KEY });
-    }
-  });
+	return useMutation({
+		mutationFn: (userRef: string) => sdk.workspaces.resendWorkspaceMembershipInvitation(userRef),
+		onSuccess: () => {
+			// Invalidate the workspaces list to ensure the cache is fresh
+			queryClient.invalidateQueries({ queryKey: USER_COLLECTION_QUERY_KEY });
+		},
+	});
 };
 
 export const useWorkspaceRemoveMember = () => {
-  const { sdk } = useOptimiqVoice();
-  const queryClient = useQueryClient();
+	const { sdk } = useOptimiqVoice();
+	const queryClient = useQueryClient();
 
-  return useMutation({
-    mutationFn: (userRef: string) =>
-      sdk.workspaces.removeUserFromWorkspace(userRef),
-    onSuccess: () => {
-      // Refresh workspace members and workspace list after removing a member.
-      queryClient.invalidateQueries({ queryKey: USER_COLLECTION_QUERY_KEY });
-      queryClient.invalidateQueries({ queryKey: COLLECTION_QUERY_KEY });
-    }
-  });
+	return useMutation({
+		mutationFn: (userRef: string) => sdk.workspaces.removeUserFromWorkspace(userRef),
+		onSuccess: () => {
+			// Refresh workspace members and workspace list after removing a member.
+			queryClient.invalidateQueries({ queryKey: USER_COLLECTION_QUERY_KEY });
+			queryClient.invalidateQueries({ queryKey: COLLECTION_QUERY_KEY });
+		},
+	});
 };

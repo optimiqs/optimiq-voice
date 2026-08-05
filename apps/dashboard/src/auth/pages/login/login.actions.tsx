@@ -6,9 +6,9 @@ import { Divider } from "~/core/components/design-system/ui/divider/divider";
 import { Typography } from "~/core/components/design-system/ui/typography/typography";
 import { Link } from "~/core/components/general/link/link";
 import {
-  IS_CLOUD,
-  IS_PRIVATE_BETA,
-  IS_SIGNUP_ENABLED
+	IS_CLOUD,
+	IS_PRIVATE_BETA,
+	IS_SIGNUP_ENABLED,
 } from "~/core/sdk/stores/optimiq-voice.config";
 import type { Form } from "./login.form";
 
@@ -17,8 +17,8 @@ import type { Form } from "./login.form";
  * Includes the form object (from React Hook Form) and a GitHub auth handler.
  */
 export interface LoginFormActionsProps extends React.PropsWithChildren {
-  form: Form;
-  onGithubAuth: () => Promise<void>;
+	form: Form;
+	onGithubAuth: () => Promise<void>;
 }
 
 /**
@@ -32,77 +32,69 @@ export interface LoginFormActionsProps extends React.PropsWithChildren {
  * Displays form error messages from URL query parameters and disables the submit button
  * when the form is invalid or currently submitting.
  */
-export function LoginFormActions({
-  form,
-  onGithubAuth
-}: LoginFormActionsProps) {
-  /** Extracts query parameters from the URL to check for error messages. */
-  const [searchParams, setSearchParams] = useSearchParams();
-  const error = searchParams.get("error");
+export function LoginFormActions({ form, onGithubAuth }: LoginFormActionsProps) {
+	/** Extracts query parameters from the URL to check for error messages. */
+	const [searchParams, setSearchParams] = useSearchParams();
+	const error = searchParams.get("error");
 
-  /** Destructure form state for validation and submission status. */
-  const { isValid, isSubmitting } = form.formState;
+	/** Destructure form state for validation and submission status. */
+	const { isValid, isSubmitting } = form.formState;
 
-  /** Determines if the Sign In button should be disabled. */
-  const isSubmitDisabled = !isValid || isSubmitting;
+	/** Determines if the Sign In button should be disabled. */
+	const isSubmitDisabled = !isValid || isSubmitting;
 
-  /**
-   * Effect hook to set error messages in the form state
-   * if an error is detected in the URL query parameters.
-   * Also clears the error from the URL to prevent persistence.
-   */
-  useEffect(() => {
-    if (error) {
-      form.setError("email", { type: "manual", message: error });
-      // Clear the error parameter from the URL to prevent it from persisting
-      const newSearchParams = new URLSearchParams(searchParams);
-      newSearchParams.delete("error");
-      setSearchParams(newSearchParams, { replace: true });
-    }
-  }, [error, form, searchParams, setSearchParams]);
+	/**
+	 * Effect hook to set error messages in the form state
+	 * if an error is detected in the URL query parameters.
+	 * Also clears the error from the URL to prevent persistence.
+	 */
+	useEffect(() => {
+		if (error) {
+			form.setError("email", { type: "manual", message: error });
+			// Clear the error parameter from the URL to prevent it from persisting
+			const newSearchParams = new URLSearchParams(searchParams);
+			newSearchParams.delete("error");
+			setSearchParams(newSearchParams, { replace: true });
+		}
+	}, [error, form, searchParams, setSearchParams]);
 
-  return (
-    <LoginFormRoot>
-      {/* Main Sign In button */}
-      <Button type="submit" isFullWidth disabled={isSubmitDisabled}>
-        {isSubmitting ? "Signing In..." : "Sign In"}
-      </Button>
+	return (
+		<LoginFormRoot>
+			{/* Main Sign In button */}
+			<Button type="submit" isFullWidth disabled={isSubmitDisabled}>
+				{isSubmitting ? "Signing In..." : "Sign In"}
+			</Button>
 
-      {/* Divider between the primary sign in and the alternative login */}
-      {IS_CLOUD && (
-        <>
-          <Divider />
-          <Button
-            isFullWidth
-            variant="outlined"
-            disabled={isSubmitting}
-            onClick={onGithubAuth}
-          >
-            Sign In with GitHub
-          </Button>
-        </>
-      )}
+			{/* Divider between the primary sign in and the alternative login */}
+			{IS_CLOUD && (
+				<>
+					<Divider />
+					<Button isFullWidth variant="outlined" disabled={isSubmitting} onClick={onGithubAuth}>
+						Sign In with GitHub
+					</Button>
+				</>
+			)}
 
-      {/* Forgot Password link */}
-      <Link to="/auth/forgot-password">
-        <Typography variant="body-small" color="base.03">
-          Forgot Password?
-        </Typography>
-      </Link>
+			{/* Forgot Password link */}
+			<Link to="/auth/forgot-password">
+				<Typography variant="body-small" color="base.03">
+					Forgot Password?
+				</Typography>
+			</Link>
 
-      {IS_SIGNUP_ENABLED && (
-        <Typography variant="body-small" color="base.03">
-          Don't have an account? <Link to="/auth/signup">Sign Up</Link>
-        </Typography>
-      )}
+			{IS_SIGNUP_ENABLED && (
+				<Typography variant="body-small" color="base.03">
+					Don't have an account? <Link to="/auth/signup">Sign Up</Link>
+				</Typography>
+			)}
 
-      {IS_PRIVATE_BETA && (
-        <Typography variant="body-small" color="base.03">
-          Private beta access is currently invite-only.
-        </Typography>
-      )}
-    </LoginFormRoot>
-  );
+			{IS_PRIVATE_BETA && (
+				<Typography variant="body-small" color="base.03">
+					Private beta access is currently invite-only.
+				</Typography>
+			)}
+		</LoginFormRoot>
+	);
 }
 
 /**
@@ -110,9 +102,9 @@ export function LoginFormActions({
  * Uses a vertical flex layout with spacing and text alignment.
  */
 export const LoginFormRoot = styled(Box)(({ theme }) => ({
-  display: "flex",
-  flexDirection: "column",
-  gap: theme.spacing(2),
-  textAlign: "center",
-  marginTop: theme.spacing(2)
+	display: "flex",
+	flexDirection: "column",
+	gap: theme.spacing(2),
+	textAlign: "center",
+	marginTop: theme.spacing(2),
 }));

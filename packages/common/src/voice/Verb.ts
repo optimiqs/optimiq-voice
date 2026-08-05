@@ -4,11 +4,11 @@ import { VoiceClientConfig } from "./voice";
 type VoiceRequest = VoiceClientConfig;
 
 type VerbRequest = {
-  mediaSessionRef: string;
+	mediaSessionRef: string;
 };
 
 type VerbResponse = {
-  mediaSessionRef: string;
+	mediaSessionRef: string;
 };
 
 export { VerbRequest, VerbResponse, VoiceRequest };

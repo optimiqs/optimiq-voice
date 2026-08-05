@@ -1,19 +1,19 @@
 {
-  "extends": "../../tsconfig.json",
-  "compilerOptions": {
-    "outDir": "dist",
-    "rootDir": "src"
-  },
-  "references": [
-    {
-      "path": "../../packages/logger"
-    },
-    {
-      "path": "../../packages/sdk"
-    },
-    {
-      "path": "../../packages/common"
-    }
-  ],
-  "exclude": ["node_modules", "dist", "test"]
+	"extends": "../../tsconfig.json",
+	"compilerOptions": {
+		"outDir": "dist",
+		"rootDir": "src"
+	},
+	"references": [
+		{
+			"path": "../../packages/logger"
+		},
+		{
+			"path": "../../packages/sdk"
+		},
+		{
+			"path": "../../packages/common"
+		}
+	],
+	"exclude": ["node_modules", "dist", "test"]
 }

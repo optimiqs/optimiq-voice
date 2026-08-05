@@ -2,12 +2,7 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { Box } from "@mui/material";
 import { useCallback, useState } from "react";
 import { useFieldArray, useForm } from "react-hook-form";
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem
-} from "~/core/components/design-system/forms";
+import { Form, FormControl, FormField, FormItem } from "~/core/components/design-system/forms";
 import { FormRoot } from "~/core/components/design-system/forms/form-root";
 import { Input } from "~/core/components/design-system/ui/input/input";
 import { ResourceIdField } from "~/core/components/design-system/ui/resource-id-field/resource-id-field";
@@ -25,9 +20,9 @@ import { schema, type Schema } from "./create-acl.schema";
  * @property {boolean} [isEdit] - Whether this form is for editing an existing ACL.
  */
 export interface CreateAclFormProps extends React.PropsWithChildren {
-  initialValues?: Schema;
-  onSubmit: (data: Schema) => Promise<void>;
-  isEdit?: boolean;
+	initialValues?: Schema;
+	onSubmit: (data: Schema) => Promise<void>;
+	isEdit?: boolean;
 }
 
 /**
@@ -46,141 +41,132 @@ export interface CreateAclFormProps extends React.PropsWithChildren {
  *
  * @param {CreateAclFormProps} props - Props including the onSubmit handler and optional initial values.
  */
-export function CreateAclForm({
-  onSubmit,
-  initialValues,
-  isEdit
-}: CreateAclFormProps) {
-  /** Local state controlling the visibility of the rules modal. */
-  const [isRulesModalOpen, setIsRulesModalOpen] = useState(false);
+export function CreateAclForm({ onSubmit, initialValues, isEdit }: CreateAclFormProps) {
+	/** Local state controlling the visibility of the rules modal. */
+	const [isRulesModalOpen, setIsRulesModalOpen] = useState(false);
 
-  /** Initializes React Hook Form with Zod resolver and initial values. */
-  const form = useForm<Schema>({
-    resolver: zodResolver(schema),
-    defaultValues: {
-      ref: null,
-      name: "",
-      rules: [],
-      ...initialValues
-    },
-    mode: "onChange"
-  });
+	/** Initializes React Hook Form with Zod resolver and initial values. */
+	const form = useForm<Schema>({
+		resolver: zodResolver(schema),
+		defaultValues: {
+			ref: null,
+			name: "",
+			rules: [],
+			...initialValues,
+		},
+		mode: "onChange",
+	});
 
-  /** React Hook Form's useFieldArray for dynamic list of rules. */
-  const { fields, remove, append } = useFieldArray({
-    control: form.control,
-    name: "rules"
-  });
+	/** React Hook Form's useFieldArray for dynamic list of rules. */
+	const { fields, remove, append } = useFieldArray({
+		control: form.control,
+		name: "rules",
+	});
 
-  /** Sync form state with FormContext */
-  useFormContextSync(form, onSubmit, isEdit);
+	/** Sync form state with FormContext */
+	useFormContextSync(form, onSubmit, isEdit);
 
-  /**
-   * Handles deletions from the Select component.
-   *
-   * @param {string[]} oldValues - The currently displayed values in the Select.
-   * @param {string[]} newValues - The new values after deletion.
-   */
-  const handleDelete = useCallback(
-    (oldValues: string[], newValues: string[]) => {
-      const deleted = oldValues.find((val) => !newValues.includes(val));
-      if (deleted) {
-        const index = fields.findIndex(
-          (item) => `${item.type}:${item.name}` === deleted
-        );
-        if (index !== -1) {
-          remove(index);
-        }
-      }
-    },
-    [fields, remove]
-  );
+	/**
+	 * Handles deletions from the Select component.
+	 *
+	 * @param {string[]} oldValues - The currently displayed values in the Select.
+	 * @param {string[]} newValues - The new values after deletion.
+	 */
+	const handleDelete = useCallback(
+		(oldValues: string[], newValues: string[]) => {
+			const deleted = oldValues.find((val) => !newValues.includes(val));
+			if (deleted) {
+				const index = fields.findIndex((item) => `${item.type}:${item.name}` === deleted);
+				if (index !== -1) {
+					remove(index);
+				}
+			}
+		},
+		[fields, remove],
+	);
 
-  /**
-   * Builds the displayed values for the Select, each formatted as "type:name".
-   */
-  const selectValues = fields.map((item) => `${item.type}:${item.name}`);
+	/**
+	 * Builds the displayed values for the Select, each formatted as "type:name".
+	 */
+	const selectValues = fields.map((item) => `${item.type}:${item.name}`);
 
-  /**
-   * Builds the Select options, matching the Select values.
-   */
-  const selectOptions = selectValues.map((val) => ({
-    value: val,
-    label: val
-  }));
+	/**
+	 * Builds the Select options, matching the Select values.
+	 */
+	const selectOptions = selectValues.map((val) => ({
+		value: val,
+		label: val,
+	}));
 
-  return (
-    <>
-      <Form {...form}>
-        <FormRoot onSubmit={form.handleSubmit(onSubmit)}>
-          {/* ACL ID - Only show in edit mode */}
-          {isEdit && initialValues?.ref && (
-            <ResourceIdField value={initialValues.ref} label="ACL Ref" />
-          )}
+	return (
+		<>
+			<Form {...form}>
+				<FormRoot onSubmit={form.handleSubmit(onSubmit)}>
+					{/* ACL ID - Only show in edit mode */}
+					{isEdit && initialValues?.ref && (
+						<ResourceIdField value={initialValues.ref} label="ACL Ref" />
+					)}
 
-          {/* Friendly Name Field */}
-          <FormField
-            control={form.control}
-            name="name"
-            render={({ field }) => (
-              <FormItem>
-                <FormControl>
-                  <Input type="text" label="Friendly Name" {...field} />
-                </FormControl>
-              </FormItem>
-            )}
-          />
+					{/* Friendly Name Field */}
+					<FormField
+						control={form.control}
+						name="name"
+						render={({ field }) => (
+							<FormItem>
+								<FormControl>
+									<Input type="text" label="Friendly Name" {...field} />
+								</FormControl>
+							</FormItem>
+						)}
+					/>
 
-          {/* Unified Rules Select Field */}
-          <FormField
-            control={form.control}
-            name="rules"
-            render={() => (
-              <FormItem>
-                <FormControl>
-                  <Box
-                    sx={{
-                      display: "flex",
-                      flexDirection: "column",
-                      gap: "12px"
-                    }}
-                  >
-                    {/* Read-only Select showing current rules */}
-                    <Select
-                      label="Network Rules"
-                      placeholder="Click below to add rules (e.g., allow:xxx, deny:xxx)."
-                      multiple
-                      value={selectValues}
-                      options={selectOptions}
-                      disabled
-                      onChange={(event) => {
-                        const newValues = event.target.value as string[];
-                        handleDelete(selectValues, newValues);
-                      }}
-                    />
+					{/* Unified Rules Select Field */}
+					<FormField
+						control={form.control}
+						name="rules"
+						render={() => (
+							<FormItem>
+								<FormControl>
+									<Box
+										sx={{
+											display: "flex",
+											flexDirection: "column",
+											gap: "12px",
+										}}
+									>
+										{/* Read-only Select showing current rules */}
+										<Select
+											label="Network Rules"
+											placeholder="Click below to add rules (e.g., allow:xxx, deny:xxx)."
+											multiple
+											value={selectValues}
+											options={selectOptions}
+											disabled
+											onChange={(event) => {
+												const newValues = event.target.value as string[];
+												handleDelete(selectValues, newValues);
+											}}
+										/>
 
-                    {/* Modal trigger to open rule creation */}
-                    <ModalTrigger
-                      onClick={() => setIsRulesModalOpen(true)}
-                      label="Add Rule"
-                    />
-                  </Box>
-                </FormControl>
-              </FormItem>
-            )}
-          />
-        </FormRoot>
-      </Form>
+										{/* Modal trigger to open rule creation */}
+										<ModalTrigger onClick={() => setIsRulesModalOpen(true)} label="Add Rule" />
+									</Box>
+								</FormControl>
+							</FormItem>
+						)}
+					/>
+				</FormRoot>
+			</Form>
 
-      {/* Modal for creating new ACL rules */}
-      <CreateRuleModal
-        isOpen={isRulesModalOpen}
-        onClose={() => setIsRulesModalOpen(false)}
-        onFormSubmit={(rule) => {
-          append(rule);
-          setIsRulesModalOpen(false);
-        }}
-      />
-    </>
-  );
+			{/* Modal for creating new ACL rules */}
+			<CreateRuleModal
+				isOpen={isRulesModalOpen}
+				onClose={() => setIsRulesModalOpen(false)}
+				onFormSubmit={(rule) => {
+					append(rule);
+					setIsRulesModalOpen(false);
+				}}
+			/>
+		</>
+	);
 }

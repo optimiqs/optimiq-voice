@@ -8,26 +8,26 @@ import { deleteNumber } from "./operations";
 import { updateNumber } from "./updateNumber";
 
 function buildService(
-  clientOptions: ClientOptions,
-  checkNumberPreconditions: NumberPreconditionsCheck
+	clientOptions: ClientOptions,
+	checkNumberPreconditions: NumberPreconditionsCheck,
 ) {
-  const client = new SDK.Numbers(clientOptions);
+	const client = new SDK.Numbers(clientOptions);
 
-  return {
-    definition: {
-      serviceName: "Numbers",
-      pckg: "numbers",
-      version: "v1beta2",
-      proto: "numbers.proto"
-    },
-    handlers: {
-      createNumber: createNumber(client, checkNumberPreconditions),
-      updateNumber: updateNumber(client, checkNumberPreconditions),
-      getNumber: getNumber(client),
-      listNumbers: listNumbers(client),
-      deleteNumber: deleteNumber(client)
-    }
-  };
+	return {
+		definition: {
+			serviceName: "Numbers",
+			pckg: "numbers",
+			version: "v1beta2",
+			proto: "numbers.proto",
+		},
+		handlers: {
+			createNumber: createNumber(client, checkNumberPreconditions),
+			updateNumber: updateNumber(client, checkNumberPreconditions),
+			getNumber: getNumber(client),
+			listNumbers: listNumbers(client),
+			deleteNumber: deleteNumber(client),
+		},
+	};
 }
 
 export { buildService };

@@ -9,11 +9,11 @@ chai.use(sinonChai);
 const sandbox = createSandbox();
 
 describe("@voice/handler/Say", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it.skip("needs tests", async function () {
-    // Noop
-  });
+	it.skip("needs tests", async function () {
+		// Noop
+	});
 });

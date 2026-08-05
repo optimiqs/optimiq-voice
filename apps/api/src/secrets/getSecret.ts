@@ -8,21 +8,17 @@ import { createGetFnUtil } from "./createGetFnUtil";
 const logger = getLogger({ service: "api", filePath: __filename });
 
 function getSecret(db: Database) {
-  const getFn = createGetFnUtil(db);
+	const getFn = createGetFnUtil(db);
 
-  const fn = async (call: { request: BaseApiObject }): Promise<Secret> => {
-    const { ref } = call.request;
+	const fn = async (call: { request: BaseApiObject }): Promise<Secret> => {
+		const { ref } = call.request;
 
-    logger.verbose("call to getSecret", { ref });
+		logger.verbose("call to getSecret", { ref });
 
-    return await getFn(ref);
-  };
+		return await getFn(ref);
+	};
 
-  return withErrorHandlingAndValidationAndAccess(
-    fn,
-    (ref: string) => getFn(ref),
-    V.emptySchema
-  );
+	return withErrorHandlingAndValidationAndAccess(fn, (ref: string) => getFn(ref), V.emptySchema);
 }
 
 export { getSecret };

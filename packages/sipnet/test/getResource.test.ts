@@ -12,85 +12,79 @@ chai.use(sinonChai);
 const sandbox = createSandbox();
 
 describe("@sipnet[resources/getResource]", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should get a sipnet resource", async function () {
-    // Arrange
-    const { getResource } = await import("../src/resources/getResource");
-    const metadata = new grpc.Metadata();
-    metadata.set("token", TEST_TOKEN);
+	it("should get a sipnet resource", async function () {
+		// Arrange
+		const { getResource } = await import("../src/resources/getResource");
+		const metadata = new grpc.Metadata();
+		metadata.set("token", TEST_TOKEN);
 
-    const domain = {
-      ref: "123",
-      name: "SIP Local",
-      domainUri: "sip.optimiq-voice.local",
-      extended: {
-        accessKeyId: "GRahn02s8tgdfghz72vb0fz538qpb5z35p"
-      },
-      createdAt: new Date(),
-      updatedAt: new Date()
-    };
+		const domain = {
+			ref: "123",
+			name: "SIP Local",
+			domainUri: "sip.optimiq-voice.local",
+			extended: {
+				accessKeyId: "GRahn02s8tgdfghz72vb0fz538qpb5z35p",
+			},
+			createdAt: new Date(),
+			updatedAt: new Date(),
+		};
 
-    const domains = {
-      getDomain: sandbox.stub().resolves(domain)
-    } as unknown as DomainsApi;
+		const domains = {
+			getDomain: sandbox.stub().resolves(domain),
+		} as unknown as DomainsApi;
 
-    const call = {
-      metadata,
-      request: {
-        ref: "123"
-      }
-    };
+		const call = {
+			metadata,
+			request: {
+				ref: "123",
+			},
+		};
 
-    const get = getResource<Domain, BaseApiObject, DomainsApi>(
-      domains,
-      "Domain"
-    );
+		const get = getResource<Domain, BaseApiObject, DomainsApi>(domains, "Domain");
 
-    // Act
-    await get(call, (error, response) => {
-      // Assert
-      expect(error).to.be.null;
-      expect(response).to.deep.equal(domain);
-    });
-  });
+		// Act
+		await get(call, (error, response) => {
+			// Assert
+			expect(error).to.be.null;
+			expect(response).to.deep.equal(domain);
+		});
+	});
 
-  it("should throw an error if sipnet resource not found", async function () {
-    // Arrange
-    const { getResource } = await import("../src/resources/getResource");
-    const metadata = new grpc.Metadata();
-    metadata.set("token", TEST_TOKEN);
+	it("should throw an error if sipnet resource not found", async function () {
+		// Arrange
+		const { getResource } = await import("../src/resources/getResource");
+		const metadata = new grpc.Metadata();
+		metadata.set("token", TEST_TOKEN);
 
-    const domains = {
-      getDomain: sandbox.stub().throws({
-        code: grpc.status.NOT_FOUND,
-        message: "The requested resource was not found"
-      })
-    } as unknown as DomainsApi;
+		const domains = {
+			getDomain: sandbox.stub().throws({
+				code: grpc.status.NOT_FOUND,
+				message: "The requested resource was not found",
+			}),
+		} as unknown as DomainsApi;
 
-    const call = {
-      metadata,
-      request: {
-        ref: "123"
-      }
-    };
+		const call = {
+			metadata,
+			request: {
+				ref: "123",
+			},
+		};
 
-    const callback = sandbox.stub();
-    const get = getResource<Domain, BaseApiObject, DomainsApi>(
-      domains,
-      "Domain"
-    );
+		const callback = sandbox.stub();
+		const get = getResource<Domain, BaseApiObject, DomainsApi>(domains, "Domain");
 
-    // Act
-    await get(call, callback);
+		// Act
+		await get(call, callback);
 
-    // Assert
-    expect(callback).to.have.been.calledOnce;
-    expect(callback).to.have.been.calledWithMatch({
-      code: grpc.status.NOT_FOUND,
-      message: "The requested resource was not found"
-    });
-  });
+		// Assert
+		expect(callback).to.have.been.calledOnce;
+		expect(callback).to.have.been.calledWithMatch({
+			code: grpc.status.NOT_FOUND,
+			message: "The requested resource was not found",
+		});
+	});
 });

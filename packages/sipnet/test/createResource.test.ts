@@ -14,88 +14,88 @@ chai.use(sinonChai);
 const sandbox = createSandbox();
 
 describe("@sipnet[resources/createResource]", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should create a sipnet resource", async function () {
-    // Arrange
-    const { createResource } = await import("../src/resources/createResource");
-    const metadata = new grpc.Metadata();
-    metadata.set("token", TEST_TOKEN);
+	it("should create a sipnet resource", async function () {
+		// Arrange
+		const { createResource } = await import("../src/resources/createResource");
+		const metadata = new grpc.Metadata();
+		metadata.set("token", TEST_TOKEN);
 
-    const domains = {
-      createDomain: sandbox.stub().resolves({ ref: "123" }),
-      getDomain: getExtendedFieldsHelper(sandbox)
-    } as unknown as DomainsApi;
+		const domains = {
+			createDomain: sandbox.stub().resolves({ ref: "123" }),
+			getDomain: getExtendedFieldsHelper(sandbox),
+		} as unknown as DomainsApi;
 
-    const call = {
-      metadata,
-      request: {
-        name: "My Domain",
-        domainUri: "sip.optimiq-voice.local",
-        accessControlListRef: "123",
-        egressPolicies: [],
-        extended: {
-          accessKeyId: "GRahn02s8tgdfghz72vb0fz538qpb5z35p"
-        }
-      }
-    };
+		const call = {
+			metadata,
+			request: {
+				name: "My Domain",
+				domainUri: "sip.optimiq-voice.local",
+				accessControlListRef: "123",
+				egressPolicies: [],
+				extended: {
+					accessKeyId: "GRahn02s8tgdfghz72vb0fz538qpb5z35p",
+				},
+			},
+		};
 
-    const callback = sandbox.stub();
+		const callback = sandbox.stub();
 
-    const create = createResource<Domain, CreateDomainRequest, DomainsApi>(
-      domains,
-      "Domain",
-      V.createDomainRequestSchema
-    );
+		const create = createResource<Domain, CreateDomainRequest, DomainsApi>(
+			domains,
+			"Domain",
+			V.createDomainRequestSchema,
+		);
 
-    // Act
-    await create(call, callback);
+		// Act
+		await create(call, callback);
 
-    // Assert
-    expect(callback).to.have.been.calledOnceWithExactly(null, { ref: "123" });
-  });
+		// Assert
+		expect(callback).to.have.been.calledOnceWithExactly(null, { ref: "123" });
+	});
 
-  it("should throw an error if the sipnet resource already exists", async function () {
-    // Arrange
-    const { createResource } = await import("../src/resources/createResource");
-    const metadata = new grpc.Metadata();
-    metadata.set("token", TEST_TOKEN);
+	it("should throw an error if the sipnet resource already exists", async function () {
+		// Arrange
+		const { createResource } = await import("../src/resources/createResource");
+		const metadata = new grpc.Metadata();
+		metadata.set("token", TEST_TOKEN);
 
-    const domains = {
-      createDomain: sandbox.stub().throws({
-        code: grpc.status.ALREADY_EXISTS,
-        message: "The resource already exists"
-      }),
-      getDomain: getExtendedFieldsHelper(sandbox)
-    } as unknown as DomainsApi;
+		const domains = {
+			createDomain: sandbox.stub().throws({
+				code: grpc.status.ALREADY_EXISTS,
+				message: "The resource already exists",
+			}),
+			getDomain: getExtendedFieldsHelper(sandbox),
+		} as unknown as DomainsApi;
 
-    const call = {
-      metadata,
-      request: {
-        name: "My Domain",
-        domainUri: "sip.optimiq-voice.local",
-        accessControlListRef: "123",
-        egressPolicies: []
-      }
-    };
+		const call = {
+			metadata,
+			request: {
+				name: "My Domain",
+				domainUri: "sip.optimiq-voice.local",
+				accessControlListRef: "123",
+				egressPolicies: [],
+			},
+		};
 
-    const callback = sandbox.stub();
+		const callback = sandbox.stub();
 
-    const create = createResource<Domain, CreateDomainRequest, DomainsApi>(
-      domains,
-      "Domain",
-      V.createDomainRequestSchema
-    );
+		const create = createResource<Domain, CreateDomainRequest, DomainsApi>(
+			domains,
+			"Domain",
+			V.createDomainRequestSchema,
+		);
 
-    // Act
-    await create(call, callback);
+		// Act
+		await create(call, callback);
 
-    // Assert
-    expect(callback).to.have.been.calledOnceWithExactly({
-      code: grpc.status.ALREADY_EXISTS,
-      message: "The resource already exists"
-    });
-  });
+		// Assert
+		expect(callback).to.have.been.calledOnceWithExactly({
+			code: grpc.status.ALREADY_EXISTS,
+			message: "The resource already exists",
+		});
+	});
 });

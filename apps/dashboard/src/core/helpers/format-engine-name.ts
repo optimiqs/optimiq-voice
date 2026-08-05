@@ -8,10 +8,7 @@ import { toTitleCase } from "./to-title-case";
  * @param prefix - The prefix to remove from the product reference (e.g. "tts.", "stt.", "llm.").
  * @returns The formatted engine name, or '-' if the productRef is missing.
  */
-export function formatEngineName(
-  productRef: string | undefined,
-  prefix: string
-): string {
-  if (!productRef) return "";
-  return toTitleCase(productRef.replace(prefix, ""));
+export function formatEngineName(productRef: string | undefined, prefix: string): string {
+	if (!productRef) return "";
+	return toTitleCase(productRef.replace(prefix, ""));
 }

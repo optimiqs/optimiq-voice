@@ -1,8 +1,8 @@
 import {
-  Controller,
-  type ControllerProps,
-  type FieldPath,
-  type FieldValues
+	Controller,
+	type ControllerProps,
+	type FieldPath,
+	type FieldValues,
 } from "react-hook-form";
 import { FormFieldContext } from "./form.context";
 
@@ -13,12 +13,12 @@ import { FormFieldContext } from "./form.context";
  * context for the form element to be accessible.
  */
 export function FormField<
-  Values extends FieldValues = FieldValues,
-  Name extends FieldPath<Values> = FieldPath<Values>
+	Values extends FieldValues = FieldValues,
+	Name extends FieldPath<Values> = FieldPath<Values>,
 >({ ...props }: ControllerProps<Values, Name>) {
-  return (
-    <FormFieldContext.Provider value={{ name: props.name }}>
-      <Controller {...props} />
-    </FormFieldContext.Provider>
-  );
+	return (
+		<FormFieldContext.Provider value={{ name: props.name }}>
+			<Controller {...props} />
+		</FormFieldContext.Provider>
+	);
 }

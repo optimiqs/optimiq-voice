@@ -3,11 +3,11 @@ export default {};
 
 export const useNavigate = () => () => {};
 export const useLocation = () => ({
-  pathname: "/",
-  search: "",
-  hash: "",
-  state: null,
-  key: "default"
+	pathname: "/",
+	search: "",
+	hash: "",
+	state: null,
+	key: "default",
 });
 export const useSearchParams = () => [new URLSearchParams(), () => {}];
 export const useSubmit = () => () => {};

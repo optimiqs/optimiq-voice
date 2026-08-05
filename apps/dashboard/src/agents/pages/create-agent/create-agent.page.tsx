@@ -16,14 +16,14 @@ import type { Route } from "./+types/create-agent.page";
  * @returns An array of metadata objects for the page.
  */
 export function meta(_: Route.MetaArgs) {
-  return [
-    { title: "Create New Agent | Optimiq Voice" },
-    {
-      name: "description",
-      content:
-        "A SIP Agent represents a user or device that connects to your SIP Domain using VoIP."
-    }
-  ];
+	return [
+		{ title: "Create New Agent | Optimiq Voice" },
+		{
+			name: "description",
+			content:
+				"A SIP Agent represents a user or device that connects to your SIP Domain using VoIP.",
+		},
+	];
 }
 
 /**
@@ -38,31 +38,31 @@ export function meta(_: Route.MetaArgs) {
  * @returns {JSX.Element} The rendered Create Agent page.
  */
 export default function CreateAgent() {
-  /** Custom hook to create a agent via API with optimistic updates. */
-  const { onGoBack, onSave } = useCreateAgent();
+	/** Custom hook to create a agent via API with optimistic updates. */
+	const { onGoBack, onSave } = useCreateAgent();
 
-  /**
-   * Renders the Create Agent page layout.
-   */
-  return (
-    <FormProvider>
-      <Page variant="form">
-        <PageHeader
-          title="Create New Agent"
-          description="A SIP Agent represents a user or device that connects to your SIP Domain using VoIP."
-          onBack={{ label: "Back to agents", onClick: onGoBack }}
-          actions={
-            <FormSubmitButton size="small" loadingText="Saving...">
-              Save Agent
-            </FormSubmitButton>
-          }
-        />
+	/**
+	 * Renders the Create Agent page layout.
+	 */
+	return (
+		<FormProvider>
+			<Page variant="form">
+				<PageHeader
+					title="Create New Agent"
+					description="A SIP Agent represents a user or device that connects to your SIP Domain using VoIP."
+					onBack={{ label: "Back to agents", onClick: onGoBack }}
+					actions={
+						<FormSubmitButton size="small" loadingText="Saving...">
+							Save Agent
+						</FormSubmitButton>
+					}
+				/>
 
-        {/* Form container with a max width for readability and consistent layout */}
-        <Box sx={{ maxWidth: "440px" }}>
-          <CreateAgentForm onSubmit={onSave} />
-        </Box>
-      </Page>
-    </FormProvider>
-  );
+				{/* Form container with a max width for readability and consistent layout */}
+				<Box sx={{ maxWidth: "440px" }}>
+					<CreateAgentForm onSubmit={onSave} />
+				</Box>
+			</Page>
+		</FormProvider>
+	);
 }

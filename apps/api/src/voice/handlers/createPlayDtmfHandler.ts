@@ -4,20 +4,20 @@ import { VoiceClient } from "../types";
 import { withErrorHandling } from "./utils/withErrorHandling";
 
 function createPlayDtmfHandler(ari: Client, voiceClient: VoiceClient) {
-  return withErrorHandling(async (request: PlayDtmfRequest) => {
-    const { mediaSessionRef, digits } = request;
+	return withErrorHandling(async (request: PlayDtmfRequest) => {
+		const { mediaSessionRef, digits } = request;
 
-    await ari.channels.sendDTMF({
-      channelId: mediaSessionRef,
-      dtmf: digits
-    });
+		await ari.channels.sendDTMF({
+			channelId: mediaSessionRef,
+			dtmf: digits,
+		});
 
-    voiceClient.sendResponse({
-      playDtmfResponse: {
-        mediaSessionRef
-      }
-    });
-  });
+		voiceClient.sendResponse({
+			playDtmfResponse: {
+				mediaSessionRef,
+			},
+		});
+	});
 }
 
 export { createPlayDtmfHandler };

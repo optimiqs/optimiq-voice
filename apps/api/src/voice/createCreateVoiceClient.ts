@@ -15,59 +15,55 @@ const generateCallAccessToken = createGenerateCallAccessToken(identityConfig);
 
 // Note: By the time the call arrives here the owner of the app MUST be authenticated
 function createCreateVoiceClient(createContainer: CreateContainer) {
-  return async function createVoiceClient(params: {
-    ari: Client;
-    event: StasisStart;
-    channel: Channel;
-  }): Promise<VoiceClient> {
-    const { ari, event, channel } = params;
-    const { id: mediaSessionRef, caller } = event.channel;
-    const { name: callerName, number: callerNumber } = caller;
+	return async function createVoiceClient(params: {
+		ari: Client;
+		event: StasisStart;
+		channel: Channel;
+	}): Promise<VoiceClient> {
+		const { ari, event, channel } = params;
+		const { id: mediaSessionRef, caller } = event.channel;
+		const { name: callerName, number: callerNumber } = caller;
 
-    const getChannelVar = createGetChannelVarWithoutThrow(channel);
+		const getChannelVar = createGetChannelVarWithoutThrow(channel);
 
-    // Variables set by Asterisk's dialplan
-    const callDirection = (await getChannelVar(ChannelVar.CALL_DIRECTION))
-      ?.value;
-    const appRef = (await getChannelVar(ChannelVar.APP_REF))?.value;
-    const ingressNumber =
-      (await getChannelVar(ChannelVar.INGRESS_NUMBER))?.value || "";
+		// Variables set by Asterisk's dialplan
+		const callDirection = (await getChannelVar(ChannelVar.CALL_DIRECTION))?.value;
+		const appRef = (await getChannelVar(ChannelVar.APP_REF))?.value;
+		const ingressNumber = (await getChannelVar(ChannelVar.INGRESS_NUMBER))?.value || "";
 
-    // Try to get callRef from channel variable (set by dialplan from X-Call-Ref header for API-originated calls)
-    // If not found, generate a new UUID (for PSTN-terminated calls)
-    const callRefFromChannel = (await getChannelVar(ChannelVar.CALL_REF))
-      ?.value;
-    const callRef = callRefFromChannel || uuidv4();
+		// Try to get callRef from channel variable (set by dialplan from X-Call-Ref header for API-originated calls)
+		// If not found, generate a new UUID (for PSTN-terminated calls)
+		const callRefFromChannel = (await getChannelVar(ChannelVar.CALL_REF))?.value;
+		const callRef = callRefFromChannel || uuidv4();
 
-    const { accessKeyId, endpoint, tts, stt } = await createContainer(appRef);
+		const { accessKeyId, endpoint, tts, stt } = await createContainer(appRef);
 
-    const sessionToken = await generateCallAccessToken({ accessKeyId, appRef });
+		const sessionToken = await generateCallAccessToken({ accessKeyId, appRef });
 
-    const metadataStr =
-      (await getChannelVar(ChannelVar.METADATA))?.value ?? "{}";
+		const metadataStr = (await getChannelVar(ChannelVar.METADATA))?.value ?? "{}";
 
-    const config = {
-      appRef,
-      mediaSessionRef,
-      callRef,
-      accessKeyId,
-      endpoint,
-      callerName,
-      callerNumber,
-      ingressNumber,
-      sessionToken,
-      callDirection: mapCallDirectionToEnum(callDirection),
-      metadata: JSON.parse(metadataStr)
-    };
+		const config = {
+			appRef,
+			mediaSessionRef,
+			callRef,
+			accessKeyId,
+			endpoint,
+			callerName,
+			callerNumber,
+			ingressNumber,
+			sessionToken,
+			callDirection: mapCallDirectionToEnum(callDirection),
+			metadata: JSON.parse(metadataStr),
+		};
 
-    logger.verbose("creating voice client with config: ", {
-      appRef,
-      callerNumber,
-      ingressNumber
-    });
+		logger.verbose("creating voice client with config: ", {
+			appRef,
+			callerNumber,
+			ingressNumber,
+		});
 
-    return new VoiceClientImpl({ ari, config, tts, stt });
-  };
+		return new VoiceClientImpl({ ari, config, tts, stt });
+	};
 }
 
 export { createCreateVoiceClient };

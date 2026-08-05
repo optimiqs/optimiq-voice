@@ -9,46 +9,43 @@ import { withErrorHandlingAndValidation } from "../utils/withDatabaseErrorHandli
 const logger = getLogger({ service: "identity", filePath: __filename });
 
 function createResetPassword(db: Database) {
-  const isValidVerificationCode = createIsValidVerificationCode(db);
+	const isValidVerificationCode = createIsValidVerificationCode(db);
 
-  const resetPassword = async (
-    call: { request: ResetPasswordRequest },
-    callback: (error?: GrpcErrorMessage) => void
-  ) => {
-    const { request } = call;
-    const { username, password, verificationCode } = request;
+	const resetPassword = async (
+		call: { request: ResetPasswordRequest },
+		callback: (error?: GrpcErrorMessage) => void,
+	) => {
+		const { request } = call;
+		const { username, password, verificationCode } = request;
 
-    logger.verbose("call to resetPassword", {
-      username,
-      password,
-      verificationCode
-    });
+		logger.verbose("call to resetPassword", {
+			username,
+			password,
+			verificationCode,
+		});
 
-    const isValid = await isValidVerificationCode({
-      type: ContactType.EMAIL,
-      value: username,
-      code: verificationCode
-    });
+		const isValid = await isValidVerificationCode({
+			type: ContactType.EMAIL,
+			value: username,
+			code: verificationCode,
+		});
 
-    if (!isValid) {
-      return callback({
-        code: status.PERMISSION_DENIED,
-        message: "Invalid verification code"
-      });
-    }
+		if (!isValid) {
+			return callback({
+				code: status.PERMISSION_DENIED,
+				message: "Invalid verification code",
+			});
+		}
 
-    await db.user.update({
-      where: { email: username },
-      data: { password }
-    });
+		await db.user.update({
+			where: { email: username },
+			data: { password },
+		});
 
-    callback(null);
-  };
+		callback(null);
+	};
 
-  return withErrorHandlingAndValidation(
-    resetPassword,
-    V.resetPasswordRequestSchema
-  );
+	return withErrorHandlingAndValidation(resetPassword, V.resetPasswordRequestSchema);
 }
 
 export { createResetPassword };

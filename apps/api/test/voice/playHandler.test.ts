@@ -14,44 +14,44 @@ const sandbox = createSandbox();
 const channelId = "channel-id";
 
 describe("@voice/handler/Play", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should handle a Play command", async function () {
-    // Arrange
-    const ari = getAriStub(sandbox);
+	it("should handle a Play command", async function () {
+		// Arrange
+		const ari = getAriStub(sandbox);
 
-    const onStub = ari.on as sinon.SinonStub;
+		const onStub = ari.on as sinon.SinonStub;
 
-    onStub.withArgs(AriEvent.PLAYBACK_FINISHED).callsFake((_, cb) => {
-      cb({}, { id: playRequest.playbackRef });
-    });
+		onStub.withArgs(AriEvent.PLAYBACK_FINISHED).callsFake((_, cb) => {
+			cb({}, { id: playRequest.playbackRef });
+		});
 
-    const createVoiceClient = getCreateVoiceClient(sandbox);
+		const createVoiceClient = getCreateVoiceClient(sandbox);
 
-    const playRequest = {
-      playbackRef: "playbackRef",
-      mediaSessionRef: channelId,
-      url: "url"
-    };
+		const playRequest = {
+			playbackRef: "playbackRef",
+			mediaSessionRef: channelId,
+			url: "url",
+		};
 
-    // Act
-    await createPlayHandler(ari, createVoiceClient())(playRequest);
+		// Act
+		await createPlayHandler(ari, createVoiceClient())(playRequest);
 
-    // Assert
-    expect(ari.channels.play).to.have.been.calledOnce;
-    expect(createVoiceClient().sendResponse).to.have.been.calledOnce;
-    expect(createVoiceClient().sendResponse).to.have.been.calledWith({
-      playResponse: {
-        playbackRef: playRequest.playbackRef,
-        mediaSessionRef: playRequest.mediaSessionRef
-      }
-    });
-    expect(ari.channels.play).to.have.been.calledWith({
-      channelId,
-      media: `sound:${playRequest.url}`,
-      playbackId: playRequest.playbackRef
-    });
-  });
+		// Assert
+		expect(ari.channels.play).to.have.been.calledOnce;
+		expect(createVoiceClient().sendResponse).to.have.been.calledOnce;
+		expect(createVoiceClient().sendResponse).to.have.been.calledWith({
+			playResponse: {
+				playbackRef: playRequest.playbackRef,
+				mediaSessionRef: playRequest.mediaSessionRef,
+			},
+		});
+		expect(ari.channels.play).to.have.been.calledWith({
+			channelId,
+			media: `sound:${playRequest.url}`,
+			playbackId: playRequest.playbackRef,
+		});
+	});
 });

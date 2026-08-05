@@ -3,7 +3,7 @@ import { VerbRequest } from "./Verb";
 type StopSayRequest = VerbRequest;
 
 type StopSayResponse = {
-  mediaSessionRef: string;
+	mediaSessionRef: string;
 };
 
 export { StopSayRequest, StopSayResponse };

@@ -4,7 +4,7 @@ import { RecordingsController } from "./http/recordings.controller";
 import { RuntimeHostService } from "./runtime/runtime-host.service";
 
 @Module({
-  controllers: [IdentityInviteController, RecordingsController],
-  providers: [RuntimeHostService]
+	controllers: [IdentityInviteController, RecordingsController],
+	providers: [RuntimeHostService],
 })
 export class AppModule {}

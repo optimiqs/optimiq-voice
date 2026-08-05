@@ -24,14 +24,14 @@ import type { Route } from "./+types/edit-domain.page";
  * @returns {Array} Metadata objects for the page.
  */
 export function meta(_: Route.MetaArgs) {
-  return [
-    { title: "Domains | Optimiq Voice" },
-    {
-      name: "description",
-      content:
-        "A SIP Domain is used to group multiple SIP Agents for internal calling and organization."
-    }
-  ];
+	return [
+		{ title: "Domains | Optimiq Voice" },
+		{
+			name: "description",
+			content:
+				"A SIP Domain is used to group multiple SIP Agents for internal calling and organization.",
+		},
+	];
 }
 
 /**
@@ -45,104 +45,100 @@ export function meta(_: Route.MetaArgs) {
  * @returns {JSX.Element} The rendered Edit Domain page.
  */
 export default function EditDomain() {
-  /** Retrieves the current workspace ID for building navigation paths. */
-  const workspaceId = useWorkspaceId();
+	/** Retrieves the current workspace ID for building navigation paths. */
+	const workspaceId = useWorkspaceId();
 
-  /** Extracts the domain reference from the URL parameters. */
-  const { ref } = useParams();
+	/** Extracts the domain reference from the URL parameters. */
+	const { ref } = useParams();
 
-  /**
-   * Ensures the domain reference is provided.
-   *
-   * This value should never be null or undefined, as it is required
-   * to fetch and update the domain data.
-   */
-  if (!ref) {
-    throw new Error("Domain reference is required");
-  }
+	/**
+	 * Ensures the domain reference is provided.
+	 *
+	 * This value should never be null or undefined, as it is required
+	 * to fetch and update the domain data.
+	 */
+	if (!ref) {
+		throw new Error("Domain reference is required");
+	}
 
-  /** Fetches the existing domain details for editing. */
-  const { data, isLoading } = useDomain(ref);
+	/** Fetches the existing domain details for editing. */
+	const { data, isLoading } = useDomain(ref);
 
-  /** Hook to programmatically navigate between pages. */
-  const navigate = useNavigate();
+	/** Hook to programmatically navigate between pages. */
+	const navigate = useNavigate();
 
-  /**
-   * Handler for navigating back to the domains page.
-   * Uses `viewTransition` for smoother transitions.
-   */
-  const onGoBack = useCallback(() => {
-    navigate(`/workspaces/${workspaceId}/sip-network/domains`, {
-      viewTransition: true
-    });
-  }, [navigate, workspaceId]);
+	/**
+	 * Handler for navigating back to the domains page.
+	 * Uses `viewTransition` for smoother transitions.
+	 */
+	const onGoBack = useCallback(() => {
+		navigate(`/workspaces/${workspaceId}/sip-network/domains`, {
+			viewTransition: true,
+		});
+	}, [navigate, workspaceId]);
 
-  /** Custom hook to handle domain updates via the API. */
-  const { mutateAsync } = useUpdateDomain();
+	/** Custom hook to handle domain updates via the API. */
+	const { mutateAsync } = useUpdateDomain();
 
-  /**
-   * Handler called after form submission.
-   * Updates the domain, shows a toast, and navigates back to the domains page.
-   *
-   * @param {Schema} data - The validated form data.
-   */
-  const onSave = useCallback(
-    async (data: Schema) => {
-      try {
-        await mutateAsync({ ...data, ref });
-        toast("Domain updated successfully!");
-        onGoBack();
-      } catch (error) {
-        toast(getErrorMessage(error));
-      }
-    },
-    [mutateAsync, ref, onGoBack]
-  );
+	/**
+	 * Handler called after form submission.
+	 * Updates the domain, shows a toast, and navigates back to the domains page.
+	 *
+	 * @param {Schema} data - The validated form data.
+	 */
+	const onSave = useCallback(
+		async (data: Schema) => {
+			try {
+				await mutateAsync({ ...data, ref });
+				toast("Domain updated successfully!");
+				onGoBack();
+			} catch (error) {
+				toast(getErrorMessage(error));
+			}
+		},
+		[mutateAsync, ref, onGoBack],
+	);
 
-  /**
-   * Effect that ensures the user is redirected if the domain does not exist.
-   * Shows an error toast and navigates back to the domains page.
-   */
-  useEffect(() => {
-    if (!isLoading && !data) {
-      toast("Oops! You are trying to edit a domain that does not exist.");
-      onGoBack();
-    }
-  }, [isLoading, data, onGoBack]);
+	/**
+	 * Effect that ensures the user is redirected if the domain does not exist.
+	 * Shows an error toast and navigates back to the domains page.
+	 */
+	useEffect(() => {
+		if (!isLoading && !data) {
+			toast("Oops! You are trying to edit a domain that does not exist.");
+			onGoBack();
+		}
+	}, [isLoading, data, onGoBack]);
 
-  /**
-   * Shows a loading indicator while fetching the domain data.
-   */
-  if (isLoading || !data) {
-    return <Splash message="Loading domain details..." />;
-  }
+	/**
+	 * Shows a loading indicator while fetching the domain data.
+	 */
+	if (isLoading || !data) {
+		return <Splash message="Loading domain details..." />;
+	}
 
-  /**
-   * Renders the Edit Domain page layout.
-   */
-  return (
-    <FormProvider>
-      <Page variant="form">
-        <PageHeader
-          title="Edit Domain"
-          description="A SIP Domain is used to group multiple SIP Agents for internal calling and organization."
-          onBack={{ label: "Back to domains", onClick: onGoBack }}
-          actions={
-            <FormSubmitButton size="small" loadingText="Saving...">
-              Save Domain
-            </FormSubmitButton>
-          }
-        />
+	/**
+	 * Renders the Edit Domain page layout.
+	 */
+	return (
+		<FormProvider>
+			<Page variant="form">
+				<PageHeader
+					title="Edit Domain"
+					description="A SIP Domain is used to group multiple SIP Agents for internal calling and organization."
+					onBack={{ label: "Back to domains", onClick: onGoBack }}
+					actions={
+						<FormSubmitButton size="small" loadingText="Saving...">
+							Save Domain
+						</FormSubmitButton>
+					}
+				/>
 
-        {/* Form container with a max width for readability and consistent layout */}
-        <Box sx={{ maxWidth: "440px" }}>
-          <CreateDomainForm
-            onSubmit={onSave}
-            initialValues={data}
-            isEdit={true}
-          />
-        </Box>
-      </Page>
-    </FormProvider>
-  );
+				{/* Form container with a max width for readability and consistent layout */}
+				<Box sx={{ maxWidth: "440px" }}>
+					<CreateDomainForm onSubmit={onSave} initialValues={data} isEdit={true} />
+				</Box>
+			</Page>
+		</FormProvider>
+	);
 }

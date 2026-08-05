@@ -16,14 +16,14 @@ import type { Route } from "./+types/create-domain.page";
  * @returns An array of metadata objects for the page.
  */
 export function meta(_: Route.MetaArgs) {
-  return [
-    { title: "Create New Domain | Optimiq Voice" },
-    {
-      name: "description",
-      content:
-        "A SIP Domain is used to group multiple SIP Agents for internal calling and organization."
-    }
-  ];
+	return [
+		{ title: "Create New Domain | Optimiq Voice" },
+		{
+			name: "description",
+			content:
+				"A SIP Domain is used to group multiple SIP Agents for internal calling and organization.",
+		},
+	];
 }
 
 /**
@@ -38,31 +38,31 @@ export function meta(_: Route.MetaArgs) {
  * @returns {JSX.Element} The rendered Create Domain page.
  */
 export default function CreateDomain() {
-  /** Custom hook to create a domain via API with optimistic updates. */
-  const { onGoBack, onSave } = useCreateDomain();
+	/** Custom hook to create a domain via API with optimistic updates. */
+	const { onGoBack, onSave } = useCreateDomain();
 
-  /**
-   * Renders the Create Domain page layout.
-   */
-  return (
-    <FormProvider>
-      <Page variant="form">
-        <PageHeader
-          title="Create New Domain"
-          description="A SIP Domain is used to group multiple SIP Agents for internal calling and organization."
-          onBack={{ label: "Back to domains", onClick: onGoBack }}
-          actions={
-            <FormSubmitButton size="small" loadingText="Saving...">
-              Save Domain
-            </FormSubmitButton>
-          }
-        />
+	/**
+	 * Renders the Create Domain page layout.
+	 */
+	return (
+		<FormProvider>
+			<Page variant="form">
+				<PageHeader
+					title="Create New Domain"
+					description="A SIP Domain is used to group multiple SIP Agents for internal calling and organization."
+					onBack={{ label: "Back to domains", onClick: onGoBack }}
+					actions={
+						<FormSubmitButton size="small" loadingText="Saving...">
+							Save Domain
+						</FormSubmitButton>
+					}
+				/>
 
-        {/* Form container with a max width for readability and consistent layout */}
-        <Box sx={{ maxWidth: "440px" }}>
-          <CreateDomainForm onSubmit={onSave} />
-        </Box>
-      </Page>
-    </FormProvider>
-  );
+				{/* Form container with a max width for readability and consistent layout */}
+				<Box sx={{ maxWidth: "440px" }}>
+					<CreateDomainForm onSubmit={onSave} />
+				</Box>
+			</Page>
+		</FormProvider>
+	);
 }

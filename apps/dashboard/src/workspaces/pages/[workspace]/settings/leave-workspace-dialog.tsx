@@ -5,11 +5,11 @@ import { Modal } from "~/core/components/design-system/ui/modal/modal";
 import { Typography } from "~/core/components/design-system/ui/typography/typography";
 
 export interface LeaveWorkspaceDialogProps {
-  open: boolean;
-  onClose: () => void;
-  onConfirm: () => void;
-  workspaceName?: string;
-  isLeaving?: boolean;
+	open: boolean;
+	onClose: () => void;
+	onConfirm: () => void;
+	workspaceName?: string;
+	isLeaving?: boolean;
 }
 
 /**
@@ -22,57 +22,42 @@ export interface LeaveWorkspaceDialogProps {
  * @returns {JSX.Element} The rendered confirmation dialog.
  */
 export function LeaveWorkspaceDialog({
-  open,
-  onClose,
-  onConfirm,
-  workspaceName,
-  isLeaving = false
+	open,
+	onClose,
+	onConfirm,
+	workspaceName,
+	isLeaving = false,
 }: LeaveWorkspaceDialogProps) {
-  const handleConfirm = useCallback(() => {
-    onConfirm();
-  }, [onConfirm]);
+	const handleConfirm = useCallback(() => {
+		onConfirm();
+	}, [onConfirm]);
 
-  return (
-    <Modal
-      open={open}
-      onClose={onClose}
-      title="Leave Workspace"
-      maxWidth="sm"
-      hideCloseButton={isLeaving}
-    >
-      <Stack spacing={3}>
-        <Box>
-          <Typography variant="body-small" color="base.03" sx={{ mb: 2 }}>
-            Are you sure you want to leave{" "}
-            {workspaceName ? (
-              <strong>{workspaceName}</strong>
-            ) : (
-              "this workspace"
-            )}
-            ? You will lose access to its resources until a workspace owner
-            invites you again.
-          </Typography>
-        </Box>
+	return (
+		<Modal
+			open={open}
+			onClose={onClose}
+			title="Leave Workspace"
+			maxWidth="sm"
+			hideCloseButton={isLeaving}
+		>
+			<Stack spacing={3}>
+				<Box>
+					<Typography variant="body-small" color="base.03" sx={{ mb: 2 }}>
+						Are you sure you want to leave{" "}
+						{workspaceName ? <strong>{workspaceName}</strong> : "this workspace"}? You will lose
+						access to its resources until a workspace owner invites you again.
+					</Typography>
+				</Box>
 
-        <Stack direction="row" spacing={2} justifyContent="flex-end">
-          <Button
-            variant="outlined"
-            onClick={onClose}
-            disabled={isLeaving}
-            size="small"
-          >
-            Cancel
-          </Button>
-          <Button
-            onClick={handleConfirm}
-            disabled={isLeaving}
-            size="small"
-            danger
-          >
-            {isLeaving ? "Leaving..." : "Leave Workspace"}
-          </Button>
-        </Stack>
-      </Stack>
-    </Modal>
-  );
+				<Stack direction="row" spacing={2} justifyContent="flex-end">
+					<Button variant="outlined" onClick={onClose} disabled={isLeaving} size="small">
+						Cancel
+					</Button>
+					<Button onClick={handleConfirm} disabled={isLeaving} size="small" danger>
+						{isLeaving ? "Leaving..." : "Leave Workspace"}
+					</Button>
+				</Stack>
+			</Stack>
+		</Modal>
+	);
 }

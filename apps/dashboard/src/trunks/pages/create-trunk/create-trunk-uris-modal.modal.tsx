@@ -3,12 +3,7 @@ import { useCallback } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { Transport } from "@optimiq-voice/types";
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem
-} from "~/core/components/design-system/forms";
+import { Form, FormControl, FormField, FormItem } from "~/core/components/design-system/forms";
 import { FormRoot } from "~/core/components/design-system/forms/form-root";
 import { Button } from "~/core/components/design-system/ui/button/button";
 import { Checkbox } from "~/core/components/design-system/ui/checkbox/checkbox";
@@ -24,19 +19,13 @@ import { Select } from "~/core/components/design-system/ui/select/select";
  * - The type is either "allow" or "deny".
  */
 export const schema = z.object({
-  host: z.string().nonempty("Host is required"),
-  port: z.coerce.number().int().positive("Port must be a positive integer"),
-  transport: z.nativeEnum(Transport),
-  user: z.string().optional(),
-  weight: z.coerce
-    .number()
-    .int()
-    .nonnegative("Weight must be a non-negative integer"),
-  priority: z.coerce
-    .number()
-    .int()
-    .nonnegative("Priority must be a non-negative integer"),
-  enabled: z.boolean()
+	host: z.string().nonempty("Host is required"),
+	port: z.coerce.number().int().positive("Port must be a positive integer"),
+	transport: z.nativeEnum(Transport),
+	user: z.string().optional(),
+	weight: z.coerce.number().int().nonnegative("Weight must be a non-negative integer"),
+	priority: z.coerce.number().int().nonnegative("Priority must be a non-negative integer"),
+	enabled: z.boolean(),
 });
 
 /**
@@ -54,9 +43,9 @@ export type Schema = z.infer<typeof schema>;
  * @property {(data: Schema) => void} onFormSubmit - Function triggered when the form is successfully submitted.
  */
 export interface ModalProps {
-  isOpen: boolean;
-  onClose: () => void;
-  onFormSubmit: (data: Schema) => void;
+	isOpen: boolean;
+	onClose: () => void;
+	onFormSubmit: (data: Schema) => void;
 }
 
 /**
@@ -72,158 +61,149 @@ export interface ModalProps {
  * @param {ModalProps} props - The component props controlling visibility and form behavior.
  * @returns {JSX.Element} The rendered modal containing the rule creation form.
  */
-export const CreateTrunkUrisModal = ({
-  isOpen,
-  onClose,
-  onFormSubmit
-}: ModalProps) => {
-  /**
-   * Initializes React Hook Form with Zod validation and default values.
-   */
-  const form = useForm<Schema>({
-    resolver: zodResolver(schema),
-    defaultValues: {
-      host: "",
-      port: 5060, // Default SIP port
-      transport: Transport.TCP, // Default transport protocol
-      user: "",
-      weight: 10, // Default weight
-      priority: 1, // Default priority
-      enabled: true // Default to enabled
-    },
-    mode: "onChange"
-  });
+export const CreateTrunkUrisModal = ({ isOpen, onClose, onFormSubmit }: ModalProps) => {
+	/**
+	 * Initializes React Hook Form with Zod validation and default values.
+	 */
+	const form = useForm<Schema>({
+		resolver: zodResolver(schema),
+		defaultValues: {
+			host: "",
+			port: 5060, // Default SIP port
+			transport: Transport.TCP, // Default transport protocol
+			user: "",
+			weight: 10, // Default weight
+			priority: 1, // Default priority
+			enabled: true, // Default to enabled
+		},
+		mode: "onChange",
+	});
 
-  /**
-   * Handles the form submission.
-   *
-   * Calls the parent-provided onFormSubmit function with the validated data,
-   * closes the modal, and resets the form after a short delay to avoid visual flicker.
-   *
-   * @param {Schema} data - The validated form data.
-   */
-  const onSubmit = useCallback(
-    (data: Schema) => {
-      onFormSubmit(data);
-      onClose(); // Close the modal
-      setTimeout(() => {
-        form.reset(); // Reset the form state after closing the modal
-      }, 100); // Slight delay to ensure the modal is closed before resetting
-    },
-    [onFormSubmit, onClose, form]
-  );
+	/**
+	 * Handles the form submission.
+	 *
+	 * Calls the parent-provided onFormSubmit function with the validated data,
+	 * closes the modal, and resets the form after a short delay to avoid visual flicker.
+	 *
+	 * @param {Schema} data - The validated form data.
+	 */
+	const onSubmit = useCallback(
+		(data: Schema) => {
+			onFormSubmit(data);
+			onClose(); // Close the modal
+			setTimeout(() => {
+				form.reset(); // Reset the form state after closing the modal
+			}, 100); // Slight delay to ensure the modal is closed before resetting
+		},
+		[onFormSubmit, onClose, form],
+	);
 
-  return (
-    <Modal open={isOpen} onClose={onClose} title="Create New Rule">
-      <Form {...form}>
-        <FormRoot onSubmit={form.handleSubmit(onSubmit)}>
-          <FormField
-            control={form.control}
-            name="host"
-            render={({ field }) => (
-              <FormItem>
-                <FormControl>
-                  <Input type="text" label="IP or Hostname" {...field} />
-                </FormControl>
-              </FormItem>
-            )}
-          />
+	return (
+		<Modal open={isOpen} onClose={onClose} title="Create New Rule">
+			<Form {...form}>
+				<FormRoot onSubmit={form.handleSubmit(onSubmit)}>
+					<FormField
+						control={form.control}
+						name="host"
+						render={({ field }) => (
+							<FormItem>
+								<FormControl>
+									<Input type="text" label="IP or Hostname" {...field} />
+								</FormControl>
+							</FormItem>
+						)}
+					/>
 
-          <FormField
-            control={form.control}
-            name="user"
-            render={({ field }) => (
-              <FormItem>
-                <FormControl>
-                  <Input type="text" label="User" {...field} />
-                </FormControl>
-              </FormItem>
-            )}
-          />
+					<FormField
+						control={form.control}
+						name="user"
+						render={({ field }) => (
+							<FormItem>
+								<FormControl>
+									<Input type="text" label="User" {...field} />
+								</FormControl>
+							</FormItem>
+						)}
+					/>
 
-          <FormField
-            control={form.control}
-            name="port"
-            render={({ field }) => (
-              <FormItem>
-                <FormControl>
-                  <Input type="number" label="Port" {...field} />
-                </FormControl>
-              </FormItem>
-            )}
-          />
+					<FormField
+						control={form.control}
+						name="port"
+						render={({ field }) => (
+							<FormItem>
+								<FormControl>
+									<Input type="number" label="Port" {...field} />
+								</FormControl>
+							</FormItem>
+						)}
+					/>
 
-          <FormField
-            control={form.control}
-            name="transport"
-            render={({ field }) => (
-              <FormItem>
-                <FormControl>
-                  <Select
-                    label="Transport"
-                    options={Object.values(Transport).map((transport) => ({
-                      value: transport,
-                      label: transport
-                    }))}
-                    {...field}
-                  />
-                </FormControl>
-              </FormItem>
-            )}
-          />
+					<FormField
+						control={form.control}
+						name="transport"
+						render={({ field }) => (
+							<FormItem>
+								<FormControl>
+									<Select
+										label="Transport"
+										options={Object.values(Transport).map((transport) => ({
+											value: transport,
+											label: transport,
+										}))}
+										{...field}
+									/>
+								</FormControl>
+							</FormItem>
+						)}
+					/>
 
-          <FormField
-            control={form.control}
-            name="weight"
-            render={({ field }) => (
-              <FormItem>
-                <FormControl>
-                  <Input type="number" label="Weight" {...field} />
-                </FormControl>
-              </FormItem>
-            )}
-          />
+					<FormField
+						control={form.control}
+						name="weight"
+						render={({ field }) => (
+							<FormItem>
+								<FormControl>
+									<Input type="number" label="Weight" {...field} />
+								</FormControl>
+							</FormItem>
+						)}
+					/>
 
-          <FormField
-            control={form.control}
-            name="priority"
-            render={({ field }) => (
-              <FormItem>
-                <FormControl>
-                  <Input type="number" label="Priority" {...field} />
-                </FormControl>
-              </FormItem>
-            )}
-          />
+					<FormField
+						control={form.control}
+						name="priority"
+						render={({ field }) => (
+							<FormItem>
+								<FormControl>
+									<Input type="number" label="Priority" {...field} />
+								</FormControl>
+							</FormItem>
+						)}
+					/>
 
-          <FormField
-            control={form.control}
-            name="enabled"
-            render={({ field }) => (
-              <FormItem>
-                <FormControl>
-                  <Checkbox
-                    checked={field.value}
-                    onChange={(e) => field.onChange(e.target.checked)}
-                  >
-                    Enable Outbound SIP URI
-                  </Checkbox>
-                </FormControl>
-              </FormItem>
-            )}
-          />
+					<FormField
+						control={form.control}
+						name="enabled"
+						render={({ field }) => (
+							<FormItem>
+								<FormControl>
+									<Checkbox
+										checked={field.value}
+										onChange={(e) => field.onChange(e.target.checked)}
+									>
+										Enable Outbound SIP URI
+									</Checkbox>
+								</FormControl>
+							</FormItem>
+						)}
+					/>
 
-          {/* Submit Button */}
-          <Button
-            type="submit"
-            disabled={!form.formState.isValid}
-            isFullWidth
-            size="small"
-          >
-            Save Rule
-          </Button>
-        </FormRoot>
-      </Form>
-    </Modal>
-  );
+					{/* Submit Button */}
+					<Button type="submit" disabled={!form.formState.isValid} isFullWidth size="small">
+						Save Rule
+					</Button>
+				</FormRoot>
+			</Form>
+		</Modal>
+	);
 };

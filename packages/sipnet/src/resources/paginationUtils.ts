@@ -1,17 +1,14 @@
 type ListResponse<T> = {
-  items: T[];
-  nextPageToken?: string;
+	items: T[];
+	nextPageToken?: string;
 };
 
 type PaginatedListOptions<TInput, TOutput = TInput> = {
-  pageSize: number;
-  pageToken?: string;
-  fetchPage: (
-    pageToken: string | undefined,
-    pageSize: number
-  ) => Promise<ListResponse<TInput>>;
-  filterItems: (items: TInput[]) => TOutput[];
-  maxIterations?: number;
+	pageSize: number;
+	pageToken?: string;
+	fetchPage: (pageToken: string | undefined, pageSize: number) => Promise<ListResponse<TInput>>;
+	filterItems: (items: TInput[]) => TOutput[];
+	maxIterations?: number;
 };
 
 /**
@@ -19,23 +16,24 @@ type PaginatedListOptions<TInput, TOutput = TInput> = {
  * Empty strings are falsy in JS, but gRPC/protobuf may send them as empty strings.
  */
 export function normalizePageToken(pageToken?: string): string | undefined {
-  return pageToken === "" ? undefined : pageToken;
+	return pageToken === "" ? undefined : pageToken;
 }
 
 /**
  * Normalizes nextPageToken from response; returns empty string when there are no more pages.
  */
 export function normalizeNextPageToken(nextPageToken?: string): string {
-  return nextPageToken && nextPageToken !== "" ? nextPageToken : "";
+	return nextPageToken && nextPageToken !== "" ? nextPageToken : "";
 }
 
 /**
  * Filters items by accessKeyId from extended field.
  */
-export function filterByAccessKeyId<
-  T extends { extended?: { accessKeyId?: string } }
->(items: T[], accessKeyId: string): T[] {
-  return items.filter((item) => item.extended?.accessKeyId === accessKeyId);
+export function filterByAccessKeyId<T extends { extended?: { accessKeyId?: string } }>(
+	items: T[],
+	accessKeyId: string,
+): T[] {
+	return items.filter((item) => item.extended?.accessKeyId === accessKeyId);
 }
 
 /**
@@ -50,78 +48,68 @@ export function filterByAccessKeyId<
  * @template TOutput - The type of items after filtering/transformation (defaults to TInput)
  */
 export async function paginateWithFiltering<TInput, TOutput = TInput>(
-  options: PaginatedListOptions<TInput, TOutput>
+	options: PaginatedListOptions<TInput, TOutput>,
 ): Promise<ListResponse<TOutput>> {
-  const {
-    pageSize,
-    pageToken,
-    fetchPage,
-    filterItems,
-    maxIterations = 10
-  } = options;
+	const { pageSize, pageToken, fetchPage, filterItems, maxIterations = 10 } = options;
 
-  const normalizedPageToken = normalizePageToken(pageToken);
-  const items: TOutput[] = [];
-  let nextPageToken: string = "";
-  let currentPageToken: string | undefined = normalizedPageToken;
-  let hasMorePages = true;
-  let iterations = 0;
+	const normalizedPageToken = normalizePageToken(pageToken);
+	const items: TOutput[] = [];
+	let nextPageToken: string = "";
+	let currentPageToken: string | undefined = normalizedPageToken;
+	let hasMorePages = true;
+	let iterations = 0;
 
-  while (
-    items.length < pageSize &&
-    hasMorePages &&
-    iterations < maxIterations
-  ) {
-    iterations++;
+	while (items.length < pageSize && hasMorePages && iterations < maxIterations) {
+		iterations++;
 
-    // Request more items to account for filtering
-    const backendRequestedSize = pageSize * 2;
-    const response = await fetchPage(currentPageToken, backendRequestedSize);
+		// Request more items to account for filtering
+		const backendRequestedSize = pageSize * 2;
+		const response = await fetchPage(currentPageToken, backendRequestedSize);
 
-    if (!response || !response.items) {
-      hasMorePages = false;
-      nextPageToken = "";
-      break;
-    }
+		if (!response || !response.items) {
+			hasMorePages = false;
+			nextPageToken = "";
+			break;
+		}
 
-    const filteredItems = filterItems(response.items);
-    items.push(...filteredItems);
+		const filteredItems = filterItems(response.items);
+		items.push(...filteredItems);
 
-    const backendNextPageToken = normalizeNextPageToken(response.nextPageToken);
+		const backendNextPageToken = normalizeNextPageToken(response.nextPageToken);
 
-    // If we got no items from backend or no nextPageToken, we're done
-    if (response.items.length === 0 || !backendNextPageToken) {
-      hasMorePages = false;
-      nextPageToken = "";
-      break;
-    }
+		// If we got no items from backend or no nextPageToken, we're done
+		if (response.items.length === 0 || !backendNextPageToken) {
+			hasMorePages = false;
+			nextPageToken = "";
+			break;
+		}
 
-    // Check if backend returned fewer items than requested (indicating last page)
-    // If backend returned exactly what we asked for or more, there might be more items
-    const backendHasMoreItems = response.items.length >= backendRequestedSize;
+		// Check if backend returned fewer items than requested (indicating last page)
+		// If backend returned exactly what we asked for or more, there might be more items
+		const backendHasMoreItems = response.items.length >= backendRequestedSize;
 
-    // If we've filled the page, we're done
-    if (items.length >= pageSize) {
-      // We filled the page, so there might be more items
-      // Only return nextPageToken if backend indicates there are more items
-      nextPageToken = backendHasMoreItems ? backendNextPageToken : "";
-      break;
-    }
+		// If we've filled the page, we're done
+		if (items.length >= pageSize) {
+			// We filled the page, so there might be more items
+			// Only return nextPageToken if backend indicates there are more items
+			nextPageToken = backendHasMoreItems ? backendNextPageToken : "";
+			break;
+		}
 
-    // If we got filtered items in this iteration, return them
-    // Only continue if we got 0 filtered items (meaning all items were from other customers)
-    if (filteredItems.length === 0) {
-      // No items matched in this page, continue to next page
-      currentPageToken = backendNextPageToken;
-      nextPageToken = backendNextPageToken;
-    } else {
-      nextPageToken = backendHasMoreItems ? backendNextPageToken : "";
-      break;
-    }
-  }
+		// If we got filtered items in this iteration, return them
+		// Only continue if we got 0 filtered items (meaning all items were from other customers)
+		if (filteredItems.length === 0) {
+			// No items matched in this page, continue to next page
+			currentPageToken = backendNextPageToken;
+			nextPageToken = backendNextPageToken;
+		} else {
+			nextPageToken = backendHasMoreItems ? backendNextPageToken : "";
+			break;
+		}
+	}
 
-  return {
-    items: items.slice(0, pageSize),
-    nextPageToken
-  };
+	return {
+		items: items.slice(0, pageSize),
+		nextPageToken,
+	};
 }

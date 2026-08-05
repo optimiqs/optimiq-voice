@@ -1,6 +1,6 @@
 type ClientOptions = {
-  endpoint: string;
-  insecure: boolean;
+	endpoint: string;
+	insecure: boolean;
 };
 
 export { ClientOptions };

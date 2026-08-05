@@ -147,9 +147,9 @@ Sets the handler to be called when a new connection is established.
 
 ```js
 audioSocket.onConnection(async (req, res) => {
-  console.log("new connection from:", req.ref);
+	console.log("new connection from:", req.ref);
 
-  await res.play("/path/to/audio/file");
+	await res.play("/path/to/audio/file");
 });
 ```
 

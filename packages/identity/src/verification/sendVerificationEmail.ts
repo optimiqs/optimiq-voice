@@ -3,19 +3,19 @@ import { createBodyForVerificationEmail } from "./createBodyForVerificationEmail
 import { VerificationParams } from "./types";
 
 async function sendVerificationEmail(
-  sendEmail: (params: EmailParams) => Promise<void>,
-  request: VerificationParams
+	sendEmail: (params: EmailParams) => Promise<void>,
+	request: VerificationParams,
 ) {
-  const { recipient, verificationCode, templateDir } = request;
+	const { recipient, verificationCode, templateDir } = request;
 
-  await sendEmail({
-    to: recipient,
-    subject: "Your verification code",
-    html: createBodyForVerificationEmail({
-      templateDir,
-      verificationCode
-    })
-  });
+	await sendEmail({
+		to: recipient,
+		subject: "Your verification code",
+		html: createBodyForVerificationEmail({
+			templateDir,
+			verificationCode,
+		}),
+	});
 }
 
 export { sendVerificationEmail };

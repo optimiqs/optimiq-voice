@@ -24,14 +24,14 @@ import type { Acl } from "@optimiq-voice/types";
  * @returns {Array} Metadata objects for the page.
  */
 export function meta(_: Route.MetaArgs) {
-  return [
-    { title: "Edit ACL | Optimiq Voice" },
-    {
-      name: "description",
-      content:
-        "An ACL defines IP-based rules to allow or deny access to your voice infrastructure."
-    }
-  ];
+	return [
+		{ title: "Edit ACL | Optimiq Voice" },
+		{
+			name: "description",
+			content:
+				"An ACL defines IP-based rules to allow or deny access to your voice infrastructure.",
+		},
+	];
 }
 
 /**
@@ -45,138 +45,134 @@ export function meta(_: Route.MetaArgs) {
  * @returns {JSX.Element} The rendered Edit Acl page.
  */
 export default function EditAcl() {
-  /** Retrieves the current workspace ID for navigation purposes. */
-  const workspaceId = useWorkspaceId();
+	/** Retrieves the current workspace ID for navigation purposes. */
+	const workspaceId = useWorkspaceId();
 
-  /** Extracts the ACL reference (ID) from the URL parameters. */
-  const { ref } = useParams();
+	/** Extracts the ACL reference (ID) from the URL parameters. */
+	const { ref } = useParams();
 
-  /**
-   * Ensures the ACL reference is provided.
-   *
-   * This value should never be null or undefined; otherwise,
-   * throw an error to avoid rendering the form without data.
-   */
-  if (!ref) {
-    throw new Error("ACL reference is required.");
-  }
+	/**
+	 * Ensures the ACL reference is provided.
+	 *
+	 * This value should never be null or undefined; otherwise,
+	 * throw an error to avoid rendering the form without data.
+	 */
+	if (!ref) {
+		throw new Error("ACL reference is required.");
+	}
 
-  /** Fetches the existing ACL details from the API. */
-  const { data, isLoading } = useAcl(ref);
+	/** Fetches the existing ACL details from the API. */
+	const { data, isLoading } = useAcl(ref);
 
-  /** Hook to navigate between pages in the application. */
-  const navigate = useNavigate();
+	/** Hook to navigate between pages in the application. */
+	const navigate = useNavigate();
 
-  /**
-   * Navigates back to the ACLs overview page.
-   *
-   * Uses the view transition API for smoother page transitions.
-   */
-  const onGoBack = useCallback(() => {
-    navigate(`/workspaces/${workspaceId}/sip-network/acls`, {
-      viewTransition: true
-    });
-  }, [navigate, workspaceId]);
+	/**
+	 * Navigates back to the ACLs overview page.
+	 *
+	 * Uses the view transition API for smoother page transitions.
+	 */
+	const onGoBack = useCallback(() => {
+		navigate(`/workspaces/${workspaceId}/sip-network/acls`, {
+			viewTransition: true,
+		});
+	}, [navigate, workspaceId]);
 
-  /** Initializes the mutation hook to update the ACL. */
-  const { mutateAsync } = useUpdateAcl();
+	/** Initializes the mutation hook to update the ACL. */
+	const { mutateAsync } = useUpdateAcl();
 
-  /**
-   * Handles the form submission event.
-   *
-   * - Transforms the unified 'rules' field into 'allow' and 'deny' arrays.
-   * - Calls the API to update the ACL.
-   * - Shows a toast notification on success or error.
-   * - Navigates back to the ACLs page on success.
-   *
-   * @param {Schema} data - The validated form data.
-   */
-  const onSave = useCallback(
-    async ({ rules, ...data }: Schema) => {
-      const deny = rules
-        .filter((rule) => rule.type === "deny")
-        .map(({ name }) => name);
+	/**
+	 * Handles the form submission event.
+	 *
+	 * - Transforms the unified 'rules' field into 'allow' and 'deny' arrays.
+	 * - Calls the API to update the ACL.
+	 * - Shows a toast notification on success or error.
+	 * - Navigates back to the ACLs page on success.
+	 *
+	 * @param {Schema} data - The validated form data.
+	 */
+	const onSave = useCallback(
+		async ({ rules, ...data }: Schema) => {
+			const deny = rules.filter((rule) => rule.type === "deny").map(({ name }) => name);
 
-      const allow = rules
-        .filter((rule) => rule.type === "allow")
-        .map(({ name }) => name);
+			const allow = rules.filter((rule) => rule.type === "allow").map(({ name }) => name);
 
-      try {
-        await mutateAsync({ ...data, ref, deny, allow });
-        toast("ACL updated successfully!");
-        onGoBack();
-      } catch (error) {
-        toast(getErrorMessage(error));
-      }
-    },
-    [mutateAsync, ref, onGoBack]
-  );
+			try {
+				await mutateAsync({ ...data, ref, deny, allow });
+				toast("ACL updated successfully!");
+				onGoBack();
+			} catch (error) {
+				toast(getErrorMessage(error));
+			}
+		},
+		[mutateAsync, ref, onGoBack],
+	);
 
-  /**
-   * Effect that redirects the user back to the ACLs page if the ACL doesn't exist.
-   *
-   * - Shows an error toast.
-   * - Navigates back to the ACLs overview.
-   */
-  useEffect(() => {
-    if (!isLoading && !data) {
-      toast("Oops! You are trying to edit an ACL that does not exist.");
-      onGoBack();
-    }
-  }, [isLoading, data, onGoBack]);
+	/**
+	 * Effect that redirects the user back to the ACLs page if the ACL doesn't exist.
+	 *
+	 * - Shows an error toast.
+	 * - Navigates back to the ACLs overview.
+	 */
+	useEffect(() => {
+		if (!isLoading && !data) {
+			toast("Oops! You are trying to edit an ACL that does not exist.");
+			onGoBack();
+		}
+	}, [isLoading, data, onGoBack]);
 
-  /**
-   * Formats the ACL data into the shape expected by the form.
-   *
-   * - Combines 'allow' and 'deny' lists into a single 'rules' array.
-   *
-   * @param {Acl & { deny?: string[] }} acl - The ACL data from the API.
-   * @returns {Schema} - The formatted form values.
-   */
-  const formatAclToFormValues = useCallback(
-    (acl: Acl & { deny?: string[] }) => ({
-      ...acl,
-      rules: [
-        ...acl.allow.map((name) => ({ type: "allow", name })),
-        ...(acl.deny || []).map((name) => ({ type: "deny", name }))
-      ] as Schema["rules"]
-    }),
-    []
-  );
+	/**
+	 * Formats the ACL data into the shape expected by the form.
+	 *
+	 * - Combines 'allow' and 'deny' lists into a single 'rules' array.
+	 *
+	 * @param {Acl & { deny?: string[] }} acl - The ACL data from the API.
+	 * @returns {Schema} - The formatted form values.
+	 */
+	const formatAclToFormValues = useCallback(
+		(acl: Acl & { deny?: string[] }) => ({
+			...acl,
+			rules: [
+				...acl.allow.map((name) => ({ type: "allow", name })),
+				...(acl.deny || []).map((name) => ({ type: "deny", name })),
+			] as Schema["rules"],
+		}),
+		[],
+	);
 
-  /**
-   * Shows a loading indicator while fetching the ACL data.
-   */
-  if (isLoading || !data) {
-    return <Splash message="Loading ACL details..." />;
-  }
+	/**
+	 * Shows a loading indicator while fetching the ACL data.
+	 */
+	if (isLoading || !data) {
+		return <Splash message="Loading ACL details..." />;
+	}
 
-  /**
-   * Renders the Edit ACL page layout.
-   */
-  return (
-    <FormProvider>
-      <Page variant="form">
-        <PageHeader
-          title="Edit ACL"
-          description="An ACL defines IP-based rules to allow or deny access to your voice infrastructure."
-          onBack={{ label: "Back to ACLs", onClick: onGoBack }}
-          actions={
-            <FormSubmitButton size="small" loadingText="Saving...">
-              Save ACL
-            </FormSubmitButton>
-          }
-        />
+	/**
+	 * Renders the Edit ACL page layout.
+	 */
+	return (
+		<FormProvider>
+			<Page variant="form">
+				<PageHeader
+					title="Edit ACL"
+					description="An ACL defines IP-based rules to allow or deny access to your voice infrastructure."
+					onBack={{ label: "Back to ACLs", onClick: onGoBack }}
+					actions={
+						<FormSubmitButton size="small" loadingText="Saving...">
+							Save ACL
+						</FormSubmitButton>
+					}
+				/>
 
-        {/* Form container with a max width for consistent layout and readability */}
-        <Box sx={{ maxWidth: "440px" }}>
-          <CreateAclForm
-            onSubmit={onSave}
-            initialValues={formatAclToFormValues(data)}
-            isEdit={true}
-          />
-        </Box>
-      </Page>
-    </FormProvider>
-  );
+				{/* Form container with a max width for consistent layout and readability */}
+				<Box sx={{ maxWidth: "440px" }}>
+					<CreateAclForm
+						onSubmit={onSave}
+						initialValues={formatAclToFormValues(data)}
+						isEdit={true}
+					/>
+				</Box>
+			</Page>
+		</FormProvider>
+	);
 }

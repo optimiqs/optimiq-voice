@@ -21,14 +21,14 @@ import type { Secret } from "@optimiq-voice/types";
  * @returns An array of metadata objects for the page.
  */
 export function meta(_: Route.MetaArgs) {
-  return [
-    { title: "Secrets | Optimiq Voice" },
-    {
-      name: "description",
-      content:
-        "Manage encrypted variables used in your apps and APIs. Only available within this workspace."
-    }
-  ];
+	return [
+		{ title: "Secrets | Optimiq Voice" },
+		{
+			name: "description",
+			content:
+				"Manage encrypted variables used in your apps and APIs. Only available within this workspace.",
+		},
+	];
 }
 
 /**
@@ -40,112 +40,110 @@ export function meta(_: Route.MetaArgs) {
  * @returns {JSX.Element} The rendered Secrets page.
  */
 export default function SecretsList() {
-  /** Hook to navigate programmatically within the application. */
-  const navigate = useNavigate();
+	/** Hook to navigate programmatically within the application. */
+	const navigate = useNavigate();
 
-  /** Retrieves the current workspace ID for API calls and navigation. */
-  const workspaceId = useWorkspaceId();
+	/** Retrieves the current workspace ID for API calls and navigation. */
+	const workspaceId = useWorkspaceId();
 
-  /** State to hold the current pagination token used to fetch a specific page of data. */
-  const [pageToken, setPageToken] = useState<string | undefined>(undefined);
+	/** State to hold the current pagination token used to fetch a specific page of data. */
+	const [pageToken, setPageToken] = useState<string | undefined>(undefined);
 
-  /** Fetch secrets data using the current page token and page size. */
-  const { data, nextPageToken, isLoading } = useSecrets({
-    pageSize: PAGE_SIZE,
-    pageToken
-  });
+	/** Fetch secrets data using the current page token and page size. */
+	const { data, nextPageToken, isLoading } = useSecrets({
+		pageSize: PAGE_SIZE,
+		pageToken,
+	});
 
-  /** Hook to delete a secret via the API. */
-  const { mutate: deleteSecret } = useDeleteSecret();
+	/** Hook to delete a secret via the API. */
+	const { mutate: deleteSecret } = useDeleteSecret();
 
-  /**
-   * Custom hook for table management:
-   * - Handles search functionality
-   * - Handles pagination (next/prev pages)
-   * - Handles deletion of selected rows
-   * - Integrates with UI components
-   */
-  const {
-    filteredData,
-    searchBy,
-    setSearchBy,
-    handleNextPage,
-    handlePrevPage,
-    handleSearch,
-    handleDelete,
-    prevTokens
-  } = useResourceTable({
-    data,
-    pageSize: PAGE_SIZE,
-    pageToken,
-    setPageToken,
-    deleteResource: deleteSecret,
-    searchableFields: SECRETS_SEARCHABLE_FIELDS,
-    defaultSearchBy: "name"
-  });
+	/**
+	 * Custom hook for table management:
+	 * - Handles search functionality
+	 * - Handles pagination (next/prev pages)
+	 * - Handles deletion of selected rows
+	 * - Integrates with UI components
+	 */
+	const {
+		filteredData,
+		searchBy,
+		setSearchBy,
+		handleNextPage,
+		handlePrevPage,
+		handleSearch,
+		handleDelete,
+		prevTokens,
+	} = useResourceTable({
+		data,
+		pageSize: PAGE_SIZE,
+		pageToken,
+		setPageToken,
+		deleteResource: deleteSecret,
+		searchableFields: SECRETS_SEARCHABLE_FIELDS,
+		defaultSearchBy: "name",
+	});
 
-  /**
-   * Callback function to handle editing a selected secret.
-   *
-   * Navigates to the edit page for the selected secret.
-   * Uses view transitions for a smoother user experience.
-   * @param ref - The reference of the secret to edit.
-   * @param {ISecret} ref - The secret object containing the reference.
-   * @returns {void}
-   */
-  const onEditSelected = useCallback(({ ref }: Secret) => {
-    navigate(`/workspaces/${workspaceId}/secrets/${ref}/edit`, {
-      viewTransition: true
-    });
-  }, []);
+	/**
+	 * Callback function to handle editing a selected secret.
+	 *
+	 * Navigates to the edit page for the selected secret.
+	 * Uses view transitions for a smoother user experience.
+	 * @param ref - The reference of the secret to edit.
+	 * @param {ISecret} ref - The secret object containing the reference.
+	 * @returns {void}
+	 */
+	const onEditSelected = useCallback(({ ref }: Secret) => {
+		navigate(`/workspaces/${workspaceId}/secrets/${ref}/edit`, {
+			viewTransition: true,
+		});
+	}, []);
 
-  /**
-   * Renders the Secrets page, including a header and a DataTable.
-   */
-  return (
-    <Page>
-      <SecretsPageHeader />
+	/**
+	 * Renders the Secrets page, including a header and a DataTable.
+	 */
+	return (
+		<Page>
+			<SecretsPageHeader />
 
-      <DataTable
-        /** Indicates loading state during data fetch. */
-        isLoading={isLoading}
-        /** Data displayed in the table, filtered by search input. */
-        data={filteredData}
-        /** Column definitions for each table column. */
-        columns={columns}
-        /** Function to determine the unique row ID for each record. */
-        getRowId={(row) => row.ref}
-        /** The currently selected search field (e.g., "ref", "name"). */
-        searchBy={searchBy}
-        /** List of available searchable fields presented to the user. */
-        searchableFields={SECRETS_SEARCHABLE_FIELDS}
-        /** Secret of rows displayed per page. */
-        pageSize={PAGE_SIZE}
-        /** Pagination configuration: total rows, next and previous tokens. */
-        pagination={{
-          total: filteredData.length,
-          nextToken: nextPageToken,
-          prevToken: prevTokens.length
-            ? prevTokens[prevTokens.length - 1]
-            : null
-        }}
-        /** Handler for navigating to the next page. */
-        onNextPage={() => handleNextPage(nextPageToken)}
-        /** Handler for navigating to the previous page. */
-        onPrevPage={handlePrevPage}
-        /** Handler for updating the search input. */
-        onSearch={handleSearch}
-        /** Handler for changing the search field selection. */
-        onSearchByFieldChange={setSearchBy}
-        /** Handler for deleting selected rows. */
-        onDeleteSelected={handleDelete}
-        /** Handler for editing selected rows (currently shows a toast). */
-        onEditSelected={onEditSelected}
-        /** Handler for clicking on a row to navigate to edit page. */
-        onRowClick={onEditSelected}
-        /** Indicates if the table supports row selection. */
-        features={["selection", "pagination"]}
-      />
-    </Page>
-  );
+			<DataTable
+				/** Indicates loading state during data fetch. */
+				isLoading={isLoading}
+				/** Data displayed in the table, filtered by search input. */
+				data={filteredData}
+				/** Column definitions for each table column. */
+				columns={columns}
+				/** Function to determine the unique row ID for each record. */
+				getRowId={(row) => row.ref}
+				/** The currently selected search field (e.g., "ref", "name"). */
+				searchBy={searchBy}
+				/** List of available searchable fields presented to the user. */
+				searchableFields={SECRETS_SEARCHABLE_FIELDS}
+				/** Secret of rows displayed per page. */
+				pageSize={PAGE_SIZE}
+				/** Pagination configuration: total rows, next and previous tokens. */
+				pagination={{
+					total: filteredData.length,
+					nextToken: nextPageToken,
+					prevToken: prevTokens.length ? prevTokens[prevTokens.length - 1] : null,
+				}}
+				/** Handler for navigating to the next page. */
+				onNextPage={() => handleNextPage(nextPageToken)}
+				/** Handler for navigating to the previous page. */
+				onPrevPage={handlePrevPage}
+				/** Handler for updating the search input. */
+				onSearch={handleSearch}
+				/** Handler for changing the search field selection. */
+				onSearchByFieldChange={setSearchBy}
+				/** Handler for deleting selected rows. */
+				onDeleteSelected={handleDelete}
+				/** Handler for editing selected rows (currently shows a toast). */
+				onEditSelected={onEditSelected}
+				/** Handler for clicking on a row to navigate to edit page. */
+				onRowClick={onEditSelected}
+				/** Indicates if the table supports row selection. */
+				features={["selection", "pagination"]}
+			/>
+		</Page>
+	);
 }

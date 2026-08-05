@@ -6,22 +6,22 @@ import { Checkbox } from "~/core/components/design-system/ui/checkbox/checkbox";
  * Props interface for the JsonPreviewToggle component.
  */
 interface JsonPreviewToggleProps {
-  /**
-   * Indicates whether the checkbox is currently checked.
-   */
-  checked: boolean;
+	/**
+	 * Indicates whether the checkbox is currently checked.
+	 */
+	checked: boolean;
 
-  /**
-   * Callback function to handle checkbox state changes.
-   *
-   * @param checked - The new checked state.
-   */
-  onChange: (checked: boolean) => void;
+	/**
+	 * Callback function to handle checkbox state changes.
+	 *
+	 * @param checked - The new checked state.
+	 */
+	onChange: (checked: boolean) => void;
 
-  /**
-   * Disables the checkbox if true, preventing user interaction.
-   */
-  disabled: boolean;
+	/**
+	 * Disables the checkbox if true, preventing user interaction.
+	 */
+	disabled: boolean;
 }
 
 /**
@@ -38,17 +38,13 @@ interface JsonPreviewToggleProps {
  * @returns {JSX.Element} The rendered JSON preview toggle.
  */
 export const JsonPreviewToggle: React.FC<JsonPreviewToggleProps> = ({
-  checked,
-  onChange,
-  disabled
+	checked,
+	onChange,
+	disabled,
 }) => (
-  <Box>
-    <Checkbox
-      checked={checked}
-      onChange={(e) => onChange(e.target.checked)}
-      disabled={disabled}
-    >
-      Show preview (JSON only)
-    </Checkbox>
-  </Box>
+	<Box>
+		<Checkbox checked={checked} onChange={(e) => onChange(e.target.checked)} disabled={disabled}>
+			Show preview (JSON only)
+		</Checkbox>
+	</Box>
 );

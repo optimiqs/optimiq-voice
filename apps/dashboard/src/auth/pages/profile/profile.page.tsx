@@ -16,7 +16,7 @@ import type { Route } from "./+types/profile.page";
  * @returns {Array} An array containing the page title.
  */
 export function meta(_: Route.MetaArgs) {
-  return [{ title: "Personal Settings | Optimiq Voice" }];
+	return [{ title: "Personal Settings | Optimiq Voice" }];
 }
 
 /**
@@ -29,33 +29,33 @@ export function meta(_: Route.MetaArgs) {
  * @returns {JSX.Element} The rendered personal settings page.
  */
 export default function Profile() {
-  const navigate = useNavigate();
+	const navigate = useNavigate();
 
-  const onGoBack = () => {
-    navigate("/");
-  };
+	const onGoBack = () => {
+		navigate("/");
+	};
 
-  /**
-   * Renders the personal settings page with a header and profile form.
-   */
-  return (
-    <FormProvider>
-      <Page>
-        <PageHeader
-          title="Personal Settings"
-          description="Update your personal information and account settings."
-          onBack={{ label: "Back to dashboard", onClick: onGoBack }}
-          actions={
-            <FormSubmitButton size="small" loadingText="Saving...">
-              Save Changes
-            </FormSubmitButton>
-          }
-        />
+	/**
+	 * Renders the personal settings page with a header and profile form.
+	 */
+	return (
+		<FormProvider>
+			<Page>
+				<PageHeader
+					title="Personal Settings"
+					description="Update your personal information and account settings."
+					onBack={{ label: "Back to dashboard", onClick: onGoBack }}
+					actions={
+						<FormSubmitButton size="small" loadingText="Saving...">
+							Save Changes
+						</FormSubmitButton>
+					}
+				/>
 
-        <Box sx={{ maxWidth: "440px" }}>
-          <PersonalSettingsForm />
-        </Box>
-      </Page>
-    </FormProvider>
-  );
+				<Box sx={{ maxWidth: "440px" }}>
+					<PersonalSettingsForm />
+				</Box>
+			</Page>
+		</FormProvider>
+	);
 }

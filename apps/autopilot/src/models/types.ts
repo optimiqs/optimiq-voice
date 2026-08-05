@@ -5,40 +5,34 @@ import { KnowledgeBase } from "../knowledge";
 import { Tool } from "../tools/types";
 
 type LanguageModel = {
-  invoke: (text: string, isReentry?: boolean) => Promise<InvocationResult>;
+	invoke: (text: string, isReentry?: boolean) => Promise<InvocationResult>;
 };
 
 type BaseModelParams = {
-  firstMessage?: string;
-  goodbyeMessage?: string;
-  transferOptions: { message: string };
-  systemPrompt: string;
-  knowledgeBase: KnowledgeBase;
-  tools: Tool[];
-  telephonyContext: TelephonyContext;
+	firstMessage?: string;
+	goodbyeMessage?: string;
+	transferOptions: { message: string };
+	systemPrompt: string;
+	knowledgeBase: KnowledgeBase;
+	tools: Tool[];
+	telephonyContext: TelephonyContext;
 };
 
 type LanguageModelParams = BaseModelParams & {
-  model: BaseChatModel;
+	model: BaseChatModel;
 };
 
 type InvocationResult = {
-  type: "say" | "hangup" | "transfer";
-  content?: string;
-  toolCalls?: ToolCall[];
+	type: "say" | "hangup" | "transfer";
+	content?: string;
+	toolCalls?: ToolCall[];
 };
 
 type TelephonyContext = {
-  callDirection: CallDirection;
-  ingressNumber: string;
-  callerNumber: string;
-  metadata?: Record<string, string>;
+	callDirection: CallDirection;
+	ingressNumber: string;
+	callerNumber: string;
+	metadata?: Record<string, string>;
 };
 
-export {
-  BaseModelParams,
-  InvocationResult,
-  LanguageModel,
-  LanguageModelParams,
-  TelephonyContext
-};
+export { BaseModelParams, InvocationResult, LanguageModel, LanguageModelParams, TelephonyContext };

@@ -27,10 +27,10 @@ import { OPTIMIQ_VOICE_SERVER_CONFIG } from "../stores/optimiq-voice.config";
  * @returns {Client} A configured instance of the Optimiq Voice SDK Client for Node.js.
  */
 export const getClient = cache(() => {
-  Logger.debug("[optimiq-voice.server] Creating Optimiq Voice Client instance");
+	Logger.debug("[optimiq-voice.server] Creating Optimiq Voice Client instance");
 
-  const optimiqVoiceClient = new SDK.Client(OPTIMIQ_VOICE_SERVER_CONFIG);
-  return optimiqVoiceClient;
+	const optimiqVoiceClient = new SDK.Client(OPTIMIQ_VOICE_SERVER_CONFIG);
+	return optimiqVoiceClient;
 });
 
 /**

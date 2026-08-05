@@ -8,9 +8,9 @@ import { useDataTable } from "../data-table.context";
  * Props definition for a single row in the DataTableBody.
  */
 export interface DataTableBodyRowProps {
-  row: Row<any>;
-  showSelection: boolean;
-  onRowClick?: (row: any) => void;
+	row: Row<any>;
+	showSelection: boolean;
+	onRowClick?: (row: any) => void;
 }
 
 /**
@@ -19,52 +19,49 @@ export interface DataTableBodyRowProps {
  * Supports row click navigation while preserving selection functionality.
  */
 const DataRow = ({ row, showSelection, onRowClick }: DataTableBodyRowProps) => {
-  const theme = useTheme();
+	const theme = useTheme();
 
-  const handleRowClick = (event: React.MouseEvent) => {
-    // Don't trigger row click if clicking on the selection checkbox
-    if ((event.target as HTMLElement).closest('[data-selection-cell="true"]')) {
-      return;
-    }
+	const handleRowClick = (event: React.MouseEvent) => {
+		// Don't trigger row click if clicking on the selection checkbox
+		if ((event.target as HTMLElement).closest('[data-selection-cell="true"]')) {
+			return;
+		}
 
-    if (onRowClick) {
-      onRowClick(row.original);
-    }
-  };
+		if (onRowClick) {
+			onRowClick(row.original);
+		}
+	};
 
-  return (
-    <TableRow
-      key={row.id}
-      selected={row.getIsSelected()}
-      onClick={handleRowClick}
-      sx={{
-        cursor: onRowClick ? "pointer" : "default",
-        "&:hover": onRowClick
-          ? {
-              backgroundColor: theme.palette.base["08"]
-            }
-          : {},
-        transition: "background-color 0.2s ease"
-      }}
-    >
-      {showSelection && (
-        <TableCell data-selection-cell="true">
-          <Checkbox
-            checked={row.getIsSelected()}
-            onChange={row.getToggleSelectedHandler()}
-          />
-        </TableCell>
-      )}
+	return (
+		<TableRow
+			key={row.id}
+			selected={row.getIsSelected()}
+			onClick={handleRowClick}
+			sx={{
+				cursor: onRowClick ? "pointer" : "default",
+				"&:hover": onRowClick
+					? {
+							backgroundColor: theme.palette.base["08"],
+						}
+					: {},
+				transition: "background-color 0.2s ease",
+			}}
+		>
+			{showSelection && (
+				<TableCell data-selection-cell="true">
+					<Checkbox checked={row.getIsSelected()} onChange={row.getToggleSelectedHandler()} />
+				</TableCell>
+			)}
 
-      {row.getVisibleCells().map((cell: any) => (
-        <TableCell key={cell.id}>
-          {cell.column.id === "ref"
-            ? lastUuidSegment(cell.getValue() as string)
-            : flexRender(cell.column.columnDef.cell, cell.getContext())}
-        </TableCell>
-      ))}
-    </TableRow>
-  );
+			{row.getVisibleCells().map((cell: any) => (
+				<TableCell key={cell.id}>
+					{cell.column.id === "ref"
+						? lastUuidSegment(cell.getValue() as string)
+						: flexRender(cell.column.columnDef.cell, cell.getContext())}
+				</TableCell>
+			))}
+		</TableRow>
+	);
 };
 
 /**
@@ -72,18 +69,12 @@ const DataRow = ({ row, showSelection, onRowClick }: DataTableBodyRowProps) => {
  * @param colSpan - Number of columns to span across.
  * @param message - Text message to show in the empty row.
  */
-const EmptyStateRow = ({
-  colSpan,
-  message
-}: {
-  colSpan: number;
-  message: string;
-}) => (
-  <TableRow sx={{ height: 72 }}>
-    <TableCell colSpan={colSpan} sx={{ textAlign: "center !important" }}>
-      {message}
-    </TableCell>
-  </TableRow>
+const EmptyStateRow = ({ colSpan, message }: { colSpan: number; message: string }) => (
+	<TableRow sx={{ height: 72 }}>
+		<TableCell colSpan={colSpan} sx={{ textAlign: "center !important" }}>
+			{message}
+		</TableCell>
+	</TableRow>
 );
 
 /**
@@ -91,39 +82,28 @@ const EmptyStateRow = ({
  * Displays rows of data, a loading message, or an empty state depending on the table's state.
  */
 export function DataTableBody() {
-  const { table, features, isLoading, onRowClick } = useDataTable();
+	const { table, features, isLoading, onRowClick } = useDataTable();
 
-  /** All table rows based on current state and filters. */
-  const rows = table.getRowModel().rows;
+	/** All table rows based on current state and filters. */
+	const rows = table.getRowModel().rows;
 
-  /** Determines if selection checkboxes should be shown. */
-  const showSelection = features.includes("selection");
+	/** Determines if selection checkboxes should be shown. */
+	const showSelection = features.includes("selection");
 
-  /** Calculates the number of columns to span for empty/loading rows. */
-  const colSpan = table.getAllColumns().length + (showSelection ? 1 : 0);
+	/** Calculates the number of columns to span for empty/loading rows. */
+	const colSpan = table.getAllColumns().length + (showSelection ? 1 : 0);
 
-  return (
-    <TableBody>
-      {rows.length > 0 ? (
-        rows.map((row) => (
-          <DataRow
-            key={row.id}
-            row={row}
-            showSelection={showSelection}
-            onRowClick={onRowClick}
-          />
-        ))
-      ) : isLoading ? (
-        <EmptyStateRow
-          colSpan={colSpan}
-          message="Hey! We're loading your data..."
-        />
-      ) : (
-        <EmptyStateRow
-          colSpan={colSpan}
-          message="Oops! You don't have any data yet."
-        />
-      )}
-    </TableBody>
-  );
+	return (
+		<TableBody>
+			{rows.length > 0 ? (
+				rows.map((row) => (
+					<DataRow key={row.id} row={row} showSelection={showSelection} onRowClick={onRowClick} />
+				))
+			) : isLoading ? (
+				<EmptyStateRow colSpan={colSpan} message="Hey! We're loading your data..." />
+			) : (
+				<EmptyStateRow colSpan={colSpan} message="Oops! You don't have any data yet." />
+			)}
+		</TableBody>
+	);
 }

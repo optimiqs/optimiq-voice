@@ -38,35 +38,31 @@ Voice Application Example:
 
 ```typescript
 const VoiceServer = require("@optimiq-voice/voice").default;
-const {
-  GatherSource,
-  VoiceRequest,
-  VoiceResponse
-} = require("@optimiq-voice/voice");
+const { GatherSource, VoiceRequest, VoiceResponse } = require("@optimiq-voice/voice");
 
 new VoiceServer().listen(async (req: VoiceRequest, voice: VoiceResponse) => {
-  const { ingressNumber, sessionRef, appRef } = req;
+	const { ingressNumber, sessionRef, appRef } = req;
 
-  await voice.answer();
+	await voice.answer();
 
-  await voice.say("Hi there! What's your name?");
+	await voice.say("Hi there! What's your name?");
 
-  const { speech: name } = await res.gather({
-    source: GatherSource.SPEECH
-  });
+	const { speech: name } = await res.gather({
+		source: GatherSource.SPEECH,
+	});
 
-  await voice.say("Nice to meet you " + name + "!");
+	await voice.say("Nice to meet you " + name + "!");
 
-  await voice.say("Please enter your 4 digit pin.");
+	await voice.say("Please enter your 4 digit pin.");
 
-  const { digits } = await voice.gather({
-    maxDigits: 4,
-    finishOnKey: "#"
-  });
+	const { digits } = await voice.gather({
+		maxDigits: 4,
+		finishOnKey: "#",
+	});
 
-  await voice.say("Your pin is " + digits);
+	await voice.say("Your pin is " + digits);
 
-  await voice.hangup();
+	await voice.hangup();
 });
 
 // Your app will live at tcp://127.0.0.1:50061
@@ -119,8 +115,8 @@ Constructs a new VoiceResponse object.
 import { VoiceServer } from "@optimiq-voice/voice";
 
 async function handler(request, response) {
-  await response.answer();
-  await response.play("https://soundsserver:9000/sounds/hello-world.wav");
+	await response.answer();
+	await response.play("https://soundsserver:9000/sounds/hello-world.wav");
 }
 
 new VoiceServer().listen(handler, { port: 3000 });
@@ -138,7 +134,7 @@ must run the answer command.
 
 ```js
 async function handler(request, response) {
-  await response.answer();
+	await response.answer();
 }
 ```
 
@@ -153,7 +149,7 @@ Hangup the call.
 
 ```js
 async function handler(request, response) {
-  await response.hangup();
+	await response.hangup();
 }
 ```
 
@@ -176,8 +172,8 @@ Play an audio in the call.
 
 ```js
 async function handler(request, response) {
-  await response.answer();
-  await response.play("https://soundsserver:9000/sounds/hello-world.wav");
+	await response.answer();
+	await response.play("https://soundsserver:9000/sounds/hello-world.wav");
 }
 ```
 
@@ -197,8 +193,8 @@ Play a series of DTMF digits in a call.
 
 ```js
 async function handler(request, response) {
-  await response.answer();
-  await response.playDtmf("1234");
+	await response.answer();
+	await response.playDtmf("1234");
 }
 ```
 
@@ -220,13 +216,13 @@ Control the playback of the currently playing media.
 
 ```js
 async function handler(request, response) {
-  await response.answer();
-  await response.play("https://s3.optimiq.health/uuid/hello-world.wav", {
-    playbackRef: "playback-01"
-  });
+	await response.answer();
+	await response.play("https://s3.optimiq.health/uuid/hello-world.wav", {
+		playbackRef: "playback-01",
+	});
 
-  // Pause the media
-  await response.playbackControl("playback-01", PlaybackControlAction.PAUSE);
+	// Pause the media
+	await response.playbackControl("playback-01", PlaybackControlAction.PAUSE);
 }
 ```
 
@@ -251,13 +247,13 @@ Waits for data entry from the user's keypad or from a speech provider.
 
 ```js
 async function handler(request, response) {
-  await response.answer();
-  const speech = await response.gather({
-    source: GatherSource.SPEECH,
-    numDigits: 3
-  });
-  console.log("speech: " + speech);
-  await response.hangup();
+	await response.answer();
+	const speech = await response.gather({
+		source: GatherSource.SPEECH,
+		numDigits: 3,
+	});
+	console.log("speech: " + speech);
+	await response.hangup();
 }
 ```
 
@@ -281,11 +277,11 @@ Send a text for a TTS engine to convert to speech.
 
 ```js
 async function handler(request, response) {
-  await response.answer();
-  const playbackRef = await response.say("Hello World");
+	await response.answer();
+	const playbackRef = await response.say("Hello World");
 
-  // Like the play verb, you can control the playback
-  await response.playbackControl(playbackRef, PlaybackControlAction.STOP);
+	// Like the play verb, you can control the playback
+	await response.playbackControl(playbackRef, PlaybackControlAction.STOP);
 }
 ```
 
@@ -310,9 +306,9 @@ Record the audio of the call.
 
 ```js
 async function handler(request, response) {
-  await response.answer();
-  const record = await response.record();
-  console.log("Recording: %s", record.name);
+	await response.answer();
+	const record = await response.record();
+	console.log("Recording: %s", record.name);
 }
 ```
 
@@ -351,18 +347,18 @@ Starts a bidirectional audio stream between the call and the application.
 
 ```js
 async function handler(request, response) {
-  await response.answer();
+	await response.answer();
 
-  const stream = await response.stream({
-    direction: StreamDirection.BOTH
-  });
+	const stream = await response.stream({
+		direction: StreamDirection.BOTH,
+	});
 
-  stream.onPayload((payload) => {
-    // Use the payload
-  });
+	stream.onPayload((payload) => {
+		// Use the payload
+	});
 
-  // Or write to the stream
-  // stream.write({ type: StreamMessageType.AUDIO_OUT, payload: "\x00\x01\x02" });
+	// Or write to the stream
+	// stream.write({ type: StreamMessageType.AUDIO_OUT, payload: "\x00\x01\x02" });
 }
 ```
 
@@ -385,11 +381,11 @@ Starts a server-side stream gather operation which sends transcription data to t
 
 ```js
 async function handler(request, response) {
-  await response.answer();
-  const sGather = await response.sgather({ source: StreamGatherSource.SPEECH });
-  sGather.onPayload((payload) => {
-    console.log("Payload: %s", payload);
-  });
+	await response.answer();
+	const sGather = await response.sgather({ source: StreamGatherSource.SPEECH });
+	sGather.onPayload((payload) => {
+		console.log("Payload: %s", payload);
+	});
 }
 ```
 
@@ -411,8 +407,8 @@ Mutes a call.
 
 ```js
 async function handler(request, response) {
-  await response.answer();
-  await response.mute(); // Will mute both directions
+	await response.answer();
+	await response.mute(); // Will mute both directions
 }
 ```
 
@@ -434,8 +430,8 @@ Unmute a call.
 
 ```js
 async function handler(request, response) {
-  await response.answer();
-  await response.unmute(); // Will unmute both directions
+	await response.answer();
+	await response.unmute(); // Will unmute both directions
 }
 ```
 

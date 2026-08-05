@@ -22,7 +22,7 @@ export const shouldRevalidate = () => false;
  * @returns The session object if authenticated
  */
 export async function loader({ request }: Route.LoaderArgs) {
-  return await getRequiredSession(request.headers.get("Cookie"));
+	return await getRequiredSession(request.headers.get("Cookie"));
 }
 
 /**
@@ -31,72 +31,69 @@ export async function loader({ request }: Route.LoaderArgs) {
  * This is the layout for authenticated users. It wraps protected routes
  * and will eventually include a header with user information and logout functionality.
  */
-export default function AuthenticatedLayout({
-  loaderData: { session }
-}: Route.ComponentProps) {
-  const { client } = useOptimiqVoice();
-  const navigate = useNavigate();
-  const { pathname } = useLocation();
+export default function AuthenticatedLayout({ loaderData: { session } }: Route.ComponentProps) {
+	const { client } = useOptimiqVoice();
+	const navigate = useNavigate();
+	const { pathname } = useLocation();
 
-  useEffect(() => {
-    if (!IS_CLOUD) return;
+	useEffect(() => {
+		if (!IS_CLOUD) return;
 
-    const idToken = client.getIdToken();
-    if (!idToken) return;
+		const idToken = client.getIdToken();
+		if (!idToken) return;
 
-    const { emailVerified, phoneNumberVerified } =
-      jwtDecode<IDTokenPayload>(idToken);
+		const { emailVerified, phoneNumberVerified } = jwtDecode<IDTokenPayload>(idToken);
 
-    Logger.debug("[ID Token] Decoded", {
-      emailVerified,
-      phoneNumberVerified,
-      currentPath: pathname
-    });
+		Logger.debug("[ID Token] Decoded", {
+			emailVerified,
+			phoneNumberVerified,
+			currentPath: pathname,
+		});
 
-    const isVerified = emailVerified && phoneNumberVerified;
+		const isVerified = emailVerified && phoneNumberVerified;
 
-    if (!isVerified && pathname !== "/accounts/verify") {
-      Logger.debug("[Redirect] Not verified, redirecting to /accounts/verify");
-      navigate("/accounts/verify", { replace: true });
-    }
+		if (!isVerified && pathname !== "/accounts/verify") {
+			Logger.debug("[Redirect] Not verified, redirecting to /accounts/verify");
+			navigate("/accounts/verify", { replace: true });
+		}
 
-    if (isVerified && pathname === "/accounts/verify") {
-      Logger.debug("[Redirect] Already verified, redirecting to home");
-      navigate("/", { replace: true });
-    }
-  }, [client, pathname, navigate]);
+		if (isVerified && pathname === "/accounts/verify") {
+			Logger.debug("[Redirect] Already verified, redirecting to home");
+			navigate("/", { replace: true });
+		}
+	}, [client, pathname, navigate]);
 
-  return (
-    <AuthenticatedProvider initialSession={session}>
-      <MainRoot>
-        <Header />
-        <MainContent>
-          <Outlet />
-        </MainContent>
-      </MainRoot>
-    </AuthenticatedProvider>
-  );
+	return (
+		<AuthenticatedProvider initialSession={session}>
+			<MainRoot>
+				<Header />
+				<MainContent>
+					<Outlet />
+				</MainContent>
+			</MainRoot>
+		</AuthenticatedProvider>
+	);
 }
 
 export const MainRoot = styled(Box)(({ theme }) => ({
-  display: "flex",
-  flexDirection: "column",
-  flexGrow: 1,
-  height: "100%",
-  overflow: "hidden",
-  backgroundColor: theme.palette.bg.app,
-  ...theme.applyStyles("dark", {
-    backgroundColor: theme.palette.bg.app
-  })
+	display: "flex",
+	flexDirection: "column",
+	flexGrow: 1,
+	height: "100%",
+	overflow: "hidden",
+	backgroundColor: theme.palette.bg.app,
+	...theme.applyStyles("dark", {
+		backgroundColor: theme.palette.bg.app,
+	}),
 }));
 
 export const MainContent = styled(Box)(({ theme }) => ({
-  display: "flex",
-  flexDirection: "column",
-  height: "100%",
-  backgroundColor: theme.palette.bg.app,
-  overflow: "hidden",
-  ...theme.applyStyles("dark", {
-    backgroundColor: theme.palette.bg.app
-  })
+	display: "flex",
+	flexDirection: "column",
+	height: "100%",
+	backgroundColor: theme.palette.bg.app,
+	overflow: "hidden",
+	...theme.applyStyles("dark", {
+		backgroundColor: theme.palette.bg.app,
+	}),
 }));

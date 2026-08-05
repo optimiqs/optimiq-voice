@@ -12,57 +12,57 @@ chai.use(sinonChai);
 const sandbox = createSandbox();
 
 describe("@calls/trackCall", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should track the status of a call", async function () {
-    const { createTrackCall } = await import("../../src/calls/createTrackCall");
-    const callRef = "5d8c253a-62a0-48d5-9c8f-cfd00279936f";
+	it("should track the status of a call", async function () {
+		const { createTrackCall } = await import("../../src/calls/createTrackCall");
+		const callRef = "5d8c253a-62a0-48d5-9c8f-cfd00279936f";
 
-    const call = {
-      write: sandbox.stub(),
-      end: sandbox.stub(),
-      request: {
-        ref: callRef
-      }
-    };
+		const call = {
+			write: sandbox.stub(),
+			end: sandbox.stub(),
+			request: {
+				ref: callRef,
+			},
+		};
 
-    const subscription = { callback: sandbox.stub() };
-    const nc = {
-      subscribe: sandbox.stub().returns(subscription)
-    } as unknown as NatsConnection;
+		const subscription = { callback: sandbox.stub() };
+		const nc = {
+			subscribe: sandbox.stub().returns(subscription),
+		} as unknown as NatsConnection;
 
-    const trackCall = createTrackCall(nc);
+		const trackCall = createTrackCall(nc);
 
-    trackCall(call, () => {});
+		trackCall(call, () => {});
 
-    const msg = {
-      json: sandbox
-        .stub()
-        .onFirstCall()
-        .returns({ ref: callRef, status: DialStatus.TRYING })
-        .onSecondCall()
-        .returns({ ref: callRef, status: DialStatus.PROGRESS })
-        .onThirdCall()
-        .returns({ ref: callRef, status: DialStatus.ANSWER })
-    };
+		const msg = {
+			json: sandbox
+				.stub()
+				.onFirstCall()
+				.returns({ ref: callRef, status: DialStatus.TRYING })
+				.onSecondCall()
+				.returns({ ref: callRef, status: DialStatus.PROGRESS })
+				.onThirdCall()
+				.returns({ ref: callRef, status: DialStatus.ANSWER }),
+		};
 
-    subscription.callback(null, msg);
-    subscription.callback(null, msg);
-    subscription.callback(null, msg);
+		subscription.callback(null, msg);
+		subscription.callback(null, msg);
+		subscription.callback(null, msg);
 
-    expect(call.write).to.have.been.calledWith({
-      ref: callRef,
-      status: DialStatus.TRYING
-    });
-    expect(call.write).to.have.been.calledWith({
-      ref: callRef,
-      status: DialStatus.PROGRESS
-    });
-    expect(call.write).to.have.been.calledWith({
-      ref: callRef,
-      status: DialStatus.ANSWER
-    });
-  });
+		expect(call.write).to.have.been.calledWith({
+			ref: callRef,
+			status: DialStatus.TRYING,
+		});
+		expect(call.write).to.have.been.calledWith({
+			ref: callRef,
+			status: DialStatus.PROGRESS,
+		});
+		expect(call.write).to.have.been.calledWith({
+			ref: callRef,
+			status: DialStatus.ANSWER,
+		});
+	});
 });

@@ -13,35 +13,35 @@ const sandbox = createSandbox();
 const channelId = "channel-id";
 
 describe("@voice/handler/PlayDtmf", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should handle a PlayDtmf command", async function () {
-    // Arrange
-    const ari = getAriStub(sandbox);
+	it("should handle a PlayDtmf command", async function () {
+		// Arrange
+		const ari = getAriStub(sandbox);
 
-    const createVoiceClient = getCreateVoiceClient(sandbox);
+		const createVoiceClient = getCreateVoiceClient(sandbox);
 
-    const playDtmfRequest = {
-      mediaSessionRef: channelId,
-      digits: "123"
-    };
+		const playDtmfRequest = {
+			mediaSessionRef: channelId,
+			digits: "123",
+		};
 
-    // Act
-    await createPlayDtmfHandler(ari, createVoiceClient())(playDtmfRequest);
+		// Act
+		await createPlayDtmfHandler(ari, createVoiceClient())(playDtmfRequest);
 
-    // Assert
-    expect(ari.channels.sendDTMF).to.have.been.calledOnce;
-    expect(createVoiceClient().sendResponse).to.have.been.calledOnce;
-    expect(createVoiceClient().sendResponse).to.have.been.calledWith({
-      playDtmfResponse: {
-        mediaSessionRef: channelId
-      }
-    });
-    expect(ari.channels.sendDTMF).to.have.been.calledWith({
-      channelId,
-      dtmf: playDtmfRequest.digits
-    });
-  });
+		// Assert
+		expect(ari.channels.sendDTMF).to.have.been.calledOnce;
+		expect(createVoiceClient().sendResponse).to.have.been.calledOnce;
+		expect(createVoiceClient().sendResponse).to.have.been.calledWith({
+			playDtmfResponse: {
+				mediaSessionRef: channelId,
+			},
+		});
+		expect(ari.channels.sendDTMF).to.have.been.calledWith({
+			channelId,
+			dtmf: playDtmfRequest.digits,
+		});
+	});
 });

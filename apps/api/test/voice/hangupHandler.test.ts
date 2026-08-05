@@ -13,29 +13,29 @@ const sandbox = createSandbox();
 const channelId = "channel-id";
 
 describe("@voice/handler/Hangup", function () {
-  afterEach(function () {
-    return sandbox.restore();
-  });
+	afterEach(function () {
+		return sandbox.restore();
+	});
 
-  it("should handle a Hangup command", async function () {
-    // Arrange
-    const ari = getAriStub(sandbox);
+	it("should handle a Hangup command", async function () {
+		// Arrange
+		const ari = getAriStub(sandbox);
 
-    const createVoiceClient = getCreateVoiceClient(sandbox);
+		const createVoiceClient = getCreateVoiceClient(sandbox);
 
-    const hangupRequest = {
-      mediaSessionRef: channelId
-    };
+		const hangupRequest = {
+			mediaSessionRef: channelId,
+		};
 
-    // Act
-    await createHangupHandler(ari, createVoiceClient())(hangupRequest);
+		// Act
+		await createHangupHandler(ari, createVoiceClient())(hangupRequest);
 
-    // Wait for 3 seconds to allow the hangup to complete
-    await new Promise((resolve) => setTimeout(resolve, 4000));
+		// Wait for 3 seconds to allow the hangup to complete
+		await new Promise((resolve) => setTimeout(resolve, 4000));
 
-    // Assert
-    expect(createVoiceClient().close).to.have.been.calledOnce;
-    expect(ari.channels.hangup).to.have.been.calledOnce;
-    expect(ari.channels.hangup).to.have.been.calledWith({ channelId });
-  }).timeout(5000);
+		// Assert
+		expect(createVoiceClient().close).to.have.been.calledOnce;
+		expect(ari.channels.hangup).to.have.been.calledOnce;
+		expect(ari.channels.hangup).to.have.been.calledWith({ channelId });
+	}).timeout(5000);
 });

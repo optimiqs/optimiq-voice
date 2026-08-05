@@ -43,35 +43,31 @@ Voice Application Example:
 
 ```typescript
 const VoiceServer = require("@optimiq-voice/voice").default;
-const {
-  GatherSource,
-  VoiceRequest,
-  VoiceResponse
-} = require("@optimiq-voice/voice");
+const { GatherSource, VoiceRequest, VoiceResponse } = require("@optimiq-voice/voice");
 
 new VoiceServer().listen(async (req: VoiceRequest, voice: VoiceResponse) => {
-  const { ingressNumber, sessionRef, appRef } = req;
+	const { ingressNumber, sessionRef, appRef } = req;
 
-  await voice.answer();
+	await voice.answer();
 
-  await voice.say("Hi there! What's your name?");
+	await voice.say("Hi there! What's your name?");
 
-  const { speech: name } = await voice.gather({
-    source: GatherSource.SPEECH
-  });
+	const { speech: name } = await voice.gather({
+		source: GatherSource.SPEECH,
+	});
 
-  await voice.say("Nice to meet you " + name + "!");
+	await voice.say("Nice to meet you " + name + "!");
 
-  await voice.say("Please enter your 4 digit pin.");
+	await voice.say("Please enter your 4 digit pin.");
 
-  const { digits } = await voice.gather({
-    maxDigits: 4,
-    finishOnKey: "#"
-  });
+	const { digits } = await voice.gather({
+		maxDigits: 4,
+		finishOnKey: "#",
+	});
 
-  await voice.say("Your pin is " + digits);
+	await voice.say("Your pin is " + digits);
 
-  await voice.hangup();
+	await voice.hangup();
 });
 
 // Your app will live at tcp://127.0.0.1:50061
@@ -87,28 +83,28 @@ Example of originating a call with the SDK:
 const SDK = require("@optimiq-voice/sdk");
 
 async function main(request) {
-  const apiKey = "your-api-key";
-  const apiSecret = "your-api-secret";
-  const accessKeyId = "WO00000000000000000000000000000000";
+	const apiKey = "your-api-key";
+	const apiSecret = "your-api-secret";
+	const accessKeyId = "WO00000000000000000000000000000000";
 
-  const client = new SDK.Client({ accessKeyId });
-  await client.loginWithApiKey(apiKey, apiSecret);
+	const client = new SDK.Client({ accessKeyId });
+	await client.loginWithApiKey(apiKey, apiSecret);
 
-  const calls = new SDK.Calls(client);
-  const response = await calls.createCall(request);
+	const calls = new SDK.Calls(client);
+	const response = await calls.createCall(request);
 
-  console.log(response); // successful response
+	console.log(response); // successful response
 }
 
 const request = {
-  from: "+18287854037",
-  to: "+17853178070",
-  appRef: "3e61ecb7-a1b6-4a93-84c3-4f1979165bca",
-  // Optional metadata to be sent to the Voice Application
-  metadata: {
-    name: "John Doe",
-    message: "Please call me back."
-  }
+	from: "+18287854037",
+	to: "+17853178070",
+	appRef: "3e61ecb7-a1b6-4a93-84c3-4f1979165bca",
+	// Optional metadata to be sent to the Voice Application
+	metadata: {
+		name: "John Doe",
+		message: "Please call me back.",
+	},
 };
 
 main(request).catch(console.error);

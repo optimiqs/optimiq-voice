@@ -8,35 +8,32 @@ import { withErrorHandlingAndValidation } from "../utils/withDatabaseErrorHandli
 const logger = getLogger({ service: "identity", filePath: __filename });
 
 function createRegenerateApiKey(db: Database) {
-  const regenerateApiKey = async (
-    call: { request: BaseApiObject },
-    callback: (
-      error: GrpcErrorMessage,
-      response?: RegenerateApiKeyResponse
-    ) => void
-  ) => {
-    const { request } = call;
-    const { ref } = request;
+	const regenerateApiKey = async (
+		call: { request: BaseApiObject },
+		callback: (error: GrpcErrorMessage, response?: RegenerateApiKeyResponse) => void,
+	) => {
+		const { request } = call;
+		const { ref } = request;
 
-    logger.info("regenerating ApiKey", { ref });
+		logger.info("regenerating ApiKey", { ref });
 
-    const response = await db.apiKey.update({
-      where: {
-        ref
-      },
-      data: {
-        accessKeySecret: generateAccessKeySecret()
-      }
-    });
+		const response = await db.apiKey.update({
+			where: {
+				ref,
+			},
+			data: {
+				accessKeySecret: generateAccessKeySecret(),
+			},
+		});
 
-    callback(null, {
-      ref: response.ref,
-      accessKeyId: response.accessKeyId,
-      accessKeySecret: response.accessKeySecret
-    });
-  };
+		callback(null, {
+			ref: response.ref,
+			accessKeyId: response.accessKeyId,
+			accessKeySecret: response.accessKeySecret,
+		});
+	};
 
-  return withErrorHandlingAndValidation(regenerateApiKey, V.emptySchema);
+	return withErrorHandlingAndValidation(regenerateApiKey, V.emptySchema);
 }
 
 export { createRegenerateApiKey };

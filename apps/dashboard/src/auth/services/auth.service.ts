@@ -1,11 +1,11 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
-  type User as Resource,
-  type CreateUserRequest as ResourceCreateRequest,
-  type UpdateUserRequest as ResourceUpdateRequest,
-  type ListWorkspaceMembersRequest as ResourceListRequest,
-  type SendResetPasswordCodeRequest,
-  type ResetPasswordRequest
+	type User as Resource,
+	type CreateUserRequest as ResourceCreateRequest,
+	type UpdateUserRequest as ResourceUpdateRequest,
+	type ListWorkspaceMembersRequest as ResourceListRequest,
+	type SendResetPasswordCodeRequest,
+	type ResetPasswordRequest,
 } from "@optimiq-voice/types";
 import { toast } from "~/core/components/design-system/ui/toaster/toaster";
 import { useOptimisticCreateResource } from "~/core/hooks/use-optimistic-create-resource";
@@ -38,20 +38,19 @@ export const RESOURCE_QUERY_KEY = ["resource:user"];
  * @returns A React Query object containing user data and query metadata.
  */
 export const useUsers = (params?: ResourceListRequest) => {
-  const { sdk } = useOptimiqVoice();
-  const workspaceId = useWorkspaceId();
+	const { sdk } = useOptimiqVoice();
+	const workspaceId = useWorkspaceId();
 
-  const { data, ...rest } = useQuery({
-    queryKey: [...COLLECTION_QUERY_KEY, workspaceId, params],
-    queryFn: async () =>
-      await sdk.workspaces.listWorkspaceMembers({ ...params })
-  });
+	const { data, ...rest } = useQuery({
+		queryKey: [...COLLECTION_QUERY_KEY, workspaceId, params],
+		queryFn: async () => await sdk.workspaces.listWorkspaceMembers({ ...params }),
+	});
 
-  return {
-    data: data?.items || [],
-    nextPageToken: data?.nextPageToken,
-    ...rest
-  };
+	return {
+		data: data?.items || [],
+		nextPageToken: data?.nextPageToken,
+		...rest,
+	};
 };
 
 /**
@@ -68,15 +67,15 @@ export const useUsers = (params?: ResourceListRequest) => {
  * @returns A React Query result object containing the user and metadata.
  */
 export const useUser = (ref: string) => {
-  const { sdk } = useOptimiqVoice();
+	const { sdk } = useOptimiqVoice();
 
-  const { data = null, ...rest } = useQuery({
-    queryKey: [...RESOURCE_QUERY_KEY, ref],
-    queryFn: async () => sdk.users.getUser(ref),
-    enabled: !!ref
-  });
+	const { data = null, ...rest } = useQuery({
+		queryKey: [...RESOURCE_QUERY_KEY, ref],
+		queryFn: async () => sdk.users.getUser(ref),
+		enabled: !!ref,
+	});
 
-  return { data, ...rest };
+	return { data, ...rest };
 };
 
 /**
@@ -91,16 +90,13 @@ export const useUser = (ref: string) => {
  * @returns A mutation object that can be used to trigger the creation.
  */
 export const useCreateUser = () => {
-  const { sdk } = useOptimiqVoice();
+	const { sdk } = useOptimiqVoice();
 
-  return useOptimisticCreateResource<
-    Resource,
-    Omit<ResourceCreateRequest, "avatar">
-  >(
-    (req) => sdk.users.createUser({ avatar: "", ...req }),
-    COLLECTION_QUERY_KEY,
-    RESOURCE_QUERY_KEY
-  );
+	return useOptimisticCreateResource<Resource, Omit<ResourceCreateRequest, "avatar">>(
+		(req) => sdk.users.createUser({ avatar: "", ...req }),
+		COLLECTION_QUERY_KEY,
+		RESOURCE_QUERY_KEY,
+	);
 };
 
 /**
@@ -115,13 +111,13 @@ export const useCreateUser = () => {
  * @returns A mutation object for updating an user.
  */
 export const useUpdateUser = () => {
-  const { sdk } = useOptimiqVoice();
+	const { sdk } = useOptimiqVoice();
 
-  return useOptimisticUpdateResource<Resource, ResourceUpdateRequest>(
-    (req) => sdk.users.updateUser(req),
-    COLLECTION_QUERY_KEY,
-    RESOURCE_QUERY_KEY
-  );
+	return useOptimisticUpdateResource<Resource, ResourceUpdateRequest>(
+		(req) => sdk.users.updateUser(req),
+		COLLECTION_QUERY_KEY,
+		RESOURCE_QUERY_KEY,
+	);
 };
 
 /**
@@ -135,13 +131,13 @@ export const useUpdateUser = () => {
  * @returns A mutation object for deleting an user.
  */
 export const useDeleteUser = () => {
-  const { sdk } = useOptimiqVoice();
+	const { sdk } = useOptimiqVoice();
 
-  return useOptimisticDeleteResource(
-    (ref) => sdk.users.deleteUser(ref),
-    COLLECTION_QUERY_KEY,
-    RESOURCE_QUERY_KEY
-  );
+	return useOptimisticDeleteResource(
+		(ref) => sdk.users.deleteUser(ref),
+		COLLECTION_QUERY_KEY,
+		RESOURCE_QUERY_KEY,
+	);
 };
 
 /**
@@ -154,15 +150,14 @@ export const useDeleteUser = () => {
  * @returns A mutation object that can be used to trigger the password reset code request.
  */
 export const useForgotPassword = () => {
-  const { sdk } = useOptimiqVoice();
+	const { sdk } = useOptimiqVoice();
 
-  return useMutation({
-    mutationFn: (request: SendResetPasswordCodeRequest) =>
-      sdk.users.sendResetPasswordCode(request),
-    onError: () => {
-      toast("Oops! Something went wrong while trying to reset your password.");
-    }
-  });
+	return useMutation({
+		mutationFn: (request: SendResetPasswordCodeRequest) => sdk.users.sendResetPasswordCode(request),
+		onError: () => {
+			toast("Oops! Something went wrong while trying to reset your password.");
+		},
+	});
 };
 
 /**
@@ -175,38 +170,36 @@ export const useForgotPassword = () => {
  * @returns A mutation object that can be used to trigger the password reset.
  */
 export const useResetPassword = () => {
-  const { sdk } = useOptimiqVoice();
+	const { sdk } = useOptimiqVoice();
 
-  return useMutation({
-    mutationFn: (request: ResetPasswordRequest) =>
-      sdk.users.resetPassword(request),
-    onError: () => {
-      toast("Oops! Something went wrong while trying to reset your password.");
-    }
-  });
+	return useMutation({
+		mutationFn: (request: ResetPasswordRequest) => sdk.users.resetPassword(request),
+		onError: () => {
+			toast("Oops! Something went wrong while trying to reset your password.");
+		},
+	});
 };
 
 export const useCreateUserWithOauth2Code = () => {
-  const { sdk } = useOptimiqVoice();
+	const { sdk } = useOptimiqVoice();
 
-  return useMutation({
-    mutationFn: async (code: string) =>
-      sdk.users.createUserWithOauth2Code({ code })
-  });
+	return useMutation({
+		mutationFn: async (code: string) => sdk.users.createUserWithOauth2Code({ code }),
+	});
 };
 
 export const useLoginWithOauth2Code = () => {
-  const { client } = useOptimiqVoice();
+	const { client } = useOptimiqVoice();
 
-  return useMutation({
-    mutationFn: async (code: string) => {
-      await client.loginWithOauth2Code("GITHUB", code);
+	return useMutation({
+		mutationFn: async (code: string) => {
+			await client.loginWithOauth2Code("GITHUB", code);
 
-      return {
-        accessToken: client.getAccessToken(),
-        refreshToken: client.getRefreshToken(),
-        idToken: client.getIdToken()
-      };
-    }
-  });
+			return {
+				accessToken: client.getAccessToken(),
+				refreshToken: client.getRefreshToken(),
+				idToken: client.getIdToken(),
+			};
+		},
+	});
 };

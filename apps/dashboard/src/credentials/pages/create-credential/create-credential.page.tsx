@@ -16,14 +16,13 @@ import type { Route } from "./+types/create-credential.page";
  * @returns An array of metadata objects for the page.
  */
 export function meta(_: Route.MetaArgs) {
-  return [
-    { title: "Credentials | Optimiq Voice" },
-    {
-      name: "description",
-      content:
-        "Credentials are used to authenticate SIP Agents and Trunks within your network."
-    }
-  ];
+	return [
+		{ title: "Credentials | Optimiq Voice" },
+		{
+			name: "description",
+			content: "Credentials are used to authenticate SIP Agents and Trunks within your network.",
+		},
+	];
 }
 
 /**
@@ -38,31 +37,31 @@ export function meta(_: Route.MetaArgs) {
  * @returns {JSX.Element} The rendered Create Credential page.
  */
 export default function CreateCredential() {
-  /** Custom hook to create a credential via API with optimistic updates. */
-  const { onGoBack, onSave } = useCreateCredential();
+	/** Custom hook to create a credential via API with optimistic updates. */
+	const { onGoBack, onSave } = useCreateCredential();
 
-  /**
-   * Renders the Create Credential page layout.
-   */
-  return (
-    <FormProvider>
-      <Page variant="form">
-        <PageHeader
-          title="Create New Credentials"
-          description="Credentials are used to authenticate SIP Agents and Trunks within your network."
-          onBack={{ label: "Back to credentials", onClick: onGoBack }}
-          actions={
-            <FormSubmitButton size="small" loadingText="Saving...">
-              Save Credential
-            </FormSubmitButton>
-          }
-        />
+	/**
+	 * Renders the Create Credential page layout.
+	 */
+	return (
+		<FormProvider>
+			<Page variant="form">
+				<PageHeader
+					title="Create New Credentials"
+					description="Credentials are used to authenticate SIP Agents and Trunks within your network."
+					onBack={{ label: "Back to credentials", onClick: onGoBack }}
+					actions={
+						<FormSubmitButton size="small" loadingText="Saving...">
+							Save Credential
+						</FormSubmitButton>
+					}
+				/>
 
-        {/* Form container with a max width for readability and consistent layout */}
-        <Box sx={{ maxWidth: "440px" }}>
-          <CreateCredentialForm onSubmit={onSave} />
-        </Box>
-      </Page>
-    </FormProvider>
-  );
+				{/* Form container with a max width for readability and consistent layout */}
+				<Box sx={{ maxWidth: "440px" }}>
+					<CreateCredentialForm onSubmit={onSave} />
+				</Box>
+			</Page>
+		</FormProvider>
+	);
 }

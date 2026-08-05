@@ -1,93 +1,82 @@
 import { useCallback, useEffect } from "react";
 import { useNavigate, useSearchParams, useSubmit } from "react-router";
-import {
-  useCreateUserWithOauth2Code,
-  useLoginWithOauth2Code
-} from "~/auth/services/auth.service";
+import { useCreateUserWithOauth2Code, useLoginWithOauth2Code } from "~/auth/services/auth.service";
 import { toast } from "~/core/components/design-system/ui/toaster/toaster";
 import { Splash } from "~/core/components/general/splash/splash";
 import { getErrorMessage } from "~/core/helpers/extract-error-message";
 import { IS_SIGNUP_ENABLED } from "~/core/sdk/stores/optimiq-voice.config";
 import { Logger } from "~/core/shared/logger";
-import type {
-  OAuthAction,
-  OAuthResponse,
-  OAuthState
-} from "~/auth/config/oauth";
+import type { OAuthAction, OAuthResponse, OAuthState } from "~/auth/config/oauth";
 import type { ExchangeCredentialsResponse } from "~/auth/services/sessions/auth.interfaces";
 
-const SIGNUP_DISABLED_MESSAGE =
-  "Signup is currently limited to private beta invites.";
+const SIGNUP_DISABLED_MESSAGE = "Signup is currently limited to private beta invites.";
 
 // Re-export form action
 export { action } from "./github-oauth.action";
 
 export default function GithubOAuth() {
-  const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
-  const code = searchParams.get("code");
-  const state = searchParams.get("state");
+	const navigate = useNavigate();
+	const [searchParams] = useSearchParams();
+	const code = searchParams.get("code");
+	const state = searchParams.get("state");
 
-  const submit = useSubmit();
-  const { mutateAsync: createUser } = useCreateUserWithOauth2Code();
-  const { mutateAsync: loginUser } = useLoginWithOauth2Code();
+	const submit = useSubmit();
+	const { mutateAsync: createUser } = useCreateUserWithOauth2Code();
+	const { mutateAsync: loginUser } = useLoginWithOauth2Code();
 
-  const getOAuthResponse = useCallback((): OAuthResponse | null => {
-    if (!code || !state) return null;
+	const getOAuthResponse = useCallback((): OAuthResponse | null => {
+		if (!code || !state) return null;
 
-    try {
-      const decoded = JSON.parse(decodeURIComponent(state)) as OAuthState;
-      return { code, action: decoded.action };
-    } catch (error) {
-      Logger.error(
-        "[GithubOAuth] Failed to parse state, defaulting to signin",
-        error
-      );
-      return { code, action: "signin" };
-    }
-  }, [code, state]);
+		try {
+			const decoded = JSON.parse(decodeURIComponent(state)) as OAuthState;
+			return { code, action: decoded.action };
+		} catch (error) {
+			Logger.error("[GithubOAuth] Failed to parse state, defaulting to signin", error);
+			return { code, action: "signin" };
+		}
+	}, [code, state]);
 
-  const handleOAuthResponse = useCallback(async () => {
-    try {
-      const oauth = getOAuthResponse();
-      if (!oauth) throw new Error("Missing code or state");
+	const handleOAuthResponse = useCallback(async () => {
+		try {
+			const oauth = getOAuthResponse();
+			if (!oauth) throw new Error("Missing code or state");
 
-      const { code, action } = oauth;
+			const { code, action } = oauth;
 
-      if (action === "signup" && !IS_SIGNUP_ENABLED) {
-        throw new Error(SIGNUP_DISABLED_MESSAGE);
-      }
+			if (action === "signup" && !IS_SIGNUP_ENABLED) {
+				throw new Error(SIGNUP_DISABLED_MESSAGE);
+			}
 
-      const actionMap: Record<OAuthAction, () => Promise<any>> = {
-        signin: () => loginUser(code),
-        signup: () => createUser(code)
-      };
+			const actionMap: Record<OAuthAction, () => Promise<any>> = {
+				signin: () => loginUser(code),
+				signup: () => createUser(code),
+			};
 
-      const response: ExchangeCredentialsResponse = await actionMap[action]();
+			const response: ExchangeCredentialsResponse = await actionMap[action]();
 
-      if (!response) {
-        throw new Error("No response received from OAuth action");
-      }
+			if (!response) {
+				throw new Error("No response received from OAuth action");
+			}
 
-      await submit({ ...response }, { method: "post", viewTransition: true });
-    } catch (error) {
-      Logger.error("[GithubOAuth] Error handling OAuth response", error);
-      toast(getErrorMessage(error));
-      navigate("/auth/login");
-    }
-  }, [getOAuthResponse, loginUser, createUser, navigate, submit]);
+			await submit({ ...response }, { method: "post", viewTransition: true });
+		} catch (error) {
+			Logger.error("[GithubOAuth] Error handling OAuth response", error);
+			toast(getErrorMessage(error));
+			navigate("/auth/login");
+		}
+	}, [getOAuthResponse, loginUser, createUser, navigate, submit]);
 
-  useEffect(() => {
-    if (!code || !state) {
-      toast("Invalid OAuth response");
-      navigate("/auth/login");
-      return;
-    }
+	useEffect(() => {
+		if (!code || !state) {
+			toast("Invalid OAuth response");
+			navigate("/auth/login");
+			return;
+		}
 
-    Logger.debug("[GithubOAuth] Handling OAuth response", { code, state });
+		Logger.debug("[GithubOAuth] Handling OAuth response", { code, state });
 
-    handleOAuthResponse();
-  }, []);
+		handleOAuthResponse();
+	}, []);
 
-  return <Splash message="Authenticating with OAuth providers..." />;
+	return <Splash message="Authenticating with OAuth providers..." />;
 }

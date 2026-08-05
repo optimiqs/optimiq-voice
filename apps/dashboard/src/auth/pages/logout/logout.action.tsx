@@ -1,8 +1,5 @@
 import { redirect } from "react-router";
-import {
-  destroySession,
-  getSessionCookie
-} from "~/auth/services/sessions/session.server";
+import { destroySession, getSessionCookie } from "~/auth/services/sessions/session.server";
 import type { Route } from "./+types/logout.page";
 
 /**
@@ -16,16 +13,16 @@ import type { Route } from "./+types/logout.page";
  * @returns A redirect response to the login page with the session cookie cleared.
  */
 export async function action({ request }: Route.ActionArgs) {
-  /** Extract the cookie header from the incoming request. */
-  const headers = request.headers.get("Cookie");
+	/** Extract the cookie header from the incoming request. */
+	const headers = request.headers.get("Cookie");
 
-  /** Retrieve the current session cookie using the cookie header. */
-  const sessionCookie = await getSessionCookie(headers);
+	/** Retrieve the current session cookie using the cookie header. */
+	const sessionCookie = await getSessionCookie(headers);
 
-  /** Destroy the session on the server and return a redirect to the login page. */
-  return redirect("/auth/login", {
-    headers: {
-      "Set-Cookie": await destroySession(sessionCookie)
-    }
-  });
+	/** Destroy the session on the server and return a redirect to the login page. */
+	return redirect("/auth/login", {
+		headers: {
+			"Set-Cookie": await destroySession(sessionCookie),
+		},
+	});
 }

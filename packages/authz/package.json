@@ -1,32 +1,32 @@
 {
-  "name": "@optimiq-voice/authz",
-  "version": "0.22.3",
-  "description": "Authorization module for Optimiq Voice",
-  "license": "MIT",
-  "main": "dist/index",
-  "types": "dist/index",
-  "directories": {
-    "src": "src",
-    "test": "test"
-  },
-  "scripts": {
-    "prebuild": "rimraf ./dist tsconfig.tsbuildinfo",
-    "build": "tsc -b tsconfig.json",
-    "clean": "rimraf ./dist node_modules tsconfig.tsbuildinfo",
-    "start:dev": "nodemon --exec tsx --watch src src/server/server.ts"
-  },
-  "files": [
-    "dist"
-  ],
-  "dependencies": {
-    "@optimiq-voice/common": "workspace:^",
-    "@optimiq-voice/logger": "workspace:^",
-    "@grpc/grpc-js": "1.10.12",
-    "deepmerge": "4.3.1",
-    "grpc-health-check": "2.1.0"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/optimiqs/optimiq-voice.git"
-  }
+	"name": "@optimiq-voice/authz",
+	"version": "0.22.3",
+	"description": "Authorization module for Optimiq Voice",
+	"license": "MIT",
+	"main": "dist/index",
+	"types": "dist/index",
+	"directories": {
+		"src": "src",
+		"test": "test"
+	},
+	"scripts": {
+		"prebuild": "rimraf ./dist tsconfig.tsbuildinfo",
+		"build": "tsc -b tsconfig.json",
+		"clean": "rimraf ./dist node_modules tsconfig.tsbuildinfo",
+		"start:dev": "nodemon --exec tsx --watch src src/server/server.ts"
+	},
+	"files": [
+		"dist"
+	],
+	"dependencies": {
+		"@optimiq-voice/common": "workspace:^",
+		"@optimiq-voice/logger": "workspace:^",
+		"@grpc/grpc-js": "1.10.12",
+		"deepmerge": "4.3.1",
+		"grpc-health-check": "2.1.0"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/optimiqs/optimiq-voice.git"
+	}
 }

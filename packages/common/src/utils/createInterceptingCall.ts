@@ -1,15 +1,15 @@
 import { status as GRPCStatus, ServerInterceptingCall } from "@grpc/grpc-js";
 
 function createInterceptingCall(params: {
-  call: ServerInterceptingCall;
-  code: GRPCStatus;
-  details: string;
+	call: ServerInterceptingCall;
+	code: GRPCStatus;
+	details: string;
 }) {
-  const { call, code, details } = params;
+	const { call, code, details } = params;
 
-  call.sendStatus({ code, details });
+	call.sendStatus({ code, details });
 
-  return call;
+	return call;
 }
 
 export { createInterceptingCall };

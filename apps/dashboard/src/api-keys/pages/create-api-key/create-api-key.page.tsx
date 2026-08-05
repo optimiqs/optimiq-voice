@@ -17,14 +17,14 @@ import type { Route } from "./+types/create-api-key.page";
  * @returns An array of metadata objects for the page.
  */
 export function meta(_: Route.MetaArgs) {
-  return [
-    { title: "API Keys | Optimiq Voice" },
-    {
-      name: "description",
-      content:
-        "An API Key is an encrypted token that grants secure access to Optimiq Voice's APIs."
-    }
-  ];
+	return [
+		{ title: "API Keys | Optimiq Voice" },
+		{
+			name: "description",
+			content:
+				"An API Key is an encrypted token that grants secure access to Optimiq Voice's APIs.",
+		},
+	];
 }
 
 /**
@@ -39,54 +39,46 @@ export function meta(_: Route.MetaArgs) {
  * @returns {JSX.Element} The rendered Create ApiKey page.
  */
 export default function CreateApiKey() {
-  /** Custom hook to create a apiKey via API with optimistic updates. */
-  const { onGoBack, onSave, data } = useCreateApiKey();
+	/** Custom hook to create a apiKey via API with optimistic updates. */
+	const { onGoBack, onSave, data } = useCreateApiKey();
 
-  /**
-   * Renders the Create ApiKey page layout.
-   */
-  return (
-    <FormProvider>
-      <Page variant="form">
-        <PageHeader
-          title="Create New API Key"
-          description="An API Key is an encrypted token that grants secure access to Optimiq Voice's APIs."
-          onBack={{ label: "Back to API Keys", onClick: onGoBack }}
-          actions={
-            <FormSubmitButton
-              size="small"
-              loadingText="Saving..."
-              requireDirty={false}
-            >
-              Save API Key
-            </FormSubmitButton>
-          }
-        />
+	/**
+	 * Renders the Create ApiKey page layout.
+	 */
+	return (
+		<FormProvider>
+			<Page variant="form">
+				<PageHeader
+					title="Create New API Key"
+					description="An API Key is an encrypted token that grants secure access to Optimiq Voice's APIs."
+					onBack={{ label: "Back to API Keys", onClick: onGoBack }}
+					actions={
+						<FormSubmitButton size="small" loadingText="Saving..." requireDirty={false}>
+							Save API Key
+						</FormSubmitButton>
+					}
+				/>
 
-        {/* Form container with a max width for readability and consistent layout */}
-        <Box
-          sx={{
-            maxWidth: "440px",
-            gap: "24px",
-            display: "flex",
-            flexDirection: "column"
-          }}
-        >
-          <CreateApiKeyForm onSubmit={onSave} />
+				{/* Form container with a max width for readability and consistent layout */}
+				<Box
+					sx={{
+						maxWidth: "440px",
+						gap: "24px",
+						display: "flex",
+						flexDirection: "column",
+					}}
+				>
+					<CreateApiKeyForm onSubmit={onSave} />
 
-          {/* Display success message if API Key was created successfully */}
-          {data && (
-            <Box sx={{ display: "flex", flexDirection: "column", gap: "24px" }}>
-              <Input label="Access Key ID" value={data.accessKeyId} disabled />
-              <Input
-                label="Secret Access Key"
-                value={data.accessKeySecret}
-                disabled
-              />
-            </Box>
-          )}
-        </Box>
-      </Page>
-    </FormProvider>
-  );
+					{/* Display success message if API Key was created successfully */}
+					{data && (
+						<Box sx={{ display: "flex", flexDirection: "column", gap: "24px" }}>
+							<Input label="Access Key ID" value={data.accessKeyId} disabled />
+							<Input label="Secret Access Key" value={data.accessKeySecret} disabled />
+						</Box>
+					)}
+				</Box>
+			</Page>
+		</FormProvider>
+	);
 }

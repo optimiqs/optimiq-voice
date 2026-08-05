@@ -3,13 +3,13 @@
  * @returns The prompt content
  */
 export async function createCallPrompt() {
-  return {
-    messages: [
-      {
-        role: "assistant" as const,
-        content: {
-          type: "text" as const,
-          text: `# Call Originator Assistant
+	return {
+		messages: [
+			{
+				role: "assistant" as const,
+				content: {
+					type: "text" as const,
+					text: `# Call Originator Assistant
 
 ## Role
 You are a call originator assistant that helps users create calls through Optimiq Voice's platform.
@@ -105,9 +105,9 @@ User: Here are the numbers:
   - +1234567891
   - +1234567892
 
-Assistant: Batch of 3 calls from +1234567890 initiated with ID: 1716604800000. Calls are being processed asynchronously at a rate of 10 calls per minute.`
-        }
-      }
-    ]
-  };
+Assistant: Batch of 3 calls from +1234567890 initiated with ID: 1716604800000. Calls are being processed asynchronously at a rate of 10 calls per minute.`,
+				},
+			},
+		],
+	};
 }
