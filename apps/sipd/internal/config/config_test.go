@@ -59,6 +59,8 @@ func TestLoadReadsEveryKnob(t *testing.T) {
 		"SIPD_UDP":               "false",
 		"SIPD_TCP":               "1",
 		"NATS_URL":               "nats://broker:4222",
+		"NATS_USER":              "optimiq",
+		"NATS_PASS":              "s3cret",
 		"SIPD_MIN_EXPIRES":       "30",
 		"SIPD_MAX_EXPIRES":       "7200",
 		"SIPD_DEFAULT_EXPIRES":   "600",
@@ -79,6 +81,9 @@ func TestLoadReadsEveryKnob(t *testing.T) {
 	}
 	if cfg.MinExpires != 30*time.Second || cfg.MaxExpires != 7200*time.Second || cfg.DefaultExpires != 600*time.Second {
 		t.Errorf("expiry = %s/%s/%s", cfg.MinExpires, cfg.MaxExpires, cfg.DefaultExpires)
+	}
+	if cfg.NATSURL != "nats://broker:4222" || cfg.NATSUser != "optimiq" || cfg.NATSPass != "s3cret" {
+		t.Errorf("nats = %q user=%q", cfg.NATSURL, cfg.NATSUser)
 	}
 	if cfg.NonceTTL != 2*time.Minute || cfg.NonceSecret != "fleet-wide" {
 		t.Errorf("nonce = %s / %q", cfg.NonceTTL, cfg.NonceSecret)
@@ -177,5 +182,42 @@ func TestLoadReportsEveryProblemAtOnce(t *testing.T) {
 	}
 	if strings.Count(err.Error(), "\n  - ") < 3 {
 		t.Errorf("error reports too few problems:\n%v", err)
+	}
+}
+
+// The broker requires authentication, and half a credential is a typo rather than a configuration:
+// it produces an authorization violation on every connect and reconnect, forever, with nothing
+// fatal to notice it by. Boot is the only place it is cheap to catch.
+func TestLoadRejectsHalfANATSCredential(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		pairs map[string]string
+		want  string
+	}{
+		{"user without pass", map[string]string{"NATS_USER": "optimiq"}, "NATS_USER is set but NATS_PASS is not"},
+		{"pass without user", map[string]string{"NATS_PASS": "s3cret"}, "NATS_PASS is set but NATS_USER is not"},
+		{"whitespace is not a password", map[string]string{"NATS_USER": "optimiq", "NATS_PASS": "   "}, "NATS_USER is set but NATS_PASS is not"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := config.Load(env(minimal(tc.pairs)))
+			if err == nil {
+				t.Fatal("Load accepted half a NATS credential")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %v, want it to mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// Neither set is a broker with no authentication configured, which is what the SIPp rig and the
+// integration tests run. It must stay legal.
+func TestLoadAcceptsAnUnauthenticatedBroker(t *testing.T) {
+	cfg, err := config.Load(env(minimal(nil)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.NATSUser != "" || cfg.NATSPass != "" {
+		t.Errorf("credentials = %q / %q, want both empty", cfg.NATSUser, cfg.NATSPass)
 	}
 }

@@ -1,5 +1,6 @@
 import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
 import { connect, type KV, KvWatchInclude, type NatsConnection, type Subscription } from "nats";
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import {
 	agentStateEntrySchema,
 	callEventSchema,
@@ -96,6 +97,7 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 		try {
 			this.connection = await connect({
 				servers: this.env.NATS_URL,
+				...natsCredentials(this.env),
 				name: "optimiq-api-live",
 				maxReconnectAttempts: -1,
 				reconnectTimeWait: 1_000,

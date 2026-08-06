@@ -38,6 +38,7 @@
  */
 
 import { connect, type NatsConnection } from "nats";
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import { ensureKvBuckets, kvKeyFor, QUEUE_MEMBERSHIP_KV } from "@optimiq-voice/events/streams";
 import { createPbxDatabaseClient, sql } from "@optimiq-voice/pbx-db";
 
@@ -67,9 +68,9 @@ async function readOrganizationIds(
 	const rows = await database.adminDb.execute(
 		sql`select distinct "organization_id" from "queue" order by "organization_id"`,
 	);
-	const list = (
-		Array.isArray(rows) ? rows : ((rows as { rows?: unknown[] }).rows ?? [])
-	) as { organization_id: string }[];
+	const list = (Array.isArray(rows) ? rows : ((rows as { rows?: unknown[] }).rows ?? [])) as {
+		organization_id: string;
+	}[];
 	return list.map((row) => row.organization_id);
 }
 
@@ -100,12 +101,14 @@ async function main(): Promise<void> {
 
 	try {
 		const organizations =
-			onlyOrganization === undefined
-				? await readOrganizationIds(database)
-				: [onlyOrganization];
+			onlyOrganization === undefined ? await readOrganizationIds(database) : [onlyOrganization];
 		log(`read ${String(organizations.length)} organization(s) with queues`);
 
-		connection = await connect({ servers: natsUrl, name: "rebuild-queue-membership" });
+		connection = await connect({
+			servers: natsUrl,
+			...natsCredentials(process.env),
+			name: "rebuild-queue-membership",
+		});
 		const manager = await connection.jetstreamManager();
 		await ensureKvBuckets(manager, [QUEUE_MEMBERSHIP_KV]);
 		const bucket = await manager.jetstream().views.kv(QUEUE_MEMBERSHIP_KV.name);

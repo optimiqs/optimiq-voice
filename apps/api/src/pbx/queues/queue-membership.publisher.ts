@@ -1,5 +1,6 @@
 import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
 import { connect, type JetStreamManager, type KV, type NatsConnection } from "nats";
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import { queueMembershipSchema } from "@optimiq-voice/events/schemas";
 import { ensureKvBuckets, kvKeyFor, QUEUE_MEMBERSHIP_KV } from "@optimiq-voice/events/streams";
 import { getLogger } from "@optimiq-voice/logger";
@@ -108,6 +109,7 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 			// artifacts publish normally) and sharing a field would couple their shutdown ordering.
 			this.connection = await connect({
 				servers: this.env.NATS_URL,
+				...natsCredentials(this.env),
 				name: "optimiq-api-queue-membership",
 				maxReconnectAttempts: -1,
 				reconnectTimeWait: 1_000,

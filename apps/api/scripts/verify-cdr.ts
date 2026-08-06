@@ -45,6 +45,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 
 const execFileAsync = promisify(execFile);
 
@@ -334,7 +335,11 @@ async function main(): Promise<void> {
 	let organizationA = "";
 	let organizationB = "";
 
-	const publisher = await connect({ servers: nats.url, name: "verify-cdr-publisher" });
+	const publisher = await connect({
+		servers: nats.url,
+		...natsCredentials(process.env),
+		name: "verify-cdr-publisher",
+	});
 	const jetstream = publisher.jetstream();
 
 	const publishLeg = async (
@@ -392,7 +397,11 @@ async function main(): Promise<void> {
 
 		console.log("\n2. the area denies by default");
 		const anonymousList = await fetch(`${baseUrl}/api/v1/cdr`);
-		check("an anonymous CDR list is 401", anonymousList.status === 401, `status ${anonymousList.status}`);
+		check(
+			"an anonymous CDR list is 401",
+			anonymousList.status === 401,
+			`status ${anonymousList.status}`,
+		);
 		const anonymousRecordings = await fetch(`${baseUrl}/api/v1/recordings`);
 		check(
 			"an anonymous recordings list is 401",
@@ -511,7 +520,11 @@ async function main(): Promise<void> {
 			"organization A's legs to be filed",
 			async () => (await countLegs(organizationA)) >= 5,
 		);
-		check("the writer filed organization A's five legs", filedA, `${String(await countLegs(organizationA))} rows`);
+		check(
+			"the writer filed organization A's five legs",
+			filedA,
+			`${String(await countLegs(organizationA))} rows`,
+		);
 		const filedB = await waitFor(
 			"organization B's leg to be filed",
 			async () => (await countLegs(organizationB)) >= 1,
@@ -606,7 +619,11 @@ async function main(): Promise<void> {
 		// --- 7. the query API ----------------------------------------------------------------------
 		console.log("\n7. the query API");
 		const listA = await clientA("GET", "/api/v1/cdr?limit=50");
-		check("organization A can list its legs", listA.status === 200, `status ${String(listA.status)}`);
+		check(
+			"organization A can list its legs",
+			listA.status === 200,
+			`status ${String(listA.status)}`,
+		);
 		check("the list envelope carries the resolved range", typeof listA.body.range === "object");
 		check(
 			"the list envelope carries a cursor field rather than a total",
@@ -682,9 +699,15 @@ async function main(): Promise<void> {
 		console.log("\n9. cursor pagination");
 		const pageOne = await clientA("GET", "/api/v1/cdr?limit=2");
 		check("a page returns exactly the limit", rows(pageOne).length === 2);
-		check("a page with more behind it carries a cursor", typeof pageOne.body.nextCursor === "string");
+		check(
+			"a page with more behind it carries a cursor",
+			typeof pageOne.body.nextCursor === "string",
+		);
 		const cursor = String(pageOne.body.nextCursor);
-		const pageTwo = await clientA("GET", `/api/v1/cdr?limit=2&cursor=${encodeURIComponent(cursor)}`);
+		const pageTwo = await clientA(
+			"GET",
+			`/api/v1/cdr?limit=2&cursor=${encodeURIComponent(cursor)}`,
+		);
 		const pageOneIds = rows(pageOne).map((row) => String(row.id));
 		const pageTwoIds = rows(pageTwo).map((row) => String(row.id));
 		check(
@@ -705,10 +728,18 @@ async function main(): Promise<void> {
 			"GET",
 			"/api/v1/cdr?from=2020-01-01T00:00:00.000Z&to=2026-12-31T00:00:00.000Z",
 		);
-		check("a range wider than the cap is a 400", tooWide.status === 400, `status ${String(tooWide.status)}`);
+		check(
+			"a range wider than the cap is a 400",
+			tooWide.status === 400,
+			`status ${String(tooWide.status)}`,
+		);
 		check("the 400 carries code CDR_RANGE_TOO_WIDE", tooWide.body.code === "CDR_RANGE_TOO_WIDE");
 		const badCursor = await clientA("GET", "/api/v1/cdr?cursor=not-a-cursor");
-		check("a forged cursor is a 400", badCursor.status === 400, `status ${String(badCursor.status)}`);
+		check(
+			"a forged cursor is a 400",
+			badCursor.status === 400,
+			`status ${String(badCursor.status)}`,
+		);
 		check("the 400 carries code CDR_INVALID_CURSOR", badCursor.body.code === "CDR_INVALID_CURSOR");
 		const badDisposition = await clientA("GET", "/api/v1/cdr?disposition=maybe");
 		check("a value the column would refuse is a 400", badDisposition.status === 400);
@@ -747,14 +778,20 @@ async function main(): Promise<void> {
 			new TextEncoder().encode("this is not an envelope"),
 			{ msgID: `garbage-${RUN_ID}` },
 		);
-		const quarantinedUnreadable = await waitFor("the unreadable message to be quarantined", async () => {
-			const found = await cdrSql<{ total: number }[]>`
+		const quarantinedUnreadable = await waitFor(
+			"the unreadable message to be quarantined",
+			async () => {
+				const found = await cdrSql<{ total: number }[]>`
 				select count(*)::int as total from "cdr_write_quarantine"
 				where "reason" = 'unreadable' and "subject" = ${subjectFor.cdrLeg(organizationA)}
 			`;
-			return (found[0]?.total ?? 0) > 0;
-		});
-		check("bytes that are not a cdr.leg.write are quarantined as unreadable", quarantinedUnreadable);
+				return (found[0]?.total ?? 0) > 0;
+			},
+		);
+		check(
+			"bytes that are not a cdr.leg.write are quarantined as unreadable",
+			quarantinedUnreadable,
+		);
 		const quarantineRow = await cdrSql<{ stream: string; stream_sequence: string | null }[]>`
 			select "stream", "stream_sequence" from "cdr_write_quarantine"
 			where "reason" = 'unreadable' order by "quarantined_at" desc limit 1
@@ -776,12 +813,15 @@ async function main(): Promise<void> {
 			{ ...aLeg, id: smuggledLegId, callId: createEntityId(), startedAt: isoMinutesAgo(5) },
 			{ subjectOverride: subjectFor.cdrLeg(organizationA), msgId: `smuggled-${RUN_ID}` },
 		);
-		const quarantinedForeign = await waitFor("the foreign-subject message to be quarantined", async () => {
-			const found = await cdrSql<{ total: number }[]>`
+		const quarantinedForeign = await waitFor(
+			"the foreign-subject message to be quarantined",
+			async () => {
+				const found = await cdrSql<{ total: number }[]>`
 				select count(*)::int as total from "cdr_write_quarantine" where "reason" = 'foreign-subject'
 			`;
-			return (found[0]?.total ?? 0) > 0;
-		});
+				return (found[0]?.total ?? 0) > 0;
+			},
+		);
 		check(
 			"an envelope delivered on another organization's subject is quarantined, not written",
 			quarantinedForeign,
@@ -816,7 +856,14 @@ async function main(): Promise<void> {
 			orgId: organizationA,
 			callId: callOne,
 			source: "engine",
-			data: { legId: aLegId, recordingId, objectKey, durationMs: 30_000, reason: "completed", bytes: 16 },
+			data: {
+				legId: aLegId,
+				recordingId,
+				objectKey,
+				durationMs: 30_000,
+				reason: "completed",
+				bytes: 16,
+			},
 		});
 		await jetstream.publish(stopped.subject, new TextEncoder().encode(JSON.stringify(stopped)), {
 			msgID: stopped.id,
@@ -872,12 +919,24 @@ async function main(): Promise<void> {
 		// --- 14. signed URLs -----------------------------------------------------------------------
 		console.log("\n14. signed download URLs");
 		const minted = await clientA("POST", `/api/v1/recordings/${recordingRowId}/download-url`, {});
-		check("a download URL can be minted", minted.status === 201 || minted.status === 200, `status ${String(minted.status)}`);
+		check(
+			"a download URL can be minted",
+			minted.status === 201 || minted.status === 200,
+			`status ${String(minted.status)}`,
+		);
 		const signedUrl = String(data(minted).url ?? "");
-		check("the minted URL carries a token rather than the recording id", signedUrl.length > 0 && !signedUrl.includes(recordingRowId), signedUrl.slice(0, 60));
+		check(
+			"the minted URL carries a token rather than the recording id",
+			signedUrl.length > 0 && !signedUrl.includes(recordingRowId),
+			signedUrl.slice(0, 60),
+		);
 
 		const fetched = await fetch(`${baseUrl}${signedUrl}`);
-		check("the signed URL streams the object anonymously", fetched.status === 200, `status ${String(fetched.status)}`);
+		check(
+			"the signed URL streams the object anonymously",
+			fetched.status === 200,
+			`status ${String(fetched.status)}`,
+		);
 		check(
 			"the response is typed as audio and marked private",
 			(fetched.headers.get("content-type") ?? "").startsWith("audio/") &&
@@ -888,7 +947,11 @@ async function main(): Promise<void> {
 		const token = new URL(signedUrl, baseUrl).searchParams.get("token") ?? "";
 		const [encodedPayload, signature] = token.split(".");
 		const tampered = `${Buffer.from(
-			JSON.stringify({ r: recordingRowId, o: organizationB, e: Math.floor(Date.now() / 1000) + 60 }),
+			JSON.stringify({
+				r: recordingRowId,
+				o: organizationB,
+				e: Math.floor(Date.now() / 1000) + 60,
+			}),
 			"utf8",
 		).toString("base64url")}.${String(signature)}`;
 		const tamperedResponse = await fetch(

@@ -27,6 +27,19 @@ const natsUrl = z
 	.min(1)
 	.regex(/^nats:\/\//iu, "must be a nats:// URL, e.g. nats://localhost:4222");
 
+/**
+ * One half of the broker credential, where the empty string means "explicitly none".
+ *
+ * Optional because a broker with no authentication is a real configuration here: the verify
+ * harnesses and `test/` start their own throwaway `nats` container per run and never configure a
+ * user on it. Production is not left to this schema — `assertEnvInvariants` refuses to boot a
+ * production process whose broker URL is set without both of these.
+ */
+const natsCredential = z.preprocess(
+	(value) => (typeof value === "string" && value.trim().length === 0 ? undefined : value),
+	z.string().min(1).optional(),
+);
+
 export const pbxEnvSchema = z.object({
 	/**
 	 * The telephony bounded context's database. Separate from `DATABASE_URL` (better-auth, the
@@ -42,6 +55,15 @@ export const pbxEnvSchema = z.object({
 	 * configuration changes that do not need it.
 	 */
 	NATS_URL: natsUrl.optional(),
+
+	/**
+	 * How every connection in this area authenticates to that broker. Unprefixed and shared with
+	 * apps/engine and apps/sipd, on the same terms as `NATS_URL` itself; see `config/nats.conf`.
+	 * `natsCredentials` from `@optimiq-voice/config/nats-credentials` turns the pair into the
+	 * `user`/`pass` connection options and refuses a half-set pair.
+	 */
+	NATS_USER: natsCredential,
+	NATS_PASS: natsCredential,
 
 	/** Whether to create the `routing-cache` KV bucket if the broker does not have it yet. */
 	PBX_ENSURE_KV_BUCKETS: z

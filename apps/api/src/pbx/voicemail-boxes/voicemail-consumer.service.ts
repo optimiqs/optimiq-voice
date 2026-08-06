@@ -1,5 +1,6 @@
 import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
 import { AckPolicy, connect, DeliverPolicy, type NatsConnection } from "nats";
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import { getLogger } from "@optimiq-voice/logger";
 import { eq, voicemailBox, voicemailMessage } from "@optimiq-voice/pbx-db";
 import { PBX_DATABASE, PBX_ENV } from "../shared/pbx.tokens";
@@ -94,6 +95,7 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 		try {
 			this.connection = await connect({
 				servers: this.env.NATS_URL,
+				...natsCredentials(this.env),
 				name: "optimiq-api-voicemail",
 				maxReconnectAttempts: -1,
 				reconnectTimeWait: 1_000,

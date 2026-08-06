@@ -46,6 +46,9 @@ const natsUrl = z
 	.min(1)
 	.regex(/^nats:\/\//iu, "must be a nats:// URL, e.g. nats://nats:4222");
 
+/** An optional secret where the empty string means "explicitly none", not "invalid". */
+const optionalCredential = z.preprocess(emptyAsUnset, z.string().min(1).optional());
+
 const port = (fallback: number) => z.coerce.number().int().min(1).max(65_535).default(fallback);
 
 const durationMs = (fallback: number, max: number) =>
@@ -75,6 +78,20 @@ export const engineEnvSchema = z.object({
 
 	// ---- NATS ----------------------------------------------------------------------------
 	NATS_URL: natsUrl.default("nats://localhost:4222"),
+	/**
+	 * How every connection this app opens authenticates to that broker — see `config/nats.conf`.
+	 * Unprefixed and shared with apps/api and apps/sipd, on the same terms as `NATS_URL`.
+	 *
+	 * Optional because a broker with no authentication is a real configuration: `test/` starts a
+	 * throwaway `nats` container per run and never configures a user on it. Production is not left
+	 * to this schema — `assertEnvInvariants` in `@optimiq-voice/config` refuses to boot a production
+	 * process whose broker URL is set without both of these.
+	 *
+	 * Kept out of the URL because `/healthz` and the boot log both report the URL the engine
+	 * connected to; a `nats://user:pass@host` would put the password in both.
+	 */
+	NATS_USER: optionalCredential,
+	NATS_PASS: optionalCredential,
 	/**
 	 * Whether this instance applies the JetStream stream/KV definitions at boot. Safe to leave on
 	 * — `ensureStreams` is idempotent — but a deployment that runs the definitions as a migration

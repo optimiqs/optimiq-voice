@@ -192,6 +192,13 @@ const envSchema = z.object({
 	// ---- Platform placeholders (canonical names for the rebuilt services) -----------------
 	DATABASE_URL: optionalUri,
 	NATS_URL: optionalUri,
+	/**
+	 * The broker requires authentication (`config/nats.conf`). Both are optional here because a
+	 * developer's ephemeral broker and the verify harnesses' throwaway containers have no auth at
+	 * all; `assertEnvInvariants` requires both in production whenever a NATS URL is configured.
+	 */
+	NATS_USER: optionalString,
+	NATS_PASS: optionalString,
 	AUTH_SECRET: z.string().min(32).optional(),
 	AUTH_URL: optionalUrl,
 	AUTH_COOKIE_DOMAIN: optionalString,
@@ -233,6 +240,11 @@ const envSchema = z.object({
 	API_OWNER_NAME: optionalString,
 	API_OWNER_PASSWORD: optionalString,
 	API_ROOT_DOMAIN: optionalString,
+	/**
+	 * The SIP password apps/api hands Routr for the default peer. Present here only so the
+	 * production placeholder check can see it; `apps/api/src/envs.ts` is what reads it.
+	 */
+	API_ROUTR_DEFAULT_PEER_PASSWORD: optionalString,
 	API_SMTP_AUTH_PASS: optionalString,
 	API_SMTP_AUTH_USER: optionalString,
 	API_SMTP_HOST: optionalString,

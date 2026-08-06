@@ -2,6 +2,11 @@ import fs from "fs";
 import { join } from "path";
 import dotenv from "dotenv";
 import { assertEnvsAreSet } from "@optimiq-voice/common";
+// The `/env-invariants` subpath rather than the package root: the root re-exports `env`, whose
+// module side effects parse and validate the WHOLE environment at import time, and this file runs
+// before that is wanted. The subpath is pure functions.
+import { assertResolvedSecret } from "@optimiq-voice/config/env-invariants";
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 
 if (process.env.NODE_ENV === "development") {
 	// `import.meta.dirname` is the ES-module replacement for `__dirname`; it resolves to
@@ -147,12 +152,46 @@ export const INTEGRATIONS_FILE = e.API_INTEGRATIONS_FILE || "/opt/optimiq-voice/
 
 export const NATS_URL = e.API_NATS_URL;
 
+/**
+ * The `user` / `pass` connection options for the broker, which requires authentication — see
+ * `config/nats.conf`. `NATS_USER` and `NATS_PASS` are unprefixed and shared with apps/engine and
+ * apps/sipd, on the same terms as `NATS_URL` itself.
+ *
+ * Kept out of the URL because most of this app's connect sites LOG the URL they connected to; a
+ * `nats://user:pass@host` would put the password in the log aggregator.
+ *
+ * Resolved once, here, so a half-set pair (one variable renamed, the other not) throws while this
+ * module is being imported — at boot — instead of turning into an `Authorization Violation` that
+ * each service catches and logs as a warning while coming up "healthy" with a dead backbone.
+ *
+ * Empty when neither is set, which is a broker with no authentication configured: the integration
+ * harnesses and the verify scripts start one of those per run.
+ */
+export const NATS_CREDENTIALS = natsCredentials(e);
+
 export const OWNER_EMAIL = e.API_OWNER_EMAIL;
 
 // Default owner configurations (If OWNER_EMAIL is set, the system will create a default user and a workspace)
 export const OWNER_NAME = e.API_OWNER_NAME || "Admin";
 
-export const OWNER_PASSWORD = e.API_OWNER_PASSWORD || "changeme";
+/**
+ * The seeded owner's password.
+ *
+ * The `changeme` fallback is deliberate and stays: a developer bringing the stack up locally should
+ * be able to sign in as the seeded owner without inventing a password first. What is NOT acceptable
+ * is that fallback reaching production, and until now it could — silently, and in the one way the
+ * `.env.example` tripwire could not see. `assertEnvInvariants` matches the literal string in a
+ * checked ENVIRONMENT VARIABLE, so leaving `API_OWNER_PASSWORD` unset produced exactly the public
+ * password the tripwire exists to refuse while the tripwire had nothing to look at.
+ *
+ * `assertResolvedSecret` moves the check onto the RESOLVED value, whichever side of the `||`
+ * produced it, and only bites when NODE_ENV is production.
+ */
+export const OWNER_PASSWORD = assertResolvedSecret(
+	"API_OWNER_PASSWORD",
+	e.API_OWNER_PASSWORD || "changeme",
+	{ nodeEnv: e.NODE_ENV },
+);
 
 export const ROUTR_API_ENDPOINT = e.API_ROUTR_API_ENDPOINT || "routr:51907";
 
@@ -160,7 +199,17 @@ export const ROUTR_DEFAULT_PEER_AOR = e.API_ROUTR_DEFAULT_PEER_AOR || "sip:voice
 
 export const ROUTR_DEFAULT_PEER_NAME = e.API_ROUTR_DEFAULT_PEER_NAME || "Voice Server";
 
-export const ROUTR_DEFAULT_PEER_PASSWORD = e.API_ROUTR_DEFAULT_PEER_PASSWORD || "changeme";
+/**
+ * The SIP password provisioned for Routr's default peer — the credential the media server registers
+ * with. Same shape and same hazard as `OWNER_PASSWORD` above: a useful local default that used to
+ * be able to become a production SIP password without anything noticing, because the tripwire only
+ * ever inspected the environment variable and an unset variable has nothing to inspect.
+ */
+export const ROUTR_DEFAULT_PEER_PASSWORD = assertResolvedSecret(
+	"API_ROUTR_DEFAULT_PEER_PASSWORD",
+	e.API_ROUTR_DEFAULT_PEER_PASSWORD || "changeme",
+	{ nodeEnv: e.NODE_ENV },
+);
 
 export const ROUTR_DEFAULT_PEER_USERNAME = e.API_ROUTR_DEFAULT_PEER_USERNAME || "voice";
 

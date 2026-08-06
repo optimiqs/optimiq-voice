@@ -6,6 +6,7 @@ import {
 	type KV,
 	type NatsConnection,
 } from "nats";
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import {
 	AGENT_STATE_KV,
 	CHANNELS_KV,
@@ -74,6 +75,7 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	async onModuleInit(): Promise<void> {
 		this.connection = await connect({
 			servers: this.env.NATS_URL,
+			...natsCredentials(this.env),
 			name: "optimiq-engine-jetstream",
 			// The engine must not exit because the broker restarted mid-shift.
 			maxReconnectAttempts: -1,

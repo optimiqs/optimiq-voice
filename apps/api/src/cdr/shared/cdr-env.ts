@@ -37,6 +37,17 @@ const natsUrl = z.preprocess(
 );
 
 /**
+ * One half of the broker credential, on the same "empty string means explicitly none" terms as
+ * {@link natsUrl} above. Optional because the verify harnesses and `test/` run against a throwaway
+ * `nats` container with no authentication configured; `assertEnvInvariants` is what makes both
+ * mandatory in production.
+ */
+const natsCredential = z.preprocess(
+	(value) => (typeof value === "string" && value.trim().length === 0 ? undefined : value),
+	z.string().min(1).optional(),
+);
+
+/**
  * The signing key for recording download URLs.
  *
  * 32 characters is not decoration: the token is the ONLY thing standing between an anonymous
@@ -60,6 +71,13 @@ export const cdrEnvSchema = z.object({
 	 * take the call history offline for a reason that has nothing to do with call history.
 	 */
 	NATS_URL: natsUrl,
+
+	/**
+	 * How the durable writers authenticate to that broker. Unprefixed and shared with every other
+	 * service; see `config/nats.conf`.
+	 */
+	NATS_USER: natsCredential,
+	NATS_PASS: natsCredential,
 
 	CDR_DATABASE_MAX_CONNECTIONS: z.coerce.number().int().min(2).max(100).default(10),
 

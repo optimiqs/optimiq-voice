@@ -36,6 +36,7 @@ import { execFile } from "node:child_process";
 import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 
 const execFileAsync = promisify(execFile);
 
@@ -1435,7 +1436,11 @@ async function main(): Promise<void> {
 			const { connect } = await import("nats");
 			const { ClientProxyFactory, Transport } = await import("@nestjs/microservices");
 			const { firstValueFrom } = await import("rxjs");
-			const connection = await connect({ servers: nats.url, name: "verify-pbx" });
+			const connection = await connect({
+				servers: nats.url,
+				...natsCredentials(process.env),
+				name: "verify-pbx",
+			});
 
 			/**
 			 * The rpc is driven through a NestJS `ClientProxy`, not a raw `connection.request`.
@@ -1449,7 +1454,11 @@ async function main(): Promise<void> {
 			 */
 			const rpcClient = ClientProxyFactory.create({
 				transport: Transport.NATS,
-				options: { servers: [nats.url], name: "verify-pbx-rpc" },
+				options: {
+					servers: [nats.url],
+					...natsCredentials(process.env),
+					name: "verify-pbx-rpc",
+				},
 			});
 			await rpcClient.connect();
 

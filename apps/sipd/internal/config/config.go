@@ -48,6 +48,22 @@ type Config struct {
 	// NATSURL is the backbone. NATS_URL, default nats://127.0.0.1:4222.
 	NATSURL string
 
+	// NATSUser and NATSPass authenticate to it. NATS_USER / NATS_PASS.
+	//
+	// The broker requires authentication (config/nats.conf); these are the same two unprefixed
+	// names apps/api and apps/engine read, because it is one identity for the whole platform
+	// account and splitting the variable names per service would only make them drift.
+	//
+	// Both empty is legal and means "a broker with no authentication configured" — the SIPp rig and
+	// the integration tests start one of those per run. One set without the other is NOT legal: it
+	// is a rename applied to half a pair, and the broker would answer every connect with an
+	// authorization violation that this process would spend its life retrying.
+	//
+	// They are options rather than userinfo in NATSURL because the URL is logged: the boot line,
+	// every reconnect and the connect error itself all carry it.
+	NATSUser string
+	NATSPass string
+
 	// Expiry policy, in seconds on the wire.
 	//   SIPD_MIN_EXPIRES     default 60   — below this a REGISTER gets 423 Interval Too Brief
 	//   SIPD_MAX_EXPIRES     default 3600 — above this the grant is silently clamped down
@@ -145,6 +161,8 @@ func Load(getenv Getenv) (Config, error) {
 		ListenAddr:         stringOr(getenv, "SIPD_LISTEN_ADDR", "0.0.0.0:5060"),
 		Realm:              strings.TrimSpace(getenv("SIPD_REALM")),
 		NATSURL:            stringOr(getenv, "NATS_URL", "nats://127.0.0.1:4222"),
+		NATSUser:           strings.TrimSpace(getenv("NATS_USER")),
+		NATSPass:           strings.TrimSpace(getenv("NATS_PASS")),
 		NonceSecret:        getenv("SIPD_NONCE_SECRET"),
 		CredentialsFile:    getenv("SIPD_CREDENTIALS_FILE"),
 		ProvisionSecretKey: strings.TrimSpace(getenv("SIPD_PROVISION_SECRET_KEY")),
@@ -205,6 +223,15 @@ func Load(getenv Getenv) (Config, error) {
 	}
 	if cfg.ListenAddr == "" {
 		fail("SIPD_LISTEN_ADDR must not be empty")
+	}
+	// Half a credential is a typo, not a configuration. Caught here so it costs a startup error
+	// rather than an authorization violation on every reconnect for the life of the process.
+	if (cfg.NATSUser == "") != (cfg.NATSPass == "") {
+		set, missing := "NATS_USER", "NATS_PASS"
+		if cfg.NATSUser == "" {
+			set, missing = "NATS_PASS", "NATS_USER"
+		}
+		fail("%s is set but %s is not: NATS authentication needs both", set, missing)
 	}
 	if !cfg.EnableUDP && !cfg.EnableTCP {
 		fail("SIPD_UDP and SIPD_TCP are both false: sipd would accept no traffic at all")

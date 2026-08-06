@@ -1,5 +1,6 @@
 import { connect } from "nats";
 import { getLogger } from "@optimiq-voice/logger";
+import { NATS_CREDENTIALS } from "../envs";
 import { NatsEventCallback } from "./types";
 
 const logger = getLogger({ service: "api", filePath: import.meta.filename });
@@ -24,6 +25,7 @@ async function streamEvents(subscription, callback: NatsEventCallback) {
 async function watchNats(natsUrl: string, callback: NatsEventCallback) {
 	const connection = await connect({
 		servers: natsUrl,
+		...NATS_CREDENTIALS,
 		maxReconnectAttempts: -1,
 	});
 	const subscription = connection.subscribe(ROUTR_CALL_SUBJECT);

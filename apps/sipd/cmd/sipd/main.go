@@ -55,7 +55,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	conn, err := nats.Connect(cfg.NATSURL,
+	natsOpts := []nats.Option{
 		nats.Name(config.EventSource),
 		// A SIP edge must survive a broker restart without dropping registrations: it keeps
 		// answering REGISTER from the credential store and catches up on events afterwards.
@@ -67,8 +67,18 @@ func run() error {
 		nats.ReconnectHandler(func(c *nats.Conn) {
 			log.Info("nats reconnected", "url", c.ConnectedUrl())
 		}),
-	)
+	}
+	// Only when configured: an empty pair means a broker with no authentication, which is what the
+	// SIPp rig and the integration tests run. config.Load has already refused a half-set pair.
+	if cfg.NATSUser != "" {
+		natsOpts = append(natsOpts, nats.UserInfo(cfg.NATSUser, cfg.NATSPass))
+	}
+
+	conn, err := nats.Connect(cfg.NATSURL, natsOpts...)
 	if err != nil {
+		// A rejected credential lands here as "nats: Authorization Violation" and takes the process
+		// down with it. That is deliberate: a SIP edge that cannot reach the credential RPC cannot
+		// authenticate a REGISTER, so a "degraded" sipd is one that answers every phone with 500.
 		return fmt.Errorf("connecting to NATS at %s: %w", cfg.NATSURL, err)
 	}
 	defer func() {

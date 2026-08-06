@@ -44,6 +44,7 @@ import { execFile } from "node:child_process";
 import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 
 const execFileAsync = promisify(execFile);
 
@@ -897,7 +898,11 @@ async function main(): Promise<void> {
 		} else {
 			console.log("\nB9. the ordered number reaches the did-index");
 			const { connect } = await import("nats");
-			const connection = await connect({ servers: nats.url, name: "verify-carrier" });
+			const connection = await connect({
+				servers: nats.url,
+				...natsCredentials(process.env),
+				name: "verify-carrier",
+			});
 			try {
 				const manager = await connection.jetstreamManager();
 				const bucket = await manager.jetstream().views.kv(DID_INDEX_KV.name);

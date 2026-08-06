@@ -41,6 +41,7 @@ import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { WebSocket } from "ws";
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 
 const execFileAsync = promisify(execFile);
 
@@ -377,7 +378,11 @@ async function main(): Promise<void> {
 
 	let organizationA = "";
 	let organizationB = "";
-	const connection = await connect({ servers: nats.url, name: "verify-live-writer" });
+	const connection = await connect({
+		servers: nats.url,
+		...natsCredentials(process.env),
+		name: "verify-live-writer",
+	});
 	const manager = await connection.jetstreamManager();
 	await ensureKvBuckets(manager, [
 		REGISTRATIONS_KV,
@@ -558,7 +563,8 @@ async function main(): Promise<void> {
 		const agentSubscribed = await agentLive.waitFor(
 			(frame) => frame.op === "subscribed" && frame.id === "a1",
 		);
-		const denied = (agentSubscribed?.denied as { topic: string; reason: string; permission?: string }[]) ?? [];
+		const denied =
+			(agentSubscribed?.denied as { topic: string; reason: string; permission?: string }[]) ?? [];
 		check(
 			"an agent is granted agent-state",
 			((agentSubscribed?.topics as string[]) ?? []).includes("agent-state"),
@@ -586,7 +592,9 @@ async function main(): Promise<void> {
 		);
 
 		owner.send({ op: "subscribe", topics: ["cdr", "queue:not-a-uuid", "queue:*"], id: "s2" });
-		const badTopics = await owner.waitFor((frame) => frame.op === "subscribed" && frame.id === "s2");
+		const badTopics = await owner.waitFor(
+			(frame) => frame.op === "subscribed" && frame.id === "s2",
+		);
 		const badDenied = (badTopics?.denied as { topic: string; reason: string }[]) ?? [];
 		check(
 			"an unknown topic is denied rather than guessed at",
@@ -692,9 +700,7 @@ async function main(): Promise<void> {
 
 		await registrations.put(
 			kvKeyFor.registration(organizationA, "cccccccccccccccccccccccccccccccc"),
-			encoder.encode(
-				JSON.stringify({ ...bindingA, aorHash: "cccccccccccccccccccccccccccccccc" }),
-			),
+			encoder.encode(JSON.stringify({ ...bindingA, aorHash: "cccccccccccccccccccccccccccccccc" })),
 		);
 		const aSaw = await owner.waitFor(eventOn("registrations", "put"));
 		await delay(400);
@@ -733,9 +739,7 @@ async function main(): Promise<void> {
 		owner.clear();
 		await registrations.put(
 			kvKeyFor.registration(organizationA, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
-			encoder.encode(
-				JSON.stringify({ ...bindingB, aorHash: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" }),
-			),
+			encoder.encode(JSON.stringify({ ...bindingB, aorHash: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" })),
 		);
 		await delay(600);
 		check(
@@ -851,7 +855,9 @@ async function main(): Promise<void> {
 			sipSecretRef: "secret://verify-live/1001",
 		});
 		const extensionId = String((extension.body.data as { id?: string } | undefined)?.id ?? "");
-		const agentUser = await sql<{ id: string }[]>`select "id" from "user" where "email" = ${agentEmail}`;
+		const agentUser = await sql<
+			{ id: string }[]
+		>`select "id" from "user" where "email" = ${agentEmail}`;
 		const linkedUserId = agentUser[0]?.id ?? "";
 		const queueRow = await clientA("POST", "/api/v1/queues", {
 			name: `Support ${RUN_ID}`,
@@ -878,9 +884,17 @@ async function main(): Promise<void> {
 		agentLive.clear();
 
 		const login = await clientAgent("POST", `/api/v1/queue-agents/${agentId}/session/login`, {});
-		check("an agent logs THEMSELVES in with queues.join.own", login.status === 201 || login.status === 200, `status ${login.status}`);
+		check(
+			"an agent logs THEMSELVES in with queues.join.own",
+			login.status === 201 || login.status === 200,
+			`status ${login.status}`,
+		);
 		const loginData = login.body.data as { status?: string; live?: boolean } | undefined;
-		check("…and the response reports the live status", loginData?.status === "available", JSON.stringify(loginData ?? {}));
+		check(
+			"…and the response reports the live status",
+			loginData?.status === "available",
+			JSON.stringify(loginData ?? {}),
+		);
 
 		const loginEvent = await agentLive.waitFor(eventOn("agent-state", "put"));
 		check("…and the transition arrives on the socket", loginEvent !== undefined);
@@ -893,7 +907,8 @@ async function main(): Promise<void> {
 		const kvEntry = await agentStateBucket.get(kvKeyFor.agentState(organizationA, agentId));
 		check(
 			"…and is in the agent-state bucket the engine reads",
-			kvEntry !== null && JSON.parse(new TextDecoder().decode(kvEntry.value)).status === "available",
+			kvEntry !== null &&
+				JSON.parse(new TextDecoder().decode(kvEntry.value)).status === "available",
 		);
 
 		const again = await clientAgent("POST", `/api/v1/queue-agents/${agentId}/session/login`, {});
@@ -935,7 +950,11 @@ async function main(): Promise<void> {
 			extensionId: String((otherExtension.body.data as { id?: string } | undefined)?.id ?? ""),
 		});
 		const otherAgentId = String((otherAgent.body.data as { id?: string } | undefined)?.id ?? "");
-		check("a second, unlinked agent was created", otherAgentId.length > 0, `status ${otherAgent.status}`);
+		check(
+			"a second, unlinked agent was created",
+			otherAgentId.length > 0,
+			`status ${otherAgent.status}`,
+		);
 		const forbidden = await clientAgent(
 			"POST",
 			`/api/v1/queue-agents/${otherAgentId}/session/login`,

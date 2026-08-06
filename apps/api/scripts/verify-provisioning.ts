@@ -35,6 +35,7 @@ import { execFile } from "node:child_process";
 import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 
 const execFileAsync = promisify(execFile);
 
@@ -346,7 +347,11 @@ async function main(): Promise<void> {
 
 		if (nats !== undefined) {
 			const { connect } = await import("nats");
-			natsConnection = await connect({ servers: nats.url, name: "verify-provisioning-sub" });
+			natsConnection = await connect({
+				servers: nats.url,
+				...natsCredentials(process.env),
+				name: "verify-provisioning-sub",
+			});
 			const subscription = natsConnection.subscribe(subjectFilterFor.allProvision());
 			void (async () => {
 				for await (const message of subscription) {

@@ -1,5 +1,6 @@
 import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
 import { connect, type NatsConnection } from "nats";
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import { getLogger } from "@optimiq-voice/logger";
 import { eq, sql, voicemailMessage } from "@optimiq-voice/pbx-db";
 import { PBX_ENV } from "../shared/pbx.tokens";
@@ -66,6 +67,7 @@ export class VoicemailMwiPublisher implements OnModuleInit, OnApplicationShutdow
 		try {
 			this.connection = await connect({
 				servers: this.env.NATS_URL,
+				...natsCredentials(this.env),
 				name: "optimiq-api-voicemail-mwi",
 				maxReconnectAttempts: -1,
 				reconnectTimeWait: 1_000,

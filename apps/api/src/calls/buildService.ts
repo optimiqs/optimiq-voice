@@ -1,7 +1,7 @@
 import { connect } from "nats";
 import { InfluxDBClient } from "@optimiq-voice/common";
 import { db } from "../core/db";
-import { NATS_URL } from "../envs";
+import { NATS_CREDENTIALS, NATS_URL } from "../envs";
 import { createCall } from "./createCall";
 import { createCallPublisher } from "./createCallPublisher";
 import { createTrackCall } from "./createTrackCall";
@@ -10,7 +10,7 @@ import { listCalls } from "./listCalls";
 
 async function buildService(influxdb: InfluxDBClient) {
 	const callPublisher = await createCallPublisher(NATS_URL);
-	const nc = await connect({ servers: NATS_URL, maxReconnectAttempts: -1 });
+	const nc = await connect({ servers: NATS_URL, ...NATS_CREDENTIALS, maxReconnectAttempts: -1 });
 
 	return {
 		definition: {

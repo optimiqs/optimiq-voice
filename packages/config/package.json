@@ -10,6 +10,14 @@
 		".": {
 			"types": "./src/index.ts",
 			"default": "./dist/index.js"
+		},
+		"./nats-credentials": {
+			"types": "./src/nats-credentials.ts",
+			"default": "./dist/nats-credentials.js"
+		},
+		"./env-invariants": {
+			"types": "./src/env-invariants.ts",
+			"default": "./dist/env-invariants.js"
 		}
 	},
 	"files": [

@@ -5,6 +5,7 @@ import { connect, type JetStreamManager, type KV, type NatsConnection } from "na
 // narrow a discriminated union. `./streams` and `./subjects` reach only `subjects.ts`, which
 // compiles cleanly either way. Recorded as a follow-up: the fix is to bring `apps/api` up to
 // strict, not to weaken the contracts package.
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import { ensureKvBuckets, ROUTING_CACHE_KV } from "@optimiq-voice/events/streams";
 import { getLogger } from "@optimiq-voice/logger";
 import { ROUTING_CACHE_BUCKET } from "@optimiq-voice/routing";
@@ -85,6 +86,7 @@ export class RoutingCachePublisher implements OnModuleInit, OnApplicationShutdow
 		try {
 			this.connection = await connect({
 				servers: this.env.NATS_URL,
+				...natsCredentials(this.env),
 				name: "optimiq-api-routing-cache",
 				// The control plane must not die because the broker restarted.
 				maxReconnectAttempts: -1,

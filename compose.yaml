@@ -58,6 +58,10 @@ services:
       - API_LOGS_LEVEL
       - API_LOGS_TRANSPORT
       - API_NATS_URL
+      # The broker requires authentication (see the `nats` service and config/nats.conf).
+      # These are the canonical, unprefixed names every platform service reads.
+      - NATS_USER
+      - NATS_PASS
       - API_OWNER_EMAIL
       - API_OWNER_NAME
       - API_OWNER_PASSWORD
@@ -213,6 +217,8 @@ services:
       ARI_PASSWORD: ${ASTERISK_ARI_SECRET}
       ARI_APP: ${ENGINE_ARI_APP:-optimiq-engine}
       NATS_URL: ${ENGINE_NATS_URL:-nats://nats:4222}
+      NATS_USER: ${NATS_USER}
+      NATS_PASS: ${NATS_PASS}
       ENGINE_PORT: ${ENGINE_PORT:-4010}
       ENGINE_ROUTING_ENABLED: ${ENGINE_ROUTING_ENABLED:-true}
       # Single-tenant development only. In production this is unset and an
@@ -253,16 +259,31 @@ services:
     volumes:
       - influxdb:/var/lib/influxdb2
 
-  # `-js` enables JetStream, which is NOT the image's default. Without it the
+  # The platform backbone. It runs from `config/nats.conf` rather than command-line
+  # flags because the flags cannot express authorization, and a config file and a
+  # command line are not merged — so `-js --store_dir /data` moved into the file's
+  # `jetstream` block along with the accounts.
+  #
+  # JetStream is still load-bearing rather than an optimisation: without it the
   # engine cannot apply its stream/KV definitions at boot, the `channels` and
-  # `routing-cache` buckets do not exist, and every `cdr.leg.write` is refused —
-  # so the flag is load-bearing rather than an optimisation. Core pub/sub (which
-  # is all `routr` uses) is unaffected by turning it on.
+  # `routing-cache` buckets do not exist, and every `cdr.leg.write` is refused.
+  # Core pub/sub (which is all `routr` uses) is unaffected by having it on.
+  #
+  # The four credentials below are resolved by nats-server itself out of this
+  # container's environment, so no password appears in this file. Leave any of them
+  # unset and the broker REFUSES TO START ("variable reference ... can not be
+  # found") instead of coming up open, which is the point.
   nats:
     image: nats:2.11.8
     restart: unless-stopped
-    command: ["-js", "--store_dir", "/data"]
+    command: ["-c", "/etc/nats/nats.conf"]
+    environment:
+      - NATS_USER
+      - NATS_PASS
+      - NATS_SYS_USER
+      - NATS_SYS_PASS
     volumes:
+      - ./config/nats.conf:/etc/nats/nats.conf:ro
       - nats:/data
     expose:
       - 4222

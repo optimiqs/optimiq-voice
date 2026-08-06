@@ -31,6 +31,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 
 const execFileAsync = promisify(execFile);
 
@@ -318,7 +319,11 @@ async function main(): Promise<void> {
 		const responder = app.get(SipCredentialsResponder);
 		check("the credential responder is subscribed", responder.isReady);
 
-		nc = await connect({ servers: nats.url, name: "verify-sip-credentials" });
+		nc = await connect({
+			servers: nats.url,
+			...natsCredentials(process.env),
+			name: "verify-sip-credentials",
+		});
 
 		const ask = async (
 			realm: string,

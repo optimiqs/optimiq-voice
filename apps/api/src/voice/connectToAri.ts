@@ -8,6 +8,7 @@ import {
 	ASTERISK_ARI_SECRET,
 	ASTERISK_ARI_USERNAME,
 	INTEGRATIONS_FILE,
+	NATS_CREDENTIALS,
 	NATS_URL,
 } from "../envs";
 import { createCreateVoiceClient } from "./createCreateVoiceClient";
@@ -47,7 +48,11 @@ async function connectToAri() {
 
 		const createContainer = createCreateContainer(db, INTEGRATIONS_FILE);
 
-		const nats = await connect({ servers: NATS_URL, maxReconnectAttempts: -1 });
+		const nats = await connect({
+			servers: NATS_URL,
+			...NATS_CREDENTIALS,
+			maxReconnectAttempts: -1,
+		});
 
 		const dispatcher = new VoiceDispatcher(ari, nats, createCreateVoiceClient(createContainer));
 

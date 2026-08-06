@@ -35,6 +35,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
 /**
@@ -269,9 +270,8 @@ async function main(): Promise<void> {
 	const { registerPbxTransport } = await import("../src/pbx/pbx-bootstrap");
 	const { PbxModule } = await import("../src/pbx/pbx.module");
 	const { createPostgresClient } = await import("@optimiq-voice/db");
-	const { parseVoicemailPinHash, ROUTING_CACHE_BUCKET, routingCacheKey } = await import(
-		"@optimiq-voice/routing"
-	);
+	const { parseVoicemailPinHash, ROUTING_CACHE_BUCKET, routingCacheKey } =
+		await import("@optimiq-voice/routing");
 	const { verifyVoicemailPin } = await import("../src/pbx/voicemail-boxes/voicemail-pin.service");
 	const { createPbxDatabaseClient, sql: pbxSql } = await import("@optimiq-voice/pbx-db");
 
@@ -398,7 +398,11 @@ async function main(): Promise<void> {
 		// has to appear. A `mohClassId` with no `mohClass` beside it is exactly the state the loader
 		// was in before it learned to read the table.
 		const namedMoh = await clientA("PATCH", `/api/v1/extensions/${extensionId}`, { mohClassId });
-		check("point the extension at the MOH class -> 200", namedMoh.status === 200, `status ${namedMoh.status}`);
+		check(
+			"point the extension at the MOH class -> 200",
+			namedMoh.status === 200,
+			`status ${namedMoh.status}`,
+		);
 
 		// --- 2. the set-PIN endpoint ---------------------------------------------------------------
 		console.log("\n2. POST /voicemail-boxes/:id/pin");
@@ -447,10 +451,7 @@ async function main(): Promise<void> {
 			"the digest verifies against the PIN it was made from",
 			await verifyVoicemailPin(GOOD_PIN, storedDigest ?? ""),
 		);
-		check(
-			"and refuses a different PIN",
-			!(await verifyVoicemailPin("80413", storedDigest ?? "")),
-		);
+		check("and refuses a different PIN", !(await verifyVoicemailPin("80413", storedDigest ?? "")));
 		check(
 			"re-setting the PIN produces a DIFFERENT digest (a fresh salt, not a re-run)",
 			await (async () => {
@@ -471,7 +472,11 @@ async function main(): Promise<void> {
 			console.log("  (artifact inspection SKIPPED — no broker to read the KV bucket from)");
 		} else {
 			const { connect } = await import("nats");
-			const inspectConnection = await connect({ servers: nats.url, name: "verify-vm-kv" });
+			const inspectConnection = await connect({
+				servers: nats.url,
+				...natsCredentials(process.env),
+				name: "verify-vm-kv",
+			});
 			try {
 				const manager = await inspectConnection.jetstreamManager();
 				const bucket = await manager.jetstream().views.kv(ROUTING_CACHE_BUCKET);
@@ -675,7 +680,11 @@ async function main(): Promise<void> {
 
 		const played = await fetch(`${baseUrl}${url}`);
 		const playedBody = Buffer.from(await played.arrayBuffer());
-		check("following it ANONYMOUSLY streams the audio", played.status === 200, `status ${played.status}`);
+		check(
+			"following it ANONYMOUSLY streams the audio",
+			played.status === 200,
+			`status ${played.status}`,
+		);
 		check(
 			"the bytes are the object the engine wrote",
 			playedBody.equals(audio),
@@ -722,17 +731,17 @@ async function main(): Promise<void> {
 		const foreignPin = await clientB("POST", `/api/v1/voicemail-boxes/${mailboxId}/pin`, {
 			pin: GOOD_PIN,
 		});
-		check(
-			"nor set its PIN",
-			foreignPin.status === 404,
-			`status ${foreignPin.status}`,
-		);
+		check("nor set its PIN", foreignPin.status === 404, `status ${foreignPin.status}`);
 		const foreignPlay = await clientB(
 			"POST",
 			`/api/v1/voicemail-boxes/${mailboxId}/messages/${messageIds[1]}/play-url`,
 			{},
 		);
-		check("nor mint a link to its audio", foreignPlay.status === 404, `status ${foreignPlay.status}`);
+		check(
+			"nor mint a link to its audio",
+			foreignPlay.status === 404,
+			`status ${foreignPlay.status}`,
+		);
 
 		// --- 7. rpc.voicemail.v1.list ---------------------------------------------------------------
 		if (nats === undefined) {
@@ -744,13 +753,21 @@ async function main(): Promise<void> {
 			const { connect } = await import("nats");
 			const { ClientProxyFactory, Transport } = await import("@nestjs/microservices");
 			const { VOICEMAIL_LIST_RPC } = await import("@optimiq-voice/events/schemas");
-			const connection = await connect({ servers: nats.url, name: "verify-voicemail" });
+			const connection = await connect({
+				servers: nats.url,
+				...natsCredentials(process.env),
+				name: "verify-voicemail",
+			});
 			// Driven through a Nest `ClientProxy` rather than a raw request, for the reason
 			// `verify-pbx.ts` records: Nest's NATS transport wraps the payload in its own envelope, so
 			// a raw `connection.request` would prove the subject and nothing about the contract.
 			const rpcClient = ClientProxyFactory.create({
 				transport: Transport.NATS,
-				options: { servers: [nats.url], name: "verify-voicemail-rpc" },
+				options: {
+					servers: [nats.url],
+					...natsCredentials(process.env),
+					name: "verify-voicemail-rpc",
+				},
 			});
 			await rpcClient.connect();
 
@@ -808,7 +825,10 @@ async function main(): Promise<void> {
 				check(
 					"the reply satisfies voicemailListResponseSchema",
 					VOICEMAIL_LIST_RPC.response.safeParse(answer).success,
-					JSON.stringify(VOICEMAIL_LIST_RPC.response.safeParse(answer).error?.issues ?? []).slice(0, 120),
+					JSON.stringify(VOICEMAIL_LIST_RPC.response.safeParse(answer).error?.issues ?? []).slice(
+						0,
+						120,
+					),
 				);
 
 				/*
@@ -865,15 +885,17 @@ async function main(): Promise<void> {
 
 				// --- MWI, from the HTTP side ---------------------------------------------------------
 				mwiSeen.length = 0;
-				await clientA(
-					"PATCH",
-					`/api/v1/voicemail-boxes/${mailboxId}/messages/${messageIds[1]}`,
-					{ read: true },
-				);
+				await clientA("PATCH", `/api/v1/voicemail-boxes/${mailboxId}/messages/${messageIds[1]}`, {
+					read: true,
+				});
 				for (let attempt = 0; attempt < 25 && mwiSeen.length === 0; attempt += 1) {
 					await delay(200);
 				}
-				check("marking a message read publishes an MWI update", mwiSeen.length > 0, String(mwiSeen.length));
+				check(
+					"marking a message read publishes an MWI update",
+					mwiSeen.length > 0,
+					String(mwiSeen.length),
+				);
 				check(
 					"it carries absolute counts and says WHY they moved",
 					mwiSeen[0]?.newCount === 0 &&
@@ -890,10 +912,7 @@ async function main(): Promise<void> {
 				);
 
 				mwiSeen.length = 0;
-				await clientA(
-					"DELETE",
-					`/api/v1/voicemail-boxes/${mailboxId}/messages/${messageIds[1]}`,
-				);
+				await clientA("DELETE", `/api/v1/voicemail-boxes/${mailboxId}/messages/${messageIds[1]}`);
 				for (let attempt = 0; attempt < 25 && mwiSeen.length === 0; attempt += 1) {
 					await delay(200);
 				}
@@ -1003,9 +1022,10 @@ function mailboxOf(response: JsonResponse): {
 }
 
 function unwrap(result: unknown): Record<string, unknown>[] {
-	return (
-		Array.isArray(result) ? result : ((result as { rows?: unknown[] }).rows ?? [])
-	) as Record<string, unknown>[];
+	return (Array.isArray(result) ? result : ((result as { rows?: unknown[] }).rows ?? [])) as Record<
+		string,
+		unknown
+	>[];
 }
 
 /** Reads the digest straight out of the column, because no endpoint returns it — by design. */

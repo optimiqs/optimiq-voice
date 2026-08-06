@@ -1,5 +1,6 @@
 import { Global, Module } from "@nestjs/common";
 import { ClientsModule, Transport } from "@nestjs/microservices";
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import { loadEngineEnv } from "../config/engine-env";
 import { CallEventPublisher } from "./call-event-publisher.service";
 import { ENVELOPE_ONLY_SERIALIZER } from "./envelope.serializer";
@@ -46,6 +47,7 @@ import type { EngineEnv } from "../config/engine-env";
 					transport: Transport.NATS as const,
 					options: {
 						servers: [env.NATS_URL],
+						...natsCredentials(env),
 						name: "optimiq-engine-events",
 						maxReconnectAttempts: -1,
 						reconnectTimeWait: 1_000,
@@ -62,6 +64,7 @@ import type { EngineEnv } from "../config/engine-env";
 					transport: Transport.NATS as const,
 					options: {
 						servers: [env.NATS_URL],
+						...natsCredentials(env),
 						name: "optimiq-engine-rpc",
 						maxReconnectAttempts: -1,
 						reconnectTimeWait: 1_000,

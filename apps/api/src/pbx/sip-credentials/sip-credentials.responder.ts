@@ -1,5 +1,6 @@
 import { Inject, Injectable, OnApplicationShutdown, OnModuleInit } from "@nestjs/common";
 import { connect, type NatsConnection, type Subscription } from "nats";
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import { sipCredentialRequestSchema } from "@optimiq-voice/events/schemas";
 import { RPC_SUBJECTS } from "@optimiq-voice/events/subjects";
 import { getLogger } from "@optimiq-voice/logger";
@@ -92,6 +93,7 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 		try {
 			this.connection = await connect({
 				servers: this.env.NATS_URL,
+				...natsCredentials(this.env),
 				name: "optimiq-api-sip-credentials",
 				maxReconnectAttempts: -1,
 				reconnectTimeWait: 1_000,

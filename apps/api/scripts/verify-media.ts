@@ -42,6 +42,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
 type PbxSql = typeof import("@optimiq-voice/pbx-db").sql;
@@ -1216,7 +1217,11 @@ async function main(): Promise<void> {
 			console.log("  (artifact inspection SKIPPED — no broker to read the KV bucket from)");
 		} else {
 			const { connect } = await import("nats");
-			const inspectConnection = await connect({ servers: nats.url, name: "verify-media-kv" });
+			const inspectConnection = await connect({
+				servers: nats.url,
+				...natsCredentials(process.env),
+				name: "verify-media-kv",
+			});
 			try {
 				const manager = await inspectConnection.jetstreamManager();
 				const bucket = await manager.jetstream().views.kv(ROUTING_CACHE_BUCKET);

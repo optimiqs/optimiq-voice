@@ -7,6 +7,7 @@ import {
 	ASTERISK_TRUNK,
 	CALLS_CREATE_SUBJECT,
 	DEFAULT_NATS_QUEUE_GROUP,
+	NATS_CREDENTIALS,
 } from "../envs";
 import { CreateCallRequest } from "./types";
 
@@ -25,7 +26,7 @@ async function createCreateCallSubscriber(config: CallManagerConfig) {
 	try {
 		logger.verbose("connecting to nats", { natsUrl });
 
-		const nc = await connect({ servers: natsUrl, maxReconnectAttempts: -1 });
+		const nc = await connect({ servers: natsUrl, ...NATS_CREDENTIALS, maxReconnectAttempts: -1 });
 
 		logger.verbose("subscribing to call create subject", {
 			subject: CALLS_CREATE_SUBJECT,

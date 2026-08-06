@@ -33,6 +33,7 @@
  */
 
 import { connect, type KV, type NatsConnection } from "nats";
+import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import { DID_INDEX_KV, ensureKvBuckets, kvKeyFor } from "@optimiq-voice/events/streams";
 import { createPbxDatabaseClient, sql } from "@optimiq-voice/pbx-db";
 
@@ -144,7 +145,11 @@ async function main(): Promise<void> {
 			});
 		}
 
-		connection = await connect({ servers: natsUrl, name: "rebuild-did-index" });
+		connection = await connect({
+			servers: natsUrl,
+			...natsCredentials(process.env),
+			name: "rebuild-did-index",
+		});
 		const manager = await connection.jetstreamManager();
 		await ensureKvBuckets(manager, [DID_INDEX_KV]);
 		const bucket = await manager.jetstream().views.kv(DID_INDEX_KV.name);

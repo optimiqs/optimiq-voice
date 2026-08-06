@@ -1,15 +1,23 @@
 import { describe, expect, it } from "bun:test";
-import { assertEnvInvariants, type EnvInvariantConfig } from "./env-invariants";
+import {
+	assertEnvInvariants,
+	assertResolvedSecret,
+	ResolvedSecretPlaceholderError,
+	type EnvInvariantConfig,
+} from "./env-invariants";
 
 const productionBaseline: EnvInvariantConfig = {
 	NODE_ENV: "production",
 	DATABASE_URL: "postgresql://voice:s3cret@db.internal:5432/optimiq_voice",
 	NATS_URL: "nats://nats.internal:4222",
+	NATS_USER: "optimiq",
+	NATS_PASS: "a-real-nats-password",
 	AUTH_SECRET: "a".repeat(48),
 	AUTH_URL: "https://auth.optimiq.example",
 	API_APP_URL: "https://app.optimiq.example",
 	API_CLOAK_ENCRYPTION_KEY: "k1.aesgcm256.notTheExampleKeyValue0000000000=",
 	API_OWNER_PASSWORD: "a-real-owner-password",
+	API_ROUTR_DEFAULT_PEER_PASSWORD: "a-real-peer-password",
 	API_ASTERISK_ARI_SECRET: "a-real-ari-secret",
 	ASTERISK_ARI_SECRET: "a-real-ari-secret",
 	ASTERISK_SIPPROXY_SECRET: "a-real-sipproxy-secret",
@@ -108,7 +116,15 @@ describe("env invariants in production", () => {
 
 	it("rejects every .env.example placeholder secret", () => {
 		const placeholders: { key: string; overrides: Partial<EnvInvariantConfig> }[] = [
+			{
+				key: "AUTH_SECRET",
+				overrides: { AUTH_SECRET: "replace-with-a-generated-auth-secret" },
+			},
 			{ key: "API_OWNER_PASSWORD", overrides: { API_OWNER_PASSWORD: "changeme" } },
+			{
+				key: "API_ROUTR_DEFAULT_PEER_PASSWORD",
+				overrides: { API_ROUTR_DEFAULT_PEER_PASSWORD: "changeme" },
+			},
 			{ key: "API_ASTERISK_ARI_SECRET", overrides: { API_ASTERISK_ARI_SECRET: "changeme" } },
 			{ key: "ASTERISK_ARI_SECRET", overrides: { ASTERISK_ARI_SECRET: "ChangeMe" } },
 			{ key: "ASTERISK_SIPPROXY_SECRET", overrides: { ASTERISK_SIPPROXY_SECRET: "changeme" } },
@@ -130,6 +146,20 @@ describe("env invariants in production", () => {
 		}
 	});
 
+	it("requires NATS credentials whenever a broker URL is configured", () => {
+		expect(() => assertEnvInvariants(withProduction({ NATS_USER: undefined }))).toThrow(
+			"NATS_USER must be set.",
+		);
+
+		expect(() => assertEnvInvariants(withProduction({ NATS_PASS: "   " }))).toThrow(
+			"NATS_PASS must be set.",
+		);
+
+		expect(() => assertEnvInvariants(withProduction({ NATS_PASS: "changeme" }))).toThrow(
+			"NATS_PASS still uses the .env.example placeholder value.",
+		);
+	});
+
 	it("rejects unset telephony addresses", () => {
 		expect(() =>
 			assertEnvInvariants(
@@ -144,5 +174,48 @@ describe("env invariants in production", () => {
 		expect(() => assertEnvInvariants(withProduction({ RTPENGINE_PUBLIC_IP: undefined }))).toThrow(
 			"RTPENGINE_PUBLIC_IP must be a reachable address in production.",
 		);
+	});
+});
+
+/**
+ * The hole `assertResolvedSecret` exists to close: a secret written as
+ * `e.API_OWNER_PASSWORD || "changeme"` produces the placeholder from an UNSET variable, so the
+ * schema-level check above never sees the string it is looking for.
+ */
+describe("assertResolvedSecret", () => {
+	it("returns the value untouched outside production, placeholder or not", () => {
+		expect(assertResolvedSecret("API_OWNER_PASSWORD", "changeme", { nodeEnv: "development" })).toBe(
+			"changeme",
+		);
+
+		expect(assertResolvedSecret("API_OWNER_PASSWORD", "changeme", { nodeEnv: undefined })).toBe(
+			"changeme",
+		);
+	});
+
+	it("returns a real production secret", () => {
+		expect(
+			assertResolvedSecret("API_OWNER_PASSWORD", "a-real-owner-password", {
+				nodeEnv: "production",
+			}),
+		).toBe("a-real-owner-password");
+	});
+
+	it("refuses a defaulted placeholder in production", () => {
+		expect(() =>
+			assertResolvedSecret("API_OWNER_PASSWORD", "changeme", { nodeEnv: "production" }),
+		).toThrow("API_OWNER_PASSWORD still uses the .env.example placeholder value.");
+
+		expect(() =>
+			assertResolvedSecret("API_ROUTR_DEFAULT_PEER_PASSWORD", "ChangeMe", {
+				nodeEnv: "production",
+			}),
+		).toThrow(ResolvedSecretPlaceholderError);
+	});
+
+	it("refuses an empty production secret", () => {
+		expect(() =>
+			assertResolvedSecret("API_OWNER_PASSWORD", "   ", { nodeEnv: "production" }),
+		).toThrow("API_OWNER_PASSWORD must be set.");
 	});
 });
