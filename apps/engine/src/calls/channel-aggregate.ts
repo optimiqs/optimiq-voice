@@ -42,6 +42,7 @@ export class ChannelAggregate {
 
 	private snapshotValue: ChannelSnapshot;
 	private hangupInitiatedByEngine = false;
+	private detachedFromWalk = false;
 
 	private constructor(ariChannelId: string, snapshot: ChannelSnapshot) {
 		this.ariChannelId = ariChannelId;
@@ -118,6 +119,28 @@ export class ChannelAggregate {
 	/** Whether the ENGINE decided to hang this leg up, rather than the far end. */
 	get wasHungUpByEngine(): boolean {
 		return this.hangupInitiatedByEngine;
+	}
+
+	/**
+	 * Whether a call-control feature has taken this leg away from its routing walk.
+	 *
+	 * NOT a teardown: the leg is alive, answered and talking to somebody. It is the walk that is
+	 * over. Kept separate from `isTearingDown` because everything the walk would do next to a
+	 * detached leg still SUCCEEDS at the media server — and every bit of it is wrong.
+	 */
+	get isDetached(): boolean {
+		return this.detachedFromWalk;
+	}
+
+	/**
+	 * Takes the leg away from its routing walk. One-way, and idempotent.
+	 *
+	 * Set by a pickup, which hangs up the phone the walk was ringing. Without this the walk reads
+	 * that as a failed dial, takes the no-answer branch, and sends a caller who is already talking to
+	 * somebody to voicemail.
+	 */
+	detach(): void {
+		this.detachedFromWalk = true;
 	}
 
 	/**
@@ -250,6 +273,23 @@ export class ChannelAggregate {
 			...this.snapshotValue,
 			variables: { ...this.snapshotValue.variables, [name]: value },
 		};
+	}
+
+	/**
+	 * Forgets a variable.
+	 *
+	 * Exists for one variable and one reason: a transfer, a park and a pickup all break a bridge
+	 * pairing that the teardown path reads to decide whether to hang the other side up. Setting the
+	 * variable to an empty string would be read as a leg id; it has to be gone.
+	 */
+	clearVariable(name: string): void {
+		if (!(name in this.snapshotValue.variables)) {
+			return;
+		}
+		const variables = Object.fromEntries(
+			Object.entries(this.snapshotValue.variables).filter(([key]) => key !== name),
+		);
+		this.snapshotValue = { ...this.snapshotValue, variables };
 	}
 
 	/** Associates the leg with a bridge, or clears the association when `undefined`. */

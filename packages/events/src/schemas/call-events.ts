@@ -11,8 +11,11 @@ import {
 	hangupCauseSchema,
 	hangupSideSchema,
 	legSideSchema,
+	parkEndReasonSchema,
+	pickupKindSchema,
 	recordingKindSchema,
 	recordingStopReasonSchema,
+	transferKindSchema,
 } from "./telephony";
 
 /**
@@ -156,6 +159,77 @@ export const conferenceLeftDataSchema = z.object({
 });
 
 /**
+ * `call.parked` — a call is sitting in an orbit slot.
+ *
+ * `slot` is the number somebody dials to collect it, which is why it is a dial string rather than
+ * an integer: it is announced over a PA system and typed into a phone, and a slot that had to be
+ * re-derived from a lot id and an offset would be a different number in every consumer.
+ *
+ * `parkedByLegId` is the leg that put the call there — the parker. It is optional because a call
+ * can also be parked by a routing plan that sends a DID straight to a lot, in which case nobody
+ * parked it and inventing a parker would be a lie the timeout ringback then acts on.
+ */
+export const callParkedDataSchema = z.object({
+	legId: z.uuid(),
+	parkLotId: z.uuid(),
+	slot: dialStringSchema,
+	/** When the lot will return the call to the parker. Absent means the lot has no timeout. */
+	timeoutMs: z.int().min(0).optional(),
+	parkedByLegId: z.uuid().optional(),
+	mohClass: z.string().max(64).optional(),
+});
+
+/** `call.unparked` — the call left the slot, and why. Paired with a `call.parked`. */
+export const callUnparkedDataSchema = z.object({
+	legId: z.uuid(),
+	parkLotId: z.uuid(),
+	slot: dialStringSchema,
+	reason: parkEndReasonSchema,
+	/** The leg that collected the call. Present only when `reason` is `retrieved`. */
+	retrievedByLegId: z.uuid().optional(),
+	/** How long the call sat in the lot. */
+	durationMs: z.int().min(0).optional(),
+});
+
+/**
+ * `call.transferred` — a call was handed to a new party, and the handover completed.
+ *
+ * All three legs are named because a transfer is the one operation where "which call is this?"
+ * has three defensible answers. `legId` is the TRANSFEREE — the party that was handed over and is
+ * still on the phone — because that is the leg a consumer follows afterwards.
+ */
+export const callTransferredDataSchema = z.object({
+	/** The transferee: the party handed to a new destination. */
+	legId: z.uuid(),
+	kind: transferKindSchema,
+	/** What was dialled for them, in the target context. */
+	destination: dialStringSchema,
+	/** Routing namespace the destination was resolved in. */
+	routingContext: z.string().max(64).optional(),
+	/** The party that asked for the transfer, if it was still up when the transfer completed. */
+	transferorLegId: z.uuid().optional(),
+	/** The consultation leg, for an attended transfer. */
+	targetLegId: z.uuid().optional(),
+});
+
+/**
+ * `call.picked-up` — somebody answered a call that was ringing at another extension.
+ *
+ * `legId` is the leg that DID the picking up. `pickedUpLegId` is the caller they took over, which
+ * is the A-leg of the original call rather than the ringing phone — the ringing phone is hung up
+ * with `PICKED_OFF` and has no call left to be part of.
+ */
+export const callPickedUpDataSchema = z.object({
+	legId: z.uuid(),
+	pickedUpLegId: z.uuid(),
+	kind: pickupKindSchema,
+	/** The extension whose ringing call was taken. */
+	extension: dialStringSchema,
+	/** The leg that was ringing and is now hung up with `PICKED_OFF`. */
+	abandonedLegId: z.uuid().optional(),
+});
+
+/**
  * `call.emergency.dialed` — the Kari's Law notification seam.
  *
  * Published at the moment the first trunk attempt is made, not when it is answered: the statute
@@ -209,6 +283,10 @@ export const CALL_EVENT_DEFINITIONS = {
 	"channel.destroyed": defineEvent("call", "channel.destroyed", channelDestroyedDataSchema),
 	"conference.joined": defineEvent("call", "conference.joined", conferenceJoinedDataSchema),
 	"conference.left": defineEvent("call", "conference.left", conferenceLeftDataSchema),
+	"call.parked": defineEvent("call", "call.parked", callParkedDataSchema),
+	"call.unparked": defineEvent("call", "call.unparked", callUnparkedDataSchema),
+	"call.transferred": defineEvent("call", "call.transferred", callTransferredDataSchema),
+	"call.picked-up": defineEvent("call", "call.picked-up", callPickedUpDataSchema),
 	"call.emergency.dialed": defineEvent(
 		"call",
 		"call.emergency.dialed",
@@ -244,6 +322,10 @@ export const callEventSchema = z.discriminatedUnion("type", [
 	CALL_EVENT_DEFINITIONS["channel.destroyed"].envelope,
 	CALL_EVENT_DEFINITIONS["conference.joined"].envelope,
 	CALL_EVENT_DEFINITIONS["conference.left"].envelope,
+	CALL_EVENT_DEFINITIONS["call.parked"].envelope,
+	CALL_EVENT_DEFINITIONS["call.unparked"].envelope,
+	CALL_EVENT_DEFINITIONS["call.transferred"].envelope,
+	CALL_EVENT_DEFINITIONS["call.picked-up"].envelope,
 	CALL_EVENT_DEFINITIONS["call.emergency.dialed"].envelope,
 ]);
 

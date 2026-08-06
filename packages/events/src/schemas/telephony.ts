@@ -56,6 +56,41 @@ export const RECORDING_KINDS = ["call", "voicemail", "conference"] as const;
 export type RecordingKind = (typeof RECORDING_KINDS)[number];
 export const recordingKindSchema = z.enum(RECORDING_KINDS);
 
+/**
+ * How a call was handed to a new party (frozen reference §3).
+ *
+ * `blind` re-routes the transferee and the transferor walks away; `attended` keeps a consultation
+ * leg first. The pair is a routing-significant fact rather than a cosmetic one — a completed
+ * transfer leaves `BLIND_TRANSFER` (800) or `ATTENDED_TRANSFER` (801) on the transferor's leg, and
+ * a report that could not tell them apart could not tell a warm handover from a dumped call.
+ */
+export const TRANSFER_KINDS = ["blind", "attended"] as const;
+export type TransferKind = (typeof TRANSFER_KINDS)[number];
+export const transferKindSchema = z.enum(TRANSFER_KINDS);
+
+/**
+ * How a parked call left its orbit slot.
+ *
+ * Three outcomes that sound identical on the wire and mean completely different things in a
+ * report: somebody collected the call, the parker forgot it and it rang back, or the caller gave
+ * up. Collapsing them into "the park ended" is how a lot with a broken timeout looks healthy.
+ */
+export const PARK_END_REASONS = ["retrieved", "timeout", "abandoned"] as const;
+export type ParkEndReason = (typeof PARK_END_REASONS)[number];
+export const parkEndReasonSchema = z.enum(PARK_END_REASONS);
+
+/**
+ * Which pickup feature answered somebody else's ringing phone.
+ *
+ * `directed` names the extension (`**200`); `group` takes whatever is ringing in the caller's own
+ * pickup group (`*8`). They are separated because "who was allowed to answer that" is an audit
+ * question, and a group pickup is an authorisation derived from membership rather than from the
+ * digits dialled.
+ */
+export const PICKUP_KINDS = ["directed", "group"] as const;
+export type PickupKind = (typeof PICKUP_KINDS)[number];
+export const pickupKindSchema = z.enum(PICKUP_KINDS);
+
 /** How a recording ended. */
 export const RECORDING_STOP_REASONS = ["completed", "cancelled", "failed"] as const;
 export type RecordingStopReason = (typeof RECORDING_STOP_REASONS)[number];

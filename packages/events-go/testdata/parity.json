@@ -117,11 +117,7 @@
 		},
 		{
 			"builder": "queue",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
-				"_all",
-				"agent.state"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "_all", "agent.state"],
 			"subject": "queue.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293._all.agent.state"
 		},
 		{
@@ -144,23 +140,17 @@
 		},
 		{
 			"builder": "cdrLeg",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
 			"subject": "cdr.leg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
 		},
 		{
 			"builder": "audit",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
 			"subject": "audit.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
 		},
 		{
 			"builder": "provision",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
 			"subject": "provision.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
 		}
 	],
@@ -172,32 +162,22 @@
 		},
 		{
 			"filter": "callsInOrg",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
 			"result": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.>"
 		},
 		{
 			"filter": "call",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
-				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c"],
 			"result": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.>"
 		},
 		{
 			"filter": "callEventInOrg",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
-				"channel.hangup"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "channel.hangup"],
 			"result": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.*.channel.hangup"
 		},
 		{
 			"filter": "callEvent",
-			"args": [
-				"channel.hangup"
-			],
+			"args": ["channel.hangup"],
 			"result": "calls.evt.v1.*.*.channel.hangup"
 		},
 		{
@@ -207,25 +187,17 @@
 		},
 		{
 			"filter": "registrationsInOrg",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
 			"result": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.>"
 		},
 		{
 			"filter": "registrationsForAor",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
-				"9c99510034b54c0217012ab2d10512d0"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "9c99510034b54c0217012ab2d10512d0"],
 			"result": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.9c99510034b54c0217012ab2d10512d0.>"
 		},
 		{
 			"filter": "registrationEventInOrg",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
-				"expired"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "expired"],
 			"result": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.*.expired"
 		},
 		{
@@ -235,25 +207,17 @@
 		},
 		{
 			"filter": "queuesInOrg",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
 			"result": "queue.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.>"
 		},
 		{
 			"filter": "queue",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
-				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"],
 			"result": "queue.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e.>"
 		},
 		{
 			"filter": "queueEventInOrg",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
-				"agent.state"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "agent.state"],
 			"result": "queue.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.*.agent.state"
 		},
 		{
@@ -263,25 +227,17 @@
 		},
 		{
 			"filter": "voicemailInOrg",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
 			"result": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.>"
 		},
 		{
 			"filter": "voicemailBox",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
-				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51"],
 			"result": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51.>"
 		},
 		{
 			"filter": "voicemailEventInOrg",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
-				"mwi.updated"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "mwi.updated"],
 			"result": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.*.mwi.updated"
 		},
 		{
@@ -291,9 +247,7 @@
 		},
 		{
 			"filter": "cdrLegsInOrg",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
 			"result": "cdr.leg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
 		},
 		{
@@ -303,9 +257,7 @@
 		},
 		{
 			"filter": "auditInOrg",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
 			"result": "audit.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
 		},
 		{
@@ -315,9 +267,7 @@
 		},
 		{
 			"filter": "provisionInOrg",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
 			"result": "provision.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
 		}
 	],
@@ -499,10 +449,7 @@
 	"kvKeys": [
 		{
 			"builder": "registration",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
-				"9c99510034b54c0217012ab2d10512d0"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "9c99510034b54c0217012ab2d10512d0"],
 			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.9c99510034b54c0217012ab2d10512d0"
 		},
 		{
@@ -516,64 +463,42 @@
 		},
 		{
 			"builder": "presence",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
-				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b50"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b50"],
 			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b50"
 		},
 		{
 			"builder": "agentState",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
-				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4f"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4f"],
 			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4f"
 		},
 		{
 			"builder": "routingCache",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
-				"inbound"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "inbound"],
 			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.inbound"
 		},
 		{
 			"builder": "routingCache",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
-				"inbound",
-				"441632960111"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "inbound", "441632960111"],
 			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.inbound.441632960111"
 		},
 		{
 			"builder": "didIndex",
-			"args": [
-				"+441632960111"
-			],
+			"args": ["+441632960111"],
 			"key": "441632960111"
 		},
 		{
 			"builder": "didIndex",
-			"args": [
-				"441632960111"
-			],
+			"args": ["441632960111"],
 			"key": "441632960111"
 		},
 		{
 			"builder": "didIndex",
-			"args": [
-				"+1 (212) 555-0100"
-			],
+			"args": ["+1 (212) 555-0100"],
 			"key": "12125550100"
 		},
 		{
 			"builder": "queueMembership",
-			"args": [
-				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
-				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"
-			],
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"],
 			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"
 		}
 	],
@@ -581,9 +506,7 @@
 		{
 			"name": "CALLS",
 			"description": "Channel lifecycle events per call leg (plan §3.5, §4.2).",
-			"subjects": [
-				"calls.evt.v1.>"
-			],
+			"subjects": ["calls.evt.v1.>"],
 			"retention": "limits",
 			"storage": "file",
 			"discard": "old",
@@ -597,9 +520,7 @@
 		{
 			"name": "REGISTRATIONS",
 			"description": "SIP registrar register/unregister/expire transitions (plan §3.5).",
-			"subjects": [
-				"sip.reg.v1.>"
-			],
+			"subjects": ["sip.reg.v1.>"],
 			"retention": "limits",
 			"storage": "file",
 			"discard": "old",
@@ -613,9 +534,7 @@
 		{
 			"name": "QUEUES",
 			"description": "Queue caller and agent-state events (plan §3.5).",
-			"subjects": [
-				"queue.evt.v1.>"
-			],
+			"subjects": ["queue.evt.v1.>"],
 			"retention": "limits",
 			"storage": "file",
 			"discard": "old",
@@ -629,9 +548,7 @@
 		{
 			"name": "VOICEMAIL",
 			"description": "Voicemail message and MWI events consumed durably by the pbx writer (plan §3.5).",
-			"subjects": [
-				"voicemail.evt.v1.>"
-			],
+			"subjects": ["voicemail.evt.v1.>"],
 			"retention": "limits",
 			"storage": "file",
 			"discard": "new",
@@ -645,9 +562,7 @@
 		{
 			"name": "CDR",
 			"description": "Per-leg CDR writes consumed durably by the cdr-db writer (plan §3.5).",
-			"subjects": [
-				"cdr.leg.v1.*"
-			],
+			"subjects": ["cdr.leg.v1.*"],
 			"retention": "limits",
 			"storage": "file",
 			"discard": "new",
@@ -661,9 +576,7 @@
 		{
 			"name": "AUDIT",
 			"description": "Control-plane audit trail (plan §3.5, §5 T1 audit log).",
-			"subjects": [
-				"audit.evt.v1.*"
-			],
+			"subjects": ["audit.evt.v1.*"],
 			"retention": "limits",
 			"storage": "file",
 			"discard": "new",
@@ -677,9 +590,7 @@
 		{
 			"name": "PROVISION",
 			"description": "Device provisioning request/render/reject events (plan §3.5, §4.1.7).",
-			"subjects": [
-				"provision.evt.v1.*"
-			],
+			"subjects": ["provision.evt.v1.*"],
 			"retention": "limits",
 			"storage": "file",
 			"discard": "old",
@@ -764,49 +675,14 @@
 		}
 	],
 	"vocabularies": {
-		"LegSide": [
-			"a",
-			"b"
-		],
-		"CallDirection": [
-			"inbound",
-			"outbound",
-			"internal"
-		],
-		"HangupSide": [
-			"caller",
-			"callee",
-			"system"
-		],
-		"BridgeMode": [
-			"full",
-			"signal-only",
-			"bypass-media",
-			"proxy-media"
-		],
-		"DTMFSource": [
-			"rfc2833",
-			"info",
-			"inband",
-			"application"
-		],
-		"RecordingKind": [
-			"call",
-			"voicemail",
-			"conference"
-		],
-		"RecordingStopReason": [
-			"completed",
-			"cancelled",
-			"failed"
-		],
-		"SIPTransport": [
-			"udp",
-			"tcp",
-			"tls",
-			"ws",
-			"wss"
-		],
+		"LegSide": ["a", "b"],
+		"CallDirection": ["inbound", "outbound", "internal"],
+		"HangupSide": ["caller", "callee", "system"],
+		"BridgeMode": ["full", "signal-only", "bypass-media", "proxy-media"],
+		"DTMFSource": ["rfc2833", "info", "inband", "application"],
+		"RecordingKind": ["call", "voicemail", "conference"],
+		"RecordingStopReason": ["completed", "cancelled", "failed"],
+		"SIPTransport": ["udp", "tcp", "tls", "ws", "wss"],
 		"AgentStatus": [
 			"logged-out",
 			"available",
@@ -834,23 +710,15 @@
 			"channel.destroyed",
 			"conference.joined",
 			"conference.left",
+			"call.parked",
+			"call.unparked",
+			"call.transferred",
+			"call.picked-up",
 			"call.emergency.dialed"
 		],
-		"registration": [
-			"registered",
-			"unregistered",
-			"expired"
-		],
-		"queue": [
-			"caller.joined",
-			"caller.answered",
-			"caller.abandoned",
-			"agent.state"
-		],
-		"voicemail": [
-			"message.left",
-			"mwi.updated"
-		]
+		"registration": ["registered", "unregistered", "expired"],
+		"queue": ["caller.joined", "caller.answered", "caller.abandoned", "agent.state"],
+		"voicemail": ["message.left", "mwi.updated"]
 	},
 	"eventTypes": [
 		{
@@ -927,6 +795,26 @@
 			"family": "call",
 			"type": "conference.left",
 			"goType": "ConferenceLeftData"
+		},
+		{
+			"family": "call",
+			"type": "call.parked",
+			"goType": "CallParkedData"
+		},
+		{
+			"family": "call",
+			"type": "call.unparked",
+			"goType": "CallUnparkedData"
+		},
+		{
+			"family": "call",
+			"type": "call.transferred",
+			"goType": "CallTransferredData"
+		},
+		{
+			"family": "call",
+			"type": "call.picked-up",
+			"goType": "CallPickedUpData"
 		},
 		{
 			"family": "call",
@@ -1183,9 +1071,7 @@
 					"agentId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4f",
 					"status": "wrap-up",
 					"previousStatus": "on-call",
-					"queueIds": [
-						"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"
-					],
+					"queueIds": ["0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"],
 					"reason": "after-call work"
 				}
 			}

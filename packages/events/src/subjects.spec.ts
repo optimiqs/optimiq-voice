@@ -361,6 +361,10 @@ describe("event-name guards", () => {
 			// sees them. See README's evolution rules.
 			"conference.joined",
 			"conference.left",
+			"call.parked",
+			"call.unparked",
+			"call.transferred",
+			"call.picked-up",
 			"call.emergency.dialed",
 		]);
 	});

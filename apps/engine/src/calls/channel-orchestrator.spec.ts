@@ -4,8 +4,10 @@ import { makeFakeMediaPort } from "../ari/media-port.fake";
 import { fakeQueueOrchestratorArgs } from "../queue/queue-services.fake";
 import { CallSignalBus } from "../routing/call-signals";
 import { ConferenceRegistry } from "../routing/conference-registry";
+import { ParkRegistry } from "../routing/park-registry";
 import { DtmfRegistry } from "../verbs/dtmf-registry";
 import { makeVerbExecutorRuntime } from "../verbs/verb-executor";
+import { CallControlRegistry } from "./call-control-registry";
 import { ChannelOrchestrator } from "./channel-orchestrator.service";
 import type { EngineEnv } from "../config/engine-env";
 import type { CallEventPublisher } from "../nats/call-event-publisher.service";
@@ -141,6 +143,8 @@ function harness(env: EngineEnv = fakeEnv()) {
 		signals,
 		new ConferenceRegistry(),
 		...(fakeQueueOrchestratorArgs() as [never, never, never, never, never]),
+		new ParkRegistry(),
+		new CallControlRegistry(),
 	);
 
 	return {
@@ -506,6 +510,8 @@ describe("resilience", () => {
 			h.signals,
 			new ConferenceRegistry(),
 			...(fakeQueueOrchestratorArgs() as [never, never, never, never, never]),
+			new ParkRegistry(),
+			new CallControlRegistry(),
 		);
 
 		await expect(

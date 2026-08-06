@@ -9,11 +9,14 @@ import {
 	VerbNotPermittedFailure,
 } from "./verb-errors";
 import type { MediaPort } from "../ari/media-port";
+import type { CallControlPort, ControlledLeg } from "../calls/call-control";
+import type { CallControlRegistry } from "../calls/call-control-registry";
 import type { VerbFailure } from "./verb-errors";
 import type {
 	AcknowledgedResult,
 	DtmfCollection,
 	PlaybackResult,
+	RecordResult,
 	Verb,
 	VerbName,
 	VerbResult,
@@ -41,9 +44,22 @@ import type {
  *
  * ## What is implemented
  *
- * `answer`, `ringing`, `play`, `gather` and `hangup` — the P2 inbound slice. The other 23 return
- * {@link UnsupportedVerbFailure}, which is an honest answer an application can act on, rather than
- * a silent no-op. Adding one is a new `case` and a new method; nothing else moves.
+ * The P2 inbound slice — `answer`, `ringing`, `play`, `gather`, `hangup` — plus the call-control
+ * wave: `hold`, `unhold`, `park`, `unpark`, `transfer`, `record`, `mute`, `unmute`, `playDtmf`,
+ * `stopPlay`, `setVariable` and `sleep`.
+ *
+ * The remaining eight are still {@link UnsupportedVerbFailure}, which is an honest answer an
+ * application can act on rather than a silent no-op, and each one is unimplemented for a stated
+ * reason rather than by omission — see the `default` group in {@link makeVerbExecutor}'s switch.
+ *
+ * ## Two kinds of verb, and why they take different routes
+ *
+ * A verb that is one media command (`answer`, `mute`, `playDtmf`) goes straight to {@link MediaPort}.
+ * A verb that is a call-control OPERATION (`hold`, `park`, `transfer`) goes to
+ * {@link CallControlPort}, because each of them is several media commands plus routing plus state
+ * that outlives the verb — an orbit slot, a consultation, a hold that has to remember which bridge
+ * to return to. Putting that here would make the executor own call state; putting the media
+ * commands there would make call control own the protocol.
  */
 
 /** What the executor needs to know about the leg it is acting on. */
@@ -74,14 +90,25 @@ export class VerbExecutor extends Context.Service<VerbExecutor, VerbExecutorInte
 	"@optimiq-voice/engine/VerbExecutor",
 ) {}
 
-/** Everything the executor depends on. Both are ports, so a spec supplies two closures. */
+/** Everything the executor depends on. All ports, so a spec supplies closures and a fake. */
 export interface VerbExecutorDependencies {
 	readonly media: MediaPort;
 	readonly collectDtmf: DtmfCollector;
+	/**
+	 * The call-control seam, read LAZILY.
+	 *
+	 * A registry rather than the port itself because the port is the orchestrator, and the
+	 * orchestrator is built from this executor — see `call-control-registry.ts` for the cycle this
+	 * breaks. Absent, or bound to nothing, means the call-control verbs report themselves
+	 * unimplemented, which is what an engine with routing switched off honestly is.
+	 */
+	readonly callControl?: CallControlRegistry;
 	/** Injected so a spec can assert elapsed times without waiting for them. */
 	readonly now?: () => number;
 	/** Injected so playback references are deterministic in a spec. */
 	readonly newPlaybackRef?: () => string;
+	/** Injected so a spec asserts a `sleep` without waiting for it. */
+	readonly delay?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -93,6 +120,13 @@ export interface VerbExecutorDependencies {
 export function makeVerbExecutor(deps: VerbExecutorDependencies): VerbExecutorInterface {
 	const now = deps.now ?? Date.now;
 	const newPlaybackRef = deps.newPlaybackRef ?? (() => `pb-${crypto.randomUUID()}`);
+	const delay =
+		deps.delay ??
+		((ms: number) =>
+			new Promise<void>((resolve) => {
+				const timer = setTimeout(resolve, ms);
+				timer.unref?.();
+			}));
 
 	/** Turns a media-server rejection into a typed failure, never a defect. */
 	const mediaCall = <A>(
@@ -233,6 +267,161 @@ export function makeVerbExecutor(deps: VerbExecutorDependencies): VerbExecutorIn
 	): Effect.Effect<VerbResult, VerbFailure> =>
 		Effect.fail(new UnsupportedVerbFailure({ verb, channelId: context.channelId }));
 
+	// --- call control --------------------------------------------------------------------------
+
+	/**
+	 * Resolves the call-control seam for one leg.
+	 *
+	 * Two ways it can be absent and both are honest failures rather than defects: nothing has
+	 * registered a binding (routing is off, or a spec built the executor bare), or the binding does
+	 * not know this leg (it belongs to another engine instance, or it has already been reaped).
+	 * Neither is a state to throw on — an application asked for something this engine cannot do to
+	 * this leg, and that is exactly what {@link UnsupportedVerbFailure} means.
+	 */
+	const controlFor = (
+		context: VerbChannelContext,
+		verb: VerbName,
+	): Effect.Effect<{ port: CallControlPort; leg: ControlledLeg }, VerbFailure> => {
+		const binding = deps.callControl?.current;
+		if (binding === undefined) {
+			return Effect.fail(new UnsupportedVerbFailure({ verb, channelId: context.channelId }));
+		}
+		const leg = binding.legFor(context.mediaChannelId);
+		if (leg === undefined) {
+			return Effect.fail(
+				new VerbNotPermittedFailure({
+					verb,
+					channelId: context.channelId,
+					reason: "this engine is not handling the leg",
+				}),
+			);
+		}
+		return Effect.succeed({ port: binding.port, leg });
+	};
+
+	/** Turns a call-control refusal into the same typed failure a media rejection produces. */
+	const controlled = (
+		verb: AcknowledgedResult["verb"],
+		context: VerbChannelContext,
+		run: (input: { port: CallControlPort; leg: ControlledLeg }) => Promise<{
+			readonly ok: boolean;
+			readonly reason?: string;
+		}>,
+	): Effect.Effect<VerbResult, VerbFailure> =>
+		Effect.gen(function* () {
+			const binding = yield* controlFor(context, verb);
+			const outcome = yield* mediaCall(verb, context, () => run(binding));
+			if (!outcome.ok) {
+				return yield* Effect.fail(
+					new VerbNotPermittedFailure({
+						verb,
+						channelId: context.channelId,
+						reason: outcome.reason ?? "the operation was refused",
+					}),
+				);
+			}
+			return acknowledged(verb);
+		});
+
+	/**
+	 * Starts an on-demand recording, and returns as soon as it is RUNNING.
+	 *
+	 * The same contract `play` holds to, and for the same reason: the caller needs the handle now,
+	 * and the recording ends when the call does or when something stops it — neither of which this
+	 * effect can wait for without holding a fiber for the length of a phone call. `durationMs` is
+	 * therefore `0` here and the real figure rides `channel.record.stopped`, which is the event the
+	 * uploader and the CDR's `recordingKey` both read anyway.
+	 */
+	const record = (
+		context: VerbChannelContext,
+		verb: Extract<Verb, { verb: "record" }>,
+	): Effect.Effect<VerbResult, VerbFailure> =>
+		Effect.gen(function* () {
+			const binding = yield* controlFor(context, "record");
+			const outcome = yield* mediaCall("record", context, () =>
+				binding.port.startRecording(binding.leg, {
+					...(verb.maxDurationMs === undefined ? {} : { maxDurationMs: verb.maxDurationMs }),
+					...(verb.silenceStopMs === undefined ? {} : { silenceStopMs: verb.silenceStopMs }),
+					...(verb.beep === undefined ? {} : { beep: verb.beep }),
+					...(verb.format === undefined ? {} : { format: verb.format }),
+				}),
+			);
+			if (!outcome.result.ok || outcome.recordingId === undefined) {
+				return yield* Effect.fail(
+					new VerbNotPermittedFailure({
+						verb: "record",
+						channelId: context.channelId,
+						reason: outcome.result.ok ? "the recording produced no handle" : outcome.result.reason,
+					}),
+				);
+			}
+			const result: RecordResult = {
+				verb: "record",
+				endReason: "completed",
+				recordingId: outcome.recordingId,
+				mediaRef: `object://${outcome.objectKey ?? ""}`,
+				durationMs: 0,
+				format: verb.format ?? "wav",
+			};
+			return result;
+		});
+
+	/**
+	 * Stops one playback by reference.
+	 *
+	 * Omitting the reference is documented as "stop all of them" and is REFUSED rather than
+	 * approximated: the engine does not hold a per-leg playback list, and a `stopPlay` that silently
+	 * stopped nothing is worse than one that says it needs a handle.
+	 */
+	const stopPlay = (
+		context: VerbChannelContext,
+		verb: Extract<Verb, { verb: "stopPlay" }>,
+	): Effect.Effect<VerbResult, VerbFailure> => {
+		if (verb.playbackRef === undefined) {
+			return Effect.fail(
+				new VerbNotPermittedFailure({
+					verb: "stopPlay",
+					channelId: context.channelId,
+					reason: "a playback reference is required; the engine holds no per-leg playback list",
+				}),
+			);
+		}
+		return Effect.map(
+			mediaCall("stopPlay", context, () => deps.media.stopPlayback(verb.playbackRef as string)),
+			() => acknowledged("stopPlay"),
+		);
+	};
+
+	/**
+	 * Sets a channel variable.
+	 *
+	 * `channel` scope only. `export` copies a value onto every leg this channel originates and
+	 * `global` is process-wide; neither is a variable write, both are policy the routing compiler
+	 * allow-lists, and implementing them as a plain write here would be the tenant-data leak that
+	 * allow-list exists to prevent.
+	 */
+	const setVariable = (
+		context: VerbChannelContext,
+		verb: Extract<Verb, { verb: "setVariable" }>,
+	): Effect.Effect<VerbResult, VerbFailure> => {
+		const scope = verb.scope ?? "channel";
+		if (scope !== "channel") {
+			return Effect.fail(
+				new VerbNotPermittedFailure({
+					verb: "setVariable",
+					channelId: context.channelId,
+					reason: `the "${scope}" scope is not a plain variable write and is not implemented`,
+				}),
+			);
+		}
+		return Effect.map(
+			mediaCall("setVariable", context, () =>
+				deps.media.setVariable(context.mediaChannelId, verb.name, verb.value),
+			),
+			() => acknowledged("setVariable"),
+		);
+	};
+
 	const dispatch = Effect.fn("VerbExecutor.dispatch")(function* (
 		context: VerbChannelContext,
 		verb: Verb,
@@ -250,31 +439,104 @@ export function makeVerbExecutor(deps: VerbExecutorDependencies): VerbExecutorIn
 				return yield* gather(context, verb);
 			case "hangup":
 				return yield* hangup(context, verb);
-
-			// --- not implemented in the P2 slice ---------------------------------------------
-			case "earlyMedia":
 			case "stopPlay":
+				return yield* stopPlay(context, verb);
+			case "setVariable":
+				return yield* setVariable(context, verb);
+			case "record":
+				return yield* record(context, verb);
+
+			case "hold":
+				return yield* controlled("hold", context, ({ port, leg }) =>
+					port.hold(leg, {
+						...(verb.musicOnHold === undefined ? {} : { musicOnHold: verb.musicOnHold }),
+						...(verb.soft === undefined ? {} : { soft: verb.soft }),
+					}),
+				);
+			case "unhold":
+				return yield* controlled("unhold", context, ({ port, leg }) => port.unhold(leg));
+			case "park":
+				return yield* controlled("park", context, async ({ port, leg }) => {
+					const outcome = await port.park(leg, {
+						...(verb.lot === undefined ? {} : { lot: verb.lot }),
+						...(verb.orbit === undefined ? {} : { orbit: verb.orbit }),
+						...(verb.timeoutMs === undefined ? {} : { timeoutMs: verb.timeoutMs }),
+						...(verb.musicOnHold === undefined ? {} : { musicOnHold: verb.musicOnHold }),
+					});
+					return outcome.result;
+				});
+			case "unpark":
+				return yield* controlled("unpark", context, ({ port, leg }) =>
+					port.unpark(leg, {
+						...(verb.lot === undefined ? {} : { lot: verb.lot }),
+						...(verb.orbit === undefined ? {} : { orbit: verb.orbit }),
+					}),
+				);
+			case "transfer":
+				return yield* controlled("transfer", context, ({ port, leg }) =>
+					port.transfer(leg, {
+						kind: verb.kind,
+						destination: verb.destination.destination,
+						...(verb.destination.context === undefined
+							? {}
+							: { context: verb.destination.context }),
+						...(verb.fallbackDestination === undefined
+							? {}
+							: { fallbackDestination: verb.fallbackDestination.destination }),
+					}),
+				);
+
+			case "playDtmf":
+				return yield* Effect.map(
+					mediaCall("playDtmf", context, () =>
+						deps.media.sendDtmf(context.mediaChannelId, {
+							digits: verb.digits.join(""),
+							...(verb.toneDurationMs === undefined ? {} : { toneDurationMs: verb.toneDurationMs }),
+						}),
+					),
+					() => acknowledged("playDtmf"),
+				);
+			case "mute":
+				return yield* Effect.map(
+					mediaCall("mute", context, () => deps.media.mute(context.mediaChannelId, verb.direction)),
+					() => acknowledged("mute"),
+				);
+			case "unmute":
+				return yield* Effect.map(
+					mediaCall("unmute", context, () =>
+						deps.media.unmute(context.mediaChannelId, verb.direction),
+					),
+					() => acknowledged("unmute"),
+				);
+			case "sleep":
+				return yield* Effect.map(
+					mediaCall("sleep", context, () => delay(Math.max(0, verb.durationMs))),
+					() => acknowledged("sleep"),
+				);
+
+			// --- still unimplemented, each for a stated reason --------------------------------
+			// `earlyMedia`: ARI exposes 180 (`ring`) and 200 (`answer`) and nothing for 183 + SDP.
+			// `playbackControl`: needs `POST /playbacks/{id}/control`, which the ARI client does not
+			//   surface yet; a pause that silently did nothing is worse than an honest refusal.
+			// `say` / `stopSay`: no TTS renderer is wired. Faking it with `sound:` files would play
+			//   the wrong words.
+			// `dial`: the plan walker owns origination, including lose-race and CDR-correct B-legs.
+			//   A second originator here would be a second, subtly different one.
+			// `bridge` / `unbridge`: both address a peer by DOMAIN leg id, and resolving one to a
+			//   media channel needs the registry the call-control seam owns — the next wave, alongside
+			//   the session-protocol transport that would send them.
+			// `stream` / `stopStream` / `streamGather` / `stopStreamGather`: the AudioSocket seam.
+			case "earlyMedia":
 			case "playbackControl":
 			case "say":
 			case "stopSay":
-			case "record":
 			case "dial":
 			case "bridge":
 			case "unbridge":
-			case "transfer":
-			case "hold":
-			case "unhold":
-			case "park":
-			case "unpark":
-			case "playDtmf":
-			case "mute":
-			case "unmute":
 			case "stream":
 			case "stopStream":
 			case "streamGather":
 			case "stopStreamGather":
-			case "setVariable":
-			case "sleep":
 				return yield* unsupported(context, verb.verb);
 			default:
 				// Exhaustiveness: adding a verb to `@optimiq-voice/telephony` breaks this line, which

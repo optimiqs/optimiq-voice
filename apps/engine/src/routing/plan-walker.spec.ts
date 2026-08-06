@@ -107,6 +107,7 @@ function harness(options: HarnessOptions = {}) {
 	const state = {
 		answered: options.answered ?? false,
 		tearingDown: false,
+		detached: false,
 		bridgeId: undefined as string | undefined,
 	};
 
@@ -168,6 +169,9 @@ function harness(options: HarnessOptions = {}) {
 		organizationId: ORG_ID,
 		callerIdNumber: "+15551234567",
 		callerIdName: "Ada",
+		get isDetached(): boolean {
+			return state.detached;
+		},
 		get isTearingDown(): boolean {
 			return state.tearingDown;
 		},
@@ -1937,13 +1941,10 @@ describe("feature codes", () => {
 });
 
 describe("node kinds that are not implemented yet", () => {
-	// `conference` left this list when it gained a real runtime; it now behaves like `queue` —
-	// implemented, and falling back to the announcement when the walk was not given its registry.
-	// See `plan-walker-conference.spec.ts`.
-	for (const node of [
-		{ id: "p", kind: "park", parkLotId: "p-1" },
-		{ id: "a", kind: "application", application: "autopilot" },
-	] as PlanNode[]) {
+	// `conference` and `park` both left this list when they gained real runtimes; each now behaves
+	// like `queue` — implemented, and falling back to the announcement when the walk was not given
+	// its registry. See `plan-walker-conference.spec.ts` and `plan-walker-park.spec.ts`.
+	for (const node of [{ id: "a", kind: "application", application: "autopilot" }] as PlanNode[]) {
 		it(`announces and hangs up for a \`${node.kind}\` node`, async () => {
 			const h = harness();
 			const outcome = await h.walker.walk(walkInput([node]));
@@ -1953,6 +1954,25 @@ describe("node kinds that are not implemented yet", () => {
 			expect(verbNames(h.verbs)).toEqual(["answer", "play", "hangup"]);
 		});
 	}
+
+	it("announces a `park` node when the walk has no call-control runtime", async () => {
+		const h = harness();
+		const outcome = await h.walker.walk(
+			walkInput([
+				{
+					id: "p",
+					kind: "park",
+					parkLotId: "p-1",
+					slotStart: 401,
+					slotEnd: 410,
+					timeoutSeconds: 120,
+				} as PlanNode,
+			]),
+		);
+
+		expect(outcome.hangupCause).toBe("FACILITY_NOT_IMPLEMENTED");
+		expect(outcome.notes.join(" ")).toContain("has no call-control runtime");
+	});
 
 	/**
 	 * A `queue` node IS implemented — but only when the walk was given the ACD plane. A walker

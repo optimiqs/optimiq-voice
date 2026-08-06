@@ -109,13 +109,49 @@ export interface RecordingHandle {
 	readonly format: string;
 }
 
+/** Which direction of the media path a mute or a tap applies to. */
+export type MediaDirection = "in" | "out" | "both";
+
+/** Digits generated towards the far end. Milliseconds, as everywhere above this seam. */
+export interface SendDtmfRequest {
+	readonly digits: string;
+	readonly toneDurationMs?: number;
+	readonly gapMs?: number;
+}
+
+/**
+ * A channel that listens to another channel.
+ *
+ * The tap primitive behind on-demand recording, and the reason recording does not need a bridge
+ * API: a snoop channel spying on `both` directions of a bridged leg hears the whole conversation,
+ * so recording it produces one object with both parties in it, on any media server that can tap a
+ * channel at all.
+ *
+ * `snoopChannelId` is CLIENT-assigned for exactly the same reason {@link OriginateRequest}'s is:
+ * the tap is handed to the engine's own application, so its `StasisStart` must be recognisable
+ * BEFORE it arrives or the tap is filed as a new inbound call.
+ */
+export interface SnoopRequest {
+	/** The leg being listened to. */
+	readonly channelId: string;
+	readonly snoopChannelId: string;
+	/** The application the tap is handed to. Must match the engine's own. */
+	readonly application: string;
+	/** Which direction to listen to. `both` is what a call recording needs. */
+	readonly spy: MediaDirection;
+	/** Which direction to inject audio into. Absent means listen only. */
+	readonly whisper?: MediaDirection;
+}
+
 /**
  * Everything the engine asks a media server to do.
  *
- * Still deliberately small: transfer, park, snoop and hold/unhold are absent rather than
- * present-and-throwing, because an interface that lies about its capabilities is worse than one
- * that is honestly incomplete — the verb executor already reports an unimplemented verb as a typed
- * failure.
+ * Still deliberately small, and still domain-shaped. `transfer` and `park` are absent and will stay
+ * absent: neither is a media operation. A transfer is "take this leg out of that bridge, resolve a
+ * destination for it, put it in a new one" and a park is "take it out and play it music until
+ * somebody dials its slot" — both are compositions of the primitives below plus routing the media
+ * server knows nothing about, and a media server that implemented them would be making routing
+ * decisions on the far side of this seam.
  */
 export interface MediaPort {
 	/** SIP 200 OK. Starts billing. */
@@ -191,4 +227,37 @@ export interface MediaPort {
 
 	/** Stop music on hold. */
 	stopMusicOnHold(channelId: string): Promise<void>;
+
+	// --- P4: the call-control surface ----------------------------------------------------------
+
+	/**
+	 * Tell the far end this leg is on hold (SIP re-INVITE, `sendonly`).
+	 *
+	 * SIGNALLING only, and deliberately separate from {@link startMusicOnHold}: the phone at the
+	 * other end needs to know so it can light its hold key, and the person on the leg needs to hear
+	 * something. They are different facts about different parties and a call-control runtime uses
+	 * them independently — a call held mid-attended-transfer wants the music without the re-INVITE,
+	 * because renegotiating twice in three seconds is how phones drop audio.
+	 */
+	hold(channelId: string): Promise<void>;
+
+	/** Release the signalling hold. */
+	unhold(channelId: string): Promise<void>;
+
+	/** Stop audio flowing in one or both directions without touching the bridge. */
+	mute(channelId: string, direction: MediaDirection): Promise<void>;
+
+	/** Undo {@link mute}. */
+	unmute(channelId: string, direction: MediaDirection): Promise<void>;
+
+	/** Generate DTMF towards the far end. */
+	sendDtmf(channelId: string, request: SendDtmfRequest): Promise<void>;
+
+	/**
+	 * Create a channel that listens to another one.
+	 *
+	 * The tap enters the engine's own application, so the caller MUST make the id recognisable
+	 * before calling this — see {@link SnoopRequest}.
+	 */
+	snoop(request: SnoopRequest): Promise<OriginatedChannel>;
 }

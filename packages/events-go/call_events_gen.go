@@ -25,6 +25,10 @@ const (
 	EventTypeChannelDestroyed     = "channel.destroyed"
 	EventTypeConferenceJoined     = "conference.joined"
 	EventTypeConferenceLeft       = "conference.left"
+	EventTypeCallParked           = "call.parked"
+	EventTypeCallUnparked         = "call.unparked"
+	EventTypeCallTransferred      = "call.transferred"
+	EventTypeCallPickedUp         = "call.picked-up"
 	EventTypeCallEmergencyDialed  = "call.emergency.dialed"
 )
 
@@ -200,6 +204,137 @@ type ConferenceLeftData struct {
 	MemberCount  int    `json:"memberCount"`
 	DurationMs   *int   `json:"durationMs,omitempty"`
 }
+
+// CallParkedData is the payload of the "call.parked" event.
+//
+// Subject: calls.evt.v1.<orgId>.<callId>.call.parked
+// Envelope: Envelope[CallParkedData]
+type CallParkedData struct {
+	LegID         string  `json:"legId"`
+	ParkLotID     string  `json:"parkLotId"`
+	Slot          string  `json:"slot"`
+	TimeoutMs     *int    `json:"timeoutMs,omitempty"`
+	ParkedByLegID *string `json:"parkedByLegId,omitempty"`
+	MOHClass      *string `json:"mohClass,omitempty"`
+}
+
+// CallUnparkedData is the payload of the "call.unparked" event.
+//
+// Subject: calls.evt.v1.<orgId>.<callId>.call.unparked
+// Envelope: Envelope[CallUnparkedData]
+type CallUnparkedData struct {
+	LegID            string             `json:"legId"`
+	ParkLotID        string             `json:"parkLotId"`
+	Slot             string             `json:"slot"`
+	Reason           CallUnparkedReason `json:"reason"`
+	RetrievedByLegID *string            `json:"retrievedByLegId,omitempty"`
+	DurationMs       *int               `json:"durationMs,omitempty"`
+}
+
+// CallUnparkedReason is the closed vocabulary of CallUnparkedData.reason.
+type CallUnparkedReason string
+
+const (
+	CallUnparkedReasonRetrieved CallUnparkedReason = "retrieved"
+	CallUnparkedReasonTimeout   CallUnparkedReason = "timeout"
+	CallUnparkedReasonAbandoned CallUnparkedReason = "abandoned"
+)
+
+// CallUnparkedReasonValues lists every member of the vocabulary, in contract order.
+var CallUnparkedReasonValues = []CallUnparkedReason{
+	CallUnparkedReasonRetrieved,
+	CallUnparkedReasonTimeout,
+	CallUnparkedReasonAbandoned,
+}
+
+// Valid reports whether v is a member of the CallUnparkedReason vocabulary.
+func (v CallUnparkedReason) Valid() bool {
+	for _, candidate := range CallUnparkedReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v CallUnparkedReason) String() string { return string(v) }
+
+// CallTransferredData is the payload of the "call.transferred" event.
+//
+// Subject: calls.evt.v1.<orgId>.<callId>.call.transferred
+// Envelope: Envelope[CallTransferredData]
+type CallTransferredData struct {
+	LegID           string              `json:"legId"`
+	Kind            CallTransferredKind `json:"kind"`
+	Destination     string              `json:"destination"`
+	RoutingContext  *string             `json:"routingContext,omitempty"`
+	TransferorLegID *string             `json:"transferorLegId,omitempty"`
+	TargetLegID     *string             `json:"targetLegId,omitempty"`
+}
+
+// CallTransferredKind is the closed vocabulary of CallTransferredData.kind.
+type CallTransferredKind string
+
+const (
+	CallTransferredKindBlind    CallTransferredKind = "blind"
+	CallTransferredKindAttended CallTransferredKind = "attended"
+)
+
+// CallTransferredKindValues lists every member of the vocabulary, in contract order.
+var CallTransferredKindValues = []CallTransferredKind{
+	CallTransferredKindBlind,
+	CallTransferredKindAttended,
+}
+
+// Valid reports whether v is a member of the CallTransferredKind vocabulary.
+func (v CallTransferredKind) Valid() bool {
+	for _, candidate := range CallTransferredKindValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v CallTransferredKind) String() string { return string(v) }
+
+// CallPickedUpData is the payload of the "call.picked-up" event.
+//
+// Subject: calls.evt.v1.<orgId>.<callId>.call.picked-up
+// Envelope: Envelope[CallPickedUpData]
+type CallPickedUpData struct {
+	LegID          string           `json:"legId"`
+	PickedUpLegID  string           `json:"pickedUpLegId"`
+	Kind           CallPickedUpKind `json:"kind"`
+	Extension      string           `json:"extension"`
+	AbandonedLegID *string          `json:"abandonedLegId,omitempty"`
+}
+
+// CallPickedUpKind is the closed vocabulary of CallPickedUpData.kind.
+type CallPickedUpKind string
+
+const (
+	CallPickedUpKindDirected CallPickedUpKind = "directed"
+	CallPickedUpKindGroup    CallPickedUpKind = "group"
+)
+
+// CallPickedUpKindValues lists every member of the vocabulary, in contract order.
+var CallPickedUpKindValues = []CallPickedUpKind{
+	CallPickedUpKindDirected,
+	CallPickedUpKindGroup,
+}
+
+// Valid reports whether v is a member of the CallPickedUpKind vocabulary.
+func (v CallPickedUpKind) Valid() bool {
+	for _, candidate := range CallPickedUpKindValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v CallPickedUpKind) String() string { return string(v) }
 
 // CallEmergencyDialedData is the payload of the "call.emergency.dialed" event.
 //

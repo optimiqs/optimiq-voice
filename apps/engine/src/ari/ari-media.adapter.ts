@@ -3,6 +3,7 @@ import { ariReasonCodeFor } from "../calls/ari-mapping";
 import type {
 	BridgeHandle,
 	CreateBridgeRequest,
+	MediaDirection,
 	MediaPort,
 	OriginateRequest,
 	OriginatedChannel,
@@ -10,6 +11,8 @@ import type {
 	PlayRequest,
 	RecordRequest,
 	RecordingHandle,
+	SendDtmfRequest,
+	SnoopRequest,
 } from "./media-port";
 import type { AriClient } from "@optimiq-voice/media-ari";
 import type { HangupCause } from "@optimiq-voice/telephony";
@@ -150,5 +153,43 @@ export class AriMediaAdapter implements MediaPort {
 
 	async stopMusicOnHold(channelId: string): Promise<void> {
 		await this.client.channels.stopMoh(channelId);
+	}
+
+	// --- P4 ------------------------------------------------------------------------------------
+
+	async hold(channelId: string): Promise<void> {
+		await this.client.channels.hold(channelId);
+	}
+
+	async unhold(channelId: string): Promise<void> {
+		await this.client.channels.unhold(channelId);
+	}
+
+	async mute(channelId: string, direction: MediaDirection): Promise<void> {
+		await this.client.channels.mute(channelId, direction);
+	}
+
+	async unmute(channelId: string, direction: MediaDirection): Promise<void> {
+		await this.client.channels.unmute(channelId, direction);
+	}
+
+	async sendDtmf(channelId: string, request: SendDtmfRequest): Promise<void> {
+		await this.client.channels.sendDtmf(channelId, {
+			digits: request.digits,
+			durationMs: request.toneDurationMs,
+			betweenMs: request.gapMs,
+		});
+	}
+
+	async snoop(request: SnoopRequest): Promise<OriginatedChannel> {
+		const channel = await this.client.channels.snoop(request.channelId, {
+			snoopId: request.snoopChannelId,
+			app: request.application,
+			spy: request.spy,
+			// ARI's `whisper` defaults to `none`, and passing `undefined` means the same thing; it is
+			// spelled out so the recording path can never accidentally inject audio into a live call.
+			whisper: request.whisper ?? "none",
+		});
+		return { channelId: channel.id, name: channel.name };
 	}
 }

@@ -83,6 +83,7 @@ function harness(options: HarnessOptions = {}) {
 		organizationId: ORG_ID,
 		callerIdNumber: "+15551234567",
 		callerIdName: "Ada",
+		isDetached: false,
 		get isTearingDown(): boolean {
 			return state.tearingDown;
 		},

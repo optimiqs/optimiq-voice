@@ -83,11 +83,16 @@ import type {
  * mute, no kick, no lock, no entry/exit tones, no participant list, and no room state shared
  * between engine processes.
  *
+ * Also real: `park` — both directions of it. A call routed to a lot is put in an orbit slot with
+ * music and left there for somebody to collect; a call that DIALLED a slot in that lot's range
+ * collects whoever is in it. Which of the two happens is decided by the digits, because the compiler
+ * points both at one node. `feature-code` now serves directed (`**<ext>`) and group (`*8`) pickup
+ * for real, through the same call-control runtime.
+ *
  * Placeholder, and honest about it: `voicemail` records but has no mailbox, no MWI and no email;
- * `feature-code` serves `*97` as that placeholder and answers everything else with an
- * announcement; `park` and `application` announce and hang up. Every one of them adds
- * a line to {@link WalkOutcome.notes}, so a call that hit a gap says so in the log rather than
- * looking like a routing bug.
+ * `feature-code` serves `*97` as that placeholder and answers everything else with an announcement;
+ * `application` announces and hangs up. Every one of them adds a line to {@link WalkOutcome.notes},
+ * so a call that hit a gap says so in the log rather than looking like a routing bug.
  */
 
 /** The A-leg, as the walker sees it. Every member is live: the orchestrator owns the state. */
@@ -100,11 +105,52 @@ export interface WalkerChannel {
 	readonly organizationId: string;
 	readonly isTearingDown: boolean;
 	readonly isAnswered: boolean;
+	/**
+	 * Whether a call-control feature has taken this leg over.
+	 *
+	 * Set by a directed or group pickup, and read at every step boundary and inside every dial loop.
+	 * Without it the walk that is ringing an extension sees its B-leg die with `PICKED_OFF`, takes
+	 * the no-answer branch, and sends a caller who is by then talking to somebody to voicemail. A
+	 * detached walk stops where it is and leaves the leg alone.
+	 */
+	readonly isDetached: boolean;
 	readonly callerIdNumber?: string;
 	readonly callerIdName?: string;
 	/** Guarded state move. Returns whether the machine actually moved. */
 	moveTo(state: ChannelState): boolean;
 	setBridge(bridgeId: string | undefined): void;
+}
+
+/**
+ * The call-control operations a plan node can reach.
+ *
+ * A narrow, walker-shaped port rather than the whole {@link
+ * import("../calls/call-control").CallControlPort}: the walker acts on ONE leg — the A-leg it is
+ * routing — so every method here is already bound to it, and the walker never has to hold a
+ * `ControlledLeg` or know that such a thing exists. It also keeps the walker's specs to four
+ * closures and a fake, which is the standard every other collaborator here holds to.
+ *
+ * Absent means the park lot and the pickup codes announce and hang up exactly as they did before
+ * this wave, and say so in the notes.
+ */
+export interface WalkerCallControl {
+	/** Parks the A-leg. `orbit` is what the caller dialled after the code, when they dialled one. */
+	park(request: {
+		readonly parkLotId: string;
+		readonly orbit?: string;
+		readonly timeoutMs?: number;
+		readonly mohClass?: string;
+	}): Promise<{ readonly ok: boolean; readonly slot?: number; readonly reason?: string }>;
+	/** Collects the call sitting in `orbit` onto the A-leg. */
+	unpark(request: {
+		readonly parkLotId: string;
+		readonly orbit: string;
+	}): Promise<{ readonly ok: boolean; readonly reason?: string }>;
+	/** Answers somebody else's ringing call on the A-leg. */
+	pickup(request: {
+		readonly kind: "directed" | "group";
+		readonly extension: string;
+	}): Promise<{ readonly ok: boolean; readonly reason?: string }>;
 }
 
 /** Deployment-shaped knobs. All of them have defaults; none of them is a routing decision. */
@@ -252,6 +298,23 @@ export interface PlanWalkerDependencies {
 	 * state outlives a single walk — see `conference-registry.ts`.
 	 */
 	readonly conferences?: ConferenceRegistry;
+	/**
+	 * Park lots and call pickup, bound to the A-leg.
+	 *
+	 * Optional for the same reason `queue` and `conferences` are: a spec about an IVR should not have
+	 * to stand up a park registry, and without it a `park` node or a pickup code announces and hangs
+	 * up exactly as it did before this wave.
+	 */
+	readonly control?: WalkerCallControl;
+	/**
+	 * Run just before the A-leg is joined to whatever the walk found.
+	 *
+	 * Exists for one caller and one reason: a transferred leg is held with music for the whole time
+	 * the target rings, and the music has to stop at the INSTANT of bridging. Stopping it before the
+	 * walk starts would give the transferee silence for the entire ring; stopping it afterwards would
+	 * play music over the conversation.
+	 */
+	readonly beforeBridge?: (bridgeId: string) => Promise<void>;
 	/** Injected so ids are deterministic in a spec. */
 	readonly newId?: () => string;
 	readonly now?: () => number;
@@ -476,7 +539,7 @@ export class PlanWalker {
 		let nodeId: PlanNodeId | undefined = input.plan.entryNodeId;
 
 		for (let step = 0; step < this.settings.maxPlanSteps; step += 1) {
-			if (this.deps.channel.isTearingDown) {
+			if (this.abandoned) {
 				return this.outcome("aborted");
 			}
 			if (nodeId === undefined) {
@@ -563,7 +626,7 @@ export class PlanWalker {
 				return await this.externalNode(node, input);
 			}
 			case "feature-code": {
-				return await this.featureCodeNode(node);
+				return await this.featureCodeNode(node, input);
 			}
 			case "queue": {
 				return await this.queueNode(node);
@@ -571,10 +634,13 @@ export class PlanWalker {
 			case "conference": {
 				return await this.conferenceNode(node);
 			}
+			case "park": {
+				return await this.parkNode(node, input);
+			}
 			default: {
-				// `park`, `application`: real destinations with real runtimes, neither of
-				// which exists yet. Announcing and hanging up is a worse product than the real thing
-				// and a better one than silence.
+				// `application`: a real destination with a real runtime that does not exist yet.
+				// Announcing and hanging up is a worse product than the real thing and a better one
+				// than silence.
 				this.note(`node kind "${node.kind}" is not implemented yet; announced and hung up`);
 				return await this.announceAndHangup(
 					this.settings.unavailableAnnouncement,
@@ -646,9 +712,13 @@ export class PlanWalker {
 	 */
 	private async featureCodeNode(
 		node: Extract<PlanNode, { kind: "feature-code" }>,
+		input: WalkInput,
 	): Promise<StepResult> {
 		if (node.targetNodeId !== undefined) {
 			return { kind: "goto", nodeId: node.targetNodeId };
+		}
+		if (node.action === "call-pickup" || node.action === "group-pickup") {
+			return await this.pickupCode(node, input);
 		}
 		if (node.action === "voicemail-check" || node.action === "voicemail-direct") {
 			// A feature code with no target compiled to nothing to go to: the tenant has the code but
@@ -667,6 +737,177 @@ export class PlanWalker {
 			this.settings.unavailableAnnouncement,
 			"FACILITY_NOT_IMPLEMENTED",
 		);
+	}
+
+	/**
+	 * `**<extension>` and `*8` — answering somebody else's ringing phone.
+	 *
+	 * The call-control runtime does the work; this method's job is to turn "nothing was ringing" into
+	 * something the caller can hear. `NO_PICKUP` (Q.850 812) is the cause, not `NO_ANSWER`: the
+	 * caller reached the feature and the feature had nothing to give them, which is a different fact
+	 * from a phone nobody picked up and is the one a support ticket needs.
+	 *
+	 * The A-leg is deliberately NOT answered first. `pickup` answers it itself, at the moment it has
+	 * a call to connect — answering earlier would start billing somebody for a feature code that
+	 * then found nothing.
+	 */
+	private async pickupCode(
+		node: Extract<PlanNode, { kind: "feature-code" }>,
+		input: WalkInput,
+	): Promise<StepResult> {
+		const control = this.deps.control;
+		if (control === undefined) {
+			this.note(
+				`feature code ${node.code} (${node.action}) was dialled but this walk has no call-control runtime`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		const kind = node.action === "group-pickup" ? "group" : "directed";
+		const extension = input.featureArgument?.trim() ?? "";
+		if (kind === "directed" && extension === "") {
+			this.note(`feature code ${node.code} needs the extension whose call is being picked up`);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		const outcome = await control.pickup({ kind, extension });
+		if (outcome.ok) {
+			this.note(
+				kind === "group"
+					? "picked up a call ringing in the caller's pickup group"
+					: `picked up the call ringing at extension ${extension}`,
+			);
+			return { kind: "bridged" };
+		}
+
+		this.note(`pickup refused: ${outcome.reason ?? "nothing was ringing"}`);
+		return await this.announceAndHangup(this.settings.unavailableAnnouncement, "NO_PICKUP");
+	}
+
+	// -------------------------------------------------------------------------------------------
+	// Park lots
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * A park lot, in both of its directions.
+	 *
+	 * ## One node, two operations, and the dialled digits decide
+	 *
+	 * `packages/routing` compiles a lot's orbit range into the internal number table pointing at THIS
+	 * node, and the `call-park` feature code at the same node. So a call arrives here either because
+	 * somebody dialled `401` — which means "collect whoever is on 401" — or because it was sent to
+	 * the lot itself, which means "put this call in a slot". The digits are the only thing that tells
+	 * the two apart, and getting it backwards would park the person who came to collect a call.
+	 *
+	 * ## Parking ends the walk with the call still up
+	 *
+	 * The outcome is `bridged` rather than `hangup` because the leg lives on: it is in an orbit,
+	 * hearing music, waiting for somebody. `bridged` is the walk status that means "the walk is over
+	 * and the call is up", which is exactly true here even though there is nobody on the other side
+	 * yet — and it is what stops the orchestrator from tearing the leg down when the walk returns.
+	 *
+	 * ## No slot announcement
+	 *
+	 * A caller who reaches a lot has been PUT there — transferred, or routed by a plan — so the
+	 * person who needs to hear "this call is on 401" is not on this leg. Reading the slot out to the
+	 * parked caller would announce it to the one party it is useless to, and then leave them
+	 * listening to music wondering what the number was for. The slot goes out on `call.parked`, which
+	 * is what a wallboard and the parker's own screen pop read.
+	 */
+	private async parkNode(
+		node: Extract<PlanNode, { kind: "park" }>,
+		input: WalkInput,
+	): Promise<StepResult> {
+		const control = this.deps.control;
+		if (control === undefined) {
+			this.note(
+				`park lot "${node.parkLotId}" was reached but this walk has no call-control runtime; announced and hung up`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+		if (!(await this.ensureAnswered())) {
+			return { kind: "aborted" };
+		}
+
+		const orbit = this.orbitDialedFor(node, input);
+		return orbit === undefined
+			? await this.parkIntoLot(node, control, input)
+			: await this.retrieveFromLot(node, control, orbit);
+	}
+
+	/**
+	 * Which orbit the caller dialled, when they dialled one.
+	 *
+	 * Only the digits that are IN the lot's range count. `*5` with no argument, and an internal
+	 * number that happens to look like a slot in a different lot, both mean "park this call" —
+	 * because a retrieval of a slot this lot does not have is not a retrieval at all.
+	 */
+	private orbitDialedFor(
+		node: Extract<PlanNode, { kind: "park" }>,
+		input: WalkInput,
+	): string | undefined {
+		for (const candidate of [input.featureArgument, input.originalDialedNumber]) {
+			const digits = candidate?.trim();
+			if (digits === undefined || digits === "") {
+				continue;
+			}
+			const slot = Number.parseInt(digits, 10);
+			if (String(slot) === digits && slot >= node.slotStart && slot <= node.slotEnd) {
+				return digits;
+			}
+		}
+		return undefined;
+	}
+
+	private async parkIntoLot(
+		node: Extract<PlanNode, { kind: "park" }>,
+		control: WalkerCallControl,
+		input: WalkInput,
+	): Promise<StepResult> {
+		const requested = input.featureArgument?.trim();
+		const outcome = await control.park({
+			parkLotId: node.parkLotId,
+			...(requested === undefined || requested === "" ? {} : { orbit: requested }),
+			...(node.timeoutSeconds > 0 ? { timeoutMs: node.timeoutSeconds * MILLIS_PER_SECOND } : {}),
+			...(node.mohClass === undefined ? {} : { mohClass: node.mohClass }),
+		});
+
+		if (outcome.ok) {
+			this.note(`parked on orbit ${String(outcome.slot ?? "?")} of lot ${node.parkLotId}`);
+			return { kind: "bridged" };
+		}
+
+		// A lot that cannot take the call is a routing failure with a branch of its own — the same
+		// `timeoutNodeId` a forgotten call takes — because "the lot is full" and "nobody collected it"
+		// both end with the call needing somewhere else to go.
+		this.note(`the call could not be parked: ${outcome.reason ?? "the lot refused it"}`);
+		if (node.timeoutNodeId !== undefined) {
+			return { kind: "goto", nodeId: node.timeoutNodeId };
+		}
+		return await this.announceAndHangup(this.settings.unavailableAnnouncement, "USER_BUSY");
+	}
+
+	private async retrieveFromLot(
+		node: Extract<PlanNode, { kind: "park" }>,
+		control: WalkerCallControl,
+		orbit: string,
+	): Promise<StepResult> {
+		const outcome = await control.unpark({ parkLotId: node.parkLotId, orbit });
+		if (outcome.ok) {
+			this.note(`retrieved the call parked on orbit ${orbit}`);
+			return { kind: "bridged" };
+		}
+		this.note(`orbit ${orbit} could not be retrieved: ${outcome.reason ?? "nothing is parked"}`);
+		return await this.announceAndHangup(this.settings.unavailableAnnouncement, "NO_PICKUP");
 	}
 
 	// -------------------------------------------------------------------------------------------
@@ -2166,7 +2407,9 @@ export class PlanWalker {
 		let last: DialOutcome = { kind: "timeout" };
 
 		for (const [index, attempt] of attempts.entries()) {
-			if (this.deps.channel.isTearingDown) {
+			// `abandoned`, not just `isTearingDown`: a pickup takes the caller away while this loop is
+			// between two members of a ring group, and the leg it takes is still very much alive.
+			if (this.abandoned) {
 				return { kind: "aborted" };
 			}
 			if (attempt.delaySeconds > 0) {
@@ -2437,6 +2680,13 @@ export class PlanWalker {
 		}
 
 		const bridgeId = this.newId();
+		// The last moment before audio starts flowing, which is exactly where a transferred leg's
+		// hold music has to stop. Never fatal: silence is a worse call, a failed bridge is no call.
+		try {
+			await this.deps.beforeBridge?.(bridgeId);
+		} catch (error) {
+			this.log("a pre-bridge hook failed", { bridgeId, err: String(error) });
+		}
 		try {
 			await this.deps.media.createBridge({ bridgeId, name: `call-${this.deps.channel.callId}` });
 			await this.deps.media.addToBridge(bridgeId, [
@@ -2601,6 +2851,19 @@ export class PlanWalker {
 
 	private peerLegIdOf(mediaChannelId: string): string {
 		return this.deps.peerLegId?.(mediaChannelId) ?? this.newId();
+	}
+
+	/**
+	 * Whether there is any point continuing.
+	 *
+	 * Two ways a walk stops mattering, and they are not the same fact. The leg is TEARING DOWN — it
+	 * is going away, and nothing may be done to it. Or the leg has been DETACHED — it is alive and
+	 * well and belongs to somebody else now, because a pickup took the caller over. The second one is
+	 * the dangerous one: everything the walk would do next still succeeds, and every bit of it is
+	 * wrong.
+	 */
+	private get abandoned(): boolean {
+		return this.deps.channel.isTearingDown || this.deps.channel.isDetached;
 	}
 
 	private note(message: string): void {

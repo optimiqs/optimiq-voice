@@ -9,6 +9,8 @@
 import type { BridgeState } from "./bridge";
 import type { CallState } from "./call-state";
 import type { ChannelState } from "./channel-state";
+import type { ParkState } from "./park";
+import type { TransferState } from "./transfer";
 
 /** Base class so a consumer can catch every telephony invariant violation with one `instanceof`. */
 export class TelephonyError extends Error {
@@ -54,6 +56,36 @@ export class InvalidBridgeTransitionError extends TelephonyError {
 
 	constructor(from: BridgeState, to: BridgeState) {
 		super(`Invalid bridge state transition: "${from}" -> "${to}"`);
+		this.from = from;
+		this.to = to;
+	}
+}
+
+/**
+ * A transfer was moved along an edge the machine does not have — completing one that was already
+ * cancelled, or succeeding without first committing to the join.
+ */
+export class InvalidTransferTransitionError extends TelephonyError {
+	readonly from: TransferState;
+	readonly to: TransferState;
+
+	constructor(from: TransferState, to: TransferState) {
+		super(`Invalid transfer state transition: "${from}" -> "${to}"`);
+		this.from = from;
+		this.to = to;
+	}
+}
+
+/**
+ * A parked call was moved along a non-existent edge — retrieving one that has already timed out,
+ * which is exactly the race two extensions dialling one slot produce.
+ */
+export class InvalidParkTransitionError extends TelephonyError {
+	readonly from: ParkState;
+	readonly to: ParkState;
+
+	constructor(from: ParkState, to: ParkState) {
+		super(`Invalid park state transition: "${from}" -> "${to}"`);
 		this.from = from;
 		this.to = to;
 	}

@@ -2,8 +2,10 @@ import type {
 	ConferencePlanNode,
 	ExecutionPlan,
 	ExtensionPlanNode,
+	FeatureCodePlanNode,
 	HangupPlanNode,
 	IvrMenuPlanNode,
+	ParkPlanNode,
 	PlanNode,
 	PlanNodeTable,
 	PlaybackPlanNode,
@@ -154,6 +156,31 @@ export function conferenceNode(
 		maxMembers: 0,
 		waitForModerator: false,
 		recordEnabled: false,
+		...overrides,
+	};
+}
+
+export function parkNode(id: string, overrides: Partial<ParkPlanNode> = {}): ParkPlanNode {
+	return {
+		id,
+		kind: "park",
+		parkLotId: `lot-${id}`,
+		slotStart: 401,
+		slotEnd: 403,
+		timeoutSeconds: 120,
+		...overrides,
+	};
+}
+
+export function featureCodeNode(
+	id: string,
+	overrides: Partial<FeatureCodePlanNode> & Pick<FeatureCodePlanNode, "action">,
+): FeatureCodePlanNode {
+	return {
+		id,
+		kind: "feature-code",
+		featureCodeId: `fc-${id}`,
+		code: "*8",
 		...overrides,
 	};
 }

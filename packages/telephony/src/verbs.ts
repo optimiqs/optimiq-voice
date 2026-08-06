@@ -531,6 +531,11 @@ export const MEDIA_PATH_VERBS = [
 	"streamGather",
 	"hold",
 	"unhold",
+	// Parking a leg that has not answered would put a ringing caller in an orbit slot with music
+	// nobody can hear and a timeout nobody is waiting on; retrieving onto one would join a live
+	// caller to a phone that has not picked up. Both are the media-path invariant, not a new rule.
+	"park",
+	"unpark",
 ] as const satisfies readonly VerbName[];
 
 /**

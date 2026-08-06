@@ -143,11 +143,80 @@ describe("call events", () => {
 		expect(callEventSchema.parse(JSON.parse(JSON.stringify(event)))).toEqual(event);
 	});
 
+	it("bounds a park with the slot somebody dials to collect it", () => {
+		const lot = createEntityId();
+		const parked = makeCallEvent("call.parked", {
+			orgId: ORG,
+			callId: CALL,
+			source: "engine",
+			data: { legId: LEG, parkLotId: lot, slot: "401", timeoutMs: 120_000, mohClass: "default" },
+		});
+		const unparked = makeCallEvent("call.unparked", {
+			orgId: ORG,
+			callId: CALL,
+			source: "engine",
+			data: {
+				legId: LEG,
+				parkLotId: lot,
+				slot: "401",
+				reason: "retrieved",
+				retrievedByLegId: createEntityId(),
+				durationMs: 8_000,
+			},
+		});
+		expect(callEventSchema.parse(parked)).toEqual(parked);
+		expect(callEventSchema.parse(unparked)).toEqual(unparked);
+	});
+
+	it("names the transferee as the transfer's own leg, and both other parties beside it", () => {
+		const event = makeCallEvent("call.transferred", {
+			orgId: ORG,
+			callId: CALL,
+			source: "engine",
+			data: {
+				legId: LEG,
+				kind: "attended",
+				destination: "1002",
+				routingContext: "internal",
+				transferorLegId: createEntityId(),
+				targetLegId: createEntityId(),
+			},
+		});
+		expect(callEventSchema.parse(event)).toEqual(event);
+	});
+
+	it("records a pickup as the picker, the caller taken over, and the phone left ringing", () => {
+		const event = makeCallEvent("call.picked-up", {
+			orgId: ORG,
+			callId: CALL,
+			source: "engine",
+			data: {
+				legId: LEG,
+				pickedUpLegId: createEntityId(),
+				kind: "directed",
+				extension: "200",
+				abandonedLegId: createEntityId(),
+			},
+		});
+		expect(callEventSchema.parse(event)).toEqual(event);
+	});
+
 	it.each([
 		[
 			"an unknown bridge mode",
 			"channel.bridged",
 			{ legId: LEG, peerLegId: LEG, bridgeId: LEG, mode: "telepathy" },
+		],
+		[
+			"a park that ended for a reason the vocabulary does not have",
+			"call.unparked",
+			{ legId: LEG, parkLotId: LEG, slot: "401", reason: "forgotten" },
+		],
+		["a transfer of an unknown kind", "call.transferred", { legId: LEG, kind: "warm" }],
+		[
+			"a pickup with no extension",
+			"call.picked-up",
+			{ legId: LEG, pickedUpLegId: LEG, kind: "group" },
 		],
 		[
 			"a two-character DTMF digit",

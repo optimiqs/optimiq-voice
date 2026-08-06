@@ -1,6 +1,7 @@
 import type {
 	BridgeHandle,
 	CreateBridgeRequest,
+	MediaDirection,
 	MediaPort,
 	OriginateRequest,
 	OriginatedChannel,
@@ -8,6 +9,8 @@ import type {
 	PlayRequest,
 	RecordRequest,
 	RecordingHandle,
+	SendDtmfRequest,
+	SnoopRequest,
 } from "./media-port";
 import type { HangupCause } from "@optimiq-voice/telephony";
 
@@ -51,6 +54,14 @@ export interface FakeMediaPortOptions {
 	 */
 	readonly onRecord?: (channelId: string, request: RecordRequest) => void;
 	/**
+	 * Called after a successful `snoop`, so a spec can deliver the tap's `StasisStart`.
+	 *
+	 * Synchronous for the same reason as {@link onOriginate}: a tap on a local channel reaches the
+	 * application before the HTTP response does, and the recording runtime subscribes first.
+	 */
+	readonly onSnoop?: (request: SnoopRequest) => void;
+	readonly snoopFails?: boolean;
+	/**
 	 * Called after `answer`, so a spec can deliver the `Up` state change a real media server sends.
 	 *
 	 * `answer` is a REQUEST: the leg only gains a media path when the far end's `200 OK` has been
@@ -60,6 +71,8 @@ export interface FakeMediaPortOptions {
 	readonly onAnswer?: (channelId: string) => void;
 	readonly bridgeFails?: boolean;
 	readonly recordFails?: boolean;
+	/** Makes the music class unavailable, which every hold path has to survive. */
+	readonly musicOnHoldFails?: boolean;
 }
 
 export interface FakeMediaPort extends MediaPort {
@@ -161,9 +174,36 @@ export function makeFakeMediaPort(options: FakeMediaPortOptions = {}): FakeMedia
 		},
 		startMusicOnHold: async (channelId: string, mohClass?: string): Promise<void> => {
 			record("startMusicOnHold", channelId, mohClass);
+			if (options.musicOnHoldFails === true) {
+				throw new Error("no such music class");
+			}
 		},
 		stopMusicOnHold: async (channelId: string): Promise<void> => {
 			record("stopMusicOnHold", channelId);
+		},
+
+		hold: async (channelId: string): Promise<void> => {
+			record("hold", channelId);
+		},
+		unhold: async (channelId: string): Promise<void> => {
+			record("unhold", channelId);
+		},
+		mute: async (channelId: string, direction: MediaDirection): Promise<void> => {
+			record("mute", channelId, direction);
+		},
+		unmute: async (channelId: string, direction: MediaDirection): Promise<void> => {
+			record("unmute", channelId, direction);
+		},
+		sendDtmf: async (channelId: string, request: SendDtmfRequest): Promise<void> => {
+			record("sendDtmf", channelId, request);
+		},
+		snoop: async (request: SnoopRequest): Promise<OriginatedChannel> => {
+			record("snoop", request);
+			if (options.snoopFails === true) {
+				throw new Error("snoop refused");
+			}
+			options.onSnoop?.(request);
+			return { channelId: request.snoopChannelId, name: `Snoop/${request.channelId}` };
 		},
 	};
 

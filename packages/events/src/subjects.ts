@@ -82,6 +82,38 @@ export const CALL_EVENTS = [
 	/** A conference participant left. The pair bounds a participant's time in the room. */
 	"conference.left",
 	/**
+	 * A call was placed in a park lot's orbit slot.
+	 *
+	 * Not `channel.held` with extra fields: a held call is still somebody's call and cannot be
+	 * collected by anybody else, whereas a parked one is addressable by slot number from every
+	 * phone in the building. That is the fact a wallboard renders and a "who is on 401?" question
+	 * is answered from.
+	 */
+	"call.parked",
+	/**
+	 * A call left its orbit slot, with the reason it left.
+	 *
+	 * `retrieved`, `timeout` and `abandoned` are the whole point — see `parkEndReasonSchema`. The
+	 * pair with `call.parked` bounds a call's time in the lot.
+	 */
+	"call.unparked",
+	/**
+	 * A call was handed to a new party.
+	 *
+	 * Published when the transfer COMPLETES, not when it is requested: an attended transfer that
+	 * the transferor cancels never happened as far as anybody downstream is concerned, and
+	 * publishing the request would put a transfer in the report for every consultation.
+	 */
+	"call.transferred",
+	/**
+	 * A ringing call was answered from a different extension.
+	 *
+	 * Distinct from `channel.answered` because two legs are involved and the interesting one is the
+	 * leg that did NOT answer: it is hung up with `PICKED_OFF` (805) rather than `NO_ANSWER`, and
+	 * without this event the only evidence a pickup happened is that pairing.
+	 */
+	"call.picked-up",
+	/**
 	 * An emergency call was originated. **This is the Kari's Law notification seam.**
 	 *
 	 * 47 U.S.C. §623(b) requires an MLTS to notify a central location — a front desk, a security

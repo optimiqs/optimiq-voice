@@ -15,6 +15,7 @@ import { QueueCursors, QueuePositions } from "../queue/queue-registry";
 import { CallSignalBus, legSignalKey, recordingSignalKey } from "../routing/call-signals";
 import { ConferenceRegistry } from "../routing/conference-registry";
 import { DidIndexSource } from "../routing/did-index.source";
+import { ParkRegistry } from "../routing/park-registry";
 import { PlanWalker } from "../routing/plan-walker";
 import { RoutingArtifactSource } from "../routing/routing-artifact.source";
 import { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
@@ -27,6 +28,8 @@ import {
 	hangupCauseFromAri,
 	hangupSideFor,
 } from "./ari-mapping";
+import { CallControl } from "./call-control";
+import { CallControlRegistry } from "./call-control-registry";
 import { buildCdrLegWrite } from "./cdr-leg";
 import { ChannelAggregate } from "./channel-aggregate";
 import { callIdForAriChannel, legIdForAriChannel, resolveOrganizationId } from "./channel-identity";
@@ -38,12 +41,26 @@ import type {
 	OriginatedLegHooks,
 	PlanWalkerSettings,
 	VoicemailPort,
+	WalkerCallControl,
 	WalkerChannel,
 } from "../routing/plan-walker";
 import type { VerbChannelContext, VerbExecutorRuntime } from "../verbs/verb-executor";
+import type {
+	CallControlHost,
+	ControlledLeg,
+	ParkLot,
+	PickupCandidate,
+	RouteOutcome,
+	RouteRequest,
+} from "./call-control";
 import type { CallDirection, CallEvent, LegSide } from "@optimiq-voice/events";
 import type { AriChannel, AriEvent } from "@optimiq-voice/media-ari";
-import type { ResolvedRoute, RoutingArtifact } from "@optimiq-voice/routing";
+import type {
+	ExecutionPlan,
+	ParkPlanNode,
+	ResolvedRoute,
+	RoutingArtifact,
+} from "@optimiq-voice/routing";
 import type { CallerProfile, HangupCause, Verb, VerbResult } from "@optimiq-voice/telephony";
 
 /** Channel variables the routing walk writes back, so the KV mirror carries the decision too. */
@@ -106,6 +123,8 @@ export class ChannelOrchestrator {
 	/** Detached routing walks, so the drain and the integration suite can await settlement. */
 	private readonly walks = new Map<string, Promise<void>>();
 	private draining = false;
+	/** Hold, transfer, park, pickup and on-demand recording, over the ports below. */
+	private readonly control: CallControl;
 
 	constructor(
 		@Inject(ENGINE_ENV) private readonly env: EngineEnv,
@@ -124,7 +143,29 @@ export class ChannelOrchestrator {
 		private readonly queueEvents: QueueEventPublisher,
 		private readonly queuePositions: QueuePositions,
 		private readonly queueCursors: QueueCursors,
-	) {}
+		private readonly parks: ParkRegistry,
+		private readonly callControl: CallControlRegistry,
+	) {
+		this.control = new CallControl({
+			media: this.media,
+			signals: this.signals,
+			parks: this.parks,
+			host: this.callControlHost(),
+			settings: {
+				application: this.env.ARI_APP,
+				recordingFormat: this.env.ENGINE_RECORDING_FORMAT,
+			},
+			log: (message, detail) => {
+				this.logger.info(detail ?? {}, message);
+			},
+		});
+		// Published rather than injected, because the verb executor's runtime is built BEFORE this
+		// class and reads the binding lazily. See `call-control-registry.ts` for the cycle.
+		this.callControl.register({
+			port: this.control,
+			legFor: (mediaChannelId) => this.controlledLegFor(mediaChannelId),
+		});
+	}
 
 	/** Live legs this instance is handling. `/healthz` and the drain both read it. */
 	get activeChannelCount(): number {
@@ -191,6 +232,12 @@ export class ChannelOrchestrator {
 				return;
 			case "ChannelVarset":
 				this.onVarset(event.channel, event.variable, event.value);
+				return;
+			case "ChannelHold":
+				await this.onPhoneHold(event.channel, true, event.musicClass);
+				return;
+			case "ChannelUnhold":
+				await this.onPhoneHold(event.channel, false);
 				return;
 			case "RecordingStarted":
 				this.signals.emit(recordingSignalKey(event.recording.name), {
@@ -524,32 +571,7 @@ export class ChannelOrchestrator {
 			"resolved a route",
 		);
 
-		const walker = new PlanWalker({
-			media: this.media,
-			signals: this.signals,
-			channel: walkerChannelFor(aggregate),
-			execute: (verb) => this.execute(aggregate, verb),
-			publish: (type, data) => this.publishCallEvent(aggregate, type, data),
-			settings: this.walkerSettings(),
-			peerLegId: legIdForAriChannel,
-			legs: this.legHooksFor(aggregate),
-			voicemail: this.voicemailPortFor(aggregate),
-			mailbox: this.mailbox,
-			// The ACD plane, passed as a bundle rather than five constructor arguments to the walker:
-			// a queue node needs all five or none of them, and a walk that had four would fail in the
-			// middle of somebody's hold music rather than at construction.
-			conferences: this.conferences,
-			queue: {
-				membership: this.queueMembership,
-				agents: this.agentState,
-				events: this.queueEvents,
-				positions: this.queuePositions,
-				cursor: this.queueCursors,
-			},
-			log: (message, detail) => {
-				this.logger.info({ channelId: aggregate.channelId, ...detail }, message);
-			},
-		});
+		const walker = this.walkerFor(aggregate);
 
 		const outcome = await walker.walk({
 			plan: route.plan,
@@ -590,6 +612,352 @@ export class ChannelOrchestrator {
 			},
 			"the routing walk finished",
 		);
+	}
+
+	/**
+	 * Builds a plan walker over this leg.
+	 *
+	 * One factory, two callers: the inbound routing walk, and every re-route a call-control feature
+	 * asks for — a blind transfer's destination, an attended transfer's consultation, a park
+	 * timeout's ringback. They MUST be the same walker: that is what makes a transferred call produce
+	 * the same B-leg CDR, the same `channel.bridged` and the same failover branches as a call that
+	 * arrived at the destination the ordinary way. Two walkers would be two behaviours, and the
+	 * second one would be discovered from a support ticket.
+	 */
+	private walkerFor(
+		aggregate: ChannelAggregate,
+		extra: { readonly beforeBridge?: (bridgeId: string) => Promise<void> } = {},
+	): PlanWalker {
+		return new PlanWalker({
+			media: this.media,
+			signals: this.signals,
+			channel: walkerChannelFor(aggregate),
+			execute: (verb) => this.execute(aggregate, verb),
+			publish: (type, data) => this.publishCallEvent(aggregate, type, data),
+			settings: this.walkerSettings(),
+			peerLegId: legIdForAriChannel,
+			legs: this.legHooksFor(aggregate),
+			voicemail: this.voicemailPortFor(aggregate),
+			mailbox: this.mailbox,
+			// The ACD plane, passed as a bundle rather than five constructor arguments to the walker:
+			// a queue node needs all five or none of them, and a walk that had four would fail in the
+			// middle of somebody's hold music rather than at construction.
+			conferences: this.conferences,
+			queue: {
+				membership: this.queueMembership,
+				agents: this.agentState,
+				events: this.queueEvents,
+				positions: this.queuePositions,
+				cursor: this.queueCursors,
+			},
+			control: this.walkerCallControlFor(aggregate),
+			...(extra.beforeBridge === undefined ? {} : { beforeBridge: extra.beforeBridge }),
+			log: (message, detail) => {
+				this.logger.info({ channelId: aggregate.channelId, ...detail }, message);
+			},
+		});
+	}
+
+	// -------------------------------------------------------------------------------------------
+	// Call control
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * The call-control runtime's view of one leg.
+	 *
+	 * Getters throughout, for the reason {@link walkerChannelFor}'s are: a parked call sits in its
+	 * orbit for minutes, and every one of these values can change underneath it.
+	 *
+	 * `peerMediaChannelId` is derived from the bridge-peer VARIABLE rather than from a live bridge
+	 * lookup, because that variable is the one thing written on both legs at bridge time and it is
+	 * what survives into the KV snapshot a failover reads.
+	 */
+	private controlledLegFor(mediaChannelId: string): ControlledLeg | undefined {
+		const aggregate = this.registry.byAriChannelId(mediaChannelId);
+		return aggregate === undefined ? undefined : this.controlledLeg(aggregate);
+	}
+
+	private controlledLeg(aggregate: ChannelAggregate): ControlledLeg {
+		const registry = this.registry;
+		return {
+			mediaChannelId: aggregate.ariChannelId,
+			legId: aggregate.channelId,
+			callId: aggregate.callId,
+			organizationId: aggregate.organizationId,
+			get isTearingDown(): boolean {
+				return aggregate.isTearingDown;
+			},
+			get isAnswered(): boolean {
+				return aggregate.isAnswered;
+			},
+			get bridgeId(): string | undefined {
+				return aggregate.snapshot.bridgeId;
+			},
+			get peerMediaChannelId(): string | undefined {
+				const peerLegId = aggregate.snapshot.variables[BRIDGE_PEER_VARIABLE];
+				return peerLegId === undefined
+					? undefined
+					: registry.byDomainChannelId(peerLegId)?.ariChannelId;
+			},
+			get callerIdNumber(): string | undefined {
+				return aggregate.snapshot.profile.callerIdNumber;
+			},
+			get callerIdName(): string | undefined {
+				return aggregate.snapshot.profile.callerIdName;
+			},
+			get destinationNumber(): string | undefined {
+				return aggregate.snapshot.profile.destinationNumber;
+			},
+			moveTo: (state) => aggregate.tryTransitionTo(state),
+			moveCallStateTo: (state) => aggregate.tryCallStateTo(state),
+			setBridge: (bridgeId) => {
+				aggregate.setBridge(bridgeId);
+			},
+			setBridgePeer: (peerLegId) => {
+				if (peerLegId === undefined) {
+					aggregate.clearVariable(BRIDGE_PEER_VARIABLE);
+				} else {
+					aggregate.setVariable(BRIDGE_PEER_VARIABLE, peerLegId);
+				}
+				void this.jetstream.putChannel(aggregate.snapshot);
+			},
+			addFlag: (flag) => {
+				aggregate.addFlag(flag);
+			},
+			removeFlag: (flag) => {
+				aggregate.removeFlag(flag);
+			},
+			markHangup: (cause) => {
+				aggregate.markHangup({ cause, at: Date.now(), initiatedByEngine: true });
+			},
+			detach: () => {
+				aggregate.detach();
+			},
+		};
+	}
+
+	/** Everything the call-control runtime needs that only this class can answer. */
+	private callControlHost(): CallControlHost {
+		return {
+			legFor: (mediaChannelId) => this.controlledLegFor(mediaChannelId),
+			ringingFor: (leg, extension) => this.ringingCandidates(leg, extension),
+			publish: async (leg, type, data) => {
+				const aggregate = this.registry.byDomainChannelId(leg.legId);
+				if (aggregate === undefined) {
+					return;
+				}
+				await this.publishCallEvent(aggregate, type, data);
+			},
+			route: async (leg, request) => await this.routeLeg(leg, request),
+			parkLotFor: async (leg, lotRef) => await this.parkLotFor(leg, lotRef),
+			parkLotForSlot: async (leg, slot) => await this.parkLotForSlot(leg, slot),
+		};
+	}
+
+	/** The narrow slice of call control a plan node can reach, bound to the leg being walked. */
+	private walkerCallControlFor(aggregate: ChannelAggregate): WalkerCallControl {
+		const leg = this.controlledLeg(aggregate);
+		return {
+			park: async (request) => {
+				const outcome = await this.control.park(leg, {
+					lot: request.parkLotId,
+					...(request.orbit === undefined ? {} : { orbit: request.orbit }),
+					...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
+					...(request.mohClass === undefined ? {} : { musicOnHold: request.mohClass }),
+				});
+				return {
+					ok: outcome.result.ok,
+					...(outcome.slot === undefined ? {} : { slot: outcome.slot }),
+					...(outcome.result.ok ? {} : { reason: outcome.result.reason }),
+				};
+			},
+			unpark: async (request) => {
+				const result = await this.control.unpark(leg, {
+					lot: request.parkLotId,
+					orbit: request.orbit,
+				});
+				return result.ok ? { ok: true } : { ok: false, reason: result.reason };
+			},
+			pickup: async (request) => {
+				const result = await this.control.pickup(leg, {
+					kind: request.kind,
+					extension: request.extension,
+				});
+				return result.ok ? { ok: true } : { ok: false, reason: result.reason };
+			},
+		};
+	}
+
+	/**
+	 * Re-resolves a destination for a leg that is already up, and walks the plan it produces.
+	 *
+	 * The transfer context is `internal` and nothing else by default. A transfer destination that
+	 * resolved in `outbound` would turn every phone with a transfer key into a way to dial anywhere
+	 * on the tenant's account — the toll-fraud boundary the three separate match tables exist to
+	 * hold, given away by a feature.
+	 *
+	 * An internal destination that matches nothing does NOT fall through to outbound here, which is
+	 * the one place this deliberately differs from {@link resolveRoute}: an inbound caller dialling
+	 * an unknown extension is a routing question, and a transfer to an unknown extension is a
+	 * mistake somebody made on a keypad while holding a live call.
+	 */
+	private async routeLeg(leg: ControlledLeg, request: RouteRequest): Promise<RouteOutcome> {
+		const aggregate = this.registry.byDomainChannelId(leg.legId);
+		if (aggregate === undefined) {
+			return { status: "unresolved", notes: ["this engine is no longer handling the leg"] };
+		}
+
+		const artifact = await this.routing.get(aggregate.organizationId);
+		if (artifact === undefined) {
+			return {
+				status: "unresolved",
+				notes: [`no routing artifact for organization ${aggregate.organizationId}`],
+			};
+		}
+
+		const context = request.context ?? "internal";
+		const from = request.callerIdNumber ?? aggregate.snapshot.profile.callerIdNumber ?? "";
+		const now = new Date();
+		const resolved =
+			context === "outbound"
+				? resolveOutbound(artifact, { from, dialed: request.destination, now })
+				: resolveInternal(artifact, { from, dialed: request.destination, now });
+
+		if (resolved.plan === undefined || !resolved.matched) {
+			return {
+				status: "unresolved",
+				notes: [resolved.reason ?? `nothing matched ${request.destination} in ${context}`],
+			};
+		}
+
+		// The walker's hook takes a bridge id it has no use for; the caller's takes none. Adapted here
+		// rather than widening the caller's contract with an argument no call-control operation reads.
+		const beforeBridge = request.beforeBridge;
+		const outcome = await this.walkerFor(
+			aggregate,
+			beforeBridge === undefined ? {} : { beforeBridge: async () => await beforeBridge() },
+		).walk({
+			plan: resolved.plan as ExecutionPlan,
+			timeConditions: artifact.timeConditions,
+			now,
+			// The digits that were dialled, so a park lot on the far side can tell a retrieval from a
+			// park exactly as it would for a caller who dialled them.
+			originalDialedNumber: request.destination,
+			...(resolved.dialedNumber === undefined ? {} : { dialedNumber: resolved.dialedNumber }),
+			...(request.callerIdNumber === undefined ? {} : { callerIdNumber: request.callerIdNumber }),
+			...(request.callerIdName === undefined ? {} : { callerIdName: request.callerIdName }),
+			...(resolved.featureArgument === undefined
+				? {}
+				: { featureArgument: resolved.featureArgument }),
+			mailboxes: artifact.internal.mailboxes,
+		});
+
+		if (outcome.destination !== undefined) {
+			// The transferred leg's CDR must say where it ENDED UP, not where it was going when the
+			// transfer took it.
+			aggregate.setVariable(DESTINATION_TYPE_VARIABLE, outcome.destination.destinationType);
+			if (outcome.destination.destinationRef !== undefined) {
+				aggregate.setVariable(DESTINATION_REF_VARIABLE, outcome.destination.destinationRef);
+			}
+			await this.jetstream.putChannel(aggregate.snapshot);
+		}
+
+		return {
+			status: outcome.status,
+			...(outcome.hangupCause === undefined ? {} : { cause: outcome.hangupCause }),
+			notes: outcome.notes,
+		};
+	}
+
+	/**
+	 * Phones this instance currently has ringing for an extension.
+	 *
+	 * A B-leg is what rings: the switch dialled it on behalf of somebody, and that somebody is its
+	 * `OPTIMIQ_ORIGINATING_LEG_ID`. A candidate with no live originator is skipped rather than
+	 * offered — picking one up would connect the picker to nobody.
+	 *
+	 * ## Group pickup is org-wide, and that is a stated limitation
+	 *
+	 * `*8` should take whatever is ringing in the caller's own PICKUP GROUP, and the artifact carries
+	 * no pickup-group membership: `extension.pickup_group` is not compiled into it. So a group pickup
+	 * here answers whatever is ringing in the organization, longest-ringing first. On a small tenant
+	 * that is the same answer; on a large one it is too broad, and it is recorded here rather than in
+	 * a ticket because the failure is a receptionist answering the warehouse's call, which reads as a
+	 * phone-system bug and is not one.
+	 */
+	private ringingCandidates(leg: ControlledLeg, extension: string): readonly PickupCandidate[] {
+		const wanted = extension.trim();
+		const candidates: PickupCandidate[] = [];
+
+		for (const aggregate of this.registry.all) {
+			if (
+				aggregate.organizationId !== leg.organizationId ||
+				aggregate.isTearingDown ||
+				aggregate.snapshot.variables.OPTIMIQ_LEG !== "b" ||
+				aggregate.isAnswered
+			) {
+				continue;
+			}
+			if (wanted !== "" && aggregate.snapshot.profile.destinationNumber !== wanted) {
+				continue;
+			}
+			const originatorLegId = aggregate.snapshot.variables.OPTIMIQ_ORIGINATING_LEG_ID;
+			const caller =
+				originatorLegId === undefined
+					? undefined
+					: this.registry.byDomainChannelId(originatorLegId);
+			if (caller === undefined || caller.isTearingDown || caller.isDetached) {
+				continue;
+			}
+			candidates.push({
+				ringingLeg: this.controlledLeg(aggregate),
+				callerLeg: this.controlledLeg(caller),
+				ringingSinceMs: aggregate.snapshot.createdAt,
+			});
+		}
+
+		return candidates.sort((left, right) => left.ringingSinceMs - right.ringingSinceMs);
+	}
+
+	/** The lot a park should use: the one named, or the organization's only one. */
+	private async parkLotFor(leg: ControlledLeg, lotRef?: string): Promise<ParkLot | undefined> {
+		const lots = await this.parkLots(leg);
+		if (lotRef !== undefined && lotRef.trim() !== "") {
+			return lots.find((lot) => lot.parkLotId === lotRef.trim());
+		}
+		// With several lots and no name there is no defensible default: parking a call in the wrong
+		// lot puts it on a slot number nobody is going to dial.
+		return lots.length === 1 ? lots[0] : undefined;
+	}
+
+	private async parkLotForSlot(leg: ControlledLeg, slot: number): Promise<ParkLot | undefined> {
+		const lots = await this.parkLots(leg);
+		return lots.find((lot) => slot >= lot.slotStart && slot <= lot.slotEnd);
+	}
+
+	/**
+	 * The organization's park lots, from the compiled artifact.
+	 *
+	 * The RANGE comes from `internal.parkSlots` (which is what makes a dialled slot resolve) and the
+	 * timeout and music come from the `park` plan node the range points at. Both halves are needed:
+	 * a lot with a range and no timeout would hold a forgotten call until the process restarted.
+	 */
+	private async parkLots(leg: ControlledLeg): Promise<readonly ParkLot[]> {
+		const artifact = await this.routing.get(leg.organizationId);
+		if (artifact === undefined) {
+			return [];
+		}
+		return artifact.internal.parkSlots.map((range) => {
+			const node = artifact.nodes[range.nodeId];
+			const park = node?.kind === "park" ? (node as ParkPlanNode) : undefined;
+			return {
+				parkLotId: range.parkLotId,
+				slotStart: range.slotStart,
+				slotEnd: range.slotEnd,
+				...(park?.timeoutSeconds === undefined ? {} : { timeoutSeconds: park.timeoutSeconds }),
+				...(park?.mohClass === undefined ? {} : { mohClass: park.mohClass }),
+			};
+		});
 	}
 
 	/**
@@ -988,6 +1356,74 @@ export class ChannelOrchestrator {
 		}
 	}
 
+	/**
+	 * The phone at one end pressed hold.
+	 *
+	 * This is the OTHER half of hold, and the half that actually happens on a real PBX: an agent
+	 * presses the key on their desk phone, the phone re-INVITEs with `sendonly`, and the engine finds
+	 * out from an ARI event rather than from a verb. The person who needs music is the FAR END — the
+	 * caller, who would otherwise hear nothing at all and conclude the call had dropped.
+	 *
+	 * So the engine plays music at the peer rather than at the leg the event is about, and publishes
+	 * `channel.held` naming the peer, because the peer is the party a BLF subscriber and a wallboard
+	 * see as held. The leg that pressed hold is not on hold; it is holding.
+	 *
+	 * Best-effort throughout: a music class that will not start leaves a caller in silence, which is
+	 * a worse call and a much better outcome than an exception on the ARI socket.
+	 */
+	private async onPhoneHold(
+		channel: AriChannel,
+		held: boolean,
+		musicClass?: string,
+	): Promise<void> {
+		const aggregate = this.registry.byAriChannelId(channel.id);
+		if (aggregate === undefined || aggregate.isTearingDown) {
+			return;
+		}
+		const peerLegId = aggregate.snapshot.variables[BRIDGE_PEER_VARIABLE];
+		const peer = peerLegId === undefined ? undefined : this.registry.byDomainChannelId(peerLegId);
+
+		if (held) {
+			aggregate.addFlag("hold");
+		} else {
+			aggregate.removeFlag("hold");
+		}
+
+		if (peer !== undefined && !peer.isTearingDown) {
+			try {
+				if (held) {
+					await this.media.startMusicOnHold(peer.ariChannelId, musicClass);
+				} else {
+					await this.media.stopMusicOnHold(peer.ariChannelId);
+				}
+			} catch (error) {
+				this.logger.warn(
+					{ ariChannelId: peer.ariChannelId, held, err: String(error) },
+					"could not move the far end's hold music",
+				);
+			}
+			// `held → unheld → active`: the transient state is what lets a watcher tell "resumed" from
+			// "was never held", and the machine refuses to skip it.
+			if (held) {
+				peer.tryCallStateTo("held");
+			} else {
+				peer.tryCallStateTo("unheld");
+				peer.tryCallStateTo("active");
+			}
+			await this.events.publish(held ? "channel.held" : "channel.unheld", {
+				orgId: peer.organizationId,
+				callId: peer.callId,
+				data: {
+					legId: peer.channelId,
+					...(held && musicClass !== undefined ? { mohClass: musicClass } : {}),
+				} as never,
+			});
+			await this.jetstream.putChannel(peer.snapshot);
+		}
+
+		await this.jetstream.putChannel(aggregate.snapshot);
+	}
+
 	private onVarset(channel: AriChannel | undefined, variable: string, value: string): void {
 		if (channel === undefined) {
 			return;
@@ -1049,6 +1485,18 @@ export class ChannelOrchestrator {
 		const aggregate = this.registry.byAriChannelId(channel.id);
 		if (aggregate === undefined) {
 			return;
+		}
+
+		// BEFORE the cause is fixed and before the CDR is written, because two of these change what
+		// the record says: completing an attended transfer fixes this leg's cause as
+		// `ATTENDED_TRANSFER`, and stopping a recording is what puts an object key behind the call.
+		try {
+			await this.control.onLegEnded(channel.id);
+		} catch (error) {
+			this.logger.warn(
+				{ ariChannelId: channel.id, err: String(error) },
+				"a call-control operation could not be released cleanly",
+			);
 		}
 
 		const at = Date.now();
@@ -1199,6 +1647,10 @@ export class ChannelOrchestrator {
 		// Every walk is waiting on a signal that will never come once the calls are gone. Dropping
 		// the waiters lets the timers fire and the walks settle instead of holding the drain open.
 		this.signals.clear();
+		// Park timeouts and consultation watchers are the same problem one layer up: a lot's ringback
+		// timer would otherwise fire during the drain and route a call on an instance that is leaving.
+		this.control.clear();
+		this.parks.clear();
 
 		const deadline = Date.now() + timeoutMs;
 		while (this.registry.size > 0 && Date.now() < deadline) {
@@ -1296,6 +1748,9 @@ function walkerChannelFor(aggregate: ChannelAggregate): WalkerChannel {
 		organizationId: aggregate.organizationId,
 		get isTearingDown(): boolean {
 			return aggregate.isTearingDown;
+		},
+		get isDetached(): boolean {
+			return aggregate.isDetached;
 		},
 		get isAnswered(): boolean {
 			return aggregate.isAnswered;

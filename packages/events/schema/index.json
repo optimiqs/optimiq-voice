@@ -120,6 +120,34 @@
 		},
 		{
 			"family": "call",
+			"type": "call.parked",
+			"subject": "calls.evt.v1.<orgId>.<callId>.call.parked",
+			"dataSchema": "events/call.call.parked.schema.json",
+			"goType": "CallParkedData"
+		},
+		{
+			"family": "call",
+			"type": "call.unparked",
+			"subject": "calls.evt.v1.<orgId>.<callId>.call.unparked",
+			"dataSchema": "events/call.call.unparked.schema.json",
+			"goType": "CallUnparkedData"
+		},
+		{
+			"family": "call",
+			"type": "call.transferred",
+			"subject": "calls.evt.v1.<orgId>.<callId>.call.transferred",
+			"dataSchema": "events/call.call.transferred.schema.json",
+			"goType": "CallTransferredData"
+		},
+		{
+			"family": "call",
+			"type": "call.picked-up",
+			"subject": "calls.evt.v1.<orgId>.<callId>.call.picked-up",
+			"dataSchema": "events/call.call.picked-up.schema.json",
+			"goType": "CallPickedUpData"
+		},
+		{
+			"family": "call",
 			"type": "call.emergency.dialed",
 			"subject": "calls.evt.v1.<orgId>.<callId>.call.emergency.dialed",
 			"dataSchema": "events/call.call.emergency.dialed.schema.json",

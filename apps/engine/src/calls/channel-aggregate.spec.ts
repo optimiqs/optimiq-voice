@@ -165,6 +165,34 @@ describe("flags and variables", () => {
 		aggregate.setBridge(undefined);
 		expect(aggregate.snapshot.bridgeId).toBeUndefined();
 	});
+
+	it("forgets a variable outright rather than blanking it", () => {
+		const aggregate = makeAggregate();
+		aggregate.setVariable("OPTIMIQ_BRIDGE_PEER_LEG_ID", "leg-2");
+		aggregate.clearVariable("OPTIMIQ_BRIDGE_PEER_LEG_ID");
+		// An empty string would be read as a leg id by the teardown path; the key has to be gone.
+		expect("OPTIMIQ_BRIDGE_PEER_LEG_ID" in aggregate.snapshot.variables).toBe(false);
+		expect(() => {
+			aggregate.clearVariable("NEVER_SET");
+		}).not.toThrow();
+	});
+});
+
+describe("detaching from a routing walk", () => {
+	it("starts attached and is one-way once a feature takes the leg over", () => {
+		const aggregate = makeAggregate();
+		expect(aggregate.isDetached).toBe(false);
+		aggregate.detach();
+		aggregate.detach();
+		expect(aggregate.isDetached).toBe(true);
+	});
+
+	it("is NOT a teardown — the leg is alive, it is the walk that is over", () => {
+		const aggregate = makeAggregate();
+		aggregate.detach();
+		expect(aggregate.isTearingDown).toBe(false);
+		expect(aggregate.snapshot.hangupCause).toBeUndefined();
+	});
 });
 
 describe("the snapshot", () => {

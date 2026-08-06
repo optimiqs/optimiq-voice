@@ -80,6 +80,7 @@ function caller(options: CallerOptions) {
 		organizationId: ORG_ID,
 		callerIdNumber: "+15551234567",
 		callerIdName: "Ada",
+		isDetached: false,
 		get isTearingDown(): boolean {
 			return state.tearingDown;
 		},
@@ -268,6 +269,7 @@ describe("a conference with no PIN", () => {
 				callId: CALL_ID,
 				organizationId: ORG_ID,
 				isTearingDown: false,
+				isDetached: false,
 				isAnswered: true,
 				moveTo: () => true,
 				setBridge: () => undefined,

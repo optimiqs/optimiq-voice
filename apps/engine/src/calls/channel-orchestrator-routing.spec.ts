@@ -5,8 +5,10 @@ import { makeFakeMediaPort } from "../ari/media-port.fake";
 import { fakeQueueOrchestratorArgs } from "../queue/queue-services.fake";
 import { CallSignalBus, legSignalKey } from "../routing/call-signals";
 import { ConferenceRegistry } from "../routing/conference-registry";
+import { ParkRegistry } from "../routing/park-registry";
 import { DtmfRegistry } from "../verbs/dtmf-registry";
 import { makeVerbExecutorRuntime } from "../verbs/verb-executor";
+import { CallControlRegistry } from "./call-control-registry";
 import { ChannelOrchestrator } from "./channel-orchestrator.service";
 import type { EngineEnv } from "../config/engine-env";
 import type { CallEventPublisher } from "../nats/call-event-publisher.service";
@@ -214,6 +216,8 @@ function harness(options: HarnessOptions = {}) {
 		signals,
 		new ConferenceRegistry(),
 		...(fakeQueueOrchestratorArgs() as [never, never, never, never, never]),
+		new ParkRegistry(),
+		new CallControlRegistry(),
 	);
 
 	holder.orchestrator = orchestrator;
@@ -544,6 +548,35 @@ describe("B-leg CDRs", () => {
 		expect(bLeg?.data.destinationRef).toBe(extensionId);
 		// A callee's hangup is attributed to the callee, never to the caller.
 		expect(bLeg?.data.hangupSide).toBe("callee");
+	});
+
+	it("plays hold music at the FAR END when a phone presses hold", async () => {
+		const h = harness({
+			artifact: artifactWith(
+				[...TERMINALS, extensionNode("ext:1", "1001", "0195c0f0-1c2f-7000-8000-0000000000f1")],
+				"ext:1",
+			),
+		});
+
+		await arrive(h);
+		const bLegChannelId = h.media.originated()[0]?.channelId as string;
+
+		await h.orchestrator.handleEvent(
+			// ARI spells it lower-case on the wire; the parser is what normalises it.
+			ariEvent("ChannelHold", { channel: bLegChannel(bLegChannelId), musicclass: "default" }),
+		);
+
+		// The person who needs music is the CALLER, not the agent who pressed the key: the agent can
+		// hear their own phone, and a caller in silence concludes the call has dropped.
+		const started = h.media.calls.find((call) => call.method === "startMusicOnHold");
+		expect(started?.args).toEqual([ARI_CHANNEL, "default"]);
+		expect(h.published.filter((event) => event.type === "channel.held")).toHaveLength(1);
+
+		await h.orchestrator.handleEvent(
+			ariEvent("ChannelUnhold", { channel: bLegChannel(bLegChannelId) }),
+		);
+		expect(h.media.calls.some((call) => call.method === "stopMusicOnHold")).toBe(true);
+		expect(h.published.filter((event) => event.type === "channel.unheld")).toHaveLength(1);
 	});
 
 	it("records the bridge on both legs, so a call can be reassembled from either", async () => {

@@ -34,6 +34,10 @@ var EventTypes = []EventTypeInfo{
 	{Family: FamilyCall, Type: EventTypeChannelDestroyed, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.channel.destroyed"},
 	{Family: FamilyCall, Type: EventTypeConferenceJoined, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.conference.joined"},
 	{Family: FamilyCall, Type: EventTypeConferenceLeft, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.conference.left"},
+	{Family: FamilyCall, Type: EventTypeCallParked, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.call.parked"},
+	{Family: FamilyCall, Type: EventTypeCallUnparked, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.call.unparked"},
+	{Family: FamilyCall, Type: EventTypeCallTransferred, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.call.transferred"},
+	{Family: FamilyCall, Type: EventTypeCallPickedUp, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.call.picked-up"},
 	{Family: FamilyCall, Type: EventTypeCallEmergencyDialed, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.call.emergency.dialed"},
 	{Family: FamilyRegistration, Type: EventTypeRegistrationRegistered, SubjectTemplate: "sip.reg.v1.<orgId>.<aorHash>.registered"},
 	{Family: FamilyRegistration, Type: EventTypeRegistrationUnregistered, SubjectTemplate: "sip.reg.v1.<orgId>.<aorHash>.unregistered"},
@@ -88,6 +92,14 @@ func NewDataFor(eventType string) any {
 		return new(ConferenceJoinedData)
 	case EventTypeConferenceLeft:
 		return new(ConferenceLeftData)
+	case EventTypeCallParked:
+		return new(CallParkedData)
+	case EventTypeCallUnparked:
+		return new(CallUnparkedData)
+	case EventTypeCallTransferred:
+		return new(CallTransferredData)
+	case EventTypeCallPickedUp:
+		return new(CallPickedUpData)
 	case EventTypeCallEmergencyDialed:
 		return new(CallEmergencyDialedData)
 	case EventTypeRegistrationRegistered:

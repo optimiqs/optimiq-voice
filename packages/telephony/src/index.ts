@@ -104,6 +104,8 @@ export {
 	InvalidBridgeTransitionError,
 	InvalidCallStateTransitionError,
 	InvalidChannelTransitionError,
+	InvalidParkTransitionError,
+	InvalidTransferTransitionError,
 	TelephonyError,
 } from "./errors";
 export {
@@ -161,6 +163,42 @@ export {
 	type HangupCause,
 	type Q850HangupCause,
 } from "./hangup-causes";
+export {
+	assertParkTransition,
+	INITIAL_PARK_STATE,
+	isParkEndReason,
+	isParkSlotInRange,
+	isParkState,
+	isTerminalParkState,
+	isUsableParkSlotRange,
+	isValidParkTransition,
+	nextFreeParkSlot,
+	PARK_END_REASONS,
+	PARK_STATES,
+	PARK_TERMINAL_STATES,
+	parkEndReasonFor,
+	parkSlotCapacity,
+	parkTransitionsFrom,
+	parseParkSlot,
+	VALID_PARK_TRANSITIONS,
+	type ParkEndReason,
+	type ParkSlotRangeBounds,
+	type ParkState,
+} from "./park";
+export {
+	assertTransferTransition,
+	FIRST_TRANSFER_STATE_BY_KIND,
+	hangupCauseForTransfer,
+	INITIAL_TRANSFER_STATE,
+	isTerminalTransferState,
+	isTransferState,
+	isValidTransferTransition,
+	TRANSFER_STATES,
+	TRANSFER_TERMINAL_STATES,
+	transferTransitionsFrom,
+	VALID_TRANSFER_TRANSITIONS,
+	type TransferState,
+} from "./transfer";
 export {
 	DIAL_STRATEGIES,
 	DIAL_TARGET_KINDS,
