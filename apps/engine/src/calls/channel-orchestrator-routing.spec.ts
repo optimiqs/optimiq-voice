@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { parseAriEvent } from "@optimiq-voice/media-ari";
 import { ROUTING_ARTIFACT_VERSION } from "@optimiq-voice/routing";
 import { makeFakeMediaPort } from "../ari/media-port.fake";
+import { fakeQueueOrchestratorArgs } from "../queue/queue-services.fake";
 import { CallSignalBus, legSignalKey } from "../routing/call-signals";
 import { DtmfRegistry } from "../verbs/dtmf-registry";
 import { makeVerbExecutorRuntime } from "../verbs/verb-executor";
@@ -195,6 +196,7 @@ function harness(options: HarnessOptions = {}) {
 		routing,
 		(options.didIndex ?? NO_DID_INDEX) as DidIndexSource,
 		signals,
+		...(fakeQueueOrchestratorArgs() as [never, never, never, never, never]),
 	);
 
 	holder.orchestrator = orchestrator;

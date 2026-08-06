@@ -9,10 +9,12 @@ import { NestFactory } from "@nestjs/core";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
 import { connect, type NatsConnection, type Subscription } from "nats";
 import {
+	AGENT_STATE_KV,
 	CHANNELS_KV,
 	DID_INDEX_KV,
 	ensureKvBuckets,
 	kvKeyFor,
+	QUEUE_MEMBERSHIP_KV,
 	ROUTING_CACHE_KV,
 	parseSubject,
 	safeValidateEvent,
@@ -44,6 +46,11 @@ import type { ChannelSnapshot } from "@optimiq-voice/telephony";
  *   the `channels` KV entry appearing and clearing; exactly one `cdr.leg.write` per leg;
  * - the P3 routing chain: DID → inbound resolve → IVR → (timeout branch) → extension → an
  *   originated B-leg → `channel.bridged`, with the CDR carrying `destinationType: "extension"`.
+ * - the ACD chain: DID → queue → the `queue-membership` roster → the `agent-state` bucket → an
+ *   agent leg dialled from the roster's contact → `channel.bridged`, with
+ *   `queue.evt.v1.<org>.<queue>.caller.{joined,answered}` observed in order on a subscription no
+ *   engine code owns; and the abandonment case, where a roster whose agents are all logged out
+ *   ejects the caller on `maxWaitNoAgentSeconds` with `reason: "no-agents"`.
  *
  * The artifact is seeded into KV DIRECTLY rather than through `apps/api`'s seed script: this suite
  * exists to prove the engine consumes the artifact contract, and standing up Postgres, RLS and the
@@ -93,6 +100,21 @@ const ORG_ID_B = "0195c0f0-1c2f-7000-8000-0000000000ab";
 const EXTENSION_ID_B = "0195c0f0-1c2f-7000-8000-0000000000e3";
 const ROUTED_DID_B = "12125550200";
 
+/**
+ * The ACD fixtures.
+ *
+ * `QUEUE_ID` is staffed by one agent whose contact dials the loopback context, so the agent leg
+ * actually answers without a registered softphone — the same trick the extension nodes use.
+ * `EMPTY_QUEUE_ID` has a roster with nobody logged in, which is what exercises the abandonment
+ * path: `maxWaitNoAgentSeconds` ejects the caller in two seconds instead of ten minutes.
+ */
+const QUEUE_ID = "0195c0f0-1c2f-7000-8000-0000000000f1";
+const EMPTY_QUEUE_ID = "0195c0f0-1c2f-7000-8000-0000000000f2";
+const QUEUE_AGENT_ID = "0195c0f0-1c2f-7000-8000-0000000000f3";
+const IDLE_AGENT_ID = "0195c0f0-1c2f-7000-8000-0000000000f4";
+const QUEUE_DID = "12125550300";
+const EMPTY_QUEUE_DID = "12125550400";
+
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 
@@ -140,6 +162,33 @@ function seedArtifact(): RoutingArtifact {
 			],
 			timeoutNodeId: `extension:${EXTENSION_ID}`,
 		} as PlanNode,
+		{
+			id: `queue:${QUEUE_ID}`,
+			kind: "queue",
+			queueId: QUEUE_ID,
+			// One at a time: `ring-all` with a single agent proves nothing extra, and `top-down`
+			// makes "which agent rang" an assertion rather than a race.
+			strategy: "top-down",
+			maxWaitSeconds: 60,
+			maxWaitNoAgentSeconds: 0,
+			announcePositionEnabled: false,
+			announceFrequencySeconds: 60,
+			recordEnabled: false,
+			timeoutNodeId: "hangup:NORMAL_CLEARING",
+		} as PlanNode,
+		{
+			id: `queue:${EMPTY_QUEUE_ID}`,
+			kind: "queue",
+			queueId: EMPTY_QUEUE_ID,
+			strategy: "longest-idle",
+			maxWaitSeconds: 600,
+			// The whole point of this node: a roster with nobody logged in ejects fast.
+			maxWaitNoAgentSeconds: 2,
+			announcePositionEnabled: false,
+			announceFrequencySeconds: 60,
+			recordEnabled: false,
+			timeoutNodeId: "hangup:NORMAL_CLEARING",
+		} as PlanNode,
 	];
 
 	return {
@@ -159,6 +208,20 @@ function seedArtifact(): RoutingArtifact {
 					enabled: true,
 					recordEnabled: false,
 					destinationNodeId: `ivr-menu:${IVR_ID}`,
+				},
+				[QUEUE_DID]: {
+					phoneNumberId: "0195c0f0-1c2f-7000-8000-0000000000d3",
+					e164: QUEUE_DID,
+					enabled: true,
+					recordEnabled: false,
+					destinationNodeId: `queue:${QUEUE_ID}`,
+				},
+				[EMPTY_QUEUE_DID]: {
+					phoneNumberId: "0195c0f0-1c2f-7000-8000-0000000000d4",
+					e164: EMPTY_QUEUE_DID,
+					enabled: true,
+					recordEnabled: false,
+					destinationNodeId: `queue:${EMPTY_QUEUE_ID}`,
 				},
 			},
 			noMatchNodeId: "hangup:UNALLOCATED_NUMBER",
@@ -234,8 +297,10 @@ suite("engine end-to-end", () => {
 	let nats: NatsConnection;
 	let callSubscription: Subscription;
 	let cdrSubscription: Subscription;
+	let queueSubscription: Subscription;
 	const callEvents: Received[] = [];
 	const cdrEvents: Received[] = [];
+	const queueEvents: Received[] = [];
 	const invalid: string[] = [];
 	let startedNats = false;
 	let startedAsterisk = false;
@@ -245,6 +310,7 @@ suite("engine end-to-end", () => {
 	/** What the observer actually saw, for a timeout that would otherwise say nothing. */
 	const describeObserved = (): string =>
 		`observed calls=[${callEvents.map((event) => event.envelope.type).join(", ")}] ` +
+		`queue=[${queueEvents.map((event) => event.envelope.type).join(", ")}] ` +
 		`cdrs=${String(cdrEvents.length)} rejected=[${invalid.join(" | ")}]`;
 
 	beforeAll(async () => {
@@ -366,6 +432,7 @@ suite("engine end-to-end", () => {
 		nats = await connect({ servers: natsUrl, name: "engine-integration-observer" });
 		callSubscription = nats.subscribe(subjectFilterFor.allCalls());
 		cdrSubscription = nats.subscribe(subjectFilterFor.allCdrLegs());
+		queueSubscription = nats.subscribe(subjectFilterFor.allQueues());
 
 		void (async () => {
 			for await (const message of callSubscription) {
@@ -377,11 +444,17 @@ suite("engine end-to-end", () => {
 				collect(message.subject, decoder.decode(message.data), cdrEvents, invalid);
 			}
 		})();
+		void (async () => {
+			for await (const message of queueSubscription) {
+				collect(message.subject, decoder.decode(message.data), queueEvents, invalid);
+			}
+		})();
 	}, 300_000);
 
 	afterAll(async () => {
 		callSubscription?.unsubscribe();
 		cdrSubscription?.unsubscribe();
+		queueSubscription?.unsubscribe();
 		await nats?.close();
 		await app?.close();
 		if (startedAsterisk) {
@@ -527,6 +600,168 @@ suite("engine end-to-end", () => {
 			describeObserved,
 		);
 		expect(orchestrator.activeChannelCount).toBe(0);
+	}, 180_000);
+
+	/**
+	 * The ACD path, end to end.
+	 *
+	 * A DID whose plan node is a `queue`, a roster in the `queue-membership` bucket, an agent marked
+	 * `available` in `agent-state`, and a caller who ends up bridged to them. What is being proven is
+	 * the whole chain the pure suites cannot reach: that the engine READS both buckets over real
+	 * NATS, that the agent leg is a real Asterisk channel dialled from the roster's contact string,
+	 * that the queue events land on `queue.evt.v1.<org>.<queue>.*` in order and pass their own
+	 * schema, and that the agent's state machine moves in the bucket a wallboard would read.
+	 */
+	it("puts a queued caller on hold, rings the agent from the roster, and bridges them", async () => {
+		const ari = app.get(AriConnectionService);
+		const callerChannelId = `engine-it-queue-${String(Date.now())}`;
+
+		callEvents.length = 0;
+		cdrEvents.length = 0;
+		queueEvents.length = 0;
+
+		await ari.client.channels.originate({
+			endpoint: `Local/${QUEUE_DID}@optimiq-inbound/n`,
+			context: "optimiq-loopback",
+			extension: "8000",
+			priority: 1,
+			channelId: callerChannelId,
+			timeoutSeconds: 30,
+		});
+
+		// --- the caller joined -------------------------------------------------------------------
+		await waitFor(
+			"queue.caller.joined",
+			async () => queueEvents.some((event) => event.envelope.type === "caller.joined"),
+			40_000,
+			describeObserved,
+		);
+
+		const joined = queueEvents.find((event) => event.envelope.type === "caller.joined");
+		expect(joined?.subject).toBe(subjectFor.queue(ORG_ID, QUEUE_ID, "caller.joined"));
+		expect(joined?.envelope.data).toMatchObject({ position: 1, priority: 0 });
+		const callId = (joined?.envelope.data as { callId: string }).callId;
+
+		// --- the agent was rung and the caller was bridged ---------------------------------------
+		await waitFor(
+			"queue.caller.answered",
+			async () => queueEvents.some((event) => event.envelope.type === "caller.answered"),
+			40_000,
+			describeObserved,
+		);
+
+		const answered = queueEvents.find((event) => event.envelope.type === "caller.answered");
+		expect(answered?.subject).toBe(subjectFor.queue(ORG_ID, QUEUE_ID, "caller.answered"));
+		expect(answered?.envelope.data).toMatchObject({
+			callId,
+			agentId: QUEUE_AGENT_ID,
+			strategy: "top-down",
+		});
+		// The wait the CALLER experienced, which is the SLA metric and must not be zero on a call
+		// where a phone actually rang.
+		expect((answered?.envelope.data as { waitMs: number }).waitMs).toBeGreaterThan(0);
+
+		await waitFor(
+			"channel.bridged",
+			async () => callEvents.some((event) => event.envelope.type === "channel.bridged"),
+			40_000,
+			describeObserved,
+		);
+
+		// --- joined strictly before answered, and nothing else in between -------------------------
+		const queueOrder = queueEvents
+			.filter((event) => event.envelope.type.startsWith("caller."))
+			.map((event) => event.envelope.type);
+		expect(queueOrder).toEqual(["caller.joined", "caller.answered"]);
+
+		// --- the agent's live state moved, and a wallboard could see it --------------------------
+		const agentStatus = await readAgentState(natsUrl, ORG_ID, QUEUE_AGENT_ID);
+		expect(agentStatus?.status).toBe("on-call");
+		expect(agentStatus?.queueId).toBe(QUEUE_ID);
+		expect(agentStatus?.source).toBe("engine");
+
+		const agentStateEvents = queueEvents.filter((event) => event.envelope.type === "agent.state");
+		expect(
+			agentStateEvents.map((event) => (event.envelope.data as { status: string }).status),
+		).toEqual(["ringing", "on-call"]);
+
+		// --- the CDR names the queue as the destination, on both legs ---------------------------
+		await ari.client.channels.hangup(callerChannelId, { causeCode: 16 });
+		await waitFor("both legs' CDRs", async () => cdrEvents.length >= 2, 40_000, describeObserved);
+
+		const aLeg = cdrEvents.find((event) => (event.envelope.data as { leg: string }).leg === "a");
+		const bLeg = cdrEvents.find((event) => (event.envelope.data as { leg: string }).leg === "b");
+		expect(aLeg?.envelope.data).toMatchObject({
+			callId,
+			disposition: "answered",
+			destinationType: "queue",
+			destinationRef: QUEUE_ID,
+		});
+		expect(bLeg?.envelope.data).toMatchObject({
+			callId,
+			leg: "b",
+			destinationType: "queue",
+			destinationRef: QUEUE_ID,
+		});
+		expect(invalid).toEqual([]);
+	}, 180_000);
+
+	/**
+	 * The abandonment path.
+	 *
+	 * A queue with a roster whose only agent is logged out. `maxWaitNoAgentSeconds` is what has to
+	 * fire — NOT `maxWaitSeconds`, which is ten minutes here precisely so that a test which passed
+	 * for the wrong reason would take ten minutes to do it. The caller leaves through the queue's
+	 * timeout branch, and the event says `no-agents` rather than `caller-hangup`, which is the
+	 * distinction an SLA report is built on.
+	 */
+	it("ejects a caller from a queue nobody is staffing, and reports why", async () => {
+		const ari = app.get(AriConnectionService);
+		const callerChannelId = `engine-it-queue-empty-${String(Date.now())}`;
+
+		callEvents.length = 0;
+		cdrEvents.length = 0;
+		queueEvents.length = 0;
+
+		await ari.client.channels.originate({
+			endpoint: `Local/${EMPTY_QUEUE_DID}@optimiq-inbound/n`,
+			context: "optimiq-loopback",
+			extension: "8000",
+			priority: 1,
+			channelId: callerChannelId,
+			timeoutSeconds: 30,
+		});
+
+		await waitFor(
+			"queue.caller.abandoned",
+			async () => queueEvents.some((event) => event.envelope.type === "caller.abandoned"),
+			40_000,
+			describeObserved,
+		);
+
+		const abandoned = queueEvents.find((event) => event.envelope.type === "caller.abandoned");
+		expect(abandoned?.subject).toBe(subjectFor.queue(ORG_ID, EMPTY_QUEUE_ID, "caller.abandoned"));
+		expect(abandoned?.envelope.data).toMatchObject({ reason: "no-agents", position: 1 });
+		// Ejected on the no-agent deadline (2 s), nowhere near the 600 s maximum wait.
+		expect((abandoned?.envelope.data as { waitMs: number }).waitMs).toBeLessThan(60_000);
+
+		// Nobody's phone rang: an agent who is logged out is not a candidate, so there is no B-leg.
+		expect(
+			callEvents.filter(
+				(event) =>
+					event.envelope.type === "channel.created" &&
+					(event.envelope.data as { leg: string }).leg === "b",
+			),
+		).toEqual([]);
+
+		await tryHangup(ari, callerChannelId);
+		await waitFor("cdr.leg.write", async () => cdrEvents.length > 0, 40_000, describeObserved);
+		const aLeg = cdrEvents.find((event) => (event.envelope.data as { leg: string }).leg === "a");
+		expect(aLeg?.envelope.data).toMatchObject({
+			destinationType: "queue",
+			destinationRef: EMPTY_QUEUE_ID,
+		});
+		expect(invalid).toEqual([]);
 	}, 180_000);
 
 	it("rejects a DID the artifact does not route, and files an unrouted CDR", async () => {
@@ -787,7 +1022,12 @@ async function seedRoutingArtifact(natsUrl: string): Promise<void> {
 	const connection = await connect({ servers: natsUrl, name: "engine-integration-seed" });
 	try {
 		const manager = await connection.jetstreamManager();
-		await ensureKvBuckets(manager, [ROUTING_CACHE_KV, DID_INDEX_KV]);
+		await ensureKvBuckets(manager, [
+			ROUTING_CACHE_KV,
+			DID_INDEX_KV,
+			QUEUE_MEMBERSHIP_KV,
+			AGENT_STATE_KV,
+		]);
 		const kv = await connection.jetstream().views.kv(ROUTING_CACHE_KV.name);
 		await kv.put(routingCacheKey(ORG_ID), encoder.encode(JSON.stringify(seedArtifact())));
 		await kv.put(routingCacheKey(ORG_ID_B), encoder.encode(JSON.stringify(seedArtifactB())));
@@ -815,6 +1055,124 @@ async function seedRoutingArtifact(natsUrl: string): Promise<void> {
 					phoneNumberId: "0195c0f0-1c2f-7000-8000-0000000000d2",
 					e164: ROUTED_DID_B,
 					enabled: true,
+				}),
+			),
+		);
+		for (const number of [QUEUE_DID, EMPTY_QUEUE_DID]) {
+			await did.put(
+				kvKeyFor.didIndex(number),
+				encoder.encode(
+					JSON.stringify({
+						organizationId: ORG_ID,
+						phoneNumberId: `0195c0f0-1c2f-7000-8000-0000000000d${number === QUEUE_DID ? "3" : "4"}`,
+						e164: number,
+						enabled: true,
+					}),
+				),
+			);
+		}
+
+		// --- the ACD read models ---------------------------------------------------------------
+		//
+		// Seeded DIRECTLY, exactly as the routing artifact and the DID index are, and for the same
+		// reason: this suite proves the ENGINE consumes the contract. The `queue-membership`
+		// publisher in `apps/api` does not exist yet (it is the explicit follow-up from this wave),
+		// and `agent-state` login/logout is a control-plane surface that does not either — so
+		// writing these by hand is not a shortcut around a component, it is standing in for one that
+		// is not built. When they land, deleting these two blocks is the whole change.
+		const membership = await connection.jetstream().views.kv(QUEUE_MEMBERSHIP_KV.name);
+		await membership.put(
+			kvKeyFor.queueMembership(ORG_ID, QUEUE_ID),
+			encoder.encode(
+				JSON.stringify({
+					orgId: ORG_ID,
+					queueId: QUEUE_ID,
+					name: "Support",
+					wrapUpSeconds: 1,
+					tierRulesApply: false,
+					tierRuleWaitSeconds: 0,
+					tierRuleNoAgentNoWait: false,
+					agents: [
+						{
+							agentId: QUEUE_AGENT_ID,
+							name: "Loopback agent",
+							contactKind: "extension",
+							// Dials the context that answers, so the agent leg is real without a phone.
+							// `/n` for the same Local-optimisation reason the extension template has it.
+							contact: "Local/1001@optimiq-loopback/n",
+							extensionId: EXTENSION_ID,
+							level: 1,
+							position: 1,
+							wrapUpSeconds: 1,
+							maxNoAnswer: 3,
+							noAnswerDelaySeconds: 1,
+							busyDelaySeconds: 1,
+							rejectDelaySeconds: 1,
+							enabled: true,
+						},
+					],
+					updatedAt: new Date().toISOString(),
+					revision: 1,
+				}),
+			),
+		);
+		await membership.put(
+			kvKeyFor.queueMembership(ORG_ID, EMPTY_QUEUE_ID),
+			encoder.encode(
+				JSON.stringify({
+					orgId: ORG_ID,
+					queueId: EMPTY_QUEUE_ID,
+					name: "Nights",
+					wrapUpSeconds: 1,
+					tierRulesApply: false,
+					tierRuleWaitSeconds: 0,
+					tierRuleNoAgentNoWait: false,
+					// A roster with a seat in it and nobody sitting there: the entry EXISTS, so a
+					// failure here cannot be confused with a missing bucket.
+					agents: [
+						{
+							agentId: IDLE_AGENT_ID,
+							name: "Off shift",
+							contactKind: "extension",
+							contact: "Local/1001@optimiq-loopback/n",
+							level: 1,
+							position: 1,
+							wrapUpSeconds: 1,
+							maxNoAnswer: 3,
+							noAnswerDelaySeconds: 1,
+							busyDelaySeconds: 1,
+							rejectDelaySeconds: 1,
+							enabled: true,
+						},
+					],
+					updatedAt: new Date().toISOString(),
+					revision: 1,
+				}),
+			),
+		);
+
+		const agentState = await connection.jetstream().views.kv(AGENT_STATE_KV.name);
+		await agentState.put(
+			kvKeyFor.agentState(ORG_ID, QUEUE_AGENT_ID),
+			encoder.encode(
+				JSON.stringify({
+					orgId: ORG_ID,
+					agentId: QUEUE_AGENT_ID,
+					status: "available",
+					since: new Date().toISOString(),
+					source: "api",
+				}),
+			),
+		);
+		await agentState.put(
+			kvKeyFor.agentState(ORG_ID, IDLE_AGENT_ID),
+			encoder.encode(
+				JSON.stringify({
+					orgId: ORG_ID,
+					agentId: IDLE_AGENT_ID,
+					status: "logged-out",
+					since: new Date().toISOString(),
+					source: "api",
 				}),
 			),
 		);
@@ -882,6 +1240,29 @@ function collect(subject: string, payload: string, into: Received[], invalid: st
 		return;
 	}
 	into.push({ subject, envelope: result.data });
+}
+
+/** Reads one agent's live state, as a wallboard would. */
+async function readAgentState(
+	natsUrl: string,
+	orgId: string,
+	agentId: string,
+): Promise<{ status: string; queueId?: string; source?: string } | undefined> {
+	const connection = await connect({ servers: natsUrl, name: "engine-integration-agent-state" });
+	try {
+		const kv = await connection.jetstream().views.kv(AGENT_STATE_KV.name);
+		const entry = await kv.get(kvKeyFor.agentState(orgId, agentId));
+		if (entry === null || entry.value.length === 0) {
+			return undefined;
+		}
+		return JSON.parse(decoder.decode(entry.value)) as {
+			status: string;
+			queueId?: string;
+			source?: string;
+		};
+	} finally {
+		await connection.close();
+	}
 }
 
 /** Reads the `channels` bucket over a short-lived connection, as an outside observer would. */

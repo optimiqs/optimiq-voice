@@ -8,6 +8,10 @@ import { isDtmfDigit } from "@optimiq-voice/telephony";
 import { CallEventPublisher } from "../nats/call-event-publisher.service";
 import { JetStreamService } from "../nats/jetstream.service";
 import { CALLS_EFFECT_RUNTIME, ENGINE_ENV, MEDIA_PORT } from "../nats/nats.tokens";
+import { AgentStateStore } from "../queue/agent-state.store";
+import { QueueEventPublisher } from "../queue/queue-event-publisher.service";
+import { QueueMembershipSource } from "../queue/queue-membership.source";
+import { QueueCursors, QueuePositions } from "../queue/queue-registry";
 import { CallSignalBus, legSignalKey, recordingSignalKey } from "../routing/call-signals";
 import { DidIndexSource } from "../routing/did-index.source";
 import { PlanWalker } from "../routing/plan-walker";
@@ -111,6 +115,11 @@ export class ChannelOrchestrator {
 		private readonly routing: RoutingArtifactSource,
 		private readonly didIndex: DidIndexSource,
 		private readonly signals: CallSignalBus,
+		private readonly queueMembership: QueueMembershipSource,
+		private readonly agentState: AgentStateStore,
+		private readonly queueEvents: QueueEventPublisher,
+		private readonly queuePositions: QueuePositions,
+		private readonly queueCursors: QueueCursors,
 	) {}
 
 	/** Live legs this instance is handling. `/healthz` and the drain both read it. */
@@ -521,6 +530,16 @@ export class ChannelOrchestrator {
 			peerLegId: legIdForAriChannel,
 			legs: this.legHooksFor(aggregate),
 			voicemail: this.voicemailPortFor(aggregate),
+			// The ACD plane, passed as a bundle rather than five constructor arguments to the walker:
+			// a queue node needs all five or none of them, and a walk that had four would fail in the
+			// middle of somebody's hold music rather than at construction.
+			queue: {
+				membership: this.queueMembership,
+				agents: this.agentState,
+				events: this.queueEvents,
+				positions: this.queuePositions,
+				cursor: this.queueCursors,
+			},
 			log: (message, detail) => {
 				this.logger.info({ channelId: aggregate.channelId, ...detail }, message);
 			},

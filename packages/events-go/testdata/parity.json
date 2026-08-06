@@ -565,6 +565,14 @@
 				"+1 (212) 555-0100"
 			],
 			"key": "12125550100"
+		},
+		{
+			"builder": "queueMembership",
+			"args": [
+				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"
+			],
+			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"
 		}
 	],
 	"streams": [
@@ -739,6 +747,16 @@
 			"history": 1,
 			"storage": "file",
 			"maxValueSizeBytes": 4096,
+			"maxBytes": 268435456,
+			"numReplicas": 1
+		},
+		{
+			"name": "queue-membership",
+			"description": "Queue -> ordered tiers with agent dial strings, for ACD distribution.",
+			"ttlMs": 0,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 131072,
 			"maxBytes": 268435456,
 			"numReplicas": 1
 		}

@@ -7,11 +7,13 @@ import {
 	type NatsConnection,
 } from "nats";
 import {
+	AGENT_STATE_KV,
 	CHANNELS_KV,
 	DID_INDEX_KV,
 	ensureKvBuckets,
 	ensureStreams,
 	kvKeyFor,
+	QUEUE_MEMBERSHIP_KV,
 	ROUTING_CACHE_KV,
 	subjectFor,
 } from "@optimiq-voice/events";
@@ -54,6 +56,8 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	private channelsKv: KV | undefined;
 	private routingCacheKv: KV | undefined;
 	private didIndexKv: KV | undefined;
+	private queueMembershipKv: KV | undefined;
+	private agentStateKv: KV | undefined;
 	private ready = false;
 
 	constructor(@Inject(ENGINE_ENV) private readonly env: EngineEnv) {}
@@ -107,6 +111,13 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		// applies, so an engine that boots before the control plane has ever run does not have to
 		// discover the bucket's absence on its first inbound call.
 		this.didIndexKv = await this.jetstream.views.kv(DID_INDEX_KV.name);
+		// The ACD pair. `queue-membership` is written by `apps/api` and read here; `agent-state` is
+		// written by BOTH — the control plane on login/logout/pause, this engine on the call-driven
+		// transitions it is the only process that can see. Opening the views creates the buckets with
+		// the same definitions `ensureKvBuckets` applies, so an engine that boots before the control
+		// plane has ever run does not discover their absence on its first queued caller.
+		this.queueMembershipKv = await this.jetstream.views.kv(QUEUE_MEMBERSHIP_KV.name);
+		this.agentStateKv = await this.jetstream.views.kv(AGENT_STATE_KV.name);
 		this.ready = true;
 	}
 
@@ -148,6 +159,32 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	 */
 	didIndexKey(did: string): string {
 		return kvKeyFor.didIndex(did);
+	}
+
+	/**
+	 * The `queue-membership` bucket, for {@link import("../queue/queue-membership.source")
+	 * .QueueMembershipSource}.
+	 *
+	 * Exposed raw, like the routing cache, because the consumer owns the read pattern: it needs both
+	 * a point read and a long-lived watch, and a watch's lifetime belongs to whoever iterates it.
+	 *
+	 * `undefined` before `onModuleInit` has run, or after shutdown.
+	 */
+	get queueMembership(): KV | undefined {
+		return this.queueMembershipKv;
+	}
+
+	/**
+	 * The `agent-state` bucket, for {@link import("../queue/agent-state.store").AgentStateStore}.
+	 *
+	 * The one bucket this service exposes that the engine WRITES as well as reads, and the write is
+	 * deliberately not wrapped here the way `putChannel` is. A channel snapshot is a mirror of state
+	 * the engine already holds, so a lost write costs a failover its detail; an agent transition is a
+	 * state machine step that has to be guarded against what the bucket currently holds, and a
+	 * read-guard-write belongs with the machine rather than with the connection.
+	 */
+	get agentState(): KV | undefined {
+		return this.agentStateKv;
 	}
 
 	/**
@@ -254,6 +291,8 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		this.channelsKv = undefined;
 		this.routingCacheKv = undefined;
 		this.didIndexKv = undefined;
+		this.queueMembershipKv = undefined;
+		this.agentStateKv = undefined;
 		if (connection !== undefined && !connection.isClosed()) {
 			// `drain` flushes in-flight publishes before closing; `close` would drop them, and the
 			// publishes in flight during a shutdown are precisely the CDRs of the calls being

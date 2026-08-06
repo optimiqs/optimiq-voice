@@ -544,6 +544,53 @@ export const DID_INDEX_KV: KvBucketDefinition = {
 	numReplicas: 1,
 };
 
+/**
+ * `queue-membership` — queue → its ordered tiers, and how to dial each agent in them.
+ *
+ * ## Why the engine cannot read this from the database
+ *
+ * A queue node in the routing artifact carries the queue's *routing* configuration — strategy,
+ * timeouts, prompts, the timeout branch — because that is what the compiler has. It carries no
+ * agents, and it should not: tiers change when a supervisor moves somebody between queues, which is
+ * not a routing change and must not force a recompile of every route in the tenant.
+ *
+ * So the engine needs the membership at call time, from a process that holds no `pbx-db` handle and
+ * must not grow one (a database on the call path is the thing this architecture spends its budget
+ * avoiding). That leaves two seams: an RPC per queued caller, or a derived read model. This is the
+ * read model, and it is the same shape as {@link DID_INDEX_KV} for the same reasons — written by
+ * `apps/api` inside the unit of work that changes a tier or an agent, read (and watched) by the
+ * engine.
+ *
+ * ## What is in the value and why
+ *
+ * The tiers (`level`, `position`), each agent's dial string, and the DISTRIBUTION parameters that
+ * live on the `queue` / `queue_agent` rows rather than in the artifact: `wrapUpSeconds`,
+ * `maxNoAnswer`, the no-answer/busy/reject penalty delays, and the three `tier_rule_*` columns. They
+ * are here rather than in the plan node because they change with membership, not with routing — see
+ * `queueMembershipSchema`.
+ *
+ * ## Why the TTL is zero
+ *
+ * Same argument as `did-index`: this is CONFIGURATION, not live state. An expiring entry means a
+ * queue that suddenly has no agents and ejects every caller to its timeout branch — an outage
+ * produced by a timer rather than by a change. Agent AVAILABILITY is the live half and lives in
+ * {@link AGENT_STATE_KV}, which does have a TTL, because a stale "available" self-corrects and a
+ * stale roster does not.
+ */
+export const QUEUE_MEMBERSHIP_KV: KvBucketDefinition = {
+	name: "queue-membership",
+	description: "Queue -> ordered tiers with agent dial strings, for ACD distribution.",
+	// 0 = never expire. Read the note above before changing this.
+	ttlMs: 0,
+	history: 1,
+	storage: "file",
+	// A queue with 200 agents at ~300 bytes each, with headroom. `queue_tier` has no hard cap, but
+	// a roster that does not fit here is one no distribution strategy could ring fairly anyway.
+	maxValueSizeBytes: 128 * 1024,
+	maxBytes: 256 * MIB,
+	numReplicas: 1,
+};
+
 export const KV_BUCKETS: readonly KvBucketDefinition[] = [
 	REGISTRATIONS_KV,
 	CHANNELS_KV,
@@ -551,6 +598,7 @@ export const KV_BUCKETS: readonly KvBucketDefinition[] = [
 	AGENT_STATE_KV,
 	ROUTING_CACHE_KV,
 	DID_INDEX_KV,
+	QUEUE_MEMBERSHIP_KV,
 ];
 
 /** The KV wire options for a bucket definition. */
@@ -663,6 +711,18 @@ export const kvKeyFor = {
 	 */
 	didIndex(did: string): string {
 		return assertKeyToken("did", didIndexToken(did));
+	},
+	/**
+	 * `queue-membership`: `<orgId>.<queueId>` — one entry per queue, holding its whole roster.
+	 *
+	 * Per QUEUE and not per (queue, agent), deliberately. Distribution has to consider the tiers
+	 * TOGETHER — "the lowest level with an available agent" is not answerable from one agent's row —
+	 * so a per-agent key would mean a range read per queued caller, and a partially-applied write
+	 * would produce a roster the control plane never held. One key makes the roster atomic and the
+	 * read a point get.
+	 */
+	queueMembership(orgId: string, queueId: string): string {
+		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("queueId", queueId)}`;
 	},
 } as const;
 

@@ -338,6 +338,29 @@ var DIDIndexKV = KVBucketDefinition{
 	NumReplicas:  1,
 }
 
+// QueueMembershipKV holds queue → its ordered tiers, and how to dial each agent in them.
+//
+// A queue node in the routing artifact carries the queue's routing configuration and no agents,
+// deliberately: tiers change when a supervisor moves somebody between queues, which is not a routing
+// change and must not force a recompile. The engine still needs the roster at call time from a
+// process that holds no pbx-db handle, so this is the derived read model — written by apps/api
+// inside the unit of work that changes a tier, read and watched by apps/engine.
+//
+// The TTL is zero for the same reason DIDIndexKV's is: this is configuration, not live state. An
+// expiring entry means a queue that suddenly has no agents and ejects every caller to its timeout
+// branch. Agent AVAILABILITY is the live half and lives in AgentStateKV, which does have a TTL,
+// because a stale "available" self-corrects and a stale roster does not.
+var QueueMembershipKV = KVBucketDefinition{
+	Name:         "queue-membership",
+	Description:  "Queue -> ordered tiers with agent dial strings, for ACD distribution.",
+	TTL:          0,
+	History:      1,
+	Storage:      StorageFile,
+	MaxValueSize: 128 * 1024,
+	MaxBytes:     256 * mib,
+	NumReplicas:  1,
+}
+
 // KVBuckets lists every bucket the backbone owns, in apply order.
 var KVBuckets = []KVBucketDefinition{
 	RegistrationsKV,
@@ -346,6 +369,7 @@ var KVBuckets = []KVBucketDefinition{
 	AgentStateKV,
 	RoutingCacheKV,
 	DIDIndexKV,
+	QueueMembershipKV,
 }
 
 // KVBucketByName looks a bucket definition up by name.
@@ -458,4 +482,23 @@ func DIDIndexKVKey(did string) (string, error) {
 		return "", err
 	}
 	return token("did", normalized)
+}
+
+// QueueMembershipKVKey builds the queue-membership key <orgId>.<queueId>: one entry per queue,
+// holding its whole roster.
+//
+// Per queue and not per (queue, agent), deliberately. Distribution has to consider the tiers
+// together — "the lowest level with an available agent" is not answerable from one agent's row — so
+// a per-agent key would mean a range read per queued caller, and a partially-applied write would
+// produce a roster the control plane never held.
+func QueueMembershipKVKey(orgID, queueID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	queue, err := token("queueId", queueID)
+	if err != nil {
+		return "", err
+	}
+	return org + "." + queue, nil
 }

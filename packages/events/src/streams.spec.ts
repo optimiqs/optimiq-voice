@@ -266,7 +266,7 @@ describe("stream reconciliation helpers", () => {
 });
 
 describe("kv bucket definitions", () => {
-	it("declares the six buckets from plan §3.5", () => {
+	it("declares every bucket the backbone owns, in apply order", () => {
 		expect(KV_BUCKETS.map((bucket) => bucket.name)).toEqual([
 			"registrations",
 			"channels",
@@ -274,6 +274,7 @@ describe("kv bucket definitions", () => {
 			"agent-state",
 			"routing-cache",
 			"did-index",
+			"queue-membership",
 		]);
 	});
 
@@ -285,13 +286,20 @@ describe("kv bucket definitions", () => {
 	});
 
 	/**
-	 * `did-index` is the ONE bucket that must not expire: it holds configuration, not live state,
-	 * and an expired entry turns an inbound call to a valid DID into an `INVALID_PROFILE` rejection
-	 * — an outage produced by a timer rather than by a change.
+	 * The two CONFIGURATION buckets must not expire. `did-index` and `queue-membership` both hold
+	 * derived configuration rather than live state, and an expired entry is an outage produced by a
+	 * timer rather than by a change: an inbound call to a valid DID rejected with `INVALID_PROFILE`,
+	 * or a staffed queue that suddenly has no agents and ejects every caller to its timeout branch.
+	 *
+	 * Everything else holds live state whose staleness self-corrects — a registration refreshes, a
+	 * channel ends, an agent's status is rewritten on their next transition — so a TTL is a safety
+	 * net rather than a hazard.
 	 */
-	it("gives every LIVE-STATE bucket a TTL, and did-index none", () => {
+	const CONFIGURATION_BUCKETS = ["did-index", "queue-membership"];
+
+	it("gives every LIVE-STATE bucket a TTL, and the configuration buckets none", () => {
 		for (const bucket of KV_BUCKETS) {
-			if (bucket.name === "did-index") {
+			if (CONFIGURATION_BUCKETS.includes(bucket.name)) {
 				expect(bucket.ttlMs).toBe(0);
 				continue;
 			}
@@ -301,7 +309,14 @@ describe("kv bucket definitions", () => {
 
 	it("keeps derived presence in memory and durable state on disk", () => {
 		expect(KV_BUCKETS.find((bucket) => bucket.name === "presence")?.storage).toBe("memory");
-		for (const name of ["registrations", "channels", "agent-state", "routing-cache", "did-index"]) {
+		for (const name of [
+			"registrations",
+			"channels",
+			"agent-state",
+			"routing-cache",
+			"did-index",
+			"queue-membership",
+		]) {
 			expect(KV_BUCKETS.find((bucket) => bucket.name === name)?.storage).toBe("file");
 		}
 	});

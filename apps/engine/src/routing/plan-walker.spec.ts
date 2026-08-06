@@ -1477,7 +1477,6 @@ describe("feature codes", () => {
 
 describe("node kinds that are not implemented yet", () => {
 	for (const node of [
-		{ id: "q", kind: "queue", queueId: "q-1" },
 		{ id: "c", kind: "conference", conferenceId: "c-1" },
 		{ id: "p", kind: "park", parkLotId: "p-1" },
 		{ id: "a", kind: "application", application: "autopilot" },
@@ -1491,6 +1490,35 @@ describe("node kinds that are not implemented yet", () => {
 			expect(verbNames(h.verbs)).toEqual(["answer", "play", "hangup"]);
 		});
 	}
+
+	/**
+	 * A `queue` node IS implemented — but only when the walk was given the ACD plane. A walker
+	 * constructed without it (which is every spec in this file, and any future caller that forgets)
+	 * must degrade to the announcement rather than throwing on a live call, and must say which of the
+	 * two situations it was in.
+	 */
+	it("falls back to the announcement for a `queue` node when the walk has no ACD services", async () => {
+		const h = harness();
+		const outcome = await h.walker.walk(
+			walkInput([
+				{
+					id: "q",
+					kind: "queue",
+					queueId: "q-1",
+					strategy: "longest-idle",
+					maxWaitSeconds: 0,
+					maxWaitNoAgentSeconds: 0,
+					announcePositionEnabled: false,
+					announceFrequencySeconds: 60,
+					recordEnabled: false,
+				},
+			] as PlanNode[]),
+		);
+
+		expect(outcome.hangupCause).toBe("FACILITY_NOT_IMPLEMENTED");
+		expect(outcome.notes.join(" ")).toContain("has no ACD services");
+		expect(verbNames(h.verbs)).toEqual(["answer", "play", "hangup"]);
+	});
 });
 
 // =================================================================================================

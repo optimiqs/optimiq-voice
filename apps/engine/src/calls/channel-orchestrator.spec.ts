@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "bun:test";
 import { parseAriEvent } from "@optimiq-voice/media-ari";
 import { makeFakeMediaPort } from "../ari/media-port.fake";
+import { fakeQueueOrchestratorArgs } from "../queue/queue-services.fake";
 import { CallSignalBus } from "../routing/call-signals";
 import { DtmfRegistry } from "../verbs/dtmf-registry";
 import { makeVerbExecutorRuntime } from "../verbs/verb-executor";
@@ -126,6 +127,7 @@ function harness(env: EngineEnv = fakeEnv()) {
 		routing,
 		NO_DID_INDEX,
 		signals,
+		...(fakeQueueOrchestratorArgs() as [never, never, never, never, never]),
 	);
 
 	return {
@@ -488,6 +490,7 @@ describe("resilience", () => {
 			h.routing,
 			NO_DID_INDEX,
 			h.signals,
+			...(fakeQueueOrchestratorArgs() as [never, never, never, never, never]),
 		);
 
 		await expect(

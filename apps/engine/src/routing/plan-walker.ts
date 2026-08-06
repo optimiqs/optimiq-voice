@@ -1,10 +1,18 @@
 import { createEntityId } from "@optimiq-voice/identifiers";
 import { evaluateTimeCondition, matchPattern } from "@optimiq-voice/routing";
 import { RETRYABLE_HANGUP_CAUSES } from "@optimiq-voice/telephony";
+import { QueueSession } from "../queue/queue-session";
 import { legSignalKey, recordingSignalKey } from "./call-signals";
 import { DEFAULT_MEDIA_REF_SETTINGS, resolveMediaRef } from "./media-refs";
 import { planDestinationOf } from "./plan-destination";
 import type { MediaPort } from "../ari/media-port";
+import type {
+	QueueCallPort,
+	QueueDialAttempt,
+	QueueDialOutcome,
+	QueueServices,
+	QueueSessionSettings,
+} from "../queue/queue-session";
 import type { CallSignalBus, LegSignal } from "./call-signals";
 import type { MediaRefSettings } from "./media-refs";
 import type { PlanDestination } from "./plan-destination";
@@ -17,6 +25,7 @@ import type {
 	MailboxEntry,
 	PlanNode,
 	PlanNodeId,
+	QueuePlanNode,
 	RingGroupPlanNode,
 	TrunkDialPlanNode,
 	VoicemailPlanNode,
@@ -58,13 +67,16 @@ import type {
  *
  * Real: `extension`, `ring-group` (both strategies, with lose-race), `ivr-menu` (retries, invalid
  * and timeout branches, submenu recursion), `time-condition`, `trunk-dial` (failover honouring
- * `continueOnCauses`), `external`, `playback`, `hangup`.
+ * `continueOnCauses`), `external`, `playback`, `hangup`, and `queue` — music on hold, position
+ * announcements, all six distribution strategies with tier rules, agent state and wrap-up, delegated
+ * to `../queue/queue-session.ts` (which needs {@link PlanWalkerDependencies.queue}; without it the
+ * node falls back to the announcement below).
  *
  * Placeholder, and honest about it: `voicemail` records but has no mailbox, no MWI and no email;
  * `feature-code` serves `*97` as that placeholder and answers everything else with an
- * announcement; `queue`, `conference`, `park` and `application` announce and hang up. Every one of
- * them adds a line to {@link WalkOutcome.notes}, so a call that hit a gap says so in the log rather
- * than looking like a routing bug.
+ * announcement; `conference`, `park` and `application` announce and hang up. Every one of them adds
+ * a line to {@link WalkOutcome.notes}, so a call that hit a gap says so in the log rather than
+ * looking like a routing bug.
  */
 
 /** The A-leg, as the walker sees it. Every member is live: the orchestrator owns the state. */
@@ -154,6 +166,18 @@ export interface PlanWalkerDependencies {
 	 * reports in its notes rather than pretending the message landed somewhere.
 	 */
 	readonly voicemail?: VoicemailPort;
+	/**
+	 * The ACD plane: the roster source, the agent state machine, the queue event publisher and the
+	 * per-process line and cursor.
+	 *
+	 * Optional for the same reason `legs` and `voicemail` are — a walker spec supplies four closures
+	 * and a fake, and should not have to stand up a queue runtime to test an IVR. When it is absent a
+	 * `queue` node announces and hangs up exactly as it did before this wave, and says so in the
+	 * notes rather than looking like a routing bug.
+	 */
+	readonly queue?: QueueServices;
+	/** Deployment knobs for the queue runtime: poll interval, agent ring timeout, RNG. */
+	readonly queueSettings?: Partial<QueueSessionSettings>;
 	/** Injected so ids are deterministic in a spec. */
 	readonly newId?: () => string;
 	readonly now?: () => number;
@@ -410,9 +434,12 @@ export class PlanWalker {
 			case "feature-code": {
 				return await this.featureCodeNode(node);
 			}
+			case "queue": {
+				return await this.queueNode(node);
+			}
 			default: {
-				// `queue`, `conference`, `park`, `application`: real destinations with real runtimes,
-				// none of which exist yet. Announcing and hanging up is a worse product than a queue
+				// `conference`, `park`, `application`: real destinations with real runtimes, none of
+				// which exist yet. Announcing and hanging up is a worse product than the real thing
 				// and a better one than silence.
 				this.note(`node kind "${node.kind}" is not implemented yet; announced and hung up`);
 				return await this.announceAndHangup(
@@ -1165,6 +1192,193 @@ export class PlanWalker {
 	}
 
 	// -------------------------------------------------------------------------------------------
+	// Queues
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * An ACD queue.
+	 *
+	 * The whole runtime lives in `../queue/queue-session.ts`; this method's job is to hand it the
+	 * media primitives the walker already owns and to turn its outcome into a step.
+	 *
+	 * That split is deliberate. Everything a queued caller needs — answer-and-wait, originate a leg
+	 * through the CDR-correct leg hooks, bridge with the right causes, resolve a prompt id — exists
+	 * here already, and duplicating it inside the queue module would produce a second, subtly
+	 * different way to originate a B-leg. Everything a queue needs that the walker knows nothing
+	 * about — tier rules, six distribution strategies, agent state, wrap-up — lives there, where it
+	 * can be tested against fakes without a channel.
+	 *
+	 * ## The outcomes
+	 *
+	 * - `answered` — the caller is bridged to an agent; the walk is over and the call is up.
+	 * - `timeout` — a wait deadline expired. The queue's `timeoutNodeId` is taken when it has one,
+	 *   and `ALLOTTED_TIMEOUT` (Q.850 802) when it does not. NOT `NO_ANSWER`: a queue that ran out of
+	 *   patience is a different fact from a phone nobody picked up, and it is the fact an SLA report
+	 *   is built on.
+	 * - `abandoned` — the caller hung up. Nothing is left to route.
+	 * - `failed` — the roster could not be read. `NORMAL_TEMPORARY_FAILURE`, and a note that names
+	 *   the bucket, because this is an infrastructure fault and must not be reported as an empty
+	 *   queue.
+	 */
+	private async queueNode(node: QueuePlanNode): Promise<StepResult> {
+		const services = this.deps.queue;
+		if (services === undefined) {
+			this.note(
+				`queue "${node.queueId}" cannot be served: this walk has no ACD services; announced and hung up`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		const session = new QueueSession(node, this.queueCallPort(), services, {
+			agentRingTimeoutSeconds: this.settings.defaultRingTimeoutSeconds,
+			...this.deps.queueSettings,
+		});
+
+		const outcome = await session.run();
+
+		switch (outcome.kind) {
+			case "answered": {
+				return { kind: "bridged" };
+			}
+			case "timeout": {
+				return this.branch(node.timeoutNodeId, "ALLOTTED_TIMEOUT");
+			}
+			case "abandoned":
+			case "aborted": {
+				return { kind: "aborted" };
+			}
+			default: {
+				return { kind: "hangup", cause: "NORMAL_TEMPORARY_FAILURE" };
+			}
+		}
+	}
+
+	/**
+	 * The walker's media primitives, as the queue session consumes them.
+	 *
+	 * `channel` is destructured out because {@link WalkerChannel.isTearingDown} is a LIVE getter on
+	 * the orchestrator's aggregate: the port has to re-read it on every access, so the value cannot
+	 * be captured and the object needs a getter of its own. Everything else is an arrow function,
+	 * which closes over the walker's `this` lexically.
+	 */
+	private queueCallPort(): QueueCallPort {
+		const { channel, media, execute } = this.deps;
+		return {
+			get isTearingDown(): boolean {
+				return channel.isTearingDown;
+			},
+			callerLegId: channel.channelId,
+			callId: channel.callId,
+			organizationId: channel.organizationId,
+			...(channel.callerIdNumber === undefined ? {} : { callerNumber: channel.callerIdNumber }),
+			ensureAnswered: async () => await this.ensureAnswered(),
+			play: async (playable: string) =>
+				(await execute({ verb: "play", media: playable })) !== undefined,
+			startMusicOnHold: async (mohClass?: string) => {
+				try {
+					await media.startMusicOnHold(channel.mediaChannelId, mohClass);
+				} catch (error) {
+					// A missing music class must not end a call. The caller hears silence, which is
+					// worse than music and much better than a hangup, and the note says which it was.
+					this.note(`music on hold could not be started: ${String(error)}`);
+				}
+			},
+			stopMusicOnHold: async () => {
+				try {
+					await media.stopMusicOnHold(channel.mediaChannelId);
+				} catch {
+					// Stopping music that is not playing is a no-op everywhere it matters.
+				}
+			},
+			dial: async (attempts, fanOut, ringTimeoutSeconds) =>
+				await this.dialQueueAgents(attempts, fanOut, ringTimeoutSeconds),
+			bridge: async (mediaChannelId, onEnded) =>
+				(await this.bridgeWith(mediaChannelId, onEnded)).kind === "bridged",
+			resolvePrompt: (promptId) => resolveMediaRef({ promptId }, this.settings.mediaRefs),
+			spellNumber: (value) => this.spellNumber(value),
+			note: (message) => {
+				this.note(message);
+			},
+			delay: async (ms) => {
+				await this.delay(ms);
+			},
+			now: () => this.deps.now?.() ?? Date.now(),
+		};
+	}
+
+	/**
+	 * Rings queue agents, translating between the session's vocabulary and the walker's.
+	 *
+	 * The one behaviour that is queue-specific is `abortOnCallerHangup`: a queued caller who gives up
+	 * while an agent's phone is ringing must not leave that phone ringing. An extension or a ring
+	 * group does not need it — the caller's hangup tears the whole call down within the same event
+	 * — but a queue has already answered the caller, so their leg's death arrives as a signal the
+	 * dial has to be watching for.
+	 */
+	private async dialQueueAgents(
+		attempts: readonly QueueDialAttempt[],
+		fanOut: "one" | "all",
+		ringTimeoutSeconds: number,
+	): Promise<QueueDialOutcome> {
+		if (attempts.length === 0) {
+			return { kind: "timeout" };
+		}
+
+		const dialAttempts: DialAttempt[] = attempts.map((attempt) => ({
+			endpoint: attempt.endpoint,
+			label: attempt.label,
+			destinationNumber: attempt.destinationNumber,
+			timeoutSeconds: attempt.timeoutSeconds || ringTimeoutSeconds,
+			delaySeconds: 0,
+			...(this.callerIdForQueue() === undefined ? {} : { callerId: this.callerIdForQueue() }),
+		}));
+
+		const outcome =
+			fanOut === "all"
+				? await this.dialSimultaneous(dialAttempts, ringTimeoutSeconds, true)
+				: await this.dialOne(dialAttempts[0] as DialAttempt, 0, true);
+
+		switch (outcome.kind) {
+			case "answered": {
+				const agent = attempts[outcome.index] ?? attempts[0];
+				return {
+					kind: "answered",
+					agentId: (agent as QueueDialAttempt).agentId,
+					mediaChannelId: outcome.mediaChannelId,
+				};
+			}
+			case "failed": {
+				const agent = attempts[outcome.index] ?? attempts[0];
+				return {
+					kind: "failed",
+					agentId: (agent as QueueDialAttempt).agentId,
+					cause: outcome.cause,
+				};
+			}
+			case "aborted": {
+				return { kind: "aborted" };
+			}
+			default: {
+				return { kind: "timeout" };
+			}
+		}
+	}
+
+	/**
+	 * The identity a queue agent's phone shows.
+	 *
+	 * The CALLER's, not the queue's — an agent has to see who is on the line before they answer, and
+	 * a queue name in the caller id field is a name they already know from the fact their queue
+	 * phone rang. The queue is carried on the B-leg's `destinationType` for the CDR instead.
+	 */
+	private callerIdForQueue(): string | undefined {
+		return composeCallerId(this.deps.channel.callerIdName, this.deps.channel.callerIdNumber);
+	}
+
+	// -------------------------------------------------------------------------------------------
 	// Dialling
 	// -------------------------------------------------------------------------------------------
 
@@ -1205,6 +1419,7 @@ export class PlanWalker {
 	private async dialSimultaneous(
 		attempts: readonly DialAttempt[],
 		overallTimeoutSeconds: number,
+		abortOnCallerHangup = false,
 	): Promise<DialOutcome> {
 		const channelIds = attempts.map(() => this.newId());
 		const unwatchers: (() => void)[] = [];
@@ -1230,6 +1445,10 @@ export class PlanWalker {
 			Math.max(1, overallTimeoutSeconds) * MILLIS_PER_SECOND,
 		);
 		overall.unref?.();
+
+		if (abortOnCallerHangup) {
+			unwatchers.push(this.watchCallerHangup(resolveOutcome));
+		}
 
 		for (const index of attempts.keys()) {
 			const channelId = channelIds[index] as string;
@@ -1291,7 +1510,11 @@ export class PlanWalker {
 	}
 
 	/** Rings exactly one attempt and waits for it to answer, fail or time out. */
-	private async dialOne(attempt: DialAttempt, index: number): Promise<DialOutcome> {
+	private async dialOne(
+		attempt: DialAttempt,
+		index: number,
+		abortOnCallerHangup = false,
+	): Promise<DialOutcome> {
 		const channelId = this.newId();
 		let settled = false;
 		let resolveOutcome: (outcome: DialOutcome) => void = () => undefined;
@@ -1317,6 +1540,10 @@ export class PlanWalker {
 			}
 		});
 
+		const unwatchCaller = abortOnCallerHangup
+			? this.watchCallerHangup(resolveOutcome)
+			: (): void => undefined;
+
 		const timer = setTimeout(
 			() => {
 				resolveOutcome({ kind: "timeout" });
@@ -1332,11 +1559,30 @@ export class PlanWalker {
 		const outcome = await outcomePromise;
 		clearTimeout(timer);
 		unwatch();
+		unwatchCaller();
 
 		if (outcome.kind !== "answered") {
 			await this.hangupQuietly(channelId, "ORIGINATOR_CANCEL");
 		}
 		return outcome;
+	}
+
+	/**
+	 * Ends a dial the moment the CALLER goes away.
+	 *
+	 * Only queue dials install this, and the reason is that a queue has already ANSWERED the caller.
+	 * For an unanswered inbound call the caller's hangup tears the whole call down in one event and
+	 * the walk aborts anyway; for a queued caller the A-leg's death is just a signal, and without
+	 * this the agent's phone would keep ringing for the full timeout on behalf of somebody who has
+	 * gone. The dial's existing cleanup then hangs the agent legs up with `ORIGINATOR_CANCEL`, which
+	 * is exactly what happened.
+	 */
+	private watchCallerHangup(resolve: (outcome: DialOutcome) => void): () => void {
+		return this.deps.signals.watch(legSignalKey(this.deps.channel.mediaChannelId), (signal) => {
+			if ((signal as LegSignal).kind === "ended") {
+				resolve({ kind: "aborted" });
+			}
+		});
 	}
 
 	/**
@@ -1406,7 +1652,10 @@ export class PlanWalker {
 	 * The A-leg is answered FIRST, and only once the far end has: answering earlier would start
 	 * billing a caller for a call nobody picked up.
 	 */
-	private async bridgeWith(peerMediaChannelId: string): Promise<StepResult> {
+	private async bridgeWith(
+		peerMediaChannelId: string,
+		onPeerEnded?: () => void,
+	): Promise<StepResult> {
 		if (!(await this.ensureAnswered())) {
 			await this.hangupQuietly(peerMediaChannelId, "ORIGINATOR_CANCEL");
 			return { kind: "aborted" };
@@ -1444,6 +1693,10 @@ export class PlanWalker {
 				return;
 			}
 			unwatch();
+			// The queue's wrap-up hook, when there is one. Called BEFORE the teardown so an agent's
+			// after-call timer starts at the moment their call ended rather than after two awaited
+			// media-server round trips.
+			onPeerEnded?.();
 			void this.onPeerEnded(bridgeId, peerMediaChannelId);
 		});
 

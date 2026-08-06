@@ -111,6 +111,17 @@ export {
 	type QueueEventOf,
 } from "./queue-events";
 export {
+	agentStateEntrySchema,
+	QUEUE_AGENT_CONTACT_KINDS,
+	queueAgentContactKindSchema,
+	queueMembershipAgentSchema,
+	queueMembershipSchema,
+	type AgentStateEntry,
+	type QueueAgentContactKind,
+	type QueueMembership,
+	type QueueMembershipAgent,
+} from "./queue-state";
+export {
 	aorSchema,
 	contactSchema,
 	makeRegistrationEvent,

@@ -6,6 +6,7 @@ import type {
 	PlanNode,
 	PlanNodeTable,
 	PlaybackPlanNode,
+	QueuePlanNode,
 	RingGroupPlanNode,
 	TimeConditionPlanNode,
 	TrunkDialPlanNode,
@@ -117,6 +118,23 @@ export function trunkAttempt(name: string, order: number): TrunkDialPlanNode["at
 		sipProxy: "sip.carrier.example",
 		transport: "udp",
 		order,
+	};
+}
+
+export function queueNode(id: string, overrides: Partial<QueuePlanNode> = {}): QueuePlanNode {
+	return {
+		id,
+		kind: "queue",
+		queueId: `queue-${id}`,
+		strategy: "longest-idle",
+		// Both deadlines off by default: a spec about distribution should not have to remember to
+		// disable a timeout it never mentioned, and `pbx-db`'s own default for both is 0.
+		maxWaitSeconds: 0,
+		maxWaitNoAgentSeconds: 0,
+		announcePositionEnabled: false,
+		announceFrequencySeconds: 60,
+		recordEnabled: false,
+		...overrides,
 	};
 }
 

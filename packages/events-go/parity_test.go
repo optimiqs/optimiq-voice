@@ -359,6 +359,8 @@ func TestParityKVKeys(t *testing.T) {
 			got, err = RoutingCacheKVKey(tc.Args[0], tc.Args[1], tc.Args[2:]...)
 		case "didIndex":
 			got, err = DIDIndexKVKey(tc.Args[0])
+		case "queueMembership":
+			got, err = QueueMembershipKVKey(tc.Args[0], tc.Args[1])
 		default:
 			t.Fatalf("golden names KV key builder %q, which this package does not implement", tc.Builder)
 		}

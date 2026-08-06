@@ -895,6 +895,11 @@ function parityGolden(): unknown {
 				args: ["+1 (212) 555-0100"],
 				key: kvKeyFor.didIndex("+1 (212) 555-0100"),
 			},
+			{
+				builder: "queueMembership",
+				args: [ORG_A, QUEUE_A],
+				key: kvKeyFor.queueMembership(ORG_A, QUEUE_A),
+			},
 		],
 		streams: EVENT_STREAMS.map((definition: StreamDefinition) => ({ ...definition })),
 		kvBuckets: KV_BUCKETS.map((definition: KvBucketDefinition) => ({ ...definition })),
