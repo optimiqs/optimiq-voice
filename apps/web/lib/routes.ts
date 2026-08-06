@@ -31,7 +31,46 @@ export const routes = {
 	settings: "/settings",
 	members: "/settings/members",
 	apiKeys: "/settings/api-keys",
+
+	/**
+	 * Detail views, for the three entities that own a child collection.
+	 *
+	 * Everything else is edited in a dialog over its list, because everything else is one flat row
+	 * — a route for a form with no sub-resource is a page load the user pays for and a back button
+	 * that leaves the list. An IVR menu's options, a ring group's members and a time condition's
+	 * rules are ordered collections with their own destinations, which a dialog inside a dialog
+	 * cannot hold.
+	 *
+	 * They are nested under their list's path so `getPagePermissions` inherits the parent's
+	 * requirement by ancestry — `/ivr/<id>` needs `ivr.read` without `PAGE_PERMISSIONS` naming it.
+	 */
+	ivrMenu: (id: string) => `/ivr/${id}`,
+	ringGroup: (id: string) => `/ring-groups/${id}`,
+	timeCondition: (id: string) => `/routing/time-conditions/${id}`,
 } as const;
+
+/**
+ * The Routing page's sections, as query state.
+ *
+ * Inbound routes, outbound routes, time conditions and feature codes are four views of ONE
+ * subject — how a call is routed — and all four are gated by `routes.*`. Four sidebar entries
+ * would be four ways to say "routing"; four tabs on one page with the section in the URL keeps
+ * every view linkable without inventing four routes and four permission entries that would all
+ * have to say the same thing.
+ */
+export const ROUTING_TABS = [
+	"inbound",
+	"outbound",
+	"time-conditions",
+	"feature-codes",
+	"tools",
+] as const;
+
+export type RoutingTab = (typeof ROUTING_TABS)[number];
+
+export function routingTabHref(tab: RoutingTab): string {
+	return tab === "inbound" ? routes.routing : `${routes.routing}?tab=${tab}`;
+}
 
 /**
  * Prefixes reachable without a session.

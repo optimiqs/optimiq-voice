@@ -1,7 +1,9 @@
 "use client";
 
+import { cn } from "~/lib/cn";
 import { getFieldErrorMessage } from "~/lib/forms/field-errors";
-import { Field, FieldDescription, FieldLabel, Input, Select } from "./field";
+import { Field, FieldDescription, FieldLabel, Input, Select, Textarea } from "./field";
+import { Switch } from "./switch";
 import type { ReactNode } from "react";
 
 /**
@@ -143,5 +145,93 @@ export function SelectField<TValue extends string = string>({
 				</p>
 			) : null}
 		</Field>
+	);
+}
+
+export function TextareaField<TValue extends string = string>({
+	field,
+	label,
+	description,
+	required,
+	disabled,
+	className,
+	submitError,
+	placeholder,
+	rows = 4,
+}: BaseFieldProps & { field: FieldLike<TValue>; placeholder?: string; rows?: number }) {
+	const error = useFieldError(field, submitError);
+	const errorId = `${field.name}-error`;
+	const descriptionId = `${field.name}-description`;
+
+	return (
+		<Field name={field.name} className={className}>
+			<FieldLabel htmlFor={field.name}>
+				{label}
+				{required ? (
+					<span aria-hidden="true" className="ml-0.5 text-danger">
+						*
+					</span>
+				) : null}
+			</FieldLabel>
+			<Textarea
+				id={field.name}
+				name={field.name}
+				rows={rows}
+				value={field.state.value}
+				onChange={(event) => field.handleChange(event.target.value as TValue)}
+				onBlur={field.handleBlur}
+				disabled={disabled}
+				placeholder={placeholder}
+				aria-required={required || undefined}
+				aria-invalid={error ? true : undefined}
+				aria-describedby={
+					[description ? descriptionId : null, error ? errorId : null].filter(Boolean).join(" ") ||
+					undefined
+				}
+			/>
+			{description ? <FieldDescription id={descriptionId}>{description}</FieldDescription> : null}
+			{error ? (
+				<p id={errorId} role="alert" className="text-xs text-danger">
+					{error}
+				</p>
+			) : null}
+		</Field>
+	);
+}
+
+/**
+ * A boolean setting, laid out as a row rather than as a stacked field.
+ *
+ * A switch has no empty state to validate, so there is no error slot: the whole row is the label,
+ * which is also what makes the hit target the width of the form instead of the width of the
+ * switch.
+ */
+export function SwitchField({
+	field,
+	label,
+	description,
+	disabled,
+	className,
+}: {
+	field: FieldLike<boolean>;
+	label: string;
+	description?: ReactNode;
+	disabled?: boolean;
+	className?: string;
+}) {
+	return (
+		<div className={cn("flex items-start justify-between gap-4", className)}>
+			<label htmlFor={field.name} className="flex min-w-0 flex-col gap-0.5">
+				<span className="text-sm font-medium text-foreground">{label}</span>
+				{description ? <span className="text-xs text-muted-foreground">{description}</span> : null}
+			</label>
+			<Switch
+				id={field.name}
+				checked={field.state.value}
+				onCheckedChange={(checked) => field.handleChange(checked)}
+				disabled={disabled}
+				className="mt-0.5"
+			/>
+		</div>
 	);
 }

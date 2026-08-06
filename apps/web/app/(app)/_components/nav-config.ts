@@ -53,25 +53,25 @@ export const NAV_SECTIONS: readonly NavSection[] = [
 	{
 		label: "Telephony",
 		items: [
-			{ title: "Extensions", url: routes.extensions, icon: PhoneIcon, comingSoon: true },
+			{ title: "Extensions", url: routes.extensions, icon: PhoneIcon },
 			{ title: "Devices", url: routes.devices, icon: DeviceIcon, comingSoon: true },
-			{ title: "Numbers", url: routes.numbers, icon: HashIcon, comingSoon: true },
-			{ title: "Trunks", url: routes.trunks, icon: TrunkIcon, comingSoon: true },
+			{ title: "Numbers", url: routes.numbers, icon: HashIcon },
+			{ title: "Trunks", url: routes.trunks, icon: TrunkIcon },
 		],
 	},
 	{
 		label: "Routing",
 		items: [
-			{ title: "Routing", url: routes.routing, icon: RouteIcon, comingSoon: true },
-			{ title: "IVR menus", url: routes.ivr, icon: MenuIcon, comingSoon: true },
-			{ title: "Ring groups", url: routes.ringGroups, icon: UsersIcon, comingSoon: true },
+			{ title: "Routing", url: routes.routing, icon: RouteIcon },
+			{ title: "IVR menus", url: routes.ivr, icon: MenuIcon },
+			{ title: "Ring groups", url: routes.ringGroups, icon: UsersIcon },
 			{ title: "Queues", url: routes.queues, icon: QueueIcon, comingSoon: true },
 		],
 	},
 	{
 		label: "Call features",
 		items: [
-			{ title: "Voicemail", url: routes.voicemail, icon: VoicemailIcon, comingSoon: true },
+			{ title: "Voicemail", url: routes.voicemail, icon: VoicemailIcon },
 			{ title: "Conferences", url: routes.conferences, icon: ConferenceIcon, comingSoon: true },
 		],
 	},

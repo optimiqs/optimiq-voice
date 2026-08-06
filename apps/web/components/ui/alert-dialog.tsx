@@ -17,6 +17,7 @@ export function ConfirmDialog({
 	onOpenChange,
 	title,
 	description,
+	details,
 	confirmLabel = "Confirm",
 	cancelLabel = "Cancel",
 	destructive = false,
@@ -27,7 +28,13 @@ export function ConfirmDialog({
 	open?: boolean;
 	onOpenChange?: (open: boolean) => void;
 	title: string;
-	description: string;
+	description: ReactNode;
+	/**
+	 * Extra content between the description and the buttons — the one place a confirmation may
+	 * carry structure. A `PBX_REFERENCED` 409 lists the rows that refused the delete AS LINKS, and
+	 * a `description` string cannot hold a link the user can follow to go and fix them.
+	 */
+	details?: ReactNode;
 	confirmLabel?: string;
 	cancelLabel?: string;
 	destructive?: boolean;
@@ -48,7 +55,7 @@ export function ConfirmDialog({
 				/>
 				<BaseAlertDialog.Popup
 					className={cn(
-						"fixed top-1/2 left-1/2 z-50 w-[min(26rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2",
+						"fixed top-1/2 left-1/2 z-50 max-h-[calc(100dvh-2rem)] w-[min(30rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 overflow-y-auto",
 						"rounded-panel border border-border bg-surface p-6 shadow-overlay",
 						"transition-[opacity,transform] duration-[--motion-base] ease-[--ease-emphasized]",
 						"data-[starting-style]:scale-95 data-[starting-style]:opacity-0",
@@ -58,9 +65,13 @@ export function ConfirmDialog({
 					<BaseAlertDialog.Title className="text-base font-semibold text-foreground">
 						{title}
 					</BaseAlertDialog.Title>
-					<BaseAlertDialog.Description className="mt-1 text-sm text-muted-foreground">
+					<BaseAlertDialog.Description
+						render={<div />}
+						className="mt-1 text-sm text-muted-foreground"
+					>
 						{description}
 					</BaseAlertDialog.Description>
+					{details ? <div className="mt-4">{details}</div> : null}
 					<div className="mt-6 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
 						<BaseAlertDialog.Close render={<Button variant="secondary">{cancelLabel}</Button>} />
 						<Button

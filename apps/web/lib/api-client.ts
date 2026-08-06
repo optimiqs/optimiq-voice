@@ -14,14 +14,24 @@ import type { Permission } from "./permissions";
 
 export const API_BASE_PATH = "/api/v1";
 
-/** A non-2xx response, carrying the status so callers can branch on 401 / 403 without parsing. */
+/**
+ * A non-2xx response, carrying the status so callers can branch on 401 / 403 without parsing.
+ *
+ * `body` is the parsed payload, kept because the PBX area's failure taxonomy is a contract: a 422
+ * carries `issues[]` or `diagnostics[]` addressed at form fields, and a 409 carries the rows that
+ * refused a delete. Throwing away everything but `message` would force every form to re-fetch
+ * information the server already sent, and would put a list of referencing entities into a single
+ * string. `lib/pbx/errors.ts` is the only place that reads it.
+ */
 export class ApiError extends Error {
 	readonly status: number;
+	readonly body: unknown;
 
-	constructor(status: number, message: string) {
+	constructor(status: number, message: string, body: unknown = null) {
 		super(message);
 		this.name = "ApiError";
 		this.status = status;
+		this.body = body;
 	}
 
 	/** The caller has no session — the app should send them to sign-in. */
@@ -73,6 +83,7 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
 		throw new ApiError(
 			response.status,
 			messageFrom(payload, `Request failed (${response.status})`),
+			payload,
 		);
 	}
 	return payload as T;

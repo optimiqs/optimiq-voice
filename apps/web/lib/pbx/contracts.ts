@@ -1,0 +1,427 @@
+/**
+ * The PBX contract, mirrored — never imported.
+ *
+ * `apps/api/src/pbx/**` is a Nest application: importing its DTOs here would drag `zod/v4`,
+ * `@nestjs/common` and `@optimiq-voice/pbx-db` (and therefore Drizzle and a Postgres driver) into
+ * the browser bundle. So the closed sets and the row shapes are restated, and
+ * `contracts.spec.ts` asserts they still match the values the server exports.
+ *
+ * Rows arrive as the Drizzle row, camelCased, with `Date` columns serialized to ISO strings. Every
+ * entity carries `id`, `organizationId`, `createdAt` and `updatedAt`; only the fields the admin UI
+ * actually renders or edits are declared below.
+ */
+
+// ---------------------------------------------------------------------------------------------
+// Envelopes
+// ---------------------------------------------------------------------------------------------
+
+export interface PagedEnvelope<T> {
+	readonly data: readonly T[];
+	readonly total: number;
+	readonly page: number;
+	readonly limit: number;
+	readonly totalPages: number;
+}
+
+export interface ItemEnvelope<T> {
+	readonly data: T;
+}
+
+/** Every mutation returns this. `warnings` is always present, possibly empty. */
+export interface MutationEnvelope<T> {
+	readonly data: T;
+	readonly warnings: readonly WireDiagnostic[];
+}
+
+/**
+ * A compiler diagnostic, flattened for the wire.
+ *
+ * `field` is the last segment of `path` when that segment names a column — which is exactly what
+ * lets `routing.compile` say "this inbound route's destinationRef dangles" and have the message
+ * land on the control that produced it.
+ */
+export interface WireDiagnostic {
+	readonly severity: "error" | "warning" | "info";
+	readonly code: string;
+	readonly message: string;
+	readonly subject?: { readonly kind: string; readonly id: string; readonly name?: string | null };
+	readonly path?: string;
+	readonly field?: string;
+}
+
+/** A row that points at the entity a delete was refused for. */
+export interface EntityReference {
+	readonly kind: string;
+	readonly id: string;
+	readonly name: string | null;
+	readonly field: string;
+}
+
+export interface DestinationIssue {
+	readonly field: string;
+	readonly code: string;
+	readonly message: string;
+}
+
+export interface ValidationIssue {
+	readonly field: string;
+	readonly code: string;
+	readonly message: string;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Closed sets, mirrored from @optimiq-voice/pbx-db and @optimiq-voice/routing
+// ---------------------------------------------------------------------------------------------
+
+export const DESTINATION_TYPES = [
+	"extension",
+	"ivr",
+	"ring-group",
+	"queue",
+	"voicemail",
+	"conference",
+	"park",
+	"time-condition",
+	"external",
+	"application",
+	"hangup",
+] as const;
+export type DestinationType = (typeof DESTINATION_TYPES)[number];
+
+export type DestinationKind = "entity" | "value" | "terminal";
+
+/**
+ * Which half of the trio each type populates. `entity` needs `destinationRef`; `value` needs
+ * `destinationData.value` and must NOT carry a ref; `terminal` carries neither (though `hangup`
+ * may carry a `cause`).
+ */
+export const DESTINATION_TYPE_KINDS: Readonly<Record<DestinationType, DestinationKind>> = {
+	extension: "entity",
+	ivr: "entity",
+	"ring-group": "entity",
+	queue: "entity",
+	voicemail: "entity",
+	conference: "entity",
+	park: "entity",
+	"time-condition": "entity",
+	external: "value",
+	application: "value",
+	hangup: "terminal",
+};
+
+export const RECORD_POLICIES = ["none", "inbound", "outbound", "all", "on-demand"] as const;
+export type RecordPolicy = (typeof RECORD_POLICIES)[number];
+
+export const TOLL_CLASSES = ["internal", "local", "national", "international", "premium"] as const;
+export type TollClass = (typeof TOLL_CLASSES)[number];
+
+export const TRUNK_KINDS = ["register", "ip-auth"] as const;
+export type TrunkKind = (typeof TRUNK_KINDS)[number];
+
+export const TRUNK_STATUSES = ["unknown", "up", "down", "degraded", "disabled"] as const;
+export type TrunkStatus = (typeof TRUNK_STATUSES)[number];
+
+export const SIP_TRANSPORTS = ["udp", "tcp", "tls"] as const;
+export type SipTransport = (typeof SIP_TRANSPORTS)[number];
+
+export const ROUTE_MATCH_KINDS = ["exact", "prefix", "regex", "any"] as const;
+export type RouteMatchKind = (typeof ROUTE_MATCH_KINDS)[number];
+
+export const IVR_OPTION_MATCH_KINDS = ["digit", "regex"] as const;
+export type IvrOptionMatchKind = (typeof IVR_OPTION_MATCH_KINDS)[number];
+
+export const RING_GROUP_STRATEGIES = ["simultaneous", "sequential"] as const;
+export type RingGroupStrategy = (typeof RING_GROUP_STRATEGIES)[number];
+
+export const VOICEMAIL_EMAIL_MODES = ["none", "notify", "attach"] as const;
+export type VoicemailEmailMode = (typeof VOICEMAIL_EMAIL_MODES)[number];
+
+export const FEATURE_CODE_ACTIONS = [
+	"voicemail-check",
+	"voicemail-direct",
+	"voicemail-record-greeting",
+	"call-park",
+	"call-pickup",
+	"group-pickup",
+	"call-forward-all",
+	"call-forward-busy",
+	"call-forward-no-answer",
+	"do-not-disturb",
+	"follow-me",
+	"intercom",
+	"paging",
+	"record-toggle",
+	"redial",
+	"echo-test",
+	"queue-toggle",
+	"agent-status",
+	"eavesdrop",
+	"transfer",
+] as const;
+export type FeatureCodeAction = (typeof FEATURE_CODE_ACTIONS)[number];
+
+export const ROUTING_CONTEXTS = ["inbound", "internal", "outbound"] as const;
+export type RoutingContext = (typeof ROUTING_CONTEXTS)[number];
+
+// ---------------------------------------------------------------------------------------------
+// Rows
+// ---------------------------------------------------------------------------------------------
+
+export interface DestinationData {
+	readonly value?: string;
+	readonly args?: Readonly<Record<string, string | number | boolean>>;
+	readonly cause?: string;
+}
+
+export interface EntityRow {
+	readonly id: string;
+	readonly organizationId: string;
+	readonly createdAt: string;
+	readonly updatedAt: string;
+}
+
+export interface FollowMeTarget {
+	readonly destination: string;
+	readonly delaySeconds: number;
+	readonly timeoutSeconds: number;
+	readonly confirm?: boolean;
+}
+
+export interface ExtensionRow extends EntityRow {
+	readonly number: string;
+	readonly label: string;
+	readonly sipSecretRef: string;
+	readonly callerIdName: string | null;
+	readonly callerIdNumber: string | null;
+	readonly outboundCallerIdName: string | null;
+	readonly outboundCallerIdNumber: string | null;
+	readonly emergencyCallerIdName: string | null;
+	readonly emergencyCallerIdNumber: string | null;
+	readonly voicemailEnabled: boolean;
+	readonly doNotDisturb: boolean;
+	readonly forwardAllEnabled: boolean;
+	readonly forwardAllDestination: string | null;
+	readonly forwardBusyEnabled: boolean;
+	readonly forwardBusyDestination: string | null;
+	readonly forwardNoAnswerEnabled: boolean;
+	readonly forwardNoAnswerDestination: string | null;
+	readonly forwardUnregisteredEnabled: boolean;
+	readonly forwardUnregisteredDestination: string | null;
+	readonly followMe: {
+		readonly enabled: boolean;
+		readonly ignoreBusy?: boolean;
+		readonly targets: readonly FollowMeTarget[];
+	} | null;
+	readonly recordPolicy: RecordPolicy;
+	readonly tollClass: TollClass;
+	readonly callTimeoutSeconds: number;
+	readonly maxRegistrations: number;
+	readonly codecOverride: string | null;
+	readonly enabled: boolean;
+}
+
+/** The three columns of one destination trio, spread onto the row rather than nested. */
+export interface DestinationTrio {
+	readonly destinationType: DestinationType | null;
+	readonly destinationRef: string | null;
+	readonly destinationData: DestinationData | null;
+}
+
+export interface PhoneNumberRow extends EntityRow, DestinationTrio {
+	readonly e164: string;
+	readonly label: string | null;
+	readonly callerIdNamePrefix: string | null;
+	readonly recordEnabled: boolean;
+	readonly emergencyAddressId: string | null;
+	readonly voiceEnabled: boolean;
+	readonly faxEnabled: boolean;
+	readonly enabled: boolean;
+}
+
+export interface TrunkRow extends EntityRow {
+	readonly name: string;
+	readonly kind: TrunkKind;
+	readonly sipDomain: string;
+	readonly sipProxy: string;
+	readonly outboundProxy: string | null;
+	readonly authUser: string | null;
+	readonly sipSecretRef: string | null;
+	readonly registerExpiresSeconds: number;
+	readonly transport: SipTransport;
+	readonly codecPrefs: string | null;
+	readonly maxChannels: number | null;
+	readonly callerIdNumberOverride: string | null;
+	readonly status: TrunkStatus;
+	readonly enabled: boolean;
+}
+
+export interface InboundRouteRow extends EntityRow, DestinationTrio {
+	readonly name: string;
+	readonly priority: number;
+	readonly matchKind: RouteMatchKind;
+	readonly matchPattern: string | null;
+	readonly phoneNumberId: string | null;
+	readonly callerIdPattern: string | null;
+	readonly failoverDestinationType: DestinationType | null;
+	readonly failoverDestinationRef: string | null;
+	readonly failoverDestinationData: DestinationData | null;
+	readonly timeConditionId: string | null;
+	readonly recordEnabled: boolean;
+	readonly enabled: boolean;
+}
+
+export interface TrunkPriorityEntry {
+	readonly trunkId: string;
+	readonly order: number;
+	readonly weight?: number;
+}
+
+export interface OutboundRouteRow extends EntityRow {
+	readonly name: string;
+	readonly priority: number;
+	readonly matchKind: RouteMatchKind;
+	readonly dialPatterns: readonly string[];
+	readonly stripDigits: number;
+	readonly prependDigits: string | null;
+	readonly tollClass: TollClass;
+	readonly trunkPriority: readonly TrunkPriorityEntry[];
+	readonly timeConditionId: string | null;
+	readonly failoverDestinationType: DestinationType | null;
+	readonly failoverDestinationRef: string | null;
+	readonly failoverDestinationData: DestinationData | null;
+	readonly callerIdNumberOverride: string | null;
+	readonly recordEnabled: boolean;
+	readonly enabled: boolean;
+}
+
+export interface TimeRulePredicate {
+	readonly weekdays?: readonly number[];
+	readonly monthDays?: readonly number[];
+	readonly months?: readonly number[];
+	readonly weeksOfMonth?: readonly number[];
+	readonly timeOfDay?: { readonly from: string; readonly to: string };
+	readonly dateRange?: { readonly from: string; readonly to: string };
+}
+
+export interface TimeConditionRow extends EntityRow, DestinationTrio {
+	readonly name: string;
+	readonly timezone: string;
+	readonly nomatchDestinationType: DestinationType | null;
+	readonly nomatchDestinationRef: string | null;
+	readonly nomatchDestinationData: DestinationData | null;
+	readonly enabled: boolean;
+}
+
+export interface TimeConditionRuleRow extends EntityRow {
+	readonly timeConditionId: string;
+	readonly ordinal: number;
+	readonly label: string | null;
+	readonly predicates: readonly TimeRulePredicate[];
+	readonly enabled: boolean;
+}
+
+export interface IvrMenuRow extends EntityRow {
+	readonly name: string;
+	readonly extensionNumber: string | null;
+	readonly parentId: string | null;
+	readonly greetingPromptId: string | null;
+	readonly shortGreetingPromptId: string | null;
+	readonly invalidPromptId: string | null;
+	readonly timeoutPromptId: string | null;
+	readonly digitTimeoutMs: number;
+	readonly interDigitTimeoutMs: number;
+	readonly maxDigits: number;
+	readonly maxFailures: number;
+	readonly maxTimeouts: number;
+	readonly directDialEnabled: boolean;
+	readonly timeoutDestinationType: DestinationType | null;
+	readonly timeoutDestinationRef: string | null;
+	readonly timeoutDestinationData: DestinationData | null;
+	readonly invalidDestinationType: DestinationType | null;
+	readonly invalidDestinationRef: string | null;
+	readonly invalidDestinationData: DestinationData | null;
+	readonly enabled: boolean;
+}
+
+export interface IvrMenuOptionRow extends EntityRow, DestinationTrio {
+	readonly ivrMenuId: string;
+	readonly ordinal: number;
+	readonly matchKind: IvrOptionMatchKind;
+	readonly matchValue: string;
+	readonly label: string | null;
+	readonly enabled: boolean;
+}
+
+export interface RingGroupRow extends EntityRow {
+	readonly name: string;
+	readonly extensionNumber: string | null;
+	readonly strategy: RingGroupStrategy;
+	readonly ringTimeoutSeconds: number;
+	readonly callerIdNamePrefix: string | null;
+	readonly ignoreBusy: boolean;
+	readonly confirmEnabled: boolean;
+	readonly confirmPromptId: string | null;
+	readonly mohClassId: string | null;
+	readonly ringbackPromptId: string | null;
+	readonly timeoutDestinationType: DestinationType | null;
+	readonly timeoutDestinationRef: string | null;
+	readonly timeoutDestinationData: DestinationData | null;
+	readonly enabled: boolean;
+}
+
+export interface RingGroupMemberRow extends EntityRow, DestinationTrio {
+	readonly ringGroupId: string;
+	readonly ordinal: number;
+	readonly delaySeconds: number;
+	readonly timeoutSeconds: number;
+	readonly confirmRequired: boolean;
+	readonly enabled: boolean;
+}
+
+export interface FeatureCodeRow extends EntityRow {
+	readonly code: string;
+	readonly action: FeatureCodeAction;
+	readonly params: Readonly<Record<string, string | number | boolean>> | null;
+	readonly label: string | null;
+	readonly enabled: boolean;
+}
+
+export interface VoicemailBoxRow extends EntityRow {
+	readonly mailboxNumber: string;
+	readonly label: string | null;
+	readonly extensionId: string | null;
+	readonly emailAddress: string | null;
+	readonly emailMode: VoicemailEmailMode;
+	readonly deleteAfterDelivery: boolean;
+	readonly transcriptionEnabled: boolean;
+	readonly mwiEnabled: boolean;
+	readonly maxMessages: number;
+	readonly maxMessageSeconds: number;
+	readonly enabled: boolean;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Routing operations
+// ---------------------------------------------------------------------------------------------
+
+export interface CompileResult {
+	readonly organizationId: string;
+	readonly snapshotHash: string;
+	readonly compiledAt: string;
+	readonly cacheKey: string;
+	readonly published: boolean;
+	readonly warnings: readonly WireDiagnostic[];
+}
+
+export interface SimulateResult {
+	readonly matched: boolean;
+	readonly routingContext: RoutingContext;
+	readonly entryNodeId?: string;
+	readonly destinationType?: string;
+	readonly destinationRef?: string;
+	readonly matchedRuleId?: string;
+	readonly matchedRuleName?: string;
+	readonly dialedNumber?: string;
+	readonly reason?: string;
+	readonly diagnostics: readonly WireDiagnostic[];
+}

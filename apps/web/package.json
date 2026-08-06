@@ -14,7 +14,8 @@
 		"start": "next start --port 3100",
 		"test": "bun test",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
-		"smoke": "tsx scripts/smoke-auth-flow.ts"
+		"smoke": "tsx scripts/smoke-auth-flow.ts",
+		"smoke:pbx": "tsx scripts/smoke-pbx.ts"
 	},
 	"dependencies": {
 		"@base-ui/react": "catalog:",
@@ -38,6 +39,8 @@
 	},
 	"devDependencies": {
 		"@optimiq-voice/auth": "workspace:*",
+		"@optimiq-voice/pbx-db": "workspace:*",
+		"@optimiq-voice/routing": "workspace:*",
 		"@tailwindcss/postcss": "catalog:",
 		"@tanstack/react-query-devtools": "catalog:",
 		"@types/bun": "catalog:",
