@@ -30,5 +30,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Run lint (includes format checking)
+      # `lint` is oxlint and `format:check` is oxfmt — two separate tools, so two separate steps.
+      # They used to be a single step labelled "includes format checking" that only ran oxlint,
+      # which meant formatting was never actually verified in CI.
+      - name: Run lint
         run: pnpm run lint
+
+      - name: Check formatting
+        run: pnpm run format:check

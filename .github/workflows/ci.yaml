@@ -1,0 +1,127 @@
+# Workspace CI for the Optimiq Voice platform packages.
+#
+# `unit tests` runs the legacy root mocha suite; this workflow runs what turbo knows about — the
+# per-package specs (bun:test in packages/*, mocha in apps/api), typecheck, the events codegen
+# drift gate and the Go modules. Build runs first because several packages resolve their workspace
+# dependencies through `main: ./dist/index.js` (pnpm-workspace has linkWorkspacePackages: false),
+# so the specs import built output, not source.
+#
+# NOT run here: the `verify:*` scripts in apps/api and the `smoke:*` scripts in apps/web. They talk
+# to a live Postgres + NATS + Asterisk stack and are run locally against the compose stack
+# (`pnpm run start:services`), not in CI.
+name: ci
+
+on:
+  pull_request:
+    branches:
+      - main
+      - "feat/**"
+  push:
+    branches:
+      - main
+      - "feat/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workspace:
+    name: build, test and typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.20.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.x"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      # Most package `test` scripts are `bun test src`, so the bun runtime has to be on PATH.
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.11"
+
+      - name: Restore turbo cache
+        uses: actions/cache@v4
+        with:
+          path: .turbo/cache
+          key: turbo-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            turbo-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm exec turbo run build
+
+      - name: Test
+        run: pnpm exec turbo run test
+
+      - name: Typecheck
+        run: pnpm exec turbo run typecheck
+
+  codegen-drift:
+    name: events codegen drift
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.20.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.x"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      # gofmt is what makes the generated Go canonical, so the codegen refuses to run without it.
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Regenerate the contract and fail on drift
+        run: pnpm --filter @optimiq-voice/events codegen:check
+
+  go:
+    name: go modules
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache-dependency-path: |
+            apps/sipd/go.sum
+            packages/events-go/go.sum
+
+      - name: Test apps/sipd
+        working-directory: apps/sipd
+        run: go test ./...
+
+      - name: Test packages/events-go
+        working-directory: packages/events-go
+        run: go test ./...
