@@ -1,6 +1,10 @@
 {
 	"compilerOptions": {
 		"composite": true,
+		// tsx resolves THIS tsconfig when root mocha runs; apps/api sources use
+		// parameter decorators, so the flag must be on here too.
+		"experimentalDecorators": true,
+		"emitDecoratorMetadata": true,
 		"outDir": "dist",
 		"rootDir": ".",
 		"declaration": true,
