@@ -20,13 +20,18 @@
  *
  * What it proves, in order:
  *
- *  1. Every PBX route the app claims — lists and the three detail views — renders through Next.
+ *  1. Every PBX route the app claims — lists and the four detail views — renders through Next.
  *  2. Create / edit / delete round trips for an extension, a DID and an inbound route carrying a
  *     destination trio, using the exact bodies the forms build.
  *  3. A dangling destination is refused, ROLLED BACK, and maps to a real form field.
  *  4. A compile failure is refused, ROLLED BACK, and reads as "not saved" rather than as a warning.
  *  5. A save that merely warns SUCCEEDS, and the warning is carried in the envelope.
  *  6. A refused delete names its referrers, and every one of them resolves to a link.
+ *  7. The T2 area end to end: a queue, an agent, a tier joining the two, a conference room, a park
+ *     lot, and a call-park feature code wired to that lot through the param-fields declaration the
+ *     form reads instead of a JSON textarea.
+ *  8. `queues.manage-agents` is a DIFFERENT grant from `queues.write`, enforced by the API — proved
+ *     with a second real session holding neither.
  *
  * Playwright is not set up in this repository, so this is fetch-level: it verifies the contract
  * and the server-rendered HTML, not clicks.
@@ -47,8 +52,9 @@ import {
 	pbxFormMessage,
 	pbxReferences,
 } from "../lib/pbx/errors";
+import { buildParamsBody, paramFieldsFor } from "../lib/pbx/feature-code-params";
 import { referenceHref } from "../lib/pbx/references";
-import type { EntityReference } from "../lib/pbx/contracts";
+import type { EntityReference, FeatureCodeParamFields } from "../lib/pbx/contracts";
 
 const DEFAULT_DATABASE_URL = "postgresql://optimiq:optimiq@localhost:5433/optimiq";
 const DEFAULT_PBX_DATABASE_URL = "postgresql://optimiq:optimiq@localhost:5433/optimiq_pbx";
@@ -268,10 +274,13 @@ async function main(): Promise<void> {
 			"./src/auth/auth-bootstrap.ts"
 		);
 		const { PbxModule } = await import("./src/pbx/pbx.module.ts");
+		// \`warn\` is on because development email delivery is a LOGGING stub — the one-time
+		// verification link is written to the log rather than sent, and section 12 needs it to put a
+		// second real member in the organization. See \`apps/api/src/auth/auth-email.delivery.ts\`.
 		const app = await NestFactory.create(
 			createApiRootModule([], [PbxModule]),
 			new FastifyAdapter(),
-			{ logger: ["error"] },
+			{ logger: ["error", "warn"] },
 		);
 		app.enableShutdownHooks();
 		await registerAuthTransport(app);
@@ -297,12 +306,49 @@ async function main(): Promise<void> {
 			stdio: ["ignore", "pipe", "pipe"],
 		},
 	);
+	/**
+	 * The API's log, kept so the verification link can be read out of it.
+	 *
+	 * Development email delivery is a stub that LOGS the one-time link instead of sending it, which
+	 * is the only way to complete a signup from a script — and completing one is the only way to get
+	 * a second real session, which is the only way to prove `queues.manage-agents` is enforced rather
+	 * than merely declared. Reading a token out of a log is not something production code should ever
+	 * do; it is exactly what a smoke against a logging mailer must.
+	 *
+	 * Both streams are captured because which one a Nest `warn` lands on is a framework detail, and
+	 * this must not break the day it changes.
+	 */
+	let apiLog = "";
+
 	apiProcess.stderr?.on("data", (chunk: Buffer) => {
-		const text = chunk.toString().trim();
-		if (text) {
-			console.error(`  [api] ${text}`);
+		const text = chunk.toString();
+		apiLog += text;
+		const trimmed = text.trim();
+		// The stub mailer's warnings are expected noise here — they are the point, not a problem.
+		if (trimmed && !trimmed.includes("STUB email delivery")) {
+			console.error(`  [api] ${trimmed}`);
 		}
 	});
+
+	apiProcess.stdout?.on("data", (chunk: Buffer) => {
+		apiLog += chunk.toString();
+	});
+
+	async function verificationTokenFor(email: string): Promise<string | undefined> {
+		const deadline = Date.now() + 10_000;
+		const pattern = new RegExp(
+			`verification link for ${email.replaceAll(/[.+]/gu, String.raw`\$&`)}[^\\n]*?token=([\\w.-]+)`,
+			"u",
+		);
+		while (Date.now() < deadline) {
+			const match = pattern.exec(apiLog);
+			if (match?.[1]) {
+				return match[1];
+			}
+			await delay(200);
+		}
+		return undefined;
+	}
 
 	let next: ChildProcess | null = null;
 
@@ -391,9 +437,11 @@ async function main(): Promise<void> {
 		const seededIvr = await client("GET", "/api/v1/ivr-menus?page=1&limit=1");
 		const seededRingGroups = await client("GET", "/api/v1/ring-groups?page=1&limit=1");
 		const seededConditions = await client("GET", "/api/v1/time-conditions?page=1&limit=1");
+		const seededQueues = await client("GET", "/api/v1/queues?page=1&limit=1");
 		const ivrMenuId = firstId(seededIvr);
 		const ringGroupId = firstId(seededRingGroups);
 		const timeConditionId = firstId(seededConditions);
+		const seededQueueId = firstId(seededQueues);
 
 		const routes = [
 			"/extensions",
@@ -402,6 +450,10 @@ async function main(): Promise<void> {
 			"/voicemail",
 			"/ivr",
 			"/ring-groups",
+			"/queues",
+			"/queues?tab=agents",
+			"/conferences",
+			"/park-lots",
 			"/routing",
 			"/routing?tab=outbound",
 			"/routing?tab=time-conditions",
@@ -409,6 +461,7 @@ async function main(): Promise<void> {
 			"/routing?tab=tools",
 			`/ivr/${ivrMenuId}`,
 			`/ring-groups/${ringGroupId}`,
+			`/queues/${seededQueueId}`,
 			`/routing/time-conditions/${timeConditionId}`,
 		];
 		const routeFailures: string[] = [];
@@ -706,6 +759,416 @@ async function main(): Promise<void> {
 			Array.isArray(data(simulated).diagnostics),
 			typeof data(simulated).diagnostics,
 		);
+
+		// --- 11. a queue, an agent, and the tier that joins them -----------------------------------
+		console.log("\n11. queue: settings, an agent, and a membership");
+
+		/**
+		 * The agent's own extension, created here rather than reused: section 9 deleted the one
+		 * section 2 built, and a smoke that silently depends on teardown order is a smoke that fails
+		 * for the wrong reason.
+		 */
+		const agentExtension = await client("POST", "/api/v1/extensions", {
+			number: `8${RUN_DIGITS}`,
+			label: "Smoke Agent Extension",
+			sipSecretRef: `secret://smoke-agent/${RUN_ID}`,
+			tollClass: "internal",
+			recordPolicy: "none",
+			enabled: true,
+		});
+		const agentExtensionId = rowId(agentExtension);
+
+		const queue = await client("POST", "/api/v1/queues", {
+			name: `Smoke queue ${RUN_ID}`,
+			extensionNumber: `7${RUN_DIGITS}`,
+			strategy: "longest-idle",
+			maxWaitSeconds: 300,
+			maxWaitNoAgentSeconds: 30,
+			wrapUpSeconds: 10,
+			announcePositionEnabled: true,
+			announceFrequencySeconds: 30,
+			tierRulesApply: true,
+			tierRuleWaitSeconds: 10,
+			recordEnabled: false,
+			enabled: true,
+			// The queue form's own trio writer, so the smoke exercises the code the dialog runs.
+			...writeDestination({ type: "extension", ref: agentExtensionId, data: null }, "timeout"),
+		});
+		const queueId = rowId(queue);
+		check(
+			"create queue -> 201 with the settings the dialog sends",
+			queue.status === 201 && data(queue).strategy === "longest-idle",
+			`status ${queue.status}`,
+		);
+
+		/**
+		 * `resettable`: an emptied numeric control sends `null` and means "put it back to the server
+		 * default", NOT "clear it to NULL". Every knob on the queue form is one of these, so a `null`
+		 * that came back as `null` would mean the whole form clears columns it meant to reset.
+		 */
+		const reset = await client("PATCH", `/api/v1/queues/${queueId}`, { wrapUpSeconds: null });
+		check(
+			"a null on a resettable knob restores the default rather than nulling the column",
+			reset.status === 200 && typeof data(reset).wrapUpSeconds === "number",
+			`status ${reset.status}, wrapUpSeconds ${JSON.stringify(data(reset).wrapUpSeconds)}`,
+		);
+
+		const agent = await client("POST", "/api/v1/queue-agents", {
+			name: `Smoke agent ${RUN_ID}`,
+			contactKind: "extension",
+			extensionId: agentExtensionId,
+			contact: null,
+			status: "logged-out",
+			maxNoAnswer: 3,
+			enabled: true,
+		});
+		const agentId = rowId(agent);
+		check(
+			"create agent -> 201 at the TOP-LEVEL endpoint, carrying no queue",
+			agent.status === 201 && data(agent).queueId === undefined,
+			`status ${agent.status}`,
+		);
+
+		/** The reachability pair, refused server-side exactly as the form refuses it. */
+		const unreachable = await client("POST", "/api/v1/queue-agents", {
+			name: `Unreachable ${RUN_ID}`,
+			contactKind: "extension",
+			extensionId: null,
+			contact: null,
+		});
+		const unreachableFields = pbxFieldErrors(asApiError(unreachable));
+		check(
+			"an agent with no way to be dialled is refused, on the extension control",
+			unreachable.status === 400 && typeof unreachableFields.extensionId === "string",
+			`status ${unreachable.status}, fields ${JSON.stringify(Object.keys(unreachableFields))}`,
+		);
+
+		const tier = await client("POST", `/api/v1/queues/${queueId}/tiers`, {
+			queueAgentId: agentId,
+			level: 1,
+			position: 1,
+		});
+		const tierId = rowId(tier);
+		check(
+			"staff the queue -> 201, and the tier carries (level, position)",
+			tier.status === 201 && data(tier).level === 1 && data(tier).position === 1,
+			`status ${tier.status}`,
+		);
+
+		const movedTier = await client("PATCH", `/api/v1/queues/${queueId}/tiers/${tierId}`, {
+			level: 2,
+			position: 5,
+		});
+		check(
+			"a membership can be moved between levels",
+			movedTier.status === 200 && data(movedTier).level === 2 && data(movedTier).position === 5,
+			`status ${movedTier.status}`,
+		);
+
+		const tierList = await client("GET", `/api/v1/queues/${queueId}/tiers`);
+		check(
+			"the tier list is an unpaginated collection, as the child panel assumes",
+			tierList.status === 200 &&
+				Array.isArray(tierList.body.data) &&
+				(tierList.body.data as unknown[]).length === 1,
+			`status ${tierList.status}`,
+		);
+
+		/**
+		 * A tier has NO reorder endpoint, deliberately: its place is `(level, position)`, which the
+		 * caller states because it decides who is offered the call first. The detail page has no drag
+		 * handle for exactly this reason, and this is the check that keeps that true.
+		 */
+		const reorder = await client("PUT", `/api/v1/queues/${queueId}/tiers/reorder`, {
+			ids: [tierId],
+		});
+		check(
+			"there is no reorder endpoint for tiers, so the UI must not offer one",
+			reorder.status === 404 || reorder.status === 405,
+			`status ${reorder.status}`,
+		);
+
+		// --- 12. `queues.manage-agents` is not `queues.write` ---------------------------------------
+		console.log("\n12. staffing the floor is a different grant from editing the queue");
+
+		const agentEmail = `pbx-smoke-agent-${RUN_ID}@smoke.optimiq.test`;
+		const invited = await client("POST", "/api/auth/organization/invite-member", {
+			email: agentEmail,
+			role: "agent",
+			organizationId,
+		});
+		const invitationId = typeof invited.body.id === "string" ? invited.body.id : "";
+
+		/** A SECOND real session, because a permission the API does not enforce is decoration. */
+		const agentJar = new CookieJar();
+		const agentClient: Client = makeClient(webUrl, agentJar);
+		const agentSignUp = await agentClient("POST", "/api/auth/sign-up/email", {
+			name: "PBX Smoke Agent",
+			email: agentEmail,
+			password,
+		});
+		/**
+		 * `requireEmailVerificationOnInvitation` is on, so an unverified account cannot join an
+		 * organization — which is the right policy and an obstacle for a script. The stub mailer logs
+		 * the link, so the token is read back out of the API's log.
+		 */
+		const verificationToken = await verificationTokenFor(agentEmail);
+		const verified = await agentClient(
+			"GET",
+			`/api/auth/verify-email?token=${verificationToken ?? ""}`,
+		);
+		const accepted = await agentClient("POST", "/api/auth/organization/accept-invitation", {
+			invitationId,
+		});
+		const activated = await agentClient("POST", "/api/auth/organization/set-active", {
+			organizationId,
+		});
+		check(
+			"the invited agent verifies, accepts, and lands on the organization",
+			invited.status === 200 &&
+				agentSignUp.status === 200 &&
+				verified.status < 400 &&
+				accepted.status === 200 &&
+				activated.status === 200,
+			`invite ${invited.status}, sign-up ${agentSignUp.status}, verify ${verified.status}, accept ${
+				accepted.status
+			} ${JSON.stringify(accepted.body).slice(0, 120)}, activate ${activated.status}`,
+		);
+
+		const agentMe = await agentClient("GET", "/api/v1/me");
+		const agentPermissions = Array.isArray(agentMe.body.permissions)
+			? (agentMe.body.permissions as string[])
+			: [];
+		check(
+			"the agent role resolves to queues.read and park-lots.read but neither write grant",
+			agentPermissions.includes("queues.read") &&
+				agentPermissions.includes("park-lots.read") &&
+				!agentPermissions.includes("queues.write") &&
+				!agentPermissions.includes("queues.manage-agents"),
+			`${agentPermissions.length} permissions`,
+		);
+
+		const agentReadsQueues = await agentClient("GET", "/api/v1/queues?page=1&limit=1");
+		const agentReadsLots = await agentClient("GET", "/api/v1/park-lots?page=1&limit=1");
+		check(
+			"and can READ both lists, which is why those pages are gated on the read grant",
+			agentReadsQueues.status === 200 && agentReadsLots.status === 200,
+			`queues ${agentReadsQueues.status}, park-lots ${agentReadsLots.status}`,
+		);
+
+		/** The manage-agents-gated action: the UI hides this button, and the API refuses it. */
+		const refusedTier = await agentClient("POST", `/api/v1/queues/${queueId}/tiers`, {
+			queueAgentId: agentId,
+			level: 1,
+			position: 2,
+		});
+		check(
+			"staffing a queue without queues.manage-agents is refused",
+			refusedTier.status === 403,
+			`status ${refusedTier.status}`,
+		);
+
+		const refusedAgent = await agentClient("POST", "/api/v1/queue-agents", {
+			name: "Should not exist",
+			contactKind: "external",
+			contact: "+12125550111",
+		});
+		const refusedSettings = await agentClient("PATCH", `/api/v1/queues/${queueId}`, {
+			maxWaitSeconds: 10,
+		});
+		check(
+			"and so are creating an agent and editing the queue's own settings",
+			refusedAgent.status === 403 && refusedSettings.status === 403,
+			`agent ${refusedAgent.status}, settings ${refusedSettings.status}`,
+		);
+
+		// --- 13. a conference room -----------------------------------------------------------------
+		console.log("\n13. conference: create and edit, with no PIN anywhere on the wire");
+		const conference = await client("POST", "/api/v1/conferences", {
+			name: `Smoke room ${RUN_ID}`,
+			roomNumber: `9${RUN_DIGITS}`,
+			maxMembers: 25,
+			recordEnabled: false,
+			announceJoinLeave: true,
+			waitForModerator: false,
+			enabled: true,
+		});
+		const conferenceId = rowId(conference);
+		check(
+			"create conference -> 201 with the body the dialog builds",
+			conference.status === 201 && data(conference).roomNumber === `9${RUN_DIGITS}`,
+			`status ${conference.status}`,
+		);
+
+		/**
+		 * The form omits the PIN columns because the API does not accept them. If that ever changed
+		 * silently, a dialog with no PIN control would be hiding a setting users need — so the
+		 * refusal is asserted rather than assumed.
+		 */
+		const pinned = await client("PATCH", `/api/v1/conferences/${conferenceId}`, {
+			pinHash: "0123456789abcdef",
+		});
+		check(
+			"a PIN digest is refused by the DTO, which is why the form has no PIN control",
+			pinned.status === 400,
+			`status ${pinned.status}`,
+		);
+
+		const resized = await client("PATCH", `/api/v1/conferences/${conferenceId}`, {
+			maxMembers: 60,
+		});
+		check(
+			"edit conference -> 200",
+			resized.status === 200 && data(resized).maxMembers === 60,
+			`status ${resized.status}`,
+		);
+
+		// --- 14. a park lot, and the feature code wired to it via param-fields ---------------------
+		console.log("\n14. park lot + a call-park code pointed at it through the param declaration");
+		const slotStart = 7000 + (Number(RUN_DIGITS) % 900);
+		const lot = await client("POST", "/api/v1/park-lots", {
+			name: `Smoke lot ${RUN_ID}`,
+			slotStart,
+			slotEnd: slotStart + 9,
+			timeoutSeconds: 120,
+			enabled: true,
+			...writeDestination({ type: "extension", ref: agentExtensionId, data: null }, "timeout"),
+		});
+		const lotId = rowId(lot);
+		check(
+			"create park lot -> 201 with the slot range and the timeout trio",
+			lot.status === 201 &&
+				data(lot).slotStart === slotStart &&
+				data(lot).timeoutDestinationType === "extension",
+			`status ${lot.status}`,
+		);
+
+		/** The range check the schema mirrors: it lands on `slotEnd`, not on the row. */
+		const backwards = await client("POST", "/api/v1/park-lots", {
+			name: `Backwards ${RUN_ID}`,
+			slotStart: slotStart + 9,
+			slotEnd: slotStart,
+		});
+		const backwardsFields = pbxFieldErrors(asApiError(backwards));
+		check(
+			"a slot range that runs backwards is refused on the last-slot control",
+			backwards.status === 400 && typeof backwardsFields.slotEnd === "string",
+			`status ${backwards.status}, fields ${JSON.stringify(Object.keys(backwardsFields))}`,
+		);
+
+		/**
+		 * The whole point of `param-fields`: the feature-code form renders a park-lot PICKER instead
+		 * of a JSON textarea, and it can only do that if the server declares the key. So the
+		 * declaration is fetched and the body is built by the app's own `buildParamsBody` — the same
+		 * function the dialog calls.
+		 */
+		const declaration = await client("GET", "/api/v1/feature-codes/param-fields");
+		const fields = declaration.body.data as FeatureCodeParamFields | undefined;
+		const parkFields = paramFieldsFor(fields, "call-park");
+		check(
+			"GET /feature-codes/param-fields declares call-park's lotId as an entity ref into park",
+			declaration.status === 200 &&
+				parkFields.length === 1 &&
+				parkFields[0]?.name === "lotId" &&
+				parkFields[0]?.kind === "entity" &&
+				parkFields[0]?.entityType === "park",
+			`status ${declaration.status}, ${JSON.stringify(parkFields)}`,
+		);
+		check(
+			"and declares no parameters for an action that takes none, so the form shows no controls",
+			paramFieldsFor(fields, "redial").length === 0,
+			JSON.stringify(paramFieldsFor(fields, "redial")),
+		);
+
+		const parkCode = await client("POST", "/api/v1/feature-codes", {
+			code: `*8${RUN_DIGITS}`,
+			action: "call-park",
+			params: buildParamsBody(parkFields, { lotId }),
+			label: "Park a call",
+			enabled: true,
+		});
+		const parkCodeId = rowId(parkCode);
+		const storedParams = data(parkCode).params as Record<string, unknown> | null;
+		check(
+			"the picker's choice reaches the server as params.lotId",
+			parkCode.status === 201 && storedParams?.lotId === lotId,
+			`status ${parkCode.status}, params ${JSON.stringify(storedParams)}`,
+		);
+
+		/** A typo the old free-form bag would have accepted, saved, and silently never read. */
+		const typo = await client("POST", "/api/v1/feature-codes", {
+			code: `*9${RUN_DIGITS}`,
+			action: "call-park",
+			params: { lot_id: lotId },
+		});
+		const typoFields = pbxFieldErrors(asApiError(typo));
+		check(
+			"an undeclared parameter key is refused and lands on the parameters section",
+			typo.status === 400 && typeof typoFields.params === "string",
+			`status ${typo.status}, fields ${JSON.stringify(Object.keys(typoFields))}`,
+		);
+
+		/**
+		 * Switching the action retires the old one's parameters. The form sends `action` with a
+		 * `params` built from the NEW action's (empty) field list, which is `null` — and the server
+		 * agrees that is what replacing an action means.
+		 */
+		const repointedCode = await client("PATCH", `/api/v1/feature-codes/${parkCodeId}`, {
+			action: "redial",
+			params: buildParamsBody(paramFieldsFor(fields, "redial"), { lotId }),
+		});
+		check(
+			"changing the action clears the parameters the old one was pointed at",
+			repointedCode.status === 200 && !data(repointedCode).params,
+			`status ${repointedCode.status}, params ${JSON.stringify(data(repointedCode).params)}`,
+		);
+
+		await client("PATCH", `/api/v1/feature-codes/${parkCodeId}`, {
+			action: "call-park",
+			params: buildParamsBody(parkFields, { lotId }),
+		});
+
+		/**
+		 * `feature_code.params.lotId` names a lot from inside a `jsonb` column, so no foreign key can
+		 * express it and the generic reverse scan cannot see it. The API has a dedicated scan for
+		 * exactly this, which is what makes the park-lot delete confirmation's copy true.
+		 */
+		const refusedLot = await client("DELETE", `/api/v1/park-lots/${lotId}`);
+		const lotReferences: readonly EntityReference[] = pbxReferences(asApiError(refusedLot));
+		check(
+			"deleting a lot a call-park code pins is refused, naming the code",
+			refusedLot.status === 409 &&
+				lotReferences.some((reference) => reference.kind === "feature-code"),
+			`status ${refusedLot.status}, ${lotReferences.map((r) => r.kind).join(", ")}`,
+		);
+		check(
+			"and that referrer resolves to the feature-codes tab, prefilled",
+			lotReferences.every((reference) => referenceHref(reference) !== undefined),
+			lotReferences.map((reference) => referenceHref(reference) ?? "—").join(", "),
+		);
+
+		// --- 15. tear the T2 fixture down, in dependency order -------------------------------------
+		console.log("\n15. delete the T2 fixture");
+		await client("DELETE", `/api/v1/feature-codes/${parkCodeId}`);
+		const lotDeleted = await client("DELETE", `/api/v1/park-lots/${lotId}`);
+		check(
+			"delete park lot -> 200 once no code pins it",
+			lotDeleted.status === 200,
+			`status ${lotDeleted.status}`,
+		);
+		const conferenceDeleted = await client("DELETE", `/api/v1/conferences/${conferenceId}`);
+		check(
+			"delete conference -> 200",
+			conferenceDeleted.status === 200,
+			`status ${conferenceDeleted.status}`,
+		);
+		const tierDeleted = await client("DELETE", `/api/v1/queues/${queueId}/tiers/${tierId}`);
+		check("delete membership -> 200", tierDeleted.status === 200, `status ${tierDeleted.status}`);
+		const agentDeleted = await client("DELETE", `/api/v1/queue-agents/${agentId}`);
+		check("delete agent -> 200", agentDeleted.status === 200, `status ${agentDeleted.status}`);
+		const queueDeleted = await client("DELETE", `/api/v1/queues/${queueId}`);
+		check("delete queue -> 200", queueDeleted.status === 200, `status ${queueDeleted.status}`);
+		await client("DELETE", `/api/v1/extensions/${agentExtensionId}`);
 	} finally {
 		next?.kill("SIGTERM");
 		apiProcess.kill("SIGTERM");

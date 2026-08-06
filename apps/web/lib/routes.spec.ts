@@ -1,5 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { isPublicRoute, routes, safeRedirectTarget, signInWithRedirect } from "./routes";
+import {
+	isPublicRoute,
+	queueTabHref,
+	routes,
+	safeRedirectTarget,
+	signInWithRedirect,
+} from "./routes";
 
 describe("isPublicRoute", () => {
 	it("covers the auth screens and the invitation landing page", () => {
@@ -55,5 +61,28 @@ describe("signInWithRedirect", () => {
 	it("omits the parameter when there is nothing worth returning to", () => {
 		expect(signInWithRedirect(routes.overview)).toBe(routes.signIn);
 		expect(signInWithRedirect(routes.signIn)).toBe(routes.signIn);
+	});
+});
+
+describe("queueTabHref", () => {
+	/**
+	 * The default tab is the bare path, not `?tab=queues`. `nuqs` is configured with
+	 * `clearOnDefault`, so a link carrying the default would be rewritten the moment the page loaded
+	 * — leaving the user on a URL that differs from the one they were sent.
+	 */
+	it("leaves the default tab off the URL and names every other one", () => {
+		expect(queueTabHref("queues")).toBe(routes.queues);
+		expect(queueTabHref("agents")).toBe(`${routes.queues}?tab=agents`);
+	});
+});
+
+describe("detail routes", () => {
+	/**
+	 * Nested under the list's path, which is what makes `getPagePermissions` inherit the list's
+	 * requirement by ancestry rather than needing a `PAGE_PERMISSIONS` line of its own.
+	 */
+	it("nests a queue's detail view under the queue list", () => {
+		expect(routes.queue("0193f2aa")).toBe(`${routes.queues}/0193f2aa`);
+		expect(routes.queue("0193f2aa").startsWith(`${routes.queues}/`)).toBe(true);
 	});
 });

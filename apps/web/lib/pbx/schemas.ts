@@ -17,6 +17,9 @@ import { z } from "zod";
 import {
 	FEATURE_CODE_ACTIONS,
 	IVR_OPTION_MATCH_KINDS,
+	QUEUE_AGENT_CONTACT_KINDS,
+	QUEUE_AGENT_STATUSES,
+	QUEUE_STRATEGIES,
 	RECORD_POLICIES,
 	RING_GROUP_STRATEGIES,
 	ROUTE_MATCH_KINDS,
@@ -95,6 +98,27 @@ function optionalInt(min: number, max: number) {
 			`Must be between ${min} and ${max}`,
 		);
 }
+
+/**
+ * A numeric control the server has NO default for, so blank is not "use the default" — it is a
+ * missing required column.
+ *
+ * `park_lot.slot_start` and `slot_end` are the only two of these: every other integer on a PBX row
+ * is `notNull().default(n)` and therefore {@link optionalInt}. Treating them the same would send
+ * `undefined` for a column the DTO requires and turn an empty input into a 400 with no field.
+ */
+function requiredInt(min: number, max: number) {
+	return z
+		.string()
+		.trim()
+		.min(1, "Required")
+		.transform((value) => Number(value))
+		.refine((value) => Number.isInteger(value), "Whole numbers only")
+		.refine((value) => value >= min && value <= max, `Must be between ${min} and ${max}`);
+}
+
+/** A select over another resource's rows, where the server column is a required uuid. */
+const requiredReference = z.string().trim().min(1, "Required");
 
 export const timezoneName = z
 	.string()
@@ -307,6 +331,133 @@ export const ringGroupMemberFormSchema = z.strictObject({
 	enabled: z.boolean(),
 });
 export type RingGroupMemberFormValues = z.input<typeof ringGroupMemberFormSchema>;
+
+/**
+ * A queue's own settings — everything the DTO calls a knob, and nothing about who answers it.
+ *
+ * `mohClassId`, `greetingPromptId` and `announcePromptId` are absent for the same reason a ring
+ * group's `mohClassId` is: they are uuids into tables with no CRUD endpoint, so a control here would
+ * be a text box for an id nobody can look up. `PATCH` semantics keep whatever is already stored —
+ * the form sends only what it showed — so a seeded greeting survives every save made here.
+ */
+export const queueFormSchema = z.strictObject({
+	name: displayName,
+	extensionNumber: optionalDigits(16),
+	strategy: z.enum(QUEUE_STRATEGIES),
+	/** 0 disables the cap and callers wait indefinitely. */
+	maxWaitSeconds: optionalInt(0, 86_400),
+	maxWaitNoAgentSeconds: optionalInt(0, 86_400),
+	wrapUpSeconds: optionalInt(0, 3600),
+	announcePositionEnabled: z.boolean(),
+	announceFrequencySeconds: optionalInt(5, 3600),
+	abandonedResumeAllowed: z.boolean(),
+	discardAbandonedAfterSeconds: optionalInt(0, 86_400),
+	tierRulesApply: z.boolean(),
+	tierRuleWaitSeconds: optionalInt(0, 3600),
+	tierRuleNoAgentNoWait: z.boolean(),
+	recordEnabled: z.boolean(),
+	enabled: z.boolean(),
+});
+export type QueueFormValues = z.input<typeof queueFormSchema>;
+
+/**
+ * One agent.
+ *
+ * The reachability pair is checked here as well as on the server, and deliberately with the server's
+ * own wording: `contact_kind` decides which of two nullable columns is the live one, and an agent
+ * the engine cannot dial is a seat that silently never rings. Catching it before the round trip puts
+ * the message on the control the user was editing.
+ *
+ * `statusChangedAt` is not here because it is not writable — it is stamped when `status` moves, and
+ * a form that could backdate it would make every wallboard's "on this call for 12 minutes" a number
+ * the agent chose.
+ */
+export const queueAgentFormSchema = z
+	.strictObject({
+		name: displayName,
+		contactKind: z.enum(QUEUE_AGENT_CONTACT_KINDS),
+		extensionId: z.string().trim(),
+		contact: z
+			.string()
+			.trim()
+			.refine((value) => value === "" || dialableString.safeParse(value).success, {
+				message: "Must be a dialable string",
+			})
+			.transform((value) => (value.length === 0 ? null : value)),
+		status: z.enum(QUEUE_AGENT_STATUSES),
+		wrapUpSeconds: optionalInt(0, 3600),
+		maxNoAnswer: optionalInt(1, 100),
+		noAnswerDelaySeconds: optionalInt(0, 3600),
+		busyDelaySeconds: optionalInt(0, 3600),
+		rejectDelaySeconds: optionalInt(0, 3600),
+		enabled: z.boolean(),
+	})
+	.refine((value) => value.contactKind !== "extension" || value.extensionId.length > 0, {
+		path: ["extensionId"],
+		message: "An extension-backed agent needs the extension the call is offered to.",
+	})
+	.refine((value) => value.contactKind !== "external" || value.contact !== null, {
+		path: ["contact"],
+		message: "An external agent needs the number to dial.",
+	});
+export type QueueAgentFormValues = z.input<typeof queueAgentFormSchema>;
+
+/**
+ * A tier: which agent serves which queue, at which ring level and in what order within it.
+ *
+ * `queueId` is in the FORM but never in the body — the queue is the path segment. It is here because
+ * the same dialog is opened from a queue's page (where the queue is fixed) and from the agents list
+ * (where it is the thing being chosen), and the validator must be able to say "pick a queue" in the
+ * second case.
+ */
+export const queueTierFormSchema = z.strictObject({
+	queueId: requiredReference,
+	queueAgentId: requiredReference,
+	/** Lower levels are offered the call first; every agent at a level is tried before the next. */
+	level: optionalInt(1, 100),
+	/** Order within the level, which `top-down` and `round-robin` walk in. */
+	position: optionalInt(1, 1000),
+});
+export type QueueTierFormValues = z.input<typeof queueTierFormSchema>;
+
+/**
+ * A conference room.
+ *
+ * No PIN fields: a PIN is set through an endpoint that hashes it, never by pasting a digest into a
+ * JSON body, and that endpoint does not exist yet. The dialog says so rather than offering a control
+ * that would silently store nothing.
+ */
+export const conferenceFormSchema = z.strictObject({
+	name: displayName,
+	roomNumber: internalNumber,
+	maxMembers: optionalInt(2, 1000),
+	recordEnabled: z.boolean(),
+	announceJoinLeave: z.boolean(),
+	waitForModerator: z.boolean(),
+	enabled: z.boolean(),
+});
+export type ConferenceFormValues = z.input<typeof conferenceFormSchema>;
+
+/**
+ * A park lot: an inclusive slot range and what happens to a call nobody picks back up.
+ *
+ * The range check mirrors the server's, which mirrors a check constraint. Without it the database
+ * refuses the row with a `23514` that surfaces as a 503 — a failure the user cannot act on — so both
+ * layers turn it into a message on `slotEnd`.
+ */
+export const parkLotFormSchema = z
+	.strictObject({
+		name: displayName,
+		slotStart: requiredInt(1, 99_999),
+		slotEnd: requiredInt(1, 99_999),
+		timeoutSeconds: optionalInt(5, 86_400),
+		enabled: z.boolean(),
+	})
+	.refine((value) => value.slotEnd >= value.slotStart, {
+		path: ["slotEnd"],
+		message: "The last slot must not be lower than the first.",
+	});
+export type ParkLotFormValues = z.input<typeof parkLotFormSchema>;
 
 export const featureCodeFormSchema = z.strictObject({
 	code: z

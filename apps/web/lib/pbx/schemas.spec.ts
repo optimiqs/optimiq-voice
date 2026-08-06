@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+	conferenceFormSchema,
 	dialableString,
 	e164,
 	extensionFormSchema,
@@ -7,7 +8,11 @@ import {
 	inboundRouteFormSchema,
 	internalNumber,
 	outboundRouteFormSchema,
+	parkLotFormSchema,
 	parseDialPatterns,
+	queueAgentFormSchema,
+	queueFormSchema,
+	queueTierFormSchema,
 	timeRuleFormSchema,
 	timezoneName,
 	voicemailBoxFormSchema,
@@ -323,5 +328,211 @@ describe("voicemailBoxFormSchema", () => {
 	it("treats a blank email as absent rather than as an invalid address", () => {
 		expect(voicemailBoxFormSchema.parse(base).emailAddress).toBeNull();
 		expect(voicemailBoxFormSchema.safeParse({ ...base, emailAddress: "nope" }).success).toBe(false);
+	});
+});
+
+describe("queueFormSchema", () => {
+	const base = {
+		name: "Support",
+		extensionNumber: "",
+		strategy: "longest-idle" as const,
+		maxWaitSeconds: "",
+		maxWaitNoAgentSeconds: "",
+		wrapUpSeconds: "",
+		announcePositionEnabled: false,
+		announceFrequencySeconds: "",
+		abandonedResumeAllowed: false,
+		discardAbandonedAfterSeconds: "",
+		tierRulesApply: true,
+		tierRuleWaitSeconds: "",
+		tierRuleNoAgentNoWait: false,
+		recordEnabled: false,
+		enabled: true,
+	};
+
+	/**
+	 * The whole point of `resettable` on the server: an emptied numeric control means "put it back
+	 * to the default", which is `null` on the wire — not `""`, and not the column's current value.
+	 */
+	it("turns every emptied number into a null rather than a zero", () => {
+		const parsed = queueFormSchema.parse(base);
+		expect(parsed.maxWaitSeconds).toBeNull();
+		expect(parsed.wrapUpSeconds).toBeNull();
+		expect(parsed.tierRuleWaitSeconds).toBeNull();
+	});
+
+	/** 0 is a REAL value here — it disables the cap and makes callers wait indefinitely. */
+	it("keeps a zero wait cap, which is not the same as leaving it empty", () => {
+		expect(queueFormSchema.parse({ ...base, maxWaitSeconds: "0" }).maxWaitSeconds).toBe(0);
+	});
+
+	it("bounds the announcement interval at the server's own floor of 5 seconds", () => {
+		expect(queueFormSchema.safeParse({ ...base, announceFrequencySeconds: "4" }).success).toBe(
+			false,
+		);
+		expect(queueFormSchema.safeParse({ ...base, announceFrequencySeconds: "5" }).success).toBe(
+			true,
+		);
+	});
+
+	it("refuses a wait cap past a day and an internal number with letters in it", () => {
+		expect(queueFormSchema.safeParse({ ...base, maxWaitSeconds: "86401" }).success).toBe(false);
+		expect(queueFormSchema.safeParse({ ...base, extensionNumber: "70a0" }).success).toBe(false);
+		expect(queueFormSchema.parse({ ...base, extensionNumber: "" }).extensionNumber).toBeNull();
+	});
+});
+
+describe("queueAgentFormSchema", () => {
+	const base = {
+		name: "Alice Chen",
+		contactKind: "extension" as const,
+		extensionId: "0193f2aa-0000-7000-8000-000000000001",
+		contact: "",
+		status: "logged-out" as const,
+		wrapUpSeconds: "",
+		maxNoAnswer: "",
+		noAnswerDelaySeconds: "",
+		busyDelaySeconds: "",
+		rejectDelaySeconds: "",
+		enabled: true,
+	};
+
+	/**
+	 * The reachability pair, mirrored from the server's `assertReachable`. An agent the engine
+	 * cannot dial is a seat that silently never rings — the queue simply times out — so both layers
+	 * refuse it, and this one puts the message on the control the user was editing.
+	 */
+	it("an extension-backed agent needs an extension", () => {
+		const result = queueAgentFormSchema.safeParse({ ...base, extensionId: "" });
+		expect(result.success).toBe(false);
+		expect(result.error?.issues[0]?.path).toEqual(["extensionId"]);
+	});
+
+	it("an external agent needs a number, and is happy without an extension", () => {
+		const external = { ...base, contactKind: "external" as const, extensionId: "" };
+		const result = queueAgentFormSchema.safeParse(external);
+		expect(result.success).toBe(false);
+		expect(result.error?.issues[0]?.path).toEqual(["contact"]);
+
+		expect(queueAgentFormSchema.safeParse({ ...external, contact: "+12125550100" }).success).toBe(
+			true,
+		);
+	});
+
+	it("rejects a contact that is not dialable", () => {
+		const external = { ...base, contactKind: "external" as const, extensionId: "" };
+		expect(queueAgentFormSchema.safeParse({ ...external, contact: "call alice" }).success).toBe(
+			false,
+		);
+	});
+
+	it("keeps at least one no-answer attempt — zero would never offer the agent a call", () => {
+		expect(queueAgentFormSchema.safeParse({ ...base, maxNoAnswer: "0" }).success).toBe(false);
+		expect(queueAgentFormSchema.safeParse({ ...base, maxNoAnswer: "1" }).success).toBe(true);
+	});
+});
+
+describe("queueTierFormSchema", () => {
+	const base = {
+		queueId: "0193f2aa-0000-7000-8000-000000000002",
+		queueAgentId: "0193f2aa-0000-7000-8000-000000000003",
+		level: "",
+		position: "",
+	};
+
+	/**
+	 * `queueId` is validated here and never sent: it is the endpoint's path segment. The dialog is
+	 * opened from a queue's page (where it is context) AND from the agent list (where it is a
+	 * choice), and the second case is the one that needs a "pick a queue" message.
+	 */
+	it("requires both ends of the membership", () => {
+		expect(queueTierFormSchema.safeParse({ ...base, queueId: "" }).success).toBe(false);
+		expect(queueTierFormSchema.safeParse({ ...base, queueAgentId: "" }).success).toBe(false);
+		expect(queueTierFormSchema.safeParse(base).success).toBe(true);
+	});
+
+	/** Level and position are 1-based: there is no tier zero, and no agent at position zero. */
+	it("keeps level and position 1-based, and lets both fall back to the server default", () => {
+		expect(queueTierFormSchema.safeParse({ ...base, level: "0" }).success).toBe(false);
+		expect(queueTierFormSchema.safeParse({ ...base, position: "0" }).success).toBe(false);
+		expect(queueTierFormSchema.safeParse({ ...base, level: "101" }).success).toBe(false);
+
+		const parsed = queueTierFormSchema.parse(base);
+		expect(parsed.level).toBeNull();
+		expect(parsed.position).toBeNull();
+	});
+});
+
+describe("conferenceFormSchema", () => {
+	const base = {
+		name: "All hands",
+		roomNumber: "8000",
+		maxMembers: "",
+		recordEnabled: false,
+		announceJoinLeave: true,
+		waitForModerator: false,
+		enabled: true,
+	};
+
+	it("needs a dialable room number", () => {
+		expect(conferenceFormSchema.safeParse(base).success).toBe(true);
+		expect(conferenceFormSchema.safeParse({ ...base, roomNumber: "" }).success).toBe(false);
+		expect(conferenceFormSchema.safeParse({ ...base, roomNumber: "80a0" }).success).toBe(false);
+	});
+
+	/** A room of one is a phone call. The server's floor is 2 and this mirrors it. */
+	it("keeps a room at two seats or more", () => {
+		expect(conferenceFormSchema.safeParse({ ...base, maxMembers: "1" }).success).toBe(false);
+		expect(conferenceFormSchema.safeParse({ ...base, maxMembers: "2" }).success).toBe(true);
+		expect(conferenceFormSchema.safeParse({ ...base, maxMembers: "1001" }).success).toBe(false);
+	});
+
+	/**
+	 * There are no PIN fields, and that is load-bearing: the API does not accept a digest in a JSON
+	 * body, so a form offering one would store nothing while looking like it had.
+	 */
+	it("has no PIN fields at all", () => {
+		expect(conferenceFormSchema.safeParse({ ...base, pinHash: "whatever" } as never).success).toBe(
+			false,
+		);
+	});
+});
+
+describe("parkLotFormSchema", () => {
+	const base = {
+		name: "Reception",
+		slotStart: "701",
+		slotEnd: "720",
+		timeoutSeconds: "",
+		enabled: true,
+	};
+
+	/**
+	 * The only REQUIRED integers in the PBX area. Every other number on a PBX form has a server
+	 * default, so blank means "use it"; here blank is a missing column and a 400 with no field.
+	 */
+	it("requires both ends of the slot range", () => {
+		expect(parkLotFormSchema.safeParse({ ...base, slotStart: "" }).success).toBe(false);
+		expect(parkLotFormSchema.safeParse({ ...base, slotEnd: "" }).success).toBe(false);
+		expect(parkLotFormSchema.parse(base).slotStart).toBe(701);
+	});
+
+	/** Mirrors the server's refinement, which mirrors a check constraint. */
+	it("refuses a range that runs backwards, and lands the message on the last slot", () => {
+		const result = parkLotFormSchema.safeParse({ ...base, slotStart: "720", slotEnd: "701" });
+		expect(result.success).toBe(false);
+		expect(result.error?.issues[0]?.path).toEqual(["slotEnd"]);
+	});
+
+	it("allows a lot of exactly one slot", () => {
+		expect(parkLotFormSchema.safeParse({ ...base, slotStart: "701", slotEnd: "701" }).success).toBe(
+			true,
+		);
+	});
+
+	it("bounds the park timeout at the server's floor of 5 seconds", () => {
+		expect(parkLotFormSchema.safeParse({ ...base, timeoutSeconds: "4" }).success).toBe(false);
+		expect(parkLotFormSchema.safeParse({ ...base, timeoutSeconds: "5" }).success).toBe(true);
+		expect(parkLotFormSchema.parse(base).timeoutSeconds).toBeNull();
 	});
 });

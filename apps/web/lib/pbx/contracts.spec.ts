@@ -17,7 +17,11 @@ import {
 	TRUNK_STATUSES as SERVER_TRUNK_STATUSES,
 	VOICEMAIL_EMAIL_MODES as SERVER_VOICEMAIL_EMAIL_MODES,
 } from "@optimiq-voice/pbx-db";
-import { ROUTING_CONTEXTS as SERVER_ROUTING_CONTEXTS } from "@optimiq-voice/routing";
+import {
+	ROUTING_CONTEXTS as SERVER_ROUTING_CONTEXTS,
+	ROUTING_TABLE_TO_ENTITY as SERVER_ROUTING_TABLES,
+} from "@optimiq-voice/routing";
+import { PBX_CHILDREN, PBX_RESOURCES } from "./client";
 import {
 	DESTINATION_TYPE_KINDS,
 	DESTINATION_TYPES,
@@ -196,5 +200,85 @@ describe("the destination picker's own tables", () => {
 		for (const type of SERVER_DESTINATION_TYPES) {
 			expect(offered).toContain(type);
 		}
+	});
+});
+
+/**
+ * Which writes evict the compile view.
+ *
+ * `ROUTING_TABLE_TO_ENTITY` is stated by `@optimiq-voice/routing` as the whole answer — "anything not
+ * in this map is not a routing input and must not evict the cache" — and each descriptor restates it
+ * for the endpoint in front of that table. Getting one wrong is invisible: too eager only wastes a
+ * request, and too lax leaves the compile panel showing a hash for a configuration that no longer
+ * exists, which is the one thing that panel is for.
+ *
+ * The key→table map is written HERE rather than derived, for the same reason `reference-kinds.ts`
+ * exists: a list derived from the thing it checks proves nothing.
+ */
+const RESOURCE_TABLES: Readonly<Record<string, string>> = {
+	extensions: "extension",
+	"phone-numbers": "phone_number",
+	trunks: "trunk",
+	"inbound-routes": "inbound_route",
+	"outbound-routes": "outbound_route",
+	"time-conditions": "time_condition",
+	"feature-codes": "feature_code",
+	"ivr-menus": "ivr_menu",
+	"ring-groups": "ring_group",
+	queues: "queue",
+	"queue-agents": "queue_agent",
+	conferences: "conference",
+	"park-lots": "park_lot",
+	"voicemail-boxes": "voicemail_box",
+};
+
+const CHILD_TABLES: Readonly<Record<string, string>> = {
+	options: "ivr_menu_option",
+	destinations: "ring_group_destination",
+	rules: "time_condition_rule",
+	tiers: "queue_tier",
+};
+
+describe("affectsRouting, mirrored from @optimiq-voice/routing", () => {
+	it("every resource has a table in the map above, so none can be quietly skipped", () => {
+		for (const resource of Object.values(PBX_RESOURCES)) {
+			expect(RESOURCE_TABLES[resource.key]).toBeTruthy();
+		}
+		for (const child of Object.values(PBX_CHILDREN)) {
+			expect(CHILD_TABLES[child.key]).toBeTruthy();
+		}
+	});
+
+	it("each resource agrees with the routing package about whether it is an input", () => {
+		for (const resource of Object.values(PBX_RESOURCES)) {
+			const table = RESOURCE_TABLES[resource.key] as string;
+			expect({ key: resource.key, affectsRouting: resource.affectsRouting }).toEqual({
+				key: resource.key,
+				affectsRouting: table in SERVER_ROUTING_TABLES,
+			});
+		}
+	});
+
+	it("and so does each child collection", () => {
+		for (const child of Object.values(PBX_CHILDREN)) {
+			const table = CHILD_TABLES[child.key] as string;
+			expect({ key: child.key, affectsRouting: child.affectsRouting }).toEqual({
+				key: child.key,
+				affectsRouting: table in SERVER_ROUTING_TABLES,
+			});
+		}
+	});
+
+	/**
+	 * The claim the queues UI is built on, stated on its own so it fails loudly rather than as one
+	 * line of a loop: staffing a queue is live state, not a dial-plan change. If the routing package
+	 * ever starts compiling membership, the detail page's copy and its invalidation are both wrong.
+	 */
+	it("says a queue recompiles and its agents and tiers do not", () => {
+		expect(PBX_RESOURCES.queues.affectsRouting).toBe(true);
+		expect(PBX_RESOURCES.queueAgents.affectsRouting).toBe(false);
+		expect(PBX_CHILDREN.queueTiers.affectsRouting).toBe(false);
+		expect("queue_agent" in SERVER_ROUTING_TABLES).toBe(false);
+		expect("queue_tier" in SERVER_ROUTING_TABLES).toBe(false);
 	});
 });

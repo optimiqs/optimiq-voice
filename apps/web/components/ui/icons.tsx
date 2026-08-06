@@ -136,6 +136,16 @@ export function ConferenceIcon(props: IconProps) {
 	);
 }
 
+/** Call park: the parking "P" on a sign, because that is the metaphor the feature is named for. */
+export function ParkIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<rect x="3" y="3" width="18" height="18" rx="4" />
+			<path d="M10 16.5v-9h3.25a2.75 2.75 0 0 1 0 5.5H10" />
+		</Glyph>
+	);
+}
+
 export function RecordIcon(props: IconProps) {
 	return (
 		<Glyph {...props}>

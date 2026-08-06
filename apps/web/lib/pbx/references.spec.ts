@@ -19,14 +19,36 @@ function reference(kind: string, name: string | null = "Main line"): EntityRefer
 }
 
 describe("referenceHref", () => {
-	it("links the three entities with a detail view straight at the row", () => {
+	it("links the four entities with a detail view straight at the row", () => {
 		expect(referenceHref(reference("ivr-menu"))).toBe("/ivr/0193f2aa-0000-7000-8000-000000000002");
 		expect(referenceHref(reference("ring-group"))).toBe(
 			"/ring-groups/0193f2aa-0000-7000-8000-000000000002",
 		);
+		expect(referenceHref(reference("queue"))).toBe("/queues/0193f2aa-0000-7000-8000-000000000002");
 		expect(referenceHref(reference("time-condition"))).toBe(
 			"/routing/time-conditions/0193f2aa-0000-7000-8000-000000000002",
 		);
+	});
+
+	/**
+	 * `park-lot` used to land on `/routing` — the closest thing to a home it had while lots were
+	 * unmanageable. It has its own route now, and a stale mapping would send someone refused a
+	 * delete to a page their lot is not on, which is worse than no link at all.
+	 */
+	it("sends a park lot to its own list rather than to the routing page", () => {
+		expect(referenceHref(reference("park-lot", "Reception"))).toBe("/park-lots?q=Reception");
+		expect(referenceHref(reference("conference", "All hands"))).toBe("/conferences?q=All%20hands");
+	});
+
+	/**
+	 * An agent is deliberately NOT here. Nothing may point at one as a destination — a call is
+	 * offered to a queue and the queue picks the agent — and `queue_tier.queue_agent_id` cascades, so
+	 * the API has no reason to name an agent in a 409. A listing for a kind the server cannot emit
+	 * would be a mapping nobody can reach and nobody can check.
+	 */
+	it("has no listing for kinds the API never emits as a reference", () => {
+		expect(referenceHref(reference("queue-agent"))).toBeUndefined();
+		expect(referenceHref(reference("queue-tier"))).toBeUndefined();
 	});
 
 	/**

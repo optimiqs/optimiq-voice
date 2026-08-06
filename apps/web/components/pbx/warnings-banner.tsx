@@ -2,6 +2,7 @@
 
 import { cn } from "~/lib/cn";
 import { Badge } from "../ui/badge";
+import type { ReactNode } from "react";
 import type { WireDiagnostic } from "~/lib/pbx/contracts";
 
 /**
@@ -48,6 +49,42 @@ export function WarningsBanner({
 				<p className="text-xs text-muted-foreground">{description}</p>
 			</div>
 			<DiagnosticList diagnostics={warnings} />
+		</section>
+	);
+}
+
+/**
+ * Something THIS UI noticed, with no compiler diagnostic behind it.
+ *
+ * A queue with no staffed tier rings nobody and ejects its callers into the timeout branch — but
+ * `affectsRouting` says a tier is not a routing input, so the compiler never looks and there is no
+ * code to quote. {@link WarningsBanner} would therefore have to be handed an invented one, and a
+ * fabricated `code` in the same mono line the real ones use is a lie that costs someone an hour in
+ * `packages/routing` looking for it.
+ *
+ * So the observation is made in its own voice: same amber, no code, no subject.
+ */
+export function NoticeBanner({
+	title,
+	description,
+	className,
+}: {
+	title: string;
+	description: ReactNode;
+	className?: string;
+}) {
+	return (
+		<section
+			aria-label={title}
+			className={cn(
+				"flex flex-col gap-2 rounded-panel border border-warning/40 bg-warning-subtle px-4 py-3",
+				className,
+			)}
+		>
+			<div className="flex flex-wrap items-center gap-2">
+				<Badge tone="warning">{title}</Badge>
+			</div>
+			<p className="text-sm text-foreground">{description}</p>
 		</section>
 	);
 }

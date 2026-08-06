@@ -61,8 +61,37 @@ describe("canAccessPage", () => {
 		const manager = resolveRolePermissions("manager");
 		expect(canAccessPage(routes.ivr, manager)).toBe(true);
 		expect(canAccessPage(routes.queues, manager)).toBe(true);
+		expect(canAccessPage(routes.parkLots, manager)).toBe(true);
 		expect(canAccessPage(routes.members, manager)).toBe(true);
 		expect(canAccessPage(routes.trunks, manager)).toBe(false);
+	});
+
+	/**
+	 * An agent parks calls with `*5`, so the lot list has to be readable to render where a call went
+	 * — `park-lots.read` is in the agent template for exactly that reason. Gating the page on
+	 * `park-lots.write` instead would hide it from everyone whose job is to use it.
+	 */
+	it("lets an agent read the queue and park-lot surfaces without being able to change them", () => {
+		const agent = resolveRolePermissions("agent");
+		expect(canAccessPage(routes.queues, agent)).toBe(true);
+		expect(canAccessPage(routes.parkLots, agent)).toBe(true);
+		expect(canAccessPage(routes.conferences, agent)).toBe(true);
+		expect(agent.includes("queues.write")).toBe(false);
+		expect(agent.includes("queues.manage-agents")).toBe(false);
+		expect(agent.includes("park-lots.write")).toBe(false);
+	});
+
+	/**
+	 * A detail view can never be less protected than its list. `/queues/<id>` is not in the map at
+	 * all — it inherits `queues.read` from `/queues` by ancestry, which is why nesting it under the
+	 * list's path is a decision rather than a convention.
+	 */
+	it("inherits the queue list's requirement for a queue's detail view", () => {
+		expect(getPagePermissions(routes.queue("0193f2aa-0000-7000-8000-000000000001"))).toEqual({
+			permissions: ["queues.read"],
+		});
+		expect(canAccessPage(routes.queue("abc"), resolveRolePermissions("user"))).toBe(false);
+		expect(canAccessPage(routes.queue("abc"), resolveRolePermissions("agent"))).toBe(true);
 	});
 
 	it("allows any route it has no opinion about", () => {

@@ -6,6 +6,7 @@ import {
 	HistoryIcon,
 	KeyIcon,
 	MenuIcon,
+	ParkIcon,
 	PhoneIcon,
 	QueueIcon,
 	RecordIcon,
@@ -65,14 +66,15 @@ export const NAV_SECTIONS: readonly NavSection[] = [
 			{ title: "Routing", url: routes.routing, icon: RouteIcon },
 			{ title: "IVR menus", url: routes.ivr, icon: MenuIcon },
 			{ title: "Ring groups", url: routes.ringGroups, icon: UsersIcon },
-			{ title: "Queues", url: routes.queues, icon: QueueIcon, comingSoon: true },
+			{ title: "Queues", url: routes.queues, icon: QueueIcon },
 		],
 	},
 	{
 		label: "Call features",
 		items: [
 			{ title: "Voicemail", url: routes.voicemail, icon: VoicemailIcon },
-			{ title: "Conferences", url: routes.conferences, icon: ConferenceIcon, comingSoon: true },
+			{ title: "Conferences", url: routes.conferences, icon: ConferenceIcon },
+			{ title: "Park lots", url: routes.parkLots, icon: ParkIcon },
 		],
 	},
 	{

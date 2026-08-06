@@ -13,6 +13,7 @@ import {
 	createPbxChild,
 	deletePbx,
 	deletePbxChild,
+	fetchFeatureCodeParamFields,
 	getPbx,
 	listPbx,
 	listPbxChildren,
@@ -25,7 +26,12 @@ import {
 import { pbxErrorCode, pbxToastMessage } from "~/lib/pbx/errors";
 import { queryKeys } from "~/lib/query-keys";
 import { useActiveOrganization } from "../_context/session-context";
-import type { MutationEnvelope, PagedEnvelope, WireDiagnostic } from "~/lib/pbx/contracts";
+import type {
+	FeatureCodeParamFields,
+	MutationEnvelope,
+	PagedEnvelope,
+	WireDiagnostic,
+} from "~/lib/pbx/contracts";
 
 /**
  * Server state for the PBX area.
@@ -111,24 +117,17 @@ export function usePbxChildren<TRow>(
 }
 
 /**
- * Resources whose rows the routing compiler reads.
+ * Invalidates a resource's cached pages, and the compile view when the write could change what a
+ * call does.
  *
- * Everything except trunks and voicemail boxes feeds the artifact, so a write to any of them can
- * change what a call does — and the compile panel must not keep showing the hash from before.
+ * Whether it could is the DESCRIPTOR's answer (`affectsRouting`), pinned against
+ * `@optimiq-voice/routing` in `contracts.spec.ts` — not a second list kept here, which is how the
+ * two would come to disagree. A child collection passes its own, because a queue tier lives under
+ * `queues` and yet is not a routing input: the compiler emits a queue node with its strategy and
+ * announcements, and who is logged into it is live state the engine reads at dial time. Staffing the
+ * floor must not look like republishing the dial plan.
  */
-const ROUTING_RESOURCE_KEYS: ReadonlySet<string> = new Set([
-	"extensions",
-	"phone-numbers",
-	"inbound-routes",
-	"outbound-routes",
-	"time-conditions",
-	"feature-codes",
-	"ivr-menus",
-	"ring-groups",
-	"voicemail-boxes",
-]);
-
-function useInvalidatePbx(resourceKey: string): () => Promise<void> {
+function useInvalidatePbx(resourceKey: string, affectsRouting: boolean): () => Promise<void> {
 	const queryClient = useQueryClient();
 	const organizationId = useOrganizationId();
 
@@ -136,7 +135,7 @@ function useInvalidatePbx(resourceKey: string): () => Promise<void> {
 		await queryClient.invalidateQueries({
 			queryKey: queryKeys.pbxResource(organizationId, resourceKey),
 		});
-		if (ROUTING_RESOURCE_KEYS.has(resourceKey)) {
+		if (affectsRouting) {
 			await queryClient.invalidateQueries({
 				queryKey: queryKeys.routingCompile(organizationId),
 			});
@@ -144,10 +143,27 @@ function useInvalidatePbx(resourceKey: string): () => Promise<void> {
 	};
 }
 
+/**
+ * What each feature-code action's `params` accepts, so the form renders a control rather than a
+ * JSON box.
+ *
+ * Static per deployment — it describes the action, not the tenant — so it is cached hard and never
+ * refetched. The one thing it can be is FORBIDDEN, for a caller without `feature-codes.read`, and
+ * the dialog treats that as "no declared parameters" rather than as an error to show.
+ */
+export function useFeatureCodeParamFields(): UseQueryResult<FeatureCodeParamFields> {
+	return useQuery({
+		queryKey: queryKeys.featureCodeParamFields(),
+		queryFn: fetchFeatureCodeParamFields,
+		staleTime: Number.POSITIVE_INFINITY,
+		retry: false,
+	});
+}
+
 export function usePbxCreate<TRow>(
 	resource: PbxResourceDescriptor<TRow>,
 ): UseMutationResult<MutationEnvelope<TRow>, Error, Record<string, unknown>> {
-	const invalidate = useInvalidatePbx(resource.key);
+	const invalidate = useInvalidatePbx(resource.key, resource.affectsRouting);
 
 	return useMutation({
 		mutationFn: (values: Record<string, unknown>) => createPbx(resource, values),
@@ -175,7 +191,7 @@ export function usePbxUpdate<TRow>(
 	Error,
 	{ readonly id: string; readonly values: Record<string, unknown> }
 > {
-	const invalidate = useInvalidatePbx(resource.key);
+	const invalidate = useInvalidatePbx(resource.key, resource.affectsRouting);
 
 	return useMutation({
 		mutationFn: ({ id, values }: { id: string; values: Record<string, unknown> }) =>
@@ -195,7 +211,7 @@ export function usePbxUpdate<TRow>(
 export function usePbxDelete<TRow>(
 	resource: PbxResourceDescriptor<TRow>,
 ): UseMutationResult<MutationEnvelope<{ readonly id: string }>, Error, string> {
-	const invalidate = useInvalidatePbx(resource.key);
+	const invalidate = useInvalidatePbx(resource.key, resource.affectsRouting);
 
 	return useMutation({
 		mutationFn: (id: string) => deletePbx(resource, id),
@@ -218,7 +234,7 @@ export function usePbxChildCreate<TRow>(
 	parentResourceKey: string,
 	parentId: string | undefined,
 ): UseMutationResult<MutationEnvelope<TRow>, Error, Record<string, unknown>> {
-	const invalidate = useInvalidatePbx(parentResourceKey);
+	const invalidate = useInvalidatePbx(parentResourceKey, child.affectsRouting);
 
 	return useMutation({
 		mutationFn: (values: Record<string, unknown>) =>
@@ -244,7 +260,7 @@ export function usePbxChildUpdate<TRow>(
 	Error,
 	{ readonly id: string; readonly values: Record<string, unknown> }
 > {
-	const invalidate = useInvalidatePbx(parentResourceKey);
+	const invalidate = useInvalidatePbx(parentResourceKey, child.affectsRouting);
 
 	return useMutation({
 		mutationFn: ({ id, values }: { id: string; values: Record<string, unknown> }) =>
@@ -266,7 +282,7 @@ export function usePbxChildDelete<TRow>(
 	parentResourceKey: string,
 	parentId: string | undefined,
 ): UseMutationResult<MutationEnvelope<{ readonly id: string }>, Error, string> {
-	const invalidate = useInvalidatePbx(parentResourceKey);
+	const invalidate = useInvalidatePbx(parentResourceKey, child.affectsRouting);
 
 	return useMutation({
 		mutationFn: (id: string) => deletePbxChild(child, parentId as string, id),

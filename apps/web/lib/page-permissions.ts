@@ -40,6 +40,12 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, PageRequirement>> = {
 	[routes.queues]: { permissions: ["queues.read"] },
 	[routes.voicemail]: { permissions: ["voicemail.read", "voicemail.read.own"] },
 	[routes.conferences]: { permissions: ["conferences.read"] },
+	/**
+	 * `park-lots.read` and nothing else — the `agent` template holds it precisely so a person who
+	 * parks calls with `*5` can see which orbit a call landed in. Gating this page on `park-lots.write`
+	 * would hide the lot list from everyone whose job is to use it.
+	 */
+	[routes.parkLots]: { permissions: ["park-lots.read"] },
 	[routes.recordings]: { permissions: ["recordings.read", "recordings.read.own"] },
 	[routes.cdr]: { permissions: ["cdr.read", "cdr.read.own"] },
 	[routes.settings]: { permissions: ["settings.read"] },

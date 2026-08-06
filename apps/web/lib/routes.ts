@@ -26,6 +26,7 @@ export const routes = {
 	queues: "/queues",
 	voicemail: "/voicemail",
 	conferences: "/conferences",
+	parkLots: "/park-lots",
 	recordings: "/recordings",
 	cdr: "/cdr",
 	settings: "/settings",
@@ -33,12 +34,12 @@ export const routes = {
 	apiKeys: "/settings/api-keys",
 
 	/**
-	 * Detail views, for the three entities that own a child collection.
+	 * Detail views, for the four entities that own a child collection.
 	 *
 	 * Everything else is edited in a dialog over its list, because everything else is one flat row
 	 * — a route for a form with no sub-resource is a page load the user pays for and a back button
-	 * that leaves the list. An IVR menu's options, a ring group's members and a time condition's
-	 * rules are ordered collections with their own destinations, which a dialog inside a dialog
+	 * that leaves the list. An IVR menu's options, a ring group's members, a time condition's rules
+	 * and a queue's tiers are collections with their own targets, which a dialog inside a dialog
 	 * cannot hold.
 	 *
 	 * They are nested under their list's path so `getPagePermissions` inherits the parent's
@@ -46,8 +47,25 @@ export const routes = {
 	 */
 	ivrMenu: (id: string) => `/ivr/${id}`,
 	ringGroup: (id: string) => `/ring-groups/${id}`,
+	queue: (id: string) => `/queues/${id}`,
 	timeCondition: (id: string) => `/routing/time-conditions/${id}`,
 } as const;
+
+/**
+ * The Queues page's two sections.
+ *
+ * Agents are a TOP-LEVEL resource (`/api/v1/queue-agents`) because `queue_agent` carries no queue —
+ * one agent serves several queues through a tier. So they cannot live on a queue's own page, and a
+ * second sidebar entry called "Queue agents" would be a second way to say "queues". One page with
+ * the section in the URL keeps both views linkable, and both are gated by `queues.read`.
+ */
+export const QUEUE_TABS = ["queues", "agents"] as const;
+
+export type QueueTab = (typeof QUEUE_TABS)[number];
+
+export function queueTabHref(tab: QueueTab): string {
+	return tab === "queues" ? routes.queues : `${routes.queues}?tab=${tab}`;
+}
 
 /**
  * The Routing page's sections, as query state.

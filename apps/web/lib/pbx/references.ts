@@ -6,10 +6,9 @@
  * them while they still have the context. That is only true if the names are LINKS. A list of
  * "inbound-route 0193f2…" is a dead end wearing the costume of an explanation.
  *
- * Several kinds have no screen of their own yet (`queue`, `park-lot`, `conference`, and the two
- * child kinds whose parent is the linkable thing). Those resolve to their parent's list or to
- * nothing at all, and a reference with no destination renders as plain text rather than as a link
- * that goes nowhere.
+ * The child kinds have no screen of their own — their PARENT is the linkable thing — so they
+ * resolve to the parent's list. A reference with no destination at all renders as plain text
+ * rather than as a link that goes nowhere.
  */
 
 import { routes, routingTabHref } from "../routes";
@@ -65,7 +64,7 @@ const KIND_LISTINGS: Readonly<Record<string, KindListing>> = {
 	"ring-group": { path: routes.ringGroups, searchKey: "q" },
 	"ring-group-destination": { path: routes.ringGroups, searchKey: "q" },
 	queue: { path: routes.queues, searchKey: "q" },
-	"park-lot": { path: routes.routing, searchKey: "q" },
+	"park-lot": { path: routes.parkLots, searchKey: "q" },
 	conference: { path: routes.conferences, searchKey: "q" },
 	"voicemail-box": { path: routes.voicemail, searchKey: "q" },
 	"voicemail-option": { path: routes.voicemail, searchKey: "q" },
@@ -74,7 +73,7 @@ const KIND_LISTINGS: Readonly<Record<string, KindListing>> = {
 /**
  * Where to send someone to fix a referring row.
  *
- * The three entities with a detail view get a direct link. Everything else lands on its list with
+ * The four entities with a detail view get a direct link. Everything else lands on its list with
  * the row's name already in the search box — the list is where the row is editable, and arriving
  * with the search prefilled is the difference between "here is the page it is on" and "here it
  * is".
@@ -86,6 +85,9 @@ export function referenceHref(reference: EntityReference): string | undefined {
 		}
 		case "ring-group": {
 			return routes.ringGroup(reference.id);
+		}
+		case "queue": {
+			return routes.queue(reference.id);
 		}
 		case "time-condition": {
 			return routes.timeCondition(reference.id);

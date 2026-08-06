@@ -70,6 +70,15 @@ export interface PbxResourceDescriptor<TRow> {
 		readonly write: Permission;
 		readonly delete: Permission;
 	};
+	/**
+	 * Whether writing one of these can change what a call does.
+	 *
+	 * `ROUTING_TABLE_TO_ENTITY` in `@optimiq-voice/routing` is the authority — "anything not in this
+	 * map is not a routing input and must not evict the cache" — and `contracts.spec.ts` holds each
+	 * of these against it. It lives on the descriptor rather than in a set beside the mutation hooks
+	 * so that adding a resource cannot quietly forget to say.
+	 */
+	readonly affectsRouting: boolean;
 	/** Used by the destination picker and reference lists to name a row. */
 	readonly displayName: (row: TRow) => string;
 }
@@ -81,6 +90,7 @@ function descriptor<TRow>(value: PbxResourceDescriptor<TRow>): PbxResourceDescri
 export const PBX_RESOURCES = {
 	extensions: descriptor<ExtensionRow>({
 		key: "extensions",
+		affectsRouting: true,
 		path: "/extensions",
 		label: "extension",
 		labelPlural: "Extensions",
@@ -93,6 +103,7 @@ export const PBX_RESOURCES = {
 	}),
 	phoneNumbers: descriptor<PhoneNumberRow>({
 		key: "phone-numbers",
+		affectsRouting: true,
 		path: "/phone-numbers",
 		label: "number",
 		labelPlural: "Numbers",
@@ -101,6 +112,7 @@ export const PBX_RESOURCES = {
 	}),
 	trunks: descriptor<TrunkRow>({
 		key: "trunks",
+		affectsRouting: true,
 		path: "/trunks",
 		label: "trunk",
 		labelPlural: "Trunks",
@@ -109,6 +121,7 @@ export const PBX_RESOURCES = {
 	}),
 	inboundRoutes: descriptor<InboundRouteRow>({
 		key: "inbound-routes",
+		affectsRouting: true,
 		path: "/inbound-routes",
 		label: "inbound route",
 		labelPlural: "Inbound routes",
@@ -117,6 +130,7 @@ export const PBX_RESOURCES = {
 	}),
 	outboundRoutes: descriptor<OutboundRouteRow>({
 		key: "outbound-routes",
+		affectsRouting: true,
 		path: "/outbound-routes",
 		label: "outbound route",
 		labelPlural: "Outbound routes",
@@ -125,6 +139,7 @@ export const PBX_RESOURCES = {
 	}),
 	timeConditions: descriptor<TimeConditionRow>({
 		key: "time-conditions",
+		affectsRouting: true,
 		path: "/time-conditions",
 		label: "time condition",
 		labelPlural: "Time conditions",
@@ -137,6 +152,7 @@ export const PBX_RESOURCES = {
 	}),
 	featureCodes: descriptor<FeatureCodeRow>({
 		key: "feature-codes",
+		affectsRouting: true,
 		path: "/feature-codes",
 		label: "feature code",
 		labelPlural: "Feature codes",
@@ -149,6 +165,7 @@ export const PBX_RESOURCES = {
 	}),
 	ivrMenus: descriptor<IvrMenuRow>({
 		key: "ivr-menus",
+		affectsRouting: true,
 		path: "/ivr-menus",
 		label: "IVR menu",
 		labelPlural: "IVR menus",
@@ -157,6 +174,7 @@ export const PBX_RESOURCES = {
 	}),
 	ringGroups: descriptor<RingGroupRow>({
 		key: "ring-groups",
+		affectsRouting: true,
 		path: "/ring-groups",
 		label: "ring group",
 		labelPlural: "Ring groups",
@@ -169,6 +187,7 @@ export const PBX_RESOURCES = {
 	}),
 	queues: descriptor<QueueRow>({
 		key: "queues",
+		affectsRouting: true,
 		path: "/queues",
 		label: "queue",
 		labelPlural: "Queues",
@@ -182,6 +201,7 @@ export const PBX_RESOURCES = {
 	 */
 	queueAgents: descriptor<QueueAgentRow>({
 		key: "queue-agents",
+		affectsRouting: false,
 		path: "/queue-agents",
 		label: "agent",
 		labelPlural: "Queue agents",
@@ -194,6 +214,7 @@ export const PBX_RESOURCES = {
 	}),
 	conferences: descriptor<ConferenceRow>({
 		key: "conferences",
+		affectsRouting: true,
 		path: "/conferences",
 		label: "conference",
 		labelPlural: "Conferences",
@@ -206,6 +227,7 @@ export const PBX_RESOURCES = {
 	}),
 	parkLots: descriptor<ParkLotRow>({
 		key: "park-lots",
+		affectsRouting: true,
 		path: "/park-lots",
 		label: "park lot",
 		labelPlural: "Park lots",
@@ -214,6 +236,7 @@ export const PBX_RESOURCES = {
 	}),
 	voicemailBoxes: descriptor<VoicemailBoxRow>({
 		key: "voicemail-boxes",
+		affectsRouting: true,
 		path: "/voicemail-boxes",
 		label: "voicemail box",
 		labelPlural: "Voicemail boxes",
@@ -235,6 +258,16 @@ export interface PbxChildDescriptor<TRow> {
 	readonly label: string;
 	readonly parentPath: string;
 	readonly displayName: (row: TRow) => string;
+	/**
+	 * Whether writing one changes what a call does.
+	 *
+	 * `affectsRouting()` in `@optimiq-voice/routing` is the authority, and it says `queue_tier` is
+	 * NOT a routing input: the compiler emits a queue node with its strategy and announcements, and
+	 * agent membership is live state the engine reads at dial time. Invalidating the compile view on
+	 * every tier edit would evict a panel that did not change — and, worse, imply that staffing the
+	 * floor republishes the dial plan.
+	 */
+	readonly affectsRouting: boolean;
 }
 
 function child<TRow>(value: PbxChildDescriptor<TRow>): PbxChildDescriptor<TRow> {
@@ -248,6 +281,7 @@ export const PBX_CHILDREN = {
 		label: "option",
 		parentPath: "/ivr-menus",
 		displayName: (row) => row.label ?? row.matchValue,
+		affectsRouting: true,
 	}),
 	ringGroupMembers: child<RingGroupMemberRow>({
 		key: "destinations",
@@ -255,6 +289,7 @@ export const PBX_CHILDREN = {
 		label: "member",
 		parentPath: "/ring-groups",
 		displayName: (row) => `Member ${row.ordinal + 1}`,
+		affectsRouting: true,
 	}),
 	timeConditionRules: child<TimeConditionRuleRow>({
 		key: "rules",
@@ -262,6 +297,7 @@ export const PBX_CHILDREN = {
 		label: "rule",
 		parentPath: "/time-conditions",
 		displayName: (row) => row.label ?? `Rule ${row.ordinal + 1}`,
+		affectsRouting: true,
 	}),
 	/**
 	 * Queue tiers have no `ordinal` and therefore no reorder endpoint: a tier's place is
@@ -274,6 +310,7 @@ export const PBX_CHILDREN = {
 		label: "agent",
 		parentPath: "/queues",
 		displayName: (row) => `Level ${row.level}, position ${row.position}`,
+		affectsRouting: false,
 	}),
 } as const;
 

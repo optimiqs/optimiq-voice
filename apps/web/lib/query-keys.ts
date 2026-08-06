@@ -34,6 +34,14 @@ export const queryKeys = {
 		["organizations", organizationId, "pbx", resource, "item", id] as const,
 	pbxChildren: (organizationId: string, resource: string, parentId: string, child: string) =>
 		["organizations", organizationId, "pbx", resource, "item", parentId, child] as const,
+	/**
+	 * What each feature-code action's `params` accepts.
+	 *
+	 * NOT scoped by organization, unlike everything else here: it describes the schema, not the
+	 * tenant, so the answer is the same for every organization on the deployment and re-fetching it
+	 * on an org switch would be a request that can only return what is already cached.
+	 */
+	featureCodeParamFields: () => ["pbx", "feature-code-param-fields"] as const,
 	/** The compile/simulate surface, which reads the whole configuration rather than one table. */
 	routingCompile: (organizationId: string) =>
 		["organizations", organizationId, "pbx", "routing", "compile"] as const,
