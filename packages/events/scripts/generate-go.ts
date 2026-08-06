@@ -10,6 +10,7 @@ import { makeCdrLegWriteEvent } from "../src/schemas/cdr-events";
 import { makeProvisionEvent } from "../src/schemas/provision-events";
 import { makeQueueEvent } from "../src/schemas/queue-events";
 import { makeRegistrationEvent } from "../src/schemas/registration-events";
+import { makeVoicemailEvent } from "../src/schemas/voicemail-events";
 import {
 	EVENT_STREAMS,
 	KV_BUCKETS,
@@ -20,6 +21,7 @@ import {
 import {
 	aorSubjectToken,
 	CALL_EVENTS,
+	didIndexToken,
 	matchesSubject,
 	parseSubject,
 	QUEUE_EVENTS,
@@ -30,6 +32,7 @@ import {
 	SUBJECT_VERSION,
 	subjectFilterFor,
 	subjectFor,
+	VOICEMAIL_EVENTS,
 } from "../src/subjects";
 import { GoFileEmitter, pascal, type JsonSchema } from "./go-emitter";
 import {
@@ -267,20 +270,21 @@ function emitGo(
 			if (schema === undefined) {
 				throw new Error(`Missing schema for ${entry.family}.${entry.type}.`);
 			}
-			emitter.declareStruct(entry.goName, [
-				`the payload of the ${JSON.stringify(entry.type)} event.`,
-				"",
-				`Subject: ${entry.subjectTemplate}`,
-				"Envelope: Envelope[" + entry.goName + "]",
-			], withoutDialect(schema));
+			emitter.declareStruct(
+				entry.goName,
+				[
+					`the payload of the ${JSON.stringify(entry.type)} event.`,
+					"",
+					`Subject: ${entry.subjectTemplate}`,
+					"Envelope: Envelope[" + entry.goName + "]",
+				],
+				withoutDialect(schema),
+			);
 		}
 
 		writeText(
 			join(GO_DIR, `${FAMILY_FILE[family]}_gen.go`),
-			emitter.render(
-				[`Payloads for the ${family} event family.`],
-				"events",
-			),
+			emitter.render([`Payloads for the ${family} event family.`], "events"),
 		);
 	}
 
@@ -297,9 +301,7 @@ function emitGo(
 	rpcConsts.push(")", "");
 	rpcConsts.push("const (");
 	for (const entry of RPC_ENTRIES) {
-		rpcConsts.push(
-			`\tTimeout${entry.goName}RPC = ${entry.timeoutMs} * time.Millisecond`,
-		);
+		rpcConsts.push(`\tTimeout${entry.goName}RPC = ${entry.timeoutMs} * time.Millisecond`);
 	}
 	rpcConsts.push(")", "");
 	rpcEmitter.imports.add("time");
@@ -310,12 +312,16 @@ function emitGo(
 		if (pair === undefined) {
 			throw new Error(`Missing RPC schemas for ${entry.subject}.`);
 		}
-		rpcEmitter.declareStruct(`${entry.goName}Request`, [
-			`the request body of ${entry.subject}.`,
-		], withoutDialect(pair.request));
-		rpcEmitter.declareStruct(`${entry.goName}Response`, [
-			`the reply body of ${entry.subject}.`,
-		], withoutDialect(pair.response));
+		rpcEmitter.declareStruct(
+			`${entry.goName}Request`,
+			[`the request body of ${entry.subject}.`],
+			withoutDialect(pair.request),
+		);
+		rpcEmitter.declareStruct(
+			`${entry.goName}Response`,
+			[`the reply body of ${entry.subject}.`],
+			withoutDialect(pair.response),
+		);
 	}
 	writeText(
 		join(GO_DIR, "rpc_gen.go"),
@@ -349,10 +355,14 @@ function emitGo(
 		);
 	}
 	registry.push("}", "");
-	registry.push("// NewDataFor returns a pointer to a zero payload struct for eventType, or nil when the");
+	registry.push(
+		"// NewDataFor returns a pointer to a zero payload struct for eventType, or nil when the",
+	);
 	registry.push("// type is not part of this contract version.");
 	registry.push("//");
-	registry.push("// A v1.n producer may emit a type a v1.0 consumer has never heard of (envelope.ts:");
+	registry.push(
+		"// A v1.n producer may emit a type a v1.0 consumer has never heard of (envelope.ts:",
+	);
 	registry.push("// additive-only evolution), so a nil result is a normal outcome, not an error.");
 	registry.push("func NewDataFor(eventType string) any {");
 	registry.push("\tswitch eventType {");
@@ -369,7 +379,9 @@ function emitGo(
 	writeText(
 		join(GO_DIR, "registry_gen.go"),
 		registryEmitter.render(
-			["The contract's event-type registry: everything a generic consumer needs to route a message."],
+			[
+				"The contract's event-type registry: everything a generic consumer needs to route a message.",
+			],
 			"events",
 		),
 	);
@@ -386,12 +398,26 @@ const LEG_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d";
 const QUEUE_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e";
 const AGENT_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4f";
 const DEVICE_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b50";
+const MAILBOX_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51";
+const MESSAGE_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b52";
+/** DIDs in the two shapes the index has to reconcile: as stored, and as a carrier delivers it. */
+const DID_STORED = "+441632960111";
+const DID_DIALLED = "441632960111";
 const AT = "2026-08-05T10:00:00.000Z";
 
 /** Deterministic event ids: no `createEntityId()` anywhere in the golden. */
 function eventId(index: number): string {
 	return `0192c7a1-4b8e-7f21-8b3c-9d0e1f2a${index.toString(16).padStart(4, "0")}`;
 }
+
+/** The shapes one DID arrives in: stored, dialled, punctuated, and a national-format near-miss. */
+const DID_CASES = [
+	"+441632960111",
+	"441632960111",
+	"+1 (212) 555-0100",
+	"+1-212-555-0100",
+	"0044 1632 960111",
+];
 
 const AOR_CASES = [
 	"sip:1001@acme.example.com",
@@ -531,7 +557,13 @@ function eventSamples(): readonly {
 			...next(),
 			orgId: ORG_A,
 			queueId: QUEUE_A,
-			data: { callId: CALL_A, legId: LEG_A, position: 3, priority: 10, callerNumber: "+441632960111" },
+			data: {
+				callId: CALL_A,
+				legId: LEG_A,
+				position: 3,
+				priority: 10,
+				callerNumber: "+441632960111",
+			},
 		}),
 	});
 	samples.push({
@@ -547,6 +579,47 @@ function eventSamples(): readonly {
 				previousStatus: "on-call",
 				queueIds: [QUEUE_A],
 				reason: "after-call work",
+			},
+		}),
+	});
+
+	samples.push({
+		name: "voicemail.message.left",
+		goType: "VoicemailMessageLeftData",
+		envelope: makeVoicemailEvent("message.left", {
+			...next(),
+			orgId: ORG_A,
+			mailboxId: MAILBOX_A,
+			data: {
+				messageId: MESSAGE_A,
+				mailboxNumber: "1001",
+				callId: CALL_A,
+				legId: LEG_A,
+				recordingId: DEVICE_A,
+				objectKey: "voicemail/2026/08/05/message-a.wav",
+				durationMs: 12_400,
+				sizeBytes: 198_400,
+				callerIdNumber: "+441632960111",
+				callerIdName: "Ada Lovelace",
+				receivedAt: AT,
+				transcriptionRequested: false,
+			},
+		}),
+	});
+	samples.push({
+		name: "voicemail.mwi.updated",
+		goType: "VoicemailMWIUpdatedData",
+		envelope: makeVoicemailEvent("mwi.updated", {
+			...next(),
+			orgId: ORG_A,
+			mailboxId: MAILBOX_A,
+			source: "api",
+			data: {
+				mailboxNumber: "1001",
+				extensionNumber: "1001",
+				newCount: 3,
+				savedCount: 12,
+				reason: "message-left",
 			},
 		}),
 	});
@@ -625,12 +698,50 @@ function eventSamples(): readonly {
 
 function parityGolden(): unknown {
 	const subjectBuilders = [
-		{ builder: "call", args: [ORG_A, CALL_A, "channel.created"], subject: subjectFor.call(ORG_A, CALL_A, "channel.created") },
-		{ builder: "call", args: [ORG_B, CALL_A, "channel.record.started"], subject: subjectFor.call(ORG_B, CALL_A, "channel.record.started") },
-		{ builder: "registration", args: [ORG_A, aorSubjectToken(AOR_CASES[0] as string), "registered"], subject: subjectFor.registration(ORG_A, aorSubjectToken(AOR_CASES[0] as string), "registered") },
-		{ builder: "registration", args: [ORG_A, aorSubjectToken(AOR_CASES[4] as string), "expired"], subject: subjectFor.registration(ORG_A, aorSubjectToken(AOR_CASES[4] as string), "expired") },
-		{ builder: "queue", args: [ORG_A, QUEUE_A, "caller.joined"], subject: subjectFor.queue(ORG_A, QUEUE_A, "caller.joined") },
-		{ builder: "queue", args: [ORG_A, QUEUE_SCOPE_ALL, "agent.state"], subject: subjectFor.queue(ORG_A, QUEUE_SCOPE_ALL, "agent.state") },
+		{
+			builder: "call",
+			args: [ORG_A, CALL_A, "channel.created"],
+			subject: subjectFor.call(ORG_A, CALL_A, "channel.created"),
+		},
+		{
+			builder: "call",
+			args: [ORG_B, CALL_A, "channel.record.started"],
+			subject: subjectFor.call(ORG_B, CALL_A, "channel.record.started"),
+		},
+		{
+			builder: "registration",
+			args: [ORG_A, aorSubjectToken(AOR_CASES[0] as string), "registered"],
+			subject: subjectFor.registration(
+				ORG_A,
+				aorSubjectToken(AOR_CASES[0] as string),
+				"registered",
+			),
+		},
+		{
+			builder: "registration",
+			args: [ORG_A, aorSubjectToken(AOR_CASES[4] as string), "expired"],
+			subject: subjectFor.registration(ORG_A, aorSubjectToken(AOR_CASES[4] as string), "expired"),
+		},
+		{
+			builder: "queue",
+			args: [ORG_A, QUEUE_A, "caller.joined"],
+			subject: subjectFor.queue(ORG_A, QUEUE_A, "caller.joined"),
+		},
+		{
+			builder: "queue",
+			args: [ORG_A, QUEUE_SCOPE_ALL, "agent.state"],
+			subject: subjectFor.queue(ORG_A, QUEUE_SCOPE_ALL, "agent.state"),
+		},
+		{
+			builder: "voicemail",
+			args: [ORG_A, MAILBOX_A, "message.left"],
+			subject: subjectFor.voicemail(ORG_A, MAILBOX_A, "message.left"),
+		},
+		{
+			builder: "voicemail",
+			args: [ORG_A, MAILBOX_A, "mwi.updated"],
+			subject: subjectFor.voicemail(ORG_A, MAILBOX_A, "mwi.updated"),
+		},
 		{ builder: "cdrLeg", args: [ORG_A], subject: subjectFor.cdrLeg(ORG_A) },
 		{ builder: "audit", args: [ORG_A], subject: subjectFor.audit(ORG_A) },
 		{ builder: "provision", args: [ORG_A], subject: subjectFor.provision(ORG_A) },
@@ -640,16 +751,52 @@ function parityGolden(): unknown {
 		{ filter: "allCalls", args: [], result: subjectFilterFor.allCalls() },
 		{ filter: "callsInOrg", args: [ORG_A], result: subjectFilterFor.callsInOrg(ORG_A) },
 		{ filter: "call", args: [ORG_A, CALL_A], result: subjectFilterFor.call(ORG_A, CALL_A) },
-		{ filter: "callEventInOrg", args: [ORG_A, "channel.hangup"], result: subjectFilterFor.callEventInOrg(ORG_A, "channel.hangup") },
-		{ filter: "callEvent", args: ["channel.hangup"], result: subjectFilterFor.callEvent("channel.hangup") },
+		{
+			filter: "callEventInOrg",
+			args: [ORG_A, "channel.hangup"],
+			result: subjectFilterFor.callEventInOrg(ORG_A, "channel.hangup"),
+		},
+		{
+			filter: "callEvent",
+			args: ["channel.hangup"],
+			result: subjectFilterFor.callEvent("channel.hangup"),
+		},
 		{ filter: "allRegistrations", args: [], result: subjectFilterFor.allRegistrations() },
-		{ filter: "registrationsInOrg", args: [ORG_A], result: subjectFilterFor.registrationsInOrg(ORG_A) },
-		{ filter: "registrationsForAor", args: [ORG_A, aorSubjectToken(AOR_CASES[0] as string)], result: subjectFilterFor.registrationsForAor(ORG_A, aorSubjectToken(AOR_CASES[0] as string)) },
-		{ filter: "registrationEventInOrg", args: [ORG_A, "expired"], result: subjectFilterFor.registrationEventInOrg(ORG_A, "expired") },
+		{
+			filter: "registrationsInOrg",
+			args: [ORG_A],
+			result: subjectFilterFor.registrationsInOrg(ORG_A),
+		},
+		{
+			filter: "registrationsForAor",
+			args: [ORG_A, aorSubjectToken(AOR_CASES[0] as string)],
+			result: subjectFilterFor.registrationsForAor(ORG_A, aorSubjectToken(AOR_CASES[0] as string)),
+		},
+		{
+			filter: "registrationEventInOrg",
+			args: [ORG_A, "expired"],
+			result: subjectFilterFor.registrationEventInOrg(ORG_A, "expired"),
+		},
 		{ filter: "allQueues", args: [], result: subjectFilterFor.allQueues() },
 		{ filter: "queuesInOrg", args: [ORG_A], result: subjectFilterFor.queuesInOrg(ORG_A) },
 		{ filter: "queue", args: [ORG_A, QUEUE_A], result: subjectFilterFor.queue(ORG_A, QUEUE_A) },
-		{ filter: "queueEventInOrg", args: [ORG_A, "agent.state"], result: subjectFilterFor.queueEventInOrg(ORG_A, "agent.state") },
+		{
+			filter: "queueEventInOrg",
+			args: [ORG_A, "agent.state"],
+			result: subjectFilterFor.queueEventInOrg(ORG_A, "agent.state"),
+		},
+		{ filter: "allVoicemail", args: [], result: subjectFilterFor.allVoicemail() },
+		{ filter: "voicemailInOrg", args: [ORG_A], result: subjectFilterFor.voicemailInOrg(ORG_A) },
+		{
+			filter: "voicemailBox",
+			args: [ORG_A, MAILBOX_A],
+			result: subjectFilterFor.voicemailBox(ORG_A, MAILBOX_A),
+		},
+		{
+			filter: "voicemailEventInOrg",
+			args: [ORG_A, "mwi.updated"],
+			result: subjectFilterFor.voicemailEventInOrg(ORG_A, "mwi.updated"),
+		},
 		{ filter: "allCdrLegs", args: [], result: subjectFilterFor.allCdrLegs() },
 		{ filter: "cdrLegsInOrg", args: [ORG_A], result: subjectFilterFor.cdrLegsInOrg(ORG_A) },
 		{ filter: "allAudit", args: [], result: subjectFilterFor.allAudit() },
@@ -662,6 +809,7 @@ function parityGolden(): unknown {
 		subjectFor.call(ORG_A, CALL_A, "channel.record.started"),
 		subjectFor.registration(ORG_A, aorSubjectToken(AOR_CASES[0] as string), "registered"),
 		subjectFor.queue(ORG_A, QUEUE_A, "caller.joined"),
+		subjectFor.voicemail(ORG_A, MAILBOX_A, "message.left"),
 		subjectFor.cdrLeg(ORG_A),
 		subjectFor.audit(ORG_A),
 		subjectFor.provision(ORG_A),
@@ -677,9 +825,18 @@ function parityGolden(): unknown {
 	const matchCases: readonly (readonly [string, string])[] = [
 		[subjectFilterFor.allCalls(), subjectFor.call(ORG_A, CALL_A, "channel.created")],
 		[subjectFilterFor.callsInOrg(ORG_A), subjectFor.call(ORG_B, CALL_A, "channel.created")],
-		[subjectFilterFor.callEvent("channel.hangup"), subjectFor.call(ORG_A, CALL_A, "channel.hangup")],
-		[subjectFilterFor.callEvent("channel.hangup"), subjectFor.call(ORG_A, CALL_A, "channel.record.started")],
-		[subjectFilterFor.callEventInOrg(ORG_A, "channel.record.started"), subjectFor.call(ORG_A, CALL_A, "channel.record.started")],
+		[
+			subjectFilterFor.callEvent("channel.hangup"),
+			subjectFor.call(ORG_A, CALL_A, "channel.hangup"),
+		],
+		[
+			subjectFilterFor.callEvent("channel.hangup"),
+			subjectFor.call(ORG_A, CALL_A, "channel.record.started"),
+		],
+		[
+			subjectFilterFor.callEventInOrg(ORG_A, "channel.record.started"),
+			subjectFor.call(ORG_A, CALL_A, "channel.record.started"),
+		],
 		[subjectFilterFor.allCdrLegs(), subjectFor.cdrLeg(ORG_A)],
 		[subjectFilterFor.allCdrLegs(), subjectFor.call(ORG_A, CALL_A, "channel.created")],
 		["a.b", "a.b"],
@@ -699,6 +856,7 @@ function parityGolden(): unknown {
 		rpcSubjects: RPC_SUBJECTS,
 		queueScopeAll: QUEUE_SCOPE_ALL,
 		aorSubjectTokens: AOR_CASES.map((aor) => ({ aor, token: aorSubjectToken(aor) })),
+		didIndexTokens: DID_CASES.map((did) => ({ did, token: didIndexToken(did) })),
 		subjectBuilders,
 		subjectFilters,
 		parseSubject: parseCases,
@@ -708,12 +866,35 @@ function parityGolden(): unknown {
 			matches: matchesSubject(filter, subject),
 		})),
 		kvKeys: [
-			{ builder: "registration", args: [ORG_A, aorSubjectToken(AOR_CASES[0] as string)], key: kvKeyFor.registration(ORG_A, aorSubjectToken(AOR_CASES[0] as string)) },
-			{ builder: "channel", args: [ORG_A, CALL_A, LEG_A], key: kvKeyFor.channel(ORG_A, CALL_A, LEG_A) },
+			{
+				builder: "registration",
+				args: [ORG_A, aorSubjectToken(AOR_CASES[0] as string)],
+				key: kvKeyFor.registration(ORG_A, aorSubjectToken(AOR_CASES[0] as string)),
+			},
+			{
+				builder: "channel",
+				args: [ORG_A, CALL_A, LEG_A],
+				key: kvKeyFor.channel(ORG_A, CALL_A, LEG_A),
+			},
 			{ builder: "presence", args: [ORG_A, DEVICE_A], key: kvKeyFor.presence(ORG_A, DEVICE_A) },
 			{ builder: "agentState", args: [ORG_A, AGENT_A], key: kvKeyFor.agentState(ORG_A, AGENT_A) },
-			{ builder: "routingCache", args: [ORG_A, "inbound"], key: kvKeyFor.routingCache(ORG_A, "inbound") },
-			{ builder: "routingCache", args: [ORG_A, "inbound", "441632960111"], key: kvKeyFor.routingCache(ORG_A, "inbound", "441632960111") },
+			{
+				builder: "routingCache",
+				args: [ORG_A, "inbound"],
+				key: kvKeyFor.routingCache(ORG_A, "inbound"),
+			},
+			{
+				builder: "routingCache",
+				args: [ORG_A, "inbound", "441632960111"],
+				key: kvKeyFor.routingCache(ORG_A, "inbound", "441632960111"),
+			},
+			{ builder: "didIndex", args: [DID_STORED], key: kvKeyFor.didIndex(DID_STORED) },
+			{ builder: "didIndex", args: [DID_DIALLED], key: kvKeyFor.didIndex(DID_DIALLED) },
+			{
+				builder: "didIndex",
+				args: ["+1 (212) 555-0100"],
+				key: kvKeyFor.didIndex("+1 (212) 555-0100"),
+			},
 		],
 		streams: EVENT_STREAMS.map((definition: StreamDefinition) => ({ ...definition })),
 		kvBuckets: KV_BUCKETS.map((definition: KvBucketDefinition) => ({ ...definition })),
@@ -724,6 +905,7 @@ function parityGolden(): unknown {
 			call: [...CALL_EVENTS],
 			registration: [...REGISTRATION_EVENTS],
 			queue: [...QUEUE_EVENTS],
+			voicemail: [...VOICEMAIL_EVENTS],
 		},
 		eventTypes: EVENT_ENTRIES.map((entry) => ({
 			family: entry.family,

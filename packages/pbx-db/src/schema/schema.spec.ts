@@ -87,15 +87,31 @@ describe("tenant tables", () => {
 		}
 	});
 
+	/**
+	 * Indexes that span every tenant, and why each one has to.
+	 *
+	 * The rule this suspends exists because a tenant-scoped query wants the tenant predicate to be
+	 * the leading column, so RLS is satisfied by an index seek rather than a filter. These two are
+	 * not tenant-scoped queries: both are resolved BEFORE a tenant is known, which is precisely what
+	 * makes them global.
+	 */
+	const DELIBERATELY_GLOBAL_INDEXES = new Set([
+		// A provisioning token arrives from a phone that has not told anyone who it belongs to.
+		"device_provisioning_token_key",
+		// A DID has exactly one owner on the PSTN, so it has exactly one owner here. Uniqueness is
+		// the point rather than a lookup path: it is what makes "two tenants claim one number"
+		// impossible at the moment of the write, and therefore what makes the `did-index` KV bucket
+		// safe to treat as a projection with one writer per key.
+		"phone_number_e164_global_key",
+	]);
+
 	it("leads every composite index with organization_id so the tenant predicate is usable", () => {
 		for (const table of tables) {
 			const config = getTableConfig(table);
 			for (const index of config.indexes) {
 				const [first] = index.config.columns;
 				const name = index.config.name ?? "<unnamed>";
-				// The provisioning token is resolved before a tenant is known, so it is the one
-				// index that is deliberately global.
-				if (name === "device_provisioning_token_key") {
+				if (DELIBERATELY_GLOBAL_INDEXES.has(name)) {
 					continue;
 				}
 				expect(

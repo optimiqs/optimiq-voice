@@ -39,6 +39,8 @@ var EventTypes = []EventTypeInfo{
 	{Family: FamilyQueue, Type: EventTypeQueueCallerAnswered, SubjectTemplate: "queue.evt.v1.<orgId>.<queueId>.caller.answered"},
 	{Family: FamilyQueue, Type: EventTypeQueueCallerAbandoned, SubjectTemplate: "queue.evt.v1.<orgId>.<queueId>.caller.abandoned"},
 	{Family: FamilyQueue, Type: EventTypeQueueAgentState, SubjectTemplate: "queue.evt.v1.<orgId>.<queueId>.agent.state"},
+	{Family: FamilyVoicemail, Type: EventTypeVoicemailMessageLeft, SubjectTemplate: "voicemail.evt.v1.<orgId>.<mailboxId>.message.left"},
+	{Family: FamilyVoicemail, Type: EventTypeVoicemailMWIUpdated, SubjectTemplate: "voicemail.evt.v1.<orgId>.<mailboxId>.mwi.updated"},
 	{Family: FamilyCDR, Type: EventTypeCDRLegWrite, SubjectTemplate: "cdr.leg.v1.<orgId>"},
 	{Family: FamilyAudit, Type: EventTypeAuditRecorded, SubjectTemplate: "audit.evt.v1.<orgId>"},
 	{Family: FamilyProvision, Type: EventTypeProvisionDeviceRequested, SubjectTemplate: "provision.evt.v1.<orgId>"},
@@ -93,6 +95,10 @@ func NewDataFor(eventType string) any {
 		return new(QueueCallerAbandonedData)
 	case EventTypeQueueAgentState:
 		return new(QueueAgentStateData)
+	case EventTypeVoicemailMessageLeft:
+		return new(VoicemailMessageLeftData)
+	case EventTypeVoicemailMWIUpdated:
+		return new(VoicemailMWIUpdatedData)
 	case EventTypeCDRLegWrite:
 		return new(CDRLegWriteData)
 	case EventTypeAuditRecorded:

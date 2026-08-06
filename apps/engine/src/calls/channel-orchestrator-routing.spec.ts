@@ -9,11 +9,24 @@ import { ChannelOrchestrator } from "./channel-orchestrator.service";
 import type { EngineEnv } from "../config/engine-env";
 import type { CallEventPublisher } from "../nats/call-event-publisher.service";
 import type { JetStreamService } from "../nats/jetstream.service";
+import type { DidIndexSource } from "../routing/did-index.source";
 import type { RoutingArtifactSource } from "../routing/routing-artifact.source";
 import type { CallEventOf, CdrLegWriteEnvelope } from "@optimiq-voice/events";
 import type { AriEvent } from "@optimiq-voice/media-ari";
 import type { PlanNode, PlanNodeTable, RoutingArtifact } from "@optimiq-voice/routing";
 import type { ChannelSnapshot } from "@optimiq-voice/telephony";
+
+/**
+ * A DID index that never resolves anything.
+ *
+ * Every case in the pure suite drives a call that already carries `OPTIMIQ_ORG_ID`, so the lookup
+ * is not what is under test here and a stub that always misses keeps each case exercising exactly
+ * the path it was written for. The lookup itself is covered by `did-index.source.spec.ts`, and the
+ * multi-tenant flow end to end by the integration suite.
+ */
+const NO_DID_INDEX = {
+	organizationFor: async () => undefined,
+} as unknown as DidIndexSource;
 
 /**
  * The orchestrator's ROUTING behaviour: resolve on `StasisStart`, walk the plan, and enrich the
@@ -109,13 +122,22 @@ const TERMINALS: PlanNode[] = [
 	{ id: "hangup:NORMAL_CLEARING", kind: "hangup", cause: "NORMAL_CLEARING" },
 ];
 
-function harness(options: { artifact?: RoutingArtifact; env?: Partial<EngineEnv> } = {}) {
+interface HarnessOptions {
+	readonly artifact?: RoutingArtifact;
+	readonly env?: Partial<EngineEnv>;
+	/** Channel variables the media fake reports. `{}` is a call the dialplan told nothing. */
+	readonly variables?: Record<string, string>;
+	/** A DID index for the cases that are about the lookup. Defaults to one that never resolves. */
+	readonly didIndex?: Pick<DidIndexSource, "organizationFor">;
+}
+
+function harness(options: HarnessOptions = {}) {
 	const signals = new CallSignalBus();
 	// The orchestrator is built below but has to be reachable from the media fake, because a real
 	// media server answers by DELIVERING AN EVENT — the whole point of `ensureAnswered`.
 	const holder: { orchestrator?: ChannelOrchestrator } = {};
 	const media = makeFakeMediaPort({
-		variables: { OPTIMIQ_ORG_ID: ORG },
+		variables: options.variables ?? { OPTIMIQ_ORG_ID: ORG },
 		onOriginate: (request) => {
 			signals.emit(legSignalKey(request.channelId), { kind: "answered" });
 		},
@@ -171,6 +193,7 @@ function harness(options: { artifact?: RoutingArtifact; env?: Partial<EngineEnv>
 		events,
 		jetstream,
 		routing,
+		(options.didIndex ?? NO_DID_INDEX) as DidIndexSource,
 		signals,
 	);
 
@@ -431,5 +454,191 @@ describe("drain with routing on", () => {
 		const h = harness({ artifact: artifactWith(TERMINALS, "hangup:NORMAL_CLEARING") });
 		await arrive(h);
 		expect(h.orchestrator.activeWalkCount).toBe(0);
+	});
+});
+
+// =================================================================================================
+// B-leg CDRs
+// =================================================================================================
+
+/** The ARI channel shape a leg the engine originated arrives as. */
+function bLegChannel(id: string): Record<string, unknown> {
+	return {
+		id,
+		name: `PJSIP/1001-${id.slice(-4)}`,
+		state: "Up",
+		caller: { name: "", number: "" },
+		dialplan: { context: "optimiq-internal", exten: "1001", priority: 1 },
+	};
+}
+
+/** An extension node the plan can dial. */
+function extensionNode(id: string, number: string, extensionId: string): PlanNode {
+	return {
+		id,
+		kind: "extension",
+		extensionId,
+		number,
+		tollClass: "internal",
+		recordPolicy: "none",
+		timeoutSeconds: 20,
+		doNotDisturb: false,
+	} as PlanNode;
+}
+
+describe("B-leg CDRs", () => {
+	/**
+	 * The gap this closes: a call to a ring group produced FIVE legs and ONE record. Everything a
+	 * PBX is asked about the other four — which agent answered, how long each phone rang, what the
+	 * losers were told — is unanswerable from the caller's row alone.
+	 */
+	it("gives an originated leg its own record, linked to the A-leg by callId", async () => {
+		const extensionId = "0195c0f0-1c2f-7000-8000-0000000000f1";
+		const h = harness({
+			artifact: artifactWith([...TERMINALS, extensionNode("ext:1", "1001", extensionId)], "ext:1"),
+		});
+
+		await arrive(h);
+		const bLegChannelId = h.media.originated()[0]?.channelId as string;
+		expect(bLegChannelId).toBeDefined();
+
+		// Both legs end. The B-leg first, as a callee hanging up does.
+		await h.orchestrator.handleEvent(
+			ariEvent("ChannelDestroyed", { channel: bLegChannel(bLegChannelId), cause: 16 }),
+		);
+		await h.orchestrator.handleEvent(
+			ariEvent("ChannelDestroyed", { channel: channel(), cause: 16 }),
+		);
+
+		expect(h.cdrs).toHaveLength(2);
+		const [bLeg, aLeg] = h.cdrs;
+		expect(bLeg?.data.leg).toBe("b");
+		expect(aLeg?.data.leg).toBe("a");
+		// One call, two rows: the correlation the `call_legs` table has always modelled.
+		expect(bLeg?.data.callId).toBe(aLeg?.data.callId as string);
+		// The B-leg names the leg that dialled it; the A-leg names nobody.
+		expect(bLeg?.data.originatingLegId).toBeTruthy();
+		expect(aLeg?.data.originatingLegId).toBeNull();
+		// The B-leg reports who it reached, not who called.
+		expect(bLeg?.data.toNumber).toBe("1001");
+		expect(bLeg?.data.destinationType).toBe("extension");
+		expect(bLeg?.data.destinationRef).toBe(extensionId);
+		// A callee's hangup is attributed to the callee, never to the caller.
+		expect(bLeg?.data.hangupSide).toBe("callee");
+	});
+
+	it("records the bridge on both legs, so a call can be reassembled from either", async () => {
+		const h = harness({
+			artifact: artifactWith(
+				[...TERMINALS, extensionNode("ext:1", "1001", "0195c0f0-1c2f-7000-8000-0000000000f1")],
+				"ext:1",
+			),
+		});
+
+		await arrive(h);
+		const bLegChannelId = h.media.originated()[0]?.channelId as string;
+
+		await h.orchestrator.handleEvent(
+			ariEvent("ChannelDestroyed", { channel: bLegChannel(bLegChannelId), cause: 16 }),
+		);
+
+		// The B-leg died while both were still in the bridge, so it names its peer.
+		expect(h.cdrs[0]?.data.bridgeLegId).toBeTruthy();
+	});
+
+	it("mirrors an originated leg into the channels bucket under the same call", async () => {
+		const h = harness({
+			artifact: artifactWith(
+				[...TERMINALS, extensionNode("ext:1", "1001", "0195c0f0-1c2f-7000-8000-0000000000f1")],
+				"ext:1",
+			),
+		});
+
+		await arrive(h);
+
+		const snapshots = [...h.kv.values()];
+		expect(snapshots.filter((snapshot) => snapshot.variables.OPTIMIQ_LEG === "b")).toHaveLength(1);
+		expect(new Set(snapshots.map((snapshot) => snapshot.callId)).size).toBe(1);
+	});
+
+	it("publishes channel.created for the leg it dialled, marked as the B side", async () => {
+		const h = harness({
+			artifact: artifactWith(
+				[...TERMINALS, extensionNode("ext:1", "1001", "0195c0f0-1c2f-7000-8000-0000000000f1")],
+				"ext:1",
+			),
+		});
+
+		await arrive(h);
+
+		const created = h.published.filter((event) => event.type === "channel.created");
+		expect(created).toHaveLength(2);
+		expect(created.map((event) => event.data.leg).sort()).toEqual(["a", "b"]);
+	});
+});
+
+// =================================================================================================
+// Multi-tenant attribution
+// =================================================================================================
+
+describe("attributing an inbound call to a tenant", () => {
+	/**
+	 * The blocker this closes. Without the index the engine could only read `OPTIMIQ_ORG_ID` off the
+	 * channel, so one dialplan served one tenant and every other tenant's DID was rejected.
+	 */
+	it("resolves the organization from the did-index when the channel carries none", async () => {
+		const looked: (string | undefined)[] = [];
+		const h = harness({
+			artifact: artifactWith(TERMINALS, "hangup:NORMAL_CLEARING"),
+			variables: {},
+			didIndex: {
+				organizationFor: async (did: string | undefined) => {
+					looked.push(did);
+					return { organizationId: ORG, phoneNumberId: "pn-1", e164: DID, enabled: true };
+				},
+			},
+		});
+
+		await arrive(h);
+
+		expect(looked).toEqual([DID]);
+		expect(h.cdrs).toHaveLength(0);
+		// The call was accepted and walked, not rejected at the door.
+		expect(h.media.hungUp().map((entry) => entry.cause)).not.toContain("INVALID_PROFILE");
+	});
+
+	/**
+	 * The one ordering decision that matters: putting the development default ABOVE the index would
+	 * make a box with the variable set answer every tenant's DID as its own tenant — reintroducing
+	 * the exact bug the index exists to prevent, through the fallback meant to make one box handy.
+	 */
+	it("prefers the did-index over ENGINE_DEFAULT_ORGANIZATION_ID", async () => {
+		const other = "0195c0f0-1c2f-7000-8000-000000000002";
+		const h = harness({
+			artifact: artifactWith(TERMINALS, "hangup:NORMAL_CLEARING"),
+			variables: {},
+			env: { ENGINE_DEFAULT_ORGANIZATION_ID: other },
+			didIndex: {
+				organizationFor: async () => ({ organizationId: ORG, enabled: true }),
+			},
+		});
+
+		await arrive(h);
+		await h.orchestrator.handleEvent(
+			ariEvent("ChannelDestroyed", { channel: channel(), cause: 16 }),
+		);
+
+		expect(h.cdrs[0]?.orgId).toBe(ORG);
+	});
+
+	it("rejects with INVALID_PROFILE when nothing can attribute the call", async () => {
+		const h = harness({ variables: {} });
+
+		await h.orchestrator.handleEvent(ariEvent("StasisStart", { channel: channel(), args: [] }));
+		await h.orchestrator.awaitWalks();
+
+		expect(h.media.hungUp()).toContainEqual({ channelId: ARI_CHANNEL, cause: "INVALID_PROFILE" });
+		// Never filed under a guess: no CDR, no events, nothing in KV.
+		expect(h.cdrs).toEqual([]);
 	});
 });

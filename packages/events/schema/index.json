@@ -7,6 +7,7 @@
 		"call": "calls.evt.v1",
 		"registration": "sip.reg.v1",
 		"queue": "queue.evt.v1",
+		"voicemail": "voicemail.evt.v1",
 		"cdrLeg": "cdr.leg.v1",
 		"audit": "audit.evt.v1",
 		"provision": "provision.evt.v1"
@@ -151,6 +152,20 @@
 			"subject": "queue.evt.v1.<orgId>.<queueId>.agent.state",
 			"dataSchema": "events/queue.agent.state.schema.json",
 			"goType": "QueueAgentStateData"
+		},
+		{
+			"family": "voicemail",
+			"type": "message.left",
+			"subject": "voicemail.evt.v1.<orgId>.<mailboxId>.message.left",
+			"dataSchema": "events/voicemail.message.left.schema.json",
+			"goType": "VoicemailMessageLeftData"
+		},
+		{
+			"family": "voicemail",
+			"type": "mwi.updated",
+			"subject": "voicemail.evt.v1.<orgId>.<mailboxId>.mwi.updated",
+			"dataSchema": "events/voicemail.mwi.updated.schema.json",
+			"goType": "VoicemailMWIUpdatedData"
 		},
 		{
 			"family": "cdr",

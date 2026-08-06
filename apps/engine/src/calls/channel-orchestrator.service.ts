@@ -1,7 +1,7 @@
 import { Inject, Injectable } from "@nestjs/common";
 import * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
-import { makeCdrLegWriteEvent, validateEvent } from "@optimiq-voice/events";
+import { makeCdrLegWriteEvent, makeVoicemailEvent, validateEvent } from "@optimiq-voice/events";
 import { getLogger } from "@optimiq-voice/logging";
 import { resolveInbound, resolveInternal, resolveOutbound } from "@optimiq-voice/routing";
 import { isDtmfDigit } from "@optimiq-voice/telephony";
@@ -9,6 +9,7 @@ import { CallEventPublisher } from "../nats/call-event-publisher.service";
 import { JetStreamService } from "../nats/jetstream.service";
 import { CALLS_EFFECT_RUNTIME, ENGINE_ENV, MEDIA_PORT } from "../nats/nats.tokens";
 import { CallSignalBus, legSignalKey, recordingSignalKey } from "../routing/call-signals";
+import { DidIndexSource } from "../routing/did-index.source";
 import { PlanWalker } from "../routing/plan-walker";
 import { RoutingArtifactSource } from "../routing/routing-artifact.source";
 import { dtmfEventFrom } from "../verbs/dtmf-inbox";
@@ -26,7 +27,13 @@ import { callIdForAriChannel, legIdForAriChannel, resolveOrganizationId } from "
 import { ChannelRegistry } from "./channel-registry";
 import type { MediaPort } from "../ari/media-port";
 import type { EngineEnv } from "../config/engine-env";
-import type { PlanWalkerSettings, WalkerChannel } from "../routing/plan-walker";
+import type {
+	OriginatedLeg,
+	OriginatedLegHooks,
+	PlanWalkerSettings,
+	VoicemailPort,
+	WalkerChannel,
+} from "../routing/plan-walker";
 import type { VerbChannelContext, VerbExecutorRuntime } from "../verbs/verb-executor";
 import type { CallDirection, CallEvent, LegSide } from "@optimiq-voice/events";
 import type { AriChannel, AriEvent } from "@optimiq-voice/media-ari";
@@ -36,6 +43,16 @@ import type { CallerProfile, HangupCause, Verb, VerbResult } from "@optimiq-voic
 /** Channel variables the routing walk writes back, so the KV mirror carries the decision too. */
 const DESTINATION_TYPE_VARIABLE = "OPTIMIQ_DESTINATION_TYPE";
 const DESTINATION_REF_VARIABLE = "OPTIMIQ_DESTINATION_REF";
+/**
+ * The leg this one was bridged to.
+ *
+ * A variable rather than a live lookup across the registry, because the peer relationship is torn
+ * down before both CDRs are written: the first leg to die releases the bridge, and a lookup would
+ * find nothing for the second. Written on BOTH legs at bridge time, so each one's record carries
+ * the other's id whichever dies first — and, being a channel variable, it survives into the KV
+ * snapshot an instance taking over a failover reads.
+ */
+const BRIDGE_PEER_VARIABLE = "OPTIMIQ_BRIDGE_PEER_LEG_ID";
 
 /**
  * The channel orchestrator — the engine's core.
@@ -92,6 +109,7 @@ export class ChannelOrchestrator {
 		private readonly events: CallEventPublisher,
 		private readonly jetstream: JetStreamService,
 		private readonly routing: RoutingArtifactSource,
+		private readonly didIndex: DidIndexSource,
 		private readonly signals: CallSignalBus,
 	) {}
 
@@ -233,17 +251,15 @@ export class ChannelOrchestrator {
 			return;
 		}
 
-		const organizationId = resolveOrganizationId(
-			variables,
-			this.env.ENGINE_DEFAULT_ORGANIZATION_ID,
-		);
+		const organizationId = await this.attributeCall(channel, variables);
 
 		if (organizationId === undefined) {
 			// Invariant 3. `INVALID_PROFILE` is the honest cause: the call reached us without the
-			// routing context that says who it belongs to.
+			// routing context that says who it belongs to, and nothing on the platform could supply it.
 			this.logger.error(
 				{ ariChannelId: channel.id, exten: channel.dialplan?.exten },
-				"rejecting a call with no resolvable organization (set OPTIMIQ_ORG_ID in the dialplan)",
+				"rejecting a call with no resolvable organization (no OPTIMIQ_ORG_ID, and the dialled " +
+					"number is not in the did-index bucket)",
 			);
 			await this.hangupQuietly(channel.id, "INVALID_PROFILE");
 			return;
@@ -312,6 +328,59 @@ export class ChannelOrchestrator {
 			return;
 		}
 		await this.runUnroutedProgram(aggregate);
+	}
+
+	/**
+	 * Which tenant this call belongs to, in the only order that is safe.
+	 *
+	 * 1. **`OPTIMIQ_ORG_ID` on the channel.** The SIP edge or the dialplan already decided, which is
+	 *    the strongest signal there is: it was made with the INVITE in hand, including headers this
+	 *    process never sees. A deployment where the edge stamps `X-Optimiq-Org-Id` lands here.
+	 * 2. **The `did-index` bucket, keyed by the dialled number.** The multi-tenant path: the control
+	 *    plane wrote the mapping when the number was provisioned, and `phone_number.e164` carries a
+	 *    platform-wide unique index so at most one tenant can ever have claimed it.
+	 * 3. **`ENGINE_DEFAULT_ORGANIZATION_ID`.** Development only, and LAST on purpose. Ordering it
+	 *    above the index would make a developer box with the variable set answer every tenant's DID
+	 *    as its own tenant — which is exactly the bug the index exists to prevent, reintroduced by
+	 *    the fallback meant to make one box convenient.
+	 *
+	 * `undefined` is a rejection, never a default. There is no fourth step.
+	 */
+	private async attributeCall(
+		channel: AriChannel,
+		variables: Readonly<Record<string, string | undefined>>,
+	): Promise<string | undefined> {
+		// No fallback here: the env default is applied below, after the index has had its say.
+		const stamped = resolveOrganizationId(variables);
+		if (stamped !== undefined) {
+			return stamped;
+		}
+
+		const dialled = channel.dialplan?.exten;
+		const hit = await this.didIndex.organizationFor(dialled);
+		if (hit !== undefined) {
+			this.logger.info(
+				{
+					ariChannelId: channel.id,
+					did: dialled,
+					organizationId: hit.organizationId,
+					phoneNumberId: hit.phoneNumberId,
+					enabled: hit.enabled,
+				},
+				"attributed an inbound call from the did-index bucket",
+			);
+			return hit.organizationId;
+		}
+
+		const fallback = this.env.ENGINE_DEFAULT_ORGANIZATION_ID;
+		if (fallback !== undefined) {
+			this.logger.warn(
+				{ ariChannelId: channel.id, did: dialled, organizationId: fallback },
+				"no did-index entry; falling back to ENGINE_DEFAULT_ORGANIZATION_ID (development only)",
+			);
+			return resolveOrganizationId({}, fallback);
+		}
+		return undefined;
 	}
 
 	/**
@@ -450,6 +519,8 @@ export class ChannelOrchestrator {
 			publish: (type, data) => this.publishCallEvent(aggregate, type, data),
 			settings: this.walkerSettings(),
 			peerLegId: legIdForAriChannel,
+			legs: this.legHooksFor(aggregate),
+			voicemail: this.voicemailPortFor(aggregate),
 			log: (message, detail) => {
 				this.logger.info({ channelId: aggregate.channelId, ...detail }, message);
 			},
@@ -463,6 +534,9 @@ export class ChannelOrchestrator {
 			...(route.callerIdNumber === undefined ? {} : { callerIdNumber: route.callerIdNumber }),
 			...(route.callerIdName === undefined ? {} : { callerIdName: route.callerIdName }),
 			...(route.featureArgument === undefined ? {} : { featureArgument: route.featureArgument }),
+			// The mailbox table travels with the plan so a `check` can answer "does the extension
+			// this call came from have a box?" without a database handle. See `WalkInput.mailboxes`.
+			mailboxes: artifact.internal.mailboxes,
 		});
 
 		if (outcome.destination !== undefined) {
@@ -486,6 +560,184 @@ export class ChannelOrchestrator {
 			},
 			"the routing walk finished",
 		);
+	}
+
+	/**
+	 * Gives every leg the walk originates a `ChannelAggregate`, and therefore a CDR of its own.
+	 *
+	 * ## Why a B-leg needs one at all
+	 *
+	 * A call is not one leg. A caller reaching a ring group of four produces five legs, four of which
+	 * were rung, one of which answered, and three of which lost the race — and until now the system
+	 * wrote ONE record, for the caller. Everything a PBX is asked about the other four is unanswerable
+	 * from that record: which agent picked up, how long each phone rang before the winner did, whether
+	 * a member was ringing at all, what the trunk charged for the leg that reached a mobile. The
+	 * `call_legs` table has always modelled it correctly (`leg`, `originating_leg_id`, `bridge_leg_id`
+	 * are its first four columns); nothing was filling the rows.
+	 *
+	 * ## Why the aggregate is created BEFORE the originate
+	 *
+	 * Because `StasisStart` for a fast-answering leg can arrive before the originate's own HTTP
+	 * response does. Creating the aggregate afterwards would leave a window in which the leg's events
+	 * — including its `ChannelDestroyed`, and therefore its CDR — arrive at an orchestrator that has
+	 * never heard of it.
+	 *
+	 * ## Direction, and what a B-leg's `toNumber` means
+	 *
+	 * The leg keeps the CALL's direction, not the wire's: an inbound call to a ring group produces
+	 * B-legs the switch dialled outward, but they are part of an inbound call and reporting them as
+	 * outbound would put a company's incoming volume in its outbound column. `fromNumber` is the
+	 * caller identity the leg was asked to present and `toNumber` is what it was asked to reach,
+	 * which is the pair a human reads as "who rang whom".
+	 */
+	private legHooksFor(aLeg: ChannelAggregate): OriginatedLegHooks {
+		return {
+			originated: (leg) => {
+				if (this.registry.byAriChannelId(leg.mediaChannelId) !== undefined) {
+					return;
+				}
+				const bLeg = ChannelAggregate.create({
+					ariChannelId: leg.mediaChannelId,
+					channelId: legIdForAriChannel(leg.mediaChannelId),
+					// The A-leg's call id, so every leg of one call shares a subject and a `call_id`.
+					callId: aLeg.callId,
+					organizationId: aLeg.organizationId,
+					direction: callDirectionFrom(aLeg.snapshot.variables.OPTIMIQ_CALL_DIRECTION),
+					leg: "b",
+					profile: {
+						callerIdName: aLeg.snapshot.profile.callerIdName,
+						callerIdNumber: aLeg.snapshot.profile.callerIdNumber,
+						ani: aLeg.snapshot.profile.ani,
+						destinationNumber: leg.destinationNumber,
+						context: aLeg.snapshot.profile.context,
+						channelName: leg.endpoint,
+						source: "ari",
+					},
+					variables: {
+						OPTIMIQ_LEG: "b",
+						OPTIMIQ_ORIGINATING_LEG_ID: aLeg.channelId,
+						...(leg.destinationType === undefined
+							? {}
+							: { [DESTINATION_TYPE_VARIABLE]: leg.destinationType }),
+						...(leg.destinationRef === undefined
+							? {}
+							: { [DESTINATION_REF_VARIABLE]: leg.destinationRef }),
+					},
+					createdAt: Date.now(),
+				});
+				this.registry.add(bLeg);
+				// A B-leg is created, then immediately dialled: `initializing` is the state that says
+				// "the endpoint is known, the INVITE has not gone out yet".
+				bLeg.transitionTo("initializing");
+				bLeg.transitionTo("routing");
+				bLeg.transitionTo("executing");
+				void this.publishBLegCreated(bLeg, aLeg, leg);
+			},
+			hangingUp: (mediaChannelId, cause) => {
+				const aggregate = this.registry.byAriChannelId(mediaChannelId);
+				// First-wins, so this only lands when nothing has decided the cause yet — which is
+				// exactly the case it exists for: the walker's own `LOSE_RACE` / `ORIGINATOR_CANCEL`,
+				// which the media server is about to overwrite with a generic code.
+				aggregate?.markHangup({ cause, at: Date.now(), initiatedByEngine: true });
+			},
+			bridged: (mediaChannelId, bridgeId) => {
+				const bLeg = this.registry.byAriChannelId(mediaChannelId);
+				if (bLeg === undefined) {
+					return;
+				}
+				bLeg.setBridge(bridgeId);
+				bLeg.tryTransitionTo("exchanging-media");
+				// Both directions, now, while both legs are still up. See `BRIDGE_PEER_VARIABLE`.
+				bLeg.setVariable(BRIDGE_PEER_VARIABLE, aLeg.channelId);
+				aLeg.setVariable(BRIDGE_PEER_VARIABLE, bLeg.channelId);
+				void this.jetstream.putChannel(bLeg.snapshot);
+				void this.jetstream.putChannel(aLeg.snapshot);
+			},
+		};
+	}
+
+	/**
+	 * Where a recorded message goes.
+	 *
+	 * The walk records the audio and knows which box it belongs to; this turns that into the
+	 * `voicemail.message.left` fact and puts it on the backbone with an ack. The engine deliberately
+	 * does NOT write the `voicemail_message` row itself: it holds no database handle, the row lives
+	 * in the control plane's bounded context, and an engine that opened a second Postgres connection
+	 * to file a mailbox row would put a database on the call path for the first time.
+	 *
+	 * The envelope is validated before it is published, for the same reason the CDR's is: an event
+	 * that fails its own schema at the consumer is a message nobody can file, discovered hours later.
+	 */
+	private voicemailPortFor(aggregate: ChannelAggregate): VoicemailPort {
+		return {
+			messageLeft: async (message) => {
+				const envelope = makeVoicemailEvent("message.left", {
+					orgId: aggregate.organizationId,
+					mailboxId: message.voicemailBoxId,
+					source: "engine",
+					data: {
+						messageId: message.messageId,
+						mailboxNumber: message.mailboxNumber,
+						callId: aggregate.callId,
+						legId: aggregate.channelId,
+						recordingId: message.recordingId,
+						objectKey: message.objectKey,
+						durationMs: message.durationMs,
+						receivedAt: new Date().toISOString(),
+						...(message.callerIdNumber === undefined
+							? {}
+							: { callerIdNumber: message.callerIdNumber }),
+						...(message.callerIdName === undefined ? {} : { callerIdName: message.callerIdName }),
+					},
+				});
+				validateEvent(envelope.subject, envelope);
+				await this.jetstream.publishVoicemail(envelope);
+				this.logger.info(
+					{
+						callId: aggregate.callId,
+						mailboxId: message.voicemailBoxId,
+						messageId: message.messageId,
+						durationMs: message.durationMs,
+						mwiEnabled: message.mwiEnabled,
+					},
+					"filed a voicemail message",
+				);
+			},
+		};
+	}
+
+	/** `channel.created` for a leg the engine dialled. Best-effort: a B-leg's events are not its CDR. */
+	private async publishBLegCreated(
+		bLeg: ChannelAggregate,
+		aLeg: ChannelAggregate,
+		leg: OriginatedLeg,
+	): Promise<void> {
+		try {
+			await this.events.publish("channel.created", {
+				orgId: bLeg.organizationId,
+				callId: bLeg.callId,
+				data: {
+					legId: bLeg.channelId,
+					leg: "b" satisfies LegSide,
+					direction: callDirectionFrom(
+						aLeg.snapshot.variables.OPTIMIQ_CALL_DIRECTION,
+					) satisfies CallDirection,
+					from: {
+						number: dialStringOr(bLeg.snapshot.profile.callerIdNumber),
+						...(bLeg.snapshot.profile.callerIdName === undefined
+							? {}
+							: { name: bLeg.snapshot.profile.callerIdName }),
+					},
+					to: { number: dialStringOr(leg.destinationNumber) },
+				},
+			});
+			await this.jetstream.putChannel(bLeg.snapshot);
+		} catch (error) {
+			this.logger.warn(
+				{ channelId: bLeg.channelId, err: String(error) },
+				"failed to publish channel.created for an originated leg",
+			);
+		}
 	}
 
 	/**
@@ -654,7 +906,9 @@ export class ChannelOrchestrator {
 		await this.jetstream.putChannel(aggregate.snapshot);
 
 		// After the mirror, so a failover that happens mid-announcement sees an answered leg.
-		if (justAnswered) {
+		// A-legs only: the pre-routing announcement is for the CALLER. Playing it at a callee's leg
+		// the walker just dialled would talk over the person who picked up.
+		if (justAnswered && legSideOf(aggregate) === "a") {
 			await this.runAnsweredProgram(aggregate);
 		}
 	}
@@ -774,8 +1028,9 @@ export class ChannelOrchestrator {
 		aggregate.tryTransitionTo("hangup");
 		aggregate.tryCallStateTo("hangup");
 
+		const leg = legSideOf(aggregate);
 		const cause = aggregate.hangupCause ?? "NORMAL_UNSPECIFIED";
-		const side = hangupSideFor({ leg: "a", initiatedByEngine: aggregate.wasHungUpByEngine });
+		const side = hangupSideFor({ leg, initiatedByEngine: aggregate.wasHungUpByEngine });
 
 		await this.events.publish("channel.hangup", {
 			orgId: aggregate.organizationId,
@@ -807,6 +1062,35 @@ export class ChannelOrchestrator {
 		aggregate.transitionTo("destroyed");
 		await this.jetstream.deleteChannel(aggregate.snapshot);
 		this.registry.remove(aggregate);
+
+		await this.endBridgePeer(aggregate);
+	}
+
+	/**
+	 * Ends the leg this one was bridged to, once its own record is written.
+	 *
+	 * A bridge is two legs and a call is over when either of them goes. The walker already handles
+	 * one direction — it watches the leg it originated and tears the call down when the callee hangs
+	 * up — but nothing handled the other, because until B-legs were tracked there was nothing to
+	 * handle it WITH: the callee's channel was invisible to this process. The visible symptom was a
+	 * Local channel still holding a media port after the caller had gone, ended eventually by
+	 * Asterisk's absolute timeout rather than by the call finishing.
+	 *
+	 * Ordered after the CDR deliberately. Hanging the peer up first would race its own
+	 * `ChannelDestroyed` against this leg's record, and the two legs of one call must not be able to
+	 * interleave their teardown.
+	 */
+	private async endBridgePeer(aggregate: ChannelAggregate): Promise<void> {
+		const peerLegId = aggregate.snapshot.variables[BRIDGE_PEER_VARIABLE];
+		if (peerLegId === undefined) {
+			return;
+		}
+		const peer = this.registry.byDomainChannelId(peerLegId);
+		if (peer === undefined || peer.isTearingDown) {
+			return;
+		}
+		peer.markHangup({ cause: "NORMAL_CLEARING", at: Date.now(), initiatedByEngine: true });
+		await this.hangupQuietly(peer.ariChannelId, "NORMAL_CLEARING");
 	}
 
 	private async writeCdr(
@@ -824,14 +1108,21 @@ export class ChannelOrchestrator {
 			// `unknown` rather than inventing one.
 			const destinationType = aggregate.snapshot.variables[DESTINATION_TYPE_VARIABLE];
 			const destinationRef = aggregate.snapshot.variables[DESTINATION_REF_VARIABLE];
+			// Set on a B-leg by `legHooksFor`, absent on an A-leg. This is what makes the four rows of
+			// a ring-group call assemble back into one call: they share `callId`, and each B-leg names
+			// the leg that dialled it.
+			const originatingLegId = aggregate.snapshot.variables.OPTIMIQ_ORIGINATING_LEG_ID;
+			const bridgeLegId = aggregate.snapshot.variables[BRIDGE_PEER_VARIABLE];
 			const data = buildCdrLegWrite({
 				snapshot: aggregate.snapshot,
-				leg: "a",
+				leg: legSideOf(aggregate),
 				direction: callDirectionFrom(aggregate.snapshot.variables.OPTIMIQ_CALL_DIRECTION),
 				hangupCause: input.cause,
 				hangupCauseCode: input.causeCode,
 				hangupSide: input.side,
 				endedAt: input.endedAt,
+				...(originatingLegId === undefined ? {} : { originatingLegId }),
+				...(bridgeLegId === undefined ? {} : { bridgeLegId }),
 				...(destinationType === undefined ? {} : { destinationType }),
 				...(destinationRef === undefined ? {} : { destinationRef }),
 			});
@@ -941,6 +1232,18 @@ export class ChannelOrchestrator {
 		);
 		return Object.fromEntries(entries);
 	}
+}
+
+/**
+ * Which side of the call a tracked leg is.
+ *
+ * Read off `OPTIMIQ_LEG`, which the walker exports onto every leg it originates and which nothing
+ * else sets, rather than off a field: the variable is already mirrored into the `channels` KV
+ * snapshot, so an instance that picks this leg up after a failover reads the same answer and writes
+ * the same CDR. A field would live only in the process that died.
+ */
+function legSideOf(aggregate: ChannelAggregate): LegSide {
+	return aggregate.snapshot.variables.OPTIMIQ_LEG === "b" ? "b" : "a";
 }
 
 /**

@@ -15,7 +15,13 @@ import {
 } from "./plan-fixtures.fake";
 import { composeCallerId, PlanWalker } from "./plan-walker";
 import type { FakeMediaPortOptions } from "../ari/media-port.fake";
-import type { PlanWalkerSettings, WalkerChannel, WalkInput } from "./plan-walker";
+import type {
+	PlanWalkerSettings,
+	VoicemailMessage,
+	VoicemailPort,
+	WalkerChannel,
+	WalkInput,
+} from "./plan-walker";
 import type { CallEvent } from "@optimiq-voice/events";
 import type { CompiledTimeCondition, PlanNode } from "@optimiq-voice/routing";
 import type {
@@ -64,6 +70,8 @@ interface HarnessOptions {
 		| { readonly kind: "failed"; readonly reason: string }
 		/** Never reports: the walker's own backstop timer is what has to end it. */
 		| { readonly kind: "silent" };
+	/** Where a recorded message is filed. Absent means the walk has no voicemail port. */
+	readonly voicemail?: VoicemailPort;
 }
 
 type LegReaction =
@@ -214,6 +222,7 @@ function harness(options: HarnessOptions = {}) {
 		},
 		settings: { answerTimeoutMs: 200, ...options.settings },
 		peerLegId: (mediaChannelId) => `leg-of-${mediaChannelId}`,
+		...(options.voicemail === undefined ? {} : { voicemail: options.voicemail }),
 		newId: () => {
 			counter += 1;
 			return `id-${String(counter)}`;
@@ -1101,12 +1110,113 @@ describe("voicemail", () => {
 		expect(h.published).toEqual([]);
 	});
 
-	it("announces and hangs up in `check` mode, and says why", async () => {
+	it("refuses a `check` that is not the caller's own mailbox", async () => {
+		// The node names box 8000 and the call is from +15551234567. Opening it anyway would hand a
+		// caller somebody else's messages on the strength of having dialled the right node.
 		const h = harness();
 		const outcome = await h.walker.walk(walkInput([voicemailNode("vm", { mode: "check" })]));
 
 		expect(verbNames(h.verbs)).toEqual(["answer", "play", "hangup"]);
-		expect(outcome.notes.join(" ")).toContain("mailbox authentication");
+		expect(outcome.hangupCause).toBe("INVALID_NUMBER_FORMAT");
+		expect(outcome.notes.join(" ")).toContain("matched no mailbox");
+	});
+
+	it("opens the caller's own mailbox and reads its number back as digits", async () => {
+		const h = harness();
+		const outcome = await h.walker.walk(
+			walkInput([voicemailNode("vm", { mode: "check", mailboxNumber: "1001" })], {
+				callerIdNumber: "1001",
+			}),
+		);
+
+		// `digits/N` is in Asterisk's core sound package, so this works with no prompt pack and no
+		// TTS — which is the whole point of spelling the number rather than synthesising it.
+		expect(h.verbs).toEqual([
+			{ verb: "answer" },
+			{ verb: "play", media: "sound:digits/1" },
+			{ verb: "play", media: "sound:digits/0" },
+			{ verb: "play", media: "sound:digits/0" },
+			{ verb: "play", media: "sound:digits/1" },
+			{ verb: "hangup", cause: "NORMAL_CLEARING" },
+		]);
+		expect(outcome.notes.join(" ")).toContain("message counts and playback");
+	});
+
+	it("opens a mailbox the artifact says the caller owns, even when the node names another", async () => {
+		const h = harness();
+		const outcome = await h.walker.walk(
+			walkInput([voicemailNode("vm", { mode: "check" })], {
+				callerIdNumber: "1002",
+				mailboxes: {
+					"1002": {
+						voicemailBoxId: "vm-1002",
+						mailboxNumber: "1002",
+						leaveNodeId: "vm",
+						checkNodeId: "vm",
+					},
+				},
+			}),
+		);
+
+		expect(h.verbs).toContainEqual({ verb: "play", media: "sound:digits/2" });
+		expect(outcome.hangupCause).toBe("NORMAL_CLEARING");
+	});
+
+	it("files the recorded message against the box, once, with the audio it actually captured", async () => {
+		const filed: VoicemailMessage[] = [];
+		const h = harness({
+			voicemail: {
+				messageLeft: async (message) => {
+					filed.push(message);
+				},
+			},
+		});
+		await h.walker.walk(walkInput([voicemailNode("vm")]));
+
+		expect(filed).toHaveLength(1);
+		expect(filed[0]?.voicemailBoxId).toBe("vm-vm");
+		expect(filed[0]?.mailboxNumber).toBe("8000");
+		expect(filed[0]?.durationMs).toBeGreaterThan(0);
+		expect(filed[0]?.callerIdNumber).toBe("+15551234567");
+		// The same object the `channel.record.*` pair named, so the uploader and the mailbox row
+		// point at one file rather than at two names for it.
+		const stopped = h.published.find((event) => event.type === "channel.record.stopped");
+		const stoppedKey = (stopped?.data ?? {}) as { objectKey?: string };
+		expect(filed[0]?.objectKey).toBe(String(stoppedKey.objectKey));
+	});
+
+	it("does NOT file a message when the recording produced no audio", async () => {
+		// A mailbox entry with silence behind it costs a user the trip and tells them nothing, and
+		// lights a lamp for a message that is not there.
+		const filed: VoicemailMessage[] = [];
+		const h = harness({
+			recording: { kind: "failed", reason: "no audio path" },
+			voicemail: {
+				messageLeft: async (message) => {
+					filed.push(message);
+				},
+			},
+		});
+		const outcome = await h.walker.walk(walkInput([voicemailNode("vm")]));
+
+		expect(filed).toEqual([]);
+		expect(outcome.notes.join(" ")).toContain("no audio");
+	});
+
+	it("reports a filing failure on the walk rather than swallowing it", async () => {
+		const h = harness({
+			voicemail: {
+				messageLeft: async () => {
+					throw new Error("broker unreachable");
+				},
+			},
+		});
+		const outcome = await h.walker.walk(walkInput([voicemailNode("vm")]));
+
+		// The object is in the store and the row is not: a divergence an operator has to be able
+		// to see, and the caller has already hung up so there is nothing left to fail.
+		expect(outcome.hangupCause).toBe("NORMAL_CLEARING");
+		expect(outcome.notes.join(" ")).toContain("could NOT be filed");
 	});
 
 	it("records the mailbox as the CDR destination", async () => {
@@ -1118,11 +1228,13 @@ describe("voicemail", () => {
 		});
 	});
 
-	it("says out loud that the message was recorded but not filed", async () => {
+	it("says out loud when there is nowhere to file the message", async () => {
+		// No voicemail port: the walk records and then has nothing to hand the message to. Silence
+		// here would be a message that vanished between the store and the mailbox.
 		const h = harness();
 		const outcome = await h.walker.walk(walkInput([voicemailNode("vm")]));
 
-		expect(outcome.notes.join(" ")).toContain("not filed");
+		expect(outcome.notes.join(" ")).toContain("no voicemail port");
 	});
 });
 
@@ -1325,7 +1437,7 @@ describe("feature codes", () => {
 		expect(outcome.visited).toEqual(["f", "done"]);
 	});
 
-	it("serves *97 with the voicemail placeholder and names the gap", async () => {
+	it("announces *97 with no mailbox behind it, rather than playing a greeting at it", async () => {
 		const h = harness();
 		const outcome = await h.walker.walk(
 			walkInput([
@@ -1340,8 +1452,8 @@ describe("feature codes", () => {
 		);
 
 		expect(verbNames(h.verbs)).toEqual(["answer", "play", "hangup"]);
-		expect(outcome.hangupCause).toBe("NORMAL_CLEARING");
-		expect(outcome.notes.join(" ")).toContain("no mailbox wired");
+		expect(outcome.hangupCause).toBe("INVALID_NUMBER_FORMAT");
+		expect(outcome.notes.join(" ")).toContain("resolved to no mailbox node");
 	});
 
 	it("announces and hangs up for every other code, rather than doing nothing", async () => {

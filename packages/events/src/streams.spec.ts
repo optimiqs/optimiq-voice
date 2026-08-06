@@ -74,11 +74,12 @@ describe("duration conversion", () => {
 });
 
 describe("stream definitions", () => {
-	it("declares the six streams from plan §3.5", () => {
+	it("declares the seven streams from plan §3.5", () => {
 		expect(EVENT_STREAMS.map((stream) => stream.name)).toEqual([
 			"CALLS",
 			"REGISTRATIONS",
 			"QUEUES",
+			"VOICEMAIL",
 			"CDR",
 			"AUDIT",
 			"PROVISION",
@@ -265,27 +266,42 @@ describe("stream reconciliation helpers", () => {
 });
 
 describe("kv bucket definitions", () => {
-	it("declares the five buckets from plan §3.5", () => {
+	it("declares the six buckets from plan §3.5", () => {
 		expect(KV_BUCKETS.map((bucket) => bucket.name)).toEqual([
 			"registrations",
 			"channels",
 			"presence",
 			"agent-state",
 			"routing-cache",
+			"did-index",
 		]);
 	});
 
-	it("gives every bucket a TTL and a single revision of history", () => {
+	it("gives every bucket a single revision of history", () => {
 		for (const bucket of KV_BUCKETS) {
-			expect(bucket.ttlMs).toBeGreaterThan(0);
 			expect(bucket.history).toBe(1);
 			expect(bucket.maxValueSizeBytes).toBeGreaterThan(0);
 		}
 	});
 
+	/**
+	 * `did-index` is the ONE bucket that must not expire: it holds configuration, not live state,
+	 * and an expired entry turns an inbound call to a valid DID into an `INVALID_PROFILE` rejection
+	 * — an outage produced by a timer rather than by a change.
+	 */
+	it("gives every LIVE-STATE bucket a TTL, and did-index none", () => {
+		for (const bucket of KV_BUCKETS) {
+			if (bucket.name === "did-index") {
+				expect(bucket.ttlMs).toBe(0);
+				continue;
+			}
+			expect(bucket.ttlMs).toBeGreaterThan(0);
+		}
+	});
+
 	it("keeps derived presence in memory and durable state on disk", () => {
 		expect(KV_BUCKETS.find((bucket) => bucket.name === "presence")?.storage).toBe("memory");
-		for (const name of ["registrations", "channels", "agent-state", "routing-cache"]) {
+		for (const name of ["registrations", "channels", "agent-state", "routing-cache", "did-index"]) {
 			expect(KV_BUCKETS.find((bucket) => bucket.name === name)?.storage).toBe("file");
 		}
 	});

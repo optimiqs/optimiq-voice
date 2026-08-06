@@ -13,6 +13,7 @@ import { createHash } from "node:crypto";
  * calls.evt.v1.<orgId>.<callId>.<event>      event = channel.created … channel.destroyed
  * sip.reg.v1.<orgId>.<aorHash>.<event>       event = registered | unregistered | expired
  * queue.evt.v1.<orgId>.<queueId>.<event>     event = caller.joined | … | agent.state
+ * voicemail.evt.v1.<orgId>.<mailboxId>.<event>  event = message.left | mwi.updated
  * cdr.leg.v1.<orgId>                         one subject per org; event type is in the envelope
  * audit.evt.v1.<orgId>
  * provision.evt.v1.<orgId>
@@ -39,6 +40,7 @@ export const SUBJECT_ROOTS = {
 	call: `calls.evt.${SUBJECT_VERSION}`,
 	registration: `sip.reg.${SUBJECT_VERSION}`,
 	queue: `queue.evt.${SUBJECT_VERSION}`,
+	voicemail: `voicemail.evt.${SUBJECT_VERSION}`,
 	cdrLeg: `cdr.leg.${SUBJECT_VERSION}`,
 	audit: `audit.evt.${SUBJECT_VERSION}`,
 	provision: `provision.evt.${SUBJECT_VERSION}`,
@@ -85,6 +87,19 @@ export const QUEUE_EVENTS = [
 export type QueueEvent = (typeof QUEUE_EVENTS)[number];
 
 /**
+ * Voicemail vocabulary.
+ *
+ * `message.left` is the FACT that a caller recorded something — the engine publishes it and the
+ * control plane files the row. `mwi.updated` is the DERIVED count that lights a lamp, published by
+ * whoever owns the mailbox's row, because only that process can count what is in it.
+ *
+ * Keeping them separate is what stops the engine from having to know how many unread messages a
+ * box holds in order to record one.
+ */
+export const VOICEMAIL_EVENTS = ["message.left", "mwi.updated"] as const;
+export type VoicemailEvent = (typeof VOICEMAIL_EVENTS)[number];
+
+/**
  * Reserved queue-scope token for events that belong to the org rather than to one queue —
  * in practice `agent.state`, since an agent has one status across every tier they sit in.
  * Wallboards subscribe to `queue.evt.v1.<org>.>` and therefore see both scopes.
@@ -99,6 +114,7 @@ export const EVENT_FAMILIES = [
 	"call",
 	"registration",
 	"queue",
+	"voicemail",
 	"cdr",
 	"audit",
 	"provision",
@@ -168,6 +184,31 @@ export function aorSubjectToken(aor: string): string {
 	return createHash("sha256").update(normalized).digest("hex").slice(0, 32);
 }
 
+/**
+ * Stable key token for a DID, for the `did-index` KV bucket.
+ *
+ * An E.164 number is stored as `+441632960111` and dialled as `441632960111`, `+441632960111` or
+ * (from a carrier that strips it) `441632960111` with punctuation. None of `+`, spaces, dashes or
+ * parentheses survive as a KV key token, and none of them carry meaning, so the token is the
+ * DIGITS of the number and nothing else. Both writers (the control plane, from the stored E.164)
+ * and the reader (the engine, from the dialled number) go through this one function, which is what
+ * makes "the DID the tenant configured" and "the DID the carrier delivered" the same key.
+ *
+ * What it deliberately does NOT do is guess a dial plan. `0044…` and `+44…` are the same number to
+ * a human and different tokens here, because turning a national prefix into a country code needs to
+ * know which country the trunk is in — a per-trunk normalization step that belongs to the SIP edge,
+ * not to a string function in the contract package.
+ *
+ * @throws {SubjectTokenError} when the value contains no digits at all.
+ */
+export function didIndexToken(did: string): string {
+	const digits = did.replace(/[^0-9]/gu, "");
+	if (digits.length === 0) {
+		throw new SubjectTokenError("did", did);
+	}
+	return digits;
+}
+
 /** Builds a concrete publish subject. Never concatenate subjects at a call site. */
 export const subjectFor = {
 	/** `calls.evt.v1.<orgId>.<callId>.<event>` */
@@ -181,6 +222,10 @@ export const subjectFor = {
 	/** `queue.evt.v1.<orgId>.<queueId>.<event>` */
 	queue(orgId: string, queueId: string, event: QueueEvent | (string & {})): string {
 		return `${SUBJECT_ROOTS.queue}.${assertToken("orgId", orgId)}.${assertToken("queueId", queueId)}.${assertEvent(event)}`;
+	},
+	/** `voicemail.evt.v1.<orgId>.<mailboxId>.<event>` — `mailboxId` is the voicemail box's id. */
+	voicemail(orgId: string, mailboxId: string, event: VoicemailEvent | (string & {})): string {
+		return `${SUBJECT_ROOTS.voicemail}.${assertToken("orgId", orgId)}.${assertToken("mailboxId", mailboxId)}.${assertEvent(event)}`;
 	},
 	/** `cdr.leg.v1.<orgId>` — a single ordered subject per org; the CDR writer consumes it. */
 	cdrLeg(orgId: string): string {
@@ -256,6 +301,21 @@ export const subjectFilterFor = {
 		return `${SUBJECT_ROOTS.queue}.${assertToken("orgId", orgId)}.*.${assertEvent(event)}`;
 	},
 
+	/** Every voicemail event, every org — the VOICEMAIL stream's own subject list. */
+	allVoicemail(): string {
+		return `${SUBJECT_ROOTS.voicemail}.>`;
+	},
+	voicemailInOrg(orgId: string): string {
+		return `${SUBJECT_ROOTS.voicemail}.${assertToken("orgId", orgId)}.>`;
+	},
+	/** Every event of one mailbox — what a BLF/MWI subscriber for one box watches. */
+	voicemailBox(orgId: string, mailboxId: string): string {
+		return `${SUBJECT_ROOTS.voicemail}.${assertToken("orgId", orgId)}.${assertToken("mailboxId", mailboxId)}.>`;
+	},
+	voicemailEventInOrg(orgId: string, event: VoicemailEvent | (string & {})): string {
+		return `${SUBJECT_ROOTS.voicemail}.${assertToken("orgId", orgId)}.*.${assertEvent(event)}`;
+	},
+
 	/** `cdr.leg.v1.*` — the CDR writer's filter; one token, so `*` not `>`. */
 	allCdrLegs(): string {
 		return `${SUBJECT_ROOTS.cdrLeg}.*`;
@@ -303,6 +363,14 @@ export type ParsedSubject =
 			readonly version: string;
 			readonly orgId: string;
 			readonly queueId: string;
+			readonly event: string;
+	  }
+	| {
+			readonly kind: "voicemail";
+			readonly family: "voicemail";
+			readonly version: string;
+			readonly orgId: string;
+			readonly mailboxId: string;
 			readonly event: string;
 	  }
 	| {
@@ -384,6 +452,17 @@ export function parseSubject(subject: string): ParsedSubject | undefined {
 		const [orgId, queueId, ...event] = rest as [string, string, ...string[]];
 		return { kind: "queue", family: "queue", version, orgId, queueId, event: event.join(".") };
 	}
+	if (prefix === "voicemail.evt" && rest.length >= 3) {
+		const [orgId, mailboxId, ...event] = rest as [string, string, ...string[]];
+		return {
+			kind: "voicemail",
+			family: "voicemail",
+			version,
+			orgId,
+			mailboxId,
+			event: event.join("."),
+		};
+	}
 	if (prefix === "cdr.leg" && rest.length === 1) {
 		return { kind: "cdr-leg", family: "cdr", version, orgId: rest[0] as string };
 	}
@@ -427,6 +506,10 @@ export function isRegistrationEvent(value: string): value is RegistrationEvent {
 
 export function isQueueEvent(value: string): value is QueueEvent {
 	return (QUEUE_EVENTS as readonly string[]).includes(value);
+}
+
+export function isVoicemailEvent(value: string): value is VoicemailEvent {
+	return (VOICEMAIL_EVENTS as readonly string[]).includes(value);
 }
 
 /**

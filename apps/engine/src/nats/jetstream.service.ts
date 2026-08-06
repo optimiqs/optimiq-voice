@@ -8,6 +8,7 @@ import {
 } from "nats";
 import {
 	CHANNELS_KV,
+	DID_INDEX_KV,
 	ensureKvBuckets,
 	ensureStreams,
 	kvKeyFor,
@@ -17,7 +18,7 @@ import {
 import { getLogger } from "@optimiq-voice/logging";
 import { ENGINE_ENV } from "./nats.tokens";
 import type { EngineEnv } from "../config/engine-env";
-import type { CdrLegWriteEnvelope } from "@optimiq-voice/events";
+import type { CdrLegWriteEnvelope, VoicemailEventEnvelope } from "@optimiq-voice/events";
 import type { ChannelSnapshot } from "@optimiq-voice/telephony";
 
 /**
@@ -52,6 +53,7 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	private jetstream: JetStreamClient | undefined;
 	private channelsKv: KV | undefined;
 	private routingCacheKv: KV | undefined;
+	private didIndexKv: KV | undefined;
 	private ready = false;
 
 	constructor(@Inject(ENGINE_ENV) private readonly env: EngineEnv) {}
@@ -100,6 +102,11 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		// definition `ensureKvBuckets` applies — so a fresh cluster does not need the API to have
 		// booted first for the engine to come up.
 		this.routingCacheKv = await this.jetstream.views.kv(ROUTING_CACHE_KV.name);
+		// Same reasoning as the routing cache: WRITTEN by `apps/api` when a number is provisioned,
+		// read here. Opening the view creates the bucket with the same definition `ensureKvBuckets`
+		// applies, so an engine that boots before the control plane has ever run does not have to
+		// discover the bucket's absence on its first inbound call.
+		this.didIndexKv = await this.jetstream.views.kv(DID_INDEX_KV.name);
 		this.ready = true;
 	}
 
@@ -115,6 +122,32 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	 */
 	get routingCache(): KV | undefined {
 		return this.routingCacheKv;
+	}
+
+	/**
+	 * The `did-index` bucket, for {@link import("../routing/did-index.source").DidIndexSource}.
+	 *
+	 * Exposed raw, like {@link routingCache}, because the consumer owns the read pattern. Unlike the
+	 * routing cache there is no watch: an entry here decides which TENANT a call belongs to, so it is
+	 * read fresh per call rather than cached — see the source's header for the argument.
+	 *
+	 * `undefined` before `onModuleInit` has run, or after shutdown.
+	 */
+	get didIndex(): KV | undefined {
+		return this.didIndexKv;
+	}
+
+	/**
+	 * The bucket key for a dialled number.
+	 *
+	 * Here rather than at the call site so the engine's reader and the control plane's writer are
+	 * provably using one normalisation (`kvKeyFor.didIndex`, pinned across languages by the
+	 * `packages/events` parity golden).
+	 *
+	 * @throws {import("@optimiq-voice/events").SubjectTokenError} when the value has no digits.
+	 */
+	didIndexKey(did: string): string {
+		return kvKeyFor.didIndex(did);
 	}
 
 	/**
@@ -191,6 +224,28 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		);
 	}
 
+	/**
+	 * Publishes one voicemail event with an ack.
+	 *
+	 * Acked for the same reason the CDR is: `VOICEMAIL` is `discard: new`, so an overflowing broker
+	 * REFUSES the write rather than dropping it, and a core publish cannot see a refusal. A dropped
+	 * `voicemail.message.left` is a message a caller recorded and a user will never be shown — the
+	 * audio is in the object store and nothing points at it.
+	 *
+	 * `msgID` is the envelope's own UUID v7, so a retry inside the stream's duplicate window inserts
+	 * one row rather than two copies of one message. Throws on failure: the caller notes it on the
+	 * walk, which is what makes the divergence visible.
+	 */
+	async publishVoicemail(envelope: VoicemailEventEnvelope): Promise<void> {
+		const jetstream = this.jetstream;
+		if (jetstream === undefined) {
+			throw new Error("JetStream is not connected; cannot publish a voicemail event.");
+		}
+		await jetstream.publish(envelope.subject, new TextEncoder().encode(JSON.stringify(envelope)), {
+			msgID: envelope.id,
+		});
+	}
+
 	async onApplicationShutdown(): Promise<void> {
 		this.ready = false;
 		const connection = this.connection;
@@ -198,6 +253,7 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		this.jetstream = undefined;
 		this.channelsKv = undefined;
 		this.routingCacheKv = undefined;
+		this.didIndexKv = undefined;
 		if (connection !== undefined && !connection.isClosed()) {
 			// `drain` flushes in-flight publishes before closing; `close` would drop them, and the
 			// publishes in flight during a shutdown are precisely the CDRs of the calls being

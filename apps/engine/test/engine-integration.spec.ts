@@ -10,6 +10,7 @@ import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fa
 import { connect, type NatsConnection, type Subscription } from "nats";
 import {
 	CHANNELS_KV,
+	DID_INDEX_KV,
 	ensureKvBuckets,
 	kvKeyFor,
 	ROUTING_CACHE_KV,
@@ -78,6 +79,19 @@ const IVR_ID = "0195c0f0-1c2f-7000-8000-0000000000e2";
 /** A DID the seeded artifact routes, and one it does not. */
 const ROUTED_DID = "12125550100";
 const UNROUTED_DID = "19998887777";
+
+/**
+ * A SECOND tenant, with its own DID and its own artifact.
+ *
+ * Its whole purpose is the multi-tenant case: a call for this number arrives on a context that
+ * stamps no organization, and `ENGINE_DEFAULT_ORGANIZATION_ID` points at the FIRST tenant. If the
+ * engine attributed by the fallback, this call would be filed under org A — which is precisely the
+ * failure the `did-index` bucket exists to prevent, and precisely what a single assertion on the
+ * CDR's `orgId` catches.
+ */
+const ORG_ID_B = "0195c0f0-1c2f-7000-8000-0000000000ab";
+const EXTENSION_ID_B = "0195c0f0-1c2f-7000-8000-0000000000e3";
+const ROUTED_DID_B = "12125550200";
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -475,10 +489,25 @@ suite("engine end-to-end", () => {
 		expect(callEvents.map((event) => event.envelope.orgId)).toEqual(callEvents.map(() => ORG_ID));
 		expect(invalid).toEqual([]);
 
-		// --- the CDR, enriched with where the call actually went -------------------------------
-		expect(cdrEvents).toHaveLength(1);
-		const cdr = cdrEvents[0];
+		// --- the CDRs, enriched with where the call actually went ------------------------------
+		//
+		// TWO records, not one: the caller's leg and the leg the engine dialled. This assertion used
+		// to read `toHaveLength(1)`, which was an accurate description of a gap — everything about
+		// the callee's leg was unanswerable from the caller's row.
+		await waitFor("both legs' CDRs", async () => cdrEvents.length >= 2, 30_000, describeObserved);
+		expect(cdrEvents).toHaveLength(2);
+		const cdr = cdrEvents.find((event) => (event.envelope.data as { leg: string }).leg === "a");
+		const bLegCdr = cdrEvents.find((event) => (event.envelope.data as { leg: string }).leg === "b");
 		expect(cdr?.subject).toBe(subjectFor.cdrLeg(ORG_ID));
+		expect(bLegCdr?.subject).toBe(subjectFor.cdrLeg(ORG_ID));
+		expect(bLegCdr?.envelope.data).toMatchObject({
+			callId,
+			leg: "b",
+			toNumber: "1001",
+			destinationType: "extension",
+			destinationRef: EXTENSION_ID,
+		});
+		expect((bLegCdr?.envelope.data as { originatingLegId?: string }).originatingLegId).toBe(legId);
 		expect(cdr?.envelope.type).toBe("cdr.leg.write");
 		expect(cdr?.envelope.data).toMatchObject({
 			callId,
@@ -534,6 +563,193 @@ suite("engine end-to-end", () => {
 		await tryHangup(ari, callerChannelId);
 	}, 120_000);
 
+	/**
+	 * The multi-tenant case, and the blocker it closes.
+	 *
+	 * Both calls arrive on `optimiq-inbound-untrusted`, which stamps NO organization — a carrier
+	 * trunk, not a dialplan that already knows the tenant. `ENGINE_DEFAULT_ORGANIZATION_ID` is set to
+	 * org A throughout this suite, so if the engine fell back to it, org B's call would be filed
+	 * under org A: its events on org A's subjects, its CDR in org A's ledger, its recording in org
+	 * A's bucket. Every assertion below is that it does not.
+	 */
+	it("attributes two tenants' DIDs to two tenants, with no organization on the channel", async () => {
+		const ari = app.get(AriConnectionService);
+		const orchestrator = app.get(ChannelOrchestrator);
+
+		callEvents.length = 0;
+		cdrEvents.length = 0;
+
+		const callerA = `engine-it-tenant-a-${String(Date.now())}`;
+		await ari.client.channels.originate({
+			endpoint: `Local/${ROUTED_DID}@optimiq-inbound-untrusted/n`,
+			context: "optimiq-loopback",
+			extension: "8000",
+			priority: 1,
+			channelId: callerA,
+			timeoutSeconds: 30,
+		});
+		await waitFor(
+			"org A's call was created",
+			async () =>
+				callEvents.some(
+					(event) => event.envelope.orgId === ORG_ID && event.envelope.type === "channel.created",
+				),
+			40_000,
+			describeObserved,
+		);
+
+		const callerB = `engine-it-tenant-b-${String(Date.now())}`;
+		await ari.client.channels.originate({
+			endpoint: `Local/${ROUTED_DID_B}@optimiq-inbound-untrusted/n`,
+			context: "optimiq-loopback",
+			extension: "8000",
+			priority: 1,
+			channelId: callerB,
+			timeoutSeconds: 30,
+		});
+		await waitFor(
+			"org B's call was created",
+			async () =>
+				callEvents.some(
+					(event) => event.envelope.orgId === ORG_ID_B && event.envelope.type === "channel.created",
+				),
+			40_000,
+			describeObserved,
+		);
+
+		// Each call's events are on ITS OWN tenant's subjects, and the DID each carries is the one
+		// that tenant owns. A misattribution shows up here as a `to.number` under the wrong org.
+		const aCreated = callEvents.find(
+			(event) => event.envelope.orgId === ORG_ID && event.envelope.type === "channel.created",
+		);
+		const bCreated = callEvents.find(
+			(event) => event.envelope.orgId === ORG_ID_B && event.envelope.type === "channel.created",
+		);
+		expect(aCreated?.envelope.data).toMatchObject({ to: { number: ROUTED_DID } });
+		expect(bCreated?.envelope.data).toMatchObject({ to: { number: ROUTED_DID_B } });
+		expect(bCreated?.subject).toBe(
+			subjectFor.call(ORG_ID_B, subjectCallId(bCreated?.subject ?? ""), "channel.created"),
+		);
+
+		// Org B's artifact dials extension 2001; org A's walks an IVR first and dials 1001. Reading
+		// the DIALLED number back is what proves each call was routed by its own tenant's artifact
+		// rather than by whichever one happened to be cached.
+		await orchestrator.awaitWalks();
+		const bDialled = callEvents.filter(
+			(event) => event.envelope.orgId === ORG_ID_B && event.envelope.type === "channel.created",
+		);
+		expect(
+			bDialled.some(
+				(event) => (event.envelope.data as { to?: { number?: string } }).to?.number === "2001",
+			),
+		).toBe(true);
+
+		await tryHangup(ari, callerA);
+		await tryHangup(ari, callerB);
+
+		await waitFor(
+			"both tenants' CDRs",
+			async () =>
+				cdrEvents.some((event) => event.envelope.orgId === ORG_ID) &&
+				cdrEvents.some((event) => event.envelope.orgId === ORG_ID_B),
+			40_000,
+			describeObserved,
+		);
+
+		// The CDR is the record that gets billed. Org B's DID must never appear in org A's ledger.
+		const aLedger = cdrEvents.filter((event) => event.envelope.orgId === ORG_ID);
+		const bLedger = cdrEvents.filter((event) => event.envelope.orgId === ORG_ID_B);
+		expect(
+			aLedger.every(
+				(event) => (event.envelope.data as { toNumber: string }).toNumber !== ROUTED_DID_B,
+			),
+		).toBe(true);
+		expect(
+			bLedger.some(
+				(event) => (event.envelope.data as { toNumber: string }).toNumber === ROUTED_DID_B,
+			),
+		).toBe(true);
+		expect(bLedger[0]?.subject).toBe(subjectFor.cdrLeg(ORG_ID_B));
+	}, 180_000);
+
+	/**
+	 * B-leg CDRs.
+	 *
+	 * Until this wave a ring-group call produced one record — the caller's — and everything about
+	 * the legs the switch dialled was unanswerable from it. `call_legs` has always had the columns;
+	 * this asserts they are now filled, and that the two rows of one call correlate.
+	 */
+	it("files a CDR for the leg it dialled, linked to the caller's", async () => {
+		const ari = app.get(AriConnectionService);
+		const callerChannelId = `engine-it-bleg-${String(Date.now())}`;
+
+		callEvents.length = 0;
+		cdrEvents.length = 0;
+
+		await ari.client.channels.originate({
+			endpoint: `Local/${ROUTED_DID}@optimiq-inbound/n`,
+			context: "optimiq-loopback",
+			extension: "8000",
+			priority: 1,
+			channelId: callerChannelId,
+			timeoutSeconds: 30,
+		});
+
+		await waitFor(
+			"the call is bridged",
+			async () => callEvents.some((event) => event.envelope.type === "channel.bridged"),
+			60_000,
+			describeObserved,
+		);
+
+		// A `channel.created` for each side, and the B side names the extension it reached.
+		const created = callEvents.filter((event) => event.envelope.type === "channel.created");
+		expect(created.map((event) => (event.envelope.data as { leg: string }).leg).sort()).toEqual([
+			"a",
+			"b",
+		]);
+
+		await tryHangup(ari, callerChannelId);
+
+		// Both rows OF THIS CALL. Filtering by `callId` rather than taking the first two matters:
+		// the suite's earlier calls are still tearing down, and a pair assembled across two calls
+		// would assert exactly the correlation bug this test exists to catch — in reverse.
+		const legsOfOneCall = (): readonly Record<string, unknown>[] => {
+			const rows = cdrEvents.map((event) => event.envelope.data as Record<string, unknown>);
+			const byCall = new Map<string, Record<string, unknown>[]>();
+			for (const row of rows) {
+				const key = String(row.callId);
+				byCall.set(key, [...(byCall.get(key) ?? []), row]);
+			}
+			for (const group of byCall.values()) {
+				if (group.some((row) => row.leg === "a") && group.some((row) => row.leg === "b")) {
+					return group;
+				}
+			}
+			return [];
+		};
+
+		await waitFor(
+			"both legs' CDRs, on one call",
+			async () => legsOfOneCall().length >= 2,
+			60_000,
+			describeObserved,
+		);
+
+		const rows = legsOfOneCall();
+		const aLeg = rows.find((row) => row.leg === "a");
+		const bLeg = rows.find((row) => row.leg === "b");
+		expect(aLeg).toBeDefined();
+		expect(bLeg).toBeDefined();
+		// One call, two rows — the correlation a report assembles a call from.
+		expect(bLeg?.callId).toBe(aLeg?.callId);
+		expect(bLeg?.originatingLegId).toBeTruthy();
+		expect(aLeg?.originatingLegId).toBeNull();
+		expect(bLeg?.toNumber).toBe("1001");
+		expect(bLeg?.destinationType).toBe("extension");
+		expect(bLeg?.destinationRef).toBe(EXTENSION_ID);
+	}, 180_000);
+
 	it("stops admitting calls once a drain begins", async () => {
 		const orchestrator = app.get(ChannelOrchestrator);
 		await orchestrator.drain(0);
@@ -570,12 +786,85 @@ async function tryHangup(ari: AriConnectionService, channelId: string): Promise<
 async function seedRoutingArtifact(natsUrl: string): Promise<void> {
 	const connection = await connect({ servers: natsUrl, name: "engine-integration-seed" });
 	try {
-		await ensureKvBuckets(await connection.jetstreamManager(), [ROUTING_CACHE_KV]);
+		const manager = await connection.jetstreamManager();
+		await ensureKvBuckets(manager, [ROUTING_CACHE_KV, DID_INDEX_KV]);
 		const kv = await connection.jetstream().views.kv(ROUTING_CACHE_KV.name);
 		await kv.put(routingCacheKey(ORG_ID), encoder.encode(JSON.stringify(seedArtifact())));
+		await kv.put(routingCacheKey(ORG_ID_B), encoder.encode(JSON.stringify(seedArtifactB())));
+
+		// What `apps/api`'s `DidIndexPublisher` writes when a number is provisioned. Seeded here for
+		// the same reason the artifacts are: this suite tests the ENGINE's half of the contract, and
+		// standing the control plane up to write two rows would test the control plane.
+		const did = await connection.jetstream().views.kv(DID_INDEX_KV.name);
+		await did.put(
+			kvKeyFor.didIndex(ROUTED_DID),
+			encoder.encode(
+				JSON.stringify({
+					organizationId: ORG_ID,
+					phoneNumberId: "0195c0f0-1c2f-7000-8000-0000000000d1",
+					e164: ROUTED_DID,
+					enabled: true,
+				}),
+			),
+		);
+		await did.put(
+			kvKeyFor.didIndex(ROUTED_DID_B),
+			encoder.encode(
+				JSON.stringify({
+					organizationId: ORG_ID_B,
+					phoneNumberId: "0195c0f0-1c2f-7000-8000-0000000000d2",
+					e164: ROUTED_DID_B,
+					enabled: true,
+				}),
+			),
+		);
 	} finally {
 		await connection.close();
 	}
+}
+
+/**
+ * The second tenant's routing: its DID straight to its own extension, no IVR.
+ *
+ * Deliberately a DIFFERENT shape from org A's, so "the call was routed by the right tenant's
+ * artifact" is observable in the events rather than inferred from the subject alone.
+ */
+function seedArtifactB(): RoutingArtifact {
+	const nodes: PlanNode[] = [
+		{ id: "hangup:UNALLOCATED_NUMBER", kind: "hangup", cause: "UNALLOCATED_NUMBER" },
+		{ id: "hangup:NORMAL_CLEARING", kind: "hangup", cause: "NORMAL_CLEARING" },
+		{ id: "hangup:OUTGOING_CALL_BARRED", kind: "hangup", cause: "OUTGOING_CALL_BARRED" },
+		{
+			id: `extension:${EXTENSION_ID_B}`,
+			kind: "extension",
+			extensionId: EXTENSION_ID_B,
+			number: "2001",
+			tollClass: "internal",
+			recordPolicy: "none",
+			timeoutSeconds: 20,
+			doNotDisturb: false,
+		} as PlanNode,
+	];
+
+	return {
+		...seedArtifact(),
+		organizationId: ORG_ID_B,
+		snapshotHash: "integration-seed-b-1",
+		nodes: Object.fromEntries(nodes.map((node) => [node.id, node])),
+		inbound: {
+			rules: [],
+			didDefaults: {
+				[ROUTED_DID_B]: {
+					phoneNumberId: "0195c0f0-1c2f-7000-8000-0000000000d2",
+					e164: ROUTED_DID_B,
+					enabled: true,
+					recordEnabled: false,
+					destinationNodeId: `extension:${EXTENSION_ID_B}`,
+				},
+			},
+			noMatchNodeId: "hangup:UNALLOCATED_NUMBER",
+		},
+	} as unknown as RoutingArtifact;
 }
 
 /** Validates and records one delivered message; a rejection is remembered, never thrown. */

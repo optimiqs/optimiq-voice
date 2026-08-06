@@ -1,0 +1,40 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"mailboxNumber": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 64
+		},
+		"extensionNumber": {
+			"type": "string",
+			"maxLength": 64
+		},
+		"newCount": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 9007199254740991
+		},
+		"savedCount": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 9007199254740991
+		},
+		"reason": {
+			"type": "string",
+			"enum": [
+				"message-left",
+				"message-read",
+				"message-deleted",
+				"resync"
+			]
+		}
+	},
+	"required": [
+		"mailboxNumber",
+		"newCount",
+		"savedCount"
+	],
+	"additionalProperties": false
+}

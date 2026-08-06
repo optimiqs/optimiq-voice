@@ -20,6 +20,7 @@ import { QueueAgentsController, QueuesController } from "./queues/queues.control
 import { QueueAgentsService, QueueTiersService, QueuesService } from "./queues/queues.service";
 import { RingGroupsController } from "./ring-groups/ring-groups.controller";
 import { RingGroupDestinationsService, RingGroupsService } from "./ring-groups/ring-groups.service";
+import { DidIndexPublisher } from "./routing/did-index.publisher";
 import { RoutingCachePublisher } from "./routing/routing-cache.publisher";
 import { RoutingRpcController } from "./routing/routing-rpc.controller";
 import { RoutingController } from "./routing/routing.controller";
@@ -37,6 +38,7 @@ import { TrunksController } from "./trunks/trunks.controller";
 import { TrunksService } from "./trunks/trunks.service";
 import { VoicemailBoxesController } from "./voicemail-boxes/voicemail-boxes.controller";
 import { VoicemailBoxesService } from "./voicemail-boxes/voicemail-boxes.service";
+import { VoicemailConsumer } from "./voicemail-boxes/voicemail-consumer.service";
 import type { PbxEnv } from "./shared/pbx-env";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
@@ -94,9 +96,14 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 			inject: [PBX_ENV],
 		},
 		RoutingCachePublisher,
+		DidIndexPublisher,
 		{
 			provide: PBX_EFFECT_RUNTIME,
-			useFactory: (database: PbxDatabaseClient, publisher: RoutingCachePublisher) =>
+			useFactory: (
+				database: PbxDatabaseClient,
+				publisher: RoutingCachePublisher,
+				didIndex: DidIndexPublisher,
+			) =>
 				makePbxRepositoryRuntime({
 					database,
 					onArtifactCompiled: (compiled) => {
@@ -104,12 +111,16 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 							// A recompile that produced the same `snapshotHash` describes a cache entry that
 							// is already correct. `compiledAt` is the artifact's only non-derived field, so
 							// skipping the write is a provable no-op rather than a heuristic.
+							//
+							// The DID index rides on the same evidence: the set of phone numbers is part of
+							// the hashed snapshot, so an unchanged hash means an unchanged index.
 							return;
 						}
 						void publisher.publish(compiled.cacheKey, compiled.artifact);
+						void didIndex.syncOrganization(compiled.artifact);
 					},
 				}),
-			inject: [PBX_DATABASE, RoutingCachePublisher],
+			inject: [PBX_DATABASE, RoutingCachePublisher, DidIndexPublisher],
 		},
 		ExtensionsService,
 		PhoneNumbersService,
@@ -129,9 +140,17 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		ParkLotsService,
 		FeatureCodesService,
 		VoicemailBoxesService,
+		VoicemailConsumer,
 		RoutingService,
 	],
-	exports: [PBX_ENV, PBX_DATABASE, PBX_EFFECT_RUNTIME, RoutingService, RoutingCachePublisher],
+	exports: [
+		PBX_ENV,
+		PBX_DATABASE,
+		PBX_EFFECT_RUNTIME,
+		RoutingService,
+		RoutingCachePublisher,
+		DidIndexPublisher,
+	],
 })
 export class PbxModule implements OnApplicationShutdown {
 	constructor(@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient) {

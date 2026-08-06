@@ -1,4 +1,10 @@
-import { isSubjectToken, SUBJECT_ROOTS, subjectFilterFor, SubjectTokenError } from "./subjects";
+import {
+	didIndexToken,
+	isSubjectToken,
+	SUBJECT_ROOTS,
+	subjectFilterFor,
+	SubjectTokenError,
+} from "./subjects";
 import type { JetStreamManager, KvOptions, StreamConfig, StreamUpdateConfig } from "nats";
 
 /**
@@ -123,6 +129,30 @@ export const QUEUES_STREAM: StreamDefinition = {
 };
 
 /**
+ * `VOICEMAIL` — mailbox facts on their way to `pbx-db`, plus the derived MWI counts.
+ *
+ * `discard: new` for the same reason as CDR and AUDIT: a `message.left` that the broker silently
+ * dropped is a message a caller recorded and a user will never see, which is indistinguishable from
+ * the system losing their voicemail — because it is. The publisher gets an error it can retry on.
+ *
+ * 30 days matches CDR: it is how far back a mailbox can be rebuilt from the log alone.
+ */
+export const VOICEMAIL_STREAM: StreamDefinition = {
+	name: "VOICEMAIL",
+	description: "Voicemail message and MWI events consumed durably by the pbx writer (plan §3.5).",
+	subjects: [subjectFilterFor.allVoicemail()],
+	retention: "limits",
+	storage: "file",
+	discard: "new",
+	maxAgeMs: 30 * DAY_MS,
+	maxMsgs: -1,
+	maxBytes: 2 * GIB,
+	maxMsgsPerSubject: -1,
+	duplicateWindowMs: 10 * MINUTE_MS,
+	numReplicas: 1,
+};
+
+/**
  * `CDR` — per-leg call records on their way to `cdr-db`. "Replay = rebuild": the 30-day window is
  * how far back the CDR table can be reconstructed from the log alone. A wider `duplicate_window`
  * than the rest because a crash-looping writer may retry the same leg minutes later.
@@ -179,6 +209,7 @@ export const EVENT_STREAMS: readonly StreamDefinition[] = [
 	CALLS_STREAM,
 	REGISTRATIONS_STREAM,
 	QUEUES_STREAM,
+	VOICEMAIL_STREAM,
 	CDR_STREAM,
 	AUDIT_STREAM,
 	PROVISION_STREAM,
@@ -478,12 +509,48 @@ export const ROUTING_CACHE_KV: KvBucketDefinition = {
 	numReplicas: 1,
 };
 
+/**
+ * `did-index` — DID → owning organization. THE multi-tenant inbound lookup.
+ *
+ * An inbound INVITE arrives from a carrier carrying a dialled number and no idea whose it is. Every
+ * other bucket here is keyed by organization first, because every other reader already knows the
+ * tenant; this one exists precisely because the reader does not, so its key is the DID alone (see
+ * `kvKeyFor.didIndex`).
+ *
+ * ## Why the TTL is zero
+ *
+ * Every other bucket holds LIVE state whose staleness is self-correcting: a registration refreshes,
+ * a channel ends, an artifact recompiles. This holds CONFIGURATION, and an expiring entry means an
+ * inbound call to a perfectly valid DID stops resolving to a tenant and is rejected with
+ * `INVALID_PROFILE` — an outage produced by a timer rather than by a change. The entry is written
+ * when the number is configured and deleted when it is released; nothing else may remove it.
+ *
+ * ## What it is NOT
+ *
+ * It is not the authority on who owns a DID — `phone_number` in `pbx-db` is, and a global unique
+ * index there is what makes two tenants claiming one number impossible. This bucket is a derived
+ * read model, rebuildable at any time from the database by `apps/api`'s
+ * `scripts/rebuild-did-index.ts`.
+ */
+export const DID_INDEX_KV: KvBucketDefinition = {
+	name: "did-index",
+	description: "DID (E.164 digits) -> owning organization, for inbound tenant attribution.",
+	// 0 = never expire. Read the note above before changing this.
+	ttlMs: 0,
+	history: 1,
+	storage: "file",
+	maxValueSizeBytes: 4 * 1024,
+	maxBytes: 256 * MIB,
+	numReplicas: 1,
+};
+
 export const KV_BUCKETS: readonly KvBucketDefinition[] = [
 	REGISTRATIONS_KV,
 	CHANNELS_KV,
 	PRESENCE_KV,
 	AGENT_STATE_KV,
 	ROUTING_CACHE_KV,
+	DID_INDEX_KV,
 ];
 
 /** The KV wire options for a bucket definition. */
@@ -586,6 +653,16 @@ export const kvKeyFor = {
 		return discriminator === undefined
 			? base
 			: `${base}.${assertKeyToken("discriminator", discriminator)}`;
+	},
+	/**
+	 * `did-index`: the DID's digits, and nothing else.
+	 *
+	 * The ONE key in this file that is not organization-scoped, because the organization is what it
+	 * answers. Normalization goes through {@link didIndexToken} so the control plane writing a
+	 * stored `+441632960111` and the engine reading a dialled `441632960111` land on one key.
+	 */
+	didIndex(did: string): string {
+		return assertKeyToken("did", didIndexToken(did));
 	},
 } as const;
 

@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "phone_number_e164_global_key" ON "phone_number" ("e164");

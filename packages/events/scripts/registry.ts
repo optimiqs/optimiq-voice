@@ -18,6 +18,7 @@ import {
 	recordingStopReasonSchema,
 	sipTransportSchema,
 } from "../src/schemas/telephony";
+import { VOICEMAIL_EVENT_DEFINITIONS } from "../src/schemas/voicemail-events";
 import type { EventFamily } from "../src/subjects";
 
 /**
@@ -160,6 +161,20 @@ function queueEntry(type: keyof typeof QUEUE_EVENT_DEFINITIONS, goName: string):
 	};
 }
 
+function voicemailEntry(
+	type: keyof typeof VOICEMAIL_EVENT_DEFINITIONS,
+	goName: string,
+): EventEntry {
+	return {
+		family: "voicemail",
+		type,
+		goName: `${goName}Data`,
+		goConst: `EventType${goName}`,
+		data: VOICEMAIL_EVENT_DEFINITIONS[type].data,
+		subjectTemplate: `voicemail.evt.v1.<orgId>.<mailboxId>.${type}`,
+	};
+}
+
 function provisionEntry(
 	type: keyof typeof PROVISION_EVENT_DEFINITIONS,
 	goName: string,
@@ -201,6 +216,9 @@ export const EVENT_ENTRIES: readonly EventEntry[] = [
 	queueEntry("caller.answered", "QueueCallerAnswered"),
 	queueEntry("caller.abandoned", "QueueCallerAbandoned"),
 	queueEntry("agent.state", "QueueAgentState"),
+
+	voicemailEntry("message.left", "VoicemailMessageLeft"),
+	voicemailEntry("mwi.updated", "VoicemailMWIUpdated"),
 
 	{
 		family: "cdr",
@@ -258,6 +276,7 @@ export const FAMILY_ORDER: readonly EventFamily[] = [
 	"call",
 	"registration",
 	"queue",
+	"voicemail",
 	"cdr",
 	"audit",
 	"provision",
@@ -268,6 +287,7 @@ export const FAMILY_FILE: Readonly<Record<EventFamily, string>> = {
 	call: "call_events",
 	registration: "registration_events",
 	queue: "queue_events",
+	voicemail: "voicemail_events",
 	cdr: "cdr_events",
 	audit: "audit_events",
 	provision: "provision_events",

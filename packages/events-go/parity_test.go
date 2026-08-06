@@ -20,16 +20,17 @@ import (
 // the stream/bucket definitions.
 
 type goldenParsedSubject struct {
-	Kind    string `json:"kind"`
-	Family  string `json:"family"`
-	Version string `json:"version"`
-	OrgID   string `json:"orgId"`
-	CallID  string `json:"callId"`
-	AORHash string `json:"aorHash"`
-	QueueID string `json:"queueId"`
-	Event   string `json:"event"`
-	Service string `json:"service"`
-	Method  string `json:"method"`
+	Kind      string `json:"kind"`
+	Family    string `json:"family"`
+	Version   string `json:"version"`
+	OrgID     string `json:"orgId"`
+	CallID    string `json:"callId"`
+	AORHash   string `json:"aorHash"`
+	QueueID   string `json:"queueId"`
+	MailboxID string `json:"mailboxId"`
+	Event     string `json:"event"`
+	Service   string `json:"service"`
+	Method    string `json:"method"`
 }
 
 type goldenStream struct {
@@ -68,6 +69,11 @@ type golden struct {
 		AOR   string `json:"aor"`
 		Token string `json:"token"`
 	} `json:"aorSubjectTokens"`
+
+	DIDIndexTokens []struct {
+		DID   string `json:"did"`
+		Token string `json:"token"`
+	} `json:"didIndexTokens"`
 
 	SubjectBuilders []struct {
 		Builder string   `json:"builder"`
@@ -156,6 +162,7 @@ func TestParityConstants(t *testing.T) {
 		"call":         SubjectRootCall,
 		"registration": SubjectRootRegistration,
 		"queue":        SubjectRootQueue,
+		"voicemail":    SubjectRootVoicemail,
 		"cdrLeg":       SubjectRootCDRLeg,
 		"audit":        SubjectRootAudit,
 		"provision":    SubjectRootProvision,
@@ -190,6 +197,23 @@ func TestParityAORSubjectToken(t *testing.T) {
 	}
 }
 
+func TestParityDIDIndexToken(t *testing.T) {
+	for _, tc := range loadGolden(t).DIDIndexTokens {
+		tok, err := DIDIndexToken(tc.DID)
+		if err != nil {
+			t.Errorf("DIDIndexToken(%q): %v", tc.DID, err)
+			continue
+		}
+		if tok != tc.Token {
+			t.Errorf("DIDIndexToken(%q) = %q, golden %q", tc.DID, tok, tc.Token)
+		}
+	}
+
+	if _, err := DIDIndexToken("+ -()"); err == nil {
+		t.Error("DIDIndexToken with no digits should reject: there is no key to write it under")
+	}
+}
+
 func TestParitySubjectBuilders(t *testing.T) {
 	must := builderFor(t)
 	for _, tc := range loadGolden(t).SubjectBuilders {
@@ -201,6 +225,8 @@ func TestParitySubjectBuilders(t *testing.T) {
 			got = must(RegistrationSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "queue":
 			got = must(QueueSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
+		case "voicemail":
+			got = must(VoicemailSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "cdrLeg":
 			got = must(CDRLegSubject(tc.Args[0]))
 		case "audit":
@@ -247,6 +273,14 @@ func TestParitySubjectFilters(t *testing.T) {
 			got = must(QueueFilter(tc.Args[0], tc.Args[1]))
 		case "queueEventInOrg":
 			got = must(QueueEventInOrgFilter(tc.Args[0], tc.Args[1]))
+		case "allVoicemail":
+			got = AllVoicemailFilter()
+		case "voicemailInOrg":
+			got = must(VoicemailInOrgFilter(tc.Args[0]))
+		case "voicemailBox":
+			got = must(VoicemailBoxFilter(tc.Args[0], tc.Args[1]))
+		case "voicemailEventInOrg":
+			got = must(VoicemailEventInOrgFilter(tc.Args[0], tc.Args[1]))
 		case "allCdrLegs":
 			got = AllCDRLegsFilter()
 		case "cdrLegsInOrg":
@@ -282,16 +316,17 @@ func TestParityParseSubject(t *testing.T) {
 			continue
 		}
 		got := goldenParsedSubject{
-			Kind:    string(parsed.Kind),
-			Family:  parsed.Family,
-			Version: parsed.Version,
-			OrgID:   parsed.OrgID,
-			CallID:  parsed.CallID,
-			AORHash: parsed.AORHash,
-			QueueID: parsed.QueueID,
-			Event:   parsed.Event,
-			Service: parsed.Service,
-			Method:  parsed.Method,
+			Kind:      string(parsed.Kind),
+			Family:    parsed.Family,
+			Version:   parsed.Version,
+			OrgID:     parsed.OrgID,
+			CallID:    parsed.CallID,
+			AORHash:   parsed.AORHash,
+			QueueID:   parsed.QueueID,
+			MailboxID: parsed.MailboxID,
+			Event:     parsed.Event,
+			Service:   parsed.Service,
+			Method:    parsed.Method,
 		}
 		if got != *tc.Parsed {
 			t.Errorf("ParseSubject(%q) = %+v, golden %+v", tc.Subject, got, *tc.Parsed)
@@ -322,6 +357,8 @@ func TestParityKVKeys(t *testing.T) {
 			got, err = AgentStateKVKey(tc.Args[0], tc.Args[1])
 		case "routingCache":
 			got, err = RoutingCacheKVKey(tc.Args[0], tc.Args[1], tc.Args[2:]...)
+		case "didIndex":
+			got, err = DIDIndexKVKey(tc.Args[0])
 		default:
 			t.Fatalf("golden names KV key builder %q, which this package does not implement", tc.Builder)
 		}
@@ -420,6 +457,7 @@ func TestParityVocabularies(t *testing.T) {
 		"call":         EventTypesOfFamily(FamilyCall),
 		"registration": EventTypesOfFamily(FamilyRegistration),
 		"queue":        EventTypesOfFamily(FamilyQueue),
+		"voicemail":    EventTypesOfFamily(FamilyVoicemail),
 	}
 	if !reflect.DeepEqual(events, g.EventVocabularies) {
 		t.Errorf("event vocabularies = %v, golden %v", events, g.EventVocabularies)

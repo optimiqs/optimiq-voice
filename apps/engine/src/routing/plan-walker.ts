@@ -14,6 +14,7 @@ import type {
 	ExecutionPlan,
 	ExtensionPlanNode,
 	IvrMenuPlanNode,
+	MailboxEntry,
 	PlanNode,
 	PlanNodeId,
 	RingGroupPlanNode,
@@ -134,12 +135,86 @@ export interface PlanWalkerDependencies {
 	 * `peerLegId` a bridge event carries. Production passes the real deterministic derivation.
 	 */
 	readonly peerLegId?: (mediaChannelId: string) => string;
+	/**
+	 * Told about every leg this walk creates, ends or bridges — so the orchestrator can give each
+	 * one a `ChannelAggregate` and therefore its own CDR.
+	 *
+	 * A callback bundle rather than a return value, because the facts arrive at three different
+	 * moments and only one of them is the walker's own result: a leg exists the instant it is
+	 * originated (before it rings), its cause is decided when the WALKER hangs it up (a ring-all
+	 * loser's `LOSE_RACE` is known here and nowhere else — ARI will report a generic code for it),
+	 * and its bridge peer is known only after the race is over.
+	 *
+	 * Optional, so the walker stays testable with four closures and a fake port. When it is absent
+	 * the walk behaves exactly as it did before B-leg CDRs existed.
+	 */
+	readonly legs?: OriginatedLegHooks;
+	/**
+	 * Where a recorded message is filed. Absent means the walk records but cannot file, which it
+	 * reports in its notes rather than pretending the message landed somewhere.
+	 */
+	readonly voicemail?: VoicemailPort;
 	/** Injected so ids are deterministic in a spec. */
 	readonly newId?: () => string;
 	readonly now?: () => number;
 	/** Injected so a spec asserts a ring-group delay without waiting for it. */
 	readonly delay?: (ms: number) => Promise<void>;
 	readonly log?: (message: string, detail?: Record<string, unknown>) => void;
+}
+
+/** One recorded message, on its way to a mailbox. */
+export interface VoicemailMessage {
+	readonly voicemailBoxId: string;
+	readonly mailboxNumber: string;
+	/** Minted by the walker, so a redelivered publish inserts one row rather than two. */
+	readonly messageId: string;
+	readonly recordingId: string;
+	readonly objectKey: string;
+	readonly durationMs: number;
+	/** Whether the box wants a lamp lit. Carried so the consumer does not have to re-read the box. */
+	readonly mwiEnabled: boolean;
+	readonly callerIdNumber?: string;
+	readonly callerIdName?: string;
+}
+
+/** The seam between the walk and the backbone, for voicemail specifically. */
+export interface VoicemailPort {
+	messageLeft(message: VoicemailMessage): Promise<void>;
+}
+
+/** One leg the walk is about to create, as the orchestrator needs to file it. */
+export interface OriginatedLeg {
+	/** The media-server channel id the walker chose. Deterministic within the walk. */
+	readonly mediaChannelId: string;
+	/** The endpoint string handed to the media server, for the log. */
+	readonly endpoint: string;
+	/** What is being reached: the extension number, the trunk's dialled number, the external one. */
+	readonly destinationNumber: string;
+	/** Human label the notes use (`extension 1001`, `trunk carrier-a`). */
+	readonly label: string;
+	/** The plan node this leg serves, in the compiler's kebab-case vocabulary. */
+	readonly destinationType?: string;
+	/** The row that node names, when it has one. */
+	readonly destinationRef?: string;
+	/** The caller identity presented on this leg, as composed for the media server. */
+	readonly callerId?: string;
+}
+
+/** Everything the orchestrator needs to know about the legs a walk owns. */
+export interface OriginatedLegHooks {
+	/** A leg is about to be created. Called BEFORE the originate, so no event can outrun it. */
+	originated(leg: OriginatedLeg): void;
+	/**
+	 * The WALKER is ending this leg, with this cause.
+	 *
+	 * Called before the media server is told, for the same reason the orchestrator fixes the A-leg's
+	 * cause before its own hangup: Asterisk answers a local `DELETE /channels` with a generic
+	 * `ChannelHangupRequest`, and the cause is first-wins. Without this a ring-all loser's CDR says
+	 * `NORMAL_UNSPECIFIED` — indistinguishable from a callee who declined — instead of `LOSE_RACE`.
+	 */
+	hangingUp(mediaChannelId: string, cause: HangupCause): void;
+	/** The A-leg and this leg are now in `bridgeId`. Both CDRs gain the other's leg id. */
+	bridged(mediaChannelId: string, bridgeId: string): void;
 }
 
 /** One call's facts, alongside the plan the resolver produced for them. */
@@ -155,6 +230,15 @@ export interface WalkInput {
 	readonly callerIdName?: string;
 	/** Digits dialled after a feature code. Internal only. */
 	readonly featureArgument?: string;
+	/**
+	 * The artifact's mailbox table, keyed by mailbox number.
+	 *
+	 * Supplied alongside the plan for the same reason `timeConditions` is: a `check` has to answer
+	 * "does the extension this call came from have a mailbox?", which is a fact about the artifact
+	 * rather than about the plan the resolver produced, and a walker that could not see it would
+	 * have to either refuse every check or open whatever box the node happened to name.
+	 */
+	readonly mailboxes?: Readonly<Record<string, MailboxEntry>>;
 }
 
 export type WalkStatus =
@@ -188,6 +272,8 @@ type StepResult =
 interface DialAttempt {
 	readonly endpoint: string;
 	readonly label: string;
+	/** The number being reached, for the B-leg's `toNumber`. */
+	readonly destinationNumber: string;
 	readonly timeoutSeconds: number;
 	readonly delaySeconds: number;
 	readonly callerId?: string;
@@ -313,7 +399,7 @@ export class PlanWalker {
 				return await this.ivrMenuNode(node);
 			}
 			case "voicemail": {
-				return await this.voicemailNode(node);
+				return await this.voicemailNode(node, input);
 			}
 			case "trunk-dial": {
 				return await this.trunkDialNode(node, input);
@@ -404,10 +490,16 @@ export class PlanWalker {
 			return { kind: "goto", nodeId: node.targetNodeId };
 		}
 		if (node.action === "voicemail-check" || node.action === "voicemail-direct") {
+			// A feature code with no target compiled to nothing to go to: the tenant has the code but
+			// no mailbox behind it. Announcing that is the honest answer — the alternative is a `*97`
+			// that plays a greeting and hangs up, which a user reads as "my voicemail is broken".
 			this.note(
-				`feature code ${node.code} (${node.action}) has no mailbox wired yet; played the placeholder`,
+				`feature code ${node.code} (${node.action}) resolved to no mailbox node; nothing to open`,
 			);
-			return await this.announceAndHangup(this.settings.voicemailGreeting, "NORMAL_CLEARING");
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
 		}
 		this.note(`feature code ${node.code} (${node.action}) is not implemented yet`);
 		return await this.announceAndHangup(
@@ -547,6 +639,7 @@ export class PlanWalker {
 				{
 					endpoint: this.endpointForExtension(node.number),
 					label: `extension ${node.number}`,
+					destinationNumber: node.number,
 					timeoutSeconds: node.timeoutSeconds || this.settings.defaultRingTimeoutSeconds,
 					delaySeconds: 0,
 					callerId: this.callerIdFor(input),
@@ -594,6 +687,7 @@ export class PlanWalker {
 			attempts.push({
 				endpoint: this.endpointForExtension(target.number),
 				label: `extension ${target.number}`,
+				destinationNumber: target.number,
 				timeoutSeconds:
 					member.timeoutSeconds ||
 					node.ringTimeoutSeconds ||
@@ -705,6 +799,7 @@ export class PlanWalker {
 						.replaceAll("{number}", number)
 						.replaceAll("{trunk}", attempt.name),
 					label: `trunk ${attempt.name}`,
+					destinationNumber: number,
 					timeoutSeconds: this.settings.defaultRingTimeoutSeconds,
 					delaySeconds: 0,
 					callerId: composeCallerId(
@@ -762,6 +857,7 @@ export class PlanWalker {
 					.replaceAll("{number}", node.destination)
 					.replaceAll("{trunk}", "external"),
 				label: `external ${node.destination}`,
+				destinationNumber: node.destination,
 				timeoutSeconds: this.settings.defaultRingTimeoutSeconds,
 				delaySeconds: 0,
 				callerId: composeCallerId(
@@ -780,27 +876,41 @@ export class PlanWalker {
 	// -------------------------------------------------------------------------------------------
 
 	/**
-	 * The voicemail placeholder.
+	 * Leaving a message in a mailbox.
 	 *
-	 * It answers, plays a greeting and records — which is the half of voicemail a caller
-	 * experiences. What it does NOT do is store the message against a mailbox, light an MWI lamp or
-	 * send an email, because none of those exist yet; `check` mode therefore announces and hangs up
-	 * rather than pretending to open a mailbox.
+	 * ## What is real
 	 *
-	 * The recording is published as `channel.record.started` / `channel.record.stopped` with a real
-	 * object key, so the CDR writer and the object-store uploader have the contract they need before
-	 * the mailbox does.
+	 * The caller hears a greeting, hears a beep, records, and the message is FILED: a
+	 * `voicemail.message.left` carrying the box id, the object key, the duration, the caller's
+	 * identity and the leg it was left on is published on the VOICEMAIL stream, which the control
+	 * plane consumes into a `voicemail_message` row and answers with `voicemail.mwi.updated`. The
+	 * `channel.record.*` pair still goes out on the call stream for the object-store uploader, which
+	 * is a different consumer with a different retention and must not have to join across streams.
+	 *
+	 * The publish carries the message id the engine mints, so the consumer's insert is idempotent
+	 * over a redelivery rather than producing two copies of one message.
+	 *
+	 * ## What is not, and why
+	 *
+	 * **The greeting is still the deployment-wide one.** `VoicemailPlanNode` carries the box's id,
+	 * number, `maxMessageSeconds` and `mwiEnabled` — but not the object key of its active greeting,
+	 * which lives in `voicemail_greeting` and is never compiled into the artifact. Reading it here
+	 * would mean a database round trip on the call path from a process that holds no database
+	 * handle, so the honest fix is one the compiler owns: embed the active greeting's key at compile
+	 * time, exactly as it embeds every other routing input. That is a `packages/routing` change and
+	 * is recorded as a follow-up rather than worked around here.
+	 *
+	 * **Email delivery is not wired.** `voicemail_box.email_mode` is likewise not in the artifact,
+	 * and delivery belongs to the control plane, which is where the `voicemail.message.left`
+	 * consumer already is.
 	 */
-	private async voicemailNode(node: VoicemailPlanNode): Promise<StepResult> {
+	private async voicemailNode(node: VoicemailPlanNode, input: WalkInput): Promise<StepResult> {
 		if (!(await this.ensureAnswered())) {
 			return { kind: "aborted" };
 		}
 
 		if (node.mode === "check") {
-			this.note(
-				`voicemail box ${node.mailboxNumber} was dialled in "check" mode, which needs mailbox authentication that is not implemented yet`,
-			);
-			return await this.announceAndHangup(this.settings.voicemailGreeting, "NORMAL_CLEARING");
+			return await this.voicemailCheck(node, input);
 		}
 
 		await this.deps.execute({ verb: "play", media: this.settings.voicemailGreeting });
@@ -846,10 +956,154 @@ export class PlanWalker {
 			reason: result.reason,
 		});
 
+		if (result.reason === "failed" || result.durationMs <= 0) {
+			// A failed or empty recording must NOT become a mailbox row. A message a user opens to
+			// find silence in is worse than no message: it costs them the trip and tells them nothing,
+			// and it lights an MWI lamp that has nothing behind it.
+			this.note(
+				`voicemail recording ${recordingId} produced no audio (${result.reason}); no message was filed`,
+			);
+			return { kind: "hangup", cause: "NORMAL_CLEARING" };
+		}
+
+		await this.fileVoicemailMessage(node, recordingId, objectKey, result.durationMs);
+		return { kind: "hangup", cause: "NORMAL_CLEARING" };
+	}
+
+	/**
+	 * Publishes the message so the control plane can file it.
+	 *
+	 * Failures are noted, not fatal. The caller has already recorded and hung up by the time this
+	 * runs, so there is no call left to fail — but the object IS in the store and the row is not,
+	 * which is a divergence an operator has to be able to see. It is a `note` (and therefore a log
+	 * line on the walk) rather than a silent catch for exactly that reason.
+	 */
+	private async fileVoicemailMessage(
+		node: VoicemailPlanNode,
+		recordingId: string,
+		objectKey: string,
+		durationMs: number,
+	): Promise<void> {
+		const port = this.deps.voicemail;
+		if (port === undefined) {
+			this.note(
+				`voicemail message ${recordingId} was recorded but not filed: this walk has no voicemail port`,
+			);
+			return;
+		}
+		try {
+			await port.messageLeft({
+				voicemailBoxId: node.voicemailBoxId,
+				mailboxNumber: node.mailboxNumber,
+				messageId: this.newId(),
+				recordingId,
+				objectKey,
+				durationMs,
+				mwiEnabled: node.mwiEnabled,
+				...(this.deps.channel.callerIdNumber === undefined
+					? {}
+					: { callerIdNumber: this.deps.channel.callerIdNumber }),
+				...(this.deps.channel.callerIdName === undefined
+					? {}
+					: { callerIdName: this.deps.channel.callerIdName }),
+			});
+		} catch (error) {
+			this.note(
+				`voicemail message ${recordingId} was recorded into ${objectKey} but could NOT be filed: ${String(error)}`,
+			);
+		}
+	}
+
+	/**
+	 * Opening a mailbox — `*97`, and any `voicemail` node in `check` mode.
+	 *
+	 * ## What is real
+	 *
+	 * The caller is identified by the extension they are calling from, their mailbox is found in the
+	 * artifact's mailbox table, and the box's number is read back to them one digit at a time using
+	 * the `digits/*` sounds every Asterisk install ships — no TTS, no per-deployment prompt pack. A
+	 * caller who dials `*97` from a phone with no mailbox is told so instead of hearing silence.
+	 *
+	 * ## What is stubbed, precisely
+	 *
+	 * **There is no PIN check.** `voicemail_box.pin_hash` is not compiled into the artifact, so the
+	 * only authentication available here is "the call came from this extension" — which is exactly
+	 * as strong as the phone on the desk and no stronger. That is the classic PBX default and it is
+	 * ACCEPTABLE for `*97` from an internal extension; it is NOT acceptable for the from-anywhere
+	 * check a `voicemail` node in `check` mode can be reached by, so that path is refused rather
+	 * than silently opened. Closing it needs the compiler to embed the hash.
+	 *
+	 * **There is no message count and no playback.** Both need the `voicemail_message` rows, which
+	 * live in `pbx-db` behind the control plane; the engine holds no database handle and there is no
+	 * read model on the backbone that carries them. The `voicemail.mwi.updated` event added in this
+	 * wave is the contract that read model will be built on. Until it exists this announces the
+	 * mailbox and stops, and says so in the notes rather than playing "you have no messages" at
+	 * somebody who has nine.
+	 */
+	private async voicemailCheck(node: VoicemailPlanNode, input: WalkInput): Promise<StepResult> {
+		const caller = input.callerIdNumber ?? this.deps.channel.callerIdNumber;
+		const mailbox = this.mailboxFor(node, caller, input);
+
+		if (mailbox === undefined) {
+			this.note(
+				`voicemail check from ${caller ?? "an unknown caller"} matched no mailbox; refusing rather than opening box ${node.mailboxNumber}`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		for (const media of this.spellNumber(mailbox)) {
+			if (this.deps.channel.isTearingDown) {
+				return { kind: "aborted" };
+			}
+			await this.deps.execute({ verb: "play", media });
+		}
+
 		this.note(
-			`voicemail message ${recordingId} was recorded but not filed: mailbox storage, MWI and email notification are the next wave`,
+			`voicemail check opened box ${mailbox}; message counts and playback need the voicemail read model (voicemail.evt.v1) and are not implemented yet`,
 		);
 		return { kind: "hangup", cause: "NORMAL_CLEARING" };
+	}
+
+	/**
+	 * Which mailbox a check may open.
+	 *
+	 * The node's own `mailboxNumber` is only honoured when it IS the caller's — a feature code
+	 * compiles to a node with the dialling extension's box, so in the `*97` case the two agree, and
+	 * in every other case they disagreeing means somebody is being handed a mailbox that is not
+	 * theirs. The artifact's mailbox table is the second source: it is keyed by mailbox number and
+	 * is what makes "does this extension have a box at all?" answerable without a database.
+	 */
+	private mailboxFor(
+		node: VoicemailPlanNode,
+		caller: string | undefined,
+		input: WalkInput,
+	): string | undefined {
+		const callerNumber = caller?.trim();
+		if (callerNumber === undefined || callerNumber === "") {
+			return undefined;
+		}
+		if (node.mailboxNumber === callerNumber) {
+			return node.mailboxNumber;
+		}
+		const known = input.mailboxes?.[callerNumber];
+		return known === undefined ? undefined : known.mailboxNumber;
+	}
+
+	/**
+	 * A number as a sequence of playable digit sounds.
+	 *
+	 * `digits/0` … `digits/9` are in Asterisk's core sound package, so this works on a stock install
+	 * with no prompt pack and no TTS. Anything that is not a digit is dropped rather than guessed
+	 * at: there is no core sound for `#`, and playing nothing is better than playing the wrong word.
+	 */
+	private spellNumber(value: string): readonly string[] {
+		const prefix = this.settings.mediaRefs.promptPrefix;
+		return [...value]
+			.filter((character) => character >= "0" && character <= "9")
+			.map((digit) => `${prefix}digits/${digit}`);
 	}
 
 	private waitForRecording(
@@ -1099,6 +1353,23 @@ export class PlanWalker {
 		index: number,
 		onFailure: (cause: HangupCause) => void,
 	): Promise<void> {
+		// BEFORE the media server is asked. A leg that answers instantly would otherwise deliver its
+		// `StasisStart` to an orchestrator that has never heard of it, and be filed as a new inbound
+		// call — the exact failure the `OPTIMIQ_LEG` check exists to prevent, one layer earlier.
+		this.deps.legs?.originated({
+			mediaChannelId: channelId,
+			endpoint: attempt.endpoint,
+			destinationNumber: attempt.destinationNumber,
+			label: attempt.label,
+			...(this.destination?.destinationType === undefined
+				? {}
+				: { destinationType: this.destination.destinationType }),
+			...(this.destination?.destinationRef === undefined
+				? {}
+				: { destinationRef: this.destination.destinationRef }),
+			...(attempt.callerId === undefined ? {} : { callerId: attempt.callerId }),
+		});
+
 		try {
 			await this.deps.media.originate({
 				endpoint: attempt.endpoint,
@@ -1157,6 +1428,7 @@ export class PlanWalker {
 
 		this.deps.channel.setBridge(bridgeId);
 		this.deps.channel.moveTo("exchanging-media");
+		this.deps.legs?.bridged(peerMediaChannelId, bridgeId);
 
 		await this.deps.publish("channel.bridged", {
 			legId: this.deps.channel.channelId,
@@ -1272,6 +1544,8 @@ export class PlanWalker {
 	}
 
 	private async hangupQuietly(mediaChannelId: string, cause: HangupCause): Promise<void> {
+		// Fix the cause before the media server is told; see `OriginatedLegHooks.hangingUp`.
+		this.deps.legs?.hangingUp(mediaChannelId, cause);
 		try {
 			await this.deps.media.hangup(mediaChannelId, cause);
 		} catch (error) {

@@ -27,10 +27,20 @@ NATS backbone, mirrors live channel state into JetStream KV, and emits one CDR p
 - **Dial and bridge.** Extensions and ring groups are originated over ARI and bridged on answer,
   with `LOSE_RACE` cleanup for the losers of a ring-all.
 
-**Not here yet:** queues, conferences, park, attended/blind transfer, real voicemail (boxes, MWI,
-email), answer confirmation, B-leg CDRs, and the session-protocol server. Every one of them is
-named in the walk's `notes`, so a call that hit a gap says so in the log rather than looking like a
-routing bug.
+- **Multi-tenant inbound.** A call that arrives with no organization on the channel is attributed by
+  its dialled DID through the `did-index` KV bucket, which `apps/api` maintains when a number is
+  provisioned. Two tenants' DIDs land in two tenants' artifacts, CDRs and event subjects.
+- **B-leg CDRs.** Every leg the engine originates gets a `ChannelAggregate`, a `channel.created`, a
+  KV mirror and a `cdr.leg.write` of its own, linked to the A-leg by `callId` and
+  `originatingLegId`.
+- **Voicemail.** A caller hears the greeting, records, and the message is FILED — a
+  `voicemail.message.left` on the `VOICEMAIL` stream carrying the box, the object key, the duration
+  and the caller's identity.
+
+**Not here yet:** queues, conferences, park, attended/blind transfer, answer confirmation, mailbox
+playback, per-box greetings and PINs, voicemail email delivery, and the session-protocol server.
+Every one of them is named in the walk's `notes`, so a call that hit a gap says so in the log rather
+than looking like a routing bug.
 
 ## Routing
 
@@ -70,8 +80,9 @@ recursive walker would express that as a stack overflow on a live call.
 | `trunk-dial`                   | Ordered failover honouring `continueOnCauses` (a closed allow-list, never "every cause") |
 | `external`                     | Dialled when literal; REFUSED with `OUTGOING_CALL_BARRED` when it needs outbound routing |
 | `playback` / `hangup`          | Direct verb mapping                                                 |
-| `voicemail`                    | **Placeholder** — greeting + ARI record + `channel.record.*`; no mailbox, MWI or email |
-| `feature-code`                 | **Placeholder** — `*97` serves the voicemail placeholder, everything else announces and hangs up |
+| `voicemail` (`leave`)          | Greeting + ARI record + `channel.record.*` + `voicemail.message.left`; an empty or failed recording files nothing. Greeting is deployment-wide, not per box |
+| `voicemail` (`check`)          | Authenticates by the calling extension, reads the mailbox number back as `digits/*`; no PIN, no counts, no playback |
+| `feature-code`                 | `*97` opens the caller's own mailbox; a code with no mailbox behind it announces and refuses. Everything else announces and hangs up |
 | `queue` `conference` `park` `application` | **Stub** — announce and hang up with `FACILITY_NOT_IMPLEMENTED` |
 
 **The A-leg is never answered early.** A `hangup` terminal (a blocked caller, an unallocated DID)
@@ -83,18 +94,55 @@ ARI event stream. The walker subscribes to a leg's key BEFORE it originates, whi
 orchestrator tells a B-leg's `StasisStart` from a new inbound call: a watched key means "this is
 ours, do not file it as a call of its own".
 
+### Attributing a call to a tenant
+
+An inbound INVITE from a carrier carries a dialled number and nothing that says whose it is, and
+everything downstream of that moment is organization-scoped. Three sources are tried, in this order:
+
+1. **`OPTIMIQ_ORG_ID` on the channel.** The strongest signal: the SIP edge or the dialplan already
+   decided, with the INVITE in hand. A deployment where the edge stamps `X-Optimiq-Org-Id` lands
+   here.
+2. **The `did-index` KV bucket**, keyed by the DIGITS of the dialled number
+   (`kvKeyFor.didIndex`, so `+441632960111`, `441632960111` and `+44 1632 960111` are one key).
+   `apps/api` writes it after the commit that provisions the number, and rebuilds it with
+   `pnpm --filter @optimiq-voice/api rebuild:did-index`.
+3. **`ENGINE_DEFAULT_ORGANIZATION_ID`.** Development only, and LAST on purpose — above the index it
+   would make a box with the variable set answer every tenant's DID as its own tenant, which is the
+   bug the index exists to prevent, reintroduced by the fallback meant to make one box convenient.
+
+Nothing else. A call none of the three attributes is REJECTED with `INVALID_PROFILE`.
+
+The lookup is **not cached**, deliberately: every other read on this path is, because a stale
+artifact merely routes a call the way it was routed a second ago, while a stale DID→org mapping
+files a call under the wrong tenant — a billing error and an isolation breach at once, and both are
+silent. One KV round trip is the price of not having one.
+
+Two tenants cannot claim one DID: `phone_number.e164` carries a platform-wide unique index in
+`pbx-db`, so Postgres refuses the second claim inside the write transaction. The bucket is a derived
+read model of that column, and `DidIndexPublisher` REFUSES to move a key to a second organization
+rather than resolving a conflict the database says cannot exist.
+
 ### Known gaps
 
-- **There is no DID → organization index.** The engine reads `OPTIMIQ_ORG_ID` off the channel and
-  rejects the call with `INVALID_PROFILE` when it is absent — it does not look the DID up, because
-  nothing in the system exposes that mapping yet. Development sets it from the container's
-  environment (see `apps/asterisk/config/extensions.conf`); production needs either the SIP edge to
-  stamp an `X-Optimiq-Org-Id` header or a real index. **This is the blocker for multi-tenant
-  inbound.**
+- **The did-index publish is after the commit.** An API process that dies between committing a new
+  number and writing the bucket leaves the DID routable by nobody until the next write for that
+  organization or a run of `rebuild:did-index`. Closing the window needs an outbox, not a retry.
+- **DID normalisation does not guess a dial plan.** `0044…` and `+44…` are different keys, because
+  turning a national prefix into a country code needs to know which country the trunk is in. That
+  belongs to the SIP edge.
+- **Per-box voicemail greetings and PINs are not in the artifact.** `VoicemailPlanNode` carries the
+  box id, number, `maxMessageSeconds` and `mwiEnabled` — not the active greeting's object key or the
+  PIN hash. So the greeting is deployment-wide and `check` authenticates by the calling extension
+  only. The fix is the compiler's: embed both, as it embeds every other routing input.
+- **Mailbox counts and playback** need the `voicemail_message` rows, which live behind the control
+  plane; the engine holds no database handle. `voicemail.mwi.updated` is the contract that read model
+  will be built on.
+- **Voicemail email delivery** is not wired. `voicemail_box.email_mode` is likewise not compiled into
+  the artifact, and delivery belongs to the control plane, which is where the `message.left` consumer
+  is.
 - **IVR direct dial** needs a second, `internal`-context resolve the walker cannot make from a
   plan alone; digits that match no option are treated as invalid and the gap is reported.
-- **Call-block `voicemail` action** is flagged by the resolver but has no mailbox to divert to.
-- **B-legs get events but no CDR.** One `cdr.leg.write` per call, for the A-leg.
+- **Call-block `voicemail` action** is flagged by the resolver but is not diverted to a mailbox.
 
 ## Architecture
 
@@ -148,11 +196,12 @@ one that died — which is what makes the KV snapshot usable for failover instea
 | `ENGINE_VOICEMAIL_GREETING`      | `sound:unavailable`     | Placeholder until per-box greetings exist            |
 | `ENGINE_RECORDING_FORMAT`        | `wav`                   |                                                      |
 
-**The dialplan must set `OPTIMIQ_ORG_ID`** to the tenant's UUID before `Stasis()`. A call with no
-resolvable organization is REJECTED with `INVALID_PROFILE`, never filed under a guess: a
-mis-attributed CDR is both a billing error and a tenant-isolation breach, and both are silent.
-`ENGINE_DEFAULT_ORGANIZATION_ID` provides a single-tenant development fallback and should be unset
-in production.
+**The dialplan no longer has to set `OPTIMIQ_ORG_ID`.** It still wins when it is set — see
+"Attributing a call to a tenant" — but a carrier trunk pointed at `optimiq-inbound-untrusted`
+resolves its tenant from the `did-index` bucket. A call none of the three sources attributes is
+REJECTED with `INVALID_PROFILE`, never filed under a guess: a mis-attributed CDR is both a billing
+error and a tenant-isolation breach, and both are silent. `ENGINE_DEFAULT_ORGANIZATION_ID` provides a
+single-tenant development fallback and should be unset in production.
 
 ## Health
 
@@ -166,8 +215,8 @@ fails on a broker blip restarts a healthy process and turns a blip into an outag
 ## Tests
 
 ```sh
-pnpm --filter @optimiq-voice/engine test              # 315 pure specs, no Docker
-pnpm --filter @optimiq-voice/engine test:integration  # + 4 against real Asterisk + NATS
+pnpm --filter @optimiq-voice/engine test              # 343 pure specs, no Docker
+pnpm --filter @optimiq-voice/engine test:integration  # + 6 against real Asterisk + NATS
 ```
 
 The pure suite drives whole calls through the orchestrator and the plan walker with fake ports —
@@ -181,8 +230,12 @@ drives real calls into the `optimiq-inbound` context. It asserts the whole chain
 resolve → IVR → timeout branch → extension → an originated B-leg → `channel.bridged`, the
 `calls.evt.*` events arriving in order and schema-valid on their own call's subject, the `channels`
 KV entry appearing and clearing, and one `cdr.leg.write` carrying
-`destinationType: "extension"`. A second call proves an unrouted DID is rejected with
-`UNALLOCATED_NUMBER`, never answered, and files a CDR that honestly says `unknown`. Set
+`destinationType: "extension"`, **plus a second `cdr.leg.write` for the leg it dialled**, carrying
+`leg: "b"`, the same `callId` and the A-leg's id as `originatingLegId`. A second call proves an
+unrouted DID is rejected with `UNALLOCATED_NUMBER`, never answered, and files a CDR that honestly
+says `unknown`. A third and fourth drive `optimiq-inbound-untrusted` — a context that stamps NO
+organization — with two tenants' DIDs and assert that each lands in its own tenant's artifact,
+subjects and ledger while `ENGINE_DEFAULT_ORGANIZATION_ID` points at the other one. Set
 `NATS_INTEGRATION_URL` / `ARI_INTEGRATION_URL` to use services you already run; only containers the
 suite started are removed.
 

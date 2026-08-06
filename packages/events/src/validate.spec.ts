@@ -7,6 +7,7 @@ import { makeCdrLegWriteEvent } from "./schemas/cdr-events";
 import { makeProvisionEvent } from "./schemas/provision-events";
 import { makeQueueEvent } from "./schemas/queue-events";
 import { makeRegistrationEvent } from "./schemas/registration-events";
+import { makeVoicemailEvent } from "./schemas/voicemail-events";
 import { EVENT_FAMILIES, RPC_SUBJECTS, subjectFor } from "./subjects";
 import {
 	anyEventSchema,
@@ -22,6 +23,7 @@ const OTHER_ORG = createEntityId();
 const CALL = createEntityId();
 const LEG = createEntityId();
 const QUEUE = createEntityId();
+const MAILBOX = createEntityId();
 
 const callEvent = makeCallEvent("channel.answered", {
 	orgId: ORG,
@@ -49,6 +51,21 @@ const samples = {
 		queueId: QUEUE,
 		source: "engine",
 		data: { callId: CALL, legId: LEG, waitMs: 41_000, reason: "caller-hangup" },
+	}),
+	voicemail: makeVoicemailEvent("message.left", {
+		orgId: ORG,
+		mailboxId: MAILBOX,
+		source: "engine",
+		data: {
+			messageId: createEntityId(),
+			mailboxNumber: "1001",
+			callId: CALL,
+			legId: LEG,
+			recordingId: createEntityId(),
+			objectKey: "voicemail/2026/08/05/message.wav",
+			durationMs: 8_200,
+			receivedAt: "2026-08-05T10:00:00.000Z",
+		},
 	}),
 	cdr: makeCdrLegWriteEvent({
 		orgId: ORG,

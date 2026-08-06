@@ -5,6 +5,7 @@
 		"call": "calls.evt.v1",
 		"registration": "sip.reg.v1",
 		"queue": "queue.evt.v1",
+		"voicemail": "voicemail.evt.v1",
 		"cdrLeg": "cdr.leg.v1",
 		"audit": "audit.evt.v1",
 		"provision": "provision.evt.v1"
@@ -42,6 +43,28 @@
 		{
 			"aor": "sip:a@b",
 			"token": "45d0e5cfd8660c7beff53cde59993ebd"
+		}
+	],
+	"didIndexTokens": [
+		{
+			"did": "+441632960111",
+			"token": "441632960111"
+		},
+		{
+			"did": "441632960111",
+			"token": "441632960111"
+		},
+		{
+			"did": "+1 (212) 555-0100",
+			"token": "12125550100"
+		},
+		{
+			"did": "+1-212-555-0100",
+			"token": "12125550100"
+		},
+		{
+			"did": "0044 1632 960111",
+			"token": "00441632960111"
 		}
 	],
 	"subjectBuilders": [
@@ -98,6 +121,24 @@
 				"agent.state"
 			],
 			"subject": "queue.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293._all.agent.state"
+		},
+		{
+			"builder": "voicemail",
+			"args": [
+				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51",
+				"message.left"
+			],
+			"subject": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51.message.left"
+		},
+		{
+			"builder": "voicemail",
+			"args": [
+				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51",
+				"mwi.updated"
+			],
+			"subject": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51.mwi.updated"
 		},
 		{
 			"builder": "cdrLeg",
@@ -214,6 +255,34 @@
 			"result": "queue.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.*.agent.state"
 		},
 		{
+			"filter": "allVoicemail",
+			"args": [],
+			"result": "voicemail.evt.v1.>"
+		},
+		{
+			"filter": "voicemailInOrg",
+			"args": [
+				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
+			],
+			"result": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.>"
+		},
+		{
+			"filter": "voicemailBox",
+			"args": [
+				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51"
+			],
+			"result": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51.>"
+		},
+		{
+			"filter": "voicemailEventInOrg",
+			"args": [
+				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"mwi.updated"
+			],
+			"result": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.*.mwi.updated"
+		},
+		{
 			"filter": "allCdrLegs",
 			"args": [],
 			"result": "cdr.leg.v1.*"
@@ -282,6 +351,17 @@
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"queueId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e",
 				"event": "caller.joined"
+			}
+		},
+		{
+			"subject": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51.message.left",
+			"parsed": {
+				"kind": "voicemail",
+				"family": "voicemail",
+				"version": "v1",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"mailboxId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51",
+				"event": "message.left"
 			}
 		},
 		{
@@ -464,6 +544,27 @@
 				"441632960111"
 			],
 			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.inbound.441632960111"
+		},
+		{
+			"builder": "didIndex",
+			"args": [
+				"+441632960111"
+			],
+			"key": "441632960111"
+		},
+		{
+			"builder": "didIndex",
+			"args": [
+				"441632960111"
+			],
+			"key": "441632960111"
+		},
+		{
+			"builder": "didIndex",
+			"args": [
+				"+1 (212) 555-0100"
+			],
+			"key": "12125550100"
 		}
 	],
 	"streams": [
@@ -513,6 +614,22 @@
 			"maxBytes": 2147483648,
 			"maxMsgsPerSubject": -1,
 			"duplicateWindowMs": 120000,
+			"numReplicas": 1
+		},
+		{
+			"name": "VOICEMAIL",
+			"description": "Voicemail message and MWI events consumed durably by the pbx writer (plan §3.5).",
+			"subjects": [
+				"voicemail.evt.v1.>"
+			],
+			"retention": "limits",
+			"storage": "file",
+			"discard": "new",
+			"maxAgeMs": 2592000000,
+			"maxMsgs": -1,
+			"maxBytes": 2147483648,
+			"maxMsgsPerSubject": -1,
+			"duplicateWindowMs": 600000,
 			"numReplicas": 1
 		},
 		{
@@ -614,6 +731,16 @@
 			"maxValueSizeBytes": 1048576,
 			"maxBytes": 1073741824,
 			"numReplicas": 1
+		},
+		{
+			"name": "did-index",
+			"description": "DID (E.164 digits) -> owning organization, for inbound tenant attribution.",
+			"ttlMs": 0,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 4096,
+			"maxBytes": 268435456,
+			"numReplicas": 1
 		}
 	],
 	"vocabularies": {
@@ -696,6 +823,10 @@
 			"caller.answered",
 			"caller.abandoned",
 			"agent.state"
+		],
+		"voicemail": [
+			"message.left",
+			"mwi.updated"
 		]
 	},
 	"eventTypes": [
@@ -798,6 +929,16 @@
 			"family": "queue",
 			"type": "agent.state",
 			"goType": "QueueAgentStateData"
+		},
+		{
+			"family": "voicemail",
+			"type": "message.left",
+			"goType": "VoicemailMessageLeftData"
+		},
+		{
+			"family": "voicemail",
+			"type": "mwi.updated",
+			"goType": "VoicemailMWIUpdatedData"
 		},
 		{
 			"family": "cdr",
@@ -1012,10 +1153,55 @@
 			}
 		},
 		{
+			"name": "voicemail.message.left",
+			"goType": "VoicemailMessageLeftData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0009",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51.message.left",
+				"type": "message.left",
+				"source": "sipd",
+				"data": {
+					"messageId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b52",
+					"mailboxNumber": "1001",
+					"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c",
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d",
+					"recordingId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b50",
+					"objectKey": "voicemail/2026/08/05/message-a.wav",
+					"durationMs": 12400,
+					"sizeBytes": 198400,
+					"callerIdNumber": "+441632960111",
+					"callerIdName": "Ada Lovelace",
+					"receivedAt": "2026-08-05T10:00:00.000Z",
+					"transcriptionRequested": false
+				}
+			}
+		},
+		{
+			"name": "voicemail.mwi.updated",
+			"goType": "VoicemailMWIUpdatedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000a",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51.mwi.updated",
+				"type": "mwi.updated",
+				"source": "api",
+				"data": {
+					"mailboxNumber": "1001",
+					"extensionNumber": "1001",
+					"newCount": 3,
+					"savedCount": 12,
+					"reason": "message-left"
+				}
+			}
+		},
+		{
 			"name": "cdr.leg.write",
 			"goType": "CDRLegWriteData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0009",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000b",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "cdr.leg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -1054,7 +1240,7 @@
 			"name": "audit.recorded",
 			"goType": "AuditRecordedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000a",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000c",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "audit.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -1088,7 +1274,7 @@
 			"name": "provision.device.rejected",
 			"goType": "ProvisionDeviceRejectedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000b",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000d",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "provision.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",

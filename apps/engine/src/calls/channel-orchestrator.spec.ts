@@ -8,10 +8,23 @@ import { ChannelOrchestrator } from "./channel-orchestrator.service";
 import type { EngineEnv } from "../config/engine-env";
 import type { CallEventPublisher } from "../nats/call-event-publisher.service";
 import type { JetStreamService } from "../nats/jetstream.service";
+import type { DidIndexSource } from "../routing/did-index.source";
 import type { RoutingArtifactSource } from "../routing/routing-artifact.source";
 import type { CallEventOf, CdrLegWriteEnvelope } from "@optimiq-voice/events";
 import type { AriEvent } from "@optimiq-voice/media-ari";
 import type { ChannelSnapshot } from "@optimiq-voice/telephony";
+
+/**
+ * A DID index that never resolves anything.
+ *
+ * Every case in the pure suite drives a call that already carries `OPTIMIQ_ORG_ID`, so the lookup
+ * is not what is under test here and a stub that always misses keeps each case exercising exactly
+ * the path it was written for. The lookup itself is covered by `did-index.source.spec.ts`, and the
+ * multi-tenant flow end to end by the integration suite.
+ */
+const NO_DID_INDEX = {
+	organizationFor: async () => undefined,
+} as unknown as DidIndexSource;
 
 /**
  * Orchestrator specs, driven entirely by fakes.
@@ -111,6 +124,7 @@ function harness(env: EngineEnv = fakeEnv()) {
 		events,
 		jetstream,
 		routing,
+		NO_DID_INDEX,
 		signals,
 	);
 
@@ -472,6 +486,7 @@ describe("resilience", () => {
 			failing,
 			h.jetstream,
 			h.routing,
+			NO_DID_INDEX,
 			h.signals,
 		);
 

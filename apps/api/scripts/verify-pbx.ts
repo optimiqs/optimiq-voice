@@ -53,6 +53,20 @@ const DEFAULT_PBX_DATABASE_URL = "postgresql://optimiq:optimiq@localhost:5433/op
 const TEST_SECRET = process.env.AUTH_SECRET ?? "verify-auth-slice-secret-0123456789abcdef";
 const RUN_ID = Date.now().toString(36);
 
+/**
+ * The run's DID, unique per run.
+ *
+ * `phone_number.e164` carries a PLATFORM-WIDE unique index (a DID has exactly one owner on the
+ * PSTN, so it has exactly one owner here), which means a fixed number would make two runs — or one
+ * run and the leftovers of a crashed one — collide with a 409 that has nothing to do with what the
+ * run is checking. The last nine digits are derived from the run id, which also makes the row
+ * traceable to the run that made it.
+ */
+const RUN_DID = `+1212${(Date.now() % 1_000_000).toString().padStart(6, "0")}`;
+
+/** A second number, created and released so the index's DELETE path is exercised too. */
+const SPARE_DID = `+1213${(Date.now() % 1_000_000).toString().padStart(6, "0")}`;
+
 // ---------------------------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------------------------
@@ -279,6 +293,7 @@ async function main(): Promise<void> {
 	const { createPostgresClient } = await import("@optimiq-voice/db");
 	const { routingCacheKey, ROUTING_CACHE_BUCKET } = await import("@optimiq-voice/routing");
 	const { ROUTING_RESOLVE_RPC } = await import("@optimiq-voice/events/schemas");
+	const { DID_INDEX_KV, kvKeyFor } = await import("@optimiq-voice/events/streams");
 
 	const sql = createPostgresClient({
 		url: databaseUrl,
@@ -669,7 +684,7 @@ async function main(): Promise<void> {
 		);
 
 		const did = await clientA("POST", "/api/v1/phone-numbers", {
-			e164: "+12125550100",
+			e164: RUN_DID,
 			label: "Main line",
 			destinationType: "ivr",
 			destinationRef: ivrId,
@@ -678,10 +693,41 @@ async function main(): Promise<void> {
 		const didId = id(did);
 		check("create DID -> 201", did.status === 201, `status ${did.status}`);
 
+		// --- the DID is claimed platform-wide, not per tenant --------------------------------------
+		//
+		// Two organizations claiming one number is not a configuration choice: an inbound INVITE for
+		// it would have to be attributed to one of them with nothing that can decide which, and the
+		// loser's calls, recordings and CDRs would be filed under the winner. The constraint lives in
+		// the database because that is the only place it is atomic with the write.
+		const stolenDid = await clientB("POST", "/api/v1/phone-numbers", {
+			e164: RUN_DID,
+			label: "Poaching A's number",
+			destinationType: "extension",
+			destinationRef: id(bOwn),
+		});
+		check(
+			"a second organization claiming the same DID is 409",
+			stolenDid.status === 409,
+			`status ${stolenDid.status}`,
+		);
+		check(
+			"the 409 says the number is claimed platform-wide, without naming who holds it",
+			typeof stolenDid.body.message === "string" &&
+				String(stolenDid.body.message).includes("already provisioned on this platform") &&
+				!String(stolenDid.body.message).includes(organizationA),
+			String(stolenDid.body.message).slice(0, 90),
+		);
+		const notStolen = await clientB("GET", "/api/v1/phone-numbers");
+		check(
+			"the refused DID was not written into B",
+			rows(notStolen).every((row) => row.e164 !== RUN_DID),
+			`${String(rows(notStolen).length)} row(s)`,
+		);
+
 		const inbound = await clientA("POST", "/api/v1/inbound-routes", {
 			name: "Main line",
 			matchKind: "exact",
-			matchPattern: "+12125550100",
+			matchPattern: RUN_DID,
 			phoneNumberId: didId,
 			destinationType: "time-condition",
 			destinationRef: timeConditionId,
@@ -1128,7 +1174,7 @@ async function main(): Promise<void> {
 
 		const simulateOpen = await clientA("POST", "/api/v1/routing/simulate", {
 			routingContext: "inbound",
-			destinationNumber: "+12125550100",
+			destinationNumber: RUN_DID,
 			callerNumber: "+13105550111",
 			// A Wednesday at 14:00 New York = 19:00Z.
 			at: "2026-08-05T19:00:00.000Z",
@@ -1153,7 +1199,7 @@ async function main(): Promise<void> {
 
 		const simulateClosed = await clientA("POST", "/api/v1/routing/simulate", {
 			routingContext: "inbound",
-			destinationNumber: "+12125550100",
+			destinationNumber: RUN_DID,
 			// The same Wednesday at 03:00 New York = 07:00Z — outside the window.
 			at: "2026-08-05T07:00:00.000Z",
 		});
@@ -1220,7 +1266,7 @@ async function main(): Promise<void> {
 
 		const simulateB = await clientB("POST", "/api/v1/routing/simulate", {
 			routingContext: "inbound",
-			destinationNumber: "+12125550100",
+			destinationNumber: RUN_DID,
 			at: "2026-08-05T19:00:00.000Z",
 		});
 		check(
@@ -1286,10 +1332,54 @@ async function main(): Promise<void> {
 					);
 				}
 
+				// --- the did-index bucket ---------------------------------------------------------
+				//
+				// THE multi-tenant inbound lookup: an INVITE arrives with a dialled number and nothing
+				// that says whose it is, and this is what answers. Written after the commit by
+				// `DidIndexPublisher`, read per call by the engine.
+				const didBucket = await manager.jetstream().views.kv(DID_INDEX_KV.name);
+				const didKey = kvKeyFor.didIndex(RUN_DID);
+				const didEntry = await didBucket.get(didKey);
+				check("the DID is in the did-index bucket", didEntry !== null, didKey);
+
+				if (didEntry !== null) {
+					const indexed = JSON.parse(new TextDecoder().decode(didEntry.value)) as {
+						organizationId?: string;
+						phoneNumberId?: string;
+						e164?: string;
+					};
+					check(
+						"the did-index entry names the organization that owns the number",
+						indexed.organizationId === organizationA,
+						String(indexed.organizationId),
+					);
+					check(
+						"the did-index entry names the phone_number row",
+						indexed.phoneNumberId === didId,
+						`${String(indexed.phoneNumberId)} vs ${didId}`,
+					);
+					check(
+						"the did-index entry keeps the E.164 as stored, punctuation and all",
+						indexed.e164 === RUN_DID,
+						String(indexed.e164),
+					);
+				}
+
+				// The key is the DIGITS of the number, so the form the control plane stores and the
+				// form a carrier delivers land on one entry. A lookup that only worked for one of them
+				// would work on a developer box and miss in production.
+				check(
+					"the dialled form of the number resolves to the same key",
+					kvKeyFor.didIndex(RUN_DID.replace("+", "")) === didKey &&
+						kvKeyFor.didIndex(`${RUN_DID.slice(0, 2)} (${RUN_DID.slice(2, 5)}) ${RUN_DID.slice(5)}`) ===
+							didKey,
+					didKey,
+				);
+
 				const request = {
 					orgId: organizationA,
 					direction: "inbound" as const,
-					destinationNumber: "+12125550100",
+					destinationNumber: RUN_DID,
 					callerNumber: "+13105550111",
 					routingContext: "inbound",
 					at: "2026-08-05T19:00:00.000Z",
@@ -1327,6 +1417,153 @@ async function main(): Promise<void> {
 					"a malformed rpc request is answered, not dropped",
 					malformedAnswer.matched === false && typeof malformedAnswer.reason === "string",
 					String(malformedAnswer.reason).slice(0, 60),
+				);
+				// --- voicemail: the engine's fact becomes a mailbox row ---------------------------
+				//
+				// The engine records the audio and publishes `voicemail.message.left`; this asserts the
+				// other half — the durable consumer that files it and answers with the box's counts.
+				// Published exactly as the engine publishes it, so the two halves are proven against one
+				// contract rather than against each other's assumptions.
+				const { makeVoicemailEvent } = await import("@optimiq-voice/events/schemas");
+				const { createEntityId } = await import("@optimiq-voice/identifiers");
+				const messageId = createEntityId();
+				const messageEnvelope = makeVoicemailEvent("message.left", {
+					orgId: organizationA,
+					mailboxId,
+					source: "engine",
+					data: {
+						messageId,
+						mailboxNumber: "8000",
+						callId: createEntityId(),
+						legId: createEntityId(),
+						recordingId: createEntityId(),
+						objectKey: `voicemail/${RUN_ID}/message.wav`,
+						durationMs: 8_200,
+						callerIdNumber: "+15551234567",
+						callerIdName: "Ada",
+						receivedAt: new Date().toISOString(),
+					},
+				});
+
+				const mwiSubscription = connection.subscribe(`voicemail.evt.v1.${organizationA}.>`);
+				const mwiSeen: Record<string, unknown>[] = [];
+				void (async () => {
+					for await (const raw of mwiSubscription) {
+						const decoded = JSON.parse(new TextDecoder().decode(raw.data)) as {
+							type?: string;
+							data?: Record<string, unknown>;
+						};
+						if (decoded.type === "mwi.updated" && decoded.data !== undefined) {
+							mwiSeen.push(decoded.data);
+						}
+					}
+				})();
+
+				await connection
+					.jetstream()
+					.publish(
+						messageEnvelope.subject,
+						new TextEncoder().encode(JSON.stringify(messageEnvelope)),
+						{ msgID: messageEnvelope.id },
+					);
+				// Published twice, deliberately: a redelivery is what JetStream guarantees, and one row
+				// is what the mailbox has to end up with.
+				await connection
+					.jetstream()
+					.publish(
+						messageEnvelope.subject,
+						new TextEncoder().encode(JSON.stringify(messageEnvelope)),
+						{ msgID: `${messageEnvelope.id}-retry` },
+					);
+
+				const { createPbxDatabaseClient: openPbx, sql: pbxQuery } = await import(
+					"@optimiq-voice/pbx-db"
+				);
+				const pbxRead = openPbx({
+					url: pbxDatabaseUrl,
+					applicationName: "verify-pbx-voicemail",
+					poolMaxConnectionsOverride: 2,
+				});
+				try {
+					let filed: Record<string, unknown>[] = [];
+					for (let attempt = 0; attempt < 30 && filed.length === 0; attempt += 1) {
+						await delay(200);
+						filed = (await pbxRead.withTenantScope(organizationA, async (transaction) => {
+							const result = await transaction.execute(
+								pbxQuery`select "id", "voicemail_box_id", "folder", "duration_ms", "object_key",
+									"caller_id_number", "call_leg_ref"
+									from "voicemail_message" where "id" = ${messageId}::uuid`,
+							);
+							return (
+								Array.isArray(result) ? result : ((result as { rows?: unknown[] }).rows ?? [])
+							) as Record<string, unknown>[];
+						})) as Record<string, unknown>[];
+					}
+
+					check("the voicemail message was filed into pbx-db", filed.length === 1, `${String(filed.length)} row(s)`);
+					check(
+						"the row names the box, the folder and the audio the engine recorded",
+						filed[0]?.voicemail_box_id === mailboxId &&
+							filed[0]?.folder === "new" &&
+							filed[0]?.duration_ms === 8200 &&
+							String(filed[0]?.object_key).includes(RUN_ID),
+						JSON.stringify(filed[0] ?? {}).slice(0, 140),
+					);
+
+					const duplicated = (await pbxRead.withTenantScope(organizationA, async (transaction) => {
+						const result = await transaction.execute(
+							pbxQuery`select count(*)::int as "total" from "voicemail_message"
+								where "voicemail_box_id" = ${mailboxId}::uuid`,
+						);
+						return (
+							Array.isArray(result) ? result : ((result as { rows?: unknown[] }).rows ?? [])
+						) as { total: number }[];
+					})) as { total: number }[];
+					check(
+						"a redelivered message files ONE row, not two copies of one voicemail",
+						duplicated[0]?.total === 1,
+						String(duplicated[0]?.total),
+					);
+
+					for (let attempt = 0; attempt < 25 && mwiSeen.length === 0; attempt += 1) {
+						await delay(200);
+					}
+					check("an MWI update was published for the box", mwiSeen.length > 0, String(mwiSeen.length));
+					check(
+						"the MWI update carries absolute counts, not a delta",
+						mwiSeen[0]?.newCount === 1 && mwiSeen[0]?.savedCount === 0,
+						JSON.stringify(mwiSeen[0] ?? {}),
+					);
+				} finally {
+					mwiSubscription.unsubscribe();
+					await pbxRead.close();
+				}
+
+				// Releasing a number must take its index entry with it, or the next tenant to be sold
+				// that DID inherits calls routed to the previous one.
+				const releaseTarget = await clientA("POST", "/api/v1/phone-numbers", {
+					e164: SPARE_DID,
+					label: "Spare line",
+					destinationType: "extension",
+					destinationRef: extensionAId,
+				});
+				check("create a second DID -> 201", releaseTarget.status === 201);
+				await delay(300);
+				const spareKey = kvKeyFor.didIndex(SPARE_DID);
+				check(
+					"the second DID is indexed too",
+					(await didBucket.get(spareKey)) !== null,
+					spareKey,
+				);
+
+				const released = await clientA("DELETE", `/api/v1/phone-numbers/${id(releaseTarget)}`);
+				check("delete the second DID -> 200", released.status === 200, `status ${released.status}`);
+				await delay(300);
+				const afterRelease = await didBucket.get(spareKey);
+				check(
+					"releasing a DID removes its did-index entry",
+					afterRelease === null || afterRelease.value.length === 0,
+					spareKey,
 				);
 			} finally {
 				await rpcClient.close();

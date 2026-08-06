@@ -291,6 +291,22 @@ export function isPbxFailure(value: unknown): value is PbxFailure {
 
 /** Postgres `unique_violation`. */
 const UNIQUE_VIOLATION = "23505";
+
+/**
+ * Unique indexes that span EVERY tenant, and the message a violation of one may carry.
+ *
+ * The default 409 wording says "another … in this organization", which is true of every other
+ * unique index in the schema and false of these: the row that collided belongs to a tenant the
+ * caller cannot see and must not learn anything about. The replacement says exactly what happened —
+ * the number is claimed on this platform — and nothing else. No organization id, no label, no
+ * "contact the owner": the existence of the claim is already the minimum this constraint has to
+ * disclose in order to be enforceable at all.
+ */
+const PLATFORM_WIDE_CONSTRAINTS: Readonly<Record<string, string>> = {
+	phone_number_e164_global_key:
+		"That number is already provisioned on this platform. A DID has exactly one owner, so it " +
+		"has to be released from wherever it is configured before it can be added here.",
+};
 /** Postgres `check_violation` — a table-level invariant the row broke. */
 const CHECK_VIOLATION = "23514";
 
@@ -353,7 +369,9 @@ export function toPbxFailure(
 		return new PbxConflictFailure({
 			kind,
 			field: constraintField(constraint, table),
-			detail: `Another ${kind} in this organization already uses that value (${constraint}).`,
+			detail:
+				PLATFORM_WIDE_CONSTRAINTS[constraint] ??
+				`Another ${kind} in this organization already uses that value (${constraint}).`,
 		});
 	}
 	if (error?.code === CHECK_VIOLATION) {

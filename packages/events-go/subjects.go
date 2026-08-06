@@ -16,6 +16,7 @@ import (
 //	calls.evt.v1.<orgId>.<callId>.<event>      event = channel.created … channel.destroyed
 //	sip.reg.v1.<orgId>.<aorHash>.<event>       event = registered | unregistered | expired
 //	queue.evt.v1.<orgId>.<queueId>.<event>     event = caller.joined | … | agent.state
+//	voicemail.evt.v1.<orgId>.<mailboxId>.<event>  event = message.left | mwi.updated
 //	cdr.leg.v1.<orgId>                         one subject per org; the type is in the envelope
 //	audit.evt.v1.<orgId>
 //	provision.evt.v1.<orgId>
@@ -37,6 +38,7 @@ const (
 	SubjectRootCall         = "calls.evt." + SubjectVersion
 	SubjectRootRegistration = "sip.reg." + SubjectVersion
 	SubjectRootQueue        = "queue.evt." + SubjectVersion
+	SubjectRootVoicemail    = "voicemail.evt." + SubjectVersion
 	SubjectRootCDRLeg       = "cdr.leg." + SubjectVersion
 	SubjectRootAudit        = "audit.evt." + SubjectVersion
 	SubjectRootProvision    = "provision.evt." + SubjectVersion
@@ -55,6 +57,7 @@ const (
 	FamilyCall         EventFamily = "call"
 	FamilyRegistration EventFamily = "registration"
 	FamilyQueue        EventFamily = "queue"
+	FamilyVoicemail    EventFamily = "voicemail"
 	FamilyCDR          EventFamily = "cdr"
 	FamilyAudit        EventFamily = "audit"
 	FamilyProvision    EventFamily = "provision"
@@ -65,6 +68,7 @@ var EventFamilies = []EventFamily{
 	FamilyCall,
 	FamilyRegistration,
 	FamilyQueue,
+	FamilyVoicemail,
 	FamilyCDR,
 	FamilyAudit,
 	FamilyProvision,
@@ -181,6 +185,30 @@ func AORSubjectToken(aor string) (string, error) {
 	return hex.EncodeToString(sum[:])[:32], nil
 }
 
+// DIDIndexToken returns the stable key token for a DID, for the did-index KV bucket.
+//
+// An E.164 number is stored as "+441632960111" and dialled as "441632960111", "+441632960111" or
+// (from a carrier that strips it) with punctuation. None of "+", spaces, dashes or parentheses
+// survive as a KV key token, and none of them carry meaning, so the token is the DIGITS and nothing
+// else. Both writers and readers go through this one function, which is what makes "the DID the
+// tenant configured" and "the DID the carrier delivered" the same key.
+//
+// What it deliberately does NOT do is guess a dial plan: "0044…" and "+44…" are the same number to a
+// human and different tokens here, because turning a national prefix into a country code needs to
+// know which country the trunk is in. That belongs to the SIP edge, not to the contract package.
+func DIDIndexToken(did string) (string, error) {
+	digits := make([]byte, 0, len(did))
+	for i := 0; i < len(did); i++ {
+		if did[i] >= '0' && did[i] <= '9' {
+			digits = append(digits, did[i])
+		}
+	}
+	if len(digits) == 0 {
+		return "", &SubjectTokenError{Role: "did", Value: did}
+	}
+	return string(digits), nil
+}
+
 // ---------------------------------------------------------------------------------------------
 // publish subjects
 // ---------------------------------------------------------------------------------------------
@@ -236,6 +264,24 @@ func QueueSubject(orgID, queueID, event string) (string, error) {
 		return "", err
 	}
 	return SubjectRootQueue + "." + org + "." + queue + "." + name, nil
+}
+
+// VoicemailSubject builds voicemail.evt.v1.<orgId>.<mailboxId>.<event>. mailboxID is the
+// voicemail box's row id.
+func VoicemailSubject(orgID, mailboxID, event string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	mailbox, err := token("mailboxId", mailboxID)
+	if err != nil {
+		return "", err
+	}
+	name, err := eventName(event)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootVoicemail + "." + org + "." + mailbox + "." + name, nil
 }
 
 // CDRLegSubject builds cdr.leg.v1.<orgId> — a single ordered subject per org.
@@ -392,6 +438,44 @@ func QueueEventInOrgFilter(orgID, event string) (string, error) {
 	return SubjectRootQueue + "." + org + ".*." + name, nil
 }
 
+// AllVoicemailFilter matches every voicemail event — the VOICEMAIL stream's subjects.
+func AllVoicemailFilter() string { return SubjectRootVoicemail + ".>" }
+
+// VoicemailInOrgFilter matches every voicemail event of one org.
+func VoicemailInOrgFilter(orgID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootVoicemail + "." + org + ".>", nil
+}
+
+// VoicemailBoxFilter matches every event of one mailbox — what an MWI subscriber watches.
+func VoicemailBoxFilter(orgID, mailboxID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	mailbox, err := token("mailboxId", mailboxID)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootVoicemail + "." + org + "." + mailbox + ".>", nil
+}
+
+// VoicemailEventInOrgFilter matches one voicemail event name across every mailbox of one org.
+func VoicemailEventInOrgFilter(orgID, event string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	name, err := eventName(event)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootVoicemail + "." + org + ".*." + name, nil
+}
+
 // AllCDRLegsFilter matches every org's CDR subject. One token, so "*" not ">".
 func AllCDRLegsFilter() string { return SubjectRootCDRLeg + ".*" }
 
@@ -422,6 +506,7 @@ const (
 	KindCall         SubjectKind = "call"
 	KindRegistration SubjectKind = "registration"
 	KindQueue        SubjectKind = "queue"
+	KindVoicemail    SubjectKind = "voicemail"
 	KindCDRLeg       SubjectKind = "cdr-leg"
 	KindAudit        SubjectKind = "audit"
 	KindProvision    SubjectKind = "provision"
@@ -444,7 +529,9 @@ type ParsedSubject struct {
 	AORHash string
 	// QueueID is set for KindQueue.
 	QueueID string
-	// Event is the (possibly dotted) event name, for the three per-entity families.
+	// MailboxID is set for KindVoicemail.
+	MailboxID string
+	// Event is the (possibly dotted) event name, for the four per-entity families.
 	//
 	// It is returned as a plain string, not a checked vocabulary member: a v1.n producer may emit
 	// an event name a v1.0 consumer has never heard of, and dropping that message at parse time
@@ -496,6 +583,11 @@ func ParseSubject(subject string) (ParsedSubject, bool) {
 		return ParsedSubject{
 			Kind: KindQueue, Family: string(FamilyQueue), Version: version,
 			OrgID: rest[0], QueueID: rest[1], Event: strings.Join(rest[2:], "."),
+		}, true
+	case prefix == "voicemail.evt" && len(rest) >= 3:
+		return ParsedSubject{
+			Kind: KindVoicemail, Family: string(FamilyVoicemail), Version: version,
+			OrgID: rest[0], MailboxID: rest[1], Event: strings.Join(rest[2:], "."),
 		}, true
 	case prefix == "cdr.leg" && len(rest) == 1:
 		return ParsedSubject{

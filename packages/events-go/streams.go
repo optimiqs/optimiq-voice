@@ -126,6 +126,26 @@ var QueuesStream = StreamDefinition{
 	NumReplicas:       1,
 }
 
+// VoicemailStream carries mailbox facts on their way to pbx-db, plus the derived MWI counts.
+//
+// discard: new for the same reason as CDR and AUDIT: a message.left the broker silently dropped is a
+// message a caller recorded and a user will never see, which is indistinguishable from the system
+// losing their voicemail — because it is.
+var VoicemailStream = StreamDefinition{
+	Name:              "VOICEMAIL",
+	Description:       "Voicemail message and MWI events consumed durably by the pbx writer (plan §3.5).",
+	Subjects:          []string{AllVoicemailFilter()},
+	Retention:         RetentionLimits,
+	Storage:           StorageFile,
+	Discard:           DiscardNew,
+	MaxAge:            30 * 24 * time.Hour,
+	MaxMsgs:           Unlimited,
+	MaxBytes:          2 * gib,
+	MaxMsgsPerSubject: Unlimited,
+	DuplicateWindow:   10 * time.Minute,
+	NumReplicas:       1,
+}
+
 // CDRStream carries per-leg call records on their way to cdr-db. "Replay = rebuild": the 30-day
 // window is how far back the CDR table can be reconstructed from the log alone.
 var CDRStream = StreamDefinition{
@@ -181,6 +201,7 @@ var EventStreams = []StreamDefinition{
 	CallsStream,
 	RegistrationsStream,
 	QueuesStream,
+	VoicemailStream,
 	CDRStream,
 	AuditStream,
 	ProvisionStream,
@@ -294,6 +315,29 @@ var RoutingCacheKV = KVBucketDefinition{
 	NumReplicas:  1,
 }
 
+// DIDIndexKV holds DID → owning organization: THE multi-tenant inbound lookup.
+//
+// Every other bucket here is keyed by organization first, because every other reader already knows
+// the tenant. This one exists precisely because the reader does not — an inbound INVITE arrives from
+// a carrier with a dialled number and no idea whose it is — so its key is the DID alone.
+//
+// The TTL is zero on purpose. Every other bucket holds live state whose staleness self-corrects;
+// this holds CONFIGURATION, and an expiring entry means an inbound call to a valid DID stops
+// resolving to a tenant — an outage produced by a timer rather than by a change.
+//
+// It is not the authority on who owns a DID (phone_number in pbx-db is); it is a derived read model,
+// rebuildable from the database at any time.
+var DIDIndexKV = KVBucketDefinition{
+	Name:         "did-index",
+	Description:  "DID (E.164 digits) -> owning organization, for inbound tenant attribution.",
+	TTL:          0,
+	History:      1,
+	Storage:      StorageFile,
+	MaxValueSize: 4 * 1024,
+	MaxBytes:     256 * mib,
+	NumReplicas:  1,
+}
+
 // KVBuckets lists every bucket the backbone owns, in apply order.
 var KVBuckets = []KVBucketDefinition{
 	RegistrationsKV,
@@ -301,6 +345,7 @@ var KVBuckets = []KVBucketDefinition{
 	PresenceKV,
 	AgentStateKV,
 	RoutingCacheKV,
+	DIDIndexKV,
 }
 
 // KVBucketByName looks a bucket definition up by name.
@@ -400,4 +445,17 @@ func RoutingCacheKVKey(orgID, artifact string, discriminator ...string) (string,
 		key += "." + suffix
 	}
 	return key, nil
+}
+
+// DIDIndexKVKey builds the did-index key: the DID's digits, and nothing else.
+//
+// The ONE key in this file that is not organization-scoped, because the organization is what it
+// answers. Normalisation goes through DIDIndexToken so a control plane writing a stored
+// "+441632960111" and an engine reading a dialled "441632960111" land on one key.
+func DIDIndexKVKey(did string) (string, error) {
+	normalized, err := DIDIndexToken(did)
+	if err != nil {
+		return "", err
+	}
+	return token("did", normalized)
 }

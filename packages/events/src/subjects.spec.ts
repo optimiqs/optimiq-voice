@@ -37,6 +37,7 @@ describe("subject roots", () => {
 			call: "calls.evt.v1",
 			registration: "sip.reg.v1",
 			queue: "queue.evt.v1",
+			voicemail: "voicemail.evt.v1",
 			cdrLeg: "cdr.leg.v1",
 			audit: "audit.evt.v1",
 			provision: "provision.evt.v1",
@@ -64,6 +65,7 @@ describe("subject roots", () => {
 			"provision",
 			"queue",
 			"registration",
+			"voicemail",
 		]);
 	});
 });

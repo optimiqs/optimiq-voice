@@ -19,6 +19,7 @@
 		"migrate:identity": "tsx scripts/migrate-identity-to-organizations.ts",
 		"prebuild": "rimraf ./dist tsconfig.tsbuildinfo tsconfig.build.tsbuildinfo",
 		"pretest": "bash ../../.scripts/gen-keypair.sh",
+		"rebuild:did-index": "tsx scripts/rebuild-did-index.ts",
 		"seed:pbx": "tsx scripts/seed-pbx-demo.ts",
 		"start:dev": "nodemon --exec tsx --watch src src/main.ts",
 		"test": "cross-env LOGS_LEVEL=none NODE_ENV=development API_IDENTITY_PRIVATE_KEY_PATH=.keys/private.pem API_IDENTITY_PUBLIC_KEY_PATH=.keys/public.pem mocha \"test/**/*.test.ts\"",

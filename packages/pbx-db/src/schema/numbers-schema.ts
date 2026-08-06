@@ -15,6 +15,25 @@ import { emergencyAddress } from "./emergency-schema";
  *
  * The destination trio is the DID's default route. An inbound route may still override it — the
  * routing compiler resolves route matches first and falls back to the number's own destination.
+ *
+ * ## Why `e164` is unique GLOBALLY and not just per tenant
+ *
+ * A DID is a number on the PSTN, and the PSTN has exactly one owner for it. Two organizations on
+ * one platform claiming `+441632960111` is not a configuration choice, it is a claim that cannot
+ * both be true — and the moment an inbound INVITE for that number arrives, the platform has to
+ * decide which tenant it belongs to with no information that can decide it. "Last write wins" picks
+ * a tenant at random and files another tenant's calls, recordings and CDRs under it: a billing error
+ * and an isolation breach in one.
+ *
+ * So the constraint lives in the database, where it is the only mechanism that is atomic with the
+ * write. RLS does not weaken it: a unique index is enforced against every row in the table,
+ * including rows the inserting role cannot see, so the second tenant gets a `23505` rather than a
+ * duplicate. That is also its one cost — the 409 tells the second tenant the number is taken
+ * somewhere on the platform. `pbx.errors.ts` phrases that message so it says exactly that and
+ * nothing more: never which organization, never any of its detail.
+ *
+ * The `did-index` KV bucket in `@optimiq-voice/events` is the DERIVED read model of this column;
+ * this index is what makes that bucket's single-writer-per-key assumption true.
  */
 
 export const phoneNumber = pgTable.withRLS(
@@ -39,6 +58,8 @@ export const phoneNumber = pgTable.withRLS(
 	},
 	(table) => [
 		uniqueIndex("phone_number_organization_e164_key").on(table.organizationId, table.e164),
+		// One DID, one owner, platform-wide. See the header for the full argument.
+		uniqueIndex("phone_number_e164_global_key").on(table.e164),
 		index("phone_number_organization_enabled_idx").on(table.organizationId, table.enabled),
 		index("phone_number_organization_destination_idx").on(
 			table.organizationId,

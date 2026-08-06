@@ -175,3 +175,17 @@ export {
 	type RecordingStopReason,
 	type SipTransport,
 } from "./telephony";
+export {
+	makeVoicemailEvent,
+	VOICEMAIL_EVENT_DEFINITIONS,
+	voicemailEventSchema,
+	voicemailMessageLeftDataSchema,
+	voicemailMwiUpdatedDataSchema,
+	type VoicemailEventDataOf,
+	type VoicemailEventDefinitions,
+	type VoicemailEventEnvelope,
+	type VoicemailEventInput,
+	type VoicemailEventOf,
+	type VoicemailMessageLeftData,
+	type VoicemailMwiUpdatedData,
+} from "./voicemail-events";
