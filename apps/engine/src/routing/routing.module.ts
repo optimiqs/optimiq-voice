@@ -2,6 +2,7 @@ import { Global, Module } from "@nestjs/common";
 import { CallSignalBus } from "./call-signals";
 import { DidIndexSource } from "./did-index.source";
 import { RoutingArtifactSource } from "./routing-artifact.source";
+import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
 
 /**
  * The routing plane.
@@ -12,6 +13,8 @@ import { RoutingArtifactSource } from "./routing-artifact.source";
  * would mean two memory caches, two KV watches, and a window where one of them is stale.
  * {@link DidIndexSource} joins them because it is the same kind of thing one layer earlier: the
  * lookup that decides which tenant a call belongs to before any of the above can be scoped.
+ * {@link VoicemailMailboxRpcSource} joins them because it is stateless over the same rpc client
+ * proxy and there is nothing per-call about "ask the control plane what is in this mailbox".
  *
  * The plan walker itself is NOT a provider: one is constructed per call, over that call's channel
  * and that call's plan, and it holds per-walk state (retry counters, visited nodes, the notes).
@@ -20,7 +23,7 @@ import { RoutingArtifactSource } from "./routing-artifact.source";
  */
 @Global()
 @Module({
-	providers: [CallSignalBus, RoutingArtifactSource, DidIndexSource],
-	exports: [CallSignalBus, RoutingArtifactSource, DidIndexSource],
+	providers: [CallSignalBus, RoutingArtifactSource, DidIndexSource, VoicemailMailboxRpcSource],
+	exports: [CallSignalBus, RoutingArtifactSource, DidIndexSource, VoicemailMailboxRpcSource],
 })
 export class RoutingModule {}

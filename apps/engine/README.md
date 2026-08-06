@@ -33,14 +33,19 @@ NATS backbone, mirrors live channel state into JetStream KV, and emits one CDR p
 - **B-leg CDRs.** Every leg the engine originates gets a `ChannelAggregate`, a `channel.created`, a
   KV mirror and a `cdr.leg.write` of its own, linked to the A-leg by `callId` and
   `originatingLegId`.
-- **Voicemail.** A caller hears the greeting, records, and the message is FILED — a
+- **Voicemail.** A caller hears the box's **own** greeting (compiled into the plan node from
+  `voicemail_greeting`, `temporary` beating `unavailable`), records, and the message is FILED — a
   `voicemail.message.left` on the `VOICEMAIL` stream carrying the box, the object key, the duration
   and the caller's identity.
+- **The `*97` menu.** A mailbox with a PIN is challenged before it opens (three attempts, scrypt
+  digest from the artifact), then the messages are read out newest-first with `1` next / `2` replay
+  / `*` exit, driven by `rpc.voicemail.v1.list`.
 
-**Not here yet:** queues, conferences, park, attended/blind transfer, answer confirmation, mailbox
-playback, per-box greetings and PINs, voicemail email delivery, and the session-protocol server.
-Every one of them is named in the walk's `notes`, so a call that hit a gap says so in the log rather
-than looking like a routing bug.
+**Not here yet:** conferences, park, attended/blind transfer, answer confirmation, voicemail email
+delivery, mailbox delete/save, and the session-protocol server. **And two things this wave built but
+cannot yet run end to end**: the `rpc.voicemail.v1.list` responder (API side) and a mount that makes
+object-store audio reachable by Asterisk — see "Known gaps". Every one of them is named in the
+walk's `notes`, so a call that hit a gap says so in the log rather than looking like a routing bug.
 
 ## Routing
 
@@ -80,10 +85,10 @@ recursive walker would express that as a stack overflow on a live call.
 | `trunk-dial`                   | Ordered failover honouring `continueOnCauses` (a closed allow-list, never "every cause") |
 | `external`                     | Dialled when literal; REFUSED with `OUTGOING_CALL_BARRED` when it needs outbound routing |
 | `playback` / `hangup`          | Direct verb mapping                                                 |
-| `voicemail` (`leave`)          | Greeting + ARI record + `channel.record.*` + `voicemail.message.left`; an empty or failed recording files nothing. Greeting is deployment-wide, not per box |
-| `voicemail` (`check`)          | Authenticates by the calling extension, reads the mailbox number back as `digits/*`; no PIN, no counts, no playback |
+| `voicemail` (`leave`)          | The box's own greeting (`greetingMedia`, falling back to `ENGINE_VOICEMAIL_GREETING`) + ARI record + `channel.record.*` + `voicemail.message.left`; an empty or failed recording files nothing |
+| `voicemail` (`check`)          | PIN challenge when the box has one, mailbox number read back as `digits/*`, then message playback over `rpc.voicemail.v1.list` with `1` next / `2` replay / `*` exit |
 | `feature-code`                 | `*97` opens the caller's own mailbox; a code with no mailbox behind it announces and refuses. Everything else announces and hangs up |
-| `queue` `conference` `park` `application` | **Stub** — announce and hang up with `FACILITY_NOT_IMPLEMENTED` |
+| `conference` `park` `application` | **Stub** — announce and hang up with `FACILITY_NOT_IMPLEMENTED` |
 
 **The A-leg is never answered early.** A `hangup` terminal (a blocked caller, an unallocated DID)
 tears the leg down without answering, and an extension's B-leg has to answer before the A-leg does
@@ -130,13 +135,31 @@ rather than resolving a conflict the database says cannot exist.
 - **DID normalisation does not guess a dial plan.** `0044…` and `+44…` are different keys, because
   turning a national prefix into a country code needs to know which country the trunk is in. That
   belongs to the SIP edge.
-- **Per-box voicemail greetings and PINs are not in the artifact.** `VoicemailPlanNode` carries the
-  box id, number, `maxMessageSeconds` and `mwiEnabled` — not the active greeting's object key or the
-  PIN hash. So the greeting is deployment-wide and `check` authenticates by the calling extension
-  only. The fix is the compiler's: embed both, as it embeds every other routing input.
-- **Mailbox counts and playback** need the `voicemail_message` rows, which live behind the control
-  plane; the engine holds no database handle. `voicemail.mwi.updated` is the contract that read model
-  will be built on.
+- **ARI cannot fetch an object, and nothing in this repo mounts the store.** The compiler embeds a
+  greeting as `object://<objectKey>` and the message read model returns the same. ARI's `play`
+  accepts `sound:`, `recording:`, `number:`, `digits:`, `characters:` and `tone:` — **there is no
+  HTTP media scheme** — so the only way that audio becomes playable is for the object store to be
+  visible to Asterisk as a filesystem. Set `ENGINE_MEDIA_OBJECT_ROOT` to where it is mounted and
+  greetings and messages play; leave it unset (the default, and the state of `compose.yaml`, which
+  mounts no such volume) and both fall back to the configured announcement **and say so in the
+  notes**. Deploying this means mounting the directory the API serves recordings from
+  (`CDR_RECORDING_ROOT`) into the Asterisk container. Fetching-and-staging inside the engine was the
+  alternative and was rejected: it puts a download on the call path.
+- **Nothing answers `rpc.voicemail.v1.list`.** The contract, the Go structs and the engine client
+  exist; the API-side responder does not. Until it does, a `*97` authenticates, reads the mailbox
+  number back, and announces the mailbox as **unavailable** — deliberately never as "you have no
+  messages", which is a far more damaging thing to tell somebody who has nine.
+- **Nothing sets a voicemail PIN.** `voicemail_box.pin_hash` has no write path: the API excludes PIN
+  fields from every DTO pending "a dedicated endpoint that hashes it", which does not exist. The
+  digest format is now specified (`packages/routing` §3.1) and verified here, so the endpoint has a
+  contract to write against — but until it ships every box has a null digest and `*97` keeps
+  authenticating by the calling extension alone.
+- **No delete and no save in the mailbox menu.** Both mutate `voicemail_message` state the engine
+  cannot write. A `7` that appeared to delete a message that is still there is the worst outcome
+  available, so the key is not offered.
+- **The busy greeting is unreachable.** An extension's busy and no-answer branches compile to the
+  same `voicemail:<id>:leave` node, so nothing here can tell the two apart. Splitting that node is a
+  `packages/routing` change.
 - **Voicemail email delivery** is not wired. `voicemail_box.email_mode` is likewise not compiled into
   the artifact, and delivery belongs to the control plane, which is where the `message.left` consumer
   is.
@@ -193,7 +216,13 @@ one that died — which is what makes the KV snapshot usable for failover instea
 | `ENGINE_DEFAULT_RING_TIMEOUT_SECONDS` | `30`               | When neither node nor member specifies one           |
 | `ENGINE_PROMPT_MEDIA_PREFIX`     | `sound:`                | How a bare prompt id is rendered                     |
 | `ENGINE_UNAVAILABLE_ANNOUNCEMENT`| `sound:unavailable`     | Unresolvable media and the stubbed node kinds        |
-| `ENGINE_VOICEMAIL_GREETING`      | `sound:unavailable`     | Placeholder until per-box greetings exist            |
+| `ENGINE_VOICEMAIL_GREETING`      | `sound:unavailable`     | Played when the box has no greeting of its own       |
+| `ENGINE_MEDIA_OBJECT_ROOT`       | unset                   | Where the object store is mounted INSIDE Asterisk. Unset = greetings and messages fall back |
+| `ENGINE_VOICEMAIL_PIN_PROMPT`    | `sound:vm-password`     | Asked before a mailbox with a PIN opens              |
+| `ENGINE_VOICEMAIL_PIN_INVALID_PROMPT` | `sound:vm-incorrect` | Played between failed attempts                      |
+| `ENGINE_VOICEMAIL_PIN_ATTEMPTS`  | `3`                     | Then the call is refused with `CALL_REJECTED`        |
+| `ENGINE_VOICEMAIL_MENU_TIMEOUT_MS` | `5000`                | Wait for a control digit after a message plays       |
+| `ENGINE_VOICEMAIL_RPC_TIMEOUT_MS`| `3000`                  | Deadline for `rpc.voicemail.v1.list`                 |
 | `ENGINE_RECORDING_FORMAT`        | `wav`                   |                                                      |
 
 **The dialplan no longer has to set `OPTIMIQ_ORG_ID`.** It still wins when it is set — see

@@ -12,6 +12,7 @@ import type { CallEventPublisher } from "../nats/call-event-publisher.service";
 import type { JetStreamService } from "../nats/jetstream.service";
 import type { DidIndexSource } from "../routing/did-index.source";
 import type { RoutingArtifactSource } from "../routing/routing-artifact.source";
+import type { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
 import type { CallEventOf, CdrLegWriteEnvelope } from "@optimiq-voice/events";
 import type { AriEvent } from "@optimiq-voice/media-ari";
 import type { PlanNode, PlanNodeTable, RoutingArtifact } from "@optimiq-voice/routing";
@@ -28,6 +29,15 @@ import type { ChannelSnapshot } from "@optimiq-voice/telephony";
 const NO_DID_INDEX = {
 	organizationFor: async () => undefined,
 } as unknown as DidIndexSource;
+
+/**
+ * No mailbox responder — which is production's state too until the API side of
+ * `rpc.voicemail.v1.list` lands. A `*97` therefore announces the mailbox as unavailable rather
+ * than as empty, and `plan-walker.spec.ts` is where that distinction is asserted.
+ */
+const NO_MAILBOX = {
+	list: async () => ({ found: false, messages: [], reason: "no responder in this spec" }),
+} as unknown as VoicemailMailboxRpcSource;
 
 /**
  * The orchestrator's ROUTING behaviour: resolve on `StasisStart`, walk the plan, and enrich the
@@ -130,6 +140,8 @@ interface HarnessOptions {
 	readonly variables?: Record<string, string>;
 	/** A DID index for the cases that are about the lookup. Defaults to one that never resolves. */
 	readonly didIndex?: Pick<DidIndexSource, "organizationFor">;
+	/** A mailbox source for the `*97` cases. Defaults to one that answers "unreadable". */
+	readonly mailbox?: Pick<VoicemailMailboxRpcSource, "list">;
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -194,6 +206,9 @@ function harness(options: HarnessOptions = {}) {
 		events,
 		jetstream,
 		routing,
+		// No mailbox responder in a spec, which is also the production state until the API side
+		// lands: a `*97` announces the mailbox as unavailable rather than as empty.
+		(options.mailbox ?? NO_MAILBOX) as VoicemailMailboxRpcSource,
 		(options.didIndex ?? NO_DID_INDEX) as DidIndexSource,
 		signals,
 		...(fakeQueueOrchestratorArgs() as [never, never, never, never, never]),

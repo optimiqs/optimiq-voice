@@ -51,6 +51,12 @@ export const DIAGNOSTIC_CODES = [
 	"unresolvable-forward",
 	/** An extension has voicemail enabled but no mailbox exists for it. */
 	"missing-voicemail-box",
+	/** An entity names a music-on-hold class that is not in the snapshot, or is disabled. */
+	"dangling-moh-class",
+	/** A voicemail greeting row belongs to a mailbox that is not in the snapshot. */
+	"dangling-voicemail-greeting",
+	/** A mailbox's `pinHash` is not in the format `voicemail-pin.ts` defines, so it is not enforced. */
+	"invalid-pin-hash",
 
 	// --- matching tables ------------------------------------------------------------------------
 	/** Two entities claim the same internal number (extension 200 and ring group 200). */

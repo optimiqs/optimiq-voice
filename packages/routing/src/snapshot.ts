@@ -26,7 +26,9 @@
  * | `ringGroups`              | `ring_group`             | 1:1                                        |
  * | `ringGroupDestinations`   | `ring_group_destination` | flat list, joined by `ringGroupId`         |
  * | `queues`                  | `queue`                  | queue row only; agents/tiers are live state|
- * | `voicemailBoxes`          | `voicemail_box`          | mailbox number + owner, nothing else       |
+ * | `voicemailBoxes`          | `voicemail_box`          | mailbox number, owner, PIN digest          |
+ * | `voicemailGreetings`      | `voicemail_greeting`     | flat list, joined by `voicemailBoxId`      |
+ * | `mohClasses`              | `moh_class`              | id → name, so a plan node can carry the name|
  * | `conferences`             | `conference`             | room number + PIN presence                 |
  * | `parkLots`                | `park_lot`               | slot range + timeout branch                |
  * | `featureCodes`            | `feature_code`           | 1:1                                        |
@@ -39,6 +41,17 @@
  *
  * Rows the loader must NOT filter out: disabled ones. `enabled = false` is a routing fact (it
  * produces a `disabled-entity` diagnostic and a deliberately absent match), not an absence.
+ *
+ * # Optional collections
+ *
+ * Two collections — `mohClasses` and `voicemailGreetings` — are declared **optional** on
+ * {@link OrgRoutingSnapshot} and listed in {@link OPTIONAL_SNAPSHOT_COLLECTIONS}. That is a
+ * deliberate rollout affordance rather than a modelling accident: they were added after the API's
+ * snapshot loader was written, and a required field would have made this package impossible to
+ * release before the loader caught up. Absent and empty mean exactly the same thing everywhere —
+ * the compiler defaults them to `[]`, the canonical form hashes them as `[]`, and the plan nodes
+ * they enrich simply keep the field they would otherwise have gained. Once the loader populates
+ * them the optionality is free to go.
  */
 
 import type { DestinationInput } from "./destinations";
@@ -96,6 +109,28 @@ export type QueueStrategy = (typeof QUEUE_STRATEGIES)[number];
 export const IVR_OPTION_MATCH_KINDS = ["digit", "regex"] as const;
 
 export type IvrOptionMatchKind = (typeof IVR_OPTION_MATCH_KINDS)[number];
+
+/**
+ * Mirrored from `pbx-db` `voicemail-schema.ts`.
+ *
+ * A box has at most one **active** greeting per kind (a partial unique index enforces it), so the
+ * set is a small closed vocabulary rather than an ordering.
+ */
+export const VOICEMAIL_GREETING_KINDS = ["unavailable", "busy", "name", "temporary"] as const;
+
+export type VoicemailGreetingKind = (typeof VOICEMAIL_GREETING_KINDS)[number];
+
+/**
+ * Which greeting a call that is about to record hears, most specific first.
+ *
+ * `temporary` is the "I am on holiday until the 9th" greeting a user records from their phone, and
+ * it is meant to override the standing one for as long as it is active — so it wins. `name` is the
+ * directory recording and is never a call greeting, and `busy` is unreachable from here: an
+ * extension's busy and no-answer branches compile to the *same* `voicemail:<id>:leave` node, so
+ * the walker cannot tell the two apart at playback time. Splitting that node is a larger change
+ * than this one and is recorded as a follow-up rather than half-done here.
+ */
+export const VOICEMAIL_LEAVE_GREETING_PRECEDENCE = ["temporary", "unavailable"] as const;
 
 /** Mirrored from `pbx-db` `features-schema.ts`. */
 export const FEATURE_CODE_ACTIONS = [
@@ -349,6 +384,51 @@ export interface VoicemailBoxInput extends RoutingEntityInput {
 	readonly extensionId?: string | null;
 	readonly mwiEnabled: boolean;
 	readonly maxMessageSeconds: number;
+	/**
+	 * The mailbox PIN, as a digest in the `VOICEMAIL_PIN_HASH` format documented in
+	 * `voicemail-pin.ts`. Never a plaintext PIN, and never the caller's to invent.
+	 *
+	 * This is the one secret-shaped field in the snapshot, and it is here for the same reason the
+	 * rest of the snapshot is: the engine authenticates a `*97` on the call path, in a process that
+	 * holds no database handle. A digest whose parameters are strong enough to survive a leaked
+	 * artifact is the price of that, which is why the format is a *verified* contract rather than
+	 * "whatever the API happened to write". Email addresses, transcription flags and message
+	 * retention stay API-side: none of them changes what happens during a call.
+	 */
+	readonly pinHash?: string | null;
+}
+
+/**
+ * One recorded greeting belonging to a mailbox.
+ *
+ * `active` rather than a pointer on the box: `pbx-db` models it that way to avoid a circular
+ * foreign key, and it makes "activate this greeting" a single-table update. The compiler applies
+ * {@link VOICEMAIL_LEAVE_GREETING_PRECEDENCE} over the active rows.
+ *
+ * Not a {@link RoutingEntityInput}: greetings have no `enabled` column. `active` is the flag, and
+ * it means something different — an inactive greeting is a kept recording, not a switched-off one.
+ */
+export interface VoicemailGreetingInput {
+	readonly id: string;
+	readonly voicemailBoxId: string;
+	readonly kind: VoicemailGreetingKind;
+	/** Object-storage key for the audio. Never a filesystem path and never a `prompt` row id. */
+	readonly objectKey: string;
+	readonly active: boolean;
+	readonly durationMs?: number | null;
+	readonly label?: string | null;
+}
+
+/**
+ * A music-on-hold class.
+ *
+ * Only the name, because the name is the only thing routing needs: every `mohClassId` in this
+ * snapshot is a row id, and every media server addresses a class by its NAME. Resolving the two at
+ * compile time is what keeps a database round trip off the call path. The stream URI, the sample
+ * rate and the file list belong to the media server's own provisioning, not to a routing decision.
+ */
+export interface MohClassInput extends RoutingEntityInput {
+	readonly name: string;
 }
 
 export interface ConferenceInput extends RoutingEntityInput {
@@ -432,6 +512,10 @@ export interface OrgRoutingSnapshot {
 	readonly ringGroupDestinations: readonly RingGroupDestinationInput[];
 	readonly queues: readonly QueueInput[];
 	readonly voicemailBoxes: readonly VoicemailBoxInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly voicemailGreetings?: readonly VoicemailGreetingInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly mohClasses?: readonly MohClassInput[];
 	readonly conferences: readonly ConferenceInput[];
 	readonly parkLots: readonly ParkLotInput[];
 	readonly featureCodes: readonly FeatureCodeInput[];
@@ -460,6 +544,8 @@ export const SNAPSHOT_COLLECTIONS = [
 	"ringGroupDestinations",
 	"queues",
 	"voicemailBoxes",
+	"voicemailGreetings",
+	"mohClasses",
 	"conferences",
 	"parkLots",
 	"featureCodes",
@@ -467,6 +553,44 @@ export const SNAPSHOT_COLLECTIONS = [
 ] as const satisfies readonly (keyof OrgRoutingSnapshot)[];
 
 export type SnapshotCollection = (typeof SNAPSHOT_COLLECTIONS)[number];
+
+/**
+ * Collections a snapshot may omit entirely.
+ *
+ * Everything that walks {@link SNAPSHOT_COLLECTIONS} — the shape assertion, the canonical form, the
+ * compiler's indexes — reads through {@link snapshotCollection}, so "absent" and "empty" are the
+ * same input everywhere and neither the hash nor the artifact can depend on which one a loader
+ * produced.
+ */
+export const OPTIONAL_SNAPSHOT_COLLECTIONS = [
+	"voicemailGreetings",
+	"mohClasses",
+] as const satisfies readonly SnapshotCollection[];
+
+export type OptionalSnapshotCollection = (typeof OPTIONAL_SNAPSHOT_COLLECTIONS)[number];
+
+const OPTIONAL_SNAPSHOT_COLLECTION_SET: ReadonlySet<string> = new Set(
+	OPTIONAL_SNAPSHOT_COLLECTIONS,
+);
+
+export function isOptionalSnapshotCollection(
+	collection: string,
+): collection is OptionalSnapshotCollection {
+	return OPTIONAL_SNAPSHOT_COLLECTION_SET.has(collection);
+}
+
+/**
+ * One collection's rows, with an absent optional collection read as empty.
+ *
+ * The union of the seventeen row types has no useful common supertype beyond "carries an `id`",
+ * which is exactly what every caller here needs (they sort by it), so that is what this returns.
+ */
+export function snapshotCollection(
+	snapshot: OrgRoutingSnapshot,
+	collection: SnapshotCollection,
+): readonly { readonly id: string }[] {
+	return (snapshot[collection] ?? []) as readonly { readonly id: string }[];
+}
 
 /** An empty but structurally complete snapshot. Handy for tests and for a brand-new tenant. */
 export function emptySnapshot(organizationId: string): OrgRoutingSnapshot {
@@ -485,6 +609,8 @@ export function emptySnapshot(organizationId: string): OrgRoutingSnapshot {
 		ringGroupDestinations: [],
 		queues: [],
 		voicemailBoxes: [],
+		voicemailGreetings: [],
+		mohClasses: [],
 		conferences: [],
 		parkLots: [],
 		featureCodes: [],

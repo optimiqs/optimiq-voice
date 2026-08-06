@@ -11,6 +11,7 @@ import type { CallEventPublisher } from "../nats/call-event-publisher.service";
 import type { JetStreamService } from "../nats/jetstream.service";
 import type { DidIndexSource } from "../routing/did-index.source";
 import type { RoutingArtifactSource } from "../routing/routing-artifact.source";
+import type { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
 import type { CallEventOf, CdrLegWriteEnvelope } from "@optimiq-voice/events";
 import type { AriEvent } from "@optimiq-voice/media-ari";
 import type { ChannelSnapshot } from "@optimiq-voice/telephony";
@@ -26,6 +27,15 @@ import type { ChannelSnapshot } from "@optimiq-voice/telephony";
 const NO_DID_INDEX = {
 	organizationFor: async () => undefined,
 } as unknown as DidIndexSource;
+
+/**
+ * No mailbox responder — which is production's state too until the API side of
+ * `rpc.voicemail.v1.list` lands. A `*97` therefore announces the mailbox as unavailable rather
+ * than as empty, and `plan-walker.spec.ts` is where that distinction is asserted.
+ */
+const NO_MAILBOX = {
+	list: async () => ({ found: false, messages: [], reason: "no responder in this spec" }),
+} as unknown as VoicemailMailboxRpcSource;
 
 /**
  * Orchestrator specs, driven entirely by fakes.
@@ -125,6 +135,7 @@ function harness(env: EngineEnv = fakeEnv()) {
 		events,
 		jetstream,
 		routing,
+		NO_MAILBOX,
 		NO_DID_INDEX,
 		signals,
 		...(fakeQueueOrchestratorArgs() as [never, never, never, never, never]),
@@ -488,6 +499,7 @@ describe("resilience", () => {
 			failing,
 			h.jetstream,
 			h.routing,
+			NO_MAILBOX,
 			NO_DID_INDEX,
 			h.signals,
 			...(fakeQueueOrchestratorArgs() as [never, never, never, never, never]),

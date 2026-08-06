@@ -4,6 +4,8 @@ import {
 	CALL_BLOCK_DIRECTIONS,
 	emptySnapshot,
 	FEATURE_CODE_ACTIONS,
+	isOptionalSnapshotCollection,
+	OPTIONAL_SNAPSHOT_COLLECTIONS,
 	QUEUE_STRATEGIES,
 	RECORD_POLICIES,
 	RING_GROUP_STRATEGIES,
@@ -125,8 +127,23 @@ describe("emptySnapshot", () => {
 		}
 	});
 
-	it("lists seventeen collections", () => {
-		expect(SNAPSHOT_COLLECTIONS).toHaveLength(17);
+	it("lists nineteen collections", () => {
+		expect(SNAPSHOT_COLLECTIONS).toHaveLength(19);
+	});
+
+	it("marks exactly the collections a loader may omit as optional", () => {
+		expect([...OPTIONAL_SNAPSHOT_COLLECTIONS]).toEqual(["voicemailGreetings", "mohClasses"]);
+	});
+
+	it("only marks real collections optional", () => {
+		for (const collection of OPTIONAL_SNAPSHOT_COLLECTIONS) {
+			expect(SNAPSHOT_COLLECTIONS).toContain(collection);
+			expect(isOptionalSnapshotCollection(collection)).toBe(true);
+		}
+	});
+
+	it("does not mark a required collection optional", () => {
+		expect(isOptionalSnapshotCollection("extensions")).toBe(false);
 	});
 
 	it("has no duplicate collections", () => {

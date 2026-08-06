@@ -152,8 +152,40 @@ export const engineEnvSchema = z.object({
 	/** Played when a plan names audio this release cannot resolve, and by the unimplemented kinds. */
 	ENGINE_UNAVAILABLE_ANNOUNCEMENT: z.string().min(1).default("sound:unavailable"),
 
-	/** Played before a voicemail recording starts. Replaced by per-box greetings in the next wave. */
+	/** Played before a voicemail recording starts, when the box has no greeting of its own. */
 	ENGINE_VOICEMAIL_GREETING: z.string().min(1).default("sound:unavailable"),
+
+	/**
+	 * Absolute path, INSIDE the media server, at which the object store is mounted.
+	 *
+	 * The compiler embeds a voicemail greeting as `object://<objectKey>` and a voicemail message
+	 * arrives from the read model the same way. **ARI has no HTTP media scheme** — `play` takes
+	 * `sound:`, `recording:`, `number:`, `digits:`, `characters:`, `tone:` and nothing else — so the
+	 * only way an object becomes playable is for the store to be visible to Asterisk as a
+	 * filesystem, at which point `sound:<absolute path>` works.
+	 *
+	 * Empty (the default, and the state of this repo's compose stack, which mounts no such volume)
+	 * means those refs resolve to nothing and the engine falls back to
+	 * `ENGINE_VOICEMAIL_GREETING` / `ENGINE_UNAVAILABLE_ANNOUNCEMENT`, saying so in the walk notes.
+	 * Deploying per-box greetings therefore means mounting the same directory the API serves
+	 * recordings from (`CDR_RECORDING_ROOT`) into the Asterisk container and pointing this at it.
+	 */
+	ENGINE_MEDIA_OBJECT_ROOT: z.string().default(""),
+
+	/** Asked for before a mailbox that has a PIN is opened. In Asterisk's core sound package. */
+	ENGINE_VOICEMAIL_PIN_PROMPT: z.string().min(1).default("sound:vm-password"),
+
+	/** Played after a wrong PIN, before the next attempt. Also core. */
+	ENGINE_VOICEMAIL_PIN_INVALID_PROMPT: z.string().min(1).default("sound:vm-incorrect"),
+
+	/** PIN attempts before the call is refused. A four-digit secret needs a lockout. */
+	ENGINE_VOICEMAIL_PIN_ATTEMPTS: z.coerce.number().int().min(1).max(10).default(3),
+
+	/** How long to wait for a control digit after a voicemail message finishes playing. */
+	ENGINE_VOICEMAIL_MENU_TIMEOUT_MS: z.coerce.number().int().min(500).max(60_000).default(5_000),
+
+	/** Deadline for `rpc.voicemail.v1.list`. The caller is already connected and listening. */
+	ENGINE_VOICEMAIL_RPC_TIMEOUT_MS: z.coerce.number().int().min(100).max(30_000).default(3_000),
 
 	/** Container voicemail is recorded in. `wav` is what every downstream tool can already read. */
 	ENGINE_RECORDING_FORMAT: z.enum(["wav", "gsm", "ulaw", "alaw", "g722"]).default("wav"),

@@ -73,6 +73,15 @@ describe("invalidation contract", () => {
 		expect(affectsRouting("ivr_menu_option")).toBe(true);
 	});
 
+	it("evicts on a greeting or a music-on-hold rename", () => {
+		// Both are compiled INTO plan nodes, so a cached artifact survives a rename as a name nobody
+		// changed and a greeting nobody re-recorded. That is exactly the class of staleness this
+		// contract exists to prevent, and it is worth an explicit assertion rather than relying on
+		// the derived "every kind has a table" check above to have caught the omission.
+		expect(affectsRouting("voicemail_greeting")).toBe(true);
+		expect(affectsRouting("moh_class")).toBe(true);
+	});
+
 	it("ignores a table routing does not read", () => {
 		// A voicemail message, a CDR row or an agent status change must not evict a hot artifact.
 		expect(affectsRouting("voicemail_message")).toBe(false);

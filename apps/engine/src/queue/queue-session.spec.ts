@@ -227,10 +227,26 @@ describe("joining a queue", () => {
 		expect(h.timeline.indexOf("play:sound:welcome")).toBeLessThan(h.timeline.indexOf("moh:start"));
 	});
 
-	it("starts music on hold with the queue's class", async () => {
-		const h = harness({ node: { mohClassId: "jazz" }, dials: [{ kind: "answer" }] });
+	it("starts music on hold with the class NAME the compiler resolved", async () => {
+		const h = harness({
+			node: { mohClassId: "0195c0f0-1c2f-7000-8000-00000000m0h1", mohClass: "jazz" },
+			dials: [{ kind: "answer" }],
+		});
 		await h.session.run();
 		expect(h.timeline).toContain("moh:start:jazz");
+	});
+
+	it("asks for no class at all when only the row id is known", async () => {
+		// An artifact compiled before the compiler resolved names, or one whose class was deleted.
+		// Passing the UUID through would select the media server's default class anyway — silently,
+		// and with no error — so `undefined` says the same thing without pretending otherwise.
+		const h = harness({
+			node: { mohClassId: "0195c0f0-1c2f-7000-8000-00000000m0h1" },
+			dials: [{ kind: "answer" }],
+		});
+		await h.session.run();
+		expect(h.timeline).toContain("moh:start");
+		expect(h.timeline.some((entry) => entry.startsWith("moh:start:"))).toBe(false);
 	});
 
 	it("stops the music before an agent's phone is rung", async () => {

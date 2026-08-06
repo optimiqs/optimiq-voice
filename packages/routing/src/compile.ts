@@ -44,8 +44,13 @@ import {
 	validateDigitManipulation,
 } from "./patterns";
 import { planNodeReferences } from "./plan";
-import { SNAPSHOT_COLLECTIONS } from "./snapshot";
+import {
+	isOptionalSnapshotCollection,
+	SNAPSHOT_COLLECTIONS,
+	VOICEMAIL_LEAVE_GREETING_PRECEDENCE,
+} from "./snapshot";
 import { compileTimePredicate, isKnownTimezone, validateTimePredicate } from "./time-conditions";
+import { voicemailPinHashIssue } from "./voicemail-pin";
 import type {
 	CompiledCallBlockRule,
 	CompiledRoutingSettings,
@@ -72,9 +77,12 @@ import type {
 	CallBlockAction,
 	ExtensionInput,
 	IvrMenuOptionInput,
+	MohClassInput,
 	OrgRoutingSnapshot,
 	RingGroupDestinationInput,
 	TimeConditionRuleInput,
+	VoicemailGreetingInput,
+	VoicemailGreetingKind,
 } from "./snapshot";
 import type { CompiledTimeCondition, CompiledTimeRule } from "./time-conditions";
 import type { HangupCause } from "@optimiq-voice/telephony";
@@ -183,7 +191,14 @@ function assertSnapshotShape(snapshot: OrgRoutingSnapshot): void {
 		throw new RoutingSnapshotError("organizationId", "must be a non-empty string");
 	}
 	for (const collection of SNAPSHOT_COLLECTIONS) {
-		if (!Array.isArray(snapshot[collection])) {
+		const rows = snapshot[collection];
+		// An optional collection may be absent — that is the whole point of it being optional, and it
+		// is how this package stays compilable against a loader that has not learned to load it yet.
+		// A collection that is PRESENT and not an array is still a malformed snapshot.
+		if (rows === undefined && isOptionalSnapshotCollection(collection)) {
+			continue;
+		}
+		if (!Array.isArray(rows)) {
 			throw new RoutingSnapshotError(collection, "must be an array");
 		}
 	}
@@ -221,6 +236,9 @@ class Compiler {
 		string,
 		OrgRoutingSnapshot["timeConditions"][number]
 	>();
+	private readonly mohClassesById = new Map<string, MohClassInput>();
+	/** Active greetings, keyed by `<voicemailBoxId>:<kind>` — at most one row per pair. */
+	private readonly activeGreetings = new Map<string, VoicemailGreetingInput>();
 	private readonly ivrOptionsByMenu = new Map<string, IvrMenuOptionInput[]>();
 	private readonly ringMembersByGroup = new Map<string, RingGroupDestinationInput[]>();
 	private readonly timeRulesByCondition = new Map<string, TimeConditionRuleInput[]>();
@@ -312,6 +330,10 @@ class Compiler {
 		for (const condition of sortById(this.snapshot.timeConditions)) {
 			this.timeConditionInputsById.set(condition.id, condition);
 		}
+		for (const mohClass of sortById(this.snapshot.mohClasses ?? [])) {
+			this.mohClassesById.set(mohClass.id, mohClass);
+		}
+		this.indexVoicemailGreetings();
 		for (const option of sortByOrdinal(this.snapshot.ivrMenuOptions)) {
 			pushInto(this.ivrOptionsByMenu, option.ivrMenuId, option);
 		}
@@ -680,6 +702,7 @@ class Compiler {
 			timeoutSeconds: extension.callTimeoutSeconds,
 			doNotDisturb: extension.doNotDisturb,
 			mohClassId: extension.mohClassId ?? undefined,
+			mohClass: this.mohClassName(extension.mohClassId, subject, "mohClassId"),
 			forwardAllNodeId: extension.forwardAllEnabled
 				? this.forwardNode(extension.forwardAllDestination, subject, "forwardAllDestination")
 				: undefined,
@@ -963,6 +986,7 @@ class Compiler {
 			confirmPromptId: group.confirmPromptId ?? undefined,
 			callerIdNamePrefix: group.callerIdNamePrefix ?? undefined,
 			mohClassId: group.mohClassId ?? undefined,
+			mohClass: this.mohClassName(group.mohClassId, subject, "mohClassId"),
 			ringbackPromptId: group.ringbackPromptId ?? undefined,
 			members,
 			timeoutNodeId: this.namedDestinationNode(group, "timeout", subject) ?? undefined,
@@ -997,6 +1021,7 @@ class Compiler {
 			queueId: entry.id,
 			strategy: entry.strategy,
 			mohClassId: entry.mohClassId ?? undefined,
+			mohClass: this.mohClassName(entry.mohClassId, subject, "mohClassId"),
 			greetingPromptId: entry.greetingPromptId ?? undefined,
 			announcePromptId: entry.announcePromptId ?? undefined,
 			maxWaitSeconds: entry.maxWaitSeconds,
@@ -1035,6 +1060,14 @@ class Compiler {
 			return id;
 		}
 		this.claimed.add(id);
+		const subject: DiagnosticSubject = {
+			kind: "voicemail-box",
+			id: box.id,
+			name: box.mailboxNumber,
+		};
+		// Only `leave` plays a greeting. A `check` opens the mailbox for its owner, and playing them
+		// their own "I am not at my desk" recording on the way in would be theatre.
+		const greeting = mode === "leave" ? this.activeLeaveGreeting(box.id) : undefined;
 		this.nodes.set(
 			id,
 			compact({
@@ -1046,9 +1079,132 @@ class Compiler {
 				mode,
 				maxMessageSeconds: box.maxMessageSeconds,
 				mwiEnabled: box.mwiEnabled,
+				greetingMedia: greeting === undefined ? undefined : objectMediaRef(greeting.objectKey),
+				greetingKind: greeting?.kind,
+				pinHash: this.voicemailPinHash(box, subject),
 			}) as PlanNode,
 		);
 		return id;
+	}
+
+	/**
+	 * The greeting a caller about to record hears, by {@link VOICEMAIL_LEAVE_GREETING_PRECEDENCE}.
+	 *
+	 * A box with no active greeting is the normal state — most mailboxes are never personalised —
+	 * so its absence is not a diagnostic. The engine falls back to its deployment-wide announcement,
+	 * which is exactly what it did before greetings were compiled at all.
+	 */
+	private activeLeaveGreeting(voicemailBoxId: string): VoicemailGreetingInput | undefined {
+		for (const kind of VOICEMAIL_LEAVE_GREETING_PRECEDENCE) {
+			const greeting = this.activeGreetings.get(greetingKey(voicemailBoxId, kind));
+			if (greeting !== undefined && greeting.objectKey.trim().length > 0) {
+				return greeting;
+			}
+		}
+		return undefined;
+	}
+
+	/**
+	 * The box's PIN digest, if it is one.
+	 *
+	 * A digest this compiler cannot parse is *not* embedded, and the mailbox therefore keeps the
+	 * authentication it had before — see the long note in `voicemail-pin.ts` for why that is a
+	 * warning rather than an error or a silent pass.
+	 */
+	private voicemailPinHash(
+		box: OrgRoutingSnapshot["voicemailBoxes"][number],
+		subject: DiagnosticSubject,
+	): string | undefined {
+		const raw = box.pinHash ?? undefined;
+		if (raw === undefined || raw.trim() === "") {
+			return undefined;
+		}
+		const issue = voicemailPinHashIssue(raw);
+		if (issue !== undefined) {
+			this.bag.warning(
+				"invalid-pin-hash",
+				`Mailbox ${box.mailboxNumber} has a PIN digest this release cannot read (${issue}); the PIN is NOT enforced and the mailbox falls back to authenticating by the calling extension.`,
+				subject,
+				"pinHash",
+			);
+			return undefined;
+		}
+		return raw.trim();
+	}
+
+	/**
+	 * Indexes the active greetings, one per (box, kind).
+	 *
+	 * `pbx-db` enforces that uniqueness with a partial unique index, so a second active row for a
+	 * pair cannot exist in a healthy database — but the snapshot is data, not a database, and a
+	 * compiler that assumed the constraint would produce a different artifact depending on which
+	 * row the loader happened to return first. Sorting by id and keeping the FIRST makes the choice
+	 * deterministic whatever arrives.
+	 */
+	private indexVoicemailGreetings(): void {
+		for (const greeting of sortById(this.snapshot.voicemailGreetings ?? [])) {
+			if (!greeting.active) {
+				continue;
+			}
+			if (!this.voicemailById.has(greeting.voicemailBoxId)) {
+				this.bag.warning(
+					"dangling-voicemail-greeting",
+					`Voicemail greeting "${greeting.id}" belongs to mailbox "${greeting.voicemailBoxId}", which is not in this snapshot; it was ignored.`,
+					{ kind: "voicemail-greeting", id: greeting.id },
+					"voicemailBoxId",
+				);
+				continue;
+			}
+			const key = greetingKey(greeting.voicemailBoxId, greeting.kind);
+			if (!this.activeGreetings.has(key)) {
+				this.activeGreetings.set(key, greeting);
+			}
+		}
+	}
+
+	/**
+	 * A `moh_class` row id resolved to the NAME a media server will accept.
+	 *
+	 * Warning rather than error on both misses: music on hold is decoration. A tenant who deletes a
+	 * class that four ring groups still name has a configuration worth flagging, not a PBX that
+	 * should refuse to route calls until they fix it — the caller hears the media server's default
+	 * class, which is a perfectly good hold experience.
+	 */
+	private mohClassName(
+		mohClassId: string | null | undefined,
+		subject: DiagnosticSubject,
+		path: string,
+	): string | undefined {
+		const id = mohClassId ?? undefined;
+		if (id === undefined || id.trim() === "") {
+			return undefined;
+		}
+		// Nothing to resolve against: a loader that does not yet load the collection is a rollout
+		// state, not a dangling reference, and reporting every MOH id as broken would bury the real
+		// diagnostics in noise on every tenant at once.
+		if (this.snapshot.mohClasses === undefined) {
+			return undefined;
+		}
+		const mohClass = this.mohClassesById.get(id);
+		if (mohClass === undefined) {
+			this.bag.warning(
+				"dangling-moh-class",
+				`Music-on-hold class "${id}" is not in this snapshot; callers hear the media server's default class.`,
+				subject,
+				path,
+			);
+			return undefined;
+		}
+		if (!mohClass.enabled) {
+			this.bag.warning(
+				"dangling-moh-class",
+				`Music-on-hold class "${mohClass.name}" is disabled; callers hear the media server's default class.`,
+				subject,
+				path,
+			);
+			return undefined;
+		}
+		return mohClass.name;
 	}
 
 	private conferenceNodeById(
@@ -1072,6 +1228,7 @@ class Compiler {
 			return id;
 		}
 		this.claimed.add(id);
+		const subject: DiagnosticSubject = { kind: "conference", id: room.id, name: room.name };
 		this.nodes.set(
 			id,
 			compact({
@@ -1085,6 +1242,7 @@ class Compiler {
 				waitForModerator: room.waitForModerator,
 				recordEnabled: room.recordEnabled,
 				mohClassId: room.mohClassId ?? undefined,
+				mohClass: this.mohClassName(room.mohClassId, subject, "mohClassId"),
 			}) as PlanNode,
 		);
 		return id;
@@ -1119,6 +1277,7 @@ class Compiler {
 				slotEnd: lot.slotEnd,
 				timeoutSeconds: lot.timeoutSeconds,
 				mohClassId: lot.mohClassId ?? undefined,
+				mohClass: this.mohClassName(lot.mohClassId, subject, "mohClassId"),
 				timeoutNodeId: this.namedDestinationNode(lot, "timeout", subject) ?? undefined,
 			}) as PlanNode,
 		);
@@ -2133,6 +2292,22 @@ function outboundSpecificity(rule: OutboundRule): number {
 
 function allowFirst(action: CallBlockAction): number {
 	return action === "allow" ? 0 : 1;
+}
+
+function greetingKey(voicemailBoxId: string, kind: VoicemailGreetingKind): string {
+	return `${voicemailBoxId}:${kind}`;
+}
+
+/**
+ * An object-storage key as a domain `MediaRef`.
+ *
+ * `object://` rather than `file://` because the key is not a path: it is a key into whatever the
+ * deployment's object store is, and only the reader knows where that store is mounted or how it is
+ * served. Rendering it as a path here would bake one deployment's layout into every artifact, and
+ * artifacts outlive deployments.
+ */
+function objectMediaRef(objectKey: string): string {
+	return `object://${objectKey.trim().replace(/^\/+/, "")}`;
 }
 
 function sortById<T extends { readonly id: string }>(rows: readonly T[]): readonly T[] {

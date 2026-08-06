@@ -16,6 +16,7 @@ import { CallSignalBus, legSignalKey, recordingSignalKey } from "../routing/call
 import { DidIndexSource } from "../routing/did-index.source";
 import { PlanWalker } from "../routing/plan-walker";
 import { RoutingArtifactSource } from "../routing/routing-artifact.source";
+import { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
 import { dtmfEventFrom } from "../verbs/dtmf-inbox";
 import { DtmfRegistry } from "../verbs/dtmf-registry";
 import {
@@ -113,6 +114,7 @@ export class ChannelOrchestrator {
 		private readonly events: CallEventPublisher,
 		private readonly jetstream: JetStreamService,
 		private readonly routing: RoutingArtifactSource,
+		private readonly mailbox: VoicemailMailboxRpcSource,
 		private readonly didIndex: DidIndexSource,
 		private readonly signals: CallSignalBus,
 		private readonly queueMembership: QueueMembershipSource,
@@ -530,6 +532,7 @@ export class ChannelOrchestrator {
 			peerLegId: legIdForAriChannel,
 			legs: this.legHooksFor(aggregate),
 			voicemail: this.voicemailPortFor(aggregate),
+			mailbox: this.mailbox,
 			// The ACD plane, passed as a bundle rather than five constructor arguments to the walker:
 			// a queue node needs all five or none of them, and a walk that had four would fail in the
 			// middle of somebody's hold music rather than at construction.
@@ -807,9 +810,14 @@ export class ChannelOrchestrator {
 			recordingFormat: this.env.ENGINE_RECORDING_FORMAT,
 			voicemailGreeting: this.env.ENGINE_VOICEMAIL_GREETING,
 			unavailableAnnouncement: this.env.ENGINE_UNAVAILABLE_ANNOUNCEMENT,
+			voicemailPinPrompt: this.env.ENGINE_VOICEMAIL_PIN_PROMPT,
+			voicemailPinInvalidPrompt: this.env.ENGINE_VOICEMAIL_PIN_INVALID_PROMPT,
+			voicemailPinAttempts: this.env.ENGINE_VOICEMAIL_PIN_ATTEMPTS,
+			voicemailMenuTimeoutMs: this.env.ENGINE_VOICEMAIL_MENU_TIMEOUT_MS,
 			mediaRefs: {
 				promptPrefix: this.env.ENGINE_PROMPT_MEDIA_PREFIX,
 				fallbackMedia: this.env.ENGINE_UNAVAILABLE_ANNOUNCEMENT,
+				objectMediaRoot: this.env.ENGINE_MEDIA_OBJECT_ROOT,
 			},
 		};
 	}

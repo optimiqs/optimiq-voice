@@ -12,6 +12,12 @@
 
 import { compileRoutingArtifact, tryCompileRoutingArtifact } from "./compile";
 import { emptySnapshot } from "./snapshot";
+import {
+	DEFAULT_VOICEMAIL_PIN_SCRYPT_PARAMS,
+	DERIVED_KEY_BYTES,
+	formatVoicemailPinHash,
+	MIN_SALT_BYTES,
+} from "./voicemail-pin";
 import type { RoutingArtifact } from "./artifact";
 import type { CompileResult } from "./compile";
 import type {
@@ -22,6 +28,7 @@ import type {
 	InboundRouteInput,
 	IvrMenuInput,
 	IvrMenuOptionInput,
+	MohClassInput,
 	OrgRoutingSnapshot,
 	OutboundRouteInput,
 	ParkLotInput,
@@ -33,6 +40,7 @@ import type {
 	TimeConditionRuleInput,
 	TrunkInput,
 	VoicemailBoxInput,
+	VoicemailGreetingInput,
 } from "./snapshot";
 
 export const ORG_ID = "org-0001";
@@ -223,6 +231,48 @@ export function aVoicemailBox(overrides: Partial<VoicemailBoxInput> = {}): Voice
 		maxMessageSeconds: 300,
 		...overrides,
 	};
+}
+
+export function aVoicemailGreeting(
+	overrides: Partial<VoicemailGreetingInput> = {},
+): VoicemailGreetingInput {
+	return {
+		id: "vmg-1",
+		voicemailBoxId: "vm-1",
+		kind: "unavailable",
+		objectKey: "org-0001/voicemail/vm-1/unavailable.wav",
+		active: true,
+		...overrides,
+	};
+}
+
+export function aMohClass(overrides: Partial<MohClassInput> = {}): MohClassInput {
+	return {
+		id: "moh-1",
+		enabled: true,
+		name: "default-hold",
+		...overrides,
+	};
+}
+
+/**
+ * A syntactically valid PIN digest.
+ *
+ * The bytes are not the digest of any PIN — nothing in this package hashes, and a fixture that
+ * pretended otherwise would be a lie a spec could come to depend on. What it is valid *for* is the
+ * only thing the compiler checks: the format contract in `voicemail-pin.ts`.
+ */
+export const A_PIN_HASH = formatVoicemailPinHash(
+	DEFAULT_VOICEMAIL_PIN_SCRYPT_PARAMS,
+	base64Zeroes(MIN_SALT_BYTES),
+	base64Zeroes(DERIVED_KEY_BYTES),
+);
+
+/** Base64 of `bytes` zero bytes — `A` is the zero sextet, `=` is the padding. */
+function base64Zeroes(bytes: number): string {
+	const groups = Math.ceil(bytes / 3);
+	const padding = groups * 3 - bytes;
+	return "A".repeat(groups * 4 - padding) + "=".repeat(padding);
 }
 
 export function aConference(overrides: Partial<ConferenceInput> = {}): ConferenceInput {

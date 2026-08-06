@@ -3,8 +3,9 @@ import { evaluateTimeCondition, matchPattern } from "@optimiq-voice/routing";
 import { RETRYABLE_HANGUP_CAUSES } from "@optimiq-voice/telephony";
 import { QueueSession } from "../queue/queue-session";
 import { legSignalKey, recordingSignalKey } from "./call-signals";
-import { DEFAULT_MEDIA_REF_SETTINGS, resolveMediaRef } from "./media-refs";
+import { DEFAULT_MEDIA_REF_SETTINGS, resolveMediaRef, translateMediaRef } from "./media-refs";
 import { planDestinationOf } from "./plan-destination";
+import { verifyVoicemailPin } from "./voicemail-pin";
 import type { MediaPort } from "../ari/media-port";
 import type {
 	QueueCallPort,
@@ -111,10 +112,23 @@ export interface PlanWalkerSettings {
 	/** Hard budget on nodes visited in one walk. A cycle hits it instead of running forever. */
 	readonly maxPlanSteps: number;
 	readonly recordingFormat: string;
-	/** Played before a voicemail recording starts. */
+	/** Played before a voicemail recording starts, when the box has no greeting of its own. */
 	readonly voicemailGreeting: string;
 	/** Played for the node kinds this slice does not implement. */
 	readonly unavailableAnnouncement: string;
+	/** Asked for before a mailbox with a PIN is opened. */
+	readonly voicemailPinPrompt: string;
+	/** Played after a wrong PIN, before the next attempt. */
+	readonly voicemailPinInvalidPrompt: string;
+	/** Attempts before the call is refused. A four-digit secret needs a lockout. */
+	readonly voicemailPinAttempts: number;
+	readonly voicemailPinMaxDigits: number;
+	readonly voicemailPinTimeoutMs: number;
+	readonly voicemailPinInterDigitTimeoutMs: number;
+	/** How long to wait for a control digit after a message finishes playing. */
+	readonly voicemailMenuTimeoutMs: number;
+	/** Replays of one message before `2` stops being honoured. */
+	readonly voicemailMaxReplays: number;
 	readonly mediaRefs: MediaRefSettings;
 }
 
@@ -128,6 +142,16 @@ export const DEFAULT_PLAN_WALKER_SETTINGS: PlanWalkerSettings = {
 	recordingFormat: "wav",
 	voicemailGreeting: "sound:unavailable",
 	unavailableAnnouncement: "sound:unavailable",
+	// `vm-password` and `vm-incorrect` are in Asterisk's core sound package, so a PIN challenge
+	// works on a stock install with no prompt pack — the same standard the digit readback holds to.
+	voicemailPinPrompt: "sound:vm-password",
+	voicemailPinInvalidPrompt: "sound:vm-incorrect",
+	voicemailPinAttempts: 3,
+	voicemailPinMaxDigits: 10,
+	voicemailPinTimeoutMs: 10_000,
+	voicemailPinInterDigitTimeoutMs: 3_000,
+	voicemailMenuTimeoutMs: 5_000,
+	voicemailMaxReplays: 3,
 	mediaRefs: DEFAULT_MEDIA_REF_SETTINGS,
 };
 
@@ -167,6 +191,11 @@ export interface PlanWalkerDependencies {
 	 */
 	readonly voicemail?: VoicemailPort;
 	/**
+	 * Where the `*97` menu reads a mailbox from. Absent means a check authenticates and then
+	 * announces the mailbox as unavailable — never as empty.
+	 */
+	readonly mailbox?: VoicemailMailboxSource;
+	/**
 	 * The ACD plane: the roster source, the agent state machine, the queue event publisher and the
 	 * per-process line and cursor.
 	 *
@@ -204,6 +233,55 @@ export interface VoicemailMessage {
 /** The seam between the walk and the backbone, for voicemail specifically. */
 export interface VoicemailPort {
 	messageLeft(message: VoicemailMessage): Promise<void>;
+}
+
+/** What the `*97` menu asks for. */
+export interface VoicemailListingRequest {
+	readonly organizationId: string;
+	readonly voicemailBoxId: string;
+	/** The mailbox the walk authenticated, for the responder to check the box id against. */
+	readonly mailboxNumber: string;
+	readonly callId?: string;
+}
+
+/** One message, as the menu needs it. `media` is a domain `MediaRef`, already rendered. */
+export interface VoicemailListingMessage {
+	readonly messageId: string;
+	readonly media: string;
+	readonly durationMs: number;
+	readonly receivedAt: string;
+	readonly callerIdNumber?: string;
+	readonly callerIdName?: string;
+}
+
+/**
+ * A mailbox's contents.
+ *
+ * `found` is separate from an empty `messages` and the separation is the whole point: "you have no
+ * messages" told to somebody who has nine is worse than any error, so a source that could not read
+ * the mailbox says so rather than returning nothing and letting the caller draw a conclusion.
+ */
+export interface VoicemailListing {
+	readonly found: boolean;
+	/** Newest first. */
+	readonly messages: readonly VoicemailListingMessage[];
+	readonly reason?: string;
+}
+
+/**
+ * Where the `*97` menu gets a mailbox's messages.
+ *
+ * A port rather than a direct RPC call for the usual reason — a spec should not need a broker — and
+ * for one specific to this feature: "no responder" is a state the menu has to handle correctly and
+ * will keep having to handle until the API side lands, so it must be as easy to write a test for as
+ * a successful listing is.
+ */
+export interface VoicemailMailboxSource {
+	/**
+	 * @throws when the source could not be reached at all. The walk catches it and treats it exactly
+	 * as `found: false` — a broker timeout and a responder saying "no" are the same fact to a caller.
+	 */
+	list(request: VoicemailListingRequest): Promise<VoicemailListing>;
 }
 
 /** One leg the walk is about to create, as the orchestrator needs to file it. */
@@ -917,19 +995,24 @@ export class PlanWalker {
 	 * The publish carries the message id the engine mints, so the consumer's insert is idempotent
 	 * over a redelivery rather than producing two copies of one message.
 	 *
+	 * **The greeting is the box's own** when the compiler embedded one: `VoicemailPlanNode` now
+	 * carries `greetingMedia` (the active `voicemail_greeting`, as an `object://` ref) and the
+	 * walker plays it. Two things can make it fall back to the deployment-wide announcement, and
+	 * both are legitimate rather than failures: the box has no active greeting (most do not), or the
+	 * deployment has not mounted its object store inside the media server, in which case
+	 * `resolveMediaRef` cannot render the ref — see the header of `media-refs.ts` for why there is
+	 * no HTTP alternative. Either way the fallback is noted, not silent.
+	 *
 	 * ## What is not, and why
 	 *
-	 * **The greeting is still the deployment-wide one.** `VoicemailPlanNode` carries the box's id,
-	 * number, `maxMessageSeconds` and `mwiEnabled` — but not the object key of its active greeting,
-	 * which lives in `voicemail_greeting` and is never compiled into the artifact. Reading it here
-	 * would mean a database round trip on the call path from a process that holds no database
-	 * handle, so the honest fix is one the compiler owns: embed the active greeting's key at compile
-	 * time, exactly as it embeds every other routing input. That is a `packages/routing` change and
-	 * is recorded as a follow-up rather than worked around here.
+	 * **The busy greeting is unreachable.** An extension's busy and no-answer branches compile to
+	 * the same `voicemail:<id>:leave` node, so nothing here can tell a caller who got a busy signal
+	 * from one who got no answer. Splitting that node is a `packages/routing` change and is recorded
+	 * as a follow-up rather than guessed at.
 	 *
-	 * **Email delivery is not wired.** `voicemail_box.email_mode` is likewise not in the artifact,
-	 * and delivery belongs to the control plane, which is where the `voicemail.message.left`
-	 * consumer already is.
+	 * **Email delivery is not wired.** `voicemail_box.email_mode` is not in the artifact, and
+	 * delivery belongs to the control plane, which is where the `voicemail.message.left` consumer
+	 * already is.
 	 */
 	private async voicemailNode(node: VoicemailPlanNode, input: WalkInput): Promise<StepResult> {
 		if (!(await this.ensureAnswered())) {
@@ -940,7 +1023,7 @@ export class PlanWalker {
 			return await this.voicemailCheck(node, input);
 		}
 
-		await this.deps.execute({ verb: "play", media: this.settings.voicemailGreeting });
+		await this.deps.execute({ verb: "play", media: this.leaveGreetingFor(node) });
 
 		const recordingId = this.newId();
 		const format = this.settings.recordingFormat;
@@ -998,6 +1081,29 @@ export class PlanWalker {
 	}
 
 	/**
+	 * The greeting a caller about to record hears.
+	 *
+	 * Which greeting is a routing decision the compiler already made (`temporary` beats
+	 * `unavailable`); all that is left here is rendering it, and deciding what to do when it cannot
+	 * be rendered. The deployment-wide announcement is that answer, and the note says which of the
+	 * two reasons it was taken for — "this box has no greeting" and "this deployment cannot reach
+	 * the one it has" look identical to a caller and are very different to an operator.
+	 */
+	private leaveGreetingFor(node: VoicemailPlanNode): string {
+		if (node.greetingMedia === undefined) {
+			return this.settings.voicemailGreeting;
+		}
+		const media = translateMediaRef(node.greetingMedia, this.settings.mediaRefs);
+		if (media === undefined) {
+			this.note(
+				`voicemail box ${node.mailboxNumber} has a ${node.greetingKind ?? "recorded"} greeting (${node.greetingMedia}) this deployment cannot play; falling back to the default announcement. Mount the object store into the media server and set ENGINE_MEDIA_OBJECT_ROOT.`,
+			);
+			return this.settings.voicemailGreeting;
+		}
+		return media;
+	}
+
+	/**
 	 * Publishes the message so the control plane can file it.
 	 *
 	 * Failures are noted, not fatal. The caller has already recorded and hung up by the time this
@@ -1051,21 +1157,24 @@ export class PlanWalker {
 	 * the `digits/*` sounds every Asterisk install ships — no TTS, no per-deployment prompt pack. A
 	 * caller who dials `*97` from a phone with no mailbox is told so instead of hearing silence.
 	 *
+	 * **There is a PIN challenge** when the box has one. `VoicemailPlanNode.pinHash` carries the
+	 * digest (format and rationale: `packages/routing`'s `voicemail-pin.ts`), and a box that has one
+	 * must pass it before anything is read out. A box with no digest keeps the classic PBX default —
+	 * "the call came from this extension", which is exactly as strong as the phone on the desk.
+	 *
+	 * **There is message playback** when a responder answers `rpc.voicemail.v1.list`.
+	 *
 	 * ## What is stubbed, precisely
 	 *
-	 * **There is no PIN check.** `voicemail_box.pin_hash` is not compiled into the artifact, so the
-	 * only authentication available here is "the call came from this extension" — which is exactly
-	 * as strong as the phone on the desk and no stronger. That is the classic PBX default and it is
-	 * ACCEPTABLE for `*97` from an internal extension; it is NOT acceptable for the from-anywhere
-	 * check a `voicemail` node in `check` mode can be reached by, so that path is refused rather
-	 * than silently opened. Closing it needs the compiler to embed the hash.
+	 * **Nothing answers that RPC yet.** `voicemail_message` rows live in `pbx-db` behind the control
+	 * plane and the engine holds no database handle, so the contract exists and the client is wired,
+	 * but the API-side responder is a named follow-up. Until it lands, a check authenticates, then
+	 * announces the mailbox as unavailable and ends — deliberately NOT "you have no messages", which
+	 * is a far more damaging thing to tell somebody who has nine.
 	 *
-	 * **There is no message count and no playback.** Both need the `voicemail_message` rows, which
-	 * live in `pbx-db` behind the control plane; the engine holds no database handle and there is no
-	 * read model on the backbone that carries them. The `voicemail.mwi.updated` event added in this
-	 * wave is the contract that read model will be built on. Until it exists this announces the
-	 * mailbox and stops, and says so in the notes rather than playing "you have no messages" at
-	 * somebody who has nine.
+	 * **There is no delete and no save.** Both mutate `voicemail_message` state the engine cannot
+	 * write; offering a `7` that silently did nothing would be worse than not offering it. The menu
+	 * is next / replay / exit, and it says so.
 	 */
 	private async voicemailCheck(node: VoicemailPlanNode, input: WalkInput): Promise<StepResult> {
 		const caller = input.callerIdNumber ?? this.deps.channel.callerIdNumber;
@@ -1081,6 +1190,11 @@ export class PlanWalker {
 			);
 		}
 
+		const authenticated = await this.challengeVoicemailPin(node, mailbox);
+		if (authenticated.kind !== "granted") {
+			return authenticated.result;
+		}
+
 		for (const media of this.spellNumber(mailbox)) {
 			if (this.deps.channel.isTearingDown) {
 				return { kind: "aborted" };
@@ -1088,9 +1202,202 @@ export class PlanWalker {
 			await this.deps.execute({ verb: "play", media });
 		}
 
+		return await this.voicemailMenu(node, mailbox);
+	}
+
+	/**
+	 * The PIN gate.
+	 *
+	 * Three attempts, then the call ends — the same budget an IVR gives a caller who keeps pressing
+	 * the wrong key, and for the same reason: a mailbox with an unlimited retry budget over a phone
+	 * line is a four-digit secret with no lockout.
+	 *
+	 * A box with no digest is NOT challenged. That is a deliberate product decision rather than an
+	 * oversight: `*97` from the owner's own extension is authenticated by the extension, which is
+	 * the classic PBX default, and challenging a PIN nobody has set would lock every existing user
+	 * out of their mailbox on the deploy that shipped this.
+	 *
+	 * The caller is never told *why* an attempt failed. "Incorrect PIN" covers a mismatch, an empty
+	 * entry and a digest this release cannot read, because the difference between those is
+	 * information an attacker can use and the owner cannot.
+	 */
+	private async challengeVoicemailPin(
+		node: VoicemailPlanNode,
+		mailbox: string,
+	): Promise<
+		{ readonly kind: "granted" } | { readonly kind: "denied"; readonly result: StepResult }
+	> {
+		if (node.pinHash === undefined) {
+			return { kind: "granted" };
+		}
+
+		for (let attempt = 0; attempt < this.settings.voicemailPinAttempts; attempt += 1) {
+			if (this.deps.channel.isTearingDown) {
+				return { kind: "denied", result: { kind: "aborted" } };
+			}
+
+			const result = await this.deps.execute({
+				verb: "gather",
+				maxDigits: this.settings.voicemailPinMaxDigits,
+				terminators: ["#"],
+				timeoutMs: this.settings.voicemailPinTimeoutMs,
+				interDigitTimeoutMs: this.settings.voicemailPinInterDigitTimeoutMs,
+				media: this.settings.voicemailPinPrompt,
+			});
+			if (result === undefined) {
+				return { kind: "denied", result: { kind: "hangup", cause: "NORMAL_TEMPORARY_FAILURE" } };
+			}
+			const collection = collectionOf(result);
+			if (collection?.endReason === "hangup") {
+				return { kind: "denied", result: { kind: "aborted" } };
+			}
+
+			const verified = await verifyVoicemailPin(collection?.digits.join("") ?? "", node.pinHash);
+			if (verified.ok) {
+				return { kind: "granted" };
+			}
+			if (verified.failure === "malformed-hash" || verified.failure === "kdf-error") {
+				// Fails closed, and is a defect rather than a wrong guess: the compiler refuses to embed
+				// a digest it cannot read, so reaching here means the artifact came from something that
+				// skipped that check. Retrying would only burn the caller's remaining attempts.
+				this.note(
+					`voicemail box ${mailbox} carries a PIN digest this release cannot verify (${verified.failure}); the check was refused`,
+				);
+				return {
+					kind: "denied",
+					result: await this.announceAndHangup(
+						this.settings.unavailableAnnouncement,
+						"NORMAL_TEMPORARY_FAILURE",
+					),
+				};
+			}
+			await this.deps.execute({ verb: "play", media: this.settings.voicemailPinInvalidPrompt });
+		}
+
 		this.note(
-			`voicemail check opened box ${mailbox}; message counts and playback need the voicemail read model (voicemail.evt.v1) and are not implemented yet`,
+			`voicemail check for box ${mailbox} failed ${this.settings.voicemailPinAttempts} PIN attempts`,
 		);
+		return {
+			kind: "denied",
+			result: { kind: "hangup", cause: "CALL_REJECTED" },
+		};
+	}
+
+	/**
+	 * Reading a mailbox out, newest first.
+	 *
+	 * The message list is an RPC because the rows are the control plane's. Everything about the
+	 * failure path here follows from one rule: **a mailbox the engine could not read must never be
+	 * announced as empty.** `found: false` and `messages: []` are separate states in the contract for
+	 * exactly that reason, and no responder at all is the first of the two.
+	 *
+	 * The controls are `1` next, `2` replay, `*` exit; a timeout advances, because a caller who
+	 * presses nothing has finished with that message. Delete and save are absent rather than
+	 * present-and-inert — both write `voicemail_message` state the engine cannot write, and a `7`
+	 * that appeared to delete a message that is still there is the worst outcome available.
+	 */
+	private async voicemailMenu(node: VoicemailPlanNode, mailbox: string): Promise<StepResult> {
+		const source = this.deps.mailbox;
+		if (source === undefined) {
+			this.note(`voicemail check opened box ${mailbox}; this walk has no mailbox source`);
+			return await this.announceAndHangup(this.settings.unavailableAnnouncement, "NORMAL_CLEARING");
+		}
+
+		let listing: VoicemailListing | undefined;
+		try {
+			listing = await source.list({
+				organizationId: this.deps.channel.organizationId,
+				voicemailBoxId: node.voicemailBoxId,
+				mailboxNumber: mailbox,
+				callId: this.deps.channel.callId,
+			});
+		} catch (error) {
+			this.note(`voicemail listing for box ${mailbox} failed: ${String(error)}`);
+			listing = undefined;
+		}
+
+		if (listing === undefined || !listing.found) {
+			// NOT "you have no messages". See the method note.
+			this.note(
+				`voicemail box ${mailbox} could not be read (${listing?.reason ?? "no responder"}); announced as unavailable rather than as empty`,
+			);
+			return await this.announceAndHangup(this.settings.unavailableAnnouncement, "NORMAL_CLEARING");
+		}
+
+		for (const media of this.spellNumber(String(listing.messages.length))) {
+			if (this.deps.channel.isTearingDown) {
+				return { kind: "aborted" };
+			}
+			await this.deps.execute({ verb: "play", media });
+		}
+
+		if (listing.messages.length === 0) {
+			this.note(`voicemail box ${mailbox} is empty`);
+			return { kind: "hangup", cause: "NORMAL_CLEARING" };
+		}
+
+		return await this.playVoicemailMessages(mailbox, listing.messages);
+	}
+
+	private async playVoicemailMessages(
+		mailbox: string,
+		messages: readonly VoicemailListingMessage[],
+	): Promise<StepResult> {
+		let index = 0;
+		let replays = 0;
+
+		while (index < messages.length) {
+			if (this.deps.channel.isTearingDown) {
+				return { kind: "aborted" };
+			}
+			const message = messages[index] as VoicemailListingMessage;
+			const media = translateMediaRef(message.media, this.settings.mediaRefs);
+			if (media === undefined) {
+				// The row exists and its audio does not reach this deployment. Skipping is right — the
+				// caller still gets their other messages — and the note is what tells an operator that
+				// the object store is not mounted rather than that the message was lost.
+				this.note(
+					`voicemail message ${message.messageId} in box ${mailbox} names audio this deployment cannot play (${message.media}); it was skipped`,
+				);
+				index += 1;
+				continue;
+			}
+
+			const control = await this.deps.execute({
+				verb: "gather",
+				maxDigits: 1,
+				terminators: ["#"],
+				// The prompt IS the message: `gather` plays it and stops on the first digit, so a caller
+				// who has heard enough presses `1` and moves on rather than waiting out a two-minute
+				// recording. That barge-in is the difference between a usable mailbox and one people
+				// check from their email instead.
+				timeoutMs: this.settings.voicemailMenuTimeoutMs,
+				interDigitTimeoutMs: this.settings.voicemailMenuTimeoutMs,
+				media,
+			});
+			if (control === undefined) {
+				return { kind: "hangup", cause: "NORMAL_TEMPORARY_FAILURE" };
+			}
+			const collection = collectionOf(control);
+			if (collection?.endReason === "hangup") {
+				return { kind: "aborted" };
+			}
+
+			const digit = collection?.digits.join("") ?? "";
+			if (digit === "*") {
+				return { kind: "hangup", cause: "NORMAL_CLEARING" };
+			}
+			if (digit === "2" && replays < this.settings.voicemailMaxReplays) {
+				replays += 1;
+				continue;
+			}
+			// `1`, anything unrecognised, and a timeout all advance: a caller who pressed nothing has
+			// finished with this message, and one who pressed `9` meant *something* other than "again".
+			replays = 0;
+			index += 1;
+		}
+
+		this.note(`voicemail box ${mailbox} played ${messages.length} message(s) to the end`);
 		return { kind: "hangup", cause: "NORMAL_CLEARING" };
 	}
 

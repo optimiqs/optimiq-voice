@@ -26,6 +26,19 @@
  * Hangup causes are `@optimiq-voice/telephony`'s taxonomy verbatim. The engine keys failover off
  * them, the CDR writer stores them, and a routing decision that invented its own cause names would
  * be invisible to both.
+ *
+ * # Row ids versus the names a media server speaks
+ *
+ * Five node kinds carry both a `mohClassId` and a `mohClass`. The first is the `moh_class` row id,
+ * which is what the tenant's configuration stores and what a call-flow inspector needs in order to
+ * link back to the row. The second is that class's **name**, which is the only thing a media
+ * server will accept — Asterisk's `POST /channels/{id}/moh` takes `mohClass=<name>`, and handing it
+ * a UUID selects the server's default class and reports no error at all.
+ *
+ * Both are present rather than the name replacing the id: the id is the fact, the name is derived
+ * from a row that may have been renamed since, and an artifact compiled before this resolution
+ * existed carries only the id. Every reader therefore treats the name as optional and falls back to
+ * the media server's default class — which is what an unresolved UUID was silently producing.
  */
 
 import type { CompiledPattern } from "./patterns";
@@ -38,6 +51,7 @@ import type {
 	SipTransport,
 	TollClass,
 	TrunkKind,
+	VoicemailGreetingKind,
 } from "./snapshot";
 import type { HangupCause } from "@optimiq-voice/telephony";
 
@@ -96,6 +110,8 @@ export interface ExtensionPlanNode extends PlanNodeBase {
 	readonly timeoutSeconds: number;
 	readonly doNotDisturb: boolean;
 	readonly mohClassId?: string;
+	/** The class's NAME, resolved from `mohClassId`. Absent means "the media server's default". */
+	readonly mohClass?: string;
 	/** Taken before ringing when "forward all" is on. */
 	readonly forwardAllNodeId?: PlanNodeId;
 	readonly busyNodeId?: PlanNodeId;
@@ -121,6 +137,8 @@ export interface RingGroupPlanNode extends PlanNodeBase {
 	readonly confirmPromptId?: string;
 	readonly callerIdNamePrefix?: string;
 	readonly mohClassId?: string;
+	/** The class's NAME, resolved from `mohClassId`. Absent means "the media server's default". */
+	readonly mohClass?: string;
 	readonly ringbackPromptId?: string;
 	/** In `ordinal` order. Never empty in a compiled artifact — an empty group is a hard error. */
 	readonly members: readonly RingGroupMember[];
@@ -160,6 +178,8 @@ export interface QueuePlanNode extends PlanNodeBase {
 	readonly queueId: string;
 	readonly strategy: QueueStrategy;
 	readonly mohClassId?: string;
+	/** The class's NAME, resolved from `mohClassId`. Absent means "the media server's default". */
+	readonly mohClass?: string;
 	readonly greetingPromptId?: string;
 	readonly announcePromptId?: string;
 	readonly maxWaitSeconds: number;
@@ -175,6 +195,28 @@ export const VOICEMAIL_MODES = ["leave", "check"] as const;
 
 export type VoicemailMode = (typeof VOICEMAIL_MODES)[number];
 
+/**
+ * A mailbox, in one of its two modes.
+ *
+ * # Why the greeting and the PIN are here
+ *
+ * Both are read at exactly one moment — the instant a call reaches the mailbox — by a process that
+ * holds no database handle. Everything else about a box (its email address, its transcription
+ * flag, its message retention) is read by the control plane at its leisure and has no business in
+ * an artifact. The line is "does call-time behaviour change if this field changes?", and it puts
+ * precisely two fields on this side of it.
+ *
+ * `greetingMedia` is a domain `MediaRef`, not a media-server URI: which greeting to play is a
+ * routing decision (the compiler applies `VOICEMAIL_LEAVE_GREETING_PRECEDENCE` over the box's
+ * active rows), while turning `object://…` into something Asterisk will accept is a protocol
+ * detail the engine's media layer owns. A reader that cannot resolve the ref falls back to its
+ * deployment-wide announcement rather than playing silence at a caller.
+ *
+ * `pinHash` is a digest in the format `voicemail-pin.ts` defines, never a PIN. A reader with no
+ * digest must not invent an authentication step, and a reader with one must not accept a call
+ * without it: absent means "this box has no PIN", which is the classic PBX default for `*97` from
+ * the owner's own extension.
+ */
 export interface VoicemailPlanNode extends PlanNodeBase {
 	readonly kind: "voicemail";
 	readonly voicemailBoxId: string;
@@ -182,6 +224,12 @@ export interface VoicemailPlanNode extends PlanNodeBase {
 	readonly mode: VoicemailMode;
 	readonly maxMessageSeconds: number;
 	readonly mwiEnabled: boolean;
+	/** The box's active greeting for this mode, as a domain `MediaRef`. `leave` only. */
+	readonly greetingMedia?: string;
+	/** Which kind `greetingMedia` came from, for the log and the call-flow inspector. */
+	readonly greetingKind?: VoicemailGreetingKind;
+	/** Digest of the mailbox PIN. Absent means the box has no PIN and no challenge is issued. */
+	readonly pinHash?: string;
 }
 
 export interface ConferencePlanNode extends PlanNodeBase {
@@ -193,6 +241,8 @@ export interface ConferencePlanNode extends PlanNodeBase {
 	readonly waitForModerator: boolean;
 	readonly recordEnabled: boolean;
 	readonly mohClassId?: string;
+	/** The class's NAME, resolved from `mohClassId`. Absent means "the media server's default". */
+	readonly mohClass?: string;
 }
 
 export interface ParkPlanNode extends PlanNodeBase {
@@ -202,6 +252,8 @@ export interface ParkPlanNode extends PlanNodeBase {
 	readonly slotEnd: number;
 	readonly timeoutSeconds: number;
 	readonly mohClassId?: string;
+	/** The class's NAME, resolved from `mohClassId`. Absent means "the media server's default". */
+	readonly mohClass?: string;
 	readonly timeoutNodeId?: PlanNodeId;
 }
 

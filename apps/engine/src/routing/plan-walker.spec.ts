@@ -1,6 +1,13 @@
 import { describe, expect, it } from "bun:test";
+import {
+	DEFAULT_VOICEMAIL_PIN_SCRYPT_PARAMS,
+	DERIVED_KEY_BYTES,
+	formatVoicemailPinHash,
+	MIN_SALT_BYTES,
+} from "@optimiq-voice/routing";
 import { makeFakeMediaPort } from "../ari/media-port.fake";
 import { CallSignalBus, legSignalKey, recordingSignalKey } from "./call-signals";
+import { DEFAULT_MEDIA_REF_SETTINGS } from "./media-refs";
 import {
 	extensionNode,
 	hangupNode,
@@ -17,6 +24,7 @@ import { composeCallerId, PlanWalker } from "./plan-walker";
 import type { FakeMediaPortOptions } from "../ari/media-port.fake";
 import type {
 	PlanWalkerSettings,
+	VoicemailMailboxSource,
 	VoicemailMessage,
 	VoicemailPort,
 	WalkerChannel,
@@ -72,6 +80,8 @@ interface HarnessOptions {
 		| { readonly kind: "silent" };
 	/** Where a recorded message is filed. Absent means the walk has no voicemail port. */
 	readonly voicemail?: VoicemailPort;
+	/** Where the `*97` menu reads a mailbox from. Absent means the walk has no mailbox source. */
+	readonly mailbox?: VoicemailMailboxSource;
 }
 
 type LegReaction =
@@ -223,6 +233,7 @@ function harness(options: HarnessOptions = {}) {
 		settings: { answerTimeoutMs: 200, ...options.settings },
 		peerLegId: (mediaChannelId) => `leg-of-${mediaChannelId}`,
 		...(options.voicemail === undefined ? {} : { voicemail: options.voicemail }),
+		...(options.mailbox === undefined ? {} : { mailbox: options.mailbox }),
 		newId: () => {
 			counter += 1;
 			return `id-${String(counter)}`;
@@ -1131,15 +1142,17 @@ describe("voicemail", () => {
 
 		// `digits/N` is in Asterisk's core sound package, so this works with no prompt pack and no
 		// TTS — which is the whole point of spelling the number rather than synthesising it.
+		// The trailing announcement is the no-mailbox-source path, asserted on its own below.
 		expect(h.verbs).toEqual([
 			{ verb: "answer" },
 			{ verb: "play", media: "sound:digits/1" },
 			{ verb: "play", media: "sound:digits/0" },
 			{ verb: "play", media: "sound:digits/0" },
 			{ verb: "play", media: "sound:digits/1" },
+			{ verb: "play", media: "sound:unavailable" },
 			{ verb: "hangup", cause: "NORMAL_CLEARING" },
 		]);
-		expect(outcome.notes.join(" ")).toContain("message counts and playback");
+		expect(outcome.notes.join(" ")).toContain("no mailbox source");
 	});
 
 	it("opens a mailbox the artifact says the caller owns, even when the node names another", async () => {
@@ -1235,6 +1248,317 @@ describe("voicemail", () => {
 		const outcome = await h.walker.walk(walkInput([voicemailNode("vm")]));
 
 		expect(outcome.notes.join(" ")).toContain("no voicemail port");
+	});
+});
+
+// =================================================================================================
+// Per-box greetings
+// =================================================================================================
+
+/** A deployment that HAS mounted its object store inside the media server. */
+const MOUNTED_MEDIA: Partial<PlanWalkerSettings> = {
+	mediaRefs: { ...DEFAULT_MEDIA_REF_SETTINGS, objectMediaRoot: "/objects" },
+};
+
+describe("voicemail greetings", () => {
+	it("plays the box's own greeting when the deployment can reach it", async () => {
+		const h = harness({ settings: MOUNTED_MEDIA });
+		await h.walker.walk(
+			walkInput([
+				voicemailNode("vm", {
+					greetingMedia: "object://org-1/vm-1/holiday.wav",
+					greetingKind: "temporary",
+				}),
+			]),
+		);
+
+		expect(h.verbs).toContainEqual({ verb: "play", media: "sound:/objects/org-1/vm-1/holiday" });
+	});
+
+	it("falls back to the deployment announcement when the box has no greeting", async () => {
+		const h = harness({ settings: MOUNTED_MEDIA });
+		await h.walker.walk(walkInput([voicemailNode("vm")]));
+
+		expect(h.verbs).toContainEqual({ verb: "play", media: "sound:unavailable" });
+	});
+
+	it("says WHY it fell back when the object store is not mounted", async () => {
+		// "This box has no greeting" and "this deployment cannot reach the one it has" sound
+		// identical to a caller and are completely different problems to an operator.
+		const h = harness();
+		const outcome = await h.walker.walk(
+			walkInput([
+				voicemailNode("vm", {
+					greetingMedia: "object://org-1/vm-1/holiday.wav",
+					greetingKind: "unavailable",
+				}),
+			]),
+		);
+
+		expect(h.verbs).toContainEqual({ verb: "play", media: "sound:unavailable" });
+		expect(outcome.notes.join(" ")).toContain("ENGINE_MEDIA_OBJECT_ROOT");
+	});
+
+	it("still records after falling back — a greeting is not a precondition", async () => {
+		const h = harness({ voicemail: { messageLeft: async () => undefined } });
+		await h.walker.walk(walkInput([voicemailNode("vm", { greetingMedia: "object://x.wav" })]));
+
+		expect(h.media.methods()).toContain("record");
+	});
+});
+
+// =================================================================================================
+// The *97 menu: PIN, listing, playback
+// =================================================================================================
+
+const A_PIN_HASH_FOR = async (pin: string): Promise<string> => {
+	// Hashed for real, with the contract's own parameters, because a spec that asserted a PIN check
+	// against a fixture digest would be asserting string equality rather than a KDF.
+	const { randomBytes, scryptSync } = await import("node:crypto");
+	const salt = randomBytes(MIN_SALT_BYTES);
+	const key = scryptSync(pin, salt, DERIVED_KEY_BYTES, {
+		N: DEFAULT_VOICEMAIL_PIN_SCRYPT_PARAMS.cost,
+		r: DEFAULT_VOICEMAIL_PIN_SCRYPT_PARAMS.blockSize,
+		p: DEFAULT_VOICEMAIL_PIN_SCRYPT_PARAMS.parallelism,
+	});
+	return formatVoicemailPinHash(
+		DEFAULT_VOICEMAIL_PIN_SCRYPT_PARAMS,
+		salt.toString("base64"),
+		key.toString("base64"),
+	);
+};
+
+function checkNodeFor(overrides: Partial<Parameters<typeof voicemailNode>[1]> = {}) {
+	return voicemailNode("vm", { mode: "check", mailboxNumber: "1001", ...overrides });
+}
+
+const OWN_MAILBOX = { callerIdNumber: "1001" };
+
+function aListing(count: number) {
+	return {
+		found: true,
+		messages: Array.from({ length: count }, (_, index) => ({
+			messageId: `msg-${String(index)}`,
+			media: `object://org-1/vm-1/msg-${String(index)}.wav`,
+			durationMs: 4_000,
+			receivedAt: "2026-08-05T12:00:00.000Z",
+		})),
+	};
+}
+
+describe("voicemail check — the PIN gate", () => {
+	it("does not challenge a box with no PIN", async () => {
+		// The classic PBX default: `*97` from the owner's extension is authenticated by the
+		// extension. Challenging a PIN nobody set would lock every existing user out on deploy day.
+		const h = harness();
+		await h.walker.walk(walkInput([checkNodeFor()], OWN_MAILBOX));
+
+		expect(verbNames(h.verbs)).not.toContain("gather");
+	});
+
+	it("opens the mailbox on the correct PIN", async () => {
+		const pinHash = await A_PIN_HASH_FOR("4242");
+		const h = harness({
+			gathers: [{ digits: ["4", "2", "4", "2"], endReason: "terminator" }],
+			mailbox: { list: async () => aListing(0) },
+		});
+		const outcome = await h.walker.walk(walkInput([checkNodeFor({ pinHash })], OWN_MAILBOX));
+
+		expect(h.verbs).toContainEqual({ verb: "play", media: "sound:digits/0" });
+		expect(outcome.hangupCause).toBe("NORMAL_CLEARING");
+		expect(outcome.notes.join(" ")).toContain("is empty");
+	});
+
+	it("refuses the call after three wrong PINs", async () => {
+		const pinHash = await A_PIN_HASH_FOR("4242");
+		const h = harness({ gathers: [{ digits: ["0", "0", "0", "0"], endReason: "terminator" }] });
+		const outcome = await h.walker.walk(walkInput([checkNodeFor({ pinHash })], OWN_MAILBOX));
+
+		expect(verbNames(h.verbs).filter((verb) => verb === "gather")).toHaveLength(3);
+		expect(outcome.hangupCause).toBe("CALL_REJECTED");
+		expect(outcome.notes.join(" ")).toContain("3 PIN attempts");
+	});
+
+	it("plays the retry prompt between attempts, so a caller knows they were wrong", async () => {
+		const pinHash = await A_PIN_HASH_FOR("4242");
+		const h = harness({ gathers: [{ digits: ["9"], endReason: "terminator" }] });
+		await h.walker.walk(walkInput([checkNodeFor({ pinHash })], OWN_MAILBOX));
+
+		expect(h.verbs).toContainEqual({ verb: "play", media: "sound:vm-incorrect" });
+	});
+
+	it("never reads the mailbox out when the PIN failed", async () => {
+		const pinHash = await A_PIN_HASH_FOR("4242");
+		let listed = false;
+		const h = harness({
+			gathers: [{ digits: ["1"], endReason: "terminator" }],
+			mailbox: {
+				list: async () => {
+					listed = true;
+					return aListing(2);
+				},
+			},
+		});
+		await h.walker.walk(walkInput([checkNodeFor({ pinHash })], OWN_MAILBOX));
+
+		expect(listed).toBe(false);
+	});
+
+	it("ends the walk when the caller hangs up mid-challenge", async () => {
+		const pinHash = await A_PIN_HASH_FOR("4242");
+		const h = harness({ gathers: [{ digits: [], endReason: "hangup" }] });
+		const outcome = await h.walker.walk(walkInput([checkNodeFor({ pinHash })], OWN_MAILBOX));
+
+		expect(outcome.status).toBe("aborted");
+	});
+
+	it("fails CLOSED on a digest it cannot verify, without burning the attempts", async () => {
+		// The compiler refuses to embed an unparseable digest, so reaching here means the artifact
+		// came from something that skipped that check. Retrying would only cost the caller.
+		const h = harness({ gathers: [{ digits: ["1", "2"], endReason: "terminator" }] });
+		const outcome = await h.walker.walk(
+			walkInput([checkNodeFor({ pinHash: "not-a-digest" })], OWN_MAILBOX),
+		);
+
+		expect(verbNames(h.verbs).filter((verb) => verb === "gather")).toHaveLength(1);
+		expect(outcome.hangupCause).toBe("NORMAL_TEMPORARY_FAILURE");
+		expect(outcome.notes.join(" ")).toContain("cannot verify");
+	});
+});
+
+describe("voicemail check — the message menu", () => {
+	it("announces the mailbox as UNAVAILABLE, never as empty, when nothing answers", async () => {
+		// The single most important behaviour in this file. "You have no messages" told to somebody
+		// who has nine is worse than any error, so an unreadable mailbox and an empty one are
+		// separate states all the way from the rpc contract to what the caller hears.
+		const h = harness({
+			mailbox: { list: async () => ({ found: false, messages: [], reason: "no responder" }) },
+		});
+		const outcome = await h.walker.walk(walkInput([checkNodeFor()], OWN_MAILBOX));
+
+		// Spelled exactly: the mailbox number read back, then the announcement — and NOTHING between
+		// them, because anything between them would be a count for a mailbox nobody could read.
+		expect(h.verbs).toEqual([
+			{ verb: "answer" },
+			{ verb: "play", media: "sound:digits/1" },
+			{ verb: "play", media: "sound:digits/0" },
+			{ verb: "play", media: "sound:digits/0" },
+			{ verb: "play", media: "sound:digits/1" },
+			{ verb: "play", media: "sound:unavailable" },
+			{ verb: "hangup", cause: "NORMAL_CLEARING" },
+		]);
+		expect(outcome.notes.join(" ")).toContain("rather than as empty");
+	});
+
+	it("treats a source that throws exactly as one that says no", async () => {
+		const h = harness({
+			mailbox: {
+				list: async () => {
+					throw new Error("broker unreachable");
+				},
+			},
+		});
+		const outcome = await h.walker.walk(walkInput([checkNodeFor()], OWN_MAILBOX));
+
+		expect(outcome.notes.join(" ")).toContain("failed");
+		expect(outcome.hangupCause).toBe("NORMAL_CLEARING");
+	});
+
+	it("announces zero for a genuinely empty mailbox", async () => {
+		const h = harness({ mailbox: { list: async () => aListing(0) } });
+		const outcome = await h.walker.walk(walkInput([checkNodeFor()], OWN_MAILBOX));
+
+		expect(h.verbs).toContainEqual({ verb: "play", media: "sound:digits/0" });
+		expect(outcome.notes.join(" ")).toContain("is empty");
+	});
+
+	it("plays each message through, newest first, and ends", async () => {
+		const h = harness({
+			settings: MOUNTED_MEDIA,
+			mailbox: { list: async () => aListing(2) },
+			gathers: [{ digits: [], endReason: "timeout" }],
+		});
+		const outcome = await h.walker.walk(walkInput([checkNodeFor()], OWN_MAILBOX));
+
+		const played = h.verbs
+			.filter((verb): verb is Extract<Verb, { verb: "gather" }> => verb.verb === "gather")
+			.map((verb) => verb.media);
+		expect(played).toEqual(["sound:/objects/org-1/vm-1/msg-0", "sound:/objects/org-1/vm-1/msg-1"]);
+		expect(outcome.notes.join(" ")).toContain("played 2 message(s)");
+	});
+
+	it("replays a message on `2` and moves on afterwards", async () => {
+		const gathers: DtmfCollection[] = [
+			{ digits: ["2"], endReason: "max-digits" },
+			{ digits: ["1"], endReason: "max-digits" },
+		];
+		const h = harness({
+			settings: MOUNTED_MEDIA,
+			mailbox: { list: async () => aListing(1) },
+			gathers,
+		});
+		await h.walker.walk(walkInput([checkNodeFor()], OWN_MAILBOX));
+
+		const plays = h.verbs.filter(
+			(verb) => verb.verb === "gather" && verb.media === "sound:/objects/org-1/vm-1/msg-0",
+		);
+		expect(plays).toHaveLength(2);
+	});
+
+	it("stops honouring `2` once the replay budget is spent", async () => {
+		// Otherwise a caller with a stuck key holds a channel open forever.
+		const h = harness({
+			settings: { ...MOUNTED_MEDIA, voicemailMaxReplays: 2 },
+			mailbox: { list: async () => aListing(1) },
+			gathers: [{ digits: ["2"], endReason: "max-digits" }],
+		});
+		const outcome = await h.walker.walk(walkInput([checkNodeFor()], OWN_MAILBOX));
+
+		expect(
+			h.verbs.filter((verb) => verb.verb === "gather" && verb.media?.includes("msg-0")),
+		).toHaveLength(3);
+		expect(outcome.hangupCause).toBe("NORMAL_CLEARING");
+	});
+
+	it("exits on `*` without playing the rest", async () => {
+		const h = harness({
+			settings: MOUNTED_MEDIA,
+			mailbox: { list: async () => aListing(3) },
+			gathers: [{ digits: ["*"], endReason: "max-digits" }],
+		});
+		const outcome = await h.walker.walk(walkInput([checkNodeFor()], OWN_MAILBOX));
+
+		expect(h.verbs.filter((verb) => verb.verb === "gather")).toHaveLength(1);
+		expect(outcome.hangupCause).toBe("NORMAL_CLEARING");
+	});
+
+	it("skips a message whose audio this deployment cannot play, and says which", async () => {
+		// The row exists and its audio does not reach here. Skipping is right — the caller still gets
+		// their other messages — and the note is what tells an operator the store is not mounted.
+		const h = harness({
+			mailbox: { list: async () => aListing(2) },
+			gathers: [{ digits: [], endReason: "timeout" }],
+		});
+		const outcome = await h.walker.walk(walkInput([checkNodeFor()], OWN_MAILBOX));
+
+		expect(verbNames(h.verbs)).not.toContain("gather");
+		expect(outcome.notes.join(" ")).toContain("cannot play");
+		expect(outcome.hangupCause).toBe("NORMAL_CLEARING");
+	});
+
+	it("hands the responder the mailbox the walk authenticated, not the one the node named", async () => {
+		const seen: string[] = [];
+		const h = harness({
+			mailbox: {
+				list: async (request) => {
+					seen.push(`${request.voicemailBoxId}:${request.mailboxNumber}`);
+					return aListing(0);
+				},
+			},
+		});
+		await h.walker.walk(walkInput([checkNodeFor()], OWN_MAILBOX));
+
+		expect(seen).toEqual(["vm-vm:1001"]);
 	});
 });
 

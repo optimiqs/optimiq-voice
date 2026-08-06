@@ -708,12 +708,15 @@ export class QueueSession {
 		if (this.call.isTearingDown) {
 			return;
 		}
-		// `mohClassId` is a `moh_class` row id and the media server wants a CLASS NAME. The two agree
-		// in every deployment whose classes are provisioned by name, and where they do not the media
-		// server falls back to its default class rather than failing — which is why this passes it
-		// through instead of refusing. Compiling the NAME into the plan node is the proper fix and
-		// belongs to `packages/routing`.
-		await this.call.startMusicOnHold(this.node.mohClassId);
+		// `mohClass` is the class NAME, resolved from `mohClassId` by the compiler — the media server
+		// addresses a class by name and answers a row id by silently selecting its default.
+		//
+		// The row id is deliberately NOT passed as a fallback. It used to be, on the theory that a
+		// deployment might provision classes under their ids; ids are UUIDv7 and names are names, so
+		// that theory was never true and the effect was identical to passing nothing. `undefined` says
+		// the same thing honestly, and is also what an artifact compiled before the resolution
+		// existed, or one whose class was deleted, correctly produces.
+		await this.call.startMusicOnHold(this.node.mohClass);
 	}
 
 	/**

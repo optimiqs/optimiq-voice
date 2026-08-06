@@ -10,6 +10,26 @@
  * PRODUCT decision (where does a tenant's audio live?) and `URI → sound:` is a PROTOCOL detail.
  * Putting the first one below the media seam would make the prompt library an Asterisk concept.
  *
+ * ## `object://` and the mount it needs
+ *
+ * The compiler embeds a voicemail greeting as `object://<objectKey>` — a key into the deployment's
+ * object store, because that is what `voicemail_greeting.object_key` is and rendering it as a path
+ * at compile time would bake one deployment's layout into every artifact.
+ *
+ * Turning that key into audio is where an honest limitation lives. **ARI has no HTTP media
+ * scheme.** `POST /channels/{id}/play` accepts `sound:`, `recording:`, `number:`, `digits:`,
+ * `characters:` and `tone:` and nothing else, so there is no URL the engine can hand Asterisk that
+ * makes it fetch an object. The only way audio in the object store becomes playable is for the
+ * store to be *visible to the media server as a filesystem*, at which point `sound:<absolute
+ * path>` works (ARI resolves an absolute path without an extension and picks the best format
+ * itself).
+ *
+ * So {@link MediaRefSettings.objectMediaRoot} is the deployment's answer to "where is the object
+ * store mounted inside the media server". Set it and greetings play; leave it unset and
+ * `object://` resolves to `undefined`, which every caller reads as "use the configured
+ * announcement". Reporting the gap beats playing silence, and inventing a fetch-and-stage step
+ * inside the engine would put a download on the call path.
+ *
  * ## What this slice does NOT do
  *
  * It does not fetch, cache or render anything. `tts://` and `https://` have no ARI equivalent that
@@ -27,11 +47,20 @@ export interface MediaRefSettings {
 	readonly promptPrefix: string;
 	/** Played when a node names audio this slice cannot resolve. */
 	readonly fallbackMedia: string;
+	/**
+	 * Absolute path, INSIDE the media server, at which the object store is mounted.
+	 *
+	 * Empty means "it is not mounted", which is the default and the state of the compose stack in
+	 * this repo: no service mounts one, so `object://` refs resolve to nothing and every caller
+	 * falls back. See the header for why there is no HTTP alternative.
+	 */
+	readonly objectMediaRoot: string;
 }
 
 export const DEFAULT_MEDIA_REF_SETTINGS: MediaRefSettings = {
 	promptPrefix: "sound:",
 	fallbackMedia: "sound:unavailable",
+	objectMediaRoot: "",
 };
 
 /** Media URI schemes Asterisk understands directly; anything already in one is passed through. */
@@ -95,9 +124,32 @@ export function translateMediaRef(
 		// `.wav` on a box that also has `.g722` forces a transcode on every play.
 		return `sound:${stripExtension(trimmed.slice("file://".length))}`;
 	}
+	if (trimmed.startsWith("object://")) {
+		return objectMedia(trimmed.slice("object://".length), settings);
+	}
 	// `stream://`, `tts://`, `https://` — real sources with no direct ARI equivalent. See the
 	// header: reporting the gap beats playing silence.
 	return undefined;
+}
+
+/**
+ * An object key under the configured mount, as a `sound:` path.
+ *
+ * `..` is rejected rather than normalised. The key comes out of an artifact, which comes out of a
+ * database row, which comes out of an upload — three hops from something a tenant controls. A key
+ * of `../../etc/asterisk/whatever` that this function helpfully resolved would be a tenant reading
+ * a file off the media server by leaving themselves a voicemail greeting.
+ */
+function objectMedia(objectKey: string, settings: MediaRefSettings): string | undefined {
+	const root = settings.objectMediaRoot.trim().replace(/\/+$/, "");
+	const key = objectKey.trim().replace(/^\/+/, "");
+	if (root === "" || key === "") {
+		return undefined;
+	}
+	if (key.split("/").includes("..")) {
+		return undefined;
+	}
+	return `sound:${stripExtension(`${root}/${key}`)}`;
 }
 
 function stripExtension(path: string): string {

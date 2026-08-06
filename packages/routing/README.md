@@ -74,6 +74,28 @@ Three properties are load-bearing:
    `RoutingArtifactVersionError`. A reader that finds one must discard the entry and recompile —
    never walk it best-effort.
 
+#### When to bump `ROUTING_ARTIFACT_VERSION`
+
+The rule is **"could a reader compiled against the previous version _misinterpret_ this?"**, not
+"did the shape change". Those are different questions and only the first one is worth a flag day.
+
+| change                                            | bump? | why                                                            |
+| ------------------------------------------------- | ----- | -------------------------------------------------------------- |
+| a new **optional** field on a node                 | no    | an old reader does not read it and keeps its existing fallback   |
+| a new required field, or a new node **kind**       | yes   | an old reader hits a node it cannot execute                      |
+| a field's meaning or units change under one name   | yes   | an old reader executes it confidently and wrongly                |
+| a field removed                                    | yes   | an old reader reads `undefined` where it required a value        |
+
+The additive optional fields in §2.5 are therefore **version 1** still. What actually forces the
+recompile is the other token: `snapshotHash` moves the moment the input gains a collection, so
+every cached artifact goes stale on the deploy that adds one and is rebuilt from the current
+configuration. That is the migration, and it costs one compile per organization.
+
+The corollary a reader must honour: **every optional node field needs a defined behaviour when it
+is absent**, because an artifact compiled by the previous release is a legitimate input. "Fall back
+to the media server's default class" and "play the deployment-wide announcement" are those
+behaviours for the two fields added here.
+
 ### 2.2 Node table, not a tree
 
 Destinations form a graph, not a tree: an IVR option may point back at its parent menu, a ring
@@ -133,7 +155,41 @@ A route the caller's toll class does not cover does **not** end resolution — t
 because a lower-class route further down may also match. Only when every matching route has been
 refused does the call take `deniedNodeId` (`OUTGOING_CALL_BARRED`).
 
-### 2.5 Failover and `continueOnCauses`
+### 2.5 What the compiler resolves, and why it is here rather than in the engine
+
+Three facts are embedded into plan nodes at compile time. All three follow the same rule: **the
+engine holds no database handle, so a fact it needs at the moment a call arrives either travels in
+the artifact or does not exist.**
+
+| node field                        | resolved from                        | absent means                                  |
+| ---------------------------------- | ------------------------------------ | --------------------------------------------- |
+| `mohClass` (5 node kinds)          | `moh_class.name` via `mohClassId`     | the media server's default class               |
+| `VoicemailPlanNode.greetingMedia`  | the box's active `voicemail_greeting` | the reader's deployment-wide announcement      |
+| `VoicemailPlanNode.pinHash`        | `voicemail_box.pin_hash`              | the box has no PIN; no challenge is issued     |
+
+**Music on hold.** Every `mohClassId` in the snapshot is a row id, and every media server addresses
+a class by its **name** — Asterisk's `POST /channels/{id}/moh` takes `mohClass=<name>` and answers a
+UUID by selecting its default class with no error at all. The id stays alongside the name because
+the id is the fact and a call-flow inspector needs it to link back to the row. A dangling or
+disabled class is a **warning**: hold music is decoration, and a tenant who deleted a class four
+ring groups still name has a configuration worth flagging, not a PBX that should stop routing calls.
+
+**Voicemail greetings.** `pbx-db` models the active greeting as a flag on the greeting rows rather
+than a pointer on the box (no circular foreign key; "activate this one" is a single-table update),
+with at most one active row per `(box, kind)`. The compiler applies
+`VOICEMAIL_LEAVE_GREETING_PRECEDENCE` — `temporary` beats `unavailable` — and embeds the winner as
+`object://<objectKey>`, a **domain `MediaRef`**. Rendering it as a path here would bake one
+deployment's storage layout into every artifact, and artifacts outlive deployments; resolving
+`object://` to something a media server will play is the engine's media layer's job.
+
+`busy` is deliberately unreachable: an extension's busy and no-answer branches compile to the *same*
+`voicemail:<id>:leave` node, so nothing downstream can tell the two apart. Splitting that node is a
+larger change than this one and is a recorded follow-up rather than a half-done feature. `name` is
+the directory recording and is never a call greeting.
+
+**The PIN digest.** See §3.1.
+
+### 2.6 Failover and `continueOnCauses`
 
 `TrunkDialPlanNode.continueOnCauses` defaults to `RETRYABLE_HANGUP_CAUSES` from
 `@optimiq-voice/telephony`, never "every cause". Walking a whole trunk list after a `CALL_REJECTED`
@@ -141,7 +197,7 @@ multiplies one fraudulent attempt by the number of carriers a tenant has, which 
 amplification a compromised extension is looking for. Tenants may narrow the set
 (`settings.trunkContinueOnCauses`); unknown cause names are dropped with a warning.
 
-### 2.6 Time conditions
+### 2.7 Time conditions
 
 Evaluated in the tenant's IANA zone via `Intl.DateTimeFormat`, against a caller-supplied instant.
 The DST behaviour is deliberate and pinned by tests:
@@ -181,6 +237,50 @@ one, a mutually recursive pair of IVR menus, an unanchored dial regex.
 
 The rule that falls out: **a warning never blocks a save, an error always does.**
 
+### 3.1 The voicemail PIN digest format
+
+`pbx-db`'s `voicemail_box.pin_hash` is a nullable `text` column with no stated format, and the API
+deliberately excludes PIN fields from every DTO ("a PIN is set through a dedicated endpoint that
+hashes it") — an endpoint that **does not exist yet**. So far the column has only ever been read as
+`pinHash !== null`.
+
+Once the compiler embeds that digest and the engine verifies a caller's digits against it, two
+processes in different languages, released independently, have to agree on how to check a secret.
+That agreement is a format, and a format with no owner drifts. This package owns it, in
+`src/voicemail-pin.ts`, because it is the one module both sides already depend on and it depends on
+nothing itself:
+
+```
+scrypt$N=<cost>,r=<block>,p=<parallelism>$<salt-base64>$<hash-base64>
+```
+
+- four `$`-separated fields; parameters **in the string**, so raising the cost is a re-hash on next
+  set rather than a flag day — old digests keep verifying under their own parameters;
+- standard base64 (`+/=`), salt ≥ 16 bytes, derived key exactly 32 bytes;
+- `N` a power of two, and all three parameters bounded (`N ≤ 2²⁰`, `r ≤ 32`, `p ≤ 16`) — **and the
+  working set `128·N·r` bounded at 64 MiB, which is the check that matters.** The per-parameter
+  ceilings multiply: `N = 2²⁰` and `r = 32` are each individually inside their limit and together
+  are a four-gigabyte allocation **on the call path**, triggered by a row somebody wrote. Refusing
+  at parse time means it never reaches the KDF; 64 MiB is four times the recommended working set,
+  so the cost can be raised twice before anyone revisits the number.
+
+scrypt rather than bcrypt or argon2 for one decisive reason: `node:crypto.scrypt` is standard
+library in every runtime here (Node, Bun) and `golang.org/x/crypto/scrypt` in the Go data plane, so
+verification needs no dependency in a process that is on the call path. It is also what better-auth
+— the only other password hasher in this monorepo — uses internally, so the operational story is one
+algorithm rather than two.
+
+This package **parses and validates only**. It does not hash and it does not verify: it is a pure
+compiler, and giving it a KDF so a test could hash a PIN would put one on the resolver's import
+graph. Hashing belongs to the API's (unbuilt) set-PIN endpoint, verification to `apps/engine`; both
+read the parameters out of `parseVoicemailPinHash`.
+
+A digest the compiler cannot parse raises an `invalid-pin-hash` **warning** and is **not embedded**,
+so the mailbox keeps the authentication it had. Failing the compile would take a tenant's whole call
+routing down over one mailbox; passing silently would hide "the PIN you set is not being enforced"
+from the only person who can fix it. A warning is surfaced by the same machinery as every other
+diagnostic, which is the point.
+
 Every enabled entity is compiled whether or not anything references it, so a ring group built
 before it is wired up still produces its warning, and the artifact is a complete picture of the
 tenant's call flows.
@@ -200,6 +300,23 @@ Two rules for the loader:
 1. **Do not filter out disabled rows.** `enabled = false` is a routing fact, not an absence.
 2. **Do not pre-join.** Child collections are flat arrays keyed by their parent id; the compiler
    owns every join and sorts everything it walks.
+
+### 4.1 Optional collections
+
+`mohClasses` and `voicemailGreetings` are declared **optional** on `OrgRoutingSnapshot` and listed
+in `OPTIONAL_SNAPSHOT_COLLECTIONS`. That is a rollout affordance, not a modelling accident: they
+were added after the API's snapshot loader was written, and a required field would have made this
+package impossible to release before the loader caught up.
+
+Absent and empty mean exactly the same thing everywhere. The shape assertion skips an absent
+optional collection, `canonicalizeSnapshot` hashes it as `[]`, and the compiler's indexes read it
+through `snapshotCollection`. One consequence is deliberate and worth stating: **a snapshot with no
+`mohClasses` key produces no `dangling-moh-class` warnings at all.** A loader that has not learned
+to load the table is a rollout state, not a tenant with four broken references, and one warning per
+MOH id would bury the real diagnostics on every tenant simultaneously.
+
+Once the loader populates both, the optionality is free to go — the only edit is deleting two `?`s
+and the two entries in `OPTIONAL_SNAPSHOT_COLLECTIONS`.
 
 ---
 
@@ -287,7 +404,29 @@ Because `compiledAt` is the only non-derived field, a recompile that produces th
 1. **CRUD** for every routing entity, with destination validation (`destinationShapeIssues` plus a
    real existence check against the target table — the database only enforces the trio's *shape*).
 2. **Snapshot loader** — one RLS-scoped read per collection, projected onto the `*Input` types.
-   Seventeen `select … where organization_id = $1`, no joins, disabled rows included.
+   Nineteen `select … where organization_id = $1`, no joins, disabled rows included. Two of the
+   nineteen are **not yet loaded** and are the gating follow-up for §2.5:
+
+   ```ts
+   // apps/api/src/pbx/routing/snapshot-loader.ts — add to the Promise.all batch:
+   transaction.select().from(mohClass),
+   transaction.select().from(voicemailGreeting),
+
+   // …and to the returned literal:
+   mohClasses: mohClasses.map((row) => ({ id: row.id, enabled: row.enabled, name: row.name })),
+   voicemailGreetings: voicemailGreetings.map((row) => ({
+       id: row.id,
+       voicemailBoxId: row.voicemailBoxId,
+       kind: row.kind,
+       objectKey: row.objectKey,
+       active: row.active,
+       durationMs: row.durationMs,
+       label: row.label,
+   })),
+   ```
+
+   `voicemailBoxes` also needs one more field: `pinHash: row.pinHash`. Until it is added the
+   compiler embeds no digest and `*97` keeps authenticating by the calling extension.
 3. **Compile-on-write** — after any mutation to a `ROUTING_TABLE_TO_ENTITY` table: load, compile,
    fail the request on errors, otherwise persist the artifact and evict/replace the KV key.
    `isArtifactFresh` short-circuits the write when nothing changed.
@@ -299,6 +438,13 @@ Because `compiledAt` is the only non-derived field, a recompile that produces th
 7. **A "test this number" endpoint** — the resolvers with an explicit `now` are exactly the right
    shape for a "what happens if someone calls this DID on Sunday at 3am?" tool. It costs a
    controller.
+8. **A set-PIN endpoint** — `POST /voicemail-boxes/:id/pin`, hashing with `node:crypto.scrypt` and
+   `DEFAULT_VOICEMAIL_PIN_SCRYPT_PARAMS`, writing `formatVoicemailPinHash(...)` into
+   `voicemail_box.pin_hash`. The resource file already says a PIN "is set through a dedicated
+   endpoint that hashes it"; §3.1 is now the format that endpoint must produce. Nothing enforces a
+   PIN until it exists.
+9. **An `rpc.voicemail.v1.list` responder** — see `packages/events`. The engine's `*97` menu calls
+   it and degrades to "mailbox unavailable" while nobody answers.
 
 ### Notes that constrain the API, and one for `packages/events`
 
@@ -320,7 +466,7 @@ Because `compiledAt` is the only non-derived field, a recompile that produces th
 ## 8. Development
 
 ```sh
-bun test src            # 589 colocated specs
+bun test src            # 647 colocated specs
 pnpm typecheck
 pnpm build              # tsc + ESM specifier rewrite -> dist/
 ```

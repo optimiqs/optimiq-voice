@@ -42,8 +42,8 @@
 import { canonicalJson } from "./canonical-json";
 import { RoutingSnapshotError } from "./errors";
 import { sha256 } from "./sha256";
-import { SNAPSHOT_COLLECTIONS } from "./snapshot";
-import type { OrgRoutingSnapshot, SnapshotCollection } from "./snapshot";
+import { snapshotCollection, SNAPSHOT_COLLECTIONS } from "./snapshot";
+import type { OrgRoutingSnapshot } from "./snapshot";
 
 /** The KV bucket compiled artifacts live in. Mirrors `ROUTING_CACHE_KV.name` in `packages/events`. */
 export const ROUTING_CACHE_BUCKET = "routing-cache";
@@ -101,6 +101,8 @@ export const ROUTING_TABLE_TO_ENTITY: Readonly<Record<string, RoutingEntityKind>
 	ring_group_destination: "ringGroupDestinations",
 	queue: "queues",
 	voicemail_box: "voicemailBoxes",
+	voicemail_greeting: "voicemailGreetings",
+	moh_class: "mohClasses",
 	conference: "conferences",
 	park_lot: "parkLots",
 	feature_code: "featureCodes",
@@ -161,15 +163,16 @@ export function invalidationKeysForBatch(
  * Sorting rows by id is what makes the hash independent of the loader's `ORDER BY`. Row *order*
  * within a collection carries no routing meaning — `priority` and `ordinal` do, and they are
  * fields — so sorting loses nothing and buys a hash that only moves when content moves.
+ *
+ * Every collection appears, including the optional ones and including the empty ones. An omitted
+ * optional collection hashes exactly as an empty array does, so the snapshot a loader that has not
+ * caught up produces and the snapshot it will produce once it has are the same input whenever the
+ * tenant genuinely has no rows — which is the property that lets the two ship independently.
  */
 export function canonicalizeSnapshot(snapshot: OrgRoutingSnapshot): string {
 	const collections: Record<string, unknown> = {};
 	for (const collection of SNAPSHOT_COLLECTIONS) {
-		// Every collection is an array of rows carrying an `id`; the union of their element types is
-		// not, which is the one thing a per-collection cast buys over seventeen literal accesses.
-		collections[collection] = sortById(
-			snapshot[collection as SnapshotCollection] as readonly { readonly id: string }[],
-		);
+		collections[collection] = sortById(snapshotCollection(snapshot, collection));
 	}
 	return canonicalJson({
 		organizationId: snapshot.organizationId,

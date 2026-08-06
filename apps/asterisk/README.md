@@ -124,7 +124,47 @@ pins `astdatadir` accordingly.
 
 ## Volumes
 
-No volumes are exposed.
+No volumes are exposed, and that is a limitation worth stating rather than a design choice.
+
+### Tenant audio needs one, and ARI gives no alternative
+
+Per-box voicemail greetings and voicemail message playback are tenant audio: the rows in
+`voicemail_greeting` and `voicemail_message` hold an **object-storage key**, not a path, and the
+routing compiler embeds it into the plan as `object://<objectKey>`.
+
+Asterisk cannot fetch it. ARI's `POST /channels/{id}/play` accepts exactly `sound:`, `recording:`,
+`number:`, `digits:`, `characters:` and `tone:` — **there is no HTTP media scheme**, and no URL the
+engine can hand Asterisk that makes it retrieve an object. The only way that audio plays is for the
+object store to be visible to this container as a filesystem, at which point `sound:<absolute path>`
+resolves (ARI takes an absolute path without an extension and picks the best available format
+itself).
+
+So a deployment that wants per-box greetings mounts the directory the API serves recordings from
+(`CDR_RECORDING_ROOT`) read-only, and points the engine at the same path:
+
+```yaml
+asterisk:
+  volumes:
+    - ${CDR_RECORDING_ROOT}:/var/lib/optimiq/objects:ro
+engine:
+  environment:
+    ENGINE_MEDIA_OBJECT_ROOT: /var/lib/optimiq/objects
+```
+
+`compose.yaml` deliberately does **not** do this: there is no object-store service in the stack to
+mount, so the mount would name a path that does not exist. With `ENGINE_MEDIA_OBJECT_ROOT` unset —
+the default — the engine resolves those refs to nothing, falls back to
+`ENGINE_VOICEMAIL_GREETING` / `ENGINE_UNAVAILABLE_ANNOUNCEMENT`, and records the reason in the
+walk's notes. See `apps/engine/README.md` §"Known gaps".
+
+The alternative — having the engine download the object and stage it before playing — was rejected
+for the obvious reason: it puts a network fetch on the call path, in front of a caller who is
+already connected and listening.
+
+### `sounds/`
+
+Baked into the image (`COPY sounds/ /usr/share/asterisk/sounds/en`), not mounted, so
+`sound:unavailable` resolves on a stock container with no host state.
 
 ## Contributing
 
