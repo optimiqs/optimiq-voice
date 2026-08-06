@@ -16,9 +16,8 @@ end, before any of it carries a call.
                     │ SIP (UDP/TCP today; TLS/WSS next)      │
                     ▼                                        ▼
         ┌────────────────────────────────────────────────────────┐
-        │  SIP EDGE                                              │
-        │  scaffold: Routr (contained behind packages/sipnet)     │
-        │  TARGET:   apps/sipd  ◀── you are here                  │
+        │  SIP EDGE — apps/sipd  ◀── you are here                 │
+        │  registrar today; proxying next. Nothing sits in front. │
         └───────────────┬────────────────────────────────────────┘
                         │  registrations KV  ·  sip.reg.v1 events
                         ▼
@@ -41,63 +40,63 @@ It shares one contract with every TypeScript service through
 
 ## What it does
 
-| Behaviour | Status |
-| --- | --- |
-| `REGISTER` with MD5 digest auth (`qop=auth`), 401 challenge + stale re-challenge | ✅ |
-| Stateless nonce (HMAC over expiry + salt) — any instance verifies any instance's challenge | ✅ |
-| AOR ownership check: an account may only bind its own address of record | ✅ |
-| Expiry policy: min / max clamp, `423 Interval Too Brief` + `Min-Expires`, default interval | ✅ |
-| Contact `expires` parameter overriding the `Expires` header | ✅ |
-| De-registration on `Expires: 0`, and `Contact: *` + `Expires: 0` | ✅ |
-| Registration query (`REGISTER` with no `Contact`) | ✅ |
-| Binding written to the `registrations` KV bucket | ✅ |
-| `sip.reg.v1` `registered` / `unregistered` / `expired` events on the `REGISTRATIONS` stream | ✅ |
-| Background expiry sweeper + rehydration of another instance's bindings after a restart | ✅ |
-| Credential lookup over `rpc.sip.v1.credential`, with a bounded positive+negative cache | ✅ |
-| `OPTIONS` keepalive responder | ✅ |
-| UDP + TCP listeners | ✅ |
-| Everything else → `501 Not Implemented` | ✅ |
+| Behaviour                                                                                   | Status |
+| ------------------------------------------------------------------------------------------- | ------ |
+| `REGISTER` with MD5 digest auth (`qop=auth`), 401 challenge + stale re-challenge            | ✅     |
+| Stateless nonce (HMAC over expiry + salt) — any instance verifies any instance's challenge  | ✅     |
+| AOR ownership check: an account may only bind its own address of record                     | ✅     |
+| Expiry policy: min / max clamp, `423 Interval Too Brief` + `Min-Expires`, default interval  | ✅     |
+| Contact `expires` parameter overriding the `Expires` header                                 | ✅     |
+| De-registration on `Expires: 0`, and `Contact: *` + `Expires: 0`                            | ✅     |
+| Registration query (`REGISTER` with no `Contact`)                                           | ✅     |
+| Binding written to the `registrations` KV bucket                                            | ✅     |
+| `sip.reg.v1` `registered` / `unregistered` / `expired` events on the `REGISTRATIONS` stream | ✅     |
+| Background expiry sweeper + rehydration of another instance's bindings after a restart      | ✅     |
+| Credential lookup over `rpc.sip.v1.credential`, with a bounded positive+negative cache      | ✅     |
+| `OPTIONS` keepalive responder                                                               | ✅     |
+| UDP + TCP listeners                                                                         | ✅     |
+| Everything else → `501 Not Implemented`                                                     | ✅     |
 
 ### Explicitly NOT implemented yet
 
-| Gap | Why / when |
-| --- | --- |
-| **Cache invalidation on a provisioning change** | The credential cache expires by TTL (seconds), so a disabled extension can still register for up to `SIPD_CREDENTIAL_CACHE_TTL`. `NATSStore.Forget` is the seam a JetStream consumer on the provisioning stream will attach to; that consumer belongs with the provisioning wave. |
-| **Proxy / INVITE path** | The next PG wave. `sipd` answers 501 to INVITE rather than pretending. |
-| **NAT traversal, `Record-Route`, `rport`/`received` rewriting on requests** | Comes with the proxy. Bindings already record the observed `sourceAddress`, which is the piece the proxy will need. |
-| **TLS and WSS listeners** | sipgo supports both (`ListenAndServeTLS`); wiring plus certificate management is a deployment story, not a code one. |
-| **Multiple simultaneous contacts per AOR** | The location model is one binding per AOR. Forking to a desk phone *and* a softphone needs a list-valued KV record; it is the first thing the proxy wave requires. |
-| **Multi-realm / multi-domain** | One realm per process (`SIPD_REALM`). The `Registrar` holds no package-level state, so multi-realm is "construct more of them", not a rewrite. |
-| **Nonce-count replay tracking** | Deliberate — see `internal/registrar/auth.go`. Rate limiting and the anti-fraud consumer on the `REGISTRATIONS` stream are the real mitigation, and they are control-plane concerns (plan §5 T1). |
-| **`fail2ban`-style blocking** | Same: `sipd` publishes the events, the control plane decides. |
+| Gap                                                                         | Why / when                                                                                                                                                                                                                                                                        |
+| --------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Cache invalidation on a provisioning change**                             | The credential cache expires by TTL (seconds), so a disabled extension can still register for up to `SIPD_CREDENTIAL_CACHE_TTL`. `NATSStore.Forget` is the seam a JetStream consumer on the provisioning stream will attach to; that consumer belongs with the provisioning wave. |
+| **Proxy / INVITE path**                                                     | The next PG wave. `sipd` answers 501 to INVITE rather than pretending.                                                                                                                                                                                                            |
+| **NAT traversal, `Record-Route`, `rport`/`received` rewriting on requests** | Comes with the proxy. Bindings already record the observed `sourceAddress`, which is the piece the proxy will need.                                                                                                                                                               |
+| **TLS and WSS listeners**                                                   | sipgo supports both (`ListenAndServeTLS`); wiring plus certificate management is a deployment story, not a code one.                                                                                                                                                              |
+| **Multiple simultaneous contacts per AOR**                                  | The location model is one binding per AOR. Forking to a desk phone _and_ a softphone needs a list-valued KV record; it is the first thing the proxy wave requires.                                                                                                                |
+| **Multi-realm / multi-domain**                                              | One realm per process (`SIPD_REALM`). The `Registrar` holds no package-level state, so multi-realm is "construct more of them", not a rewrite.                                                                                                                                    |
+| **Nonce-count replay tracking**                                             | Deliberate — see `internal/registrar/auth.go`. Rate limiting and the anti-fraud consumer on the `REGISTRATIONS` stream are the real mitigation, and they are control-plane concerns (plan §5 T1).                                                                                 |
+| **`fail2ban`-style blocking**                                               | Same: `sipd` publishes the events, the control plane decides.                                                                                                                                                                                                                     |
 
 ## Configuration
 
 Everything is environmental; there are no flags. Invalid configuration fails at boot with **every**
 problem listed at once, not one per restart.
 
-| Variable | Default | Notes |
-| --- | --- | --- |
-| `SIPD_REALM` | — **required** | Digest realm. Part of `HA1 = MD5(user:realm:pass)`, so changing it invalidates every credential. No default on purpose. |
-| `SIPD_LISTEN_ADDR` | `0.0.0.0:5060` | Bound by both transports. |
-| `SIPD_UDP` / `SIPD_TCP` | `true` / `true` | Toggles. Leaving TCP off is not advisable: a REGISTER with a long Contact and several Vias exceeds the safe UDP MTU. |
-| `NATS_URL` | `nats://127.0.0.1:4222` | The backbone. |
-| `SIPD_MIN_EXPIRES` | `60` | Seconds. Below this a REGISTER gets `423` + `Min-Expires`. |
-| `SIPD_MAX_EXPIRES` | `3600` | Seconds. Above this the grant is silently clamped down. |
-| `SIPD_DEFAULT_EXPIRES` | `300` | Seconds. Used when the REGISTER states no interval at all. |
-| `SIPD_NONCE_TTL` | `1m` | Go duration. How long a challenge stays usable. |
-| `SIPD_NONCE_SECRET` | random per process | **Set this fleet-wide before running more than one replica**, or a device challenged by instance A is rejected by instance B. 32+ random bytes. |
-| `SIPD_SWEEP_INTERVAL` | `5s` | How often lapsed bindings are noticed. Bounds event lateness, not binding lifetime. |
-| `SIPD_CREDENTIAL_SOURCE` | `file` | `file` (development / the SIPp rig) or `nats` (**production** — `rpc.sip.v1.credential` against `apps/api`). |
-| `SIPD_CREDENTIALS_FILE` | — | Required when the source is `file`. See `config/credentials.example.json`. |
-| `SIPD_CREDENTIAL_TIMEOUT` | `500ms` | Per-request deadline for the credential RPC — the contract's own. It sits inside a REGISTER transaction and a phone's retransmission timer starts at 500 ms, so a slower reply competes with the retry it caused. |
-| `SIPD_CREDENTIAL_CACHE_TTL` | `30s` | How long a resolved credential is reused. Short: the alternative to staleness is an account disabled minutes ago that still registers. |
-| `SIPD_CREDENTIAL_NEGATIVE_CACHE_TTL` | `10s` | How long "no such account" / "disabled" is reused. This is the half that stops a username scanner becoming one database query per guess. |
-| `SIPD_CREDENTIAL_CACHE_MAX_ENTRIES` | `10000` | Cache ceiling. An unbounded negative cache keyed on an attacker-chosen username is a memory amplifier. |
-| `SIPD_PROVISION_SECRET_KEY` | — | **Normally unset.** Only the file store's derived form uses it (see below). Production sipd holds no derivation key at all. |
-| `SIPD_USER_AGENT` | `optimiq-sipd` | `Server:` / `User-Agent:` header. |
-| `SIPD_LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. Output is JSON on stdout (`log/slog`). |
-| `SIPD_SHUTDOWN_TIMEOUT` | `10s` | Bounds graceful shutdown. |
+| Variable                             | Default                 | Notes                                                                                                                                                                                                             |
+| ------------------------------------ | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SIPD_REALM`                         | — **required**          | Digest realm. Part of `HA1 = MD5(user:realm:pass)`, so changing it invalidates every credential. No default on purpose.                                                                                           |
+| `SIPD_LISTEN_ADDR`                   | `0.0.0.0:5060`          | Bound by both transports.                                                                                                                                                                                         |
+| `SIPD_UDP` / `SIPD_TCP`              | `true` / `true`         | Toggles. Leaving TCP off is not advisable: a REGISTER with a long Contact and several Vias exceeds the safe UDP MTU.                                                                                              |
+| `NATS_URL`                           | `nats://127.0.0.1:4222` | The backbone.                                                                                                                                                                                                     |
+| `SIPD_MIN_EXPIRES`                   | `60`                    | Seconds. Below this a REGISTER gets `423` + `Min-Expires`.                                                                                                                                                        |
+| `SIPD_MAX_EXPIRES`                   | `3600`                  | Seconds. Above this the grant is silently clamped down.                                                                                                                                                           |
+| `SIPD_DEFAULT_EXPIRES`               | `300`                   | Seconds. Used when the REGISTER states no interval at all.                                                                                                                                                        |
+| `SIPD_NONCE_TTL`                     | `1m`                    | Go duration. How long a challenge stays usable.                                                                                                                                                                   |
+| `SIPD_NONCE_SECRET`                  | random per process      | **Set this fleet-wide before running more than one replica**, or a device challenged by instance A is rejected by instance B. 32+ random bytes.                                                                   |
+| `SIPD_SWEEP_INTERVAL`                | `5s`                    | How often lapsed bindings are noticed. Bounds event lateness, not binding lifetime.                                                                                                                               |
+| `SIPD_CREDENTIAL_SOURCE`             | `file`                  | `file` (development / the SIPp rig) or `nats` (**production** — `rpc.sip.v1.credential` against `apps/api`).                                                                                                      |
+| `SIPD_CREDENTIALS_FILE`              | —                       | Required when the source is `file`. See `config/credentials.example.json`.                                                                                                                                        |
+| `SIPD_CREDENTIAL_TIMEOUT`            | `500ms`                 | Per-request deadline for the credential RPC — the contract's own. It sits inside a REGISTER transaction and a phone's retransmission timer starts at 500 ms, so a slower reply competes with the retry it caused. |
+| `SIPD_CREDENTIAL_CACHE_TTL`          | `30s`                   | How long a resolved credential is reused. Short: the alternative to staleness is an account disabled minutes ago that still registers.                                                                            |
+| `SIPD_CREDENTIAL_NEGATIVE_CACHE_TTL` | `10s`                   | How long "no such account" / "disabled" is reused. This is the half that stops a username scanner becoming one database query per guess.                                                                          |
+| `SIPD_CREDENTIAL_CACHE_MAX_ENTRIES`  | `10000`                 | Cache ceiling. An unbounded negative cache keyed on an attacker-chosen username is a memory amplifier.                                                                                                            |
+| `SIPD_PROVISION_SECRET_KEY`          | —                       | **Normally unset.** Only the file store's derived form uses it (see below). Production sipd holds no derivation key at all.                                                                                       |
+| `SIPD_USER_AGENT`                    | `optimiq-sipd`          | `Server:` / `User-Agent:` header.                                                                                                                                                                                 |
+| `SIPD_LOG_LEVEL`                     | `info`                  | `debug` \| `info` \| `warn` \| `error`. Output is JSON on stdout (`log/slog`).                                                                                                                                    |
+| `SIPD_SHUTDOWN_TIMEOUT`              | `10s`                   | Bounds graceful shutdown.                                                                                                                                                                                         |
 
 ## Running
 
@@ -187,35 +186,34 @@ have been handed rather than a literal that silently drifts.
 
 ```jsonc
 {
-  "realm": "acme.example.com",
-  "accounts": [
-    // the ordinary fixture form
-    { "orgId": "018f…", "username": "1001", "password": "s3cret" },
-    // the derived form — needs SIPD_PROVISION_SECRET_KEY
-    { "orgId": "018f…", "username": "1002", "secretRef": "ext/1002/sip" }
-  ]
+	"realm": "acme.example.com",
+	"accounts": [
+		// the ordinary fixture form
+		{ "orgId": "018f…", "username": "1001", "password": "s3cret" },
+		// the derived form — needs SIPD_PROVISION_SECRET_KEY
+		{ "orgId": "018f…", "username": "1002", "secretRef": "ext/1002/sip" },
+	],
 }
 ```
 
 ### What the API side needs
 
-| Where | Variable / row | Why |
-| --- | --- | --- |
-| `apps/api` | `PROVISION_SIP_SECRET_KEY` | The root key. The **same value** the renderer used; rotating it invalidates every provisioned phone at once, which is the correct response to a compromise and the reason it is a deployment variable. |
-| `apps/api` | `PBX_DATABASE_URL`, `NATS_URL` | Without `NATS_URL` the PBX area mounts its REST surface and serves **no** RPC subjects, so no phone can register. |
-| `pbx-db` | an `org_setting` row: `category='sip'`, `name='realm'`, `value='"acme.example.com"'` | **The realm → organization directory.** `rpc.sip.v1.credential` carries no tenant — resolving one is the whole request — so the API needs to know which organization owns the realm sipd challenges with. Without it every lookup is refused with a `reason` naming this row. Two organizations claiming one realm is refused rather than resolved arbitrarily. |
-| `sipd` | `SIPD_REALM` | Must equal that `org_setting` value. It is inside `HA1`, so a mismatch is an authentication failure, not a routing one. |
+| Where      | Variable / row                                                                       | Why                                                                                                                                                                                                                                                                                                                                                             |
+| ---------- | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apps/api` | `PROVISION_SIP_SECRET_KEY`                                                           | The root key. The **same value** the renderer used; rotating it invalidates every provisioned phone at once, which is the correct response to a compromise and the reason it is a deployment variable.                                                                                                                                                          |
+| `apps/api` | `PBX_DATABASE_URL`, `NATS_URL`                                                       | Without `NATS_URL` the PBX area mounts its REST surface and serves **no** RPC subjects, so no phone can register.                                                                                                                                                                                                                                               |
+| `pbx-db`   | an `org_setting` row: `category='sip'`, `name='realm'`, `value='"acme.example.com"'` | **The realm → organization directory.** `rpc.sip.v1.credential` carries no tenant — resolving one is the whole request — so the API needs to know which organization owns the realm sipd challenges with. Without it every lookup is refused with a `reason` naming this row. Two organizations claiming one realm is refused rather than resolved arbitrarily. |
+| `sipd`     | `SIPD_REALM`                                                                         | Must equal that `org_setting` value. It is inside `HA1`, so a mismatch is an authentication failure, not a routing one.                                                                                                                                                                                                                                         |
 
 ### Failure modes, and what each one looks like
 
-| Situation | sipd | Where to look |
-| --- | --- | --- |
-| Nobody subscribed to the subject (an `apps/api` deploy) | `403`, `cannot look up the account … no responders available` | Not cached — the next REGISTER after the API returns succeeds. |
-| Realm not mapped to an organization | `403` | `apps/api` logs `refusing a credential lookup for an unmapped realm`. The phone learns nothing; the operator learns everything. |
-| Unknown extension, disabled extension, wrong password | `403`, identical status **and** reason phrase | Deliberate: a distinguishable answer is an extension enumerator. `found` and `enabled` stay separate on the RPC so the API's logs and any admin UI can still tell them apart. |
-| `PROVISION_SIP_SECRET_KEY` unset on the API | `403` | The renderer already refuses to emit a config without it, so such a deployment has no provisioned phones anyway. |
-| Realm changed on one side only | `403` for every account | `HA1` is computed over the realm. Change it in both places and re-provision. |
-
+| Situation                                               | sipd                                                          | Where to look                                                                                                                                                                 |
+| ------------------------------------------------------- | ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Nobody subscribed to the subject (an `apps/api` deploy) | `403`, `cannot look up the account … no responders available` | Not cached — the next REGISTER after the API returns succeeds.                                                                                                                |
+| Realm not mapped to an organization                     | `403`                                                         | `apps/api` logs `refusing a credential lookup for an unmapped realm`. The phone learns nothing; the operator learns everything.                                               |
+| Unknown extension, disabled extension, wrong password   | `403`, identical status **and** reason phrase                 | Deliberate: a distinguishable answer is an extension enumerator. `found` and `enabled` stay separate on the RPC so the API's logs and any admin UI can still tell them apart. |
+| `PROVISION_SIP_SECRET_KEY` unset on the API             | `403`                                                         | The renderer already refuses to emit a config without it, so such a deployment has no provisioned phones anyway.                                                              |
+| Realm changed on one side only                          | `403` for every account                                       | `HA1` is computed over the realm. Change it in both places and re-provision.                                                                                                  |
 
 ## Tests
 

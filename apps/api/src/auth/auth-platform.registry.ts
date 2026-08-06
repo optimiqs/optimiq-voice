@@ -1,31 +1,21 @@
 import type { AuthPlatform } from "./auth.platform";
-import type { LegacyAccessKeyRepository } from "./legacy-access-key.repository";
 
 /**
  * A process-global handle on the auth platform, for the parts of `apps/api` that Nest does not
  * construct.
  *
- * `RuntimeHostService` starts the legacy runtime (`src/runtime/app-runtime.ts`) from
- * `onApplicationBootstrap`: the gRPC servers, the ARI dispatcher and the NATS subscription. None
- * of them are Nest providers, so none of them can inject `AUTH_PLATFORM` — yet the ARI dispatcher
- * is exactly where identity-removal Step 4 item 4 has to mint a per-call token.
- *
- * The alternatives were worse. Constructing a second `AuthPlatform` inside the runtime would open
- * a second PostgreSQL pool and a second JWKS cache against the same database; rewriting the ARI
- * path into Nest providers is the P1 slice rewrite, not a step of this cutover. A single,
- * explicitly-named registry that `AuthModule` publishes and the runtime reads is the smallest
- * seam that keeps one pool and stays greppable — and it disappears when the voice path becomes a
- * feature slice.
+ * It exists for code started outside the Nest container, which cannot inject `AUTH_PLATFORM` and
+ * must not construct a second one: a second `AuthPlatform` means a second PostgreSQL pool and a
+ * second JWKS cache against the same database. A single, explicitly-named registry that
+ * `AuthModule` publishes is the smallest seam that keeps one pool and stays greppable.
  *
  * It fails **closed**: `requireAuthRuntime()` throws when the slice is not mounted, so an
  * environment without `DATABASE_URL` / `AUTH_SECRET` / `AUTH_URL` cannot silently fall back to an
- * unauthenticated call path. (It also cannot fall back to the identity signer — that path is
- * deleted.)
+ * unauthenticated call path.
  */
 
 export interface AuthRuntimeHandle {
 	readonly platform: AuthPlatform;
-	readonly legacyAccessKeys: LegacyAccessKeyRepository;
 }
 
 let current: AuthRuntimeHandle | undefined;

@@ -17,10 +17,6 @@ describe("config env module", () => {
 
 	it("parses strict booleans, defaults and APP_ENV_CONTENT hydration", async () => {
 		process.env.NODE_ENV = "test";
-		process.env.API_AUTHZ_SERVICE_ENABLED = "false";
-		process.env.API_IDENTITY_OAUTH2_GITHUB_ENABLED = "0";
-		process.env.AUTOPILOT_KNOWLEDGE_BASE_ENABLED = "1";
-		process.env.ROUTR_NATS_PUBLISHER_ENABLED = "true";
 		process.env.API_SMTP_SECURE = "";
 		process.env.API_NATS_URL = "nats://nats:4222";
 		process.env.API_DATABASE_URL = "postgresql://postgres:postgres@postgres:5432/optimiq-voice";
@@ -34,12 +30,10 @@ describe("config env module", () => {
 		const mod = await import("./env");
 
 		expect(mod.env.NODE_ENV).toBe("test");
-		// "false" / "0" / "" must never be truthy — the whole point of the strict parser.
-		expect(mod.env.API_AUTHZ_SERVICE_ENABLED).toBe(false);
-		expect(mod.env.API_IDENTITY_OAUTH2_GITHUB_ENABLED).toBe(false);
+		// "" must never be truthy — the whole point of the strict parser. `API_SMTP_SECURE` is the
+		// last booleanString key in the schema now that the identity/authz/autopilot/Routr blocks
+		// are deleted, so it carries the case on its own.
 		expect(mod.env.API_SMTP_SECURE).toBe(false);
-		expect(mod.env.AUTOPILOT_KNOWLEDGE_BASE_ENABLED).toBe(true);
-		expect(mod.env.ROUTR_NATS_PUBLISHER_ENABLED).toBe(true);
 
 		// Telephony defaults survive an otherwise empty environment.
 		expect(mod.env.ASTERISK_RTP_PORT_START).toBe(10000);

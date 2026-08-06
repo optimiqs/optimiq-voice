@@ -38,14 +38,6 @@ const optionalUri = z.preprocess(
 
 const port = (fallback: number) => z.coerce.number().int().min(1).max(65535).default(fallback);
 
-const optionalE164 = z.preprocess(
-	(value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
-	z
-		.string()
-		.regex(/^\+[1-9]\d{1,14}$/u, "must be E.164 (e.g. +14155552671)")
-		.optional(),
-);
-
 /** The single dotenv file is the repository root `.env`. Nothing above the repo is read. */
 const findEnvPath = (filename: string): string | null => {
 	const baseDir = import.meta.dirname;
@@ -211,27 +203,7 @@ const envSchema = z.object({
 	API_ASTERISK_ARI_PROXY_URL: optionalUrl,
 	API_ASTERISK_ARI_SECRET: optionalString,
 	API_ASTERISK_ARI_USERNAME: z.string().default("ari"),
-	API_AUTHZ_SERVICE_ENABLED: booleanString.default(false),
-	API_AUTHZ_SERVICE_HOST: optionalString,
-	API_AUTHZ_SERVICE_METHODS: optionalString,
-	API_AUTHZ_SERVICE_PORT: port(50071),
-	API_CLOAK_ENCRYPTION_KEY: optionalString,
 	API_DATABASE_URL: optionalUri,
-	API_IDENTITY_DATABASE_URL: optionalUri,
-	API_IDENTITY_ISSUER: optionalString,
-	API_IDENTITY_OAUTH2_GITHUB_CLIENT_ID: optionalString,
-	API_IDENTITY_OAUTH2_GITHUB_CLIENT_SECRET: optionalString,
-	API_IDENTITY_OAUTH2_GITHUB_ENABLED: booleanString.default(false),
-	API_IDENTITY_WORKSPACE_INVITE_FAIL_URL: optionalUrl,
-	API_IDENTITY_WORKSPACE_INVITE_URL: optionalUrl,
-	API_IDENTITY_WORKSPACE_INVITE_EXPIRATION: z.string().default("1d"),
-	API_IDENTITY_CONTACT_VERIFICATION_REQUIRED: booleanString.default(false),
-	API_IDENTITY_TWO_FACTOR_AUTHENTICATION_REQUIRED: booleanString.default(false),
-	API_INFLUXDB_INIT_ORG: optionalString,
-	API_INFLUXDB_INIT_PASSWORD: optionalString,
-	API_INFLUXDB_INIT_TOKEN: optionalString,
-	API_INFLUXDB_INIT_USERNAME: optionalString,
-	API_INFLUXDB_URL: optionalUrl,
 	API_LOGS_FORMAT: z.enum(["json", "pretty", "none"]).default("json"),
 	API_LOGS_LEVEL: optionalString,
 	API_LOGS_TRANSPORT: optionalString,
@@ -240,47 +212,12 @@ const envSchema = z.object({
 	API_OWNER_NAME: optionalString,
 	API_OWNER_PASSWORD: optionalString,
 	API_ROOT_DOMAIN: optionalString,
-	/**
-	 * The SIP password apps/api hands Routr for the default peer. Present here only so the
-	 * production placeholder check can see it; `apps/api/src/envs.ts` is what reads it.
-	 */
-	API_ROUTR_DEFAULT_PEER_PASSWORD: optionalString,
 	API_SMTP_AUTH_PASS: optionalString,
 	API_SMTP_AUTH_USER: optionalString,
 	API_SMTP_HOST: optionalString,
 	API_SMTP_PORT: port(587),
 	API_SMTP_SECURE: booleanString.default(true),
 	API_SMTP_SENDER: optionalString,
-	API_SIGNALING_SERVER: optionalUri,
-	API_TWILIO_ACCOUNT_SID: optionalString,
-	API_TWILIO_AUTH_TOKEN: optionalString,
-	API_TWILIO_PHONE_NUMBER: optionalE164,
-
-	// ---- Autopilot -----------------------------------------------------------------------
-	AUTOPILOT_AWS_S3_ACCESS_KEY_ID: optionalString,
-	AUTOPILOT_AWS_S3_ENDPOINT: optionalUrl,
-	AUTOPILOT_AWS_S3_REGION: z.string().default("us-east-1"),
-	AUTOPILOT_AWS_S3_SECRET_ACCESS_KEY: optionalString,
-	AUTOPILOT_CONVERSATION_PROVIDER: z.enum(["api", "file"]).default("api"),
-	AUTOPILOT_CONVERSATION_PROVIDER_FILE: optionalString,
-	AUTOPILOT_INTEGRATIONS_FILE: optionalString,
-	AUTOPILOT_KNOWLEDGE_BASE_ENABLED: booleanString.default(false),
-	AUTOPILOT_LOGS_FORMAT: optionalString,
-	AUTOPILOT_LOGS_LEVEL: optionalString,
-	AUTOPILOT_LOGS_TRANSPORT: optionalString,
-	AUTOPILOT_OPENAI_API_KEY: optionalString,
-	AUTOPILOT_UNSTRUCTURED_API_KEY: optionalString,
-	AUTOPILOT_UNSTRUCTURED_API_URL: optionalUrl,
-
-	// ---- Routr (SIP signaling) -----------------------------------------------------------
-	ROUTR_DATABASE_URL: optionalUri,
-	ROUTR_EXTERNAL_ADDRS: optionalString,
-	ROUTR_LOGS_FORMAT: optionalString,
-	ROUTR_LOGS_LEVEL: optionalString,
-	ROUTR_LOGS_TRANSPORT: optionalString,
-	ROUTR_NATS_PUBLISHER_ENABLED: booleanString.default(true),
-	ROUTR_NATS_PUBLISHER_URL: optionalUri,
-	ROUTR_RTPENGINE_HOST: optionalString,
 
 	// ---- Asterisk (media / application server) -------------------------------------------
 	ASTERISK_ARI_PROXY_URL: optionalUrl,
@@ -296,17 +233,6 @@ const envSchema = z.object({
 	ASTERISK_SIPPROXY_PORT: port(5060),
 	ASTERISK_SIPPROXY_SECRET: optionalString,
 	ASTERISK_SIPPROXY_USERNAME: z.string().default("voice"),
-
-	// ---- RTP engine ----------------------------------------------------------------------
-	RTPENGINE_PORT_MAX: port(20000),
-	RTPENGINE_PORT_MIN: port(10000),
-	RTPENGINE_PUBLIC_IP: optionalString,
-
-	// ---- InfluxDB (CDR / metrics) --------------------------------------------------------
-	INFLUXDB_INIT_ORG: optionalString,
-	INFLUXDB_INIT_PASSWORD: optionalString,
-	INFLUXDB_INIT_TOKEN: optionalString,
-	INFLUXDB_INIT_USERNAME: optionalString,
 
 	// ---- Postgres ------------------------------------------------------------------------
 	POSTGRES_PASSWORD: optionalString,

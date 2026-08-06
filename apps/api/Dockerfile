@@ -25,11 +25,10 @@ RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# `node .scripts/copy-hbs.cjs` is no longer run here: it copies `packages/identity/src/templates`
-# into that package's `dist`, and `apps/api` has not depended on `@optimiq-voice/identity` since
-# the identity service was removed — so the package is not in this filter's closure and the
-# templates are not in the deploy tree either. This app's mail bodies are TypeScript template
-# functions (`src/mail/mail-templates.ts`), which the compiler emits like any other module.
+# There is no Handlebars template copy step. The legacy `.scripts/copy-hbs.cjs` existed to move the
+# identity service's `.hbs` mail bodies into its `dist`; both the script and that package are
+# deleted. This app's mail bodies are TypeScript template functions (`src/mail/mail-templates.ts`),
+# which the compiler emits like any other module.
 RUN pnpm --filter @optimiq-voice/api... run build
 
 RUN PNPM_CONFIG_INJECT_WORKSPACE_PACKAGES=true pnpm --filter @optimiq-voice/api deploy --prod /prod/api \
@@ -58,18 +57,14 @@ USER appuser
 # Extract database host and port from API_DATABASE_URL environment variable.
 #
 # Two steps that used to run between the migration and the server are gone with the legacy
-# platform:
+# platform: the identity service's own `db-provision.mjs` (which provisioned `fnidentity`), and
+# `dist/core/seed.js` (which seeded a product catalogue and a default owner from `API_OWNER_*`).
+# Sign-up is better-auth's now, and the PBX/CDR demo seeds are
+# `pnpm --filter @optimiq-voice/api seed:pbx` / `seed:cdr` — developer tools, not a boot step.
 #
-#   node /service/node_modules/@optimiq-voice/identity/scripts/db-provision.mjs
-#     provisioned the `fnidentity` database for the deleted identity service. `apps/api` no longer
-#     depends on `@optimiq-voice/identity`, so the path does not exist in the deploy tree at all.
-#
-#   node /service/dist/core/seed.js
-#     seeded that database's product catalogue and the default owner/workspace from
-#     `API_OWNER_*`. Its source (`src/core/seed.ts`) is deleted; sign-up is better-auth's, and the
-#     PBX/CDR demo seeds are `pnpm --filter @optimiq-voice/api seed:pbx` / `seed:cdr`, which are
-#     developer tools rather than a boot step.
-#
-# `scripts/db-provision.mjs` stays: it is this app's OWN drizzle migration runner against
-# API_DATABASE_URL, and `main.ts`'s tenant-RLS preflight asserts the shape it produces.
+# `scripts/db-provision.mjs` stays. It is this app's OWN drizzle migration runner against
+# API_DATABASE_URL, and it is what applies `drizzle/20260806164427_drop_legacy_api_tables` to an
+# existing deployment. Note that it migrates only the BASE database: `PBX_DATABASE_URL` and
+# `CDR_DATABASE_URL` are migrated by `packages/pbx-db` and `packages/cdr-db` (`pnpm db:migrate`),
+# which run outside this image.
 CMD ["sh", "-c", "DB_HOST=$(echo $API_DATABASE_URL | sed -n 's/.*@\\([^:/]*\\)[:/].*/\\1/p') && DB_PORT=$(echo $API_DATABASE_URL | sed -n 's/.*:\\([0-9]*\\)\\/.*/\\1/p') && if [ -z \"$DB_PORT\" ]; then DB_PORT=5432; fi && dockerize -wait tcp://${DB_HOST}:${DB_PORT} -timeout 30s && node /service/scripts/db-provision.mjs && node /service/dist/index.js"]

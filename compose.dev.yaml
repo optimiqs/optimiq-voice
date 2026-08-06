@@ -1,7 +1,7 @@
 services:
-  # `dashboard` is deliberately absent: the legacy React Router app is no longer part of the stack.
-  # Its source and Dockerfile are untouched, so `docker build -f apps/dashboard/Dockerfile .` still
-  # works for anyone who needs it — it just is not wired up any more.
+  # `dashboard` is absent because `apps/dashboard` is deleted, along with `routr`, `rtpengine`,
+  # `influxdb` and `autoheal` — see the note at the bottom of compose.yaml for each. `apps/web` is
+  # the frontend and `apps/sipd` is the SIP edge.
   web:
     build:
       context: .
@@ -25,31 +25,15 @@ services:
     # The gRPC listener on :50051 is gone too. It was never published to the host — it terminated
     # plaintext h2c and its interceptor verified a token the same process signed, so publishing it
     # would have put a credential oracle on 0.0.0.0 of every developer machine — and now the
-    # listener itself does not exist. `API_ROUTR_API_ENDPOINT` went with it: nothing in this app
-    # provisions Routr any more.
+    # listener itself does not exist. `API_ROUTR_API_ENDPOINT` went with it: Routr is deleted.
     environment:
       - API_SMTP_PORT
       - API_SMTP_SECURE
-
-  routr:
-    ports:
-      - 51907:51907
-      - 51908:51908
-      - 5060:5060/udp
-      - 5060-5063:5060-5063
-    environment:
-      # In development this environment variable points to an
-      # address not accessible from the container. Therefore, we
-      # need to manually point to the NAT's container address here.
-      #
-      # The credentials are IN THE URL, unlike every first-party service, because `routr` is a
-      # third-party image whose only NATS configuration is this one variable. It does not log the
-      # URL, which is what makes that acceptable here and not elsewhere.
-      NATS_PUBLISHER_URL: nats://${NATS_USER}:${NATS_PASS}@nats:4222
-      CONSOLE_PUBLISHER_ENABLED: "true"
     volumes:
-      - ./etc/log4j2.yaml:/etc/routr/log4j2.yaml
-      - ./.keys/public.pem:/etc/routr/keys/public.pem
+      # The object store, read-write — the same directory the `asterisk` service mounts read-only
+      # below. Without it, an upload written inside this container is invisible to the media server
+      # and every prompt, greeting and hold-music file plays as silence.
+      - ${PBX_MEDIA_OBJECT_ROOT:-${CDR_RECORDING_ROOT:-./.media}}:/opt/optimiq-voice/recordings
 
   asterisk:
     build:
@@ -106,10 +90,6 @@ services:
   postgres:
     ports:
       - 5432:5432
-
-  influxdb:
-    ports:
-      - 8086:8086
 
   nats:
     ports:

@@ -1,0 +1,25 @@
+{
+  "version": "8",
+  "dialect": "postgres",
+  "id": "03c1eeef-dfea-43a2-88ba-d717d258d6e2",
+  "prevIds": [
+    "be982965-a96b-436a-8f08-352652448a01"
+  ],
+  "ddl": [
+    {
+      "superuser": false,
+      "createDb": false,
+      "createRole": false,
+      "inherit": false,
+      "canLogin": false,
+      "replication": false,
+      "bypassRls": false,
+      "connLimit": -1,
+      "password": null,
+      "validUntil": null,
+      "name": "api_tenant_tls",
+      "entityType": "roles"
+    }
+  ],
+  "renames": []
+}

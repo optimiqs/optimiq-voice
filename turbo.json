@@ -4,14 +4,13 @@
 	"tasks": {
 		"build": {
 			"dependsOn": ["^build"],
-			"outputs": ["dist/**", "build/**", ".react-router/**", ".next/**", "!.next/cache/**"]
+			"outputs": ["dist/**", "build/**", ".next/**", "!.next/cache/**"]
 		},
 		"clean": {
 			"cache": false
 		},
 		"typecheck": {
-			"dependsOn": ["^build"],
-			"outputs": [".react-router/**"]
+			"dependsOn": ["^build"]
 		},
 		"test": {
 			"dependsOn": ["^build"],

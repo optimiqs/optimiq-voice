@@ -1,2 +1,0 @@
-export const SIGN_ALGORITHM = "RS256";
-export const VERIFICATION_CODE_EXPIRATION = 5 * 60 * 1000;

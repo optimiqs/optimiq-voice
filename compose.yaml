@@ -37,24 +37,74 @@ services:
   api:
     image: optimiq-voice/api:0.17.1
     restart: unless-stopped
-    # Only what the process still reads. Every entry below was checked against the source; the
-    # ones that went with the legacy areas are listed at the bottom of this block rather than
-    # left here as environment the container accepts and ignores.
+    # Only what the process still reads, and now ALL of it.
+    #
+    # Until this wave the list was a subset: it carried the auth slice's database but not its
+    # secret, and neither telephony database at all, so a stack started from the shipped file came
+    # up as an HTTP server with no authentication and no PBX, CDR, live, provisioning or media
+    # surface — every one of which `main.ts` mounts only when its own variable is present. The
+    # areas gate themselves silently by design (`isAuthSliceConfigured`, `isPbxAreaEnabled`,
+    # `isCdrAreaEnabled`), which is right for a deployment that means it and wrong for the file
+    # that is supposed to describe the whole platform.
     environment:
       # The public origin. `src/auth/auth.config.ts` uses it as better-auth's `baseURL` and
       # `src/mail/mail-env.ts` falls back to it for the links in verification, password-reset,
       # invitation and voicemail mail.
       - API_APP_URL
-      # The telephony database. `packages/config` maps it onto the canonical `DATABASE_URL`, and
-      # `main.ts` asserts its tenant-RLS contract before `NestFactory.create`.
+      #
+      # --- The auth slice: all three, or none of it mounts --------------------------------------
+      #
+      # `isAuthSliceConfigured()` is `DATABASE_URL && AUTH_SECRET && AUTH_URL`, and the PBX and CDR
+      # areas are gated on the auth slice in turn — their routes are `@RequirePermissions`-guarded
+      # and the guard comes from it. So a missing AUTH_SECRET does not degrade authentication, it
+      # removes the entire product surface.
+      #
+      # The base database. `packages/config` maps `API_DATABASE_URL` onto the canonical
+      # `DATABASE_URL`; better-auth's tables (`packages/db`) live here.
       - API_DATABASE_URL
-      # The broker. `API_NATS_URL` is the transitional name `packages/config` maps onto `NATS_URL`,
-      # which is what the PBX, CDR, live and provisioning areas actually read.
+      # Signs every session cookie and every one-time link. `openssl rand -base64 32`; at least 32
+      # characters, and production refuses to boot on the `.env.example` placeholder.
+      - AUTH_SECRET
+      # The public origin better-auth signs cookies and builds callback URLs against. Production
+      # requires it to be HTTPS. It is the browser-facing origin — `web`, not `api`.
+      - AUTH_URL
+      #
+      # --- The telephony areas ------------------------------------------------------------------
+      #
+      # Separate databases from the base one, deliberately (plan §3.3). `PBX_DATABASE_URL` mounts
+      # extensions, ring groups, IVRs, queues, voicemail, routing, the media library and device
+      # provisioning; `CDR_DATABASE_URL` mounts call reporting and recording playback.
+      - PBX_DATABASE_URL
+      - CDR_DATABASE_URL
+      #
+      # --- The broker --------------------------------------------------------------------------
+      #
+      # BOTH names, and that is not redundancy. `API_NATS_URL` is the transitional alias
+      # `packages/config` maps onto `NATS_URL` for anything reading through that package — but the
+      # PBX and CDR areas parse `process.env` directly at their own boundary and read the
+      # unprefixed name, and `cdr-env.ts` requires it. With only the prefixed name set, the CDR
+      # area fails its schema at boot and the PBX area silently skips the routing-cache publish and
+      # the `rpc.routing.v1.resolve` responder.
       - API_NATS_URL
+      - NATS_URL
       # The broker requires authentication (see the `nats` service and config/nats.conf).
       # These are the canonical, unprefixed names every platform service reads.
       - NATS_USER
       - NATS_PASS
+      #
+      # --- Media ---------------------------------------------------------------------------------
+      #
+      # One object store, mounted once. `CDR_RECORDING_ROOT` is the root the PBX area's voicemail
+      # media and media library both inherit (`PBX_VOICEMAIL_MEDIA_ROOT`, `PBX_MEDIA_OBJECT_ROOT`),
+      # and it must name the same directory `apps/engine` writes into and Asterisk reads back as
+      # `ENGINE_MEDIA_OBJECT_ROOT` — an upload written anywhere else is a prompt that has a row, a
+      # working preview in the admin UI, and silence on the call.
+      - CDR_RECORDING_ROOT
+      # Signs recording and voicemail playback URLs. Optional: without it the LISTS still work and
+      # minting a playback URL fails with a named error rather than falling back to an unsigned
+      # route. There is no default and there never will be one.
+      - CDR_RECORDING_URL_SECRET
+      #
       # Mail. `src/mail/mail-env.ts` reads the `MAIL_*` names first and these as the aliases.
       - API_SMTP_AUTH_PASS
       - API_SMTP_AUTH_USER
@@ -67,16 +117,17 @@ services:
       #
       #   API_ASTERISK_ARI_*        src/voice's ARI application (deleted; apps/engine owns ARI)
       #   API_AUTHZ_SERVICE_*       src/voice/client/AuthorizationHandler (deleted)
-      #   API_CLOAK_ENCRYPTION_KEY  src/core/db.ts's field encryption (deleted). Still read by the
-      #                             one-shot identity migration scripts, which run from a shell
-      #                             and not from this container.
+      #   API_CLOAK_ENCRYPTION_KEY  src/core/db.ts's field encryption, then the one-shot identity
+      #                             migration scripts. Both deleted; nothing decrypts a cloaked
+      #                             value anywhere in this repository.
       #   API_IDENTITY_*            the identity service and its invite controller (deleted)
-      #   API_INFLUXDB_*            src/calls' metrics writer (deleted)
-      #   API_LOGS_*                @optimiq-voice/logger (replaced by @optimiq-voice/logging,
+      #   API_INFLUXDB_*            src/calls' metrics writer (deleted, with InfluxDB itself)
+      #   API_LOGS_*                the deleted logger package (replaced by @optimiq-voice/logging,
       #                             which reads LOG_LEVEL / LOG_PRETTY)
       #   API_OWNER_*               src/core/seed.ts's default owner (deleted; sign-up is
       #                             better-auth's)
       #   API_ROOT_DOMAIN           had no reader in this app even before this change
+      #   API_ROUTR_*               Routr provisioning (deleted, with Routr itself)
       #   API_SIGNALING_SERVER      src/core/testTokenConfig.ts (deleted)
       #   API_TWILIO_*              the identity service's 2FA / contact verification (deleted)
     expose:
@@ -99,65 +150,6 @@ services:
     # `./config/integrations.json:/opt/optimiq-voice/integrations.json:ro` (API_INTEGRATIONS_FILE)
     # carried the STT/TTS vendor credentials for the deleted `src/voice` ARI application. Speech
     # integration returns with the AI-agent app, on its own configuration surface.
-
-  routr:
-    image: optimiq-voice/routr-one:2.13.22
-    restart: unless-stopped
-    labels:
-      - "autoheal=true"
-    environment:
-      DATABASE_URL: ${ROUTR_DATABASE_URL}
-      EXTERNAL_ADDRS: ${ROUTR_EXTERNAL_ADDRS}
-      LOGS_FORMAT: ${ROUTR_LOGS_FORMAT}
-      LOGS_LEVEL: ${ROUTR_LOGS_LEVEL}
-      LOGS_TRANSPORT: ${ROUTR_LOGS_TRANSPORT}
-      NATS_PUBLISHER_ENABLED: true
-      NATS_PUBLISHER_URL: ${ROUTR_NATS_PUBLISHER_URL}
-      RTPENGINE_HOST: ${ROUTR_RTPENGINE_HOST}
-      START_INTERNAL_DB: "false"
-      CONNECT_VERIFIER_PUBLIC_KEY_PATH: /etc/routr/keys/public.pem
-    expose:
-      - 51907
-      - 51908
-    ports:
-      - 5060:5060/udp
-      - 5060-5063:5060-5063
-    # Add this healthcheck along with the autoheal container as we are having issues with Routr crashing out.
-    # We will need a proper fix for this before we can remove this healthcheck.
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          'printf "REGISTER sip:localhost SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bKhealth\r\nFrom: <sip:health@localhost>;tag=1234\r\nTo: <sip:health@localhost>\r\nCall-ID: health-$$@localhost\r\nCSeq: 1 REGISTER\r\nMax-Forwards: 70\r\nContent-Type: text/plain\r\nContent-Length: 4\r\n\r\nping" | nc -u -w 1 127.0.0.1 5060 | grep -Eq "^SIP/2.0"',
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 6
-      start_period: 15s
-    volumes:
-      - ./.keys/public.pem:/etc/routr/keys/public.pem:ro
-
-  # RTPEngine uses a range of ports to handle RTP traffic. Because exposing a large range of ports
-  # is not possible in Docker, we need to use network_mode: host.
-  #
-  # Unfortunately, network_mode: host is not supported for Windows or Mac.
-  # In those cases, we need to use a different approach.
-  #
-  # By default we are opening a small range of ports (10000-10100) to handle RTP traffic.
-  # However, this is not enough for production environments.
-  #
-  # We recommend that when using Linux you use network_mode: host and remove the ports section.
-  rtpengine:
-    image: optimiq-voice/rtpengine:0.3.17
-    restart: unless-stopped
-    platform: linux/x86_64
-    ports:
-      - 10000-10100:10000-10100/udp
-      - 8080:8080
-    environment:
-      PORT_MAX: ${RTPENGINE_PORT_MAX}
-      PORT_MIN: ${RTPENGINE_PORT_MIN}
-      PUBLIC_IP: ${RTPENGINE_PUBLIC_IP}
 
   asterisk:
     image: optimiq-voice/asterisk:22
@@ -230,21 +222,6 @@ services:
     volumes:
       - db:/var/lib/postgresql/data
 
-  influxdb:
-    image: influxdb:2.7
-    restart: unless-stopped
-    expose:
-      - 8086
-    environment:
-      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_INIT_TOKEN}
-      DOCKER_INFLUXDB_INIT_BUCKET: calls
-      DOCKER_INFLUXDB_INIT_MODE: setup
-      DOCKER_INFLUXDB_INIT_ORG: ${INFLUXDB_INIT_ORG}
-      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUXDB_INIT_PASSWORD}
-      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUXDB_INIT_USERNAME}
-    volumes:
-      - influxdb:/var/lib/influxdb2
-
   # The platform backbone. It runs from `config/nats.conf` rather than command-line
   # flags because the flags cannot express authorization, and a config file and a
   # command line are not merged — so `-js --store_dir /data` moved into the file's
@@ -274,29 +251,29 @@ services:
     expose:
       - 4222
 
-  # `envoy` is gone, and nothing replaced it.
+  # Four services are gone from this file and are NOT coming back under these names.
   #
-  # It was the stack's TLS terminator and edge router on 8449: `/optimiq_voice.*` to the API's
-  # gRPC-web listener, `/api/*` to its HTTP bridge, everything else to the dashboard. Two of those
-  # three destinations no longer exist — the gRPC listener died with the legacy services in this
-  # wave, and the dashboard was de-shipped earlier — and the third moved: `web` proxies `/api/auth/*`
-  # and `/api/v1/*` to `api:9876` from its own Next server, which is what keeps the better-auth
-  # session cookie first-party. A second proxy in front of that only added a place for the cookie
-  # domain and the CORS story to disagree.
+  # `envoy` was the stack's TLS terminator and edge router on 8449: `/optimiq_voice.*` to the API's
+  # gRPC-web listener, `/api/*` to its HTTP bridge, everything else to the dashboard. All three
+  # destinations are gone. `web` proxies `/api/auth/*` and `/api/v1/*` to `api:9876` from its own
+  # Next server, which is what keeps the better-auth session cookie first-party; a second proxy in
+  # front of that only added a place for the cookie domain and the CORS story to disagree. A
+  # deployment that wants TLS terminates it in front of `web` (see its `ports` above).
   #
-  # `config/envoy.yaml` and `config/envoy.dev.yaml` are still on disk and are deleted in wave 2.
-  # A deployment that wants TLS terminates it in front of `web` (see its `ports` above).
-
-  autoheal:
-    image: willfarrell/autoheal:latest
-    restart: unless-stopped
-    environment:
-      - AUTOHEAL_CONTAINER_LABEL=autoheal
-      - AUTOHEAL_INTERVAL=10
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+  # `routr` and `rtpengine` were the SIP edge and the media relay of the legacy call path.
+  # `apps/sipd` is the SIP edge now, and it derives its credentials over `rpc.sip.v1.credential`
+  # from the broker rather than from a Routr database. Their ports (5060-5063, 51907-51908,
+  # 10000-10100/udp) are no longer published by anything in this file.
+  #
+  # `influxdb` held the legacy `calls` bucket that `src/calls`' metrics writer wrote to. Call
+  # records live in PostgreSQL now — `packages/cdr-db`, partitioned, tenant-scoped by RLS and
+  # queryable by the CDR area. The bucket was dropped without a backfill: nothing reads it.
+  #
+  # `autoheal` existed for one reason — `routr` crashed and needed restarting — and it was given
+  # the Docker socket to do it. A container with `/var/run/docker.sock` can start any container on
+  # the host as root; that is a very large capability to hold for a workaround to a service that no
+  # longer exists.
 
 volumes:
   db:
-  influxdb:
   nats:

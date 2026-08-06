@@ -15,22 +15,14 @@ const productionBaseline: EnvInvariantConfig = {
 	AUTH_SECRET: "a".repeat(48),
 	AUTH_URL: "https://auth.optimiq.example",
 	API_APP_URL: "https://app.optimiq.example",
-	API_CLOAK_ENCRYPTION_KEY: "k1.aesgcm256.notTheExampleKeyValue0000000000=",
 	API_OWNER_PASSWORD: "a-real-owner-password",
-	API_ROUTR_DEFAULT_PEER_PASSWORD: "a-real-peer-password",
 	API_ASTERISK_ARI_SECRET: "a-real-ari-secret",
 	ASTERISK_ARI_SECRET: "a-real-ari-secret",
 	ASTERISK_SIPPROXY_SECRET: "a-real-sipproxy-secret",
 	ASTERISK_SIPPROXY_HOST: "203.0.113.10",
 	ASTERISK_RTP_PORT_START: 10000,
 	ASTERISK_RTP_PORT_END: 20000,
-	ROUTR_EXTERNAL_ADDRS: "203.0.113.10",
-	RTPENGINE_PUBLIC_IP: "203.0.113.10",
-	RTPENGINE_PORT_MIN: 10000,
-	RTPENGINE_PORT_MAX: 20000,
 	POSTGRES_PASSWORD: "a-real-postgres-password",
-	INFLUXDB_INIT_PASSWORD: "a-real-influx-password",
-	API_INFLUXDB_INIT_PASSWORD: "a-real-influx-password",
 };
 
 const withProduction = (overrides: Partial<EnvInvariantConfig>): EnvInvariantConfig => ({
@@ -51,14 +43,6 @@ describe("env invariants outside production", () => {
 				ASTERISK_RTP_PORT_END: 10000,
 			}),
 		).toThrow("ASTERISK_RTP_PORT_START must be lower than ASTERISK_RTP_PORT_END.");
-
-		expect(() =>
-			assertEnvInvariants({
-				NODE_ENV: "development",
-				RTPENGINE_PORT_MIN: 30000,
-				RTPENGINE_PORT_MAX: 30000,
-			}),
-		).toThrow("RTPENGINE_PORT_MIN must be lower than RTPENGINE_PORT_MAX.");
 	});
 });
 
@@ -121,22 +105,10 @@ describe("env invariants in production", () => {
 				overrides: { AUTH_SECRET: "replace-with-a-generated-auth-secret" },
 			},
 			{ key: "API_OWNER_PASSWORD", overrides: { API_OWNER_PASSWORD: "changeme" } },
-			{
-				key: "API_ROUTR_DEFAULT_PEER_PASSWORD",
-				overrides: { API_ROUTR_DEFAULT_PEER_PASSWORD: "changeme" },
-			},
 			{ key: "API_ASTERISK_ARI_SECRET", overrides: { API_ASTERISK_ARI_SECRET: "changeme" } },
 			{ key: "ASTERISK_ARI_SECRET", overrides: { ASTERISK_ARI_SECRET: "ChangeMe" } },
 			{ key: "ASTERISK_SIPPROXY_SECRET", overrides: { ASTERISK_SIPPROXY_SECRET: "changeme" } },
 			{ key: "POSTGRES_PASSWORD", overrides: { POSTGRES_PASSWORD: "postgres" } },
-			{ key: "INFLUXDB_INIT_PASSWORD", overrides: { INFLUXDB_INIT_PASSWORD: "changeme" } },
-			{ key: "API_INFLUXDB_INIT_PASSWORD", overrides: { API_INFLUXDB_INIT_PASSWORD: "changeme" } },
-			{
-				key: "API_CLOAK_ENCRYPTION_KEY",
-				overrides: {
-					API_CLOAK_ENCRYPTION_KEY: "k1.aesgcm256.MmPSvzCG9fk654bAbl30tsqq4h9d3N4F11hlue8bGAY=",
-				},
-			},
 		];
 
 		for (const { key, overrides } of placeholders) {
@@ -163,17 +135,17 @@ describe("env invariants in production", () => {
 	it("rejects unset telephony addresses", () => {
 		expect(() =>
 			assertEnvInvariants(
-				withProduction({ ROUTR_EXTERNAL_ADDRS: "/* Set to the IP address of the host */" }),
+				withProduction({ ASTERISK_SIPPROXY_HOST: "/* Set to the IP address of the host */" }),
 			),
-		).toThrow("ROUTR_EXTERNAL_ADDRS must be a reachable address in production.");
+		).toThrow("ASTERISK_SIPPROXY_HOST must be a reachable address in production.");
 
 		expect(() => assertEnvInvariants(withProduction({ ASTERISK_SIPPROXY_HOST: "" }))).toThrow(
 			"ASTERISK_SIPPROXY_HOST must be a reachable address in production.",
 		);
 
-		expect(() => assertEnvInvariants(withProduction({ RTPENGINE_PUBLIC_IP: undefined }))).toThrow(
-			"RTPENGINE_PUBLIC_IP must be a reachable address in production.",
-		);
+		expect(() =>
+			assertEnvInvariants(withProduction({ ASTERISK_SIPPROXY_HOST: undefined })),
+		).toThrow("ASTERISK_SIPPROXY_HOST must be a reachable address in production.");
 	});
 });
 
@@ -207,7 +179,7 @@ describe("assertResolvedSecret", () => {
 		).toThrow("API_OWNER_PASSWORD still uses the .env.example placeholder value.");
 
 		expect(() =>
-			assertResolvedSecret("API_ROUTR_DEFAULT_PEER_PASSWORD", "ChangeMe", {
+			assertResolvedSecret("API_ASTERISK_ARI_SECRET", "ChangeMe", {
 				nodeEnv: "production",
 			}),
 		).toThrow(ResolvedSecretPlaceholderError);

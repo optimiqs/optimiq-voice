@@ -201,7 +201,7 @@ DELETED: apps/freeswitch, apps/fusionpbx, apps/asterisk→(replaced by infra/ast
 ### 4.3 Tenancy & RBAC
 
 - RLS everywhere (oikos `atlas-db` pattern): tenant `pgRole`, `set local role` + `set_config` wrapper, boot preflight, append-only policies for CDR/audit.
-- Permissions: collapse FusionPBX's ~940 to `<resource>.<action>[.<scope>]` (~80 entries) + `SYSTEM_ROLE_TEMPLATES` (owner/admin/manager/user/agent), defined once in `packages/common`, code-genned to the frontend (oikos sync-permissions bridge).
+- Permissions: collapse FusionPBX's ~940 to `<resource>.<action>[.<scope>]` (~80 entries) + `SYSTEM_ROLE_TEMPLATES` (owner/admin/manager/user/agent), defined once in `packages/auth` (`packages/common` was deleted 2026-08-06), code-genned to the frontend (oikos sync-permissions bridge).
 
 ### 4.4 API surface
 
@@ -231,6 +231,40 @@ Backend: Effect `4.0.0-beta.83` + `@effect/sql-pg`, drizzle-orm `1.0.0-rc.4`, Ne
 - **P5 Business depth (T2):** ACD + wallboard, conferences, provisioning, BLF, reporting; SDK/ctl/mcp regen.
 - **PG (parallel Go track, starts alongside P3):** `apps/sipd` v1 (registrar/auth/location on NATS KV, proxy to media plane) shadow-deployed → replaces Routr when registration + basic-call SIPp suites pass. **2026-08-06:** the credential path is closed — `rpc.sip.v1.credential` in `packages/events` carries `{realm, username}` to `apps/api`, which resolves the tenant from the realm (`org_setting` `sip`/`realm`), repeats the provisioning password derivation and replies with an `ha1`; the root key never reaches the SIP edge. It is served by a **raw** NATS subscription, not a Nest `@MessagePattern`: measured, a request carrying the contract's own payload is never answered by the Nest transport, which frames request-reply as `{pattern,data,id}` / `{response,isDisposed,id}`. That framing is invisible while both ends are Nest and fatal the moment one end is Go — see the note at the head of `packages/events/src/schemas/rpc.ts`. **Any future cross-language `rpc.*` subject must be served raw.** `apps/mediad` v1 (RTP, G.711/Opus/G.722, bridges, play/record, DTMF, MOH) behind the same engine contract as `media-ari` → per-capability cutover (bridged calls → recording → conferencing mix-minus → T.38 last). Asterisk retired at full parity.
 - **P6 Consolidation:** Routr + Asterisk + `packages/sipnet` + `media-ari` deleted; InfluxDB retired; Rust hot-path evaluation inside sipd/mediad with production profiles.
+
+  **P6 — PARTIALLY COMPLETE (2026-08-06, legacy removal wave 2).** Everything in P6 that did not
+  depend on `apps/mediad` reaching parity is done. Removed, in one wave, with no code left behind:
+
+  - **Services:** `routr`, `rtpengine`, `influxdb`, `envoy`, `autoheal` — out of `compose.yaml` and
+    `compose.dev.yaml`, with their config (`config/envoy.yaml`, `config/envoy-tls.yaml`,
+    `etc/log4j2.yaml`) and their env blocks (`ROUTR_*`, `RTPENGINE_*`, `INFLUXDB_*`,
+    `API_INFLUXDB_*`) deleted from both templates and from `packages/config`. **InfluxDB was
+    retired without a backfill** — nothing read the `calls` bucket; call records live in
+    `packages/cdr-db`.
+  - **Apps:** `apps/autopilot`, `apps/ctl`, `apps/dashboard`, `apps/identity`, `apps/mcp`.
+  - **Packages:** `sdk`, `authz`, `streams`, `identity`, `identity-client`, `sipnet`, `voice`,
+    `common`, `types`, `logger`.
+  - **Release machinery:** lerna + nx, `lerna.json`, the gRPC/protobuf codegen toolchain
+    (`generate:protos`, `grpc-tools`, `protoc*`), `web-test-runner`, and six GitHub workflows
+    (`release`, `tag-npm-packages`, `test-sdk-install`, `publish-{dashboard,identity,autopilot}`).
+    `publish-api` went too rather than being rewritten: everything after its image push was a
+    legacy integration harness. Container publishing is rebuilt with the deployment story.
+  - **Database:** the `legacy_workspace_organization` / `legacy_user_account` ledger
+    (`packages/db/drizzle/20260806164358_drop_legacy_identity_mapping`) and the five legacy
+    `apps/api` tables plus `products` and three enums
+    (`apps/api/drizzle/20260806164427_drop_legacy_api_tables`). `apps/api` now owns **no** tenant
+    tables in the base database, so its boot-time tenant-RLS preflight was removed with them;
+    `packages/pbx-db` and `packages/cdr-db` still assert theirs.
+
+  **Still open in P6, and unchanged:** `apps/asterisk` and `packages/media-ari` stay until
+  `apps/mediad` reaches parity — they are the media plane, not scaffolding to be removed on the
+  Routr clock. Rust hot-path evaluation is untouched.
+
+  **One correction to the plan as written:** `packages/voice`'s `createCallTokenVerifier` was
+  new-platform code that happened to live in a legacy package. It moved to
+  `packages/auth/src/call-token-verifier.ts` before the deletion; `verify:call-token` passes 27/27
+  through it.
+
 - Each phase = OpenSpec change proposal → review → implement → test gate (Bun unit + DB-integration + SIPp/e2e call-flow tests) → ship. Opus 5 subagents execute; I lead and review.
 
 ## 8. Risks

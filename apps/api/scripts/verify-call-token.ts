@@ -8,13 +8,14 @@
  * `CallTokenService`, fetches the published JWKS over HTTP and verifies the token against it with
  * `jose`.
  *
- * Section 6 then runs the **real** verifier from `@optimiq-voice/voice` —
- * `createCallTokenVerifier`, the one `VoiceServer` hands to its gRPC interceptor — against the
- * live `/api/auth/jwks` endpoint. That closes Step 4's loop at the level this environment can
- * reach: the minter in `apps/api` and the verifier in `packages/voice` agree on a token, with no
- * identity service, no `.keys/*.pem` and no gRPC `getPublicKey` round trip anywhere in the path.
- * The plan's full gate (an inbound call reaching an autopilot application) additionally needs
- * Asterisk and Routr, which are not available here.
+ * Section 6 then runs the **real** verifier from `@optimiq-voice/auth` —
+ * `createCallTokenVerifier` — against the live `/api/auth/jwks` endpoint. That closes Step 4's
+ * loop at the level this environment can reach: the minter and the verifier agree on a token,
+ * with no identity service, no `.keys/*.pem` and no gRPC `getPublicKey` round trip anywhere in
+ * the path.
+ *
+ * The verifier moved out of `packages/voice` when that package was deleted; it is the same module,
+ * now beside the rest of the better-auth composition.
  *
  * Deliberately separate from `verify:auth`.
  */
@@ -159,15 +160,15 @@ async function main(): Promise<void> {
 		check("a re-signed payload fails verification", rejected);
 
 		// -----------------------------------------------------------------------------------------
-		// 6. The real packages/voice verifier, over real HTTP (identity-removal Step 4, item 2)
+		// 6. The real @optimiq-voice/auth verifier, over real HTTP (identity-removal Step 4, item 2)
 		// -----------------------------------------------------------------------------------------
-		console.log("6. verify through packages/voice's createCallTokenVerifier");
+		console.log("6. verify through @optimiq-voice/auth's createCallTokenVerifier");
 		const { createCallTokenVerifier, CallTokenVerificationError } =
-			await import("@optimiq-voice/voice");
+			await import("@optimiq-voice/auth");
 
 		const verifyCallToken = createCallTokenVerifier({ authUrl: baseUrl });
 		const claims = await verifyCallToken(token);
-		check("the voice verifier accepts a freshly minted token", true);
+		check("the call-token verifier accepts a freshly minted token", true);
 		check(
 			"it reads the tenant from organizationId, not from a client header",
 			claims.organizationId === ORGANIZATION_ID,

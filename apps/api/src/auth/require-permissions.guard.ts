@@ -15,10 +15,16 @@ import { REQUIRE_PERMISSIONS_METADATA } from "./require-permissions.decorator";
  * The global session and authorization guard (identity-removal Step 3).
  *
  * Registered once as an `APP_GUARD` by `AuthModule`, so it covers every Nest HTTP route in
- * `apps/api` — including routes added later, which is the whole point. It replaces the gRPC-era
- * `createAuthInterceptor` for the HTTP surface; the gRPC servers `RuntimeHostService` starts are
- * untouched and still authenticate through `packages/common/src/identity/` until Step 2 supplies
- * the `accessKeyId → organization.id` mapping those call sites need.
+ * `apps/api` — including routes added later, which is the whole point. It is now the ONLY
+ * authorization path in this process: the gRPC interceptor it replaced, the `accessKeyId →
+ * organization.id` ledger that translated for it, and the legacy access-key repository that read
+ * that ledger are all deleted.
+ *
+ * Organizations are resolved purely from the live better-auth tables. `AuthService.resolveAccess`
+ * reads `session.activeOrganizationId` and the caller's `member` row, and derives permissions from
+ * the role recorded there — there is no fallback lookup, no pre-migration `WO…` key path, and
+ * nothing to consult when a session has no active organization except to refuse with
+ * `NoActiveOrganizationException`.
  *
  * **Deny by default.** A route with no metadata at all requires an authenticated session. Opting
  * out is explicit and auditable via `@PublicRoute()`.
@@ -27,8 +33,9 @@ import { REQUIRE_PERMISSIONS_METADATA } from "./require-permissions.decorator";
  * its own exception so a client can tell "sign in" from "pick an organization" from "not allowed".
  *
  * The caller was resolved once per request by the Fastify `preHandler` hook in
- * `auth-http.plugin.ts` (`auth.api.getSession`, which accepts the session cookie and the bearer
- * plugin's `Authorization: Bearer <token>`). This guard never touches a header itself.
+ * `auth-http.plugin.ts` (`auth.api.getSession`, which accepts the session cookie, the bearer
+ * plugin's `Authorization: Bearer <token>` and the API-key header). This guard never touches a
+ * header itself.
  */
 @Injectable()
 export class RequirePermissionsGuard implements CanActivate {

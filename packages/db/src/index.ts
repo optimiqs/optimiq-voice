@@ -60,7 +60,6 @@ export {
 	withTenantEffectTransaction,
 	withTenantTransaction,
 } from "./tenant/index";
-export { legacyUserAccount, legacyWorkspaceOrganization } from "./schema/legacy/index";
 export {
 	auditTimestampColumns,
 	tenantOrganizationIdColumn,

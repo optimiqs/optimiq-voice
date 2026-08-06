@@ -51,12 +51,7 @@ export {
 	type ResolvedAccess,
 	type SessionOverview,
 } from "./auth.service";
-export { AUTH_LEGACY_ACCESS_KEYS, AUTH_PLATFORM, AUTH_REPOSITORY } from "./auth.tokens";
-export {
-	createLegacyAccessKeyRepository,
-	type LegacyAccessKeyRepository,
-	UnmappedAccessKeyError,
-} from "./legacy-access-key.repository";
+export { AUTH_PLATFORM, AUTH_REPOSITORY } from "./auth.tokens";
 export {
 	buildCallAccessTokenClaims,
 	CALL_TOKEN_AUDIENCE,

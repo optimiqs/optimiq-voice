@@ -1,35 +1,38 @@
 context: |
   # Project: Optimiq Voice
 
-  Optimiq Voice is a complete business calling system for phone numbers, inbound and outbound
-  calls, AI receptionists, SIP connectivity, and custom call flows. It is a TypeScript monorepo
-  (`apps/*` and `packages/*`) whose services are composed into a single gRPC `api` alongside
-  voice/telephony infrastructure (Asterisk/ARI, NATS, InfluxDB).
+  Optimiq Voice is a complete business calling system: phone numbers, inbound and outbound calls,
+  SIP connectivity and custom call flows. It is a pnpm + turbo monorepo (`apps/*`, `packages/*`,
+  plus a `go.work` workspace for the Go data plane) under the `@optimiq-voice/*` scope.
 
   ## Relevant modules
 
-  - `packages/identity` — `@optimiq-voice/identity`: a **library** exporting `buildIdentityService(config)`
-    (gRPC service definition + handlers), the canonical Drizzle schema, and helpers
-    (`upsertDefaultUser`). Entities: User, Workspace, WorkspaceMember, ApiKey, VerificationCode.
-    RS256 JWTs (id/access/refresh) with a single issuer/audience per instance.
-  - `apps/api` — composes identity + voice services into one gRPC server with an auth
-    interceptor, a public-method allow-list, an accept-invite HTTP bridge, and default seeding.
-    Coupled to telephony infra (NATS/InfluxDB/Asterisk).
-  - `packages/sdk` — `@optimiq-voice/sdk`: client SDK with `Users`/`Workspaces`/`ApiKeys` wrappers over
-    generated gRPC stubs, targeting a single Optimiq Voice `api` endpoint; stateful single-principal
-    (accessKeyId + token refresher).
-  - `packages/common` — `createServiceDefinition`, auth interceptor, proto loading.
+  - `apps/api` — the control plane. NestJS on Fastify, ONE HTTP listener on 9876 serving
+    `/api/auth/*` (better-auth) and `/api/v1/*` (the PBX, CDR, live, provisioning and media
+    areas). Each area mounts only when its own database URL is present, and the PBX/CDR areas
+    mount only alongside the auth slice because their permission guard comes from it.
+  - `apps/web` — the admin frontend. Next.js app router, and the stack's ingress: it proxies
+    `/api/auth/*` and `/api/v1/*` server-side to the API, which keeps the session cookie
+    first-party.
+  - `apps/engine` — the call engine. ARI-driven channel orchestration, the routing artifact
+    walker, typed NATS call events and per-leg CDR emission.
+  - `apps/sipd` — the SIP edge (Go). Registrar today, proxy next.
+  - `apps/asterisk` — the media plane, until `apps/mediad` lands.
+  - `packages/auth` — better-auth composition, the permission registry, session/organization
+    helpers and the per-call token verifier (JWKS over HTTP, no shared secret).
+  - `packages/db`, `packages/pbx-db`, `packages/cdr-db` — one Drizzle package per bounded
+    context, each owning its own database, migration journal, tenant role and RLS policies.
+  - `packages/events` / `packages/events-go` — the NATS contract, generated for both runtimes and
+    gated against drift in CI.
 
-  ## Context for changes
-
-  External products (e.g. QCobro, an AI-voice collections app) want to **reuse Optimiq Voice
-  Identity** without running the telephony monolith. Today they must hand-wire their own
-  gRPC server around `buildIdentityService`, vendor the proto + generate a client, and vendor
-   the database schema. These OpenSpec changes aim to make Identity consumable as (a) a standalone
-  service, (b) a client package, and (c) a multi-product identity store.
+  Authentication is better-auth end to end: sessions and API keys over HTTP, and per-call tokens
+  signed with the JWKS key and verified against `GET /api/auth/jwks`. There is no gRPC surface, no
+  identity service and no `accessKeyId`; multi-tenancy is `organization.id` enforced by PostgreSQL
+  row-level security.
 
   ## Conventions
 
-  - TypeScript, ESM, gRPC (`@grpc/grpc-js`), and Drizzle ORM (PostgreSQL).
+  - TypeScript, ESM, Effect for the service layer, Drizzle ORM on PostgreSQL, NATS for messaging.
+  - Formatting is oxfmt (tabs, 100 columns, double quotes); linting is oxlint.
   - Spec deltas follow OpenSpec format: `## ADDED/MODIFIED Requirements`, `### Requirement: …`,
     `#### Scenario: …` with WHEN/THEN/AND.

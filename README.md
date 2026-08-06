@@ -14,67 +14,57 @@ admin UI shows live state.
 
 ## Architecture
 
-| Piece             | What it is                                                                                                                                                        | Where                                   |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
-| Control-plane API | NestJS 11 on Fastify 5, Effect 4, Drizzle + Postgres. gRPC on 50051, an HTTP bridge on 9876. Owns tenancy, auth, provisioning and the PBX schema.                 | `apps/api`                              |
-| Admin frontend    | Next.js 16 App Router. Talks to the API through a same-origin proxy so the session cookie stays first-party.                                                      | `apps/web`                              |
-| Call engine       | Turns Asterisk ARI events into domain state, walks the compiled routing artifact, publishes call events and emits one CDR per leg.                                | `apps/engine`                           |
-| SIP edge          | Go 1.26 SIP service. Today a registrar: digest auth, AOR bindings in NATS KV, `sip.reg.v1` transitions. Intended to replace Routr.                                | `apps/sipd`                             |
-| Media server      | A dockerized Asterisk 22 (LTS) with generated `pjsip`/`ari` config. Scaffolding — the engine drives it over ARI.                                                  | `apps/asterisk`                         |
-| Event backbone    | The versioned subject taxonomy, Zod event schemas and JetStream stream/KV definitions every service shares. A Go peer is generated from it and drift-gated in CI. | `packages/events`, `packages/events-go` |
-| Routing compiler  | Compiles a PBX configuration snapshot into a cacheable routing artifact and resolves inbound, internal and outbound calls against it.                             | `packages/routing`                      |
-| Carrier           | Typed Telnyx API v2 client, with an in-package fake Telnyx server for tests.                                                                                      | `packages/telnyx`                       |
+| Piece             | What it is                                                                                                                                                           | Where                                   |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
+| Control-plane API | NestJS 11 on Fastify 5, Effect 4, Drizzle + Postgres. One HTTP listener on 9876: `/api/auth/*` and `/api/v1/*`. Owns tenancy, auth, provisioning and the PBX schema. | `apps/api`                              |
+| Admin frontend    | Next.js 16 App Router. Talks to the API through a same-origin proxy so the session cookie stays first-party.                                                         | `apps/web`                              |
+| Call engine       | Turns Asterisk ARI events into domain state, walks the compiled routing artifact, publishes call events and emits one CDR per leg.                                   | `apps/engine`                           |
+| SIP edge          | Go 1.26 SIP service. Today a registrar: digest auth, AOR bindings in NATS KV, `sip.reg.v1` transitions. Proxying is next.                                            | `apps/sipd`                             |
+| Media server      | A dockerized Asterisk 22 (LTS) with generated `pjsip`/`ari` config. Scaffolding — the engine drives it over ARI.                                                     | `apps/asterisk`                         |
+| Event backbone    | The versioned subject taxonomy, Zod event schemas and JetStream stream/KV definitions every service shares. A Go peer is generated from it and drift-gated in CI.    | `packages/events`, `packages/events-go` |
+| Routing compiler  | Compiles a PBX configuration snapshot into a cacheable routing artifact and resolves inbound, internal and outbound calls against it.                                | `packages/routing`                      |
+| Carrier           | Typed Telnyx API v2 client, with an in-package fake Telnyx server for tests.                                                                                         | `packages/telnyx`                       |
 
-Postgres, NATS (JetStream), InfluxDB, Envoy and rtpengine round out the runtime; all of them are in
-`compose.yaml`.
+Postgres and NATS (JetStream) round out the runtime; both are in `compose.yaml`, which now
+describes the whole stack and nothing else. The legacy platform's `routr`, `rtpengine`, `influxdb`,
+`envoy`, `autopilot` and `dashboard` services have been deleted along with their code — `apps/web`
+is the ingress, `apps/sipd` is the SIP edge, and call records live in Postgres
+(`packages/cdr-db`), not in a metrics bucket.
 
 ## Repository layout
 
 ```
 apps/
   api          control-plane API (NestJS + Fastify + Effect)
-  web          admin frontend (Next.js 16)
+  web          admin frontend (Next.js 16) — the stack's ingress
   engine       ARI-driven call engine
   sipd         Go SIP edge (registrar)
   asterisk     Asterisk 22 image, config and run script
-  autopilot    LLM voice-AI agent
-  mcp          Model Context Protocol server over the API
-  ctl          oclif command-line tool
-  dashboard    legacy React Router admin UI — no longer part of the stack
-  identity     Dockerfile only; the code lives in packages/identity
 packages/
-  auth         better-auth composition and the permission registry
-  authz        legacy authorization service
+  auth         better-auth composition, permission registry, call-token verifier
   cdr-db       CDR bounded context: per-leg records, call events, recordings
-  common       shared library and protobuf definitions
   config       the one validated view of the environment
   db           schema primitives, tenant RLS wrappers, preflight harness
   effect-runtime  Effect <-> NestJS seam
   events       NATS contract (subjects, schemas, streams)
   events-go    generated Go peer of packages/events
   identifiers  UUID v7 entity identifiers
-  identity     legacy identity service
-  logger       legacy logger
   logging      redacting Pino logger
   media-ari    typed Asterisk 22 ARI adapter (protocol only)
   pbx-db       telephony bounded context: PBX schema, RLS policies
   routing      routing compiler
-  sdk          web and Node.js SDK
-  sipnet       Routr-based SIP stack
-  streams      AudioSocket support
   telephony    pure call domain: state machines, verbs, hangup causes
   telnyx       Telnyx client and fake server
-  types        shared types
-  voice        voice application server
-config/        Envoy, nginx and example integration configuration
-etc/           logging configuration mounted into containers
+config/        nats.conf — the broker's accounts and JetStream settings
 openspec/      specifications and in-flight change proposals
 plans/         migration plans and research notes
 ```
 
-Several packages are inherited from the platform this fork started as — `authz`, `common`,
-`identity`, `logger`, `sdk`, `sipnet`, `streams`, `types`, `voice`, and `apps/ctl`, `apps/mcp`,
-`apps/dashboard`. They still build, and they are being retired rather than extended.
+Nothing inherited from the platform this fork started as remains. The gRPC API and its identity,
+authz, sipnet, streams, SDK, CLI, MCP, autopilot and dashboard companions were deleted rather than
+carried; multi-tenancy is `organization.id` under row-level security, and there is no `accessKeyId`
+anywhere in the tree. An AI-agent application returns later as a session-protocol consumer of
+`apps/engine`, not as a resurrection of `apps/autopilot`.
 
 ## Quickstart
 
@@ -91,23 +81,22 @@ pnpm install
 # 3. Build. Workspace packages resolve through their built output, so this comes first.
 pnpm run build
 
-# 4. Infrastructure: Postgres, NATS, InfluxDB, Asterisk, Routr, rtpengine, Envoy,
-#    plus Adminer on :8282 and MailHog on :8025. Generates a signing keypair first.
+# 4. Infrastructure: Postgres, NATS and Asterisk, plus Adminer on :8282 and MailHog on :8025.
 pnpm run start:services
 
-# 5. Schema.
+# 5. Schema. Creates and migrates all three databases: base, PBX and CDR.
 pnpm run db:migrate
 
-# 6. The API on gRPC :50051 with its HTTP bridge on :9876.
+# 6. The API's HTTP bridge on :9876.
 pnpm run start:api
 
 # 7. The admin frontend on :3100, in a second terminal.
 pnpm --filter @optimiq-voice/web run dev
 ```
 
-Sign in with `API_OWNER_EMAIL` / `API_OWNER_PASSWORD` from your `.env`. Mail is delivered to
-MailHog, so sign-up, invitation and voicemail messages are real messages you can open at
-<http://localhost:8025>.
+Sign up at <http://localhost:3100>; the first account creates its own organization. Mail is
+delivered to MailHog, so verification, invitation and voicemail messages are real messages you can
+open at <http://localhost:8025>.
 
 Stop everything with `pnpm run stop:services`.
 
@@ -125,12 +114,14 @@ pnpm run format:check     # oxfmt --check
 pnpm run db:generate      # regenerate migrations across every schema package
 ```
 
-Tests are split by runner. The newer packages and apps use Bun; the inherited tree uses Mocha at
-the root.
+Tests are split by runner: every package and `apps/web` / `apps/engine` use Bun, `apps/api` uses
+Mocha, and `turbo run test` runs all of them. The root `pnpm test` is the pre-push gate and resolves
+to the same `apps/api` files.
 
 ```bash
-pnpm --filter @optimiq-voice/web run test        # bun test
+pnpm exec turbo run test                         # everything
 pnpm --filter @optimiq-voice/engine run test     # bun test src
+pnpm --filter @optimiq-voice/api run test        # mocha
 pnpm run test                                    # root Mocha suite (needs .env)
 cd apps/sipd && go test ./...                    # Go SIP edge
 ```
@@ -142,8 +133,9 @@ they need a live Postgres, NATS and Asterisk to run against.
 
 ## Running the whole stack in containers
 
-`compose.yaml` is the deployment topology; `compose.dev.yaml` overlays local builds, published ports
-and the two development-only containers.
+`compose.yaml` is the deployment topology — `web`, `api`, `engine`, `asterisk`, `postgres` and
+`nats`, with `web` on `WEB_PORT` (3100) as the only published port. `compose.dev.yaml` overlays
+local builds, published ports and the two development-only containers (Adminer, MailHog).
 
 ```bash
 docker compose -f compose.yaml -f compose.dev.yaml up -d --build
@@ -159,8 +151,9 @@ enforces and which it does not.
 This is a platform under active migration, not a finished product. The routing compiler, the PBX
 schema and the admin frontend are the mature parts. The call engine implements a subset of the
 session protocol and reports the rest as unsupported rather than pretending; `apps/sipd` registers
-endpoints but does not yet proxy calls; E911 addresses are stored but never sent to a carrier.
-Where something is not built, the code and the UI say so.
+endpoints but does not yet proxy calls; E911 addresses are stored but never sent to a carrier; and
+container publishing beyond the Asterisk image is not wired up yet. Where something is not built,
+the code and the UI say so.
 
 ## Contributing
 

@@ -7,18 +7,20 @@
  * `experimentalDecorators` (the repository-root mocha invocation resolves the root tsconfig,
  * which does not).
  *
- * This is the replacement for `createGenerateCallAccessToken` in `packages/identity`, which signs
- * with `.keys/private.pem` (RS256) and can only be verified by a party that fetched the identity
+ * It replaced `createGenerateCallAccessToken` in the deleted identity package, which signed with
+ * `.keys/private.pem` (RS256) and could only be verified by a party that had fetched the identity
  * service's public key over gRPC. Tokens built from these claims are signed with the key
  * better-auth manages in the `jwks` table and are verifiable by anyone who can reach
- * `GET /api/auth/jwks`.
+ * `GET /api/auth/jwks`. `@optimiq-voice/auth`'s `createCallTokenVerifier` is the verifier.
  *
  * ## Claim mapping
  *
- * The payload is a strict SUPERSET of the legacy one, so a verifier can be migrated to JWKS
- * without simultaneously being migrated off the `access[]` shape:
+ * The payload is a strict SUPERSET of the legacy one. That was originally so a verifier could be
+ * migrated to JWKS without simultaneously being migrated off the `access[]` shape; it is now
+ * simply the contract, pinned by `test/auth/callTokenClaims.test.ts` and by
+ * `scripts/verify-call-token.ts`, which asserts both aliases on a token minted by the live slice:
  *
- * | legacy (`createGenerateCallAccessToken`)         | here                                          |
+ * | legacy (`createGenerateCallAccessToken`)          | here                                          |
  * | ------------------------------------------------ | --------------------------------------------- |
  * | `iss` — `API_IDENTITY_ISSUER`                    | `iss` — the jwt plugin's issuer (`AUTH_URL`)  |
  * | `sub` — the application ref                      | `sub` — the application ref (unchanged)       |
@@ -32,10 +34,12 @@
  * | RS256, `.keys/private.pem`                       | the jwks key, published at `/api/auth/jwks`   |
  * | `expiresIn: "30s"`                               | {@link CALL_TOKEN_EXPIRES_IN} (`"30s"`)       |
  *
- * `accessKeyId` and `access[]` carry the ORGANIZATION ID during coexistence: every consumer that
- * reads them (`hasAccess`, `tokenHasAccessKeyId` in `packages/common/src/identity/`) only ever
- * compares them for equality against the tenant identifier on the wire, so the value changes but
- * the shape does not. They are deleted with `packages/common/src/identity/` in Step 9.
+ * `accessKeyId` and `access[]` carry the ORGANIZATION ID, not a workspace key — the value changed
+ * at the cutover, the shape did not. They are KEPT rather than dropped with the rest of the
+ * `accessKeyId` vocabulary for one reason: they are part of the asserted token contract. Two of
+ * `verify:call-token`'s 27 checks read them, and `toCallTokenClaims` in `@optimiq-voice/auth`
+ * accepts them as fallbacks for `organizationId`. Removing them is a contract change with a
+ * verifier on the other side of it, not a cleanup.
  */
 
 /** Just enough time to validate one `Voice/CreateSession`, matching the legacy signer. */
@@ -63,9 +67,9 @@ export interface CallAccessTokenClaims {
 	readonly organizationId: string;
 	readonly appRef: string;
 	readonly callRef: string;
-	/** Legacy alias of `organizationId`; read by `packages/common/src/identity/`. */
+	/** Legacy alias of `organizationId`; accepted as a fallback by the call-token verifier. */
 	readonly accessKeyId: string;
-	/** Legacy shape, kept until the gRPC interceptor is deleted in Step 9. */
+	/** Legacy shape, kept because `verify:call-token` asserts it. See the note above. */
 	readonly access: readonly { readonly accessKeyId: string; readonly role: string }[];
 }
 

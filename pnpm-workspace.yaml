@@ -7,23 +7,26 @@ linkWorkspacePackages: false
 saveWorkspaceProtocol: rolling
 injectWorkspacePackages: false
 
-# drizzle-kit imports drizzle-orm internals but does not declare it, so it would resolve the
-# legacy 0.45.2 hoisted at the repository root instead of the importer's pinned version.
-# Declaring the peer makes pnpm link the drizzle-orm each consumer actually depends on.
+# drizzle-kit imports drizzle-orm internals but does not declare it. The legacy 0.45.2 root pin it
+# used to resolve against is gone, but the missing peer is still missing — declaring it keeps pnpm
+# linking the drizzle-orm each importer actually depends on rather than whatever hoists first.
 packageExtensions:
   drizzle-kit:
     peerDependencies:
       drizzle-orm: "*"
 
+# Postinstall scripts are denied by default; these are the packages allowed to run one. Every entry
+# that existed only for the deleted platform is gone: grpc-tools / protoc-gen-grpc-web /
+# protoc-gen-js (the gRPC codegen toolchain), nx (the deleted lerna/nx release machinery),
+# onnxruntime-node (autopilot's local inference) and core-js-pure (the dashboard's build).
+#
+# `protobufjs` and `sharp` STAY, and are no longer direct dependencies of anything: protobufjs
+# arrives under `@grpc/grpc-js` via `@nestjs/microservices` (apps/api and apps/engine both use the
+# NATS transport) and sharp arrives under `next` (apps/web). Dropping them turns `pnpm install`
+# into a non-zero exit with ERR_PNPM_IGNORED_BUILDS.
 onlyBuiltDependencies:
-  - core-js-pure
   - esbuild
-  - grpc-tools
-  - nx
-  - onnxruntime-node
   - protobufjs
-  - protoc-gen-grpc-web
-  - protoc-gen-js
   - sharp
   - unrs-resolver
 
@@ -42,25 +45,6 @@ minimumReleaseAgeExclude:
   - "@aws-sdk/middleware-sdk-s3@3.972.72"
   - "@aws-sdk/nested-clients@3.997.41"
   - "@aws-sdk/token-providers@3.1103.0"
-  - "@langchain/anthropic@1.5.3"
-  - "@mui/core-downloads-tracker@9.3.0"
-  - "@mui/icons-material@9.3.0"
-  - "@mui/material@9.3.0"
-  - "@mui/private-theming@9.3.0"
-  - "@mui/styled-engine@9.3.0"
-  - "@mui/system@9.3.0"
-  - "@mui/types@9.3.0"
-  - "@mui/utils@9.3.0"
-  - "@nx/nx-darwin-arm64@23.2.0-canary.20260804-c3b7f1e"
-  - "@nx/nx-darwin-x64@23.2.0-canary.20260804-c3b7f1e"
-  - "@nx/nx-freebsd-x64@23.2.0-canary.20260804-c3b7f1e"
-  - "@nx/nx-linux-arm-gnueabihf@23.2.0-canary.20260804-c3b7f1e"
-  - "@nx/nx-linux-arm64-gnu@23.2.0-canary.20260804-c3b7f1e"
-  - "@nx/nx-linux-arm64-musl@23.2.0-canary.20260804-c3b7f1e"
-  - "@nx/nx-linux-x64-gnu@23.2.0-canary.20260804-c3b7f1e"
-  - "@nx/nx-linux-x64-musl@23.2.0-canary.20260804-c3b7f1e"
-  - "@nx/nx-win32-arm64-msvc@23.2.0-canary.20260804-c3b7f1e"
-  - "@nx/nx-win32-x64-msvc@23.2.0-canary.20260804-c3b7f1e"
   - "@rxjs/observable-polyfill@9.0.0-beta.0"
   - "@types/pg@8.20.4"
   - "@typescript/typescript-darwin-arm64@7.1.0-dev.20260805.1"
@@ -70,22 +54,19 @@ minimumReleaseAgeExclude:
   - "@typescript/typescript-linux-x64@7.1.0-dev.20260805.1"
   - "@typescript/typescript-win32-arm64@7.1.0-dev.20260805.1"
   - "@typescript/typescript-win32-x64@7.1.0-dev.20260805.1"
-  - nx@23.2.0-canary.20260804-c3b7f1e
   - rxjs@9.0.0-beta.0
   - tsx@4.23.7
   - typescript@7.1.0-dev.20260805.1
 
 allowBuilds:
-  core-js-pure: true
   esbuild: true
-  grpc-tools: true
+  grpc-tools: set this to true or false
   msgpackr-extract: true
-  nx: true
-  onnxruntime-node: true
-  protobufjs: true
-  protoc-gen-grpc-web: true
-  protoc-gen-js: true
-  sharp: true
+  nx: set this to true or false
+  protobufjs: set this to true or false
+  protoc-gen-grpc-web: set this to true or false
+  protoc-gen-js: set this to true or false
+  sharp: set this to true or false
 
 # Pinned dependency catalog (oikos-care conventions; see plans/reference/oikos-conventions.md)
 catalog:

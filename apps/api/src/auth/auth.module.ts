@@ -5,12 +5,8 @@ import { createMailerEmailDelivery } from "./auth-email.delivery";
 import { clearAuthRuntime, publishAuthRuntime } from "./auth-platform.registry";
 import { type AuthPlatform, createAuthPlatform } from "./auth.platform";
 import { AuthService } from "./auth.service";
-import { AUTH_LEGACY_ACCESS_KEYS, AUTH_PLATFORM, AUTH_REPOSITORY } from "./auth.tokens";
+import { AUTH_PLATFORM, AUTH_REPOSITORY } from "./auth.tokens";
 import { CallTokenService } from "./call-token.service";
-import {
-	createLegacyAccessKeyRepository,
-	type LegacyAccessKeyRepository,
-} from "./legacy-access-key.repository";
 import { MeController } from "./me.controller";
 import { OrganizationsController } from "./organizations.controller";
 import { RequirePermissionsGuard } from "./require-permissions.guard";
@@ -18,10 +14,10 @@ import { RequirePermissionsGuard } from "./require-permissions.guard";
 /**
  * The better-auth feature slice.
  *
- * It adds `/api/auth/*`, the session hook, the first REST resources and — since identity-removal
- * Step 3 — the **global** session guard over every Nest HTTP route. The gRPC identity path is
- * still untouched: `RuntimeHostService` starts those servers outside Nest and they keep
- * authenticating through `createAuthInterceptor` until Step 2 lands the tenant mapping.
+ * It adds `/api/auth/*`, the session hook, the first REST resources and the **global** session
+ * guard over every Nest HTTP route. It is the only authentication path this process has: the gRPC
+ * identity surface it coexisted with, and the `accessKeyId → organization.id` ledger that
+ * translated between the two, are both deleted.
  *
  * The guard is registered here rather than in `main.ts` so that it exists exactly when the slice
  * does: an environment without `DATABASE_URL` / `AUTH_SECRET` / `AUTH_URL` boots `AppModule`
@@ -48,34 +44,18 @@ import { RequirePermissionsGuard } from "./require-permissions.guard";
 			useFactory: (platform: AuthPlatform) => platform.repository,
 			inject: [AUTH_PLATFORM],
 		},
-		{
-			provide: AUTH_LEGACY_ACCESS_KEYS,
-			useFactory: (platform: AuthPlatform) => createLegacyAccessKeyRepository(platform),
-			inject: [AUTH_PLATFORM],
-		},
 		AuthService,
 		CallTokenService,
 		RequirePermissionsGuard,
 		{ provide: APP_GUARD, useExisting: RequirePermissionsGuard },
 	],
-	exports: [
-		AUTH_PLATFORM,
-		AUTH_REPOSITORY,
-		AUTH_LEGACY_ACCESS_KEYS,
-		AuthService,
-		CallTokenService,
-		RequirePermissionsGuard,
-	],
+	exports: [AUTH_PLATFORM, AUTH_REPOSITORY, AuthService, CallTokenService, RequirePermissionsGuard],
 })
 export class AuthModule implements OnApplicationShutdown {
-	constructor(
-		@Inject(AUTH_PLATFORM) private readonly platform: AuthPlatform,
-		@Inject(AUTH_LEGACY_ACCESS_KEYS) legacyAccessKeys: LegacyAccessKeyRepository,
-	) {
-		// The ARI dispatcher and the gRPC servers are started by `RuntimeHostService`, outside the
-		// Nest container, and identity-removal Step 4 item 4 mints per-call tokens there. See
-		// `auth-platform.registry.ts` for why this seam exists and when it dies.
-		publishAuthRuntime({ platform: this.platform, legacyAccessKeys });
+	constructor(@Inject(AUTH_PLATFORM) private readonly platform: AuthPlatform) {
+		// Published for the code paths Nest does not construct. See `auth-platform.registry.ts`
+		// for why the seam exists and when it dies.
+		publishAuthRuntime({ platform: this.platform });
 	}
 
 	/** The slice owns its postgres pool, so shutdown is deterministic instead of process-exit. */

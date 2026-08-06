@@ -66,7 +66,7 @@ export type ResolvedRecordingMedia = MediaResponse;
  * Following the link is an ANONYMOUS request carrying that decision as a signature.
  *
  * Splitting them is what makes the media usable at all: an `<audio src>` cannot carry a session
- * negotiation, and `apps/autopilot` posts a recording URL into a customer's webhook where the
+ * negotiation, and an integration may post a recording URL into a customer's webhook where the
  * fetcher has no session by definition. The alternative the codebase used to carry was
  * `/api/recordings/:id`, served anonymously with no signature and enumerable by file name. This is
  * the fix its own comment asked for, and that route is now deleted.

@@ -17,22 +17,14 @@ export interface EnvInvariantConfig {
 	AUTH_URL?: string;
 	AUTH_COOKIE_DOMAIN?: string;
 	API_APP_URL?: string;
-	API_CLOAK_ENCRYPTION_KEY?: string;
 	API_OWNER_PASSWORD?: string;
-	API_ROUTR_DEFAULT_PEER_PASSWORD?: string;
 	API_ASTERISK_ARI_SECRET?: string;
 	ASTERISK_ARI_SECRET?: string;
 	ASTERISK_SIPPROXY_SECRET?: string;
 	ASTERISK_SIPPROXY_HOST?: string;
 	ASTERISK_RTP_PORT_START?: number;
 	ASTERISK_RTP_PORT_END?: number;
-	ROUTR_EXTERNAL_ADDRS?: string;
-	RTPENGINE_PUBLIC_IP?: string;
-	RTPENGINE_PORT_MIN?: number;
-	RTPENGINE_PORT_MAX?: number;
 	POSTGRES_PASSWORD?: string;
-	INFLUXDB_INIT_PASSWORD?: string;
-	API_INFLUXDB_INIT_PASSWORD?: string;
 }
 
 /** Minimum entropy we accept for a signing/encryption secret. */
@@ -49,7 +41,6 @@ const PLACEHOLDER_SECRETS: ReadonlySet<string> = new Set([
 	"password",
 	"postgres",
 	"secret",
-	"k1.aesgcm256.mmpsvzcg9fk654babl30tsqq4h9d3n4f11hlue8bgay=",
 	// AUTH_SECRET's placeholder. It is long on purpose: the minimum-length check below would wave
 	// through anything of 32 characters, so the template's own value has to be refused by name or
 	// a deployment could ship the session-signing key that is printed in the repository.
@@ -83,10 +74,11 @@ export class ResolvedSecretPlaceholderError extends Error {
  * `assertProductionSecrets` below reads environment variables, so it only ever sees a value an
  * operator actually set. That is a hole for any secret written as `e.SOME_PASSWORD || "changeme"`:
  * leaving the variable UNSET produces exactly the password the tripwire exists to refuse, and the
- * tripwire never fires because the string never appears in a checked variable. `apps/api/src/envs.ts`
- * has two of these — `OWNER_PASSWORD` and `ROUTR_DEFAULT_PEER_PASSWORD` — and the fallbacks are
- * worth keeping, because a developer running the stack locally should not have to invent a password
- * to sign in as the seeded owner.
+ * tripwire never fires because the string never appears in a checked variable. No caller has such a
+ * default today — the two that did (`OWNER_PASSWORD` and `ROUTR_DEFAULT_PEER_PASSWORD` in
+ * `apps/api/src/envs.ts`) went with the legacy platform — but the hole is a property of the
+ * `||`-with-a-default idiom rather than of those two variables, so the guard stays for the next
+ * one.
  *
  * So the check moves to the RESOLVED value: whatever the process is actually going to use, default
  * included. Call it at the point the constant is defined, and production stops booting on a
@@ -155,33 +147,16 @@ function assertMediaPortRanges(config: EnvInvariantConfig): void {
 			config.ASTERISK_RTP_PORT_END,
 		);
 	}
-
-	if (config.RTPENGINE_PORT_MIN !== undefined && config.RTPENGINE_PORT_MAX !== undefined) {
-		assertPortRange(
-			"RTPENGINE_PORT_MIN",
-			config.RTPENGINE_PORT_MIN,
-			"RTPENGINE_PORT_MAX",
-			config.RTPENGINE_PORT_MAX,
-		);
-	}
 }
 
 function assertProductionSecrets(config: EnvInvariantConfig): void {
 	const secretKeys = [
 		["AUTH_SECRET", config.AUTH_SECRET],
-		["API_CLOAK_ENCRYPTION_KEY", config.API_CLOAK_ENCRYPTION_KEY],
 		["API_OWNER_PASSWORD", config.API_OWNER_PASSWORD],
-		// The SIP password apps/api hands Routr for the default peer. It has an in-code default of
-		// "changeme" in `apps/api/src/envs.ts`, which this check cannot see when the variable is
-		// unset — `assertResolvedSecret` covers that case at the point of definition. This entry
-		// catches the other half: an operator who set the variable and set it to the placeholder.
-		["API_ROUTR_DEFAULT_PEER_PASSWORD", config.API_ROUTR_DEFAULT_PEER_PASSWORD],
 		["API_ASTERISK_ARI_SECRET", config.API_ASTERISK_ARI_SECRET],
 		["ASTERISK_ARI_SECRET", config.ASTERISK_ARI_SECRET],
 		["ASTERISK_SIPPROXY_SECRET", config.ASTERISK_SIPPROXY_SECRET],
 		["POSTGRES_PASSWORD", config.POSTGRES_PASSWORD],
-		["INFLUXDB_INIT_PASSWORD", config.INFLUXDB_INIT_PASSWORD],
-		["API_INFLUXDB_INIT_PASSWORD", config.API_INFLUXDB_INIT_PASSWORD],
 	] as const;
 
 	for (const [key, value] of secretKeys) {
@@ -212,12 +187,15 @@ function assertProductionNatsCredentials(config: EnvInvariantConfig): void {
 	}
 }
 
+/**
+ * The addresses an endpoint has to be able to reach.
+ *
+ * `ROUTR_EXTERNAL_ADDRS` and `RTPENGINE_PUBLIC_IP` were checked here until Routr and rtpengine were
+ * deleted. `apps/sipd` is the SIP edge now and carries its own configuration; Asterisk's SIP-proxy
+ * host is the one address still resolved through the root environment.
+ */
 function assertProductionTelephonyHosts(config: EnvInvariantConfig): void {
-	const hostKeys = [
-		["ROUTR_EXTERNAL_ADDRS", config.ROUTR_EXTERNAL_ADDRS],
-		["ASTERISK_SIPPROXY_HOST", config.ASTERISK_SIPPROXY_HOST],
-		["RTPENGINE_PUBLIC_IP", config.RTPENGINE_PUBLIC_IP],
-	] as const;
+	const hostKeys = [["ASTERISK_SIPPROXY_HOST", config.ASTERISK_SIPPROXY_HOST]] as const;
 
 	for (const [key, value] of hostKeys) {
 		if (isUnsetHost(value)) {

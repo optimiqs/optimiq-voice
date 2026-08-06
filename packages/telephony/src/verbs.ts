@@ -7,11 +7,11 @@
  * canonical verb list.
  *
  * One protocol, three consumers: the PBX feature runtimes, Autopilot, and customer voice apps
- * (`packages/voice`, whose existing verb names are preserved where they still make sense). The
+ * (the deleted voice package, whose verb names are preserved where they still make sense). The
  * union is discriminated on `verb`, so a handler is an exhaustive switch and adding a verb is a
  * compile error everywhere it must be handled.
  *
- * Durations are milliseconds with an explicit `Ms` suffix — the legacy `packages/voice` surface
+ * Durations are milliseconds with an explicit `Ms` suffix — the legacy voice surface
  * used bare seconds in some places and milliseconds in others, and that ambiguity is not carried
  * forward.
  */

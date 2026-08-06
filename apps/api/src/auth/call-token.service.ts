@@ -12,15 +12,13 @@ import {
  *
  * The claim contract lives in `call-token.claims.ts`; this file is only the signing adapter.
  *
- * **This is the live call path** as of Step 4 item 4: `src/voice/createCreateVoiceClient.ts` calls
- * `createCallAccessTokenMinter` for every inbound call, and `packages/voice` verifies the result
- * against `/api/auth/jwks`. The identity signer (`createGenerateCallAccessToken`, RS256 over
- * `.keys/private.pem`) has no callers left.
+ * The counterpart verifier is `createCallTokenVerifier` in `@optimiq-voice/auth`, which validates
+ * against `/api/auth/jwks` with no shared secret. The identity signer
+ * (`createGenerateCallAccessToken`, RS256 over `.keys/private.pem`) is deleted.
  *
  * Two entry points, deliberately: `CallTokenService` for anything Nest constructs, and the bare
- * `createCallAccessTokenMinter(platform)` closure for the ARI dispatcher, which is started by
- * `RuntimeHostService` outside the container and reaches the platform through
- * `auth-platform.registry.ts`.
+ * `createCallAccessTokenMinter(platform)` closure for code started outside the container, which
+ * reaches the platform through `auth-platform.registry.ts`.
  */
 
 /**

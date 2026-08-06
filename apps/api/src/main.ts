@@ -2,7 +2,6 @@ import "reflect-metadata";
 import { Type } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { FastifyAdapter, NestFastifyApplication } from "@nestjs/platform-fastify";
-import { assertTenantRlsPreflight } from "@optimiq-voice/db";
 import { getLogger } from "@optimiq-voice/logging";
 import { AppModule } from "./app.module";
 import {
@@ -12,9 +11,8 @@ import {
 } from "./auth/auth-bootstrap";
 import { assertCdrPreflight, isCdrAreaEnabled } from "./cdr/cdr-bootstrap";
 import { CdrModule } from "./cdr/cdr.module";
-import { API_TENANT_RLS_PLAN, createApiTenantRlsIntrospector } from "./core/db/rls-preflight-plan";
 import { httpLoggerOptions } from "./core/http/log-redaction";
-import { DATABASE_URL, HTTP_BRIDGE_PORT } from "./envs";
+import { HTTP_BRIDGE_PORT } from "./envs";
 import { registerLiveTransport } from "./live/live-bootstrap";
 import { LiveModule } from "./live/live.module";
 import { assertMailPreflight, loadMailEnv, selectMailTransport } from "./mail";
@@ -26,26 +24,20 @@ const logger = getLogger("api.bootstrap");
 
 async function bootstrap() {
 	/**
-	 * Identity-removal **Step 5 item 3** — assert the telephony database's tenant contract before
-	 * anything can serve a request.
+	 * There is no tenant-RLS preflight for the base database any more, and its absence is the
+	 * point rather than an omission.
 	 *
-	 * The tenant role, its grants and the per-table policies are the only thing standing between
-	 * two tenants once `db.forOrganization(...)` is in the read path, and a policy that silently
-	 * failed to apply looks exactly like one that works until the day it does not. Booting is the
-	 * last moment a misconfiguration can be turned into a refusal to start rather than a leak, so
-	 * it runs here, before `NestFactory.create`.
+	 * It asserted `api_tenant_tls`'s grants and the `<table>_tenant_isolation` policy on five
+	 * tables — `applications`, `secrets`, `tts_services`, `stt_services`, `intelligence_services`
+	 * — every one of which belonged to the deleted gRPC platform and has now been dropped (see
+	 * `src/core/db/schema.ts` and `drizzle/20260806164427_drop_legacy_api_tables`). A preflight
+	 * over an empty table list is not a weaker check, it is a meaningless one: the introspection
+	 * query would have to ask PostgreSQL about no tables at all.
+	 *
+	 * The databases that actually hold tenant rows still assert theirs. `packages/pbx-db` and
+	 * `packages/cdr-db` own their roles, grants and policies, and `assertCdrPreflight()` below
+	 * runs before `NestFactory.create` for exactly the reason this one used to.
 	 */
-	const preflight = await assertTenantRlsPreflight(
-		API_TENANT_RLS_PLAN,
-		createApiTenantRlsIntrospector(DATABASE_URL),
-	);
-	logger.info(
-		{
-			role: API_TENANT_RLS_PLAN.roleName,
-			tables: preflight.tables.length,
-		},
-		"tenant RLS preflight passed",
-	);
 
 	/**
 	 * Mail, asserted before anything can send one.

@@ -20,10 +20,14 @@ import dotenv from "dotenv";
  *
  * Deliberately absent, and deliberately NOT re-added as a convenience:
  *
- * - `assertEnvsAreSet` from `@optimiq-voice/common` — a legacy package this app no longer depends
- *   on. The area-level env loaders assert what they need.
+ * - `assertEnvsAreSet` from the deleted `@optimiq-voice/common`. The area-level env loaders assert
+ *   what they need.
  * - the keypair reads. Nothing in this app signs RS256 any more; `src/auth/call-token.service.ts`
  *   mints call tokens through better-auth's JWKS.
+ * - `DATABASE_URL`. It existed for one caller — the base database's tenant-RLS preflight in
+ *   `main.ts` — and that preflight went with the five legacy tables it asserted. The auth slice
+ *   reads the canonical `DATABASE_URL` through `@optimiq-voice/config`, which is where the
+ *   `API_DATABASE_URL` alias is resolved.
  */
 if (process.env.NODE_ENV === "development") {
 	// `import.meta.dirname` is the ES-module replacement for `__dirname`; it resolves to
@@ -32,14 +36,6 @@ if (process.env.NODE_ENV === "development") {
 }
 
 const e = process.env;
-
-/**
- * The telephony database. Named without the `API_` prefix to match `packages/db`'s vocabulary.
- *
- * `main.ts` hands this to `assertTenantRlsPreflight` before `NestFactory.create`, so a drifted
- * tenant policy is a refusal to start rather than a cross-tenant read.
- */
-export const DATABASE_URL = e.API_DATABASE_URL;
 
 /** The port the HTTP bridge listens on: `/api/auth/*` and `/api/v1/*`. */
 export const HTTP_BRIDGE_PORT = e.API_HTTP_BRIDGE_PORT ? parseInt(e.API_HTTP_BRIDGE_PORT) : 9876;

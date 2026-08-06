@@ -124,7 +124,7 @@ export const authzCheckRequestSchema = z.object({
 		type: z.enum(["user", "api-key", "service"]),
 		id: z.string().min(1).max(128),
 	}),
-	/** `<resource>.<action>[.<scope>]` strings from the permission registry in `packages/common`. */
+	/** `<resource>.<action>[.<scope>]` strings from the permission registry in `packages/auth`. */
 	permissions: z
 		.array(
 			z

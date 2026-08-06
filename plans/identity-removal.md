@@ -1,8 +1,41 @@
 # Identity Service Removal — Cutover Plan
 
-**Date:** 2026-08-05 · **Phase:** written in P0, executed in P1 · **Status:** Steps 1, 1.5, **2**,
-**3**, 4 and **5** are **DONE**; Step 6 is settled (recommendation (b) adopted); Steps 7-9 not
-started, with their gates restated below.
+**Date:** 2026-08-05 · **Phase:** written in P0, executed in P1 · **Status:** **COMPLETE.**
+Steps 1, 1.5, 2, 3, 4 and 5 were done on 2026-08-05; Steps **6, 7, 8 and 9** were completed on
+**2026-08-06** in the legacy-removal wave described below. Nothing in this plan is outstanding.
+
+> **Steps 6-9 — completed 2026-08-06 (legacy removal, wave 2).** The outcome differs from what
+> Steps 7 and 9 anticipated in one important way: rather than _swapping_ the SDK, dashboard and CLI
+> onto better-auth, they were **deleted**, along with every other consumer of the gRPC surface. The
+> owner decision was that all legacy goes and nothing pre-cutover is honoured, which made most of
+> Step 7 unnecessary and turned Step 9 into a straight deletion.
+>
+> - **Step 6 (SIP connect token / keys).** Retired by deleting Routr. `apps/sipd` is the SIP edge
+>   and derives credentials over `rpc.sip.v1.credential`; `.scripts/gen-keypair.sh` and the
+>   `generate:keypair` script are gone, and no process reads `.keys/*.pem`.
+> - **Step 7 (SDK / dashboard / CLI swap).** Not swapped — deleted: `packages/sdk`, `apps/ctl`,
+>   `apps/dashboard`, `apps/mcp`. `apps/web` is the only client, and it speaks HTTP to
+>   `/api/auth/*` and `/api/v1/*`.
+> - **Step 8 (infrastructure and config).** `routr`, `rtpengine`, `influxdb`, `envoy` and
+>   `autoheal` are out of both compose files; `config/envoy*.yaml`, `config/integrations*.json`
+>   and `etc/log4j2.yaml` are deleted; `API_IDENTITY_*`, `API_AUTHZ_*`, `API_TWILIO_*`,
+>   `API_INFLUXDB_*`, `INFLUXDB_*`, `ROUTR_*`, `RTPENGINE_*`, `AUTOPILOT_*`, `MCP_*`,
+>   `API_SIGNALING_SERVER` and `API_CLOAK_ENCRYPTION_KEY` are out of both env templates and out of
+>   `packages/config`. The shipped `api` service gained the variables it was silently missing —
+>   `AUTH_SECRET`, `AUTH_URL`, `PBX_DATABASE_URL`, `CDR_DATABASE_URL`, `NATS_URL` and the media
+>   roots — without which the stack booted with no product surface at all.
+> - **Step 9 (deletion list).** Executed in full, plus the packages the list did not name because
+>   they were not identity-specific: `authz`, `streams`, `logger`, `types`, `common`, `sipnet`,
+>   `voice`, `apps/autopilot`. The `legacy_*` tables were dropped by
+>   `packages/db/drizzle/20260806164358_drop_legacy_identity_mapping`, and the five legacy
+>   `apps/api` tables (`applications`, `secrets`, `tts_services`, `stt_services`,
+>   `intelligence_services`, plus `products` and the three enums) by
+>   `apps/api/drizzle/20260806164427_drop_legacy_api_tables`. Both are applied.
+>
+> **The one thing that did NOT die on schedule:** `packages/voice`'s `createCallTokenVerifier` was
+> new-platform code, not legacy. It moved to `packages/auth/src/call-token-verifier.ts` before the
+> package was deleted; `verify:call-token` still passes 27/27 through it. Its gRPC interceptor
+> (`createJwksAuthInterceptor`) was deleted with the transport it served.
 
 The custom RS256 gRPC identity service is retired and replaced by **better-auth 1.6.23**
 (`packages/auth`) on the **base database** (`packages/db`). This document enumerates everything
@@ -706,14 +739,14 @@ not be retired yet — and it is not dead code either, `apps/api/src/core/servic
 registers `buildIdentityService`. Its handlers had already been rewired to
 `getTenantAccessKeyFromCall` by Step 3; only their fixtures lagged.
 
-| suite                                                          | disposition | what changed                                        |
-| -------------------------------------------------------------- | ----------- | ---------------------------------------------------- |
-| `@identity[apikeys/createApiKey]` (2)                          | fixed       | fixture stamps the server-resolved tenant           |
-| `@identity[workspace/inviteUserToWorkspace]` (3)               | fixed       | same                                                |
-| `@identity[workspace/removeUserFromWorkspace]` (2)             | fixed       | same                                                |
-| `@identity[workspace/resendWorkspaceMembershipInvitation]` (1) | fixed       | same                                                |
-| `@sipnet[sipnet/createNumber]` (2)                             | fixed       | fixture stamps `organizationid` too                 |
-| `@sipnet[resources/{create,delete,get,list,update}]` (11)      | fixed       | stamps + the two semantic changes below             |
+| suite                                                          | disposition | what changed                              |
+| -------------------------------------------------------------- | ----------- | ----------------------------------------- |
+| `@identity[apikeys/createApiKey]` (2)                          | fixed       | fixture stamps the server-resolved tenant |
+| `@identity[workspace/inviteUserToWorkspace]` (3)               | fixed       | same                                      |
+| `@identity[workspace/removeUserFromWorkspace]` (2)             | fixed       | same                                      |
+| `@identity[workspace/resendWorkspaceMembershipInvitation]` (1) | fixed       | same                                      |
+| `@sipnet[sipnet/createNumber]` (2)                             | fixed       | fixture stamps `organizationid` too       |
+| `@sipnet[resources/{create,delete,get,list,update}]` (11)      | fixed       | stamps + the two semantic changes below   |
 
 Two fixtures record a **behaviour change** rather than a missing stamp, and both are Step 3 item 4
 working as designed:
@@ -1361,26 +1394,26 @@ Open, out of scope here:
 
 ## 7. Gate status (last run 2026-08-05, local stack on `:5433`)
 
-| gate                          | command                                                                                                                                                            | result                              |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------- |
-| api build                     | `pnpm --filter @optimiq-voice/api build`                                                                                                                           | pass                                |
-| api typecheck (both projects) | `pnpm --filter @optimiq-voice/api typecheck`                                                                                                                       | pass                                |
-| api unit tests                | `pnpm --filter @optimiq-voice/api test`                                                                                                                            | **411 passing**, 2 pending          |
+| gate                          | command                                                                                                                                                            | result                                                       |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------ |
+| api build                     | `pnpm --filter @optimiq-voice/api build`                                                                                                                           | pass                                                         |
+| api typecheck (both projects) | `pnpm --filter @optimiq-voice/api typecheck`                                                                                                                       | pass                                                         |
+| api unit tests                | `pnpm --filter @optimiq-voice/api test`                                                                                                                            | **411 passing**, 2 pending                                   |
 | **root unit tests**           | `pnpm test`                                                                                                                                                        | **564 passing**, 3 pending, 0 failing (was 540 / 21 failing) |
-| device provisioning           | `pnpm --filter @optimiq-voice/api verify:provisioning`                                                                                                             | **93/93**                           |
-| PBX area                      | `pnpm --filter @optimiq-voice/api verify:pbx`                                                                                                                      | **148/148**                         |
-| **SIP credential RPC**        | `pnpm --filter @optimiq-voice/api verify:sip-credentials`                                                                                                          | **17/17** (new)                     |
-| auth slice                    | `DATABASE_URL=… pnpm --filter @optimiq-voice/api verify:auth`                                                                                                      | **49/49** (was 38)                  |
-| per-call token                | `DATABASE_URL=… pnpm --filter @optimiq-voice/api verify:call-token`                                                                                                | **27/27**                           |
-| **Step 2 data migration**     | `DATABASE_URL=… IDENTITY_DATABASE_URL=… API_CLOAK_ENCRYPTION_KEY=… pnpm --filter @optimiq-voice/api verify:identity-migration`                                     | **19/19**                           |
-| **Step 5 tenancy + parity**   | `API_DATABASE_URL=… DATABASE_URL=… pnpm --filter @optimiq-voice/api verify:tenancy`                                                                                | **22/22** (new)                     |
-| `packages/auth`               | `pnpm --filter @optimiq-voice/auth test`                                                                                                                           | 170 pass                            |
-| `packages/db`                 | `pnpm --filter @optimiq-voice/db test`                                                                                                                             | **93 pass**                         |
-| tenant RLS — pbx              | `bun run scripts/tenant-rls-preflight.ts --plan-module ../../pbx-db/src/rls-preflight-plan --plan-export PBX_TENANT_RLS_PLAN --url …/optimiq_pbx --require-tables` | `ok`, 35/35                         |
-| tenant RLS — cdr              | `… --plan-module ../../cdr-db/src/rls-preflight-plan --url …/optimiq_cdr --require-tables`                                                                         | `ok`, 3/3                           |
-| **tenant RLS — api**          | `… --plan-module ../../../apps/api/src/core/db/rls-preflight-plan --plan-export API_TENANT_RLS_PLAN --url …/optimiq-voice --require-tables`                        | `ok`, 5/5 (new)                     |
-| repo                          | `pnpm exec turbo run build typecheck --filter='!@optimiq-voice/web' --filter='!@optimiq-voice/routing'`                                                            | 40/40                               |
-| lint / format                 | `oxlint --disable-nested-config --deny-warnings <touched>` · `oxfmt --check <touched>`                                                                             | clean                               |
+| device provisioning           | `pnpm --filter @optimiq-voice/api verify:provisioning`                                                                                                             | **93/93**                                                    |
+| PBX area                      | `pnpm --filter @optimiq-voice/api verify:pbx`                                                                                                                      | **148/148**                                                  |
+| **SIP credential RPC**        | `pnpm --filter @optimiq-voice/api verify:sip-credentials`                                                                                                          | **17/17** (new)                                              |
+| auth slice                    | `DATABASE_URL=… pnpm --filter @optimiq-voice/api verify:auth`                                                                                                      | **49/49** (was 38)                                           |
+| per-call token                | `DATABASE_URL=… pnpm --filter @optimiq-voice/api verify:call-token`                                                                                                | **27/27**                                                    |
+| **Step 2 data migration**     | `DATABASE_URL=… IDENTITY_DATABASE_URL=… API_CLOAK_ENCRYPTION_KEY=… pnpm --filter @optimiq-voice/api verify:identity-migration`                                     | **19/19**                                                    |
+| **Step 5 tenancy + parity**   | `API_DATABASE_URL=… DATABASE_URL=… pnpm --filter @optimiq-voice/api verify:tenancy`                                                                                | **22/22** (new)                                              |
+| `packages/auth`               | `pnpm --filter @optimiq-voice/auth test`                                                                                                                           | 170 pass                                                     |
+| `packages/db`                 | `pnpm --filter @optimiq-voice/db test`                                                                                                                             | **93 pass**                                                  |
+| tenant RLS — pbx              | `bun run scripts/tenant-rls-preflight.ts --plan-module ../../pbx-db/src/rls-preflight-plan --plan-export PBX_TENANT_RLS_PLAN --url …/optimiq_pbx --require-tables` | `ok`, 35/35                                                  |
+| tenant RLS — cdr              | `… --plan-module ../../cdr-db/src/rls-preflight-plan --url …/optimiq_cdr --require-tables`                                                                         | `ok`, 3/3                                                    |
+| **tenant RLS — api**          | `… --plan-module ../../../apps/api/src/core/db/rls-preflight-plan --plan-export API_TENANT_RLS_PLAN --url …/optimiq-voice --require-tables`                        | `ok`, 5/5 (new)                                              |
+| repo                          | `pnpm exec turbo run build typecheck --filter='!@optimiq-voice/web' --filter='!@optimiq-voice/routing'`                                                            | 40/40                                                        |
+| lint / format                 | `oxlint --disable-nested-config --deny-warnings <touched>` · `oxfmt --check <touched>`                                                                             | clean                                                        |
 
 `@optimiq-voice/web` is excluded: it is being built in a parallel workstream and its typecheck is
 red for reasons unrelated to this cutover (`invite-member-dialog.tsx`, `lib/auth-client.ts`,
@@ -1410,14 +1443,17 @@ verify scripts are self-configuring and a full `.env` overrides the placeholders
 **Residual gates that need infrastructure this environment does not have**
 
 1. **Step 4 item 4, the SIP leg** — an inbound call through Asterisk + Routr reaching an autopilot
-   application. Everything up to the SIP boundary is proven by `verify:call-token` (27/27, the
-   real `packages/voice` verifier over live HTTP) and the three `createVoiceClient` cases.
+   application. Everything up to the SIP boundary is proven by `verify:call-token` (27/27, now
+   through `@optimiq-voice/auth`'s verifier over live HTTP). **Superseded 2026-08-06:** Routr and
+   the autopilot application are deleted, so this gate no longer has a subject. The call path it
+   guarded is `apps/sipd` → `apps/asterisk` → `apps/engine`, whose own gates live in the master
+   plan.
 2. **Step 8 items 4-5** — "verified in every environment"; verified in one. Step 5's backfill has
    the same shape of residual: the column rewrite is proven against a three-tenant fixture set on
    this stack, and each other environment must run the sequence in the Step 8 note before its
    `NOT NULL` migration will pass.
-3. **The gRPC surface has not been exercised end to end by a real client.** `verify:tenancy` and
-   the unit specs cover the tenant resolution, the cross-tenant gate and the query rewrite, but no
-   released SDK/CLI/dashboard build has been pointed at the rewritten interceptor chain. That
-   matters most for the ordering constraint recorded in Step 3 (`tenancy` must precede
-   `checkMethodAuthorized`) and for `AUTHZ_SERVICE_ENABLED=true`, which is off by default here.
+3. **The gRPC surface has not been exercised end to end by a real client.** **Closed 2026-08-06,
+   by deletion.** There is no gRPC surface, no interceptor chain, no `AUTHZ_SERVICE_ENABLED` and no
+   SDK/CLI/dashboard build to point at one. The HTTP surface that replaced it is exercised by the
+   ten `verify:*` suites (49 + 27 + 186 + 75 + 78 + 93 + 70 + 17 + 69 + 145 checks), every one of
+   which drives the real Nest application against a real PostgreSQL.

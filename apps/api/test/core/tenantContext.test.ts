@@ -6,7 +6,7 @@ import {
 	tenantDatabaseRoleName,
 	tenantOrganizationSettingName,
 } from "@optimiq-voice/db";
-import { API_TENANT_RLS_PLAN } from "../../src/core/db/rls-preflight-plan";
+import { apiTenantRole, tables } from "../../src/core/db/schema";
 import {
 	API_TENANT_CONTEXT_NAME,
 	API_TENANT_ORGANIZATION_SETTING,
@@ -66,17 +66,16 @@ describe("@core/tenantContext", function () {
 		expect(statements).to.have.property("setOrganization");
 	});
 
-	it("preflights every table the grants migration grants, and nothing else", function () {
-		// `products` is platform-global: no organization_id, no grant, no policy. If it ever gains
-		// one it must appear in both places at once.
-		expect(API_TENANT_RLS_PLAN.expectations.map(({ table }) => table).sort()).to.deep.equal([
-			"applications",
-			"intelligence_services",
-			"secrets",
-			"stt_services",
-			"tts_services",
-		]);
-		expect(API_TENANT_RLS_PLAN.roleName).to.equal(API_TENANT_ROLE_NAME);
-		expect(API_TENANT_RLS_PLAN.expectations.every(({ mode }) => mode === "read-write")).to.be.true;
+	it("owns no tables, which is why there is no boot preflight for this database", function () {
+		// The five tenant-scoped tables this context used to own — applications, secrets,
+		// tts_services, stt_services, intelligence_services — belonged to the deleted gRPC platform
+		// and were dropped by `drizzle/20260806164427_drop_legacy_api_tables`. `main.ts` therefore
+		// runs no `assertTenantRlsPreflight` here; pbx-db and cdr-db still run theirs.
+		//
+		// The day this context grows a tenant table again, this case fails first — and the fix is
+		// to declare it with a `<table>_tenant_isolation` policy, grant it to the role below, and
+		// restore the preflight rather than to delete this assertion.
+		expect(Object.keys(tables)).to.deep.equal([]);
+		expect((apiTenantRole as unknown as { name: string }).name).to.equal(API_TENANT_ROLE_NAME);
 	});
 });

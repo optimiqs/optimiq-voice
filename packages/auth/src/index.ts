@@ -25,6 +25,18 @@ export {
 	SESSION_COOKIE_CACHE_VERSION,
 } from "./auth";
 export {
+	CALL_TOKEN_AUDIENCE,
+	CALL_TOKEN_METADATA_KEY,
+	type CallTokenClaims,
+	type CallTokenVerifier,
+	CallTokenVerificationError,
+	type CallTokenVerifierOptions,
+	createCallTokenVerifier,
+	JWKS_PATH,
+	ORGANIZATION_METADATA_KEY,
+	toCallTokenClaims,
+} from "./call-token-verifier";
+export {
 	buildAccessControlStatements,
 	getSystemRoleTemplate,
 	hasPermission,

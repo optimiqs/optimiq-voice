@@ -11,14 +11,12 @@
 		"test": "test"
 	},
 	"scripts": {
-		"backfill:tenancy": "tsx scripts/backfill-tenancy-organization-id.ts",
 		"build": "tsc -p tsconfig.build.json && node ../../.scripts/rewrite-esm-specifiers.mjs",
 		"clean": "rimraf ./dist node_modules tsconfig.tsbuildinfo tsconfig.build.tsbuildinfo",
 		"db:deploy": "node scripts/db-provision.mjs",
 		"db:generate": "drizzle-kit generate --config drizzle.config.ts",
 		"emit:sip-vectors": "tsx scripts/emit-sip-derivation-vectors.ts",
 		"generate:musiconhold": "tsx scripts/generate-musiconhold.ts",
-		"migrate:identity": "tsx scripts/migrate-identity-to-organizations.ts",
 		"prebuild": "rimraf ./dist tsconfig.tsbuildinfo tsconfig.build.tsbuildinfo",
 		"rebuild:did-index": "tsx scripts/rebuild-did-index.ts",
 		"rebuild:queue-membership": "tsx scripts/rebuild-queue-membership.ts",
@@ -31,7 +29,6 @@
 		"verify:call-token": "tsx scripts/verify-call-token.ts",
 		"verify:carrier": "tsx scripts/verify-carrier.ts",
 		"verify:cdr": "tsx scripts/verify-cdr.ts",
-		"verify:identity-migration": "tsx scripts/verify-identity-migration.ts",
 		"verify:live": "tsx scripts/verify-live.ts",
 		"verify:media": "tsx scripts/verify-media.ts",
 		"verify:pbx": "tsx scripts/verify-pbx.ts",
@@ -43,7 +40,6 @@
 		"optimiq-voice": "./dist/index.js"
 	},
 	"dependencies": {
-		"@47ng/cloak": "1.2.0",
 		"@fastify/multipart": "catalog:",
 		"@nestjs/common": "11.1.28",
 		"@nestjs/core": "11.1.28",
@@ -86,7 +82,6 @@
 		"url": "git+https://github.com/optimiqs/optimiq-voice.git"
 	},
 	"devDependencies": {
-		"@optimiq-voice/voice": "workspace:^",
 		"@types/nodemailer": "8.0.1",
 		"@types/ws": "8.18.1",
 		"cross-env": "7.0.3",

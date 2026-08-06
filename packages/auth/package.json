@@ -41,7 +41,8 @@
 		"@optimiq-voice/identifiers": "workspace:*",
 		"better-auth": "catalog:",
 		"better-call": "catalog:",
-		"drizzle-orm": "catalog:"
+		"drizzle-orm": "catalog:",
+		"jose": "catalog:"
 	},
 	"devDependencies": {
 		"@types/bun": "catalog:",

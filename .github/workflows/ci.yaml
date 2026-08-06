@@ -1,10 +1,23 @@
 # Workspace CI for the Optimiq Voice platform packages.
 #
-# `unit tests` runs the legacy root mocha suite; this workflow runs what turbo knows about — the
-# per-package specs (bun:test in packages/*, mocha in apps/api), typecheck, the events codegen
-# drift gate and the Go modules. Build runs first because several packages resolve their workspace
-# dependencies through `main: ./dist/index.js` (pnpm-workspace has linkWorkspacePackages: false),
-# so the specs import built output, not source.
+# This is the ONLY test workflow. It runs what turbo knows about — the per-package specs (bun:test
+# in packages/*, mocha in apps/api), typecheck, the events codegen drift gate and the Go modules.
+# Build runs first because several packages resolve their workspace dependencies through
+# `main: ./dist/index.js` (pnpm-workspace has linkWorkspacePackages: false), so the specs import
+# built output, not source.
+#
+# The separate `unit tests` workflow is gone: the root `pnpm test` mocha glob resolves to
+# `apps/api/test/**` and nothing else, which `turbo run test` already covers through apps/api's own
+# `test` script. It was running the same files a second time in a job that also had to fabricate a
+# `.env`.
+#
+# The npm/lerna release pipeline (`release`, `tag npm packages`, `test sdk install`) and the
+# per-app container publishes for the dashboard, identity and autopilot images are gone with the
+# apps they shipped. `publish api` went with them rather than being rewritten: everything after its
+# image push was a legacy integration harness (a generated RSA keypair, `config/integrations.json`,
+# an `envoy`/`routr` compose stack and a wait on the deleted gRPC listener on :50051), and a
+# rewrite would have been a new harness rather than an edit. Container publishing is rebuilt fresh
+# alongside the deployment story; `publish asterisk` is self-contained and still runs.
 #
 # NOT run here: the `verify:*` scripts in apps/api and the `smoke:*` scripts in apps/web. They talk
 # to a live Postgres + NATS + Asterisk stack and are run locally against the compose stack
