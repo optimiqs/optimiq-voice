@@ -17,6 +17,7 @@ import { httpLoggerOptions } from "./core/http/log-redaction";
 import { DATABASE_URL, HTTP_BRIDGE_PORT } from "./envs";
 import { registerLiveTransport } from "./live/live-bootstrap";
 import { LiveModule } from "./live/live.module";
+import { assertMailPreflight, loadMailEnv, selectMailTransport } from "./mail";
 import { isPbxAreaEnabled, registerPbxTransport } from "./pbx/pbx-bootstrap";
 import { PbxModule } from "./pbx/pbx.module";
 import { ProvisioningModule } from "./provisioning/provisioning.module";
@@ -41,6 +42,23 @@ async function bootstrap() {
 	logger.info("tenant RLS preflight passed", {
 		role: API_TENANT_RLS_PLAN.roleName,
 		tables: preflight.tables.length,
+	});
+
+	/**
+	 * Mail, asserted before anything can send one.
+	 *
+	 * The unconfigured state is legitimate — every message is rendered and written to this log, so
+	 * a developer can complete a sign-up without running a relay — and it is exactly what a
+	 * production deployment must never do: verification, password-reset and invitation messages are
+	 * one-time links, and a log aggregator is not where they belong. So the fallback is refused in
+	 * production and permitted everywhere else, at boot, on the same terms as the RLS and CDR
+	 * preflights above: the last moment a misconfiguration can be a refusal to start.
+	 */
+	const mailEnv = loadMailEnv();
+	assertMailPreflight(mailEnv);
+	logger.info("mail preflight passed", {
+		transport: selectMailTransport(mailEnv),
+		host: mailEnv.host ?? null,
 	});
 
 	/**

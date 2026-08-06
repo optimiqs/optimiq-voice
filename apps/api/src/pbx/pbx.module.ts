@@ -19,6 +19,8 @@ import { IvrMenusController } from "./ivr-menus/ivr-menus.controller";
 import { IvrMenuOptionsService, IvrMenusService } from "./ivr-menus/ivr-menus.service";
 import { MohClassesController } from "./moh-classes/moh-classes.controller";
 import { MohClassesService } from "./moh-classes/moh-classes.service";
+import { OrgSettingsController } from "./org-settings/org-settings.controller";
+import { OrgSettingsService } from "./org-settings/org-settings.service";
 import { OutboundRoutesController } from "./outbound-routes/outbound-routes.controller";
 import { OutboundRoutesService } from "./outbound-routes/outbound-routes.service";
 import { ParkLotsController } from "./park-lots/park-lots.controller";
@@ -61,6 +63,7 @@ import { TrunksService } from "./trunks/trunks.service";
 import { VoicemailBoxesController } from "./voicemail-boxes/voicemail-boxes.controller";
 import { VoicemailBoxesService } from "./voicemail-boxes/voicemail-boxes.service";
 import { VoicemailConsumer } from "./voicemail-boxes/voicemail-consumer.service";
+import { VoicemailEmailService } from "./voicemail-boxes/voicemail-email.service";
 import { VoicemailGreetingsController } from "./voicemail-boxes/voicemail-greetings.controller";
 import { VoicemailGreetingsService } from "./voicemail-boxes/voicemail-greetings.service";
 import { VoicemailMessagesController } from "./voicemail-boxes/voicemail-messages.controller";
@@ -124,6 +127,16 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		PromptsController,
 		EmergencyAddressesController,
 		FeatureCodesController,
+		/**
+		 * The settings cascade's middle level.
+		 *
+		 * In the PBX area rather than beside the auth slice because `org_setting` is a `pbx-db`
+		 * table under the same RLS policy as every other resource here, and because
+		 * `affectsRouting("org_setting")` is TRUE — a settings write recompiles the tenant's routing
+		 * artifact through the same repository the other eleven resources use. Mounting it anywhere
+		 * else would mean a second write path to a routing input.
+		 */
+		OrgSettingsController,
 		VoicemailBoxesController,
 		/**
 		 * The contents of a mailbox, on the same prefix as its configuration.
@@ -340,15 +353,18 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		MohClassesService,
 		EmergencyAddressesService,
 		FeatureCodesService,
+		OrgSettingsService,
 		VoicemailBoxesService,
 		VoicemailPinService,
 		VoicemailMwiPublisher,
 		VoicemailMessagesService,
 		VoicemailGreetingsService,
+		VoicemailEmailService,
 		VoicemailConsumer,
 		RoutingService,
 	],
 	exports: [
+		OrgSettingsService,
 		PBX_ENV,
 		PBX_DATABASE,
 		PBX_EFFECT_RUNTIME,

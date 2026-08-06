@@ -48,6 +48,27 @@ function organizationPluginOptions(auth: ReturnType<typeof createAuth>): {
 	};
 }
 
+/** The two-factor plugin's options, as composed. */
+function twoFactorPluginOptions(auth: ReturnType<typeof createAuth>): {
+	otpOptions?: {
+		sendOTP?: (data: {
+			user: { id: string; email?: string; name?: string };
+			otp: string;
+		}) => unknown;
+	};
+} {
+	const plugins = auth.options.plugins as { id: string; options?: unknown }[];
+	const plugin = plugins.find((candidate) => candidate.id === "two-factor");
+	return (plugin?.options ?? {}) as {
+		otpOptions?: {
+			sendOTP?: (data: {
+				user: { id: string; email?: string; name?: string };
+				otp: string;
+			}) => unknown;
+		};
+	};
+}
+
 describe("createAuth", () => {
 	const auth = buildAuth();
 	const endpoints = Object.keys(auth.api);
@@ -79,6 +100,52 @@ describe("createAuth", () => {
 	it("registers two-factor enrolment", () => {
 		expect(endpoints).toContain("enableTwoFactor");
 		expect(endpoints).toContain("verifyTOTP");
+	});
+
+	it("wires the two-factor OTP sender onto the plugin's own option name", () => {
+		// `otpOptions.sendOTP` is what better-auth 1.6 reads; anything else composes silently and
+		// mints codes nobody receives.
+		const withOtp = buildAuth({
+			email: { ...email, sendTwoFactorOtp: () => Promise.resolve() },
+		});
+		expect(twoFactorPluginOptions(withOtp).otpOptions?.sendOTP).toBeFunction();
+		expect(Object.keys(withOtp.api)).toContain("sendTwoFactorOTP");
+	});
+
+	it("omits the OTP adapter when the host has no way to deliver a code", () => {
+		// Registering it anyway would make POST /two-factor/send-otp answer 200 for a code that
+		// went nowhere, which is worse than the endpoint not existing.
+		expect(twoFactorPluginOptions(auth).otpOptions).toBeUndefined();
+	});
+
+	it("hands the sender the user's id, address and name", async () => {
+		const seen: { id?: string; email?: string; otp?: string }[] = [];
+		const withOtp = buildAuth({
+			email: {
+				...email,
+				sendTwoFactorOtp: async ({ user, otp }) => {
+					seen.push({ id: user.id, email: user.email, otp });
+				},
+			},
+		});
+		const sendOTP = twoFactorPluginOptions(withOtp).otpOptions?.sendOTP;
+		await sendOTP?.({ user: { id: "u1", email: "a@b.test", name: "A" }, otp: "123456" });
+		expect(seen).toEqual([{ id: "u1", email: "a@b.test", otp: "123456" }]);
+	});
+
+	it("sends nothing for a user with no address rather than inventing a recipient", async () => {
+		let called = 0;
+		const withOtp = buildAuth({
+			email: {
+				...email,
+				sendTwoFactorOtp: async () => {
+					called += 1;
+				},
+			},
+		});
+		const sendOTP = twoFactorPluginOptions(withOtp).otpOptions?.sendOTP;
+		await sendOTP?.({ user: { id: "u1" }, otp: "123456" });
+		expect(called).toBe(0);
 	});
 
 	it("publishes JWKS so service and per-call tokens can be verified offline", () => {

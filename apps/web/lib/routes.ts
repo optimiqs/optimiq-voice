@@ -34,6 +34,8 @@ export const routes = {
 	members: "/settings/members",
 	apiKeys: "/settings/api-keys",
 	emergencyAddresses: "/settings/emergency-addresses",
+	/** The `notifications` category of the settings cascade — voicemail-to-email and its from-name. */
+	notifications: "/settings/notifications",
 
 	/**
 	 * Detail views, for the four entities that own a child collection.

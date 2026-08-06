@@ -67,6 +67,19 @@ export interface AuthEmailDelivery {
 		readonly role: string | undefined;
 		readonly acceptUrl: string;
 	}) => Promise<void>;
+	/**
+	 * The second factor's one-time code, delivered out of band.
+	 *
+	 * Optional, and its presence is load-bearing rather than decorative: better-auth's `twoFactor`
+	 * plugin only wires its `otp` sub-adapter when `otpOptions.sendOTP` is supplied, so a host that
+	 * omits this gets TOTP and backup codes and no email path — which is the correct behaviour for
+	 * a host with no transport, because `POST /two-factor/send-otp` would otherwise mint a code
+	 * nobody can receive and answer 200.
+	 */
+	readonly sendTwoFactorOtp?: (input: {
+		readonly user: AuthMailRecipient;
+		readonly otp: string;
+	}) => Promise<void>;
 }
 
 export interface AuthJwtOptions {
@@ -187,6 +200,10 @@ export function createAuth(options: CreateAuthOptions) {
 		? createSessionOrganizationHook(options.organizationRepository)
 		: undefined;
 
+	// Captured once so the plugin's option object can be built conditionally without re-reading a
+	// possibly-undefined member inside the callback.
+	const sendTwoFactorOtp = options.email.sendTwoFactorOtp;
+
 	const rolesOption = options.organizationRoles ?? true;
 	const accessControl = rolesOption === false ? undefined : buildOrganizationAccessControl();
 	const creatorRole =
@@ -297,7 +314,38 @@ export function createAuth(options: CreateAuthOptions) {
 				requireName: true,
 			}),
 			admin(),
-			twoFactor({ issuer: options.appName ?? "Optimiq Voice" }),
+			twoFactor({
+				issuer: options.appName ?? "Optimiq Voice",
+				/**
+				 * `otpOptions.sendOTP` — the plugin's own option name, and the only way to reach the
+				 * `otp` sub-adapter. Registered only when the host supplied a sender, for the reason
+				 * `AuthEmailDelivery.sendTwoFactorOtp` records.
+				 */
+				...(sendTwoFactorOtp === undefined
+					? {}
+					: {
+							otpOptions: {
+								sendOTP: async (data) => {
+									/**
+									 * `UserWithTwoFactor.email` is typed optional by the plugin, so the guard
+									 * is a type narrowing and a real one at once: a user row with no address
+									 * has nowhere to receive a code, and inventing a recipient would be
+									 * worse than not sending. Returning without sending leaves the OTP
+									 * unusable, which is the correct outcome for an account that cannot
+									 * receive it — the other factors (TOTP, backup codes) are unaffected.
+									 */
+									const email = data.user.email;
+									if (typeof email !== "string" || email.length === 0) {
+										return;
+									}
+									await sendTwoFactorOtp({
+										user: { id: data.user.id, email, name: data.user.name },
+										otp: data.otp,
+									});
+								},
+							},
+						}),
+			}),
 			jwt(buildJwtPluginOptions(options.jwt)),
 			bearer(),
 			...((options.openApiEnabled ?? true) ? [openAPI()] : []),

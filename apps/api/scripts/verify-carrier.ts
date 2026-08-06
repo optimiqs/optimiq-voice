@@ -988,6 +988,7 @@ async function main(): Promise<void> {
 				PBX_OUTBOX_RETENTION_HOURS: 24,
 				PBX_VOICEMAIL_MEDIA_ROOT: "/tmp/optimiq-voice-unused",
 				PBX_VOICEMAIL_URL_TTL_SECONDS: 300,
+				PBX_VOICEMAIL_EMAIL_URL_TTL_SECONDS: 24 * 3600,
 				PBX_MEDIA_OBJECT_ROOT: "/tmp/optimiq-voice-unused",
 				PBX_MEDIA_MAX_UPLOAD_BYTES: 10 * 1024 * 1024,
 			});

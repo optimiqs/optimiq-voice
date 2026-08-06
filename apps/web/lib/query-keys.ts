@@ -70,7 +70,15 @@ export const queryKeys = {
 	 * routing change and the compile banner has to notice.
 	 */
 	voicemailGreetings: (organizationId: string, boxId: string) =>
-		["organizations", organizationId, "pbx", "voicemail-boxes", "item", boxId, "greetings"] as const,
+		[
+			"organizations",
+			organizationId,
+			"pbx",
+			"voicemail-boxes",
+			"item",
+			boxId,
+			"greetings",
+		] as const,
 
 	/**
 	 * The audio files under one hold-music class.
@@ -98,6 +106,22 @@ export const queryKeys = {
 	 * on an org switch would be a request that can only return what is already cached.
 	 */
 	featureCodeParamFields: () => ["pbx", "feature-code-param-fields"] as const,
+
+	/**
+	 * The organization settings cascade.
+	 *
+	 * `orgSettingsCatalog` is NOT organization-scoped, on exactly the same terms as
+	 * `featureCodeParamFields`: it describes what settings exist and what type each is, which is a
+	 * property of the deployment's code and identical for every tenant.
+	 *
+	 * `orgSettingsCategory` IS scoped, because the resolved values are the tenant's. It sits under
+	 * `pbx` so an org switch and the coarse PBX sweeps both reach it — `org_setting` is a routing
+	 * input (`affectsRouting("org_setting")` is true), so a settings save recompiles the artifact
+	 * and the compile view has to be invalidated with it.
+	 */
+	orgSettingsCatalog: () => ["pbx", "org-settings-catalog"] as const,
+	orgSettingsCategory: (organizationId: string, category: string) =>
+		["organizations", organizationId, "pbx", "org-settings", category] as const,
 	/** The compile/simulate surface, which reads the whole configuration rather than one table. */
 	routingCompile: (organizationId: string) =>
 		["organizations", organizationId, "pbx", "routing", "compile"] as const,

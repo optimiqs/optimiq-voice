@@ -69,6 +69,17 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, PageRequirement>> = {
 	 * could. The API guards reads with `numbers.read`, so this says the same thing.
 	 */
 	[routes.emergencyAddresses]: { permissions: ["numbers.read"] },
+	/**
+	 * The notification settings.
+	 *
+	 * `settings.read` because that is exactly what `OrgSettingsController` guards the category read
+	 * with. Naming anything else here would produce the disagreement this map exists to prevent —
+	 * a visible nav tab and a page that 403s. Saving needs `settings.write`, which the page gates
+	 * with `RequirePermission` rather than with a route requirement: a role that can see the
+	 * organization's policy but not change it should see it, read-only, not be told the page does
+	 * not exist.
+	 */
+	[routes.notifications]: { permissions: ["settings.read"] },
 };
 
 /** True when `path` matches `pattern`, treating any `[segment]` in the pattern as a wildcard. */

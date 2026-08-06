@@ -145,6 +145,31 @@ export const pbxEnvSchema = z.object({
 	PBX_VOICEMAIL_URL_TTL_SECONDS: z.coerce.number().int().min(30).max(3600).default(300),
 
 	/**
+	 * How long the playback link inside a voicemail NOTIFICATION stays valid.
+	 *
+	 * Its own knob, and a much longer default, because the threat model is different from the web
+	 * UI's. A link minted for a signed-in admin who is looking at the screen needs to outlive one
+	 * click, and five minutes is generous for that — the browser can always mint another. A link in
+	 * an email has no way to mint another: the recipient reads their mail when they read it, and a
+	 * link that expired while it sat in an inbox is a notification that tells somebody they have a
+	 * voicemail and then refuses to play it.
+	 *
+	 * Twenty-four hours by default, capped at seven days. The token is still signed, still carries
+	 * the message id and the organization INSIDE the signature (so there is nothing to enumerate),
+	 * still verified against the tenant's RLS scope before a byte is read, and still revocable in
+	 * bulk by rotating `PBX_VOICEMAIL_URL_SECRET`. What a longer TTL costs is the window in which a
+	 * forwarded email lets its new holder hear one message — which is the same thing forwarding an
+	 * ATTACHED recording would cost, permanently, and this is the reason the notification carries a
+	 * link rather than the audio.
+	 */
+	PBX_VOICEMAIL_EMAIL_URL_TTL_SECONDS: z.coerce
+		.number()
+		.int()
+		.min(300)
+		.max(7 * 24 * 3600)
+		.default(24 * 3600),
+
+	/**
 	 * Where the media LIBRARY writes uploads: MOH files, prompts and voicemail greetings.
 	 *
 	 * Defaults to `PBX_VOICEMAIL_MEDIA_ROOT` (which itself defaults to `CDR_RECORDING_ROOT`) for

@@ -1302,6 +1302,129 @@ async function main(): Promise<void> {
 			String(data(simulateB).matched),
 		);
 
+		// --- 8b. the organization settings cascade ----------------------------------------------------
+		//
+		// `org_setting` had no write path before this section existed: the table was in `pbx-db`, the
+		// compiler read eight of its names, and nothing could put a row in it. What is proved here is
+		// the cascade itself — a tenant with no rows still answers with every setting at its code
+		// default, a save lands, a second tenant is unaffected — plus the two refusals that keep a
+		// settings screen from writing configuration nothing reads.
+		console.log("\n8b. the organization settings cascade");
+
+		const catalog = await clientA("GET", "/api/v1/org-settings/catalog");
+		// `data()` narrows to a record; the catalogue's payload is an array, which is a record
+		// structurally but not to the compiler. `rows()` is the array-shaped reader beside it.
+		const catalogEntries = rows(catalog) as { name: string; category: string }[];
+		check(
+			"the catalogue names every setting the platform declares",
+			Array.isArray(catalogEntries) &&
+				catalogEntries.some((entry) => entry.name === "voicemailToEmailEnabled") &&
+				catalogEntries.some((entry) => entry.category === "routing"),
+			`${catalogEntries.length} entry/entries`,
+		);
+
+		const notificationsBefore = await clientA(
+			"GET",
+			"/api/v1/org-settings/categories/notifications",
+		);
+		const defaults = data(notificationsBefore) as Record<string, unknown>;
+		check(
+			"a tenant with no rows is still fully configured, from the code defaults",
+			defaults.voicemailToEmailEnabled === true && defaults.fromName === null,
+			JSON.stringify(defaults),
+		);
+
+		const savedNotifications = await clientA(
+			"PATCH",
+			"/api/v1/org-settings/categories/notifications",
+			{ voicemailToEmailEnabled: false, fromName: "Acme Support" },
+		);
+		check(
+			"a partial patch upserts only the names it carries",
+			savedNotifications.status === 200 &&
+				(savedNotifications.body as { written?: string[] }).written?.length === 2,
+			`status ${savedNotifications.status}`,
+		);
+
+		const notificationsAfter = await clientA(
+			"GET",
+			"/api/v1/org-settings/categories/notifications",
+		);
+		const resolved = data(notificationsAfter) as Record<string, unknown>;
+		check(
+			"the saved values overlay the defaults, and the untouched ones keep theirs",
+			resolved.voicemailToEmailEnabled === false &&
+				resolved.fromName === "Acme Support" &&
+				resolved.voicemailToEmailIncludeLink === true,
+			JSON.stringify(resolved),
+		);
+
+		const secondSave = await clientA("PATCH", "/api/v1/org-settings/categories/notifications", {
+			fromName: "Acme Support Desk",
+		});
+		check(
+			"saving the same setting twice updates the row rather than colliding with the unique index",
+			secondSave.status === 200,
+			`status ${secondSave.status}`,
+		);
+
+		const badValue = await clientA("PATCH", "/api/v1/org-settings/categories/notifications", {
+			voicemailToEmailEnabled: "yes",
+		});
+		check(
+			"a wrong-typed value is refused rather than stored as a row nothing can read",
+			badValue.status === 400 &&
+				(badValue.body as { code?: string }).code === "SETTING_PATCH_INVALID",
+			`status ${badValue.status}`,
+		);
+
+		const unknownName = await clientA("PATCH", "/api/v1/org-settings/categories/notifications", {
+			voicemailToEmail: true,
+		});
+		check(
+			"a name the platform does not read is refused, not saved and ignored forever",
+			unknownName.status === 400,
+			`status ${unknownName.status}`,
+		);
+
+		const unknownCategory = await clientA("GET", "/api/v1/org-settings/categories/nope");
+		check(
+			"an uncatalogued category is a 404, not an empty object a screen would render as blank",
+			unknownCategory.status === 404 &&
+				(unknownCategory.body as { code?: string }).code === "SETTING_CATEGORY_UNKNOWN",
+			`status ${unknownCategory.status}`,
+		);
+
+		/**
+		 * The routing category is READ here and deliberately not written.
+		 *
+		 * Writing one would be a genuine assertion — it is the same endpoint and the same
+		 * repository — and it would also change the compiled artifact, because the snapshot loader
+		 * selects `org_setting where category = 'routing'` and the compiler hashes what it loads.
+		 * Section 9 compares the artifact in the KV bucket against the hash section 8's compile
+		 * reported, so a routing write here makes that comparison fail for a reason that has
+		 * nothing to do with the cache. The `notifications` writes above are safe for the mirror
+		 * image of that reason: they are not in the snapshot, so the recompile they trigger
+		 * produces the same hash and publishes nothing.
+		 *
+		 * That the routing names are accepted by the same validated path is covered by
+		 * `test/pbx/orgSettings.test.ts`, which drives `parseCategoryPatch` directly.
+		 */
+		const routingSettings = await clientA("GET", "/api/v1/org-settings/categories/routing");
+		check(
+			"the routing category the compiler reads is served by the same facade",
+			routingSettings.status === 200 &&
+				"outboundEnabled" in (data(routingSettings) as Record<string, unknown>),
+			JSON.stringify(data(routingSettings)),
+		);
+
+		const notificationsB = await clientB("GET", "/api/v1/org-settings/categories/notifications");
+		check(
+			"B sees its own defaults, not A's overrides — RLS, not a predicate",
+			(data(notificationsB) as Record<string, unknown>).voicemailToEmailEnabled === true,
+			JSON.stringify(data(notificationsB)),
+		);
+
 		// --- 9. the NATS half -------------------------------------------------------------------------
 		if (nats === undefined) {
 			console.log("\n9. NATS checks SKIPPED (docker unavailable)");

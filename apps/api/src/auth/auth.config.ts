@@ -35,8 +35,13 @@ export interface AuthSliceConfig {
 	readonly cookieSameSite: "strict" | "lax" | "none" | undefined;
 	readonly sessionExpiresInSeconds: number;
 	/**
-	 * Email delivery is a console stub until the SMTP helpers are ported, so requiring
-	 * verification outside production would lock every developer out of their own sign-up.
+	 * Required in production only.
+	 *
+	 * This used to be a consequence of email delivery being a log-only stub; it no longer is —
+	 * `src/mail` sends for real, and with no SMTP configured it still renders the verification link
+	 * into the log, so a developer can complete the flow either way. It stays production-only
+	 * because that is a deployment policy rather than a transport limitation: a local or CI process
+	 * spinning up seeded users should not have to complete a mail round trip to sign in.
 	 */
 	readonly requireEmailVerification: boolean;
 	readonly rateLimitEnabled: boolean;

@@ -3,6 +3,7 @@ import { AckPolicy, connect, DeliverPolicy, type NatsConnection } from "nats";
 import { getLogger } from "@optimiq-voice/logger";
 import { eq, voicemailBox, voicemailMessage } from "@optimiq-voice/pbx-db";
 import { PBX_DATABASE, PBX_ENV } from "../shared/pbx.tokens";
+import { VoicemailEmailService } from "./voicemail-email.service";
 import { readMailboxCounts, VoicemailMwiPublisher } from "./voicemail-mwi.publisher";
 import type { PbxEnv } from "../shared/pbx-env";
 import type { MailboxCounts } from "./voicemail-mwi.publisher";
@@ -64,6 +65,7 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 		@Inject(PBX_ENV) private readonly env: PbxEnv,
 		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
 		@Inject(VoicemailMwiPublisher) private readonly mwi: VoicemailMwiPublisher,
+		@Inject(VoicemailEmailService) private readonly email: VoicemailEmailService,
 	) {}
 
 	get stats(): {
@@ -229,6 +231,7 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 			}
 			message.ack();
 			await this.publishMwi(envelope.orgId, mailboxId, data.mailboxNumber, counts);
+			await this.notifyByEmail(envelope.orgId, mailboxId, data.messageId);
 		} catch (error) {
 			this.failed += 1;
 			logger.error("failed to file a voicemail message; it will be redelivered", {
@@ -316,6 +319,39 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 		counts: MailboxCounts,
 	): Promise<void> {
 		await this.mwi.publish(organizationId, mailboxId, mailboxNumber, counts, "message-left");
+	}
+
+	/**
+	 * Voicemail-to-email, on exactly the same terms as the MWI publish.
+	 *
+	 * After the ack and never in the failure path: the row IS filed, and a relay that is down must
+	 * not cause the message to be redelivered and filed again. `VoicemailEmailService.notify` does
+	 * not throw — every refusal is a named outcome — so this is a `void` return by construction
+	 * rather than by a swallowed `catch`.
+	 *
+	 * ## What a duplicate delivery does
+	 *
+	 * JetStream will eventually redeliver, and a crash between the ack and this call means a
+	 * message that is filed and never emailed. Both are accepted, in that direction: the insert is
+	 * `on conflict do nothing`, so a redelivery re-runs this and sends a SECOND notification for a
+	 * message the recipient already has — an annoyance — whereas making the send part of the acked
+	 * unit of work would mean a relay outage re-filing rows. A duplicate notification carries the
+	 * same `X-Optimiq-Voicemail-Message-Id`, which is what lets a mail store collapse it.
+	 */
+	private async notifyByEmail(
+		organizationId: string,
+		mailboxId: string,
+		messageId: string,
+	): Promise<void> {
+		const outcome = await this.email.notify(organizationId, mailboxId, messageId);
+		if (outcome.outcome === "failed") {
+			// Already logged with the cause by the service; this records the message it belonged to.
+			logger.warn("a voicemail was filed but its notification could not be sent", {
+				organizationId,
+				mailboxId,
+				messageId,
+			});
+		}
 	}
 }
 

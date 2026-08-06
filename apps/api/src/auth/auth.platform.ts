@@ -1,6 +1,5 @@
-import { type Auth, createAuth } from "@optimiq-voice/auth";
+import { type Auth, type AuthEmailDelivery, createAuth } from "@optimiq-voice/auth";
 import { createDatabaseClient, type DatabaseClient } from "@optimiq-voice/db";
-import { createLoggingEmailDelivery } from "./auth-email.delivery";
 import { type AuthSliceConfig, resolveAuthSliceConfig } from "./auth.config";
 import { type AuthRepository, createAuthRepository } from "./auth.repository";
 
@@ -20,7 +19,17 @@ export interface AuthPlatform {
 	readonly close: () => Promise<void>;
 }
 
+/**
+ * Composes the runtime.
+ *
+ * `email` is a REQUIRED parameter rather than something this function builds, and that is the
+ * point of the change that introduced it: delivery used to be a log-only stub constructed here,
+ * which meant nothing outside this file could see whether messages were being sent. It is now the
+ * `Mailer` that `MailModule` owns, injected by `auth.module.ts`, so the transport has one owner
+ * with one lifecycle and this function has no opinion about SMTP at all.
+ */
 export function createAuthPlatform(
+	email: AuthEmailDelivery,
 	config: AuthSliceConfig = resolveAuthSliceConfig(),
 ): AuthPlatform {
 	const database = createDatabaseClient({
@@ -38,7 +47,7 @@ export function createAuthPlatform(
 		baseURL: config.baseURL,
 		appURL: config.appURL,
 		trustedOrigins: config.trustedOrigins,
-		email: createLoggingEmailDelivery(),
+		email,
 		organizationRepository: repository,
 		sessionExpiresInSeconds: config.sessionExpiresInSeconds,
 		requireEmailVerification: config.requireEmailVerification,
