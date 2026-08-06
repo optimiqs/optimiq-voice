@@ -659,15 +659,21 @@ async function main(): Promise<void> {
 			String(data(trunkRow).authUser),
 		);
 		/**
-		 * The password is NOT in the database. It is returned once here and remains re-derivable
-		 * from the carrier via `carrier_ref`, which is a strictly better place for it than a column
-		 * every service in the area can read.
+		 * The password is NOT in the database. It is returned once by the provision call and remains
+		 * re-derivable from the carrier via `carrier_ref`, which is a strictly better place for it
+		 * than a column every service in the area can read.
+		 *
+		 * The handle itself is no longer asserted to be PRESENT: `sipSecretRef` is `secretColumns`
+		 * on `TRUNK_RESOURCE`, so a read that returned it would be the bug. That the write landed is
+		 * proven by the provisioning flow succeeding at all — the engine resolves the handle from
+		 * the row, not from this response.
 		 */
 		check(
-			"the trunk row stores a secret handle, never the password",
-			data(trunkRow).sipSecretRef === `secret://telnyx/trunk/${trunkId}` &&
-				!JSON.stringify(data(trunkRow)).includes(String(credentials.sipPassword)),
-			String(data(trunkRow).sipSecretRef),
+			"the trunk row leaks neither the password nor the secret handle",
+			data(trunkRow).sipSecretRef === undefined &&
+				!JSON.stringify(data(trunkRow)).includes(String(credentials.sipPassword)) &&
+				!JSON.stringify(data(trunkRow)).includes(`secret://telnyx/trunk/${trunkId}`),
+			JSON.stringify(data(trunkRow).sipSecretRef),
 		);
 		check(
 			"the trunk row records its carrier provenance",

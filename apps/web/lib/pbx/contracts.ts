@@ -211,10 +211,18 @@ export interface FollowMeTarget {
 	readonly confirm?: boolean;
 }
 
+/**
+ * `sipSecretRef` and `sipPasswordHa1` are absent, and their absence is the contract.
+ *
+ * Both are in `secretColumns` on the server's `EXTENSION_RESOURCE`, so they are stripped from
+ * every list, get, create and update body. They remain writable — `extensionCreateFormSchema`
+ * still requires a reference, and the edit form sends one when the operator types one — which is
+ * the asymmetry worth naming: a credential goes in and does not come back, so nothing here can
+ * render it, pre-fill it, or diff against it.
+ */
 export interface ExtensionRow extends EntityRow {
 	readonly number: string;
 	readonly label: string;
-	readonly sipSecretRef: string;
 	readonly callerIdName: string | null;
 	readonly callerIdNumber: string | null;
 	readonly outboundCallerIdName: string | null;
@@ -285,8 +293,12 @@ export interface TrunkRow extends EntityRow {
 	readonly sipDomain: string;
 	readonly sipProxy: string;
 	readonly outboundProxy: string | null;
+	/**
+	 * The SIP username — the public half of the pair, and the one an operator needs when a
+	 * registration is failing. `sipSecretRef` is the other half's address and is `secretColumns`
+	 * on the server, so it is not on the wire and is not declared here.
+	 */
 	readonly authUser: string | null;
-	readonly sipSecretRef: string | null;
 	readonly registerExpiresSeconds: number;
 	readonly transport: SipTransport;
 	readonly codecPrefs: string | null;

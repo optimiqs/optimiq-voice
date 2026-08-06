@@ -23,4 +23,19 @@ export const TRUNK_RESOURCE: PbxResource = {
 	enabledColumn: trunk.enabled,
 	destinations: [],
 	destinationType: null,
+	/**
+	 * The outbound-auth secret half, withheld for the same reason as an extension's.
+	 *
+	 * `authUser` is deliberately NOT here. It is the SIP username — the public half of the pair,
+	 * the value the carrier prints on its own portal, and the one thing an operator staring at a
+	 * failing registration most needs to see. `trunk-detail.tsx` renders it as "SIP username" and
+	 * should keep doing so; hiding it would cost a real diagnostic and buy nothing, because a
+	 * username without its secret authenticates nothing.
+	 *
+	 * `sipSecretRef` is the other half's address in the secret manager, and it is withheld. The
+	 * carrier-provisioning path writes it through `TrunksService.update` (`carrier.service.ts`),
+	 * whose envelope is spread into the provisioning response — so redacting at the resource is
+	 * what keeps it out of that second surface too, rather than only out of the CRUD one.
+	 */
+	secretColumns: ["sipSecretRef"],
 };

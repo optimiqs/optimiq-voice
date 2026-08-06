@@ -7,19 +7,30 @@ import { SelectField, SwitchField, TextField } from "~/components/ui/form-fields
 import { useServerFieldErrors } from "~/lib/forms/server-errors";
 import { PBX_RESOURCES } from "~/lib/pbx/client";
 import { RECORD_POLICIES, TOLL_CLASSES } from "~/lib/pbx/contracts";
-import { extensionFormSchema, type ExtensionFormValues } from "~/lib/pbx/schemas";
+import {
+	extensionEditFormSchema,
+	extensionFormSchema,
+	type ExtensionFormValues,
+} from "~/lib/pbx/schemas";
 import { usePbxCreate, usePbxUpdate } from "../../_hooks/use-pbx-queries";
 import type { ExtensionRow } from "~/lib/pbx/contracts";
 
 /**
  * Create and edit an extension.
  *
- * ## The SIP secret is a reference, not a password
+ * ## The SIP secret is a reference, not a password — and it is write-only
  *
  * `sipSecretRef` is a handle into the secret manager — the password itself never reaches this
  * database, which is why the field is a plain text input labelled as a reference rather than a
  * masked password box. Rendering it as a password field would tell the user they are typing a
  * credential, and they would.
+ *
+ * It does not come back. The server strips it, and `sipPasswordHa1` with it, from every response
+ * (`secretColumns` on `EXTENSION_RESOURCE`), so there is nothing to pre-fill: on an edit the field
+ * opens blank and means "leave the stored reference alone" unless the operator types a new one.
+ * That is why editing validates against `extensionEditFormSchema` and why a blank reference is
+ * OMITTED from the PATCH rather than sent as `null` — an absent key is the only encoding of "do
+ * not touch this" the server accepts.
  *
  * ## Toll class is not a formality
  *
@@ -48,7 +59,8 @@ function defaultsFor(extension: ExtensionRow | null): ExtensionFormValues {
 	return {
 		number: extension?.number ?? "",
 		label: extension?.label ?? "",
-		sipSecretRef: extension?.sipSecretRef ?? "",
+		// Never pre-filled: the server does not return it. See the note at the top of this file.
+		sipSecretRef: "",
 		callerIdName: extension?.callerIdName ?? "",
 		callerIdNumber: extension?.callerIdNumber ?? "",
 		outboundCallerIdNumber: extension?.outboundCallerIdNumber ?? "",
@@ -80,11 +92,14 @@ export function ExtensionDialog({
 	const mutation = extension === null ? create : update;
 	const server = useServerFieldErrors();
 
+	// Creating requires a secret reference; editing accepts a blank one as "leave it alone".
+	const schema = extension === null ? extensionFormSchema : extensionEditFormSchema;
+
 	const form = useForm({
 		defaultValues: defaultsFor(extension),
-		validators: { onSubmit: extensionFormSchema },
+		validators: { onSubmit: schema },
 		onSubmit: async ({ value }) => {
-			const parsed = extensionFormSchema.parse(value);
+			const parsed = schema.parse(value);
 			server.clear();
 
 			/**
@@ -101,7 +116,15 @@ export function ExtensionDialog({
 			const body = {
 				number: parsed.number,
 				label: parsed.label,
-				sipSecretRef: parsed.sipSecretRef,
+				/**
+				 * Present only when there is one to send.
+				 *
+				 * On a create the schema guarantees a non-empty string. On an edit a blank field
+				 * parses to `null`, and `null` is not "unchanged" to the server — `sipSecretRef` is
+				 * `z.string().min(1)` on the create DTO, so a null is a 400 and would be a confusing
+				 * one. Dropping the key is what leaves the stored reference alone.
+				 */
+				...(parsed.sipSecretRef === null ? {} : { sipSecretRef: parsed.sipSecretRef }),
 				callerIdName: parsed.callerIdName,
 				callerIdNumber: parsed.callerIdNumber,
 				outboundCallerIdNumber: parsed.outboundCallerIdNumber,
@@ -181,9 +204,13 @@ export function ExtensionDialog({
 						<TextField
 							field={field}
 							label="SIP secret reference"
-							required
+							required={extension === null}
 							placeholder="secret://extensions/1001"
-							description="A handle into the secret manager. The password itself is never stored here."
+							description={
+								extension === null
+									? "A handle into the secret manager. The password itself is never stored here."
+									: "Write-only: the stored reference is never sent back. Leave blank to keep it."
+							}
 							disabled={mutation.isPending}
 							submitError={server.errors.sipSecretRef}
 							className="sm:col-span-2"

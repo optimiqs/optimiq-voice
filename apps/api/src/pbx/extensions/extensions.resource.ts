@@ -22,4 +22,24 @@ export const EXTENSION_RESOURCE: PbxResource = {
 	enabledColumn: extension.enabled,
 	destinations: [],
 	destinationType: "extension",
+	/**
+	 * The SIP credential columns, which no reader of this API has any business receiving.
+	 *
+	 * `sipPasswordHa1` is `MD5(user:realm:password)`. It is not a password "hash" in the sense that
+	 * makes a leak survivable — it IS the credential the registrar compares against, so anyone
+	 * holding it can answer a digest challenge without ever recovering the password, and can also
+	 * grind it offline at MD5 speed if they want the password too. It was being returned in full
+	 * from every extension list page.
+	 *
+	 * `sipSecretRef` is a handle rather than the secret itself, which is exactly why it is worth
+	 * withholding: it is the address an attacker who has reached the secret manager needs in order
+	 * to know WHICH secret belongs to this extension. Publishing the index of a vault to every
+	 * reader of the extension list gives up the one thing the indirection was bought for.
+	 *
+	 * Both stay writable — `createExtensionDto` still requires `sipSecretRef` and still accepts a
+	 * pre-computed HA1 — because setting a credential and reading one back are different rights.
+	 * `apps/web`'s edit form sends the reference only when the operator retypes it; an absent key on
+	 * a PATCH leaves the stored value alone.
+	 */
+	secretColumns: ["sipSecretRef", "sipPasswordHa1"],
 };

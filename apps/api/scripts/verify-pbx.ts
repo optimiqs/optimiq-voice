@@ -381,6 +381,23 @@ async function main(): Promise<void> {
 			Array.isArray(extensionA.body.warnings),
 			JSON.stringify(warnings(extensionA).map((warning) => warning.code)),
 		);
+		/**
+		 * The write above SENT a secret reference and the response must not contain it.
+		 *
+		 * `secretColumns` on `EXTENSION_RESOURCE` strips `sip_secret_ref` and `sip_password_ha1`
+		 * from every serialized row, so the check is on the whole body rather than on the field: a
+		 * future column that happens to carry the same value would be the same leak.
+		 */
+		check(
+			"the create response carries no SIP credential",
+			!JSON.stringify(extensionA.body).includes("secret://verify/1001") &&
+				data(extensionA).sipSecretRef === undefined &&
+				data(extensionA).sipPasswordHa1 === undefined,
+			JSON.stringify({
+				sipSecretRef: data(extensionA).sipSecretRef,
+				sipPasswordHa1: data(extensionA).sipPasswordHa1,
+			}),
+		);
 
 		const extensionB = await clientA("POST", "/api/v1/extensions", {
 			number: "1002",

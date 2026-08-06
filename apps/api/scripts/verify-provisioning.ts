@@ -453,9 +453,17 @@ async function main(): Promise<void> {
 				tokenA.startsWith(`${String(data(created).provisioningToken)}.`),
 			String(data(created).provisioningToken),
 		);
+		/**
+		 * Inverted deliberately. This used to assert that the response carried a 64-hex digest,
+		 * which passed — and in passing documented that `provisioning_token_hash` was on the wire.
+		 * The digest is the stored half of a live credential and is now `secretColumns` on
+		 * `DEVICE_RESOURCE`, so the thing worth checking is that it is NOT there.
+		 */
 		check(
-			"the stored hash is a sha256 digest, not the secret",
-			/^[0-9a-f]{64}$/u.test(String(data(created).provisioningTokenHash ?? "")),
+			"the stored hash never leaves the server",
+			data(created).provisioningTokenHash === undefined &&
+				!Object.hasOwn(data(created), "provisioningTokenHash"),
+			String(data(created).provisioningTokenHash),
 		);
 
 		const duplicate = await clientA("POST", "/api/v1/devices", {

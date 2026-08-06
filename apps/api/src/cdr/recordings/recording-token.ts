@@ -6,12 +6,11 @@ import { resolve as resolvePath, sep as pathSeparator } from "node:path";
  *
  * ## The problem this replaces
  *
- * `src/http/recordings.controller.ts` serves `/api/recordings/:id` anonymously, and its own comment
- * says why that is not safe: `apps/autopilot` posts a recording URL to a customer's `eventsHook`,
- * so the fetcher is a third party with no session, so the route cannot sit behind the guard. Path
- * traversal is blocked; ENUMERATION is not. Anyone who can guess a file name can read a stranger's
- * call audio. That controller records the fix as "a signed, expiring URL minted alongside the
- * recording"; this is that fix.
+ * `/api/recordings/:id` used to serve any recording anonymously, keyed by its file name. Path
+ * traversal was blocked; ENUMERATION was not, so anyone who could guess a file name could read a
+ * stranger's call audio. It could not simply be put behind the session guard, because the fetcher
+ * of an `<audio src>` or of a webhook payload has no session — the fix had to be a credential the
+ * URL carries. That is this, and the route it defended is now deleted (`src/app.module.ts`).
  *
  * ## The scheme
  *

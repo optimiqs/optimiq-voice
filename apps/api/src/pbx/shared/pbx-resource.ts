@@ -51,6 +51,13 @@ export interface PbxResource {
 	 * The write DTOs already exclude the column — "a PIN is set through a dedicated endpoint that
 	 * hashes it" — and this is the read half of the same sentence.
 	 *
+	 * The same rule covers the SIP credential columns, which are the larger case: `extension`'s
+	 * `sip_password_ha1` and `sip_secret_ref`, `trunk`'s and `device_line`'s `sip_secret_ref`, and
+	 * `device`'s `provisioning_token_hash`. Those columns differ from the PIN digests in one way
+	 * that matters — they are WRITABLE through the ordinary DTOs, because setting a credential is
+	 * something an admin form legitimately does. Being writable is not being readable, and this
+	 * field is what keeps the two rights apart: a value may go in and never come back out.
+	 *
 	 * Enforced in {@link PbxResourceService}, one layer above the repository, rather than as a
 	 * column projection in the queries. The repository's guards, the destination merge and
 	 * compile-on-write all read whole rows, and a projection would have to be threaded through

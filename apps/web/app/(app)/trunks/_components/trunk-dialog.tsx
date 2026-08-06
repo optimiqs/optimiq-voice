@@ -16,6 +16,17 @@ import type { TrunkRow } from "~/lib/pbx/contracts";
  * `status` is deliberately absent from this form. It is the ENGINE's view of the carrier — what
  * the registration actually did — and a control-plane form that could set it would let an admin
  * declare a dead trunk healthy. The list shows it; nothing here writes it.
+ *
+ * ## `sipSecretRef` is write-only
+ *
+ * The server strips it from every response (`secretColumns` on `TRUNK_RESOURCE`), so the field
+ * cannot be pre-filled and opens blank on an edit. Blank therefore means "leave the stored
+ * reference alone" and the key is OMITTED from the PATCH — sending the `null` that a blank
+ * optional field would otherwise produce would silently erase the trunk's credential and take the
+ * carrier registration down with it. The consequence is that this form can no longer clear a
+ * reference; changing one means typing the new one.
+ *
+ * `authUser` is the public half and still round-trips normally.
  */
 const TRUNK_KIND_LABELS: Readonly<Record<(typeof TRUNK_KINDS)[number], string>> = {
 	register: "Register with the carrier",
@@ -30,7 +41,8 @@ function defaultsFor(trunk: TrunkRow | null): TrunkFormValues {
 		sipProxy: trunk?.sipProxy ?? "",
 		outboundProxy: trunk?.outboundProxy ?? "",
 		authUser: trunk?.authUser ?? "",
-		sipSecretRef: trunk?.sipSecretRef ?? "",
+		// Never pre-filled: the server does not return it. See the note at the top of this file.
+		sipSecretRef: "",
 		transport: trunk?.transport ?? "udp",
 		registerExpiresSeconds:
 			trunk?.registerExpiresSeconds === undefined ? "" : String(trunk.registerExpiresSeconds),
@@ -69,7 +81,8 @@ export function TrunkDialog({
 				sipProxy: parsed.sipProxy,
 				outboundProxy: parsed.outboundProxy,
 				authUser: parsed.authUser,
-				sipSecretRef: parsed.sipSecretRef,
+				// Absent when blank — never `null`, which the server would read as "erase it".
+				...(parsed.sipSecretRef === null ? {} : { sipSecretRef: parsed.sipSecretRef }),
 				transport: parsed.transport,
 				// `.optional()` on the server, so a blank field is an ABSENT key, never a null.
 				registerExpiresSeconds: parsed.registerExpiresSeconds ?? undefined,
@@ -197,7 +210,11 @@ export function TrunkDialog({
 							field={field}
 							label="SIP secret reference"
 							placeholder="secret://trunks/primary"
-							description="A handle into the secret manager. The password itself is never stored here."
+							description={
+								trunk === null
+									? "A handle into the secret manager. The password itself is never stored here."
+									: "Write-only: the stored reference is never sent back. Leave blank to keep it."
+							}
 							disabled={mutation.isPending}
 							submitError={server.errors.sipSecretRef}
 						/>

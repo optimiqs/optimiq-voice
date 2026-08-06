@@ -49,6 +49,20 @@ export const DEVICE_RESOURCE: PbxResource = {
 	enabledColumn: device.enabled,
 	destinations: [],
 	destinationType: null,
+	/**
+	 * The digest half of the provisioning token, withheld.
+	 *
+	 * `provisioning_token` — the reference — stays: it is documented as the non-secret half, it is
+	 * what the "shown once" panel checks its minted token against, and a phone presents it in the
+	 * clear on every config fetch. `provisioning_token_hash` is the other half, and returning it
+	 * turned a credential that "is never recoverable from this database" into one recoverable from
+	 * a device list page. Nothing in `apps/web` reads it; it was on the wire by omission.
+	 *
+	 * The mint path is unaffected: `DevicesService` writes the hash through `create`/`update` and
+	 * returns the plaintext token in its own `provisioning` envelope, which is not a table row and
+	 * is not redacted here.
+	 */
+	secretColumns: ["provisioningTokenHash"],
 };
 
 export const DEVICE_LINE_RESOURCE: PbxChildResource = {
@@ -69,6 +83,15 @@ export const DEVICE_LINE_RESOURCE: PbxChildResource = {
 	enabledColumn: deviceLine.enabled,
 	destinations: [],
 	destinationType: null,
+	/**
+	 * As on `extension`: the handle into the secret manager, not the username beside it.
+	 *
+	 * A line's `sipSecretRef` overrides the extension's when the handset registers under its own
+	 * credential, so it is the same class of value and gets the same treatment. `provision.service`
+	 * reads it straight from the tenant-scoped snapshot, never from a response body, so the
+	 * rendered configuration a phone fetches is unchanged.
+	 */
+	secretColumns: ["sipSecretRef"],
 };
 
 export const DEVICE_KEY_RESOURCE: PbxChildResource = {

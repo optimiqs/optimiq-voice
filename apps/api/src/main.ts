@@ -13,6 +13,7 @@ import {
 import { assertCdrPreflight, isCdrAreaEnabled } from "./cdr/cdr-bootstrap";
 import { CdrModule } from "./cdr/cdr.module";
 import { API_TENANT_RLS_PLAN, createApiTenantRlsIntrospector } from "./core/db/rls-preflight-plan";
+import { httpLoggerOptions } from "./core/http/log-redaction";
 import { DATABASE_URL, HTTP_BRIDGE_PORT } from "./envs";
 import { registerLiveTransport } from "./live/live-bootstrap";
 import { LiveModule } from "./live/live.module";
@@ -129,9 +130,21 @@ async function bootstrap() {
 	 * real rather than decorative, and the cost is one extra reference to a body Fastify has
 	 * already read.
 	 */
-	const app = await NestFactory.create<NestFastifyApplication>(rootModule, new FastifyAdapter(), {
-		rawBody: true,
-	});
+	/**
+	 * `logger` is pino, and it is configured rather than left at its default `false`.
+	 *
+	 * A silent HTTP layer is not a safe one, it is an unobservable one: with the logger off,
+	 * Fastify has nowhere to report a request that died before a controller saw it. Turning it on
+	 * means pino now serializes objects that requests hand it, which is why `httpLoggerOptions`
+	 * exists — it carries the `redact` path set that keeps `authorization`, `cookie`, `x-api-key`
+	 * and the SIP/PIN/token field names out of every line, and it reads the same `LOGS_LEVEL` the
+	 * winston logger reads so one variable still governs logging in this process.
+	 */
+	const app = await NestFactory.create<NestFastifyApplication>(
+		rootModule,
+		new FastifyAdapter({ logger: httpLoggerOptions() }),
+		{ rawBody: true },
+	);
 	app.enableShutdownHooks();
 
 	// Raw Fastify wiring has to exist before `listen`, which is when Nest installs its own router

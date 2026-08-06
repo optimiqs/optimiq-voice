@@ -23,11 +23,9 @@ import type { AppSession } from "@optimiq-voice/auth";
 /**
  * `/api/v1/recordings` — media metadata, and the signed route that reaches the bytes.
  *
- * Distinct from `src/http/recordings.controller.ts`, which serves the legacy
- * `/api/recordings/:id` for `apps/autopilot`'s webhook payloads. That route stays for now because
- * removing it breaks every conversation-ended webhook already in the wild; the migration is to
- * have autopilot mint one of these instead, and it is a change on autopilot's side. The two do not
- * overlap: different prefix, different mechanism, and this one is not enumerable.
+ * The only route to recording media. The legacy `/api/recordings/:id` — anonymous, keyed by a
+ * guessable file name — has been removed; see `src/app.module.ts` for what replaced it and why
+ * putting a session guard in front of it instead would not have helped its one caller.
  */
 @Controller("api/v1/recordings")
 export class CdrRecordingsController {

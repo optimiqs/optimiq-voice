@@ -67,9 +67,9 @@ export type ResolvedRecordingMedia = MediaResponse;
  *
  * Splitting them is what makes the media usable at all: an `<audio src>` cannot carry a session
  * negotiation, and `apps/autopilot` posts a recording URL into a customer's webhook where the
- * fetcher has no session by definition. The alternative the codebase has today is
- * `/api/recordings/:id` served anonymously with no signature — its own comment records that
- * enumeration is unstopped and that a signed expiring URL is the fix. This is that fix.
+ * fetcher has no session by definition. The alternative the codebase used to carry was
+ * `/api/recordings/:id`, served anonymously with no signature and enumerable by file name. This is
+ * the fix its own comment asked for, and that route is now deleted.
  *
  * ## What a token can and cannot do
  *

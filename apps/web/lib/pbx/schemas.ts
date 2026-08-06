@@ -157,23 +157,59 @@ export const timezoneName = z
 // Entities
 // ---------------------------------------------------------------------------------------------
 
-export const extensionFormSchema = z.strictObject({
-	number: internalNumber,
-	label: displayName,
-	sipSecretRef: z.string().trim().min(1, "Required").max(256, "At most 256 characters"),
-	callerIdName: optionalText(128),
-	callerIdNumber: optionalText(32),
-	outboundCallerIdNumber: optionalText(32),
-	tollClass: z.enum(TOLL_CLASSES),
-	recordPolicy: z.enum(RECORD_POLICIES),
-	callTimeoutSeconds: optionalInt(5, 300),
-	maxRegistrations: optionalInt(1, 20),
-	mohClassId: optionalReference(),
-	voicemailEnabled: z.boolean(),
-	doNotDisturb: z.boolean(),
-	enabled: z.boolean(),
-});
+/**
+ * The extension form, in the two shapes the SIP secret reference can take.
+ *
+ * ## Why there are two, and why they are built by a function
+ *
+ * The server stopped returning `sipSecretRef` — it is `secretColumns` on `EXTENSION_RESOURCE` —
+ * so the edit dialog has nothing to pre-fill and the field opens blank on every edit. Under the
+ * create rule that blank is a validation error, which would mean nobody could rename an extension
+ * without first knowing and retyping its secret handle. So blank means "leave the stored reference
+ * alone" when editing, and the dialog omits the key from the PATCH rather than sending `null`. The
+ * cost is that the form can no longer CLEAR a reference — not a state an extension can usefully be
+ * in, since `extension.sip_secret_ref` is `NOT NULL`.
+ *
+ * They come out of a factory, and the field is annotated `ZodType<string | null, string>`, so that
+ * both constants have the SAME static type. A dialog picks one at render time and hands it to
+ * TanStack Form's `validators.onSubmit`, which takes a schema and not a union of schemas — an
+ * `.extend()` that narrowed one field would type-check here and fail at the call site.
+ */
+type SecretRefField = z.ZodType<string | null, string>;
+
+const requiredSecretRef: SecretRefField = z
+	.string()
+	.trim()
+	.min(1, "Required")
+	.max(256, "At most 256 characters");
+
+const optionalSecretRef: SecretRefField = optionalText(256);
+
+function extensionSchema(sipSecretRef: SecretRefField) {
+	return z.strictObject({
+		number: internalNumber,
+		label: displayName,
+		sipSecretRef,
+		callerIdName: optionalText(128),
+		callerIdNumber: optionalText(32),
+		outboundCallerIdNumber: optionalText(32),
+		tollClass: z.enum(TOLL_CLASSES),
+		recordPolicy: z.enum(RECORD_POLICIES),
+		callTimeoutSeconds: optionalInt(5, 300),
+		maxRegistrations: optionalInt(1, 20),
+		mohClassId: optionalReference(),
+		voicemailEnabled: z.boolean(),
+		doNotDisturb: z.boolean(),
+		enabled: z.boolean(),
+	});
+}
+
+/** Creating: a reference is required, because `POST /api/v1/extensions` requires one. */
+export const extensionFormSchema = extensionSchema(requiredSecretRef);
 export type ExtensionFormValues = z.input<typeof extensionFormSchema>;
+
+/** Editing: blank means "keep the stored reference", and the dialog drops the key. */
+export const extensionEditFormSchema = extensionSchema(optionalSecretRef);
 
 export const phoneNumberFormSchema = z.strictObject({
 	e164,

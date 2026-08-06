@@ -89,7 +89,12 @@ export interface DeviceLineRow extends EntityRow {
 	readonly lineNumber: number;
 	readonly extensionId: string | null;
 	readonly authUser: string | null;
-	readonly sipSecretRef: string | null;
+	/**
+	 * `sipSecretRef` is absent for the reason it is absent from `ExtensionRow`: it is
+	 * `secretColumns` on `DEVICE_LINE_RESOURCE` and is stripped from every response. The rendered
+	 * configuration a phone fetches still uses it — `provision.service` reads the column from a
+	 * tenant-scoped snapshot, not from this API.
+	 */
 	readonly serverAddress: string | null;
 	readonly serverPort: number;
 	readonly transport: SipTransport;

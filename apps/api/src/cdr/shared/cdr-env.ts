@@ -118,8 +118,8 @@ export const cdrEnvSchema = z.object({
 	/**
 	 * Where recording objects live.
 	 *
-	 * A filesystem root today, matching what `apps/engine` writes and what the legacy
-	 * `/api/recordings/:id` route reads. When the S3-compatible store lands, this becomes a bucket
+	 * A filesystem root today, matching what `apps/engine` writes. Only the signed media route
+	 * reaches into it. When the S3-compatible store lands, this becomes a bucket
 	 * and `GET …/media/:token` answers with a 302 to a presigned object URL — the token scheme
 	 * above does not change, because it authorizes the REQUEST, not the storage.
 	 */
