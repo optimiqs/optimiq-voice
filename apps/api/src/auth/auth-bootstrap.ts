@@ -24,9 +24,12 @@ export { isAuthSliceConfigured as isAuthSliceEnabled };
  * Composition happens here rather than in `AppModule`'s `imports` so that the slice can be
  * omitted entirely when it is not configured, and so `verify-auth-slice.ts` can mount it alone.
  */
-export function createApiRootModule(baseModules: readonly Type<unknown>[]): Type<unknown> {
+export function createApiRootModule(
+	baseModules: readonly Type<unknown>[],
+	extraModules: readonly Type<unknown>[] = [],
+): Type<unknown> {
 	class ApiRootModule {}
-	Module({ imports: [...baseModules, AuthModule] })(ApiRootModule);
+	Module({ imports: [...baseModules, AuthModule, ...extraModules] })(ApiRootModule);
 	return ApiRootModule;
 }
 

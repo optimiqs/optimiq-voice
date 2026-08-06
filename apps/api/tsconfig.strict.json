@@ -24,6 +24,12 @@
 		"strictBindCallApply": true,
 		"strictPropertyInitialization": false
 	},
-	"include": ["src/auth/**/*", "scripts/**/*", "test/auth/**/*"],
+	"include": [
+		"src/auth/**/*",
+		"src/pbx/**/*",
+		"scripts/**/*",
+		"test/auth/**/*",
+		"test/pbx/**/*"
+	],
 	"exclude": ["scripts/verify-tenancy-backfill.ts"]
 }

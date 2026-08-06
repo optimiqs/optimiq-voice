@@ -32,6 +32,30 @@ export {
 	PBX_TENANT_RLS_PLAN,
 	PBX_TENANT_TABLES,
 } from "./rls-preflight-plan";
+export type { AnyPgColumn, PgColumn, PgTable } from "./sql";
+export {
+	and,
+	asc,
+	between,
+	count,
+	desc,
+	eq,
+	getTableName,
+	gt,
+	gte,
+	ilike,
+	inArray,
+	isNotNull,
+	isNull,
+	lt,
+	lte,
+	ne,
+	not,
+	notInArray,
+	or,
+	type SQL,
+	sql,
+} from "./sql";
 export {
 	appendOnlyTenantPolicies,
 	PBX_TENANT_CONTEXT_NAME,

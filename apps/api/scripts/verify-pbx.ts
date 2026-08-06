@@ -1,0 +1,1082 @@
+/**
+ * End-to-end verification of the PBX area (P3 gate).
+ *
+ *   DATABASE_URL=postgresql://optimiq:optimiq@localhost:5433/optimiq \
+ *   PBX_DATABASE_URL=postgresql://optimiq:optimiq@localhost:5433/optimiq_pbx \
+ *     pnpm --filter @optimiq-voice/api verify:pbx
+ *
+ * It boots the real HTTP slice — `createApiRootModule([], [PbxModule])`, the auth slice plus the
+ * PBX area, on an ephemeral port against a real PostgreSQL — and drives it as a client would.
+ * `AppModule` is excluded for the same reason `verify-auth-slice.ts` excludes it: its
+ * `RuntimeHostService` starts the gRPC servers, the ARI client and the InfluxDB writer, none of
+ * which this gate is about and none of which exist on a developer machine.
+ *
+ * What it proves, in order:
+ *
+ *  1. CRUD round trips for all eleven T1 resources, including the three child collections.
+ *  2. Tenant isolation: a second organization cannot see, read, update or delete the first's rows
+ *     — enforced by RLS, not by a `where` clause we could forget.
+ *  3. Compile-on-write refuses an unsound configuration with a 422 carrying field-addressable
+ *     diagnostics, AND rolls the mutation back (the dangling row is not in the database after).
+ *  4. Compile-on-write persists a configuration that is merely questionable and returns the
+ *     warning in the envelope (an empty ring group).
+ *  5. A delete that would leave a dangling destination is refused with a 409 naming the referrers.
+ *  6. With a broker: the compiled artifact appears in the `routing-cache` KV bucket under the key
+ *     `packages/routing` specifies, and `rpc.routing.v1.resolve` answers over NATS.
+ *
+ * The NATS half is skipped, loudly, when Docker is unavailable — it spins `nats:2.11-alpine` on an
+ * ephemeral port and removes it afterwards.
+ */
+
+import { execFile } from "node:child_process";
+import { createServer } from "node:net";
+import { setTimeout as delay } from "node:timers/promises";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+
+const DEFAULT_DATABASE_URL = "postgresql://optimiq:optimiq@localhost:5433/optimiq";
+const DEFAULT_PBX_DATABASE_URL = "postgresql://optimiq:optimiq@localhost:5433/optimiq_pbx";
+/**
+ * The same secret `verify-auth-slice.ts` uses, and `AUTH_SECRET` from the environment when it is
+ * set.
+ *
+ * better-auth encrypts its JWKS private keys with `AUTH_SECRET` and stores them in the database,
+ * so two verification scripts pointing at one development database MUST agree on it — a second
+ * secret cannot decrypt the first one's keys, and every session resolution fails with
+ * `Failed to decrypt private key`, which surfaces as a blanket 401.
+ */
+const TEST_SECRET = process.env.AUTH_SECRET ?? "verify-auth-slice-secret-0123456789abcdef";
+const RUN_ID = Date.now().toString(36);
+
+// ---------------------------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------------------------
+
+const checks: { name: string; ok: boolean; detail: string }[] = [];
+
+function check(name: string, ok: boolean, detail = ""): boolean {
+	checks.push({ name, ok, detail });
+	console.log(`  [${ok ? "PASS" : "FAIL"}] ${name}${detail ? ` — ${detail}` : ""}`);
+	return ok;
+}
+
+async function findFreePort(): Promise<number> {
+	return await new Promise((resolve, reject) => {
+		const server = createServer();
+		server.on("error", reject);
+		server.listen(0, "127.0.0.1", () => {
+			const address = server.address();
+			if (typeof address === "string" || address === null) {
+				server.close();
+				reject(new Error("could not allocate an ephemeral port"));
+				return;
+			}
+			const { port } = address;
+			server.close(() => resolve(port));
+		});
+	});
+}
+
+class CookieJar {
+	private readonly cookies = new Map<string, string>();
+
+	absorb(response: Response): void {
+		for (const raw of response.headers.getSetCookie()) {
+			const [pair] = raw.split(";");
+			if (!pair) continue;
+			const separator = pair.indexOf("=");
+			if (separator === -1) continue;
+			this.cookies.set(pair.slice(0, separator).trim(), pair.slice(separator + 1).trim());
+		}
+	}
+
+	header(): string {
+		return [...this.cookies].map(([name, value]) => `${name}=${value}`).join("; ");
+	}
+}
+
+interface JsonResponse {
+	readonly status: number;
+	readonly body: Record<string, unknown>;
+}
+
+function makeClient(baseUrl: string, jar: CookieJar) {
+	return async (method: string, path: string, body?: unknown): Promise<JsonResponse> => {
+		const headers: Record<string, string> = { accept: "application/json" };
+		if (body !== undefined) {
+			headers["content-type"] = "application/json";
+		}
+		const cookie = jar.header();
+		if (cookie) {
+			headers.cookie = cookie;
+		}
+		const response = await fetch(`${baseUrl}${path}`, {
+			method,
+			headers,
+			...(body === undefined ? {} : { body: JSON.stringify(body) }),
+		});
+		jar.absorb(response);
+		const text = await response.text();
+		let parsed: unknown = null;
+		try {
+			parsed = text.length > 0 ? JSON.parse(text) : null;
+		} catch {
+			parsed = { raw: text };
+		}
+		return {
+			status: response.status,
+			body:
+				typeof parsed === "object" && parsed !== null
+					? (parsed as Record<string, unknown>)
+					: { value: parsed },
+		};
+	};
+}
+
+type Client = ReturnType<typeof makeClient>;
+
+function data(response: JsonResponse): Record<string, unknown> {
+	const value = response.body.data;
+	return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+}
+
+function rows(response: JsonResponse): Record<string, unknown>[] {
+	const value = response.body.data;
+	return Array.isArray(value) ? (value as Record<string, unknown>[]) : [];
+}
+
+function id(response: JsonResponse): string {
+	const value = data(response).id;
+	return typeof value === "string" ? value : "";
+}
+
+function warnings(response: JsonResponse): { code?: string; field?: string }[] {
+	const value = response.body.warnings;
+	return Array.isArray(value) ? (value as { code?: string; field?: string }[]) : [];
+}
+
+function diagnostics(response: JsonResponse): { code?: string; field?: string }[] {
+	const value = response.body.diagnostics;
+	return Array.isArray(value) ? (value as { code?: string; field?: string }[]) : [];
+}
+
+function references(response: JsonResponse): { kind?: string; id?: string }[] {
+	const value = response.body.references;
+	return Array.isArray(value) ? (value as { kind?: string; id?: string }[]) : [];
+}
+
+// ---------------------------------------------------------------------------------------------
+// Docker-managed NATS
+// ---------------------------------------------------------------------------------------------
+
+interface NatsHandle {
+	readonly url: string;
+	readonly containerId: string;
+}
+
+/**
+ * Containers this harness starts all carry this prefix, so a run that was killed before its
+ * cleanup could not leave a broker listening on a port the next run has no idea about.
+ */
+const NATS_CONTAINER_PREFIX = "optimiq-verify-pbx";
+
+/** Removes containers a previous, interrupted run left behind. Best effort by construction. */
+async function sweepStaleNats(): Promise<void> {
+	try {
+		const { stdout } = await execFileAsync("docker", [
+			"ps",
+			"-aq",
+			"--filter",
+			`name=${NATS_CONTAINER_PREFIX}`,
+		]);
+		const stale = stdout
+			.split("\n")
+			.map((line) => line.trim())
+			.filter(Boolean);
+		if (stale.length > 0) {
+			await execFileAsync("docker", ["rm", "-f", ...stale]);
+			console.log(`  (removed ${stale.length} stale verify-pbx NATS container(s))`);
+		}
+	} catch {
+		// No docker, or nothing to sweep. Either way there is nothing to report.
+	}
+}
+
+async function startNats(): Promise<NatsHandle | undefined> {
+	const port = await findFreePort();
+	await sweepStaleNats();
+	try {
+		const { stdout } = await execFileAsync("docker", [
+			"run",
+			"-d",
+			"--rm",
+			"--name",
+			`${NATS_CONTAINER_PREFIX}-${RUN_ID}`,
+			"-p",
+			`${port}:4222`,
+			"nats:2.11-alpine",
+			"-js",
+		]);
+		const containerId = stdout.trim();
+		// JetStream needs a moment before it accepts stream/KV management calls.
+		await delay(1500);
+		return { url: `nats://127.0.0.1:${port}`, containerId };
+	} catch (error) {
+		console.log(
+			`  (docker unavailable — NATS checks will be skipped: ${
+				error instanceof Error ? error.message.split("\n")[0] : String(error)
+			})`,
+		);
+		return undefined;
+	}
+}
+
+async function stopNats(handle: NatsHandle): Promise<void> {
+	try {
+		await execFileAsync("docker", ["rm", "-f", handle.containerId]);
+	} catch (error) {
+		console.error("could not remove the NATS container", error);
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+
+async function main(): Promise<void> {
+	const databaseUrl = process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL;
+	const pbxDatabaseUrl = process.env.PBX_DATABASE_URL ?? DEFAULT_PBX_DATABASE_URL;
+	const port = await findFreePort();
+	const baseUrl = `http://127.0.0.1:${port}`;
+
+	console.log("\nstarting NATS (nats:2.11-alpine, JetStream)\n");
+	const nats = await startNats();
+
+	// `@optimiq-voice/config` parses the environment at import time and the PBX module reads it in
+	// a provider factory, so it has to be complete before anything that imports either is loaded.
+	// Every import below is therefore dynamic.
+	process.env.NODE_ENV = "test";
+	process.env.DATABASE_URL = databaseUrl;
+	process.env.PBX_DATABASE_URL = pbxDatabaseUrl;
+	process.env.AUTH_SECRET = TEST_SECRET;
+	process.env.AUTH_URL = baseUrl;
+	process.env.API_APP_URL = baseUrl;
+	if (nats === undefined) {
+		delete process.env.NATS_URL;
+	} else {
+		process.env.NATS_URL = nats.url;
+	}
+
+	await import("reflect-metadata");
+	const { NestFactory } = await import("@nestjs/core");
+	const { FastifyAdapter } = await import("@nestjs/platform-fastify");
+	const { createApiRootModule, registerAuthTransport } = await import("../src/auth/auth-bootstrap");
+	const { registerPbxTransport } = await import("../src/pbx/pbx-bootstrap");
+	const { PbxModule } = await import("../src/pbx/pbx.module");
+	const { createPostgresClient } = await import("@optimiq-voice/db");
+	const { routingCacheKey, ROUTING_CACHE_BUCKET } = await import("@optimiq-voice/routing");
+	const { ROUTING_RESOLVE_RPC } = await import("@optimiq-voice/events/schemas");
+
+	const sql = createPostgresClient({
+		url: databaseUrl,
+		applicationName: "verify-pbx",
+		poolMaxConnectionsOverride: 2,
+	});
+
+	console.log(`booting the auth slice + PBX area on ${baseUrl}\n`);
+	const app = await NestFactory.create(createApiRootModule([], [PbxModule]), new FastifyAdapter(), {
+		logger: ["error"],
+	});
+	app.enableShutdownHooks();
+	await registerAuthTransport(app);
+	const rpcServed = await registerPbxTransport(app);
+	await app.listen(port, "127.0.0.1");
+	await delay(200);
+
+	const ownerEmail = `pbx-owner-${RUN_ID}@verify.optimiq.test`;
+	const otherEmail = `pbx-other-${RUN_ID}@verify.optimiq.test`;
+	const password = "Verify-Pbx-Slice-2026!";
+	const jarA = new CookieJar();
+	const jarB = new CookieJar();
+	const clientA: Client = makeClient(baseUrl, jarA);
+	const clientB: Client = makeClient(baseUrl, jarB);
+	let organizationA = "";
+	let organizationB = "";
+
+	try {
+		// --- 0. two tenants ---------------------------------------------------------------------
+		console.log("0. two organizations, two owners");
+		await clientA("POST", "/api/auth/sign-up/email", {
+			name: "PBX Owner A",
+			email: ownerEmail,
+			password,
+		});
+		const createA = await clientA("POST", "/api/auth/organization/create", {
+			name: `PBX Org A ${RUN_ID}`,
+			slug: `pbx-org-a-${RUN_ID}`,
+		});
+		organizationA = typeof createA.body.id === "string" ? createA.body.id : "";
+		await clientA("POST", "/api/auth/organization/set-active", { organizationId: organizationA });
+		check("organization A created", organizationA.length > 0, organizationA);
+
+		await clientB("POST", "/api/auth/sign-up/email", {
+			name: "PBX Owner B",
+			email: otherEmail,
+			password,
+		});
+		const createB = await clientB("POST", "/api/auth/organization/create", {
+			name: `PBX Org B ${RUN_ID}`,
+			slug: `pbx-org-b-${RUN_ID}`,
+		});
+		organizationB = typeof createB.body.id === "string" ? createB.body.id : "";
+		await clientB("POST", "/api/auth/organization/set-active", { organizationId: organizationB });
+		check("organization B created", organizationB.length > 0, organizationB);
+
+		// --- 1. authentication is required ------------------------------------------------------
+		console.log("\n1. the area denies by default");
+		const anonymous = await fetch(`${baseUrl}/api/v1/extensions`);
+		check("an anonymous list is 401", anonymous.status === 401, `status ${anonymous.status}`);
+
+		// --- 2. extensions: the full round trip ---------------------------------------------------
+		console.log("\n2. extensions CRUD");
+		const extensionA = await clientA("POST", "/api/v1/extensions", {
+			number: "1001",
+			label: "Alice Nguyen",
+			sipSecretRef: "secret://verify/1001",
+			tollClass: "international",
+		});
+		check("create extension 1001 -> 201", extensionA.status === 201, `status ${extensionA.status}`);
+		const extensionAId = id(extensionA);
+		check("create returns the row with an id", extensionAId.length > 0, extensionAId);
+		check(
+			"create returns a warnings array in the envelope",
+			Array.isArray(extensionA.body.warnings),
+			JSON.stringify(warnings(extensionA).map((warning) => warning.code)),
+		);
+
+		const extensionB = await clientA("POST", "/api/v1/extensions", {
+			number: "1002",
+			label: "Ben Okafor",
+			sipSecretRef: "secret://verify/1002",
+		});
+		const extensionBId = id(extensionB);
+		await clientA("POST", "/api/v1/extensions", {
+			number: "1003",
+			label: "Carla Reyes",
+			sipSecretRef: "secret://verify/1003",
+		});
+
+		const duplicate = await clientA("POST", "/api/v1/extensions", {
+			number: "1001",
+			label: "Duplicate",
+			sipSecretRef: "secret://verify/dup",
+		});
+		check("a duplicate number is 409", duplicate.status === 409, `status ${duplicate.status}`);
+		check("the 409 carries code PBX_CONFLICT", duplicate.body.code === "PBX_CONFLICT");
+
+		const invalidBody = await clientA("POST", "/api/v1/extensions", {
+			number: "1004",
+			label: "No secret ref",
+		});
+		check("a missing required field is 400", invalidBody.status === 400);
+		check("the 400 carries per-field issues", diagnosticsOrIssues(invalidBody).length > 0);
+
+		const unknownKey = await clientA("POST", "/api/v1/extensions", {
+			number: "1005",
+			label: "Typo",
+			sipSecretRef: "secret://verify/1005",
+			recordEnabled: true,
+		});
+		check(
+			"an unknown key is rejected rather than dropped",
+			unknownKey.status === 400,
+			`status ${unknownKey.status}`,
+		);
+
+		const listExtensions = await clientA("GET", "/api/v1/extensions");
+		check("list returns 200", listExtensions.status === 200);
+		check("list returns three extensions", rows(listExtensions).length === 3);
+		check(
+			"list carries the paging envelope",
+			listExtensions.body.total === 3 &&
+				listExtensions.body.page === 1 &&
+				listExtensions.body.limit === 20 &&
+				listExtensions.body.totalPages === 1,
+			JSON.stringify({
+				total: listExtensions.body.total,
+				page: listExtensions.body.page,
+				limit: listExtensions.body.limit,
+				totalPages: listExtensions.body.totalPages,
+			}),
+		);
+
+		const paged = await clientA("GET", "/api/v1/extensions?page=2&limit=2");
+		check(
+			"page 2 of limit 2 returns the third row and the full total",
+			rows(paged).length === 1 && paged.body.total === 3 && paged.body.totalPages === 2,
+			`${rows(paged).length} row(s), total ${String(paged.body.total)}`,
+		);
+
+		const searched = await clientA("GET", "/api/v1/extensions?search=okafor");
+		check(
+			"search matches case-insensitively on the label",
+			rows(searched).length === 1 && rows(searched)[0]?.number === "1002",
+			`${rows(searched).length} row(s)`,
+		);
+
+		const gotExtension = await clientA("GET", `/api/v1/extensions/${extensionAId}`);
+		check("get returns the row", gotExtension.status === 200 && id(gotExtension) === extensionAId);
+
+		const patched = await clientA("PATCH", `/api/v1/extensions/${extensionAId}`, {
+			label: "Alice N.",
+			doNotDisturb: true,
+		});
+		check(
+			"patch applies only the supplied keys",
+			patched.status === 200 &&
+				data(patched).label === "Alice N." &&
+				data(patched).doNotDisturb === true &&
+				data(patched).tollClass === "international",
+			`tollClass ${String(data(patched).tollClass)}`,
+		);
+
+		const missing = await clientA("GET", "/api/v1/extensions/019fd3c2-dead-76be-a6b3-b0f1914e39b6");
+		check("an unknown id is 404", missing.status === 404, `status ${missing.status}`);
+		check("the 404 carries code PBX_NOT_FOUND", missing.body.code === "PBX_NOT_FOUND");
+
+		// --- 3. tenant isolation -------------------------------------------------------------------
+		console.log("\n3. RLS isolation between the two organizations");
+		const listB = await clientB("GET", "/api/v1/extensions");
+		check(
+			"organization B sees none of A's extensions",
+			listB.status === 200 && rows(listB).length === 0,
+			`${rows(listB).length} row(s)`,
+		);
+
+		const crossRead = await clientB("GET", `/api/v1/extensions/${extensionAId}`);
+		check("B reading A's extension by id is 404", crossRead.status === 404);
+
+		const crossPatch = await clientB("PATCH", `/api/v1/extensions/${extensionAId}`, {
+			label: "hijacked",
+		});
+		check("B patching A's extension is 404", crossPatch.status === 404);
+
+		const crossDelete = await clientB("DELETE", `/api/v1/extensions/${extensionAId}`);
+		check("B deleting A's extension is 404", crossDelete.status === 404);
+
+		const stillThere = await clientA("GET", `/api/v1/extensions/${extensionAId}`);
+		check(
+			"A's extension survived B's attempts",
+			stillThere.status === 200 && data(stillThere).label === "Alice N.",
+		);
+
+		// B may create its own 1001 — the unique index is per organization.
+		const bOwn = await clientB("POST", "/api/v1/extensions", {
+			number: "1001",
+			label: "B's own 1001",
+			sipSecretRef: "secret://verify/b-1001",
+		});
+		check(
+			"B can use the same extension number in its own tenant",
+			bOwn.status === 201,
+			`status ${bOwn.status}`,
+		);
+
+		// --- 4. the rest of the inventory ---------------------------------------------------------
+		console.log("\n4. trunks, voicemail boxes, ring groups, IVR menus");
+		const trunk = await clientA("POST", "/api/v1/trunks", {
+			name: "Demo carrier",
+			kind: "ip-auth",
+			sipDomain: "sip.demo-carrier.test",
+			sipProxy: "sip.demo-carrier.test:5060",
+			maxChannels: 30,
+		});
+		const trunkId = id(trunk);
+		check("create trunk -> 201", trunk.status === 201, `status ${trunk.status}`);
+
+		const mailbox = await clientA("POST", "/api/v1/voicemail-boxes", {
+			mailboxNumber: "8000",
+			label: "General voicemail",
+			emailAddress: "voicemail@demo.optimiq.test",
+			emailMode: "notify",
+		});
+		const mailboxId = id(mailbox);
+		check("create voicemail box -> 201", mailbox.status === 201, `status ${mailbox.status}`);
+
+		const ringGroup = await clientA("POST", "/api/v1/ring-groups", {
+			name: "Sales",
+			extensionNumber: "2000",
+			strategy: "simultaneous",
+			timeoutDestinationType: "voicemail",
+			timeoutDestinationRef: mailboxId,
+		});
+		const ringGroupId = id(ringGroup);
+		check("create ring group -> 201", ringGroup.status === 201, `status ${ringGroup.status}`);
+		check(
+			"an empty ring group is saved and warns rather than failing",
+			ringGroup.status === 201 &&
+				warnings(ringGroup).some((warning) => warning.code === "empty-ring-group"),
+			JSON.stringify(warnings(ringGroup).map((warning) => warning.code)),
+		);
+
+		const member1 = await clientA("POST", `/api/v1/ring-groups/${ringGroupId}/destinations`, {
+			ordinal: 1,
+			destinationType: "extension",
+			destinationRef: extensionAId,
+		});
+		check("add a ring-group member -> 201", member1.status === 201, `status ${member1.status}`);
+		check(
+			"the empty-ring-group warning clears once a member exists",
+			!warnings(member1).some((warning) => warning.code === "empty-ring-group"),
+			JSON.stringify(warnings(member1).map((warning) => warning.code)),
+		);
+
+		await clientA("POST", `/api/v1/ring-groups/${ringGroupId}/destinations`, {
+			ordinal: 2,
+			destinationType: "extension",
+			destinationRef: extensionBId,
+		});
+		const members = await clientA("GET", `/api/v1/ring-groups/${ringGroupId}/destinations`);
+		check("the members list returns both, in ordinal order", rows(members).length === 2);
+
+		const orphanChild = await clientA(
+			"GET",
+			"/api/v1/ring-groups/019fd3c2-dead-76be-a6b3-b0f1914e39b6/destinations",
+		);
+		check(
+			"a child collection under an unknown parent is 404",
+			orphanChild.status === 404,
+			`status ${orphanChild.status}`,
+		);
+
+		const ivr = await clientA("POST", "/api/v1/ivr-menus", {
+			name: "Main menu",
+			extensionNumber: "3000",
+			directDialEnabled: true,
+			timeoutDestinationType: "voicemail",
+			timeoutDestinationRef: mailboxId,
+			invalidDestinationType: "voicemail",
+			invalidDestinationRef: mailboxId,
+		});
+		const ivrId = id(ivr);
+		check("create IVR menu -> 201", ivr.status === 201, `status ${ivr.status}`);
+
+		const option1 = await clientA("POST", `/api/v1/ivr-menus/${ivrId}/options`, {
+			ordinal: 1,
+			matchValue: "1",
+			label: "Sales",
+			destinationType: "ring-group",
+			destinationRef: ringGroupId,
+		});
+		check("add an IVR option -> 201", option1.status === 201, `status ${option1.status}`);
+
+		// --- 5. destination validation ------------------------------------------------------------
+		console.log("\n5. destination validation: shape and a real existence check");
+		const danglingOption = await clientA("POST", `/api/v1/ivr-menus/${ivrId}/options`, {
+			ordinal: 9,
+			matchValue: "9",
+			destinationType: "ring-group",
+			destinationRef: "019fd3c2-dead-76be-a6b3-b0f1914e39b6",
+		});
+		check(
+			"an option pointing at a non-existent ring group is 422",
+			danglingOption.status === 422,
+			`status ${danglingOption.status}`,
+		);
+		check(
+			"the 422 is PBX_INVALID_DESTINATION and names the field",
+			danglingOption.body.code === "PBX_INVALID_DESTINATION" &&
+				issuesOf(danglingOption).some((issue) => issue.field === "destinationRef"),
+			JSON.stringify(issuesOf(danglingOption)),
+		);
+
+		const crossTenantDestination = await clientB("POST", "/api/v1/ring-groups", {
+			name: "B points at A",
+			timeoutDestinationType: "voicemail",
+			timeoutDestinationRef: mailboxId,
+		});
+		check(
+			"B cannot point a destination at A's mailbox",
+			crossTenantDestination.status === 422,
+			`status ${crossTenantDestination.status}`,
+		);
+
+		const badShape = await clientA("POST", `/api/v1/ivr-menus/${ivrId}/options`, {
+			ordinal: 8,
+			matchValue: "8",
+			destinationType: "external",
+			destinationRef: extensionAId,
+		});
+		check(
+			"a value-backed destination carrying a ref is 422",
+			badShape.status === 422,
+			`status ${badShape.status}`,
+		);
+
+		// --- 6. compile-on-write: the routing entities ---------------------------------------------
+		console.log("\n6. routing entities and compile-on-write");
+		const timeCondition = await clientA("POST", "/api/v1/time-conditions", {
+			name: "Business hours",
+			timezone: "America/New_York",
+			destinationType: "ivr",
+			destinationRef: ivrId,
+			nomatchDestinationType: "voicemail",
+			nomatchDestinationRef: mailboxId,
+		});
+		const timeConditionId = id(timeCondition);
+		check(
+			"create time condition -> 201",
+			timeCondition.status === 201,
+			`status ${timeCondition.status}`,
+		);
+		check(
+			"a condition with no rules warns rather than failing",
+			warnings(timeCondition).some((warning) => warning.code === "empty-time-condition"),
+			JSON.stringify(warnings(timeCondition).map((warning) => warning.code)),
+		);
+
+		const rule = await clientA("POST", `/api/v1/time-conditions/${timeConditionId}/rules`, {
+			ordinal: 1,
+			label: "Weekdays 09:00-17:00",
+			predicates: [{ weekdays: [1, 2, 3, 4, 5], timeOfDay: { from: "09:00", to: "17:00" } }],
+		});
+		check("add a time rule -> 201", rule.status === 201, `status ${rule.status}`);
+
+		const badTimezone = await clientA("POST", "/api/v1/time-conditions", {
+			name: "Nowhere",
+			timezone: "Mars/Olympus_Mons",
+			destinationType: "ivr",
+			destinationRef: ivrId,
+		});
+		check(
+			"an unknown timezone fails the compile with a 422",
+			badTimezone.status === 422 && badTimezone.body.code === "ROUTING_COMPILE_FAILED",
+			`status ${badTimezone.status} code ${String(badTimezone.body.code)}`,
+		);
+		check(
+			"the compile 422 carries the unknown-timezone diagnostic",
+			diagnostics(badTimezone).some((entry) => entry.code === "unknown-timezone"),
+			JSON.stringify(diagnostics(badTimezone).map((entry) => entry.code)),
+		);
+		const afterBadTimezone = await clientA("GET", "/api/v1/time-conditions?search=Nowhere");
+		check(
+			"the rejected time condition was ROLLED BACK, not persisted",
+			rows(afterBadTimezone).length === 0,
+			`${rows(afterBadTimezone).length} row(s) found`,
+		);
+
+		const did = await clientA("POST", "/api/v1/phone-numbers", {
+			e164: "+12125550100",
+			label: "Main line",
+			destinationType: "ivr",
+			destinationRef: ivrId,
+			callerIdNamePrefix: "[Main] ",
+		});
+		const didId = id(did);
+		check("create DID -> 201", did.status === 201, `status ${did.status}`);
+
+		const inbound = await clientA("POST", "/api/v1/inbound-routes", {
+			name: "Main line",
+			matchKind: "exact",
+			matchPattern: "+12125550100",
+			phoneNumberId: didId,
+			destinationType: "time-condition",
+			destinationRef: timeConditionId,
+			failoverDestinationType: "voicemail",
+			failoverDestinationRef: mailboxId,
+		});
+		check("create inbound route -> 201", inbound.status === 201, `status ${inbound.status}`);
+
+		const outbound = await clientA("POST", "/api/v1/outbound-routes", {
+			name: "National",
+			matchKind: "prefix",
+			dialPatterns: ["0"],
+			stripDigits: 1,
+			prependDigits: "+1",
+			tollClass: "national",
+			trunkPriority: [{ trunkId, order: 1 }],
+		});
+		const outboundId = id(outbound);
+		check("create outbound route -> 201", outbound.status === 201, `status ${outbound.status}`);
+
+		const noTollClass = await clientA("POST", "/api/v1/outbound-routes", {
+			name: "Missing toll class",
+			dialPatterns: ["9"],
+			trunkPriority: [],
+		});
+		check(
+			"an outbound route without a toll class is refused at the DTO",
+			noTollClass.status === 400,
+			`status ${noTollClass.status}`,
+		);
+
+		const featureCode = await clientA("POST", "/api/v1/feature-codes", {
+			code: "*97",
+			action: "voicemail-check",
+			label: "Check my voicemail",
+		});
+		check("create feature code -> 201", featureCode.status === 201, `status ${featureCode.status}`);
+
+		// `voicemail-direct` takes a REQUIRED argument (`*99` + the mailbox number), so a second code
+		// starting with `*99` can never be dialed unambiguously — a compile error, not a warning.
+		await clientA("POST", "/api/v1/feature-codes", { code: "*99", action: "voicemail-direct" });
+		const conflictingCode = await clientA("POST", "/api/v1/feature-codes", {
+			code: "*991",
+			action: "redial",
+		});
+		check(
+			"a feature code shadowed by an argument-taking one fails the compile",
+			conflictingCode.status === 422 && conflictingCode.body.code === "ROUTING_COMPILE_FAILED",
+			`status ${conflictingCode.status} code ${String(conflictingCode.body.code)}`,
+		);
+
+		// --- 7. referenced deletes ------------------------------------------------------------------
+		console.log("\n7. deletes that would leave a dangling pointer");
+		const deleteRingGroup = await clientA("DELETE", `/api/v1/ring-groups/${ringGroupId}`);
+		check(
+			"deleting a ring group an IVR option targets is 409",
+			deleteRingGroup.status === 409,
+			`status ${deleteRingGroup.status}`,
+		);
+		check(
+			"the 409 is PBX_REFERENCED and names the referring IVR option",
+			deleteRingGroup.body.code === "PBX_REFERENCED" &&
+				references(deleteRingGroup).some((entry) => entry.kind === "ivr-menu-option"),
+			JSON.stringify(references(deleteRingGroup)),
+		);
+
+		const deleteTrunk = await clientA("DELETE", `/api/v1/trunks/${trunkId}`);
+		check(
+			"deleting a trunk an outbound route lists is 409",
+			deleteTrunk.status === 409,
+			`status ${deleteTrunk.status}`,
+		);
+		check(
+			"the trunk 409 names the outbound route from the JSONB list",
+			references(deleteTrunk).some((entry) => entry.id === outboundId),
+			JSON.stringify(references(deleteTrunk)),
+		);
+
+		const deleteTimeCondition = await clientA(
+			"DELETE",
+			`/api/v1/time-conditions/${timeConditionId}`,
+		);
+		check(
+			"deleting a time condition a route gates on is 409",
+			deleteTimeCondition.status === 409,
+			`status ${deleteTimeCondition.status}`,
+		);
+
+		const deleteFreeExtension = await clientA(
+			"DELETE",
+			"/api/v1/extensions/" + (await freeExtensionId(clientA)),
+		);
+		check(
+			"an unreferenced extension deletes cleanly",
+			deleteFreeExtension.status === 200,
+			`status ${deleteFreeExtension.status}`,
+		);
+
+		// --- 8. compile and simulate -----------------------------------------------------------------
+		console.log("\n8. compile and simulate");
+		const compiled = await clientA("POST", "/api/v1/routing/compile");
+		check("POST /routing/compile -> 200", compiled.status === 200, `status ${compiled.status}`);
+		const expectedKey = routingCacheKey(organizationA);
+		check(
+			"the compile reports the cache key packages/routing specifies",
+			data(compiled).cacheKey === expectedKey,
+			`${String(data(compiled).cacheKey)} vs ${expectedKey}`,
+		);
+		check(
+			"the compile reports a snapshot hash",
+			typeof data(compiled).snapshotHash === "string" &&
+				(data(compiled).snapshotHash as string).length === 64,
+		);
+
+		const simulateOpen = await clientA("POST", "/api/v1/routing/simulate", {
+			routingContext: "inbound",
+			destinationNumber: "+12125550100",
+			callerNumber: "+13105550111",
+			// A Wednesday at 14:00 New York = 19:00Z.
+			at: "2026-08-05T19:00:00.000Z",
+		});
+		check(
+			"simulate inside business hours reaches the IVR",
+			simulateOpen.status === 200 &&
+				data(simulateOpen).matched === true &&
+				data(simulateOpen).destinationType === "ivr-menu",
+			`${String(data(simulateOpen).destinationType)} / ${String(data(simulateOpen).destinationRef)}`,
+		);
+		check(
+			"the resolved IVR is the one that was created",
+			data(simulateOpen).destinationRef === ivrId,
+			String(data(simulateOpen).destinationRef),
+		);
+		check(
+			"destinationType is the compiler's own kebab-case vocabulary, untranslated",
+			data(simulateOpen).destinationType === "ivr-menu",
+			String(data(simulateOpen).destinationType),
+		);
+
+		const simulateClosed = await clientA("POST", "/api/v1/routing/simulate", {
+			routingContext: "inbound",
+			destinationNumber: "+12125550100",
+			// The same Wednesday at 03:00 New York = 07:00Z — outside the window.
+			at: "2026-08-05T07:00:00.000Z",
+		});
+		check(
+			"simulate outside business hours reaches voicemail",
+			data(simulateClosed).destinationType === "voicemail" &&
+				data(simulateClosed).destinationRef === mailboxId,
+			`${String(data(simulateClosed).destinationType)} / ${String(data(simulateClosed).destinationRef)}`,
+		);
+
+		const simulateUnknown = await clientA("POST", "/api/v1/routing/simulate", {
+			routingContext: "inbound",
+			destinationNumber: "+19995550000",
+			at: "2026-08-05T19:00:00.000Z",
+		});
+		check(
+			"an unrouted DID does not match",
+			data(simulateUnknown).matched === false,
+			String(data(simulateUnknown).matched),
+		);
+
+		const simulateOutbound = await clientA("POST", "/api/v1/routing/simulate", {
+			routingContext: "outbound",
+			destinationNumber: "03105550123",
+			callerNumber: "1002",
+			at: "2026-08-05T19:00:00.000Z",
+		});
+		check(
+			"an outbound call from a national extension reaches the trunk",
+			data(simulateOutbound).matched === true &&
+				data(simulateOutbound).destinationType === "trunk-dial",
+			`${String(data(simulateOutbound).destinationType)} reason ${String(data(simulateOutbound).reason)}`,
+		);
+		check(
+			"digit manipulation applied strip-then-prepend",
+			data(simulateOutbound).dialedNumber === "+13105550123",
+			String(data(simulateOutbound).dialedNumber),
+		);
+
+		const simulateBarred = await clientA("POST", "/api/v1/routing/simulate", {
+			routingContext: "outbound",
+			destinationNumber: "03105550123",
+			// 1003 is `local`, which does not cover a `national` route.
+			callerNumber: "1003",
+			at: "2026-08-05T19:00:00.000Z",
+		});
+		check(
+			"a local-class extension is barred from the national route",
+			data(simulateBarred).matched === false,
+			`matched ${String(data(simulateBarred).matched)} reason ${String(data(simulateBarred).reason)}`,
+		);
+
+		const simulateFeatureCode = await clientA("POST", "/api/v1/routing/simulate", {
+			routingContext: "internal",
+			destinationNumber: "*97",
+			callerNumber: "1002",
+			at: "2026-08-05T19:00:00.000Z",
+		});
+		check(
+			"a feature code resolves in the internal context",
+			data(simulateFeatureCode).destinationType === "feature-code",
+			String(data(simulateFeatureCode).destinationType),
+		);
+
+		const simulateB = await clientB("POST", "/api/v1/routing/simulate", {
+			routingContext: "inbound",
+			destinationNumber: "+12125550100",
+			at: "2026-08-05T19:00:00.000Z",
+		});
+		check(
+			"B's simulation of A's DID does not match — the artifact is per tenant",
+			data(simulateB).matched === false,
+			String(data(simulateB).matched),
+		);
+
+		// --- 9. the NATS half -------------------------------------------------------------------------
+		if (nats === undefined) {
+			console.log("\n9. NATS checks SKIPPED (docker unavailable)");
+		} else {
+			console.log("\n9. routing-cache KV and rpc.routing.v1.resolve");
+			check("the resolve rpc was registered at boot", rpcServed, String(rpcServed));
+
+			const { connect } = await import("nats");
+			const { ClientProxyFactory, Transport } = await import("@nestjs/microservices");
+			const { firstValueFrom } = await import("rxjs");
+			const connection = await connect({ servers: nats.url, name: "verify-pbx" });
+
+			/**
+			 * The rpc is driven through a NestJS `ClientProxy`, not a raw `connection.request`.
+			 *
+			 * That is not convenience — it is the contract. Nest's NATS transport does request-reply
+			 * with its own envelope (`{ pattern, data, id }`), and its server treats a message with
+			 * **no `id`** as a fire-and-forget event and never replies. A raw request therefore times
+			 * out against a perfectly healthy responder, and `apps/engine` — which speaks the same
+			 * transport, per plan §3.5 — would not. Using the client the engine uses is what makes
+			 * this check mean something.
+			 */
+			const rpcClient = ClientProxyFactory.create({
+				transport: Transport.NATS,
+				options: { servers: [nats.url], name: "verify-pbx-rpc" },
+			});
+			await rpcClient.connect();
+
+			try {
+				const manager = await connection.jetstreamManager();
+				const bucket = await manager.jetstream().views.kv(ROUTING_CACHE_BUCKET);
+				const entry = await bucket.get(expectedKey);
+				check("the artifact is in the routing-cache bucket", entry !== null, expectedKey);
+
+				if (entry !== null) {
+					const artifact = JSON.parse(new TextDecoder().decode(entry.value)) as {
+						organizationId: string;
+						snapshotHash: string;
+						artifactVersion: number;
+					};
+					check(
+						"the cached artifact belongs to organization A",
+						artifact.organizationId === organizationA,
+						artifact.organizationId,
+					);
+					check(
+						"the cached artifact matches the hash the compile reported",
+						artifact.snapshotHash === data(compiled).snapshotHash,
+						`${artifact.snapshotHash} vs ${String(data(compiled).snapshotHash)}`,
+					);
+					check(
+						"the cached artifact carries a version",
+						typeof artifact.artifactVersion === "number",
+						String(artifact.artifactVersion),
+					);
+				}
+
+				const request = {
+					orgId: organizationA,
+					direction: "inbound" as const,
+					destinationNumber: "+12125550100",
+					callerNumber: "+13105550111",
+					routingContext: "inbound",
+					at: "2026-08-05T19:00:00.000Z",
+				};
+				const answer = (await firstValueFrom(
+					rpcClient.send<Record<string, unknown>>(ROUTING_RESOLVE_RPC.subject, request),
+				)) as Record<string, unknown>;
+				check("rpc.routing.v1.resolve replied", typeof answer === "object" && answer !== null);
+				check("the rpc reply matched", answer.matched === true, JSON.stringify(answer.matched));
+				check(
+					"the rpc reply names the IVR in kebab-case",
+					answer.destinationType === "ivr-menu" && answer.destinationRef === ivrId,
+					`${String(answer.destinationType)} / ${String(answer.destinationRef)}`,
+				);
+				check(
+					"the rpc reply carries the cache key and a TTL",
+					answer.cacheKey === expectedKey && typeof answer.ttlMs === "number",
+					`${String(answer.cacheKey)} ttl ${String(answer.ttlMs)}`,
+				);
+				check("the rpc reply carries the artifact", typeof answer.artifact === "object");
+
+				const parsedReply = ROUTING_RESOLVE_RPC.response.safeParse(answer);
+				check(
+					"the rpc reply satisfies routingResolveResponseSchema",
+					parsedReply.success,
+					parsedReply.success ? "" : JSON.stringify(parsedReply.error.issues.slice(0, 3)),
+				);
+
+				const malformedAnswer = (await firstValueFrom(
+					rpcClient.send<Record<string, unknown>>(ROUTING_RESOLVE_RPC.subject, {
+						orgId: "not-a-uuid",
+					}),
+				)) as Record<string, unknown>;
+				check(
+					"a malformed rpc request is answered, not dropped",
+					malformedAnswer.matched === false && typeof malformedAnswer.reason === "string",
+					String(malformedAnswer.reason).slice(0, 60),
+				);
+			} finally {
+				await rpcClient.close();
+				await connection.drain();
+			}
+		}
+	} finally {
+		console.log("\ncleaning up");
+		try {
+			await app.close();
+			if (organizationA) {
+				await sql`delete from "organization" where "id" = ${organizationA}`;
+			}
+			if (organizationB) {
+				await sql`delete from "organization" where "id" = ${organizationB}`;
+			}
+			await sql`delete from "user" where "email" in (${ownerEmail}, ${otherEmail})`;
+			// The PBX rows are in the other database and carry no FK to the organization, so they
+			// have to be removed explicitly or every run leaves a tenant behind.
+			const { createPbxDatabaseClient, sql: pbxSql } = await import("@optimiq-voice/pbx-db");
+			const pbx = createPbxDatabaseClient({
+				url: pbxDatabaseUrl,
+				applicationName: "verify-pbx-cleanup",
+				poolMaxConnectionsOverride: 2,
+			});
+			try {
+				for (const organizationId of [organizationA, organizationB].filter(Boolean)) {
+					await pbx.withTenantScope(organizationId, async (transaction) => {
+						for (const table of [
+							"inbound_route",
+							"outbound_route",
+							"phone_number",
+							"ivr_menu_option",
+							"ivr_menu",
+							"ring_group_destination",
+							"ring_group",
+							"time_condition_rule",
+							"time_condition",
+							"feature_code",
+							"voicemail_box",
+							"extension",
+							"trunk",
+						]) {
+							await transaction.execute(pbxSql`delete from ${pbxSql.identifier(table)}`);
+						}
+					});
+				}
+			} finally {
+				await pbx.close();
+			}
+		} catch (error) {
+			console.error("cleanup failed", error);
+		}
+		await sql.end({ timeout: 5 });
+		if (nats !== undefined) {
+			await stopNats(nats);
+		}
+	}
+
+	const failed = checks.filter((entry) => !entry.ok);
+	console.log(`\n${checks.length - failed.length}/${checks.length} checks passed`);
+	if (failed.length > 0) {
+		console.error(`FAILED: ${failed.map((entry) => entry.name).join(", ")}`);
+		process.exitCode = 1;
+		return;
+	}
+	console.log("PBX area verification PASSED");
+}
+
+/** `issues` on a 400/422 body, whichever the failure used. */
+function issuesOf(response: JsonResponse): { field?: string; code?: string }[] {
+	const value = response.body.issues;
+	return Array.isArray(value) ? (value as { field?: string; code?: string }[]) : [];
+}
+
+function diagnosticsOrIssues(response: JsonResponse): unknown[] {
+	return [...issuesOf(response), ...diagnostics(response)];
+}
+
+/** An extension nothing points at, for the "a clean delete works" case. */
+async function freeExtensionId(client: Client): Promise<string> {
+	const list = await client("GET", "/api/v1/extensions?search=Carla");
+	const first = rows(list)[0];
+	return typeof first?.id === "string" ? first.id : "";
+}
+
+await main();

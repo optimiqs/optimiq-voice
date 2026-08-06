@@ -12,6 +12,8 @@ import {
 } from "./auth/auth-bootstrap";
 import { API_TENANT_RLS_PLAN, createApiTenantRlsIntrospector } from "./core/db/rls-preflight-plan";
 import { DATABASE_URL, HTTP_BRIDGE_PORT } from "./envs";
+import { isPbxAreaEnabled, registerPbxTransport } from "./pbx/pbx-bootstrap";
+import { PbxModule } from "./pbx/pbx.module";
 
 const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
@@ -44,7 +46,24 @@ async function bootstrap() {
 		logger.info("better-auth slice disabled (DATABASE_URL, AUTH_SECRET or AUTH_URL not set)");
 	}
 
-	const rootModule: Type<unknown> = authSliceEnabled ? createApiRootModule([AppModule]) : AppModule;
+	/**
+	 * The PBX area (P3) is additive and optional in exactly the same way, and for the same reason:
+	 * an environment without `PBX_DATABASE_URL` boots everything that came before it untouched. It
+	 * is mounted only alongside the auth slice, because every one of its routes is guarded by
+	 * `@RequirePermissions` and the guard the auth slice registers is what enforces that — mounting
+	 * the CRUD surface without it would publish eleven unauthenticated tenant-scoped resources.
+	 */
+	const pbxAreaEnabled = authSliceEnabled && isPbxAreaEnabled();
+	if (isPbxAreaEnabled() && !authSliceEnabled) {
+		logger.warn(
+			"PBX_DATABASE_URL is set but the auth slice is not configured — the PBX area is NOT " +
+				"mounted, because its permission guard comes from the auth slice.",
+		);
+	}
+
+	const rootModule: Type<unknown> = authSliceEnabled
+		? createApiRootModule([AppModule], pbxAreaEnabled ? [PbxModule] : [])
+		: AppModule;
 
 	const app = await NestFactory.create<NestFastifyApplication>(rootModule, new FastifyAdapter());
 	app.enableShutdownHooks();
@@ -54,6 +73,9 @@ async function bootstrap() {
 	if (authSliceEnabled) {
 		await registerAuthTransport(app);
 		logger.info("better-auth mounted on /api/auth/*");
+	}
+	if (pbxAreaEnabled) {
+		await registerPbxTransport(app);
 	}
 
 	await app.listen(HTTP_BRIDGE_PORT, "0.0.0.0");
