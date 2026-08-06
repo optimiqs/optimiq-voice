@@ -357,6 +357,9 @@ importers:
       '@optimiq-voice/streams':
         specifier: workspace:^
         version: link:../../packages/streams
+      '@optimiq-voice/telnyx':
+        specifier: workspace:*
+        version: link:../../packages/telnyx
       '@optimiq-voice/types':
         specifier: workspace:^
         version: link:../../packages/types
@@ -384,6 +387,9 @@ importers:
       elevenlabs:
         specifier: 1.59.0
         version: 1.59.0(encoding@0.1.13)
+      fastify:
+        specifier: 'catalog:'
+        version: 5.11.2
       grpc-health-check:
         specifier: 2.1.0
         version: 2.1.0
@@ -914,6 +920,9 @@ importers:
       '@optimiq-voice/routing':
         specifier: workspace:*
         version: link:../../packages/routing
+      '@optimiq-voice/telnyx':
+        specifier: workspace:*
+        version: link:../../packages/telnyx
       '@tailwindcss/postcss':
         specifier: 'catalog:'
         version: 4.3.3
@@ -1423,6 +1432,19 @@ importers:
         version: 10.0.0
 
   packages/telephony:
+    devDependencies:
+      '@types/bun':
+        specifier: 'catalog:'
+        version: 1.3.14
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+
+  packages/telnyx:
+    dependencies:
+      zod:
+        specifier: 'catalog:'
+        version: 4.4.3
     devDependencies:
       '@types/bun':
         specifier: 'catalog:'

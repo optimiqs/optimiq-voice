@@ -49,6 +49,16 @@ export const routes = {
 	ringGroup: (id: string) => `/ring-groups/${id}`,
 	queue: (id: string) => `/queues/${id}`,
 	timeCondition: (id: string) => `/routing/time-conditions/${id}`,
+
+	/**
+	 * A trunk's detail page, which the four above do not have a reason to exist for.
+	 *
+	 * Its reason is carrier provisioning: the SIP credentials a provision returns are shown once
+	 * and are the kind of thing an admin copies into a phone system while reading them, which a
+	 * dialog over a list — dismissable by a click anywhere outside it — is the wrong container for.
+	 * It inherits `trunks.read` by ancestry, so `PAGE_PERMISSIONS` needs no entry.
+	 */
+	trunk: (id: string) => `/trunks/${id}`,
 } as const;
 
 /**
@@ -88,6 +98,26 @@ export type RoutingTab = (typeof ROUTING_TABS)[number];
 
 export function routingTabHref(tab: RoutingTab): string {
 	return tab === "inbound" ? routes.routing : `${routes.routing}?tab=${tab}`;
+}
+
+/**
+ * The Numbers page's two sections.
+ *
+ * Buying a number and listing the numbers you own are two views of one subject, and both are about
+ * DIDs — so a second sidebar entry called "Order numbers" would be a second way to say "numbers",
+ * and a second route would need a `PAGE_PERMISSIONS` line duplicating `numbers.read`. The tab lives
+ * in `?tab=` so "here is the search I ran" is a link, the same as every list's filter state.
+ *
+ * The `order` tab is rendered for everyone with `numbers.read` and its controls are gated on
+ * `numbers.order` — hiding the tab entirely from a manager would leave them unable to see that
+ * ordering exists, which is worse than showing them a panel that explains they cannot use it.
+ */
+export const NUMBER_TABS = ["numbers", "order"] as const;
+
+export type NumberTab = (typeof NUMBER_TABS)[number];
+
+export function numberTabHref(tab: NumberTab): string {
+	return tab === "numbers" ? routes.numbers : `${routes.numbers}?tab=${tab}`;
 }
 
 /**

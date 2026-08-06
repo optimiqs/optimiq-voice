@@ -3,6 +3,7 @@ import { getTableName, Table } from "drizzle-orm";
 import { getTableConfig } from "drizzle-orm/pg-core";
 import { DESTINATION_TYPES, DestinationColumnPrefixError } from "../destinations";
 import { pbxTenantContext } from "../tenant";
+import { CARRIER_PROVIDERS } from "./carrier-schema";
 import { destinationCheck, namedDestinationColumns } from "./columns";
 import { EXTENSION_USER_ROLES, RECORD_POLICIES, TOLL_CLASSES } from "./extensions-schema";
 import { FEATURE_CODE_ACTIONS } from "./features-schema";
@@ -15,6 +16,7 @@ import { VOICEMAIL_FOLDERS } from "./voicemail-schema";
 const tables = Object.values(pbxTables);
 
 const CONST_TUPLES = {
+	CARRIER_PROVIDERS,
 	DESTINATION_TYPES,
 	EXTENSION_USER_ROLES,
 	FEATURE_CODE_ACTIONS,
@@ -152,6 +154,46 @@ describe("destination trios", () => {
 				for (const column of referencing) {
 					expect(column.endsWith("destination_ref")).toBe(false);
 				}
+			}
+		}
+	});
+});
+
+describe("carrier provenance", () => {
+	/**
+	 * The two tables a managed carrier can create a row in. Anything else gaining a
+	 * `carrier_provider` column without gaining the pair and the check is a row that can claim to be
+	 * managed while being unactionable — which is how a resource gets orphaned at the carrier.
+	 */
+	const CARRIER_OWNED_TABLES = ["phone_number", "trunk"] as const;
+
+	it("ships carrier_provider and carrier_ref together, with an all-or-nothing check", () => {
+		for (const table of tables) {
+			const config = getTableConfig(table);
+			const columnNames = new Set(config.columns.map((column) => column.name));
+			if (!columnNames.has("carrier_provider") && !columnNames.has("carrier_ref")) {
+				continue;
+			}
+			expect(columnNames, `${config.name} has half a provenance pair`).toContain(
+				"carrier_provider",
+			);
+			expect(columnNames, `${config.name} has half a provenance pair`).toContain("carrier_ref");
+			expect(
+				config.checks.map((constraint) => constraint.name),
+				`${config.name} is missing its carrier shape check`,
+			).toContain(`${config.name}_carrier_shape_check`);
+		}
+	});
+
+	it("keeps provenance nullable so a BYO-SIP trunk and a typed-in DID stay expressible", () => {
+		for (const name of CARRIER_OWNED_TABLES) {
+			const config = getTableConfig(
+				tables.find((table) => getTableName(table) === name) ?? pbxTables.trunk,
+			);
+			for (const columnName of ["carrier_provider", "carrier_ref"]) {
+				const column = config.columns.find((candidate) => candidate.name === columnName);
+				expect(column, `${name}.${columnName} is missing`).toBeDefined();
+				expect(column?.notNull, `${name}.${columnName} is NOT NULL`).toBe(false);
 			}
 		}
 	});

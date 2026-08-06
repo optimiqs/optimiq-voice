@@ -6,6 +6,7 @@ import {
 	uuidV7PrimaryKey,
 } from "@optimiq-voice/db";
 import { tenantIsolationPolicy } from "../tenant";
+import { carrierCheck, carrierColumns } from "./carrier-schema";
 import { destinationCheck, destinationColumns } from "./columns";
 import { emergencyAddress } from "./emergency-schema";
 
@@ -54,6 +55,13 @@ export const phoneNumber = pgTable.withRLS(
 		voiceEnabled: boolean("voice_enabled").notNull().default(true),
 		faxEnabled: boolean("fax_enabled").notNull().default(false),
 		enabled: boolean("enabled").notNull().default(true),
+		/**
+		 * Set when the platform ordered this DID through a managed carrier; NULL for a number an
+		 * admin typed in. It is what makes "release it upstream on delete" a decision the row can
+		 * answer rather than a carrier lookup keyed on an E.164 that any platform could claim.
+		 * See `carrier-schema.ts`.
+		 */
+		...carrierColumns(),
 		...auditTimestampColumns(),
 	},
 	(table) => [
@@ -70,7 +78,13 @@ export const phoneNumber = pgTable.withRLS(
 			table.organizationId,
 			table.emergencyAddressId,
 		),
+		index("phone_number_organization_carrier_idx").on(
+			table.organizationId,
+			table.carrierProvider,
+			table.carrierRef,
+		),
 		destinationCheck("phone_number"),
+		carrierCheck("phone_number"),
 		tenantIsolationPolicy("phone_number"),
 	],
 );

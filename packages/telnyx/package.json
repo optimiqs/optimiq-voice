@@ -1,0 +1,39 @@
+{
+	"name": "@optimiq-voice/telnyx",
+	"version": "0.1.0",
+	"description": "Typed Telnyx API v2 client for Optimiq Voice: phone-number search/order/configuration, credential connections and outbound voice profiles, plus an in-package fake Telnyx server for tests",
+	"license": "MIT",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./src/index.ts",
+	"exports": {
+		".": {
+			"types": "./src/index.ts",
+			"default": "./dist/index.js"
+		},
+		"./fake": {
+			"types": "./src/fake/index.ts",
+			"default": "./dist/fake/index.js"
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/optimiqs/optimiq-voice.git"
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json && node ../../.scripts/rewrite-esm-specifiers.mjs",
+		"clean": "rimraf ./dist",
+		"test": "bun test src",
+		"typecheck": "tsc -p tsconfig.json --noEmit"
+	},
+	"dependencies": {
+		"zod": "catalog:"
+	},
+	"devDependencies": {
+		"@types/bun": "catalog:",
+		"typescript": "^5.9.3"
+	}
+}

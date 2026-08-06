@@ -47,6 +47,23 @@ export const queryKeys = {
 		["organizations", organizationId, "pbx", "routing", "compile"] as const,
 
 	/**
+	 * The carrier surface.
+	 *
+	 * `carrierStatus` is organization-scoped even though the answer is platform-wide, because it is
+	 * only ever read inside an organization's shell and scoping it keeps one rule — every key under
+	 * `organizations/<id>` dies on an org switch — rather than one rule and an exception.
+	 *
+	 * `carrierNumberSearch` sits UNDER `pbx/phone-numbers`, so the coarse `pbxResource`
+	 * invalidation a successful order fires sweeps the search results too. That is what makes a
+	 * number disappear from the "available" list the moment it is bought, without the panel having
+	 * to know an order happened.
+	 */
+	carrierStatus: (organizationId: string) =>
+		["organizations", organizationId, "carrier", "status"] as const,
+	carrierNumberSearch: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
+		["organizations", organizationId, "pbx", "phone-numbers", "carrier-search", query] as const,
+
+	/**
 	 * The reporting area, scoped by organization for the same reason everything else is.
 	 *
 	 * Unlike `pbx`, there is no mutation that invalidates these — `call_legs` is an append-only

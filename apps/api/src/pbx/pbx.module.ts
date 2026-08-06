@@ -1,5 +1,9 @@
 import { Inject, Module, type OnApplicationShutdown } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logger";
+import { CarrierWebhookController } from "./carrier/carrier-webhook.controller";
+import { CarrierController, CarrierTrunkController } from "./carrier/carrier.controller";
+import { carrierProviders } from "./carrier/carrier.providers";
+import { CarrierService } from "./carrier/carrier.service";
 import { ConferencesController } from "./conferences/conferences.controller";
 import { ConferencesService } from "./conferences/conferences.service";
 import { ExtensionsController } from "./extensions/extensions.controller";
@@ -87,8 +91,22 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		VoicemailBoxesController,
 		RoutingController,
 		RoutingRpcController,
+		/**
+		 * The carrier slice mounts unconditionally, even without a `TELNYX_API_KEY`.
+		 *
+		 * That is the opposite of how the area itself is gated, and deliberately so. `PbxModule` is
+		 * skipped without `PBX_DATABASE_URL` because there is nothing it could answer; the carrier
+		 * endpoints, by contrast, have a useful answer for an unconfigured deployment — a 503 with
+		 * `CARRIER_NOT_CONFIGURED`, which `apps/web` renders as "connect a carrier". A 404 would tell
+		 * an admin the feature does not exist and send them looking for a version to upgrade to.
+		 */
+		CarrierController,
+		CarrierTrunkController,
+		CarrierWebhookController,
 	],
 	providers: [
+		...carrierProviders,
+		CarrierService,
 		{ provide: PBX_ENV, useFactory: (): PbxEnv => loadPbxEnv() },
 		{
 			provide: PBX_DATABASE,
@@ -116,8 +134,16 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 							// the hashed snapshot, so an unchanged hash means an unchanged index.
 							return;
 						}
-						void publisher.publish(compiled.cacheKey, compiled.artifact);
-						void didIndex.syncOrganization(compiled.artifact);
+						// Fire-and-forget by design (the mutation already committed), but a bare
+						// `void` promise turns NATS's CONNECTION_DRAINING during shutdown into an
+						// unhandled rejection that kills the process — the publish must observe
+						// its own failure.
+						publisher.publish(compiled.cacheKey, compiled.artifact).catch((cause) => {
+							logger.error(`routing cache publish failed for ${compiled.cacheKey}`, cause);
+						});
+						didIndex.syncOrganization(compiled.artifact).catch((cause) => {
+							logger.error(`did-index sync failed for ${compiled.cacheKey}`, cause);
+						});
 					},
 				}),
 			inject: [PBX_DATABASE, RoutingCachePublisher, DidIndexPublisher],

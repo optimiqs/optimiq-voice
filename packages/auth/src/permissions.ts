@@ -38,6 +38,18 @@ export const PERMISSIONS = [
 
 	"numbers.read",
 	"numbers.write",
+	/**
+	 * Buying a DID from the managed carrier.
+	 *
+	 * Split from `numbers.write` because the two differ in the only way that matters here: writing
+	 * changes how a number the organization already owns behaves, ordering **spends the
+	 * organization's money on a recurring commitment**. A manager who may re-point a DID at a
+	 * different IVR should not, by that fact alone, be able to add a line to the monthly bill. It
+	 * is the sharpest boundary in the carrier feature, and the only one that earned its own entry —
+	 * see the header of `apps/api/src/pbx/carrier/carrier.module.ts` for why release and trunk
+	 * provisioning deliberately did not.
+	 */
+	"numbers.order",
 	"numbers.delete",
 	"numbers.assign",
 	"numbers.emergency",
@@ -249,9 +261,16 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 				description: "Create, edit and re-route DIDs, including caller-ID overrides.",
 			},
 			{
+				permission: "numbers.order",
+				label: "Order numbers",
+				description:
+					"Buy a new DID from the connected carrier. Creates a recurring charge on the organization's account.",
+			},
+			{
 				permission: "numbers.delete",
 				label: "Delete numbers",
-				description: "Release a DID from the organization.",
+				description:
+					"Release a DID from the organization, and from the carrier when the platform ordered it.",
 			},
 			{
 				permission: "numbers.assign",

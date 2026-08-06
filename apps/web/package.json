@@ -42,6 +42,7 @@
 		"@optimiq-voice/auth": "workspace:*",
 		"@optimiq-voice/pbx-db": "workspace:*",
 		"@optimiq-voice/routing": "workspace:*",
+		"@optimiq-voice/telnyx": "workspace:*",
 		"@tailwindcss/postcss": "catalog:",
 		"@tanstack/react-query-devtools": "catalog:",
 		"@types/bun": "catalog:",

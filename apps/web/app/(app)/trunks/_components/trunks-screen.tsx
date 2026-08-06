@@ -14,6 +14,7 @@ import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
 import { PageHeader } from "~/components/ui/page-header";
 import { DEFAULT_PAGE_LIMIT, PBX_RESOURCES } from "~/lib/pbx/client";
+import { routes } from "~/lib/routes";
 import { usePermission } from "../../_context/session-context";
 import { usePbxDelete, usePbxList } from "../../_hooks/use-pbx-queries";
 import { TrunkDialog } from "./trunk-dialog";
@@ -110,6 +111,16 @@ export function TrunksScreen() {
 						cell: (row) => <Badge tone={STATUS_TONE[row.status]}>{row.status}</Badge>,
 					},
 					{
+						key: "provider",
+						header: "Provider",
+						cell: (row) =>
+							row.carrierProvider === null ? (
+								<Badge tone="neutral">BYO SIP</Badge>
+							) : (
+								<Badge tone="accent">{row.carrierProvider}</Badge>
+							),
+					},
+					{
 						key: "enabled",
 						header: "State",
 						cell: (row) => <EnabledBadge enabled={row.enabled} />,
@@ -118,6 +129,8 @@ export function TrunksScreen() {
 				rowActions={(row) => (
 					<RowActions
 						label={`trunk ${row.name}`}
+						detailHref={routes.trunk(row.id)}
+						detailLabel="Open"
 						onEdit={
 							canWrite
 								? () => {

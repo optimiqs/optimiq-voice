@@ -260,6 +260,13 @@ export interface PhoneNumberRow extends EntityRow, DestinationTrio {
 	readonly voiceEnabled: boolean;
 	readonly faxEnabled: boolean;
 	readonly enabled: boolean;
+	/**
+	 * Set when the platform bought this DID from the managed carrier; `null` for one an admin typed
+	 * in. It is what decides which delete the Numbers screen calls — the plain one, or the one that
+	 * also gives the number back and stops the bill.
+	 */
+	readonly carrierProvider: string | null;
+	readonly carrierRef: string | null;
 }
 
 export interface TrunkRow extends EntityRow {
@@ -277,6 +284,10 @@ export interface TrunkRow extends EntityRow {
 	readonly callerIdNumberOverride: string | null;
 	readonly status: TrunkStatus;
 	readonly enabled: boolean;
+	/** Set once the trunk has been provisioned at the managed carrier; `null` for a BYO-SIP trunk. */
+	readonly carrierProvider: string | null;
+	readonly carrierRef: string | null;
+	readonly carrierProfileRef: string | null;
 }
 
 export interface InboundRouteRow extends EntityRow, DestinationTrio {

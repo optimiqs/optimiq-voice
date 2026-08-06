@@ -92,7 +92,20 @@ async function bootstrap() {
 		? createApiRootModule([AppModule], extraModules)
 		: AppModule;
 
-	const app = await NestFactory.create<NestFastifyApplication>(rootModule, new FastifyAdapter());
+	/**
+	 * `rawBody: true` exists for exactly one route: `POST /api/v1/carrier/webhooks/telnyx`.
+	 *
+	 * Telnyx signs `${timestamp}|${rawBody}` with Ed25519, and `JSON.parse` followed by
+	 * `JSON.stringify` is not the identity function — key order, unicode escaping and number
+	 * formatting all move — so a signature verified against the re-serialized body fails for
+	 * valid deliveries. (Telnyx's own SDK samples make this mistake; their troubleshooting note
+	 * contradicts them and is correct.) Keeping the buffer is the only way the verification can be
+	 * real rather than decorative, and the cost is one extra reference to a body Fastify has
+	 * already read.
+	 */
+	const app = await NestFactory.create<NestFastifyApplication>(rootModule, new FastifyAdapter(), {
+		rawBody: true,
+	});
 	app.enableShutdownHooks();
 
 	// Raw Fastify wiring has to exist before `listen`, which is when Nest installs its own router

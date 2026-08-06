@@ -2,6 +2,7 @@
  * The telephony schema surface: tables, the const tuples their status columns are typed against,
  * the JSON shapes stored in `jsonb` columns, and the relational configuration.
  */
+export * from "./carrier-schema";
 export * from "./columns";
 export * from "./conferences-schema";
 export * from "./devices-schema";

@@ -42,6 +42,7 @@ import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { startFakeTelnyxServer } from "@optimiq-voice/telnyx/fake";
 import { ApiError } from "../lib/api-client";
 import { writeDestination } from "../lib/pbx/destinations";
 import {
@@ -256,6 +257,17 @@ async function main(): Promise<void> {
 	const webUrl = `http://127.0.0.1:${webPort}`;
 
 	/**
+	 * A fake carrier, in THIS process, reachable by the API's process over loopback.
+	 *
+	 * Nobody working on this repository has a Telnyx key, and the operations this section drives —
+	 * buy a number, provision a trunk — are billable and irreversible. `@optimiq-voice/telnyx/fake`
+	 * is the same server the client's own unit tests and `verify:carrier` use, so the three cannot
+	 * drift: if the frontend's understanding of the carrier contract diverges from the client's, one
+	 * of them fails here.
+	 */
+	const fakeTelnyx = await startFakeTelnyxServer();
+
+	/**
 	 * The API runs as its OWN process, rooted at `apps/api`.
 	 *
 	 * It cannot be imported from here — `@nestjs/core` and the rest do not resolve from `apps/web`,
@@ -302,6 +314,11 @@ async function main(): Promise<void> {
 				AUTH_SECRET: TEST_SECRET,
 				AUTH_URL: apiUrl,
 				API_APP_URL: webUrl,
+				// The carrier, pointed at the fake. Without these the carrier endpoints answer 503 —
+				// which is also a state worth rendering, and section 13 checks that separately by
+				// reading `carrier/status` rather than by booting a second API.
+				TELNYX_API_KEY: "smoke-pbx-carrier-key",
+				TELNYX_API_BASE: fakeTelnyx.baseUrl,
 			},
 			stdio: ["ignore", "pipe", "pipe"],
 		},
@@ -443,10 +460,18 @@ async function main(): Promise<void> {
 		const timeConditionId = firstId(seededConditions);
 		const seededQueueId = firstId(seededQueues);
 
+		const seededTrunks = await client("GET", "/api/v1/trunks?page=1&limit=1");
+		const seededTrunkId = firstId(seededTrunks);
+
 		const routes = [
 			"/extensions",
 			"/numbers",
+			// The order tab is a second view of the same subject rather than a second route, so it is
+			// only reachable — and only renderable — through the query state. A tab that 404s or
+			// crashes would otherwise be invisible to a route list.
+			"/numbers?tab=order",
 			"/trunks",
+			`/trunks/${seededTrunkId}`,
 			"/voicemail",
 			"/ivr",
 			"/ring-groups",
@@ -1177,9 +1202,154 @@ async function main(): Promise<void> {
 		const queueDeleted = await client("DELETE", `/api/v1/queues/${queueId}`);
 		check("delete queue -> 200", queueDeleted.status === 200, `status ${queueDeleted.status}`);
 		await client("DELETE", `/api/v1/extensions/${agentExtensionId}`);
+
+		// --- 13. the carrier surface ---------------------------------------------------------------
+		//
+		// Driven through the Next origin like everything else, against the in-package fake carrier.
+		// The claim is the frontend's, not the API's: that the bodies `lib/carrier/client.ts` builds
+		// are accepted, and that the shapes it destructures are the shapes that come back.
+		console.log("\n13. the carrier surface");
+
+		const carrierStatus = await client("GET", "/api/v1/carrier/status");
+		check(
+			"carrier status is readable",
+			carrierStatus.status === 200,
+			`status ${carrierStatus.status}`,
+		);
+		const statusBody = (carrierStatus.body.data ?? {}) as Record<string, unknown>;
+		check(
+			"the carrier reports itself configured, with a SIP domain the UI can show",
+			statusBody.configured === true && typeof statusBody.sipDomain === "string",
+			String(statusBody.sipDomain),
+		);
+
+		const numberSearch = await client(
+			"GET",
+			"/api/v1/carrier/available-numbers?country=US&areaCode=212&limit=2",
+		);
+		check("number search is 200", numberSearch.status === 200, `status ${numberSearch.status}`);
+		const offered = Array.isArray(numberSearch.body.data)
+			? (numberSearch.body.data as Record<string, unknown>[])
+			: [];
+		/**
+		 * The frontend's field names, not the carrier's. `OrderNumberPanel` reads `e164`,
+		 * `monthlyCost` and `features`; a response carrying `phone_number` and `cost_information`
+		 * would render an empty table with no error, which is the failure this catches.
+		 */
+		check(
+			"search results use the shape the order panel reads",
+			offered.length === 2 &&
+				typeof offered[0]?.e164 === "string" &&
+				Array.isArray(offered[0]?.features),
+			Object.keys(offered[0] ?? {}).join(","),
+		);
+
+		const orderTarget = String(offered[0]?.e164 ?? "");
+		const ordered = await client("POST", "/api/v1/carrier/number-orders", {
+			e164: orderTarget,
+			label: "Smoke ordered",
+			...writeDestination({ type: "hangup", ref: null, data: null }, ""),
+		});
+		check("ordering a searched number is 201", ordered.status === 201, `status ${ordered.status}`);
+		const orderedRow = (ordered.body.data ?? {}) as Record<string, unknown>;
+		check(
+			"the ordered row carries the carrier badge the list renders",
+			orderedRow.carrierProvider === "telnyx" && typeof orderedRow.carrierRef === "string",
+			String(orderedRow.carrierProvider),
+		);
+		check(
+			"the order envelope carries warnings, like every other mutation",
+			Array.isArray(ordered.body.warnings),
+			JSON.stringify(ordered.body.warnings),
+		);
+
+		/**
+		 * The destination trio is required on the order for the same reason it is on the number form:
+		 * a DID that bills monthly and rings nobody is the worst version of an unset destination. The
+		 * panel validates it client-side, so this proves the server agrees rather than trusting it.
+		 */
+		const withoutDestination = await client("POST", "/api/v1/carrier/number-orders", {
+			e164: String(offered[1]?.e164 ?? ""),
+			label: "No destination",
+		});
+		check(
+			"an order with no destination is refused",
+			withoutDestination.status === 400,
+			`status ${withoutDestination.status}`,
+		);
+		check(
+			"and it maps to a form field rather than to nothing",
+			Object.keys(pbxFieldErrors(asApiError(withoutDestination))).length > 0,
+			JSON.stringify(Object.keys(pbxFieldErrors(asApiError(withoutDestination)))),
+		);
+
+		const provisionTrunkTarget = await client("POST", "/api/v1/trunks", {
+			name: `Smoke carrier trunk ${RUN_ID}`,
+			sipDomain: "unprovisioned.invalid",
+			sipProxy: "sip:unprovisioned.invalid:5060",
+		});
+		const provisionTrunkId = rowId(provisionTrunkTarget);
+		const provisioned = await client(
+			"POST",
+			`/api/v1/trunks/${provisionTrunkId}/provision-telnyx`,
+			{},
+		);
+		check(
+			"provisioning a trunk is 201",
+			provisioned.status === 201,
+			`status ${provisioned.status}`,
+		);
+		const credentials = (provisioned.body.carrier ?? {}) as Record<string, unknown>;
+		/**
+		 * Every field the provisioning panel renders, present in one check: a missing one is a blank
+		 * row in the "shown once" box, and the password is the one thing that cannot be re-read from
+		 * this side afterwards.
+		 */
+		check(
+			"the response carries every credential the panel shows",
+			typeof credentials.sipUri === "string" &&
+				typeof credentials.sipUsername === "string" &&
+				typeof credentials.sipPassword === "string" &&
+				typeof credentials.registerExpiresSeconds === "number" &&
+				credentials.reprovisioned === false,
+			Object.keys(credentials).join(","),
+		);
+
+		const provisionedTrunkPage = await page(webUrl, `/trunks/${provisionTrunkId}`, jar);
+		check(
+			"the provisioned trunk's detail page renders",
+			provisionedTrunkPage.status === 200,
+			`status ${provisionedTrunkPage.status}`,
+		);
+
+		const releasedNumber = await client(
+			"DELETE",
+			`/api/v1/carrier/numbers/${String(orderedRow.id)}`,
+		);
+		check(
+			"releasing a carrier number is 200",
+			releasedNumber.status === 200,
+			`status ${releasedNumber.status}`,
+		);
+		/**
+		 * Specifically NOT "no warnings at all".
+		 *
+		 * Compile-on-write returns every warning the organization's configuration currently carries,
+		 * and the demo fixture ships several — extensions with voicemail enabled and no mailbox. So
+		 * the claim that matters is narrower and truer: the release itself did not add one. A
+		 * `carrier-release-failed` warning means the row is gone here but the number is still billed
+		 * there, which is the one outcome this check exists to catch.
+		 */
+		check(
+			"the release added no carrier warning, so the number really went back",
+			!warningCodes(releasedNumber).some((code) => code.startsWith("carrier-release")),
+			warningCodes(releasedNumber).join(","),
+		);
+		await client("DELETE", `/api/v1/trunks/${provisionTrunkId}`);
 	} finally {
 		next?.kill("SIGTERM");
 		apiProcess.kill("SIGTERM");
+		await fakeTelnyx.close();
 		await delay(300);
 	}
 

@@ -18,6 +18,23 @@ import {
 } from "./permissions";
 
 describe("PERMISSIONS", () => {
+	/**
+	 * The registry is at **90 of 90** as of the Telnyx carrier work.
+	 *
+	 * That is deliberate, not an accident of arriving last. The carrier integration needed exactly
+	 * one new grant — `numbers.order`, which is the only carrier operation whose blast radius
+	 * (spending the organization's money on a recurring commitment) is not already covered by an
+	 * existing one. Release rides `numbers.delete`, because a role that can delete the row but not
+	 * release the number upstream would orphan DIDs at the carrier and bill for them forever; trunk
+	 * provisioning rides `trunks.write`, because "change how this organization reaches the PSTN" is
+	 * already what that permission means.
+	 *
+	 * The ceiling itself is not arbitrary — it is the argument that FusionPBX's ~940 field-level
+	 * permissions were unusable and that a model an admin can actually reason about has to fit on a
+	 * page. So the next feature that wants a permission should first spend the effort we spent
+	 * here: prove the existing grants cannot express the boundary. If it genuinely cannot, raise
+	 * this number in the same change and say why, rather than deleting the assertion.
+	 */
 	it("stays within the size the collapsed FusionPBX model targets", () => {
 		expect(PERMISSIONS.length).toBeGreaterThanOrEqual(60);
 		expect(PERMISSIONS.length).toBeLessThanOrEqual(90);

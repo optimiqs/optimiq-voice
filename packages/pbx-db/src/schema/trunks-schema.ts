@@ -6,6 +6,7 @@ import {
 	uuidV7PrimaryKey,
 } from "@optimiq-voice/db";
 import { tenantIsolationPolicy } from "../tenant";
+import { carrierCheck, carrierColumns } from "./carrier-schema";
 import type { SipTransport } from "./devices-schema";
 
 /**
@@ -53,12 +54,31 @@ export const trunk = pgTable.withRLS(
 		statusReason: text("status_reason"),
 		statusLatencyMs: integer("status_latency_ms"),
 		enabled: boolean("enabled").notNull().default(true),
+		/**
+		 * Set when the platform provisioned this trunk at a managed carrier. `carrier_ref` is the
+		 * connection's id over there — the handle the delete path needs to tear it down, and the one
+		 * a re-provision uses to update rather than create a second connection.
+		 */
+		...carrierColumns(),
+		/**
+		 * The carrier-side outbound voice profile bound to this connection. Separate from
+		 * `carrier_ref` because it is a distinct resource with its own lifecycle: profiles carry the
+		 * spend limits and destination allow-lists, and several connections may share one, so
+		 * deleting a connection must not assume it may delete the profile too.
+		 */
+		carrierProfileRef: text("carrier_profile_ref"),
 		...auditTimestampColumns(),
 	},
 	(table) => [
 		uniqueIndex("trunk_organization_name_key").on(table.organizationId, table.name),
 		index("trunk_organization_enabled_idx").on(table.organizationId, table.enabled),
 		index("trunk_organization_status_idx").on(table.organizationId, table.status),
+		index("trunk_organization_carrier_idx").on(
+			table.organizationId,
+			table.carrierProvider,
+			table.carrierRef,
+		),
+		carrierCheck("trunk"),
 		tenantIsolationPolicy("trunk"),
 	],
 );

@@ -79,6 +79,35 @@ channel over with the dialplan position it is standing on, and inside a subrouti
 the subroutine's — so the engine would receive `exten = start` for every call and resolve every DID
 as unallocated.
 
+## Carrier trunks (Telnyx)
+
+`config/pjsip_telnyx_example.conf` is the pjsip shape a trunk provisioned by
+`POST /api/v1/trunks/:id/provision-telnyx` needs: a `registration`, an `auth`,
+an `aor`, an `identify` and an `endpoint` in `optimiq-inbound`.
+
+It is an **example and is not included** by `pjsip.conf`. Nothing in it takes
+effect unless somebody copies it deliberately, which is the same containment
+`pjsip_dev_endpoints.conf` gets and for the same reason: a trunk template that
+auto-loaded is a template somebody eventually fills in with a real password and
+commits.
+
+Two things the file explains at length and that are worth repeating here:
+
+- **Registration is for INBOUND only.** Outbound placement over a Telnyx
+  credential connection needs no REGISTER — the INVITE is challenged with a SIP
+  `407` and the same digest credential answers it. A trunk whose registration
+  has lapsed keeps placing calls while silently receiving none, which is why the
+  expiry is 180 s rather than an hour.
+- **`context = optimiq-inbound`, never `optimiq-internal`.** Carrier traffic is
+  unauthenticated traffic arriving over an authenticated transport. A carrier
+  that could reach the internal context could re-enter the outbound routes —
+  the classic open relay, where a call into one of your DIDs leaves again as
+  billable international minutes.
+
+The SIP username and password come from the provisioning response. The password
+is never stored in `pbx-db`; it stays re-derivable from Telnyx through the
+connection id in `trunk.carrier_ref`.
+
 ## Exposed ports
 
 - `6060` - Default SIP port
