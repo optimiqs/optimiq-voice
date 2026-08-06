@@ -133,6 +133,30 @@ export type IvrOptionMatchKind = (typeof IVR_OPTION_MATCH_KINDS)[number];
 export const RING_GROUP_STRATEGIES = ["simultaneous", "sequential"] as const;
 export type RingGroupStrategy = (typeof RING_GROUP_STRATEGIES)[number];
 
+export const QUEUE_STRATEGIES = [
+	"longest-idle",
+	"ring-all",
+	"round-robin",
+	"top-down",
+	"sequential",
+	"random",
+] as const;
+export type QueueStrategy = (typeof QUEUE_STRATEGIES)[number];
+
+export const QUEUE_AGENT_STATUSES = [
+	"logged-out",
+	"available",
+	"on-break",
+	"on-call",
+	"wrap-up",
+	"unavailable",
+] as const;
+export type QueueAgentStatus = (typeof QUEUE_AGENT_STATUSES)[number];
+
+/** How the engine reaches an agent: their extension, or a literal number. */
+export const QUEUE_AGENT_CONTACT_KINDS = ["extension", "external"] as const;
+export type QueueAgentContactKind = (typeof QUEUE_AGENT_CONTACT_KINDS)[number];
+
 export const VOICEMAIL_EMAIL_MODES = ["none", "notify", "attach"] as const;
 export type VoicemailEmailMode = (typeof VOICEMAIL_EMAIL_MODES)[number];
 
@@ -378,6 +402,91 @@ export interface RingGroupMemberRow extends EntityRow, DestinationTrio {
 	readonly enabled: boolean;
 }
 
+export interface QueueRow extends EntityRow {
+	readonly name: string;
+	readonly extensionNumber: string | null;
+	readonly strategy: QueueStrategy;
+	readonly mohClassId: string | null;
+	readonly greetingPromptId: string | null;
+	readonly announcePromptId: string | null;
+	readonly maxWaitSeconds: number;
+	readonly maxWaitNoAgentSeconds: number;
+	readonly wrapUpSeconds: number;
+	readonly announcePositionEnabled: boolean;
+	readonly announceFrequencySeconds: number;
+	readonly abandonedResumeAllowed: boolean;
+	readonly discardAbandonedAfterSeconds: number;
+	readonly tierRulesApply: boolean;
+	readonly tierRuleWaitSeconds: number;
+	readonly tierRuleNoAgentNoWait: boolean;
+	readonly recordEnabled: boolean;
+	readonly timeoutDestinationType: DestinationType | null;
+	readonly timeoutDestinationRef: string | null;
+	readonly timeoutDestinationData: DestinationData | null;
+	readonly enabled: boolean;
+}
+
+/**
+ * An agent is organization-level, not queue-level: `queue_agent` carries no queue, and
+ * {@link QueueTierRow} is the membership that says which queues they serve. `/queue-agents` is
+ * therefore a top-level list, not a child of `/queues`.
+ */
+export interface QueueAgentRow extends EntityRow {
+	readonly name: string;
+	readonly userId: string | null;
+	readonly contactKind: QueueAgentContactKind;
+	readonly extensionId: string | null;
+	readonly contact: string | null;
+	readonly status: QueueAgentStatus;
+	readonly statusChangedAt: string | null;
+	readonly wrapUpSeconds: number;
+	readonly maxNoAnswer: number;
+	readonly noAnswerDelaySeconds: number;
+	readonly busyDelaySeconds: number;
+	readonly rejectDelaySeconds: number;
+	readonly enabled: boolean;
+}
+
+export interface QueueTierRow extends EntityRow {
+	readonly queueId: string;
+	readonly queueAgentId: string;
+	/** Lower levels are offered the call first. */
+	readonly level: number;
+	/** Order within the level. */
+	readonly position: number;
+}
+
+/**
+ * A conference room.
+ *
+ * `pinHash` / `moderatorPinHash` are not on the wire: the API does not accept a digest in a JSON
+ * body, so the row reports only whether a PIN exists — and today it never does. See
+ * `apps/api/src/pbx/conferences/conferences.resource.ts`.
+ */
+export interface ConferenceRow extends EntityRow {
+	readonly name: string;
+	readonly roomNumber: string;
+	readonly maxMembers: number;
+	readonly recordEnabled: boolean;
+	readonly mohClassId: string | null;
+	readonly announceJoinLeave: boolean;
+	readonly waitForModerator: boolean;
+	readonly enabled: boolean;
+}
+
+export interface ParkLotRow extends EntityRow {
+	readonly name: string;
+	/** Inclusive dialable slot range, e.g. 701–720. */
+	readonly slotStart: number;
+	readonly slotEnd: number;
+	readonly timeoutSeconds: number;
+	readonly timeoutDestinationType: DestinationType | null;
+	readonly timeoutDestinationRef: string | null;
+	readonly timeoutDestinationData: DestinationData | null;
+	readonly mohClassId: string | null;
+	readonly enabled: boolean;
+}
+
 export interface FeatureCodeRow extends EntityRow {
 	readonly code: string;
 	readonly action: FeatureCodeAction;
@@ -385,6 +494,26 @@ export interface FeatureCodeRow extends EntityRow {
 	readonly label: string | null;
 	readonly enabled: boolean;
 }
+
+/**
+ * What one feature-code action's `params` accepts, as `GET /feature-codes/param-fields` reports it.
+ *
+ * The server declares this so the form can render a control instead of a JSON textarea: today only
+ * `call-park` takes anything (`lotId`, an entity ref into the park-lot list), and every other
+ * action reports an empty list — which is a fact about the action, not a gap in the API.
+ */
+export interface FeatureCodeParamField {
+	readonly name: string;
+	readonly label: string;
+	readonly description: string;
+	readonly kind: "entity";
+	readonly entityType: DestinationType;
+	readonly required: boolean;
+}
+
+export type FeatureCodeParamFields = Readonly<
+	Record<FeatureCodeAction, readonly FeatureCodeParamField[]>
+>;
 
 export interface VoicemailBoxRow extends EntityRow {
 	readonly mailboxNumber: string;

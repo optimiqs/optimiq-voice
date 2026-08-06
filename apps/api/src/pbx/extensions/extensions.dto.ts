@@ -1,6 +1,6 @@
 import { z } from "zod/v4";
 import { RECORD_POLICIES, TOLL_CLASSES } from "@optimiq-voice/pbx-db";
-import { dialableString, displayName, internalNumber, patchOf } from "../shared/dto";
+import { dialableString, displayName, internalNumber, patchOf, resettable } from "../shared/dto";
 
 /**
  * The follow-me ladder, stored whole as JSON because it is small, ordered and read as a unit.
@@ -50,8 +50,8 @@ export const createExtensionDto = z.strictObject({
 	 * expensive weekend.
 	 */
 	tollClass: z.enum(TOLL_CLASSES).optional(),
-	callTimeoutSeconds: z.int().min(5).max(300).optional(),
-	maxRegistrations: z.int().min(1).max(20).optional(),
+	callTimeoutSeconds: resettable(z.int().min(5).max(300)),
+	maxRegistrations: resettable(z.int().min(1).max(20)),
 	codecOverride: z.string().max(128).nullish(),
 	enabled: z.boolean().optional(),
 });

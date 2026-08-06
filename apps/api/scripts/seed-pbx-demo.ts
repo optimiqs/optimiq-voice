@@ -18,8 +18,13 @@
  *          ▼
  *   default destination ─► IVR "Main menu"   (taken when no route matches)
  *
+ *                     3 ─► "Support" queue ─► agents 1002, 1003 (tier 1) ─► voicemail on timeout
+ *
+ *   conference "Standup" (room 9000)
+ *   park lot "Front desk" (slots 701–720) ─► voicemail 8000 when nobody retrieves the call
+ *
  *   outbound "National" (toll class national, strip 0, prepend +1) ─► trunk "Demo carrier"
- *   feature codes *97 (check voicemail) and *69 (redial)
+ *   feature codes *97 (check voicemail), *69 (redial) and *5 (park into "Front desk")
  * ```
  *
  * It is written directly against `@optimiq-voice/pbx-db` rather than through the HTTP API on
@@ -34,6 +39,7 @@
 
 import { createEntityId } from "@optimiq-voice/identifiers";
 import {
+	conference,
 	createPbxDatabaseClient,
 	extension,
 	featureCode,
@@ -41,7 +47,11 @@ import {
 	ivrMenu,
 	ivrMenuOption,
 	outboundRoute,
+	parkLot,
 	phoneNumber,
+	queue,
+	queueAgent,
+	queueTier,
 	ringGroup,
 	ringGroupDestination,
 	sql,
@@ -64,6 +74,10 @@ export interface SeededDemo {
 	readonly inboundRouteId: string;
 	readonly outboundRouteId: string;
 	readonly trunkId: string;
+	readonly queueId: string;
+	readonly queueAgentIds: readonly string[];
+	readonly conferenceId: string;
+	readonly parkLotId: string;
 }
 
 /** The tables this fixture owns, in dependency order for the reset. */
@@ -75,6 +89,13 @@ const OWNED_TABLES = [
 	"ivr_menu",
 	"ring_group_destination",
 	"ring_group",
+	// Tiers before the queue and the agents they join: `on delete cascade` would handle it, but the
+	// reset must not depend on the order the deletes happen to cascade in.
+	"queue_tier",
+	"queue_agent",
+	"queue",
+	"park_lot",
+	"conference",
 	"time_condition_rule",
 	"time_condition",
 	"feature_code",
@@ -102,6 +123,10 @@ export async function seedPbxDemo(
 			inboundRoute: createEntityId(),
 			outboundRoute: createEntityId(),
 			trunk: createEntityId(),
+			queue: createEntityId(),
+			queueAgents: [createEntityId(), createEntityId()],
+			conference: createEntityId(),
+			parkLot: createEntityId(),
 		};
 
 		await transaction.insert(extension).values(
@@ -167,6 +192,68 @@ export async function seedPbxDemo(
 			},
 		]);
 
+		// The queue, its agents and their tier. `queue_agent` and `queue_tier` are not routing inputs
+		// — the compiler emits the queue node and the engine reads membership live — so they are
+		// seeded purely so the admin screens and the wallboard have something to show.
+		await transaction.insert(queue).values({
+			id: ids.queue,
+			organizationId,
+			name: "Support",
+			extensionNumber: "2100",
+			strategy: "longest-idle",
+			maxWaitSeconds: 300,
+			announcePositionEnabled: true,
+			timeoutDestinationType: "voicemail",
+			timeoutDestinationRef: ids.voicemailBox,
+		});
+
+		await transaction.insert(queueAgent).values(
+			[
+				{ name: "Ben Okafor", extensionIndex: 1 },
+				{ name: "Carla Reyes", extensionIndex: 2 },
+			].map((row, index) => ({
+				id: ids.queueAgents[index] as string,
+				organizationId,
+				name: row.name,
+				contactKind: "extension" as const,
+				extensionId: ids.extensions[row.extensionIndex] as string,
+				status: "logged-out" as const,
+			})),
+		);
+
+		await transaction.insert(queueTier).values(
+			ids.queueAgents.map((queueAgentId, index) => ({
+				id: createEntityId(),
+				organizationId,
+				queueId: ids.queue,
+				queueAgentId,
+				level: 1,
+				position: index + 1,
+			})),
+		);
+
+		await transaction.insert(conference).values({
+			id: ids.conference,
+			organizationId,
+			name: "Standup",
+			roomNumber: "9000",
+			maxMembers: 25,
+			announceJoinLeave: true,
+		});
+
+		// A parked call nobody retrieves must go somewhere, or it sits in hold music until the
+		// carrier gives up — which is the failure mode the timeout trio exists to prevent.
+		await transaction.insert(parkLot).values({
+			id: ids.parkLot,
+			organizationId,
+			name: "Front desk",
+			slotStart: 701,
+			slotEnd: 720,
+			timeoutSeconds: 180,
+			timeoutDestinationType: "voicemail",
+			timeoutDestinationRef: ids.voicemailBox,
+		});
+
 		await transaction.insert(ivrMenu).values({
 			id: ids.ivrMenu,
 			organizationId,
@@ -208,6 +295,17 @@ export async function seedPbxDemo(
 				organizationId,
 				ivrMenuId: ids.ivrMenu,
 				ordinal: 3,
+				matchKind: "digit" as const,
+				matchValue: "3",
+				label: "Support queue",
+				destinationType: "queue" as const,
+				destinationRef: ids.queue,
+			},
+			{
+				id: createEntityId(),
+				organizationId,
+				ivrMenuId: ids.ivrMenu,
+				ordinal: 4,
 				matchKind: "digit" as const,
 				matchValue: "0",
 				label: "Operator",
@@ -305,6 +403,15 @@ export async function seedPbxDemo(
 				action: "redial" as const,
 				label: "Redial",
 			},
+			{
+				id: createEntityId(),
+				organizationId,
+				code: "*5",
+				action: "call-park" as const,
+				// The one parameter the compiler reads: it resolves the lot into a park node.
+				params: { lotId: ids.parkLot },
+				label: "Park this call",
+			},
 		]);
 
 		return {
@@ -318,6 +425,10 @@ export async function seedPbxDemo(
 			inboundRouteId: ids.inboundRoute,
 			outboundRouteId: ids.outboundRoute,
 			trunkId: ids.trunk,
+			queueId: ids.queue,
+			queueAgentIds: ids.queueAgents,
+			conferenceId: ids.conference,
+			parkLotId: ids.parkLot,
 		};
 	});
 }

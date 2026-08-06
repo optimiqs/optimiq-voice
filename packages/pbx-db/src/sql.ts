@@ -48,3 +48,12 @@ export type { SQL } from "drizzle-orm";
  * declaration will not accept the table objects this package exports.
  */
 export type { AnyPgColumn, PgColumn, PgTable } from "drizzle-orm/pg-core";
+/**
+ * Table introspection, re-exported for the same instance-binding reason as everything above.
+ *
+ * `apps/api` reads the unique-index definitions off a table so a `23505` can name the column the
+ * form should attach the message to, rather than guessing it from the index name. A
+ * `getTableConfig` imported from the consumer's own drizzle copy would be handed a table object
+ * built by this one and would not recognise it.
+ */
+export { getTableConfig } from "drizzle-orm/pg-core";

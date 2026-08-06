@@ -1,5 +1,7 @@
 import { Inject, Module, type OnApplicationShutdown } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logger";
+import { ConferencesController } from "./conferences/conferences.controller";
+import { ConferencesService } from "./conferences/conferences.service";
 import { ExtensionsController } from "./extensions/extensions.controller";
 import { ExtensionsService } from "./extensions/extensions.service";
 import { FeatureCodesController } from "./feature-codes/feature-codes.controller";
@@ -10,8 +12,12 @@ import { IvrMenusController } from "./ivr-menus/ivr-menus.controller";
 import { IvrMenuOptionsService, IvrMenusService } from "./ivr-menus/ivr-menus.service";
 import { OutboundRoutesController } from "./outbound-routes/outbound-routes.controller";
 import { OutboundRoutesService } from "./outbound-routes/outbound-routes.service";
+import { ParkLotsController } from "./park-lots/park-lots.controller";
+import { ParkLotsService } from "./park-lots/park-lots.service";
 import { PhoneNumbersController } from "./phone-numbers/phone-numbers.controller";
 import { PhoneNumbersService } from "./phone-numbers/phone-numbers.service";
+import { QueueAgentsController, QueuesController } from "./queues/queues.controller";
+import { QueueAgentsService, QueueTiersService, QueuesService } from "./queues/queues.service";
 import { RingGroupsController } from "./ring-groups/ring-groups.controller";
 import { RingGroupDestinationsService, RingGroupsService } from "./ring-groups/ring-groups.service";
 import { RoutingCachePublisher } from "./routing/routing-cache.publisher";
@@ -39,14 +45,14 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 /**
  * The PBX area.
  *
- * ## One module for eleven slices
+ * ## One module for fourteen slices
  *
  * The oikos convention is one Nest module per feature slice, and its purpose is that a slice's
  * wiring is declared where the slice lives. Here every slice shares the same three things — one
- * `PbxDatabaseClient` (one connection pool, not eleven), one `ModuleEffectRuntime` over one
- * repository layer, and one `RoutingCachePublisher` — so eleven modules would each be an `imports`
- * line pointing at whichever module owned the shared providers, plus eleven chances for one of
- * them to build a second pool by accident. The slices keep their own directories, DTOs, resource
+ * `PbxDatabaseClient` (one connection pool, not fourteen), one `ModuleEffectRuntime` over one
+ * repository layer, and one `RoutingCachePublisher` — so fourteen modules would each be an
+ * `imports` line pointing at whichever module owned the shared providers, plus fourteen chances for
+ * one of them to build a second pool by accident. The slices keep their own directories, DTOs, resource
  * declarations, services and controllers; what they share is stated once, here.
  *
  * The Effect runtime is provided under a **Symbol token via `useFactory`** per the oikos seam
@@ -71,6 +77,10 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		TimeConditionsController,
 		IvrMenusController,
 		RingGroupsController,
+		QueuesController,
+		QueueAgentsController,
+		ConferencesController,
+		ParkLotsController,
 		FeatureCodesController,
 		VoicemailBoxesController,
 		RoutingController,
@@ -112,6 +122,11 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		IvrMenuOptionsService,
 		RingGroupsService,
 		RingGroupDestinationsService,
+		QueuesService,
+		QueueAgentsService,
+		QueueTiersService,
+		ConferencesService,
+		ParkLotsService,
 		FeatureCodesService,
 		VoicemailBoxesService,
 		RoutingService,

@@ -1,6 +1,6 @@
 import { z } from "zod/v4";
 import { VOICEMAIL_EMAIL_MODES } from "@optimiq-voice/pbx-db";
-import { internalNumber, patchOf } from "../shared/dto";
+import { internalNumber, patchOf, resettable } from "../shared/dto";
 
 export const createVoicemailBoxDto = z.strictObject({
 	/** Usually the extension number, but boxes may be standalone. */
@@ -13,8 +13,8 @@ export const createVoicemailBoxDto = z.strictObject({
 	deleteAfterDelivery: z.boolean().optional(),
 	transcriptionEnabled: z.boolean().optional(),
 	mwiEnabled: z.boolean().optional(),
-	maxMessages: z.int().min(1).max(10_000).optional(),
-	maxMessageSeconds: z.int().min(10).max(3600).optional(),
+	maxMessages: resettable(z.int().min(1).max(10_000)),
+	maxMessageSeconds: resettable(z.int().min(10).max(3600)),
 	enabled: z.boolean().optional(),
 });
 

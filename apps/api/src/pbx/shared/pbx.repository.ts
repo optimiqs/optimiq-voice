@@ -16,6 +16,7 @@ import { compileOnWrite, requiresRecompile } from "../routing/compile-on-write";
 import {
 	assertDestinations,
 	findDestinationReferences,
+	findParkLotFeatureCodeReferences,
 	findScalarReferences,
 	findTrunkReferences,
 	readRows,
@@ -25,12 +26,13 @@ import {
 	PbxEntityNotFoundFailure,
 	PbxEntityReferencedFailure,
 	type PbxFailure,
+	PbxValidationFailure,
 	toPbxFailure,
 } from "./pbx.errors";
 import type { CompiledWrite } from "../routing/compile-on-write";
 import type { ListQuery, PagedResult, Pagination } from "./pagination";
 import type { PbxChildResource, PbxResource } from "./pbx-resource";
-import type { SQL } from "@optimiq-voice/pbx-db";
+import type { PgTable, SQL } from "@optimiq-voice/pbx-db";
 import type { Diagnostic } from "@optimiq-voice/routing";
 
 /**
@@ -125,6 +127,13 @@ export interface PbxRepositoryInterface {
 		id: string,
 	) => Effect.Effect<MutationResult<{ readonly id: string }>, PbxFailure>;
 
+	readonly reorderChildren: (
+		organizationId: string,
+		resource: PbxChildResource,
+		parentId: string,
+		ids: readonly string[],
+	) => Effect.Effect<MutationResult<readonly Record<string, unknown>[]>, PbxFailure>;
+
 	/** Compiles the organization's configuration without mutating anything. */
 	readonly compile: (organizationId: string) => Effect.Effect<CompiledWrite, PbxFailure>;
 }
@@ -169,6 +178,84 @@ function listPredicate(resource: PbxResource, query: ListQuery): SQL | undefined
 		return undefined;
 	}
 	return clauses.length === 1 ? clauses[0] : and(...clauses);
+}
+
+// ---------------------------------------------------------------------------------------------
+// `null` means "reset"
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * What an explicit `null` means for a column the database says can never be null.
+ *
+ * The PATCH contract is: an absent key is "leave it alone", a present `null` is "clear it". For a
+ * nullable column that is unambiguous. For the ~40 tuning knobs that are `notNull().default(n)` —
+ * `ringTimeoutSeconds`, `maxWaitSeconds`, `wrapUpSeconds`, `maxMessages` — "clear it" cannot mean
+ * NULL, because the column refuses NULL and the write would come back as a 503 the user cannot act
+ * on. It can only mean **put it back to what the server picked**, which is the reset a form's
+ * "Use default" control needs and the only reading of `null` those columns have.
+ *
+ * So the two paths are translated rather than refused:
+ *
+ * - **insert** — the key is dropped, and Drizzle emits the column's `DEFAULT`.
+ * - **update** — the key becomes a literal `default`, which is the only way SQL says "put this
+ *   column back" in an `UPDATE … SET`.
+ *
+ * A `null` for a genuinely nullable column (`callerIdName`, `mohClassId`, a destination trio) is
+ * untouched and still clears to NULL, which is what it has always meant. The distinction is read
+ * off the column, not off a hand-maintained list, so a column that gains a default gains the
+ * behaviour with it. The DTOs mark these fields `.nullish()` so `null` is even expressible; see
+ * `shared/dto.ts`.
+ */
+function columnResetsToDefault(table: PgTable, key: string): boolean {
+	const column = (table as unknown as Record<string, ColumnLike | undefined>)[key];
+	return column?.notNull === true && column.hasDefault === true;
+}
+
+interface ColumnLike {
+	readonly notNull?: boolean;
+	readonly hasDefault?: boolean;
+}
+
+/** Insert values with every "reset me" null removed, so the column's own DEFAULT applies. */
+function withInsertDefaults(
+	table: PgTable,
+	values: Record<string, unknown>,
+): Record<string, unknown> {
+	const next: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(values)) {
+		if (value === null && columnResetsToDefault(table, key)) {
+			continue;
+		}
+		next[key] = value;
+	}
+	return next;
+}
+
+/** Update values with every "reset me" null rewritten to the SQL keyword `default`. */
+function withUpdateDefaults(
+	table: PgTable,
+	values: Record<string, unknown>,
+): Record<string, unknown> {
+	const next: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(values)) {
+		next[key] = value === null && columnResetsToDefault(table, key) ? sql`default` : value;
+	}
+	return next;
+}
+
+/**
+ * The merged row a guard sees, with the resets resolved back to the value they will land on.
+ *
+ * `sql\`default\`` is not a value a destination check can read, and neither is the `null` it came
+ * from, so the merge that feeds `assertDestinations` drops resettable nulls instead of carrying
+ * them: what the row will hold after the write is the column's default, not NULL.
+ */
+function mergedForGuards(
+	table: PgTable,
+	existing: Record<string, unknown>,
+	values: Record<string, unknown>,
+): Record<string, unknown> {
+	return { ...existing, ...withInsertDefaults(table, values) };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -239,11 +326,55 @@ async function assertNotReferenced(
 		...(resource.scalarReferences === undefined
 			? []
 			: await findScalarReferences(transaction, resource.scalarReferences, id)),
+		// Two references live inside `jsonb` where no column — and therefore no generic scan — can
+		// reach them: an outbound route's trunk list, and a `call-park` code's pinned lot.
 		...(resource.tableName === "trunk" ? await findTrunkReferences(transaction, id) : []),
+		...(resource.tableName === "park_lot"
+			? await findParkLotFeatureCodeReferences(transaction, id)
+			: []),
 	];
 
 	if (references.length > 0) {
 		throw new PbxEntityReferencedFailure({ kind: resource.kind, id, references });
+	}
+}
+
+/** The camelCase Drizzle key of a column, derived from its physical name. */
+function columnKey(column: PgColumnLike): string {
+	const name = (column as unknown as { name: string }).name;
+	return name.replace(/_([a-z])/gu, (_full, letter: string) => letter.toUpperCase());
+}
+
+/**
+ * Refuses a reorder whose id list is not exactly the collection's membership.
+ *
+ * Reported as a 400 with the field the client sent rather than a 404 on the first unknown id: the
+ * list as a whole is what was wrong, and a form that just lost a race with another editor needs to
+ * be told to reload, not to hunt for one id.
+ */
+function assertPermutation(
+	kind: string,
+	present: readonly string[],
+	requested: readonly string[],
+): void {
+	const unique = new Set(requested);
+	if (unique.size !== requested.length) {
+		throw new PbxValidationFailure({
+			field: "ids",
+			detail: "The same id appears twice in the requested order.",
+		});
+	}
+	const current = new Set(present);
+	const missing = present.filter((id) => !unique.has(id));
+	const unknown = requested.filter((id) => !current.has(id));
+	if (missing.length > 0 || unknown.length > 0) {
+		throw new PbxValidationFailure({
+			field: "ids",
+			detail:
+				`The order must list every ${kind} in this collection exactly once ` +
+				`(${present.length} expected, ${requested.length} sent). ` +
+				"Reload the list and try again.",
+		});
 	}
 }
 
@@ -278,16 +409,22 @@ export interface PbxRepositoryDependencies {
 export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositoryInterface {
 	const newId = deps.newId ?? createEntityId;
 
-	/** The single Effect↔transaction seam. Read the class doc above before changing this. */
+	/**
+	 * The single Effect↔transaction seam. Read the class doc above before changing this.
+	 *
+	 * `table` travels with the failure mapping so a `23505` can be answered with the column the
+	 * index is actually on rather than with a parse of the index's name.
+	 */
 	const scoped = <A>(
 		kind: string,
 		operation: string,
 		organizationId: string,
+		table: PgTable | undefined,
 		work: (transaction: PbxDatabaseTransaction) => Promise<A>,
 	): Effect.Effect<A, PbxFailure> =>
 		Effect.tryPromise({
 			try: async () => await deps.database.withTenantScope(organizationId, work),
-			catch: (cause) => toPbxFailure(kind, operation, cause),
+			catch: (cause) => toPbxFailure(kind, operation, cause, table),
 		});
 
 	/** Publishes after the commit, never inside it — see `routing-cache.publisher.ts`. */
@@ -304,17 +441,23 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 		query: ListQuery,
 	) {
 		const pagination: Pagination = normalizePagination(query);
-		const rows = yield* scoped(resource.kind, "list", organizationId, async (transaction) => {
-			const predicate = listPredicate(resource, query);
-			const base = transaction
-				.select({ row: resource.table, total: windowTotal })
-				.from(resource.table);
-			const filtered = predicate === undefined ? base : base.where(predicate);
-			return await filtered
-				.orderBy(...resource.orderBy.map((column) => asc(column)))
-				.limit(pagination.limit)
-				.offset(pagination.offset);
-		});
+		const rows = yield* scoped(
+			resource.kind,
+			"list",
+			organizationId,
+			resource.table,
+			async (transaction) => {
+				const predicate = listPredicate(resource, query);
+				const base = transaction
+					.select({ row: resource.table, total: windowTotal })
+					.from(resource.table);
+				const filtered = predicate === undefined ? base : base.where(predicate);
+				return await filtered
+					.orderBy(...resource.orderBy.map((column) => asc(column)))
+					.limit(pagination.limit)
+					.offset(pagination.offset);
+			},
+		);
 
 		const total = rows[0]?.total ?? 0;
 		return paged(
@@ -333,6 +476,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 			resource.kind,
 			"get",
 			organizationId,
+			resource.table,
 			async (transaction) => await requireRow(transaction, resource, id),
 		);
 	});
@@ -346,8 +490,15 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 			resource.kind,
 			"create",
 			organizationId,
+			resource.table,
 			async (transaction): Promise<MutationResult<Record<string, unknown>>> => {
-				const row = { ...values, id: newId(), organizationId };
+				// A `null` on a `notNull().default()` column means "use the server default"; dropping the
+				// key is how an INSERT says that. See `withInsertDefaults`.
+				const row = {
+					...withInsertDefaults(resource.table, values),
+					id: newId(),
+					organizationId,
+				};
 				// Guard-then-execute: nothing is written until every destination on the row has been
 				// shape-checked AND proven to resolve, in this transaction.
 				await assertDestinations(transaction, row, resource.destinations);
@@ -377,14 +528,19 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 			resource.kind,
 			"update",
 			organizationId,
+			resource.table,
 			async (transaction): Promise<MutationResult<Record<string, unknown>>> => {
 				const existing = await requireRow(transaction, resource, id);
 				// Destinations are validated against the MERGED row: a PATCH that changes only
 				// `destinationRef` still has to satisfy the trio's existing `destinationType`.
-				await assertDestinations(transaction, { ...existing, ...values }, resource.destinations);
+				await assertDestinations(
+					transaction,
+					mergedForGuards(resource.table, existing, values),
+					resource.destinations,
+				);
 				const updated = await transaction
 					.update(resource.table)
-					.set(values as never)
+					.set(withUpdateDefaults(resource.table, values) as never)
 					.where(eq(rowId(resource), id))
 					.returning();
 				const row = (updated[0] ?? existing) as Record<string, unknown>;
@@ -408,6 +564,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 			resource.kind,
 			"remove",
 			organizationId,
+			resource.table,
 			async (transaction): Promise<MutationResult<{ readonly id: string }>> => {
 				await requireRow(transaction, resource, id);
 				await assertNotReferenced(transaction, resource, id);
@@ -428,14 +585,20 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 		resource: PbxChildResource,
 		parentId: string,
 	) {
-		return yield* scoped(resource.kind, "listChildren", organizationId, async (transaction) => {
-			await requireParent(transaction, resource, parentId);
-			return (await transaction
-				.select()
-				.from(resource.table)
-				.where(eq(resource.parentColumn, parentId))
-				.orderBy(...resource.orderBy.map((column) => asc(column)))) as Record<string, unknown>[];
-		});
+		return yield* scoped(
+			resource.kind,
+			"listChildren",
+			organizationId,
+			resource.table,
+			async (transaction) => {
+				await requireParent(transaction, resource, parentId);
+				return (await transaction
+					.select()
+					.from(resource.table)
+					.where(eq(resource.parentColumn, parentId))
+					.orderBy(...resource.orderBy.map((column) => asc(column)))) as Record<string, unknown>[];
+			},
+		);
 	});
 
 	const createChild = Effect.fn("PbxRepository.createChild")(function* (
@@ -448,10 +611,11 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 			resource.kind,
 			"createChild",
 			organizationId,
+			resource.table,
 			async (transaction): Promise<MutationResult<Record<string, unknown>>> => {
 				await requireParent(transaction, resource, parentId);
 				const row = {
-					...values,
+					...withInsertDefaults(resource.table, values),
 					id: newId(),
 					organizationId,
 					[parentKey(resource)]: parentId,
@@ -483,12 +647,17 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 			resource.kind,
 			"updateChild",
 			organizationId,
+			resource.table,
 			async (transaction): Promise<MutationResult<Record<string, unknown>>> => {
 				const existing = await requireChild(transaction, resource, parentId, id);
-				await assertDestinations(transaction, { ...existing, ...values }, resource.destinations);
+				await assertDestinations(
+					transaction,
+					mergedForGuards(resource.table, existing, values),
+					resource.destinations,
+				);
 				const updated = await transaction
 					.update(resource.table)
-					.set(values as never)
+					.set(withUpdateDefaults(resource.table, values) as never)
 					.where(and(eq(rowId(resource), id), eq(resource.parentColumn, parentId)))
 					.returning();
 				const compiled = await recompileIfNeeded(transaction, organizationId, resource.tableName);
@@ -512,6 +681,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 			resource.kind,
 			"removeChild",
 			organizationId,
+			resource.table,
 			async (transaction): Promise<MutationResult<{ readonly id: string }>> => {
 				await requireChild(transaction, resource, parentId, id);
 				await assertNotReferenced(transaction, resource, id);
@@ -529,11 +699,88 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 		return announce(result);
 	});
 
+	/**
+	 * Rewrites a child collection's ordinals to the order the caller listed its ids in.
+	 *
+	 * Ordinal is **semantics, not decoration** in all three collections that have one: the first
+	 * time-condition rule whose predicates match wins, IVR options are offered in ordinal order, and
+	 * a sequential ring group dials its members in it. So reordering a list of six by PATCHing six
+	 * rows one at a time is not a convenience problem, it is a correctness one — each PATCH
+	 * recompiles, so the five intermediate states are compiled, published to the routing cache, and
+	 * briefly executable, and a client that dies halfway leaves the collection in an order nobody
+	 * chose. Worse, the natural "swap two ordinals" sequence transiently duplicates one.
+	 *
+	 * One statement per row, one transaction, one recompile at the end: the collection is only ever
+	 * observed in the order it started in or the order it was asked for.
+	 *
+	 * The `ids` must be exactly the collection's current membership — a permutation, no more and no
+	 * less. Accepting a subset would mean inventing a rule for where the omitted rows go, and every
+	 * such rule is a silent reordering of rows the caller never mentioned.
+	 */
+	const reorderChildren = Effect.fn("PbxRepository.reorderChildren")(function* (
+		organizationId: string,
+		resource: PbxChildResource,
+		parentId: string,
+		ids: readonly string[],
+	) {
+		const result = yield* scoped(
+			resource.kind,
+			"reorderChildren",
+			organizationId,
+			resource.table,
+			async (transaction): Promise<MutationResult<readonly Record<string, unknown>[]>> => {
+				const ordinalColumn = resource.ordinalColumn;
+				if (ordinalColumn === undefined) {
+					throw new PbxValidationFailure({
+						field: "ids",
+						detail: `${resource.kind} rows have no order to rewrite.`,
+					});
+				}
+
+				await requireParent(transaction, resource, parentId);
+				const existing = (await transaction
+					.select()
+					.from(resource.table)
+					.where(eq(resource.parentColumn, parentId))) as Record<string, unknown>[];
+
+				assertPermutation(
+					resource.kind,
+					existing.map((row) => String(row.id)),
+					ids,
+				);
+
+				// Ordinals are rewritten to 0…n-1 rather than preserving whatever the rows happened to
+				// hold: the point of the endpoint is that the stored order is exactly the sent order,
+				// and reusing the old values would leave gaps that the next insert has to guess around.
+				for (const [index, id] of ids.entries()) {
+					await transaction
+						.update(resource.table)
+						.set({ [columnKey(ordinalColumn)]: index } as never)
+						.where(and(eq(rowId(resource), id), eq(resource.parentColumn, parentId)));
+				}
+
+				const reordered = (await transaction
+					.select()
+					.from(resource.table)
+					.where(eq(resource.parentColumn, parentId))
+					.orderBy(...resource.orderBy.map((column) => asc(column)))) as Record<string, unknown>[];
+				const compiled = await recompileIfNeeded(transaction, organizationId, resource.tableName);
+				return {
+					row: reordered,
+					warnings: compiled?.warnings ?? [],
+					...(compiled === undefined ? {} : { compiled }),
+				};
+			},
+		);
+		return announce(result);
+	});
+
 	const compile = Effect.fn("PbxRepository.compile")(function* (organizationId: string) {
 		return yield* scoped(
 			"routing",
 			"compile",
 			organizationId,
+			undefined,
 			async (transaction) => await compileOnWrite(transaction, organizationId),
 		);
 	});
@@ -572,8 +819,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 
 	/** The camelCase property the parent id is written to, derived from the column's name. */
 	function parentKey(resource: PbxChildResource): string {
-		const name = (resource.parentColumn as unknown as { name: string }).name;
-		return name.replace(/_([a-z])/gu, (_full, letter: string) => letter.toUpperCase());
+		return columnKey(resource.parentColumn);
 	}
 
 	return {
@@ -586,6 +832,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 		createChild,
 		updateChild,
 		removeChild,
+		reorderChildren,
 		compile,
 	};
 }

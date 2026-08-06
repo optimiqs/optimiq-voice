@@ -1,6 +1,6 @@
 import { z } from "zod/v4";
 import { SIP_TRANSPORTS, TRUNK_KINDS } from "@optimiq-voice/pbx-db";
-import { displayName, patchOf } from "../shared/dto";
+import { displayName, patchOf, resettable } from "../shared/dto";
 
 /**
  * `status`, `statusChangedAt`, `statusReason` and `statusLatencyMs` are deliberately absent: they
@@ -16,7 +16,7 @@ export const createTrunkDto = z.strictObject({
 	authUser: z.string().max(128).nullish(),
 	/** Handle into the secret manager; the password never lands in this database. */
 	sipSecretRef: z.string().max(256).nullish(),
-	registerExpiresSeconds: z.int().min(30).max(86_400).optional(),
+	registerExpiresSeconds: resettable(z.int().min(30).max(86_400)),
 	transport: z.enum(SIP_TRANSPORTS).optional(),
 	codecPrefs: z.string().max(128).nullish(),
 	maxChannels: z.int().min(1).max(10_000).nullish(),

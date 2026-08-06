@@ -15,7 +15,9 @@ import { apiFetch } from "../api-client";
 import type { Permission } from "../permissions";
 import type {
 	CompileResult,
+	ConferenceRow,
 	ExtensionRow,
+	FeatureCodeParamFields,
 	FeatureCodeRow,
 	InboundRouteRow,
 	ItemEnvelope,
@@ -24,7 +26,11 @@ import type {
 	MutationEnvelope,
 	OutboundRouteRow,
 	PagedEnvelope,
+	ParkLotRow,
 	PhoneNumberRow,
+	QueueAgentRow,
+	QueueRow,
+	QueueTierRow,
 	RingGroupMemberRow,
 	RingGroupRow,
 	RoutingContext,
@@ -122,7 +128,11 @@ export const PBX_RESOURCES = {
 		path: "/time-conditions",
 		label: "time condition",
 		labelPlural: "Time conditions",
-		permissions: { read: "routes.read", write: "routes.write", delete: "routes.delete" },
+		permissions: {
+			read: "time-conditions.read",
+			write: "time-conditions.write",
+			delete: "time-conditions.delete",
+		},
 		displayName: (row) => row.name,
 	}),
 	featureCodes: descriptor<FeatureCodeRow>({
@@ -130,7 +140,11 @@ export const PBX_RESOURCES = {
 		path: "/feature-codes",
 		label: "feature code",
 		labelPlural: "Feature codes",
-		permissions: { read: "routes.read", write: "routes.write", delete: "routes.delete" },
+		permissions: {
+			read: "feature-codes.read",
+			write: "feature-codes.write",
+			delete: "feature-codes.delete",
+		},
 		displayName: (row) => (row.label ? `${row.code} · ${row.label}` : row.code),
 	}),
 	ivrMenus: descriptor<IvrMenuRow>({
@@ -152,6 +166,51 @@ export const PBX_RESOURCES = {
 			delete: "ring-groups.delete",
 		},
 		displayName: (row) => row.name,
+	}),
+	queues: descriptor<QueueRow>({
+		key: "queues",
+		path: "/queues",
+		label: "queue",
+		labelPlural: "Queues",
+		permissions: { read: "queues.read", write: "queues.write", delete: "queues.delete" },
+		displayName: (row) => row.name,
+	}),
+	/**
+	 * Agents are top-level because `queue_agent` carries no queue — one agent serves several queues
+	 * through a tier. Writing one is `queues.manage-agents`, which is what staffing the floor means
+	 * and is deliberately not the same grant as editing a queue's overflow behaviour.
+	 */
+	queueAgents: descriptor<QueueAgentRow>({
+		key: "queue-agents",
+		path: "/queue-agents",
+		label: "agent",
+		labelPlural: "Queue agents",
+		permissions: {
+			read: "queues.read",
+			write: "queues.manage-agents",
+			delete: "queues.manage-agents",
+		},
+		displayName: (row) => row.name,
+	}),
+	conferences: descriptor<ConferenceRow>({
+		key: "conferences",
+		path: "/conferences",
+		label: "conference",
+		labelPlural: "Conferences",
+		permissions: {
+			read: "conferences.read",
+			write: "conferences.write",
+			delete: "conferences.delete",
+		},
+		displayName: (row) => `${row.roomNumber} · ${row.name}`,
+	}),
+	parkLots: descriptor<ParkLotRow>({
+		key: "park-lots",
+		path: "/park-lots",
+		label: "park lot",
+		labelPlural: "Park lots",
+		permissions: { read: "park-lots.read", write: "park-lots.write", delete: "park-lots.delete" },
+		displayName: (row) => `${row.name} (${row.slotStart}–${row.slotEnd})`,
 	}),
 	voicemailBoxes: descriptor<VoicemailBoxRow>({
 		key: "voicemail-boxes",
@@ -203,6 +262,18 @@ export const PBX_CHILDREN = {
 		label: "rule",
 		parentPath: "/time-conditions",
 		displayName: (row) => row.label ?? `Rule ${row.ordinal + 1}`,
+	}),
+	/**
+	 * Queue tiers have no `ordinal` and therefore no reorder endpoint: a tier's place is
+	 * `(level, position)`, which the caller sets explicitly because it decides who is offered the
+	 * call first. It is routing policy, not a drag handle.
+	 */
+	queueTiers: child<QueueTierRow>({
+		key: "tiers",
+		segment: "tiers",
+		label: "agent",
+		parentPath: "/queues",
+		displayName: (row) => `Level ${row.level}, position ${row.position}`,
 	}),
 } as const;
 
@@ -329,6 +400,36 @@ export async function deletePbxChild<TRow>(
 		`${child.parentPath}/${parentId}/${child.segment}/${id}`,
 		{ method: "DELETE" },
 	);
+}
+
+/**
+ * Rewrites a child collection's order in ONE request.
+ *
+ * The body is the COMPLETE list of ids in their new order, not a moved id and an index: the server
+ * refuses anything that is not an exact permutation, which is what makes a stale editor's reorder a
+ * recoverable 400 instead of a silent scramble. Sending N PATCHes instead would publish N
+ * intermediate orders to the routing cache, each of them briefly executable.
+ *
+ * Returns the collection as the server stored it, so the caller renders that rather than the
+ * optimistic order it sent.
+ */
+export async function reorderPbxChildren<TRow>(
+	child: PbxChildDescriptor<TRow>,
+	parentId: string,
+	ids: readonly string[],
+): Promise<MutationEnvelope<readonly TRow[]>> {
+	return await apiFetch<MutationEnvelope<readonly TRow[]>>(
+		`${child.parentPath}/${parentId}/${child.segment}/reorder`,
+		{ method: "PUT", body: JSON.stringify({ ids }) },
+	);
+}
+
+/** What each feature-code action's `params` accepts. Static per deployment; safe to cache hard. */
+export async function fetchFeatureCodeParamFields(): Promise<FeatureCodeParamFields> {
+	const { data } = await apiFetch<ItemEnvelope<FeatureCodeParamFields>>(
+		"/feature-codes/param-fields",
+	);
+	return data;
 }
 
 // ---------------------------------------------------------------------------------------------

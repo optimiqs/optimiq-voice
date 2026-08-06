@@ -300,6 +300,33 @@ export async function findTrunkReferences(
 }
 
 /**
+ * Feature codes that pin this park lot in `params.lotId`.
+ *
+ * `call-park` may name a specific orbit, and the compiler resolves it (`compile.ts`,
+ * `featureCodeTarget`). The name lives inside a `jsonb` column, so there is no foreign key and the
+ * generic destination scan — which only looks at `<prefix>destination_ref` columns — cannot see it.
+ * Without this, deleting the lot would succeed and the very next save, on an unrelated row, would
+ * fail the recompile with a dangling reference the user could not connect to what they did.
+ */
+export async function findParkLotFeatureCodeReferences(
+	transaction: PbxDatabaseTransaction,
+	parkLotId: string,
+): Promise<readonly EntityReference[]> {
+	const rows = await transaction.execute(sql`
+		select id::text as id, code::text as name
+		from feature_code
+		where params ->> 'lotId' = ${parkLotId}
+		limit 25
+	`);
+	return readRows(rows).map((row) => ({
+		kind: "feature-code",
+		id: String(row.id),
+		name: row.name === null || row.name === undefined ? null : String(row.name),
+		field: "params.lotId",
+	}));
+}
+
+/**
  * Normalizes what `transaction.execute` hands back.
  *
  * drizzle-orm's postgres-js driver returns the driver's own result object, which is array-like but

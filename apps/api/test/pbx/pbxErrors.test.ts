@@ -1,4 +1,5 @@
 import { expect } from "chai";
+import { queue, queueTier } from "@optimiq-voice/pbx-db";
 import {
 	diagnosticField,
 	isPbxFailure,
@@ -42,6 +43,62 @@ describe("pbx failures", () => {
 		const body = failure.toHttpException().getResponse() as Record<string, unknown>;
 		expect(body.code).to.equal("PBX_CONFLICT");
 		expect(body.field).to.equal("number");
+	});
+
+	/**
+	 * The index name is a KEY into the schema, not a string to parse.
+	 *
+	 * `queue_organization_extension_number_key` happens to parse correctly, so it proves nothing on
+	 * its own; `queue_tier_organization_queue_agent_key` is the case that matters — its middle is not
+	 * a column name at all, and the parse would have produced `queueAgent`, a field no form renders.
+	 */
+	it("reads the offending column off the table's own unique index", () => {
+		const failure = toPbxFailure(
+			"queue",
+			"create",
+			{ code: "23505", constraint_name: "queue_organization_extension_number_key" },
+			queue,
+		);
+		const body = failure.toHttpException().getResponse() as Record<string, unknown>;
+		expect(body.field).to.equal("extensionNumber");
+	});
+
+	it("reports a compound index by its first non-tenant column", () => {
+		const failure = toPbxFailure(
+			"queue-tier",
+			"createChild",
+			{ code: "23505", constraint_name: "queue_tier_organization_queue_agent_key" },
+			queueTier,
+		);
+		const body = failure.toHttpException().getResponse() as Record<string, unknown>;
+		expect(body.field).to.equal("queueId");
+	});
+
+	it("falls back to the index-name parse when the schema does not describe the constraint", () => {
+		const failure = toPbxFailure(
+			"extension",
+			"create",
+			{ code: "23505", constraint_name: "extension_organization_number_key" },
+			undefined,
+		);
+		const body = failure.toHttpException().getResponse() as Record<string, unknown>;
+		expect(body.field).to.equal("number");
+	});
+
+	/**
+	 * A check constraint is a statement about the row the caller sent. Reporting it as a 503 told a
+	 * user whose park lot ended before it started that the telephony database was unavailable.
+	 */
+	it("maps a check violation to a 400 rather than a 503", () => {
+		const failure = toPbxFailure("park-lot", "create", {
+			code: "23514",
+			constraint_name: "park_lot_slot_range_check",
+		});
+		const exception = failure.toHttpException();
+		const body = exception.getResponse() as Record<string, unknown>;
+		expect(exception.getStatus()).to.equal(400);
+		expect(body.code).to.equal("PBX_VALIDATION_FAILED");
+		expect(String(body.message)).to.contain("park_lot_slot_range_check");
 	});
 
 	it("finds the driver error through drizzle's wrapper", () => {

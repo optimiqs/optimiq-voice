@@ -1,12 +1,32 @@
 import { BadRequestException } from "@nestjs/common";
 import { expect } from "chai";
+import { FEATURE_CODE_ACTIONS } from "@optimiq-voice/pbx-db";
+import {
+	createConferenceDto,
+	updateConferenceDto,
+} from "../../src/pbx/conferences/conferences.dto";
 import { createExtensionDto, updateExtensionDto } from "../../src/pbx/extensions/extensions.dto";
-import { createFeatureCodeDto } from "../../src/pbx/feature-codes/feature-codes.dto";
+import {
+	createFeatureCodeDto,
+	FEATURE_CODE_PARAM_FIELDS,
+	updateFeatureCodeDto,
+} from "../../src/pbx/feature-codes/feature-codes.dto";
+import { updateIvrMenuDto } from "../../src/pbx/ivr-menus/ivr-menus.dto";
 import { createOutboundRouteDto } from "../../src/pbx/outbound-routes/outbound-routes.dto";
+import { createParkLotDto, updateParkLotDto } from "../../src/pbx/park-lots/park-lots.dto";
 import { createPhoneNumberDto } from "../../src/pbx/phone-numbers/phone-numbers.dto";
-import { parseDto } from "../../src/pbx/shared/dto";
+import {
+	createQueueAgentDto,
+	createQueueTierDto,
+	updateQueueAgentDto,
+	updateQueueDto,
+} from "../../src/pbx/queues/queues.dto";
+import { updateRingGroupDto } from "../../src/pbx/ring-groups/ring-groups.dto";
+import { parseDto, reorderDto } from "../../src/pbx/shared/dto";
 import { listQuerySchema, normalizePagination, paged } from "../../src/pbx/shared/pagination";
 import { createTimeConditionRuleDto } from "../../src/pbx/time-conditions/time-conditions.dto";
+import { updateVoicemailBoxDto } from "../../src/pbx/voicemail-boxes/voicemail-boxes.dto";
+import type { z } from "zod/v4";
 
 /** The edge: what a request body is allowed to say, and what happens when it says something else. */
 describe("pbx DTOs", () => {
@@ -119,6 +139,159 @@ describe("pbx DTOs", () => {
 			expect(
 				createFeatureCodeDto.safeParse({ code: "*97", action: "launch-missiles" }).success,
 			).to.equal(false);
+		});
+
+		it("accepts the one parameter the compiler reads, and only for its action", () => {
+			const lotId = "0193f2aa-0000-7000-8000-000000000001";
+			expect(
+				createFeatureCodeDto.safeParse({ code: "*5", action: "call-park", params: { lotId } })
+					.success,
+			).to.equal(true);
+			// `redial` reads nothing, so a param on it is dead configuration wearing a setting's clothes.
+			expect(
+				createFeatureCodeDto.safeParse({ code: "*69", action: "redial", params: { lotId } })
+					.success,
+			).to.equal(false);
+		});
+
+		it("names the offending parameter, not just 'params'", () => {
+			const result = createFeatureCodeDto.safeParse({
+				code: "*5",
+				action: "call-park",
+				params: { lot_id: "0193f2aa-0000-7000-8000-000000000001" },
+			});
+			expect(result.success).to.equal(false);
+			expect(
+				result.error?.issues.map((issue) => issue.path.join(".")),
+				"the typo must land on the parameter that caused it",
+			).to.include("params.lot_id");
+		});
+
+		it("refuses parameters sent without the action they belong to", () => {
+			const result = updateFeatureCodeDto.safeParse({ params: { lotId: "x" } });
+			expect(result.success).to.equal(false);
+			expect(result.error?.issues.map((issue) => issue.path.join("."))).to.include("action");
+		});
+
+		it("retires the old action's parameters when the action changes", () => {
+			const patched = updateFeatureCodeDto.parse({ action: "redial" }) as Record<string, unknown>;
+			expect(patched.action).to.equal("redial");
+			expect("params" in patched, "a redial row must not keep a park lot").to.equal(true);
+			expect(patched.params).to.equal(null);
+		});
+
+		it("describes every action's parameters so a form can render a control", () => {
+			for (const action of FEATURE_CODE_ACTIONS) {
+				expect(FEATURE_CODE_PARAM_FIELDS[action], action).to.be.an("array");
+			}
+			const park = FEATURE_CODE_PARAM_FIELDS["call-park"];
+			expect(park).to.have.length(1);
+			expect(park[0]?.name).to.equal("lotId");
+			expect(park[0]?.entityType).to.equal("park");
+			// Every other action renders as "no parameters", which is a fact, not a gap.
+			expect(
+				FEATURE_CODE_ACTIONS.filter((action) => FEATURE_CODE_PARAM_FIELDS[action].length > 0),
+			).to.deep.equal(["call-park"]);
+		});
+	});
+
+	/**
+	 * The reset contract.
+	 *
+	 * Every numeric knob backed by a `notNull().default()` column accepts `null`, which the
+	 * repository turns into the column's DEFAULT. If the DTO refused it, a form's "Use default"
+	 * control would have nothing to send and would have to guess the server's number itself — which
+	 * is how a client-side copy of a default drifts.
+	 */
+	describe("null resets a defaulted numeric field", () => {
+		const resettableCases: [string, z.ZodType, Record<string, unknown>, string][] = [
+			["extension.callTimeoutSeconds", updateExtensionDto, {}, "callTimeoutSeconds"],
+			["ring group.ringTimeoutSeconds", updateRingGroupDto, {}, "ringTimeoutSeconds"],
+			["ivr menu.digitTimeoutMs", updateIvrMenuDto, {}, "digitTimeoutMs"],
+			["voicemail box.maxMessages", updateVoicemailBoxDto, {}, "maxMessages"],
+			["queue.maxWaitSeconds", updateQueueDto, {}, "maxWaitSeconds"],
+			["conference.maxMembers", updateConferenceDto, {}, "maxMembers"],
+			["park lot.timeoutSeconds", updateParkLotDto, {}, "timeoutSeconds"],
+		];
+
+		for (const [name, schema, base, field] of resettableCases) {
+			it(`accepts an explicit null for ${name}`, () => {
+				const parsed = schema.parse({ ...base, [field]: null }) as Record<string, unknown>;
+				expect(field in parsed, "the key must survive so the repository can act on it").to.equal(
+					true,
+				);
+				expect(parsed[field]).to.equal(null);
+			});
+		}
+
+		it("still refuses a value outside the column's range", () => {
+			expect(updateQueueDto.safeParse({ maxWaitSeconds: -1 }).success).to.equal(false);
+			expect(updateQueueDto.safeParse({ maxWaitSeconds: 0 }).success).to.equal(true);
+		});
+	});
+
+	describe("reorder", () => {
+		it("takes the complete order and nothing else", () => {
+			const ids = ["0193f2aa-0000-7000-8000-000000000001"];
+			expect(reorderDto.safeParse({ ids }).success).to.equal(true);
+			expect(reorderDto.safeParse({ ids: [] }).success).to.equal(false);
+			expect(reorderDto.safeParse({ ids, from: 0, to: 1 }).success).to.equal(false);
+			expect(reorderDto.safeParse({ ids: ["not-a-uuid"] }).success).to.equal(false);
+		});
+	});
+
+	describe("queues", () => {
+		const extensionId = "0193f2aa-0000-7000-8000-000000000001";
+
+		it("refuses an agent the engine could never dial", () => {
+			expect(createQueueAgentDto.safeParse({ name: "Alice" }).success).to.equal(false);
+			expect(
+				createQueueAgentDto.safeParse({ name: "Alice", contactKind: "extension", extensionId })
+					.success,
+			).to.equal(true);
+			expect(
+				createQueueAgentDto.safeParse({ name: "Sales line", contactKind: "external" }).success,
+			).to.equal(false);
+			expect(
+				createQueueAgentDto.safeParse({
+					name: "Sales line",
+					contactKind: "external",
+					contact: "+12125550100",
+				}).success,
+			).to.equal(true);
+		});
+
+		it("does not re-check reachability on a PATCH that never mentions it", () => {
+			expect(updateQueueAgentDto.safeParse({ name: "Alice N." }).success).to.equal(true);
+		});
+
+		it("takes the queue from the path, never from the tier body", () => {
+			expect(
+				createQueueTierDto.safeParse({ queueAgentId: extensionId, queueId: extensionId }).success,
+			).to.equal(false);
+			expect(createQueueTierDto.safeParse({ queueAgentId: extensionId }).success).to.equal(true);
+		});
+	});
+
+	describe("park lots", () => {
+		it("refuses a slot range that ends before it starts", () => {
+			const base = { name: "Front desk", slotStart: 701, slotEnd: 720 };
+			expect(createParkLotDto.safeParse(base).success).to.equal(true);
+			expect(createParkLotDto.safeParse({ ...base, slotEnd: 700 }).success).to.equal(false);
+			// Equal ends are a one-slot lot, which is a legitimate thing to want.
+			expect(createParkLotDto.safeParse({ ...base, slotEnd: 701 }).success).to.equal(true);
+		});
+	});
+
+	describe("conferences", () => {
+		it("does not let an admin paste a PIN digest into the row", () => {
+			expect(
+				createConferenceDto.safeParse({ name: "Board", roomNumber: "9000", pinHash: "$2b$…" })
+					.success,
+			).to.equal(false);
+			expect(createConferenceDto.safeParse({ name: "Board", roomNumber: "9000" }).success).to.equal(
+				true,
+			);
 		});
 	});
 

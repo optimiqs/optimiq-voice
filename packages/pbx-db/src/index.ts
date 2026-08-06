@@ -40,6 +40,7 @@ export {
 	count,
 	desc,
 	eq,
+	getTableConfig,
 	getTableName,
 	gt,
 	gte,

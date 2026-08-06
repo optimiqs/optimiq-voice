@@ -49,6 +49,7 @@ export const TIME_CONDITION_RULE_RESOURCE: PbxChildResource = {
 	table: timeConditionRule,
 	searchColumns: [],
 	orderBy: [timeConditionRule.ordinal, timeConditionRule.id],
+	ordinalColumn: timeConditionRule.ordinal,
 	enabledColumn: timeConditionRule.enabled,
 	destinations: [],
 	destinationType: null,

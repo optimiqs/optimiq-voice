@@ -1,6 +1,7 @@
 import { expect } from "chai";
 import * as schema from "@optimiq-voice/pbx-db";
 import { DESTINATION_TARGET_TABLES, DESTINATION_TYPES, getTableName } from "@optimiq-voice/pbx-db";
+import { CONFERENCE_RESOURCE } from "../../src/pbx/conferences/conferences.resource";
 import { EXTENSION_RESOURCE } from "../../src/pbx/extensions/extensions.resource";
 import { FEATURE_CODE_RESOURCE } from "../../src/pbx/feature-codes/feature-codes.resource";
 import { INBOUND_ROUTE_RESOURCE } from "../../src/pbx/inbound-routes/inbound-routes.resource";
@@ -9,7 +10,13 @@ import {
 	IVR_MENU_RESOURCE,
 } from "../../src/pbx/ivr-menus/ivr-menus.resource";
 import { OUTBOUND_ROUTE_RESOURCE } from "../../src/pbx/outbound-routes/outbound-routes.resource";
+import { PARK_LOT_RESOURCE } from "../../src/pbx/park-lots/park-lots.resource";
 import { PHONE_NUMBER_RESOURCE } from "../../src/pbx/phone-numbers/phone-numbers.resource";
+import {
+	QUEUE_AGENT_RESOURCE,
+	QUEUE_RESOURCE,
+	QUEUE_TIER_RESOURCE,
+} from "../../src/pbx/queues/queues.resource";
 import {
 	RING_GROUP_DESTINATION_RESOURCE,
 	RING_GROUP_RESOURCE,
@@ -21,7 +28,7 @@ import {
 } from "../../src/pbx/time-conditions/time-conditions.resource";
 import { TRUNK_RESOURCE } from "../../src/pbx/trunks/trunks.resource";
 import { VOICEMAIL_BOX_RESOURCE } from "../../src/pbx/voicemail-boxes/voicemail-boxes.resource";
-import type { PbxResource } from "../../src/pbx/shared/pbx-resource";
+import type { PbxChildResource, PbxResource } from "../../src/pbx/shared/pbx-resource";
 
 /**
  * The declarations, checked against the schema they claim to describe.
@@ -69,8 +76,21 @@ const RESOURCES: readonly PbxResource[] = [
 	IVR_MENU_OPTION_RESOURCE,
 	RING_GROUP_RESOURCE,
 	RING_GROUP_DESTINATION_RESOURCE,
+	QUEUE_RESOURCE,
+	QUEUE_AGENT_RESOURCE,
+	QUEUE_TIER_RESOURCE,
+	CONFERENCE_RESOURCE,
+	PARK_LOT_RESOURCE,
 	FEATURE_CODE_RESOURCE,
 	VOICEMAIL_BOX_RESOURCE,
+];
+
+/** The collections whose order is semantic, and therefore have a `PUT …/reorder`. */
+const CHILD_RESOURCES: readonly PbxChildResource[] = [
+	TIME_CONDITION_RULE_RESOURCE,
+	IVR_MENU_OPTION_RESOURCE,
+	RING_GROUP_DESTINATION_RESOURCE,
+	QUEUE_TIER_RESOURCE,
 ];
 
 describe("PBX resource declarations", () => {
@@ -139,6 +159,43 @@ describe("PBX resource declarations", () => {
 			if (site.nameColumn !== null) {
 				expect(columnNames, `${site.table}.${site.nameColumn}`).to.include(site.nameColumn);
 			}
+		}
+	});
+
+	/**
+	 * A reorder writes `ordinalColumn`, so a descriptor that named a column its table does not have
+	 * would fail at runtime on the first PUT rather than here.
+	 */
+	it("names a real integer column wherever a child collection declares an order", () => {
+		for (const resource of CHILD_RESOURCES) {
+			if (resource.ordinalColumn === undefined) {
+				continue;
+			}
+			const columns = columnsOf(resource.table);
+			const name = (resource.ordinalColumn as unknown as { name: string }).name;
+			expect(
+				Object.values(columns).map((column) => column?.name),
+				`${resource.tableName}.${name}`,
+			).to.include(name);
+			expect(
+				resource.orderBy.at(0),
+				`${resource.kind} must list by the column reorder rewrites`,
+			).to.equal(resource.ordinalColumn);
+		}
+	});
+
+	/**
+	 * Every entity-backed destination type must now have a CRUD slice behind it. `queue`,
+	 * `conference` and `park` were the three that did not, which is why the picker in `apps/web`
+	 * could show them but never populate them.
+	 */
+	it("backs every entity-backed destination type with a resource declaration", () => {
+		const declared = new Set(RESOURCES.map((resource) => resource.destinationType));
+		for (const type of DESTINATION_TYPES) {
+			if (DESTINATION_TARGET_TABLES[type] === null) {
+				continue;
+			}
+			expect(declared.has(type), `no resource declares destinationType "${type}"`).to.equal(true);
 		}
 	});
 

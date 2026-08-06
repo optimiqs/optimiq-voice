@@ -43,10 +43,48 @@ export function parseDto<T extends z.ZodType>(schema: T, value: unknown): z.outp
  * A key that is absent is "leave it alone"; a key present as `null` is "clear it". Zod's
  * `.partial()` gives exactly that distinction, and the repository writes only the keys it is
  * handed — so a partial update never resurrects a default over a value the user set.
+ *
+ * ## What "clear it" means for a column that cannot be null
+ *
+ * Most of the tuning knobs in this area are `notNull().default(n)` in the schema:
+ * `ringTimeoutSeconds`, `maxWaitSeconds`, `wrapUpSeconds`, `maxMessages`, `digitTimeoutMs`. They
+ * are declared here with {@link resettable} (`.nullish()`), so `null` is expressible, and it means
+ * **reset to the server default** rather than NULL — the column refuses NULL, and a form's "Use
+ * default" control has no other way to say what it means. The translation happens once, in
+ * `pbx.repository.ts` (`withInsertDefaults` / `withUpdateDefaults`), driven off the column's own
+ * `notNull`/`hasDefault` flags rather than a list that could fall behind the schema.
+ *
+ * A `null` for a genuinely nullable column still clears to NULL. The two cases are distinguished
+ * by the column, so a DTO author does not have to remember which is which — only to mark a numeric
+ * knob `.nullish()` so the client can send the reset at all.
  */
 export function patchOf<T extends z.ZodObject>(schema: T): z.ZodObject {
 	return schema.partial();
 }
+
+/**
+ * A field whose `null` means "put it back to the server default".
+ *
+ * Every numeric knob backed by a `notNull().default()` column is declared with this, so the reset
+ * is uniformly available and uniformly spelled. It is `.nullish()` and nothing else; the name is
+ * the documentation, and it is what makes "which of these accept a reset?" answerable by grep.
+ */
+export function resettable<T extends z.ZodType>(schema: T) {
+	return schema.nullish();
+}
+
+/**
+ * `PUT …/reorder` — the complete, ordered list of a child collection's ids.
+ *
+ * The whole list rather than a moved id and a target index: the server rewrites ordinals to the
+ * positions given, and a partial instruction would leave it inventing where the rows nobody
+ * mentioned should go. The API refuses anything that is not an exact permutation of the
+ * collection, which also makes a stale client's reorder a 400 it can recover from rather than a
+ * silent scramble.
+ */
+export const reorderDto = z.strictObject({
+	ids: z.array(z.uuid()).min(1).max(500),
+});
 
 // ---------------------------------------------------------------------------------------------
 // Shared field shapes

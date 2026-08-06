@@ -1,6 +1,6 @@
 import { z } from "zod/v4";
 import { ROUTE_MATCH_KINDS, TOLL_CLASSES } from "@optimiq-voice/pbx-db";
-import { displayName, namedDestinationShape, patchOf } from "../shared/dto";
+import { displayName, namedDestinationShape, patchOf, resettable } from "../shared/dto";
 
 /** One trunk in the ordered failover chain. `weight` shares load between equal `order`s. */
 const trunkPriorityEntry = z.strictObject({
@@ -11,11 +11,11 @@ const trunkPriorityEntry = z.strictObject({
 
 export const createOutboundRouteDto = z.strictObject({
 	name: displayName,
-	priority: z.int().min(0).max(10_000).optional(),
+	priority: resettable(z.int().min(0).max(10_000)),
 	matchKind: z.enum(ROUTE_MATCH_KINDS).optional(),
 	/** Ordered alternatives; the first that matches wins. */
 	dialPatterns: z.array(z.string().min(1).max(256)).min(1).max(50),
-	stripDigits: z.int().min(0).max(20).optional(),
+	stripDigits: resettable(z.int().min(0).max(20)),
 	prependDigits: z.string().max(20).nullish(),
 	/**
 	 * Required, never defaulted. An extension may only take this route when its own `tollClass`

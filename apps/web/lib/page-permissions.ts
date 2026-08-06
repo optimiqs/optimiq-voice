@@ -26,7 +26,15 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, PageRequirement>> = {
 	[routes.devices]: { permissions: ["devices.read", "devices.read.own"] },
 	[routes.numbers]: { permissions: ["numbers.read"] },
 	[routes.trunks]: { permissions: ["trunks.read"] },
-	[routes.routing]: { permissions: ["routes.read"] },
+	/**
+	 * Four tabs share this page — inbound, outbound, time conditions, feature codes — and the last
+	 * two now have permissions of their own rather than borrowing `routes.*`. `mode: "any"` is what
+	 * keeps the page reachable for a role granted only one of them; the tab whose list the caller
+	 * cannot read is the API's answer, not this map's.
+	 */
+	[routes.routing]: {
+		permissions: ["routes.read", "time-conditions.read", "feature-codes.read"],
+	},
 	[routes.ivr]: { permissions: ["ivr.read"] },
 	[routes.ringGroups]: { permissions: ["ring-groups.read"] },
 	[routes.queues]: { permissions: ["queues.read"] },

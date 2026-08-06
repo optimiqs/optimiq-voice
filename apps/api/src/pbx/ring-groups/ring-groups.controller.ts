@@ -8,11 +8,12 @@ import {
 	ParseUUIDPipe,
 	Patch,
 	Post,
+	Put,
 	Query,
 } from "@nestjs/common";
 import { RequirePermissions } from "../../auth/require-permissions.decorator";
 import { Session } from "../../auth/session.decorator";
-import { parseDto } from "../shared/dto";
+import { parseDto, reorderDto } from "../shared/dto";
 import { listQuerySchema } from "../shared/pagination";
 import {
 	createRingGroupDestinationDto,
@@ -82,6 +83,23 @@ export class RingGroupsController {
 		@Body() body: unknown,
 	) {
 		return await this.members.create(session, id, parseDto(createRingGroupDestinationDto, body));
+	}
+
+	/**
+	 * Replaces the members' order in one transaction.
+	 *
+	 * `PUT` rather than `PATCH` because the body is the complete order, not a delta — see
+	 * `reorderDto`. A `sequential` group dials in ordinal order, so this is the difference between
+	 * one recompile and N of them, each publishing an order nobody asked for.
+	 */
+	@Put(":id/destinations/reorder")
+	@RequirePermissions("ring-groups.write")
+	async reorderMembers(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+		@Body() body: unknown,
+	) {
+		return await this.members.reorder(session, id, parseDto(reorderDto, body).ids);
 	}
 
 	@Patch(":id/destinations/:destinationId")

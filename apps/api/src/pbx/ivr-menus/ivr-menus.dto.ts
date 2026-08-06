@@ -6,6 +6,7 @@ import {
 	internalNumber,
 	namedDestinationShape,
 	patchOf,
+	resettable,
 } from "../shared/dto";
 
 export const createIvrMenuDto = z.strictObject({
@@ -17,11 +18,11 @@ export const createIvrMenuDto = z.strictObject({
 	shortGreetingPromptId: z.uuid().nullish(),
 	invalidPromptId: z.uuid().nullish(),
 	timeoutPromptId: z.uuid().nullish(),
-	digitTimeoutMs: z.int().min(500).max(60_000).optional(),
-	interDigitTimeoutMs: z.int().min(200).max(30_000).optional(),
-	maxDigits: z.int().min(1).max(10).optional(),
-	maxFailures: z.int().min(1).max(10).optional(),
-	maxTimeouts: z.int().min(1).max(10).optional(),
+	digitTimeoutMs: resettable(z.int().min(500).max(60_000)),
+	interDigitTimeoutMs: resettable(z.int().min(200).max(30_000)),
+	maxDigits: resettable(z.int().min(1).max(10)),
+	maxFailures: resettable(z.int().min(1).max(10)),
+	maxTimeouts: resettable(z.int().min(1).max(10)),
 	/** Allow callers to dial an extension number that is not an explicit option. */
 	directDialEnabled: z.boolean().optional(),
 	...namedDestinationShape("timeout"),

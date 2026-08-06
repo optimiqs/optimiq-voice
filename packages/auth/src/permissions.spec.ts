@@ -60,11 +60,14 @@ describe("PERMISSIONS", () => {
 			"numbers",
 			"trunks",
 			"routes",
+			"time-conditions",
+			"feature-codes",
 			"ivr",
 			"ring-groups",
 			"queues",
 			"voicemail",
 			"conferences",
+			"park-lots",
 			"recordings",
 			"cdr",
 			"settings",
@@ -75,6 +78,34 @@ describe("PERMISSIONS", () => {
 			"secrets",
 		]) {
 			expect(resources).toContain(resource);
+		}
+	});
+
+	/**
+	 * Every CRUD surface `apps/api/src/pbx` exposes must own a read/write/delete trio.
+	 *
+	 * Three of them borrowed `routes.*` while the registry had no entry of their own, which made
+	 * "can edit a dial pattern" and "can move the holiday schedule" the same grant. Naming them is
+	 * the fix, and this test is what stops the next slice from borrowing again.
+	 */
+	it("gives every PBX CRUD resource its own read/write/delete trio", () => {
+		const flat = new Set<string>(PERMISSIONS);
+		for (const resource of [
+			"extensions",
+			"devices",
+			"numbers",
+			"trunks",
+			"routes",
+			"time-conditions",
+			"feature-codes",
+			"ring-groups",
+			"queues",
+			"conferences",
+			"park-lots",
+		]) {
+			for (const action of ["read", "write", "delete"]) {
+				expect(flat.has(`${resource}.${action}`)).toBe(true);
+			}
 		}
 	});
 
@@ -190,6 +221,38 @@ describe("SYSTEM_ROLE_TEMPLATES", () => {
 		for (const permission of user) expect(agent.has(permission)).toBe(true);
 		for (const permission of agent) expect(manager.has(permission)).toBe(true);
 		for (const permission of manager) expect(admin.has(permission)).toBe(true);
+	});
+
+	/**
+	 * A manager runs the phone system day to day, so every telephony CRUD surface has to be
+	 * reachable from that role — otherwise the screens exist and the role that is supposed to use
+	 * them 403s.
+	 */
+	it("lets a manager write every telephony resource the admin UI exposes", () => {
+		const manager = new Set<string>(getSystemRoleTemplate("manager").permissions);
+		for (const permission of [
+			"time-conditions.write",
+			"feature-codes.write",
+			"queues.write",
+			"conferences.write",
+			"park-lots.write",
+			"ring-groups.write",
+			"ivr.write",
+		] as Permission[]) {
+			expect(manager.has(permission)).toBe(true);
+		}
+	});
+
+	/** Deleting telephony configuration stays with an administrator. */
+	it("withholds delete on the new telephony resources from a manager", () => {
+		const manager = new Set<string>(getSystemRoleTemplate("manager").permissions);
+		for (const permission of [
+			"time-conditions.delete",
+			"feature-codes.delete",
+			"park-lots.delete",
+		] as Permission[]) {
+			expect(manager.has(permission)).toBe(false);
+		}
 	});
 
 	it("throws for an unknown role id", () => {

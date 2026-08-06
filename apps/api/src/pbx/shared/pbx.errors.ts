@@ -7,6 +7,8 @@ import {
 	ServiceUnavailableException,
 } from "@nestjs/common";
 import * as Schema from "effect/Schema";
+import { getTableConfig } from "@optimiq-voice/pbx-db";
+import type { PgTable } from "@optimiq-voice/pbx-db";
 import type { Diagnostic } from "@optimiq-voice/routing";
 
 /**
@@ -289,6 +291,8 @@ export function isPbxFailure(value: unknown): value is PbxFailure {
 
 /** Postgres `unique_violation`. */
 const UNIQUE_VIOLATION = "23505";
+/** Postgres `check_violation` — a table-level invariant the row broke. */
+const CHECK_VIOLATION = "23514";
 
 interface PostgresErrorish {
 	readonly code?: string;
@@ -329,8 +333,17 @@ function asPostgresError(value: unknown): PostgresErrorish | undefined {
  *
  * Unique violations become a 409 naming the offending index, because "extension 200 already
  * exists" is a form error the user can act on and a 500 is not.
+ *
+ * `table` is the Drizzle table the statement was aimed at. It is optional only so the mapping can
+ * still be exercised without one; every repository call site passes it, and passing it is what
+ * turns the offending column from a guess into a lookup — see {@link constraintField}.
  */
-export function toPbxFailure(kind: string, operation: string, cause: unknown): PbxFailure {
+export function toPbxFailure(
+	kind: string,
+	operation: string,
+	cause: unknown,
+	table?: PgTable,
+): PbxFailure {
 	if (isPbxFailure(cause)) {
 		return cause;
 	}
@@ -339,8 +352,18 @@ export function toPbxFailure(kind: string, operation: string, cause: unknown): P
 		const constraint = error.constraint_name ?? "unique index";
 		return new PbxConflictFailure({
 			kind,
-			field: constraintField(constraint),
+			field: constraintField(constraint, table),
 			detail: `Another ${kind} in this organization already uses that value (${constraint}).`,
+		});
+	}
+	if (error?.code === CHECK_VIOLATION) {
+		// A check constraint is an invariant about the row the caller sent, not an outage. Reporting
+		// it as a 503 would tell a user whose park lot ends before it starts that the database is
+		// down, and would have them retry the same body until it did not.
+		const constraint = error.constraint_name ?? "a table constraint";
+		return new PbxValidationFailure({
+			field: "",
+			detail: `The values are not a valid ${kind}: they break ${constraint}.`,
 		});
 	}
 	return new PbxDatabaseFailure({
@@ -350,16 +373,61 @@ export function toPbxFailure(kind: string, operation: string, cause: unknown): P
 }
 
 /**
- * Best-effort index-name → form-field mapping.
+ * The form field a unique violation belongs to.
  *
- * The indexes are named `<table>_organization_<column>_key`, so the middle is the column. A guess
- * is better than nothing here: the alternative is a 409 the form cannot attach to any input.
+ * Postgres hands back only the **constraint name**, so something has to turn
+ * `queue_organization_extension_number_key` into `extensionNumber`. Parsing the name was the first
+ * answer and it is not a reliable one: it only works for indexes that happen to follow
+ * `<table>_organization_<column>_key`, it cannot tell a compound index from a single-column one,
+ * and it silently returns "" — a 409 the form can attach to nothing — for every index that
+ * deviates (`park_lot_slot_range_check`, `queue_tier_organization_queue_agent_key`).
+ *
+ * So the name is used as a **key into the schema** instead. `getTableConfig` gives the indexes the
+ * table actually declares, with their real columns; the tenant discriminator is dropped (every
+ * unique index here is `(organization_id, …)`, and "organizationId" is not a field any form
+ * renders) and the first remaining column is the one the user typed into. A compound index reports
+ * its first non-tenant column, which is the one the message reads best against.
+ *
+ * The name parse survives as the fallback for anything the schema does not describe — a constraint
+ * created by a migration and never modelled in Drizzle, say.
  */
-function constraintField(constraint: string): string {
-	const match = /^[a-z_]+?_organization_(?<column>[a-z_]+)_key$/u.exec(constraint);
-	const column = match?.groups?.column;
-	if (column === undefined) {
-		return "";
+function constraintField(constraint: string, table: PgTable | undefined): string {
+	const column = table === undefined ? undefined : uniqueIndexColumn(table, constraint);
+	if (column !== undefined) {
+		return toCamelCase(column);
 	}
+	const match = /^[a-z_]+?_organization_(?<column>[a-z_]+)_key$/u.exec(constraint);
+	const parsed = match?.groups?.column;
+	return parsed === undefined ? "" : toCamelCase(parsed);
+}
+
+/** The first non-tenant column of the named unique index on `table`, or `undefined`. */
+function uniqueIndexColumn(table: PgTable, constraint: string): string | undefined {
+	let config: ReturnType<typeof getTableConfig>;
+	try {
+		config = getTableConfig(table);
+	} catch {
+		return undefined;
+	}
+
+	const indexed = config.indexes.find(
+		(index) => index.config.unique && index.config.name === constraint,
+	);
+	const columns =
+		indexed === undefined
+			? config.uniqueConstraints.find((unique) => unique.name === constraint)?.columns
+			: indexed.config.columns;
+	if (columns === undefined) {
+		return undefined;
+	}
+
+	const names = columns
+		.map((column) => (column as { name?: unknown }).name)
+		.filter((name): name is string => typeof name === "string" && name.length > 0)
+		.filter((name) => name !== "organization_id");
+	return names[0];
+}
+
+function toCamelCase(column: string): string {
 	return column.replace(/_([a-z])/gu, (_full, letter: string) => letter.toUpperCase());
 }

@@ -26,6 +26,7 @@ export const RING_GROUP_DESTINATION_RESOURCE: PbxChildResource = {
 	table: ringGroupDestination,
 	searchColumns: [],
 	orderBy: [ringGroupDestination.ordinal, ringGroupDestination.id],
+	ordinalColumn: ringGroupDestination.ordinal,
 	enabledColumn: ringGroupDestination.enabled,
 	destinations: [{ prefix: "", required: true }],
 	destinationType: null,

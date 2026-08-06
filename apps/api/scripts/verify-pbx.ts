@@ -13,7 +13,7 @@
  *
  * What it proves, in order:
  *
- *  1. CRUD round trips for all eleven T1 resources, including the three child collections.
+ *  1. CRUD round trips for all fourteen T1 resources, including the four child collections.
  *  2. Tenant isolation: a second organization cannot see, read, update or delete the first's rows
  *     — enforced by RLS, not by a `where` clause we could forget.
  *  3. Compile-on-write refuses an unsound configuration with a 422 carrying field-addressable
@@ -21,7 +21,11 @@
  *  4. Compile-on-write persists a configuration that is merely questionable and returns the
  *     warning in the envelope (an empty ring group).
  *  5. A delete that would leave a dangling destination is refused with a 409 naming the referrers.
- *  6. With a broker: the compiled artifact appears in the `routing-cache` KV bucket under the key
+ *  6. The three CRUD surfaces that landed last — queues (with agents and tiers), conferences and
+ *     park lots — are routable: a queue reached through an IVR option compiles and simulates.
+ *  7. `PUT …/reorder` rewrites a child collection's order in ONE transaction, and a `null` on a
+ *     defaulted numeric column resets it to the server's value rather than failing the write.
+ *  8. With a broker: the compiled artifact appears in the `routing-cache` KV bucket under the key
  *     `packages/routing` specifies, and `rpc.routing.v1.resolve` answers over NATS.
  *
  * The NATS half is skipped, loudly, when Docker is unavailable — it spins `nats:2.11-alpine` on an
@@ -161,9 +165,9 @@ function diagnostics(response: JsonResponse): { code?: string; field?: string }[
 	return Array.isArray(value) ? (value as { code?: string; field?: string }[]) : [];
 }
 
-function references(response: JsonResponse): { kind?: string; id?: string }[] {
+function references(response: JsonResponse): { kind?: string; id?: string; field?: string }[] {
 	const value = response.body.references;
-	return Array.isArray(value) ? (value as { kind?: string; id?: string }[]) : [];
+	return Array.isArray(value) ? (value as { kind?: string; id?: string; field?: string }[]) : [];
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -729,6 +733,336 @@ async function main(): Promise<void> {
 			`status ${conflictingCode.status} code ${String(conflictingCode.body.code)}`,
 		);
 
+		// --- 6b. queues, agents and tiers -----------------------------------------------------------
+		console.log("\n6b. queues, agents and tiers");
+		const queue = await clientA("POST", "/api/v1/queues", {
+			name: "Support",
+			extensionNumber: "2100",
+			strategy: "longest-idle",
+			maxWaitSeconds: 300,
+			announcePositionEnabled: true,
+			timeoutDestinationType: "voicemail",
+			timeoutDestinationRef: mailboxId,
+		});
+		const queueId = id(queue);
+		check("create queue -> 201", queue.status === 201, `status ${queue.status}`);
+		check(
+			"the queue kept the values it was given",
+			data(queue).maxWaitSeconds === 300 && data(queue).strategy === "longest-idle",
+			`maxWaitSeconds ${String(data(queue).maxWaitSeconds)}`,
+		);
+
+		const duplicateQueue = await clientA("POST", "/api/v1/queues", { name: "Support" });
+		check(
+			"a duplicate queue name is 409",
+			duplicateQueue.status === 409 && duplicateQueue.body.code === "PBX_CONFLICT",
+			`status ${duplicateQueue.status}`,
+		);
+		check(
+			"the 409 echoes the column the unique index is actually on",
+			duplicateQueue.body.field === "name",
+			`field ${String(duplicateQueue.body.field)}`,
+		);
+
+		const unreachableAgent = await clientA("POST", "/api/v1/queue-agents", { name: "Nobody" });
+		check(
+			"an agent with no way to be dialed is refused at the DTO",
+			unreachableAgent.status === 400,
+			`status ${unreachableAgent.status}`,
+		);
+
+		const agentA = await clientA("POST", "/api/v1/queue-agents", {
+			name: "Ben Okafor",
+			contactKind: "extension",
+			extensionId: extensionBId,
+		});
+		const agentAId = id(agentA);
+		check("create queue agent -> 201", agentA.status === 201, `status ${agentA.status}`);
+
+		const agentB = await clientA("POST", "/api/v1/queue-agents", {
+			name: "Overflow line",
+			contactKind: "external",
+			contact: "+13105550199",
+		});
+		const agentBId = id(agentB);
+		check(
+			"an external agent needs only a dial string",
+			agentB.status === 201,
+			`status ${agentB.status}`,
+		);
+
+		const tierA = await clientA("POST", `/api/v1/queues/${queueId}/tiers`, {
+			queueAgentId: agentAId,
+			level: 1,
+			position: 1,
+		});
+		check("add a queue tier -> 201", tierA.status === 201, `status ${tierA.status}`);
+		await clientA("POST", `/api/v1/queues/${queueId}/tiers`, {
+			queueAgentId: agentBId,
+			level: 2,
+			position: 1,
+		});
+		const tiers = await clientA("GET", `/api/v1/queues/${queueId}/tiers`);
+		check(
+			"the tier list returns both, lowest level first",
+			rows(tiers).length === 2 && rows(tiers)[0]?.level === 1,
+			`${rows(tiers).length} row(s)`,
+		);
+
+		const duplicateTier = await clientA("POST", `/api/v1/queues/${queueId}/tiers`, {
+			queueAgentId: agentAId,
+		});
+		check(
+			"the same agent cannot be tiered into one queue twice",
+			duplicateTier.status === 409,
+			`status ${duplicateTier.status}`,
+		);
+
+		const orphanTier = await clientA(
+			"POST",
+			"/api/v1/queues/019fd3c2-dead-76be-a6b3-b0f1914e39b6/tiers",
+			{ queueAgentId: agentAId },
+		);
+		check(
+			"a tier under an unknown queue is 404",
+			orphanTier.status === 404,
+			`status ${orphanTier.status}`,
+		);
+
+		const tierBAgent = await clientB("POST", "/api/v1/queue-agents", {
+			name: "B's agent",
+			contactKind: "external",
+			contact: "+13105550188",
+		});
+		check("B may create its own agent", tierBAgent.status === 201, `status ${tierBAgent.status}`);
+		const crossTierList = await clientB("GET", `/api/v1/queues/${queueId}/tiers`);
+		check(
+			"B cannot list A's queue tiers",
+			crossTierList.status === 404,
+			`status ${crossTierList.status}`,
+		);
+
+		// --- 6c. conferences and park lots ----------------------------------------------------------
+		console.log("\n6c. conferences and park lots");
+		const conference = await clientA("POST", "/api/v1/conferences", {
+			name: "Standup",
+			roomNumber: "9000",
+			maxMembers: 25,
+		});
+		const conferenceId = id(conference);
+		check("create conference -> 201", conference.status === 201, `status ${conference.status}`);
+
+		const pinAttempt = await clientA("POST", "/api/v1/conferences", {
+			name: "Board",
+			roomNumber: "9001",
+			pinHash: "$2b$10$notahash",
+		});
+		check(
+			"a PIN digest cannot be pasted into a conference row",
+			pinAttempt.status === 400,
+			`status ${pinAttempt.status}`,
+		);
+
+		const badRange = await clientA("POST", "/api/v1/park-lots", {
+			name: "Backwards",
+			slotStart: 720,
+			slotEnd: 701,
+		});
+		check(
+			"a park lot whose range ends before it starts is a 400, not a 503",
+			badRange.status === 400,
+			`status ${badRange.status}`,
+		);
+
+		const parkLot = await clientA("POST", "/api/v1/park-lots", {
+			name: "Front desk",
+			slotStart: 701,
+			slotEnd: 720,
+			timeoutSeconds: 180,
+			timeoutDestinationType: "voicemail",
+			timeoutDestinationRef: mailboxId,
+		});
+		const parkLotId = id(parkLot);
+		check("create park lot -> 201", parkLot.status === 201, `status ${parkLot.status}`);
+
+		// --- 6d. the new entities are routable ------------------------------------------------------
+		console.log("\n6d. a queue, a conference and a park lot as destinations");
+		const queueOption = await clientA("POST", `/api/v1/ivr-menus/${ivrId}/options`, {
+			ordinal: 3,
+			matchValue: "3",
+			label: "Support queue",
+			destinationType: "queue",
+			destinationRef: queueId,
+		});
+		check(
+			"an IVR option may now point at a queue — the destination type finally has a CRUD behind it",
+			queueOption.status === 201,
+			`status ${queueOption.status}`,
+		);
+
+		const conferenceOption = await clientA("POST", `/api/v1/ivr-menus/${ivrId}/options`, {
+			ordinal: 4,
+			matchValue: "4",
+			label: "Standup",
+			destinationType: "conference",
+			destinationRef: conferenceId,
+		});
+		check(
+			"an IVR option may point at a conference",
+			conferenceOption.status === 201,
+			`status ${conferenceOption.status}`,
+		);
+
+		const parkOption = await clientA("POST", `/api/v1/ivr-menus/${ivrId}/options`, {
+			ordinal: 5,
+			matchValue: "5",
+			label: "Park",
+			destinationType: "park",
+			destinationRef: parkLotId,
+		});
+		check(
+			"an IVR option may point at a park lot",
+			parkOption.status === 201,
+			`status ${parkOption.status}`,
+		);
+
+		const parkCode = await clientA("POST", "/api/v1/feature-codes", {
+			code: "*5",
+			action: "call-park",
+			params: { lotId: parkLotId },
+		});
+		check(
+			"a call-park code may pin a lot — the one parameter the compiler reads",
+			parkCode.status === 201,
+			`status ${parkCode.status}`,
+		);
+		const strayParam = await clientA("POST", "/api/v1/feature-codes", {
+			code: "*70",
+			action: "redial",
+			params: { lotId: parkLotId },
+		});
+		check(
+			"a parameter on an action that reads none is refused rather than stored",
+			strayParam.status === 400,
+			`status ${strayParam.status}`,
+		);
+		const paramFields = await clientA("GET", "/api/v1/feature-codes/param-fields");
+		check(
+			"the API describes each action's parameters so a form can render them",
+			paramFields.status === 200 &&
+				Array.isArray((data(paramFields)["call-park"] as unknown[] | undefined) ?? undefined),
+			`status ${paramFields.status}`,
+		);
+
+		const deleteBusyLot = await clientA("DELETE", `/api/v1/park-lots/${parkLotId}`);
+		check(
+			"deleting a lot a feature code pins is 409, not a compile failure two saves later",
+			deleteBusyLot.status === 409 &&
+				references(deleteBusyLot).some((entry) => entry.field === "params.lotId"),
+			`status ${deleteBusyLot.status} ${JSON.stringify(references(deleteBusyLot))}`,
+		);
+
+		// --- 6e. reorder ----------------------------------------------------------------------------
+		console.log("\n6e. PUT …/options/reorder");
+		const optionsBefore = await clientA("GET", `/api/v1/ivr-menus/${ivrId}/options`);
+		const optionIds = rows(optionsBefore).map((row) => String(row.id));
+		check("the menu has four options to reorder", optionIds.length === 4, `${optionIds.length}`);
+
+		const reversed = [...optionIds].reverse();
+		const reordered = await clientA("PUT", `/api/v1/ivr-menus/${ivrId}/options/reorder`, {
+			ids: reversed,
+		});
+		check("reorder -> 200", reordered.status === 200, `status ${reordered.status}`);
+		check(
+			"the reorder returns the collection in the order it was asked for",
+			rows(reordered)
+				.map((row) => String(row.id))
+				.join(",") === reversed.join(","),
+			rows(reordered)
+				.map((row) => String(row.ordinal))
+				.join(","),
+		);
+		check(
+			"ordinals were rewritten to 0…n-1 rather than left with gaps",
+			rows(reordered)
+				.map((row) => Number(row.ordinal))
+				.join(",") === "0,1,2,3",
+			rows(reordered)
+				.map((row) => String(row.ordinal))
+				.join(","),
+		);
+		const optionsAfter = await clientA("GET", `/api/v1/ivr-menus/${ivrId}/options`);
+		check(
+			"a fresh read agrees with what the reorder returned",
+			rows(optionsAfter)
+				.map((row) => String(row.id))
+				.join(",") === reversed.join(","),
+		);
+
+		const shortOrder = await clientA("PUT", `/api/v1/ivr-menus/${ivrId}/options/reorder`, {
+			ids: reversed.slice(0, 2),
+		});
+		check(
+			"a partial order is refused rather than silently moving the rows nobody mentioned",
+			shortOrder.status === 400 && shortOrder.body.code === "PBX_VALIDATION_FAILED",
+			`status ${shortOrder.status} code ${String(shortOrder.body.code)}`,
+		);
+		const duplicatedOrder = await clientA("PUT", `/api/v1/ivr-menus/${ivrId}/options/reorder`, {
+			ids: [reversed[0] as string, ...reversed.slice(1), reversed[0] as string],
+		});
+		check(
+			"an order that repeats an id is refused",
+			duplicatedOrder.status === 400,
+			`status ${duplicatedOrder.status}`,
+		);
+		const stillFour = await clientA("GET", `/api/v1/ivr-menus/${ivrId}/options`);
+		check(
+			"a refused reorder changed nothing",
+			rows(stillFour)
+				.map((row) => String(row.id))
+				.join(",") === reversed.join(","),
+		);
+
+		// --- 6f. null resets a defaulted column -----------------------------------------------------
+		console.log("\n6f. null on a defaulted numeric column means 'use the default'");
+		const beforeReset = await clientA("GET", `/api/v1/queues/${queueId}`);
+		check(
+			"the queue still holds the non-default value it was created with",
+			data(beforeReset).maxWaitSeconds === 300,
+			String(data(beforeReset).maxWaitSeconds),
+		);
+		const reset = await clientA("PATCH", `/api/v1/queues/${queueId}`, { maxWaitSeconds: null });
+		check(
+			"a null on a notNull-with-default column is accepted, not a 503",
+			reset.status === 200,
+			`status ${reset.status}`,
+		);
+		check(
+			"it reset to the schema default (0) rather than writing NULL",
+			data(reset).maxWaitSeconds === 0,
+			String(data(reset).maxWaitSeconds),
+		);
+		const clearNullable = await clientA("PATCH", `/api/v1/queues/${queueId}`, {
+			extensionNumber: null,
+		});
+		check(
+			"a null on a genuinely nullable column still clears to NULL",
+			clearNullable.status === 200 && data(clearNullable).extensionNumber === null,
+			String(data(clearNullable).extensionNumber),
+		);
+
+		const simulateQueue = await clientA("POST", "/api/v1/routing/simulate", {
+			routingContext: "internal",
+			destinationNumber: "*5",
+			callerNumber: "1002",
+			at: "2026-08-05T19:00:00.000Z",
+		});
+		check(
+			"the pinned park lot resolves through its feature code",
+			data(simulateQueue).destinationType === "feature-code",
+			String(data(simulateQueue).destinationType),
+		);
+
 		// --- 7. referenced deletes ------------------------------------------------------------------
 		console.log("\n7. deletes that would leave a dangling pointer");
 		const deleteRingGroup = await clientA("DELETE", `/api/v1/ring-groups/${ringGroupId}`);
@@ -1029,6 +1363,11 @@ async function main(): Promise<void> {
 							"ivr_menu",
 							"ring_group_destination",
 							"ring_group",
+							"queue_tier",
+							"queue_agent",
+							"queue",
+							"park_lot",
+							"conference",
 							"time_condition_rule",
 							"time_condition",
 							"feature_code",

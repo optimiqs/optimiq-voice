@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
 	describeDestination,
 	destinationFieldNames,
+	destinationKind,
 	destinationTarget,
 	EMPTY_DESTINATION,
 	readDestination,
@@ -164,28 +165,49 @@ describe("validateDestinationValue", () => {
 
 describe("selectableDestinationTypes", () => {
 	/**
-	 * `queue`, `conference` and `park` are entity-backed with no CRUD endpoint in P3. Offering them
-	 * would produce a ref the user cannot populate and the compiler rejects as dangling.
+	 * `queue`, `conference` and `park` were entity-backed with no CRUD endpoint, so offering them
+	 * would have produced a ref the user could not populate and the compiler rejects as dangling.
+	 * Their endpoints have landed, so they are offered — and the RULE has not changed: a type is
+	 * offered when, and only when, it has a list behind it.
 	 */
-	it("hides entity types that have no management screen", () => {
+	it("offers every entity type that has a management screen", () => {
 		const offered = selectableDestinationTypes(null);
-		expect(offered).not.toContain("queue");
-		expect(offered).not.toContain("conference");
-		expect(offered).not.toContain("park");
+		expect(offered).toContain("queue");
+		expect(offered).toContain("conference");
+		expect(offered).toContain("park");
 		expect(offered).toContain("extension");
 		expect(offered).toContain("external");
 		expect(offered).toContain("hangup");
 	});
 
-	/** Otherwise an edit would silently re-point a seeded queue destination at whatever is first. */
-	it("keeps the current value selectable even when it is not offered", () => {
+	/**
+	 * The rule itself, stated without naming a type: an entity-backed type with no target is still
+	 * hidden. This is what keeps the next such type from being offered before it can be populated.
+	 */
+	it("still hides an entity type with no target", () => {
+		const offered = selectableDestinationTypes(null);
+		for (const type of offered) {
+			if (destinationKind(type) !== "entity") {
+				continue;
+			}
+			expect(destinationTarget(type)).toBeDefined();
+		}
+	});
+
+	/** Otherwise an edit would silently re-point a destination at whatever is first in the select. */
+	it("keeps the current value selectable", () => {
 		expect(selectableDestinationTypes("queue")).toContain("queue");
 	});
 
 	it("only claims a target for types the picker can actually populate", () => {
 		expect(destinationTarget("extension")?.path).toBe("/extensions");
-		expect(destinationTarget("queue")).toBeUndefined();
+		expect(destinationTarget("queue")?.path).toBe("/queues");
+		expect(destinationTarget("conference")?.path).toBe("/conferences");
+		expect(destinationTarget("park")?.path).toBe("/park-lots");
+		// Value- and terminal-backed types have no row to pick, and never gain one.
 		expect(destinationTarget("external")).toBeUndefined();
+		expect(destinationTarget("application")).toBeUndefined();
+		expect(destinationTarget("hangup")).toBeUndefined();
 	});
 });
 

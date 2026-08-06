@@ -54,6 +54,14 @@ export const PERMISSIONS = [
 	"routes.publish",
 	"routes.simulate",
 
+	"time-conditions.read",
+	"time-conditions.write",
+	"time-conditions.delete",
+
+	"feature-codes.read",
+	"feature-codes.write",
+	"feature-codes.delete",
+
 	// --- Call features -------------------------------------------------------
 	"ivr.read",
 	"ivr.write",
@@ -84,6 +92,10 @@ export const PERMISSIONS = [
 	"conferences.write",
 	"conferences.delete",
 	"conferences.moderate",
+
+	"park-lots.read",
+	"park-lots.write",
+	"park-lots.delete",
 
 	// --- Media, reporting and audit -----------------------------------------
 	"recordings.read",
@@ -314,6 +326,50 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 		],
 	},
 	{
+		resource: "time-conditions",
+		label: "Time conditions",
+		description: "Business-hours and holiday schedules, and the branches they gate.",
+		permissions: [
+			{
+				permission: "time-conditions.read",
+				label: "View time conditions",
+				description: "Inspect schedules, their rules and where each branch goes.",
+			},
+			{
+				permission: "time-conditions.write",
+				label: "Manage time conditions",
+				description: "Create and edit schedules, rules, timezones and no-match branches.",
+			},
+			{
+				permission: "time-conditions.delete",
+				label: "Delete time conditions",
+				description: "Remove a schedule once no route gates on it.",
+			},
+		],
+	},
+	{
+		resource: "feature-codes",
+		label: "Feature codes",
+		description: "The star-code catalogue dialled from a handset.",
+		permissions: [
+			{
+				permission: "feature-codes.read",
+				label: "View feature codes",
+				description: "List the star codes and the action each one runs.",
+			},
+			{
+				permission: "feature-codes.write",
+				label: "Manage feature codes",
+				description: "Create and edit star codes, their actions and their parameters.",
+			},
+			{
+				permission: "feature-codes.delete",
+				label: "Delete feature codes",
+				description: "Remove a star code from the dial plan.",
+			},
+		],
+	},
+	{
 		resource: "ivr",
 		label: "IVR menus",
 		description: "Auto-attendant menus, prompts and their nested options.",
@@ -470,6 +526,28 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 				permission: "conferences.moderate",
 				label: "Moderate conferences",
 				description: "Mute, kick, lock and record a live conference.",
+			},
+		],
+	},
+	{
+		resource: "park-lots",
+		label: "Park lots",
+		description: "Call-park orbits, their slot ranges and their retrieval timeout.",
+		permissions: [
+			{
+				permission: "park-lots.read",
+				label: "View park lots",
+				description: "Inspect park orbits and the slots they occupy.",
+			},
+			{
+				permission: "park-lots.write",
+				label: "Manage park lots",
+				description: "Create and edit park orbits, slot ranges and timeout behaviour.",
+			},
+			{
+				permission: "park-lots.delete",
+				label: "Delete park lots",
+				description: "Remove a park orbit.",
 			},
 		],
 	},
@@ -714,6 +792,8 @@ const AGENT_PERMISSIONS = [
 	"queues.join.own",
 	"queues.monitor",
 	"conferences.read",
+	// An agent parks calls with `*5`, so the lot list has to be readable to render where a call went.
+	"park-lots.read",
 ] as const satisfies readonly Permission[];
 
 const MANAGER_PERMISSIONS = [
@@ -728,6 +808,10 @@ const MANAGER_PERMISSIONS = [
 	"numbers.assign",
 	"routes.read",
 	"routes.simulate",
+	"time-conditions.read",
+	"time-conditions.write",
+	"feature-codes.read",
+	"feature-codes.write",
 	"ivr.read",
 	"ivr.write",
 	"ivr.publish",
@@ -740,6 +824,7 @@ const MANAGER_PERMISSIONS = [
 	"voicemail.listen",
 	"conferences.write",
 	"conferences.moderate",
+	"park-lots.write",
 	"recordings.read",
 	"recordings.download",
 	"cdr.read",

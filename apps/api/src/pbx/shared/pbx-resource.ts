@@ -51,4 +51,14 @@ export interface PbxChildResource extends PbxResource {
 	readonly parentKind: string;
 	/** The parent's table, so the child write can prove the parent exists in this tenant. */
 	readonly parentTable: PgTable;
+	/**
+	 * The column that holds the collection's order, when the order means something.
+	 *
+	 * Its presence is what makes `PUT …/reorder` available: the whole ordered list is rewritten in
+	 * one transaction and recompiled once, rather than as N PATCHes each of which publishes an
+	 * intermediate order to the routing cache. A collection whose order is not semantic (queue
+	 * tiers are ordered by `(level, position)`, which is a routing policy the caller sets
+	 * explicitly, not a drag handle) simply omits it and has no reorder endpoint.
+	 */
+	readonly ordinalColumn?: PgColumn;
 }

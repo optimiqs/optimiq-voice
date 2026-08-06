@@ -8,11 +8,12 @@ import {
 	ParseUUIDPipe,
 	Patch,
 	Post,
+	Put,
 	Query,
 } from "@nestjs/common";
 import { RequirePermissions } from "../../auth/require-permissions.decorator";
 import { Session } from "../../auth/session.decorator";
-import { parseDto } from "../shared/dto";
+import { parseDto, reorderDto } from "../shared/dto";
 import { listQuerySchema } from "../shared/pagination";
 import {
 	createIvrMenuDto,
@@ -81,6 +82,22 @@ export class IvrMenusController {
 		@Body() body: unknown,
 	) {
 		return await this.options.create(session, id, parseDto(createIvrMenuOptionDto, body));
+	}
+
+	/**
+	 * Replaces the options' order in one transaction.
+	 *
+	 * Declared before `:id/options/:optionId` so `reorder` is read as the literal it is rather than
+	 * as an option id — Nest matches routes in declaration order.
+	 */
+	@Put(":id/options/reorder")
+	@RequirePermissions("ivr.write")
+	async reorderOptions(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+		@Body() body: unknown,
+	) {
+		return await this.options.reorder(session, id, parseDto(reorderDto, body).ids);
 	}
 
 	@Patch(":id/options/:optionId")

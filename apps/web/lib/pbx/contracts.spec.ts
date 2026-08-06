@@ -5,6 +5,9 @@ import {
 	DESTINATION_TYPES as SERVER_DESTINATION_TYPES,
 	FEATURE_CODE_ACTIONS as SERVER_FEATURE_CODE_ACTIONS,
 	IVR_OPTION_MATCH_KINDS as SERVER_IVR_OPTION_MATCH_KINDS,
+	QUEUE_AGENT_CONTACT_KINDS as SERVER_QUEUE_AGENT_CONTACT_KINDS,
+	QUEUE_AGENT_STATUSES as SERVER_QUEUE_AGENT_STATUSES,
+	QUEUE_STRATEGIES as SERVER_QUEUE_STRATEGIES,
 	RECORD_POLICIES as SERVER_RECORD_POLICIES,
 	RING_GROUP_STRATEGIES as SERVER_RING_GROUP_STRATEGIES,
 	ROUTE_MATCH_KINDS as SERVER_ROUTE_MATCH_KINDS,
@@ -20,6 +23,9 @@ import {
 	DESTINATION_TYPES,
 	FEATURE_CODE_ACTIONS,
 	IVR_OPTION_MATCH_KINDS,
+	QUEUE_AGENT_CONTACT_KINDS,
+	QUEUE_AGENT_STATUSES,
+	QUEUE_STRATEGIES,
 	RECORD_POLICIES,
 	RING_GROUP_STRATEGIES,
 	ROUTE_MATCH_KINDS,
@@ -30,7 +36,11 @@ import {
 	TRUNK_STATUSES,
 	VOICEMAIL_EMAIL_MODES,
 } from "./contracts";
-import { DESTINATION_TYPE_LABELS, destinationTarget } from "./destinations";
+import {
+	DESTINATION_TYPE_LABELS,
+	destinationTarget,
+	selectableDestinationTypes,
+} from "./destinations";
 
 /**
  * These tests exist to make drift LOUD.
@@ -86,6 +96,20 @@ describe("closed sets mirrored from @optimiq-voice/pbx-db", () => {
 		expect(RING_GROUP_STRATEGIES).toEqual([...SERVER_RING_GROUP_STRATEGIES]);
 	});
 
+	/** Six of them, and the order is the order the strategy select reads. */
+	it("queue strategies match, in order", () => {
+		expect(QUEUE_STRATEGIES).toEqual([...SERVER_QUEUE_STRATEGIES]);
+	});
+
+	/**
+	 * Agent status is what a wallboard colours a tile by, so a missing member is an agent state the
+	 * UI renders as unknown while the engine is acting on it.
+	 */
+	it("queue agent statuses and contact kinds match", () => {
+		expect(QUEUE_AGENT_STATUSES).toEqual([...SERVER_QUEUE_AGENT_STATUSES]);
+		expect(QUEUE_AGENT_CONTACT_KINDS).toEqual([...SERVER_QUEUE_AGENT_CONTACT_KINDS]);
+	});
+
 	it("voicemail email modes match", () => {
 		expect(VOICEMAIL_EMAIL_MODES).toEqual([...SERVER_VOICEMAIL_EMAIL_MODES]);
 	});
@@ -126,14 +150,51 @@ describe("the destination picker's own tables", () => {
 	});
 
 	/**
-	 * The three entity types P3 has no CRUD for. When their endpoints land, this test fails — which
-	 * is the reminder to add them to `DESTINATION_TARGETS` rather than leaving the picker quietly
-	 * unable to point at a queue.
+	 * This test used to record `["queue", "conference", "park"]` — the three entity types P3 had no
+	 * CRUD for — precisely so that it would FAIL when their endpoints landed and force the picker to
+	 * be taught about them. They have landed, so the expectation is now empty: every type the server
+	 * says is entity-backed has a list the picker can page through.
+	 *
+	 * It is kept rather than deleted because the next entity-backed type will arrive the same way,
+	 * and this is what will say so.
 	 */
-	it("records exactly which entity types still have no management screen", () => {
+	it("leaves no entity-backed destination type without a list to pick from", () => {
 		const unbacked = SERVER_DESTINATION_TYPES.filter(
 			(type) => SERVER_TYPE_KINDS[type] === "entity" && destinationTarget(type) === undefined,
 		);
-		expect([...unbacked]).toEqual(["queue", "conference", "park"]);
+		expect([...unbacked]).toEqual([]);
+	});
+
+	/**
+	 * The picker's target must be the list endpoint for the type's OWN table. Pointing `park` at the
+	 * conference list would render a picker full of rows whose ids the compiler then rejects as
+	 * dangling — a mistake no type check can catch, because both are `string`.
+	 */
+	it("points each type at the endpoint for its own table", () => {
+		const expectedPath: Partial<Record<string, string>> = {
+			extension: "/extensions",
+			ivr: "/ivr-menus",
+			"ring-group": "/ring-groups",
+			queue: "/queues",
+			voicemail: "/voicemail-boxes",
+			conference: "/conferences",
+			park: "/park-lots",
+			"time-condition": "/time-conditions",
+		};
+		for (const type of SERVER_DESTINATION_TYPES) {
+			const target = destinationTarget(type);
+			if (target === undefined) {
+				continue;
+			}
+			expect(target.path).toBe(expectedPath[type] as string);
+		}
+	});
+
+	/** A type with a list is offerable; the guard exists for the next one that arrives without. */
+	it("offers every entity-backed type in a fresh picker", () => {
+		const offered = selectableDestinationTypes(null);
+		for (const type of SERVER_DESTINATION_TYPES) {
+			expect(offered).toContain(type);
+		}
 	});
 });

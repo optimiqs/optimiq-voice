@@ -34,6 +34,7 @@ export const IVR_MENU_OPTION_RESOURCE: PbxChildResource = {
 	table: ivrMenuOption,
 	searchColumns: [],
 	orderBy: [ivrMenuOption.ordinal, ivrMenuOption.id],
+	ordinalColumn: ivrMenuOption.ordinal,
 	enabledColumn: ivrMenuOption.enabled,
 	destinations: [{ prefix: "", required: true }],
 	destinationType: null,

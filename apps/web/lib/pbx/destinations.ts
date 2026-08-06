@@ -6,11 +6,12 @@
  * `"timeout"`, `"invalid"`, `"nomatch"`). Eleven trio sites across seven entities all mean the
  * same thing, so the shape of one is described once here and `DestinationPicker` renders it.
  *
- * Three destination types are entity-backed but have **no CRUD endpoint in P3** — `queue`,
- * `conference` and `park`. Offering them in the picker would produce a ref the user cannot
- * populate and the compiler would reject as dangling on the very next save, so they are shown
- * only when a row already carries one (seeded or set by another tool) and never offered as a new
- * choice. See `selectableDestinationTypes`.
+ * Every entity-backed type now has a list endpoint behind it. `queue`, `conference` and `park` did
+ * not until their CRUD landed, and until then offering them here would have produced a ref the user
+ * could not populate and the compiler would have rejected as dangling on the very next save — so
+ * they were shown only when a row already carried one. {@link selectableDestinationTypes} still
+ * enforces that rule; it simply no longer excludes anything, and it is what keeps a future
+ * entity-backed type from being offered before it has somewhere to point.
  */
 
 import { PBX_RESOURCES } from "./client";
@@ -86,13 +87,17 @@ function target<TRow>(resource: PbxResourceDescriptor<TRow>): DestinationTargetR
 
 /**
  * The list endpoint that populates the entity picker for a type, or `undefined` when the type is
- * not entity-backed — or, for `queue` / `conference` / `park`, when its CRUD does not exist yet.
+ * not entity-backed. Every entity-backed type has one; a new one that does not is simply not
+ * offered, rather than offered and unpopulatable.
  */
 const DESTINATION_TARGETS: Partial<Record<DestinationType, DestinationTargetResource>> = {
 	extension: target(PBX_RESOURCES.extensions),
 	ivr: target(PBX_RESOURCES.ivrMenus),
 	"ring-group": target(PBX_RESOURCES.ringGroups),
+	queue: target(PBX_RESOURCES.queues),
 	voicemail: target(PBX_RESOURCES.voicemailBoxes),
+	conference: target(PBX_RESOURCES.conferences),
+	park: target(PBX_RESOURCES.parkLots),
 	"time-condition": target(PBX_RESOURCES.timeConditions),
 };
 

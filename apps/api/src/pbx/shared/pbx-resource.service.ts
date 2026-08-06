@@ -173,4 +173,22 @@ export abstract class PbxChildResourceService {
 		);
 		return { data: result.row, warnings: result.warnings.map(toWireDiagnostic) };
 	}
+
+	/**
+	 * `PUT …/reorder` — the whole ordered list, in one transaction and one recompile.
+	 *
+	 * Returns the collection in its new order rather than just an acknowledgement, so the caller
+	 * renders what the server stored instead of the optimistic order it sent.
+	 */
+	async reorder(
+		session: AppSession,
+		parentId: string,
+		ids: readonly string[],
+	): Promise<MutationEnvelope<readonly Record<string, unknown>[]>> {
+		const organizationId = this.organizationId(session);
+		const result = await runEffect(this.runtime, (repository) =>
+			repository.reorderChildren(organizationId, this.resource, parentId, ids),
+		);
+		return { data: result.row, warnings: result.warnings.map(toWireDiagnostic) };
+	}
 }
