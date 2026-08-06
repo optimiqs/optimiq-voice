@@ -23,18 +23,9 @@
 		},
 		"reason": {
 			"type": "string",
-			"enum": [
-				"message-left",
-				"message-read",
-				"message-deleted",
-				"resync"
-			]
+			"enum": ["message-left", "message-read", "message-deleted", "resync"]
 		}
 	},
-	"required": [
-		"mailboxNumber",
-		"newCount",
-		"savedCount"
-	],
+	"required": ["mailboxNumber", "newCount", "savedCount"],
 	"additionalProperties": false
 }

@@ -19,11 +19,7 @@
 					},
 					"folder": {
 						"type": "string",
-						"enum": [
-							"new",
-							"saved",
-							"deleted"
-						]
+						"enum": ["new", "saved", "deleted"]
 					},
 					"objectKey": {
 						"type": "string",
@@ -49,13 +45,7 @@
 						"maxLength": 128
 					}
 				},
-				"required": [
-					"messageId",
-					"folder",
-					"objectKey",
-					"durationMs",
-					"receivedAt"
-				],
+				"required": ["messageId", "folder", "objectKey", "durationMs", "receivedAt"],
 				"additionalProperties": false
 			}
 		},
@@ -82,12 +72,6 @@
 			"maxLength": 256
 		}
 	},
-	"required": [
-		"found",
-		"messages",
-		"total",
-		"newCount",
-		"savedCount"
-	],
+	"required": ["found", "messages", "total", "newCount", "savedCount"],
 	"additionalProperties": false
 }

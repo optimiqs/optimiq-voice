@@ -24,11 +24,7 @@
 		},
 		"reason": {
 			"type": "string",
-			"enum": [
-				"completed",
-				"cancelled",
-				"failed"
-			]
+			"enum": ["completed", "cancelled", "failed"]
 		},
 		"bytes": {
 			"type": "integer",
@@ -36,12 +32,6 @@
 			"maximum": 9007199254740991
 		}
 	},
-	"required": [
-		"legId",
-		"recordingId",
-		"objectKey",
-		"durationMs",
-		"reason"
-	],
+	"required": ["legId", "recordingId", "objectKey", "durationMs", "reason"],
 	"additionalProperties": false
 }

@@ -24,18 +24,9 @@
 		},
 		"reason": {
 			"type": "string",
-			"enum": [
-				"caller-hangup",
-				"timeout",
-				"overflow",
-				"no-agents"
-			]
+			"enum": ["caller-hangup", "timeout", "overflow", "no-agents"]
 		}
 	},
-	"required": [
-		"callId",
-		"legId",
-		"waitMs"
-	],
+	"required": ["callId", "legId", "waitMs"],
 	"additionalProperties": false
 }

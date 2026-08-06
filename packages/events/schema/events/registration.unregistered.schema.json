@@ -18,13 +18,7 @@
 		},
 		"transport": {
 			"type": "string",
-			"enum": [
-				"udp",
-				"tcp",
-				"tls",
-				"ws",
-				"wss"
-			]
+			"enum": ["udp", "tcp", "tls", "ws", "wss"]
 		},
 		"userAgent": {
 			"type": "string",
@@ -46,19 +40,9 @@
 		},
 		"reason": {
 			"type": "string",
-			"enum": [
-				"client",
-				"admin",
-				"replaced",
-				"gateway-down"
-			]
+			"enum": ["client", "admin", "replaced", "gateway-down"]
 		}
 	},
-	"required": [
-		"aor",
-		"aorHash",
-		"contact",
-		"transport"
-	],
+	"required": ["aor", "aorHash", "contact", "transport"],
 	"additionalProperties": false
 }

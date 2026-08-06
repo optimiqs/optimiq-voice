@@ -27,9 +27,6 @@
 			"maxLength": 64
 		}
 	},
-	"required": [
-		"sourceAddress",
-		"macAddress"
-	],
+	"required": ["sourceAddress", "macAddress"],
 	"additionalProperties": false
 }

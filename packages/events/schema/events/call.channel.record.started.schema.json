@@ -19,21 +19,12 @@
 		},
 		"kind": {
 			"type": "string",
-			"enum": [
-				"call",
-				"voicemail",
-				"conference"
-			]
+			"enum": ["call", "voicemail", "conference"]
 		},
 		"stereo": {
 			"type": "boolean"
 		}
 	},
-	"required": [
-		"legId",
-		"recordingId",
-		"objectKey",
-		"kind"
-	],
+	"required": ["legId", "recordingId", "objectKey", "kind"],
 	"additionalProperties": false
 }

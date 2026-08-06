@@ -12,8 +12,6 @@
 			"maxLength": 64
 		}
 	},
-	"required": [
-		"legId"
-	],
+	"required": ["legId"],
 	"additionalProperties": false
 }

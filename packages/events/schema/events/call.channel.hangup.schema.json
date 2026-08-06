@@ -20,18 +20,9 @@
 		},
 		"side": {
 			"type": "string",
-			"enum": [
-				"caller",
-				"callee",
-				"system"
-			]
+			"enum": ["caller", "callee", "system"]
 		}
 	},
-	"required": [
-		"legId",
-		"cause",
-		"causeCode",
-		"side"
-	],
+	"required": ["legId", "cause", "causeCode", "side"],
 	"additionalProperties": false
 }

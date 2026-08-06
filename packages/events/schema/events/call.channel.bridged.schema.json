@@ -19,19 +19,9 @@
 		},
 		"mode": {
 			"type": "string",
-			"enum": [
-				"full",
-				"signal-only",
-				"bypass-media",
-				"proxy-media"
-			]
+			"enum": ["full", "signal-only", "bypass-media", "proxy-media"]
 		}
 	},
-	"required": [
-		"legId",
-		"peerLegId",
-		"bridgeId",
-		"mode"
-	],
+	"required": ["legId", "peerLegId", "bridgeId", "mode"],
 	"additionalProperties": false
 }

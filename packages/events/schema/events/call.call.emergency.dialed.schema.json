@@ -41,10 +41,6 @@
 			"maxLength": 128
 		}
 	},
-	"required": [
-		"legId",
-		"dialed",
-		"number"
-	],
+	"required": ["legId", "dialed", "number"],
 	"additionalProperties": false
 }

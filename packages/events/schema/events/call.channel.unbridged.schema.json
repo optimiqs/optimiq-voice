@@ -22,10 +22,6 @@
 			"maxLength": 64
 		}
 	},
-	"required": [
-		"legId",
-		"peerLegId",
-		"bridgeId"
-	],
+	"required": ["legId", "peerLegId", "bridgeId"],
 	"additionalProperties": false
 }

@@ -24,21 +24,9 @@
 		},
 		"strategy": {
 			"type": "string",
-			"enum": [
-				"longest-idle",
-				"ring-all",
-				"round-robin",
-				"top-down",
-				"sequential",
-				"random"
-			]
+			"enum": ["longest-idle", "ring-all", "round-robin", "top-down", "sequential", "random"]
 		}
 	},
-	"required": [
-		"callId",
-		"legId",
-		"agentId",
-		"waitMs"
-	],
+	"required": ["callId", "legId", "agentId", "waitMs"],
 	"additionalProperties": false
 }

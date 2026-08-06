@@ -45,9 +45,6 @@
 			"maxLength": 128
 		}
 	},
-	"required": [
-		"agentId",
-		"status"
-	],
+	"required": ["agentId", "status"],
 	"additionalProperties": false
 }

@@ -18,19 +18,9 @@
 		},
 		"source": {
 			"type": "string",
-			"enum": [
-				"rfc2833",
-				"info",
-				"inband",
-				"application"
-			]
+			"enum": ["rfc2833", "info", "inband", "application"]
 		}
 	},
-	"required": [
-		"legId",
-		"digit",
-		"durationMs",
-		"source"
-	],
+	"required": ["legId", "digit", "durationMs", "source"],
 	"additionalProperties": false
 }

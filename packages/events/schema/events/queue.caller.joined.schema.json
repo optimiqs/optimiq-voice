@@ -27,11 +27,6 @@
 			"maxLength": 128
 		}
 	},
-	"required": [
-		"callId",
-		"legId",
-		"position",
-		"priority"
-	],
+	"required": ["callId", "legId", "position", "priority"],
 	"additionalProperties": false
 }

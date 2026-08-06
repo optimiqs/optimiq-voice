@@ -12,11 +12,7 @@
 			"properties": {
 				"type": {
 					"type": "string",
-					"enum": [
-						"user",
-						"api-key",
-						"service"
-					]
+					"enum": ["user", "api-key", "service"]
 				},
 				"id": {
 					"type": "string",
@@ -24,10 +20,7 @@
 					"maxLength": 128
 				}
 			},
-			"required": [
-				"type",
-				"id"
-			],
+			"required": ["type", "id"],
 			"additionalProperties": false
 		},
 		"permissions": {
@@ -54,16 +47,10 @@
 					"maxLength": 128
 				}
 			},
-			"required": [
-				"type"
-			],
+			"required": ["type"],
 			"additionalProperties": false
 		}
 	},
-	"required": [
-		"orgId",
-		"subject",
-		"permissions"
-	],
+	"required": ["orgId", "subject", "permissions"],
 	"additionalProperties": false
 }

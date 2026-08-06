@@ -18,13 +18,7 @@
 		},
 		"transport": {
 			"type": "string",
-			"enum": [
-				"udp",
-				"tcp",
-				"tls",
-				"ws",
-				"wss"
-			]
+			"enum": ["udp", "tcp", "tls", "ws", "wss"]
 		},
 		"userAgent": {
 			"type": "string",
@@ -53,12 +47,6 @@
 			"type": "boolean"
 		}
 	},
-	"required": [
-		"aor",
-		"aorHash",
-		"contact",
-		"transport",
-		"expiresInSeconds"
-	],
+	"required": ["aor", "aorHash", "contact", "transport", "expiresInSeconds"],
 	"additionalProperties": false
 }

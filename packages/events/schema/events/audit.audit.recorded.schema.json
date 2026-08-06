@@ -7,12 +7,7 @@
 			"properties": {
 				"type": {
 					"type": "string",
-					"enum": [
-						"user",
-						"api-key",
-						"service",
-						"system"
-					]
+					"enum": ["user", "api-key", "service", "system"]
 				},
 				"id": {
 					"type": "string",
@@ -31,9 +26,7 @@
 					"maxLength": 512
 				}
 			},
-			"required": [
-				"type"
-			],
+			"required": ["type"],
 			"additionalProperties": false
 		},
 		"action": {
@@ -60,18 +53,12 @@
 					"maxLength": 256
 				}
 			},
-			"required": [
-				"type"
-			],
+			"required": ["type"],
 			"additionalProperties": false
 		},
 		"outcome": {
 			"type": "string",
-			"enum": [
-				"allowed",
-				"denied",
-				"failed"
-			]
+			"enum": ["allowed", "denied", "failed"]
 		},
 		"requestId": {
 			"type": "string",
@@ -96,11 +83,6 @@
 			"maxLength": 512
 		}
 	},
-	"required": [
-		"actor",
-		"action",
-		"resource",
-		"outcome"
-	],
+	"required": ["actor", "action", "resource", "outcome"],
 	"additionalProperties": false
 }

@@ -9,18 +9,11 @@
 		},
 		"leg": {
 			"type": "string",
-			"enum": [
-				"a",
-				"b"
-			]
+			"enum": ["a", "b"]
 		},
 		"direction": {
 			"type": "string",
-			"enum": [
-				"inbound",
-				"outbound",
-				"internal"
-			]
+			"enum": ["inbound", "outbound", "internal"]
 		},
 		"from": {
 			"type": "object",
@@ -35,9 +28,7 @@
 					"maxLength": 128
 				}
 			},
-			"required": [
-				"number"
-			],
+			"required": ["number"],
 			"additionalProperties": false
 		},
 		"to": {
@@ -49,9 +40,7 @@
 					"maxLength": 128
 				}
 			},
-			"required": [
-				"number"
-			],
+			"required": ["number"],
 			"additionalProperties": false
 		},
 		"originatingLegId": {
@@ -72,12 +61,6 @@
 			"maxLength": 64
 		}
 	},
-	"required": [
-		"legId",
-		"leg",
-		"direction",
-		"from",
-		"to"
-	],
+	"required": ["legId", "leg", "direction", "from", "to"],
 	"additionalProperties": false
 }

@@ -43,14 +43,6 @@
 		},
 		"data": {}
 	},
-	"required": [
-		"id",
-		"at",
-		"orgId",
-		"subject",
-		"type",
-		"source",
-		"data"
-	],
+	"required": ["id", "at", "orgId", "subject", "type", "source", "data"],
 	"additionalProperties": false
 }

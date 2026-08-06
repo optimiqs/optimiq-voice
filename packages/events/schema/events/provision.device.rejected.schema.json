@@ -37,9 +37,6 @@
 			"maxLength": 512
 		}
 	},
-	"required": [
-		"sourceAddress",
-		"reason"
-	],
+	"required": ["sourceAddress", "reason"],
 	"additionalProperties": false
 }

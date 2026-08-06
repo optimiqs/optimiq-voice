@@ -14,10 +14,7 @@
 		},
 		"leg": {
 			"type": "string",
-			"enum": [
-				"a",
-				"b"
-			]
+			"enum": ["a", "b"]
 		},
 		"originatingLegId": {
 			"anyOf": [
@@ -45,11 +42,7 @@
 		},
 		"direction": {
 			"type": "string",
-			"enum": [
-				"inbound",
-				"outbound",
-				"internal"
-			]
+			"enum": ["inbound", "outbound", "internal"]
 		},
 		"fromNumber": {
 			"type": "string",
@@ -144,11 +137,7 @@
 			"anyOf": [
 				{
 					"type": "string",
-					"enum": [
-						"caller",
-						"callee",
-						"system"
-					]
+					"enum": ["caller", "callee", "system"]
 				},
 				{
 					"type": "null"

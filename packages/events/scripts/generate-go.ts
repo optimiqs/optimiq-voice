@@ -943,11 +943,30 @@ function gofmt(): void {
 	}
 }
 
+function oxfmtJson(): void {
+	const targets = written
+		.filter((path) => path.endsWith(".json"))
+		.map((path) => join(REPO_ROOT, path));
+	if (targets.length === 0) {
+		return;
+	}
+	try {
+		execFileSync(join(REPO_ROOT, "node_modules", ".bin", "oxfmt"), targets, { stdio: "pipe" });
+	} catch (error) {
+		throw new Error(
+			"oxfmt failed. Codegen always formats its output so that the drift gate compares the " +
+				"same canonical JSON the commit hook produces; re-run after `pnpm install`.\n" +
+				String((error as { stderr?: Buffer }).stderr ?? error),
+		);
+	}
+}
+
 function main(): void {
 	const { eventSchemas, rpcSchemas } = emitJsonSchemas();
 	emitGo(eventSchemas, rpcSchemas);
 	writeJson(join(GO_DIR, "testdata", "parity.json"), parityGolden());
 	gofmt();
+	oxfmtJson();
 
 	process.stdout.write(`events codegen: wrote ${written.length} files\n`);
 	for (const path of written) {

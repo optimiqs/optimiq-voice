@@ -36,13 +36,6 @@
 			"maximum": 9007199254740991
 		}
 	},
-	"required": [
-		"legId",
-		"conferenceId",
-		"roomNumber",
-		"bridgeId",
-		"moderator",
-		"memberCount"
-	],
+	"required": ["legId", "conferenceId", "roomNumber", "bridgeId", "moderator", "memberCount"],
 	"additionalProperties": false
 }

@@ -47,14 +47,6 @@
 			"maximum": 9007199254740991
 		}
 	},
-	"required": [
-		"sourceAddress",
-		"macAddress",
-		"vendor",
-		"model",
-		"deviceId",
-		"templateId",
-		"bytes"
-	],
+	"required": ["sourceAddress", "macAddress", "vendor", "model", "deviceId", "templateId", "bytes"],
 	"additionalProperties": false
 }

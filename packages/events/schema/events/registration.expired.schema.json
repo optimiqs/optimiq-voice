@@ -18,13 +18,7 @@
 		},
 		"transport": {
 			"type": "string",
-			"enum": [
-				"udp",
-				"tcp",
-				"tls",
-				"ws",
-				"wss"
-			]
+			"enum": ["udp", "tcp", "tls", "ws", "wss"]
 		},
 		"userAgent": {
 			"type": "string",
@@ -50,11 +44,6 @@
 			"maximum": 9007199254740991
 		}
 	},
-	"required": [
-		"aor",
-		"aorHash",
-		"contact",
-		"transport"
-	],
+	"required": ["aor", "aorHash", "contact", "transport"],
 	"additionalProperties": false
 }
