@@ -31,13 +31,12 @@ import type { QueueMembership } from "@optimiq-voice/events";
  * control plane that never wrote the entry, and only one of them is fixed by telling people to log
  * in.
  *
- * ## The writer does not exist yet
+ * ## The writer
  *
- * `apps/api` is what should `put` here — inside the same unit of work that writes a `queue_tier` or
- * a `queue_agent` row, exactly as it maintains `did-index` for `phone_number`. That publisher is an
- * explicit follow-up. Until it lands, this reads a bucket only tests and an operator write into,
- * which is why every log line here names the bucket: an empty queue in production will be this, and
- * it should say so.
+ * `apps/api`'s `QueueMembershipPublisher` `put`s here on every `queue`/`queue_agent`/`queue_tier`/
+ * `extension` mutation (whole-org re-projection), exactly as it maintains `did-index` for
+ * `phone_number`; `rebuild:queue-membership` backfills. Every log line here still names the bucket
+ * so an empty queue in production says which projection to check.
  */
 @Injectable()
 export class QueueMembershipSource

@@ -1075,11 +1075,10 @@ async function seedRoutingArtifact(natsUrl: string): Promise<void> {
 		// --- the ACD read models ---------------------------------------------------------------
 		//
 		// Seeded DIRECTLY, exactly as the routing artifact and the DID index are, and for the same
-		// reason: this suite proves the ENGINE consumes the contract. The `queue-membership`
-		// publisher in `apps/api` does not exist yet (it is the explicit follow-up from this wave),
-		// and `agent-state` login/logout is a control-plane surface that does not either — so
-		// writing these by hand is not a shortcut around a component, it is standing in for one that
-		// is not built. When they land, deleting these two blocks is the whole change.
+		// reason: this suite proves the ENGINE consumes the contract. The writers now exist —
+		// `apps/api`'s `QueueMembershipPublisher` and the agent-session endpoints — but this
+		// harness boots only the engine, so hand-writing the buckets stands in for the api
+		// process, not for a missing component. `verify:live` proves the api-side writers.
 		const membership = await connection.jetstream().views.kv(QUEUE_MEMBERSHIP_KV.name);
 		await membership.put(
 			kvKeyFor.queueMembership(ORG_ID, QUEUE_ID),

@@ -1,4 +1,12 @@
-import { AGENT_STATUSES, type AgentStateEntry, type AgentStatus } from "@optimiq-voice/events";
+import {
+	AGENT_STATUSES,
+	ENGINE_DRIVEN_TRANSITIONS,
+	VALID_AGENT_TRANSITIONS,
+	type AgentStateEntry,
+	type AgentStatus,
+} from "@optimiq-voice/events";
+
+export { ENGINE_DRIVEN_TRANSITIONS, VALID_AGENT_TRANSITIONS };
 
 /**
  * The ACD agent state machine — the engine's half of it.
@@ -37,30 +45,12 @@ import { AGENT_STATUSES, type AgentStateEntry, type AgentStatus } from "@optimiq
 export type { AgentStatus };
 
 /**
- * Adjacency of the machine, across both writers.
+ * The adjacency tables live in `@optimiq-voice/events` (`agent-state-machine.ts`) so this process
+ * and the api's session endpoints validate against ONE machine — they are re-exported above for
+ * existing importers. The invariants (logged-out reachable from everywhere, no self-edges,
+ * `ringing` only from `available`, `on-call` only from `ringing`) are pinned by the shared
+ * package's spec; `agent-state.spec.ts` here pins the engine-side split below.
  *
- * Invariants pinned by `agent-state.spec.ts`:
- * 1. `logged-out` is reachable from every state — an agent can always go home, including mid-call
- *    (their leg is torn down by the call, not by this machine).
- * 2. No state lists itself. A re-entry is not a transition and must not produce an `agent.state`
- *    event, because a wallboard reading the stream as a transition log would show a flapping agent.
- * 3. `ringing` is reachable ONLY from `available`. Distribution selects an available agent; there is
- *    no path that starts a ring at somebody on a break, and a machine that allowed one would let a
- *    dropped state update turn into a call at a phone nobody is sitting at.
- * 4. `on-call` is reachable only from `ringing` — a call the engine did not ring for is not a queue
- *    call, and filing it as one would corrupt the agent's handled-call count.
- */
-export const VALID_AGENT_TRANSITIONS = {
-	"logged-out": ["available", "on-break", "unavailable"],
-	available: ["ringing", "wrap-up", "on-break", "unavailable", "logged-out"],
-	ringing: ["on-call", "available", "unavailable", "on-break", "logged-out"],
-	"on-call": ["wrap-up", "available", "unavailable", "logged-out"],
-	"wrap-up": ["available", "on-break", "unavailable", "logged-out"],
-	"on-break": ["available", "unavailable", "logged-out"],
-	unavailable: ["available", "on-break", "logged-out"],
-} as const satisfies Record<AgentStatus, readonly AgentStatus[]>;
-
-/**
  * The transitions THIS process may write.
  *
  * Everything here is a fact the switch observed and nothing else in the system can see:
@@ -77,15 +67,6 @@ export const VALID_AGENT_TRANSITIONS = {
  *
  * `logged-out`, `on-break` and the `unavailable` an agent sets by hand are deliberately absent.
  */
-export const ENGINE_DRIVEN_TRANSITIONS: readonly (readonly [AgentStatus, AgentStatus])[] = [
-	["available", "ringing"],
-	["ringing", "on-call"],
-	["ringing", "available"],
-	["ringing", "unavailable"],
-	["on-call", "wrap-up"],
-	["on-call", "available"],
-	["wrap-up", "available"],
-];
 
 /** Raised when a transition is refused. Carries both ends, so the log says what was attempted. */
 export class InvalidAgentTransitionError extends Error {
