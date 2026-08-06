@@ -45,15 +45,19 @@ import {
 	isWellFormedFeatureCode,
 } from "./feature-codes";
 import {
+	applyDigitManipulation,
 	compilePattern,
+	matchPattern,
 	patternSpecificity,
 	patternSubsumes,
 	validateDigitManipulation,
 } from "./patterns";
 import { planNodeReferences } from "./plan";
+import { checkCallBlock } from "./resolve";
 import {
 	isOptionalSnapshotCollection,
 	SNAPSHOT_COLLECTIONS,
+	tollClassCovers,
 	VOICEMAIL_LEAVE_GREETING_PRECEDENCE,
 } from "./snapshot";
 import { compileTimePredicate, isKnownTimezone, validateTimePredicate } from "./time-conditions";
@@ -81,11 +85,19 @@ import type { Destination } from "./destinations";
 import type { Diagnostic, DiagnosticSubject } from "./diagnostics";
 import type { CompiledFeatureCode } from "./feature-codes";
 import type { CompiledPattern } from "./patterns";
-import type { PlanNode, PlanNodeId, RingGroupMember } from "./plan";
+import type {
+	ExtensionPlanNode,
+	FollowMeDestination,
+	FollowMePlan,
+	PlanNode,
+	PlanNodeId,
+	RingGroupMember,
+} from "./plan";
 import type {
 	CallBlockAction,
 	EmergencyAddressInput,
 	ExtensionInput,
+	FollowMeTargetInput,
 	IvrMenuOptionInput,
 	MohClassInput,
 	OrgRoutingSnapshot,
@@ -277,6 +289,11 @@ class Compiler {
 		const outbound = this.compileOutbound(settings, emergency);
 		const callBlock = this.compileCallBlock();
 		const extensionIndex = this.compileExtensionIndex();
+
+		// LAST of the node passes: a follow-me hop to an external number resolves against the
+		// outbound rules and the call-block table, so both have to exist before it runs. It only
+		// rewrites `extension` nodes that are already in the table, so closure still holds below.
+		this.compileFollowMe(outbound, callBlock);
 
 		this.detectIvrCycles();
 		this.assertNodeClosure();
@@ -804,6 +821,215 @@ class Compiler {
 			return this.extensionNode(internal);
 		}
 		return this.externalNode(target, true);
+	}
+
+	// -------------------------------------------------------------------------------------------
+	// Follow-me
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * Attaches each enabled extension's follow-me ladder to its already-compiled node.
+	 *
+	 * # Why this is a pass and not part of `extensionNode`
+	 *
+	 * A hop to a number outside the organization has to pick a trunk, and the only honest way to
+	 * pick one is the tenant's own outbound match table — the same rules, the same toll-class gate
+	 * and the same call-block screen a user pressing those digits on their desk phone would meet.
+	 * That table is compiled after the entity nodes are, so the ladder is resolved here, once both
+	 * exist, rather than duplicating trunk selection inside the extension node.
+	 *
+	 * # The toll-fraud boundary
+	 *
+	 * A follow-me destination is written by an extension's own user and is validated at write time,
+	 * but "validated" is not "authorised": an extension that may not dial internationally must not
+	 * acquire that ability by typing the number into a forwarding box instead of a keypad. So the
+	 * hop is matched against `outbound.rules` in the artifact's own priority order, refused when
+	 * `tollClassCovers` says the extension does not hold the route's class, refused when the
+	 * organization's outbound kill switch is off, and refused when a call-block rule names it. A
+	 * refused hop keeps its place in the ladder with no `targetNodeId`, which the engine skips and
+	 * the inspector can explain.
+	 *
+	 * # Degradation
+	 *
+	 * A ladder with nothing dialable in it is NOT attached. The extension then rings its own
+	 * endpoint, which is what it did before follow-me was executed at all — strictly better than a
+	 * caller hearing silence because every hop was refused.
+	 */
+	private compileFollowMe(
+		outbound: OutboundMatchTable,
+		callBlock: readonly CompiledCallBlockRule[],
+	): void {
+		for (const extension of sortById(this.snapshot.extensions)) {
+			if (!extension.enabled) {
+				continue;
+			}
+			const config = extension.followMe ?? undefined;
+			if (config === undefined || config.enabled !== true) {
+				continue;
+			}
+			const node = this.nodes.get(`extension:${extension.id}`);
+			if (node === undefined || node.kind !== "extension") {
+				continue;
+			}
+			const subject: DiagnosticSubject = {
+				kind: "extension",
+				id: extension.id,
+				name: extension.number,
+			};
+
+			const destinations: FollowMeDestination[] = [];
+			for (const [index, target] of (config.targets ?? []).entries()) {
+				const hop = this.followMeDestination(
+					extension,
+					target,
+					index,
+					outbound,
+					callBlock,
+					subject,
+				);
+				if (hop !== undefined) {
+					destinations.push(hop);
+				}
+			}
+
+			if (!destinations.some((hop) => hop.targetNodeId !== undefined)) {
+				this.bag.warning(
+					"empty-follow-me",
+					`Extension ${extension.number} has follow-me switched on but no hop that can be dialled; the extension rings its own endpoint instead.`,
+					subject,
+					"followMe.targets",
+				);
+				continue;
+			}
+
+			const followMe: FollowMePlan = {
+				// Derived, because `pbx-db` has no strategy column — see `FollowMePlan.strategy`.
+				strategy: destinations.every((hop) => hop.delaySeconds === 0)
+					? "simultaneous"
+					: "sequential",
+				ignoreBusy: config.ignoreBusy === true,
+				destinations,
+			};
+			this.nodes.set(node.id, compact({ ...node, followMe }) as ExtensionPlanNode);
+		}
+	}
+
+	/** One hop, resolved. `undefined` means the hop is not worth carrying at all. */
+	private followMeDestination(
+		extension: ExtensionInput,
+		target: FollowMeTargetInput,
+		index: number,
+		outbound: OutboundMatchTable,
+		callBlock: readonly CompiledCallBlockRule[],
+		subject: DiagnosticSubject,
+	): FollowMeDestination | undefined {
+		const path = `followMe.targets[${String(index)}]`;
+		const dialString = (target.destination ?? "").trim();
+		if (dialString.length === 0) {
+			this.bag.warning(
+				"unresolvable-follow-me",
+				`Follow-me hop ${String(index + 1)} of extension ${extension.number} has no destination; it was dropped from the ladder.`,
+				subject,
+				path,
+			);
+			return undefined;
+		}
+
+		const hop: FollowMeDestination = {
+			ordinal: index,
+			destination: dialString,
+			delaySeconds: wholeSeconds(target.delaySeconds),
+			timeoutSeconds: wholeSeconds(target.timeoutSeconds),
+			confirmRequired: target.confirm === true,
+		};
+
+		// An internal number wins, for the same reason it wins for forwarding: it stays inside the
+		// PBX, consumes no trunk channel and presents the caller to a colleague rather than a carrier.
+		const internal = this.extensionsByNumber.get(dialString);
+		if (internal !== undefined) {
+			return { ...hop, targetNodeId: this.extensionNode(internal) };
+		}
+
+		const external = this.followMeTrunkTarget(
+			extension,
+			dialString,
+			outbound,
+			callBlock,
+			subject,
+			path,
+		);
+		return external === undefined
+			? hop
+			: { ...hop, targetNodeId: external.nodeId, dialedNumber: external.dialedNumber };
+	}
+
+	/**
+	 * The trunk chain an off-net hop takes, chosen by the tenant's own outbound rules.
+	 *
+	 * Deliberately NOT `resolveOutbound`: that function answers "what should happen to this call",
+	 * which includes the emergency table and time gates, and neither belongs here. A follow-me hop
+	 * is never an emergency call, and a time gate is a fact about when the call arrives that a
+	 * compiler must not read a clock to evaluate. What is shared is everything that decides whether
+	 * the hop may be dialled at all — the rule order, the toll-class gate, the digit manipulation
+	 * and the call-block screen — because those are the fraud boundary.
+	 */
+	private followMeTrunkTarget(
+		extension: ExtensionInput,
+		dialString: string,
+		outbound: OutboundMatchTable,
+		callBlock: readonly CompiledCallBlockRule[],
+		subject: DiagnosticSubject,
+		path: string,
+	): { readonly nodeId: PlanNodeId; readonly dialedNumber: string } | undefined {
+		if (!outbound.enabled) {
+			this.bag.warning(
+				"unresolvable-follow-me",
+				`Follow-me hop "${dialString}" of extension ${extension.number} leaves the organization, whose outbound calling is switched off; the hop is not dialled.`,
+				subject,
+				path,
+			);
+			return undefined;
+		}
+
+		const blocked = checkCallBlock(callBlock, dialString, "outbound");
+		if (blocked !== null && blocked.action !== "allow") {
+			this.bag.warning(
+				"unresolvable-follow-me",
+				`Follow-me hop "${dialString}" of extension ${extension.number} matches call-block rule "${blocked.label ?? blocked.id}" (${blocked.action}); the hop is not dialled.`,
+				subject,
+				path,
+			);
+			return undefined;
+		}
+
+		let denied = false;
+		for (const rule of outbound.rules) {
+			if (!rule.patterns.some((pattern) => matchPattern(pattern, dialString) !== null)) {
+				continue;
+			}
+			if (!tollClassCovers(extension.tollClass, rule.tollClass)) {
+				denied = true;
+				continue;
+			}
+			const dialedNumber = applyDigitManipulation(
+				{ stripDigits: rule.stripDigits, prependDigits: rule.prependDigits ?? null },
+				dialString,
+			);
+			if (dialedNumber === null) {
+				continue;
+			}
+			return { nodeId: rule.destinationNodeId, dialedNumber };
+		}
+
+		this.bag.warning(
+			"unresolvable-follow-me",
+			denied
+				? `Follow-me hop "${dialString}" of extension ${extension.number} only matches outbound routes above the extension's toll class ("${extension.tollClass}"); the hop is not dialled.`
+				: `Follow-me hop "${dialString}" of extension ${extension.number} matches no outbound route; the hop is not dialled.`,
+			subject,
+			path,
+		);
+		return undefined;
 	}
 
 	private ivrNodeById(ref: string, subject: DiagnosticSubject, path: string): PlanNodeId | null {
@@ -2612,6 +2838,17 @@ function outboundSpecificity(rule: OutboundRule): number {
 
 function allowFirst(action: CallBlockAction): number {
 	return action === "allow" ? 0 : 1;
+}
+
+/**
+ * A stored second count, made safe to put in an artifact.
+ *
+ * The follow-me ladder is JSON in a column rather than typed rows, so a negative delay or a
+ * fractional timeout is a shape the database will happily hold. Clamping here means the engine
+ * never has to defend against one on the call path.
+ */
+function wholeSeconds(value: number | undefined): number {
+	return Number.isFinite(value) ? Math.max(0, Math.trunc(value as number)) : 0;
 }
 
 function greetingKey(voicemailBoxId: string, kind: VoicemailGreetingKind): string {

@@ -24,6 +24,8 @@ import type {
 	ConferencePlanNode,
 	ExecutionPlan,
 	ExtensionPlanNode,
+	FollowMeDestination,
+	FollowMePlan,
 	IvrMenuPlanNode,
 	MailboxEntry,
 	PlanNode,
@@ -68,7 +70,9 @@ import type {
  *
  * ## What is real and what is a placeholder
  *
- * Real: `extension`, `ring-group` (both strategies, with lose-race), `ivr-menu` (retries, invalid
+ * Real: `extension` (including its follow-me ladder — both strategies, on-net and off-net hops, the
+ * ladder's own timeouts, and the extension's own no-answer branch behind it), `ring-group` (both
+ * strategies, with lose-race), `ivr-menu` (retries, invalid
  * and timeout branches, submenu recursion), `time-condition`, `trunk-dial` (failover honouring
  * `continueOnCauses`), `external`, `playback`, `hangup`, and `queue` — music on hold, position
  * announcements, all six distribution strategies with tier rules, agent state and wrap-up, delegated
@@ -1032,6 +1036,12 @@ export class PlanWalker {
 		if (node.doNotDisturb) {
 			return this.branch(node.busyNodeId, "USER_BUSY");
 		}
+		// After forward-all and DND, before the endpoint: a ladder REPLACES the plain dial. Both of
+		// the checks above outrank it — a user who has switched everything through to a colleague
+		// or gone on do-not-disturb has said something more specific than "find me".
+		if (node.followMe !== undefined) {
+			return await this.followMeNode(node, node.followMe, input);
+		}
 
 		await this.deps.execute({ verb: "ringing" });
 		this.deps.channel.moveTo("executing");
@@ -1055,6 +1065,153 @@ export class PlanWalker {
 			noAnswerNodeId: node.noAnswerNodeId,
 			notRegisteredNodeId: node.notRegisteredNodeId,
 		});
+	}
+
+	/**
+	 * An extension's follow-me ladder.
+	 *
+	 * ## The two strategies are the ring group's two strategies
+	 *
+	 * Deliberately: a ladder IS a per-user ring group, and giving it a second dialling idiom would
+	 * mean two places to fix the next race condition. `sequential` walks the hops in `ordinal`
+	 * order, honouring each hop's own delay and timeout and stopping on `USER_BUSY` unless the
+	 * ladder says to ignore it. `simultaneous` originates every hop at once and the first answer
+	 * wins; every loser is hung up with `LOSE_RACE` before the winner is bridged, so a mobile that
+	 * picks up a moment late hears the call end rather than being joined to a bridge it did not win.
+	 *
+	 * ## Which strategy is a COMPILER decision
+	 *
+	 * `pbx-db` has no strategy column, so `packages/routing` derives one from the delays and writes
+	 * it into the artifact. The walker reads the field; it does not re-derive it. A second copy of
+	 * that rule here would be a silent divergence the first time either side changed.
+	 *
+	 * ## Off-net hops are ordinary outbound legs
+	 *
+	 * A hop to a mobile carries the `trunk-dial` node its own organization's outbound rules chose
+	 * for it, with the number already through that route's digit manipulation. The toll-class gate,
+	 * the outbound kill switch and the call-block screen were all applied when that node was chosen
+	 * — a hop the compiler refused arrives with no `targetNodeId` and is skipped loudly here. This
+	 * walker never invents a trunk for a follow-me number, which is the whole toll-fraud boundary.
+	 *
+	 * ## Running out of hops is not a new outcome
+	 *
+	 * Every ending — busy, unregistered, nobody home — goes through the extension's OWN three
+	 * branches, so a ladder that finds nobody lands in the same mailbox the unanswered desk phone
+	 * would have.
+	 */
+	private async followMeNode(
+		node: ExtensionPlanNode,
+		followMe: FollowMePlan,
+		input: WalkInput,
+	): Promise<StepResult> {
+		const attempts: DialAttempt[] = [];
+		for (const hop of [...followMe.destinations].sort((a, b) => a.ordinal - b.ordinal)) {
+			const attempt = this.followMeAttempt(node, hop, input);
+			if (attempt !== undefined) {
+				attempts.push(attempt);
+			}
+		}
+
+		if (attempts.length === 0) {
+			this.note(
+				`follow-me for extension ${node.number} has no dialable hop; the extension's no-answer branch was taken`,
+			);
+			return this.branch(node.noAnswerNodeId, "NO_ANSWER");
+		}
+		if (this.abandoned) {
+			return { kind: "aborted" };
+		}
+
+		await this.deps.execute({ verb: "ringing" });
+		this.deps.channel.moveTo("executing");
+
+		const outcome =
+			followMe.strategy === "sequential"
+				? await this.dialSequential(attempts, followMe.ignoreBusy ? [] : ["USER_BUSY"])
+				: await this.dialSimultaneous(attempts, followMeOverallTimeout(attempts));
+
+		return await this.settleDial(outcome, {
+			busyNodeId: node.busyNodeId,
+			noAnswerNodeId: node.noAnswerNodeId,
+			notRegisteredNodeId: node.notRegisteredNodeId,
+		});
+	}
+
+	/** One hop as a leg to originate, or `undefined` when there is nothing dialable behind it. */
+	private followMeAttempt(
+		node: ExtensionPlanNode,
+		hop: FollowMeDestination,
+		input: WalkInput,
+	): DialAttempt | undefined {
+		if (hop.targetNodeId === undefined) {
+			this.note(
+				`follow-me hop "${hop.destination}" of extension ${node.number} was refused by the compiler (no route, no trunk, or the number is barred); it was not rung`,
+			);
+			return undefined;
+		}
+		const target = input.plan.nodes[hop.targetNodeId];
+		if (target === undefined) {
+			this.note(
+				`follow-me hop "${hop.destination}" of extension ${node.number} points at missing node "${hop.targetNodeId}"; it was not rung`,
+			);
+			return undefined;
+		}
+		if (hop.confirmRequired) {
+			this.note(
+				`follow-me hop "${hop.destination}" of extension ${node.number} asks for answer confirmation, which is not implemented yet; the hop was dialled without it`,
+			);
+		}
+
+		const timeoutSeconds =
+			hop.timeoutSeconds || node.timeoutSeconds || this.settings.defaultRingTimeoutSeconds;
+
+		if (target.kind === "extension") {
+			return {
+				endpoint: this.endpointForExtension(target.number),
+				label: `extension ${target.number}`,
+				destinationNumber: target.number,
+				timeoutSeconds,
+				delaySeconds: hop.delaySeconds,
+				callerId: this.callerIdFor(input),
+			};
+		}
+
+		if (target.kind !== "trunk-dial") {
+			this.note(
+				`follow-me hop "${hop.destination}" of extension ${node.number} resolves to a ${target.kind} node, which cannot be dialled as a leg; it was skipped`,
+			);
+			return undefined;
+		}
+
+		// The route's own chain, lowest order first — the same ordering `trunkDialNode` walks. A
+		// racing leg takes the first trunk only: failing over inside one hop of a ladder would
+		// stretch that hop past its own timeout and past the hop behind it.
+		const trunk = [...target.attempts].sort((a, b) => a.order - b.order)[0];
+		if (trunk === undefined) {
+			this.note(
+				`follow-me hop "${hop.destination}" of extension ${node.number} has no usable trunk on route "${target.outboundRouteId}"; it was not rung`,
+			);
+			return undefined;
+		}
+		const number = hop.dialedNumber ?? hop.destination;
+		return {
+			endpoint: this.settings.trunkDialTemplate
+				.replaceAll("{number}", number)
+				.replaceAll("{trunk}", trunk.name),
+			label: `follow-me ${hop.destination}`,
+			destinationNumber: number,
+			timeoutSeconds,
+			delaySeconds: hop.delaySeconds,
+			// The trunk-dial precedence, unchanged: a carrier that will only accept its own ANI wins
+			// over the route's override, which wins over showing the caller who is calling.
+			callerId: composeCallerId(
+				input.callerIdName ?? this.deps.channel.callerIdName,
+				trunk.callerIdNumberOverride ??
+					target.callerIdNumberOverride ??
+					input.callerIdNumber ??
+					this.deps.channel.callerIdNumber,
+			),
+		};
 	}
 
 	/**
@@ -2870,6 +3027,21 @@ export class PlanWalker {
 		this.notes.push(message);
 		this.log(message);
 	}
+}
+
+/**
+ * How long a simultaneous ladder rings before nobody answered.
+ *
+ * The longest hop's own deadline — its delay plus its timeout — rather than a single figure for
+ * the ladder: a hop that starts ten seconds late and rings for twenty has to be allowed its twenty
+ * seconds, and an overall budget shorter than that would cancel the one leg most likely to be a
+ * mobile still waking up.
+ */
+function followMeOverallTimeout(attempts: readonly DialAttempt[]): number {
+	return attempts.reduce(
+		(longest, attempt) => Math.max(longest, attempt.delaySeconds + attempt.timeoutSeconds),
+		1,
+	);
 }
 
 function collectionOf(result: VerbResult): DtmfCollection | undefined {

@@ -117,6 +117,72 @@ export interface ExtensionPlanNode extends PlanNodeBase {
 	readonly busyNodeId?: PlanNodeId;
 	readonly noAnswerNodeId?: PlanNodeId;
 	readonly notRegisteredNodeId?: PlanNodeId;
+	/**
+	 * The follow-me ladder, when the extension has one and it is switched on.
+	 *
+	 * Present means "ring THESE instead of the endpoint" — the ladder REPLACES the plain dial, it
+	 * does not run alongside it. That is the upstream behaviour and the only one that can be
+	 * expressed without inventing a column: a user who wants their desk phone to ring first puts
+	 * their own extension number at the top of the list, which is exactly what the admin UI shows
+	 * them. Absent (the overwhelmingly common case) means the extension rings and nothing else
+	 * changes.
+	 *
+	 * Optional rather than always-present so an old reader ignores it and dials the endpoint, which
+	 * is what every release before this one did.
+	 */
+	readonly followMe?: FollowMePlan;
+}
+
+/**
+ * One hop of a compiled follow-me ladder.
+ *
+ * The dial facts are resolved here rather than at call time because the engine holds no database
+ * handle and no outbound match table: `targetNodeId` names either the `extension` node whose
+ * endpoint to ring, or the `trunk-dial` node whose trunk chain carries the call off-net.
+ *
+ * `targetNodeId` is ABSENT when the compiler could not resolve the hop — no outbound route matched
+ * it, the extension's toll class does not cover the route that did, outbound calling is switched
+ * off for the organization, or a call-block rule refuses the number. A reader skips such a hop; it
+ * is kept in the artifact so the call-flow inspector can show the tenant *which* hop is dead and
+ * the walk's notes can say why it was not rung. Dropping it would make a misconfigured ladder look
+ * like a shorter one.
+ */
+export interface FollowMeDestination {
+	/** Position in the ladder, lowest first. The stored array's index. */
+	readonly ordinal: number;
+	/** The dial string as the tenant configured it. For the log and the inspector, never for matching. */
+	readonly destination: string;
+	readonly delaySeconds: number;
+	readonly timeoutSeconds: number;
+	/** Ask the answering party to press a digit before bridging. Not implemented by the engine yet. */
+	readonly confirmRequired: boolean;
+	/** `extension:<id>` or `trunk-dial:<outboundRouteId>`. Absent means "unresolvable, skip it". */
+	readonly targetNodeId?: PlanNodeId;
+	/**
+	 * External hops only: the number after the matched outbound route's digit manipulation — what
+	 * actually goes on the wire. Internal hops dial the extension node's own `number`.
+	 */
+	readonly dialedNumber?: string;
+}
+
+/**
+ * An extension's follow-me ladder, compiled.
+ *
+ * # `strategy` is derived, not stored
+ *
+ * `pbx-db`'s `follow_me` JSON has no strategy field (`ring_group` does). The compiler reads the
+ * delays as the strategy: every hop at delay zero is `simultaneous` — a ring-all across the
+ * ladder, first answer wins — and any hop with a positive delay is `sequential`, a find-me ladder
+ * walked in order. That is FreeSWITCH's own reading of the same two numbers, and it is the only
+ * one available without a column that does not exist. The derived value is written into the
+ * artifact rather than re-derived by every reader, so the engine executes a decision it can see.
+ */
+export interface FollowMePlan {
+	readonly strategy: RingGroupStrategy;
+	/** A busy hop does not end a sequential ladder. Ignored by `simultaneous`, which races. */
+	readonly ignoreBusy: boolean;
+	/** In `ordinal` order. Never empty in a compiled artifact — an empty ladder is not compiled. */
+	readonly destinations: readonly FollowMeDestination[];
 }
 
 export interface RingGroupMember {
@@ -462,6 +528,10 @@ export function planNodeReferences(node: PlanNode): readonly PlanNodeId[] {
 				node.busyNodeId,
 				node.noAnswerNodeId,
 				node.notRegisteredNodeId,
+				// The ladder's hops are references like any other branch: closure has to hold over
+				// them, and the reachability walk has to reach the trunk-dial node a follow-me hop
+				// is the only path to.
+				...(node.followMe?.destinations ?? []).map((hop) => hop.targetNodeId),
 			]);
 		}
 		case "ring-group": {

@@ -49,6 +49,10 @@ export const DIAGNOSTIC_CODES = [
 	"missing-time-condition",
 	/** An extension's forward destination resolves to nothing dialable. */
 	"unresolvable-forward",
+	/** A follow-me hop resolves to nothing dialable — no route, no trunk, or the number is blocked. */
+	"unresolvable-follow-me",
+	/** Follow-me is switched on for an extension whose ladder has no usable hops. */
+	"empty-follow-me",
 	/** An extension has voicemail enabled but no mailbox exists for it. */
 	"missing-voicemail-box",
 	/** An entity names a music-on-hold class that is not in the snapshot, or is disabled. */

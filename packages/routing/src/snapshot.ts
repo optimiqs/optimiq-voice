@@ -206,6 +206,40 @@ export interface RoutingEntityInput {
 	readonly enabled: boolean;
 }
 
+/**
+ * One hop of an extension's follow-me ladder. Mirrors `pbx-db` `FollowMeTarget` verbatim.
+ *
+ * `destination` is a dial string, not a destination trio, for the same reason the forwarding
+ * columns are: it is what a user types into the "also ring my mobile" box. An internal extension
+ * number wins over an external one, exactly as it does for forwarding.
+ */
+export interface FollowMeTargetInput {
+	readonly destination: string;
+	readonly delaySeconds: number;
+	readonly timeoutSeconds: number;
+	/** Require the answering party to press a digit before the leg is bridged. */
+	readonly confirm?: boolean;
+}
+
+/**
+ * The `extension.follow_me` JSON column. Mirrors `pbx-db` `FollowMeConfig` verbatim.
+ *
+ * # There is no strategy column, so the compiler derives one
+ *
+ * `pbx-db` stores a delay and a timeout per target and nothing that says "ring these together" or
+ * "ring these one after another" — unlike `ring_group`, which has an explicit `strategy`. The
+ * compiler therefore reads the delays as the strategy, which is the reading FreeSWITCH's own
+ * `follow_me` gives them: every target at delay zero rings at once, and the first non-zero delay is
+ * a tenant saying "not yet, ring the desk first". See {@link FollowMePlan.strategy}.
+ */
+export interface FollowMeInput {
+	readonly enabled: boolean;
+	/** A busy target does not end a sequential ladder; the next hop is still tried. */
+	readonly ignoreBusy?: boolean;
+	/** In ladder order. The array IS the order — there is no ordinal column to sort by. */
+	readonly targets: readonly FollowMeTargetInput[];
+}
+
 export interface ExtensionInput extends RoutingEntityInput {
 	readonly number: string;
 	readonly label: string;
@@ -224,6 +258,14 @@ export interface ExtensionInput extends RoutingEntityInput {
 	readonly forwardNoAnswerDestination?: string | null;
 	readonly forwardUnregisteredEnabled: boolean;
 	readonly forwardUnregisteredDestination?: string | null;
+	/**
+	 * The follow-me ladder, if this extension has one.
+	 *
+	 * Optional so this package stays compilable against a loader that does not yet select the
+	 * column — the same rollout rule the optional snapshot collections follow. An extension whose
+	 * ladder is absent behaves exactly as it did before follow-me was compiled at all.
+	 */
+	readonly followMe?: FollowMeInput | null;
 	readonly recordPolicy: RecordPolicy;
 	readonly mohClassId?: string | null;
 	readonly tollClass: TollClass;
