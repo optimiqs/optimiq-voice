@@ -22,6 +22,7 @@ import (
 	"github.com/emiago/sipgo"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/config"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/credentials"
@@ -86,7 +87,7 @@ func run() error {
 		return err
 	}
 
-	credentialStore, err := openCredentialStore(cfg, log)
+	credentialStore, err := openCredentialStore(cfg, conn, log)
 	if err != nil {
 		return err
 	}
@@ -208,24 +209,46 @@ func waitFor(group *sync.WaitGroup, timeout time.Duration) bool {
 	}
 }
 
-func openCredentialStore(cfg config.Config, log *slog.Logger) (credentials.Store, error) {
+func openCredentialStore(cfg config.Config, conn *nats.Conn, log *slog.Logger) (credentials.Store, error) {
 	switch cfg.CredentialSource {
 	case config.CredentialSourceFile:
-		store, err := credentials.NewFileStore(cfg.CredentialsFile)
+		store, err := credentials.NewFileStore(cfg.CredentialsFile, credentials.FileStoreOptions{
+			ProvisionSecretKey: cfg.ProvisionSecretKey,
+		})
 		if err != nil {
 			return nil, err
 		}
 		log.Info("credential store ready",
 			"source", "file", "path", cfg.CredentialsFile, "accounts", store.Len())
 		log.Warn("the file credential store is for development and the SIPp rig only; " +
-			"production uses SIPD_CREDENTIAL_SOURCE=nats once rpc.sip.v1.credential exists")
+			"production uses SIPD_CREDENTIAL_SOURCE=nats")
 		return store, nil
 	case config.CredentialSourceNATS:
-		// Constructing it succeeds and Lookup fails, so a misconfiguration surfaces as a 403 with a
-		// loud log rather than a silent boot into an edge that authenticates nobody.
-		log.Error("SIPD_CREDENTIAL_SOURCE=nats is not implemented yet; every REGISTER will be refused",
-			"error", credentials.ErrNotImplemented)
-		return credentials.NewNATSStore(500 * time.Millisecond), nil
+		store, err := credentials.NewNATSStore(conn, credentials.NATSOptions{
+			Timeout:     cfg.CredentialTimeout,
+			PositiveTTL: cfg.CredentialCacheTTL,
+			NegativeTTL: cfg.CredentialNegativeCacheTTL,
+			MaxEntries:  cfg.CredentialCacheMaxEntries,
+		})
+		if err != nil {
+			return nil, err
+		}
+		// No probe request at boot. A registrar that refused to start because the control plane
+		// was briefly down would turn an API deploy into a SIP outage, and the failure mode
+		// without a probe is already correct: every REGISTER is refused with a logged reason
+		// until the responder answers, and recovers on its own the moment it does.
+		log.Info("credential store ready",
+			"source", "nats",
+			"subject", contract.SubjectSipCredentialRPC,
+			"timeout", cfg.CredentialTimeout,
+			"cacheTtl", cfg.CredentialCacheTTL,
+			"negativeCacheTtl", cfg.CredentialNegativeCacheTTL)
+		if cfg.ProvisionSecretKey != "" {
+			log.Warn("SIPD_PROVISION_SECRET_KEY is set but SIPD_CREDENTIAL_SOURCE=nats does not " +
+				"use it: the API derives every password and ships an ha1. Unset it — the SIP edge " +
+				"should not hold a key that derives every tenant's credential.")
+		}
+		return store, nil
 	default:
 		return nil, fmt.Errorf("unsupported credential source %q", cfg.CredentialSource)
 	}

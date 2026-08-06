@@ -5,7 +5,7 @@ import chaiAsPromised from "chai-as-promised";
 import { createSandbox } from "sinon";
 import sinonChai from "sinon-chai";
 import { getExtendedFieldsHelper } from "@optimiq-voice/sipnet/test/getExtendedFieldsHelper";
-import { TEST_TOKEN } from "@optimiq-voice/sipnet/test/testToken";
+import { createScopedMetadata } from "@optimiq-voice/sipnet/test/testCall";
 import { Domain, DomainExtended, DomainsApi, ListDomainsRequest } from "@optimiq-voice/types";
 
 chai.use(chaiAsPromised);
@@ -20,9 +20,10 @@ describe("@sipnet[resources/listResources]", function () {
 	it("should list sipnet resources", async function () {
 		// Arrange
 		const { listResources } = await import("../src/resources/listResources");
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
-		metadata.set("accesskeyid", "WO00000000000000000000000000000000");
+		// Scoped by the tenancy interceptor (identity-removal Step 3 item 2), not by the caller.
+		const metadata = createScopedMetadata({
+			accessKeyId: "WO00000000000000000000000000000000",
+		});
 
 		const domain = {
 			ref: "123",
@@ -90,11 +91,10 @@ describe("@sipnet[resources/listResources]", function () {
 	it("should paginate through pages when first pages contain items from other customers", async function () {
 		// Arrange
 		const { listResources } = await import("../src/resources/listResources");
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		// Scoped by the tenancy interceptor (identity-removal Step 3 item 2), not by the caller.
 		const currentAccessKeyId = "WO00000000000000000000000000000000";
 		const otherAccessKeyId = "WO11111111111111111111111111111111";
-		metadata.set("accesskeyid", currentAccessKeyId);
+		const metadata = createScopedMetadata({ accessKeyId: currentAccessKeyId });
 
 		// First page: items from other customer
 		const otherCustomerDomain1 = {
@@ -220,10 +220,9 @@ describe("@sipnet[resources/listResources]", function () {
 	it("should NOT return nextPageToken when on the last page (backend returns fewer items than requested)", async function () {
 		// Arrange
 		const { listResources } = await import("../src/resources/listResources");
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		// Scoped by the tenancy interceptor (identity-removal Step 3 item 2), not by the caller.
 		const currentAccessKeyId = "WO00000000000000000000000000000000";
-		metadata.set("accesskeyid", currentAccessKeyId);
+		const metadata = createScopedMetadata({ accessKeyId: currentAccessKeyId });
 
 		// Create 3 items from current customer - this is less than backendRequestedSize (pageSize * 2 = 20)
 		// so it should be detected as the last page
@@ -305,10 +304,9 @@ describe("@sipnet[resources/listResources]", function () {
 	it("should handle empty pageToken and return items when they exist in first page", async function () {
 		// Arrange
 		const { listResources } = await import("../src/resources/listResources");
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		// Scoped by the tenancy interceptor (identity-removal Step 3 item 2), not by the caller.
 		const currentAccessKeyId = "WO00000000000000000000000000000000";
-		metadata.set("accesskeyid", currentAccessKeyId);
+		const metadata = createScopedMetadata({ accessKeyId: currentAccessKeyId });
 
 		const domain = {
 			ref: "123",

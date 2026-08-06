@@ -227,6 +227,14 @@
 			"responseSchema": "rpc/rpc.voicemail.v1.list.response.schema.json",
 			"goRequestType": "VoicemailListRequest",
 			"goResponseType": "VoicemailListResponse"
+		},
+		{
+			"subject": "rpc.sip.v1.credential",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.sip.v1.credential.request.schema.json",
+			"responseSchema": "rpc/rpc.sip.v1.credential.response.schema.json",
+			"goRequestType": "SipCredentialRequest",
+			"goResponseType": "SipCredentialResponse"
 		}
 	]
 }

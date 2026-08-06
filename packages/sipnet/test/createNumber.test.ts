@@ -6,7 +6,7 @@ import { createSandbox } from "sinon";
 import sinonChai from "sinon-chai";
 import { APP_REF_HEADER, ROUTR_DEFAULT_PEER_AOR } from "@optimiq-voice/common";
 import { NumbersApi } from "@optimiq-voice/types";
-import { TEST_TOKEN } from "./testToken";
+import { createScopedMetadata, TEST_ACCESS_KEY_ID } from "./testCall";
 
 chai.use(chaiAsPromised);
 chai.use(sinonChai);
@@ -22,10 +22,9 @@ describe("@sipnet[sipnet/createNumber]", function () {
 	it("should create a number resource", async function () {
 		// Arrange
 		const { createNumber } = await import("../src/numbers/createNumber");
-		const accessKeyId = "GRahn02s8tgdfghz72vb0fz538qpb5z35p";
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
-		metadata.set("accesskeyid", accessKeyId);
+		const accessKeyId = TEST_ACCESS_KEY_ID;
+		// Scoped by the tenancy interceptor (identity-removal Step 3 item 2), not by the caller.
+		const metadata = createScopedMetadata({ accessKeyId });
 
 		const numbers = {
 			createNumber: sandbox.stub().resolves({ ref: "123" }),
@@ -70,8 +69,7 @@ describe("@sipnet[sipnet/createNumber]", function () {
 	it("should throw a validation error if the country ISO code is invalid", async function () {
 		// Arrange
 		const { createNumber } = await import("../src/numbers/createNumber");
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		const metadata = createScopedMetadata();
 
 		const numbers = {
 			createNumber: sandbox.stub().resolves({ ref: "123" }),
@@ -108,8 +106,7 @@ describe("@sipnet[sipnet/createNumber]", function () {
 	it("should throw a validation error if the SIP URI is invalid", async function () {
 		// Arrange
 		const { createNumber } = await import("../src/numbers/createNumber");
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		const metadata = createScopedMetadata();
 
 		const numbers = {
 			createNumber: sandbox.stub().resolves({ ref: "123" }),
@@ -146,8 +143,7 @@ describe("@sipnet[sipnet/createNumber]", function () {
 	it("should throw a precondition error if the appRef does not exist", async function () {
 		// Arrange
 		const { createNumber } = await import("../src/numbers/createNumber");
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		const metadata = createScopedMetadata();
 
 		const numbers = {
 			createNumber: sandbox.stub().resolves({ ref: "123" }),

@@ -50,7 +50,7 @@ func TestFileStoreLoadsPasswordsAndPrecomputedHashes(t *testing.T) {
 		]
 	}`)
 
-	store, err := credentials.NewFileStore(path)
+	store, err := credentials.NewFileStore(path, credentials.FileStoreOptions{})
 	if err != nil {
 		t.Fatalf("NewFileStore: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestFileStoreRealmIsCaseInsensitiveAndUsernameIsNot(t *testing.T) {
 		"realm": "Acme.Example.COM",
 		"accounts": [{"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "username": "Alice", "password": "p"}]
 	}`)
-	store, err := credentials.NewFileStore(path)
+	store, err := credentials.NewFileStore(path, credentials.FileStoreOptions{})
 	if err != nil {
 		t.Fatalf("NewFileStore: %v", err)
 	}
@@ -128,13 +128,13 @@ func TestFileStoreRejectsBadFixturesAtLoad(t *testing.T) {
 
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
-			if _, err := credentials.NewFileStore(writeFixture(t, body)); err == nil {
+			if _, err := credentials.NewFileStore(writeFixture(t, body), credentials.FileStoreOptions{}); err == nil {
 				t.Error("a bad fixture must fail at boot, not at the first REGISTER")
 			}
 		})
 	}
 
-	if _, err := credentials.NewFileStore(filepath.Join(t.TempDir(), "absent.json")); err == nil {
+	if _, err := credentials.NewFileStore(filepath.Join(t.TempDir(), "absent.json"), credentials.FileStoreOptions{}); err == nil {
 		t.Error("a missing file must fail at boot")
 	}
 }
@@ -142,7 +142,7 @@ func TestFileStoreRejectsBadFixturesAtLoad(t *testing.T) {
 func TestFileStoreReloadKeepsTheOldSetOnFailure(t *testing.T) {
 	path := writeFixture(t, `{"realm":"a.example.com","accounts":[
 		{"orgId":"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293","username":"1001","password":"p"}]}`)
-	store, err := credentials.NewFileStore(path)
+	store, err := credentials.NewFileStore(path, credentials.FileStoreOptions{})
 	if err != nil {
 		t.Fatalf("NewFileStore: %v", err)
 	}
@@ -159,10 +159,54 @@ func TestFileStoreReloadKeepsTheOldSetOnFailure(t *testing.T) {
 	}
 }
 
-func TestNATSStoreIsHonestlyUnimplemented(t *testing.T) {
-	store := credentials.NewNATSStore(0)
-	if _, err := store.Lookup(context.Background(), "a.example.com", "1001"); !errors.Is(err, credentials.ErrNotImplemented) {
-		t.Errorf("err = %v, want ErrNotImplemented", err)
+func TestNATSStoreRequiresAConnection(t *testing.T) {
+	// The stub this replaced constructed happily and failed at Lookup, because there was no
+	// transport to require. Now a nil connection is a wiring mistake, and a wiring mistake must
+	// stop the process at boot rather than turn into a 403 per REGISTER.
+	if _, err := credentials.NewNATSStore(nil, credentials.NATSOptions{}); err == nil {
+		t.Error("NewNATSStore(nil) must fail: an edge with no transport authenticates nobody")
+	}
+}
+
+func TestFileStoreDerivesFromASecretRef(t *testing.T) {
+	// The derived form is what makes a development fixture agree with what apps/api would have
+	// rendered for the same line, instead of a literal somebody copied once. It is confined to the
+	// file store because it needs the root key, which production sipd deliberately does not hold.
+	const (
+		key   = "provision-root-key-0123456789abcdef"
+		org   = "018f4f5e-0000-7000-8000-0000000000a1"
+		realm = "acme.example.com"
+		user  = "1001"
+		ref   = "ext/1001/sip"
+	)
+
+	path := writeFixture(t, `{"realm":"`+realm+`","accounts":[
+		{"orgId":"`+org+`","username":"`+user+`","secretRef":"`+ref+`"}
+	]}`)
+
+	store, err := credentials.NewFileStore(path, credentials.FileStoreOptions{ProvisionSecretKey: key})
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+
+	credential, err := store.Lookup(context.Background(), realm, user)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+
+	want, err := credentials.DeriveHA1(key, org, ref, user, realm)
+	if err != nil {
+		t.Fatalf("DeriveHA1: %v", err)
+	}
+	if credential.HA1 != want {
+		t.Errorf("ha1 = %q, want the derived %q", credential.HA1, want)
+	}
+
+	// Without the key the same fixture must refuse to load. Loading it with an empty-key
+	// derivation would produce an account whose password nobody can compute, and the symptom
+	// would be a phone that cannot register for no visible reason.
+	if _, err := credentials.NewFileStore(path, credentials.FileStoreOptions{}); err == nil {
+		t.Error("a secretRef account with no root key must fail at load")
 	}
 }
 
@@ -187,7 +231,8 @@ func TestCredentialValidate(t *testing.T) {
 // The example fixture is what the README tells a newcomer to run with. If it stops loading, the
 // first five minutes of the project are broken, so it is checked here rather than in a comment.
 func TestShippedExampleFixtureLoads(t *testing.T) {
-	store, err := credentials.NewFileStore(filepath.Join("..", "..", "config", "credentials.example.json"))
+	store, err := credentials.NewFileStore(filepath.Join("..", "..", "config", "credentials.example.json"),
+		credentials.FileStoreOptions{})
 	if err != nil {
 		t.Fatalf("config/credentials.example.json does not load: %v", err)
 	}

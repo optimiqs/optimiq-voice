@@ -21,8 +21,8 @@ type CredentialSource string
 const (
 	// CredentialSourceFile reads a static JSON file. Development and the SIPp test rig.
 	CredentialSourceFile CredentialSource = "file"
-	// CredentialSourceNATS resolves credentials over request-reply against apps/api. NOT YET
-	// IMPLEMENTED — see internal/credentials/nats.go.
+	// CredentialSourceNATS resolves credentials over `rpc.sip.v1.credential` request-reply
+	// against apps/api. This is the production source.
 	CredentialSourceNATS CredentialSource = "nats"
 )
 
@@ -76,6 +76,44 @@ type Config struct {
 	CredentialSource CredentialSource
 	CredentialsFile  string
 
+	// CredentialTimeout bounds one `rpc.sip.v1.credential` request.
+	// SIPD_CREDENTIAL_TIMEOUT, default 500ms — the contract's own deadline.
+	//
+	// It sits inside a REGISTER transaction, and a phone's retransmission timer starts at 500 ms,
+	// so a reply slower than that is already competing with the retry it caused. Raising it does
+	// not make a slow control plane work; it makes the edge queue behind one.
+	CredentialTimeout time.Duration
+
+	// CredentialCacheTTL and CredentialNegativeCacheTTL are how long a resolved credential and a
+	// definite refusal are reused. SIPD_CREDENTIAL_CACHE_TTL (default 30s),
+	// SIPD_CREDENTIAL_NEGATIVE_CACHE_TTL (default 10s).
+	//
+	// Short on purpose: the alternative to staleness is an account disabled minutes ago that can
+	// still register. The negative one is what stops a username scanner turning into a query per
+	// guess. Failures are never cached at any TTL.
+	CredentialCacheTTL         time.Duration
+	CredentialNegativeCacheTTL time.Duration
+
+	// CredentialCacheMaxEntries bounds the credential cache.
+	// SIPD_CREDENTIAL_CACHE_MAX_ENTRIES, default 10000.
+	//
+	// An unbounded negative cache keyed on an attacker-supplied username is a memory amplifier:
+	// one map entry per guess, for free.
+	CredentialCacheMaxEntries int
+
+	// ProvisionSecretKey is the provisioning root key, and is normally EMPTY.
+	// SIPD_PROVISION_SECRET_KEY.
+	//
+	// Production sipd never derives a password: `rpc.sip.v1.credential` returns a ready-made HA1
+	// the API derived, precisely so this key stays on the control plane rather than on the most
+	// internet-exposed process in the system. It derives every tenant's password, so an edge that
+	// holds it turns an edge compromise into a total credential compromise.
+	//
+	// It exists for the file store's derived form: a development or SIPp-rig fixture can name an
+	// (orgId, secretRef) pair and get exactly the password apps/api would render, instead of a
+	// copied literal that drifts. See internal/credentials/derive.go.
+	ProvisionSecretKey string
+
 	// UserAgent is the Server/User-Agent header value. SIPD_USER_AGENT, default "optimiq-sipd".
 	UserAgent string
 
@@ -104,12 +142,13 @@ func Load(getenv Getenv) (Config, error) {
 	}
 
 	cfg := Config{
-		ListenAddr:      stringOr(getenv, "SIPD_LISTEN_ADDR", "0.0.0.0:5060"),
-		Realm:           strings.TrimSpace(getenv("SIPD_REALM")),
-		NATSURL:         stringOr(getenv, "NATS_URL", "nats://127.0.0.1:4222"),
-		NonceSecret:     getenv("SIPD_NONCE_SECRET"),
-		CredentialsFile: getenv("SIPD_CREDENTIALS_FILE"),
-		UserAgent:       stringOr(getenv, "SIPD_USER_AGENT", "optimiq-sipd"),
+		ListenAddr:         stringOr(getenv, "SIPD_LISTEN_ADDR", "0.0.0.0:5060"),
+		Realm:              strings.TrimSpace(getenv("SIPD_REALM")),
+		NATSURL:            stringOr(getenv, "NATS_URL", "nats://127.0.0.1:4222"),
+		NonceSecret:        getenv("SIPD_NONCE_SECRET"),
+		CredentialsFile:    getenv("SIPD_CREDENTIALS_FILE"),
+		ProvisionSecretKey: strings.TrimSpace(getenv("SIPD_PROVISION_SECRET_KEY")),
+		UserAgent:          stringOr(getenv, "SIPD_USER_AGENT", "optimiq-sipd"),
 	}
 
 	var err error
@@ -140,6 +179,18 @@ func Load(getenv Getenv) (Config, error) {
 	if cfg.LogLevel, err = levelOr(getenv, "SIPD_LOG_LEVEL", slog.LevelInfo); err != nil {
 		fail("%v", err)
 	}
+	if cfg.CredentialTimeout, err = durationOr(getenv, "SIPD_CREDENTIAL_TIMEOUT", 500*time.Millisecond); err != nil {
+		fail("%v", err)
+	}
+	if cfg.CredentialCacheTTL, err = durationOr(getenv, "SIPD_CREDENTIAL_CACHE_TTL", 30*time.Second); err != nil {
+		fail("%v", err)
+	}
+	if cfg.CredentialNegativeCacheTTL, err = durationOr(getenv, "SIPD_CREDENTIAL_NEGATIVE_CACHE_TTL", 10*time.Second); err != nil {
+		fail("%v", err)
+	}
+	if cfg.CredentialCacheMaxEntries, err = intOr(getenv, "SIPD_CREDENTIAL_CACHE_MAX_ENTRIES", 10_000); err != nil {
+		fail("%v", err)
+	}
 
 	switch source := CredentialSource(stringOr(getenv, "SIPD_CREDENTIAL_SOURCE", string(CredentialSourceFile))); source {
 	case CredentialSourceFile, CredentialSourceNATS:
@@ -160,6 +211,15 @@ func Load(getenv Getenv) (Config, error) {
 	}
 	if cfg.CredentialSource == CredentialSourceFile && cfg.CredentialsFile == "" {
 		fail("SIPD_CREDENTIALS_FILE is required when SIPD_CREDENTIAL_SOURCE=file")
+	}
+	if cfg.CredentialTimeout <= 0 {
+		fail("SIPD_CREDENTIAL_TIMEOUT must be positive")
+	}
+	if cfg.CredentialCacheTTL < 0 || cfg.CredentialNegativeCacheTTL < 0 {
+		fail("the credential cache TTLs must not be negative")
+	}
+	if cfg.CredentialCacheMaxEntries <= 0 {
+		fail("SIPD_CREDENTIAL_CACHE_MAX_ENTRIES must be positive")
 	}
 	// The clamps are only meaningful ordered: min <= default <= max.
 	if cfg.MinExpires > cfg.MaxExpires {
@@ -221,6 +281,18 @@ func secondsOr(getenv Getenv, key string, fallback int) (time.Duration, error) {
 		return 0, fmt.Errorf("%s must be a non-negative whole number of seconds, got %q", key, raw)
 	}
 	return time.Duration(value) * time.Second, nil
+}
+
+func intOr(getenv Getenv, key string, fallback int) (int, error) {
+	raw := strings.TrimSpace(getenv(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback, fmt.Errorf("%s must be a whole number, got %q", key, raw)
+	}
+	return value, nil
 }
 
 func durationOr(getenv Getenv, key string, fallback time.Duration) (time.Duration, error) {

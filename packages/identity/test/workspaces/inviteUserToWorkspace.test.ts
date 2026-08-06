@@ -7,7 +7,7 @@ import sinonChai from "sinon-chai";
 import { Role } from "@optimiq-voice/types";
 import { Database } from "../../src/db";
 import { IdentityConfig } from "../../src/exchanges/types";
-import { TEST_PRIVATE_KEY, TEST_TOKEN, TEST_UUID } from "../utils";
+import { createScopedMetadata, TEST_PRIVATE_KEY, TEST_TOKEN, TEST_UUID } from "../utils";
 
 chai.use(chaiAsPromised);
 chai.use(sinonChai);
@@ -31,8 +31,8 @@ describe("@identity[workspace/inviteUserToWorkspace]", function () {
 	it("should invite a user to a workspace", async function () {
 		// Arrange
 		const sendInvite = sandbox.stub();
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		// Scoped by the tenancy interceptor (identity-removal Step 3 item 2), not by the caller.
+		const metadata = createScopedMetadata();
 
 		const call = {
 			metadata,
@@ -84,8 +84,8 @@ describe("@identity[workspace/inviteUserToWorkspace]", function () {
 	it("should return an error if the user is already a member", async function () {
 		// Arrange
 		const sendInvite = sandbox.stub();
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		// Scoped by the tenancy interceptor (identity-removal Step 3 item 2), not by the caller.
+		const metadata = createScopedMetadata();
 
 		const call = {
 			metadata,
@@ -142,8 +142,8 @@ describe("@identity[workspace/inviteUserToWorkspace]", function () {
 	it("should return an error if the inviter is not an admin", async function () {
 		// Arrange
 		const sendInvite = sandbox.stub();
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		// Scoped by the tenancy interceptor (identity-removal Step 3 item 2), not by the caller.
+		const metadata = createScopedMetadata();
 
 		const identityConfig = {} as IdentityConfig;
 

@@ -690,6 +690,53 @@ Coverage: `apps/api/test/auth/apiKeySession.test.ts` (9 cases) plus `verify:auth
 live checks: creation, `referenceId` is the organization, session resolution, admin-not-owner,
 not-a-person, a guarded route, cross-tenant refusal for both principal kinds, tampered key).
 
+#### Step 3 fallout — the root mocha suite, repaired 2026-08-06
+
+Commit `415d14659` re-enabled decorators in the root tsconfig, which un-masked a transform crash
+that had been swallowing the root run. Underneath it were **21 failures**, all one defect: Step 3
+item 2 replaced `getAccessKeyIdFromCall` — which returned `undefined` for an unscoped call — with
+`getTenantAccessKeyFromCall` / `getOrganizationIdFromCall`, which **throw**
+`MissingTenantScopeError`. Every fixture that stamped only `token` therefore produced `INTERNAL`
+before the handler body ran, and the assertions saw `{ code: 13 }` where they expected the real
+answer.
+
+Disposition, per suite. **Nothing was deleted or skipped**: the honest reading of the deletion
+list is that Step 9 is gated on Steps 1-8 (7 and 8 are not started), so `packages/identity` may
+not be retired yet — and it is not dead code either, `apps/api/src/core/services.ts:24` still
+registers `buildIdentityService`. Its handlers had already been rewired to
+`getTenantAccessKeyFromCall` by Step 3; only their fixtures lagged.
+
+| suite                                                          | disposition | what changed                                        |
+| -------------------------------------------------------------- | ----------- | ---------------------------------------------------- |
+| `@identity[apikeys/createApiKey]` (2)                          | fixed       | fixture stamps the server-resolved tenant           |
+| `@identity[workspace/inviteUserToWorkspace]` (3)               | fixed       | same                                                |
+| `@identity[workspace/removeUserFromWorkspace]` (2)             | fixed       | same                                                |
+| `@identity[workspace/resendWorkspaceMembershipInvitation]` (1) | fixed       | same                                                |
+| `@sipnet[sipnet/createNumber]` (2)                             | fixed       | fixture stamps `organizationid` too                 |
+| `@sipnet[resources/{create,delete,get,list,update}]` (11)      | fixed       | stamps + the two semantic changes below             |
+
+Two fixtures record a **behaviour change** rather than a missing stamp, and both are Step 3 item 4
+working as designed:
+
+1. `getResource`'s not-found message is `withTenantResourceAccess`'s own (`Domain not found: 123`),
+   not `handleError`'s `The requested resource was not found` — the ownership check now answers
+   **before** the SDK's error reaches `handleError`, because a read that fails is not an
+   authorisation however it failed.
+2. Cross-tenant is `NOT_FOUND`, not `PERMISSION_DENIED`, and carries the **same message** as an
+   absent row. Confirming a foreign ref exists would make the endpoint an enumeration oracle.
+
+Three cases were **added** to `getResource`, because those are exactly the properties `withAccess`
+did not have and nothing else pins: a foreign-owned row is refused and leaks nothing; a row with
+no recorded owner is refused (the `if (!extended) return true` defect, now closed); and an
+unscoped call is refused **without reading anything** — `getDomain` is never called.
+
+The shared fixtures are `packages/identity/test/utils.ts` (`createScopedMetadata`) and
+`packages/sipnet/test/testCall.ts`. Both stamp through the real `stampOrganizationIdOnCall` /
+`stampTenantAccessKeyOnCall` rather than literal header strings, so the metadata key names cannot
+drift between `createTenancyInterceptor` and the suites that stand in for it.
+
+Root `pnpm test`: **564 passing, 3 pending, 0 failing** (was 540 / 3 / 21).
+
 ### Step 4 — Per-call and service tokens — **DONE 2026-08-05**
 
 - [x] 1. Replace `createGenerateCallAccessToken` with the better-auth jwt plugin: a short-lived
@@ -1260,6 +1307,15 @@ Fixed:
   `apps/autopilot/src/envs.ts`, `apps/mcp/src/env.ts`); none catch it, so the process still dies —
   it just says why now.
 
+- **No SIP domain could be created at all.** `packages/common/src/validators/sipnet/domains.ts`
+  matched `/^[a-zA-Z0-9-]+(\.[a-zA-Z]{2,})+$/`, which permits a hyphen **only in the first label**,
+  while its second refinement requires every domain to end with `ROOT_DOMAIN`. That was survivable
+  when the root domain was `fonoster.local` and became a total outage of `Domains/CreateDomain`
+  when it became `optimiq-voice.local`: after the rename **no string satisfies both refinements**.
+  The expression is now an ordinary hostname check (labels start/end alphanumeric, hyphens inside,
+  alphabetic TLD ≥ 2). Found by the sipnet `createResource` suite once the root mocha run started
+  executing again — it is not tenancy fallout, and it predates this cutover.
+
 Also fixed, as a consequence of Step 3 item 4:
 
 - **`hasAccessToResource` granted access to a resource that did not exist**
@@ -1309,7 +1365,11 @@ Open, out of scope here:
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------- |
 | api build                     | `pnpm --filter @optimiq-voice/api build`                                                                                                                           | pass                                |
 | api typecheck (both projects) | `pnpm --filter @optimiq-voice/api typecheck`                                                                                                                       | pass                                |
-| api unit tests                | `pnpm --filter @optimiq-voice/api test`                                                                                                                            | **142 passing**, 2 pending (was 95) |
+| api unit tests                | `pnpm --filter @optimiq-voice/api test`                                                                                                                            | **411 passing**, 2 pending          |
+| **root unit tests**           | `pnpm test`                                                                                                                                                        | **564 passing**, 3 pending, 0 failing (was 540 / 21 failing) |
+| device provisioning           | `pnpm --filter @optimiq-voice/api verify:provisioning`                                                                                                             | **93/93**                           |
+| PBX area                      | `pnpm --filter @optimiq-voice/api verify:pbx`                                                                                                                      | **148/148**                         |
+| **SIP credential RPC**        | `pnpm --filter @optimiq-voice/api verify:sip-credentials`                                                                                                          | **17/17** (new)                     |
 | auth slice                    | `DATABASE_URL=… pnpm --filter @optimiq-voice/api verify:auth`                                                                                                      | **49/49** (was 38)                  |
 | per-call token                | `DATABASE_URL=… pnpm --filter @optimiq-voice/api verify:call-token`                                                                                                | **27/27**                           |
 | **Step 2 data migration**     | `DATABASE_URL=… IDENTITY_DATABASE_URL=… API_CLOAK_ENCRYPTION_KEY=… pnpm --filter @optimiq-voice/api verify:identity-migration`                                     | **19/19**                           |

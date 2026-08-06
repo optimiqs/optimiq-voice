@@ -40,6 +40,8 @@ import { createPbxDatabase } from "./shared/pbx-database";
 import { loadPbxEnv } from "./shared/pbx-env";
 import { makePbxRepositoryRuntime } from "./shared/pbx-runtime";
 import { PBX_DATABASE, PBX_EFFECT_RUNTIME, PBX_ENV } from "./shared/pbx.tokens";
+import { SipCredentialsResponder } from "./sip-credentials/sip-credentials.responder";
+import { SipCredentialsService } from "./sip-credentials/sip-credentials.service";
 import { TimeConditionsController } from "./time-conditions/time-conditions.controller";
 import {
 	TimeConditionRulesService,
@@ -132,6 +134,8 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 	providers: [
 		...carrierProviders,
 		CarrierService,
+		SipCredentialsService,
+		SipCredentialsResponder,
 		{ provide: PBX_ENV, useFactory: (): PbxEnv => loadPbxEnv() },
 		{
 			provide: PBX_DATABASE,

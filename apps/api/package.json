@@ -16,6 +16,7 @@
 		"clean": "rimraf ./dist node_modules tsconfig.tsbuildinfo tsconfig.build.tsbuildinfo",
 		"db:deploy": "node scripts/db-provision.mjs",
 		"db:generate": "drizzle-kit generate --config drizzle.config.ts",
+		"emit:sip-vectors": "tsx scripts/emit-sip-derivation-vectors.ts",
 		"migrate:identity": "tsx scripts/migrate-identity-to-organizations.ts",
 		"prebuild": "rimraf ./dist tsconfig.tsbuildinfo tsconfig.build.tsbuildinfo",
 		"pretest": "bash ../../.scripts/gen-keypair.sh",
@@ -34,6 +35,7 @@
 		"verify:live": "tsx scripts/verify-live.ts",
 		"verify:pbx": "tsx scripts/verify-pbx.ts",
 		"verify:provisioning": "tsx scripts/verify-provisioning.ts",
+		"verify:sip-credentials": "tsx scripts/verify-sip-credentials.ts",
 		"verify:tenancy": "tsx scripts/verify-tenancy-backfill.ts",
 		"verify:voicemail": "tsx scripts/verify-voicemail.ts"
 	},

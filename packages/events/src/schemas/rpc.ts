@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { RPC_SUBJECTS } from "../subjects";
-import { callDirectionSchema, destinationTypeSchema, dialStringSchema } from "./telephony";
+import {
+	callDirectionSchema,
+	destinationTypeSchema,
+	dialStringSchema,
+	sipTransportSchema,
+} from "./telephony";
 
 /**
  * Request-reply contracts for the `rpc.*` subjects (plan §3.5).
@@ -12,6 +17,30 @@ import { callDirectionSchema, destinationTypeSchema, dialStringSchema } from "./
  *
  * `rpc.media.*` (engine → `mediad`) is deliberately absent: it arrives with `apps/mediad`, and
  * inventing its shape before the media plane exists would be fiction.
+ *
+ * ## What is actually on the wire — read this before adding a responder
+ *
+ * A schema here describes the PAYLOAD. NestJS's NATS transport does not put the payload on the
+ * wire for request-reply; it puts its own framing around it:
+ *
+ * ```text
+ * request   {"pattern":"<subject>","data":{…the schema…},"id":"…"}
+ * reply     {"response":{…the schema…},"isDisposed":true,"id":"…"}
+ * ```
+ *
+ * and a request carrying the bare payload is **not answered at all** — it times out. That is
+ * invisible while both ends are Nest (`@MessagePattern` ↔ `ClientProxy.send`), which is what every
+ * subject above was when it was written, and `apps/engine/src/nats/envelope.serializer.ts` records
+ * the same leak on the event side.
+ *
+ * It stops being invisible the moment a caller is not TypeScript. `packages/events-go` generates
+ * request/response structs from these schemas, so a Go caller speaks the payload and nothing else.
+ * `rpc.sip.v1.credential` therefore has a **raw** responder
+ * (`apps/api/src/pbx/sip-credentials/sip-credentials.responder.ts`), not a `@MessagePattern` one.
+ *
+ * Rule of thumb: if a subject has, or could have, a non-TypeScript participant, serve it raw so
+ * that the contract is the wire. If it is Nest-to-Nest, `@MessagePattern` is fine — but the
+ * generated Go structs for it are then documentation, not a usable client.
  */
 
 /** A request-reply contract: one subject, one request schema, one response schema. */
@@ -202,9 +231,95 @@ export const VOICEMAIL_LIST_RPC = defineRpc(
 	3_000,
 );
 
+// ---------------------------------------------------------------------------------------------
+// rpc.sip.v1.credential — sipd → api, on every REGISTER that answers a digest challenge
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The registrar's credential lookup.
+ *
+ * ## Why the registrar cannot answer this itself
+ *
+ * `apps/sipd` holds no database handle and must not grow one: extension rows are `pbx-db`, which
+ * the API owns. All the registrar has at the moment it must decide is what the phone put on the
+ * wire — a realm and a username — so this is the one `rpc.*` request that does **not** carry an
+ * `orgId`. Every other subject is called by something that already knows its tenant; here,
+ * resolving the tenant IS the request. The responder derives it from the realm and MUST NOT take
+ * a tenant hint from the caller, which is why no such field exists to be trusted.
+ *
+ * ## Why the reply carries HA1 and never a password
+ *
+ * `ha1 = MD5(username:realm:password)` is exactly what RFC 2617 digest verification consumes, so
+ * shipping it lets the registrar answer a REGISTER without ever holding a credential it could
+ * replay somewhere else. It also puts the realm inside the hash, which makes a realm change an
+ * explicit re-provisioning event rather than a silent authentication outage.
+ *
+ * The alternative — replying `{ orgId, secretRef }` and letting `apps/sipd` run the derivation —
+ * was rejected: it would require `PROVISION_SIP_SECRET_KEY` to be deployed to the SIP edge, which
+ * is the most exposed process in the system. The root key derives **every** tenant's password, so
+ * a compromised edge would be a total credential compromise rather than the loss of whatever is
+ * registered against that edge. Deriving in the API keeps the root key on the control plane, and
+ * `apps/sipd/internal/credentials/derive.go` exists to prove the two languages agree on the
+ * derivation, not to run it in production.
+ *
+ * ## `found` and `enabled` are separate, and the SIP layer merges them
+ *
+ * The registrar answers `403` for both, so a caller cannot tell an unknown extension from a
+ * disabled one — no enumeration oracle. They stay distinct on the wire so an operator UI and the
+ * logs can say which one actually happened.
+ */
+export const sipCredentialRequestSchema = z.object({
+	/** The digest realm the registrar challenged with. This is what resolves the tenant. */
+	realm: z.string().min(1).max(255),
+	/** SIP user part, matched case-sensitively per RFC 3261 §19.1.4. */
+	username: z.string().min(1).max(128),
+	/**
+	 * `ip:port` the REGISTER arrived from, and its transport.
+	 *
+	 * Sent so the responder can apply per-account ACLs and feed the fail2ban-style counters in the
+	 * master plan §5 T1 — **not** because the registrar needs them back. A responder that ignores
+	 * them is correct today.
+	 */
+	sourceAddress: z.string().max(64).optional(),
+	transport: sipTransportSchema.optional(),
+});
+
+export const sipCredentialResponseSchema = z.object({
+	/** False means "no such account in this realm". Never means "the lookup failed" — see `reason`. */
+	found: z.boolean(),
+	/** An account that exists but is administratively off. Distinct on the wire, merged at SIP. */
+	enabled: z.boolean().default(false),
+	orgId: z.uuid().optional(),
+	username: z.string().max(128).optional(),
+	realm: z.string().max(255).optional(),
+	/** `MD5(username:realm:password)`, lower-case hex. Never a password. */
+	ha1: z
+		.string()
+		.regex(/^[0-9a-f]{32}$/, "ha1 must be 32 lower-case hex characters")
+		.optional(),
+	deviceId: z.uuid().optional(),
+	extensionId: z.uuid().optional(),
+	/** Why the lookup could not be answered, for the support ticket. Never shown to a phone. */
+	reason: z.string().max(256).optional(),
+});
+
+export type SipCredentialRequest = z.infer<typeof sipCredentialRequestSchema>;
+export type SipCredentialResponse = z.infer<typeof sipCredentialResponseSchema>;
+
+export const SIP_CREDENTIAL_RPC = defineRpc(
+	RPC_SUBJECTS.sipCredential,
+	sipCredentialRequestSchema,
+	sipCredentialResponseSchema,
+	// The tightest deadline in this file, and deliberately so: this one sits inside a REGISTER
+	// transaction. A phone's retransmission timer starts at 500 ms, so a reply that arrives later
+	// than that is already competing with the retry it caused.
+	500,
+);
+
 /** Every request-reply contract, keyed by subject. */
 export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.routingResolve]: ROUTING_RESOLVE_RPC,
 	[RPC_SUBJECTS.authzCheck]: AUTHZ_CHECK_RPC,
 	[RPC_SUBJECTS.voicemailList]: VOICEMAIL_LIST_RPC,
+	[RPC_SUBJECTS.sipCredential]: SIP_CREDENTIAL_RPC,
 } as const;

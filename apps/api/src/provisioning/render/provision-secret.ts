@@ -26,13 +26,12 @@ import { createHmac } from "node:crypto";
  *
  * ## What this is a contract WITH
  *
- * The registrar has to accept the same password. Today nothing consumes
- * `extension.sip_password_ha1` — the credential pipeline is not built on either side — so this
- * function is the *first* statement of what the shared derivation is, and it is exported precisely
- * so `apps/sipd` can adopt it verbatim rather than inventing a second one. Until it does, a
- * provisioned phone renders a correct-looking configuration whose password nothing yet checks.
- * That is recorded as a follow-up rather than hidden: the alternative was to ship a template with
- * an empty password field, which fails later and more confusingly.
+ * The registrar accepts the same password: the `rpc.sip.v1.credential` responder
+ * (`sip-credentials.responder.ts`) computes ha1 from THIS derivation and `apps/sipd` verifies
+ * digest auth against it — the root key never leaves the api. Byte-exact parity is pinned by
+ * vectors emitted from this function (`emit:sip-vectors`) and asserted in
+ * `apps/sipd/internal/credentials/derive_test.go`; a change here without regenerating them is a
+ * credential rotation, not a refactor.
  *
  * ## Alphabet
  *

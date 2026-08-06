@@ -6,7 +6,7 @@ import { createSandbox } from "sinon";
 import sinonChai from "sinon-chai";
 import { Database } from "../../src/db";
 import { IdentityConfig } from "../../src/exchanges/types";
-import { TEST_PRIVATE_KEY, TEST_TOKEN } from "../utils";
+import { createScopedMetadata, TEST_PRIVATE_KEY } from "../utils";
 
 chai.use(chaiAsPromised);
 chai.use(sinonChai);
@@ -19,8 +19,8 @@ describe("@identity[workspace/resendWorkspaceMembershipInvitation]", function ()
 
 	it("should resend a workspace membership invitation", async function () {
 		// Arrange
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		// Scoped by the tenancy interceptor (identity-removal Step 3 item 2), not by the caller.
+		const metadata = createScopedMetadata();
 		const userRef = "635c0cd8-8125-483d-b467-05c53ce2cd31";
 
 		const call = {
@@ -85,8 +85,8 @@ describe("@identity[workspace/resendWorkspaceMembershipInvitation]", function ()
 
 	it("should return PERMISSION_DENIED if user is not an admin", async function () {
 		// Arrange
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		// Scoped by the tenancy interceptor (identity-removal Step 3 item 2), not by the caller.
+		const metadata = createScopedMetadata();
 		const userRef = "635c0cd8-8125-483d-b467-05c53ce2cd31";
 
 		const call = {

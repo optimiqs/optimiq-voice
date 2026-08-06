@@ -19,6 +19,7 @@ import { createHash } from "node:crypto";
  * provision.evt.v1.<orgId>
  * rpc.routing.v1.resolve                     request-reply, not JetStream
  * rpc.authz.v1.check
+ * rpc.sip.v1.credential
  * ```
  *
  * The version token (`v1`) is a MAJOR version and is part of the subject, not the payload: a
@@ -51,6 +52,7 @@ export const RPC_SUBJECTS = {
 	routingResolve: `rpc.routing.${SUBJECT_VERSION}.resolve`,
 	authzCheck: `rpc.authz.${SUBJECT_VERSION}.check`,
 	voicemailList: `rpc.voicemail.${SUBJECT_VERSION}.list`,
+	sipCredential: `rpc.sip.${SUBJECT_VERSION}.credential`,
 } as const;
 
 /**
@@ -247,6 +249,10 @@ export const subjectFor = {
 	/** `rpc.authz.v1.check` */
 	authzCheckRpc(): string {
 		return RPC_SUBJECTS.authzCheck;
+	},
+	/** `rpc.sip.v1.credential` */
+	sipCredentialRpc(): string {
+		return RPC_SUBJECTS.sipCredential;
 	},
 } as const;
 

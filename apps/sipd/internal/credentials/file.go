@@ -25,25 +25,47 @@ import (
 //	      "deviceId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b50",
 //	      "extensionId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51"
 //	    },
-//	    { "orgId": "…", "username": "1002", "ha1": "…32 hex…", "enabled": false }
+//	    { "orgId": "…", "username": "1002", "ha1": "…32 hex…", "enabled": false },
+//	    { "orgId": "…", "username": "1003", "secretRef": "ext/1003/sip" }
 //	  ]
 //	}
 //
 // The top-level realm is a default for accounts that do not state their own.
+//
+// # The derived form
+//
+// The third account above states neither a password nor an ha1, only the `secretRef` that
+// apps/api's provisioning renderer would have used. The password is then DERIVED with the shared
+// contract (derive.go) from SIPD_PROVISION_SECRET_KEY, which means a development or SIPp-rig
+// fixture gets byte-for-byte the credential a real provisioned phone was handed, instead of a
+// literal somebody copied out of a config once and that silently stopped matching.
+//
+// It requires the root key, which is exactly why it is confined to the file store: production runs
+// on the RPC, where apps/api derives and the edge holds no key at all.
 type FileStore struct {
 	path string
+	opts FileStoreOptions
 
 	mu       sync.RWMutex
 	accounts map[string]Credential
 	disabled map[string]struct{}
 }
 
+// FileStoreOptions configures the optional derived form.
+type FileStoreOptions struct {
+	// ProvisionSecretKey enables `secretRef` accounts. Empty means an account that needs it is a
+	// load-time error rather than a silently unusable entry.
+	ProvisionSecretKey string
+}
+
 type fileAccount struct {
-	OrgID       string `json:"orgId"`
-	Username    string `json:"username"`
-	Realm       string `json:"realm"`
-	Password    string `json:"password"`
-	HA1         string `json:"ha1"`
+	OrgID    string `json:"orgId"`
+	Username string `json:"username"`
+	Realm    string `json:"realm"`
+	Password string `json:"password"`
+	HA1      string `json:"ha1"`
+	// SecretRef derives the password through the shared provisioning contract. See the type doc.
+	SecretRef   string `json:"secretRef"`
 	DeviceID    string `json:"deviceId"`
 	ExtensionID string `json:"extensionId"`
 	// Enabled defaults to true: a fixture should not need a field to work.
@@ -56,8 +78,8 @@ type fileDocument struct {
 }
 
 // NewFileStore loads the file immediately so a bad fixture fails at boot, not at first REGISTER.
-func NewFileStore(path string) (*FileStore, error) {
-	store := &FileStore{path: path}
+func NewFileStore(path string, opts FileStoreOptions) (*FileStore, error) {
+	store := &FileStore{path: path, opts: opts}
 	if err := store.Reload(); err != nil {
 		return nil, err
 	}
@@ -91,8 +113,19 @@ func (s *FileStore) Reload() error {
 			DeviceID:    strings.TrimSpace(account.DeviceID),
 			ExtensionID: strings.TrimSpace(account.ExtensionID),
 		}
-		if credential.HA1 == "" && account.Password != "" {
+		switch {
+		case credential.HA1 != "":
+			// A precomputed digest wins: it is the only form that needs no secret at all.
+		case account.Password != "":
 			credential.HA1 = HA1(credential.Username, credential.Realm, account.Password)
+		case account.SecretRef != "":
+			derived, err := DeriveHA1(s.opts.ProvisionSecretKey, credential.OrgID,
+				account.SecretRef, credential.Username, credential.Realm)
+			if err != nil {
+				return fmt.Errorf("credentials: %s account #%d (%s) uses secretRef: %w",
+					s.path, index, credential.Username, err)
+			}
+			credential.HA1 = derived
 		}
 		if err := credential.Validate(); err != nil {
 			return fmt.Errorf("credentials: %s account #%d: %w", s.path, index, err)

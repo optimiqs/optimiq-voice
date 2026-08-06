@@ -273,6 +273,13 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		request: RPC_CONTRACTS["rpc.voicemail.v1.list"].request,
 		response: RPC_CONTRACTS["rpc.voicemail.v1.list"].response,
 	},
+	{
+		subject: "rpc.sip.v1.credential",
+		goName: "SipCredential",
+		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.credential"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.sip.v1.credential"].request,
+		response: RPC_CONTRACTS["rpc.sip.v1.credential"].response,
+	},
 ];
 
 /** The base envelope, emitted as JSON Schema only — its Go form is hand-written `Envelope[T]`. */

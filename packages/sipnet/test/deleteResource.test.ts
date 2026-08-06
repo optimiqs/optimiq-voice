@@ -6,7 +6,7 @@ import { createSandbox } from "sinon";
 import sinonChai from "sinon-chai";
 import { BaseApiObject, Domain, DomainsApi } from "@optimiq-voice/types";
 import { getExtendedFieldsHelper } from "./getExtendedFieldsHelper";
-import { TEST_TOKEN } from "./testToken";
+import { createScopedMetadata } from "./testCall";
 
 chai.use(chaiAsPromised);
 chai.use(sinonChai);
@@ -20,8 +20,8 @@ describe("@sipnet[resources/deleteResource]", function () {
 	it("should delete a sipnet resource", async function () {
 		// Arrange
 		const { deleteResource } = await import("../src/resources/deleteResource");
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		// Scoped by the tenancy interceptor (identity-removal Step 3 item 2), not by the caller.
+		const metadata = createScopedMetadata();
 
 		const domains = {
 			deleteDomain: sandbox.stub().resolves({ ref: "123" }),

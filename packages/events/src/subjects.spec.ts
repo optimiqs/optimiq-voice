@@ -46,6 +46,7 @@ describe("subject roots", () => {
 			routingResolve: "rpc.routing.v1.resolve",
 			authzCheck: "rpc.authz.v1.check",
 			voicemailList: "rpc.voicemail.v1.list",
+			sipCredential: "rpc.sip.v1.credential",
 		});
 	});
 

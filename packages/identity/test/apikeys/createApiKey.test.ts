@@ -6,7 +6,7 @@ import { createSandbox } from "sinon";
 import sinonChai from "sinon-chai";
 import { Role } from "@optimiq-voice/types";
 import { DATABASE_ALREADY_EXISTS, Database } from "../../src/db";
-import { TEST_TOKEN } from "../utils";
+import { createScopedMetadata } from "../utils";
 
 chai.use(chaiAsPromised);
 chai.use(sinonChai);
@@ -19,8 +19,8 @@ describe("@identity[apikeys/createApiKey]", function () {
 
 	it("should create a new ApiKey", async function () {
 		// Arrange
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		// Scoped by the tenancy interceptor (identity-removal Step 3 item 2), not by the caller.
+		const metadata = createScopedMetadata();
 
 		const call = {
 			metadata,
@@ -59,8 +59,8 @@ describe("@identity[apikeys/createApiKey]", function () {
 
 	it("should throw an error if the ApiKey already exists", async function () {
 		// Arrange
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		// Scoped by the tenancy interceptor (identity-removal Step 3 item 2), not by the caller.
+		const metadata = createScopedMetadata();
 		const call = {
 			metadata,
 			request: {

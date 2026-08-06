@@ -6,7 +6,7 @@ import { createSandbox } from "sinon";
 import sinonChai from "sinon-chai";
 import { Role } from "@optimiq-voice/types";
 import { Database } from "../../src/db";
-import { TEST_TOKEN } from "../utils";
+import { createScopedMetadata } from "../utils";
 
 chai.use(chaiAsPromised);
 chai.use(sinonChai);
@@ -19,8 +19,8 @@ describe("@identity[workspace/removeUserFromWorkspace]", function () {
 
 	it("should remove a user from a workspace", async function () {
 		// Arrange
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		// Scoped by the tenancy interceptor (identity-removal Step 3 item 2), not by the caller.
+		const metadata = createScopedMetadata();
 		const userRef = "635c0cd8-8125-483d-b467-05c53ce2cd31";
 
 		const call = {
@@ -63,8 +63,8 @@ describe("@identity[workspace/removeUserFromWorkspace]", function () {
 
 	it("should throw a permission denied error", async function () {
 		// Arrange
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		// Scoped by the tenancy interceptor (identity-removal Step 3 item 2), not by the caller.
+		const metadata = createScopedMetadata();
 		const userRef = "635c0cd8-8125-483d-b467-05c53ce2cd30";
 
 		const call = {

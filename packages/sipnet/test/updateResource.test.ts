@@ -6,7 +6,7 @@ import { createSandbox } from "sinon";
 import sinonChai from "sinon-chai";
 import { Validators as V } from "@optimiq-voice/common";
 import { getExtendedFieldsHelper } from "@optimiq-voice/sipnet/test/getExtendedFieldsHelper";
-import { TEST_TOKEN } from "@optimiq-voice/sipnet/test/testToken";
+import { createScopedMetadata } from "@optimiq-voice/sipnet/test/testCall";
 import { Domain, DomainsApi, UpdateDomainRequest } from "@optimiq-voice/types";
 
 chai.use(chaiAsPromised);
@@ -21,8 +21,8 @@ describe("@sipnet[resources/updateResource]", function () {
 	it("should update a sipnet resource", async function () {
 		// Arrange
 		const { updateResource } = await import("../src/resources/updateResource");
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		// Scoped by the tenancy interceptor (identity-removal Step 3 item 2), not by the caller.
+		const metadata = createScopedMetadata();
 
 		const domains = {
 			updateDomain: sandbox.stub().resolves({ ref: "123" }),
@@ -57,8 +57,8 @@ describe("@sipnet[resources/updateResource]", function () {
 	it("should throw an error if the sipnet resource doesn't exists", async function () {
 		// Arrange
 		const { updateResource } = await import("../src/resources/updateResource");
-		const metadata = new grpc.Metadata();
-		metadata.set("token", TEST_TOKEN);
+		// Scoped by the tenancy interceptor (identity-removal Step 3 item 2), not by the caller.
+		const metadata = createScopedMetadata();
 
 		const domains = {
 			updateDomain: sandbox.stub().throws({

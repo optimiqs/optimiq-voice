@@ -21,12 +21,14 @@ const (
 	SubjectRoutingResolveRPC = "rpc.routing.v1.resolve"
 	SubjectAuthzCheckRPC     = "rpc.authz.v1.check"
 	SubjectVoicemailListRPC  = "rpc.voicemail.v1.list"
+	SubjectSipCredentialRPC  = "rpc.sip.v1.credential"
 )
 
 const (
 	TimeoutRoutingResolveRPC = 2000 * time.Millisecond
 	TimeoutAuthzCheckRPC     = 1000 * time.Millisecond
 	TimeoutVoicemailListRPC  = 3000 * time.Millisecond
+	TimeoutSipCredentialRPC  = 500 * time.Millisecond
 )
 
 // RoutingResolveRequest is the request body of rpc.routing.v1.resolve.
@@ -195,3 +197,24 @@ func (v VoicemailListResponseMessagesFolder) Valid() bool {
 }
 
 func (v VoicemailListResponseMessagesFolder) String() string { return string(v) }
+
+// SipCredentialRequest is the request body of rpc.sip.v1.credential.
+type SipCredentialRequest struct {
+	Realm         string        `json:"realm"`
+	Username      string        `json:"username"`
+	SourceAddress *string       `json:"sourceAddress,omitempty"`
+	Transport     *SIPTransport `json:"transport,omitempty"`
+}
+
+// SipCredentialResponse is the reply body of rpc.sip.v1.credential.
+type SipCredentialResponse struct {
+	Found       bool    `json:"found"`
+	Enabled     bool    `json:"enabled"`
+	OrgID       *string `json:"orgId,omitempty"`
+	Username    *string `json:"username,omitempty"`
+	Realm       *string `json:"realm,omitempty"`
+	Ha1         *string `json:"ha1,omitempty"`
+	DeviceID    *string `json:"deviceId,omitempty"`
+	ExtensionID *string `json:"extensionId,omitempty"`
+	Reason      *string `json:"reason,omitempty"`
+}

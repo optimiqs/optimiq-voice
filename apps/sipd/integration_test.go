@@ -191,17 +191,33 @@ type edge struct {
 	aorHash   string
 }
 
-// startEdge boots a registrar on a real UDP socket against a real bucket and stream.
+// startEdge boots a registrar on a real UDP socket against a real bucket and stream, backed by the
+// file credential store.
 func startEdge(t *testing.T, ctx context.Context, js jetstream.JetStream) *edge {
+	t.Helper()
+
+	store, err := credentials.NewFileStore(writeCredentials(t), credentials.FileStoreOptions{})
+	if err != nil {
+		t.Fatalf("loading credentials: %v", err)
+	}
+	return startEdgeWithStore(t, ctx, js, store)
+}
+
+// startEdgeWithStore is startEdge with the credential store supplied, so the credential-RPC suite
+// can boot the same vertical against NATSStore instead of the file fixture. Everything else — the
+// socket, the bucket, the stream, the expiry policy — is identical, which is what makes a
+// behavioural difference between the two attributable to the store.
+func startEdgeWithStore(
+	t *testing.T,
+	ctx context.Context,
+	js jetstream.JetStream,
+	credentialStore credentials.Store,
+) *edge {
 	t.Helper()
 
 	bindings, err := kv.Open(ctx, js)
 	if err != nil {
 		t.Fatalf("opening the registrations bucket: %v", err)
-	}
-	credentialStore, err := credentials.NewFileStore(writeCredentials(t))
-	if err != nil {
-		t.Fatalf("loading credentials: %v", err)
 	}
 	authenticator, err := registrar.NewAuthenticator(itRealm, []byte("integration-secret"), time.Minute)
 	if err != nil {
@@ -273,9 +289,22 @@ type sipClient struct {
 	conn   *net.UDPConn
 	parser *sip.Parser
 	cseq   int
+	// user and aor are what this client claims to be. They are fields rather than constants
+	// because the registrar checks that the digest username OWNS the AOR being registered, and
+	// that check runs BEFORE the credential lookup — so a test that wants to exercise the
+	// credential store with a different account has to move the AOR too, or it only ever proves
+	// the ownership check works.
+	user   string
+	aor    string
+	callID string
 }
 
 func dialSIP(t *testing.T, addr string) *sipClient {
+	t.Helper()
+	return dialSIPAs(t, addr, itUser)
+}
+
+func dialSIPAs(t *testing.T, addr, user string) *sipClient {
 	t.Helper()
 	remote, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -286,11 +315,23 @@ func dialSIP(t *testing.T, addr string) *sipClient {
 		t.Fatalf("dialing %s: %v", addr, err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	return &sipClient{t: t, conn: conn, parser: sip.NewParser()}
+
+	callID := "sipd-integration-1"
+	if user != itUser {
+		callID = "sipd-integration-" + user
+	}
+	return &sipClient{
+		t:      t,
+		conn:   conn,
+		parser: sip.NewParser(),
+		user:   user,
+		aor:    "sip:" + user + "@" + itRealm,
+		callID: callID,
+	}
 }
 
 func (c *sipClient) localContact() string {
-	return "sip:" + itUser + "@" + c.conn.LocalAddr().String()
+	return "sip:" + c.user + "@" + c.conn.LocalAddr().String()
 }
 
 func (c *sipClient) register(authorization string, contactParams string, extra ...string) *sip.Response {
@@ -302,9 +343,9 @@ func (c *sipClient) register(authorization string, contactParams string, extra .
 		"REGISTER sip:" + itRealm + " SIP/2.0",
 		fmt.Sprintf("Via: SIP/2.0/UDP %s;branch=z9hG4bKit%d;rport", local.String(), c.cseq),
 		"Max-Forwards: 70",
-		"From: <" + itAOR + ">;tag=itfrom",
-		"To: <" + itAOR + ">",
-		"Call-ID: sipd-integration-1",
+		"From: <" + c.aor + ">;tag=itfrom",
+		"To: <" + c.aor + ">",
+		"Call-ID: " + c.callID,
 		"CSeq: " + strconv.Itoa(c.cseq) + " REGISTER",
 		"Contact: <" + c.localContact() + ">" + contactParams,
 		"User-Agent: sipd-integration-test",
@@ -344,6 +385,13 @@ func (c *sipClient) readResponse() *sip.Response {
 
 func (c *sipClient) authenticate(res *sip.Response) string {
 	c.t.Helper()
+	return c.authenticateAs(res, c.user, itPass)
+}
+
+// authenticateAs answers a challenge with an arbitrary credential, so a test can send a WRONG
+// password — or a right password for an account that does not exist — and see what comes back.
+func (c *sipClient) authenticateAs(res *sip.Response, username, password string) string {
+	c.t.Helper()
 	header := res.GetHeader("WWW-Authenticate")
 	if header == nil {
 		c.t.Fatal("the 401 carried no challenge")
@@ -354,7 +402,7 @@ func (c *sipClient) authenticate(res *sip.Response) string {
 	}
 	answer, err := digest.Digest(challenge, digest.Options{
 		Method: "REGISTER", URI: "sip:" + itRealm,
-		Username: itUser, Password: itPass, Count: 1, Cnonce: "0a4f113b",
+		Username: username, Password: password, Count: 1, Cnonce: "0a4f113b",
 	})
 	if err != nil {
 		c.t.Fatalf("computing the digest: %v", err)

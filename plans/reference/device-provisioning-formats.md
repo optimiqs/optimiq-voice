@@ -514,4 +514,4 @@ RFC 3261 §19.1.
 | Snom fkey keyword completeness | No single official page enumerates them; `dtmf` unconfirmed. |
 | Acrobits `provlink://` / `provlinkbs://` | Field-observed in FusionPBX templates, undocumented. |
 | Zoiper `o` / `x` / `tr` QR query parameters | Partially documented. |
-| The derived SIP password | `apps/api/src/provisioning/render/provision-secret.ts` defines the derivation; **no registrar consumes it yet**. |
+| ~~The derived SIP password~~ | **CLOSED 2026-08-06.** `apps/sipd` consumes it: `rpc.sip.v1.credential` (`packages/events`) carries `{realm, username}` to `apps/api`, which repeats the derivation and replies with `ha1 = MD5(user:realm:password)`; `apps/sipd/internal/credentials/derive.go` is a byte-exact Go port pinned to golden vectors emitted by the TypeScript implementation (`pnpm --filter @optimiq-voice/api emit:sip-vectors`). The gated sipd integration suite registers a phone with a TypeScript-derived password end to end. Deployment prerequisites — including the `org_setting` `sip`/`realm` row that maps a realm to a tenant — are in `apps/sipd/README.md` § Credentials. |
