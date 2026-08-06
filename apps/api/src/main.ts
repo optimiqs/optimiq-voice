@@ -14,6 +14,8 @@ import { assertCdrPreflight, isCdrAreaEnabled } from "./cdr/cdr-bootstrap";
 import { CdrModule } from "./cdr/cdr.module";
 import { API_TENANT_RLS_PLAN, createApiTenantRlsIntrospector } from "./core/db/rls-preflight-plan";
 import { DATABASE_URL, HTTP_BRIDGE_PORT } from "./envs";
+import { registerLiveTransport } from "./live/live-bootstrap";
+import { LiveModule } from "./live/live.module";
 import { isPbxAreaEnabled, registerPbxTransport } from "./pbx/pbx-bootstrap";
 import { PbxModule } from "./pbx/pbx.module";
 
@@ -84,8 +86,16 @@ async function bootstrap() {
 		await assertCdrPreflight();
 	}
 
+	/**
+	 * The live channel rides on the PBX area, not beside it.
+	 *
+	 * Every topic it serves is a projection of state the PBX area's processes write, and it reads
+	 * `PBX_ENV` for the broker URL rather than parsing the environment a second time — so mounting
+	 * it without the PBX area would be a socket with nothing on the other end and an environment
+	 * contract with two owners.
+	 */
 	const extraModules = [
-		...(pbxAreaEnabled ? [PbxModule] : []),
+		...(pbxAreaEnabled ? [PbxModule, LiveModule] : []),
 		...(cdrAreaEnabled ? [CdrModule] : []),
 	];
 	const rootModule: Type<unknown> = authSliceEnabled
@@ -116,6 +126,7 @@ async function bootstrap() {
 	}
 	if (pbxAreaEnabled) {
 		await registerPbxTransport(app);
+		await registerLiveTransport(app);
 	}
 
 	await app.listen(HTTP_BRIDGE_PORT, "0.0.0.0");

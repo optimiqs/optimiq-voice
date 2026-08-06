@@ -15,6 +15,7 @@ import { Button } from "~/components/ui/button";
 import { PageHeader } from "~/components/ui/page-header";
 import { DEFAULT_PAGE_LIMIT, PBX_RESOURCES } from "~/lib/pbx/client";
 import { usePermission } from "../../_context/session-context";
+import { useLiveRegistrations } from "../../_hooks/use-live-queries";
 import { usePbxDelete, usePbxList } from "../../_hooks/use-pbx-queries";
 import { ExtensionDialog } from "./extension-dialog";
 import type { ExtensionRow } from "~/lib/pbx/contracts";
@@ -26,6 +27,19 @@ import type { ExtensionRow } from "~/lib/pbx/contracts";
  * option and DID that points here holds a `destination_ref` with no foreign key behind it, so the
  * API scans for referrers and answers 409 with their names — which the confirmation renders as
  * links rather than as a failure message.
+ *
+ * ## The Registered column is LIVE, and belongs here rather than on a page of its own
+ *
+ * A registration binds an AOR — which is an extension — to a contact, so "which of my phones are
+ * online" is a column of this table and not a separate screen. It is streamed from the
+ * `registrations` KV bucket over `/api/v1/live`, so it changes as phones come and go rather than on
+ * a refresh, and it is gated on `extensions.read` exactly as this page is: a caller who can see the
+ * list can see which of them are up.
+ *
+ * A binding is only shown as registered if its GRANTED interval has not lapsed. The bucket's TTL is
+ * an hour and a device's `Expires:` is minutes, so an entry can be present and long dead — a column
+ * that read presence as "registered" would show an unplugged phone as online for the rest of the
+ * hour, which is the exact opposite of what an operator opens this page to find out.
  */
 export function ExtensionsScreen() {
 	const resource = PBX_RESOURCES.extensions;
@@ -36,6 +50,7 @@ export function ExtensionsScreen() {
 
 	const canWrite = usePermission(resource.permissions.write);
 	const canDelete = usePermission(resource.permissions.delete);
+	const registrations = useLiveRegistrations();
 
 	const [editing, setEditing] = useState<ExtensionRow | null>(null);
 	const [dialogOpen, setDialogOpen] = useState(false);
@@ -119,6 +134,31 @@ export function ExtensionsScreen() {
 								) : null}
 							</div>
 						),
+					},
+					{
+						key: "registered",
+						header: "Registered",
+						cell: (row) => {
+							if (!registrations.loaded) {
+								// Not loaded is not "offline". Painting every phone as unregistered for
+								// the half second before the snapshot lands would be a confidently wrong
+								// answer to the one question this column exists for.
+								return <span className="text-xs text-subtle-foreground">—</span>;
+							}
+							const binding = registrations.byExtensionId.get(row.id);
+							return binding === undefined ? (
+								<Badge tone="neutral">Offline</Badge>
+							) : (
+								<div className="flex flex-col gap-0.5">
+									<Badge tone="success">Online</Badge>
+									{binding.userAgent ? (
+										<span className="max-w-40 truncate text-xs text-muted-foreground">
+											{binding.userAgent}
+										</span>
+									) : null}
+								</div>
+							);
+						},
 					},
 					{
 						key: "enabled",

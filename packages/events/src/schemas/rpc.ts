@@ -129,8 +129,82 @@ export const AUTHZ_CHECK_RPC = defineRpc(
 	1_000,
 );
 
+// ---------------------------------------------------------------------------------------------
+// rpc.voicemail.v1.list — engine → api, when a caller opens a mailbox
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The read model behind the `*97` menu.
+ *
+ * Messages live in `pbx-db`'s `voicemail_message`, which is the control plane's table; the engine
+ * holds no database handle and must not grow one, so a caller who has just authenticated needs a
+ * request-reply to find out what is in their mailbox. Request-reply rather than an event stream
+ * because the answer is needed *now*, at the moment the caller is listening to silence, and a
+ * consumer-maintained projection would be a second copy of the same rows with its own staleness.
+ *
+ * The engine is expected to survive nobody answering. A mailbox it cannot list is announced as
+ * unavailable and the call ends — never as "you have no messages", which is a different and much
+ * more damaging thing to tell somebody who has nine.
+ */
+export const voicemailListRequestSchema = z.object({
+	orgId: z.uuid(),
+	voicemailBoxId: z.uuid(),
+	/**
+	 * The number the caller reached the mailbox from, as the engine authenticated it.
+	 *
+	 * The responder MUST treat this as a claim to be checked against the box, not as authorisation:
+	 * the engine authenticates a caller with the box's PIN and its own extension check, but a
+	 * responder that trusted a request purely because it arrived on the broker would hand any
+	 * process on the network any tenant's messages.
+	 */
+	mailboxNumber: z.string().min(1).max(32),
+	/** `new` is what the menu plays. `saved` and `deleted` are the other `voicemail_message` folders. */
+	folder: z.enum(["new", "saved", "deleted"]).default("new"),
+	/** Newest first, capped so one mailbox cannot produce an unbounded reply. */
+	limit: z.int().min(1).max(100).default(20),
+	callId: z.uuid().optional(),
+});
+
+export const voicemailMessageSummarySchema = z.object({
+	messageId: z.uuid(),
+	folder: z.enum(["new", "saved", "deleted"]),
+	/** Object-storage key for the audio. The engine renders it as an `object://` media ref. */
+	objectKey: z.string().min(1).max(1024),
+	durationMs: z.int().min(0),
+	receivedAt: z.iso.datetime(),
+	callerIdNumber: z.string().max(64).optional(),
+	callerIdName: z.string().max(128).optional(),
+});
+
+export const voicemailListResponseSchema = z.object({
+	/** False means "this mailbox could not be read" — never "it is empty". */
+	found: z.boolean(),
+	/** Newest first. Empty with `found: true` is a genuinely empty folder. */
+	messages: z.array(voicemailMessageSummarySchema).max(100).default([]),
+	/** Total in the folder, which may exceed `messages.length` when `limit` truncated it. */
+	total: z.int().min(0).default(0),
+	newCount: z.int().min(0).default(0),
+	savedCount: z.int().min(0).default(0),
+	/** Why the mailbox could not be read, for the support ticket. */
+	reason: z.string().max(256).optional(),
+});
+
+export type VoicemailListRequest = z.infer<typeof voicemailListRequestSchema>;
+export type VoicemailListResponse = z.infer<typeof voicemailListResponseSchema>;
+export type VoicemailMessageSummary = z.infer<typeof voicemailMessageSummarySchema>;
+
+export const VOICEMAIL_LIST_RPC = defineRpc(
+	RPC_SUBJECTS.voicemailList,
+	voicemailListRequestSchema,
+	voicemailListResponseSchema,
+	// Longer than a routing resolve: this one is answered while the caller is already connected and
+	// listening, so a slow reply costs a second of dead air rather than a call that never connects.
+	3_000,
+);
+
 /** Every request-reply contract, keyed by subject. */
 export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.routingResolve]: ROUTING_RESOLVE_RPC,
 	[RPC_SUBJECTS.authzCheck]: AUTHZ_CHECK_RPC,
+	[RPC_SUBJECTS.voicemailList]: VOICEMAIL_LIST_RPC,
 } as const;

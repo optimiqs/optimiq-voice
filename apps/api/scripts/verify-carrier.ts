@@ -954,6 +954,10 @@ async function main(): Promise<void> {
 				PBX_DATABASE_URL: pbxDatabaseUrl,
 				PBX_DATABASE_MAX_CONNECTIONS: 2,
 				PBX_ENSURE_KV_BUCKETS: false,
+				// Unused by a cleanup handle — it only ever runs DELETEs — but the env type is total on
+				// purpose, so a new field is a compile error at every construction site rather than an
+				// `undefined` that reaches a dial string.
+				PBX_EXTENSION_DIAL_TEMPLATE: "PJSIP/{number}",
 			});
 			if (organizationId.length > 0) {
 				await pbx.withTenantScope(organizationId, async (transaction) => {

@@ -50,6 +50,22 @@ export const pbxEnvSchema = z.object({
 
 	/** Pool ceiling for the PBX pool specifically; the base client applies the shared budget. */
 	PBX_DATABASE_MAX_CONNECTIONS: z.coerce.number().int().min(1).max(100).default(10),
+
+	/**
+	 * How an extension number becomes a dial string in the media server's vocabulary.
+	 *
+	 * MUST match `apps/engine`'s `ENGINE_EXTENSION_DIAL_TEMPLATE`, and shares its default. The
+	 * `queue-membership` bucket holds a resolved dial string per agent, not an extension number,
+	 * because the engine hands it to the media server verbatim rather than re-deriving an endpoint
+	 * from a number it cannot verify (see `packages/events` `queueMembershipAgentSchema`). Two
+	 * templates that disagree produce a queue whose agents' phones never ring while every direct
+	 * call to the same extension works — which is why this is stated here rather than assumed.
+	 *
+	 * A template rather than a hard-coded `PJSIP/` for the reason the engine records: the same code
+	 * has to work against a registrar-backed deployment (`PJSIP/1001`) and a dialplan-mediated one
+	 * (`Local/1001@context`).
+	 */
+	PBX_EXTENSION_DIAL_TEMPLATE: z.string().min(1).default("PJSIP/{number}"),
 });
 
 export type PbxEnv = z.infer<typeof pbxEnvSchema>;

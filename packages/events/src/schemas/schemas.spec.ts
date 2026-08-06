@@ -10,7 +10,7 @@ import { baseEventEnvelopeSchema, defineEvent, makeEvent } from "./envelope";
 import { makeProvisionEvent, provisionEventSchema } from "./provision-events";
 import { makeQueueEvent, queueEventSchema } from "./queue-events";
 import { makeRegistrationEvent, registrationEventSchema } from "./registration-events";
-import { AUTHZ_CHECK_RPC, ROUTING_RESOLVE_RPC } from "./rpc";
+import { AUTHZ_CHECK_RPC, ROUTING_RESOLVE_RPC, VOICEMAIL_LIST_RPC } from "./rpc";
 
 const ORG = createEntityId();
 const CALL = createEntityId();
@@ -477,6 +477,79 @@ describe("rpc contracts", () => {
 		expect(
 			AUTHZ_CHECK_RPC.response.parse({ allowed: false, granted: [], missing: ["extension.read"] })
 				.allowed,
+		).toBe(false);
+	});
+
+	it("pins the voicemail list contract to its subject", () => {
+		expect(VOICEMAIL_LIST_RPC.subject).toBe("rpc.voicemail.v1.list");
+	});
+
+	it("defaults a voicemail list request to the new folder", () => {
+		const request = VOICEMAIL_LIST_RPC.request.parse({
+			orgId: ORG,
+			voicemailBoxId: createEntityId(),
+			mailboxNumber: "1001",
+		});
+		expect(request.folder).toBe("new");
+		expect(request.limit).toBe(20);
+	});
+
+	it("caps a voicemail list so one mailbox cannot produce an unbounded reply", () => {
+		expect(
+			VOICEMAIL_LIST_RPC.request.safeParse({
+				orgId: ORG,
+				voicemailBoxId: createEntityId(),
+				mailboxNumber: "1001",
+				limit: 1_000,
+			}).success,
+		).toBe(false);
+	});
+
+	it("distinguishes an unreadable mailbox from an empty one", () => {
+		// The whole reason `found` exists. "You have no messages" told to somebody who has nine is a
+		// worse outcome than any error message, so the two states are separate fields rather than an
+		// empty array standing for both.
+		const unreadable = VOICEMAIL_LIST_RPC.response.parse({ found: false, reason: "no responder" });
+		expect(unreadable.messages).toEqual([]);
+		expect(unreadable.found).toBe(false);
+
+		const empty = VOICEMAIL_LIST_RPC.response.parse({ found: true, messages: [], total: 0 });
+		expect(empty.found).toBe(true);
+	});
+
+	it("validates a message summary the engine can actually play", () => {
+		const response = VOICEMAIL_LIST_RPC.response.parse({
+			found: true,
+			total: 1,
+			newCount: 1,
+			messages: [
+				{
+					messageId: createEntityId(),
+					folder: "new",
+					objectKey: "org/vm-1/msg.wav",
+					durationMs: 4_200,
+					receivedAt: "2026-08-05T12:00:00.000Z",
+					callerIdNumber: "+15551230000",
+				},
+			],
+		});
+		expect(response.messages[0]?.objectKey).toBe("org/vm-1/msg.wav");
+	});
+
+	it("refuses a message with no object key — there would be nothing to play", () => {
+		expect(
+			VOICEMAIL_LIST_RPC.response.safeParse({
+				found: true,
+				messages: [
+					{
+						messageId: createEntityId(),
+						folder: "new",
+						objectKey: "",
+						durationMs: 1,
+						receivedAt: "2026-08-05T12:00:00.000Z",
+					},
+				],
+			}).success,
 		).toBe(false);
 	});
 });

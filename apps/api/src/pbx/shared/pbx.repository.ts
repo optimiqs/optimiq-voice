@@ -67,6 +67,27 @@ export interface MutationResult<T> {
 	readonly compiled?: CompiledWrite;
 }
 
+/**
+ * What committed, for the projections that are not the routing artifact.
+ *
+ * `onArtifactCompiled` only fires for tables `affectsRouting()` returns true for, which is correct
+ * and is exactly why this exists alongside it: `queue_agent` and `queue_tier` are deliberately NOT
+ * routing inputs — `packages/routing` calls agent membership live state the engine reads at dial
+ * time, so logging an agent in must not evict a tenant's compiled artifact — and yet a write to
+ * either of them changes the roster the ACD distributes against. A seam that fired only on
+ * recompiles would leave the `queue-membership` bucket stale for exactly the writes that change it
+ * most often.
+ *
+ * The event names the physical TABLE rather than the resource kind, because the subscribers are
+ * projections of tables and the child resources (`queue-tier`) do not map one-to-one onto kinds.
+ */
+export interface PbxMutationEvent {
+	readonly organizationId: string;
+	readonly tableName: string;
+	readonly kind: string;
+	readonly operation: "create" | "update" | "remove" | "reorder";
+}
+
 export interface PbxRepositoryInterface {
 	readonly list: (
 		organizationId: string,
@@ -402,6 +423,12 @@ export interface PbxRepositoryDependencies {
 	 * without a broker.
 	 */
 	readonly onArtifactCompiled?: (compiled: CompiledWrite) => void;
+	/**
+	 * Called after EVERY write commits, whether or not it recompiled. Injected on the same terms as
+	 * `onArtifactCompiled` — a plain callback, so the repository keeps no knowledge of NATS and a
+	 * spec can assert the seam without a broker.
+	 */
+	readonly onMutation?: (event: PbxMutationEvent) => void;
 	/** Injected so a spec can pin generated ids. */
 	readonly newId?: () => string;
 }
@@ -427,11 +454,29 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 			catch: (cause) => toPbxFailure(kind, operation, cause, table),
 		});
 
-	/** Publishes after the commit, never inside it — see `routing-cache.publisher.ts`. */
-	const announce = <T>(result: MutationResult<T>): MutationResult<T> => {
+	/**
+	 * Publishes after the commit, never inside it — see `routing-cache.publisher.ts`.
+	 *
+	 * Both seams fire here and in this order: the artifact first, because a reader that sees a new
+	 * roster for a queue whose routing node does not exist yet has nothing to do with it, and the
+	 * reverse leaves a live queue pointing at a roster from before the change for as long as the
+	 * second publish takes.
+	 */
+	const announce = <T>(
+		resource: PbxResource | PbxChildResource,
+		operation: PbxMutationEvent["operation"],
+		organizationId: string,
+		result: MutationResult<T>,
+	): MutationResult<T> => {
 		if (result.compiled !== undefined && deps.onArtifactCompiled !== undefined) {
 			deps.onArtifactCompiled(result.compiled);
 		}
+		deps.onMutation?.({
+			organizationId,
+			tableName: resource.tableName,
+			kind: resource.kind,
+			operation,
+		});
 		return result;
 	};
 
@@ -515,7 +560,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 				};
 			},
 		);
-		return announce(result);
+		return announce(resource, "create", organizationId, result);
 	});
 
 	const update = Effect.fn("PbxRepository.update")(function* (
@@ -552,7 +597,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 				};
 			},
 		);
-		return announce(result);
+		return announce(resource, "update", organizationId, result);
 	});
 
 	const remove = Effect.fn("PbxRepository.remove")(function* (
@@ -577,7 +622,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 				};
 			},
 		);
-		return announce(result);
+		return announce(resource, "remove", organizationId, result);
 	});
 
 	const listChildren = Effect.fn("PbxRepository.listChildren")(function* (
@@ -633,7 +678,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 				};
 			},
 		);
-		return announce(result);
+		return announce(resource, "create", organizationId, result);
 	});
 
 	const updateChild = Effect.fn("PbxRepository.updateChild")(function* (
@@ -668,7 +713,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 				};
 			},
 		);
-		return announce(result);
+		return announce(resource, "update", organizationId, result);
 	});
 
 	const removeChild = Effect.fn("PbxRepository.removeChild")(function* (
@@ -696,7 +741,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 				};
 			},
 		);
-		return announce(result);
+		return announce(resource, "remove", organizationId, result);
 	});
 
 	/**
@@ -772,7 +817,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 				};
 			},
 		);
-		return announce(result);
+		return announce(resource, "reorder", organizationId, result);
 	});
 
 	const compile = Effect.fn("PbxRepository.compile")(function* (organizationId: string) {

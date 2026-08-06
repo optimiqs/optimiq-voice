@@ -21,6 +21,28 @@
  */
 
 export {
+	ABSENT_AGENT_STATUS,
+	AGENT_SESSION_ACTION_SOURCES,
+	AGENT_SESSION_ACTION_TARGET,
+	AGENT_SESSION_ACTIONS,
+	AGENT_STATUS_VALUES,
+	AGENT_TRANSITION_REFUSALS,
+	API_DRIVEN_TRANSITIONS,
+	assertApiAgentTransition,
+	assertEngineAgentTransition,
+	canAgentTransition,
+	ENGINE_DRIVEN_TRANSITIONS,
+	InvalidAgentTransitionError,
+	isApiDrivenTransition,
+	isEngineDrivenTransition,
+	planAgentSessionAction,
+	VALID_AGENT_TRANSITIONS,
+	type AgentSessionAction,
+	type AgentSessionPlan,
+	type AgentTransition,
+	type AgentTransitionRefusal,
+} from "./agent-state-machine";
+export {
 	auditActorSchema,
 	auditChangeSchema,
 	AUDIT_EVENT_DEFINITIONS,
@@ -97,6 +119,18 @@ export {
 	type ProvisionEventOf,
 } from "./provision-events";
 export {
+	isLiveChannel,
+	isRegistrationLapsed,
+	LIVE_CHANNEL_DIRECTIONS,
+	LIVE_CHANNEL_TEARDOWN_STATES,
+	liveChannelSchema,
+	registrationBindingSchema,
+	type LiveChannel,
+	type LiveChannelDirection,
+	type LiveChannelTeardownState,
+	type RegistrationBinding,
+} from "./live-state";
+export {
 	makeQueueEvent,
 	QUEUE_EVENT_DEFINITIONS,
 	queueAgentStateDataSchema,
@@ -144,11 +178,18 @@ export {
 	routingResolveRequestSchema,
 	routingResolveResponseSchema,
 	RPC_CONTRACTS,
+	VOICEMAIL_LIST_RPC,
+	voicemailListRequestSchema,
+	voicemailListResponseSchema,
+	voicemailMessageSummarySchema,
 	type AuthzCheckRequest,
 	type AuthzCheckResponse,
 	type RoutingResolveRequest,
 	type RoutingResolveResponse,
 	type RpcContract,
+	type VoicemailListRequest,
+	type VoicemailListResponse,
+	type VoicemailMessageSummary,
 } from "./rpc";
 export {
 	AGENT_STATUSES,

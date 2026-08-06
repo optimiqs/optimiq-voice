@@ -4,6 +4,7 @@ import { parseAsStringLiteral, useQueryState } from "nuqs";
 import { PageHeader } from "~/components/ui/page-header";
 import { Tabs, TabsIndicator, TabsList, TabsPanel, TabsTrigger } from "~/components/ui/tabs";
 import { QUEUE_TABS, type QueueTab } from "~/lib/routes";
+import { AgentConsole } from "./agent-console";
 import { QueueAgentsPanel } from "./queue-agents-panel";
 import { QueuesPanel } from "./queues-panel";
 
@@ -35,6 +36,13 @@ export function QueuesScreen() {
 				title="Queues"
 				description="Callers wait in a queue until a staffed agent is free. The queue decides how long they wait and who they are offered to; a membership decides who is staffed, and that is a separate permission."
 			/>
+
+			{/*
+			 * The console renders only for a user whose account is linked to an agent seat, so for
+			 * everyone else this line is nothing at all rather than an empty state apologising for
+			 * a feature that does not apply to them.
+			 */}
+			<AgentConsole />
 
 			<Tabs value={tab} onValueChange={(next) => void setTab(next as QueueTab)}>
 				<TabsList>

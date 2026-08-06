@@ -20,11 +20,13 @@ import (
 const (
 	SubjectRoutingResolveRPC = "rpc.routing.v1.resolve"
 	SubjectAuthzCheckRPC     = "rpc.authz.v1.check"
+	SubjectVoicemailListRPC  = "rpc.voicemail.v1.list"
 )
 
 const (
 	TimeoutRoutingResolveRPC = 2000 * time.Millisecond
 	TimeoutAuthzCheckRPC     = 1000 * time.Millisecond
+	TimeoutVoicemailListRPC  = 3000 * time.Millisecond
 )
 
 // RoutingResolveRequest is the request body of rpc.routing.v1.resolve.
@@ -106,3 +108,90 @@ type AuthzCheckResponse struct {
 	Missing []string `json:"missing"`
 	Reason  *string  `json:"reason,omitempty"`
 }
+
+// VoicemailListRequest is the request body of rpc.voicemail.v1.list.
+type VoicemailListRequest struct {
+	OrgID          string                     `json:"orgId"`
+	VoicemailBoxID string                     `json:"voicemailBoxId"`
+	MailboxNumber  string                     `json:"mailboxNumber"`
+	Folder         VoicemailListRequestFolder `json:"folder"`
+	Limit          int                        `json:"limit"`
+	CallID         *string                    `json:"callId,omitempty"`
+}
+
+// VoicemailListRequestFolder is the closed vocabulary of VoicemailListRequest.folder.
+type VoicemailListRequestFolder string
+
+const (
+	VoicemailListRequestFolderNew     VoicemailListRequestFolder = "new"
+	VoicemailListRequestFolderSaved   VoicemailListRequestFolder = "saved"
+	VoicemailListRequestFolderDeleted VoicemailListRequestFolder = "deleted"
+)
+
+// VoicemailListRequestFolderValues lists every member of the vocabulary, in contract order.
+var VoicemailListRequestFolderValues = []VoicemailListRequestFolder{
+	VoicemailListRequestFolderNew,
+	VoicemailListRequestFolderSaved,
+	VoicemailListRequestFolderDeleted,
+}
+
+// Valid reports whether v is a member of the VoicemailListRequestFolder vocabulary.
+func (v VoicemailListRequestFolder) Valid() bool {
+	for _, candidate := range VoicemailListRequestFolderValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v VoicemailListRequestFolder) String() string { return string(v) }
+
+// VoicemailListResponse is the reply body of rpc.voicemail.v1.list.
+type VoicemailListResponse struct {
+	Found      bool                            `json:"found"`
+	Messages   []VoicemailListResponseMessages `json:"messages"`
+	Total      int                             `json:"total"`
+	NewCount   int                             `json:"newCount"`
+	SavedCount int                             `json:"savedCount"`
+	Reason     *string                         `json:"reason,omitempty"`
+}
+
+// VoicemailListResponseMessages is a payload fragment of the contract.
+type VoicemailListResponseMessages struct {
+	MessageID      string                              `json:"messageId"`
+	Folder         VoicemailListResponseMessagesFolder `json:"folder"`
+	ObjectKey      string                              `json:"objectKey"`
+	DurationMs     int                                 `json:"durationMs"`
+	ReceivedAt     EventTime                           `json:"receivedAt"`
+	CallerIDNumber *string                             `json:"callerIdNumber,omitempty"`
+	CallerIDName   *string                             `json:"callerIdName,omitempty"`
+}
+
+// VoicemailListResponseMessagesFolder is the closed vocabulary of VoicemailListResponseMessages.folder.
+type VoicemailListResponseMessagesFolder string
+
+const (
+	VoicemailListResponseMessagesFolderNew     VoicemailListResponseMessagesFolder = "new"
+	VoicemailListResponseMessagesFolderSaved   VoicemailListResponseMessagesFolder = "saved"
+	VoicemailListResponseMessagesFolderDeleted VoicemailListResponseMessagesFolder = "deleted"
+)
+
+// VoicemailListResponseMessagesFolderValues lists every member of the vocabulary, in contract order.
+var VoicemailListResponseMessagesFolderValues = []VoicemailListResponseMessagesFolder{
+	VoicemailListResponseMessagesFolderNew,
+	VoicemailListResponseMessagesFolderSaved,
+	VoicemailListResponseMessagesFolderDeleted,
+}
+
+// Valid reports whether v is a member of the VoicemailListResponseMessagesFolder vocabulary.
+func (v VoicemailListResponseMessagesFolder) Valid() bool {
+	for _, candidate := range VoicemailListResponseMessagesFolderValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v VoicemailListResponseMessagesFolder) String() string { return string(v) }

@@ -11,6 +11,7 @@ import { signInWithRedirect } from "~/lib/routes";
 import { NoOrganization } from "./_components/no-organization";
 import { PermissionDenied } from "./_components/require-permission";
 import { Sidebar } from "./_components/sidebar";
+import { LiveProvider } from "./_context/live-context";
 import { SessionProvider, useSessionOverviewQuery } from "./_context/session-context";
 
 /**
@@ -79,16 +80,24 @@ function AuthenticatedShell({ children }: { children: ReactNode }) {
 
 	const allowed = canAccessPage(pathname, session.permissions);
 
+	/**
+	 * `LiveProvider` sits INSIDE `SessionProvider` and inside this component's own gate, so the
+	 * socket cannot be opened before the server has said who the caller is and which organization
+	 * they are acting in. It opens nothing on its own — `LiveClient` connects on the first topic
+	 * lease — so the pages that are ordinary CRUD never pay for it.
+	 */
 	return (
 		<SessionProvider overview={session}>
-			<div className="flex h-dvh overflow-hidden bg-canvas">
-				<Sidebar />
-				<main id="main" className="flex min-w-0 flex-1 flex-col overflow-y-auto">
-					<div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-8 py-8">
-						{allowed ? children : <PermissionDenied what="this page" />}
-					</div>
-				</main>
-			</div>
+			<LiveProvider>
+				<div className="flex h-dvh overflow-hidden bg-canvas">
+					<Sidebar />
+					<main id="main" className="flex min-w-0 flex-1 flex-col overflow-y-auto">
+						<div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-8 py-8">
+							{allowed ? children : <PermissionDenied what="this page" />}
+						</div>
+					</main>
+				</div>
+			</LiveProvider>
 		</SessionProvider>
 	);
 }

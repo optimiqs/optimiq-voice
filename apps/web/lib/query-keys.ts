@@ -81,4 +81,20 @@ export const queryKeys = {
 		["organizations", organizationId, "cdr", "recordings"] as const,
 	recordingList: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
 		["organizations", organizationId, "cdr", "recordings", "list", query] as const,
+
+	/**
+	 * Agent availability.
+	 *
+	 * Availability itself is LIVE state and is not in this cache — it arrives over the socket and
+	 * lives in component state, because a KV bucket's contents have no staleness for `staleTime` to
+	 * be a question about (see `_hooks/use-live-queries.ts`). What IS cached is the answer to "which
+	 * agent seat is this user?", which is a database row, changes when an administrator links one,
+	 * and is read by the console strip on every page that shows it.
+	 *
+	 * Filed under `pbx/queue-agents` on purpose: a mutation to the agents resource already
+	 * invalidates that subtree, so unlinking a user takes this with it without the agent dialog
+	 * having to know the console exists.
+	 */
+	myAgentSession: (organizationId: string) =>
+		["organizations", organizationId, "pbx", "queue-agents", "session", "me"] as const,
 } as const;

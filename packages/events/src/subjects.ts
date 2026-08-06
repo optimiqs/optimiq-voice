@@ -50,6 +50,7 @@ export const SUBJECT_ROOTS = {
 export const RPC_SUBJECTS = {
 	routingResolve: `rpc.routing.${SUBJECT_VERSION}.resolve`,
 	authzCheck: `rpc.authz.${SUBJECT_VERSION}.check`,
+	voicemailList: `rpc.voicemail.${SUBJECT_VERSION}.list`,
 } as const;
 
 /**

@@ -9,20 +9,49 @@ import { canAccessPage } from "~/lib/page-permissions";
 import { roleLabel } from "~/lib/permissions";
 import { routes } from "~/lib/routes";
 import { NAV_SECTIONS } from "./_components/nav-config";
-import { useAppSession } from "./_context/session-context";
+import { useAppSession, useAnyPermission } from "./_context/session-context";
+import { useLiveStatus } from "./_context/live-context";
+import { LiveIndicator } from "./queues/_components/agent-console";
+import {
+	useLiveActiveCalls,
+	useLiveAgentStates,
+	useLiveRegistrations,
+} from "./_hooks/use-live-queries";
 
 /**
- * The landing surface.
+ * The landing surface: what is happening on this tenant's phone system, right now.
  *
- * Live call and registration counts belong here, but they come from the engine's WebSocket
- * fan-out, which does not exist yet (roadmap P2). Rather than invent metrics, this shows what the
- * session actually is — who you are, which tenant you are acting in, and what that grants — which
- * is also the fastest way to tell whether auth is wired correctly.
+ * ## Every number here comes from the socket, not from a poll
+ *
+ * Three KV buckets are the authority for live state — `registrations`, `channels`, `agent-state` —
+ * and this page watches them through `/api/v1/live`. Nothing is fetched on an interval, so the
+ * page costs one WebSocket rather than three requests every few seconds per open tab, and a change
+ * appears when it happens rather than on the next tick.
+ *
+ * ## A tile the caller may not watch is not rendered
+ *
+ * Each topic is gated on the permission the server gates it on, and `useLive*` returns
+ * `permitted: false` rather than an empty count when it is missing. That matters because "0
+ * registered devices" and "you may not see registered devices" look identical as a number, and the
+ * first is an incident.
+ *
+ * ## Not loaded is not zero
+ *
+ * A tile shows a dash until its snapshot arrives. A dashboard that painted `0 active calls`
+ * half a second before the snapshot said `7` would be a number that was briefly, confidently
+ * wrong — which on an operations screen is worse than a number that is briefly absent.
  */
 export default function OverviewPage() {
 	const session = useAppSession();
 	const granted = new Set<string>(session.permissions);
 	const organization = session.activeOrganization;
+	const connection = useLiveStatus();
+
+	const registrations = useLiveRegistrations();
+	const calls = useLiveActiveCalls();
+	const agents = useLiveAgentStates();
+
+	const watchesAnything = useAnyPermission(["extensions.read", "cdr.read", "queues.monitor"]);
 
 	const reachable = NAV_SECTIONS.flatMap((section) => section.items).filter(
 		(item) => item.url !== routes.overview && canAccessPage(item.url, granted),
@@ -32,13 +61,66 @@ export default function OverviewPage() {
 		<>
 			<PageHeader
 				title={organization ? organization.name : "Dashboard"}
-				description="Live call, registration and queue activity will appear here once the engine's event stream lands."
+				description="Live registration, call and queue activity, streamed from the switch as it happens."
 				actions={
-					<Button variant="secondary" render={<Link href={routes.settings} />}>
-						Organization settings
-					</Button>
+					<div className="flex items-center gap-2">
+						{watchesAnything ? <LiveIndicator /> : null}
+						<Button variant="secondary" render={<Link href={routes.settings} />}>
+							Organization settings
+						</Button>
+					</div>
 				}
 			/>
+
+			{watchesAnything ? (
+				<div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+					<LiveTile
+						label="Registered devices"
+						value={registrations.loaded ? String(registrations.liveCount) : null}
+						permitted={registrations.permitted}
+						deniedHint="Needs permission to view extensions."
+						hint={
+							registrations.rows.length > registrations.liveCount
+								? `${String(registrations.rows.length - registrations.liveCount)} binding(s) have lapsed and are being swept`
+								: "Phones currently reachable by the switch."
+						}
+						href={routes.extensions}
+					/>
+					<LiveTile
+						label="Active calls"
+						value={calls.loaded ? String(calls.callCount) : null}
+						permitted={calls.permitted}
+						deniedHint="Needs permission to view call history."
+						hint={
+							calls.callCount === 0
+								? "Nothing in progress."
+								: `${String(calls.answeredCount)} answered, ${String(calls.legs.length)} legs`
+						}
+						href={routes.cdr}
+					/>
+					<LiveTile
+						label="Agents available"
+						value={agents.loaded ? String(agents.availableCount) : null}
+						permitted={agents.permitted}
+						deniedHint="Needs permission to monitor queues."
+						hint={
+							agents.staffedCount === 0
+								? "Nobody is logged in."
+								: `${String(agents.staffedCount)} logged in, ${String(agents.availableCount)} ready for the next caller`
+						}
+						href={routes.queues}
+					/>
+				</div>
+			) : null}
+
+			{connection === "refused" ? (
+				<Card>
+					<CardBody className="text-sm text-muted-foreground">
+						The live connection was refused, which usually means the session ended or the active
+						organization changed. Reload the page to reconnect.
+					</CardBody>
+				</Card>
+			) : null}
 
 			<div className="grid gap-4 sm:grid-cols-2">
 				<Card>
@@ -62,9 +144,7 @@ export default function OverviewPage() {
 				<Card>
 					<CardHeader>
 						<CardTitle>Where to go next</CardTitle>
-						<CardDescription>
-							The areas your role can reach. Most open once the PBX entities ship.
-						</CardDescription>
+						<CardDescription>The areas your role can reach.</CardDescription>
 					</CardHeader>
 					<CardBody>
 						<ul className="flex flex-wrap gap-2">
@@ -80,6 +160,48 @@ export default function OverviewPage() {
 				</Card>
 			</div>
 		</>
+	);
+}
+
+/**
+ * One live figure.
+ *
+ * `value === null` means "not loaded yet" and renders an em dash — deliberately NOT `0`. The two
+ * are indistinguishable on a dashboard and only one of them is a fact.
+ */
+function LiveTile({
+	label,
+	value,
+	hint,
+	href,
+	permitted,
+	deniedHint,
+}: {
+	label: string;
+	value: string | null;
+	hint: string;
+	href: string;
+	permitted: boolean;
+	deniedHint: string;
+}) {
+	return (
+		<Card>
+			<CardBody className="flex flex-col gap-1">
+				<div className="flex items-baseline justify-between gap-2">
+					<p className="text-sm font-medium text-muted-foreground">{label}</p>
+					<Link
+						href={href}
+						className="text-xs text-primary underline-offset-4 hover:underline"
+					>
+						Open
+					</Link>
+				</div>
+				<p className="text-3xl font-semibold text-foreground" data-tabular>
+					{permitted ? (value ?? "—") : "—"}
+				</p>
+				<p className="text-xs text-subtle-foreground">{permitted ? hint : deniedHint}</p>
+			</CardBody>
+		</Card>
 	);
 }
 

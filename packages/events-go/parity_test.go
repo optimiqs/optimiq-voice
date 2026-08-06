@@ -174,6 +174,7 @@ func TestParityConstants(t *testing.T) {
 	rpc := map[string]string{
 		"routingResolve": SubjectRoutingResolveRPC,
 		"authzCheck":     SubjectAuthzCheckRPC,
+		"voicemailList":  SubjectVoicemailListRPC,
 	}
 	if !reflect.DeepEqual(rpc, g.RPCSubjects) {
 		t.Errorf("rpc subjects = %v, golden %v", rpc, g.RPCSubjects)

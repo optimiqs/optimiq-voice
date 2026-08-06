@@ -20,6 +20,13 @@ import { ParkLotsController } from "./park-lots/park-lots.controller";
 import { ParkLotsService } from "./park-lots/park-lots.service";
 import { PhoneNumbersController } from "./phone-numbers/phone-numbers.controller";
 import { PhoneNumbersService } from "./phone-numbers/phone-numbers.service";
+import { AgentStatePublisher } from "./queues/agent-state.publisher";
+import { QueueAgentSessionController } from "./queues/queue-agent-session.controller";
+import { QueueAgentSessionService } from "./queues/queue-agent-session.service";
+import {
+	affectsQueueMembership,
+	QueueMembershipPublisher,
+} from "./queues/queue-membership.publisher";
 import { QueueAgentsController, QueuesController } from "./queues/queues.controller";
 import { QueueAgentsService, QueueTiersService, QueuesService } from "./queues/queues.service";
 import { RingGroupsController } from "./ring-groups/ring-groups.controller";
@@ -85,6 +92,7 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		RingGroupsController,
 		QueuesController,
 		QueueAgentsController,
+		QueueAgentSessionController,
 		ConferencesController,
 		ParkLotsController,
 		FeatureCodesController,
@@ -115,12 +123,15 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		},
 		RoutingCachePublisher,
 		DidIndexPublisher,
+		QueueMembershipPublisher,
+		AgentStatePublisher,
 		{
 			provide: PBX_EFFECT_RUNTIME,
 			useFactory: (
 				database: PbxDatabaseClient,
 				publisher: RoutingCachePublisher,
 				didIndex: DidIndexPublisher,
+				queueMembership: QueueMembershipPublisher,
 			) =>
 				makePbxRepositoryRuntime({
 					database,
@@ -145,8 +156,34 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 							logger.error(`did-index sync failed for ${compiled.cacheKey}`, cause);
 						});
 					},
+					/**
+					 * The queue roster rides on a SEPARATE seam from the artifact, and it has to.
+					 *
+					 * `affectsRouting("queue_agent")` is false by design — `packages/routing` calls
+					 * agent membership live state the engine reads at dial time, so logging somebody in
+					 * must not evict a tenant's compiled artifact — which means `onArtifactCompiled`
+					 * never fires for the two tables that change a roster most often. Hanging the
+					 * publish off `onMutation` instead is what makes "add an agent to a tier" reach the
+					 * engine at all.
+					 *
+					 * Fire-and-forget with an explicit `catch`, for the reason recorded above: the
+					 * mutation already committed, and a bare `void` turns NATS's CONNECTION_DRAINING
+					 * during shutdown into an unhandled rejection that kills the process.
+					 */
+					onMutation: (event) => {
+						if (!affectsQueueMembership(event.tableName)) {
+							return;
+						}
+						queueMembership.syncOrganization(event.organizationId).catch((cause) => {
+							logger.error(
+								`queue-membership sync failed for organization ${event.organizationId} ` +
+									`after a ${event.operation} on ${event.tableName}`,
+								cause,
+							);
+						});
+					},
 				}),
-			inject: [PBX_DATABASE, RoutingCachePublisher, DidIndexPublisher],
+			inject: [PBX_DATABASE, RoutingCachePublisher, DidIndexPublisher, QueueMembershipPublisher],
 		},
 		ExtensionsService,
 		PhoneNumbersService,
@@ -162,6 +199,7 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		QueuesService,
 		QueueAgentsService,
 		QueueTiersService,
+		QueueAgentSessionService,
 		ConferencesService,
 		ParkLotsService,
 		FeatureCodesService,
@@ -176,6 +214,8 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		RoutingService,
 		RoutingCachePublisher,
 		DidIndexPublisher,
+		QueueMembershipPublisher,
+		AgentStatePublisher,
 	],
 })
 export class PbxModule implements OnApplicationShutdown {

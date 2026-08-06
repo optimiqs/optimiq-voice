@@ -12,7 +12,8 @@
 	},
 	"rpcSubjects": {
 		"routingResolve": "rpc.routing.v1.resolve",
-		"authzCheck": "rpc.authz.v1.check"
+		"authzCheck": "rpc.authz.v1.check",
+		"voicemailList": "rpc.voicemail.v1.list"
 	},
 	"queueScopeAll": "_all",
 	"aorSubjectTokens": [

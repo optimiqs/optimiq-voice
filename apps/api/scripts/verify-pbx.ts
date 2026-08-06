@@ -293,7 +293,9 @@ async function main(): Promise<void> {
 	const { createPostgresClient } = await import("@optimiq-voice/db");
 	const { routingCacheKey, ROUTING_CACHE_BUCKET } = await import("@optimiq-voice/routing");
 	const { ROUTING_RESOLVE_RPC } = await import("@optimiq-voice/events/schemas");
-	const { DID_INDEX_KV, kvKeyFor } = await import("@optimiq-voice/events/streams");
+	const { DID_INDEX_KV, kvKeyFor, QUEUE_MEMBERSHIP_KV } = await import(
+		"@optimiq-voice/events/streams"
+	);
 
 	const sql = createPostgresClient({
 		url: databaseUrl,
@@ -1331,6 +1333,120 @@ async function main(): Promise<void> {
 						String(artifact.artifactVersion),
 					);
 				}
+
+				// --- the queue-membership bucket ---------------------------------------------------
+				//
+				// The ACD's read model: the roster `apps/engine` distributes every queued caller
+				// against. It rides on the `onMutation` seam rather than on `onArtifactCompiled`,
+				// because `queue_agent` and `queue_tier` are deliberately NOT routing inputs — so the
+				// interesting assertion is that a tier write, which recompiles NOTHING, still reaches
+				// the bucket.
+				const rosterBucket = await manager.jetstream().views.kv(QUEUE_MEMBERSHIP_KV.name);
+				const rosterKey = kvKeyFor.queueMembership(organizationA, queueId);
+				await delay(600);
+				const rosterEntry = await rosterBucket.get(rosterKey);
+				check("the queue has a roster in the queue-membership bucket", rosterEntry !== null, rosterKey);
+
+				interface RosterValue {
+					readonly orgId?: string;
+					readonly queueId?: string;
+					readonly wrapUpSeconds?: number;
+					readonly tierRulesApply?: boolean;
+					readonly revision?: number;
+					readonly agents?: {
+						readonly agentId: string;
+						readonly contact: string;
+						readonly contactKind: string;
+						readonly level: number;
+						readonly position: number;
+						readonly enabled: boolean;
+					}[];
+				}
+				const readRoster = async (key: string): Promise<RosterValue | undefined> => {
+					const entry = await rosterBucket.get(key);
+					return entry === null || entry.value.length === 0
+						? undefined
+						: (JSON.parse(new TextDecoder().decode(entry.value)) as RosterValue);
+				};
+
+				const roster = await readRoster(rosterKey);
+				check(
+					"the roster names the tenant and the queue it belongs to",
+					roster?.orgId === organizationA && roster.queueId === queueId,
+					`${String(roster?.orgId)} / ${String(roster?.queueId)}`,
+				);
+				check(
+					"the roster holds both tiered agents, ordered by level",
+					roster?.agents?.length === 2 &&
+						roster.agents[0]?.agentId === agentAId &&
+						roster.agents[1]?.agentId === agentBId,
+					JSON.stringify(roster?.agents?.map((agent) => [agent.agentId, agent.level]) ?? []),
+				);
+				check(
+					"an extension agent's contact is a resolved DIAL STRING, not an extension id",
+					roster?.agents?.[0]?.contact === "PJSIP/1002",
+					String(roster?.agents?.[0]?.contact),
+				);
+				check(
+					"an external agent's dial string is passed through untouched",
+					roster?.agents?.[1]?.contact === "+13105550199" &&
+						roster.agents[1]?.contactKind === "external",
+					String(roster?.agents?.[1]?.contact),
+				);
+				check(
+					"the roster carries the tier rules, which are meaningless without the tiers",
+					typeof roster?.tierRulesApply === "boolean" &&
+						typeof roster.wrapUpSeconds === "number",
+					`tierRulesApply=${String(roster?.tierRulesApply)} wrapUp=${String(roster?.wrapUpSeconds)}`,
+				);
+
+				// An agent's CONTACT changing is the case the projection exists for: the roster holds
+				// a dial string derived from `extension.number`, so a renumber moves every queue that
+				// agent serves — and nothing about the queue itself was touched.
+				await clientA("PATCH", `/api/v1/extensions/${extensionBId}`, { number: "1502" });
+				await delay(600);
+				const renumbered = await readRoster(rosterKey);
+				check(
+					"renumbering an extension republishes the rosters that dial it",
+					renumbered?.agents?.[0]?.contact === "PJSIP/1502",
+					String(renumbered?.agents?.[0]?.contact),
+				);
+				check(
+					"…and advances the revision the engine logs",
+					(renumbered?.revision ?? 0) > (roster?.revision ?? 0),
+					`${String(roster?.revision)} -> ${String(renumbered?.revision)}`,
+				);
+
+				// Removing a membership is a `queue_tier` delete, which recompiles nothing at all.
+				const tierList = await clientA("GET", `/api/v1/queues/${queueId}/tiers`);
+				const firstTierId = typeof rows(tierList)[0]?.id === "string" ? String(rows(tierList)[0]?.id) : "";
+				await clientA("DELETE", `/api/v1/queues/${queueId}/tiers/${firstTierId}`);
+				await delay(600);
+				const afterTierDelete = await readRoster(rosterKey);
+				check(
+					"removing a tier takes the seat out of the roster",
+					afterTierDelete?.agents?.length === 1,
+					`${String(afterTierDelete?.agents?.length)} seat(s)`,
+				);
+
+				// Disabling an agent keeps the seat with `enabled: false` — the engine skips it and a
+				// wallboard greys it, which "not in the roster" cannot express.
+				await clientA("PATCH", `/api/v1/queue-agents/${agentBId}`, { enabled: false });
+				await delay(600);
+				const afterDisable = await readRoster(rosterKey);
+				check(
+					"a disabled agent stays in the roster, marked disabled",
+					afterDisable?.agents?.length === 1 && afterDisable.agents[0]?.enabled === false,
+					JSON.stringify(afterDisable?.agents ?? []),
+				);
+
+				const otherRoster = await rosterBucket.get(
+					kvKeyFor.queueMembership(organizationB, queueId),
+				);
+				check(
+					"another tenant has no entry under this queue's id",
+					otherRoster === null || otherRoster.value.length === 0,
+				);
 
 				// --- the did-index bucket ---------------------------------------------------------
 				//

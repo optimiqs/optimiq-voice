@@ -219,6 +219,14 @@
 			"responseSchema": "rpc/rpc.authz.v1.check.response.schema.json",
 			"goRequestType": "AuthzCheckRequest",
 			"goResponseType": "AuthzCheckResponse"
+		},
+		{
+			"subject": "rpc.voicemail.v1.list",
+			"timeoutMs": 3000,
+			"requestSchema": "rpc/rpc.voicemail.v1.list.request.schema.json",
+			"responseSchema": "rpc/rpc.voicemail.v1.list.response.schema.json",
+			"goRequestType": "VoicemailListRequest",
+			"goResponseType": "VoicemailListResponse"
 		}
 	]
 }

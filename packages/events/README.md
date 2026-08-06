@@ -28,6 +28,7 @@ Every subject carries its MAJOR version. Nothing outside `subjects.ts` concatena
 | `provision.evt.v1.<orgId>`                 | `PROVISION`    | type only: `device.requested` · `device.rendered` · `device.rejected`                                                                                                                                 |
 | `rpc.routing.v1.resolve`                   | — (core NATS)  | request-reply                                                                                                                                                                                         |
 | `rpc.authz.v1.check`                       | — (core NATS)  | request-reply                                                                                                                                                                                         |
+| `rpc.voicemail.v1.list`                    | — (core NATS)  | request-reply                                                                                                                                                                                         |
 
 Notes:
 
@@ -181,9 +182,26 @@ guard — it stops an event from being scoped to the wrong tenant by a consumer.
 
 ## Request-reply contracts
 
-`ROUTING_RESOLVE_RPC` and `AUTHZ_CHECK_RPC` are subject + request schema + response schema + a
-suggested timeout. Wire them with NestJS `@MessagePattern(ROUTING_RESOLVE_RPC.subject)` and a
-`ClientProxy`. `rpc.media.*` arrives with `apps/mediad`.
+`ROUTING_RESOLVE_RPC`, `AUTHZ_CHECK_RPC` and `VOICEMAIL_LIST_RPC` are subject + request schema +
+response schema + a suggested timeout. Wire them with NestJS
+`@MessagePattern(ROUTING_RESOLVE_RPC.subject)` and a `ClientProxy`. `rpc.media.*` arrives with
+`apps/mediad`.
+
+### `rpc.voicemail.v1.list` — no responder yet
+
+`apps/engine` calls it from the `*97` menu (`routing/voicemail-mailbox.source.ts`); **nothing
+answers it.** The API-side responder is a named follow-up, and the engine is built to survive its
+absence rather than to discover it.
+
+The one thing an implementor must not get wrong is the response's two failure shapes. `found: false`
+means "this mailbox could not be read"; `found: true` with an empty `messages` means "this folder is
+empty". They are separate fields because the engine says something different for each, and telling
+somebody with nine messages that they have none is a worse outcome than any error.
+
+The responder must also **check `mailboxNumber` against `voicemailBoxId`** rather than trusting it.
+The engine authenticates a caller (PIN, plus the calling extension) before it asks, but a request
+that arrived on the broker is not itself authorisation — without that check any process on the
+network can read any tenant's messages by naming a box id.
 
 ## TODO — Go struct generation (blocked on `apps/mediad`)
 

@@ -17,14 +17,17 @@ import { PBX_CHILDREN, PBX_RESOURCES } from "~/lib/pbx/client";
 import { describeDestination, readDestination } from "~/lib/pbx/destinations";
 import { queueTabHref, routes } from "~/lib/routes";
 import { usePermission } from "../../_context/session-context";
+import { useLiveAgentStates, useLiveQueue } from "../../_hooks/use-live-queries";
 import {
 	usePbxChildDelete,
 	usePbxChildren,
 	usePbxItem,
 	usePbxList,
 } from "../../_hooks/use-pbx-queries";
+import { AgentSessionControls, LiveIndicator } from "./agent-console";
 import { QueueDialog } from "./queue-dialog";
 import { AgentStatusBadge } from "./queue-shared";
+import type { QueueAgentStatus } from "~/lib/pbx/contracts";
 import { QueueTierDialog } from "./queue-tier-dialog";
 import type { QueueAgentRow, QueueRow, QueueTierRow } from "~/lib/pbx/contracts";
 
@@ -45,6 +48,19 @@ import type { QueueAgentRow, QueueRow, QueueTierRow } from "~/lib/pbx/contracts"
  * API has no reorder endpoint for tiers and that is a decision rather than a gap: a tier's place is
  * routing policy the caller states, not a list the user rearranges. Sorting is done here, on the
  * same keys the server orders by.
+ *
+ * ## Live state overrides the row, never the other way round
+ *
+ * `queue_agent.status` is a persisted LAST-KNOWN value (`packages/pbx-db` says so) and the
+ * `agent-state` KV bucket is what distribution actually reads. The engine writes `ringing` and
+ * `on-call` into the bucket without touching Postgres, so the column is behind by construction —
+ * never ahead. The table therefore prefers the socket's answer and falls back to the row, which is
+ * what makes the first paint say something true instead of nothing.
+ *
+ * The waiting-caller count is derived from the queue event stream and has no snapshot behind it:
+ * the engine holds the waiting list in memory, so a page opened while callers are already queued
+ * starts at zero and becomes correct as the queue turns over. That is labelled rather than hidden —
+ * a count that claimed to be complete would be worse than one that says it is watching.
  */
 export function QueueDetail({ queueId }: { queueId: string }) {
 	const queue = usePbxItem(PBX_RESOURCES.queues, queueId);
@@ -57,6 +73,11 @@ export function QueueDetail({ queueId }: { queueId: string }) {
 
 	const canWrite = usePermission(PBX_RESOURCES.queues.permissions.write);
 	const canManageAgents = usePermission(PBX_RESOURCES.queueAgents.permissions.write);
+	const canMonitor = usePermission("queues.monitor");
+	const canJoinAny = usePermission("queues.join");
+
+	const agentStates = useLiveAgentStates();
+	const liveQueue = useLiveQueue(canMonitor ? queueId : null);
 
 	const [queueDialogOpen, setQueueDialogOpen] = useState(false);
 	const [editingTier, setEditingTier] = useState<QueueTierRow | null>(null);
@@ -112,6 +133,7 @@ export function QueueDetail({ queueId }: { queueId: string }) {
 				).toLowerCase()}.`}
 				actions={
 					<div className="flex items-center gap-2">
+						{canMonitor ? <LiveIndicator /> : null}
 						<Button render={<Link href={routes.queues} />} variant="ghost">
 							All queues
 						</Button>
@@ -123,6 +145,39 @@ export function QueueDetail({ queueId }: { queueId: string }) {
 					</div>
 				}
 			/>
+
+			{canMonitor ? (
+				<div className="grid gap-4 sm:grid-cols-3">
+					<LiveTile
+						label="Waiting now"
+						value={String(liveQueue.waiting.length)}
+						hint={
+							liveQueue.loaded
+								? "Callers who joined while this page was open."
+								: "Counting from the moment this page opened — the engine holds the waiting list, so earlier callers are not included."
+						}
+					/>
+					<LiveTile
+						label="Staffed"
+						value={String(
+							rows.filter((tier) => {
+								const status = agentStates.byAgentId.get(tier.queueAgentId)?.status;
+								return status !== undefined && status !== "logged-out";
+							}).length,
+						)}
+						hint={`of ${String(rows.length)} agent${rows.length === 1 ? "" : "s"} on this queue`}
+					/>
+					<LiveTile
+						label="Available"
+						value={String(
+							rows.filter(
+								(tier) => agentStates.byAgentId.get(tier.queueAgentId)?.status === "available",
+							).length,
+						)}
+						hint="Ready to be offered the next caller."
+					/>
+				</div>
+			) : null}
 
 			{!tiers.isPending && staffed.length === 0 ? (
 				<NoticeBanner
@@ -201,7 +256,23 @@ export function QueueDetail({ queueId }: { queueId: string }) {
 						header: "Status",
 						cell: (tier) => {
 							const agent = agentsById.get(tier.queueAgentId);
-							return agent ? <AgentStatusBadge status={agent.status} /> : "—";
+							if (!agent) {
+								return "—";
+							}
+							// The socket first, the row second. See the class header.
+							const status = (agentStates.byAgentId.get(tier.queueAgentId)?.status ??
+								agent.status) as QueueAgentStatus;
+							return (
+								<div className="flex items-center gap-2">
+									<AgentStatusBadge status={status} />
+									<AgentSessionControls
+										agentId={agent.id}
+										agentName={agent.name}
+										status={status}
+										canManage={canJoinAny || canManageAgents}
+									/>
+								</div>
+							);
 						},
 					},
 					{
@@ -284,5 +355,24 @@ export function QueueDetail({ queueId }: { queueId: string }) {
 				}}
 			/>
 		</>
+	);
+}
+
+/**
+ * One live number.
+ *
+ * A plain card rather than a chart: the useful question on a queue page is "how many, right now",
+ * and a sparkline would be inventing a history the client does not have (there is no snapshot
+ * behind the waiting count — see the class header).
+ */
+function LiveTile({ label, value, hint }: { label: string; value: string; hint: string }) {
+	return (
+		<div className="rounded-panel border border-border bg-surface px-4 py-3">
+			<p className="text-xs font-medium text-muted-foreground">{label}</p>
+			<p className="mt-1 text-2xl font-semibold text-foreground" data-tabular>
+				{value}
+			</p>
+			<p className="mt-1 text-xs text-subtle-foreground">{hint}</p>
+		</div>
 	);
 }

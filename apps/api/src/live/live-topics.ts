@@ -1,0 +1,136 @@
+import { hasPermission, type Permission } from "@optimiq-voice/auth";
+
+/**
+ * The live channel's topic grammar, and the permission each topic is gated on.
+ *
+ * ## Why topics are a closed vocabulary and not a subject filter
+ *
+ * The obvious design is to let a client subscribe to a NATS subject filter and check permissions
+ * against it. It is also how a client ends up subscribing to `>` and how a permission check ends up
+ * being a pattern-matching problem. A closed set of four topics means the mapping from "what the
+ * client asked for" to "what may be read" is a lookup, the upstream subjects are chosen by the
+ * server, and the organization id is never something the client sends — it comes from the session,
+ * exactly as it does on every REST route (oikos §4: no controller accepts a tenant from a caller).
+ *
+ * ## The permission mapping, and why each one
+ *
+ * | Topic            | Permission         | Reasoning                                              |
+ * | ---------------- | ------------------ | ------------------------------------------------------ |
+ * | `registrations`  | `extensions.read`  | A registration is an extension's device being reachable |
+ * | `active-calls`   | `cdr.read`         | The live view of what call history shows afterwards     |
+ * | `queue:<id>`     | `queues.monitor`   | Literally "Watch live queue and agent state"            |
+ * | `agent-state`    | `queues.monitor`   | Same surface, org-wide rather than per queue            |
+ *
+ * `registrations → extensions.read` rather than `devices.read`: the bucket is keyed by AOR and an
+ * AOR is an extension, so an operator who may not see the extension list must not be handed a live
+ * feed of which of them are online — that feed IS the extension list, one field wider.
+ *
+ * `active-calls → cdr.read` is the one worth arguing with, and the argument for it is that there is
+ * no honest alternative. The registry has no `calls.*` resource, and a live call feed carries
+ * exactly what `cdr.read` grants after the fact — who called whom, from where, for how long — with
+ * the only difference being latency. Gating "the same data, sooner" more loosely than "the same
+ * data, later" would be a hole; gating it on a NEW permission would mean the ninety-first entry in
+ * a registry at its documented ceiling, for a distinction nobody has asked for. Recorded here so
+ * that when a wallboard role does need calls without history, adding `calls.monitor` is a
+ * deliberate change to one table rather than a rediscovery.
+ *
+ * Note what falls out of this for the `agent` role, and that it is the intended shape: an agent
+ * holds `queues.monitor` and `queues.read` but only `extensions.read.own` and `cdr.read.own`, and
+ * `hasPermission` does not let a scoped grant satisfy an unscoped requirement. So an agent's
+ * console sees its queues and its own state, and is refused the registrations and active-calls
+ * feeds — which is exactly the wallboard/agent split the role templates already describe.
+ */
+
+export const LIVE_TOPIC_KINDS = ["registrations", "active-calls", "queue", "agent-state"] as const;
+export type LiveTopicKind = (typeof LIVE_TOPIC_KINDS)[number];
+
+/** A parsed topic. `queue` is the only one that carries an id. */
+export type LiveTopic =
+	| { readonly kind: "registrations" }
+	| { readonly kind: "active-calls" }
+	| { readonly kind: "agent-state" }
+	| { readonly kind: "queue"; readonly queueId: string };
+
+export const LIVE_TOPIC_PERMISSIONS = {
+	registrations: "extensions.read",
+	"active-calls": "cdr.read",
+	queue: "queues.monitor",
+	"agent-state": "queues.monitor",
+} as const satisfies Record<LiveTopicKind, Permission>;
+
+/**
+ * The upstream this server has to be reading for a topic to produce anything.
+ *
+ * One topic can need two (`active-calls` reads the `channels` bucket for state AND the call event
+ * stream for transitions, because a bucket says what IS and a stream says what CHANGED, and a
+ * wallboard that only had the first would redraw a whole table to show one leg answering). Sources
+ * are ref-counted independently, so two topics sharing one open it once.
+ */
+export const LIVE_SOURCES = [
+	"registrations-kv",
+	"channels-kv",
+	"call-events",
+	"agent-state-kv",
+	"queue-events",
+] as const;
+export type LiveSource = (typeof LIVE_SOURCES)[number];
+
+export const LIVE_TOPIC_SOURCES = {
+	registrations: ["registrations-kv"],
+	"active-calls": ["channels-kv", "call-events"],
+	queue: ["queue-events", "agent-state-kv"],
+	"agent-state": ["agent-state-kv", "queue-events"],
+} as const satisfies Record<LiveTopicKind, readonly LiveSource[]>;
+
+/** A UUID, which is what every queue id on this platform is (`packages/identifiers`). */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+
+/**
+ * Parses a wire topic.
+ *
+ * Returns `undefined` rather than throwing, and rejects a `queue:` whose id is not a UUID — which
+ * is both a validation and a safety check, because the id becomes a NATS subject token and a value
+ * that is not one would either throw inside the subject builder or, worse, build a filter with a
+ * wildcard in it.
+ */
+export function parseLiveTopic(value: string): LiveTopic | undefined {
+	if (value === "registrations" || value === "active-calls" || value === "agent-state") {
+		return { kind: value };
+	}
+	const queuePrefix = "queue:";
+	if (value.startsWith(queuePrefix)) {
+		const queueId = value.slice(queuePrefix.length);
+		return UUID_PATTERN.test(queueId) ? { kind: "queue", queueId } : undefined;
+	}
+	return undefined;
+}
+
+/** The canonical wire form. Used as the map key, so it must round-trip `parseLiveTopic`. */
+export function formatLiveTopic(topic: LiveTopic): string {
+	return topic.kind === "queue" ? `queue:${topic.queueId}` : topic.kind;
+}
+
+export function permissionForTopic(topic: LiveTopic): Permission {
+	return LIVE_TOPIC_PERMISSIONS[topic.kind];
+}
+
+export function sourcesForTopic(topic: LiveTopic): readonly LiveSource[] {
+	return LIVE_TOPIC_SOURCES[topic.kind];
+}
+
+/**
+ * Whether a caller may subscribe.
+ *
+ * `hasPermission` is the same predicate the HTTP guard uses, including its rule that an unscoped
+ * grant covers its scopes and a scoped one never covers the unscoped requirement. That direction is
+ * the whole gate here: `cdr.read.own` means "calls you were on", and there is no per-connection
+ * filter that could turn an org-wide live feed into that.
+ */
+export function mayReadTopic(granted: Iterable<string>, topic: LiveTopic): boolean {
+	return hasPermission(granted, permissionForTopic(topic));
+}
+
+/** The topics a caller could subscribe to at all, for the `welcome` frame. */
+export function allowedTopicKinds(granted: Iterable<string>): readonly LiveTopicKind[] {
+	return LIVE_TOPIC_KINDS.filter((kind) => hasPermission(granted, LIVE_TOPIC_PERMISSIONS[kind]));
+}
