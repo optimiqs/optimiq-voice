@@ -27,7 +27,9 @@
 				"unknown-vendor",
 				"template-missing",
 				"rate-limited",
-				"disabled"
+				"disabled",
+				"ip-not-allowed",
+				"not-configured"
 			]
 		},
 		"detail": {

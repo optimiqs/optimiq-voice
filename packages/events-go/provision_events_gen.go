@@ -69,6 +69,8 @@ const (
 	ProvisionDeviceRejectedReasonTemplateMissing ProvisionDeviceRejectedReason = "template-missing"
 	ProvisionDeviceRejectedReasonRateLimited     ProvisionDeviceRejectedReason = "rate-limited"
 	ProvisionDeviceRejectedReasonDisabled        ProvisionDeviceRejectedReason = "disabled"
+	ProvisionDeviceRejectedReasonIPNotAllowed    ProvisionDeviceRejectedReason = "ip-not-allowed"
+	ProvisionDeviceRejectedReasonNotConfigured   ProvisionDeviceRejectedReason = "not-configured"
 )
 
 // ProvisionDeviceRejectedReasonValues lists every member of the vocabulary, in contract order.
@@ -80,6 +82,8 @@ var ProvisionDeviceRejectedReasonValues = []ProvisionDeviceRejectedReason{
 	ProvisionDeviceRejectedReasonTemplateMissing,
 	ProvisionDeviceRejectedReasonRateLimited,
 	ProvisionDeviceRejectedReasonDisabled,
+	ProvisionDeviceRejectedReasonIPNotAllowed,
+	ProvisionDeviceRejectedReasonNotConfigured,
 }
 
 // Valid reports whether v is a member of the ProvisionDeviceRejectedReason vocabulary.

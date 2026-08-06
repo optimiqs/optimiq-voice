@@ -14,6 +14,24 @@ import { extension } from "./extensions-schema";
  * device by MAC, user agent or source IP; ours resolves by a per-device bearer token carried in
  * the URL, so `provisioning_token` is unique across the whole database (a provisioning request
  * arrives with no organization context and must resolve the tenant from the token alone).
+ *
+ * ## The token is split, and only half of it is a secret
+ *
+ * The provisioning URL carries `<reference>.<secret>`. The **reference** is what
+ * `provisioning_token` holds: a random, globally-unique, non-secret handle whose only job is the
+ * one this column was created for — resolving a tenant before a tenant is known. The **secret** is
+ * never stored; {@link device.provisioningTokenHash} holds its SHA-256, and the render path
+ * compares digests in constant time.
+ *
+ * That split is what makes a database dump useless to an attacker. A single plaintext column would
+ * mean every row in a leaked backup is a working, unauthenticated configuration URL for a phone
+ * that is registered on somebody's desk — which is the FusionPBX failure mode this whole design
+ * exists to avoid, merely moved from the network to the disk.
+ *
+ * `provisioning_token_hash` is nullable ONLY for the compatibility window: rows written before the
+ * split have a plaintext token and no hash, and the render path still accepts them by exact match
+ * so an existing deployment's phones keep provisioning until their tokens are rotated. A row with a
+ * hash NEVER takes that path. See `apps/api/src/provisioning/render/provision-token.ts`.
  */
 
 /** v1 provisioning catalogue — roughly 80% of the installed base. */
@@ -120,10 +138,20 @@ export const device = pgTable.withRLS(
 			onDelete: "set null",
 		}),
 		/**
-		 * Bearer token in the provisioning URL. Globally unique because the provisioning request
-		 * has no tenant context; rotate it to revoke a stolen config URL.
+		 * The NON-SECRET half of the provisioning URL's token: a random reference that resolves this
+		 * row without a tenant context. Globally unique because the provisioning request has none;
+		 * rotate it — together with the secret — to revoke a stolen config URL.
 		 */
 		provisioningToken: text("provisioning_token").notNull(),
+		/**
+		 * `sha256(secret)`, lower-case hex. The secret itself is shown to an administrator once, at
+		 * mint time, and is never recoverable from this database.
+		 *
+		 * NULL means a row from before the split, whose `provisioning_token` is still the whole
+		 * plaintext token. Rotating that device fills this in and the legacy path stops applying to
+		 * it.
+		 */
+		provisioningTokenHash: text("provisioning_token_hash"),
 		provisioningTokenExpiresAt: utcTimestamp("provisioning_token_expires_at"),
 		lastProvisionedAt: utcTimestamp("last_provisioned_at"),
 		lastProvisionedIp: text("last_provisioned_ip"),
@@ -134,6 +162,11 @@ export const device = pgTable.withRLS(
 	(table) => [
 		uniqueIndex("device_organization_mac_address_key").on(table.organizationId, table.macAddress),
 		uniqueIndex("device_provisioning_token_key").on(table.provisioningToken),
+		/**
+		 * Global for the same reason the reference's index is, and unique for a second one: two
+		 * devices sharing a secret digest would make one stolen URL serve both.
+		 */
+		uniqueIndex("device_provisioning_token_hash_key").on(table.provisioningTokenHash),
 		index("device_organization_enabled_idx").on(table.organizationId, table.enabled),
 		index("device_organization_profile_idx").on(table.organizationId, table.deviceProfileId),
 		tenantIsolationPolicy("device"),

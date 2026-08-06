@@ -32,6 +32,7 @@ export const REFERENCE_KIND_LABELS: Readonly<Record<string, string>> = {
 	conference: "Conference",
 	"voicemail-box": "Voicemail box",
 	"voicemail-option": "Voicemail option",
+	device: "Device",
 };
 
 export function referenceKindLabel(kind: string): string {
@@ -68,6 +69,7 @@ const KIND_LISTINGS: Readonly<Record<string, KindListing>> = {
 	conference: { path: routes.conferences, searchKey: "q" },
 	"voicemail-box": { path: routes.voicemail, searchKey: "q" },
 	"voicemail-option": { path: routes.voicemail, searchKey: "q" },
+	device: { path: routes.devices, searchKey: "q" },
 };
 
 /**

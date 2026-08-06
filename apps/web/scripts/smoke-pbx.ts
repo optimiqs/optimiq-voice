@@ -289,11 +289,15 @@ async function main(): Promise<void> {
 			"./src/auth/auth-bootstrap.ts"
 		);
 		const { PbxModule } = await import("./src/pbx/pbx.module.ts");
+		// Provisioning rides on the PBX area and is gated on the same two conditions; see
+		// \`apps/api/src/main.ts\`. Mounting it here is what makes the devices screen's CONTRACT
+		// checkable rather than only its markup.
+		const { ProvisioningModule } = await import("./src/provisioning/provisioning.module.ts");
 		// \`warn\` is on because development email delivery is a LOGGING stub — the one-time
 		// verification link is written to the log rather than sent, and section 12 needs it to put a
 		// second real member in the organization. See \`apps/api/src/auth/auth-email.delivery.ts\`.
 		const app = await NestFactory.create(
-			createApiRootModule([], [PbxModule]),
+			createApiRootModule([], [PbxModule, ProvisioningModule]),
 			new FastifyAdapter(),
 			{ logger: ["error", "warn"] },
 		);
@@ -322,6 +326,18 @@ async function main(): Promise<void> {
 				// reading `carrier/status` rather than by booting a second API.
 				TELNYX_API_KEY: "smoke-pbx-carrier-key",
 				TELNYX_API_BASE: fakeTelnyx.baseUrl,
+				/**
+				 * Provisioning, configured. Without these the render endpoint answers 503 and the mint
+				 * endpoint refuses — which is a state worth rendering, and the devices screen shows it as
+				 * a banner, but it is not the state this section is about.
+				 *
+				 * `PROVISION_BASE_URL` is the API's own origin rather than the web app's: a phone fetches
+				 * its configuration from wherever the SIP edge is published, which is not the hostname an
+				 * administrator signs in to.
+				 */
+				PROVISION_SIP_SERVER: "pbx.smoke.optimiq.test",
+				PROVISION_SIP_SECRET_KEY: "smoke-provisioning-root-key-0123456789",
+				PROVISION_BASE_URL: apiUrl,
 			},
 			stdio: ["ignore", "pipe", "pipe"],
 		},
@@ -468,6 +484,10 @@ async function main(): Promise<void> {
 
 		const routes = [
 			"/extensions",
+			"/devices",
+			// The profiles tab is a second view of the same subject rather than a second route, so a
+			// tab that 404s or crashes would otherwise be invisible to a route list.
+			"/devices?tab=profiles",
 			"/numbers",
 			// The order tab is a second view of the same subject rather than a second route, so it is
 			// only reachable — and only renderable — through the query state. A tab that 404s or
@@ -1374,10 +1394,7 @@ async function main(): Promise<void> {
 			Object.keys(data(smokeMailbox)).join(","),
 		);
 
-		const smokeMessages = await client(
-			"GET",
-			`/api/v1/voicemail-boxes/${smokeMailboxId}/messages`,
-		);
+		const smokeMessages = await client("GET", `/api/v1/voicemail-boxes/${smokeMailboxId}/messages`);
 		check(
 			"the messages drawer's list endpoint answers",
 			smokeMessages.status === 200,
@@ -1408,16 +1425,17 @@ async function main(): Promise<void> {
 				!Object.hasOwn(data(smokeSetPin), "pinHash"),
 			JSON.stringify(data(smokeSetPin)),
 		);
-		const smokeClearPin = await client(
-			"DELETE",
-			`/api/v1/voicemail-boxes/${smokeMailboxId}/pin`,
-		);
+		const smokeClearPin = await client("DELETE", `/api/v1/voicemail-boxes/${smokeMailboxId}/pin`);
 		check(
 			"clearing it answers with pinSet false",
 			smokeClearPin.status === 200 && data(smokeClearPin).pinSet === false,
 			JSON.stringify(data(smokeClearPin)),
 		);
 		await client("DELETE", `/api/v1/voicemail-boxes/${smokeMailboxId}`);
+
+		// --- 16. devices: the provisioning contract, as the screen builds it ------------------------
+		console.log("\n16. devices and provisioning");
+		await runDeviceChecks(client);
 	} finally {
 		next?.kill("SIGTERM");
 		apiProcess.kill("SIGTERM");
@@ -1434,6 +1452,126 @@ async function main(): Promise<void> {
 		}
 		process.exitCode = 1;
 	}
+}
+
+/**
+ * The devices screen's contract, exercised with the exact bodies the forms build.
+ *
+ * The interesting claims are the two a unit test cannot make. First, that the create response
+ * carries `provisioning.token` — the screen renders a page-level panel off that key and would show
+ * nothing at all if the server put it somewhere else. Second, that the row a later read returns
+ * carries only the NON-SECRET reference, which is what makes "shown once" a true statement rather
+ * than a UI convention.
+ */
+async function runDeviceChecks(client: Client): Promise<void> {
+	const catalog = await client("GET", "/api/v1/provisioning/catalog");
+	const vendors = Array.isArray(data(catalog).vendors)
+		? (data(catalog).vendors as Record<string, unknown>[])
+		: [];
+	check(
+		"the vendor catalogue is served, so the picker is not hard-coded",
+		catalog.status === 200 && vendors.length > 0,
+		`${vendors.length} vendors`,
+	);
+	check(
+		"every catalogue entry carries the caveats the form renders beside the vendor",
+		vendors.every((entry) => Array.isArray(entry.caveats)),
+	);
+
+	const mac = `0015${Date.now().toString(16).slice(-8)}`.slice(0, 12);
+	/**
+	 * The body `device-dialog.tsx` sends, field for field — including the nulls a cleared optional
+	 * text field becomes. A smoke that sent a hand-written body would prove the API works and
+	 * nothing about whether the form is talking to it correctly.
+	 */
+	const created = await client("POST", "/api/v1/devices", {
+		macAddress: mac.toUpperCase().replace(/(..)(?=.)/gu, "$1:"),
+		vendor: "yealink",
+		model: "T54W",
+		label: "Smoke device",
+		deviceProfileId: null,
+		settings: { "local_time.time_zone": "+0" },
+		enabled: true,
+	});
+	const deviceId = rowId(created);
+	check(
+		"the create body the dialog builds is accepted",
+		created.status === 200 || created.status === 201,
+		`status ${created.status}`,
+	);
+	check(
+		"the MAC comes back normalized, which is what makes the uniqueness index real",
+		data(created).macAddress === mac,
+		String(data(created).macAddress),
+	);
+
+	const provisioning = created.body.provisioning as Record<string, unknown> | undefined;
+	check(
+		"create carries the once-only provisioning token the panel renders",
+		typeof provisioning?.token === "string" && String(provisioning.token).includes("."),
+	);
+	check(
+		"and the full URL, built from the API's own public base",
+		typeof provisioning?.configUrl === "string" &&
+			String(provisioning.configUrl).includes("/provision/"),
+		String(provisioning?.configUrl),
+	);
+
+	const read = await client("GET", `/api/v1/devices/${deviceId}`);
+	check(
+		"a later read carries only the non-secret reference — 'shown once' is literally true",
+		read.status === 200 &&
+			typeof data(read).provisioningToken === "string" &&
+			!String(provisioning?.token ?? "").startsWith(`${String(data(read).provisioningToken)}.x`) &&
+			String(provisioning?.token ?? "").startsWith(`${String(data(read).provisioningToken)}.`),
+	);
+
+	const rotated = await client("POST", `/api/v1/devices/${deviceId}/provisioning-token`, {});
+	const rotatedToken = (rotated.body.provisioning as Record<string, unknown> | undefined)?.token;
+	check(
+		"rotating returns a different token, which is what the confirmation dialog promises",
+		rotated.status === 201 &&
+			typeof rotatedToken === "string" &&
+			rotatedToken !== provisioning?.token,
+		`status ${rotated.status}`,
+	);
+
+	const profile = await client("POST", "/api/v1/device-profiles", {
+		name: `Smoke profile ${Date.now().toString(36)}`,
+		description: null,
+		vendor: "yealink",
+		model: null,
+		settings: { "features.dnd.enable": "1" },
+		enabled: true,
+	});
+	const profileId = rowId(profile);
+	check(
+		"the profile body the dialog builds is accepted",
+		profile.status === 201,
+		`status ${profile.status}`,
+	);
+
+	await client("PATCH", `/api/v1/devices/${deviceId}`, { deviceProfileId: profileId });
+	const refused = await client("DELETE", `/api/v1/device-profiles/${profileId}`);
+	check(
+		"deleting a profile in use is refused with the taxonomy the delete dialog decodes",
+		refused.status === 409 && pbxErrorCode(asApiError(refused)) === "PBX_REFERENCED",
+		`status ${refused.status}`,
+	);
+	check(
+		"and its referrers resolve to links the dialog can render",
+		pbxReferences(asApiError(refused)).every(
+			(reference: EntityReference) => referenceHref(reference) !== undefined,
+		),
+	);
+
+	await client("DELETE", `/api/v1/devices/${deviceId}`);
+	const cleaned = await client("DELETE", `/api/v1/device-profiles/${profileId}`);
+	check(
+		"and the profile deletes cleanly once nothing points at it",
+		cleaned.status === 200,
+		`status ${cleaned.status}`,
+	);
 }
 
 function firstId(response: JsonResponse): string {

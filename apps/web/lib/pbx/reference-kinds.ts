@@ -27,4 +27,11 @@ export const DESTINATION_SITE_KINDS: readonly string[] = [
 	"voicemail-box",
 	"feature-code",
 	"conference",
+	/**
+	 * A device holds a scalar reference to a device PROFILE, so deleting a profile a fleet still
+	 * uses is refused and names the devices. That delete is the one place a `device` appears in a
+	 * `PBX_REFERENCED` body — a device is never a destination, because a call is routed to an
+	 * extension and the registrar decides which of its handsets ring.
+	 */
+	"device",
 ];

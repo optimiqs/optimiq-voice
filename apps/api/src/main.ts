@@ -18,6 +18,7 @@ import { registerLiveTransport } from "./live/live-bootstrap";
 import { LiveModule } from "./live/live.module";
 import { isPbxAreaEnabled, registerPbxTransport } from "./pbx/pbx-bootstrap";
 import { PbxModule } from "./pbx/pbx.module";
+import { ProvisioningModule } from "./provisioning/provisioning.module";
 
 const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
@@ -94,8 +95,23 @@ async function bootstrap() {
 	 * it without the PBX area would be a socket with nothing on the other end and an environment
 	 * contract with two owners.
 	 */
+	/**
+	 * Device provisioning rides on the PBX area for the same reasons, and is gated on exactly the
+	 * same two conditions.
+	 *
+	 * It injects `PBX_DATABASE`, `PBX_EFFECT_RUNTIME` and `PBX_ENV` from `PbxModule` rather than
+	 * building a second pool, so without `PBX_DATABASE_URL` there is nothing for it to mount on; and
+	 * its CRUD half is a dozen `@RequirePermissions`-guarded endpoints, so without the auth slice
+	 * mounting it would publish a tenant's device inventory — including the endpoint that rotates
+	 * provisioning credentials — unauthenticated.
+	 *
+	 * Composed HERE rather than in `AppModule.imports`, deliberately: `AppModule` is the root on a
+	 * deployment with no auth slice and no telephony database, and an unconditional import there
+	 * would make such a deployment fail to boot on a `PBX_DATABASE_URL` it has no use for. This is
+	 * the seam `PbxModule`, `LiveModule` and `CdrModule` are already composed through.
+	 */
 	const extraModules = [
-		...(pbxAreaEnabled ? [PbxModule, LiveModule] : []),
+		...(pbxAreaEnabled ? [PbxModule, ProvisioningModule, LiveModule] : []),
 		...(cdrAreaEnabled ? [CdrModule] : []),
 	];
 	const rootModule: Type<unknown> = authSliceEnabled

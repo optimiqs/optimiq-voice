@@ -44,15 +44,7 @@ export const queryKeys = {
 	 * entry.
 	 */
 	voicemailMessagesFor: (organizationId: string, boxId: string) =>
-		[
-			"organizations",
-			organizationId,
-			"pbx",
-			"voicemail-boxes",
-			"item",
-			boxId,
-			"messages",
-		] as const,
+		["organizations", organizationId, "pbx", "voicemail-boxes", "item", boxId, "messages"] as const,
 	voicemailMessages: (
 		organizationId: string,
 		boxId: string,
@@ -80,6 +72,19 @@ export const queryKeys = {
 	/** The compile/simulate surface, which reads the whole configuration rather than one table. */
 	routingCompile: (organizationId: string) =>
 		["organizations", organizationId, "pbx", "routing", "compile"] as const,
+
+	/**
+	 * Which vendors this deployment can provision, and whether it is configured to provision at all.
+	 *
+	 * Organization-scoped even though the answer is deployment-wide, for the reason `carrierStatus`
+	 * is: it is only ever read inside an organization's shell, and scoping it keeps one rule — every
+	 * key under `organizations/<id>` dies on an org switch — rather than one rule and an exception.
+	 *
+	 * NOT filed under `pbx/devices`: a device mutation must not invalidate it, because no device edit
+	 * can change which templates the API has or which environment variables an operator has set.
+	 */
+	provisioningCatalog: (organizationId: string) =>
+		["organizations", organizationId, "provisioning", "catalog"] as const,
 
 	/**
 	 * The carrier surface.

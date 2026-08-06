@@ -100,6 +100,9 @@ describe("tenant tables", () => {
 	const DELIBERATELY_GLOBAL_INDEXES = new Set([
 		// A provisioning token arrives from a phone that has not told anyone who it belongs to.
 		"device_provisioning_token_key",
+		// The secret half of the same token, hashed. Global for the same reason, and unique so one
+		// stolen URL cannot resolve to two devices.
+		"device_provisioning_token_hash_key",
 		// A DID has exactly one owner on the PSTN, so it has exactly one owner here. Uniqueness is
 		// the point rather than a lookup path: it is what makes "two tenants claim one number"
 		// impossible at the moment of the write, and therefore what makes the `did-index` KV bucket

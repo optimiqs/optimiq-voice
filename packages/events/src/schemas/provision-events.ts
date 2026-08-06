@@ -62,6 +62,23 @@ export const deviceRejectedDataSchema = z.object({
 		"template-missing",
 		"rate-limited",
 		"disabled",
+		/**
+		 * The token verified, but the request came from an address the organization's provisioning
+		 * ACL refuses.
+		 *
+		 * Its own reason rather than being folded into `disabled`, because the two mean opposite
+		 * things to whoever is counting them: `disabled` is an administrator's own configuration
+		 * doing what it was told, while this one is a VALID credential being presented from an
+		 * unexpected network — which is what a stolen provisioning URL looks like from the outside,
+		 * and is the single most actionable signal this event family carries.
+		 */
+		"ip-not-allowed",
+		/**
+		 * The deployment cannot render configurations at all yet (no SIP server or no secret root
+		 * key). Not the device's fault and not an attack; separated so an operator's missing
+		 * variable is not counted as a rejection in the anti-fraud view.
+		 */
+		"not-configured",
 	]),
 	detail: z.string().max(512).optional(),
 });

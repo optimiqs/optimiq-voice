@@ -55,7 +55,7 @@ export const NAV_SECTIONS: readonly NavSection[] = [
 		label: "Telephony",
 		items: [
 			{ title: "Extensions", url: routes.extensions, icon: PhoneIcon },
-			{ title: "Devices", url: routes.devices, icon: DeviceIcon, comingSoon: true },
+			{ title: "Devices", url: routes.devices, icon: DeviceIcon },
 			{ title: "Numbers", url: routes.numbers, icon: HashIcon },
 			{ title: "Trunks", url: routes.trunks, icon: TrunkIcon },
 		],

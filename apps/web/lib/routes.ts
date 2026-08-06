@@ -101,6 +101,23 @@ export function routingTabHref(tab: RoutingTab): string {
 }
 
 /**
+ * The Devices page's two sections.
+ *
+ * A device profile is not something an administrator sets out to manage — it is something they
+ * reach for while managing devices, and it is gated by the same `devices.*` grants because editing
+ * one edits the configuration of every phone that uses it. So a second sidebar entry would be a
+ * second way to say "phones", and a second route would need a `PAGE_PERMISSIONS` line duplicating
+ * `devices.read`. The tab lives in `?tab=` so a support conversation about a profile is a link.
+ */
+export const DEVICE_TABS = ["devices", "profiles"] as const;
+
+export type DeviceTab = (typeof DEVICE_TABS)[number];
+
+export function deviceTabHref(tab: DeviceTab): string {
+	return tab === "devices" ? routes.devices : `${routes.devices}?tab=${tab}`;
+}
+
+/**
  * The Numbers page's two sections.
  *
  * Buying a number and listing the numbers you own are two views of one subject, and both are about
