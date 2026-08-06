@@ -311,7 +311,9 @@ export const PBX_RESOURCES = {
 	 */
 	emergencyAddresses: descriptor<EmergencyAddressRow>({
 		key: "emergency-addresses",
-		affectsRouting: false,
+		// Routing input since the E911 wave: assignments feed the artifact's
+		// emergency tables (ELIN selection), so a save invalidates the compile view.
+		affectsRouting: true,
 		path: "/emergency-addresses",
 		label: "emergency address",
 		labelPlural: "Emergency addresses",
@@ -643,10 +645,10 @@ export async function setVoicemailMessageRead(
 	messageId: string,
 	read: boolean,
 ): Promise<VoicemailMessageResult> {
-	return await apiFetch<VoicemailMessageResult>(
-		`/voicemail-boxes/${boxId}/messages/${messageId}`,
-		{ method: "PATCH", body: JSON.stringify({ read }) },
-	);
+	return await apiFetch<VoicemailMessageResult>(`/voicemail-boxes/${boxId}/messages/${messageId}`, {
+		method: "PATCH",
+		body: JSON.stringify({ read }),
+	});
 }
 
 /**

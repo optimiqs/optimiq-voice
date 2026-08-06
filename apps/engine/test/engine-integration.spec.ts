@@ -115,6 +115,19 @@ const IDLE_AGENT_ID = "0195c0f0-1c2f-7000-8000-0000000000f4";
 const QUEUE_DID = "12125550300";
 const EMPTY_QUEUE_DID = "12125550400";
 
+/**
+ * A conference room, with no PIN.
+ *
+ * No PIN on purpose: the PIN gate is a pure decision over a digest and
+ * `plan-walker-conference.spec.ts` proves every branch of it against a real scrypt verification.
+ * What only a real Asterisk can prove is the other half — that `createBridge` + `addToBridge`
+ * against a live ARI actually puts a leg into a mixing bridge, and that the join/leave pair is
+ * published around it. Adding a PIN here would mean generating inbound DTMF into a Local channel,
+ * which is the flakiest thing this harness can do and would prove nothing the unit suite does not.
+ */
+const CONFERENCE_ID = "0195c0f0-1c2f-7000-8000-0000000000f5";
+const CONFERENCE_DID = "12125550500";
+
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 
@@ -177,6 +190,16 @@ function seedArtifact(): RoutingArtifact {
 			timeoutNodeId: "hangup:NORMAL_CLEARING",
 		} as PlanNode,
 		{
+			id: `conference:${CONFERENCE_ID}`,
+			kind: "conference",
+			conferenceId: CONFERENCE_ID,
+			roomNumber: "3001",
+			requiresPin: false,
+			maxMembers: 0,
+			waitForModerator: false,
+			recordEnabled: false,
+		} as PlanNode,
+		{
 			id: `queue:${EMPTY_QUEUE_ID}`,
 			kind: "queue",
 			queueId: EMPTY_QUEUE_ID,
@@ -222,6 +245,13 @@ function seedArtifact(): RoutingArtifact {
 					enabled: true,
 					recordEnabled: false,
 					destinationNodeId: `queue:${EMPTY_QUEUE_ID}`,
+				},
+				[CONFERENCE_DID]: {
+					phoneNumberId: "0195c0f0-1c2f-7000-8000-0000000000d5",
+					e164: CONFERENCE_DID,
+					enabled: true,
+					recordEnabled: false,
+					destinationNodeId: `conference:${CONFERENCE_ID}`,
 				},
 			},
 			noMatchNodeId: "hangup:UNALLOCATED_NUMBER",
@@ -764,6 +794,78 @@ suite("engine end-to-end", () => {
 		expect(invalid).toEqual([]);
 	}, 180_000);
 
+	/**
+	 * A conference room, against a real ARI mixing bridge.
+	 *
+	 * The unit suite proves the PIN gate, the moderator distinction, `waitForModerator` and
+	 * `maxMembers` against a fake port. What only this can prove is that the two media primitives
+	 * the runtime is built on — `POST /bridges` with a client-assigned id, then
+	 * `POST /bridges/{id}/addChannel` — actually work against a live Asterisk, and that the
+	 * join/leave pair is published around them and validates against its own schema.
+	 *
+	 * One caller, not two: a second Local channel would double the flakiest part of this harness to
+	 * prove a member count the registry's own spec already asserts.
+	 */
+	it("joins a caller to a real mixing bridge and publishes the conference pair", async () => {
+		const ari = app.get(AriConnectionService);
+		const callerChannelId = `engine-it-conference-${String(Date.now())}`;
+
+		callEvents.length = 0;
+		cdrEvents.length = 0;
+
+		await ari.client.channels.originate({
+			endpoint: `Local/${CONFERENCE_DID}@optimiq-inbound/n`,
+			context: "optimiq-loopback",
+			extension: "8000",
+			priority: 1,
+			channelId: callerChannelId,
+			timeoutSeconds: 30,
+		});
+
+		await waitFor(
+			"conference.joined",
+			async () => callEvents.some((event) => event.envelope.type === "conference.joined"),
+			40_000,
+			describeObserved,
+		);
+
+		const joined = callEvents.find((event) => event.envelope.type === "conference.joined");
+		const callId = subjectCallId(joined?.subject ?? "");
+		expect(joined?.subject).toBe(subjectFor.call(ORG_ID, callId, "conference.joined"));
+		expect(joined?.envelope.data).toMatchObject({
+			conferenceId: CONFERENCE_ID,
+			roomNumber: "3001",
+			moderator: false,
+			memberCount: 1,
+		});
+
+		// The bridge is a real one, and the mirrored channel snapshot names it — which is the
+		// assertion that would fail if `addToBridge` had quietly not happened.
+		const legId = (joined?.envelope.data as { legId: string }).legId;
+		const joinedKv = await readKv(natsUrl, kvKeyFor.channel(ORG_ID, callId, legId));
+		expect(joinedKv?.bridgeId).toBe((joined?.envelope.data as { bridgeId: string }).bridgeId);
+
+		await tryHangup(ari, callerChannelId);
+
+		await waitFor(
+			"conference.left",
+			async () => callEvents.some((event) => event.envelope.type === "conference.left"),
+			40_000,
+			describeObserved,
+		);
+		const left = callEvents.find((event) => event.envelope.type === "conference.left");
+		// Zero remaining is what tells the walker to destroy the bridge.
+		expect(left?.envelope.data).toMatchObject({ conferenceId: CONFERENCE_ID, memberCount: 0 });
+
+		await waitFor("cdr.leg.write", async () => cdrEvents.length > 0, 40_000, describeObserved);
+		const aLeg = cdrEvents.find((event) => (event.envelope.data as { leg: string }).leg === "a");
+		expect(aLeg?.envelope.data).toMatchObject({
+			destinationType: "conference",
+			destinationRef: CONFERENCE_ID,
+		});
+		expect(invalid).toEqual([]);
+	}, 180_000);
+
 	it("rejects a DID the artifact does not route, and files an unrouted CDR", async () => {
 		const ari = app.get(AriConnectionService);
 		const callerChannelId = `engine-it-unrouted-${String(Date.now())}`;
@@ -1058,13 +1160,18 @@ async function seedRoutingArtifact(natsUrl: string): Promise<void> {
 				}),
 			),
 		);
-		for (const number of [QUEUE_DID, EMPTY_QUEUE_DID]) {
+		const NUMBER_IDS: Readonly<Record<string, string>> = {
+			[QUEUE_DID]: "0195c0f0-1c2f-7000-8000-0000000000d3",
+			[EMPTY_QUEUE_DID]: "0195c0f0-1c2f-7000-8000-0000000000d4",
+			[CONFERENCE_DID]: "0195c0f0-1c2f-7000-8000-0000000000d5",
+		};
+		for (const number of [QUEUE_DID, EMPTY_QUEUE_DID, CONFERENCE_DID]) {
 			await did.put(
 				kvKeyFor.didIndex(number),
 				encoder.encode(
 					JSON.stringify({
 						organizationId: ORG_ID,
-						phoneNumberId: `0195c0f0-1c2f-7000-8000-0000000000d${number === QUEUE_DID ? "3" : "4"}`,
+						phoneNumberId: NUMBER_IDS[number],
 						e164: number,
 						enabled: true,
 					}),

@@ -13,6 +13,7 @@ import { QueueEventPublisher } from "../queue/queue-event-publisher.service";
 import { QueueMembershipSource } from "../queue/queue-membership.source";
 import { QueueCursors, QueuePositions } from "../queue/queue-registry";
 import { CallSignalBus, legSignalKey, recordingSignalKey } from "../routing/call-signals";
+import { ConferenceRegistry } from "../routing/conference-registry";
 import { DidIndexSource } from "../routing/did-index.source";
 import { PlanWalker } from "../routing/plan-walker";
 import { RoutingArtifactSource } from "../routing/routing-artifact.source";
@@ -117,6 +118,7 @@ export class ChannelOrchestrator {
 		private readonly mailbox: VoicemailMailboxRpcSource,
 		private readonly didIndex: DidIndexSource,
 		private readonly signals: CallSignalBus,
+		private readonly conferences: ConferenceRegistry,
 		private readonly queueMembership: QueueMembershipSource,
 		private readonly agentState: AgentStateStore,
 		private readonly queueEvents: QueueEventPublisher,
@@ -536,6 +538,7 @@ export class ChannelOrchestrator {
 			// The ACD plane, passed as a bundle rather than five constructor arguments to the walker:
 			// a queue node needs all five or none of them, and a walk that had four would fail in the
 			// middle of somebody's hold music rather than at construction.
+			conferences: this.conferences,
 			queue: {
 				membership: this.queueMembership,
 				agents: this.agentState,
@@ -553,6 +556,11 @@ export class ChannelOrchestrator {
 			timeConditions: artifact.timeConditions,
 			now: new Date(),
 			...(route.dialedNumber === undefined ? {} : { dialedNumber: route.dialedNumber }),
+			// What the caller actually pressed, so the Kari's Law notification can say `9911` rather
+			// than the `911` the switch sent.
+			...(channel.dialplan?.exten === undefined
+				? {}
+				: { originalDialedNumber: channel.dialplan.exten }),
 			...(route.callerIdNumber === undefined ? {} : { callerIdNumber: route.callerIdNumber }),
 			...(route.callerIdName === undefined ? {} : { callerIdName: route.callerIdName }),
 			...(route.featureArgument === undefined ? {} : { featureArgument: route.featureArgument }),

@@ -1,6 +1,7 @@
 import {
 	callBlockRule,
 	conference,
+	emergencyAddress,
 	eq,
 	extension,
 	featureCode,
@@ -39,7 +40,7 @@ import type { OrgRoutingSnapshot, RoutingSettingsInput } from "@optimiq-voice/ro
  *    is exactly what `select … where organization_id = $1` returns. The compiler owns every join
  *    and sorts everything it walks, which is what makes its output deterministic.
  *
- * Twenty statements, no joins, run inside the caller's tenant transaction — so RLS scopes them
+ * Twenty-one statements, no joins, run inside the caller's tenant transaction — so RLS scopes them
  * and `organization_id` never appears in a predicate here. That is deliberate: the policy is the
  * filter, and duplicating it in the query would make a missing policy invisible.
  *
@@ -101,6 +102,7 @@ export async function loadOrgRoutingSnapshot(
 		callBlockRules,
 		mohClasses,
 		voicemailGreetings,
+		emergencyAddresses,
 		settingRows,
 	] = await Promise.all([
 		transaction.select().from(extension),
@@ -122,6 +124,7 @@ export async function loadOrgRoutingSnapshot(
 		transaction.select().from(callBlockRule),
 		transaction.select().from(mohClass),
 		transaction.select().from(voicemailGreeting),
+		transaction.select().from(emergencyAddress),
 		transaction.select().from(orgSetting).where(eq(orgSetting.category, ROUTING_SETTINGS_CATEGORY)),
 	]);
 
@@ -164,6 +167,9 @@ export async function loadOrgRoutingSnapshot(
 			destinationType: row.destinationType,
 			destinationRef: row.destinationRef,
 			destinationData: row.destinationData,
+			// The DID's dispatchable location. The compiler picks the organization's ELIN from the
+			// numbers that carry one and whose address the carrier has validated.
+			emergencyAddressId: row.emergencyAddressId,
 		})),
 		trunks: trunks.map((row) => ({
 			id: row.id,
@@ -341,6 +347,15 @@ export async function loadOrgRoutingSnapshot(
 			mohClassId: row.mohClassId,
 			waitForModerator: row.waitForModerator,
 			recordEnabled: row.recordEnabled,
+			// Both digests, for the same reason `voicemail_box.pin_hash` is loaded: the gate is
+			// applied on the call path by a process with no database handle. `packages/routing`
+			// parses them and refuses to embed one it cannot read — and, unlike a mailbox, a room
+			// whose digest is unreadable is REFUSED rather than opened.
+			pinHash: row.pinHash,
+			moderatorPinHash: row.moderatorPinHash,
+			// Until this was loaded, setting a moderator PIN recompiled to an identical
+			// `snapshotHash`: the column was written, stored, and read by nothing.
+			requiresModeratorPin: row.moderatorPinHash !== null,
 		})),
 		parkLots: parkLots.map((row) => ({
 			id: row.id,
@@ -390,6 +405,19 @@ export async function loadOrgRoutingSnapshot(
 			durationMs: row.durationMs,
 			label: row.label,
 		})),
+		/**
+		 * Three columns of `emergency_address`, and deliberately not the address itself.
+		 *
+		 * The compiler needs to answer exactly two questions — "does this DID's address exist?" and
+		 * "has the carrier validated it?" — and the artifact is written to a KV bucket every engine
+		 * instance can read. Carrying a tenant's street addresses there would be a liability with no
+		 * routing upside; the label is there so a diagnostic can name the address a human recognises.
+		 */
+		emergencyAddresses: emergencyAddresses.map((row) => ({
+			id: row.id,
+			label: row.label,
+			validated: row.validated,
+		})),
 	};
 }
 
@@ -405,7 +433,7 @@ interface SettingRow {
 /**
  * Projects `org_setting` rows onto {@link RoutingSettingsInput}.
  *
- * Only the seven names the compiler declares are read; anything else in the `routing` category is
+ * Only the eight names the compiler declares are read; anything else in the `routing` category is
  * ignored rather than passed through, so a stray row cannot change how calls are routed. A
  * disabled row is treated as absent, which is what the settings cascade means by `enabled`.
  */
@@ -426,6 +454,7 @@ export function readRoutingSettings(rows: readonly SettingRow[]): RoutingSetting
 
 	const trunkContinueOnCauses = byName.get("trunkContinueOnCauses");
 	const outboundEnabled = byName.get("outboundEnabled");
+	const emergencyNumbers = byName.get("emergencyNumbers");
 
 	return {
 		...(asString("defaultTimezone") === undefined
@@ -451,5 +480,14 @@ export function readRoutingSettings(rows: readonly SettingRow[]): RoutingSetting
 				}
 			: {}),
 		...(typeof outboundEnabled === "boolean" ? { outboundEnabled } : {}),
+		// Additive to the compiled-in NANP set, never replacing it: there is deliberately no setting
+		// that can remove `911` from an organization's dial plan.
+		...(Array.isArray(emergencyNumbers)
+			? {
+					emergencyNumbers: emergencyNumbers.filter(
+						(entry): entry is string => typeof entry === "string",
+					),
+				}
+			: {}),
 	};
 }

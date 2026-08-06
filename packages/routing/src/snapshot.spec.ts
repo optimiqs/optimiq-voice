@@ -127,12 +127,16 @@ describe("emptySnapshot", () => {
 		}
 	});
 
-	it("lists nineteen collections", () => {
-		expect(SNAPSHOT_COLLECTIONS).toHaveLength(19);
+	it("lists twenty collections", () => {
+		expect(SNAPSHOT_COLLECTIONS).toHaveLength(20);
 	});
 
 	it("marks exactly the collections a loader may omit as optional", () => {
-		expect([...OPTIONAL_SNAPSHOT_COLLECTIONS]).toEqual(["voicemailGreetings", "mohClasses"]);
+		expect([...OPTIONAL_SNAPSHOT_COLLECTIONS]).toEqual([
+			"voicemailGreetings",
+			"mohClasses",
+			"emergencyAddresses",
+		]);
 	});
 
 	it("only marks real collections optional", () => {

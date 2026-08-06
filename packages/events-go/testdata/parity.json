@@ -831,7 +831,10 @@
 			"channel.record.started",
 			"channel.record.stopped",
 			"channel.hangup",
-			"channel.destroyed"
+			"channel.destroyed",
+			"conference.joined",
+			"conference.left",
+			"call.emergency.dialed"
 		],
 		"registration": [
 			"registered",
@@ -914,6 +917,21 @@
 			"family": "call",
 			"type": "channel.destroyed",
 			"goType": "ChannelDestroyedData"
+		},
+		{
+			"family": "call",
+			"type": "conference.joined",
+			"goType": "ConferenceJoinedData"
+		},
+		{
+			"family": "call",
+			"type": "conference.left",
+			"goType": "ConferenceLeftData"
+		},
+		{
+			"family": "call",
+			"type": "call.emergency.dialed",
+			"goType": "CallEmergencyDialedData"
 		},
 		{
 			"family": "registration",

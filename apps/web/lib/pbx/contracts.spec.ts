@@ -326,16 +326,14 @@ describe("affectsRouting, mirrored from @optimiq-voice/routing", () => {
 	});
 
 	/**
-	 * E911 data is not routing data — yet.
-	 *
-	 * Nothing in `@optimiq-voice/routing` reads `emergency_address`: the compiler's only
-	 * emergency-aware field is `ExtensionInput.emergencyCallerIdNumber`, which it copies to the
-	 * extension index and never acts on. Assigning an address to a DID does recompile, because
-	 * `phone_number` is a routing table, and produces an identical artifact. When emergency routing
-	 * lands, this is the line that has to change first.
+	 * E911 data became routing data when emergency routing landed: the compiler reads
+	 * `emergency_address` (`ROUTING_TABLE_TO_ENTITY.emergency_address → "emergencyAddresses"`)
+	 * to build the emergency match tables and select the ELIN, so an address save must
+	 * invalidate the compile view.
 	 */
-	it("says a dispatchable location is not a routing input", () => {
-		expect(PBX_RESOURCES.emergencyAddresses.affectsRouting).toBe(false);
+	it("says a dispatchable location is a routing input", () => {
+		expect(PBX_RESOURCES.emergencyAddresses.affectsRouting).toBe(true);
+		expect(SERVER_ROUTING_TABLES.emergency_address).toBe("emergencyAddresses");
 	});
 
 	it("says a queue recompiles and its agents and tiers do not", () => {

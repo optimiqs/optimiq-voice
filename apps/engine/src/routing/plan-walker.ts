@@ -5,7 +5,7 @@ import { QueueSession } from "../queue/queue-session";
 import { legSignalKey, recordingSignalKey } from "./call-signals";
 import { DEFAULT_MEDIA_REF_SETTINGS, resolveMediaRef, translateMediaRef } from "./media-refs";
 import { planDestinationOf } from "./plan-destination";
-import { verifyVoicemailPin } from "./voicemail-pin";
+import { verifyPinDigest, verifyVoicemailPin } from "./voicemail-pin";
 import type { MediaPort } from "../ari/media-port";
 import type {
 	QueueCallPort,
@@ -15,11 +15,13 @@ import type {
 	QueueSessionSettings,
 } from "../queue/queue-session";
 import type { CallSignalBus, LegSignal } from "./call-signals";
+import type { ConferenceRegistry } from "./conference-registry";
 import type { MediaRefSettings } from "./media-refs";
 import type { PlanDestination } from "./plan-destination";
 import type { CallEvent } from "@optimiq-voice/events";
 import type {
 	CompiledTimeCondition,
+	ConferencePlanNode,
 	ExecutionPlan,
 	ExtensionPlanNode,
 	IvrMenuPlanNode,
@@ -73,9 +75,17 @@ import type {
  * to `../queue/queue-session.ts` (which needs {@link PlanWalkerDependencies.queue}; without it the
  * node falls back to the announcement below).
  *
+ * Also real, and deliberately minimal: `conference` — a PIN-gated join to a shared ARI mixing
+ * bridge, moderator entry, `waitForModerator`, `maxMembers`, and a join/leave event pair
+ * (needs {@link PlanWalkerDependencies.conferences}; without it the node falls back to the
+ * announcement below). What a conference here does NOT do, and none of it is hidden: no recording
+ * (`ConferencePlanNode.recordEnabled` is read by nothing), no in-conference DTMF controls, no
+ * mute, no kick, no lock, no entry/exit tones, no participant list, and no room state shared
+ * between engine processes.
+ *
  * Placeholder, and honest about it: `voicemail` records but has no mailbox, no MWI and no email;
  * `feature-code` serves `*97` as that placeholder and answers everything else with an
- * announcement; `conference`, `park` and `application` announce and hang up. Every one of them adds
+ * announcement; `park` and `application` announce and hang up. Every one of them adds
  * a line to {@link WalkOutcome.notes}, so a call that hit a gap says so in the log rather than
  * looking like a routing bug.
  */
@@ -129,6 +139,19 @@ export interface PlanWalkerSettings {
 	readonly voicemailMenuTimeoutMs: number;
 	/** Replays of one message before `2` stops being honoured. */
 	readonly voicemailMaxReplays: number;
+	/** Asked for before a room with a PIN is opened. */
+	readonly conferencePinPrompt: string;
+	/** Played after a wrong room PIN, before the next attempt. */
+	readonly conferencePinInvalidPrompt: string;
+	/** Attempts before the call is refused. Same budget, same reasoning, as the mailbox. */
+	readonly conferencePinAttempts: number;
+	readonly conferencePinMaxDigits: number;
+	readonly conferencePinTimeoutMs: number;
+	readonly conferencePinInterDigitTimeoutMs: number;
+	/** Played when a room is at `maxMembers`. */
+	readonly conferenceFullAnnouncement: string;
+	/** How long a participant holds for a moderator before the call is given up on. */
+	readonly conferenceModeratorWaitMs: number;
 	readonly mediaRefs: MediaRefSettings;
 }
 
@@ -152,6 +175,19 @@ export const DEFAULT_PLAN_WALKER_SETTINGS: PlanWalkerSettings = {
 	voicemailPinInterDigitTimeoutMs: 3_000,
 	voicemailMenuTimeoutMs: 5_000,
 	voicemailMaxReplays: 3,
+	// `conf-getpin`, `conf-invalidpin` and `conf-locked` are all in Asterisk's core sound package,
+	// so a PIN-gated room works on a stock install with no prompt pack — the same standard the
+	// mailbox challenge holds to.
+	conferencePinPrompt: "sound:conf-getpin",
+	conferencePinInvalidPrompt: "sound:conf-invalidpin",
+	conferencePinAttempts: 3,
+	conferencePinMaxDigits: 10,
+	conferencePinTimeoutMs: 10_000,
+	conferencePinInterDigitTimeoutMs: 3_000,
+	conferenceFullAnnouncement: "sound:conf-locked",
+	// Ten minutes. Long enough that a moderator who is late still finds their meeting, short
+	// enough that a forgotten leg does not hold a channel until the process restarts.
+	conferenceModeratorWaitMs: 600_000,
 	mediaRefs: DEFAULT_MEDIA_REF_SETTINGS,
 };
 
@@ -207,6 +243,15 @@ export interface PlanWalkerDependencies {
 	readonly queue?: QueueServices;
 	/** Deployment knobs for the queue runtime: poll interval, agent ring timeout, RNG. */
 	readonly queueSettings?: Partial<QueueSessionSettings>;
+	/**
+	 * The rooms this process is hosting.
+	 *
+	 * Optional for the same reason `queue` is, and with the same honest fallback: without it a
+	 * `conference` node announces and hangs up, which is exactly what it did before this wave. It
+	 * is a registry rather than anything richer because a conference is the one destination whose
+	 * state outlives a single walk — see `conference-registry.ts`.
+	 */
+	readonly conferences?: ConferenceRegistry;
 	/** Injected so ids are deterministic in a spec. */
 	readonly newId?: () => string;
 	readonly now?: () => number;
@@ -327,6 +372,14 @@ export interface WalkInput {
 	readonly now?: Date;
 	/** The number to dial, after digit manipulation. Outbound only. */
 	readonly dialedNumber?: string;
+	/**
+	 * The digits the caller actually pressed, before any digit manipulation.
+	 *
+	 * Only the emergency notification reads it, and it reads it because "the caller dialled 9911"
+	 * and "the switch sent 911" are different facts, and the person reading the Kari's Law alert
+	 * wants the first one.
+	 */
+	readonly originalDialedNumber?: string;
 	/** Caller identity to present on originated legs. */
 	readonly callerIdNumber?: string;
 	readonly callerIdName?: string;
@@ -515,9 +568,12 @@ export class PlanWalker {
 			case "queue": {
 				return await this.queueNode(node);
 			}
+			case "conference": {
+				return await this.conferenceNode(node);
+			}
 			default: {
-				// `conference`, `park`, `application`: real destinations with real runtimes, none of
-				// which exist yet. Announcing and hanging up is a worse product than the real thing
+				// `park`, `application`: real destinations with real runtimes, neither of
+				// which exists yet. Announcing and hanging up is a worse product than the real thing
 				// and a better one than silence.
 				this.note(`node kind "${node.kind}" is not implemented yet; announced and hung up`);
 				return await this.announceAndHangup(
@@ -869,7 +925,27 @@ export class PlanWalker {
 	 * `continueOnCauses` is a CLOSED allow-list, defaulting to telephony's retryable set, and the
 	 * walker honours it literally: walking a whole trunk list after a `CALL_REJECTED` multiplies one
 	 * fraudulent attempt by the number of carriers a tenant has, which is precisely the
-	 * amplification a compromised extension is looking for.
+	 * amplification a compromised extension is looking for. An emergency node ships a much wider
+	 * list, from `packages/routing`, and this walker does not need to know that — it reads the
+	 * field either way.
+	 *
+	 * ## What `emergency` changes here
+	 *
+	 * Two things, and only two:
+	 *
+	 * 1. **The caller id is the ELIN and nothing may override it.** The ordinary precedence is
+	 *    trunk override → route override → the caller's number, and both overrides are the tenant's
+	 *    main line. Presenting that on a `911` call sends a dispatcher to the head office for a
+	 *    call from the warehouse, so the emergency path takes the number the resolver worked out
+	 *    (the extension's own `emergencyCallerIdNumber`, else the organization's ELIN) and ignores
+	 *    both.
+	 * 2. **It publishes `call.emergency.dialed`**, once, BEFORE the first attempt. That is the
+	 *    Kari's Law notification seam: the statute is about the attempt, and a call that failed
+	 *    over three carriers before it reached a PSAP is exactly the one the front desk needs to
+	 *    hear about immediately rather than afterwards.
+	 *
+	 * Everything that could refuse the call was bypassed in the resolver, not here: there is no
+	 * call-block check on this path and the emergency node carries no time gate and no failover.
 	 */
 	private async trunkDialNode(node: TrunkDialPlanNode, input: WalkInput): Promise<StepResult> {
 		// Only the RESOLVED number. There is no sensible fallback: the caller's own number is the
@@ -893,6 +969,14 @@ export class PlanWalker {
 		await this.deps.execute({ verb: "ringing" });
 		this.deps.channel.moveTo("executing");
 
+		const emergency = node.emergency === true;
+		// The ELIN wins outright on the emergency path. See the note above for why both overrides
+		// are ignored rather than merely ranked below it.
+		const presentedNumber = emergency ? (input.callerIdNumber ?? node.elin) : undefined;
+		if (emergency) {
+			await this.notifyEmergency(node, input, number, attempts[0]?.name, presentedNumber);
+		}
+
 		let lastCause: HangupCause = "NORMAL_TEMPORARY_FAILURE";
 		for (const attempt of attempts) {
 			if (this.deps.channel.isTearingDown) {
@@ -909,7 +993,11 @@ export class PlanWalker {
 					delaySeconds: 0,
 					callerId: composeCallerId(
 						input.callerIdName,
-						attempt.callerIdNumberOverride ?? node.callerIdNumberOverride ?? input.callerIdNumber,
+						emergency
+							? presentedNumber
+							: (attempt.callerIdNumberOverride ??
+									node.callerIdNumberOverride ??
+									input.callerIdNumber),
 					),
 				},
 				0,
@@ -932,6 +1020,52 @@ export class PlanWalker {
 		}
 
 		return this.branch(node.failoverNodeId, lastCause);
+	}
+
+	/**
+	 * The Kari's Law notification, as an event.
+	 *
+	 * Fire-and-forget and never fatal: an emergency call must not fail because a broker was slow,
+	 * and a notification that could hang up the call it is notifying about would be worse than no
+	 * notification at all. A publish that fails is a `note` on the walk, which is what the support
+	 * ticket reads.
+	 *
+	 * Delivery — the email, the webhook, the screen pop at the front desk — is a consumer's job.
+	 * The engine holds no tenant configuration and no SMTP handle, and a notification that lives
+	 * inside one process is a notification one restart loses.
+	 */
+	private async notifyEmergency(
+		node: TrunkDialPlanNode,
+		input: WalkInput,
+		number: string,
+		trunkName: string | undefined,
+		elin: string | undefined,
+	): Promise<void> {
+		const callerNumber = this.deps.channel.callerIdNumber;
+		const callerName = input.callerIdName ?? this.deps.channel.callerIdName;
+		this.note(
+			`emergency call to ${number} presenting ${elin ?? "no caller id"}${
+				node.emergencyAddressId === undefined ? "" : ` for address ${node.emergencyAddressId}`
+			}`,
+		);
+		try {
+			await this.deps.publish("call.emergency.dialed", {
+				legId: this.deps.channel.channelId,
+				// What the caller actually pressed, which may carry the outside-line 9.
+				dialed: input.originalDialedNumber ?? number,
+				number,
+				...(callerNumber === undefined ? {} : { callerNumber }),
+				...(callerName === undefined ? {} : { callerName }),
+				...(elin === undefined ? {} : { elin }),
+				...(node.emergencyAddressId === undefined
+					? {}
+					: { emergencyAddressId: node.emergencyAddressId }),
+				...(trunkName === undefined ? {} : { trunkName }),
+			});
+		} catch (error) {
+			this.log("failed to publish the emergency notification", { err: String(error) });
+			this.note(`the emergency notification for ${number} could not be published`);
+		}
 	}
 
 	/**
@@ -974,6 +1108,340 @@ export class PlanWalker {
 		);
 
 		return await this.settleDial(outcome, {});
+	}
+
+	// -------------------------------------------------------------------------------------------
+	// Conference
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * Joining a conference room.
+	 *
+	 * ## The order is the security property
+	 *
+	 * PIN first, registry second, bridge third. A caller who fails the challenge never appears in
+	 * the room's member list and never touches the bridge, so "how many people are in this room"
+	 * counts admitted callers rather than attempts, and a wrong PIN cannot be used to probe whether
+	 * a meeting is running.
+	 *
+	 * ## Fail closed, twice
+	 *
+	 * `requiresPin` with no `pinHash` means the compiler refused a digest it could not read, or the
+	 * artifact predates the field. Either way the room is REFUSED — see the note on
+	 * `ConferencePlanNode`. This is the one place the conference gate deliberately differs from the
+	 * mailbox gate, which degrades to "authenticated by the calling extension"; the classic default
+	 * for a bridge is "anyone who knows the number", and restoring that silently would turn a
+	 * formatting change into an open conference.
+	 *
+	 * ## `waitForModerator` holds OUTSIDE the bridge
+	 *
+	 * A participant waiting for a moderator hears music on hold and is not in the mixing bridge at
+	 * all, so early arrivals cannot hear each other before the meeting starts. They are in the
+	 * registry — which is what makes `maxMembers` and "has a moderator arrived?" correct across
+	 * walks — but the media join is deferred until the gate opens.
+	 */
+	private async conferenceNode(node: ConferencePlanNode): Promise<StepResult> {
+		const registry = this.deps.conferences;
+		if (registry === undefined) {
+			this.note(
+				`conference room ${node.roomNumber} was reached but this walk has no conference registry; announced and hung up`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		if (!(await this.ensureAnswered())) {
+			return { kind: "aborted" };
+		}
+
+		const admission = await this.challengeConferencePin(node);
+		if (admission.kind !== "admitted") {
+			return admission.result;
+		}
+
+		const joinedAtMs = (this.deps.now ?? Date.now)();
+		const joined = registry.join(
+			node.conferenceId,
+			{
+				mediaChannelId: this.deps.channel.mediaChannelId,
+				legId: this.deps.channel.channelId,
+				moderator: admission.moderator,
+				joinedAtMs,
+			},
+			{ newBridgeId: this.newId(), maxMembers: node.maxMembers },
+		);
+		if (joined.kind === "full") {
+			this.note(
+				`conference room ${node.roomNumber} is at its limit of ${node.maxMembers} members; the caller was refused`,
+			);
+			return await this.announceAndHangup(this.settings.conferenceFullAnnouncement, "USER_BUSY");
+		}
+
+		if (
+			node.waitForModerator &&
+			!admission.moderator &&
+			!joined.room.moderatorPresent &&
+			!(await this.holdForModerator(node, registry))
+		) {
+			registry.leave(node.conferenceId, this.deps.channel.mediaChannelId);
+			return { kind: "aborted" };
+		}
+
+		const bridgeId = joined.room.bridgeId;
+		try {
+			// Unconditional, and safe: the media server's bridge creation takes a CLIENT-assigned id
+			// and is an upsert on it. Calling it only for the member the registry called `created`
+			// would be wrong the moment that member is one held outside the bridge for a moderator.
+			await this.deps.media.createBridge({
+				bridgeId,
+				name: `conference-${node.conferenceId}`,
+			});
+			await this.deps.media.addToBridge(bridgeId, [this.deps.channel.mediaChannelId]);
+		} catch (error) {
+			registry.leave(node.conferenceId, this.deps.channel.mediaChannelId);
+			this.log("failed to join a conference bridge", { bridgeId, err: String(error) });
+			this.note(`joining conference room ${node.roomNumber} failed: ${String(error)}`);
+			return { kind: "hangup", cause: "NORMAL_TEMPORARY_FAILURE" };
+		}
+
+		this.deps.channel.setBridge(bridgeId);
+		this.deps.channel.moveTo("exchanging-media");
+
+		const room = registry.room(node.conferenceId);
+		await this.deps.publish("conference.joined", {
+			legId: this.deps.channel.channelId,
+			conferenceId: node.conferenceId,
+			roomNumber: node.roomNumber,
+			bridgeId,
+			moderator: admission.moderator,
+			memberCount: room?.members.length ?? 1,
+		});
+
+		if (node.recordEnabled) {
+			// Said out loud rather than silently ignored: a tenant who ticked "record this room" and
+			// finds no recording has a compliance problem, and a note in the call log is the
+			// difference between finding out now and finding out at the hearing.
+			this.note(
+				`conference room ${node.roomNumber} is configured to record, which this release does not implement`,
+			);
+		}
+
+		// The leg's own death is what removes it from the room. Nothing else is watching it: the
+		// walk returns `bridged` and the orchestrator takes over from here.
+		const unwatch = this.deps.signals.watch(
+			legSignalKey(this.deps.channel.mediaChannelId),
+			(signal) => {
+				if ((signal as LegSignal).kind !== "ended") {
+					return;
+				}
+				unwatch();
+				void this.leaveConference(node, bridgeId, joinedAtMs, admission.moderator);
+			},
+		);
+
+		return { kind: "bridged" };
+	}
+
+	/**
+	 * The room's PIN gate.
+	 *
+	 * One challenge serves both credentials: the digits are checked against the moderator digest
+	 * FIRST and then against the participant digest, so a moderator dials one number and is
+	 * recognised rather than having to announce themselves. The caller is never told which of the
+	 * two they matched — or that there are two — because the difference is information an attacker
+	 * can use and a legitimate participant does not need.
+	 *
+	 * An empty entry is admitted as a participant when the room has no participant PIN. That is
+	 * what makes a moderator PIN usable on its own: without it, a room whose only credential is the
+	 * moderator's would challenge every participant for a PIN they were never given.
+	 */
+	private async challengeConferencePin(
+		node: ConferencePlanNode,
+	): Promise<
+		| { readonly kind: "admitted"; readonly moderator: boolean }
+		| { readonly kind: "denied"; readonly result: StepResult }
+	> {
+		// Fails closed. See the node's own documentation for why this differs from a mailbox.
+		if (node.requiresPin && node.pinHash === undefined) {
+			this.note(
+				`conference room ${node.roomNumber} requires a PIN this release cannot verify; the room was refused rather than opened`,
+			);
+			return {
+				kind: "denied",
+				result: await this.announceAndHangup(
+					this.settings.unavailableAnnouncement,
+					"NORMAL_TEMPORARY_FAILURE",
+				),
+			};
+		}
+
+		const wantsChallenge = node.pinHash !== undefined || node.moderatorPinHash !== undefined;
+		if (!wantsChallenge) {
+			return { kind: "admitted", moderator: false };
+		}
+
+		for (let attempt = 0; attempt < this.settings.conferencePinAttempts; attempt += 1) {
+			if (this.deps.channel.isTearingDown) {
+				return { kind: "denied", result: { kind: "aborted" } };
+			}
+
+			const result = await this.deps.execute({
+				verb: "gather",
+				maxDigits: this.settings.conferencePinMaxDigits,
+				terminators: ["#"],
+				timeoutMs: this.settings.conferencePinTimeoutMs,
+				interDigitTimeoutMs: this.settings.conferencePinInterDigitTimeoutMs,
+				media: this.settings.conferencePinPrompt,
+			});
+			if (result === undefined) {
+				return { kind: "denied", result: { kind: "hangup", cause: "NORMAL_TEMPORARY_FAILURE" } };
+			}
+			const collection = collectionOf(result);
+			if (collection?.endReason === "hangup") {
+				return { kind: "denied", result: { kind: "aborted" } };
+			}
+			const digits = collection?.digits.join("") ?? "";
+
+			// Nothing entered, and nothing to enter: a room whose only credential is the moderator's
+			// admits everyone else as a participant.
+			if (digits.trim() === "" && node.pinHash === undefined) {
+				return { kind: "admitted", moderator: false };
+			}
+
+			// Moderator first, so a moderator whose PIN happens to also be the participant PIN is
+			// still a moderator.
+			if (node.moderatorPinHash !== undefined) {
+				const asModerator = await verifyPinDigest(digits, node.moderatorPinHash);
+				if (asModerator.ok) {
+					return { kind: "admitted", moderator: true };
+				}
+				if (asModerator.failure === "malformed-hash" || asModerator.failure === "kdf-error") {
+					return {
+						kind: "denied",
+						result: await this.refuseConference(node, asModerator.failure),
+					};
+				}
+			}
+
+			if (node.pinHash !== undefined) {
+				const asParticipant = await verifyPinDigest(digits, node.pinHash);
+				if (asParticipant.ok) {
+					return { kind: "admitted", moderator: false };
+				}
+				if (asParticipant.failure === "malformed-hash" || asParticipant.failure === "kdf-error") {
+					return {
+						kind: "denied",
+						result: await this.refuseConference(node, asParticipant.failure),
+					};
+				}
+			}
+
+			await this.deps.execute({ verb: "play", media: this.settings.conferencePinInvalidPrompt });
+		}
+
+		this.note(
+			`conference room ${node.roomNumber} refused after ${this.settings.conferencePinAttempts} PIN attempts`,
+		);
+		return { kind: "denied", result: { kind: "hangup", cause: "CALL_REJECTED" } };
+	}
+
+	/**
+	 * A digest this release cannot verify, found at call time.
+	 *
+	 * A defect rather than a wrong guess — the compiler refuses to embed one — so it ends the call
+	 * instead of burning the caller's remaining attempts on a check that can never succeed.
+	 */
+	private async refuseConference(node: ConferencePlanNode, failure: string): Promise<StepResult> {
+		this.note(
+			`conference room ${node.roomNumber} carries a PIN digest this release cannot verify (${failure}); the room was refused`,
+		);
+		return await this.announceAndHangup(
+			this.settings.unavailableAnnouncement,
+			"NORMAL_TEMPORARY_FAILURE",
+		);
+	}
+
+	/**
+	 * Music on hold until a moderator arrives.
+	 *
+	 * Returns whether the caller is still there and may now join. Three ways out: a moderator
+	 * joined, the caller hung up, or the wait budget expired — and the budget exists because a
+	 * meeting whose moderator never dials in would otherwise hold a channel until the process
+	 * restarts.
+	 */
+	private async holdForModerator(
+		node: ConferencePlanNode,
+		registry: ConferenceRegistry,
+	): Promise<boolean> {
+		this.note(`held in conference room ${node.roomNumber} until a moderator joins`);
+		await this.deps.media.startMusicOnHold(this.deps.channel.mediaChannelId, node.mohClass);
+
+		const waiter = registry.awaitModerator(node.conferenceId);
+		let hungUp = false;
+		const unwatch = this.deps.signals.watch(
+			legSignalKey(this.deps.channel.mediaChannelId),
+			(signal) => {
+				if ((signal as LegSignal).kind === "ended") {
+					hungUp = true;
+					waiter.cancel();
+				}
+			},
+		);
+		const expiry = this.delay(this.settings.conferenceModeratorWaitMs).then(() => {
+			waiter.cancel();
+		});
+
+		await Promise.race([waiter.arrived, expiry]);
+		unwatch();
+		waiter.cancel();
+
+		try {
+			await this.deps.media.stopMusicOnHold(this.deps.channel.mediaChannelId);
+		} catch (error) {
+			this.log("failed to stop conference hold music", { err: String(error) });
+		}
+
+		if (hungUp || this.deps.channel.isTearingDown) {
+			return false;
+		}
+		if (registry.room(node.conferenceId)?.moderatorPresent !== true) {
+			this.note(`no moderator joined conference room ${node.roomNumber} within the wait budget`);
+			return false;
+		}
+		return true;
+	}
+
+	/** Removes this leg from the room, publishes the pair's second half, and tidies the bridge. */
+	private async leaveConference(
+		node: ConferencePlanNode,
+		bridgeId: string,
+		joinedAtMs: number,
+		moderator: boolean,
+	): Promise<void> {
+		const registry = this.deps.conferences;
+		if (registry === undefined) {
+			return;
+		}
+		const departure = registry.leave(node.conferenceId, this.deps.channel.mediaChannelId);
+		try {
+			await this.deps.publish("conference.left", {
+				legId: this.deps.channel.channelId,
+				conferenceId: node.conferenceId,
+				roomNumber: node.roomNumber,
+				bridgeId,
+				moderator,
+				memberCount: departure.memberCount,
+				durationMs: Math.max(0, (this.deps.now ?? Date.now)() - joinedAtMs),
+			});
+			this.deps.channel.setBridge(undefined);
+			if (departure.emptied) {
+				await this.deps.media.destroyBridge(bridgeId);
+			}
+		} catch (error) {
+			this.log("failed to leave a conference cleanly", { bridgeId, err: String(error) });
+		}
 	}
 
 	// -------------------------------------------------------------------------------------------

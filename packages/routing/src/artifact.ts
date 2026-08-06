@@ -150,14 +150,48 @@ export interface MailboxEntry {
 }
 
 /**
+ * One emergency dial string, and what it dials.
+ *
+ * A separate table from `OutboundRule` rather than a flag on one, because every field on an
+ * outbound rule is a gate the emergency path must not have: no toll class, no time gate, no digit
+ * manipulation, no `enabled`. What is left is "these digits, that node", which is this.
+ *
+ * `number` differs from the key for the `9`-prefixed forms: dialing `9911` reaches the trunk as
+ * `911`, because the `9` was the tenant's outside-line habit and not part of the number.
+ */
+export interface EmergencyRule {
+	/** The dialed string. Also the key this rule is stored under. */
+	readonly dialed: string;
+	/** What the trunk is asked to dial. */
+	readonly number: string;
+	/** The `trunk-dial` node with `emergency: true`. */
+	readonly destinationNodeId: PlanNodeId;
+}
+
+/**
+ * The emergency table, keyed by dial string.
+ *
+ * Present on BOTH {@link InternalMatchTable} and {@link OutboundMatchTable}, with the same node
+ * ids, because an extension may dial `911` in either context and neither resolver may fall
+ * through to the other to find it. Optional so an artifact compiled before emergency handling
+ * existed parses; a reader that finds it absent has no emergency path, which is what it had.
+ */
+export type EmergencyMatchTable = Readonly<Record<string, EmergencyRule>>;
+
+/**
  * Internal matching.
  *
- * Order is fixed and is part of the contract: feature codes, then voicemail prefixes, then exact
- * internal numbers, then park slots. Feature codes come first because they start with `*` and no
- * extension may; voicemail prefixes come before numbers because `*99200` must not be read as an
- * extension named `*99200`.
+ * Order is fixed and is part of the contract: **emergency numbers**, then feature codes, then
+ * voicemail prefixes, then exact internal numbers, then park slots. Emergency comes first and
+ * ahead of everything, including the call-block table, because Kari's Law says `911` is dialable
+ * from any station with no prefix and no permission — which means nothing a tenant can configure
+ * may sit in front of it. Feature codes come next because they start with `*` and no extension
+ * may; voicemail prefixes come before numbers because `*99200` must not be read as an extension
+ * named `*99200`.
  */
 export interface InternalMatchTable {
+	/** Consulted FIRST, ahead of `callBlock`. Absent in an artifact compiled before E911. */
+	readonly emergency?: EmergencyMatchTable;
 	/** Sorted by descending code length, so longest-code-wins is a linear walk. */
 	readonly featureCodes: readonly CompiledFeatureCode[];
 	readonly voicemailPrefixes: readonly VoicemailPrefixEntry[];
@@ -187,7 +221,12 @@ export interface OutboundRule {
 
 export interface OutboundMatchTable {
 	readonly rules: readonly OutboundRule[];
-	/** Whether the organization may place outbound calls at all. */
+	/**
+	 * Consulted BEFORE {@link enabled}, before the caller is looked up, before the toll-class gate
+	 * and before `callBlock`. That ordering is the bypass, and it is the whole compliance story.
+	 */
+	readonly emergency?: EmergencyMatchTable;
+	/** Whether the organization may place outbound calls at all. Emergency ignores it. */
 	readonly enabled: boolean;
 	/** Taken when nothing matched. */
 	readonly noMatchNodeId: PlanNodeId;

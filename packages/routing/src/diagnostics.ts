@@ -58,6 +58,18 @@ export const DIAGNOSTIC_CODES = [
 	/** A mailbox's `pinHash` is not in the format `voicemail-pin.ts` defines, so it is not enforced. */
 	"invalid-pin-hash",
 
+	// --- emergency dialing (Kari's Law / RAY BAUM'S Act) ----------------------------------------
+	/** A DID carries no `emergencyAddressId`, so it cannot serve as an ELIN for the organization. */
+	"missing-emergency-address",
+	/** A DID names an emergency address that is not in the snapshot, or is not validated. */
+	"dangling-emergency-address",
+	/** The organization has extensions but no trunk an emergency call could take. */
+	"no-emergency-route",
+	/** An emergency dial string is also an internal number; the emergency table wins. */
+	"emergency-number-shadowed",
+	/** A configured emergency number is not a dial string this package can match. */
+	"invalid-emergency-number",
+
 	// --- matching tables ------------------------------------------------------------------------
 	/** Two entities claim the same internal number (extension 200 and ring group 200). */
 	"duplicate-internal-number",
@@ -103,6 +115,8 @@ export const DIAGNOSTIC_CODES = [
 	"time-condition-open",
 	/** A rule matched but its time condition gate was closed. */
 	"time-condition-closed",
+	/** The dialed string matched the emergency table; every configurable gate was bypassed. */
+	"emergency-call",
 ] as const;
 
 export type DiagnosticCode = (typeof DIAGNOSTIC_CODES)[number];

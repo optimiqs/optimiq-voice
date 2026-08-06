@@ -670,6 +670,10 @@ describe("compile — inbound", () => {
 		const result = compileAttempt(
 			aSnapshot({
 				extensions: [anExtension()],
+				// A trunk, so the compile is not also reporting `no-emergency-route`: an organization
+				// with stations and no carrier cannot reach a dispatcher, and that warning is about
+				// this snapshot rather than about the disabled route under test.
+				trunks: [aTrunk()],
 				inboundRoutes: [anInboundRoute({ enabled: false })],
 			}),
 		);

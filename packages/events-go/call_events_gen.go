@@ -23,6 +23,9 @@ const (
 	EventTypeChannelRecordStopped = "channel.record.stopped"
 	EventTypeChannelHangup        = "channel.hangup"
 	EventTypeChannelDestroyed     = "channel.destroyed"
+	EventTypeConferenceJoined     = "conference.joined"
+	EventTypeConferenceLeft       = "conference.left"
+	EventTypeCallEmergencyDialed  = "call.emergency.dialed"
 )
 
 // ChannelCreatedData is the payload of the "channel.created" event.
@@ -169,4 +172,46 @@ type ChannelHangupData struct {
 type ChannelDestroyedData struct {
 	LegID      string `json:"legId"`
 	DurationMs *int   `json:"durationMs,omitempty"`
+}
+
+// ConferenceJoinedData is the payload of the "conference.joined" event.
+//
+// Subject: calls.evt.v1.<orgId>.<callId>.conference.joined
+// Envelope: Envelope[ConferenceJoinedData]
+type ConferenceJoinedData struct {
+	LegID        string `json:"legId"`
+	ConferenceID string `json:"conferenceId"`
+	RoomNumber   string `json:"roomNumber"`
+	BridgeID     string `json:"bridgeId"`
+	Moderator    bool   `json:"moderator"`
+	MemberCount  int    `json:"memberCount"`
+}
+
+// ConferenceLeftData is the payload of the "conference.left" event.
+//
+// Subject: calls.evt.v1.<orgId>.<callId>.conference.left
+// Envelope: Envelope[ConferenceLeftData]
+type ConferenceLeftData struct {
+	LegID        string `json:"legId"`
+	ConferenceID string `json:"conferenceId"`
+	RoomNumber   string `json:"roomNumber"`
+	BridgeID     string `json:"bridgeId"`
+	Moderator    bool   `json:"moderator"`
+	MemberCount  int    `json:"memberCount"`
+	DurationMs   *int   `json:"durationMs,omitempty"`
+}
+
+// CallEmergencyDialedData is the payload of the "call.emergency.dialed" event.
+//
+// Subject: calls.evt.v1.<orgId>.<callId>.call.emergency.dialed
+// Envelope: Envelope[CallEmergencyDialedData]
+type CallEmergencyDialedData struct {
+	LegID              string  `json:"legId"`
+	Dialed             string  `json:"dialed"`
+	Number             string  `json:"number"`
+	CallerNumber       *string `json:"callerNumber,omitempty"`
+	CallerName         *string `json:"callerName,omitempty"`
+	Elin               *string `json:"elin,omitempty"`
+	EmergencyAddressID *string `json:"emergencyAddressId,omitempty"`
+	TrunkName          *string `json:"trunkName,omitempty"`
 }

@@ -232,6 +232,33 @@ export interface VoicemailPlanNode extends PlanNodeBase {
 	readonly pinHash?: string;
 }
 
+/**
+ * A conference room.
+ *
+ * # Why the digests are here
+ *
+ * The same rule that put `VoicemailPlanNode.pinHash` here: the gate is applied at the instant a
+ * caller reaches the room, by a process holding no database handle, so the digest travels in the
+ * artifact or the room cannot be gated at all. The format is `voicemail-pin.ts`'s, verbatim —
+ * the compiler parses it, refuses to embed one it cannot read, and the engine verifies it with
+ * the same constant-time check it uses for `*97`.
+ *
+ * # `requiresPin` and `pinHash` are separate facts, and a reader must not conflate them
+ *
+ * `requiresPin` means "the room's row has a PIN set". `pinHash` means "and this release can
+ * verify it". They come apart in exactly two situations and both must fail CLOSED:
+ *
+ * - the digest is in a format this release cannot parse (the compiler raises `invalid-pin-hash`
+ *   and embeds nothing);
+ * - the artifact was compiled by a release that predated this field.
+ *
+ * In both, `requiresPin === true && pinHash === undefined`, and the only honest answer is to
+ * refuse the room. Admitting the caller would turn a formatting change into an open conference
+ * bridge, which is the failure mode this whole design exists to avoid.
+ *
+ * `requiresModeratorPin` is optional and absent means `false`: a reader compiled before moderator
+ * support simply has no moderators, which is what it did anyway.
+ */
 export interface ConferencePlanNode extends PlanNodeBase {
 	readonly kind: "conference";
 	readonly conferenceId: string;
@@ -243,6 +270,12 @@ export interface ConferencePlanNode extends PlanNodeBase {
 	readonly mohClassId?: string;
 	/** The class's NAME, resolved from `mohClassId`. Absent means "the media server's default". */
 	readonly mohClass?: string;
+	/** Digest of the participant PIN. Absent with `requiresPin` set means "refuse the room". */
+	readonly pinHash?: string;
+	/** Digest of the moderator PIN. Entering it admits the caller AND releases `waitForModerator`. */
+	readonly moderatorPinHash?: string;
+	/** Whether the room's row has a moderator PIN. Absent means `false`. */
+	readonly requiresModeratorPin?: boolean;
 }
 
 export interface ParkPlanNode extends PlanNodeBase {
@@ -297,6 +330,21 @@ export interface TrunkAttempt {
  * `RETRYABLE_HANGUP_CAUSES`. It is deliberately not "every cause": walking an entire trunk list
  * after a `CALL_REJECTED` multiplies one fraudulent call attempt by the number of carriers a
  * tenant has, which is precisely the amplification a compromised extension is looking for.
+ *
+ * # The emergency variant
+ *
+ * `emergency` marks the ONE node in an artifact that was not compiled from an `outbound_route`
+ * row (`outboundRouteId` is the literal `"emergency"`). It exists as a flag on this node rather
+ * than as a fourteenth node kind for a deliberate reason: a new kind is a
+ * `ROUTING_ARTIFACT_VERSION` bump — an old reader hits a node it cannot execute and refuses the
+ * call — whereas three optional fields leave an old reader dialing the trunk chain with the
+ * tenant's ordinary caller id. For an emergency call, "dialed with the wrong ANI" is a far better
+ * failure than "refused", and it is what every release before this one would have done anyway.
+ *
+ * `elin` is the Emergency Location Identification Number: the callback number a PSAP dials and
+ * the key it looks the dispatchable location up by. It is the ORGANIZATION's fallback — the
+ * calling extension's own `emergencyCallerIdNumber` wins over it, and the resolver applies that
+ * precedence because only the resolver knows who is calling.
  */
 export interface TrunkDialPlanNode extends PlanNodeBase {
 	readonly kind: "trunk-dial";
@@ -308,6 +356,12 @@ export interface TrunkDialPlanNode extends PlanNodeBase {
 	readonly callerIdNumberOverride?: string;
 	/** Taken when every attempt has failed. */
 	readonly failoverNodeId?: PlanNodeId;
+	/** Marks the emergency dial node. A reader that does not know the field dials normally. */
+	readonly emergency?: boolean;
+	/** `emergency_address.id` the ELIN is registered against, for the notification event. */
+	readonly emergencyAddressId?: string;
+	/** Organization-level ELIN. The caller's own emergency caller id wins over it. */
+	readonly elin?: string;
 }
 
 /** Hand the leg to a named engine application (the `application` destination type). */

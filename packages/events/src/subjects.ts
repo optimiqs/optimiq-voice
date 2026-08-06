@@ -73,6 +73,30 @@ export const CALL_EVENTS = [
 	"channel.record.stopped",
 	"channel.hangup",
 	"channel.destroyed",
+	// --- not channel lifecycle: facts ABOUT a call that a consumer acts on ---------------------
+	/**
+	 * A conference participant joined a room. Carries whether they came in as a moderator, which
+	 * is what releases everyone else's `waitForModerator` hold.
+	 */
+	"conference.joined",
+	/** A conference participant left. The pair bounds a participant's time in the room. */
+	"conference.left",
+	/**
+	 * An emergency call was originated. **This is the Kari's Law notification seam.**
+	 *
+	 * 47 U.S.C. §623(b) requires an MLTS to notify a central location — a front desk, a security
+	 * office, a distribution list — when a `911` call is placed from the system, contemporaneously
+	 * and without requiring anyone to reconfigure anything. The engine cannot deliver an email or
+	 * a webhook (it holds no tenant configuration and no SMTP handle), and a notification that
+	 * lives inside the engine is a notification one process can lose.
+	 *
+	 * So the contract is the EVENT: the engine publishes this the moment the first trunk attempt
+	 * is made — before the answer, because the notification is about the attempt — and delivery is
+	 * a consumer's job. It carries the dialed number, the caller, the ELIN actually presented and
+	 * the dispatchable location's id, which is everything a "someone on the 4th floor dialed 911"
+	 * message needs.
+	 */
+	"call.emergency.dialed",
 ] as const;
 export type CallEvent = (typeof CALL_EVENTS)[number];
 

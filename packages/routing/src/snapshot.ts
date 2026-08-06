@@ -33,6 +33,7 @@
  * | `parkLots`                | `park_lot`               | slot range + timeout branch                |
  * | `featureCodes`            | `feature_code`           | 1:1                                        |
  * | `callBlockRules`          | `call_block_rule`        | 1:1 minus the hit counters                 |
+ * | `emergencyAddresses`      | `emergency_address`      | id, label and `validated` only             |
  * | `settings`                | `org_setting` (subset)   | the handful of settings routing reads      |
  *
  * Collections are flat arrays rather than pre-joined trees on purpose: that is what
@@ -44,7 +45,8 @@
  *
  * # Optional collections
  *
- * Two collections — `mohClasses` and `voicemailGreetings` — are declared **optional** on
+ * Three collections — `mohClasses`, `voicemailGreetings` and `emergencyAddresses` — are declared
+ * **optional** on
  * {@link OrgRoutingSnapshot} and listed in {@link OPTIONAL_SNAPSHOT_COLLECTIONS}. That is a
  * deliberate rollout affordance rather than a modelling accident: they were added after the API's
  * snapshot loader was written, and a required field would have made this package impossible to
@@ -235,6 +237,16 @@ export interface PhoneNumberInput extends RoutingEntityInput, DestinationInput {
 	readonly callerIdNamePrefix?: string | null;
 	readonly recordEnabled: boolean;
 	readonly voiceEnabled: boolean;
+	/**
+	 * The dispatchable location registered against this number, from
+	 * `phone_number.emergency_address_id`.
+	 *
+	 * A DID with one is a candidate ELIN: the number a PSAP calls back and the key it looks the
+	 * address up by. A DID without one produces a `missing-emergency-address` **warning** rather
+	 * than an error, because refusing to compile a tenant's whole routing over an unassigned
+	 * address would take their working calls down to fix a call they have not yet placed.
+	 */
+	readonly emergencyAddressId?: string | null;
 }
 
 export interface TrunkInput extends RoutingEntityInput {
@@ -431,6 +443,22 @@ export interface MohClassInput extends RoutingEntityInput {
 	readonly name: string;
 }
 
+/**
+ * A conference room.
+ *
+ * # Why there are two digests and a `requiresPin` that is neither
+ *
+ * `requiresPin` is `pin_hash !== null` as the loader computes it, and it exists independently of
+ * {@link pinHash} for the same reason `VoicemailPlanNode` embeds a digest the compiler may refuse:
+ * "this room wants a PIN" and "this release can verify that PIN" are different facts, and a reader
+ * that conflated them would fail OPEN on a digest written under a format it cannot parse. A room
+ * with `requiresPin` and no embedded digest is refused, not admitted.
+ *
+ * The moderator digest is a second, higher credential over the same room. Entering it admits the
+ * caller AND satisfies {@link waitForModerator} for everyone already holding, which is the whole
+ * point of the flag: without a way to tell a moderator from a participant, "hold until a moderator
+ * arrives" can never end.
+ */
 export interface ConferenceInput extends RoutingEntityInput {
 	readonly name: string;
 	readonly roomNumber: string;
@@ -439,6 +467,40 @@ export interface ConferenceInput extends RoutingEntityInput {
 	readonly mohClassId?: string | null;
 	readonly waitForModerator: boolean;
 	readonly recordEnabled: boolean;
+	/**
+	 * The participant PIN, as a digest in the format `voicemail-pin.ts` defines. Never a PIN.
+	 *
+	 * Here for exactly the reason {@link VoicemailBoxInput.pinHash} is: the engine gates a room on
+	 * the call path, in a process holding no database handle. One format, one parser, one verifier.
+	 */
+	readonly pinHash?: string | null;
+	/** The moderator PIN digest, same format. Admits the caller as a moderator. */
+	readonly moderatorPinHash?: string | null;
+	/**
+	 * `moderator_pin_hash !== null`, as the loader computes it. Optional so a loader that predates
+	 * moderator support is a supported rollout state rather than a type error; absent is read as
+	 * `moderatorPinHash != null`.
+	 */
+	readonly requiresModeratorPin?: boolean;
+}
+
+/**
+ * A dispatchable location, from `emergency_address`.
+ *
+ * Only three columns, because only three affect a routing decision: the id a DID points at, the
+ * label a diagnostic names, and `validated` — the gate the carrier applies before it will accept
+ * the address for emergency origination. The street, the locality and the postal code are the
+ * control plane's; nothing on the call path reads them, and an artifact carrying a tenant's
+ * postal addresses into a KV bucket every engine can read is a liability with no upside.
+ *
+ * Not a {@link RoutingEntityInput}: `emergency_address` has no `enabled` column. `validated` is
+ * the flag and it means something different — an unvalidated address is one the carrier has not
+ * accepted yet, not one an admin switched off.
+ */
+export interface EmergencyAddressInput {
+	readonly id: string;
+	readonly label: string;
+	readonly validated: boolean;
 }
 
 export interface ParkLotInput extends RoutingEntityInput {
@@ -493,6 +555,14 @@ export interface RoutingSettingsInput {
 	readonly trunkContinueOnCauses?: readonly string[];
 	/** Whether an internal caller may reach outbound routes at all (org-level kill switch). */
 	readonly outboundEnabled?: boolean;
+	/**
+	 * Emergency dial strings this organization recognises **in addition to** the compiled-in NANP
+	 * set (`emergency.ts`). One row for a tenant whose handsets are not all in North America.
+	 *
+	 * Additive, never replacing, and there is no setting that removes a seeded number: the
+	 * compiled-in `911` is the one routing decision a tenant does not get to switch off.
+	 */
+	readonly emergencyNumbers?: readonly string[];
 }
 
 /** Everything the compiler is allowed to see about one organization. */
@@ -520,6 +590,8 @@ export interface OrgRoutingSnapshot {
 	readonly parkLots: readonly ParkLotInput[];
 	readonly featureCodes: readonly FeatureCodeInput[];
 	readonly callBlockRules: readonly CallBlockRuleInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly emergencyAddresses?: readonly EmergencyAddressInput[];
 }
 
 /**
@@ -550,6 +622,7 @@ export const SNAPSHOT_COLLECTIONS = [
 	"parkLots",
 	"featureCodes",
 	"callBlockRules",
+	"emergencyAddresses",
 ] as const satisfies readonly (keyof OrgRoutingSnapshot)[];
 
 export type SnapshotCollection = (typeof SNAPSHOT_COLLECTIONS)[number];
@@ -565,6 +638,7 @@ export type SnapshotCollection = (typeof SNAPSHOT_COLLECTIONS)[number];
 export const OPTIONAL_SNAPSHOT_COLLECTIONS = [
 	"voicemailGreetings",
 	"mohClasses",
+	"emergencyAddresses",
 ] as const satisfies readonly SnapshotCollection[];
 
 export type OptionalSnapshotCollection = (typeof OPTIONAL_SNAPSHOT_COLLECTIONS)[number];
@@ -582,7 +656,7 @@ export function isOptionalSnapshotCollection(
 /**
  * One collection's rows, with an absent optional collection read as empty.
  *
- * The union of the seventeen row types has no useful common supertype beyond "carries an `id`",
+ * The union of the row types has no useful common supertype beyond "carries an `id`",
  * which is exactly what every caller here needs (they sort by it), so that is what this returns.
  */
 export function snapshotCollection(
@@ -615,5 +689,6 @@ export function emptySnapshot(organizationId: string): OrgRoutingSnapshot {
 		parkLots: [],
 		featureCodes: [],
 		callBlockRules: [],
+		emergencyAddresses: [],
 	};
 }

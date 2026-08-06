@@ -32,6 +32,9 @@ var EventTypes = []EventTypeInfo{
 	{Family: FamilyCall, Type: EventTypeChannelRecordStopped, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.channel.record.stopped"},
 	{Family: FamilyCall, Type: EventTypeChannelHangup, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.channel.hangup"},
 	{Family: FamilyCall, Type: EventTypeChannelDestroyed, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.channel.destroyed"},
+	{Family: FamilyCall, Type: EventTypeConferenceJoined, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.conference.joined"},
+	{Family: FamilyCall, Type: EventTypeConferenceLeft, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.conference.left"},
+	{Family: FamilyCall, Type: EventTypeCallEmergencyDialed, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.call.emergency.dialed"},
 	{Family: FamilyRegistration, Type: EventTypeRegistrationRegistered, SubjectTemplate: "sip.reg.v1.<orgId>.<aorHash>.registered"},
 	{Family: FamilyRegistration, Type: EventTypeRegistrationUnregistered, SubjectTemplate: "sip.reg.v1.<orgId>.<aorHash>.unregistered"},
 	{Family: FamilyRegistration, Type: EventTypeRegistrationExpired, SubjectTemplate: "sip.reg.v1.<orgId>.<aorHash>.expired"},
@@ -81,6 +84,12 @@ func NewDataFor(eventType string) any {
 		return new(ChannelHangupData)
 	case EventTypeChannelDestroyed:
 		return new(ChannelDestroyedData)
+	case EventTypeConferenceJoined:
+		return new(ConferenceJoinedData)
+	case EventTypeConferenceLeft:
+		return new(ConferenceLeftData)
+	case EventTypeCallEmergencyDialed:
+		return new(CallEmergencyDialedData)
 	case EventTypeRegistrationRegistered:
 		return new(RegistrationRegisteredData)
 	case EventTypeRegistrationUnregistered:

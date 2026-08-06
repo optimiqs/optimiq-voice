@@ -41,8 +41,9 @@ NATS backbone, mirrors live channel state into JetStream KV, and emits one CDR p
   digest from the artifact), then the messages are read out newest-first with `1` next / `2` replay
   / `*` exit, driven by `rpc.voicemail.v1.list`.
 
-**Not here yet:** conferences, park, attended/blind transfer, answer confirmation, voicemail email
-delivery, mailbox delete/save, and the session-protocol server. **And two things this wave built but
+**Not here yet:** park, attended/blind transfer, answer confirmation, voicemail email delivery,
+mailbox delete/save, and the session-protocol server. **Conferences are here, minimally** — see the
+node table and the conference gaps below for exactly which parts. **And two things this wave built but
 cannot yet run end to end**: the `rpc.voicemail.v1.list` responder (API side) and a mount that makes
 object-store audio reachable by Asterisk — see "Known gaps". Every one of them is named in the
 walk's `notes`, so a call that hit a gap says so in the log rather than looking like a routing bug.
@@ -66,7 +67,7 @@ inbound INVITE on a DID
 
 **`RoutingArtifactSource`** (`src/routing/routing-artifact.source.ts`) is three layers deep:
 in-process memory, then the KV bucket, then the RPC. Invalidation is a KV **watch**, not a TTL —
-`apps/api` writes the artifact in the same unit of work as the row change, so its `put` *is* the
+`apps/api` writes the artifact in the same unit of work as the row change, so its `put` _is_ the
 invalidation signal. The bucket's 1 h TTL stays a backstop. A watch that dies drops every memory
 copy, because an engine that stopped hearing about changes must not keep serving the last thing it
 heard as if it were current. An artifact whose `artifactVersion` this release does not understand
@@ -76,19 +77,21 @@ is discarded and recompiled, never walked best-effort.
 budget, because the table is a graph: an IVR option may point back at its parent menu, and a
 recursive walker would express that as a stack overflow on a live call.
 
-| Node kind                      | Status                                                             |
-| ------------------------------ | ------------------------------------------------------------------ |
-| `extension`                    | Originate, bridge on answer; busy / no-answer / not-registered branches |
-| `ring-group`                   | `simultaneous` (multi-originate, first answer wins, losers get `LOSE_RACE`) and `sequential` (per-member timeout, `ignoreBusy`) |
-| `ivr-menu`                     | Greeting + `gather`, option dispatch, separate invalid / timeout budgets, submenu recursion |
-| `time-condition`               | Evaluated against the WALK's instant, so a caller who sits in an IVR across 17:00 gets the after-hours branch |
-| `trunk-dial`                   | Ordered failover honouring `continueOnCauses` (a closed allow-list, never "every cause") |
-| `external`                     | Dialled when literal; REFUSED with `OUTGOING_CALL_BARRED` when it needs outbound routing |
-| `playback` / `hangup`          | Direct verb mapping                                                 |
-| `voicemail` (`leave`)          | The box's own greeting (`greetingMedia`, falling back to `ENGINE_VOICEMAIL_GREETING`) + ARI record + `channel.record.*` + `voicemail.message.left`; an empty or failed recording files nothing |
-| `voicemail` (`check`)          | PIN challenge when the box has one, mailbox number read back as `digits/*`, then message playback over `rpc.voicemail.v1.list` with `1` next / `2` replay / `*` exit |
-| `feature-code`                 | `*97` opens the caller's own mailbox; a code with no mailbox behind it announces and refuses. Everything else announces and hangs up |
-| `conference` `park` `application` | **Stub** — announce and hang up with `FACILITY_NOT_IMPLEMENTED` |
+| Node kind                  | Status                                                                                                                                                                                                                                                                                                 |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `extension`                | Originate, bridge on answer; busy / no-answer / not-registered branches                                                                                                                                                                                                                                |
+| `ring-group`               | `simultaneous` (multi-originate, first answer wins, losers get `LOSE_RACE`) and `sequential` (per-member timeout, `ignoreBusy`)                                                                                                                                                                        |
+| `ivr-menu`                 | Greeting + `gather`, option dispatch, separate invalid / timeout budgets, submenu recursion                                                                                                                                                                                                            |
+| `time-condition`           | Evaluated against the WALK's instant, so a caller who sits in an IVR across 17:00 gets the after-hours branch                                                                                                                                                                                          |
+| `trunk-dial`               | Ordered failover honouring `continueOnCauses` (a closed allow-list, never "every cause")                                                                                                                                                                                                               |
+| `external`                 | Dialled when literal; REFUSED with `OUTGOING_CALL_BARRED` when it needs outbound routing                                                                                                                                                                                                               |
+| `playback` / `hangup`      | Direct verb mapping                                                                                                                                                                                                                                                                                    |
+| `voicemail` (`leave`)      | The box's own greeting (`greetingMedia`, falling back to `ENGINE_VOICEMAIL_GREETING`) + ARI record + `channel.record.*` + `voicemail.message.left`; an empty or failed recording files nothing                                                                                                         |
+| `voicemail` (`check`)      | PIN challenge when the box has one, mailbox number read back as `digits/*`, then message playback over `rpc.voicemail.v1.list` with `1` next / `2` replay / `*` exit                                                                                                                                   |
+| `feature-code`             | `*97` opens the caller's own mailbox; a code with no mailbox behind it announces and refuses. Everything else announces and hangs up                                                                                                                                                                   |
+| `conference`               | PIN gate (participant AND moderator digests, one challenge, three attempts, fail closed), join to a shared ARI mixing bridge, `waitForModerator` held on MOH OUTSIDE the bridge, `maxMembers`, `conference.joined` / `conference.left`. Needs `ConferenceRegistry`; without it, the announcement below |
+| `trunk-dial` (`emergency`) | The ELIN wins over every caller-id override, and `call.emergency.dialed` is published BEFORE the first attempt — the Kari's Law notification seam                                                                                                                                                      |
+| `park` `application`       | **Stub** — announce and hang up with `FACILITY_NOT_IMPLEMENTED`                                                                                                                                                                                                                                        |
 
 **The A-leg is never answered early.** A `hangup` terminal (a blocked caller, an unallocated DID)
 tears the leg down without answering, and an extension's B-leg has to answer before the A-leg does
@@ -129,9 +132,41 @@ rather than resolving a conflict the database says cannot exist.
 
 ### Known gaps
 
-- **The did-index publish is after the commit.** An API process that dies between committing a new
-  number and writing the bucket leaves the DID routable by nobody until the next write for that
-  organization or a run of `rebuild:did-index`. Closing the window needs an outbox, not a retry.
+- ~~**The did-index publish is after the commit.**~~ _Closed._ The publish is still after the
+  commit, and has to be — publishing from inside the write transaction would put an index entry for
+  a state that might roll back in front of live calls. What has changed is that the obligation is
+  now recorded **in** that transaction: `pbx_projection_outbox` gets a row per owed projection,
+  the after-commit publish marks it discharged, and a sweeper in `apps/api` republishes whatever the
+  fast path failed to mark. The same table covers `routing-cache` and `queue-membership`. An API
+  process that dies between the commit and the publish now costs up to one sweep interval
+  (`PBX_OUTBOX_SWEEP_INTERVAL_MS`, 15 s by default) instead of costing a manual `rebuild:did-index`.
+  The rebuild scripts remain, unchanged, for the failures an outbox cannot repair — a bucket lost to
+  a fresh cluster, a restored snapshot, a `nats kv del`.
+- **Hold-music classes need a generated `musiconhold.conf`.** The plan carries a class NAME, and
+  `POST /channels/{id}/moh?mohClass=<name>` resolves it against the media server's configuration
+  file rather than against a path — so tenant audio uploaded under `moh/<org>/<classId>/` is not
+  playable until that file declares the class. `pnpm --filter @optimiq-voice/api
+generate:musiconhold` renders it from `moh_class` and `apps/asterisk`'s `run.sh` picks it up at
+  start; see `apps/asterisk/README.md` for the mount, the reload, and the one case it refuses (a
+  class name two organizations claim — Asterisk's class namespace is global, so declaring either
+  would play one tenant's hold music to another tenant's callers).
+- **A conference room is a single-process room.** `ConferenceRegistry` is an in-memory map, so two
+  engine instances behind one media server each create their own bridge for room `3001` and neither
+  knows about the other: participants who land on different instances hear hold music and not each
+  other, which reads as a media bug and is not one. Closing it needs a shared claim on the bridge id
+  (KV, compare-and-set) plus an owner for cleanup when the claiming instance dies — the hard half.
+  A single-instance deployment, which is what `compose.dev.yaml` and the integration harness run,
+  has no split.
+- **A conference does not record, mute, kick, lock or tone.** `ConferencePlanNode.recordEnabled` is
+  read and reported in the walk's `notes`, never acted on; there are no in-conference DTMF controls,
+  no participant list and no entry/exit tones. A tenant who ticked "record this room" is told so in
+  the call log rather than finding out later.
+- **The Kari's Law notification is published, not delivered.** `call.emergency.dialed` carries the
+  dial string, the wire number, the caller, the ELIN presented and the dispatchable location's id,
+  and it goes out before the first trunk attempt. Turning that into an email, a webhook or a screen
+  pop at the front desk is a CONSUMER's job and is not built: the engine holds no tenant
+  configuration and no SMTP handle, and a notification that lives inside one process is one a
+  restart loses.
 - **DID normalisation does not guess a dial plan.** `0044…` and `+44…` are different keys, because
   turning a national prefix into a country code needs to know which country the trunk is in. That
   belongs to the SIP edge.
@@ -197,33 +232,33 @@ one that died — which is what makes the KV snapshot usable for failover instea
 
 ## Configuration
 
-| Variable                         | Default                 | Notes                                                |
-| -------------------------------- | ----------------------- | ---------------------------------------------------- |
-| `ARI_URL`                        | `http://localhost:8088` | With or without `/ari`                               |
-| `ARI_USERNAME` / `ARI_PASSWORD`  | `ari` / — (required)    | A missing password stops the process at boot         |
-| `ARI_APP`                        | `optimiq-engine`        | The `Stasis()` application name                      |
-| `ARI_SUBSCRIBE_ALL`              | `false`                 | `true` means one engine sees every tenant's channels |
-| `NATS_URL`                       | `nats://localhost:4222` |                                                      |
-| `ENGINE_ENSURE_STREAMS`          | `true`                  | Applies the `@optimiq-voice/events` definitions      |
-| `ENGINE_PORT` / `ENGINE_HOST`    | `4010` / `0.0.0.0`      | `/healthz` and `/livez` only                         |
-| `ENGINE_DEFAULT_ORGANIZATION_ID` | unset                   | Dev only — see below                                 |
-| `ENGINE_DRAIN_TIMEOUT_MS`        | `30000`                 |                                                      |
-| `ENGINE_INBOUND_ANNOUNCEMENT`    | unset                   | Pre-routing only; a plan overrides it                |
-| `ENGINE_ROUTING_ENABLED`         | `true`                  | Off leaves the pre-routing ring/answer program       |
-| `ENGINE_ROUTING_RPC_TIMEOUT_MS`  | `2000`                  | Deadline for `rpc.routing.v1.resolve`                |
-| `ENGINE_EXTENSION_DIAL_TEMPLATE` | `PJSIP/{number}`        | `{number}` is substituted                            |
-| `ENGINE_TRUNK_DIAL_TEMPLATE`     | `PJSIP/{number}@{trunk}`| `{number}` and `{trunk}` are substituted             |
-| `ENGINE_DEFAULT_RING_TIMEOUT_SECONDS` | `30`               | When neither node nor member specifies one           |
-| `ENGINE_PROMPT_MEDIA_PREFIX`     | `sound:`                | How a bare prompt id is rendered                     |
-| `ENGINE_UNAVAILABLE_ANNOUNCEMENT`| `sound:unavailable`     | Unresolvable media and the stubbed node kinds        |
-| `ENGINE_VOICEMAIL_GREETING`      | `sound:unavailable`     | Played when the box has no greeting of its own       |
-| `ENGINE_MEDIA_OBJECT_ROOT`       | unset                   | Where the object store is mounted INSIDE Asterisk. Unset = greetings and messages fall back |
-| `ENGINE_VOICEMAIL_PIN_PROMPT`    | `sound:vm-password`     | Asked before a mailbox with a PIN opens              |
-| `ENGINE_VOICEMAIL_PIN_INVALID_PROMPT` | `sound:vm-incorrect` | Played between failed attempts                      |
-| `ENGINE_VOICEMAIL_PIN_ATTEMPTS`  | `3`                     | Then the call is refused with `CALL_REJECTED`        |
-| `ENGINE_VOICEMAIL_MENU_TIMEOUT_MS` | `5000`                | Wait for a control digit after a message plays       |
-| `ENGINE_VOICEMAIL_RPC_TIMEOUT_MS`| `3000`                  | Deadline for `rpc.voicemail.v1.list`                 |
-| `ENGINE_RECORDING_FORMAT`        | `wav`                   |                                                      |
+| Variable                              | Default                  | Notes                                                                                       |
+| ------------------------------------- | ------------------------ | ------------------------------------------------------------------------------------------- |
+| `ARI_URL`                             | `http://localhost:8088`  | With or without `/ari`                                                                      |
+| `ARI_USERNAME` / `ARI_PASSWORD`       | `ari` / — (required)     | A missing password stops the process at boot                                                |
+| `ARI_APP`                             | `optimiq-engine`         | The `Stasis()` application name                                                             |
+| `ARI_SUBSCRIBE_ALL`                   | `false`                  | `true` means one engine sees every tenant's channels                                        |
+| `NATS_URL`                            | `nats://localhost:4222`  |                                                                                             |
+| `ENGINE_ENSURE_STREAMS`               | `true`                   | Applies the `@optimiq-voice/events` definitions                                             |
+| `ENGINE_PORT` / `ENGINE_HOST`         | `4010` / `0.0.0.0`       | `/healthz` and `/livez` only                                                                |
+| `ENGINE_DEFAULT_ORGANIZATION_ID`      | unset                    | Dev only — see below                                                                        |
+| `ENGINE_DRAIN_TIMEOUT_MS`             | `30000`                  |                                                                                             |
+| `ENGINE_INBOUND_ANNOUNCEMENT`         | unset                    | Pre-routing only; a plan overrides it                                                       |
+| `ENGINE_ROUTING_ENABLED`              | `true`                   | Off leaves the pre-routing ring/answer program                                              |
+| `ENGINE_ROUTING_RPC_TIMEOUT_MS`       | `2000`                   | Deadline for `rpc.routing.v1.resolve`                                                       |
+| `ENGINE_EXTENSION_DIAL_TEMPLATE`      | `PJSIP/{number}`         | `{number}` is substituted                                                                   |
+| `ENGINE_TRUNK_DIAL_TEMPLATE`          | `PJSIP/{number}@{trunk}` | `{number}` and `{trunk}` are substituted                                                    |
+| `ENGINE_DEFAULT_RING_TIMEOUT_SECONDS` | `30`                     | When neither node nor member specifies one                                                  |
+| `ENGINE_PROMPT_MEDIA_PREFIX`          | `sound:`                 | How a bare prompt id is rendered                                                            |
+| `ENGINE_UNAVAILABLE_ANNOUNCEMENT`     | `sound:unavailable`      | Unresolvable media and the stubbed node kinds                                               |
+| `ENGINE_VOICEMAIL_GREETING`           | `sound:unavailable`      | Played when the box has no greeting of its own                                              |
+| `ENGINE_MEDIA_OBJECT_ROOT`            | unset                    | Where the object store is mounted INSIDE Asterisk. Unset = greetings and messages fall back |
+| `ENGINE_VOICEMAIL_PIN_PROMPT`         | `sound:vm-password`      | Asked before a mailbox with a PIN opens                                                     |
+| `ENGINE_VOICEMAIL_PIN_INVALID_PROMPT` | `sound:vm-incorrect`     | Played between failed attempts                                                              |
+| `ENGINE_VOICEMAIL_PIN_ATTEMPTS`       | `3`                      | Then the call is refused with `CALL_REJECTED`                                               |
+| `ENGINE_VOICEMAIL_MENU_TIMEOUT_MS`    | `5000`                   | Wait for a control digit after a message plays                                              |
+| `ENGINE_VOICEMAIL_RPC_TIMEOUT_MS`     | `3000`                   | Deadline for `rpc.voicemail.v1.list`                                                        |
+| `ENGINE_RECORDING_FORMAT`             | `wav`                    |                                                                                             |
 
 **The dialplan no longer has to set `OPTIMIQ_ORG_ID`.** It still wins when it is set — see
 "Attributing a call to a tenant" — but a carrier trunk pointed at `optimiq-inbound-untrusted`

@@ -51,6 +51,13 @@ export type VoicemailPinResult =
  *
  * Never throws: this runs inside a call walk, and an exception out of one would end a call that
  * should merely have been told "incorrect PIN".
+ *
+ * Named for voicemail because voicemail is where the format came from, but it is not
+ * voicemail-specific and must not become so: `ConferencePlanNode.pinHash` and
+ * `ConferencePlanNode.moderatorPinHash` are digests in the same format written by the same API
+ * endpoint, and a second implementation of "check a scrypt digest in constant time" is a second
+ * place for the fail-open bug to live. {@link verifyPinDigest} is the neutral name; both are the
+ * same function.
  */
 export async function verifyVoicemailPin(
 	pin: string,
@@ -90,6 +97,22 @@ export async function verifyVoicemailPin(
 	}
 	return timingSafeEqual(derived, expected) ? { ok: true } : { ok: false, failure: "mismatch" };
 }
+
+/**
+ * {@link verifyVoicemailPin} under the name the rest of the engine should use.
+ *
+ * One verifier, three call sites (`*97`, a conference participant PIN, a conference moderator
+ * PIN) and therefore one place where the constant-time comparison, the digest-sourced parameters
+ * and the fail-closed behaviour are decided. An alias rather than a rename because the voicemail
+ * name is what the `*97` path and its specs already say, and churning them proves nothing.
+ */
+export const verifyPinDigest = verifyVoicemailPin;
+
+/** {@link VoicemailPinResult} under the neutral name. */
+export type PinDigestResult = VoicemailPinResult;
+
+/** {@link VoicemailPinFailure} under the neutral name. */
+export type PinDigestFailure = VoicemailPinFailure;
 
 function deriveKey(
 	pin: string,

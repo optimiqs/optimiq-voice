@@ -3,6 +3,7 @@ import { parseAriEvent } from "@optimiq-voice/media-ari";
 import { makeFakeMediaPort } from "../ari/media-port.fake";
 import { fakeQueueOrchestratorArgs } from "../queue/queue-services.fake";
 import { CallSignalBus } from "../routing/call-signals";
+import { ConferenceRegistry } from "../routing/conference-registry";
 import { DtmfRegistry } from "../verbs/dtmf-registry";
 import { makeVerbExecutorRuntime } from "../verbs/verb-executor";
 import { ChannelOrchestrator } from "./channel-orchestrator.service";
@@ -138,6 +139,7 @@ function harness(env: EngineEnv = fakeEnv()) {
 		NO_MAILBOX,
 		NO_DID_INDEX,
 		signals,
+		new ConferenceRegistry(),
 		...(fakeQueueOrchestratorArgs() as [never, never, never, never, never]),
 	);
 
@@ -502,6 +504,7 @@ describe("resilience", () => {
 			NO_MAILBOX,
 			NO_DID_INDEX,
 			h.signals,
+			new ConferenceRegistry(),
 			...(fakeQueueOrchestratorArgs() as [never, never, never, never, never]),
 		);
 

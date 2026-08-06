@@ -31,6 +31,13 @@ import { ROUTING_ARTIFACT_VERSION } from "./artifact";
 import { snapshotHash } from "./cache";
 import { destinationShapeIssues, isDestinationType } from "./destinations";
 import { DiagnosticBag } from "./diagnostics";
+import {
+	EMERGENCY_CONTINUE_ON_CAUSES,
+	EMERGENCY_NODE_ID,
+	EMERGENCY_ROUTE_ID,
+	emergencyNumbers,
+	invalidEmergencyNumbers,
+} from "./emergency";
 import { RoutingCompileError, RoutingSnapshotError } from "./errors";
 import {
 	FEATURE_CODE_ARGUMENT_MODE,
@@ -54,6 +61,8 @@ import { voicemailPinHashIssue } from "./voicemail-pin";
 import type {
 	CompiledCallBlockRule,
 	CompiledRoutingSettings,
+	EmergencyMatchTable,
+	EmergencyRule,
 	ExtensionIndexEntry,
 	InboundDidDefault,
 	InboundMatchTable,
@@ -75,6 +84,7 @@ import type { CompiledPattern } from "./patterns";
 import type { PlanNode, PlanNodeId, RingGroupMember } from "./plan";
 import type {
 	CallBlockAction,
+	EmergencyAddressInput,
 	ExtensionInput,
 	IvrMenuOptionInput,
 	MohClassInput,
@@ -237,6 +247,7 @@ class Compiler {
 		OrgRoutingSnapshot["timeConditions"][number]
 	>();
 	private readonly mohClassesById = new Map<string, MohClassInput>();
+	private readonly emergencyAddressesById = new Map<string, EmergencyAddressInput>();
 	/** Active greetings, keyed by `<voicemailBoxId>:<kind>` — at most one row per pair. */
 	private readonly activeGreetings = new Map<string, VoicemailGreetingInput>();
 	private readonly ivrOptionsByMenu = new Map<string, IvrMenuOptionInput[]>();
@@ -257,9 +268,13 @@ class Compiler {
 		this.compileTimeConditions();
 		this.materialiseEntities();
 
-		const internal = this.compileInternal();
+		// Before the three tables, because both `internal` and `outbound` embed it and the
+		// shadowing check reads the internal numbers `compileInternal` claims.
+		const emergency = this.compileEmergency();
+
+		const internal = this.compileInternal(emergency);
 		const inbound = this.compileInbound();
-		const outbound = this.compileOutbound(settings);
+		const outbound = this.compileOutbound(settings, emergency);
 		const callBlock = this.compileCallBlock();
 		const extensionIndex = this.compileExtensionIndex();
 
@@ -332,6 +347,9 @@ class Compiler {
 		}
 		for (const mohClass of sortById(this.snapshot.mohClasses ?? [])) {
 			this.mohClassesById.set(mohClass.id, mohClass);
+		}
+		for (const address of sortById(this.snapshot.emergencyAddresses ?? [])) {
+			this.emergencyAddressesById.set(address.id, address);
 		}
 		this.indexVoicemailGreetings();
 		for (const option of sortByOrdinal(this.snapshot.ivrMenuOptions)) {
@@ -1243,9 +1261,56 @@ class Compiler {
 				recordEnabled: room.recordEnabled,
 				mohClassId: room.mohClassId ?? undefined,
 				mohClass: this.mohClassName(room.mohClassId, subject, "mohClassId"),
+				pinHash: this.conferencePinHash(room, room.pinHash, "pinHash", subject),
+				moderatorPinHash: this.conferencePinHash(
+					room,
+					room.moderatorPinHash,
+					"moderatorPinHash",
+					subject,
+				),
+				requiresModeratorPin:
+					(room.requiresModeratorPin ?? room.moderatorPinHash != null) || undefined,
 			}) as PlanNode,
 		);
 		return id;
+	}
+
+	/**
+	 * A conference PIN digest, if it is one.
+	 *
+	 * The `voicemailPinHash` clone, and deliberately a clone rather than a shared helper taking a
+	 * subject and a label: the two differ in what the caller is told when the digest is unreadable,
+	 * and that difference is the point. A mailbox with an unreadable digest **degrades** — it falls
+	 * back to authenticating by the calling extension, which is the classic PBX default and is what
+	 * it did before PINs were compiled at all. A room with an unreadable digest **fails closed** —
+	 * the engine refuses it — because the classic default for a conference bridge is "anyone who
+	 * knows the number is in", and silently restoring that on a room whose owner set a PIN would
+	 * turn a formatting change into an open bridge.
+	 *
+	 * So both warn, both refuse to embed, and the messages say which of the two happened.
+	 */
+	private conferencePinHash(
+		room: OrgRoutingSnapshot["conferences"][number],
+		raw: string | null | undefined,
+		path: "pinHash" | "moderatorPinHash",
+		subject: DiagnosticSubject,
+	): string | undefined {
+		const value = raw ?? undefined;
+		if (value === undefined || value.trim() === "") {
+			return undefined;
+		}
+		const issue = voicemailPinHashIssue(value);
+		if (issue !== undefined) {
+			const which = path === "pinHash" ? "participant" : "moderator";
+			this.bag.warning(
+				"invalid-pin-hash",
+				`Conference room ${room.roomNumber} has a ${which} PIN digest this release cannot read (${issue}); the room is refused rather than admitted without a PIN.`,
+				subject,
+				path,
+			);
+			return undefined;
+		}
+		return value.trim();
 	}
 
 	private parkNodeById(ref: string, subject: DiagnosticSubject, path: string): PlanNodeId | null {
@@ -1403,14 +1468,16 @@ class Compiler {
 	// Internal context
 	// -------------------------------------------------------------------------------------------
 
-	private compileInternal(): InternalMatchTable {
+	private compileInternal(emergency: EmergencyMatchTable): InternalMatchTable {
 		const featureCodes = this.compileFeatureCodes();
 		const voicemailPrefixes = this.compileVoicemailPrefixes(featureCodes);
 
 		this.claimInternalNumbers();
+		this.reportEmergencyShadowing(emergency);
 		const parkSlots = this.compileParkSlots();
 
 		return {
+			...(Object.keys(emergency).length === 0 ? {} : { emergency }),
 			featureCodes,
 			voicemailPrefixes,
 			mailboxes: this.compileMailboxes(),
@@ -1959,7 +2026,10 @@ class Compiler {
 	// Outbound context
 	// -------------------------------------------------------------------------------------------
 
-	private compileOutbound(settings: CompiledRoutingSettings): OutboundMatchTable {
+	private compileOutbound(
+		settings: CompiledRoutingSettings,
+		emergency: EmergencyMatchTable,
+	): OutboundMatchTable {
 		const rules: OutboundRule[] = [];
 		const continueOnCauses = this.trunkContinueOnCauses();
 
@@ -2063,6 +2133,7 @@ class Compiler {
 
 		return {
 			rules: ordered,
+			...(Object.keys(emergency).length === 0 ? {} : { emergency }),
 			enabled: settings.outboundEnabled,
 			noMatchNodeId: this.hangupNode(NO_MATCH_CAUSE),
 			deniedNodeId: this.hangupNode(TOLL_DENIED_CAUSE),
@@ -2130,6 +2201,255 @@ class Compiler {
 		}
 
 		return { attempts, continueOnCauses };
+	}
+
+	// -------------------------------------------------------------------------------------------
+	// Emergency dialing
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * The emergency table and the one node it points at.
+	 *
+	 * Compiled unconditionally — a tenant with no trunks and no addresses still gets the table, and
+	 * gets the warnings that say why dialing it will not reach anybody. The alternative, compiling
+	 * it only when it would work, produces a silent artifact for exactly the organization that most
+	 * needs to be told.
+	 *
+	 * The node is a `trunk-dial` with `emergency: true` rather than a new node kind, because a new
+	 * kind is an artifact-version bump and this is not worth a flag day — see the note on
+	 * {@link import("./plan").TrunkDialPlanNode}.
+	 */
+	private compileEmergency(): EmergencyMatchTable {
+		this.reportInvalidEmergencyNumbers();
+		const location = this.emergencyLocation();
+		const attempts = this.emergencyTrunkAttempts();
+		this.reportEmergencyReachability(attempts.length);
+
+		if (!this.claimed.has(EMERGENCY_NODE_ID)) {
+			this.claimed.add(EMERGENCY_NODE_ID);
+			this.nodes.set(
+				EMERGENCY_NODE_ID,
+				compact({
+					id: EMERGENCY_NODE_ID,
+					kind: "trunk-dial",
+					label: "Emergency",
+					outboundRouteId: EMERGENCY_ROUTE_ID,
+					// Unused: the emergency path is never toll-class gated. `internal` is the lowest
+					// rank, so a reader that gates anyway lets every caller through rather than none.
+					tollClass: "internal",
+					attempts,
+					continueOnCauses: EMERGENCY_CONTINUE_ON_CAUSES,
+					// Never recorded by default. An emergency call may be recorded where the law
+					// permits it, but that is a deliberate deployment decision and not a compiler's.
+					recordEnabled: false,
+					emergency: true,
+					emergencyAddressId: location.emergencyAddressId,
+					elin: location.elin,
+					// No `failoverNodeId` and no time gate, on purpose: there is nowhere better for an
+					// emergency call to go, and a gate is a thing that can close.
+				}) as PlanNode,
+			);
+		}
+
+		const table: Record<string, EmergencyRule> = {};
+		for (const seed of emergencyNumbers(this.snapshot.settings?.emergencyNumbers)) {
+			table[seed.dialed] = {
+				dialed: seed.dialed,
+				number: seed.number,
+				destinationNodeId: EMERGENCY_NODE_ID,
+			};
+		}
+		return sortRecordKeys(table);
+	}
+
+	private reportInvalidEmergencyNumbers(): void {
+		for (const raw of invalidEmergencyNumbers(this.snapshot.settings?.emergencyNumbers)) {
+			this.bag.warning(
+				"invalid-emergency-number",
+				`Emergency number ${JSON.stringify(raw)} is not a dial string this release can match; it was dropped. The compiled-in emergency numbers are unaffected.`,
+				undefined,
+				"settings.emergencyNumbers",
+			);
+		}
+	}
+
+	/**
+	 * The organization's ELIN and the address it is registered against.
+	 *
+	 * Chosen from the DIDs, deterministically: enabled, voice-enabled, carrying an
+	 * `emergencyAddressId` that resolves to a **validated** address, lowest E.164 first. Lowest
+	 * rather than "the first the loader returned" for the usual reason — the artifact has to be
+	 * byte-stable — and validated rather than merely assigned because an unvalidated address is one
+	 * the carrier has not accepted, and presenting an ANI it will reject is worse than presenting
+	 * the tenant's ordinary outbound caller id.
+	 *
+	 * Every DID that could have been a candidate and is not produces a warning naming that number.
+	 */
+	private emergencyLocation(): {
+		readonly elin?: string;
+		readonly emergencyAddressId?: string;
+	} {
+		let chosen: { readonly elin: string; readonly emergencyAddressId: string } | undefined;
+		const unassigned: DiagnosticSubject[] = [];
+
+		for (const did of [...this.snapshot.phoneNumbers].sort((left, right) =>
+			left.e164 < right.e164 ? -1 : left.e164 > right.e164 ? 1 : 0,
+		)) {
+			if (!did.enabled || !did.voiceEnabled) {
+				continue;
+			}
+			const subject: DiagnosticSubject = { kind: "phone-number", id: did.id, name: did.e164 };
+			const addressId = did.emergencyAddressId ?? undefined;
+			if (addressId === undefined || addressId.trim() === "") {
+				unassigned.push(subject);
+				continue;
+			}
+			// A loader that does not yet load the collection is a rollout state, not a tenant with
+			// broken references — the same rule `mohClassName` follows, and for the same reason.
+			if (this.snapshot.emergencyAddresses === undefined) {
+				chosen ??= { elin: did.e164, emergencyAddressId: addressId };
+				continue;
+			}
+			const address = this.emergencyAddressesById.get(addressId);
+			if (address === undefined) {
+				this.bag.warning(
+					"dangling-emergency-address",
+					`Number ${did.e164} names emergency address "${addressId}", which is not in this snapshot; it cannot serve as this organization's ELIN.`,
+					subject,
+					"emergencyAddressId",
+				);
+				continue;
+			}
+			if (!address.validated) {
+				this.bag.warning(
+					"dangling-emergency-address",
+					`Number ${did.e164} names emergency address "${address.label}", which the carrier has not validated; it cannot serve as this organization's ELIN until it is.`,
+					subject,
+					"emergencyAddressId",
+				);
+				continue;
+			}
+			chosen ??= { elin: did.e164, emergencyAddressId: addressId };
+		}
+
+		// Only worth saying when the organization has DIDs at all, and only about the numbers that
+		// could have carried the address. A tenant with no numbers has a different problem.
+		for (const subject of unassigned) {
+			this.bag.warning(
+				"missing-emergency-address",
+				`Number ${subject.name ?? subject.id} has no emergency address, so it cannot be used as an emergency callback number (ELIN). RAY BAUM'S Act requires a dispatchable location for every station that can dial 911.`,
+				subject,
+				"emergencyAddressId",
+			);
+		}
+
+		return chosen === undefined ? {} : chosen;
+	}
+
+	/**
+	 * The emergency failover chain: **every** trunk in the snapshot, disabled ones included.
+	 *
+	 * The ordering is documented because it has to be reproducible:
+	 *
+	 * 1. trunks named by an **enabled** outbound route, in (route priority asc, route id asc,
+	 *    entry order asc) order — the tenant's own carrier preference, reused rather than invented;
+	 * 2. then every remaining trunk, by name asc.
+	 *
+	 * Deduplicated by trunk id, first position wins. `enabled` is deliberately ignored at both
+	 * steps: an administrator disables a trunk to stop it carrying ordinary traffic, which is not a
+	 * statement about whether a call to a dispatcher should be attempted over it. Trying a disabled
+	 * carrier costs one INVITE; not trying it costs the call.
+	 */
+	private emergencyTrunkAttempts(): readonly import("./plan").TrunkAttempt[] {
+		const ordered: string[] = [];
+		const seen = new Set<string>();
+
+		const routes = [...this.snapshot.outboundRoutes]
+			.filter((route) => route.enabled)
+			.sort(
+				(left, right) =>
+					left.priority - right.priority || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+			);
+		for (const route of routes) {
+			for (const entry of [...route.trunkPriority].sort(
+				(left, right) => left.order - right.order,
+			)) {
+				if (this.trunksById.has(entry.trunkId) && !seen.has(entry.trunkId)) {
+					seen.add(entry.trunkId);
+					ordered.push(entry.trunkId);
+				}
+			}
+		}
+		for (const trunk of [...this.snapshot.trunks].sort((left, right) =>
+			left.name < right.name ? -1 : left.name > right.name ? 1 : 0,
+		)) {
+			if (!seen.has(trunk.id)) {
+				seen.add(trunk.id);
+				ordered.push(trunk.id);
+			}
+		}
+
+		return ordered.map((trunkId, index) => {
+			const trunk = this.trunksById.get(trunkId) as OrgRoutingSnapshot["trunks"][number];
+			return compact({
+				trunkId: trunk.id,
+				name: trunk.name,
+				kind: trunk.kind,
+				sipDomain: trunk.sipDomain,
+				sipProxy: trunk.sipProxy,
+				outboundProxy: trunk.outboundProxy ?? undefined,
+				transport: trunk.transport,
+				codecPrefs: trunk.codecPrefs ?? undefined,
+				maxChannels: trunk.maxChannels ?? undefined,
+				// Deliberately NOT carried: a trunk's ordinary caller-id override would replace the
+				// ELIN with the tenant's main number, and the ELIN is the whole point.
+				order: index,
+			}) as import("./plan").TrunkAttempt;
+		});
+	}
+
+	private reportEmergencyReachability(attemptCount: number): void {
+		if (attemptCount > 0) {
+			return;
+		}
+		const stations = this.snapshot.extensions.filter((extension) => extension.enabled);
+		if (stations.length === 0) {
+			return;
+		}
+		const named = [...stations]
+			.map((extension) => extension.number)
+			.sort()
+			.slice(0, 5);
+		const suffix =
+			stations.length > named.length ? ` and ${stations.length - named.length} more` : "";
+		this.bag.warning(
+			"no-emergency-route",
+			`This organization has no trunk an emergency call could take, so extensions ${named.join(", ")}${suffix} cannot reach a dispatcher by dialing 911.`,
+			undefined,
+			"trunks",
+		);
+	}
+
+	/**
+	 * Internal numbers the emergency table takes precedence over.
+	 *
+	 * A warning rather than an error, and the emergency table wins rather than the extension:
+	 * Kari's Law is not negotiable, and an organization that numbered a desk phone `911` has made a
+	 * mistake that a diagnostic can explain and a routing table cannot compromise on.
+	 */
+	private reportEmergencyShadowing(emergency: EmergencyMatchTable): void {
+		for (const dialed of Object.keys(emergency).sort()) {
+			const claimed = this.internalNumbers.get(dialed);
+			if (claimed === undefined) {
+				continue;
+			}
+			this.bag.warning(
+				"emergency-number-shadowed",
+				`Internal number ${dialed} is claimed by ${claimed.kind} "${claimed.entityId}", but ${dialed} is an emergency number and is matched first; the ${claimed.kind} is no longer reachable by dialing it.`,
+				{ kind: claimed.kind, id: claimed.entityId, name: claimed.number },
+				"extensionNumber",
+			);
+		}
 	}
 
 	// -------------------------------------------------------------------------------------------

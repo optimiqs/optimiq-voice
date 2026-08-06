@@ -28,6 +28,7 @@ import { tollClassCovers } from "./snapshot";
 import { evaluateTimeCondition } from "./time-conditions";
 import type {
 	CompiledCallBlockRule,
+	EmergencyRule,
 	InboundRule,
 	OutboundRule,
 	RouteTimeGate,
@@ -165,6 +166,65 @@ function blockTerminalNodeId(action: CallBlockAction): PlanNodeId | null {
 			return null;
 		}
 	}
+}
+
+// -----------------------------------------------------------------------------------------------
+// Emergency
+// -----------------------------------------------------------------------------------------------
+
+/**
+ * The emergency short-circuit, run FIRST by `resolveInternal` and `resolveOutbound`.
+ *
+ * Everything it skips, it skips on purpose. Kari's Law requires that `911` be dialable from any
+ * station with no prefix and no permission, and every gate this function sits in front of is a
+ * permission somebody can revoke:
+ *
+ * - **`outbound.enabled`** — the organization-wide outbound kill switch. A tenant who disables
+ *   outbound calling for the weekend has not disabled emergency calling.
+ * - **"the caller must be a known extension"** — a leg with no toll class cannot dial out. It can
+ *   dial a dispatcher.
+ * - **the toll-class gate** — an `internal`-class handset in a warehouse is exactly the station
+ *   most likely to need this.
+ * - **`callBlock`** — a rule blocking a caller or a prefix cannot block `911`.
+ * - **time conditions** — the emergency node carries no gate and no failover, so there is nothing
+ *   for `followGates` to close.
+ *
+ * The caller id it returns is the ELIN precedence, and it is the one thing here that is NOT a
+ * bypass: the calling extension's own `emergencyCallerIdNumber` (the desk's registered
+ * dispatchable location) beats the organization's default ELIN, which beats the ordinary outbound
+ * caller id. A PSAP dials back what it is given.
+ */
+function resolveEmergency(
+	artifact: RoutingArtifact,
+	rule: EmergencyRule,
+	context: RoutingContext,
+	from: string,
+	diagnostics: Diagnostic[],
+): ResolvedRoute {
+	const caller = artifact.extensionsByNumber[from];
+	const node = artifact.nodes[rule.destinationNodeId];
+	const elin = node !== undefined && node.kind === "trunk-dial" ? node.elin : undefined;
+	const callerIdNumber =
+		caller?.emergencyCallerIdNumber ?? elin ?? artifact.settings.outboundCallerIdNumber;
+
+	diagnostics.push({
+		severity: "info",
+		code: "emergency-call",
+		message: `${rule.dialed} matched the emergency table; it dials ${rule.number} presenting ${callerIdNumber ?? "no caller id"}, bypassing the outbound kill switch, the toll-class gate, the call-block table and every time condition.`,
+	});
+
+	return compactRoute({
+		matched: true,
+		context,
+		plan: planFrom(artifact, rule.destinationNodeId),
+		matchedRuleId: "emergency",
+		matchedRuleName: rule.dialed,
+		dialedNumber: rule.number,
+		callerIdNumber,
+		callerIdName: caller?.outboundCallerIdName ?? artifact.settings.outboundCallerIdName,
+		reason: `emergency call to ${rule.dialed}`,
+		diagnostics,
+	});
 }
 
 interface GateWalk {
@@ -440,6 +500,14 @@ export function resolveInternal(
 	input: ResolveInternalInput,
 ): ResolvedRoute {
 	const diagnostics: Diagnostic[] = [];
+
+	// Before the call-block table, before the feature codes, before the number map. See
+	// `resolveEmergency` for the list of gates this ordering bypasses and why each one is on it.
+	const emergency = artifact.internal.emergency?.[input.dialed];
+	if (emergency !== undefined) {
+		return resolveEmergency(artifact, emergency, "internal", input.from, diagnostics);
+	}
+
 	const blockRule = checkCallBlock(artifact.callBlock, input.dialed, "both");
 	if (blockRule !== null && blockRule.action !== "allow") {
 		const terminal = blockTerminalNodeId(blockRule.action);
@@ -566,6 +634,13 @@ export function resolveOutbound(
 	input: ResolveOutboundInput,
 ): ResolvedRoute {
 	const diagnostics: Diagnostic[] = [];
+
+	// FIRST — ahead of the kill switch, the caller lookup, the toll-class gate and the call-block
+	// table, all four of which can refuse a call and none of which may refuse this one.
+	const emergency = artifact.outbound.emergency?.[input.dialed];
+	if (emergency !== undefined) {
+		return resolveEmergency(artifact, emergency, "outbound", input.from, diagnostics);
+	}
 
 	if (!artifact.outbound.enabled) {
 		diagnostics.push({

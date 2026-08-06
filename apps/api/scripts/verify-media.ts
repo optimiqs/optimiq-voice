@@ -17,12 +17,16 @@
  *     `snapshotHash` (five node kinds carry the resolved NAME); activating a greeting puts its
  *     object key into the compiled artifact as `object://<key>`; uploading a prompt does NOT
  *     recompile, because `prompt` is deliberately not a routing table.
- *  3. **Conference PINs.** The set/clear endpoints `conferences.resource.ts` has been promising,
- *     hashed in the format `packages/routing` owns, verified with the same code path the engine
- *     uses — and the exact, documented gap: `requiresPin` reaches the artifact, the DIGEST does
- *     not, and the moderator PIN reaches nothing at all.
+ *  3. **Conference PINs, end to end.** The set/clear endpoints `conferences.resource.ts` has been
+ *     promising, hashed in the format `packages/routing` owns, verified with the same code path
+ *     the engine uses — and, since routing README §7 item 11 closed, BOTH digests travelling into
+ *     the compiled artifact, where this script re-verifies them against the PINs it set. The two
+ *     assertions that used to read "THE DOCUMENTED GAP" are now their inverses; if they ever fail
+ *     open again, this is where it shows.
  *  4. **E911.** The `emergency_address` CRUD, the per-number assignment, the delete guard that
- *     stops a dispatchable location being silently stripped from a live DID, and RLS isolation.
+ *     stops a dispatchable location being silently stripped from a live DID, RLS isolation — and,
+ *     since §7 item 12 closed, the emergency table in the compiled artifact: `911` in BOTH the
+ *     internal and the outbound contexts, pointing at a `trunk-dial` node marked `emergency`.
  *  5. **HTTP Range.** `206` with a correct `content-range` and a correctly sized body, `200` for a
  *     request with no range, `416` for a range past the end — on BOTH pre-existing media routes
  *     (voicemail messages, CDR recordings are covered by shape here and by `verify-cdr.ts` for the
@@ -146,7 +150,11 @@ function makeUploader(baseUrl: string, jar: CookieJar) {
 		fields: Readonly<Record<string, string>> = {},
 	): Promise<JsonResponse> => {
 		const form = new FormData();
-		form.append("file", new Blob([file.bytes as unknown as BlobPart], { type: file.type }), file.name);
+		form.append(
+			"file",
+			new Blob([file.bytes as unknown as BlobPart], { type: file.type }),
+			file.name,
+		);
 		for (const [key, value] of Object.entries(fields)) {
 			form.append(key, value);
 		}
@@ -363,9 +371,8 @@ async function main(): Promise<void> {
 	const { registerPbxTransport } = await import("../src/pbx/pbx-bootstrap");
 	const { PbxModule } = await import("../src/pbx/pbx.module");
 	const { createPostgresClient } = await import("@optimiq-voice/db");
-	const { parseVoicemailPinHash, ROUTING_CACHE_BUCKET, routingCacheKey } = await import(
-		"@optimiq-voice/routing"
-	);
+	const { parseVoicemailPinHash, ROUTING_CACHE_BUCKET, routingCacheKey } =
+		await import("@optimiq-voice/routing");
 	const { verifyVoicemailPin } = await import("../src/pbx/voicemail-boxes/voicemail-pin.service");
 	const { decideRange } = await import("../src/media/http-range");
 	const { createPbxDatabaseClient, sql: pbxSql } = await import("@optimiq-voice/pbx-db");
@@ -474,7 +481,11 @@ async function main(): Promise<void> {
 			name: "hold-loop.wav",
 			type: "audio/wav",
 		});
-		check("uploading an 8 kHz mono PCM WAV -> 201", upload.status === 201, `status ${upload.status}`);
+		check(
+			"uploading an 8 kHz mono PCM WAV -> 201",
+			upload.status === 201,
+			`status ${upload.status}`,
+		);
 		const objectKey = String(data(upload).objectKey ?? "");
 		check(
 			"the row carries an object key under moh/<org>/<class>/",
@@ -665,8 +676,9 @@ async function main(): Promise<void> {
 		);
 		check(
 			"and the object is still on disk — a refused delete unlinks nothing",
-			(await stat(join(mediaRoot, String(data(prompt).objectKey))).catch(() => undefined))
-				?.isFile() === true,
+			(
+				await stat(join(mediaRoot, String(data(prompt).objectKey))).catch(() => undefined)
+			)?.isFile() === true,
 		);
 
 		await clientA("PATCH", `/api/v1/ivr-menus/${ivrId}`, { greetingPromptId: null });
@@ -687,7 +699,11 @@ async function main(): Promise<void> {
 		const baseline = await clientA("POST", "/api/v1/routing/compile", {});
 		check("compile -> 200", baseline.status === 200, `status ${baseline.status}`);
 		const hashAfterUploads = String(data(baseline).snapshotHash ?? "");
-		check("the compile reports a snapshot hash", hashAfterUploads.length > 0, hashAfterUploads.slice(0, 16));
+		check(
+			"the compile reports a snapshot hash",
+			hashAfterUploads.length > 0,
+			hashAfterUploads.slice(0, 16),
+		);
 
 		const anotherPrompt = await uploadA(
 			"/api/v1/prompts",
@@ -712,14 +728,22 @@ async function main(): Promise<void> {
 			// greeting embedding would have nowhere to appear.
 			voicemailEnabled: true,
 		});
-		check("an extension can name the MOH class", extension.status === 201, `status ${extension.status}`);
+		check(
+			"an extension can name the MOH class",
+			extension.status === 201,
+			`status ${extension.status}`,
+		);
 
-		const beforeRename = String(data(await clientA("POST", "/api/v1/routing/compile", {})).snapshotHash);
+		const beforeRename = String(
+			data(await clientA("POST", "/api/v1/routing/compile", {})).snapshotHash,
+		);
 		const renamed = await clientA("PATCH", `/api/v1/moh-classes/${mohClassId}`, {
 			name: `hold-renamed-${RUN_ID}`,
 		});
 		check("renaming the MOH class -> 200", renamed.status === 200, `status ${renamed.status}`);
-		const afterRename = String(data(await clientA("POST", "/api/v1/routing/compile", {})).snapshotHash);
+		const afterRename = String(
+			data(await clientA("POST", "/api/v1/routing/compile", {})).snapshotHash,
+		);
 		check(
 			"renaming an MOH class DOES move the snapshot hash — five node kinds carry the name",
 			afterRename !== beforeRename,
@@ -746,7 +770,8 @@ async function main(): Promise<void> {
 		const greetingKey = String(data(greeting).objectKey ?? "");
 		check(
 			"it is active by default and lands under greetings/<org>/<box>/",
-			data(greeting).active === true && greetingKey.startsWith(`greetings/${organizationA}/${mailboxId}/`),
+			data(greeting).active === true &&
+				greetingKey.startsWith(`greetings/${organizationA}/${mailboxId}/`),
 			`${String(data(greeting).active)} ${greetingKey}`,
 		);
 
@@ -853,7 +878,9 @@ async function main(): Promise<void> {
 			);
 		}
 
-		const hashBeforePin = String(data(await clientA("POST", "/api/v1/routing/compile", {})).snapshotHash);
+		const hashBeforePin = String(
+			data(await clientA("POST", "/api/v1/routing/compile", {})).snapshotHash,
+		);
 		const setRoomPin = await clientA("POST", `/api/v1/conferences/${conferenceId}/pin`, {
 			pin: GOOD_PIN,
 		});
@@ -864,7 +891,14 @@ async function main(): Promise<void> {
 			JSON.stringify(data(setRoomPin)),
 		);
 
-		const roomDigest = await readColumn(pbx, pbxSql, organizationA, "conference", "pin_hash", conferenceId);
+		const roomDigest = await readColumn(
+			pbx,
+			pbxSql,
+			organizationA,
+			"conference",
+			"pin_hash",
+			conferenceId,
+		);
 		check(
 			"the stored digest is in the format packages/routing owns",
 			parseVoicemailPinHash(roomDigest ?? "") !== undefined,
@@ -876,7 +910,9 @@ async function main(): Promise<void> {
 		);
 		check("and refuses a different PIN", !(await verifyVoicemailPin("80413", roomDigest ?? "")));
 
-		const hashAfterPin = String(data(await clientA("POST", "/api/v1/routing/compile", {})).snapshotHash);
+		const hashAfterPin = String(
+			data(await clientA("POST", "/api/v1/routing/compile", {})).snapshotHash,
+		);
 		check(
 			"setting a room PIN MOVES the snapshot hash — `requiresPin` reaches the artifact",
 			hashAfterPin !== hashBeforePin,
@@ -912,9 +948,11 @@ async function main(): Promise<void> {
 		const hashAfterModerator = String(
 			data(await clientA("POST", "/api/v1/routing/compile", {})).snapshotHash,
 		);
+		// GAP CLOSED: the loader now projects `moderator_pin_hash` and `requiresModeratorPin`, so
+		// setting one is a routing change rather than a column write nothing downstream reads.
 		check(
-			"the moderator PIN does NOT move the hash — the documented gap, not a regression",
-			hashAfterModerator === hashAfterPin,
+			"setting a moderator PIN MOVES the hash — it used to recompile to an identical artifact",
+			hashAfterModerator !== hashAfterPin,
 			`${hashAfterPin.slice(0, 12)} -> ${hashAfterModerator.slice(0, 12)}`,
 		);
 
@@ -926,14 +964,28 @@ async function main(): Promise<void> {
 		);
 		check(
 			"the column is NULL again",
-			(await readColumn(pbx, pbxSql, organizationA, "conference", "pin_hash", conferenceId)) === null,
+			(await readColumn(pbx, pbxSql, organizationA, "conference", "pin_hash", conferenceId)) ===
+				null,
+		);
+		const hashAfterClear = String(
+			data(await clientA("POST", "/api/v1/routing/compile", {})).snapshotHash,
 		);
 		check(
-			"clearing it moves the hash back",
-			String(data(await clientA("POST", "/api/v1/routing/compile", {})).snapshotHash) === hashBeforePin,
+			"clearing it moves the hash again, but NOT back to the start — the moderator PIN is still set",
+			hashAfterClear !== hashAfterModerator && hashAfterClear !== hashBeforePin,
+			`${hashAfterModerator.slice(0, 12)} -> ${hashAfterClear.slice(0, 12)} (start ${hashBeforePin.slice(0, 12)})`,
 		);
-		// Put it back for the artifact inspection below.
+		await clientA("DELETE", `/api/v1/conferences/${conferenceId}/moderator-pin`);
+		check(
+			"clearing BOTH returns the tenant to exactly the artifact it started with",
+			String(data(await clientA("POST", "/api/v1/routing/compile", {})).snapshotHash) ===
+				hashBeforePin,
+		);
+		// Put both back for the artifact inspection below.
 		await clientA("POST", `/api/v1/conferences/${conferenceId}/pin`, { pin: GOOD_PIN });
+		await clientA("POST", `/api/v1/conferences/${conferenceId}/moderator-pin`, {
+			pin: MODERATOR_PIN,
+		});
 
 		// --- 9. E911 ---------------------------------------------------------------------------------
 		console.log("\n9. emergency addresses");
@@ -1041,12 +1093,30 @@ async function main(): Promise<void> {
 
 		// The pure decision function first: the cases a live request cannot easily reach.
 		check("decideRange: no header -> full", decideRange(undefined, 100).kind === "full");
-		check("decideRange: a unit we do not serve -> full", decideRange("seconds=0-10", 100).kind === "full");
-		check("decideRange: a malformed spec -> full (invalid, not unsatisfiable)", decideRange("bytes=abc", 100).kind === "full");
-		check("decideRange: last before first -> full", decideRange("bytes=50-10", 100).kind === "full");
-		check("decideRange: multi-range -> unsatisfiable, never half-answered", decideRange("bytes=0-9,20-29", 100).kind === "unsatisfiable");
-		check("decideRange: start past the end -> unsatisfiable", decideRange("bytes=100-", 100).kind === "unsatisfiable");
-		check("decideRange: a zero-length object -> unsatisfiable for any range", decideRange("bytes=0-", 0).kind === "unsatisfiable");
+		check(
+			"decideRange: a unit we do not serve -> full",
+			decideRange("seconds=0-10", 100).kind === "full",
+		);
+		check(
+			"decideRange: a malformed spec -> full (invalid, not unsatisfiable)",
+			decideRange("bytes=abc", 100).kind === "full",
+		);
+		check(
+			"decideRange: last before first -> full",
+			decideRange("bytes=50-10", 100).kind === "full",
+		);
+		check(
+			"decideRange: multi-range -> unsatisfiable, never half-answered",
+			decideRange("bytes=0-9,20-29", 100).kind === "unsatisfiable",
+		);
+		check(
+			"decideRange: start past the end -> unsatisfiable",
+			decideRange("bytes=100-", 100).kind === "unsatisfiable",
+		);
+		check(
+			"decideRange: a zero-length object -> unsatisfiable for any range",
+			decideRange("bytes=0-", 0).kind === "unsatisfiable",
+		);
 		check(
 			"decideRange: an end past the object is clamped, not refused",
 			JSON.stringify(decideRange("bytes=0-999999", 100)) ===
@@ -1064,20 +1134,36 @@ async function main(): Promise<void> {
 			JSON.stringify(decideRange("bytes=-999", 100)) ===
 				JSON.stringify({ kind: "partial", start: 0, end: 99, length: 100 }),
 		);
-		check("decideRange: `bytes=-0` asks for nothing -> unsatisfiable", decideRange("bytes=-0", 100).kind === "unsatisfiable");
+		check(
+			"decideRange: `bytes=-0` asks for nothing -> unsatisfiable",
+			decideRange("bytes=-0", 100).kind === "unsatisfiable",
+		);
 
 		// Then a real object, over the wire, on all four routes.
 		const mohFileList = await clientA("GET", `/api/v1/moh-classes/${mohClassId}/files`);
 		const survivingMohId = String(rows(mohFileList)[0]?.id ?? "");
 		const mohPlay = await clientA("POST", `/api/v1/prompts/${survivingMohId}/play-url`);
-		check("minting a prompt preview link -> 201", mohPlay.status === 201, `status ${mohPlay.status}`);
-		await assertRangeBehaviour("the prompt media route", String(data(mohPlay).url ?? ""), baseUrl, goodWav.length);
+		check(
+			"minting a prompt preview link -> 201",
+			mohPlay.status === 201,
+			`status ${mohPlay.status}`,
+		);
+		await assertRangeBehaviour(
+			"the prompt media route",
+			String(data(mohPlay).url ?? ""),
+			baseUrl,
+			goodWav.length,
+		);
 
 		const greetingPlay = await clientA(
 			"POST",
 			`/api/v1/voicemail-boxes/${mailboxId}/greetings/${replacementId}/play-url`,
 		);
-		check("minting a greeting preview link -> 201", greetingPlay.status === 201, `status ${greetingPlay.status}`);
+		check(
+			"minting a greeting preview link -> 201",
+			greetingPlay.status === 201,
+			`status ${greetingPlay.status}`,
+		);
 		await assertRangeBehaviour(
 			"the greeting media route",
 			String(data(greetingPlay).url ?? ""),
@@ -1089,12 +1175,22 @@ async function main(): Promise<void> {
 		// at a real file, and drive the same three cases through it.
 		const messageBytes = makeWav(8000, 1, 4000);
 		await writeFile(join(mediaRoot, "verify-media-message.wav"), messageBytes);
-		const messageId = await seedMessage(pbx, pbxSql, organizationA, mailboxId, "verify-media-message.wav");
+		const messageId = await seedMessage(
+			pbx,
+			pbxSql,
+			organizationA,
+			mailboxId,
+			"verify-media-message.wav",
+		);
 		const messagePlay = await clientA(
 			"POST",
 			`/api/v1/voicemail-boxes/${mailboxId}/messages/${messageId}/play-url`,
 		);
-		check("minting a voicemail playback link -> 201", messagePlay.status === 201, `status ${messagePlay.status}`);
+		check(
+			"minting a voicemail playback link -> 201",
+			messagePlay.status === 201,
+			`status ${messagePlay.status}`,
+		);
 		await assertRangeBehaviour(
 			"the voicemail message media route",
 			String(data(messagePlay).url ?? ""),
@@ -1103,7 +1199,9 @@ async function main(): Promise<void> {
 		);
 
 		const tampered = `${String(data(messagePlay).url ?? "")}tamper`;
-		const tamperedResponse = await fetch(`${baseUrl}${tampered}`, { headers: { range: "bytes=0-9" } });
+		const tamperedResponse = await fetch(`${baseUrl}${tampered}`, {
+			headers: { range: "bytes=0-9" },
+		});
 		check(
 			"a tampered token is still refused, range or no range",
 			tamperedResponse.status === 403,
@@ -1158,22 +1256,58 @@ async function main(): Promise<void> {
 					conferenceNode?.requiresPin === true,
 					String(conferenceNode?.requiresPin),
 				);
+				// GAP CLOSED (routing README §7 item 11). The digest now travels, so the engine can
+				// verify what `requiresPin` announces — and this is asserted against the SAME digest
+				// the engine's verifier accepted a few checks above, not merely against "a string".
 				check(
-					"THE DOCUMENTED GAP: the conference node carries no digest, so the engine cannot verify one",
-					conferenceNode !== undefined && !Object.hasOwn(conferenceNode, "pinHash"),
-					Object.keys(conferenceNode ?? {}).join(","),
+					"the conference node carries the participant digest the engine verifies",
+					typeof conferenceNode?.pinHash === "string" &&
+						(await verifyVoicemailPin(GOOD_PIN, String(conferenceNode.pinHash))),
+					String(conferenceNode?.pinHash).slice(0, 24),
 				);
 				check(
-					"THE DOCUMENTED GAP: and no moderator field at all",
-					conferenceNode !== undefined &&
-						!Object.hasOwn(conferenceNode, "moderatorPinHash") &&
-						!Object.hasOwn(conferenceNode, "requiresModeratorPin"),
-					Object.keys(conferenceNode ?? {}).join(","),
+					"and the moderator digest, which used to reach nothing at all",
+					typeof conferenceNode?.moderatorPinHash === "string" &&
+						(await verifyVoicemailPin(MODERATOR_PIN, String(conferenceNode.moderatorPinHash))),
+					String(conferenceNode?.moderatorPinHash).slice(0, 24),
+				);
+				check(
+					"and says the room has a moderator PIN, which is what makes waitForModerator enforceable",
+					conferenceNode?.requiresModeratorPin === true,
+					String(conferenceNode?.requiresModeratorPin),
 				);
 				check(
 					"the conference resolves its MOH class id to the RENAMED class name",
 					conferenceNode?.mohClass === `hold-renamed-${RUN_ID}`,
 					`${String(conferenceNode?.mohClassId)} -> ${String(conferenceNode?.mohClass)}`,
+				);
+
+				// GAP CLOSED (routing README §7 item 12). E911 is no longer "an address book nothing
+				// on the call path reads": the emergency table is in the artifact, in both contexts,
+				// and it points at a node marked `emergency`.
+				const emergencyNode = nodes.find(
+					(node) => node.kind === "trunk-dial" && node.emergency === true,
+				);
+				check(
+					"the artifact carries an emergency dial node",
+					emergencyNode !== undefined,
+					String(emergencyNode?.id),
+				);
+				const internalEmergency = (
+					artifact as { internal?: { emergency?: Record<string, unknown> } }
+				).internal?.emergency;
+				const outboundEmergency = (
+					artifact as { outbound?: { emergency?: Record<string, unknown> } }
+				).outbound?.emergency;
+				check(
+					"911 is in BOTH the internal and the outbound emergency tables",
+					internalEmergency?.["911"] !== undefined && outboundEmergency?.["911"] !== undefined,
+					`${Object.keys(internalEmergency ?? {}).join(",")} | ${Object.keys(outboundEmergency ?? {}).join(",")}`,
+				);
+				check(
+					"the outside-line form 9911 dials 911 on the wire",
+					(outboundEmergency?.["9911"] as { number?: string } | undefined)?.number === "911",
+					JSON.stringify(outboundEmergency?.["9911"]),
 				);
 			} finally {
 				await inspectConnection.drain();
@@ -1295,11 +1429,7 @@ async function assertRangeBehaviour(
 
 	const partial = await fetch(`${baseUrl}${url}`, { headers: { range: "bytes=10-41" } });
 	const partialBody = new Uint8Array(await partial.arrayBuffer());
-	check(
-		`${label}: a satisfiable Range -> 206`,
-		partial.status === 206,
-		`status ${partial.status}`,
-	);
+	check(`${label}: a satisfiable Range -> 206`, partial.status === 206, `status ${partial.status}`);
 	check(
 		`${label}: with the right content-range`,
 		partial.headers.get("content-range") === `bytes 10-41/${String(sizeBytes)}`,
@@ -1330,11 +1460,7 @@ async function assertRangeBehaviour(
 		headers: { range: `bytes=${String(sizeBytes + 10)}-` },
 	});
 	void (await past.arrayBuffer());
-	check(
-		`${label}: a Range past the end -> 416`,
-		past.status === 416,
-		`status ${past.status}`,
-	);
+	check(`${label}: a Range past the end -> 416`, past.status === 416, `status ${past.status}`);
 	check(
 		`${label}: whose content-range tells the client the real size`,
 		past.headers.get("content-range") === `bytes */${String(sizeBytes)}`,
@@ -1371,6 +1497,7 @@ interface ArtifactShape {
 }
 
 interface PlanNodeShape {
+	readonly id?: string;
 	readonly kind?: string;
 	readonly mode?: string;
 	readonly voicemailBoxId?: string;
@@ -1378,8 +1505,15 @@ interface PlanNodeShape {
 	readonly greetingKind?: string;
 	readonly conferenceId?: string;
 	readonly requiresPin?: boolean;
+	readonly pinHash?: string;
+	readonly moderatorPinHash?: string;
+	readonly requiresModeratorPin?: boolean;
 	readonly mohClassId?: string;
 	readonly mohClass?: string;
+	/** Set only on the one `trunk-dial` node that was not compiled from an `outbound_route` row. */
+	readonly emergency?: boolean;
+	readonly elin?: string;
+	readonly emergencyAddressId?: string;
 }
 
 /**
@@ -1405,9 +1539,10 @@ function afterReplacement2Active(greetings: readonly Record<string, unknown>[]):
 }
 
 function unwrap(result: unknown): Record<string, unknown>[] {
-	return (
-		Array.isArray(result) ? result : ((result as { rows?: unknown[] }).rows ?? [])
-	) as Record<string, unknown>[];
+	return (Array.isArray(result) ? result : ((result as { rows?: unknown[] }).rows ?? [])) as Record<
+		string,
+		unknown
+	>[];
 }
 
 /** Reads a column no endpoint returns — by design, for every digest in this schema. */

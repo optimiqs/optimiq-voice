@@ -4,6 +4,7 @@ import { ROUTING_ARTIFACT_VERSION } from "@optimiq-voice/routing";
 import { makeFakeMediaPort } from "../ari/media-port.fake";
 import { fakeQueueOrchestratorArgs } from "../queue/queue-services.fake";
 import { CallSignalBus, legSignalKey } from "../routing/call-signals";
+import { ConferenceRegistry } from "../routing/conference-registry";
 import { DtmfRegistry } from "../verbs/dtmf-registry";
 import { makeVerbExecutorRuntime } from "../verbs/verb-executor";
 import { ChannelOrchestrator } from "./channel-orchestrator.service";
@@ -211,6 +212,7 @@ function harness(options: HarnessOptions = {}) {
 		(options.mailbox ?? NO_MAILBOX) as VoicemailMailboxRpcSource,
 		(options.didIndex ?? NO_DID_INDEX) as DidIndexSource,
 		signals,
+		new ConferenceRegistry(),
 		...(fakeQueueOrchestratorArgs() as [never, never, never, never, never]),
 	);
 

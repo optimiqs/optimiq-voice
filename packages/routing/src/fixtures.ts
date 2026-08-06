@@ -23,6 +23,7 @@ import type { CompileResult } from "./compile";
 import type {
 	CallBlockRuleInput,
 	ConferenceInput,
+	EmergencyAddressInput,
 	ExtensionInput,
 	FeatureCodeInput,
 	InboundRouteInput,
@@ -285,6 +286,17 @@ export function aConference(overrides: Partial<ConferenceInput> = {}): Conferenc
 		maxMembers: 50,
 		waitForModerator: false,
 		recordEnabled: false,
+		...overrides,
+	};
+}
+
+export function anEmergencyAddress(
+	overrides: Partial<EmergencyAddressInput> = {},
+): EmergencyAddressInput {
+	return {
+		id: "addr-1",
+		label: "Head office, floor 2",
+		validated: true,
 		...overrides,
 	};
 }

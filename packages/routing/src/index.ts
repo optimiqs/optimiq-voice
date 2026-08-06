@@ -22,6 +22,8 @@ export {
 	ROUTING_CONTEXTS,
 	type CompiledCallBlockRule,
 	type CompiledRoutingSettings,
+	type EmergencyMatchTable,
+	type EmergencyRule,
 	type ExtensionIndexEntry,
 	type InboundDidDefault,
 	type InboundMatchTable,
@@ -82,6 +84,17 @@ export {
 	type DestinationShapeIssue,
 	type DestinationType,
 } from "./destinations";
+export {
+	DEFAULT_EMERGENCY_NUMBERS,
+	EMERGENCY_CONTINUE_ON_CAUSES,
+	EMERGENCY_NODE_ID,
+	EMERGENCY_ROUTE_ID,
+	emergencyNumbers,
+	invalidEmergencyNumbers,
+	isEmergencyDialString,
+	MAX_EMERGENCY_NUMBERS,
+	type EmergencyNumberSeed,
+} from "./emergency";
 export {
 	DIAGNOSTIC_CODES,
 	DIAGNOSTIC_SEVERITIES,
@@ -205,6 +218,7 @@ export {
 	type CallBlockMatchKind,
 	type CallBlockRuleInput,
 	type ConferenceInput,
+	type EmergencyAddressInput,
 	type ExtensionInput,
 	type FeatureCodeAction,
 	type FeatureCodeInput,

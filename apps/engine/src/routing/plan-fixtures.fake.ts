@@ -1,4 +1,5 @@
 import type {
+	ConferencePlanNode,
 	ExecutionPlan,
 	ExtensionPlanNode,
 	HangupPlanNode,
@@ -133,6 +134,25 @@ export function queueNode(id: string, overrides: Partial<QueuePlanNode> = {}): Q
 		maxWaitNoAgentSeconds: 0,
 		announcePositionEnabled: false,
 		announceFrequencySeconds: 60,
+		recordEnabled: false,
+		...overrides,
+	};
+}
+
+export function conferenceNode(
+	id: string,
+	overrides: Partial<ConferencePlanNode> = {},
+): ConferencePlanNode {
+	return {
+		id,
+		kind: "conference",
+		conferenceId: `conf-${id}`,
+		roomNumber: "3001",
+		requiresPin: false,
+		// 0 is `pbx-db`'s own default and means "no limit" everywhere in this schema, so a spec
+		// about the PIN gate does not have to remember to raise a cap it never mentioned.
+		maxMembers: 0,
+		waitForModerator: false,
 		recordEnabled: false,
 		...overrides,
 	};

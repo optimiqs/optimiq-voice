@@ -356,6 +356,12 @@ describe("event-name guards", () => {
 			"channel.record.stopped",
 			"channel.hangup",
 			"channel.destroyed",
+			// Additive, and therefore NOT a `v1` → `v2` subject bump: an existing consumer filters on
+			// the event tokens it knows, and a JetStream consumer that does not name these never
+			// sees them. See README's evolution rules.
+			"conference.joined",
+			"conference.left",
+			"call.emergency.dialed",
 		]);
 	});
 });

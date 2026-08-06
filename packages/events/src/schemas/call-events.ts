@@ -126,6 +126,64 @@ export const channelDestroyedDataSchema = z.object({
 	durationMs: z.int().min(0).optional(),
 });
 
+/**
+ * `conference.joined` — a leg entered a conference room's mixing bridge.
+ *
+ * `moderator` is the load-bearing field: a room with `waitForModerator` holds every participant
+ * in music on hold until one arrives, so "who joined" is not enough — "as what" is the fact that
+ * ends the hold.
+ */
+export const conferenceJoinedDataSchema = z.object({
+	legId: z.uuid(),
+	conferenceId: z.uuid(),
+	roomNumber: dialStringSchema,
+	bridgeId: z.uuid(),
+	moderator: z.boolean(),
+	/** Members in the room INCLUDING this one, after the join. */
+	memberCount: z.int().min(1),
+});
+
+/** `conference.left` — the leg is out of the room. Paired with a `conference.joined`. */
+export const conferenceLeftDataSchema = z.object({
+	legId: z.uuid(),
+	conferenceId: z.uuid(),
+	roomNumber: dialStringSchema,
+	bridgeId: z.uuid(),
+	moderator: z.boolean(),
+	/** Members remaining AFTER this one left. Zero means the bridge was torn down. */
+	memberCount: z.int().min(0),
+	durationMs: z.int().min(0).optional(),
+});
+
+/**
+ * `call.emergency.dialed` — the Kari's Law notification seam.
+ *
+ * Published at the moment the first trunk attempt is made, not when it is answered: the statute
+ * is about the attempt, and a call that failed over three carriers before reaching a PSAP is
+ * exactly the one somebody at the front desk needs to hear about immediately.
+ *
+ * Every field a notification needs is here so a consumer never has to join back to the artifact:
+ * what was dialed, who dialed it, what ANI the PSAP will see, and which dispatchable location
+ * that ANI is registered against. `emergencyAddressId` may be absent — that is an organization
+ * with no validated address, which is worth saying in the notification rather than hiding.
+ */
+export const callEmergencyDialedDataSchema = z.object({
+	legId: z.uuid(),
+	/** The dial string the caller entered, e.g. `911` or `9911`. */
+	dialed: dialStringSchema,
+	/** What went on the wire, after the outside-line prefix was stripped. */
+	number: dialStringSchema,
+	/** The calling station, when there is one. An API-originated leg may have none. */
+	callerNumber: dialStringSchema.optional(),
+	callerName: z.string().max(128).optional(),
+	/** The ELIN actually presented. Absent means the call went out with no caller id at all. */
+	elin: dialStringSchema.optional(),
+	/** `emergency_address.id` the ELIN is registered against. */
+	emergencyAddressId: z.uuid().optional(),
+	/** The trunk the first attempt was placed over, for the "did it get out?" question. */
+	trunkName: z.string().max(128).optional(),
+});
+
 /** Every call event contract, keyed by its `type` (which is also its subject event token). */
 export const CALL_EVENT_DEFINITIONS = {
 	"channel.created": defineEvent("call", "channel.created", channelCreatedDataSchema),
@@ -149,6 +207,13 @@ export const CALL_EVENT_DEFINITIONS = {
 	),
 	"channel.hangup": defineEvent("call", "channel.hangup", channelHangupDataSchema),
 	"channel.destroyed": defineEvent("call", "channel.destroyed", channelDestroyedDataSchema),
+	"conference.joined": defineEvent("call", "conference.joined", conferenceJoinedDataSchema),
+	"conference.left": defineEvent("call", "conference.left", conferenceLeftDataSchema),
+	"call.emergency.dialed": defineEvent(
+		"call",
+		"call.emergency.dialed",
+		callEmergencyDialedDataSchema,
+	),
 } as const;
 
 export type CallEventDefinitions = typeof CALL_EVENT_DEFINITIONS;
@@ -177,6 +242,9 @@ export const callEventSchema = z.discriminatedUnion("type", [
 	CALL_EVENT_DEFINITIONS["channel.record.stopped"].envelope,
 	CALL_EVENT_DEFINITIONS["channel.hangup"].envelope,
 	CALL_EVENT_DEFINITIONS["channel.destroyed"].envelope,
+	CALL_EVENT_DEFINITIONS["conference.joined"].envelope,
+	CALL_EVENT_DEFINITIONS["conference.left"].envelope,
+	CALL_EVENT_DEFINITIONS["call.emergency.dialed"].envelope,
 ]);
 
 export type CallEventEnvelope = z.infer<typeof callEventSchema>;

@@ -340,6 +340,77 @@ describe("compile — voicemail PIN digests", () => {
 	});
 });
 
+const ROOM_NODE = "conference:conf-1";
+
+describe("compile — conference PIN digests", () => {
+	it("embeds the participant digest, so the engine can verify what `requiresPin` announces", () => {
+		const artifact = compiled(
+			aSnapshot({
+				conferences: [aConference({ requiresPin: true, pinHash: A_PIN_HASH })],
+			}),
+		);
+		const node = artifact.nodes[ROOM_NODE] as ConferencePlanNode;
+		expect(node.requiresPin).toBe(true);
+		expect(node.pinHash).toBe(A_PIN_HASH);
+	});
+
+	it("embeds the moderator digest and says the room has one", () => {
+		const node = compiled(
+			aSnapshot({ conferences: [aConference({ moderatorPinHash: A_PIN_HASH })] }),
+		).nodes[ROOM_NODE] as ConferencePlanNode;
+		expect(node.moderatorPinHash).toBe(A_PIN_HASH);
+		expect(node.requiresModeratorPin).toBe(true);
+	});
+
+	it("leaves both fields off a room with no PIN at all", () => {
+		const node = compiled(aSnapshot({ conferences: [aConference()] })).nodes[
+			ROOM_NODE
+		] as ConferencePlanNode;
+		expect(node.pinHash).toBeUndefined();
+		expect(node.moderatorPinHash).toBeUndefined();
+		expect(node.requiresModeratorPin).toBeUndefined();
+	});
+
+	it("warns about a malformed room digest and does NOT embed it", () => {
+		const result = compileAttempt(
+			aSnapshot({ conferences: [aConference({ requiresPin: true, pinHash: "1234" })] }),
+		);
+		expect(result.ok).toBe(true);
+		expect(codesOf(result)).toContain("invalid-pin-hash");
+		const node = (result.ok ? result.artifact.nodes[ROOM_NODE] : undefined) as ConferencePlanNode;
+		// `requiresPin` stays true and the digest is absent: that pair is what tells the engine to
+		// REFUSE the room rather than admit the caller without one.
+		expect(node.requiresPin).toBe(true);
+		expect(node.pinHash).toBeUndefined();
+	});
+
+	it("says in the warning that the room is refused rather than opened", () => {
+		const result = compileAttempt(
+			aSnapshot({ conferences: [aConference({ requiresPin: true, pinHash: "nope" })] }),
+		);
+		const warning = result.diagnostics.find((entry) => entry.code === "invalid-pin-hash");
+		expect(warning?.message).toContain("refused rather than admitted");
+	});
+
+	it("distinguishes the two digests in the warning it raises", () => {
+		const result = compileAttempt(
+			aSnapshot({ conferences: [aConference({ moderatorPinHash: "nope" })] }),
+		);
+		const warning = result.diagnostics.find((entry) => entry.code === "invalid-pin-hash");
+		expect(warning?.message).toContain("moderator");
+		expect(warning?.path).toBe("moderatorPinHash");
+	});
+
+	it("moves the snapshot hash when a moderator PIN is set", () => {
+		// The bug this closes: the column was written and stored, and the artifact was identical.
+		const before = snapshotHash(aSnapshot({ conferences: [aConference()] }));
+		const after = snapshotHash(
+			aSnapshot({ conferences: [aConference({ moderatorPinHash: A_PIN_HASH })] }),
+		);
+		expect(after).not.toBe(before);
+	});
+});
+
 // -------------------------------------------------------------------------------------------
 // Determinism and versioning
 // -------------------------------------------------------------------------------------------

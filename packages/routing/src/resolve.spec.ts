@@ -809,7 +809,8 @@ describe("resolveOutbound — digits and identity", () => {
 				outboundRoutes: [anOutboundRoute({ matchKind: "any", dialPatterns: [], stripDigits: 20 })],
 			}),
 		);
-		const route = resolveOutbound(greedy, { from: "1001", dialed: "911", now: NOW });
+		// Not `911`: that is in the emergency table now and never reaches an outbound rule at all.
+		const route = resolveOutbound(greedy, { from: "1001", dialed: "5551230001", now: NOW });
 		expect(route.matched).toBe(false);
 		expect(route.diagnostics.map((entry) => entry.code)).toContain("digit-manipulation-underflow");
 	});

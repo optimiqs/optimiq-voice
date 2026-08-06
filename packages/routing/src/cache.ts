@@ -107,6 +107,10 @@ export const ROUTING_TABLE_TO_ENTITY: Readonly<Record<string, RoutingEntityKind>
 	park_lot: "parkLots",
 	feature_code: "featureCodes",
 	call_block_rule: "callBlockRules",
+	// A routing input as of E911: a DID's `emergency_address_id` picks the organization's ELIN, and
+	// the address's `validated` flag decides whether it may. Editing the address therefore changes
+	// what an emergency call presents, which is a compiled fact.
+	emergency_address: "emergencyAddresses",
 	org_setting: "settings",
 } as const;
 

@@ -750,10 +750,24 @@ async function main(): Promise<void> {
 		console.log("\nB7. release, and the delete that deliberately does not release");
 		const released = await client("DELETE", `/api/v1/carrier/numbers/${orderedId}`);
 		check("the release is 200", released.status === 200, `status ${released.status}`);
+		/**
+		 * The claim here is about the RELEASE, not about the tenant.
+		 *
+		 * This used to be `warnings.length === 0`, which was the same claim for as long as the only
+		 * diagnostics a clean tenant could produce were about routing entities. E911 changed that:
+		 * `packages/routing` now warns once per DID that carries no `emergency_address_id`, because
+		 * RAY BAUM'S Act wants a dispatchable location for every station that can dial `911` — and
+		 * the numbers this script buys are, correctly, not given one.
+		 *
+		 * So the assertion becomes "nothing the release itself caused", expressed as an allow-list
+		 * of one. A release that produced a `dangling-destination` or an `empty-trunk-list` would
+		 * still fail it, which is what the check was for.
+		 */
+		const releaseWarnings = warningCodes(released);
 		check(
-			"the release reports no warnings",
-			warningCodes(released).length === 0,
-			warningCodes(released).join(","),
+			"the release itself causes no warnings (the E911 ones are about the tenant's numbers)",
+			releaseWarnings.every((code) => code === "missing-emergency-address"),
+			releaseWarnings.join(","),
 		);
 		check(
 			"the carrier has the number back",
@@ -958,6 +972,14 @@ async function main(): Promise<void> {
 				// purpose, so a new field is a compile error at every construction site rather than an
 				// `undefined` that reaches a dial string.
 				PBX_EXTENSION_DIAL_TEMPLATE: "PJSIP/{number}",
+				// Likewise unused: this handle runs no module and therefore no sweeper. The interval is
+				// nevertheless the disabling `0` rather than the default, so that if this ever DID boot
+				// a module it would not start background work in a cleanup path.
+				PBX_OUTBOX_SWEEP_INTERVAL_MS: 0,
+				PBX_OUTBOX_BACKOFF_BASE_MS: 15_000,
+				PBX_OUTBOX_BACKOFF_CAP_MS: 300_000,
+				PBX_OUTBOX_STUCK_ATTEMPTS: 5,
+				PBX_OUTBOX_RETENTION_HOURS: 24,
 				PBX_VOICEMAIL_MEDIA_ROOT: "/tmp/optimiq-voice-unused",
 				PBX_VOICEMAIL_URL_TTL_SECONDS: 300,
 				PBX_MEDIA_OBJECT_ROOT: "/tmp/optimiq-voice-unused",

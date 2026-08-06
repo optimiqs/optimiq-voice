@@ -27,7 +27,7 @@ const route = resolveInbound(artifact, { did: "+12125550100", callerNumber, now:
 FusionPBX compiles every feature into one central dialplan table and serves it to FreeSWITCH per
 request, cached in memcached under structured keys, invalidated by the PHP layer on every save
 (`plans/reference/fusionpbx-inventory.md` §5 item 1). §7 of the same document names that
-invalidation contract *the single most load-bearing integration behaviour in the system* — and
+invalidation contract _the single most load-bearing integration behaviour in the system_ — and
 upstream implements it as a convention repeated at 73 call sites.
 
 Our rebuild keeps every feature a first-class entity and makes the compile step explicit:
@@ -47,10 +47,10 @@ Our rebuild keeps every feature a first-class entity and makes the compile step 
 interface RoutingArtifact {
 	artifactVersion: number; // ROUTING_ARTIFACT_VERSION — bump on any breaking shape change
 	organizationId: string;
-	snapshotHash: string;    // SHA-256 of the canonical input snapshot
-	compiledAt: string;      // ISO 8601, supplied by the caller
+	snapshotHash: string; // SHA-256 of the canonical input snapshot
+	compiledAt: string; // ISO 8601, supplied by the caller
 	settings: CompiledRoutingSettings;
-	nodes: PlanNodeTable;    // id -> PlanNode, closed under reference
+	nodes: PlanNodeTable; // id -> PlanNode, closed under reference
 	timeConditions: Record<string, CompiledTimeCondition>;
 	inbound: InboundMatchTable;
 	internal: InternalMatchTable;
@@ -79,12 +79,12 @@ Three properties are load-bearing:
 The rule is **"could a reader compiled against the previous version _misinterpret_ this?"**, not
 "did the shape change". Those are different questions and only the first one is worth a flag day.
 
-| change                                            | bump? | why                                                            |
-| ------------------------------------------------- | ----- | -------------------------------------------------------------- |
-| a new **optional** field on a node                 | no    | an old reader does not read it and keeps its existing fallback   |
-| a new required field, or a new node **kind**       | yes   | an old reader hits a node it cannot execute                      |
-| a field's meaning or units change under one name   | yes   | an old reader executes it confidently and wrongly                |
-| a field removed                                    | yes   | an old reader reads `undefined` where it required a value        |
+| change                                           | bump? | why                                                            |
+| ------------------------------------------------ | ----- | -------------------------------------------------------------- |
+| a new **optional** field on a node               | no    | an old reader does not read it and keeps its existing fallback |
+| a new required field, or a new node **kind**     | yes   | an old reader hits a node it cannot execute                    |
+| a field's meaning or units change under one name | yes   | an old reader executes it confidently and wrongly              |
+| a field removed                                  | yes   | an old reader reads `undefined` where it required a value      |
 
 The additive optional fields in §2.5 are therefore **version 1** still. What actually forces the
 recompile is the other token: `snapshotHash` moves the moment the input gains a collection, so
@@ -114,6 +114,9 @@ Consequences worth knowing:
 
 Node kinds: `extension`, `ring-group`, `ivr-menu`, `queue`, `voicemail`, `conference`, `park`,
 `external`, `trunk-dial`, `application`, `playback`, `feature-code`, `time-condition`, `hangup`.
+Fourteen, and deliberately still fourteen: emergency dialing is a `trunk-dial` with `emergency:
+true` rather than a fifteenth kind, because a new kind is a version bump and three optional fields
+are not — see §7 item 12.
 Terminals speak `@optimiq-voice/telephony`'s hangup-cause taxonomy verbatim.
 
 ### 2.3 Three contexts, three tables
@@ -121,11 +124,11 @@ Terminals speak `@optimiq-voice/telephony`'s hangup-cause taxonomy verbatim.
 Contexts are the security boundary, not a naming convention
 (`plans/reference/freeswitch-capabilities.md` §7):
 
-| context    | table                | who resolves in it                 | can reach a trunk |
-| ---------- | -------------------- | ---------------------------------- | ----------------- |
-| `inbound`  | `artifact.inbound`   | carrier traffic, unauthenticated   | **no**            |
-| `internal` | `artifact.internal`  | a registered extension             | **no**            |
-| `outbound` | `artifact.outbound`  | a registered extension, gated      | yes               |
+| context    | table               | who resolves in it               | can reach a trunk |
+| ---------- | ------------------- | -------------------------------- | ----------------- |
+| `inbound`  | `artifact.inbound`  | carrier traffic, unauthenticated | **no**            |
+| `internal` | `artifact.internal` | a registered extension           | **no**            |
+| `outbound` | `artifact.outbound` | a registered extension, gated    | yes               |
 
 Unauthenticated traffic cannot reach a trunk because the function that reaches trunks is not the
 one it is allowed to call. Toll-fraud rule #1 is a property of the data structure rather than a
@@ -147,6 +150,10 @@ destination, then `UNALLOCATED_NUMBER`:
 slot ranges. Feature codes come first because they start with `*` and no internal number may;
 voicemail prefixes come before numbers so `*99101` is a mailbox, not an extension called `*99101`.
 
+**Emergency** — checked BEFORE everything above, in both the internal and the outbound contexts,
+and before the call-block table in either. It is the only match that no tenant configuration can
+suppress; §7 item 12 lists exactly what it bypasses and why each item is on the list.
+
 **Outbound** — `rules` pre-sorted by `(priority asc, specificity desc, id asc)`; first matching
 pattern within a rule wins; then the toll-class gate, then the time gate, then digit manipulation
 (strip-then-prepend), then the ordered trunk failover chain.
@@ -161,11 +168,14 @@ Three facts are embedded into plan nodes at compile time. All three follow the s
 engine holds no database handle, so a fact it needs at the moment a call arrives either travels in
 the artifact or does not exist.**
 
-| node field                        | resolved from                        | absent means                                  |
-| ---------------------------------- | ------------------------------------ | --------------------------------------------- |
-| `mohClass` (5 node kinds)          | `moh_class.name` via `mohClassId`     | the media server's default class               |
-| `VoicemailPlanNode.greetingMedia`  | the box's active `voicemail_greeting` | the reader's deployment-wide announcement      |
-| `VoicemailPlanNode.pinHash`        | `voicemail_box.pin_hash`              | the box has no PIN; no challenge is issued     |
+| node field                            | resolved from                         | absent means                                    |
+| ------------------------------------- | ------------------------------------- | ----------------------------------------------- |
+| `mohClass` (5 node kinds)             | `moh_class.name` via `mohClassId`     | the media server's default class                |
+| `VoicemailPlanNode.greetingMedia`     | the box's active `voicemail_greeting` | the reader's deployment-wide announcement       |
+| `VoicemailPlanNode.pinHash`           | `voicemail_box.pin_hash`              | the box has no PIN; no challenge is issued      |
+| `ConferencePlanNode.pinHash`          | `conference.pin_hash`                 | with `requiresPin` set: **refuse the room**     |
+| `ConferencePlanNode.moderatorPinHash` | `conference.moderator_pin_hash`       | the room has no moderator credential            |
+| `TrunkDialPlanNode.elin`              | the lowest validated-address DID      | no organization ELIN; the caller's own, or none |
 
 **Music on hold.** Every `mohClassId` in the snapshot is a row id, and every media server addresses
 a class by its **name** — Asterisk's `POST /channels/{id}/moh` takes `mohClass=<name>` and answers a
@@ -182,7 +192,7 @@ with at most one active row per `(box, kind)`. The compiler applies
 deployment's storage layout into every artifact, and artifacts outlive deployments; resolving
 `object://` to something a media server will play is the engine's media layer's job.
 
-`busy` is deliberately unreachable: an extension's busy and no-answer branches compile to the *same*
+`busy` is deliberately unreachable: an extension's busy and no-answer branches compile to the _same_
 `voicemail:<id>:leave` node, so nothing downstream can tell the two apart. Splitting that node is a
 larger change than this one and is a recorded follow-up rather than a half-done feature. `name` is
 the directory recording and is never a call greeting.
@@ -204,7 +214,7 @@ The DST behaviour is deliberate and pinned by tests:
 
 - **spring forward** — a window inside the hour that does not exist never matches that day;
 - **fall back** — a window inside the repeated hour matches during **both** passes;
-- **overnight** (`from > to`) is `[from, 24:00) ∪ [00:00, to]`, evaluated against the *same* day's
+- **overnight** (`from > to`) is `[from, 24:00) ∪ [00:00, to]`, evaluated against the _same_ day's
   other predicates, so "Fridays 22:00–06:00" means Friday evening plus Friday's small hours;
 - both ends of a wall-clock window are **inclusive**.
 
@@ -221,11 +231,11 @@ A time condition has two roles, kept separate so neither field becomes dead conf
 The compiler runs on the write path (compile-on-save) as well as on a cache miss, and that decides
 the line:
 
-| severity    | meaning                                        | effect                       |
-| ----------- | ---------------------------------------------- | ---------------------------- |
-| **error**   | the artifact would not be *sound*               | no artifact; the save fails  |
-| **warning** | sound artifact, probably not what was meant     | artifact ships with the note |
-| **info**    | a decision a resolver made                      | call-path observability      |
+| severity    | meaning                                     | effect                       |
+| ----------- | ------------------------------------------- | ---------------------------- |
+| **error**   | the artifact would not be _sound_           | no artifact; the save fails  |
+| **warning** | sound artifact, probably not what was meant | artifact ships with the note |
+| **info**    | a decision a resolver made                  | call-path observability      |
 
 Errors are things the CRUD layer must refuse to save: a dangling destination, an uncompilable
 regex, two entities claiming the same internal number, an IVR option pointing at its own menu,
@@ -303,8 +313,8 @@ Two rules for the loader:
 
 ### 4.1 Optional collections
 
-`mohClasses` and `voicemailGreetings` are declared **optional** on `OrgRoutingSnapshot` and listed
-in `OPTIONAL_SNAPSHOT_COLLECTIONS`. That is a rollout affordance, not a modelling accident: they
+`mohClasses`, `voicemailGreetings` and `emergencyAddresses` are declared **optional** on
+`OrgRoutingSnapshot` and listed in `OPTIONAL_SNAPSHOT_COLLECTIONS`. That is a rollout affordance, not a modelling accident: they
 were added after the API's snapshot loader was written, and a required field would have made this
 package impossible to release before the loader caught up.
 
@@ -326,13 +336,13 @@ not a same-wave one.
 ## 5. The invalidation contract
 
 ```ts
-routingCacheKey(orgId);                    // "<orgId>.artifact", in the `routing-cache` KV bucket
-affectsRouting("ivr_menu_option");         // true  — a routing input
-affectsRouting("voicemail_message");       // false — not a routing input
-invalidationKeysFor({ organizationId, table, operation });      // [] or ["<orgId>.artifact"]
-invalidationKeysForBatch(changes);         // deduplicated, sorted — one transaction, one eviction
-snapshotHash(snapshot);                    // the freshness token
-isArtifactFresh(artifact, snapshot);       // hash + org comparison
+routingCacheKey(orgId); // "<orgId>.artifact", in the `routing-cache` KV bucket
+affectsRouting("ivr_menu_option"); // true  — a routing input
+affectsRouting("voicemail_message"); // false — not a routing input
+invalidationKeysFor({ organizationId, table, operation }); // [] or ["<orgId>.artifact"]
+invalidationKeysForBatch(changes); // deduplicated, sorted — one transaction, one eviction
+snapshotHash(snapshot); // the freshness token
+isArtifactFresh(artifact, snapshot); // hash + org comparison
 ```
 
 **The rule: one artifact per organization, one key per organization; any mutation to any entity in
@@ -348,7 +358,7 @@ therefore changes nodes reachable from all three tables. Sub-keys would either b
 together on every write (identical behaviour, three times the bookkeeping) or be invalidated
 selectively and be wrong.
 
-The refinement that *does* pay is the other axis: knowing which mutations are routing inputs at
+The refinement that _does_ pay is the other axis: knowing which mutations are routing inputs at
 all. A voicemail message, a CDR row, an agent status change and a device provisioning edit are not,
 and `affectsRouting` says so, so the API does not evict a hot artifact on every voicemail.
 
@@ -405,7 +415,7 @@ Because `compiledAt` is the only non-derived field, a recompile that produces th
 ## 7. What P3's API side still has to build
 
 1. **CRUD** for every routing entity, with destination validation (`destinationShapeIssues` plus a
-   real existence check against the target table — the database only enforces the trio's *shape*).
+   real existence check against the target table — the database only enforces the trio's _shape_).
 2. ~~**Snapshot loader**~~ — **DONE.** Twenty RLS-scoped reads, no joins, disabled rows included,
    projected onto the `*Input` types. `moh_class` and `voicemail_greeting` are loaded and
    `voicemailBoxes` carries `pinHash`, so §2.5's embeddings fire: a compiled artifact now holds a
@@ -418,6 +428,7 @@ Because `compiledAt` is the only non-derived field, a recompile that produces th
    §4.1 says the only edit needed is deleting two `?`s and two entries — but doing it turns "a
    loader that has not caught up" from a supported rollout state into a type error, and there is
    still a released API that predates the change. Worth doing on the next major, not with it.
+
 3. **Compile-on-write** — after any mutation to a `ROUTING_TABLE_TO_ENTITY` table: load, compile,
    fail the request on errors, otherwise persist the artifact and evict/replace the KV key.
    `isArtifactFresh` short-circuits the write when nothing changed.
@@ -472,40 +483,81 @@ Because `compiledAt` is the only non-derived field, a recompile that produces th
     re-upload. `apps/web`'s `lib/pbx/contracts.spec.ts` asserts the current answer in both
     directions, so the day it changes is a failing test rather than a silent one.
 
-11. **A conference set-PIN endpoint** — the API half is **DONE**
-    (`POST|DELETE /api/v1/conferences/:id/pin` and `…/moderator-pin`, hashing with the same
-    `formatVoicemailPinHash` §3.1 defines), and the ROUTING half is not. Precisely:
-    - `ConferenceInput.requiresPin` is already `pin_hash !== null` in the loader, so setting a
-      participant PIN moves `snapshotHash` and `ConferencePlanNode.requiresPin` becomes true. That
-      part works end to end and `apps/api verify:media` asserts it against a real artifact.
-    - **`ConferenceInput` and `ConferencePlanNode` carry no digest**, so the engine can know a room
-      wants a PIN and cannot verify one. `VoicemailPlanNode.pinHash` is the shape it needs; adding
-      `pinHash` to `ConferenceInput` (`snapshot.ts`), to `ConferencePlanNode` (`plan.ts`) and a
-      `conferencePinHash()` clone of `voicemailPinHash()` (`compile.ts`, ~line 1112) is the whole
-      change. Optional fields, so **no `ROUTING_ARTIFACT_VERSION` bump** per §2.1 — and §2.5's
-      table gains a fourth row.
-    - **The moderator PIN reaches nothing at all.** There is no `moderatorPinHash` and no
-      `requiresModeratorPin` on `ConferenceInput`, so the loader drops the column and setting one
-      recompiles to an identical `snapshotHash`. The column is written and stored; nothing
-      downstream reads it. `waitForModerator` is therefore still un-enforceable.
+11. ~~**A conference set-PIN endpoint**~~ — **DONE, both halves.** The API's
+    (`POST|DELETE /api/v1/conferences/:id/pin` and `…/moderator-pin`) hashes with the same
+    `formatVoicemailPinHash` §3.1 defines; this package now carries what it writes:
+    - `ConferenceInput` gained `pinHash`, `moderatorPinHash` and `requiresModeratorPin`;
+      `ConferencePlanNode` gained the same three; `conferencePinHash()` in `compile.ts` is the
+      `voicemailPinHash()` clone that parses them. All optional, so **no `ROUTING_ARTIFACT_VERSION`
+      bump** per §2.1, and §2.5's table gains two rows.
+    - Setting a moderator PIN now moves `snapshotHash`. It previously recompiled to a byte-identical
+      artifact: the column was written, stored, and read by nothing, which made `waitForModerator`
+      un-enforceable. `apps/api verify:media` asserts the move, and re-verifies BOTH digests out of
+      a real artifact against the PINs it set.
+    - **The one place a room deliberately differs from a mailbox.** An unreadable digest raises the
+      same `invalid-pin-hash` warning and is equally not embedded — but the two readers must do
+      opposite things with the result. A mailbox degrades to authenticating by the calling
+      extension (the classic `*97` default). A room **fails closed**: `requiresPin === true` with
+      no `pinHash` means the engine refuses it, because the classic default for a bridge is "anyone
+      who knows the number is in", and silently restoring that on a room whose owner set a PIN
+      would turn a formatting change into an open conference. The warning's own text says which
+      happened.
 
-12. **E911 call handling** — the API now models the data
-    (`emergency_address` CRUD, `phone_number.emergency_address_id`, `extension.emergency_caller_id_*`)
-    and this package models none of the behaviour. The one emergency-aware field here is
-    `ExtensionInput.emergencyCallerIdNumber`, which is copied to `ExtensionIndexEntry` and never
-    acted on. `emergency_address` is not in `ROUTING_TABLE_TO_ENTITY` and there is no
-    `emergencyAddresses` collection. What full compliance needs, in this package:
-    - an emergency route that **bypasses `OutboundMatchTable.enabled`** (checked before any rule
-      match today) **and the toll-class gate** and `callBlockRules` — Kari's Law requires that
-      `911` be dialable with no prefix and no permission, which no combination of the current
-      `OutboundRule` fields can express;
-    - somewhere to carry the dispatchable location or its ELIN: neither `OutboundRule` nor
-      `TrunkDialPlanNode` has a field for it today;
-    - a Kari's Law **notification** — an event, not a routing decision, so `packages/events`
-      rather than this package, and `apps/engine` to emit it on an emergency origination.
+    What `apps/engine` built on top, and what it did not: a conference node is now a real join to
+    a shared ARI mixing bridge with the PIN gate, moderator entry, `waitForModerator` (held on
+    music OUTSIDE the bridge, so early arrivals cannot hear each other), `maxMembers`, and a
+    `conference.joined` / `conference.left` event pair. Still stubbed: **recording**
+    (`recordEnabled` is read and noted, never acted on), in-conference DTMF controls, mute, kick,
+    lock, entry/exit tones, the participant list, and cross-process room state — two engine
+    instances hosting the same room each create their own bridge.
 
-    Until those land, the honest description of the API's E911 surface is "a validated-by-nobody
-    address book, assignable per DID, that nothing on the call path reads". The admin UI says so.
+12. ~~**E911 call handling**~~ — **DONE in this package and in `apps/engine`.** The compiler now
+    models the behaviour the API had already modelled the data for:
+    - **A fixed emergency table** (`src/emergency.ts`), seeded NANP-only — `911`, `933` (the
+      carrier test number), `9911`/`9933` (the outside-line habit) and `+1911` — and extended per
+      organization through `settings.emergencyNumbers`. Additive only: there is deliberately no
+      setting that removes `911`. The seed list is short on purpose, because an emergency number
+      **shadows** an internal one; `112` and `999` are real emergency numbers and equally plausible
+      three-digit extensions, so they are a tenant's decision rather than ours. A collision raises
+      `emergency-number-shadowed` and the emergency table still wins.
+    - **The bypass.** The table is written into BOTH `internal` and `outbound` and both resolvers
+      consult it FIRST, ahead of `OutboundMatchTable.enabled`, ahead of the caller lookup, ahead of
+      the toll-class gate and ahead of `callBlockRules`. The emergency node carries no time gate
+      and no failover, so there is nothing left that can close. Each of those is a spec in
+      `emergency.spec.ts` that first proves the gate refuses an ordinary call.
+    - **The location travels.** `PhoneNumberInput.emergencyAddressId` and an optional
+      `emergencyAddresses` collection (id, label, `validated` — never the street: the artifact
+      lives in a KV bucket every engine can read). The compiler picks the organization's ELIN
+      deterministically — enabled, voice-enabled, lowest E.164, address present AND validated — and
+      puts it plus the address id on the node. The resolver applies the precedence only it can:
+      the calling extension's own `emergencyCallerIdNumber` beats the organization ELIN beats the
+      ordinary outbound caller id.
+    - **Trunk selection is unfiltered by `enabled`,** in a documented order: trunks named by an
+      enabled outbound route first (route priority, then entry order), then everything else by
+      name. An administrator disables a trunk to stop it carrying ordinary traffic, which is not a
+      statement about whether a call to a dispatcher should be attempted over it. `continueOnCauses`
+      is much wider than `RETRYABLE_HANGUP_CAUSES` for the same reason: a rejection is a reason to
+      try the next carrier, and the toll-fraud amplification argument does not apply to `911`.
+    - **Diagnostics.** `missing-emergency-address` per DID that carries none (naming the number),
+      `dangling-emergency-address` for one that is missing or unvalidated, `no-emergency-route`
+      when an organization has stations and no trunk at all, `emergency-number-shadowed`,
+      `invalid-emergency-number`, and an `emergency-call` info diagnostic on the resolved route
+      listing what was bypassed.
+
+    **It is a `trunk-dial` node with `emergency: true`, not a new node kind.** A new kind is a
+    `ROUTING_ARTIFACT_VERSION` bump — an old reader hits a node it cannot execute and refuses the
+    call — whereas three optional fields leave an old reader dialing the trunk chain with the
+    tenant's ordinary caller id. For an emergency call "dialed with the wrong ANI" is a much better
+    failure than "refused", and it is what every release before this one would have done anyway.
+
+    **The Kari's Law notification is an event, and that is the contract.** `apps/engine` publishes
+    `call.emergency.dialed` (added to `packages/events`, additive, no subject bump) at the moment
+    the first trunk attempt is made — before the answer, because the statute is about the attempt —
+    carrying the dial string, the wire number, the caller, the ELIN actually presented and the
+    address id. Delivery (webhook, email, a screen pop at the front desk) is a consumer's job and
+    is the recorded follow-up: the engine holds no tenant configuration and no SMTP handle, and a
+    notification that lives inside one process is one a restart loses. `emergency_address` is now
+    in `ROUTING_TABLE_TO_ENTITY`, so editing an address recompiles the tenant.
 
 ### Notes that constrain the API, and one for `packages/events`
 
@@ -527,7 +579,7 @@ Because `compiledAt` is the only non-derived field, a recompile that produces th
 ## 8. Development
 
 ```sh
-bun test src            # 647 colocated specs
+bun test src            # 693 colocated specs
 pnpm typecheck
 pnpm build              # tsc + ESM specifier rewrite -> dist/
 ```

@@ -207,6 +207,9 @@ export const EVENT_ENTRIES: readonly EventEntry[] = [
 	callEntry("channel.record.stopped", "ChannelRecordStopped"),
 	callEntry("channel.hangup", "ChannelHangup"),
 	callEntry("channel.destroyed", "ChannelDestroyed"),
+	callEntry("conference.joined", "ConferenceJoined"),
+	callEntry("conference.left", "ConferenceLeft"),
+	callEntry("call.emergency.dialed", "CallEmergencyDialed"),
 
 	registrationEntry("registered", "RegistrationRegistered"),
 	registrationEntry("unregistered", "RegistrationUnregistered"),

@@ -31,7 +31,7 @@ import type {
 	WalkInput,
 } from "./plan-walker";
 import type { CallEvent } from "@optimiq-voice/events";
-import type { CompiledTimeCondition, PlanNode } from "@optimiq-voice/routing";
+import type { CompiledTimeCondition, PlanNode, TrunkDialPlanNode } from "@optimiq-voice/routing";
 import type {
 	ChannelState,
 	DtmfCollection,
@@ -82,6 +82,8 @@ interface HarnessOptions {
 	readonly voicemail?: VoicemailPort;
 	/** Where the `*97` menu reads a mailbox from. Absent means the walk has no mailbox source. */
 	readonly mailbox?: VoicemailMailboxSource;
+	/** Makes ONE event type's publish throw — how "a slow broker must not end a call" is tested. */
+	readonly failPublishOf?: CallEvent;
 }
 
 type LegReaction =
@@ -228,6 +230,9 @@ function harness(options: HarnessOptions = {}) {
 		channel,
 		execute,
 		publish: async (type, data) => {
+			if (options.failPublishOf === type) {
+				throw new Error("the broker is unreachable");
+			}
 			published.push({ type, data });
 		},
 		settings: { answerTimeoutMs: 200, ...options.settings },
@@ -1700,6 +1705,138 @@ describe("trunk dialling", () => {
 	});
 });
 
+/**
+ * The emergency half of a trunk dial.
+ *
+ * Everything that could have refused the call was bypassed in `packages/routing`'s resolvers —
+ * `emergency.spec.ts` there is where those proofs live. What is left for the walker is exactly
+ * two things: the ELIN must be what the far end sees, and the Kari's Law notification must go out
+ * before the first attempt rather than after the call.
+ */
+describe("an emergency trunk dial", () => {
+	const emergencyNode = (overrides: Partial<TrunkDialPlanNode> = {}) =>
+		trunkDialNode("e", {
+			outboundRouteId: "emergency",
+			emergency: true,
+			elin: "+12125550100",
+			emergencyAddressId: "0195c0f0-1c2f-7000-8000-0000000000d1",
+			...overrides,
+		});
+
+	it("presents the ELIN the resolver worked out", async () => {
+		const h = harness({ reactions: { "carrier-a": { kind: "answer" } } });
+		await h.walker.walk(
+			walkInput([emergencyNode()], { dialedNumber: "911", callerIdNumber: "+12125550199" }),
+		);
+		expect(h.media.originated()[0]?.callerId).toBe("+12125550199");
+	});
+
+	it("falls back to the node's own ELIN when the resolver supplied none", async () => {
+		const h = harness({ reactions: { "carrier-a": { kind: "answer" } } });
+		await h.walker.walk(walkInput([emergencyNode()], { dialedNumber: "911" }));
+		expect(h.media.originated()[0]?.callerId).toBe("+12125550100");
+	});
+
+	it("ignores a trunk's caller-id override, which would send a dispatcher to the wrong address", async () => {
+		const h = harness({ reactions: { "carrier-a": { kind: "answer" } } });
+		await h.walker.walk(
+			walkInput(
+				[
+					emergencyNode({
+						callerIdNumberOverride: "+15559999999",
+						attempts: [{ ...trunkAttempt("carrier-a", 0), callerIdNumberOverride: "+15558888888" }],
+					}),
+				],
+				{ dialedNumber: "911", callerIdNumber: "+12125550199" },
+			),
+		);
+		expect(h.media.originated()[0]?.callerId).toBe("+12125550199");
+	});
+
+	it("does NOT touch an ordinary trunk dial's caller-id precedence", async () => {
+		const h = harness({ reactions: { "carrier-a": { kind: "answer" } } });
+		await h.walker.walk(
+			walkInput([trunkDialNode("t", { callerIdNumberOverride: "+15559999999" })], {
+				dialedNumber: "+1",
+				callerIdNumber: "+12125550199",
+			}),
+		);
+		expect(h.media.originated()[0]?.callerId).toBe("+15559999999");
+	});
+
+	it("publishes the Kari's Law notification BEFORE the first attempt", async () => {
+		const h = harness({ reactions: { "carrier-a": { kind: "answer" } } });
+		await h.walker.walk(
+			walkInput([emergencyNode()], { dialedNumber: "911", callerIdNumber: "+12125550199" }),
+		);
+		// The publish is recorded on the same timeline as the originate, so "before" is a fact
+		// rather than an ordering the spec asserts by hoping.
+		expect(h.published[0]?.type).toBe("call.emergency.dialed");
+	});
+
+	it("carries what a notification needs: the number, the caller, the ELIN and the address", async () => {
+		const h = harness({ reactions: { "carrier-a": { kind: "answer" } } });
+		await h.walker.walk(
+			walkInput([emergencyNode()], {
+				dialedNumber: "911",
+				originalDialedNumber: "9911",
+				callerIdNumber: "+12125550199",
+			}),
+		);
+		const event = h.published.find((entry) => entry.type === "call.emergency.dialed");
+		expect(event?.data).toMatchObject({
+			dialed: "9911",
+			number: "911",
+			callerNumber: "+15551234567",
+			elin: "+12125550199",
+			emergencyAddressId: "0195c0f0-1c2f-7000-8000-0000000000d1",
+			trunkName: "carrier-a",
+		});
+	});
+
+	it("publishes nothing of the kind for an ordinary trunk dial", async () => {
+		const h = harness({ reactions: { "carrier-a": { kind: "answer" } } });
+		await h.walker.walk(walkInput([trunkDialNode("t")], { dialedNumber: "+1" }));
+		expect(h.published.map((entry) => entry.type)).not.toContain("call.emergency.dialed");
+	});
+
+	it("still dials when the notification cannot be published", async () => {
+		// A slow broker must not be able to stop a call to a dispatcher.
+		const h = harness({
+			reactions: { "carrier-a": { kind: "answer" } },
+			failPublishOf: "call.emergency.dialed",
+		});
+		const outcome = await h.walker.walk(walkInput([emergencyNode()], { dialedNumber: "911" }));
+
+		expect(outcome.status).toBe("bridged");
+		expect(outcome.notes.join(" ")).toContain("could not be published");
+	});
+
+	it("keeps trying carriers past a rejection, because the node says to", async () => {
+		const h = harness({
+			reactions: {
+				"carrier-a": { kind: "reject", cause: "CALL_REJECTED" },
+				"carrier-b": { kind: "answer" },
+			},
+		});
+		const outcome = await h.walker.walk(
+			walkInput(
+				[
+					emergencyNode({
+						attempts: [trunkAttempt("carrier-a", 0), trunkAttempt("carrier-b", 1)],
+						// The wider list `packages/routing` compiles onto an emergency node.
+						continueOnCauses: ["CALL_REJECTED"],
+					}),
+				],
+				{ dialedNumber: "911" },
+			),
+		);
+
+		expect(outcome.status).toBe("bridged");
+		expect(h.media.originated()).toHaveLength(2);
+	});
+});
+
 describe("external numbers", () => {
 	it("dials a literal destination that does not need outbound routing", async () => {
 		const h = harness({ reactions: { external: { kind: "answer" } } });
@@ -1800,8 +1937,10 @@ describe("feature codes", () => {
 });
 
 describe("node kinds that are not implemented yet", () => {
+	// `conference` left this list when it gained a real runtime; it now behaves like `queue` —
+	// implemented, and falling back to the announcement when the walk was not given its registry.
+	// See `plan-walker-conference.spec.ts`.
 	for (const node of [
-		{ id: "c", kind: "conference", conferenceId: "c-1" },
 		{ id: "p", kind: "park", parkLotId: "p-1" },
 		{ id: "a", kind: "application", application: "autopilot" },
 	] as PlanNode[]) {

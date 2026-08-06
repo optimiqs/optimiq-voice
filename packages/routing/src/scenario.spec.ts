@@ -75,6 +75,8 @@ const ACME: OrgRoutingSnapshot = {
 			forwardBusyEnabled: false,
 			forwardNoAnswerEnabled: false,
 			forwardUnregisteredEnabled: false,
+			// The intern sits in the warehouse, which has its own registered callback number.
+			emergencyCallerIdNumber: "+12125550199",
 		},
 	],
 	voicemailBoxes: [
@@ -114,6 +116,7 @@ const ACME: OrgRoutingSnapshot = {
 			destinationRef: "tc-hours",
 			recordEnabled: false,
 			voiceEnabled: true,
+			emergencyAddressId: "addr-hq",
 		},
 		{
 			id: "did-sales",
@@ -123,7 +126,12 @@ const ACME: OrgRoutingSnapshot = {
 			destinationRef: "rg-sales",
 			recordEnabled: true,
 			voiceEnabled: true,
+			emergencyAddressId: "addr-hq",
 		},
+	],
+	emergencyAddresses: [
+		{ id: "addr-hq", label: "Acme HQ, 4th floor", validated: true },
+		{ id: "addr-warehouse", label: "Acme warehouse", validated: false },
 	],
 	timeConditions: [
 		{
@@ -663,13 +671,40 @@ describe("Acme — internal dialing", () => {
 
 describe("Acme — outbound", () => {
 	it("lets the intern dial an emergency number despite their local class", () => {
-		// The emergency route requires only `internal`, which every class covers. This is the one
-		// route that must never be gated by privilege.
+		// Not by matching the tenant's own `out-emergency` route: the compiled-in emergency table is
+		// consulted before the rule list exists, so privilege never enters into it.
 		const route = resolveOutbound(artifact, { from: "102", dialed: "911", now: DURING_HOURS });
-		expect(route.matchedRuleId).toBe("out-emergency");
+		expect(route.matchedRuleId).toBe("emergency");
+		expect(route.dialedNumber).toBe("911");
 	});
 
-	it("puts emergency ahead of every other route", () => {
+	it("presents the intern's own registered callback number on 911", () => {
+		expect(
+			resolveOutbound(artifact, { from: "102", dialed: "911", now: DURING_HOURS }).callerIdNumber,
+		).toBe("+12125550199");
+	});
+
+	it("presents the organization ELIN for an extension with no callback number of its own", () => {
+		// `+12125550100` is the lowest-sorting DID carrying a VALIDATED emergency address.
+		expect(
+			resolveOutbound(artifact, { from: "100", dialed: "911", now: DURING_HOURS }).callerIdNumber,
+		).toBe("+12125550100");
+	});
+
+	it("dials 911 with outbound calling switched off for the whole organization", () => {
+		const dark = compileRoutingArtifact(
+			{ ...ACME, settings: { ...ACME.settings, outboundEnabled: false } },
+			{ compiledAt: COMPILED_AT },
+		);
+		expect(
+			resolveOutbound(dark, { from: "100", dialed: "+12125559999", now: DURING_HOURS }).matched,
+		).toBe(false);
+		expect(resolveOutbound(dark, { from: "100", dialed: "911", now: DURING_HOURS }).matched).toBe(
+			true,
+		);
+	});
+
+	it("still reaches an emergency node from the tenant's own priority-1 route", () => {
 		expect(artifact.outbound.rules[0]?.id).toBe("out-emergency");
 	});
 

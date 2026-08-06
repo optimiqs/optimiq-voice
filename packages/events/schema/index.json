@@ -105,6 +105,27 @@
 			"goType": "ChannelDestroyedData"
 		},
 		{
+			"family": "call",
+			"type": "conference.joined",
+			"subject": "calls.evt.v1.<orgId>.<callId>.conference.joined",
+			"dataSchema": "events/call.conference.joined.schema.json",
+			"goType": "ConferenceJoinedData"
+		},
+		{
+			"family": "call",
+			"type": "conference.left",
+			"subject": "calls.evt.v1.<orgId>.<callId>.conference.left",
+			"dataSchema": "events/call.conference.left.schema.json",
+			"goType": "ConferenceLeftData"
+		},
+		{
+			"family": "call",
+			"type": "call.emergency.dialed",
+			"subject": "calls.evt.v1.<orgId>.<callId>.call.emergency.dialed",
+			"dataSchema": "events/call.call.emergency.dialed.schema.json",
+			"goType": "CallEmergencyDialedData"
+		},
+		{
 			"family": "registration",
 			"type": "registered",
 			"subject": "sip.reg.v1.<orgId>.<aorHash>.registered",
