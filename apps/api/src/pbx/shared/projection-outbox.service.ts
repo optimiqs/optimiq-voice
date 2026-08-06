@@ -1,5 +1,5 @@
 import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { QueueMembershipPublisher } from "../queues/queue-membership.publisher";
 import { compileOnWrite } from "../routing/compile-on-write";
 import { DidIndexPublisher } from "../routing/did-index.publisher";
@@ -17,7 +17,7 @@ import type { PbxEnv } from "./pbx-env";
 import type { ProjectionName } from "./projection-outbox";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /**
  * The projection outbox's sweeper: the second half of the safety net, and the half that runs when
@@ -128,12 +128,15 @@ export class ProjectionOutboxSweeper implements OnModuleInit, OnApplicationShutd
 			void this.sweep();
 		}, this.env.PBX_OUTBOX_SWEEP_INTERVAL_MS);
 		this.timer.unref?.();
-		logger.info("projection outbox sweeper started", {
-			intervalMs: this.env.PBX_OUTBOX_SWEEP_INTERVAL_MS,
-			backoffBaseMs: this.env.PBX_OUTBOX_BACKOFF_BASE_MS,
-			backoffCapMs: this.env.PBX_OUTBOX_BACKOFF_CAP_MS,
-			stuckAttempts: this.env.PBX_OUTBOX_STUCK_ATTEMPTS,
-		});
+		logger.info(
+			{
+				intervalMs: this.env.PBX_OUTBOX_SWEEP_INTERVAL_MS,
+				backoffBaseMs: this.env.PBX_OUTBOX_BACKOFF_BASE_MS,
+				backoffCapMs: this.env.PBX_OUTBOX_BACKOFF_CAP_MS,
+				stuckAttempts: this.env.PBX_OUTBOX_STUCK_ATTEMPTS,
+			},
+			"projection outbox sweeper started",
+		);
 	}
 
 	onApplicationShutdown(): void {
@@ -162,7 +165,7 @@ export class ProjectionOutboxSweeper implements OnModuleInit, OnApplicationShutd
 		} catch (error) {
 			// A sweep that throws must not kill the interval. The next tick tries again.
 			this.failed += 1;
-			logger.error("the projection outbox sweep failed", error);
+			logger.error({ err: error }, "the projection outbox sweep failed");
 			return { attempted: 0, discharged: 0, failed: 1, deferred: 0, stuck: 0, pruned: 0 };
 		} finally {
 			this.running = false;
@@ -210,14 +213,17 @@ export class ProjectionOutboxSweeper implements OnModuleInit, OnApplicationShutd
 				const marked = await dischargeRows(this.database.adminDb, group.ids);
 				this.discharged += marked;
 				discharged += marked;
-				logger.info("the projection outbox published a projection the fast path did not", {
-					organizationId: group.organizationId,
-					projection: group.projection,
-					rows: marked,
-					owed: group.ids.length,
-					attempts: group.attempts,
-					owedForMs: now.getTime() - group.oldestCreatedAt.getTime(),
-				});
+				logger.info(
+					{
+						organizationId: group.organizationId,
+						projection: group.projection,
+						rows: marked,
+						owed: group.ids.length,
+						attempts: group.attempts,
+						owedForMs: now.getTime() - group.oldestCreatedAt.getTime(),
+					},
+					"the projection outbox published a projection the fast path did not",
+				);
 			} catch (error) {
 				failed += 1;
 				this.failed += 1;
@@ -226,12 +232,15 @@ export class ProjectionOutboxSweeper implements OnModuleInit, OnApplicationShutd
 					group.ids,
 					error instanceof Error ? error.message : String(error),
 				);
-				logger.warn("a projection outbox publish failed and will be retried", {
-					organizationId: group.organizationId,
-					projection: group.projection,
-					attempts: group.attempts + 1,
-					error,
-				});
+				logger.warn(
+					{
+						organizationId: group.organizationId,
+						projection: group.projection,
+						attempts: group.attempts + 1,
+						error,
+					},
+					"a projection outbox publish failed and will be retried",
+				);
 			}
 		}
 
@@ -256,8 +265,6 @@ export class ProjectionOutboxSweeper implements OnModuleInit, OnApplicationShutd
 	 */
 	private reportStuck(group: PendingProjection, now: Date): void {
 		logger.error(
-			`a ${group.projection} projection has failed ${group.attempts} times and is still owed; ` +
-				`the engine is reading a stale ${group.projection} for this organization — ${REPAIR[group.projection]}`,
 			{
 				organizationId: group.organizationId,
 				projection: group.projection,
@@ -266,6 +273,8 @@ export class ProjectionOutboxSweeper implements OnModuleInit, OnApplicationShutd
 				owedForMs: now.getTime() - group.oldestCreatedAt.getTime(),
 				lastError: group.lastError,
 			},
+			`a ${group.projection} projection has failed ${group.attempts} times and is still owed; ` +
+				`the engine is reading a stale ${group.projection} for this organization — ${REPAIR[group.projection]}`,
 		);
 	}
 

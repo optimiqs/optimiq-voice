@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { Inject, Injectable } from "@nestjs/common";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { and, deviceLine, eq, extension, orgSetting, sql } from "@optimiq-voice/pbx-db";
 import { loadProvisioningEnv } from "../../provisioning/provisioning-env";
 import { deriveSipPassword } from "../../provisioning/render/provision-secret";
@@ -8,7 +8,7 @@ import { PBX_DATABASE } from "../shared/pbx.tokens";
 import type { SipCredentialResponse } from "@optimiq-voice/events/schemas";
 import type { PbxDatabaseClient, PbxDatabaseTransaction } from "@optimiq-voice/pbx-db";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /**
  * The `rpc.sip.v1.credential` read model — what `apps/sipd` needs to authenticate a REGISTER.
@@ -77,7 +77,7 @@ export class SipCredentialsService {
 			// Not `found: false`. An unmapped realm is a DEPLOYMENT problem — nobody told this API
 			// which tenant that realm belongs to — and reporting it as "no such account" would send
 			// an operator hunting for an extension that exists.
-			logger.warn("refusing a credential lookup for an unmapped realm", { realm, username });
+			logger.warn({ realm, username }, "refusing a credential lookup for an unmapped realm");
 			return refuse(
 				`no organization is mapped to realm "${realm}" ` +
 					`(set the org_setting sip/realm for the tenant that owns it)`,
@@ -97,10 +97,13 @@ export class SipCredentialsService {
 		if (ha1 === undefined) {
 			// The renderer refuses to emit a config without the root key, so a deployment in this
 			// state has no provisioned phones to authenticate anyway. Say which variable it is.
-			logger.error("cannot answer a credential lookup: PROVISION_SIP_SECRET_KEY is not set", {
-				realm,
-				username,
-			});
+			logger.error(
+				{
+					realm,
+					username,
+				},
+				"cannot answer a credential lookup: PROVISION_SIP_SECRET_KEY is not set",
+			);
 			return refuse("PROVISION_SIP_SECRET_KEY is not configured on this API");
 		}
 
@@ -165,7 +168,7 @@ export class SipCredentialsService {
 			return undefined;
 		}
 		if (rows.length > 1) {
-			logger.error("more than one organization claims the same SIP realm; refusing", { realm });
+			logger.error({ realm }, "more than one organization claims the same SIP realm; refusing");
 			return undefined;
 		}
 		return rows[0].organizationId;
@@ -216,7 +219,7 @@ export class SipCredentialsService {
 		if (rows.length > 1) {
 			// Two lines answering to one auth id is a data problem the registrar must not paper
 			// over: whichever it picked, half the fleet would authenticate and half would not.
-			logger.error("more than one device line uses the same auth user; refusing", { username });
+			logger.error({ username }, "more than one device line uses the same auth user; refusing");
 			return undefined;
 		}
 

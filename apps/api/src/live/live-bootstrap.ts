@@ -1,11 +1,11 @@
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { LiveGateway } from "./live-gateway";
 import { LIVE_PATH } from "./live-protocol";
 import type { INestApplication } from "@nestjs/common";
 import type { IncomingMessage, Server } from "node:http";
 import type { Duplex } from "node:stream";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.live");
 
 /**
  * Attaches the live WebSocket gateway to the HTTP server's `upgrade` event.
@@ -39,7 +39,7 @@ export async function registerLiveTransport(app: INestApplication): Promise<bool
 		// would be unhandled and would take the process down, so it is caught and the socket is
 		// closed — an upgrade that failed for an unexpected reason must not be left half-open.
 		void gateway.handleUpgrade(request, socket, head).catch((error) => {
-			logger.error("a live upgrade failed", error);
+			logger.error({ err: error }, "a live upgrade failed");
 			socket.destroy();
 		});
 	});

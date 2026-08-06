@@ -1,5 +1,5 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { resolveSettings } from "../catalog/cascade";
 import { modelDefaults, templateFor } from "../catalog/catalog";
 import { renderWith } from "../catalog/template";
@@ -31,7 +31,7 @@ import type { SoftphonePayload } from "../catalog/templates/softphone";
 import type { ProvisioningEnv } from "../provisioning-env";
 import type { RenderSnapshot, TokenLookup } from "./provision.repository";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.provisioning");
 
 /**
  * The render path: a phone's token in, a configuration out.
@@ -110,21 +110,27 @@ export class ProvisionService {
 		if (parsed === undefined) {
 			// No tenant is known, so nothing can be published. Logged at `warn`, which is where a
 			// platform operator watches for enumeration.
-			logger.warn("provisioning request with an unparsable token", {
-				sourceAddress: request.sourceAddress,
-				path: request.path,
-			});
+			logger.warn(
+				{
+					sourceAddress: request.sourceAddress,
+					path: request.path,
+				},
+				"provisioning request with an unparsable token",
+			);
 			throw new ProvisionRefusedException({ reason: "missing-token" });
 		}
 
 		// --- 2. resolve the reference (the one untenanted read) -----------------------------------
 		const found = await this.repository.findByTokenReference(parsed.reference);
 		if (found === undefined) {
-			logger.warn("provisioning request for an unknown token reference", {
-				sourceAddress: request.sourceAddress,
-				path: request.path,
-				userAgent: request.userAgent,
-			});
+			logger.warn(
+				{
+					sourceAddress: request.sourceAddress,
+					path: request.path,
+					userAgent: request.userAgent,
+				},
+				"provisioning request for an unknown token reference",
+			);
 			throw new ProvisionRefusedException({ reason: "invalid-token" });
 		}
 
@@ -254,11 +260,14 @@ export class ProvisionService {
 			const registerUser = row.extension?.number ?? row.line.authUser ?? undefined;
 			const secretRef = row.extension?.sipSecretRef ?? row.line.sipSecretRef ?? undefined;
 			if (registerUser === undefined || secretRef === undefined) {
-				logger.warn("skipping a device line with no resolvable SIP identity", {
-					organizationId,
-					deviceId: snapshot.device.id,
-					lineNumber: row.line.lineNumber,
-				});
+				logger.warn(
+					{
+						organizationId,
+						deviceId: snapshot.device.id,
+						lineNumber: row.line.lineNumber,
+					},
+					"skipping a device line with no resolvable SIP identity",
+				);
 				continue;
 			}
 
@@ -332,11 +341,14 @@ export class ProvisionService {
 				request.sourceIp,
 			);
 		} catch (error) {
-			logger.error("could not record a provisioning check-in", {
-				organizationId: context.organizationId,
-				deviceId: context.deviceId,
-				error,
-			});
+			logger.error(
+				{
+					organizationId: context.organizationId,
+					deviceId: context.deviceId,
+					error,
+				},
+				"could not record a provisioning check-in",
+			);
 		}
 
 		await this.events.publish("device.rendered", context.organizationId, {
@@ -361,15 +373,18 @@ export class ProvisionService {
 		reason: ProvisionRejectReason,
 		detail: string,
 	): Promise<void> {
-		logger.warn("provisioning request refused", {
-			reason,
-			detail,
-			organizationId: found.organizationId,
-			deviceId: found.id,
-			macAddress: found.macAddress,
-			sourceAddress: request.sourceAddress,
-			userAgent: request.userAgent,
-		});
+		logger.warn(
+			{
+				reason,
+				detail,
+				organizationId: found.organizationId,
+				deviceId: found.id,
+				macAddress: found.macAddress,
+				sourceAddress: request.sourceAddress,
+				userAgent: request.userAgent,
+			},
+			"provisioning request refused",
+		);
 		await this.events.publish("device.rejected", found.organizationId, {
 			sourceAddress: request.sourceAddress,
 			...(request.path === undefined ? {} : { path: request.path }),

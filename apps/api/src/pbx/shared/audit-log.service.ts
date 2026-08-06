@@ -1,11 +1,11 @@
 import { Injectable } from "@nestjs/common";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { diffOf, insertAuditLog } from "./audit-log";
 import type { AuditAction, AuditActor } from "./audit-log";
 import type { PbxChildResource, PbxResource } from "./pbx-resource";
 import type { PbxDatabaseTransaction } from "@optimiq-voice/pbx-db";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /** What the repository hands the ledger for one committed-or-not-at-all mutation. */
 export interface AuditMutationInput {
@@ -80,11 +80,14 @@ export class AuditLogService {
 	): Promise<void> {
 		if (input.actor === undefined) {
 			this.skipped += 1;
-			logger.warn("a PBX mutation reached the ledger with no actor and was not recorded", {
-				organizationId: input.organizationId,
-				resource: input.resource.tableName,
-				action: input.action,
-			});
+			logger.warn(
+				{
+					organizationId: input.organizationId,
+					resource: input.resource.tableName,
+					action: input.action,
+				},
+				"a PBX mutation reached the ledger with no actor and was not recorded",
+			);
 			return;
 		}
 

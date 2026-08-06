@@ -1,8 +1,8 @@
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { isMailConfigured } from "./mail-env";
 import type { MailEnv } from "./mail-env";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.mail");
 
 /**
  * The transport seam: one interface, two implementations, one selection rule.
@@ -76,13 +76,13 @@ export function createLoggingTransport(): MailTransport {
 		kind: "log",
 		send: async (message) => {
 			logger.warn(
-				"MAIL NOT SENT (no SMTP configured) — the message below was rendered and discarded",
 				{
 					to: message.to,
 					subject: message.subject,
 					text: message.text,
 					html: message.html,
 				},
+				"MAIL NOT SENT (no SMTP configured) — the message below was rendered and discarded",
 			);
 			return { delivered: false, transport: "log" };
 		},

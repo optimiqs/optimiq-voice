@@ -7,13 +7,13 @@ import { connect, type JetStreamManager, type KV, type NatsConnection } from "na
 // strict, not to weaken the contracts package.
 import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import { ensureKvBuckets, ROUTING_CACHE_KV } from "@optimiq-voice/events/streams";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { ROUTING_CACHE_BUCKET } from "@optimiq-voice/routing";
 import { PBX_ENV } from "../shared/pbx.tokens";
 import type { PbxEnv } from "../shared/pbx-env";
 import type { RoutingArtifact } from "@optimiq-voice/routing";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /**
  * The `routing-cache` KV half of the NATS backbone.
@@ -97,12 +97,12 @@ export class RoutingCachePublisher implements OnModuleInit, OnApplicationShutdow
 				await ensureKvBuckets(manager, [ROUTING_CACHE_KV]);
 			}
 			this.bucket = await manager.jetstream().views.kv(ROUTING_CACHE_BUCKET);
-			logger.info("routing-cache KV bucket ready", { bucket: ROUTING_CACHE_BUCKET });
+			logger.info({ bucket: ROUTING_CACHE_BUCKET }, "routing-cache KV bucket ready");
 		} catch (error) {
 			// Same reasoning as a publish failure: a broker that is down must not stop the control
 			// plane from serving configuration changes.
 			this.failed += 1;
-			logger.error("could not open the routing-cache KV bucket", error);
+			logger.error({ err: error }, "could not open the routing-cache KV bucket");
 		}
 	}
 
@@ -137,11 +137,14 @@ export class RoutingCachePublisher implements OnModuleInit, OnApplicationShutdow
 			return true;
 		} catch (error) {
 			this.failed += 1;
-			logger.error("failed to publish a routing artifact", {
-				cacheKey,
-				organizationId: artifact.organizationId,
-				error,
-			});
+			logger.error(
+				{
+					cacheKey,
+					organizationId: artifact.organizationId,
+					error,
+				},
+				"failed to publish a routing artifact",
+			);
 			return false;
 		}
 	}
@@ -159,7 +162,7 @@ export class RoutingCachePublisher implements OnModuleInit, OnApplicationShutdow
 			}
 			return JSON.parse(new TextDecoder().decode(entry.value)) as RoutingArtifact;
 		} catch (error) {
-			logger.error("failed to read a routing artifact", { cacheKey, error });
+			logger.error({ cacheKey, error }, "failed to read a routing artifact");
 			return undefined;
 		}
 	}

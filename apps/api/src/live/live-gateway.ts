@@ -1,7 +1,7 @@
 import { Inject, Injectable, type OnApplicationShutdown } from "@nestjs/common";
 import { fromNodeHeaders } from "better-auth/node";
 import { WebSocket, WebSocketServer } from "ws";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { toAppSession, type RawAuthSession } from "../auth/app-session";
 import { AuthService } from "../auth/auth.service";
 import { AUTH_PLATFORM } from "../auth/auth.tokens";
@@ -33,7 +33,7 @@ import type { AppSession, Permission } from "@optimiq-voice/auth";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.live");
 
 /**
  * The `/api/v1/live` WebSocket gateway.
@@ -161,9 +161,12 @@ export class LiveGateway implements OnApplicationShutdown {
 
 		if (!this.isTrustedOrigin(request)) {
 			this.refuse(socket, 403, "Forbidden");
-			logger.warn("refused a live upgrade from an untrusted origin", {
-				origin: request.headers.origin,
-			});
+			logger.warn(
+				{
+					origin: request.headers.origin,
+				},
+				"refused a live upgrade from an untrusted origin",
+			);
 			return;
 		}
 
@@ -174,7 +177,7 @@ export class LiveGateway implements OnApplicationShutdown {
 			})) as RawAuthSession | null;
 			session = resolved === null ? null : toAppSession(resolved);
 		} catch (error) {
-			logger.warn("live session resolution failed", error);
+			logger.warn({ err: error }, "live session resolution failed");
 		}
 
 		if (session === null) {
@@ -237,7 +240,7 @@ export class LiveGateway implements OnApplicationShutdown {
 			this.forget(connection);
 		});
 		connection.socket.on("error", (error) => {
-			logger.warn("a live socket errored", { organizationId: connection.organizationId, error });
+			logger.warn({ organizationId: connection.organizationId, error }, "a live socket errored");
 			this.forget(connection);
 		});
 	}
@@ -476,10 +479,13 @@ export class LiveGateway implements OnApplicationShutdown {
 				}
 			}
 		} catch (error) {
-			logger.warn("could not revalidate a live session", {
-				organizationId: connection.organizationId,
-				error,
-			});
+			logger.warn(
+				{
+					organizationId: connection.organizationId,
+					error,
+				},
+				"could not revalidate a live session",
+			);
 		}
 	}
 
@@ -525,11 +531,14 @@ export class LiveGateway implements OnApplicationShutdown {
 		try {
 			connection.socket.send(JSON.stringify(frame));
 		} catch (error) {
-			logger.warn("could not write a live frame", {
-				organizationId: connection.organizationId,
-				op: frame.op,
-				error,
-			});
+			logger.warn(
+				{
+					organizationId: connection.organizationId,
+					op: frame.op,
+					error,
+				},
+				"could not write a live frame",
+			);
 		}
 	}
 }

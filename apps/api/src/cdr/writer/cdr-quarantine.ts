@@ -1,8 +1,8 @@
 import { cdrWriteQuarantine } from "@optimiq-voice/cdr-db";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import type { CdrDatabaseClient, CdrQuarantineReason } from "@optimiq-voice/cdr-db";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.cdr");
 
 /**
  * The writers' dead-letter sink.
@@ -63,14 +63,17 @@ export async function quarantineMessage(
 	database: CdrDatabaseClient,
 	entry: QuarantineEntry,
 ): Promise<void> {
-	logger.error("quarantining a CDR message", {
-		stream: entry.stream,
-		subject: entry.subject,
-		sequence: entry.streamSequence,
-		reason: entry.reason,
-		deliveries: entry.deliveryCount,
-		detail: entry.detail,
-	});
+	logger.error(
+		{
+			stream: entry.stream,
+			subject: entry.subject,
+			sequence: entry.streamSequence,
+			reason: entry.reason,
+			deliveries: entry.deliveryCount,
+			detail: entry.detail,
+		},
+		"quarantining a CDR message",
+	);
 	try {
 		await database.adminDb.insert(cdrWriteQuarantine).values({
 			organizationId: entry.organizationId ?? null,
@@ -83,11 +86,14 @@ export async function quarantineMessage(
 			payload: asJsonPayload(entry.payload),
 		});
 	} catch (error) {
-		logger.error("could not record a quarantined CDR message; the log line above is the record", {
-			stream: entry.stream,
-			subject: entry.subject,
-			sequence: entry.streamSequence,
-			error,
-		});
+		logger.error(
+			{
+				stream: entry.stream,
+				subject: entry.subject,
+				sequence: entry.streamSequence,
+				error,
+			},
+			"could not record a quarantined CDR message; the log line above is the record",
+		);
 	}
 }

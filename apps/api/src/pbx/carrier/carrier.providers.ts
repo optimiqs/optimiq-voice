@@ -1,11 +1,11 @@
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { createTelnyxClient, type TelnyxClient } from "@optimiq-voice/telnyx";
 import { loadCarrierEnv } from "./carrier-env";
 import { CARRIER_ENV, TELNYX_CLIENT } from "./carrier.tokens";
 import type { CarrierEnv } from "./carrier-env";
 import type { Provider } from "@nestjs/common";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /**
  * The carrier slice's providers, kept out of `pbx.module.ts` so that file stays a list of what the
@@ -27,12 +27,15 @@ export const carrierProviders: readonly Provider[] = [
 				);
 				return undefined;
 			}
-			logger.info("carrier configured", {
-				provider: "telnyx",
-				baseUrl: env.TELNYX_API_BASE,
-				sipRegion: env.TELNYX_SIP_REGION,
-				webhooks: env.TELNYX_PUBLIC_KEY === undefined ? "unverifiable" : "verified",
-			});
+			logger.info(
+				{
+					provider: "telnyx",
+					baseUrl: env.TELNYX_API_BASE,
+					sipRegion: env.TELNYX_SIP_REGION,
+					webhooks: env.TELNYX_PUBLIC_KEY === undefined ? "unverifiable" : "verified",
+				},
+				"carrier configured",
+			);
 			return createTelnyxClient({
 				apiKey: env.TELNYX_API_KEY,
 				baseUrl: env.TELNYX_API_BASE,
@@ -45,13 +48,16 @@ export const carrierProviders: readonly Provider[] = [
 				 */
 				onAttempt: (event) => {
 					if (event.error !== undefined || (event.status ?? 200) >= 400) {
-						logger.warn("carrier request attempt failed", {
-							method: event.method,
-							path: event.path,
-							attempt: event.attempt,
-							status: event.status,
-							retryInMs: event.retryInMs,
-						});
+						logger.warn(
+							{
+								method: event.method,
+								path: event.path,
+								attempt: event.attempt,
+								status: event.status,
+								retryInMs: event.retryInMs,
+							},
+							"carrier request attempt failed",
+						);
 					}
 				},
 			});

@@ -2,7 +2,7 @@ import { Inject, Injectable } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { runEffect } from "@optimiq-voice/effect-runtime";
 import { ROUTING_CACHE_KV } from "@optimiq-voice/events/streams";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import {
 	isRoutingContext,
 	parseRoutingArtifact,
@@ -24,7 +24,7 @@ import type { WireDiagnostic } from "../shared/pbx.errors";
 import type { AppSession } from "@optimiq-voice/auth";
 import type { RoutingResolveRequest, RoutingResolveResponse } from "@optimiq-voice/events/schemas";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /**
  * The TTL the engine should apply to a cached artifact, taken from the bucket definition rather
@@ -205,7 +205,7 @@ export class RoutingService {
 		try {
 			return parseRoutingArtifact(cached);
 		} catch (error) {
-			logger.warn("discarding an unreadable cached routing artifact", { cacheKey, error });
+			logger.warn({ cacheKey, error }, "discarding an unreadable cached routing artifact");
 			return undefined;
 		}
 	}

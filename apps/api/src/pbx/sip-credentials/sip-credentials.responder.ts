@@ -3,13 +3,13 @@ import { connect, type NatsConnection, type Subscription } from "nats";
 import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import { sipCredentialRequestSchema } from "@optimiq-voice/events/schemas";
 import { RPC_SUBJECTS } from "@optimiq-voice/events/subjects";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { PBX_ENV } from "../shared/pbx.tokens";
 import { SipCredentialsService } from "./sip-credentials.service";
 import type { PbxEnv } from "../shared/pbx-env";
 import type { SipCredentialResponse } from "@optimiq-voice/events/schemas";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /**
  * The `rpc.sip.v1.credential` responder — the other end of `apps/sipd`'s digest challenge.
@@ -101,7 +101,7 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 		} catch (error) {
 			// A broker that is down must not stop the control plane from serving configuration
 			// changes — the same posture the routing cache takes.
-			logger.error(`could not subscribe to ${RPC_SUBJECTS.sipCredential}`, error);
+			logger.error({ err: error }, `could not subscribe to ${RPC_SUBJECTS.sipCredential}`);
 			return;
 		}
 
@@ -113,9 +113,12 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 		});
 		void this.consume(this.subscription);
 
-		logger.info(`serving ${RPC_SUBJECTS.sipCredential} over NATS`, {
-			servers: this.env.NATS_URL,
-		});
+		logger.info(
+			{
+				servers: this.env.NATS_URL,
+			},
+			`serving ${RPC_SUBJECTS.sipCredential} over NATS`,
+		);
 	}
 
 	private async consume(subscription: Subscription): Promise<void> {
@@ -130,14 +133,14 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 			} catch (error) {
 				// Unreachable in principle — `answer` catches — but a throw here would end the
 				// iterator and silently stop serving the subject for the life of the process.
-				logger.error(`${RPC_SUBJECTS.sipCredential} handler threw`, error);
+				logger.error({ err: error }, `${RPC_SUBJECTS.sipCredential} handler threw`);
 				reply = refuse("credential lookup failed");
 			}
 
 			try {
 				message.respond(encoder.encode(JSON.stringify(reply)));
 			} catch (error) {
-				logger.error(`could not reply on ${RPC_SUBJECTS.sipCredential}`, error);
+				logger.error({ err: error }, `could not reply on ${RPC_SUBJECTS.sipCredential}`);
 			}
 		}
 	}
@@ -164,7 +167,7 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 			const reason = parsed.error.issues
 				.map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
 				.join("; ");
-			logger.warn(`rejected a malformed ${RPC_SUBJECTS.sipCredential} request`, { reason });
+			logger.warn({ reason }, `rejected a malformed ${RPC_SUBJECTS.sipCredential} request`);
 			return refuse(reason);
 		}
 
@@ -175,12 +178,15 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 				sourceAddress: parsed.data.sourceAddress,
 			});
 		} catch (error) {
-			logger.error(`${RPC_SUBJECTS.sipCredential} failed`, {
-				realm: parsed.data.realm,
-				username: parsed.data.username,
-				sourceAddress: parsed.data.sourceAddress,
-				error,
-			});
+			logger.error(
+				{
+					realm: parsed.data.realm,
+					username: parsed.data.username,
+					sourceAddress: parsed.data.sourceAddress,
+					error,
+				},
+				`${RPC_SUBJECTS.sipCredential} failed`,
+			);
 			return refuse(
 				`credential lookup failed: ${error instanceof Error ? error.message : String(error)}`,
 			);

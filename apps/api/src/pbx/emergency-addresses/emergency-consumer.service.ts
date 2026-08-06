@@ -1,12 +1,12 @@
 import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
 import { AckPolicy, connect, DeliverPolicy, type NatsConnection } from "nats";
 import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { PBX_ENV } from "../shared/pbx.tokens";
 import { EmergencyNotificationService } from "./emergency-notification.service";
 import type { PbxEnv } from "../shared/pbx-env";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /** The durable this consumer binds to. Named, so a redeploy resumes rather than replays. */
 export const EMERGENCY_DURABLE = "pbx-emergency-notifier";
@@ -112,7 +112,7 @@ export class EmergencyConsumer implements OnModuleInit, OnApplicationShutdown {
 			void this.run();
 		} catch (error) {
 			this.failed += 1;
-			logger.error("could not connect the emergency notification consumer", error);
+			logger.error({ err: error }, "could not connect the emergency notification consumer");
 		}
 	}
 
@@ -155,7 +155,7 @@ export class EmergencyConsumer implements OnModuleInit, OnApplicationShutdown {
 			// `consumers.add` on an existing durable with identical config is a no-op; anything else
 			// here means the consumer cannot run, and saying so once is better than a silent loop.
 			if (!/consumer already exists/iu.test(String(error))) {
-				logger.error("could not create the emergency durable consumer", error);
+				logger.error({ err: error }, "could not create the emergency durable consumer");
 			}
 		}
 
@@ -165,10 +165,13 @@ export class EmergencyConsumer implements OnModuleInit, OnApplicationShutdown {
 				.consumers.get(CALLS_STREAM.name, EMERGENCY_DURABLE);
 			const messages = await consumer.consume();
 			this.running = true;
-			logger.info("emergency notification consumer running", {
-				durable: EMERGENCY_DURABLE,
-				subject: EMERGENCY_SUBJECT_FILTER,
-			});
+			logger.info(
+				{
+					durable: EMERGENCY_DURABLE,
+					subject: EMERGENCY_SUBJECT_FILTER,
+				},
+				"emergency notification consumer running",
+			);
 			for await (const message of messages) {
 				if (this.stopped) {
 					break;
@@ -178,7 +181,7 @@ export class EmergencyConsumer implements OnModuleInit, OnApplicationShutdown {
 		} catch (error) {
 			if (!this.stopped) {
 				this.failed += 1;
-				logger.error("the emergency notification consumer stopped", error);
+				logger.error({ err: error }, "the emergency notification consumer stopped");
 			}
 		}
 		this.running = false;
@@ -203,10 +206,13 @@ export class EmergencyConsumer implements OnModuleInit, OnApplicationShutdown {
 			) as unknown as EmergencyEnvelope;
 		} catch (error) {
 			this.terminated += 1;
-			logger.error("terminating a call event that is not readable as one", {
-				subject: message.subject,
-				error,
-			});
+			logger.error(
+				{
+					subject: message.subject,
+					error,
+				},
+				"terminating a call event that is not readable as one",
+			);
 			message.term();
 			return;
 		}
@@ -222,10 +228,13 @@ export class EmergencyConsumer implements OnModuleInit, OnApplicationShutdown {
 			// disagrees with the one it was delivered on could scope this notification — and the
 			// settings read behind it — to the wrong tenant.
 			this.terminated += 1;
-			logger.error("terminating an emergency event delivered on a foreign subject", {
-				subject: message.subject,
-				envelopeSubject: envelope.subject,
-			});
+			logger.error(
+				{
+					subject: message.subject,
+					envelopeSubject: envelope.subject,
+				},
+				"terminating an emergency event delivered on a foreign subject",
+			);
 			message.term();
 			return;
 		}
@@ -255,11 +264,14 @@ export class EmergencyConsumer implements OnModuleInit, OnApplicationShutdown {
 			// Already logged with the cause by the service; this records the call it belonged to, and
 			// it is an ERROR rather than a warning because an undelivered Kari's Law notification is
 			// a compliance event, not a degraded feature.
-			logger.error("an emergency call was placed and its notification could not be delivered", {
-				organizationId: envelope.orgId,
-				eventId: envelope.id,
-				number: data.number,
-			});
+			logger.error(
+				{
+					organizationId: envelope.orgId,
+					eventId: envelope.id,
+					number: data.number,
+				},
+				"an emergency call was placed and its notification could not be delivered",
+			);
 		}
 	}
 }

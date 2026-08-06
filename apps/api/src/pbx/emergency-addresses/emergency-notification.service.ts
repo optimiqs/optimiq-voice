@@ -1,5 +1,5 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { emergencyAddress, eq, extension } from "@optimiq-voice/pbx-db";
 import {
 	DEFAULT_MAIL_APP_NAME,
@@ -11,7 +11,7 @@ import { OrgSettingsService } from "../org-settings/org-settings.service";
 import { PBX_DATABASE } from "../shared/pbx.tokens";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /** The header a mail store collapses a redelivery on. The value is the EVENT's uuid v7. */
 export const EMERGENCY_EVENT_ID_HEADER = "X-Optimiq-Emergency-Event-Id";
@@ -104,11 +104,14 @@ export class EmergencyNotificationService {
 			return await this.deliver(organizationId, notice);
 		} catch (error) {
 			this.failed += 1;
-			logger.error("failed to send an emergency notification", {
-				organizationId,
-				eventId: notice.eventId,
-				error,
-			});
+			logger.error(
+				{
+					organizationId,
+					eventId: notice.eventId,
+					error,
+				},
+				"failed to send an emergency notification",
+			);
 			return { outcome: "failed" };
 		}
 	}
@@ -128,9 +131,9 @@ export class EmergencyNotificationService {
 		if (recipients.length === 0) {
 			this.skipped += 1;
 			logger.warn(
+				{ organizationId, number: notice.number, eventId: notice.eventId },
 				"an emergency call was placed and this organization has no Kari's Law recipients " +
 					"configured; set notifications.emergencyNotificationEmails",
-				{ organizationId, number: notice.number, eventId: notice.eventId },
 			);
 			return { outcome: "skipped", reason: "no-recipients" };
 		}
@@ -177,11 +180,14 @@ export class EmergencyNotificationService {
 		}
 		this.sent += 1;
 		if (failed.length > 0) {
-			logger.warn("an emergency notification reached some recipients but not all", {
-				organizationId,
-				eventId: notice.eventId,
-				failed,
-			});
+			logger.warn(
+				{
+					organizationId,
+					eventId: notice.eventId,
+					failed,
+				},
+				"an emergency notification reached some recipients but not all",
+			);
 			return { outcome: "partial", to: delivered, failed };
 		}
 		return { outcome: "sent", to: delivered };

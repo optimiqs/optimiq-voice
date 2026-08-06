@@ -3,7 +3,7 @@ import { Inject, Injectable } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { runEffect } from "@optimiq-voice/effect-runtime";
 import { createEntityId } from "@optimiq-voice/identifiers";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { and, asc, eq, ilike, mohClass, or, prompt, sql } from "@optimiq-voice/pbx-db";
 import { openMediaResponse } from "../../media/media-response";
 import { contentTypeForKey } from "../media/media-audio";
@@ -42,7 +42,7 @@ import type { PromptListQuery, UpdatePrompt } from "./prompts.dto";
 import type { AppSession } from "@optimiq-voice/auth";
 import type { PbxDatabaseClient, PbxDatabaseTransaction, PromptKind } from "@optimiq-voice/pbx-db";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /**
  * The media library: uploading audio, listing it, serving it back, deleting it.
@@ -372,7 +372,7 @@ export class PromptsService {
 	async unlinkObjects(objectKeys: readonly string[], reason: string): Promise<void> {
 		for (const objectKey of objectKeys) {
 			await deleteMediaObject(this.env.PBX_MEDIA_OBJECT_ROOT, objectKey).catch((cause: unknown) => {
-				logger.error("could not unlink a media object", { objectKey, reason, cause });
+				logger.error({ objectKey, reason, cause }, "could not unlink a media object");
 			});
 		}
 	}
@@ -500,11 +500,14 @@ export async function openStoredObject(
 ): Promise<MediaResponse> {
 	const path = resolveMediaObjectPath(root, objectKey);
 	if (path === undefined) {
-		logger.error("a media object key resolves outside the object root", {
-			kind: options.subject.kind,
-			id: options.subject.id,
-			objectKey,
-		});
+		logger.error(
+			{
+				kind: options.subject.kind,
+				id: options.subject.id,
+				objectKey,
+			},
+			"a media object key resolves outside the object root",
+		);
 		throw new MediaLinkInvalidException();
 	}
 

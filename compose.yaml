@@ -18,8 +18,17 @@ services:
   web:
     image: optimiq-voice/web:0.1.0
     restart: unless-stopped
-    expose:
-      - 3100
+    # Published, not merely exposed: this is now the stack's ingress.
+    #
+    # `envoy` used to be the only service with a host port, terminating on 8449 and splitting
+    # `/api/*` off to the API's gRPC-web and HTTP bridges. It is gone, and nothing replaced it,
+    # because nothing needs to: this app's `next.config` rewrites `/api/auth/*` and `/api/v1/*`
+    # server-side to `API_PROXY_ORIGIN` (default `http://api:9876`, this network), so the browser
+    # only ever speaks to this origin and the session cookie stays first-party either way. A second
+    # reverse proxy in front of a server that already reverse-proxies was one more place for the
+    # cookie domain and the CORS story to disagree.
+    ports:
+      - ${WEB_PORT:-3100}:3100
     environment:
       # The only genuine runtime knob. Everything else the app reads is either compiled in or
       # proxied to `api`, which owns the database, the auth secret and the mail transport.
@@ -28,91 +37,68 @@ services:
   api:
     image: optimiq-voice/api:0.17.1
     restart: unless-stopped
+    # Only what the process still reads. Every entry below was checked against the source; the
+    # ones that went with the legacy areas are listed at the bottom of this block rather than
+    # left here as environment the container accepts and ignores.
     environment:
+      # The public origin. `src/auth/auth.config.ts` uses it as better-auth's `baseURL` and
+      # `src/mail/mail-env.ts` falls back to it for the links in verification, password-reset,
+      # invitation and voicemail mail.
       - API_APP_URL
-      - API_ASTERISK_ARI_PROXY_URL
-      - API_ASTERISK_ARI_SECRET
-      - API_ASTERISK_ARI_USERNAME
-      - API_AUTHZ_SERVICE_ENABLED
-      - API_AUTHZ_SERVICE_HOST
-      - API_AUTHZ_SERVICE_METHODS
-      - API_AUTHZ_SERVICE_PORT
-      - API_CLOAK_ENCRYPTION_KEY
+      # The telephony database. `packages/config` maps it onto the canonical `DATABASE_URL`, and
+      # `main.ts` asserts its tenant-RLS contract before `NestFactory.create`.
       - API_DATABASE_URL
-      - API_IDENTITY_DATABASE_URL
-      - API_IDENTITY_ISSUER
-      - API_IDENTITY_CONTACT_VERIFICATION_REQUIRED
-      - API_IDENTITY_TWO_FACTOR_AUTHENTICATION_REQUIRED
-      - API_IDENTITY_WORKSPACE_INVITE_EXPIRATION
-      - API_IDENTITY_WORKSPACE_INVITE_FAIL_URL
-      - API_IDENTITY_WORKSPACE_INVITE_URL
-      - API_IDENTITY_OAUTH2_GITHUB_CLIENT_ID
-      - API_IDENTITY_OAUTH2_GITHUB_CLIENT_SECRET
-      - API_IDENTITY_OAUTH2_GITHUB_ENABLED
-      - API_INFLUXDB_INIT_ORG
-      - API_INFLUXDB_INIT_PASSWORD
-      - API_INFLUXDB_INIT_TOKEN
-      - API_INFLUXDB_INIT_USERNAME
-      - API_INFLUXDB_URL
-      - API_LOGS_FORMAT
-      - API_LOGS_LEVEL
-      - API_LOGS_TRANSPORT
+      # The broker. `API_NATS_URL` is the transitional name `packages/config` maps onto `NATS_URL`,
+      # which is what the PBX, CDR, live and provisioning areas actually read.
       - API_NATS_URL
       # The broker requires authentication (see the `nats` service and config/nats.conf).
       # These are the canonical, unprefixed names every platform service reads.
       - NATS_USER
       - NATS_PASS
-      - API_OWNER_EMAIL
-      - API_OWNER_NAME
-      - API_OWNER_PASSWORD
-      - API_ROOT_DOMAIN
+      # Mail. `src/mail/mail-env.ts` reads the `MAIL_*` names first and these as the aliases.
       - API_SMTP_AUTH_PASS
       - API_SMTP_AUTH_USER
       - API_SMTP_HOST
       - API_SMTP_PORT
       - API_SMTP_SECURE
       - API_SMTP_SENDER
-      - API_SIGNALING_SERVER
-      - API_TWILIO_ACCOUNT_SID
-      - API_TWILIO_AUTH_TOKEN
-      - API_TWILIO_PHONE_NUMBER
+      #
+      # Removed with the code that read them — each verified to have no reader left in apps/api:
+      #
+      #   API_ASTERISK_ARI_*        src/voice's ARI application (deleted; apps/engine owns ARI)
+      #   API_AUTHZ_SERVICE_*       src/voice/client/AuthorizationHandler (deleted)
+      #   API_CLOAK_ENCRYPTION_KEY  src/core/db.ts's field encryption (deleted). Still read by the
+      #                             one-shot identity migration scripts, which run from a shell
+      #                             and not from this container.
+      #   API_IDENTITY_*            the identity service and its invite controller (deleted)
+      #   API_INFLUXDB_*            src/calls' metrics writer (deleted)
+      #   API_LOGS_*                @optimiq-voice/logger (replaced by @optimiq-voice/logging,
+      #                             which reads LOG_LEVEL / LOG_PRETTY)
+      #   API_OWNER_*               src/core/seed.ts's default owner (deleted; sign-up is
+      #                             better-auth's)
+      #   API_ROOT_DOMAIN           had no reader in this app even before this change
+      #   API_SIGNALING_SERVER      src/core/testTokenConfig.ts (deleted)
+      #   API_TWILIO_*              the identity service's 2FA / contact verification (deleted)
     expose:
-      # The legacy gRPC listener. `expose` and never `ports`: it terminates PLAINTEXT h2c
-      # (`getServerCredentials({})` falls through to `createInsecure()`), it fronts the legacy
-      # identity handlers, and its auth interceptor verifies a token this same process signs — so
-      # anything that can reach it can be told about credentials. Its only remaining callers are
-      # inside this network: `envoy`'s `api-cluster` and `autopilot` (`AUTOPILOT_API_ENDPOINT`,
-      # default `api:50051`). Nothing on the host needs it; `compose.dev.yaml` used to publish it
-      # and no longer does. The listener dies with the legacy identity service in a later phase.
-      - 50051
-      # The HTTP bridge: /api/auth/* and /api/v1/*. Both `envoy` and `web` route to it, so it is
-      # listed here for the same reason 50051 is — the network is flat, but the contract is not.
+      # The HTTP bridge, and now the only listener this process has: /api/auth/* and /api/v1/*.
+      # `web` rewrites to it, in-network, which is why it is `expose` and not `ports`.
+      #
+      # The legacy gRPC listener on 50051 is gone. It terminated plaintext h2c, fronted the
+      # identity/sipnet/applications/secrets/calls handlers, and its auth interceptor verified a
+      # token the same process signed — so anything that could reach it could be told about
+      # credentials. Its two callers went with it: `envoy`'s `api-cluster` (service deleted) and
+      # `autopilot` (`AUTOPILOT_API_ENDPOINT`, service deleted).
       - 9876
-    volumes:
-      - ./.keys:/opt/optimiq-voice/keys:ro
-      - ./config/integrations.json:/opt/optimiq-voice/integrations.json:ro
-
-  autopilot:
-    image: optimiq-voice/autopilot:0.17.1
-    restart: unless-stopped
-    expose:
-      - 50061
-    environment:
-      - AUTOPILOT_AWS_S3_ACCESS_KEY_ID
-      - AUTOPILOT_AWS_S3_ENDPOINT
-      - AUTOPILOT_AWS_S3_REGION
-      - AUTOPILOT_AWS_S3_SECRET_ACCESS_KEY
-      - AUTOPILOT_CONVERSATION_PROVIDER
-      - AUTOPILOT_KNOWLEDGE_BASE_ENABLED
-      - AUTOPILOT_LOGS_FORMAT
-      - AUTOPILOT_LOGS_LEVEL
-      - AUTOPILOT_LOGS_TRANSPORT
-      - AUTOPILOT_OPENAI_API_KEY
-      - AUTOPILOT_RECORDING_BASE_URL
-      - AUTOPILOT_UNSTRUCTURED_API_KEY
-      - AUTOPILOT_UNSTRUCTURED_API_URL
-    volumes:
-      - ./config/integrations.json:/opt/optimiq-voice/integrations.json:ro
+    # No volumes.
+    #
+    # `./.keys:/opt/optimiq-voice/keys:ro` mounted the RSA keypair that `src/envs.ts` read at
+    # import time to sign identity tokens. Nothing in this process signs RS256 any more — call
+    # tokens are minted and verified through better-auth's JWKS — so the mount named a file the
+    # image no longer opens.
+    #
+    # `./config/integrations.json:/opt/optimiq-voice/integrations.json:ro` (API_INTEGRATIONS_FILE)
+    # carried the STT/TTS vendor credentials for the deleted `src/voice` ARI application. Speech
+    # integration returns with the AI-agent app, on its own configuration surface.
 
   routr:
     image: optimiq-voice/routr-one:2.13.22
@@ -288,21 +274,18 @@ services:
     expose:
       - 4222
 
-  envoy:
-    image: envoyproxy/envoy:v1.35.0
-    restart: unless-stopped
-    volumes:
-      - ./config/envoy.yaml:/etc/envoy/envoy.yaml:ro
-      # If using letsencrypt, you need to mount the letsencrypt directory
-      # by uncommenting the following line and changing the domain name to match your domain.
-      #
-      # Symbolic links will not work here!!!
-      #
-      # - ./path/to/letsencrypt:/etc/letsencrypt:ro
-    ports:
-      - 8449:8449
-      # If using letsencrypt, you need to expose port 443 and remove the default HTTP port (8449)
-      # - 443:443
+  # `envoy` is gone, and nothing replaced it.
+  #
+  # It was the stack's TLS terminator and edge router on 8449: `/optimiq_voice.*` to the API's
+  # gRPC-web listener, `/api/*` to its HTTP bridge, everything else to the dashboard. Two of those
+  # three destinations no longer exist — the gRPC listener died with the legacy services in this
+  # wave, and the dashboard was de-shipped earlier — and the third moved: `web` proxies `/api/auth/*`
+  # and `/api/v1/*` to `api:9876` from its own Next server, which is what keeps the better-auth
+  # session cookie first-party. A second proxy in front of that only added a place for the cookie
+  # domain and the CORS story to disagree.
+  #
+  # `config/envoy.yaml` and `config/envoy.dev.yaml` are still on disk and are deleted in wave 2.
+  # A deployment that wants TLS terminates it in front of `web` (see its `ports` above).
 
   autoheal:
     image: willfarrell/autoheal:latest

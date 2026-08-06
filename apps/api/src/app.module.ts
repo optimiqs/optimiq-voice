@@ -1,28 +1,30 @@
 import { Module } from "@nestjs/common";
-import { IdentityInviteController } from "./http/identity-invite.controller";
-import { RuntimeHostService } from "./runtime/runtime-host.service";
 
 /**
- * `GET /api/recordings/:id` used to be mounted here and is gone.
+ * The root module of the API process, and now deliberately empty.
  *
- * It was an anonymous read of any file under the recording root whose name a caller could guess —
- * `resolve()` stopped path traversal, nothing stopped enumeration — and its own comment said so,
- * recording "a signed, expiring URL minted alongside the recording" as the fix. That fix landed:
- * `src/cdr/recordings` mints `POST /api/v1/recordings/:id/download-url` under
- * `recordings.download` and serves the bytes from `GET /api/v1/recordings/media?token=…`, where
- * the recording id lives inside the signed blob and the read still runs through the tenant's RLS
- * policy. `apps/web` has only ever used that path.
+ * Everything this module used to own has been removed with the legacy platform:
  *
- * The route's one remaining caller was `apps/autopilot`, which posts
- * `${AUTOPILOT_RECORDING_BASE_URL}/<appRef>_<mediaSessionRef>.wav` into a customer's `eventsHook`.
- * Keeping it behind a session guard instead would not have helped anyone: a webhook fetcher has no
- * session by definition, so authenticating the route breaks that caller exactly as removing it
- * does — and those file names are ARI recording artifacts, not `cdr-db` `recordings` rows, so
- * there is no owning organization to scope such a request to in the first place. Autopilot's
- * migration is to mint a signed link, and it is a change on autopilot's side.
+ * - `RuntimeHostService` started the gRPC server on `API_BIND_ADDR` (`0.0.0.0:50051`) and, through
+ *   `app-runtime.ts`, seeded a default user and a Routr peer before binding the identity, sipnet,
+ *   applications, secrets, calls and welcome-demo service builders. That whole surface is gone;
+ *   the API speaks HTTP only, and `apps/engine` owns call control.
+ * - `IdentityInviteController` served `GET /api/identity/accept-invite`, the landing page for the
+ *   legacy identity service's workspace-invitation emails. Links in invitation emails that were
+ *   already sent by that service are now dead links. The live path is better-auth's organization
+ *   plugin: an invitation is accepted through `POST /api/auth/organization/accept-invitation`,
+ *   which `apps/web` drives — see `src/auth/auth-email.delivery.ts` for the mail it sends.
+ * - `GET /api/recordings/:id` was removed earlier: it was an anonymous read of any file under the
+ *   recording root whose name a caller could guess. `src/cdr/recordings` replaced it with a signed,
+ *   expiring URL (`POST /api/v1/recordings/:id/download-url` →
+ *   `GET /api/v1/recordings/media?token=…`), where the recording id lives inside the signed blob
+ *   and the read still runs through the tenant's RLS policy.
+ *
+ * The module itself stays because it is still the composition root: `main.ts` boots it directly on
+ * a deployment with no auth slice, and wraps it with `createApiRootModule([AppModule], …)`
+ * otherwise. The functional areas (`AuthModule`, `PbxModule`, `ProvisioningModule`, `LiveModule`,
+ * `CdrModule`) are composed there, conditionally, because each one is gated on its own database
+ * URL being configured.
  */
-@Module({
-	controllers: [IdentityInviteController],
-	providers: [RuntimeHostService],
-})
+@Module({})
 export class AppModule {}

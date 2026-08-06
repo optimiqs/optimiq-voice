@@ -4,10 +4,10 @@ import {
 	resolveCdrDatabaseUrl,
 } from "@optimiq-voice/cdr-db";
 import { assertTenantRlsPreflight } from "@optimiq-voice/db";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { isCdrSliceConfigured } from "./shared/cdr-env";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.cdr");
 
 export { isCdrSliceConfigured as isCdrAreaEnabled };
 
@@ -36,9 +36,12 @@ export async function assertCdrPreflight(): Promise<boolean> {
 		cdrTenantRlsPreflightPlan,
 		createCdrTenantRlsIntrospector(url),
 	);
-	logger.info("CDR tenant RLS preflight passed", {
-		role: cdrTenantRlsPreflightPlan.roleName,
-		tables: preflight.tables.length,
-	});
+	logger.info(
+		{
+			role: cdrTenantRlsPreflightPlan.roleName,
+			tables: preflight.tables.length,
+		},
+		"CDR tenant RLS preflight passed",
+	);
 	return true;
 }

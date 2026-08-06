@@ -5,12 +5,12 @@ import { connect, type JetStreamManager, type KV, type NatsConnection } from "na
 import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import { DID_INDEX_KV, ensureKvBuckets, kvKeyFor } from "@optimiq-voice/events/streams";
 import { didIndexToken } from "@optimiq-voice/events/subjects";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { PBX_ENV } from "../shared/pbx.tokens";
 import type { PbxEnv } from "../shared/pbx-env";
 import type { RoutingArtifact } from "@optimiq-voice/routing";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /**
  * The `did-index` KV half of the NATS backbone: **which tenant does this DID belong to?**
@@ -113,10 +113,10 @@ export class DidIndexPublisher implements OnModuleInit, OnApplicationShutdown {
 				await ensureKvBuckets(manager, [DID_INDEX_KV]);
 			}
 			this.bucket = await manager.jetstream().views.kv(DID_INDEX_KV.name);
-			logger.info("did-index KV bucket ready", { bucket: DID_INDEX_KV.name });
+			logger.info({ bucket: DID_INDEX_KV.name }, "did-index KV bucket ready");
 		} catch (error) {
 			this.failed += 1;
-			logger.error("could not open the did-index KV bucket", error);
+			logger.error({ err: error }, "could not open the did-index KV bucket");
 		}
 	}
 
@@ -172,11 +172,14 @@ export class DidIndexPublisher implements OnModuleInit, OnApplicationShutdown {
 				// A stored "number" with no digits in it cannot be dialled and cannot be indexed.
 				// Logged rather than thrown: one unusable row must not stop the other DIDs syncing.
 				this.failed += 1;
-				logger.error("skipping a phone number that has no did-index key", {
-					organizationId,
-					e164: entry.e164,
-					error,
-				});
+				logger.error(
+					{
+						organizationId,
+						e164: entry.e164,
+						error,
+					},
+					"skipping a phone number that has no did-index key",
+				);
 			}
 		}
 
@@ -190,10 +193,10 @@ export class DidIndexPublisher implements OnModuleInit, OnApplicationShutdown {
 				this.conflicts += 1;
 				conflicts.push({ key, e164: entry.e164, heldBy: existing.organizationId });
 				logger.error(
+					{ key, claimedBy: organizationId, heldBy: existing.organizationId },
 					"refusing to move a did-index entry to another organization; the database's " +
 						"global unique index on phone_number.e164 says this cannot happen, so the bucket " +
 						"is out of date — run scripts/rebuild-did-index.ts",
-					{ key, claimedBy: organizationId, heldBy: existing.organizationId },
 				);
 				continue;
 			}
@@ -216,7 +219,7 @@ export class DidIndexPublisher implements OnModuleInit, OnApplicationShutdown {
 				published += 1;
 			} catch (error) {
 				this.failed += 1;
-				logger.error("failed to write a did-index entry", { key, organizationId, error });
+				logger.error({ key, organizationId, error }, "failed to write a did-index entry");
 			}
 		}
 
@@ -234,7 +237,7 @@ export class DidIndexPublisher implements OnModuleInit, OnApplicationShutdown {
 				deleted += 1;
 			} catch (error) {
 				this.failed += 1;
-				logger.error("failed to delete a did-index entry", { key, organizationId, error });
+				logger.error({ key, organizationId, error }, "failed to delete a did-index entry");
 			}
 		}
 
@@ -250,7 +253,7 @@ export class DidIndexPublisher implements OnModuleInit, OnApplicationShutdown {
 		try {
 			return await this.readEntry(bucket, kvKeyFor.didIndex(did));
 		} catch (error) {
-			logger.error("failed to read a did-index entry", { did, error });
+			logger.error({ did, error }, "failed to read a did-index entry");
 			return undefined;
 		}
 	}
@@ -281,7 +284,7 @@ export class DidIndexPublisher implements OnModuleInit, OnApplicationShutdown {
 		} catch {
 			// An unreadable entry is treated as absent so a rewrite can repair it, rather than as a
 			// conflict that would block the organization that legitimately owns the number.
-			logger.warn("discarding an unreadable did-index entry", { key });
+			logger.warn({ key }, "discarding an unreadable did-index entry");
 			return undefined;
 		}
 	}

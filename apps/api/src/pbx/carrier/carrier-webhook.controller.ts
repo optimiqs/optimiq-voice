@@ -1,5 +1,5 @@
 import { Controller, Headers, HttpCode, HttpStatus, Inject, Post, Req } from "@nestjs/common";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import {
 	asNumberOrderWebhook,
 	parseTelnyxWebhookEvent,
@@ -18,7 +18,7 @@ import type { CarrierEnv } from "./carrier-env";
 import type { RawBodyRequest } from "@nestjs/common";
 import type { FastifyRequest } from "fastify";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /**
  * `POST /api/v1/carrier/webhooks/telnyx`.
@@ -96,7 +96,7 @@ export class CarrierWebhookController {
 			verifyTelnyxWebhook({ rawBody, signature, timestamp, publicKey });
 		} catch (error) {
 			if (error instanceof TelnyxSignatureError) {
-				logger.warn("rejected a telnyx webhook", { reason: error.reason });
+				logger.warn({ reason: error.reason }, "rejected a telnyx webhook");
 				throw new CarrierSignatureInvalidException(error.reason);
 			}
 			throw error;
@@ -116,17 +116,20 @@ export class CarrierWebhookController {
 			// `number_order.complete` fires for both outcomes, so the branch is on the payload's
 			// status, never on the event type. Reading it the other way treats every failed order as
 			// a success.
-			logger.info("telnyx number order completed", {
-				eventId: event.id,
-				orderId: order.order.id,
-				status: order.order.status,
-				customerReference: order.order.customer_reference,
-				attempt: event.attempt,
-			});
+			logger.info(
+				{
+					eventId: event.id,
+					orderId: order.order.id,
+					status: order.order.status,
+					customerReference: order.order.customer_reference,
+					attempt: event.attempt,
+				},
+				"telnyx number order completed",
+			);
 			return { received: true };
 		}
 
-		logger.info("telnyx webhook received", { eventId: event.id, eventType: event.eventType });
+		logger.info({ eventId: event.id, eventType: event.eventType }, "telnyx webhook received");
 		return { received: true };
 	}
 }

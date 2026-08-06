@@ -2,12 +2,12 @@ import { Controller, Inject } from "@nestjs/common";
 import { MessagePattern, Payload } from "@nestjs/microservices";
 import { routingResolveRequestSchema } from "@optimiq-voice/events/schemas";
 import { RPC_SUBJECTS } from "@optimiq-voice/events/subjects";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { PublicRoute } from "../../auth/public-route.decorator";
 import { RoutingService } from "./routing.service";
 import type { RoutingResolveResponse } from "@optimiq-voice/events/schemas";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /**
  * The `rpc.routing.v1.resolve` responder.
@@ -45,7 +45,7 @@ export class RoutingRpcController {
 			const reason = parsed.error.issues
 				.map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
 				.join("; ");
-			logger.warn("rejected a malformed rpc.routing.v1.resolve request", { reason });
+			logger.warn({ reason }, "rejected a malformed rpc.routing.v1.resolve request");
 			return { matched: false, reason: reason.slice(0, 256) };
 		}
 
@@ -54,7 +54,7 @@ export class RoutingRpcController {
 		} catch (error) {
 			// A resolve failure must not become a broker-level timeout: the engine has a live call
 			// waiting and needs an answer it can act on.
-			logger.error("rpc.routing.v1.resolve failed", { orgId: parsed.data.orgId, error });
+			logger.error({ orgId: parsed.data.orgId, error }, "rpc.routing.v1.resolve failed");
 			return {
 				matched: false,
 				reason:

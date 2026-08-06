@@ -1,7 +1,7 @@
 import { stat } from "node:fs/promises";
 import { Inject, Injectable } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { openMediaResponse } from "../../media/media-response";
 import { nextCursorFrom } from "../query/cdr-cursor";
 import { CdrCursorError } from "../query/cdr-cursor";
@@ -30,7 +30,7 @@ import type { CdrEnv } from "../shared/cdr-env";
 import type { AppSession } from "@optimiq-voice/auth";
 import type { CdrDatabaseClient } from "@optimiq-voice/cdr-db";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.cdr");
 
 export interface RecordingListEnvelope {
 	readonly data: readonly RecordingListRow[];
@@ -213,10 +213,13 @@ export class RecordingsService {
 
 		const path = resolveRecordingObjectPath(this.env.CDR_RECORDING_ROOT, row.objectKey);
 		if (path === undefined) {
-			logger.error("a recording object key resolves outside the recording root", {
-				recordingId: row.id,
-				objectKey: row.objectKey,
-			});
+			logger.error(
+				{
+					recordingId: row.id,
+					objectKey: row.objectKey,
+				},
+				"a recording object key resolves outside the recording root",
+			);
 			throw new CdrLinkInvalidException();
 		}
 

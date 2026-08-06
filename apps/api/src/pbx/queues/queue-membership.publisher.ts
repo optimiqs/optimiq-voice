@@ -3,7 +3,7 @@ import { connect, type JetStreamManager, type KV, type NatsConnection } from "na
 import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import { queueMembershipSchema } from "@optimiq-voice/events/schemas";
 import { ensureKvBuckets, kvKeyFor, QUEUE_MEMBERSHIP_KV } from "@optimiq-voice/events/streams";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { extension, queue, queueAgent, queueTier } from "@optimiq-voice/pbx-db";
 import { PBX_DATABASE, PBX_ENV } from "../shared/pbx.tokens";
 import {
@@ -16,7 +16,7 @@ import type { PbxEnv } from "../shared/pbx-env";
 import type { QueueMembership } from "@optimiq-voice/events/schemas";
 import type { PbxDatabaseClient, PbxDatabaseTransaction } from "@optimiq-voice/pbx-db";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /**
  * The `queue-membership` KV half of the NATS backbone: **who answers this queue, and how is each of
@@ -119,10 +119,10 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 				await ensureKvBuckets(manager, [QUEUE_MEMBERSHIP_KV]);
 			}
 			this.bucket = await manager.jetstream().views.kv(QUEUE_MEMBERSHIP_KV.name);
-			logger.info("queue-membership KV bucket ready", { bucket: QUEUE_MEMBERSHIP_KV.name });
+			logger.info({ bucket: QUEUE_MEMBERSHIP_KV.name }, "queue-membership KV bucket ready");
 		} catch (error) {
 			this.failed += 1;
-			logger.error("could not open the queue-membership KV bucket", error);
+			logger.error({ err: error }, "could not open the queue-membership KV bucket");
 		}
 	}
 
@@ -198,9 +198,9 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 		for (const seat of unreachable) {
 			this.dropped += 1;
 			logger.error(
+				{ organizationId, ...seat },
 				"an agent was left out of a queue roster because there is no way to dial them; the " +
 					"engine would ring nothing and penalise them for not answering",
-				{ organizationId, ...seat },
 			);
 		}
 
@@ -218,11 +218,14 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 				// engine could ever act on it. Logged rather than thrown: one unusable row must not stop
 				// the other queues from being published.
 				this.failed += 1;
-				logger.error("skipping a queue that has no queue-membership key", {
-					organizationId,
-					queueId: membership.queueId,
-					error,
-				});
+				logger.error(
+					{
+						organizationId,
+						queueId: membership.queueId,
+						error,
+					},
+					"skipping a queue that has no queue-membership key",
+				);
 				continue;
 			}
 			wanted.set(key, membership);
@@ -241,7 +244,7 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 				published += 1;
 			} catch (error) {
 				this.failed += 1;
-				logger.error("failed to write a queue-membership entry", { key, organizationId, error });
+				logger.error({ key, organizationId, error }, "failed to write a queue-membership entry");
 			}
 		}
 
@@ -255,7 +258,7 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 				deleted += 1;
 			} catch (error) {
 				this.failed += 1;
-				logger.error("failed to delete a queue-membership entry", { key, organizationId, error });
+				logger.error({ key, organizationId, error }, "failed to delete a queue-membership entry");
 			}
 		}
 
@@ -271,7 +274,7 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 		try {
 			return await readEntry(bucket, kvKeyFor.queueMembership(organizationId, queueId));
 		} catch (error) {
-			logger.error("failed to read a queue-membership entry", { organizationId, queueId, error });
+			logger.error({ organizationId, queueId, error }, "failed to read a queue-membership entry");
 			return undefined;
 		}
 	}
@@ -293,7 +296,7 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 		try {
 			keys = await collect(await bucket.keys(`${organizationId}.*`));
 		} catch (error) {
-			logger.warn("could not list queue-membership keys", { organizationId, error });
+			logger.warn({ organizationId, error }, "could not list queue-membership keys");
 			return found;
 		}
 		for (const key of keys) {
@@ -404,7 +407,7 @@ async function readEntry(bucket: KV, key: string): Promise<QueueMembership | und
 	try {
 		return queueMembershipSchema.parse(JSON.parse(new TextDecoder().decode(value.value)));
 	} catch {
-		logger.warn("discarding an unreadable queue-membership entry", { key });
+		logger.warn({ key }, "discarding an unreadable queue-membership entry");
 		return undefined;
 	}
 }

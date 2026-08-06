@@ -1,5 +1,5 @@
 import { Inject, Injectable, type OnApplicationShutdown } from "@nestjs/common";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { createMailTransport } from "./mail-transport";
 import { MAIL_ENV } from "./mail.tokens";
 import type { MailEnv } from "./mail-env";
@@ -11,7 +11,7 @@ import type {
 	MailTransportKind,
 } from "./mail-transport";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.mail");
 
 /** The default product name every template falls back to when nothing sets one. */
 export const DEFAULT_MAIL_APP_NAME = "Optimiq Voice";
@@ -52,12 +52,15 @@ export class Mailer implements OnApplicationShutdown {
 					"fallback; a NODE_ENV=production process refuses to boot into it.",
 			);
 		} else {
-			logger.info("SMTP mail transport ready", {
-				host: env.host,
-				port: env.port,
-				secure: env.secure,
-				authenticated: env.user !== undefined,
-			});
+			logger.info(
+				{
+					host: env.host,
+					port: env.port,
+					secure: env.secure,
+					authenticated: env.user !== undefined,
+				},
+				"SMTP mail transport ready",
+			);
 		}
 	}
 
@@ -90,11 +93,14 @@ export class Mailer implements OnApplicationShutdown {
 			this.failed += 1;
 			// The SUBJECT and the recipient, never the body: a body carries the one-time link, and an
 			// error path is exactly where a log ends up somewhere it was not meant to.
-			logger.error("failed to send a message", {
-				to: message.to,
-				subject: message.subject,
-				error,
-			});
+			logger.error(
+				{
+					to: message.to,
+					subject: message.subject,
+					error,
+				},
+				"failed to send a message",
+			);
 			return { delivered: false, transport: this.transport.kind };
 		}
 	}

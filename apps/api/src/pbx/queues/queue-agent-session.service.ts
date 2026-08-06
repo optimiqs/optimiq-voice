@@ -7,7 +7,7 @@ import {
 	type AgentStateEntry,
 	type AgentStatus,
 } from "@optimiq-voice/events/schemas";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { eq, queueAgent, queueTier } from "@optimiq-voice/pbx-db";
 import { PBX_DATABASE } from "../shared/pbx.tokens";
 import { AgentStatePublisher, AgentStateUnavailableError } from "./agent-state.publisher";
@@ -20,7 +20,7 @@ import {
 import type { AppSession } from "@optimiq-voice/auth";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /**
  * Agent availability: the shift half of the ACD state machine, which the engine refuses to write.
@@ -152,15 +152,18 @@ export class QueueAgentSessionService {
 
 		await this.rememberStatus(organizationId, agentId, plan.to, entry.since);
 
-		logger.info("agent session action applied", {
-			organizationId,
-			agentId,
-			action,
-			from,
-			to: plan.to,
-			actor: session.user.id,
-			self: row.userId === session.user.id,
-		});
+		logger.info(
+			{
+				organizationId,
+				agentId,
+				action,
+				from,
+				to: plan.to,
+				actor: session.user.id,
+				self: row.userId === session.user.id,
+			},
+			"agent session action applied",
+		);
 
 		return {
 			data: await this.viewOf(organizationId, row, session, entry),
@@ -246,9 +249,9 @@ export class QueueAgentSessionService {
 			});
 		} catch (error) {
 			logger.warn(
+				{ organizationId, agentId, status, error },
 				"the agent's live state was updated but the persisted last-known status was not; a " +
 					"wallboard will show the old value until its KV watch warms up",
-				{ organizationId, agentId, status, error },
 			);
 		}
 	}

@@ -3,7 +3,7 @@ import { Inject, Injectable, UnprocessableEntityException } from "@nestjs/common
 import { HttpStatus } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { createEntityId } from "@optimiq-voice/identifiers";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import {
 	TELNYX_REGISTER_EXPIRES_SECONDS,
 	TelnyxTransportError,
@@ -23,7 +23,7 @@ import type { CarrierEnv } from "./carrier-env";
 import type { ProvisionTrunkBody, SearchAvailableNumbersQuery } from "./carrier.dto";
 import type { AppSession } from "@optimiq-voice/auth";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /**
  * The carrier slice's domain logic: the part that knows what an organization is.
@@ -228,7 +228,7 @@ export class CarrierService {
 				total: result.totalResults ?? result.data.length,
 			};
 		} catch (error) {
-			logger.warn("carrier number search failed", { error });
+			logger.warn({ error }, "carrier number search failed");
 			throw toCarrierException(error, "the number search");
 		}
 	}
@@ -278,21 +278,27 @@ export class CarrierService {
 				// retry: retrying is how one order becomes two, and two DIDs are two monthly bills.
 				const reconciled = await this.reconcileOrder(client, customerReference);
 				if (reconciled === undefined) {
-					logger.error("carrier order outcome unknown", {
-						organizationId,
-						customerReference,
-						error,
-					});
+					logger.error(
+						{
+							organizationId,
+							customerReference,
+							error,
+						},
+						"carrier order outcome unknown",
+					);
 					throw toCarrierException(error, "the number order");
 				}
-				logger.warn("carrier order reconciled after a transport failure", {
-					organizationId,
-					customerReference,
-					orderId: reconciled.id,
-				});
+				logger.warn(
+					{
+						organizationId,
+						customerReference,
+						orderId: reconciled.id,
+					},
+					"carrier order reconciled after a transport failure",
+				);
 				order = reconciled;
 			} else {
-				logger.warn("carrier order refused", { organizationId, error });
+				logger.warn({ organizationId, error }, "carrier order refused");
 				throw toCarrierException(error, "the number order");
 			}
 		}
@@ -314,12 +320,15 @@ export class CarrierService {
 				carrierProvider: "telnyx",
 				carrierRef: carrierNumberId,
 			});
-			logger.info("carrier number ordered", {
-				organizationId,
-				e164: body.e164,
-				carrierRef: carrierNumberId,
-				orderId: order.id,
-			});
+			logger.info(
+				{
+					organizationId,
+					e164: body.e164,
+					carrierRef: carrierNumberId,
+					orderId: order.id,
+				},
+				"carrier number ordered",
+			);
 			return {
 				...created,
 				carrier: {
@@ -347,7 +356,7 @@ export class CarrierService {
 			const orders = await client.numberOrders.findByCustomerReference(customerReference);
 			return orders[0];
 		} catch (error) {
-			logger.error("carrier order reconciliation failed", { customerReference, error });
+			logger.error({ customerReference, error }, "carrier order reconciliation failed");
 			return undefined;
 		}
 	}
@@ -389,15 +398,18 @@ export class CarrierService {
 	): Promise<void> {
 		try {
 			await client.phoneNumbers.release(carrierRef);
-			logger.warn("carrier number released after a failed local write", {
-				organizationId,
-				e164,
-				carrierRef,
-			});
+			logger.warn(
+				{
+					organizationId,
+					e164,
+					carrierRef,
+				},
+				"carrier number released after a failed local write",
+			);
 		} catch (error) {
 			logger.error(
-				"ORPHANED CARRIER NUMBER — bought but neither recorded nor released; release it by hand",
 				{ organizationId, e164, carrierRef, error },
+				"ORPHANED CARRIER NUMBER — bought but neither recorded nor released; release it by hand",
 			);
 		}
 	}
@@ -444,25 +456,31 @@ export class CarrierService {
 				code: "carrier-release-skipped",
 				message: `${row.e164 as string} was removed here, but this deployment has no carrier configured, so it was not released at Telnyx. It is still being billed.`,
 			};
-			logger.error("carrier-managed number deleted with no carrier configured", {
-				organizationId,
-				carrierRef,
-			});
+			logger.error(
+				{
+					organizationId,
+					carrierRef,
+				},
+				"carrier-managed number deleted with no carrier configured",
+			);
 			return { ...removed, warnings: [...removed.warnings, warning] };
 		}
 
 		try {
 			await this.telnyx.phoneNumbers.release(carrierRef);
-			logger.info("carrier number released", {
-				organizationId,
-				e164: row.e164,
-				carrierRef,
-			});
+			logger.info(
+				{
+					organizationId,
+					e164: row.e164,
+					carrierRef,
+				},
+				"carrier number released",
+			);
 			return removed;
 		} catch (error) {
 			logger.error(
-				"ORPHANED CARRIER NUMBER — deleted here but not released upstream; release it by hand",
 				{ organizationId, e164: row.e164, carrierRef, error },
+				"ORPHANED CARRIER NUMBER — deleted here but not released upstream; release it by hand",
 			);
 			const warning: WireDiagnostic = {
 				severity: "warning",
@@ -580,13 +598,16 @@ export class CarrierService {
 				carrierProfileRef: profile.id,
 			});
 
-			logger.info("trunk provisioned with telnyx", {
-				organizationId,
-				trunkId,
-				connectionId: connection.id,
-				outboundVoiceProfileId: profile.id,
-				reprovisioned: existingConnectionId !== undefined,
-			});
+			logger.info(
+				{
+					organizationId,
+					trunkId,
+					connectionId: connection.id,
+					outboundVoiceProfileId: profile.id,
+					reprovisioned: existingConnectionId !== undefined,
+				},
+				"trunk provisioned with telnyx",
+			);
 
 			return {
 				...updated,
@@ -603,7 +624,7 @@ export class CarrierService {
 				},
 			};
 		} catch (error) {
-			logger.warn("trunk provisioning failed", { organizationId, trunkId, error });
+			logger.warn({ organizationId, trunkId, error }, "trunk provisioning failed");
 			throw toCarrierException(error, "trunk provisioning");
 		}
 	}

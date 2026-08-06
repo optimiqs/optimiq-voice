@@ -1,11 +1,11 @@
 import { Transport } from "@nestjs/microservices";
 import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import { RPC_SUBJECTS } from "@optimiq-voice/events/subjects";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { isPbxSliceConfigured, loadPbxEnv } from "./shared/pbx-env";
 import type { INestApplication } from "@nestjs/common";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 export { isPbxSliceConfigured as isPbxAreaEnabled };
 
@@ -48,7 +48,7 @@ export async function registerPbxTransport(app: INestApplication): Promise<boole
 		{ inheritAppConfig: true },
 	);
 	await app.startAllMicroservices();
-	logger.info(`serving ${RPC_SUBJECTS.routingResolve} over NATS`, { servers: env.NATS_URL });
+	logger.info({ servers: env.NATS_URL }, `serving ${RPC_SUBJECTS.routingResolve} over NATS`);
 	return true;
 }
 
@@ -123,7 +123,7 @@ export async function registerPbxMultipart(
 		 */
 		throwFileSizeLimit: false,
 	});
-	logger.info("media uploads enabled", { maxUploadBytes });
+	logger.info({ maxUploadBytes }, "media uploads enabled");
 }
 
 /** The two methods of the Fastify instance this module uses. See {@link registerPbxMultipart}. */

@@ -2,7 +2,7 @@ import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } fro
 import { connect, type NatsConnection } from "nats";
 import { callLegs, withCdrWriterScope } from "@optimiq-voice/cdr-db";
 import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { CDR_DATABASE, CDR_ENV } from "../shared/cdr.tokens";
 import { mapCdrLegWrite } from "./cdr-leg-mapping";
 import { CdrPartitionCache } from "./cdr-partition-cache";
@@ -17,7 +17,7 @@ import {
 import type { CdrEnv } from "../shared/cdr-env";
 import type { CdrDatabaseClient } from "@optimiq-voice/cdr-db";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.cdr");
 
 /** The durable this consumer binds to. Named, so a redeploy resumes rather than replays. */
 const DURABLE = "cdr-leg-writer";
@@ -142,7 +142,7 @@ export class CdrLegWriter implements OnModuleInit, OnApplicationShutdown {
 			// Fire-and-forget: the consume loop is long-lived and awaiting it here would never return.
 			void this.run();
 		} catch (error) {
-			logger.error("could not connect the CDR leg writer", error);
+			logger.error({ err: error }, "could not connect the CDR leg writer");
 		}
 	}
 
@@ -168,7 +168,7 @@ export class CdrLegWriter implements OnModuleInit, OnApplicationShutdown {
 			const manager = await connection.jetstreamManager();
 			await ensureStreams(manager, [CDR_STREAM]);
 		} catch (error) {
-			logger.error("could not ensure the CDR stream", error);
+			logger.error({ err: error }, "could not ensure the CDR stream");
 		}
 		await ensureDurableConsumer(connection, {
 			streamName: CDR_STREAM.name,
@@ -182,14 +182,17 @@ export class CdrLegWriter implements OnModuleInit, OnApplicationShutdown {
 			// day does not pay for a `CREATE TABLE`.
 			await this.warmPartitions();
 		} catch (error) {
-			logger.error("could not warm the CDR partition horizon; it will be ensured per leg", error);
+			logger.error(
+				{ err: error },
+				"could not warm the CDR partition horizon; it will be ensured per leg",
+			);
 		}
 
 		try {
 			const consumer = await connection.jetstream().consumers.get(CDR_STREAM.name, DURABLE);
 			const messages = await consumer.consume();
 			this.running = true;
-			logger.info("CDR leg writer running", { durable: DURABLE, stream: CDR_STREAM.name });
+			logger.info({ durable: DURABLE, stream: CDR_STREAM.name }, "CDR leg writer running");
 			for await (const message of messages) {
 				if (this.stopped) {
 					break;
@@ -198,7 +201,7 @@ export class CdrLegWriter implements OnModuleInit, OnApplicationShutdown {
 			}
 		} catch (error) {
 			if (!this.stopped) {
-				logger.error("the CDR leg writer stopped", error);
+				logger.error({ err: error }, "the CDR leg writer stopped");
 			}
 		}
 		this.running = false;
@@ -282,11 +285,14 @@ export class CdrLegWriter implements OnModuleInit, OnApplicationShutdown {
 		}
 		if (mapped.coercions.length > 0) {
 			this.coerced += 1;
-			logger.warn("a CDR leg needed coercion to fit the reporting schema", {
-				legId: mapped.values.id,
-				orgId: envelope.orgId,
-				coercions: mapped.coercions,
-			});
+			logger.warn(
+				{
+					legId: mapped.values.id,
+					orgId: envelope.orgId,
+					coercions: mapped.coercions,
+				},
+				"a CDR leg needed coercion to fit the reporting schema",
+			);
 		}
 
 		try {
@@ -310,12 +316,15 @@ export class CdrLegWriter implements OnModuleInit, OnApplicationShutdown {
 				return;
 			}
 			this.retried += 1;
-			logger.error("failed to file a CDR leg; it will be redelivered", {
-				legId: mapped.values.id,
-				subject: message.subject,
-				delivery: deliveries,
-				error,
-			});
+			logger.error(
+				{
+					legId: mapped.values.id,
+					subject: message.subject,
+					delivery: deliveries,
+					error,
+				},
+				"failed to file a CDR leg; it will be redelivered",
+			);
 			message.nak(redeliveryDelayMs(deliveries));
 		}
 	}

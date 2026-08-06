@@ -1,5 +1,5 @@
 import { Inject, Module, type OnApplicationShutdown } from "@nestjs/common";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { CdrController } from "./query/cdr.controller";
 import { CdrService } from "./query/cdr.service";
 import { CdrRecordingsController } from "./recordings/recordings.controller";
@@ -12,7 +12,7 @@ import { CdrRecordingWriter } from "./writer/recording-writer.service";
 import type { CdrEnv } from "./shared/cdr-env";
 import type { CdrDatabaseClient } from "@optimiq-voice/cdr-db";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.cdr");
 
 /**
  * The CDR area — reporting reads, and the durable writers that fill the ledger.

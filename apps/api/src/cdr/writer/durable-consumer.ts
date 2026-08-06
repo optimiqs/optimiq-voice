@@ -1,8 +1,8 @@
 import { AckPolicy, DeliverPolicy } from "nats";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import type { NatsConnection } from "nats";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.cdr");
 
 /**
  * The bits of JetStream both CDR writers need, in one place.
@@ -83,11 +83,14 @@ export async function ensureDurableConsumer(
 		});
 	} catch (error) {
 		if (!/consumer already exists/iu.test(String(error))) {
-			logger.error("could not create a CDR durable consumer", {
-				stream: spec.streamName,
-				durable: spec.durable,
-				error,
-			});
+			logger.error(
+				{
+					stream: spec.streamName,
+					durable: spec.durable,
+					error,
+				},
+				"could not create a CDR durable consumer",
+			);
 		}
 	}
 }

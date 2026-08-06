@@ -1,5 +1,5 @@
 import { Module } from "@nestjs/common";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { PbxModule } from "../pbx/pbx.module";
 import { ProvisioningCatalogController } from "./catalog/catalog.controller";
 import { DevicesController, DeviceProfilesController } from "./devices/devices.controller";
@@ -19,7 +19,7 @@ import { ProvisionRepository } from "./render/provision.repository";
 import { ProvisionService } from "./render/provision.service";
 import type { ProvisioningEnv } from "./provisioning-env";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.provisioning");
 
 /**
  * Device provisioning: the MAC-addressed inventory, the vendor catalogue, and the one endpoint a

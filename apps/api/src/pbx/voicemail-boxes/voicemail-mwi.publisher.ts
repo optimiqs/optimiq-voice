@@ -1,13 +1,13 @@
 import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
 import { connect, type NatsConnection } from "nats";
 import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { eq, sql, voicemailMessage } from "@optimiq-voice/pbx-db";
 import { PBX_ENV } from "../shared/pbx.tokens";
 import type { PbxEnv } from "../shared/pbx-env";
 import type { PbxDatabaseTransaction } from "@optimiq-voice/pbx-db";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /** What the lamp is driven by. Absolute, never a delta. */
 export interface MailboxCounts {
@@ -74,7 +74,7 @@ export class VoicemailMwiPublisher implements OnModuleInit, OnApplicationShutdow
 			});
 		} catch (error) {
 			this.failed += 1;
-			logger.error("could not connect the MWI publisher", error);
+			logger.error({ err: error }, "could not connect the MWI publisher");
 		}
 	}
 
@@ -123,7 +123,7 @@ export class VoicemailMwiPublisher implements OnModuleInit, OnApplicationShutdow
 			return true;
 		} catch (error) {
 			this.failed += 1;
-			logger.error("failed to publish an MWI update", { mailboxId, reason, error });
+			logger.error({ mailboxId, reason, error }, "failed to publish an MWI update");
 			return false;
 		}
 	}

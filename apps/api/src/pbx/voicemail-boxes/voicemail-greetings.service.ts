@@ -1,7 +1,7 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { createEntityId } from "@optimiq-voice/identifiers";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { and, asc, eq, voicemailBox, voicemailGreeting } from "@optimiq-voice/pbx-db";
 import { buildObjectKey, deleteMediaObject, writeMediaObject } from "../media/media-storage";
 import { mediaPathFor, mintMediaToken, verifyMediaToken } from "../media/media-token";
@@ -34,7 +34,7 @@ import type {
 	VoicemailGreetingKind,
 } from "@optimiq-voice/pbx-db";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /**
  * A mailbox's recorded greetings.
@@ -405,7 +405,10 @@ export class VoicemailGreetingsService {
 		this.publisher
 			.publish(result.compiled.cacheKey, result.compiled.artifact)
 			.catch((cause: unknown) => {
-				logger.error(`routing cache publish failed for ${result.compiled.cacheKey}`, cause);
+				logger.error(
+					{ err: cause },
+					`routing cache publish failed for ${result.compiled.cacheKey}`,
+				);
 			});
 
 		return result;
@@ -413,7 +416,7 @@ export class VoicemailGreetingsService {
 
 	private async unlink(objectKey: string): Promise<void> {
 		await deleteMediaObject(this.env.PBX_MEDIA_OBJECT_ROOT, objectKey).catch((cause: unknown) => {
-			logger.error("could not unlink a greeting's audio", { objectKey, cause });
+			logger.error({ objectKey, cause }, "could not unlink a greeting's audio");
 		});
 	}
 }

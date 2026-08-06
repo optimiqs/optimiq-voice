@@ -1,6 +1,6 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { and, desc, eq, inArray, sql, voicemailBox, voicemailMessage } from "@optimiq-voice/pbx-db";
 import { openMediaResponse } from "../../media/media-response";
 import { mediaObjectSize } from "../media/media-storage";
@@ -33,7 +33,7 @@ import type {
 	VoicemailFolder,
 } from "@optimiq-voice/pbx-db";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /**
  * The messages in a mailbox — the read model behind both the web UI and the `*97` menu.
@@ -282,10 +282,13 @@ export class VoicemailMessagesService {
 
 		const path = resolveVoicemailObjectPath(this.env.PBX_VOICEMAIL_MEDIA_ROOT, row.objectKey);
 		if (path === undefined) {
-			logger.error("a voicemail object key resolves outside the media root", {
-				messageId: row.id,
-				objectKey: row.objectKey,
-			});
+			logger.error(
+				{
+					messageId: row.id,
+					objectKey: row.objectKey,
+				},
+				"a voicemail object key resolves outside the media root",
+			);
 			throw new VoicemailLinkInvalidException();
 		}
 
@@ -354,11 +357,14 @@ export class VoicemailMessagesService {
 			if (box.mailboxNumber !== request.mailboxNumber) {
 				// Logged as an ERROR rather than a warning: every legitimate caller has the box id and
 				// the number from the same row, so a mismatch is either a bug or an attempt.
-				logger.error("refusing a voicemail listing whose mailbox number does not match the box", {
-					orgId: request.orgId,
-					voicemailBoxId: request.voicemailBoxId,
-					claimed: request.mailboxNumber,
-				});
+				logger.error(
+					{
+						orgId: request.orgId,
+						voicemailBoxId: request.voicemailBoxId,
+						claimed: request.mailboxNumber,
+					},
+					"refusing a voicemail listing whose mailbox number does not match the box",
+				);
 				return refuse("the mailbox number does not match this mailbox");
 			}
 			if (!box.enabled) {

@@ -10,41 +10,26 @@ services:
         # Both are compiled into the image rather than read at boot. Rebuild to change either.
         - API_PROXY_ORIGIN=${API_PROXY_ORIGIN:-http://api:9876}
         - NEXT_PUBLIC_AUTH_BASE_URL=${NEXT_PUBLIC_AUTH_BASE_URL:-}
-    ports:
-      - 3100:3100
+    # `ports` moved to compose.yaml: `web` is the stack's ingress now that `envoy` is gone, so the
+    # publication belongs in the shipped file rather than the development override.
 
   api:
     build:
       context: .
       dockerfile: ./apps/api/Dockerfile
-    volumes:
-      - ./.keys:/opt/optimiq-voice/keys
-    # The legacy gRPC listener (:50051) is NOT published to the host, and must not be.
+    # No `./.keys` mount and no gRPC port.
     #
-    # It is the identity-era surface: it terminates plaintext h2c (`getServerCredentials` returns
-    # insecure credentials unless a certificate is mounted), it fronts the legacy identity handlers,
-    # and its `createAuthInterceptor` verifies a token the same process signs. Publishing it put a
-    # credential oracle on 0.0.0.0:50051 of every developer machine and of anything that ran this
-    # file — reachable from the LAN, from a container on a shared bridge, and from any process on
-    # the box, with no TLS to make interception visible.
+    # The keypair mount existed because `src/envs.ts` read `private.pem` / `public.pem` at import
+    # time to sign identity tokens; that read is gone, and so is the RS256 signing path.
     #
-    # The port stays open INSIDE the compose network (`expose: 50051` in compose.yaml), because two
-    # services still dial it there: `envoy`'s `api-cluster` and `autopilot`'s
-    # `AUTOPILOT_API_ENDPOINT` (default `api:50051`). Both are compose-internal, so removing the
-    # publication costs nothing they need. Reaching it from the host is `docker compose exec` or a
-    # deliberate `docker compose run --publish`, which is the point: it becomes a decision.
-    #
-    # The whole listener dies with the legacy identity service in a later phase; until then this is
-    # the boundary.
+    # The gRPC listener on :50051 is gone too. It was never published to the host — it terminated
+    # plaintext h2c and its interceptor verified a token the same process signed, so publishing it
+    # would have put a credential oracle on 0.0.0.0 of every developer machine — and now the
+    # listener itself does not exist. `API_ROUTR_API_ENDPOINT` went with it: nothing in this app
+    # provisions Routr any more.
     environment:
-      - API_ROUTR_API_ENDPOINT
       - API_SMTP_PORT
       - API_SMTP_SECURE
-
-  autopilot:
-    build:
-      context: .
-      dockerfile: ./apps/autopilot/Dockerfile
 
   routr:
     ports:
@@ -125,12 +110,6 @@ services:
   influxdb:
     ports:
       - 8086:8086
-
-  envoy:
-    extra_hosts:
-      api: ${DOCKER_HOST_ADDRESS}
-    environment:
-      - loglevel=debug
 
   nats:
     ports:

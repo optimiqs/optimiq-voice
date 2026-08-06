@@ -1,12 +1,12 @@
 import { Module } from "@nestjs/common";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { AuthModule } from "../auth/auth.module";
 import { PbxModule } from "../pbx/pbx.module";
 import { LiveGateway } from "./live-gateway";
 import { LiveHub } from "./live-hub.service";
 import { LIVE_PATH } from "./live-protocol";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.live");
 
 /**
  * The live-operations channel.

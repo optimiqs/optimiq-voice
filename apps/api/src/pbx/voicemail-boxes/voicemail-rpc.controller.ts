@@ -2,12 +2,12 @@ import { Controller, Inject } from "@nestjs/common";
 import { MessagePattern, Payload } from "@nestjs/microservices";
 import { voicemailListRequestSchema } from "@optimiq-voice/events/schemas";
 import { RPC_SUBJECTS } from "@optimiq-voice/events/subjects";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { PublicRoute } from "../../auth/public-route.decorator";
 import { VoicemailMessagesService } from "./voicemail-messages.service";
 import type { BrokerListReply } from "./voicemail-messages.service";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /**
  * The `rpc.voicemail.v1.list` responder — the other end of the engine's `*97` menu.
@@ -56,7 +56,7 @@ export class VoicemailRpcController {
 			const reason = parsed.error.issues
 				.map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
 				.join("; ");
-			logger.warn("rejected a malformed rpc.voicemail.v1.list request", { reason });
+			logger.warn({ reason }, "rejected a malformed rpc.voicemail.v1.list request");
 			return refuse(reason);
 		}
 
@@ -70,11 +70,14 @@ export class VoicemailRpcController {
 			});
 		} catch (error) {
 			// A failure must not become a broker-level timeout: the caller is connected and waiting.
-			logger.error("rpc.voicemail.v1.list failed", {
-				orgId: parsed.data.orgId,
-				voicemailBoxId: parsed.data.voicemailBoxId,
-				error,
-			});
+			logger.error(
+				{
+					orgId: parsed.data.orgId,
+					voicemailBoxId: parsed.data.voicemailBoxId,
+					error,
+				},
+				"rpc.voicemail.v1.list failed",
+			);
 			return refuse(
 				`voicemail listing failed: ${error instanceof Error ? error.message : String(error)}`,
 			);

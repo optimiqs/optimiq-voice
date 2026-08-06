@@ -10,12 +10,12 @@ import {
 	QUEUES_STREAM,
 } from "@optimiq-voice/events/streams";
 import { QUEUE_SCOPE_ALL } from "@optimiq-voice/events/subjects";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { PBX_ENV } from "../shared/pbx.tokens";
 import type { PbxEnv } from "../shared/pbx-env";
 import type { AgentStateEntry, AgentStatus } from "@optimiq-voice/events/schemas";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /**
  * The control plane's half of the `agent-state` bucket: the shift transitions the engine refuses.
@@ -99,10 +99,10 @@ export class AgentStatePublisher implements OnModuleInit, OnApplicationShutdown 
 				await ensureStreams(manager, [QUEUES_STREAM]);
 			}
 			this.bucket = await manager.jetstream().views.kv(AGENT_STATE_KV.name);
-			logger.info("agent-state KV bucket ready", { bucket: AGENT_STATE_KV.name });
+			logger.info({ bucket: AGENT_STATE_KV.name }, "agent-state KV bucket ready");
 		} catch (error) {
 			this.failed += 1;
-			logger.error("could not open the agent-state KV bucket", error);
+			logger.error({ err: error }, "could not open the agent-state KV bucket");
 		}
 	}
 
@@ -131,17 +131,20 @@ export class AgentStatePublisher implements OnModuleInit, OnApplicationShutdown 
 				// The same tenancy check `QueueMembershipSource` draws for rosters: a value naming one
 				// organization under another's key is a bug, and acting on it would show one tenant's
 				// agent as another's.
-				logger.error("discarding an agent-state entry filed under another agent's key", {
-					organizationId,
-					agentId,
-					entryOrgId: entry.orgId,
-					entryAgentId: entry.agentId,
-				});
+				logger.error(
+					{
+						organizationId,
+						agentId,
+						entryOrgId: entry.orgId,
+						entryAgentId: entry.agentId,
+					},
+					"discarding an agent-state entry filed under another agent's key",
+				);
 				return undefined;
 			}
 			return entry;
 		} catch (error) {
-			logger.warn("could not read an agent-state entry", { organizationId, agentId, error });
+			logger.warn({ organizationId, agentId, error }, "could not read an agent-state entry");
 			return undefined;
 		}
 	}
@@ -188,11 +191,14 @@ export class AgentStatePublisher implements OnModuleInit, OnApplicationShutdown 
 		// bare `void` would turn NATS's CONNECTION_DRAINING at shutdown into an unhandled rejection.
 		this.publishTransition(entry, input.queueIds).catch((cause) => {
 			this.failed += 1;
-			logger.error("agent.state publish failed", {
-				organizationId: input.organizationId,
-				agentId: input.agentId,
-				cause,
-			});
+			logger.error(
+				{
+					organizationId: input.organizationId,
+					agentId: input.agentId,
+					cause,
+				},
+				"agent.state publish failed",
+			);
 		});
 
 		return entry;

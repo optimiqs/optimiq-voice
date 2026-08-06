@@ -1,5 +1,5 @@
 import { Inject, Module, type OnApplicationShutdown } from "@nestjs/common";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { CarrierWebhookController } from "./carrier/carrier-webhook.controller";
 import { CarrierController, CarrierTrunkController } from "./carrier/carrier.controller";
 import { carrierProviders } from "./carrier/carrier.providers";
@@ -77,7 +77,7 @@ import { VoicemailRpcController } from "./voicemail-boxes/voicemail-rpc.controll
 import type { PbxEnv } from "./shared/pbx-env";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /**
  * The PBX area.
@@ -232,9 +232,9 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 					dischargeProjection(database.adminDb, organizationId, projection, cutoff).catch(
 						(cause) => {
 							logger.error(
+								cause,
 								`could not mark the ${projection} outbox row discharged for organization ` +
 									`${organizationId}; the sweeper will republish it`,
-								cause,
 							);
 						},
 					);
@@ -286,7 +286,10 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 								}
 							})
 							.catch((cause) => {
-								logger.error(`routing cache publish failed for ${compiled.cacheKey}`, cause);
+								logger.error(
+									{ err: cause },
+									`routing cache publish failed for ${compiled.cacheKey}`,
+								);
 							});
 						didIndex
 							.syncOrganization(compiled.artifact)
@@ -300,7 +303,7 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 								}
 							})
 							.catch((cause) => {
-								logger.error(`did-index sync failed for ${compiled.cacheKey}`, cause);
+								logger.error({ err: cause }, `did-index sync failed for ${compiled.cacheKey}`);
 							});
 					},
 					/**
@@ -331,9 +334,9 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 							})
 							.catch((cause) => {
 								logger.error(
+									cause,
 									`queue-membership sync failed for organization ${event.organizationId} ` +
 										`after a ${event.operation} on ${event.tableName}`,
-									cause,
 								);
 							});
 					},

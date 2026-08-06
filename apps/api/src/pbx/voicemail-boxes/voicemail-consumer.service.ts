@@ -1,7 +1,7 @@
 import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
 import { AckPolicy, connect, DeliverPolicy, type NatsConnection } from "nats";
 import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { eq, voicemailBox, voicemailMessage } from "@optimiq-voice/pbx-db";
 import { PBX_DATABASE, PBX_ENV } from "../shared/pbx.tokens";
 import { VoicemailEmailService } from "./voicemail-email.service";
@@ -10,7 +10,7 @@ import type { PbxEnv } from "../shared/pbx-env";
 import type { MailboxCounts } from "./voicemail-mwi.publisher";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /** The durable this consumer binds to. Named, so a redeploy resumes rather than replays. */
 const DURABLE = "pbx-voicemail-writer";
@@ -104,7 +104,7 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 			void this.run();
 		} catch (error) {
 			this.failed += 1;
-			logger.error("could not connect the voicemail consumer", error);
+			logger.error({ err: error }, "could not connect the voicemail consumer");
 		}
 	}
 
@@ -146,7 +146,7 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 			// `consumers.add` on an existing durable with identical config is a no-op; anything else
 			// here means the consumer cannot run, and saying so once is better than a silent loop.
 			if (!/consumer already exists/iu.test(String(error))) {
-				logger.error("could not create the voicemail durable consumer", error);
+				logger.error({ err: error }, "could not create the voicemail durable consumer");
 			}
 		}
 
@@ -154,7 +154,7 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 			const consumer = await connection.jetstream().consumers.get(VOICEMAIL_STREAM.name, DURABLE);
 			const messages = await consumer.consume();
 			this.running = true;
-			logger.info("voicemail consumer running", { durable: DURABLE });
+			logger.info({ durable: DURABLE }, "voicemail consumer running");
 			for await (const message of messages) {
 				if (this.stopped) {
 					break;
@@ -164,7 +164,7 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 		} catch (error) {
 			if (!this.stopped) {
 				this.failed += 1;
-				logger.error("the voicemail consumer stopped", error);
+				logger.error({ err: error }, "the voicemail consumer stopped");
 			}
 		}
 		this.running = false;
@@ -191,10 +191,13 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 		} catch (error) {
 			// Bytes that are not this contract will never become this contract. Terminating is the
 			// only way not to block every message behind them.
-			logger.error("terminating a voicemail message that is not readable as one", {
-				subject: message.subject,
-				error,
-			});
+			logger.error(
+				{
+					subject: message.subject,
+					error,
+				},
+				"terminating a voicemail message that is not readable as one",
+			);
 			message.term();
 			return;
 		}
@@ -206,10 +209,13 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 		if (envelope.subject !== message.subject) {
 			// The tenancy cross-check `validateEvent` would have made: an envelope whose own subject
 			// disagrees with the one it was delivered on could scope a write to the wrong tenant.
-			logger.error("terminating a voicemail message delivered on a foreign subject", {
-				subject: message.subject,
-				envelopeSubject: envelope.subject,
-			});
+			logger.error(
+				{
+					subject: message.subject,
+					envelopeSubject: envelope.subject,
+				},
+				"terminating a voicemail message delivered on a foreign subject",
+			);
 			message.term();
 			return;
 		}
@@ -224,10 +230,13 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 		try {
 			const counts = await this.file(envelope.orgId, mailboxId, data);
 			if (counts === undefined) {
-				logger.error("terminating a voicemail message for a mailbox that does not exist", {
-					subject: message.subject,
-					mailboxId,
-				});
+				logger.error(
+					{
+						subject: message.subject,
+						mailboxId,
+					},
+					"terminating a voicemail message for a mailbox that does not exist",
+				);
 				message.term();
 				return;
 			}
@@ -236,10 +245,13 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 			await this.notifyByEmail(envelope.orgId, mailboxId, data.messageId);
 		} catch (error) {
 			this.failed += 1;
-			logger.error("failed to file a voicemail message; it will be redelivered", {
-				subject: message.subject,
-				error,
-			});
+			logger.error(
+				{
+					subject: message.subject,
+					error,
+				},
+				"failed to file a voicemail message; it will be redelivered",
+			);
 			message.nak(5_000);
 		}
 	}
@@ -348,11 +360,14 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 		const outcome = await this.email.notify(organizationId, mailboxId, messageId);
 		if (outcome.outcome === "failed") {
 			// Already logged with the cause by the service; this records the message it belonged to.
-			logger.warn("a voicemail was filed but its notification could not be sent", {
-				organizationId,
-				mailboxId,
-				messageId,
-			});
+			logger.warn(
+				{
+					organizationId,
+					mailboxId,
+					messageId,
+				},
+				"a voicemail was filed but its notification could not be sent",
+			);
 		}
 	}
 }

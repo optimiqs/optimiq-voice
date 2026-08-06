@@ -16,12 +16,12 @@ import {
 	REGISTRATIONS_KV,
 } from "@optimiq-voice/events/streams";
 import { subjectFilterFor } from "@optimiq-voice/events/subjects";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { PBX_ENV } from "../pbx/shared/pbx.tokens";
 import type { PbxEnv } from "../pbx/shared/pbx-env";
 import type { LiveSource } from "./live-topics";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.live");
 
 /**
  * The upstream side of the live channel: one set of NATS watches and subscriptions per
@@ -110,9 +110,9 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 			for (const definition of [REGISTRATIONS_KV, CHANNELS_KV, AGENT_STATE_KV]) {
 				this.buckets.set(definition.name, await jetstream.views.kv(definition.name));
 			}
-			logger.info("live hub connected", { servers: this.env.NATS_URL });
+			logger.info({ servers: this.env.NATS_URL }, "live hub connected");
 		} catch (error) {
-			logger.error("the live hub could not reach the broker", error);
+			logger.error({ err: error }, "the live hub could not reach the broker");
 		}
 	}
 
@@ -192,7 +192,7 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 				}
 			}
 		} catch (error) {
-			logger.warn("could not read a live snapshot", { organizationId, source, error });
+			logger.warn({ organizationId, source, error }, "could not read a live snapshot");
 		}
 		return values;
 	}
@@ -239,7 +239,7 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 			this.startSubscription(organizationId, source, handle);
 		} catch (error) {
 			if (!this.stopped) {
-				logger.error("could not open a live upstream", { organizationId, source, error });
+				logger.error({ organizationId, source, error }, "could not open a live upstream");
 			}
 		}
 	}
@@ -296,7 +296,7 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 				}
 			} catch (error) {
 				if (!this.stopped) {
-					logger.warn("a live KV watch ended", { organizationId, source, error });
+					logger.warn({ organizationId, source, error }, "a live KV watch ended");
 				}
 			}
 		})();
@@ -335,7 +335,7 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 				}
 			} catch (error) {
 				if (!this.stopped) {
-					logger.warn("a live subscription ended", { organizationId, source, error });
+					logger.warn({ organizationId, source, error }, "a live subscription ended");
 				}
 			}
 		})();
@@ -360,7 +360,7 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 			decoded = JSON.parse(new TextDecoder().decode(value));
 		} catch {
 			this.dropped += 1;
-			logger.warn("dropping an unparseable live KV entry", { organizationId, source, key });
+			logger.warn({ organizationId, source, key }, "dropping an unparseable live KV entry");
 			return undefined;
 		}
 		const schema =
@@ -372,12 +372,15 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 		const result = schema.safeParse(decoded);
 		if (!result.success) {
 			this.dropped += 1;
-			logger.warn("dropping a live KV entry that does not match its contract", {
-				organizationId,
-				source,
-				key,
-				issues: result.error.issues.slice(0, 3).map((issue) => issue.message),
-			});
+			logger.warn(
+				{
+					organizationId,
+					source,
+					key,
+					issues: result.error.issues.slice(0, 3).map((issue) => issue.message),
+				},
+				"dropping a live KV entry that does not match its contract",
+			);
 			return undefined;
 		}
 		const entryOrg =
@@ -388,12 +391,15 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 					: undefined;
 		if (entryOrg !== organizationId) {
 			this.dropped += 1;
-			logger.error("refusing to fan out a live entry filed under another organization", {
-				organizationId,
-				source,
-				key,
-				entryOrg,
-			});
+			logger.error(
+				{
+					organizationId,
+					source,
+					key,
+					entryOrg,
+				},
+				"refusing to fan out a live entry filed under another organization",
+			);
 			return undefined;
 		}
 		return result.data;
@@ -415,11 +421,14 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 		const result = schema.safeParse(decoded);
 		if (!result.success) {
 			this.dropped += 1;
-			logger.warn("dropping a live event that does not match its contract", {
-				organizationId,
-				source,
-				issues: result.error.issues.slice(0, 3).map((issue) => issue.message),
-			});
+			logger.warn(
+				{
+					organizationId,
+					source,
+					issues: result.error.issues.slice(0, 3).map((issue) => issue.message),
+				},
+				"dropping a live event that does not match its contract",
+			);
 			return undefined;
 		}
 		if (result.data.orgId !== organizationId) {
@@ -427,11 +436,14 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 			// building a subject by hand. Checked anyway, at the one place cross-tenant delivery would
 			// be visible to a user.
 			this.dropped += 1;
-			logger.error("refusing to fan out an event filed under another organization", {
-				organizationId,
-				source,
-				eventOrg: result.data.orgId,
-			});
+			logger.error(
+				{
+					organizationId,
+					source,
+					eventOrg: result.data.orgId,
+				},
+				"refusing to fan out an event filed under another organization",
+			);
 			return undefined;
 		}
 		return result.data;
@@ -465,7 +477,7 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 				});
 			} catch (error) {
 				// One misbehaving sink must not stop the others, and must not kill the watch loop.
-				logger.warn("a live listener threw", { organizationId, source, error });
+				logger.warn({ organizationId, source, error }, "a live listener threw");
 			}
 		}
 	}

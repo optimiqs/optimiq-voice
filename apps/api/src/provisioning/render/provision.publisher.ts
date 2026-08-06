@@ -3,12 +3,12 @@ import { connect, type JetStreamManager, type NatsConnection } from "nats";
 import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import { makeProvisionEvent } from "@optimiq-voice/events/schemas";
 import { ensureStreams, PROVISION_STREAM } from "@optimiq-voice/events/streams";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { PBX_ENV } from "../../pbx/shared/pbx.tokens";
 import type { PbxEnv } from "../../pbx/shared/pbx-env";
 import type { ProvisionEvent, ProvisionEventDataOf } from "@optimiq-voice/events/schemas";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.provisioning");
 
 /**
  * `provision.evt.v1.<orgId>` — the security record of every configuration request.
@@ -81,10 +81,10 @@ export class ProvisionEventPublisher implements OnModuleInit, OnApplicationShutd
 				// "nothing happened".
 				await ensureStreams(manager, [PROVISION_STREAM]);
 			}
-			logger.info("provision event stream ready", { stream: PROVISION_STREAM.name });
+			logger.info({ stream: PROVISION_STREAM.name }, "provision event stream ready");
 		} catch (error) {
 			this.failed += 1;
-			logger.error("could not prepare the provision event stream", error);
+			logger.error({ err: error }, "could not prepare the provision event stream");
 		}
 	}
 
@@ -129,7 +129,7 @@ export class ProvisionEventPublisher implements OnModuleInit, OnApplicationShutd
 			return true;
 		} catch (error) {
 			this.failed += 1;
-			logger.error("provision event publish failed", { type, organizationId, error });
+			logger.error({ type, organizationId, error }, "provision event publish failed");
 			return false;
 		}
 	}

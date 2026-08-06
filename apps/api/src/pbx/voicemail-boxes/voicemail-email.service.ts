@@ -1,5 +1,5 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { eq, voicemailBox, voicemailMessage } from "@optimiq-voice/pbx-db";
 import { DEFAULT_MAIL_APP_NAME, Mailer, voicemailMail } from "../../mail";
 import { OrgSettingsService } from "../org-settings/org-settings.service";
@@ -8,7 +8,7 @@ import { mintVoicemailMediaToken, voicemailMediaPath } from "./voicemail-media-t
 import type { PbxEnv } from "../shared/pbx-env";
 import type { PbxDatabaseClient, VoicemailEmailMode } from "@optimiq-voice/pbx-db";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.pbx");
 
 /** Why a message was not emailed. Returned rather than thrown; every one of these is normal. */
 export type VoicemailEmailSkip =
@@ -101,12 +101,15 @@ export class VoicemailEmailService {
 			return await this.deliver(organizationId, mailboxId, messageId);
 		} catch (error) {
 			this.failed += 1;
-			logger.error("failed to send a voicemail notification", {
-				organizationId,
-				mailboxId,
-				messageId,
-				error,
-			});
+			logger.error(
+				{
+					organizationId,
+					mailboxId,
+					messageId,
+					error,
+				},
+				"failed to send a voicemail notification",
+			);
 			return { outcome: "failed" };
 		}
 	}
@@ -140,8 +143,8 @@ export class VoicemailEmailService {
 		}
 		if (context.emailMode === "attach") {
 			logger.debug(
-				"this mailbox asks for the audio as an attachment; sending a signed link instead",
 				{ organizationId, mailboxId },
+				"this mailbox asks for the audio as an attachment; sending a signed link instead",
 			);
 		}
 

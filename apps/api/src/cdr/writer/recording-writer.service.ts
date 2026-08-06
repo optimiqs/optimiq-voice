@@ -8,7 +8,7 @@ import {
 	withCdrWriterScope,
 } from "@optimiq-voice/cdr-db";
 import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { CDR_DATABASE, CDR_ENV } from "../shared/cdr.tokens";
 import { quarantineMessage } from "./cdr-quarantine";
 import {
@@ -21,7 +21,7 @@ import {
 import type { CdrEnv } from "../shared/cdr-env";
 import type { CdrDatabaseClient, RecordingKind } from "@optimiq-voice/cdr-db";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.cdr");
 
 const DURABLE = "cdr-recording-writer";
 const MAX_DELIVER = 5;
@@ -121,7 +121,7 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 			});
 			void this.run();
 		} catch (error) {
-			logger.error("could not connect the CDR recording writer", error);
+			logger.error({ err: error }, "could not connect the CDR recording writer");
 		}
 	}
 
@@ -146,7 +146,7 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 			const manager = await connection.jetstreamManager();
 			await ensureStreams(manager, [CALLS_STREAM]);
 		} catch (error) {
-			logger.error("could not ensure the CALLS stream", error);
+			logger.error({ err: error }, "could not ensure the CALLS stream");
 		}
 
 		/**
@@ -170,7 +170,7 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 			const consumer = await connection.jetstream().consumers.get(CALLS_STREAM.name, DURABLE);
 			const messages = await consumer.consume();
 			this.running = true;
-			logger.info("CDR recording writer running", { durable: DURABLE, stream: CALLS_STREAM.name });
+			logger.info({ durable: DURABLE, stream: CALLS_STREAM.name }, "CDR recording writer running");
 			for await (const message of messages) {
 				if (this.stopped) {
 					break;
@@ -179,7 +179,7 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 			}
 		} catch (error) {
 			if (!this.stopped) {
-				logger.error("the CDR recording writer stopped", error);
+				logger.error({ err: error }, "the CDR recording writer stopped");
 			}
 		}
 		this.running = false;
@@ -249,11 +249,14 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 				message.term();
 				return;
 			}
-			logger.error("failed to file recording metadata; it will be redelivered", {
-				subject: message.subject,
-				delivery: deliveries,
-				error,
-			});
+			logger.error(
+				{
+					subject: message.subject,
+					delivery: deliveries,
+					error,
+				},
+				"failed to file recording metadata; it will be redelivered",
+			);
 			message.nak(redeliveryDelayMs(deliveries));
 		}
 	}

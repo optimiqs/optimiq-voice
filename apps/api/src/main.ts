@@ -3,7 +3,7 @@ import { Type } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { FastifyAdapter, NestFastifyApplication } from "@nestjs/platform-fastify";
 import { assertTenantRlsPreflight } from "@optimiq-voice/db";
-import { getLogger } from "@optimiq-voice/logger";
+import { getLogger } from "@optimiq-voice/logging";
 import { AppModule } from "./app.module";
 import {
 	createApiRootModule,
@@ -22,7 +22,7 @@ import { isPbxAreaEnabled, registerPbxTransport } from "./pbx/pbx-bootstrap";
 import { PbxModule } from "./pbx/pbx.module";
 import { ProvisioningModule } from "./provisioning/provisioning.module";
 
-const logger = getLogger({ service: "api", filePath: import.meta.filename });
+const logger = getLogger("api.bootstrap");
 
 async function bootstrap() {
 	/**
@@ -39,10 +39,13 @@ async function bootstrap() {
 		API_TENANT_RLS_PLAN,
 		createApiTenantRlsIntrospector(DATABASE_URL),
 	);
-	logger.info("tenant RLS preflight passed", {
-		role: API_TENANT_RLS_PLAN.roleName,
-		tables: preflight.tables.length,
-	});
+	logger.info(
+		{
+			role: API_TENANT_RLS_PLAN.roleName,
+			tables: preflight.tables.length,
+		},
+		"tenant RLS preflight passed",
+	);
 
 	/**
 	 * Mail, asserted before anything can send one.
@@ -56,10 +59,13 @@ async function bootstrap() {
 	 */
 	const mailEnv = loadMailEnv();
 	assertMailPreflight(mailEnv);
-	logger.info("mail preflight passed", {
-		transport: selectMailTransport(mailEnv),
-		host: mailEnv.host ?? null,
-	});
+	logger.info(
+		{
+			transport: selectMailTransport(mailEnv),
+			host: mailEnv.host ?? null,
+		},
+		"mail preflight passed",
+	);
 
 	/**
 	 * The better-auth slice is additive and optional: an environment without `DATABASE_URL` /
@@ -181,6 +187,6 @@ async function bootstrap() {
 }
 
 bootstrap().catch((error) => {
-	logger.error("failed to start API", error);
+	logger.error({ err: error }, "failed to start API");
 	process.exitCode = 1;
 });
