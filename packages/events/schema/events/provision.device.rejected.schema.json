@@ -1,0 +1,43 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"sourceAddress": {
+			"type": "string",
+			"maxLength": 64
+		},
+		"path": {
+			"type": "string",
+			"maxLength": 512
+		},
+		"userAgent": {
+			"type": "string",
+			"maxLength": 256
+		},
+		"macAddress": {
+			"type": "string",
+			"pattern": "^[0-9a-f]{12}$"
+		},
+		"reason": {
+			"type": "string",
+			"enum": [
+				"unknown-mac",
+				"invalid-token",
+				"missing-token",
+				"unknown-vendor",
+				"template-missing",
+				"rate-limited",
+				"disabled"
+			]
+		},
+		"detail": {
+			"type": "string",
+			"maxLength": 512
+		}
+	},
+	"required": [
+		"sourceAddress",
+		"reason"
+	],
+	"additionalProperties": false
+}

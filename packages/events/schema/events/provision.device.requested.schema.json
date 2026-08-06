@@ -1,0 +1,35 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"sourceAddress": {
+			"type": "string",
+			"maxLength": 64
+		},
+		"path": {
+			"type": "string",
+			"maxLength": 512
+		},
+		"userAgent": {
+			"type": "string",
+			"maxLength": 256
+		},
+		"macAddress": {
+			"type": "string",
+			"pattern": "^[0-9a-f]{12}$"
+		},
+		"vendor": {
+			"type": "string",
+			"maxLength": 64
+		},
+		"model": {
+			"type": "string",
+			"maxLength": 64
+		}
+	},
+	"required": [
+		"sourceAddress",
+		"macAddress"
+	],
+	"additionalProperties": false
+}

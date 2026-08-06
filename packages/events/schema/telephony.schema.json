@@ -1,0 +1,95 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"title": "Optimiq Voice telephony vocabularies",
+	"description": "Closed string vocabularies shared across event families. Authority: packages/events/src/schemas/telephony.ts.",
+	"$defs": {
+		"LegSide": {
+			"description": "A-leg is the originating/inbound side; B-leg is every leg the engine originated for it.",
+			"type": "string",
+			"enum": [
+				"a",
+				"b"
+			]
+		},
+		"CallDirection": {
+			"description": "Direction as the organization sees it, not as the switch sees it.",
+			"type": "string",
+			"enum": [
+				"inbound",
+				"outbound",
+				"internal"
+			]
+		},
+		"HangupSide": {
+			"description": "Which side tore the call down; system covers engine/media timeouts and admin hangups.",
+			"type": "string",
+			"enum": [
+				"caller",
+				"callee",
+				"system"
+			]
+		},
+		"BridgeMode": {
+			"description": "Bridge modes, from plans/reference/freeswitch-capabilities.md §1.",
+			"type": "string",
+			"enum": [
+				"full",
+				"signal-only",
+				"bypass-media",
+				"proxy-media"
+			]
+		},
+		"DTMFSource": {
+			"description": "DTMF transports, from the frozen reference §4.",
+			"type": "string",
+			"enum": [
+				"rfc2833",
+				"info",
+				"inband",
+				"application"
+			]
+		},
+		"RecordingKind": {
+			"description": "What produced a stored media object.",
+			"type": "string",
+			"enum": [
+				"call",
+				"voicemail",
+				"conference"
+			]
+		},
+		"RecordingStopReason": {
+			"description": "How a recording ended.",
+			"type": "string",
+			"enum": [
+				"completed",
+				"cancelled",
+				"failed"
+			]
+		},
+		"SIPTransport": {
+			"description": "SIP transports the edge accepts.",
+			"type": "string",
+			"enum": [
+				"udp",
+				"tcp",
+				"tls",
+				"ws",
+				"wss"
+			]
+		},
+		"AgentStatus": {
+			"description": "ACD agent status. Drives queue distribution and the wallboard.",
+			"type": "string",
+			"enum": [
+				"logged-out",
+				"available",
+				"ringing",
+				"on-call",
+				"wrap-up",
+				"on-break",
+				"unavailable"
+			]
+		}
+	}
+}

@@ -1,0 +1,18 @@
+// Go workspace for the Optimiq Voice data plane (plan §3.3: "Go apps live in a go.work workspace;
+// single repo, per-app go.mod, CI parity with turbo").
+//
+// TypeScript remains the default language; Go is used where the 2026 industry consensus is Go —
+// the SIP edge and, later, the media plane. Everything here consumes the same NATS contract as the
+// TypeScript services, via packages/events-go.
+//
+//	packages/events-go   generated + hand-written NATS contract (peer of @optimiq-voice/events)
+//	apps/sipd            SIP edge: registrar today, proxy next; retires Routr in P6
+//	apps/mediad          NOT YET — RTP/media plane on Pion; add its `use` line when it lands
+//
+//	go work sync && go build ./... && go test ./...
+go 1.26
+
+use (
+	./apps/sipd
+	./packages/events-go
+)

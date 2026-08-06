@@ -1,0 +1,60 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"sourceAddress": {
+			"type": "string",
+			"maxLength": 64
+		},
+		"path": {
+			"type": "string",
+			"maxLength": 512
+		},
+		"userAgent": {
+			"type": "string",
+			"maxLength": 256
+		},
+		"macAddress": {
+			"type": "string",
+			"pattern": "^[0-9a-f]{12}$"
+		},
+		"vendor": {
+			"type": "string",
+			"maxLength": 64
+		},
+		"model": {
+			"type": "string",
+			"maxLength": 64
+		},
+		"deviceId": {
+			"type": "string",
+			"format": "uuid",
+			"pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+		},
+		"templateId": {
+			"type": "string",
+			"format": "uuid",
+			"pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+		},
+		"deviceProfileId": {
+			"type": "string",
+			"format": "uuid",
+			"pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+		},
+		"bytes": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 9007199254740991
+		}
+	},
+	"required": [
+		"sourceAddress",
+		"macAddress",
+		"vendor",
+		"model",
+		"deviceId",
+		"templateId",
+		"bytes"
+	],
+	"additionalProperties": false
+}

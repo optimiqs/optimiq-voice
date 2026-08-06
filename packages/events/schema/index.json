@@ -1,0 +1,209 @@
+{
+	"description": "Manifest of the Optimiq Voice NATS contract. Generated from packages/events/src by scripts/generate-go.ts; do not edit. Every message on the backbone is the envelope (envelope.schema.json) with `data` replaced by the referenced payload schema.",
+	"subjectVersion": "v1",
+	"envelopeSchema": "envelope.schema.json",
+	"vocabulariesSchema": "telephony.schema.json",
+	"subjectRoots": {
+		"call": "calls.evt.v1",
+		"registration": "sip.reg.v1",
+		"queue": "queue.evt.v1",
+		"cdrLeg": "cdr.leg.v1",
+		"audit": "audit.evt.v1",
+		"provision": "provision.evt.v1"
+	},
+	"events": [
+		{
+			"family": "call",
+			"type": "channel.created",
+			"subject": "calls.evt.v1.<orgId>.<callId>.channel.created",
+			"dataSchema": "events/call.channel.created.schema.json",
+			"goType": "ChannelCreatedData"
+		},
+		{
+			"family": "call",
+			"type": "channel.ringing",
+			"subject": "calls.evt.v1.<orgId>.<callId>.channel.ringing",
+			"dataSchema": "events/call.channel.ringing.schema.json",
+			"goType": "ChannelRingingData"
+		},
+		{
+			"family": "call",
+			"type": "channel.early-media",
+			"subject": "calls.evt.v1.<orgId>.<callId>.channel.early-media",
+			"dataSchema": "events/call.channel.early-media.schema.json",
+			"goType": "ChannelEarlyMediaData"
+		},
+		{
+			"family": "call",
+			"type": "channel.answered",
+			"subject": "calls.evt.v1.<orgId>.<callId>.channel.answered",
+			"dataSchema": "events/call.channel.answered.schema.json",
+			"goType": "ChannelAnsweredData"
+		},
+		{
+			"family": "call",
+			"type": "channel.bridged",
+			"subject": "calls.evt.v1.<orgId>.<callId>.channel.bridged",
+			"dataSchema": "events/call.channel.bridged.schema.json",
+			"goType": "ChannelBridgedData"
+		},
+		{
+			"family": "call",
+			"type": "channel.unbridged",
+			"subject": "calls.evt.v1.<orgId>.<callId>.channel.unbridged",
+			"dataSchema": "events/call.channel.unbridged.schema.json",
+			"goType": "ChannelUnbridgedData"
+		},
+		{
+			"family": "call",
+			"type": "channel.held",
+			"subject": "calls.evt.v1.<orgId>.<callId>.channel.held",
+			"dataSchema": "events/call.channel.held.schema.json",
+			"goType": "ChannelHeldData"
+		},
+		{
+			"family": "call",
+			"type": "channel.unheld",
+			"subject": "calls.evt.v1.<orgId>.<callId>.channel.unheld",
+			"dataSchema": "events/call.channel.unheld.schema.json",
+			"goType": "ChannelUnheldData"
+		},
+		{
+			"family": "call",
+			"type": "channel.dtmf",
+			"subject": "calls.evt.v1.<orgId>.<callId>.channel.dtmf",
+			"dataSchema": "events/call.channel.dtmf.schema.json",
+			"goType": "ChannelDTMFData"
+		},
+		{
+			"family": "call",
+			"type": "channel.record.started",
+			"subject": "calls.evt.v1.<orgId>.<callId>.channel.record.started",
+			"dataSchema": "events/call.channel.record.started.schema.json",
+			"goType": "ChannelRecordStartedData"
+		},
+		{
+			"family": "call",
+			"type": "channel.record.stopped",
+			"subject": "calls.evt.v1.<orgId>.<callId>.channel.record.stopped",
+			"dataSchema": "events/call.channel.record.stopped.schema.json",
+			"goType": "ChannelRecordStoppedData"
+		},
+		{
+			"family": "call",
+			"type": "channel.hangup",
+			"subject": "calls.evt.v1.<orgId>.<callId>.channel.hangup",
+			"dataSchema": "events/call.channel.hangup.schema.json",
+			"goType": "ChannelHangupData"
+		},
+		{
+			"family": "call",
+			"type": "channel.destroyed",
+			"subject": "calls.evt.v1.<orgId>.<callId>.channel.destroyed",
+			"dataSchema": "events/call.channel.destroyed.schema.json",
+			"goType": "ChannelDestroyedData"
+		},
+		{
+			"family": "registration",
+			"type": "registered",
+			"subject": "sip.reg.v1.<orgId>.<aorHash>.registered",
+			"dataSchema": "events/registration.registered.schema.json",
+			"goType": "RegistrationRegisteredData"
+		},
+		{
+			"family": "registration",
+			"type": "unregistered",
+			"subject": "sip.reg.v1.<orgId>.<aorHash>.unregistered",
+			"dataSchema": "events/registration.unregistered.schema.json",
+			"goType": "RegistrationUnregisteredData"
+		},
+		{
+			"family": "registration",
+			"type": "expired",
+			"subject": "sip.reg.v1.<orgId>.<aorHash>.expired",
+			"dataSchema": "events/registration.expired.schema.json",
+			"goType": "RegistrationExpiredData"
+		},
+		{
+			"family": "queue",
+			"type": "caller.joined",
+			"subject": "queue.evt.v1.<orgId>.<queueId>.caller.joined",
+			"dataSchema": "events/queue.caller.joined.schema.json",
+			"goType": "QueueCallerJoinedData"
+		},
+		{
+			"family": "queue",
+			"type": "caller.answered",
+			"subject": "queue.evt.v1.<orgId>.<queueId>.caller.answered",
+			"dataSchema": "events/queue.caller.answered.schema.json",
+			"goType": "QueueCallerAnsweredData"
+		},
+		{
+			"family": "queue",
+			"type": "caller.abandoned",
+			"subject": "queue.evt.v1.<orgId>.<queueId>.caller.abandoned",
+			"dataSchema": "events/queue.caller.abandoned.schema.json",
+			"goType": "QueueCallerAbandonedData"
+		},
+		{
+			"family": "queue",
+			"type": "agent.state",
+			"subject": "queue.evt.v1.<orgId>.<queueId>.agent.state",
+			"dataSchema": "events/queue.agent.state.schema.json",
+			"goType": "QueueAgentStateData"
+		},
+		{
+			"family": "cdr",
+			"type": "cdr.leg.write",
+			"subject": "cdr.leg.v1.<orgId>",
+			"dataSchema": "events/cdr.cdr.leg.write.schema.json",
+			"goType": "CDRLegWriteData"
+		},
+		{
+			"family": "audit",
+			"type": "audit.recorded",
+			"subject": "audit.evt.v1.<orgId>",
+			"dataSchema": "events/audit.audit.recorded.schema.json",
+			"goType": "AuditRecordedData"
+		},
+		{
+			"family": "provision",
+			"type": "device.requested",
+			"subject": "provision.evt.v1.<orgId>",
+			"dataSchema": "events/provision.device.requested.schema.json",
+			"goType": "ProvisionDeviceRequestedData"
+		},
+		{
+			"family": "provision",
+			"type": "device.rendered",
+			"subject": "provision.evt.v1.<orgId>",
+			"dataSchema": "events/provision.device.rendered.schema.json",
+			"goType": "ProvisionDeviceRenderedData"
+		},
+		{
+			"family": "provision",
+			"type": "device.rejected",
+			"subject": "provision.evt.v1.<orgId>",
+			"dataSchema": "events/provision.device.rejected.schema.json",
+			"goType": "ProvisionDeviceRejectedData"
+		}
+	],
+	"rpc": [
+		{
+			"subject": "rpc.routing.v1.resolve",
+			"timeoutMs": 2000,
+			"requestSchema": "rpc/rpc.routing.v1.resolve.request.schema.json",
+			"responseSchema": "rpc/rpc.routing.v1.resolve.response.schema.json",
+			"goRequestType": "RoutingResolveRequest",
+			"goResponseType": "RoutingResolveResponse"
+		},
+		{
+			"subject": "rpc.authz.v1.check",
+			"timeoutMs": 1000,
+			"requestSchema": "rpc/rpc.authz.v1.check.request.schema.json",
+			"responseSchema": "rpc/rpc.authz.v1.check.response.schema.json",
+			"goRequestType": "AuthzCheckRequest",
+			"goResponseType": "AuthzCheckResponse"
+		}
+	]
+}

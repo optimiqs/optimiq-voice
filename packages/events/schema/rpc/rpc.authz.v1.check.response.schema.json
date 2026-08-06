@@ -1,0 +1,35 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"allowed": {
+			"type": "boolean"
+		},
+		"granted": {
+			"maxItems": 64,
+			"type": "array",
+			"items": {
+				"type": "string",
+				"maxLength": 96
+			}
+		},
+		"missing": {
+			"maxItems": 64,
+			"type": "array",
+			"items": {
+				"type": "string",
+				"maxLength": 96
+			}
+		},
+		"reason": {
+			"type": "string",
+			"maxLength": 256
+		}
+	},
+	"required": [
+		"allowed",
+		"granted",
+		"missing"
+	],
+	"additionalProperties": false
+}
