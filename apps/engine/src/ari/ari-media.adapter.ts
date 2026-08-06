@@ -1,6 +1,16 @@
 import { AriHttpError } from "@optimiq-voice/media-ari";
 import { ariReasonCodeFor } from "../calls/ari-mapping";
-import type { MediaPort, PlaybackHandle, PlayRequest } from "./media-port";
+import type {
+	BridgeHandle,
+	CreateBridgeRequest,
+	MediaPort,
+	OriginateRequest,
+	OriginatedChannel,
+	PlaybackHandle,
+	PlayRequest,
+	RecordRequest,
+	RecordingHandle,
+} from "./media-port";
 import type { AriClient } from "@optimiq-voice/media-ari";
 import type { HangupCause } from "@optimiq-voice/telephony";
 
@@ -19,7 +29,11 @@ import type { HangupCause } from "@optimiq-voice/telephony";
  * boolean rather than an exception, so the orchestrator never has to catch to ask.
  */
 export class AriMediaAdapter implements MediaPort {
-	constructor(private readonly client: AriClient) {}
+	constructor(
+		private readonly client: AriClient,
+		/** The Stasis application name; `watchChannel` subscribes on its behalf. */
+		private readonly applicationName: string,
+	) {}
 
 	async answer(channelId: string): Promise<void> {
 		await this.client.channels.answer(channelId);
@@ -65,5 +79,76 @@ export class AriMediaAdapter implements MediaPort {
 
 	async channelExists(channelId: string): Promise<boolean> {
 		return (await this.client.channels.get(channelId)) !== undefined;
+	}
+
+	async watchChannel(channelId: string): Promise<void> {
+		await this.client.applications.subscribe(this.applicationName, [`channel:${channelId}`]);
+	}
+
+	// --- P3 ------------------------------------------------------------------------------------
+
+	async originate(request: OriginateRequest): Promise<OriginatedChannel> {
+		const channel = await this.client.channels.originate({
+			endpoint: request.endpoint,
+			app: request.application,
+			appArgs: request.applicationArgs,
+			channelId: request.channelId,
+			callerId: request.callerId,
+			timeoutSeconds: request.timeoutSeconds,
+			originator: request.originatorChannelId,
+			variables: request.variables,
+		});
+		return { channelId: channel.id, name: channel.name };
+	}
+
+	async createBridge(request: CreateBridgeRequest): Promise<BridgeHandle> {
+		// `dtmf_events` alongside `mixing`: the walker's own DTMF handling (an IVR that a bridged
+		// party can still drive, the attended-transfer key) needs the digits to arrive as ARI
+		// events rather than only as inband audio the far end hears.
+		const bridge = await this.client.bridges.create({
+			types: ["mixing", "dtmf_events"],
+			bridgeId: request.bridgeId,
+			name: request.name,
+		});
+		return { bridgeId: bridge.id };
+	}
+
+	async addToBridge(bridgeId: string, channelIds: readonly string[]): Promise<void> {
+		await this.client.bridges.addChannels(bridgeId, channelIds);
+	}
+
+	async removeFromBridge(bridgeId: string, channelIds: readonly string[]): Promise<void> {
+		await this.client.bridges.removeChannels(bridgeId, channelIds);
+	}
+
+	async destroyBridge(bridgeId: string): Promise<void> {
+		await this.client.bridges.destroy(bridgeId);
+	}
+
+	async record(channelId: string, request: RecordRequest): Promise<RecordingHandle> {
+		const recording = await this.client.channels.record(channelId, {
+			name: request.name,
+			format: request.format,
+			maxDurationSeconds: request.maxDurationSeconds,
+			maxSilenceSeconds: request.maxSilenceSeconds,
+			beep: request.beep,
+			terminateOn: request.terminateOn,
+			// A voicemail re-recorded into the same name is the caller pressing `*` to start over;
+			// refusing it would fail the call over a file that is about to be replaced anyway.
+			ifExists: "overwrite",
+		});
+		return { name: recording.name, format: recording.format };
+	}
+
+	async stopRecording(name: string): Promise<void> {
+		await this.client.recordings.stop(name);
+	}
+
+	async startMusicOnHold(channelId: string, mohClass?: string): Promise<void> {
+		await this.client.channels.startMoh(channelId, mohClass);
+	}
+
+	async stopMusicOnHold(channelId: string): Promise<void> {
+		await this.client.channels.stopMoh(channelId);
 	}
 }

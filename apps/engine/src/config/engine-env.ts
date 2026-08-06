@@ -24,6 +24,18 @@ import "@optimiq-voice/config";
  * `401` on the first inbound call.
  */
 
+/**
+ * Treats an empty string as "not set".
+ *
+ * Docker Compose's `${VAR:-}` interpolation writes an EMPTY STRING when the variable is absent, so
+ * an optional variable declared in `compose.yaml` arrives as `""` rather than as missing. Without
+ * this, a deployment that simply has no default organization fails to boot on the value it does not
+ * have — which is the opposite of what "optional" means.
+ */
+function emptyAsUnset(value: unknown): unknown {
+	return typeof value === "string" && value.trim() === "" ? undefined : value;
+}
+
 const requiredUrl = z
 	.string()
 	.min(1)
@@ -80,7 +92,7 @@ export const engineEnvSchema = z.object({
 	 * unattributable call is REJECTED rather than filed under a guess: a mis-attributed CDR is a
 	 * billing error and a tenant-isolation breach, and neither is worth a completed test call.
 	 */
-	ENGINE_DEFAULT_ORGANIZATION_ID: z.uuid().optional(),
+	ENGINE_DEFAULT_ORGANIZATION_ID: z.preprocess(emptyAsUnset, z.uuid().optional()),
 
 	/** How long a drain waits for live channels before hanging the stragglers up. */
 	ENGINE_DRAIN_TIMEOUT_MS: durationMs(30_000, 600_000),
@@ -89,15 +101,62 @@ export const engineEnvSchema = z.object({
 	 * Optional media URI played to an answered inbound call, in the media server's vocabulary
 	 * (`sound:unavailable`).
 	 *
-	 * A stand-in for the routing executor that lands in P3, and unset by default: a P2 engine that
-	 * answers and then holds the line is honest about having no routing yet, whereas one that
-	 * always plays a hard-coded prompt is a product decision made by a placeholder.
+	 * The pre-routing stand-in. It is only used when the call produced NO execution plan — with
+	 * routing enabled and an artifact present, the plan decides what the caller hears, and an
+	 * announcement that played over it would be a product decision made by a placeholder.
 	 */
 	ENGINE_INBOUND_ANNOUNCEMENT: z
 		.string()
 		.min(1)
 		.optional()
 		.transform((value) => (value === undefined || value.trim() === "" ? undefined : value.trim())),
+
+	// ---- Routing -------------------------------------------------------------------------
+	/**
+	 * Whether inbound calls are routed through the compiled routing artifact.
+	 *
+	 * On by default. Turning it off leaves the pre-routing behaviour (ring, answer, optional
+	 * announcement) in place, which is the fallback for a deployment whose control plane is not
+	 * up yet — not a supported production mode.
+	 */
+	ENGINE_ROUTING_ENABLED: z
+		.stringbool({ truthy: ["true", "1"], falsy: ["false", "0", ""] })
+		.default(true),
+
+	/**
+	 * Deadline for `rpc.routing.v1.resolve`, the cache-miss path.
+	 *
+	 * The contract in `packages/events` suggests 2 s and this matches it: these calls sit between
+	 * an INVITE and a ringing phone, so slow is the same as broken.
+	 */
+	ENGINE_ROUTING_RPC_TIMEOUT_MS: durationMs(2_000, 30_000),
+
+	/**
+	 * How an extension NUMBER becomes a dialable endpoint. `{number}` is substituted.
+	 *
+	 * A template rather than a hard-coded `PJSIP/` because the same engine has to work against a
+	 * registrar-backed deployment (`PJSIP/1001`) and against a dialplan-mediated one
+	 * (`Local/1001@optimiq-internal`), and which one a site uses is deployment, not code.
+	 */
+	ENGINE_EXTENSION_DIAL_TEMPLATE: z.string().min(1).default("PJSIP/{number}"),
+
+	/** How a trunk attempt becomes an endpoint. `{number}` and `{trunk}` are substituted. */
+	ENGINE_TRUNK_DIAL_TEMPLATE: z.string().min(1).default("PJSIP/{number}@{trunk}"),
+
+	/** Ring time used when neither the plan node nor the ring-group member specifies one. */
+	ENGINE_DEFAULT_RING_TIMEOUT_SECONDS: z.coerce.number().int().min(1).max(600).default(30),
+
+	/** Prefix a bare prompt id is rendered under, e.g. `sound:prompts/`. */
+	ENGINE_PROMPT_MEDIA_PREFIX: z.string().min(1).default("sound:"),
+
+	/** Played when a plan names audio this release cannot resolve, and by the unimplemented kinds. */
+	ENGINE_UNAVAILABLE_ANNOUNCEMENT: z.string().min(1).default("sound:unavailable"),
+
+	/** Played before a voicemail recording starts. Replaced by per-box greetings in the next wave. */
+	ENGINE_VOICEMAIL_GREETING: z.string().min(1).default("sound:unavailable"),
+
+	/** Container voicemail is recorded in. `wav` is what every downstream tool can already read. */
+	ENGINE_RECORDING_FORMAT: z.enum(["wav", "gsm", "ulaw", "alaw", "g722"]).default("wav"),
 });
 
 export type EngineEnv = z.infer<typeof engineEnvSchema>;

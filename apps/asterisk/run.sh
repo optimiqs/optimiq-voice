@@ -20,6 +20,12 @@ END
 [ -z "$SIPPROXY_PORT" ]       && { export SIPPROXY_PORT='5060'; }
 [ -z "$CODECS" ]              && { export CODECS='g722,ulaw,alaw,gsm'; }
 [ -z "$DTMF_MODE" ]           && { export DTMF_MODE='rfc2833'; }
+# The Stasis application `extensions.conf`'s Optimiq contexts hand channels to.
+# Must match apps/engine's ARI_APP, or inbound calls ring into a dead app.
+[ -z "$OPTIMIQ_ARI_APP" ]     && { export OPTIMIQ_ARI_APP='optimiq-engine'; }
+# Read by ${ENV(OPTIMIQ_DEV_ORG_ID)} in the dialplan. Deliberately has NO
+# default: an unset value makes the engine reject the call with INVALID_PROFILE,
+# which is the correct outcome for a box nobody has told which tenant it serves.
 
 # Required environment variables
 [ -z "$ARI_USERNAME" ]          ||
@@ -47,6 +53,13 @@ sed -i.bak "s|RTP_PORT_START_PLACEHOLDER|${RTP_PORT_START}|g" /etc/asterisk/rtp.
 sed -i.bak "s|RTP_PORT_END_PLACEHOLDER|${RTP_PORT_END}|g" /etc/asterisk/rtp.conf
 
 rm /etc/asterisk/*.bak
+
+# Static SIP credentials ship in the image but are removed unless explicitly
+# enabled. Fail-safe by default: the box that forgets to set this flag is the
+# box with no shared passwords on it, not the other way round.
+if [ "$OPTIMIQ_DEV_ENDPOINTS" != "true" ]; then
+  rm -f /etc/asterisk/pjsip_dev_endpoints.conf
+fi
 
 asterisk -v
 

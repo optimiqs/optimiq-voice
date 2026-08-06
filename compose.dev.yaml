@@ -58,8 +58,23 @@ services:
     ports:
       - 6060:6060
       - 8088:8088
+    environment:
+      # Two registrable extensions (1001 / 1002) with static credentials, so the
+      # routing slice can be driven from a softphone without a provisioning
+      # layer. Development compose only — see pjsip_dev_endpoints.conf.
+      OPTIMIQ_DEV_ENDPOINTS: ${OPTIMIQ_DEV_ENDPOINTS:-true}
     extra_hosts:
       api: ${DOCKER_HOST_ADDRESS}
+
+  engine:
+    build:
+      context: .
+      dockerfile: ./apps/engine/Dockerfile
+    ports:
+      - 4010:4010
+    environment:
+      NODE_ENV: development
+      LOGS_LEVEL: ${ENGINE_LOGS_LEVEL:-debug}
 
   postgres:
     ports:

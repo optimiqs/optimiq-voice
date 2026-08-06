@@ -133,10 +133,50 @@ describe("buildCdrLegWrite", () => {
 		expect(Object.keys(data)).not.toContain("organizationId");
 	});
 
-	it("reports an honest unknown destination type until the routing executor lands", () => {
+	it("reports an honest unknown destination for a leg that was never routed", () => {
 		const data = buildCdrLegWrite({ ...base, snapshot: snapshot(), endedAt: 1_010_000 });
 		expect(data.destinationType).toBe("unknown");
 		expect(data.destinationRef).toBeNull();
+	});
+
+	it("carries the destination the routing walk reached", () => {
+		const data = buildCdrLegWrite({
+			...base,
+			snapshot: snapshot(),
+			endedAt: 1_010_000,
+			destinationType: "extension",
+			destinationRef: "0195c0f0-1c2f-7000-8000-0000000000f1",
+		});
+
+		expect(data.destinationType).toBe("extension");
+		expect(data.destinationRef).toBe("0195c0f0-1c2f-7000-8000-0000000000f1");
+		expect(cdrLegWriteDataSchema.safeParse(data).success).toBe(true);
+	});
+
+	it("accepts a kebab-case destination type, which is the compiler's vocabulary", () => {
+		const data = buildCdrLegWrite({
+			...base,
+			snapshot: snapshot(),
+			endedAt: 1_010_000,
+			destinationType: "ring-group",
+			destinationRef: "0195c0f0-1c2f-7000-8000-0000000000f2",
+		});
+
+		expect(cdrLegWriteDataSchema.safeParse(data).success).toBe(true);
+	});
+
+	it("reports a type with a null ref for a value-backed destination", () => {
+		// An `external` node's "ref" is an E.164 string, and the column is a UUID.
+		const data = buildCdrLegWrite({
+			...base,
+			snapshot: snapshot(),
+			endedAt: 1_010_000,
+			destinationType: "external",
+		});
+
+		expect(data.destinationType).toBe("external");
+		expect(data.destinationRef).toBeNull();
+		expect(cdrLegWriteDataSchema.safeParse(data).success).toBe(true);
 	});
 
 	it("emits ISO-8601 instants", () => {

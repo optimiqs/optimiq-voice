@@ -75,6 +75,8 @@ export const ENGINE_CHANNEL_VARIABLES = [
 	"OPTIMIQ_ORG_ID",
 	"OPTIMIQ_CALL_DIRECTION",
 	"OPTIMIQ_ROUTING_CONTEXT",
+	/** `b` on a leg the engine originated; absent on a leg that arrived from the outside. */
+	"OPTIMIQ_LEG",
 ] as const;
 
 export type EngineChannelVariable = (typeof ENGINE_CHANNEL_VARIABLES)[number];

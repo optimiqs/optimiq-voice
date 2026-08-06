@@ -3,54 +3,32 @@ import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import { VERB_NAMES } from "@optimiq-voice/telephony";
+import { makeFakeMediaPort } from "../ari/media-port.fake";
 import {
 	MediaCommandFailure,
 	UnsupportedVerbFailure,
 	VerbNotPermittedFailure,
 } from "./verb-errors";
 import { makeVerbExecutor } from "./verb-executor";
-import type { MediaPort, PlaybackHandle, PlayRequest } from "../ari/media-port";
+import type { MediaPort } from "../ari/media-port";
 import type { VerbChannelContext } from "./verb-executor";
-import type { DtmfCollection, HangupCause, Verb, VerbResult } from "@optimiq-voice/telephony";
+import type { DtmfCollection, Verb, VerbResult } from "@optimiq-voice/telephony";
 
 interface Call {
 	readonly method: string;
 	readonly args: readonly unknown[];
 }
 
-/** A complete media server, as far as the engine's logic is concerned. */
+/**
+ * A complete media server, as far as the engine's logic is concerned.
+ *
+ * Built on the shared `*.fake.ts` port so that a method added to `MediaPort` does not have to be
+ * re-stubbed in every spec file that touches it; `overrides` is what these specs actually use it
+ * for — making one command fail.
+ */
 function fakeMedia(overrides: Partial<MediaPort> = {}): { port: MediaPort; calls: Call[] } {
-	const calls: Call[] = [];
-	const record = (method: string, ...args: unknown[]): void => {
-		calls.push({ method, args });
-	};
-
-	const port: MediaPort = {
-		answer: async (channelId) => {
-			record("answer", channelId);
-		},
-		ring: async (channelId) => {
-			record("ring", channelId);
-		},
-		play: async (channelId: string, request: PlayRequest): Promise<PlaybackHandle> => {
-			record("play", channelId, request);
-			return { playbackRef: request.playbackRef };
-		},
-		stopPlayback: async (playbackRef) => {
-			record("stopPlayback", playbackRef);
-		},
-		hangup: async (channelId, cause: HangupCause) => {
-			record("hangup", channelId, cause);
-		},
-		getVariable: async () => undefined,
-		setVariable: async () => {
-			// nothing to record for the specs below
-		},
-		channelExists: async () => true,
-		...overrides,
-	};
-
-	return { port, calls };
+	const fake = makeFakeMediaPort();
+	return { port: { ...fake, ...overrides }, calls: fake.calls };
 }
 
 const ANSWERED: VerbChannelContext = {

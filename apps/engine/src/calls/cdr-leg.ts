@@ -22,8 +22,13 @@ export type CallDisposition = (typeof CALL_DISPOSITIONS)[number];
 
 /**
  * What the routing decision resolved to. Authority: `@optimiq-voice/cdr-db`
- * `CALL_DESTINATION_TYPES`. The engine reports `unknown` until the routing executor lands in P3 —
- * an honest `unknown` is a far better record than a guessed `extension`.
+ * `CALL_DESTINATION_TYPES`.
+ *
+ * Still the fallback rather than the answer: a leg the plan walker never got to a destination for —
+ * a call rejected at the door, a drain straggler, an artifact that could not be read — genuinely
+ * has no destination, and an honest `unknown` is a far better record than a guessed `extension`.
+ * Every leg the walker DID route carries the walk's own destination instead (see
+ * {@link CdrLegInput.destinationType}).
  */
 export const DEFAULT_DESTINATION_TYPE = "unknown";
 
@@ -79,6 +84,18 @@ export interface CdrLegInput {
 	readonly originatingLegId?: string;
 	/** The leg this one was bridged to, when it was. */
 	readonly bridgeLegId?: string;
+	/**
+	 * Where the routing walk left the call, in the compiler's kebab-case vocabulary
+	 * (`extension`, `ring-group`, `ivr-menu`, …). Absent means the leg was never routed.
+	 */
+	readonly destinationType?: string;
+	/**
+	 * The row the destination names, when it is backed by one.
+	 *
+	 * Only set alongside `destinationType`, and only for kinds that HAVE a row: the CDR column is a
+	 * UUID, and an `external` node's "ref" is an E.164 string that would fail validation.
+	 */
+	readonly destinationRef?: string;
 }
 
 /**
@@ -105,8 +122,8 @@ export function buildCdrLegWrite(input: CdrLegInput): CdrLegWriteData {
 		fromNumber: dialStringOr(snapshot.profile.callerIdNumber),
 		fromName: snapshot.profile.callerIdName ?? null,
 		toNumber: dialStringOr(snapshot.profile.destinationNumber),
-		destinationType: DEFAULT_DESTINATION_TYPE,
-		destinationRef: null,
+		destinationType: input.destinationType ?? DEFAULT_DESTINATION_TYPE,
+		destinationRef: input.destinationRef ?? null,
 
 		startedAt: new Date(startedAt).toISOString(),
 		answeredAt: answeredAt === undefined ? null : new Date(answeredAt).toISOString(),

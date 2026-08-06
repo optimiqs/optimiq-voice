@@ -34,6 +34,7 @@
 		"@optimiq-voice/identifiers": "workspace:*",
 		"@optimiq-voice/logging": "workspace:*",
 		"@optimiq-voice/media-ari": "workspace:*",
+		"@optimiq-voice/routing": "workspace:*",
 		"@optimiq-voice/telephony": "workspace:*",
 		"effect": "catalog:",
 		"fastify": "catalog:",

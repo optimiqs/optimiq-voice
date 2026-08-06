@@ -11,6 +11,7 @@ import {
 	ensureKvBuckets,
 	ensureStreams,
 	kvKeyFor,
+	ROUTING_CACHE_KV,
 	subjectFor,
 } from "@optimiq-voice/events";
 import { getLogger } from "@optimiq-voice/logging";
@@ -50,6 +51,7 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	private connection: NatsConnection | undefined;
 	private jetstream: JetStreamClient | undefined;
 	private channelsKv: KV | undefined;
+	private routingCacheKv: KV | undefined;
 	private ready = false;
 
 	constructor(@Inject(ENGINE_ENV) private readonly env: EngineEnv) {}
@@ -93,7 +95,26 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 
 		this.jetstream = this.connection.jetstream();
 		this.channelsKv = await this.jetstream.views.kv(CHANNELS_KV.name);
+		// The routing cache is READ here and written by `apps/api` on save. Opening the view is
+		// still safe when the bucket does not exist yet — `views.kv` creates it with the same
+		// definition `ensureKvBuckets` applies — so a fresh cluster does not need the API to have
+		// booted first for the engine to come up.
+		this.routingCacheKv = await this.jetstream.views.kv(ROUTING_CACHE_KV.name);
 		this.ready = true;
+	}
+
+	/**
+	 * The `routing-cache` bucket, for the routing artifact source.
+	 *
+	 * Exposed as the raw `KV` rather than wrapped in a read/watch pair, because the artifact source
+	 * needs BOTH a point read and a long-lived watch, and a watch is an async iterator whose
+	 * lifetime belongs to its consumer. Wrapping it here would mean this service owning a
+	 * subscription it has no reason to know the shape of.
+	 *
+	 * `undefined` before `onModuleInit` has run, or after shutdown.
+	 */
+	get routingCache(): KV | undefined {
+		return this.routingCacheKv;
 	}
 
 	/**
@@ -176,6 +197,7 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		this.connection = undefined;
 		this.jetstream = undefined;
 		this.channelsKv = undefined;
+		this.routingCacheKv = undefined;
 		if (connection !== undefined && !connection.isClosed()) {
 			// `drain` flushes in-flight publishes before closing; `close` would drop them, and the
 			// publishes in flight during a shutdown are precisely the CDRs of the calls being

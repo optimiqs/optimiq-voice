@@ -1,15 +1,17 @@
 import { beforeEach, describe, expect, it } from "bun:test";
 import { parseAriEvent } from "@optimiq-voice/media-ari";
+import { makeFakeMediaPort } from "../ari/media-port.fake";
+import { CallSignalBus } from "../routing/call-signals";
 import { DtmfRegistry } from "../verbs/dtmf-registry";
 import { makeVerbExecutorRuntime } from "../verbs/verb-executor";
 import { ChannelOrchestrator } from "./channel-orchestrator.service";
-import type { MediaPort } from "../ari/media-port";
 import type { EngineEnv } from "../config/engine-env";
 import type { CallEventPublisher } from "../nats/call-event-publisher.service";
 import type { JetStreamService } from "../nats/jetstream.service";
+import type { RoutingArtifactSource } from "../routing/routing-artifact.source";
 import type { CallEventOf, CdrLegWriteEnvelope } from "@optimiq-voice/events";
 import type { AriEvent } from "@optimiq-voice/media-ari";
-import type { ChannelSnapshot, HangupCause } from "@optimiq-voice/telephony";
+import type { ChannelSnapshot } from "@optimiq-voice/telephony";
 
 /**
  * Orchestrator specs, driven entirely by fakes.
@@ -44,37 +46,26 @@ function fakeEnv(overrides: Partial<EngineEnv> = {}): EngineEnv {
 		NATS_URL: "nats://localhost:4222",
 		ENGINE_ENSURE_STREAMS: false,
 		ENGINE_DRAIN_TIMEOUT_MS: 1_000,
+		// These specs cover the ORCHESTRATOR — channel state, events, KV and the CDR — with no
+		// artifact in play. Routing has its own specs (`src/routing/*.spec.ts`), and leaving it on
+		// here would make every one of these assertions depend on a fake artifact source instead.
+		ENGINE_ROUTING_ENABLED: false,
+		ENGINE_ROUTING_RPC_TIMEOUT_MS: 2_000,
+		ENGINE_EXTENSION_DIAL_TEMPLATE: "PJSIP/{number}",
+		ENGINE_TRUNK_DIAL_TEMPLATE: "PJSIP/{number}@{trunk}",
+		ENGINE_DEFAULT_RING_TIMEOUT_SECONDS: 30,
+		ENGINE_PROMPT_MEDIA_PREFIX: "sound:",
+		ENGINE_UNAVAILABLE_ANNOUNCEMENT: "sound:unavailable",
+		ENGINE_VOICEMAIL_GREETING: "sound:unavailable",
+		ENGINE_RECORDING_FORMAT: "wav",
 		...overrides,
 	} as EngineEnv;
 }
 
 function harness(env: EngineEnv = fakeEnv()) {
-	const mediaCalls: { method: string; args: unknown[] }[] = [];
-	const variables: Record<string, string> = { OPTIMIQ_ORG_ID: ORG };
-
-	const media: MediaPort = {
-		answer: async (channelId) => {
-			mediaCalls.push({ method: "answer", args: [channelId] });
-		},
-		ring: async (channelId) => {
-			mediaCalls.push({ method: "ring", args: [channelId] });
-		},
-		play: async (channelId, request) => {
-			mediaCalls.push({ method: "play", args: [channelId, request.media] });
-			return { playbackRef: request.playbackRef };
-		},
-		stopPlayback: async (ref) => {
-			mediaCalls.push({ method: "stopPlayback", args: [ref] });
-		},
-		hangup: async (channelId, cause: HangupCause) => {
-			mediaCalls.push({ method: "hangup", args: [channelId, cause] });
-		},
-		getVariable: async (_channelId, name) => variables[name],
-		setVariable: async (_channelId, name, value) => {
-			variables[name] = value;
-		},
-		channelExists: async () => true,
-	};
+	const media = makeFakeMediaPort({ variables: { OPTIMIQ_ORG_ID: ORG } });
+	const mediaCalls = media.calls;
+	const variables = media.variables;
 
 	const published: PublishedEvent[] = [];
 	const events = {
@@ -107,7 +98,21 @@ function harness(env: EngineEnv = fakeEnv()) {
 		collectDtmf: (context, verb) => dtmf.forChannel(context.channelId).collect(verb),
 	});
 
-	const orchestrator = new ChannelOrchestrator(env, media, runtime, dtmf, events, jetstream);
+	const signals = new CallSignalBus();
+	const routing = {
+		get: async () => undefined,
+	} as unknown as RoutingArtifactSource;
+
+	const orchestrator = new ChannelOrchestrator(
+		env,
+		media,
+		runtime,
+		dtmf,
+		events,
+		jetstream,
+		routing,
+		signals,
+	);
 
 	return {
 		orchestrator,
@@ -119,6 +124,8 @@ function harness(env: EngineEnv = fakeEnv()) {
 		dtmf,
 		mediaPort: media,
 		jetstream,
+		signals,
+		routing,
 	};
 }
 
@@ -158,7 +165,7 @@ describe("inbound call arrival", () => {
 
 		expect(h.orchestrator.activeChannelCount).toBe(1);
 		expect(h.kv.size).toBe(1);
-		expect(h.mediaCalls.map((call) => call.method)).toEqual(["ring", "answer"]);
+		expect(h.mediaCalls.map((call) => call.method)).toEqual(["watchChannel", "ring", "answer"]);
 	});
 
 	it("plays the announcement only once the channel is really Up", async () => {
@@ -166,13 +173,18 @@ describe("inbound call arrival", () => {
 		await h.orchestrator.handleEvent(ariEvent("StasisStart", { channel: channel(), args: [] }));
 
 		// `answer` is a request, not a state: nothing may be played yet.
-		expect(h.mediaCalls.map((call) => call.method)).toEqual(["ring", "answer"]);
+		expect(h.mediaCalls.map((call) => call.method)).toEqual(["watchChannel", "ring", "answer"]);
 
 		await h.orchestrator.handleEvent(
 			ariEvent("ChannelStateChange", { channel: channel({ state: "Up" }) }),
 		);
-		expect(h.mediaCalls.map((call) => call.method)).toEqual(["ring", "answer", "play"]);
-		expect(h.mediaCalls[2]?.args[1]).toEqual(["sound:welcome"]);
+		expect(h.mediaCalls.map((call) => call.method)).toEqual([
+			"watchChannel",
+			"ring",
+			"answer",
+			"play",
+		]);
+		expect(h.mediaCalls[3]?.args[1]).toMatchObject({ media: ["sound:welcome"] });
 	});
 
 	it("REJECTS a call with no resolvable organization rather than guessing a tenant", async () => {
@@ -459,6 +471,8 @@ describe("resilience", () => {
 			new DtmfRegistry(),
 			failing,
 			h.jetstream,
+			h.routing,
+			h.signals,
 		);
 
 		await expect(

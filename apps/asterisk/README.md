@@ -61,6 +61,23 @@ Environment variables are used in the entry point script to render configuration
 - `DTMF_MODE` - DTMF mode. Defaults to `rfc2833`
 - `CODECS` - Comma separated list of codecs. Defaults to `g722,ulaw,alaw,gsm`
 - `HTTP_BINDADDR` - Where to listen for HTTP traffic. Defaults to `0.0.0.0`
+- `OPTIMIQ_ARI_APP` - Stasis application the `optimiq-*` contexts hand channels to. Must match `apps/engine`'s `ARI_APP`. Defaults to `optimiq-engine`
+- `OPTIMIQ_DEV_ORG_ID` - Organization UUID stamped onto every channel entering the `optimiq-*` contexts. **No default**: unset means the engine rejects inbound calls with `INVALID_PROFILE`, which is correct for a box nobody has assigned to a tenant. Development only — production resolves the org from the DID (see `apps/engine/README.md` §"Known gaps")
+- `OPTIMIQ_DEV_ENDPOINTS` - `true` keeps `pjsip_dev_endpoints.conf`, two registrable extensions (1001 / 1002) with **static credentials that are in version control**. Anything else deletes the file at startup. Defaults to off
+
+## Dialplan contexts
+
+| Context            | Purpose                                                                       |
+| ------------------ | ----------------------------------------------------------------------------- |
+| `optimiq-inbound`  | Carrier traffic. Stamps the org and hands the channel to the engine's Stasis app |
+| `optimiq-internal` | Registered extensions dialling. Same handover, `internal` routing context      |
+| `optimiq-loopback` | A target that answers. For echo tests and the engine's gated integration suite |
+| `local-ctx`        | The legacy Fonoster media controller. Untouched                               |
+
+The handover is written out per pattern rather than factored into a `GoSub`: `Stasis()` hands the
+channel over with the dialplan position it is standing on, and inside a subroutine that position is
+the subroutine's — so the engine would receive `exten = start` for every call and resolve every DID
+as unallocated.
 
 ## Exposed ports
 

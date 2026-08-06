@@ -5,5 +5,8 @@
 		"noEmit": false
 	},
 	"include": ["src/**/*"],
-	"exclude": ["src/**/*.spec.ts", "src/**/*.test.ts", "test/**/*"]
+	// `*.fake.ts` is spec scaffolding that lives next to the contract it fakes (the same rule
+	// `packages/routing` applies to `fixtures.ts`): compiled by the tooling project so the specs
+	// typecheck, never shipped in `dist`.
+	"exclude": ["src/**/*.spec.ts", "src/**/*.test.ts", "src/**/*.fake.ts", "test/**/*"]
 }

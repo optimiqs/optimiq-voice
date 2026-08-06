@@ -1,0 +1,435 @@
+import { describe, expect, it } from "bun:test";
+import { parseAriEvent } from "@optimiq-voice/media-ari";
+import { ROUTING_ARTIFACT_VERSION } from "@optimiq-voice/routing";
+import { makeFakeMediaPort } from "../ari/media-port.fake";
+import { CallSignalBus, legSignalKey } from "../routing/call-signals";
+import { DtmfRegistry } from "../verbs/dtmf-registry";
+import { makeVerbExecutorRuntime } from "../verbs/verb-executor";
+import { ChannelOrchestrator } from "./channel-orchestrator.service";
+import type { EngineEnv } from "../config/engine-env";
+import type { CallEventPublisher } from "../nats/call-event-publisher.service";
+import type { JetStreamService } from "../nats/jetstream.service";
+import type { RoutingArtifactSource } from "../routing/routing-artifact.source";
+import type { CallEventOf, CdrLegWriteEnvelope } from "@optimiq-voice/events";
+import type { AriEvent } from "@optimiq-voice/media-ari";
+import type { PlanNode, PlanNodeTable, RoutingArtifact } from "@optimiq-voice/routing";
+import type { ChannelSnapshot } from "@optimiq-voice/telephony";
+
+/**
+ * The orchestrator's ROUTING behaviour: resolve on `StasisStart`, walk the plan, and enrich the
+ * CDR with where the call went.
+ *
+ * `channel-orchestrator.spec.ts` covers the same class with routing OFF, which is the state
+ * machines, the events, the KV mirror and the CDR. This file is the other half — the seam between
+ * those and `packages/routing` — and it is the only place a fake artifact appears.
+ */
+
+const ORG = "0195c0f0-1c2f-7000-8000-000000000001";
+const ARI_CHANNEL = "1754400000.42";
+const DID = "+12125550100";
+
+interface PublishedEvent {
+	readonly type: string;
+	readonly data: Record<string, unknown>;
+}
+
+function fakeEnv(overrides: Partial<EngineEnv> = {}): EngineEnv {
+	return {
+		NODE_ENV: "test",
+		ENGINE_PORT: 4010,
+		ENGINE_HOST: "127.0.0.1",
+		ARI_URL: "http://asterisk:8088",
+		ARI_USERNAME: "ari",
+		ARI_PASSWORD: "secret",
+		ARI_APP: "optimiq-engine",
+		ARI_SUBSCRIBE_ALL: false,
+		ARI_REQUEST_TIMEOUT_MS: 10_000,
+		NATS_URL: "nats://localhost:4222",
+		ENGINE_ENSURE_STREAMS: false,
+		ENGINE_DRAIN_TIMEOUT_MS: 1_000,
+		ENGINE_ROUTING_ENABLED: true,
+		ENGINE_ROUTING_RPC_TIMEOUT_MS: 2_000,
+		ENGINE_EXTENSION_DIAL_TEMPLATE: "PJSIP/{number}",
+		ENGINE_TRUNK_DIAL_TEMPLATE: "PJSIP/{number}@{trunk}",
+		ENGINE_DEFAULT_RING_TIMEOUT_SECONDS: 30,
+		ENGINE_PROMPT_MEDIA_PREFIX: "sound:",
+		ENGINE_UNAVAILABLE_ANNOUNCEMENT: "sound:unavailable",
+		ENGINE_VOICEMAIL_GREETING: "sound:unavailable",
+		ENGINE_RECORDING_FORMAT: "wav",
+		...overrides,
+	} as EngineEnv;
+}
+
+/** A minimal artifact: one DID, pointing at whatever node the spec supplies. */
+function artifactWith(nodes: readonly PlanNode[], entryNodeId: string): RoutingArtifact {
+	return {
+		artifactVersion: ROUTING_ARTIFACT_VERSION,
+		organizationId: ORG,
+		snapshotHash: "hash-1",
+		compiledAt: "2026-08-05T12:00:00.000Z",
+		settings: {},
+		nodes: Object.fromEntries(nodes.map((node) => [node.id, node])) as PlanNodeTable,
+		timeConditions: {},
+		inbound: {
+			rules: [],
+			didDefaults: {
+				[DID]: {
+					phoneNumberId: "0195c0f0-1c2f-7000-8000-0000000000d1",
+					e164: DID,
+					enabled: true,
+					recordEnabled: false,
+					destinationNodeId: entryNodeId,
+				},
+			},
+			noMatchNodeId: "hangup:UNALLOCATED_NUMBER",
+		},
+		internal: {
+			featureCodes: [],
+			voicemailPrefixes: [],
+			numbers: {},
+			mailboxes: {},
+			parkSlots: [],
+			noMatchNodeId: "hangup:UNALLOCATED_NUMBER",
+		},
+		outbound: {
+			enabled: true,
+			rules: [],
+			noMatchNodeId: "hangup:UNALLOCATED_NUMBER",
+			deniedNodeId: "hangup:OUTGOING_CALL_BARRED",
+		},
+		callBlock: [],
+		extensionsByNumber: {},
+		diagnostics: [],
+	} as unknown as RoutingArtifact;
+}
+
+const TERMINALS: PlanNode[] = [
+	{ id: "hangup:UNALLOCATED_NUMBER", kind: "hangup", cause: "UNALLOCATED_NUMBER" },
+	{ id: "hangup:CALL_REJECTED", kind: "hangup", cause: "CALL_REJECTED" },
+	{ id: "hangup:NORMAL_CLEARING", kind: "hangup", cause: "NORMAL_CLEARING" },
+];
+
+function harness(options: { artifact?: RoutingArtifact; env?: Partial<EngineEnv> } = {}) {
+	const signals = new CallSignalBus();
+	// The orchestrator is built below but has to be reachable from the media fake, because a real
+	// media server answers by DELIVERING AN EVENT — the whole point of `ensureAnswered`.
+	const holder: { orchestrator?: ChannelOrchestrator } = {};
+	const media = makeFakeMediaPort({
+		variables: { OPTIMIQ_ORG_ID: ORG },
+		onOriginate: (request) => {
+			signals.emit(legSignalKey(request.channelId), { kind: "answered" });
+		},
+		onAnswer: (channelId) => {
+			if (channelId !== ARI_CHANNEL) {
+				return;
+			}
+			queueMicrotask(() => {
+				void holder.orchestrator?.handleEvent(
+					ariEvent("ChannelStateChange", { channel: channel({ state: "Up" }) }),
+				);
+			});
+		},
+	});
+
+	const published: PublishedEvent[] = [];
+	const events = {
+		publish: async (type: string, input: { data: Record<string, unknown> }) => {
+			published.push({ type, data: input.data });
+			return undefined as unknown as CallEventOf<"channel.created">;
+		},
+	} as unknown as CallEventPublisher;
+
+	const kv = new Map<string, ChannelSnapshot>();
+	const cdrs: CdrLegWriteEnvelope[] = [];
+	const jetstream = {
+		putChannel: async (snapshot: ChannelSnapshot) => {
+			kv.set(snapshot.channelId, snapshot);
+		},
+		deleteChannel: async (snapshot: ChannelSnapshot) => {
+			kv.delete(snapshot.channelId);
+		},
+		publishCdrLeg: async (envelope: CdrLegWriteEnvelope) => {
+			cdrs.push(envelope);
+		},
+	} as unknown as JetStreamService;
+
+	const routing = {
+		get: async () => options.artifact,
+	} as unknown as RoutingArtifactSource;
+
+	const dtmf = new DtmfRegistry();
+	const runtime = makeVerbExecutorRuntime({
+		media,
+		collectDtmf: (context, verb) => dtmf.forChannel(context.channelId).collect(verb),
+	});
+
+	const orchestrator = new ChannelOrchestrator(
+		fakeEnv(options.env),
+		media,
+		runtime,
+		dtmf,
+		events,
+		jetstream,
+		routing,
+		signals,
+	);
+
+	holder.orchestrator = orchestrator;
+	return { orchestrator, media, published, kv, cdrs, signals, dtmf };
+}
+
+function channel(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	return {
+		id: ARI_CHANNEL,
+		name: "PJSIP/trunk-00000001",
+		state: "Ring",
+		caller: { name: "Ada", number: "+15551234567" },
+		dialplan: { context: "optimiq-inbound", exten: DID, priority: 1 },
+		...overrides,
+	};
+}
+
+function ariEvent(type: string, extra: Record<string, unknown>): AriEvent {
+	return parseAriEvent({ type, application: "optimiq-engine", ...extra });
+}
+
+/** Arrive, then let the detached walk settle. */
+async function arrive(h: ReturnType<typeof harness>): Promise<void> {
+	await h.orchestrator.handleEvent(ariEvent("StasisStart", { channel: channel(), args: [] }));
+	await h.orchestrator.awaitWalks();
+}
+
+describe("routed inbound calls", () => {
+	it("resolves the DID and walks the plan it produced", async () => {
+		const h = harness({
+			artifact: artifactWith(
+				[
+					...TERMINALS,
+					{
+						id: "ext:1",
+						kind: "extension",
+						extensionId: "0195c0f0-1c2f-7000-8000-0000000000f1",
+						number: "1001",
+						tollClass: "internal",
+						recordPolicy: "none",
+						timeoutSeconds: 20,
+						doNotDisturb: false,
+					} as PlanNode,
+				],
+				"ext:1",
+			),
+		});
+
+		await arrive(h);
+
+		expect(h.media.originated()[0]?.endpoint).toBe("PJSIP/1001");
+		expect(h.media.methods()).toContain("createBridge");
+		expect(h.published.map((event) => event.type)).toContain("channel.bridged");
+	});
+
+	it("does NOT run the pre-routing announcement over the plan", async () => {
+		const h = harness({
+			env: { ENGINE_INBOUND_ANNOUNCEMENT: "sound:welcome" },
+			artifact: artifactWith(
+				[...TERMINALS, { id: "p", kind: "playback", promptId: "greeting" } as PlanNode],
+				"p",
+			),
+		});
+
+		await arrive(h);
+
+		const played = h.media.calls
+			.filter((call) => call.method === "play")
+			.map((call) => (call.args[1] as { media: string[] }).media[0]);
+		expect(played).toEqual(["sound:greeting"]);
+	});
+
+	it("rejects a DID nothing matches with UNALLOCATED_NUMBER, never a guess", async () => {
+		const h = harness({ artifact: artifactWith(TERMINALS, "hangup:UNALLOCATED_NUMBER") });
+		await h.orchestrator.handleEvent(
+			ariEvent("StasisStart", {
+				channel: channel({ dialplan: { context: "optimiq-inbound", exten: "+19998887777" } }),
+				args: [],
+			}),
+		);
+		await h.orchestrator.awaitWalks();
+
+		expect(h.media.hungUp()).toContainEqual({
+			channelId: ARI_CHANNEL,
+			cause: "UNALLOCATED_NUMBER",
+		});
+	});
+
+	it("falls back to the unrouted program when the organization has no artifact", async () => {
+		const h = harness();
+		await arrive(h);
+
+		// Ring + answer, and no rejection: a control plane that is briefly unreachable must not
+		// silently drop every inbound call.
+		expect(h.media.methods()).toEqual(["watchChannel", "ring", "answer"]);
+	});
+
+	it("honours a call-block rule by walking the terminal the resolver chose", async () => {
+		const artifact = artifactWith(TERMINALS, "hangup:NORMAL_CLEARING");
+		const blocked = {
+			...artifact,
+			callBlock: [
+				{
+					id: "0195c0f0-1c2f-7000-8000-0000000000b1",
+					direction: "inbound",
+					action: "block",
+					pattern: { kind: "exact", value: "+15551234567" },
+					label: "known nuisance",
+				},
+			],
+		} as unknown as import("@optimiq-voice/routing").RoutingArtifact;
+
+		const h = harness({ artifact: blocked });
+		await arrive(h);
+
+		expect(h.media.hungUp()).toContainEqual({ channelId: ARI_CHANNEL, cause: "CALL_REJECTED" });
+		// A blocked caller is never answered, so it is never billed.
+		expect(h.media.methods()).not.toContain("answer");
+	});
+});
+
+describe("CDR destination enrichment", () => {
+	it("fills destinationType and destinationRef from the walk", async () => {
+		const h = harness({
+			artifact: artifactWith(
+				[
+					...TERMINALS,
+					{
+						id: "ivr:1",
+						kind: "ivr-menu",
+						ivrMenuId: "0195c0f0-1c2f-7000-8000-0000000000f9",
+						digitTimeoutMs: 10,
+						interDigitTimeoutMs: 10,
+						maxDigits: 1,
+						maxFailures: 0,
+						maxTimeouts: 0,
+						directDialEnabled: false,
+						options: [],
+					} as PlanNode,
+				],
+				"ivr:1",
+			),
+		});
+
+		await arrive(h);
+		await h.orchestrator.handleEvent(
+			ariEvent("ChannelDestroyed", { channel: channel(), cause: 16 }),
+		);
+
+		expect(h.cdrs[0]?.data).toMatchObject({
+			destinationType: "ivr-menu",
+			destinationRef: "0195c0f0-1c2f-7000-8000-0000000000f9",
+		});
+	});
+
+	it("mirrors the destination onto the channel snapshot, so a failover can write it too", async () => {
+		const h = harness({
+			artifact: artifactWith(
+				[...TERMINALS, { id: "p", kind: "playback", promptId: "greeting" } as PlanNode],
+				"p",
+			),
+		});
+
+		await arrive(h);
+
+		const snapshot = [...h.kv.values()][0];
+		expect(snapshot?.variables.OPTIMIQ_DESTINATION_TYPE).toBe("playback");
+	});
+
+	it("still reports `unknown` for a leg that was never routed", async () => {
+		const h = harness();
+		await arrive(h);
+		await h.orchestrator.handleEvent(
+			ariEvent("ChannelDestroyed", { channel: channel(), cause: 16 }),
+		);
+
+		expect(h.cdrs[0]?.data).toMatchObject({ destinationType: "unknown", destinationRef: null });
+	});
+});
+
+describe("legs the walker originated", () => {
+	it("does NOT file a B-leg's StasisStart as a new inbound call", async () => {
+		const h = harness();
+		// Stand in for the walker: a watched key is what marks a leg as ours.
+		const seen: string[] = [];
+		h.signals.watch(legSignalKey("b-leg-1"), (signal) => seen.push(signal.kind));
+
+		await h.orchestrator.handleEvent(
+			ariEvent("StasisStart", { channel: channel({ id: "b-leg-1" }), args: [] }),
+		);
+
+		expect(seen).toEqual(["entered"]);
+		expect(h.orchestrator.activeChannelCount).toBe(0);
+		expect(h.published).toEqual([]);
+	});
+
+	it("republishes a B-leg's answer on the signal bus", async () => {
+		const h = harness();
+		const seen: string[] = [];
+		h.signals.watch(legSignalKey("b-leg-1"), (signal) => seen.push(signal.kind));
+
+		await h.orchestrator.handleEvent(
+			ariEvent("ChannelStateChange", { channel: channel({ id: "b-leg-1", state: "Up" }) }),
+		);
+		expect(seen).toEqual(["answered"]);
+	});
+
+	it("republishes a B-leg's death with the Q.850 cause the failover keys off", async () => {
+		const h = harness();
+		const seen: unknown[] = [];
+		h.signals.watch(legSignalKey("b-leg-1"), (signal) => seen.push(signal));
+
+		await h.orchestrator.handleEvent(
+			ariEvent("ChannelDestroyed", { channel: channel({ id: "b-leg-1" }), cause: 17 }),
+		);
+		expect(seen).toEqual([{ kind: "ended", cause: "USER_BUSY", causeCode: 17 }]);
+	});
+
+	it("republishes recording progress so a voicemail can finish", async () => {
+		const h = harness();
+		const seen: unknown[] = [];
+		h.signals.watch("recording:vm-1", (signal) => seen.push(signal));
+
+		await h.orchestrator.handleEvent(
+			ariEvent("RecordingFinished", {
+				recording: { name: "vm-1", format: "wav", duration: 3 },
+			}),
+		);
+		expect(seen).toEqual([{ kind: "recording-finished", durationMs: 3_000 }]);
+	});
+
+	it("republishes a failed recording with the media server's reason", async () => {
+		const h = harness();
+		const seen: unknown[] = [];
+		h.signals.watch("recording:vm-1", (signal) => seen.push(signal));
+
+		await h.orchestrator.handleEvent(
+			ariEvent("RecordingFailed", {
+				recording: { name: "vm-1", format: "wav", cause: "disk full" },
+			}),
+		);
+		expect(seen).toEqual([{ kind: "recording-failed", reason: "disk full" }]);
+	});
+});
+
+describe("drain with routing on", () => {
+	it("drops every waiter, so an in-flight walk can settle instead of holding the drain", async () => {
+		const h = harness();
+		h.signals.watch(legSignalKey("b-leg-1"), () => undefined);
+		await h.orchestrator.drain(0);
+
+		expect(h.signals.watchedKeyCount).toBe(0);
+		expect(h.orchestrator.isDraining).toBe(true);
+	});
+
+	it("reports no walks in flight once they have settled", async () => {
+		const h = harness({ artifact: artifactWith(TERMINALS, "hangup:NORMAL_CLEARING") });
+		await arrive(h);
+		expect(h.orchestrator.activeWalkCount).toBe(0);
+	});
+});

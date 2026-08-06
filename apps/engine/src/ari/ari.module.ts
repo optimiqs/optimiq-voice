@@ -18,7 +18,7 @@ import type { MediaPort } from "./media-port";
 		{
 			provide: MEDIA_PORT,
 			useFactory: (connection: AriConnectionService): MediaPort =>
-				new AriMediaAdapter(connection.client),
+				new AriMediaAdapter(connection.client, connection.applicationName),
 			inject: [AriConnectionService],
 		},
 	],

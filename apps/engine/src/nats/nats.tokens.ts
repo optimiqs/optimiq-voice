@@ -5,8 +5,17 @@
  * another module's token by accident, and it cannot be produced by a typo.
  */
 
-/** The NestJS `ClientProxy` over the NATS transport, used for core event publishes. */
+/**
+ * The NestJS `ClientProxy` used for core EVENT publishes.
+ *
+ * Separate from {@link ROUTING_RPC_CLIENT} because the two need different wire formats: an event
+ * must reach the broker as the bare envelope `@optimiq-voice/events` specifies, while a
+ * request-reply call must carry Nest's own packet shape or the API's microservice never answers.
+ */
 export const CALL_EVENTS_CLIENT = Symbol("engine/CallEventsClient");
+
+/** The NestJS `ClientProxy` used for `rpc.*` request-reply. Keeps Nest's default serializer. */
+export const ROUTING_RPC_CLIENT = Symbol("engine/RoutingRpcClient");
 
 /** The engine's validated environment. */
 export const ENGINE_ENV = Symbol("engine/Env");

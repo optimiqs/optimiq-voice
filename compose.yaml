@@ -158,8 +158,46 @@ services:
       SIPPROXY_PORT: ${ASTERISK_SIPPROXY_PORT}
       SIPPROXY_SECRET: ${ASTERISK_SIPPROXY_SECRET}
       SIPPROXY_USERNAME: ${ASTERISK_SIPPROXY_USERNAME}
+      # The Optimiq contexts in extensions.conf read these with ${ENV(...)}, so
+      # no tenant id is baked into a file in version control. Leaving
+      # OPTIMIQ_DEV_ORG_ID unset makes the engine REJECT inbound calls with
+      # INVALID_PROFILE, which is correct for a box nobody has assigned.
+      OPTIMIQ_ARI_APP: ${ENGINE_ARI_APP:-optimiq-engine}
+      OPTIMIQ_DEV_ORG_ID: ${OPTIMIQ_DEV_ORG_ID:-}
+      # Static SIP credentials for two demo extensions. Off unless set to
+      # `true`; see apps/asterisk/config/pjsip_dev_endpoints.conf.
+      OPTIMIQ_DEV_ENDPOINTS: ${OPTIMIQ_DEV_ENDPOINTS:-false}
     expose:
       - 6060
+
+  # The Optimiq Voice call engine: ARI-driven channel orchestration, the routing
+  # artifact walker, typed NATS call events and per-leg CDR emission.
+  #
+  # It deliberately has no `depends_on: service_healthy`. The engine is built to
+  # come up against a broker and a media server that are not ready yet — the ARI
+  # socket reconnects, the routing-cache watch retries with backoff, and
+  # `/healthz` reports `degraded` in the meantime. Gating startup would only
+  # move the failure from a log line to a deploy that never finishes.
+  engine:
+    image: optimiq-voice/engine:0.1.0
+    restart: unless-stopped
+    environment:
+      ARI_URL: ${ENGINE_ARI_URL:-http://asterisk:8088}
+      ARI_USERNAME: ${ASTERISK_ARI_USERNAME}
+      ARI_PASSWORD: ${ASTERISK_ARI_SECRET}
+      ARI_APP: ${ENGINE_ARI_APP:-optimiq-engine}
+      NATS_URL: ${ENGINE_NATS_URL:-nats://nats:4222}
+      ENGINE_PORT: ${ENGINE_PORT:-4010}
+      ENGINE_ROUTING_ENABLED: ${ENGINE_ROUTING_ENABLED:-true}
+      # Single-tenant development only. In production this is unset and an
+      # unattributable call is rejected rather than filed under a guess.
+      ENGINE_DEFAULT_ORGANIZATION_ID: ${OPTIMIQ_DEV_ORG_ID:-}
+      ENGINE_EXTENSION_DIAL_TEMPLATE: ${ENGINE_EXTENSION_DIAL_TEMPLATE:-PJSIP/{number}}
+      ENGINE_TRUNK_DIAL_TEMPLATE: ${ENGINE_TRUNK_DIAL_TEMPLATE:-PJSIP/{number}@{trunk}}
+      LOGS_FORMAT: ${ENGINE_LOGS_FORMAT:-}
+      LOGS_LEVEL: ${ENGINE_LOGS_LEVEL:-}
+    expose:
+      - 4010
 
   postgres:
     image: postgres:16.10-alpine3.22
@@ -189,9 +227,17 @@ services:
     volumes:
       - influxdb:/var/lib/influxdb2
 
+  # `-js` enables JetStream, which is NOT the image's default. Without it the
+  # engine cannot apply its stream/KV definitions at boot, the `channels` and
+  # `routing-cache` buckets do not exist, and every `cdr.leg.write` is refused —
+  # so the flag is load-bearing rather than an optimisation. Core pub/sub (which
+  # is all `routr` uses) is unaffected by turning it on.
   nats:
     image: nats:2.11.8
     restart: unless-stopped
+    command: ["-js", "--store_dir", "/data"]
+    volumes:
+      - nats:/data
     expose:
       - 4222
 
@@ -223,3 +269,4 @@ services:
 volumes:
   db:
   influxdb:
+  nats:
