@@ -67,12 +67,12 @@ Environment variables are used in the entry point script to render configuration
 
 ## Dialplan contexts
 
-| Context            | Purpose                                                                       |
-| ------------------ | ----------------------------------------------------------------------------- |
+| Context            | Purpose                                                                          |
+| ------------------ | -------------------------------------------------------------------------------- |
 | `optimiq-inbound`  | Carrier traffic. Stamps the org and hands the channel to the engine's Stasis app |
-| `optimiq-internal` | Registered extensions dialling. Same handover, `internal` routing context      |
-| `optimiq-loopback` | A target that answers. For echo tests and the engine's gated integration suite |
-| `local-ctx`        | The legacy Fonoster media controller. Untouched                               |
+| `optimiq-internal` | Registered extensions dialling. Same handover, `internal` routing context        |
+| `optimiq-loopback` | A target that answers. For echo tests and the engine's gated integration suite   |
+| `local-ctx`        | The inherited upstream media controller. Untouched                               |
 
 The handover is written out per pattern rather than factored into a `GoSub`: `Stasis()` hands the
 channel over with the dialplan position it is standing on, and inside a subroutine that position is
@@ -236,8 +236,8 @@ second set of ARI credentials into the control plane to touch one file was the l
 regenerate-and-reload step is stated instead of hidden. `apps/api/scripts/generate-musiconhold.ts`
 records the same decision at the call site.
 
-**One class per name, platform-wide.** `moh_class.name` is unique per *organization*; Asterisk's
-class namespace is *global* — one file, one set of sections, no tenant dimension. Two tenants that
+**One class per name, platform-wide.** `moh_class.name` is unique per _organization_; Asterisk's
+class namespace is _global_ — one file, one set of sections, no tenant dimension. Two tenants that
 both name a class `hold` collide, and the generator declares **neither**, reports both in the file's
 banner and on stderr, and exits non-zero. Picking a winner would play one tenant's hold music to
 another tenant's callers. The undeclared classes fall back to `default`, which is exactly what

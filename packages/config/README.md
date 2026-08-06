@@ -36,6 +36,24 @@ are set; `AUTH_URL` and `API_APP_URL` are HTTPS; `ROUTR_EXTERNAL_ADDRS`,
 `/* Set to … */` marker; and no ARI/SIP/Postgres/Influx/cloak secret still equals its
 `.env.example` placeholder. RTP port ranges are checked in every environment.
 
+### What it does NOT cover
+
+The placeholder check is exact string matching against `PLACEHOLDER_SECRETS`, so it catches a
+value left as shipped and nothing else. It does not catch:
+
+- **An unset variable that a service defaults in code.** `apps/api`'s `envs.ts` falls back to
+  `"changeme"` for `API_OWNER_PASSWORD` and `API_ROUTR_DEFAULT_PEER_PASSWORD`; the second is not
+  in `.env.example` at all, so it is that value in every deployment. Unset is not a placeholder,
+  so neither is refused.
+- **Secrets outside the checked list:** `INFLUXDB_INIT_TOKEN` / `API_INFLUXDB_INIT_TOKEN`, the
+  passwords embedded in `API_DATABASE_URL`, `API_IDENTITY_DATABASE_URL` and `ROUTR_DATABASE_URL`,
+  `SMTP_PASS` / `API_SMTP_AUTH_PASS`, `API_TWILIO_AUTH_TOKEN` and the `AUTOPILOT_*` keys.
+- **A weak secret that is merely different.** Only `AUTH_SECRET` has a length rule.
+
+The literal strings in `PLACEHOLDER_SECRETS` are load-bearing: they are what `.env.example`
+ships. Changing a placeholder in one place without the other turns a loud startup failure into a
+deployment running on a public password.
+
 ## Adding a variable
 
 Add it to `envSchema` in `src/env.ts` with an explicit default or `.optional()`. If it only

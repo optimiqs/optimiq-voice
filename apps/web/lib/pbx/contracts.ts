@@ -585,8 +585,8 @@ export interface VoicemailPinState {
  * `pinHash`/`moderatorPinHash` from every normal response, and these endpoints answer in booleans.
  *
  * `pinSet` reaches the compiled routing artifact as `ConferencePlanNode.requiresPin`.
- * `moderatorPinSet` reaches nothing yet: `ConferenceInput` in `@optimiq-voice/routing` has no
- * moderator field, so the column is stored and the engine does not read it. The dialog says so.
+ * `moderatorPinSet` is compiled too: the engine verifies it at the same entry prompt, admitting
+ * the caller as moderator and releasing anyone held on `waitForModerator`.
  */
 export interface ConferencePinState {
 	readonly id: string;

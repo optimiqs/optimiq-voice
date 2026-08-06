@@ -21,11 +21,11 @@ import type { ConferenceRow } from "~/lib/pbx/contracts";
  * action menu — see `conference-pin-dialog.tsx`. Nothing here can show whether a room has one,
  * because the server strips the digests from every response.
  *
- * "Wait for a moderator" still carries a warning, and the reason has narrowed rather than gone
- * away: the moderator PIN can be STORED now, but `ConferenceInput` in `@optimiq-voice/routing`
- * carries no moderator field, so no engine reads it and no caller can identify as one. A room with
- * this switched on therefore still holds everybody in music-on-hold indefinitely. The server
- * accepts the combination — it is only unsound in context — so the caution belongs on the control.
+ * "Wait for a moderator" still carries a note, but it is now a dependency rather than a warning.
+ * The moderator PIN is compiled into the artifact and checked by the engine, and matching it is
+ * what releases everybody holding — so the switch works, and it works ONLY once the room has a
+ * moderator PIN. Nothing here can tell whether it does (the digests never leave the server), so
+ * the note says what the pairing needs rather than asserting the room is misconfigured.
  */
 function defaultsFor(conference: ConferenceRow | null): ConferenceFormValues {
 	return {
@@ -177,7 +177,7 @@ export function ConferenceDialog({
 						<SwitchField
 							field={field}
 							label="Hold participants until a moderator arrives"
-							description="Nothing enforces the moderator PIN on calls yet, so nobody can arrive as one: this holds everyone in music-on-hold for as long as they stay on the line."
+							description="Callers hear music on hold until somebody enters this room's moderator PIN. Set one from the Actions menu — without it nobody can arrive as a moderator and every caller waits until the call is dropped."
 							disabled={mutation.isPending}
 						/>
 					)}

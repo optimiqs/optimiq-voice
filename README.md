@@ -1,527 +1,175 @@
-# Optimiq Voice: The complete calling system for modern businesses
+# Optimiq Voice
 
-[Optimiq Voice](https://optimiq.health) brings phone numbers, inbound and outbound calls, AI receptionists, SIP connectivity, and custom call flows into one business calling system.
+[![ci](https://github.com/optimiqs/optimiq-voice/actions/workflows/ci.yaml/badge.svg)](https://github.com/optimiqs/optimiq-voice/actions/workflows/ci.yaml)
+[![license](https://img.shields.io/github/license/optimiqs/optimiq-voice?color=%2347b96d)](./LICENSE)
 
-<a href="https://discord.gg/mpWSRUhG7e"><img alt="Optimiq Voice community banner" src="https://raw.githubusercontent.com/optimiqs/.github/main/profile/community.png"></img></a>
+A multi-tenant cloud phone system. One deployment serves many organizations: each gets its own
+extensions, IVRs, ring groups, queues, conference rooms, voicemail, park lots, time conditions and
+call detail records, isolated at the database level by row-level security rather than by convention.
 
-![build](https://github.com/optimiqs/optimiq-voice/workflows/unit%20tests/badge.svg) [![release](https://github.com/optimiqs/optimiq-voice/actions/workflows/release.yaml/badge.svg)](https://github.com/optimiqs/optimiq-voice/actions/workflows/release.yaml) [![Discord](https://img.shields.io/discord/1016419835455996076?color=5865F2&label=Discord&logo=discord&logoColor=white)](https://discord.gg/4QWgSz4hTC) <a href="https://github.com/optimiqs/optimiq-voice/blob/main/CODE_OF_CONDUCT.md"><img src="https://img.shields.io/badge/Code%20of%20Conduct-v1.0-ff69b4.svg?color=%2347b96d" alt="Code Of Conduct"></a> ![GitHub](https://img.shields.io/github/license/optimiqs/optimiq-voice?color=%2347b96d) ![Twitter Follow](https://img.shields.io/twitter/follow/optimiq-voice?style=social)
+Numbers arrive over SIP from a carrier, the routing compiler turns an organization's configuration
+into a deterministic artifact, and the call engine walks that artifact against a real channel. Every
+significant thing that happens on a call is a typed event on a NATS backbone, which is also how the
+admin UI shows live state.
 
-## Features
+## Architecture
 
-The most notable features of Optimiq Voice are:
+| Piece             | What it is                                                                                                                                                        | Where                                   |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
+| Control-plane API | NestJS 11 on Fastify 5, Effect 4, Drizzle + Postgres. gRPC on 50051, an HTTP bridge on 9876. Owns tenancy, auth, provisioning and the PBX schema.                 | `apps/api`                              |
+| Admin frontend    | Next.js 16 App Router. Talks to the API through a same-origin proxy so the session cookie stays first-party.                                                      | `apps/web`                              |
+| Call engine       | Turns Asterisk ARI events into domain state, walks the compiled routing artifact, publishes call events and emits one CDR per leg.                                | `apps/engine`                           |
+| SIP edge          | Go 1.26 SIP service. Today a registrar: digest auth, AOR bindings in NATS KV, `sip.reg.v1` transitions. Intended to replace Routr.                                | `apps/sipd`                             |
+| Media server      | A dockerized Asterisk 22 (LTS) with generated `pjsip`/`ari` config. Scaffolding — the engine drives it over ARI.                                                  | `apps/asterisk`                         |
+| Event backbone    | The versioned subject taxonomy, Zod event schemas and JetStream stream/KV definitions every service shares. A Go peer is generated from it and drift-gated in CI. | `packages/events`, `packages/events-go` |
+| Routing compiler  | Compiles a PBX configuration snapshot into a cacheable routing artifact and resolves inbound, internal and outbound calls against it.                             | `packages/routing`                      |
+| Carrier           | Typed Telnyx API v2 client, with an in-package fake Telnyx server for tests.                                                                                      | `packages/telnyx`                       |
 
-- [x] Multitenancy
-- [x] Easy deployment of PBX functionalities
-- [x] Custom call flows and voice applications
-- [x] NodeJS SDK
-- [x] Support for Amazon Simple Storage Service (S3)
-- [x] Secure API endpoints with Let's Encrypt
-- [x] Authentication with OAuth2
-- [x] Authentication with JWT
-- [x] Role-Based Access Control (RBAC)
-- [x] Plugins-based Command-line Tool
-- [x] Support for Google Speech APIs
+Postgres, NATS (JetStream), InfluxDB, Envoy and rtpengine round out the runtime; all of them are in
+`compose.yaml`.
 
-## Code Examples
+## Repository layout
 
-A Voice Application is a server that controls a call's flow. A Voice Application can use any combination of the following verbs:
-
-- `Answer` - Accepts an incoming call
-- `Hangup` - Closes the call
-- `Play`: Takes a URL with a media file and streams the sound back to the calling party
-- `PlayDtmf` - Takes a DTMF sequence and plays it back to the calling party
-- `Say` - Takes a text, synthesizes the text into audio, and streams back the result
-- `Gather` - Waits for DTMF or speech events and returns back the result
-- `SGather` - Returns a stream for future DTMF and speech results
-- `Stream` - Creates a bidirectional stream to send and receive audio from a caller
-- `Dial` - Passes the call to an Agent or a Number at the PSTN
-- `Record` - It records the voice of the calling party and saves the audio on the Storage sub-system
-- `Mute` - It tells the channel to stop sending media, effectively muting the channel
-- `Unmute` - It tells the channel to allow media flow
-
-Voice Application Example:
-
-```typescript
-const VoiceServer = require("@optimiq-voice/voice").default;
-const { GatherSource, VoiceRequest, VoiceResponse } = require("@optimiq-voice/voice");
-
-new VoiceServer().listen(async (req: VoiceRequest, voice: VoiceResponse) => {
-	const { ingressNumber, sessionRef, appRef } = req;
-
-	await voice.answer();
-
-	await voice.say("Hi there! What's your name?");
-
-	const { speech: name } = await voice.gather({
-		source: GatherSource.SPEECH,
-	});
-
-	await voice.say("Nice to meet you " + name + "!");
-
-	await voice.say("Please enter your 4 digit pin.");
-
-	const { digits } = await voice.gather({
-		maxDigits: 4,
-		finishOnKey: "#",
-	});
-
-	await voice.say("Your pin is " + digits);
-
-	await voice.hangup();
-});
-
-// Your app will live at tcp://127.0.0.1:50061
-// and you can easily publish it to the Internet with:
-// ngrok tcp 50061
+```
+apps/
+  api          control-plane API (NestJS + Fastify + Effect)
+  web          admin frontend (Next.js 16)
+  engine       ARI-driven call engine
+  sipd         Go SIP edge (registrar)
+  asterisk     Asterisk 22 image, config and run script
+  autopilot    LLM voice-AI agent
+  mcp          Model Context Protocol server over the API
+  ctl          oclif command-line tool
+  dashboard    legacy React Router admin UI — no longer part of the stack
+  identity     Dockerfile only; the code lives in packages/identity
+packages/
+  auth         better-auth composition and the permission registry
+  authz        legacy authorization service
+  cdr-db       CDR bounded context: per-leg records, call events, recordings
+  common       shared library and protobuf definitions
+  config       the one validated view of the environment
+  db           schema primitives, tenant RLS wrappers, preflight harness
+  effect-runtime  Effect <-> NestJS seam
+  events       NATS contract (subjects, schemas, streams)
+  events-go    generated Go peer of packages/events
+  identifiers  UUID v7 entity identifiers
+  identity     legacy identity service
+  logger       legacy logger
+  logging      redacting Pino logger
+  media-ari    typed Asterisk 22 ARI adapter (protocol only)
+  pbx-db       telephony bounded context: PBX schema, RLS policies
+  routing      routing compiler
+  sdk          web and Node.js SDK
+  sipnet       Routr-based SIP stack
+  streams      AudioSocket support
+  telephony    pure call domain: state machines, verbs, hangup causes
+  telnyx       Telnyx client and fake server
+  types        shared types
+  voice        voice application server
+config/        Envoy, nginx and example integration configuration
+etc/           logging configuration mounted into containers
+openspec/      specifications and in-flight change proposals
+plans/         migration plans and research notes
 ```
 
-Everything in Optimiq Voice is an API first, and initiating a call is no exception. You can use the SDK to start a call with a few lines of code.
+Several packages are inherited from the platform this fork started as — `authz`, `common`,
+`identity`, `logger`, `sdk`, `sipnet`, `streams`, `types`, `voice`, and `apps/ctl`, `apps/mcp`,
+`apps/dashboard`. They still build, and they are being retired rather than extended.
 
-Example of originating a call with the SDK:
+## Quickstart
 
-```typescript
-const SDK = require("@optimiq-voice/sdk");
-
-async function main(request) {
-	const apiKey = "your-api-key";
-	const apiSecret = "your-api-secret";
-	const accessKeyId = "WO00000000000000000000000000000000";
-
-	const client = new SDK.Client({ accessKeyId });
-	await client.loginWithApiKey(apiKey, apiSecret);
-
-	const calls = new SDK.Calls(client);
-	const response = await calls.createCall(request);
-
-	console.log(response); // successful response
-}
-
-const request = {
-	from: "+18287854037",
-	to: "+17853178070",
-	appRef: "3e61ecb7-a1b6-4a93-84c3-4f1979165bca",
-	// Optional metadata to be sent to the Voice Application
-	metadata: {
-		name: "John Doe",
-		message: "Please call me back.",
-	},
-};
-
-main(request).catch(console.error);
-```
-
-## Getting Started
-
-Generate a signing keypair before starting the complete stack directly with Docker Compose:
+**Requirements:** Node >= 22.13.0, pnpm 11.20.0, Docker, and Go 1.26 to work on `apps/sipd`.
+Package tests run under Bun (CI pins 1.3.11).
 
 ```bash
-pnpm run generate:keypair
+# 1. Configuration. This file is local-development only and every secret in it is public.
+cp .env.example.dev .env
+
+# 2. Dependencies.
+pnpm install
+
+# 3. Build. Workspace packages resolve through their built output, so this comes first.
+pnpm run build
+
+# 4. Infrastructure: Postgres, NATS, InfluxDB, Asterisk, Routr, rtpengine, Envoy,
+#    plus Adminer on :8282 and MailHog on :8025. Generates a signing keypair first.
+pnpm run start:services
+
+# 5. Schema.
+pnpm run db:migrate
+
+# 6. The API on gRPC :50051 with its HTTP bridge on :9876.
+pnpm run start:api
+
+# 7. The admin frontend on :3100, in a second terminal.
+pnpm --filter @optimiq-voice/web run dev
 ```
 
-The `pnpm run start:services` command generates this local keypair automatically.
+Sign in with `API_OWNER_EMAIL` / `API_OWNER_PASSWORD` from your `.env`. Mail is delivered to
+MailHog, so sign-up, invitation and voicemail messages are real messages you can open at
+<http://localhost:8025>.
 
-To get started with Optimiq Voice, use the following resources:
+Stop everything with `pnpm run stop:services`.
 
-- [Deploying Optimiq Voice with Docker](https://docs.optimiq.health/self-hosting)
-- [Guide for Early Access User](https://docs.optimiq.health/quickstart)
-- [Getting started with Optimiq Voice](https://docs.optimiq.health/quickstart)
+Optional demo data: `pnpm run db:seed`, `pnpm --filter @optimiq-voice/api run seed:pbx`,
+`pnpm --filter @optimiq-voice/api run seed:cdr`.
 
-## Give a Star! ⭐
+## Everyday commands
 
-Please give it a star if you like this project or plan to use it. Thanks 🙏
+```bash
+pnpm run build            # turbo run build
+pnpm run typecheck        # turbo run typecheck
+pnpm run lint             # oxlint
+pnpm run format           # oxfmt
+pnpm run format:check     # oxfmt --check
+pnpm run db:generate      # regenerate migrations across every schema package
+```
 
-## Bugs and Feedback
+Tests are split by runner. The newer packages and apps use Bun; the inherited tree uses Mocha at
+the root.
 
-For bugs, questions, and discussions, please use the [Github Issues](https://github.com/optimiqs/optimiq-voice/issues)
+```bash
+pnpm --filter @optimiq-voice/web run test        # bun test
+pnpm --filter @optimiq-voice/engine run test     # bun test src
+pnpm run test                                    # root Mocha suite (needs .env)
+cd apps/sipd && go test ./...                    # Go SIP edge
+```
+
+CI (`.github/workflows/ci.yaml`) runs `turbo run build`, `turbo run test` and `turbo run typecheck`,
+checks that the Go event peer has not drifted from `packages/events`, and runs the Go module tests.
+The `verify:*` scripts in `apps/api` and the `smoke:*` scripts in `apps/web` are not part of CI —
+they need a live Postgres, NATS and Asterisk to run against.
+
+## Running the whole stack in containers
+
+`compose.yaml` is the deployment topology; `compose.dev.yaml` overlays local builds, published ports
+and the two development-only containers.
+
+```bash
+docker compose -f compose.yaml -f compose.dev.yaml up -d --build
+```
+
+For a real deployment, start from `.env.example` instead. It is the production template: it ships
+placeholders rather than credentials, and `@optimiq-voice/config` refuses to boot a
+`NODE_ENV=production` process that still carries them. The file lists which secrets that preflight
+enforces and which it does not.
+
+## Status
+
+This is a platform under active migration, not a finished product. The routing compiler, the PBX
+schema and the admin frontend are the mature parts. The call engine implements a subset of the
+session protocol and reports the rest as unsupported rather than pretending; `apps/sipd` registers
+endpoints but does not yet proxy calls; E911 addresses are stored but never sent to a carrier.
+Where something is not built, the code and the UI say so.
 
 ## Contributing
 
-For contributing, please see the following links:
-
-- [Contribution Documents](https://github.com/optimiqs/optimiq-voice/blob/main/CONTRIBUTING.md)
-- [Contributors](https://github.com/optimiqs/optimiq-voice/contributors)
+Bugs, questions and discussion belong in
+[GitHub Issues](https://github.com/optimiqs/optimiq-voice/issues).
 
 <!-- readme: contributors -start -->
-<table>
-<tr>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/psanders>
-            <img src=https://avatars.githubusercontent.com/u/539774?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Pedro Sanders/>
-            <br />
-            <sub style="font-size:14px"><b>Pedro Sanders</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/efraa>
-            <img src=https://avatars.githubusercontent.com/u/40646537?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Efrain Peralta/>
-            <br />
-            <sub style="font-size:14px"><b>Efrain Peralta</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/angelbencosme>
-            <img src=https://avatars.githubusercontent.com/u/6846866?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Angel M. Bencosme/>
-            <br />
-            <sub style="font-size:14px"><b>Angel M. Bencosme</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/whernandez>
-            <img src=https://avatars.githubusercontent.com/u/37089069?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Wandy Hernandez/>
-            <br />
-            <sub style="font-size:14px"><b>Wandy Hernandez</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/obrucheoghene>
-            <img src=https://avatars.githubusercontent.com/u/111436934?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Obruche Wilfred  Oghenechohwo/>
-            <br />
-            <sub style="font-size:14px"><b>Obruche Wilfred  Oghenechohwo</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/wardner>
-            <img src=https://avatars.githubusercontent.com/u/51765669?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Wardner Lara/>
-            <br />
-            <sub style="font-size:14px"><b>Wardner Lara</b></sub>
-        </a>
-    </td>
-</tr>
-<tr>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/rihernandez>
-            <img src=https://avatars.githubusercontent.com/u/27718122?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Richard HC/>
-            <br />
-            <sub style="font-size:14px"><b>Richard HC</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/Nageswari-droid>
-            <img src=https://avatars.githubusercontent.com/u/65342122?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Nageswari/>
-            <br />
-            <sub style="font-size:14px"><b>Nageswari</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/xquanluu>
-            <img src=https://avatars.githubusercontent.com/u/110280845?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Hoan Luu Huu/>
-            <br />
-            <sub style="font-size:14px"><b>Hoan Luu Huu</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/speedymonster>
-            <img src=https://avatars.githubusercontent.com/u/31810381?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Speedy Monster/>
-            <br />
-            <sub style="font-size:14px"><b>Speedy Monster</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/parz3val>
-            <img src=https://avatars.githubusercontent.com/u/34773307?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=harry_dev/>
-            <br />
-            <sub style="font-size:14px"><b>harry_dev</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/CKanishka>
-            <img src=https://avatars.githubusercontent.com/u/30779692?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Kanishka Chowdhury/>
-            <br />
-            <sub style="font-size:14px"><b>Kanishka Chowdhury</b></sub>
-        </a>
-    </td>
-</tr>
-<tr>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/BrayanMnz>
-            <img src=https://avatars.githubusercontent.com/u/61812255?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Brayan Munoz V./>
-            <br />
-            <sub style="font-size:14px"><b>Brayan Munoz V.</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/milis92>
-            <img src=https://avatars.githubusercontent.com/u/13440798?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Ivan Milisavljevic />
-            <br />
-            <sub style="font-size:14px"><b>Ivan Milisavljevic </b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/dedekrnwan>
-            <img src=https://avatars.githubusercontent.com/u/25242055?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Dede kurniawan/>
-            <br />
-            <sub style="font-size:14px"><b>Dede kurniawan</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/gad2103>
-            <img src=https://avatars.githubusercontent.com/u/1045265?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=gabriel duncan/>
-            <br />
-            <sub style="font-size:14px"><b>gabriel duncan</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/iamppborah>
-            <img src=https://avatars.githubusercontent.com/u/96339995?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Prasurjya Pran Borah/>
-            <br />
-            <sub style="font-size:14px"><b>Prasurjya Pran Borah</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/justjordan15>
-            <img src=https://avatars.githubusercontent.com/u/164441222?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Jordan/>
-            <br />
-            <sub style="font-size:14px"><b>Jordan</b></sub>
-        </a>
-    </td>
-</tr>
-<tr>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/hectorvent>
-            <img src=https://avatars.githubusercontent.com/u/2405682?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Hector Ventura/>
-            <br />
-            <sub style="font-size:14px"><b>Hector Ventura</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/0xflotus>
-            <img src=https://avatars.githubusercontent.com/u/26602940?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=0xflotus/>
-            <br />
-            <sub style="font-size:14px"><b>0xflotus</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/itzmanish>
-            <img src=https://avatars.githubusercontent.com/u/12438068?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Manish/>
-            <br />
-            <sub style="font-size:14px"><b>Manish</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/osehgol>
-            <img src=https://avatars.githubusercontent.com/u/4996423?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Osama Sehgol/>
-            <br />
-            <sub style="font-size:14px"><b>Osama Sehgol</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/psuet>
-            <img src=https://avatars.githubusercontent.com/u/7604288?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Paul Sütterlin/>
-            <br />
-            <sub style="font-size:14px"><b>Paul Sütterlin</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/RiadVargas>
-            <img src=https://avatars.githubusercontent.com/u/4274014?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Riad Vargas/>
-            <br />
-            <sub style="font-size:14px"><b>Riad Vargas</b></sub>
-        </a>
-    </td>
-</tr>
-<tr>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/vcidst>
-            <img src=https://avatars.githubusercontent.com/u/683016?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Shailendra Paliwal/>
-            <br />
-            <sub style="font-size:14px"><b>Shailendra Paliwal</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/gitter-badger>
-            <img src=https://avatars.githubusercontent.com/u/8518239?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=The Gitter Badger/>
-            <br />
-            <sub style="font-size:14px"><b>The Gitter Badger</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/YuriCodes>
-            <img src=https://avatars.githubusercontent.com/u/80093500?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Yuri/>
-            <br />
-            <sub style="font-size:14px"><b>Yuri</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/cdrsociate>
-            <img src=https://avatars.githubusercontent.com/u/89363212?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=cdrsociate/>
-            <br />
-            <sub style="font-size:14px"><b>cdrsociate</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/ghana7989>
-            <img src=https://avatars.githubusercontent.com/u/65382745?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=pavan/>
-            <br />
-            <sub style="font-size:14px"><b>pavan</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/nrjchnd>
-            <img src=https://avatars.githubusercontent.com/u/17134818?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=nrjchnd/>
-            <br />
-            <sub style="font-size:14px"><b>nrjchnd</b></sub>
-        </a>
-    </td>
-</tr>
-<tr>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/salami-dev>
-            <img src=https://avatars.githubusercontent.com/u/57477131?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Salami Bashir/>
-            <br />
-            <sub style="font-size:14px"><b>Salami Bashir</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/scshiv29-dev>
-            <img src=https://avatars.githubusercontent.com/u/68141773?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Shivam Deepak Chaudhary/>
-            <br />
-            <sub style="font-size:14px"><b>Shivam Deepak Chaudhary</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/showf68>
-            <img src=https://avatars.githubusercontent.com/u/45857918?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Yossef Haim/>
-            <br />
-            <sub style="font-size:14px"><b>Yossef Haim</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/telenautical>
-            <img src=https://avatars.githubusercontent.com/u/106842020?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=telenautical/>
-            <br />
-            <sub style="font-size:14px"><b>telenautical</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/theewiz>
-            <img src=https://avatars.githubusercontent.com/u/81051645?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Wisdom Elendu/>
-            <br />
-            <sub style="font-size:14px"><b>Wisdom Elendu</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/judgegodwins>
-            <img src=https://avatars.githubusercontent.com/u/38760034?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Judge Godwins/>
-            <br />
-            <sub style="font-size:14px"><b>Judge Godwins</b></sub>
-        </a>
-    </td>
-</tr>
-<tr>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/jonathan-chin>
-            <img src=https://avatars.githubusercontent.com/u/7519412?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Jon Chin/>
-            <br />
-            <sub style="font-size:14px"><b>Jon Chin</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/harish-chander>
-            <img src=https://avatars.githubusercontent.com/u/13236956?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Harish Chander/>
-            <br />
-            <sub style="font-size:14px"><b>Harish Chander</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/GaryBarnes17>
-            <img src=https://avatars.githubusercontent.com/u/97693048?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Gary Barnes/>
-            <br />
-            <sub style="font-size:14px"><b>Gary Barnes</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/FidalMathew>
-            <img src=https://avatars.githubusercontent.com/u/84982038?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Fidal Mathew/>
-            <br />
-            <sub style="font-size:14px"><b>Fidal Mathew</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/eatskolnikov>
-            <img src=https://avatars.githubusercontent.com/u/1693000?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Enmanuel Toribio/>
-            <br />
-            <sub style="font-size:14px"><b>Enmanuel Toribio</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/jellydn>
-            <img src=https://avatars.githubusercontent.com/u/870029?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Dung Duc Huynh (Kaka)/>
-            <br />
-            <sub style="font-size:14px"><b>Dung Duc Huynh (Kaka)</b></sub>
-        </a>
-    </td>
-</tr>
-<tr>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/cdosoftei>
-            <img src=https://avatars.githubusercontent.com/u/7636091?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Ciprian/>
-            <br />
-            <sub style="font-size:14px"><b>Ciprian</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/infinitydon>
-            <img src=https://avatars.githubusercontent.com/u/6318992?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Christopher Adigun/>
-            <br />
-            <sub style="font-size:14px"><b>Christopher Adigun</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/brunowego>
-            <img src=https://avatars.githubusercontent.com/u/441774?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Bruno Gomes/>
-            <br />
-            <sub style="font-size:14px"><b>Bruno Gomes</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/brunoarueira>
-            <img src=https://avatars.githubusercontent.com/u/119518?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Bruno Arueira/>
-            <br />
-            <sub style="font-size:14px"><b>Bruno Arueira</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/antoniusostermann>
-            <img src=https://avatars.githubusercontent.com/u/2332002?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Antonius Ostermann/>
-            <br />
-            <sub style="font-size:14px"><b>Antonius Ostermann</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/alifiratari>
-            <img src=https://avatars.githubusercontent.com/u/10004438?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Ali Firat ARI/>
-            <br />
-            <sub style="font-size:14px"><b>Ali Firat ARI</b></sub>
-        </a>
-    </td>
-</tr>
-<tr>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/alexsands>
-            <img src=https://avatars.githubusercontent.com/u/4269772?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Alex/>
-            <br />
-            <sub style="font-size:14px"><b>Alex</b></sub>
-        </a>
-    </td>
-    <td align="center" style="word-wrap: break-word; width: 150.0; height: 150.0">
-        <a href=https://github.com/itsalb3rt>
-            <img src=https://avatars.githubusercontent.com/u/35310226?v=4 width="100;"  style="border-radius:50%;align-items:center;justify-content:center;overflow:hidden;padding-top:10px" alt=Albert E. Hidalgo Taveras/>
-            <br />
-            <sub style="font-size:14px"><b>Albert E. Hidalgo Taveras</b></sub>
-        </a>
-    </td>
-</tr>
-</table>
 <!-- readme: contributors -end -->
-
-## Sponsors
-
-We're glad to be supported by respected companies and individuals from several industries.
-
-Find all our supporters [here](https://github.com/sponsors/optimiqs)
-
-> [Become a Github Sponsor](https://github.com/sponsors/optimiqs)
 
 ## License
 
-Copyright (C) 2026 by Optimiq Voice contributors. MIT License (see [LICENSE](https://github.com/optimiqs/optimiq-voice/blob/main/LICENSE) for details).
+[MIT](./LICENSE)

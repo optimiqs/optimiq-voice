@@ -11,10 +11,10 @@ import {
 	DialogTitle,
 } from "~/components/ui/dialog";
 import { inputClassName } from "~/components/ui/field";
-import type { ConferencePinRole } from "~/lib/pbx/client";
 import { pbxFormMessage } from "~/lib/pbx/errors";
 import { keypadPinIssue, MAX_PIN_LENGTH, MIN_PIN_LENGTH } from "~/lib/pbx/schemas";
 import { useConferencePin } from "../../_hooks/use-media-queries";
+import type { ConferencePinRole } from "~/lib/pbx/client";
 import type { ConferenceRow } from "~/lib/pbx/contracts";
 
 /**
@@ -38,21 +38,21 @@ import type { ConferenceRow } from "~/lib/pbx/contracts";
  *
  * ## What each PIN does, and the difference is not cosmetic
  *
- * The **room PIN** is enforced. `pinSet` reaches the compiled artifact as
- * `ConferencePlanNode.requiresPin`, so setting one changes what a caller is asked for on the next
- * call after the recompile.
+ * Both are enforced. `pinSet` and `moderatorPinSet` reach the compiled artifact as
+ * `ConferencePlanNode.requiresPin` / `requiresModeratorPin`, with the digests alongside them, so
+ * setting either changes what a caller is asked for on the next call after the recompile.
  *
- * The **moderator PIN** is stored and enforced by nothing. `ConferenceInput` in
- * `@optimiq-voice/routing` carries no moderator field, so no compiled plan node has anywhere to put
- * it and no engine reads it. The dialog says that plainly rather than presenting two controls that
- * look equivalent. It is still offered, because storing it now means the rooms are already
- * configured when the engine grows the field — but somebody setting one today must not believe they
- * have restricted anything.
+ * There is **one** prompt for both. The engine checks the digits against the moderator digest
+ * first and the participant digest second, so a moderator dials the room like anyone else and is
+ * recognised rather than having to announce themselves; the caller is never told which of the two
+ * they matched. A room whose only credential is the moderator's admits an empty entry as a
+ * participant, which is what makes a moderator PIN usable on its own.
  *
- * That is also why the moderator variant warns about `waitForModerator`: a room with that switched
- * on and no enforced way to identify a moderator holds every participant in music-on-hold for as
- * long as they stay on the line, with nobody able to release them. The server accepts the
- * combination — it is unsound only in context — so the caution belongs on the control.
+ * The difference is what admission means. Matching the **moderator** digest also satisfies
+ * `waitForModerator` for everybody already holding — that is the whole point of the flag, and it
+ * is why the moderator variant carries a note when the room has it switched on: until a moderator
+ * PIN exists, nobody can arrive as one and every participant sits in music-on-hold until the
+ * engine's wait budget expires.
  *
  * ## The policy lives on the server
  *
@@ -114,7 +114,7 @@ export function ConferencePinDialog({
 					</DialogTitle>
 					<DialogDescription>
 						{isModerator
-							? "Stored, hashed, and read by nothing. The routing engine has no moderator field yet, so a room with this set behaves exactly as one without."
+							? "Asked for at the same prompt as the room PIN. Entering it admits the caller as a moderator, which also releases anyone held waiting for one."
 							: "Asked for when somebody dials this room. Without one, anyone who can reach the number is admitted."}
 					</DialogDescription>
 				</DialogHeader>
@@ -159,10 +159,9 @@ export function ConferencePinDialog({
 
 					{isModerator && conference?.waitForModerator === true ? (
 						<p className="mt-2 rounded-panel border border-warning/40 bg-warning-subtle px-3 py-2 text-xs text-foreground">
-							This room holds participants until a moderator arrives. Because no moderator PIN is
-							enforced on calls yet, nobody can arrive as one — everybody who dials in waits in
-							music-on-hold until they hang up. Switch that setting off on the room until the
-							engine reads this PIN.
+							This room holds participants until a moderator arrives, and entering this PIN is how
+							somebody arrives as one. Until a moderator PIN is set, everybody who dials in waits in
+							music-on-hold until the wait budget runs out and the call ends.
 						</p>
 					) : null}
 

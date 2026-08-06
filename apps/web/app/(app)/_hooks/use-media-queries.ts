@@ -379,11 +379,10 @@ export function useGreetingPlaybackUrl(): UseMutationResult<
  * would be two places to remember that `conference` is a routing input.
  *
  * It IS one: setting a participant PIN flips `ConferencePlanNode.requiresPin` in the compiled
- * artifact, so the compile view is invalidated. The MODERATOR pin is stored and reaches nothing
- * downstream today (`ConferenceInput` in `@optimiq-voice/routing` has no moderator field), and it
- * still invalidates — a recompile that produced an identical hash is a provable no-op, and a hook
- * that tried to be clever about which of the two mattered would be a second copy of a rule the
- * server already applies.
+ * artifact, and the moderator PIN is compiled and verified at the same prompt (matching it admits
+ * the caller as moderator and releases anyone held on `waitForModerator`) — so either credential
+ * changing invalidates the compile view, and a hook that tried to be clever about which of the
+ * two mattered would be a second copy of a rule the server already applies.
  *
  * No toast on failure: the PIN form renders the message under its own input, where it can be
  * re-read and acted on.
