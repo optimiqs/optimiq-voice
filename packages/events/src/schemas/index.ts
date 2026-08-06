@@ -2,25 +2,21 @@
  * Zod contracts for every subject on the NATS backbone.
  *
  * These schemas are the SINGLE SOURCE OF TRUTH for the wire format. The inferred TypeScript types
- * are derived from them, and the Go structs for `apps/sipd` / `apps/mediad` will be too.
+ * are derived from them, and the Go structs in `packages/events-go` are generated from them.
  *
- * ## TODO — cross-language codegen (blocked on `apps/mediad` existing)
+ * ## Cross-language codegen (live — see `scripts/generate-go.ts`)
  *
- * Plan §3.5 requires "generated Go structs (single source: JSON Schema emitted from Zod; CI checks
- * cross-language drift)". Deliberately NOT built yet: generating structs for a service that does
- * not exist would freeze the contract against an imaginary consumer. When `apps/mediad` lands:
+ * `pnpm --filter @optimiq-voice/events codegen` walks the explicit registry in
+ * `scripts/registry.ts`, emits JSON Schema (draft-2020-12, zod 4 `z.toJSONSchema`) into
+ * `schema/`, and generates `packages/events-go/*_gen.go` plus the parity golden
+ * (`testdata/parity.json`) that the Go tests byte-compare against the live TS implementation.
+ * `pnpm --filter @optimiq-voice/events codegen:check` is the CI drift gate: a schema change that
+ * forgets codegen fails the build, which is the whole point of "no untyped publishes".
  *
- * 1. `scripts/emit-json-schema.ts` — walk `EVENT_SCHEMAS_BY_FAMILY` and `RPC_CONTRACTS`, call
- *    `z.toJSONSchema(schema, { target: "draft-2020-12", io: "output" })` (built into zod 4, no
- *    extra dependency), and write `schema/<family>.schema.json` per family plus one
- *    `schema/index.json` manifest listing subject → schema file.
- * 2. `scripts/generate-go-structs.sh` — run `quicktype`/`go-jsonschema` over that directory into
- *    `apps/mediad/internal/events/` (package `events`), one file per family.
- * 3. CI drift gate: re-run step 1 into a temp dir and `git diff --exit-code` the committed JSON
- *    Schema, then re-run step 2 and diff the Go. A schema change that forgets codegen fails the
- *    build, which is the whole point of "no untyped publishes, lint-enforced".
+ * Adding or changing a schema therefore means: edit here, register it in `scripts/registry.ts`
+ * if new, run `codegen`, and commit the regenerated `schema/` + `packages/events-go` output.
  *
- * Keep the emitted JSON Schema in the repo: it is the artifact the drift check compares, and it
+ * The emitted JSON Schema stays in the repo: it is the artifact the drift check compares, and it
  * documents the contract for anyone who cannot run TypeScript.
  */
 

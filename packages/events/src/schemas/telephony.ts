@@ -99,15 +99,16 @@ export const hangupCauseSchema = z
 export const hangupCauseCodeSchema = z.int().min(0).max(1023);
 
 /**
- * What a routing decision resolved to. **Authority: `cdr-db` `CALL_DESTINATION_TYPES`.** Kept as
- * a constrained string here for the same reason as {@link hangupCauseSchema}: new destination
- * types arrive with new PBX features and must not require an `events` release.
+ * What a routing decision resolved to. **Authority: `cdr-db` `CALL_DESTINATION_TYPES`** (snake)
+ * and `pbx-db`/`routing` destination kinds (kebab). Kept as a constrained string here for the
+ * same reason as {@link hangupCauseSchema}: new destination types arrive with new PBX features
+ * and must not require an `events` release.
  */
 export const destinationTypeSchema = z
 	.string()
 	.min(1)
 	.max(32)
-	.regex(/^[a-z][a-z_]*$/, "destination type must be lower_snake_case (see cdr-db)");
+	.regex(/^[a-z][a-z_-]*$/, "destination type must be lower snake_case or kebab-case");
 
 /** Reporting outcome of a leg. **Authority: `cdr-db` `CALL_DISPOSITIONS`.** */
 export const dispositionSchema = z
