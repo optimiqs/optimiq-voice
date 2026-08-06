@@ -161,6 +161,38 @@ The alternative — having the engine download the object and stage it before pl
 for the obvious reason: it puts a network fetch on the call path, in front of a caller who is
 already connected and listening.
 
+#### The media library uses the same mount, and MOH needs one more step
+
+`apps/api` now serves an upload path for the tenant's own audio — hold-music files, IVR prompts and
+voicemail greetings — and it writes into the **same object root**, which is why
+`PBX_MEDIA_OBJECT_ROOT` defaults to `PBX_VOICEMAIL_MEDIA_ROOT` and that in turn to
+`CDR_RECORDING_ROOT`. The layout under it is:
+
+```text
+prompts/<organizationId>/<uuid>.wav
+moh/<organizationId>/<mohClassId>/<uuid>.wav
+greetings/<organizationId>/<voicemailBoxId>/<uuid>.wav
+```
+
+Every segment is a UUID the API minted — never a user-supplied name, never a class's NAME (renaming
+a class must not have to move files). The API refuses anything the media server cannot decode:
+RIFF/WAVE 16-bit PCM and MP3 only, checked by **magic bytes** rather than by the declared content
+type, because a renamed executable declares `audio/wav`. 8 kHz mono PCM is the documented baseline —
+anything else is stored with a warning that says it will be resampled on every play.
+
+**Prompts and greetings work with the mount alone.** The compiler embeds them as
+`object://<objectKey>`, `media-refs.ts` renders that as `sound:<ENGINE_MEDIA_OBJECT_ROOT>/<key>`
+with the extension stripped, and Asterisk picks the best format sitting beside that stem.
+
+**Music on hold does not**, and this is a real gap worth stating rather than discovering. The engine
+hands ARI a hold-music CLASS NAME, and Asterisk resolves a class through `musiconhold.conf`, not
+through a path — so uploading files under `moh/<org>/<classId>/` puts the audio where the container
+can see it and does **not**, on its own, make the class exist. A deployment that wants tenant-managed
+hold music needs a `musiconhold.conf` section per class pointing `directory` at that path, generated
+from the `moh_class` table. Nothing does that yet; today the classes are configuration the compiler
+resolves and the media server has to have been told about separately. Recorded here because this
+file is where an operator asks the question.
+
 ### `sounds/`
 
 Baked into the image (`COPY sounds/ /usr/share/asterisk/sounds/en`), not mounted, so

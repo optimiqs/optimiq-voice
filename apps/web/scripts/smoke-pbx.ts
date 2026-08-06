@@ -41,7 +41,9 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -174,6 +176,97 @@ function makeClient(baseUrl: string, jar: CookieJar) {
 type Client = ReturnType<typeof makeClient>;
 
 /**
+ * A `multipart/form-data` upload, through the Next origin the browser uses.
+ *
+ * Built with the platform's own `FormData` and `Blob`, and — critically — with NO `content-type`
+ * header: the runtime derives it from the body and appends the boundary token, and a hand-written
+ * one cannot contain a boundary we do not know. That is exactly the constraint `apiUpload` in
+ * `lib/api-client.ts` has to honour, which is why the smoke reproduces it rather than shortcutting
+ * to a hand-built body. If the rewrite ever mangled a multipart request, this is what would notice.
+ */
+function makeUploader(baseUrl: string, jar: CookieJar) {
+	return async (
+		path: string,
+		file: { readonly bytes: Uint8Array; readonly name: string; readonly type: string },
+		fields: Readonly<Record<string, string>> = {},
+	): Promise<JsonResponse> => {
+		const form = new FormData();
+		form.append(
+			"file",
+			new Blob([file.bytes as unknown as BlobPart], { type: file.type }),
+			file.name,
+		);
+		for (const [key, value] of Object.entries(fields)) {
+			form.append(key, value);
+		}
+		const headers: Record<string, string> = { accept: "application/json" };
+		const cookie = jar.header();
+		if (cookie) {
+			headers.cookie = cookie;
+		}
+		const response = await fetch(`${baseUrl}${path}`, {
+			method: "POST",
+			headers,
+			redirect: "manual",
+			body: form,
+		});
+		jar.absorb(response);
+		const text = await response.text();
+		let parsed: unknown = null;
+		try {
+			parsed = text.length > 0 ? JSON.parse(text) : null;
+		} catch {
+			parsed = { raw: text };
+		}
+		return {
+			status: response.status,
+			body:
+				typeof parsed === "object" && parsed !== null
+					? (parsed as Record<string, unknown>)
+					: { value: parsed },
+		};
+	};
+}
+
+type Uploader = ReturnType<typeof makeUploader>;
+
+/**
+ * A minimal, VALID RIFF/WAVE file: 16-bit signed PCM, 8 kHz, mono.
+ *
+ * Generated rather than checked in as a binary fixture, because the server sniffs MAGIC BYTES and
+ * refuses anything it cannot play — a fixture of zeroes named `.wav` would be refused, correctly,
+ * and the upload path would never be exercised. A quiet ramp rather than silence so a truncated
+ * body shows up as a wrong byte value rather than as another zero.
+ */
+function makeWav(samples = 800): Uint8Array {
+	const dataBytes = samples * 2;
+	const buffer = new ArrayBuffer(44 + dataBytes);
+	const view = new DataView(buffer);
+	const ascii = (offset: number, text: string): void => {
+		for (let index = 0; index < text.length; index += 1) {
+			view.setUint8(offset + index, text.charCodeAt(index));
+		}
+	};
+	ascii(0, "RIFF");
+	view.setUint32(4, 36 + dataBytes, true);
+	ascii(8, "WAVE");
+	ascii(12, "fmt ");
+	view.setUint32(16, 16, true);
+	view.setUint16(20, 1, true);
+	view.setUint16(22, 1, true);
+	view.setUint32(24, 8000, true);
+	view.setUint32(28, 16_000, true);
+	view.setUint16(32, 2, true);
+	view.setUint16(34, 16, true);
+	ascii(36, "data");
+	view.setUint32(40, dataBytes, true);
+	for (let index = 0; index < samples; index += 1) {
+		view.setInt16(44 + index * 2, (index % 256) - 128, true);
+	}
+	return new Uint8Array(buffer);
+}
+
+/**
  * Rebuilds the `ApiError` the app's own client would have thrown, so the error helpers under test
  * are run against the REAL body rather than against a fixture that could drift from it.
  */
@@ -258,6 +351,15 @@ async function main(): Promise<void> {
 	const webPort = await findFreePort();
 	const apiUrl = `http://127.0.0.1:${apiPort}`;
 	const webUrl = `http://127.0.0.1:${webPort}`;
+	/**
+	 * A real directory for the media library's uploads.
+	 *
+	 * Section 16 stats nothing on disk — it drives the API through the Next rewrite, which is the
+	 * whole point of a smoke — but the API does write there, and pointing it at a production mount
+	 * that does not exist would turn every upload into an `EACCES` that reads as a bug in the upload
+	 * path. Removed in the `finally`, along with everything else this run created.
+	 */
+	const mediaRoot = await mkdtemp(join(tmpdir(), "optimiq-smoke-media-"));
 
 	/**
 	 * A fake carrier, in THIS process, reachable by the API's process over loopback.
@@ -288,6 +390,11 @@ async function main(): Promise<void> {
 		const { createApiRootModule, registerAuthTransport } = await import(
 			"./src/auth/auth-bootstrap.ts"
 		);
+		// The PBX area's own bootstrap, which registers \`@fastify/multipart\` on the adapter — the
+		// media library's upload routes answer 415 without it, and a Fastify plugin cannot be
+		// registered from a Nest module (see \`pbx-bootstrap.ts\`). It is a logged no-op for the NATS
+		// half here, because this smoke runs no broker.
+		const { registerPbxTransport } = await import("./src/pbx/pbx-bootstrap.ts");
 		const { PbxModule } = await import("./src/pbx/pbx.module.ts");
 		// Provisioning rides on the PBX area and is gated on the same two conditions; see
 		// \`apps/api/src/main.ts\`. Mounting it here is what makes the devices screen's CONTRACT
@@ -303,6 +410,7 @@ async function main(): Promise<void> {
 		);
 		app.enableShutdownHooks();
 		await registerAuthTransport(app);
+		await registerPbxTransport(app);
 		await app.listen(${apiPort}, "127.0.0.1");
 		console.log("PBX_SLICE_READY");
 	`;
@@ -338,6 +446,18 @@ async function main(): Promise<void> {
 				PROVISION_SIP_SERVER: "pbx.smoke.optimiq.test",
 				PROVISION_SIP_SECRET_KEY: "smoke-provisioning-root-key-0123456789",
 				PROVISION_BASE_URL: apiUrl,
+				/**
+				 * A real, writable object root for the media library.
+				 *
+				 * The default (`/opt/optimiq-voice/recordings`) is a production mount that does not
+				 * exist here, and an upload into it would fail with an `EACCES` that reads as a bug in
+				 * the upload path rather than as a missing directory. The signing secret is the media
+				 * route's — without one, minting a preview link is a named 503 rather than an
+				 * unsigned fallback, which is correct and is not what section 16 is testing.
+				 */
+				PBX_MEDIA_OBJECT_ROOT: mediaRoot,
+				PBX_VOICEMAIL_MEDIA_ROOT: mediaRoot,
+				PBX_VOICEMAIL_URL_SECRET: "smoke-pbx-media-signing-secret-0123456789",
 			},
 			stdio: ["ignore", "pipe", "pipe"],
 		},
@@ -436,6 +556,7 @@ async function main(): Promise<void> {
 
 		const jar = new CookieJar();
 		const client: Client = makeClient(webUrl, jar);
+		const upload: Uploader = makeUploader(webUrl, jar);
 		const email = `pbx-smoke-${RUN_ID}@smoke.optimiq.test`;
 		const password = "Smoke-Pbx-Flow-2026!";
 
@@ -502,6 +623,10 @@ async function main(): Promise<void> {
 			"/queues?tab=agents",
 			"/conferences",
 			"/park-lots",
+			// The media library, and its second tab. Both are `?tab=` views of one page, so a tab
+			// that 404s or crashes would otherwise be invisible to a route list.
+			"/media",
+			"/media?tab=prompts",
 			"/routing",
 			"/routing?tab=outbound",
 			"/routing?tab=time-conditions",
@@ -511,6 +636,8 @@ async function main(): Promise<void> {
 			`/ring-groups/${ringGroupId}`,
 			`/queues/${seededQueueId}`,
 			`/routing/time-conditions/${timeConditionId}`,
+			// A settings sub-screen, which is a real route rather than a tab.
+			"/settings/emergency-addresses",
 		];
 		const routeFailures: string[] = [];
 		for (const route of routes) {
@@ -1057,17 +1184,75 @@ async function main(): Promise<void> {
 		);
 
 		/**
-		 * The form omits the PIN columns because the API does not accept them. If that ever changed
-		 * silently, a dialog with no PIN control would be hiding a setting users need — so the
-		 * refusal is asserted rather than assumed.
+		 * The edit form still omits the PIN columns, and the API still refuses them.
+		 *
+		 * That has NOT changed now that the set-PIN endpoints exist — it is the whole point of them.
+		 * A `PATCH` body that sometimes carries a digest is a `PATCH` body somebody eventually puts a
+		 * plaintext PIN into, and a digest an admin pasted in is a digest nothing hashed. The dialog
+		 * has no PIN control; the two dedicated dialogs do, and they are checked below.
 		 */
 		const pinned = await client("PATCH", `/api/v1/conferences/${conferenceId}`, {
 			pinHash: "0123456789abcdef",
 		});
 		check(
-			"a PIN digest is refused by the DTO, which is why the form has no PIN control",
+			"a PIN digest is still refused by the DTO, which is why the edit form has no PIN control",
 			pinned.status === 400,
 			`status ${pinned.status}`,
+		);
+
+		/**
+		 * The two PIN dialogs' contract.
+		 *
+		 * Both are dialogs, so there is no route to render and no server-side HTML to assert against
+		 * — what this proves at fetch level is that the shape the components were written against is
+		 * the shape the server answers with, through the Next rewrite the browser would use.
+		 */
+		const smokeWeakRoomPin = await client("POST", `/api/v1/conferences/${conferenceId}/pin`, {
+			pin: "1111",
+		});
+		check(
+			"the room-PIN dialog's weak-PIN case reads as a form error, not as a crash",
+			smokeWeakRoomPin.status === 400 && typeof smokeWeakRoomPin.body.message === "string",
+			`status ${smokeWeakRoomPin.status}`,
+		);
+		const smokeRoomPin = await client("POST", `/api/v1/conferences/${conferenceId}/pin`, {
+			pin: "72609",
+		});
+		check(
+			"setting a room PIN answers with both flags and never a digest",
+			smokeRoomPin.status === 201 &&
+				data(smokeRoomPin).pinSet === true &&
+				data(smokeRoomPin).moderatorPinSet === false &&
+				!Object.hasOwn(data(smokeRoomPin), "pinHash"),
+			JSON.stringify(data(smokeRoomPin)),
+		);
+		const smokeModeratorPin = await client(
+			"POST",
+			`/api/v1/conferences/${conferenceId}/moderator-pin`,
+			{ pin: "51937" },
+		);
+		check(
+			"setting a moderator PIN reports both flags, so one dialog can render the other's state",
+			smokeModeratorPin.status === 201 &&
+				data(smokeModeratorPin).pinSet === true &&
+				data(smokeModeratorPin).moderatorPinSet === true,
+			JSON.stringify(data(smokeModeratorPin)),
+		);
+		const smokeClearedRoomPin = await client("DELETE", `/api/v1/conferences/${conferenceId}/pin`);
+		check(
+			"clearing the room PIN answers pinSet false and leaves the moderator PIN alone",
+			smokeClearedRoomPin.status === 200 &&
+				data(smokeClearedRoomPin).pinSet === false &&
+				data(smokeClearedRoomPin).moderatorPinSet === true,
+			JSON.stringify(data(smokeClearedRoomPin)),
+		);
+		await client("DELETE", `/api/v1/conferences/${conferenceId}/moderator-pin`);
+		const conferenceRow = await client("GET", `/api/v1/conferences/${conferenceId}`);
+		check(
+			"and neither digest is ever on a conference row the list renders",
+			!Object.hasOwn(data(conferenceRow), "pinHash") &&
+				!Object.hasOwn(data(conferenceRow), "moderatorPinHash"),
+			Object.keys(data(conferenceRow)).join(","),
 		);
 
 		const resized = await client("PATCH", `/api/v1/conferences/${conferenceId}`, {
@@ -1431,16 +1616,220 @@ async function main(): Promise<void> {
 			smokeClearPin.status === 200 && data(smokeClearPin).pinSet === false,
 			JSON.stringify(data(smokeClearPin)),
 		);
+		// --- 16. the media library: upload, preview, seek --------------------------------------------
+		//
+		// The platform's first file-upload path, and the first `<audio>` that can be scrubbed. Three
+		// things are worth proving at fetch level, and none of them is provable from a rendered page:
+		//
+		//  1. **A multipart body survives the Next rewrite.** Everything else the smokes drive is
+		//     JSON, so this is the only request whose content type carries a generated boundary. A
+		//     proxy that rewrote or buffered it wrongly would break uploads in the browser only.
+		//  2. **The magic-byte refusal is a form error, not a crash.** The upload dialogs render the
+		//     server's sentence under the file input, so the taxonomy has to hold.
+		//  3. **The preview link answers a Range request.** The `<audio>` element decides whether its
+		//     scrub bar works from `accept-ranges` on the first response and from a `206` on the
+		//     second — so both have to be true through the rewrite, not just against the API.
+		console.log("\n16. the media library");
+		const wav = makeWav();
+
+		const smokeMohClass = await client("POST", "/api/v1/moh-classes", {
+			name: `smoke-hold-${RUN_ID}`,
+			description: "Smoke",
+		});
+		const smokeMohClassId = rowId(smokeMohClass);
+		check(
+			"create a hold-music class through the rewrite is 201",
+			smokeMohClass.status === 201,
+			`status ${smokeMohClass.status}`,
+		);
+
+		const smokeUpload = await upload(
+			`/api/v1/moh-classes/${smokeMohClassId}/files`,
+			{ bytes: wav, name: "hold-loop.wav", type: "audio/wav" },
+			{ name: `smoke-loop-${RUN_ID}` },
+		);
+		check(
+			"a multipart upload survives the Next rewrite and is stored",
+			smokeUpload.status === 201 && typeof data(smokeUpload).objectKey === "string",
+			`status ${smokeUpload.status} ${String(data(smokeUpload).objectKey ?? "")}`,
+		);
+		const smokeFileId = rowId(smokeUpload);
+
+		const smokeBadUpload = await upload(`/api/v1/moh-classes/${smokeMohClassId}/files`, {
+			// A DOS/PE header renamed `.wav` and declared `audio/wav` — the case the sniffer exists
+			// for, and the case the dialog has to render as a sentence under the file input.
+			bytes: new Uint8Array([0x4d, 0x5a, 0x90, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+			name: "trojan.wav",
+			type: "audio/wav",
+		});
+		check(
+			"a file that is not audio is refused as a form error the dialog can render",
+			smokeBadUpload.status === 400 &&
+				pbxErrorCode(asApiError(smokeBadUpload)) === "MEDIA_UPLOAD_REJECTED" &&
+				typeof smokeBadUpload.body.message === "string",
+			`status ${smokeBadUpload.status} ${String(smokeBadUpload.body.code)}`,
+		);
+
+		const smokeFiles = await client("GET", `/api/v1/moh-classes/${smokeMohClassId}/files`);
+		check(
+			"the files dialog's list endpoint answers with exactly what was accepted",
+			smokeFiles.status === 200 && listLength(smokeFiles) === 1,
+			`status ${smokeFiles.status}, ${String(listLength(smokeFiles))} file(s)`,
+		);
+
+		const smokePlayUrl = await client("POST", `/api/v1/prompts/${smokeFileId}/play-url`);
+		const smokeMediaPath = String(
+			(data(smokePlayUrl) as { url?: unknown }).url ?? "",
+		);
+		check(
+			"minting a preview link answers with a path the player can use verbatim",
+			smokePlayUrl.status === 201 && smokeMediaPath.startsWith("/api/v1/prompts/media?token="),
+			`status ${smokePlayUrl.status} ${smokeMediaPath.slice(0, 40)}`,
+		);
+
+		const smokeFull = await fetch(`${webUrl}${smokeMediaPath}`, { redirect: "manual" });
+		const smokeFullBody = new Uint8Array(await smokeFull.arrayBuffer());
+		check(
+			"the preview link streams the whole object through the rewrite",
+			smokeFull.status === 200 && smokeFullBody.length === wav.length,
+			`status ${smokeFull.status}, ${String(smokeFullBody.length)}/${String(wav.length)} bytes`,
+		);
+		check(
+			"and advertises accept-ranges: bytes, which is what makes the scrub bar draggable at all",
+			smokeFull.headers.get("accept-ranges") === "bytes",
+			String(smokeFull.headers.get("accept-ranges")),
+		);
+
+		const smokeRange = await fetch(`${webUrl}${smokeMediaPath}`, {
+			headers: { range: "bytes=44-75" },
+			redirect: "manual",
+		});
+		const smokeRangeBody = new Uint8Array(await smokeRange.arrayBuffer());
+		check(
+			"a seek is answered 206 with the range's own content-length and exactly those bytes",
+			smokeRange.status === 206 &&
+				smokeRange.headers.get("content-range") === `bytes 44-75/${String(wav.length)}` &&
+				smokeRange.headers.get("content-length") === "32" &&
+				smokeRangeBody.length === 32,
+			`status ${smokeRange.status} ${String(smokeRange.headers.get("content-range"))}`,
+		);
+
+		const smokePastEnd = await fetch(`${webUrl}${smokeMediaPath}`, {
+			headers: { range: `bytes=${String(wav.length + 10)}-` },
+			redirect: "manual",
+		});
+		void (await smokePastEnd.arrayBuffer());
+		check(
+			"a seek past the end is a 416 that tells the player the real size",
+			smokePastEnd.status === 416 &&
+				smokePastEnd.headers.get("content-range") === `bytes */${String(wav.length)}`,
+			`status ${smokePastEnd.status} ${String(smokePastEnd.headers.get("content-range"))}`,
+		);
+
+		// The greetings dialog's contract: upload, list, and the activate verb.
+		const smokeGreeting = await upload(
+			`/api/v1/voicemail-boxes/${smokeMailboxId}/greetings`,
+			{ bytes: wav, name: "unavailable.wav", type: "audio/wav" },
+			{ kind: "unavailable", label: "Smoke greeting" },
+		);
+		check(
+			"a greeting uploads and is active by default, which is what the checkbox promises",
+			smokeGreeting.status === 201 && data(smokeGreeting).active === true,
+			`status ${smokeGreeting.status}`,
+		);
+		const smokeGreetingId = rowId(smokeGreeting);
+		const smokeDeactivated = await client(
+			"POST",
+			`/api/v1/voicemail-boxes/${smokeMailboxId}/greetings/${smokeGreetingId}/deactivate`,
+		);
+		check(
+			"standing a greeting down is a verb, and answers with the row the dialog re-renders",
+			smokeDeactivated.status === 200 && data(smokeDeactivated).active === false,
+			`status ${smokeDeactivated.status}`,
+		);
+		await client(
+			"DELETE",
+			`/api/v1/voicemail-boxes/${smokeMailboxId}/greetings/${smokeGreetingId}`,
+		);
+
+		// The E911 screen's contract, and the selector the number dialog renders.
+		const smokeAddress = await client("POST", "/api/v1/emergency-addresses", {
+			label: `Smoke HQ ${RUN_ID}`,
+			streetLine1: "1 Telephone Road",
+			locationDetail: "Floor 3",
+			locality: "Springfield",
+			administrativeArea: "IL",
+			postalCode: "62701",
+			country: "us",
+		});
+		const smokeAddressId = rowId(smokeAddress);
+		check(
+			"an emergency address is created and is NOT validated on our say-so",
+			smokeAddress.status === 201 &&
+				data(smokeAddress).validated === false &&
+				data(smokeAddress).country === "US",
+			`status ${smokeAddress.status} validated=${String(data(smokeAddress).validated)}`,
+		);
+		/**
+		 * A DID of its own, rather than the one section 5 created.
+		 *
+		 * That one has been given back to the carrier by section 8, so a `PATCH` against it is a 404 —
+		 * and a smoke that reused it would report the E911 selector as broken every time the carrier
+		 * section changed. One number, created here, deleted below.
+		 */
+		const smokeE911Number = await client("POST", "/api/v1/phone-numbers", {
+			// `phone_number.e164` is unique PLATFORM-wide, not per tenant, so a smoke that reused a
+			// literal would collide with its own previous run. `+1998555<run>` shares the reserved
+			// `+1999555…` block section 5 uses, one prefix over.
+			e164: `+1998555${RUN_DIGITS}`,
+			label: "Smoke E911 DID",
+			destinationType: "hangup",
+			voiceEnabled: true,
+			enabled: true,
+		});
+		const smokeE911NumberId = rowId(smokeE911Number);
+		check(
+			"a DID for the E911 checks is created",
+			smokeE911Number.status === 201,
+			`status ${smokeE911Number.status}`,
+		);
+		const smokeAssigned = await client("PATCH", `/api/v1/phone-numbers/${smokeE911NumberId}`, {
+			emergencyAddressId: smokeAddressId,
+		});
+		check(
+			"the number dialog's emergency selector writes through a plain PATCH",
+			smokeAssigned.status === 200 && data(smokeAssigned).emergencyAddressId === smokeAddressId,
+			`status ${smokeAssigned.status}`,
+		);
+		const smokeAddressRefused = await client(
+			"DELETE",
+			`/api/v1/emergency-addresses/${smokeAddressId}`,
+		);
+		check(
+			"deleting an address a DID uses is refused with the taxonomy the delete dialog decodes",
+			smokeAddressRefused.status === 409 &&
+				pbxErrorCode(asApiError(smokeAddressRefused)) === "PBX_REFERENCED",
+			`status ${smokeAddressRefused.status}`,
+		);
+		await client("PATCH", `/api/v1/phone-numbers/${smokeE911NumberId}`, {
+			emergencyAddressId: null,
+		});
+		await client("DELETE", `/api/v1/emergency-addresses/${smokeAddressId}`);
+		await client("DELETE", `/api/v1/phone-numbers/${smokeE911NumberId}`);
+
+		await client("DELETE", `/api/v1/moh-classes/${smokeMohClassId}/files/${smokeFileId}`);
+		await client("DELETE", `/api/v1/moh-classes/${smokeMohClassId}`);
 		await client("DELETE", `/api/v1/voicemail-boxes/${smokeMailboxId}`);
 
-		// --- 16. devices: the provisioning contract, as the screen builds it ------------------------
-		console.log("\n16. devices and provisioning");
+		// --- 17. devices: the provisioning contract, as the screen builds it ------------------------
+		console.log("\n17. devices and provisioning");
 		await runDeviceChecks(client);
 	} finally {
 		next?.kill("SIGTERM");
 		apiProcess.kill("SIGTERM");
 		await fakeTelnyx.close();
 		await delay(300);
+		await rm(mediaRoot, { recursive: true, force: true });
 	}
 
 	const failed = checks.filter((entry) => !entry.ok);
@@ -1572,6 +1961,11 @@ async function runDeviceChecks(client: Client): Promise<void> {
 		cleaned.status === 200,
 		`status ${cleaned.status}`,
 	);
+}
+
+/** How many rows a list envelope carries. `0` when the body is not a list at all. */
+function listLength(response: JsonResponse): number {
+	return Array.isArray(response.body.data) ? response.body.data.length : 0;
 }
 
 function firstId(response: JsonResponse): string {

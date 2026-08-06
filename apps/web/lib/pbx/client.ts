@@ -11,11 +11,13 @@
  * of extensions and nothing else.
  */
 
-import { apiFetch } from "../api-client";
+import { apiFetch, apiUpload } from "../api-client";
 import type { Permission } from "../permissions";
 import type {
 	CompileResult,
+	ConferencePinState,
 	ConferenceRow,
+	EmergencyAddressRow,
 	ExtensionRow,
 	FeatureCodeParamFields,
 	FeatureCodeRow,
@@ -23,11 +25,15 @@ import type {
 	ItemEnvelope,
 	IvrMenuOptionRow,
 	IvrMenuRow,
+	MediaPlaybackLink,
+	MohClassRow,
 	MutationEnvelope,
 	OutboundRouteRow,
 	PagedEnvelope,
 	ParkLotRow,
 	PhoneNumberRow,
+	PromptKind,
+	PromptRow,
 	QueueAgentRow,
 	QueueRow,
 	QueueTierRow,
@@ -40,6 +46,8 @@ import type {
 	TrunkRow,
 	VoicemailBoxRow,
 	VoicemailFolder,
+	VoicemailGreetingKind,
+	VoicemailGreetingRow,
 	VoicemailMessageDeletion,
 	VoicemailMessagePage,
 	VoicemailMessageResult,
@@ -248,6 +256,71 @@ export const PBX_RESOURCES = {
 		labelPlural: "Voicemail boxes",
 		permissions: { read: "voicemail.read", write: "voicemail.write", delete: "voicemail.delete" },
 		displayName: (row) => (row.label ? `${row.mailboxNumber} · ${row.label}` : row.mailboxNumber),
+	}),
+	/**
+	 * Music-on-hold classes.
+	 *
+	 * `affectsRouting: true` — `moh_class` IS in `ROUTING_TABLE_TO_ENTITY`, because five node kinds
+	 * carry the class's resolved NAME and a rename therefore has to reach the engine.
+	 * `contracts.spec.ts` holds this against the routing package and will fail if it is guessed.
+	 *
+	 * `settings.*` rather than a `media.*` pair, which does not exist: the registry is at its
+	 * documented ceiling and `apps/api`'s controller makes the same compromise, with the same note
+	 * that a narrower pair is the right fix.
+	 */
+	mohClasses: descriptor<MohClassRow>({
+		key: "moh-classes",
+		affectsRouting: true,
+		path: "/moh-classes",
+		label: "hold music class",
+		labelPlural: "Hold music",
+		permissions: { read: "settings.read", write: "settings.write", delete: "settings.write" },
+		displayName: (row) => row.name,
+	}),
+	/**
+	 * The prompt library.
+	 *
+	 * `affectsRouting: false`, and the reason is worth knowing before changing it: the compiler
+	 * copies a `promptId` into a plan node VERBATIM and never resolves it, so renaming a prompt or
+	 * replacing its audio changes nothing the artifact contains. If that ever changes, `prompt` has
+	 * to be added to `ROUTING_TABLE_TO_ENTITY` in the same commit.
+	 *
+	 * There is no generic `createPbx` for this resource — a prompt is created by an upload, because
+	 * `prompt.object_key` is `notNull` and a library entry with no audio is an entry an IVR can be
+	 * pointed at that plays nothing. See {@link uploadPrompt}.
+	 */
+	prompts: descriptor<PromptRow>({
+		key: "prompts",
+		affectsRouting: false,
+		path: "/prompts",
+		label: "prompt",
+		labelPlural: "Prompts",
+		permissions: { read: "settings.read", write: "settings.write", delete: "settings.write" },
+		displayName: (row) => row.name,
+	}),
+	/**
+	 * Dispatchable locations for E911.
+	 *
+	 * `affectsRouting: false` — `emergency_address` is not in `ROUTING_TABLE_TO_ENTITY` and nothing
+	 * in `@optimiq-voice/routing` reads it. Assigning one to a DID does recompile, because
+	 * `phone_number` is a routing table, and produces an identical artifact.
+	 *
+	 * `numbers.emergency` for writes: the permission exists already and its catalog entry names this
+	 * feature. Reads are `numbers.read` so the Numbers screen can render which DID has which
+	 * location without granting the narrower one.
+	 */
+	emergencyAddresses: descriptor<EmergencyAddressRow>({
+		key: "emergency-addresses",
+		affectsRouting: false,
+		path: "/emergency-addresses",
+		label: "emergency address",
+		labelPlural: "Emergency addresses",
+		permissions: {
+			read: "numbers.read",
+			write: "numbers.emergency",
+			delete: "numbers.emergency",
+		},
+		displayName: (row) => `${row.label} — ${row.streetLine1}, ${row.locality}`,
 	}),
 } as const;
 
@@ -608,6 +681,239 @@ export async function mintVoicemailPlaybackUrl(
 ): Promise<VoicemailPlaybackLink> {
 	const { data } = await apiFetch<ItemEnvelope<VoicemailPlaybackLink>>(
 		`/voicemail-boxes/${boxId}/messages/${messageId}/play-url`,
+		{ method: "POST", body: JSON.stringify({}) },
+	);
+	return data;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Conference PINs
+// ---------------------------------------------------------------------------------------------
+
+/** Which of a room's two PINs an endpoint is setting. */
+export type ConferencePinRole = "participant" | "moderator";
+
+function conferencePinPath(conferenceId: string, role: ConferencePinRole): string {
+	return `/conferences/${conferenceId}/${role === "moderator" ? "moderator-pin" : "pin"}`;
+}
+
+/**
+ * Sets one of a conference room's PINs.
+ *
+ * The same contract as {@link setVoicemailPin}, down to the digest format: the plaintext travels in
+ * the body of a `POST` and nowhere else, the server hashes it with scrypt before the request
+ * returns, and nothing here ever receives a digest back.
+ */
+export async function setConferencePin(
+	conferenceId: string,
+	role: ConferencePinRole,
+	pin: string,
+): Promise<MutationEnvelope<ConferencePinState>> {
+	return await apiFetch<MutationEnvelope<ConferencePinState>>(
+		conferencePinPath(conferenceId, role),
+		{ method: "POST", body: JSON.stringify({ pin }) },
+	);
+}
+
+/** Clears it. Clearing the participant PIN opens the room to anyone who can dial its number. */
+export async function clearConferencePin(
+	conferenceId: string,
+	role: ConferencePinRole,
+): Promise<MutationEnvelope<ConferencePinState>> {
+	return await apiFetch<MutationEnvelope<ConferencePinState>>(
+		conferencePinPath(conferenceId, role),
+		{ method: "DELETE" },
+	);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The media library
+// ---------------------------------------------------------------------------------------------
+
+export interface PromptListQuery extends PbxListQuery {
+	readonly kind?: PromptKind | undefined;
+	readonly mohClassId?: string | undefined;
+}
+
+/**
+ * One page of the prompt library.
+ *
+ * An absent `kind` means the two kinds a prompt PICKER can offer — `prompt` and `greeting` — and
+ * never MOH files, which are reached through their class. The API decides that; this just does not
+ * send a `kind` when there is none.
+ */
+export async function listPrompts(query: PromptListQuery): Promise<PagedEnvelope<PromptRow>> {
+	const params = new URLSearchParams(pbxListSearchParams(query));
+	if (query.kind !== undefined) {
+		params.set("kind", query.kind);
+	}
+	if (query.mohClassId !== undefined) {
+		params.set("mohClassId", query.mohClassId);
+	}
+	const search = params.toString();
+	return await apiFetch<PagedEnvelope<PromptRow>>(
+		`/prompts${search.length > 0 ? `?${search}` : ""}`,
+	);
+}
+
+/**
+ * Uploads an audio file into the library.
+ *
+ * `multipart/form-data` through {@link apiUpload}, because that is what a browser produces from a
+ * `<input type="file">` and because `prompt.object_key` is `notNull` — there is no JSON create for
+ * this resource and there will not be one.
+ *
+ * The server refuses anything it cannot play: content type, file extension and MAGIC BYTES are all
+ * checked, and the last is the one that matters (a renamed executable declares `audio/wav`). A
+ * refusal is an `ApiError` carrying `MEDIA_UPLOAD_REJECTED` and an `issues[]` entry addressed at
+ * `file`, so a form renders it under the file input.
+ */
+export async function uploadPrompt(
+	file: File,
+	fields: { readonly name?: string; readonly language?: string } = {},
+): Promise<MutationEnvelope<PromptRow>> {
+	return await apiUpload<MutationEnvelope<PromptRow>>("/prompts", file, fields);
+}
+
+export async function updatePrompt(
+	promptId: string,
+	values: { readonly name?: string; readonly language?: string },
+): Promise<MutationEnvelope<PromptRow>> {
+	return await apiFetch<MutationEnvelope<PromptRow>>(`/prompts/${promptId}`, {
+		method: "PATCH",
+		body: JSON.stringify(values),
+	});
+}
+
+/** Deletes a prompt and its stored object. Refused with a 409 while anything still plays it. */
+export async function deletePrompt(promptId: string): Promise<MutationEnvelope<{ id: string }>> {
+	return await apiFetch<MutationEnvelope<{ id: string }>>(`/prompts/${promptId}`, {
+		method: "DELETE",
+	});
+}
+
+/** The audio files under one hold-music class. Not paginated — the API does not paginate it. */
+export async function listMohFiles(mohClassId: string): Promise<readonly PromptRow[]> {
+	const { data } = await apiFetch<{ data: readonly PromptRow[] }>(
+		`/moh-classes/${mohClassId}/files`,
+	);
+	return data;
+}
+
+export async function uploadMohFile(
+	mohClassId: string,
+	file: File,
+	fields: { readonly name?: string } = {},
+): Promise<MutationEnvelope<PromptRow>> {
+	return await apiUpload<MutationEnvelope<PromptRow>>(
+		`/moh-classes/${mohClassId}/files`,
+		file,
+		fields,
+	);
+}
+
+export async function deleteMohFile(
+	mohClassId: string,
+	fileId: string,
+): Promise<MutationEnvelope<{ id: string }>> {
+	return await apiFetch<MutationEnvelope<{ id: string }>>(
+		`/moh-classes/${mohClassId}/files/${fileId}`,
+		{ method: "DELETE" },
+	);
+}
+
+/**
+ * Mints a short-lived preview link for a stored prompt.
+ *
+ * A `POST` for a read-shaped operation, deliberately: it creates a credential with a lifetime, and
+ * a `GET` that minted one would be prefetched, cached and logged as though it were idempotent. The
+ * same reasoning as {@link mintVoicemailPlaybackUrl}, and the same reason the link is never held in
+ * a query cache.
+ */
+export async function mintPromptPlaybackUrl(promptId: string): Promise<MediaPlaybackLink> {
+	const { data } = await apiFetch<ItemEnvelope<MediaPlaybackLink>>(
+		`/prompts/${promptId}/play-url`,
+		{ method: "POST", body: JSON.stringify({}) },
+	);
+	return data;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Voicemail greetings
+// ---------------------------------------------------------------------------------------------
+
+export async function listVoicemailGreetings(
+	boxId: string,
+): Promise<readonly VoicemailGreetingRow[]> {
+	const { data } = await apiFetch<{ data: readonly VoicemailGreetingRow[] }>(
+		`/voicemail-boxes/${boxId}/greetings`,
+	);
+	return data;
+}
+
+/**
+ * Uploads a greeting.
+ *
+ * `active` defaults to TRUE on the server, and the form says so: an admin who has just uploaded a
+ * greeting has expressed an intention, and leaving it inactive would mean the obvious action
+ * silently does not change what callers hear. It is a multipart TEXT part, so it travels as
+ * `"true"` / `"false"`.
+ */
+export async function uploadVoicemailGreeting(
+	boxId: string,
+	file: File,
+	fields: {
+		readonly kind?: VoicemailGreetingKind;
+		readonly label?: string;
+		readonly active?: boolean;
+	} = {},
+): Promise<MutationEnvelope<VoicemailGreetingRow>> {
+	return await apiUpload<MutationEnvelope<VoicemailGreetingRow>>(
+		`/voicemail-boxes/${boxId}/greetings`,
+		file,
+		{
+			...(fields.kind === undefined ? {} : { kind: fields.kind }),
+			...(fields.label === undefined ? {} : { label: fields.label }),
+			...(fields.active === undefined ? {} : { active: String(fields.active) }),
+		},
+	);
+}
+
+/**
+ * Activates or deactivates a greeting.
+ *
+ * Two routes rather than a `PATCH { active }`, because activation is a two-row write on the server
+ * (the incumbent for that kind is stood down in the same transaction, which is what the partial
+ * unique index requires) and because deactivating a `temporary` greeting is the normal way to come
+ * back from holiday — a distinct verb, not a checkbox.
+ */
+export async function setVoicemailGreetingActive(
+	boxId: string,
+	greetingId: string,
+	active: boolean,
+): Promise<MutationEnvelope<VoicemailGreetingRow>> {
+	return await apiFetch<MutationEnvelope<VoicemailGreetingRow>>(
+		`/voicemail-boxes/${boxId}/greetings/${greetingId}/${active ? "activate" : "deactivate"}`,
+		{ method: "POST", body: JSON.stringify({}) },
+	);
+}
+
+export async function deleteVoicemailGreeting(
+	boxId: string,
+	greetingId: string,
+): Promise<MutationEnvelope<{ id: string }>> {
+	return await apiFetch<MutationEnvelope<{ id: string }>>(
+		`/voicemail-boxes/${boxId}/greetings/${greetingId}`,
+		{ method: "DELETE" },
+	);
+}
+
+export async function mintGreetingPlaybackUrl(
+	boxId: string,
+	greetingId: string,
+): Promise<MediaPlaybackLink> {
+	const { data } = await apiFetch<ItemEnvelope<MediaPlaybackLink>>(
+		`/voicemail-boxes/${boxId}/greetings/${greetingId}/play-url`,
 		{ method: "POST", body: JSON.stringify({}) },
 	);
 	return data;

@@ -125,6 +125,25 @@ export function NumbersPanel() {
 						),
 					},
 					{
+						/*
+						 * Assigned or not, and nothing more. The address's LABEL would need one lookup per
+						 * row — `emergencyAddressId` is a bare id on this row — for a column whose only
+						 * actionable state is the empty one. A number that carries voice and has no
+						 * location is the row worth flagging; a fax-only or disabled DID is not, because
+						 * nobody dials 911 from it.
+						 */
+						key: "emergency",
+						header: "E911",
+						cell: (row) =>
+							row.emergencyAddressId !== null ? (
+								<Badge tone="neutral">Assigned</Badge>
+							) : row.voiceEnabled ? (
+								<Badge tone="warning">No location</Badge>
+							) : (
+								<span className="text-muted-foreground">—</span>
+							),
+					},
+					{
 						key: "enabled",
 						header: "State",
 						cell: (row) => <EnabledBadge enabled={row.enabled} />,

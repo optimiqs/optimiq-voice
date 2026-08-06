@@ -89,6 +89,73 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
 	return payload as T;
 }
 
+/**
+ * A `multipart/form-data` upload — the one request shape {@link apiFetch} cannot express.
+ *
+ * ## Why it is a second function rather than a flag
+ *
+ * `apiFetch` sets `content-type: application/json` whenever a body is present. For a `FormData`
+ * body that header must be **absent**, not merely different: the browser generates a boundary token
+ * when it serialises the body, appends it to the content type, and a header we wrote by hand cannot
+ * contain a boundary we do not know. Setting it to `multipart/form-data` produces a request the
+ * server parses as having no parts at all.
+ *
+ * That is not something a flag on `apiFetch` expresses well — the flag would have to mean "and
+ * also do not set the header you always set" — so the upload path is its own function, with its own
+ * three-line header block, and `apiFetch` keeps the invariant that a body is JSON.
+ *
+ * Everything else is shared on purpose: same `credentials: "include"` (the session cookie is what
+ * authorises the upload), same error decoding, so `MEDIA_UPLOAD_REJECTED` and
+ * `MEDIA_UPLOAD_TOO_LARGE` arrive as an {@link ApiError} carrying the server's `issues[]` and reach
+ * a form field through `lib/pbx/errors.ts` exactly as a validation failure on a JSON body does.
+ *
+ * ## The `file` part's name is a contract
+ *
+ * `apps/api`'s reader takes the FIRST file part whatever it is called and refuses a second, so the
+ * name is documentation rather than dispatch — but the error message it prints names `file`, so
+ * that is what callers send.
+ */
+export async function apiUpload<T>(
+	path: string,
+	file: File,
+	fields: Readonly<Record<string, string | undefined>> = {},
+): Promise<T> {
+	const form = new FormData();
+	form.append("file", file, file.name);
+	for (const [key, value] of Object.entries(fields)) {
+		if (value !== undefined && value !== "") {
+			form.append(key, value);
+		}
+	}
+
+	const response = await fetch(`${API_BASE_PATH}${path}`, {
+		method: "POST",
+		credentials: "include",
+		// `accept` only. See the header: the browser owns `content-type` here.
+		headers: { accept: "application/json" },
+		body: form,
+	});
+
+	const text = await response.text();
+	let payload: unknown = null;
+	if (text.length > 0) {
+		try {
+			payload = JSON.parse(text);
+		} catch {
+			payload = text;
+		}
+	}
+
+	if (!response.ok) {
+		throw new ApiError(
+			response.status,
+			messageFrom(payload, `Upload failed (${response.status})`),
+			payload,
+		);
+	}
+	return payload as T;
+}
+
 // --- Shapes mirrored from apps/api/src/auth ----------------------------------------------------
 
 export interface OrganizationView {

@@ -1,9 +1,9 @@
-import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
 import { Inject, Injectable } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { getLogger } from "@optimiq-voice/logger";
 import { and, desc, eq, inArray, sql, voicemailBox, voicemailMessage } from "@optimiq-voice/pbx-db";
+import { openMediaResponse } from "../../media/media-response";
+import { mediaObjectSize } from "../media/media-storage";
 import { normalizePagination, paged } from "../shared/pagination";
 import { PBX_DATABASE, PBX_ENV } from "../shared/pbx.tokens";
 import {
@@ -21,6 +21,7 @@ import {
 	VoicemailNotFoundException,
 	VoicemailSigningUnavailableException,
 } from "./voicemail.errors";
+import type { MediaResponse } from "../../media/media-response";
 import type { PagedResult } from "../shared/pagination";
 import type { PbxEnv } from "../shared/pbx-env";
 import type { UpdateVoicemailMessage, VoicemailMessageListQuery } from "./voicemail-messages.dto";
@@ -31,7 +32,6 @@ import type {
 	PbxDatabaseTransaction,
 	VoicemailFolder,
 } from "@optimiq-voice/pbx-db";
-import type { ReadStream } from "node:fs";
 
 const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
@@ -237,11 +237,15 @@ export class VoicemailMessagesService {
 	/**
 	 * Verifies a token and opens the object behind it.
 	 *
-	 * Order: signature, expiry, tenant-scoped row read, containment check, open. Every step before
-	 * the last can only ever narrow, so an anonymous request that is not carrying a genuine token
-	 * never reaches the filesystem.
+	 * Order: signature, expiry, tenant-scoped row read, containment check, stat, open. Every step
+	 * before the last can only ever narrow, so an anonymous request that is not carrying a genuine
+	 * token never reaches the filesystem. The RANGE is decided last, after the size is known,
+	 * because `bytes=500-` means something different for a 100-byte object than for a 100 MB one.
 	 */
-	async openSignedMedia(token: string): Promise<ResolvedVoicemailMedia> {
+	async openSignedMedia(
+		token: string,
+		rangeHeader?: string | undefined,
+	): Promise<ResolvedVoicemailMedia> {
 		const secret = this.env.PBX_VOICEMAIL_URL_SECRET;
 		if (secret === undefined) {
 			// No key configured means no token can be genuine. Never a fallback to unsigned access.
@@ -285,23 +289,16 @@ export class VoicemailMessagesService {
 			throw new VoicemailLinkInvalidException();
 		}
 
-		let sizeBytes: number;
-		try {
-			const info = await stat(path);
-			if (!info.isFile()) {
-				throw new Error("not a file");
-			}
-			sizeBytes = info.size;
-		} catch {
+		const sizeBytes = await mediaObjectSize(path);
+		if (sizeBytes === undefined) {
 			throw new VoicemailMediaGoneException();
 		}
 
-		return {
-			stream: createReadStream(path),
+		return openMediaResponse(path, sizeBytes, {
 			contentType: contentTypeFor(row.objectKey),
-			sizeBytes,
 			fileName: downloadFileName(row.receivedAt, row.id, row.objectKey),
-		};
+			rangeHeader,
+		});
 	}
 
 	// -------------------------------------------------------------------------------------------
@@ -508,12 +505,15 @@ export interface VoicemailPlaybackLink {
 	readonly expiresInSeconds: number;
 }
 
-export interface ResolvedVoicemailMedia {
-	readonly stream: ReadStream;
-	readonly contentType: string;
-	readonly sizeBytes: number;
-	readonly fileName: string;
-}
+/**
+ * What the media route answers with.
+ *
+ * A {@link MediaResponse} rather than a bare stream, so a partial response can carry its own
+ * status, its own `content-length` (the RANGE's length, not the object's) and its `content-range`.
+ * See `src/media/http-range.ts` for why this route used to say `accept-ranges: none` and why that
+ * was the reason the scrub bar did not work.
+ */
+export type ResolvedVoicemailMedia = MediaResponse;
 
 /**
  * The RPC request, declared structurally.

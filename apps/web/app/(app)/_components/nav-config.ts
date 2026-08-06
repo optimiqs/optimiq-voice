@@ -6,6 +6,7 @@ import {
 	HistoryIcon,
 	KeyIcon,
 	MenuIcon,
+	MusicIcon,
 	ParkIcon,
 	PhoneIcon,
 	QueueIcon,
@@ -75,6 +76,15 @@ export const NAV_SECTIONS: readonly NavSection[] = [
 			{ title: "Voicemail", url: routes.voicemail, icon: VoicemailIcon },
 			{ title: "Conferences", url: routes.conferences, icon: ConferenceIcon },
 			{ title: "Park lots", url: routes.parkLots, icon: ParkIcon },
+			/**
+			 * Hold music and the prompt library, on one page with the section in `?tab=`.
+			 *
+			 * Under "Call features" rather than "Organization" because that is what an admin is doing
+			 * when they reach for it: they are building an IVR or a queue and they need the audio it
+			 * plays. It is guarded by `settings.read` all the same — see `page-permissions.ts` for why
+			 * the permission and the section disagree, and why the permission is the one that matters.
+			 */
+			{ title: "Media", url: routes.mediaLibrary, icon: MusicIcon },
 		],
 	},
 	{

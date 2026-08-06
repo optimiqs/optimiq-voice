@@ -47,10 +47,28 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, PageRequirement>> = {
 	 */
 	[routes.parkLots]: { permissions: ["park-lots.read"] },
 	[routes.recordings]: { permissions: ["recordings.read", "recordings.read.own"] },
+	/**
+	 * The media library — hold music and the prompt library.
+	 *
+	 * `settings.read` because the API guards it with `settings.read`/`settings.write`, and it does
+	 * that because there is no `media.*` pair in the registry and the registry is at its documented
+	 * ceiling. Naming a different permission here would produce the exact disagreement this map
+	 * exists to prevent: a visible nav entry and a page that 403s.
+	 */
+	[routes.mediaLibrary]: { permissions: ["settings.read"] },
 	[routes.cdr]: { permissions: ["cdr.read", "cdr.read.own"] },
 	[routes.settings]: { permissions: ["settings.read"] },
 	[routes.members]: { permissions: ["members.read"] },
 	[routes.apiKeys]: { permissions: ["api-keys.read", "api-keys.read.own"] },
+	/**
+	 * Dispatchable locations.
+	 *
+	 * Declared explicitly rather than left to inherit `/settings`' `settings.read`, which would be
+	 * the wrong answer in both directions: an admin with `numbers.read` and no settings grant could
+	 * not reach the addresses their DIDs point at, and one with `settings.read` and no numbers grant
+	 * could. The API guards reads with `numbers.read`, so this says the same thing.
+	 */
+	[routes.emergencyAddresses]: { permissions: ["numbers.read"] },
 };
 
 /** True when `path` matches `pattern`, treating any `[segment]` in the pattern as a wildcard. */

@@ -19,6 +19,7 @@ import { usePermission } from "../../_context/session-context";
 import { useLiveVoicemail } from "../../_hooks/use-live-queries";
 import { usePbxDelete, usePbxList } from "../../_hooks/use-pbx-queries";
 import { VoicemailBoxDialog } from "./voicemail-box-dialog";
+import { VoicemailGreetingsDialog } from "./voicemail-greetings-dialog";
 import { VoicemailMessagesDialog } from "./voicemail-messages-dialog";
 import { VoicemailPinDialog } from "./voicemail-pin-dialog";
 import type { VoicemailBoxRow } from "~/lib/pbx/contracts";
@@ -60,6 +61,7 @@ export function VoicemailScreen() {
 	const [pendingDelete, setPendingDelete] = useState<VoicemailBoxRow | null>(null);
 	const [messagesFor, setMessagesFor] = useState<VoicemailBoxRow | null>(null);
 	const [pinFor, setPinFor] = useState<VoicemailBoxRow | null>(null);
+	const [greetingsFor, setGreetingsFor] = useState<VoicemailBoxRow | null>(null);
 
 	const live = useLiveVoicemail();
 
@@ -170,6 +172,7 @@ export function VoicemailScreen() {
 								{canListen ? (
 									<MenuItem onClick={() => setMessagesFor(row)}>Messages</MenuItem>
 								) : null}
+								<MenuItem onClick={() => setGreetingsFor(row)}>Greetings…</MenuItem>
 								{canWrite ? <MenuItem onClick={() => setPinFor(row)}>Set PIN…</MenuItem> : null}
 							</>
 						}
@@ -222,6 +225,27 @@ export function VoicemailScreen() {
 					}
 				}}
 				box={messagesFor}
+			/>
+
+			{/*
+			 * Keyed for the same reason the message dialog is: the upload form and the four slots are
+			 * per-mailbox state, and reusing them across two mailboxes would show the first one's
+			 * greetings while the second one's query resolves.
+			 *
+			 * The menu item is not permission-gated, unlike Messages and Set PIN. Reading a mailbox's
+			 * greetings needs nothing narrower than the read that put the row on this table — hearing
+			 * one needs `voicemail.listen` and changing one needs `voicemail.write`, and the dialog
+			 * gates each of those on the control that performs it.
+			 */}
+			<VoicemailGreetingsDialog
+				key={`greetings-${greetingsFor?.id ?? "none"}`}
+				open={greetingsFor !== null}
+				onOpenChange={(open) => {
+					if (!open) {
+						setGreetingsFor(null);
+					}
+				}}
+				box={greetingsFor}
 			/>
 
 			<VoicemailPinDialog

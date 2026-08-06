@@ -1,8 +1,8 @@
-import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import { Inject, Injectable } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { getLogger } from "@optimiq-voice/logger";
+import { openMediaResponse } from "../../media/media-response";
 import { nextCursorFrom } from "../query/cdr-cursor";
 import { CdrCursorError } from "../query/cdr-cursor";
 import { MAX_RANGE_DAYS, rangeDays, resolveTimeRange } from "../query/cdr.dto";
@@ -23,12 +23,12 @@ import {
 	resolveRecordingObjectPath,
 	verifyRecordingToken,
 } from "./recording-token";
+import type { MediaResponse } from "../../media/media-response";
 import type { RecordingListQuery } from "../query/cdr.dto";
 import type { RecordingListRow } from "../query/cdr.repository";
 import type { CdrEnv } from "../shared/cdr-env";
 import type { AppSession } from "@optimiq-voice/auth";
 import type { CdrDatabaseClient } from "@optimiq-voice/cdr-db";
-import type { ReadStream } from "node:fs";
 
 const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
@@ -45,12 +45,16 @@ export interface RecordingDownloadLink {
 	readonly expiresInSeconds: number;
 }
 
-export interface ResolvedRecordingMedia {
-	readonly stream: ReadStream;
-	readonly contentType: string;
-	readonly sizeBytes: number;
-	readonly fileName: string;
-}
+/**
+ * What the media route answers with.
+ *
+ * Was `{ stream, contentType, sizeBytes, fileName }` and is now a {@link MediaResponse}, which
+ * carries the STATUS and the exact header set as well as the stream. The reason is `Range`: a
+ * partial response is a different status, a different `content-length` and an extra
+ * `content-range`, and a shape that only carried the stream could not express any of them. See
+ * `src/media/http-range.ts` for why seeking did not work before this.
+ */
+export type ResolvedRecordingMedia = MediaResponse;
 
 /**
  * Recording metadata, and the signed link that reaches its media.
@@ -174,7 +178,10 @@ export class RecordingsService {
 	 * Every step before the last is cheap and every one of them can only ever narrow, so an
 	 * anonymous request that is not carrying a genuine token never reaches the filesystem.
 	 */
-	async openSignedMedia(token: string): Promise<ResolvedRecordingMedia> {
+	async openSignedMedia(
+		token: string,
+		rangeHeader?: string | undefined,
+	): Promise<ResolvedRecordingMedia> {
 		const secret = this.env.CDR_RECORDING_URL_SECRET;
 		if (secret === undefined) {
 			// No key configured means no token can be genuine. Never a fallback to unsigned access.
@@ -226,12 +233,11 @@ export class RecordingsService {
 			throw new CdrMediaGoneException();
 		}
 
-		return {
-			stream: createReadStream(path),
+		return openMediaResponse(path, sizeBytes, {
 			contentType: contentTypeFor(row.objectKey),
-			sizeBytes,
 			fileName: downloadFileName(row),
-		};
+			rangeHeader,
+		});
 	}
 }
 

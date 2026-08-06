@@ -10,11 +10,13 @@ import {
 	Patch,
 	Post,
 	Query,
+	Req,
 	Res,
 } from "@nestjs/common";
 import { PublicRoute } from "../../auth/public-route.decorator";
 import { RequirePermissions } from "../../auth/require-permissions.decorator";
 import { Session } from "../../auth/session.decorator";
+import { applyMediaResponse, readRangeHeader } from "../../media/media-http";
 import { parseDto } from "../shared/dto";
 import {
 	deleteVoicemailMessageQuerySchema,
@@ -22,19 +24,8 @@ import {
 	voicemailMessageListQuerySchema,
 } from "./voicemail-messages.dto";
 import { VoicemailMessagesService } from "./voicemail-messages.service";
+import type { MediaReply, MediaRequest } from "../../media/media-http";
 import type { AppSession } from "@optimiq-voice/auth";
-
-/**
- * The one method of the Fastify reply this controller uses.
- *
- * Declared structurally rather than imported as `FastifyReply`, for the reason
- * `recordings.controller.ts` records: `fastify` arrives here transitively under
- * `@nestjs/platform-fastify`, and adding it as a direct dependency to name a type in one signature
- * would be a dependency taken on for a type import.
- */
-interface MediaReply {
-	header(name: string, value: string): unknown;
-}
 
 /**
  * `/api/v1/voicemail-boxes/:id/messages` — the mailbox's contents.
@@ -72,19 +63,28 @@ export class VoicemailMessagesController {
 	 * correct here for the reason the whole scheme exists: the fetcher of an `<audio src>` has no
 	 * session. What replaces it is the token, verified before the service touches the database and
 	 * long before it touches the filesystem.
+	 *
+	 * ## `Range` is honoured
+	 *
+	 * This route used to answer `accept-ranges: none`, and the comment that said so was honest about
+	 * the consequence: a seeking player would ask for a range it never got. The cost of that honesty
+	 * was that the scrub bar did not work. `src/media/http-range.ts` decides what a `Range` header
+	 * means for an object of a known size; `applyMediaResponse` renders the decision as `200`, `206`
+	 * or `416`. The token validation is untouched — it happens first, and a range is only ever
+	 * decided for a request that already proved it may read the row.
 	 */
 	@Get("media")
 	@PublicRoute()
 	@Header("Cache-Control", "private, no-store")
-	async media(@Query("token") token: string, @Res({ passthrough: true }) reply: MediaReply) {
-		const media = await this.messages.openSignedMedia(token ?? "");
-		void reply.header("content-type", media.contentType);
-		void reply.header("content-length", String(media.sizeBytes));
-		void reply.header("content-disposition", `inline; filename="${media.fileName}"`);
-		// `accept-ranges: none` is honest rather than restrictive: this streams the whole object, so
-		// claiming range support would make a seeking audio player ask for a range it never gets.
-		void reply.header("accept-ranges", "none");
-		return media.stream;
+	async media(
+		@Query("token") token: string,
+		@Req() request: MediaRequest,
+		@Res({ passthrough: true }) reply: MediaReply,
+	) {
+		return applyMediaResponse(
+			reply,
+			await this.messages.openSignedMedia(token ?? "", readRangeHeader(request)),
+		);
 	}
 
 	@Get(":id/messages")

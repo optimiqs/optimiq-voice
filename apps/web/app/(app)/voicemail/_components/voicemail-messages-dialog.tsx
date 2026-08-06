@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { MediaPreviewButton } from "~/components/pbx/media-preview-button";
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
 import {
@@ -12,7 +13,6 @@ import {
 	DialogTitle,
 } from "~/components/ui/dialog";
 import { EmptyState } from "~/components/ui/empty-state";
-import { inputClassName } from "~/components/ui/field";
 import { LoadingPanel } from "~/components/ui/spinner";
 import {
 	Table,
@@ -322,11 +322,15 @@ function MessagesTable({
 /**
  * Play one message through a URL minted on demand.
  *
- * Deliberately the same shape as `RecordingPlayer` rather than a reuse of it: that component takes
- * a `RecordingRow` and mints through the CDR endpoint, and generalising it over two unrelated
- * resources would mean a discriminant and two code paths inside one component. The BEHAVIOUR is
- * what matters and it is identical — ask first, never render a live credential for a row nobody
- * played.
+ * The mint-on-press behaviour now lives in `MediaPreviewButton`, which four screens share — this
+ * one, the hold-music files dialog, the prompt library and the greetings dialog. It was extracted
+ * from here rather than the other way round, because this is where the reasoning was written down
+ * and it applies unchanged to all four: never render a live credential for a row nobody played.
+ *
+ * What stays here is the part that is about VOICEMAIL specifically — the permission that gates
+ * listening, and the sentence a row shows when the caller does not have it. `voicemail.listen` is
+ * separate from `voicemail.read` on purpose (a supervisor may see that a message exists without
+ * being entitled to hear it), so this is not a detail the shared button could infer.
  */
 function MessagePlayer({
 	boxId,
@@ -338,46 +342,16 @@ function MessagePlayer({
 	canListen: boolean;
 }) {
 	const mint = useVoicemailPlaybackUrl();
-	const [source, setSource] = useState<string | null>(null);
 
 	if (!canListen) {
 		return <span className="text-xs text-muted-foreground">No listen permission</span>;
 	}
 
-	if (source !== null) {
-		return (
-			<audio
-				controls
-				autoPlay
-				src={source}
-				className={cn(inputClassName, "h-8 max-w-full p-0")}
-				aria-label={`Voicemail from ${new Date(message.receivedAt).toLocaleString()}`}
-			>
-				<track kind="captions" />
-			</audio>
-		);
-	}
-
 	return (
-		<div className="flex flex-col gap-1">
-			<Button
-				size="sm"
-				variant="secondary"
-				disabled={mint.isPending}
-				onClick={() => {
-					mint.mutate(
-						{ boxId, messageId: message.id },
-						{ onSuccess: (link) => setSource(link.url) },
-					);
-				}}
-			>
-				{mint.isPending ? "Preparing…" : "Play"}
-			</Button>
-			{mint.isError ? (
-				<span className="text-xs text-danger">
-					{mint.error.message || "This message could not be prepared for playback."}
-				</span>
-			) : null}
-		</div>
+		<MediaPreviewButton
+			mint={() => mint.mutateAsync({ boxId, messageId: message.id })}
+			label={`Voicemail from ${new Date(message.receivedAt).toLocaleString()}`}
+			failureMessage="This message could not be prepared for playback."
+		/>
 	);
 }

@@ -62,6 +62,35 @@ export const queryKeys = {
 		] as const,
 
 	/**
+	 * A mailbox's GREETINGS, filed under the mailbox exactly as its messages are.
+	 *
+	 * The coarse `pbxResource(org, "voicemail-boxes")` invalidation every mailbox mutation already
+	 * fires sweeps these too, so deleting a box cannot leave its greetings cached behind it — and,
+	 * more usefully, an upload invalidates the box list as well, because activating a greeting is a
+	 * routing change and the compile banner has to notice.
+	 */
+	voicemailGreetings: (organizationId: string, boxId: string) =>
+		["organizations", organizationId, "pbx", "voicemail-boxes", "item", boxId, "greetings"] as const,
+
+	/**
+	 * The audio files under one hold-music class.
+	 *
+	 * Filed under `pbx/moh-classes/item/<id>` so a class mutation sweeps its files, and NOT under
+	 * `pbx/prompts` even though the rows live in the `prompt` table. The two lists answer different
+	 * questions — "what does this class play" and "what can I point an IVR at" — and a file upload
+	 * must invalidate the first without evicting the second, which is a page a user may be reading.
+	 */
+	mohClassFiles: (organizationId: string, mohClassId: string) =>
+		["organizations", organizationId, "pbx", "moh-classes", "item", mohClassId, "files"] as const,
+
+	/**
+	 * The prompt library list, which takes a `kind` filter the generic list machinery has no
+	 * vocabulary for. Filed under `pbx/prompts`, so the generic mutation invalidation still sweeps it.
+	 */
+	promptList: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
+		["organizations", organizationId, "pbx", "prompts", "list", query] as const,
+
+	/**
 	 * What each feature-code action's `params` accepts.
 	 *
 	 * NOT scoped by organization, unlike everything else here: it describes the schema, not the

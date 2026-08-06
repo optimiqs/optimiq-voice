@@ -12,11 +12,13 @@ import {
 import { RowActions } from "~/components/pbx/row-actions";
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
+import { MenuItem } from "~/components/ui/menu";
 import { PageHeader } from "~/components/ui/page-header";
-import { DEFAULT_PAGE_LIMIT, PBX_RESOURCES } from "~/lib/pbx/client";
+import { DEFAULT_PAGE_LIMIT, PBX_RESOURCES, type ConferencePinRole } from "~/lib/pbx/client";
 import { usePermission } from "../../_context/session-context";
 import { usePbxDelete, usePbxList } from "../../_hooks/use-pbx-queries";
 import { ConferenceDialog } from "./conference-dialog";
+import { ConferencePinDialog } from "./conference-pin-dialog";
 import type { ConferenceRow } from "~/lib/pbx/contracts";
 
 /**
@@ -29,6 +31,17 @@ import type { ConferenceRow } from "~/lib/pbx/contracts";
  * What DOES point at a room — DIDs, IVR options, ring-group timeouts — is surfaced where it matters
  * most: the delete is refused while anything still targets it, and the confirmation names every
  * referrer as a link.
+ *
+ * ## The two PINs are row actions, and neither is a column
+ *
+ * The server never returns `pinHash` or `moderatorPinHash` — they are stripped from every response
+ * — so there is nothing for a column to render: this table cannot say whether a room has a PIN, and
+ * a column that guessed would be wrong in the direction that matters. The actions describe what
+ * they DO instead, which is the honest version, exactly as the voicemail screen does for its
+ * mailbox PIN.
+ *
+ * One dialog component serves both, keyed by the room AND the role: opening the moderator PIN for
+ * one room after the participant PIN of another must not reuse the first dialog's typed digits.
  */
 export function ConferencesScreen() {
 	const resource = PBX_RESOURCES.conferences;
@@ -43,6 +56,10 @@ export function ConferencesScreen() {
 	const [editing, setEditing] = useState<ConferenceRow | null>(null);
 	const [dialogOpen, setDialogOpen] = useState(false);
 	const [pendingDelete, setPendingDelete] = useState<ConferenceRow | null>(null);
+	const [pinFor, setPinFor] = useState<{
+		readonly conference: ConferenceRow;
+		readonly role: ConferencePinRole;
+	} | null>(null);
 
 	const createButton = canWrite ? (
 		<Button
@@ -118,6 +135,18 @@ export function ConferencesScreen() {
 				rowActions={(row) => (
 					<RowActions
 						label={`conference room ${row.roomNumber}`}
+						extra={
+							canWrite ? (
+								<>
+									<MenuItem onClick={() => setPinFor({ conference: row, role: "participant" })}>
+										Room PIN…
+									</MenuItem>
+									<MenuItem onClick={() => setPinFor({ conference: row, role: "moderator" })}>
+										Moderator PIN…
+									</MenuItem>
+								</>
+							) : null
+						}
 						onEdit={
 							canWrite
 								? () => {
@@ -151,6 +180,18 @@ export function ConferencesScreen() {
 				open={dialogOpen}
 				onOpenChange={setDialogOpen}
 				conference={editing}
+			/>
+
+			<ConferencePinDialog
+				key={`pin-${pinFor?.role ?? "none"}-${pinFor?.conference.id ?? "none"}`}
+				open={pinFor !== null}
+				onOpenChange={(open) => {
+					if (!open) {
+						setPinFor(null);
+					}
+				}}
+				conference={pinFor?.conference ?? null}
+				role={pinFor?.role ?? "participant"}
 			/>
 
 			<DeleteEntityDialog

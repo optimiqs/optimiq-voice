@@ -3,13 +3,20 @@ import {
 	conferenceFormSchema,
 	dialableString,
 	e164,
+	emergencyAddressFormSchema,
 	extensionFormSchema,
 	featureCodeFormSchema,
+	greetingUploadFormSchema,
 	inboundRouteFormSchema,
 	internalNumber,
+	keypadPinIssue,
+	mohClassFormSchema,
+	mohClassName,
 	outboundRouteFormSchema,
 	parkLotFormSchema,
 	parseDialPatterns,
+	phoneNumberFormSchema,
+	promptFormSchema,
 	queueAgentFormSchema,
 	queueFormSchema,
 	queueTierFormSchema,
@@ -534,5 +541,273 @@ describe("parkLotFormSchema", () => {
 		expect(parkLotFormSchema.safeParse({ ...base, timeoutSeconds: "4" }).success).toBe(false);
 		expect(parkLotFormSchema.safeParse({ ...base, timeoutSeconds: "5" }).success).toBe(true);
 		expect(parkLotFormSchema.parse(base).timeoutSeconds).toBeNull();
+	});
+});
+
+// ---------------------------------------------------------------------------------------------
+// The media library
+// ---------------------------------------------------------------------------------------------
+
+describe("mohClassName, which becomes a section name in the media server's configuration", () => {
+	/**
+	 * Stricter than `displayName`, and the reason is not cosmetic.
+	 *
+	 * The compiler resolves every `mohClassId` in a tenant's configuration to this NAME, and the
+	 * media server looks it up as a section in `musiconhold.conf`. A `]` or a newline in it is a
+	 * configuration file that does not parse — which takes hold music away from every extension,
+	 * queue, conference and park lot on the box, not just this class.
+	 */
+	it("accepts what a media server will take as a class name", () => {
+		expect(mohClassName.safeParse("default").success).toBe(true);
+		expect(mohClassName.safeParse("office-hours_v2.1").success).toBe(true);
+		expect(mohClassName.safeParse("8bit").success).toBe(true);
+	});
+
+	it("refuses anything that could break the configuration file it lands in", () => {
+		expect(mohClassName.safeParse("hold]music").success).toBe(false);
+		expect(mohClassName.safeParse("hold music").success).toBe(false);
+		expect(mohClassName.safeParse("hold\nmusic").success).toBe(false);
+		expect(mohClassName.safeParse("-leading-dash").success).toBe(false);
+		expect(mohClassName.safeParse("").success).toBe(false);
+	});
+});
+
+describe("mohClassFormSchema", () => {
+	const base = {
+		name: "office-hours",
+		description: "",
+		source: "library" as const,
+		streamUri: "",
+		shuffle: true,
+		sampleRateHz: 8000 as const,
+		isDefault: false,
+		enabled: true,
+	};
+
+	it("accepts a library class with no stream URI", () => {
+		const result = mohClassFormSchema.parse(base);
+		expect(result.streamUri).toBeNull();
+		expect(result.description).toBeNull();
+	});
+
+	/**
+	 * Mirrors the server's refinement. A streaming class with no URI plays silence to everyone on
+	 * hold and the media server has no way to report it, so both layers refuse — on the field that
+	 * is missing, so the message lands on the control that produced it.
+	 */
+	it("refuses a streaming class with no URI, on streamUri", () => {
+		const result = mohClassFormSchema.safeParse({ ...base, source: "stream" });
+		expect(result.success).toBe(false);
+		expect(result.error?.issues[0]?.path).toEqual(["streamUri"]);
+	});
+
+	it("accepts a streaming class that names its source", () => {
+		expect(
+			mohClassFormSchema.safeParse({
+				...base,
+				source: "stream",
+				streamUri: "http://ice.example.test/hold",
+			}).success,
+		).toBe(true);
+	});
+
+	/**
+	 * A LIBRARY class with a stream URI is deliberately allowed.
+	 *
+	 * Switching a class back and forth while keeping the URI on the row is a normal thing to do, and
+	 * losing it on every switch would be hostile.
+	 */
+	it("allows a library class to keep a stream URI it is not using", () => {
+		expect(
+			mohClassFormSchema.safeParse({ ...base, streamUri: "http://ice.example.test/hold" }).success,
+		).toBe(true);
+	});
+
+	it("offers only the three sample rates the stack can serve without surprise", () => {
+		expect(mohClassFormSchema.safeParse({ ...base, sampleRateHz: 8000 }).success).toBe(true);
+		expect(mohClassFormSchema.safeParse({ ...base, sampleRateHz: 44_100 }).success).toBe(false);
+	});
+});
+
+describe("promptFormSchema", () => {
+	it("requires a name and a well-formed language tag", () => {
+		expect(promptFormSchema.safeParse({ name: "Welcome", language: "en-US" }).success).toBe(true);
+		expect(promptFormSchema.safeParse({ name: "Welcome", language: "en" }).success).toBe(true);
+		expect(promptFormSchema.safeParse({ name: "", language: "en-US" }).success).toBe(false);
+		// The grammar is BCP 47's, not a list of known tags: `english` is a well-formed 7-letter
+		// primary subtag and is accepted, `en_US` is not a tag at all. Checking the shape rather than
+		// the registry is deliberate — a hard-coded list of languages is a list that goes stale.
+		expect(promptFormSchema.safeParse({ name: "Welcome", language: "en_US" }).success).toBe(false);
+		expect(promptFormSchema.safeParse({ name: "Welcome", language: "e" }).success).toBe(false);
+	});
+
+	/**
+	 * The object key is not here and never will be.
+	 *
+	 * It is the only thing standing between a row and a file, and RLS does not protect the
+	 * filesystem: accepting one from a client would let an admin re-point a library entry at another
+	 * tenant's audio by editing a string. `z.strictObject` is what makes that a parse failure here
+	 * rather than a silently dropped key.
+	 */
+	it("refuses an object key, so a prompt cannot be re-pointed at another file", () => {
+		expect(
+			promptFormSchema.safeParse({
+				name: "Welcome",
+				language: "en-US",
+				objectKey: "prompts/somebody-else/secret.wav",
+			}).success,
+		).toBe(false);
+	});
+});
+
+describe("greetingUploadFormSchema", () => {
+	it("takes one of the four slots, an optional label and an explicit active flag", () => {
+		const result = greetingUploadFormSchema.parse({
+			kind: "temporary",
+			label: "",
+			active: true,
+		});
+		expect(result.kind).toBe("temporary");
+		expect(result.label).toBeNull();
+		expect(result.active).toBe(true);
+	});
+
+	it("refuses a kind the server does not model", () => {
+		expect(
+			greetingUploadFormSchema.safeParse({ kind: "holiday", label: "", active: true }).success,
+		).toBe(false);
+	});
+});
+
+// ---------------------------------------------------------------------------------------------
+// E911
+// ---------------------------------------------------------------------------------------------
+
+describe("emergencyAddressFormSchema", () => {
+	const base = {
+		label: "Head office",
+		streetLine1: "1 Telephone Road",
+		streetLine2: "",
+		locationDetail: "Floor 3, Room 314",
+		locality: "Springfield",
+		administrativeArea: "IL",
+		postalCode: "62701",
+		country: "us",
+	};
+
+	it("upper-cases the country so one address is not stored twice", () => {
+		expect(emergencyAddressFormSchema.parse(base).country).toBe("US");
+	});
+
+	it("requires the four fields that are wrong to omit in every jurisdiction", () => {
+		expect(emergencyAddressFormSchema.safeParse({ ...base, streetLine1: "  " }).success).toBe(
+			false,
+		);
+		expect(emergencyAddressFormSchema.safeParse({ ...base, locality: "" }).success).toBe(false);
+		expect(emergencyAddressFormSchema.safeParse({ ...base, administrativeArea: "" }).success).toBe(
+			false,
+		);
+		expect(emergencyAddressFormSchema.safeParse({ ...base, postalCode: "" }).success).toBe(false);
+	});
+
+	/**
+	 * The dispatchable-location detail is optional, and that is a product decision rather than an
+	 * oversight: a single-occupancy building genuinely has none. The screen marks it strongly
+	 * recommended and says why — a responder given a twelve-floor office block and no floor number
+	 * is the failure RAY BAUM'S Act was written about.
+	 */
+	it("allows an address with no floor or room, because some buildings have none", () => {
+		expect(emergencyAddressFormSchema.safeParse({ ...base, locationDetail: "" }).success).toBe(
+			true,
+		);
+		expect(emergencyAddressFormSchema.parse({ ...base, locationDetail: "" }).locationDetail).toBeNull();
+	});
+
+	it("refuses a country code that is not two letters", () => {
+		expect(emergencyAddressFormSchema.safeParse({ ...base, country: "USA" }).success).toBe(false);
+		expect(emergencyAddressFormSchema.safeParse({ ...base, country: "12" }).success).toBe(false);
+	});
+
+	/**
+	 * `validated` is a fact a CARRIER asserted, never a value an admin may set.
+	 *
+	 * Accepting it here would let anyone with `numbers.emergency` mark an unverified address as
+	 * verified, which for a field whose entire purpose is regulatory assurance is not a validation
+	 * bug but a compliance one. The server refuses it too; this is the client half of the same rule.
+	 */
+	it("refuses a self-declared `validated`", () => {
+		expect(emergencyAddressFormSchema.safeParse({ ...base, validated: true }).success).toBe(false);
+	});
+});
+
+describe("phoneNumberFormSchema, now carrying a dispatchable location", () => {
+	const base = {
+		e164: "+12125550100",
+		label: "",
+		callerIdNamePrefix: "",
+		recordEnabled: false,
+		emergencyAddressId: "",
+		voiceEnabled: true,
+		faxEnabled: false,
+		enabled: true,
+	};
+
+	/**
+	 * Blank clears it, which on a `PATCH` is `null` rather than `""` — the column is a uuid foreign
+	 * key and an empty string is a `22P02` the user cannot act on.
+	 */
+	it("clears the emergency address to null rather than to an empty string", () => {
+		expect(phoneNumberFormSchema.parse(base).emergencyAddressId).toBeNull();
+	});
+
+	it("keeps an assigned address", () => {
+		const id = "019fd5fb-de54-700b-8826-8cf8ab5199af";
+		expect(phoneNumberFormSchema.parse({ ...base, emergencyAddressId: id }).emergencyAddressId).toBe(
+			id,
+		);
+	});
+});
+
+// ---------------------------------------------------------------------------------------------
+// PINs
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One policy for the mailbox PIN and both conference PINs, mirroring `voicemailPinIssue` on the
+ * server — which is itself one function serving all three.
+ *
+ * The two refused SHAPES exist because of the engine's three-attempt limit rather than because of
+ * entropy: a PIN drawn from the handful of sequences every attacker tries FIRST is materially
+ * weaker than one that is not. The blocklist stops there deliberately; a longer one starts guessing
+ * at what a user meant and produces "rejected, and I do not know why".
+ */
+describe("keypadPinIssue, mirrored from voicemail-boxes.dto.ts", () => {
+	it("accepts a PIN a telephone keypad can enter", () => {
+		expect(keypadPinIssue("80412")).toBeUndefined();
+		expect(keypadPinIssue("5193")).toBeUndefined();
+		expect(keypadPinIssue("9042317685")).toBeUndefined();
+	});
+
+	it("refuses anything but digits, because the keypad has ten keys", () => {
+		expect(keypadPinIssue("12ab")).toBeDefined();
+		expect(keypadPinIssue("80 12")).toBeDefined();
+	});
+
+	it("bounds the length at the server's four and ten", () => {
+		expect(keypadPinIssue("123")).toBeDefined();
+		expect(keypadPinIssue("12345678901")).toBeDefined();
+	});
+
+	it("refuses one repeated digit and a straight run in either direction", () => {
+		expect(keypadPinIssue("0000")).toBeDefined();
+		expect(keypadPinIssue("9999")).toBeDefined();
+		expect(keypadPinIssue("1234")).toBeDefined();
+		expect(keypadPinIssue("4321")).toBeDefined();
+		expect(keypadPinIssue("98765")).toBeDefined();
+	});
+
+	/** Two adjacent digits are not a run. The rule is about the WHOLE PIN counting. */
+	it("does not refuse a PIN that merely contains consecutive digits", () => {
+		expect(keypadPinIssue("1245")).toBeUndefined();
 	});
 });

@@ -485,11 +485,13 @@ async function main(): Promise<void> {
 			"/queues",
 			"/voicemail",
 			"/conferences",
+			"/media",
 			"/recordings",
 			"/cdr",
 			"/settings",
 			"/settings/members",
 			"/settings/api-keys",
+			"/settings/emergency-addresses",
 		];
 		const failures: string[] = [];
 		for (const route of routes) {

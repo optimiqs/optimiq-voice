@@ -4,8 +4,11 @@ import { CarrierWebhookController } from "./carrier/carrier-webhook.controller";
 import { CarrierController, CarrierTrunkController } from "./carrier/carrier.controller";
 import { carrierProviders } from "./carrier/carrier.providers";
 import { CarrierService } from "./carrier/carrier.service";
+import { ConferencePinService } from "./conferences/conference-pin.service";
 import { ConferencesController } from "./conferences/conferences.controller";
 import { ConferencesService } from "./conferences/conferences.service";
+import { EmergencyAddressesController } from "./emergency-addresses/emergency-addresses.controller";
+import { EmergencyAddressesService } from "./emergency-addresses/emergency-addresses.service";
 import { ExtensionsController } from "./extensions/extensions.controller";
 import { ExtensionsService } from "./extensions/extensions.service";
 import { FeatureCodesController } from "./feature-codes/feature-codes.controller";
@@ -14,12 +17,16 @@ import { InboundRoutesController } from "./inbound-routes/inbound-routes.control
 import { InboundRoutesService } from "./inbound-routes/inbound-routes.service";
 import { IvrMenusController } from "./ivr-menus/ivr-menus.controller";
 import { IvrMenuOptionsService, IvrMenusService } from "./ivr-menus/ivr-menus.service";
+import { MohClassesController } from "./moh-classes/moh-classes.controller";
+import { MohClassesService } from "./moh-classes/moh-classes.service";
 import { OutboundRoutesController } from "./outbound-routes/outbound-routes.controller";
 import { OutboundRoutesService } from "./outbound-routes/outbound-routes.service";
 import { ParkLotsController } from "./park-lots/park-lots.controller";
 import { ParkLotsService } from "./park-lots/park-lots.service";
 import { PhoneNumbersController } from "./phone-numbers/phone-numbers.controller";
 import { PhoneNumbersService } from "./phone-numbers/phone-numbers.service";
+import { PromptsController } from "./prompts/prompts.controller";
+import { PromptsService } from "./prompts/prompts.service";
 import { AgentStatePublisher } from "./queues/agent-state.publisher";
 import { QueueAgentSessionController } from "./queues/queue-agent-session.controller";
 import { QueueAgentSessionService } from "./queues/queue-agent-session.service";
@@ -52,6 +59,8 @@ import { TrunksService } from "./trunks/trunks.service";
 import { VoicemailBoxesController } from "./voicemail-boxes/voicemail-boxes.controller";
 import { VoicemailBoxesService } from "./voicemail-boxes/voicemail-boxes.service";
 import { VoicemailConsumer } from "./voicemail-boxes/voicemail-consumer.service";
+import { VoicemailGreetingsController } from "./voicemail-boxes/voicemail-greetings.controller";
+import { VoicemailGreetingsService } from "./voicemail-boxes/voicemail-greetings.service";
 import { VoicemailMessagesController } from "./voicemail-boxes/voicemail-messages.controller";
 import { VoicemailMessagesService } from "./voicemail-boxes/voicemail-messages.service";
 import { VoicemailMwiPublisher } from "./voicemail-boxes/voicemail-mwi.publisher";
@@ -102,6 +111,16 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		QueueAgentSessionController,
 		ConferencesController,
 		ParkLotsController,
+		/**
+		 * The media library, and the dispatchable locations.
+		 *
+		 * `MohClassesController` serves two resources on one prefix — the class, and the `prompt`
+		 * rows under it — because a class's files are created by an UPLOAD and the child-resource
+		 * machinery has no seam for a multipart request. See its header.
+		 */
+		MohClassesController,
+		PromptsController,
+		EmergencyAddressesController,
 		FeatureCodesController,
 		VoicemailBoxesController,
 		/**
@@ -115,6 +134,19 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		 * property of the router we are relying on, not of the code.
 		 */
 		VoicemailMessagesController,
+		/**
+		 * The mailbox's GREETINGS, on the same prefix again.
+		 *
+		 * A third lifecycle on `/voicemail-boxes`: the box row is CRUD through the Effect
+		 * repository, a message is not a routing input at all, and a greeting is a routing input
+		 * whose activation is inherently a two-row write and therefore cannot go through the
+		 * repository. Three lifecycles, three controllers, one prefix.
+		 *
+		 * `GET /voicemail-boxes/greetings/media` and `GET /voicemail-boxes/:id/messages` coexist for
+		 * the reason recorded above `VoicemailMessagesController`: Fastify's radix router prefers a
+		 * static segment over a parametric one at every level, regardless of declaration order.
+		 */
+		VoicemailGreetingsController,
 		RoutingController,
 		RoutingRpcController,
 		VoicemailRpcController,
@@ -222,12 +254,17 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		QueueTiersService,
 		QueueAgentSessionService,
 		ConferencesService,
+		ConferencePinService,
 		ParkLotsService,
+		PromptsService,
+		MohClassesService,
+		EmergencyAddressesService,
 		FeatureCodesService,
 		VoicemailBoxesService,
 		VoicemailPinService,
 		VoicemailMwiPublisher,
 		VoicemailMessagesService,
+		VoicemailGreetingsService,
 		VoicemailConsumer,
 		RoutingService,
 	],
@@ -242,6 +279,7 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		AgentStatePublisher,
 		VoicemailMessagesService,
 		VoicemailMwiPublisher,
+		PromptsService,
 	],
 })
 export class PbxModule implements OnApplicationShutdown {

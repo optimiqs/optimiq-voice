@@ -7,27 +7,18 @@ import {
 	ParseUUIDPipe,
 	Post,
 	Query,
+	Req,
 	Res,
 } from "@nestjs/common";
 import { PublicRoute } from "../../auth/public-route.decorator";
 import { RequirePermissions } from "../../auth/require-permissions.decorator";
 import { Session } from "../../auth/session.decorator";
+import { applyMediaResponse, readRangeHeader } from "../../media/media-http";
 import { parseDto } from "../../pbx/shared/dto";
 import { recordingListQuerySchema } from "../query/cdr.dto";
 import { RecordingsService } from "./recordings.service";
+import type { MediaReply, MediaRequest } from "../../media/media-http";
 import type { AppSession } from "@optimiq-voice/auth";
-
-/**
- * The one method of the Fastify reply this controller uses.
- *
- * Declared structurally rather than imported as `FastifyReply` because `fastify` is a transitive
- * dependency here (it arrives under `@nestjs/platform-fastify`), and adding it as a direct one to
- * name a type in a single signature would be a dependency taken on for a type import. The same
- * reasoning `auth-bootstrap.ts` applies to `AuthHttpServer`.
- */
-interface MediaReply {
-	header(name: string, value: string): unknown;
-}
 
 /**
  * `/api/v1/recordings` — media metadata, and the signed route that reaches the bytes.
@@ -58,19 +49,29 @@ export class CdrRecordingsController {
 	 *
 	 * The token arrives as a QUERY parameter — see `recordingMediaPath` for why the path form was
 	 * tried first and abandoned (Fastify caps a route parameter at 100 characters).
+	 *
+	 * ## `Range` is honoured, and the scrub bar depends on it
+	 *
+	 * This route used to answer `accept-ranges: none`, which was honest about what it did and is
+	 * exactly why dragging the playhead on a forty-minute recording either did nothing or restarted
+	 * it. A browser decides whether a media element is seekable from `accept-ranges` on the FIRST
+	 * response and from whether a subsequent `Range` request comes back `206`, so both halves had
+	 * to change together. `src/media/http-range.ts` decides; `applyMediaResponse` renders the
+	 * decision — including the `416` with a `content-range: bytes * /<size>`, which is the only
+	 * answer that lets a player recover from a seek past the end.
 	 */
 	@Get("media")
 	@PublicRoute()
 	@Header("Cache-Control", "private, no-store")
-	async media(@Query("token") token: string, @Res({ passthrough: true }) reply: MediaReply) {
-		const media = await this.recordings.openSignedMedia(token ?? "");
-		void reply.header("content-type", media.contentType);
-		void reply.header("content-length", String(media.sizeBytes));
-		void reply.header("content-disposition", `inline; filename="${media.fileName}"`);
-		// `accept-ranges: none` is honest rather than restrictive: this streams the whole object, so
-		// claiming range support would make a seeking audio player ask for a range it never gets.
-		void reply.header("accept-ranges", "none");
-		return media.stream;
+	async media(
+		@Query("token") token: string,
+		@Req() request: MediaRequest,
+		@Res({ passthrough: true }) reply: MediaReply,
+	) {
+		return applyMediaResponse(
+			reply,
+			await this.recordings.openSignedMedia(token ?? "", readRangeHeader(request)),
+		);
 	}
 
 	@Get(":id")

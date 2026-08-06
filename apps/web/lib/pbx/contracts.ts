@@ -555,6 +555,24 @@ export interface VoicemailPinState {
 	readonly pinSet: boolean;
 }
 
+/**
+ * What a conference PIN endpoint answers with.
+ *
+ * Both flags on every reply, so a dialog that just set one does not have to re-fetch to render the
+ * other. Never a digest and never the PIN — `secretColumns` on the API resource strips
+ * `pinHash`/`moderatorPinHash` from every normal response, and these endpoints answer in booleans.
+ *
+ * `pinSet` reaches the compiled routing artifact as `ConferencePlanNode.requiresPin`.
+ * `moderatorPinSet` reaches nothing yet: `ConferenceInput` in `@optimiq-voice/routing` has no
+ * moderator field, so the column is stored and the engine does not read it. The dialog says so.
+ */
+export interface ConferencePinState {
+	readonly id: string;
+	readonly roomNumber: string;
+	readonly pinSet: boolean;
+	readonly moderatorPinSet: boolean;
+}
+
 /** `new` / `saved` / `deleted` — `voicemail_message.folder`, the whole state machine. */
 export const VOICEMAIL_FOLDERS = ["new", "saved", "deleted"] as const;
 export type VoicemailFolder = (typeof VOICEMAIL_FOLDERS)[number];
@@ -608,6 +626,93 @@ export interface VoicemailPlaybackLink {
 	readonly url: string;
 	readonly expiresAt: string;
 	readonly expiresInSeconds: number;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The media library
+// ---------------------------------------------------------------------------------------------
+
+/** How a music-on-hold class sources its audio. Mirrors `MOH_SOURCES` in `@optimiq-voice/pbx-db`. */
+export const MOH_SOURCES = ["library", "stream"] as const;
+export type MohSource = (typeof MOH_SOURCES)[number];
+
+/** What a stored audio object is for. Mirrors `PROMPT_KINDS`. */
+export const PROMPT_KINDS = ["prompt", "moh", "greeting"] as const;
+export type PromptKind = (typeof PROMPT_KINDS)[number];
+
+/** The four greeting slots. Mirrors `VOICEMAIL_GREETING_KINDS`. */
+export const VOICEMAIL_GREETING_KINDS = ["unavailable", "busy", "name", "temporary"] as const;
+export type VoicemailGreetingKind = (typeof VOICEMAIL_GREETING_KINDS)[number];
+
+export interface MohClassRow extends EntityRow {
+	readonly name: string;
+	readonly description: string | null;
+	readonly source: MohSource;
+	readonly streamUri: string | null;
+	readonly shuffle: boolean;
+	readonly sampleRateHz: number;
+	readonly isDefault: boolean;
+	readonly enabled: boolean;
+}
+
+/**
+ * One stored audio object.
+ *
+ * `objectKey` is read-only on the wire and read-only in this app: it is the only thing standing
+ * between a row and a file, and the API refuses to patch it. It is surfaced because an operator
+ * looking for a file under the media mount needs to know what it is called.
+ */
+export interface PromptRow extends EntityRow {
+	readonly name: string;
+	readonly kind: PromptKind;
+	readonly mohClassId: string | null;
+	readonly objectKey: string;
+	readonly contentType: string;
+	readonly durationMs: number | null;
+	readonly sizeBytes: number | null;
+	readonly checksum: string | null;
+	readonly language: string;
+}
+
+export interface VoicemailGreetingRow extends EntityRow {
+	readonly voicemailBoxId: string;
+	readonly kind: VoicemailGreetingKind;
+	readonly label: string | null;
+	readonly objectKey: string;
+	readonly durationMs: number | null;
+	/** At most one per kind. Activating one stands the incumbent down in the same transaction. */
+	readonly active: boolean;
+}
+
+/** A short-lived preview link. The same shape as a voicemail message's, deliberately. */
+export type MediaPlaybackLink = VoicemailPlaybackLink;
+
+// ---------------------------------------------------------------------------------------------
+// E911
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A dispatchable location, per RAY BAUM'S Act.
+ *
+ * `validated` and its three companions are written by a carrier's E911 provisioning API and by
+ * nothing else — this app never sends them, and the API refuses them in a request body. An
+ * unvalidated address is stored, assignable, and shown as unvalidated: the alternative is a screen
+ * that claims a regulatory guarantee the platform has not obtained.
+ */
+export interface EmergencyAddressRow extends EntityRow {
+	readonly label: string;
+	readonly streetLine1: string;
+	readonly streetLine2: string | null;
+	/** Floor / suite / room — what turns an address into a DISPATCHABLE location. */
+	readonly locationDetail: string | null;
+	readonly locality: string;
+	readonly administrativeArea: string;
+	readonly postalCode: string;
+	readonly country: string;
+	readonly validated: boolean;
+	readonly validatedAt: string | null;
+	readonly validationProvider: string | null;
+	readonly validationReference: string | null;
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -165,6 +165,27 @@ export function HistoryIcon(props: IconProps) {
 	);
 }
 
+/** The media library: a musical note. Hold music and prompts are both "audio the tenant stored". */
+export function MusicIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<path d="M9 18V5l12-2v13" />
+			<path d="M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+			<path d="M21 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+		</Glyph>
+	);
+}
+
+/** A dispatchable location: a map pin. */
+export function LocationIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<path d="M20 10c0 5.5-8 12-8 12s-8-6.5-8-12a8 8 0 0 1 16 0Z" />
+			<path d="M14.5 10a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0Z" />
+		</Glyph>
+	);
+}
+
 export function SettingsIcon(props: IconProps) {
 	return (
 		<Glyph {...props}>

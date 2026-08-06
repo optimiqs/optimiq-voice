@@ -960,6 +960,8 @@ async function main(): Promise<void> {
 				PBX_EXTENSION_DIAL_TEMPLATE: "PJSIP/{number}",
 				PBX_VOICEMAIL_MEDIA_ROOT: "/tmp/optimiq-voice-unused",
 				PBX_VOICEMAIL_URL_TTL_SECONDS: 300,
+				PBX_MEDIA_OBJECT_ROOT: "/tmp/optimiq-voice-unused",
+				PBX_MEDIA_MAX_UPLOAD_BYTES: 10 * 1024 * 1024,
 			});
 			if (organizationId.length > 0) {
 				await pbx.withTenantScope(organizationId, async (transaction) => {

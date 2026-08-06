@@ -5,6 +5,8 @@ import {
 	DESTINATION_TYPES as SERVER_DESTINATION_TYPES,
 	FEATURE_CODE_ACTIONS as SERVER_FEATURE_CODE_ACTIONS,
 	IVR_OPTION_MATCH_KINDS as SERVER_IVR_OPTION_MATCH_KINDS,
+	MOH_SOURCES as SERVER_MOH_SOURCES,
+	PROMPT_KINDS as SERVER_PROMPT_KINDS,
 	QUEUE_AGENT_CONTACT_KINDS as SERVER_QUEUE_AGENT_CONTACT_KINDS,
 	QUEUE_AGENT_STATUSES as SERVER_QUEUE_AGENT_STATUSES,
 	QUEUE_STRATEGIES as SERVER_QUEUE_STRATEGIES,
@@ -16,6 +18,7 @@ import {
 	TRUNK_KINDS as SERVER_TRUNK_KINDS,
 	TRUNK_STATUSES as SERVER_TRUNK_STATUSES,
 	VOICEMAIL_EMAIL_MODES as SERVER_VOICEMAIL_EMAIL_MODES,
+	VOICEMAIL_GREETING_KINDS as SERVER_VOICEMAIL_GREETING_KINDS,
 } from "@optimiq-voice/pbx-db";
 import {
 	ROUTING_CONTEXTS as SERVER_ROUTING_CONTEXTS,
@@ -27,6 +30,8 @@ import {
 	DESTINATION_TYPES,
 	FEATURE_CODE_ACTIONS,
 	IVR_OPTION_MATCH_KINDS,
+	MOH_SOURCES,
+	PROMPT_KINDS,
 	QUEUE_AGENT_CONTACT_KINDS,
 	QUEUE_AGENT_STATUSES,
 	QUEUE_STRATEGIES,
@@ -39,6 +44,7 @@ import {
 	TRUNK_KINDS,
 	TRUNK_STATUSES,
 	VOICEMAIL_EMAIL_MODES,
+	VOICEMAIL_GREETING_KINDS,
 } from "./contracts";
 import {
 	DESTINATION_TYPE_LABELS,
@@ -116,6 +122,26 @@ describe("closed sets mirrored from @optimiq-voice/pbx-db", () => {
 
 	it("voicemail email modes match", () => {
 		expect(VOICEMAIL_EMAIL_MODES).toEqual([...SERVER_VOICEMAIL_EMAIL_MODES]);
+	});
+
+	it("music-on-hold sources match", () => {
+		expect(MOH_SOURCES).toEqual([...SERVER_MOH_SOURCES]);
+	});
+
+	it("prompt kinds match", () => {
+		expect(PROMPT_KINDS).toEqual([...SERVER_PROMPT_KINDS]);
+	});
+
+	/**
+	 * The four greeting slots.
+	 *
+	 * Order matters here for a reason beyond reading order: `temporary` WINS over `unavailable` at
+	 * compile time (`VOICEMAIL_LEAVE_GREETING_PRECEDENCE` in `@optimiq-voice/routing`), which is what
+	 * makes "I am away until Monday" a recording you add and delete rather than one you overwrite.
+	 * A kind this app did not offer would be a slot nobody could fill.
+	 */
+	it("voicemail greeting kinds match", () => {
+		expect(VOICEMAIL_GREETING_KINDS).toEqual([...SERVER_VOICEMAIL_GREETING_KINDS]);
 	});
 
 	/** Twenty of them. A missing one is a feature nobody can configure. */
@@ -230,6 +256,18 @@ const RESOURCE_TABLES: Readonly<Record<string, string>> = {
 	conferences: "conference",
 	"park-lots": "park_lot",
 	"voicemail-boxes": "voicemail_box",
+	"moh-classes": "moh_class",
+	/**
+	 * `prompt` is deliberately absent from `ROUTING_TABLE_TO_ENTITY`, and the loop below asserts
+	 * that the descriptor agrees. The reason it is absent is worth knowing before anyone "fixes" it:
+	 * the compiler copies a `promptId` into a plan node VERBATIM and never resolves it, so renaming a
+	 * prompt or re-uploading its audio changes nothing the artifact contains. The day the compiler
+	 * starts resolving prompt ids to `object://` media refs — as it already does for `mohClassId` →
+	 * class name — `prompt` has to be added to that map in the same commit, and this test is what
+	 * will notice.
+	 */
+	prompts: "prompt",
+	"emergency-addresses": "emergency_address",
 };
 
 const CHILD_TABLES: Readonly<Record<string, string>> = {
@@ -274,6 +312,32 @@ describe("affectsRouting, mirrored from @optimiq-voice/routing", () => {
 	 * line of a loop: staffing a queue is live state, not a dial-plan change. If the routing package
 	 * ever starts compiling membership, the detail page's copy and its invalidation are both wrong.
 	 */
+	/**
+	 * The media library's two halves, stated on their own for the same reason the queue claim is.
+	 *
+	 * A hold-music class IS a routing input: five node kinds carry its resolved NAME, so a rename has
+	 * to reach the engine and the compile banner has to say so. A prompt is NOT, for the reason
+	 * recorded beside `prompts` in `RESOURCE_TABLES` — and the difference is invisible in the UI, so
+	 * it is asserted rather than left to a loop over fifteen resources.
+	 */
+	it("says hold music recompiles and the prompt library does not", () => {
+		expect(PBX_RESOURCES.mohClasses.affectsRouting).toBe(true);
+		expect(PBX_RESOURCES.prompts.affectsRouting).toBe(false);
+	});
+
+	/**
+	 * E911 data is not routing data — yet.
+	 *
+	 * Nothing in `@optimiq-voice/routing` reads `emergency_address`: the compiler's only
+	 * emergency-aware field is `ExtensionInput.emergencyCallerIdNumber`, which it copies to the
+	 * extension index and never acts on. Assigning an address to a DID does recompile, because
+	 * `phone_number` is a routing table, and produces an identical artifact. When emergency routing
+	 * lands, this is the line that has to change first.
+	 */
+	it("says a dispatchable location is not a routing input", () => {
+		expect(PBX_RESOURCES.emergencyAddresses.affectsRouting).toBe(false);
+	});
+
 	it("says a queue recompiles and its agents and tiers do not", () => {
 		expect(PBX_RESOURCES.queues.affectsRouting).toBe(true);
 		expect(PBX_RESOURCES.queueAgents.affectsRouting).toBe(false);

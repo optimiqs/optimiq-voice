@@ -94,6 +94,39 @@ export const pbxEnvSchema = z.object({
 		.optional(),
 	/** How long a minted playback URL stays valid. Minutes, for the reasons the CDR area records. */
 	PBX_VOICEMAIL_URL_TTL_SECONDS: z.coerce.number().int().min(30).max(3600).default(300),
+
+	/**
+	 * Where the media LIBRARY writes uploads: MOH files, prompts and voicemail greetings.
+	 *
+	 * Defaults to `PBX_VOICEMAIL_MEDIA_ROOT` (which itself defaults to `CDR_RECORDING_ROOT`) for
+	 * the reason those two share a default: **there is one object store**, and the media server
+	 * mounts it once as `ENGINE_MEDIA_OBJECT_ROOT`. The compiler embeds a greeting as
+	 * `object://<objectKey>` and `apps/engine` renders that as
+	 * `sound:<ENGINE_MEDIA_OBJECT_ROOT>/<key>`, so an upload written anywhere else is an upload the
+	 * media server cannot find — a prompt that exists, has a row, has a working preview in the
+	 * admin UI, and plays as silence on a call.
+	 *
+	 * It is nevertheless a NAME of its own, on the same terms as the voicemail root: an operator
+	 * who genuinely splits the stores can say so, and a deployment with the PBX area but no CDR
+	 * area has somewhere to inherit from.
+	 */
+	PBX_MEDIA_OBJECT_ROOT: z.string().min(1).default("/opt/optimiq-voice/recordings"),
+
+	/**
+	 * The upload size cap, in bytes. 10 MiB by default.
+	 *
+	 * Chosen against the format that has to work everywhere rather than against a disk budget: ten
+	 * minutes of 8 kHz mono 16-bit PCM WAV is about 9.6 MB, and ten minutes is already a very long
+	 * prompt. An MP3 at that size is hours. The cap is here to bound what one request can make this
+	 * process hold in memory (`media-upload.ts` buffers before it validates), not to ration storage
+	 * — which is why raising it is a deliberate act with a stated cost rather than a knob.
+	 */
+	PBX_MEDIA_MAX_UPLOAD_BYTES: z.coerce
+		.number()
+		.int()
+		.min(1024)
+		.max(200 * 1024 * 1024)
+		.default(10 * 1024 * 1024),
 });
 
 export type PbxEnv = z.infer<typeof pbxEnvSchema>;
@@ -152,6 +185,12 @@ function withMediaFallbacks(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 			"PBX_VOICEMAIL_URL_TTL_SECONDS",
 			"CDR_RECORDING_URL_TTL_SECONDS",
 		),
+		// Two hops, in order: the library's own root, then the voicemail root, then the CDR root.
+		// `pick` is applied twice rather than given three names because the middle one has its own
+		// fallback and duplicating that here is how the two would eventually disagree.
+		PBX_MEDIA_OBJECT_ROOT:
+			pick("PBX_MEDIA_OBJECT_ROOT", "PBX_VOICEMAIL_MEDIA_ROOT") ??
+			pick("PBX_MEDIA_OBJECT_ROOT", "CDR_RECORDING_ROOT"),
 	};
 
 	const merged: NodeJS.ProcessEnv = { ...source };

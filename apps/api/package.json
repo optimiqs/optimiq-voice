@@ -33,6 +33,7 @@
 		"verify:cdr": "tsx scripts/verify-cdr.ts",
 		"verify:identity-migration": "tsx scripts/verify-identity-migration.ts",
 		"verify:live": "tsx scripts/verify-live.ts",
+		"verify:media": "tsx scripts/verify-media.ts",
 		"verify:pbx": "tsx scripts/verify-pbx.ts",
 		"verify:provisioning": "tsx scripts/verify-provisioning.ts",
 		"verify:sip-credentials": "tsx scripts/verify-sip-credentials.ts",
@@ -45,6 +46,7 @@
 	"dependencies": {
 		"@47ng/cloak": "1.2.0",
 		"@deepgram/sdk": "3.13.0",
+		"@fastify/multipart": "catalog:",
 		"@google-cloud/speech": "6.7.1",
 		"@google-cloud/text-to-speech": "5.8.1",
 		"@grpc/grpc-js": "1.10.12",

@@ -448,6 +448,65 @@ Because `compiledAt` is the only non-derived field, a recompile that produces th
    `mailboxNumber` must equal the claimed one — and answers `found: false` with a reason for every
    refusal, never an empty list with `found: true`.
 
+10. ~~**A media library**~~ — **DONE, with one gap that lives in this package.**
+    `apps/api` now serves CRUD for `moh_class`, an upload path for `prompt`, and per-mailbox
+    `voicemail_greeting` upload/activate/deactivate/delete
+    (`apps/api/src/pbx/{moh-classes,prompts}`, `voicemail-greetings.service.ts`). Two consequences
+    for this package, and both already hold:
+    - **A rename reaches the engine.** `moh_class` is in `ROUTING_TABLE_TO_ENTITY`, so renaming a
+      class recompiles the tenant and every one of §2.5's five `mohClass` embeddings moves with it.
+    - **Activating a greeting reaches the engine.** `voicemail_greeting` is in that map too, and
+      the greeting service runs `compileOnWrite` INSIDE its own transaction rather than through
+      `repository.updateChild`, because activation is inherently a two-row write (the partial
+      unique index `voicemail_greeting_box_kind_active_key` permits one active row per kind, so the
+      incumbent has to be stood down in the same statement sequence). Two transactions would
+      publish an artifact in which the mailbox has no active greeting at all.
+
+    `prompt` is deliberately **absent** from `ROUTING_TABLE_TO_ENTITY`, and the reason is a
+    property of this package rather than a decision of the API's: the compiler copies a `promptId`
+    into a plan node verbatim (`IvrMenuPlanNode.greetingPromptId` and five siblings), never
+    resolves it, and never emits a dangling-prompt diagnostic. So an upload changes nothing the
+    artifact contains. **The day `promptId` starts resolving to `object://<key>` — the way
+    `mohClassId` already resolves to a class name — `prompt` must be added to
+    `ROUTING_TABLE_TO_ENTITY` in the same change**, or every artifact goes stale on the first
+    re-upload. `apps/web`'s `lib/pbx/contracts.spec.ts` asserts the current answer in both
+    directions, so the day it changes is a failing test rather than a silent one.
+
+11. **A conference set-PIN endpoint** — the API half is **DONE**
+    (`POST|DELETE /api/v1/conferences/:id/pin` and `…/moderator-pin`, hashing with the same
+    `formatVoicemailPinHash` §3.1 defines), and the ROUTING half is not. Precisely:
+    - `ConferenceInput.requiresPin` is already `pin_hash !== null` in the loader, so setting a
+      participant PIN moves `snapshotHash` and `ConferencePlanNode.requiresPin` becomes true. That
+      part works end to end and `apps/api verify:media` asserts it against a real artifact.
+    - **`ConferenceInput` and `ConferencePlanNode` carry no digest**, so the engine can know a room
+      wants a PIN and cannot verify one. `VoicemailPlanNode.pinHash` is the shape it needs; adding
+      `pinHash` to `ConferenceInput` (`snapshot.ts`), to `ConferencePlanNode` (`plan.ts`) and a
+      `conferencePinHash()` clone of `voicemailPinHash()` (`compile.ts`, ~line 1112) is the whole
+      change. Optional fields, so **no `ROUTING_ARTIFACT_VERSION` bump** per §2.1 — and §2.5's
+      table gains a fourth row.
+    - **The moderator PIN reaches nothing at all.** There is no `moderatorPinHash` and no
+      `requiresModeratorPin` on `ConferenceInput`, so the loader drops the column and setting one
+      recompiles to an identical `snapshotHash`. The column is written and stored; nothing
+      downstream reads it. `waitForModerator` is therefore still un-enforceable.
+
+12. **E911 call handling** — the API now models the data
+    (`emergency_address` CRUD, `phone_number.emergency_address_id`, `extension.emergency_caller_id_*`)
+    and this package models none of the behaviour. The one emergency-aware field here is
+    `ExtensionInput.emergencyCallerIdNumber`, which is copied to `ExtensionIndexEntry` and never
+    acted on. `emergency_address` is not in `ROUTING_TABLE_TO_ENTITY` and there is no
+    `emergencyAddresses` collection. What full compliance needs, in this package:
+    - an emergency route that **bypasses `OutboundMatchTable.enabled`** (checked before any rule
+      match today) **and the toll-class gate** and `callBlockRules` — Kari's Law requires that
+      `911` be dialable with no prefix and no permission, which no combination of the current
+      `OutboundRule` fields can express;
+    - somewhere to carry the dispatchable location or its ELIN: neither `OutboundRule` nor
+      `TrunkDialPlanNode` has a field for it today;
+    - a Kari's Law **notification** — an event, not a routing decision, so `packages/events`
+      rather than this package, and `apps/engine` to emit it on an emergency origination.
+
+    Until those land, the honest description of the API's E911 surface is "a validated-by-nobody
+    address book, assignable per DID, that nothing on the call path reads". The admin UI says so.
+
 ### Notes that constrain the API, and one for `packages/events`
 
 - **`routingResolveResponseSchema.destinationType` cannot express our destination types.** It is

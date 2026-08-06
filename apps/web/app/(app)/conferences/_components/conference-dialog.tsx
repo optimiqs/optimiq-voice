@@ -16,12 +16,15 @@ import type { ConferenceRow } from "~/lib/pbx/contracts";
  *
  * `pinHash` and `moderatorPinHash` are absent from the API's DTO for the same reason
  * `voicemail_box.pinHash` is: a PIN is set through an endpoint that hashes it, never by an admin
- * pasting a digest into a JSON body. That endpoint does not exist yet, so no room has a PIN today
- * and this form says so rather than offering a control that would silently store nothing.
+ * pasting a digest into a JSON body. Both endpoints exist now, and both are reached from the row's
+ * action menu — see `conference-pin-dialog.tsx`. Nothing here can show whether a room has one,
+ * because the server strips the digests from every response.
  *
- * That is also why "wait for a moderator" carries a warning: with no moderator PIN to enter, a room
- * with it switched on holds everyone in music-on-hold indefinitely. The server accepts the
- * combination — it is only unsound in context — so the caution belongs on the control.
+ * "Wait for a moderator" still carries a warning, and the reason has narrowed rather than gone
+ * away: the moderator PIN can be STORED now, but `ConferenceInput` in `@optimiq-voice/routing`
+ * carries no moderator field, so no engine reads it and no caller can identify as one. A room with
+ * this switched on therefore still holds everybody in music-on-hold indefinitely. The server
+ * accepts the combination — it is only unsound in context — so the caution belongs on the control.
  */
 function defaultsFor(conference: ConferenceRow | null): ConferenceFormValues {
 	return {
@@ -97,7 +100,7 @@ export function ConferenceDialog({
 			pending={mutation.isPending}
 			error={mutation.error}
 			onSubmit={() => void form.handleSubmit()}
-			footerNote="PINs are managed separately: the API sets them through an endpoint that hashes them rather than accepting a digest in this form, and that endpoint is not built yet — so no room requires a PIN today."
+			footerNote="PINs are set from this room's Actions menu, through an endpoint that hashes them rather than accepting a digest in this form. Nothing can display whether a room has one — the digests never leave the server."
 		>
 			<FormSection title="Room">
 				<form.Field name="name">
@@ -155,7 +158,7 @@ export function ConferenceDialog({
 						<SwitchField
 							field={field}
 							label="Hold participants until a moderator arrives"
-							description="With no moderator PIN — and none can be set yet — this holds everyone in music-on-hold for as long as they stay on the line."
+							description="Nothing enforces the moderator PIN on calls yet, so nobody can arrive as one: this holds everyone in music-on-hold for as long as they stay on the line."
 							disabled={mutation.isPending}
 						/>
 					)}

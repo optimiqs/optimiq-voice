@@ -16,6 +16,7 @@
 import { z } from "zod";
 import {
 	FEATURE_CODE_ACTIONS,
+	MOH_SOURCES,
 	IVR_OPTION_MATCH_KINDS,
 	QUEUE_AGENT_CONTACT_KINDS,
 	QUEUE_AGENT_STATUSES,
@@ -28,6 +29,7 @@ import {
 	TOLL_CLASSES,
 	TRUNK_KINDS,
 	VOICEMAIL_EMAIL_MODES,
+	VOICEMAIL_GREETING_KINDS,
 } from "./contracts";
 
 // ---------------------------------------------------------------------------------------------
@@ -153,6 +155,15 @@ export const phoneNumberFormSchema = z.strictObject({
 	label: optionalText(128),
 	callerIdNamePrefix: optionalText(32),
 	recordEnabled: z.boolean(),
+	/**
+	 * The dispatchable location this DID reports when somebody dials 911 (RAY BAUM'S Act).
+	 *
+	 * Blank means "no location assigned", which is a real and common state — a DID that is never
+	 * used for outbound calls needs none — so it clears to `null` rather than being required. The
+	 * form warns when a voice-enabled number has none; it does not refuse to save one, because the
+	 * alternative is an admin who cannot add a number until they have an address for it.
+	 */
+	emergencyAddressId: optionalText(64),
 	voiceEnabled: z.boolean(),
 	faxEnabled: z.boolean(),
 	enabled: z.boolean(),
@@ -520,4 +531,177 @@ export function parseDialPatterns(text: string): string[] {
 		.split(/[\n,]/u)
 		.map((entry) => entry.trim())
 		.filter((entry) => entry.length > 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The media library
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A music-on-hold class name.
+ *
+ * Stricter than `displayName` for a reason that is not cosmetic: the name is what the compiler
+ * resolves every `mohClassId` to, and what the media server looks up as a section in
+ * `musiconhold.conf`. A `]` or a newline in it is a configuration file that does not parse, so the
+ * alphabet is the one every PBX has used for this since the beginning.
+ */
+export const mohClassName = z
+	.string()
+	.trim()
+	.min(1, "Required")
+	.max(64, "At most 64 characters")
+	.regex(
+		/^[A-Za-z0-9][A-Za-z0-9._-]*$/u,
+		"Letters, digits, dot, dash and underscore only — this becomes a class name in the media server",
+	);
+
+/**
+ * A hold-music class.
+ *
+ * The refinement mirrors the server's: a `stream` class with no URI is a class that plays silence
+ * to everyone on hold, and the media server has no way to report it. Refused on the field that is
+ * missing, so the message lands on the control that produced it.
+ */
+export const mohClassFormSchema = z
+	.strictObject({
+		name: mohClassName,
+		description: optionalText(512),
+		source: z.enum(MOH_SOURCES),
+		streamUri: optionalText(512),
+		shuffle: z.boolean(),
+		sampleRateHz: z.union([z.literal(8000), z.literal(16_000), z.literal(48_000)]),
+		isDefault: z.boolean(),
+		enabled: z.boolean(),
+	})
+	.refine((value) => value.source !== "stream" || value.streamUri !== null, {
+		path: ["streamUri"],
+		message: "A streaming class needs the URI the media server should pull",
+	});
+export type MohClassFormValues = z.input<typeof mohClassFormSchema>;
+
+/**
+ * A prompt's metadata.
+ *
+ * Only two fields, and that is the whole editable surface: `objectKey`, `contentType`, `sizeBytes`
+ * and `checksum` are facts about the STORED OBJECT, written by the upload path from the bytes it
+ * actually stored. The API refuses them in a `PATCH` body — accepting an object key from a client
+ * would let an admin re-point a library entry at another tenant's file by editing a string.
+ *
+ * Replacing the audio is a new upload, not an edit: the object key is what a compiled artifact and
+ * a live call may already be holding.
+ */
+export const promptFormSchema = z.strictObject({
+	name: displayName,
+	language: z
+		.string()
+		.trim()
+		.min(1, "Required")
+		.max(35, "At most 35 characters")
+		.regex(/^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/u, "Must be a language tag, e.g. en-US"),
+});
+export type PromptFormValues = z.input<typeof promptFormSchema>;
+
+/** The upload form: a file, plus the two things the server will otherwise infer from the file. */
+export const promptUploadFormSchema = z.strictObject({
+	name: optionalText(128),
+	language: z
+		.string()
+		.trim()
+		.max(35, "At most 35 characters")
+		.regex(/^$|^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/u, "Must be a language tag, e.g. en-US"),
+});
+export type PromptUploadFormValues = z.input<typeof promptUploadFormSchema>;
+
+/** A voicemail greeting upload: which slot it fills, what to call it, whether to use it now. */
+export const greetingUploadFormSchema = z.strictObject({
+	kind: z.enum(VOICEMAIL_GREETING_KINDS),
+	label: optionalText(128),
+	active: z.boolean(),
+});
+export type GreetingUploadFormValues = z.input<typeof greetingUploadFormSchema>;
+
+// ---------------------------------------------------------------------------------------------
+// E911
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A dispatchable location.
+ *
+ * Deliberately shallow, and this mirrors the server's reasoning rather than being lazy about it:
+ * the address is going to be validated by a CARRIER'S E911 API against the authoritative database,
+ * and a second, weaker validator here would refuse addresses that exist — for a building somebody
+ * may one day dial 911 from. So the only rules are the ones that are wrong in every jurisdiction.
+ *
+ * `locationDetail` is optional and strongly recommended, and the form says which: a responder given
+ * a twelve-floor office block and no floor number is the failure RAY BAUM'S was written about.
+ *
+ * `validated` is absent and always will be. It is a fact a provider asserted, not a value an admin
+ * may set — accepting it here would let anyone with `numbers.emergency` mark an unverified address
+ * as verified, which for a field whose entire purpose is regulatory assurance is not a validation
+ * bug but a compliance one.
+ */
+export const emergencyAddressFormSchema = z.strictObject({
+	label: displayName,
+	streetLine1: z.string().trim().min(1, "Required").max(128, "At most 128 characters"),
+	streetLine2: optionalText(128),
+	locationDetail: optionalText(128),
+	locality: z.string().trim().min(1, "Required").max(128, "At most 128 characters"),
+	administrativeArea: z.string().trim().min(1, "Required").max(128, "At most 128 characters"),
+	postalCode: z.string().trim().min(1, "Required").max(32, "At most 32 characters"),
+	country: z
+		.string()
+		.trim()
+		.length(2, "Two letters, e.g. US")
+		.regex(/^[A-Za-z]{2}$/u, "Two letters, e.g. US")
+		.transform((value) => value.toUpperCase()),
+});
+export type EmergencyAddressFormValues = z.input<typeof emergencyAddressFormSchema>;
+
+// ---------------------------------------------------------------------------------------------
+// PINs
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A telephone-keypad PIN, mirroring `voicemailPinIssue` in `apps/api`.
+ *
+ * One schema for the mailbox PIN and both conference PINs, because the server uses one function for
+ * all three: the keypad has ten keys, `#` terminates entry, and with three attempts per call a PIN
+ * drawn from the handful an attacker tries first is materially weaker than one that is not.
+ *
+ * The blocklist stops at two shapes on purpose. A longer one — birthdays, `1122`, keypad patterns —
+ * starts guessing at what a user meant and produces "rejected, and I do not know why", which is how
+ * PINs end up written on the handset.
+ */
+export const MIN_PIN_LENGTH = 4;
+export const MAX_PIN_LENGTH = 10;
+
+export function keypadPinIssue(pin: string): string | undefined {
+	if (!/^\d+$/u.test(pin)) {
+		return "A PIN is digits only — it is entered on a telephone keypad.";
+	}
+	if (pin.length < MIN_PIN_LENGTH || pin.length > MAX_PIN_LENGTH) {
+		return `A PIN is between ${MIN_PIN_LENGTH} and ${MAX_PIN_LENGTH} digits.`;
+	}
+	if ([...pin].every((digit) => digit === pin[0])) {
+		return "A PIN of one repeated digit is among the first an attacker tries.";
+	}
+	if (isStraightRun(pin)) {
+		return "A PIN that counts up or down is among the first an attacker tries.";
+	}
+	return undefined;
+}
+
+function isStraightRun(pin: string): boolean {
+	let ascending = true;
+	let descending = true;
+	for (let index = 1; index < pin.length; index += 1) {
+		const step = Number(pin[index]) - Number(pin[index - 1]);
+		if (step !== 1) {
+			ascending = false;
+		}
+		if (step !== -1) {
+			descending = false;
+		}
+	}
+	return ascending || descending;
 }

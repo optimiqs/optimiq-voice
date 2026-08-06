@@ -29,9 +29,11 @@ export const routes = {
 	parkLots: "/park-lots",
 	recordings: "/recordings",
 	cdr: "/cdr",
+	mediaLibrary: "/media",
 	settings: "/settings",
 	members: "/settings/members",
 	apiKeys: "/settings/api-keys",
+	emergencyAddresses: "/settings/emergency-addresses",
 
 	/**
 	 * Detail views, for the four entities that own a child collection.
@@ -135,6 +137,26 @@ export type NumberTab = (typeof NUMBER_TABS)[number];
 
 export function numberTabHref(tab: NumberTab): string {
 	return tab === "numbers" ? routes.numbers : `${routes.numbers}?tab=${tab}`;
+}
+
+/**
+ * The Media page's two sections.
+ *
+ * Hold music and the prompt library are two views of ONE subject — the tenant's stored audio — and
+ * both are gated by the same `settings.*` grants, because both are organization-wide configuration
+ * every call feature draws on. Two sidebar entries would be two ways to say "audio"; the tab lives
+ * in `?tab=` so "here is the class I mean" is a link, the same as every other list's filter state.
+ *
+ * They are nevertheless different SHAPES rather than two lists of the same thing: a hold-music
+ * class is a container with files under it, and a prompt is a file an IVR can be pointed at. The
+ * split is the API's (`moh_class` is a routing input; `prompt` is not), not a display choice.
+ */
+export const MEDIA_TABS = ["hold-music", "prompts"] as const;
+
+export type MediaTab = (typeof MEDIA_TABS)[number];
+
+export function mediaTabHref(tab: MediaTab): string {
+	return tab === "hold-music" ? routes.mediaLibrary : `${routes.mediaLibrary}?tab=${tab}`;
 }
 
 /**
