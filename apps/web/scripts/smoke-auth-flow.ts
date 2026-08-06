@@ -29,6 +29,7 @@ import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { PERMISSIONS as GENERATED_PERMISSIONS } from "../lib/permissions.generated";
 
 const DEFAULT_DATABASE_URL = "postgresql://optimiq:optimiq@localhost:5433/optimiq";
 
@@ -382,8 +383,8 @@ async function main(): Promise<void> {
 		check("me reports the owner role", asString(field(me.body, "role")) === "owner");
 		check(
 			"the owner receives the full generated permission set",
-			permissions.length === 80,
-			`${permissions.length} permissions`,
+			permissions.length === GENERATED_PERMISSIONS.length,
+			`${permissions.length} permissions (registry: ${GENERATED_PERMISSIONS.length})`,
 		);
 
 		// --- 7. members and API keys through the rewrite -----------------------------------------

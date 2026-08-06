@@ -19,15 +19,24 @@ export {
 export { callLegs, type CallLegRow, type NewCallLegRow } from "./call-leg-schema";
 export { callEvents, type CallEventRow, type NewCallEventRow } from "./call-event-schema";
 export { recordings, type NewRecordingRow, type RecordingRow } from "./recording-schema";
+export {
+	CDR_QUARANTINE_REASONS,
+	cdrWriteQuarantine,
+	type CdrQuarantineReason,
+	type CdrWriteQuarantineRow,
+	type NewCdrWriteQuarantineRow,
+} from "./quarantine-schema";
 
 import { callEvents } from "./call-event-schema";
 import { callLegs } from "./call-leg-schema";
+import { cdrWriteQuarantine } from "./quarantine-schema";
 import { recordings } from "./recording-schema";
 
 /** Every table in the CDR journal, for `drizzle({ schema })` and test fixtures. */
 export const cdrSchema = {
 	callEvents,
 	callLegs,
+	cdrWriteQuarantine,
 	recordings,
 } as const;
 

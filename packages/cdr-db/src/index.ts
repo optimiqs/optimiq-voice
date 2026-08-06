@@ -1,5 +1,11 @@
 export { CDR_CONTEXT_NAME, CDR_WRITER_SETTING_NAME, cdrTenantContext } from "./cdr-context";
-export { createCdrDatabaseClient, resolveCdrDatabaseUrl, type CdrDatabaseClient } from "./client";
+export {
+	createCdrDatabaseClient,
+	resolveCdrDatabaseUrl,
+	type CdrDatabase,
+	type CdrDatabaseClient,
+	type CdrDatabaseTransaction,
+} from "./client";
 export {
 	ANSWERED_HANGUP_CAUSES,
 	EXTENDED_HANGUP_CAUSES,
@@ -44,6 +50,33 @@ export {
 export { createCdrTenantRlsIntrospector } from "./rls-introspector";
 export { CDR_APPEND_ONLY_TABLES, cdrTenantRlsPreflightPlan } from "./rls-preflight-plan";
 export {
+	and,
+	asc,
+	between,
+	count,
+	desc,
+	eq,
+	getTableConfig,
+	getTableName,
+	gt,
+	gte,
+	ilike,
+	inArray,
+	isNotNull,
+	isNull,
+	lt,
+	lte,
+	ne,
+	not,
+	notInArray,
+	or,
+	sql,
+	type AnyPgColumn,
+	type PgColumn,
+	type PgTable,
+	type SQL,
+} from "./sql";
+export {
 	DEFAULT_CDR_RETENTION_MONTHS,
 	DEFAULT_RECORDING_TOMBSTONE_MONTHS,
 	dropPartitionsBefore,
@@ -75,7 +108,9 @@ export {
 	CALL_LEG_SIDES,
 	callEvents,
 	callLegs,
+	CDR_QUARANTINE_REASONS,
 	cdrSchema,
+	cdrWriteQuarantine,
 	HANGUP_SIDES,
 	RECORDING_KINDS,
 	recordings,
@@ -87,10 +122,13 @@ export {
 	type CallEventType,
 	type CallLegRow,
 	type CallLegSide,
+	type CdrQuarantineReason,
 	type CdrSchema,
+	type CdrWriteQuarantineRow,
 	type HangupSide,
 	type NewCallEventRow,
 	type NewCallLegRow,
+	type NewCdrWriteQuarantineRow,
 	type NewRecordingRow,
 	type RecordingKind,
 	type RecordingRow,

@@ -80,8 +80,8 @@ export const NAV_SECTIONS: readonly NavSection[] = [
 	{
 		label: "Insight",
 		items: [
-			{ title: "Recordings", url: routes.recordings, icon: RecordIcon, comingSoon: true },
-			{ title: "Call history", url: routes.cdr, icon: HistoryIcon, comingSoon: true },
+			{ title: "Recordings", url: routes.recordings, icon: RecordIcon },
+			{ title: "Call history", url: routes.cdr, icon: HistoryIcon },
 		],
 	},
 	{

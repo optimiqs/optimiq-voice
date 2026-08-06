@@ -15,6 +15,7 @@
 		"test": "bun test",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
 		"smoke": "tsx scripts/smoke-auth-flow.ts",
+		"smoke:cdr": "tsx scripts/smoke-cdr.ts",
 		"smoke:pbx": "tsx scripts/smoke-pbx.ts"
 	},
 	"dependencies": {

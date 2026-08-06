@@ -745,9 +745,17 @@ async function main(): Promise<void> {
 			`status ${compiled.status}`,
 		);
 
+		// The seed derives a run-unique DID (e164 is now platform-globally unique),
+		// so read it back from the API rather than hardcoding it.
+		const seededNumbers = await client("GET", "/api/v1/phone-numbers?limit=1");
+		const seededRows = data(seededNumbers);
+		const seededDid =
+			Array.isArray(seededRows) && seededRows.length > 0
+				? String((seededRows[0] as Record<string, unknown>).e164)
+				: "";
 		const simulated = await client("POST", "/api/v1/routing/simulate", {
 			routingContext: "inbound",
-			destinationNumber: "+12125550100",
+			destinationNumber: seededDid,
 		});
 		check(
 			"POST /routing/simulate resolves the seeded DID",

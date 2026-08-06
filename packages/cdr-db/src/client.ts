@@ -1,4 +1,6 @@
 import {
+	type AdminDatabase,
+	type AdminDatabaseTransaction,
 	createTenantDatabaseClient,
 	type DatabaseClientOptions,
 	type TenantDatabaseClient,
@@ -14,6 +16,18 @@ import { cdrTenantContext } from "./cdr-context";
  * `withCdrWriterScope`.
  */
 export type CdrDatabaseClient = TenantDatabaseClient;
+
+/**
+ * The Drizzle handles a consumer receives, re-exported under CDR names.
+ *
+ * Not cosmetic: a consumer outside this workspace package (`apps/api`) resolves its own copy of
+ * `drizzle-orm` — see `src/sql.ts` — so it cannot name these types by importing them from
+ * `drizzle-orm` itself and have them accept the tables THIS package built. Re-exporting them
+ * alongside the tables and the operators is what makes a repository function outside this package
+ * declarable at all.
+ */
+export type CdrDatabase = AdminDatabase;
+export type CdrDatabaseTransaction = AdminDatabaseTransaction;
 
 export function createCdrDatabaseClient(options: DatabaseClientOptions): CdrDatabaseClient {
 	return createTenantDatabaseClient(cdrTenantContext, options);

@@ -8,6 +8,7 @@
 export * from "./call-leg-schema";
 export * from "./call-event-schema";
 export * from "./recording-schema";
+export * from "./quarantine-schema";
 
 import { cdrTenantContext } from "../cdr-context";
 

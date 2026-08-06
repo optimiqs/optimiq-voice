@@ -10,6 +10,8 @@ import {
 	isAuthSliceEnabled,
 	registerAuthTransport,
 } from "./auth/auth-bootstrap";
+import { assertCdrPreflight, isCdrAreaEnabled } from "./cdr/cdr-bootstrap";
+import { CdrModule } from "./cdr/cdr.module";
 import { API_TENANT_RLS_PLAN, createApiTenantRlsIntrospector } from "./core/db/rls-preflight-plan";
 import { DATABASE_URL, HTTP_BRIDGE_PORT } from "./envs";
 import { isPbxAreaEnabled, registerPbxTransport } from "./pbx/pbx-bootstrap";
@@ -61,8 +63,33 @@ async function bootstrap() {
 		);
 	}
 
+	/**
+	 * The CDR area (P5) is additive and optional in exactly the same way, and gated the same way:
+	 * every route it serves is either `@RequirePermissions`-guarded or a signed anonymous media
+	 * route, and the guard that enforces the first comes from the auth slice. Mounting the reporting
+	 * surface without it would publish an organization's entire call history unauthenticated.
+	 *
+	 * Its RLS preflight runs BEFORE `NestFactory.create`, alongside the auth database's, for the
+	 * reason the CDR contract is worth asserting at all: `call_legs` is append-only by privilege,
+	 * and a drifted grant is only detectable before traffic arrives.
+	 */
+	const cdrAreaEnabled = authSliceEnabled && isCdrAreaEnabled();
+	if (isCdrAreaEnabled() && !authSliceEnabled) {
+		logger.warn(
+			"CDR_DATABASE_URL is set but the auth slice is not configured — the CDR area is NOT " +
+				"mounted, because its permission guard comes from the auth slice.",
+		);
+	}
+	if (cdrAreaEnabled) {
+		await assertCdrPreflight();
+	}
+
+	const extraModules = [
+		...(pbxAreaEnabled ? [PbxModule] : []),
+		...(cdrAreaEnabled ? [CdrModule] : []),
+	];
 	const rootModule: Type<unknown> = authSliceEnabled
-		? createApiRootModule([AppModule], pbxAreaEnabled ? [PbxModule] : [])
+		? createApiRootModule([AppModule], extraModules)
 		: AppModule;
 
 	const app = await NestFactory.create<NestFastifyApplication>(rootModule, new FastifyAdapter());

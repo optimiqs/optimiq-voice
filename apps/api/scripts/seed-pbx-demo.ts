@@ -113,6 +113,9 @@ export async function seedPbxDemo(
 			await transaction.execute(sql`delete from ${sql.identifier(table)}`);
 		}
 
+		// Run-unique DID: +12125550100 collided across runs once phone_number.e164
+		// became platform-globally unique (stale demo orgs held the number).
+		const demoDid = `+1212555${String(Date.now() % 10_000).padStart(4, "0")}`;
 		const ids = {
 			extensions: [createEntityId(), createEntityId(), createEntityId()],
 			ringGroup: createEntityId(),
@@ -338,7 +341,7 @@ export async function seedPbxDemo(
 		await transaction.insert(phoneNumber).values({
 			id: ids.phoneNumber,
 			organizationId,
-			e164: "+12125550100",
+			e164: demoDid,
 			label: "Main line",
 			// The DID's own destination is the fallback the compiler uses when no rule matches.
 			destinationType: "ivr",
@@ -352,7 +355,7 @@ export async function seedPbxDemo(
 			name: "Main line",
 			priority: 100,
 			matchKind: "exact",
-			matchPattern: "+12125550100",
+			matchPattern: demoDid,
 			phoneNumberId: ids.phoneNumber,
 			destinationType: "time-condition",
 			destinationRef: ids.timeCondition,

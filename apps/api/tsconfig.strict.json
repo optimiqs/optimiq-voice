@@ -26,9 +26,11 @@
 	},
 	"include": [
 		"src/auth/**/*",
+		"src/cdr/**/*",
 		"src/pbx/**/*",
 		"scripts/**/*",
 		"test/auth/**/*",
+		"test/cdr/**/*",
 		"test/pbx/**/*"
 	],
 	"exclude": ["scripts/verify-tenancy-backfill.ts"]

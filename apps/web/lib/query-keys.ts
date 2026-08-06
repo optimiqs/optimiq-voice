@@ -45,4 +45,23 @@ export const queryKeys = {
 	/** The compile/simulate surface, which reads the whole configuration rather than one table. */
 	routingCompile: (organizationId: string) =>
 		["organizations", organizationId, "pbx", "routing", "compile"] as const,
+
+	/**
+	 * The reporting area, scoped by organization for the same reason everything else is.
+	 *
+	 * Unlike `pbx`, there is no mutation that invalidates these — `call_legs` is an append-only
+	 * ledger the UI cannot write to, so the subtree handle exists for the ORGANIZATION SWITCH and
+	 * for a manual refresh, not for a write path. A cached page of another tenant's call history is
+	 * the one thing an org switch must never leave behind.
+	 */
+	cdr: (organizationId: string) => ["organizations", organizationId, "cdr"] as const,
+	cdrList: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
+		["organizations", organizationId, "cdr", "legs", query] as const,
+	/** One call's legs, keyed by call id — what an expanded row reads. */
+	cdrCall: (organizationId: string, callId: string) =>
+		["organizations", organizationId, "cdr", "call", callId] as const,
+	recordings: (organizationId: string) =>
+		["organizations", organizationId, "cdr", "recordings"] as const,
+	recordingList: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
+		["organizations", organizationId, "cdr", "recordings", "list", query] as const,
 } as const;

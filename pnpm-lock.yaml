@@ -318,6 +318,9 @@ importers:
       '@optimiq-voice/autopilot':
         specifier: workspace:^
         version: link:../autopilot
+      '@optimiq-voice/cdr-db':
+        specifier: workspace:*
+        version: link:../../packages/cdr-db
       '@optimiq-voice/common':
         specifier: workspace:^
         version: link:../../packages/common

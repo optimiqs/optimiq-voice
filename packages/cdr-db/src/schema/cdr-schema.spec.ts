@@ -1,9 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import { getTableConfig } from "drizzle-orm/pg-core";
 import { CDR_PARTITION_KEYS, PARTITIONED_CDR_TABLES } from "../partitions";
+import { cdrTenantRlsPreflightPlan } from "../rls-preflight-plan";
 import { callEvents } from "./call-event-schema";
 import { callLegs } from "./call-leg-schema";
 import { cdrSchema } from "./index";
+import { cdrWriteQuarantine } from "./quarantine-schema";
 import { recordings } from "./recording-schema";
 import type { PgTable } from "drizzle-orm/pg-core";
 
@@ -19,6 +21,21 @@ const partitionedTables: Record<PartitionedTableName, PgTable> = {
 	call_legs: callLegs,
 	call_events: callEvents,
 };
+
+/**
+ * The tables the tenant role can reach, taken from the preflight plan rather than restated.
+ *
+ * The plan is what boot asserts against the live catalogue, so deriving the list from it is what
+ * keeps "which tables are tenant-scoped?" answerable in one place — and makes a table added to the
+ * journal without a decision about its tenancy fail one of the two specs below.
+ */
+const CDR_TENANT_TABLE_NAMES: readonly string[] = cdrTenantRlsPreflightPlan.expectations.map(
+	(expectation) => expectation.table,
+);
+
+const tenantTables: readonly PgTable[] = Object.values(cdrSchema).filter((table) =>
+	CDR_TENANT_TABLE_NAMES.includes(getTableConfig(table).name),
+);
 
 /** `it.each` needs a mutable array of argument tuples to infer the callback parameter. */
 const partitionedTableCases = PARTITIONED_CDR_TABLES.map(
@@ -155,13 +172,33 @@ describe("tenant policies", () => {
 		}
 	});
 
-	it("puts an organization_id column on every table in the journal", () => {
-		for (const table of Object.values(cdrSchema)) {
+	it("puts a non-null organization_id column on every TENANT table in the journal", () => {
+		for (const table of tenantTables) {
 			const config = getTableConfig(table);
 			const organizationId = config.columns.find((column) => column.name === "organization_id");
 
 			expect(organizationId?.notNull).toBe(true);
 		}
+	});
+
+	/**
+	 * The one table in the journal that is deliberately NOT tenant-scoped, asserted as a decision
+	 * rather than left as an omission.
+	 *
+	 * `cdr_write_quarantine` holds messages the writer could not turn into rows, and a large share
+	 * of them are there precisely because their organization could not be established — an
+	 * `organization_id NOT NULL` column under an RLS policy could not hold the rows it exists for.
+	 * It carries no policies, no RLS and no tenant grants, and it is absent from
+	 * `cdrTenantRlsPreflightPlan` for the same reason. If a future edit makes it look like a tenant
+	 * table, this fails and the decision gets re-made on purpose.
+	 */
+	it("keeps the quarantine table off the tenant surface entirely", () => {
+		const config = getTableConfig(cdrWriteQuarantine);
+
+		expect(config.enableRLS).toBe(false);
+		expect(config.policies).toHaveLength(0);
+		expect(config.columns.find((column) => column.name === "organization_id")?.notNull).toBe(false);
+		expect(CDR_TENANT_TABLE_NAMES).not.toContain(config.name);
 	});
 });
 
