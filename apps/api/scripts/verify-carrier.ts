@@ -958,6 +958,8 @@ async function main(): Promise<void> {
 				// purpose, so a new field is a compile error at every construction site rather than an
 				// `undefined` that reaches a dial string.
 				PBX_EXTENSION_DIAL_TEMPLATE: "PJSIP/{number}",
+				PBX_VOICEMAIL_MEDIA_ROOT: "/tmp/optimiq-voice-unused",
+				PBX_VOICEMAIL_URL_TTL_SECONDS: 300,
 			});
 			if (organizationId.length > 0) {
 				await pbx.withTenantScope(organizationId, async (transaction) => {

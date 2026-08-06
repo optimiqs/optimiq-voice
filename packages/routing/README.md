@@ -315,8 +315,11 @@ through `snapshotCollection`. One consequence is deliberate and worth stating: *
 to load the table is a rollout state, not a tenant with four broken references, and one warning per
 MOH id would bury the real diagnostics on every tenant simultaneously.
 
-Once the loader populates both, the optionality is free to go — the only edit is deleting two `?`s
-and the two entries in `OPTIONAL_SNAPSHOT_COLLECTIONS`.
+The loader populates both as of the API's voicemail wave (§7 item 2), so the optionality is free to
+go — the only edit is deleting two `?`s and the two entries in `OPTIONAL_SNAPSHOT_COLLECTIONS`. It
+is deliberately still here: removing it turns "a loader that has not caught up" from a supported
+rollout state into a type error, and a released API predates the change. A major-version cleanup,
+not a same-wave one.
 
 ---
 
@@ -403,30 +406,18 @@ Because `compiledAt` is the only non-derived field, a recompile that produces th
 
 1. **CRUD** for every routing entity, with destination validation (`destinationShapeIssues` plus a
    real existence check against the target table — the database only enforces the trio's *shape*).
-2. **Snapshot loader** — one RLS-scoped read per collection, projected onto the `*Input` types.
-   Nineteen `select … where organization_id = $1`, no joins, disabled rows included. Two of the
-   nineteen are **not yet loaded** and are the gating follow-up for §2.5:
+2. ~~**Snapshot loader**~~ — **DONE.** Twenty RLS-scoped reads, no joins, disabled rows included,
+   projected onto the `*Input` types. `moh_class` and `voicemail_greeting` are loaded and
+   `voicemailBoxes` carries `pinHash`, so §2.5's embeddings fire: a compiled artifact now holds a
+   mailbox's active greeting as `object://<objectKey>`, its PIN digest, and every `mohClassId`
+   resolved to the class NAME a media server accepts.
+   `apps/api verify:voicemail` asserts all three against a real artifact in the KV bucket.
 
-   ```ts
-   // apps/api/src/pbx/routing/snapshot-loader.ts — add to the Promise.all batch:
-   transaction.select().from(mohClass),
-   transaction.select().from(voicemailGreeting),
-
-   // …and to the returned literal:
-   mohClasses: mohClasses.map((row) => ({ id: row.id, enabled: row.enabled, name: row.name })),
-   voicemailGreetings: voicemailGreetings.map((row) => ({
-       id: row.id,
-       voicemailBoxId: row.voicemailBoxId,
-       kind: row.kind,
-       objectKey: row.objectKey,
-       active: row.active,
-       durationMs: row.durationMs,
-       label: row.label,
-   })),
-   ```
-
-   `voicemailBoxes` also needs one more field: `pinHash: row.pinHash`. Until it is added the
-   compiler embeds no digest and `*97` keeps authenticating by the calling extension.
+   One thing this package can now clean up, and deliberately has not: `mohClasses` and
+   `voicemailGreetings` are still `?`-optional and still listed in `OPTIONAL_SNAPSHOT_COLLECTIONS`.
+   §4.1 says the only edit needed is deleting two `?`s and two entries — but doing it turns "a
+   loader that has not caught up" from a supported rollout state into a type error, and there is
+   still a released API that predates the change. Worth doing on the next major, not with it.
 3. **Compile-on-write** — after any mutation to a `ROUTING_TABLE_TO_ENTITY` table: load, compile,
    fail the request on errors, otherwise persist the artifact and evict/replace the KV key.
    `isArtifactFresh` short-circuits the write when nothing changed.
@@ -438,13 +429,24 @@ Because `compiledAt` is the only non-derived field, a recompile that produces th
 7. **A "test this number" endpoint** — the resolvers with an explicit `now` are exactly the right
    shape for a "what happens if someone calls this DID on Sunday at 3am?" tool. It costs a
    controller.
-8. **A set-PIN endpoint** — `POST /voicemail-boxes/:id/pin`, hashing with `node:crypto.scrypt` and
-   `DEFAULT_VOICEMAIL_PIN_SCRYPT_PARAMS`, writing `formatVoicemailPinHash(...)` into
-   `voicemail_box.pin_hash`. The resource file already says a PIN "is set through a dedicated
-   endpoint that hashes it"; §3.1 is now the format that endpoint must produce. Nothing enforces a
-   PIN until it exists.
-9. **An `rpc.voicemail.v1.list` responder** — see `packages/events`. The engine's `*97` menu calls
-   it and degrades to "mailbox unavailable" while nobody answers.
+8. ~~**A set-PIN endpoint**~~ — **DONE.** `POST /voicemail-boxes/:id/pin` and a matching `DELETE`,
+   in `apps/api/src/pbx/voicemail-boxes/voicemail-pin.service.ts`. It hashes with
+   `node:crypto.scrypt` and `DEFAULT_VOICEMAIL_PIN_SCRYPT_PARAMS` and writes
+   `formatVoicemailPinHash(...)`, so §3.1 is a contract with a writer, a parser and a verifier in
+   three different processes. Two properties worth recording here because they constrain anything
+   that changes the format:
+   - the write goes through the same repository `update` every other mutation uses, so setting a
+     PIN recompiles the tenant and republishes the artifact — a direct column write would leave the
+     engine verifying the previous digest;
+   - `pin_hash` is excluded from every RESPONSE as well as every request DTO (the API's resource
+     declarations carry a `secretColumns` list), because a digest in a response body is a digest
+     somebody can crack offline, and a four-digit PIN behind scrypt is seconds of work.
+9. ~~**An `rpc.voicemail.v1.list` responder**~~ — **DONE.** A `@MessagePattern` on the same NATS
+   microservice `rpc.routing.v1.resolve` is served by, in
+   `apps/api/src/pbx/voicemail-boxes/voicemail-rpc.controller.ts`. It makes the cross-check the
+   request schema asks for by name — the box is loaded under `withTenantScope(orgId)` and its own
+   `mailboxNumber` must equal the claimed one — and answers `found: false` with a reason for every
+   refusal, never an empty list with `found: true`.
 
 ### Notes that constrain the API, and one for `packages/events`
 

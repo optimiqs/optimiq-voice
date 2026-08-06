@@ -50,6 +50,11 @@ import { TrunksService } from "./trunks/trunks.service";
 import { VoicemailBoxesController } from "./voicemail-boxes/voicemail-boxes.controller";
 import { VoicemailBoxesService } from "./voicemail-boxes/voicemail-boxes.service";
 import { VoicemailConsumer } from "./voicemail-boxes/voicemail-consumer.service";
+import { VoicemailMessagesController } from "./voicemail-boxes/voicemail-messages.controller";
+import { VoicemailMessagesService } from "./voicemail-boxes/voicemail-messages.service";
+import { VoicemailMwiPublisher } from "./voicemail-boxes/voicemail-mwi.publisher";
+import { VoicemailPinService } from "./voicemail-boxes/voicemail-pin.service";
+import { VoicemailRpcController } from "./voicemail-boxes/voicemail-rpc.controller";
 import type { PbxEnv } from "./shared/pbx-env";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
@@ -97,8 +102,20 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		ParkLotsController,
 		FeatureCodesController,
 		VoicemailBoxesController,
+		/**
+		 * The contents of a mailbox, on the same prefix as its configuration.
+		 *
+		 * `GET /voicemail-boxes/media` and `GET /voicemail-boxes/:id` are declared in two different
+		 * classes and would collide under a router that resolved by declaration order. Fastify's
+		 * (`find-my-way`) is a radix tree that prefers a STATIC segment over a parametric one
+		 * regardless of order, so the literal wins and the media route is reachable — which is what
+		 * makes splitting the two controllers safe rather than a trap. Stated here because it is a
+		 * property of the router we are relying on, not of the code.
+		 */
+		VoicemailMessagesController,
 		RoutingController,
 		RoutingRpcController,
+		VoicemailRpcController,
 		/**
 		 * The carrier slice mounts unconditionally, even without a `TELNYX_API_KEY`.
 		 *
@@ -204,6 +221,9 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		ParkLotsService,
 		FeatureCodesService,
 		VoicemailBoxesService,
+		VoicemailPinService,
+		VoicemailMwiPublisher,
+		VoicemailMessagesService,
 		VoicemailConsumer,
 		RoutingService,
 	],
@@ -216,6 +236,8 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		DidIndexPublisher,
 		QueueMembershipPublisher,
 		AgentStatePublisher,
+		VoicemailMessagesService,
+		VoicemailMwiPublisher,
 	],
 })
 export class PbxModule implements OnApplicationShutdown {

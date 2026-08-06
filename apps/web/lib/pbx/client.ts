@@ -39,6 +39,12 @@ import type {
 	TimeConditionRuleRow,
 	TrunkRow,
 	VoicemailBoxRow,
+	VoicemailFolder,
+	VoicemailMessageDeletion,
+	VoicemailMessagePage,
+	VoicemailMessageResult,
+	VoicemailPinState,
+	VoicemailPlaybackLink,
 } from "./contracts";
 
 /** The API's own cap. Asking for more is a 400, so the control that offers page sizes stops here. */
@@ -494,5 +500,115 @@ export async function simulateRouting(request: SimulateRequest): Promise<Simulat
 		method: "POST",
 		body: JSON.stringify(request),
 	});
+	return data;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Voicemail: the PIN, and the messages in a mailbox
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Sets a mailbox PIN.
+ *
+ * The plaintext travels in the body of a `POST` and nowhere else, and the server hashes it before
+ * the request returns (`scrypt`, in the digest format `packages/routing` owns). Nothing here ever
+ * receives a digest back — the reply is `{ pinSet: true }`.
+ *
+ * A dedicated route rather than a field on the mailbox `PATCH`, because a `PATCH` body that
+ * sometimes contains a secret is a `PATCH` body that ends up in a debug log.
+ */
+export async function setVoicemailPin(
+	boxId: string,
+	pin: string,
+): Promise<MutationEnvelope<VoicemailPinState>> {
+	return await apiFetch<MutationEnvelope<VoicemailPinState>>(`/voicemail-boxes/${boxId}/pin`, {
+		method: "POST",
+		body: JSON.stringify({ pin }),
+	});
+}
+
+/** Clears it. The mailbox falls back to authenticating by the calling extension. */
+export async function clearVoicemailPin(
+	boxId: string,
+): Promise<MutationEnvelope<VoicemailPinState>> {
+	return await apiFetch<MutationEnvelope<VoicemailPinState>>(`/voicemail-boxes/${boxId}/pin`, {
+		method: "DELETE",
+	});
+}
+
+export interface VoicemailMessageQuery {
+	readonly folder?: VoicemailFolder | undefined;
+	readonly page?: number | undefined;
+	readonly limit?: number | undefined;
+}
+
+/** One page of a mailbox, newest first. An absent folder means everything except the trash. */
+export async function listVoicemailMessages(
+	boxId: string,
+	query: VoicemailMessageQuery,
+): Promise<VoicemailMessagePage> {
+	const params = new URLSearchParams();
+	if (query.folder !== undefined) {
+		params.set("folder", query.folder);
+	}
+	params.set("page", String(query.page ?? 1));
+	params.set("limit", String(query.limit ?? DEFAULT_PAGE_LIMIT));
+	return await apiFetch<VoicemailMessagePage>(
+		`/voicemail-boxes/${boxId}/messages?${params.toString()}`,
+	);
+}
+
+/**
+ * Marks a message read or unread.
+ *
+ * `read` rather than a folder, because that is the control the UI has. The server translates it —
+ * read means "out of the `new` folder", which is the same fact the MWI lamp is defined by, so the
+ * badge and the phone cannot disagree.
+ */
+export async function setVoicemailMessageRead(
+	boxId: string,
+	messageId: string,
+	read: boolean,
+): Promise<VoicemailMessageResult> {
+	return await apiFetch<VoicemailMessageResult>(
+		`/voicemail-boxes/${boxId}/messages/${messageId}`,
+		{ method: "PATCH", body: JSON.stringify({ read }) },
+	);
+}
+
+/**
+ * Deletes a message.
+ *
+ * Without `purge` it moves to the `deleted` folder, which is the schema's own tombstone and is
+ * recoverable. With it, the row goes. The audio object is never unlinked from here either way —
+ * retention owns the object store's lifecycle.
+ */
+export async function deleteVoicemailMessage(
+	boxId: string,
+	messageId: string,
+	purge = false,
+): Promise<VoicemailMessageDeletion> {
+	const suffix = purge ? "?purge=true" : "";
+	return await apiFetch<VoicemailMessageDeletion>(
+		`/voicemail-boxes/${boxId}/messages/${messageId}${suffix}`,
+		{ method: "DELETE" },
+	);
+}
+
+/**
+ * Mints a playback URL for one message.
+ *
+ * `POST` because it CREATES a credential with a lifetime — the same argument
+ * `mintRecordingDownloadUrl` makes, and the reason neither is ever cached: a URL minted at page
+ * load and clicked twenty minutes later is a 410 that reads as "the recording is broken".
+ */
+export async function mintVoicemailPlaybackUrl(
+	boxId: string,
+	messageId: string,
+): Promise<VoicemailPlaybackLink> {
+	const { data } = await apiFetch<ItemEnvelope<VoicemailPlaybackLink>>(
+		`/voicemail-boxes/${boxId}/messages/${messageId}/play-url`,
+		{ method: "POST", body: JSON.stringify({}) },
+	);
 	return data;
 }

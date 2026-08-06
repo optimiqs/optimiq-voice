@@ -540,6 +540,76 @@ export interface VoicemailBoxRow extends EntityRow {
 	readonly enabled: boolean;
 }
 
+/**
+ * Whether a mailbox has a PIN.
+ *
+ * `pinSet`, never the digest: `voicemail_box.pin_hash` is in `secretColumns` on the server's
+ * resource declaration and is stripped from every response, so a row simply does not carry it and
+ * this type must not pretend otherwise. What the UI needs is the boolean, and it comes back from
+ * the set/clear endpoints rather than from the row — which is why the mailbox list cannot show a
+ * "PIN set" column today and the dialog says so instead of guessing.
+ */
+export interface VoicemailPinState {
+	readonly id: string;
+	readonly mailboxNumber: string;
+	readonly pinSet: boolean;
+}
+
+/** `new` / `saved` / `deleted` — `voicemail_message.folder`, the whole state machine. */
+export const VOICEMAIL_FOLDERS = ["new", "saved", "deleted"] as const;
+export type VoicemailFolder = (typeof VOICEMAIL_FOLDERS)[number];
+
+/**
+ * One message in a mailbox.
+ *
+ * `read` is DERIVED from `folder` by the server and sent anyway, because every control in the UI
+ * is phrased as read/unread and re-deriving it here would put a rule about mailbox semantics in
+ * two places. `objectKey` is deliberately absent: playback goes through a signed URL minted per
+ * listen, so the browser never needs the store key and is never given it.
+ */
+export interface VoicemailMessageRow {
+	readonly id: string;
+	readonly voicemailBoxId: string;
+	readonly folder: VoicemailFolder;
+	readonly read: boolean;
+	readonly callerIdName: string | null;
+	readonly callerIdNumber: string | null;
+	readonly receivedAt: string;
+	readonly durationMs: number;
+	readonly sizeBytes: number | null;
+	readonly transcription: string | null;
+	readonly callLegRef: string | null;
+}
+
+/** The counts as the server has them NOW, so a badge never has to add up a page. */
+export interface VoicemailMailboxSummary {
+	readonly id: string;
+	readonly mailboxNumber: string;
+	readonly newCount: number;
+	readonly savedCount: number;
+}
+
+export interface VoicemailMessagePage extends PagedEnvelope<VoicemailMessageRow> {
+	readonly mailbox: VoicemailMailboxSummary;
+}
+
+export interface VoicemailMessageResult {
+	readonly data: VoicemailMessageRow;
+	readonly mailbox: VoicemailMailboxSummary;
+}
+
+export interface VoicemailMessageDeletion {
+	readonly data: { readonly id: string; readonly purged: boolean };
+	readonly mailbox: VoicemailMailboxSummary;
+}
+
+/** A short-lived, anonymous URL an `<audio src>` can actually fetch. Minutes, not hours. */
+export interface VoicemailPlaybackLink {
+	readonly url: string;
+	readonly expiresAt: string;
+	readonly expiresInSeconds: number;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Routing operations
 // ---------------------------------------------------------------------------------------------

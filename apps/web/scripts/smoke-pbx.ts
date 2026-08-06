@@ -32,6 +32,9 @@
  *     form reads instead of a JSON textarea.
  *  8. `queues.manage-agents` is a DIFFERENT grant from `queues.write`, enforced by the API — proved
  *     with a second real session holding neither.
+ *  9. The voicemail mailbox surface the messages drawer and the PIN dialog are built on: the
+ *     message list and its counts, and that a mailbox row never carries a PIN digest in either
+ *     direction.
  *
  * Playwright is not set up in this repository, so this is fetch-level: it verifies the contract
  * and the server-rendered HTML, not clicks.
@@ -1346,6 +1349,75 @@ async function main(): Promise<void> {
 			warningCodes(releasedNumber).join(","),
 		);
 		await client("DELETE", `/api/v1/trunks/${provisionTrunkId}`);
+
+		// --- 9. the voicemail mailbox surface -----------------------------------------------------
+		//
+		// The messages drawer and the PIN dialog are the two things on the voicemail screen that talk
+		// to endpoints the rest of the PBX area does not. Both are dialogs, so there is no route to
+		// render and no server-side HTML to assert against — what this can prove at fetch level is
+		// that the CONTRACT behind them is the one the components were written against, through the
+		// Next rewrite the browser would use.
+		console.log("\n9. the voicemail mailbox surface");
+		const smokeMailbox = await client("POST", "/api/v1/voicemail-boxes", {
+			mailboxNumber: "7451",
+			label: "Smoke mailbox",
+		});
+		const smokeMailboxId = rowId(smokeMailbox);
+		check(
+			"create a mailbox through the rewrite is 201",
+			smokeMailbox.status === 201,
+			`status ${smokeMailbox.status}`,
+		);
+		check(
+			"the row the list renders carries no PIN digest",
+			!Object.hasOwn(data(smokeMailbox), "pinHash"),
+			Object.keys(data(smokeMailbox)).join(","),
+		);
+
+		const smokeMessages = await client(
+			"GET",
+			`/api/v1/voicemail-boxes/${smokeMailboxId}/messages`,
+		);
+		check(
+			"the messages drawer's list endpoint answers",
+			smokeMessages.status === 200,
+			`status ${smokeMessages.status}`,
+		);
+		const smokeMailboxSummary = (smokeMessages.body.mailbox ?? {}) as Record<string, unknown>;
+		check(
+			"and carries the counts the drawer's header renders",
+			smokeMailboxSummary.newCount === 0 && smokeMailboxSummary.savedCount === 0,
+			JSON.stringify(smokeMailboxSummary),
+		);
+
+		const smokeWeakPin = await client("POST", `/api/v1/voicemail-boxes/${smokeMailboxId}/pin`, {
+			pin: "1111",
+		});
+		check(
+			"the PIN dialog's weak-PIN case reads as a form error, not as a crash",
+			smokeWeakPin.status === 400 && typeof smokeWeakPin.body.message === "string",
+			`status ${smokeWeakPin.status}`,
+		);
+		const smokeSetPin = await client("POST", `/api/v1/voicemail-boxes/${smokeMailboxId}/pin`, {
+			pin: "72609",
+		});
+		check(
+			"setting a PIN answers with pinSet and never the digest",
+			smokeSetPin.status === 201 &&
+				data(smokeSetPin).pinSet === true &&
+				!Object.hasOwn(data(smokeSetPin), "pinHash"),
+			JSON.stringify(data(smokeSetPin)),
+		);
+		const smokeClearPin = await client(
+			"DELETE",
+			`/api/v1/voicemail-boxes/${smokeMailboxId}/pin`,
+		);
+		check(
+			"clearing it answers with pinSet false",
+			smokeClearPin.status === 200 && data(smokeClearPin).pinSet === false,
+			JSON.stringify(data(smokeClearPin)),
+		);
+		await client("DELETE", `/api/v1/voicemail-boxes/${smokeMailboxId}`);
 	} finally {
 		next?.kill("SIGTERM");
 		apiProcess.kill("SIGTERM");

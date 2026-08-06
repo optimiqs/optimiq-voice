@@ -7,6 +7,7 @@ import {
 	inboundRoute,
 	ivrMenu,
 	ivrMenuOption,
+	mohClass,
 	orgSetting,
 	outboundRoute,
 	parkLot,
@@ -19,6 +20,7 @@ import {
 	timeConditionRule,
 	trunk,
 	voicemailBox,
+	voicemailGreeting,
 } from "@optimiq-voice/pbx-db";
 import type { OrgRoutingSnapshot, RoutingSettingsInput } from "@optimiq-voice/routing";
 
@@ -37,9 +39,39 @@ import type { OrgRoutingSnapshot, RoutingSettingsInput } from "@optimiq-voice/ro
  *    is exactly what `select … where organization_id = $1` returns. The compiler owns every join
  *    and sorts everything it walks, which is what makes its output deterministic.
  *
- * Nineteen statements, no joins, run inside the caller's tenant transaction — so RLS scopes them
+ * Twenty statements, no joins, run inside the caller's tenant transaction — so RLS scopes them
  * and `organization_id` never appears in a predicate here. That is deliberate: the policy is the
  * filter, and duplicating it in the query would make a missing policy invisible.
+ *
+ * ## The two collections that arrived late, and the field that came with them
+ *
+ * `moh_class` and `voicemail_greeting` are declared OPTIONAL on `OrgRoutingSnapshot` and listed in
+ * `OPTIONAL_SNAPSHOT_COLLECTIONS` — a rollout affordance `packages/routing` created precisely so
+ * it could ship before this loader caught up (README §4.1, §7 item 2). They are loaded now, along
+ * with `voicemail_box.pin_hash`, and the three of them together are what make the compiler's
+ * embeddings fire rather than degrade:
+ *
+ * - `mohClasses` turns every `moh_class_id` in the snapshot into the NAME a media server accepts,
+ *   at compile time, so no database round trip sits on the hold path. Until it was loaded,
+ *   `mohClassName` returned `undefined` for every reference AND — deliberately — raised no
+ *   `dangling-moh-class` warnings, because "the loader has not learned this table" and "this
+ *   tenant has four broken references" must not look the same in the diagnostics.
+ * - `voicemailGreetings` gives each mailbox its own recorded greeting, as `object://<objectKey>`,
+ *   instead of the media server's generic `ENGINE_VOICEMAIL_GREETING`.
+ * - `pinHash` is the digest the engine verifies a caller's `*97` digits against. Until it was
+ *   loaded the compiler embedded none, and a mailbox authenticated by the calling extension alone
+ *   — which is to say, not at all, to anyone who can reach a handset.
+ *
+ * Adding collections moves every organization's `snapshotHash` exactly once, on the first compile
+ * after this deploy: the hash covers the canonicalized snapshot and an absent optional collection
+ * hashes as `[]`, so a tenant that has no MOH classes and no greetings hashes identically before
+ * and after. Only tenants that actually have rows recompile to a different artifact, which is the
+ * behaviour you want from a loader that just learned to see them.
+ *
+ * Greetings are loaded WHOLE — inactive rows included — for the same reason disabled rows are:
+ * `active` is a routing fact the compiler owns (`indexVoicemailGreetings` sorts by id and keeps the
+ * first active row per box/kind, so the artifact is deterministic whatever order arrives), and a
+ * `where active` here would hand the compiler a pre-made decision it is supposed to make.
  *
  * The reads are issued as one `Promise.all` batch: they are independent, they are all on the same
  * connection inside one transaction (so postgres.js pipelines them), and the compile-on-write path
@@ -67,6 +99,8 @@ export async function loadOrgRoutingSnapshot(
 		parkLots,
 		featureCodes,
 		callBlockRules,
+		mohClasses,
+		voicemailGreetings,
 		settingRows,
 	] = await Promise.all([
 		transaction.select().from(extension),
@@ -86,6 +120,8 @@ export async function loadOrgRoutingSnapshot(
 		transaction.select().from(parkLot),
 		transaction.select().from(featureCode),
 		transaction.select().from(callBlockRule),
+		transaction.select().from(mohClass),
+		transaction.select().from(voicemailGreeting),
 		transaction.select().from(orgSetting).where(eq(orgSetting.category, ROUTING_SETTINGS_CATEGORY)),
 	]);
 
@@ -288,6 +324,12 @@ export async function loadOrgRoutingSnapshot(
 			extensionId: row.extensionId,
 			mwiEnabled: row.mwiEnabled,
 			maxMessageSeconds: row.maxMessageSeconds,
+			// The one secret-shaped field in the snapshot, and the only one the engine cannot do
+			// without: `*97` authentication happens on the call path, in a process with no database
+			// handle. `packages/routing` parses it and refuses to embed a digest it cannot read
+			// (`invalid-pin-hash`, a warning), so a malformed value costs the mailbox its PIN rather
+			// than the tenant its routing.
+			pinHash: row.pinHash,
 		})),
 		conferences: conferences.map((row) => ({
 			id: row.id,
@@ -327,6 +369,25 @@ export async function loadOrgRoutingSnapshot(
 			matchKind: row.matchKind,
 			direction: row.direction,
 			action: row.action,
+			label: row.label,
+		})),
+		/**
+		 * The name is the only column routing reads: every `mohClassId` in this snapshot is a row
+		 * id and every media server addresses a class by name. The stream URI, the sample rate and
+		 * the file list belong to the media server's provisioning, not to a routing decision.
+		 */
+		mohClasses: mohClasses.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			name: row.name,
+		})),
+		voicemailGreetings: voicemailGreetings.map((row) => ({
+			id: row.id,
+			voicemailBoxId: row.voicemailBoxId,
+			kind: row.kind,
+			objectKey: row.objectKey,
+			active: row.active,
+			durationMs: row.durationMs,
 			label: row.label,
 		})),
 	};

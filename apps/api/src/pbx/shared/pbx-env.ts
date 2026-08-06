@@ -66,6 +66,34 @@ export const pbxEnvSchema = z.object({
 	 * (`Local/1001@context`).
 	 */
 	PBX_EXTENSION_DIAL_TEMPLATE: z.string().min(1).default("PJSIP/{number}"),
+
+	/**
+	 * Where voicemail audio lives, and the key that signs a link to it.
+	 *
+	 * Both DEFAULT to the CDR area's variables (see {@link loadPbxEnv}), and that is not laziness:
+	 * there is one object store. `apps/engine` writes a voicemail recording into the same root it
+	 * writes call recordings into, `ENGINE_MEDIA_OBJECT_ROOT` is documented as "mount the directory
+	 * the API serves recordings from", and a deployment that had to configure a SECOND root would
+	 * be configuring a second copy of the same directory — with the failure mode that voicemail
+	 * playback 410s while call playback works, for a reason nothing in the UI can explain.
+	 *
+	 * They are nevertheless separate names, because the two areas mount independently: an API
+	 * deployment with `PBX_DATABASE_URL` and no `CDR_DATABASE_URL` has mailboxes, has messages,
+	 * and has no CDR area to inherit anything from. Naming them lets that deployment work, and lets
+	 * an operator who genuinely does split the stores say so.
+	 *
+	 * Optional secret, exactly as in the CDR area: without a key the messages LIST still works —
+	 * the metadata is not the media — and minting a playback URL fails with a named error rather
+	 * than falling back to an unsigned route. There is no default key and there never will be one.
+	 */
+	PBX_VOICEMAIL_MEDIA_ROOT: z.string().min(1).default("/opt/optimiq-voice/recordings"),
+	PBX_VOICEMAIL_URL_SECRET: z.string().min(32, "must be at least 32 characters").optional(),
+	PBX_VOICEMAIL_URL_SECRET_PREVIOUS: z
+		.string()
+		.min(32, "must be at least 32 characters")
+		.optional(),
+	/** How long a minted playback URL stays valid. Minutes, for the reasons the CDR area records. */
+	PBX_VOICEMAIL_URL_TTL_SECONDS: z.coerce.number().int().min(30).max(3600).default(300),
 });
 
 export type PbxEnv = z.infer<typeof pbxEnvSchema>;
@@ -85,7 +113,7 @@ export function isPbxSliceConfigured(): boolean {
  * a 500 on the first extension list.
  */
 export function loadPbxEnv(source: NodeJS.ProcessEnv = process.env): PbxEnv {
-	const parsed = pbxEnvSchema.safeParse(source);
+	const parsed = pbxEnvSchema.safeParse(withMediaFallbacks(source));
 	if (!parsed.success) {
 		const detail = parsed.error.issues
 			.map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
@@ -93,4 +121,46 @@ export function loadPbxEnv(source: NodeJS.ProcessEnv = process.env): PbxEnv {
 		throw new Error(`Invalid PBX environment — ${detail}`);
 	}
 	return parsed.data;
+}
+
+/**
+ * Fills the voicemail media variables from the CDR area's when they are not set explicitly.
+ *
+ * A read-only overlay rather than a mutation of `process.env`, so the fallback is visible in one
+ * function and cannot surprise anything else that reads the environment. An empty string counts as
+ * "not set", for the reason `cdr-env.ts` records at length: an orchestrator that wants to turn a
+ * variable off sets it to `""`, because "absent" is not a thing `docker compose` can express.
+ */
+function withMediaFallbacks(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const pick = (primary: string, fallback: string): string | undefined => {
+		const own = source[primary];
+		if (typeof own === "string" && own.trim().length > 0) {
+			return own;
+		}
+		const inherited = source[fallback];
+		return typeof inherited === "string" && inherited.trim().length > 0 ? inherited : undefined;
+	};
+
+	const overlay: Record<string, string | undefined> = {
+		PBX_VOICEMAIL_MEDIA_ROOT: pick("PBX_VOICEMAIL_MEDIA_ROOT", "CDR_RECORDING_ROOT"),
+		PBX_VOICEMAIL_URL_SECRET: pick("PBX_VOICEMAIL_URL_SECRET", "CDR_RECORDING_URL_SECRET"),
+		PBX_VOICEMAIL_URL_SECRET_PREVIOUS: pick(
+			"PBX_VOICEMAIL_URL_SECRET_PREVIOUS",
+			"CDR_RECORDING_URL_SECRET_PREVIOUS",
+		),
+		PBX_VOICEMAIL_URL_TTL_SECONDS: pick(
+			"PBX_VOICEMAIL_URL_TTL_SECONDS",
+			"CDR_RECORDING_URL_TTL_SECONDS",
+		),
+	};
+
+	const merged: NodeJS.ProcessEnv = { ...source };
+	for (const [key, value] of Object.entries(overlay)) {
+		if (value === undefined) {
+			delete merged[key];
+		} else {
+			merged[key] = value;
+		}
+	}
+	return merged;
 }

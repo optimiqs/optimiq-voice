@@ -1,9 +1,11 @@
 import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
 import { AckPolicy, connect, DeliverPolicy, type NatsConnection } from "nats";
 import { getLogger } from "@optimiq-voice/logger";
-import { eq, sql, voicemailBox, voicemailMessage } from "@optimiq-voice/pbx-db";
+import { eq, voicemailBox, voicemailMessage } from "@optimiq-voice/pbx-db";
 import { PBX_DATABASE, PBX_ENV } from "../shared/pbx.tokens";
+import { readMailboxCounts, VoicemailMwiPublisher } from "./voicemail-mwi.publisher";
 import type { PbxEnv } from "../shared/pbx-env";
+import type { MailboxCounts } from "./voicemail-mwi.publisher";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
 const logger = getLogger({ service: "api", filePath: import.meta.filename });
@@ -41,9 +43,13 @@ const DURABLE = "pbx-voicemail-writer";
  *
  * `voicemail.mwi.updated` is published with ABSOLUTE counts read back in the same transaction, never
  * a delta: a lamp driven by deltas is one dropped message away from being wrong until somebody
- * reboots a phone. Nothing consumes it yet — the BLF/MWI fan-out is a later wave — and it is
- * published now because it is the contract that wave is built on, and because publishing it later
- * would mean the counts for every message filed in between were never emitted.
+ * reboots a phone.
+ *
+ * The publish itself now lives in {@link VoicemailMwiPublisher}, because this is no longer the only
+ * thing that moves a mailbox's counts: reading and deleting a message from the web UI move them
+ * too, and three copies of "build the envelope, publish it, swallow the failure" is three chances
+ * to emit a lamp state in a different shape. The ORDER is unchanged and still matters — ack first,
+ * then publish — for the reason `publishMwi` records below.
  */
 @Injectable()
 export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
@@ -57,6 +63,7 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 	constructor(
 		@Inject(PBX_ENV) private readonly env: PbxEnv,
 		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
+		@Inject(VoicemailMwiPublisher) private readonly mwi: VoicemailMwiPublisher,
 	) {}
 
 	get stats(): {
@@ -291,19 +298,7 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 				this.filed += 1;
 			}
 
-			const counted = await transaction
-				.select({
-					folder: voicemailMessage.folder,
-					total: sql<number>`count(*)`.mapWith(Number),
-				})
-				.from(voicemailMessage)
-				.where(eq(voicemailMessage.voicemailBoxId, mailboxId))
-				.groupBy(voicemailMessage.folder);
-
-			return {
-				newCount: counted.find((row) => row.folder === "new")?.total ?? 0,
-				savedCount: counted.find((row) => row.folder === "saved")?.total ?? 0,
-			};
+			return await readMailboxCounts(transaction, mailboxId);
 		});
 	}
 
@@ -320,34 +315,7 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 		mailboxNumber: string,
 		counts: MailboxCounts,
 	): Promise<void> {
-		const connection = this.connection;
-		if (connection === undefined) {
-			return;
-		}
-		try {
-			const { makeVoicemailEvent } = await import("@optimiq-voice/events/schemas");
-			const envelope = makeVoicemailEvent("mwi.updated", {
-				orgId: organizationId,
-				mailboxId,
-				source: "api",
-				data: {
-					mailboxNumber,
-					newCount: counts.newCount,
-					savedCount: counts.savedCount,
-					reason: "message-left",
-				},
-			});
-			await connection
-				.jetstream()
-				.publish(envelope.subject, new TextEncoder().encode(JSON.stringify(envelope)), {
-					msgID: envelope.id,
-				});
-		} catch (error) {
-			logger.error("failed to publish an MWI update; the message itself was filed", {
-				mailboxId,
-				error,
-			});
-		}
+		await this.mwi.publish(organizationId, mailboxId, mailboxNumber, counts, "message-left");
 	}
 }
 
@@ -373,9 +341,4 @@ interface VoicemailEnvelope {
 		readonly callerIdName?: string;
 		readonly receivedAt: string;
 	};
-}
-
-interface MailboxCounts {
-	readonly newCount: number;
-	readonly savedCount: number;
 }

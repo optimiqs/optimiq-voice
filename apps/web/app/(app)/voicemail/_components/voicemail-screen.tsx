@@ -12,11 +12,15 @@ import {
 import { RowActions } from "~/components/pbx/row-actions";
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
+import { MenuItem } from "~/components/ui/menu";
 import { PageHeader } from "~/components/ui/page-header";
 import { DEFAULT_PAGE_LIMIT, PBX_RESOURCES } from "~/lib/pbx/client";
 import { usePermission } from "../../_context/session-context";
+import { useLiveVoicemail } from "../../_hooks/use-live-queries";
 import { usePbxDelete, usePbxList } from "../../_hooks/use-pbx-queries";
 import { VoicemailBoxDialog } from "./voicemail-box-dialog";
+import { VoicemailMessagesDialog } from "./voicemail-messages-dialog";
+import { VoicemailPinDialog } from "./voicemail-pin-dialog";
 import type { VoicemailBoxRow } from "~/lib/pbx/contracts";
 
 /**
@@ -24,8 +28,20 @@ import type { VoicemailBoxRow } from "~/lib/pbx/contracts";
  *
  * A box is a destination in its own right — anything can point at it — so deleting one that a
  * ring group's timeout or an IVR's invalid branch targets is refused with the referrers named.
- * Messages already in the box are a separate concern the P5 mailbox surface will own; this page
- * is about the box's configuration.
+ *
+ * ## Two things live behind the row actions, and neither is a column
+ *
+ * **Messages** open in their own dialog. They are not a column because a mailbox's contents are
+ * not a property of its configuration — they change without anybody editing anything, they are
+ * paginated, and a count on this table would be one query per row on every page load. What the
+ * table CAN show cheaply is the unread count once a `voicemail.mwi.updated` arrives while the page
+ * is open, which is the live overlay below: it starts empty (there is no snapshot for this topic)
+ * and fills in as mailboxes change, so the column reads "—" until there is something true to say.
+ *
+ * **The PIN** is a dialog rather than a field on the edit form because the server never returns
+ * `pinHash` — it is stripped from every response — so there is no current value to prefill and no
+ * way to render "a PIN is set". A secret with a write-only lifecycle does not belong in a form
+ * that round-trips a row.
  */
 export function VoicemailScreen() {
 	const resource = PBX_RESOURCES.voicemailBoxes;
@@ -37,9 +53,15 @@ export function VoicemailScreen() {
 	const canWrite = usePermission(resource.permissions.write);
 	const canDelete = usePermission(resource.permissions.delete);
 
+	const canListen = usePermission("voicemail.listen");
+
 	const [editing, setEditing] = useState<VoicemailBoxRow | null>(null);
 	const [dialogOpen, setDialogOpen] = useState(false);
 	const [pendingDelete, setPendingDelete] = useState<VoicemailBoxRow | null>(null);
+	const [messagesFor, setMessagesFor] = useState<VoicemailBoxRow | null>(null);
+	const [pinFor, setPinFor] = useState<VoicemailBoxRow | null>(null);
+
+	const live = useLiveVoicemail();
 
 	const createButton = canWrite ? (
 		<Button
@@ -103,6 +125,28 @@ export function VoicemailScreen() {
 						),
 					},
 					{
+						key: "unread",
+						header: "Unread",
+						className: "whitespace-nowrap",
+						/*
+						 * Only ever the LIVE count, never a fetched one. There is no snapshot behind the
+						 * voicemail topic (the counts live in `voicemail_message`, which this list does
+						 * not join), so a mailbox nothing has happened to shows an em dash rather than a
+						 * zero — "I have not been told" and "there are none" are different facts and a
+						 * table that conflated them would be quietly wrong for every mailbox on the page.
+						 */
+						cell: (row) => {
+							const counts = live.counts.get(row.id);
+							return counts === undefined ? (
+								<span className="text-muted-foreground">—</span>
+							) : (
+								<Badge tone={counts.newCount > 0 ? "accent" : "neutral"}>
+									{counts.newCount}
+								</Badge>
+							);
+						},
+					},
+					{
 						key: "features",
 						header: "Features",
 						cell: (row) => (
@@ -121,6 +165,14 @@ export function VoicemailScreen() {
 				rowActions={(row) => (
 					<RowActions
 						label={`mailbox ${row.mailboxNumber}`}
+						extra={
+							<>
+								{canListen ? (
+									<MenuItem onClick={() => setMessagesFor(row)}>Messages</MenuItem>
+								) : null}
+								{canWrite ? <MenuItem onClick={() => setPinFor(row)}>Set PIN…</MenuItem> : null}
+							</>
+						}
 						onEdit={
 							canWrite
 								? () => {
@@ -154,6 +206,33 @@ export function VoicemailScreen() {
 				open={dialogOpen}
 				onOpenChange={setDialogOpen}
 				box={editing}
+			/>
+
+			{/*
+			 * Keyed by the mailbox so opening a second one remounts rather than reusing the first's
+			 * folder tab and page. The alternative — resetting on close — leaves the previous
+			 * mailbox's rows on screen for a frame while the new query resolves.
+			 */}
+			<VoicemailMessagesDialog
+				key={`messages-${messagesFor?.id ?? "none"}`}
+				open={messagesFor !== null}
+				onOpenChange={(open) => {
+					if (!open) {
+						setMessagesFor(null);
+					}
+				}}
+				box={messagesFor}
+			/>
+
+			<VoicemailPinDialog
+				key={`pin-${pinFor?.id ?? "none"}`}
+				open={pinFor !== null}
+				onOpenChange={(open) => {
+					if (!open) {
+						setPinFor(null);
+					}
+				}}
+				box={pinFor}
 			/>
 
 			<DeleteEntityDialog

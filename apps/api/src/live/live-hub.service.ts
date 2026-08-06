@@ -6,6 +6,7 @@ import {
 	liveChannelSchema,
 	queueEventSchema,
 	registrationBindingSchema,
+	voicemailEventSchema,
 } from "@optimiq-voice/events/schemas";
 import {
 	AGENT_STATE_KV,
@@ -304,10 +305,10 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 		if (connection === undefined || connection.isClosed()) {
 			return;
 		}
-		const filter =
-			source === "call-events"
-				? subjectFilterFor.callsInOrg(organizationId)
-				: subjectFilterFor.queuesInOrg(organizationId);
+		const filter = SUBJECT_FILTER_FOR_SOURCE[source]?.(organizationId);
+		if (filter === undefined) {
+			return;
+		}
 		// Core NATS, not JetStream. These are live listeners with no durable state, no ack and no
 		// replay: a browser that was not connected did not miss anything it can act on, and a durable
 		// consumer per tab is a resource nobody deletes when a laptop lid closes.
@@ -408,7 +409,7 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 			this.dropped += 1;
 			return undefined;
 		}
-		const schema = source === "call-events" ? callEventSchema : queueEventSchema;
+		const schema = EVENT_SCHEMA_FOR_SOURCE[source] ?? queueEventSchema;
 		const result = schema.safeParse(decoded);
 		if (!result.success) {
 			this.dropped += 1;
@@ -493,6 +494,47 @@ interface OrgSource {
 	refs: number;
 	stop: () => void;
 }
+
+/**
+ * Which subject filter each STREAM-backed source subscribes to. KV sources map to `undefined`.
+ *
+ * A table rather than the ternary this used to be. With two stream sources a conditional reads
+ * fine; with three it silently becomes "queue-events, or anything I forgot to add" — which is how
+ * a new source ends up subscribed to the wrong subject and delivering another feature's events
+ * under its own name.
+ */
+const SUBJECT_FILTER_FOR_SOURCE: Readonly<
+	Partial<Record<LiveSource, (organizationId: string) => string>>
+> = {
+	"call-events": (organizationId) => subjectFilterFor.callsInOrg(organizationId),
+	"queue-events": (organizationId) => subjectFilterFor.queuesInOrg(organizationId),
+	/**
+	 * `mwi.updated` only — NOT `voicemail.evt.v1.<org>.>`.
+	 *
+	 * The other event on this root is `message.left`, whose payload is the caller's number, the
+	 * object key of the audio and its duration: the message itself. The live topic exists to keep a
+	 * count badge honest while a page is open, and `voicemail.read` is the permission gating it, so
+	 * pushing message metadata down the same socket would widen the topic well past what its name
+	 * and its permission mapping say it carries. Filtering at the SUBJECT rather than in the handler
+	 * means those bytes never leave the broker.
+	 */
+	"voicemail-events": (organizationId) =>
+		subjectFilterFor.voicemailEventInOrg(organizationId, "mwi.updated"),
+};
+
+/** Which contract each stream source's payloads are parsed against. */
+const EVENT_SCHEMA_FOR_SOURCE: Readonly<
+	Partial<
+		Record<
+			LiveSource,
+			typeof callEventSchema | typeof queueEventSchema | typeof voicemailEventSchema
+		>
+	>
+> = {
+	"call-events": callEventSchema,
+	"queue-events": queueEventSchema,
+	"voicemail-events": voicemailEventSchema,
+};
 
 /** Which bucket each KV-backed source reads. Stream sources map to `undefined`. */
 const BUCKET_FOR_SOURCE: Readonly<Partial<Record<LiveSource, string>>> = {

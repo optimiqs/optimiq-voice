@@ -7,7 +7,7 @@ import { hasPermission, type Permission } from "@optimiq-voice/auth";
  *
  * The obvious design is to let a client subscribe to a NATS subject filter and check permissions
  * against it. It is also how a client ends up subscribing to `>` and how a permission check ends up
- * being a pattern-matching problem. A closed set of four topics means the mapping from "what the
+ * being a pattern-matching problem. A closed set of named topics means the mapping from "what the
  * client asked for" to "what may be read" is a lookup, the upstream subjects are chosen by the
  * server, and the organization id is never something the client sends — it comes from the session,
  * exactly as it does on every REST route (oikos §4: no controller accepts a tenant from a caller).
@@ -20,6 +20,15 @@ import { hasPermission, type Permission } from "@optimiq-voice/auth";
  * | `active-calls`   | `cdr.read`         | The live view of what call history shows afterwards     |
  * | `queue:<id>`     | `queues.monitor`   | Literally "Watch live queue and agent state"            |
  * | `agent-state`    | `queues.monitor`   | Same surface, org-wide rather than per queue            |
+ * | `voicemail`      | `voicemail.read`   | The counts, which is strictly less than the list        |
+ *
+ * `voicemail → voicemail.read` needs no argument at all, and that is the point of saying so: the
+ * topic carries `voicemail.evt.v1.<org>.<mailbox>.mwi.updated`, whose whole payload is a mailbox
+ * number and two counts. Anyone who may LIST a mailbox already sees both numbers and every message
+ * behind them, so gating the live count more tightly than the list would protect nothing while
+ * making the badge disagree with the page under it. Note what it does NOT carry: `message.left` is
+ * on the same subject root but is filtered out upstream (see `live-hub.service.ts`), because its
+ * payload is a caller's number, an object key and a duration — the message itself, not a count.
  *
  * `registrations → extensions.read` rather than `devices.read`: the bucket is keyed by AOR and an
  * AOR is an extension, so an operator who may not see the extension list must not be handed a live
@@ -41,7 +50,13 @@ import { hasPermission, type Permission } from "@optimiq-voice/auth";
  * feeds — which is exactly the wallboard/agent split the role templates already describe.
  */
 
-export const LIVE_TOPIC_KINDS = ["registrations", "active-calls", "queue", "agent-state"] as const;
+export const LIVE_TOPIC_KINDS = [
+	"registrations",
+	"active-calls",
+	"queue",
+	"agent-state",
+	"voicemail",
+] as const;
 export type LiveTopicKind = (typeof LIVE_TOPIC_KINDS)[number];
 
 /** A parsed topic. `queue` is the only one that carries an id. */
@@ -49,6 +64,7 @@ export type LiveTopic =
 	| { readonly kind: "registrations" }
 	| { readonly kind: "active-calls" }
 	| { readonly kind: "agent-state" }
+	| { readonly kind: "voicemail" }
 	| { readonly kind: "queue"; readonly queueId: string };
 
 export const LIVE_TOPIC_PERMISSIONS = {
@@ -56,6 +72,7 @@ export const LIVE_TOPIC_PERMISSIONS = {
 	"active-calls": "cdr.read",
 	queue: "queues.monitor",
 	"agent-state": "queues.monitor",
+	voicemail: "voicemail.read",
 } as const satisfies Record<LiveTopicKind, Permission>;
 
 /**
@@ -72,6 +89,7 @@ export const LIVE_SOURCES = [
 	"call-events",
 	"agent-state-kv",
 	"queue-events",
+	"voicemail-events",
 ] as const;
 export type LiveSource = (typeof LIVE_SOURCES)[number];
 
@@ -80,6 +98,16 @@ export const LIVE_TOPIC_SOURCES = {
 	"active-calls": ["channels-kv", "call-events"],
 	queue: ["queue-events", "agent-state-kv"],
 	"agent-state": ["agent-state-kv", "queue-events"],
+	/**
+	 * One source, and no bucket behind it.
+	 *
+	 * There is no `voicemail` KV projection to snapshot from, on purpose: the counts live in
+	 * `voicemail_message` and the page that renders them has already fetched them over HTTP
+	 * (`GET /voicemail-boxes/:id/messages` returns `mailbox.newCount`). A bucket would be a third
+	 * copy of a number two places already agree on. The stream is what tells an open page the
+	 * number changed while somebody was looking at it.
+	 */
+	voicemail: ["voicemail-events"],
 } as const satisfies Record<LiveTopicKind, readonly LiveSource[]>;
 
 /** A UUID, which is what every queue id on this platform is (`packages/identifiers`). */
@@ -94,7 +122,12 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
  * wildcard in it.
  */
 export function parseLiveTopic(value: string): LiveTopic | undefined {
-	if (value === "registrations" || value === "active-calls" || value === "agent-state") {
+	if (
+		value === "registrations" ||
+		value === "active-calls" ||
+		value === "agent-state" ||
+		value === "voicemail"
+	) {
 		return { kind: value };
 	}
 	const queuePrefix = "queue:";

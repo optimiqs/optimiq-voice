@@ -45,6 +45,28 @@ export interface ItemEnvelope<T> {
 	readonly data: T;
 }
 
+/**
+ * Drops `columns` from `row`, returning the row unchanged when there is nothing to drop.
+ *
+ * A free function rather than a method so the child-resource service and any hand-written service
+ * that shapes a row can use the same one, and so it can be unit-tested without a runtime.
+ */
+export function redactRow(
+	row: Record<string, unknown>,
+	columns: readonly string[] | undefined,
+): Record<string, unknown> {
+	if (columns === undefined || columns.length === 0) {
+		return row;
+	}
+	const next: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(row)) {
+		if (!columns.includes(key)) {
+			next[key] = value;
+		}
+	}
+	return next;
+}
+
 export abstract class PbxResourceService {
 	protected constructor(
 		protected readonly runtime: PbxRepositoryRuntime,
@@ -56,18 +78,32 @@ export abstract class PbxResourceService {
 		return requireActiveOrganizationId(session);
 	}
 
+	/**
+	 * The row, minus anything the resource declared secret.
+	 *
+	 * The repository reads whole rows on purpose — its guards, its destination merge and
+	 * compile-on-write all need the row as it will be — so the redaction lives here, at the one
+	 * seam where a row becomes a response body. See {@link PbxResource.secretColumns}.
+	 */
+	protected redact(row: Record<string, unknown>): Record<string, unknown> {
+		return redactRow(row, this.resource.secretColumns);
+	}
+
 	async list(session: AppSession, query: ListQuery): Promise<PagedResult<Record<string, unknown>>> {
 		const organizationId = this.organizationId(session);
-		return await runEffect(this.runtime, (repository) =>
+		const page = await runEffect(this.runtime, (repository) =>
 			repository.list(organizationId, this.resource, query),
 		);
+		return { ...page, data: page.data.map((row) => this.redact(row)) };
 	}
 
 	async get(session: AppSession, id: string): Promise<ItemEnvelope<Record<string, unknown>>> {
 		const organizationId = this.organizationId(session);
 		return {
-			data: await runEffect(this.runtime, (repository) =>
-				repository.get(organizationId, this.resource, id),
+			data: this.redact(
+				await runEffect(this.runtime, (repository) =>
+					repository.get(organizationId, this.resource, id),
+				),
 			),
 		};
 	}
@@ -80,7 +116,7 @@ export abstract class PbxResourceService {
 		const result = await runEffect(this.runtime, (repository) =>
 			repository.create(organizationId, this.resource, values),
 		);
-		return { data: result.row, warnings: result.warnings.map(toWireDiagnostic) };
+		return { data: this.redact(result.row), warnings: result.warnings.map(toWireDiagnostic) };
 	}
 
 	async update(
@@ -92,7 +128,7 @@ export abstract class PbxResourceService {
 		const result = await runEffect(this.runtime, (repository) =>
 			repository.update(organizationId, this.resource, id, values),
 		);
-		return { data: result.row, warnings: result.warnings.map(toWireDiagnostic) };
+		return { data: this.redact(result.row), warnings: result.warnings.map(toWireDiagnostic) };
 	}
 
 	async remove(
@@ -125,16 +161,20 @@ export abstract class PbxChildResourceService {
 		return requireActiveOrganizationId(session);
 	}
 
+	/** As {@link PbxResourceService.redact} — `secretColumns` is inherited from `PbxResource`. */
+	protected redact(row: Record<string, unknown>): Record<string, unknown> {
+		return redactRow(row, this.resource.secretColumns);
+	}
+
 	async list(
 		session: AppSession,
 		parentId: string,
 	): Promise<{ readonly data: readonly Record<string, unknown>[] }> {
 		const organizationId = this.organizationId(session);
-		return {
-			data: await runEffect(this.runtime, (repository) =>
-				repository.listChildren(organizationId, this.resource, parentId),
-			),
-		};
+		const rows = await runEffect(this.runtime, (repository) =>
+			repository.listChildren(organizationId, this.resource, parentId),
+		);
+		return { data: rows.map((row) => this.redact(row)) };
 	}
 
 	async create(
@@ -146,7 +186,7 @@ export abstract class PbxChildResourceService {
 		const result = await runEffect(this.runtime, (repository) =>
 			repository.createChild(organizationId, this.resource, parentId, values),
 		);
-		return { data: result.row, warnings: result.warnings.map(toWireDiagnostic) };
+		return { data: this.redact(result.row), warnings: result.warnings.map(toWireDiagnostic) };
 	}
 
 	async update(
@@ -159,7 +199,7 @@ export abstract class PbxChildResourceService {
 		const result = await runEffect(this.runtime, (repository) =>
 			repository.updateChild(organizationId, this.resource, parentId, id, values),
 		);
-		return { data: result.row, warnings: result.warnings.map(toWireDiagnostic) };
+		return { data: this.redact(result.row), warnings: result.warnings.map(toWireDiagnostic) };
 	}
 
 	async remove(
@@ -189,6 +229,9 @@ export abstract class PbxChildResourceService {
 		const result = await runEffect(this.runtime, (repository) =>
 			repository.reorderChildren(organizationId, this.resource, parentId, ids),
 		);
-		return { data: result.row, warnings: result.warnings.map(toWireDiagnostic) };
+		return {
+			data: result.row.map((row) => this.redact(row)),
+			warnings: result.warnings.map(toWireDiagnostic),
+		};
 	}
 }

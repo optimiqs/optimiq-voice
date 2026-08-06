@@ -35,6 +35,41 @@ export const queryKeys = {
 	pbxChildren: (organizationId: string, resource: string, parentId: string, child: string) =>
 		["organizations", organizationId, "pbx", resource, "item", parentId, child] as const,
 	/**
+	 * The messages in one mailbox.
+	 *
+	 * Filed UNDER `pbx/voicemail-boxes/item/<id>` on purpose: the coarse `pbxResource` invalidation
+	 * that every mailbox mutation already fires sweeps the message lists too, so deleting a box
+	 * cannot leave its messages cached behind it. The `folder`/`page` query is the last segment for
+	 * the reason every list key here has one — two folders are two answers and must never share an
+	 * entry.
+	 */
+	voicemailMessagesFor: (organizationId: string, boxId: string) =>
+		[
+			"organizations",
+			organizationId,
+			"pbx",
+			"voicemail-boxes",
+			"item",
+			boxId,
+			"messages",
+		] as const,
+	voicemailMessages: (
+		organizationId: string,
+		boxId: string,
+		query: Readonly<Record<string, unknown>>,
+	) =>
+		[
+			"organizations",
+			organizationId,
+			"pbx",
+			"voicemail-boxes",
+			"item",
+			boxId,
+			"messages",
+			query,
+		] as const,
+
+	/**
 	 * What each feature-code action's `params` accepts.
 	 *
 	 * NOT scoped by organization, unlike everything else here: it describes the schema, not the

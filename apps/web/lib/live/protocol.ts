@@ -20,6 +20,7 @@ export type LiveTopic =
 	| "registrations"
 	| "active-calls"
 	| "agent-state"
+	| "voicemail"
 	| `queue:${string}`;
 
 /** The topic KINDS a `welcome` frame lists. `queue` needs an id appended to become a topic. */
@@ -28,6 +29,7 @@ export const LIVE_TOPIC_KINDS = [
 	"active-calls",
 	"queue",
 	"agent-state",
+	"voicemail",
 ] as const;
 export type LiveTopicKind = (typeof LIVE_TOPIC_KINDS)[number];
 

@@ -24,4 +24,11 @@ export const CONFERENCE_RESOURCE: PbxResource = {
 	enabledColumn: conference.enabled,
 	destinations: [],
 	destinationType: "conference",
+	/**
+	 * Neither digest is returned either, for the reason `voicemail-boxes.resource.ts` states at
+	 * length: a hash in a response body is a hash somebody can crack offline, and a room PIN is
+	 * shorter than a password. Both columns are NULL today (no endpoint writes them yet), so this
+	 * is a rule established before there is anything to leak rather than after.
+	 */
+	secretColumns: ["pinHash", "moderatorPinHash"],
 };

@@ -286,3 +286,80 @@ export function useLiveQueue(queueId: string | null): LiveQueueResult {
 
 	return { waiting, loaded, permitted };
 }
+
+// ---------------------------------------------------------------------------------------------
+// voicemail
+// ---------------------------------------------------------------------------------------------
+
+export interface LiveMailboxCounts {
+	readonly newCount: number;
+	readonly savedCount: number;
+}
+
+export interface LiveVoicemailResult {
+	/** Keyed by `voicemail_box.id`. Empty until a mailbox's counts change while the page is open. */
+	readonly counts: ReadonlyMap<string, LiveMailboxCounts>;
+	readonly permitted: boolean;
+}
+
+/**
+ * Live mailbox counts, from `voicemail.mwi.updated`.
+ *
+ * ## Why the map starts EMPTY and that is not a bug
+ *
+ * There is no KV projection behind this topic, so there is no snapshot frame: the socket can only
+ * say what CHANGED while the page was open. The counts a screen renders therefore come from the
+ * HTTP list (`mailbox.newCount`), and this map OVERLAYS the ones that have moved since. A caller
+ * reads `counts.get(boxId) ?? fetched`, which is correct in both directions — before any event,
+ * and after one.
+ *
+ * Building a bucket to make the snapshot possible was the alternative, and it would be a third
+ * copy of a number that `voicemail_message` already holds and the list endpoint already returns.
+ *
+ * ## The mailbox id comes from the SUBJECT
+ *
+ * `voicemail.evt.v1.<orgId>.<mailboxId>.mwi.updated` — the box is the address, not the payload,
+ * which is the rule `packages/events` applies to `queueId` and `callId` too. So the envelope's own
+ * `subject` is parsed rather than a field being invented for it.
+ */
+export function useLiveVoicemail(): LiveVoicemailResult {
+	const permitted = usePermission("voicemail.read");
+	const [counts, setCounts] = useState<ReadonlyMap<string, LiveMailboxCounts>>(() => new Map());
+
+	const onUpdate = useCallback((event: LiveUpdateEvent) => {
+		if (event.kind !== "mwi.updated") {
+			return;
+		}
+		const envelope = event.data as {
+			subject?: string;
+			data?: { newCount?: unknown; savedCount?: unknown };
+		};
+		const mailboxId = envelope?.subject?.split(".")[4];
+		const payload = envelope?.data;
+		if (
+			mailboxId === undefined ||
+			payload === undefined ||
+			typeof payload.newCount !== "number" ||
+			typeof payload.savedCount !== "number"
+		) {
+			return;
+		}
+		const next: LiveMailboxCounts = {
+			newCount: payload.newCount,
+			savedCount: payload.savedCount,
+		};
+		setCounts((previous) => {
+			const held = previous.get(mailboxId);
+			if (held?.newCount === next.newCount && held.savedCount === next.savedCount) {
+				return previous;
+			}
+			const updated = new Map(previous);
+			updated.set(mailboxId, next);
+			return updated;
+		});
+	}, []);
+
+	useLiveTopic("voicemail", { onUpdate }, { enabled: permitted });
+
+	return { counts, permitted };
+}

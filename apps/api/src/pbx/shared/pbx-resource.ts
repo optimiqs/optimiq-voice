@@ -42,6 +42,22 @@ export interface PbxResource {
 	readonly destinationType: DestinationType | null;
 	/** Foreign keys pointing here that we refuse to orphan even though no destination trio does. */
 	readonly scalarReferences?: readonly ScalarReferenceSite[];
+	/**
+	 * Columns that must never leave the process in a response body.
+	 *
+	 * Two tables carry a `pin_hash`, and neither of them has any business returning it: a digest is
+	 * not information an admin screen can use, it is offline-crackable by anyone who obtains it,
+	 * and a four-digit PIN behind scrypt is a few CPU-seconds of work once the digest is in hand.
+	 * The write DTOs already exclude the column — "a PIN is set through a dedicated endpoint that
+	 * hashes it" — and this is the read half of the same sentence.
+	 *
+	 * Enforced in {@link PbxResourceService}, one layer above the repository, rather than as a
+	 * column projection in the queries. The repository's guards, the destination merge and
+	 * compile-on-write all read whole rows, and a projection would have to be threaded through
+	 * every one of them for a rule that is about the response envelope. Redacting at the shaping
+	 * layer means there is exactly one place a row becomes a body, and it is the place that strips.
+	 */
+	readonly secretColumns?: readonly string[];
 }
 
 /** A child collection owned by a parent resource (IVR options, ring-group members, time rules). */

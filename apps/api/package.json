@@ -33,7 +33,8 @@
 		"verify:identity-migration": "tsx scripts/verify-identity-migration.ts",
 		"verify:live": "tsx scripts/verify-live.ts",
 		"verify:pbx": "tsx scripts/verify-pbx.ts",
-		"verify:tenancy": "tsx scripts/verify-tenancy-backfill.ts"
+		"verify:tenancy": "tsx scripts/verify-tenancy-backfill.ts",
+		"verify:voicemail": "tsx scripts/verify-voicemail.ts"
 	},
 	"bin": {
 		"optimiq-voice": "./dist/index.js"
