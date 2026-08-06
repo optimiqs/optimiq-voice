@@ -17,6 +17,7 @@
 		"db:deploy": "node scripts/db-provision.mjs",
 		"db:generate": "drizzle-kit generate --config drizzle.config.ts",
 		"emit:sip-vectors": "tsx scripts/emit-sip-derivation-vectors.ts",
+		"generate:musiconhold": "tsx scripts/generate-musiconhold.ts",
 		"migrate:identity": "tsx scripts/migrate-identity-to-organizations.ts",
 		"prebuild": "rimraf ./dist tsconfig.tsbuildinfo tsconfig.build.tsbuildinfo",
 		"pretest": "bash ../../.scripts/gen-keypair.sh",

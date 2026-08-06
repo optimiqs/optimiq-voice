@@ -283,6 +283,15 @@ async function main(): Promise<void> {
 	} else {
 		process.env.NATS_URL = nats.url;
 	}
+	/**
+	 * The outbox sweeper's TIMER is off; the sweeper itself is not.
+	 *
+	 * §10 drives `sweep()` by hand, because "wait fifteen seconds and hope" is not a check. A
+	 * background interval running alongside it would publish the row this script is about to prove
+	 * is still pending, and the failure would be intermittent and blamed on the broker. `0` disables
+	 * the timer and leaves the method callable — see `PBX_OUTBOX_SWEEP_INTERVAL_MS` in `pbx-env.ts`.
+	 */
+	process.env.PBX_OUTBOX_SWEEP_INTERVAL_MS = "0";
 
 	await import("reflect-metadata");
 	const { NestFactory } = await import("@nestjs/core");
@@ -293,9 +302,8 @@ async function main(): Promise<void> {
 	const { createPostgresClient } = await import("@optimiq-voice/db");
 	const { routingCacheKey, ROUTING_CACHE_BUCKET } = await import("@optimiq-voice/routing");
 	const { ROUTING_RESOLVE_RPC } = await import("@optimiq-voice/events/schemas");
-	const { DID_INDEX_KV, kvKeyFor, QUEUE_MEMBERSHIP_KV } = await import(
-		"@optimiq-voice/events/streams"
-	);
+	const { DID_INDEX_KV, kvKeyFor, QUEUE_MEMBERSHIP_KV } =
+		await import("@optimiq-voice/events/streams");
 
 	const sql = createPostgresClient({
 		url: databaseUrl,
@@ -1345,7 +1353,11 @@ async function main(): Promise<void> {
 				const rosterKey = kvKeyFor.queueMembership(organizationA, queueId);
 				await delay(600);
 				const rosterEntry = await rosterBucket.get(rosterKey);
-				check("the queue has a roster in the queue-membership bucket", rosterEntry !== null, rosterKey);
+				check(
+					"the queue has a roster in the queue-membership bucket",
+					rosterEntry !== null,
+					rosterKey,
+				);
 
 				interface RosterValue {
 					readonly orgId?: string;
@@ -1395,8 +1407,7 @@ async function main(): Promise<void> {
 				);
 				check(
 					"the roster carries the tier rules, which are meaningless without the tiers",
-					typeof roster?.tierRulesApply === "boolean" &&
-						typeof roster.wrapUpSeconds === "number",
+					typeof roster?.tierRulesApply === "boolean" && typeof roster.wrapUpSeconds === "number",
 					`tierRulesApply=${String(roster?.tierRulesApply)} wrapUp=${String(roster?.wrapUpSeconds)}`,
 				);
 
@@ -1419,7 +1430,8 @@ async function main(): Promise<void> {
 
 				// Removing a membership is a `queue_tier` delete, which recompiles nothing at all.
 				const tierList = await clientA("GET", `/api/v1/queues/${queueId}/tiers`);
-				const firstTierId = typeof rows(tierList)[0]?.id === "string" ? String(rows(tierList)[0]?.id) : "";
+				const firstTierId =
+					typeof rows(tierList)[0]?.id === "string" ? String(rows(tierList)[0]?.id) : "";
 				await clientA("DELETE", `/api/v1/queues/${queueId}/tiers/${firstTierId}`);
 				await delay(600);
 				const afterTierDelete = await readRoster(rosterKey);
@@ -1487,8 +1499,9 @@ async function main(): Promise<void> {
 				check(
 					"the dialled form of the number resolves to the same key",
 					kvKeyFor.didIndex(RUN_DID.replace("+", "")) === didKey &&
-						kvKeyFor.didIndex(`${RUN_DID.slice(0, 2)} (${RUN_DID.slice(2, 5)}) ${RUN_DID.slice(5)}`) ===
-							didKey,
+						kvKeyFor.didIndex(
+							`${RUN_DID.slice(0, 2)} (${RUN_DID.slice(2, 5)}) ${RUN_DID.slice(5)}`,
+						) === didKey,
 					didKey,
 				);
 
@@ -1592,9 +1605,8 @@ async function main(): Promise<void> {
 						{ msgID: `${messageEnvelope.id}-retry` },
 					);
 
-				const { createPbxDatabaseClient: openPbx, sql: pbxQuery } = await import(
-					"@optimiq-voice/pbx-db"
-				);
+				const { createPbxDatabaseClient: openPbx, sql: pbxQuery } =
+					await import("@optimiq-voice/pbx-db");
 				const pbxRead = openPbx({
 					url: pbxDatabaseUrl,
 					applicationName: "verify-pbx-voicemail",
@@ -1616,7 +1628,11 @@ async function main(): Promise<void> {
 						})) as Record<string, unknown>[];
 					}
 
-					check("the voicemail message was filed into pbx-db", filed.length === 1, `${String(filed.length)} row(s)`);
+					check(
+						"the voicemail message was filed into pbx-db",
+						filed.length === 1,
+						`${String(filed.length)} row(s)`,
+					);
 					check(
 						"the row names the box, the folder and the audio the engine recorded",
 						filed[0]?.voicemail_box_id === mailboxId &&
@@ -1644,7 +1660,11 @@ async function main(): Promise<void> {
 					for (let attempt = 0; attempt < 25 && mwiSeen.length === 0; attempt += 1) {
 						await delay(200);
 					}
-					check("an MWI update was published for the box", mwiSeen.length > 0, String(mwiSeen.length));
+					check(
+						"an MWI update was published for the box",
+						mwiSeen.length > 0,
+						String(mwiSeen.length),
+					);
 					check(
 						"the MWI update carries absolute counts, not a delta",
 						mwiSeen[0]?.newCount === 1 && mwiSeen[0]?.savedCount === 0,
@@ -1666,11 +1686,7 @@ async function main(): Promise<void> {
 				check("create a second DID -> 201", releaseTarget.status === 201);
 				await delay(300);
 				const spareKey = kvKeyFor.didIndex(SPARE_DID);
-				check(
-					"the second DID is indexed too",
-					(await didBucket.get(spareKey)) !== null,
-					spareKey,
-				);
+				check("the second DID is indexed too", (await didBucket.get(spareKey)) !== null, spareKey);
 
 				const released = await clientA("DELETE", `/api/v1/phone-numbers/${id(releaseTarget)}`);
 				check("delete the second DID -> 200", released.status === 200, `status ${released.status}`);
@@ -1681,6 +1697,222 @@ async function main(): Promise<void> {
 					afterRelease === null || afterRelease.value.length === 0,
 					spareKey,
 				);
+
+				// --- 10. the projection outbox ----------------------------------------------------
+				//
+				// The safety net under the three publishes above. Everything so far proved the FAST
+				// path: a write commits, the after-commit publish reaches the bucket. This proves the
+				// case the fast path structurally cannot cover — the process dying between the commit
+				// and the publish — which is the window all three publishers used to name as needing
+				// "an outbox, not a retry loop".
+				//
+				// It is simulated rather than induced, and the simulation is exact: an outbox row that
+				// is committed and NOT marked published is, by construction, indistinguishable from
+				// one whose process died before it could publish. `published_at IS NULL` is the whole
+				// state. So the setup is: delete the bucket entry, insert the row the write would have
+				// inserted, skip the fast path, sweep.
+				console.log("\n10. the projection outbox");
+
+				const { createPbxDatabaseClient: openOutbox, sql: outboxSql } =
+					await import("@optimiq-voice/pbx-db");
+				const { ProjectionOutboxSweeper } =
+					await import("../src/pbx/shared/projection-outbox.service");
+				const sweeper = app.get(ProjectionOutboxSweeper);
+				const outboxDb = openOutbox({
+					url: pbxDatabaseUrl,
+					applicationName: "verify-pbx-outbox",
+					poolMaxConnectionsOverride: 2,
+				});
+
+				/** Rows for one organization, as the sweeper sees them — untenanted, like the sweeper. */
+				const outboxRows = async (
+					organizationId: string,
+				): Promise<{ projection: string; published_at: string | null; attempts: number }[]> => {
+					const result = await outboxDb.adminDb.execute(
+						outboxSql`select "projection", "published_at", "attempts"
+							from "pbx_projection_outbox" where "organization_id" = ${organizationId}::uuid
+							order by "created_at"`,
+					);
+					return (
+						Array.isArray(result) ? result : ((result as { rows?: unknown[] }).rows ?? [])
+					) as { projection: string; published_at: string | null; attempts: number }[];
+				};
+
+				try {
+					// Every write in §2–§9 recorded an obligation and every fast-path publish discharged
+					// it. Both halves matter: no rows at all would mean the repository never enqueued,
+					// and a pending row here would mean the fast path never marks.
+					await delay(600);
+					const recorded = await outboxRows(organizationA);
+					check(
+						"the writes so far each recorded what they owed in the outbox",
+						recorded.length > 0,
+						`${String(recorded.length)} row(s)`,
+					);
+					check(
+						"…and the fast path discharged every one of them",
+						recorded.every((row) => row.published_at !== null),
+						`${String(recorded.filter((row) => row.published_at === null).length)} still pending`,
+					);
+					check(
+						"all three projections are represented",
+						new Set(recorded.map((row) => row.projection)).size === 3,
+						[...new Set(recorded.map((row) => row.projection))].sort().join(", "),
+					);
+
+					// --- the kill window -----------------------------------------------------------
+					//
+					// Evict the artifact, then record the obligation a committed write would have
+					// recorded — and do NOT publish. This is the state a `kill -9` between COMMIT and
+					// the after-commit publish leaves behind, reproduced exactly.
+					await bucket.delete(expectedKey);
+					const evicted = await bucket.get(expectedKey);
+					check(
+						"the artifact is gone from the bucket (simulating a lost publish)",
+						evicted === null || evicted.value.length === 0,
+						expectedKey,
+					);
+
+					await outboxDb.withTenantScope(organizationA, async (transaction) => {
+						await transaction.execute(
+							outboxSql`insert into "pbx_projection_outbox"
+								("id", "organization_id", "projection", "payload")
+								values (gen_random_uuid(), ${organizationA}::uuid, 'routing-cache',
+									${JSON.stringify({ tableName: "extension", kind: "extension", operation: "update" })}::jsonb)`,
+						);
+					});
+					const pendingBefore = (await outboxRows(organizationA)).filter(
+						(row) => row.published_at === null,
+					);
+					check(
+						"the obligation is recorded and unpublished, as a killed process would leave it",
+						pendingBefore.length === 1 && pendingBefore[0]?.projection === "routing-cache",
+						`${String(pendingBefore.length)} pending`,
+					);
+
+					const firstSweep = await sweeper.sweep();
+					check(
+						"the sweeper published the projection the fast path did not",
+						firstSweep.attempted === 1 && firstSweep.discharged === 1,
+						`attempted ${String(firstSweep.attempted)}, discharged ${String(firstSweep.discharged)}, failed ${String(firstSweep.failed)}`,
+					);
+					const restored = await bucket.get(expectedKey);
+					check(
+						"the artifact is back in the routing-cache bucket",
+						restored !== null && restored.value.length > 0,
+						expectedKey,
+					);
+					// A NATS KV `delete` leaves a tombstone, so `get` answers with an entry carrying an
+					// empty value rather than with `null` — the length check is what tells "republished"
+					// from "still deleted".
+					if (restored !== null && restored.value.length > 0) {
+						const artifact = JSON.parse(new TextDecoder().decode(restored.value)) as {
+							organizationId?: string;
+						};
+						// Re-derived from the database, not replayed from the row — which is why the row
+						// carries no artifact at all. See `shared/projection-outbox.ts`.
+						check(
+							"the republished artifact belongs to the right tenant",
+							artifact.organizationId === organizationA,
+							String(artifact.organizationId),
+						);
+					}
+					check(
+						"nothing is left owed",
+						(await outboxRows(organizationA)).every((row) => row.published_at !== null),
+						"",
+					);
+
+					// --- a redundant publish is harmless -------------------------------------------
+					//
+					// The sweeper never proves a row was really unpublished; it only never misses one.
+					// That is only safe because every publish is a whole-organization reconcile against
+					// the CURRENT database — so publishing twice writes the same bytes twice. Two API
+					// replicas sweeping at once do exactly this, which is why there is no lease.
+					const beforeDuplicate = await bucket.get(expectedKey);
+					await outboxDb.withTenantScope(organizationA, async (transaction) => {
+						await transaction.execute(
+							outboxSql`insert into "pbx_projection_outbox"
+								("id", "organization_id", "projection")
+								values (gen_random_uuid(), ${organizationA}::uuid, 'routing-cache')`,
+						);
+					});
+					const duplicateSweep = await sweeper.sweep();
+					const afterDuplicate = await bucket.get(expectedKey);
+					/**
+					 * Compared by `snapshotHash`, not by bytes.
+					 *
+					 * `compiledAt` is the artifact's only non-derived field and moves on every compile, so
+					 * a byte comparison would fail on a republish that is in fact perfectly correct — and
+					 * would be asserting the opposite of what the design says. `snapshotHash` is the
+					 * content hash of everything the engine acts on; equal hashes are what "the same
+					 * value" means here, and are exactly what `isArtifactFresh` uses to decide a publish
+					 * can be skipped in the first place.
+					 */
+					const hashOf = (entry: { value: Uint8Array } | null): string =>
+						entry === null || entry.value.length === 0
+							? ""
+							: String(
+									(
+										JSON.parse(new TextDecoder().decode(entry.value)) as {
+											snapshotHash?: string;
+										}
+									).snapshotHash ?? "",
+								);
+					const beforeHash = hashOf(beforeDuplicate);
+					const afterHash = hashOf(afterDuplicate);
+					check(
+						"a duplicate publish rewrites the same value rather than corrupting it",
+						duplicateSweep.failed === 0 && beforeHash.length > 0 && beforeHash === afterHash,
+						`failed ${String(duplicateSweep.failed)}, ${beforeHash.slice(0, 12)} vs ${afterHash.slice(0, 12)}`,
+					);
+
+					// --- backoff -------------------------------------------------------------------
+					//
+					// A group that failed a moment ago is not retried on the very next tick. Without
+					// this, a broker that is down turns every sweep into a full round of doomed
+					// publishes, and the logs stop being readable exactly when they matter.
+					await outboxDb.withTenantScope(organizationA, async (transaction) => {
+						await transaction.execute(
+							outboxSql`insert into "pbx_projection_outbox"
+								("id", "organization_id", "projection", "attempts", "last_attempt_at")
+								values (gen_random_uuid(), ${organizationA}::uuid, 'queue-membership', 3, now())`,
+						);
+					});
+					const deferredSweep = await sweeper.sweep();
+					check(
+						"a group that just failed is deferred rather than retried immediately",
+						deferredSweep.deferred === 1 && deferredSweep.attempted === 0,
+						`deferred ${String(deferredSweep.deferred)}, attempted ${String(deferredSweep.attempted)}`,
+					);
+
+					// --- a stuck row is reported, and is still retried ------------------------------
+					//
+					// Past the threshold the sweeper logs at error on EVERY sweep with the tenant, the
+					// projection, how long it has been owed and which script repairs it — because a
+					// stuck projection mentioned once at info level six hours ago is a stuck projection
+					// nobody knows about. It is reported, not abandoned: an obligation the system
+					// decided to forget is the outcome the table exists to make impossible.
+					await outboxDb.adminDb.execute(
+						outboxSql`update "pbx_projection_outbox"
+							set "attempts" = 99, "last_attempt_at" = now() - interval '1 hour',
+								"last_error" = 'simulated'
+							where "organization_id" = ${organizationA}::uuid and "published_at" is null`,
+					);
+					const stuckSweep = await sweeper.sweep();
+					check(
+						"a row past the stuck threshold is reported loudly and still retried",
+						stuckSweep.stuck === 1 && stuckSweep.attempted === 1,
+						`stuck ${String(stuckSweep.stuck)}, attempted ${String(stuckSweep.attempted)}, discharged ${String(stuckSweep.discharged)}`,
+					);
+					check(
+						"the sweeper leaves nothing owed once the broker is answering",
+						(await outboxRows(organizationA)).every((row) => row.published_at !== null),
+						"",
+					);
+				} finally {
+					await outboxDb.close();
+				}
 			} finally {
 				await rpcClient.close();
 				await connection.drain();
@@ -1709,6 +1941,9 @@ async function main(): Promise<void> {
 				for (const organizationId of [organizationA, organizationB].filter(Boolean)) {
 					await pbx.withTenantScope(organizationId, async (transaction) => {
 						for (const table of [
+							// First: it references nothing, and a row left behind would make the next run's
+							// "the fast path discharged every one of them" check read this run's rows.
+							"pbx_projection_outbox",
 							"inbound_route",
 							"outbound_route",
 							"phone_number",

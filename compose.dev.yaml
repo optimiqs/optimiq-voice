@@ -63,6 +63,27 @@ services:
       # routing slice can be driven from a softphone without a provisioning
       # layer. Development compose only — see pjsip_dev_endpoints.conf.
       OPTIMIQ_DEV_ENDPOINTS: ${OPTIMIQ_DEV_ENDPOINTS:-true}
+      # Where run.sh looks for the generated musiconhold.conf and where the
+      # engine's `object://` media resolves. Must equal the container side of
+      # the mount below and apps/engine's ENGINE_MEDIA_OBJECT_ROOT.
+      OPTIMIQ_MEDIA_OBJECT_ROOT: /var/lib/optimiq/objects
+    volumes:
+      # The object store, read-only.
+      #
+      # In development apps/api runs on the HOST (see `start:services`, which
+      # brings up the infrastructure and not the app), so the uploads it writes
+      # under PBX_MEDIA_OBJECT_ROOT are on the host filesystem — bind-mounting
+      # that directory is what lets the media server open the audio at all.
+      #
+      # Two things need it, and both are silent failures without it: prompts and
+      # voicemail greetings, which the compiler emits as `object://<key>` and the
+      # engine renders as a `sound:` path; and tenant hold music, whose generated
+      # `moh/musiconhold.conf` run.sh copies into /etc/asterisk at start.
+      #
+      # `compose.yaml` deliberately does NOT do this: there is no object-store
+      # service in the shipped stack to mount, so the mount would name a path
+      # that does not exist. See apps/asterisk/README.md.
+      - ${PBX_MEDIA_OBJECT_ROOT:-${CDR_RECORDING_ROOT:-./.media}}:/var/lib/optimiq/objects:ro
     extra_hosts:
       api: ${DOCKER_HOST_ADDRESS}
 
@@ -75,6 +96,12 @@ services:
     environment:
       NODE_ENV: development
       LOGS_LEVEL: ${ENGINE_LOGS_LEVEL:-debug}
+      # The container-side path of the asterisk service's object-store mount
+      # above. The engine never opens these files — it hands Asterisk a
+      # `sound:<root>/<key>` — so this must be ASTERISK's path, not the engine's,
+      # and the two containers agreeing is the whole point of pinning it here.
+      # Unset, greetings and prompts fall back to the built-in announcements.
+      ENGINE_MEDIA_OBJECT_ROOT: /var/lib/optimiq/objects
 
   postgres:
     ports:

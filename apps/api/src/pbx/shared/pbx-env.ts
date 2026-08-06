@@ -52,6 +52,55 @@ export const pbxEnvSchema = z.object({
 	PBX_DATABASE_MAX_CONNECTIONS: z.coerce.number().int().min(1).max(100).default(10),
 
 	/**
+	 * The projection outbox's sweeper — the safety net under the three KV publishes.
+	 *
+	 * See `shared/projection-outbox.ts` for what it is and `packages/pbx-db`'s `outbox-schema.ts`
+	 * for why the table exists. The knobs are here rather than hard-coded because the right values
+	 * depend on how much a deployment minds a stale bucket: the sweep interval is the WORST-CASE
+	 * staleness after a crash, and the stuck threshold is how many failed rounds an operator wants
+	 * to sit through before the logs start shouting.
+	 *
+	 * `PBX_OUTBOX_SWEEP_INTERVAL_MS` is deliberately not tiny. The fast path handles every healthy
+	 * write, so a sweep that finds work is already an incident; polling every second would spend a
+	 * connection a second to discover, almost always, that there is nothing to do.
+	 *
+	 * A sweep interval of `0` disables the sweeper entirely, for a process that must not do
+	 * background work — a one-shot migration container, a test harness driving the module directly.
+	 * The obligations are still recorded, so another process (or the next boot) discharges them.
+	 */
+	PBX_OUTBOX_SWEEP_INTERVAL_MS: z.coerce.number().int().min(0).max(3_600_000).default(15_000),
+	/**
+	 * The first retry delay after a failure; each further failure doubles it up to the cap.
+	 *
+	 * Its own variable rather than "the sweep interval", which is what it started as and which was
+	 * wrong for a reason worth keeping written down: setting the interval to `0` to drive `sweep()`
+	 * by hand also set the backoff base to `0`, so every failed group became due immediately and the
+	 * backoff quietly stopped existing in exactly the configuration a harness uses to test it. Two
+	 * concepts, two knobs.
+	 */
+	PBX_OUTBOX_BACKOFF_BASE_MS: z.coerce.number().int().min(1).max(3_600_000).default(15_000),
+	/**
+	 * The backoff cap. A broker that is restarting is back in seconds; a broker that is gone is gone
+	 * for hours, and retrying it every fifteen seconds for those hours is a log nobody can read.
+	 */
+	PBX_OUTBOX_BACKOFF_CAP_MS: z.coerce.number().int().min(1_000).max(3_600_000).default(300_000),
+	/**
+	 * How many failed attempts make a row STUCK — logged at error with everything needed to act on
+	 * it, on every sweep, until it clears. Five is roughly a minute of a restarting broker at the
+	 * default interval and backoff, which is long enough not to page on a rolling NATS upgrade.
+	 */
+	PBX_OUTBOX_STUCK_ATTEMPTS: z.coerce.number().int().min(1).max(1000).default(5),
+	/**
+	 * How long a DISCHARGED row is kept before it is pruned.
+	 *
+	 * Kept at all — rather than deleted at the moment of publish — so an operator investigating "the
+	 * engine had the wrong roster at 14:03" can see that the obligation existed and when it was
+	 * met. Pending rows are never pruned by age: an obligation nothing has managed to discharge is
+	 * exactly the row worth keeping.
+	 */
+	PBX_OUTBOX_RETENTION_HOURS: z.coerce.number().int().min(1).max(8760).default(24),
+
+	/**
 	 * How an extension number becomes a dial string in the media server's vocabulary.
 	 *
 	 * MUST match `apps/engine`'s `ENGINE_EXTENSION_DIAL_TEMPLATE`, and shares its default. The

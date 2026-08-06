@@ -2,6 +2,7 @@
 
 import { useForm } from "@tanstack/react-form";
 import { EntityFormDialog, FormSection } from "~/components/pbx/entity-form-dialog";
+import { ResourceSelect } from "~/components/pbx/resource-select";
 import { SelectField, SwitchField, TextField } from "~/components/ui/form-fields";
 import { useServerFieldErrors } from "~/lib/forms/server-errors";
 import { PBX_RESOURCES } from "~/lib/pbx/client";
@@ -57,6 +58,7 @@ function defaultsFor(extension: ExtensionRow | null): ExtensionFormValues {
 			extension?.callTimeoutSeconds === undefined ? "" : String(extension.callTimeoutSeconds),
 		maxRegistrations:
 			extension?.maxRegistrations === undefined ? "" : String(extension.maxRegistrations),
+		mohClassId: extension?.mohClassId ?? "",
 		voicemailEnabled: extension?.voicemailEnabled ?? true,
 		doNotDisturb: extension?.doNotDisturb ?? false,
 		enabled: extension?.enabled ?? true,
@@ -91,6 +93,10 @@ export function ExtensionDialog({
 			 * `callTimeoutSeconds` and `maxRegistrations` are `.optional()` on the server, not
 			 * `.nullish()` — a null is a 400. `JSON.stringify` drops undefined keys, and an absent key
 			 * on a PATCH means "leave it alone", which is exactly what a blank optional field means.
+			 *
+			 * `mohClassId` is the opposite case and goes on the wire as `null` when it is empty: it is
+			 * `.nullish()`, and an absent key would mean an operator who chose "the organization
+			 * default" would keep hearing whichever class was set before.
 			 */
 			const body = {
 				number: parsed.number,
@@ -103,6 +109,7 @@ export function ExtensionDialog({
 				recordPolicy: parsed.recordPolicy,
 				callTimeoutSeconds: parsed.callTimeoutSeconds ?? undefined,
 				maxRegistrations: parsed.maxRegistrations ?? undefined,
+				mohClassId: parsed.mohClassId,
 				voicemailEnabled: parsed.voicemailEnabled,
 				doNotDisturb: parsed.doNotDisturb,
 				enabled: parsed.enabled,
@@ -278,6 +285,22 @@ export function ExtensionDialog({
 							placeholder="3"
 							disabled={mutation.isPending}
 							submitError={server.errors.maxRegistrations}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="mohClassId">
+					{(field) => (
+						<ResourceSelect
+							id="mohClassId"
+							label="Hold music"
+							resource={PBX_RESOURCES.mohClasses}
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="The organization default"
+							description="What the other party hears when this extension puts them on hold or transfers them."
+							disabled={mutation.isPending}
+							error={server.errors.mohClassId}
+							className="sm:col-span-2"
 						/>
 					)}
 				</form.Field>

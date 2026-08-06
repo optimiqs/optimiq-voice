@@ -15,6 +15,7 @@ export * from "./features-schema";
 export * from "./ivr-schema";
 export * from "./media-schema";
 export * from "./numbers-schema";
+export * from "./outbox-schema";
 export * from "./queues-schema";
 export * from "./ring-groups-schema";
 export * from "./routing-schema";

@@ -2,6 +2,7 @@
 
 import { useForm } from "@tanstack/react-form";
 import { EntityFormDialog, FormSection } from "~/components/pbx/entity-form-dialog";
+import { ResourceSelect } from "~/components/pbx/resource-select";
 import { SwitchField, TextField } from "~/components/ui/form-fields";
 import { useServerFieldErrors } from "~/lib/forms/server-errors";
 import { PBX_RESOURCES } from "~/lib/pbx/client";
@@ -31,6 +32,7 @@ function defaultsFor(conference: ConferenceRow | null): ConferenceFormValues {
 		name: conference?.name ?? "",
 		roomNumber: conference?.roomNumber ?? "",
 		maxMembers: conference?.maxMembers === undefined ? "" : String(conference.maxMembers),
+		mohClassId: conference?.mohClassId ?? "",
 		recordEnabled: conference?.recordEnabled ?? false,
 		announceJoinLeave: conference?.announceJoinLeave ?? true,
 		waitForModerator: conference?.waitForModerator ?? false,
@@ -63,6 +65,7 @@ export function ConferenceDialog({
 				name: parsed.name,
 				roomNumber: parsed.roomNumber,
 				maxMembers: parsed.maxMembers,
+				mohClassId: parsed.mohClassId,
 				recordEnabled: parsed.recordEnabled,
 				announceJoinLeave: parsed.announceJoinLeave,
 				waitForModerator: parsed.waitForModerator,
@@ -138,6 +141,22 @@ export function ConferenceDialog({
 							description="Leave empty for the server's default."
 							disabled={mutation.isPending}
 							submitError={server.errors.maxMembers}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="mohClassId">
+					{(field) => (
+						<ResourceSelect
+							id="conferenceMohClassId"
+							label="Hold music"
+							resource={PBX_RESOURCES.mohClasses}
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="The organization default"
+							description="What the first person in the room hears while they are alone in it — and what everyone hears for as long as the switch below holds them."
+							disabled={mutation.isPending}
+							error={server.errors.mohClassId}
+							className="sm:col-span-2"
 						/>
 					)}
 				</form.Field>

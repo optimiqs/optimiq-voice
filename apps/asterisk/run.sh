@@ -61,6 +61,35 @@ if [ "$OPTIMIQ_DEV_ENDPOINTS" != "true" ]; then
   rm -f /etc/asterisk/pjsip_dev_endpoints.conf
 fi
 
+# Tenant music-on-hold classes, if the object store is mounted.
+#
+# A hold-music class is a row in `moh_class` and a section in this file, and Asterisk resolves a
+# class by NAME against the file — never by path. So the audio the API uploads under
+# `<root>/moh/<org>/<class>/` is invisible to `res_musiconhold` until something declares the class.
+#
+# `apps/api`'s `generate:musiconhold` renders that declaration into `<root>/moh/musiconhold.conf`,
+# in the object store the media server already mounts — deliberately, so tenant hold music needs no
+# SECOND mount that a deployment can forget. This copies it over the baked fallback if it is there.
+#
+# Copied rather than symlinked or `#include`d: `/etc/asterisk` is owned by the `asterisk` user and
+# the mount is read-only, and a copy is also what makes the running configuration a snapshot — a
+# regeneration mid-call cannot change what this process resolves until somebody reloads.
+#
+# A restart therefore always picks up a change. Without one:
+#
+#   asterisk -rx 'module reload res_musiconhold.so'
+#
+# The absence of the file is NOT an error: a deployment with no object-store mount, or one that has
+# never generated it, keeps the baked `[default]` class and hears the stock hold music.
+[ -z "$OPTIMIQ_MEDIA_OBJECT_ROOT" ] && { export OPTIMIQ_MEDIA_OBJECT_ROOT='/var/lib/optimiq/objects'; }
+if [ -r "${OPTIMIQ_MEDIA_OBJECT_ROOT}/moh/musiconhold.conf" ]; then
+  cp "${OPTIMIQ_MEDIA_OBJECT_ROOT}/moh/musiconhold.conf" /etc/asterisk/musiconhold.conf
+  echo "musiconhold.conf: using the generated classes from ${OPTIMIQ_MEDIA_OBJECT_ROOT}/moh"
+else
+  echo "musiconhold.conf: no generated classes at ${OPTIMIQ_MEDIA_OBJECT_ROOT}/moh — only [default] is declared."
+  echo "  Tenant hold music needs the object store mounted and 'pnpm --filter @optimiq-voice/api generate:musiconhold' run."
+fi
+
 asterisk -v
 
 while sleep 3600; do :; done

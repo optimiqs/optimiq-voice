@@ -141,10 +141,13 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 	 * full argument — publishing from inside the transaction would put a roster for a state that
 	 * might roll back in front of live callers).
 	 *
-	 * The residual window is real and is named honestly: if the process dies between the commit and
-	 * this publish, the tier is in the database and not in the bucket, and the engine distributes
-	 * against the previous roster until the next write for that organization or a run of
-	 * `scripts/rebuild-queue-membership.ts`. Closing it needs an outbox, not a retry loop.
+	 * The residual window that ordering opens — the process dying between the commit and this
+	 * publish, leaving the tier in the database and the engine distributing against the previous
+	 * roster — is closed by `shared/projection-outbox.ts`, which is the outbox this comment used to
+	 * say was needed: the obligation is recorded INSIDE the write transaction, this publish is the
+	 * fast path that discharges it, and a sweeper republishes whatever the fast path failed to mark.
+	 * `scripts/rebuild-queue-membership.ts` remains for the failures an outbox cannot repair — a
+	 * bucket lost to a fresh cluster, a restored snapshot, a seat that has since become reachable.
 	 */
 	async syncOrganization(organizationId: string): Promise<QueueMembershipSyncResult> {
 		if (this.bucket === undefined) {
@@ -380,23 +383,16 @@ export interface QueueMembershipSyncResult {
 }
 
 /**
- * The tables whose mutation changes a roster.
+ * The tables whose mutation changes a roster — re-exported, not declared here.
  *
- * `extension` is here and is the one that is easy to miss: an `extension` agent's dial string is
- * derived from `extension.number`, so renumbering an extension moves every queue that agent serves.
- * Leaving it out would publish rosters that dial the old number until something else happened to
- * touch the queue.
+ * They MOVED to `shared/projection-outbox.ts` when the outbox landed, because the repository has to
+ * consult the same list INSIDE the write transaction to decide what obligation to record, and this
+ * file imports `nats` — which would drag a broker client into every repository spec. The re-export
+ * keeps `pbx.module.ts` and every other caller importing it from the publisher it belongs to, and
+ * keeps the list itself in the one file both sides can reach. Two copies of it would be a queue
+ * whose roster is published but never owed, or owed but never published.
  */
-export const QUEUE_MEMBERSHIP_TABLES: readonly string[] = [
-	"queue",
-	"queue_agent",
-	"queue_tier",
-	"extension",
-];
-
-export function affectsQueueMembership(tableName: string): boolean {
-	return QUEUE_MEMBERSHIP_TABLES.includes(tableName);
-}
+export { affectsQueueMembership, QUEUE_MEMBERSHIP_TABLES } from "../shared/projection-outbox";
 
 async function readEntry(bucket: KV, key: string): Promise<QueueMembership | undefined> {
 	const value = await bucket.get(key);

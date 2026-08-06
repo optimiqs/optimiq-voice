@@ -4,6 +4,7 @@ import { useForm } from "@tanstack/react-form";
 import { useState } from "react";
 import { DestinationPicker } from "~/components/pbx/destination-picker";
 import { EntityFormDialog, FormSection } from "~/components/pbx/entity-form-dialog";
+import { PromptSelect, ResourceSelect } from "~/components/pbx/resource-select";
 import { SelectField, SwitchField, TextField } from "~/components/ui/form-fields";
 import { useServerFieldErrors } from "~/lib/forms/server-errors";
 import { PBX_RESOURCES } from "~/lib/pbx/client";
@@ -44,6 +45,9 @@ function defaultsFor(queue: QueueRow | null): QueueFormValues {
 		name: queue?.name ?? "",
 		extensionNumber: queue?.extensionNumber ?? "",
 		strategy: queue?.strategy ?? "longest-idle",
+		mohClassId: queue?.mohClassId ?? "",
+		greetingPromptId: queue?.greetingPromptId ?? "",
+		announcePromptId: queue?.announcePromptId ?? "",
 		maxWaitSeconds: seconds(queue?.maxWaitSeconds),
 		maxWaitNoAgentSeconds: seconds(queue?.maxWaitNoAgentSeconds),
 		wrapUpSeconds: seconds(queue?.wrapUpSeconds),
@@ -101,11 +105,18 @@ export function QueueDialog({
 			 * default rather than clearing it to NULL, which is what "leave it empty" means on a column
 			 * that is `notNull().default(n)`. `undefined` would leave the stored value alone on a
 			 * PATCH, which is a different intent and not the one an emptied input expresses.
+			 *
+			 * The three audio selectors send `null` too, and it means the other thing: those columns
+			 * ARE nullable, so an emptied one clears the class or prompt rather than restoring a
+			 * default. Same value on the wire, opposite effect, and the difference is the column's.
 			 */
 			const body = {
 				name: parsed.name,
 				extensionNumber: parsed.extensionNumber,
 				strategy: parsed.strategy,
+				mohClassId: parsed.mohClassId,
+				greetingPromptId: parsed.greetingPromptId,
+				announcePromptId: parsed.announcePromptId,
 				maxWaitSeconds: parsed.maxWaitSeconds,
 				maxWaitNoAgentSeconds: parsed.maxWaitNoAgentSeconds,
 				wrapUpSeconds: parsed.wrapUpSeconds,
@@ -160,7 +171,7 @@ export function QueueDialog({
 			footerNote={
 				queue === null
 					? "Agents are staffed on the queue's page once it exists, and that is a separate permission. A queue with nobody in it holds callers until the wait cap and then takes the timeout destination."
-					: "Music-on-hold and the greeting and announcement prompts are stored on this queue but have no picker yet; saving here leaves them exactly as they are."
+					: "Hold music and the two prompts are chosen from the media library. Audio has to be uploaded there before it appears in these lists."
 			}
 		>
 			<FormSection title="Queue">
@@ -277,7 +288,54 @@ export function QueueDialog({
 				errors={errors}
 			/>
 
-			<FormSection title="Announcements">
+			<FormSection
+				title="What the caller hears"
+				description="The greeting plays once, on arrival; the hold music plays under everything else until an agent picks up."
+			>
+				<form.Field name="mohClassId">
+					{(field) => (
+						<ResourceSelect
+							id="queueMohClassId"
+							label="Hold music"
+							resource={PBX_RESOURCES.mohClasses}
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="The organization default"
+							description="Plays for the whole wait, interrupted by the announcements below."
+							disabled={mutation.isPending}
+							error={errors.mohClassId}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="greetingPromptId">
+					{(field) => (
+						<PromptSelect
+							id="queueGreetingPromptId"
+							label="Greeting"
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="Go straight to the hold music"
+							description="Played once as the call joins the queue, before the wait begins."
+							disabled={mutation.isPending}
+							error={errors.greetingPromptId}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="announcePromptId">
+					{(field) => (
+						<PromptSelect
+							id="queueAnnouncePromptId"
+							label="Periodic announcement"
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="None"
+							description="Repeated at the interval below. With no prompt chosen, the interval only governs the position announcement."
+							disabled={mutation.isPending}
+							error={errors.announcePromptId}
+							className="sm:col-span-2"
+						/>
+					)}
+				</form.Field>
 				<form.Field name="announceFrequencySeconds">
 					{(field) => (
 						<TextField

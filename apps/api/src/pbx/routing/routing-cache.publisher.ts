@@ -37,6 +37,12 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
  * the row is committed — would report "your change was not saved" about a change that was, which
  * is the worse lie.
  *
+ * Swallowed is not the same as forgotten. The write records what it owes in
+ * `pbx_projection_outbox` INSIDE its own transaction (`shared/projection-outbox.ts`); this publish
+ * is the fast path that discharges the obligation in milliseconds, and a sweeper republishes
+ * whatever it failed to mark — including the case no in-process retry can cover, the process dying
+ * between the commit and this call.
+ *
  * ## Absent broker
  *
  * `NATS_URL` is optional. Without it this service never connects, `publish` is a no-op that

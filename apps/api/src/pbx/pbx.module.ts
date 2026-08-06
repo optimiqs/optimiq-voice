@@ -47,6 +47,8 @@ import { createPbxDatabase } from "./shared/pbx-database";
 import { loadPbxEnv } from "./shared/pbx-env";
 import { makePbxRepositoryRuntime } from "./shared/pbx-runtime";
 import { PBX_DATABASE, PBX_EFFECT_RUNTIME, PBX_ENV } from "./shared/pbx.tokens";
+import { dischargeProjection } from "./shared/projection-outbox";
+import { ProjectionOutboxSweeper } from "./shared/projection-outbox.service";
 import { SipCredentialsResponder } from "./sip-credentials/sip-credentials.responder";
 import { SipCredentialsService } from "./sip-credentials/sip-credentials.service";
 import { TimeConditionsController } from "./time-conditions/time-conditions.controller";
@@ -178,6 +180,7 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		DidIndexPublisher,
 		QueueMembershipPublisher,
 		AgentStatePublisher,
+		ProjectionOutboxSweeper,
 		{
 			provide: PBX_EFFECT_RUNTIME,
 			useFactory: (
@@ -185,9 +188,48 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 				publisher: RoutingCachePublisher,
 				didIndex: DidIndexPublisher,
 				queueMembership: QueueMembershipPublisher,
-			) =>
-				makePbxRepositoryRuntime({
+				env: PbxEnv,
+			) => {
+				/**
+				 * The fast path's second half: mark the obligation the write recorded.
+				 *
+				 * `cutoff` is captured by the CALLER, before the publish starts, and passed in — see
+				 * `shared/projection-outbox.ts`. Marking a cutoff taken afterwards would discharge
+				 * obligations recorded by writes that this publish never saw.
+				 *
+				 * Its own `catch`, on the same terms as the publishes it follows: this is a
+				 * fire-and-forget continuation of a request that already returned, and an unobserved
+				 * rejection during shutdown kills the process. A discharge that fails is also the
+				 * benign direction — the row stays pending and the sweeper republishes, which is
+				 * idempotent.
+				 */
+				const discharge = (
+					organizationId: string,
+					projection: "routing-cache" | "did-index" | "queue-membership",
+					cutoff: Date,
+				): void => {
+					if (env.NATS_URL === undefined) {
+						return;
+					}
+					dischargeProjection(database.adminDb, organizationId, projection, cutoff).catch(
+						(cause) => {
+							logger.error(
+								`could not mark the ${projection} outbox row discharged for organization ` +
+									`${organizationId}; the sweeper will republish it`,
+								cause,
+							);
+						},
+					);
+				};
+
+				return makePbxRepositoryRuntime({
 					database,
+					/**
+					 * Recorded only when there is a broker. Without `NATS_URL` there is no bucket for a
+					 * projection to be stale in, and enqueueing anyway would accumulate obligations on
+					 * every developer machine that nothing could ever discharge.
+					 */
+					outboxEnabled: env.NATS_URL !== undefined,
 					onArtifactCompiled: (compiled) => {
 						if (!compiled.changed) {
 							// A recompile that produced the same `snapshotHash` describes a cache entry that
@@ -196,18 +238,41 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 							//
 							// The DID index rides on the same evidence: the set of phone numbers is part of
 							// the hashed snapshot, so an unchanged hash means an unchanged index.
+							//
+							// `projectionsOwedBy` uses this exact predicate, so nothing was enqueued either
+							// and there is nothing here to discharge.
 							return;
 						}
+						const cutoff = new Date();
+						const { organizationId } = compiled.artifact;
 						// Fire-and-forget by design (the mutation already committed), but a bare
 						// `void` promise turns NATS's CONNECTION_DRAINING during shutdown into an
 						// unhandled rejection that kills the process — the publish must observe
 						// its own failure.
-						publisher.publish(compiled.cacheKey, compiled.artifact).catch((cause) => {
-							logger.error(`routing cache publish failed for ${compiled.cacheKey}`, cause);
-						});
-						didIndex.syncOrganization(compiled.artifact).catch((cause) => {
-							logger.error(`did-index sync failed for ${compiled.cacheKey}`, cause);
-						});
+						publisher
+							.publish(compiled.cacheKey, compiled.artifact)
+							.then((published) => {
+								if (published) {
+									discharge(organizationId, "routing-cache", cutoff);
+								}
+							})
+							.catch((cause) => {
+								logger.error(`routing cache publish failed for ${compiled.cacheKey}`, cause);
+							});
+						didIndex
+							.syncOrganization(compiled.artifact)
+							.then((result) => {
+								// A conflict means the bucket and the database's global unique index disagree,
+								// which `did-index.publisher.ts` says is a human decision. Leaving the row
+								// pending is what puts it in front of one: the sweeper retries, fails the same
+								// way, and eventually logs it as stuck with the rebuild script named.
+								if (!result.skipped && result.conflicts.length === 0) {
+									discharge(organizationId, "did-index", cutoff);
+								}
+							})
+							.catch((cause) => {
+								logger.error(`did-index sync failed for ${compiled.cacheKey}`, cause);
+							});
 					},
 					/**
 					 * The queue roster rides on a SEPARATE seam from the artifact, and it has to.
@@ -227,16 +292,31 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 						if (!affectsQueueMembership(event.tableName)) {
 							return;
 						}
-						queueMembership.syncOrganization(event.organizationId).catch((cause) => {
-							logger.error(
-								`queue-membership sync failed for organization ${event.organizationId} ` +
-									`after a ${event.operation} on ${event.tableName}`,
-								cause,
-							);
-						});
+						const cutoff = new Date();
+						queueMembership
+							.syncOrganization(event.organizationId)
+							.then((result) => {
+								if (!result.skipped) {
+									discharge(event.organizationId, "queue-membership", cutoff);
+								}
+							})
+							.catch((cause) => {
+								logger.error(
+									`queue-membership sync failed for organization ${event.organizationId} ` +
+										`after a ${event.operation} on ${event.tableName}`,
+									cause,
+								);
+							});
 					},
-				}),
-			inject: [PBX_DATABASE, RoutingCachePublisher, DidIndexPublisher, QueueMembershipPublisher],
+				});
+			},
+			inject: [
+				PBX_DATABASE,
+				RoutingCachePublisher,
+				DidIndexPublisher,
+				QueueMembershipPublisher,
+				PBX_ENV,
+			],
 		},
 		ExtensionsService,
 		PhoneNumbersService,
@@ -277,6 +357,7 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		DidIndexPublisher,
 		QueueMembershipPublisher,
 		AgentStatePublisher,
+		ProjectionOutboxSweeper,
 		VoicemailMessagesService,
 		VoicemailMwiPublisher,
 		PromptsService,

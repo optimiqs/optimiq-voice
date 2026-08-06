@@ -122,6 +122,30 @@ function requiredInt(min: number, max: number) {
 /** A select over another resource's rows, where the server column is a required uuid. */
 const requiredReference = z.string().trim().min(1, "Required");
 
+/**
+ * A select over another resource's rows, where the server column is `z.uuid().nullish()`.
+ *
+ * Blank means "clear it", and on a `PATCH` that is `null` rather than an absent key — the same
+ * distinction {@link optionalText} makes, but with sharper consequences. An absent key leaves the
+ * stored id alone, so a form that omitted an emptied selector would let an operator clear the hold
+ * music, press Save, and hear the old class on the next call with nothing on screen disagreeing.
+ * `""` is not an option either: the column is a uuid and Postgres answers an empty string with a
+ * `22P02` the user cannot act on.
+ *
+ * The uuid check is here rather than left to the server because these values come from a select
+ * whose options are ids: anything else in the control is a bug in this app, and a message on the
+ * field names it better than a 400 does.
+ */
+function optionalReference() {
+	return z
+		.string()
+		.trim()
+		.refine((value) => value === "" || z.uuid().safeParse(value).success, {
+			message: "Pick one from the list",
+		})
+		.transform((value) => (value.length === 0 ? null : value));
+}
+
 export const timezoneName = z
 	.string()
 	.trim()
@@ -144,6 +168,7 @@ export const extensionFormSchema = z.strictObject({
 	recordPolicy: z.enum(RECORD_POLICIES),
 	callTimeoutSeconds: optionalInt(5, 300),
 	maxRegistrations: optionalInt(1, 20),
+	mohClassId: optionalReference(),
 	voicemailEnabled: z.boolean(),
 	doNotDisturb: z.boolean(),
 	enabled: z.boolean(),
@@ -303,6 +328,16 @@ export const ivrMenuFormSchema = z.strictObject({
 	maxDigits: optionalInt(1, 10),
 	maxFailures: optionalInt(1, 10),
 	maxTimeouts: optionalInt(1, 10),
+	/**
+	 * The four things a caller hears from this menu, in the order a call meets them: the greeting on
+	 * arrival, the shorter one on every re-prompt, and the two apologies for a wrong key and for
+	 * silence. All four are optional and a menu with none of them answers mute, which is legal and
+	 * occasionally deliberate — a menu reached only from another menu that has already spoken.
+	 */
+	greetingPromptId: optionalReference(),
+	shortGreetingPromptId: optionalReference(),
+	invalidPromptId: optionalReference(),
+	timeoutPromptId: optionalReference(),
 	directDialEnabled: z.boolean(),
 	enabled: z.boolean(),
 });
@@ -330,6 +365,15 @@ export const ringGroupFormSchema = z.strictObject({
 	callerIdNamePrefix: optionalText(32),
 	ignoreBusy: z.boolean(),
 	confirmEnabled: z.boolean(),
+	/**
+	 * `confirmPromptId` is only reached when `confirmEnabled` is on — it is what the answering member
+	 * hears before they press a key — but it is NOT refused when the switch is off. Storing the
+	 * prompt while confirmation is disabled is how someone sets a group up in two sittings, and
+	 * clearing it on save would be a form deleting configuration nobody asked it to delete.
+	 */
+	confirmPromptId: optionalReference(),
+	mohClassId: optionalReference(),
+	ringbackPromptId: optionalReference(),
 	enabled: z.boolean(),
 });
 export type RingGroupFormValues = z.input<typeof ringGroupFormSchema>;
@@ -346,15 +390,19 @@ export type RingGroupMemberFormValues = z.input<typeof ringGroupMemberFormSchema
 /**
  * A queue's own settings — everything the DTO calls a knob, and nothing about who answers it.
  *
- * `mohClassId`, `greetingPromptId` and `announcePromptId` are absent for the same reason a ring
- * group's `mohClassId` is: they are uuids into tables with no CRUD endpoint, so a control here would
- * be a text box for an id nobody can look up. `PATCH` semantics keep whatever is already stored —
- * the form sends only what it showed — so a seeded greeting survives every save made here.
+ * The three audio columns are here now that `/moh-classes` and `/prompts` exist to select from, and
+ * they behave differently from every other optional field on this form: an emptied numeric knob
+ * sends `null` meaning "put the server default back", while an emptied SELECTOR sends `null`
+ * meaning "play nothing at all". Both are `null` on the wire and the difference is entirely in the
+ * column — `announceFrequencySeconds` is `notNull().default(n)`, `announcePromptId` is nullable.
  */
 export const queueFormSchema = z.strictObject({
 	name: displayName,
 	extensionNumber: optionalDigits(16),
 	strategy: z.enum(QUEUE_STRATEGIES),
+	mohClassId: optionalReference(),
+	greetingPromptId: optionalReference(),
+	announcePromptId: optionalReference(),
 	/** 0 disables the cap and callers wait indefinitely. */
 	maxWaitSeconds: optionalInt(0, 86_400),
 	maxWaitNoAgentSeconds: optionalInt(0, 86_400),
@@ -442,6 +490,7 @@ export const conferenceFormSchema = z.strictObject({
 	name: displayName,
 	roomNumber: internalNumber,
 	maxMembers: optionalInt(2, 1000),
+	mohClassId: optionalReference(),
 	recordEnabled: z.boolean(),
 	announceJoinLeave: z.boolean(),
 	waitForModerator: z.boolean(),
@@ -462,6 +511,7 @@ export const parkLotFormSchema = z
 		slotStart: requiredInt(1, 99_999),
 		slotEnd: requiredInt(1, 99_999),
 		timeoutSeconds: optionalInt(5, 86_400),
+		mohClassId: optionalReference(),
 		enabled: z.boolean(),
 	})
 	.refine((value) => value.slotEnd >= value.slotStart, {

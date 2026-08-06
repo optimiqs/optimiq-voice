@@ -184,14 +184,72 @@ anything else is stored with a warning that says it will be resampled on every p
 `object://<objectKey>`, `media-refs.ts` renders that as `sound:<ENGINE_MEDIA_OBJECT_ROOT>/<key>`
 with the extension stripped, and Asterisk picks the best format sitting beside that stem.
 
-**Music on hold does not**, and this is a real gap worth stating rather than discovering. The engine
-hands ARI a hold-music CLASS NAME, and Asterisk resolves a class through `musiconhold.conf`, not
-through a path — so uploading files under `moh/<org>/<classId>/` puts the audio where the container
-can see it and does **not**, on its own, make the class exist. A deployment that wants tenant-managed
-hold music needs a `musiconhold.conf` section per class pointing `directory` at that path, generated
-from the `moh_class` table. Nothing does that yet; today the classes are configuration the compiler
-resolves and the media server has to have been told about separately. Recorded here because this
-file is where an operator asks the question.
+**Music on hold needs one more step**, because the engine hands ARI a hold-music CLASS NAME and
+Asterisk resolves a class through `musiconhold.conf`, not through a path. Uploading files under
+`moh/<org>/<classId>/` puts the audio where the container can see it and does **not**, on its own,
+make the class exist. `musiconhold.conf` is now generated from the `moh_class` table; the rest of
+this section is how.
+
+### Music on hold
+
+`config/musiconhold.conf` ships in the image and declares exactly one class, `default`, pointing at
+`/usr/share/asterisk/moh`. That is the fallback, and it exists because `res_musiconhold` with zero
+classes is the worst failure available: it logs nothing an operator can act on and every hold plays
+silence.
+
+Tenant classes are generated:
+
+```sh
+PBX_DATABASE_URL=postgresql://…/optimiq_pbx \
+PBX_MEDIA_OBJECT_ROOT=/opt/optimiq-voice/recordings \
+PBX_MEDIA_CONTAINER_ROOT=/var/lib/optimiq/objects \
+  pnpm --filter @optimiq-voice/api generate:musiconhold
+```
+
+which reads every `moh_class` row on the platform and writes
+`<PBX_MEDIA_OBJECT_ROOT>/moh/musiconhold.conf`. `run.sh` copies that file over the baked one at
+start, from `$OPTIMIQ_MEDIA_OBJECT_ROOT` (default `/var/lib/optimiq/objects`, the container side of
+the mount above). Absence is not an error: a box with no mount keeps `[default]` and says so on
+stdout.
+
+**The two roots are the thing to get right.** The API writes under `PBX_MEDIA_OBJECT_ROOT`; the
+`directory=` lines inside the file must be the path **Asterisk** sees, which is
+`PBX_MEDIA_CONTAINER_ROOT` and must equal the container side of the mount and
+`ENGINE_MEDIA_OBJECT_ROOT`. Getting it wrong produces a file that parses perfectly and plays
+nothing. The generator takes only the container root, so there is only one to pass.
+
+It is deliberately written into the object store rather than into a config volume of its own: that
+directory is by construction the one a deployment has already mounted for prompts and greetings, and
+a second mount is a second thing to forget.
+
+**Applying a change.** A container restart is always sufficient. Without one:
+
+```sh
+docker compose exec asterisk asterisk -rx 'module reload res_musiconhold.so'
+```
+
+The API does not do this itself, and the reason is not laziness: `apps/api` has no ARI client
+(`packages/media-ari` is the engine's, and its `AriAsterisk` wraps only `GET /asterisk/info`), there
+is no AMI client anywhere in the repository, and `compose.yaml` gives this service `expose: 6060`
+and nothing else — 8088 is published only by `compose.dev.yaml`, for a developer's browser. Wiring a
+second set of ARI credentials into the control plane to touch one file was the larger change; the
+regenerate-and-reload step is stated instead of hidden. `apps/api/scripts/generate-musiconhold.ts`
+records the same decision at the call site.
+
+**One class per name, platform-wide.** `moh_class.name` is unique per *organization*; Asterisk's
+class namespace is *global* — one file, one set of sections, no tenant dimension. Two tenants that
+both name a class `hold` collide, and the generator declares **neither**, reports both in the file's
+banner and on stderr, and exits non-zero. Picking a winner would play one tenant's hold music to
+another tenant's callers. The undeclared classes fall back to `default`, which is exactly what
+happens today, so nothing regresses while the ambiguity stands. Closing it properly means qualifying
+the class name at compile time in `packages/routing` (the engine asks for the bare name because the
+compiler put the bare name in the plan) — recorded as a follow-up, not done here.
+
+A class is also left undeclared when it is disabled (matching the compiler's warning that a disabled
+class falls back to the media server's own), when it is a `library` class with no files yet (a
+`mode=files` section over an empty directory logs once at load and then serves silence for the life
+of the process), or when it is a `stream` class with no URI. The first two are normal states and do
+not fail the generator; the last does.
 
 ### `sounds/`
 

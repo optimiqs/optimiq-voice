@@ -29,6 +29,7 @@ import {
 	PbxValidationFailure,
 	toPbxFailure,
 } from "./pbx.errors";
+import { enqueueProjections, payloadOf, projectionsOwedBy } from "./projection-outbox";
 import type { CompiledWrite } from "../routing/compile-on-write";
 import type { ListQuery, PagedResult, Pagination } from "./pagination";
 import type { PbxChildResource, PbxResource } from "./pbx-resource";
@@ -429,12 +430,60 @@ export interface PbxRepositoryDependencies {
 	 * spec can assert the seam without a broker.
 	 */
 	readonly onMutation?: (event: PbxMutationEvent) => void;
+	/**
+	 * Whether a write also records what it owes in `pbx_projection_outbox`.
+	 *
+	 * Off means the two seams above are the only publish path, which is what the area did before the
+	 * outbox existed. The module turns it on exactly when there is a broker to publish to: with no
+	 * `NATS_URL` there is no bucket for a projection to be stale in, and enqueueing anyway would
+	 * accumulate obligations on every developer machine that nothing could ever discharge.
+	 */
+	readonly outboxEnabled?: boolean;
 	/** Injected so a spec can pin generated ids. */
 	readonly newId?: () => string;
 }
 
 export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositoryInterface {
 	const newId = deps.newId ?? createEntityId;
+
+	/**
+	 * The last thing every write does, still inside its transaction: recompile if the table is a
+	 * routing input, then record what the commit will owe the KV buckets.
+	 *
+	 * The outbox insert is here rather than after the commit for the whole reason the table exists —
+	 * see `shared/projection-outbox.ts`. Being in the transaction means there is no interleaving in
+	 * which the row is durable and the obligation is not, and it means a failure to record the
+	 * obligation fails the write, which is the honest outcome: a caller told "saved" about a change
+	 * whose projection can be silently lost is worse off than a caller told to retry.
+	 *
+	 * `projectionsOwedBy` deliberately uses the SAME predicate the fast path uses — an unchanged
+	 * `snapshotHash` owes nothing, because the bucket already holds the right value. If the two ever
+	 * disagreed, the sweeper would spend forever republishing states the fast path had correctly
+	 * decided were already there.
+	 */
+	const settle = async (
+		transaction: PbxDatabaseTransaction,
+		organizationId: string,
+		resource: PbxResource | PbxChildResource,
+		operation: PbxMutationEvent["operation"],
+	): Promise<CompiledWrite | undefined> => {
+		const compiled = await recompileIfNeeded(transaction, organizationId, resource.tableName);
+		if (deps.outboxEnabled === true) {
+			await enqueueProjections(
+				transaction,
+				organizationId,
+				projectionsOwedBy(resource.tableName, compiled?.changed ?? false),
+				payloadOf({
+					organizationId,
+					tableName: resource.tableName,
+					kind: resource.kind,
+					operation,
+				}),
+				newId,
+			);
+		}
+		return compiled;
+	};
 
 	/**
 	 * The single Effect↔transaction seam. Read the class doc above before changing this.
@@ -552,7 +601,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 					.values(row as never)
 					.returning();
 				const created = inserted[0] as Record<string, unknown>;
-				const compiled = await recompileIfNeeded(transaction, organizationId, resource.tableName);
+				const compiled = await settle(transaction, organizationId, resource, "create");
 				return {
 					row: created,
 					warnings: compiled?.warnings ?? [],
@@ -589,7 +638,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 					.where(eq(rowId(resource), id))
 					.returning();
 				const row = (updated[0] ?? existing) as Record<string, unknown>;
-				const compiled = await recompileIfNeeded(transaction, organizationId, resource.tableName);
+				const compiled = await settle(transaction, organizationId, resource, "update");
 				return {
 					row,
 					warnings: compiled?.warnings ?? [],
@@ -614,7 +663,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 				await requireRow(transaction, resource, id);
 				await assertNotReferenced(transaction, resource, id);
 				await transaction.delete(resource.table).where(eq(rowId(resource), id));
-				const compiled = await recompileIfNeeded(transaction, organizationId, resource.tableName);
+				const compiled = await settle(transaction, organizationId, resource, "remove");
 				return {
 					row: { id },
 					warnings: compiled?.warnings ?? [],
@@ -670,7 +719,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 					.insert(resource.table)
 					.values(row as never)
 					.returning();
-				const compiled = await recompileIfNeeded(transaction, organizationId, resource.tableName);
+				const compiled = await settle(transaction, organizationId, resource, "create");
 				return {
 					row: inserted[0] as Record<string, unknown>,
 					warnings: compiled?.warnings ?? [],
@@ -705,7 +754,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 					.set(withUpdateDefaults(resource.table, values) as never)
 					.where(and(eq(rowId(resource), id), eq(resource.parentColumn, parentId)))
 					.returning();
-				const compiled = await recompileIfNeeded(transaction, organizationId, resource.tableName);
+				const compiled = await settle(transaction, organizationId, resource, "update");
 				return {
 					row: (updated[0] ?? existing) as Record<string, unknown>,
 					warnings: compiled?.warnings ?? [],
@@ -733,7 +782,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 				await transaction
 					.delete(resource.table)
 					.where(and(eq(rowId(resource), id), eq(resource.parentColumn, parentId)));
-				const compiled = await recompileIfNeeded(transaction, organizationId, resource.tableName);
+				const compiled = await settle(transaction, organizationId, resource, "remove");
 				return {
 					row: { id },
 					warnings: compiled?.warnings ?? [],
@@ -809,7 +858,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 					.from(resource.table)
 					.where(eq(resource.parentColumn, parentId))
 					.orderBy(...resource.orderBy.map((column) => asc(column)))) as Record<string, unknown>[];
-				const compiled = await recompileIfNeeded(transaction, organizationId, resource.tableName);
+				const compiled = await settle(transaction, organizationId, resource, "reorder");
 				return {
 					row: reordered,
 					warnings: compiled?.warnings ?? [],

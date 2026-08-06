@@ -4,6 +4,7 @@ import { useForm } from "@tanstack/react-form";
 import { useState } from "react";
 import { DestinationPicker } from "~/components/pbx/destination-picker";
 import { EntityFormDialog, FormSection } from "~/components/pbx/entity-form-dialog";
+import { PromptSelect } from "~/components/pbx/resource-select";
 import { SwitchField, TextField } from "~/components/ui/form-fields";
 import { useServerFieldErrors } from "~/lib/forms/server-errors";
 import { PBX_RESOURCES } from "~/lib/pbx/client";
@@ -40,6 +41,10 @@ function defaultsFor(menu: IvrMenuRow | null): IvrMenuFormValues {
 		maxDigits: menu?.maxDigits === undefined ? "" : String(menu.maxDigits),
 		maxFailures: menu?.maxFailures === undefined ? "" : String(menu.maxFailures),
 		maxTimeouts: menu?.maxTimeouts === undefined ? "" : String(menu.maxTimeouts),
+		greetingPromptId: menu?.greetingPromptId ?? "",
+		shortGreetingPromptId: menu?.shortGreetingPromptId ?? "",
+		invalidPromptId: menu?.invalidPromptId ?? "",
+		timeoutPromptId: menu?.timeoutPromptId ?? "",
 		directDialEnabled: menu?.directDialEnabled ?? false,
 		enabled: menu?.enabled ?? true,
 	};
@@ -99,6 +104,17 @@ export function IvrMenuDialog({
 				maxDigits: parsed.maxDigits ?? undefined,
 				maxFailures: parsed.maxFailures ?? undefined,
 				maxTimeouts: parsed.maxTimeouts ?? undefined,
+				/**
+				 * `null` where the numbers above send `undefined`, and the difference is the column's:
+				 * the timing knobs are `.optional()` with a server default, so a blank one is left
+				 * alone, while the four prompt columns are `.nullish()` and a cleared selector has to
+				 * reach the database as `null` or the menu keeps playing a recording the operator just
+				 * removed from it.
+				 */
+				greetingPromptId: parsed.greetingPromptId,
+				shortGreetingPromptId: parsed.shortGreetingPromptId,
+				invalidPromptId: parsed.invalidPromptId,
+				timeoutPromptId: parsed.timeoutPromptId,
 				directDialEnabled: parsed.directDialEnabled,
 				enabled: parsed.enabled,
 				...writeDestination(timeoutDestination, "timeout"),
@@ -171,6 +187,68 @@ export function IvrMenuDialog({
 							description="Optional. Lets staff dial the menu directly."
 							disabled={mutation.isPending}
 							submitError={errors.extensionNumber}
+						/>
+					)}
+				</form.Field>
+			</FormSection>
+
+			<FormSection
+				title="What the caller hears"
+				description="Every one of these is optional. A menu with none of them answers in silence and waits for a digit, which is occasionally deliberate and usually not."
+			>
+				<form.Field name="greetingPromptId">
+					{(field) => (
+						<PromptSelect
+							id="ivrGreetingPromptId"
+							label="Greeting"
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="Say nothing"
+							description="Played once when the call arrives. Usually the recording that lists the options."
+							disabled={mutation.isPending}
+							error={errors.greetingPromptId}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="shortGreetingPromptId">
+					{(field) => (
+						<PromptSelect
+							id="ivrShortGreetingPromptId"
+							label="Short greeting"
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="Repeat the greeting"
+							description="Played on every re-prompt after the first, so a caller who mis-keys does not sit through the whole menu again."
+							disabled={mutation.isPending}
+							error={errors.shortGreetingPromptId}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="invalidPromptId">
+					{(field) => (
+						<PromptSelect
+							id="ivrInvalidPromptId"
+							label="Wrong key"
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="Say nothing and re-prompt"
+							description="Played when the caller presses something the menu has no option for."
+							disabled={mutation.isPending}
+							error={errors.invalidPromptId}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="timeoutPromptId">
+					{(field) => (
+						<PromptSelect
+							id="ivrTimeoutPromptId"
+							label="No key at all"
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="Say nothing and re-prompt"
+							description="Played when the caller stays silent past the wait below."
+							disabled={mutation.isPending}
+							error={errors.timeoutPromptId}
 						/>
 					)}
 				</form.Field>

@@ -4,6 +4,7 @@ import { useForm } from "@tanstack/react-form";
 import { useState } from "react";
 import { DestinationPicker } from "~/components/pbx/destination-picker";
 import { EntityFormDialog, FormSection } from "~/components/pbx/entity-form-dialog";
+import { PromptSelect, ResourceSelect } from "~/components/pbx/resource-select";
 import { SelectField, SwitchField, TextField } from "~/components/ui/form-fields";
 import { useServerFieldErrors } from "~/lib/forms/server-errors";
 import { PBX_RESOURCES } from "~/lib/pbx/client";
@@ -42,6 +43,9 @@ function defaultsFor(group: RingGroupRow | null): RingGroupFormValues {
 		callerIdNamePrefix: group?.callerIdNamePrefix ?? "",
 		ignoreBusy: group?.ignoreBusy ?? false,
 		confirmEnabled: group?.confirmEnabled ?? false,
+		confirmPromptId: group?.confirmPromptId ?? "",
+		mohClassId: group?.mohClassId ?? "",
+		ringbackPromptId: group?.ringbackPromptId ?? "",
 		enabled: group?.enabled ?? true,
 	};
 }
@@ -91,6 +95,14 @@ export function RingGroupDialog({
 				callerIdNamePrefix: parsed.callerIdNamePrefix,
 				ignoreBusy: parsed.ignoreBusy,
 				confirmEnabled: parsed.confirmEnabled,
+				/**
+				 * `null` rather than an absent key when a selector is emptied. These three columns are
+				 * `z.uuid().nullish()`, so `null` clears them — which is what "None" in the control
+				 * means, and what an absent key would silently refuse to do.
+				 */
+				confirmPromptId: parsed.confirmPromptId,
+				mohClassId: parsed.mohClassId,
+				ringbackPromptId: parsed.ringbackPromptId,
 				enabled: parsed.enabled,
 				...writeDestination(timeoutDestination, "timeout"),
 			};
@@ -219,6 +231,41 @@ export function RingGroupDialog({
 				errors={errors}
 			/>
 
+			<FormSection
+				title="What the caller hears"
+				description="While the group rings, the caller gets one of these instead of a plain ringing tone — or the tone itself if neither is set."
+			>
+				<form.Field name="mohClassId">
+					{(field) => (
+						<ResourceSelect
+							id="ringGroupMohClassId"
+							label="Hold music"
+							resource={PBX_RESOURCES.mohClasses}
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="The organization default"
+							description="A whole class, played on a loop for as long as the group rings."
+							disabled={mutation.isPending}
+							error={errors.mohClassId}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="ringbackPromptId">
+					{(field) => (
+						<PromptSelect
+							id="ringbackPromptId"
+							label="Ringback"
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="The normal ringing tone"
+							description="One recording, played in place of the ringing tone."
+							disabled={mutation.isPending}
+							error={errors.ringbackPromptId}
+						/>
+					)}
+				</form.Field>
+			</FormSection>
+
 			<FormSection title="Behaviour" columns={1}>
 				<form.Field name="ignoreBusy">
 					{(field) => (
@@ -236,6 +283,20 @@ export function RingGroupDialog({
 							label="Ask the member to confirm"
 							description="The member presses a key to accept, so a voicemail box cannot answer for them."
 							disabled={mutation.isPending}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="confirmPromptId">
+					{(field) => (
+						<PromptSelect
+							id="confirmPromptId"
+							label="Confirmation prompt"
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="The system's own wording"
+							description="What the answering member hears before they press a key. Only reached with confirmation switched on, but stored either way."
+							disabled={mutation.isPending}
+							error={errors.confirmPromptId}
 						/>
 					)}
 				</form.Field>

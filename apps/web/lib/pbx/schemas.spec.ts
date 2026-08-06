@@ -9,6 +9,7 @@ import {
 	greetingUploadFormSchema,
 	inboundRouteFormSchema,
 	internalNumber,
+	ivrMenuFormSchema,
 	keypadPinIssue,
 	mohClassFormSchema,
 	mohClassName,
@@ -20,6 +21,7 @@ import {
 	queueAgentFormSchema,
 	queueFormSchema,
 	queueTierFormSchema,
+	ringGroupFormSchema,
 	timeRuleFormSchema,
 	timezoneName,
 	voicemailBoxFormSchema,
@@ -82,6 +84,7 @@ describe("optional text", () => {
 			recordPolicy: "none",
 			callTimeoutSeconds: "",
 			maxRegistrations: "",
+			mohClassId: "",
 			voicemailEnabled: true,
 			doNotDisturb: false,
 			enabled: true,
@@ -107,6 +110,7 @@ describe("optional text", () => {
 			recordPolicy: "none" as const,
 			callTimeoutSeconds: "",
 			maxRegistrations: "",
+			mohClassId: "",
 			voicemailEnabled: true,
 			doNotDisturb: false,
 			enabled: true,
@@ -129,6 +133,7 @@ describe("optional text", () => {
 			recordPolicy: "none" as const,
 			callTimeoutSeconds: "4",
 			maxRegistrations: "",
+			mohClassId: "",
 			voicemailEnabled: true,
 			doNotDisturb: false,
 			enabled: true,
@@ -343,6 +348,9 @@ describe("queueFormSchema", () => {
 		name: "Support",
 		extensionNumber: "",
 		strategy: "longest-idle" as const,
+		mohClassId: "",
+		greetingPromptId: "",
+		announcePromptId: "",
 		maxWaitSeconds: "",
 		maxWaitNoAgentSeconds: "",
 		wrapUpSeconds: "",
@@ -475,6 +483,7 @@ describe("conferenceFormSchema", () => {
 		name: "All hands",
 		roomNumber: "8000",
 		maxMembers: "",
+		mohClassId: "",
 		recordEnabled: false,
 		announceJoinLeave: true,
 		waitForModerator: false,
@@ -511,6 +520,7 @@ describe("parkLotFormSchema", () => {
 		slotStart: "701",
 		slotEnd: "720",
 		timeoutSeconds: "",
+		mohClassId: "",
 		enabled: true,
 	};
 
@@ -720,7 +730,9 @@ describe("emergencyAddressFormSchema", () => {
 		expect(emergencyAddressFormSchema.safeParse({ ...base, locationDetail: "" }).success).toBe(
 			true,
 		);
-		expect(emergencyAddressFormSchema.parse({ ...base, locationDetail: "" }).locationDetail).toBeNull();
+		expect(
+			emergencyAddressFormSchema.parse({ ...base, locationDetail: "" }).locationDetail,
+		).toBeNull();
 	});
 
 	it("refuses a country code that is not two letters", () => {
@@ -762,10 +774,183 @@ describe("phoneNumberFormSchema, now carrying a dispatchable location", () => {
 
 	it("keeps an assigned address", () => {
 		const id = "019fd5fb-de54-700b-8826-8cf8ab5199af";
-		expect(phoneNumberFormSchema.parse({ ...base, emergencyAddressId: id }).emergencyAddressId).toBe(
-			id,
-		);
+		expect(
+			phoneNumberFormSchema.parse({ ...base, emergencyAddressId: id }).emergencyAddressId,
+		).toBe(id);
 	});
+});
+
+// ---------------------------------------------------------------------------------------------
+// The audio selectors: every column that names a hold-music class or a prompt
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The complete set of `moh_class` and `prompt` references on a PBX form, held in one table.
+ *
+ * A table rather than twelve near-identical `it` blocks, because the claim being made is the same
+ * for every one of them and the risk being guarded against is a column being ADDED to the schema
+ * with the wrong helper. A loop over a list that names each column is the only shape where adding
+ * the thirteenth means adding one line here rather than remembering that this file exists.
+ *
+ * The bases carry a blank string in every selector, which is what `defaultsFor(null)` produces in
+ * each dialog — so what these tests parse is what a freshly opened create form would submit.
+ */
+const AUDIO_REFERENCE_FORMS = [
+	{
+		label: "extensionFormSchema",
+		schema: extensionFormSchema,
+		base: {
+			number: "1001",
+			label: "Alice",
+			sipSecretRef: "secret://x",
+			callerIdName: "",
+			callerIdNumber: "",
+			outboundCallerIdNumber: "",
+			tollClass: "national",
+			recordPolicy: "none",
+			callTimeoutSeconds: "",
+			maxRegistrations: "",
+			mohClassId: "",
+			voicemailEnabled: true,
+			doNotDisturb: false,
+			enabled: true,
+		},
+		columns: ["mohClassId"],
+	},
+	{
+		label: "queueFormSchema",
+		schema: queueFormSchema,
+		base: {
+			name: "Support",
+			extensionNumber: "",
+			strategy: "longest-idle",
+			mohClassId: "",
+			greetingPromptId: "",
+			announcePromptId: "",
+			maxWaitSeconds: "",
+			maxWaitNoAgentSeconds: "",
+			wrapUpSeconds: "",
+			announcePositionEnabled: false,
+			announceFrequencySeconds: "",
+			abandonedResumeAllowed: false,
+			discardAbandonedAfterSeconds: "",
+			tierRulesApply: true,
+			tierRuleWaitSeconds: "",
+			tierRuleNoAgentNoWait: false,
+			recordEnabled: false,
+			enabled: true,
+		},
+		columns: ["mohClassId", "greetingPromptId", "announcePromptId"],
+	},
+	{
+		label: "ringGroupFormSchema",
+		schema: ringGroupFormSchema,
+		base: {
+			name: "Sales",
+			extensionNumber: "",
+			strategy: "simultaneous",
+			ringTimeoutSeconds: "",
+			callerIdNamePrefix: "",
+			ignoreBusy: false,
+			confirmEnabled: false,
+			confirmPromptId: "",
+			mohClassId: "",
+			ringbackPromptId: "",
+			enabled: true,
+		},
+		columns: ["confirmPromptId", "mohClassId", "ringbackPromptId"],
+	},
+	{
+		label: "ivrMenuFormSchema",
+		schema: ivrMenuFormSchema,
+		base: {
+			name: "Main menu",
+			extensionNumber: "",
+			digitTimeoutMs: "",
+			interDigitTimeoutMs: "",
+			maxDigits: "",
+			maxFailures: "",
+			maxTimeouts: "",
+			greetingPromptId: "",
+			shortGreetingPromptId: "",
+			invalidPromptId: "",
+			timeoutPromptId: "",
+			directDialEnabled: false,
+			enabled: true,
+		},
+		columns: ["greetingPromptId", "shortGreetingPromptId", "invalidPromptId", "timeoutPromptId"],
+	},
+	{
+		label: "conferenceFormSchema",
+		schema: conferenceFormSchema,
+		base: {
+			name: "All hands",
+			roomNumber: "8000",
+			maxMembers: "",
+			mohClassId: "",
+			recordEnabled: false,
+			announceJoinLeave: true,
+			waitForModerator: false,
+			enabled: true,
+		},
+		columns: ["mohClassId"],
+	},
+	{
+		label: "parkLotFormSchema",
+		schema: parkLotFormSchema,
+		base: {
+			name: "Reception",
+			slotStart: "701",
+			slotEnd: "720",
+			timeoutSeconds: "",
+			mohClassId: "",
+			enabled: true,
+		},
+		columns: ["mohClassId"],
+	},
+] as const;
+
+describe("optionalReference, on every column that names a class or a prompt", () => {
+	const id = "019fd5fb-de54-700b-8826-8cf8ab5199af";
+
+	/**
+	 * The behaviour change these tests exist to pin down.
+	 *
+	 * Before there was a picker, these columns were absent from the schemas entirely, so a save left
+	 * whatever was stored alone. Now an emptied selector means "play nothing" and has to reach the
+	 * server as `null` — an absent key would let an operator clear the hold music, press Save, and
+	 * hear the old class on the next call with nothing on screen disagreeing.
+	 */
+	for (const form of AUDIO_REFERENCE_FORMS) {
+		it(`${form.label}: an emptied selector parses to null, not to "" and not to undefined`, () => {
+			const parsed = form.schema.parse(form.base) as Record<string, unknown>;
+			for (const column of form.columns) {
+				expect(parsed[column]).toBeNull();
+			}
+		});
+
+		it(`${form.label}: a chosen row survives the parse unchanged`, () => {
+			for (const column of form.columns) {
+				const parsed = form.schema.parse({ ...form.base, [column]: id }) as Record<string, unknown>;
+				expect(parsed[column]).toBe(id);
+			}
+		});
+
+		/**
+		 * Anything that is not a uuid in one of these controls is a bug in this app — the options ARE
+		 * ids — so it is refused here rather than sent for the server to answer with a 400 that names
+		 * no field. Surrounding whitespace is trimmed first, because a select whose value was pasted
+		 * in by a test or a browser extension should not fail on it.
+		 */
+		it(`${form.label}: refuses a value that is not a uuid`, () => {
+			for (const column of form.columns) {
+				expect(form.schema.safeParse({ ...form.base, [column]: "the-default-one" }).success).toBe(
+					false,
+				);
+				expect(form.schema.safeParse({ ...form.base, [column]: ` ${id} ` }).success).toBe(true);
+			}
+		});
+	}
 });
 
 // ---------------------------------------------------------------------------------------------

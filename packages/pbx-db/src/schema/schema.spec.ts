@@ -108,6 +108,15 @@ describe("tenant tables", () => {
 		// impossible at the moment of the write, and therefore what makes the `did-index` KV bucket
 		// safe to treat as a projection with one writer per key.
 		"phone_number_e164_global_key",
+		// The projection outbox's two sweeper indexes. Leading with `organization_id` would be
+		// actively wrong here: the sweeper's question is "which tenants are owed a publish?", asked by
+		// a platform process that has no session organization and runs on the untenanted handle. An
+		// organization-first index could only be scanned in full for that query, while the partial
+		// index below is the size of the backlog — normally empty, because the fast path marks its own
+		// row within milliseconds of the commit.
+		"pbx_projection_outbox_pending_idx",
+		// Retention prunes published rows by age, across every tenant, for the same reason.
+		"pbx_projection_outbox_published_idx",
 	]);
 
 	it("leads every composite index with organization_id so the tenant predicate is usable", () => {

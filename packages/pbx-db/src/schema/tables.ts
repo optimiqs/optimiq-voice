@@ -6,6 +6,7 @@ import { callBlockRule, featureCode } from "./features-schema";
 import { ivrMenu, ivrMenuOption } from "./ivr-schema";
 import { mohClass, prompt } from "./media-schema";
 import { phoneNumber } from "./numbers-schema";
+import { projectionOutbox } from "./outbox-schema";
 import { queue, queueAgent, queueTier } from "./queues-schema";
 import { ringGroup, ringGroupDestination } from "./ring-groups-schema";
 import { inboundRoute, outboundRoute } from "./routing-schema";
@@ -48,6 +49,7 @@ export const pbxTables = {
 	outboundRoute,
 	parkLot,
 	phoneNumber,
+	projectionOutbox,
 	prompt,
 	queue,
 	queueAgent,

@@ -40,11 +40,20 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
  * ## Published after the commit, and a failure is not fatal
  *
  * Identical reasoning to `routing-cache.publisher.ts`: publishing inside the transaction would put
- * an index entry for a state that might roll back in front of live calls. The residual window is
- * real and is named here honestly — if the process dies between the commit and the publish, the DID
- * is in the database and not in the bucket, and an inbound call to it is rejected with
- * `INVALID_PROFILE` until the next write for that organization or a run of the rebuild script. It
- * is recorded as a follow-up rather than papered over: closing it needs an outbox, not a retry loop.
+ * an index entry for a state that might roll back in front of live calls.
+ *
+ * The residual window that ordering opens — the process dying between the commit and the publish,
+ * leaving the DID in the database, absent from the bucket, and inbound calls to it rejected with
+ * `INVALID_PROFILE` — is closed by `shared/projection-outbox.ts`, which is the outbox this header
+ * used to say was needed. The obligation is written INSIDE the write transaction; this publish is
+ * the fast path that discharges it in milliseconds; a sweeper republishes whatever the fast path
+ * failed to mark. A publish failure here is therefore still logged and swallowed — the API must not
+ * report "your change was not saved" about a change that was — but it is no longer forgotten.
+ *
+ * `scripts/rebuild-did-index.ts` remains, unchanged, for the failures an outbox cannot repair: a
+ * bucket lost to a fresh cluster, a restored snapshot, a `nats kv del`. So does the conflict path
+ * below, which is a divergence between the database's constraint and the bucket and is a human
+ * decision by design — the sweeper reports it as stuck rather than resolving it.
  */
 @Injectable()
 export class DidIndexPublisher implements OnModuleInit, OnApplicationShutdown {

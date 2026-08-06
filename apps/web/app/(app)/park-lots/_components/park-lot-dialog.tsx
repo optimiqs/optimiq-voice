@@ -4,6 +4,7 @@ import { useForm } from "@tanstack/react-form";
 import { useState } from "react";
 import { DestinationPicker } from "~/components/pbx/destination-picker";
 import { EntityFormDialog, FormSection } from "~/components/pbx/entity-form-dialog";
+import { ResourceSelect } from "~/components/pbx/resource-select";
 import { SwitchField, TextField } from "~/components/ui/form-fields";
 import { useServerFieldErrors } from "~/lib/forms/server-errors";
 import { PBX_RESOURCES } from "~/lib/pbx/client";
@@ -35,6 +36,7 @@ function defaultsFor(lot: ParkLotRow | null): ParkLotFormValues {
 		slotStart: lot === null ? "" : String(lot.slotStart),
 		slotEnd: lot === null ? "" : String(lot.slotEnd),
 		timeoutSeconds: lot?.timeoutSeconds === undefined ? "" : String(lot.timeoutSeconds),
+		mohClassId: lot?.mohClassId ?? "",
 		enabled: lot?.enabled ?? true,
 	};
 }
@@ -81,6 +83,7 @@ export function ParkLotDialog({
 				slotStart: parsed.slotStart,
 				slotEnd: parsed.slotEnd,
 				timeoutSeconds: parsed.timeoutSeconds,
+				mohClassId: parsed.mohClassId,
 				enabled: parsed.enabled,
 				...writeDestination(timeoutDestination, "timeout"),
 			};
@@ -121,7 +124,7 @@ export function ParkLotDialog({
 			error={mutation.error}
 			onSubmit={() => void form.handleSubmit()}
 			size="lg"
-			footerNote="A call-park feature code can pin this lot, or leave the lot empty to park in the first one with a free slot. Music-on-hold is stored on the lot but has no picker yet; saving here leaves it as it is."
+			footerNote="A call-park feature code can pin this lot, or leave the lot empty to park in the first one with a free slot."
 		>
 			<FormSection title="Lot">
 				<form.Field name="name">
@@ -173,6 +176,22 @@ export function ParkLotDialog({
 							description="How long a call may sit here before the destination below is taken."
 							disabled={mutation.isPending}
 							submitError={errors.timeoutSeconds}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="mohClassId">
+					{(field) => (
+						<ResourceSelect
+							id="parkLotMohClassId"
+							label="Hold music"
+							resource={PBX_RESOURCES.mohClasses}
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="The organization default"
+							description="What a parked caller listens to for the whole time they are waiting to be picked back up."
+							disabled={mutation.isPending}
+							error={errors.mohClassId}
+							className="sm:col-span-2"
 						/>
 					)}
 				</form.Field>

@@ -1678,9 +1678,7 @@ async function main(): Promise<void> {
 		);
 
 		const smokePlayUrl = await client("POST", `/api/v1/prompts/${smokeFileId}/play-url`);
-		const smokeMediaPath = String(
-			(data(smokePlayUrl) as { url?: unknown }).url ?? "",
-		);
+		const smokeMediaPath = String((data(smokePlayUrl) as { url?: unknown }).url ?? "");
 		check(
 			"minting a preview link answers with a path the player can use verbatim",
 			smokePlayUrl.status === 201 && smokeMediaPath.startsWith("/api/v1/prompts/media?token="),
@@ -1816,6 +1814,104 @@ async function main(): Promise<void> {
 		});
 		await client("DELETE", `/api/v1/emergency-addresses/${smokeAddressId}`);
 		await client("DELETE", `/api/v1/phone-numbers/${smokeE911NumberId}`);
+
+		/**
+		 * The hold-music SELECTOR, end to end: the entity forms can now choose a class, and this is
+		 * the claim that choosing one reaches the engine.
+		 *
+		 * A queue of its own, created here. The one section 11 built was deleted in section 15, above,
+		 * and a smoke that depended on that ordering would start failing for a reason that has nothing
+		 * to do with hold music.
+		 *
+		 * ## What can honestly be asserted at this level, and what cannot
+		 *
+		 * Not the artifact. `POST /routing/compile` deliberately answers with
+		 * `{organizationId, snapshotHash, compiledAt, cacheKey, published, warnings}` and NOT the
+		 * compiled plan — `routing.service.ts` explains why, and the reason is that a large tenant's
+		 * artifact is megabytes of JSON nobody asked for. The smoke also runs no NATS broker, so the
+		 * KV bucket the artifact is published into cannot be read back either.
+		 *
+		 * What is left is a HASH DELTA, and it is a real proof rather than a consolation prize:
+		 * `snapshotHash` is SHA-256 over the canonical form of the compiler's INPUT, and two snapshots
+		 * hash the same exactly when they compile to the same artifact. So a hash that moves when the
+		 * queue is pointed at a class means the assignment is an input to the plan; a hash that moves
+		 * again when only the class's NAME changes means the name is in there too — which is the fact
+		 * that matters on a call, because a media server addresses a class by name and answers a UUID
+		 * by silently playing its own default.
+		 */
+		const mohQueue = await client("POST", "/api/v1/queues", {
+			name: `Smoke MOH queue ${RUN_ID}`,
+			extensionNumber: `6${RUN_DIGITS}`,
+			strategy: "longest-idle",
+			enabled: true,
+		});
+		const mohQueueId = rowId(mohQueue);
+		check(
+			"a queue for the hold-music round trip is created",
+			mohQueue.status === 201,
+			`status ${mohQueue.status}`,
+		);
+
+		const beforeAssign = await client("POST", "/api/v1/routing/compile", {});
+		const hashBeforeAssign = String(data(beforeAssign).snapshotHash ?? "");
+
+		const mohAssigned = await client("PATCH", `/api/v1/queues/${mohQueueId}`, {
+			mohClassId: smokeMohClassId,
+		});
+		check(
+			"the queue dialog's hold-music selector writes through a plain PATCH and echoes the id",
+			mohAssigned.status === 200 && data(mohAssigned).mohClassId === smokeMohClassId,
+			`status ${mohAssigned.status}, mohClassId ${String(data(mohAssigned).mohClassId)}`,
+		);
+
+		const afterAssign = await client("POST", "/api/v1/routing/compile", {});
+		const hashAfterAssign = String(data(afterAssign).snapshotHash ?? "");
+		check(
+			"assigning a class changes the snapshot hash, so the assignment reaches the plan",
+			afterAssign.status === 200 &&
+				hashAfterAssign.length > 0 &&
+				hashAfterAssign !== hashBeforeAssign,
+			`${hashBeforeAssign.slice(0, 12)} -> ${hashAfterAssign.slice(0, 12)}`,
+		);
+
+		const mohRenamed = await client("PATCH", `/api/v1/moh-classes/${smokeMohClassId}`, {
+			name: `smoke-hold-renamed-${RUN_ID}`,
+		});
+		const afterRename = await client("POST", "/api/v1/routing/compile", {});
+		const hashAfterRename = String(data(afterRename).snapshotHash ?? "");
+		check(
+			"renaming the class changes it again, so the NAME the media server needs is an input too",
+			mohRenamed.status === 200 &&
+				afterRename.status === 200 &&
+				hashAfterRename.length > 0 &&
+				hashAfterRename !== hashAfterAssign,
+			`${hashAfterAssign.slice(0, 12)} -> ${hashAfterRename.slice(0, 12)}`,
+		);
+
+		/**
+		 * The `scalarReferences` guard. The foreign key is `on delete set null`, so without this the
+		 * database would take the delete and quietly return the queue to the media server's default
+		 * class — the kind of change nobody notices until a caller mentions the hold music changed.
+		 */
+		const mohClassRefused = await client("DELETE", `/api/v1/moh-classes/${smokeMohClassId}`);
+		const mohClassReferences = pbxReferences(asApiError(mohClassRefused));
+		check(
+			"deleting a class a queue plays is refused, naming the queue",
+			mohClassRefused.status === 409 &&
+				pbxErrorCode(asApiError(mohClassRefused)) === "PBX_REFERENCED" &&
+				mohClassReferences.some((reference) => reference.kind === "queue"),
+			`status ${mohClassRefused.status}, ${mohClassReferences.map((r) => r.kind).join(", ")}`,
+		);
+
+		const mohCleared = await client("PATCH", `/api/v1/queues/${mohQueueId}`, {
+			mohClassId: null,
+		});
+		check(
+			"an emptied selector sends null and actually clears the column",
+			mohCleared.status === 200 && data(mohCleared).mohClassId === null,
+			`status ${mohCleared.status}, mohClassId ${JSON.stringify(data(mohCleared).mohClassId)}`,
+		);
+		await client("DELETE", `/api/v1/queues/${mohQueueId}`);
 
 		await client("DELETE", `/api/v1/moh-classes/${smokeMohClassId}/files/${smokeFileId}`);
 		await client("DELETE", `/api/v1/moh-classes/${smokeMohClassId}`);

@@ -240,6 +240,16 @@ export interface ExtensionRow extends EntityRow {
 	readonly tollClass: TollClass;
 	readonly callTimeoutSeconds: number;
 	readonly maxRegistrations: number;
+	/**
+	 * Which hold-music class this extension's own holds play from.
+	 *
+	 * It is the extension putting somebody on hold that this governs, not the extension being
+	 * held — a call parked or transferred BY this endpoint plays this class, and `null` falls back
+	 * to the organization's default class. The column has always been on the row and in the API's
+	 * DTO; it was missing from this interface until the class list had a CRUD endpoint to select
+	 * from, which meant TypeScript quietly agreed that a `PATCH` could not carry it.
+	 */
+	readonly mohClassId: string | null;
 	readonly codecOverride: string | null;
 	readonly enabled: boolean;
 }
@@ -665,6 +675,16 @@ export interface MohClassRow extends EntityRow {
 export interface PromptRow extends EntityRow {
 	readonly name: string;
 	readonly kind: PromptKind;
+	/**
+	 * Which class this file BELONGS to — the media library's own relation, and the one column named
+	 * `mohClassId` in this file that is not a form selector.
+	 *
+	 * Every other `mohClassId` on a PBX row points OUT of that row at a class ("play this while the
+	 * caller waits") and now has a picker on its entity form. This one points the other way: it is
+	 * how a `moh`-kind prompt is filed under the class whose loop it is part of, and it is set by
+	 * uploading the file into a class rather than by choosing a class for the file. See
+	 * `app/(app)/media/_components/moh-files-dialog.tsx`, which is the whole of its user interface.
+	 */
 	readonly mohClassId: string | null;
 	readonly objectKey: string;
 	readonly contentType: string;
