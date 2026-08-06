@@ -20,6 +20,16 @@ const apiOrigin = (process.env.API_PROXY_ORIGIN ?? "http://127.0.0.1:50051").rep
 const nextConfig = {
 	reactStrictMode: true,
 	poweredByHeader: false,
+	/**
+	 * Emits `.next/standalone` — a self-contained server with only the traced `node_modules` it
+	 * actually reaches. This is what `apps/web/Dockerfile` ships: a pnpm workspace install cannot be
+	 * copied into a runtime image the way `pnpm deploy --prod` handles the backend services, because
+	 * the symlinked store does not survive the copy and Next's server is not a plain library graph.
+	 *
+	 * Paths inside the output are relative to `outputFileTracingRoot` below, so the entrypoint is
+	 * `.next/standalone/apps/web/server.js`, not `.next/standalone/server.js`.
+	 */
+	output: "standalone",
 	outputFileTracingRoot: new URL("../../", import.meta.url).pathname,
 	experimental: {
 		optimizePackageImports: ["@base-ui/react", "@tanstack/react-query", "@tanstack/react-table"],

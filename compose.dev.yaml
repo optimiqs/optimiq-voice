@@ -1,21 +1,17 @@
 services:
-  dashboard:
+  # `dashboard` is deliberately absent: the legacy React Router app is no longer part of the stack.
+  # Its source and Dockerfile are untouched, so `docker build -f apps/dashboard/Dockerfile .` still
+  # works for anyone who needs it — it just is not wired up any more.
+  web:
     build:
       context: .
-      dockerfile: ./apps/dashboard/Dockerfile
+      dockerfile: ./apps/web/Dockerfile
       args:
-        - DASHBOARD_EDITION
-        - DASHBOARD_API_URL
-        - DASHBOARD_ALLOW_INSECURE
-        - DASHBOARD_AUTH_GITHUB_ENABLED
-        - DASHBOARD_AUTH_GITHUB_CLIENT_ID
-        - DASHBOARD_AUTH_GITHUB_URL
-        - DASHBOARD_AUTH_GITHUB_CALLBACK_URL
+        # Both are compiled into the image rather than read at boot. Rebuild to change either.
+        - API_PROXY_ORIGIN=${API_PROXY_ORIGIN:-http://api:9876}
+        - NEXT_PUBLIC_AUTH_BASE_URL=${NEXT_PUBLIC_AUTH_BASE_URL:-}
     ports:
-      - 3030:3030
-    environment:
-      - NODE_ENV
-      - SERVER_DASHBOARD_SESSION_SECRET
+      - 3100:3100
 
   api:
     build:

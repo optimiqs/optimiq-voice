@@ -71,7 +71,7 @@ static_resources:
                         - match:
                             prefix: "/"
                           route:
-                            cluster: dashboard-cluster
+                            cluster: web-cluster
                             timeout: 0s
                       cors:
                         allow_origin_string_match:
@@ -144,16 +144,16 @@ static_resources:
                     socket_address:
                       address: api
                       port_value: 9876
-    - name: dashboard-cluster
+    - name: web-cluster
       type: logical_dns
       connect_timeout: 20s
       lb_policy: round_robin
       load_assignment:
-        cluster_name: dashboard-cluster
+        cluster_name: web-cluster
         endpoints:
           - lb_endpoints:
               - endpoint:
                   address:
                     socket_address:
-                      address: dashboard
-                      port_value: 3030
+                      address: web
+                      port_value: 3100

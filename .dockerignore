@@ -21,6 +21,11 @@ node_modules
 **/coverage
 **/build
 **/tsconfig.tsbuildinfo
+# Next.js and turbo caches. apps/web/.next alone is hundreds of megabytes after a local build, and
+# shipping it into the context would also let a stale local build shadow the one made in the image.
+**/.next
+**/.turbo
+**/.react-router
 
 # Test files
 **/test
