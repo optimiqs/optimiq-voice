@@ -2058,6 +2058,190 @@ async function main(): Promise<void> {
 				await connection.drain();
 			}
 		}
+
+		// --- 11. the change ledger ---------------------------------------------------------------
+		//
+		// `audit_log` is the append-only ledger `security-schema.ts` describes: the tenant role holds
+		// SELECT and INSERT and nothing else, under two policies rather than one `FOR ALL`, so
+		// neither a bug nor a compromised runtime principal can rewrite history. Until this run it
+		// had no writer at all.
+		//
+		// The write is INSIDE the mutation's transaction, and that is what the last two checks in
+		// this section are for: a rolled-back write must leave no row, and a committed one must
+		// leave exactly one. Nothing else can prove that — an after-commit writer passes every
+		// other check here and still records changes that never happened.
+		//
+		// Outside the NATS gate on purpose: the ledger has nothing to do with a broker, and a
+		// developer machine without Docker is exactly where a regression here would hide.
+		console.log("\n11. the change ledger (audit_log)");
+		{
+			const { createPbxDatabaseClient: openAudit, sql: auditSql } =
+				await import("@optimiq-voice/pbx-db");
+			const auditDb = openAudit({
+				url: pbxDatabaseUrl,
+				applicationName: "verify-pbx-audit",
+				poolMaxConnectionsOverride: 2,
+			});
+
+			interface LedgerRow {
+				action: string;
+				resource_type: string;
+				resource_ref: string | null;
+				actor_type: string;
+				actor_user_id: string | null;
+				before: Record<string, unknown> | null;
+				after: Record<string, unknown> | null;
+			}
+
+			/** The tenant's own rows, read THROUGH RLS — the same way anything else would read them. */
+			const ledger = async (organizationId: string): Promise<LedgerRow[]> =>
+				await auditDb.withTenantScope(organizationId, async (transaction) => {
+					const result = await transaction.execute(
+						auditSql`select "action", "resource_type", "resource_ref", "actor_type",
+								"actor_user_id", "before", "after"
+							from "audit_log" order by "occurred_at"`,
+					);
+					return (
+						Array.isArray(result) ? result : ((result as { rows?: unknown[] }).rows ?? [])
+					) as LedgerRow[];
+				});
+
+			try {
+				const owners = await sql`select "id" from "user" where "email" = ${ownerEmail}`;
+				const ownerUserId = String((owners[0] as { id?: string } | undefined)?.id ?? "");
+
+				const rowsA = await ledger(organizationA);
+				check(
+					"every write in §2–§10 left a ledger row",
+					rowsA.length > 0,
+					`${String(rowsA.length)} row(s)`,
+				);
+				check(
+					"the ledger names the actor from the session, not a service account",
+					rowsA.length > 0 &&
+						rowsA.every((row) => row.actor_type === "user" && row.actor_user_id === ownerUserId),
+					`actor ${String(rowsA[0]?.actor_type)} / ${String(rowsA[0]?.actor_user_id)}`,
+				);
+				check(
+					"the ledger's verbs are the resource kind plus the action",
+					rowsA.some((row) => row.action === "extension.create") &&
+						rowsA.some((row) => row.action === "extension.update") &&
+						rowsA.some((row) => row.action === "extension.delete"),
+					[...new Set(rowsA.map((row) => row.action))].sort().slice(0, 6).join(", "),
+				);
+				check(
+					"a settings save is recorded like any other write",
+					rowsA.some((row) => row.resource_type === "org_setting"),
+					String(rowsA.filter((row) => row.resource_type === "org_setting").length),
+				);
+
+				// RLS, not a `where` clause: organization B holds SELECT on the same table and sees
+				// nothing of A's, which is the property that makes the ledger safe to expose later.
+				const rowsB = await ledger(organizationB);
+				check(
+					"another tenant cannot read this tenant's ledger",
+					rowsB.every((row) => row.actor_user_id !== ownerUserId),
+					`${String(rowsB.length)} row(s) visible to B`,
+				);
+
+				// --- the diff is the changed columns, and a secret is a NAME without a value -------
+				const ledgerExtension = await clientA("POST", "/api/v1/extensions", {
+					number: "1901",
+					label: "Ledger subject",
+					sipSecretRef: "secret://verify/ledger",
+				});
+				const ledgerExtensionId = id(ledgerExtension);
+				check(
+					"a fresh extension to watch through the ledger",
+					ledgerExtension.status === 201 && ledgerExtensionId.length > 0,
+					`status ${String(ledgerExtension.status)}`,
+				);
+				await clientA("PATCH", `/api/v1/extensions/${ledgerExtensionId}`, {
+					label: "Ledger subject renamed",
+				});
+				const afterRename = (await ledger(organizationA)).filter(
+					(row) => row.resource_ref === ledgerExtensionId,
+				);
+				const renameRow = afterRename.find((row) => row.action === "extension.update");
+				check(
+					"an update records only the column that moved",
+					renameRow !== undefined &&
+						Object.keys(renameRow.after ?? {}).join(",") === "label" &&
+						(renameRow.after as { label?: string } | null)?.label === "Ledger subject renamed",
+					JSON.stringify(renameRow?.after),
+				);
+				check(
+					"…and its before is the value that was there",
+					(renameRow?.before as { label?: string } | null)?.label === "Ledger subject",
+					JSON.stringify(renameRow?.before),
+				);
+
+				await clientA("PATCH", `/api/v1/extensions/${ledgerExtensionId}`, {
+					sipSecretRef: "secret://verify/ledger-rotated",
+				});
+				const rotationRows = (await ledger(organizationA)).filter(
+					(row) => row.resource_ref === ledgerExtensionId && row.action === "extension.update",
+				);
+				const rotation = rotationRows.at(-1);
+				check(
+					"rotating a secret is recorded as the column NAME, never the value",
+					rotation !== undefined &&
+						(rotation.after as { sipSecretRef?: string } | null)?.sipSecretRef === "[redacted]" &&
+						!JSON.stringify(rotation).includes("secret://verify/ledger-rotated"),
+					JSON.stringify(rotation?.after),
+				);
+				check(
+					"no ledger row anywhere carries a SIP credential",
+					!JSON.stringify(await ledger(organizationA)).includes("secret://verify/"),
+					"",
+				);
+
+				// --- the in-transaction proof, both directions ------------------------------------
+				//
+				// A create that compile-on-write refuses is rolled back. An after-commit writer would
+				// have already been told "created" by then and would leave a row describing a change
+				// the database does not have; sharing the transaction means the same ROLLBACK removes
+				// both. The mirror case is the check after it: the write that DOES commit leaves
+				// exactly one row, so the ledger is not merely conservative — it is complete.
+				const before = (await ledger(organizationA)).length;
+				const refused = await clientA("POST", "/api/v1/inbound-routes", {
+					e164: RUN_DID,
+					destinationType: "extension",
+					destinationRef: "019fd3c2-dead-7dea-adea-dbeefdeadbee",
+				});
+				const afterRefusal = (await ledger(organizationA)).length;
+				check(
+					"a mutation the compiler refuses is rolled back",
+					refused.status === 422 || refused.status === 400 || refused.status === 409,
+					`status ${String(refused.status)}`,
+				);
+				check(
+					"…and leaves NO ledger row, because the append shares its transaction",
+					afterRefusal === before,
+					`${String(before)} -> ${String(afterRefusal)}`,
+				);
+
+				await clientA("DELETE", `/api/v1/extensions/${ledgerExtensionId}`);
+				const afterDelete = (await ledger(organizationA)).filter(
+					(row) => row.resource_ref === ledgerExtensionId,
+				);
+				const deletion = afterDelete.find((row) => row.action === "extension.delete");
+				check(
+					"a delete records the row as it last was, and no after",
+					deletion !== undefined &&
+						deletion.after === null &&
+						(deletion.before as { label?: string } | null)?.label === "Ledger subject renamed",
+					JSON.stringify(deletion?.before),
+				);
+				check(
+					"one committed write leaves exactly one ledger row",
+					afterDelete.filter((row) => row.action === "extension.delete").length === 1,
+					String(afterDelete.filter((row) => row.action === "extension.delete").length),
+				);
+			} finally {
+				await auditDb.close();
+			}
+		}
 	} finally {
 		console.log("\ncleaning up");
 		try {

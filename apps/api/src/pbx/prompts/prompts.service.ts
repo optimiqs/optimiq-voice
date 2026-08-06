@@ -24,6 +24,7 @@ import {
 	MediaSigningUnavailableException,
 	MediaUploadRejectedException,
 } from "../media/media.errors";
+import { actorFromSession } from "../shared/audit-log";
 import { parseDto } from "../shared/dto";
 import { normalizePagination, paged } from "../shared/pagination";
 import { toWireDiagnostic } from "../shared/pbx.errors";
@@ -226,17 +227,22 @@ export class PromptsService {
 
 		try {
 			const result = await runEffect(this.runtime, (repository) =>
-				repository.create(organizationId, PROMPT_RESOURCE, {
-					name: fields.name ?? audio.fileName,
-					kind: options.kind,
-					mohClassId: mohClassId ?? null,
-					objectKey,
-					contentType: audio.format.contentType,
-					durationMs: audio.durationMs ?? null,
-					sizeBytes: audio.sizeBytes,
-					checksum: checksumOf(audio),
-					...(fields.language === undefined ? {} : { language: fields.language }),
-				}),
+				repository.create(
+					organizationId,
+					PROMPT_RESOURCE,
+					{
+						name: fields.name ?? audio.fileName,
+						kind: options.kind,
+						mohClassId: mohClassId ?? null,
+						objectKey,
+						contentType: audio.format.contentType,
+						durationMs: audio.durationMs ?? null,
+						sizeBytes: audio.sizeBytes,
+						checksum: checksumOf(audio),
+						...(fields.language === undefined ? {} : { language: fields.language }),
+					},
+					actorFromSession(session),
+				),
 			);
 			return {
 				data: result.row,
@@ -263,7 +269,13 @@ export class PromptsService {
 	): Promise<MutationEnvelope<Record<string, unknown>>> {
 		const organizationId = requireActiveOrganizationId(session);
 		const result = await runEffect(this.runtime, (repository) =>
-			repository.update(organizationId, PROMPT_RESOURCE, id, patch as Record<string, unknown>),
+			repository.update(
+				organizationId,
+				PROMPT_RESOURCE,
+				id,
+				patch as Record<string, unknown>,
+				actorFromSession(session),
+			),
 		);
 		return { data: result.row, warnings: result.warnings.map(toWireDiagnostic) };
 	}
@@ -291,7 +303,7 @@ export class PromptsService {
 		});
 
 		const result = await runEffect(this.runtime, (repository) =>
-			repository.remove(organizationId, PROMPT_RESOURCE, id),
+			repository.remove(organizationId, PROMPT_RESOURCE, id, actorFromSession(session)),
 		);
 
 		if (objectKey !== undefined) {

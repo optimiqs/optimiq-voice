@@ -9,6 +9,8 @@ import { ConferencesController } from "./conferences/conferences.controller";
 import { ConferencesService } from "./conferences/conferences.service";
 import { EmergencyAddressesController } from "./emergency-addresses/emergency-addresses.controller";
 import { EmergencyAddressesService } from "./emergency-addresses/emergency-addresses.service";
+import { EmergencyConsumer } from "./emergency-addresses/emergency-consumer.service";
+import { EmergencyNotificationService } from "./emergency-addresses/emergency-notification.service";
 import { ExtensionsController } from "./extensions/extensions.controller";
 import { ExtensionsService } from "./extensions/extensions.service";
 import { FeatureCodesController } from "./feature-codes/feature-codes.controller";
@@ -45,6 +47,7 @@ import { RoutingCachePublisher } from "./routing/routing-cache.publisher";
 import { RoutingRpcController } from "./routing/routing-rpc.controller";
 import { RoutingController } from "./routing/routing.controller";
 import { RoutingService } from "./routing/routing.service";
+import { AuditLogService } from "./shared/audit-log.service";
 import { createPbxDatabase } from "./shared/pbx-database";
 import { loadPbxEnv } from "./shared/pbx-env";
 import { makePbxRepositoryRuntime } from "./shared/pbx-runtime";
@@ -194,6 +197,7 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		QueueMembershipPublisher,
 		AgentStatePublisher,
 		ProjectionOutboxSweeper,
+		AuditLogService,
 		{
 			provide: PBX_EFFECT_RUNTIME,
 			useFactory: (
@@ -202,6 +206,7 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 				didIndex: DidIndexPublisher,
 				queueMembership: QueueMembershipPublisher,
 				env: PbxEnv,
+				audit: AuditLogService,
 			) => {
 				/**
 				 * The fast path's second half: mark the obligation the write recorded.
@@ -237,6 +242,17 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 
 				return makePbxRepositoryRuntime({
 					database,
+					/**
+					 * The change ledger, and the ONE seam here that is inside the write.
+					 *
+					 * `onArtifactCompiled` and `onMutation` above are fire-and-forget continuations of a
+					 * request that already returned; this is not. It is awaited, it shares the mutation's
+					 * transaction, and a failure fails the write — which is the point, and the reason it
+					 * is passed as a plain function rather than being reached for by the repository:
+					 * `audit-log.service.ts` owns the argument, the repository owns the transaction, and
+					 * a spec can assert the seam with neither.
+					 */
+					recordAudit: async (transaction, input) => await audit.recordMutation(transaction, input),
 					/**
 					 * Recorded only when there is a broker. Without `NATS_URL` there is no bucket for a
 					 * projection to be stale in, and enqueueing anyway would accumulate obligations on
@@ -329,6 +345,7 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 				DidIndexPublisher,
 				QueueMembershipPublisher,
 				PBX_ENV,
+				AuditLogService,
 			],
 		},
 		ExtensionsService,
@@ -352,6 +369,17 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		PromptsService,
 		MohClassesService,
 		EmergencyAddressesService,
+		/**
+		 * Kari's Law delivery: the consumer of `call.emergency.dialed`.
+		 *
+		 * Mounted beside the dispatchable locations because that is what the notification is
+		 * ABOUT — the event names an `emergency_address.id` and this is the slice that owns the
+		 * table it resolves against. Registered unconditionally: without `NATS_URL` the consumer
+		 * logs once at boot and stays idle, which is a deployment discovering that its
+		 * notifications are not wired rather than a provider silently absent from the container.
+		 */
+		EmergencyNotificationService,
+		EmergencyConsumer,
 		FeatureCodesService,
 		OrgSettingsService,
 		VoicemailBoxesService,
@@ -364,6 +392,7 @@ const logger = getLogger({ service: "api", filePath: import.meta.filename });
 		RoutingService,
 	],
 	exports: [
+		AuditLogService,
 		OrgSettingsService,
 		PBX_ENV,
 		PBX_DATABASE,

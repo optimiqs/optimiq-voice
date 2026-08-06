@@ -111,6 +111,9 @@ export class OrgSettingsService extends PbxResourceService {
 			(await this.readRows(organizationId, category)).map((row) => [row.name, row]),
 		);
 		const written: string[] = [];
+		// One actor for the whole patch: a settings form is one action by one person, and deriving it
+		// per setting would put N identical objects in the ledger's call path for no gain.
+		const actor = this.actor(session);
 
 		for (const [name, value] of parsed.values) {
 			const descriptor = findSetting(category, name);
@@ -123,25 +126,36 @@ export class OrgSettingsService extends PbxResourceService {
 			const row = existing.get(name);
 			if (row === undefined) {
 				await runEffect(this.runtime, (repository) =>
-					repository.create(organizationId, this.resource, {
-						category,
-						name,
-						value,
-						valueType: descriptor.valueType,
-						description: descriptor.label,
-						enabled: true,
-					}),
+					repository.create(
+						organizationId,
+						this.resource,
+						{
+							category,
+							name,
+							value,
+							valueType: descriptor.valueType,
+							description: descriptor.label,
+							enabled: true,
+						},
+						actor,
+					),
 				);
 			} else {
 				await runEffect(this.runtime, (repository) =>
-					repository.update(organizationId, this.resource, row.id, {
-						value,
-						valueType: descriptor.valueType,
-						// A save re-enables a row somebody had switched off: the cascade reads a disabled
-						// row as absent, so leaving it disabled would silently discard the value the user
-						// just typed.
-						enabled: true,
-					}),
+					repository.update(
+						organizationId,
+						this.resource,
+						row.id,
+						{
+							value,
+							valueType: descriptor.valueType,
+							// A save re-enables a row somebody had switched off: the cascade reads a disabled
+							// row as absent, so leaving it disabled would silently discard the value the user
+							// just typed.
+							enabled: true,
+						},
+						actor,
+					),
 				);
 			}
 			written.push(name);
@@ -173,6 +187,15 @@ export class OrgSettingsService extends PbxResourceService {
 			voicemailToEmailIncludeTranscription: resolved.voicemailToEmailIncludeTranscription === true,
 			fromName: typeof resolved.fromName === "string" ? resolved.fromName : undefined,
 			replyTo: typeof resolved.replyTo === "string" ? resolved.replyTo : undefined,
+			// Narrowed element by element rather than cast: `resolveCategory` already falls back to
+			// the default when a stored value fails its schema, but a row written before the
+			// catalogue entry existed can still be an array of the wrong thing, and a non-string in
+			// this list would become a recipient nothing can deliver to.
+			emergencyNotificationEmails: Array.isArray(resolved.emergencyNotificationEmails)
+				? resolved.emergencyNotificationEmails.filter(
+						(entry): entry is string => typeof entry === "string" && entry.trim().length > 0,
+					)
+				: [],
 		};
 	}
 
@@ -218,4 +241,6 @@ export interface NotificationSettings {
 	readonly voicemailToEmailIncludeTranscription: boolean;
 	readonly fromName: string | undefined;
 	readonly replyTo: string | undefined;
+	/** Kari's Law recipients. Empty is the default and means nobody is notified. */
+	readonly emergencyNotificationEmails: readonly string[];
 }

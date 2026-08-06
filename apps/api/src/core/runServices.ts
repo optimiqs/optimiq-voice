@@ -63,6 +63,39 @@ type RunningServices = {
 	close(): Promise<void>;
 };
 
+/** Addresses that mean "every interface". */
+const WILDCARD_HOSTS = new Set(["0.0.0.0", "::", "[::]", "*", ""]);
+
+/**
+ * Says out loud what a wildcard bind on this listener costs.
+ *
+ * This is the LEGACY identity gRPC surface and it is a credential oracle: `getServerCredentials({})`
+ * falls through to `ServerCredentials.createInsecure()`, so the wire is plaintext h2c, and the
+ * `createAuthInterceptor` above verifies tokens this same process signs. Anything that can open a
+ * socket to it can talk to the identity handlers and can watch somebody else's do the same.
+ *
+ * The default is still `0.0.0.0:50051` and that is not an oversight — two compose services dial it
+ * across the flat network (`envoy`'s `api-cluster`, and `autopilot` via `AUTOPILOT_API_ENDPOINT`,
+ * default `api:50051`), so a loopback bind would break them. What the deployment controls is
+ * whether the container's port is REACHABLE, and that is a `ports:` decision: `compose.yaml`
+ * `expose`s it to the network and `compose.dev.yaml` no longer publishes it to the host.
+ *
+ * So the honest thing this process can do is refuse to be quiet about it. A single-process
+ * deployment that has no sidecars dialling in should set `API_BIND_ADDR=127.0.0.1:50051` and this
+ * line goes away; the listener itself goes away with the legacy identity service in a later phase.
+ */
+function warnIfPubliclyBound(bindAddr: string): void {
+	const host = bindAddr.includes(":") ? bindAddr.slice(0, bindAddr.lastIndexOf(":")) : bindAddr;
+	if (!WILDCARD_HOSTS.has(host.trim())) {
+		return;
+	}
+	logger.warn(
+		`the legacy gRPC listener is bound to every interface (${bindAddr}) over PLAINTEXT h2c. ` +
+			"It must not be published to the host or reachable outside the deployment's own network. " +
+			"Set API_BIND_ADDR=127.0.0.1:50051 if nothing dials it across the network.",
+	);
+}
+
 async function runServices(): Promise<RunningServices> {
 	const healthImpl = new HealthImplementation(statusMap);
 	const credentials = await getServerCredentials({});
@@ -100,6 +133,7 @@ async function runServices(): Promise<RunningServices> {
 
 			healthImpl.setStatus("", GRPC_SERVING_STATUS);
 			logger.info(`api running at ${API_BIND_ADDR}`);
+			warnIfPubliclyBound(API_BIND_ADDR);
 			resolve();
 		});
 	});

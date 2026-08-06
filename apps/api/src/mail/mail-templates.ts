@@ -308,3 +308,146 @@ export function voicemailMail(input: VoicemailMailInput): RenderedMail {
 		html: shell(input.fromName ?? input.appName, htmlParts),
 	};
 }
+
+// ---------------------------------------------------------------------------------------------
+// Kari's Law
+// ---------------------------------------------------------------------------------------------
+
+export interface EmergencyDialedMailInput {
+	readonly appName: string;
+	readonly fromName?: string | undefined;
+	/** What the caller keyed, e.g. `9911`. */
+	readonly dialed: string;
+	/** What went on the wire after the outside-line prefix was stripped, e.g. `911`. */
+	readonly number: string;
+	/** The calling station — the CALLBACK number a responder or a colleague dials. */
+	readonly callerNumber?: string | undefined;
+	readonly callerName?: string | undefined;
+	/** The extension behind the calling station, when one is known. */
+	readonly callerExtension?: string | undefined;
+	/** The ELIN actually presented. Absent means the call went out with no caller id at all. */
+	readonly elin?: string | undefined;
+	/** The dispatchable location the ELIN is registered against, already formatted. */
+	readonly location?: string | undefined;
+	/** Set when the event named an address the control plane could not find or read. */
+	readonly locationUnknown?: boolean | undefined;
+	readonly trunkName?: string | undefined;
+	/** When the call was placed — the event's `at`, never when this message was rendered. */
+	readonly dialedAt: Date;
+}
+
+/** The address a responder is given, on one line. Empty parts are dropped, never rendered blank. */
+export function formatDispatchableLocation(address: {
+	readonly label?: string | null;
+	readonly streetLine1?: string | null;
+	readonly streetLine2?: string | null;
+	readonly locationDetail?: string | null;
+	readonly locality?: string | null;
+	readonly administrativeArea?: string | null;
+	readonly postalCode?: string | null;
+	readonly country?: string | null;
+}): string {
+	const parts = [
+		address.label,
+		address.streetLine1,
+		address.streetLine2,
+		address.locationDetail,
+		address.locality,
+		address.administrativeArea,
+		address.postalCode,
+		address.country,
+	]
+		.map((part) => part?.trim())
+		.filter((part): part is string => part !== undefined && part.length > 0);
+	return parts.join(", ");
+}
+
+/**
+ * The Kari's Law notification.
+ *
+ * ## What is in it, and why each part is there
+ *
+ * 47 CFR §9.16(b)(2) says the notification must include, "to the extent technically feasible", the
+ * fact that a 911 call was made, a **callback number**, and **information about the caller's
+ * location**. So the subject leads with the number dialed and the caller, and the body carries
+ * the callback number, the extension, the dispatchable location behind the ELIN, and the instant
+ * the call was placed. Nothing here is a link and nothing here needs a login: the recipient is a
+ * front desk that has thirty seconds, not an admin at a browser.
+ *
+ * The message says explicitly when a field is missing rather than omitting the line, because
+ * "location: unknown" is actionable — somebody walks the floor — and a missing line reads as a
+ * rendering bug.
+ */
+export function emergencyDialedMail(input: EmergencyDialedMailInput): RenderedMail {
+	const caller = formatCaller(input.callerNumber, input.callerName);
+	const placed = input.dialedAt.toISOString().replace("T", " ").slice(0, 19) + " UTC";
+	const callback =
+		input.callerNumber === undefined || input.callerNumber.trim().length === 0
+			? "not presented"
+			: input.callerNumber.trim();
+	const extension =
+		input.callerExtension === undefined || input.callerExtension.trim().length === 0
+			? "unknown"
+			: input.callerExtension.trim();
+	const location =
+		input.location !== undefined && input.location.length > 0
+			? input.location
+			: input.locationUnknown === true
+				? "on record but could not be read — check the emergency address for this number"
+				: "not registered for this call";
+	const elin = input.elin === undefined || input.elin.trim().length === 0 ? "none" : input.elin;
+
+	const textLines = [
+		`${input.number} was dialed from this phone system.`,
+		"",
+		`Dialed:    ${input.dialed}${input.dialed === input.number ? "" : ` (sent as ${input.number})`}`,
+		`Caller:    ${caller}`,
+		`Callback:  ${callback}`,
+		`Extension: ${extension}`,
+		`Location:  ${location}`,
+		`ELIN:      ${elin}`,
+		`Placed:    ${placed}`,
+	];
+	if (input.trunkName !== undefined && input.trunkName.trim().length > 0) {
+		textLines.push(`Trunk:     ${input.trunkName.trim()}`);
+	}
+	textLines.push(
+		"",
+		"This is an automatic notification sent when an emergency number is dialed " +
+			"(Kari's Law, 47 CFR §9.16). Nobody has to acknowledge it for the call to proceed.",
+	);
+
+	const rows = [
+		[
+			"Dialed",
+			`${input.dialed}${input.dialed === input.number ? "" : ` (sent as ${input.number})`}`,
+		],
+		["Caller", caller],
+		["Callback", callback],
+		["Extension", extension],
+		["Location", location],
+		["ELIN", elin],
+		["Placed", placed],
+		...(input.trunkName !== undefined && input.trunkName.trim().length > 0
+			? [["Trunk", input.trunkName.trim()]]
+			: []),
+	];
+
+	return {
+		subject: `EMERGENCY: ${input.number} dialed from ${caller}`,
+		text: textLines.join("\n"),
+		html: shell(input.fromName ?? input.appName, [
+			`<strong>${escapeHtml(`${input.number} was dialed from this phone system.`)}</strong>`,
+			rows
+				.map(
+					([label, value]) =>
+						`<span style="color:#666">${escapeHtml(String(label))}</span> ${escapeHtml(String(value))}`,
+				)
+				.join("<br/>\n"),
+			`<span style="color:#666;font-size:13px">${escapeHtml(
+				"This is an automatic notification sent when an emergency number is dialed " +
+					"(Kari's Law, 47 CFR §9.16). Nobody has to acknowledge it for the call to proceed.",
+			)}</span>`,
+		]),
+	};
+}

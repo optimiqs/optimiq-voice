@@ -124,6 +124,40 @@ export const NOTIFICATION_SETTINGS: readonly SettingDescriptor[] = [
 		schema: z.email().max(254).nullable(),
 		defaultValue: null,
 	}),
+	/**
+	 * The Kari's Law "central location".
+	 *
+	 * 47 U.S.C. §623(b) / 47 CFR §9.16 require an MLTS to notify a central location — a front desk,
+	 * a security office, a distribution list — when somebody dials 911 from it, contemporaneously
+	 * with the call and without anyone having to configure it per call. This list IS that central
+	 * location, expressed the way a tenant can actually maintain it.
+	 *
+	 * Three properties are deliberate:
+	 *
+	 * - **The default is empty, and empty means nobody is notified.** There is no defensible
+	 *   platform-wide default recipient — mailing the account owner would send a security incident
+	 *   to whoever happened to sign up — so an unconfigured tenant gets a WARN log naming the
+	 *   setting rather than a message to a guess. See `emergency-notification.service.ts`.
+	 * - **There is no enable/disable flag beside it.** A boolean that can be false while addresses
+	 *   are configured is a switch somebody turns off during a mail storm and never turns back on,
+	 *   and the thing it disables is a legal obligation. The list's emptiness is the only off.
+	 * - **`voicemailToEmailEnabled` does NOT gate it.** That switch is a privacy policy about
+	 *   recorded audio leaving the platform; this is a life-safety notification carrying no
+	 *   recording. Coupling them would let a compliance decision about voicemail silently disable
+	 *   Kari's Law.
+	 */
+	descriptor({
+		category: NOTIFICATION_SETTINGS_CATEGORY,
+		name: "emergencyNotificationEmails",
+		valueType: "array",
+		label: "Emergency notification recipients",
+		description:
+			"Addresses notified the moment somebody dials an emergency number from this " +
+			"organization (Kari's Law, 47 CFR §9.16). Empty means nobody is notified — the platform " +
+			"has no safe default for who a tenant's front desk is.",
+		schema: z.array(z.email().max(254)).max(32),
+		defaultValue: [],
+	}),
 ];
 
 /**

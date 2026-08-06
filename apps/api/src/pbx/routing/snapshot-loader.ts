@@ -155,6 +155,7 @@ export async function loadOrgRoutingSnapshot(
 			mohClassId: row.mohClassId,
 			tollClass: row.tollClass,
 			callTimeoutSeconds: row.callTimeoutSeconds,
+			followMe: row.followMe ?? undefined,
 		})),
 		phoneNumbers: phoneNumbers.map((row) => ({
 			id: row.id,

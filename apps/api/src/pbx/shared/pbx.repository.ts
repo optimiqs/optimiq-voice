@@ -31,6 +31,8 @@ import {
 } from "./pbx.errors";
 import { enqueueProjections, payloadOf, projectionsOwedBy } from "./projection-outbox";
 import type { CompiledWrite } from "../routing/compile-on-write";
+import type { AuditAction, AuditActor } from "./audit-log";
+import type { AuditMutationInput } from "./audit-log.service";
 import type { ListQuery, PagedResult, Pagination } from "./pagination";
 import type { PbxChildResource, PbxResource } from "./pbx-resource";
 import type { PgTable, SQL } from "@optimiq-voice/pbx-db";
@@ -106,6 +108,7 @@ export interface PbxRepositoryInterface {
 		organizationId: string,
 		resource: PbxResource,
 		values: Record<string, unknown>,
+		actor?: AuditActor,
 	) => Effect.Effect<MutationResult<Record<string, unknown>>, PbxFailure>;
 
 	readonly update: (
@@ -113,12 +116,14 @@ export interface PbxRepositoryInterface {
 		resource: PbxResource,
 		id: string,
 		values: Record<string, unknown>,
+		actor?: AuditActor,
 	) => Effect.Effect<MutationResult<Record<string, unknown>>, PbxFailure>;
 
 	readonly remove: (
 		organizationId: string,
 		resource: PbxResource,
 		id: string,
+		actor?: AuditActor,
 	) => Effect.Effect<MutationResult<{ readonly id: string }>, PbxFailure>;
 
 	readonly listChildren: (
@@ -132,6 +137,7 @@ export interface PbxRepositoryInterface {
 		resource: PbxChildResource,
 		parentId: string,
 		values: Record<string, unknown>,
+		actor?: AuditActor,
 	) => Effect.Effect<MutationResult<Record<string, unknown>>, PbxFailure>;
 
 	readonly updateChild: (
@@ -140,6 +146,7 @@ export interface PbxRepositoryInterface {
 		parentId: string,
 		id: string,
 		values: Record<string, unknown>,
+		actor?: AuditActor,
 	) => Effect.Effect<MutationResult<Record<string, unknown>>, PbxFailure>;
 
 	readonly removeChild: (
@@ -147,6 +154,7 @@ export interface PbxRepositoryInterface {
 		resource: PbxChildResource,
 		parentId: string,
 		id: string,
+		actor?: AuditActor,
 	) => Effect.Effect<MutationResult<{ readonly id: string }>, PbxFailure>;
 
 	readonly reorderChildren: (
@@ -154,6 +162,7 @@ export interface PbxRepositoryInterface {
 		resource: PbxChildResource,
 		parentId: string,
 		ids: readonly string[],
+		actor?: AuditActor,
 	) => Effect.Effect<MutationResult<readonly Record<string, unknown>[]>, PbxFailure>;
 
 	/** Compiles the organization's configuration without mutating anything. */
@@ -439,12 +448,59 @@ export interface PbxRepositoryDependencies {
 	 * accumulate obligations on every developer machine that nothing could ever discharge.
 	 */
 	readonly outboxEnabled?: boolean;
+	/**
+	 * Appends the change ledger row, INSIDE the mutation's transaction.
+	 *
+	 * Injected on the same terms as the two callbacks above — a plain function, so the repository
+	 * keeps no knowledge of `audit_log` and a spec can assert the ledger seam without a database.
+	 * Unlike them it is AWAITED and it is inside the unit of work: a rolled-back write must leave
+	 * no ledger row and a committed one must leave exactly one. See `audit-log.service.ts` for the
+	 * argument, including the cost.
+	 */
+	readonly recordAudit?: (
+		transaction: PbxDatabaseTransaction,
+		input: AuditMutationInput,
+	) => Promise<void>;
 	/** Injected so a spec can pin generated ids. */
 	readonly newId?: () => string;
 }
 
 export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositoryInterface {
 	const newId = deps.newId ?? createEntityId;
+
+	/**
+	 * The ledger append, still inside the write's transaction.
+	 *
+	 * Called by every mutation immediately after the row has been written and BEFORE {@link settle}
+	 * recompiles: the recompile is what turns an unsound configuration into a 422 and a rollback,
+	 * and being on the same side of it means the ledger and the database agree by construction
+	 * rather than by a rule somebody has to remember.
+	 */
+	const audit = async (
+		transaction: PbxDatabaseTransaction,
+		organizationId: string,
+		resource: PbxResource | PbxChildResource,
+		action: AuditAction,
+		resourceRef: string | null,
+		rows: {
+			readonly before?: Record<string, unknown> | undefined;
+			readonly after?: Record<string, unknown> | undefined;
+		},
+		actor: AuditActor | undefined,
+	): Promise<void> => {
+		if (deps.recordAudit === undefined) {
+			return;
+		}
+		await deps.recordAudit(transaction, {
+			organizationId,
+			resource,
+			action,
+			resourceRef,
+			...(rows.before === undefined ? {} : { before: rows.before }),
+			...(rows.after === undefined ? {} : { after: rows.after }),
+			actor,
+		});
+	};
 
 	/**
 	 * The last thing every write does, still inside its transaction: recompile if the table is a
@@ -579,6 +635,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 		organizationId: string,
 		resource: PbxResource,
 		values: Record<string, unknown>,
+		actor?: AuditActor,
 	) {
 		const result = yield* scoped(
 			resource.kind,
@@ -601,6 +658,15 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 					.values(row as never)
 					.returning();
 				const created = inserted[0] as Record<string, unknown>;
+				await audit(
+					transaction,
+					organizationId,
+					resource,
+					"create",
+					String(created.id ?? row.id),
+					{ after: created },
+					actor,
+				);
 				const compiled = await settle(transaction, organizationId, resource, "create");
 				return {
 					row: created,
@@ -617,6 +683,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 		resource: PbxResource,
 		id: string,
 		values: Record<string, unknown>,
+		actor?: AuditActor,
 	) {
 		const result = yield* scoped(
 			resource.kind,
@@ -638,6 +705,15 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 					.where(eq(rowId(resource), id))
 					.returning();
 				const row = (updated[0] ?? existing) as Record<string, unknown>;
+				await audit(
+					transaction,
+					organizationId,
+					resource,
+					"update",
+					id,
+					{ before: existing, after: row },
+					actor,
+				);
 				const compiled = await settle(transaction, organizationId, resource, "update");
 				return {
 					row,
@@ -653,6 +729,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 		organizationId: string,
 		resource: PbxResource,
 		id: string,
+		actor?: AuditActor,
 	) {
 		const result = yield* scoped(
 			resource.kind,
@@ -660,9 +737,18 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 			organizationId,
 			resource.table,
 			async (transaction): Promise<MutationResult<{ readonly id: string }>> => {
-				await requireRow(transaction, resource, id);
+				const existing = await requireRow(transaction, resource, id);
 				await assertNotReferenced(transaction, resource, id);
 				await transaction.delete(resource.table).where(eq(rowId(resource), id));
+				await audit(
+					transaction,
+					organizationId,
+					resource,
+					"delete",
+					id,
+					{ before: existing },
+					actor,
+				);
 				const compiled = await settle(transaction, organizationId, resource, "remove");
 				return {
 					row: { id },
@@ -700,6 +786,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 		resource: PbxChildResource,
 		parentId: string,
 		values: Record<string, unknown>,
+		actor?: AuditActor,
 	) {
 		const result = yield* scoped(
 			resource.kind,
@@ -719,6 +806,16 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 					.insert(resource.table)
 					.values(row as never)
 					.returning();
+				const created = inserted[0] as Record<string, unknown>;
+				await audit(
+					transaction,
+					organizationId,
+					resource,
+					"create",
+					String(created.id ?? row.id),
+					{ after: created },
+					actor,
+				);
 				const compiled = await settle(transaction, organizationId, resource, "create");
 				return {
 					row: inserted[0] as Record<string, unknown>,
@@ -736,6 +833,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 		parentId: string,
 		id: string,
 		values: Record<string, unknown>,
+		actor?: AuditActor,
 	) {
 		const result = yield* scoped(
 			resource.kind,
@@ -754,6 +852,15 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 					.set(withUpdateDefaults(resource.table, values) as never)
 					.where(and(eq(rowId(resource), id), eq(resource.parentColumn, parentId)))
 					.returning();
+				await audit(
+					transaction,
+					organizationId,
+					resource,
+					"update",
+					id,
+					{ before: existing, after: (updated[0] ?? existing) as Record<string, unknown> },
+					actor,
+				);
 				const compiled = await settle(transaction, organizationId, resource, "update");
 				return {
 					row: (updated[0] ?? existing) as Record<string, unknown>,
@@ -770,6 +877,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 		resource: PbxChildResource,
 		parentId: string,
 		id: string,
+		actor?: AuditActor,
 	) {
 		const result = yield* scoped(
 			resource.kind,
@@ -777,11 +885,20 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 			organizationId,
 			resource.table,
 			async (transaction): Promise<MutationResult<{ readonly id: string }>> => {
-				await requireChild(transaction, resource, parentId, id);
+				const existing = await requireChild(transaction, resource, parentId, id);
 				await assertNotReferenced(transaction, resource, id);
 				await transaction
 					.delete(resource.table)
 					.where(and(eq(rowId(resource), id), eq(resource.parentColumn, parentId)));
+				await audit(
+					transaction,
+					organizationId,
+					resource,
+					"delete",
+					id,
+					{ before: existing },
+					actor,
+				);
 				const compiled = await settle(transaction, organizationId, resource, "remove");
 				return {
 					row: { id },
@@ -816,6 +933,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 		resource: PbxChildResource,
 		parentId: string,
 		ids: readonly string[],
+		actor?: AuditActor,
 	) {
 		const result = yield* scoped(
 			resource.kind,
@@ -858,6 +976,20 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 					.from(resource.table)
 					.where(eq(resource.parentColumn, parentId))
 					.orderBy(...resource.orderBy.map((column) => asc(column)))) as Record<string, unknown>[];
+				// The collection, not a row: a reorder's `resource_ref` is the PARENT, and the change is
+				// the ordering itself — recording N per-row ordinal diffs would say the same thing N
+				// times and still not say what the new order is. Only `after` is stored, because the
+				// order the rows were READ back in is the only one that was ever observable; `existing`
+				// above is deliberately unordered (the permutation check does not need an order).
+				await audit(
+					transaction,
+					organizationId,
+					resource,
+					"reorder",
+					parentId,
+					{ after: { order: reordered.map((row) => String(row.id)) } },
+					actor,
+				);
 				const compiled = await settle(transaction, organizationId, resource, "reorder");
 				return {
 					row: reordered,

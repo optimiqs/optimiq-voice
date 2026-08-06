@@ -1,6 +1,7 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { runEffect } from "@optimiq-voice/effect-runtime";
+import { actorFromSession } from "../shared/audit-log";
 import { toWireDiagnostic } from "../shared/pbx.errors";
 import { PBX_EFFECT_RUNTIME } from "../shared/pbx.tokens";
 import { hashVoicemailPin } from "../voicemail-boxes/voicemail-pin.service";
@@ -130,7 +131,13 @@ export class ConferencePinService {
 		const organizationId = requireActiveOrganizationId(session);
 		const column = role === "moderator" ? "moderatorPinHash" : "pinHash";
 		const result = await runEffect(this.runtime, (repository) =>
-			repository.update(organizationId, CONFERENCE_RESOURCE, id, { [column]: pinHash }),
+			repository.update(
+				organizationId,
+				CONFERENCE_RESOURCE,
+				id,
+				{ [column]: pinHash },
+				actorFromSession(session),
+			),
 		);
 		const row = result.row as {
 			readonly id: string;

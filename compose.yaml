@@ -73,7 +73,13 @@ services:
       - API_TWILIO_AUTH_TOKEN
       - API_TWILIO_PHONE_NUMBER
     expose:
-      # gRPC.
+      # The legacy gRPC listener. `expose` and never `ports`: it terminates PLAINTEXT h2c
+      # (`getServerCredentials({})` falls through to `createInsecure()`), it fronts the legacy
+      # identity handlers, and its auth interceptor verifies a token this same process signs — so
+      # anything that can reach it can be told about credentials. Its only remaining callers are
+      # inside this network: `envoy`'s `api-cluster` and `autopilot` (`AUTOPILOT_API_ENDPOINT`,
+      # default `api:50051`). Nothing on the host needs it; `compose.dev.yaml` used to publish it
+      # and no longer does. The listener dies with the legacy identity service in a later phase.
       - 50051
       # The HTTP bridge: /api/auth/* and /api/v1/*. Both `envoy` and `web` route to it, so it is
       # listed here for the same reason 50051 is — the network is flat, but the contract is not.

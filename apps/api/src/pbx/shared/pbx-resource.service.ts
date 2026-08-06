@@ -1,6 +1,8 @@
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { runEffect } from "@optimiq-voice/effect-runtime";
+import { actorFromSession } from "./audit-log";
 import { toWireDiagnostic } from "./pbx.errors";
+import type { AuditActor } from "./audit-log";
 import type { PagedResult } from "./pagination";
 import type { ListQuery } from "./pagination";
 import type { PbxChildResource, PbxResource } from "./pbx-resource";
@@ -79,6 +81,18 @@ export abstract class PbxResourceService {
 	}
 
 	/**
+	 * The principal the change ledger will attribute this mutation to.
+	 *
+	 * Derived HERE for the same reason `organizationId` is: this is the one layer that has a
+	 * session, and a repository that reached for an actor of its own would be a repository that can
+	 * be wrong about who did something. It travels as the last argument of every write, alongside
+	 * the tenant. See `audit-log.ts`.
+	 */
+	protected actor(session: AppSession): AuditActor {
+		return actorFromSession(session);
+	}
+
+	/**
 	 * The row, minus anything the resource declared secret.
 	 *
 	 * The repository reads whole rows on purpose — its guards, its destination merge and
@@ -114,7 +128,7 @@ export abstract class PbxResourceService {
 	): Promise<MutationEnvelope<Record<string, unknown>>> {
 		const organizationId = this.organizationId(session);
 		const result = await runEffect(this.runtime, (repository) =>
-			repository.create(organizationId, this.resource, values),
+			repository.create(organizationId, this.resource, values, this.actor(session)),
 		);
 		return { data: this.redact(result.row), warnings: result.warnings.map(toWireDiagnostic) };
 	}
@@ -126,7 +140,7 @@ export abstract class PbxResourceService {
 	): Promise<MutationEnvelope<Record<string, unknown>>> {
 		const organizationId = this.organizationId(session);
 		const result = await runEffect(this.runtime, (repository) =>
-			repository.update(organizationId, this.resource, id, values),
+			repository.update(organizationId, this.resource, id, values, this.actor(session)),
 		);
 		return { data: this.redact(result.row), warnings: result.warnings.map(toWireDiagnostic) };
 	}
@@ -137,7 +151,7 @@ export abstract class PbxResourceService {
 	): Promise<MutationEnvelope<{ readonly id: string }>> {
 		const organizationId = this.organizationId(session);
 		const result = await runEffect(this.runtime, (repository) =>
-			repository.remove(organizationId, this.resource, id),
+			repository.remove(organizationId, this.resource, id, this.actor(session)),
 		);
 		return { data: result.row, warnings: result.warnings.map(toWireDiagnostic) };
 	}
@@ -159,6 +173,11 @@ export abstract class PbxChildResourceService {
 
 	protected organizationId(session: AppSession): string {
 		return requireActiveOrganizationId(session);
+	}
+
+	/** As {@link PbxResourceService.actor} — the ledger attributes a child write the same way. */
+	protected actor(session: AppSession): AuditActor {
+		return actorFromSession(session);
 	}
 
 	/** As {@link PbxResourceService.redact} — `secretColumns` is inherited from `PbxResource`. */
@@ -184,7 +203,7 @@ export abstract class PbxChildResourceService {
 	): Promise<MutationEnvelope<Record<string, unknown>>> {
 		const organizationId = this.organizationId(session);
 		const result = await runEffect(this.runtime, (repository) =>
-			repository.createChild(organizationId, this.resource, parentId, values),
+			repository.createChild(organizationId, this.resource, parentId, values, this.actor(session)),
 		);
 		return { data: this.redact(result.row), warnings: result.warnings.map(toWireDiagnostic) };
 	}
@@ -197,7 +216,14 @@ export abstract class PbxChildResourceService {
 	): Promise<MutationEnvelope<Record<string, unknown>>> {
 		const organizationId = this.organizationId(session);
 		const result = await runEffect(this.runtime, (repository) =>
-			repository.updateChild(organizationId, this.resource, parentId, id, values),
+			repository.updateChild(
+				organizationId,
+				this.resource,
+				parentId,
+				id,
+				values,
+				this.actor(session),
+			),
 		);
 		return { data: this.redact(result.row), warnings: result.warnings.map(toWireDiagnostic) };
 	}
@@ -209,7 +235,7 @@ export abstract class PbxChildResourceService {
 	): Promise<MutationEnvelope<{ readonly id: string }>> {
 		const organizationId = this.organizationId(session);
 		const result = await runEffect(this.runtime, (repository) =>
-			repository.removeChild(organizationId, this.resource, parentId, id),
+			repository.removeChild(organizationId, this.resource, parentId, id, this.actor(session)),
 		);
 		return { data: result.row, warnings: result.warnings.map(toWireDiagnostic) };
 	}
@@ -227,7 +253,7 @@ export abstract class PbxChildResourceService {
 	): Promise<MutationEnvelope<readonly Record<string, unknown>[]>> {
 		const organizationId = this.organizationId(session);
 		const result = await runEffect(this.runtime, (repository) =>
-			repository.reorderChildren(organizationId, this.resource, parentId, ids),
+			repository.reorderChildren(organizationId, this.resource, parentId, ids, this.actor(session)),
 		);
 		return {
 			data: result.row.map((row) => this.redact(row)),

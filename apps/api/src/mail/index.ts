@@ -16,8 +16,11 @@ export {
 	withLegacyFallbacks,
 } from "./mail-env";
 export {
+	type EmergencyDialedMailInput,
+	emergencyDialedMail,
 	escapeHtml,
 	formatCaller,
+	formatDispatchableLocation,
 	formatDuration,
 	type InvitationMailInput,
 	invitationMail,

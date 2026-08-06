@@ -11,6 +11,7 @@ import {
 	parseVoicemailPinHash,
 	scryptMemoryBytes,
 } from "@optimiq-voice/routing";
+import { actorFromSession } from "../shared/audit-log";
 import { toWireDiagnostic } from "../shared/pbx.errors";
 import { PBX_EFFECT_RUNTIME } from "../shared/pbx.tokens";
 import { VOICEMAIL_BOX_RESOURCE } from "./voicemail-boxes.resource";
@@ -107,7 +108,13 @@ export class VoicemailPinService {
 	): Promise<MutationEnvelope<VoicemailPinState>> {
 		const organizationId = requireActiveOrganizationId(session);
 		const result = await runEffect(this.runtime, (repository) =>
-			repository.update(organizationId, VOICEMAIL_BOX_RESOURCE, id, { pinHash }),
+			repository.update(
+				organizationId,
+				VOICEMAIL_BOX_RESOURCE,
+				id,
+				{ pinHash },
+				actorFromSession(session),
+			),
 		);
 		const row = result.row as { readonly id: string; readonly mailboxNumber: string };
 		return {

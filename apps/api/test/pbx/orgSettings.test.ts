@@ -49,7 +49,22 @@ describe("org settings catalogue", () => {
 			"voicemailToEmailIncludeTranscription",
 			"fromName",
 			"replyTo",
+			"emergencyNotificationEmails",
 		]);
+	});
+
+	it("catalogues the Kari's Law recipients as an empty-by-default address list", () => {
+		const entry = findSetting(NOTIFICATION_SETTINGS_CATEGORY, "emergencyNotificationEmails");
+		expect(entry?.valueType).to.equal("array");
+		expect(entry?.defaultValue).to.deep.equal([]);
+		expect(entry?.schema.safeParse(["ops@example.com", "desk@example.com"]).success).to.equal(true);
+		// A non-address in the list would become a recipient nothing can deliver to.
+		expect(entry?.schema.safeParse(["not-an-address"]).success).to.equal(false);
+	});
+
+	it("resolves the emergency recipients to the empty list when a tenant has no row", () => {
+		const resolved = resolveCategory(NOTIFICATION_SETTINGS_CATEGORY, []);
+		expect(resolved.emergencyNotificationEmails).to.deep.equal([]);
 	});
 
 	it("only catalogues routing names the compiler actually reads", () => {
