@@ -1,6 +1,8 @@
 import { Inject, Module, type OnApplicationShutdown } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
 import { createObjectStore, describeObjectStore, loadStorageEnv } from "../storage";
+import { AuditLogQueryService } from "./audit-log/audit-log-query.service";
+import { AuditLogController } from "./audit-log/audit-log.controller";
 import { CarrierWebhookController } from "./carrier/carrier-webhook.controller";
 import { CarrierController, CarrierTrunkController } from "./carrier/carrier.controller";
 import { carrierProviders } from "./carrier/carrier.providers";
@@ -176,6 +178,17 @@ const logger = getLogger("api.pbx");
 		RoutingController,
 		RoutingRpcController,
 		VoicemailRpcController,
+		/**
+		 * The change ledger's read surface.
+		 *
+		 * In the PBX area rather than beside the reporting one because `audit_log` is a `pbx-db`
+		 * table under `pbx_tenant_tls` and the same RLS machinery every other resource here uses —
+		 * it shares this module's pool and its tenant scope, and mounting it in `CdrModule` would
+		 * mean a second connection budget against a database that area does not otherwise touch.
+		 * It is a listing and nothing else: the table is append-only in the database, so there is
+		 * no write for a controller to expose.
+		 */
+		AuditLogController,
 		/**
 		 * The carrier slice mounts unconditionally, even without a `TELNYX_API_KEY`.
 		 *
@@ -436,6 +449,15 @@ const logger = getLogger("api.pbx");
 		VoicemailEmailService,
 		VoicemailConsumer,
 		RoutingService,
+		/**
+		 * The ledger READER, beside the writer it never talks to.
+		 *
+		 * `AuditLogService` (above) appends inside a mutation's transaction; this one opens its own
+		 * `withTenantScope` and only ever selects. They share a table and nothing else, which is why
+		 * they are two classes rather than one with a `list()` on it — a reader that could reach the
+		 * writer's insert is a reader somebody can make write.
+		 */
+		AuditLogQueryService,
 	],
 	exports: [
 		AuditLogService,

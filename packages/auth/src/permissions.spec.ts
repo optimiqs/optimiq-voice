@@ -19,7 +19,19 @@ import {
 
 describe("PERMISSIONS", () => {
 	/**
-	 * The registry is at **90 of 90** as of the Telnyx carrier work.
+	 * The registry is at **91 of 91** as of the audit-log read surface.
+	 *
+	 * The ceiling was raised by one, in the change that needed it, for `audit.read` — and the
+	 * argument the previous note asked for is this: the `audit_log` ledger records every change
+	 * every member made, with the before/after diff of each. The only existing grant broad enough
+	 * to have covered it was `settings.read`, which every self-service role holds so that a user's
+	 * own preferences screen renders. Reusing it would have handed the organization's entire
+	 * change history to the narrowest role in the registry — the opposite of a boundary. No other
+	 * grant expresses "may read what everyone else did", so the registry gained one.
+	 *
+	 * It gained exactly one: the table is append-only in the database (the tenant role holds
+	 * `SELECT, INSERT` and nothing more), so there is no write, delete or retention action left
+	 * for a second permission to guard.
 	 *
 	 * That is deliberate, not an accident of arriving last. The carrier integration needed exactly
 	 * one new grant — `numbers.order`, which is the only carrier operation whose blast radius
@@ -37,7 +49,7 @@ describe("PERMISSIONS", () => {
 	 */
 	it("stays within the size the collapsed FusionPBX model targets", () => {
 		expect(PERMISSIONS.length).toBeGreaterThanOrEqual(60);
-		expect(PERMISSIONS.length).toBeLessThanOrEqual(90);
+		expect(PERMISSIONS.length).toBeLessThanOrEqual(91);
 	});
 
 	it("contains no duplicates", () => {
@@ -87,6 +99,7 @@ describe("PERMISSIONS", () => {
 			"park-lots",
 			"recordings",
 			"cdr",
+			"audit",
 			"settings",
 			"members",
 			"api-keys",

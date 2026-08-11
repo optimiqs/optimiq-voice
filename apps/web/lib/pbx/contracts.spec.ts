@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+	AUDIT_ACTOR_TYPES as SERVER_AUDIT_ACTOR_TYPES,
 	DESTINATION_TARGET_TABLES as SERVER_TARGET_TABLES,
 	DESTINATION_TYPE_KINDS as SERVER_TYPE_KINDS,
 	DESTINATION_TYPES as SERVER_DESTINATION_TYPES,
@@ -26,6 +27,7 @@ import {
 } from "@optimiq-voice/routing";
 import { PBX_CHILDREN, PBX_RESOURCES } from "./client";
 import {
+	AUDIT_ACTOR_TYPES,
 	DESTINATION_TYPE_KINDS,
 	DESTINATION_TYPES,
 	FEATURE_CODE_ACTIONS,
@@ -147,6 +149,16 @@ describe("closed sets mirrored from @optimiq-voice/pbx-db", () => {
 	/** Twenty of them. A missing one is a feature nobody can configure. */
 	it("feature code actions match", () => {
 		expect(FEATURE_CODE_ACTIONS).toEqual([...SERVER_FEATURE_CODE_ACTIONS]);
+	});
+
+	/**
+	 * The ledger's actor types.
+	 *
+	 * A missing member is an audit entry this app renders as an unknown principal — on the one
+	 * screen whose entire job is saying who did something.
+	 */
+	it("audit actor types match, in order", () => {
+		expect(AUDIT_ACTOR_TYPES).toEqual([...SERVER_AUDIT_ACTOR_TYPES]);
 	});
 });
 

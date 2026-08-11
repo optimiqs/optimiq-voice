@@ -97,7 +97,26 @@ export const auditLog = pgTable.withRLS(
 		createdAt: utcTimestamp("created_at").notNull().defaultNow(),
 	},
 	(table) => [
-		index("audit_log_organization_occurred_idx").on(table.organizationId, table.occurredAt),
+		/**
+		 * The reading index, and the reason `id` is on the end of it.
+		 *
+		 * `/api/v1/audit-log` pages the ledger with a keyset over `(occurred_at, id)` — see
+		 * `apps/api/src/pbx/audit-log/audit-log.cursor.ts` for why a ledger cannot use `offset` —
+		 * and a row comparison `(occurred_at, id) < (…, …)` is only an index SEEK when the index
+		 * carries both columns in that order. With `(organization_id, occurred_at)` alone the
+		 * comparison degrades into a filter over every row in the requested window, which is the
+		 * cost the cursor exists to avoid. `id` is UUID v7 and therefore already time-ordered, so
+		 * the third column also never contradicts the visible sort.
+		 *
+		 * Extended in place rather than added alongside: this table takes a write on every mutation
+		 * in the tenant, so a fourth index whose first two columns duplicate an existing one would
+		 * be paid for on every change and read by nothing.
+		 */
+		index("audit_log_organization_occurred_idx").on(
+			table.organizationId,
+			table.occurredAt,
+			table.id,
+		),
 		index("audit_log_organization_resource_idx").on(
 			table.organizationId,
 			table.resourceType,

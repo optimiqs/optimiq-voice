@@ -187,6 +187,17 @@ export type FeatureCodeAction = (typeof FEATURE_CODE_ACTIONS)[number];
 export const ROUTING_CONTEXTS = ["inbound", "internal", "outbound"] as const;
 export type RoutingContext = (typeof ROUTING_CONTEXTS)[number];
 
+/**
+ * Who a ledger entry is attributed to.
+ *
+ * The split matters to anything that renders one: a `user` entry has `actorUserId` and no
+ * `actorRef`, and an `api-key` or `service` entry has `actorRef` and no `actorUserId` — the server
+ * refuses to write a key id into a column documented as `user.id`, so a screen that reached for
+ * `actorUserId` on machine traffic would render a blank instead of the key that did it.
+ */
+export const AUDIT_ACTOR_TYPES = ["user", "api-key", "service", "system"] as const;
+export type AuditActorType = (typeof AUDIT_ACTOR_TYPES)[number];
+
 // ---------------------------------------------------------------------------------------------
 // Rows
 // ---------------------------------------------------------------------------------------------
@@ -757,6 +768,87 @@ export interface EmergencyAddressRow extends EntityRow {
 	readonly validatedAt: string | null;
 	readonly validationProvider: string | null;
 	readonly validationReference: string | null;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The change ledger
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * `GET /api/v1/audit-log` — a cursor envelope, and not the paged one above.
+ *
+ * The same divergence `lib/cdr/contracts.ts` documents, for the same reason on the server's side:
+ * `total` needs a `count(*)` over a table that takes a row for every mutation forever, and
+ * `offset` over a ledger being appended to while somebody reads it silently skips rows. So this
+ * list says "1–25, more" and cannot say "1–25 of 41,882".
+ *
+ * `range` is the window the server actually applied AFTER defaulting (thirty days when the caller
+ * sends neither bound). Render it: a filter the user cannot see is what makes "why is my change
+ * missing?" unanswerable.
+ */
+export interface AuditCursorEnvelope<T> {
+	readonly data: readonly T[];
+	/** Pass back as `?cursor=` for the next page. `null` means this was the last one. */
+	readonly nextCursor: string | null;
+	readonly limit: number;
+	readonly range: { readonly from: string; readonly to: string };
+}
+
+/**
+ * One entry in the append-only change ledger.
+ *
+ * Not an `EntityRow`: the table has `createdAt` and deliberately no `updatedAt`, because an
+ * updatable timestamp on an immutable ledger is a contradiction and the tenant database role has
+ * no UPDATE privilege to maintain it. There are no create/update/delete calls for this row shape
+ * anywhere in this app, and there is no endpoint behind them if one were written.
+ *
+ * `before` and `after` are the CHANGED columns only, already redacted server-side: a value from a
+ * secret column never entered the table, though the column's NAME appears on both sides so
+ * "somebody rotated this extension's SIP password" stays auditable. A create has no `before`; a
+ * delete has no `after`.
+ */
+export interface AuditLogEntryRow {
+	readonly id: string;
+	readonly organizationId: string;
+	readonly actorType: AuditActorType;
+	/** The person, when there is one. `null` for an API key, a service or the system. */
+	readonly actorUserId: string | null;
+	/** The API key id or service name, when there is no person. `null` for a user. */
+	readonly actorRef: string | null;
+	/** Dotted verb: `extension.update`, `org-setting.create`. */
+	readonly action: string;
+	/** Physical table name of the changed row, e.g. `extension`. */
+	readonly resourceType: string;
+	readonly resourceRef: string | null;
+	readonly before: Readonly<Record<string, unknown>> | null;
+	readonly after: Readonly<Record<string, unknown>> | null;
+	readonly ipAddress: string | null;
+	readonly userAgent: string | null;
+	/** Correlation id from the request pipeline, so an entry joins to a log line. */
+	readonly requestId: string | null;
+	readonly occurredAt: string;
+	readonly createdAt: string;
+}
+
+/**
+ * The query string `GET /api/v1/audit-log` accepts.
+ *
+ * Every filter is EXACT — there is no free-text search, because the only text worth matching is
+ * the user agent and the diff, and an `ilike` over either is a scan of the window dressed up as a
+ * feature. `actorUserId` and `actorRef` are separate controls because they are separate
+ * principals; see {@link AUDIT_ACTOR_TYPES}.
+ */
+export interface AuditLogQueryParams {
+	readonly from?: string;
+	readonly to?: string;
+	readonly actorType?: AuditActorType;
+	readonly actorUserId?: string;
+	readonly actorRef?: string;
+	readonly action?: string;
+	readonly resourceType?: string;
+	readonly resourceRef?: string;
+	readonly limit?: number;
+	readonly cursor?: string;
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -76,6 +76,7 @@ export const PERMISSIONS = [
 	"cdr.read",
 	"cdr.read.own",
 	"cdr.export",
+	"audit.read",
 	"settings.read",
 	"settings.write",
 	"settings.write.all",
@@ -567,6 +568,18 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 		],
 	},
 	{
+		resource: "audit",
+		label: "Audit log",
+		description: "The append-only record of who changed the phone system, and what they changed.",
+		permissions: [
+			{
+				permission: "audit.read",
+				label: "View the audit log",
+				description: "Search the organization's change history and read the before/after of each change.",
+			},
+		],
+	},
+	{
 		resource: "settings",
 		label: "Settings",
 		description: "The organization settings cascade and platform defaults.",
@@ -816,6 +829,7 @@ export const SYSTEM_ROLE_TEMPLATES: readonly SystemRoleTemplate[] = [
 			"cdr.read",
 			"cdr.read.own",
 			"cdr.export",
+			"audit.read",
 			"settings.read",
 			"settings.write",
 			"settings.write.all",
@@ -914,6 +928,7 @@ export const SYSTEM_ROLE_TEMPLATES: readonly SystemRoleTemplate[] = [
 			"cdr.read",
 			"cdr.read.own",
 			"cdr.export",
+			"audit.read",
 			"settings.read",
 			"settings.write",
 			"members.read",

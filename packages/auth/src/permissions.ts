@@ -120,6 +120,24 @@ export const PERMISSIONS = [
 	"cdr.read.own",
 	"cdr.export",
 
+	/**
+	 * Reading the `audit_log` change ledger.
+	 *
+	 * Its own entry rather than a ride on `settings.read`, which is what the ledger's writer said
+	 * it was waiting for (`apps/api/src/pbx/shared/audit-log.service.ts`, "No read surface,
+	 * deliberately"). The two are not the same question: `settings.read` is held by every
+	 * self-service role in the registry — a user has it so their own preferences screen renders —
+	 * and the ledger is a record of every change every OTHER member made, with the before/after
+	 * of each one. Guarding it with `settings.read` would hand the organization's whole change
+	 * history to the narrowest role there is.
+	 *
+	 * `read` and no more: the table is append-only in the database itself (the tenant role holds
+	 * `SELECT, INSERT` under two policies rather than one `FOR ALL`), so there is no write, no
+	 * delete and no retention knob for a permission to guard. If an export path lands later it
+	 * gets `audit.export`, on the same argument that split `cdr.export` from `cdr.read`.
+	 */
+	"audit.read",
+
 	// --- Platform and tenancy ------------------------------------------------
 	"settings.read",
 	"settings.write",
@@ -621,6 +639,19 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 				permission: "cdr.export",
 				label: "Export call history",
 				description: "Generate CSV or scheduled reporting exports.",
+			},
+		],
+	},
+	{
+		resource: "audit",
+		label: "Audit log",
+		description: "The append-only record of who changed the phone system, and what they changed.",
+		permissions: [
+			{
+				permission: "audit.read",
+				label: "View the audit log",
+				description:
+					"Search the organization's change history and read the before/after of each change.",
 			},
 		],
 	},
