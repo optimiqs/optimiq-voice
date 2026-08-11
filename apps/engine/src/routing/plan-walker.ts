@@ -3447,7 +3447,7 @@ export class PlanWalker {
 			legId: this.deps.channel.channelId,
 			peerLegId: this.peerLegIdOf(peerMediaChannelId),
 			bridgeId,
-			mode: "full",
+			mode: "media",
 		});
 
 		// Once bridged, the B-leg's death is what ends the call. Nothing else is watching it: the

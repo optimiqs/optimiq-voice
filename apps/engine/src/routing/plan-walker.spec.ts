@@ -607,7 +607,7 @@ describe("extension nodes", () => {
 		await h.walker.walk(walkInput(plan()));
 
 		const bridged = h.published.find((event) => event.type === "channel.bridged");
-		expect(bridged?.data).toMatchObject({ legId: A_LEG_ID, mode: "full" });
+		expect(bridged?.data).toMatchObject({ legId: A_LEG_ID, mode: "media" });
 		expect(String(bridged?.data.peerLegId)).toStartWith("leg-of-");
 	});
 

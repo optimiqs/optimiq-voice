@@ -596,7 +596,7 @@ suite("engine end-to-end", () => {
 		);
 
 		const bridged = callEvents.find((event) => event.envelope.type === "channel.bridged");
-		expect(bridged?.envelope.data).toMatchObject({ legId, mode: "full" });
+		expect(bridged?.envelope.data).toMatchObject({ legId, mode: "media" });
 
 		// The B-leg the walker originated reached the loopback context and answered, so the
 		// mirrored snapshot now names a bridge.
