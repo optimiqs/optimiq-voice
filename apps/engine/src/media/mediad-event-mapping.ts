@@ -65,9 +65,13 @@ import type { HangupCause } from "@optimiq-voice/telephony";
  * Each one is a claim this file has to be able to justify:
  *
  * - `released` → 16 NORMAL_CLEARING. The engine asked, so the call ended the way calls end.
- * - `rtp-timeout` → 41 NORMAL_TEMPORARY_FAILURE. The network stopped carrying audio; the call was fine and
+ * - `rtp-timeout` → 804 MEDIA_TIMEOUT. The network stopped carrying audio; the call was fine and
  *   the transport was not. Not 31 NORMAL_UNSPECIFIED, which would put a media failure in the same
- *   CDR bucket as every unexplained hangup and make it invisible in a report.
+ *   CDR bucket as every unexplained hangup and make it invisible in a report — and not 41
+ *   NORMAL_TEMPORARY_FAILURE either, which is where this used to land: the taxonomy has carried a
+ *   cause that means exactly "the media stopped" since it was written, and mapping to a general
+ *   failure while the Asterisk-side watchdog raises the specific one would make the two drivers
+ *   report the same event under two different names in the same CDR table.
  * - `idle-reaped` → 102 RECOVERY_ON_TIMER_EXPIRE, which is literally what happened: a timer the
  *   engine was supposed to beat expired and the resource was reclaimed.
  * - `drained` → 44 REQUESTED_CHAN_UNAVAIL. The channel this call was using went away underneath it.
@@ -75,7 +79,7 @@ import type { HangupCause } from "@optimiq-voice/telephony";
  */
 const CAUSE_BY_REASON: Readonly<Record<string, { cause: HangupCause; code: number }>> = {
 	released: { cause: "NORMAL_CLEARING", code: 16 },
-	"rtp-timeout": { cause: "NORMAL_TEMPORARY_FAILURE", code: 41 },
+	"rtp-timeout": { cause: "MEDIA_TIMEOUT", code: 804 },
 	"idle-reaped": { cause: "RECOVERY_ON_TIMER_EXPIRE", code: 102 },
 	drained: { cause: "REQUESTED_CHAN_UNAVAIL", code: 44 },
 	error: { cause: "NORMAL_TEMPORARY_FAILURE", code: 41 },

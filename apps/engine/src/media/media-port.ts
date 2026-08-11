@@ -1,4 +1,4 @@
-import type { HangupCause } from "@optimiq-voice/telephony";
+import type { BridgeMode, HangupCause } from "@optimiq-voice/telephony";
 
 /**
  * The engine-facing media contract.
@@ -77,9 +77,11 @@ export interface OriginatedChannel {
 /**
  * A bridge, as the engine names it.
  *
- * `mixing` is the only mode the walker asks for today. A two-party call could use the cheaper
- * `proxy_media`, but a mixing bridge is the one that can be recorded and the one DTMF survives,
- * and both of those are the next wave rather than a hypothetical.
+ * There is no mode on the REQUEST, deliberately. A route that asked for `bypass` on Asterisk would
+ * get a mixing bridge anyway — ARI has one bridge type the engine can use — and a request field
+ * the adapter silently ignores is the exact defect this wave exists to remove. What the bridge
+ * runs in is a property of the driver, declared once at {@link MediaPort.bridgeMode}; a per-route
+ * mode becomes a request field on the day a driver can honour more than one.
  */
 export interface CreateBridgeRequest {
 	/** Client-assigned, so the id is known before the bridge exists (and is a domain UUID). */
@@ -154,6 +156,22 @@ export interface SnoopRequest {
  * decisions on the far side of this seam.
  */
 export interface MediaPort {
+	/**
+	 * The mode this driver's bridges actually run in.
+	 *
+	 * A DECLARATION, not a request: `packages/telephony/src/bridge.ts` names four modes and the two
+	 * drivers behind this seam deliver different ones. Asterisk's mixing bridge decodes the audio,
+	 * so it is `media` and every media bug in §5 — recording, eavesdrop, inband detection — can
+	 * attach to it. `mediad`'s v1 relays packets and never decodes them, so it is `proxy-media`:
+	 * the packets pass through us and the samples do not exist, which is precisely why it refuses
+	 * `snoop` by name and cannot record a live conversation.
+	 *
+	 * Stated here rather than rediscovered at each call site so a feature asks
+	 * `supportsRecording(port.bridgeMode)` once, in domain terms, instead of every runtime
+	 * re-deriving what its media plane can do and one of them getting it wrong.
+	 */
+	readonly bridgeMode: BridgeMode;
+
 	/** SIP 200 OK. Starts billing. */
 	answer(channelId: string): Promise<void>;
 

@@ -31,7 +31,7 @@ import type {
 } from "./media-port";
 import type { MediadTransport } from "./mediad-transport";
 import type { MediaAllocateSessionResponse } from "@optimiq-voice/events";
-import type { HangupCause } from "@optimiq-voice/telephony";
+import type { BridgeMode, HangupCause } from "@optimiq-voice/telephony";
 
 /**
  * {@link MediaPort} over `apps/mediad`, at rung 4 of `plans/mediad-design.md` §2.
@@ -106,6 +106,14 @@ import type { HangupCause } from "@optimiq-voice/telephony";
 const MILLIS_PER_SECOND = 1_000;
 
 export class MediadMediaPort implements MediaPort {
+	/**
+	 * v1 relays RTP without decoding it — the header is rewritten and the payload is passed through
+	 * byte for byte. That is `proxy-media` exactly, and it is the reason `snoop` is refused
+	 * permanently below rather than pending: there are no samples to tap. See
+	 * {@link MediaPort.bridgeMode}.
+	 */
+	readonly bridgeMode = "proxy-media" satisfies BridgeMode;
+
 	private readonly logger = getLogger("engine.mediad");
 
 	/**

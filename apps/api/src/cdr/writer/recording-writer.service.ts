@@ -290,6 +290,21 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 		}
 	}
 
+	/**
+	 * When this recording becomes eligible for purging, or `null` for "keep indefinitely".
+	 *
+	 * Computed at WRITE time from the window in force now, never re-derived on the sweep — see
+	 * `CDR_RECORDING_RETENTION_DAYS`. `null` is the default and is what leaves a row invisible to
+	 * the sweeper forever, which is the pre-existing behaviour of every row already in the table.
+	 */
+	private retentionUntil(): Date | null {
+		const days = this.env.CDR_RECORDING_RETENTION_DAYS;
+		if (days <= 0) {
+			return null;
+		}
+		return new Date(Date.now() + days * 24 * 60 * 60 * 1_000);
+	}
+
 	/** Creates the metadata row. Idempotent on `object_key`, which is unique across the bucket. */
 	private async recordStarted(
 		organizationId: string,
@@ -307,6 +322,7 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 					objectKey: data.objectKey,
 					durationMs: 0,
 					sizeBytes: 0,
+					retentionUntil: this.retentionUntil(),
 				})
 				.onConflictDoNothing()
 				.returning({ id: recordings.id });
@@ -347,9 +363,14 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 					objectKey: data.objectKey,
 					durationMs,
 					sizeBytes,
+					retentionUntil: this.retentionUntil(),
 				})
 				.onConflictDoUpdate({
 					target: recordings.objectKey,
+					// `retention_until` is deliberately NOT in the update set: the row was stamped when
+					// the recording started, and a redelivery of `stopped` (or a `stopped` that arrives
+					// after a settings change) must not quietly extend or shorten a window that has
+					// already been recorded against this object.
 					set: { durationMs, sizeBytes, updatedAt: new Date() },
 					// The tenant predicate on the conflict path. `object_key` is unique across the
 					// BUCKET rather than within a tenant, so without it a producer that guessed another

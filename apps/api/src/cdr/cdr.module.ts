@@ -3,6 +3,7 @@ import { getLogger } from "@optimiq-voice/logging";
 import { createObjectStore, describeObjectStore, loadStorageEnv } from "../storage";
 import { CdrController } from "./query/cdr.controller";
 import { CdrService } from "./query/cdr.service";
+import { CdrRecordingRetentionSweeper } from "./recordings/recording-retention-sweeper.service";
 import { CdrRecordingsController } from "./recordings/recordings.controller";
 import { RecordingsService } from "./recordings/recordings.service";
 import { createCdrDatabase } from "./shared/cdr-database";
@@ -75,8 +76,16 @@ const logger = getLogger("api.cdr");
 		RecordingsService,
 		CdrLegWriter,
 		CdrRecordingWriter,
+		CdrRecordingRetentionSweeper,
 	],
-	exports: [CDR_ENV, CDR_DATABASE, CDR_RECORDING_STORE, CdrService, RecordingsService],
+	exports: [
+		CDR_ENV,
+		CDR_DATABASE,
+		CDR_RECORDING_STORE,
+		CdrService,
+		RecordingsService,
+		CdrRecordingRetentionSweeper,
+	],
 })
 export class CdrModule implements OnApplicationShutdown {
 	constructor(@Inject(CDR_DATABASE) private readonly database: CdrDatabaseClient) {

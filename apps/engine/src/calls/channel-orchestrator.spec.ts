@@ -128,6 +128,10 @@ function fakeEnv(overrides: Partial<EngineEnv> = {}): EngineEnv {
 		ENGINE_EXTENSION_DIAL_TEMPLATE: "PJSIP/{number}",
 		ENGINE_TRUNK_DIAL_TEMPLATE: "PJSIP/{number}@{trunk}",
 		ENGINE_DEFAULT_RING_TIMEOUT_SECONDS: 30,
+		ENGINE_PROGRESS_TIMEOUT_SECONDS: 0,
+		// Off unless a case arms it: every other spec in this file would otherwise leave a live
+		// timer behind for four hours of test-runner wall clock.
+		ENGINE_MAX_CALL_DURATION_SECONDS: 0,
 		ENGINE_PROMPT_MEDIA_PREFIX: "sound:",
 		ENGINE_UNAVAILABLE_ANNOUNCEMENT: "sound:unavailable",
 		ENGINE_VOICEMAIL_GREETING: "sound:unavailable",
@@ -540,6 +544,71 @@ describe("progress", () => {
 		const snapshot = [...h.kv.values()][0];
 		expect(snapshot?.variables.OPTIMIQ_X).toBe("1");
 		expect(snapshot?.variables.SIPCALLID).toBeUndefined();
+	});
+});
+
+/**
+ * The maximum-call-duration ceiling.
+ *
+ * These cases use the real clock, at the shortest budget the environment schema permits (one
+ * second). Faking it would mean injecting a timer seam into the orchestrator for one guardrail,
+ * and the thing worth proving here — that the timer is armed at ANSWER and disarmed at the leg's
+ * end — is exactly the part a fake timer would stop testing.
+ */
+describe("maximum call duration", () => {
+	const settle = (ms: number): Promise<void> =>
+		new Promise((resolve) => {
+			setTimeout(resolve, ms);
+		});
+
+	async function answeredWithCeiling(seconds: number) {
+		const h = harness(fakeEnv({ ENGINE_MAX_CALL_DURATION_SECONDS: seconds }));
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
+		await h.orchestrator.handleEvent(
+			mediaEvent("ChannelStateChange", { channel: channel({ state: "Up" }) }),
+		);
+		return h;
+	}
+
+	it("ends a call that outlives the ceiling, and says ALLOTTED_TIMEOUT in the CDR", async () => {
+		const h = await answeredWithCeiling(1);
+
+		await settle(1_200);
+
+		expect(h.mediaPort.hungUp()).toEqual([{ channelId: ARI_CHANNEL, cause: "ALLOTTED_TIMEOUT" }]);
+
+		// The cause is fixed BEFORE the media server reports its own generic code, which is the
+		// whole point: a CDR that said NORMAL_CLEARING could not tell a cut call from a hangup.
+		await h.orchestrator.handleEvent(
+			mediaEvent("ChannelDestroyed", {
+				channel: channel({ state: "Down" }),
+				cause: 16,
+				cause_txt: "Normal Clearing",
+			}),
+		);
+		expect(h.cdrs[0]?.data).toMatchObject({ hangupCause: "ALLOTTED_TIMEOUT" });
+	});
+
+	it("disarms the ceiling when the call ends on its own first", async () => {
+		const h = await answeredWithCeiling(1);
+		await h.orchestrator.handleEvent(
+			mediaEvent("ChannelDestroyed", {
+				channel: channel({ state: "Down" }),
+				cause: 16,
+				cause_txt: "Normal Clearing",
+			}),
+		);
+
+		await settle(1_200);
+
+		expect(h.mediaPort.hungUp()).toEqual([]);
+		expect(h.cdrs[0]?.data).toMatchObject({ hangupCause: "NORMAL_CLEARING" });
+	});
+
+	it("arms nothing at all when the deployment has switched the ceiling off", async () => {
+		const h = await answeredWithCeiling(0);
+		await settle(1_200);
+		expect(h.mediaPort.hungUp()).toEqual([]);
 	});
 });
 

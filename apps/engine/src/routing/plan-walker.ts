@@ -5,6 +5,7 @@ import { QueueSession } from "../queue/queue-session";
 import { legSignalKey, recordingSignalKey } from "./call-signals";
 import { DEFAULT_MEDIA_REF_SETTINGS, resolveMediaRef, translateMediaRef } from "./media-refs";
 import { planDestinationOf, sameDestination } from "./plan-destination";
+import { orderTrunkAttempts } from "./trunk-selection";
 import { verifyPinDigest, verifyVoicemailPin } from "./voicemail-pin";
 import type { MediaPort } from "../media/media-port";
 import type {
@@ -18,6 +19,7 @@ import type { CallSignalBus, LegSignal } from "./call-signals";
 import type { ConferenceRegistry } from "./conference-registry";
 import type { MediaRefSettings } from "./media-refs";
 import type { PlanDestination } from "./plan-destination";
+import type { TrunkCapacityPort } from "./trunk-capacity";
 import type { CallEvent } from "@optimiq-voice/events";
 import type {
 	CompiledTimeCondition,
@@ -169,6 +171,20 @@ export interface PlanWalkerSettings {
 	readonly trunkDialTemplate: string;
 	/** Ring time when neither the node nor the member specifies one. */
 	readonly defaultRingTimeoutSeconds: number;
+	/**
+	 * How long an originated leg has to show PROGRESS before it is given up on (`progress_timeout`).
+	 *
+	 * Progress is 180/183 — the far end acknowledging that something is ringing. It is a different
+	 * fact from an answer, and a much earlier one: a carrier that has accepted the INVITE and then
+	 * gone silent will sit there for the whole ring timeout and hand a sequential ladder its
+	 * `NO_ANSWER` thirty seconds late, by which point the caller has hung up. A trunk that is
+	 * black-holing calls is exactly this shape, and it is the case failover exists for.
+	 *
+	 * `0` disables it, which is the default: a deployment whose media server does not republish
+	 * ringing for originated legs would otherwise cancel every call it makes. Turn it on with
+	 * `ENGINE_PROGRESS_TIMEOUT_SECONDS` once ringing is known to arrive.
+	 */
+	readonly progressTimeoutSeconds: number;
 	/** How long to wait for the A-leg's `Up` after issuing `answer`. */
 	readonly answerTimeoutMs: number;
 	/** Hard budget on nodes visited in one walk. A cycle hits it instead of running forever. */
@@ -238,6 +254,7 @@ export const DEFAULT_PLAN_WALKER_SETTINGS: PlanWalkerSettings = {
 	extensionDialTemplate: "PJSIP/{number}",
 	trunkDialTemplate: "PJSIP/{number}@{trunk}",
 	defaultRingTimeoutSeconds: 30,
+	progressTimeoutSeconds: 0,
 	answerTimeoutMs: 10_000,
 	maxPlanSteps: 64,
 	recordingFormat: "wav",
@@ -376,7 +393,20 @@ export interface PlanWalkerDependencies {
 	readonly now?: () => number;
 	/** Injected so a spec asserts a ring-group delay without waiting for it. */
 	readonly delay?: (ms: number) => Promise<void>;
+	/**
+	 * `[0,1)`, for the one decision in the walk that is deliberately not deterministic: how a
+	 * weighted trunk tier is sampled (`trunk-selection.ts`). Injected for the same reason
+	 * `queueSettings.random` is — a spec that asserts a share cannot roll dice.
+	 */
+	readonly random?: () => number;
 	readonly log?: (message: string, detail?: Record<string, unknown>) => void;
+	/**
+	 * The per-trunk concurrent-call ceiling, or absent when this deployment does not enforce one.
+	 *
+	 * Absent means a trunk's `maxChannels` is read and ignored, which is what every release before
+	 * this one did — so a walker spec that is not about capacity does not have to supply one.
+	 */
+	readonly trunkCapacity?: TrunkCapacityPort;
 }
 
 /** One recorded message, on its way to a mailbox. */
@@ -611,6 +641,7 @@ export class PlanWalker {
 	private readonly newId: () => string;
 	private readonly delay: (ms: number) => Promise<void>;
 	private readonly log: (message: string, detail?: Record<string, unknown>) => void;
+	private readonly random: () => number;
 	private readonly notes: string[] = [];
 	private readonly visited: PlanNodeId[] = [];
 	private destination: PlanDestination | undefined;
@@ -626,6 +657,7 @@ export class PlanWalker {
 					timer.unref?.();
 				}));
 		this.log = deps.log ?? (() => undefined);
+		this.random = deps.random ?? Math.random;
 	}
 
 	/**
@@ -1279,10 +1311,12 @@ export class PlanWalker {
 			return undefined;
 		}
 
-		// The route's own chain, lowest order first — the same ordering `trunkDialNode` walks. A
-		// racing leg takes the first trunk only: failing over inside one hop of a ladder would
-		// stretch that hop past its own timeout and past the hop behind it.
-		const trunk = [...target.attempts].sort((a, b) => a.order - b.order)[0];
+		// The route's own chain, in the same order `trunkDialNode` walks it — weights included, so a
+		// tenant's 70/30 split holds for follow-me hops too rather than sending every one of them to
+		// whichever carrier happens to sort first. A racing leg takes the head of the chain only:
+		// failing over inside one hop of a ladder would stretch that hop past its own timeout and
+		// past the hop behind it.
+		const trunk = orderTrunkAttempts(target.attempts, this.random)[0];
 		if (trunk === undefined) {
 			this.note(
 				`follow-me hop "${hop.destination}" of extension ${node.number} has no usable trunk on route "${target.outboundRouteId}"; it was not rung`,
@@ -1473,7 +1507,9 @@ export class PlanWalker {
 		const continueOn = new Set<string>(
 			node.continueOnCauses.length > 0 ? node.continueOnCauses : RETRYABLE_HANGUP_CAUSES,
 		);
-		const attempts = [...node.attempts].sort((a, b) => a.order - b.order);
+		// Failover tiers in `order`, and within a tier the share the tenant bought. See
+		// `trunk-selection.ts` for why a weight is sampled rather than sorted.
+		const attempts = orderTrunkAttempts(node.attempts, this.random);
 		if (attempts.length === 0) {
 			this.note(`trunk-dial node "${node.id}" has no trunks configured`);
 			return this.branch(node.failoverNodeId, "NETWORK_OUT_OF_ORDER");
@@ -1495,6 +1531,29 @@ export class PlanWalker {
 			if (this.deps.channel.isTearingDown) {
 				return { kind: "aborted" };
 			}
+
+			// Before the INVITE, never after: a burst of simultaneous dials that all checked a count
+			// they then went on to increase would every one of them pass a full trunk.
+			const reservation = this.deps.trunkCapacity?.reserve(
+				this.deps.channel.organizationId,
+				attempt.trunkId,
+				attempt.maxChannels,
+			);
+			if (this.deps.trunkCapacity !== undefined && reservation === undefined) {
+				this.note(
+					`trunk ${attempt.name} is at its ${String(attempt.maxChannels)}-channel ceiling; the call was not offered to it`,
+				);
+				this.log("a trunk was skipped at its channel ceiling", {
+					trunk: attempt.name,
+					maxChannels: attempt.maxChannels,
+				});
+				// A retryable cause on purpose: being full is exactly the condition the next trunk in
+				// the chain exists for, and a chain of full trunks ends on the route's own failover
+				// branch with a congestion cause a carrier and a report both understand.
+				lastCause = "SWITCH_CONGESTION";
+				continue;
+			}
+
 			const outcome = await this.dialOne(
 				{
 					endpoint: this.settings.trunkDialTemplate
@@ -1517,8 +1576,12 @@ export class PlanWalker {
 			);
 
 			if (outcome.kind === "answered") {
+				// Handed to the leg: from here the channel is spent until the leg ends, and the
+				// orchestrator returns it in `onLegEnded`.
+				reservation?.bindTo(outcome.mediaChannelId);
 				return await this.bridgeWith(outcome.mediaChannelId);
 			}
+			reservation?.release();
 			if (outcome.kind === "aborted") {
 				return { kind: "aborted" };
 			}
@@ -2762,6 +2825,7 @@ export class PlanWalker {
 	): Promise<DialOutcome> {
 		const channelIds = attempts.map(() => this.newId());
 		const unwatchers: (() => void)[] = [];
+		const progressTimers: { readonly cancel: () => void }[] = [];
 		const abortConfirmations: (() => void)[] = [];
 		const confirming = new Set<number>();
 		const ended = new Set<number>();
@@ -2816,10 +2880,28 @@ export class PlanWalker {
 		for (const index of attempts.keys()) {
 			const channelId = channelIds[index] as string;
 			const attempt = attempts[index] as DialAttempt;
+			// Per leg, not per race: one black-holing trunk in a ring-all must not keep the other
+			// phones from ringing, so the silent leg drops OUT of the race and the race goes on.
+			// A race in which every leg fell silent ends as a timeout, i.e. as "nobody answered".
+			const progress = this.armProgressTimeout(attempt, () => {
+				if (settled || ended.has(index)) {
+					return;
+				}
+				this.note(`${attempt.label} showed no progress and was dropped from the race`);
+				void this.hangupQuietly(channelId, "ORIGINATOR_CANCEL").finally(() => {
+					legIsOut(index);
+				});
+			});
+			progressTimers.push(progress);
 			unwatchers.push(
 				this.deps.signals.watch(legSignalKey(channelId), (signal) => {
 					const leg = signal as LegSignal;
+					if (leg.kind === "ringing" || leg.kind === "progress") {
+						progress.sawProgress();
+						return;
+					}
 					if (leg.kind === "answered" || leg.kind === "entered") {
+						progress.sawProgress();
 						const confirm = attempt.confirm;
 						if (confirm === undefined) {
 							resolveOutcome({ kind: "answered", mediaChannelId: channelId, index });
@@ -2870,6 +2952,9 @@ export class PlanWalker {
 
 		const outcome = await outcomePromise;
 		clearTimeout(overall);
+		for (const progress of progressTimers) {
+			progress.cancel();
+		}
 		for (const unwatch of unwatchers) {
 			unwatch();
 		}
@@ -2894,6 +2979,39 @@ export class PlanWalker {
 		return outcome;
 	}
 
+	/**
+	 * Arms one leg's `progress_timeout`, or a no-op when the deployment has it switched off.
+	 *
+	 * Single-shot in both directions: the first progress signal disarms it for good (a leg that
+	 * rings, stops and rings again has already proved the far end is alive), and `onSilence` fires
+	 * at most once. Returning a pair of closures rather than a timer handle keeps the two dial
+	 * loops from having to know whether a timer exists at all.
+	 */
+	private armProgressTimeout(
+		attempt: DialAttempt,
+		onSilence: () => void,
+	): { readonly sawProgress: () => void; readonly cancel: () => void } {
+		const seconds = this.settings.progressTimeoutSeconds;
+		if (seconds <= 0) {
+			return { sawProgress: () => undefined, cancel: () => undefined };
+		}
+		// Never longer than the ring budget: a progress timeout above it can only fire after the
+		// dial has already been settled by its own timer, which is a timer that does nothing.
+		const budget = Math.min(seconds, Math.max(1, attempt.timeoutSeconds)) * MILLIS_PER_SECOND;
+		let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
+			timer = undefined;
+			onSilence();
+		}, budget);
+		timer.unref?.();
+		const cancel = (): void => {
+			if (timer !== undefined) {
+				clearTimeout(timer);
+				timer = undefined;
+			}
+		};
+		return { sawProgress: cancel, cancel };
+	}
+
 	/** Rings exactly one attempt and waits for it to answer, fail or time out. */
 	private async dialOne(
 		attempt: DialAttempt,
@@ -2914,9 +3032,21 @@ export class PlanWalker {
 			};
 		});
 
+		// Cleared by the first sign of life from the far end, whichever it is. See
+		// {@link PlanWalkerSettings.progressTimeoutSeconds} for why a silent leg is cut early.
+		const progress = this.armProgressTimeout(attempt, () => {
+			this.note(`${attempt.label} showed no progress and was given up on`);
+			resolveOutcome({ kind: "timeout" });
+		});
+
 		const unwatch = this.deps.signals.watch(legSignalKey(channelId), (signal) => {
 			const leg = signal as LegSignal;
+			if (leg.kind === "ringing" || leg.kind === "progress") {
+				progress.sawProgress();
+				return;
+			}
 			if (leg.kind === "answered" || leg.kind === "entered") {
+				progress.sawProgress();
 				resolveOutcome({ kind: "answered", mediaChannelId: channelId, index });
 				return;
 			}
@@ -2943,6 +3073,7 @@ export class PlanWalker {
 
 		const outcome = await outcomePromise;
 		clearTimeout(timer);
+		progress.cancel();
 		unwatch();
 		unwatchCaller();
 

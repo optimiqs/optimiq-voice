@@ -152,6 +152,52 @@ export const cdrEnvSchema = z.object({
 	 * above does not change, because it authorizes the REQUEST, not the storage.
 	 */
 	CDR_RECORDING_ROOT: z.string().min(1).default("/opt/optimiq-voice/recordings"),
+
+	/**
+	 * How long a call recording is kept before it is purged, in days.
+	 *
+	 * Stamped onto `recordings.retention_until` when the row is written, because that is the only
+	 * moment the policy in force is unambiguous: applying today's window retroactively to a row
+	 * recorded under last year's is exactly the mistake a retention policy exists to prevent, and a
+	 * customer who shortened their window should not have three-year-old audio disappear as a side
+	 * effect of a settings change.
+	 *
+	 * `0` — the default, and what every release before this one did implicitly — means keep
+	 * indefinitely: `retention_until` stays null and the sweeper never sees the row. That remains
+	 * the default because deleting a tenant's audio is not a thing to start doing on an upgrade.
+	 *
+	 * ## Why this is a platform setting and not (yet) a per-organization one
+	 *
+	 * The natural home for a tenant's own window is `org_setting`, which lives in `pbx-db` — a
+	 * different database with a different pool, deliberately never shared with this one
+	 * (`cdr.module.ts`). Reading it here would put a cross-database round trip on the recording
+	 * write path for every recording, and a `PbxDatabaseClient` into a module that has been
+	 * self-contained on purpose. A per-org window belongs on the event or in a cached policy
+	 * projection; until one of those exists, this is a platform-wide floor rather than a promise
+	 * the column cannot keep.
+	 */
+	CDR_RECORDING_RETENTION_DAYS: z.coerce.number().int().min(0).max(3_650).default(0),
+
+	/**
+	 * How often the recording purge runs in this process. `0` disables it.
+	 *
+	 * The sweep deletes the OBJECT first and tombstones the row only for the objects that actually
+	 * went, so an interval that is missed costs latency and never correctness. Hourly by default:
+	 * a retention window is measured in days, so anything finer only adds load.
+	 *
+	 * It runs under the same `CDR_WRITER_ENABLED` switch as the durable consumers, for the same
+	 * reason — it is a singleton workload, and N API replicas each purging the same batch would be
+	 * N-1 wasted passes over an object store.
+	 */
+	CDR_RECORDING_SWEEP_INTERVAL_MS: z.coerce
+		.number()
+		.int()
+		.min(0)
+		.max(86_400_000)
+		.default(3_600_000),
+
+	/** Recordings purged in one pass. Bounded so one sweep cannot hold the pool for minutes. */
+	CDR_RECORDING_SWEEP_BATCH: z.coerce.number().int().min(1).max(1_000).default(200),
 });
 
 export type CdrEnv = z.infer<typeof cdrEnvSchema>;

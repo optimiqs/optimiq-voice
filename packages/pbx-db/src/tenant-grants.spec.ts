@@ -33,10 +33,30 @@ function grantBlocks(sql: string): { privileges: string; tables: readonly string
 	return blocks;
 }
 
+/**
+ * Tables a later migration dropped.
+ *
+ * A `DROP TABLE` takes its grants with it, so a table that was granted and then dropped is not a
+ * privilege anybody holds — but the GRANT statement is still sitting in the migration history this
+ * spec reads, and without this it would look like one. Subtracting the drops is what lets a table
+ * be REMOVED from the schema without the spec demanding a revoke migration that Postgres does not
+ * need.
+ */
+function droppedTables(sql: string): ReadonlySet<string> {
+	return new Set(
+		[...sql.matchAll(/DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?"([a-z_]+)"/gu)].map(
+			([, name]) => name ?? "",
+		),
+	);
+}
+
 const sql = readMigrationSql();
 const blocks = grantBlocks(sql);
+const dropped = droppedTables(sql);
 const grantedPrivileges = new Map<string, string>(
-	blocks.flatMap((block) => block.tables.map((table) => [table, block.privileges] as const)),
+	blocks
+		.flatMap((block) => block.tables.map((table) => [table, block.privileges] as const))
+		.filter(([table]) => !dropped.has(table)),
 );
 
 describe("tenant role grants", () => {

@@ -5,6 +5,7 @@ import {
 	hangupCauseForTransfer,
 	INITIAL_PARK_STATE,
 	INITIAL_TRANSFER_STATE,
+	supportsRecording,
 } from "@optimiq-voice/telephony";
 import { legSignalKey, recordingSignalKey } from "../routing/call-signals";
 import { parkSlotFor } from "../routing/park-registry";
@@ -397,6 +398,11 @@ interface Consultation {
 	readonly transfereeMediaChannelId: string;
 	readonly destination: string;
 	readonly context: string;
+	/**
+	 * Where the transferee goes when the handover fails and the transferor is no longer there to
+	 * take them back (`transfer_fallback_extension`). See {@link CallControl.rescueTransferee}.
+	 */
+	readonly fallbackDestination?: string;
 	readonly startedAtMs: number;
 	/** Drops the watcher on the transferee, which aborts the transfer if they hang up. */
 	readonly stopWatching: () => void;
@@ -1253,6 +1259,9 @@ export class CallControl implements CallControlPort {
 			transfereeMediaChannelId: transferee.mediaChannelId,
 			destination,
 			context,
+			...(request.fallbackDestination === undefined
+				? {}
+				: { fallbackDestination: request.fallbackDestination }),
 			startedAtMs: this.now(),
 			// A transferee who hangs up while on hold ends the transfer: there is nobody left to hand
 			// over, and a consultation that continued would connect the transferor to a target for a
@@ -1331,6 +1340,10 @@ export class CallControl implements CallControlPort {
 			consultation.state = "failed";
 			assertTransferTransition("consulting", "failed");
 			await this.dropConsultation(leg.mediaChannelId);
+			const rescued = await this.rescueTransferee(leg, transferee, consultation);
+			if (rescued !== undefined) {
+				return rescued;
+			}
 			const returned = await this.unhold(transferee);
 			return refuse(
 				`the consultation leg is gone; the transferee was ${
@@ -1351,6 +1364,10 @@ export class CallControl implements CallControlPort {
 			consultation.state = "failed";
 			assertTransferTransition("completing", "failed");
 			await this.dropConsultation(leg.mediaChannelId);
+			const rescued = await this.rescueTransferee(leg, transferee, consultation);
+			if (rescued !== undefined) {
+				return rescued;
+			}
 			return refuse(`the transferee could not be joined to the target: ${String(error)}`);
 		}
 
@@ -1462,6 +1479,57 @@ export class CallControl implements CallControlPort {
 		}
 		return refuse(
 			`the transferee could not be routed to ${destination} (${outcome.status}); the routing walk ended the call`,
+		);
+	}
+
+	/**
+	 * The transferee's last resort when an ATTENDED transfer falls apart at completion.
+	 *
+	 * `completeTransfer` has exactly one production caller — {@link CallControl.onLegEnded}, the
+	 * transferor hanging up, which is the classic completion signal. So every failure inside it is
+	 * a failure with **nobody left to hand the caller back to**: the "the transferee was returned
+	 * to the transferor" repair below unholds them onto a leg that is at that moment being
+	 * destroyed, and what the caller hears is silence and then a dropped call.
+	 *
+	 * That is precisely the case `transfer_fallback_extension` names, and it is the only place an
+	 * attended transfer has one. A CONSULTATION that never connects is not this case — there the
+	 * transferor is still on the line and is the best possible fallback, so `transfer()` keeps
+	 * returning the transferee to them and does not come through here.
+	 *
+	 * `undefined` means "no rescue was attempted"; the caller then falls through to its own repair.
+	 */
+	private async rescueTransferee(
+		transferor: ControlledLeg,
+		transferee: ControlledLeg,
+		consultation: Consultation,
+	): Promise<CallControlResult | undefined> {
+		const fallback = consultation.fallbackDestination?.trim();
+		if (fallback === undefined || fallback === "") {
+			return undefined;
+		}
+		if (transferee.isTearingDown) {
+			return undefined;
+		}
+
+		transferee.setBridgePeer(undefined);
+		transferee.addFlag("transfer");
+		transferee.moveTo("routing");
+
+		const outcome = await this.routeTransferee(transferee, fallback, consultation.context);
+		if (outcome.status !== "bridged") {
+			return refuse(
+				`the transfer failed and the fallback destination ${fallback} could not be reached (${outcome.status})`,
+			);
+		}
+		await this.publishQuietly(transferee, "call.transferred", {
+			legId: transferee.legId,
+			kind: consultation.kind satisfies TransferKind,
+			destination: fallback,
+			routingContext: consultation.context,
+			transferorLegId: transferor.legId,
+		});
+		return ok(
+			`the transfer failed; the transferee was sent to the fallback destination ${fallback}`,
 		);
 	}
 
@@ -1630,6 +1698,16 @@ export class CallControl implements CallControlPort {
 	 * voicemail path publishes, so the object-store uploader, the CDR's `recordingKey` and the
 	 * signed-URL endpoint all work with no change. `kind` is `call` rather than `voicemail`, which
 	 * is the only difference and is what the retention policy keys off.
+	 *
+	 * ## The media plane has to be holding samples
+	 *
+	 * A tap reads DECODED audio, so it is only possible on a bridge whose mode decodes — which is
+	 * `media` and nothing else ({@link import("@optimiq-voice/telephony").supportsRecording}). The
+	 * check is made here, against the driver's declared {@link MediaPort.bridgeMode}, rather than
+	 * being discovered from whatever error a relay-only plane returns when asked to snoop: the two
+	 * failures need different answers from an operator ("this media plane cannot record" is a
+	 * deployment fact, "the media server refused a tap" is an incident) and only one of them is
+	 * worth paging about.
 	 */
 	async startRecording(
 		leg: ControlledLeg,
@@ -1638,6 +1716,13 @@ export class CallControl implements CallControlPort {
 		const refusal = this.refuseIfUnusable(leg, "record");
 		if (refusal !== undefined) {
 			return { result: refusal };
+		}
+		if (!supportsRecording(this.deps.media.bridgeMode)) {
+			return {
+				result: refuse(
+					`this media plane bridges in ${this.deps.media.bridgeMode} mode, which never decodes the audio, so a call on it cannot be recorded`,
+				),
+			};
 		}
 		if (this.recordings.has(leg.mediaChannelId)) {
 			return { result: refuse("this leg is already being recorded") };

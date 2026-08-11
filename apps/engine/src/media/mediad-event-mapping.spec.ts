@@ -118,8 +118,10 @@ describe("toMediaEventFromMediad", () => {
 			// The engine asked, so the call ended the way calls end.
 			["released", "NORMAL_CLEARING", 16],
 			// The network stopped carrying audio. NOT 31 NORMAL_UNSPECIFIED, which would bury a media
-			// failure in the same CDR bucket as every unexplained hangup.
-			["rtp-timeout", "NORMAL_TEMPORARY_FAILURE", 41],
+			// failure in the same CDR bucket as every unexplained hangup — and not the general 41
+			// NORMAL_TEMPORARY_FAILURE either: the taxonomy has a cause that means exactly this, and
+			// the Asterisk-side watchdog raises it, so the two drivers must agree on the name.
+			["rtp-timeout", "MEDIA_TIMEOUT", 804],
 			// Literally what happened: a timer the engine should have beaten expired.
 			["idle-reaped", "RECOVERY_ON_TIMER_EXPIRE", 102],
 			// The channel this call was using went away underneath it.

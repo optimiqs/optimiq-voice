@@ -15,7 +15,7 @@ import type {
 	SnoopRequest,
 } from "./media-port";
 import type { AriClient } from "@optimiq-voice/media-ari";
-import type { HangupCause } from "@optimiq-voice/telephony";
+import type { BridgeMode, HangupCause } from "@optimiq-voice/telephony";
 
 /**
  * {@link MediaPort} over Asterisk ARI.
@@ -32,6 +32,12 @@ import type { HangupCause } from "@optimiq-voice/telephony";
  * boolean rather than an exception, so the orchestrator never has to catch to ask.
  */
 export class AriMediaAdapter implements MediaPort {
+	/**
+	 * Asterisk's `mixing` bridge decodes the audio, which is what makes recording, `snoop` and
+	 * `dtmf_events` possible on it. See {@link MediaPort.bridgeMode}.
+	 */
+	readonly bridgeMode = "media" satisfies BridgeMode;
+
 	constructor(
 		private readonly client: AriClient,
 		/** The Stasis application name; `watchChannel` subscribes on its behalf. */

@@ -10,8 +10,8 @@ import { projectionOutbox } from "./outbox-schema";
 import { queue, queueAgent, queueTier } from "./queues-schema";
 import { ringGroup, ringGroupDestination } from "./ring-groups-schema";
 import { inboundRoute, outboundRoute } from "./routing-schema";
-import { auditLog, sipAclEntry } from "./security-schema";
-import { orgSetting, userSetting } from "./settings-schema";
+import { auditLog, sipAclEntry, sipAuthEvent } from "./security-schema";
+import { orgSetting } from "./settings-schema";
 import { timeCondition, timeConditionRule } from "./time-conditions-schema";
 import { trunk } from "./trunks-schema";
 import {
@@ -57,10 +57,10 @@ export const pbxTables = {
 	ringGroup,
 	ringGroupDestination,
 	sipAclEntry,
+	sipAuthEvent,
 	timeCondition,
 	timeConditionRule,
 	trunk,
-	userSetting,
 	voicemailBox,
 	voicemailGreeting,
 	voicemailMessage,

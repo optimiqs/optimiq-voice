@@ -990,6 +990,53 @@ describe("attended transfer", () => {
 		expect(h.control.hasPendingTransfer("t")).toBe(false);
 	});
 
+	it("sends the transferee to the fallback when the target is gone at completion time", async () => {
+		const transferor = fakeLeg("t");
+		const transferee = fakeLeg("e");
+		bridgePair(transferor, transferee);
+		const destinations: string[] = [];
+		const h = harness({
+			legs: [transferor, transferee],
+			route: async (_leg, request) => {
+				destinations.push(request.destination);
+				return { status: "bridged", notes: [] };
+			},
+		});
+		await h.control.transfer(transferor, {
+			kind: "attended",
+			destination: "1002",
+			fallbackDestination: "1003",
+		});
+		// The target hangs up while the transferor is still consulting, so the completion below has
+		// no bridge to join the transferee to.
+		transferor.peerMediaChannelId = undefined;
+		transferor.bridgeId = undefined;
+
+		const result = await h.control.onLegEnded("t");
+
+		expect(destinations).toEqual(["1002", "1003"]);
+		expect(h.eventsOf("call.transferred")[0]?.data).toMatchObject({
+			legId: "leg-e",
+			kind: "attended",
+			destination: "1003",
+		});
+		expect(result).toBeUndefined();
+	});
+
+	it("falls back to the transferor when there is no fallback destination", async () => {
+		const { transferor, transferee, h } = consulting();
+		await h.control.transfer(transferor, { kind: "attended", destination: "1002" });
+		transferor.peerMediaChannelId = undefined;
+		transferor.bridgeId = undefined;
+
+		const result = await h.control.completeTransfer(transferor);
+
+		expect(result.ok).toBe(false);
+		expect(h.control.isHeld("e")).toBe(false);
+		expect(transferee.callStates).toEqual(["held", "unheld", "active"]);
+		expect(h.eventsOf("call.transferred")).toHaveLength(0);
+	});
+
 	it("refuses to complete or cancel a transfer that was never started", async () => {
 		const h = harness();
 		const leg = fakeLeg("t");
@@ -1164,6 +1211,20 @@ describe("on-demand recording", () => {
 		expect(await h.control.startRecording(leg)).toMatchObject({
 			result: { ok: false, reason: "this leg is already being recorded" },
 		});
+	});
+
+	it("refuses on a media plane whose bridges never decode, without attempting a tap", async () => {
+		const leg = fakeLeg("c");
+		// `mediad` v1: RTP is relayed and never decoded, so there are no samples to record.
+		const h = harness({ legs: [leg], media: { bridgeMode: "proxy-media" } });
+
+		const outcome = await h.control.startRecording(leg);
+
+		expect(outcome.result.ok).toBe(false);
+		expect(outcome.result.ok ? "" : outcome.result.reason).toContain("proxy-media");
+		// The refusal is a deployment fact, decided here — not an error dragged back out of the
+		// media server after a tap it was always going to reject.
+		expect(h.media.methods()).not.toContain("snoop");
 	});
 
 	it("reports a media server that refuses the tap", async () => {

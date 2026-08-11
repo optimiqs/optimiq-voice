@@ -112,7 +112,11 @@ export function trunkDialNode(
 	};
 }
 
-export function trunkAttempt(name: string, order: number): TrunkDialPlanNode["attempts"][number] {
+export function trunkAttempt(
+	name: string,
+	order: number,
+	overrides: Partial<TrunkDialPlanNode["attempts"][number]> = {},
+): TrunkDialPlanNode["attempts"][number] {
 	return {
 		trunkId: `trunk-${name}`,
 		name,
@@ -121,6 +125,7 @@ export function trunkAttempt(name: string, order: number): TrunkDialPlanNode["at
 		sipProxy: "sip.carrier.example",
 		transport: "udp",
 		order,
+		...overrides,
 	};
 }
 

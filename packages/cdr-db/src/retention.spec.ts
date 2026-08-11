@@ -6,6 +6,7 @@ import {
 	expiredRecordingsSelectQuery,
 	expiredRecordingsUpdateQuery,
 	planCdrRetention,
+	purgedRecordingSoftDeleteQuery,
 	purgedRecordingTombstoneDeleteQuery,
 	retentionCutoff,
 	RetentionWindowError,
@@ -70,6 +71,22 @@ describe("retention statements", () => {
 		expect(text).toContain("order by");
 		expect(text).toContain("limit");
 		expect(JSON.stringify(query.queryChunks)).toContain("object_key");
+	});
+
+	it("tombstones only the ids whose object actually went", () => {
+		const text = JSON.stringify(purgedRecordingSoftDeleteQuery(NOW, ["a", "b"]).queryChunks);
+
+		expect(text).toContain("update");
+		expect(text).toContain("deleted_at");
+		// Still only rows that hold an object, so a second pass over the same batch is a no-op.
+		expect(text).toContain("is null");
+	});
+
+	it("makes an empty purge batch a statement rather than the caller's problem", () => {
+		// `id = any('{}')` is legal but `in ()` is not, and a worker that found nothing to delete
+		// should not have to know which one this is.
+		expect(() => purgedRecordingSoftDeleteQuery(NOW, [])).not.toThrow();
+		expect(JSON.stringify(purgedRecordingSoftDeleteQuery(NOW, []).queryChunks)).toContain("false");
 	});
 
 	it("removes tombstones only after the object is long gone", () => {

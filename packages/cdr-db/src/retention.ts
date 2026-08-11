@@ -95,6 +95,32 @@ export function expiredRecordingsSelectQuery(now: Date, limit = 500): SQL {
 	`;
 }
 
+/**
+ * Tombstones exactly the rows whose object has just been removed from the store.
+ *
+ * The difference from {@link expiredRecordingsUpdateQuery} is which fact the `deleted_at` is a
+ * record OF. That one marks everything past its window in a single statement, which is right for
+ * the CLI sweep where the object purge is somebody else's problem; this one is for a worker that
+ * deletes the bytes first and then says so, id by id, so a store that refused half the batch
+ * leaves those recordings still playable and still due rather than marked deleted with the audio
+ * intact behind them.
+ *
+ * An empty `ids` is a no-op statement rather than a caller-side branch: a purge worker that found
+ * nothing should not have to know that `in ()` is a syntax error.
+ */
+export function purgedRecordingSoftDeleteQuery(now: Date, ids: readonly string[]): SQL {
+	if (ids.length === 0) {
+		return sql`select null::uuid as "id" where false`;
+	}
+	return sql`
+		update "recordings"
+		set "deleted_at" = ${now.toISOString()}::timestamptz, "updated_at" = ${now.toISOString()}::timestamptz
+		where "id" = any(${ids}::uuid[])
+			and "deleted_at" is null
+		returning "id"
+	`;
+}
+
 /** Removes tombstones whose object was purged longer ago than the tombstone window. */
 export function purgedRecordingTombstoneDeleteQuery(before: Date): SQL {
 	return sql`

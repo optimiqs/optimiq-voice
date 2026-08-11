@@ -12,7 +12,7 @@ import type {
 	SendDtmfRequest,
 	SnoopRequest,
 } from "./media-port";
-import type { HangupCause } from "@optimiq-voice/telephony";
+import type { BridgeMode, HangupCause } from "@optimiq-voice/telephony";
 
 /**
  * A complete {@link MediaPort} that records what it was asked to do.
@@ -35,6 +35,8 @@ export interface MediaCall {
 }
 
 export interface FakeMediaPortOptions {
+	/** The driver capability under test. Defaults to `media`, which is what every deployment runs. */
+	readonly bridgeMode?: BridgeMode;
 	/** Seeds `getVariable`. Mutated in place by `setVariable`. */
 	readonly variables?: Record<string, string>;
 	/** Lets a spec make one endpoint unreachable, which is how "not registered" is exercised. */
@@ -101,6 +103,9 @@ export function makeFakeMediaPort(options: FakeMediaPortOptions = {}): FakeMedia
 	};
 
 	const port: FakeMediaPort = {
+		// `media` by default, because the fake stands in for the driver every deployment runs. A
+		// spec about a relay-only media plane sets it to `proxy-media` and gets the refusals.
+		bridgeMode: options.bridgeMode ?? "media",
 		calls,
 		variables,
 		methods: () => calls.map((call) => call.method),

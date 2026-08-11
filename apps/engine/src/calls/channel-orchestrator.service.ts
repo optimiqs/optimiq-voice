@@ -20,6 +20,7 @@ import { DidIndexSource } from "../routing/did-index.source";
 import { ParkRegistry } from "../routing/park-registry";
 import { PlanWalker } from "../routing/plan-walker";
 import { RoutingArtifactSource } from "../routing/routing-artifact.source";
+import { TrunkCapacityRegistry } from "../routing/trunk-capacity";
 import { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
 import { dtmfEventFrom } from "../verbs/dtmf-inbox";
 import { DtmfRegistry } from "../verbs/dtmf-registry";
@@ -146,6 +147,20 @@ export class ChannelOrchestrator {
 	private readonly control: CallControl;
 	/** `*1` / `*3` / `*5` pressed mid-conversation, and the attended-transfer cancel key. */
 	private readonly midCall: MidCallFeatureRuntime;
+	/**
+	 * Live channel counts per trunk, so `trunk.max_channels` is a ceiling rather than a column.
+	 *
+	 * Held here, beside `registry`, because the two have the same lifetime and the same honest
+	 * limitation: they are this instance's view. See `trunk-capacity.ts`.
+	 */
+	private readonly trunkCapacity = new TrunkCapacityRegistry();
+	/**
+	 * The max-call-duration cut-off, per answered A-leg.
+	 *
+	 * Keyed by media channel id and cleared the moment the leg ends, so a timer never outlives the
+	 * call it was armed for. See {@link ChannelOrchestrator.armCallDurationCeiling}.
+	 */
+	private readonly durationCeilings = new Map<string, ReturnType<typeof setTimeout>>();
 
 	constructor(
 		@Inject(ENGINE_ENV) private readonly env: EngineEnv,
@@ -734,6 +749,7 @@ export class ChannelOrchestrator {
 				cursor: this.queueCursors,
 			},
 			control: this.walkerCallControlFor(aggregate),
+			trunkCapacity: this.trunkCapacity,
 			onDestination: async (destination) => {
 				await this.recordDestination(aggregate, destination);
 			},
@@ -1302,6 +1318,7 @@ export class ChannelOrchestrator {
 			extensionDialTemplate: this.env.ENGINE_EXTENSION_DIAL_TEMPLATE,
 			trunkDialTemplate: this.env.ENGINE_TRUNK_DIAL_TEMPLATE,
 			defaultRingTimeoutSeconds: this.env.ENGINE_DEFAULT_RING_TIMEOUT_SECONDS,
+			progressTimeoutSeconds: this.env.ENGINE_PROGRESS_TIMEOUT_SECONDS,
 			recordingFormat: this.env.ENGINE_RECORDING_FORMAT,
 			voicemailGreeting: this.env.ENGINE_VOICEMAIL_GREETING,
 			unavailableAnnouncement: this.env.ENGINE_UNAVAILABLE_ANNOUNCEMENT,
@@ -1424,6 +1441,7 @@ export class ChannelOrchestrator {
 		if (justAnswered) {
 			// The billing clock starts here, not at bridge time.
 			aggregate.tryTransitionTo("exchanging-media");
+			this.armCallDurationCeiling(aggregate);
 			await this.events.publish("channel.answered", {
 				orgId: aggregate.organizationId,
 				callId: aggregate.callId,
@@ -1633,6 +1651,12 @@ export class ChannelOrchestrator {
 			cause: reportedCause,
 			causeCode,
 		});
+
+		// Before the aggregate check, and unconditionally: a trunk channel this leg was holding has
+		// to come back whether or not the leg was ever filed, or the ceiling ratchets down by one
+		// every time a leg ends outside the registry and the trunk eventually refuses everything.
+		this.trunkCapacity.releaseLeg(mediaChannelId);
+		this.disarmCallDurationCeiling(mediaChannelId);
 
 		const aggregate = this.registry.byAriChannelId(mediaChannelId);
 		if (aggregate === undefined) {
@@ -1851,6 +1875,12 @@ export class ChannelOrchestrator {
 		// timer would otherwise fire during the drain and route a call on an instance that is leaving.
 		this.control.clear();
 		this.parks.clear();
+		// Same problem again: a ceiling that fired mid-drain would hang a call up with
+		// `ALLOTTED_TIMEOUT` on an instance that is already handing its work over.
+		for (const timer of this.durationCeilings.values()) {
+			clearTimeout(timer);
+		}
+		this.durationCeilings.clear();
 
 		const deadline = Date.now() + timeoutMs;
 		while (this.registry.size > 0 && Date.now() < deadline) {
@@ -1879,6 +1909,64 @@ export class ChannelOrchestrator {
 	// -------------------------------------------------------------------------------------------
 	// Helpers
 	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * Arms the maximum-call-duration cut-off for an answered A-leg.
+	 *
+	 * ## Why the engine has to own this
+	 *
+	 * A call that never ends is not a rare edge: a phone that loses power mid-conversation, a
+	 * carrier that drops a BYE, a bridge whose far end went away without a hangup — all of them
+	 * leave a leg up, holding a licence, a trunk channel and a billing meter, until somebody
+	 * notices. Neither driver has a watchdog of its own on the Asterisk path, and nothing above the
+	 * engine can see a leg to hang it up.
+	 *
+	 * ## Why `ALLOTTED_TIMEOUT` and not a generic cause
+	 *
+	 * 802 has been in the taxonomy since it was written and has never been raised. A CDR that says
+	 * `NORMAL_CLEARING` for a call the platform cut is a CDR that cannot answer "did we drop this
+	 * customer's call, or did they hang up?" — and that question is exactly what somebody asks when
+	 * they see a four-hour call on their bill.
+	 *
+	 * A-legs only. A B-leg is bridged to an A-leg whose ceiling covers the same conversation, and
+	 * arming both would cut the same call twice and race over which cause the CDR keeps.
+	 */
+	private armCallDurationCeiling(aggregate: ChannelAggregate): void {
+		const seconds = this.env.ENGINE_MAX_CALL_DURATION_SECONDS;
+		if (!Number.isFinite(seconds) || seconds <= 0 || legSideOf(aggregate) !== "a") {
+			return;
+		}
+		const mediaChannelId = aggregate.ariChannelId;
+		this.disarmCallDurationCeiling(mediaChannelId);
+
+		const timer = setTimeout(() => {
+			this.durationCeilings.delete(mediaChannelId);
+			const live = this.registry.byAriChannelId(mediaChannelId);
+			if (live === undefined || live.isTearingDown) {
+				return;
+			}
+			this.logger.warn(
+				{ channelId: live.channelId, callId: live.callId, seconds },
+				"a call reached the maximum call duration and was ended by the engine",
+			);
+			// Fixed BEFORE the hangup is issued, because `markHangup` is first-wins and the media
+			// server is about to report a generic code for a teardown it did not decide.
+			live.markHangup({ cause: "ALLOTTED_TIMEOUT", at: Date.now(), initiatedByEngine: true });
+			void this.hangupQuietly(mediaChannelId, "ALLOTTED_TIMEOUT");
+		}, seconds * 1_000);
+		timer.unref?.();
+		this.durationCeilings.set(mediaChannelId, timer);
+	}
+
+	/** Drops a leg's cut-off. Called on every leg end, so an unarmed leg costs one map lookup. */
+	private disarmCallDurationCeiling(mediaChannelId: string): void {
+		const timer = this.durationCeilings.get(mediaChannelId);
+		if (timer === undefined) {
+			return;
+		}
+		clearTimeout(timer);
+		this.durationCeilings.delete(mediaChannelId);
+	}
 
 	/** Hangs a channel up without letting a media-server failure become the caller's problem. */
 	private async hangupQuietly(ariChannelId: string, cause: HangupCause): Promise<void> {

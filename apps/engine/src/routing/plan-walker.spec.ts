@@ -21,6 +21,7 @@ import {
 	voicemailNode,
 } from "./plan-fixtures.fake";
 import { composeCallerId, PlanWalker } from "./plan-walker";
+import { TrunkCapacityRegistry } from "./trunk-capacity";
 import type { FakeMediaPortOptions } from "../media/media-port.fake";
 import type { PlanDestination } from "./plan-destination";
 import type {
@@ -31,6 +32,7 @@ import type {
 	WalkerChannel,
 	WalkInput,
 } from "./plan-walker";
+import type { TrunkCapacityPort } from "./trunk-capacity";
 import type { CallEvent } from "@optimiq-voice/events";
 import type { CompiledTimeCondition, PlanNode, TrunkDialPlanNode } from "@optimiq-voice/routing";
 import type {
@@ -85,6 +87,10 @@ interface HarnessOptions {
 	readonly mailbox?: VoicemailMailboxSource;
 	/** Makes ONE event type's publish throw — how "a slow broker must not end a call" is tested. */
 	readonly failPublishOf?: CallEvent;
+	/** `[0,1)` for weighted trunk selection. Fixed at `0` so an unscripted spec is deterministic. */
+	readonly random?: () => number;
+	/** Absent means `maxChannels` is read and ignored, exactly as it is without this port. */
+	readonly trunkCapacity?: TrunkCapacityPort;
 }
 
 type LegReaction =
@@ -92,8 +98,10 @@ type LegReaction =
 	| { readonly kind: "enter" }
 	| { readonly kind: "reject"; readonly cause: HangupCause }
 	| { readonly kind: "unreachable" }
-	/** Rings forever: the walker's own timeout is what has to end it. */
-	| { readonly kind: "silent" };
+	/** Accepts the INVITE and then says nothing at all — never even 180. A black-holing trunk. */
+	| { readonly kind: "silent" }
+	/** Reports 180 and then rings forever: alive, but nobody is picking up. */
+	| { readonly kind: "ring" };
 
 function harness(options: HarnessOptions = {}) {
 	const signals = new CallSignalBus();
@@ -132,6 +140,10 @@ function harness(options: HarnessOptions = {}) {
 			timeline.push(`originate:${request.endpoint}`);
 			const reaction = reactionFor(request.endpoint);
 			if (reaction === undefined || reaction.kind === "silent") {
+				return;
+			}
+			if (reaction.kind === "ring") {
+				signals.emit(legSignalKey(request.channelId), { kind: "ringing" });
 				return;
 			}
 			if (reaction.kind === "answer") {
@@ -251,6 +263,8 @@ function harness(options: HarnessOptions = {}) {
 		},
 		...(options.voicemail === undefined ? {} : { voicemail: options.voicemail }),
 		...(options.mailbox === undefined ? {} : { mailbox: options.mailbox }),
+		...(options.trunkCapacity === undefined ? {} : { trunkCapacity: options.trunkCapacity }),
+		random: options.random ?? ((): number => 0),
 		newId: () => {
 			counter += 1;
 			return `id-${String(counter)}`;
@@ -676,6 +690,48 @@ describe("extension nodes", () => {
 		});
 	});
 
+	it("gives a black-holing leg up on the progress timeout, long before the ring timeout", async () => {
+		const h = harness({
+			reactions: { "PJSIP/1001": { kind: "silent" } },
+			settings: { progressTimeoutSeconds: 1 },
+		});
+		// A 600-second ring budget: only the progress timeout can end this within the spec's own
+		// timeout, which is the whole assertion.
+		const outcome = await h.walker.walk(
+			walkInput(plan({ timeoutSeconds: 600, noAnswerNodeId: "na" })),
+		);
+
+		expect(outcome.visited).toEqual(["e", "na"]);
+		expect(outcome.notes.join(" ")).toContain("showed no progress");
+		expect(h.media.hungUp()).toContainEqual({
+			channelId: "id-1",
+			cause: "ORIGINATOR_CANCEL",
+		});
+	});
+
+	it("leaves a leg that rang alone: 180 is the progress the timeout is waiting for", async () => {
+		const h = harness({
+			reactions: { "PJSIP/1001": { kind: "ring" } },
+			settings: { progressTimeoutSeconds: 1 },
+		});
+		const outcome = await h.walker.walk(
+			walkInput(plan({ timeoutSeconds: 2, noAnswerNodeId: "na" })),
+		);
+
+		expect(outcome.visited).toEqual(["e", "na"]);
+		expect(outcome.notes.join(" ")).not.toContain("showed no progress");
+	});
+
+	it("does not arm a progress timeout at all when the deployment leaves it at zero", async () => {
+		const h = harness({ reactions: { "PJSIP/1001": { kind: "silent" } } });
+		const outcome = await h.walker.walk(
+			walkInput(plan({ timeoutSeconds: 1, noAnswerNodeId: "na" })),
+		);
+
+		expect(outcome.visited).toEqual(["e", "na"]);
+		expect(outcome.notes.join(" ")).not.toContain("showed no progress");
+	});
+
 	it("reports the extension as the CDR destination", async () => {
 		const h = harness({ reactions: { "PJSIP/1001": { kind: "answer" } } });
 		const outcome = await h.walker.walk(walkInput(plan()));
@@ -809,6 +865,23 @@ describe("ring groups", () => {
 			"ORIGINATOR_CANCEL",
 			"ORIGINATOR_CANCEL",
 		]);
+	});
+
+	it("drops a silent member out of a ring-all without ending the race for the others", async () => {
+		const h = harness({
+			reactions: { "PJSIP/1001": { kind: "silent" }, "PJSIP/1002": { kind: "ring" } },
+			settings: { progressTimeoutSeconds: 1 },
+		});
+		const outcome = await h.walker.walk(
+			walkInput(group({ ringTimeoutSeconds: 2, timeoutNodeId: "timeout" })),
+		);
+
+		expect(outcome.visited).toEqual(["g", "timeout"]);
+		expect(outcome.notes.join(" ")).toContain("dropped from the race");
+		// The ringing member is cancelled by the race's OWN loser cleanup at the end, which is only
+		// reachable if it was still racing — the silent member's timeout did not settle the race.
+		expect(h.media.hungUp()).toContainEqual({ channelId: "id-1", cause: "ORIGINATOR_CANCEL" });
+		expect(h.media.hungUp()).toContainEqual({ channelId: "id-2", cause: "ORIGINATOR_CANCEL" });
 	});
 
 	it("rings members in ordinal order when the strategy is sequential", async () => {
@@ -1733,6 +1806,109 @@ describe("trunk dialling", () => {
 			),
 		);
 		expect(h.media.originated()[0]?.endpoint).toContain("carrier-a");
+	});
+
+	it("spreads a shared `order` by weight, and keeps the loser as the failover behind it", async () => {
+		const attempts = [
+			trunkAttempt("carrier-a", 0, { weight: 70 }),
+			trunkAttempt("carrier-b", 0, { weight: 30 }),
+		];
+		const light = harness({
+			reactions: { carrier: { kind: "answer" } },
+			// Past `carrier-a`'s 70/100 of the line, so the 30-weight carrier takes the call.
+			random: () => 0.9,
+		});
+		await light.walker.walk(walkInput([trunkDialNode("t", { attempts })], { dialedNumber: "+1" }));
+		expect(light.media.originated()[0]?.endpoint).toContain("carrier-b");
+
+		const heavy = harness({ reactions: { carrier: { kind: "answer" } }, random: () => 0 });
+		await heavy.walker.walk(walkInput([trunkDialNode("t", { attempts })], { dialedNumber: "+1" }));
+		expect(heavy.media.originated()[0]?.endpoint).toContain("carrier-a");
+
+		// The one that lost the draw is still dialled when the winner fails: a share is not a filter.
+		const failing = harness({
+			reactions: {
+				"carrier-b": { kind: "reject", cause: "NETWORK_OUT_OF_ORDER" },
+				"carrier-a": { kind: "answer" },
+			},
+			random: () => 0.9,
+		});
+		await failing.walker.walk(
+			walkInput([trunkDialNode("t", { attempts })], { dialedNumber: "+1" }),
+		);
+		expect(failing.media.originated().map((call) => call.endpoint)).toEqual([
+			"PJSIP/+1@carrier-b",
+			"PJSIP/+1@carrier-a",
+		]);
+	});
+
+	it("skips a trunk that is at its channel ceiling and fails over to the next one", async () => {
+		const trunks = new TrunkCapacityRegistry();
+		// One channel of `carrier-a` is already in use by another call on this instance.
+		trunks.reserve(ORG_ID, "trunk-carrier-a", 1)?.bindTo("some-other-leg");
+		const h = harness({
+			reactions: { carrier: { kind: "answer" } },
+			trunkCapacity: trunks,
+		});
+
+		const outcome = await h.walker.walk(
+			walkInput(
+				[
+					trunkDialNode("t", {
+						attempts: [
+							trunkAttempt("carrier-a", 0, { maxChannels: 1 }),
+							trunkAttempt("carrier-b", 1),
+						],
+					}),
+				],
+				{ dialedNumber: "+1" },
+			),
+		);
+
+		expect(outcome.status).toBe("bridged");
+		// The full trunk was never offered the call at all — the refusal is local, before the INVITE.
+		expect(h.media.originated().map((call) => call.endpoint)).toEqual(["PJSIP/+1@carrier-b"]);
+		expect(outcome.notes.join(" ")).toContain("1-channel ceiling");
+	});
+
+	it("holds the channel for the answered leg and takes the failover branch when all are full", async () => {
+		const trunks = new TrunkCapacityRegistry();
+		const h = harness({ reactions: { carrier: { kind: "answer" } }, trunkCapacity: trunks });
+		const plan = [
+			trunkDialNode("t", {
+				failoverNodeId: "vm",
+				attempts: [trunkAttempt("carrier-a", 0, { maxChannels: 1 })],
+			}),
+			voicemailNode("vm", { mode: "check" }),
+		];
+
+		const first = await h.walker.walk(walkInput(plan, { dialedNumber: "+1" }));
+		expect(first.status).toBe("bridged");
+		expect(trunks.inUse(ORG_ID, "trunk-carrier-a")).toBe(1);
+
+		// A second call over the same, now-full trunk — a different walk, sharing this instance's
+		// registry. Nothing is dialled and the route's failover branch is taken.
+		const next = harness({ reactions: { carrier: { kind: "answer" } }, trunkCapacity: trunks });
+		const second = await next.walker.walk(walkInput(plan, { dialedNumber: "+1" }));
+		expect(second.visited).toEqual(["t", "vm"]);
+		expect(next.media.originated()).toEqual([]);
+	});
+
+	it("gives the channel back when the dial does not answer, so one bad call does not leak it", async () => {
+		const trunks = new TrunkCapacityRegistry();
+		const h = harness({
+			reactions: { carrier: { kind: "reject", cause: "NETWORK_OUT_OF_ORDER" } },
+			trunkCapacity: trunks,
+		});
+
+		await h.walker.walk(
+			walkInput(
+				[trunkDialNode("t", { attempts: [trunkAttempt("carrier-a", 0, { maxChannels: 1 })] })],
+				{ dialedNumber: "+1" },
+			),
+		);
+
+		expect(trunks.inUse(ORG_ID, "trunk-carrier-a")).toBe(0);
 	});
 
 	it("takes the failover branch when every trunk has been refused", async () => {

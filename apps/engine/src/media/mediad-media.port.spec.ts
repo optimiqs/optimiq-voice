@@ -12,6 +12,12 @@ import {
 	RPC_SUBJECTS,
 } from "@optimiq-voice/events";
 import {
+	bridgeModeDecodesMedia,
+	bridgeModeRelaysMedia,
+	supportsMediaBug,
+	supportsRecording,
+} from "@optimiq-voice/telephony";
+import {
 	MediaCommandRefusedError,
 	MediaOperationNotSupportedError,
 } from "./media-not-supported.error";
@@ -604,6 +610,24 @@ describe("recording (rung 4)", () => {
 		});
 
 		await expect(port.stopRecording("rec-1")).resolves.toBeUndefined();
+	});
+});
+
+describe("the declared bridge mode", () => {
+	/**
+	 * The mode is not decoration: it is the fact that explains the `snoop` refusal below, and it is
+	 * what `CallControl.startRecording` reads to refuse a recording BEFORE it asks for a tap this
+	 * plane was always going to reject.
+	 */
+	it("is proxy-media: packets pass through, samples never exist", () => {
+		const { port } = newPort();
+
+		expect(port.bridgeMode).toBe("proxy-media");
+		expect(bridgeModeRelaysMedia(port.bridgeMode)).toBe(true);
+		expect(bridgeModeDecodesMedia(port.bridgeMode)).toBe(false);
+		// Which is exactly why `snoop` below is a permanent refusal and not a pending rung.
+		expect(supportsMediaBug(port.bridgeMode)).toBe(false);
+		expect(supportsRecording(port.bridgeMode)).toBe(false);
 	});
 });
 

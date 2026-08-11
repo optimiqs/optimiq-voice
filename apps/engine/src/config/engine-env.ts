@@ -183,6 +183,35 @@ export const engineEnvSchema = z.object({
 	/** Ring time used when neither the plan node nor the ring-group member specifies one. */
 	ENGINE_DEFAULT_RING_TIMEOUT_SECONDS: z.coerce.number().int().min(1).max(600).default(30),
 
+	/**
+	 * How long an originated leg has to show progress (180/183) before it is given up on.
+	 *
+	 * FreeSWITCH's `progress_timeout`. A carrier that accepts the INVITE and then goes silent
+	 * otherwise holds a sequential trunk ladder for the whole ring budget before failing over, and
+	 * the caller has hung up long before the second trunk is tried.
+	 *
+	 * `0` — the default — switches it off, because it can only be enforced where the media plane
+	 * republishes ringing for legs the engine originated. Set it (10–15s is the usual figure) once
+	 * that is known to be true of the deployment; a lower value than the far end's own ring delay
+	 * cancels calls that were about to work.
+	 */
+	ENGINE_PROGRESS_TIMEOUT_SECONDS: z.coerce.number().int().min(0).max(600).default(0),
+
+	/**
+	 * The longest a single answered call may run before the engine ends it (`ALLOTTED_TIMEOUT`).
+	 *
+	 * The guardrail against a leg that never hangs up: a phone that lost power mid-conversation, a
+	 * carrier that dropped the BYE, a bridge whose far end vanished. Every one of those holds a
+	 * trunk channel and a billing meter open until somebody notices, and neither media driver has a
+	 * watchdog of its own on the Asterisk path.
+	 *
+	 * Four hours by default — comfortably past any real conversation, including a long conference,
+	 * and far short of "forever". `0` disables it, which is what a deployment that genuinely runs
+	 * day-long bridges should set, knowingly. The cut-off is recorded as `ALLOTTED_TIMEOUT` (802)
+	 * so a CDR can distinguish "the platform ended this" from "the caller hung up".
+	 */
+	ENGINE_MAX_CALL_DURATION_SECONDS: z.coerce.number().int().min(0).max(86_400).default(14_400),
+
 	/** Prefix a bare prompt id is rendered under, e.g. `sound:prompts/`. */
 	ENGINE_PROMPT_MEDIA_PREFIX: z.string().min(1).default("sound:"),
 

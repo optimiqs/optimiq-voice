@@ -83,6 +83,7 @@ export {
 	expiredRecordingsSelectQuery,
 	expiredRecordingsUpdateQuery,
 	planCdrRetention,
+	purgedRecordingSoftDeleteQuery,
 	purgedRecordingTombstoneDeleteQuery,
 	retentionCutoff,
 	RetentionWindowError,
