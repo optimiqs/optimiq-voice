@@ -246,6 +246,18 @@ export interface ExtensionRow extends EntityRow {
 	} | null;
 	readonly recordPolicy: RecordPolicy;
 	readonly tollClass: TollClass;
+	/**
+	 * The `*8` pickup group this extension belongs to, or `null` for none.
+	 *
+	 * A free-text label, not a reference: groups are named by whoever administers the phones
+	 * (`sales`, `floor-2`) and have no rows of their own. Matching is exact and case-sensitive in
+	 * the compiled artifact, so `Sales` and `sales` are two groups.
+	 *
+	 * `null` is not a group called `""` — it means the extension is in no group, and the engine
+	 * falls back to organization-wide pickup for it. That fallback is why the field is optional on
+	 * every form: leaving it blank is the behaviour a tenant had before groups existed.
+	 */
+	readonly pickupGroup: string | null;
 	readonly callTimeoutSeconds: number;
 	readonly maxRegistrations: number;
 	/**

@@ -288,9 +288,10 @@ export interface ExtensionInput extends RoutingEntityInput {
 	 * # Rollout
 	 *
 	 * Optional, like {@link ExtensionInput.followMe}, so this package stays compilable against a
-	 * loader that does not select the column. **`pbx-db` has no `pickup_group` column yet** — see
-	 * `extensions-schema.ts`. An extension whose group is absent behaves exactly as every extension
-	 * did before groups were compiled: org-wide pickup, the documented fallback.
+	 * loader that does not select the column (`extension.pickup_group`, nullable text in
+	 * `extensions-schema.ts`, supplied by the api snapshot loader). An extension whose group is
+	 * absent behaves exactly as every extension did before groups were compiled: org-wide pickup,
+	 * the documented fallback.
 	 */
 	readonly pickupGroup?: string | null;
 	readonly recordPolicy: RecordPolicy;

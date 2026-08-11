@@ -1,0 +1,1 @@
+ALTER TABLE "extension" ADD COLUMN "pickup_group" text;

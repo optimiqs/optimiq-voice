@@ -486,6 +486,44 @@ async function main(): Promise<void> {
 			`tollClass ${String(data(patched).tollClass)}`,
 		);
 
+		/**
+		 * The `*8` pickup group, on the way in.
+		 *
+		 * Two extensions, two spellings of a group, because this is the one text column on an
+		 * extension where blank and absent are DIFFERENT facts: a name means "only this group's
+		 * phones may take my ringing calls", and NULL means "in no group", which the engine reads
+		 * as the organization-wide fallback it had before groups existed. A whitespace-only name
+		 * stored verbatim would be a third thing — a real group with one accidental member — so the
+		 * DTO normalises it to NULL here rather than leaving the compiler to trim it later.
+		 *
+		 * Section 9 picks these two rows up again out of the artifact in the KV bucket, which is
+		 * what makes this a column-to-engine proof rather than a column-to-column one.
+		 */
+		const grouped = await clientA("PATCH", `/api/v1/extensions/${extensionAId}`, {
+			pickupGroup: "  sales  ",
+		});
+		check(
+			"a pickup group is trimmed on the way in and comes back on the row",
+			grouped.status === 200 && data(grouped).pickupGroup === "sales",
+			`pickupGroup ${JSON.stringify(data(grouped).pickupGroup)}`,
+		);
+		const ungrouped = await clientA("PATCH", `/api/v1/extensions/${extensionBId}`, {
+			pickupGroup: "   ",
+		});
+		check(
+			"a whitespace-only pickup group is stored as null, not as a group named with spaces",
+			ungrouped.status === 200 && data(ungrouped).pickupGroup === null,
+			`pickupGroup ${JSON.stringify(data(ungrouped).pickupGroup)}`,
+		);
+		const overlongGroup = await clientA("PATCH", `/api/v1/extensions/${extensionAId}`, {
+			pickupGroup: "g".repeat(65),
+		});
+		check(
+			"a pickup group past the 64-character bound is a 400",
+			overlongGroup.status === 400,
+			`status ${overlongGroup.status}`,
+		);
+
 		const missing = await clientA("GET", "/api/v1/extensions/019fd3c2-dead-76be-a6b3-b0f1914e39b6");
 		check("an unknown id is 404", missing.status === 404, `status ${missing.status}`);
 		check("the 404 carries code PBX_NOT_FOUND", missing.body.code === "PBX_NOT_FOUND");
@@ -1473,6 +1511,7 @@ async function main(): Promise<void> {
 						organizationId: string;
 						snapshotHash: string;
 						artifactVersion: number;
+						extensionsByNumber?: Record<string, { pickupGroup?: string }>;
 					};
 					check(
 						"the cached artifact belongs to organization A",
@@ -1488,6 +1527,31 @@ async function main(): Promise<void> {
 						"the cached artifact carries a version",
 						typeof artifact.artifactVersion === "number",
 						String(artifact.artifactVersion),
+					);
+
+					/**
+					 * `extension.pickup_group` → column → snapshot loader → compiler → KV.
+					 *
+					 * The engine never asks a database who may press `*8`; it reads
+					 * `extensionsByNumber` out of exactly this artifact. So the assertion is made on
+					 * the bytes in the bucket rather than on the API's own response, and it is made
+					 * in BOTH directions — a group that survives the trip, and an ungrouped extension
+					 * whose key is ABSENT rather than null. The second is the load-bearing one: the
+					 * engine's filter keys off `pickupGroup !== undefined`, so a loader that carried
+					 * NULL through would put every ungrouped extension into a group of its own and
+					 * make `*8` refuse calls it used to answer.
+					 */
+					const groupedEntry = artifact.extensionsByNumber?.["1001"];
+					check(
+						"1001's pickup group reached the artifact the engine answers *8 from",
+						groupedEntry?.pickupGroup === "sales",
+						JSON.stringify(groupedEntry ?? null),
+					);
+					const ungroupedEntry = artifact.extensionsByNumber?.["1002"];
+					check(
+						"1002 is in the artifact with NO pickupGroup key — the org-wide fallback",
+						ungroupedEntry !== undefined && !("pickupGroup" in ungroupedEntry),
+						JSON.stringify(ungroupedEntry ?? null),
 					);
 				}
 

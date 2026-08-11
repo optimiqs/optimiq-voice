@@ -89,6 +89,26 @@ export const extension = pgTable.withRLS(
 		mohClassId: uuidEntityId("moh_class_id").references(() => mohClass.id, {
 			onDelete: "set null",
 		}),
+		/**
+		 * The pickup group this extension belongs to — the set `*8` may answer within.
+		 *
+		 * Free text, not a foreign key, and deliberately so: a group is a NAME an administrator
+		 * gives a set of desks (`sales`, `floor-2`), it has no properties of its own, and a
+		 * `pickup_group` table would buy a join and a migration to express exactly the same set
+		 * membership. Upstream stores a string here too.
+		 *
+		 * NULL means "in no group", which is NOT a group called `""`. The routing compiler trims
+		 * and drops blanks (`pickupGroupOf` in `packages/routing/src/compile.ts`), so an extension
+		 * without a group compiles to an absent `pickupGroup` and the engine falls back to
+		 * organization-wide pickup — the behaviour every extension had before groups existed. The
+		 * API trims on the way in and normalises a blank or whitespace-only name to NULL, so the
+		 * second spelling of "no group" never reaches the column in the first place.
+		 *
+		 * No index: nothing queries by group. The snapshot loader reads every extension of an
+		 * organization whole, and the engine answers `*8` from the compiled artifact's
+		 * `extensionsByNumber`, never from this table.
+		 */
+		pickupGroup: text("pickup_group"),
 		tollClass: text("toll_class").$type<TollClass>().notNull().default("national"),
 		callTimeoutSeconds: integer("call_timeout_seconds").notNull().default(30),
 		maxRegistrations: integer("max_registrations").notNull().default(3),

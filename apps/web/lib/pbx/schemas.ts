@@ -195,6 +195,15 @@ function extensionSchema(sipSecretRef: SecretRefField) {
 		outboundCallerIdNumber: optionalText(32),
 		tollClass: z.enum(TOLL_CLASSES),
 		recordPolicy: z.enum(RECORD_POLICIES),
+		/**
+		 * The `*8` pickup group, bounded at 64 to match `pickupGroupName` in the server's DTO.
+		 *
+		 * {@link optionalText} and not a plain string: blank has to reach the server as `null`, and
+		 * this is the one text column on an extension where that matters beyond tidiness. `""` in
+		 * the column would be a group whose only member is an extension nobody meant to group, and
+		 * `null` is the documented "no group, fall back to organization-wide pickup".
+		 */
+		pickupGroup: optionalText(64),
 		callTimeoutSeconds: optionalInt(5, 300),
 		maxRegistrations: optionalInt(1, 20),
 		mohClassId: optionalReference(),

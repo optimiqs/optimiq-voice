@@ -102,6 +102,46 @@ describe("pbx DTOs", () => {
 			};
 			expect(createExtensionDto.safeParse(tooMany).success).to.equal(false);
 		});
+
+		/**
+		 * The pickup group is the one text column on an extension where blank and absent are
+		 * different facts to the engine: absent (NULL) means "in no group" and gets the org-wide
+		 * `*8` fallback, so `""` must never reach the column and be a third spelling of it.
+		 */
+		describe("the pickup group", () => {
+			const base = { number: "1001", label: "Alice", sipSecretRef: "s" };
+			const groupOf = (value: unknown) =>
+				(createExtensionDto.parse({ ...base, pickupGroup: value }) as Record<string, unknown>)
+					.pickupGroup;
+
+			it("normalises a blank or whitespace-only group to null, never to an empty string", () => {
+				expect(groupOf("")).to.equal(null);
+				expect(groupOf("   ")).to.equal(null);
+				expect(groupOf(null)).to.equal(null);
+			});
+
+			it("trims but keeps case — Sales and sales are two groups to the compiler", () => {
+				expect(groupOf("  sales  ")).to.equal("sales");
+				expect(groupOf("Sales")).to.equal("Sales");
+			});
+
+			it("bounds the name at 64 characters", () => {
+				expect(
+					createExtensionDto.safeParse({ ...base, pickupGroup: "g".repeat(64) }).success,
+				).to.equal(true);
+				expect(
+					createExtensionDto.safeParse({ ...base, pickupGroup: "g".repeat(65) }).success,
+				).to.equal(false);
+			});
+
+			it("leaves the stored group alone when the key is absent, and clears it on null", () => {
+				const untouched = updateExtensionDto.parse({}) as Record<string, unknown>;
+				expect("pickupGroup" in untouched).to.equal(false);
+				const cleared = updateExtensionDto.parse({ pickupGroup: null }) as Record<string, unknown>;
+				expect("pickupGroup" in cleared).to.equal(true);
+				expect(cleared.pickupGroup).to.equal(null);
+			});
+		});
 	});
 
 	describe("outbound routes", () => {

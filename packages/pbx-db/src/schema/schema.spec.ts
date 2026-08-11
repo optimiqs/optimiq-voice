@@ -211,6 +211,34 @@ describe("carrier provenance", () => {
 	});
 });
 
+/**
+ * The `*8` pickup group.
+ *
+ * A single nullable text column, and the two things worth pinning about it are both things a
+ * later change could quietly take away: NULL has to stay expressible, because NULL is how "in no
+ * group" is spelled and the engine's org-wide fallback depends on it; and it must NOT become an
+ * enum, a foreign key or an indexed column, because nothing queries by group — the snapshot loader
+ * reads every extension whole and the engine answers from the compiled artifact.
+ */
+describe("pickup groups", () => {
+	const extensionConfig = getTableConfig(pbxTables.extension);
+	const column = extensionConfig.columns.find((candidate) => candidate.name === "pickup_group");
+
+	it("is a nullable text column on extension, so 'in no group' stays expressible", () => {
+		expect(column).toBeDefined();
+		expect(column?.getSQLType()).toBe("text");
+		expect(column?.notNull).toBe(false);
+		expect(column?.hasDefault).toBe(false);
+	});
+
+	it("carries no index, because nothing ever queries by group", () => {
+		const indexed = extensionConfig.indexes.flatMap((index) =>
+			index.config.columns.map((entry) => ("name" in entry ? entry.name : "")),
+		);
+		expect(indexed).not.toContain("pickup_group");
+	});
+});
+
 describe("destination column helpers", () => {
 	it("derives camelCase keys and snake_case column names from one prefix", () => {
 		const columns = namedDestinationColumns("timeout");

@@ -156,6 +156,17 @@ export async function loadOrgRoutingSnapshot(
 			tollClass: row.tollClass,
 			callTimeoutSeconds: row.callTimeoutSeconds,
 			followMe: row.followMe ?? undefined,
+			/**
+			 * `?? undefined`, not the raw column, and the difference is the whole point of the field.
+			 *
+			 * `ExtensionInput.pickupGroup` distinguishes "in no group" (absent → org-wide pickup,
+			 * the fallback every extension had before groups existed) from "in group X". NULL is the
+			 * first of those, so it must arrive as ABSENT rather than as `null`. The compiler's
+			 * `pickupGroupOf` trims and drops blanks as a backstop, and the DTO refuses to store a
+			 * whitespace-only name — but a loader that leaned on either would be relying on somebody
+			 * else's normalisation to say what this tenant's phones do.
+			 */
+			pickupGroup: row.pickupGroup ?? undefined,
 		})),
 		phoneNumbers: phoneNumbers.map((row) => ({
 			id: row.id,

@@ -66,6 +66,7 @@ function defaultsFor(extension: ExtensionRow | null): ExtensionFormValues {
 		outboundCallerIdNumber: extension?.outboundCallerIdNumber ?? "",
 		tollClass: extension?.tollClass ?? "national",
 		recordPolicy: extension?.recordPolicy ?? "none",
+		pickupGroup: extension?.pickupGroup ?? "",
 		callTimeoutSeconds:
 			extension?.callTimeoutSeconds === undefined ? "" : String(extension.callTimeoutSeconds),
 		maxRegistrations:
@@ -130,6 +131,13 @@ export function ExtensionDialog({
 				outboundCallerIdNumber: parsed.outboundCallerIdNumber,
 				tollClass: parsed.tollClass,
 				recordPolicy: parsed.recordPolicy,
+				/**
+				 * `null` when blank, never an absent key — the same rule `mohClassId` follows and for
+				 * the same reason. The column is `nullish` on the server, so `null` clears it; an
+				 * absent key would leave an operator who emptied the field still in their old group,
+				 * with nothing on screen disagreeing and `*8` still reaching their old colleagues.
+				 */
+				pickupGroup: parsed.pickupGroup,
 				callTimeoutSeconds: parsed.callTimeoutSeconds ?? undefined,
 				maxRegistrations: parsed.maxRegistrations ?? undefined,
 				mohClassId: parsed.mohClassId,
@@ -312,6 +320,19 @@ export function ExtensionDialog({
 							placeholder="3"
 							disabled={mutation.isPending}
 							submitError={server.errors.maxRegistrations}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="pickupGroup">
+					{(field) => (
+						<TextField
+							field={field}
+							label="Pickup group"
+							placeholder="sales"
+							description="Dialling *8 answers a call ringing on another phone in the same group. Blank leaves this extension ungrouped: anyone may answer its calls, and it may answer only other ungrouped extensions. Until any extension has a group, *8 stays organization-wide."
+							disabled={mutation.isPending}
+							submitError={server.errors.pickupGroup}
+							className="sm:col-span-2"
 						/>
 					)}
 				</form.Field>

@@ -82,6 +82,7 @@ describe("optional text", () => {
 			outboundCallerIdNumber: "",
 			tollClass: "national",
 			recordPolicy: "none",
+			pickupGroup: "",
 			callTimeoutSeconds: "",
 			maxRegistrations: "",
 			mohClassId: "",
@@ -108,6 +109,7 @@ describe("optional text", () => {
 			outboundCallerIdNumber: "",
 			tollClass: "national" as const,
 			recordPolicy: "none" as const,
+			pickupGroup: "",
 			callTimeoutSeconds: "",
 			maxRegistrations: "",
 			mohClassId: "",
@@ -131,6 +133,7 @@ describe("optional text", () => {
 			outboundCallerIdNumber: "",
 			tollClass: "national" as const,
 			recordPolicy: "none" as const,
+			pickupGroup: "",
 			callTimeoutSeconds: "4",
 			maxRegistrations: "",
 			mohClassId: "",
@@ -143,6 +146,61 @@ describe("optional text", () => {
 			true,
 		);
 		expect(extensionFormSchema.safeParse({ ...values, callTimeoutSeconds: "5.5" }).success).toBe(
+			false,
+		);
+	});
+});
+
+/**
+ * The pickup group, where blank and absent are not the same fact.
+ *
+ * Every other optional text column on an extension is cosmetic when it is empty — a caller-id name
+ * nobody set. This one decides who may answer a ringing phone with `*8`, so the normalisation is
+ * asserted rather than inherited: a group named `" "` would be a real group with one accidental
+ * member, and `null` is the documented "no group, fall back to organization-wide pickup".
+ */
+describe("the pickup group", () => {
+	const base = {
+		number: "1001",
+		label: "Alice",
+		sipSecretRef: "secret://x",
+		callerIdName: "",
+		callerIdNumber: "",
+		outboundCallerIdNumber: "",
+		tollClass: "national" as const,
+		recordPolicy: "none" as const,
+		pickupGroup: "",
+		callTimeoutSeconds: "",
+		maxRegistrations: "",
+		mohClassId: "",
+		voicemailEnabled: true,
+		doNotDisturb: false,
+		enabled: true,
+	};
+
+	it("sends a blank group as null, so the extension leaves the group it was in", () => {
+		expect(extensionFormSchema.parse(base).pickupGroup).toBeNull();
+	});
+
+	it("treats a whitespace-only group as no group, not as a group named with spaces", () => {
+		expect(extensionFormSchema.parse({ ...base, pickupGroup: "   " }).pickupGroup).toBeNull();
+	});
+
+	it("trims, because a stray space would be a one-member group nobody meant to make", () => {
+		expect(extensionFormSchema.parse({ ...base, pickupGroup: " sales " }).pickupGroup).toBe(
+			"sales",
+		);
+	});
+
+	it("keeps case, because Sales and sales are two groups to the compiler", () => {
+		expect(extensionFormSchema.parse({ ...base, pickupGroup: "Sales" }).pickupGroup).toBe("Sales");
+	});
+
+	it("holds the group to the server's own 64-character bound", () => {
+		expect(extensionFormSchema.safeParse({ ...base, pickupGroup: "g".repeat(64) }).success).toBe(
+			true,
+		);
+		expect(extensionFormSchema.safeParse({ ...base, pickupGroup: "g".repeat(65) }).success).toBe(
 			false,
 		);
 	});
@@ -808,6 +866,7 @@ const AUDIO_REFERENCE_FORMS = [
 			outboundCallerIdNumber: "",
 			tollClass: "national",
 			recordPolicy: "none",
+			pickupGroup: "",
 			callTimeoutSeconds: "",
 			maxRegistrations: "",
 			mohClassId: "",
