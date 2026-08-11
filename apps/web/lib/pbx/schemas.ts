@@ -220,6 +220,49 @@ export type ExtensionFormValues = z.input<typeof extensionFormSchema>;
 /** Editing: blank means "keep the stored reference", and the dialog drops the key. */
 export const extensionEditFormSchema = extensionSchema(optionalSecretRef);
 
+/**
+ * The follow-me ladder, mirroring `followMeTarget` in `apps/api/src/pbx/extensions/extensions.dto.ts`.
+ *
+ * It is NOT part of `extensionSchema`, and that is deliberate: `follow_me` is one JSON column
+ * written as a whole object, so the dialog holds it beside the flat form rather than inside it —
+ * the same separation the destination trio and the trunk chain already use. Keeping it out also
+ * keeps `z.input<typeof extensionFormSchema>` a flat record of strings and booleans, which is what
+ * TanStack Form's `defaultValues` wants.
+ *
+ * Both numbers are REQUIRED per target, because the server's `followMeTarget` is a `strictObject`
+ * with neither key optional — a blank box is a 400, not "use the default". The editor pre-fills a
+ * new row rather than leaving them empty, so the requirement is only ever met by someone who
+ * cleared a box on purpose.
+ *
+ * The ceiling is the server's `.max(10)`. It is restated rather than left to the round trip because
+ * an eleventh target is refused with a path (`followMe.targets`) that collapses to one message on
+ * the whole section — which does not say which row to delete.
+ */
+export const MAX_FOLLOW_ME_TARGETS = 10;
+
+export const followMeTargetFormSchema = z.strictObject({
+	/** An extension number or an external number — the column is a dialable string, not a ref. */
+	destination: dialableString,
+	delaySeconds: requiredInt(0, 300),
+	timeoutSeconds: requiredInt(1, 300),
+	/**
+	 * "Press 1 to accept." Optional on the wire and therefore defaulted to `false` here: a target
+	 * that never carried the key must round-trip through this form unchanged.
+	 */
+	confirm: z.boolean(),
+});
+export type FollowMeTargetFormValues = z.input<typeof followMeTargetFormSchema>;
+
+export const followMeFormSchema = z.strictObject({
+	enabled: z.boolean(),
+	ignoreBusy: z.boolean(),
+	targets: z
+		.array(followMeTargetFormSchema)
+		.max(MAX_FOLLOW_ME_TARGETS, `At most ${MAX_FOLLOW_ME_TARGETS} targets`),
+});
+export type FollowMeFormValues = z.input<typeof followMeFormSchema>;
+export type FollowMeParsedValues = z.output<typeof followMeFormSchema>;
+
 export const phoneNumberFormSchema = z.strictObject({
 	e164,
 	label: optionalText(128),

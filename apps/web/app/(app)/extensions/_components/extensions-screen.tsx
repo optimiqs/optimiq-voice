@@ -14,6 +14,7 @@ import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
 import { PageHeader } from "~/components/ui/page-header";
 import { DEFAULT_PAGE_LIMIT, PBX_RESOURCES } from "~/lib/pbx/client";
+import { followMeSummary } from "~/lib/pbx/follow-me";
 import { usePermission } from "../../_context/session-context";
 import { useLiveRegistrations } from "../../_hooks/use-live-queries";
 import { usePbxDelete, usePbxList } from "../../_hooks/use-pbx-queries";
@@ -125,15 +126,24 @@ export function ExtensionsScreen() {
 					{
 						key: "features",
 						header: "Features",
-						cell: (row) => (
-							<div className="flex flex-wrap gap-1">
-								{row.voicemailEnabled ? <Badge tone="accent">Voicemail</Badge> : null}
-								{row.doNotDisturb ? <Badge tone="warning">DND</Badge> : null}
-								{row.recordPolicy !== "none" ? (
-									<Badge tone="neutral">Rec: {row.recordPolicy}</Badge>
-								) : null}
-							</div>
-						),
+						cell: (row) => {
+							/**
+							 * Only an ACTIVE ladder is badged. A stored-but-disabled one changes nothing
+							 * about where a call goes, and saying so here would tell an operator their
+							 * calls are being chased when they are not — see `followMeSummary`.
+							 */
+							const followMe = followMeSummary(row.followMe);
+							return (
+								<div className="flex flex-wrap gap-1">
+									{row.voicemailEnabled ? <Badge tone="accent">Voicemail</Badge> : null}
+									{row.doNotDisturb ? <Badge tone="warning">DND</Badge> : null}
+									{followMe ? <Badge tone="accent">{followMe}</Badge> : null}
+									{row.recordPolicy !== "none" ? (
+										<Badge tone="neutral">Rec: {row.recordPolicy}</Badge>
+									) : null}
+								</div>
+							);
+						},
 					},
 					{
 						key: "registered",

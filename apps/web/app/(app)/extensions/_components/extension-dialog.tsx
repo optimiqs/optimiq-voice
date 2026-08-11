@@ -1,6 +1,7 @@
 "use client";
 
 import { useForm } from "@tanstack/react-form";
+import { useState } from "react";
 import { EntityFormDialog, FormSection } from "~/components/pbx/entity-form-dialog";
 import { ResourceSelect } from "~/components/pbx/resource-select";
 import { SelectField, SwitchField, TextField } from "~/components/ui/form-fields";
@@ -8,11 +9,21 @@ import { useServerFieldErrors } from "~/lib/forms/server-errors";
 import { PBX_RESOURCES } from "~/lib/pbx/client";
 import { RECORD_POLICIES, TOLL_CLASSES } from "~/lib/pbx/contracts";
 import {
+	followMeFieldErrors,
+	normalizeFollowMe,
+	readFollowMe,
+	sameFollowMe,
+	writeFollowMe,
+} from "~/lib/pbx/follow-me";
+import {
 	extensionEditFormSchema,
 	extensionFormSchema,
+	followMeFormSchema,
 	type ExtensionFormValues,
+	type FollowMeFormValues,
 } from "~/lib/pbx/schemas";
 import { usePbxCreate, usePbxUpdate } from "../../_hooks/use-pbx-queries";
+import { FollowMeField } from "./follow-me-field";
 import type { ExtensionRow } from "~/lib/pbx/contracts";
 
 /**
@@ -37,6 +48,20 @@ import type { ExtensionRow } from "~/lib/pbx/contracts";
  * An extension may only take an outbound route whose class its own class covers. `national` is
  * the server's default and stays the default here: quietly granting `international` to every new
  * extension is how a compromised endpoint becomes an expensive weekend.
+ *
+ * ## The follow-me ladder is the one field this form sends only when it changed
+ *
+ * Every other control here writes a scalar column, so sending it unchanged writes back what was
+ * already there. `followMe` is a JSON object that a PATCH REPLACES whole — no merge, because an
+ * absent target in an array is a deleted target — which makes an unconditional write a different
+ * thing entirely: opening this dialog to correct a caller ID would rewrite the ladder from whatever
+ * the editor happened to render.
+ *
+ * So the key is included only when {@link sameFollowMe} says the ladder differs from the stored
+ * one, which is the diff-only rule the routing settings screen established (`changedSettings`)
+ * applied to the one field on this form that needs it. Its consequence is worth stating: an
+ * extension nobody has ever configured follow-me on gets NO `followMe` key on any save from this
+ * dialog, so the column stays `null` rather than becoming an empty ladder.
  */
 
 const TOLL_CLASS_LABELS: Readonly<Record<(typeof TOLL_CLASSES)[number], string>> = {
@@ -96,12 +121,33 @@ export function ExtensionDialog({
 	// Creating requires a secret reference; editing accepts a blank one as "leave it alone".
 	const schema = extension === null ? extensionFormSchema : extensionEditFormSchema;
 
+	/**
+	 * The ladder lives beside the form, not in it — a nested array of objects is not what TanStack
+	 * Form's `defaultValues` is good at, and the trunk chain and destination trios on the other
+	 * dialogs are held the same way for the same reason.
+	 */
+	const initialFollowMe = readFollowMe(extension);
+	const [followMe, setFollowMe] = useState<FollowMeFormValues>(initialFollowMe);
+	const [localErrors, setLocalErrors] = useState<Readonly<Record<string, string>>>({});
+
 	const form = useForm({
 		defaultValues: defaultsFor(extension),
 		validators: { onSubmit: schema },
 		onSubmit: async ({ value }) => {
 			const parsed = schema.parse(value);
 			server.clear();
+
+			// Per-rung messages, so a ladder of six with one bad number says which one. The server
+			// cannot: `pbxFieldErrors` collapses `followMe.targets.0.destination` to `followMe`.
+			const followMeProblems = followMeFieldErrors(followMe);
+			if (Object.keys(followMeProblems).length > 0) {
+				setLocalErrors(followMeProblems);
+				return;
+			}
+			setLocalErrors({});
+
+			const nextFollowMe = writeFollowMe(followMeFormSchema.parse(followMe));
+			const storedFollowMe = normalizeFollowMe(extension?.followMe);
 
 			/**
 			 * `undefined` for the optional numbers, never `null`.
@@ -144,6 +190,8 @@ export function ExtensionDialog({
 				voicemailEnabled: parsed.voicemailEnabled,
 				doNotDisturb: parsed.doNotDisturb,
 				enabled: parsed.enabled,
+				/** Present only when the ladder differs — see the note at the top of this file. */
+				...(sameFollowMe(storedFollowMe, nextFollowMe) ? {} : { followMe: nextFollowMe }),
 			};
 
 			try {
@@ -169,6 +217,8 @@ export function ExtensionDialog({
 					// finished, whereas clearing on open flashes the previous row's values first.
 					server.clear();
 					mutation.reset();
+					setLocalErrors({});
+					setFollowMe(initialFollowMe);
 					form.reset();
 				}
 				onOpenChange(next);
@@ -353,6 +403,16 @@ export function ExtensionDialog({
 					)}
 				</form.Field>
 			</FormSection>
+
+			<FollowMeField
+				value={followMe}
+				onChange={(next) => {
+					setFollowMe(next);
+					setLocalErrors({});
+				}}
+				disabled={mutation.isPending}
+				errors={{ ...server.errors, ...localErrors }}
+			/>
 
 			<FormSection title="Behaviour" columns={1}>
 				<form.Field name="voicemailEnabled">
