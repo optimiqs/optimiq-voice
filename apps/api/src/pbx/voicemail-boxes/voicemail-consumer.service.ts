@@ -7,10 +7,11 @@ import { isArchivingObjectStore } from "../../storage";
 import { PBX_DATABASE, PBX_ENV, PBX_VOICEMAIL_STORE } from "../shared/pbx.tokens";
 import { VoicemailEmailService } from "./voicemail-email.service";
 import { readMailboxCounts, VoicemailMwiPublisher } from "./voicemail-mwi.publisher";
+import { VoicemailTranscriptionService } from "./voicemail-transcription.service";
 import type { ObjectStore } from "../../storage";
 import type { PbxEnv } from "../shared/pbx-env";
 import type { MailboxCounts } from "./voicemail-mwi.publisher";
-import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
+import type { PbxDatabaseClient, VoicemailTranscriptionStatus } from "@optimiq-voice/pbx-db";
 
 const logger = getLogger("api.pbx");
 
@@ -69,6 +70,18 @@ const DURABLE = "pbx-voicemail-writer";
  * the archive buys is that an API container whose volume was replaced can still SERVE the message
  * over the signed playback route. `src/storage/object-store.ts` has the whole picture and the
  * `apps/mediad` migration note.
+ *
+ * ## Transcription is LAST, and that is its entire safety argument
+ *
+ * {@link VoicemailTranscriptionService.enqueue} is called after every other post-ack step, returns
+ * `void`, and swallows its own refusals. So a transcription seam that did not exist yesterday
+ * cannot have changed the filing, the archive, the lamp or the notification: there is no ordering
+ * in which it runs before them and no value it returns that any of them read.
+ *
+ * The row's `transcription_status` is set by the INSERT — see {@link VoicemailConsumer.file} —
+ * rather than by the enqueue, so the durable record of "this message owes a transcript" exists
+ * before the in-memory queue does. That is what makes a lost queue a back-fill rather than a
+ * silently missing transcript.
  */
 @Injectable()
 export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
@@ -86,6 +99,8 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 		@Inject(VoicemailMwiPublisher) private readonly mwi: VoicemailMwiPublisher,
 		@Inject(VoicemailEmailService) private readonly email: VoicemailEmailService,
 		@Inject(PBX_VOICEMAIL_STORE) private readonly store: ObjectStore,
+		@Inject(VoicemailTranscriptionService)
+		private readonly transcription: VoicemailTranscriptionService,
 	) {}
 
 	get stats(): {
@@ -249,8 +264,8 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 		}
 
 		try {
-			const counts = await this.file(envelope.orgId, mailboxId, data);
-			if (counts === undefined) {
+			const filed = await this.file(envelope.orgId, mailboxId, data);
+			if (filed === undefined) {
 				logger.error(
 					{
 						subject: message.subject,
@@ -268,8 +283,16 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 			// with a log line, whereas a NAK here would re-run an insert whose duplicate-detection is
 			// the only thing standing between a user and seeing one voicemail twice.
 			await this.archive(data.objectKey);
-			await this.publishMwi(envelope.orgId, mailboxId, data.mailboxNumber, counts);
+			await this.publishMwi(envelope.orgId, mailboxId, data.mailboxNumber, filed.counts);
 			await this.notifyByEmail(envelope.orgId, mailboxId, data.messageId);
+			// LAST, and after every await above, which is the whole of its safety argument: nothing
+			// that files a row, archives audio, lights a lamp or sends a notification is downstream of
+			// it, so a transcription seam that did not exist yesterday cannot have changed any of
+			// them. `enqueue` returns `void` and swallows its own refusals — see
+			// `voicemail-transcription.service.ts` — so this is not `await`ed and could not be.
+			if (filed.transcribe) {
+				this.transcription.enqueue(envelope.orgId, mailboxId, data.messageId);
+			}
 		} catch (error) {
 			this.failed += 1;
 			logger.error(
@@ -292,6 +315,18 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 	 *
 	 * `undefined` means the box is not in this organization — a message for a mailbox that was
 	 * deleted while the caller was recording into it, or an event for a tenant that no longer exists.
+	 *
+	 * ## Why the transcription decision is made HERE
+	 *
+	 * `transcription_status` is written by the INSERT rather than by a follow-up update, and the
+	 * box's `transcription_enabled` is read in the SAME transaction that reads the box's existence.
+	 * Both follow from the row being the queue: a message that is going to be transcribed must be
+	 * `pending` from the moment it exists, or there is a window in which it is filed, visible, and
+	 * invisible to the back-fill that is supposed to catch what the in-memory queue drops.
+	 *
+	 * BOTH switches must be on — a configured provider and a mailbox that asked. Configuring an
+	 * endpoint must not silently start transcribing every mailbox a tenant already had, which is why
+	 * `voicemail_box.transcription_enabled` exists and defaults to false.
 	 */
 	private async file(
 		organizationId: string,
@@ -306,16 +341,23 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 			callerIdName?: string;
 			receivedAt: string;
 		},
-	): Promise<MailboxCounts | undefined> {
+	): Promise<FiledMessage | undefined> {
 		return await this.database.withTenantScope(organizationId, async (transaction) => {
 			const box = await transaction
-				.select({ id: voicemailBox.id })
+				.select({
+					id: voicemailBox.id,
+					transcriptionEnabled: voicemailBox.transcriptionEnabled,
+				})
 				.from(voicemailBox)
 				.where(eq(voicemailBox.id, mailboxId))
 				.limit(1);
-			if (box.length === 0) {
+			const found = box[0];
+			if (found === undefined) {
 				return undefined;
 			}
+
+			const wanted = this.transcription.enabled && found.transcriptionEnabled;
+			const transcriptionStatus: VoicemailTranscriptionStatus = wanted ? "pending" : "disabled";
 
 			const inserted = await transaction
 				.insert(voicemailMessage)
@@ -331,18 +373,26 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 					durationMs: data.durationMs,
 					objectKey: data.objectKey,
 					sizeBytes: data.sizeBytes ?? null,
+					transcriptionStatus,
 					callLegRef: data.legId,
 				})
 				.onConflictDoNothing()
 				.returning({ id: voicemailMessage.id });
 
-			if (inserted.length === 0) {
-				this.duplicates += 1;
-			} else {
+			const isNew = inserted.length > 0;
+			if (isNew) {
 				this.filed += 1;
+			} else {
+				this.duplicates += 1;
 			}
 
-			return await readMailboxCounts(transaction, mailboxId);
+			return {
+				counts: await readMailboxCounts(transaction, mailboxId),
+				// Only a NEW row is enqueued. A redelivery's row already carries whatever status the
+				// first delivery gave it, and the worker re-checks `pending` anyway, so enqueuing a
+				// duplicate would be harmless — it would just be a query to learn nothing.
+				transcribe: wanted && isNew,
+			};
 		});
 	}
 
@@ -438,6 +488,13 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
  * `strictNullChecks` reason as the import above: naming the inferred union type here drags the
  * package root's `validate.ts` into this app's compilation.
  */
+/** What {@link VoicemailConsumer.file} learned in the one transaction it ran. */
+interface FiledMessage {
+	readonly counts: MailboxCounts;
+	/** True only for a NEW row whose box asked for transcription and whose provider can do it. */
+	readonly transcribe: boolean;
+}
+
 interface VoicemailEnvelope {
 	readonly type: string;
 	readonly orgId: string;

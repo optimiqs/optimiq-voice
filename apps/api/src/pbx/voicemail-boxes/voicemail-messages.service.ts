@@ -31,6 +31,7 @@ import type {
 	PbxDatabaseClient,
 	PbxDatabaseTransaction,
 	VoicemailFolder,
+	VoicemailTranscriptionStatus,
 } from "@optimiq-voice/pbx-db";
 
 const logger = getLogger("api.pbx");
@@ -120,6 +121,8 @@ export class VoicemailMessagesService {
 					durationMs: voicemailMessage.durationMs,
 					sizeBytes: voicemailMessage.sizeBytes,
 					transcription: voicemailMessage.transcription,
+					transcriptionStatus: voicemailMessage.transcriptionStatus,
+					transcribedAt: voicemailMessage.transcribedAt,
 					callLegRef: voicemailMessage.callLegRef,
 					// `count(*) over ()` on the same query rather than a second `select count(*)`, so
 					// the count and the page cannot disagree about the snapshot they were taken from —
@@ -491,6 +494,19 @@ export interface WireVoicemailMessage {
 	readonly durationMs: number;
 	readonly sizeBytes: number | null;
 	readonly transcription: string | null;
+	/**
+	 * Which of the four transcription states this message is in.
+	 *
+	 * Sent ALONGSIDE `transcription` rather than instead of it, because a null transcript is three
+	 * different facts and a UI that only had the text could not tell them apart: `disabled` (nobody
+	 * tried, and a spinner would be a lie), `pending` (a spinner is exactly right), `failed` (say so,
+	 * and stop waiting). `done` with an empty string is also legitimate — a few seconds of silence
+	 * transcribes to nothing — and is the case that makes the status load-bearing rather than a
+	 * convenience.
+	 */
+	readonly transcriptionStatus: VoicemailTranscriptionStatus;
+	/** When the transcript was written. Null in every state but `done`. */
+	readonly transcribedAt: string | null;
 	readonly callLegRef: string | null;
 }
 
@@ -586,6 +602,8 @@ interface MessageRow {
 	readonly durationMs: number;
 	readonly sizeBytes: number | null;
 	readonly transcription: string | null;
+	readonly transcriptionStatus: VoicemailTranscriptionStatus;
+	readonly transcribedAt: Date | null;
 	readonly callLegRef: string | null;
 }
 
@@ -641,6 +659,8 @@ function toWireMessage(row: MessageRow): WireVoicemailMessage {
 		durationMs: row.durationMs,
 		sizeBytes: row.sizeBytes,
 		transcription: row.transcription,
+		transcriptionStatus: row.transcriptionStatus,
+		transcribedAt: row.transcribedAt?.toISOString() ?? null,
 		callLegRef: row.callLegRef,
 	};
 }

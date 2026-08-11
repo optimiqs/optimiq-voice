@@ -20,6 +20,7 @@ import {
 	TRUNK_STATUSES as SERVER_TRUNK_STATUSES,
 	VOICEMAIL_EMAIL_MODES as SERVER_VOICEMAIL_EMAIL_MODES,
 	VOICEMAIL_GREETING_KINDS as SERVER_VOICEMAIL_GREETING_KINDS,
+	VOICEMAIL_TRANSCRIPTION_STATUSES as SERVER_VOICEMAIL_TRANSCRIPTION_STATUSES,
 } from "@optimiq-voice/pbx-db";
 import {
 	ROUTING_CONTEXTS as SERVER_ROUTING_CONTEXTS,
@@ -47,6 +48,7 @@ import {
 	TRUNK_STATUSES,
 	VOICEMAIL_EMAIL_MODES,
 	VOICEMAIL_GREETING_KINDS,
+	VOICEMAIL_TRANSCRIPTION_STATUSES,
 } from "./contracts";
 import {
 	DESTINATION_TYPE_LABELS,
@@ -124,6 +126,19 @@ describe("closed sets mirrored from @optimiq-voice/pbx-db", () => {
 
 	it("voicemail email modes match", () => {
 		expect(VOICEMAIL_EMAIL_MODES).toEqual([...SERVER_VOICEMAIL_EMAIL_MODES]);
+	});
+
+	/**
+	 * The four transcription states.
+	 *
+	 * A drifted member here is worse than a missing label, because each of these drives a DIFFERENT
+	 * thing on screen: `pending` is the only one a spinner belongs on, `disabled` is the only one
+	 * that should render nothing at all, and `done` may legitimately carry an empty transcript. A UI
+	 * that received a fifth status would fall through all four branches on the one message its user
+	 * is actually asking about.
+	 */
+	it("voicemail transcription statuses match", () => {
+		expect(VOICEMAIL_TRANSCRIPTION_STATUSES).toEqual([...SERVER_VOICEMAIL_TRANSCRIPTION_STATUSES]);
 	});
 
 	it("music-on-hold sources match", () => {

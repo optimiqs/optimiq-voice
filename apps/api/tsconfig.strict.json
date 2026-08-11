@@ -32,13 +32,15 @@
 		"src/media/**/*",
 		"src/pbx/**/*",
 		"src/storage/**/*",
+		"src/transcription/**/*",
 		"scripts/**/*",
 		"test/auth/**/*",
 		"test/cdr/**/*",
 		"test/live/**/*",
 		"test/mail/**/*",
 		"test/pbx/**/*",
-		"test/storage/**/*"
+		"test/storage/**/*",
+		"test/transcription/**/*"
 	],
 	"exclude": ["scripts/verify-tenancy-backfill.ts"]
 }

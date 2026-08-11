@@ -11,7 +11,7 @@ import { QUEUE_AGENT_STATUSES, QUEUE_STRATEGIES } from "./queues-schema";
 import { pbxRelations } from "./relations";
 import { SIP_ACL_SCOPES } from "./security-schema";
 import { pbxTables } from "./tables";
-import { VOICEMAIL_FOLDERS } from "./voicemail-schema";
+import { VOICEMAIL_FOLDERS, VOICEMAIL_TRANSCRIPTION_STATUSES } from "./voicemail-schema";
 
 const tables = Object.values(pbxTables);
 
@@ -26,6 +26,7 @@ const CONST_TUPLES = {
 	SIP_ACL_SCOPES,
 	TOLL_CLASSES,
 	VOICEMAIL_FOLDERS,
+	VOICEMAIL_TRANSCRIPTION_STATUSES,
 } as const;
 
 describe("const tuples", () => {
@@ -236,6 +237,72 @@ describe("pickup groups", () => {
 			index.config.columns.map((entry) => ("name" in entry ? entry.name : "")),
 		);
 		expect(indexed).not.toContain("pickup_group");
+	});
+});
+
+/**
+ * Voicemail transcription state.
+ *
+ * The shape here is the whole safety story for a feature that is off by default, so the assertions
+ * are about what a later change could quietly take away. `transcription_status` must stay NOT NULL
+ * with a `disabled` default, because that default is what a row inserted by anything that has never
+ * heard of transcription gets, and the only safe reading of such a row is "nobody is coming for
+ * this" — a `pending` default would make every historic message look like an unpaid debt to a
+ * back-fill. `transcribed_at` must stay nullable, because it is only ever written in `done`.
+ *
+ * The pending index must stay PARTIAL. On a healthy deployment `done` and `disabled` are together
+ * essentially the whole table; indexing them would buy a write on every filed message to answer a
+ * question ("who still owes a transcript") that is only ever asked about the tiny `pending` slice.
+ */
+describe("voicemail transcription", () => {
+	const config = getTableConfig(pbxTables.voicemailMessage);
+	const columnsByName = new Map(config.columns.map((column) => [column.name, column]));
+
+	it("keeps the transcript itself on a nullable text column", () => {
+		const column = columnsByName.get("transcription");
+		expect(column).toBeDefined();
+		expect(column?.getSQLType()).toBe("text");
+		expect(column?.notNull).toBe(false);
+	});
+
+	it("defaults the status to disabled, so a queue is never implied by an insert", () => {
+		const column = columnsByName.get("transcription_status");
+		expect(column).toBeDefined();
+		expect(column?.getSQLType()).toBe("text");
+		expect(column?.notNull).toBe(true);
+		expect(column?.default).toBe("disabled");
+	});
+
+	it("keeps transcribed_at nullable and timezone-aware, because only `done` writes it", () => {
+		const column = columnsByName.get("transcribed_at");
+		expect(column).toBeDefined();
+		expect(column?.getSQLType()).toBe("timestamp with time zone");
+		expect(column?.notNull).toBe(false);
+		expect(column?.hasDefault).toBe(false);
+	});
+
+	it("indexes the backlog partially, on pending alone", () => {
+		const index = config.indexes.find(
+			(candidate) => candidate.config.name === "voicemail_message_transcription_pending_idx",
+		);
+		expect(index).toBeDefined();
+		// Partial, and on the status the sweep actually looks for.
+		expect(index?.config.where).toBeDefined();
+		expect(JSON.stringify(index?.config.where?.queryChunks)).toContain("pending");
+		// Still organization-first, so the tenant predicate stays usable — the rule above.
+		const columns = index?.config.columns.map((entry) => ("name" in entry ? entry.name : ""));
+		expect(columns?.[0]).toBe("organization_id");
+	});
+
+	it("keeps the mailbox's own switch a plain boolean that is off by default", () => {
+		// The per-box opt-in. Transcription needs BOTH this and a configured provider; a deployment
+		// that configures a provider must not start transcribing every mailbox it already had.
+		const column = getTableConfig(pbxTables.voicemailBox).columns.find(
+			(candidate) => candidate.name === "transcription_enabled",
+		);
+		expect(column?.getSQLType()).toBe("boolean");
+		expect(column?.notNull).toBe(true);
+		expect(column?.default).toBe(false);
 	});
 });
 

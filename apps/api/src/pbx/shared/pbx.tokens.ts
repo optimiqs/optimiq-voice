@@ -33,3 +33,23 @@ export const PBX_MEDIA_STORE = Symbol("api/pbx/MediaStore");
  * audio by Asterisk. Nothing in this API ever `put`s through this store; it reads, and it archives.
  */
 export const PBX_VOICEMAIL_STORE = Symbol("api/pbx/VoicemailStore");
+
+/**
+ * The selected `TranscriptionProvider` — `disabled` unless `TRANSCRIBE_BASE_URL` is set.
+ *
+ * A token rather than the service constructing its own driver, for the reason every other seam in
+ * this area is injected: the mapping from environment to driver is one decision made in one factory
+ * (`src/transcription/transcription-provider.factory.ts`), and a test swaps the provider without
+ * touching `process.env`.
+ */
+export const PBX_TRANSCRIPTION_PROVIDER = Symbol("api/pbx/TranscriptionProvider");
+
+/**
+ * The parsed `TranscriptionEnv`, separate from the provider it selected.
+ *
+ * Separate because the two are read by different things: the PROVIDER holds the endpoint and the
+ * credential, while the retry budget, the queue ceiling and the size cap belong to the PIPELINE and
+ * are meaningful even when the driver is `disabled`. Folding them into the provider would mean the
+ * pipeline reaching through a port to find a policy that is not the port's business.
+ */
+export const PBX_TRANSCRIPTION_SETTINGS = Symbol("api/pbx/TranscriptionSettings");

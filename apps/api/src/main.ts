@@ -20,6 +20,11 @@ import { isPbxAreaEnabled, registerPbxTransport } from "./pbx/pbx-bootstrap";
 import { PbxModule } from "./pbx/pbx.module";
 import { ProvisioningModule } from "./provisioning/provisioning.module";
 import { assertStoragePreflight, loadStorageEnv } from "./storage";
+import {
+	assertTranscriptionPreflight,
+	loadTranscriptionEnv,
+	selectTranscriptionDriver,
+} from "./transcription";
 
 const logger = getLogger("api.bootstrap");
 
@@ -81,6 +86,29 @@ async function bootstrap() {
 			endpoint: storageEnv.endpoint ?? null,
 		},
 		"storage preflight passed",
+	);
+
+	/**
+	 * Voicemail transcription, on the same terms and for the same reason.
+	 *
+	 * The refusal that matters happens at PARSE time rather than in the preflight: a
+	 * `TRANSCRIBE_API_KEY` with no `TRANSCRIBE_BASE_URL`, or a base URL with no model, throws out of
+	 * `loadTranscriptionEnv` here and stops the process. That is somebody who believes voicemails are
+	 * being transcribed, and the alternative is their finding out from an empty column weeks later.
+	 *
+	 * `assertTranscriptionPreflight` deliberately asserts nothing about the CONFIGURED state — see
+	 * its own note. A production deployment with transcription off is not broken; it is the default,
+	 * and refusing to boot it would be a preflight inventing a requirement.
+	 */
+	const transcriptionEnv = loadTranscriptionEnv();
+	assertTranscriptionPreflight(transcriptionEnv);
+	logger.info(
+		{
+			driver: selectTranscriptionDriver(transcriptionEnv),
+			baseUrl: transcriptionEnv.baseUrl ?? null,
+			model: transcriptionEnv.model ?? null,
+		},
+		"transcription preflight passed",
 	);
 
 	/**

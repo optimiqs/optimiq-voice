@@ -623,6 +623,26 @@ export const VOICEMAIL_FOLDERS = ["new", "saved", "deleted"] as const;
 export type VoicemailFolder = (typeof VOICEMAIL_FOLDERS)[number];
 
 /**
+ * How far a message got through transcription. Mirrors `VOICEMAIL_TRANSCRIPTION_STATUSES`.
+ *
+ * Four states rather than "is `transcription` null", because a null transcript is three different
+ * facts and each one wants a different thing on screen:
+ *
+ * | status     | what the row means                    | what the UI should do        |
+ * | ---------- | ------------------------------------- | ---------------------------- |
+ * | `disabled` | nobody tried, and nobody is going to  | show nothing at all          |
+ * | `pending`  | queued or in flight                   | a spinner is honest here     |
+ * | `done`     | a provider answered                   | show the text, even if empty |
+ * | `failed`   | a provider was asked and refused      | say so; stop waiting         |
+ *
+ * `done` with an EMPTY transcript is legitimate — a few seconds of silence transcribes to nothing —
+ * which is the case that makes this field load-bearing rather than a convenience. A UI keyed on the
+ * text alone would render that identically to `disabled` and to a spinner that never stops.
+ */
+export const VOICEMAIL_TRANSCRIPTION_STATUSES = ["disabled", "pending", "done", "failed"] as const;
+export type VoicemailTranscriptionStatus = (typeof VOICEMAIL_TRANSCRIPTION_STATUSES)[number];
+
+/**
  * One message in a mailbox.
  *
  * `read` is DERIVED from `folder` by the server and sent anyway, because every control in the UI
@@ -641,6 +661,10 @@ export interface VoicemailMessageRow {
 	readonly durationMs: number;
 	readonly sizeBytes: number | null;
 	readonly transcription: string | null;
+	/** Which of the four states the transcript is in. See {@link VoicemailTranscriptionStatus}. */
+	readonly transcriptionStatus: VoicemailTranscriptionStatus;
+	/** ISO-8601, and null in every state but `done`. */
+	readonly transcribedAt: string | null;
 	readonly callLegRef: string | null;
 }
 

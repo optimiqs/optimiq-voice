@@ -1,6 +1,11 @@
 import { Inject, Module, type OnApplicationShutdown } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
 import { createObjectStore, describeObjectStore, loadStorageEnv } from "../storage";
+import {
+	createTranscriptionProvider,
+	describeTranscriptionProvider,
+	loadTranscriptionEnv,
+} from "../transcription";
 import { AuditLogQueryService } from "./audit-log/audit-log-query.service";
 import { AuditLogController } from "./audit-log/audit-log.controller";
 import { CarrierWebhookController } from "./carrier/carrier-webhook.controller";
@@ -59,6 +64,8 @@ import {
 	PBX_EFFECT_RUNTIME,
 	PBX_ENV,
 	PBX_MEDIA_STORE,
+	PBX_TRANSCRIPTION_PROVIDER,
+	PBX_TRANSCRIPTION_SETTINGS,
 	PBX_VOICEMAIL_STORE,
 } from "./shared/pbx.tokens";
 import { dischargeProjection } from "./shared/projection-outbox";
@@ -83,7 +90,9 @@ import { VoicemailMessagesService } from "./voicemail-boxes/voicemail-messages.s
 import { VoicemailMwiPublisher } from "./voicemail-boxes/voicemail-mwi.publisher";
 import { VoicemailPinService } from "./voicemail-boxes/voicemail-pin.service";
 import { VoicemailRpcController } from "./voicemail-boxes/voicemail-rpc.controller";
+import { VoicemailTranscriptionService } from "./voicemail-boxes/voicemail-transcription.service";
 import type { ObjectStore } from "../storage";
+import type { TranscriptionEnv, TranscriptionProvider } from "../transcription";
 import type { PbxEnv } from "./shared/pbx-env";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
@@ -247,6 +256,32 @@ const logger = getLogger("api.pbx");
 			useFactory: (env: PbxEnv): ObjectStore =>
 				createObjectStore(loadStorageEnv(), { root: env.PBX_VOICEMAIL_MEDIA_ROOT }),
 			inject: [PBX_ENV],
+		},
+		/**
+		 * Voicemail transcription: the settings, and the provider they select.
+		 *
+		 * Two providers rather than one carrying both, for the reason `pbx.tokens.ts` records: the
+		 * endpoint and the credential belong to the DRIVER, while the retry budget, the queue ceiling
+		 * and the size cap belong to the PIPELINE and mean something even when the driver is
+		 * `disabled`.
+		 *
+		 * `loadTranscriptionEnv()` is called here as well as in `main.ts`, on the same terms as
+		 * `loadStorageEnv()` above: the preflight in `main.ts` is what turns a half-configured
+		 * environment into a refusal to boot, and this call is what the module actually uses. They
+		 * parse the same `process.env` with the same schema, so they cannot disagree.
+		 */
+		{
+			provide: PBX_TRANSCRIPTION_SETTINGS,
+			useFactory: (): TranscriptionEnv => loadTranscriptionEnv(),
+		},
+		{
+			provide: PBX_TRANSCRIPTION_PROVIDER,
+			useFactory: (settings: TranscriptionEnv): TranscriptionProvider => {
+				const provider = createTranscriptionProvider(settings);
+				logger.info({ driver: provider.driver }, describeTranscriptionProvider(provider, settings));
+				return provider;
+			},
+			inject: [PBX_TRANSCRIPTION_SETTINGS],
 		},
 		RoutingCachePublisher,
 		DidIndexPublisher,
@@ -447,6 +482,7 @@ const logger = getLogger("api.pbx");
 		VoicemailMessagesService,
 		VoicemailGreetingsService,
 		VoicemailEmailService,
+		VoicemailTranscriptionService,
 		VoicemailConsumer,
 		RoutingService,
 		/**
