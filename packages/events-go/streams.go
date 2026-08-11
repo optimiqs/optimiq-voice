@@ -521,13 +521,20 @@ func ChannelKVKey(orgID, callID, legID string) (string, error) {
 	return org + "." + call + "." + leg, nil
 }
 
-// PresenceKVKey builds the presence key <orgId>.<extensionId>.
-func PresenceKVKey(orgID, extensionID string) (string, error) {
+// PresenceKVKey builds the presence key <orgId>.<extensionNumber> — the dialable number, not the
+// extension row id.
+//
+// The number because it is what both ends of this bucket already hold: every provisioning template
+// writes a BLF key as a number, so a phone SUBSCRIBEs to sip:<number>@<domain> and this process
+// reads a number off the Request-URI; and a channel snapshot carries a destination number, so the
+// engine aggregates over numbers too. See extensionPresenceSchema in packages/events for the full
+// argument.
+func PresenceKVKey(orgID, extensionNumber string) (string, error) {
 	org, err := token("orgId", orgID)
 	if err != nil {
 		return "", err
 	}
-	extension, err := token("extensionId", extensionID)
+	extension, err := token("extensionNumber", extensionNumber)
 	if err != nil {
 		return "", err
 	}

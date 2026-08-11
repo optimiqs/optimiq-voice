@@ -90,6 +90,23 @@ type Config struct {
 	MaxExpires     time.Duration
 	DefaultExpires time.Duration
 
+	// Subscription expiry policy, in seconds on the wire. It governs SUBSCRIBE (BLF and MWI), not
+	// REGISTER, and the numbers are deliberately different from the registration ones.
+	//
+	//   SIPD_SUBSCRIBE_MIN_EXPIRES     default 60  — below this a SUBSCRIBE gets 423
+	//   SIPD_SUBSCRIBE_MAX_EXPIRES     default 600 — above this the grant is silently clamped down
+	//   SIPD_SUBSCRIBE_DEFAULT_EXPIRES default 600 — used when the SUBSCRIBE states no interval
+	//
+	// Ten minutes rather than an hour, and that ceiling is the load-bearing one. The subscription
+	// table is instance-local (see internal/subscribe), so if an instance dies its subscribers'
+	// lamps freeze until they re-subscribe — and this is what bounds that window. RFC 6665 §4.2.1
+	// lets the notifier shorten what a phone asked for, so a handset requesting 3600 is simply
+	// granted 600 and refreshes six times as often. The cost is one SUBSCRIBE per phone per ten
+	// minutes; the alternative is a BLF wall that can be an hour stale after a pod is rescheduled.
+	SubscribeMinExpires     time.Duration
+	SubscribeMaxExpires     time.Duration
+	SubscribeDefaultExpires time.Duration
+
 	// NonceTTL bounds how long a digest challenge stays usable. SIPD_NONCE_TTL, default 60s.
 	NonceTTL time.Duration
 	// NonceSecret keys the nonce MAC. SIPD_NONCE_SECRET.
@@ -209,6 +226,15 @@ func Load(getenv Getenv) (Config, error) {
 	if cfg.DefaultExpires, err = secondsOr(getenv, "SIPD_DEFAULT_EXPIRES", 300); err != nil {
 		fail("%v", err)
 	}
+	if cfg.SubscribeMinExpires, err = secondsOr(getenv, "SIPD_SUBSCRIBE_MIN_EXPIRES", 60); err != nil {
+		fail("%v", err)
+	}
+	if cfg.SubscribeMaxExpires, err = secondsOr(getenv, "SIPD_SUBSCRIBE_MAX_EXPIRES", 600); err != nil {
+		fail("%v", err)
+	}
+	if cfg.SubscribeDefaultExpires, err = secondsOr(getenv, "SIPD_SUBSCRIBE_DEFAULT_EXPIRES", 600); err != nil {
+		fail("%v", err)
+	}
 	if cfg.NonceTTL, err = durationOr(getenv, "SIPD_NONCE_TTL", time.Minute); err != nil {
 		fail("%v", err)
 	}
@@ -273,6 +299,18 @@ func Load(getenv Getenv) (Config, error) {
 	}
 	if cfg.MinExpires <= 0 {
 		fail("SIPD_MIN_EXPIRES must be positive")
+	}
+	if cfg.SubscribeMinExpires <= 0 {
+		fail("SIPD_SUBSCRIBE_MIN_EXPIRES must be positive")
+	}
+	if cfg.SubscribeMinExpires > cfg.SubscribeMaxExpires {
+		fail("SIPD_SUBSCRIBE_MIN_EXPIRES (%s) must not exceed SIPD_SUBSCRIBE_MAX_EXPIRES (%s)",
+			cfg.SubscribeMinExpires, cfg.SubscribeMaxExpires)
+	}
+	if cfg.SubscribeDefaultExpires < cfg.SubscribeMinExpires ||
+		cfg.SubscribeDefaultExpires > cfg.SubscribeMaxExpires {
+		fail("SIPD_SUBSCRIBE_DEFAULT_EXPIRES (%s) must lie within [%s, %s]",
+			cfg.SubscribeDefaultExpires, cfg.SubscribeMinExpires, cfg.SubscribeMaxExpires)
 	}
 	if cfg.SweepInterval <= 0 {
 		fail("SIPD_SWEEP_INTERVAL must be positive")

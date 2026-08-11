@@ -10,6 +10,7 @@ import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import {
 	AGENT_STATE_KV,
 	CHANNELS_KV,
+	PRESENCE_KV,
 	CONFERENCE_CLAIMS_KV,
 	conferenceClaimSchema,
 	DID_INDEX_KV,
@@ -66,6 +67,7 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	private connection: NatsConnection | undefined;
 	private jetstream: JetStreamClient | undefined;
 	private channelsKv: KV | undefined;
+	private presenceKv: KV | undefined;
 	private routingCacheKv: KV | undefined;
 	private didIndexKv: KV | undefined;
 	private queueMembershipKv: KV | undefined;
@@ -133,6 +135,10 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 
 		this.jetstream = this.connection.jetstream();
 		this.channelsKv = await this.jetstream.views.kv(CHANNELS_KV.name);
+		// `presence` — the BLF/MWI read model, DERIVED from `channels` above by
+		// `presence/presence.service.ts` and read by `apps/sipd` to compose a NOTIFY. This engine is
+		// its only writer; the SIP edge's broker permissions deny it the write side entirely.
+		this.presenceKv = await this.jetstream.views.kv(PRESENCE_KV.name);
 		// The routing cache is READ here and written by `apps/api` on save. Opening the view is
 		// still safe when the bucket does not exist yet — `views.kv` creates it with the same
 		// definition `ensureKvBuckets` applies — so a fresh cluster does not need the API to have
@@ -164,6 +170,34 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 			CONFERENCE_CLAIMS_KV.name,
 		);
 		this.ready = true;
+	}
+
+	/**
+	 * The `channels` bucket, raw, for the presence publisher.
+	 *
+	 * The three helpers below ({@link putChannel} and friends) stay the way every other caller
+	 * reaches this bucket — they are point operations on a snapshot the caller already holds. The
+	 * presence publisher needs the third pattern instead: a long-lived WATCH whose lifetime belongs
+	 * to its consumer, exactly as {@link routingCache} does. Wrapping that here would mean this
+	 * service owning a subscription it has no reason to know the shape of.
+	 *
+	 * `undefined` before `onModuleInit` has run, or after shutdown.
+	 */
+	get channels(): KV | undefined {
+		return this.channelsKv;
+	}
+
+	/**
+	 * The `presence` bucket, raw, for the presence publisher.
+	 *
+	 * Raw for a different reason from the buckets above: the publisher does a read-compare-write per
+	 * extension (see the debounce note on `extensionPresenceSchema`), and a `put`-only helper here
+	 * would hide the read that makes the debounce work.
+	 *
+	 * `undefined` before `onModuleInit` has run, or after shutdown.
+	 */
+	get presence(): KV | undefined {
+		return this.presenceKv;
 	}
 
 	/**
@@ -354,6 +388,7 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		this.connection = undefined;
 		this.jetstream = undefined;
 		this.channelsKv = undefined;
+		this.presenceKv = undefined;
 		this.routingCacheKv = undefined;
 		this.didIndexKv = undefined;
 		this.queueMembershipKv = undefined;

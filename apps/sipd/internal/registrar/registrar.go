@@ -40,8 +40,10 @@ const (
 // INVITE before the proxy exists would make a phone try to place a call through a registrar.
 //
 // REFER is on it because `internal/transfer` answers it — a desk phone that does not see REFER
-// advertised may grey out its own TRANSFER key rather than trying.
-const allowedMethods = "REGISTER, OPTIONS, REFER"
+// advertised may grey out its own TRANSFER key rather than trying. SUBSCRIBE joined it for the same
+// reason when `internal/subscribe` shipped: several vendors probe the Allow set before arming a BLF
+// key, and a key that is never armed is indistinguishable from presence that does not work.
+const allowedMethods = "REGISTER, OPTIONS, REFER, SUBSCRIBE"
 
 // Options configures a Registrar. Every dependency is an interface so the unit tests run without a
 // broker, a socket or a clock.
@@ -63,6 +65,11 @@ type Options struct {
 	Source string
 	// ServerHeader is the Server: header value.
 	ServerHeader string
+	// AllowEvents is the `Allow-Events` value advertised on OPTIONS — `internal/subscribe`'s list,
+	// passed in rather than imported because that package depends on THIS one for the digest
+	// authenticator and the import cannot go both ways. Empty omits the header, which is the honest
+	// answer for a build with no subscription handler wired.
+	AllowEvents string
 	// SweepInterval is how often Run looks for lapsed bindings.
 	SweepInterval time.Duration
 	// BaseContext parents every store and publish operation, so a shutdown cancels work in flight.
@@ -90,6 +97,7 @@ type Registrar struct {
 	log           *slog.Logger
 	source        string
 	server        string
+	allowEvents   string
 	sweepInterval time.Duration
 	baseCtx       context.Context
 	opTimeout     time.Duration
@@ -133,6 +141,7 @@ func New(opts Options) (*Registrar, error) {
 		log:           opts.Logger,
 		source:        opts.Source,
 		server:        opts.ServerHeader,
+		allowEvents:   opts.AllowEvents,
 		sweepInterval: opts.SweepInterval,
 		baseCtx:       opts.BaseContext,
 		opTimeout:     opts.OperationTimeout,
@@ -259,6 +268,9 @@ func (r *Registrar) HandleRegister(req *sip.Request, tx sip.ServerTransaction) {
 func (r *Registrar) HandleOptions(req *sip.Request, tx sip.ServerTransaction) {
 	res := sip.NewResponseFromRequest(req, statusOK, "OK", nil)
 	res.AppendHeader(sip.NewHeader("Allow", allowedMethods))
+	if r.allowEvents != "" {
+		res.AppendHeader(sip.NewHeader("Allow-Events", r.allowEvents))
+	}
 	res.AppendHeader(sip.NewHeader("Accept", "application/sdp"))
 	r.send(tx, res)
 }

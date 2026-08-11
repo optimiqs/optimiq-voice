@@ -813,9 +813,18 @@ export const kvKeyFor = {
 	channel(orgId: string, callId: string, legId: string): string {
 		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("callId", callId)}.${assertKeyToken("legId", legId)}`;
 	},
-	/** `presence`: `<orgId>.<extensionId>`. */
-	presence(orgId: string, extensionId: string): string {
-		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("extensionId", extensionId)}`;
+	/**
+	 * `presence`: `<orgId>.<extensionNumber>` — the dialable number, not the `extension` row id.
+	 *
+	 * The number because it is what both ends of this bucket already hold: every provisioning
+	 * template writes a BLF key as a number, so a phone SUBSCRIBEs to `sip:<number>@<domain>` and
+	 * `sipd` reads a number off the Request-URI; and a `ChannelSnapshot` carries
+	 * `profile.destinationNumber`, so the engine aggregates over numbers too. A row-id key would put
+	 * a lookup on the path of every NOTIFY purely to translate an identifier the wire never carries.
+	 * See `extensionPresenceSchema` for the full argument and what it costs at renumbering time.
+	 */
+	presence(orgId: string, extensionNumber: string): string {
+		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("extensionNumber", extensionNumber)}`;
 	},
 	/** `agent-state`: `<orgId>.<agentId>` — an agent has one state across every queue. */
 	agentState(orgId: string, agentId: string): string {

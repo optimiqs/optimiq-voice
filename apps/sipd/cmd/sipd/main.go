@@ -4,8 +4,12 @@
 // into the `registrations` NATS KV bucket, publishes sip.reg.v1 transitions onto the REGISTRATIONS
 // stream, and answers OPTIONS. It also answers REFER — a desk phone's TRANSFER key — by asking the
 // engine over `rpc.sip.v1.transfer` and reporting the outcome back per RFC 3515; see
-// internal/transfer. The proxy/INVITE path — the half that lets it retire Routr — is the next PG
-// wave; see the README.
+// internal/transfer.
+//
+// And it is the fleet's NOTIFIER: SUBSCRIBE for RFC 4235 `dialog` (busy-lamp keys, read from the
+// `presence` KV bucket apps/engine writes) and RFC 3842 `message-summary` (the voicemail lamp, from
+// `voicemail.evt.v1.*.*.mwi.updated`); see internal/subscribe. The proxy/INVITE path — the half that
+// lets it retire Routr — is the next PG wave; see the README.
 //
 // Configuration is entirely environmental; run with no arguments.
 package main
@@ -33,7 +37,10 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/credentials"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/events"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/kv"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/mwi"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/presence"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/registrar"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/subscribe"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/transfer"
 )
 
@@ -77,8 +84,9 @@ func run() error {
 	// Only when configured: an empty pair means a broker with no authentication, which is what the
 	// SIPp rig and the integration tests run. config.Load has already refused a half-set pair, and
 	// has already preferred NATS_SIPD_USER/PASS over the shared pair — so this is the `sipd` user,
-	// whose permissions in config/nats.conf are sip.reg.v1.>, rpc.sip.v1.credential and the
-	// registrations bucket, and nothing else.
+	// whose permissions in config/nats.conf are sip.reg.v1.>, the two rpc.sip.v1 requests, the
+	// registrations bucket, READ-ONLY access to the presence bucket and the MWI event family, and
+	// nothing else.
 	if cfg.NATSUser != "" {
 		natsOpts = append(natsOpts, nats.UserInfo(cfg.NATSUser, cfg.NATSPass))
 	}
@@ -115,6 +123,14 @@ func run() error {
 		return err
 	}
 
+	// The presence bucket: apps/engine writes it, this edge only ever reads and watches it. Opened
+	// at boot rather than lazily so a broker that will not serve it fails the process here, with the
+	// bucket named, instead of on the first BLF key a receptionist presses.
+	presenceStore, err := presence.Open(ctx, js)
+	if err != nil {
+		return err
+	}
+
 	credentialStore, err := openCredentialStore(cfg, conn, log)
 	if err != nil {
 		return err
@@ -140,6 +156,7 @@ func run() error {
 		Logger:           log,
 		Source:           config.EventSource,
 		ServerHeader:     cfg.UserAgent,
+		AllowEvents:      subscribe.AllowEvents,
 		SweepInterval:    cfg.SweepInterval,
 		BaseContext:      ctx,
 		OperationTimeout: 3 * time.Second,
@@ -169,9 +186,10 @@ func run() error {
 	}
 	defer server.Close()
 
-	// The client half. It exists for exactly one thing today: the RFC 3515 NOTIFY that reports a
-	// transfer's outcome back to the phone that asked for it. A registrar otherwise never originates
-	// a request, which is why sipd had no client at all until REFER arrived.
+	// The client half. It exists to originate NOTIFY, and nothing else: the RFC 3515 report that
+	// tells a phone how its transfer went, and the RFC 6665 notifications that move its lamps. A
+	// registrar otherwise never originates a request, which is why sipd had no client at all until
+	// REFER arrived.
 	sipClient, err := sipgo.NewClient(userAgent, sipgo.WithClientLogger(log))
 	if err != nil {
 		return fmt.Errorf("creating the SIP client: %w", err)
@@ -183,19 +201,34 @@ func run() error {
 		return err
 	}
 
+	subscriptions, err := newSubscribeHandler(
+		cfg, conn, sipClient, authenticator, credentialStore, bindings, presenceStore, ctx, log)
+	if err != nil {
+		return err
+	}
+
 	server.OnRegister(reg.HandleRegister)
 	server.OnOptions(reg.HandleOptions)
 	server.OnRefer(transfers.HandleRefer)
-	// Everything else — INVITE, SUBSCRIBE, MESSAGE, … — is honestly refused until the proxy wave.
+	server.OnSubscribe(subscriptions.HandleSubscribe)
+	// Everything else — INVITE, MESSAGE, PUBLISH, … — is honestly refused until the proxy wave.
 	server.OnNoRoute(reg.HandleUnsupported)
 
 	var group sync.WaitGroup
-	errs := make(chan error, 3)
+	errs := make(chan error, 4)
 
 	group.Add(1)
 	go func() {
 		defer group.Done()
 		if err := reg.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			errs <- err
+		}
+	}()
+
+	group.Add(1)
+	go func() {
+		defer group.Done()
+		if err := subscriptions.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			errs <- err
 		}
 	}()
@@ -233,6 +266,19 @@ func run() error {
 	// indicator lit until the dialog dies, and these finish in well under a second.
 	if !transfers.Wait(cfg.ShutdownTimeout) {
 		log.Warn("some transfer outcomes were not reported before shutdown")
+	}
+
+	// Then the subscriptions. `terminated;reason=deactivated` is RFC 6665's "re-subscribe now", so
+	// every lamp this instance was serving moves to a surviving one within a round trip instead of
+	// freezing until its subscription lapses. The context is fresh and short: ctx is already
+	// cancelled by this point, and a cancelled context would drop every one of these.
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	if deactivated := subscriptions.Shutdown(shutdownCtx); deactivated > 0 {
+		log.Info("told subscribers to re-subscribe", "count", deactivated)
+	}
+	cancelShutdown()
+	if !subscriptions.Wait(cfg.ShutdownTimeout) {
+		log.Warn("some subscription notifications were not delivered before shutdown")
 	}
 	if !waitFor(&group, cfg.ShutdownTimeout) {
 		log.Warn("shutdown timed out; exiting anyway")
@@ -290,6 +336,66 @@ func newTransferHandler(
 		"subject", requester.Subject(),
 		"timeout", contract.TimeoutSipTransferRPC,
 		"contact", contact.String())
+	return handler, nil
+}
+
+// newSubscribeHandler wires SUBSCRIBE/NOTIFY: digest against the same authenticator the registrar
+// uses, the location service as the "is this phone actually here" check, the `presence` KV bucket
+// for the busy-lamp state and `voicemail.evt.v1.*.*.mwi.updated` for the message-waiting one.
+//
+// Like REFER it is always wired, and for the same reason: there is no useful degraded mode. A
+// deployment where apps/engine is not yet publishing presence gets subscriptions that are accepted
+// and notified `down`, which is exactly what a fleet of idle phones looks like and exactly what the
+// lamps should show.
+func newSubscribeHandler(
+	cfg config.Config,
+	conn *nats.Conn,
+	client *sipgo.Client,
+	authenticator *registrar.Authenticator,
+	credentialStore credentials.Store,
+	bindings kv.Store,
+	presenceStore presence.Store,
+	ctx context.Context,
+	log *slog.Logger,
+) (*subscribe.Handler, error) {
+	mwiSource, err := mwi.NewNATSSource(conn, log)
+	if err != nil {
+		return nil, err
+	}
+	notifier, err := subscribe.NewClientNotifier(client)
+	if err != nil {
+		return nil, err
+	}
+
+	handler, err := subscribe.New(subscribe.Options{
+		Realm:       cfg.Realm,
+		Auth:        authenticator,
+		Credentials: credentialStore,
+		Bindings:    bindings,
+		Presence:    presenceStore,
+		MWI:         mwiSource,
+		Notifier:    notifier,
+		Contact:     contactURI(cfg),
+		Expiry: subscribe.ExpiryPolicy{
+			Min:     cfg.SubscribeMinExpires,
+			Max:     cfg.SubscribeMaxExpires,
+			Default: cfg.SubscribeDefaultExpires,
+		},
+		Logger:        log,
+		ServerHeader:  cfg.UserAgent,
+		BaseContext:   ctx,
+		AuthTimeout:   3 * time.Second,
+		SweepInterval: cfg.SweepInterval,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	log.Info("SUBSCRIBE handling ready",
+		"events", subscribe.AllowEvents,
+		"presenceBucket", contract.PresenceKV.Name,
+		"mwiSubject", mwi.Subject,
+		"maxExpiresSeconds", int(cfg.SubscribeMaxExpires/time.Second))
 	return handler, nil
 }
 

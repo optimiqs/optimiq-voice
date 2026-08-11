@@ -159,17 +159,21 @@ export {
 	type MediaSessionRtpTimeoutData,
 } from "./media-events";
 export {
+	extensionPresenceSchema,
 	isLiveChannel,
 	isRegistrationLapsed,
 	LIVE_CHANNEL_DIRECTIONS,
 	LIVE_CHANNEL_TEARDOWN_STATES,
 	liveChannelSchema,
 	mediaSessionDirectoryEntrySchema,
+	PRESENCE_DEVICE_STATES,
 	registrationBindingSchema,
+	type ExtensionPresence,
 	type LiveChannel,
 	type LiveChannelDirection,
 	type LiveChannelTeardownState,
 	type MediaSessionDirectoryEntry,
+	type PresenceDeviceState,
 	type RegistrationBinding,
 } from "./live-state";
 export {

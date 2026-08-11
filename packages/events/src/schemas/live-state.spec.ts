@@ -1,10 +1,12 @@
 import { describe, expect, it } from "bun:test";
-import { CHANNELS_KV, REGISTRATIONS_KV } from "../streams";
+import { CHANNELS_KV, kvKeyFor, PRESENCE_KV, REGISTRATIONS_KV } from "../streams";
 import {
+	extensionPresenceSchema,
 	isLiveChannel,
 	isRegistrationLapsed,
 	LIVE_CHANNEL_TEARDOWN_STATES,
 	liveChannelSchema,
+	PRESENCE_DEVICE_STATES,
 	registrationBindingSchema,
 } from "./live-state";
 
@@ -147,5 +149,52 @@ describe("liveChannelSchema", () => {
 
 	it("is the value shape of the bucket it names", () => {
 		expect(CHANNELS_KV.name).toBe("channels");
+	});
+});
+
+describe("extensionPresenceSchema", () => {
+	const NOW = 1_785_000_000_000;
+
+	function presence(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+		return {
+			orgId: ORG,
+			extensionNumber: "1001",
+			state: "ringing",
+			channelCount: 1,
+			callStates: ["ringing"],
+			updatedAt: NOW,
+			...overrides,
+		};
+	}
+
+	it("accepts a value the engine would write", () => {
+		expect(extensionPresenceSchema.safeParse(presence()).success).toBe(true);
+	});
+
+	/**
+	 * The one closed vocabulary among the KV value contracts. `sipd` maps it onto RFC 4235
+	 * `dialog-info+xml`, and a mapper has no way to degrade an unknown value — the failure would be a
+	 * NOTIFY it cannot compose, so a lamp stuck on whatever it last showed.
+	 */
+	it("refuses a device state outside the vocabulary", () => {
+		expect(extensionPresenceSchema.safeParse(presence({ state: "dnd" })).success).toBe(false);
+		for (const state of PRESENCE_DEVICE_STATES) {
+			expect(extensionPresenceSchema.safeParse(presence({ state })).success).toBe(true);
+		}
+	});
+
+	it("keys by the dialable number, which is what a BLF key is provisioned against", () => {
+		const parsed = extensionPresenceSchema.parse(presence());
+		expect(kvKeyFor.presence(parsed.orgId, parsed.extensionNumber)).toBe(`${ORG}.1001`);
+	});
+
+	/** `.loose()`, like every other KV contract here — a writer may learn a field first. */
+	it("keeps a field this reader has not heard of", () => {
+		const parsed = extensionPresenceSchema.parse(presence({ dndUntil: NOW + 1000 }));
+		expect((parsed as Record<string, unknown>).dndUntil).toBe(NOW + 1000);
+	});
+
+	it("is the value shape of the bucket it names", () => {
+		expect(PRESENCE_KV.name).toBe("presence");
 	});
 });

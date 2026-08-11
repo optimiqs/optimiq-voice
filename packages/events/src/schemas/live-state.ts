@@ -255,3 +255,128 @@ export const mediaSessionDirectoryEntrySchema = z
 	.loose();
 
 export type MediaSessionDirectoryEntry = z.infer<typeof mediaSessionDirectoryEntrySchema>;
+
+// ---------------------------------------------------------------------------------------------
+// presence — the value a busy-lamp key renders
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The device-state vocabulary, copied from `packages/telephony`'s `DEVICE_STATES`.
+ *
+ * ## Why this list is copied rather than open
+ *
+ * `liveChannelSchema.state` above is deliberately left as an open string, on the rule that
+ * `packages/events` must not depend on `packages/telephony` and a copied list is a list that can
+ * drift. This one is copied anyway, and the difference is what the READER does with it.
+ *
+ * A wallboard renders a channel state as text, so an unknown value degrades to "a word I have not
+ * seen". `apps/sipd` MAPS a device state onto an RFC 4235 `dialog-info+xml` body, and there is no
+ * degradation available: an unrecognised state is a `NOTIFY` it cannot compose, which is a lamp
+ * stuck on whatever it last showed. A closed vocabulary is the only shape a mapper can be total
+ * over.
+ *
+ * It is also the list least likely to move: seven values, frozen by
+ * `plans/reference/freeswitch-capabilities.md` §1, unchanged in FreeSWITCH for a decade. The copy is
+ * pinned against the original by a spec in `apps/engine`, which is the one place that legitimately
+ * imports both packages.
+ */
+export const PRESENCE_DEVICE_STATES = [
+	"down",
+	"ringing",
+	"active",
+	"active-multi",
+	"held",
+	"unheld",
+	"hangup",
+] as const;
+
+export type PresenceDeviceState = (typeof PRESENCE_DEVICE_STATES)[number];
+
+/**
+ * One extension's aggregated device state, as the `presence` bucket holds it.
+ *
+ * ## Where it comes from, and why last-write-wins is safe
+ *
+ * The engine derives this from the `channels` bucket — the same {@link liveChannelSchema} values it
+ * already mirrors every leg into — and NOT from any one instance's in-memory registry. That choice
+ * is what makes the write semantics trivial:
+ *
+ *  - `channels` is SHARED, so every engine instance watching it sees the same legs and computes the
+ *    same aggregate. Concurrent writers do not disagree; they are redundant. Last-write-wins over
+ *    identical values is not a conflict.
+ *  - An instance that starts, restarts or is rescheduled rebuilds the whole picture from the
+ *    bucket's replay, so presence heals itself rather than needing a handover.
+ *  - The alternative — each instance contributing the legs it happens to hold, merged under
+ *    compare-and-swap — needs per-instance shares in the value and needs dead instances' shares aged
+ *    out. It buys nothing when the input is already global.
+ *
+ * ## Debounce, and what "last write" means
+ *
+ * Writers debounce on VALUE, not on time: an instance writes only when the aggregate it computed
+ * differs from the one it last wrote for that extension. A leg moving `ringing → active` is one
+ * write; a leg moving `active → active` (a bridge change, a variable set, a KV mirror of an
+ * unrelated field) is none. A reader can therefore treat every revision as a real transition, which
+ * is what lets `sipd` turn one KV update into exactly one NOTIFY.
+ *
+ * Deletion is meaningful and is not the same as `down`. The engine deletes the key when an extension
+ * has no live channels at all, so a lamp is cleared by the key's ABSENCE as well as by a `down`
+ * value; a reader must handle both, because the bucket's five-minute TTL produces the first
+ * unprompted.
+ *
+ * ## What it is not
+ *
+ * Not registration state. An extension whose phone is unplugged is `down` here, exactly as one whose
+ * phone is idle is; "is that device even on the network" is the `registrations` bucket's question
+ * and BLF has never answered it. Nor is it presence in the RFC 3856 sense — no availability, no
+ * note, no human-set status. It is the dialog state of an extension's channels and nothing more.
+ *
+ * `.loose()`, like every other KV contract here.
+ */
+export const extensionPresenceSchema = z
+	.object({
+		orgId: z.string().min(1).max(128),
+		/**
+		 * The dialable number, e.g. `1001` — the KV key's second token, repeated in the value.
+		 *
+		 * The NUMBER and not the `extension` row id, and that is the one contract decision in this
+		 * block worth arguing. Every provisioning template in `apps/api` writes a BLF key as a number:
+		 * Yealink emits `linekey.N.value = 200`, Snom `blf sip:200@<domain>;user=phone`, Poly
+		 * `attendant.resourceList.N.address="200@<domain>"`. A phone therefore SUBSCRIBEs to
+		 * `sip:200@<domain>` and `sipd` has a number in its hand. Keying by row id would put a lookup
+		 * — a database round trip or an RPC — on the path of every `SUBSCRIBE` and every `NOTIFY`,
+		 * to translate an identifier the wire never carries. The engine is in the same position from
+		 * the other side: a `ChannelSnapshot` carries `profile.destinationNumber`, never a row id.
+		 *
+		 * The cost is that renumbering an extension orphans its key. That is correct behaviour rather
+		 * than a defect: the phones watching the old number are watching a number that no longer
+		 * rings, and their lamps should go dark until they are reprovisioned.
+		 */
+		extensionNumber: z.string().min(1).max(64),
+		/** What every channel of this extension collapses to. What a lamp renders. */
+		state: z.enum(PRESENCE_DEVICE_STATES),
+		/** How many live channels the aggregation saw. `0` whenever `state` is `down`. */
+		channelCount: z.int().min(0).max(1024),
+		/**
+		 * The per-channel call states the aggregation collapsed, for diagnosis.
+		 *
+		 * Diagnosis is the whole justification: "why is 1001's lamp solid" is otherwise unanswerable
+		 * from this bucket alone, and the alternative is joining against `channels` by hand at the
+		 * moment somebody is complaining. Left as open strings for the same reason
+		 * `liveChannelSchema.state` is — this is an INPUT the writer already consumed, not something
+		 * a reader acts on.
+		 */
+		callStates: z.array(z.string().max(32)).max(64).optional(),
+		/**
+		 * The engine instance that last wrote this entry.
+		 *
+		 * Every instance computes the same value from the same shared input, so this is not part of
+		 * the answer — it is how an operator tells which replica is still doing the writing when one
+		 * of them has stopped.
+		 */
+		writtenBy: z.string().max(128).optional(),
+		/** Epoch millis, as `channels` and `media-sessions` do it. */
+		updatedAt: z.number(),
+	})
+	.loose();
+
+export type ExtensionPresence = z.infer<typeof extensionPresenceSchema>;
