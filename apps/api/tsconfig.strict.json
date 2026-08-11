@@ -29,13 +29,16 @@
 		"src/cdr/**/*",
 		"src/live/**/*",
 		"src/mail/**/*",
+		"src/media/**/*",
 		"src/pbx/**/*",
+		"src/storage/**/*",
 		"scripts/**/*",
 		"test/auth/**/*",
 		"test/cdr/**/*",
 		"test/live/**/*",
 		"test/mail/**/*",
-		"test/pbx/**/*"
+		"test/pbx/**/*",
+		"test/storage/**/*"
 	],
 	"exclude": ["scripts/verify-tenancy-backfill.ts"]
 }

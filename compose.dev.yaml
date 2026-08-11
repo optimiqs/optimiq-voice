@@ -95,6 +95,50 @@ services:
     ports:
       - 4222:4222
 
+  # An S3-compatible object store, for exercising STORAGE_DRIVER=s3 locally.
+  #
+  # Development ONLY, and deliberately not in compose.yaml: the shipped stack defaults to
+  # STORAGE_DRIVER=local, where the bind-mounted volume IS the store, and adding a bucket service
+  # there would ship a component the default configuration never talks to.
+  #
+  # Not started by `pnpm start:services`, which brings up postgres/nats/asterisk/adminer/mailhog.
+  # Bring it up on purpose:
+  #
+  #   docker compose -f compose.yaml -f compose.dev.yaml up minio -d
+  #   docker compose -f compose.yaml -f compose.dev.yaml exec minio \
+  #     mc alias set local http://localhost:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
+  #   docker compose -f compose.yaml -f compose.dev.yaml exec minio mc mb --ignore-existing local/optimiq-media
+  #
+  # then set STORAGE_DRIVER=s3 in the root .env (see .env.example.dev) and restart `pnpm start:api`.
+  # Uploading a prompt in the admin UI should then land the object BOTH under CDR_RECORDING_ROOT —
+  # which is what Asterisk plays from, and the reason the mirror is a mirror — and in the bucket.
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    environment:
+      # Dev credentials, from the environment with a public fallback so `compose config` works on a
+      # checkout with no .env at all. These are the same values .env.example.dev puts in
+      # S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY; MinIO's root user IS the access key.
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      # The S3 API, and the web console. The console is worth publishing in development for the same
+      # reason mailhog's UI is: "did the object actually land" is a question you want to answer by
+      # looking rather than by writing a script.
+      - 9000:9000
+      - 9001:9001
+    volumes:
+      - minio:/data
+    healthcheck:
+      # `mc ready` rather than curling /minio/health/live: it is shipped in the image, it waits for
+      # the object layer specifically, and it does not need a shell pipeline to interpret.
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
   adminer:
     image: adminer:standalone
     restart: always
@@ -108,3 +152,8 @@ services:
     ports:
       - 8025:8025
       - 1025:1025
+
+# `minio` only. `db` and `nats` are declared in compose.yaml and merge across both files; declaring
+# them again here would be a second definition of one volume rather than a shared one.
+volumes:
+  minio:

@@ -3,12 +3,11 @@ import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { getLogger } from "@optimiq-voice/logging";
 import { and, desc, eq, inArray, sql, voicemailBox, voicemailMessage } from "@optimiq-voice/pbx-db";
 import { openMediaResponse } from "../../media/media-response";
-import { mediaObjectSize } from "../media/media-storage";
+import { ObjectKeyOutsideRootError } from "../../storage";
 import { normalizePagination, paged } from "../shared/pagination";
-import { PBX_DATABASE, PBX_ENV } from "../shared/pbx.tokens";
+import { PBX_DATABASE, PBX_ENV, PBX_VOICEMAIL_STORE } from "../shared/pbx.tokens";
 import {
 	mintVoicemailMediaToken,
-	resolveVoicemailObjectPath,
 	verifyVoicemailMediaToken,
 	voicemailMediaPath,
 } from "./voicemail-media-token";
@@ -22,6 +21,7 @@ import {
 	VoicemailSigningUnavailableException,
 } from "./voicemail.errors";
 import type { MediaResponse } from "../../media/media-response";
+import type { ObjectStore } from "../../storage";
 import type { PagedResult } from "../shared/pagination";
 import type { PbxEnv } from "../shared/pbx-env";
 import type { UpdateVoicemailMessage, VoicemailMessageListQuery } from "./voicemail-messages.dto";
@@ -71,6 +71,17 @@ export class VoicemailMessagesService {
 		@Inject(PBX_ENV) private readonly env: PbxEnv,
 		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
 		@Inject(VoicemailMwiPublisher) private readonly mwi: VoicemailMwiPublisher,
+		/**
+		 * Message audio's store, rooted at `PBX_VOICEMAIL_MEDIA_ROOT`.
+		 *
+		 * This service never WRITES through it: Asterisk records the message onto the shared volume
+		 * and `voicemail-consumer.service.ts` files the row and archives the bytes. What happens here
+		 * is reads — one signed playback route — and the store is what makes that read survive a
+		 * container whose volume was replaced, because the mirror answers when the filesystem cannot.
+		 * `*97` still plays off the filesystem (see {@link listForBroker}), which is why the mirror is
+		 * an archive rather than a migration.
+		 */
+		@Inject(PBX_VOICEMAIL_STORE) private readonly store: ObjectStore,
 	) {}
 
 	// -------------------------------------------------------------------------------------------
@@ -280,24 +291,24 @@ export class VoicemailMessagesService {
 			throw new VoicemailLinkInvalidException();
 		}
 
-		const path = resolveVoicemailObjectPath(this.env.PBX_VOICEMAIL_MEDIA_ROOT, row.objectKey);
-		if (path === undefined) {
+		const stat = await this.store.head(row.objectKey).catch((cause: unknown) => {
+			if (!(cause instanceof ObjectKeyOutsideRootError)) {
+				throw cause;
+			}
+			// Containment refused the key. Answered identically to a forged token — the client must
+			// not be able to tell "poisoned column" from "bad signature" — and logged, because only
+			// one of the two is worth an investigation.
 			logger.error(
-				{
-					messageId: row.id,
-					objectKey: row.objectKey,
-				},
+				{ messageId: row.id, objectKey: row.objectKey },
 				"a voicemail object key resolves outside the media root",
 			);
 			throw new VoicemailLinkInvalidException();
-		}
-
-		const sizeBytes = await mediaObjectSize(path);
-		if (sizeBytes === undefined) {
+		});
+		if (stat === undefined) {
 			throw new VoicemailMediaGoneException();
 		}
 
-		return openMediaResponse(path, sizeBytes, {
+		return await openMediaResponse(this.store, row.objectKey, stat.sizeBytes, {
 			contentType: contentTypeFor(row.objectKey),
 			fileName: downloadFileName(row.receivedAt, row.id, row.objectKey),
 			rangeHeader,

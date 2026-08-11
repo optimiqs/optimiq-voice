@@ -105,6 +105,28 @@ services:
       # route. There is no default and there never will be one.
       - CDR_RECORDING_URL_SECRET
       #
+      # --- The object store ----------------------------------------------------------------------
+      #
+      # `STORAGE_DRIVER` defaults to `local`, which is what this shipped stack runs: the volume
+      # above IS the store, and nothing below has to be set for the file to keep working exactly as
+      # it did. Setting it to `s3` adds an S3-compatible DURABLE MIRROR — AWS, MinIO, R2, Ceph — so
+      # recordings and media survive a replaced container.
+      #
+      # It is a mirror rather than a replacement, and that is a constraint rather than a phase:
+      # Asterisk opens prompts, hold music and voicemail audio off the volume above, because ARI has
+      # no HTTP media scheme and the only thing the engine can hand it is a path. So the filesystem
+      # stays the source of truth for everything on the call path and the bucket is the copy that
+      # outlives the container. See apps/api/src/storage/object-store.ts for the object-class map
+      # and the apps/mediad migration note.
+      - STORAGE_DRIVER
+      - S3_BUCKET
+      - S3_REGION
+      - S3_ENDPOINT
+      - S3_ACCESS_KEY_ID
+      - S3_SECRET_ACCESS_KEY
+      - S3_FORCE_PATH_STYLE
+      - S3_PREFIX
+      #
       # Mail. `src/mail/mail-env.ts` reads the `MAIL_*` names first and these as the aliases.
       - API_SMTP_AUTH_PASS
       - API_SMTP_AUTH_USER

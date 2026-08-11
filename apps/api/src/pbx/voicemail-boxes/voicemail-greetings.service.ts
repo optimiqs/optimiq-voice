@@ -3,7 +3,7 @@ import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { createEntityId } from "@optimiq-voice/identifiers";
 import { getLogger } from "@optimiq-voice/logging";
 import { and, asc, eq, voicemailBox, voicemailGreeting } from "@optimiq-voice/pbx-db";
-import { buildObjectKey, deleteMediaObject, writeMediaObject } from "../media/media-storage";
+import { buildObjectKey } from "../media/media-storage";
 import { mediaPathFor, mintMediaToken, verifyMediaToken } from "../media/media-token";
 import { readUploadedAudio } from "../media/media-upload";
 import {
@@ -17,10 +17,11 @@ import { compileOnWrite } from "../routing/compile-on-write";
 import { RoutingCachePublisher } from "../routing/routing-cache.publisher";
 import { parseDto } from "../shared/dto";
 import { toWireDiagnostic } from "../shared/pbx.errors";
-import { PBX_DATABASE, PBX_ENV } from "../shared/pbx.tokens";
+import { PBX_DATABASE, PBX_ENV, PBX_MEDIA_STORE } from "../shared/pbx.tokens";
 import { uploadGreetingFieldsDto } from "./voicemail-greetings.dto";
 import { VoicemailNotFoundException } from "./voicemail.errors";
 import type { MediaResponse } from "../../media/media-response";
+import type { ObjectStore } from "../../storage";
 import type { MultipartRequest } from "../media/media-upload";
 import type { MediaPlaybackLink } from "../prompts/prompts.service";
 import type { CompiledWrite } from "../routing/compile-on-write";
@@ -78,6 +79,13 @@ export class VoicemailGreetingsService {
 		@Inject(PBX_ENV) private readonly env: PbxEnv,
 		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
 		@Inject(RoutingCachePublisher) private readonly publisher: RoutingCachePublisher,
+		/**
+		 * The media LIBRARY's store, the same one prompts and MOH files use — a greeting's key is
+		 * `greetings/<org>/<box>/<id>.<ext>` under `PBX_MEDIA_OBJECT_ROOT`, and the compiler embeds it
+		 * as `object://<key>` for Asterisk to open off the shared mount. Asterisk-shared, therefore
+		 * always filesystem-backed; see `src/storage/object-store.factory.ts`.
+		 */
+		@Inject(PBX_MEDIA_STORE) private readonly store: ObjectStore,
 	) {}
 
 	/** Every greeting on a box, active ones first, then by kind. */
@@ -133,7 +141,7 @@ export class VoicemailGreetingsService {
 		);
 		// The object first, for the reason `prompts.service.ts` sets out: a file with no row is
 		// inert, a row with no file plays silence at a caller.
-		await writeMediaObject(this.env.PBX_MEDIA_OBJECT_ROOT, objectKey, audio.bytes);
+		await this.store.put(objectKey, audio.bytes, { contentType: audio.format.contentType });
 
 		try {
 			const written = await this.write(organizationId, async (transaction) => {
@@ -347,7 +355,7 @@ export class VoicemailGreetingsService {
 			throw new MediaLinkInvalidException();
 		}
 
-		return await openStoredObject(this.env.PBX_MEDIA_OBJECT_ROOT, row.objectKey, {
+		return await openStoredObject(this.store, row.objectKey, {
 			fileName: downloadFileName(row.label ?? row.kind, row.objectKey),
 			rangeHeader,
 			subject: { kind: "voicemail-greeting", id: row.id },
@@ -415,7 +423,7 @@ export class VoicemailGreetingsService {
 	}
 
 	private async unlink(objectKey: string): Promise<void> {
-		await deleteMediaObject(this.env.PBX_MEDIA_OBJECT_ROOT, objectKey).catch((cause: unknown) => {
+		await this.store.delete(objectKey).catch((cause: unknown) => {
 			logger.error({ objectKey, cause }, "could not unlink a greeting's audio");
 		});
 	}

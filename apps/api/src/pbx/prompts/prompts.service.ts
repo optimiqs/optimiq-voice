@@ -6,14 +6,9 @@ import { createEntityId } from "@optimiq-voice/identifiers";
 import { getLogger } from "@optimiq-voice/logging";
 import { and, asc, eq, ilike, mohClass, or, prompt, sql } from "@optimiq-voice/pbx-db";
 import { openMediaResponse } from "../../media/media-response";
+import { ObjectKeyOutsideRootError } from "../../storage";
 import { contentTypeForKey } from "../media/media-audio";
-import {
-	buildObjectKey,
-	deleteMediaObject,
-	mediaObjectSize,
-	resolveMediaObjectPath,
-	writeMediaObject,
-} from "../media/media-storage";
+import { buildObjectKey } from "../media/media-storage";
 import { mediaPathFor, mintMediaToken, verifyMediaToken } from "../media/media-token";
 import { readUploadedAudio } from "../media/media-upload";
 import {
@@ -28,10 +23,11 @@ import { actorFromSession } from "../shared/audit-log";
 import { parseDto } from "../shared/dto";
 import { normalizePagination, paged } from "../shared/pagination";
 import { toWireDiagnostic } from "../shared/pbx.errors";
-import { PBX_DATABASE, PBX_EFFECT_RUNTIME, PBX_ENV } from "../shared/pbx.tokens";
+import { PBX_DATABASE, PBX_EFFECT_RUNTIME, PBX_ENV, PBX_MEDIA_STORE } from "../shared/pbx.tokens";
 import { uploadPromptFieldsDto } from "./prompts.dto";
 import { PROMPT_RESOURCE } from "./prompts.resource";
 import type { MediaResponse } from "../../media/media-response";
+import type { ObjectStore } from "../../storage";
 import type { MultipartRequest, UploadedAudio } from "../media/media-upload";
 import type { PagedResult } from "../shared/pagination";
 import type { PbxEnv } from "../shared/pbx-env";
@@ -80,6 +76,19 @@ const logger = getLogger("api.pbx");
  * A ROW WITHOUT A FILE is a library entry an admin can point an IVR at, that passes every check,
  * and that plays silence to a caller. So the recoverable failure is the one we take, and the insert
  * failure unlinks on the way out to make even that one rare.
+ *
+ * ## The bytes go through an {@link ObjectStore}, and the object stays on the shared volume
+ *
+ * `writeMediaObject` / `deleteMediaObject` are now `store.put` / `store.delete` on the injected
+ * `PBX_MEDIA_STORE`. Nothing about the ORDER above changed — it is a property of which failure is
+ * recoverable, not of where the bytes live. What the seam adds is that with `STORAGE_DRIVER=s3` the
+ * same write also lands in a bucket, so a replaced container has an archive to restore from.
+ *
+ * What it does NOT do is move the object off the filesystem, and that is deliberate: every prompt,
+ * greeting and MOH file in this library is opened by **Asterisk**, off a bind mount, as
+ * `sound:<ENGINE_MEDIA_OBJECT_ROOT>/<key>`. `src/storage/object-store.ts` sets out the constraint
+ * and `object-store.factory.ts` carries the object-class map. This service's objects are in the
+ * "Asterisk-shared" column and always will be until `apps/mediad` exists.
  */
 @Injectable()
 export class PromptsService {
@@ -87,6 +96,7 @@ export class PromptsService {
 		@Inject(PBX_ENV) private readonly env: PbxEnv,
 		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
 		@Inject(PBX_EFFECT_RUNTIME) private readonly runtime: PbxRepositoryRuntime,
+		@Inject(PBX_MEDIA_STORE) private readonly store: ObjectStore,
 	) {}
 
 	// -------------------------------------------------------------------------------------------
@@ -223,7 +233,7 @@ export class PromptsService {
 			audio.format.extension,
 		);
 
-		await writeMediaObject(this.env.PBX_MEDIA_OBJECT_ROOT, objectKey, audio.bytes);
+		await this.store.put(objectKey, audio.bytes, { contentType: audio.format.contentType });
 
 		try {
 			const result = await runEffect(this.runtime, (repository) =>
@@ -256,7 +266,7 @@ export class PromptsService {
 			// the store does not accumulate objects nothing can name. Best effort by design: the
 			// orphan is inert, and turning a failed insert into a failed unlink would replace an
 			// actionable error with a confusing one.
-			await deleteMediaObject(this.env.PBX_MEDIA_OBJECT_ROOT, objectKey).catch(() => undefined);
+			await this.store.delete(objectKey).catch(() => undefined);
 			throw cause;
 		}
 	}
@@ -371,7 +381,7 @@ export class PromptsService {
 	 */
 	async unlinkObjects(objectKeys: readonly string[], reason: string): Promise<void> {
 		for (const objectKey of objectKeys) {
-			await deleteMediaObject(this.env.PBX_MEDIA_OBJECT_ROOT, objectKey).catch((cause: unknown) => {
+			await this.store.delete(objectKey).catch((cause: unknown) => {
 				logger.error({ objectKey, reason, cause }, "could not unlink a media object");
 			});
 		}
@@ -462,7 +472,7 @@ export class PromptsService {
 			throw new MediaLinkInvalidException();
 		}
 
-		return await openStoredObject(this.env.PBX_MEDIA_OBJECT_ROOT, row.objectKey, {
+		return await openStoredObject(this.store, row.objectKey, {
 			fileName: downloadFileName(row.name, row.objectKey),
 			rangeHeader,
 			subject: { kind: "prompt", id: row.id },
@@ -481,16 +491,22 @@ export interface MediaPlaybackLink {
 }
 
 /**
- * Resolves a key under the object root and opens it for one request.
+ * Opens one stored object for one request.
  *
  * Shared by the prompt route and the greeting route because the two differ only in which table the
  * key came out of, and a second copy is a second chance to forget the containment check. The
- * containment check is the one that answers a different question from the signature: the signature
- * establishes that the CALLER may read this row, and this establishes that the KEY — which came out
- * of a database column — addresses a file inside the media root and not `../../etc/passwd`.
+ * containment check answers a different question from the signature: the signature establishes that
+ * the CALLER may read this row, and containment establishes that the KEY — which came out of a
+ * database column — addresses an object inside the media root and not `../../etc/passwd`.
+ *
+ * It now lives in the STORE rather than here: `LocalObjectStore` applies `resolveObjectPath` on
+ * every operation and raises `ObjectKeyOutsideRootError` on a key that escapes, so the check runs
+ * whether or not a caller remembered it. This function catches that error and answers with the
+ * area's "this link is invalid", which is what a row that has been poisoned should look like from
+ * outside — a stack trace is not an HTTP response.
  */
 export async function openStoredObject(
-	root: string,
+	store: ObjectStore,
 	objectKey: string,
 	options: {
 		readonly fileName: string;
@@ -498,27 +514,26 @@ export async function openStoredObject(
 		readonly subject: { readonly kind: string; readonly id: string };
 	},
 ): Promise<MediaResponse> {
-	const path = resolveMediaObjectPath(root, objectKey);
-	if (path === undefined) {
+	const stat = await store.head(objectKey).catch((cause: unknown) => {
+		if (!(cause instanceof ObjectKeyOutsideRootError)) {
+			throw cause;
+		}
+		// Containment refused the key. Logged with the row that carried it, because a poisoned
+		// `object_key` column is worth investigating — and answered identically to a forged token,
+		// because the client must not be able to tell the two apart.
 		logger.error(
-			{
-				kind: options.subject.kind,
-				id: options.subject.id,
-				objectKey,
-			},
+			{ kind: options.subject.kind, id: options.subject.id, objectKey },
 			"a media object key resolves outside the object root",
 		);
 		throw new MediaLinkInvalidException();
-	}
-
-	const sizeBytes = await mediaObjectSize(path);
-	if (sizeBytes === undefined) {
+	});
+	if (stat === undefined) {
 		// The row says there is audio and the object store disagrees. A 410 rather than a 404: it
 		// existed, and saying so is what lets the UI distinguish the two.
 		throw new MediaGoneException();
 	}
 
-	return openMediaResponse(path, sizeBytes, {
+	return await openMediaResponse(store, objectKey, stat.sizeBytes, {
 		contentType: contentTypeForKey(objectKey),
 		fileName: options.fileName,
 		rangeHeader: options.rangeHeader,

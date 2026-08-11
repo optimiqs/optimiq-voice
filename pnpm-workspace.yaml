@@ -32,7 +32,7 @@ onlyBuiltDependencies:
 
 minimumReleaseAgeExclude:
   - "@aws-sdk/checksums@3.1000.26"
-  - "@aws-sdk/client-s3@3.1103.0"
+  - "@aws-sdk/client-s3@3.1103.0 || 3.1107.0"
   - "@aws-sdk/core@3.977.6"
   - "@aws-sdk/credential-provider-env@3.972.67"
   - "@aws-sdk/credential-provider-http@3.972.69"
@@ -57,6 +57,7 @@ minimumReleaseAgeExclude:
   - rxjs@9.0.0-beta.0
   - tsx@4.23.7
   - typescript@7.1.0-dev.20260805.1
+  - "@aws-sdk/s3-request-presigner@3.1107.0"
 
 allowBuilds:
   esbuild: true

@@ -1,6 +1,6 @@
 import { HttpException, HttpStatus } from "@nestjs/common";
 import type { MediaResponse } from "./media-response";
-import type { ReadStream } from "node:fs";
+import type { Readable } from "node:stream";
 
 /**
  * The controller half of a media route.
@@ -85,7 +85,7 @@ export class MediaRangeNotSatisfiableException extends HttpException {
  *   retry the same bad range — and the exception carries the same number in its JSON body for a
  *   caller that reads one.
  */
-export function applyMediaResponse(reply: MediaReply, response: MediaResponse): ReadStream {
+export function applyMediaResponse(reply: MediaReply, response: MediaResponse): Readable {
 	for (const [name, value] of Object.entries(response.headers)) {
 		void reply.header(name, value);
 	}

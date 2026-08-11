@@ -1,5 +1,6 @@
 import { Inject, Module, type OnApplicationShutdown } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
+import { createObjectStore, describeObjectStore, loadStorageEnv } from "../storage";
 import { CarrierWebhookController } from "./carrier/carrier-webhook.controller";
 import { CarrierController, CarrierTrunkController } from "./carrier/carrier.controller";
 import { carrierProviders } from "./carrier/carrier.providers";
@@ -51,7 +52,13 @@ import { AuditLogService } from "./shared/audit-log.service";
 import { createPbxDatabase } from "./shared/pbx-database";
 import { loadPbxEnv } from "./shared/pbx-env";
 import { makePbxRepositoryRuntime } from "./shared/pbx-runtime";
-import { PBX_DATABASE, PBX_EFFECT_RUNTIME, PBX_ENV } from "./shared/pbx.tokens";
+import {
+	PBX_DATABASE,
+	PBX_EFFECT_RUNTIME,
+	PBX_ENV,
+	PBX_MEDIA_STORE,
+	PBX_VOICEMAIL_STORE,
+} from "./shared/pbx.tokens";
 import { dischargeProjection } from "./shared/projection-outbox";
 import { ProjectionOutboxSweeper } from "./shared/projection-outbox.service";
 import { SipCredentialsResponder } from "./sip-credentials/sip-credentials.responder";
@@ -74,6 +81,7 @@ import { VoicemailMessagesService } from "./voicemail-boxes/voicemail-messages.s
 import { VoicemailMwiPublisher } from "./voicemail-boxes/voicemail-mwi.publisher";
 import { VoicemailPinService } from "./voicemail-boxes/voicemail-pin.service";
 import { VoicemailRpcController } from "./voicemail-boxes/voicemail-rpc.controller";
+import type { ObjectStore } from "../storage";
 import type { PbxEnv } from "./shared/pbx-env";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
@@ -190,6 +198,41 @@ const logger = getLogger("api.pbx");
 		{
 			provide: PBX_DATABASE,
 			useFactory: (env: PbxEnv): PbxDatabaseClient => createPbxDatabase(env),
+			inject: [PBX_ENV],
+		},
+		/**
+		 * Two object stores, because there are two nameable ROOTS — not because there are two stores.
+		 *
+		 * `PBX_MEDIA_OBJECT_ROOT` and `PBX_VOICEMAIL_MEDIA_ROOT` default to the same directory in
+		 * every shipped configuration, and `pbx-env.ts` explains at length why they should stay that
+		 * way: **there is one object store**, the media server mounts it once as
+		 * `ENGINE_MEDIA_OBJECT_ROOT`, and a deployment that split them would produce a library whose
+		 * files exist, whose rows are correct, and whose audio Asterisk cannot find. They are
+		 * separately nameable so an operator who genuinely splits them can, and so a deployment with
+		 * the PBX area and no CDR area has somewhere to inherit from — which is exactly why two
+		 * providers rather than one.
+		 *
+		 * Both are Asterisk-shared classes and therefore always filesystem-backed; with
+		 * `STORAGE_DRIVER=s3` each also mirrors to the bucket. See
+		 * `src/storage/object-store.factory.ts` for the object-class map and the signed-URL decision.
+		 */
+		{
+			provide: PBX_MEDIA_STORE,
+			useFactory: (env: PbxEnv): ObjectStore => {
+				const storage = loadStorageEnv();
+				const store = createObjectStore(storage, { root: env.PBX_MEDIA_OBJECT_ROOT });
+				logger.info(
+					{ root: env.PBX_MEDIA_OBJECT_ROOT, driver: store.driver },
+					`media library objects: ${describeObjectStore(store, storage)}`,
+				);
+				return store;
+			},
+			inject: [PBX_ENV],
+		},
+		{
+			provide: PBX_VOICEMAIL_STORE,
+			useFactory: (env: PbxEnv): ObjectStore =>
+				createObjectStore(loadStorageEnv(), { root: env.PBX_VOICEMAIL_MEDIA_ROOT }),
 			inject: [PBX_ENV],
 		},
 		RoutingCachePublisher,
@@ -400,6 +443,8 @@ const logger = getLogger("api.pbx");
 		PBX_ENV,
 		PBX_DATABASE,
 		PBX_EFFECT_RUNTIME,
+		PBX_MEDIA_STORE,
+		PBX_VOICEMAIL_STORE,
 		RoutingService,
 		RoutingCachePublisher,
 		DidIndexPublisher,

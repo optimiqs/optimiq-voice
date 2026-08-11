@@ -1,9 +1,9 @@
-import { createReadStream } from "node:fs";
 import { contentRangeHeader, decideRange, unsatisfiedContentRangeHeader } from "./http-range";
-import type { ReadStream } from "node:fs";
+import type { ObjectStore } from "../storage";
+import type { Readable } from "node:stream";
 
 /**
- * Turning "a file on disk plus a `Range` header" into "a stream plus a status plus headers".
+ * Turning "an object plus a `Range` header" into "a stream plus a status plus headers".
  *
  * Shared by the three routes that stream audio — call recordings, voicemail messages and the PBX
  * media library — for the reason `http-range.ts` gives at length: they are three copies of one
@@ -18,6 +18,15 @@ import type { ReadStream } from "node:fs";
  * `content-range` the client needs in order to recover. The controller then throws the area's
  * range exception, which carries the size in its body too.
  *
+ * ## It takes an {@link ObjectStore}, not a path, and that is the whole of the storage change
+ *
+ * This function used to take an absolute filesystem path and call `createReadStream` on it. It now
+ * takes the store and the KEY, and asks the store to open the range. Everything above and below
+ * that line is unchanged — the range arithmetic, the statuses, the header set — because the
+ * decision "which bytes" has nothing to do with where the bytes are. The local driver still ends up
+ * in `createReadStream(path, { start, end })`; an S3-backed one sends a `Range` header and the
+ * store does the seeking. See `src/storage/object-store.ts`.
+ *
  * ## `accept-ranges: bytes` is now unconditional, and that is a promise
  *
  * Every response from here — `200` and `206` alike — carries it. That is the header a media element
@@ -29,8 +38,13 @@ import type { ReadStream } from "node:fs";
 /** Everything a media controller needs to answer one request. */
 export interface MediaResponse {
 	readonly status: 200 | 206 | 416;
-	/** Absent only for `416`, which has no body. */
-	readonly stream?: ReadStream;
+	/**
+	 * Absent only for `416`, which has no body.
+	 *
+	 * A `Readable` rather than `node:fs`'s `ReadStream`: the bytes may come off a disk or off an
+	 * object store, and Fastify wants the base interface either way.
+	 */
+	readonly stream?: Readable;
 	/** Headers to set, in the order they should be set. `content-type` is the caller's business. */
 	readonly headers: Readonly<Record<string, string>>;
 	/** The object's full size, for the `416` body. */
@@ -38,18 +52,23 @@ export interface MediaResponse {
 }
 
 /**
- * Opens `path` for one request, honouring a single `Range`.
+ * Opens one object for one request, honouring a single `Range`.
  *
- * `createReadStream` with `start`/`end` rather than reading the whole file and slicing: the file
- * may be an hour of audio, the point of a range request is to move a few hundred kilobytes, and the
- * kernel is better at `pread` than this process is.
+ * A ranged open rather than reading the whole object and slicing: the object may be an hour of
+ * audio, the point of a range request is to move a few hundred kilobytes, and both drivers are
+ * better at seeking than this process is — the kernel does a `pread`, S3 does it server-side.
  *
  * `content-length` is set explicitly on both paths. For `206` it is the RANGE's length, not the
  * object's — the single most common way to get a partial response wrong, and the one that makes a
  * player buffer forever waiting for bytes that are never coming.
+ *
+ * `async` now, because opening an object on a remote store is a round trip. The `416` path still
+ * opens nothing at all: a range past the end is decided from `sizeBytes` alone, so an unsatisfiable
+ * request never reaches the store.
  */
-export function openMediaResponse(
-	path: string,
+export async function openMediaResponse(
+	store: ObjectStore,
+	objectKey: string,
 	sizeBytes: number,
 	options: {
 		readonly contentType: string;
@@ -58,7 +77,7 @@ export function openMediaResponse(
 		/** `inline` for a player, `attachment` for a download. */
 		readonly disposition?: "inline" | "attachment";
 	},
-): MediaResponse {
+): Promise<MediaResponse> {
 	const disposition = options.disposition ?? "inline";
 	const base: Record<string, string> = {
 		"content-type": options.contentType,
@@ -80,7 +99,7 @@ export function openMediaResponse(
 	if (decision.kind === "partial") {
 		return {
 			status: 206,
-			stream: createReadStream(path, { start: decision.start, end: decision.end }),
+			stream: await store.getStream(objectKey, { start: decision.start, end: decision.end }),
 			headers: {
 				...base,
 				"content-range": contentRangeHeader(decision.start, decision.end, sizeBytes),
@@ -92,7 +111,7 @@ export function openMediaResponse(
 
 	return {
 		status: 200,
-		stream: createReadStream(path),
+		stream: await store.getStream(objectKey),
 		headers: { ...base, "content-length": String(sizeBytes) },
 		sizeBytes,
 	};

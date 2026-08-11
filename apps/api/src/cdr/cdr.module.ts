@@ -1,14 +1,16 @@
 import { Inject, Module, type OnApplicationShutdown } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
+import { createObjectStore, describeObjectStore, loadStorageEnv } from "../storage";
 import { CdrController } from "./query/cdr.controller";
 import { CdrService } from "./query/cdr.service";
 import { CdrRecordingsController } from "./recordings/recordings.controller";
 import { RecordingsService } from "./recordings/recordings.service";
 import { createCdrDatabase } from "./shared/cdr-database";
 import { loadCdrEnv } from "./shared/cdr-env";
-import { CDR_DATABASE, CDR_ENV } from "./shared/cdr.tokens";
+import { CDR_DATABASE, CDR_ENV, CDR_RECORDING_STORE } from "./shared/cdr.tokens";
 import { CdrLegWriter } from "./writer/cdr-writer.service";
 import { CdrRecordingWriter } from "./writer/recording-writer.service";
+import type { ObjectStore } from "../storage";
 import type { CdrEnv } from "./shared/cdr-env";
 import type { CdrDatabaseClient } from "@optimiq-voice/cdr-db";
 
@@ -46,12 +48,35 @@ const logger = getLogger("api.cdr");
 			useFactory: (env: CdrEnv): CdrDatabaseClient => createCdrDatabase(env),
 			inject: [CDR_ENV],
 		},
+		/**
+		 * The recording object store, rooted at `CDR_RECORDING_ROOT`.
+		 *
+		 * `loadStorageEnv()` is parsed here rather than injected from a shared module because the
+		 * storage contract is a handful of unprefixed process variables with no state behind them,
+		 * and a `StorageModule` whose only job was to hold one parsed object would be a module for
+		 * `main.ts` and both areas to import in order to avoid calling one pure function twice. The
+		 * boot preflight in `main.ts` parses it too, and the two parses cannot disagree: neither
+		 * mutates anything.
+		 */
+		{
+			provide: CDR_RECORDING_STORE,
+			useFactory: (env: CdrEnv): ObjectStore => {
+				const storage = loadStorageEnv();
+				const store = createObjectStore(storage, { root: env.CDR_RECORDING_ROOT });
+				logger.info(
+					{ root: env.CDR_RECORDING_ROOT, driver: store.driver },
+					`recording objects: ${describeObjectStore(store, storage)}`,
+				);
+				return store;
+			},
+			inject: [CDR_ENV],
+		},
 		CdrService,
 		RecordingsService,
 		CdrLegWriter,
 		CdrRecordingWriter,
 	],
-	exports: [CDR_ENV, CDR_DATABASE, CdrService, RecordingsService],
+	exports: [CDR_ENV, CDR_DATABASE, CDR_RECORDING_STORE, CdrService, RecordingsService],
 })
 export class CdrModule implements OnApplicationShutdown {
 	constructor(@Inject(CDR_DATABASE) private readonly database: CdrDatabaseClient) {

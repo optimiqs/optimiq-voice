@@ -9,7 +9,8 @@ import {
 } from "@optimiq-voice/cdr-db";
 import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import { getLogger } from "@optimiq-voice/logging";
-import { CDR_DATABASE, CDR_ENV } from "../shared/cdr.tokens";
+import { isArchivingObjectStore } from "../../storage";
+import { CDR_DATABASE, CDR_ENV, CDR_RECORDING_STORE } from "../shared/cdr.tokens";
 import { quarantineMessage } from "./cdr-quarantine";
 import {
 	describeError,
@@ -18,6 +19,7 @@ import {
 	redeliveryDelayMs,
 	type DurableMessage,
 } from "./durable-consumer";
+import type { ObjectStore } from "../../storage";
 import type { CdrEnv } from "../shared/cdr-env";
 import type { CdrDatabaseClient, RecordingKind } from "@optimiq-voice/cdr-db";
 
@@ -75,6 +77,22 @@ const MAX_DELIVER = 5;
  * `stopped` with `reason: "failed"` or a zero duration finalizes the row as a tombstone-in-advance
  * rather than setting `recording_key` on the leg — the same judgement `plan-walker.ts` already
  * makes for voicemail ("a message a user opens to find silence in is worse than no message").
+ *
+ * ## Archival: `stopped` is also when the bytes leave the container
+ *
+ * Asterisk writes the recording onto the shared volume; nothing else does, and nothing reads it back
+ * on the call path. That makes a call recording the one object class in this API whose bytes an
+ * object store can genuinely own — and this consumer is the one process that learns, from an event
+ * rather than from a poll, the instant at which the object is FINAL. Archiving on `started` would
+ * copy a file that is still being written; archiving on a timer would copy every file repeatedly to
+ * find the few that changed. `channel.record.stopped` is precisely the fact "it is not mid-capture
+ * any more".
+ *
+ * With `STORAGE_DRIVER=local` (the default) {@link CdrRecordingWriter.archive} is a no-op, because
+ * the store is not an `ArchivingObjectStore` and there is nowhere to copy to. With
+ * `STORAGE_DRIVER=s3` it copies volume → bucket, and a failure NAKs the message so JetStream
+ * redelivers rather than losing the copy silently. The metadata row is committed BEFORE the archive
+ * runs, so a bucket outage delays the copy and never loses the recording's existence.
  */
 @Injectable()
 export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
@@ -85,10 +103,12 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 	private finalized = 0;
 	private duplicates = 0;
 	private quarantined = 0;
+	private archived = 0;
 
 	constructor(
 		@Inject(CDR_ENV) private readonly env: CdrEnv,
 		@Inject(CDR_DATABASE) private readonly database: CdrDatabaseClient,
+		@Inject(CDR_RECORDING_STORE) private readonly store: ObjectStore,
 	) {}
 
 	get stats(): {
@@ -97,6 +117,7 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 		readonly finalized: number;
 		readonly duplicates: number;
 		readonly quarantined: number;
+		readonly archived: number;
 	} {
 		return {
 			running: this.running,
@@ -104,6 +125,7 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 			finalized: this.finalized,
 			duplicates: this.duplicates,
 			quarantined: this.quarantined,
+			archived: this.archived,
 		};
 	}
 
@@ -236,6 +258,13 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 				await this.recordStarted(envelope.orgId, callId, envelope.data);
 			} else {
 				await this.recordStopped(envelope.orgId, callId, envelope.data);
+				// After the row, never before it: a copy in the bucket that no row names is an object
+				// nothing can find, whereas a row whose copy has not happened yet is a recording that
+				// still plays off the volume. The archive throws on a transport failure and lands in
+				// the same `catch` the database writes use, so a bucket outage NAKs and JetStream
+				// redelivers — which re-runs an insert that is already idempotent and a copy that is
+				// already `exists`-guarded.
+				await this.archive(envelope.data.objectKey);
 			}
 			message.ack();
 		} catch (error) {
@@ -361,6 +390,33 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 				),
 			);
 		});
+	}
+
+	/**
+	 * Copies a finalized recording from the shared volume into the durable object store.
+	 *
+	 * A no-op unless `STORAGE_DRIVER=s3`: the capability is asked for with
+	 * {@link isArchivingObjectStore} rather than by switching on a driver name, so a store that
+	 * cannot archive simply is not one and there is no configuration to keep in sync.
+	 *
+	 * `false` from `archiveObject` means the volume had nothing to copy — the file has aged out under
+	 * a retention policy, or this API does not share a mount with the media server. Both are
+	 * configuration rather than transport, neither is worth a redelivery loop, and both are worth a
+	 * warning: a deployment that selected an object store and is archiving nothing has a problem that
+	 * only shows up months later when somebody asks for a recording.
+	 */
+	private async archive(objectKey: string): Promise<void> {
+		if (!isArchivingObjectStore(this.store)) {
+			return;
+		}
+		if (await this.store.archiveObject(objectKey)) {
+			this.archived += 1;
+			return;
+		}
+		logger.warn(
+			{ objectKey },
+			"an object store is configured but the recording was not on the shared volume to archive",
+		);
 	}
 
 	private async quarantine(

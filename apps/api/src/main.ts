@@ -19,6 +19,7 @@ import { assertMailPreflight, loadMailEnv, selectMailTransport } from "./mail";
 import { isPbxAreaEnabled, registerPbxTransport } from "./pbx/pbx-bootstrap";
 import { PbxModule } from "./pbx/pbx.module";
 import { ProvisioningModule } from "./provisioning/provisioning.module";
+import { assertStoragePreflight, loadStorageEnv } from "./storage";
 
 const logger = getLogger("api.bootstrap");
 
@@ -57,6 +58,29 @@ async function bootstrap() {
 			host: mailEnv.host ?? null,
 		},
 		"mail preflight passed",
+	);
+
+	/**
+	 * The object store, asserted before anything can write an object into the wrong place.
+	 *
+	 * `STORAGE_DRIVER=local` is the default and passes unconditionally: one box with a volume is a
+	 * legitimate deployment and the shipped `compose.yaml` has no object-store service to point at.
+	 * What is refused is a PRODUCTION process that selected `s3` and did not finish configuring it —
+	 * it would fall back to the container filesystem and lose every recording on the next deploy,
+	 * which is the same class of silent failure the mail preflight above exists to stop. Parsing here
+	 * also means a malformed `S3_*` value is a boot failure rather than a 500 on somebody's first
+	 * recorded call; the area modules parse the same variables again and cannot disagree, because
+	 * nothing here mutates the environment.
+	 */
+	const storageEnv = loadStorageEnv();
+	assertStoragePreflight(storageEnv);
+	logger.info(
+		{
+			driver: storageEnv.driver,
+			bucket: storageEnv.bucket ?? null,
+			endpoint: storageEnv.endpoint ?? null,
+		},
+		"storage preflight passed",
 	);
 
 	/**

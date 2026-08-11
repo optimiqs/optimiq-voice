@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { resolve as resolvePath, sep as pathSeparator } from "node:path";
+import { resolveObjectPath } from "../../storage";
 
 /**
  * Signed, expiring download URLs for recording media.
@@ -206,12 +206,10 @@ export function recordingMediaPath(token: string): string {
  * establishes that the KEY, which came out of the database, addresses a file inside the recording
  * root and not `../../etc/passwd`. Two different threats, two different checks: a signed token for
  * a row whose `object_key` was somehow poisoned must still not escape the root.
+ *
+ * The area's name for `resolveObjectPath` (`src/storage/object-path.ts`), which is now the one
+ * implementation of this check for every filesystem-backed root in the API. It was copied
+ * identically into the PBX area and aliased again for voicemail; three copies of a containment
+ * check is three places to get it right in two. Every caller and every test kept its import.
  */
-export function resolveRecordingObjectPath(root: string, objectKey: string): string | undefined {
-	const normalizedRoot = resolvePath(root);
-	const candidate = resolvePath(normalizedRoot, objectKey);
-	if (candidate !== normalizedRoot && !candidate.startsWith(`${normalizedRoot}${pathSeparator}`)) {
-		return undefined;
-	}
-	return candidate;
-}
+export const resolveRecordingObjectPath = resolveObjectPath;

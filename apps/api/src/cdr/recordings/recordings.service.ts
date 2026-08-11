@@ -1,8 +1,8 @@
-import { stat } from "node:fs/promises";
 import { Inject, Injectable } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { getLogger } from "@optimiq-voice/logging";
 import { openMediaResponse } from "../../media/media-response";
+import { ObjectKeyOutsideRootError } from "../../storage";
 import { nextCursorFrom } from "../query/cdr-cursor";
 import { CdrCursorError } from "../query/cdr-cursor";
 import { MAX_RANGE_DAYS, rangeDays, resolveTimeRange } from "../query/cdr.dto";
@@ -16,14 +16,10 @@ import {
 	CdrRangeTooWideException,
 	CdrSigningUnavailableException,
 } from "../shared/cdr.errors";
-import { CDR_DATABASE, CDR_ENV } from "../shared/cdr.tokens";
-import {
-	mintRecordingToken,
-	recordingMediaPath,
-	resolveRecordingObjectPath,
-	verifyRecordingToken,
-} from "./recording-token";
+import { CDR_DATABASE, CDR_ENV, CDR_RECORDING_STORE } from "../shared/cdr.tokens";
+import { mintRecordingToken, recordingMediaPath, verifyRecordingToken } from "./recording-token";
 import type { MediaResponse } from "../../media/media-response";
+import type { ObjectStore } from "../../storage";
 import type { RecordingListQuery } from "../query/cdr.dto";
 import type { RecordingListRow } from "../query/cdr.repository";
 import type { CdrEnv } from "../shared/cdr-env";
@@ -77,12 +73,28 @@ export type ResolvedRecordingMedia = MediaResponse;
  * `withTenantScope(organizationId)` and reads the row through the RLS policy, so a token that
  * somehow named a real recording and a foreign organization returns nothing — the signature is not
  * the last line of defence, it is the first.
+ *
+ * ## The bytes come from an {@link ObjectStore}, and the token still gates them
+ *
+ * The media route used to `stat` a path under `CDR_RECORDING_ROOT` and open a `ReadStream` on it. It
+ * now asks the injected store, which is the filesystem by default and the filesystem plus an S3
+ * mirror under `STORAGE_DRIVER=s3`. **The route still streams the bytes through this process; it
+ * does not redirect to a presigned URL**, and that was a decision rather than an omission — see
+ * `src/storage/object-store.factory.ts` for the four reasons, the first of which is that this
+ * token's meaning is "read the row under `withTenantScope`", which a 302 cannot preserve. A
+ * recording tombstoned after a link was minted still 410s here, and would not behind a redirect.
+ *
+ * Call recordings are the one object class in this API that **Asterisk writes and never reads
+ * back**, which is what makes them the class an object store can genuinely own: once
+ * `CdrRecordingWriter` has filed the row and archived the bytes, an API container whose volume was
+ * replaced still serves them from the mirror.
  */
 @Injectable()
 export class RecordingsService {
 	constructor(
 		@Inject(CDR_ENV) private readonly env: CdrEnv,
 		@Inject(CDR_DATABASE) private readonly database: CdrDatabaseClient,
+		@Inject(CDR_RECORDING_STORE) private readonly store: ObjectStore,
 	) {}
 
 	private organizationId(session: AppSession): string {
@@ -211,32 +223,24 @@ export class RecordingsService {
 			throw new CdrMediaGoneException();
 		}
 
-		const path = resolveRecordingObjectPath(this.env.CDR_RECORDING_ROOT, row.objectKey);
-		if (path === undefined) {
+		const stat = await this.store.head(row.objectKey).catch((cause: unknown) => {
+			if (!(cause instanceof ObjectKeyOutsideRootError)) {
+				throw cause;
+			}
 			logger.error(
-				{
-					recordingId: row.id,
-					objectKey: row.objectKey,
-				},
+				{ recordingId: row.id, objectKey: row.objectKey },
 				"a recording object key resolves outside the recording root",
 			);
 			throw new CdrLinkInvalidException();
-		}
-
-		let sizeBytes: number;
-		try {
-			const info = await stat(path);
-			if (!info.isFile()) {
-				throw new Error("not a file");
-			}
-			sizeBytes = info.size;
-		} catch {
-			// The row says there is media and the object store disagrees. A 410 rather than a 404:
-			// the recording existed, and telling the UI that is what lets it say so.
+		});
+		if (stat === undefined) {
+			// The row says there is media and the object store disagrees — neither the volume nor the
+			// mirror has it. A 410 rather than a 404: the recording existed, and telling the UI that
+			// is what lets it say so.
 			throw new CdrMediaGoneException();
 		}
 
-		return openMediaResponse(path, sizeBytes, {
+		return await openMediaResponse(this.store, row.objectKey, stat.sizeBytes, {
 			contentType: contentTypeFor(row.objectKey),
 			fileName: downloadFileName(row),
 			rangeHeader,

@@ -3,9 +3,11 @@ import { AckPolicy, connect, DeliverPolicy, type NatsConnection } from "nats";
 import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import { getLogger } from "@optimiq-voice/logging";
 import { eq, voicemailBox, voicemailMessage } from "@optimiq-voice/pbx-db";
-import { PBX_DATABASE, PBX_ENV } from "../shared/pbx.tokens";
+import { isArchivingObjectStore } from "../../storage";
+import { PBX_DATABASE, PBX_ENV, PBX_VOICEMAIL_STORE } from "../shared/pbx.tokens";
 import { VoicemailEmailService } from "./voicemail-email.service";
 import { readMailboxCounts, VoicemailMwiPublisher } from "./voicemail-mwi.publisher";
+import type { ObjectStore } from "../../storage";
 import type { PbxEnv } from "../shared/pbx-env";
 import type { MailboxCounts } from "./voicemail-mwi.publisher";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
@@ -52,6 +54,21 @@ const DURABLE = "pbx-voicemail-writer";
  * too, and three copies of "build the envelope, publish it, swallow the failure" is three chances
  * to emit a lamp state in a different shape. The ORDER is unchanged and still matters — ack first,
  * then publish — for the reason `publishMwi` records below.
+ *
+ * ## Archival: this is where the audio gets a second home
+ *
+ * `message.left` is published when the recording is COMPLETE — the engine has stopped the capture
+ * and knows the duration and the size — which makes it the same moment `channel.record.stopped` is
+ * for a call recording, and it is filing time here for the same reason. With `STORAGE_DRIVER=s3`
+ * the audio is copied from the shared volume into the bucket; with the default `local` driver
+ * {@link VoicemailConsumer.archive} is a no-op.
+ *
+ * The copy does NOT let the audio leave the volume, and that is the constraint rather than a
+ * shortcut: `*97` plays a message by handing Asterisk `object://<objectKey>` (see
+ * `voicemail-messages.service.ts` `listForBroker`), and Asterisk opens the file off a mount. What
+ * the archive buys is that an API container whose volume was replaced can still SERVE the message
+ * over the signed playback route. `src/storage/object-store.ts` has the whole picture and the
+ * `apps/mediad` migration note.
  */
 @Injectable()
 export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
@@ -61,12 +78,14 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 	private filed = 0;
 	private duplicates = 0;
 	private failed = 0;
+	private archived = 0;
 
 	constructor(
 		@Inject(PBX_ENV) private readonly env: PbxEnv,
 		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
 		@Inject(VoicemailMwiPublisher) private readonly mwi: VoicemailMwiPublisher,
 		@Inject(VoicemailEmailService) private readonly email: VoicemailEmailService,
+		@Inject(PBX_VOICEMAIL_STORE) private readonly store: ObjectStore,
 	) {}
 
 	get stats(): {
@@ -74,12 +93,14 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 		readonly filed: number;
 		readonly duplicates: number;
 		readonly failed: number;
+		readonly archived: number;
 	} {
 		return {
 			running: this.running,
 			filed: this.filed,
 			duplicates: this.duplicates,
 			failed: this.failed,
+			archived: this.archived,
 		};
 	}
 
@@ -241,6 +262,12 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 				return;
 			}
 			message.ack();
+			// Everything below the ack is best-effort by design — the row IS filed, and a broker, a
+			// relay or a bucket that is briefly unavailable must not cause the message to be written
+			// twice. The archive is the same bargain: a copy that did not happen is a durability gap
+			// with a log line, whereas a NAK here would re-run an insert whose duplicate-detection is
+			// the only thing standing between a user and seeing one voicemail twice.
+			await this.archive(data.objectKey);
 			await this.publishMwi(envelope.orgId, mailboxId, data.mailboxNumber, counts);
 			await this.notifyByEmail(envelope.orgId, mailboxId, data.messageId);
 		} catch (error) {
@@ -317,6 +344,38 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 
 			return await readMailboxCounts(transaction, mailboxId);
 		});
+	}
+
+	/**
+	 * Copies the recorded message from the shared volume into the durable object store.
+	 *
+	 * A no-op unless `STORAGE_DRIVER=s3`: the capability is asked for with
+	 * {@link isArchivingObjectStore} rather than by switching on a driver name, so a store that
+	 * cannot archive simply is not one.
+	 *
+	 * Swallows its own failure, unlike the CDR recording writer's archive, and the difference is the
+	 * position relative to the ack. There, the archive runs BEFORE the ack, so a throw NAKs and
+	 * JetStream retries a copy that is `exists`-guarded and costs nothing to repeat. Here the row is
+	 * already acked — a throw would redeliver the whole message and lean on `on conflict do nothing`
+	 * to avoid filing it twice, which is a lot of machinery to exercise for a copy that a back-fill
+	 * can make later.
+	 */
+	private async archive(objectKey: string): Promise<void> {
+		if (!isArchivingObjectStore(this.store)) {
+			return;
+		}
+		try {
+			if (await this.store.archiveObject(objectKey)) {
+				this.archived += 1;
+				return;
+			}
+			logger.warn(
+				{ objectKey },
+				"an object store is configured but the voicemail audio was not on the shared volume",
+			);
+		} catch (error) {
+			logger.error({ objectKey, err: error }, "could not archive voicemail audio to the store");
+		}
 	}
 
 	/**

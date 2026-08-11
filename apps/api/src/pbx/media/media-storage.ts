@@ -1,8 +1,16 @@
-import { mkdir, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, resolve as resolvePath, sep as pathSeparator } from "node:path";
+import { resolveObjectPath } from "../../storage";
 
 /**
- * Where uploaded media lands on disk, and what its key looks like.
+ * What an uploaded media object's key looks like, and where it lands.
+ *
+ * ## The bytes moved out of this file; the KEYS did not
+ *
+ * `writeMediaObject`, `deleteMediaObject` and `mediaObjectSize` used to live here as three thin
+ * wrappers over `node:fs`. They are now `ObjectStore.put` / `.delete` / `.head` — see
+ * `src/storage/object-store.ts` for the seam and `local-object-store.ts` for the driver that
+ * reproduces exactly what they did, against exactly these paths. What stayed is the part that was
+ * never about the filesystem: the KEY LAYOUT below, and the containment check that proves a key
+ * addresses something inside its root.
  *
  * ## One object root, three writers, one reader
  *
@@ -83,73 +91,14 @@ export function buildObjectKey(
 /**
  * The absolute path for a key under `root`, proved to stay inside it.
  *
- * The same containment check the recordings and voicemail routes apply, and it is here for the
- * WRITE side as well as the read side. On the read side it answers "did a key out of the database
- * address a file outside the root"; on the write side it answers "is the key this process just
- * built one it is allowed to create" — which is a weaker question today, because every segment is
- * a minted UUID, and is exactly the check that keeps it weak if that ever stops being true.
+ * The area's name for `resolveObjectPath`, which is now one implementation shared by every
+ * filesystem-backed root in this API (`src/storage/object-path.ts`). There were three identical
+ * copies of this check — this one, the CDR area's `resolveRecordingObjectPath`, and the alias the
+ * voicemail token module re-exported — which is three places for a future edit to get it right in
+ * two. The name stays so no import moved.
  *
- * Returns `undefined` rather than throwing, so the caller decides whether the answer is a 403
- * (a token named a bad key) or a 500 (this process built one).
+ * Still used directly, and not only by the store: `musiconhold-conf.ts` and the engine-facing
+ * vocabulary need to know WHERE a key would land on the shared volume, which is a different
+ * question from "open it for me".
  */
-export function resolveMediaObjectPath(root: string, objectKey: string): string | undefined {
-	const normalizedRoot = resolvePath(root);
-	const candidate = resolvePath(normalizedRoot, objectKey);
-	if (candidate !== normalizedRoot && !candidate.startsWith(`${normalizedRoot}${pathSeparator}`)) {
-		return undefined;
-	}
-	return candidate;
-}
-
-/**
- * Writes an object, creating its directory.
- *
- * `writeFile` rather than a stream because the bytes are already buffered: the size cap is enforced
- * before anything is written (see `media-upload.ts`), which means the whole file is in memory by
- * the time we know it is acceptable, and a stream would buy nothing but a partially-written object
- * on a mid-write failure.
- *
- * @throws when the key escapes the root — a defect, not a client error.
- */
-export async function writeMediaObject(
-	root: string,
-	objectKey: string,
-	bytes: Buffer,
-): Promise<string> {
-	const path = resolveMediaObjectPath(root, objectKey);
-	if (path === undefined) {
-		throw new Error(`refusing to write a media object outside the object root: ${objectKey}`);
-	}
-	await mkdir(dirname(path), { recursive: true });
-	await writeFile(path, bytes);
-	return path;
-}
-
-/**
- * Deletes an object, tolerating its absence.
- *
- * Absence is not an error here and the difference from the CDR area is deliberate.
- * `voicemail-messages.service.ts` does NOT unlink audio when a message row is purged, because
- * retention owns a RECORDING's lifecycle and a control plane deleting files behind it produces
- * rows whose media vanished for a reason nothing recorded. A media-library object has no retention
- * policy and no second owner: the row IS the reason the file exists, and leaving orphans under the
- * mount would grow the store forever with files nothing can name. So the library unlinks, and a
- * file already gone is the state we wanted.
- */
-export async function deleteMediaObject(root: string, objectKey: string): Promise<void> {
-	const path = resolveMediaObjectPath(root, objectKey);
-	if (path === undefined) {
-		return;
-	}
-	await rm(path, { force: true });
-}
-
-/** The object's size, or `undefined` when it is missing or is not a regular file. */
-export async function mediaObjectSize(path: string): Promise<number | undefined> {
-	try {
-		const info = await stat(path);
-		return info.isFile() ? info.size : undefined;
-	} catch {
-		return undefined;
-	}
-}
+export const resolveMediaObjectPath = resolveObjectPath;
