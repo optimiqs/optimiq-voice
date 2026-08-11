@@ -61,13 +61,10 @@ minimumReleaseAgeExclude:
 
 allowBuilds:
   esbuild: true
-  grpc-tools: set this to true or false
   msgpackr-extract: true
-  nx: set this to true or false
-  protobufjs: set this to true or false
-  protoc-gen-grpc-web: set this to true or false
-  protoc-gen-js: set this to true or false
-  sharp: set this to true or false
+  protobufjs: true
+  sharp: true
+  unrs-resolver: true
 
 # Pinned dependency catalog (oikos-care conventions; see plans/reference/oikos-conventions.md)
 catalog:

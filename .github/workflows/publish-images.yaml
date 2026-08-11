@@ -1,0 +1,141 @@
+# Container publish for the Optimiq Voice platform images.
+#
+# This replaces the deleted per-app publish workflows (dashboard, identity, autopilot, api) and the
+# npm/lerna release pipeline they hung off. The platform ships as containers now, so a release is a
+# git tag and the images that tag produces — nothing else.
+#
+# It does NOT run on every push to main: `ci.yaml` already builds, tests and typechecks every push
+# and PR, and re-running three multi-stage image builds on top of that buys nothing. Images are cut
+# from version tags, or on demand through `workflow_dispatch` when you need one image rebuilt
+# without minting a tag.
+#
+# `apps/asterisk` is not here. It has its own `publish-asterisk.yaml`: a self-contained image built
+# from `apps/asterisk` alone, on its own cadence, pushed to a different registry.
+#
+# `apps/sipd` and `apps/mediad` are not here either — neither Go app has a Dockerfile yet. Add a
+# matrix entry when one lands; nothing else in this file needs to change.
+#
+# Deployment is deliberately out of scope. This workflow's whole job is to put an image in GHCR.
+name: publish images
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      images:
+        description: Which image to build
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - api
+          - engine
+          - web
+
+concurrency:
+  group: publish-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: select images
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      # The build matrix lives here rather than in `strategy.matrix` because the `matrix` context is
+      # not available to a job-level `if`, so a dispatch that names a single image cannot be
+      # filtered downstream — the selection has to happen before the matrix is expanded.
+      #
+      # `platforms` is per app, not global:
+      #   api    — amd64 only. Its Dockerfile downloads `dockerize-linux-amd64` by a hardcoded URL,
+      #            so an arm64 image would ship an amd64 binary as its entrypoint wrapper and fail
+      #            to exec. Widen this the moment that download becomes arch-aware.
+      #   engine — node:22-slim on both arches, no arch-specific fetches.
+      #   web    — same; Next's standalone output is portable.
+      - name: Select images
+        id: select
+        env:
+          SELECTION: ${{ inputs.images || 'all' }}
+        run: |
+          set -euo pipefail
+          all='[
+            {"app":"api","platforms":"linux/amd64"},
+            {"app":"engine","platforms":"linux/amd64,linux/arm64"},
+            {"app":"web","platforms":"linux/amd64,linux/arm64"}
+          ]'
+          if [ "$SELECTION" = "all" ]; then
+            matrix="$(jq -c . <<<"$all")"
+          else
+            matrix="$(jq -c --arg app "$SELECTION" '[.[] | select(.app == $app)]' <<<"$all")"
+          fi
+          if [ "$(jq 'length' <<<"$matrix")" -eq 0 ]; then
+            echo "no image matches '$SELECTION'" >&2
+            exit 1
+          fi
+          echo "matrix=$matrix" >>"$GITHUB_OUTPUT"
+
+  publish:
+    name: publish ${{ matrix.app }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Only needed for the arm64 half of a multi-platform build; a no-op cost on the amd64-only one.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `latest` moves only on a tag push. A dispatch build is identified by its commit sha instead,
+      # so rebuilding one image by hand can never silently repoint `latest` at an untagged commit.
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/optimiqs/optimiq-voice/${{ matrix.app }}
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=sha,format=long,enable=${{ github.event_name == 'workflow_dispatch' }}
+          labels: |
+            org.opencontainers.image.title=optimiq-voice/${{ matrix.app }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      # The context is the repository root for every app. All three Dockerfiles copy the pnpm
+      # workspace manifests, `apps/`, `packages/` and `.scripts/` and run a filtered
+      # `pnpm --filter <pkg>... run build`, so a per-app context would break the install.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/${{ matrix.app }}/Dockerfile
+          platforms: ${{ matrix.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.app }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.app }}

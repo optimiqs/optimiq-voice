@@ -59,7 +59,6 @@ node_modules
 **/.dockerignore
 
 # Other unnecessary files
-apps/site
 assets
 *.log
 *.tgz
