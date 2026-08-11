@@ -55,6 +55,20 @@ export interface SipTransferCallPath {
 	resolveDialog(request: SipTransferRequest): Promise<string | undefined>;
 	/** The orchestrator's own index. `CallControlBinding.legFor`, unchanged. */
 	legFor(mediaChannelId: string): ControlledLeg | undefined;
+	/**
+	 * Whether `destination` resolves to something dialable in this leg's tenant plan.
+	 *
+	 * Asked BEFORE the transfer, which is the whole point. A blind transfer is destructive by
+	 * construction: `CallControl` hangs the transferor up and re-routes the transferee, so a
+	 * destination that turns out to match nothing costs the caller their call and reports
+	 * `transfer_failed` for what is really a typo on a keypad. Resolving first turns that into
+	 * `unknown_target` with both parties still talking to each other.
+	 *
+	 * Optional because it is an authorisation-adjacent nicety and not the contract: an implementation
+	 * that cannot cheaply resolve a plan may omit it, and every such transfer is then attempted and
+	 * refused after the fact, exactly as it was before this existed.
+	 */
+	isDialableTarget?(leg: ControlledLeg, destination: string): Promise<boolean>;
 	/** `CallControlPort.transfer`, unchanged. This responder adds no transfer semantics of its own. */
 	transfer(leg: ControlledLeg, request: TransferRequest): Promise<CallControlResult>;
 }
@@ -78,24 +92,23 @@ export interface SipTransferCallPath {
  * every desk phone's transfer key timing out. Served on `JetStreamService.rawConnection`, exactly as
  * `ParkHandoffService` is.
  *
- * ## The one thing that is NOT wired, and why it is a refusal rather than a stub
+ * ## An unattached call path is still a real state
  *
- * Resolving a SIP `Call-ID` onto a live channel is impossible in this engine today. Nothing records
- * it: the ARI driver reads four channel variables (`ENGINE_CHANNEL_VARIABLES`) and none of them is
- * the `Call-ID`, `CallerProfile` has no field for it, and `channelCreatedDataSchema.sipCallId` — the
- * one place in the contract where it appears — is optional and never populated. So
- * {@link SipTransferCallPath.resolveDialog} has no implementation in `apps/engine/src/calls`, and
- * until it does, every well-formed request is answered `correlation_unavailable`.
+ * `ChannelOrchestrator` attaches one from its constructor, so a running engine always has it. What
+ * does NOT is the window before Nest has built the calls module, and any deployment where the media
+ * driver cannot read a `Call-ID` at all. Both answer `correlation_unavailable`, which is deliberately
+ * a REFUSAL and not a silence and not a success: a silence costs the edge its whole deadline and
+ * tells it nothing, and a pretend success would have `apps/sipd` send the phone `SIP/2.0 200 OK` in
+ * the NOTIFY sipfrag for a transfer that never happened — the user watches the call stay exactly
+ * where it was while their handset says it moved. A named refusal fails the transfer key visibly.
  *
- * That is deliberately a REFUSAL and not a silence and not a success. A silence costs the edge its
- * whole deadline and tells it nothing; a pretend success would have `apps/sipd` send the phone
- * `SIP/2.0 200 OK` in the NOTIFY sipfrag for a transfer that never happened, which is the worst of
- * the three — the user watches the call stay exactly where it was while their handset says it moved.
- * A named refusal makes the transfer key fail visibly, and names the missing piece in the log.
+ * ## `wrong_instance` is still reserved
  *
- * Everything above and below that one call is real and exercised: framing, validation, the
- * attended-transfer refusal, the tenant and participation checks, the delegation to `transfer`, and
- * the reply shape. Attaching a resolver is the whole remaining change.
+ * The orchestrator's index is per-process, so an instance that answers a REFER for a call another
+ * instance holds looks up nothing and says `unknown_dialog` — the same thing it says for a call that
+ * ended. Telling the two apart needs a dialog directory in KV, the same shape as `park-claims`, and
+ * that is not built here. On a single-engine deployment the two are the same answer; on several, a
+ * desk phone's transfer key is best-effort until the directory exists.
  */
 @Injectable()
 export class SipTransferService implements OnApplicationBootstrap, OnApplicationShutdown {
@@ -127,8 +140,6 @@ export class SipTransferService implements OnApplicationBootstrap, OnApplication
 	 * Registers the call path. Modelled on `ParkHandoffService.setHandler`, and for the same reason:
 	 * the orchestrator constructs itself long after this provider does, so it pushes rather than this
 	 * class pulling — which would be a Nest cycle between `NatsModule` and `CallsModule`.
-	 *
-	 * Nothing calls this today. See the class note.
 	 */
 	attach(callPath: SipTransferCallPath): void {
 		this.callPath = callPath;
@@ -209,7 +220,7 @@ export class SipTransferService implements OnApplicationBootstrap, OnApplication
 			return this.refuse(
 				request.sipCallId,
 				"correlation_unavailable",
-				"this engine does not index SIP Call-IDs, so it cannot find the call a REFER names",
+				"no call path is attached to this instance, so it cannot look a SIP Call-ID up at all",
 			);
 		}
 
@@ -254,6 +265,27 @@ export class SipTransferService implements OnApplicationBootstrap, OnApplication
 				"the referrer is not a party to that call",
 				leg,
 			);
+		}
+
+		// Last, after the leg is known to be ours and the referrer's: resolving a destination reads the
+		// tenant's compiled artifact, and doing that for a Call-ID that turned out to belong to
+		// somebody else would let an unauthorised request probe another tenant's dial plan by timing.
+		if (callPath.isDialableTarget !== undefined) {
+			let dialable: boolean;
+			try {
+				dialable = await callPath.isDialableTarget(leg, request.target.user);
+			} catch (error) {
+				this.logger.error({ err: String(error) }, "resolving a sip transfer target threw");
+				return this.refuse(request.sipCallId, "internal", String(error), leg);
+			}
+			if (!dialable) {
+				return this.refuse(
+					request.sipCallId,
+					"unknown_target",
+					`nothing in this organization's plan answers ${request.target.user}`,
+					leg,
+				);
+			}
 		}
 
 		let result: CallControlResult;

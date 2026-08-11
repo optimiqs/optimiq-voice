@@ -21,6 +21,7 @@ import {
 	ROUTING_CACHE_KV,
 	parseSubject,
 	safeValidateEvent,
+	sipTransferResponseSchema,
 	subjectFilterFor,
 	subjectFor,
 } from "@optimiq-voice/events";
@@ -39,7 +40,7 @@ import { ParkRegistry } from "../src/routing/park-registry";
 import type { CallControlHost, ControlledLeg, ParkLot } from "../src/calls/call-control";
 import type { EngineEnv } from "../src/config/engine-env";
 import type { JetStreamService } from "../src/nats/jetstream.service";
-import type { AnyEventEnvelope, ParkClaim } from "@optimiq-voice/events";
+import type { AnyEventEnvelope, ParkClaim, SipTransferRequest } from "@optimiq-voice/events";
 import type { PlanNode, RoutingArtifact } from "@optimiq-voice/routing";
 import type { ChannelSnapshot } from "@optimiq-voice/telephony";
 
@@ -1180,6 +1181,49 @@ suite("engine end-to-end", () => {
 			await collector.close();
 		}
 	}, 60_000);
+
+	/**
+	 * `rpc.sip.v1.transfer`, end to end, without a desk phone.
+	 *
+	 * What only this can prove: that a Go-shaped request — raw JSON on a flat subject, no NestJS
+	 * `{pattern, data}` frame — is answered by a real engine inside the contract's deadline, and that
+	 * the answer is `unknown_dialog` rather than `correlation_unavailable`. The difference between
+	 * those two IS the wiring: the second means the orchestrator never attached a call path, which is
+	 * a Nest graph failure no unit spec can see, because every unit spec attaches one by hand.
+	 */
+	it("answers a REFER relayed from the sip edge, with the dialog index really attached", async () => {
+		const connection = await connect({
+			servers: natsUrl,
+			name: "engine-integration-sip-transfer",
+			...harnessNatsOptions(),
+		});
+		try {
+			const request: SipTransferRequest = {
+				orgId: ORG_ID,
+				// A dialog no call on this instance carries, because there is no PJSIP call in this
+				// suite at all: every leg here is a Local channel, which has no SIP dialog to index.
+				sipCallId: `no-such-dialog-${String(Date.now())}@1.2.3.4`,
+				referredBy: { aor: "sip:1001@acme.example.com", username: "1001" },
+				target: { user: "1002" },
+				kind: "blind",
+			};
+			const reply = await connection.request(
+				subjectFor.sipTransferRpc(),
+				new TextEncoder().encode(JSON.stringify(request)),
+				{ timeout: 5_000 },
+			);
+			const response = sipTransferResponseSchema.parse(
+				JSON.parse(new TextDecoder().decode(reply.data)) as unknown,
+			);
+
+			expect(response.ok).toBe(false);
+			expect(response.reason).toBe("unknown_dialog");
+			expect(response.sipCallId).toBe(request.sipCallId);
+			expect(response.instanceId).toBeTruthy();
+		} finally {
+			await connection.close();
+		}
+	}, 30_000);
 
 	it("stops admitting calls once a drain begins", async () => {
 		const orchestrator = app.get(ChannelOrchestrator);

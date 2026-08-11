@@ -121,6 +121,9 @@ interface CallPathOptions {
 	readonly leg?: ControlledLeg | undefined;
 	readonly result?: CallControlResult;
 	readonly transferThrows?: boolean;
+	/** Absent leaves the optional pre-flight check off, which is a supported call path. */
+	readonly dialable?: boolean;
+	readonly dialableThrows?: boolean;
 }
 
 function callPath(options: CallPathOptions = {}): {
@@ -136,6 +139,16 @@ function callPath(options: CallPathOptions = {}): {
 			return "resolved" in options ? options.resolved : "media-1";
 		},
 		legFor: () => ("leg" in options ? options.leg : leg()),
+		...(options.dialable === undefined && options.dialableThrows !== true
+			? {}
+			: {
+					isDialableTarget: async () => {
+						if (options.dialableThrows === true) {
+							throw new Error("the artifact source is on fire");
+						}
+						return options.dialable ?? true;
+					},
+				}),
 		transfer: async (target, transferRequest) => {
 			transfers.push({ leg: target, request: transferRequest });
 			if (options.transferThrows === true) {
@@ -216,6 +229,17 @@ describe("executing a transfer", () => {
 		// the SIP edge choose one would hand a phone the toll-fraud boundary.
 		expect(path.transfers[0]?.request).toEqual({ kind: "blind", destination: "1002" });
 		expect(path.transfers[0]?.leg.mediaChannelId).toBe("media-1");
+	});
+
+	it("goes ahead once the plan says the Refer-To is reachable", async () => {
+		const fake = fakeConnection();
+		const path = callPath({ dialable: true });
+		service(fake, path.path);
+
+		await fake.deliver(JSON.stringify(request()));
+
+		expect(fake.replies[0]).toMatchObject({ ok: true, destination: "1002" });
+		expect(path.transfers).toHaveLength(1);
 	});
 
 	it("accepts a REFER from the extension that ANSWERED the call, not only the one that placed it", async () => {
@@ -328,6 +352,46 @@ describe("refusing a transfer", () => {
 			reason: "not_permitted",
 			legId: "leg-1",
 		});
+		expect(path.transfers).toHaveLength(0);
+	});
+
+	it("refuses a Refer-To the plan cannot reach, without touching the call", async () => {
+		const fake = fakeConnection();
+		const path = callPath({ dialable: false });
+		service(fake, path.path);
+
+		await fake.deliver(JSON.stringify(request()));
+
+		expect(fake.replies[0]).toMatchObject({
+			ok: false,
+			reason: "unknown_target",
+			legId: "leg-1",
+		});
+		// The whole point of checking first: a blind transfer hangs the transferor up and re-routes
+		// the transferee, so attempting one at a destination that does not exist costs both of them
+		// the call they are already on.
+		expect(path.transfers).toHaveLength(0);
+	});
+
+	it("checks the target only AFTER the referrer has been authorised", async () => {
+		const fake = fakeConnection();
+		const path = callPath({ leg: leg({ organizationId: OTHER_ORG }), dialable: false });
+		service(fake, path.path);
+
+		await fake.deliver(JSON.stringify(request()));
+
+		// Otherwise an unauthorised request could probe another tenant's dial plan by timing.
+		expect(fake.replies[0]).toMatchObject({ ok: false, reason: "not_permitted" });
+	});
+
+	it("answers internal when the target check throws", async () => {
+		const fake = fakeConnection();
+		const path = callPath({ dialableThrows: true });
+		service(fake, path.path);
+
+		await fake.deliver(JSON.stringify(request()));
+
+		expect(fake.replies[0]).toMatchObject({ ok: false, reason: "internal", legId: "leg-1" });
 		expect(path.transfers).toHaveLength(0);
 	});
 

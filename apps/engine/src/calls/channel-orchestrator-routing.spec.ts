@@ -16,10 +16,12 @@ import type { MediaEvent } from "../media/media-event";
 import type { CallEventPublisher } from "../nats/call-event-publisher.service";
 import type { JetStreamService } from "../nats/jetstream.service";
 import type { ParkHandoffService } from "../nats/park-handoff.service";
+import type { SipTransferCallPath, SipTransferService } from "../nats/sip-transfer.service";
 import type { DidIndexSource } from "../routing/did-index.source";
 import type { RoutingArtifactSource } from "../routing/routing-artifact.source";
 import type { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
-import type { CallEventOf, CdrLegWriteEnvelope } from "@optimiq-voice/events";
+import type { ControlledLeg } from "./call-control";
+import type { CallEventOf, CdrLegWriteEnvelope, SipTransferRequest } from "@optimiq-voice/events";
 import type { PlanNode, PlanNodeTable, RoutingArtifact } from "@optimiq-voice/routing";
 import type { ChannelSnapshot } from "@optimiq-voice/telephony";
 
@@ -58,6 +60,34 @@ const NO_PARK_HANDOFF = {
 		throw new Error("no cross-instance park handoff in this spec");
 	},
 } as unknown as ParkHandoffService;
+
+/**
+ * A SIP transfer responder that keeps the call path instead of serving it.
+ *
+ * Wired for the same reason `NO_PARK_HANDOFF` is — the orchestrator pushes onto it in its
+ * constructor — and kept rather than discarded because this is the file where a walk ORIGINATES
+ * B-legs, which is the only place the desk phone that answers a call actually gets its channel.
+ */
+function fakeSipTransfer(): {
+	readonly service: SipTransferService;
+	readonly attached: () => SipTransferCallPath;
+} {
+	let attached: SipTransferCallPath | undefined;
+	const service = {
+		attach: (callPath: SipTransferCallPath) => {
+			attached = callPath;
+		},
+	} as unknown as SipTransferService;
+	return {
+		service,
+		attached: () => {
+			if (attached === undefined) {
+				throw new Error("the orchestrator attached no sip transfer call path");
+			}
+			return attached;
+		},
+	};
+}
 
 /**
  * The orchestrator's ROUTING behaviour: resolve on `StasisStart`, walk the plan, and enrich the
@@ -218,6 +248,8 @@ function harness(options: HarnessOptions = {}) {
 		collectDtmf: (context, verb) => dtmf.forChannel(context.channelId).collect(verb),
 	});
 
+	const sipTransfer = fakeSipTransfer();
+
 	const orchestrator = new ChannelOrchestrator(
 		fakeEnv(options.env),
 		media,
@@ -236,10 +268,20 @@ function harness(options: HarnessOptions = {}) {
 		new ParkRegistry(),
 		new CallControlRegistry(),
 		NO_PARK_HANDOFF,
+		sipTransfer.service,
 	);
 
 	holder.orchestrator = orchestrator;
-	return { orchestrator, media, published, kv, cdrs, signals, dtmf };
+	return {
+		orchestrator,
+		media,
+		published,
+		kv,
+		cdrs,
+		signals,
+		dtmf,
+		sipCallPath: sipTransfer.attached,
+	};
 }
 
 function channel(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -723,5 +765,127 @@ describe("attributing an inbound call to a tenant", () => {
 		expect(h.media.hungUp()).toContainEqual({ channelId: ARI_CHANNEL, cause: "INVALID_PROFILE" });
 		// Never filed under a guess: no CDR, no events, nothing in KV.
 		expect(h.cdrs).toEqual([]);
+	});
+});
+
+// =================================================================================================
+// SIP dialogs
+// =================================================================================================
+
+/**
+ * The correlation `rpc.sip.v1.transfer` rests on, exercised where the interesting leg exists.
+ *
+ * The A-leg case belongs in `channel-orchestrator.spec.ts`. What only this file can drive is the
+ * leg the WALK dialled — the desk phone that ANSWERED — because that aggregate is created by the
+ * walker's own hook rather than by the arrival path, and it is the leg somebody's thumb is on when
+ * they reach for the TRANSFER key on an incoming call.
+ */
+describe("sip dialog correlation", () => {
+	const EXTENSION_ID = "0195c0f0-1c2f-7000-8000-0000000000f1";
+	const TARGET_ID = "0195c0f0-1c2f-7000-8000-0000000000f2";
+
+	/** As much of a REFER as `resolveDialog` reads. */
+	function refer(sipCallId: string): SipTransferRequest {
+		return { sipCallId } as unknown as SipTransferRequest;
+	}
+
+	/** The ring-group-of-one artifact every case here uses, plus a dialable transfer target. */
+	function artifact(): RoutingArtifact {
+		const base = artifactWith(
+			[
+				...TERMINALS,
+				extensionNode("ext:1", "1001", EXTENSION_ID),
+				extensionNode("ext:2", "1002", TARGET_ID),
+			],
+			"ext:1",
+		);
+		return {
+			...base,
+			internal: {
+				...base.internal,
+				numbers: {
+					"1002": { number: "1002", kind: "extension", entityId: TARGET_ID, nodeId: "ext:2" },
+				},
+			},
+		} as unknown as RoutingArtifact;
+	}
+
+	/** Arrive, then deliver the callee's own `StasisStart` carrying its dialog. */
+	async function answeredBy(sipCallId: string): Promise<{
+		readonly h: ReturnType<typeof harness>;
+		readonly bLegChannelId: string;
+	}> {
+		const h = harness({ artifact: artifact() });
+		await arrive(h);
+		const bLegChannelId = h.media.originated()[0]?.channelId as string;
+		h.media.variables["CHANNEL(pjsip,call-id)"] = sipCallId;
+		await h.orchestrator.handleEvent(
+			mediaEvent("StasisStart", { channel: bLegChannel(bLegChannelId), args: [] }),
+		);
+		return { h, bLegChannelId };
+	}
+
+	it("indexes the leg a walk dialled, which is the only way an ANSWERED call can be transferred", async () => {
+		const { h, bLegChannelId } = await answeredBy("callee@1.2.3.4");
+
+		await expect(h.sipCallPath().resolveDialog(refer("callee@1.2.3.4"))).resolves.toBe(
+			bLegChannelId,
+		);
+		// And the leg the responder authorises against knows the number it was dialled TO, which is
+		// the half of its participation check that a callee matches on.
+		expect(h.sipCallPath().legFor(bLegChannelId)?.destinationNumber).toBe("1001");
+	});
+
+	it("keeps the callee's dialog out of the caller's index entry", async () => {
+		const { h } = await answeredBy("callee@1.2.3.4");
+
+		// The A-leg arrived before the fake knew any Call-ID, so it holds none — and the B-leg's must
+		// not have been filed against it.
+		await expect(h.sipCallPath().resolveDialog(refer("caller@1.2.3.4"))).resolves.toBe(undefined);
+	});
+
+	it("releases the callee's key when the callee hangs up", async () => {
+		const { h, bLegChannelId } = await answeredBy("callee@1.2.3.4");
+
+		await h.orchestrator.handleEvent(
+			mediaEvent("ChannelDestroyed", { channel: bLegChannel(bLegChannelId), cause: 16 }),
+		);
+
+		await expect(h.sipCallPath().resolveDialog(refer("callee@1.2.3.4"))).resolves.toBe(undefined);
+	});
+
+	it("accepts a Refer-To the tenant's plan can reach", async () => {
+		const { h, bLegChannelId } = await answeredBy("callee@1.2.3.4");
+		const leg = h.sipCallPath().legFor(bLegChannelId);
+
+		await expect(h.sipCallPath().isDialableTarget?.(leg as ControlledLeg, "1002")).resolves.toBe(
+			true,
+		);
+	});
+
+	it("refuses one it cannot, BEFORE the transfer tears the call apart", async () => {
+		const { h, bLegChannelId } = await answeredBy("callee@1.2.3.4");
+		const leg = h.sipCallPath().legFor(bLegChannelId);
+
+		// `unknown_target` at the responder. Attempting it instead would hang the transferor up and
+		// re-route the transferee at a destination that was never going to answer.
+		await expect(h.sipCallPath().isDialableTarget?.(leg as ControlledLeg, "9999")).resolves.toBe(
+			false,
+		);
+		await expect(h.sipCallPath().isDialableTarget?.(leg as ControlledLeg, "  ")).resolves.toBe(
+			false,
+		);
+	});
+
+	it("lets a transfer through when the artifact cannot be read, rather than failing the feature", async () => {
+		const h = harness();
+		await arrive(h);
+		const leg = h.sipCallPath().legFor(ARI_CHANNEL);
+
+		// A cache miss on a briefly unreachable control plane must not refuse every transfer key in
+		// the building; the routing walk behind it still reports whatever it finds.
+		await expect(h.sipCallPath().isDialableTarget?.(leg as ControlledLeg, "1002")).resolves.toBe(
+			true,
+		);
 	});
 });

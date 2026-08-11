@@ -9,6 +9,7 @@ import { CallEventPublisher } from "../nats/call-event-publisher.service";
 import { JetStreamService } from "../nats/jetstream.service";
 import { CALLS_EFFECT_RUNTIME, ENGINE_ENV, MEDIA_PORT } from "../nats/nats.tokens";
 import { ParkHandoffService } from "../nats/park-handoff.service";
+import { SipTransferService } from "../nats/sip-transfer.service";
 import { AgentStateStore } from "../queue/agent-state.store";
 import { QueueEventPublisher } from "../queue/queue-event-publisher.service";
 import { QueueMembershipSource } from "../queue/queue-membership.source";
@@ -27,7 +28,14 @@ import { CallControl, pickupGroupFilter } from "./call-control";
 import { CallControlRegistry } from "./call-control-registry";
 import { buildCdrLegWrite } from "./cdr-leg";
 import { ChannelAggregate } from "./channel-aggregate";
-import { callIdForAriChannel, legIdForAriChannel, resolveOrganizationId } from "./channel-identity";
+import {
+	callIdForAriChannel,
+	legIdForAriChannel,
+	normalizeSipCallId,
+	resolveOrganizationId,
+	SIP_CALL_ID_CHANNEL_FUNCTION,
+	SIP_CALL_ID_VARIABLE,
+} from "./channel-identity";
 import { ChannelRegistry } from "./channel-registry";
 import { MidCallFeatureRuntime } from "./mid-call-features";
 import type { EngineEnv } from "../config/engine-env";
@@ -158,6 +166,7 @@ export class ChannelOrchestrator {
 		private readonly parks: ParkRegistry,
 		private readonly callControl: CallControlRegistry,
 		private readonly parkHandoff: ParkHandoffService,
+		private readonly sipTransfer: SipTransferService,
 	) {
 		this.control = new CallControl({
 			media: this.media,
@@ -211,6 +220,19 @@ export class ChannelOrchestrator {
 					}
 				: await this.control.acceptParkHandoff(request),
 		);
+		// A desk phone's TRANSFER key, which reaches the engine as a REFER relayed by `apps/sipd`.
+		// Pushed here for the same reason the park handler is: the responder is constructed by the
+		// NATS module long before this class, and pulling would be a Nest cycle.
+		this.sipTransfer.attach({
+			// A draining instance answers as though it holds no such call, and that is honest rather
+			// than evasive: it is about to hang its remaining legs up, so a transfer accepted now would
+			// start a routing walk this process abandons halfway through somebody's hold music.
+			resolveDialog: async (request) =>
+				this.draining ? undefined : this.resolveSipDialog(request.sipCallId),
+			legFor: (mediaChannelId) => this.controlledLegFor(mediaChannelId),
+			isDialableTarget: async (leg, destination) => await this.isDialableFromLeg(leg, destination),
+			transfer: async (leg, request) => await this.control.transfer(leg, request),
+		});
 	}
 
 	/** Live legs this instance is handling. `/healthz` and the drain both read it. */
@@ -322,6 +344,11 @@ export class ChannelOrchestrator {
 			// call: filing it as one would give the callee's own leg a `channel.created`, an
 			// organization lookup it has no variables for, and a second CDR for one call.
 			this.signals.emit(legSignalKey(channel.id), { kind: "entered" });
+			// AFTER the signal and never before. The dial resolves on it, so a media-server round trip
+			// inserted ahead of it would add a whole RTT to every ring-group answer — and this read is
+			// only wanted so a desk phone that ANSWERED can press TRANSFER, which cannot happen for at
+			// least as long as it takes somebody to pick up.
+			await this.recordSipDialog(channel);
 			return;
 		}
 
@@ -329,6 +356,11 @@ export class ChannelOrchestrator {
 			// A masquerade (attended transfer completing, a pickup) can re-deliver an arrival for a
 			// channel already being tracked. Re-creating the aggregate would reset its state
 			// machine and lose the answer instant.
+			//
+			// The dialog IS re-read, because a masquerade is precisely the event that moves one: the
+			// SIP dialog the phone is in has been swapped onto a different media channel, and an index
+			// still pointing at the old one would answer a REFER with a leg that no longer has the call.
+			await this.recordSipDialog(channel);
 			return;
 		}
 
@@ -387,6 +419,11 @@ export class ChannelOrchestrator {
 		});
 
 		this.registry.add(aggregate);
+		// Read in the same batch as the other four variables, so indexing it costs no extra round trip.
+		const sipCallId = normalizeSipCallId(variables[SIP_CALL_ID_VARIABLE]);
+		if (sipCallId !== undefined) {
+			this.registry.indexSipDialog(aggregate, sipCallId);
+		}
 
 		// Explicitly subscribe to this leg's events. The engine's socket is narrow on purpose
 		// (`ARI_SUBSCRIBE_ALL=false`), and a narrow subscription stops the moment a channel leaves
@@ -422,6 +459,10 @@ export class ChannelOrchestrator {
 						: { name: channel.callerName }),
 				},
 				to: { number: dialStringOr(channel.dialedNumber) },
+				// The field has been in the contract since P1 and nothing populated it. It is what lines
+				// a call in the event stream up with a packet capture, and — now that the engine indexes
+				// it — with the REFER a desk phone sends about that same dialog.
+				...(sipCallId === undefined ? {} : { sipCallId }),
 				...(channel.context === undefined || channel.context === ""
 					? {}
 					: { routingContext: channel.context }),
@@ -1806,35 +1847,147 @@ export class ChannelOrchestrator {
 		}
 	}
 
-	/** Reads the engine's channel variables in one pass. Absent variables come back `undefined`. */
+	/**
+	 * Reads the engine's channel variables in one pass. Absent variables come back `undefined`.
+	 *
+	 * Four of the five are stored under the name they are read by. The fifth is not: the SIP
+	 * `Call-ID` is READ from a dialplan function and STORED under an `OPTIMIQ_` name, because a
+	 * variable is what survives into the KV snapshot and what a dialplan can pre-stamp, while the
+	 * function is what the media server actually answers. Hence a pair per entry rather than a name.
+	 */
 	private async readEngineVariables(
 		channel: MediaChannelSnapshot,
 	): Promise<Record<string, string | undefined>> {
 		const fromEvent = channel.variables;
-		const names = [
-			"OPTIMIQ_ORG_ID",
-			"OPTIMIQ_CALL_DIRECTION",
-			"OPTIMIQ_ROUTING_CONTEXT",
+		const names: readonly { readonly variable: string; readonly read: string }[] = [
+			{ variable: "OPTIMIQ_ORG_ID", read: "OPTIMIQ_ORG_ID" },
+			{ variable: "OPTIMIQ_CALL_DIRECTION", read: "OPTIMIQ_CALL_DIRECTION" },
+			{ variable: "OPTIMIQ_ROUTING_CONTEXT", read: "OPTIMIQ_ROUTING_CONTEXT" },
 			// Marks a leg the engine originated. Read here rather than guessed from the dialplan,
 			// because it is the only thing that is true of every originated leg and of nothing else.
-			"OPTIMIQ_LEG",
+			{ variable: "OPTIMIQ_LEG", read: "OPTIMIQ_LEG" },
+			{ variable: SIP_CALL_ID_VARIABLE, read: SIP_CALL_ID_CHANNEL_FUNCTION },
 		];
 		const entries = await Promise.all(
-			names.map(async (name) => {
+			names.map(async ({ variable, read }) => {
 				// The event's variables are only populated when the media server is configured to
 				// export them with every event, so they are an optimisation, never the truth.
-				const inline = fromEvent[name];
+				const inline = fromEvent[variable] ?? fromEvent[read];
 				if (inline !== undefined && inline !== "") {
-					return [name, inline] as const;
+					return [variable, inline] as const;
 				}
 				try {
-					return [name, await this.media.getVariable(channel.id, name)] as const;
+					return [variable, await this.media.getVariable(channel.id, read)] as const;
 				} catch {
-					return [name, undefined] as const;
+					return [variable, undefined] as const;
 				}
 			}),
 		);
 		return Object.fromEntries(entries);
+	}
+
+	// -------------------------------------------------------------------------------------------
+	// SIP dialogs
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * Records which SIP dialog a leg already in the registry is carrying, and indexes it.
+	 *
+	 * For the legs that do NOT go through the arrival path's variable batch: a B-leg the walker
+	 * originated (whose aggregate was created before the channel existed to be read from) and a
+	 * channel re-delivered by a masquerade. Both are the leg a desk phone is actually holding when
+	 * its user presses TRANSFER, so skipping them would make the feature work in one direction only.
+	 *
+	 * Silent on every failure. A leg with no readable dialog — a Local half, a snoop, a media server
+	 * that refuses the read — is a leg no REFER can name, which is not a problem with the call.
+	 */
+	private async recordSipDialog(channel: MediaChannelSnapshot): Promise<void> {
+		const aggregate = this.registry.byAriChannelId(channel.id);
+		if (aggregate === undefined) {
+			return;
+		}
+		const sipCallId = await this.readSipCallId(channel);
+		if (
+			sipCallId === undefined ||
+			aggregate.snapshot.variables[SIP_CALL_ID_VARIABLE] === sipCallId
+		) {
+			return;
+		}
+		aggregate.setVariable(SIP_CALL_ID_VARIABLE, sipCallId);
+		this.registry.indexSipDialog(aggregate, sipCallId);
+		void this.jetstream.putChannel(aggregate.snapshot);
+	}
+
+	/** The leg's SIP `Call-ID`: pre-stamped if a dialplan did it, read off the media server if not. */
+	private async readSipCallId(channel: MediaChannelSnapshot): Promise<string | undefined> {
+		const inline = normalizeSipCallId(
+			channel.variables[SIP_CALL_ID_VARIABLE] ?? channel.variables[SIP_CALL_ID_CHANNEL_FUNCTION],
+		);
+		if (inline !== undefined) {
+			return inline;
+		}
+		try {
+			return normalizeSipCallId(
+				await this.media.getVariable(channel.id, SIP_CALL_ID_CHANNEL_FUNCTION),
+			);
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * The media channel carrying a SIP dialog, for `rpc.sip.v1.transfer`.
+	 *
+	 * Keyed on the `Call-ID` alone, and the dialog TAGS the request also carries are deliberately not
+	 * consulted. Two reasons, and the second is the one that decides it. A `Call-ID` is required to be
+	 * globally unique for the dialog it names (RFC 3261 §8.1.1.4), so it is already an exact key for
+	 * everything short of a forked INVITE — which a phone registered through `apps/sipd` cannot
+	 * produce, because the registrar is the only thing forking. And Asterisk does not expose the local
+	 * and remote tags of a PJSIP session as readable channel values at all, so a tag comparison would
+	 * have to be built out of a second data source before it could reject anything.
+	 *
+	 * The consequence is written down rather than hidden: this index cannot tell two dialogs apart
+	 * that share a `Call-ID`, and it does not try to. Authorisation is a separate matter and is done
+	 * by the responder, on the leg this returns.
+	 */
+	private resolveSipDialog(sipCallId: string): string | undefined {
+		return this.registry.bySipCallId(sipCallId)?.ariChannelId;
+	}
+
+	/**
+	 * Whether a REFER's `Refer-To` resolves to anything in the tenant's plan.
+	 *
+	 * Resolved against the TRANSFEREE's identity rather than the transferor's, because the transferee
+	 * is who `CallControl` actually routes on a blind transfer — asking the question about anybody
+	 * else would answer for a call that is not the one about to be placed.
+	 *
+	 * `internal`, hard-coded, and matching `CallControlSettings.transferContext`: the responder does
+	 * not let a request off the SIP edge choose a context, and a check performed in a wider one than
+	 * the transfer itself uses would pass destinations the transfer then refuses.
+	 *
+	 * An unreadable artifact answers TRUE. This is a pre-flight courtesy, not the gate: refusing every
+	 * transfer for a tenant whose artifact is briefly unfetchable would turn a cache miss into a
+	 * feature outage, and the transfer path behind it already reports what it finds.
+	 */
+	private async isDialableFromLeg(leg: ControlledLeg, destination: string): Promise<boolean> {
+		const dialed = destination.trim();
+		if (dialed === "") {
+			return false;
+		}
+		const artifact = await this.routing.get(leg.organizationId);
+		if (artifact === undefined) {
+			return true;
+		}
+		const transferee =
+			leg.peerMediaChannelId === undefined
+				? undefined
+				: this.controlledLegFor(leg.peerMediaChannelId);
+		const resolved = resolveInternal(artifact, {
+			from: transferee?.callerIdNumber ?? leg.callerIdNumber ?? "",
+			dialed,
+			now: new Date(),
+		});
+		return resolved.matched && resolved.plan !== undefined;
 	}
 }
 

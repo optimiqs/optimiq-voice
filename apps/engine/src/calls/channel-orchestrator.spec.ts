@@ -15,10 +15,11 @@ import type { MediaEvent } from "../media/media-event";
 import type { CallEventPublisher } from "../nats/call-event-publisher.service";
 import type { JetStreamService } from "../nats/jetstream.service";
 import type { ParkHandoffService } from "../nats/park-handoff.service";
+import type { SipTransferCallPath, SipTransferService } from "../nats/sip-transfer.service";
 import type { DidIndexSource } from "../routing/did-index.source";
 import type { RoutingArtifactSource } from "../routing/routing-artifact.source";
 import type { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
-import type { CallEventOf, CdrLegWriteEnvelope } from "@optimiq-voice/events";
+import type { CallEventOf, CdrLegWriteEnvelope, SipTransferRequest } from "@optimiq-voice/events";
 import type { ChannelSnapshot } from "@optimiq-voice/telephony";
 
 /**
@@ -56,6 +57,35 @@ const NO_PARK_HANDOFF = {
 		throw new Error("no cross-instance park handoff in this spec");
 	},
 } as unknown as ParkHandoffService;
+
+/**
+ * A SIP transfer responder that keeps the call path instead of serving it.
+ *
+ * The broker half is proven in `nats/sip-transfer.service.spec.ts` with a fake call path; this is
+ * the other side of the same seam, and holding onto what the orchestrator attaches is what lets a
+ * spec ask the REAL index whether a REFER would find the call — without a socket, and without
+ * reaching into a private map to do it.
+ */
+function fakeSipTransfer(): {
+	readonly service: SipTransferService;
+	readonly attached: () => SipTransferCallPath;
+} {
+	let attached: SipTransferCallPath | undefined;
+	const service = {
+		attach: (callPath: SipTransferCallPath) => {
+			attached = callPath;
+		},
+	} as unknown as SipTransferService;
+	return {
+		service,
+		attached: () => {
+			if (attached === undefined) {
+				throw new Error("the orchestrator attached no sip transfer call path");
+			}
+			return attached;
+		},
+	};
+}
 
 /**
  * Orchestrator specs, driven entirely by fakes.
@@ -147,6 +177,8 @@ function harness(env: EngineEnv = fakeEnv()) {
 		get: async () => undefined,
 	} as unknown as RoutingArtifactSource;
 
+	const sipTransfer = fakeSipTransfer();
+
 	const orchestrator = new ChannelOrchestrator(
 		env,
 		media,
@@ -163,6 +195,7 @@ function harness(env: EngineEnv = fakeEnv()) {
 		new ParkRegistry(),
 		new CallControlRegistry(),
 		NO_PARK_HANDOFF,
+		sipTransfer.service,
 	);
 
 	return {
@@ -177,6 +210,7 @@ function harness(env: EngineEnv = fakeEnv()) {
 		jetstream,
 		signals,
 		routing,
+		sipCallPath: sipTransfer.attached,
 	};
 }
 
@@ -290,6 +324,117 @@ describe("inbound call arrival", () => {
 		h.variables.OPTIMIQ_CALL_DIRECTION = "outbound";
 		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
 		expect(h.published[0]?.data).toMatchObject({ direction: "outbound" });
+	});
+});
+
+/**
+ * The half of `rpc.sip.v1.transfer` that lives in this file: turning the `Call-ID` a desk phone puts
+ * on its REFER into a channel this process is holding.
+ *
+ * Driven through the seam the responder actually calls rather than through a private map, so what is
+ * asserted here is the same thing `apps/sipd` gets on the wire.
+ */
+describe("sip dialog correlation", () => {
+	const SIP_CALL_ID = "3c26700c1adf-6qgy0fkn7cvb";
+
+	/** As much of a REFER as `resolveDialog` reads, which is the Call-ID and nothing else. */
+	function refer(sipCallId: string): SipTransferRequest {
+		return { sipCallId } as unknown as SipTransferRequest;
+	}
+
+	async function arriveWithDialog(
+		h: ReturnType<typeof harness>,
+		sipCallId = SIP_CALL_ID,
+	): Promise<void> {
+		// `CHANNEL(pjsip,call-id)` and not `PJSIP_HEADER(read,…)`: the header function is unreadable on
+		// an outgoing leg, which is the leg a phone that ANSWERED a call is sitting on.
+		h.variables["CHANNEL(pjsip,call-id)"] = sipCallId;
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
+	}
+
+	it("records the Call-ID as a channel variable, so it survives into the KV snapshot", async () => {
+		const h = harness();
+		await arriveWithDialog(h);
+
+		const [snapshot] = [...h.kv.values()];
+		// A variable rather than a field: this is what an instance taking over a failover reads.
+		expect(snapshot?.variables.OPTIMIQ_SIP_CALL_ID).toBe(SIP_CALL_ID);
+	});
+
+	it("puts it on channel.created, a contract field nothing has ever populated", async () => {
+		const h = harness();
+		await arriveWithDialog(h);
+
+		expect(h.published[0]?.data).toMatchObject({ sipCallId: SIP_CALL_ID });
+	});
+
+	it("resolves a REFER naming that dialog onto the media channel carrying it", async () => {
+		const h = harness();
+		await arriveWithDialog(h);
+
+		await expect(h.sipCallPath().resolveDialog(refer(SIP_CALL_ID))).resolves.toBe(ARI_CHANNEL);
+		// And the leg the responder then authorises is the one this process is actually holding.
+		expect(h.sipCallPath().legFor(ARI_CHANNEL)?.callerIdNumber).toBe("+15551234567");
+	});
+
+	it("resolves nothing for a Call-ID no live call carries", async () => {
+		const h = harness();
+		await arriveWithDialog(h);
+
+		// `unknown_dialog` at the responder — a phone guessing, or a call that has already ended.
+		await expect(h.sipCallPath().resolveDialog(refer("somebody-else@1.2.3.4"))).resolves.toBe(
+			undefined,
+		);
+	});
+
+	it("takes the call when the media server cannot answer the Call-ID, and indexes nothing", async () => {
+		const h = harness();
+		// A Local half, a snoop, or a media server with no SIP notion at all.
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
+
+		expect(h.orchestrator.activeChannelCount).toBe(1);
+		expect(h.published[0]?.data).not.toHaveProperty("sipCallId");
+		await expect(h.sipCallPath().resolveDialog(refer(SIP_CALL_ID))).resolves.toBe(undefined);
+	});
+
+	it("takes a Call-ID the media server exported with the event, without a second round trip", async () => {
+		const h = harness();
+		h.variables["CHANNEL(pjsip,call-id)"] = "read@1.2.3.4";
+
+		await h.orchestrator.handleEvent(
+			mediaEvent("StasisStart", {
+				// `channelvars`, which is what an `ari.conf` configured to export variables sends. A
+				// dialplan that has already stamped the Call-ID is believed rather than re-read.
+				channel: channel({ channelvars: { OPTIMIQ_SIP_CALL_ID: "stamped@1.2.3.4" } }),
+				args: [],
+			}),
+		);
+
+		await expect(h.sipCallPath().resolveDialog(refer("stamped@1.2.3.4"))).resolves.toBe(
+			ARI_CHANNEL,
+		);
+		await expect(h.sipCallPath().resolveDialog(refer("read@1.2.3.4"))).resolves.toBe(undefined);
+	});
+
+	it("releases the key when the leg ends, so the index cannot outlive the call", async () => {
+		const h = harness();
+		await arriveWithDialog(h);
+
+		await h.orchestrator.handleEvent(
+			mediaEvent("ChannelDestroyed", { channel: channel(), cause: 16 }),
+		);
+
+		expect(h.orchestrator.activeChannelCount).toBe(0);
+		await expect(h.sipCallPath().resolveDialog(refer(SIP_CALL_ID))).resolves.toBe(undefined);
+	});
+
+	it("answers no dialog at all once the instance is draining", async () => {
+		const h = harness();
+		await arriveWithDialog(h);
+		await h.orchestrator.drain(0);
+
+		// Accepting one here would start a routing walk this process is about to abandon.
+		await expect(h.sipCallPath().resolveDialog(refer(SIP_CALL_ID))).resolves.toBe(undefined);
 	});
 });
 
@@ -579,6 +724,7 @@ describe("resilience", () => {
 			new ParkRegistry(),
 			new CallControlRegistry(),
 			NO_PARK_HANDOFF,
+			fakeSipTransfer().service,
 		);
 
 		await expect(

@@ -70,16 +70,69 @@ export function resolveOrganizationId(
 	return undefined;
 }
 
-/** The channel variables the engine reads off a channel at `StasisStart`. */
+/**
+ * Where the SIP `Call-ID` of a leg's dialog is kept, once the engine has read it.
+ *
+ * A channel VARIABLE rather than a field on `CallerProfile` or `ChannelSnapshot`, and the choice is
+ * the same one `OPTIMIQ_BRIDGE_PEER_LEG_ID` makes for the same reason: variables are already
+ * mirrored into the `channels` KV bucket, so an instance that picks this leg up after a failover
+ * reads the same Call-ID and can answer a REFER about it. A field would live only in the process
+ * that died — and would put a signalling concept into `@optimiq-voice/telephony`, which is the one
+ * package that must stay free of them.
+ */
+export const SIP_CALL_ID_VARIABLE = "OPTIMIQ_SIP_CALL_ID";
+
+/**
+ * What the engine asks the media server for when nothing has stamped {@link SIP_CALL_ID_VARIABLE}.
+ *
+ * `CHANNEL(pjsip,call-id)` and not `PJSIP_HEADER(read,Call-ID)`. Both name the same string, but the
+ * header function only reads the request that CREATED the channel and Asterisk restricts it to a
+ * pre-dial handler on an outgoing leg — which is exactly the leg a desk phone that ANSWERED a call
+ * is sitting on, so half of all transfers would find nothing. The `CHANNEL()` key is answered from
+ * the PJSIP session itself, is readable over `GET /channels/{id}/variable` at any point in the
+ * channel's life, and is the same value in both directions.
+ *
+ * A non-PJSIP channel (a Local half, an ARI-originated `Snoop`) answers empty, which is correct:
+ * those legs have no SIP dialog and nothing can REFER about them.
+ */
+export const SIP_CALL_ID_CHANNEL_FUNCTION = "CHANNEL(pjsip,call-id)";
+
+/**
+ * The channel variables the engine reads off a channel at `StasisStart`.
+ *
+ * The last one is not read by its own name — see {@link SIP_CALL_ID_CHANNEL_FUNCTION} — but it is
+ * stored under it, which is what makes it a variable rather than a lookup.
+ */
 export const ENGINE_CHANNEL_VARIABLES = [
 	"OPTIMIQ_ORG_ID",
 	"OPTIMIQ_CALL_DIRECTION",
 	"OPTIMIQ_ROUTING_CONTEXT",
 	/** `b` on a leg the engine originated; absent on a leg that arrived from the outside. */
 	"OPTIMIQ_LEG",
+	SIP_CALL_ID_VARIABLE,
 ] as const;
 
 export type EngineChannelVariable = (typeof ENGINE_CHANNEL_VARIABLES)[number];
+
+/**
+ * The Call-ID as an index key, or `undefined` when there is nothing worth indexing.
+ *
+ * Trimmed, because a dialplan `Set()` and a media server that pads its answer both happen. Rejected
+ * above 256 characters rather than truncated: that is the ceiling
+ * `sipTransferRequestSchema.sipCallId` enforces, so a longer value could never be matched by a
+ * request anyway, and a truncated key would match the WRONG call rather than none.
+ *
+ * Compared byte-for-byte thereafter. RFC 3261 §20.8 makes the `Call-ID` case-SENSITIVE, and it is
+ * an opaque token both ends echo verbatim, so folding case here would be inventing an equivalence
+ * the protocol does not have.
+ */
+export function normalizeSipCallId(value: string | undefined): string | undefined {
+	const trimmed = value?.trim();
+	if (trimmed === undefined || trimmed === "" || trimmed.length > 256) {
+		return undefined;
+	}
+	return trimmed;
+}
 
 function firstNonEmpty(values: readonly (string | undefined)[]): string | undefined {
 	for (const value of values) {

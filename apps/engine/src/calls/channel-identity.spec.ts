@@ -1,6 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import { isEntityId } from "@optimiq-voice/identifiers";
-import { callIdForAriChannel, legIdForAriChannel, resolveOrganizationId } from "./channel-identity";
+import {
+	callIdForAriChannel,
+	ENGINE_CHANNEL_VARIABLES,
+	legIdForAriChannel,
+	normalizeSipCallId,
+	resolveOrganizationId,
+	SIP_CALL_ID_VARIABLE,
+} from "./channel-identity";
 
 const ORG = "0195c0f0-1c2f-7000-8000-000000000001";
 const OTHER_ORG = "0195c0f0-1c2f-7000-8000-000000000002";
@@ -73,5 +80,36 @@ describe("resolveOrganizationId", () => {
 
 	it("trims surrounding whitespace, which a dialplan Set() readily introduces", () => {
 		expect(resolveOrganizationId({ OPTIMIQ_ORG_ID: ` ${ORG} ` })).toBe(ORG);
+	});
+});
+
+describe("normalizeSipCallId", () => {
+	it("keeps a Call-ID as the phone spelled it", () => {
+		expect(normalizeSipCallId("3c26700c1adf-6qgy0fkn7cvb")).toBe("3c26700c1adf-6qgy0fkn7cvb");
+		// Case is part of the token (RFC 3261 §20.8), so nothing here may fold it.
+		expect(normalizeSipCallId("AbC@1.2.3.4")).toBe("AbC@1.2.3.4");
+	});
+
+	it("trims, because a dialplan Set() and a padded ARI answer both happen", () => {
+		expect(normalizeSipCallId("  abc@1.2.3.4\n")).toBe("abc@1.2.3.4");
+	});
+
+	it("treats an absent or empty value as nothing to index", () => {
+		expect(normalizeSipCallId(undefined)).toBeUndefined();
+		expect(normalizeSipCallId("")).toBeUndefined();
+		// What a non-PJSIP channel — a Local half, a snoop — answers.
+		expect(normalizeSipCallId("   ")).toBeUndefined();
+	});
+
+	it("rejects a value past the contract's ceiling rather than truncating it", () => {
+		// A truncated key would match the WRONG call; no request can carry more than 256 anyway.
+		expect(normalizeSipCallId("x".repeat(256))).toHaveLength(256);
+		expect(normalizeSipCallId("x".repeat(257))).toBeUndefined();
+	});
+});
+
+describe("ENGINE_CHANNEL_VARIABLES", () => {
+	it("includes the SIP Call-ID, which is what makes a desk phone's REFER resolvable", () => {
+		expect(ENGINE_CHANNEL_VARIABLES).toContain(SIP_CALL_ID_VARIABLE);
 	});
 });
