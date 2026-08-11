@@ -361,6 +361,55 @@ var QueueMembershipKV = KVBucketDefinition{
 	NumReplicas:  1,
 }
 
+// ParkClaimsKV holds which engine instance owns which orbit slot.
+//
+// The invariant it exists for: two calls can never occupy one orbit. A colleague told "she is on
+// 401" must reach exactly that caller. An in-process map holds that within one engine and says
+// nothing across two, so a second instance behind the same media server hands out 401 again. The
+// claim is therefore taken here, with the KV create that fails when the key already exists, before
+// any media moves — a failed create is the other instance winning, not an error to retry blindly.
+//
+// The TTL is a backstop; the record's own expiresAt is what a reaper reads, because server-side
+// expiry cannot distinguish "the owner stopped heartbeating" from "written a while ago and still
+// correct". Fifteen minutes is far longer than any heartbeat interval and short enough that a
+// crashed instance's lot is usable again before the next shift.
+//
+// Nothing in Go writes this bucket today — park is an engine (ARI) operation. It is declared here so
+// both halves of the backbone create the same buckets, which is what the parity golden pins.
+var ParkClaimsKV = KVBucketDefinition{
+	Name:         "park-claims",
+	Description:  "Orbit-slot ownership across engine instances, taken under compare-and-set.",
+	TTL:          15 * time.Minute,
+	History:      1,
+	Storage:      StorageFile,
+	MaxValueSize: 4 * 1024,
+	MaxBytes:     128 * mib,
+	NumReplicas:  1,
+}
+
+// ConferenceClaimsKV holds the agreed bridge id for a room, and who is in it.
+//
+// Unlike a parked call, a conference is repairable across instances: every engine talks to the same
+// media server, so a bridge created by one is addressable by another. The only missing piece was
+// agreement on WHICH bridge id room 3001 uses — two instances each minting their own is exactly how
+// a room splits in two, with everybody hearing music and nobody hearing each other. The first joiner
+// creates the claim carrying its bridge id; a joiner that loses the create joins the winner's bridge.
+//
+// The member count lives in the claim and moves under compare-and-set, which is what makes
+// maxMembers a real cap rather than a per-instance one.
+//
+// Like ParkClaimsKV, declared but not written from Go.
+var ConferenceClaimsKV = KVBucketDefinition{
+	Name:         "conference-claims",
+	Description:  "Conference room -> agreed bridge id and member count, under compare-and-set.",
+	TTL:          15 * time.Minute,
+	History:      1,
+	Storage:      StorageFile,
+	MaxValueSize: 8 * 1024,
+	MaxBytes:     128 * mib,
+	NumReplicas:  1,
+}
+
 // KVBuckets lists every bucket the backbone owns, in apply order.
 var KVBuckets = []KVBucketDefinition{
 	RegistrationsKV,
@@ -370,6 +419,8 @@ var KVBuckets = []KVBucketDefinition{
 	RoutingCacheKV,
 	DIDIndexKV,
 	QueueMembershipKV,
+	ParkClaimsKV,
+	ConferenceClaimsKV,
 }
 
 // KVBucketByName looks a bucket definition up by name.

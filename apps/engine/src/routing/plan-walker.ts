@@ -202,6 +202,16 @@ export interface PlanWalkerSettings {
 	readonly conferenceFullAnnouncement: string;
 	/** How long a participant holds for a moderator before the call is given up on. */
 	readonly conferenceModeratorWaitMs: number;
+	/**
+	 * How often a held participant re-reads the room's shared claim.
+	 *
+	 * Only used while a moderator gate is actually closed, and only when claims are shared: a
+	 * moderator who joins on ANOTHER engine instance cannot fire a local waiter, and the alternative
+	 * to this poll is a participant holding for the full wait budget beside a meeting that started
+	 * ten minutes ago. Two seconds is below the threshold at which somebody on hold notices a delay
+	 * and far above the rate at which a KV point read costs anything.
+	 */
+	readonly conferenceClaimPollMs: number;
 	readonly mediaRefs: MediaRefSettings;
 }
 
@@ -238,6 +248,7 @@ export const DEFAULT_PLAN_WALKER_SETTINGS: PlanWalkerSettings = {
 	// Ten minutes. Long enough that a moderator who is late still finds their meeting, short
 	// enough that a forgotten leg does not hold a channel until the process restarts.
 	conferenceModeratorWaitMs: 600_000,
+	conferenceClaimPollMs: 2_000,
 	mediaRefs: DEFAULT_MEDIA_REF_SETTINGS,
 };
 
@@ -1560,7 +1571,7 @@ export class PlanWalker {
 		}
 
 		const joinedAtMs = (this.deps.now ?? Date.now)();
-		const joined = registry.join(
+		const joined = await registry.join(
 			node.conferenceId,
 			{
 				mediaChannelId: this.deps.channel.mediaChannelId,
@@ -1568,13 +1579,29 @@ export class PlanWalker {
 				moderator: admission.moderator,
 				joinedAtMs,
 			},
-			{ newBridgeId: this.newId(), maxMembers: node.maxMembers },
+			{
+				newBridgeId: this.newId(),
+				maxMembers: node.maxMembers,
+				organizationId: this.deps.channel.organizationId,
+			},
 		);
 		if (joined.kind === "full") {
 			this.note(
 				`conference room ${node.roomNumber} is at its limit of ${node.maxMembers} members; the caller was refused`,
 			);
 			return await this.announceAndHangup(this.settings.conferenceFullAnnouncement, "USER_BUSY");
+		}
+		if (joined.kind === "claims-unavailable") {
+			// The room's claim could not be taken. Joining anyway would put this caller in a bridge no
+			// other instance agrees on, which is the split the claim exists to prevent — and a caller
+			// alone in a room they think is a meeting is worse than a caller told it is unavailable.
+			this.note(
+				`conference room ${node.roomNumber} could not be claimed: ${joined.reason}; the caller was refused`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"NORMAL_TEMPORARY_FAILURE",
+			);
 		}
 
 		if (
@@ -1583,7 +1610,7 @@ export class PlanWalker {
 			!joined.room.moderatorPresent &&
 			!(await this.holdForModerator(node, registry))
 		) {
-			registry.leave(node.conferenceId, this.deps.channel.mediaChannelId);
+			await registry.leave(node.conferenceId, this.deps.channel.mediaChannelId);
 			return { kind: "aborted" };
 		}
 
@@ -1598,7 +1625,7 @@ export class PlanWalker {
 			});
 			await this.deps.media.addToBridge(bridgeId, [this.deps.channel.mediaChannelId]);
 		} catch (error) {
-			registry.leave(node.conferenceId, this.deps.channel.mediaChannelId);
+			await registry.leave(node.conferenceId, this.deps.channel.mediaChannelId);
 			this.log("failed to join a conference bridge", { bridgeId, err: String(error) });
 			this.note(`joining conference room ${node.roomNumber} failed: ${String(error)}`);
 			return { kind: "hangup", cause: "NORMAL_TEMPORARY_FAILURE" };
@@ -1614,7 +1641,9 @@ export class PlanWalker {
 			roomNumber: node.roomNumber,
 			bridgeId,
 			moderator: admission.moderator,
-			memberCount: room?.members.length ?? 1,
+			// Cluster-wide when claims are shared: a wallboard showing "2 in the room" for a meeting of
+			// six because four of them landed on another instance is a report nobody can act on.
+			memberCount: room?.memberCount ?? joined.room.memberCount,
 		});
 
 		if (node.recordEnabled) {
@@ -1778,6 +1807,22 @@ export class PlanWalker {
 
 		const waiter = registry.awaitModerator(node.conferenceId);
 		let hungUp = false;
+		// A moderator who joins on ANOTHER instance cannot fire a local waiter, so the claim is
+		// re-read while the gate is closed. One poll per HELD caller, only while a gate is actually
+		// closed — which is why it is here and not a background sweep over every room.
+		let polling = registry.isShared;
+		const poll = async (): Promise<void> => {
+			while (polling) {
+				await this.delay(this.settings.conferenceClaimPollMs);
+				if (!polling) {
+					return;
+				}
+				if (await registry.refresh(node.conferenceId)) {
+					return;
+				}
+			}
+		};
+		void poll();
 		const unwatch = this.deps.signals.watch(
 			legSignalKey(this.deps.channel.mediaChannelId),
 			(signal) => {
@@ -1792,6 +1837,7 @@ export class PlanWalker {
 		});
 
 		await Promise.race([waiter.arrived, expiry]);
+		polling = false;
 		unwatch();
 		waiter.cancel();
 
@@ -1805,6 +1851,11 @@ export class PlanWalker {
 			return false;
 		}
 		if (registry.room(node.conferenceId)?.moderatorPresent !== true) {
+			// One last read before giving up: the moderator may have arrived on another instance
+			// between the last poll and the budget expiring.
+			if (await registry.refresh(node.conferenceId)) {
+				return true;
+			}
 			this.note(`no moderator joined conference room ${node.roomNumber} within the wait budget`);
 			return false;
 		}
@@ -1822,7 +1873,7 @@ export class PlanWalker {
 		if (registry === undefined) {
 			return;
 		}
-		const departure = registry.leave(node.conferenceId, this.deps.channel.mediaChannelId);
+		const departure = await registry.leave(node.conferenceId, this.deps.channel.mediaChannelId);
 		try {
 			await this.deps.publish("conference.left", {
 				legId: this.deps.channel.channelId,

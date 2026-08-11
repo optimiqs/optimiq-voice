@@ -591,6 +591,77 @@ export const QUEUE_MEMBERSHIP_KV: KvBucketDefinition = {
 	numReplicas: 1,
 };
 
+/**
+ * `park-claims` — which engine instance owns which orbit slot.
+ *
+ * ## The invariant this exists for
+ *
+ * **Two calls can never occupy one orbit.** A colleague is told "she is on 401"; they dial 401 and
+ * must reach exactly that caller. An in-process map holds that within one engine and says nothing
+ * across two, so a second instance behind the same media server hands out 401 again and the person
+ * who dials it reaches whichever of the two the switch happened to give them.
+ *
+ * The claim is therefore taken HERE, with `create` — the KV operation that fails when the key
+ * already exists — before any media moves. A failed create is not an error to retry blindly: it is
+ * the other instance winning, and the parker moves to the next free slot or is told the lot is full.
+ *
+ * ## Why the TTL is short, and what the heartbeat is for
+ *
+ * An instance that dies mid-call leaves its claims behind, and a slot nobody can release is a slot
+ * permanently removed from the lot. So a claim carries the owning instance and an expiry, the owner
+ * re-writes it on a heartbeat for as long as the call is parked, and a claim past its expiry is
+ * REAPABLE by anybody. Fifteen minutes is longer than any heartbeat interval by two orders of
+ * magnitude and short enough that a crashed instance's lot is usable again before the next shift.
+ *
+ * The bucket TTL is the backstop; the record's own `expiresAt` is what a reaper reads, because
+ * server-side expiry cannot distinguish "the owner stopped heartbeating" from "the value was
+ * written a long time ago and is still correct".
+ */
+export const PARK_CLAIMS_KV: KvBucketDefinition = {
+	name: "park-claims",
+	description: "Orbit-slot ownership across engine instances, taken under compare-and-set.",
+	ttlMs: 15 * MINUTE_MS,
+	history: 1,
+	storage: "file",
+	maxValueSizeBytes: 4 * 1024,
+	maxBytes: 128 * MIB,
+	numReplicas: 1,
+};
+
+/**
+ * `conference-claims` — the agreed bridge id for a room, and who is in it.
+ *
+ * ## Why this fixes a split rather than merely detecting one
+ *
+ * Unlike a parked call, a conference is repairable across instances: every engine talks to the SAME
+ * media server, so a bridge created by instance A is addressable by instance B. The only thing that
+ * was missing was agreement on WHICH bridge id room `3001` uses. Two instances each minting their
+ * own is exactly how a room splits in two, with everybody hearing music and nobody hearing each
+ * other — a failure that reads as a media bug and is not one.
+ *
+ * So the first joiner `create`s the claim carrying its bridge id; a joiner who loses the create
+ * reads the winner's id and joins THAT bridge. The room is one room again.
+ *
+ * ## Member count lives here too, and that is what makes `maxMembers` real
+ *
+ * A cap enforced per instance is not a cap. The count is carried in the claim and moved under
+ * compare-and-set on every join and leave, so the twenty-first participant is refused wherever they
+ * land. The retry loop is bounded: a join that keeps losing the CAS is a room being hammered, and
+ * refusing is better than spinning on the call path.
+ *
+ * TTL matches `park-claims` for the same reason — a crashed instance's room must not survive it.
+ */
+export const CONFERENCE_CLAIMS_KV: KvBucketDefinition = {
+	name: "conference-claims",
+	description: "Conference room -> agreed bridge id and member count, under compare-and-set.",
+	ttlMs: 15 * MINUTE_MS,
+	history: 1,
+	storage: "file",
+	maxValueSizeBytes: 8 * 1024,
+	maxBytes: 128 * MIB,
+	numReplicas: 1,
+};
+
 export const KV_BUCKETS: readonly KvBucketDefinition[] = [
 	REGISTRATIONS_KV,
 	CHANNELS_KV,
@@ -599,6 +670,8 @@ export const KV_BUCKETS: readonly KvBucketDefinition[] = [
 	ROUTING_CACHE_KV,
 	DID_INDEX_KV,
 	QUEUE_MEMBERSHIP_KV,
+	PARK_CLAIMS_KV,
+	CONFERENCE_CLAIMS_KV,
 ];
 
 /** The KV wire options for a bucket definition. */
@@ -723,6 +796,30 @@ export const kvKeyFor = {
 	 */
 	queueMembership(orgId: string, queueId: string): string {
 		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("queueId", queueId)}`;
+	},
+	/**
+	 * `park-claims`: `<orgId>.<parkLotId>.<slot>` — the ORBIT is the key, because the orbit is what
+	 * has to be exclusive.
+	 *
+	 * Not keyed by the parked channel: two instances racing for slot 401 must collide, and a
+	 * channel-keyed claim would let both of them succeed and then discover the conflict at retrieval
+	 * time, which is a caller reaching the wrong person rather than a park being refused.
+	 *
+	 * The lot prefixes the slot so an operator (or a reaper) can range-read one lot, and because slot
+	 * numbers are only unique within a lot.
+	 */
+	parkClaim(orgId: string, parkLotId: string, slot: number): string {
+		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("parkLotId", parkLotId)}.${assertKeyToken("slot", String(slot))}`;
+	},
+	/**
+	 * `conference-claims`: `<orgId>.<conferenceId>` — one entry per room.
+	 *
+	 * By the room's ID and not its dialled number: a tenant may renumber `3001` while people are in
+	 * it, and a key that moved underneath a live room would strand everybody already inside on a
+	 * bridge nobody can find again.
+	 */
+	conferenceClaim(orgId: string, conferenceId: string): string {
+		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("conferenceId", conferenceId)}`;
 	},
 } as const;
 

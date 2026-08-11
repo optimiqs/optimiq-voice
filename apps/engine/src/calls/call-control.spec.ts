@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { makeFakeMediaPort } from "../ari/media-port.fake";
 import { CallSignalBus, legSignalKey, recordingSignalKey } from "../routing/call-signals";
 import { ParkRegistry } from "../routing/park-registry";
-import { CallControl } from "./call-control";
+import { CallControl, pickupGroupFilter } from "./call-control";
 import type { FakeMediaPortOptions } from "../ari/media-port.fake";
 import type {
 	CallControlHost,
@@ -14,6 +14,20 @@ import type {
 } from "./call-control";
 import type { CallEvent } from "@optimiq-voice/events";
 import type { CallState, ChannelFlag, ChannelState, HangupCause } from "@optimiq-voice/telephony";
+
+/**
+ * Settles the microtask queue.
+ *
+ * A fixed number of `await Promise.resolve()` calls used to be enough; a park or conference claim
+ * that may be shared adds asynchronous steps to paths that were synchronous, and a spec that
+ * hard-codes the tick count breaks every time one is added. Draining until nothing is left pending
+ * is the assertion these specs actually mean.
+ */
+async function flush(ticks = 12): Promise<void> {
+	for (let index = 0; index < ticks; index += 1) {
+		await Promise.resolve();
+	}
+}
 
 /**
  * Call-control specs, driven entirely by fakes.
@@ -147,7 +161,7 @@ function harness(options: HarnessOptions = {}) {
 
 	const host: CallControlHost = {
 		legFor: (mediaChannelId) => legs.get(mediaChannelId),
-		ringingFor: () => options.ringing ?? [],
+		ringingFor: async () => options.ringing ?? [],
 		publish: async (leg, type, data) => {
 			published.push({ type, legId: leg.legId, data });
 		},
@@ -425,7 +439,9 @@ describe("the park timeout", () => {
 		await h.control.park(caller);
 
 		h.timers[0]?.fn();
-		await Promise.resolve();
+		// The park registry's claim/restore round trip is asynchronous now that a claim may be shared,
+		// so the timeout's own continuation takes several microtasks to settle.
+		await flush();
 
 		expect(h.parks.at(LOT.parkLotId, 401)?.mediaChannelId).toBe("c");
 		expect(h.routes).toHaveLength(0);
@@ -695,6 +711,63 @@ describe("pickup", () => {
 		expect((await h.control.pickup(fakeLeg("p"), { kind: "directed", extension: "200" })).ok).toBe(
 			false,
 		);
+	});
+});
+
+/**
+ * Pickup GROUPS.
+ *
+ * The three-case rule, asserted directly rather than through the orchestrator's registry walk: the
+ * walk is iteration, this is the feature. Each case is a decision somebody will want to revisit, and
+ * getting the third one backwards is how a restriction becomes decorative.
+ */
+describe("the pickup group filter", () => {
+	const SALES = { pickupGroup: "sales" };
+	const FLOOR = { pickupGroup: "floor-2" };
+	const UNGROUPED = {};
+
+	it("does not exist at all for a tenant with no groups", () => {
+		expect(pickupGroupFilter({ "1001": UNGROUPED, "1002": UNGROUPED }, "1001")).toBeUndefined();
+	});
+
+	it("lets a caller answer a phone in their own group", () => {
+		const covers = pickupGroupFilter({ "1001": SALES, "1002": SALES }, "1001");
+		expect(covers?.("1002")).toBe(true);
+	});
+
+	it("refuses a phone in a different group — the receptionist and the warehouse", () => {
+		const covers = pickupGroupFilter({ "1001": SALES, "1002": FLOOR }, "1001");
+		expect(covers?.("1002")).toBe(false);
+	});
+
+	it("leaves an ungrouped extension available to everybody, which is the documented fallback", () => {
+		const covers = pickupGroupFilter({ "1001": SALES, "1002": UNGROUPED }, "1001");
+		expect(covers?.("1002")).toBe(true);
+	});
+
+	it("refuses a groupless caller a grouped phone, or the restriction is decorative", () => {
+		const covers = pickupGroupFilter({ "1001": UNGROUPED, "1002": SALES }, "1001");
+		expect(covers?.("1002")).toBe(false);
+	});
+
+	it("refuses a caller the artifact has never heard of a grouped phone", () => {
+		const covers = pickupGroupFilter({ "1002": SALES }, "+15559998888");
+		expect(covers?.("1002")).toBe(false);
+	});
+
+	it("treats a ringing leg with no destination number as ungrouped, and therefore available", () => {
+		const covers = pickupGroupFilter({ "1001": SALES }, "1001");
+		expect(covers?.(undefined)).toBe(true);
+	});
+
+	it("does not match a caller whose identity is missing to the blank-number entry", () => {
+		const covers = pickupGroupFilter({ "1001": SALES, "1002": FLOOR }, undefined);
+		expect(covers?.("1002")).toBe(false);
+	});
+
+	it("trims the caller's number, so a stray space does not lose them their group", () => {
+		const covers = pickupGroupFilter({ "1001": SALES, "1002": SALES }, " 1001 ");
+		expect(covers?.("1002")).toBe(true);
 	});
 });
 

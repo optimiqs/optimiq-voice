@@ -328,6 +328,70 @@ describe("compile — extensions", () => {
 	});
 });
 
+/**
+ * Pickup groups.
+ *
+ * The engine restricts `*8` to the caller's own group, and it can only do that if the membership
+ * survives compilation on BOTH sides of the lookup: the node (the ringing extension) and the index
+ * (the caller). Most of what follows is about the absent case, because "no group" has to keep
+ * meaning "org-wide" — a compiler that turned a blank column into a group called `""` would put a
+ * whole tenant into one group and look like it was working.
+ */
+describe("compile — pickup groups", () => {
+	it("carries the group onto the extension node", () => {
+		const artifact = compiled(aSnapshot({ extensions: [anExtension({ pickupGroup: "sales" })] }));
+		expect((artifact.nodes["extension:ext-1"] as ExtensionPlanNode).pickupGroup).toBe("sales");
+	});
+
+	it("carries the group into the calling-party index", () => {
+		const artifact = compiled(aSnapshot({ extensions: [anExtension({ pickupGroup: "sales" })] }));
+		expect(artifact.extensionsByNumber["1001"]?.pickupGroup).toBe("sales");
+	});
+
+	it("omits the field entirely when the extension is in no group", () => {
+		const artifact = compiled(aSnapshot({ extensions: [anExtension()] }));
+		expect((artifact.nodes["extension:ext-1"] as ExtensionPlanNode).pickupGroup).toBeUndefined();
+		expect(artifact.extensionsByNumber["1001"]).not.toHaveProperty("pickupGroup");
+	});
+
+	it("treats a blank group as no group rather than as a group named nothing", () => {
+		for (const value of ["", "   ", null]) {
+			const artifact = compiled(aSnapshot({ extensions: [anExtension({ pickupGroup: value })] }));
+			expect(artifact.extensionsByNumber["1001"]).not.toHaveProperty("pickupGroup");
+		}
+	});
+
+	it("trims the label so a stray space does not split a group in two", () => {
+		const artifact = compiled(
+			aSnapshot({ extensions: [anExtension({ pickupGroup: "  sales  " })] }),
+		);
+		expect(artifact.extensionsByNumber["1001"]?.pickupGroup).toBe("sales");
+	});
+
+	it("keeps case, because two spellings are two groups an admin typed on purpose", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [
+					anExtension({ pickupGroup: "Sales" }),
+					anExtension({ id: "ext-2", number: "1002", pickupGroup: "sales" }),
+				],
+			}),
+		);
+		expect(artifact.extensionsByNumber["1001"]?.pickupGroup).toBe("Sales");
+		expect(artifact.extensionsByNumber["1002"]?.pickupGroup).toBe("sales");
+	});
+
+	it("keeps the artifact byte-identical across two compiles of one grouped snapshot", () => {
+		const snapshot = aSnapshot({
+			extensions: [
+				anExtension({ pickupGroup: "floor-2" }),
+				anExtension({ id: "ext-2", number: "1002", pickupGroup: "floor-2" }),
+			],
+		});
+		expect(canonicalJson(compiled(snapshot))).toBe(canonicalJson(compiled(snapshot)));
+	});
+});
+
 describe("compile — internal numbering", () => {
 	it("claims numbers for extensions, ring groups, IVRs, queues and conference rooms", () => {
 		const artifact = compiled(

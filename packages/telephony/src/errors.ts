@@ -9,6 +9,7 @@
 import type { BridgeState } from "./bridge";
 import type { CallState } from "./call-state";
 import type { ChannelState } from "./channel-state";
+import type { MidCallFeatureState } from "./mid-call-features";
 import type { ParkState } from "./park";
 import type { TransferState } from "./transfer";
 
@@ -86,6 +87,25 @@ export class InvalidParkTransitionError extends TelephonyError {
 
 	constructor(from: ParkState, to: ParkState) {
 		super(`Invalid park state transition: "${from}" -> "${to}"`);
+		this.from = from;
+		this.to = to;
+	}
+}
+
+/**
+ * A mid-call feature-code capture was moved along an edge the machine does not have — firing an
+ * action straight out of `idle`, or starting a second capture while the first one is still running.
+ *
+ * Always an engine bug rather than user input: the machine's own entry points refuse every digit
+ * sequence a party can physically produce, so reaching this means a caller drove the machine
+ * directly and skipped a stage.
+ */
+export class InvalidMidCallFeatureTransitionError extends TelephonyError {
+	readonly from: MidCallFeatureState;
+	readonly to: MidCallFeatureState;
+
+	constructor(from: MidCallFeatureState, to: MidCallFeatureState) {
+		super(`Invalid mid-call feature state transition: "${from}" -> "${to}"`);
 		this.from = from;
 		this.to = to;
 	}

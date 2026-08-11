@@ -28,4 +28,23 @@ describe("engine env", () => {
 		expect(env.ENGINE_TRUNK_DIAL_TEMPLATE).toBe("PJSIP/{number}@{trunk}");
 		expect(env.ENGINE_ROUTING_RPC_TIMEOUT_MS).toBe(2000);
 	});
+
+	it("gives a bare deployment a working claim identity and heartbeat", () => {
+		const env = loadEngineEnv({ ARI_PASSWORD: "x" });
+		expect(env.ENGINE_INSTANCE_ID).toBe("engine");
+		// A third of the claim lease, so a claim survives two missed heartbeats.
+		expect(env.ENGINE_CLAIM_HEARTBEAT_MS).toBe(30_000);
+	});
+
+	it("takes the instance id an orchestrator supplies", () => {
+		expect(
+			loadEngineEnv({ ARI_PASSWORD: "x", ENGINE_INSTANCE_ID: "engine-7f3a" }).ENGINE_INSTANCE_ID,
+		).toBe("engine-7f3a");
+	});
+
+	it("refuses a heartbeat so long that a claim would expire between ticks", () => {
+		expect(() =>
+			loadEngineEnv({ ARI_PASSWORD: "x", ENGINE_CLAIM_HEARTBEAT_MS: "600000" }),
+		).toThrow();
+	});
 });

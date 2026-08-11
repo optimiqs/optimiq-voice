@@ -266,6 +266,33 @@ export interface ExtensionInput extends RoutingEntityInput {
 	 * ladder is absent behaves exactly as it did before follow-me was compiled at all.
 	 */
 	readonly followMe?: FollowMeInput | null;
+	/**
+	 * The pickup group this extension belongs to, from `extension.pickup_group`.
+	 *
+	 * # What `*8` is supposed to mean
+	 *
+	 * Group pickup answers whatever is ringing IN THE CALLER'S OWN GROUP, and the group is the only
+	 * thing that makes the feature usable above about twenty extensions: without it `*8` on a
+	 * hundred-seat tenant hands the receptionist the warehouse's call, which reads as a phone-system
+	 * bug and is not one. The engine cannot ask a database at call time, so the membership has to be
+	 * in the artifact or the restriction cannot exist at all.
+	 *
+	 * # It is a free-text label, not a foreign key
+	 *
+	 * Upstream stores a string and so does this: groups are named by whoever administers the phones
+	 * (`sales`, `floor-2`), they have no properties of their own, and a `pickup_group` table would
+	 * add a join and a migration to express exactly the same set membership. Matching is exact after
+	 * trimming; an empty or absent value means "no group", which is NOT the same as a group called
+	 * `""` and is why the compiler drops blanks rather than carrying them.
+	 *
+	 * # Rollout
+	 *
+	 * Optional, like {@link ExtensionInput.followMe}, so this package stays compilable against a
+	 * loader that does not select the column. **`pbx-db` has no `pickup_group` column yet** — see
+	 * `extensions-schema.ts`. An extension whose group is absent behaves exactly as every extension
+	 * did before groups were compiled: org-wide pickup, the documented fallback.
+	 */
+	readonly pickupGroup?: string | null;
 	readonly recordPolicy: RecordPolicy;
 	readonly mohClassId?: string | null;
 	readonly tollClass: TollClass;

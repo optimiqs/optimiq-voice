@@ -10,18 +10,29 @@ import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
 import {
 	AGENT_STATE_KV,
 	CHANNELS_KV,
+	CONFERENCE_CLAIMS_KV,
+	conferenceClaimSchema,
 	DID_INDEX_KV,
 	ensureKvBuckets,
 	ensureStreams,
 	kvKeyFor,
+	PARK_CLAIMS_KV,
+	parkClaimSchema,
 	QUEUE_MEMBERSHIP_KV,
 	ROUTING_CACHE_KV,
 	subjectFor,
 } from "@optimiq-voice/events";
 import { getLogger } from "@optimiq-voice/logging";
+import { KvClaimBucket, UnclaimedBucket } from "./claim-store";
 import { ENGINE_ENV } from "./nats.tokens";
 import type { EngineEnv } from "../config/engine-env";
-import type { CdrLegWriteEnvelope, VoicemailEventEnvelope } from "@optimiq-voice/events";
+import type { ClaimBucket } from "./claim-store";
+import type {
+	CdrLegWriteEnvelope,
+	ConferenceClaim,
+	ParkClaim,
+	VoicemailEventEnvelope,
+} from "@optimiq-voice/events";
 import type { ChannelSnapshot } from "@optimiq-voice/telephony";
 
 /**
@@ -59,6 +70,9 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	private didIndexKv: KV | undefined;
 	private queueMembershipKv: KV | undefined;
 	private agentStateKv: KV | undefined;
+	private parkClaimsBucket: ClaimBucket<ParkClaim> = new UnclaimedBucket<ParkClaim>();
+	private conferenceClaimsBucket: ClaimBucket<ConferenceClaim> =
+		new UnclaimedBucket<ConferenceClaim>();
 	private ready = false;
 
 	constructor(@Inject(ENGINE_ENV) private readonly env: EngineEnv) {}
@@ -120,6 +134,19 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		// plane has ever run does not discover their absence on its first queued caller.
 		this.queueMembershipKv = await this.jetstream.views.kv(QUEUE_MEMBERSHIP_KV.name);
 		this.agentStateKv = await this.jetstream.views.kv(AGENT_STATE_KV.name);
+		// The two CLAIM buckets. Both are written and read by this engine and by every other instance
+		// of it, and by nothing else — see `claim-store.ts` for why they are wrapped in a
+		// compare-and-set surface rather than exposed raw the way the read-mostly buckets are.
+		this.parkClaimsBucket = new KvClaimBucket<ParkClaim>(
+			await this.jetstream.views.kv(PARK_CLAIMS_KV.name),
+			parkClaimSchema as never,
+			PARK_CLAIMS_KV.name,
+		);
+		this.conferenceClaimsBucket = new KvClaimBucket<ConferenceClaim>(
+			await this.jetstream.views.kv(CONFERENCE_CLAIMS_KV.name),
+			conferenceClaimSchema as never,
+			CONFERENCE_CLAIMS_KV.name,
+		);
 		this.ready = true;
 	}
 
@@ -187,6 +214,26 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	 */
 	get agentState(): KV | undefined {
 		return this.agentStateKv;
+	}
+
+	/**
+	 * The `park-claims` bucket, as a compare-and-set surface.
+	 *
+	 * Wrapped rather than raw — the opposite decision from `routingCache` and `queueMembership` —
+	 * because the consumer does NOT own the read pattern here: there is exactly one correct way to
+	 * take an exclusive claim (create, and accept losing), and handing a registry a raw `KV` invites
+	 * the `put` that always wins and always splits the lot in two.
+	 *
+	 * Before `onModuleInit` has run, and after shutdown, this is an {@link UnclaimedBucket}: local
+	 * claims only, which is what a single-instance deployment and every spec run on.
+	 */
+	get parkClaims(): ClaimBucket<ParkClaim> {
+		return this.parkClaimsBucket;
+	}
+
+	/** The `conference-claims` bucket. Same contract, same reasoning, as {@link parkClaims}. */
+	get conferenceClaims(): ClaimBucket<ConferenceClaim> {
+		return this.conferenceClaimsBucket;
 	}
 
 	/**
@@ -295,6 +342,8 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		this.didIndexKv = undefined;
 		this.queueMembershipKv = undefined;
 		this.agentStateKv = undefined;
+		this.parkClaimsBucket = new UnclaimedBucket<ParkClaim>();
+		this.conferenceClaimsBucket = new UnclaimedBucket<ConferenceClaim>();
 		if (connection !== undefined && !connection.isClosed()) {
 			// `drain` flushes in-flight publishes before closing; `close` would drop them, and the
 			// publishes in flight during a shutdown are precisely the CDRs of the calls being

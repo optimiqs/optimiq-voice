@@ -16,6 +16,20 @@ import type { ConferencePlanNode } from "@optimiq-voice/routing";
 import type { ChannelState, DtmfCollection, Verb, VerbResult } from "@optimiq-voice/telephony";
 
 /**
+ * Settles the microtask queue.
+ *
+ * A fixed number of `await Promise.resolve()` calls used to be enough; a park or conference claim
+ * that may be shared adds asynchronous steps to paths that were synchronous, and a spec that
+ * hard-codes the tick count breaks every time one is added. Draining until nothing is left pending
+ * is the assertion these specs actually mean.
+ */
+async function flush(ticks = 12): Promise<void> {
+	for (let index = 0; index < ticks; index += 1) {
+		await Promise.resolve();
+	}
+}
+
+/**
  * The conference runtime: the real {@link PlanWalker} over the real {@link ConferenceRegistry},
  * with only the media server and the verb executor faked.
  *
@@ -466,8 +480,7 @@ describe("leaving a conference", () => {
 		const a = c.caller();
 		await a.walker.walk(room(conferenceNode("conf")));
 		a.hangUp();
-		await Promise.resolve();
-		await Promise.resolve();
+		await flush();
 
 		const left = a.published.find((event) => event.type === "conference.left");
 		expect(left?.data.memberCount).toBe(0);

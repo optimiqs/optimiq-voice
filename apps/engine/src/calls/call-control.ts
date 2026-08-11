@@ -10,11 +10,12 @@ import { legSignalKey, recordingSignalKey } from "../routing/call-signals";
 import { parkSlotFor } from "../routing/park-registry";
 import type { MediaPort } from "../ari/media-port";
 import type { CallSignalBus, LegSignal } from "../routing/call-signals";
-import type { ParkedCall, ParkRegistry } from "../routing/park-registry";
+import type { ParkedCall, ParkRegistry, ParkResult } from "../routing/park-registry";
 import type { CallEvent, ParkEndReason, PickupKind } from "@optimiq-voice/events";
 import type {
 	CallState,
 	ChannelFlag,
+	DtmfDigit,
 	ChannelState,
 	HangupCause,
 	MediaRef,
@@ -163,8 +164,15 @@ export interface RouteOutcome {
 export interface CallControlHost {
 	/** The leg with this media id, or `undefined` when this process is not handling it. */
 	legFor(mediaChannelId: string): ControlledLeg | undefined;
-	/** Phones currently being alerted for `extension`, longest-ringing first. */
-	ringingFor(leg: ControlledLeg, extension: string): readonly PickupCandidate[];
+	/**
+	 * Phones currently being alerted for `extension`, longest-ringing first.
+	 *
+	 * Asynchronous because a GROUP pickup has to know the caller's pickup group, and that lives in
+	 * the compiled routing artifact — which is fetched on a cache miss. A synchronous answer would
+	 * mean either a second copy of the artifact here or guessing the group, and guessing it means a
+	 * receptionist answering the warehouse's call.
+	 */
+	ringingFor(leg: ControlledLeg, extension: string): Promise<readonly PickupCandidate[]>;
 	publish(leg: ControlledLeg, type: CallEvent, data: Record<string, unknown>): Promise<void>;
 	/** Resolves `destination` through the organization's artifact and walks the plan on this leg. */
 	route(leg: ControlledLeg, request: RouteRequest): Promise<RouteOutcome>;
@@ -214,6 +222,16 @@ export interface CallControlDependencies {
 	readonly signals: CallSignalBus;
 	readonly parks: ParkRegistry;
 	readonly host: CallControlHost;
+	/**
+	 * Where an attended transfer's cancel key is armed and disarmed.
+	 *
+	 * The mid-call feature runtime, in production. Optional so a spec about transfers needs no DTMF
+	 * machinery at all, which is the same rule the walker's optional ports follow.
+	 */
+	readonly consultationKeys?: {
+		arm(mediaChannelId: string, digit: DtmfDigit): void;
+		disarm(mediaChannelId: string): void;
+	};
 	readonly settings?: Partial<CallControlSettings>;
 	/** Injected so ids are deterministic in a spec. */
 	readonly newId?: () => string;
@@ -295,6 +313,15 @@ export interface TransferRequest {
 	readonly context?: string;
 	/** Where to send the transferee when the transfer fails. */
 	readonly fallbackDestination?: string;
+	/**
+	 * Attended only: the digit that abandons the consultation and returns to the original party.
+	 *
+	 * Armed HERE, at the moment the consultation is created, and disarmed the moment it is dropped —
+	 * rather than by the verb executor around the call. A key armed by a caller that then failed to
+	 * disarm it would swallow that digit for the rest of the call, and the two places a consultation
+	 * ends (completion and abandonment) are inside this class, not around it.
+	 */
+	readonly cancelKey?: DtmfDigit;
 }
 
 export interface PickupRequest {
@@ -371,7 +398,63 @@ interface ParkTimer {
 	readonly cancel: () => void;
 }
 
+/**
+ * Whether a `*8` from `callerNumber` may answer a phone ringing at another extension.
+ *
+ * Pure, exported, and separate from the orchestrator because this three-case rule IS the feature —
+ * everything around it is registry iteration — and each case is a decision somebody will want to
+ * revisit:
+ *
+ * 1. **Both in a group** → the groups must MATCH. The case the feature exists for. Without it a
+ *    receptionist answers the warehouse's call, which reads as a phone-system bug and is not one.
+ * 2. **The target is in NO group** → anybody may take it. Org-wide is the documented fallback and
+ *    is what every extension had before groups were compiled; making an ungrouped extension
+ *    unpickable would take a working feature away from every tenant who has not configured groups.
+ * 3. **The caller is in no group, the target is** → refused. Letting a groupless caller into every
+ *    group would make the restriction decorative: an admin who groups half their extensions expects
+ *    the other half to be OUTSIDE those groups, not inside all of them.
+ *
+ * Returns `undefined` when the organization has no groups at all, so the org-wide path costs
+ * nothing on a tenant that has not configured any — which is most of them.
+ */
+export function pickupGroupFilter(
+	extensionsByNumber: Readonly<Record<string, { readonly pickupGroup?: string }>>,
+	callerNumber: string | undefined,
+): ((ringingNumber: string | undefined) => boolean) | undefined {
+	const grouped = Object.values(extensionsByNumber).some(
+		(entry) => entry.pickupGroup !== undefined,
+	);
+	if (!grouped) {
+		return undefined;
+	}
+	const callerGroup = extensionsByNumber[callerNumber?.trim() ?? ""]?.pickupGroup;
+	return (ringingNumber) => {
+		const targetGroup =
+			ringingNumber === undefined ? undefined : extensionsByNumber[ringingNumber]?.pickupGroup;
+		return targetGroup === undefined ? true : targetGroup === callerGroup;
+	};
+}
+
 const MILLIS_PER_SECOND = 1_000;
+
+/**
+ * Why a park was refused, in words the person who pressed the key can be told.
+ *
+ * `claims-unavailable` is deliberately not softened into "the lot is full": the lot may be empty,
+ * and a caller told it was full would try another lot and be refused there too. The broker's own
+ * reason is carried through because this is an outage, and the operator reading the log is the
+ * person who can fix it.
+ */
+function parkRefusal(claim: Exclude<ParkResult, { kind: "parked" }>): string {
+	switch (claim.kind) {
+		case "lot-full":
+			return `every orbit in the lot is taken (${String(claim.capacity)} in use)`;
+		case "slot-unavailable":
+			return `orbit ${String(claim.slot)} is already occupied`;
+		case "claims-unavailable":
+			return `park slots cannot be claimed right now: ${claim.reason}`;
+	}
+}
 
 export class CallControl implements CallControlPort {
 	private readonly settings: CallControlSettings;
@@ -588,7 +671,7 @@ export class CallControl implements CallControlPort {
 		const parker = request.parkedBy ?? this.peerOf(leg);
 		const mohClass = request.musicOnHold ?? lot.mohClass;
 		let state: ParkState = INITIAL_PARK_STATE;
-		const claim = this.deps.parks.park(
+		const claim = await this.deps.parks.park(
 			lot,
 			{
 				parkLotId: lot.parkLotId,
@@ -606,13 +689,7 @@ export class CallControl implements CallControlPort {
 
 		if (claim.kind !== "parked") {
 			assertParkTransition(state, "failed");
-			return {
-				result: refuse(
-					claim.kind === "lot-full"
-						? `every orbit in the lot is taken (${String(claim.capacity)} in use)`
-						: `orbit ${String(claim.slot)} is already occupied`,
-				),
-			};
+			return { result: refuse(parkRefusal(claim)) };
 		}
 
 		// Out of the bridge, and out of the peer relationship: the parker hanging up must NOT take
@@ -624,7 +701,7 @@ export class CallControl implements CallControlPort {
 			}
 			await this.deps.media.startMusicOnHold(leg.mediaChannelId, claim.entry.mohClass);
 		} catch (error) {
-			this.deps.parks.release(leg.mediaChannelId);
+			await this.deps.parks.release(leg.mediaChannelId);
 			assertParkTransition(state, "failed");
 			return { result: refuse(`the call could not be moved into the lot: ${String(error)}`) };
 		}
@@ -684,10 +761,19 @@ export class CallControl implements CallControlPort {
 			return refuse(`orbit ${request.orbit} is not a slot in any of this organization's lots`);
 		}
 
-		const parked = this.deps.parks.claim(lot.parkLotId, slot);
-		if (parked === undefined) {
+		const claimed = await this.deps.parks.claim(lot.parkLotId, slot, leg.organizationId);
+		if (claimed.kind === "elsewhere") {
+			// The honest answer, and the reason the registry distinguishes it from an empty slot: the
+			// caller IS parked, just not on a leg this process holds. Telling the retriever "nothing is
+			// parked there" would read as "somebody already collected them" and end the search.
+			return refuse(
+				`the call on orbit ${String(slot)} is parked on another engine instance (${claimed.instanceId}) and cannot be retrieved from here yet`,
+			);
+		}
+		if (claimed.kind !== "claimed") {
 			return refuse(`nothing is parked on orbit ${String(slot)}`);
 		}
+		const parked = claimed.entry;
 		this.transitionPark(parked.mediaChannelId, "retrieving");
 		this.cancelParkTimeout(parked.mediaChannelId);
 
@@ -707,7 +793,7 @@ export class CallControl implements CallControlPort {
 		} catch (error) {
 			// Put the caller back in their own slot rather than stranding them: the park machine's
 			// `retrieving → parked` edge exists for exactly this.
-			if (this.deps.parks.restore(parked)) {
+			if (await this.deps.parks.restore(parked)) {
 				this.transitionPark(parked.mediaChannelId, "parked");
 				await this.deps.media
 					.startMusicOnHold(parked.mediaChannelId, parked.mohClass)
@@ -829,6 +915,9 @@ export class CallControl implements CallControlPort {
 		};
 		this.consultations.set(leg.mediaChannelId, consultation);
 		leg.addFlag("attended-transfer");
+		if (request.cancelKey !== undefined) {
+			this.deps.consultationKeys?.arm(leg.mediaChannelId, request.cancelKey);
+		}
 
 		const route = await this.deps.host.route(leg, {
 			destination,
@@ -1074,6 +1163,9 @@ export class CallControl implements CallControlPort {
 		}
 		consultation.stopWatching();
 		this.consultations.delete(transferorMediaChannelId);
+		// Always, whichever way the consultation ended. A key left armed swallows that digit for the
+		// rest of the call, and the party has no way to recover short of hanging up.
+		this.deps.consultationKeys?.disarm(transferorMediaChannelId);
 		await Promise.resolve();
 	}
 
@@ -1107,7 +1199,7 @@ export class CallControl implements CallControlPort {
 			return refuse("a directed pickup needs the extension whose call is being taken");
 		}
 
-		const candidates = this.deps.host.ringingFor(leg, extension);
+		const candidates = await this.deps.host.ringingFor(leg, extension);
 		const candidate = candidates.find(
 			(entry) => !entry.ringingLeg.isTearingDown && !entry.callerLeg.isTearingDown,
 		);
@@ -1337,7 +1429,7 @@ export class CallControl implements CallControlPort {
 
 		const parked = this.deps.parks.forChannel(mediaChannelId);
 		if (parked !== undefined) {
-			this.deps.parks.release(mediaChannelId);
+			await this.deps.parks.release(mediaChannelId);
 			this.cancelParkTimeout(mediaChannelId);
 			this.transitionPark(mediaChannelId, "abandoned");
 			this.parkStates.delete(mediaChannelId);
@@ -1397,8 +1489,8 @@ export class CallControl implements CallControlPort {
 	 */
 	private async returnParkedCall(entry: ParkedCall): Promise<void> {
 		this.parkTimers.delete(entry.mediaChannelId);
-		const claimed = this.deps.parks.claim(entry.parkLotId, entry.slot);
-		if (claimed === undefined) {
+		const claimed = await this.deps.parks.claim(entry.parkLotId, entry.slot, entry.organizationId);
+		if (claimed.kind !== "claimed") {
 			return;
 		}
 		const leg = this.deps.host.legFor(entry.mediaChannelId);
@@ -1408,8 +1500,11 @@ export class CallControl implements CallControlPort {
 		}
 		if (entry.parkedByNumber === undefined || entry.parkedByNumber === "") {
 			// Nobody to ring back. Put the caller back where somebody can still find them.
-			if (this.deps.parks.restore(claimed)) {
-				this.armParkTimeout(claimed, this.settings.defaultParkTimeoutSeconds * MILLIS_PER_SECOND);
+			if (await this.deps.parks.restore(claimed.entry)) {
+				this.armParkTimeout(
+					claimed.entry,
+					this.settings.defaultParkTimeoutSeconds * MILLIS_PER_SECOND,
+				);
 			}
 			this.log("a parked call timed out with no parker to return it to", {
 				parkLotId: entry.parkLotId,

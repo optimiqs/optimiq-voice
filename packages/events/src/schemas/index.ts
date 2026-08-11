@@ -123,6 +123,15 @@ export {
 	type ProvisionEventOf,
 } from "./provision-events";
 export {
+	claimBaseSchema,
+	conferenceClaimSchema,
+	isClaimExpired,
+	isClaimOwnedBy,
+	parkClaimSchema,
+	type ConferenceClaim,
+	type ParkClaim,
+} from "./claims";
+export {
 	isLiveChannel,
 	isRegistrationLapsed,
 	LIVE_CHANNEL_DIRECTIONS,

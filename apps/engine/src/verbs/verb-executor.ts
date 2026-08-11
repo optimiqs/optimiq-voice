@@ -483,6 +483,9 @@ export function makeVerbExecutor(deps: VerbExecutorDependencies): VerbExecutorIn
 						...(verb.fallbackDestination === undefined
 							? {}
 							: { fallbackDestination: verb.fallbackDestination.destination }),
+						// Armed and disarmed inside the consultation's own lifetime — see
+						// `TransferRequest.cancelKey`.
+						...(verb.cancelKey === undefined ? {} : { cancelKey: verb.cancelKey }),
 					}),
 				);
 

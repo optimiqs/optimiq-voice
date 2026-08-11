@@ -39,6 +39,9 @@ describe("public surface", () => {
 			"CALL_EVENT_NAMES",
 			"CHANNEL_FLAGS",
 			"InvalidChannelTransitionError",
+			"MID_CALL_FEATURE_ACTIONS",
+			"MidCallFeatureMachine",
+			"orderMidCallFeatureCodes",
 		] as const) {
 			expect(telephony).toHaveProperty(name);
 		}

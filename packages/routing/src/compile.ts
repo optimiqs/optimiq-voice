@@ -736,6 +736,7 @@ class Compiler {
 			recordPolicy: extension.recordPolicy,
 			timeoutSeconds: extension.callTimeoutSeconds,
 			doNotDisturb: extension.doNotDisturb,
+			pickupGroup: pickupGroupOf(extension),
 			mohClassId: extension.mohClassId ?? undefined,
 			mohClass: this.mohClassName(extension.mohClassId, subject, "mohClassId"),
 			forwardAllNodeId: extension.forwardAllEnabled
@@ -2732,6 +2733,7 @@ class Compiler {
 				outboundCallerIdNumber: extension.outboundCallerIdNumber ?? undefined,
 				outboundCallerIdName: extension.outboundCallerIdName ?? undefined,
 				emergencyCallerIdNumber: extension.emergencyCallerIdNumber ?? undefined,
+				pickupGroup: pickupGroupOf(extension),
 				nodeId: this.extensionNode(extension),
 			}) as ExtensionIndexEntry;
 		}
@@ -2853,6 +2855,23 @@ function wholeSeconds(value: number | undefined): number {
 
 function greetingKey(voicemailBoxId: string, kind: VoicemailGreetingKind): string {
 	return `${voicemailBoxId}:${kind}`;
+}
+
+/**
+ * An extension's pickup group as the artifact carries it, or `undefined` when it has none.
+ *
+ * Trimmed, and a blank becomes ABSENT rather than a group named `""`. That distinction is the whole
+ * behaviour: absent means "org-wide pickup, as before", and a group of `""` would silently put
+ * every extension a loader left blank into one enormous shared group — which is the old behaviour
+ * wearing a new label, and impossible to tell apart from the intended one when it goes wrong.
+ *
+ * Not lower-cased. `Sales` and `sales` are two groups because an administrator who typed both meant
+ * two things, and case-folding a free-text label is the kind of helpfulness that merges a tenant's
+ * departments without telling anybody. `compact` drops the key when this returns `undefined`.
+ */
+function pickupGroupOf(extension: ExtensionInput): string | undefined {
+	const group = (extension.pickupGroup ?? "").trim();
+	return group.length === 0 ? undefined : group;
 }
 
 /**

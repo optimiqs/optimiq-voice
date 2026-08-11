@@ -275,6 +275,8 @@ describe("kv bucket definitions", () => {
 			"routing-cache",
 			"did-index",
 			"queue-membership",
+			"park-claims",
+			"conference-claims",
 		]);
 	});
 
@@ -316,6 +318,8 @@ describe("kv bucket definitions", () => {
 			"routing-cache",
 			"did-index",
 			"queue-membership",
+			"park-claims",
+			"conference-claims",
 		]) {
 			expect(KV_BUCKETS.find((bucket) => bucket.name === name)?.storage).toBe("file");
 		}
@@ -360,5 +364,41 @@ describe("kvKeyFor", () => {
 	it("rejects a token that would break the key namespace", () => {
 		expect(() => kvKeyFor.routingCache(ORG, "inbound.did")).toThrow(SubjectTokenError);
 		expect(() => kvKeyFor.registration("", "abc")).toThrow(SubjectTokenError);
+	});
+
+	/**
+	 * The claim keys. The ORBIT is the key and not the channel, which is the entire point: two
+	 * instances racing for slot 401 must collide on one key, or they both succeed and the collision
+	 * is discovered by a caller reaching the wrong person.
+	 */
+	it("keys a park claim by its orbit, under its lot", () => {
+		const lot = createEntityId();
+		expect(kvKeyFor.parkClaim(ORG, lot, 401)).toBe(`${ORG}.${lot}.401`);
+	});
+
+	it("gives one lot's orbits a shared prefix, so a lot can be range-read", () => {
+		const lot = createEntityId();
+		expect(kvKeyFor.parkClaim(ORG, lot, 402).startsWith(`${ORG}.${lot}.`)).toBe(true);
+	});
+
+	it("makes two calls in one orbit collide on one key", () => {
+		const lot = createEntityId();
+		expect(kvKeyFor.parkClaim(ORG, lot, 401)).toBe(kvKeyFor.parkClaim(ORG, lot, 401));
+	});
+
+	it("keeps one lot's orbit 401 distinct from another lot's", () => {
+		expect(kvKeyFor.parkClaim(ORG, createEntityId(), 401)).not.toBe(
+			kvKeyFor.parkClaim(ORG, createEntityId(), 401),
+		);
+	});
+
+	it("keys a conference claim by the room id, not by its dialled number", () => {
+		const room = createEntityId();
+		expect(kvKeyFor.conferenceClaim(ORG, room)).toBe(`${ORG}.${room}`);
+	});
+
+	it("rejects a claim token that would break the key namespace", () => {
+		expect(() => kvKeyFor.parkClaim(ORG, "lot.one", 401)).toThrow(SubjectTokenError);
+		expect(() => kvKeyFor.conferenceClaim("", createEntityId())).toThrow(SubjectTokenError);
 	});
 });

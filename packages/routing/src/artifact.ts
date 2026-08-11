@@ -254,6 +254,15 @@ export interface ExtensionIndexEntry {
 	readonly outboundCallerIdNumber?: string;
 	readonly outboundCallerIdName?: string;
 	readonly emergencyCallerIdNumber?: string;
+	/**
+	 * The caller's pickup group, when they are in one.
+	 *
+	 * THE reason this entry is read on the pickup path: a `*8` arrives with nothing but the calling
+	 * party's number, and this index is the only place the engine can turn that number into a group
+	 * without a database. Absent means the caller is in no group, which the engine treats as
+	 * org-wide — the documented fallback, not a refusal.
+	 */
+	readonly pickupGroup?: string;
 	readonly nodeId: PlanNodeId;
 }
 

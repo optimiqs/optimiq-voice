@@ -672,6 +672,26 @@
 			"maxValueSizeBytes": 131072,
 			"maxBytes": 268435456,
 			"numReplicas": 1
+		},
+		{
+			"name": "park-claims",
+			"description": "Orbit-slot ownership across engine instances, taken under compare-and-set.",
+			"ttlMs": 900000,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 4096,
+			"maxBytes": 134217728,
+			"numReplicas": 1
+		},
+		{
+			"name": "conference-claims",
+			"description": "Conference room -> agreed bridge id and member count, under compare-and-set.",
+			"ttlMs": 900000,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 8192,
+			"maxBytes": 134217728,
+			"numReplicas": 1
 		}
 	],
 	"vocabularies": {

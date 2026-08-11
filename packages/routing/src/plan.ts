@@ -109,6 +109,19 @@ export interface ExtensionPlanNode extends PlanNodeBase {
 	readonly recordPolicy: RecordPolicy;
 	readonly timeoutSeconds: number;
 	readonly doNotDisturb: boolean;
+	/**
+	 * The pickup group this extension belongs to, when it has one.
+	 *
+	 * Present means a `*8` from a phone in the SAME group may answer this extension's ringing calls
+	 * and a `*8` from anywhere else may not. Absent means the extension is in no group, and the
+	 * engine falls back to the organization-wide behaviour it has always had — see
+	 * `ExtensionInput.pickupGroup` for why the fallback is that way round and not a refusal.
+	 *
+	 * Carried on the NODE as well as on the index because the two answer different questions: the
+	 * index answers "what group is the caller in?" from a number, and the node is what a call-flow
+	 * inspector renders when somebody asks why their pickup code did nothing.
+	 */
+	readonly pickupGroup?: string;
 	readonly mohClassId?: string;
 	/** The class's NAME, resolved from `mohClassId`. Absent means "the media server's default". */
 	readonly mohClass?: string;

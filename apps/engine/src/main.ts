@@ -27,6 +27,13 @@ import { loadEngineEnv } from "./config/engine-env";
  */
 async function bootstrap(): Promise<void> {
 	const logger = getLogger("engine.bootstrap");
+	// A unique, stable identity for this process's park and conference claims, filled in BEFORE the
+	// env is parsed so the loaded object is the whole truth. The container's hostname is unique per
+	// replica under every orchestrator worth the name, and an instance id shared by two processes
+	// would mean each of them believing it owns the other's orbits.
+	if ((process.env.ENGINE_INSTANCE_ID ?? "") === "" && (process.env.HOSTNAME ?? "") !== "") {
+		process.env.ENGINE_INSTANCE_ID = process.env.HOSTNAME;
+	}
 	const env = loadEngineEnv();
 
 	const app = await NestFactory.create<NestFastifyApplication>(AppModule, new FastifyAdapter(), {

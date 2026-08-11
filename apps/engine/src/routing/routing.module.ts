@@ -1,5 +1,6 @@
 import { Global, Module } from "@nestjs/common";
 import { CallSignalBus } from "./call-signals";
+import { ClaimHeartbeatService } from "./claim-heartbeat.service";
 import { ConferenceRegistry } from "./conference-registry";
 import { DidIndexSource } from "./did-index.source";
 import { ParkRegistry } from "./park-registry";
@@ -22,7 +23,10 @@ import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
  * a second registry would put them in two. {@link ParkRegistry} joins them for the same reason,
  * more sharply: a parked call outlives its walk BY DESIGN, and its retrieval arrives minutes later
  * as a different call from a different phone. Two registries would mean an orbit that is occupied
- * on one and free on the other, which is two callers on slot 401.
+ * on one and free on the other, which is two callers on slot 401. Both are now backed by NATS KV
+ * compare-and-set claims, which is what makes that guarantee hold ACROSS processes as well as within
+ * one; {@link ClaimHeartbeatService} is what binds the buckets to them and keeps this instance's
+ * claims alive.
  *
  * The plan walker itself is NOT a provider: one is constructed per call, over that call's channel
  * and that call's plan, and it holds per-walk state (retry counters, visited nodes, the notes).
@@ -38,6 +42,7 @@ import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
 		VoicemailMailboxRpcSource,
 		ConferenceRegistry,
 		ParkRegistry,
+		ClaimHeartbeatService,
 	],
 	exports: [
 		CallSignalBus,
@@ -46,6 +51,7 @@ import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
 		VoicemailMailboxRpcSource,
 		ConferenceRegistry,
 		ParkRegistry,
+		ClaimHeartbeatService,
 	],
 })
 export class RoutingModule {}

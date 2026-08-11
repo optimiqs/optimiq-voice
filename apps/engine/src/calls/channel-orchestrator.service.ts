@@ -28,12 +28,13 @@ import {
 	hangupCauseFromAri,
 	hangupSideFor,
 } from "./ari-mapping";
-import { CallControl } from "./call-control";
+import { CallControl, pickupGroupFilter } from "./call-control";
 import { CallControlRegistry } from "./call-control-registry";
 import { buildCdrLegWrite } from "./cdr-leg";
 import { ChannelAggregate } from "./channel-aggregate";
 import { callIdForAriChannel, legIdForAriChannel, resolveOrganizationId } from "./channel-identity";
 import { ChannelRegistry } from "./channel-registry";
+import { MidCallFeatureRuntime } from "./mid-call-features";
 import type { MediaPort } from "../ari/media-port";
 import type { EngineEnv } from "../config/engine-env";
 import type {
@@ -125,6 +126,8 @@ export class ChannelOrchestrator {
 	private draining = false;
 	/** Hold, transfer, park, pickup and on-demand recording, over the ports below. */
 	private readonly control: CallControl;
+	/** `*1` / `*3` / `*5` pressed mid-conversation, and the attended-transfer cancel key. */
+	private readonly midCall: MidCallFeatureRuntime;
 
 	constructor(
 		@Inject(ENGINE_ENV) private readonly env: EngineEnv,
@@ -151,10 +154,27 @@ export class ChannelOrchestrator {
 			signals: this.signals,
 			parks: this.parks,
 			host: this.callControlHost(),
+			// A getter rather than the runtime itself: `this.midCall` is built from `this.control`, so
+			// it does not exist yet at this point in the constructor.
+			consultationKeys: {
+				arm: (mediaChannelId, digit) => {
+					this.midCall.armCancelKey(mediaChannelId, digit);
+				},
+				disarm: (mediaChannelId) => {
+					this.midCall.disarmCancelKey(mediaChannelId);
+				},
+			},
 			settings: {
 				application: this.env.ARI_APP,
 				recordingFormat: this.env.ENGINE_RECORDING_FORMAT,
 			},
+			log: (message, detail) => {
+				this.logger.info(detail ?? {}, message);
+			},
+		});
+		this.midCall = new MidCallFeatureRuntime({
+			control: this.control,
+			artifactFor: async (organizationId) => await this.routing.get(organizationId),
 			log: (message, detail) => {
 				this.logger.info(detail ?? {}, message);
 			},
@@ -740,7 +760,7 @@ export class ChannelOrchestrator {
 	private callControlHost(): CallControlHost {
 		return {
 			legFor: (mediaChannelId) => this.controlledLegFor(mediaChannelId),
-			ringingFor: (leg, extension) => this.ringingCandidates(leg, extension),
+			ringingFor: async (leg, extension) => await this.ringingCandidates(leg, extension),
 			publish: async (leg, type, data) => {
 				const aggregate = this.registry.byDomainChannelId(leg.legId);
 				if (aggregate === undefined) {
@@ -876,17 +896,37 @@ export class ChannelOrchestrator {
 	 * `OPTIMIQ_ORIGINATING_LEG_ID`. A candidate with no live originator is skipped rather than
 	 * offered — picking one up would connect the picker to nobody.
 	 *
-	 * ## Group pickup is org-wide, and that is a stated limitation
+	 * ## Group pickup is restricted to the caller's own group
 	 *
-	 * `*8` should take whatever is ringing in the caller's own PICKUP GROUP, and the artifact carries
-	 * no pickup-group membership: `extension.pickup_group` is not compiled into it. So a group pickup
-	 * here answers whatever is ringing in the organization, longest-ringing first. On a small tenant
-	 * that is the same answer; on a large one it is too broad, and it is recorded here rather than in
-	 * a ticket because the failure is a receptionist answering the warehouse's call, which reads as a
-	 * phone-system bug and is not one.
+	 * `*8` means "answer whatever is ringing IN MY GROUP", and the group now survives compilation:
+	 * `extension.pickup_group` lands on the extension node and on `extensionsByNumber`, which is what
+	 * lets this method turn the caller's number into a group with no database on the call path.
+	 *
+	 * The rule, and each half is deliberate:
+	 *
+	 * - The caller is in a group, and the ringing extension is in one → the groups must MATCH. This
+	 *   is the case the feature exists for, and without it a receptionist answers the warehouse's
+	 *   call, which reads as a phone-system bug and is not one.
+	 * - The ringing extension is in NO group → it is available to anybody. Org-wide is the documented
+	 *   fallback, and it is the behaviour every extension had before groups were compiled; making an
+	 *   ungrouped extension unpickable instead would take a working feature away from every tenant
+	 *   who has not configured groups yet.
+	 * - The CALLER is in no group but the target is → refused. The caller has no group to match, and
+	 *   letting them into every group would make the restriction decorative: an admin who groups half
+	 *   their extensions expects the other half to be outside those groups, not inside all of them.
+	 *
+	 * A DIRECTED pickup (`**<ext>`) is not filtered at all. The caller named one specific extension,
+	 * which is a different intent from "whatever is ringing near me" — upstream systems treat it the
+	 * same way, and a directed pickup that silently refused would look like the target was not
+	 * ringing.
 	 */
-	private ringingCandidates(leg: ControlledLeg, extension: string): readonly PickupCandidate[] {
+	private async ringingCandidates(
+		leg: ControlledLeg,
+		extension: string,
+	): Promise<readonly PickupCandidate[]> {
 		const wanted = extension.trim();
+		const directed = wanted !== "";
+		const groups = directed ? undefined : await this.pickupGroups(leg);
 		const candidates: PickupCandidate[] = [];
 
 		for (const aggregate of this.registry.all) {
@@ -898,7 +938,11 @@ export class ChannelOrchestrator {
 			) {
 				continue;
 			}
-			if (wanted !== "" && aggregate.snapshot.profile.destinationNumber !== wanted) {
+			const ringingNumber = aggregate.snapshot.profile.destinationNumber;
+			if (directed && ringingNumber !== wanted) {
+				continue;
+			}
+			if (groups !== undefined && !groups(ringingNumber)) {
 				continue;
 			}
 			const originatorLegId = aggregate.snapshot.variables.OPTIMIQ_ORIGINATING_LEG_ID;
@@ -917,6 +961,21 @@ export class ChannelOrchestrator {
 		}
 
 		return candidates.sort((left, right) => left.ringingSinceMs - right.ringingSinceMs);
+	}
+
+	/**
+	 * The group filter for a group pickup, or `undefined` when this organization has no groups.
+	 *
+	 * The rule itself is {@link pickupGroupFilter} in `call-control.ts`, spec'd there. This method is
+	 * only the artifact fetch, which is the part that needs the orchestrator.
+	 */
+	private async pickupGroups(
+		leg: ControlledLeg,
+	): Promise<((ringingNumber: string | undefined) => boolean) | undefined> {
+		const artifact = await this.routing.get(leg.organizationId);
+		return artifact === undefined
+			? undefined
+			: pickupGroupFilter(artifact.extensionsByNumber, leg.callerIdNumber);
 	}
 
 	/** The lot a park should use: the one named, or the organization's only one. */
@@ -1327,8 +1386,23 @@ export class ChannelOrchestrator {
 		}
 
 		const event = dtmfEventFrom({ digit: digit.toUpperCase(), durationMs });
-		this.dtmf.forChannel(aggregate.channelId).push(event);
 
+		// The mid-call runtime gets first refusal, and ONLY when nothing is collecting: a running
+		// `gather` is an application that asked for these digits, and handing one to a feature code
+		// instead would break every IVR whose menu uses a star. The runtime itself refuses any leg
+		// that is not bridged, which is the second half of the same guard.
+		const inbox = this.dtmf.forChannel(aggregate.channelId);
+		const consumed =
+			!inbox.isCollecting &&
+			(await this.midCall.offer(this.controlledLeg(aggregate), event.digit)) === "consumed";
+		if (!consumed) {
+			inbox.push(event);
+		}
+
+		// Published either way, and with no marker saying which. `channel.dtmf` is the record of what
+		// the party PRESSED — a report that omitted the digits the switch acted on would be missing
+		// exactly the interesting ones — and adding a `consumedBy` would be a wire-contract change
+		// (schema, codegen, Go parity) for something the engine log already carries.
 		await this.events.publish("channel.dtmf", {
 			orgId: aggregate.organizationId,
 			callId: aggregate.callId,
@@ -1462,6 +1536,7 @@ export class ChannelOrchestrator {
 			return;
 		}
 		this.dtmf.release(aggregate.channelId);
+		this.midCall.release(aggregate.channelId);
 	}
 
 	/**
@@ -1507,6 +1582,7 @@ export class ChannelOrchestrator {
 		});
 
 		this.dtmf.release(aggregate.channelId);
+		this.midCall.release(aggregate.channelId);
 
 		aggregate.tryTransitionTo("hangup");
 		aggregate.tryCallStateTo("hangup");

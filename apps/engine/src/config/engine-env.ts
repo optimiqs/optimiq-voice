@@ -206,6 +206,28 @@ export const engineEnvSchema = z.object({
 
 	/** Container voicemail is recorded in. `wav` is what every downstream tool can already read. */
 	ENGINE_RECORDING_FORMAT: z.enum(["wav", "gsm", "ulaw", "alaw", "g722"]).default("wav"),
+
+	/**
+	 * This process's identity in the shared park and conference claims.
+	 *
+	 * Written into every claim, and the thing that decides whether a claim is this instance's to
+	 * release or renew. It must be UNIQUE per running process and STABLE for that process's life: two
+	 * instances sharing an id would each believe they own the other's orbits, which is exactly the
+	 * state the claims exist to make impossible.
+	 *
+	 * Defaulted rather than required because an operator who does not set it should still get a
+	 * working single-instance deployment. `main.ts` fills it from the container's hostname when the
+	 * variable is unset, which is unique per replica under every orchestrator worth the name.
+	 */
+	ENGINE_INSTANCE_ID: z.string().min(1).max(128).default("engine"),
+
+	/**
+	 * How often this process pushes its claims' expiry forward.
+	 *
+	 * A third of the claim lease, so a claim survives two missed heartbeats — a broker blip must not
+	 * cost a tenant an orbit that is holding a live caller.
+	 */
+	ENGINE_CLAIM_HEARTBEAT_MS: z.coerce.number().int().min(1_000).max(300_000).default(30_000),
 });
 
 export type EngineEnv = z.infer<typeof engineEnvSchema>;
