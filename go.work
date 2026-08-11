@@ -7,12 +7,13 @@
 //
 //	packages/events-go   generated + hand-written NATS contract (peer of @optimiq-voice/events)
 //	apps/sipd            SIP edge: registrar today, proxy next; retires Routr in P6
-//	apps/mediad          NOT YET — RTP/media plane on Pion; add its `use` line when it lands
+//	apps/mediad          RTP/media plane on Pion; walking skeleton today — see plans/mediad-design.md
 //
 //	go work sync && go build ./... && go test ./...
 go 1.26
 
 use (
+	./apps/mediad
 	./apps/sipd
 	./packages/events-go
 )
