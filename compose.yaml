@@ -213,6 +213,31 @@ services:
       # Static SIP credentials for two demo extensions. Off unless set to
       # `true`; see apps/asterisk/config/pjsip_dev_endpoints.conf.
       OPTIMIQ_DEV_ENDPOINTS: ${OPTIMIQ_DEV_ENDPOINTS:-false}
+      # SIP-TLS and SDES-SRTP. Off by default, and off means the transport is not declared at all
+      # (`run.sh` removes `pjsip_tls.conf`) rather than declared and broken.
+      #
+      # Turning it on takes two things, not one: `SIP_TLS_ENABLED=true` AND certificate material
+      # readable at the two paths below. There is no code path that generates production material —
+      # it is an operator mount, e.g.
+      #
+      #   volumes:
+      #     - /etc/optimiq/sip-certs:/etc/asterisk/certs:ro
+      #
+      # `compose.tls.yaml` is the development equivalent, mounting `config/certs` from
+      # `./config/certs/generate-dev-certs.sh`. `run.sh` REFUSES TO START when the flag is true and
+      # the certificate is missing, so a half-configured box never falls back to plaintext quietly.
+      SIP_TLS_ENABLED: ${SIP_TLS_ENABLED:-false}
+      SIP_TLS_BINDADDR: ${SIP_TLS_BINDADDR:-0.0.0.0:5061}
+      SIP_TLS_CERT_FILE: ${SIP_TLS_CERT_FILE:-/etc/asterisk/certs/asterisk.pem}
+      SIP_TLS_PRIV_KEY_FILE: ${SIP_TLS_PRIV_KEY_FILE:-/etc/asterisk/certs/asterisk-key.pem}
+      SIP_TLS_CA_FILE: ${SIP_TLS_CA_FILE:-}
+      SIP_TLS_METHOD: ${SIP_TLS_METHOD:-tlsv1_2}
+      SIP_TLS_VERIFY_SERVER: ${SIP_TLS_VERIFY_SERVER:-no}
+      SIP_ENDPOINT_TRANSPORT: ${SIP_ENDPOINT_TRANSPORT:-transport-tcp}
+      SIP_MEDIA_ENCRYPTION_OPTIMISTIC: ${SIP_MEDIA_ENCRYPTION_OPTIMISTIC:-yes}
+      # Where run.sh looks for the generated `acl/acl.conf` — the CIDR ACLs rendered from
+      # `sip_acl_entry`. The same object root the hold-music classes already arrive through.
+      OPTIMIQ_MEDIA_OBJECT_ROOT: ${OPTIMIQ_MEDIA_OBJECT_ROOT:-/var/lib/optimiq/objects}
     expose:
       - 6060
 

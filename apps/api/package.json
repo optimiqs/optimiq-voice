@@ -17,6 +17,7 @@
 		"db:generate": "drizzle-kit generate --config drizzle.config.ts",
 		"emit:sip-vectors": "tsx scripts/emit-sip-derivation-vectors.ts",
 		"generate:musiconhold": "tsx scripts/generate-musiconhold.ts",
+		"generate:sip-acl": "tsx scripts/generate-sip-acl.ts",
 		"prebuild": "rimraf ./dist tsconfig.tsbuildinfo tsconfig.build.tsbuildinfo",
 		"rebuild:did-index": "tsx scripts/rebuild-did-index.ts",
 		"rebuild:queue-membership": "tsx scripts/rebuild-queue-membership.ts",

@@ -47,6 +47,18 @@ describe("tenant tables", () => {
 		expect(new Set(names).size).toBe(names.length);
 	});
 
+	/**
+	 * `user_setting` was a cascade level nothing read. It is gone, and this is here so it cannot
+	 * come back as a table before the thing that would read it does — a user-scoped setting
+	 * catalogue, an `.own` permission pair and a resolver. See `settings-schema.ts`.
+	 */
+	it("registers no settings level below the organization", () => {
+		const names = tables.map((table) => getTableName(table));
+		expect(names).toContain("org_setting");
+		expect(names).not.toContain("user_setting");
+		expect(Object.keys(pbxTables)).not.toContain("userSetting");
+	});
+
 	it("scopes every table to an organization and enables row-level security", () => {
 		for (const table of tables) {
 			const config = getTableConfig(table);

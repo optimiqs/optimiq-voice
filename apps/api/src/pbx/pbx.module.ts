@@ -55,6 +55,11 @@ import { RoutingCachePublisher } from "./routing/routing-cache.publisher";
 import { RoutingRpcController } from "./routing/routing-rpc.controller";
 import { RoutingController } from "./routing/routing.controller";
 import { RoutingService } from "./routing/routing.service";
+import { SipAclEntriesController } from "./security/sip-acl.controller";
+import { SipAclEntriesService } from "./security/sip-acl.service";
+import { SipAuthEventQueryService } from "./security/sip-auth-event-query.service";
+import { SipAuthEventController } from "./security/sip-auth-event.controller";
+import { SipAuthEventService } from "./security/sip-auth-event.service";
 import { AuditLogService } from "./shared/audit-log.service";
 import { createPbxDatabase } from "./shared/pbx-database";
 import { loadPbxEnv } from "./shared/pbx-env";
@@ -199,6 +204,16 @@ const logger = getLogger("api.pbx");
 		 * no write for a controller to expose.
 		 */
 		AuditLogController,
+		/**
+		 * The SIP edge's network policy, and the record of what it refused.
+		 *
+		 * Two controllers rather than one because they are two lifecycles on the same subject, in the
+		 * shape this area already uses for `/voicemail-boxes`: `sip_acl_entry` is ordinary read-write
+		 * CRUD through the Effect repository, and `sip_auth_event` is an append-only ledger with no
+		 * write surface at all — the same split as `AuditLogController` beside the rest of the area.
+		 */
+		SipAclEntriesController,
+		SipAuthEventController,
 		/**
 		 * The carrier slice mounts unconditionally, even without a `TELNYX_API_KEY`.
 		 *
@@ -487,6 +502,17 @@ const logger = getLogger("api.pbx");
 		VoicemailTranscriptionSweeper,
 		VoicemailConsumer,
 		RoutingService,
+		SipAclEntriesService,
+		/**
+		 * The attack log's writer and its reader, on the same terms as the change ledger's pair below:
+		 * two classes sharing a table and nothing else, so a reader cannot reach the writer's insert.
+		 *
+		 * `SipAuthEventService` is EXPORTED because the surfaces that refuse an authentication attempt
+		 * do not all live in this module — `ProvisioningModule` owns the one endpoint on this platform
+		 * that answers without a session, and it is therefore the surface with the most to record.
+		 */
+		SipAuthEventService,
+		SipAuthEventQueryService,
 		/**
 		 * The ledger READER, beside the writer it never talks to.
 		 *
@@ -499,6 +525,7 @@ const logger = getLogger("api.pbx");
 	],
 	exports: [
 		AuditLogService,
+		SipAuthEventService,
 		OrgSettingsService,
 		PBX_ENV,
 		PBX_DATABASE,

@@ -1,9 +1,11 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
+import { SipAuthEventService } from "../../pbx/security/sip-auth-event.service";
 import { resolveSettings } from "../catalog/cascade";
 import { modelDefaults, templateFor } from "../catalog/catalog";
 import { renderWith } from "../catalog/template";
 import { softphonePayload } from "../catalog/templates/softphone";
+import { resolveLinePort, resolveLineTransport } from "../catalog/transport-preference";
 import { isRenderConfigured } from "../provisioning-env";
 import { PROVISIONING_ENV } from "../provisioning.tokens";
 import { ProvisioningRateLimiter } from "./provision-rate-limit";
@@ -30,6 +32,7 @@ import type { VendorTemplate } from "../catalog/template";
 import type { SoftphonePayload } from "../catalog/templates/softphone";
 import type { ProvisioningEnv } from "../provisioning-env";
 import type { RenderSnapshot, TokenLookup } from "./provision.repository";
+import type { SipAuthEventType } from "@optimiq-voice/pbx-db";
 
 const logger = getLogger("api.provisioning");
 
@@ -79,6 +82,7 @@ export class ProvisionService {
 		@Inject(ProvisionEventPublisher) private readonly events: ProvisionEventPublisher,
 		@Inject(PROVISIONING_ENV) private readonly env: ProvisioningEnv,
 		@Inject(ProvisioningRateLimiter) private readonly limiter: ProvisioningRateLimiter,
+		@Inject(SipAuthEventService) private readonly authEvents: SipAuthEventService,
 	) {}
 
 	/** The vendor-format configuration a desk phone fetches. */
@@ -243,6 +247,20 @@ export class ProvisionService {
 		const sipServer = this.env.PROVISION_SIP_SERVER as string;
 		const rootKey = this.env.PROVISION_SIP_SECRET_KEY as string;
 
+		/**
+		 * The settings cascade, resolved ONCE and before the lines.
+		 *
+		 * It has to come first because the organization's transport preference is one of the values a
+		 * line reads (`catalog/transport-preference.ts`), and because resolving it per line would run
+		 * the same four-level merge once per account for an identical answer.
+		 */
+		const settings = resolveSettings({
+			model: modelDefaults(snapshot.device.vendor),
+			organization: snapshot.organizationSettings,
+			profile: snapshot.profile?.settings,
+			device: snapshot.device.settings,
+		});
+
 		const lines: RenderLine[] = [];
 		for (const row of snapshot.lines) {
 			if (!row.line.enabled) {
@@ -278,8 +296,16 @@ export class ProvisionService {
 				authUser: row.line.authUser ?? registerUser,
 				password: deriveSipPassword({ rootKey, organizationId, secretRef }),
 				serverAddress: row.line.serverAddress ?? sipServer,
-				serverPort: row.line.serverPort,
-				transport: row.line.transport,
+				/**
+				 * The port and the transport, after the organization's preference.
+				 *
+				 * Both default to the line's own column, so a deployment that has set neither setting
+				 * renders exactly what it rendered before the preference existed — which is the whole
+				 * migration story: a fleet of provisioned phones must not change behaviour on its next
+				 * reprovision because a feature landed.
+				 */
+				serverPort: resolveLinePort(settings, row.line.serverPort),
+				transport: resolveLineTransport(settings, row.line.transport),
 				outboundProxy: this.env.PROVISION_SIP_OUTBOUND_PROXY,
 				registerExpiresSeconds: row.line.registerExpiresSeconds,
 				sharedLine: row.line.sharedLine,
@@ -305,12 +331,7 @@ export class ProvisionService {
 			label: snapshot.device.label ?? undefined,
 			lines,
 			keys: mergeKeys(snapshot),
-			settings: resolveSettings({
-				model: modelDefaults(snapshot.device.vendor),
-				organization: snapshot.organizationSettings,
-				profile: snapshot.profile?.settings,
-				device: snapshot.device.settings,
-			}),
+			settings,
 			sipDomain: sipServer,
 			payloadUrl:
 				this.env.PROVISION_BASE_URL === undefined
@@ -393,6 +414,68 @@ export class ProvisionService {
 			reason,
 			detail,
 		} as never);
+
+		/**
+		 * And into the attack log, when the refusal is one.
+		 *
+		 * This is the one seam in the whole API that already has everything the ledger needs — the
+		 * tenant, the reason, the source address and the identity that was attempted — which is why
+		 * the recording hangs here rather than at each of the eight `throw` sites above.
+		 *
+		 * `authEventTypeFor` returns `undefined` for the refusals that are NOT authentication
+		 * failures, and that filter is the point. `not-configured` is a deployment missing a
+		 * variable; `unknown-vendor` is a template gap. Filing either as an attack would put the
+		 * platform's own misconfiguration into the feed an operator scans for intrusions and reads
+		 * source addresses out of, which is how a security log becomes noise nobody looks at.
+		 *
+		 * Awaited, and it cannot fail: `SipAuthEventService.record` swallows and logs its own errors
+		 * so that a database problem during an attack cannot change the refusal the caller receives.
+		 */
+		const eventType = authEventTypeFor(reason);
+		if (eventType !== undefined) {
+			await this.authEvents.record({
+				organizationId: found.organizationId,
+				eventType,
+				scope: "provisioning",
+				sourceIp: request.sourceIp,
+				// The MAC, not the token or any part of it: this column names WHO was attempted, and a
+				// token is a credential. `security-schema.ts` states the rule.
+				accountRef: found.macAddress,
+				transport: "https",
+				userAgent: request.userAgent,
+				detail: { reason, detail, deviceId: found.id, path: request.path ?? null },
+			});
+		}
+	}
+}
+
+/**
+ * Which refusals are authentication failures, and which are ours.
+ *
+ * The mapping is deliberately partial. Only four of the nine reasons describe something a CALLER
+ * did wrong in a way a security responder would want to see; the rest describe the state of this
+ * deployment, and `security-schema.ts` explains why mixing the two ruins the feed.
+ *
+ * `missing-token` and `unknown-mac` are absent for a different reason again — they are raised
+ * before a tenant is known, so there is no organization to file the row under and no `reject` call
+ * to reach this function. Those get the `warn` log lines above, which is what a platform operator
+ * watches for enumeration.
+ */
+function authEventTypeFor(reason: ProvisionRejectReason): SipAuthEventType | undefined {
+	switch (reason) {
+		case "invalid-token":
+			return "token-invalid";
+		case "rate-limited":
+			return "rate-limited";
+		case "ip-not-allowed":
+			return "acl-denied";
+		case "disabled":
+			// A disabled device whose token still works is a credential that outlived its authorisation,
+			// which is precisely the case an attack log exists to surface — and precisely why it is not
+			// filed as `unknown-account`. See the type's own note.
+			return "disabled-account";
+		default:
+			return undefined;
 	}
 }
 

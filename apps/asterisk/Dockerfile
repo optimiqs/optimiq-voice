@@ -12,10 +12,18 @@ COPY run.sh /
 # pins astdatadir to match.
 COPY sounds/ /usr/share/asterisk/sounds/en
 
-RUN apk add --no-cache --update asterisk asterisk-curl tini \
+# `asterisk-srtp` carries res_srtp.so, which is what makes `media_encryption = sdes` in
+# pjsip_tls.conf actually emit an `a=crypto` line. Without it the setting parses, the call sets up,
+# and the media is plaintext — the failure that looks like success. modules.conf lists the module
+# explicitly so a build that lost this package fails at startup rather than at call time.
+RUN apk add --no-cache --update asterisk asterisk-curl asterisk-srtp tini \
  && chmod +x /run.sh \
  && chown -R asterisk:asterisk /etc/asterisk \
  && chown -R asterisk:asterisk /usr/share/asterisk/sounds \
+ # logger.conf writes the Security Events feed to /var/log/asterisk/security. The process runs as
+ # `asterisk`, so the directory has to be writable by it or the channel is silently not opened.
+ && mkdir -p /var/log/asterisk \
+ && chown -R asterisk:asterisk /var/log/asterisk \
  && chown asterisk:asterisk /run.sh
 
 USER asterisk:asterisk

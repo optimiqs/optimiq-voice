@@ -65,6 +65,54 @@ Environment variables are used in the entry point script to render configuration
 - `OPTIMIQ_DEV_ORG_ID` - Organization UUID stamped onto every channel entering the `optimiq-*` contexts. **No default**: unset means the engine rejects inbound calls with `INVALID_PROFILE`, which is correct for a box nobody has assigned to a tenant. Development only — production resolves the org from the DID (see `apps/engine/README.md` §"Known gaps")
 - `OPTIMIQ_DEV_ENDPOINTS` - `true` keeps `pjsip_dev_endpoints.conf`, two registrable extensions (1001 / 1002) with **static credentials that are in version control**. Anything else deletes the file at startup. Defaults to off
 
+### SIP-TLS and SRTP
+
+- `SIP_TLS_ENABLED` - `true` declares the TLS transport. Anything else deletes `pjsip_tls.conf` at startup, exactly as `OPTIMIQ_DEV_ENDPOINTS` does, because a `[transport-tls]` whose certificate is absent does not degrade — res_pjsip fails the transport and logs it once. Defaults to off
+- `SIP_TLS_BINDADDR` - Where to listen for SIP-TLS. Defaults to `0.0.0.0:5061`, the registered SIPS port. The plaintext transport stays on `SIP_BINDADDR`, so turning TLS on adds a listener and never moves one
+- `SIP_TLS_CERT_FILE` / `SIP_TLS_PRIV_KEY_FILE` - Paths **inside the container**. Default to `/etc/asterisk/certs/asterisk.pem` and `…/asterisk-key.pem`. **`run.sh` exits non-zero** when `SIP_TLS_ENABLED=true` and either is unreadable — a box that asked for TLS must never come up quietly on cleartext
+- `SIP_TLS_CA_FILE` - CA bundle for the leg where Asterisk is the TLS _client_ (an outbound trunk). Empty by default, and empty means the `ca_list_file` line is removed rather than blanked
+- `SIP_TLS_METHOD` - TLS floor, not ceiling. Defaults to `tlsv1_2`, which pjproject reads as "1.2 or better"
+- `SIP_TLS_VERIFY_SERVER` - Verify a carrier's certificate on an outbound TLS trunk. Defaults to `no`. There is no `verify_client` knob: mutual TLS would need a client certificate on every handset, which this platform has no lifecycle for — a phone is authenticated by SIP digest over the encrypted channel
+- `SIP_TLS_MEDIA_ENCRYPTION` - What the `[optimiq-endpoint-tls]` template offers. Defaults to `sdes`
+- `SIP_MEDIA_ENCRYPTION_OPTIMISTIC` - `yes` (default) offers SRTP and accepts a plain answer; `no` makes it mandatory and a handset that cannot do it fails media setup visibly
+- `SIP_ENDPOINT_TRANSPORT` - Which transport the static dev extensions bind to. Defaults to `transport-tcp`; `transport-tls` requires `SIP_TLS_ENABLED=true` and `run.sh` refuses the contradiction
+- `SIP_MEDIA_ENCRYPTION` - What the dev extensions offer. **Derived**, not defaulted: `sdes` when their transport is TLS, `no` otherwise. An `a=crypto` line in an SDP that crossed the network in the clear publishes the media key
+
+Development certificates come from `./config/certs/generate-dev-certs.sh`, which signs an `asterisk` leaf (SANs `asterisk`, `localhost`, `asterisk.optimiq.local`, `127.0.0.1`, plus `DOCKER_HOST_ADDRESS`) under the same private CA as the broker's. `compose.tls.yaml` mounts them and turns the flag on:
+
+```sh
+DOCKER_HOST_ADDRESS=$(ipconfig getifaddr en0) ./config/certs/generate-dev-certs.sh
+docker compose -f compose.yaml -f compose.dev.yaml -f compose.tls.yaml up asterisk -d
+
+openssl s_client -connect localhost:5061 -servername asterisk -CAfile config/certs/ca.pem
+```
+
+Production is an operator mount of real material at the same two paths. Nothing in this repository generates a production key.
+
+### Network ACLs
+
+`acl.conf` is generated from the `sip_acl_entry` table:
+
+```sh
+PBX_DATABASE_URL=… PBX_MEDIA_OBJECT_ROOT=… pnpm --filter @optimiq-voice/api generate:sip-acl
+```
+
+It writes `<PBX_MEDIA_OBJECT_ROOT>/acl/acl.conf` — the same object store the hold-music classes arrive through, so tenant ACLs need no second mount — and `run.sh` copies it over the baked fallback at start. To apply a change without a restart:
+
+```sh
+docker compose exec asterisk asterisk -rx 'module reload res_pjsip.so'
+```
+
+`res_pjsip`, not `acl reload`: an endpoint caches the ACL object it resolved at load, so refreshing the names alone leaves it filtering by the old rules.
+
+The named ACLs attach to **endpoints**, not to transports — the PJSIP `transport` object has no ACL option, and a transport-level `acl =` makes res_pjsip refuse to create the transport. `optimiq-registration` is referenced from every registering endpoint's `acl` **and** `contact_acl` (the second is the toll-fraud one: a device that authenticates legitimately and then registers a Contact pointing at a third-party host has made this platform a relay); `optimiq-trunk` from the carrier wizard's `endpoint/acl`.
+
+The baked `acl.conf` declares both names as permit-all, so a deployment that has never run the generator is filtered by nothing — which is what it was before the ACLs existed, and the only safe direction for a fallback.
+
+### The security log
+
+`logger.conf` writes Asterisk's Security Events feed (`InvalidAccountID`, `InvalidPassword`, `FailedACL`, …) to `/var/log/asterisk/security`, which is where fail2ban's stock Asterisk jail already looks. Nothing in Asterisk blocks an address by itself — that is a fail2ban/CrowdSec jail, and it is a deployment decision. The API-side ledger (`sip_auth_event`, `GET /api/v1/sip-auth-events`) records the failures `apps/api` observes directly today; shipping this file's lines into the same table is the follow-up, because `apps/api` has no AMI client and port 5038 is not exposed.
+
 ## Dialplan contexts
 
 | Context            | Purpose                                                                          |
@@ -110,7 +158,8 @@ connection id in `trunk.carrier_ref`.
 
 ## Exposed ports
 
-- `6060` - Default SIP port
+- `6060` - Default SIP port (TCP)
+- `5061` - SIP-TLS, only when `SIP_TLS_ENABLED=true`
 - `8088` - ARI / HTTP port (see `http.conf`)
 
 ## Asterisk version

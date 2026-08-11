@@ -82,8 +82,21 @@ describe("org settings catalogue", () => {
 		]);
 	});
 
-	it("lists both catalogued categories", () => {
-		expect([...CATALOGUED_CATEGORIES].sort()).to.deep.equal(["notifications", "routing"]);
+	/**
+	 * Three now, not two: `provision` joined when the SIP transport preference landed.
+	 *
+	 * Worth noting why the category is only PARTIALLY catalogued, since the assertion below cannot
+	 * see it. `provision.repository.ts` reads the whole category and hands it to a device template,
+	 * so a vendor parameter this codebase has never heard of is a legitimate row and must keep
+	 * working. Only the two keys the platform itself reads — `sipTransport` and `sipPort` — are
+	 * declared, which is the rule `org-settings.catalog.ts` states for exactly this case.
+	 */
+	it("lists the catalogued categories", () => {
+		expect([...CATALOGUED_CATEGORIES].sort()).to.deep.equal([
+			"notifications",
+			"provision",
+			"routing",
+		]);
 	});
 
 	it("exposes a zod-free catalogue to clients", () => {

@@ -138,6 +138,36 @@ export const PERMISSIONS = [
 	 */
 	"audit.read",
 
+	/**
+	 * The SIP edge's network policy: CIDR allow/deny entries, and the authentication-failure log.
+	 *
+	 * Its own resource rather than a ride on `settings.*`, on exactly the argument the audit entry
+	 * above makes. `settings.read` is held by every self-service role so a user's preferences
+	 * screen renders; `security.write` is the ability to open the platform's SIP surface to an
+	 * arbitrary network, which is the same privilege class as issuing credentials and belongs
+	 * nowhere near the narrowest role in the registry.
+	 *
+	 * TWO entries, and the count was fought for — the registry carries a size ceiling with an
+	 * instruction attached ("prove the existing grants cannot express the boundary"), so here is the
+	 * proof for two and the argument against the other two that were drafted.
+	 *
+	 * There is no `security.delete`. An ACL entry is a rule, not a record: removing one and
+	 * disabling one are the same act with the same consequence, so a separate delete grant would be
+	 * a distinction a reviewer cannot act on. That is the opposite of the entity resources, where a
+	 * delete destroys history somebody may need.
+	 *
+	 * There is no separate grant for the attack log either, and that WAS drafted. The case for
+	 * splitting it is that a stream of source addresses and attempted account names is a different
+	 * kind of sensitive from a configuration table. The case against — which wins — is that it is
+	 * not a different AUDIENCE or a different blast radius: the allowlist itself already discloses
+	 * which networks reach this platform, the two are read by the same person answering the same
+	 * question during the same incident, and a role that could see the refusals but not the rule
+	 * that caused them would be a role that cannot finish the investigation. `security.read` covers
+	 * both.
+	 */
+	"security.read",
+	"security.write",
+
 	// --- Platform and tenancy ------------------------------------------------
 	"settings.read",
 	"settings.write",
@@ -652,6 +682,27 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 				label: "View the audit log",
 				description:
 					"Search the organization's change history and read the before/after of each change.",
+			},
+		],
+	},
+	{
+		resource: "security",
+		label: "Security",
+		description:
+			"Network access control for the SIP edge, and the record of failed authentication attempts.",
+		permissions: [
+			{
+				permission: "security.read",
+				label: "View network security",
+				description:
+					"Inspect the CIDR allow and deny entries that guard registration and trunks, and read " +
+					"the log of refused authentication attempts.",
+			},
+			{
+				permission: "security.write",
+				label: "Manage network ACLs",
+				description:
+					"Create and edit CIDR rules. Opening a network here lets it reach the SIP authenticator.",
 			},
 		],
 	},

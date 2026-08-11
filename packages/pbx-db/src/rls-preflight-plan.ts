@@ -5,7 +5,7 @@ import {
 	type TenantRlsPreflightPlan,
 	type TenantRlsTableExpectation,
 } from "@optimiq-voice/db";
-import { auditLog } from "./schema/security-schema";
+import { auditLog, sipAuthEvent } from "./schema/security-schema";
 import { pbxTables } from "./schema/tables";
 import { pbxTenantContext } from "./tenant";
 
@@ -18,7 +18,10 @@ import { pbxTenantContext } from "./tenant";
  */
 
 /** Ledgers: `SELECT` + `INSERT` only, two policies, no UPDATE/DELETE privilege. */
-export const PBX_APPEND_ONLY_TABLES: readonly string[] = [getTableName(auditLog)];
+export const PBX_APPEND_ONLY_TABLES: readonly string[] = [
+	getTableName(auditLog),
+	getTableName(sipAuthEvent),
+];
 
 function expectationFor(table: string): TenantRlsTableExpectation {
 	return PBX_APPEND_ONLY_TABLES.includes(table)

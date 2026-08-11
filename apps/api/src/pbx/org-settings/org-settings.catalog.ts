@@ -1,5 +1,10 @@
 import { z } from "zod/v4";
 import { SETTING_VALUE_TYPES } from "@optimiq-voice/pbx-db";
+import {
+	SIP_PORT_SETTING,
+	SIP_TRANSPORT_PREFERENCES,
+	SIP_TRANSPORT_SETTING,
+} from "../../provisioning/catalog/transport-preference";
 import { ROUTING_SETTINGS_CATEGORY } from "../routing/snapshot-loader";
 import type { SettingValueType } from "@optimiq-voice/pbx-db";
 
@@ -36,6 +41,16 @@ import type { SettingValueType } from "@optimiq-voice/pbx-db";
  */
 
 export const NOTIFICATION_SETTINGS_CATEGORY = "notifications";
+
+/**
+ * The category `provision.repository.ts` already reads whole and hands to a device template.
+ *
+ * Catalogued for the first time here, and only two of its keys are. That is the rule this file's
+ * header states: the `provision` category is genuinely open-ended — a vendor parameter this
+ * codebase has never heard of is a legitimate row — so catalogue only the keys the PLATFORM reads,
+ * and let the rest through with whatever `valueType` the caller declares.
+ */
+export const PROVISION_SETTINGS_CATEGORY = "provision";
 
 export interface SettingDescriptor {
 	readonly category: string;
@@ -254,10 +269,52 @@ export const ROUTING_SETTINGS: readonly SettingDescriptor[] = [
 	}),
 ];
 
+/**
+ * The two provisioning settings the platform itself reads.
+ *
+ * They are the fleet's migration path onto SIP-TLS, and they are catalogued rather than left as
+ * free-form `provision` rows for a specific reason: a typo in `sipTransport` is a fleet that keeps
+ * registering in the clear while the settings screen shows TLS selected. A catalogued key is
+ * validated on write and a wrong value is a 400.
+ *
+ * See `provisioning/catalog/transport-preference.ts` for why the default is `inherit` rather than
+ * `udp`, why the org level overrides the per-line column rather than defaulting it, and why the
+ * port is a separate setting instead of being inferred from the transport.
+ */
+export const PROVISION_SETTINGS: readonly SettingDescriptor[] = [
+	descriptor({
+		category: PROVISION_SETTINGS_CATEGORY,
+		name: SIP_TRANSPORT_SETTING,
+		valueType: "string",
+		label: "Phone SIP transport",
+		description:
+			"Which transport provisioned phones are told to use. 'inherit' leaves each device line " +
+			"at its own setting and is what every deployment did before this existed — change it only " +
+			"once the SIP edge answers on that transport, because a phone provisioned onto a listener " +
+			"that is not there simply stops registering. 'tls' usually needs the SIP port set to 5061 " +
+			"as well; it is the setting beside this one.",
+		schema: z.enum(SIP_TRANSPORT_PREFERENCES),
+		defaultValue: "inherit",
+	}),
+	descriptor({
+		category: PROVISION_SETTINGS_CATEGORY,
+		name: SIP_PORT_SETTING,
+		valueType: "number",
+		label: "Phone SIP port",
+		description:
+			"Overrides the port on every provisioned line. Leave empty to use each line's own port. " +
+			"Deliberately not inferred from the transport: a deployment that terminates TLS anywhere " +
+			"other than 5061 would be silently misprovisioned by a rule that guessed.",
+		schema: z.int().min(1).max(65_535).nullable(),
+		defaultValue: null,
+	}),
+];
+
 /** Every catalogued setting, in one list. */
 export const SETTING_CATALOG: readonly SettingDescriptor[] = [
 	...NOTIFICATION_SETTINGS,
 	...ROUTING_SETTINGS,
+	...PROVISION_SETTINGS,
 ];
 
 const BY_KEY = new Map(SETTING_CATALOG.map((entry) => [`${entry.category} ${entry.name}`, entry]));

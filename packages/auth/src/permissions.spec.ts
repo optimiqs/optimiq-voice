@@ -47,9 +47,27 @@ describe("PERMISSIONS", () => {
 	 * here: prove the existing grants cannot express the boundary. If it genuinely cannot, raise
 	 * this number in the same change and say why, rather than deleting the assertion.
 	 */
+	/**
+	 * Raised from 91 to 93 by the security floor, with the effort the comment above demands spent
+	 * first.
+	 *
+	 * `sip_acl_entry` gained a CRUD surface and the SIP edge gained an authentication-failure
+	 * ledger, and neither could ride an existing grant. `settings.write` was the candidate and it
+	 * is the wrong one twice over: it is held by roles that manage preferences, while the thing
+	 * being granted is the ability to open the platform's SIP surface to an arbitrary network —
+	 * the same blast radius as issuing credentials — and `settings.read` is held by EVERY
+	 * self-service role, which would publish the perimeter and the attack log to every user in the
+	 * organization. `provisioning.*` guards the phone-config surface and not the SIP edge;
+	 * `secrets.*` is about credential material, not about who may reach the authenticator.
+	 *
+	 * Two, then, and not the four that were drafted: no `security.delete` (disabling and deleting a
+	 * rule are the same act) and no separate attack-log read (same audience, same incident, and a
+	 * role that sees refusals but not the rule causing them cannot finish the investigation). Both
+	 * arguments are recorded beside the entries in `permissions.ts`.
+	 */
 	it("stays within the size the collapsed FusionPBX model targets", () => {
 		expect(PERMISSIONS.length).toBeGreaterThanOrEqual(60);
-		expect(PERMISSIONS.length).toBeLessThanOrEqual(91);
+		expect(PERMISSIONS.length).toBeLessThanOrEqual(93);
 	});
 
 	it("contains no duplicates", () => {
@@ -100,6 +118,7 @@ describe("PERMISSIONS", () => {
 			"recordings",
 			"cdr",
 			"audit",
+			"security",
 			"settings",
 			"members",
 			"api-keys",

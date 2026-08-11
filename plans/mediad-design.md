@@ -1212,3 +1212,29 @@ a call to it, which needs `apps/sipd`'s proxy — see §10 question 4.
     `describeMediaPortConformance(makePort)` invoked against the fake, against `AriMediaAdapter`, and
     against `MediadMediaPort`. Without it, "the seam holds" is proved by two separate suites that
     could drift, rather than by one suite two implementations must both satisfy.
+
+18. **NEW: `mediad` has no SRTP, and the Asterisk plane now does — so the cutover inherits it as a
+    hard requirement rather than a nice-to-have.** W1 landed SIP-TLS and SDES-SRTP on the production
+    Asterisk plane (`apps/asterisk/config/pjsip_tls.conf`, `media_encryption = sdes` on the TLS
+    endpoint template), which closes rows 1.9 and 1.10 of the parity audit for the phone↔Asterisk
+    leg. `internal/rtp/session.go` still says "no SRTP" in its header, and that is now a REGRESSION
+    surface rather than a gap: a call whose signalling and first media hop are encrypted, bridged to
+    a `mediad`-backed external-media leg, is re-emitted in the clear on that hop.
+
+    Three things follow, and they are decisions somebody has to make before rung 2 cuts over rather
+    than after:
+
+    - **The relay needs SDES at minimum**, keyed from the SDP the engine already carries. DTLS-SRTP
+      is the WebRTC profile and is what the softphone (W14) will want; SDES is what the desk-phone
+      fleet negotiates today and what the vendor templates in
+      `apps/api/src/provisioning/catalog/templates/` write.
+    - **`allocate-session` grows a crypto argument**, or the engine has no way to tell `mediad` that
+      this leg must be encrypted. Deciding its shape late means changing the wire contract after
+      there are two implementations of it.
+    - **The rung 2 cutover gate should refuse a session whose peer offered `a=crypto` and which
+      `mediad` cannot answer**, rather than silently answering in the clear. An optimistic fallback
+      is right at the SIP edge, where the alternative is a handset that cannot call at all; it is
+      wrong at an internal hop, where the operator has already been told the call is encrypted.
+
+    Recorded here rather than in the ladder because it is not a rung: it is a property every rung
+    from 2 onward has to preserve once the edge is encrypted.
