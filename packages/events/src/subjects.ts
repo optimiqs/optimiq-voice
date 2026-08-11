@@ -32,6 +32,7 @@ import { createHash } from "node:crypto";
  * rpc.media.v1.send-dtmf
  * rpc.media.v1.start-recording
  * rpc.media.v1.stop-recording
+ * rpc.engine.v1.originate                   api -> engine; ANY instance answers (queue group)
  * rpc.engine.v1.park-handoff.<instanceTok>   engine -> engine; the OWNING instance answers
  * ```
  *
@@ -116,6 +117,17 @@ export const RPC_SUBJECTS = {
 	 */
 	mediaStartRecording: `rpc.media.${SUBJECT_VERSION}.start-recording`,
 	mediaStopRecording: `rpc.media.${SUBJECT_VERSION}.stop-recording`,
+	/**
+	 * Click-to-call: the control plane asking the call engine to place a call.
+	 *
+	 * FLAT, and served on a queue group — the opposite of the entry below it, which is the only
+	 * other `rpc.engine.v1.*` subject and is addressed at one named instance. The difference is
+	 * ownership: a park handoff moves a call that ALREADY exists on exactly one engine, so only
+	 * that engine can serve it, while an originate CREATES the call and therefore has no owner to
+	 * find. Whichever instance answers becomes the owner, which is precisely what a queue group
+	 * picks for you.
+	 */
+	engineOriginate: `rpc.engine.${SUBJECT_VERSION}.originate`,
 	/**
 	 * The engine-to-engine command surface. A PREFIX, not a complete subject.
 	 *
@@ -487,6 +499,10 @@ export const subjectFor = {
 	/** `rpc.sip.v1.transfer` */
 	sipTransferRpc(): string {
 		return RPC_SUBJECTS.sipTransfer;
+	},
+	/** `rpc.engine.v1.originate` — flat, queue-grouped. See {@link RPC_SUBJECTS.engineOriginate}. */
+	engineOriginateRpc(): string {
+		return RPC_SUBJECTS.engineOriginate;
 	},
 	/**
 	 * `rpc.engine.v1.park-handoff.<instanceToken>` — addressed at ONE engine instance.

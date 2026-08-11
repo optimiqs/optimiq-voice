@@ -382,6 +382,16 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		request: RPC_CONTRACTS["rpc.media.v1.stop-recording"].request,
 		response: RPC_CONTRACTS["rpc.media.v1.stop-recording"].response,
 	},
+	// Control plane to engine: click-to-call. No Go participant today either, and emitted for the
+	// same reason the entry below it is — the Go side reads the same taxonomy, and a subject the
+	// generated package does not name reads as a subject that does not exist.
+	{
+		subject: "rpc.engine.v1.originate",
+		goName: "Originate",
+		timeoutMs: RPC_CONTRACTS["rpc.engine.v1.originate"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.engine.v1.originate"].request,
+		response: RPC_CONTRACTS["rpc.engine.v1.originate"].response,
+	},
 	// Engine to engine, and the only subject here whose emitted constant is a PREFIX: the wire
 	// subject appends the owning instance's token. Emitted anyway, because the Go side reads the
 	// same taxonomy and a missing entry reads as "this subject does not exist".

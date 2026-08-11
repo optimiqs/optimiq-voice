@@ -996,6 +996,18 @@ async function main(): Promise<void> {
 				PBX_VOICEMAIL_EMAIL_URL_TTL_SECONDS: 24 * 3600,
 				PBX_MEDIA_OBJECT_ROOT: "/tmp/optimiq-voice-unused",
 				PBX_MEDIA_MAX_UPLOAD_BYTES: 10 * 1024 * 1024,
+				// Webhook delivery, off: this handle runs no module, so nothing here can dispatch. The
+				// disabling flag rather than the default, on the same terms as the sweeper interval above.
+				PBX_WEBHOOKS_ENABLED: false,
+				PBX_WEBHOOK_TIMEOUT_MS: 5_000,
+				PBX_WEBHOOK_MAX_ATTEMPTS: 3,
+				PBX_WEBHOOK_RETRY_BASE_MS: 1_000,
+				PBX_WEBHOOK_MAX_BACKOFF_MS: 8_000,
+				PBX_WEBHOOK_CONCURRENCY: 8,
+				PBX_WEBHOOK_FAILURE_LIMIT: 20,
+				PBX_WEBHOOK_CACHE_TTL_MS: 30_000,
+				PBX_WEBHOOK_ALLOW_INSECURE_URLS: false,
+				PBX_ORIGINATE_RATE_LIMIT_PER_MINUTE: 60,
 			});
 			if (organizationId.length > 0) {
 				await pbx.withTenantScope(organizationId, async (transaction) => {

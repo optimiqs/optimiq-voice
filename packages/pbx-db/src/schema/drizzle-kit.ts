@@ -24,3 +24,4 @@ export * from "./settings-schema";
 export * from "./time-conditions-schema";
 export * from "./trunks-schema";
 export * from "./voicemail-schema";
+export * from "./webhooks-schema";

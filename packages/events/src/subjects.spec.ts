@@ -59,6 +59,7 @@ describe("subject roots", () => {
 			mediaSendDtmf: "rpc.media.v1.send-dtmf",
 			mediaStartRecording: "rpc.media.v1.start-recording",
 			mediaStopRecording: "rpc.media.v1.stop-recording",
+			engineOriginate: "rpc.engine.v1.originate",
 			engineParkHandoff: "rpc.engine.v1.park-handoff",
 		});
 	});

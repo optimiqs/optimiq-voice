@@ -109,6 +109,34 @@ export const PERMISSIONS = [
 	"park-lots.write",
 	"park-lots.delete",
 
+	/**
+	 * Placing a call from the platform: `POST /api/v1/calls`, the click-to-call button.
+	 *
+	 * ONE entry, and the first member of a `calls` resource that has never existed — so here is the
+	 * proof the ceiling's instruction asks for, and the argument against the two alternatives.
+	 *
+	 * It is not a ride on `extensions.write`. That grant is CONFIGURATION: it changes what an
+	 * extension is, on a screen an administrator visits occasionally. This one makes a phone ring
+	 * and, when the destination is off-net, spends the organization's money on a trunk minute at a
+	 * rate set by whoever is holding the API key. The blast radius is the difference between a
+	 * mis-edited row somebody notices at their leisure and an unmetered outbound dialer, which is
+	 * exactly the reason `numbers.order` was carved out of `numbers.write` when the carrier
+	 * integration landed. The same argument, one layer down.
+	 *
+	 * It is not a ride on `cdr.read` either, which is the other grant that touches calls. That one
+	 * is a READ of what already happened, and `live-topics.ts` reasoned itself onto it for the live
+	 * call feed on the grounds that "the same data, sooner" cannot be gated more loosely than "the
+	 * same data, later". Origination is not the same data at all — it is a write, and the only
+	 * write on this platform whose effect is audible in somebody's office.
+	 *
+	 * And it is exactly one. There is no `calls.hangup`, no `calls.transfer` and no `calls.monitor`,
+	 * although all three are obvious neighbours: mid-call control is not exposed over HTTP at all
+	 * today, and `live-topics.ts` already recorded that the live feed rides `cdr.read` until a
+	 * wallboard role needs otherwise. Adding a permission for a surface that does not exist would
+	 * be spending the ceiling on documentation.
+	 */
+	"calls.originate",
+
 	// --- Media, reporting and audit -----------------------------------------
 	"recordings.read",
 	"recordings.read.own",
@@ -167,6 +195,31 @@ export const PERMISSIONS = [
 	 */
 	"security.read",
 	"security.write",
+
+	/**
+	 * Outbound webhook subscriptions — where this platform's events are delivered, and with what key.
+	 *
+	 * TWO entries, shaped exactly like `security.*` above and for the same reasons.
+	 *
+	 * Its own resource rather than a ride on `settings.*`, because `settings.write` is held by the
+	 * roles that manage a tenant's ordinary configuration and this grant is the ability to point a
+	 * copy of every call event in the organization at an arbitrary URL. That is an exfiltration
+	 * primitive, not a preference, and it belongs in the same privilege class as opening the SIP
+	 * surface to a network.
+	 *
+	 * There is no `webhooks.delete`. A subscription is a rule, not a record: deleting one and
+	 * disabling one stop the same deliveries with the same consequence and leave nothing behind that
+	 * anybody could need, so a separate delete grant would be a distinction a reviewer cannot act on.
+	 * The identical argument `security.delete` lost.
+	 *
+	 * There is no `webhooks.deliveries.read` either, and it was drafted. There is no delivery LOG to
+	 * read — the current health lives on the subscription row and comes back with
+	 * `webhooks.read` — so the grant would guard a surface that does not exist. If a delivery-attempt
+	 * table lands, its payloads are a tenant's own call data and the read that guards them is this
+	 * one, unless somebody can show it is a different audience.
+	 */
+	"webhooks.read",
+	"webhooks.write",
 
 	// --- Platform and tenancy ------------------------------------------------
 	"settings.read",
@@ -619,6 +672,20 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 		],
 	},
 	{
+		resource: "calls",
+		label: "Calls",
+		description: "Placing calls from the platform.",
+		permissions: [
+			{
+				permission: "calls.originate",
+				label: "Place calls",
+				description:
+					"Ring an extension and connect it to a destination — the click-to-dial button. " +
+					"Off-net destinations are billed to the organization.",
+			},
+		],
+	},
+	{
 		resource: "recordings",
 		label: "Recordings",
 		description: "Call recordings, their retention policy and their media.",
@@ -703,6 +770,27 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 				label: "Manage network ACLs",
 				description:
 					"Create and edit CIDR rules. Opening a network here lets it reach the SIP authenticator.",
+			},
+		],
+	},
+	{
+		resource: "webhooks",
+		label: "Webhooks",
+		description: "Where this organization's call events are delivered, and with what signing key.",
+		permissions: [
+			{
+				permission: "webhooks.read",
+				label: "View webhooks",
+				description:
+					"Inspect webhook endpoints, the events each one receives, and its delivery health. " +
+					"Signing secrets are never returned.",
+			},
+			{
+				permission: "webhooks.write",
+				label: "Manage webhooks",
+				description:
+					"Create, edit and remove webhook endpoints, and rotate their signing secrets. An " +
+					"endpoint receives a copy of every event it subscribes to.",
 			},
 		],
 	},
@@ -930,6 +1018,18 @@ const MANAGER_PERMISSIONS = [
 	"recordings.download",
 	"cdr.read",
 	"cdr.export",
+	/**
+	 * A manager may place a call, and an agent may not — which is the opposite of what a dial button
+	 * in an agent console would want, and is deliberate until the scoped grant exists.
+	 *
+	 * The permission is organization-wide: it says "ring ANY extension in this tenant and connect it
+	 * to a destination". For a manager that is the shape of the job. For an agent it would be the
+	 * ability to make a colleague's phone ring and dial an international number from it, which is a
+	 * strictly larger power than anything else in `AGENT_PERMISSIONS`, every one of which is scoped
+	 * `own`. The right answer for an agent console is `calls.originate.own` — checked against
+	 * `extension_user` — and it is not in the registry because nothing serves it yet.
+	 */
+	"calls.originate",
 	"members.read",
 	"applications.read",
 ] as const satisfies readonly Permission[];

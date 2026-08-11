@@ -20,6 +20,7 @@ import {
 	voicemailMessage,
 	voicemailOption,
 } from "./voicemail-schema";
+import { webhookSubscription } from "./webhooks-schema";
 
 /**
  * Every table in the telephony bounded context, keyed by its TypeScript name.
@@ -65,6 +66,7 @@ export const pbxTables = {
 	voicemailGreeting,
 	voicemailMessage,
 	voicemailOption,
+	webhookSubscription,
 } as const;
 
 export type PbxTables = typeof pbxTables;

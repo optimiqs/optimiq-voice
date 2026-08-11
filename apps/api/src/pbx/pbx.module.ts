@@ -8,6 +8,8 @@ import {
 } from "../transcription";
 import { AuditLogQueryService } from "./audit-log/audit-log-query.service";
 import { AuditLogController } from "./audit-log/audit-log.controller";
+import { CallsController } from "./calls/calls.controller";
+import { CallsService } from "./calls/calls.service";
 import { CarrierWebhookController } from "./carrier/carrier-webhook.controller";
 import { CarrierController, CarrierTrunkController } from "./carrier/carrier.controller";
 import { carrierProviders } from "./carrier/carrier.providers";
@@ -97,6 +99,9 @@ import { VoicemailPinService } from "./voicemail-boxes/voicemail-pin.service";
 import { VoicemailRpcController } from "./voicemail-boxes/voicemail-rpc.controller";
 import { VoicemailTranscriptionSweeper } from "./voicemail-boxes/voicemail-transcription-sweeper.service";
 import { VoicemailTranscriptionService } from "./voicemail-boxes/voicemail-transcription.service";
+import { WebhookDispatcher } from "./webhooks/webhook-dispatcher.service";
+import { WebhooksController } from "./webhooks/webhooks.controller";
+import { WebhooksService } from "./webhooks/webhooks.service";
 import type { ObjectStore } from "../storage";
 import type { TranscriptionEnv, TranscriptionProvider } from "../transcription";
 import type { PbxEnv } from "./shared/pbx-env";
@@ -144,6 +149,18 @@ const logger = getLogger("api.pbx");
 		QueueAgentSessionController,
 		ConferencesController,
 		ParkLotsController,
+		/**
+		 * Click-to-call, and the integrator surface beside it.
+		 *
+		 * `CallsController` is in the PBX area rather than beside the CDR reader because origination
+		 * resolves against the tenant's ROUTING artifact — the same compiled plan every resource in
+		 * this module writes — and because its rate limiter is bounded by the same environment.
+		 * `WebhooksController` is here because `webhook_subscription` is a `pbx-db` table under the
+		 * same RLS policy as everything else in this module, and because the dispatcher that reads it
+		 * needs the same `PBX_DATABASE` handle.
+		 */
+		CallsController,
+		WebhooksController,
 		/**
 		 * The media library, and the dispatchable locations.
 		 *
@@ -513,6 +530,16 @@ const logger = getLogger("api.pbx");
 		 */
 		SipAuthEventService,
 		SipAuthEventQueryService,
+		/**
+		 * Click-to-call's originate client, and outbound webhook delivery.
+		 *
+		 * Registered unconditionally, on the terms `EmergencyConsumer` above records: without
+		 * `NATS_URL` each logs once at boot and stays idle, which is a deployment discovering that its
+		 * integrator surface is not wired rather than a provider silently absent from the container.
+		 */
+		CallsService,
+		WebhooksService,
+		WebhookDispatcher,
 		/**
 		 * The ledger READER, beside the writer it never talks to.
 		 *

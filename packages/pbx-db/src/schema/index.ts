@@ -23,3 +23,4 @@ export * from "./tables";
 export * from "./time-conditions-schema";
 export * from "./trunks-schema";
 export * from "./voicemail-schema";
+export * from "./webhooks-schema";

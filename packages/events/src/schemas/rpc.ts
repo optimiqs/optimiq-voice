@@ -46,8 +46,11 @@ import {
  * that the contract is the wire. If it is Nest-to-Nest, `@MessagePattern` is fine — but the
  * generated Go structs for it are then documentation, not a usable client.
  *
- * There is one exception to the second half, and it is `rpc.engine.v1.park-handoff`: Nest on both
- * ends and raw anyway, because its subject is not a constant. See its own note.
+ * The `rpc.engine.v1.*` pair are the exceptions to the second half — Nest on both ends and raw
+ * anyway, for two different reasons. `park-handoff`'s subject is not a constant, so no
+ * `@MessagePattern` can express it. `originate`'s is, and it is raw because the engine already
+ * serves its whole request-reply surface on one raw connection; adding a second transport for one
+ * subject buys nothing. See each one's own note.
  */
 
 /** A request-reply contract: one subject, one request schema, one response schema. */
@@ -1233,6 +1236,188 @@ export const MEDIA_STOP_RECORDING_RPC = defineRpc(
 );
 
 // ---------------------------------------------------------------------------------------------
+// rpc.engine.v1.originate — api → engine, click-to-call
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Why an originate was refused.
+ *
+ * A refusal is a REPLY, as everywhere else on this backbone, and the codes are chosen so that
+ * `apps/api` can map each one onto an HTTP status without consulting `error`: the person who
+ * clicked a dial button needs "that extension is not registered" and "the platform is busy" to
+ * look different, because only one of them is worth clicking again.
+ */
+export const ORIGINATE_REFUSAL_REASONS = [
+	/** Malformed payload, or a required field missing. Retrying the same bytes fails the same way. */
+	"bad_request",
+	/**
+	 * No extension in this tenant has that number.
+	 *
+	 * The tenant check is INSIDE this reason rather than beside it: an extension that exists in
+	 * another organization must be indistinguishable from one that exists nowhere, or the endpoint
+	 * becomes a cross-tenant extension oracle for anyone holding an API key.
+	 */
+	"unknown_extension",
+	/**
+	 * The extension exists and has no device the engine can ring — nothing registered, or every
+	 * registration expired.
+	 *
+	 * Distinct from {@link unknown_extension} because the two need opposite things said: one is a
+	 * typo in a CRM's configuration, the other is a phone that is unplugged, and only the second is
+	 * worth retrying in a minute.
+	 */
+	"extension_offline",
+	/**
+	 * `to` resolves to nothing this tenant may dial — no matching route, or a destination the
+	 * dial plan refuses.
+	 *
+	 * The toll-fraud boundary. The B-side is dialled AS THE EXTENSION, through the extension's own
+	 * outbound routes, so a click-to-call cannot reach a destination the same person could not have
+	 * dialled from their handset.
+	 */
+	"invalid_target",
+	/** The engine, or the media plane under it, has no room for another call. A LOAD signal. */
+	"capacity",
+	/**
+	 * This engine's media driver cannot originate at all.
+	 *
+	 * Named rather than folded into {@link internal} because it is a DEPLOYMENT fact with a fixed
+	 * answer: `apps/mediad` refuses origination by design — SIP signalling belongs to `apps/sipd` —
+	 * so an engine running `ENGINE_MEDIA_DRIVER=mediad` will refuse every one of these, forever, and
+	 * the operator needs to see that rather than an intermittent-looking 500. It is the same
+	 * distinction `MEDIA_REFUSAL_REASONS.not_supported` draws for the same reason.
+	 */
+	"not_supported",
+	/** This instance is draining. Do not retry HERE — another one will take the queue-group message. */
+	"shutting_down",
+	/** Anything else. */
+	"internal",
+] as const;
+
+export const originateRefusalReasonSchema = z.enum(ORIGINATE_REFUSAL_REASONS);
+export type OriginateRefusalReason = (typeof ORIGINATE_REFUSAL_REASONS)[number];
+
+/**
+ * `rpc.engine.v1.originate` — the control plane asking the call engine to place a call.
+ *
+ * ## The classic click-to-call, and why the extension rings FIRST
+ *
+ * `POST /api/v1/calls {from, to}` is a CRM's dial button. What it means is "connect this person to
+ * that number", and the only honest way to do that on a desk phone is to ring the person first and
+ * dial the target when they pick up: the alternative — dialling the target first and then ringing
+ * the extension — makes the far end listen to silence while somebody wanders back to their desk,
+ * and charges the tenant for the attempt if they never do.
+ *
+ * So the A-leg is the extension, and the B-side dial happens on answer. That ordering is what makes
+ * `extension_offline` a refusal the API can return SYNCHRONOUSLY, before anything is billed.
+ *
+ * ## RAW NATS ON BOTH ENDS, and why the queue group
+ *
+ * Both ends are NestJS, which by the rule of thumb at the head of this file would allow
+ * `@MessagePattern`. It is raw anyway, for the reason `rpc.sip.v1.transfer` is: the engine already
+ * serves its request-reply surface on the one raw connection it holds
+ * (`apps/engine/src/nats/jetstream.service.ts`), and mixing a second transport into that surface for
+ * one subject buys nothing and costs a framing mismatch the day a non-TypeScript caller appears.
+ *
+ * The subject is FLAT and served on the queue group `optimiq-engine-originate` — unlike
+ * `rpc.engine.v1.park-handoff`, whose subject names one instance. A handoff moves a call that
+ * already lives on exactly one engine; an originate CREATES one, so there is no owner to address
+ * and any instance is the right answer.
+ *
+ * ## `originateId` is assigned by the CALLER, and is NOT the call id
+ *
+ * The caller-assigned half is there for the same reason `sessionId` and `bridgeId` are on the media
+ * plane, and it bites harder here: a request whose reply is lost has still rung somebody's phone.
+ * `originateId` becomes the MEDIA CHANNEL's id, so a retry of the same request finds a channel the
+ * engine is already holding and is answered idempotently — with the ids of the call it already
+ * placed — rather than ringing the desk a second time.
+ *
+ * It is deliberately not called `callId`, and the response carries `callId` and `legId` separately,
+ * because the engine does not accept a call id from anybody: leg and call ids are DERIVED from the
+ * media channel id by `channel-identity.ts`, so that an instance which picks a call up after a
+ * failover arrives at the same ids and the CDR is not written twice. A contract that let a caller
+ * name the call would be a contract that let a caller collide two of them.
+ */
+export const originateRequestSchema = z.object({
+	/** The tenant. The responder re-checks every id against it rather than trusting the caller. */
+	orgId: z.uuid(),
+	/**
+	 * The caller's handle on this origination, and the media channel's id. See the note above.
+	 *
+	 * A UUID rather than a free string so it is a valid channel-id token on every media driver and
+	 * so two callers cannot collide by choosing the same friendly name.
+	 */
+	originateId: z.uuid(),
+	/** The extension NUMBER to ring first — `1001`, not an extension row id. */
+	fromExtension: dialStringSchema,
+	/** What that extension is dialling, exactly as it would have typed it on the handset. */
+	to: dialStringSchema,
+	/**
+	 * How long to ring the extension before giving up, in seconds.
+	 *
+	 * Bounded rather than open: an originate that rings forever is a channel and a media session
+	 * held by a request nobody is waiting on any more. The engine's own default applies when absent.
+	 */
+	ringTimeoutSeconds: z.int().min(5).max(300).optional(),
+	/**
+	 * Caller ID to present to `to`, when the tenant wants something other than the extension's own.
+	 *
+	 * Advisory: the engine's outbound routing may still override it, exactly as it does for a call
+	 * the extension dialled by hand. A contract that promised otherwise would be promising to
+	 * bypass the tenant's own CLI policy.
+	 */
+	callerIdNumber: dialStringSchema.optional(),
+	callerIdName: z.string().max(128).optional(),
+	/**
+	 * Who asked, for the engine's log and the CDR's provenance. A user id, an API key id, or a
+	 * service name — never a credential.
+	 */
+	requestedBy: z.string().max(128).optional(),
+});
+
+export const originateResponseSchema = z.object({
+	ok: z.boolean(),
+	/** Echoed so a reply can be attributed without the requester holding per-request state. */
+	originateId: z.string().min(1).max(128),
+	/** The engine instance that took the call. Always present, refusal included, for the API's log. */
+	instanceId: z.string().min(1).max(128).optional(),
+	/**
+	 * The call the engine created, on ITS terms — the token in
+	 * `calls.evt.v1.<org>.<callId>.>` and the `call_id` every CDR leg carries. Present exactly when
+	 * `ok`, and the whole reason this reply is worth waiting for: it is what lets the caller line
+	 * the webhooks that are already arriving up against the button somebody pressed.
+	 */
+	callId: z.string().min(1).max(128).optional(),
+	/** The A-leg — the extension's own leg. Present exactly when `ok`. */
+	legId: z.string().min(1).max(128).optional(),
+	/** The endpoint the A-leg was placed towards, for the support ticket. Diagnostics only. */
+	endpoint: z.string().max(256).optional(),
+	/** The destination after the plan's own normalisation, when it differs from `to`. */
+	destination: dialStringSchema.optional(),
+	reason: originateRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type OriginateRequest = z.infer<typeof originateRequestSchema>;
+export type OriginateResponse = z.infer<typeof originateResponseSchema>;
+
+export const ORIGINATE_RPC = defineRpc(
+	RPC_SUBJECTS.engineOriginate,
+	originateRequestSchema,
+	originateResponseSchema,
+	// Five seconds, and it is the longest deadline in this file by a wide margin.
+	//
+	// Nothing else here is bounded by a person: the media commands are socket work, and even the
+	// park handoff is three ARI round trips. This one RESOLVES AN EXTENSION, looks up a registered
+	// contact and asks the media server to create a channel — and it answers when the channel has
+	// been CREATED, not when the phone has been answered, so the ring itself is outside the budget.
+	// What five seconds buys is room for a media server under load; what it costs is a dial button
+	// that spins for five seconds before saying so, which is the right trade against one that gives
+	// up on a call the engine went on to place anyway.
+	5_000,
+);
+
+// ---------------------------------------------------------------------------------------------
 // rpc.engine.v1.park-handoff — engine → engine, when a park is retrieved from the wrong node
 // ---------------------------------------------------------------------------------------------
 
@@ -1398,5 +1583,6 @@ export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.mediaSendDtmf]: MEDIA_SEND_DTMF_RPC,
 	[RPC_SUBJECTS.mediaStartRecording]: MEDIA_START_RECORDING_RPC,
 	[RPC_SUBJECTS.mediaStopRecording]: MEDIA_STOP_RECORDING_RPC,
+	[RPC_SUBJECTS.engineOriginate]: ORIGINATE_RPC,
 	[RPC_SUBJECTS.engineParkHandoff]: PARK_HANDOFF_RPC,
 } as const;

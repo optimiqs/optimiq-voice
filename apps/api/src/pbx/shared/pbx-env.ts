@@ -249,6 +249,91 @@ export const pbxEnvSchema = z.object({
 		.min(1024)
 		.max(200 * 1024 * 1024)
 		.default(10 * 1024 * 1024),
+
+	/**
+	 * Outbound webhook delivery — `webhooks/webhook-dispatcher.service.ts`.
+	 *
+	 * Every knob here bounds something an ENDPOINT WE DO NOT CONTROL can do to this process. That is
+	 * the whole reason they are configuration rather than constants: a deployment with one slow
+	 * partner and a deployment with two hundred fast ones want different numbers, and the failure
+	 * mode of getting it wrong is a control plane that stops filing voicemail because somebody's CRM
+	 * is answering in ninety seconds.
+	 */
+	PBX_WEBHOOKS_ENABLED: z
+		.stringbool({ truthy: ["true", "1"], falsy: ["false", "0"] })
+		.default(true),
+	/**
+	 * How long one POST may take, end to end.
+	 *
+	 * Five seconds, and short on purpose. A receiver is expected to acknowledge and queue, not to do
+	 * work — every webhook provider says so — and a timeout longer than this converts one wedged
+	 * endpoint into a delivery slot held for a minute.
+	 */
+	PBX_WEBHOOK_TIMEOUT_MS: z.coerce.number().int().min(250).max(30_000).default(5_000),
+	/**
+	 * Attempts per delivery, including the first.
+	 *
+	 * Three, matching the transcription pipeline's, and bounded for the same reason: what a retry
+	 * absorbs is a TRANSIENT — a restart, a 502 from a load balancer, a reset connection — and an
+	 * endpoint that is genuinely down stays down for far longer than any budget worth holding a
+	 * delivery slot for. The consecutive-failure counter is what carries the longer-lived signal.
+	 */
+	PBX_WEBHOOK_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(10).default(3),
+	/** First retry delay; each further attempt doubles it, capped below. */
+	PBX_WEBHOOK_RETRY_BASE_MS: z.coerce.number().int().min(0).max(60_000).default(1_000),
+	PBX_WEBHOOK_MAX_BACKOFF_MS: z.coerce.number().int().min(0).max(300_000).default(8_000),
+	/**
+	 * How many deliveries may be in flight at once, across every tenant.
+	 *
+	 * The bound that stops a slow endpoint from stalling the consumer: the JetStream loop admits a
+	 * message only when a slot is free, so back-pressure is applied by NOT PULLING rather than by
+	 * dropping. Eight is a deployment-sized default — enough that one slow partner does not stop the
+	 * others, small enough that the process is not holding two hundred open sockets to strangers.
+	 */
+	PBX_WEBHOOK_CONCURRENCY: z.coerce.number().int().min(1).max(256).default(8),
+	/**
+	 * Consecutive failures before a subscription is switched off on the tenant's behalf.
+	 *
+	 * Twenty, which at the default retry budget is sixty failed POSTs to an endpoint that has never
+	 * once succeeded. High enough that a deploy window does not disable anybody; low enough that a
+	 * decommissioned URL stops consuming delivery slots within minutes rather than forever.
+	 *
+	 * `0` disables auto-disabling, for a deployment that would rather keep retrying and watch the
+	 * counter.
+	 */
+	PBX_WEBHOOK_FAILURE_LIMIT: z.coerce.number().int().min(0).max(10_000).default(20),
+	/**
+	 * How stale the in-memory subscription list may be.
+	 *
+	 * The dispatcher cannot query the database per message — that is one round trip per event per
+	 * tenant — so it caches each organization's subscriptions and refreshes them on this interval.
+	 * The consequence is stated plainly: a subscription created now may take up to this long to
+	 * start receiving, and one deleted now may receive for up to this long after. Thirty seconds is
+	 * short enough that nobody files a bug about it and long enough that the cache is doing its job.
+	 */
+	PBX_WEBHOOK_CACHE_TTL_MS: z.coerce.number().int().min(0).max(600_000).default(30_000),
+	/**
+	 * Whether `http://` endpoints may be configured.
+	 *
+	 * Off. The payload is a tenant's call metadata and the signature protects integrity, not
+	 * confidentiality — nothing about an HMAC stops a hop reading the body. On for a developer
+	 * pointing an endpoint at `localhost`, and refused in production by the module's own preflight.
+	 */
+	PBX_WEBHOOK_ALLOW_INSECURE_URLS: z
+		.stringbool({ truthy: ["true", "1"], falsy: ["false", "0"] })
+		.default(false),
+
+	/**
+	 * Click-to-call origination per organization per minute — `calls/originate-rate-limit.ts`.
+	 *
+	 * Sixty, which is a call a second from one tenant: far above any human pressing a dial button and
+	 * far below a number worth a carrier invoice. It is the bound on what a compromised API key can
+	 * spend before somebody notices, which is why it exists at all — every other control on this
+	 * endpoint answers "may you", and this one answers "how much".
+	 *
+	 * `0` disables it, for a deployment that bounds origination somewhere else.
+	 */
+	PBX_ORIGINATE_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().min(0).max(10_000).default(60),
 });
 
 export type PbxEnv = z.infer<typeof pbxEnvSchema>;

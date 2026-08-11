@@ -36,6 +36,7 @@ const (
 	SubjectMediaSendDtmfRPC         = "rpc.media.v1.send-dtmf"
 	SubjectMediaStartRecordingRPC   = "rpc.media.v1.start-recording"
 	SubjectMediaStopRecordingRPC    = "rpc.media.v1.stop-recording"
+	SubjectOriginateRPC             = "rpc.engine.v1.originate"
 	SubjectParkHandoffRPC           = "rpc.engine.v1.park-handoff"
 )
 
@@ -54,6 +55,7 @@ const (
 	TimeoutMediaSendDtmfRPC         = 500 * time.Millisecond
 	TimeoutMediaStartRecordingRPC   = 1000 * time.Millisecond
 	TimeoutMediaStopRecordingRPC    = 500 * time.Millisecond
+	TimeoutOriginateRPC             = 5000 * time.Millisecond
 	TimeoutParkHandoffRPC           = 3000 * time.Millisecond
 )
 
@@ -960,6 +962,69 @@ func (v MediaStopRecordingResponseReason) Valid() bool {
 }
 
 func (v MediaStopRecordingResponseReason) String() string { return string(v) }
+
+// OriginateRequest is the request body of rpc.engine.v1.originate.
+type OriginateRequest struct {
+	OrgID              string  `json:"orgId"`
+	OriginateID        string  `json:"originateId"`
+	FromExtension      string  `json:"fromExtension"`
+	To                 string  `json:"to"`
+	RingTimeoutSeconds *int    `json:"ringTimeoutSeconds,omitempty"`
+	CallerIDNumber     *string `json:"callerIdNumber,omitempty"`
+	CallerIDName       *string `json:"callerIdName,omitempty"`
+	RequestedBy        *string `json:"requestedBy,omitempty"`
+}
+
+// OriginateResponse is the reply body of rpc.engine.v1.originate.
+type OriginateResponse struct {
+	Ok          bool                     `json:"ok"`
+	OriginateID string                   `json:"originateId"`
+	InstanceID  *string                  `json:"instanceId,omitempty"`
+	CallID      *string                  `json:"callId,omitempty"`
+	LegID       *string                  `json:"legId,omitempty"`
+	Endpoint    *string                  `json:"endpoint,omitempty"`
+	Destination *string                  `json:"destination,omitempty"`
+	Reason      *OriginateResponseReason `json:"reason,omitempty"`
+	Error       *string                  `json:"error,omitempty"`
+}
+
+// OriginateResponseReason is the closed vocabulary of OriginateResponse.reason.
+type OriginateResponseReason string
+
+const (
+	OriginateResponseReasonBadRequest       OriginateResponseReason = "bad_request"
+	OriginateResponseReasonUnknownExtension OriginateResponseReason = "unknown_extension"
+	OriginateResponseReasonExtensionOffline OriginateResponseReason = "extension_offline"
+	OriginateResponseReasonInvalidTarget    OriginateResponseReason = "invalid_target"
+	OriginateResponseReasonCapacity         OriginateResponseReason = "capacity"
+	OriginateResponseReasonNotSupported     OriginateResponseReason = "not_supported"
+	OriginateResponseReasonShuttingDown     OriginateResponseReason = "shutting_down"
+	OriginateResponseReasonInternal         OriginateResponseReason = "internal"
+)
+
+// OriginateResponseReasonValues lists every member of the vocabulary, in contract order.
+var OriginateResponseReasonValues = []OriginateResponseReason{
+	OriginateResponseReasonBadRequest,
+	OriginateResponseReasonUnknownExtension,
+	OriginateResponseReasonExtensionOffline,
+	OriginateResponseReasonInvalidTarget,
+	OriginateResponseReasonCapacity,
+	OriginateResponseReasonNotSupported,
+	OriginateResponseReasonShuttingDown,
+	OriginateResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the OriginateResponseReason vocabulary.
+func (v OriginateResponseReason) Valid() bool {
+	for _, candidate := range OriginateResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v OriginateResponseReason) String() string { return string(v) }
 
 // ParkHandoffRequest is the request body of rpc.engine.v1.park-handoff.
 type ParkHandoffRequest struct {

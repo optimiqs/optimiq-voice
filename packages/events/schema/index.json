@@ -402,6 +402,14 @@
 			"goResponseType": "MediaStopRecordingResponse"
 		},
 		{
+			"subject": "rpc.engine.v1.originate",
+			"timeoutMs": 5000,
+			"requestSchema": "rpc/rpc.engine.v1.originate.request.schema.json",
+			"responseSchema": "rpc/rpc.engine.v1.originate.response.schema.json",
+			"goRequestType": "OriginateRequest",
+			"goResponseType": "OriginateResponse"
+		},
+		{
 			"subject": "rpc.engine.v1.park-handoff",
 			"timeoutMs": 3000,
 			"requestSchema": "rpc/rpc.engine.v1.park-handoff.request.schema.json",

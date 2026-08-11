@@ -1,0 +1,57 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"ok": {
+			"type": "boolean"
+		},
+		"originateId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"instanceId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"callId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"legId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"endpoint": {
+			"type": "string",
+			"maxLength": 256
+		},
+		"destination": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"reason": {
+			"type": "string",
+			"enum": [
+				"bad_request",
+				"unknown_extension",
+				"extension_offline",
+				"invalid_target",
+				"capacity",
+				"not_supported",
+				"shutting_down",
+				"internal"
+			]
+		},
+		"error": {
+			"type": "string",
+			"maxLength": 512
+		}
+	},
+	"required": ["ok", "originateId"],
+	"additionalProperties": false
+}

@@ -65,9 +65,40 @@ describe("PERMISSIONS", () => {
 	 * role that sees refusals but not the rule causing them cannot finish the investigation). Both
 	 * arguments are recorded beside the entries in `permissions.ts`.
 	 */
+	/**
+	 * Raised from 93 to 96 by the integrator surface — `calls.originate`, `webhooks.read` and
+	 * `webhooks.write` — with the effort every note above demands spent first.
+	 *
+	 * The platform had no way for anything outside it to make a call happen or to be told that one
+	 * did. Both halves of closing that are WRITES with blast radii nothing in the registry covers.
+	 *
+	 * `calls.originate` is one entry against a resource that did not exist. The two candidates to
+	 * ride were `extensions.write` and `cdr.read`, and both are the wrong shape: the first is
+	 * configuration — it changes what an extension IS — while this rings a phone and, off-net, spends
+	 * the organization's money at whatever rate the key-holder chooses; the second is a read of what
+	 * already happened, which is the argument `live-topics.ts` used to put the LIVE call feed on
+	 * `cdr.read` and which does not extend to causing a call. The precedent is exact: `numbers.order`
+	 * was carved out of `numbers.write` for the identical "this one spends money" reason.
+	 *
+	 * It is one and not four. `calls.hangup`, `calls.transfer` and `calls.monitor` were all drafted
+	 * and all dropped, because none of them has a surface: mid-call control is not exposed over HTTP,
+	 * and the live feed already rides `cdr.read` by a recorded decision. A permission guarding
+	 * nothing is documentation charged to this ceiling.
+	 *
+	 * `webhooks.*` is two, shaped exactly like `security.*` and by the same argument. `settings.*`
+	 * was the candidate and fails the same way twice: `settings.write` is held by the roles that
+	 * manage ordinary configuration, and what is being granted is the ability to point a copy of
+	 * every call event in the organization at an arbitrary URL — an exfiltration primitive, not a
+	 * preference. There is no `webhooks.delete`, because deleting and disabling a subscription stop
+	 * the same deliveries and leave nothing behind (the argument `security.delete` lost), and no
+	 * separate grant for delivery history, because there is no delivery log to read.
+	 *
+	 * The instruction the ceiling carries stands unchanged for the next feature: prove the existing
+	 * grants cannot express the boundary, raise this number in the same change, and say why.
+	 */
 	it("stays within the size the collapsed FusionPBX model targets", () => {
 		expect(PERMISSIONS.length).toBeGreaterThanOrEqual(60);
-		expect(PERMISSIONS.length).toBeLessThanOrEqual(93);
+		expect(PERMISSIONS.length).toBeLessThanOrEqual(96);
 	});
 
 	it("contains no duplicates", () => {

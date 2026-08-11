@@ -12,6 +12,8 @@ import { makeQueueEvent, queueEventSchema } from "./queue-events";
 import { makeRegistrationEvent, registrationEventSchema } from "./registration-events";
 import {
 	AUTHZ_CHECK_RPC,
+	ORIGINATE_REFUSAL_REASONS,
+	ORIGINATE_RPC,
 	ROUTING_RESOLVE_RPC,
 	SIP_TRANSFER_REFUSAL_REASONS,
 	SIP_TRANSFER_RPC,
@@ -728,6 +730,80 @@ describe("the sip transfer contract", () => {
 	it("refuses a reason outside that vocabulary", () => {
 		expect(
 			SIP_TRANSFER_RPC.response.safeParse({ ok: false, sipCallId: "a", reason: "computer_says_no" })
+				.success,
+		).toBe(false);
+	});
+});
+
+describe("the originate contract", () => {
+	const request = () => ({
+		orgId: ORG,
+		originateId: createEntityId(),
+		fromExtension: "1001",
+		to: "+15551230000",
+	});
+
+	it("pins the subject and the deadline", () => {
+		expect(ORIGINATE_RPC.subject).toBe("rpc.engine.v1.originate");
+		// The longest in the file: an extension resolve plus a channel creation, on a person's click.
+		expect(ORIGINATE_RPC.timeoutMs).toBe(5_000);
+	});
+
+	it("accepts the two fields a dial button actually has", () => {
+		const parsed = ORIGINATE_RPC.request.parse(request());
+		expect(parsed.fromExtension).toBe("1001");
+		expect(parsed.to).toBe("+15551230000");
+		expect(parsed.ringTimeoutSeconds).toBeUndefined();
+	});
+
+	it("refuses a request with no dialable target", () => {
+		expect(ORIGINATE_RPC.request.safeParse({ ...request(), to: "" }).success).toBe(false);
+	});
+
+	it("refuses an origination handle that is not a uuid — it becomes a channel id", () => {
+		expect(ORIGINATE_RPC.request.safeParse({ ...request(), originateId: "call-1" }).success).toBe(
+			false,
+		);
+	});
+
+	it("refuses a ring timeout outside the bounds a held channel is worth", () => {
+		expect(ORIGINATE_RPC.request.safeParse({ ...request(), ringTimeoutSeconds: 1 }).success).toBe(
+			false,
+		);
+		expect(ORIGINATE_RPC.request.safeParse({ ...request(), ringTimeoutSeconds: 600 }).success).toBe(
+			false,
+		);
+	});
+
+	it("carries the engine's own call and leg ids on success, never the caller's", () => {
+		const response = ORIGINATE_RPC.response.parse({
+			ok: true,
+			originateId: "019fd3c2-1111-76be-a6b3-b0f1914e39b6",
+			instanceId: "engine-1",
+			callId: "019fd3c2-2222-76be-a6b3-b0f1914e39b6",
+			legId: "019fd3c2-3333-76be-a6b3-b0f1914e39b6",
+			endpoint: "PJSIP/1001",
+		});
+		expect(response.callId).not.toBe(response.originateId);
+		expect(response.endpoint).toBe("PJSIP/1001");
+	});
+
+	it("names every refusal the responder may send, in contract order", () => {
+		expect([...ORIGINATE_REFUSAL_REASONS]).toEqual([
+			"bad_request",
+			"unknown_extension",
+			"extension_offline",
+			"invalid_target",
+			"capacity",
+			"not_supported",
+			"shutting_down",
+			"internal",
+		]);
+	});
+
+	it("refuses a reason outside that vocabulary", () => {
+		expect(
+			ORIGINATE_RPC.response.safeParse({ ok: false, originateId: "a", reason: "no_dialtone" })
 				.success,
 		).toBe(false);
 	});
