@@ -1,7 +1,16 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { getLogger } from "@optimiq-voice/logging";
-import { and, desc, eq, inArray, sql, voicemailBox, voicemailMessage } from "@optimiq-voice/pbx-db";
+import {
+	and,
+	desc,
+	eq,
+	extension,
+	inArray,
+	sql,
+	voicemailBox,
+	voicemailMessage,
+} from "@optimiq-voice/pbx-db";
 import { openMediaResponse } from "../../media/media-response";
 import { ObjectKeyOutsideRootError } from "../../storage";
 import { normalizePagination, paged } from "../shared/pagination";
@@ -474,7 +483,14 @@ export class VoicemailMessagesService {
 		if (!box.mwiEnabled) {
 			return;
 		}
-		await this.mwi.publish(organizationId, box.id, box.mailboxNumber, counts, reason);
+		await this.mwi.publish(
+			organizationId,
+			box.id,
+			box.mailboxNumber,
+			box.extensionNumber ?? undefined,
+			counts,
+			reason,
+		);
 	}
 }
 
@@ -589,6 +605,8 @@ export interface BrokerListReply {
 interface BoxRow {
 	readonly id: string;
 	readonly mailboxNumber: string;
+	/** The bound extension's number, when there is one — what sipd keys the MWI lamp on. */
+	readonly extensionNumber: string | null;
 	readonly mwiEnabled: boolean;
 }
 
@@ -613,9 +631,11 @@ async function requireBox(transaction: PbxDatabaseTransaction, boxId: string): P
 		.select({
 			id: voicemailBox.id,
 			mailboxNumber: voicemailBox.mailboxNumber,
+			extensionNumber: extension.number,
 			mwiEnabled: voicemailBox.mwiEnabled,
 		})
 		.from(voicemailBox)
+		.leftJoin(extension, eq(voicemailBox.extensionId, extension.id))
 		.where(eq(voicemailBox.id, boxId))
 		.limit(1);
 	const box = found[0];

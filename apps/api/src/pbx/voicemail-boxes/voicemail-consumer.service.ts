@@ -2,7 +2,7 @@ import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } fro
 import { AckPolicy, connect, DeliverPolicy, type NatsConnection } from "nats";
 import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import { getLogger } from "@optimiq-voice/logging";
-import { eq, voicemailBox, voicemailMessage } from "@optimiq-voice/pbx-db";
+import { eq, extension, voicemailBox, voicemailMessage } from "@optimiq-voice/pbx-db";
 import { isArchivingObjectStore } from "../../storage";
 import { PBX_DATABASE, PBX_ENV, PBX_VOICEMAIL_STORE } from "../shared/pbx.tokens";
 import { VoicemailEmailService } from "./voicemail-email.service";
@@ -283,7 +283,13 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 			// with a log line, whereas a NAK here would re-run an insert whose duplicate-detection is
 			// the only thing standing between a user and seeing one voicemail twice.
 			await this.archive(data.objectKey);
-			await this.publishMwi(envelope.orgId, mailboxId, data.mailboxNumber, filed.counts);
+			await this.publishMwi(
+				envelope.orgId,
+				mailboxId,
+				data.mailboxNumber,
+				filed.extensionNumber,
+				filed.counts,
+			);
 			// Whether this message's notification waits for its transcript. BOTH halves have to be
 			// true: the organization asked for the transcript in the mail, and this message is
 			// actually being transcribed. See {@link VoicemailConsumer.notifyByEmail}.
@@ -356,8 +362,10 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 				.select({
 					id: voicemailBox.id,
 					transcriptionEnabled: voicemailBox.transcriptionEnabled,
+					extensionNumber: extension.number,
 				})
 				.from(voicemailBox)
+				.leftJoin(extension, eq(voicemailBox.extensionId, extension.id))
 				.where(eq(voicemailBox.id, mailboxId))
 				.limit(1);
 			const found = box[0];
@@ -397,6 +405,7 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 
 			return {
 				counts: await readMailboxCounts(transaction, mailboxId),
+				extensionNumber: found.extensionNumber ?? undefined,
 				// Only a NEW row is enqueued. A redelivery's row already carries whatever status the
 				// first delivery gave it, and the worker re-checks `pending` anyway, so enqueuing a
 				// duplicate would be harmless — it would just be a query to learn nothing.
@@ -448,9 +457,17 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 		organizationId: string,
 		mailboxId: string,
 		mailboxNumber: string,
+		extensionNumber: string | undefined,
 		counts: MailboxCounts,
 	): Promise<void> {
-		await this.mwi.publish(organizationId, mailboxId, mailboxNumber, counts, "message-left");
+		await this.mwi.publish(
+			organizationId,
+			mailboxId,
+			mailboxNumber,
+			extensionNumber,
+			counts,
+			"message-left",
+		);
 	}
 
 	/**
@@ -524,6 +541,8 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 /** What {@link VoicemailConsumer.file} learned in the one transaction it ran. */
 interface FiledMessage {
 	readonly counts: MailboxCounts;
+	/** The bound extension's number, when there is one — what sipd keys the MWI lamp on. */
+	readonly extensionNumber: string | undefined;
 	/** True only for a NEW row whose box asked for transcription and whose provider can do it. */
 	readonly transcribe: boolean;
 }

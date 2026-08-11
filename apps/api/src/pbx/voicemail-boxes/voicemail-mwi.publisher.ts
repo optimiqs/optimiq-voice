@@ -86,11 +86,18 @@ export class VoicemailMwiPublisher implements OnModuleInit, OnApplicationShutdow
 		}
 	}
 
-	/** Publishes the mailbox's counts. Returns whether they reached the broker. */
+	/**
+	 * Publishes the mailbox's counts. Returns whether they reached the broker.
+	 *
+	 * `extensionNumber` is the extension whose lamp this lights, when the box is bound to one.
+	 * sipd matches a `message-summary` subscription on it; without it, sipd falls back to
+	 * assuming the mailbox number IS the extension number, which is only usually true.
+	 */
 	async publish(
 		organizationId: string,
 		mailboxId: string,
 		mailboxNumber: string,
+		extensionNumber: string | undefined,
 		counts: MailboxCounts,
 		reason: MwiReason,
 	): Promise<boolean> {
@@ -109,6 +116,7 @@ export class VoicemailMwiPublisher implements OnModuleInit, OnApplicationShutdow
 				source: "api",
 				data: {
 					mailboxNumber,
+					extensionNumber,
 					newCount: counts.newCount,
 					savedCount: counts.savedCount,
 					reason,
