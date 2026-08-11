@@ -1,9 +1,11 @@
 import { Inject, Injectable, type OnApplicationShutdown } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
 import { AriClient } from "@optimiq-voice/media-ari";
+import { toMediaEvent } from "../calls/ari-mapping";
 import { ENGINE_ENV } from "../nats/nats.tokens";
 import type { EngineEnv } from "../config/engine-env";
-import type { AriEvent, AriEventStream, AriStreamStatus } from "@optimiq-voice/media-ari";
+import type { MediaEvent } from "./media-event";
+import type { AriEventStream, AriStreamStatus } from "@optimiq-voice/media-ari";
 
 /**
  * Owns the ARI connection: the REST client and the event socket.
@@ -12,6 +14,13 @@ import type { AriEvent, AriEventStream, AriStreamStatus } from "@optimiq-voice/m
  * orchestrator's handler is registered, because a `StasisStart` that arrives before there is
  * anything to handle it is a call that rings forever. Nest's init order would make that ordering
  * implicit and therefore fragile; a start-up sequence that matters should be written down.
+ *
+ * ## It is also the event seam's boundary
+ *
+ * ARI events are translated to {@link MediaEvent} HERE, before the handler sees them, so nothing
+ * above this class ever holds an `AriEvent`. Together with `ari-media.adapter.ts` on the command
+ * side, that makes this file and `calls/ari-mapping.ts` the complete list of places a media-server
+ * swap has to touch.
  */
 @Injectable()
 export class AriConnectionService implements OnApplicationShutdown {
@@ -19,7 +28,7 @@ export class AriConnectionService implements OnApplicationShutdown {
 
 	readonly client: AriClient;
 	private stream: AriEventStream | undefined;
-	private handler: ((event: AriEvent) => void) | undefined;
+	private handler: ((event: MediaEvent) => void) | undefined;
 	private version: string | undefined;
 
 	constructor(@Inject(ENGINE_ENV) private readonly env: EngineEnv) {
@@ -53,8 +62,13 @@ export class AriConnectionService implements OnApplicationShutdown {
 		return this.stream?.eventCount ?? 0;
 	}
 
-	/** Registers the sink for ARI events. Must be called before {@link start}. */
-	setEventHandler(handler: (event: AriEvent) => void): void {
+	/**
+	 * Registers the sink for media events. Must be called before {@link start}.
+	 *
+	 * The handler receives {@link MediaEvent}, never ARI's own union: an ARI event the engine does
+	 * not consume is dropped by `toMediaEvent` and never reaches it at all.
+	 */
+	setEventHandler(handler: (event: MediaEvent) => void): void {
 		this.handler = handler;
 	}
 
@@ -79,7 +93,14 @@ export class AriConnectionService implements OnApplicationShutdown {
 
 		const handler = this.handler;
 		this.stream = this.client.createEventStream({
-			onEvent: handler,
+			onEvent: (event) => {
+				// The seam, applied at the edge. An event with no domain meaning stops here rather
+				// than reaching a handler that would have to know ARI's names to ignore it.
+				const media = toMediaEvent(event);
+				if (media !== undefined) {
+					handler(media);
+				}
+			},
 			onStatusChange: (status) => {
 				this.logger.info({ status }, "ARI event socket status changed");
 			},

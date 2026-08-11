@@ -1,22 +1,23 @@
 import { beforeEach, describe, expect, it } from "bun:test";
 import { parseAriEvent } from "@optimiq-voice/media-ari";
-import { makeFakeMediaPort } from "../ari/media-port.fake";
+import { makeFakeMediaPort } from "../media/media-port.fake";
 import { fakeQueueOrchestratorArgs } from "../queue/queue-services.fake";
 import { CallSignalBus } from "../routing/call-signals";
 import { ConferenceRegistry } from "../routing/conference-registry";
 import { ParkRegistry } from "../routing/park-registry";
 import { DtmfRegistry } from "../verbs/dtmf-registry";
 import { makeVerbExecutorRuntime } from "../verbs/verb-executor";
+import { toMediaEvent } from "./ari-mapping";
 import { CallControlRegistry } from "./call-control-registry";
 import { ChannelOrchestrator } from "./channel-orchestrator.service";
 import type { EngineEnv } from "../config/engine-env";
+import type { MediaEvent } from "../media/media-event";
 import type { CallEventPublisher } from "../nats/call-event-publisher.service";
 import type { JetStreamService } from "../nats/jetstream.service";
 import type { DidIndexSource } from "../routing/did-index.source";
 import type { RoutingArtifactSource } from "../routing/routing-artifact.source";
 import type { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
 import type { CallEventOf, CdrLegWriteEnvelope } from "@optimiq-voice/events";
-import type { AriEvent } from "@optimiq-voice/media-ari";
 import type { ChannelSnapshot } from "@optimiq-voice/telephony";
 
 /**
@@ -173,8 +174,25 @@ function channel(overrides: Record<string, unknown> = {}): Record<string, unknow
 	};
 }
 
-function ariEvent(type: string, extra: Record<string, unknown>): AriEvent {
-	return parseAriEvent({ type, application: "optimiq-engine", ...extra });
+/**
+ * One raw ARI frame, driven through the real boundary the process uses.
+ *
+ * The orchestrator consumes {@link MediaEvent} and knows nothing about ARI, so these specs could
+ * hand-build domain events directly. They deliberately do not: parsing a frame and mapping it is
+ * what `AriConnectionService` does on every live event, so driving the same path keeps the fixtures
+ * honest — a domain event no media server could actually produce would prove nothing.
+ */
+function mediaEvent(ariType: string, extra: Record<string, unknown>): MediaEvent {
+	const event = maybeMediaEvent(ariType, extra);
+	if (event === undefined) {
+		throw new Error(`${ariType} maps to no MediaEvent; use maybeMediaEvent to assert that`);
+	}
+	return event;
+}
+
+/** The same, for the cases where "the engine is not told at all" is the assertion. */
+function maybeMediaEvent(ariType: string, extra: Record<string, unknown>): MediaEvent | undefined {
+	return toMediaEvent(parseAriEvent({ type: ariType, application: "optimiq-engine", ...extra }));
 }
 
 function typesOf(published: readonly PublishedEvent[]): string[] {
@@ -184,7 +202,7 @@ function typesOf(published: readonly PublishedEvent[]): string[] {
 describe("inbound call arrival", () => {
 	it("creates a leg, publishes channel.created, mirrors KV, and runs the P2 program", async () => {
 		const h = harness();
-		await h.orchestrator.handleEvent(ariEvent("StasisStart", { channel: channel(), args: [] }));
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
 
 		expect(typesOf(h.published)).toEqual(["channel.created"]);
 		expect(h.published[0]?.orgId).toBe(ORG);
@@ -203,13 +221,13 @@ describe("inbound call arrival", () => {
 
 	it("plays the announcement only once the channel is really Up", async () => {
 		const h = harness(fakeEnv({ ENGINE_INBOUND_ANNOUNCEMENT: "sound:welcome" }));
-		await h.orchestrator.handleEvent(ariEvent("StasisStart", { channel: channel(), args: [] }));
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
 
 		// `answer` is a request, not a state: nothing may be played yet.
 		expect(h.mediaCalls.map((call) => call.method)).toEqual(["watchChannel", "ring", "answer"]);
 
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelStateChange", { channel: channel({ state: "Up" }) }),
+			mediaEvent("ChannelStateChange", { channel: channel({ state: "Up" }) }),
 		);
 		expect(h.mediaCalls.map((call) => call.method)).toEqual([
 			"watchChannel",
@@ -224,7 +242,7 @@ describe("inbound call arrival", () => {
 		const h = harness();
 		delete h.variables.OPTIMIQ_ORG_ID;
 
-		await h.orchestrator.handleEvent(ariEvent("StasisStart", { channel: channel(), args: [] }));
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
 
 		expect(h.published).toEqual([]);
 		expect(h.orchestrator.activeChannelCount).toBe(0);
@@ -236,13 +254,13 @@ describe("inbound call arrival", () => {
 		const h = harness(fakeEnv({ ENGINE_DEFAULT_ORGANIZATION_ID: ORG }));
 		delete h.variables.OPTIMIQ_ORG_ID;
 
-		await h.orchestrator.handleEvent(ariEvent("StasisStart", { channel: channel(), args: [] }));
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
 		expect(typesOf(h.published)).toEqual(["channel.created"]);
 	});
 
 	it("ignores a redelivered StasisStart, which a masquerade produces", async () => {
 		const h = harness();
-		const start = ariEvent("StasisStart", { channel: channel(), args: [] });
+		const start = mediaEvent("StasisStart", { channel: channel(), args: [] });
 		await h.orchestrator.handleEvent(start);
 		await h.orchestrator.handleEvent(start);
 
@@ -253,7 +271,7 @@ describe("inbound call arrival", () => {
 	it("reads the direction from a channel variable", async () => {
 		const h = harness();
 		h.variables.OPTIMIQ_CALL_DIRECTION = "outbound";
-		await h.orchestrator.handleEvent(ariEvent("StasisStart", { channel: channel(), args: [] }));
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
 		expect(h.published[0]?.data).toMatchObject({ direction: "outbound" });
 	});
 });
@@ -261,7 +279,7 @@ describe("inbound call arrival", () => {
 describe("progress", () => {
 	async function arrived() {
 		const h = harness();
-		await h.orchestrator.handleEvent(ariEvent("StasisStart", { channel: channel(), args: [] }));
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
 		h.published.length = 0;
 		h.mediaCalls.length = 0;
 		return h;
@@ -270,23 +288,26 @@ describe("progress", () => {
 	it("publishes channel.ringing on the alerting state", async () => {
 		const h = await arrived();
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelStateChange", { channel: channel({ state: "Ringing" }) }),
+			mediaEvent("ChannelStateChange", { channel: channel({ state: "Ringing" }) }),
 		);
 		expect(typesOf(h.published)).toEqual(["channel.ringing"]);
 	});
 
 	it("publishes channel.answered exactly once when the channel comes Up", async () => {
 		const h = await arrived();
-		const up = ariEvent("ChannelStateChange", { channel: channel({ state: "Up" }) });
+		const up = mediaEvent("ChannelStateChange", { channel: channel({ state: "Up" }) });
 		await h.orchestrator.handleEvent(up);
 		await h.orchestrator.handleEvent(up);
 		expect(typesOf(h.published)).toEqual(["channel.answered"]);
 	});
 
-	it("ignores an ARI state with no user-visible meaning", async () => {
+	it("is never told about a media-server state with no user-visible meaning", async () => {
 		const h = await arrived();
-		await h.orchestrator.handleEvent(
-			ariEvent("ChannelStateChange", { channel: channel({ state: "Busy" }) }),
+		// The drop moved down to the seam: `Busy` has no domain call state, so the mapping produces
+		// no event at all rather than one the orchestrator would have to recognise and ignore.
+		// Either way nothing is published, which is the fact this case has always been about.
+		expect(maybeMediaEvent("ChannelStateChange", { channel: channel({ state: "Busy" }) })).toBe(
+			undefined,
 		);
 		expect(h.published).toEqual([]);
 	});
@@ -294,7 +315,7 @@ describe("progress", () => {
 	it("ignores a state change for a channel it is not tracking", async () => {
 		const h = await arrived();
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelStateChange", { channel: channel({ id: "other", state: "Up" }) }),
+			mediaEvent("ChannelStateChange", { channel: channel({ id: "other", state: "Up" }) }),
 		);
 		expect(h.published).toEqual([]);
 	});
@@ -302,7 +323,7 @@ describe("progress", () => {
 	it("publishes each DTMF digit and queues it for a gather", async () => {
 		const h = await arrived();
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelDtmfReceived", { channel: channel(), digit: "7", duration_ms: 130 }),
+			mediaEvent("ChannelDtmfReceived", { channel: channel(), digit: "7", duration_ms: 130 }),
 		);
 
 		expect(typesOf(h.published)).toEqual(["channel.dtmf"]);
@@ -313,7 +334,7 @@ describe("progress", () => {
 	it("drops a non-DTMF symbol rather than publishing an invalid event", async () => {
 		const h = await arrived();
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelDtmfReceived", { channel: channel(), digit: "X", duration_ms: 10 }),
+			mediaEvent("ChannelDtmfReceived", { channel: channel(), digit: "X", duration_ms: 10 }),
 		);
 		expect(h.published).toEqual([]);
 	});
@@ -321,14 +342,14 @@ describe("progress", () => {
 	it("records engine channel variables and ignores everything else", async () => {
 		const h = await arrived();
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelVarset", { channel: channel(), variable: "OPTIMIQ_X", value: "1" }),
+			mediaEvent("ChannelVarset", { channel: channel(), variable: "OPTIMIQ_X", value: "1" }),
 		);
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelVarset", { channel: channel(), variable: "SIPCALLID", value: "abc" }),
+			mediaEvent("ChannelVarset", { channel: channel(), variable: "SIPCALLID", value: "abc" }),
 		);
 		// Observable through the KV mirror on the next state change.
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelStateChange", { channel: channel({ state: "Up" }) }),
+			mediaEvent("ChannelStateChange", { channel: channel({ state: "Up" }) }),
 		);
 		const snapshot = [...h.kv.values()][0];
 		expect(snapshot?.variables.OPTIMIQ_X).toBe("1");
@@ -339,9 +360,9 @@ describe("progress", () => {
 describe("teardown", () => {
 	async function answered() {
 		const h = harness();
-		await h.orchestrator.handleEvent(ariEvent("StasisStart", { channel: channel(), args: [] }));
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelStateChange", { channel: channel({ state: "Up" }) }),
+			mediaEvent("ChannelStateChange", { channel: channel({ state: "Up" }) }),
 		);
 		h.published.length = 0;
 		h.mediaCalls.length = 0;
@@ -353,7 +374,7 @@ describe("teardown", () => {
 		expect(h.kv.size).toBe(1);
 
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelDestroyed", {
+			mediaEvent("ChannelDestroyed", {
 				channel: channel({ state: "Down" }),
 				cause: 16,
 				cause_txt: "Normal Clearing",
@@ -378,10 +399,14 @@ describe("teardown", () => {
 	it("keeps the cause the far end sent, not the one ChannelDestroyed reports later", async () => {
 		const h = await answered();
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelHangupRequest", { channel: channel(), cause: 17 }),
+			mediaEvent("ChannelHangupRequest", { channel: channel(), cause: 17 }),
 		);
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelDestroyed", { channel: channel(), cause: 16, cause_txt: "Normal Clearing" }),
+			mediaEvent("ChannelDestroyed", {
+				channel: channel(),
+				cause: 16,
+				cause_txt: "Normal Clearing",
+			}),
 		);
 
 		expect(h.published[0]?.data).toMatchObject({ cause: "USER_BUSY" });
@@ -391,7 +416,7 @@ describe("teardown", () => {
 	it("preserves the RAW ARI code even when the cause has no name", async () => {
 		const h = await answered();
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelDestroyed", {
+			mediaEvent("ChannelDestroyed", {
 				channel: channel(),
 				cause: 47,
 				cause_txt: "Resource unavailable",
@@ -405,9 +430,9 @@ describe("teardown", () => {
 
 	it("writes a no-answer CDR that bills nothing for a leg that never answered", async () => {
 		const h = harness();
-		await h.orchestrator.handleEvent(ariEvent("StasisStart", { channel: channel(), args: [] }));
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelDestroyed", { channel: channel(), cause: 19, cause_txt: "No answer" }),
+			mediaEvent("ChannelDestroyed", { channel: channel(), cause: 19, cause_txt: "No answer" }),
 		);
 
 		expect(h.cdrs[0]?.data).toMatchObject({
@@ -421,7 +446,7 @@ describe("teardown", () => {
 	it("ignores a ChannelDestroyed for a channel it never tracked", async () => {
 		const h = harness();
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelDestroyed", { channel: channel({ id: "ghost" }), cause: 16 }),
+			mediaEvent("ChannelDestroyed", { channel: channel({ id: "ghost" }), cause: 16 }),
 		);
 		expect(h.published).toEqual([]);
 		expect(h.cdrs).toEqual([]);
@@ -430,11 +455,11 @@ describe("teardown", () => {
 	it("releases the DTMF queue when the leg goes away", async () => {
 		const h = await answered();
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelDtmfReceived", { channel: channel(), digit: "1", duration_ms: 100 }),
+			mediaEvent("ChannelDtmfReceived", { channel: channel(), digit: "1", duration_ms: 100 }),
 		);
 		expect(h.dtmf.size).toBe(1);
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelDestroyed", { channel: channel(), cause: 16 }),
+			mediaEvent("ChannelDestroyed", { channel: channel(), cause: 16 }),
 		);
 		expect(h.dtmf.size).toBe(0);
 	});
@@ -452,7 +477,7 @@ describe("drain", () => {
 		harnessInstance.mediaCalls.length = 0;
 
 		await harnessInstance.orchestrator.handleEvent(
-			ariEvent("StasisStart", { channel: channel(), args: [] }),
+			mediaEvent("StasisStart", { channel: channel(), args: [] }),
 		);
 
 		expect(harnessInstance.published).toEqual([]);
@@ -470,7 +495,7 @@ describe("drain", () => {
 
 	it("hangs up stragglers once the deadline passes", async () => {
 		await harnessInstance.orchestrator.handleEvent(
-			ariEvent("StasisStart", { channel: channel(), args: [] }),
+			mediaEvent("StasisStart", { channel: channel(), args: [] }),
 		);
 		harnessInstance.mediaCalls.length = 0;
 
@@ -515,7 +540,7 @@ describe("resilience", () => {
 		);
 
 		await expect(
-			orchestrator.handleEvent(ariEvent("StasisStart", { channel: channel(), args: [] })),
+			orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] })),
 		).resolves.toBeUndefined();
 		expect(orchestrator.activeChannelCount).toBe(1);
 	});

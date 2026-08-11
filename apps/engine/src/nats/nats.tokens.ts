@@ -23,7 +23,7 @@ export const ENGINE_ENV = Symbol("engine/Env");
 /** The `AriClient` instance for this process. */
 export const ARI_CLIENT = Symbol("engine/AriClient");
 
-/** The {@link import("../ari/media-port").MediaPort} implementation. */
+/** The {@link import("../media/media-port").MediaPort} implementation. */
 export const MEDIA_PORT = Symbol("engine/MediaPort");
 
 /** The calls module's Effect runtime (`ModuleEffectRuntime`). */

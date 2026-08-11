@@ -1,23 +1,24 @@
 import { describe, expect, it } from "bun:test";
 import { parseAriEvent } from "@optimiq-voice/media-ari";
 import { ROUTING_ARTIFACT_VERSION } from "@optimiq-voice/routing";
-import { makeFakeMediaPort } from "../ari/media-port.fake";
+import { makeFakeMediaPort } from "../media/media-port.fake";
 import { fakeQueueOrchestratorArgs } from "../queue/queue-services.fake";
 import { CallSignalBus, legSignalKey } from "../routing/call-signals";
 import { ConferenceRegistry } from "../routing/conference-registry";
 import { ParkRegistry } from "../routing/park-registry";
 import { DtmfRegistry } from "../verbs/dtmf-registry";
 import { makeVerbExecutorRuntime } from "../verbs/verb-executor";
+import { toMediaEvent } from "./ari-mapping";
 import { CallControlRegistry } from "./call-control-registry";
 import { ChannelOrchestrator } from "./channel-orchestrator.service";
 import type { EngineEnv } from "../config/engine-env";
+import type { MediaEvent } from "../media/media-event";
 import type { CallEventPublisher } from "../nats/call-event-publisher.service";
 import type { JetStreamService } from "../nats/jetstream.service";
 import type { DidIndexSource } from "../routing/did-index.source";
 import type { RoutingArtifactSource } from "../routing/routing-artifact.source";
 import type { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
 import type { CallEventOf, CdrLegWriteEnvelope } from "@optimiq-voice/events";
-import type { AriEvent } from "@optimiq-voice/media-ari";
 import type { PlanNode, PlanNodeTable, RoutingArtifact } from "@optimiq-voice/routing";
 import type { ChannelSnapshot } from "@optimiq-voice/telephony";
 
@@ -163,7 +164,7 @@ function harness(options: HarnessOptions = {}) {
 			}
 			queueMicrotask(() => {
 				void holder.orchestrator?.handleEvent(
-					ariEvent("ChannelStateChange", { channel: channel({ state: "Up" }) }),
+					mediaEvent("ChannelStateChange", { channel: channel({ state: "Up" }) }),
 				);
 			});
 		},
@@ -235,13 +236,26 @@ function channel(overrides: Record<string, unknown> = {}): Record<string, unknow
 	};
 }
 
-function ariEvent(type: string, extra: Record<string, unknown>): AriEvent {
-	return parseAriEvent({ type, application: "optimiq-engine", ...extra });
+/**
+ * One raw ARI frame, driven through the real boundary the process uses — parse, then map.
+ *
+ * The orchestrator consumes {@link MediaEvent} and knows nothing about ARI; starting from a frame
+ * keeps these fixtures anchored to something a media server actually emits. Every ARI type used
+ * here has a domain counterpart, so an `undefined` mapping is a bug in the fixture, not a case.
+ */
+function mediaEvent(ariType: string, extra: Record<string, unknown>): MediaEvent {
+	const event = toMediaEvent(
+		parseAriEvent({ type: ariType, application: "optimiq-engine", ...extra }),
+	);
+	if (event === undefined) {
+		throw new Error(`${ariType} maps to no MediaEvent`);
+	}
+	return event;
 }
 
 /** Arrive, then let the detached walk settle. */
 async function arrive(h: ReturnType<typeof harness>): Promise<void> {
-	await h.orchestrator.handleEvent(ariEvent("StasisStart", { channel: channel(), args: [] }));
+	await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
 	await h.orchestrator.awaitWalks();
 }
 
@@ -293,7 +307,7 @@ describe("routed inbound calls", () => {
 	it("rejects a DID nothing matches with UNALLOCATED_NUMBER, never a guess", async () => {
 		const h = harness({ artifact: artifactWith(TERMINALS, "hangup:UNALLOCATED_NUMBER") });
 		await h.orchestrator.handleEvent(
-			ariEvent("StasisStart", {
+			mediaEvent("StasisStart", {
 				channel: channel({ dialplan: { context: "optimiq-inbound", exten: "+19998887777" } }),
 				args: [],
 			}),
@@ -364,7 +378,7 @@ describe("CDR destination enrichment", () => {
 
 		await arrive(h);
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelDestroyed", { channel: channel(), cause: 16 }),
+			mediaEvent("ChannelDestroyed", { channel: channel(), cause: 16 }),
 		);
 
 		expect(h.cdrs[0]?.data).toMatchObject({
@@ -391,7 +405,7 @@ describe("CDR destination enrichment", () => {
 		const h = harness();
 		await arrive(h);
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelDestroyed", { channel: channel(), cause: 16 }),
+			mediaEvent("ChannelDestroyed", { channel: channel(), cause: 16 }),
 		);
 
 		expect(h.cdrs[0]?.data).toMatchObject({ destinationType: "unknown", destinationRef: null });
@@ -406,7 +420,7 @@ describe("legs the walker originated", () => {
 		h.signals.watch(legSignalKey("b-leg-1"), (signal) => seen.push(signal.kind));
 
 		await h.orchestrator.handleEvent(
-			ariEvent("StasisStart", { channel: channel({ id: "b-leg-1" }), args: [] }),
+			mediaEvent("StasisStart", { channel: channel({ id: "b-leg-1" }), args: [] }),
 		);
 
 		expect(seen).toEqual(["entered"]);
@@ -420,7 +434,7 @@ describe("legs the walker originated", () => {
 		h.signals.watch(legSignalKey("b-leg-1"), (signal) => seen.push(signal.kind));
 
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelStateChange", { channel: channel({ id: "b-leg-1", state: "Up" }) }),
+			mediaEvent("ChannelStateChange", { channel: channel({ id: "b-leg-1", state: "Up" }) }),
 		);
 		expect(seen).toEqual(["answered"]);
 	});
@@ -431,7 +445,7 @@ describe("legs the walker originated", () => {
 		h.signals.watch(legSignalKey("b-leg-1"), (signal) => seen.push(signal));
 
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelDestroyed", { channel: channel({ id: "b-leg-1" }), cause: 17 }),
+			mediaEvent("ChannelDestroyed", { channel: channel({ id: "b-leg-1" }), cause: 17 }),
 		);
 		expect(seen).toEqual([{ kind: "ended", cause: "USER_BUSY", causeCode: 17 }]);
 	});
@@ -442,7 +456,7 @@ describe("legs the walker originated", () => {
 		h.signals.watch("recording:vm-1", (signal) => seen.push(signal));
 
 		await h.orchestrator.handleEvent(
-			ariEvent("RecordingFinished", {
+			mediaEvent("RecordingFinished", {
 				recording: { name: "vm-1", format: "wav", duration: 3 },
 			}),
 		);
@@ -455,7 +469,7 @@ describe("legs the walker originated", () => {
 		h.signals.watch("recording:vm-1", (signal) => seen.push(signal));
 
 		await h.orchestrator.handleEvent(
-			ariEvent("RecordingFailed", {
+			mediaEvent("RecordingFailed", {
 				recording: { name: "vm-1", format: "wav", cause: "disk full" },
 			}),
 		);
@@ -527,10 +541,10 @@ describe("B-leg CDRs", () => {
 
 		// Both legs end. The B-leg first, as a callee hanging up does.
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelDestroyed", { channel: bLegChannel(bLegChannelId), cause: 16 }),
+			mediaEvent("ChannelDestroyed", { channel: bLegChannel(bLegChannelId), cause: 16 }),
 		);
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelDestroyed", { channel: channel(), cause: 16 }),
+			mediaEvent("ChannelDestroyed", { channel: channel(), cause: 16 }),
 		);
 
 		expect(h.cdrs).toHaveLength(2);
@@ -563,7 +577,7 @@ describe("B-leg CDRs", () => {
 
 		await h.orchestrator.handleEvent(
 			// ARI spells it lower-case on the wire; the parser is what normalises it.
-			ariEvent("ChannelHold", { channel: bLegChannel(bLegChannelId), musicclass: "default" }),
+			mediaEvent("ChannelHold", { channel: bLegChannel(bLegChannelId), musicclass: "default" }),
 		);
 
 		// The person who needs music is the CALLER, not the agent who pressed the key: the agent can
@@ -573,7 +587,7 @@ describe("B-leg CDRs", () => {
 		expect(h.published.filter((event) => event.type === "channel.held")).toHaveLength(1);
 
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelUnhold", { channel: bLegChannel(bLegChannelId) }),
+			mediaEvent("ChannelUnhold", { channel: bLegChannel(bLegChannelId) }),
 		);
 		expect(h.media.calls.some((call) => call.method === "stopMusicOnHold")).toBe(true);
 		expect(h.published.filter((event) => event.type === "channel.unheld")).toHaveLength(1);
@@ -591,7 +605,7 @@ describe("B-leg CDRs", () => {
 		const bLegChannelId = h.media.originated()[0]?.channelId as string;
 
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelDestroyed", { channel: bLegChannel(bLegChannelId), cause: 16 }),
+			mediaEvent("ChannelDestroyed", { channel: bLegChannel(bLegChannelId), cause: 16 }),
 		);
 
 		// The B-leg died while both were still in the bridge, so it names its peer.
@@ -677,7 +691,7 @@ describe("attributing an inbound call to a tenant", () => {
 
 		await arrive(h);
 		await h.orchestrator.handleEvent(
-			ariEvent("ChannelDestroyed", { channel: channel(), cause: 16 }),
+			mediaEvent("ChannelDestroyed", { channel: channel(), cause: 16 }),
 		);
 
 		expect(h.cdrs[0]?.orgId).toBe(ORG);
@@ -686,7 +700,7 @@ describe("attributing an inbound call to a tenant", () => {
 	it("rejects with INVALID_PROFILE when nothing can attribute the call", async () => {
 		const h = harness({ variables: {} });
 
-		await h.orchestrator.handleEvent(ariEvent("StasisStart", { channel: channel(), args: [] }));
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
 		await h.orchestrator.awaitWalks();
 
 		expect(h.media.hungUp()).toContainEqual({ channelId: ARI_CHANNEL, cause: "INVALID_PROFILE" });

@@ -3,16 +3,16 @@ import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import { VERB_NAMES } from "@optimiq-voice/telephony";
-import { makeFakeMediaPort } from "../ari/media-port.fake";
 import { CallControlRegistry } from "../calls/call-control-registry";
+import { makeFakeMediaPort } from "../media/media-port.fake";
 import {
 	MediaCommandFailure,
 	UnsupportedVerbFailure,
 	VerbNotPermittedFailure,
 } from "./verb-errors";
 import { makeVerbExecutor } from "./verb-executor";
-import type { MediaPort } from "../ari/media-port";
 import type { CallControlPort, ControlledLeg } from "../calls/call-control";
+import type { MediaPort } from "../media/media-port";
 import type { VerbChannelContext } from "./verb-executor";
 import type { DtmfCollection, Verb, VerbResult } from "@optimiq-voice/telephony";
 

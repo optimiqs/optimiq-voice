@@ -1,6 +1,8 @@
 import { CALL_DIRECTIONS } from "@optimiq-voice/events";
 import { hangupCauseCode, hangupCauseFromCode } from "@optimiq-voice/telephony";
+import type { MediaChannelSnapshot, MediaEvent } from "../media/media-event";
 import type { CallDirection, HangupSide, LegSide } from "@optimiq-voice/events";
+import type { AriChannel, AriEvent } from "@optimiq-voice/media-ari";
 import type { CallState, HangupCause } from "@optimiq-voice/telephony";
 
 /**
@@ -9,6 +11,11 @@ import type { CallState, HangupCause } from "@optimiq-voice/telephony";
  * Everything here is pure and total. It is the layer that makes the media server swappable: when
  * `apps/mediad` (plan §3.4 option E) replaces Asterisk, this file is replaced and the state
  * machines, the events and the CDR are untouched. Nothing below this file knows the word "ARI".
+ *
+ * It translates both directions of the seam. VALUES — Q.850 causes, call directions, channel
+ * states — have always been here. The EVENT UNION itself is here too as of {@link toMediaEvent}:
+ * this file, and the ARI adapter beneath it, are the only places in the engine that name an ARI
+ * event type at all.
  *
  * The value domains are IMPORTED, never redeclared — `CallDirection`, `HangupSide` and `LegSide`
  * belong to `@optimiq-voice/events` (the wire contract) and the state machines and hangup causes
@@ -167,3 +174,141 @@ export function dialStringOr(value: string | undefined): string {
 	const trimmed = value?.trim();
 	return trimmed === undefined || trimmed === "" ? UNKNOWN_DIAL_STRING : trimmed;
 }
+
+/**
+ * The channel facts the engine reads, lifted out of ARI's `Channel` resource.
+ *
+ * Pass-through, not normalisation: whether an empty caller number should become `unknown` or
+ * `undefined` depends on which consumer is asking (the wire contract and the CDR want different
+ * answers), so that decision stays above this seam. See {@link MediaChannelSnapshot}.
+ */
+function mediaChannelSnapshot(channel: AriChannel): MediaChannelSnapshot {
+	return {
+		id: channel.id,
+		name: channel.name,
+		...(channel.caller === undefined
+			? {}
+			: { callerName: channel.caller.name, callerNumber: channel.caller.number }),
+		...(channel.dialplan === undefined
+			? {}
+			: { dialedNumber: channel.dialplan.exten, context: channel.dialplan.context }),
+		// Only present when the media server is configured to export variables with every event,
+		// which is why the engine treats it as a hint and reads over the port when it misses.
+		variables: channel.channelvars ?? {},
+	};
+}
+
+/**
+ * The Q.850 cause a bare hangup REQUEST is read as when the far end sent none.
+ *
+ * 16, "normal clearing": the request arrived, so somebody deliberately ended the call, and the only
+ * honest reading of "deliberately, reason unstated" is a normal hangup. Defaulting to `NONE` (0)
+ * instead would put a cause on the CDR that means "no cause was ever signalled", which is a
+ * different and less true statement about a call that was explicitly hung up.
+ */
+const DEFAULT_HANGUP_REQUEST_CAUSE = 16;
+
+/**
+ * ARI's event union → the engine's own.
+ *
+ * ## Why this function is the seam
+ *
+ * It is the ONLY place an ARI event name is spoken above the ARI client. Everything downstream —
+ * the orchestrator, and whatever else grows a branch on media events — consumes
+ * {@link MediaEvent}, so replacing Asterisk means replacing this file and `ari-media.adapter.ts`
+ * and nothing else. Before it existed, the orchestrator branched on `StasisStart` and
+ * `ChannelDestroyed` directly and a media-server swap meant rewriting 1,800 lines of state machine
+ * on live calls.
+ *
+ * ## `undefined` is a first-class answer, not a failure
+ *
+ * It means "this is a real event the engine does not act on". Three kinds land here:
+ *
+ * 1. **Events with no consumer.** Bridge membership, playback progress, `Dial` status,
+ *    `ChannelCreated`, `ChannelDialplan`. The plan walker learns what it needs from the channel
+ *    events above and from its own command responses, so these carry no decision. They were
+ *    already being dropped — by the orchestrator's `default:` — and the only change is that the
+ *    drop now happens at the layer that can name what it dropped.
+ * 2. **A channel state with no user-visible meaning.** `Busy`, `OffHook`, `Unknown`, and whatever
+ *    a future Asterisk invents. `callStateFromAriChannelState` already answered `undefined` for
+ *    these and every consumer of that answer was a no-op; producing an event with no domain state
+ *    would only push an ARI-shaped hole through the seam.
+ * 3. **A `ChannelVarset` for a GLOBAL variable.** The engine's state is per-leg; a variable set on
+ *    no channel has nothing to be applied to.
+ *
+ * It is deliberately NOT the answer for a malformed event — those throw in `parseAriEvent`, at the
+ * socket, with the raw frame still in hand.
+ */
+export function toMediaEvent(event: AriEvent): MediaEvent | undefined {
+	switch (event.type) {
+		case "StasisStart":
+			return { type: "leg-arrived", channel: mediaChannelSnapshot(event.channel) };
+		case "StasisEnd":
+			return { type: "leg-left", channelId: event.channel.id };
+		case "ChannelStateChange": {
+			const callState = callStateFromAriChannelState(event.channel.state);
+			return callState === undefined
+				? undefined
+				: { type: "call-state-changed", channelId: event.channel.id, callState };
+		}
+		case "ChannelDtmfReceived":
+			return {
+				type: "dtmf-received",
+				channelId: event.channel.id,
+				digit: event.digit,
+				durationMs: event.durationMs,
+			};
+		case "ChannelHangupRequest":
+			return {
+				type: "hangup-requested",
+				channelId: event.channel.id,
+				cause: hangupCauseFromAri(event.cause ?? DEFAULT_HANGUP_REQUEST_CAUSE),
+			};
+		case "ChannelDestroyed":
+			return {
+				type: "leg-ended",
+				channelId: event.channel.id,
+				cause: hangupCauseFromAri(event.cause),
+				// The RAW code travels alongside the named cause on purpose: an unnamed Q.850 point
+				// becomes `NORMAL_UNSPECIFIED`, and the integer is then the only evidence left.
+				causeCode: event.cause,
+			};
+		case "ChannelVarset":
+			return event.channel === undefined
+				? undefined
+				: {
+						type: "variable-set",
+						channelId: event.channel.id,
+						variable: event.variable,
+						value: event.value,
+					};
+		case "ChannelHold":
+			return {
+				type: "leg-held",
+				channelId: event.channel.id,
+				...(event.musicClass === undefined ? {} : { musicClass: event.musicClass }),
+			};
+		case "ChannelUnhold":
+			return { type: "leg-unheld", channelId: event.channel.id };
+		case "RecordingStarted":
+			return { type: "recording-started", recordingName: event.recording.name };
+		case "RecordingFinished":
+			return {
+				type: "recording-finished",
+				recordingName: event.recording.name,
+				// ARI reports seconds; milliseconds are the unit everywhere above this seam.
+				durationMs: Math.round((event.recording.duration ?? 0) * 1_000),
+			};
+		case "RecordingFailed":
+			return {
+				type: "recording-failed",
+				recordingName: event.recording.name,
+				reason: event.recording.cause ?? UNKNOWN_RECORDING_FAILURE_REASON,
+			};
+		default:
+			return undefined;
+	}
+}
+
+/** What a recording failure is reported as when the media server volunteered no reason. */
+export const UNKNOWN_RECORDING_FAILURE_REASON = "unknown";

@@ -23,9 +23,9 @@ import {
 } from "@optimiq-voice/events";
 import { ROUTING_ARTIFACT_VERSION, routingCacheKey } from "@optimiq-voice/routing";
 import { AppModule } from "../src/app.module";
-import { AriConnectionService } from "../src/ari/ari-connection.service";
 import { callIdForAriChannel, legIdForAriChannel } from "../src/calls/channel-identity";
 import { ChannelOrchestrator } from "../src/calls/channel-orchestrator.service";
+import { AriConnectionService } from "../src/media/ari-connection.service";
 import type { AnyEventEnvelope } from "@optimiq-voice/events";
 import type { PlanNode, RoutingArtifact } from "@optimiq-voice/routing";
 import type { ChannelSnapshot } from "@optimiq-voice/telephony";

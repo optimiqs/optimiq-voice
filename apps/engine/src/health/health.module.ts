@@ -1,6 +1,6 @@
 import { Module } from "@nestjs/common";
-import { AriModule } from "../ari/ari.module";
 import { CallsModule } from "../calls/calls.module";
+import { AriModule } from "../media/ari.module";
 import { HealthController } from "./health.controller";
 
 @Module({

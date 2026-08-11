@@ -1,6 +1,6 @@
 import { Controller, Get, HttpCode, HttpStatus, Res } from "@nestjs/common";
-import { AriConnectionService } from "../ari/ari-connection.service";
 import { ChannelOrchestrator } from "../calls/channel-orchestrator.service";
+import { AriConnectionService } from "../media/ari-connection.service";
 import { JetStreamService } from "../nats/jetstream.service";
 import type { FastifyReply } from "fastify";
 

@@ -8,9 +8,9 @@ import {
 	UnsupportedVerbFailure,
 	VerbNotPermittedFailure,
 } from "./verb-errors";
-import type { MediaPort } from "../ari/media-port";
 import type { CallControlPort, ControlledLeg } from "../calls/call-control";
 import type { CallControlRegistry } from "../calls/call-control-registry";
+import type { MediaPort } from "../media/media-port";
 import type { VerbFailure } from "./verb-errors";
 import type {
 	AcknowledgedResult,

@@ -21,13 +21,7 @@ import { RoutingArtifactSource } from "../routing/routing-artifact.source";
 import { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
 import { dtmfEventFrom } from "../verbs/dtmf-inbox";
 import { DtmfRegistry } from "../verbs/dtmf-registry";
-import {
-	callDirectionFrom,
-	callStateFromAriChannelState,
-	dialStringOr,
-	hangupCauseFromAri,
-	hangupSideFor,
-} from "./ari-mapping";
+import { callDirectionFrom, dialStringOr, hangupSideFor } from "./ari-mapping";
 import { CallControl, pickupGroupFilter } from "./call-control";
 import { CallControlRegistry } from "./call-control-registry";
 import { buildCdrLegWrite } from "./cdr-leg";
@@ -35,8 +29,9 @@ import { ChannelAggregate } from "./channel-aggregate";
 import { callIdForAriChannel, legIdForAriChannel, resolveOrganizationId } from "./channel-identity";
 import { ChannelRegistry } from "./channel-registry";
 import { MidCallFeatureRuntime } from "./mid-call-features";
-import type { MediaPort } from "../ari/media-port";
 import type { EngineEnv } from "../config/engine-env";
+import type { MediaChannelSnapshot, MediaEvent } from "../media/media-event";
+import type { MediaPort } from "../media/media-port";
 import type {
 	OriginatedLeg,
 	OriginatedLegHooks,
@@ -55,14 +50,19 @@ import type {
 	RouteRequest,
 } from "./call-control";
 import type { CallDirection, CallEvent, LegSide } from "@optimiq-voice/events";
-import type { AriChannel, AriEvent } from "@optimiq-voice/media-ari";
 import type {
 	ExecutionPlan,
 	ParkPlanNode,
 	ResolvedRoute,
 	RoutingArtifact,
 } from "@optimiq-voice/routing";
-import type { CallerProfile, HangupCause, Verb, VerbResult } from "@optimiq-voice/telephony";
+import type {
+	CallerProfile,
+	CallState,
+	HangupCause,
+	Verb,
+	VerbResult,
+} from "@optimiq-voice/telephony";
 
 /** Channel variables the routing walk writes back, so the KV mirror carries the decision too. */
 const DESTINATION_TYPE_VARIABLE = "OPTIMIQ_DESTINATION_TYPE";
@@ -83,16 +83,24 @@ const BRIDGE_PEER_VARIABLE = "OPTIMIQ_BRIDGE_PEER_LEG_ID";
  *
  * ## What it does, in one sentence
  *
- * Turns ARI events into domain state transitions, publishes the resulting facts on NATS, mirrors
- * live state into KV, and emits one CDR per finished leg.
+ * Turns {@link MediaEvent}s into domain state transitions, publishes the resulting facts on NATS,
+ * mirrors live state into KV, and emits one CDR per finished leg.
+ *
+ * ## It does not know which media server it is talking to
+ *
+ * Commands go out through {@link MediaPort} and events come in as {@link MediaEvent}; neither
+ * names Asterisk. `media/ari-connection.service.ts` translates the event direction at the socket
+ * and `media/ari-media.adapter.ts` translates the command direction, both over the table in
+ * `ari-mapping.ts`. Nothing in this file has an ARI concept in it, which is what makes the
+ * `apps/mediad` cutover a change to two adapters rather than a rewrite of the 1,800 lines below.
  *
  * ## The invariants it exists to hold
  *
  * 1. **Every state move is guarded.** `assertChannelTransition` runs before the write, inside
  *    {@link ChannelAggregate}. An impossible transition throws rather than corrupting the
  *    snapshot other instances will read out of KV.
- * 2. **The hangup cause is fixed once.** The first cause wins; a later `ChannelDestroyed` cannot
- *    overwrite it. That is what makes the per-leg CDR reproducible from the event stream.
+ * 2. **The hangup cause is fixed once.** The first cause wins; the cause the leg's end reports
+ *    later cannot overwrite it. That is what makes the per-leg CDR reproducible from the events.
  * 3. **A call with no resolvable organization is REJECTED, never guessed.** Filing a call under
  *    the wrong tenant is both a billing error and an isolation breach, and both are silent.
  * 4. **Nothing here throws into the ARI socket.** A handler that throws inside a WebSocket
@@ -107,12 +115,12 @@ const BRIDGE_PEER_VARIABLE = "OPTIMIQ_BRIDGE_PEER_LEG_ID";
  * stream; it does not know what a ring group is.
  *
  * The walk runs DETACHED (see {@link runRoutedProgram}). It has to: an IVR that waits ten seconds
- * for a digit is waiting on ARI events that arrive through this same handler, so awaiting the walk
- * inside `StasisStart` would deadlock the call against itself.
+ * for a digit is waiting on media events that arrive through this same handler, so awaiting the
+ * walk inside the arrival handler would deadlock the call against itself.
  *
  * ## Two kinds of channel
  *
- * A `StasisStart` is either a NEW inbound call or a leg the plan walker originated. They are told
+ * An arriving leg is either a NEW inbound call or a leg the plan walker originated. They are told
  * apart by {@link CallSignalBus}: the walker subscribes to a leg's key before it originates, so a
  * watched key means "this is ours, do not file it as a new call". Getting that backwards would file
  * every B-leg as an inbound call with its own CDR.
@@ -213,73 +221,75 @@ export class ChannelOrchestrator {
 	}
 
 	/**
-	 * The single entry point for ARI events.
+	 * The single entry point for media events.
 	 *
-	 * Never throws: the caller is a WebSocket message callback (see invariant 4). Returns a promise
+	 * Never throws: the caller is a socket message callback (see invariant 4). Returns a promise
 	 * so the integration suite can await settlement; the socket itself does not await it, because
 	 * blocking the event loop on one channel's work would delay every other channel's events.
 	 */
-	async handleEvent(event: AriEvent): Promise<void> {
+	async handleEvent(event: MediaEvent): Promise<void> {
 		try {
 			await this.dispatch(event);
 		} catch (error) {
 			this.logger.error(
 				{ type: event.type, err: String(error) },
-				"unhandled failure while processing an ARI event",
+				"unhandled failure while processing a media event",
 			);
 		}
 	}
 
-	private async dispatch(event: AriEvent): Promise<void> {
+	/**
+	 * One branch per member of {@link MediaEvent}, and no `default:`.
+	 *
+	 * Exhaustive on purpose: the media server no longer decides what the engine ignores — the
+	 * mapping does, in `toMediaEvent`, where the drop can be named and tested. Adding a member to
+	 * the union without handling it here is now a compile error rather than silence on a live call.
+	 */
+	private async dispatch(event: MediaEvent): Promise<void> {
 		switch (event.type) {
-			case "StasisStart":
-				await this.onStasisStart(event.channel);
+			case "leg-arrived":
+				await this.onLegArrived(event.channel);
 				return;
-			case "ChannelStateChange":
-				await this.onChannelStateChange(event.channel);
+			case "call-state-changed":
+				await this.onCallStateChanged(event.channelId, event.callState);
 				return;
-			case "ChannelDtmfReceived":
-				await this.onDtmf(event.channel, event.digit, event.durationMs);
+			case "dtmf-received":
+				await this.onDtmf(event.channelId, event.digit, event.durationMs);
 				return;
-			case "ChannelHangupRequest":
-				this.onHangupRequest(event.channel, event.cause);
+			case "hangup-requested":
+				this.onHangupRequested(event.channelId, event.cause);
 				return;
-			case "StasisEnd":
-				this.onStasisEnd(event.channel);
+			case "leg-left":
+				this.onLegLeft(event.channelId);
 				return;
-			case "ChannelDestroyed":
-				await this.onChannelDestroyed(event.channel, event.cause);
+			case "leg-ended":
+				await this.onLegEnded(event.channelId, event.cause, event.causeCode);
 				return;
-			case "ChannelVarset":
-				this.onVarset(event.channel, event.variable, event.value);
+			case "variable-set":
+				this.onVariableSet(event.channelId, event.variable, event.value);
 				return;
-			case "ChannelHold":
-				await this.onPhoneHold(event.channel, true, event.musicClass);
+			case "leg-held":
+				await this.onPhoneHold(event.channelId, true, event.musicClass);
 				return;
-			case "ChannelUnhold":
-				await this.onPhoneHold(event.channel, false);
+			case "leg-unheld":
+				await this.onPhoneHold(event.channelId, false);
 				return;
-			case "RecordingStarted":
-				this.signals.emit(recordingSignalKey(event.recording.name), {
+			case "recording-started":
+				this.signals.emit(recordingSignalKey(event.recordingName), {
 					kind: "recording-started",
 				});
 				return;
-			case "RecordingFinished":
-				this.signals.emit(recordingSignalKey(event.recording.name), {
+			case "recording-finished":
+				this.signals.emit(recordingSignalKey(event.recordingName), {
 					kind: "recording-finished",
-					durationMs: Math.round((event.recording.duration ?? 0) * 1_000),
+					durationMs: event.durationMs,
 				});
 				return;
-			case "RecordingFailed":
-				this.signals.emit(recordingSignalKey(event.recording.name), {
+			case "recording-failed":
+				this.signals.emit(recordingSignalKey(event.recordingName), {
 					kind: "recording-failed",
-					reason: event.recording.cause ?? "unknown",
+					reason: event.reason,
 				});
-				return;
-			default:
-				// Every other ARI event is real information the engine does not act on yet
-				// (bridge membership, playback progress, Dial state). The walker gets what it needs
-				// from the channel events above.
 				return;
 		}
 	}
@@ -288,7 +298,7 @@ export class ChannelOrchestrator {
 	// Call entry
 	// -------------------------------------------------------------------------------------------
 
-	private async onStasisStart(channel: AriChannel): Promise<void> {
+	private async onLegArrived(channel: MediaChannelSnapshot): Promise<void> {
 		if (this.signals.isWatched(legSignalKey(channel.id))) {
 			// A leg the plan walker originated has reached the application. It is NOT a new inbound
 			// call: filing it as one would give the callee's own leg a `channel.created`, an
@@ -298,8 +308,8 @@ export class ChannelOrchestrator {
 		}
 
 		if (this.registry.byAriChannelId(channel.id) !== undefined) {
-			// A masquerade (attended transfer completing, a pickup) can re-deliver `StasisStart`
-			// for a channel already being tracked. Re-creating the aggregate would reset its state
+			// A masquerade (attended transfer completing, a pickup) can re-deliver an arrival for a
+			// channel already being tracked. Re-creating the aggregate would reset its state
 			// machine and lose the answer instant.
 			return;
 		}
@@ -318,13 +328,13 @@ export class ChannelOrchestrator {
 			// A leg an engine ORIGINATED, identified by the variable the walker exports onto it.
 			//
 			// The watched-key check above is the fast path but it is not sufficient on its own: a
-			// dial resolves on the FIRST signal it gets, and when `ChannelStateChange`→`Up` beats
-			// `StasisStart` the walker has already unsubscribed by the time this arrives. That
-			// window is small, real, and the failure it produces is the worst kind — the callee's
-			// own leg filed as a second inbound call, resolved against the DID table it was never
-			// dialled on, and given a CDR of its own.
+			// dial resolves on the FIRST signal it gets, and when the answer beats the arrival the
+			// walker has already unsubscribed by the time this lands. That window is small, real,
+			// and the failure it produces is the worst kind — the callee's own leg filed as a
+			// second inbound call, resolved against the DID table it was never dialled on, and
+			// given a CDR of its own.
 			this.logger.debug(
-				{ ariChannelId: channel.id, exten: channel.dialplan?.exten },
+				{ ariChannelId: channel.id, exten: channel.dialedNumber },
 				"a leg this engine originated reached the application",
 			);
 			this.signals.emit(legSignalKey(channel.id), { kind: "entered" });
@@ -337,7 +347,7 @@ export class ChannelOrchestrator {
 			// Invariant 3. `INVALID_PROFILE` is the honest cause: the call reached us without the
 			// routing context that says who it belongs to, and nothing on the platform could supply it.
 			this.logger.error(
-				{ ariChannelId: channel.id, exten: channel.dialplan?.exten },
+				{ ariChannelId: channel.id, exten: channel.dialedNumber },
 				"rejecting a call with no resolvable organization (no OPTIMIQ_ORG_ID, and the dialled " +
 					"number is not in the did-index bucket)",
 			);
@@ -363,7 +373,7 @@ export class ChannelOrchestrator {
 		// Explicitly subscribe to this leg's events. The engine's socket is narrow on purpose
 		// (`ARI_SUBSCRIBE_ALL=false`), and a narrow subscription stops the moment a channel leaves
 		// the application — which is precisely when teardown starts. Without this, a call the
-		// ENGINE ends emits `StasisEnd` and then nothing: no `channel.hangup`, no
+		// ENGINE ends reports the leg leaving and then nothing: no `channel.hangup`, no
 		// `channel.destroyed`, and no CDR. Best-effort: a media server that refuses the
 		// subscription is a degraded call, not a rejected one.
 		try {
@@ -388,15 +398,15 @@ export class ChannelOrchestrator {
 				leg: "a" satisfies LegSide,
 				direction: direction satisfies CallDirection,
 				from: {
-					number: dialStringOr(channel.caller?.number),
-					...(channel.caller?.name === undefined || channel.caller.name === ""
+					number: dialStringOr(channel.callerNumber),
+					...(channel.callerName === undefined || channel.callerName === ""
 						? {}
-						: { name: channel.caller.name }),
+						: { name: channel.callerName }),
 				},
-				to: { number: dialStringOr(channel.dialplan?.exten) },
-				...(channel.dialplan?.context === undefined || channel.dialplan.context === ""
+				to: { number: dialStringOr(channel.dialedNumber) },
+				...(channel.context === undefined || channel.context === ""
 					? {}
-					: { routingContext: channel.dialplan.context }),
+					: { routingContext: channel.context }),
 			},
 		});
 		await this.jetstream.putChannel(aggregate.snapshot);
@@ -427,7 +437,7 @@ export class ChannelOrchestrator {
 	 * `undefined` is a rejection, never a default. There is no fourth step.
 	 */
 	private async attributeCall(
-		channel: AriChannel,
+		channel: MediaChannelSnapshot,
 		variables: Readonly<Record<string, string | undefined>>,
 	): Promise<string | undefined> {
 		// No fallback here: the env default is applied below, after the index has had its say.
@@ -436,7 +446,7 @@ export class ChannelOrchestrator {
 			return stamped;
 		}
 
-		const dialled = channel.dialplan?.exten;
+		const dialled = channel.dialedNumber;
 		const hit = await this.didIndex.organizationFor(dialled);
 		if (hit !== undefined) {
 			this.logger.info(
@@ -482,10 +492,10 @@ export class ChannelOrchestrator {
 	/**
 	 * Part two of the unrouted program: whatever needs a media path.
 	 *
-	 * Separate from {@link runUnroutedProgram} because `answer` is a REQUEST, not a state: the ARI
-	 * call returns as soon as Asterisk has accepted it, and the channel only becomes `Up` — and the
-	 * leg only gains a media path — when the far end's `200 OK` has been exchanged, which arrives
-	 * as a later `ChannelStateChange`. Playing audio in the same loop as `answer` means playing it
+	 * Separate from {@link runUnroutedProgram} because `answer` is a REQUEST, not a state: the
+	 * command returns as soon as the media server has accepted it, and the leg only becomes active
+	 * — and only gains a media path — when the far end's `200 OK` has been exchanged, which arrives
+	 * as a later state change. Playing audio in the same loop as `answer` means playing it
 	 * at a leg that has not answered yet, which the verb guard correctly refuses.
 	 *
 	 * Skipped entirely when a routing walk owns the leg: the plan decides what the caller hears,
@@ -510,12 +520,12 @@ export class ChannelOrchestrator {
 	/**
 	 * Starts the routing walk, detached.
 	 *
-	 * Detached is not a shortcut, it is a requirement: the walk awaits ARI events (a B-leg
+	 * Detached is not a shortcut, it is a requirement: the walk awaits media events (a B-leg
 	 * answering, a digit arriving) that are delivered through this same handler. Awaiting the walk
-	 * from inside `StasisStart` would make the call wait for events that cannot be processed until
-	 * the call stops waiting.
+	 * from inside the arrival handler would make the call wait for events that cannot be processed
+	 * until the call stops waiting.
 	 */
-	private startRoutedProgram(aggregate: ChannelAggregate, channel: AriChannel): void {
+	private startRoutedProgram(aggregate: ChannelAggregate, channel: MediaChannelSnapshot): void {
 		const key = aggregate.ariChannelId;
 		const walk = this.runRoutedProgram(aggregate, channel)
 			.catch(async (error: unknown) => {
@@ -539,7 +549,10 @@ export class ChannelOrchestrator {
 	 * obtained the call falls back to the unrouted program rather than being dropped, because a
 	 * control plane that is briefly unreachable must not silently reject every inbound call.
 	 */
-	private async runRoutedProgram(aggregate: ChannelAggregate, channel: AriChannel): Promise<void> {
+	private async runRoutedProgram(
+		aggregate: ChannelAggregate,
+		channel: MediaChannelSnapshot,
+	): Promise<void> {
 		const artifact = await this.routing.get(aggregate.organizationId);
 		if (artifact === undefined) {
 			this.logger.error(
@@ -600,9 +613,7 @@ export class ChannelOrchestrator {
 			...(route.dialedNumber === undefined ? {} : { dialedNumber: route.dialedNumber }),
 			// What the caller actually pressed, so the Kari's Law notification can say `9911` rather
 			// than the `911` the switch sent.
-			...(channel.dialplan?.exten === undefined
-				? {}
-				: { originalDialedNumber: channel.dialplan.exten }),
+			...(channel.dialedNumber === undefined ? {} : { originalDialedNumber: channel.dialedNumber }),
 			...(route.callerIdNumber === undefined ? {} : { callerIdNumber: route.callerIdNumber }),
 			...(route.callerIdName === undefined ? {} : { callerIdName: route.callerIdName }),
 			...(route.featureArgument === undefined ? {} : { featureArgument: route.featureArgument }),
@@ -1034,10 +1045,9 @@ export class ChannelOrchestrator {
 	 *
 	 * ## Why the aggregate is created BEFORE the originate
 	 *
-	 * Because `StasisStart` for a fast-answering leg can arrive before the originate's own HTTP
-	 * response does. Creating the aggregate afterwards would leave a window in which the leg's events
-	 * — including its `ChannelDestroyed`, and therefore its CDR — arrive at an orchestrator that has
-	 * never heard of it.
+	 * Because a fast-answering leg can ARRIVE before the originate's own response does. Creating the
+	 * aggregate afterwards would leave a window in which the leg's events — including the one that
+	 * ends it, and therefore its CDR — arrive at an orchestrator that has never heard of it.
 	 *
 	 * ## Direction, and what a B-leg's `toNumber` means
 	 *
@@ -1208,12 +1218,12 @@ export class ChannelOrchestrator {
 	private resolveRoute(
 		artifact: RoutingArtifact,
 		aggregate: ChannelAggregate,
-		channel: AriChannel,
+		channel: MediaChannelSnapshot,
 	): ResolvedRoute {
 		const now = new Date();
-		const dialed = dialStringOr(channel.dialplan?.exten);
-		const caller = channel.caller?.number?.trim();
-		const callerName = channel.caller?.name?.trim();
+		const dialed = dialStringOr(channel.dialedNumber);
+		const caller = channel.callerNumber?.trim();
+		const callerName = channel.callerName?.trim();
 		const context = aggregate.snapshot.variables.OPTIMIQ_ROUTING_CONTEXT;
 		const direction = callDirectionFrom(aggregate.snapshot.variables.OPTIMIQ_CALL_DIRECTION);
 
@@ -1288,8 +1298,8 @@ export class ChannelOrchestrator {
 	private async execute(aggregate: ChannelAggregate, verb: Verb): Promise<VerbResult | undefined> {
 		if (verb.verb === "hangup") {
 			// Fix the cause BEFORE the media server is told, because the media server will not tell
-			// it back. Asterisk answers a locally-initiated `DELETE /channels/{id}` with a
-			// `ChannelHangupRequest` carrying its own generic code, and `markHangup` is first-wins —
+			// it back. A locally-initiated teardown comes back as a hangup request carrying the
+			// server's own generic code, and `markHangup` is first-wins —
 			// so without this the CDR for every call the ENGINE ended would say
 			// `NORMAL_UNSPECIFIED` instead of the routing decision that ended it. It is also what
 			// makes `hangupSide` report `system` rather than blaming the caller.
@@ -1323,26 +1333,28 @@ export class ChannelOrchestrator {
 	// Progress
 	// -------------------------------------------------------------------------------------------
 
-	private async onChannelStateChange(channel: AriChannel): Promise<void> {
-		const nextCallState = callStateFromAriChannelState(channel.state);
-		const aggregate = this.registry.byAriChannelId(channel.id);
+	private async onCallStateChanged(
+		mediaChannelId: string,
+		nextCallState: CallState,
+	): Promise<void> {
+		const aggregate = this.registry.byAriChannelId(mediaChannelId);
 
 		if (aggregate === undefined) {
 			// Not one of this instance's A-legs. If a walk is waiting on it, it is a leg that walk
 			// originated and this is the answer it is waiting for.
-			this.emitLegProgress(channel.id, nextCallState);
+			this.emitLegProgress(mediaChannelId, nextCallState);
 			return;
 		}
 
 		// The A-leg's own progress is published on the bus too, because `ensureAnswered` in the
-		// walker waits for exactly this: `answer` is a request and `Up` is the confirmation.
-		this.emitLegProgress(channel.id, nextCallState);
+		// walker waits for exactly this: `answer` is a request and `active` is the confirmation.
+		this.emitLegProgress(mediaChannelId, nextCallState);
 
 		if (aggregate.isTearingDown) {
 			return;
 		}
 
-		if (nextCallState === undefined || !aggregate.tryCallStateTo(nextCallState)) {
+		if (!aggregate.tryCallStateTo(nextCallState)) {
 			return;
 		}
 
@@ -1375,8 +1387,8 @@ export class ChannelOrchestrator {
 		}
 	}
 
-	private async onDtmf(channel: AriChannel, digit: string, durationMs: number): Promise<void> {
-		const aggregate = this.registry.byAriChannelId(channel.id);
+	private async onDtmf(mediaChannelId: string, digit: string, durationMs: number): Promise<void> {
+		const aggregate = this.registry.byAriChannelId(mediaChannelId);
 		if (aggregate === undefined) {
 			return;
 		}
@@ -1416,7 +1428,7 @@ export class ChannelOrchestrator {
 	}
 
 	/** Republishes a leg's progress on the signal bus. Unwatched keys are a no-op. */
-	private emitLegProgress(ariChannelId: string, callState: string | undefined): void {
+	private emitLegProgress(ariChannelId: string, callState: CallState): void {
 		const key = legSignalKey(ariChannelId);
 		if (!this.signals.isWatched(key)) {
 			return;
@@ -1435,7 +1447,7 @@ export class ChannelOrchestrator {
 	 *
 	 * This is the OTHER half of hold, and the half that actually happens on a real PBX: an agent
 	 * presses the key on their desk phone, the phone re-INVITEs with `sendonly`, and the engine finds
-	 * out from an ARI event rather than from a verb. The person who needs music is the FAR END — the
+	 * out from a media event rather than from a verb. The person who needs music is the FAR END — the
 	 * caller, who would otherwise hear nothing at all and conclude the call had dropped.
 	 *
 	 * So the engine plays music at the peer rather than at the leg the event is about, and publishes
@@ -1443,14 +1455,14 @@ export class ChannelOrchestrator {
 	 * see as held. The leg that pressed hold is not on hold; it is holding.
 	 *
 	 * Best-effort throughout: a music class that will not start leaves a caller in silence, which is
-	 * a worse call and a much better outcome than an exception on the ARI socket.
+	 * a worse call and a much better outcome than an exception on the event socket.
 	 */
 	private async onPhoneHold(
-		channel: AriChannel,
+		mediaChannelId: string,
 		held: boolean,
 		musicClass?: string,
 	): Promise<void> {
-		const aggregate = this.registry.byAriChannelId(channel.id);
+		const aggregate = this.registry.byAriChannelId(mediaChannelId);
 		if (aggregate === undefined || aggregate.isTearingDown) {
 			return;
 		}
@@ -1498,11 +1510,8 @@ export class ChannelOrchestrator {
 		await this.jetstream.putChannel(aggregate.snapshot);
 	}
 
-	private onVarset(channel: AriChannel | undefined, variable: string, value: string): void {
-		if (channel === undefined) {
-			return;
-		}
-		const aggregate = this.registry.byAriChannelId(channel.id);
+	private onVariableSet(mediaChannelId: string, variable: string, value: string): void {
+		const aggregate = this.registry.byAriChannelId(mediaChannelId);
 		if (aggregate === undefined || !variable.startsWith("OPTIMIQ_")) {
 			return;
 		}
@@ -1514,24 +1523,20 @@ export class ChannelOrchestrator {
 	// -------------------------------------------------------------------------------------------
 
 	/**
-	 * The far end asked to hang up. Fixes the cause NOW, while it is known — `ChannelDestroyed`
-	 * arrives later and, for a locally-initiated teardown, with a less specific code.
+	 * The far end asked to hang up. Fixes the cause NOW, while it is known — the leg's end arrives
+	 * later and, for a locally-initiated teardown, with a less specific code.
 	 */
-	private onHangupRequest(channel: AriChannel, ariCause: number | undefined): void {
-		const aggregate = this.registry.byAriChannelId(channel.id);
+	private onHangupRequested(mediaChannelId: string, cause: HangupCause): void {
+		const aggregate = this.registry.byAriChannelId(mediaChannelId);
 		if (aggregate === undefined) {
 			return;
 		}
-		aggregate.markHangup({
-			cause: hangupCauseFromAri(ariCause ?? 16),
-			at: Date.now(),
-			initiatedByEngine: false,
-		});
+		aggregate.markHangup({ cause, at: Date.now(), initiatedByEngine: false });
 	}
 
-	/** The channel left the Stasis application. Teardown has begun; no further verbs will run. */
-	private onStasisEnd(channel: AriChannel): void {
-		const aggregate = this.registry.byAriChannelId(channel.id);
+	/** The leg left the engine's control. Teardown has begun; no further verbs will run. */
+	private onLegLeft(mediaChannelId: string): void {
+		const aggregate = this.registry.byAriChannelId(mediaChannelId);
 		if (aggregate === undefined) {
 			return;
 		}
@@ -1547,17 +1552,24 @@ export class ChannelOrchestrator {
 	 * CDR has been acknowledged — an entry that outlives its call is recoverable, a CDR that was
 	 * never written is revenue.
 	 */
-	private async onChannelDestroyed(channel: AriChannel, ariCause: number): Promise<void> {
+	private async onLegEnded(
+		mediaChannelId: string,
+		// What the MEDIA SERVER says ended the leg, which is not necessarily what the CDR records:
+		// `markHangup` is first-wins, so an earlier and more specific cause (the far end's hangup
+		// request, a routing decision) keeps its place. Both are needed, hence two names.
+		reportedCause: HangupCause,
+		causeCode: number,
+	): Promise<void> {
 		// Emitted FIRST and unconditionally: a walk waiting on this leg — whether it is one it
 		// originated or the A-leg it is answering — must be released before anything slow runs,
 		// or a dial sits on its own ring timeout for a leg that is already gone.
-		this.signals.emit(legSignalKey(channel.id), {
+		this.signals.emit(legSignalKey(mediaChannelId), {
 			kind: "ended",
-			cause: hangupCauseFromAri(ariCause),
-			causeCode: ariCause,
+			cause: reportedCause,
+			causeCode,
 		});
 
-		const aggregate = this.registry.byAriChannelId(channel.id);
+		const aggregate = this.registry.byAriChannelId(mediaChannelId);
 		if (aggregate === undefined) {
 			return;
 		}
@@ -1566,20 +1578,16 @@ export class ChannelOrchestrator {
 		// the record says: completing an attended transfer fixes this leg's cause as
 		// `ATTENDED_TRANSFER`, and stopping a recording is what puts an object key behind the call.
 		try {
-			await this.control.onLegEnded(channel.id);
+			await this.control.onLegEnded(mediaChannelId);
 		} catch (error) {
 			this.logger.warn(
-				{ ariChannelId: channel.id, err: String(error) },
+				{ ariChannelId: mediaChannelId, err: String(error) },
 				"a call-control operation could not be released cleanly",
 			);
 		}
 
 		const at = Date.now();
-		aggregate.markHangup({
-			cause: hangupCauseFromAri(ariCause),
-			at,
-			initiatedByEngine: false,
-		});
+		aggregate.markHangup({ cause: reportedCause, at, initiatedByEngine: false });
 
 		this.dtmf.release(aggregate.channelId);
 		this.midCall.release(aggregate.channelId);
@@ -1597,9 +1605,9 @@ export class ChannelOrchestrator {
 			data: {
 				legId: aggregate.channelId,
 				cause,
-				// The RAW ARI code, not the code of the named cause: an unnamed Q.850 point maps to
+				// The RAW wire code, not the code of the named cause: an unnamed Q.850 point maps to
 				// `NORMAL_UNSPECIFIED` but its number is the only evidence of what really happened.
-				causeCode: ariCause,
+				causeCode,
 				side,
 			},
 		});
@@ -1616,7 +1624,7 @@ export class ChannelOrchestrator {
 			},
 		});
 
-		await this.writeCdr(aggregate, { cause, causeCode: ariCause, side, endedAt });
+		await this.writeCdr(aggregate, { cause, causeCode, side, endedAt });
 
 		aggregate.transitionTo("destroyed");
 		await this.jetstream.deleteChannel(aggregate.snapshot);
@@ -1635,9 +1643,9 @@ export class ChannelOrchestrator {
 	 * Local channel still holding a media port after the caller had gone, ended eventually by
 	 * Asterisk's absolute timeout rather than by the call finishing.
 	 *
-	 * Ordered after the CDR deliberately. Hanging the peer up first would race its own
-	 * `ChannelDestroyed` against this leg's record, and the two legs of one call must not be able to
-	 * interleave their teardown.
+	 * Ordered after the CDR deliberately. Hanging the peer up first would race the peer's own end
+	 * against this leg's record, and the two legs of one call must not be able to interleave their
+	 * teardown.
 	 */
 	private async endBridgePeer(aggregate: ChannelAggregate): Promise<void> {
 		const peerLegId = aggregate.snapshot.variables[BRIDGE_PEER_VARIABLE];
@@ -1767,9 +1775,9 @@ export class ChannelOrchestrator {
 
 	/** Reads the engine's channel variables in one pass. Absent variables come back `undefined`. */
 	private async readEngineVariables(
-		channel: AriChannel,
+		channel: MediaChannelSnapshot,
 	): Promise<Record<string, string | undefined>> {
-		const fromEvent = channel.channelvars ?? {};
+		const fromEvent = channel.variables;
 		const names = [
 			"OPTIMIQ_ORG_ID",
 			"OPTIMIQ_CALL_DIRECTION",
@@ -1780,8 +1788,8 @@ export class ChannelOrchestrator {
 		];
 		const entries = await Promise.all(
 			names.map(async (name) => {
-				// `channelvars` is only populated when Asterisk is configured to export variables
-				// with every event, so it is an optimisation, never the source of truth.
+				// The event's variables are only populated when the media server is configured to
+				// export them with every event, so they are an optimisation, never the truth.
 				const inline = fromEvent[name];
 				if (inline !== undefined && inline !== "") {
 					return [name, inline] as const;
@@ -1845,13 +1853,16 @@ function walkerChannelFor(aggregate: ChannelAggregate): WalkerChannel {
 }
 
 /** The caller profile for a leg at its first routing hop. */
-function profileFrom(channel: AriChannel, routingContext: string | undefined): CallerProfile {
+function profileFrom(
+	channel: MediaChannelSnapshot,
+	routingContext: string | undefined,
+): CallerProfile {
 	return {
-		callerIdName: emptyToUndefined(channel.caller?.name),
-		callerIdNumber: emptyToUndefined(channel.caller?.number),
-		ani: emptyToUndefined(channel.caller?.number),
-		destinationNumber: dialStringOr(channel.dialplan?.exten),
-		context: routingContext ?? emptyToUndefined(channel.dialplan?.context) ?? "default",
+		callerIdName: emptyToUndefined(channel.callerName),
+		callerIdNumber: emptyToUndefined(channel.callerNumber),
+		ani: emptyToUndefined(channel.callerNumber),
+		destinationNumber: dialStringOr(channel.dialedNumber),
+		context: routingContext ?? emptyToUndefined(channel.context) ?? "default",
 		channelName: emptyToUndefined(channel.name),
 		source: "ari",
 	};

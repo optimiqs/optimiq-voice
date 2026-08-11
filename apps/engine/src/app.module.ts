@@ -1,7 +1,7 @@
 import { Module } from "@nestjs/common";
-import { AriModule } from "./ari/ari.module";
 import { CallsModule } from "./calls/calls.module";
 import { HealthModule } from "./health/health.module";
+import { AriModule } from "./media/ari.module";
 import { NatsModule } from "./nats/nats.module";
 import { QueueModule } from "./queue/queue.module";
 import { RoutingModule } from "./routing/routing.module";

@@ -1,9 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { makeFakeMediaPort } from "../ari/media-port.fake";
+import { makeFakeMediaPort } from "../media/media-port.fake";
 import { CallSignalBus, legSignalKey, recordingSignalKey } from "../routing/call-signals";
 import { ParkRegistry } from "../routing/park-registry";
 import { CallControl, pickupGroupFilter } from "./call-control";
-import type { FakeMediaPortOptions } from "../ari/media-port.fake";
+import type { FakeMediaPortOptions } from "../media/media-port.fake";
 import type {
 	CallControlHost,
 	ControlledLeg,

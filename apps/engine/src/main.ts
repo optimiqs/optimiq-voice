@@ -3,9 +3,9 @@ import { NestFactory } from "@nestjs/core";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
 import { AppLogger, getLogger } from "@optimiq-voice/logging";
 import { AppModule } from "./app.module";
-import { AriConnectionService } from "./ari/ari-connection.service";
 import { ChannelOrchestrator } from "./calls/channel-orchestrator.service";
 import { loadEngineEnv } from "./config/engine-env";
+import { AriConnectionService } from "./media/ari-connection.service";
 
 /**
  * The engine's bootstrap.

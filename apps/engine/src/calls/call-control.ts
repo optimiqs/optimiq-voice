@@ -8,7 +8,7 @@ import {
 } from "@optimiq-voice/telephony";
 import { legSignalKey, recordingSignalKey } from "../routing/call-signals";
 import { parkSlotFor } from "../routing/park-registry";
-import type { MediaPort } from "../ari/media-port";
+import type { MediaPort } from "../media/media-port";
 import type { CallSignalBus, LegSignal } from "../routing/call-signals";
 import type { ParkedCall, ParkRegistry, ParkResult } from "../routing/park-registry";
 import type { CallEvent, ParkEndReason, PickupKind } from "@optimiq-voice/events";

@@ -5,7 +5,7 @@ import {
 	formatVoicemailPinHash,
 	MIN_SALT_BYTES,
 } from "@optimiq-voice/routing";
-import { makeFakeMediaPort } from "../ari/media-port.fake";
+import { makeFakeMediaPort } from "../media/media-port.fake";
 import { CallSignalBus, legSignalKey } from "./call-signals";
 import { ConferenceRegistry } from "./conference-registry";
 import { conferenceNode, planOf } from "./plan-fixtures.fake";

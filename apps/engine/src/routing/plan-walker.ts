@@ -6,7 +6,7 @@ import { legSignalKey, recordingSignalKey } from "./call-signals";
 import { DEFAULT_MEDIA_REF_SETTINGS, resolveMediaRef, translateMediaRef } from "./media-refs";
 import { planDestinationOf } from "./plan-destination";
 import { verifyPinDigest, verifyVoicemailPin } from "./voicemail-pin";
-import type { MediaPort } from "../ari/media-port";
+import type { MediaPort } from "../media/media-port";
 import type {
 	QueueCallPort,
 	QueueDialAttempt,

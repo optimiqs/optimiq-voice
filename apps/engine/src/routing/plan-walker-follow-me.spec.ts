@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { makeFakeMediaPort } from "../ari/media-port.fake";
+import { makeFakeMediaPort } from "../media/media-port.fake";
 import { CallSignalBus, legSignalKey } from "./call-signals";
 import {
 	extensionNode,

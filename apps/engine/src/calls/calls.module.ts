@@ -1,11 +1,11 @@
 import { Module } from "@nestjs/common";
-import { AriModule } from "../ari/ari.module";
+import { AriModule } from "../media/ari.module";
 import { CALLS_EFFECT_RUNTIME, MEDIA_PORT } from "../nats/nats.tokens";
 import { DtmfRegistry } from "../verbs/dtmf-registry";
 import { makeVerbExecutorRuntime } from "../verbs/verb-executor";
 import { CallControlRegistry } from "./call-control-registry";
 import { ChannelOrchestrator } from "./channel-orchestrator.service";
-import type { MediaPort } from "../ari/media-port";
+import type { MediaPort } from "../media/media-port";
 
 /**
  * The call-handling feature slice.
