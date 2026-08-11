@@ -5,6 +5,7 @@ import { VoicemailMessagesService } from "../../src/pbx/voicemail-boxes/voicemai
 import { VoicemailTranscriptionService } from "../../src/pbx/voicemail-boxes/voicemail-transcription.service";
 import { ObjectNotFoundError } from "../../src/storage";
 import { loadTranscriptionEnv, TranscriptionFailure } from "../../src/transcription";
+import type { VoicemailEmailService } from "../../src/pbx/voicemail-boxes/voicemail-email.service";
 import type { ObjectStore } from "../../src/storage";
 import type {
 	TranscriptionAudio,
@@ -469,6 +470,8 @@ interface Harness {
 	/** Every object key opened through the store. */
 	readonly opened: string[];
 	readonly opens: number;
+	/** Every message id the pipeline asked the email service to notify about. */
+	readonly notified: string[];
 }
 
 function harness(options: {
@@ -525,12 +528,26 @@ function harness(options: {
 		} as unknown as ObjectStore);
 
 	const settings: TranscriptionEnv = loadTranscriptionEnv(options.env ?? { ...FAST_RETRIES });
-	const service = new VoicemailTranscriptionService(database, store, options.provider, settings);
+	const notified: string[] = [];
+	const email = {
+		async notify(_organizationId: string, _mailboxId: string, messageId: string) {
+			notified.push(messageId);
+			return { outcome: "sent", to: "box@example.test", linked: false };
+		},
+	} as unknown as VoicemailEmailService;
+	const service = new VoicemailTranscriptionService(
+		database,
+		store,
+		options.provider,
+		settings,
+		email,
+	);
 	return {
 		service,
 		scopes,
 		writes,
 		opened,
+		notified,
 		get opens() {
 			return opened.length;
 		},

@@ -1,12 +1,16 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
-import { eq, voicemailBox, voicemailMessage } from "@optimiq-voice/pbx-db";
+import { and, eq, isNull, voicemailBox, voicemailMessage } from "@optimiq-voice/pbx-db";
 import { DEFAULT_MAIL_APP_NAME, Mailer, voicemailMail } from "../../mail";
 import { OrgSettingsService } from "../org-settings/org-settings.service";
 import { PBX_DATABASE, PBX_ENV } from "../shared/pbx.tokens";
 import { mintVoicemailMediaToken, voicemailMediaPath } from "./voicemail-media-token";
 import type { PbxEnv } from "../shared/pbx-env";
-import type { PbxDatabaseClient, VoicemailEmailMode } from "@optimiq-voice/pbx-db";
+import type {
+	PbxDatabaseClient,
+	VoicemailEmailMode,
+	VoicemailTranscriptionStatus,
+} from "@optimiq-voice/pbx-db";
 
 const logger = getLogger("api.pbx");
 
@@ -15,7 +19,20 @@ export type VoicemailEmailSkip =
 	| "org-disabled"
 	| "mailbox-mode-none"
 	| "no-address"
-	| "no-such-message";
+	| "no-such-message"
+	/** Somebody else already sent it. Normal: the deferred path has three racing senders. */
+	| "already-sent";
+
+/**
+ * What goes where a transcript would, when the organization asked for one and there is none.
+ *
+ * A marker rather than an omission, because the two facts are different and the reader can only tell
+ * them apart if the mail says so: a notification with no transcript section reads as "this mailbox
+ * does not do transcription", and one that says the transcript is unavailable reads as "it was
+ * supposed to and something went wrong" — which is the difference between a user who shrugs and a
+ * user who tells an administrator.
+ */
+export const TRANSCRIPTION_UNAVAILABLE = "[transcription unavailable]";
 
 /**
  * A string discriminant rather than `sent: true | false`, for the reason `org-settings.dto.ts`
@@ -153,10 +170,20 @@ export class VoicemailEmailService {
 			: undefined;
 		const inboxUrl =
 			this.mailer.appUrl === undefined ? undefined : `${this.mailer.appUrl}/voicemail`;
-		const transcription =
-			policy.voicemailToEmailIncludeTranscription && context.transcription !== null
-				? context.transcription
-				: undefined;
+		const transcription = transcriptionFor(
+			policy.voicemailToEmailIncludeTranscription,
+			context.transcription,
+			context.transcriptionStatus,
+		);
+
+		// The claim goes here and not a line earlier: every refusal above is a decision NOT to send,
+		// and marking a message as notified because a mailbox is set to `none` would make
+		// `email_sent_at` mean "somebody looked at this", which is a column nothing could then use to
+		// answer the question it exists for.
+		if (!(await this.claim(organizationId, messageId))) {
+			this.skipped += 1;
+			return { outcome: "skipped", reason: "already-sent" };
+		}
 
 		const rendered = voicemailMail({
 			appName: DEFAULT_MAIL_APP_NAME,
@@ -180,11 +207,77 @@ export class VoicemailEmailService {
 		});
 
 		if (!result.delivered) {
+			// The claim is GIVEN BACK, and this is the one place the once-only rule bends. It bends in
+			// the safe direction: nothing was delivered, so releasing cannot produce a duplicate in
+			// anybody's inbox, and holding the claim would mean a relay that was briefly down
+			// permanently suppresses a notification the back-fill would otherwise re-drive. The window
+			// it opens — two senders, one of which fails, and the other reads the released row — costs
+			// at worst one duplicate after a failure that has already been logged.
+			await this.release(organizationId, messageId);
 			this.failed += 1;
 			return { outcome: "failed" };
 		}
 		this.sent += 1;
 		return { outcome: "sent", to, linked: playUrl !== undefined };
+	}
+
+	/**
+	 * Whether this organization wants its voicemail notifications to WAIT for a transcript.
+	 *
+	 * The consumer's question at filing time, answered from the same policy read the send itself
+	 * uses. Both switches, because deferring a notification an organization has turned off would be
+	 * waiting ninety seconds to skip.
+	 *
+	 * The mailbox's half of the decision — whether this message is being transcribed at all — is the
+	 * consumer's to add, and it has it already: `file()` returns it as `transcribe`.
+	 */
+	async deferForTranscription(organizationId: string): Promise<boolean> {
+		try {
+			const policy = await this.settings.readNotificationSettingsFor(organizationId);
+			return policy.voicemailToEmailEnabled && policy.voicemailToEmailIncludeTranscription;
+		} catch (error) {
+			// A settings read that fails must not hold a notification hostage. Sending now, without a
+			// transcript, is the failure mode this whole feature is allowed to have.
+			logger.warn(
+				{ organizationId, err: error },
+				"could not read the notification policy; sending the voicemail notification immediately",
+			);
+			return false;
+		}
+	}
+
+	/**
+	 * Takes the right to send, atomically. `true` means this caller owns the notification.
+	 *
+	 * `UPDATE … SET email_sent_at = now() WHERE id = … AND email_sent_at IS NULL RETURNING id` — a
+	 * compare-and-set on the row rather than a flag in this process, because the deferred path has
+	 * three possible senders (the transcription worker, its budget timer, the back-fill) and two of
+	 * them can be in a DIFFERENT process. Under `READ COMMITTED` the loser's predicate is re-evaluated
+	 * against the winner's committed version and matches nothing, so it returns no rows and says so.
+	 *
+	 * Inside `withTenantScope`, so RLS is still the filter: the id came from a claim on the untenanted
+	 * handle, and re-proving the message belongs to this organization before writing to it is the same
+	 * rule the transcription worker follows for the object key.
+	 */
+	private async claim(organizationId: string, messageId: string): Promise<boolean> {
+		const claimed = await this.database.withTenantScope(organizationId, async (transaction) =>
+			transaction
+				.update(voicemailMessage)
+				.set({ emailSentAt: new Date() })
+				.where(and(eq(voicemailMessage.id, messageId), isNull(voicemailMessage.emailSentAt)))
+				.returning({ id: voicemailMessage.id }),
+		);
+		return claimed.length > 0;
+	}
+
+	/** Undoes a claim whose send did not happen. See the call site for why this is safe. */
+	private async release(organizationId: string, messageId: string): Promise<void> {
+		await this.database.withTenantScope(organizationId, async (transaction) => {
+			await transaction
+				.update(voicemailMessage)
+				.set({ emailSentAt: null })
+				.where(eq(voicemailMessage.id, messageId));
+		});
 	}
 
 	/**
@@ -236,6 +329,7 @@ export class VoicemailEmailService {
 					receivedAt: voicemailMessage.receivedAt,
 					durationMs: voicemailMessage.durationMs,
 					transcription: voicemailMessage.transcription,
+					transcriptionStatus: voicemailMessage.transcriptionStatus,
 				})
 				.from(voicemailMessage)
 				.where(eq(voicemailMessage.id, messageId))
@@ -260,4 +354,43 @@ interface VoicemailEmailContext {
 	readonly receivedAt: Date;
 	readonly durationMs: number;
 	readonly transcription: string | null;
+	readonly transcriptionStatus: VoicemailTranscriptionStatus;
+}
+
+/**
+ * What the notification says where the transcript goes, decided from the ROW.
+ *
+ * From the row rather than from an argument, because there are now three callers — the consumer at
+ * filing time, the transcription worker at settlement, and the back-fill — and a flag each of them
+ * passed would be three chances to disagree about a fact the database already holds. The status is
+ * what carries the difference:
+ *
+ * - `done` — the transcript, including an EMPTY one. A three-second message of hold music
+ *   transcribes to nothing, `mail-templates.ts` renders an empty string as no section, and that is
+ *   the right outcome without this function needing to know it.
+ * - `pending` — the budget expired before the provider answered. The marker: the notification was
+ *   held back for a transcript and is going out without one.
+ * - `failed` — the provider refused it. The marker, for the same reason.
+ * - `disabled` — this mailbox does not do transcription. NOTHING, which is the pre-existing
+ *   behaviour and the reason a box that never asked for a transcript cannot regress into being told
+ *   one is unavailable.
+ *
+ * A `done` row whose transcript is null is treated as the marker too. It should not exist — `done`
+ * is written together with the text — and if it does, the honest thing to say is that the transcript
+ * is not there.
+ */
+function transcriptionFor(
+	included: boolean,
+	transcription: string | null,
+	status: VoicemailTranscriptionStatus,
+): string | undefined {
+	if (!included || status === "disabled") {
+		return undefined;
+	}
+	if (transcription !== null) {
+		return transcription;
+	}
+	return status === "pending" || status === "failed" || status === "done"
+		? TRANSCRIPTION_UNAVAILABLE
+		: undefined;
 }

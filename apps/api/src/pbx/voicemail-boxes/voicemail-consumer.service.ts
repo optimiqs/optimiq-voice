@@ -284,14 +284,23 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 			// the only thing standing between a user and seeing one voicemail twice.
 			await this.archive(data.objectKey);
 			await this.publishMwi(envelope.orgId, mailboxId, data.mailboxNumber, filed.counts);
-			await this.notifyByEmail(envelope.orgId, mailboxId, data.messageId);
+			// Whether this message's notification waits for its transcript. BOTH halves have to be
+			// true: the organization asked for the transcript in the mail, and this message is
+			// actually being transcribed. See {@link VoicemailConsumer.notifyByEmail}.
+			const deferEmail =
+				filed.transcribe && (await this.email.deferForTranscription(envelope.orgId));
+			if (!deferEmail) {
+				await this.notifyByEmail(envelope.orgId, mailboxId, data.messageId);
+			}
 			// LAST, and after every await above, which is the whole of its safety argument: nothing
-			// that files a row, archives audio, lights a lamp or sends a notification is downstream of
-			// it, so a transcription seam that did not exist yesterday cannot have changed any of
-			// them. `enqueue` returns `void` and swallows its own refusals — see
-			// `voicemail-transcription.service.ts` — so this is not `await`ed and could not be.
+			// that files a row, archives audio or lights a lamp is downstream of it, so a transcription
+			// seam that did not exist yesterday cannot have changed any of them. `enqueue` returns
+			// `void` and swallows its own refusals — see `voicemail-transcription.service.ts` — so this
+			// is not `await`ed and could not be.
 			if (filed.transcribe) {
-				this.transcription.enqueue(envelope.orgId, mailboxId, data.messageId);
+				this.transcription.enqueue(envelope.orgId, mailboxId, data.messageId, {
+					deferredEmail: deferEmail,
+				});
 			}
 		} catch (error) {
 			this.failed += 1;
@@ -452,14 +461,38 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 	 * not throw — every refusal is a named outcome — so this is a `void` return by construction
 	 * rather than by a swallowed `catch`.
 	 *
+	 * ## When this does NOT run: the deferred notification
+	 *
+	 * `voicemailToEmailIncludeTranscription` used to be a promise this ordering could not keep. The
+	 * transcription is asynchronous and starts AFTER this call, so a mailbox that had asked for the
+	 * transcript in its notification got one with an empty transcript section, every time, on every
+	 * message — the setting read as configured and behaved as off.
+	 *
+	 * So the send now has two shapes and the setting picks between them:
+	 *
+	 * - **transcript not wanted, or this message is not being transcribed** — unchanged. The
+	 *   notification goes out here, at filing time, exactly as it always did. This is every mailbox
+	 *   without transcription and every deployment without a provider, which is to say almost all of
+	 *   them.
+	 * - **transcript wanted AND this message is `pending`** — the send is handed to the transcription
+	 *   pipeline, which settles it when the provider answers, when the provider fails, or when
+	 *   `TRANSCRIBE_EMAIL_WAIT_MS` runs out, whichever is first. A notification is therefore late by
+	 *   at most that budget and never absent: the back-fill re-drives any message whose process died
+	 *   holding one.
+	 *
+	 * Deferral is deliberately NOT a third setting. A tenant that asks for the transcript in the mail
+	 * has already said the transcript is the point of the mail, and a switch offering "include the
+	 * transcript, but send before it exists" is a switch whose on and off states are the same.
+	 *
 	 * ## What a duplicate delivery does
 	 *
 	 * JetStream will eventually redeliver, and a crash between the ack and this call means a
 	 * message that is filed and never emailed. Both are accepted, in that direction: the insert is
-	 * `on conflict do nothing`, so a redelivery re-runs this and sends a SECOND notification for a
-	 * message the recipient already has — an annoyance — whereas making the send part of the acked
-	 * unit of work would mean a relay outage re-filing rows. A duplicate notification carries the
-	 * same `X-Optimiq-Voicemail-Message-Id`, which is what lets a mail store collapse it.
+	 * `on conflict do nothing`, so a redelivery re-runs this — but no longer sends twice, because the
+	 * send is now gated on a `email_sent_at` compare-and-set that the deferred path needed anyway.
+	 * Making the send part of the acked unit of work would still be wrong: a relay outage would
+	 * re-file rows. A notification that does slip through as a duplicate carries the same
+	 * `X-Optimiq-Voicemail-Message-Id`, which is what lets a mail store collapse it.
 	 */
 	private async notifyByEmail(
 		organizationId: string,

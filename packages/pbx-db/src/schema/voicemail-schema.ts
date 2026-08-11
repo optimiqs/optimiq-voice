@@ -134,6 +134,51 @@ export const voicemailMessage = pgTable.withRLS(
 			.default("disabled"),
 		/** When {@link transcription} was written. Null in every state but `done`. */
 		transcribedAt: utcTimestamp("transcribed_at"),
+		/**
+		 * How many times a worker has taken responsibility for transcribing this message.
+		 *
+		 * Incremented by the CLAIM, not by the provider call, so a process that dies mid-transcription
+		 * still spent an attempt — otherwise a message that kills the worker is claimed forever. The
+		 * count is what makes `failed` eventually TERMINAL: past `TRANSCRIBE_SWEEP_MAX_ATTEMPTS` the
+		 * back-fill stops picking the row up, so a message whose audio a provider will never accept
+		 * costs a bounded number of requests rather than one an hour until somebody notices.
+		 *
+		 * Zero for every row filed before the sweeper existed, which reads correctly: those rows have
+		 * their full budget.
+		 */
+		transcriptionAttempts: integer("transcription_attempts").notNull().default(0),
+		/**
+		 * When a worker last claimed this row, and the whole of the back-fill's concurrency control.
+		 *
+		 * The claim is a single `UPDATE … WHERE transcription_claimed_at IS NULL OR … < cutoff`, so two
+		 * API replicas sweeping at the same instant serialise on the row lock and the loser's predicate
+		 * is re-evaluated against the winner's committed version — it matches nothing and claims
+		 * nothing. That is why this is a compare-and-set column rather than a lease held in a
+		 * transaction: a `SELECT … FOR UPDATE SKIP LOCKED` would have to hold its transaction open
+		 * across the provider call, and a minute-long lock in the control plane's pool is a worse
+		 * failure mode than a stale timestamp.
+		 *
+		 * A claim is never explicitly released. It EXPIRES after `TRANSCRIBE_SWEEP_CLAIM_TTL_MS`,
+		 * because the case it exists for is a process that stopped existing, and a crashed process
+		 * releases nothing.
+		 */
+		transcriptionClaimedAt: utcTimestamp("transcription_claimed_at"),
+		/**
+		 * When the voicemail-to-email notification for this message was handed to the relay.
+		 *
+		 * Exists because the notification stopped having exactly one sender: with
+		 * `voicemailToEmailIncludeTranscription` on, the mail is DEFERRED to whichever of the
+		 * transcription worker, the deferral timeout or the back-fill settles the message first, and
+		 * all three racing on the same row is the normal case rather than the exceptional one. The
+		 * send is gated on `UPDATE … SET email_sent_at = now() WHERE email_sent_at IS NULL RETURNING
+		 * id`, so the row — not an in-memory flag that a restart forgets — is what makes it once.
+		 *
+		 * Null on every message filed before this column existed, and on every message a tenant's
+		 * policy or a mailbox's mode meant was never emailed at all. It records a SEND, not a decision:
+		 * the claim is taken immediately before the relay call and given back if the relay refuses, so
+		 * a non-null value means somebody's inbox has it.
+		 */
+		emailSentAt: utcTimestamp("email_sent_at"),
 		/** Leg id in the CDR bounded context. Plain UUID: no cross-database foreign keys. */
 		callLegRef: uuidEntityId("call_leg_ref"),
 		...auditTimestampColumns(),
@@ -157,6 +202,25 @@ export const voicemailMessage = pgTable.withRLS(
 		index("voicemail_message_transcription_pending_idx")
 			.on(table.organizationId, table.receivedAt)
 			.where(sql`transcription_status = 'pending'`),
+		/**
+		 * The back-fill's index: "which messages ANYWHERE still owe a transcript".
+		 *
+		 * A second index rather than a reuse of the one above, because the two queries differ in the
+		 * one way that decides whether an index is usable. The pending index leads with
+		 * `organization_id` so a tenant-scoped question stays sargable; the back-fill asks its question
+		 * ACROSS tenants — "which tenants are owed a transcript" is not a question a tenant-scoped
+		 * transaction can ask, which is the reason `readPendingProjections` runs on the untenanted
+		 * handle too — and a leading `organization_id` it cannot constrain leaves it scanning the whole
+		 * index anyway.
+		 *
+		 * Partial over BOTH working statuses on the same terms as the pending index: `done` and
+		 * `disabled` are essentially the whole table on a healthy deployment and the back-fill never
+		 * looks at either. `transcription_claimed_at` is the second column because every eligibility
+		 * predicate ends in a comparison against it.
+		 */
+		index("voicemail_message_transcription_sweep_idx")
+			.on(table.transcriptionStatus, table.transcriptionClaimedAt)
+			.where(sql`transcription_status in ('pending', 'failed')`),
 		tenantIsolationPolicy("voicemail_message"),
 	],
 );

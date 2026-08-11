@@ -118,6 +118,13 @@ describe("tenant tables", () => {
 		"pbx_projection_outbox_pending_idx",
 		// Retention prunes published rows by age, across every tenant, for the same reason.
 		"pbx_projection_outbox_published_idx",
+		// The transcription back-fill's index, and exactly the same argument a third time: the
+		// question is "which messages ANYWHERE still owe a transcript?", asked on the untenanted
+		// handle by a process with no session organization. The tenant-scoped version of the same
+		// question already has `voicemail_message_transcription_pending_idx`, which does lead with
+		// `organization_id`; this one is partial over the two working statuses and is the size of the
+		// backlog rather than of the table.
+		"voicemail_message_transcription_sweep_idx",
 	]);
 
 	it("leads every composite index with organization_id so the tenant predicate is usable", () => {
@@ -292,6 +299,56 @@ describe("voicemail transcription", () => {
 		// Still organization-first, so the tenant predicate stays usable — the rule above.
 		const columns = index?.config.columns.map((entry) => ("name" in entry ? entry.name : ""));
 		expect(columns?.[0]).toBe("organization_id");
+	});
+
+	it("counts claims on a NOT NULL column that starts at zero", () => {
+		// Zero rather than nullable, so "how many attempts has this had" needs no coalesce anywhere and
+		// every row filed before the back-fill existed reads as having its whole budget left.
+		const column = columnsByName.get("transcription_attempts");
+		expect(column).toBeDefined();
+		expect(column?.getSQLType()).toBe("integer");
+		expect(column?.notNull).toBe(true);
+		expect(column?.default).toBe(0);
+	});
+
+	it("keeps the claim nullable, because null is what UNCLAIMED means", () => {
+		// The compare-and-set is `… WHERE transcription_claimed_at IS NULL OR … < cutoff`. A NOT NULL
+		// column with an epoch default would make every historic row permanently claimable-looking and
+		// would take the "nobody has ever touched this" state away from the predicate entirely.
+		const column = columnsByName.get("transcription_claimed_at");
+		expect(column).toBeDefined();
+		expect(column?.getSQLType()).toBe("timestamp with time zone");
+		expect(column?.notNull).toBe(false);
+		expect(column?.hasDefault).toBe(false);
+	});
+
+	it("keeps the notification marker nullable and defaultless, because it records a SEND", () => {
+		// `email_sent_at` is the once-only gate for a notification that now has three possible senders
+		// (the worker, the deferral timeout, the back-fill). A default would claim every message had
+		// been emailed, which is the one direction of error that loses mail silently.
+		const column = columnsByName.get("email_sent_at");
+		expect(column).toBeDefined();
+		expect(column?.getSQLType()).toBe("timestamp with time zone");
+		expect(column?.notNull).toBe(false);
+		expect(column?.hasDefault).toBe(false);
+	});
+
+	it("indexes the cross-tenant back-fill on status first, not organization first", () => {
+		// The distinction from the pending index above: this query cannot constrain `organization_id`
+		// — it is the query that asks WHICH tenants are owed — so a leading tenant column would leave
+		// it scanning the whole index.
+		const index = config.indexes.find(
+			(candidate) => candidate.config.name === "voicemail_message_transcription_sweep_idx",
+		);
+		expect(index).toBeDefined();
+		const columns = index?.config.columns.map((entry) => ("name" in entry ? entry.name : ""));
+		expect(columns?.[0]).toBe("transcription_status");
+		expect(columns?.[1]).toBe("transcription_claimed_at");
+		// Partial over both working statuses, and neither of the two that are ~100% of the table.
+		const predicate = JSON.stringify(index?.config.where?.queryChunks);
+		expect(predicate).toContain("pending");
+		expect(predicate).toContain("failed");
+		expect(predicate).not.toContain("disabled");
 	});
 
 	it("keeps the mailbox's own switch a plain boolean that is off by default", () => {

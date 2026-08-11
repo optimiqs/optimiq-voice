@@ -126,6 +126,99 @@ export const transcriptionEnvSchema = z
 		 * nullable transcript. See `voicemail-transcription.service.ts`.
 		 */
 		TRANSCRIBE_QUEUE_LIMIT: z.coerce.number().int().min(1).max(100_000).default(500),
+
+		/**
+		 * How often the back-fill runs. `0` disables it in this process.
+		 *
+		 * Five minutes rather than seconds because a sweep that finds work is already an anomaly — the
+		 * in-memory queue handles every message on a healthy process — and the thing it recovers from
+		 * (a restart, an overflow, a provider that was down for an hour) is not measured in seconds
+		 * either. The one case where the interval IS user-visible is a deferred notification whose
+		 * process died before it could send, and `TRANSCRIBE_EMAIL_WAIT_MS` bounds that separately.
+		 *
+		 * `0` exists for the same reason `PBX_OUTBOX_SWEEP_INTERVAL_MS`'s does: a one-shot container
+		 * or a test harness driving `sweep()` by hand must not also have a timer running.
+		 */
+		TRANSCRIBE_SWEEP_INTERVAL_MS: z.coerce.number().int().min(0).max(86_400_000).default(300_000),
+
+		/**
+		 * How old a `pending` row must be before the back-fill will take it.
+		 *
+		 * This is the whole of the "do not steal a message the live queue is holding" argument that
+		 * does not depend on being in the same process. A row is marked `pending` by the INSERT and
+		 * enqueued milliseconds later by the process that filed it, so anything younger than the grace
+		 * window is overwhelmingly likely to be in somebody's queue right now. Two minutes is longer
+		 * than a healthy transcription takes (a 60s per-request timeout, three attempts, mostly
+		 * finishing on the first) and short enough that a lost message is not lost for long.
+		 *
+		 * It is a heuristic, and it is deliberately not the only guard: the sweeper also excludes the
+		 * ids its own process is holding, the claim column excludes the ones another replica took, and
+		 * `markDone`/`markFailed` are guarded on `transcription_status = 'pending'` so even a genuine
+		 * double-transcription writes once. What the window buys is that the expensive half — the
+		 * provider request — is not paid twice on the ordinary path.
+		 */
+		TRANSCRIBE_SWEEP_GRACE_MS: z.coerce.number().int().min(0).max(86_400_000).default(120_000),
+
+		/**
+		 * How long a `failed` row waits before the back-fill tries it again.
+		 *
+		 * An hour, because `failed` means a provider already refused this message three times with
+		 * backoff. Retrying at the sweep interval would turn a five-minute outage into a permanent
+		 * request storm against an endpoint that is telling the system to stop; an hour is roughly
+		 * "somebody has had a chance to fix it", and an operator who has just fixed it does not have to
+		 * wait — restarting the process or lowering this variable picks the cohort up immediately.
+		 */
+		TRANSCRIBE_SWEEP_RETRY_AFTER_MS: z.coerce
+			.number()
+			.int()
+			.min(0)
+			.max(30 * 86_400_000)
+			.default(3_600_000),
+
+		/**
+		 * How long a claim is honoured before another sweep may take the row.
+		 *
+		 * The claim is never released explicitly — see `voicemail-schema.ts` — because the failure it
+		 * exists for is a process that stopped existing, and a crashed process releases nothing. So
+		 * this is the answer to "how long may a dead worker keep a message hostage", and it has to be
+		 * comfortably longer than the worst legitimate transcription (`TRANSCRIBE_TIMEOUT_MS` ×
+		 * `TRANSCRIBE_MAX_ATTEMPTS` plus backoff) or a slow provider becomes a duplicate-work machine.
+		 */
+		TRANSCRIBE_SWEEP_CLAIM_TTL_MS: z.coerce
+			.number()
+			.int()
+			.min(1_000)
+			.max(86_400_000)
+			.default(900_000),
+
+		/**
+		 * How many times one message may be CLAIMED before `failed` becomes terminal.
+		 *
+		 * The ceiling that stops the back-fill being an infinite retry loop wearing a schedule. Past
+		 * it the row keeps its `failed` status, stops being eligible, and stays visible to an operator
+		 * through the same status column — which is the honest outcome for a message whose audio a
+		 * provider is never going to accept. Five claims at an hour apart is most of a working day of
+		 * trying.
+		 */
+		TRANSCRIBE_SWEEP_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(1_000).default(5),
+
+		/** How many messages one sweep claims. Bounded so a long outage is drained over several passes. */
+		TRANSCRIBE_SWEEP_BATCH: z.coerce.number().int().min(1).max(10_000).default(100),
+
+		/**
+		 * How long a DEFERRED voicemail notification waits for a transcript before it goes without one.
+		 *
+		 * Only meaningful when the organization has `voicemailToEmailIncludeTranscription` on AND the
+		 * mailbox has transcription enabled; see `voicemail-consumer.service.ts` for why those two are
+		 * what switch deferral on. When the budget expires the mail is sent anyway, carrying
+		 * `[transcription unavailable]` in place of the text — a late voicemail notification is a much
+		 * worse outcome than one without a transcript, and both are better than a notification that
+		 * never arrives because a provider is wedged.
+		 *
+		 * Ninety seconds is a little over the default per-request timeout, so a single slow-but-working
+		 * transcription still makes it into the mail while a genuinely stuck one does not hold it.
+		 */
+		TRANSCRIBE_EMAIL_WAIT_MS: z.coerce.number().int().min(0).max(3_600_000).default(90_000),
 	})
 	.superRefine((value, context) => {
 		const hasBaseUrl = value.TRANSCRIBE_BASE_URL !== undefined;
@@ -148,6 +241,20 @@ export const transcriptionEnvSchema = z
 						"Set TRANSCRIBE_BASE_URL, or unset this to say transcription is off.",
 				});
 			}
+		}
+		if (value.TRANSCRIBE_SWEEP_CLAIM_TTL_MS < value.TRANSCRIBE_TIMEOUT_MS) {
+			// A claim that expires before a single request can finish is not a claim: the back-fill
+			// would take back every message that is currently being transcribed and pay the provider
+			// twice for all of them. Refused at parse time because the symptom — a doubled bill and
+			// duplicate work on a system that otherwise looks healthy — is not one anybody traces back
+			// to a timeout variable.
+			context.addIssue({
+				code: "custom",
+				path: ["TRANSCRIBE_SWEEP_CLAIM_TTL_MS"],
+				message:
+					"must be at least TRANSCRIBE_TIMEOUT_MS, or the back-fill reclaims messages that are " +
+					"still being transcribed",
+			});
 		}
 		if (value.TRANSCRIBE_MAX_BACKOFF_MS < value.TRANSCRIBE_RETRY_BASE_MS) {
 			context.addIssue({
@@ -172,6 +279,14 @@ export interface TranscriptionEnv {
 	readonly retryBaseMs: number;
 	readonly maxBackoffMs: number;
 	readonly queueLimit: number;
+	/** `0` disables the back-fill in this process. */
+	readonly sweepIntervalMs: number;
+	readonly sweepGraceMs: number;
+	readonly sweepRetryAfterMs: number;
+	readonly sweepClaimTtlMs: number;
+	readonly sweepMaxAttempts: number;
+	readonly sweepBatch: number;
+	readonly emailWaitMs: number;
 }
 
 /**
@@ -201,6 +316,13 @@ export function loadTranscriptionEnv(source: NodeJS.ProcessEnv = process.env): T
 		retryBaseMs: value.TRANSCRIBE_RETRY_BASE_MS,
 		maxBackoffMs: value.TRANSCRIBE_MAX_BACKOFF_MS,
 		queueLimit: value.TRANSCRIBE_QUEUE_LIMIT,
+		sweepIntervalMs: value.TRANSCRIBE_SWEEP_INTERVAL_MS,
+		sweepGraceMs: value.TRANSCRIBE_SWEEP_GRACE_MS,
+		sweepRetryAfterMs: value.TRANSCRIBE_SWEEP_RETRY_AFTER_MS,
+		sweepClaimTtlMs: value.TRANSCRIBE_SWEEP_CLAIM_TTL_MS,
+		sweepMaxAttempts: value.TRANSCRIBE_SWEEP_MAX_ATTEMPTS,
+		sweepBatch: value.TRANSCRIBE_SWEEP_BATCH,
+		emailWaitMs: value.TRANSCRIBE_EMAIL_WAIT_MS,
 	};
 }
 

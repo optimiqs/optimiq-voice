@@ -90,6 +90,7 @@ import { VoicemailMessagesService } from "./voicemail-boxes/voicemail-messages.s
 import { VoicemailMwiPublisher } from "./voicemail-boxes/voicemail-mwi.publisher";
 import { VoicemailPinService } from "./voicemail-boxes/voicemail-pin.service";
 import { VoicemailRpcController } from "./voicemail-boxes/voicemail-rpc.controller";
+import { VoicemailTranscriptionSweeper } from "./voicemail-boxes/voicemail-transcription-sweeper.service";
 import { VoicemailTranscriptionService } from "./voicemail-boxes/voicemail-transcription.service";
 import type { ObjectStore } from "../storage";
 import type { TranscriptionEnv, TranscriptionProvider } from "../transcription";
@@ -483,6 +484,7 @@ const logger = getLogger("api.pbx");
 		VoicemailGreetingsService,
 		VoicemailEmailService,
 		VoicemailTranscriptionService,
+		VoicemailTranscriptionSweeper,
 		VoicemailConsumer,
 		RoutingService,
 		/**
@@ -511,6 +513,7 @@ const logger = getLogger("api.pbx");
 		ProjectionOutboxSweeper,
 		VoicemailMessagesService,
 		VoicemailMwiPublisher,
+		VoicemailTranscriptionSweeper,
 		PromptsService,
 	],
 })
