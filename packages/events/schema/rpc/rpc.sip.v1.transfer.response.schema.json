@@ -1,0 +1,54 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"ok": {
+			"type": "boolean"
+		},
+		"sipCallId": {
+			"type": "string",
+			"maxLength": 256
+		},
+		"instanceId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"legId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"callId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"destination": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"reason": {
+			"type": "string",
+			"enum": [
+				"bad_request",
+				"unknown_dialog",
+				"correlation_unavailable",
+				"not_permitted",
+				"wrong_instance",
+				"unknown_target",
+				"attended_unsupported",
+				"channel_gone",
+				"transfer_failed",
+				"shutting_down",
+				"internal"
+			]
+		},
+		"error": {
+			"type": "string",
+			"maxLength": 512
+		}
+	},
+	"required": ["ok", "sipCallId"],
+	"additionalProperties": false
+}

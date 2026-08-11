@@ -26,6 +26,7 @@ const (
 	SubjectAuthzCheckRPC            = "rpc.authz.v1.check"
 	SubjectVoicemailListRPC         = "rpc.voicemail.v1.list"
 	SubjectSipCredentialRPC         = "rpc.sip.v1.credential"
+	SubjectSipTransferRPC           = "rpc.sip.v1.transfer"
 	SubjectMediaAllocateSessionRPC  = "rpc.media.v1.allocate-session"
 	SubjectMediaBridgeSessionsRPC   = "rpc.media.v1.bridge-sessions"
 	SubjectMediaUnbridgeSessionsRPC = "rpc.media.v1.unbridge-sessions"
@@ -38,6 +39,7 @@ const (
 	TimeoutAuthzCheckRPC            = 1000 * time.Millisecond
 	TimeoutVoicemailListRPC         = 3000 * time.Millisecond
 	TimeoutSipCredentialRPC         = 500 * time.Millisecond
+	TimeoutSipTransferRPC           = 2000 * time.Millisecond
 	TimeoutMediaAllocateSessionRPC  = 500 * time.Millisecond
 	TimeoutMediaBridgeSessionsRPC   = 500 * time.Millisecond
 	TimeoutMediaUnbridgeSessionsRPC = 500 * time.Millisecond
@@ -232,6 +234,126 @@ type SipCredentialResponse struct {
 	ExtensionID *string `json:"extensionId,omitempty"`
 	Reason      *string `json:"reason,omitempty"`
 }
+
+// SipTransferRequest is the request body of rpc.sip.v1.transfer.
+type SipTransferRequest struct {
+	OrgID         string                       `json:"orgId"`
+	SIPCallID     string                       `json:"sipCallId"`
+	FromTag       *string                      `json:"fromTag,omitempty"`
+	ToTag         *string                      `json:"toTag,omitempty"`
+	ReferredBy    SipTransferRequestReferredBy `json:"referredBy"`
+	Target        SipTransferRequestTarget     `json:"target"`
+	Kind          SipTransferRequestKind       `json:"kind"`
+	Replaces      *SipTransferRequestReplaces  `json:"replaces,omitempty"`
+	ReferCSeq     *int                         `json:"referCSeq,omitempty"`
+	SourceAddress *string                      `json:"sourceAddress,omitempty"`
+	Transport     *SIPTransport                `json:"transport,omitempty"`
+}
+
+// SipTransferRequestReferredBy is a payload fragment of the contract.
+type SipTransferRequestReferredBy struct {
+	AOR         string  `json:"aor"`
+	Username    string  `json:"username"`
+	ExtensionID *string `json:"extensionId,omitempty"`
+	DeviceID    *string `json:"deviceId,omitempty"`
+}
+
+// SipTransferRequestTarget is a payload fragment of the contract.
+type SipTransferRequestTarget struct {
+	User string  `json:"user"`
+	Host *string `json:"host,omitempty"`
+	URI  *string `json:"uri,omitempty"`
+}
+
+// SipTransferRequestKind is the closed vocabulary of SipTransferRequest.kind.
+type SipTransferRequestKind string
+
+const (
+	SipTransferRequestKindBlind    SipTransferRequestKind = "blind"
+	SipTransferRequestKindAttended SipTransferRequestKind = "attended"
+)
+
+// SipTransferRequestKindValues lists every member of the vocabulary, in contract order.
+var SipTransferRequestKindValues = []SipTransferRequestKind{
+	SipTransferRequestKindBlind,
+	SipTransferRequestKindAttended,
+}
+
+// Valid reports whether v is a member of the SipTransferRequestKind vocabulary.
+func (v SipTransferRequestKind) Valid() bool {
+	for _, candidate := range SipTransferRequestKindValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SipTransferRequestKind) String() string { return string(v) }
+
+// SipTransferRequestReplaces is a payload fragment of the contract.
+type SipTransferRequestReplaces struct {
+	CallID    string `json:"callId"`
+	ToTag     string `json:"toTag"`
+	FromTag   string `json:"fromTag"`
+	EarlyOnly bool   `json:"earlyOnly"`
+}
+
+// SipTransferResponse is the reply body of rpc.sip.v1.transfer.
+type SipTransferResponse struct {
+	Ok          bool                       `json:"ok"`
+	SIPCallID   string                     `json:"sipCallId"`
+	InstanceID  *string                    `json:"instanceId,omitempty"`
+	LegID       *string                    `json:"legId,omitempty"`
+	CallID      *string                    `json:"callId,omitempty"`
+	Destination *string                    `json:"destination,omitempty"`
+	Reason      *SipTransferResponseReason `json:"reason,omitempty"`
+	Error       *string                    `json:"error,omitempty"`
+}
+
+// SipTransferResponseReason is the closed vocabulary of SipTransferResponse.reason.
+type SipTransferResponseReason string
+
+const (
+	SipTransferResponseReasonBadRequest             SipTransferResponseReason = "bad_request"
+	SipTransferResponseReasonUnknownDialog          SipTransferResponseReason = "unknown_dialog"
+	SipTransferResponseReasonCorrelationUnavailable SipTransferResponseReason = "correlation_unavailable"
+	SipTransferResponseReasonNotPermitted           SipTransferResponseReason = "not_permitted"
+	SipTransferResponseReasonWrongInstance          SipTransferResponseReason = "wrong_instance"
+	SipTransferResponseReasonUnknownTarget          SipTransferResponseReason = "unknown_target"
+	SipTransferResponseReasonAttendedUnsupported    SipTransferResponseReason = "attended_unsupported"
+	SipTransferResponseReasonChannelGone            SipTransferResponseReason = "channel_gone"
+	SipTransferResponseReasonTransferFailed         SipTransferResponseReason = "transfer_failed"
+	SipTransferResponseReasonShuttingDown           SipTransferResponseReason = "shutting_down"
+	SipTransferResponseReasonInternal               SipTransferResponseReason = "internal"
+)
+
+// SipTransferResponseReasonValues lists every member of the vocabulary, in contract order.
+var SipTransferResponseReasonValues = []SipTransferResponseReason{
+	SipTransferResponseReasonBadRequest,
+	SipTransferResponseReasonUnknownDialog,
+	SipTransferResponseReasonCorrelationUnavailable,
+	SipTransferResponseReasonNotPermitted,
+	SipTransferResponseReasonWrongInstance,
+	SipTransferResponseReasonUnknownTarget,
+	SipTransferResponseReasonAttendedUnsupported,
+	SipTransferResponseReasonChannelGone,
+	SipTransferResponseReasonTransferFailed,
+	SipTransferResponseReasonShuttingDown,
+	SipTransferResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the SipTransferResponseReason vocabulary.
+func (v SipTransferResponseReason) Valid() bool {
+	for _, candidate := range SipTransferResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SipTransferResponseReason) String() string { return string(v) }
 
 // MediaAllocateSessionRequest is the request body of rpc.media.v1.allocate-session.
 type MediaAllocateSessionRequest struct {

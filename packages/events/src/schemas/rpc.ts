@@ -324,6 +324,245 @@ export const SIP_CREDENTIAL_RPC = defineRpc(
 );
 
 // ---------------------------------------------------------------------------------------------
+// rpc.sip.v1.transfer — sipd → engine, on a REFER from a desk phone
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Why a SIP transfer was refused.
+ *
+ * As everywhere else on this backbone, a refusal is a REPLY. Here it is not merely good manners:
+ * RFC 3515 obliges the referee to report the outcome back to the phone in a NOTIFY carrying a
+ * `message/sipfrag` status line, and a silence would leave `apps/sipd` inventing one. The registrar
+ * maps every code below onto a single `SIP/2.0 503 Service Unavailable` frag — the phone gets one
+ * honest failure rather than a taxonomy it cannot act on — while the code itself is what the logs
+ * and any future operator UI branch on.
+ */
+export const SIP_TRANSFER_REFUSAL_REASONS = [
+	/** Malformed payload, or a required field missing. Retrying the same bytes fails the same way. */
+	"bad_request",
+	/**
+	 * No live call matches the SIP dialog the REFER arrived in.
+	 *
+	 * The ordinary answer, and the racy one: the transferor hung up, or the far end did, between the
+	 * REFER leaving the phone and this request being served.
+	 */
+	"unknown_dialog",
+	/**
+	 * The engine cannot map a SIP `Call-ID` onto a channel AT ALL — not "looked and found nothing",
+	 * but "there is no index to look in".
+	 *
+	 * A structurally different answer from {@link unknown_dialog} and worth its own name, because the
+	 * two need different fixes: one is a call that ended, the other is a deployment where the media
+	 * driver never recorded which SIP dialog produced a channel. `channelCreatedDataSchema.sipCallId`
+	 * is optional precisely because the ARI driver does not populate it today; until something does,
+	 * every well-formed request is answered with this, and it is a REFUSAL rather than a pretend
+	 * success so that a phone's transfer button fails visibly instead of silently doing nothing.
+	 */
+	"correlation_unavailable",
+	/**
+	 * The dialog resolved, but to a call in another tenant, or to one the referrer is not a party to.
+	 *
+	 * The authorisation boundary. `apps/sipd` digest-authenticates the REFER and checks that the
+	 * referrer owns a live registration, but it cannot check who is on a call it is not in the path
+	 * of. The engine can, and must: without this, any authenticated extension could redirect any
+	 * other extension's conversation by guessing a `Call-ID`.
+	 */
+	"not_permitted",
+	/**
+	 * The dialog belongs to a call held by ANOTHER engine instance.
+	 *
+	 * Reserved rather than raised today. The subject is flat and served on a queue group, so exactly
+	 * one instance answers and it may not be the one holding the leg; distinguishing that from
+	 * `unknown_dialog` needs a dialog directory in KV, the same shape as `park-claims` and
+	 * `media-sessions`. Named now so the retry semantics — do not retry here, ask the owner — exist
+	 * in the vocabulary before the directory does.
+	 */
+	"wrong_instance",
+	/** The `Refer-To` user part resolves to nothing dialable in this tenant's plan. */
+	"unknown_target",
+	/**
+	 * The REFER carried a `Replaces` header — an ATTENDED transfer completed at the phone — and this
+	 * engine cannot honour it.
+	 *
+	 * Attended transfer exists in `CallControl`, but as a CONSULTATION the engine itself created and
+	 * therefore holds the two halves of. A phone that consulted on its own second line and then sent
+	 * `Replaces` is asking the engine to join two dialogs it never brokered. Refused by name rather
+	 * than downgraded to a blind transfer, which would drop the consultation leg the user is talking
+	 * to.
+	 */
+	"attended_unsupported",
+	/** The leg went away between resolution and the transfer. */
+	"channel_gone",
+	/** The engine tried and the media plane or the dial plan refused. See `error`. */
+	"transfer_failed",
+	/** This instance is draining. Do not retry HERE. */
+	"shutting_down",
+	/** Anything else. */
+	"internal",
+] as const;
+
+export const sipTransferRefusalReasonSchema = z.enum(SIP_TRANSFER_REFUSAL_REASONS);
+export type SipTransferRefusalReason = (typeof SIP_TRANSFER_REFUSAL_REASONS)[number];
+
+/** Blind (RFC 5589 §6) versus attended (`Replaces`, RFC 3891). */
+export const sipTransferKindSchema = z.enum(["blind", "attended"]);
+export type SipTransferKind = z.infer<typeof sipTransferKindSchema>;
+
+/**
+ * `rpc.sip.v1.transfer` — the SIP edge asking the call engine to execute a phone's REFER.
+ *
+ * ## Why this exists at all
+ *
+ * The engine already transfers calls: `CallControl.transfer` is driven by mid-call DTMF feature
+ * codes (`*1`, `*2`). That covers the softphone user who knows the code and nobody else. Every desk
+ * phone in the vendor catalogue has a physical TRANSFER key, and pressing it sends a SIP REFER —
+ * which reaches the SIP edge, not the engine, because the edge is what the phone has a dialog with.
+ * This subject is the seam between the two, and it is the only reason a deskphone's transfer button
+ * can work without teaching `apps/sipd` what a dial plan is.
+ *
+ * ## RAW NATS ON BOTH ENDS
+ *
+ * The caller is Go (`apps/sipd/internal/transfer`) and the responder is the NestJS engine — the same
+ * inversion as `rpc.media.v1.*` with the languages the other way round, and the same obligation. A
+ * Nest `@MessagePattern` responder would expect `{"pattern":…,"data":…}` framing that a Go caller
+ * does not send, and would simply never answer. The engine serves this on its raw connection
+ * (`apps/engine/src/nats/sip-transfer.service.ts`), on the queue group `optimiq-engine-sip-transfer`.
+ *
+ * ## Why request-reply and not an event
+ *
+ * RFC 3515 §2.4.4 makes the referee's progress a REQUIRED notification: after the `202 Accepted`,
+ * the phone waits for a NOTIFY whose `message/sipfrag` body is the outcome. An event would give
+ * `apps/sipd` nothing to put in that body, so it would have to either lie (`200 OK` on publish) or
+ * never send one — and a phone that never learns the outcome leaves its transfer indicator lit until
+ * the dialog dies. The deadline below is what bounds how long that indicator can stay ambiguous.
+ *
+ * ## What the edge can and cannot tell you
+ *
+ * `apps/sipd` is a registrar; it is not in the media path and holds no call state, so every field
+ * here is either something the phone put on the wire or something the digest exchange established.
+ * In particular it sends the SIP `Call-ID` and the dialog tags VERBATIM and makes no claim that they
+ * identify a call the engine knows — resolving that is the engine's half, and `unknown_dialog` /
+ * `correlation_unavailable` are the two ways it can fail.
+ *
+ * ## The referrer is authenticated, the dialog is not
+ *
+ * `referredBy` is trustworthy: it is the account whose digest response verified against the HA1 the
+ * API derived, and the edge refuses a REFER whose `From` is not that account's own AOR. The dialog
+ * identity is NOT: a `Call-ID` is a string the phone chose. So the responder must check that the
+ * resolved call actually involves `referredBy` before touching it, and answer `not_permitted` when
+ * it does not. Trusting the pair would make any authenticated extension able to redirect any other
+ * extension's conversation.
+ */
+export const sipTransferRequestSchema = z.object({
+	/** The tenant, from the credential the digest exchange resolved. Re-checked by the responder. */
+	orgId: z.uuid(),
+	/**
+	 * The `Call-ID` of the dialog the REFER arrived in — the call being transferred, not the REFER.
+	 *
+	 * Opaque and phone-chosen, so it is a LOOKUP KEY and never an authorisation. 256 is RFC 3261's
+	 * practical ceiling for the header and matches `channelCreatedDataSchema.sipCallId`.
+	 */
+	sipCallId: z.string().min(1).max(256),
+	/**
+	 * The other two thirds of the dialog identifier (RFC 3261 §12), as seen ON THE REFER.
+	 *
+	 * `fromTag` is therefore the transferor's tag and `toTag` the far end's. Optional because a
+	 * responder that can only index `Call-ID` must still be able to serve the common case, and
+	 * because a REFER outside a dialog carries no `To` tag at all.
+	 */
+	fromTag: z.string().max(128).optional(),
+	toTag: z.string().max(128).optional(),
+	/** The authenticated account that pressed TRANSFER. See the note above on why this is trusted. */
+	referredBy: z.object({
+		/** `sip:1001@acme.example.com`, host lower-cased — the same spelling the registrar binds. */
+		aor: z.string().min(1).max(512),
+		/** SIP user part, matched case-sensitively per RFC 3261 §19.1.4. */
+		username: z.string().min(1).max(128),
+		extensionId: z.uuid().optional(),
+		deviceId: z.uuid().optional(),
+	}),
+	/**
+	 * Where the call is going: the `Refer-To` header, taken apart.
+	 *
+	 * `user` is what the engine dials, because a dial plan takes a destination string and not a URI.
+	 * `host` and `uri` come along for the log and for the day a REFER to another domain has to be
+	 * refused explicitly rather than silently dialled as a local extension.
+	 */
+	target: z.object({
+		/** The `Refer-To` user part — an extension, a feature code, or an E.164 number. */
+		user: dialStringSchema,
+		host: z.string().max(255).optional(),
+		/** The `Refer-To` URI verbatim, `Replaces` stripped. Diagnostics only. */
+		uri: z.string().max(1024).optional(),
+	}),
+	/** `attended` exactly when {@link replaces} is present; `blind` otherwise. */
+	kind: sipTransferKindSchema,
+	/**
+	 * The `Replaces` parameter of a `Refer-To`, parsed (RFC 3891).
+	 *
+	 * Present means the phone completed the consultation itself and is asking the engine to join the
+	 * dialog it names. Answered `attended_unsupported` today — see that reason.
+	 */
+	replaces: z
+		.object({
+			callId: z.string().min(1).max(256),
+			toTag: z.string().min(1).max(128),
+			fromTag: z.string().min(1).max(128),
+			/** The `early-only` flag, which forbids replacing a confirmed dialog. */
+			earlyOnly: z.boolean().default(false),
+		})
+		.optional(),
+	/**
+	 * The REFER's CSeq number.
+	 *
+	 * Sent back so a log can be lined up with a packet capture, and because RFC 3515 §2.4.4 keys the
+	 * implicit subscription's `Event: refer;id=<cseq>` on exactly this value — the edge needs it to
+	 * build the NOTIFY, and echoing it here makes the two halves diagnosable together.
+	 */
+	referCSeq: z.int().min(0).optional(),
+	/**
+	 * `ip:port` the REFER arrived from, and its transport. For the responder's audit trail and the
+	 * anti-fraud counters; a responder that ignores them is correct.
+	 */
+	sourceAddress: z.string().max(64).optional(),
+	transport: sipTransportSchema.optional(),
+});
+
+export const sipTransferResponseSchema = z.object({
+	ok: z.boolean(),
+	/** Echoed so a reply can be attributed without the requester holding per-request state. */
+	sipCallId: z.string().max(256),
+	/** The engine instance that answered. Always present, refusal included, for the edge's log. */
+	instanceId: z.string().min(1).max(128).optional(),
+	/** The leg the transfer was executed on. Present when the dialog resolved, `ok` or not. */
+	legId: z.string().min(1).max(128).optional(),
+	callId: z.string().min(1).max(128).optional(),
+	/** The destination the engine actually dialled, after any plan-side normalisation. */
+	destination: z.string().max(128).optional(),
+	reason: sipTransferRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type SipTransferRequest = z.infer<typeof sipTransferRequestSchema>;
+export type SipTransferResponse = z.infer<typeof sipTransferResponseSchema>;
+
+export const SIP_TRANSFER_RPC = defineRpc(
+	RPC_SUBJECTS.sipTransfer,
+	sipTransferRequestSchema,
+	sipTransferResponseSchema,
+	// Two seconds, and the reasoning is neither of the two used elsewhere in this file.
+	//
+	// It is NOT inside a SIP transaction: the edge answers `202 Accepted` first and reports the
+	// outcome later in a NOTIFY, so nothing retransmits while this is in flight and the 500 ms
+	// pressure that shapes `rpc.sip.v1.credential` does not apply. What bounds it instead is a human:
+	// somebody pressed TRANSFER and is watching their handset for the call to leave. A blind transfer
+	// is a dial-plan resolve plus a media move — a couple of ARI round trips — so two seconds is
+	// generous for the work and short enough that a sick engine produces a failed transfer the user
+	// can retry rather than a phone stuck mid-transfer.
+	2_000,
+);
+
+// ---------------------------------------------------------------------------------------------
 // rpc.media.v1.* — engine → mediad, the media plane's command surface
 // ---------------------------------------------------------------------------------------------
 
@@ -751,6 +990,7 @@ export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.authzCheck]: AUTHZ_CHECK_RPC,
 	[RPC_SUBJECTS.voicemailList]: VOICEMAIL_LIST_RPC,
 	[RPC_SUBJECTS.sipCredential]: SIP_CREDENTIAL_RPC,
+	[RPC_SUBJECTS.sipTransfer]: SIP_TRANSFER_RPC,
 	[RPC_SUBJECTS.mediaAllocateSession]: MEDIA_ALLOCATE_SESSION_RPC,
 	[RPC_SUBJECTS.mediaBridgeSessions]: MEDIA_BRIDGE_SESSIONS_RPC,
 	[RPC_SUBJECTS.mediaUnbridgeSessions]: MEDIA_UNBRIDGE_SESSIONS_RPC,

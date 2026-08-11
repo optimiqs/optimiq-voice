@@ -16,6 +16,7 @@
 		"authzCheck": "rpc.authz.v1.check",
 		"voicemailList": "rpc.voicemail.v1.list",
 		"sipCredential": "rpc.sip.v1.credential",
+		"sipTransfer": "rpc.sip.v1.transfer",
 		"mediaAllocateSession": "rpc.media.v1.allocate-session",
 		"mediaBridgeSessions": "rpc.media.v1.bridge-sessions",
 		"mediaUnbridgeSessions": "rpc.media.v1.unbridge-sessions",

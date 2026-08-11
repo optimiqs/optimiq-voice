@@ -38,7 +38,10 @@ const (
 
 // allowedMethods is the Allow header. It is the honest list, not an aspirational one: advertising
 // INVITE before the proxy exists would make a phone try to place a call through a registrar.
-const allowedMethods = "REGISTER, OPTIONS"
+//
+// REFER is on it because `internal/transfer` answers it — a desk phone that does not see REFER
+// advertised may grey out its own TRANSFER key rather than trying.
+const allowedMethods = "REGISTER, OPTIONS, REFER"
 
 // Options configures a Registrar. Every dependency is an interface so the unit tests run without a
 // broker, a socket or a clock.

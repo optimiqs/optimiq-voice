@@ -5,9 +5,11 @@ carriers talk to. It is written in Go on [sipgo](https://github.com/emiago/sipgo
 plan's polyglot decision (`plans/optimiq-voice-master-plan.md` §3.1, §3.4 option E) — TypeScript is
 the default everywhere in this repo, and Go is used where the 2026 industry consensus is Go.
 
-**Today it is a REGISTRAR and nothing else.** That is deliberate: the first vertical proves the
-whole path — SIP in, digest auth, a binding in NATS KV, typed events on JetStream, expiry — end to
-end, before any of it carries a call.
+**Today it is a REGISTRAR, plus REFER.** That is deliberate: the first vertical proves the whole
+path — SIP in, digest auth, a binding in NATS KV, typed events on JetStream, expiry — end to end,
+before any of it carries a call. REFER joined it because a desk phone's TRANSFER key is signalling
+and signalling terminates here: the engine can already transfer a call, it just had no way to be
+asked by a telephone. `sipd` still carries no media and still holds no call state.
 
 ## Where it fits
 
@@ -40,22 +42,24 @@ It shares one contract with every TypeScript service through
 
 ## What it does
 
-| Behaviour                                                                                   | Status |
-| ------------------------------------------------------------------------------------------- | ------ |
-| `REGISTER` with MD5 digest auth (`qop=auth`), 401 challenge + stale re-challenge            | ✅     |
-| Stateless nonce (HMAC over expiry + salt) — any instance verifies any instance's challenge  | ✅     |
-| AOR ownership check: an account may only bind its own address of record                     | ✅     |
-| Expiry policy: min / max clamp, `423 Interval Too Brief` + `Min-Expires`, default interval  | ✅     |
-| Contact `expires` parameter overriding the `Expires` header                                 | ✅     |
-| De-registration on `Expires: 0`, and `Contact: *` + `Expires: 0`                            | ✅     |
-| Registration query (`REGISTER` with no `Contact`)                                           | ✅     |
-| Binding written to the `registrations` KV bucket                                            | ✅     |
-| `sip.reg.v1` `registered` / `unregistered` / `expired` events on the `REGISTRATIONS` stream | ✅     |
-| Background expiry sweeper + rehydration of another instance's bindings after a restart      | ✅     |
-| Credential lookup over `rpc.sip.v1.credential`, with a bounded positive+negative cache      | ✅     |
-| `OPTIONS` keepalive responder                                                               | ✅     |
-| UDP + TCP listeners                                                                         | ✅     |
-| Everything else → `501 Not Implemented`                                                     | ✅     |
+| Behaviour                                                                                                 | Status |
+| --------------------------------------------------------------------------------------------------------- | ------ |
+| `REGISTER` with MD5 digest auth (`qop=auth`), 401 challenge + stale re-challenge                          | ✅     |
+| Stateless nonce (HMAC over expiry + salt) — any instance verifies any instance's challenge                | ✅     |
+| AOR ownership check: an account may only bind its own address of record                                   | ✅     |
+| Expiry policy: min / max clamp, `423 Interval Too Brief` + `Min-Expires`, default interval                | ✅     |
+| Contact `expires` parameter overriding the `Expires` header                                               | ✅     |
+| De-registration on `Expires: 0`, and `Contact: *` + `Expires: 0`                                          | ✅     |
+| Registration query (`REGISTER` with no `Contact`)                                                         | ✅     |
+| Binding written to the `registrations` KV bucket                                                          | ✅     |
+| `sip.reg.v1` `registered` / `unregistered` / `expired` events on the `REGISTRATIONS` stream               | ✅     |
+| Background expiry sweeper + rehydration of another instance's bindings after a restart                    | ✅     |
+| Credential lookup over `rpc.sip.v1.credential`, with a bounded positive+negative cache                    | ✅     |
+| `REFER` — the desk phone's TRANSFER key: digest + registration check, `202`, `rpc.sip.v1.transfer`        | ✅     |
+| RFC 3515 progress reporting: `Event: refer;id=<cseq>` + `message/sipfrag` NOTIFY (`100` then `200`/`503`) | ✅     |
+| `OPTIONS` keepalive responder                                                                             | ✅     |
+| UDP + TCP listeners                                                                                       | ✅     |
+| Everything else → `501 Not Implemented`                                                                   | ✅     |
 
 ### Explicitly NOT implemented yet
 
@@ -63,6 +67,9 @@ It shares one contract with every TypeScript service through
 | --------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Cache invalidation on a provisioning change**                             | The credential cache expires by TTL (seconds), so a disabled extension can still register for up to `SIPD_CREDENTIAL_CACHE_TTL`. `NATSStore.Forget` is the seam a JetStream consumer on the provisioning stream will attach to; that consumer belongs with the provisioning wave. |
 | **Proxy / INVITE path**                                                     | The next PG wave. `sipd` answers 501 to INVITE rather than pretending.                                                                                                                                                                                                            |
+| **SIP `Call-ID` → engine channel correlation**                              | The half of REFER that is not this repository's to fix yet. `apps/engine` records no `Call-ID` on a channel, so it answers `correlation_unavailable` and the edge reports `503` to the phone. Everything either side of that lookup works; see `internal/transfer/handler.go`.    |
+| **Attended REFER (`Replaces`)**                                             | Parsed, carried on the contract as `kind: "attended"`, and refused `attended_unsupported` by the engine: joining two dialogs it never brokered is a different operation from the consultation transfer `CallControl` implements.                                                  |
+| **A REFER subscription state machine**                                      | RFC 3515's two notifications are sent; `Refer-Sub: false` (RFC 4488) is not negotiated, SUBSCRIBE refreshes are not honoured, and notifications are not retried past the transaction layer's own timers. A blind transfer reaches its final state in under two seconds.           |
 | **NAT traversal, `Record-Route`, `rport`/`received` rewriting on requests** | Comes with the proxy. Bindings already record the observed `sourceAddress`, which is the piece the proxy will need.                                                                                                                                                               |
 | **TLS and WSS listeners**                                                   | sipgo supports both (`ListenAndServeTLS`); wiring plus certificate management is a deployment story, not a code one.                                                                                                                                                              |
 | **Multiple simultaneous contacts per AOR**                                  | The location model is one binding per AOR. Forking to a desk phone _and_ a softphone needs a list-valued KV record; it is the first thing the proxy wave requires.                                                                                                                |

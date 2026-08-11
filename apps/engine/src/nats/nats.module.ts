@@ -7,6 +7,7 @@ import { ENVELOPE_ONLY_SERIALIZER } from "./envelope.serializer";
 import { JetStreamService } from "./jetstream.service";
 import { CALL_EVENTS_CLIENT, ENGINE_ENV, ROUTING_RPC_CLIENT } from "./nats.tokens";
 import { ParkHandoffService } from "./park-handoff.service";
+import { SipTransferService } from "./sip-transfer.service";
 import type { EngineEnv } from "../config/engine-env";
 
 /**
@@ -81,7 +82,15 @@ import type { EngineEnv } from "../config/engine-env";
 		JetStreamService,
 		CallEventPublisher,
 		ParkHandoffService,
+		SipTransferService,
 	],
-	exports: [ClientsModule, ENGINE_ENV, JetStreamService, CallEventPublisher, ParkHandoffService],
+	exports: [
+		ClientsModule,
+		ENGINE_ENV,
+		JetStreamService,
+		CallEventPublisher,
+		ParkHandoffService,
+		SipTransferService,
+	],
 })
 export class NatsModule {}

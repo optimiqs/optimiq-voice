@@ -61,6 +61,16 @@ export const RPC_SUBJECTS = {
 	voicemailList: `rpc.voicemail.${SUBJECT_VERSION}.list`,
 	sipCredential: `rpc.sip.${SUBJECT_VERSION}.credential`,
 	/**
+	 * The SIP edge asking the call engine to execute a phone's REFER: `apps/sipd` (Go) → the
+	 * NestJS engine.
+	 *
+	 * The second subject whose caller is Go, and the FIRST whose caller is Go and whose responder
+	 * is TypeScript — `rpc.sip.v1.credential` points the same way but is answered by `apps/api`.
+	 * Both directions carry the same obligation: raw NATS, because a Nest `@MessagePattern` would
+	 * wait for framing a Go caller never sends. See `schemas/rpc.ts`.
+	 */
+	sipTransfer: `rpc.sip.${SUBJECT_VERSION}.transfer`,
+	/**
 	 * The media-plane command surface: `apps/engine` (TypeScript) → `apps/mediad` (Go).
 	 *
 	 * These four are the FIRST subjects on this backbone whose responder is Go and whose caller is
@@ -410,6 +420,10 @@ export const subjectFor = {
 	/** `rpc.sip.v1.credential` */
 	sipCredentialRpc(): string {
 		return RPC_SUBJECTS.sipCredential;
+	},
+	/** `rpc.sip.v1.transfer` */
+	sipTransferRpc(): string {
+		return RPC_SUBJECTS.sipTransfer;
 	},
 	/**
 	 * `rpc.engine.v1.park-handoff.<instanceToken>` — addressed at ONE engine instance.

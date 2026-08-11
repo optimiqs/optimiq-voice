@@ -10,7 +10,13 @@ import { baseEventEnvelopeSchema, defineEvent, makeEvent } from "./envelope";
 import { makeProvisionEvent, provisionEventSchema } from "./provision-events";
 import { makeQueueEvent, queueEventSchema } from "./queue-events";
 import { makeRegistrationEvent, registrationEventSchema } from "./registration-events";
-import { AUTHZ_CHECK_RPC, ROUTING_RESOLVE_RPC, VOICEMAIL_LIST_RPC } from "./rpc";
+import {
+	AUTHZ_CHECK_RPC,
+	ROUTING_RESOLVE_RPC,
+	SIP_TRANSFER_REFUSAL_REASONS,
+	SIP_TRANSFER_RPC,
+	VOICEMAIL_LIST_RPC,
+} from "./rpc";
 
 const ORG = createEntityId();
 const CALL = createEntityId();
@@ -619,6 +625,110 @@ describe("rpc contracts", () => {
 					},
 				],
 			}).success,
+		).toBe(false);
+	});
+});
+
+/** Drops keys from a fixture, so "this field is required" is asserted without an unused binding. */
+function without<T extends object>(value: T, ...keys: readonly (keyof T)[]): Partial<T> {
+	const copy: Partial<T> = { ...value };
+	for (const key of keys) {
+		delete copy[key];
+	}
+	return copy;
+}
+
+describe("the sip transfer contract", () => {
+	const blind = () => ({
+		orgId: ORG,
+		sipCallId: "3c26700c1adf-6qgy0fkn7cvb",
+		fromTag: "as58c1f2b3",
+		toTag: "9f2a11",
+		referredBy: { aor: "sip:1001@acme.example.com", username: "1001" },
+		target: { user: "1002", host: "acme.example.com" },
+		kind: "blind" as const,
+		referCSeq: 3,
+	});
+
+	it("pins the subject and the deadline", () => {
+		expect(SIP_TRANSFER_RPC.subject).toBe("rpc.sip.v1.transfer");
+		// Longer than the credential RPC because it sits after the 202, not inside a transaction.
+		expect(SIP_TRANSFER_RPC.timeoutMs).toBe(2_000);
+	});
+
+	it("accepts a blind transfer carrying only what the edge can actually know", () => {
+		const request = SIP_TRANSFER_RPC.request.parse(blind());
+		expect(request.kind).toBe("blind");
+		expect(request.target.user).toBe("1002");
+		expect(request.replaces).toBeUndefined();
+	});
+
+	it("keeps the dialog identifier optional beyond the Call-ID", () => {
+		const rest = without(blind(), "fromTag", "toTag");
+		expect(SIP_TRANSFER_RPC.request.safeParse(rest).success).toBe(true);
+	});
+
+	it("carries a parsed Replaces for an attended transfer, and defaults early-only to false", () => {
+		const request = SIP_TRANSFER_RPC.request.parse({
+			...blind(),
+			kind: "attended",
+			replaces: { callId: "aa11@1.2.3.4", toTag: "b2", fromTag: "c3" },
+		});
+		expect(request.replaces?.earlyOnly).toBe(false);
+	});
+
+	it("refuses a request with no Call-ID — there would be nothing to resolve", () => {
+		expect(SIP_TRANSFER_RPC.request.safeParse({ ...blind(), sipCallId: "" }).success).toBe(false);
+	});
+
+	it("refuses a request with no dialable target", () => {
+		expect(SIP_TRANSFER_RPC.request.safeParse({ ...blind(), target: { user: "" } }).success).toBe(
+			false,
+		);
+	});
+
+	it("refuses a referrer the edge could not have authenticated", () => {
+		expect(SIP_TRANSFER_RPC.request.safeParse(without(blind(), "referredBy")).success).toBe(false);
+	});
+
+	it("refuses a transfer kind outside the closed vocabulary", () => {
+		expect(SIP_TRANSFER_RPC.request.safeParse({ ...blind(), kind: "semi-attended" }).success).toBe(
+			false,
+		);
+	});
+
+	it("echoes the Call-ID on a refusal so a reply needs no per-request state to attribute", () => {
+		const response = SIP_TRANSFER_RPC.response.parse({
+			ok: false,
+			sipCallId: "3c26700c1adf-6qgy0fkn7cvb",
+			instanceId: "engine-1",
+			reason: "correlation_unavailable",
+			error: "this engine does not index SIP Call-IDs",
+		});
+		expect(response.ok).toBe(false);
+		expect(response.reason).toBe("correlation_unavailable");
+	});
+
+	it("names every refusal the responder may send, in contract order", () => {
+		expect([...SIP_TRANSFER_REFUSAL_REASONS]).toEqual([
+			"bad_request",
+			"unknown_dialog",
+			"correlation_unavailable",
+			"not_permitted",
+			"wrong_instance",
+			"unknown_target",
+			"attended_unsupported",
+			"channel_gone",
+			"transfer_failed",
+			"shutting_down",
+			"internal",
+		]);
+	});
+
+	it("refuses a reason outside that vocabulary", () => {
+		expect(
+			SIP_TRANSFER_RPC.response.safeParse({ ok: false, sipCallId: "a", reason: "computer_says_no" })
+				.success,
 		).toBe(false);
 	});
 });

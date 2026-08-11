@@ -302,6 +302,17 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		request: RPC_CONTRACTS["rpc.sip.v1.credential"].request,
 		response: RPC_CONTRACTS["rpc.sip.v1.credential"].response,
 	},
+	// The SIP edge's transfer command. The mirror image of the entry above it: same Go caller
+	// (apps/sipd), but the request is a phone's REFER and the responder is the ENGINE rather than
+	// the API. Emitted for the same reason the credential pair is — the Go side speaks the payload
+	// and nothing else, so these structs are the wire.
+	{
+		subject: "rpc.sip.v1.transfer",
+		goName: "SipTransfer",
+		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.transfer"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.sip.v1.transfer"].request,
+		response: RPC_CONTRACTS["rpc.sip.v1.transfer"].response,
+	},
 	// The media plane. Unlike every entry above, the RESPONDER for these is Go: apps/mediad
 	// unmarshals the generated request structs and marshals the generated response ones, which is
 	// what makes the emitted code a contract rather than documentation.

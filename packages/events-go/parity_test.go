@@ -178,6 +178,7 @@ func TestParityConstants(t *testing.T) {
 		"authzCheck":            SubjectAuthzCheckRPC,
 		"voicemailList":         SubjectVoicemailListRPC,
 		"sipCredential":         SubjectSipCredentialRPC,
+		"sipTransfer":           SubjectSipTransferRPC,
 		"mediaAllocateSession":  SubjectMediaAllocateSessionRPC,
 		"mediaBridgeSessions":   SubjectMediaBridgeSessionsRPC,
 		"mediaUnbridgeSessions": SubjectMediaUnbridgeSessionsRPC,

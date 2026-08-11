@@ -1,0 +1,116 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"orgId": {
+			"type": "string",
+			"format": "uuid",
+			"pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+		},
+		"sipCallId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 256
+		},
+		"fromTag": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"toTag": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"referredBy": {
+			"type": "object",
+			"properties": {
+				"aor": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 512
+				},
+				"username": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 128
+				},
+				"extensionId": {
+					"type": "string",
+					"format": "uuid",
+					"pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+				},
+				"deviceId": {
+					"type": "string",
+					"format": "uuid",
+					"pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+				}
+			},
+			"required": ["aor", "username"],
+			"additionalProperties": false
+		},
+		"target": {
+			"type": "object",
+			"properties": {
+				"user": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 128
+				},
+				"host": {
+					"type": "string",
+					"maxLength": 255
+				},
+				"uri": {
+					"type": "string",
+					"maxLength": 1024
+				}
+			},
+			"required": ["user"],
+			"additionalProperties": false
+		},
+		"kind": {
+			"type": "string",
+			"enum": ["blind", "attended"]
+		},
+		"replaces": {
+			"type": "object",
+			"properties": {
+				"callId": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 256
+				},
+				"toTag": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 128
+				},
+				"fromTag": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 128
+				},
+				"earlyOnly": {
+					"default": false,
+					"type": "boolean"
+				}
+			},
+			"required": ["callId", "toTag", "fromTag", "earlyOnly"],
+			"additionalProperties": false
+		},
+		"referCSeq": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 9007199254740991
+		},
+		"sourceAddress": {
+			"type": "string",
+			"maxLength": 64
+		},
+		"transport": {
+			"type": "string",
+			"enum": ["udp", "tcp", "tls", "ws", "wss"]
+		}
+	},
+	"required": ["orgId", "sipCallId", "referredBy", "target", "kind"],
+	"additionalProperties": false
+}

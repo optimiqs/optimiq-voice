@@ -2,8 +2,10 @@
 //
 // Today it is a REGISTRAR: it authenticates REGISTER with digest, writes AOR → contact bindings
 // into the `registrations` NATS KV bucket, publishes sip.reg.v1 transitions onto the REGISTRATIONS
-// stream, and answers OPTIONS. The proxy/INVITE path — the half that lets it retire Routr — is the
-// next PG wave; see the README.
+// stream, and answers OPTIONS. It also answers REFER — a desk phone's TRANSFER key — by asking the
+// engine over `rpc.sip.v1.transfer` and reporting the outcome back per RFC 3515; see
+// internal/transfer. The proxy/INVITE path — the half that lets it retire Routr — is the next PG
+// wave; see the README.
 //
 // Configuration is entirely environmental; run with no arguments.
 package main
@@ -13,13 +15,16 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/emiago/sipgo"
+	"github.com/emiago/sipgo/sip"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
@@ -29,6 +34,7 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/events"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/kv"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/registrar"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/transfer"
 )
 
 func main() {
@@ -163,8 +169,23 @@ func run() error {
 	}
 	defer server.Close()
 
+	// The client half. It exists for exactly one thing today: the RFC 3515 NOTIFY that reports a
+	// transfer's outcome back to the phone that asked for it. A registrar otherwise never originates
+	// a request, which is why sipd had no client at all until REFER arrived.
+	sipClient, err := sipgo.NewClient(userAgent, sipgo.WithClientLogger(log))
+	if err != nil {
+		return fmt.Errorf("creating the SIP client: %w", err)
+	}
+	defer sipClient.Close()
+
+	transfers, err := newTransferHandler(cfg, conn, sipClient, authenticator, credentialStore, bindings, ctx, log)
+	if err != nil {
+		return err
+	}
+
 	server.OnRegister(reg.HandleRegister)
 	server.OnOptions(reg.HandleOptions)
+	server.OnRefer(transfers.HandleRefer)
 	// Everything else — INVITE, SUBSCRIBE, MESSAGE, … — is honestly refused until the proxy wave.
 	server.OnNoRoute(reg.HandleUnsupported)
 
@@ -208,11 +229,90 @@ func run() error {
 		return err
 	}
 
+	// Outcome reports first: a phone left holding a 202 with no final NOTIFY keeps its transfer
+	// indicator lit until the dialog dies, and these finish in well under a second.
+	if !transfers.Wait(cfg.ShutdownTimeout) {
+		log.Warn("some transfer outcomes were not reported before shutdown")
+	}
 	if !waitFor(&group, cfg.ShutdownTimeout) {
 		log.Warn("shutdown timed out; exiting anyway")
 	}
 	log.Info("stopped")
 	return nil
+}
+
+// newTransferHandler wires REFER: digest against the same authenticator the registrar uses, the
+// location service as the "is this phone actually here" check, `rpc.sip.v1.transfer` at the engine,
+// and NOTIFY back to the phone.
+//
+// It is always wired. There is no toggle, because the failure mode without the engine responder is
+// already correct and visible: the phone is accepted, the request times out, and the final NOTIFY
+// carries `503`. A toggle would replace that with a `501` that looks like the feature was never
+// built, which is the same message with less information in it.
+func newTransferHandler(
+	cfg config.Config,
+	conn *nats.Conn,
+	client *sipgo.Client,
+	authenticator *registrar.Authenticator,
+	credentialStore credentials.Store,
+	bindings kv.Store,
+	ctx context.Context,
+	log *slog.Logger,
+) (*transfer.Handler, error) {
+	contact := contactURI(cfg)
+	requester, err := transfer.NewNATSRequester(conn, transfer.NATSOptions{})
+	if err != nil {
+		return nil, err
+	}
+	notifier, err := transfer.NewClientNotifier(client)
+	if err != nil {
+		return nil, err
+	}
+
+	handler, err := transfer.New(transfer.Options{
+		Realm:        cfg.Realm,
+		Auth:         authenticator,
+		Credentials:  credentialStore,
+		Bindings:     bindings,
+		Transfers:    requester,
+		Notifier:     notifier,
+		Contact:      contactURI(cfg),
+		Logger:       log,
+		ServerHeader: cfg.UserAgent,
+		BaseContext:  ctx,
+		AuthTimeout:  3 * time.Second,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	log.Info("REFER handling ready",
+		"subject", requester.Subject(),
+		"timeout", contract.TimeoutSipTransferRPC,
+		"contact", contact.String())
+	return handler, nil
+}
+
+// contactURI is what this edge puts in the Contact header of its 202 and its notifications.
+//
+// The host comes from the listen address, EXCEPT when that address is a wildcard — `0.0.0.0:5060` is
+// the default and is not an address any phone can send to. In that case the realm is used, which is
+// the name the handsets were provisioned with and therefore the one that resolves. Neither is
+// clever; the alternative is a Contact the phone silently cannot reach, and a NOTIFY that never
+// arrives is indistinguishable from a transfer that never happened.
+func contactURI(cfg config.Config) sip.Uri {
+	host, port := cfg.Realm, 0
+	if listenHost, listenPort, err := net.SplitHostPort(cfg.ListenAddr); err == nil {
+		switch listenHost {
+		case "", "0.0.0.0", "::", "[::]":
+		default:
+			host = listenHost
+		}
+		if parsed, err := strconv.Atoi(listenPort); err == nil {
+			port = parsed
+		}
+	}
+	return sip.Uri{Scheme: "sip", User: cfg.UserAgent, Host: host, Port: port}
 }
 
 // waitFor blocks until the group finishes or the timeout elapses. It reports whether the group

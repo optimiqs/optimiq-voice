@@ -49,6 +49,7 @@ describe("subject roots", () => {
 			authzCheck: "rpc.authz.v1.check",
 			voicemailList: "rpc.voicemail.v1.list",
 			sipCredential: "rpc.sip.v1.credential",
+			sipTransfer: "rpc.sip.v1.transfer",
 			mediaAllocateSession: "rpc.media.v1.allocate-session",
 			mediaBridgeSessions: "rpc.media.v1.bridge-sessions",
 			mediaUnbridgeSessions: "rpc.media.v1.unbridge-sessions",
@@ -96,6 +97,8 @@ describe("subjectFor", () => {
 		expect(subjectFor.provision(ORG)).toBe(`provision.evt.v1.${ORG}`);
 		expect(subjectFor.routingResolveRpc()).toBe("rpc.routing.v1.resolve");
 		expect(subjectFor.authzCheckRpc()).toBe("rpc.authz.v1.check");
+		expect(subjectFor.sipCredentialRpc()).toBe("rpc.sip.v1.credential");
+		expect(subjectFor.sipTransferRpc()).toBe("rpc.sip.v1.transfer");
 	});
 
 	it("keeps multi-token event names in the subject tail", () => {

@@ -301,6 +301,14 @@
 			"goResponseType": "SipCredentialResponse"
 		},
 		{
+			"subject": "rpc.sip.v1.transfer",
+			"timeoutMs": 2000,
+			"requestSchema": "rpc/rpc.sip.v1.transfer.request.schema.json",
+			"responseSchema": "rpc/rpc.sip.v1.transfer.response.schema.json",
+			"goRequestType": "SipTransferRequest",
+			"goResponseType": "SipTransferResponse"
+		},
+		{
 			"subject": "rpc.media.v1.allocate-session",
 			"timeoutMs": 500,
 			"requestSchema": "rpc/rpc.media.v1.allocate-session.request.schema.json",
