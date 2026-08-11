@@ -51,6 +51,7 @@ var EventTypes = []EventTypeInfo{
 	{Family: FamilyMedia, Type: EventTypeMediaSessionEnded, SubjectTemplate: "media.evt.v1.<orgId>.<sessionId>.session.ended"},
 	{Family: FamilyMedia, Type: EventTypeMediaSessionRTPTimeout, SubjectTemplate: "media.evt.v1.<orgId>.<sessionId>.session.rtp-timeout"},
 	{Family: FamilyMedia, Type: EventTypeMediaPlaybackFinished, SubjectTemplate: "media.evt.v1.<orgId>.<sessionId>.playback.finished"},
+	{Family: FamilyMedia, Type: EventTypeMediaRecordingFinished, SubjectTemplate: "media.evt.v1.<orgId>.<sessionId>.recording.finished"},
 	{Family: FamilyCDR, Type: EventTypeCDRLegWrite, SubjectTemplate: "cdr.leg.v1.<orgId>"},
 	{Family: FamilyAudit, Type: EventTypeAuditRecorded, SubjectTemplate: "audit.evt.v1.<orgId>"},
 	{Family: FamilyProvision, Type: EventTypeProvisionDeviceRequested, SubjectTemplate: "provision.evt.v1.<orgId>"},
@@ -129,6 +130,8 @@ func NewDataFor(eventType string) any {
 		return new(MediaSessionRTPTimeoutData)
 	case EventTypeMediaPlaybackFinished:
 		return new(MediaPlaybackFinishedData)
+	case EventTypeMediaRecordingFinished:
+		return new(MediaRecordingFinishedData)
 	case EventTypeCDRLegWrite:
 		return new(CDRLegWriteData)
 	case EventTypeAuditRecorded:

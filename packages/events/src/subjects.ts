@@ -15,7 +15,7 @@ import { createHash } from "node:crypto";
  * queue.evt.v1.<orgId>.<queueId>.<event>     event = caller.joined | … | agent.state
  * voicemail.evt.v1.<orgId>.<mailboxId>.<event>  event = message.left | mwi.updated
  * media.evt.v1.<orgId>.<sessionId>.<event>   event = session.ended | session.rtp-timeout |
- *                                                    playback.finished
+ *                                                    playback.finished | recording.finished
  * cdr.leg.v1.<orgId>                         one subject per org; event type is in the envelope
  * audit.evt.v1.<orgId>
  * provision.evt.v1.<orgId>
@@ -28,6 +28,9 @@ import { createHash } from "node:crypto";
  * rpc.media.v1.release-session
  * rpc.media.v1.start-playback
  * rpc.media.v1.stop-playback
+ * rpc.media.v1.send-dtmf
+ * rpc.media.v1.start-recording
+ * rpc.media.v1.stop-recording
  * rpc.engine.v1.park-handoff.<instanceTok>   engine -> engine; the OWNING instance answers
  * ```
  *
@@ -94,6 +97,24 @@ export const RPC_SUBJECTS = {
 	 */
 	mediaStartPlayback: `rpc.media.${SUBJECT_VERSION}.start-playback`,
 	mediaStopPlayback: `rpc.media.${SUBJECT_VERSION}.stop-playback`,
+	/**
+	 * Rung 3: generate RFC 4733 digits towards a leg's far end.
+	 *
+	 * Single, and there is deliberately no `stop-dtmf`: `MediaPort.sendDtmf` returns `void` and
+	 * hands back no handle, so there is nothing an engine could name in order to interrupt a digit
+	 * string. A string is also short and bounded by construction, where a prompt is not — which is
+	 * why playback needed a stop and this does not.
+	 */
+	mediaSendDtmf: `rpc.media.${SUBJECT_VERSION}.send-dtmf`,
+	/**
+	 * Rung 4's recording pair.
+	 *
+	 * `stop-recording` is keyed by `recordingRef` alone for exactly the reason `stop-playback` is:
+	 * `MediaPort.stopRecording(name)` carries nothing else. `mediad` indexes live recordings by
+	 * reference, so the lookup stays on the side that can do it without a scan.
+	 */
+	mediaStartRecording: `rpc.media.${SUBJECT_VERSION}.start-recording`,
+	mediaStopRecording: `rpc.media.${SUBJECT_VERSION}.stop-recording`,
 	/**
 	 * The engine-to-engine command surface. A PREFIX, not a complete subject.
 	 *
@@ -235,10 +256,17 @@ export type VoicemailEvent = (typeof VOICEMAIL_EVENTS)[number];
  *   reason `session.rtp-timeout` is: `reason: error` is a media failure on a call that is still up,
  *   and without a durable record of it "the caller says they never heard the menu" has no evidence
  *   behind it at all.
+ * - `recording.finished` says a file is CLOSED and names it. Unlike the two above it, the engine
+ *   really does branch on this one — `plan-walker`'s voicemail node and `call-control`'s on-demand
+ *   recording both block on "the recording finished" before they publish `channel.record.stopped`,
+ *   and the whole archive pipeline in `apps/api` is triggered by that publish. An event published
+ *   before the bytes are on disk is a truncated recording nobody notices until it is played back,
+ *   so this one is emitted after the WAV header has been patched, the file fsynced and renamed
+ *   into place.
  *
- * There is deliberately no `session.allocated`, `session.bridged` or `playback.started`: all three
- * are the successful reply to a command the engine issued and is still holding, so publishing them
- * would be telling the caller something it already knows.
+ * There is deliberately no `session.allocated`, `session.bridged`, `playback.started` or
+ * `recording.started`: all four are the successful reply to a command the engine issued and is
+ * still holding, so publishing them would be telling the caller something it already knows.
  *
  * Named `MEDIA_SESSION_EVENTS` rather than `MEDIA_EVENTS`, breaking the `CALL_EVENTS` /
  * `QUEUE_EVENTS` pattern on purpose: `apps/engine` already owns a domain type called `MediaEvent`
@@ -250,6 +278,7 @@ export const MEDIA_SESSION_EVENTS = [
 	"session.ended",
 	"session.rtp-timeout",
 	"playback.finished",
+	"recording.finished",
 ] as const;
 export type MediaSessionEvent = (typeof MEDIA_SESSION_EVENTS)[number];
 

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"time"
 
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 
@@ -545,6 +547,305 @@ func (s *Server) refuseStopPlayback(playbackRef, reason, message string) []byte 
 		Reason:      &code,
 		Error:       stringPtr(message),
 	})
+}
+
+// HandleSendDtmf generates RFC 4733 digits towards a session's far end. Rung 3.
+//
+// The order of operations is the family's: everything REFUSABLE is decided before anything is put
+// on the wire, so an `ok` reply means the digits are going out rather than that they were accepted
+// for consideration. The two refusals that matter are worth naming separately:
+//
+//   - A leg that negotiated NO telephone-event payload type is `not_supported`, never an inband
+//     tone. The far end said it does not expect RFC 4733, and sending under a type it never agreed
+//     to produces digits it drops — an IVR that "randomly" ignores keypresses. Synthesising audio
+//     instead means a tone generator, which is the same deferral `tone://` carries at
+//     `start-playback`, and the engine's answer to either is to route the leg to Asterisk.
+//   - A character with no event code is `bad_request` naming the character, decided over the WHOLE
+//     string first. Failing halfway would leave a far-end IVR holding a prefix of what was asked
+//     for, under a reply that said the request succeeded.
+func (s *Server) HandleSendDtmf(data []byte) []byte {
+	var request contract.MediaSendDtmfRequest
+	if err := json.Unmarshal(data, &request); err != nil {
+		return s.refuseDtmf("", ReasonBadRequest, fmt.Sprintf("malformed send-dtmf request: %v", err))
+	}
+	switch {
+	case request.SessionID == "":
+		return s.refuseDtmf("", ReasonBadRequest, "sessionId is required")
+	case request.Digits == "":
+		return s.refuseDtmf(request.SessionID, ReasonBadRequest, "digits is required")
+	}
+
+	telephoneEventPT, ok := s.sessions.TelephoneEventPayloadType(request.SessionID)
+	if !ok {
+		return s.refuseDtmf(request.SessionID, s.locateRefusal([]string{request.SessionID}),
+			fmt.Sprintf("no session %s on this instance", request.SessionID))
+	}
+	if telephoneEventPT == 0 {
+		return s.refuseDtmf(request.SessionID, ReasonNotSupported,
+			"this leg negotiated no RFC 4733 telephone-event payload type, and mediad has no tone "+
+				"generator to fall back to")
+	}
+
+	opts := rtp.DtmfOptions{
+		Digits:       request.Digits,
+		ToneDuration: millis(request.ToneDurationMs),
+		Gap:          millis(request.GapMs),
+	}
+	if err := s.sessions.SendDtmf(request.SessionID, opts); err != nil {
+		reason := ReasonInternal
+		switch {
+		case errors.Is(err, rtp.ErrUnsendableDigit):
+			reason = ReasonBadRequest
+		case errors.Is(err, rtp.ErrNoTelephoneEvent):
+			reason = ReasonNotSupported
+		case errors.Is(err, rtp.ErrUnknownSession):
+			reason = ReasonUnknown
+		case errors.Is(err, rtp.ErrClosed):
+			reason = ReasonShuttingDown
+		case errors.Is(err, rtp.ErrNoRemote):
+			// The leg has not sent a packet yet, so symmetric RTP has taught us nowhere to send.
+			// `bad_request` rather than `internal`, exactly as playback treats it: the engine asked
+			// for digits on a leg that is not carrying media, and a retry fails the same way.
+			reason = ReasonBadRequest
+		}
+		s.log.Warn("refusing a send-dtmf",
+			"sessionId", request.SessionID, "digits", request.Digits,
+			"reason", reason, "error", err)
+		return s.refuseDtmf(request.SessionID, reason, err.Error())
+	}
+
+	queuedMs := int(opts.QueuedDuration().Milliseconds())
+	payloadType := int(telephoneEventPT)
+	return encode(s.log, contract.MediaSendDtmfResponse{
+		Ok:                        true,
+		SessionID:                 request.SessionID,
+		Digits:                    request.Digits,
+		QueuedMs:                  &queuedMs,
+		TelephoneEventPayloadType: &payloadType,
+		InstanceID:                stringPtr(s.instanceID),
+	})
+}
+
+func (s *Server) refuseDtmf(sessionID, reason, message string) []byte {
+	code := contract.MediaSendDtmfResponseReason(reason)
+	return encode(s.log, contract.MediaSendDtmfResponse{
+		Ok:         false,
+		SessionID:  sessionID,
+		InstanceID: stringPtr(s.instanceID),
+		Reason:     &code,
+		Error:      stringPtr(message),
+	})
+}
+
+// HandleStartRecording writes a session's audio to a file. Rung 4.
+//
+// The path is DERIVED, never accepted: `<MEDIAD_RECORDINGS_DIR>/<orgId>/<callId>/<ref>.wav`, where
+// the org and the call came in on the allocate and live on the session. That is exactly the object
+// key `apps/engine` computes for the same recording and exactly what `apps/api`'s archiver stats
+// under `CDR_RECORDING_ROOT`, so one mount serves both planes and the archive pipeline reads what
+// mediad wrote with no change at all. A caller-supplied directory would let a malformed request
+// write anywhere this process can, and the engine has nothing to say about a layout mediad can work
+// out for itself.
+//
+// The reply comes back once the FILE EXISTS and its header is written — not when the recording
+// ends, which is `recording.finished`, and not before the file is open, which would let the opening
+// moments be dropped on the floor and reported as success.
+func (s *Server) HandleStartRecording(data []byte) []byte {
+	var request contract.MediaStartRecordingRequest
+	if err := json.Unmarshal(data, &request); err != nil {
+		return s.refuseRecording("", "", ReasonBadRequest,
+			fmt.Sprintf("malformed start-recording request: %v", err))
+	}
+	switch {
+	case request.SessionID == "":
+		return s.refuseRecording("", request.RecordingRef, ReasonBadRequest, "sessionId is required")
+	case request.RecordingRef == "":
+		return s.refuseRecording(request.SessionID, "", ReasonBadRequest,
+			"recordingRef is required and must be assigned by the caller: stop-recording carries "+
+				"nothing else, and it is the filename stem")
+	case !isSafeRefToken(request.RecordingRef):
+		// The reference becomes a FILENAME, so a separator or a dot-segment in it is a path
+		// traversal. Refused by name rather than sanitised: a caller whose reference was silently
+		// rewritten would look for a file under the name it asked for and not find one.
+		return s.refuseRecording(request.SessionID, request.RecordingRef, ReasonBadRequest,
+			"recordingRef must be one token of [A-Za-z0-9._-] with no path separators: it is the "+
+				"name of a file")
+	}
+
+	if request.Format != "" && request.Format != contract.MediaStartRecordingRequestFormatWav {
+		return s.refuseRecording(request.SessionID, request.RecordingRef, ReasonNotSupported,
+			fmt.Sprintf("mediad writes WAV and nothing else; %q would download from apps/api as "+
+				"audio/wav and fail to play", request.Format))
+	}
+	if request.Beep != nil && *request.Beep {
+		// Refused rather than dropped. A voicemail whose beep never sounds is a caller talking over
+		// the tail of the greeting, and the first words of every message clipped — a defect that
+		// looks like a recording bug and is not. A tone generator is the same deferral `tone://`
+		// carries; until it exists, Asterisk serves this leg.
+		return s.refuseRecording(request.SessionID, request.RecordingRef, ReasonNotSupported,
+			"beep needs a tone generator, which mediad does not have — the same deferral tone:// "+
+				"carries at start-playback")
+	}
+	if terminateOn := derefString(request.TerminateOn); terminateOn != "" && terminateOn != "none" {
+		// Ending a recording on a digit needs DTMF DETECTION, which is the RECEIVE half of rung 3
+		// and not built: mediad relays telephone-event payloads without decoding them. A recording
+		// that ignored `#` would run to its duration limit on every voicemail.
+		return s.refuseRecording(request.SessionID, request.RecordingRef, ReasonNotSupported,
+			fmt.Sprintf("terminateOn %q needs DTMF detection, which is the receive half of rung 3 "+
+				"of the mediad capability ladder", terminateOn))
+	}
+
+	if s.recordingsDir == "" {
+		return s.refuseRecording(request.SessionID, request.RecordingRef, ReasonNotSupported,
+			"this instance has no recordings directory: set MEDIAD_RECORDINGS_DIR to the same "+
+				"mount apps/api reads as CDR_RECORDING_ROOT")
+	}
+
+	payloadType, ok := s.sessions.AudioPayloadType(request.SessionID)
+	if !ok {
+		return s.refuseRecording(request.SessionID, request.RecordingRef,
+			s.locateRefusal([]string{request.SessionID}),
+			fmt.Sprintf("no session %s on this instance", request.SessionID))
+	}
+	orgID, callID, _ := s.sessions.SessionTenancy(request.SessionID)
+	if orgID == "" || callID == "" {
+		// Unreachable through the control surface, which refuses an allocate without either. Checked
+		// anyway, because the failure it prevents is a file at `//<ref>.wav` — a path that exists,
+		// is written to, and joins to no object key any consumer will ever look for.
+		return s.refuseRecording(request.SessionID, request.RecordingRef, ReasonInternal,
+			"this session carries no org or call, so no object key can be derived for it")
+	}
+
+	direction := rtp.RecordingDirection(request.Direction)
+	if request.Direction == "" {
+		direction = rtp.RecordBoth
+	}
+	objectKey := recordingObjectKey(orgID, callID, request.RecordingRef)
+
+	startErr := s.sessions.StartRecording(request.SessionID, rtp.RecordingOptions{
+		Ref:         request.RecordingRef,
+		Path:        filepath.Join(s.recordingsDir, filepath.FromSlash(objectKey)),
+		ObjectKey:   objectKey,
+		Direction:   direction,
+		Encoding:    rtp.EncodingFor(payloadType),
+		MaxDuration: millis(request.MaxDurationMs),
+		MaxSilence:  millis(request.MaxSilenceMs),
+	})
+	if startErr != nil {
+		reason := ReasonInternal
+		switch {
+		case errors.Is(startErr, rtp.ErrUnknownSession):
+			reason = ReasonUnknown
+		case errors.Is(startErr, rtp.ErrClosed):
+			reason = ReasonShuttingDown
+		case errors.Is(startErr, rtp.ErrAlreadyRecording):
+			reason = ReasonBadRequest
+		}
+		s.log.Warn("refusing a recording",
+			"sessionId", request.SessionID, "recordingRef", request.RecordingRef,
+			"reason", reason, "error", startErr)
+		return s.refuseRecording(request.SessionID, request.RecordingRef, reason, startErr.Error())
+	}
+
+	return encode(s.log, contract.MediaStartRecordingResponse{
+		Ok:           true,
+		SessionID:    request.SessionID,
+		RecordingRef: request.RecordingRef,
+		ObjectKey:    stringPtr(objectKey),
+		InstanceID:   stringPtr(s.instanceID),
+	})
+}
+
+func (s *Server) refuseRecording(sessionID, recordingRef, reason, message string) []byte {
+	code := contract.MediaStartRecordingResponseReason(reason)
+	return encode(s.log, contract.MediaStartRecordingResponse{
+		Ok:           false,
+		SessionID:    sessionID,
+		RecordingRef: recordingRef,
+		InstanceID:   stringPtr(s.instanceID),
+		Reason:       &code,
+		Error:        stringPtr(message),
+	})
+}
+
+// HandleStopRecording finalises a recording by reference.
+//
+// A stop for a reference nothing is recording is `ok:true, stopped:false` — a SUCCESS, and the
+// common case rather than an edge one: a recording that hit its duration limit, or whose leg hung
+// up, has already finalised itself by the time the engine's teardown gets around to stopping it.
+//
+// The reply says the recorder was TOLD to stop. `recording.finished` says the header has been
+// patched, the bytes fsynced and the file renamed into place, and that is the event a consumer must
+// wait for before reading the file.
+func (s *Server) HandleStopRecording(data []byte) []byte {
+	var request contract.MediaStopRecordingRequest
+	if err := json.Unmarshal(data, &request); err != nil {
+		return s.refuseStopRecording("", ReasonBadRequest,
+			fmt.Sprintf("malformed stop-recording request: %v", err))
+	}
+	if request.RecordingRef == "" {
+		return s.refuseStopRecording("", ReasonBadRequest, "recordingRef is required")
+	}
+
+	sessionID, stopped := s.sessions.StopRecording(request.RecordingRef)
+
+	return encode(s.log, contract.MediaStopRecordingResponse{
+		Ok:           true,
+		RecordingRef: request.RecordingRef,
+		Stopped:      stopped,
+		SessionID:    stringPtr(sessionID),
+		InstanceID:   stringPtr(s.instanceID),
+	})
+}
+
+func (s *Server) refuseStopRecording(recordingRef, reason, message string) []byte {
+	code := contract.MediaStopRecordingResponseReason(reason)
+	return encode(s.log, contract.MediaStopRecordingResponse{
+		Ok:           false,
+		RecordingRef: recordingRef,
+		InstanceID:   stringPtr(s.instanceID),
+		Reason:       &code,
+		Error:        stringPtr(message),
+	})
+}
+
+// recordingObjectKey builds the key a recording lands under, relative to the recordings root.
+//
+// `<orgId>/<callId>/<recordingRef>.wav`, with FORWARD slashes whatever the host filesystem uses:
+// this is an object key that travels on the wire and into a database column, not a path. The
+// absolute path is derived from it once, at the one place that knows the root.
+func recordingObjectKey(orgID, callID, ref string) string {
+	return orgID + "/" + callID + "/" + ref + recordingExtension
+}
+
+// recordingExtension is the only container mediad writes. See the format refusal above.
+const recordingExtension = ".wav"
+
+// isSafeRefToken reports whether a reference can be part of a filename without escaping its
+// directory. Deliberately narrower than the subject-token rule: a dot is allowed, because
+// references are UUIDs today and could reasonably carry one, but `..` and every separator are not.
+func isSafeRefToken(value string) bool {
+	if value == "" || value == "." || value == ".." {
+		return false
+	}
+	for _, r := range value {
+		switch {
+		case r == '-' || r == '_' || r == '.' ||
+			(r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z'):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// millis turns an optional millisecond count on the wire into a duration. Absent is zero, which
+// every consumer of it reads as "no limit" or "use the default" rather than as "immediately".
+func millis(value *int) time.Duration {
+	if value == nil || *value <= 0 {
+		return 0
+	}
+	return time.Duration(*value) * time.Millisecond
 }
 
 // codecOf names a G.711 payload type. Anything else cannot reach here — a session is only ever

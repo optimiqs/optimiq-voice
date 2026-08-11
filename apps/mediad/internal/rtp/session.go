@@ -95,7 +95,15 @@ type Stats struct {
 	// leg. Counted rather than silent: "the other party could not be heard for six seconds" is a
 	// support ticket, and this is the number that explains it was a prompt rather than a fault.
 	SuppressedByPlayback uint64
-	LastPacketUnixMs     int64
+	// SuppressedByDtmf counts outbound audio frames dropped because a digit string was being
+	// generated towards this leg. Same argument as the counter above, on a much shorter window: a
+	// digit takes the outbound stream for a few hundred milliseconds, and this is what says so.
+	SuppressedByDtmf uint64
+	// DtmfPacketsSent counts RFC 4733 telephone-event packets this session ORIGINATED. It does not
+	// count relayed ones, which are somebody else's digits passing through and are already in
+	// PacketsSent.
+	DtmfPacketsSent  uint64
+	LastPacketUnixMs int64
 }
 
 // Session owns one RTP/RTCP port pair for the life of one call leg.
@@ -160,6 +168,19 @@ type Session struct {
 	// An atomic POINTER rather than a mutex-guarded field because it is read on the peer's packet
 	// path — 50 times a second per bridged call, in forward — and written twice per prompt.
 	playback atomic.Pointer[Playback]
+
+	// dtmf is the digit string currently owning this session's outbound stream, or nil. Read on the
+	// packet path for the same reason `playback` is, and set for a few hundred milliseconds at a
+	// time. See DtmfInjection for why a digit takes the stream rather than sharing it.
+	dtmf atomic.Pointer[DtmfInjection]
+	// dtmfMu serialises whole digit STRINGS. Digits are a sequence — a caller that sent "12" and
+	// then "34" wants "1234" — so a second string queues behind the first instead of interleaving
+	// its packets into the middle of a digit somebody else is still sending.
+	dtmfMu sync.Mutex
+
+	// recording is the file this session's audio is being written to, or nil. Read on the packet
+	// path on both directions; see Recording for what it captures and what it does not.
+	recording atomic.Pointer[Recording]
 
 	// markNextForward makes the next relayed packet carry the RTP marker bit. Set when a playback
 	// ends, because the outbound stream is switching back to the peer's timestamp clock and a
@@ -372,6 +393,15 @@ func (s *Session) handlePacket(raw []byte, from *net.UDPAddr) {
 		return
 	}
 
+	// The recording tap, and it is HERE rather than in relay for a reason: a leg is recorded whether
+	// or not it is bridged. A voicemail message is a session with no peer at all, and a tap wired
+	// into the forwarding path would produce an empty file for exactly the case recording exists for.
+	// Telephone-event packets are excluded — a digit is not audio, and decoding one as G.711 writes
+	// four bytes of noise into the file.
+	if recorder := s.recording.Load(); recorder != nil && packet.PayloadType == s.audioPayloadType {
+		recorder.Received(packet.Payload)
+	}
+
 	switch s.mode {
 	case ModeEcho:
 		s.echo(&packet, from)
@@ -454,6 +484,16 @@ func (s *Session) relay(packet *pionrtp.Packet) {
 // own — which is what keeps the two directions of a bridge from sharing anything but the payload
 // bytes.
 func (s *Session) forward(packet *pionrtp.Packet, sourceTelephoneEventPT uint8) {
+	if s.dtmfActive() {
+		// A digit is being generated towards this leg. It occupies a SPAN of the outbound timestamp
+		// clock rather than a point — every packet of a digit carries the timestamp it started at —
+		// so an audio frame let out in the middle of that span puts a second clock inside the digit
+		// and the receiver either regenerates a tone of the wrong length or drops it. See
+		// DtmfInjection.
+		s.count(func(st *Stats) { st.SuppressedByDtmf++ })
+		return
+	}
+
 	if s.playback.Load() != nil {
 		// A prompt is playing towards this leg, and a session has ONE outbound stream. Interleaving
 		// the peer's frames into it would put two unrelated timestamp clocks under one SSRC, which
@@ -516,6 +556,13 @@ func (s *Session) forward(packet *pionrtp.Packet, sourceTelephoneEventPT uint8) 
 		return
 	}
 	s.count(func(st *Stats) { st.PacketsSent++ })
+
+	// The SEND half of a `both` recording: what this leg was told, which is the other party talking.
+	// Tapped after the write rather than before it, so the file holds what actually went out.
+	// Telephone-event payloads are excluded for the same reason they are on the receive side.
+	if recorder := s.recording.Load(); recorder != nil && payloadType == s.audioPayloadType {
+		recorder.Sent(packet.Payload)
+	}
 }
 
 // latch binds the session to the first source address it hears from, and refuses every other one.

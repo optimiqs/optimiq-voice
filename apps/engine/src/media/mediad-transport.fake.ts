@@ -91,6 +91,31 @@ export class FakeMediadTransport implements MediadTransport {
 					sessionId: "leg-a",
 					instanceId: "mediad-fake",
 				};
+			case RPC_SUBJECTS.mediaSendDtmf:
+				return {
+					ok: true,
+					sessionId: request["sessionId"],
+					digits: request["digits"],
+					queuedMs: 200,
+					telephoneEventPayloadType: 101,
+					instanceId: "mediad-fake",
+				};
+			case RPC_SUBJECTS.mediaStartRecording:
+				return {
+					ok: true,
+					sessionId: request["sessionId"],
+					recordingRef: request["recordingRef"],
+					objectKey: `org/call/${String(request["recordingRef"])}.wav`,
+					instanceId: "mediad-fake",
+				};
+			case RPC_SUBJECTS.mediaStopRecording:
+				return {
+					ok: true,
+					recordingRef: request["recordingRef"],
+					stopped: true,
+					sessionId: "leg-a",
+					instanceId: "mediad-fake",
+				};
 			case RPC_SUBJECTS.mediaReleaseSession:
 				return {
 					ok: true,

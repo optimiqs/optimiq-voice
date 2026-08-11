@@ -954,6 +954,284 @@ export const MEDIA_STOP_PLAYBACK_RPC = defineRpc(
 	500,
 );
 
+/**
+ * `rpc.media.v1.send-dtmf` — generate RFC 4733 digits towards a leg's far end. Rung 3.
+ *
+ * ## Why this is generation and not the DTMF that already works
+ *
+ * Digits pressed by a party ALREADY cross a `mediad` bridge, and have since rung 2: a
+ * telephone-event payload is just bytes to a relay, so the header rewrite forwards them and
+ * renumbers the payload type between two legs that negotiated differently. What that path cannot do
+ * is ORIGINATE a digit — an attended transfer punching an extension into a far-end IVR, or a
+ * confirmed-transfer "press 1 to accept" answered on the caller's behalf — because there is no
+ * inbound packet to forward. This command is the leg that has to be synthesised.
+ *
+ * ## Refused when the leg negotiated no telephone-event payload type
+ *
+ * `not_supported`, by name, and NOT silently rendered as an inband tone. A leg whose SDP answer
+ * carried no RFC 4733 type has told us it does not expect one, and the two alternatives are both
+ * worse than a refusal: sending under a type the far end never agreed to produces digits it drops
+ * (an IVR that "randomly" ignores keypresses), and synthesising an audible tone into the G.711
+ * stream means writing a tone generator, which is the same deferral `tone://` carries at
+ * `start-playback`. The engine answers a refusal by routing the leg to Asterisk, which has both.
+ *
+ * ## Why the reply comes back when injection has STARTED
+ *
+ * Exactly what ARI's `POST /channels/{id}/dtmf` does — Asterisk queues the frames and answers — so
+ * mirroring it is what keeps the two drivers behaving identically at the seam above, which is the
+ * property the whole cutover rests on. Everything that could be REFUSED (no such session, no
+ * negotiated type, an unsendable digit, a far end that has not been learned yet) is decided before
+ * the first packet, so an `ok` reply means the digits are going out rather than that they were
+ * accepted for consideration. `queuedMs` is how long the far end will be receiving them, which is
+ * the one fact the caller cannot compute without knowing this service's defaults.
+ */
+export const mediaSendDtmfRequestSchema = z.object({
+	...mediaCommandShape,
+	/**
+	 * The digits to generate: `0-9`, `*`, `#`, and `A-D`.
+	 *
+	 * 32 is a deliberate cap rather than a round number: the longest thing anybody legitimately
+	 * punches into a far-end IVR is an account or conference PIN, and a string long enough to hold
+	 * a media session busy for a minute is a caller bug this refuses in one round trip.
+	 */
+	digits: z
+		.string()
+		.min(1)
+		.max(32)
+		.regex(/^[0-9A-Da-d*#]+$/, "digits may only contain 0-9, A-D, * and #"),
+	/**
+	 * How long each tone lasts. Milliseconds, as everywhere above this seam.
+	 *
+	 * The floor is 40 ms because RFC 4733 receivers and every inband detector built for one need
+	 * enough of a tone to recognise it, and a 20 ms digit is one packet that a single loss erases.
+	 */
+	toneDurationMs: z.int().min(40).max(1_000).optional(),
+	/** Silence between digits. Zero is legal and means "back to back". */
+	gapMs: z.int().min(0).max(1_000).optional(),
+});
+
+export const mediaSendDtmfResponseSchema = z.object({
+	ok: z.boolean(),
+	sessionId: z.string().min(1).max(128),
+	/** The digits accepted, echoed so a log line carries them without the request beside it. */
+	digits: z.string().max(32).default(""),
+	/**
+	 * How long the whole string will take to put on the wire, tone and gap included.
+	 *
+	 * The reply is sent when injection STARTS, so this is the only number that tells a caller when
+	 * the far end will have heard the last digit.
+	 */
+	queuedMs: z.int().min(0).optional(),
+	/** The RFC 4733 payload type the digits are being sent under. The leg's own negotiated one. */
+	telephoneEventPayloadType: z.int().min(0).max(127).optional(),
+	instanceId: z.string().min(1).max(128).optional(),
+	reason: mediaRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type MediaSendDtmfRequest = z.infer<typeof mediaSendDtmfRequestSchema>;
+export type MediaSendDtmfResponse = z.infer<typeof mediaSendDtmfResponseSchema>;
+
+export const MEDIA_SEND_DTMF_RPC = defineRpc(
+	RPC_SUBJECTS.mediaSendDtmf,
+	mediaSendDtmfRequestSchema,
+	mediaSendDtmfResponseSchema,
+	// 500 ms like the rest of the family, and it fits for the same reason: this command validates,
+	// takes a lock and starts a goroutine. The DIGITS take seconds; answering only once they were
+	// all on the wire would put a multi-second command on a call path for no information the caller
+	// does not already have from `queuedMs`.
+	500,
+);
+
+/**
+ * How a `mediad` recording captures a session. Rung 4.
+ *
+ * ## Why this field exists at all, and why `MediaPort` has no equivalent
+ *
+ * On Asterisk the choice is made by WHICH CHANNEL is recorded rather than by an argument:
+ * `apps/engine/src/routing/plan-walker.ts` records the caller's own channel for voicemail and gets
+ * one direction, and `apps/engine/src/calls/call-control.ts` first creates a snoop channel spying
+ * on `both` and records THAT to get the conversation. `RecordRequest` therefore has no direction on
+ * it — the direction was encoded in the channel id.
+ *
+ * `mediad` has no snoop channel and needs none: a session is already both directions, so the choice
+ * is an argument here. That is the whole reason `MediaPort.snoop` stays refused on this driver — it
+ * is an Asterisk-ism that exists to give a tap something to be addressed as, and reproducing it
+ * would mean inventing a session with no port that publishes a `leg-arrived` for a leg that does
+ * not exist.
+ */
+export const MEDIA_RECORDING_DIRECTIONS = [
+	/**
+	 * What the session RECEIVES: the far party speaking, and nothing this leg was sent.
+	 *
+	 * The faithful mirror of ARI's `channels.record` on a plain channel, which is what the
+	 * voicemail path uses — a mailbox message should contain the caller, not the greeting that was
+	 * played at them.
+	 */
+	"receive",
+	/**
+	 * Both directions, summed into one mono stream.
+	 *
+	 * The snoop replacement, and what an on-demand call recording means. It is a real mix (decode
+	 * both G.711 streams, add the linear samples, re-encode once at the end) rather than the
+	 * passthrough the relay does, and it is affordable HERE for the reason it is not affordable on
+	 * the call path: nothing downstream is waiting on it, a recording is written at wall-clock pace
+	 * by one goroutine, and a frame of skew between the two directions is inaudible in a playback
+	 * where it would be a defect in a live conference. Rung 6's mixer is a different problem.
+	 */
+	"both",
+] as const;
+
+export const mediaRecordingDirectionSchema = z.enum(MEDIA_RECORDING_DIRECTIONS);
+export type MediaRecordingDirection = (typeof MEDIA_RECORDING_DIRECTIONS)[number];
+
+/**
+ * `rpc.media.v1.start-recording` — write a session's audio to a file. Rung 4.
+ *
+ * ## Where the file goes, and why the engine does not say
+ *
+ * `MEDIAD_RECORDINGS_DIR/<orgId>/<callId>/<recordingRef>.wav`, and every one of those tokens is
+ * something `mediad` already holds: the org and the call came in on `allocate-session` and live on
+ * the session, the reference is on this request. That is not a coincidence — it is exactly the
+ * object key `apps/engine` computes for the same recording
+ * (`${organizationId}/${callId}/${recordingId}.${format}`) and exactly what `apps/api`'s archiver
+ * stats under `CDR_RECORDING_ROOT`, so one mount serves both planes and the archive pipeline needs
+ * no change to read what `mediad` wrote. It is the same mount discipline `MEDIAD_SOUNDS_DIR` uses
+ * for prompts, and for the same reason: putting an object-store fetch on the media plane would give
+ * the process with RTP sockets open to the internet a control-plane credential.
+ *
+ * A path is NOT accepted from the caller. The engine naming a directory would let a malformed or
+ * hostile request write anywhere the process can, and the engine has nothing to say about the
+ * layout that `mediad` cannot derive.
+ *
+ * ## What is refused rather than approximated
+ *
+ * - `beep` — `mediad` has no tone generator (the same deferral `tone://` carries at
+ *   `start-playback`). A voicemail whose beep never sounds is a caller talking over the tail of the
+ *   greeting, so it is refused rather than dropped.
+ * - `terminateOn` — ending a recording on a digit needs DTMF DETECTION, which is the receive half
+ *   of rung 3 and not built: `mediad` relays telephone-event payloads without decoding them. A
+ *   recording that ignored `#` would run to `maxDurationMs` on every voicemail.
+ *
+ * Both are `not_supported` with the capability named, which the engine answers by routing that leg
+ * to Asterisk. Accepting them and doing nothing is the failure mode this whole vocabulary exists to
+ * prevent.
+ */
+export const mediaStartRecordingRequestSchema = z.object({
+	...mediaCommandShape,
+	/**
+	 * Caller-assigned handle. `stop-recording` names it, `recording.finished` carries it, and it is
+	 * the FILENAME stem — so it is also what joins the file on disk to the engine's object key.
+	 */
+	recordingRef: z.string().min(1).max(128),
+	/** Which side of the session to capture. See {@link MEDIA_RECORDING_DIRECTIONS}. */
+	direction: mediaRecordingDirectionSchema.default("both"),
+	/**
+	 * Container. `wav` is the only one `mediad` writes, and anything else is `not_supported` by
+	 * name: `apps/api` serves recordings as `audio/wav` and the archiver copies bytes it never
+	 * inspects, so a `gsm` file under a `.gsm` key would download and fail to play.
+	 */
+	format: z.enum(["wav"]).default("wav"),
+	/** Hard stop. Milliseconds — the seam above speaks seconds because ARI does; this does not. */
+	maxDurationMs: z
+		.int()
+		.min(1_000)
+		.max(4 * 60 * 60 * 1_000)
+		.optional(),
+	/** Stop after this much continuous silence. Absent means "record until told to stop". */
+	maxSilenceMs: z
+		.int()
+		.min(500)
+		.max(60 * 60 * 1_000)
+		.optional(),
+	/** Refused when true — see the note above. Carried so the two drivers cannot silently differ. */
+	beep: z.boolean().optional(),
+	/** Digits that end the recording. `none` and the empty string mean the same thing: no digits. */
+	terminateOn: z.string().max(16).optional(),
+});
+
+export const mediaStartRecordingResponseSchema = z.object({
+	ok: z.boolean(),
+	sessionId: z.string().min(1).max(128),
+	recordingRef: z.string().min(1).max(128),
+	/**
+	 * The object key the file will land under, RELATIVE to the recordings root —
+	 * `<orgId>/<callId>/<recordingRef>.wav`.
+	 *
+	 * Relative and not absolute on purpose: the absolute path differs per container (the API mounts
+	 * the same directory at a different place from the media plane), so an absolute one would be
+	 * true for `mediad` and wrong for everybody reading the reply. This is the value that joins to
+	 * `recordings.object_key`.
+	 */
+	objectKey: z.string().min(1).max(1_024).optional(),
+	instanceId: z.string().min(1).max(128).optional(),
+	reason: mediaRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type MediaStartRecordingRequest = z.infer<typeof mediaStartRecordingRequestSchema>;
+export type MediaStartRecordingResponse = z.infer<typeof mediaStartRecordingResponseSchema>;
+
+export const MEDIA_START_RECORDING_RPC = defineRpc(
+	RPC_SUBJECTS.mediaStartRecording,
+	mediaStartRecordingRequestSchema,
+	mediaStartRecordingResponseSchema,
+	// 1 s, matching `start-playback` and for the mirror-image reason: that one READS a file before
+	// it answers, this one CREATES one — a directory tree to make, a file to open and a header to
+	// write — and a reply that arrives before the file exists would let the first frame be dropped
+	// on the floor. Everything after the header is the recorder's own goroutine.
+	1_000,
+);
+
+/**
+ * `rpc.media.v1.stop-recording` — close the file and publish `recording.finished`.
+ *
+ * ## Why there is no `sessionId`
+ *
+ * Because `MediaPort.stopRecording(name)` has none, exactly as with `stop-playback`. The engine
+ * stops a recording from a handler holding a reference, so `mediad` indexes live recordings by
+ * reference and does the lookup itself rather than having a session id threaded onto the seam above
+ * purely to make this payload look symmetrical.
+ *
+ * ## Idempotent, and a stop of a finished recording is a SUCCESS
+ *
+ * `ok: true, stopped: false`. `MediaPort` states the rule — "already-finished is a no-op" — and it
+ * is the normal case rather than an edge one: a recording that hit `maxDurationMs`, or whose leg
+ * hung up, has already finalised itself by the time the engine's teardown gets around to stopping
+ * it.
+ *
+ * ## The reply is not the finalisation
+ *
+ * It says the recorder was told to stop. `recording.finished` says the header has been patched, the
+ * bytes fsynced and the file renamed into place, and THAT is the event the archive pipeline must
+ * wait for — an archive triggered on this reply would copy a file that is still being written.
+ */
+export const mediaStopRecordingRequestSchema = z.object({
+	recordingRef: z.string().min(1).max(128),
+});
+
+export const mediaStopRecordingResponseSchema = z.object({
+	ok: z.boolean(),
+	recordingRef: z.string().min(1).max(128),
+	/** False when there was nothing recording. A SUCCESS, not a failure — see the note above. */
+	stopped: z.boolean().default(false),
+	/** The session the recording was on, when there was one. Logging and correlation only. */
+	sessionId: z.string().min(1).max(128).optional(),
+	instanceId: z.string().min(1).max(128).optional(),
+	reason: mediaRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type MediaStopRecordingRequest = z.infer<typeof mediaStopRecordingRequestSchema>;
+export type MediaStopRecordingResponse = z.infer<typeof mediaStopRecordingResponseSchema>;
+
+export const MEDIA_STOP_RECORDING_RPC = defineRpc(
+	RPC_SUBJECTS.mediaStopRecording,
+	mediaStopRecordingRequestSchema,
+	mediaStopRecordingResponseSchema,
+	500,
+);
+
 // ---------------------------------------------------------------------------------------------
 // rpc.engine.v1.park-handoff — engine → engine, when a park is retrieved from the wrong node
 // ---------------------------------------------------------------------------------------------
@@ -1117,5 +1395,8 @@ export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.mediaReleaseSession]: MEDIA_RELEASE_SESSION_RPC,
 	[RPC_SUBJECTS.mediaStartPlayback]: MEDIA_START_PLAYBACK_RPC,
 	[RPC_SUBJECTS.mediaStopPlayback]: MEDIA_STOP_PLAYBACK_RPC,
+	[RPC_SUBJECTS.mediaSendDtmf]: MEDIA_SEND_DTMF_RPC,
+	[RPC_SUBJECTS.mediaStartRecording]: MEDIA_START_RECORDING_RPC,
+	[RPC_SUBJECTS.mediaStopRecording]: MEDIA_STOP_RECORDING_RPC,
 	[RPC_SUBJECTS.engineParkHandoff]: PARK_HANDOFF_RPC,
 } as const;

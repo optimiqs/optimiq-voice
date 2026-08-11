@@ -1,0 +1,29 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"sessionId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"digits": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 32,
+			"pattern": "^[0-9A-Da-d*#]+$"
+		},
+		"toneDurationMs": {
+			"type": "integer",
+			"minimum": 40,
+			"maximum": 1000
+		},
+		"gapMs": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 1000
+		}
+	},
+	"required": ["sessionId", "digits"],
+	"additionalProperties": false
+}

@@ -516,10 +516,11 @@ func TestRelayWaitsForThePeerToLatch(t *testing.T) {
 
 // recordingLifecycle captures what the packet path announces.
 type recordingLifecycle struct {
-	mu        sync.Mutex
-	ended     []endedCall
-	timedOut  []timeoutCall
-	playbacks []rtp.PlaybackSummary
+	mu         sync.Mutex
+	ended      []endedCall
+	timedOut   []timeoutCall
+	playbacks  []rtp.PlaybackSummary
+	recordings []rtp.RecordingSummary
 }
 
 type endedCall struct {
@@ -548,6 +549,19 @@ func (l *recordingLifecycle) PlaybackFinished(_ rtp.SessionSummary, playback rtp
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.playbacks = append(l.playbacks, playback)
+}
+
+func (l *recordingLifecycle) RecordingFinished(_ rtp.SessionSummary, recording rtp.RecordingSummary) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.recordings = append(l.recordings, recording)
+}
+
+// recordingSummaries copies out what the packet path announced about finished recordings.
+func (l *recordingLifecycle) recordingSummaries() []rtp.RecordingSummary {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]rtp.RecordingSummary(nil), l.recordings...)
 }
 
 // playbackSummaries copies out what the packet path announced about finished prompts.

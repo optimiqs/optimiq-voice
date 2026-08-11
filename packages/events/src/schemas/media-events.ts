@@ -186,6 +186,86 @@ export const mediaPlaybackFinishedDataSchema = z.object({
 	detail: z.string().max(512).optional(),
 });
 
+/**
+ * Why a recording stopped.
+ *
+ * Wider than the playback vocabulary because a recording can end for reasons the engine did not
+ * ask for and still be a perfectly good file — a voicemail that ran out of silence is the NORMAL
+ * end of a voicemail, not a failure — and the consumer has to be able to tell those from the one
+ * outcome that means there is no usable audio.
+ */
+export const MEDIA_RECORDING_END_REASONS = [
+	/** `rpc.media.v1.stop-recording`. The engine asked, and the file is complete up to that point. */
+	"stopped",
+	/** `maxDurationMs` elapsed. A complete file of exactly that length. */
+	"max-duration",
+	/**
+	 * `maxSilenceMs` of continuous quiet. The normal end of a voicemail: the caller stopped talking.
+	 *
+	 * The trailing silence is IN the file — trimming it would mean the duration on this event and
+	 * the duration of the audio disagreed, and a consumer cannot tell which one a player will show.
+	 */
+	"max-silence",
+	/**
+	 * The session went away underneath it — released, reaped, timed out or drained.
+	 *
+	 * Still a complete file: the recorder finalises on the way down, so a caller who hangs up
+	 * mid-message leaves a playable message rather than a partial nobody can open.
+	 */
+	"session-ended",
+	/** The file could not be written or finalised. There is NO usable recording. `detail` says why. */
+	"error",
+] as const;
+
+export const mediaRecordingEndReasonSchema = z.enum(MEDIA_RECORDING_END_REASONS);
+export type MediaRecordingEndReason = (typeof MEDIA_RECORDING_END_REASONS)[number];
+
+/**
+ * `recording.finished` — the file is closed, named, and safe to read.
+ *
+ * ## The one media event the engine really does act on
+ *
+ * `session.rtp-timeout` and `playback.finished` map to nothing above the seam, and this one does
+ * not: `plan-walker`'s voicemail node and `call-control`'s on-demand recording both BLOCK on "the
+ * recording finished" before they publish `channel.record.stopped`, and `apps/api`'s archiver
+ * copies the object the moment that lands. So the ordering here is a contract rather than an
+ * implementation detail — this event is published after the WAV header has been patched with the
+ * real lengths, the bytes fsynced, and the file renamed from its `.partial` name into the object
+ * key below. Anything published earlier would archive a file that is still being written, which is
+ * a truncated recording discovered weeks later by the person who needed it.
+ *
+ * ## Why `bytes` is on it
+ *
+ * Because nothing else counts them. The engine's `channel.record.stopped` carries an optional
+ * `bytes` it has never been able to fill — it does not hold the file — so `recordings.size_bytes`
+ * is written as zero on every row today. The process that wrote the audio is the only one that can
+ * say how much there was, and a recording whose duration is 30 s and whose size is 400 bytes is a
+ * failure the duration alone hides completely.
+ */
+export const mediaRecordingFinishedDataSchema = z.object({
+	...sessionIdentityShape,
+	/** The reference the engine assigned in `rpc.media.v1.start-recording`. */
+	recordingRef: z.string().min(1).max(128),
+	reason: mediaRecordingEndReasonSchema,
+	/** How much audio the file holds. Milliseconds, as everywhere on this backbone. */
+	durationMs: z.int().min(0),
+	/** The size of the finished file, header included. Zero when `reason` is `error`. */
+	bytes: z.int().min(0),
+	/**
+	 * The object key the audio landed under, relative to the recordings root:
+	 * `<orgId>/<callId>/<recordingRef>.wav`.
+	 *
+	 * Relative rather than absolute because the same directory is mounted at a different path in
+	 * every container that touches it, and an absolute path would be true only for the media plane.
+	 * This is the value that joins to `recordings.object_key` in `cdr-db`.
+	 */
+	objectKey: z.string().min(1).max(1_024),
+	/** Which side of the session was captured. */
+	direction: z.enum(["receive", "both"]),
+	/** Free text for the `error` reason, and for anything an operator would want in a log line. */
+	detail: z.string().max(512).optional(),
+});
+
 export const MEDIA_EVENT_DEFINITIONS = {
 	"session.ended": defineEvent("media", "session.ended", mediaSessionEndedDataSchema),
 	"session.rtp-timeout": defineEvent(
@@ -194,6 +274,11 @@ export const MEDIA_EVENT_DEFINITIONS = {
 		mediaSessionRtpTimeoutDataSchema,
 	),
 	"playback.finished": defineEvent("media", "playback.finished", mediaPlaybackFinishedDataSchema),
+	"recording.finished": defineEvent(
+		"media",
+		"recording.finished",
+		mediaRecordingFinishedDataSchema,
+	),
 } as const;
 
 export type MediaEventDefinitions = typeof MEDIA_EVENT_DEFINITIONS;
@@ -211,6 +296,7 @@ export const mediaEventSchema = z.discriminatedUnion("type", [
 	MEDIA_EVENT_DEFINITIONS["session.ended"].envelope,
 	MEDIA_EVENT_DEFINITIONS["session.rtp-timeout"].envelope,
 	MEDIA_EVENT_DEFINITIONS["playback.finished"].envelope,
+	MEDIA_EVENT_DEFINITIONS["recording.finished"].envelope,
 ]);
 
 export type MediaEventEnvelope = z.infer<typeof mediaEventSchema>;
@@ -218,6 +304,7 @@ export type MediaEventEnvelope = z.infer<typeof mediaEventSchema>;
 export type MediaSessionEndedData = z.infer<typeof mediaSessionEndedDataSchema>;
 export type MediaSessionRtpTimeoutData = z.infer<typeof mediaSessionRtpTimeoutDataSchema>;
 export type MediaPlaybackFinishedData = z.infer<typeof mediaPlaybackFinishedDataSchema>;
+export type MediaRecordingFinishedData = z.infer<typeof mediaRecordingFinishedDataSchema>;
 
 /**
  * Input for {@link makeMediaEvent}. The subject is derived from `orgId` and `data.sessionId`, so a

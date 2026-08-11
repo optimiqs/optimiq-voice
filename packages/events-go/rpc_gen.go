@@ -33,6 +33,9 @@ const (
 	SubjectMediaReleaseSessionRPC   = "rpc.media.v1.release-session"
 	SubjectMediaStartPlaybackRPC    = "rpc.media.v1.start-playback"
 	SubjectMediaStopPlaybackRPC     = "rpc.media.v1.stop-playback"
+	SubjectMediaSendDtmfRPC         = "rpc.media.v1.send-dtmf"
+	SubjectMediaStartRecordingRPC   = "rpc.media.v1.start-recording"
+	SubjectMediaStopRecordingRPC    = "rpc.media.v1.stop-recording"
 	SubjectParkHandoffRPC           = "rpc.engine.v1.park-handoff"
 )
 
@@ -48,6 +51,9 @@ const (
 	TimeoutMediaReleaseSessionRPC   = 500 * time.Millisecond
 	TimeoutMediaStartPlaybackRPC    = 1000 * time.Millisecond
 	TimeoutMediaStopPlaybackRPC     = 500 * time.Millisecond
+	TimeoutMediaSendDtmfRPC         = 500 * time.Millisecond
+	TimeoutMediaStartRecordingRPC   = 1000 * time.Millisecond
+	TimeoutMediaStopRecordingRPC    = 500 * time.Millisecond
 	TimeoutParkHandoffRPC           = 3000 * time.Millisecond
 )
 
@@ -737,6 +743,223 @@ func (v MediaStopPlaybackResponseReason) Valid() bool {
 }
 
 func (v MediaStopPlaybackResponseReason) String() string { return string(v) }
+
+// MediaSendDtmfRequest is the request body of rpc.media.v1.send-dtmf.
+type MediaSendDtmfRequest struct {
+	SessionID      string `json:"sessionId"`
+	Digits         string `json:"digits"`
+	ToneDurationMs *int   `json:"toneDurationMs,omitempty"`
+	GapMs          *int   `json:"gapMs,omitempty"`
+}
+
+// MediaSendDtmfResponse is the reply body of rpc.media.v1.send-dtmf.
+type MediaSendDtmfResponse struct {
+	Ok                        bool                         `json:"ok"`
+	SessionID                 string                       `json:"sessionId"`
+	Digits                    string                       `json:"digits"`
+	QueuedMs                  *int                         `json:"queuedMs,omitempty"`
+	TelephoneEventPayloadType *int                         `json:"telephoneEventPayloadType,omitempty"`
+	InstanceID                *string                      `json:"instanceId,omitempty"`
+	Reason                    *MediaSendDtmfResponseReason `json:"reason,omitempty"`
+	Error                     *string                      `json:"error,omitempty"`
+}
+
+// MediaSendDtmfResponseReason is the closed vocabulary of MediaSendDtmfResponse.reason.
+type MediaSendDtmfResponseReason string
+
+const (
+	MediaSendDtmfResponseReasonBadRequest     MediaSendDtmfResponseReason = "bad_request"
+	MediaSendDtmfResponseReasonCapacity       MediaSendDtmfResponseReason = "capacity"
+	MediaSendDtmfResponseReasonShuttingDown   MediaSendDtmfResponseReason = "shutting_down"
+	MediaSendDtmfResponseReasonUnknownSession MediaSendDtmfResponseReason = "unknown_session"
+	MediaSendDtmfResponseReasonWrongInstance  MediaSendDtmfResponseReason = "wrong_instance"
+	MediaSendDtmfResponseReasonNotSupported   MediaSendDtmfResponseReason = "not_supported"
+	MediaSendDtmfResponseReasonInternal       MediaSendDtmfResponseReason = "internal"
+)
+
+// MediaSendDtmfResponseReasonValues lists every member of the vocabulary, in contract order.
+var MediaSendDtmfResponseReasonValues = []MediaSendDtmfResponseReason{
+	MediaSendDtmfResponseReasonBadRequest,
+	MediaSendDtmfResponseReasonCapacity,
+	MediaSendDtmfResponseReasonShuttingDown,
+	MediaSendDtmfResponseReasonUnknownSession,
+	MediaSendDtmfResponseReasonWrongInstance,
+	MediaSendDtmfResponseReasonNotSupported,
+	MediaSendDtmfResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the MediaSendDtmfResponseReason vocabulary.
+func (v MediaSendDtmfResponseReason) Valid() bool {
+	for _, candidate := range MediaSendDtmfResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaSendDtmfResponseReason) String() string { return string(v) }
+
+// MediaStartRecordingRequest is the request body of rpc.media.v1.start-recording.
+type MediaStartRecordingRequest struct {
+	SessionID     string                              `json:"sessionId"`
+	RecordingRef  string                              `json:"recordingRef"`
+	Direction     MediaStartRecordingRequestDirection `json:"direction"`
+	Format        MediaStartRecordingRequestFormat    `json:"format"`
+	MaxDurationMs *int                                `json:"maxDurationMs,omitempty"`
+	MaxSilenceMs  *int                                `json:"maxSilenceMs,omitempty"`
+	Beep          *bool                               `json:"beep,omitempty"`
+	TerminateOn   *string                             `json:"terminateOn,omitempty"`
+}
+
+// MediaStartRecordingRequestDirection is the closed vocabulary of MediaStartRecordingRequest.direction.
+type MediaStartRecordingRequestDirection string
+
+const (
+	MediaStartRecordingRequestDirectionReceive MediaStartRecordingRequestDirection = "receive"
+	MediaStartRecordingRequestDirectionBoth    MediaStartRecordingRequestDirection = "both"
+)
+
+// MediaStartRecordingRequestDirectionValues lists every member of the vocabulary, in contract order.
+var MediaStartRecordingRequestDirectionValues = []MediaStartRecordingRequestDirection{
+	MediaStartRecordingRequestDirectionReceive,
+	MediaStartRecordingRequestDirectionBoth,
+}
+
+// Valid reports whether v is a member of the MediaStartRecordingRequestDirection vocabulary.
+func (v MediaStartRecordingRequestDirection) Valid() bool {
+	for _, candidate := range MediaStartRecordingRequestDirectionValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaStartRecordingRequestDirection) String() string { return string(v) }
+
+// MediaStartRecordingRequestFormat is the closed vocabulary of MediaStartRecordingRequest.format.
+type MediaStartRecordingRequestFormat string
+
+const (
+	MediaStartRecordingRequestFormatWav MediaStartRecordingRequestFormat = "wav"
+)
+
+// MediaStartRecordingRequestFormatValues lists every member of the vocabulary, in contract order.
+var MediaStartRecordingRequestFormatValues = []MediaStartRecordingRequestFormat{
+	MediaStartRecordingRequestFormatWav,
+}
+
+// Valid reports whether v is a member of the MediaStartRecordingRequestFormat vocabulary.
+func (v MediaStartRecordingRequestFormat) Valid() bool {
+	for _, candidate := range MediaStartRecordingRequestFormatValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaStartRecordingRequestFormat) String() string { return string(v) }
+
+// MediaStartRecordingResponse is the reply body of rpc.media.v1.start-recording.
+type MediaStartRecordingResponse struct {
+	Ok           bool                               `json:"ok"`
+	SessionID    string                             `json:"sessionId"`
+	RecordingRef string                             `json:"recordingRef"`
+	ObjectKey    *string                            `json:"objectKey,omitempty"`
+	InstanceID   *string                            `json:"instanceId,omitempty"`
+	Reason       *MediaStartRecordingResponseReason `json:"reason,omitempty"`
+	Error        *string                            `json:"error,omitempty"`
+}
+
+// MediaStartRecordingResponseReason is the closed vocabulary of MediaStartRecordingResponse.reason.
+type MediaStartRecordingResponseReason string
+
+const (
+	MediaStartRecordingResponseReasonBadRequest     MediaStartRecordingResponseReason = "bad_request"
+	MediaStartRecordingResponseReasonCapacity       MediaStartRecordingResponseReason = "capacity"
+	MediaStartRecordingResponseReasonShuttingDown   MediaStartRecordingResponseReason = "shutting_down"
+	MediaStartRecordingResponseReasonUnknownSession MediaStartRecordingResponseReason = "unknown_session"
+	MediaStartRecordingResponseReasonWrongInstance  MediaStartRecordingResponseReason = "wrong_instance"
+	MediaStartRecordingResponseReasonNotSupported   MediaStartRecordingResponseReason = "not_supported"
+	MediaStartRecordingResponseReasonInternal       MediaStartRecordingResponseReason = "internal"
+)
+
+// MediaStartRecordingResponseReasonValues lists every member of the vocabulary, in contract order.
+var MediaStartRecordingResponseReasonValues = []MediaStartRecordingResponseReason{
+	MediaStartRecordingResponseReasonBadRequest,
+	MediaStartRecordingResponseReasonCapacity,
+	MediaStartRecordingResponseReasonShuttingDown,
+	MediaStartRecordingResponseReasonUnknownSession,
+	MediaStartRecordingResponseReasonWrongInstance,
+	MediaStartRecordingResponseReasonNotSupported,
+	MediaStartRecordingResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the MediaStartRecordingResponseReason vocabulary.
+func (v MediaStartRecordingResponseReason) Valid() bool {
+	for _, candidate := range MediaStartRecordingResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaStartRecordingResponseReason) String() string { return string(v) }
+
+// MediaStopRecordingRequest is the request body of rpc.media.v1.stop-recording.
+type MediaStopRecordingRequest struct {
+	RecordingRef string `json:"recordingRef"`
+}
+
+// MediaStopRecordingResponse is the reply body of rpc.media.v1.stop-recording.
+type MediaStopRecordingResponse struct {
+	Ok           bool                              `json:"ok"`
+	RecordingRef string                            `json:"recordingRef"`
+	Stopped      bool                              `json:"stopped"`
+	SessionID    *string                           `json:"sessionId,omitempty"`
+	InstanceID   *string                           `json:"instanceId,omitempty"`
+	Reason       *MediaStopRecordingResponseReason `json:"reason,omitempty"`
+	Error        *string                           `json:"error,omitempty"`
+}
+
+// MediaStopRecordingResponseReason is the closed vocabulary of MediaStopRecordingResponse.reason.
+type MediaStopRecordingResponseReason string
+
+const (
+	MediaStopRecordingResponseReasonBadRequest     MediaStopRecordingResponseReason = "bad_request"
+	MediaStopRecordingResponseReasonCapacity       MediaStopRecordingResponseReason = "capacity"
+	MediaStopRecordingResponseReasonShuttingDown   MediaStopRecordingResponseReason = "shutting_down"
+	MediaStopRecordingResponseReasonUnknownSession MediaStopRecordingResponseReason = "unknown_session"
+	MediaStopRecordingResponseReasonWrongInstance  MediaStopRecordingResponseReason = "wrong_instance"
+	MediaStopRecordingResponseReasonNotSupported   MediaStopRecordingResponseReason = "not_supported"
+	MediaStopRecordingResponseReasonInternal       MediaStopRecordingResponseReason = "internal"
+)
+
+// MediaStopRecordingResponseReasonValues lists every member of the vocabulary, in contract order.
+var MediaStopRecordingResponseReasonValues = []MediaStopRecordingResponseReason{
+	MediaStopRecordingResponseReasonBadRequest,
+	MediaStopRecordingResponseReasonCapacity,
+	MediaStopRecordingResponseReasonShuttingDown,
+	MediaStopRecordingResponseReasonUnknownSession,
+	MediaStopRecordingResponseReasonWrongInstance,
+	MediaStopRecordingResponseReasonNotSupported,
+	MediaStopRecordingResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the MediaStopRecordingResponseReason vocabulary.
+func (v MediaStopRecordingResponseReason) Valid() bool {
+	for _, candidate := range MediaStopRecordingResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaStopRecordingResponseReason) String() string { return string(v) }
 
 // ParkHandoffRequest is the request body of rpc.engine.v1.park-handoff.
 type ParkHandoffRequest struct {

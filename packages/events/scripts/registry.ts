@@ -242,6 +242,7 @@ export const EVENT_ENTRIES: readonly EventEntry[] = [
 	mediaEntry("session.ended", "MediaSessionEnded"),
 	mediaEntry("session.rtp-timeout", "MediaSessionRTPTimeout"),
 	mediaEntry("playback.finished", "MediaPlaybackFinished"),
+	mediaEntry("recording.finished", "MediaRecordingFinished"),
 
 	{
 		family: "cdr",
@@ -358,6 +359,27 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		timeoutMs: RPC_CONTRACTS["rpc.media.v1.stop-playback"].timeoutMs,
 		request: RPC_CONTRACTS["rpc.media.v1.stop-playback"].request,
 		response: RPC_CONTRACTS["rpc.media.v1.stop-playback"].response,
+	},
+	{
+		subject: "rpc.media.v1.send-dtmf",
+		goName: "MediaSendDtmf",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.send-dtmf"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.send-dtmf"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.send-dtmf"].response,
+	},
+	{
+		subject: "rpc.media.v1.start-recording",
+		goName: "MediaStartRecording",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.start-recording"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.start-recording"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.start-recording"].response,
+	},
+	{
+		subject: "rpc.media.v1.stop-recording",
+		goName: "MediaStopRecording",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.stop-recording"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.stop-recording"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.stop-recording"].response,
 	},
 	// Engine to engine, and the only subject here whose emitted constant is a PREFIX: the wire
 	// subject appends the owning instance's token. Emitted anyway, because the Go side reads the

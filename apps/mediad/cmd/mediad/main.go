@@ -155,13 +155,23 @@ func run() error {
 			"hint", "set MEDIAD_SOUNDS_DIR to the directory prompts are mounted at")
 	}
 
+	if cfg.RecordingsDir == "" {
+		// WARN and carry on, exactly as with the prompt library above: every rung below recording
+		// still works, and the refusal happens per command by name, which is where an operator can
+		// act on it. A default pointing at a directory that probably does not exist would turn one
+		// clear refusal into a per-call "cannot create file".
+		log.Warn("no recordings directory is configured; every recording will be refused as not_supported",
+			"hint", "set MEDIAD_RECORDINGS_DIR to the same mount apps/api reads as CDR_RECORDING_ROOT")
+	}
+
 	server, err := control.NewServer(control.ServerOptions{
-		Sessions:   manager,
-		Directory:  sessionDirectory,
-		Library:    library,
-		InstanceID: cfg.InstanceID,
-		PublicAddr: cfg.PublicIP,
-		Logger:     log,
+		Sessions:      manager,
+		Directory:     sessionDirectory,
+		Library:       library,
+		RecordingsDir: cfg.RecordingsDir,
+		InstanceID:    cfg.InstanceID,
+		PublicAddr:    cfg.PublicIP,
+		Logger:        log,
 	})
 	if err != nil {
 		return err
@@ -185,8 +195,12 @@ func run() error {
 			control.SubjectReleaseSession,
 			control.SubjectStartPlayback,
 			control.SubjectStopPlayback,
+			control.SubjectSendDtmf,
+			control.SubjectStartRecording,
+			control.SubjectStopRecording,
 		},
 		"soundsDir", cfg.SoundsDir,
+		"recordingsDir", cfg.RecordingsDir,
 		"queueGroup", queueGroup,
 		"rtpTimeout", cfg.RTPTimeout.String(),
 		"idleTimeout", cfg.SessionIdleTimeout.String())
@@ -197,9 +211,10 @@ func run() error {
 		log.Warn("MEDIAD_ECHO_DIAGNOSTIC is on: every session ECHOES and no call will connect. " +
 			"This is a diagnostic mode; turn it off to serve traffic.")
 	}
-	log.Info("mediad serves rungs 1-2 (file playback and bridged calls): G.711 passthrough, RFC 4733 " +
-		"DTMF, two-party relay, WAV prompts. Recording, MOH, conferencing and T.38 are still " +
-		"Asterisk's — see plans/mediad-design.md")
+	log.Info("mediad serves rungs 1-4 (playback, bridged calls, DTMF generation and recording): " +
+		"G.711 passthrough, RFC 4733 DTMF both ways, two-party relay, WAV prompts and WAV " +
+		"recordings. DTMF DETECTION, MOH, conferencing and T.38 are still Asterisk's — see " +
+		"plans/mediad-design.md")
 
 	var group sync.WaitGroup
 	group.Add(1)

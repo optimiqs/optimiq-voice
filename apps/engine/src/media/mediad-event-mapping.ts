@@ -11,9 +11,9 @@ import type { HangupCause } from "@optimiq-voice/telephony";
  * stops at this file. `ari-mapping.ts` translates Asterisk's names; this translates `mediad`'s. The
  * layer above never learns there are two.
  *
- * ## Three events in, one member out
+ * ## Four events in, three members out
  *
- * `mediad` publishes three things and the orchestrator branches on one of them, so the mapping is
+ * `mediad` publishes four things and the orchestrator branches on two of them, so the mapping is
  * not symmetric — and that asymmetry is the interesting part.
  *
  * - `session.ended` becomes `leg-ended`, the member the CDR is written from. It is the only media
@@ -30,6 +30,14 @@ import type { HangupCause } from "@optimiq-voice/telephony";
  *   planes agreeing on a shape no consumer branches on. The event is still PUBLISHED, because
  *   `reason: error` is a caller in silence where a menu should be and nothing else records it; it
  *   is read by whoever is asking that question, not by the orchestrator.
+ * - `recording.finished` becomes `recording-finished`, or `recording-failed` when the reason is
+ *   `error`. This is the one media event the layer above genuinely waits for: `plan-walker`'s
+ *   voicemail node and `call-control`'s on-demand recording both block until a recording has
+ *   finished before they publish `channel.record.stopped`, which is what triggers the archive in
+ *   `apps/api`. The split into two members mirrors the ARI path exactly — `RecordingFinished` and
+ *   `RecordingFailed` are distinct ARI events, and the callers branch on the distinction: a failure
+ *   means there is no file, so no voicemail message is filed and no recording key lands on the CDR.
+ *   Folding them together would make a caller treat a missing file as a zero-length one.
  *
  * Answering `undefined` for an event the engine does not act on is the same contract `toMediaEvent`
  * has, for the same reason: the decision about what to drop belongs to the layer that knows what it
@@ -84,6 +92,26 @@ export function toMediaEventFromMediad(envelope: MediaEventEnvelope): MediaEvent
 			channelId: envelope.data.sessionId,
 			cause: mapped.cause,
 			causeCode: mapped.code,
+		};
+	}
+	if (envelope.type === "recording.finished") {
+		// The recording is addressed by NAME the whole way up, because ARI has no recording id and
+		// the seam inherited that: `MediaPort.record(name)` names it, `stopRecording(name)` stops it,
+		// and the waiters key on the same string. `recordingRef` is that name.
+		if (envelope.data.reason === "error") {
+			return {
+				type: "recording-failed",
+				recordingName: envelope.data.recordingRef,
+				// The media plane's own account of what went wrong, or a stable stand-in. A caller
+				// logs this and files no message, so an empty string would be a voicemail that
+				// vanished with no reason attached.
+				reason: envelope.data.detail ?? "the media plane could not write the recording",
+			};
+		}
+		return {
+			type: "recording-finished",
+			recordingName: envelope.data.recordingRef,
+			durationMs: envelope.data.durationMs,
 		};
 	}
 	// `session.rtp-timeout` and `playback.finished` — see the file header. The first is the

@@ -66,6 +66,28 @@ type stubSessions struct {
 	// codecFor overrides what AudioPayloadType reports for a session, so a test can put a prompt on
 	// an A-law leg without going anywhere near a socket.
 	codecFor map[string]uint8
+
+	// The rung 3 and rung 4 halves, stubbed the same way. `telephoneEventFor` defaults to 101 for a
+	// live session; a test sets it to 0 to stand in for a leg that negotiated no RFC 4733 type.
+	dtmfErr           error
+	dtmfSends         []dtmfCall
+	telephoneEventFor map[string]uint8
+
+	recordingErr    error
+	recordingStarts []recordingCall
+	recordingStops  []string
+	recording       map[string]string
+	tenancy         map[string][2]string
+}
+
+type dtmfCall struct {
+	sessionID string
+	opts      rtp.DtmfOptions
+}
+
+type recordingCall struct {
+	sessionID string
+	opts      rtp.RecordingOptions
 }
 
 type playbackCall struct {
@@ -81,11 +103,14 @@ type bridgeCall struct {
 
 func newStub() *stubSessions {
 	return &stubSessions{
-		live:     make(map[string]bool),
-		bridges:  make(map[string][]string),
-		playing:  make(map[string]string),
-		codecFor: make(map[string]uint8),
-		nextPort: 30000,
+		live:              make(map[string]bool),
+		bridges:           make(map[string][]string),
+		playing:           make(map[string]string),
+		codecFor:          make(map[string]uint8),
+		telephoneEventFor: make(map[string]uint8),
+		recording:         make(map[string]string),
+		tenancy:           make(map[string][2]string),
+		nextPort:          30000,
 	}
 }
 
@@ -191,6 +216,72 @@ func (s *stubSessions) AudioPayloadType(sessionID string) (uint8, bool) {
 	return rtp.PayloadTypePCMU, true
 }
 
+func (s *stubSessions) SendDtmf(sessionID string, opts rtp.DtmfOptions) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dtmfSends = append(s.dtmfSends, dtmfCall{sessionID, opts})
+	return s.dtmfErr
+}
+
+func (s *stubSessions) StartRecording(sessionID string, opts rtp.RecordingOptions) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recordingStarts = append(s.recordingStarts, recordingCall{sessionID, opts})
+	if s.recordingErr != nil {
+		return s.recordingErr
+	}
+	s.recording[opts.Ref] = sessionID
+	return nil
+}
+
+func (s *stubSessions) StopRecording(recordingRef string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recordingStops = append(s.recordingStops, recordingRef)
+	sessionID, ok := s.recording[recordingRef]
+	if !ok {
+		return "", false
+	}
+	delete(s.recording, recordingRef)
+	return sessionID, true
+}
+
+func (s *stubSessions) TelephoneEventPayloadType(sessionID string) (uint8, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.live[sessionID] {
+		return 0, false
+	}
+	if forced, ok := s.telephoneEventFor[sessionID]; ok {
+		return forced, true
+	}
+	return rtp.PayloadTypeTelephoneEvent, true
+}
+
+func (s *stubSessions) SessionTenancy(sessionID string) (string, string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.live[sessionID] {
+		return "", "", false
+	}
+	if forced, ok := s.tenancy[sessionID]; ok {
+		return forced[0], forced[1], true
+	}
+	return testOrg, testCall, true
+}
+
+func (s *stubSessions) dtmfCalls() []dtmfCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]dtmfCall(nil), s.dtmfSends...)
+}
+
+func (s *stubSessions) recordingCalls() []recordingCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]recordingCall(nil), s.recordingStarts...)
+}
+
 func (s *stubSessions) playbackCalls() []playbackCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -210,6 +301,10 @@ type rig struct {
 	// prompts is the directory MEDIAD_SOUNDS_DIR points at for this rig, so a playback test can
 	// write a fixture into it.
 	prompts string
+	// recordings is the directory MEDIAD_RECORDINGS_DIR points at, so a recording test can assert
+	// on the object key the handler derived without a real file ever being written — the stub
+	// packet path never opens one.
+	recordings string
 }
 
 func newRig(t *testing.T) *rig {
@@ -221,21 +316,29 @@ func newRig(t *testing.T) *rig {
 // deployment that has not mounted a prompt store, which must refuse every playback by name.
 func newRigWithLibrary(t *testing.T, prompts string) *rig {
 	t.Helper()
+	return newRigWith(t, prompts, t.TempDir())
+}
+
+// newRigWith builds a rig with both mounts named. An empty root for either is a deployment that has
+// not mounted that store, which must refuse the matching command by name rather than answer `ok`.
+func newRigWith(t *testing.T, prompts, recordings string) *rig {
+	t.Helper()
 	sessions := newStub()
 	dir := directory.NewFakeStore()
 	// Discard logs: the refusal paths log at WARN, and a passing suite should be silent.
 	server, err := control.NewServer(control.ServerOptions{
-		Sessions:   sessions,
-		Directory:  dir,
-		Library:    audio.NewLibrary(prompts),
-		InstanceID: thisNode,
-		PublicAddr: netip.MustParseAddr("203.0.113.10"),
-		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Sessions:      sessions,
+		Directory:     dir,
+		Library:       audio.NewLibrary(prompts),
+		RecordingsDir: recordings,
+		InstanceID:    thisNode,
+		PublicAddr:    netip.MustParseAddr("203.0.113.10"),
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	return &rig{server: server, sessions: sessions, dir: dir, prompts: prompts}
+	return &rig{server: server, sessions: sessions, dir: dir, prompts: prompts, recordings: recordings}
 }
 
 func mustJSON(t *testing.T, value any) []byte {

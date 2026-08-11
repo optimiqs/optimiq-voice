@@ -103,6 +103,14 @@ type Lifecycle interface {
 	// carry the session id, and a consumer asking "did the prompt play" is reading `playedMs`, not
 	// inferring it from arrival order.
 	PlaybackFinished(session SessionSummary, playback PlaybackSummary)
+	// RecordingFinished is called exactly once per started recording, after the file is on disk.
+	//
+	// Unlike PlaybackFinished, the ordering here IS guaranteed: when a session ends under a live
+	// recording this runs BEFORE the SessionEnded that follows it, because the engine tears the leg
+	// down on `session.ended` and a consumer that had already moved on would never learn the file
+	// existed. It is also announced only after the WAV has been finalised and renamed, since the
+	// whole point of the event is that the bytes are safe to read.
+	RecordingFinished(session SessionSummary, recording RecordingSummary)
 }
 
 // SessionSummary is a session's facts, flattened, so a Lifecycle implementation never holds a
@@ -154,7 +162,10 @@ type Manager struct {
 	// reference and NOTHING ELSE — `MediaPort.stopPlayback(playbackRef)` has no channel id to give
 	// — so without this index a stop would have to scan every live session on the instance.
 	playbacks map[string]string
-	closed    bool
+	// recordings maps a recording reference to the session being recorded, for the same reason
+	// `playbacks` exists: `rpc.media.v1.stop-recording` carries a reference and nothing else.
+	recordings map[string]string
+	closed     bool
 
 	// running tracks each session's read goroutine so Drain can wait for the packet path to stop
 	// before the process exits, rather than exiting with sockets still being read.
@@ -206,6 +217,7 @@ func NewManager(opts ManagerOptions) (*Manager, error) {
 		sessions:       make(map[string]*Session),
 		bridges:        make(map[string][2]string),
 		playbacks:      make(map[string]string),
+		recordings:     make(map[string]string),
 	}
 	if manager.rtpTimeout <= 0 {
 		manager.rtpTimeout = opts.IdleAfter
@@ -347,14 +359,69 @@ func (m *Manager) Release(sessionID string) bool {
 // The summary is taken BEFORE the close so the counters and the latched far end are the session's
 // final state rather than a zeroed struct, and the announcement happens after so a consumer that
 // reacts by asking about the session gets the truth.
+//
+// A live RECORDING is finalised in between, and the order is a contract rather than tidiness: the
+// engine tears the leg down on `session.ended`, so a `recording.finished` published after it would
+// arrive to a consumer that has already written the CDR and moved on — and the file, which exists
+// and is perfectly good, would never be archived. Waiting is bounded by a flush and a rename.
 func (m *Manager) closeAndAnnounce(session *Session, reason EndReason) {
 	summary := session.Summary()
+	recording := session.ActiveRecording()
+
 	if err := session.Close(); err != nil {
 		m.log.Warn("closing a session", "sessionId", session.ID, "error", err)
+	}
+	if recording != nil {
+		m.awaitRecording(summary, recording)
 	}
 	if m.lifecycle != nil {
 		m.lifecycle.SessionEnded(summary, reason)
 	}
+}
+
+// awaitRecording waits for a recorder to finalise its file, then announces it.
+//
+// Bounded, because a drain that hung on a stuck filesystem would turn one lost recording into a
+// process that never exits. The deadline is generous next to what finalising costs — a buffer
+// flush, a header patch, an fsync and a rename — so hitting it means the disk is gone, which is
+// worth a WARN and is not worth blocking a shutdown for.
+func (m *Manager) awaitRecording(session SessionSummary, recording *Recording) {
+	select {
+	case <-recording.Done():
+		m.announceRecording(session, recording)
+	case <-time.After(recordingFinaliseTimeout):
+		m.log.Warn("a recording did not finalise in time; its file may be left as a partial",
+			"sessionId", session.SessionID, "recordingRef", recording.Ref())
+	}
+}
+
+// recordingFinaliseTimeout bounds the wait above. See awaitRecording.
+const recordingFinaliseTimeout = 5 * time.Second
+
+// announceRecording cleans the reference index and tells the Lifecycle, exactly once.
+//
+// Two paths reach a finished recording — the watcher goroutine StartRecording spawns, and a session
+// teardown that had to wait for it — and a `recording.finished` published twice would file two rows
+// for one file. The Once on the recording itself is what makes them idempotent with respect to each
+// other without either having to know the other exists.
+func (m *Manager) announceRecording(session SessionSummary, recording *Recording) {
+	recording.announceOnce.Do(func() {
+		m.mu.Lock()
+		if owner, ok := m.recordings[recording.Ref()]; ok && owner == session.SessionID {
+			delete(m.recordings, recording.Ref())
+		}
+		m.mu.Unlock()
+
+		summary := recording.Summary()
+		if summary.Reason == RecordingError {
+			m.log.Warn("a recording produced no file",
+				"sessionId", session.SessionID, "recordingRef", summary.Ref,
+				"detail", summary.Detail)
+		}
+		if m.lifecycle != nil {
+			m.lifecycle.RecordingFinished(session, summary)
+		}
+	})
 }
 
 // Bridge starts a bidirectional relay between two sessions.
@@ -536,6 +603,150 @@ func (m *Manager) StopPlayback(ref string) (string, bool) {
 		return sessionID, false
 	}
 	return sessionID, session.StopPlayback(ref)
+}
+
+// SendDtmf generates a digit string towards one session's far end. Rung 3.
+//
+// It returns when injection is RUNNING, not when the last digit is on the wire — see
+// Session.SendDtmf for why that mirrors ARI, and DtmfInjection for what taking the outbound stream
+// does and does not interrupt.
+//
+// There is no index here, unlike playbacks and recordings, because there is nothing to look a digit
+// string up BY: `MediaPort.sendDtmf` hands back no reference and there is no `stop-dtmf` to key on.
+// A string is bounded by construction and ends on its own.
+func (m *Manager) SendDtmf(sessionID string, opts DtmfOptions) error {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return ErrClosed
+	}
+	session, ok := m.sessions[sessionID]
+	m.mu.Unlock()
+
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrUnknownSession, sessionID)
+	}
+
+	// Started OUTSIDE the lock: it spawns a goroutine and touches the socket, and holding the map's
+	// mutex across that would serialise every digit on the instance behind the slowest one.
+	injection, err := session.SendDtmf(opts)
+	if err != nil {
+		return err
+	}
+
+	m.running.Add(1)
+	go func() {
+		defer m.running.Done()
+		<-injection.Done()
+		if failure := injection.Err(); failure != nil {
+			m.log.Warn("a DTMF string was cut short; the far end heard only part of it",
+				"sessionId", sessionID, "digits", injection.Digits(),
+				"sent", injection.Sent(), "error", failure)
+		}
+	}()
+	return nil
+}
+
+// StartRecording writes one session's audio to a file. Rung 4.
+//
+// It returns once the file exists and its header is written. The reference is indexed here so a
+// later `stop-recording`, which carries nothing but the reference, can find the session without
+// scanning — the same reason the playback index exists, and cleaned by the same shape of watcher.
+func (m *Manager) StartRecording(sessionID string, opts RecordingOptions) error {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return ErrClosed
+	}
+	if _, taken := m.recordings[opts.Ref]; taken {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrAlreadyRecording, opts.Ref)
+	}
+	session, ok := m.sessions[sessionID]
+	m.mu.Unlock()
+
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrUnknownSession, sessionID)
+	}
+
+	recording, err := session.StartRecording(opts)
+	if err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	m.recordings[opts.Ref] = sessionID
+	m.mu.Unlock()
+
+	m.running.Add(1)
+	go func() {
+		defer m.running.Done()
+		<-recording.Done()
+		// The teardown path may already have announced this one, having waited for exactly the
+		// channel above. announceRecording is idempotent for that reason.
+		m.announceRecording(session.Summary(), recording)
+	}()
+
+	m.log.Info("recording started",
+		"sessionId", sessionID, "recordingRef", opts.Ref,
+		"direction", opts.Direction, "objectKey", opts.ObjectKey)
+	return nil
+}
+
+// StopRecording finalises a recording by reference and reports the session it was on.
+//
+// Answering `false` for a reference nothing is recording is a SUCCESS at the wire, not an error: a
+// recording that hit its duration limit, or whose leg hung up, has already finalised itself by the
+// time the engine's teardown gets around to stopping it.
+func (m *Manager) StopRecording(ref string) (string, bool) {
+	m.mu.Lock()
+	sessionID, ok := m.recordings[ref]
+	var session *Session
+	if ok {
+		session = m.sessions[sessionID]
+	}
+	m.mu.Unlock()
+
+	if session == nil {
+		return sessionID, false
+	}
+	return sessionID, session.StopRecording(ref)
+}
+
+// RecordingSessionOf reports which session holds a recording reference, if any.
+func (m *Manager) RecordingSessionOf(ref string) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sessionID, ok := m.recordings[ref]
+	return sessionID, ok
+}
+
+// TelephoneEventPayloadType reports the RFC 4733 type a live session answered with, and whether the
+// session exists. Zero means the leg negotiated none, which is what `send-dtmf` refuses on.
+func (m *Manager) TelephoneEventPayloadType(sessionID string) (uint8, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session, ok := m.sessions[sessionID]
+	if !ok {
+		return 0, false
+	}
+	return session.TelephoneEventPayloadType(), true
+}
+
+// SessionTenancy reports the org and call a session was allocated for.
+//
+// The control surface's one other question about a leg, answered as VALUES for the same reason
+// AudioPayloadType is: a recording's path is derived from the tenant and the call, both of which
+// arrived on the allocate and live on the session, and handing the handler a live *Session so it
+// could read two strings would put the packet path's internals inside a NATS callback.
+func (m *Manager) SessionTenancy(sessionID string) (orgID, callID string, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session, found := m.sessions[sessionID]
+	if !found {
+		return "", "", false
+	}
+	return session.OrgID, session.CallID, true
 }
 
 // PlaybackSessionOf reports which session holds a playback reference, if any.

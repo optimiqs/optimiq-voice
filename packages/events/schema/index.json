@@ -239,6 +239,13 @@
 			"goType": "MediaPlaybackFinishedData"
 		},
 		{
+			"family": "media",
+			"type": "recording.finished",
+			"subject": "media.evt.v1.<orgId>.<sessionId>.recording.finished",
+			"dataSchema": "events/media.recording.finished.schema.json",
+			"goType": "MediaRecordingFinishedData"
+		},
+		{
 			"family": "cdr",
 			"type": "cdr.leg.write",
 			"subject": "cdr.leg.v1.<orgId>",
@@ -362,6 +369,30 @@
 			"responseSchema": "rpc/rpc.media.v1.stop-playback.response.schema.json",
 			"goRequestType": "MediaStopPlaybackRequest",
 			"goResponseType": "MediaStopPlaybackResponse"
+		},
+		{
+			"subject": "rpc.media.v1.send-dtmf",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.media.v1.send-dtmf.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.send-dtmf.response.schema.json",
+			"goRequestType": "MediaSendDtmfRequest",
+			"goResponseType": "MediaSendDtmfResponse"
+		},
+		{
+			"subject": "rpc.media.v1.start-recording",
+			"timeoutMs": 1000,
+			"requestSchema": "rpc/rpc.media.v1.start-recording.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.start-recording.response.schema.json",
+			"goRequestType": "MediaStartRecordingRequest",
+			"goResponseType": "MediaStartRecordingResponse"
+		},
+		{
+			"subject": "rpc.media.v1.stop-recording",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.media.v1.stop-recording.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.stop-recording.response.schema.json",
+			"goRequestType": "MediaStopRecordingRequest",
+			"goResponseType": "MediaStopRecordingResponse"
 		},
 		{
 			"subject": "rpc.engine.v1.park-handoff",

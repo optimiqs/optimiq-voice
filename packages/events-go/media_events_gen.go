@@ -13,6 +13,7 @@ const (
 	EventTypeMediaSessionEnded      = "session.ended"
 	EventTypeMediaSessionRTPTimeout = "session.rtp-timeout"
 	EventTypeMediaPlaybackFinished  = "playback.finished"
+	EventTypeMediaRecordingFinished = "recording.finished"
 )
 
 // MediaSessionEndedData is the payload of the "session.ended" event.
@@ -122,3 +123,79 @@ func (v MediaPlaybackFinishedReason) Valid() bool {
 }
 
 func (v MediaPlaybackFinishedReason) String() string { return string(v) }
+
+// MediaRecordingFinishedData is the payload of the "recording.finished" event.
+//
+// Subject: media.evt.v1.<orgId>.<sessionId>.recording.finished
+// Envelope: Envelope[MediaRecordingFinishedData]
+type MediaRecordingFinishedData struct {
+	SessionID    string                          `json:"sessionId"`
+	InstanceID   string                          `json:"instanceId"`
+	CallID       *string                         `json:"callId,omitempty"`
+	LegID        *string                         `json:"legId,omitempty"`
+	RecordingRef string                          `json:"recordingRef"`
+	Reason       MediaRecordingFinishedReason    `json:"reason"`
+	DurationMs   int                             `json:"durationMs"`
+	Bytes        int                             `json:"bytes"`
+	ObjectKey    string                          `json:"objectKey"`
+	Direction    MediaRecordingFinishedDirection `json:"direction"`
+	Detail       *string                         `json:"detail,omitempty"`
+}
+
+// MediaRecordingFinishedReason is the closed vocabulary of MediaRecordingFinishedData.reason.
+type MediaRecordingFinishedReason string
+
+const (
+	MediaRecordingFinishedReasonStopped      MediaRecordingFinishedReason = "stopped"
+	MediaRecordingFinishedReasonMaxDuration  MediaRecordingFinishedReason = "max-duration"
+	MediaRecordingFinishedReasonMaxSilence   MediaRecordingFinishedReason = "max-silence"
+	MediaRecordingFinishedReasonSessionEnded MediaRecordingFinishedReason = "session-ended"
+	MediaRecordingFinishedReasonError        MediaRecordingFinishedReason = "error"
+)
+
+// MediaRecordingFinishedReasonValues lists every member of the vocabulary, in contract order.
+var MediaRecordingFinishedReasonValues = []MediaRecordingFinishedReason{
+	MediaRecordingFinishedReasonStopped,
+	MediaRecordingFinishedReasonMaxDuration,
+	MediaRecordingFinishedReasonMaxSilence,
+	MediaRecordingFinishedReasonSessionEnded,
+	MediaRecordingFinishedReasonError,
+}
+
+// Valid reports whether v is a member of the MediaRecordingFinishedReason vocabulary.
+func (v MediaRecordingFinishedReason) Valid() bool {
+	for _, candidate := range MediaRecordingFinishedReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaRecordingFinishedReason) String() string { return string(v) }
+
+// MediaRecordingFinishedDirection is the closed vocabulary of MediaRecordingFinishedData.direction.
+type MediaRecordingFinishedDirection string
+
+const (
+	MediaRecordingFinishedDirectionReceive MediaRecordingFinishedDirection = "receive"
+	MediaRecordingFinishedDirectionBoth    MediaRecordingFinishedDirection = "both"
+)
+
+// MediaRecordingFinishedDirectionValues lists every member of the vocabulary, in contract order.
+var MediaRecordingFinishedDirectionValues = []MediaRecordingFinishedDirection{
+	MediaRecordingFinishedDirectionReceive,
+	MediaRecordingFinishedDirectionBoth,
+}
+
+// Valid reports whether v is a member of the MediaRecordingFinishedDirection vocabulary.
+func (v MediaRecordingFinishedDirection) Valid() bool {
+	for _, candidate := range MediaRecordingFinishedDirectionValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaRecordingFinishedDirection) String() string { return string(v) }

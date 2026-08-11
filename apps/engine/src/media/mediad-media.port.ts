@@ -2,8 +2,11 @@ import {
 	mediaAllocateSessionResponseSchema,
 	mediaBridgeSessionsResponseSchema,
 	mediaReleaseSessionResponseSchema,
+	mediaSendDtmfResponseSchema,
 	mediaStartPlaybackResponseSchema,
+	mediaStartRecordingResponseSchema,
 	mediaStopPlaybackResponseSchema,
+	mediaStopRecordingResponseSchema,
 	mediaUnbridgeSessionsResponseSchema,
 	RPC_SUBJECTS,
 } from "@optimiq-voice/events";
@@ -31,12 +34,12 @@ import type { MediaAllocateSessionResponse } from "@optimiq-voice/events";
 import type { HangupCause } from "@optimiq-voice/telephony";
 
 /**
- * {@link MediaPort} over `apps/mediad`, at rung 2 of `plans/mediad-design.md` §2.
+ * {@link MediaPort} over `apps/mediad`, at rung 4 of `plans/mediad-design.md` §2.
  *
  * ## The coverage map, and why it is the whole point of this file
  *
- * `MediaPort` has 24 methods because Asterisk can do 24 things. `mediad` can do nine of them today,
- * and the honest expression of that is not a partial implementation that pretends — it is an
+ * `MediaPort` has 24 methods because Asterisk can do 24 things. `mediad` can do twelve of them
+ * today, and the honest expression of that is not a partial implementation that pretends — it is an
  * implementation where every unreached rung throws {@link MediaOperationNotSupportedError} naming
  * the capability and the rung it arrives on.
  *
@@ -51,17 +54,26 @@ import type { HangupCause } from "@optimiq-voice/telephony";
  *   watchChannel        satisfied by construction: mediad events are org-wide, not per-leg
  *   play                rpc.media.v1.start-playback — rung 1, a session sourcing from a file
  *   stopPlayback        rpc.media.v1.stop-playback, keyed by reference alone
+ *   sendDtmf            rpc.media.v1.send-dtmf — rung 3, RFC 4733 under the leg's own type
+ *   record              rpc.media.v1.start-recording — rung 4, one direction (see the method)
+ *   stopRecording       rpc.media.v1.stop-recording, keyed by reference alone
  *
- * NOT SUPPORTED — throws, naming the rung
+ * NOT SUPPORTED — throws, naming the capability
  *   answer, ring                       SIP responses; apps/sipd owns signalling (design doc §5)
  *   originate                          creating a leg is signalling, not media
  *   getVariable, setVariable           channel variables are a dialplan concept mediad has none of
- *   sendDtmf                           generating digits — rung 3
- *   record, stopRecording, snoop       rung 4
+ *   snoop                              an Asterisk-ism this media plane does not need — a session
+ *                                      records both directions directly. NOT a rung; see the method
  *   startMusicOnHold, stopMusicOnHold  rung 5
  *   hold, unhold                       rung 5, and half signalling besides
  *   mute, unmute                       rung 5
  * ```
+ *
+ * Two rung-4 arguments are refused at the WIRE rather than here, with the same distinction `play`
+ * draws for `tone:`: the operation exists and this media plane cannot serve that argument. `beep`
+ * needs a tone generator, and a real `terminateOn` needs DTMF DETECTION — the receive half of rung 3
+ * — so a voicemail asking for either routes to Asterisk rather than recording without a beep and
+ * ignoring `#`.
  *
  * `play` is supported for the media refs `apps/engine/src/routing/media-refs.ts` actually emits —
  * `sound:`, which is what every domain `MediaRef` renders into. Asterisk's GENERATOR schemes are
@@ -86,6 +98,13 @@ import type { HangupCause } from "@optimiq-voice/telephony";
  * must be able to release something whose reply it never received). Keeping them equal means there
  * is no mapping table to lose on an engine restart.
  */
+/**
+ * `RecordRequest` speaks seconds because ARI does; every `rpc.media.v1.*` payload speaks
+ * milliseconds because the rest of this backbone does. The conversion lives at the adapter, which is
+ * the only place that knows both.
+ */
+const MILLIS_PER_SECOND = 1_000;
+
 export class MediadMediaPort implements MediaPort {
 	private readonly logger = getLogger("engine.mediad");
 
@@ -143,6 +162,50 @@ export class MediadMediaPort implements MediaPort {
 		);
 		this.sessions.add(request.sessionId);
 		return response;
+	}
+
+	/**
+	 * Starts a recording, naming which side of the session to capture.
+	 *
+	 * NOT a `MediaPort` method, and for the same reason {@link allocateSession} is not: the shared
+	 * interface has no way to say it. `RecordRequest` carries no direction because on Asterisk the
+	 * direction is encoded in WHICH CHANNEL is recorded — the leg itself for one side, a snoop
+	 * channel spying on `both` for the conversation — and a media plane with no snoop primitive needs
+	 * to be asked directly.
+	 *
+	 * `direction: "both"` is the snoop replacement, and it is what an on-demand call recording means:
+	 * both directions decoded, summed and written as one mono stream. It is the surface a
+	 * driver-aware caller uses instead of {@link snoop} followed by {@link record}.
+	 *
+	 * @returns the object key the audio will land under, relative to the recordings root — the same
+	 * `<orgId>/<callId>/<recordingRef>.<format>` the engine computes for `channel.record.started`,
+	 * which is what makes the two agree without either telling the other.
+	 */
+	async startRecording(request: {
+		readonly sessionId: string;
+		readonly recordingRef: string;
+		readonly direction?: "receive" | "both";
+		readonly format?: string;
+		readonly maxDurationMs?: number;
+		readonly maxSilenceMs?: number;
+		readonly beep?: boolean;
+		readonly terminateOn?: string;
+	}): Promise<string | undefined> {
+		const response = await this.call(
+			RPC_SUBJECTS.mediaStartRecording,
+			{
+				sessionId: request.sessionId,
+				recordingRef: request.recordingRef,
+				direction: request.direction ?? "both",
+				format: request.format ?? "wav",
+				...(request.maxDurationMs === undefined ? {} : { maxDurationMs: request.maxDurationMs }),
+				...(request.maxSilenceMs === undefined ? {} : { maxSilenceMs: request.maxSilenceMs }),
+				...(request.beep === undefined ? {} : { beep: request.beep }),
+				...(request.terminateOn === undefined ? {} : { terminateOn: request.terminateOn }),
+			},
+			mediaStartRecordingResponseSchema,
+		);
+		return response.objectKey;
 	}
 
 	/** Frees a session and its directory entry. Idempotent — a repeat is `released: false`. */
@@ -316,6 +379,117 @@ export class MediadMediaPort implements MediaPort {
 	}
 
 	/**
+	 * Generates DTMF towards the leg's far end. Rung 3 of `plans/mediad-design.md` §2.
+	 *
+	 * ## Generating, not forwarding
+	 *
+	 * Digits a party PRESSES have crossed a `mediad` bridge since rung 2 — a telephone-event payload
+	 * is just bytes to a relay. What that path cannot do is originate one, because there is no
+	 * inbound packet to forward, and originating is what this method is for: an attended transfer
+	 * punching an extension into a far-end IVR, or a confirmed transfer answering "press 1" on the
+	 * caller's behalf.
+	 *
+	 * ## It resolves when injection has STARTED
+	 *
+	 * Exactly what `client.channels.sendDtmf` does on ARI — Asterisk queues the frames and answers —
+	 * so the two drivers behave identically at this seam, which is the property the cutover rests on.
+	 * The interface returns `void` and hands back no handle, so a late resolution would tell a caller
+	 * nothing an early one did not. Everything refusable is decided before the first packet.
+	 *
+	 * ## A leg that negotiated no RFC 4733 type is refused, not approximated
+	 *
+	 * `mediad` answers `not_supported` and this surfaces as a {@link MediaCommandRefusedError} the
+	 * caller can route around. The two alternatives are worse: sending under a payload type the far
+	 * end never agreed to produces digits it silently drops, and an inband tone needs a synthesiser
+	 * this media plane does not have — the same deferral `tone://` carries at {@link play}.
+	 */
+	async sendDtmf(channelId: string, request: SendDtmfRequest): Promise<void> {
+		await this.call(
+			RPC_SUBJECTS.mediaSendDtmf,
+			{
+				sessionId: channelId,
+				digits: request.digits,
+				...(request.toneDurationMs === undefined ? {} : { toneDurationMs: request.toneDurationMs }),
+				...(request.gapMs === undefined ? {} : { gapMs: request.gapMs }),
+			},
+			mediaSendDtmfResponseSchema,
+		);
+	}
+
+	/**
+	 * Writes the leg's audio to a file. Rung 4 of `plans/mediad-design.md` §2.
+	 *
+	 * ## Why this records ONE direction
+	 *
+	 * Because that is what the ARI method it stands in for records. `client.channels.record` on a
+	 * plain channel captures what the channel is SAYING — the party on it — which is what
+	 * `plan-walker.ts`'s voicemail node wants: a mailbox message should hold the caller, not the
+	 * greeting that was played at them. The conversation case only exists on ARI because
+	 * `call-control.ts` interposes a snoop channel first, and `RecordRequest` has no direction on it
+	 * for exactly that reason: the direction was encoded in which channel id was passed.
+	 *
+	 * A driver-aware caller that wants both directions asks {@link startRecording} for them. That is
+	 * the same split {@link allocateSession} makes: a capability the shared interface cannot express
+	 * lives above `MediaPort` rather than being smuggled into a method whose meaning would then
+	 * differ between the two drivers.
+	 *
+	 * ## Where the file goes, and why this does not say
+	 *
+	 * `mediad` derives `<orgId>/<callId>/<name>.wav` from the session it already holds, which is
+	 * byte-for-byte the object key `call-control.ts` and `plan-walker.ts` compute for the same
+	 * recording. Passing a path would be the engine dictating a layout the media plane can work out
+	 * for itself, over a wire where a malformed one is a write to an arbitrary directory.
+	 *
+	 * ## What is refused rather than dropped
+	 *
+	 * `beep` and a real `terminateOn` are both `not_supported` at the wire — the first needs a tone
+	 * generator, the second needs DTMF DETECTION, which is the receive half of rung 3 and not built.
+	 * Both surface here as {@link MediaCommandRefusedError}, and the engine routes that leg to
+	 * Asterisk. Accepting them and doing nothing would produce a voicemail with no beep whose
+	 * caller's first words are clipped, and one that ignores `#` and runs to its duration limit.
+	 */
+	async record(channelId: string, request: RecordRequest): Promise<RecordingHandle> {
+		await this.startRecording({
+			sessionId: channelId,
+			recordingRef: request.name,
+			direction: "receive",
+			format: request.format,
+			...(request.maxDurationSeconds === undefined
+				? {}
+				: { maxDurationMs: request.maxDurationSeconds * MILLIS_PER_SECOND }),
+			...(request.maxSilenceSeconds === undefined
+				? {}
+				: { maxSilenceMs: request.maxSilenceSeconds * MILLIS_PER_SECOND }),
+			...(request.beep === undefined ? {} : { beep: request.beep }),
+			...(request.terminateOn === undefined ? {} : { terminateOn: request.terminateOn }),
+		});
+		// The CALLER's name and format, not the reply's — they are equal by contract, and returning
+		// the ones the caller already holds means a lost reply cannot produce a handle it does not
+		// recognise. Same argument as `play`.
+		return { name: request.name, format: request.format };
+	}
+
+	/**
+	 * Finalises a recording by reference. Already-finished is a no-op.
+	 *
+	 * The no-op is the normal case rather than an edge one: a recording that hit its duration limit,
+	 * or whose leg hung up, has already finalised itself by the time a teardown gets around to
+	 * stopping it. `mediad` answers `ok: true, stopped: false` for that, so this resolves rather than
+	 * throwing — which is what the interface promises.
+	 *
+	 * The reply says the recorder was TOLD to stop. The file being safe to read is
+	 * `media.evt.v1.…recording.finished`, which arrives as a `recording-finished` `MediaEvent` and is
+	 * what the callers above this seam already block on.
+	 */
+	async stopRecording(name: string): Promise<void> {
+		await this.call(
+			RPC_SUBJECTS.mediaStopRecording,
+			{ recordingRef: name },
+			mediaStopRecordingResponseSchema,
+		);
+	}
+
+	/**
 	 * Satisfied by construction, which is why it is not a refusal.
 	 *
 	 * `watchChannel` exists because ARI's narrow subscription STOPS when a channel leaves the
@@ -363,17 +537,6 @@ export class MediadMediaPort implements MediaPort {
 		return this.refuse("originate", "SIP signalling, which apps/sipd owns (design doc §5)");
 	}
 
-	async record(channelId: string, request: RecordRequest): Promise<RecordingHandle> {
-		void channelId;
-		void request;
-		return this.refuse("record", "recording (rung 4)");
-	}
-
-	async stopRecording(name: string): Promise<void> {
-		void name;
-		return this.refuse("stopRecording", "recording (rung 4)");
-	}
-
 	async startMusicOnHold(channelId: string, mohClass?: string): Promise<void> {
 		void channelId;
 		void mohClass;
@@ -407,15 +570,32 @@ export class MediadMediaPort implements MediaPort {
 		return this.refuse("unmute", "per-direction muting (rung 5)");
 	}
 
-	async sendDtmf(channelId: string, request: SendDtmfRequest): Promise<void> {
-		void channelId;
-		void request;
-		return this.refuse("sendDtmf", "DTMF generation (rung 3)");
-	}
-
+	/**
+	 * Creates a channel that listens to another one — REFUSED, and this is the one refusal on this
+	 * driver that is not a rung.
+	 *
+	 * A snoop channel is an Asterisk-ism. ARI addresses everything by channel id, so a tap has to BE
+	 * a channel in order to be a thing a command can name, and `call-control.ts` therefore creates
+	 * one spying on `both` directions before it records it.
+	 *
+	 * `mediad` has no such constraint: a session already is both directions — what it receives is the
+	 * far party, what it sends is everything the far party was told — so the direction is an argument
+	 * on {@link startRecording} rather than a second object with its own port, its own lifecycle and
+	 * its own `leg-arrived` for a leg that does not exist. Synthesising one would be exactly the
+	 * "emit fake ARI events forever" outcome `plans/mediad-design.md` §3.2 exists to avoid.
+	 *
+	 * The consequence is named rather than hidden: `call-control.ts`'s on-demand recording path calls
+	 * `snoop` before `record`, so it routes to Asterisk under this driver until that path learns to
+	 * ask the media plane for a two-direction recording directly. The capability is here; the caller
+	 * has not been pointed at it yet.
+	 */
 	async snoop(request: SnoopRequest): Promise<OriginatedChannel> {
 		void request;
-		return this.refuse("snoop", "the snoop tap (rung 4)");
+		return this.refuse(
+			"snoop",
+			"a snoop tap, which this media plane does not need: a session records both directions " +
+				"directly (see startRecording with direction 'both')",
+		);
 	}
 
 	// --- internals -------------------------------------------------------------------------------

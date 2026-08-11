@@ -18,7 +18,7 @@ import (
 //	queue.evt.v1.<orgId>.<queueId>.<event>     event = caller.joined | … | agent.state
 //	voicemail.evt.v1.<orgId>.<mailboxId>.<event>  event = message.left | mwi.updated
 //	media.evt.v1.<orgId>.<sessionId>.<event>   event = session.ended | session.rtp-timeout |
-//	                                                   playback.finished
+//	                                                   playback.finished | recording.finished
 //	cdr.leg.v1.<orgId>                         one subject per org; the type is in the envelope
 //	audit.evt.v1.<orgId>
 //	provision.evt.v1.<orgId>

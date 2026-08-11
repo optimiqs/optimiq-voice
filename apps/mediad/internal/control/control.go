@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -59,6 +60,9 @@ const (
 	SubjectReleaseSession   = contract.SubjectMediaReleaseSessionRPC
 	SubjectStartPlayback    = contract.SubjectMediaStartPlaybackRPC
 	SubjectStopPlayback     = contract.SubjectMediaStopPlaybackRPC
+	SubjectSendDtmf         = contract.SubjectMediaSendDtmfRPC
+	SubjectStartRecording   = contract.SubjectMediaStartRecordingRPC
+	SubjectStopRecording    = contract.SubjectMediaStopRecordingRPC
 )
 
 // Refusal codes. Values come from the contract; these names exist so a handler reads as prose.
@@ -83,6 +87,9 @@ type Sessions interface {
 	Release(sessionID string) bool
 	StartPlayback(sessionID string, opts rtp.PlaybackOptions) error
 	StopPlayback(playbackRef string) (string, bool)
+	SendDtmf(sessionID string, opts rtp.DtmfOptions) error
+	StartRecording(sessionID string, opts rtp.RecordingOptions) error
+	StopRecording(recordingRef string) (string, bool)
 	// AudioPayloadType reports the G.711 type a live session answered with, and whether it exists.
 	//
 	// A VALUE and not the *rtp.Session it came from, deliberately: the control surface needs
@@ -90,16 +97,26 @@ type Sessions interface {
 	// µ-law prompt on an A-law leg is a rasp rather than a wrong-sounding voice — and handing it a
 	// live session would put the packet path's internals inside a NATS callback.
 	AudioPayloadType(sessionID string) (uint8, bool)
+	// TelephoneEventPayloadType reports the RFC 4733 type a live session answered with. Zero means
+	// the leg negotiated none, which is what `send-dtmf` refuses on rather than synthesising a tone.
+	TelephoneEventPayloadType(sessionID string) (uint8, bool)
+	// SessionTenancy reports the org and call a session was allocated for.
+	//
+	// Values for the same reason as the two above, and needed for one thing: a recording's path is
+	// `<root>/<orgId>/<callId>/<recordingRef>.wav`, which is the engine's own object key, and both
+	// tokens arrived on the allocate rather than on the recording command.
+	SessionTenancy(sessionID string) (orgID, callID string, ok bool)
 }
 
 // Server answers the v1 command subjects.
 type Server struct {
-	sessions   Sessions
-	dir        directory.Store
-	library    *audio.Library
-	log        *slog.Logger
-	instanceID string
-	publicAddr netip.Addr
+	sessions      Sessions
+	dir           directory.Store
+	library       *audio.Library
+	recordingsDir string
+	log           *slog.Logger
+	instanceID    string
+	publicAddr    netip.Addr
 }
 
 // ServerOptions configures a Server.
@@ -111,6 +128,9 @@ type ServerOptions struct {
 	// Library resolves the prompts `start-playback` names. Nil is an unconfigured library, which
 	// REFUSES every playback rather than answering ok and sending nothing.
 	Library *audio.Library
+	// RecordingsDir is the root `start-recording` writes under, from MEDIAD_RECORDINGS_DIR. Empty
+	// REFUSES every recording by name, for the same reason an unconfigured Library does.
+	RecordingsDir string
 	// InstanceID names this process on the wire and in the directory. Required.
 	InstanceID string
 	// PublicAddr is what goes into an SDP answer's `c=` line. Required.
@@ -140,12 +160,13 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		library = audio.NewLibrary("")
 	}
 	return &Server{
-		sessions:   opts.Sessions,
-		dir:        opts.Directory,
-		library:    library,
-		log:        log,
-		instanceID: opts.InstanceID,
-		publicAddr: opts.PublicAddr,
+		sessions:      opts.Sessions,
+		dir:           opts.Directory,
+		library:       library,
+		recordingsDir: strings.TrimSpace(opts.RecordingsDir),
+		log:           log,
+		instanceID:    opts.InstanceID,
+		publicAddr:    opts.PublicAddr,
 	}, nil
 }
 
@@ -174,6 +195,9 @@ func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscrip
 		{SubjectReleaseSession, s.HandleReleaseSession},
 		{SubjectStartPlayback, s.HandleStartPlayback},
 		{SubjectStopPlayback, s.HandleStopPlayback},
+		{SubjectSendDtmf, s.HandleSendDtmf},
+		{SubjectStartRecording, s.HandleStartRecording},
+		{SubjectStopRecording, s.HandleStopRecording},
 	}
 
 	subscriptions := make([]*nats.Subscription, 0, len(handlers))

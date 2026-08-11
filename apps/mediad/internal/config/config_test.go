@@ -401,3 +401,30 @@ func TestSoundsDirIsTrimmed(t *testing.T) {
 		t.Errorf("SoundsDir = %q, want the trimmed path", cfg.SoundsDir)
 	}
 }
+
+// MEDIAD_RECORDINGS_DIR has no default for the same reason MEDIAD_SOUNDS_DIR has none: an instance
+// with nowhere to write REFUSES every recording by name, and the engine routes those legs to
+// Asterisk. The variable also has to be the SAME mount apps/api reads as CDR_RECORDING_ROOT, since
+// the layout under it is the engine's own object key — getting that wrong is not a broken recording
+// but a missing one, with the archiver logging that the object was not on the shared volume.
+func TestRecordingsDirDefaultsToUnset(t *testing.T) {
+	cfg, err := config.Load(env(minimal(nil)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RecordingsDir != "" {
+		t.Errorf("RecordingsDir = %q, want empty", cfg.RecordingsDir)
+	}
+}
+
+func TestRecordingsDirIsTrimmed(t *testing.T) {
+	cfg, err := config.Load(env(minimal(map[string]string{
+		"MEDIAD_RECORDINGS_DIR": "  /opt/optimiq-voice/recordings  ",
+	})))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RecordingsDir != "/opt/optimiq-voice/recordings" {
+		t.Errorf("RecordingsDir = %q, want the trimmed path", cfg.RecordingsDir)
+	}
+}

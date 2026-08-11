@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { makeMediaEvent, subjectFor } from "@optimiq-voice/events";
 import { decodeMediadEvent, toMediaEventFromMediad } from "./mediad-event-mapping";
-import type { MediaSessionEndReason } from "@optimiq-voice/events";
+import type { MediaRecordingEndReason, MediaSessionEndReason } from "@optimiq-voice/events";
 
 const ORG = "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293";
 const CALL = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c";
@@ -53,6 +53,25 @@ function playbackFinished(reason: "completed" | "stopped" | "error" = "stopped")
 			playbackRef: "pb-1",
 			reason,
 			playedMs: 1_240,
+		},
+	});
+}
+
+function recordingFinished(reason: MediaRecordingEndReason = "stopped", detail?: string) {
+	return makeMediaEvent("recording.finished", {
+		orgId: ORG,
+		source: "mediad",
+		data: {
+			sessionId: SESSION,
+			instanceId: "mediad-1",
+			callId: CALL,
+			recordingRef: "rec-1",
+			reason,
+			durationMs: 4_000,
+			bytes: 64_044,
+			objectKey: `${ORG}/${CALL}/rec-1.wav`,
+			direction: "both" as const,
+			...(detail === undefined ? {} : { detail }),
 		},
 	});
 }
@@ -119,6 +138,57 @@ describe("toMediaEventFromMediad", () => {
 			expect(toMediaEventFromMediad(playbackFinished(reason))).toBeUndefined();
 		}
 	});
+
+	/**
+	 * The one media event the layer above genuinely waits for. `plan-walker`'s voicemail node and
+	 * `call-control`'s on-demand recording both block until a recording has finished before they
+	 * publish `channel.record.stopped`, which is what triggers the archive in `apps/api` — so
+	 * dropping this one would hang a voicemail until its own timeout and file no message at all.
+	 */
+	it("turns recording.finished into the recording-finished the callers block on", () => {
+		expect(toMediaEventFromMediad(recordingFinished())).toEqual({
+			type: "recording-finished",
+			// Named, not id'd: ARI has no recording id and the seam inherited that, so `record(name)`,
+			// `stopRecording(name)` and every waiter key on the same string.
+			recordingName: "rec-1",
+			durationMs: 4_000,
+		});
+	});
+
+	it("treats every complete-file ending as finished, however the recording stopped", () => {
+		// A voicemail that ran out of silence is the NORMAL end of a voicemail, and a caller who hung
+		// up mid-message still left a playable message. Reporting either as a failure would throw
+		// away a file that exists and is good.
+		for (const reason of ["stopped", "max-duration", "max-silence", "session-ended"] as const) {
+			expect(toMediaEventFromMediad(recordingFinished(reason))).toMatchObject({
+				type: "recording-finished",
+			});
+		}
+	});
+
+	/**
+	 * Split from the above rather than folded in, mirroring ARI's own `RecordingFinished` /
+	 * `RecordingFailed` split — and the callers branch on it: a failure means there is NO file, so no
+	 * voicemail message is filed and no recording key lands on the CDR. Folding them together would
+	 * make a caller treat a missing file as a zero-length one.
+	 */
+	it("turns a failed recording into recording-failed, carrying what the media plane could say", () => {
+		expect(toMediaEventFromMediad(recordingFinished("error", "no space left on device"))).toEqual({
+			type: "recording-failed",
+			recordingName: "rec-1",
+			reason: "no space left on device",
+		});
+	});
+
+	it("never leaves a failed recording without a reason", () => {
+		// A caller logs this and files no message; an empty string would be a voicemail that vanished
+		// with nothing attached to explain it.
+		const event = toMediaEventFromMediad(recordingFinished("error"));
+		expect(event).toMatchObject({ type: "recording-failed" });
+		if (event?.type === "recording-failed") {
+			expect(event.reason.length).toBeGreaterThan(0);
+		}
+	});
 });
 
 describe("decodeMediadEvent", () => {
@@ -148,6 +218,20 @@ describe("decodeMediadEvent", () => {
 		if (decoded?.envelope.type === "playback.finished") {
 			expect(decoded.envelope.data.playbackRef).toBe("pb-1");
 			expect(decoded.envelope.data.playedMs).toBe(1_240);
+		}
+	});
+
+	it("carries the object key and byte count through on the envelope", () => {
+		// Neither is on the domain union, because nothing above the seam branches on them — but the
+		// envelope is what a consumer asking "where is that file, and is it plausible" reads, and the
+		// byte count is a number nothing else on this backbone can supply.
+		const envelope = recordingFinished();
+		const decoded = decodeMediadEvent(envelope.subject, overTheWire(envelope));
+		expect(decoded?.envelope.type).toBe("recording.finished");
+		if (decoded?.envelope.type === "recording.finished") {
+			expect(decoded.envelope.data.objectKey).toBe(`${ORG}/${CALL}/rec-1.wav`);
+			expect(decoded.envelope.data.bytes).toBe(64_044);
+			expect(decoded.envelope.data.direction).toBe("both");
 		}
 	});
 

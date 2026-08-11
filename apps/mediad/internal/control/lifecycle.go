@@ -205,6 +205,67 @@ func (a *LifecycleAnnouncer) PlaybackFinished(
 	}, "playback.finished", session.SessionID)
 }
 
+// RecordingFinished publishes `recording.finished`.
+//
+// # The one media event above this seam that is actually branched on
+//
+// `session.rtp-timeout` and `playback.finished` map to nothing in the engine's `MediaEvent` union.
+// This one maps to two members — `recording-finished` and, for `reason: error`, `recording-failed` —
+// because the engine BLOCKS on it: `plan-walker`'s voicemail node and `call-control`'s on-demand
+// recording both wait for the file before they publish `channel.record.stopped`, and `apps/api`'s
+// archiver copies the object the moment that lands.
+//
+// Which is why the packet path calls this only AFTER the WAV header has been patched with the real
+// lengths, the bytes fsynced and the file renamed from its `.partial` name into the object key. An
+// event published a moment earlier archives a file that is still being written — a truncated
+// recording nobody discovers until somebody plays it back weeks later.
+//
+// It does NOT touch the session directory. A recording ending is not a session ending, and deleting
+// the entry here would make the leg uncommandable from a neighbouring instance the moment it
+// stopped being recorded.
+func (a *LifecycleAnnouncer) RecordingFinished(
+	session rtp.SessionSummary,
+	recording rtp.RecordingSummary,
+) {
+	if a.publisher == nil || session.OrgID == "" {
+		return
+	}
+
+	envelope, err := a.envelope(session, contract.EventTypeMediaRecordingFinished)
+	if err != nil {
+		a.log.Warn("cannot build a recording.finished envelope",
+			"sessionId", session.SessionID, "recordingRef", recording.Ref, "error", err)
+		return
+	}
+
+	data := contract.MediaRecordingFinishedData{
+		SessionID:    session.SessionID,
+		InstanceID:   a.instanceID,
+		CallID:       stringPtr(session.CallID),
+		LegID:        stringPtr(session.LegID),
+		RecordingRef: recording.Ref,
+		Reason:       contract.MediaRecordingFinishedReason(recording.Reason),
+		DurationMs:   recording.DurationMs,
+		Bytes:        int(recording.Bytes),
+		ObjectKey:    recording.ObjectKey,
+		Direction:    contract.MediaRecordingFinishedDirection(recording.Direction),
+		Detail:       stringPtr(recording.Detail),
+	}
+
+	go a.publish(func(ctx context.Context) error {
+		return a.publisher.RecordingFinished(ctx,
+			contract.Envelope[contract.MediaRecordingFinishedData]{
+				ID:      envelope.id,
+				At:      envelope.at,
+				OrgID:   session.OrgID,
+				Subject: envelope.subject,
+				Type:    contract.EventTypeMediaRecordingFinished,
+				Source:  mediaevents.Source,
+				Data:    data,
+			})
+	}, "recording.finished", session.SessionID)
+}
+
 // envelopeHeader is the three values every envelope needs that are derived rather than copied.
 type envelopeHeader struct {
 	id      string

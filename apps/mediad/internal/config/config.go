@@ -154,6 +154,21 @@ type Config struct {
 	// internal/audio for why a mounted directory and not an HTTP fetch from apps/api.
 	SoundsDir string
 
+	// RecordingsDir is the directory `rpc.media.v1.start-recording` writes files under.
+	// MEDIAD_RECORDINGS_DIR, default empty.
+	//
+	// Empty is legal and means this instance REFUSES every recording with `not_supported`, which the
+	// engine answers by routing the leg to Asterisk — the same shape as SoundsDir above, and for the
+	// same reason: a recording that answered `ok` and wrote nowhere is a call that connects, sounds
+	// perfect, and has no recording, discovered days later by the person who needed it.
+	//
+	// It is the SAME MOUNT apps/api reads as CDR_RECORDING_ROOT, and the layout under it is the
+	// engine's object key exactly — `<orgId>/<callId>/<recordingRef>.wav` — so a file mediad writes
+	// is a file the existing archive pipeline stats and copies with no change at all. Getting that
+	// convention wrong is not a broken recording but a missing one: the archiver logs that the
+	// object was not on the shared volume and moves on.
+	RecordingsDir string
+
 	// LogLevel is MEDIAD_LOG_LEVEL (debug|info|warn|error), default info.
 	LogLevel slog.Level
 
@@ -225,6 +240,7 @@ func Load(getenv Getenv) (Config, error) {
 	}
 	cfg.InstanceID = stringOr(getenv, "MEDIAD_INSTANCE_ID", defaultInstanceID())
 	cfg.SoundsDir = strings.TrimSpace(getenv("MEDIAD_SOUNDS_DIR"))
+	cfg.RecordingsDir = strings.TrimSpace(getenv("MEDIAD_RECORDINGS_DIR"))
 	if cfg.ShutdownTimeout, err = durationOr(getenv, "MEDIAD_SHUTDOWN_TIMEOUT", 10*time.Second); err != nil {
 		fail("%v", err)
 	}

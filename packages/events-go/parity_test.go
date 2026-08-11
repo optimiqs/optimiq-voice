@@ -185,6 +185,9 @@ func TestParityConstants(t *testing.T) {
 		"mediaReleaseSession":   SubjectMediaReleaseSessionRPC,
 		"mediaStartPlayback":    SubjectMediaStartPlaybackRPC,
 		"mediaStopPlayback":     SubjectMediaStopPlaybackRPC,
+		"mediaSendDtmf":         SubjectMediaSendDtmfRPC,
+		"mediaStartRecording":   SubjectMediaStartRecordingRPC,
+		"mediaStopRecording":    SubjectMediaStopRecordingRPC,
 		"engineParkHandoff":     SubjectParkHandoffRPC,
 	}
 	if !reflect.DeepEqual(rpc, g.RPCSubjects) {

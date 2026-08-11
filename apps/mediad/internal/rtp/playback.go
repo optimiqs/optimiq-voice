@@ -229,11 +229,14 @@ func (p *Playback) run() {
 		// a timestamp discontinuity inside one SSRC. Marker is exactly how a sender tells a receiver
 		// "reset your expectation, a new talkspurt begins here" instead of letting the jitter buffer
 		// read the jump as catastrophic loss.
-		if err := p.session.sendPlaybackFrame(p.frames[index], index == 0); err != nil {
+		sent, err := p.session.sendPlaybackFrame(p.frames[index], index == 0)
+		if err != nil {
 			p.finish(PlaybackError, err.Error())
 			return
 		}
-		p.sent.Add(1)
+		if sent {
+			p.sent.Add(1)
+		}
 	}
 	p.finish(PlaybackCompleted, "")
 }
@@ -258,10 +261,21 @@ func (p *Playback) finish(reason PlaybackEndReason, detail string) {
 // second stream — it is the same leg's audio, sourced from a file for a while — and giving it its
 // own SSRC would make the endpoint see a new sender start and stop around every prompt, which is
 // the audible click the relay's header rewrite exists to avoid.
-func (s *Session) sendPlaybackFrame(payload []byte, marker bool) error {
+//
+// It reports whether the frame reached the socket, because there is one case where it does not and
+// nothing has gone wrong: a digit string is being generated towards this leg, and a digit owns the
+// outbound clock for its span (see DtmfInjection). The prompt keeps its SCHEDULE across that — the
+// ticker is not paused — so a prompt overlapped by digits is clipped by exactly the length of the
+// digits rather than stretched, and `playedMs` reports the audio the far end actually received.
+func (s *Session) sendPlaybackFrame(payload []byte, marker bool) (bool, error) {
+	if s.dtmfActive() {
+		s.count(func(st *Stats) { st.SuppressedByDtmf++ })
+		return false, nil
+	}
+
 	to := s.Remote()
 	if to == nil {
-		return ErrNoRemote
+		return false, ErrNoRemote
 	}
 
 	out := pionrtp.Packet{
@@ -278,17 +292,24 @@ func (s *Session) sendPlaybackFrame(payload []byte, marker bool) error {
 
 	encoded, err := out.Marshal()
 	if err != nil {
-		return fmt.Errorf("rtp: marshalling a playback frame: %w", err)
+		return false, fmt.Errorf("rtp: marshalling a playback frame: %w", err)
 	}
 	if _, err := s.ports.RTP.WriteToUDP(encoded, to); err != nil {
 		// Unlike a relayed frame, a failed playback write is NOT swallowed. A relay drops one frame
 		// of a conversation that is still going; a playback that cannot reach the socket will not
 		// reach it for the next frame either, and reporting `error` is what turns "the caller heard
 		// nothing" into an event with a reason on it.
-		return fmt.Errorf("rtp: sending a playback frame to %s: %w", to, err)
+		return false, fmt.Errorf("rtp: sending a playback frame to %s: %w", to, err)
 	}
 	s.count(func(st *Stats) { st.PacketsSent++ })
-	return nil
+
+	// The SEND half of a `both` recording. A prompt played AT the recorded party is part of what
+	// happened on that leg, so a recording of both directions holds it — which is exactly what an
+	// on-demand call recording is expected to contain.
+	if recorder := s.recording.Load(); recorder != nil {
+		recorder.Sent(payload)
+	}
+	return true, nil
 }
 
 // nextPlaybackTimestamp advances the outbound clock by one frame.

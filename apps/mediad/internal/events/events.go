@@ -35,12 +35,13 @@ const Source = "mediad"
 
 // Publisher emits media session events.
 //
-// One method per event rather than a generic one: the two payloads are distinct types, and a caller
+// One method per event rather than a generic one: the payloads are distinct types, and a caller
 // that has to name the type it is publishing cannot publish the wrong one by accident.
 type Publisher interface {
 	SessionEnded(ctx context.Context, envelope contract.Envelope[contract.MediaSessionEndedData]) error
 	SessionRTPTimeout(ctx context.Context, envelope contract.Envelope[contract.MediaSessionRTPTimeoutData]) error
 	PlaybackFinished(ctx context.Context, envelope contract.Envelope[contract.MediaPlaybackFinishedData]) error
+	RecordingFinished(ctx context.Context, envelope contract.Envelope[contract.MediaRecordingFinishedData]) error
 }
 
 // JetStreamPublisher publishes into the MEDIA stream.
@@ -83,6 +84,14 @@ func (p *JetStreamPublisher) PlaybackFinished(
 	return publish(ctx, p.js, envelope)
 }
 
+// RecordingFinished publishes a `recording.finished` event.
+func (p *JetStreamPublisher) RecordingFinished(
+	ctx context.Context,
+	envelope contract.Envelope[contract.MediaRecordingFinishedData],
+) error {
+	return publish(ctx, p.js, envelope)
+}
+
 func publish[T any](
 	ctx context.Context,
 	js jetstream.JetStream,
@@ -114,10 +123,11 @@ const PublishTimeout = 2 * time.Second
 // RecordingPublisher captures envelopes in memory instead of publishing them. It backs the unit
 // tests, exactly as sipd's does.
 type RecordingPublisher struct {
-	mu        sync.Mutex
-	ended     []contract.Envelope[contract.MediaSessionEndedData]
-	timedOut  []contract.Envelope[contract.MediaSessionRTPTimeoutData]
-	playbacks []contract.Envelope[contract.MediaPlaybackFinishedData]
+	mu         sync.Mutex
+	ended      []contract.Envelope[contract.MediaSessionEndedData]
+	timedOut   []contract.Envelope[contract.MediaSessionRTPTimeoutData]
+	playbacks  []contract.Envelope[contract.MediaPlaybackFinishedData]
+	recordings []contract.Envelope[contract.MediaRecordingFinishedData]
 }
 
 var _ Publisher = (*RecordingPublisher)(nil)
@@ -156,6 +166,24 @@ func (p *RecordingPublisher) PlaybackFinished(
 	defer p.mu.Unlock()
 	p.playbacks = append(p.playbacks, envelope)
 	return nil
+}
+
+// RecordingFinished implements Publisher.
+func (p *RecordingPublisher) RecordingFinished(
+	_ context.Context,
+	envelope contract.Envelope[contract.MediaRecordingFinishedData],
+) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.recordings = append(p.recordings, envelope)
+	return nil
+}
+
+// RecordingEvents returns a copy of the recorded `recording.finished` events.
+func (p *RecordingPublisher) RecordingEvents() []contract.Envelope[contract.MediaRecordingFinishedData] {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]contract.Envelope[contract.MediaRecordingFinishedData](nil), p.recordings...)
 }
 
 // PlaybackEvents returns a copy of the recorded `playback.finished` events.

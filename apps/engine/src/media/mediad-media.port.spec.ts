@@ -3,8 +3,11 @@ import {
 	mediaAllocateSessionRequestSchema,
 	mediaBridgeSessionsRequestSchema,
 	mediaReleaseSessionRequestSchema,
+	mediaSendDtmfRequestSchema,
 	mediaStartPlaybackRequestSchema,
+	mediaStartRecordingRequestSchema,
 	mediaStopPlaybackRequestSchema,
+	mediaStopRecordingRequestSchema,
 	mediaUnbridgeSessionsRequestSchema,
 	RPC_SUBJECTS,
 } from "@optimiq-voice/events";
@@ -436,6 +439,174 @@ describe("playback (rung 1)", () => {
 	});
 });
 
+describe("DTMF generation (rung 3)", () => {
+	it("sends the digits under the leg's session id, with nothing else on the payload", async () => {
+		const { port, transport } = newPort();
+		await port.sendDtmf(SESSION, { digits: "1234" });
+
+		const [request] = transport.on(RPC_SUBJECTS.mediaSendDtmf);
+		expect(request?.payload).toEqual({ sessionId: SESSION, digits: "1234" });
+		// The contract has to accept what the adapter actually sends.
+		expect(mediaSendDtmfRequestSchema.parse(request?.payload)).toBeDefined();
+	});
+
+	it("carries the timings only when the caller has an opinion", async () => {
+		const { port, transport } = newPort();
+		await port.sendDtmf(SESSION, { digits: "9", toneDurationMs: 250, gapMs: 50 });
+
+		const [request] = transport.on(RPC_SUBJECTS.mediaSendDtmf);
+		expect(request?.payload).toEqual({
+			sessionId: SESSION,
+			digits: "9",
+			toneDurationMs: 250,
+			gapMs: 50,
+		});
+	});
+
+	it("resolves as soon as injection has started, mirroring ARI", async () => {
+		// `client.channels.sendDtmf` queues the frames and answers, and the interface hands back
+		// nothing — so a late resolution would tell a caller nothing an early one did not.
+		const { port } = newPort();
+		await expect(port.sendDtmf(SESSION, { digits: "1" })).resolves.toBeUndefined();
+	});
+
+	it("surfaces a leg with no RFC 4733 type as a typed command refusal", async () => {
+		// The operation exists and this media plane cannot serve that argument — the same distinction
+		// `tone://` draws at `play` — so it is a MediaCommandRefusedError the caller can route
+		// around, not a capability refusal.
+		const { port, transport } = newPort();
+		transport.reply(RPC_SUBJECTS.mediaSendDtmf, {
+			ok: false,
+			sessionId: SESSION,
+			instanceId: "mediad-7c9f",
+			reason: "not_supported",
+			error: "this leg negotiated no RFC 4733 telephone-event payload type",
+		});
+
+		const attempt = port.sendDtmf(SESSION, { digits: "1" });
+		await expect(attempt).rejects.toThrow(MediaCommandRefusedError);
+		try {
+			await attempt;
+		} catch (error) {
+			expect((error as MediaCommandRefusedError).reason).toBe("not_supported");
+		}
+	});
+});
+
+describe("recording (rung 4)", () => {
+	it("records ONE direction, mirroring ARI's channels.record on a plain channel", async () => {
+		// A voicemail message should hold the caller, not the greeting that was played at them. The
+		// conversation case only exists on ARI because call-control interposes a snoop channel first.
+		const { port, transport } = newPort();
+		const handle = await port.record(SESSION, { name: "rec-1", format: "wav" });
+
+		const [request] = transport.on(RPC_SUBJECTS.mediaStartRecording);
+		expect(request?.payload).toEqual({
+			sessionId: SESSION,
+			recordingRef: "rec-1",
+			direction: "receive",
+			format: "wav",
+		});
+		expect(mediaStartRecordingRequestSchema.parse(request?.payload)).toBeDefined();
+		// The CALLER's name and format, so a lost reply cannot produce a handle it does not recognise.
+		expect(handle).toEqual({ name: "rec-1", format: "wav" });
+	});
+
+	it("converts the seconds on the seam into the milliseconds on the wire", async () => {
+		// `RecordRequest` speaks seconds because ARI does; every rpc.media.v1.* payload speaks
+		// milliseconds because the rest of this backbone does.
+		const { port, transport } = newPort();
+		await port.record(SESSION, {
+			name: "rec-1",
+			format: "wav",
+			maxDurationSeconds: 120,
+			maxSilenceSeconds: 5,
+		});
+
+		const [request] = transport.on(RPC_SUBJECTS.mediaStartRecording);
+		expect(request?.payload).toMatchObject({ maxDurationMs: 120_000, maxSilenceMs: 5_000 });
+	});
+
+	it("sends beep and terminateOn through rather than dropping them", async () => {
+		// mediad refuses both by name. Dropping them at the adapter would make the two drivers
+		// silently disagree about what was asked for — a voicemail with no beep, and one that ignores
+		// `#` and runs to its duration limit.
+		const { port, transport } = newPort();
+		await port.record(SESSION, {
+			name: "rec-1",
+			format: "wav",
+			beep: true,
+			terminateOn: "#",
+		});
+
+		const [request] = transport.on(RPC_SUBJECTS.mediaStartRecording);
+		expect(request?.payload).toMatchObject({ beep: true, terminateOn: "#" });
+	});
+
+	it("surfaces the beep refusal as a typed command refusal", async () => {
+		const { port, transport } = newPort();
+		transport.reply(RPC_SUBJECTS.mediaStartRecording, {
+			ok: false,
+			sessionId: SESSION,
+			recordingRef: "rec-1",
+			instanceId: "mediad-7c9f",
+			reason: "not_supported",
+			error: "beep needs a tone generator, which mediad does not have",
+		});
+
+		await expect(
+			port.record(SESSION, { name: "rec-1", format: "wav", beep: true }),
+		).rejects.toThrow(MediaCommandRefusedError);
+	});
+
+	it("asks for both directions through the media plane's own surface", async () => {
+		// The snoop replacement, and it lives above MediaPort for the same reason allocateSession
+		// does: RecordRequest has nowhere to say which direction, because on ARI the direction was
+		// encoded in which channel id was passed.
+		const { port, transport } = newPort();
+		const objectKey = await port.startRecording({
+			sessionId: SESSION,
+			recordingRef: "rec-1",
+			direction: "both",
+		});
+
+		const [request] = transport.on(RPC_SUBJECTS.mediaStartRecording);
+		expect(request?.payload).toEqual({
+			sessionId: SESSION,
+			recordingRef: "rec-1",
+			direction: "both",
+			format: "wav",
+		});
+		// The object key is derived by mediad from the session it already holds, and it is the same
+		// `<org>/<call>/<ref>.wav` the engine computes for `channel.record.started` — which is what
+		// makes the two agree without either telling the other.
+		expect(objectKey).toBe("org/call/rec-1.wav");
+	});
+
+	it("stops a recording by reference alone", async () => {
+		const { port, transport } = newPort();
+		await port.stopRecording("rec-1");
+
+		const [request] = transport.on(RPC_SUBJECTS.mediaStopRecording);
+		expect(request?.payload).toEqual({ recordingRef: "rec-1" });
+		expect(mediaStopRecordingRequestSchema.parse(request?.payload)).toBeDefined();
+	});
+
+	it("treats stopping an already-finished recording as a no-op", async () => {
+		// The normal case: a recording that hit its duration limit, or whose leg hung up, has already
+		// finalised itself by the time a teardown gets around to stopping it.
+		const { port, transport } = newPort();
+		transport.reply(RPC_SUBJECTS.mediaStopRecording, {
+			ok: true,
+			recordingRef: "rec-1",
+			stopped: false,
+			instanceId: "mediad-fake",
+		});
+
+		await expect(port.stopRecording("rec-1")).resolves.toBeUndefined();
+	});
+});
+
 describe("the not-supported map", () => {
 	/**
 	 * Every unreached rung fails LOUDLY. A media plane that quietly accepted `record` would produce
@@ -452,12 +623,12 @@ describe("the not-supported map", () => {
 		],
 		["getVariable", "dialplan", (port) => port.getVariable("leg-a", "X")],
 		["setVariable", "dialplan", (port) => port.setVariable("leg-a", "X", "1")],
-		["sendDtmf", "rung 3", (port) => port.sendDtmf("leg-a", { digits: "1" })],
-		["record", "rung 4", (port) => port.record("leg-a", { name: "r1", format: "wav" })],
-		["stopRecording", "rung 4", (port) => port.stopRecording("r1")],
 		[
+			// The one refusal here that is NOT a rung. A snoop channel exists because ARI addresses
+			// everything by channel id, so a tap has to be a channel; mediad records both directions
+			// of a session directly and needs no such object.
 			"snoop",
-			"rung 4",
+			"a snoop tap",
 			(port) =>
 				port.snoop({
 					channelId: "leg-a",
@@ -510,6 +681,14 @@ describe("the not-supported map", () => {
 			// source frames from a file — see the playback describe block above.
 			"play",
 			"stopPlayback",
+			// Rung 3. Generating a digit, which the relay could never do: there is no inbound packet
+			// to forward.
+			"sendDtmf",
+			// Rung 4. `record` captures ONE direction, mirroring ARI's `channels.record` on a plain
+			// channel; both directions is `startRecording`, above the interface, because
+			// `RecordRequest` has nowhere to say which.
+			"record",
+			"stopRecording",
 		];
 		const refused = refusals.map(([operation]) => operation);
 		const methods = [...supported, ...refused].sort();
