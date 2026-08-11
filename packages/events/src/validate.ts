@@ -3,6 +3,7 @@ import { UnknownEventSubjectError, validationErrorFrom } from "./errors";
 import { auditEventSchema } from "./schemas/audit-events";
 import { callEventSchema } from "./schemas/call-events";
 import { cdrEventSchema } from "./schemas/cdr-events";
+import { mediaEventSchema } from "./schemas/media-events";
 import { provisionEventSchema } from "./schemas/provision-events";
 import { queueEventSchema } from "./schemas/queue-events";
 import { registrationEventSchema } from "./schemas/registration-events";
@@ -24,6 +25,7 @@ export const EVENT_SCHEMAS_BY_FAMILY = {
 	registration: registrationEventSchema,
 	queue: queueEventSchema,
 	voicemail: voicemailEventSchema,
+	media: mediaEventSchema,
 	cdr: cdrEventSchema,
 	audit: auditEventSchema,
 	provision: provisionEventSchema,
@@ -37,6 +39,7 @@ export const anyEventSchema = z.union([
 	registrationEventSchema,
 	queueEventSchema,
 	voicemailEventSchema,
+	mediaEventSchema,
 	cdrEventSchema,
 	auditEventSchema,
 	provisionEventSchema,

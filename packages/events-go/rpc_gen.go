@@ -5,8 +5,12 @@
 
 // Request-reply contracts for the rpc.* subjects (plan §3.5).
 //
-// Contracts only: transport is the application's business. rpc.media.* arrives with
-// apps/mediad and is deliberately absent until that service exists.
+// Contracts only: transport is the application's business.
+//
+// rpc.media.v1.* is the exception that proves the rule: apps/mediad is the RESPONDER for
+// those four, so the request/response structs below are the wire, not documentation. Both
+// ends must be raw NATS — a NestJS ClientProxy would wrap the payload in its own framing
+// and mediad would reject it. See packages/events/src/schemas/rpc.ts.
 
 package events
 
@@ -18,17 +22,25 @@ import (
 // Request-reply subjects and their suggested client deadlines. These are on the call path,
 // so a slow reply is the same as a broken one.
 const (
-	SubjectRoutingResolveRPC = "rpc.routing.v1.resolve"
-	SubjectAuthzCheckRPC     = "rpc.authz.v1.check"
-	SubjectVoicemailListRPC  = "rpc.voicemail.v1.list"
-	SubjectSipCredentialRPC  = "rpc.sip.v1.credential"
+	SubjectRoutingResolveRPC        = "rpc.routing.v1.resolve"
+	SubjectAuthzCheckRPC            = "rpc.authz.v1.check"
+	SubjectVoicemailListRPC         = "rpc.voicemail.v1.list"
+	SubjectSipCredentialRPC         = "rpc.sip.v1.credential"
+	SubjectMediaAllocateSessionRPC  = "rpc.media.v1.allocate-session"
+	SubjectMediaBridgeSessionsRPC   = "rpc.media.v1.bridge-sessions"
+	SubjectMediaUnbridgeSessionsRPC = "rpc.media.v1.unbridge-sessions"
+	SubjectMediaReleaseSessionRPC   = "rpc.media.v1.release-session"
 )
 
 const (
-	TimeoutRoutingResolveRPC = 2000 * time.Millisecond
-	TimeoutAuthzCheckRPC     = 1000 * time.Millisecond
-	TimeoutVoicemailListRPC  = 3000 * time.Millisecond
-	TimeoutSipCredentialRPC  = 500 * time.Millisecond
+	TimeoutRoutingResolveRPC        = 2000 * time.Millisecond
+	TimeoutAuthzCheckRPC            = 1000 * time.Millisecond
+	TimeoutVoicemailListRPC         = 3000 * time.Millisecond
+	TimeoutSipCredentialRPC         = 500 * time.Millisecond
+	TimeoutMediaAllocateSessionRPC  = 500 * time.Millisecond
+	TimeoutMediaBridgeSessionsRPC   = 500 * time.Millisecond
+	TimeoutMediaUnbridgeSessionsRPC = 500 * time.Millisecond
+	TimeoutMediaReleaseSessionRPC   = 500 * time.Millisecond
 )
 
 // RoutingResolveRequest is the request body of rpc.routing.v1.resolve.
@@ -218,3 +230,276 @@ type SipCredentialResponse struct {
 	ExtensionID *string `json:"extensionId,omitempty"`
 	Reason      *string `json:"reason,omitempty"`
 }
+
+// MediaAllocateSessionRequest is the request body of rpc.media.v1.allocate-session.
+type MediaAllocateSessionRequest struct {
+	SessionID string                               `json:"sessionId"`
+	OrgID     string                               `json:"orgId"`
+	CallID    string                               `json:"callId"`
+	LegID     *string                              `json:"legId,omitempty"`
+	SDPOffer  string                               `json:"sdpOffer"`
+	Direction MediaAllocateSessionRequestDirection `json:"direction"`
+}
+
+// MediaAllocateSessionRequestDirection is the closed vocabulary of MediaAllocateSessionRequest.direction.
+type MediaAllocateSessionRequestDirection string
+
+const (
+	MediaAllocateSessionRequestDirectionSendrecv MediaAllocateSessionRequestDirection = "sendrecv"
+	MediaAllocateSessionRequestDirectionSendonly MediaAllocateSessionRequestDirection = "sendonly"
+	MediaAllocateSessionRequestDirectionRecvonly MediaAllocateSessionRequestDirection = "recvonly"
+	MediaAllocateSessionRequestDirectionInactive MediaAllocateSessionRequestDirection = "inactive"
+)
+
+// MediaAllocateSessionRequestDirectionValues lists every member of the vocabulary, in contract order.
+var MediaAllocateSessionRequestDirectionValues = []MediaAllocateSessionRequestDirection{
+	MediaAllocateSessionRequestDirectionSendrecv,
+	MediaAllocateSessionRequestDirectionSendonly,
+	MediaAllocateSessionRequestDirectionRecvonly,
+	MediaAllocateSessionRequestDirectionInactive,
+}
+
+// Valid reports whether v is a member of the MediaAllocateSessionRequestDirection vocabulary.
+func (v MediaAllocateSessionRequestDirection) Valid() bool {
+	for _, candidate := range MediaAllocateSessionRequestDirectionValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaAllocateSessionRequestDirection) String() string { return string(v) }
+
+// MediaAllocateSessionResponse is the reply body of rpc.media.v1.allocate-session.
+type MediaAllocateSessionResponse struct {
+	Ok                        bool                                `json:"ok"`
+	SessionID                 string                              `json:"sessionId"`
+	SDPAnswer                 *string                             `json:"sdpAnswer,omitempty"`
+	InstanceID                *string                             `json:"instanceId,omitempty"`
+	Address                   *string                             `json:"address,omitempty"`
+	RtpPort                   *int                                `json:"rtpPort,omitempty"`
+	RtcpPort                  *int                                `json:"rtcpPort,omitempty"`
+	Ssrc                      *int                                `json:"ssrc,omitempty"`
+	Codec                     *MediaAllocateSessionResponseCodec  `json:"codec,omitempty"`
+	TelephoneEventPayloadType *int                                `json:"telephoneEventPayloadType,omitempty"`
+	Reason                    *MediaAllocateSessionResponseReason `json:"reason,omitempty"`
+	Error                     *string                             `json:"error,omitempty"`
+}
+
+// MediaAllocateSessionResponseCodec is the closed vocabulary of MediaAllocateSessionResponse.codec.
+type MediaAllocateSessionResponseCodec string
+
+const (
+	MediaAllocateSessionResponseCodecPcmu MediaAllocateSessionResponseCodec = "PCMU"
+	MediaAllocateSessionResponseCodecPcma MediaAllocateSessionResponseCodec = "PCMA"
+)
+
+// MediaAllocateSessionResponseCodecValues lists every member of the vocabulary, in contract order.
+var MediaAllocateSessionResponseCodecValues = []MediaAllocateSessionResponseCodec{
+	MediaAllocateSessionResponseCodecPcmu,
+	MediaAllocateSessionResponseCodecPcma,
+}
+
+// Valid reports whether v is a member of the MediaAllocateSessionResponseCodec vocabulary.
+func (v MediaAllocateSessionResponseCodec) Valid() bool {
+	for _, candidate := range MediaAllocateSessionResponseCodecValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaAllocateSessionResponseCodec) String() string { return string(v) }
+
+// MediaAllocateSessionResponseReason is the closed vocabulary of MediaAllocateSessionResponse.reason.
+type MediaAllocateSessionResponseReason string
+
+const (
+	MediaAllocateSessionResponseReasonBadRequest     MediaAllocateSessionResponseReason = "bad_request"
+	MediaAllocateSessionResponseReasonCapacity       MediaAllocateSessionResponseReason = "capacity"
+	MediaAllocateSessionResponseReasonShuttingDown   MediaAllocateSessionResponseReason = "shutting_down"
+	MediaAllocateSessionResponseReasonUnknownSession MediaAllocateSessionResponseReason = "unknown_session"
+	MediaAllocateSessionResponseReasonWrongInstance  MediaAllocateSessionResponseReason = "wrong_instance"
+	MediaAllocateSessionResponseReasonNotSupported   MediaAllocateSessionResponseReason = "not_supported"
+	MediaAllocateSessionResponseReasonInternal       MediaAllocateSessionResponseReason = "internal"
+)
+
+// MediaAllocateSessionResponseReasonValues lists every member of the vocabulary, in contract order.
+var MediaAllocateSessionResponseReasonValues = []MediaAllocateSessionResponseReason{
+	MediaAllocateSessionResponseReasonBadRequest,
+	MediaAllocateSessionResponseReasonCapacity,
+	MediaAllocateSessionResponseReasonShuttingDown,
+	MediaAllocateSessionResponseReasonUnknownSession,
+	MediaAllocateSessionResponseReasonWrongInstance,
+	MediaAllocateSessionResponseReasonNotSupported,
+	MediaAllocateSessionResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the MediaAllocateSessionResponseReason vocabulary.
+func (v MediaAllocateSessionResponseReason) Valid() bool {
+	for _, candidate := range MediaAllocateSessionResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaAllocateSessionResponseReason) String() string { return string(v) }
+
+// MediaBridgeSessionsRequest is the request body of rpc.media.v1.bridge-sessions.
+type MediaBridgeSessionsRequest struct {
+	BridgeID   string   `json:"bridgeId"`
+	SessionIDs []string `json:"sessionIds"`
+}
+
+// MediaBridgeSessionsResponse is the reply body of rpc.media.v1.bridge-sessions.
+type MediaBridgeSessionsResponse struct {
+	Ok         bool                               `json:"ok"`
+	BridgeID   string                             `json:"bridgeId"`
+	SessionIDs []string                           `json:"sessionIds"`
+	InstanceID *string                            `json:"instanceId,omitempty"`
+	Reason     *MediaBridgeSessionsResponseReason `json:"reason,omitempty"`
+	Error      *string                            `json:"error,omitempty"`
+}
+
+// MediaBridgeSessionsResponseReason is the closed vocabulary of MediaBridgeSessionsResponse.reason.
+type MediaBridgeSessionsResponseReason string
+
+const (
+	MediaBridgeSessionsResponseReasonBadRequest     MediaBridgeSessionsResponseReason = "bad_request"
+	MediaBridgeSessionsResponseReasonCapacity       MediaBridgeSessionsResponseReason = "capacity"
+	MediaBridgeSessionsResponseReasonShuttingDown   MediaBridgeSessionsResponseReason = "shutting_down"
+	MediaBridgeSessionsResponseReasonUnknownSession MediaBridgeSessionsResponseReason = "unknown_session"
+	MediaBridgeSessionsResponseReasonWrongInstance  MediaBridgeSessionsResponseReason = "wrong_instance"
+	MediaBridgeSessionsResponseReasonNotSupported   MediaBridgeSessionsResponseReason = "not_supported"
+	MediaBridgeSessionsResponseReasonInternal       MediaBridgeSessionsResponseReason = "internal"
+)
+
+// MediaBridgeSessionsResponseReasonValues lists every member of the vocabulary, in contract order.
+var MediaBridgeSessionsResponseReasonValues = []MediaBridgeSessionsResponseReason{
+	MediaBridgeSessionsResponseReasonBadRequest,
+	MediaBridgeSessionsResponseReasonCapacity,
+	MediaBridgeSessionsResponseReasonShuttingDown,
+	MediaBridgeSessionsResponseReasonUnknownSession,
+	MediaBridgeSessionsResponseReasonWrongInstance,
+	MediaBridgeSessionsResponseReasonNotSupported,
+	MediaBridgeSessionsResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the MediaBridgeSessionsResponseReason vocabulary.
+func (v MediaBridgeSessionsResponseReason) Valid() bool {
+	for _, candidate := range MediaBridgeSessionsResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaBridgeSessionsResponseReason) String() string { return string(v) }
+
+// MediaUnbridgeSessionsRequest is the request body of rpc.media.v1.unbridge-sessions.
+type MediaUnbridgeSessionsRequest struct {
+	BridgeID string `json:"bridgeId"`
+}
+
+// MediaUnbridgeSessionsResponse is the reply body of rpc.media.v1.unbridge-sessions.
+type MediaUnbridgeSessionsResponse struct {
+	Ok         bool                                 `json:"ok"`
+	BridgeID   string                               `json:"bridgeId"`
+	Unbridged  bool                                 `json:"unbridged"`
+	SessionIDs []string                             `json:"sessionIds"`
+	InstanceID *string                              `json:"instanceId,omitempty"`
+	Reason     *MediaUnbridgeSessionsResponseReason `json:"reason,omitempty"`
+	Error      *string                              `json:"error,omitempty"`
+}
+
+// MediaUnbridgeSessionsResponseReason is the closed vocabulary of MediaUnbridgeSessionsResponse.reason.
+type MediaUnbridgeSessionsResponseReason string
+
+const (
+	MediaUnbridgeSessionsResponseReasonBadRequest     MediaUnbridgeSessionsResponseReason = "bad_request"
+	MediaUnbridgeSessionsResponseReasonCapacity       MediaUnbridgeSessionsResponseReason = "capacity"
+	MediaUnbridgeSessionsResponseReasonShuttingDown   MediaUnbridgeSessionsResponseReason = "shutting_down"
+	MediaUnbridgeSessionsResponseReasonUnknownSession MediaUnbridgeSessionsResponseReason = "unknown_session"
+	MediaUnbridgeSessionsResponseReasonWrongInstance  MediaUnbridgeSessionsResponseReason = "wrong_instance"
+	MediaUnbridgeSessionsResponseReasonNotSupported   MediaUnbridgeSessionsResponseReason = "not_supported"
+	MediaUnbridgeSessionsResponseReasonInternal       MediaUnbridgeSessionsResponseReason = "internal"
+)
+
+// MediaUnbridgeSessionsResponseReasonValues lists every member of the vocabulary, in contract order.
+var MediaUnbridgeSessionsResponseReasonValues = []MediaUnbridgeSessionsResponseReason{
+	MediaUnbridgeSessionsResponseReasonBadRequest,
+	MediaUnbridgeSessionsResponseReasonCapacity,
+	MediaUnbridgeSessionsResponseReasonShuttingDown,
+	MediaUnbridgeSessionsResponseReasonUnknownSession,
+	MediaUnbridgeSessionsResponseReasonWrongInstance,
+	MediaUnbridgeSessionsResponseReasonNotSupported,
+	MediaUnbridgeSessionsResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the MediaUnbridgeSessionsResponseReason vocabulary.
+func (v MediaUnbridgeSessionsResponseReason) Valid() bool {
+	for _, candidate := range MediaUnbridgeSessionsResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaUnbridgeSessionsResponseReason) String() string { return string(v) }
+
+// MediaReleaseSessionRequest is the request body of rpc.media.v1.release-session.
+type MediaReleaseSessionRequest struct {
+	SessionID string `json:"sessionId"`
+}
+
+// MediaReleaseSessionResponse is the reply body of rpc.media.v1.release-session.
+type MediaReleaseSessionResponse struct {
+	Ok         bool                               `json:"ok"`
+	SessionID  string                             `json:"sessionId"`
+	Released   bool                               `json:"released"`
+	InstanceID *string                            `json:"instanceId,omitempty"`
+	Reason     *MediaReleaseSessionResponseReason `json:"reason,omitempty"`
+	Error      *string                            `json:"error,omitempty"`
+}
+
+// MediaReleaseSessionResponseReason is the closed vocabulary of MediaReleaseSessionResponse.reason.
+type MediaReleaseSessionResponseReason string
+
+const (
+	MediaReleaseSessionResponseReasonBadRequest     MediaReleaseSessionResponseReason = "bad_request"
+	MediaReleaseSessionResponseReasonCapacity       MediaReleaseSessionResponseReason = "capacity"
+	MediaReleaseSessionResponseReasonShuttingDown   MediaReleaseSessionResponseReason = "shutting_down"
+	MediaReleaseSessionResponseReasonUnknownSession MediaReleaseSessionResponseReason = "unknown_session"
+	MediaReleaseSessionResponseReasonWrongInstance  MediaReleaseSessionResponseReason = "wrong_instance"
+	MediaReleaseSessionResponseReasonNotSupported   MediaReleaseSessionResponseReason = "not_supported"
+	MediaReleaseSessionResponseReasonInternal       MediaReleaseSessionResponseReason = "internal"
+)
+
+// MediaReleaseSessionResponseReasonValues lists every member of the vocabulary, in contract order.
+var MediaReleaseSessionResponseReasonValues = []MediaReleaseSessionResponseReason{
+	MediaReleaseSessionResponseReasonBadRequest,
+	MediaReleaseSessionResponseReasonCapacity,
+	MediaReleaseSessionResponseReasonShuttingDown,
+	MediaReleaseSessionResponseReasonUnknownSession,
+	MediaReleaseSessionResponseReasonWrongInstance,
+	MediaReleaseSessionResponseReasonNotSupported,
+	MediaReleaseSessionResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the MediaReleaseSessionResponseReason vocabulary.
+func (v MediaReleaseSessionResponseReason) Valid() bool {
+	for _, candidate := range MediaReleaseSessionResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaReleaseSessionResponseReason) String() string { return string(v) }

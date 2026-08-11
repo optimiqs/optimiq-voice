@@ -17,17 +17,97 @@ import (
 // two refusals differently.
 var ErrClosed = errors.New("rtp: the session manager is shutting down")
 
+// ErrUnknownSession is returned by the commands that address an existing session.
+//
+// Distinct from every other failure because the engine's recovery is different: exhaustion means
+// "retry", shutting down means "retry elsewhere", and this one means "your picture of this call is
+// wrong". The control surface turns it into `unknown_session`, and the session directory is what
+// lets the engine tell that from "the session is on my neighbour".
+var ErrUnknownSession = errors.New("rtp: no such session on this instance")
+
+// ErrCodecMismatch is returned when two sessions cannot be bridged because their answers settled
+// on different G.711 variants.
+//
+// This is the design doc §7 rule enforced at the one place it becomes visible: v1 is PASSTHROUGH,
+// so relaying µ-law bytes to a leg expecting A-law would deliver audible noise. Refusing is the
+// correct answer and Asterisk keeps serving that call — resampling here is what rung 7 is for.
+var ErrCodecMismatch = errors.New("rtp: the two sessions negotiated different codecs, and v1 does not transcode")
+
 // Descriptor is what a caller needs to tell a far end where to send its media. It is the reply
 // body of an allocate, expressed in the packet path's own vocabulary so the control package can
 // translate it to the wire without reaching into a Session.
 type Descriptor struct {
-	SessionID    string
-	Address      netip.Addr
-	RTPPort      int
-	RTCPPort     int
-	SSRC         uint32
-	Mode         Mode
-	PayloadTypes []uint8
+	SessionID                 string
+	Address                   netip.Addr
+	RTPPort                   int
+	RTCPPort                  int
+	SSRC                      uint32
+	Mode                      Mode
+	AudioPayloadType          uint8
+	TelephoneEventPayloadType uint8
+}
+
+// AllocateOptions is everything the control surface has decided about a new session.
+//
+// A struct rather than a parameter list because it has grown past the point where a reader at a
+// call site can tell which string is which, and because the next rung adds fields to it rather than
+// arguments to every caller.
+type AllocateOptions struct {
+	// SessionID is caller-assigned and required. See the note on Allocate.
+	SessionID string
+	// OrgID, CallID and LegID travel to the session directory and the lifecycle events. mediad
+	// does not route on any of them.
+	OrgID  string
+	CallID string
+	LegID  string
+	// AudioPayloadType is the G.711 type the SDP answer settled on.
+	AudioPayloadType uint8
+	// TelephoneEventPayloadType is the RFC 4733 type the answer settled on, or 0 for none.
+	TelephoneEventPayloadType uint8
+	// Inactive puts the session in ModeInactive — a leg that is ringing but not yet talking.
+	Inactive bool
+}
+
+// EndReason is why a session stopped existing. The values match the wire contract's
+// `MediaSessionEndReason` (packages/events/src/schemas/media-events.ts) exactly.
+type EndReason string
+
+// Every way a media session can end.
+const (
+	// EndReasonReleased is the engine asking. The normal end of a leg.
+	EndReasonReleased EndReason = "released"
+	// EndReasonRTPTimeout is audio stopping while the session was still allocated.
+	EndReasonRTPTimeout EndReason = "rtp-timeout"
+	// EndReasonIdleReaped is the port-leak backstop collecting a session nobody released.
+	EndReasonIdleReaped EndReason = "idle-reaped"
+	// EndReasonDrained is the instance shutting down under a live call.
+	EndReasonDrained EndReason = "drained"
+)
+
+// Lifecycle is how the packet path tells the outside world a session changed state.
+//
+// An interface, and one the Manager calls SYNCHRONOUSLY but from a goroutine it owns, so that the
+// packet path never blocks on a NATS publish or a KV write. The control package supplies the real
+// implementation; tests supply a recorder; a Manager with none is a Manager that just does not
+// announce anything, which is what every packet-path unit test wants.
+type Lifecycle interface {
+	// SessionEnded is called exactly once per session, after its sockets are closed.
+	SessionEnded(session SessionSummary, reason EndReason)
+	// RTPTimedOut is called before the SessionEnded that follows it, and only for that reason.
+	RTPTimedOut(session SessionSummary, silentFor time.Duration)
+}
+
+// SessionSummary is a session's facts, flattened, so a Lifecycle implementation never holds a
+// pointer to a Session whose sockets are already closed.
+type SessionSummary struct {
+	SessionID  string
+	OrgID      string
+	CallID     string
+	LegID      string
+	RTPPort    int
+	Stats      Stats
+	Duration   time.Duration
+	RemoteAddr string
 }
 
 // Manager owns every live session: it allocates ports, runs each session's read loop, reaps idle
@@ -43,9 +123,22 @@ type Manager struct {
 	// now is swapped in tests so idle reaping is asserted without sleeping.
 	now func() time.Time
 
+	// rtpTimeout is the "audio stopped" window. Distinct from idleAfter — see ReapIdle.
+	rtpTimeout time.Duration
+	// echoDiagnostic makes a freshly allocated session echo instead of relay. Off in production;
+	// design doc open question 5.
+	echoDiagnostic bool
+	lifecycle      Lifecycle
+
 	mu       sync.Mutex
 	sessions map[string]*Session
-	closed   bool
+	// bridges maps a caller-assigned bridge id to the two sessions relaying under it.
+	//
+	// Held HERE rather than on the sessions, even though each session already points at its peer,
+	// because unbridge addresses a bridge by id and a session pair cannot be looked up from one. The
+	// peer pointers are the packet path's view; this is the control surface's.
+	bridges map[string][2]string
+	closed  bool
 
 	// running tracks each session's read goroutine so Drain can wait for the packet path to stop
 	// before the process exits, rather than exiting with sockets still being read.
@@ -60,6 +153,13 @@ type ManagerOptions struct {
 	PublicAddr netip.Addr
 	// IdleAfter reaps sessions with no traffic for this long. Zero disables reaping.
 	IdleAfter time.Duration
+	// RTPTimeout is the window after which a session that HAS received audio and then stopped is
+	// declared timed out. Zero falls back to IdleAfter.
+	RTPTimeout time.Duration
+	// EchoDiagnostic makes new sessions echo rather than relay. Never on in production.
+	EchoDiagnostic bool
+	// Lifecycle receives session-ended and rtp-timeout notifications. Optional.
+	Lifecycle Lifecycle
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
 	// Now is the clock, for tests.
@@ -76,12 +176,19 @@ func NewManager(opts ManagerOptions) (*Manager, error) {
 	}
 
 	manager := &Manager{
-		allocator: opts.Allocator,
-		public:    opts.PublicAddr.Unmap(),
-		log:       opts.Logger,
-		idleAfter: opts.IdleAfter,
-		now:       opts.Now,
-		sessions:  make(map[string]*Session),
+		allocator:      opts.Allocator,
+		public:         opts.PublicAddr.Unmap(),
+		log:            opts.Logger,
+		idleAfter:      opts.IdleAfter,
+		rtpTimeout:     opts.RTPTimeout,
+		echoDiagnostic: opts.EchoDiagnostic,
+		lifecycle:      opts.Lifecycle,
+		now:            opts.Now,
+		sessions:       make(map[string]*Session),
+		bridges:        make(map[string][2]string),
+	}
+	if manager.rtpTimeout <= 0 {
+		manager.rtpTimeout = opts.IdleAfter
 	}
 	if manager.log == nil {
 		manager.log = slog.Default()
@@ -106,10 +213,20 @@ func NewManager(opts ManagerOptions) (*Manager, error) {
 // The mode of an existing session is NOT changed by a repeat allocate: a retry must not mutate a
 // live call. A genuine mode change is a separate operation, and arrives with the capability that
 // needs it.
-func (m *Manager) Allocate(sessionID string, mode Mode) (Descriptor, error) {
+func (m *Manager) Allocate(opts AllocateOptions) (Descriptor, error) {
+	sessionID := opts.SessionID
 	if sessionID == "" {
 		return Descriptor{}, errors.New("rtp: a session id is required")
 	}
+
+	mode := ModeRelay
+	switch {
+	case opts.Inactive:
+		mode = ModeInactive
+	case m.echoDiagnostic:
+		mode = ModeEcho
+	}
+	audioPT := opts.AudioPayloadType
 
 	m.mu.Lock()
 	if m.closed {
@@ -130,10 +247,15 @@ func (m *Manager) Allocate(sessionID string, mode Mode) (Descriptor, error) {
 	}
 
 	session, err := NewSession(Options{
-		ID:     sessionID,
-		Ports:  ports,
-		Mode:   mode,
-		Logger: m.log,
+		ID:                        sessionID,
+		Ports:                     ports,
+		Mode:                      mode,
+		OrgID:                     opts.OrgID,
+		CallID:                    opts.CallID,
+		LegID:                     opts.LegID,
+		AudioPayloadType:          audioPT,
+		TelephoneEventPayloadType: opts.TelephoneEventPayloadType,
+		Logger:                    m.log,
 	})
 	if err != nil {
 		_ = ports.Close()
@@ -167,8 +289,10 @@ func (m *Manager) Allocate(sessionID string, mode Mode) (Descriptor, error) {
 
 	m.log.Info("session allocated",
 		"sessionId", sessionID,
+		"callId", opts.CallID,
 		"rtpPort", session.LocalPort(),
 		"mode", session.Mode(),
+		"audioPayloadType", audioPT,
 		"live", m.Len())
 	return m.describe(session), nil
 }
@@ -181,17 +305,145 @@ func (m *Manager) Release(sessionID string) bool {
 	session, ok := m.sessions[sessionID]
 	if ok {
 		delete(m.sessions, sessionID)
+		// Releasing one half of a bridge tears the whole relay down. The other leg stays ALIVE and
+		// simply stops having a peer, which is the correct shape of "one party hung up": the
+		// survivor is still allocated, and the engine decides whether it hears a prompt, gets
+		// re-bridged somewhere else, or is released in turn.
+		m.unbridgeSessionLocked(sessionID)
 	}
 	m.mu.Unlock()
 
 	if !ok {
 		return false
 	}
-	if err := session.Close(); err != nil {
-		m.log.Warn("closing a session", "sessionId", sessionID, "error", err)
-	}
+	m.closeAndAnnounce(session, EndReasonReleased)
 	m.log.Info("session released", "sessionId", sessionID, "live", m.Len())
 	return true
+}
+
+// closeAndAnnounce shuts a session down and tells the Lifecycle, in that order.
+//
+// The summary is taken BEFORE the close so the counters and the latched far end are the session's
+// final state rather than a zeroed struct, and the announcement happens after so a consumer that
+// reacts by asking about the session gets the truth.
+func (m *Manager) closeAndAnnounce(session *Session, reason EndReason) {
+	summary := session.Summary()
+	if err := session.Close(); err != nil {
+		m.log.Warn("closing a session", "sessionId", session.ID, "error", err)
+	}
+	if m.lifecycle != nil {
+		m.lifecycle.SessionEnded(summary, reason)
+	}
+}
+
+// Bridge starts a bidirectional relay between two sessions.
+//
+// # What a bridge IS here
+//
+// Two pointers. Each session forwards what it receives out of the OTHER's socket, to the other's
+// latched far end — no decode, no mix, no jitter buffer, and therefore no added latency and no
+// audio-quality argument to have against Asterisk. RFC 4733 DTMF rides through it for free, because
+// a telephone-event payload is just bytes to a relay.
+//
+// # Idempotent, and re-pointable
+//
+// Bridging the same id to the same pair again is a no-op that answers success, for the same reason
+// allocate is idempotent: the engine's retry after a timeout is indistinguishable from a fresh
+// request at this layer. Bridging a session that is ALREADY in another bridge moves it — that is an
+// attended transfer, and refusing it would mean the engine had to unbridge first and the caller
+// would hear a gap in between.
+func (m *Manager) Bridge(bridgeID string, first, second string) error {
+	switch {
+	case bridgeID == "":
+		return errors.New("rtp: a bridge id is required")
+	case first == "" || second == "":
+		return errors.New("rtp: a bridge needs two session ids")
+	case first == second:
+		// A session relaying to itself is an echo with extra steps, and the only way to ask for one
+		// is a bug in the caller — most likely the same leg added to a bridge twice.
+		return errors.New("rtp: cannot bridge a session to itself")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.closed {
+		return ErrClosed
+	}
+	a, ok := m.sessions[first]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrUnknownSession, first)
+	}
+	b, ok := m.sessions[second]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrUnknownSession, second)
+	}
+	if a.AudioPayloadType() != b.AudioPayloadType() {
+		return fmt.Errorf("%w: %s answered %d, %s answered %d",
+			ErrCodecMismatch, first, a.AudioPayloadType(), second, b.AudioPayloadType())
+	}
+
+	// Detach both from whatever they were in, so a re-bridge cannot leave a stale pointer behind
+	// pushing audio at a party that is no longer in the conversation.
+	m.unbridgeSessionLocked(first)
+	m.unbridgeSessionLocked(second)
+
+	a.SetPeer(b)
+	b.SetPeer(a)
+	m.bridges[bridgeID] = [2]string{first, second}
+
+	m.log.Info("sessions bridged", "bridgeId", bridgeID, "sessionIds", []string{first, second})
+	return nil
+}
+
+// Unbridge stops a relay and leaves both sessions alive.
+//
+// Reports whether there was a relay to stop, so the caller can tell "unbridged" from "already
+// gone" — the engine retries an unbridge, and a retry answering false is the honest answer rather
+// than an error.
+func (m *Manager) Unbridge(bridgeID string) ([]string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	pair, ok := m.bridges[bridgeID]
+	if !ok {
+		return nil, false
+	}
+	m.detachLocked(bridgeID, pair)
+	m.log.Info("sessions unbridged", "bridgeId", bridgeID, "sessionIds", pair[:])
+	return []string{pair[0], pair[1]}, true
+}
+
+// unbridgeSessionLocked removes whatever bridge a session is in. Caller holds m.mu.
+func (m *Manager) unbridgeSessionLocked(sessionID string) {
+	for bridgeID, pair := range m.bridges {
+		if pair[0] == sessionID || pair[1] == sessionID {
+			m.detachLocked(bridgeID, pair)
+			return
+		}
+	}
+}
+
+// detachLocked clears both peer pointers and forgets the bridge. Caller holds m.mu.
+func (m *Manager) detachLocked(bridgeID string, pair [2]string) {
+	for _, id := range pair {
+		if session, ok := m.sessions[id]; ok {
+			session.SetPeer(nil)
+		}
+	}
+	delete(m.bridges, bridgeID)
+}
+
+// BridgeOf reports which bridge a session is in, if any. Read by the session directory writer.
+func (m *Manager) BridgeOf(sessionID string) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for bridgeID, pair := range m.bridges {
+		if pair[0] == sessionID || pair[1] == sessionID {
+			return bridgeID, true
+		}
+	}
+	return "", false
 }
 
 // Get returns a live session by id.
@@ -214,56 +466,99 @@ func (m *Manager) Capacity() int { return m.allocator.Capacity() }
 
 func (m *Manager) describe(session *Session) Descriptor {
 	return Descriptor{
-		SessionID:    session.ID,
-		Address:      m.public,
-		RTPPort:      session.LocalPort(),
-		RTCPPort:     session.LocalPort() + 1,
-		SSRC:         session.SSRC,
-		Mode:         session.Mode(),
-		PayloadTypes: SupportedPayloadTypes(),
+		SessionID:                 session.ID,
+		Address:                   m.public,
+		RTPPort:                   session.LocalPort(),
+		RTCPPort:                  session.LocalPort() + 1,
+		SSRC:                      session.SSRC,
+		Mode:                      session.Mode(),
+		AudioPayloadType:          session.AudioPayloadType(),
+		TelephoneEventPayloadType: session.TelephoneEventPayloadType(),
 	}
 }
 
-// ReapIdle closes sessions with no traffic for longer than IdleAfter and returns how many it
-// closed. Zero IdleAfter disables it entirely.
+// ReapIdle closes sessions that have gone quiet and returns how many it closed.
 //
-// A backstop, not a teardown policy — see config.SessionIdleTimeout. It is exported so a test can
-// run it without waiting for a ticker.
+// # Two different silences, and why they are not one check
+//
+// A session that RECEIVED audio and then stopped is an RTP TIMEOUT: a call that is still up as far
+// as the signalling plane is concerned, and whose two parties can no longer hear each other. A NAT
+// binding expired, a network dropped, an endpoint crashed without sending BYE. It is a media
+// failure, the engine wants to know about it while the call is notionally live, and it is
+// announced as `session.rtp-timeout` followed by a `session.ended` carrying that reason.
+//
+// A session that NEVER received a packet and simply aged out is a LEAK: the engine allocated it and
+// then stopped knowing about it — it crashed mid-call, or a release was never sent, or the far end
+// never answered the INVITE. Nothing failed in the media path, because nothing ever happened in it.
+// It is announced as `idle-reaped`, and it exists to stop a leaked port from being permanent
+// capacity loss until a restart.
+//
+// Reporting them as one event would mean a consumer counting media failures counted every abandoned
+// call setup as one.
+//
+// Exported so a test can run it without waiting for a ticker.
 func (m *Manager) ReapIdle() int {
-	if m.idleAfter <= 0 {
+	if m.idleAfter <= 0 && m.rtpTimeout <= 0 {
 		return 0
 	}
 	now := m.now()
 
+	type expiry struct {
+		session   *Session
+		reason    EndReason
+		silentFor time.Duration
+	}
+
 	m.mu.Lock()
-	var stale []*Session
+	var stale []expiry
 	for id, session := range m.sessions {
-		if session.Idle(now) > m.idleAfter {
-			stale = append(stale, session)
-			delete(m.sessions, id)
+		idle := session.Idle(now)
+		heardSomething := session.Stats().LastPacketUnixMs != 0
+
+		switch {
+		case heardSomething && m.rtpTimeout > 0 && idle > m.rtpTimeout:
+			stale = append(stale, expiry{session, EndReasonRTPTimeout, idle})
+		case !heardSomething && m.idleAfter > 0 && idle > m.idleAfter:
+			stale = append(stale, expiry{session, EndReasonIdleReaped, idle})
+		default:
+			continue
 		}
+		delete(m.sessions, id)
+		m.unbridgeSessionLocked(id)
 	}
 	m.mu.Unlock()
 
-	for _, session := range stale {
-		m.log.Warn("reaping an idle session; the engine never released it",
-			"sessionId", session.ID, "idle", session.Idle(now).String())
-		if err := session.Close(); err != nil {
-			m.log.Warn("closing an idle session", "sessionId", session.ID, "error", err)
+	for _, entry := range stale {
+		if entry.reason == EndReasonRTPTimeout {
+			m.log.Warn("a session stopped receiving RTP; the call has lost audio",
+				"sessionId", entry.session.ID, "callId", entry.session.CallID,
+				"silentFor", entry.silentFor.String())
+			if m.lifecycle != nil {
+				m.lifecycle.RTPTimedOut(entry.session.Summary(), entry.silentFor)
+			}
+		} else {
+			m.log.Warn("reaping an idle session; the engine never released it",
+				"sessionId", entry.session.ID, "idle", entry.silentFor.String())
 		}
+		m.closeAndAnnounce(entry.session, entry.reason)
 	}
 	return len(stale)
 }
 
 // RunReaper drives ReapIdle on a ticker until the context is cancelled.
 func (m *Manager) RunReaper(ctx context.Context) error {
-	if m.idleAfter <= 0 {
+	window := m.rtpTimeout
+	if m.idleAfter > 0 && (window <= 0 || m.idleAfter < window) {
+		window = m.idleAfter
+	}
+	if window <= 0 {
 		<-ctx.Done()
 		return ctx.Err()
 	}
-	// Check several times per idle window, so a session is reaped near its deadline rather than up
-	// to a whole window late.
-	interval := m.idleAfter / 4
+	// Check several times per window, so a session is reaped near its deadline rather than up to a
+	// whole window late. Driven by the SHORTER of the two windows, because a tick sized for the
+	// longer one would make the shorter deadline meaningless.
+	interval := window / 4
 	if interval < time.Second {
 		interval = time.Second
 	}
@@ -308,15 +603,14 @@ func (m *Manager) Drain(ctx context.Context) error {
 		live = append(live, session)
 		delete(m.sessions, id)
 	}
+	m.bridges = make(map[string][2]string)
 	m.mu.Unlock()
 
 	if len(live) > 0 {
 		m.log.Warn("draining live sessions; media on these calls stops now", "count", len(live))
 	}
 	for _, session := range live {
-		if err := session.Close(); err != nil {
-			m.log.Warn("closing a session during drain", "sessionId", session.ID, "error", err)
-		}
+		m.closeAndAnnounce(session, EndReasonDrained)
 	}
 
 	stopped := make(chan struct{})

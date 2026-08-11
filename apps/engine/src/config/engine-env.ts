@@ -228,6 +228,36 @@ export const engineEnvSchema = z.object({
 	 * cost a tenant an orbit that is holding a live caller.
 	 */
 	ENGINE_CLAIM_HEARTBEAT_MS: z.coerce.number().int().min(1_000).max(300_000).default(30_000),
+
+	/**
+	 * Which media plane this engine drives.
+	 *
+	 * `ari` is Asterisk through `packages/media-ari` and is the DEFAULT, deliberately and for as
+	 * long as the capability ladder in `plans/mediad-design.md` §2 is unfinished. Every rung
+	 * `mediad` has not reached is a rung Asterisk still serves, so a deployment that does not opt in
+	 * gets exactly the behaviour it had before this variable existed.
+	 *
+	 * `mediad` routes the media plane to `apps/mediad` over `rpc.media.v1.*`. It serves rung 2 —
+	 * bridged G.711 calls with RFC 4733 DTMF — and REFUSES, loudly and by name, every operation
+	 * above that. See `MediadMediaPort` for the coverage map and for why a not-supported operation
+	 * throws rather than no-ops.
+	 *
+	 * Per capability rather than per service is the plan's sequencing rule (§3.4), and this variable
+	 * is the coarse half of it: an operator picks a media plane per deployment, which makes the
+	 * cutover revertible by configuration rather than by a rollback.
+	 */
+	ENGINE_MEDIA_DRIVER: z.enum(["ari", "mediad"]).default("ari"),
+
+	/**
+	 * How long the engine waits for a `mediad` reply.
+	 *
+	 * Matched to the contract's own suggested deadline (`MEDIA_ALLOCATE_SESSION_RPC.timeoutMs`), and
+	 * exposed because the number that is right on a loopback compose file is not the number that is
+	 * right across an availability zone. It stays SHORT on purpose: every one of these sits inside
+	 * a call setup, where the caller hears the delay as silence before ringback, and a reply slower
+	 * than the deadline means the instance is sick rather than busy.
+	 */
+	ENGINE_MEDIAD_RPC_TIMEOUT_MS: z.coerce.number().int().min(100).max(10_000).default(500),
 });
 
 export type EngineEnv = z.infer<typeof engineEnvSchema>;

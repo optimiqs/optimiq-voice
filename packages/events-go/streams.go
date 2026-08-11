@@ -146,6 +146,30 @@ var VoicemailStream = StreamDefinition{
 	NumReplicas:       1,
 }
 
+// MediaStream carries the media plane's RTP session lifecycle from apps/mediad.
+//
+// discard-old and a short window, unlike CDR: these are live-state facts about calls, not a ledger.
+// What they are kept for is the question asked minutes or hours later — "why did that call go
+// quiet?" — answered from a session.rtp-timeout and a session.ended reason.
+//
+// Two days, matching nothing else on purpose: long enough for "it happened on Friday afternoon",
+// short enough that a media plane under sustained failure cannot fill a disk with its own
+// complaints.
+var MediaStream = StreamDefinition{
+	Name:              "MEDIA",
+	Description:       "Media-plane RTP session lifecycle from apps/mediad (plan §3.4, mediad-design §4).",
+	Subjects:          []string{AllMediaFilter()},
+	Retention:         RetentionLimits,
+	Storage:           StorageFile,
+	Discard:           DiscardOld,
+	MaxAge:            48 * time.Hour,
+	MaxMsgs:           Unlimited,
+	MaxBytes:          1 * gib,
+	MaxMsgsPerSubject: Unlimited,
+	DuplicateWindow:   2 * time.Minute,
+	NumReplicas:       1,
+}
+
 // CDRStream carries per-leg call records on their way to cdr-db. "Replay = rebuild": the 30-day
 // window is how far back the CDR table can be reconstructed from the log alone.
 var CDRStream = StreamDefinition{
@@ -202,6 +226,7 @@ var EventStreams = []StreamDefinition{
 	RegistrationsStream,
 	QueuesStream,
 	VoicemailStream,
+	MediaStream,
 	CDRStream,
 	AuditStream,
 	ProvisionStream,
@@ -410,6 +435,33 @@ var ConferenceClaimsKV = KVBucketDefinition{
 	NumReplicas:  1,
 }
 
+// MediaSessionsKV maps an RTP session to the mediad instance that holds it.
+//
+// rpc.media.v1.* is served by a QUEUE GROUP, so NATS hands each request to whichever mediad happens
+// to be free. That is right for allocate-session — any instance with a free port will do — and
+// wrong for every command after it, because a session lives on exactly ONE instance: its sockets
+// are bound there and its relay goroutines run there. A bridge-sessions delivered to the neighbour
+// has nothing to bridge, and without this directory it could not tell "never existed" from "belongs
+// to somebody else", which need different recoveries.
+//
+// Not a claim: nothing races for a media session, so there is no expiresAt and no heartbeat. The
+// six-hour TTL is a backstop matching ChannelsKV (a session lives exactly as long as a call leg);
+// the real cleanup is release-session deleting the key, which is part of the wire contract because a
+// directory entry that outlives its session is an instance name the engine keeps routing dead
+// commands to.
+//
+// This is the one bucket written from Go and read from both languages.
+var MediaSessionsKV = KVBucketDefinition{
+	Name:         "media-sessions",
+	Description:  "RTP session -> owning mediad instance, for per-instance command routing.",
+	TTL:          6 * time.Hour,
+	History:      1,
+	Storage:      StorageFile,
+	MaxValueSize: 4 * 1024,
+	MaxBytes:     128 * mib,
+	NumReplicas:  1,
+}
+
 // KVBuckets lists every bucket the backbone owns, in apply order.
 var KVBuckets = []KVBucketDefinition{
 	RegistrationsKV,
@@ -421,6 +473,7 @@ var KVBuckets = []KVBucketDefinition{
 	QueueMembershipKV,
 	ParkClaimsKV,
 	ConferenceClaimsKV,
+	MediaSessionsKV,
 }
 
 // KVBucketByName looks a bucket definition up by name.
@@ -552,4 +605,14 @@ func QueueMembershipKVKey(orgID, queueID string) (string, error) {
 		return "", err
 	}
 	return org + "." + queue, nil
+}
+
+// MediaSessionKVKey builds the media-sessions key: the session id, and nothing else.
+//
+// The second key here that is not organization-scoped, and for the same reason as DIDIndexKVKey:
+// the READER does not know the tenant. A mediad handed a bridge-sessions carrying two session ids
+// has no org to scope a lookup with, and threading one onto every media command purely so the key
+// could be prefixed would be shaping the wire around a key format. The org travels in the value.
+func MediaSessionKVKey(sessionID string) (string, error) {
+	return token("sessionId", sessionID)
 }

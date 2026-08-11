@@ -76,6 +76,37 @@ type Config struct {
 	RTPPortMin int
 	RTPPortMax int
 
+	// InstanceID names this process on the wire, in the session directory, and on every lifecycle
+	// event. MEDIAD_INSTANCE_ID, defaulting to the hostname plus the pid.
+	//
+	// It has to be STABLE for the life of the process and DISTINCT between processes, and those are
+	// the only two requirements. The hostname alone is not enough — two mediad containers on one
+	// host in a local compose run share it — and a random value alone would be unreadable in the
+	// one place it matters most, which is an operator reading "session X lives on instance Y" and
+	// having to work out which container that is.
+	InstanceID string
+
+	// RTPTimeout declares a session dead when it HAS received audio and then stops for this long.
+	// MEDIAD_RTP_TIMEOUT, default 30s. Zero falls back to SessionIdleTimeout.
+	//
+	// Distinct from SessionIdleTimeout, and the distinction is the whole point: this one is a MEDIA
+	// FAILURE on a call the signalling plane still believes is up, and it is announced as such. The
+	// idle timeout below is a port-leak backstop for sessions that never carried anything.
+	//
+	// 30 seconds rather than something tighter because RTP is UDP over networks that hiccup: a
+	// two-second gap is a bad Wi-Fi moment, and tearing a call down for one would make mediad worse
+	// than the network it runs on. Thirty seconds of total silence is not a hiccup.
+	RTPTimeout time.Duration
+
+	// EchoDiagnostic makes every allocated session echo instead of relay. MEDIAD_ECHO_DIAGNOSTIC,
+	// default false.
+	//
+	// Design doc open question 5, settled: echo survives rung 2 as the simplest possible smoke test
+	// of a real deployment's ports and NAT, and it is put behind a flag so it can never be reached
+	// by a production call path. A deployment that turns this on has NO working calls, by design —
+	// every leg hears itself — which is why it is refused loudly at boot when it is on.
+	EchoDiagnostic bool
+
 	// SessionIdleTimeout reaps a session that has received no RTP for this long.
 	// MEDIAD_SESSION_IDLE_TIMEOUT, default 60s. Zero disables reaping.
 	//
@@ -141,6 +172,13 @@ func Load(getenv Getenv) (Config, error) {
 	if cfg.SessionIdleTimeout, err = durationOr(getenv, "MEDIAD_SESSION_IDLE_TIMEOUT", time.Minute); err != nil {
 		fail("%v", err)
 	}
+	if cfg.RTPTimeout, err = durationOr(getenv, "MEDIAD_RTP_TIMEOUT", 30*time.Second); err != nil {
+		fail("%v", err)
+	}
+	if cfg.EchoDiagnostic, err = boolOr(getenv, "MEDIAD_ECHO_DIAGNOSTIC", false); err != nil {
+		fail("%v", err)
+	}
+	cfg.InstanceID = stringOr(getenv, "MEDIAD_INSTANCE_ID", defaultInstanceID())
 	if cfg.ShutdownTimeout, err = durationOr(getenv, "MEDIAD_SHUTDOWN_TIMEOUT", 10*time.Second); err != nil {
 		fail("%v", err)
 	}
@@ -185,6 +223,15 @@ func Load(getenv Getenv) (Config, error) {
 	problems = append(problems, checkPortRange(cfg.RTPPortMin, cfg.RTPPortMax)...)
 	if cfg.SessionIdleTimeout < 0 {
 		fail("MEDIAD_SESSION_IDLE_TIMEOUT must not be negative (0 disables idle reaping)")
+	}
+	if cfg.RTPTimeout < 0 {
+		fail("MEDIAD_RTP_TIMEOUT must not be negative (0 falls back to MEDIAD_SESSION_IDLE_TIMEOUT)")
+	}
+	if !isSubjectToken(cfg.InstanceID) {
+		// The instance id ends up in logs, in a KV value and on the wire. Constraining it to the
+		// same character set every other token on this backbone uses means it can never be the
+		// reason a value fails to parse somewhere three services away.
+		fail("MEDIAD_INSTANCE_ID must be one token of [A-Za-z0-9_-], got %q", cfg.InstanceID)
 	}
 	if cfg.ShutdownTimeout <= 0 {
 		fail("MEDIAD_SHUTDOWN_TIMEOUT must be positive")
@@ -285,4 +332,58 @@ func levelOr(getenv Getenv, key string, fallback slog.Level) (slog.Level, error)
 		return fallback, fmt.Errorf("%s must be one of debug/info/warn/error, got %q", key, raw)
 	}
 	return level, nil
+}
+
+// defaultInstanceID builds a stable, distinct, readable name for this process.
+//
+// hostname-pid: the hostname is what an operator recognises, the pid disambiguates two processes on
+// one host (a local compose run, or a restart whose predecessor has not fully exited). A hostname
+// that is not a clean token has its illegal characters folded to `-` rather than being rejected,
+// because refusing to boot over a machine name nobody chose would be refusing to boot for no
+// operational reason.
+func defaultInstanceID() string {
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		host = "mediad"
+	}
+	var cleaned strings.Builder
+	for _, r := range host {
+		switch {
+		case r == '-' || r == '_' ||
+			(r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z'):
+			cleaned.WriteRune(r)
+		default:
+			cleaned.WriteRune('-')
+		}
+	}
+	return fmt.Sprintf("%s-%d", cleaned.String(), os.Getpid())
+}
+
+// isSubjectToken mirrors the contract package's token rule, restated here so config validation does
+// not drag a dependency on it into the boot path.
+func isSubjectToken(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		switch {
+		case r == '-' || r == '_' ||
+			(r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z'):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func boolOr(getenv Getenv, key string, fallback bool) (bool, error) {
+	raw := strings.TrimSpace(getenv(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return fallback, fmt.Errorf("%s must be true or false, got %q", key, raw)
+	}
+	return value, nil
 }

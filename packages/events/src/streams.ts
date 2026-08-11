@@ -153,6 +153,33 @@ export const VOICEMAIL_STREAM: StreamDefinition = {
 };
 
 /**
+ * `MEDIA` — the media plane's session lifecycle (`apps/mediad`).
+ *
+ * `discard: old` and a short window, unlike CDR: these are live-state facts about calls, not a
+ * ledger. What they are kept for is the question asked minutes or hours later — "why did that call
+ * go quiet?" — which is answered from `session.rtp-timeout` and a `session.ended` reason, and which
+ * nobody asks about a call from last week without a CDR in front of them anyway.
+ *
+ * Two days, matching nothing else on purpose: long enough to cover a weekend's worth of "it
+ * happened on Friday afternoon" reports, short enough that a media plane under sustained failure
+ * cannot fill a disk with its own complaints.
+ */
+export const MEDIA_STREAM: StreamDefinition = {
+	name: "MEDIA",
+	description: "Media-plane RTP session lifecycle from apps/mediad (plan §3.4, mediad-design §4).",
+	subjects: [subjectFilterFor.allMedia()],
+	retention: "limits",
+	storage: "file",
+	discard: "old",
+	maxAgeMs: 2 * DAY_MS,
+	maxMsgs: -1,
+	maxBytes: 1 * GIB,
+	maxMsgsPerSubject: -1,
+	duplicateWindowMs: 2 * MINUTE_MS,
+	numReplicas: 1,
+};
+
+/**
  * `CDR` — per-leg call records on their way to `cdr-db`. "Replay = rebuild": the 30-day window is
  * how far back the CDR table can be reconstructed from the log alone. A wider `duplicate_window`
  * than the rest because a crash-looping writer may retry the same leg minutes later.
@@ -210,6 +237,7 @@ export const EVENT_STREAMS: readonly StreamDefinition[] = [
 	REGISTRATIONS_STREAM,
 	QUEUES_STREAM,
 	VOICEMAIL_STREAM,
+	MEDIA_STREAM,
 	CDR_STREAM,
 	AUDIT_STREAM,
 	PROVISION_STREAM,
@@ -662,6 +690,33 @@ export const CONFERENCE_CLAIMS_KV: KvBucketDefinition = {
 	numReplicas: 1,
 };
 
+/**
+ * `media-sessions` — which `mediad` instance holds which RTP session.
+ *
+ * The full argument for its existence, its shape and its key is on
+ * {@link import("./schemas/live-state").mediaSessionDirectoryEntrySchema}. In short: `rpc.media.v1.*`
+ * is queue-grouped, so NATS picks any instance, and every command after the allocate has to reach
+ * the ONE instance whose sockets the session is bound to.
+ *
+ * ## Why the TTL is six hours
+ *
+ * The same number as `channels`, for the same reason: a media session lives exactly as long as a
+ * call leg, and six hours covers the longest realistic one while guaranteeing a crashed instance's
+ * entries cannot outlive a shift. The TTL is a BACKSTOP — the real cleanup is `release-session`
+ * deleting the key, which is part of the wire contract precisely because a directory entry that
+ * outlives its session is an instance name the engine keeps routing dead commands to.
+ */
+export const MEDIA_SESSIONS_KV: KvBucketDefinition = {
+	name: "media-sessions",
+	description: "RTP session -> owning mediad instance, for per-instance command routing.",
+	ttlMs: 6 * HOUR_MS,
+	history: 1,
+	storage: "file",
+	maxValueSizeBytes: 4 * 1024,
+	maxBytes: 128 * MIB,
+	numReplicas: 1,
+};
+
 export const KV_BUCKETS: readonly KvBucketDefinition[] = [
 	REGISTRATIONS_KV,
 	CHANNELS_KV,
@@ -672,6 +727,7 @@ export const KV_BUCKETS: readonly KvBucketDefinition[] = [
 	QUEUE_MEMBERSHIP_KV,
 	PARK_CLAIMS_KV,
 	CONFERENCE_CLAIMS_KV,
+	MEDIA_SESSIONS_KV,
 ];
 
 /** The KV wire options for a bucket definition. */
@@ -820,6 +876,18 @@ export const kvKeyFor = {
 	 */
 	conferenceClaim(orgId: string, conferenceId: string): string {
 		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("conferenceId", conferenceId)}`;
+	},
+	/**
+	 * `media-sessions`: the session id, and nothing else.
+	 *
+	 * The second key in this file that is not organization-scoped, and for the same reason as
+	 * {@link kvKeyFor.didIndex}: the reader does not know the tenant. A `mediad` instance handed a
+	 * `bridge-sessions` carrying two session ids has no org to scope a lookup with, and threading
+	 * one onto every media command purely so the key could be prefixed would be shaping the wire
+	 * around a key format. The org travels in the VALUE.
+	 */
+	mediaSession(sessionId: string): string {
+		return assertKeyToken("sessionId", sessionId);
 	},
 } as const;
 

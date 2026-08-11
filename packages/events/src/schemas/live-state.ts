@@ -184,3 +184,74 @@ const TEARDOWN_SET: ReadonlySet<string> = new Set<string>(LIVE_CHANNEL_TEARDOWN_
 export function isLiveChannel(channel: LiveChannel): boolean {
 	return !TEARDOWN_SET.has(channel.state) && channel.hangupAt === undefined;
 }
+
+// ---------------------------------------------------------------------------------------------
+// media-sessions — which mediad instance holds which RTP session
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One entry in the `media-sessions` KV directory.
+ *
+ * ## The question it answers, and why nothing else could
+ *
+ * `rpc.media.v1.*` is served by a QUEUE GROUP, so NATS hands each request to whichever `mediad`
+ * happens to be free. That is right for `allocate-session` — any instance with a free port will do
+ * — and wrong for every command after it, because a session lives on exactly ONE instance: its
+ * sockets are bound there and its relay goroutines run there. A `bridge-sessions` delivered to the
+ * neighbour has nothing to bridge.
+ *
+ * Two designs were on the table (`plans/mediad-design.md` open question 2). Carrying an
+ * instance-specific reply subject and having the engine address it thereafter is simpler and needs
+ * no lookup, but it puts routing state in the engine, where an engine restart loses it and every
+ * live call becomes uncommandable. This directory survives that: any instance, and any engine, can
+ * ask "who owns session X?" and get the same answer.
+ *
+ * It is also the substrate open question 3 (real graceful drain) will need, which is the second
+ * reason it wins: draining means MOVING sessions, and you cannot move what you cannot enumerate.
+ *
+ * ## Why it is a directory and not a claim
+ *
+ * `park-claims` and `conference-claims` exist to make a race have exactly one winner, so they carry
+ * an expiry and are taken with `create`. Nothing races for a media session: `mediad` allocated it,
+ * `mediad` owns it, and the entry is a statement of fact written after the fact. So there is no
+ * `expiresAt` and no heartbeat — the bucket's TTL is the only backstop, and the real cleanup is the
+ * `release-session` handler deleting the key.
+ *
+ * ## Why the key is the session id alone
+ *
+ * The one other bucket not scoped by organization is `did-index`, for the same reason: the READER
+ * does not know the tenant. A `mediad` handed a `bridge-sessions` carrying two session ids has no
+ * org to scope a lookup with, and threading one through every command so the directory could be
+ * org-prefixed would be adding a field to the wire to satisfy a key format. The org travels in the
+ * value instead, where a reader that needs it has it.
+ *
+ * `.loose()`, like every other KV contract here: a value written by a process on its own release
+ * cadence must not be rejected for carrying a field this reader has not heard of.
+ */
+export const mediaSessionDirectoryEntrySchema = z
+	.object({
+		sessionId: z.string().min(1).max(128),
+		/** The `mediad` process that owns it. THE field this bucket exists for. */
+		instanceId: z.string().min(1).max(128),
+		orgId: z.string().min(1).max(128),
+		callId: z.string().min(1).max(128),
+		legId: z.string().max(128).optional(),
+		/** The advertised address and port — what went into the SDP answer's `c=`/`m=` lines. */
+		address: z.string().min(1).max(64),
+		rtpPort: z.number().int().min(1).max(65_534),
+		rtcpPort: z.number().int().min(1).max(65_535),
+		/** The codec the answer settled on, so a reader can tell what the session is carrying. */
+		codec: z.string().max(32).optional(),
+		/**
+		 * The relay this session is part of, when bridged.
+		 *
+		 * Present here as well as in `mediad`'s memory because it is what makes a bridge visible to
+		 * anything that is not the owning instance — an operator asking "who is this call talking
+		 * to", and eventually a drain that has to rebuild the relay on its new home.
+		 */
+		bridgeId: z.string().max(128).optional(),
+		allocatedAt: z.number(),
+	})
+	.loose();
+
+export type MediaSessionDirectoryEntry = z.infer<typeof mediaSessionDirectoryEntrySchema>;

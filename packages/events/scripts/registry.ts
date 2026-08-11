@@ -3,6 +3,7 @@ import { AUDIT_EVENT_DEFINITIONS } from "../src/schemas/audit-events";
 import { CALL_EVENT_DEFINITIONS } from "../src/schemas/call-events";
 import { CDR_EVENT_DEFINITIONS } from "../src/schemas/cdr-events";
 import { baseEventEnvelopeSchema } from "../src/schemas/envelope";
+import { MEDIA_EVENT_DEFINITIONS } from "../src/schemas/media-events";
 import { PROVISION_EVENT_DEFINITIONS } from "../src/schemas/provision-events";
 import { QUEUE_EVENT_DEFINITIONS } from "../src/schemas/queue-events";
 import { REGISTRATION_EVENT_DEFINITIONS } from "../src/schemas/registration-events";
@@ -175,6 +176,17 @@ function voicemailEntry(
 	};
 }
 
+function mediaEntry(type: keyof typeof MEDIA_EVENT_DEFINITIONS, goName: string): EventEntry {
+	return {
+		family: "media",
+		type,
+		goName: `${goName}Data`,
+		goConst: `EventType${goName}`,
+		data: MEDIA_EVENT_DEFINITIONS[type].data,
+		subjectTemplate: `media.evt.v1.<orgId>.<sessionId>.${type}`,
+	};
+}
+
 function provisionEntry(
 	type: keyof typeof PROVISION_EVENT_DEFINITIONS,
 	goName: string,
@@ -226,6 +238,9 @@ export const EVENT_ENTRIES: readonly EventEntry[] = [
 
 	voicemailEntry("message.left", "VoicemailMessageLeft"),
 	voicemailEntry("mwi.updated", "VoicemailMWIUpdated"),
+
+	mediaEntry("session.ended", "MediaSessionEnded"),
+	mediaEntry("session.rtp-timeout", "MediaSessionRTPTimeout"),
 
 	{
 		family: "cdr",
@@ -287,6 +302,37 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		request: RPC_CONTRACTS["rpc.sip.v1.credential"].request,
 		response: RPC_CONTRACTS["rpc.sip.v1.credential"].response,
 	},
+	// The media plane. Unlike every entry above, the RESPONDER for these is Go: apps/mediad
+	// unmarshals the generated request structs and marshals the generated response ones, which is
+	// what makes the emitted code a contract rather than documentation.
+	{
+		subject: "rpc.media.v1.allocate-session",
+		goName: "MediaAllocateSession",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.allocate-session"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.allocate-session"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.allocate-session"].response,
+	},
+	{
+		subject: "rpc.media.v1.bridge-sessions",
+		goName: "MediaBridgeSessions",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.bridge-sessions"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.bridge-sessions"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.bridge-sessions"].response,
+	},
+	{
+		subject: "rpc.media.v1.unbridge-sessions",
+		goName: "MediaUnbridgeSessions",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.unbridge-sessions"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.unbridge-sessions"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.unbridge-sessions"].response,
+	},
+	{
+		subject: "rpc.media.v1.release-session",
+		goName: "MediaReleaseSession",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.release-session"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.release-session"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.release-session"].response,
+	},
 ];
 
 /** The base envelope, emitted as JSON Schema only — its Go form is hand-written `Envelope[T]`. */
@@ -298,6 +344,7 @@ export const FAMILY_ORDER: readonly EventFamily[] = [
 	"registration",
 	"queue",
 	"voicemail",
+	"media",
 	"cdr",
 	"audit",
 	"provision",
@@ -309,6 +356,7 @@ export const FAMILY_FILE: Readonly<Record<EventFamily, string>> = {
 	registration: "registration_events",
 	queue: "queue_events",
 	voicemail: "voicemail_events",
+	media: "media_events",
 	cdr: "cdr_events",
 	audit: "audit_events",
 	provision: "provision_events",

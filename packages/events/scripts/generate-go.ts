@@ -7,6 +7,7 @@ import { z } from "zod";
 import { makeAuditEvent } from "../src/schemas/audit-events";
 import { makeCallEvent } from "../src/schemas/call-events";
 import { makeCdrLegWriteEvent } from "../src/schemas/cdr-events";
+import { makeMediaEvent } from "../src/schemas/media-events";
 import { makeProvisionEvent } from "../src/schemas/provision-events";
 import { makeQueueEvent } from "../src/schemas/queue-events";
 import { makeRegistrationEvent } from "../src/schemas/registration-events";
@@ -23,6 +24,7 @@ import {
 	CALL_EVENTS,
 	didIndexToken,
 	matchesSubject,
+	MEDIA_SESSION_EVENTS,
 	parseSubject,
 	QUEUE_EVENTS,
 	QUEUE_SCOPE_ALL,
@@ -329,8 +331,12 @@ function emitGo(
 			[
 				"Request-reply contracts for the rpc.* subjects (plan §3.5).",
 				"",
-				"Contracts only: transport is the application's business. rpc.media.* arrives with",
-				"apps/mediad and is deliberately absent until that service exists.",
+				"Contracts only: transport is the application's business.",
+				"",
+				"rpc.media.v1.* is the exception that proves the rule: apps/mediad is the RESPONDER for",
+				"those four, so the request/response structs below are the wire, not documentation. Both",
+				"ends must be raw NATS — a NestJS ClientProxy would wrap the payload in its own framing",
+				"and mediad would reject it. See packages/events/src/schemas/rpc.ts.",
 			],
 			"events",
 		),
@@ -400,6 +406,8 @@ const AGENT_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4f";
 const DEVICE_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b50";
 const MAILBOX_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51";
 const MESSAGE_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b52";
+const SESSION_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53";
+const MEDIAD_INSTANCE = "mediad-7c9f2a1b";
 /** DIDs in the two shapes the index has to reconcile: as stored, and as a carrier delivers it. */
 const DID_STORED = "+441632960111";
 const DID_DIALLED = "441632960111";
@@ -625,6 +633,46 @@ function eventSamples(): readonly {
 	});
 
 	samples.push({
+		name: "media.session.ended",
+		goType: "MediaSessionEndedData",
+		envelope: makeMediaEvent("session.ended", {
+			...next(),
+			source: "mediad",
+			orgId: ORG_A,
+			data: {
+				sessionId: SESSION_A,
+				instanceId: MEDIAD_INSTANCE,
+				callId: CALL_A,
+				legId: LEG_A,
+				rtpPort: 30_004,
+				packetsReceived: 2_100,
+				packetsSent: 2_098,
+				reason: "released",
+				durationMs: 42_000,
+			},
+		}),
+	});
+	samples.push({
+		name: "media.session.rtp-timeout",
+		goType: "MediaSessionRTPTimeoutData",
+		envelope: makeMediaEvent("session.rtp-timeout", {
+			...next(),
+			source: "mediad",
+			orgId: ORG_A,
+			data: {
+				sessionId: SESSION_A,
+				instanceId: MEDIAD_INSTANCE,
+				callId: CALL_A,
+				rtpPort: 30_004,
+				packetsReceived: 640,
+				packetsSent: 640,
+				silentForMs: 30_000,
+				remoteAddress: "203.0.113.9:41000",
+			},
+		}),
+	});
+
+	samples.push({
 		name: "cdr.leg.write",
 		goType: "CDRLegWriteData",
 		envelope: makeCdrLegWriteEvent({
@@ -742,6 +790,16 @@ function parityGolden(): unknown {
 			args: [ORG_A, MAILBOX_A, "mwi.updated"],
 			subject: subjectFor.voicemail(ORG_A, MAILBOX_A, "mwi.updated"),
 		},
+		{
+			builder: "media",
+			args: [ORG_A, SESSION_A, "session.ended"],
+			subject: subjectFor.media(ORG_A, SESSION_A, "session.ended"),
+		},
+		{
+			builder: "media",
+			args: [ORG_A, SESSION_A, "session.rtp-timeout"],
+			subject: subjectFor.media(ORG_A, SESSION_A, "session.rtp-timeout"),
+		},
 		{ builder: "cdrLeg", args: [ORG_A], subject: subjectFor.cdrLeg(ORG_A) },
 		{ builder: "audit", args: [ORG_A], subject: subjectFor.audit(ORG_A) },
 		{ builder: "provision", args: [ORG_A], subject: subjectFor.provision(ORG_A) },
@@ -797,6 +855,18 @@ function parityGolden(): unknown {
 			args: [ORG_A, "mwi.updated"],
 			result: subjectFilterFor.voicemailEventInOrg(ORG_A, "mwi.updated"),
 		},
+		{ filter: "allMedia", args: [], result: subjectFilterFor.allMedia() },
+		{ filter: "mediaInOrg", args: [ORG_A], result: subjectFilterFor.mediaInOrg(ORG_A) },
+		{
+			filter: "mediaSession",
+			args: [ORG_A, SESSION_A],
+			result: subjectFilterFor.mediaSession(ORG_A, SESSION_A),
+		},
+		{
+			filter: "mediaEventInOrg",
+			args: [ORG_A, "session.ended"],
+			result: subjectFilterFor.mediaEventInOrg(ORG_A, "session.ended"),
+		},
 		{ filter: "allCdrLegs", args: [], result: subjectFilterFor.allCdrLegs() },
 		{ filter: "cdrLegsInOrg", args: [ORG_A], result: subjectFilterFor.cdrLegsInOrg(ORG_A) },
 		{ filter: "allAudit", args: [], result: subjectFilterFor.allAudit() },
@@ -810,6 +880,7 @@ function parityGolden(): unknown {
 		subjectFor.registration(ORG_A, aorSubjectToken(AOR_CASES[0] as string), "registered"),
 		subjectFor.queue(ORG_A, QUEUE_A, "caller.joined"),
 		subjectFor.voicemail(ORG_A, MAILBOX_A, "message.left"),
+		subjectFor.media(ORG_A, SESSION_A, "session.rtp-timeout"),
 		subjectFor.cdrLeg(ORG_A),
 		subjectFor.audit(ORG_A),
 		subjectFor.provision(ORG_A),
@@ -900,6 +971,7 @@ function parityGolden(): unknown {
 				args: [ORG_A, QUEUE_A],
 				key: kvKeyFor.queueMembership(ORG_A, QUEUE_A),
 			},
+			{ builder: "mediaSession", args: [SESSION_A], key: kvKeyFor.mediaSession(SESSION_A) },
 		],
 		streams: EVENT_STREAMS.map((definition: StreamDefinition) => ({ ...definition })),
 		kvBuckets: KV_BUCKETS.map((definition: KvBucketDefinition) => ({ ...definition })),
@@ -911,6 +983,7 @@ function parityGolden(): unknown {
 			registration: [...REGISTRATION_EVENTS],
 			queue: [...QUEUE_EVENTS],
 			voicemail: [...VOICEMAIL_EVENTS],
+			media: [...MEDIA_SESSION_EVENTS],
 		},
 		eventTypes: EVENT_ENTRIES.map((entry) => ({
 			family: entry.family,

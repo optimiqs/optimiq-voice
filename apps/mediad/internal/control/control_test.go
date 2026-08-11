@@ -1,6 +1,7 @@
 package control_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,66 +11,126 @@ import (
 	"sync"
 	"testing"
 
+	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
+
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/control"
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/directory"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
 
 // The handlers are pure functions of the payload, so this whole suite runs with no broker and no
 // sockets. sipd draws the same line: the wire is left to the gated integration suite and the logic
 // is tested where it lives.
-//
+
+const (
+	testOrg     = "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
+	testCall    = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c"
+	testSession = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53"
+	thisNode    = "mediad-under-test"
+)
+
+// offerBody is what a phone actually sends: PCMU first, PCMA second, telephone-event on 101.
+const offerBody = "v=0\r\n" +
+	"o=- 12345 1 IN IP4 203.0.113.9\r\n" +
+	"s=-\r\n" +
+	"c=IN IP4 203.0.113.9\r\n" +
+	"t=0 0\r\n" +
+	"m=audio 41000 RTP/AVP 0 8 101\r\n" +
+	"a=rtpmap:0 PCMU/8000\r\n" +
+	"a=rtpmap:8 PCMA/8000\r\n" +
+	"a=rtpmap:101 telephone-event/8000\r\n" +
+	"a=sendrecv\r\n"
+
 // stubSessions stands in for *rtp.Manager.
 type stubSessions struct {
 	mu sync.Mutex
 
-	// allocErr, when set, is what Allocate returns.
-	allocErr error
-	// released records the ids Release was called with.
-	released []string
-	// allocated records the (id, mode) pairs Allocate was called with.
-	allocated []allocateCall
-	// live is the set of ids a Release should report as found.
-	live map[string]bool
+	allocErr  error
+	bridgeErr error
 
-	nextPort int
+	allocated  []rtp.AllocateOptions
+	bridged    []bridgeCall
+	unbridged  []string
+	released   []string
+	live       map[string]bool
+	bridges    map[string][]string
+	nextPort   int
+	audioForce uint8
 }
 
-type allocateCall struct {
-	id   string
-	mode rtp.Mode
+type bridgeCall struct {
+	bridgeID string
+	first    string
+	second   string
 }
 
 func newStub() *stubSessions {
-	return &stubSessions{live: make(map[string]bool), nextPort: 30000}
+	return &stubSessions{
+		live:     make(map[string]bool),
+		bridges:  make(map[string][]string),
+		nextPort: 30000,
+	}
 }
 
-func (s *stubSessions) Allocate(sessionID string, mode rtp.Mode) (rtp.Descriptor, error) {
+func (s *stubSessions) Allocate(opts rtp.AllocateOptions) (rtp.Descriptor, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.allocated = append(s.allocated, allocateCall{id: sessionID, mode: mode})
+	s.allocated = append(s.allocated, opts)
 	if s.allocErr != nil {
 		return rtp.Descriptor{}, s.allocErr
 	}
 
 	port := s.nextPort
 	s.nextPort += 2
-	s.live[sessionID] = true
+	s.live[opts.SessionID] = true
+
+	audio := opts.AudioPayloadType
+	if s.audioForce != 0 {
+		audio = s.audioForce
+	}
+	mode := rtp.ModeRelay
+	if opts.Inactive {
+		mode = rtp.ModeInactive
+	}
 	return rtp.Descriptor{
-		SessionID:    sessionID,
-		Address:      netip.MustParseAddr("203.0.113.10"),
-		RTPPort:      port,
-		RTCPPort:     port + 1,
-		SSRC:         0xfeedface,
-		Mode:         mode,
-		PayloadTypes: rtp.SupportedPayloadTypes(),
+		SessionID:                 opts.SessionID,
+		Address:                   netip.MustParseAddr("203.0.113.10"),
+		RTPPort:                   port,
+		RTCPPort:                  port + 1,
+		SSRC:                      0xfeedface,
+		Mode:                      mode,
+		AudioPayloadType:          audio,
+		TelephoneEventPayloadType: opts.TelephoneEventPayloadType,
 	}, nil
+}
+
+func (s *stubSessions) Bridge(bridgeID, first, second string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.bridged = append(s.bridged, bridgeCall{bridgeID, first, second})
+	if s.bridgeErr != nil {
+		return s.bridgeErr
+	}
+	s.bridges[bridgeID] = []string{first, second}
+	return nil
+}
+
+func (s *stubSessions) Unbridge(bridgeID string) ([]string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.unbridged = append(s.unbridged, bridgeID)
+	pair, ok := s.bridges[bridgeID]
+	if !ok {
+		return nil, false
+	}
+	delete(s.bridges, bridgeID)
+	return pair, true
 }
 
 func (s *stubSessions) Release(sessionID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	s.released = append(s.released, sessionID)
 	if s.live[sessionID] {
 		delete(s.live, sessionID)
@@ -78,213 +139,277 @@ func (s *stubSessions) Release(sessionID string) bool {
 	return false
 }
 
-func (s *stubSessions) calls() []allocateCall {
+func (s *stubSessions) allocateCalls() []rtp.AllocateOptions {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]allocateCall(nil), s.allocated...)
+	return append([]rtp.AllocateOptions(nil), s.allocated...)
 }
 
-func newServer(t *testing.T, sessions control.Sessions) *control.Server {
+type rig struct {
+	server   *control.Server
+	sessions *stubSessions
+	dir      *directory.FakeStore
+}
+
+func newRig(t *testing.T) *rig {
 	t.Helper()
+	sessions := newStub()
+	dir := directory.NewFakeStore()
 	// Discard logs: the refusal paths log at WARN, and a passing suite should be silent.
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server, err := control.NewServer(sessions, log)
+	server, err := control.NewServer(control.ServerOptions{
+		Sessions:   sessions,
+		Directory:  dir,
+		InstanceID: thisNode,
+		PublicAddr: netip.MustParseAddr("203.0.113.10"),
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	return server
+	return &rig{server: server, sessions: sessions, dir: dir}
 }
 
-func allocate(t *testing.T, server *control.Server, request any) control.AllocateResponse {
+func mustJSON(t *testing.T, value any) []byte {
 	t.Helper()
-	payload, err := json.Marshal(request)
+	payload, err := json.Marshal(value)
 	if err != nil {
-		t.Fatalf("marshalling the request: %v", err)
+		t.Fatalf("marshalling a request: %v", err)
 	}
-	var reply control.AllocateResponse
-	if err := json.Unmarshal(server.HandleAllocate(payload), &reply); err != nil {
-		t.Fatalf("the handler produced a reply that is not JSON: %v", err)
-	}
-	return reply
+	return payload
 }
 
-func release(t *testing.T, server *control.Server, request any) control.ReleaseResponse {
+func decodeAllocate(t *testing.T, raw []byte) contract.MediaAllocateSessionResponse {
 	t.Helper()
-	payload, err := json.Marshal(request)
-	if err != nil {
-		t.Fatalf("marshalling the request: %v", err)
+	var response contract.MediaAllocateSessionResponse
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatalf("decoding an allocate reply: %v\n%s", err, raw)
 	}
-	var reply control.ReleaseResponse
-	if err := json.Unmarshal(server.HandleRelease(payload), &reply); err != nil {
-		t.Fatalf("the handler produced a reply that is not JSON: %v", err)
-	}
-	return reply
+	return response
 }
 
-func TestNewServerRequiresASessionManager(t *testing.T) {
-	if _, err := control.NewServer(nil, nil); err == nil {
-		t.Error("NewServer accepted a nil session manager")
+func validAllocate() contract.MediaAllocateSessionRequest {
+	return contract.MediaAllocateSessionRequest{
+		SessionID: testSession,
+		OrgID:     testOrg,
+		CallID:    testCall,
+		SDPOffer:  offerBody,
+		Direction: "sendrecv",
 	}
 }
 
-// The v0 subjects are what the engine's client will hard-code until they are promoted into
-// packages/events. Pinning them here makes a rename a test failure rather than a silent
-// disconnection between two services that both start fine.
-func TestSubjectsAreVersionedV0(t *testing.T) {
-	if control.SubjectAllocate != "rpc.media.v0.allocate" {
-		t.Errorf("SubjectAllocate = %q", control.SubjectAllocate)
+func TestNewServerValidatesItsOptions(t *testing.T) {
+	valid := control.ServerOptions{
+		Sessions:   newStub(),
+		Directory:  directory.NewFakeStore(),
+		InstanceID: thisNode,
+		PublicAddr: netip.MustParseAddr("203.0.113.10"),
 	}
-	if control.SubjectRelease != "rpc.media.v0.release" {
-		t.Errorf("SubjectRelease = %q", control.SubjectRelease)
+
+	cases := map[string]func(*control.ServerOptions){
+		"no sessions":    func(o *control.ServerOptions) { o.Sessions = nil },
+		"no directory":   func(o *control.ServerOptions) { o.Directory = nil },
+		"no instance id": func(o *control.ServerOptions) { o.InstanceID = "" },
+		"no public addr": func(o *control.ServerOptions) { o.PublicAddr = netip.Addr{} },
 	}
-	// v0, not v1: the shape is not stable and nothing outside mediad and the engine's mediad
-	// client may depend on it. Promotion to packages/events makes it rpc.media.v1.*.
-	for _, subject := range []string{control.SubjectAllocate, control.SubjectRelease} {
-		if !strings.Contains(subject, ".v0.") {
-			t.Errorf("%q is not marked v0; see the package comment on promotion", subject)
+	for name, break_ := range cases {
+		t.Run(name, func(t *testing.T) {
+			opts := valid
+			break_(&opts)
+			if _, err := control.NewServer(opts); err == nil {
+				t.Errorf("NewServer accepted options with %s", name)
+			}
+		})
+	}
+}
+
+// The happy path, end to end through the handler: an offer in, an answer out, a directory entry
+// behind it.
+func TestAllocateAnswersAnOfferAndRecordsTheSession(t *testing.T) {
+	r := newRig(t)
+
+	response := decodeAllocate(t, r.server.HandleAllocateSession(mustJSON(t, validAllocate())))
+	if !response.Ok {
+		t.Fatalf("allocate refused: %+v", response)
+	}
+	if response.SDPAnswer == nil {
+		t.Fatal("the reply carries no SDP answer")
+	}
+
+	answer := *response.SDPAnswer
+	for _, line := range []string{
+		// The answer advertises the PUBLIC address and the session's REAL port.
+		"c=IN IP4 203.0.113.10",
+		"m=audio 30000 RTP/AVP 0 101",
+		"a=rtpmap:0 PCMU/8000",
+		"a=rtpmap:101 telephone-event/8000",
+		"a=sendrecv",
+		"a=rtcp:30001",
+	} {
+		if !strings.Contains(answer, line+"\r\n") {
+			t.Errorf("the answer is missing %q\n---\n%s", line, answer)
 		}
 	}
-}
 
-func TestAllocateReturnsTheDescriptor(t *testing.T) {
-	stub := newStub()
-	server := newServer(t, stub)
+	if response.InstanceID == nil || *response.InstanceID != thisNode {
+		t.Errorf("InstanceID = %v, want %q", response.InstanceID, thisNode)
+	}
+	if response.RtpPort == nil || *response.RtpPort != 30000 {
+		t.Errorf("RtpPort = %v, want 30000", response.RtpPort)
+	}
+	if response.RtcpPort == nil || *response.RtcpPort != 30001 {
+		t.Errorf("RtcpPort = %v, want 30001", response.RtcpPort)
+	}
+	if response.Codec == nil || *response.Codec != "PCMU" {
+		t.Errorf("Codec = %v, want PCMU", response.Codec)
+	}
+	if response.TelephoneEventPayloadType == nil || *response.TelephoneEventPayloadType != 101 {
+		t.Errorf("TelephoneEventPayloadType = %v, want 101", response.TelephoneEventPayloadType)
+	}
 
-	reply := allocate(t, server, control.AllocateRequest{
-		SessionID: "018f4f5e-0000-7000-8000-0000000000a1",
-		CallID:    "call-1",
-		Mode:      "echo",
-	})
+	// The negotiated types reach the packet path, which is what makes a session drop what its own
+	// answer did not agree to.
+	calls := r.sessions.allocateCalls()
+	if len(calls) != 1 {
+		t.Fatalf("Allocate called %d times, want 1", len(calls))
+	}
+	if calls[0].AudioPayloadType != rtp.PayloadTypePCMU {
+		t.Errorf("AudioPayloadType = %d, want PCMU", calls[0].AudioPayloadType)
+	}
+	if calls[0].TelephoneEventPayloadType != 101 {
+		t.Errorf("TelephoneEventPayloadType = %d, want 101", calls[0].TelephoneEventPayloadType)
+	}
+	if calls[0].OrgID != testOrg || calls[0].CallID != testCall {
+		t.Errorf("attribution = %+v, want the request's org and call", calls[0])
+	}
 
-	if !reply.OK {
-		t.Fatalf("allocate refused: %+v", reply)
+	entry, found, err := r.dir.Get(context.Background(), testSession)
+	if err != nil || !found {
+		t.Fatalf("no session directory entry was written (err=%v)", err)
 	}
-	if reply.SessionID != "018f4f5e-0000-7000-8000-0000000000a1" {
-		t.Errorf("SessionID = %q", reply.SessionID)
+	if entry.InstanceID != thisNode {
+		t.Errorf("directory InstanceID = %q, want %q", entry.InstanceID, thisNode)
 	}
-	// The ADVERTISED address, not the bind address: this is what goes in an SDP `c=` line.
-	if reply.Address != "203.0.113.10" {
-		t.Errorf("Address = %q", reply.Address)
+	if entry.RTPPort != 30000 || entry.RTCPPort != 30001 {
+		t.Errorf("directory ports = %d/%d, want 30000/30001", entry.RTPPort, entry.RTCPPort)
 	}
-	if reply.RTPPort != 30000 {
-		t.Errorf("RTPPort = %d", reply.RTPPort)
+	if entry.OrgID != testOrg || entry.CallID != testCall {
+		t.Errorf("directory attribution = %+v", entry)
 	}
-	// Always RTP+1, and stated explicitly so a caller never re-derives the convention.
-	if reply.RTCPPort != reply.RTPPort+1 {
-		t.Errorf("RTCPPort = %d, want %d", reply.RTCPPort, reply.RTPPort+1)
-	}
-	if reply.SSRC != 0xfeedface {
-		t.Errorf("SSRC = %#x", reply.SSRC)
-	}
-	if reply.Mode != "echo" {
-		t.Errorf("Mode = %q", reply.Mode)
-	}
-	// G.711 passthrough plus RFC 4733 — the v1 codec stance, on the wire so the SDP wave reads it
-	// instead of hard-coding the list engine-side.
-	want := []int{
-		int(rtp.PayloadTypePCMU), int(rtp.PayloadTypePCMA), int(rtp.PayloadTypeTelephoneEvent),
-	}
-	if len(reply.PayloadTypes) != len(want) {
-		t.Fatalf("PayloadTypes = %v, want %v", reply.PayloadTypes, want)
-	}
-	for i, pt := range want {
-		if reply.PayloadTypes[i] != pt {
-			t.Errorf("PayloadTypes[%d] = %d, want %d", i, reply.PayloadTypes[i], pt)
-		}
-	}
-	if reply.Error != "" || reply.Reason != "" {
-		t.Errorf("a successful reply carries an error: %q / %q", reply.Error, reply.Reason)
-	}
-}
-
-// An unset mode is the common case on the wire.
-func TestAllocateDefaultsTheMode(t *testing.T) {
-	stub := newStub()
-	server := newServer(t, stub)
-
-	reply := allocate(t, server, control.AllocateRequest{SessionID: "s1"})
-	if !reply.OK {
-		t.Fatalf("allocate refused: %+v", reply)
-	}
-	if reply.Mode != string(rtp.ModeEcho) {
-		t.Errorf("Mode = %q, want the %q default", reply.Mode, rtp.ModeEcho)
-	}
-	if calls := stub.calls(); len(calls) != 1 || calls[0].mode != rtp.ModeEcho {
-		t.Errorf("the manager was called with %+v", calls)
+	if entry.AllocatedAt == 0 {
+		t.Error("directory entry has no allocation timestamp")
 	}
 }
 
-func TestAllocatePassesInactiveThrough(t *testing.T) {
-	stub := newStub()
-	server := newServer(t, stub)
+// An offer that prefers PCMA gets a PCMA answer. Preference order is honoured because an endpoint
+// that lists PCMA first usually encodes it natively.
+func TestAllocateHonoursTheOffererPreference(t *testing.T) {
+	r := newRig(t)
+	request := validAllocate()
+	request.SDPOffer = strings.Replace(offerBody,
+		"m=audio 41000 RTP/AVP 0 8 101", "m=audio 41000 RTP/AVP 8 0 101", 1)
 
-	reply := allocate(t, server, control.AllocateRequest{SessionID: "s1", Mode: "inactive"})
-	if !reply.OK {
-		t.Fatalf("allocate refused: %+v", reply)
+	response := decodeAllocate(t, r.server.HandleAllocateSession(mustJSON(t, request)))
+	if !response.Ok {
+		t.Fatalf("allocate refused: %+v", response)
 	}
-	if calls := stub.calls(); len(calls) != 1 || calls[0].mode != rtp.ModeInactive {
-		t.Errorf("the manager was called with %+v", calls)
+	if response.Codec == nil || *response.Codec != "PCMA" {
+		t.Errorf("Codec = %v, want PCMA", response.Codec)
+	}
+	if !strings.Contains(*response.SDPAnswer, "m=audio 30000 RTP/AVP 8 101\r\n") {
+		t.Errorf("the answer did not settle on PCMA\n---\n%s", *response.SDPAnswer)
 	}
 }
 
-// Every refusal is a REPLY. A responder that stays silent is indistinguishable from a crashed one,
-// and the caller pays the full timeout to learn nothing.
-func TestAllocateRefusalsAreAlwaysReplies(t *testing.T) {
+// A ringing leg answers `inactive` and the session is created inactive, so no audio is sourced
+// before the call is answered.
+func TestAllocateAnInactiveLeg(t *testing.T) {
+	r := newRig(t)
+	request := validAllocate()
+	request.Direction = "inactive"
+
+	response := decodeAllocate(t, r.server.HandleAllocateSession(mustJSON(t, request)))
+	if !response.Ok {
+		t.Fatalf("allocate refused: %+v", response)
+	}
+	if !strings.Contains(*response.SDPAnswer, "a=inactive\r\n") {
+		t.Errorf("the answer is not inactive\n---\n%s", *response.SDPAnswer)
+	}
+	if calls := r.sessions.allocateCalls(); len(calls) != 1 || !calls[0].Inactive {
+		t.Errorf("the session was not created inactive: %+v", calls)
+	}
+}
+
+func TestAllocateRefusals(t *testing.T) {
+	noG711 := strings.NewReplacer(
+		"m=audio 41000 RTP/AVP 0 8 101", "m=audio 41000 RTP/AVP 9 111",
+		"a=rtpmap:0 PCMU/8000", "a=rtpmap:9 G722/8000",
+		"a=rtpmap:8 PCMA/8000", "a=rtpmap:111 opus/48000/2",
+	).Replace(offerBody)
+
 	cases := []struct {
 		name       string
-		payload    []byte
+		mutate     func(*contract.MediaAllocateSessionRequest)
 		allocErr   error
 		wantReason string
-		wantErrHas string
 	}{
 		{
-			name:       "malformed json",
-			payload:    []byte(`{"sessionId":`),
-			wantReason: control.ReasonBadRequest,
-			wantErrHas: "malformed allocate request",
-		},
-		{
-			name:       "not json at all",
-			payload:    []byte(`sessionId=s1`),
-			wantReason: control.ReasonBadRequest,
-			wantErrHas: "malformed allocate request",
-		},
-		{
-			// The id is the caller's to assign — see AllocateRequest.SessionID.
 			name:       "no session id",
-			payload:    []byte(`{"callId":"call-1"}`),
+			mutate:     func(rq *contract.MediaAllocateSessionRequest) { rq.SessionID = "" },
 			wantReason: control.ReasonBadRequest,
-			wantErrHas: "sessionId is required",
 		},
 		{
-			name:       "empty session id",
-			payload:    []byte(`{"sessionId":""}`),
+			name:       "no call id",
+			mutate:     func(rq *contract.MediaAllocateSessionRequest) { rq.CallID = "" },
 			wantReason: control.ReasonBadRequest,
-			wantErrHas: "sessionId is required",
 		},
 		{
-			name:       "unknown mode",
-			payload:    []byte(`{"sessionId":"s1","mode":"sendrecv"}`),
+			// Without an org there is no subject token for the lifecycle events, so the session
+			// would end silently and the engine would never learn why.
+			name:       "no org id",
+			mutate:     func(rq *contract.MediaAllocateSessionRequest) { rq.OrgID = "" },
 			wantReason: control.ReasonBadRequest,
-			wantErrHas: "unknown media mode",
 		},
 		{
-			// A load signal, not a fault: the engine routes around it.
+			name:       "no offer",
+			mutate:     func(rq *contract.MediaAllocateSessionRequest) { rq.SDPOffer = "" },
+			wantReason: control.ReasonBadRequest,
+		},
+		{
+			name:       "unparseable offer",
+			mutate:     func(rq *contract.MediaAllocateSessionRequest) { rq.SDPOffer = "not sdp at all" },
+			wantReason: control.ReasonBadRequest,
+		},
+		{
+			name:       "unknown direction",
+			mutate:     func(rq *contract.MediaAllocateSessionRequest) { rq.Direction = "duplex" },
+			wantReason: control.ReasonBadRequest,
+		},
+		{
+			// A perfectly valid offer this media plane cannot serve. The engine's recovery is to
+			// route the leg to Asterisk, not to fix the bytes and retry — a different reason code.
+			name:       "no common codec",
+			mutate:     func(rq *contract.MediaAllocateSessionRequest) { rq.SDPOffer = noG711 },
+			wantReason: control.ReasonNotSupported,
+		},
+		{
+			// Hold is rung 5. Answering sendrecv to a sendonly request would put a held caller back
+			// into the conversation, so it is refused by name rather than downgraded.
+			name:       "hold is not supported yet",
+			mutate:     func(rq *contract.MediaAllocateSessionRequest) { rq.Direction = "sendonly" },
+			wantReason: control.ReasonNotSupported,
+		},
+		{
 			name:       "ports exhausted",
-			payload:    []byte(`{"sessionId":"s1"}`),
 			allocErr:   rtp.ErrPortsExhausted,
 			wantReason: control.ReasonCapacity,
 		},
 		{
-			// Do not retry HERE — this instance is going away.
 			name:       "shutting down",
-			payload:    []byte(`{"sessionId":"s1"}`),
 			allocErr:   rtp.ErrClosed,
 			wantReason: control.ReasonShuttingDown,
 		},
 		{
 			name:       "anything else",
-			payload:    []byte(`{"sessionId":"s1"}`),
 			allocErr:   errors.New("the socket layer fell over"),
 			wantReason: control.ReasonInternal,
 		},
@@ -292,211 +417,345 @@ func TestAllocateRefusalsAreAlwaysReplies(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			stub := newStub()
-			stub.allocErr = tc.allocErr
-			server := newServer(t, stub)
-
-			raw := server.HandleAllocate(tc.payload)
-			if len(raw) == 0 {
-				t.Fatal("the handler produced no reply; a refusal must still be a reply")
-			}
-			var reply control.AllocateResponse
-			if err := json.Unmarshal(raw, &reply); err != nil {
-				t.Fatalf("the reply is not JSON: %v", err)
+			r := newRig(t)
+			r.sessions.allocErr = tc.allocErr
+			request := validAllocate()
+			if tc.mutate != nil {
+				tc.mutate(&request)
 			}
 
-			if reply.OK {
-				t.Fatalf("the handler accepted a bad request: %+v", reply)
+			response := decodeAllocate(t, r.server.HandleAllocateSession(mustJSON(t, request)))
+			if response.Ok {
+				t.Fatalf("allocate succeeded; want a refusal with reason %q", tc.wantReason)
 			}
-			if reply.Reason != tc.wantReason {
-				t.Errorf("Reason = %q, want %q", reply.Reason, tc.wantReason)
+			if response.Reason == nil || string(*response.Reason) != tc.wantReason {
+				t.Errorf("reason = %v, want %q", response.Reason, tc.wantReason)
 			}
-			if reply.Error == "" {
-				t.Error("a refusal must carry a human-readable Error alongside its Reason")
+			// A refusal is a REPLY: it always says something a human can read, and always names the
+			// instance so a support ticket can point at a process.
+			if response.Error == nil || *response.Error == "" {
+				t.Error("a refusal carried no error message")
 			}
-			if tc.wantErrHas != "" && !strings.Contains(reply.Error, tc.wantErrHas) {
-				t.Errorf("Error = %q, want it to mention %q", reply.Error, tc.wantErrHas)
+			if response.InstanceID == nil || *response.InstanceID != thisNode {
+				t.Errorf("a refusal did not name the instance: %v", response.InstanceID)
 			}
-			// A refusal must not leak a port number the caller might act on.
-			if reply.RTPPort != 0 {
-				t.Errorf("a refusal carries RTPPort %d", reply.RTPPort)
+			if r.dir.Len() != 0 {
+				t.Error("a refused allocate wrote a session directory entry")
 			}
 		})
 	}
 }
 
-// A bad request must never reach the packet path.
-func TestAllocateDoesNotTouchTheManagerOnABadRequest(t *testing.T) {
-	stub := newStub()
-	server := newServer(t, stub)
+// Malformed bytes are answered, not dropped. A responder that stays silent is indistinguishable
+// from a crashed one and the caller pays the whole timeout to learn nothing.
+func TestEveryHandlerAnswersGarbage(t *testing.T) {
+	r := newRig(t)
+	garbage := []byte("{not json")
 
-	server.HandleAllocate([]byte(`{"sessionId":"s1","mode":"nonsense"}`))
-	server.HandleAllocate([]byte(`{}`))
-	server.HandleAllocate([]byte(`not json`))
-
-	if calls := stub.calls(); len(calls) != 0 {
-		t.Errorf("the manager was called %d times for requests that never validated: %+v",
-			len(calls), calls)
-	}
-}
-
-func TestReleaseReportsWhetherThereWasASession(t *testing.T) {
-	stub := newStub()
-	server := newServer(t, stub)
-
-	if reply := allocate(t, server, control.AllocateRequest{SessionID: "s1"}); !reply.OK {
-		t.Fatalf("allocate refused: %+v", reply)
-	}
-
-	first := release(t, server, control.ReleaseRequest{SessionID: "s1"})
-	if !first.OK || !first.Released {
-		t.Errorf("first release = %+v, want ok and released", first)
-	}
-
-	// Release is idempotent, and a retry after a lost reply must NOT look like an error: OK stays
-	// true and Released reports the truth.
-	second := release(t, server, control.ReleaseRequest{SessionID: "s1"})
-	if !second.OK {
-		t.Errorf("releasing an unknown session must succeed: %+v", second)
-	}
-	if second.Released {
-		t.Error("the second release claimed to have released something")
-	}
-	if second.Error != "" || second.Reason != "" {
-		t.Errorf("a repeat release carries an error: %q / %q", second.Error, second.Reason)
-	}
-}
-
-func TestReleaseRefusalsAreAlwaysReplies(t *testing.T) {
-	cases := []struct {
-		name       string
-		payload    []byte
-		wantErrHas string
-	}{
-		{"malformed json", []byte(`{"sessionId":`), "malformed release request"},
-		{"no session id", []byte(`{}`), "sessionId is required"},
-		{"empty session id", []byte(`{"sessionId":""}`), "sessionId is required"},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			stub := newStub()
-			server := newServer(t, stub)
-
-			var reply control.ReleaseResponse
-			raw := server.HandleRelease(tc.payload)
-			if err := json.Unmarshal(raw, &reply); err != nil {
-				t.Fatalf("the reply is not JSON: %v", err)
+	for name, reply := range map[string][]byte{
+		"allocate": r.server.HandleAllocateSession(garbage),
+		"bridge":   r.server.HandleBridgeSessions(garbage),
+		"unbridge": r.server.HandleUnbridgeSessions(garbage),
+		"release":  r.server.HandleReleaseSession(garbage),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var envelope struct {
+				OK     bool   `json:"ok"`
+				Reason string `json:"reason"`
+				Error  string `json:"error"`
 			}
-			if reply.OK {
-				t.Fatalf("the handler accepted a bad request: %+v", reply)
+			if err := json.Unmarshal(reply, &envelope); err != nil {
+				t.Fatalf("the reply to garbage is not JSON: %v\n%s", err, reply)
 			}
-			if reply.Reason != control.ReasonBadRequest {
-				t.Errorf("Reason = %q, want %q", reply.Reason, control.ReasonBadRequest)
+			if envelope.OK {
+				t.Error("garbage was accepted")
 			}
-			if !strings.Contains(reply.Error, tc.wantErrHas) {
-				t.Errorf("Error = %q, want it to mention %q", reply.Error, tc.wantErrHas)
+			if envelope.Reason != control.ReasonBadRequest {
+				t.Errorf("reason = %q, want %q", envelope.Reason, control.ReasonBadRequest)
 			}
-			if len(stub.released) != 0 {
-				t.Errorf("the manager was asked to release %v for an invalid request", stub.released)
+			if envelope.Error == "" {
+				t.Error("the refusal carried no message")
 			}
 		})
 	}
 }
 
-// The wire format is the CONTRACT: the engine's client is TypeScript and reads these exact field
-// names. A rename here is a silent break there, so the JSON is pinned rather than the struct.
-func TestWireFieldNames(t *testing.T) {
-	stub := newStub()
-	server := newServer(t, stub)
-
-	var decoded map[string]any
-	if err := json.Unmarshal(
-		server.HandleAllocate([]byte(`{"sessionId":"s1","callId":"c1","mode":"echo"}`)),
-		&decoded,
-	); err != nil {
-		t.Fatalf("the reply is not JSON: %v", err)
+func decodeBridge(t *testing.T, raw []byte) contract.MediaBridgeSessionsResponse {
+	t.Helper()
+	var response contract.MediaBridgeSessionsResponse
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatalf("decoding a bridge reply: %v\n%s", err, raw)
 	}
+	return response
+}
 
-	for _, field := range []string{"ok", "sessionId", "address", "rtpPort", "rtcpPort", "ssrc", "mode", "payloadTypes"} {
-		if _, ok := decoded[field]; !ok {
-			t.Errorf("a successful allocate reply is missing %q; the fields are camelCase, as "+
-				"every other contract in packages/events is", field)
+func TestBridgeRelaysTwoSessionsAndNotesItInTheDirectory(t *testing.T) {
+	r := newRig(t)
+	for _, id := range []string{"leg-a", "leg-b"} {
+		request := validAllocate()
+		request.SessionID = id
+		if response := decodeAllocate(t, r.server.HandleAllocateSession(mustJSON(t, request))); !response.Ok {
+			t.Fatalf("allocating %s: %+v", id, response)
 		}
 	}
-	// Optional fields must be absent rather than present-and-empty, so a caller can tell "no
-	// error" from "an empty error".
-	if _, ok := decoded["error"]; ok {
-		t.Error("a successful reply carries an `error` key")
+
+	reply := r.server.HandleBridgeSessions(mustJSON(t, contract.MediaBridgeSessionsRequest{
+		BridgeID:   "bridge-1",
+		SessionIDs: []string{"leg-a", "leg-b"},
+	}))
+	response := decodeBridge(t, reply)
+	if !response.Ok {
+		t.Fatalf("bridge refused: %+v", response)
+	}
+	if len(response.SessionIDs) != 2 {
+		t.Errorf("SessionIDs = %v, want both legs", response.SessionIDs)
 	}
 
-	// The request side must accept exactly the names the engine will send.
-	var request control.AllocateRequest
-	if err := json.Unmarshal([]byte(`{"sessionId":"s1","callId":"c1","mode":"inactive"}`), &request); err != nil {
-		t.Fatalf("decoding a request: %v", err)
-	}
-	if request.SessionID != "s1" || request.CallID != "c1" || request.Mode != "inactive" {
-		t.Errorf("request decoded as %+v", request)
+	for _, id := range []string{"leg-a", "leg-b"} {
+		entry, found, err := r.dir.Get(context.Background(), id)
+		if err != nil || !found {
+			t.Fatalf("%s has no directory entry", id)
+		}
+		if entry.BridgeID != "bridge-1" {
+			// A bridge that is invisible outside its own instance is a bridge a drain cannot move
+			// and an operator cannot explain.
+			t.Errorf("%s directory BridgeID = %q, want bridge-1", id, entry.BridgeID)
+		}
 	}
 }
 
-// Both deadlines are on the call path, where a slow reply is the same as a broken one. The shape
-// mirrors packages/events-go's TimeoutXxxRPC constants, which is where these move on promotion.
-func TestTimeoutsAreShortEnoughToSitInsideACallSetup(t *testing.T) {
-	if control.TimeoutAllocateRPC <= 0 || control.TimeoutAllocateRPC > 2_000_000_000 {
-		t.Errorf("TimeoutAllocateRPC = %s; allocate binds a socket and should answer in "+
-			"microseconds", control.TimeoutAllocateRPC)
+func TestBridgeRefusals(t *testing.T) {
+	t.Run("three sessions is a conference, not a bridge", func(t *testing.T) {
+		r := newRig(t)
+		response := decodeBridge(t, r.server.HandleBridgeSessions(
+			mustJSON(t, contract.MediaBridgeSessionsRequest{
+				BridgeID:   "bridge-1",
+				SessionIDs: []string{"a", "b", "c"},
+			})))
+		if response.Ok {
+			t.Fatal("a three-way bridge was accepted")
+		}
+		if response.Reason == nil || string(*response.Reason) != control.ReasonNotSupported {
+			t.Errorf("reason = %v, want not_supported", response.Reason)
+		}
+		if response.Error == nil || !strings.Contains(*response.Error, "rung 6") {
+			// A not-supported refusal must name the capability, so the reader knows whether to wait
+			// for it or design around it.
+			t.Errorf("the refusal does not name the missing capability: %v", response.Error)
+		}
+	})
+
+	t.Run("no bridge id", func(t *testing.T) {
+		r := newRig(t)
+		response := decodeBridge(t, r.server.HandleBridgeSessions(
+			mustJSON(t, contract.MediaBridgeSessionsRequest{SessionIDs: []string{"a", "b"}})))
+		if response.Ok || response.Reason == nil || string(*response.Reason) != control.ReasonBadRequest {
+			t.Errorf("a bridge with no id was not refused as bad_request: %+v", response)
+		}
+	})
+
+	t.Run("codec mismatch is not supported", func(t *testing.T) {
+		r := newRig(t)
+		r.sessions.bridgeErr = rtp.ErrCodecMismatch
+		response := decodeBridge(t, r.server.HandleBridgeSessions(
+			mustJSON(t, contract.MediaBridgeSessionsRequest{
+				BridgeID:   "bridge-1",
+				SessionIDs: []string{"a", "b"},
+			})))
+		if response.Reason == nil || string(*response.Reason) != control.ReasonNotSupported {
+			t.Errorf("reason = %v, want not_supported", response.Reason)
+		}
+	})
+
+	t.Run("an unknown session on this instance", func(t *testing.T) {
+		r := newRig(t)
+		r.sessions.bridgeErr = rtp.ErrUnknownSession
+		response := decodeBridge(t, r.server.HandleBridgeSessions(
+			mustJSON(t, contract.MediaBridgeSessionsRequest{
+				BridgeID:   "bridge-1",
+				SessionIDs: []string{"a", "b"},
+			})))
+		if response.Reason == nil || string(*response.Reason) != control.ReasonUnknown {
+			t.Errorf("reason = %v, want unknown_session", response.Reason)
+		}
+	})
+
+	// THE reason the directory exists: "somebody else has it" and "nobody has it" need opposite
+	// recoveries, and answering the wrong one tears down a healthy call during a scale-out.
+	t.Run("a session that lives on another instance", func(t *testing.T) {
+		r := newRig(t)
+		r.sessions.bridgeErr = rtp.ErrUnknownSession
+		if err := r.dir.Put(context.Background(), directory.Entry{
+			SessionID:  "leg-b",
+			InstanceID: "mediad-somewhere-else",
+			OrgID:      testOrg,
+			CallID:     testCall,
+			Address:    "203.0.113.11",
+			RTPPort:    31000,
+			RTCPPort:   31001,
+		}); err != nil {
+			t.Fatalf("seeding the directory: %v", err)
+		}
+
+		response := decodeBridge(t, r.server.HandleBridgeSessions(
+			mustJSON(t, contract.MediaBridgeSessionsRequest{
+				BridgeID:   "bridge-1",
+				SessionIDs: []string{"leg-a", "leg-b"},
+			})))
+		if response.Reason == nil || string(*response.Reason) != control.ReasonWrongNode {
+			t.Errorf("reason = %v, want wrong_instance", response.Reason)
+		}
+	})
+}
+
+func decodeUnbridge(t *testing.T, raw []byte) contract.MediaUnbridgeSessionsResponse {
+	t.Helper()
+	var response contract.MediaUnbridgeSessionsResponse
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatalf("decoding an unbridge reply: %v\n%s", err, raw)
 	}
-	if control.TimeoutReleaseRPC <= 0 || control.TimeoutReleaseRPC > 2_000_000_000 {
-		t.Errorf("TimeoutReleaseRPC = %s", control.TimeoutReleaseRPC)
+	return response
+}
+
+func TestUnbridgeIsIdempotentAndClearsTheDirectory(t *testing.T) {
+	r := newRig(t)
+	for _, id := range []string{"leg-a", "leg-b"} {
+		request := validAllocate()
+		request.SessionID = id
+		r.server.HandleAllocateSession(mustJSON(t, request))
+	}
+	r.server.HandleBridgeSessions(mustJSON(t, contract.MediaBridgeSessionsRequest{
+		BridgeID:   "bridge-1",
+		SessionIDs: []string{"leg-a", "leg-b"},
+	}))
+
+	first := decodeUnbridge(t, r.server.HandleUnbridgeSessions(
+		mustJSON(t, contract.MediaUnbridgeSessionsRequest{BridgeID: "bridge-1"})))
+	if !first.Ok || !first.Unbridged {
+		t.Fatalf("the first unbridge did nothing: %+v", first)
+	}
+	for _, id := range []string{"leg-a", "leg-b"} {
+		entry, _, _ := r.dir.Get(context.Background(), id)
+		if entry.BridgeID != "" {
+			t.Errorf("%s still shows bridge %q after an unbridge", id, entry.BridgeID)
+		}
+	}
+
+	// A retry after a lost reply must not look like a failure.
+	second := decodeUnbridge(t, r.server.HandleUnbridgeSessions(
+		mustJSON(t, contract.MediaUnbridgeSessionsRequest{BridgeID: "bridge-1"})))
+	if !second.Ok {
+		t.Errorf("a repeat unbridge was refused: %+v", second)
+	}
+	if second.Unbridged {
+		t.Error("a repeat unbridge claimed to have done something")
 	}
 }
 
-// Subscribe needs a real connection; a nil one is a programming error refused at wiring time
-// rather than at the first request.
+func decodeRelease(t *testing.T, raw []byte) contract.MediaReleaseSessionResponse {
+	t.Helper()
+	var response contract.MediaReleaseSessionResponse
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatalf("decoding a release reply: %v\n%s", err, raw)
+	}
+	return response
+}
+
+// The directory delete is part of the CONTRACT: an entry that outlives its session is an instance
+// name the engine keeps routing dead commands to.
+func TestReleaseFreesTheSessionAndTheDirectoryEntry(t *testing.T) {
+	r := newRig(t)
+	if response := decodeAllocate(t, r.server.HandleAllocateSession(mustJSON(t, validAllocate()))); !response.Ok {
+		t.Fatalf("allocate: %+v", response)
+	}
+	if r.dir.Len() != 1 {
+		t.Fatalf("directory holds %d entries after an allocate, want 1", r.dir.Len())
+	}
+
+	response := decodeRelease(t, r.server.HandleReleaseSession(
+		mustJSON(t, contract.MediaReleaseSessionRequest{SessionID: testSession})))
+	if !response.Ok || !response.Released {
+		t.Fatalf("release: %+v", response)
+	}
+	if r.dir.Len() != 0 {
+		t.Errorf("directory still holds %d entries after a release", r.dir.Len())
+	}
+}
+
+// Releasing something this instance never had is a SUCCESS that still clears the directory: that is
+// exactly the shape of a retry that landed on the wrong node after a failover.
+func TestReleaseOfAnUnknownSessionSucceedsAndStillCleansUp(t *testing.T) {
+	r := newRig(t)
+	if err := r.dir.Put(context.Background(), directory.Entry{
+		SessionID:  "ghost",
+		InstanceID: "mediad-somewhere-else",
+		OrgID:      testOrg,
+		CallID:     testCall,
+		Address:    "203.0.113.11",
+		RTPPort:    31000,
+		RTCPPort:   31001,
+	}); err != nil {
+		t.Fatalf("seeding the directory: %v", err)
+	}
+
+	response := decodeRelease(t, r.server.HandleReleaseSession(
+		mustJSON(t, contract.MediaReleaseSessionRequest{SessionID: "ghost"})))
+	if !response.Ok {
+		t.Fatalf("release of an unknown session was refused: %+v", response)
+	}
+	if response.Released {
+		t.Error("release claimed to have torn down a session this instance never had")
+	}
+	if r.dir.Len() != 0 {
+		t.Error("the stale directory entry survived the release")
+	}
+}
+
+func TestReleaseWithoutASessionIDIsRefused(t *testing.T) {
+	r := newRig(t)
+	response := decodeRelease(t, r.server.HandleReleaseSession(
+		mustJSON(t, contract.MediaReleaseSessionRequest{})))
+	if response.Ok {
+		t.Fatal("a release with no session id was accepted")
+	}
+	if response.Reason == nil || string(*response.Reason) != control.ReasonBadRequest {
+		t.Errorf("reason = %v, want bad_request", response.Reason)
+	}
+}
+
+// A directory that cannot be written must not fail a call. The session is already bound and
+// answerable; failing here would fail the call AND hold the port until the reaper.
+func TestAllocateSurvivesADirectoryFailure(t *testing.T) {
+	r := newRig(t)
+	r.dir.PutErr = errors.New("the broker is unwell")
+
+	response := decodeAllocate(t, r.server.HandleAllocateSession(mustJSON(t, validAllocate())))
+	if !response.Ok {
+		t.Fatalf("a KV failure failed the allocate: %+v", response)
+	}
+	if response.SDPAnswer == nil {
+		t.Error("no answer was produced")
+	}
+}
+
+// The subjects this service answers are the contract's, not a local copy.
+func TestSubjectsComeFromTheContract(t *testing.T) {
+	cases := map[string]string{
+		control.SubjectAllocateSession:  "rpc.media.v1.allocate-session",
+		control.SubjectBridgeSessions:   "rpc.media.v1.bridge-sessions",
+		control.SubjectUnbridgeSessions: "rpc.media.v1.unbridge-sessions",
+		control.SubjectReleaseSession:   "rpc.media.v1.release-session",
+	}
+	for got, want := range cases {
+		if got != want {
+			t.Errorf("subject = %q, want %q", got, want)
+		}
+	}
+}
+
 func TestSubscribeRequiresAConnection(t *testing.T) {
-	server := newServer(t, newStub())
-	if _, err := server.Subscribe(nil, "mediad"); err == nil {
+	r := newRig(t)
+	if _, err := r.server.Subscribe(nil, "mediad"); err == nil {
 		t.Error("Subscribe accepted a nil connection")
-	}
-}
-
-// A regression test for a bug a Go-to-Go round trip cannot see.
-//
-// `[]uint8` is `[]byte` to Go, and encoding/json marshals `[]byte` as a base64 STRING. The reply
-// carried `"payloadTypes":"AAhl"` instead of `[0,8,101]`, which decodes back to the right thing in
-// Go and is simply the wrong type to the TypeScript engine. Only an assertion against the actual
-// JSON catches it, so this test reads the raw value rather than unmarshalling into the response
-// struct.
-func TestPayloadTypesAreAJSONArrayNotBase64(t *testing.T) {
-	server := newServer(t, newStub())
-
-	raw := server.HandleAllocate([]byte(`{"sessionId":"s1"}`))
-
-	var decoded map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		t.Fatalf("the reply is not JSON: %v", err)
-	}
-	field, ok := decoded["payloadTypes"]
-	if !ok {
-		t.Fatal("the reply has no payloadTypes")
-	}
-	if field[0] != '[' {
-		t.Fatalf("payloadTypes is %s, want a JSON array; a []uint8 field marshals as base64 and "+
-			"the TypeScript engine would receive a string", field)
-	}
-
-	var payloadTypes []int
-	if err := json.Unmarshal(field, &payloadTypes); err != nil {
-		t.Fatalf("payloadTypes is not an array of numbers: %v", err)
-	}
-	want := []int{0, 8, 101} // PCMU, PCMA, telephone-event
-	if len(payloadTypes) != len(want) {
-		t.Fatalf("payloadTypes = %v, want %v", payloadTypes, want)
-	}
-	for i := range want {
-		if payloadTypes[i] != want[i] {
-			t.Errorf("payloadTypes[%d] = %d, want %d", i, payloadTypes[i], want[i])
-		}
 	}
 }

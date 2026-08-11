@@ -48,6 +48,8 @@ var EventTypes = []EventTypeInfo{
 	{Family: FamilyQueue, Type: EventTypeQueueAgentState, SubjectTemplate: "queue.evt.v1.<orgId>.<queueId>.agent.state"},
 	{Family: FamilyVoicemail, Type: EventTypeVoicemailMessageLeft, SubjectTemplate: "voicemail.evt.v1.<orgId>.<mailboxId>.message.left"},
 	{Family: FamilyVoicemail, Type: EventTypeVoicemailMWIUpdated, SubjectTemplate: "voicemail.evt.v1.<orgId>.<mailboxId>.mwi.updated"},
+	{Family: FamilyMedia, Type: EventTypeMediaSessionEnded, SubjectTemplate: "media.evt.v1.<orgId>.<sessionId>.session.ended"},
+	{Family: FamilyMedia, Type: EventTypeMediaSessionRTPTimeout, SubjectTemplate: "media.evt.v1.<orgId>.<sessionId>.session.rtp-timeout"},
 	{Family: FamilyCDR, Type: EventTypeCDRLegWrite, SubjectTemplate: "cdr.leg.v1.<orgId>"},
 	{Family: FamilyAudit, Type: EventTypeAuditRecorded, SubjectTemplate: "audit.evt.v1.<orgId>"},
 	{Family: FamilyProvision, Type: EventTypeProvisionDeviceRequested, SubjectTemplate: "provision.evt.v1.<orgId>"},
@@ -120,6 +122,10 @@ func NewDataFor(eventType string) any {
 		return new(VoicemailMessageLeftData)
 	case EventTypeVoicemailMWIUpdated:
 		return new(VoicemailMWIUpdatedData)
+	case EventTypeMediaSessionEnded:
+		return new(MediaSessionEndedData)
+	case EventTypeMediaSessionRTPTimeout:
+		return new(MediaSessionRTPTimeoutData)
 	case EventTypeCDRLegWrite:
 		return new(CDRLegWriteData)
 	case EventTypeAuditRecorded:

@@ -86,6 +86,22 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		return this.env.NATS_URL;
 	}
 
+	/**
+	 * The raw connection, for the one caller that needs core request-reply with NO Nest framing.
+	 *
+	 * Exposed rather than duplicated: `rpc.media.v1.*` is served by a Go responder that unmarshals
+	 * the bare contract struct, so its client cannot be a `ClientProxy` (see
+	 * `media/mediad-transport.ts`), and opening a THIRD connection to the same broker would be a
+	 * third thing to authenticate, drain and reconnect for no benefit.
+	 *
+	 * `undefined` before `onModuleInit` has run and after shutdown, which is why the media transport
+	 * reads it through an accessor rather than capturing it once at construction: Nest builds
+	 * providers before it initialises them.
+	 */
+	get rawConnection(): NatsConnection | undefined {
+		return this.connection;
+	}
+
 	async onModuleInit(): Promise<void> {
 		this.connection = await connect({
 			servers: this.env.NATS_URL,

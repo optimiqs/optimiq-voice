@@ -74,12 +74,13 @@ describe("duration conversion", () => {
 });
 
 describe("stream definitions", () => {
-	it("declares the seven streams from plan §3.5", () => {
+	it("declares every stream the backbone owns, in apply order", () => {
 		expect(EVENT_STREAMS.map((stream) => stream.name)).toEqual([
 			"CALLS",
 			"REGISTRATIONS",
 			"QUEUES",
 			"VOICEMAIL",
+			"MEDIA",
 			"CDR",
 			"AUDIT",
 			"PROVISION",
@@ -277,6 +278,7 @@ describe("kv bucket definitions", () => {
 			"queue-membership",
 			"park-claims",
 			"conference-claims",
+			"media-sessions",
 		]);
 	});
 

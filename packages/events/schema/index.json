@@ -8,6 +8,7 @@
 		"registration": "sip.reg.v1",
 		"queue": "queue.evt.v1",
 		"voicemail": "voicemail.evt.v1",
+		"media": "media.evt.v1",
 		"cdrLeg": "cdr.leg.v1",
 		"audit": "audit.evt.v1",
 		"provision": "provision.evt.v1"
@@ -217,6 +218,20 @@
 			"goType": "VoicemailMWIUpdatedData"
 		},
 		{
+			"family": "media",
+			"type": "session.ended",
+			"subject": "media.evt.v1.<orgId>.<sessionId>.session.ended",
+			"dataSchema": "events/media.session.ended.schema.json",
+			"goType": "MediaSessionEndedData"
+		},
+		{
+			"family": "media",
+			"type": "session.rtp-timeout",
+			"subject": "media.evt.v1.<orgId>.<sessionId>.session.rtp-timeout",
+			"dataSchema": "events/media.session.rtp-timeout.schema.json",
+			"goType": "MediaSessionRTPTimeoutData"
+		},
+		{
 			"family": "cdr",
 			"type": "cdr.leg.write",
 			"subject": "cdr.leg.v1.<orgId>",
@@ -284,6 +299,38 @@
 			"responseSchema": "rpc/rpc.sip.v1.credential.response.schema.json",
 			"goRequestType": "SipCredentialRequest",
 			"goResponseType": "SipCredentialResponse"
+		},
+		{
+			"subject": "rpc.media.v1.allocate-session",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.media.v1.allocate-session.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.allocate-session.response.schema.json",
+			"goRequestType": "MediaAllocateSessionRequest",
+			"goResponseType": "MediaAllocateSessionResponse"
+		},
+		{
+			"subject": "rpc.media.v1.bridge-sessions",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.media.v1.bridge-sessions.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.bridge-sessions.response.schema.json",
+			"goRequestType": "MediaBridgeSessionsRequest",
+			"goResponseType": "MediaBridgeSessionsResponse"
+		},
+		{
+			"subject": "rpc.media.v1.unbridge-sessions",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.media.v1.unbridge-sessions.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.unbridge-sessions.response.schema.json",
+			"goRequestType": "MediaUnbridgeSessionsRequest",
+			"goResponseType": "MediaUnbridgeSessionsResponse"
+		},
+		{
+			"subject": "rpc.media.v1.release-session",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.media.v1.release-session.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.release-session.response.schema.json",
+			"goRequestType": "MediaReleaseSessionRequest",
+			"goResponseType": "MediaReleaseSessionResponse"
 		}
 	]
 }

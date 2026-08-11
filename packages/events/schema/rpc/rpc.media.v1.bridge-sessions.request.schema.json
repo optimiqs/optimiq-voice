@@ -1,0 +1,23 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"bridgeId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"sessionIds": {
+			"minItems": 2,
+			"maxItems": 2,
+			"type": "array",
+			"items": {
+				"type": "string",
+				"minLength": 1,
+				"maxLength": 128
+			}
+		}
+	},
+	"required": ["bridgeId", "sessionIds"],
+	"additionalProperties": false
+}

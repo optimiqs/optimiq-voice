@@ -1,6 +1,11 @@
 # `apps/mediad` — the Go media plane
 
-**Status:** walking skeleton shipped; no call is served by it. Asterisk 22 is still the media plane.
+**Status:** **rung 2 shipped** — SDP offer/answer, bridged G.711 calls with RFC 4733 DTMF, an RTP
+session directory in NATS KV, and a lifecycle event family. The contract is promoted to
+`packages/events` as `rpc.media.v1.*` + `media.evt.v1.*`, and `apps/engine` has a real
+`MediadMediaPort` behind `ENGINE_MEDIA_DRIVER=ari|mediad` (default `ari`). **Asterisk 22 is still
+the media plane for every deployment that has not opted in, and for every rung above 2 in all of
+them.**
 **Plan refs:** §3.3 (polyglot), §3.4 option E + option table, §3.5 (NATS), PG (parallel Go track), §8 risk 1.
 **Peer:** `apps/sipd` (SIP edge, same track, same idiom).
 
@@ -10,33 +15,41 @@ parity with Asterisk is proven rather than asserted. It also records what the fi
 built and what it deliberately did not.
 
 The plan's claim (§8 risk 1) is that "the engine-facing contract is identical for `media-ari` and
-`mediad`, so there is zero engine churn at swap". **§3 below shows that is currently true of
-commands and false of events.** Closing that gap is the first real piece of work, and it is work in
-`apps/engine`, not in `mediad`.
+`mediad`, so there is zero engine churn at swap". §3 below showed that was true of commands and
+false of events. **That gap is now closed**: `apps/engine/src/media/media-event.ts` holds a
+twelve-member domain `MediaEvent` union, `calls/ari-mapping.ts` translates ARI into it, and
+`media/mediad-event-mapping.ts` translates `mediad` into it. Neither the orchestrator nor the verb
+executor mentions either media server.
 
 ---
 
-## 1. Scope, and what v0 is
+## 1. Scope, and where the service is
 
 `mediad` v1 scope, per §3.4: RTP, G.711/Opus/G.722, bridges, play/record, DTMF (RFC 4733), MOH —
 behind the same engine contract as `packages/media-ari`, cut over per capability.
 
-**v0 (this wave) is a walking skeleton and nothing more.** It proves the packet substrate that every
-capability above sits on:
+**Rung 0 (substrate) and rung 2 (bridged calls) are built.** Rung 1's negotiation half is built with
+them, because bridging needs SDP; rung 1's playback half is not, because bridging does not. What
+exists:
 
 - a port-pair allocator over a configured range, which **binds** rather than counts;
 - an RTP `Session` that receives, learns its far end from the packets themselves, and can put audio
   back on the wire;
-- a raw-NATS command surface that allocates and releases one;
-- a drain that does not leak ports.
+- SDP offer/answer for G.711 with RFC 4733 negotiated rather than assumed;
+- a two-party RELAY, which is what a bridged call is;
+- a promoted `rpc.media.v1.*` command surface and a `media.evt.v1.*` lifecycle family;
+- a NATS KV session directory, so a second instance can route or refuse correctly;
+- a drain that does not leak ports and says on the wire that it cost audio.
 
-Everything above that — bridging, playback, recording, mixing — is a consumer of exactly those
-pieces. Bridging is two sessions forwarding to each other. Playback is a session sourcing frames
-from a file instead of from a socket. Recording is a session teeing them. Building the substrate
-first, and proving it with tests, is what makes those cheap.
+Everything above that — playback, recording, mixing — is a consumer of exactly those pieces.
+Playback is a session sourcing frames from a file instead of from a socket. Recording is a session
+teeing them. Building the substrate first, and proving it with tests, is what made bridging cheap.
 
 **Library choice.** Pion, as §3.4 requires, but _only_ the pieces that are needed:
-`github.com/pion/rtp` today for packet marshal/unmarshal, `github.com/pion/sdp` when SDP lands.
+`github.com/pion/rtp` for packet marshal/unmarshal and `github.com/pion/sdp/v3` for parsing an
+offer. The ANSWER is written by hand rather than marshalled: it is twelve lines, every one of them
+is a decision this service has to be able to justify, and going through a generic object model would
+hide which of them `mediad` actually controls.
 **Not `pion/webrtc`** — that pulls ICE, DTLS-SRTP, SCTP and a full peer-connection state machine to
 solve a problem we do not have. SIP endpoints send plain RTP over UDP to an address in an SDP `c=`
 line. If a WebRTC softphone (§7 T3) ever needs a real `PeerConnection`, that is a separate ingress
@@ -49,17 +62,17 @@ in front of the same session model, argued for on its own merits.
 Per §3.4's sequencing rule, cutover is **per capability**, not per service. Asterisk keeps serving
 everything not yet on a proven rung. Each rung is independently revertible by configuration.
 
-| #   | Rung                           | What it adds                                                                         | Why here                                                                                                                        | Gate                                                                                            |
-| --- | ------------------------------ | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| 0   | **Substrate** _(done)_         | Port allocation, RTP receive/send, latching, control surface, drain                  | Everything else consumes it                                                                                                     | Unit suite, race-clean                                                                          |
-| 1   | **SDP + one-legged media**     | `pion/sdp` offer/answer, real negotiation, `inactive`/`sendrecv`, playback of a file | The first rung that requires signalling integration; forces the sipd↔mediad boundary (§5) to be real                            | A call answered by mediad hears a prompt; MOS on the prompt                                     |
-| 2   | **Bridged calls**              | Two sessions forwarding to each other; the minimal op set in §3.3                    | §3.4's named first cutover. Two-party audio is ~80% of PBX traffic                                                              | Engine integration suite green against mediad; SIPp basic-call; MOS/jitter vs Asterisk baseline |
-| 3   | **DTMF (RFC 4733)**            | Digit detection out of the telephone-event stream, emitted as an engine event        | IVR, voicemail PINs and attended transfer all break without it. Shipped near-free by rung 2 (the payload already flows)         | Every DTMF unit test in the engine passes against mediad                                        |
-| 4   | **Recording**                  | Tee a session's frames to a container; the `snoop` primitive                         | §3.4's second named rung. Needs no mixing — a tap on a bridged leg hears both parties                                           | Byte-comparable recording of a scripted call; retention/S3 path unchanged                       |
-| 5   | **MOH + park/hold**            | A session sourcing from a loop instead of a peer                                     | Small once rung 1 exists (playback with a different source)                                                                     | Held-call audio; re-INVITE interop                                                              |
-| 6   | **Conference mix-minus**       | N-way mixing, per-participant minus-self                                             | §3.4's third rung, and the hard one — this is where jambonz/LiveKit spent years. Needs a jitter buffer (§6) to sound acceptable | MOS at 3/5/10 participants; CPU per conference                                                  |
-| 7   | **Opus / G.722 + transcoding** | Wideband, and the first real DSP                                                     | Deliberately after mixing: a mixer must decode anyway, so the codec layer is cheaper to build once mixing forces it             | Interop matrix; CPU per transcoded leg                                                          |
-| 8   | **T.38**                       | Fax                                                                                  | §3.4 says last, and it is right: fax is a different protocol wearing RTP's clothes, low volume, high fiddliness                 | A real fax round trip                                                                           |
+| #   | Rung                                                               | What it adds                                                                         | Why here                                                                                                                        | Gate                                                                                            |
+| --- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| 0   | **Substrate** _(done)_                                             | Port allocation, RTP receive/send, latching, control surface, drain                  | Everything else consumes it                                                                                                     | Unit suite, race-clean                                                                          |
+| 1   | **SDP + one-legged media** _(negotiation done; playback deferred)_ | `pion/sdp` offer/answer, real negotiation, `inactive`/`sendrecv`, playback of a file | The first rung that requires signalling integration; forces the sipd↔mediad boundary (§5) to be real                            | A call answered by mediad hears a prompt; MOS on the prompt                                     |
+| 2   | **Bridged calls** _(done)_                                         | Two sessions forwarding to each other; the minimal op set in §3.3                    | §3.4's named first cutover. Two-party audio is ~80% of PBX traffic                                                              | Engine integration suite green against mediad; SIPp basic-call; MOS/jitter vs Asterisk baseline |
+| 3   | **DTMF (RFC 4733)**                                                | Digit detection out of the telephone-event stream, emitted as an engine event        | IVR, voicemail PINs and attended transfer all break without it. Shipped near-free by rung 2 (the payload already flows)         | Every DTMF unit test in the engine passes against mediad                                        |
+| 4   | **Recording**                                                      | Tee a session's frames to a container; the `snoop` primitive                         | §3.4's second named rung. Needs no mixing — a tap on a bridged leg hears both parties                                           | Byte-comparable recording of a scripted call; retention/S3 path unchanged                       |
+| 5   | **MOH + park/hold**                                                | A session sourcing from a loop instead of a peer                                     | Small once rung 1 exists (playback with a different source)                                                                     | Held-call audio; re-INVITE interop                                                              |
+| 6   | **Conference mix-minus**                                           | N-way mixing, per-participant minus-self                                             | §3.4's third rung, and the hard one — this is where jambonz/LiveKit spent years. Needs a jitter buffer (§6) to sound acceptable | MOS at 3/5/10 participants; CPU per conference                                                  |
+| 7   | **Opus / G.722 + transcoding**                                     | Wideband, and the first real DSP                                                     | Deliberately after mixing: a mixer must decode anyway, so the codec layer is cheaper to build once mixing forces it             | Interop matrix; CPU per transcoded leg                                                          |
+| 8   | **T.38**                                                           | Fax                                                                                  | §3.4 says last, and it is right: fax is a different protocol wearing RTP's clothes, low volume, high fiddliness                 | A real fax round trip                                                                           |
 
 Asterisk is retired (§P6) only after rung 8. `packages/media-ari` and `apps/asterisk` stay until
 then — they are the media plane, not scaffolding to delete early.
@@ -70,14 +83,14 @@ then — they are the media plane, not scaffolding to delete early.
 
 ### 3.1 What exists: the command seam
 
-`apps/engine/src/ari/media-port.ts` defines `MediaPort`, and its own doc comment states the
+`apps/engine/src/media/media-port.ts` defines `MediaPort`, and its own doc comment states the
 contract this whole effort depends on:
 
 > `packages/media-ari` implements it today; `mediad`'s client will implement it tomorrow; the verb
 > executor above it never learns which.
 
 It is genuinely good. The vocabulary is domain vocabulary — `HangupCause`, milliseconds, playback
-refs — and `apps/engine/src/ari/ari-media.adapter.ts` is the only file allowed to know ARI's shape.
+refs — and `apps/engine/src/media/ari-media.adapter.ts` is the only file allowed to know ARI's shape.
 24 methods, in three plan-phase groups:
 
 - **P2 (call basics):** `answer`, `ring`, `play`, `stopPlayback`, `hangup`, `getVariable`,
@@ -86,41 +99,70 @@ refs — and `apps/engine/src/ari/ari-media.adapter.ts` is the only file allowed
   `destroyBridge`, `record`, `stopRecording`, `startMusicOnHold`, `stopMusicOnHold`
 - **P4 (call control):** `hold`, `unhold`, `mute`, `unmute`, `sendDtmf`, `snoop`
 
-A `MediadMediaAdapter implements MediaPort` sitting next to `AriMediaAdapter`, translating to the
-subjects in §4, is a drop-in. **This half of the swap really is free.**
+`MediadMediaPort implements MediaPort` now sits next to `AriMediaAdapter` and is selected by
+`ENGINE_MEDIA_DRIVER`. **This half of the swap really is free — for the operations the media plane
+can serve.** The coverage map at rung 2:
 
-### 3.2 What does not exist: the event seam — the main finding of this wave
+| `MediaPort` method                                                        | `mediad`                                                             |
+| ------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `createBridge`                                                            | local bookkeeping — a relay with no members is nothing on the wire   |
+| `addToBridge`                                                             | `rpc.media.v1.bridge-sessions`, at exactly two members               |
+| `removeFromBridge`, `destroyBridge`                                       | `rpc.media.v1.unbridge-sessions`                                     |
+| `hangup`                                                                  | `rpc.media.v1.release-session` — the MEDIA half of a teardown        |
+| `channelExists`                                                           | the adapter's own session registry                                   |
+| `watchChannel`                                                            | satisfied by construction: `mediad` events are org-wide, not per-leg |
+| `answer`, `ring`, `originate`                                             | **refused** — signalling, which `apps/sipd` owns (§5)                |
+| `getVariable`, `setVariable`                                              | **refused** — channel variables are a dialplan concept               |
+| `play`, `stopPlayback`                                                    | **refused** — rung 1's second half                                   |
+| `sendDtmf`                                                                | **refused** — rung 3                                                 |
+| `record`, `stopRecording`, `snoop`                                        | **refused** — rung 4                                                 |
+| `startMusicOnHold`, `stopMusicOnHold`, `hold`, `unhold`, `mute`, `unmute` | **refused** — rung 5                                                 |
 
-`MediaPort` is **commands only**. Events are not behind it.
+A refusal is a typed `MediaOperationNotSupportedError` naming the operation, the capability and the
+rung, and it **never silently no-ops**. A media plane that quietly accepted `record` and did nothing
+would produce a call that connects, sounds perfect and has no recording — discovered days later by
+somebody who needed it, with nothing in any log to say why. The same silence on `startMusicOnHold`
+is a held caller listening to nothing and hanging up. Those are the worst defects a telephony system
+has, because they are invisible at the moment they happen.
 
-`apps/engine/src/calls/channel-orchestrator.service.ts` (1,793 lines) imports `AriChannel` and
-`AriEvent` _directly_ from `@optimiq-voice/media-ari` and branches on ARI's own event-type strings —
-`StasisStart`, `StasisEnd`, `ChannelStateChange`, `ChannelDestroyed`, and the rest of the 21-member
-`ARI_EVENT_TYPES` union. There are ~47 such references. `AriConnectionService.setEventHandler`
-is typed `(event: AriEvent) => void`.
+**`allocateSession` is NOT on `MediaPort`**, deliberately: `MediaPort` is the vocabulary of an
+engine driving a media server that also terminates SIP, and it has no concept of an SDP offer
+because Asterisk never showed it one. It is a method on `MediadMediaPort` alone, for the
+`apps/sipd` path to call, so that `AriMediaAdapter` never has to throw from an interface method it
+could not implement.
 
-`apps/engine/src/calls/ari-mapping.ts` translates _values_ (Q.850 causes, call directions, channel
-states) and says it is "the layer that makes the media server swappable". It is — for values. The
-**event union itself** is not translated anywhere.
+### 3.2 The event seam — closed
 
-So the plan's zero-churn claim holds for the command direction and does not hold for the event
-direction. **A `mediad` cutover as the code stands today would either require rewriting the
-orchestrator, or require `mediad` to emit synthetic ARI events** — which would embed Asterisk's
-vocabulary permanently in a service built to replace it, and is the wrong answer.
+`MediaPort` was commands only. The orchestrator imported `AriEvent` from `@optimiq-voice/media-ari`
+and branched on Asterisk's own event-type strings in ~47 places, which meant the swap the plan rests
+on was only half available: a `mediad` cutover would have required either rewriting the orchestrator
+on live calls, or making `mediad` emit synthetic ARI events forever — embedding Asterisk's
+vocabulary permanently in the service built to replace it.
 
-**The work, and it belongs in `apps/engine` before rung 2:**
+**Done, in the wave before this one:**
 
-1. Define `MediaEvent` — a domain-shaped discriminated union — next to `MediaPort`.
-2. Add `toMediaEvent(ariEvent): MediaEvent | undefined` to `ari-mapping.ts`, the file that already
-   owns ARI→domain translation.
-3. Change the orchestrator to consume `MediaEvent`. This is the large, boring, mechanical change,
-   and it is a **pure refactor with Asterisk still in place** — provable by the existing engine
-   integration suite, with no media risk.
-4. `mediad` then emits `MediaEvent` natively and neither side ever mentions ARI.
+1. `apps/engine/src/media/media-event.ts` defines `MediaEvent`, a twelve-member domain union.
+2. `calls/ari-mapping.ts` gained `toMediaEvent(ariEvent)`, applied at the edge by
+   `AriConnectionService` so nothing above it ever holds an `AriEvent`.
+3. The orchestrator consumes `MediaEvent`, proved by the existing integration suite with Asterisk
+   still in place — a pure refactor with no media risk, which was the whole point of doing it first.
+4. `media/mediad-event-mapping.ts` now does the same for `mediad`. Neither side mentions the other.
 
-Doing step 3 while Asterisk is still the only backend is the whole point: it de-risks the cutover by
-separating "change the engine's internal shape" from "change the media server", instead of doing
-both at once on live calls.
+The engine's `ari/` directory was renamed `media/` as part of it (open question 1, §10).
+
+**The asymmetry worth knowing about:** `mediad` publishes two events and the union gains one
+member. `session.ended` becomes `leg-ended` — the member the CDR is written from. `session.rtp-timeout`
+maps to NOTHING, because it is the diagnosis that immediately precedes a `session.ended` whose reason
+is `rtp-timeout`, and raising both would tear the leg down twice: once on the warning and once on the
+fact it warned about. The reason survives on the `leg-ended` it caused, which is where a consumer
+asking "why did that call drop" looks.
+
+A media plane has no Q.850 opinion — it never saw a SIP response — so `mediad-event-mapping.ts`
+picks the closest cause it can DEFEND from the reason `mediad` did report (`released` → 16
+NORMAL_CLEARING, `rtp-timeout` → 41 NORMAL_TEMPORARY_FAILURE, `idle-reaped` → 102
+RECOVERY_ON_TIMER_EXPIRE, `drained` → 44 REQUESTED_CHAN_UNAVAIL). That is a translation, which is
+what the mapping layer is for; the alternative would be `mediad` inventing a signalling cause it has
+no evidence for and putting that fiction in the shared contract.
 
 ### 3.3 The minimal operation set for bridged-call parity (rung 2)
 
@@ -189,71 +231,86 @@ JetStream.**
 
 ### 4.2 Subjects
 
-v0, today, defined in `apps/mediad/internal/control/control.go`:
+Promoted, and defined in `packages/events/src/schemas/rpc.ts` + `src/subjects.ts`:
 
-| Subject                 | Kind               | Deadline |
-| ----------------------- | ------------------ | -------- |
-| `rpc.media.v0.allocate` | core request-reply | 500 ms   |
-| `rpc.media.v0.release`  | core request-reply | 500 ms   |
+| Subject                          | Kind               | Deadline |
+| -------------------------------- | ------------------ | -------- |
+| `rpc.media.v1.allocate-session`  | core request-reply | 500 ms   |
+| `rpc.media.v1.bridge-sessions`   | core request-reply | 500 ms   |
+| `rpc.media.v1.unbridge-sessions` | core request-reply | 500 ms   |
+| `rpc.media.v1.release-session`   | core request-reply | 500 ms   |
 
-`v0` is load-bearing: it means _this shape will change and nothing outside `mediad` and the engine's
-`mediad` client may depend on it._
+| Subject                                                | Kind              | Stream  |
+| ------------------------------------------------------ | ----------------- | ------- |
+| `media.evt.v1.<orgId>.<sessionId>.session.ended`       | JetStream publish | `MEDIA` |
+| `media.evt.v1.<orgId>.<sessionId>.session.rtp-timeout` | JetStream publish | `MEDIA` |
 
-### 4.3 Why the subjects are NOT in `packages/events` yet
+The `v0` subjects are gone. Nothing outside `mediad` and the engine's client ever depended on them,
+which is exactly the property `v0` in the name was there to buy.
 
-**Deliberate, and it must stay that way until rung 2.** `packages/events/src/schemas/rpc.ts` already
-says so:
+**The engine reads the events with a CORE subscription** on `media.evt.v1.>`, even though a
+JetStream stream captures them. That is not a contradiction: a JetStream publish is a publish, so a
+core subscriber sees it live while the stream keeps it for whoever needs it later. The engine wants
+the former — a leg to tear down NOW — and must not pay for a durable consumer's ack round trip on
+the call path to get it.
 
-> `rpc.media.*` (engine → `mediad`) is deliberately absent: it arrives with `apps/mediad`, and
-> inventing its shape before the media plane exists would be fiction.
+### 4.3 The promotion, and the criteria it had to meet
 
-`packages/events` is consumed by `apps/api`, `apps/engine` and `packages/events-go`; a field added
-there is a field every service compiles against, and the codegen drift gate in CI enforces it. The
-command set that bridged-call parity actually needs is not known until a real capability has been
-built against it, and promoting a guess would freeze the guess.
+The subjects were deliberately absent from `packages/events` while the media plane was a walking
+skeleton: the command set bridged-call parity actually needs was not knowable until a real
+capability had been built against it, and promoting a guess would have frozen the guess.
 
-**Promotion criteria — all four, then it becomes `rpc.media.v1.*` in `packages/events`:**
+**All four criteria are now met, so the contract is promoted:**
 
-1. Rung 2 (bridged calls) works end to end against a real endpoint.
-2. The command set has been stable across one full capability (i.e. rung 3 added no field to it).
-3. SDP is in the payloads, so the shape reflects real negotiation rather than the v0
-   `{port, ssrc}` stub.
-4. The engine has a real `MediadMediaAdapter`, so there is a second implementer to disagree.
+1. ✅ Rung 2 (bridged calls) works end to end — see §9.
+2. ✅ The command set is the one rung 2 forced, not a guess: `allocate-session` carries SDP because
+   negotiation needed it, and `bridge`/`unbridge` are separate because a transfer needs to separate
+   legs without ending them.
+3. ✅ SDP is in the payloads. The v0 `{port, ssrc}` stub is gone.
+4. ✅ The engine has a real `MediadMediaPort` (`apps/engine/src/media/mediad-media.port.ts`), so
+   there is a second implementer to disagree.
 
-Until then the v0 constants live in `mediad` and the engine's client hard-codes them. That is a
-known, bounded, two-file duplication with a written expiry, which is a better trade than a shared
-contract that is wrong.
+Promoted shape: Zod in `packages/events/src/schemas/rpc.ts` (commands) and
+`src/schemas/media-events.ts` (events), Go structs generated into `packages/events-go`, with the
+codegen drift gate in CI enforcing that the two languages cannot diverge.
 
-### 4.4 Payloads (v0)
+**The raw-NATS obligation is now recorded on the schema itself**, on
+`mediaAllocateSessionRequestSchema`, because this is the first subject family whose caller is
+TypeScript and whose responder is Go — the direction where `ClientProxy` is the idiomatic thing to
+reach for and is wrong.
 
-`allocate` — request / reply:
+### 4.4 Payloads
+
+`allocate-session` — request / reply:
 
 ```jsonc
-{ "sessionId": "018f…", "callId": "018f…", "mode": "echo" }
+{ "sessionId": "018f…", "orgId": "018f…", "callId": "018f…",
+  "sdpOffer": "v=0\r\no=- …", "direction": "sendrecv" }
 
-{ "ok": true, "sessionId": "018f…", "address": "203.0.113.10",
+{ "ok": true, "sessionId": "018f…", "sdpAnswer": "v=0\r\n…",
+  "instanceId": "mediad-7c9f", "address": "203.0.113.10",
   "rtpPort": 30000, "rtcpPort": 30001, "ssrc": 4277009102,
-  "mode": "echo", "payloadTypes": [0, 8, 101] }
+  "codec": "PCMU", "telephoneEventPayloadType": 101 }
 ```
 
-Three properties are load-bearing and carry forward to v1:
+Four properties are load-bearing:
 
 - **`sessionId` is caller-assigned.** Same reason `OriginateRequest.channelId` is client-assigned at
   the `MediaPort` seam: the caller must be able to release a session whose reply it never received.
-  A server-assigned id means a timed-out allocate leaves a port held under a name nobody knows.
 - **Allocate is idempotent on `sessionId`.** A retry returns the same session and does not open a
-  second port, and does not mutate a live session's mode. Without this, every timed-out allocate
-  leaks a port.
-- **A refusal is a reply, never a silence.** `{"ok": false, "reason": "...", "error": "..."}` with a
-  stable machine-readable `reason` the engine branches on: `bad_request` (retrying the same bytes
-  fails the same way), `capacity` (a load signal — try another instance or fail with congestion),
-  `shutting_down` (do not retry _here_), `internal`. A responder that stays silent on a request it
-  dislikes is indistinguishable from a crashed one, and the caller pays the full timeout to learn
-  nothing.
+  second port. Without this, every timed-out allocate leaks one.
+- **`orgId` is required**, and it is not decoration: it is the subject token the session's lifecycle
+  events are published under. A session allocated without one would end silently.
+- **A refusal is a reply, never a silence**, with a stable machine-readable `reason` the engine
+  branches on: `bad_request`, `capacity`, `shutting_down`, `unknown_session`, `wrong_instance`,
+  `not_supported`, `internal`. `wrong_instance` is answerable only because of the session directory
+  (§6.1) — without it a second instance could not tell "never existed" from "belongs to my
+  neighbour", and those need opposite recoveries.
+
+`not_supported` is the honest expression of a per-capability cutover: a rung `mediad` has not
+reached is refused by name, and the engine routes that leg to Asterisk.
 
 `address` is `MEDIAD_PUBLIC_IP`, never the bind address — it is what goes in an SDP `c=` line.
-
----
 
 ## 5. Who owns signalling glue: sipd vs mediad
 
@@ -310,6 +367,66 @@ let anyone who can guess a port take over a call with a single UDP packet. The c
 endpoint legitimately changing address mid-call (Wi-Fi→LTE) is cut off; the right place to fix that
 is an authenticated re-INVITE from the signalling plane, not a heuristic in the packet path.
 
+**Bridging is a RELAY, and the header rewrite is the interesting part.** Two sessions, each
+forwarding what it receives out of the other's socket. The PAYLOAD is passed through byte for byte —
+that is what makes rung 2 achievable with no DSP, and it is what carries RFC 4733 DTMF for free,
+since a telephone-event payload is just bytes to a relay. The HEADER is not, and each rewritten
+field is a separate decision:
+
+- **SSRC becomes the outgoing session's own.** Two legs are two independent RTP sessions; handing
+  leg B a stream stamped with leg A's SSRC would make B's jitter buffer see the synchronisation
+  source change every time the bridge is re-pointed (an attended transfer), which endpoints handle
+  by resetting — an audible click at best. One stable SSRC per leg for the life of the leg is what
+  an endpoint expects.
+- **Sequence numbers become the outgoing session's own**, incrementing by one per forwarded packet.
+  Passing A's through would leak A's losses into B's statistics and, worse, make the sequence space
+  JUMP on a re-bridge, which a jitter buffer reads as catastrophic loss and answers with concealment
+  noise.
+- **Timestamp is kept.** It is the frame's sampling instant and a relay does not resample, so it is
+  still true. Rewriting it would be inventing a clock.
+- **Marker is kept.** On a telephone-event payload it is the start-of-digit flag; dropping it turns
+  every DTMF press into one an IVR cannot detect.
+- **Payload type is translated for telephone-event ONLY.** G.711 is refused at bridge time when the
+  two legs disagree (see §7), so the audio type always matches. The RFC 4733 type is dynamic and the
+  two legs routinely land on different numbers — 101 and 96 are both common — and the payload FORMAT
+  is identical, so renumbering is correct and is the whole reason DTMF survives a bridge between two
+  phones that negotiated differently.
+
+**Two silences, and they are different events.** A session that RECEIVED audio and then stopped is
+an RTP TIMEOUT: a call still up as far as the signalling plane is concerned, whose parties can no
+longer hear each other. A session that NEVER received a packet and aged out is a LEAK: the engine
+allocated it and stopped knowing about it. Reporting them as one event would make every abandoned
+call setup look like a media failure, so they have separate windows (`MEDIAD_RTP_TIMEOUT`, default
+30s; `MEDIAD_SESSION_IDLE_TIMEOUT`, default 60s) and separate reasons on the wire.
+
+### 6.1 The session directory (open question 2, answered)
+
+`rpc.media.v1.*` is served by a QUEUE GROUP, so NATS hands each request to whichever `mediad` is
+free. Right for `allocate-session`; wrong for every command after it, because a session lives on
+exactly ONE instance — its sockets are bound there and its relay goroutines run there.
+
+**The answer is a NATS KV directory**, `media-sessions`, keyed by session id alone, mapping to the
+owning `instanceId` plus the tenant, the call, the advertised address/port and the bridge. Written
+on allocate, updated on bridge, **deleted on release** — and the delete is part of the wire contract
+rather than an implementation detail, because an entry that outlives its session is an instance name
+the engine keeps routing dead commands to.
+
+The alternative — the allocate reply carrying an instance-specific subject the engine uses
+thereafter — is simpler and needs no lookup, but it puts routing state in the engine, where an
+engine restart loses it and every live call becomes uncommandable. The directory survives that, and
+it is the substrate open question 3 needs, because draining means MOVING sessions and you cannot
+move what you cannot enumerate.
+
+Keyed by session id and NOT organization-scoped, which makes it the second exception after
+`did-index` — and for the same reason: the READER does not know the tenant. A `mediad` handed a
+`bridge-sessions` carrying two session ids has no org to scope a lookup with, and threading one onto
+every command purely so the key could be prefixed would be shaping the wire around a key format. The
+org travels in the value.
+
+It is a DIRECTORY, not a claim: nothing races for a media session, so there is no `expiresAt` and no
+heartbeat, unlike `park-claims`. The bucket's six-hour TTL (matching `channels`, because a session
+lives exactly as long as a call leg) is a backstop.
+
 **Jitter buffer: none in v1, and that is a real decision, not an omission.**
 
 - Rungs 2–5 are **relay** paths. Packets are forwarded, not decoded. A jitter buffer on a relay adds
@@ -325,7 +442,7 @@ multiplexing, each call's latency is independent, and a parked goroutine costs a
 profile ever says otherwise, the replacement is batched reads (`recvmmsg`) behind the same method —
 which is why the read loop is the only thing that touches the socket.
 
-**RTCP** is bound but not read in v0. Bound anyway, because an unbound odd port is one an unrelated
+**RTCP** is bound but not read. Bound anyway, because an unbound odd port is one an unrelated
 process can take, and the day RTCP is implemented the pairing would already be broken on exactly the
 hosts that had been running longest.
 
@@ -337,8 +454,11 @@ hosts that had been running longest.
 
 - PCMU (PT 0) and PCMA (PT 8) are the two payload types every endpoint on earth supports, so
   passthrough covers the bridged-call cutover without a single DSP operation.
-- RFC 4733 telephone-event (PT 101) rides alongside for DTMF. v0 recognises 101 by convention; real
-  negotiation reads it from the SDP `a=rtpmap` and lands with rung 1.
+- RFC 4733 telephone-event rides alongside for DTMF, and is **negotiated rather than assumed**: the
+  type is dynamic, real endpoints offer 96, 100 and 101, and a session forwarding DTMF under a type
+  the far end never agreed to produces digits the far end drops — an IVR that "randomly" ignores
+  keypresses. Each session carries whatever its own answer settled on, and the relay renumbers
+  between two legs that chose differently (§6).
 - **A codec mismatch is resolved in SDP negotiation by refusing the offer, not in the media path by
   resampling.** That is what makes rung 2 achievable: no DSP, no CPU cliff, no audio-quality
   regression to argue about against Asterisk.
@@ -357,7 +477,7 @@ Three layers. The first does not exist yet and is the highest-value thing to bui
 
 ### 8.1 A `MediaPort` conformance suite (new — build this)
 
-Today `apps/engine/src/ari/media-port.fake.ts` backs nine unit specs, `AriMediaAdapter` has no spec
+Today `apps/engine/src/media/media-port.fake.ts` backs nine unit specs, `AriMediaAdapter` has no spec
 of its own, and there is **no suite that runs the same assertions against two implementations**.
 
 Build one: export `describeMediaPortConformance(makePort: () => MediaPort)` and invoke it three
@@ -415,71 +535,113 @@ with the codegen drift gate in `ci.yaml`.
 
 ---
 
-## 9. What this wave shipped
+## 9. What this wave shipped (rung 2)
 
 ```
+packages/events/
+├── src/subjects.ts               media.evt.v1 root, MEDIA_SESSION_EVENTS, rpc.media.v1.* subjects
+├── src/schemas/rpc.ts            the four command contracts + MEDIA_REFUSAL_REASONS
+├── src/schemas/media-events.ts   session.ended / session.rtp-timeout payloads
+├── src/schemas/live-state.ts     mediaSessionDirectoryEntrySchema
+└── src/streams.ts                MEDIA stream, media-sessions KV, kvKeyFor.mediaSession
+
+packages/events-go/               regenerated: media_events_gen.go, rpc_gen.go, registry_gen.go,
+                                  parity.json — plus hand-written media_sessions.go, MediaStream,
+                                  MediaSessionsKV, MediaSubject/Filters, MediaSessionKVKey
+
 apps/mediad/
-├── go.mod                        module; pion/rtp + nats.go only
-├── cmd/mediad/main.go            boot, NATS connect, subscribe, drain (sipd's shape)
-└── internal/
-    ├── config/config.go          env parsing, fail-fast, collects every problem
-    ├── rtp/
-    │   ├── allocator.go          binding round-robin port-pair allocator
-    │   ├── session.go            one leg: receive, latch, echo; pion/rtp codec
-    │   └── manager.go            lifecycle, idempotent allocate, idle reaper, drain
-    └── control/control.go        raw-NATS rpc.media.v0.allocate / .release
+├── internal/sdp/                 offer parse + answer build; G.711 + RFC 4733 negotiation
+├── internal/rtp/                 relay (peer pointers, header rewrite), bridge/unbridge,
+│                                 per-session negotiated payload types, two-window reaper
+├── internal/directory/           the media-sessions KV directory (+ an in-memory fake)
+├── internal/events/              JetStream lifecycle publisher (sipd's shape) (+ a recorder)
+├── internal/control/             rpc.media.v1.* handlers + the LifecycleAnnouncer
+└── internal/config/              MEDIAD_INSTANCE_ID, MEDIAD_RTP_TIMEOUT, MEDIAD_ECHO_DIAGNOSTIC
+
+apps/engine/src/media/
+├── mediad-media.port.ts          MediadMediaPort implements MediaPort (coverage map in §3.1)
+├── mediad-transport.ts           raw NatsConnection.request(), never a ClientProxy
+├── mediad-event-mapping.ts       media.evt.v1.* -> the MediaEvent union
+├── mediad.service.ts             boot probe, event subscription, lifecycle
+├── media-not-supported.error.ts  the typed refusals
+└── ari.module.ts                 ENGINE_MEDIA_DRIVER picks the plane
 ```
 
-Plus `go.work` (added the `use` line the file had reserved for it) and this document.
+**Configuration added.** `MEDIAD_INSTANCE_ID` (hostname-pid by default — stable, distinct,
+readable), `MEDIAD_RTP_TIMEOUT` (30s), `MEDIAD_ECHO_DIAGNOSTIC` (false). Engine-side:
+`ENGINE_MEDIA_DRIVER` (**`ari` by default — zero behaviour change unless an operator opts in**) and
+`ENGINE_MEDIAD_RPC_TIMEOUT_MS` (500).
 
-**Configuration.** `MEDIAD_BIND_IP`, `MEDIAD_PUBLIC_IP` (**required** — no safe default, and a wrong
-value fails as _silence_, not as an error), `MEDIAD_RTP_PORT_MIN`/`_MAX`,
-`MEDIAD_SESSION_IDLE_TIMEOUT`, `MEDIAD_SHUTDOWN_TIMEOUT`, `MEDIAD_LOG_LEVEL`.
+**Refuses to boot rather than degrading.** `ENGINE_MEDIA_DRIVER=mediad` with no `mediad` listening
+is a process that does not start, proved by a real request on a real subject (a `release-session`
+for an id nothing holds, which changes no state and any live instance answers in microseconds). The
+alternative — booting and failing per call — is the failure mode this design keeps rejecting: a
+service that looks healthy and answers no calls, discovered by a customer rather than by a deploy.
 
-**The NATS variables are unprefixed** — `NATS_URL`, `NATS_USER`, `NATS_PASS` — matching `apps/api`,
-`apps/engine` and `apps/sipd`. The broker credential is one platform-account identity; a
-`MEDIAD_`-prefixed alias would be a second name for one secret to drift between. The RTP knobs are
-prefixed because they genuinely belong to this process alone. _(This deviates from the wave brief's
-literal `MEDIAD_NATS_URL`; the repo-wide convention and its documented rationale won.)_
+**Verified.** `apps/mediad` 162 tests race-clean; `packages/events` 246; `packages/events-go`
+parity green with byte-reproducible codegen; `apps/engine` 842 unit specs (up from 799) plus the
+9/9 integration suite unchanged on the ARI path. A live round-trip against the real broker proved
+the whole wire: raw TS request → Go responder → SDP answer on the session's real port → directory
+entry → bridge → refusal with a machine-readable reason → release → directory cleaned →
+`media.evt.v1.…session.ended` with `reason: released` on a core subscription.
 
-**Not touched, deliberately:** `packages/events` (§4.3), `apps/engine`, `apps/sipd`, `compose.yaml`.
-**No compose service yet** — one arrives with the first real capability, because a service in the
-compose file that serves no call is a thing to keep running and debug for no benefit.
+**Still not touched:** `compose.yaml`. A `mediad` service arrives when a deployment actually routes
+a call to it, which needs `apps/sipd`'s proxy — see §10 question 4.
 
----
+## 10. Open questions
 
-## 10. Open questions for the next wave
+**Answered in this wave:**
 
-1. **Where does the `MediaEvent` union live?** §3.2's refactor needs a home for the domain event
-   type. `apps/engine/src/ari/media-port.ts` (next to `MediaPort`, but the directory is named `ari`)
-   or `packages/telephony` (the domain package, but the engine is its only consumer)? Leaning
-   `packages/telephony`, and renaming the engine's `ari/` directory to `media/` as part of the same
-   refactor.
+1. ~~**Where does the `MediaEvent` union live?**~~ **`apps/engine/src/media/media-event.ts`**, and
+   the engine's `ari/` directory was renamed `media/` as part of the same refactor. `packages/telephony`
+   lost: the union's members are chosen by what the ORCHESTRATOR consumes — a member nobody branches
+   on is a shape two media servers would have to agree on for no reason — so it belongs with its
+   consumer. The domain package holds values (`HangupCause`, `CallState`), which the union's fields
+   use; that split has held.
 
-2. **How does the engine address a _specific_ `mediad` instance?** v0 uses a queue group, so NATS
-   picks any instance — correct for allocate, wrong for everything after it, because a session lives
-   on exactly one instance. Options: the allocate reply carries an instance-specific subject the
-   engine uses thereafter (simple, no lookup, but the engine holds routing state); or a session
-   directory in NATS KV keyed by `sessionId` (survives an engine restart, costs a KV read per
-   command). **The KV directory is probably right**, because it is also the substrate for question 3.
+2. ~~**How does the engine address a specific `mediad` instance?**~~ **A NATS KV session directory**,
+   `media-sessions`. Full reasoning in §6.1. The reply-subject alternative lost because it puts
+   routing state in the engine, where a restart loses it.
 
-3. **What does graceful drain mean for a media server?** v0 closes live sessions at shutdown, and
-   the honest description is _calls on this instance lose audio_. There is no "finish the last
-   request" — a session ends when a call ends, and a call can last hours. Real graceful drain means
-   moving sessions to another instance, which needs the KV directory _and_ a re-INVITE from the
-   signalling plane to repoint the far end. This is a genuine design problem, not a TODO, and it
-   should be solved before `mediad` carries production traffic — not after.
+3. ~~**Is echo mode worth keeping past rung 1?**~~ **Kept, behind `MEDIAD_ECHO_DIAGNOSTIC`.** It is
+   now unreachable from the wire — no field in `allocate-session` selects it — so it can never be
+   hit by a production call path, which was the whole concern. It costs one branch in the packet
+   path and buys the simplest possible smoke test of a real deployment's ports and NAT with no
+   second party. A deployment that leaves the flag on serves NO working calls (every leg hears
+   itself), so it is warned about on every boot.
 
-4. **Does `sipd`'s proxy wave need to know about `mediad` at all?** §5 says no — the engine is the
-   courier. Worth re-testing against the actual INVITE path when `sipd`'s proxy lands, because if it
-   turns out the engine hop adds meaningful post-dial delay, the answer changes and the coupling has
-   to be argued for explicitly rather than discovered.
+**Still open, and honestly so:**
 
-5. **Is echo mode worth keeping past rung 1?** It exists to prove the packet path without a second
-   party. Once bridging works, a test can use two real sessions instead. Keeping it costs a branch
-   in the hot loop; deleting it costs the simplest possible smoke test. Lean: keep it, but move it
-   behind an explicit "diagnostic" flag so it can never be reached by a production call path.
+3. **What does graceful drain mean for a media server?** Unchanged, and now one dependency closer:
+   the session directory exists, so an instance can enumerate what it holds and another can find it.
+   What is still missing is the MOVE — repointing a far end needs an authenticated re-INVITE from
+   the signalling plane, so this cannot be finished inside `mediad` at all. Today a drain closes
+   live sessions and says so on the wire (`session.ended` with `reason: drained`), which is the
+   honest description of "calls on this instance lose audio". **This must be solved before `mediad`
+   carries production traffic, not after.**
 
-6. **RTCP: when?** Bound but unread today. It carries the receiver reports that are the _only_
-   in-band signal of call quality, and the MOS/jitter gate in §8.4 will want them. Probably rung 2,
-   as read-only telemetry, before anything depends on it.
+4. **Does `sipd`'s proxy wave need to know about `mediad`?** §5 still says no — the engine is the
+   courier — and this wave did not test it, because there is no INVITE path yet. It is now the
+   BLOCKING question rather than a background one: `MediadMediaPort` refuses `answer`, `ring` and
+   `originate` by design, so nothing can drive a whole call through `mediad` until `sipd` terminates
+   the dialog and hands the engine an offer. Re-test the post-dial delay of the extra hop when it
+   lands; if it is material, the coupling has to be argued for explicitly rather than discovered.
+
+5. **RTCP: when?** Still bound and unread. It carries the receiver reports that are the only in-band
+   signal of call quality, and §8.4's MOS/jitter gate wants them. It did not block rung 2 — a relay
+   forwards RTP whether or not it reads RTCP — so it moves to the rung that first needs a quality
+   number it cannot get from anywhere else.
+
+6. **NEW: what proves the audio is GOOD, not just correct?** §8.4 gates rungs 2 and 6 on MOS and
+   jitter against an Asterisk baseline on the same hardware. This wave proved CORRECTNESS — the
+   right bytes reach the right socket with the right header — and measured nothing. The relay adds
+   no jitter buffer and no transcoding, so the expected delta is a few hundred microseconds of
+   forwarding latency, but "expected" is not "measured", and the whole point of the gate is that
+   absolute MOS numbers are meaningless while the delta against the thing being replaced is not.
+   **Rung 2 is not cut over until this exists.**
+
+7. **NEW: the `MediaPort` conformance suite (§8.1) still does not exist.** There is now a second
+   implementation to run it against, which is exactly the condition that made it worth building —
+   `describeMediaPortConformance(makePort)` invoked against the fake, against `AriMediaAdapter`, and
+   against `MediadMediaPort`. Without it, "the seam holds" is proved by two separate suites that
+   could drift, rather than by one suite two implementations must both satisfy.

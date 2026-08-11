@@ -16,6 +16,14 @@ import (
 
 var publicAddr = netipMustParseStatic("203.0.113.10")
 
+// Every allocate in this file carries the same tenant and call. mediad does not route on either —
+// they exist so a lifecycle event and a directory entry can be attributed — so one value is enough
+// for everything except the tests that are specifically about them.
+const (
+	testOrg  = "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
+	testCall = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c"
+)
+
 func newManager(t *testing.T, low, high int, idleAfter time.Duration, now func() time.Time) *rtp.Manager {
 	t.Helper()
 
@@ -57,7 +65,7 @@ func TestNewManagerValidatesItsOptions(t *testing.T) {
 func TestAllocateDescribesTheSession(t *testing.T) {
 	manager := newManager(t, 55100, 55119, 0, nil)
 
-	descriptor, err := manager.Allocate("session-1", rtp.ModeEcho)
+	descriptor, err := manager.Allocate(rtp.AllocateOptions{SessionID: "session-1", OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU, Inactive: false})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
@@ -78,7 +86,7 @@ func TestAllocateDescribesTheSession(t *testing.T) {
 	if descriptor.SSRC == 0 {
 		t.Error("SSRC is zero")
 	}
-	if descriptor.Mode != rtp.ModeEcho {
+	if descriptor.Mode != rtp.ModeRelay {
 		t.Errorf("Mode = %q", descriptor.Mode)
 	}
 	if manager.Len() != 1 {
@@ -92,11 +100,11 @@ func TestAllocateDescribesTheSession(t *testing.T) {
 func TestAllocateIsIdempotentBySessionID(t *testing.T) {
 	manager := newManager(t, 55200, 55219, 0, nil)
 
-	first, err := manager.Allocate("same-id", rtp.ModeEcho)
+	first, err := manager.Allocate(rtp.AllocateOptions{SessionID: "same-id", OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU, Inactive: false})
 	if err != nil {
 		t.Fatalf("first Allocate: %v", err)
 	}
-	second, err := manager.Allocate("same-id", rtp.ModeEcho)
+	second, err := manager.Allocate(rtp.AllocateOptions{SessionID: "same-id", OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU, Inactive: false})
 	if err != nil {
 		t.Fatalf("second Allocate: %v", err)
 	}
@@ -117,16 +125,16 @@ func TestAllocateIsIdempotentBySessionID(t *testing.T) {
 func TestARepeatAllocateDoesNotChangeTheMode(t *testing.T) {
 	manager := newManager(t, 55300, 55319, 0, nil)
 
-	if _, err := manager.Allocate("s1", rtp.ModeEcho); err != nil {
+	if _, err := manager.Allocate(rtp.AllocateOptions{SessionID: "s1", OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU, Inactive: false}); err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
-	second, err := manager.Allocate("s1", rtp.ModeInactive)
+	second, err := manager.Allocate(rtp.AllocateOptions{SessionID: "s1", OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU, Inactive: true})
 	if err != nil {
 		t.Fatalf("second Allocate: %v", err)
 	}
-	if second.Mode != rtp.ModeEcho {
+	if second.Mode != rtp.ModeRelay {
 		t.Errorf("Mode = %q, want the original %q; a retry must not mutate a live session",
-			second.Mode, rtp.ModeEcho)
+			second.Mode, rtp.ModeRelay)
 	}
 }
 
@@ -142,7 +150,7 @@ func TestConcurrentAllocateForOneIDYieldsOneSession(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			descriptor, err := manager.Allocate("racing-id", rtp.ModeEcho)
+			descriptor, err := manager.Allocate(rtp.AllocateOptions{SessionID: "racing-id", OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU, Inactive: false})
 			if err != nil {
 				return
 			}
@@ -167,7 +175,7 @@ func TestConcurrentAllocateForOneIDYieldsOneSession(t *testing.T) {
 
 func TestAllocateRequiresASessionID(t *testing.T) {
 	manager := newManager(t, 55500, 55509, 0, nil)
-	if _, err := manager.Allocate("", rtp.ModeEcho); err == nil {
+	if _, err := manager.Allocate(rtp.AllocateOptions{SessionID: "", OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU, Inactive: false}); err == nil {
 		t.Error("Allocate accepted an empty session id")
 	}
 }
@@ -176,11 +184,11 @@ func TestAllocateSurfacesExhaustion(t *testing.T) {
 	manager := newManager(t, 55600, 55603, 0, nil) // two pairs
 
 	for i, id := range []string{"a", "b"} {
-		if _, err := manager.Allocate(id, rtp.ModeEcho); err != nil {
+		if _, err := manager.Allocate(rtp.AllocateOptions{SessionID: id, OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU, Inactive: false}); err != nil {
 			t.Fatalf("Allocate #%d: %v", i, err)
 		}
 	}
-	if _, err := manager.Allocate("c", rtp.ModeEcho); !errors.Is(err, rtp.ErrPortsExhausted) {
+	if _, err := manager.Allocate(rtp.AllocateOptions{SessionID: "c", OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU, Inactive: false}); !errors.Is(err, rtp.ErrPortsExhausted) {
 		t.Errorf("error = %v, want ErrPortsExhausted", err)
 	}
 }
@@ -188,7 +196,7 @@ func TestAllocateSurfacesExhaustion(t *testing.T) {
 func TestReleaseFreesThePortAndReportsWhatHappened(t *testing.T) {
 	manager := newManager(t, 55700, 55703, 0, nil) // two pairs
 
-	descriptor, err := manager.Allocate("s1", rtp.ModeEcho)
+	descriptor, err := manager.Allocate(rtp.AllocateOptions{SessionID: "s1", OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU, Inactive: false})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
@@ -221,7 +229,7 @@ func TestGetReturnsALiveSession(t *testing.T) {
 	if _, ok := manager.Get("s1"); ok {
 		t.Error("Get found a session that was never allocated")
 	}
-	if _, err := manager.Allocate("s1", rtp.ModeEcho); err != nil {
+	if _, err := manager.Allocate(rtp.AllocateOptions{SessionID: "s1", OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU, Inactive: false}); err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
 	session, ok := manager.Get("s1")
@@ -244,7 +252,7 @@ func TestReapIdleClosesSessionsWithNoTraffic(t *testing.T) {
 	clock := func() time.Time { return now }
 	manager := newManager(t, 55900, 55919, 30*time.Second, clock)
 
-	if _, err := manager.Allocate("stale", rtp.ModeEcho); err != nil {
+	if _, err := manager.Allocate(rtp.AllocateOptions{SessionID: "stale", OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU, Inactive: false}); err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
 
@@ -270,7 +278,7 @@ func TestReapIdleIsDisabledByAZeroTimeout(t *testing.T) {
 	now := time.Now()
 	manager := newManager(t, 56000, 56019, 0, func() time.Time { return now })
 
-	if _, err := manager.Allocate("forever", rtp.ModeEcho); err != nil {
+	if _, err := manager.Allocate(rtp.AllocateOptions{SessionID: "forever", OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU, Inactive: false}); err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
 	now = now.Add(24 * time.Hour)
@@ -286,7 +294,7 @@ func TestReapIdleIsDisabledByAZeroTimeout(t *testing.T) {
 func TestReapIdleSparesASessionThatIsReceivingTraffic(t *testing.T) {
 	manager := newManager(t, 56100, 56119, 50*time.Millisecond, nil)
 
-	descriptor, err := manager.Allocate("busy", rtp.ModeEcho)
+	descriptor, err := manager.Allocate(rtp.AllocateOptions{SessionID: "busy", OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU, Inactive: false})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
@@ -349,7 +357,7 @@ func TestDrainClosesEverythingAndRefusesNewAllocations(t *testing.T) {
 	}
 
 	for _, id := range []string{"a", "b", "c"} {
-		if _, err := manager.Allocate(id, rtp.ModeEcho); err != nil {
+		if _, err := manager.Allocate(rtp.AllocateOptions{SessionID: id, OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU, Inactive: false}); err != nil {
 			t.Fatalf("Allocate %q: %v", id, err)
 		}
 	}
@@ -366,7 +374,7 @@ func TestDrainClosesEverythingAndRefusesNewAllocations(t *testing.T) {
 	if allocator.InUse() != 0 {
 		t.Errorf("InUse() = %d after a drain; ports leaked", allocator.InUse())
 	}
-	if _, err := manager.Allocate("d", rtp.ModeEcho); !errors.Is(err, rtp.ErrClosed) {
+	if _, err := manager.Allocate(rtp.AllocateOptions{SessionID: "d", OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU, Inactive: false}); !errors.Is(err, rtp.ErrClosed) {
 		t.Errorf("Allocate after a drain returned %v, want ErrClosed", err)
 	}
 	// Draining twice is a no-op, so a signal handler racing an explicit shutdown is harmless.

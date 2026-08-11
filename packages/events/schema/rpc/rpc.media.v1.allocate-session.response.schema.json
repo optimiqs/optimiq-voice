@@ -1,0 +1,70 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"ok": {
+			"type": "boolean"
+		},
+		"sessionId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"sdpAnswer": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 16384
+		},
+		"instanceId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"address": {
+			"type": "string",
+			"maxLength": 64
+		},
+		"rtpPort": {
+			"type": "integer",
+			"minimum": 1,
+			"maximum": 65534
+		},
+		"rtcpPort": {
+			"type": "integer",
+			"minimum": 1,
+			"maximum": 65535
+		},
+		"ssrc": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 4294967295
+		},
+		"codec": {
+			"type": "string",
+			"enum": ["PCMU", "PCMA"]
+		},
+		"telephoneEventPayloadType": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 127
+		},
+		"reason": {
+			"type": "string",
+			"enum": [
+				"bad_request",
+				"capacity",
+				"shutting_down",
+				"unknown_session",
+				"wrong_instance",
+				"not_supported",
+				"internal"
+			]
+		},
+		"error": {
+			"type": "string",
+			"maxLength": 512
+		}
+	},
+	"required": ["ok", "sessionId"],
+	"additionalProperties": false
+}

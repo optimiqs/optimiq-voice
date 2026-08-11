@@ -1,13 +1,14 @@
 // Package rtp is mediad's packet path: a port-pair allocator over a configured range, and a
 // Session that owns one bound pair for the life of one call leg.
 //
-// v0 is a WALKING SKELETON. It proves that a port can be allocated, that RTP arrives on it, that
-// the far end can be learned from the packets themselves, and that audio can be put back on the
-// wire — which together are the whole substrate every later capability sits on (bridging is two
-// sessions forwarding to each other; playback is a session sourcing frames from a file; recording
-// is a session teeing them to one). What it deliberately does NOT have is in
-// plans/mediad-design.md §6: no jitter buffer, no transcoding, no packet loss concealment, no
-// SRTP, no RTCP.
+// Rung 2 of plans/mediad-design.md §2: a port is allocated, RTP arrives on it, the far end is
+// learned from the packets themselves (symmetric RTP), and two sessions RELAY to each other, which
+// is what a bridged call is. Playback is the same substrate with a file as the source and recording
+// is the same substrate with a tee; both are later rungs.
+//
+// What it deliberately does NOT have is in plans/mediad-design.md §6: no jitter buffer (a relay
+// must not add one — the receiving endpoint already has one, and two in series make the call
+// worse), no transcoding, no packet loss concealment, no SRTP, no RTCP reading.
 package rtp
 
 import (
@@ -20,6 +21,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pionrtp "github.com/pion/rtp"
@@ -34,30 +36,26 @@ const (
 	// not accidentally source audio.
 	ModeInactive Mode = "inactive"
 
-	// ModeEcho reflects received payloads back to the source. It exists to prove the packet path
-	// end to end without a second party, and it is what the v0 control surface allocates.
+	// ModeRelay forwards received payloads to a peer session, and is what a bridged leg is in.
 	//
-	// It is a diagnostic, not a product capability. The first real capability (bridged calls,
-	// design doc §2) replaces it with forwarding to a peer session.
+	// A session is put in this mode at allocation and has NO PEER until a bridge-sessions command
+	// gives it one; until then it receives, counts and discards, exactly like ModeInactive. That is
+	// the correct behaviour for a leg that has answered but is not yet talking to anybody — a
+	// caller listening to ringback while the B-leg rings.
+	ModeRelay Mode = "relay"
+
+	// ModeEcho reflects received payloads back to the source.
+	//
+	// A DIAGNOSTIC, not a product capability, and design doc open question 5 asked whether it
+	// should survive rung 2. It does, and it is now unreachable from the wire: no field in
+	// `rpc.media.v1.allocate-session` selects it, and only MEDIAD_ECHO_DIAGNOSTIC=true makes the
+	// manager produce it. The cost of keeping it is one branch in the packet path; the value is the
+	// simplest possible smoke test of a real deployment's ports and NAT, needing no second party.
+	// What it must never be is reachable by a production call path, which is what the flag settles.
 	ModeEcho Mode = "echo"
 )
 
-// ParseMode validates a mode from the wire. Unknown modes are refused rather than defaulted: a
-// typo in a control message should be a visible error, not a session that silently does nothing.
-func ParseMode(raw string) (Mode, error) {
-	switch Mode(raw) {
-	case ModeInactive:
-		return ModeInactive, nil
-	case ModeEcho:
-		return ModeEcho, nil
-	case "":
-		return ModeEcho, nil
-	default:
-		return "", fmt.Errorf("rtp: unknown media mode %q (want %q or %q)", raw, ModeInactive, ModeEcho)
-	}
-}
-
-// Payload types mediad handles in v0.
+// Payload types mediad handles.
 //
 // G.711 only, and PASSTHROUGH only: bytes in, same bytes out. There is no transcoding in v1 (design
 // doc §7) — a codec mismatch is resolved in SDP negotiation by refusing the offer, not in the media
@@ -68,19 +66,16 @@ const (
 	PayloadTypePCMU uint8 = 0
 	// PayloadTypePCMA is G.711 A-law, RFC 3551 static PT 8.
 	PayloadTypePCMA uint8 = 8
-	// PayloadTypeTelephoneEvent is RFC 4733 DTMF. Dynamic, but 101 is the de-facto value every
-	// endpoint offers, and v0 recognises only that one. Real negotiation reads it from the SDP
-	// `a=rtpmap` and arrives with the SDP wave.
+	// PayloadTypeTelephoneEvent is the DE-FACTO RFC 4733 DTMF type, and a DEFAULT rather than a
+	// rule: the type is dynamic, real endpoints offer 96, 100 and 101, and each session now carries
+	// whatever its own SDP negotiation settled on (see Session.telephoneEventPayloadType). This
+	// constant is what an answer proposes when the offer left the choice open.
 	PayloadTypeTelephoneEvent uint8 = 101
 )
 
 // SupportedPayloadTypes is what a session accepts, in the order it would be offered.
 func SupportedPayloadTypes() []uint8 {
 	return []uint8{PayloadTypePCMU, PayloadTypePCMA, PayloadTypeTelephoneEvent}
-}
-
-func isSupportedPayloadType(pt uint8) bool {
-	return pt == PayloadTypePCMU || pt == PayloadTypePCMA || pt == PayloadTypeTelephoneEvent
 }
 
 // maxPacketSize bounds one read. A 20 ms G.711 frame is 160 bytes of payload plus a 12-byte
@@ -108,17 +103,45 @@ type Session struct {
 	// SSRC identifies this session's own stream, RFC 3550 §5.1. Random per session.
 	SSRC uint32
 
+	// OrgID, CallID and LegID are carried, never acted on. mediad routes on session ids alone; these
+	// exist so a lifecycle event and a directory entry can be attributed to a tenant and a call
+	// without the engine having to correlate them after the fact.
+	OrgID  string
+	CallID string
+	LegID  string
+
 	mode  Mode
 	ports *PortPair
 	log   *slog.Logger
+
+	// audioPayloadType is the ONE G.711 type this session negotiated. Per-session rather than a
+	// package constant, because negotiation is per leg: one call can have a PCMU A-leg and a PCMA
+	// B-leg, and a session must drop what its own answer did not agree to.
+	audioPayloadType uint8
+	// telephoneEventPayloadType is the RFC 4733 type this session negotiated, or 0 for none.
+	telephoneEventPayloadType uint8
+
+	// peer is the session this one forwards to, set by Bridge and cleared by Unbridge.
+	//
+	// Guarded by its own RWMutex rather than the stats lock: it is read on EVERY packet (50 times a
+	// second per call) and written twice in a call's life, which is the exact shape an RWMutex is
+	// for. Sharing the stats mutex would serialise the read path behind counter updates.
+	peerMu sync.RWMutex
+	peer   *Session
 
 	// remote is the far end, LEARNED from the first packet rather than configured. See latch.
 	remoteMu sync.RWMutex
 	remote   *net.UDPAddr
 
-	// sequence is this session's own outbound counter. Echo does not reuse the sender's numbers:
+	// sequence is this session's own outbound counter. A relay does not reuse the sender's numbers:
 	// two streams sharing a sequence space is exactly what a jitter buffer cannot untangle.
-	sequence uint16
+	//
+	// ATOMIC, not a plain uint16, and the reason is the relay's threading: a session's outbound
+	// packets are written by its PEER's read goroutine, and across an unbridge/re-bridge (an
+	// attended transfer) the old peer's goroutine can still be in flight while the new one starts.
+	// Two writers, briefly, is exactly the window `-race` catches and a production deploy does not.
+	// The counter is 32-bit and truncated on use because Go has no atomic uint16.
+	sequence atomic.Uint32
 
 	statsMu sync.Mutex
 	stats   Stats
@@ -134,8 +157,16 @@ type Options struct {
 	ID string
 	// Ports is the allocated pair the session takes ownership of. Closing the session closes it.
 	Ports *PortPair
-	// Mode defaults to ModeEcho.
+	// OrgID, CallID and LegID are carried through to lifecycle events and the session directory.
+	OrgID  string
+	CallID string
+	LegID  string
+	// Mode defaults to ModeRelay.
 	Mode Mode
+	// AudioPayloadType is the negotiated G.711 type. Defaults to PCMU.
+	AudioPayloadType uint8
+	// TelephoneEventPayloadType is the negotiated RFC 4733 type; 0 means the offer had none.
+	TelephoneEventPayloadType uint8
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
 	// SSRC forces the synchronisation source. Zero means "generate one". Tests set it; nothing
@@ -158,7 +189,7 @@ func NewSession(opts Options) (*Session, error) {
 
 	mode := opts.Mode
 	if mode == "" {
-		mode = ModeEcho
+		mode = ModeRelay
 	}
 	logger := opts.Logger
 	if logger == nil {
@@ -174,13 +205,18 @@ func NewSession(opts Options) (*Session, error) {
 	}
 
 	return &Session{
-		ID:        opts.ID,
-		SSRC:      ssrc,
-		mode:      mode,
-		ports:     opts.Ports,
-		log:       logger.With("sessionId", opts.ID, "rtpPort", opts.Ports.Port, "ssrc", ssrc),
-		done:      make(chan struct{}),
-		createdAt: time.Now(),
+		ID:                        opts.ID,
+		SSRC:                      ssrc,
+		OrgID:                     opts.OrgID,
+		CallID:                    opts.CallID,
+		LegID:                     opts.LegID,
+		mode:                      mode,
+		ports:                     opts.Ports,
+		audioPayloadType:          opts.AudioPayloadType,
+		telephoneEventPayloadType: opts.TelephoneEventPayloadType,
+		log:                       logger.With("sessionId", opts.ID, "rtpPort", opts.Ports.Port, "ssrc", ssrc),
+		done:                      make(chan struct{}),
+		createdAt:                 time.Now(),
 	}, nil
 }
 
@@ -285,17 +321,142 @@ func (s *Session) handlePacket(raw []byte, from *net.UDPAddr) {
 		st.LastPacketUnixMs = now.UnixMilli()
 	})
 
-	if !isSupportedPayloadType(packet.PayloadType) {
-		// v1 is G.711 passthrough. An unexpected payload type means SDP negotiation let something
-		// through it should not have, so it is counted as the negotiation bug it is and dropped
-		// rather than reflected.
+	if !s.accepts(packet.PayloadType) {
+		// v1 is G.711 passthrough. A payload type this session did not negotiate means SDP
+		// negotiation let something through it should not have, so it is counted as the negotiation
+		// bug it is and dropped rather than forwarded — forwarding it would put bytes the far end
+		// cannot decode into a live call.
 		s.count(func(st *Stats) { st.UnsupportedPT++ })
 		return
 	}
 
-	if s.mode == ModeEcho {
+	switch s.mode {
+	case ModeEcho:
 		s.echo(&packet, from)
+	case ModeRelay:
+		s.relay(&packet)
 	}
+}
+
+// accepts reports whether a payload type is one this session negotiated.
+func (s *Session) accepts(pt uint8) bool {
+	if pt == s.audioPayloadType {
+		return true
+	}
+	return s.telephoneEventPayloadType != 0 && pt == s.telephoneEventPayloadType
+}
+
+// AudioPayloadType is the G.711 type this session negotiated.
+func (s *Session) AudioPayloadType() uint8 { return s.audioPayloadType }
+
+// TelephoneEventPayloadType is the RFC 4733 type this session negotiated, or 0.
+func (s *Session) TelephoneEventPayloadType() uint8 { return s.telephoneEventPayloadType }
+
+// SetPeer points this session's forwarding at another. Bridge calls it on BOTH sessions.
+func (s *Session) SetPeer(peer *Session) {
+	s.peerMu.Lock()
+	defer s.peerMu.Unlock()
+	s.peer = peer
+}
+
+// Peer is the session this one forwards to, or nil when it is not bridged.
+func (s *Session) Peer() *Session {
+	s.peerMu.RLock()
+	defer s.peerMu.RUnlock()
+	return s.peer
+}
+
+// relay forwards a received packet to the peer session, out of the PEER's socket.
+//
+// # Why the header is rewritten rather than passed through
+//
+// The payload is passed through byte for byte — that is what makes rung 2 achievable with no DSP,
+// and it is what carries RFC 4733 DTMF for free, since a telephone-event payload is just bytes to a
+// relay. The HEADER is not passed through, and each rewritten field is a separate decision:
+//
+//   - SSRC becomes the outgoing session's own. Two legs are two independent RTP sessions; handing
+//     leg B a stream stamped with leg A's SSRC would make B's jitter buffer see the synchronisation
+//     source change every time the bridge is re-pointed (an attended transfer), which endpoints
+//     read as "a different sender started talking" and handle by resetting — an audible click at
+//     best. One stable SSRC per leg for the life of the leg is what an endpoint expects.
+//
+//   - Sequence numbers become the outgoing session's own, and increment by one per forwarded
+//     packet. Passing A's through would leak A's losses into B's loss statistics and, worse, would
+//     make the sequence space JUMP on a re-bridge, which a jitter buffer reads as catastrophic loss
+//     and answers with concealment noise.
+//
+//   - Timestamp is KEPT. It is the frame's sampling instant, and a relay does not resample, so it
+//     is still true. Rewriting it would be inventing a clock.
+//
+//   - Marker is KEPT. On a telephone-event payload it is the start-of-digit flag, and dropping it
+//     turns every DTMF press into one an IVR cannot detect.
+//
+//   - Payload type is TRANSLATED for telephone-event only. G.711 is refused at bridge time when the
+//     two legs disagree (see Manager.Bridge), so the audio type always matches. The RFC 4733 type is
+//     dynamic and the two legs routinely land on different numbers (101 and 96 are both common);
+//     the payload FORMAT is identical, so renumbering is correct and is the whole reason DTMF
+//     survives a bridge between two phones that negotiated differently.
+func (s *Session) relay(packet *pionrtp.Packet) {
+	peer := s.Peer()
+	if peer == nil {
+		// Allocated but not yet bridged. Received, counted, discarded — which is exactly right for
+		// a leg that has answered and is listening to ringback.
+		return
+	}
+	peer.forward(packet, s.telephoneEventPayloadType)
+}
+
+// forward writes a packet out of THIS session's socket, to THIS session's latched far end.
+//
+// Called on the receiving session's peer, so all the socket and sequence state it touches is its
+// own — which is what keeps the two directions of a bridge from sharing anything but the payload
+// bytes.
+func (s *Session) forward(packet *pionrtp.Packet, sourceTelephoneEventPT uint8) {
+	to := s.Remote()
+	if to == nil {
+		// The far end of this leg has not spoken yet, so there is no address to send to. Symmetric
+		// RTP is a learned address, and a leg that has not sent has not taught us one; dropping is
+		// the only honest option, and it self-corrects on the first packet from that side.
+		return
+	}
+
+	payloadType := packet.PayloadType
+	if sourceTelephoneEventPT != 0 && payloadType == sourceTelephoneEventPT {
+		if s.telephoneEventPayloadType == 0 {
+			// This leg never negotiated telephone-event, so there is no number to send DTMF under.
+			// Dropped rather than sent as audio: an RFC 4733 payload rendered as G.711 is a loud
+			// click, which is worse than a missing digit.
+			s.count(func(st *Stats) { st.UnsupportedPT++ })
+			return
+		}
+		payloadType = s.telephoneEventPayloadType
+	}
+
+	out := pionrtp.Packet{
+		Header: pionrtp.Header{
+			Version:        2,
+			PayloadType:    payloadType,
+			SequenceNumber: s.nextSequence(),
+			Timestamp:      packet.Timestamp,
+			SSRC:           s.SSRC,
+			Marker:         packet.Marker,
+		},
+		Payload: packet.Payload,
+	}
+
+	encoded, err := out.Marshal()
+	if err != nil {
+		s.log.Debug("cannot marshal a relayed packet", "error", err)
+		return
+	}
+	if _, err := s.ports.RTP.WriteToUDP(encoded, to); err != nil {
+		// Per-packet and self-correcting. A call is not torn down because one frame did not make it
+		// out, and logging every send failure on a congested link is how a media server fills a
+		// disk while it is already struggling.
+		s.log.Debug("cannot relay a packet", "error", err, "remote", to.String())
+		return
+	}
+	s.count(func(st *Stats) { st.PacketsSent++ })
 }
 
 // latch binds the session to the first source address it hears from, and refuses every other one.
@@ -348,13 +509,11 @@ func (s *Session) latch(from *net.UDPAddr) bool {
 // is what loop-detection logic in real endpoints is built to discard. The timestamp is kept,
 // because in echo the frame's sampling instant genuinely is the one it arrived with.
 func (s *Session) echo(packet *pionrtp.Packet, to *net.UDPAddr) {
-	s.sequence++
-
 	out := pionrtp.Packet{
 		Header: pionrtp.Header{
 			Version:        2,
 			PayloadType:    packet.PayloadType,
-			SequenceNumber: s.sequence,
+			SequenceNumber: s.nextSequence(),
 			Timestamp:      packet.Timestamp,
 			SSRC:           s.SSRC,
 			// Marker survives: on a telephone-event payload it is the start-of-digit flag, and
@@ -376,6 +535,11 @@ func (s *Session) echo(packet *pionrtp.Packet, to *net.UDPAddr) {
 		return
 	}
 	s.count(func(st *Stats) { st.PacketsSent++ })
+}
+
+// nextSequence advances and returns this session's outbound RTP sequence number.
+func (s *Session) nextSequence() uint16 {
+	return uint16(s.sequence.Add(1))
 }
 
 func (s *Session) count(mutate func(*Stats)) {
@@ -407,6 +571,25 @@ func (s *Session) Close() error {
 			"foreignSource", stats.ForeignSource)
 	})
 	return err
+}
+
+// Summary flattens the session's facts for a Lifecycle implementation, which must never hold a
+// pointer to a Session whose sockets are already closed.
+func (s *Session) Summary() SessionSummary {
+	remote := ""
+	if addr := s.Remote(); addr != nil {
+		remote = addr.String()
+	}
+	return SessionSummary{
+		SessionID:  s.ID,
+		OrgID:      s.OrgID,
+		CallID:     s.CallID,
+		LegID:      s.LegID,
+		RTPPort:    s.ports.Port,
+		Stats:      s.Stats(),
+		Duration:   time.Since(s.createdAt),
+		RemoteAddr: remote,
+	}
 }
 
 // LocalAddrPort is the address a caller should advertise for this session, given the public address

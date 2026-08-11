@@ -14,12 +14,17 @@ import { createHash } from "node:crypto";
  * sip.reg.v1.<orgId>.<aorHash>.<event>       event = registered | unregistered | expired
  * queue.evt.v1.<orgId>.<queueId>.<event>     event = caller.joined | … | agent.state
  * voicemail.evt.v1.<orgId>.<mailboxId>.<event>  event = message.left | mwi.updated
+ * media.evt.v1.<orgId>.<sessionId>.<event>   event = session.ended | session.rtp-timeout
  * cdr.leg.v1.<orgId>                         one subject per org; event type is in the envelope
  * audit.evt.v1.<orgId>
  * provision.evt.v1.<orgId>
  * rpc.routing.v1.resolve                     request-reply, not JetStream
  * rpc.authz.v1.check
  * rpc.sip.v1.credential
+ * rpc.media.v1.allocate-session              engine -> mediad; RAW NATS both ends (see rpc.ts)
+ * rpc.media.v1.bridge-sessions
+ * rpc.media.v1.unbridge-sessions
+ * rpc.media.v1.release-session
  * ```
  *
  * The version token (`v1`) is a MAJOR version and is part of the subject, not the payload: a
@@ -42,6 +47,7 @@ export const SUBJECT_ROOTS = {
 	registration: `sip.reg.${SUBJECT_VERSION}`,
 	queue: `queue.evt.${SUBJECT_VERSION}`,
 	voicemail: `voicemail.evt.${SUBJECT_VERSION}`,
+	media: `media.evt.${SUBJECT_VERSION}`,
 	cdrLeg: `cdr.leg.${SUBJECT_VERSION}`,
 	audit: `audit.evt.${SUBJECT_VERSION}`,
 	provision: `provision.evt.${SUBJECT_VERSION}`,
@@ -53,6 +59,17 @@ export const RPC_SUBJECTS = {
 	authzCheck: `rpc.authz.${SUBJECT_VERSION}.check`,
 	voicemailList: `rpc.voicemail.${SUBJECT_VERSION}.list`,
 	sipCredential: `rpc.sip.${SUBJECT_VERSION}.credential`,
+	/**
+	 * The media-plane command surface: `apps/engine` (TypeScript) → `apps/mediad` (Go).
+	 *
+	 * These four are the FIRST subjects on this backbone whose responder is Go and whose caller is
+	 * TypeScript, which inverts the framing obligation every other subject carries — see the
+	 * "raw NATS on both ends" note at the head of `schemas/rpc.ts`.
+	 */
+	mediaAllocateSession: `rpc.media.${SUBJECT_VERSION}.allocate-session`,
+	mediaBridgeSessions: `rpc.media.${SUBJECT_VERSION}.bridge-sessions`,
+	mediaUnbridgeSessions: `rpc.media.${SUBJECT_VERSION}.unbridge-sessions`,
+	mediaReleaseSession: `rpc.media.${SUBJECT_VERSION}.release-session`,
 } as const;
 
 /**
@@ -159,6 +176,37 @@ export const VOICEMAIL_EVENTS = ["message.left", "mwi.updated"] as const;
 export type VoicemailEvent = (typeof VOICEMAIL_EVENTS)[number];
 
 /**
+ * Media-plane session vocabulary — what `apps/mediad` TELLS, as opposed to what it is ASKED
+ * (`rpc.media.v1.*`).
+ *
+ * The split is the platform's usual one: ask over core request-reply, tell over JetStream. A
+ * command is a synchronous question inside a call setup; these two are facts about a session that
+ * outlive the asking, and the engine acts on them by tearing a leg down.
+ *
+ * Only two members, and both exist because something branches on them:
+ *
+ * - `session.ended` is the fact. It carries the reason, so one consumer can tell a session that was
+ *   released in the normal course of a hangup from one that died — which is the difference between
+ *   a clean call and a media outage in the same wallboard.
+ * - `session.rtp-timeout` is the DIAGNOSIS that precedes an `ended` whose reason is `rtp-timeout`.
+ *   It is separate rather than folded in because it is actionable on its own: audio stopped while
+ *   the signalling plane still believes the call is up, which is the single most common shape of a
+ *   "the call was still connected but we could not hear each other" report.
+ *
+ * There is deliberately no `session.allocated` or `session.bridged`: both are the successful reply
+ * to a command the engine issued and is still holding, so publishing them would be telling the
+ * caller something it already knows.
+ *
+ * Named `MEDIA_SESSION_EVENTS` rather than `MEDIA_EVENTS`, breaking the `CALL_EVENTS` /
+ * `QUEUE_EVENTS` pattern on purpose: `apps/engine` already owns a domain type called `MediaEvent`
+ * (its media-server-agnostic event union, `src/media/media-event.ts`), and the one file that must
+ * import both is the `mediad` adapter. Two different `MediaEvent`s in one import list is a rename
+ * waiting to be applied to the wrong one.
+ */
+export const MEDIA_SESSION_EVENTS = ["session.ended", "session.rtp-timeout"] as const;
+export type MediaSessionEvent = (typeof MEDIA_SESSION_EVENTS)[number];
+
+/**
  * Reserved queue-scope token for events that belong to the org rather than to one queue —
  * in practice `agent.state`, since an agent has one status across every tier they sit in.
  * Wallboards subscribe to `queue.evt.v1.<org>.>` and therefore see both scopes.
@@ -174,6 +222,7 @@ export const EVENT_FAMILIES = [
 	"registration",
 	"queue",
 	"voicemail",
+	"media",
 	"cdr",
 	"audit",
 	"provision",
@@ -286,6 +335,16 @@ export const subjectFor = {
 	voicemail(orgId: string, mailboxId: string, event: VoicemailEvent | (string & {})): string {
 		return `${SUBJECT_ROOTS.voicemail}.${assertToken("orgId", orgId)}.${assertToken("mailboxId", mailboxId)}.${assertEvent(event)}`;
 	},
+	/**
+	 * `media.evt.v1.<orgId>.<sessionId>.<event>` — the media plane's session lifecycle.
+	 *
+	 * `sessionId` and not `callId`: a call has one id and several media sessions (one per leg), and
+	 * the thing that ends, times out, or is reaped is the session. The call it belongs to travels in
+	 * the payload, so a consumer that thinks in calls has it without the subject having to lie.
+	 */
+	media(orgId: string, sessionId: string, event: MediaSessionEvent | (string & {})): string {
+		return `${SUBJECT_ROOTS.media}.${assertToken("orgId", orgId)}.${assertToken("sessionId", sessionId)}.${assertEvent(event)}`;
+	},
 	/** `cdr.leg.v1.<orgId>` — a single ordered subject per org; the CDR writer consumes it. */
 	cdrLeg(orgId: string): string {
 		return `${SUBJECT_ROOTS.cdrLeg}.${assertToken("orgId", orgId)}`;
@@ -379,6 +438,21 @@ export const subjectFilterFor = {
 		return `${SUBJECT_ROOTS.voicemail}.${assertToken("orgId", orgId)}.*.${assertEvent(event)}`;
 	},
 
+	/** Every media-session event, every org — the MEDIA stream's own subject list. */
+	allMedia(): string {
+		return `${SUBJECT_ROOTS.media}.>`;
+	},
+	mediaInOrg(orgId: string): string {
+		return `${SUBJECT_ROOTS.media}.${assertToken("orgId", orgId)}.>`;
+	},
+	/** Every event of one media session. */
+	mediaSession(orgId: string, sessionId: string): string {
+		return `${SUBJECT_ROOTS.media}.${assertToken("orgId", orgId)}.${assertToken("sessionId", sessionId)}.>`;
+	},
+	mediaEventInOrg(orgId: string, event: MediaSessionEvent | (string & {})): string {
+		return `${SUBJECT_ROOTS.media}.${assertToken("orgId", orgId)}.*.${assertEvent(event)}`;
+	},
+
 	/** `cdr.leg.v1.*` — the CDR writer's filter; one token, so `*` not `>`. */
 	allCdrLegs(): string {
 		return `${SUBJECT_ROOTS.cdrLeg}.*`;
@@ -434,6 +508,14 @@ export type ParsedSubject =
 			readonly version: string;
 			readonly orgId: string;
 			readonly mailboxId: string;
+			readonly event: string;
+	  }
+	| {
+			readonly kind: "media";
+			readonly family: "media";
+			readonly version: string;
+			readonly orgId: string;
+			readonly sessionId: string;
 			readonly event: string;
 	  }
 	| {
@@ -526,6 +608,10 @@ export function parseSubject(subject: string): ParsedSubject | undefined {
 			event: event.join("."),
 		};
 	}
+	if (prefix === "media.evt" && rest.length >= 3) {
+		const [orgId, sessionId, ...event] = rest as [string, string, ...string[]];
+		return { kind: "media", family: "media", version, orgId, sessionId, event: event.join(".") };
+	}
 	if (prefix === "cdr.leg" && rest.length === 1) {
 		return { kind: "cdr-leg", family: "cdr", version, orgId: rest[0] as string };
 	}
@@ -573,6 +659,10 @@ export function isQueueEvent(value: string): value is QueueEvent {
 
 export function isVoicemailEvent(value: string): value is VoicemailEvent {
 	return (VOICEMAIL_EVENTS as readonly string[]).includes(value);
+}
+
+export function isMediaSessionEvent(value: string): value is MediaSessionEvent {
+	return (MEDIA_SESSION_EVENTS as readonly string[]).includes(value);
 }
 
 /**

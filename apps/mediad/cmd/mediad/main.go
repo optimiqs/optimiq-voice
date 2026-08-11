@@ -1,11 +1,15 @@
 // Command mediad is the Optimiq Voice media plane (plan §3.4, PG track).
 //
-// Today it is a WALKING SKELETON: it allocates RTP/RTCP port pairs from a configured range over
-// `rpc.media.v0.allocate` / `.release`, receives RTP on them, learns the far end from the packets
-// themselves, and echoes G.711 back. That is the substrate — nothing more. The capability ladder
-// that turns it into Asterisk's replacement (bridged calls → recording → conference mix-minus →
-// T.38) is in plans/mediad-design.md, and Asterisk keeps serving every real call until each rung
-// is proven.
+// It serves rung 2 of plans/mediad-design.md §2 — BRIDGED CALLS. It answers `rpc.media.v1.*` with
+// SDP (G.711 passthrough plus RFC 4733), allocates RTP/RTCP port pairs from a configured range,
+// learns each far end from the packets themselves, relays between two sessions, and publishes
+// `media.evt.v1.*` when a session ends or its audio stops. Which mediad instance holds which session
+// is recorded in the `media-sessions` KV directory, so the commands after an allocate reach the one
+// instance that can serve them.
+//
+// The rungs above this one (recording → MOH/park → conference mix-minus → Opus/G.722 → T.38) are
+// still Asterisk's, and Asterisk keeps serving every real call until each is proven. The engine
+// chooses per deployment with ENGINE_MEDIA_DRIVER.
 //
 // Configuration is entirely environmental; run with no arguments.
 package main
@@ -22,9 +26,12 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/config"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/control"
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/directory"
+	mediaevents "github.com/optimiqs/optimiq-voice/apps/mediad/internal/events"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
 
@@ -57,16 +64,6 @@ func run() error {
 	defer stop()
 
 	allocator, err := rtp.NewAllocator(cfg.BindIP, cfg.RTPPortMin, cfg.RTPPortMax)
-	if err != nil {
-		return err
-	}
-
-	manager, err := rtp.NewManager(rtp.ManagerOptions{
-		Allocator:  allocator,
-		PublicAddr: cfg.PublicIP,
-		IdleAfter:  cfg.SessionIdleTimeout,
-		Logger:     log,
-	})
 	if err != nil {
 		return err
 	}
@@ -104,7 +101,44 @@ func run() error {
 		}
 	}()
 
-	server, err := control.NewServer(manager, log)
+	// JetStream is needed for two things and neither is optional at this rung: the `media-sessions`
+	// KV directory, without which a second instance cannot route a command, and the lifecycle
+	// publisher, without which a call that loses audio ends silently.
+	js, err := jetstream.New(conn)
+	if err != nil {
+		return fmt.Errorf("opening JetStream: %w", err)
+	}
+
+	openCtx, cancelOpen := context.WithTimeout(ctx, 10*time.Second)
+	sessionDirectory, err := directory.Open(openCtx, js, log)
+	cancelOpen()
+	if err != nil {
+		return err
+	}
+
+	announcer := control.NewLifecycleAnnouncer(
+		mediaevents.NewJetStreamPublisher(js), sessionDirectory, cfg.InstanceID, log)
+
+	manager, err := rtp.NewManager(rtp.ManagerOptions{
+		Allocator:      allocator,
+		PublicAddr:     cfg.PublicIP,
+		IdleAfter:      cfg.SessionIdleTimeout,
+		RTPTimeout:     cfg.RTPTimeout,
+		EchoDiagnostic: cfg.EchoDiagnostic,
+		Lifecycle:      announcer,
+		Logger:         log,
+	})
+	if err != nil {
+		return err
+	}
+
+	server, err := control.NewServer(control.ServerOptions{
+		Sessions:   manager,
+		Directory:  sessionDirectory,
+		InstanceID: cfg.InstanceID,
+		PublicAddr: cfg.PublicIP,
+		Logger:     log,
+	})
 	if err != nil {
 		return err
 	}
@@ -119,12 +153,25 @@ func run() error {
 		"publicIp", cfg.PublicIP.String(),
 		"rtpPortRange", fmt.Sprintf("%d-%d", cfg.RTPPortMin, cfg.RTPPortMax),
 		"capacity", cfg.Capacity(),
-		"allocateSubject", control.SubjectAllocate,
-		"releaseSubject", control.SubjectRelease,
+		"instanceId", cfg.InstanceID,
+		"subjects", []string{
+			control.SubjectAllocateSession,
+			control.SubjectBridgeSessions,
+			control.SubjectUnbridgeSessions,
+			control.SubjectReleaseSession,
+		},
 		"queueGroup", queueGroup,
+		"rtpTimeout", cfg.RTPTimeout.String(),
 		"idleTimeout", cfg.SessionIdleTimeout.String())
-	log.Warn("this is the mediad walking skeleton: it allocates ports and echoes G.711. " +
-		"No call is served by it — Asterisk is still the media plane. See plans/mediad-design.md")
+	if cfg.EchoDiagnostic {
+		// Refused as a state rather than as a value: a deployment with this on serves NO working
+		// calls, because every leg hears itself instead of the other party. It is a smoke-test mode
+		// and an operator who left it on needs to see that on every boot, not once in a changelog.
+		log.Warn("MEDIAD_ECHO_DIAGNOSTIC is on: every session ECHOES and no call will connect. " +
+			"This is a diagnostic mode; turn it off to serve traffic.")
+	}
+	log.Info("mediad serves rung 2 (bridged calls): G.711 passthrough, RFC 4733 DTMF, two-party " +
+		"relay. Recording, MOH, conferencing and T.38 are still Asterisk's — see plans/mediad-design.md")
 
 	var group sync.WaitGroup
 	group.Add(1)

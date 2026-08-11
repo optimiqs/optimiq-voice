@@ -1,291 +1,143 @@
-// Package control is mediad's NATS command surface.
+// Package control is mediad's NATS command surface: the Go responder for `rpc.media.v1.*`.
 //
-// # Why the subjects live here and not in packages/events
+// # The contract now lives in packages/events, and this is the promotion
 //
-// Every other cross-service subject in this platform is defined in `packages/events` (Zod) and
-// generated into `packages/events-go`, and that is where `rpc.media.*` will end up. It is NOT
-// there yet, on purpose — the head of `packages/events/src/schemas/rpc.ts` already says so:
-//
-//	`rpc.media.*` (engine → `mediad`) is deliberately absent: it arrives with `apps/mediad`, and
-//	inventing its shape before the media plane exists would be fiction.
-//
-// The command set that bridged-call parity actually needs (design doc §3) is not known until a
-// real capability has been built against it. Promoting a guess into the shared contract would
-// freeze it: `packages/events` is consumed by apps/api, apps/engine and packages/events-go, and a
-// field added there is a field every service compiles against. So v0 lives here, is named `v0`
-// rather than `v1` so nothing mistakes it for a stable contract, and moves to `packages/events` as
-// `rpc.media.v1.*` when the first capability has proven the shape. Design doc §4 has the promotion
-// criteria.
+// v0 defined its subjects and its structs here, deliberately, because the command set bridged-call
+// parity actually needs was not knowable until a real capability had been built against it, and
+// promoting a guess into the shared contract would have frozen the guess. All four promotion
+// criteria in plans/mediad-design.md §4.3 are now met — rung 2 works, SDP is in the payloads, and
+// the engine has a real `MediadMediaPort` — so the shapes below are `packages/events-go` types
+// generated from the Zod source of truth, and the drift gate keeps the two languages honest.
 //
 // # Raw NATS, not a Nest @MessagePattern — and the same rule in reverse
 //
-// The responder here is a raw `conn.Subscribe` + `msg.Respond`, so the bytes on the wire are
-// exactly the structs below. That is mandatory for a subject with a non-TypeScript participant,
-// and mediad is a Go process talking to a NestJS engine, so this subject is that case in its purest
-// form. NestJS's NATS transport frames request-reply as `{"pattern":…,"data":…,"id":…}` /
-// `{"response":…,"isDisposed":true,"id":…}`, and a request carrying the bare contract payload is
-// not answered at all — it times out. `rpc.sip.v1.credential` is served raw by apps/api for exactly
-// this reason (see `apps/api/src/pbx/sip-credentials/sip-credentials.responder.ts`).
+// The responder here is a raw `conn.Subscribe` + `msg.Respond`, so the bytes on the wire are exactly
+// the generated structs. That is mandatory for a subject with a non-TypeScript participant, and
+// this family is that case in its purest form: a Go responder answering a NestJS caller.
 //
-// The obligation runs the other way too: when the engine calls into mediad, its client must be a
-// raw NATS request, NOT a Nest `ClientProxy.send`. A `ClientProxy` would wrap the payload in the
-// framing above and this handler would reject it as malformed. Design doc §4 states this as a
-// requirement on the engine-side client.
+// NestJS's NATS transport frames request-reply as `{"pattern":…,"data":…,"id":…}` /
+// `{"response":…,"isDisposed":true,"id":…}`, and a request carrying the bare contract payload is not
+// answered at all — it times out. The obligation runs the other way here: the ENGINE's client must
+// be a raw `NatsConnection.request()`, NOT a `ClientProxy.send`, because a ClientProxy would wrap
+// the payload in that framing and this handler would reject it as malformed. The rule is recorded
+// on `mediaAllocateSessionRequestSchema` in packages/events for whoever writes the next client.
+//
+// # A refusal is a REPLY, never a silence
+//
+// Every handler answers. A responder that simply does not reply to a request it dislikes is
+// indistinguishable from a crashed one, and the caller pays the whole timeout to learn nothing.
+// `ok:false` with a machine-readable `reason` costs one round trip and tells the engine whether to
+// retry, try another instance, or route the leg to Asterisk.
 package control
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"time"
 
 	"github.com/nats-io/nats.go"
+	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/directory"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
 
-// The v0 command subjects.
+// The v1 command subjects, taken from the contract package rather than restated.
 //
-// `v0` is load-bearing. It means "this shape WILL change and nothing outside mediad and the
-// engine's mediad client may depend on it". The moment it is promoted to `packages/events` it
-// becomes `rpc.media.v1.*` and gains the compatibility obligations every other `.v1` subject has.
+// Re-declared as local names purely so the subscription table below reads as a list of this
+// service's own surface; the VALUES come from packages/events-go, so a subject rename in the Zod
+// source is a compile error here rather than a silent mismatch at runtime.
 const (
-	// SubjectAllocate reserves an RTP port pair for a session.
-	SubjectAllocate = "rpc.media.v0.allocate"
-	// SubjectRelease frees one.
-	SubjectRelease = "rpc.media.v0.release"
+	SubjectAllocateSession  = contract.SubjectMediaAllocateSessionRPC
+	SubjectBridgeSessions   = contract.SubjectMediaBridgeSessionsRPC
+	SubjectUnbridgeSessions = contract.SubjectMediaUnbridgeSessionsRPC
+	SubjectReleaseSession   = contract.SubjectMediaReleaseSessionRPC
 )
 
-// Suggested client deadlines, in the shape packages/events-go states them (TimeoutXxxRPC).
-//
-// Both are short because both are on the call path: an allocate sits inside the engine's answer of
-// an INVITE, and a caller hears the delay as silence before ringback. Allocate does a bind — a
-// syscall, microseconds — so 500 ms is three orders of magnitude of headroom, and a reply slower
-// than that means the instance is sick rather than busy.
+// Refusal codes. Values come from the contract; these names exist so a handler reads as prose.
 const (
-	TimeoutAllocateRPC = 500 * time.Millisecond
-	TimeoutReleaseRPC  = 500 * time.Millisecond
-)
-
-// AllocateRequest asks for a port pair.
-type AllocateRequest struct {
-	// SessionID is assigned by the CALLER, never by mediad.
-	//
-	// Same reason `OriginateRequest.channelId` is client-assigned at the engine's MediaPort seam:
-	// the caller must be able to release a session whose allocate reply it never received. A
-	// server-assigned id would mean a timed-out allocate leaves a port held under a name nobody
-	// knows, and the only recovery would be the idle reaper. It is also what makes Allocate
-	// idempotent — see rtp.Manager.Allocate.
-	SessionID string `json:"sessionId"`
-	// CallID is the call this leg belongs to. Carried for logs and for the future session
-	// directory; mediad does not route on it in v0.
-	CallID string `json:"callId,omitempty"`
-	// Mode is "echo" (default) or "inactive". See rtp.Mode.
-	Mode string `json:"mode,omitempty"`
-}
-
-// AllocateResponse is the reply.
-//
-// Every field is present on success and the error path is a REPLY, never a silence. A responder
-// that simply does not answer a request it dislikes is indistinguishable from a crashed one, and
-// the caller pays the full timeout to learn nothing. `ok:false` with a reason costs one round trip
-// and tells the engine whether to retry, try another instance, or fail the call.
-type AllocateResponse struct {
-	OK        bool   `json:"ok"`
-	SessionID string `json:"sessionId"`
-	// Address is the address the far end should send RTP to — MEDIAD_PUBLIC_IP, not the bind
-	// address. It is what goes in an SDP `c=` line.
-	Address string `json:"address,omitempty"`
-	RTPPort int    `json:"rtpPort,omitempty"`
-	// RTCPPort is always RTPPort+1 (RFC 3550 §11). Stated explicitly anyway, so a caller never has
-	// to re-derive a convention.
-	RTCPPort int    `json:"rtcpPort,omitempty"`
-	SSRC     uint32 `json:"ssrc,omitempty"`
-	Mode     string `json:"mode,omitempty"`
-	// PayloadTypes is what this session accepts, most-preferred first. v0 is G.711 passthrough
-	// plus RFC 4733, so the answer is always the same; it is on the wire so the SDP wave can start
-	// reading it instead of hard-coding the list on the engine side.
-	//
-	// `[]int`, NOT `[]uint8`, and this is a correctness fix rather than a style choice.
-	// `[]uint8` is `[]byte` to Go, and encoding/json marshals `[]byte` as a BASE64 STRING: the
-	// reply would carry `"payloadTypes":"AAhl"` instead of `[0,8,101]`, and the TypeScript engine
-	// would receive a string where it expects an array. A Go-to-Go round trip decodes that back
-	// happily, so only a test that inspects the actual JSON — or a real cross-language call —
-	// catches it. See TestPayloadTypesAreAJSONArrayNotBase64.
-	PayloadTypes []int `json:"payloadTypes,omitempty"`
-	// Error is a human-readable reason when OK is false.
-	Error string `json:"error,omitempty"`
-	// Reason is a stable machine-readable code. The engine branches on THIS, never on Error.
-	Reason string `json:"reason,omitempty"`
-}
-
-// ReleaseRequest frees a session.
-type ReleaseRequest struct {
-	SessionID string `json:"sessionId"`
-}
-
-// ReleaseResponse reports what happened.
-type ReleaseResponse struct {
-	OK        bool   `json:"ok"`
-	SessionID string `json:"sessionId"`
-	// Released is false when there was no such session. That is a SUCCESS, not a failure: release
-	// is idempotent, and a retry after a lost reply must not look like an error.
-	Released bool   `json:"released"`
-	Error    string `json:"error,omitempty"`
-	Reason   string `json:"reason,omitempty"`
-}
-
-// Machine-readable refusal codes. The engine branches on these.
-const (
-	// ReasonBadRequest — the payload was malformed or a required field was missing. Retrying the
-	// same bytes will fail the same way.
-	ReasonBadRequest = "bad_request"
-	// ReasonCapacity — no port pair is free. Retry elsewhere, or fail the call with congestion.
-	// This is the one refusal that is about load rather than correctness.
-	ReasonCapacity = "capacity"
-	// ReasonShuttingDown — this instance is draining. Do not retry HERE.
+	ReasonBadRequest   = "bad_request"
+	ReasonCapacity     = "capacity"
 	ReasonShuttingDown = "shutting_down"
-	// ReasonInternal — anything else.
-	ReasonInternal = "internal"
+	ReasonUnknown      = "unknown_session"
+	ReasonWrongNode    = "wrong_instance"
+	ReasonNotSupported = "not_supported"
+	ReasonInternal     = "internal"
 )
 
-// Sessions is what the control surface needs from the packet path. An interface rather than the
-// concrete *rtp.Manager so the handlers are table-testable against a stub with no sockets in it —
-// the same reason sipd's registrar takes a credentials.Store.
+// Sessions is what the control surface needs from the packet path.
+//
+// An interface rather than the concrete *rtp.Manager so the handlers are table-testable against a
+// stub with no sockets in it — the same line sipd's registrar draws with credentials.Store.
 type Sessions interface {
-	Allocate(sessionID string, mode rtp.Mode) (rtp.Descriptor, error)
+	Allocate(opts rtp.AllocateOptions) (rtp.Descriptor, error)
+	Bridge(bridgeID, first, second string) error
+	Unbridge(bridgeID string) ([]string, bool)
 	Release(sessionID string) bool
 }
 
-// Server answers the v0 command subjects.
+// Server answers the v1 command subjects.
 type Server struct {
-	sessions Sessions
-	log      *slog.Logger
+	sessions   Sessions
+	dir        directory.Store
+	log        *slog.Logger
+	instanceID string
+	publicAddr netip.Addr
+}
+
+// ServerOptions configures a Server.
+type ServerOptions struct {
+	// Sessions is the packet path. Required.
+	Sessions Sessions
+	// Directory records session ownership. Required — see the package doc on directory.
+	Directory directory.Store
+	// InstanceID names this process on the wire and in the directory. Required.
+	InstanceID string
+	// PublicAddr is what goes into an SDP answer's `c=` line. Required.
+	PublicAddr netip.Addr
+	// Logger defaults to slog.Default().
+	Logger *slog.Logger
 }
 
 // NewServer builds a Server.
-func NewServer(sessions Sessions, log *slog.Logger) (*Server, error) {
-	if sessions == nil {
+func NewServer(opts ServerOptions) (*Server, error) {
+	switch {
+	case opts.Sessions == nil:
 		return nil, errors.New("control: a session manager is required")
+	case opts.Directory == nil:
+		return nil, errors.New("control: a session directory is required")
+	case opts.InstanceID == "":
+		return nil, errors.New("control: an instance id is required")
+	case !opts.PublicAddr.IsValid():
+		return nil, errors.New("control: a public address is required")
 	}
+	log := opts.Logger
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{sessions: sessions, log: log}, nil
+	return &Server{
+		sessions:   opts.Sessions,
+		dir:        opts.Directory,
+		log:        log,
+		instanceID: opts.InstanceID,
+		publicAddr: opts.PublicAddr,
+	}, nil
 }
 
-// HandleAllocate turns request bytes into reply bytes.
+// InstanceID names this process. Carried on every reply so a refusal can be attributed.
+func (s *Server) InstanceID() string { return s.instanceID }
+
+// Subscribe attaches every handler to a connection and returns the subscriptions.
 //
-// Bytes in, bytes out, no *nats.Msg: the whole handler is then a pure function of the payload, and
-// the unit suite covers it as a table without a broker anywhere near it. sipd draws the same line —
-// `credentialFromReply` is tested in-package while the transport is left to the gated integration
-// suite. It never returns an error, because there is no caller that could do anything with one: a
-// refusal IS the reply.
-func (s *Server) HandleAllocate(data []byte) []byte {
-	var request AllocateRequest
-	if err := json.Unmarshal(data, &request); err != nil {
-		return encode(s.log, AllocateResponse{
-			OK:     false,
-			Error:  fmt.Sprintf("malformed allocate request: %v", err),
-			Reason: ReasonBadRequest,
-		})
-	}
-
-	if request.SessionID == "" {
-		return encode(s.log, AllocateResponse{
-			OK:     false,
-			Error:  "sessionId is required and must be assigned by the caller",
-			Reason: ReasonBadRequest,
-		})
-	}
-
-	mode, err := rtp.ParseMode(request.Mode)
-	if err != nil {
-		return encode(s.log, AllocateResponse{
-			OK:        false,
-			SessionID: request.SessionID,
-			Error:     err.Error(),
-			Reason:    ReasonBadRequest,
-		})
-	}
-
-	descriptor, err := s.sessions.Allocate(request.SessionID, mode)
-	if err != nil {
-		reason := ReasonInternal
-		switch {
-		case errors.Is(err, rtp.ErrPortsExhausted):
-			reason = ReasonCapacity
-		case errors.Is(err, rtp.ErrClosed):
-			reason = ReasonShuttingDown
-		}
-		// Logged at WARN rather than ERROR: capacity and shutdown are operational states, and a
-		// deploy would otherwise page on every drain.
-		s.log.Warn("refusing an allocate",
-			"sessionId", request.SessionID, "callId", request.CallID,
-			"reason", reason, "error", err)
-		return encode(s.log, AllocateResponse{
-			OK:        false,
-			SessionID: request.SessionID,
-			Error:     err.Error(),
-			Reason:    reason,
-		})
-	}
-
-	return encode(s.log, AllocateResponse{
-		OK:           true,
-		SessionID:    descriptor.SessionID,
-		Address:      descriptor.Address.String(),
-		RTPPort:      descriptor.RTPPort,
-		RTCPPort:     descriptor.RTCPPort,
-		SSRC:         descriptor.SSRC,
-		Mode:         string(descriptor.Mode),
-		PayloadTypes: widenPayloadTypes(descriptor.PayloadTypes),
-	})
-}
-
-// widenPayloadTypes converts the packet path's `[]uint8` to the wire's `[]int`. See
-// AllocateResponse.PayloadTypes for why the wire type is not `[]uint8`.
-func widenPayloadTypes(payloadTypes []uint8) []int {
-	widened := make([]int, len(payloadTypes))
-	for i, pt := range payloadTypes {
-		widened[i] = int(pt)
-	}
-	return widened
-}
-
-// HandleRelease turns request bytes into reply bytes.
-func (s *Server) HandleRelease(data []byte) []byte {
-	var request ReleaseRequest
-	if err := json.Unmarshal(data, &request); err != nil {
-		return encode(s.log, ReleaseResponse{
-			OK:     false,
-			Error:  fmt.Sprintf("malformed release request: %v", err),
-			Reason: ReasonBadRequest,
-		})
-	}
-	if request.SessionID == "" {
-		return encode(s.log, ReleaseResponse{
-			OK:     false,
-			Error:  "sessionId is required",
-			Reason: ReasonBadRequest,
-		})
-	}
-
-	// Releasing an unknown session is OK:true, Released:false. See ReleaseResponse.Released.
-	return encode(s.log, ReleaseResponse{
-		OK:        true,
-		SessionID: request.SessionID,
-		Released:  s.sessions.Release(request.SessionID),
-	})
-}
-
-// Subscribe attaches both handlers to a connection and returns the subscriptions.
-//
-// Raw `conn.Subscribe`, and a queue group so several mediad instances can share the subject and
+// Raw `conn.Subscribe`, and a queue group so several mediad instances can share the subjects and
 // NATS picks one — which is what makes the media plane horizontally scalable without a load
-// balancer or a discovery step. Per-instance addressing (the engine talking to the specific
-// instance holding a session) is a v1 problem and is design doc open question 2.
+// balancer or a discovery step. Per-instance addressing, which the three commands AFTER allocate
+// need, is the `media-sessions` KV directory rather than a per-instance subject; see
+// internal/directory.
 func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscription, error) {
 	if conn == nil {
 		return nil, errors.New("control: a NATS connection is required")
@@ -295,8 +147,10 @@ func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscrip
 		subject string
 		handle  func([]byte) []byte
 	}{
-		{SubjectAllocate, s.HandleAllocate},
-		{SubjectRelease, s.HandleRelease},
+		{SubjectAllocateSession, s.HandleAllocateSession},
+		{SubjectBridgeSessions, s.HandleBridgeSessions},
+		{SubjectUnbridgeSessions, s.HandleUnbridgeSessions},
+		{SubjectReleaseSession, s.HandleReleaseSession},
 	}
 
 	subscriptions := make([]*nats.Subscription, 0, len(handlers))
@@ -339,8 +193,8 @@ func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscrip
 	return subscriptions, nil
 }
 
-// encode marshals a reply. A reply that cannot be marshalled is a programming error, but the
-// caller is mid-call, so it degrades to a hand-written refusal rather than to a timeout.
+// encode marshals a reply. A reply that cannot be marshalled is a programming error, but the caller
+// is mid-call, so it degrades to a hand-written refusal rather than to a timeout.
 func encode(log *slog.Logger, reply any) []byte {
 	payload, err := json.Marshal(reply)
 	if err != nil {
@@ -348,4 +202,30 @@ func encode(log *slog.Logger, reply any) []byte {
 		return []byte(`{"ok":false,"reason":"internal","error":"cannot encode the reply"}`)
 	}
 	return payload
+}
+
+func stringPtr(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func intPtr(value int) *int { return &value }
+
+// dirContext bounds a directory operation. See directory.Timeout for why it is short.
+func dirContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), directory.Timeout)
+}
+
+// nowMillis is the clock every timestamp on the wire uses. Epoch milliseconds, matching every other
+// KV value on this backbone.
+func nowMillis() int64 { return time.Now().UnixMilli() }
+
+// sdpSessionIDs derives the `o=` line's session id and version from a session id and a port.
+//
+// Deterministic rather than random so that a re-answer of the same session produces the same origin
+// — some endpoints treat a changed `o=` session id as a whole new session and renegotiate.
+func sdpSessionIDs(port int) (uint64, uint64) {
+	return uint64(port), 1
 }

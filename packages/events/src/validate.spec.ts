@@ -4,6 +4,7 @@ import { EventValidationError, UnknownEventSubjectError } from "./errors";
 import { makeAuditEvent } from "./schemas/audit-events";
 import { makeCallEvent } from "./schemas/call-events";
 import { makeCdrLegWriteEvent } from "./schemas/cdr-events";
+import { makeMediaEvent } from "./schemas/media-events";
 import { makeProvisionEvent } from "./schemas/provision-events";
 import { makeQueueEvent } from "./schemas/queue-events";
 import { makeRegistrationEvent } from "./schemas/registration-events";
@@ -24,6 +25,7 @@ const CALL = createEntityId();
 const LEG = createEntityId();
 const QUEUE = createEntityId();
 const MAILBOX = createEntityId();
+const SESSION = createEntityId();
 
 const callEvent = makeCallEvent("channel.answered", {
 	orgId: ORG,
@@ -65,6 +67,21 @@ const samples = {
 			objectKey: "voicemail/2026/08/05/message.wav",
 			durationMs: 8_200,
 			receivedAt: "2026-08-05T10:00:00.000Z",
+		},
+	}),
+	media: makeMediaEvent("session.ended", {
+		orgId: ORG,
+		source: "mediad",
+		data: {
+			sessionId: SESSION,
+			instanceId: "mediad-1",
+			callId: CALL,
+			legId: LEG,
+			rtpPort: 30_002,
+			packetsReceived: 1_500,
+			packetsSent: 1_500,
+			reason: "released",
+			durationMs: 30_000,
 		},
 	}),
 	cdr: makeCdrLegWriteEvent({

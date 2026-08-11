@@ -17,6 +17,7 @@ import (
 //	sip.reg.v1.<orgId>.<aorHash>.<event>       event = registered | unregistered | expired
 //	queue.evt.v1.<orgId>.<queueId>.<event>     event = caller.joined | … | agent.state
 //	voicemail.evt.v1.<orgId>.<mailboxId>.<event>  event = message.left | mwi.updated
+//	media.evt.v1.<orgId>.<sessionId>.<event>   event = session.ended | session.rtp-timeout
 //	cdr.leg.v1.<orgId>                         one subject per org; the type is in the envelope
 //	audit.evt.v1.<orgId>
 //	provision.evt.v1.<orgId>
@@ -39,6 +40,7 @@ const (
 	SubjectRootRegistration = "sip.reg." + SubjectVersion
 	SubjectRootQueue        = "queue.evt." + SubjectVersion
 	SubjectRootVoicemail    = "voicemail.evt." + SubjectVersion
+	SubjectRootMedia        = "media.evt." + SubjectVersion
 	SubjectRootCDRLeg       = "cdr.leg." + SubjectVersion
 	SubjectRootAudit        = "audit.evt." + SubjectVersion
 	SubjectRootProvision    = "provision.evt." + SubjectVersion
@@ -58,6 +60,7 @@ const (
 	FamilyRegistration EventFamily = "registration"
 	FamilyQueue        EventFamily = "queue"
 	FamilyVoicemail    EventFamily = "voicemail"
+	FamilyMedia        EventFamily = "media"
 	FamilyCDR          EventFamily = "cdr"
 	FamilyAudit        EventFamily = "audit"
 	FamilyProvision    EventFamily = "provision"
@@ -69,6 +72,7 @@ var EventFamilies = []EventFamily{
 	FamilyRegistration,
 	FamilyQueue,
 	FamilyVoicemail,
+	FamilyMedia,
 	FamilyCDR,
 	FamilyAudit,
 	FamilyProvision,
@@ -284,6 +288,26 @@ func VoicemailSubject(orgID, mailboxID, event string) (string, error) {
 	return SubjectRootVoicemail + "." + org + "." + mailbox + "." + name, nil
 }
 
+// MediaSubject builds media.evt.v1.<orgId>.<sessionId>.<event>.
+//
+// Keyed by SESSION and not by call: a call has one id and several media sessions (one per leg), and
+// the thing that ends, times out or is reaped is the session. The call travels in the payload.
+func MediaSubject(orgID, sessionID, event string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	session, err := token("sessionId", sessionID)
+	if err != nil {
+		return "", err
+	}
+	name, err := eventName(event)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootMedia + "." + org + "." + session + "." + name, nil
+}
+
 // CDRLegSubject builds cdr.leg.v1.<orgId> — a single ordered subject per org.
 func CDRLegSubject(orgID string) (string, error) {
 	org, err := token("orgId", orgID)
@@ -476,6 +500,44 @@ func VoicemailEventInOrgFilter(orgID, event string) (string, error) {
 	return SubjectRootVoicemail + "." + org + ".*." + name, nil
 }
 
+// AllMediaFilter matches every media-session event — the MEDIA stream's subjects.
+func AllMediaFilter() string { return SubjectRootMedia + ".>" }
+
+// MediaInOrgFilter matches every media-session event of one org.
+func MediaInOrgFilter(orgID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootMedia + "." + org + ".>", nil
+}
+
+// MediaSessionFilter matches every event of one media session.
+func MediaSessionFilter(orgID, sessionID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	session, err := token("sessionId", sessionID)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootMedia + "." + org + "." + session + ".>", nil
+}
+
+// MediaEventInOrgFilter matches one media event name across every session of one org.
+func MediaEventInOrgFilter(orgID, event string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	name, err := eventName(event)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootMedia + "." + org + ".*." + name, nil
+}
+
 // AllCDRLegsFilter matches every org's CDR subject. One token, so "*" not ">".
 func AllCDRLegsFilter() string { return SubjectRootCDRLeg + ".*" }
 
@@ -507,6 +569,7 @@ const (
 	KindRegistration SubjectKind = "registration"
 	KindQueue        SubjectKind = "queue"
 	KindVoicemail    SubjectKind = "voicemail"
+	KindMedia        SubjectKind = "media"
 	KindCDRLeg       SubjectKind = "cdr-leg"
 	KindAudit        SubjectKind = "audit"
 	KindProvision    SubjectKind = "provision"
@@ -531,6 +594,8 @@ type ParsedSubject struct {
 	QueueID string
 	// MailboxID is set for KindVoicemail.
 	MailboxID string
+	// SessionID is set for KindMedia.
+	SessionID string
 	// Event is the (possibly dotted) event name, for the four per-entity families.
 	//
 	// It is returned as a plain string, not a checked vocabulary member: a v1.n producer may emit
@@ -588,6 +653,11 @@ func ParseSubject(subject string) (ParsedSubject, bool) {
 		return ParsedSubject{
 			Kind: KindVoicemail, Family: string(FamilyVoicemail), Version: version,
 			OrgID: rest[0], MailboxID: rest[1], Event: strings.Join(rest[2:], "."),
+		}, true
+	case prefix == "media.evt" && len(rest) >= 3:
+		return ParsedSubject{
+			Kind: KindMedia, Family: string(FamilyMedia), Version: version,
+			OrgID: rest[0], SessionID: rest[1], Event: strings.Join(rest[2:], "."),
 		}, true
 	case prefix == "cdr.leg" && len(rest) == 1:
 		return ParsedSubject{

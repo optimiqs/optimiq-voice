@@ -31,7 +31,15 @@ func newRunningSession(t *testing.T, mode rtp.Mode) *rtp.Session {
 		t.Fatalf("Allocate: %v", err)
 	}
 
-	session, err := rtp.NewSession(rtp.Options{ID: "session-under-test", Ports: pair, Mode: mode})
+	session, err := rtp.NewSession(rtp.Options{
+		ID:    "session-under-test",
+		Ports: pair,
+		Mode:  mode,
+		// PCMU plus the de-facto RFC 4733 type: what a real answer to a real phone settles on, and
+		// what the packets these tests send are stamped with.
+		AudioPayloadType:          rtp.PayloadTypePCMU,
+		TelephoneEventPayloadType: rtp.PayloadTypeTelephoneEvent,
+	})
 	if err != nil {
 		_ = pair.Close()
 		t.Fatalf("NewSession: %v", err)
@@ -390,37 +398,34 @@ func TestInactiveSessionReceivesButNeverSends(t *testing.T) {
 	}
 }
 
-func TestParseMode(t *testing.T) {
-	cases := []struct {
-		raw     string
-		want    rtp.Mode
-		wantErr bool
-	}{
-		{"echo", rtp.ModeEcho, false},
-		{"inactive", rtp.ModeInactive, false},
-		// An unset mode is the common case on the wire and means the v0 default.
-		{"", rtp.ModeEcho, false},
-		// A typo must be a visible error, never a session that silently does nothing.
-		{"Echo", "", true},
-		{"bridge", "", true},
-		{"sendrecv", "", true},
+// The wire no longer carries a mode at all.
+//
+// v0 let a caller ask for "echo" or "inactive" by name. v1 does not: the mode is DERIVED from the
+// SDP direction the engine asked for and from whether the diagnostic flag is on, because a media
+// mode is an outcome of negotiation rather than an input to it. This test pins the default so that
+// a session created without one relays rather than doing something surprising.
+func TestSessionDefaultsToRelay(t *testing.T) {
+	allocator, err := rtp.NewAllocator(loopback, 54100, 54109)
+	if err != nil {
+		t.Fatalf("NewAllocator: %v", err)
 	}
-	for _, tc := range cases {
-		t.Run("mode="+tc.raw, func(t *testing.T) {
-			got, err := rtp.ParseMode(tc.raw)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("ParseMode(%q) = %q, want an error", tc.raw, got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("ParseMode(%q): %v", tc.raw, err)
-			}
-			if got != tc.want {
-				t.Errorf("ParseMode(%q) = %q, want %q", tc.raw, got, tc.want)
-			}
-		})
+	pair, err := allocator.Allocate()
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	defer func() { _ = pair.Close() }()
+
+	session, err := rtp.NewSession(rtp.Options{ID: "defaults", Ports: pair})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if session.Mode() != rtp.ModeRelay {
+		t.Errorf("Mode = %q, want %q", session.Mode(), rtp.ModeRelay)
+	}
+	// A relay with no peer is silent, which is what a leg that has answered but is not yet talking
+	// to anybody must be.
+	if session.Peer() != nil {
+		t.Error("a fresh session already has a peer")
 	}
 }
 

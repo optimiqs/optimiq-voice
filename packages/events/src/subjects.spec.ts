@@ -38,6 +38,7 @@ describe("subject roots", () => {
 			registration: "sip.reg.v1",
 			queue: "queue.evt.v1",
 			voicemail: "voicemail.evt.v1",
+			media: "media.evt.v1",
 			cdrLeg: "cdr.leg.v1",
 			audit: "audit.evt.v1",
 			provision: "provision.evt.v1",
@@ -47,6 +48,10 @@ describe("subject roots", () => {
 			authzCheck: "rpc.authz.v1.check",
 			voicemailList: "rpc.voicemail.v1.list",
 			sipCredential: "rpc.sip.v1.credential",
+			mediaAllocateSession: "rpc.media.v1.allocate-session",
+			mediaBridgeSessions: "rpc.media.v1.bridge-sessions",
+			mediaUnbridgeSessions: "rpc.media.v1.unbridge-sessions",
+			mediaReleaseSession: "rpc.media.v1.release-session",
 		});
 	});
 
@@ -64,6 +69,7 @@ describe("subject roots", () => {
 			"audit",
 			"call",
 			"cdr",
+			"media",
 			"provision",
 			"queue",
 			"registration",

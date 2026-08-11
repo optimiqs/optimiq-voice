@@ -28,6 +28,7 @@ type goldenParsedSubject struct {
 	AORHash   string `json:"aorHash"`
 	QueueID   string `json:"queueId"`
 	MailboxID string `json:"mailboxId"`
+	SessionID string `json:"sessionId"`
 	Event     string `json:"event"`
 	Service   string `json:"service"`
 	Method    string `json:"method"`
@@ -163,6 +164,7 @@ func TestParityConstants(t *testing.T) {
 		"registration": SubjectRootRegistration,
 		"queue":        SubjectRootQueue,
 		"voicemail":    SubjectRootVoicemail,
+		"media":        SubjectRootMedia,
 		"cdrLeg":       SubjectRootCDRLeg,
 		"audit":        SubjectRootAudit,
 		"provision":    SubjectRootProvision,
@@ -172,10 +174,14 @@ func TestParityConstants(t *testing.T) {
 	}
 
 	rpc := map[string]string{
-		"routingResolve": SubjectRoutingResolveRPC,
-		"authzCheck":     SubjectAuthzCheckRPC,
-		"voicemailList":  SubjectVoicemailListRPC,
-		"sipCredential":  SubjectSipCredentialRPC,
+		"routingResolve":        SubjectRoutingResolveRPC,
+		"authzCheck":            SubjectAuthzCheckRPC,
+		"voicemailList":         SubjectVoicemailListRPC,
+		"sipCredential":         SubjectSipCredentialRPC,
+		"mediaAllocateSession":  SubjectMediaAllocateSessionRPC,
+		"mediaBridgeSessions":   SubjectMediaBridgeSessionsRPC,
+		"mediaUnbridgeSessions": SubjectMediaUnbridgeSessionsRPC,
+		"mediaReleaseSession":   SubjectMediaReleaseSessionRPC,
 	}
 	if !reflect.DeepEqual(rpc, g.RPCSubjects) {
 		t.Errorf("rpc subjects = %v, golden %v", rpc, g.RPCSubjects)
@@ -229,6 +235,8 @@ func TestParitySubjectBuilders(t *testing.T) {
 			got = must(QueueSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "voicemail":
 			got = must(VoicemailSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
+		case "media":
+			got = must(MediaSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "cdrLeg":
 			got = must(CDRLegSubject(tc.Args[0]))
 		case "audit":
@@ -283,6 +291,14 @@ func TestParitySubjectFilters(t *testing.T) {
 			got = must(VoicemailBoxFilter(tc.Args[0], tc.Args[1]))
 		case "voicemailEventInOrg":
 			got = must(VoicemailEventInOrgFilter(tc.Args[0], tc.Args[1]))
+		case "allMedia":
+			got = AllMediaFilter()
+		case "mediaInOrg":
+			got = must(MediaInOrgFilter(tc.Args[0]))
+		case "mediaSession":
+			got = must(MediaSessionFilter(tc.Args[0], tc.Args[1]))
+		case "mediaEventInOrg":
+			got = must(MediaEventInOrgFilter(tc.Args[0], tc.Args[1]))
 		case "allCdrLegs":
 			got = AllCDRLegsFilter()
 		case "cdrLegsInOrg":
@@ -326,6 +342,7 @@ func TestParityParseSubject(t *testing.T) {
 			AORHash:   parsed.AORHash,
 			QueueID:   parsed.QueueID,
 			MailboxID: parsed.MailboxID,
+			SessionID: parsed.SessionID,
 			Event:     parsed.Event,
 			Service:   parsed.Service,
 			Method:    parsed.Method,
@@ -363,6 +380,8 @@ func TestParityKVKeys(t *testing.T) {
 			got, err = DIDIndexKVKey(tc.Args[0])
 		case "queueMembership":
 			got, err = QueueMembershipKVKey(tc.Args[0], tc.Args[1])
+		case "mediaSession":
+			got, err = MediaSessionKVKey(tc.Args[0])
 		default:
 			t.Fatalf("golden names KV key builder %q, which this package does not implement", tc.Builder)
 		}
@@ -462,6 +481,7 @@ func TestParityVocabularies(t *testing.T) {
 		"registration": EventTypesOfFamily(FamilyRegistration),
 		"queue":        EventTypesOfFamily(FamilyQueue),
 		"voicemail":    EventTypesOfFamily(FamilyVoicemail),
+		"media":        EventTypesOfFamily(FamilyMedia),
 	}
 	if !reflect.DeepEqual(events, g.EventVocabularies) {
 		t.Errorf("event vocabularies = %v, golden %v", events, g.EventVocabularies)

@@ -6,6 +6,7 @@
 		"registration": "sip.reg.v1",
 		"queue": "queue.evt.v1",
 		"voicemail": "voicemail.evt.v1",
+		"media": "media.evt.v1",
 		"cdrLeg": "cdr.leg.v1",
 		"audit": "audit.evt.v1",
 		"provision": "provision.evt.v1"
@@ -14,7 +15,11 @@
 		"routingResolve": "rpc.routing.v1.resolve",
 		"authzCheck": "rpc.authz.v1.check",
 		"voicemailList": "rpc.voicemail.v1.list",
-		"sipCredential": "rpc.sip.v1.credential"
+		"sipCredential": "rpc.sip.v1.credential",
+		"mediaAllocateSession": "rpc.media.v1.allocate-session",
+		"mediaBridgeSessions": "rpc.media.v1.bridge-sessions",
+		"mediaUnbridgeSessions": "rpc.media.v1.unbridge-sessions",
+		"mediaReleaseSession": "rpc.media.v1.release-session"
 	},
 	"queueScopeAll": "_all",
 	"aorSubjectTokens": [
@@ -139,6 +144,24 @@
 			"subject": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51.mwi.updated"
 		},
 		{
+			"builder": "media",
+			"args": [
+				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53",
+				"session.ended"
+			],
+			"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.session.ended"
+		},
+		{
+			"builder": "media",
+			"args": [
+				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53",
+				"session.rtp-timeout"
+			],
+			"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.session.rtp-timeout"
+		},
+		{
 			"builder": "cdrLeg",
 			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
 			"subject": "cdr.leg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
@@ -241,6 +264,26 @@
 			"result": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.*.mwi.updated"
 		},
 		{
+			"filter": "allMedia",
+			"args": [],
+			"result": "media.evt.v1.>"
+		},
+		{
+			"filter": "mediaInOrg",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
+			"result": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.>"
+		},
+		{
+			"filter": "mediaSession",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53"],
+			"result": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.>"
+		},
+		{
+			"filter": "mediaEventInOrg",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "session.ended"],
+			"result": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.*.session.ended"
+		},
+		{
 			"filter": "allCdrLegs",
 			"args": [],
 			"result": "cdr.leg.v1.*"
@@ -314,6 +357,17 @@
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"mailboxId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51",
 				"event": "message.left"
+			}
+		},
+		{
+			"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.session.rtp-timeout",
+			"parsed": {
+				"kind": "media",
+				"family": "media",
+				"version": "v1",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"sessionId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53",
+				"event": "session.rtp-timeout"
 			}
 		},
 		{
@@ -500,6 +554,11 @@
 			"builder": "queueMembership",
 			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"],
 			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"
+		},
+		{
+			"builder": "mediaSession",
+			"args": ["0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53"],
+			"key": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53"
 		}
 	],
 	"streams": [
@@ -557,6 +616,20 @@
 			"maxBytes": 2147483648,
 			"maxMsgsPerSubject": -1,
 			"duplicateWindowMs": 600000,
+			"numReplicas": 1
+		},
+		{
+			"name": "MEDIA",
+			"description": "Media-plane RTP session lifecycle from apps/mediad (plan §3.4, mediad-design §4).",
+			"subjects": ["media.evt.v1.>"],
+			"retention": "limits",
+			"storage": "file",
+			"discard": "old",
+			"maxAgeMs": 172800000,
+			"maxMsgs": -1,
+			"maxBytes": 1073741824,
+			"maxMsgsPerSubject": -1,
+			"duplicateWindowMs": 120000,
 			"numReplicas": 1
 		},
 		{
@@ -692,6 +765,16 @@
 			"maxValueSizeBytes": 8192,
 			"maxBytes": 134217728,
 			"numReplicas": 1
+		},
+		{
+			"name": "media-sessions",
+			"description": "RTP session -> owning mediad instance, for per-instance command routing.",
+			"ttlMs": 21600000,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 4096,
+			"maxBytes": 134217728,
+			"numReplicas": 1
 		}
 	],
 	"vocabularies": {
@@ -738,7 +821,8 @@
 		],
 		"registration": ["registered", "unregistered", "expired"],
 		"queue": ["caller.joined", "caller.answered", "caller.abandoned", "agent.state"],
-		"voicemail": ["message.left", "mwi.updated"]
+		"voicemail": ["message.left", "mwi.updated"],
+		"media": ["session.ended", "session.rtp-timeout"]
 	},
 	"eventTypes": [
 		{
@@ -885,6 +969,16 @@
 			"family": "voicemail",
 			"type": "mwi.updated",
 			"goType": "VoicemailMWIUpdatedData"
+		},
+		{
+			"family": "media",
+			"type": "session.ended",
+			"goType": "MediaSessionEndedData"
+		},
+		{
+			"family": "media",
+			"type": "session.rtp-timeout",
+			"goType": "MediaSessionRTPTimeoutData"
 		},
 		{
 			"family": "cdr",
@@ -1142,10 +1236,55 @@
 			}
 		},
 		{
+			"name": "media.session.ended",
+			"goType": "MediaSessionEndedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000b",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.session.ended",
+				"type": "session.ended",
+				"source": "mediad",
+				"data": {
+					"sessionId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53",
+					"instanceId": "mediad-7c9f2a1b",
+					"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c",
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d",
+					"rtpPort": 30004,
+					"packetsReceived": 2100,
+					"packetsSent": 2098,
+					"reason": "released",
+					"durationMs": 42000
+				}
+			}
+		},
+		{
+			"name": "media.session.rtp-timeout",
+			"goType": "MediaSessionRTPTimeoutData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000c",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.session.rtp-timeout",
+				"type": "session.rtp-timeout",
+				"source": "mediad",
+				"data": {
+					"sessionId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53",
+					"instanceId": "mediad-7c9f2a1b",
+					"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c",
+					"rtpPort": 30004,
+					"packetsReceived": 640,
+					"packetsSent": 640,
+					"silentForMs": 30000,
+					"remoteAddress": "203.0.113.9:41000"
+				}
+			}
+		},
+		{
 			"name": "cdr.leg.write",
 			"goType": "CDRLegWriteData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000b",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000d",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "cdr.leg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -1184,7 +1323,7 @@
 			"name": "audit.recorded",
 			"goType": "AuditRecordedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000c",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000e",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "audit.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -1218,7 +1357,7 @@
 			"name": "provision.device.rejected",
 			"goType": "ProvisionDeviceRejectedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000d",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000f",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "provision.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
