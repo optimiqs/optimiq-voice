@@ -144,7 +144,7 @@ describe("call events", () => {
 			orgId: ORG,
 			callId: CALL,
 			source: "engine",
-			data: { legId: LEG, peerLegId: createEntityId(), bridgeId: createEntityId(), mode: "full" },
+			data: { legId: LEG, peerLegId: createEntityId(), bridgeId: createEntityId(), mode: "media" },
 		});
 		expect(callEventSchema.parse(JSON.parse(JSON.stringify(event)))).toEqual(event);
 	});

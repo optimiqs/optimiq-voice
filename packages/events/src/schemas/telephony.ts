@@ -38,8 +38,13 @@ export const HANGUP_SIDES = ["caller", "callee", "system"] as const;
 export type HangupSide = (typeof HANGUP_SIDES)[number];
 export const hangupSideSchema = z.enum(HANGUP_SIDES);
 
-/** Bridge modes, from `plans/reference/freeswitch-capabilities.md` §1. */
-export const BRIDGE_MODES = ["full", "signal-only", "bypass-media", "proxy-media"] as const;
+/**
+ * Bridge modes. This is `packages/telephony`'s runtime vocabulary (`bridge.ts`), not the frozen
+ * reference's — the two disagreed (`full`/`bypass-media` vs `media`/`bypass`), and a `BridgeMode`
+ * that crosses the wire must round-trip into the type the engine actually enforces
+ * (`MediaPort.bridgeMode` gates recording on it). One vocabulary, owned by the runtime.
+ */
+export const BRIDGE_MODES = ["media", "proxy-media", "signal-only", "bypass"] as const;
 export type BridgeMode = (typeof BRIDGE_MODES)[number];
 export const bridgeModeSchema = z.enum(BRIDGE_MODES);
 

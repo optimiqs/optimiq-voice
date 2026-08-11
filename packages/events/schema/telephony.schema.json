@@ -21,7 +21,7 @@
 		"BridgeMode": {
 			"description": "Bridge modes, from plans/reference/freeswitch-capabilities.md §1.",
 			"type": "string",
-			"enum": ["full", "signal-only", "bypass-media", "proxy-media"]
+			"enum": ["media", "proxy-media", "signal-only", "bypass"]
 		},
 		"DTMFSource": {
 			"description": "DTMF transports, from the frozen reference §4.",

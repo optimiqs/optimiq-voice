@@ -788,7 +788,7 @@
 		"LegSide": ["a", "b"],
 		"CallDirection": ["inbound", "outbound", "internal"],
 		"HangupSide": ["caller", "callee", "system"],
-		"BridgeMode": ["full", "signal-only", "bypass-media", "proxy-media"],
+		"BridgeMode": ["media", "proxy-media", "signal-only", "bypass"],
 		"DTMFSource": ["rfc2833", "info", "inband", "application"],
 		"RecordingKind": ["call", "voicemail", "conference"],
 		"RecordingStopReason": ["completed", "cancelled", "failed"],

@@ -5,14 +5,13 @@ import type { ProvisioningSettings } from "@optimiq-voice/pbx-db";
  *
  * ## The four levels, and why there are exactly four
  *
- * `packages/pbx-db`'s `settings-schema.ts` states the shape of the general cascade and then says
- * what provisioning adds to it:
+ * `packages/pbx-db`'s `settings-schema.ts` states the shape of the general cascade
+ * (`code default → org_setting`; the once-planned `user_setting` level was dropped — zero readers
+ * ever existed, see the schema header) and provisioning extends it with
+ * `device_profile.settings → device.settings`.
  *
- * > the resolution order is `code default → org_setting → user_setting`, and provisioning extends
- * > it with `device_profile.settings → device.settings`
- *
- * A device has no user, so `user_setting` does not apply — a phone on a shared desk belongs to an
- * organization and a profile, not to whoever last sat at it. That leaves:
+ * A device has no user in any case — a phone on a shared desk belongs to an organization and a
+ * profile, not to whoever last sat at it. That leaves:
  *
  * 1. **Model defaults** — code, in the vendor catalog. Versioned, typed, reviewable, and the only
  *    level that can carry a comment explaining why a value is what it is.

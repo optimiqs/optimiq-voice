@@ -105,18 +105,18 @@ func (v HangupSide) String() string { return string(v) }
 type BridgeMode string
 
 const (
-	BridgeModeFull        BridgeMode = "full"
-	BridgeModeSignalOnly  BridgeMode = "signal-only"
-	BridgeModeBypassMedia BridgeMode = "bypass-media"
-	BridgeModeProxyMedia  BridgeMode = "proxy-media"
+	BridgeModeMedia      BridgeMode = "media"
+	BridgeModeProxyMedia BridgeMode = "proxy-media"
+	BridgeModeSignalOnly BridgeMode = "signal-only"
+	BridgeModeBypass     BridgeMode = "bypass"
 )
 
 // BridgeModeValues lists every member of the vocabulary, in contract order.
 var BridgeModeValues = []BridgeMode{
-	BridgeModeFull,
-	BridgeModeSignalOnly,
-	BridgeModeBypassMedia,
+	BridgeModeMedia,
 	BridgeModeProxyMedia,
+	BridgeModeSignalOnly,
+	BridgeModeBypass,
 }
 
 // Valid reports whether v is a member of the BridgeMode vocabulary.

@@ -864,7 +864,7 @@ export class CallControl implements CallControlPort {
 			legId: leg.legId,
 			peerLegId: parkedLeg.legId,
 			bridgeId,
-			mode: "full",
+			mode: "media",
 		});
 		return ok(`retrieved orbit ${String(parked.slot)}`);
 	}
@@ -945,7 +945,7 @@ export class CallControl implements CallControlPort {
 			legId: leg.legId,
 			...(response.legId === undefined ? {} : { peerLegId: response.legId }),
 			bridgeId: response.bridgeId ?? bridgeId,
-			mode: "full",
+			mode: "media",
 		});
 		return ok(`retrieved orbit ${String(slot)} from ${ownerInstanceId}`);
 	}
@@ -1028,7 +1028,7 @@ export class CallControl implements CallControlPort {
 			legId: leg.legId,
 			peerLegId: parked.legId,
 			bridgeId,
-			mode: "full",
+			mode: "media",
 		});
 		return ok(`retrieved orbit ${String(slot)} from ${deadInstanceId}`);
 	}
@@ -1667,7 +1667,7 @@ export class CallControl implements CallControlPort {
 			legId: leg.legId,
 			peerLegId: candidate.callerLeg.legId,
 			bridgeId,
-			mode: "full",
+			mode: "media",
 		});
 		return ok(`picked up the call ringing at ${extension}`);
 	}

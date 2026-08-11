@@ -553,7 +553,7 @@ describe("cross-instance retrieval", () => {
 		expect(collector.eventsOf("call.unparked")).toHaveLength(0);
 		expect(collector.eventsOf("channel.bridged")[0]).toMatchObject({
 			legId: "leg-r",
-			data: { peerLegId: "leg-c", mode: "full" },
+			data: { peerLegId: "leg-c", mode: "media" },
 		});
 	});
 
