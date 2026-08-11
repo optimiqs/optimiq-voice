@@ -132,6 +132,35 @@ describe("env invariants in production", () => {
 		);
 	});
 
+	it("accepts a per-service pair instead, which is what a split deployment ships", () => {
+		// A container given only its own least-privilege identity must boot. Demanding the shared
+		// pair here would refuse exactly the configuration `config/nats.conf` exists to reach.
+		expect(() =>
+			assertEnvInvariants(
+				withProduction({
+					NATS_USER: undefined,
+					NATS_PASS: undefined,
+					NATS_ENGINE_USER: "optimiq-engine",
+					NATS_ENGINE_PASS: "a-real-engine-password",
+				}),
+			),
+		).not.toThrow();
+	});
+
+	it("still refuses a placeholder in a per-service password", () => {
+		expect(() =>
+			assertEnvInvariants(
+				withProduction({ NATS_MEDIAD_USER: "optimiq-mediad", NATS_MEDIAD_PASS: "changeme" }),
+			),
+		).toThrow("NATS_MEDIAD_PASS still uses the .env.example placeholder value.");
+	});
+
+	it("does not let half a per-service pair stand in for the shared one", () => {
+		expect(() =>
+			assertEnvInvariants(withProduction({ NATS_USER: undefined, NATS_SIPD_USER: "optimiq-sipd" })),
+		).toThrow("NATS_USER must be set.");
+	});
+
 	it("rejects unset telephony addresses", () => {
 		expect(() =>
 			assertEnvInvariants(

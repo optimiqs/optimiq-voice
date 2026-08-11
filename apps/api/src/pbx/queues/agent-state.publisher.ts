@@ -1,6 +1,6 @@
 import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
 import { connect, type JetStreamManager, type KV, type NatsConnection } from "nats";
-import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
+import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import { agentStateEntrySchema, makeQueueEvent } from "@optimiq-voice/events/schemas";
 import {
 	AGENT_STATE_KV,
@@ -84,7 +84,7 @@ export class AgentStatePublisher implements OnModuleInit, OnApplicationShutdown 
 		try {
 			this.connection = await connect({
 				servers: this.env.NATS_URL,
-				...natsCredentials(this.env),
+				...natsConnectionOptions(this.env, "api"),
 				name: "optimiq-api-agent-state",
 				maxReconnectAttempts: -1,
 				reconnectTimeWait: 1_000,

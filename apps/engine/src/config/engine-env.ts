@@ -80,18 +80,38 @@ export const engineEnvSchema = z.object({
 	NATS_URL: natsUrl.default("nats://localhost:4222"),
 	/**
 	 * How every connection this app opens authenticates to that broker — see `config/nats.conf`.
-	 * Unprefixed and shared with apps/api and apps/sipd, on the same terms as `NATS_URL`.
 	 *
-	 * Optional because a broker with no authentication is a real configuration: `test/` starts a
-	 * throwaway `nats` container per run and never configures a user on it. Production is not left
-	 * to this schema — `assertEnvInvariants` in `@optimiq-voice/config` refuses to boot a production
-	 * process whose broker URL is set without both of these.
+	 * `NATS_ENGINE_USER` / `NATS_ENGINE_PASS` are this process's OWN identity, and the one the
+	 * broker's `engine` permission set is written for: the call and queue vocabulary, CDR legs and
+	 * voicemail deposits, the routing and media RPCs it CALLS, and the call path's four KV
+	 * buckets. It cannot answer an RPC, cannot publish registration events, and cannot write
+	 * `routing-cache`, `did-index` or `queue-membership` — a bug on the call path cannot rewrite a
+	 * tenant's dial plan.
+	 *
+	 * `NATS_USER` / `NATS_PASS` remain as the fallback, and are now the operator identity.
+	 *
+	 * All four optional because a broker with no authentication is a real configuration: `test/`
+	 * starts a throwaway `nats` container per run and never configures a user on it. Production is
+	 * not left to this schema — `assertEnvInvariants` in `@optimiq-voice/config` refuses to boot a
+	 * production process whose broker URL is set without both of the unprefixed pair.
 	 *
 	 * Kept out of the URL because `/healthz` and the boot log both report the URL the engine
 	 * connected to; a `nats://user:pass@host` would put the password in both.
 	 */
 	NATS_USER: optionalCredential,
 	NATS_PASS: optionalCredential,
+	NATS_ENGINE_USER: optionalCredential,
+	NATS_ENGINE_PASS: optionalCredential,
+	/**
+	 * Broker transport security. Off unless set, so a bare `nats://` development broker keeps
+	 * working with no variables at all — which is what `test/` and `pnpm start:services` run.
+	 *
+	 * `NATS_TLS_CA` is a CA bundle path: it enables TLS and PINS that CA, which is what the
+	 * development certificates from `config/certs/generate-dev-certs.sh` need.
+	 * `NATS_TLS_ENABLED=true` is TLS against the system trust store instead.
+	 */
+	NATS_TLS_CA: z.string().min(1).optional(),
+	NATS_TLS_ENABLED: z.string().optional(),
 	/**
 	 * Whether this instance applies the JetStream stream/KV definitions at boot. Safe to leave on
 	 * — `ensureStreams` is idempotent — but a deployment that runs the definitions as a migration

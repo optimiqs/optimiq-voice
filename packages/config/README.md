@@ -36,6 +36,25 @@ are set; `AUTH_URL` and `API_APP_URL` are HTTPS; `ROUTR_EXTERNAL_ADDRS`,
 `/* Set to … */` marker; and no ARI/SIP/Postgres/Influx/cloak secret still equals its
 `.env.example` placeholder. RTP port ranges are checked in every environment.
 
+Broker credentials are checked as a PAIR rather than as two names: production needs either the
+shared `NATS_USER` / `NATS_PASS` or one whole per-service pair (`NATS_API_*`, `NATS_ENGINE_*`,
+`NATS_MEDIAD_*`, `NATS_SIPD_*`), because a split deployment ships each container only the identity
+it uses. Every per-service password present is placeholder-checked whether or not this process is
+the one that will connect with it.
+
+## Broker identity and TLS
+
+`natsCredentials(source, service?)` resolves the connection identity. With a service tag it prefers
+`NATS_<SERVICE>_USER` / `NATS_<SERVICE>_PASS` — the least-privilege user `config/nats.conf` defines
+for that service — and falls back to the shared pair, which is the operator identity the `nats` CLI
+and the `pnpm verify:*` harnesses use. A HALF-SET pair throws, per pair: falling back from half a
+service pair would silently promote the process onto the operator credential.
+
+`natsTlsOptions(source)` resolves transport security and defaults to OFF. `NATS_TLS_CA` is a CA
+bundle path — it enables TLS and pins that CA — and `NATS_TLS_ENABLED=true` is TLS against the
+system trust store. `natsConnectionOptions(source, service?)` is both together, which is what every
+first-party connection site spreads.
+
 ### What it does NOT cover
 
 The placeholder check is exact string matching against `PLACEHOLDER_SECRETS`, so it catches a

@@ -188,9 +188,27 @@ const envSchema = z.object({
 	 * The broker requires authentication (`config/nats.conf`). Both are optional here because a
 	 * developer's ephemeral broker and the verify harnesses' throwaway containers have no auth at
 	 * all; `assertEnvInvariants` requires both in production whenever a NATS URL is configured.
+	 *
+	 * These are the SHARED pair — the operator identity, and the fallback for any process without
+	 * its own. The four per-service pairs below are the least-privilege identities
+	 * `config/nats.conf` defines; `natsCredentials(env, service)` prefers them.
 	 */
 	NATS_USER: optionalString,
 	NATS_PASS: optionalString,
+	NATS_API_USER: optionalString,
+	NATS_API_PASS: optionalString,
+	NATS_ENGINE_USER: optionalString,
+	NATS_ENGINE_PASS: optionalString,
+	NATS_MEDIAD_USER: optionalString,
+	NATS_MEDIAD_PASS: optionalString,
+	NATS_SIPD_USER: optionalString,
+	NATS_SIPD_PASS: optionalString,
+	/**
+	 * Broker transport security, off unless set. `NATS_TLS_CA` is a CA bundle path and pins that
+	 * CA; `NATS_TLS_ENABLED=true` is TLS against the system trust store. See `natsTlsOptions`.
+	 */
+	NATS_TLS_CA: optionalString,
+	NATS_TLS_ENABLED: optionalString,
 	AUTH_SECRET: z.string().min(32).optional(),
 	AUTH_URL: optionalUrl,
 	AUTH_COOKIE_DOMAIN: optionalString,

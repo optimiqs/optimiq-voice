@@ -87,10 +87,26 @@ services:
       # the `rpc.routing.v1.resolve` responder.
       - API_NATS_URL
       - NATS_URL
-      # The broker requires authentication (see the `nats` service and config/nats.conf).
-      # These are the canonical, unprefixed names every platform service reads.
-      - NATS_USER
-      - NATS_PASS
+      # The broker requires authentication (see the `nats` service and config/nats.conf), and this
+      # container gets the `api` USER specifically — not the shared one.
+      #
+      # `config/nats.conf` gives that user an allow-list built from what this process actually
+      # does: the three event families it publishes, the three RPC subjects it answers, the four KV
+      # buckets it owns and the two it only reads. It cannot write `channels`, `park-claims` or
+      # `conference-claims` (the call path's buckets), and it cannot publish a call event.
+      #
+      # NATS_USER / NATS_PASS are deliberately NOT passed any more. They are the operator identity
+      # now — the `nats` CLI and the verify scripts — and a service container holding them would
+      # make the per-user split decorative. `packages/config`'s `natsCredentials(env, "api")` picks
+      # the prefixed pair up and falls back to the unprefixed one only if it is absent, so a
+      # deployment mid-migration still works.
+      - NATS_API_USER
+      - NATS_API_PASS
+      # Transport security, both optional and both off by default: absent means a plaintext
+      # `nats://` connection, which is what the shipped broker serves. Set NATS_TLS_CA to a CA
+      # bundle path (and bring the broker up with compose.tls.yaml) to turn TLS on.
+      - NATS_TLS_CA
+      - NATS_TLS_ENABLED
       #
       # --- Media ---------------------------------------------------------------------------------
       #
@@ -217,8 +233,15 @@ services:
       ARI_PASSWORD: ${ASTERISK_ARI_SECRET}
       ARI_APP: ${ENGINE_ARI_APP:-optimiq-engine}
       NATS_URL: ${ENGINE_NATS_URL:-nats://nats:4222}
-      NATS_USER: ${NATS_USER}
-      NATS_PASS: ${NATS_PASS}
+      # The `engine` user, not the shared one — see the note on the `api` service and the
+      # permission sets in config/nats.conf. This identity may publish the call and queue
+      # vocabulary, write CDR legs, and call the media and routing RPCs; it may NOT write the
+      # control plane's three KV buckets, answer any RPC, or touch `sip.reg.v1.>`.
+      NATS_ENGINE_USER: ${NATS_ENGINE_USER}
+      NATS_ENGINE_PASS: ${NATS_ENGINE_PASS}
+      # Off unless set; see the `api` service.
+      NATS_TLS_CA: ${NATS_TLS_CA:-}
+      NATS_TLS_ENABLED: ${NATS_TLS_ENABLED:-}
       ENGINE_PORT: ${ENGINE_PORT:-4010}
       ENGINE_ROUTING_ENABLED: ${ENGINE_ROUTING_ENABLED:-true}
       # Single-tenant development only. In production this is unset and an
@@ -254,17 +277,37 @@ services:
   # `routing-cache` buckets do not exist, and every `cdr.leg.write` is refused.
   # Core pub/sub (which is all `routr` uses) is unaffected by having it on.
   #
-  # The four credentials below are resolved by nats-server itself out of this
+  # The ten credentials below are resolved by nats-server itself out of this
   # container's environment, so no password appears in this file. Leave any of them
   # unset and the broker REFUSES TO START ("variable reference ... can not be
   # found") instead of coming up open, which is the point.
+  #
+  # Five users in the OPTIMIQ account — one per service plus the shared operator
+  # identity — and one in $SYS. Each service user carries a subject allow-list built
+  # from that service's actual publish/subscribe inventory; see config/nats.conf.
+  #
+  # TLS lives in compose.tls.yaml, an overlay, so this file's broker stays plaintext
+  # and a checkout that has never generated certificates still comes up.
   nats:
     image: nats:2.11.8
     restart: unless-stopped
     command: ["-c", "/etc/nats/nats.conf"]
     environment:
+      # The operator / fallback identity. Unscoped by design: the verify harnesses
+      # in apps/api/scripts drive whichever service they exercise and would otherwise
+      # need a sixth permission set that is the union of the other four.
       - NATS_USER
       - NATS_PASS
+      # The four per-service identities.
+      - NATS_API_USER
+      - NATS_API_PASS
+      - NATS_ENGINE_USER
+      - NATS_ENGINE_PASS
+      - NATS_MEDIAD_USER
+      - NATS_MEDIAD_PASS
+      - NATS_SIPD_USER
+      - NATS_SIPD_PASS
+      # The system account: $SYS.> monitoring and JetStream introspection.
       - NATS_SYS_USER
       - NATS_SYS_PASS
     volumes:

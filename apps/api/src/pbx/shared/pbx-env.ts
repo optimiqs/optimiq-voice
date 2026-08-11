@@ -57,13 +57,39 @@ export const pbxEnvSchema = z.object({
 	NATS_URL: natsUrl.optional(),
 
 	/**
-	 * How every connection in this area authenticates to that broker. Unprefixed and shared with
-	 * apps/engine and apps/sipd, on the same terms as `NATS_URL` itself; see `config/nats.conf`.
-	 * `natsCredentials` from `@optimiq-voice/config/nats-credentials` turns the pair into the
-	 * `user`/`pass` connection options and refuses a half-set pair.
+	 * How every connection in this area authenticates to that broker.
+	 *
+	 * `NATS_API_USER` / `NATS_API_PASS` are this process's OWN identity: `config/nats.conf` gives
+	 * the `api` user a subject allow-list built from what this area actually does — the three event
+	 * families it publishes, the three RPC subjects it answers, the four KV buckets it owns and the
+	 * two it only reads. It cannot publish a call event and cannot write the call path's buckets.
+	 *
+	 * `NATS_USER` / `NATS_PASS` remain as the FALLBACK, and are the operator identity: the `nats`
+	 * CLI and the `pnpm verify:*` harnesses in `scripts/`. A deployment that has not split its
+	 * credentials still works on them alone.
+	 *
+	 * `natsConnectionOptions(env, "api")` from `@optimiq-voice/config/nats-credentials` applies
+	 * that precedence, adds the TLS options below, and refuses a half-set pair — per pair, so a
+	 * typo in `NATS_API_PASS` stops the boot rather than silently demoting this process onto the
+	 * operator credential.
 	 */
 	NATS_USER: natsCredential,
 	NATS_PASS: natsCredential,
+	NATS_API_USER: natsCredential,
+	NATS_API_PASS: natsCredential,
+
+	/**
+	 * Broker transport security. Both optional, both off by default.
+	 *
+	 * `NATS_TLS_CA` is a path to a CA bundle: setting it enables TLS and pins that CA, which is
+	 * the private-CA case (`config/certs/generate-dev-certs.sh`, and any deployment issuing its
+	 * own). `NATS_TLS_ENABLED=true` is TLS against the system trust store. Neither set is a
+	 * plaintext connection, which is what the shipped broker serves — its `tls` block lives in the
+	 * `compose.tls.yaml` overlay, so client and broker default to plaintext together rather than
+	 * half-agreeing.
+	 */
+	NATS_TLS_CA: z.string().min(1).optional(),
+	NATS_TLS_ENABLED: z.string().optional(),
 
 	/** Whether to create the `routing-cache` KV bucket if the broker does not have it yet. */
 	PBX_ENSURE_KV_BUCKETS: z

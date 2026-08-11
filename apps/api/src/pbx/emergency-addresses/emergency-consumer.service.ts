@@ -1,6 +1,6 @@
 import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
 import { AckPolicy, connect, DeliverPolicy, type NatsConnection } from "nats";
-import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
+import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import { getLogger } from "@optimiq-voice/logging";
 import { PBX_ENV } from "../shared/pbx.tokens";
 import { EmergencyNotificationService } from "./emergency-notification.service";
@@ -103,7 +103,7 @@ export class EmergencyConsumer implements OnModuleInit, OnApplicationShutdown {
 		try {
 			this.connection = await connect({
 				servers: this.env.NATS_URL,
-				...natsCredentials(this.env),
+				...natsConnectionOptions(this.env, "api"),
 				name: "optimiq-api-emergency",
 				maxReconnectAttempts: -1,
 				reconnectTimeWait: 1_000,

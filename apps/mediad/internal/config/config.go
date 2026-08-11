@@ -23,24 +23,49 @@ import (
 type Config struct {
 	// NATSURL is the backbone. NATS_URL, default nats://127.0.0.1:4222.
 	//
-	// Unprefixed, and NOT `MEDIAD_NATS_URL`. apps/api, apps/engine and apps/sipd all read these
-	// three names; the broker credential is one platform-account identity, not a per-service one,
-	// and a per-service alias would only give the fleet three names for one secret to drift
-	// between. The RTP knobs below are MEDIAD_-prefixed because they genuinely belong to this
+	// Unprefixed, and NOT `MEDIAD_NATS_URL`. apps/api, apps/engine and apps/sipd all read this
+	// name; where the broker lives is a property of the deployment rather than of any one
+	// process. The RTP knobs below are MEDIAD_-prefixed because they genuinely belong to this
 	// process alone.
 	NATSURL string
 
-	// NATSUser and NATSPass authenticate to it. NATS_USER / NATS_PASS.
+	// NATSUser and NATSPass authenticate to it. NATS_MEDIAD_USER / NATS_MEDIAD_PASS, falling
+	// back to the unprefixed NATS_USER / NATS_PASS.
+	//
+	// The prefixed pair is this process's OWN broker identity. `config/nats.conf` gives the
+	// `mediad` user a permission set scoped to what this inventory actually needs — the four
+	// `rpc.media.v1.*` command subjects, `media.evt.v1.>` publishes and the `media-sessions` KV
+	// bucket — and nothing else. It cannot read `rpc.sip.v1.credential`, cannot forge a CDR leg
+	// and cannot see another plane's events. That is the whole reason the prefixed pair exists:
+	// a media plane that is compromised should not also be a control plane.
+	//
+	// The unprefixed fallback is what keeps a deployment that has not split its credentials, and
+	// the integration rig that starts an unauthenticated broker, working unchanged.
 	//
 	// Both empty is legal and means "a broker with no authentication configured", which is what
-	// the integration rig starts. One set without the other is NOT legal: it is a rename applied
-	// to half a pair, and the broker would answer every connect with an authorization violation
-	// this process would spend its life retrying.
+	// the integration rig starts. One set without the other is NOT legal, PER PAIR: it is a
+	// rename applied to half a pair, and the broker would answer every connect with an
+	// authorization violation this process would spend its life retrying.
 	//
 	// They are options rather than userinfo in NATSURL because the URL is logged — the boot line,
 	// every reconnect, and the connect error itself all carry it.
 	NATSUser string
 	NATSPass string
+
+	// NATSTLSCA is the path to a PEM bundle the broker's certificate must chain to.
+	// NATS_TLS_CA. Empty is PLAINTEXT unless NATS_TLS_ENABLED says otherwise.
+	//
+	// Empty by default on purpose: the shipped broker listens without TLS and the `tls` block
+	// lives in `compose.tls.yaml`, an overlay. A client that demanded TLS by default would fail
+	// to connect on every checkout that has never run `config/certs/generate-dev-certs.sh`.
+	NATSTLSCA string
+
+	// NATSTLSEnabled turns on TLS against the SYSTEM trust store. NATS_TLS_ENABLED.
+	//
+	// The two-name split matters: a private CA (development, and any deployment that issues its
+	// own) needs NATSTLSCA, while a broker whose certificate comes from a public issuer needs
+	// only this. Setting NATSTLSCA implies this.
+	NATSTLSEnabled bool
 
 	// BindIP is the address the RTP/RTCP sockets bind. MEDIAD_BIND_IP, default 0.0.0.0.
 	//
@@ -154,12 +179,19 @@ func Load(getenv Getenv) (Config, error) {
 	}
 
 	cfg := Config{
-		NATSURL:  stringOr(getenv, "NATS_URL", "nats://127.0.0.1:4222"),
-		NATSUser: strings.TrimSpace(getenv("NATS_USER")),
-		NATSPass: strings.TrimSpace(getenv("NATS_PASS")),
+		NATSURL:   stringOr(getenv, "NATS_URL", "nats://127.0.0.1:4222"),
+		NATSTLSCA: strings.TrimSpace(getenv("NATS_TLS_CA")),
 	}
 
+	// The per-service pair first, the shared pair as the fallback. `problems` collects the
+	// half-set complaint rather than returning it, so an operator sees it alongside every other
+	// configuration error in one startup message.
+	cfg.NATSUser, cfg.NATSPass, problems = resolveNATSCredentials(getenv, "MEDIAD", problems)
+
 	var err error
+	if cfg.NATSTLSEnabled, err = boolOr(getenv, "NATS_TLS_ENABLED", false); err != nil {
+		fail("%v", err)
+	}
 	if cfg.BindIP, err = addrOr(getenv, "MEDIAD_BIND_IP", netip.AddrFrom4([4]byte{0, 0, 0, 0})); err != nil {
 		fail("%v", err)
 	}
@@ -205,16 +237,6 @@ func Load(getenv Getenv) (Config, error) {
 		default:
 			cfg.PublicIP = addr.Unmap()
 		}
-	}
-
-	// Half a credential is a typo, not a configuration. Caught here so it costs a startup error
-	// rather than an authorization violation on every reconnect for the life of the process.
-	if (cfg.NATSUser == "") != (cfg.NATSPass == "") {
-		set, missing := "NATS_USER", "NATS_PASS"
-		if cfg.NATSUser == "" {
-			set, missing = "NATS_PASS", "NATS_USER"
-		}
-		fail("%s is set but %s is not: NATS authentication needs both", set, missing)
 	}
 
 	if cfg.NATSURL == "" {
@@ -275,6 +297,43 @@ func checkPortRange(low, high int) []string {
 		add("MEDIAD_RTP_PORT_MIN/MAX (%d-%d) leave room for no RTP/RTCP pair at all", low, high)
 	}
 	return problems
+}
+
+// resolveNATSCredentials reads the broker identity, preferring this service's own.
+//
+// `NATS_<SERVICE>_USER` / `NATS_<SERVICE>_PASS` win when BOTH are set — that is the least-privilege
+// user `config/nats.conf` defines for this process. Otherwise the shared `NATS_USER` / `NATS_PASS`
+// are used, which is what a deployment that has not split its credentials and the integration rig
+// still supply. Both absent is a broker with no authentication, which is legal.
+//
+// A HALF-SET pair is refused PER PAIR, and refused rather than ignored: falling back from a
+// half-set `NATS_MEDIAD_*` to the shared pair would hand this process the operator identity and
+// hide the typo behind a working connection, which is the failure this check exists to prevent.
+// It is collected into `problems` rather than returned so one startup message carries every
+// configuration error at once.
+func resolveNATSCredentials(getenv Getenv, service string, problems []string) (string, string, []string) {
+	scopedUserKey, scopedPassKey := "NATS_"+service+"_USER", "NATS_"+service+"_PASS"
+
+	for _, pair := range [2][2]string{
+		{scopedUserKey, scopedPassKey},
+		{"NATS_USER", "NATS_PASS"},
+	} {
+		user := strings.TrimSpace(getenv(pair[0]))
+		pass := strings.TrimSpace(getenv(pair[1]))
+
+		switch {
+		case user != "" && pass != "":
+			return user, pass, problems
+		case user != "":
+			return "", "", append(problems, fmt.Sprintf(
+				"%s is set but %s is not: NATS authentication needs both", pair[0], pair[1]))
+		case pass != "":
+			return "", "", append(problems, fmt.Sprintf(
+				"%s is set but %s is not: NATS authentication needs both", pair[1], pair[0]))
+		}
+	}
+
+	return "", "", problems
 }
 
 func stringOr(getenv Getenv, key, fallback string) string {

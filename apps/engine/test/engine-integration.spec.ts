@@ -8,6 +8,7 @@ import { spawnSync } from "node:child_process";
 import { NestFactory } from "@nestjs/core";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
 import { connect, type NatsConnection, type Subscription } from "nats";
+import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import {
 	AGENT_STATE_KV,
 	CHANNELS_KV,
@@ -459,7 +460,11 @@ suite("engine end-to-end", () => {
 
 		// An INDEPENDENT connection, so the assertions observe what a real consumer would see
 		// rather than the engine's own client.
-		nats = await connect({ servers: natsUrl, name: "engine-integration-observer" });
+		nats = await connect({
+			servers: natsUrl,
+			name: "engine-integration-observer",
+			...harnessNatsOptions(),
+		});
 		callSubscription = nats.subscribe(subjectFilterFor.allCalls());
 		cdrSubscription = nats.subscribe(subjectFilterFor.allCdrLegs());
 		queueSubscription = nats.subscribe(subjectFilterFor.allQueues());
@@ -1115,13 +1120,35 @@ async function tryHangup(ari: AriConnectionService, channelId: string): Promise<
 }
 
 /**
+ * How the HARNESS itself connects — which is not how the engine under test connects.
+ *
+ * The suite plays the CONTROL PLANE: it seeds `routing-cache`, `did-index` and `queue-membership`,
+ * and it observes every event family. `config/nats.conf` grants none of that to the `engine` user —
+ * writing the dial plan is apps/api's, and the engine subscribes to no call event — so the harness
+ * uses the unprefixed operator identity (`natsCredentials` with no service tag) while the engine
+ * boots on `NATS_ENGINE_USER`/`PASS`. Two identities, matching the two roles, which is exactly the
+ * arrangement production has.
+ *
+ * Empty when nothing is configured, which is the default path: `beforeAll` starts a throwaway
+ * `nats` container with no authentication at all. It is only non-empty when a run is pointed at an
+ * authenticated broker with `NATS_INTEGRATION_URL`.
+ */
+function harnessNatsOptions(): ReturnType<typeof natsConnectionOptions> {
+	return natsConnectionOptions(process.env);
+}
+
+/**
  * Writes the demo tenant's artifact into the `routing-cache` bucket.
  *
  * The bucket has to exist first: the engine creates it at boot, but the seed runs BEFORE the
  * engine so that the very first call is a cache hit rather than an rpc timeout.
  */
 async function seedRoutingArtifact(natsUrl: string): Promise<void> {
-	const connection = await connect({ servers: natsUrl, name: "engine-integration-seed" });
+	const connection = await connect({
+		servers: natsUrl,
+		name: "engine-integration-seed",
+		...harnessNatsOptions(),
+	});
 	try {
 		const manager = await connection.jetstreamManager();
 		await ensureKvBuckets(manager, [
@@ -1354,7 +1381,11 @@ async function readAgentState(
 	orgId: string,
 	agentId: string,
 ): Promise<{ status: string; queueId?: string; source?: string } | undefined> {
-	const connection = await connect({ servers: natsUrl, name: "engine-integration-agent-state" });
+	const connection = await connect({
+		servers: natsUrl,
+		name: "engine-integration-agent-state",
+		...harnessNatsOptions(),
+	});
 	try {
 		const kv = await connection.jetstream().views.kv(AGENT_STATE_KV.name);
 		const entry = await kv.get(kvKeyFor.agentState(orgId, agentId));
@@ -1373,7 +1404,11 @@ async function readAgentState(
 
 /** Reads the `channels` bucket over a short-lived connection, as an outside observer would. */
 async function readKv(natsUrl: string, key: string): Promise<ChannelSnapshot | undefined> {
-	const connection = await connect({ servers: natsUrl, name: "engine-integration-kv" });
+	const connection = await connect({
+		servers: natsUrl,
+		name: "engine-integration-kv",
+		...harnessNatsOptions(),
+	});
 	try {
 		const kv = await connection.jetstream().views.kv(CHANNELS_KV.name);
 		const entry = await kv.get(key);

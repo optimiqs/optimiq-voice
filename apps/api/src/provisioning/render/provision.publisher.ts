@@ -1,6 +1,6 @@
 import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
 import { connect, type JetStreamManager, type NatsConnection } from "nats";
-import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
+import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import { makeProvisionEvent } from "@optimiq-voice/events/schemas";
 import { ensureStreams, PROVISION_STREAM } from "@optimiq-voice/events/streams";
 import { getLogger } from "@optimiq-voice/logging";
@@ -69,7 +69,7 @@ export class ProvisionEventPublisher implements OnModuleInit, OnApplicationShutd
 		try {
 			this.connection = await connect({
 				servers: this.env.NATS_URL,
-				...natsCredentials(this.env),
+				...natsConnectionOptions(this.env, "api"),
 				name: "optimiq-api-provision-events",
 				maxReconnectAttempts: -1,
 				reconnectTimeWait: 1_000,

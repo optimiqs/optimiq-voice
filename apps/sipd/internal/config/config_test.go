@@ -197,6 +197,15 @@ func TestLoadRejectsHalfANATSCredential(t *testing.T) {
 		{"user without pass", map[string]string{"NATS_USER": "optimiq"}, "NATS_USER is set but NATS_PASS is not"},
 		{"pass without user", map[string]string{"NATS_PASS": "s3cret"}, "NATS_PASS is set but NATS_USER is not"},
 		{"whitespace is not a password", map[string]string{"NATS_USER": "optimiq", "NATS_PASS": "   "}, "NATS_USER is set but NATS_PASS is not"},
+		{"service user without pass", map[string]string{"NATS_SIPD_USER": "optimiq-sipd"}, "NATS_SIPD_USER is set but NATS_SIPD_PASS is not"},
+		{"service pass without user", map[string]string{"NATS_SIPD_PASS": "s3cret"}, "NATS_SIPD_PASS is set but NATS_SIPD_USER is not"},
+		// Falling back here would hand sipd the OPERATOR identity and hide the typo behind a
+		// working connection — the exact failure this check exists to prevent.
+		{"half a service pair does not fall back", map[string]string{
+			"NATS_USER":      "optimiq",
+			"NATS_PASS":      "shared",
+			"NATS_SIPD_USER": "optimiq-sipd",
+		}, "NATS_SIPD_USER is set but NATS_SIPD_PASS is not"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := config.Load(env(minimal(tc.pairs)))
@@ -219,5 +228,59 @@ func TestLoadAcceptsAnUnauthenticatedBroker(t *testing.T) {
 	}
 	if cfg.NATSUser != "" || cfg.NATSPass != "" {
 		t.Errorf("credentials = %q / %q, want both empty", cfg.NATSUser, cfg.NATSPass)
+	}
+}
+
+// NATS_SIPD_USER/PASS is this process's own least-privilege identity in config/nats.conf — it may
+// publish sip.reg.v1.>, request rpc.sip.v1.credential and use the registrations bucket, and
+// nothing else. The unprefixed pair is the shared operator credential and only the fallback.
+func TestLoadPrefersTheServiceCredentialPair(t *testing.T) {
+	cfg, err := config.Load(env(minimal(map[string]string{
+		"NATS_USER":      "optimiq",
+		"NATS_PASS":      "shared",
+		"NATS_SIPD_USER": "optimiq-sipd",
+		"NATS_SIPD_PASS": "scoped",
+	})))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.NATSUser != "optimiq-sipd" || cfg.NATSPass != "scoped" {
+		t.Errorf("credentials = %q / %q, want the sipd pair to outrank the shared one",
+			cfg.NATSUser, cfg.NATSPass)
+	}
+
+	shared, err := config.Load(env(minimal(map[string]string{
+		"NATS_USER": "optimiq",
+		"NATS_PASS": "shared",
+	})))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if shared.NATSUser != "optimiq" || shared.NATSPass != "shared" {
+		t.Errorf("credentials = %q / %q, want the shared pair as the fallback",
+			shared.NATSUser, shared.NATSPass)
+	}
+}
+
+// TLS is OFF unless configured. The shipped broker serves plaintext — its tls block lives in the
+// compose.tls.yaml overlay — so a client that demanded TLS by default could never reach it.
+func TestLoadLeavesTLSOffUnlessConfigured(t *testing.T) {
+	cfg, err := config.Load(env(minimal(nil)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.NATSTLSCA != "" || cfg.NATSTLSEnabled {
+		t.Errorf("tls = %q / %v, want both off by default", cfg.NATSTLSCA, cfg.NATSTLSEnabled)
+	}
+
+	withTLS, err := config.Load(env(minimal(map[string]string{
+		"NATS_TLS_CA":      "/etc/nats/certs/ca.pem",
+		"NATS_TLS_ENABLED": "true",
+	})))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if withTLS.NATSTLSCA != "/etc/nats/certs/ca.pem" || !withTLS.NATSTLSEnabled {
+		t.Errorf("tls = %q / %v", withTLS.NATSTLSCA, withTLS.NATSTLSEnabled)
 	}
 }

@@ -109,8 +109,9 @@ func TestLoadReadsEveryKnob(t *testing.T) {
 	}
 }
 
-// The NATS variables are deliberately UNPREFIXED, matching apps/api, apps/engine and apps/sipd.
-// A MEDIAD_-prefixed alias would be a second name for one platform credential.
+// The broker URL is deliberately UNPREFIXED, matching apps/api, apps/engine and apps/sipd: where
+// the broker lives is a property of the deployment, not of this process. The CREDENTIAL is the
+// opposite — see TestNATSCredentialsPreferTheServicePair.
 func TestNATSVariablesAreUnprefixed(t *testing.T) {
 	cfg, err := config.Load(env(minimal(map[string]string{
 		"MEDIAD_NATS_URL": "nats://wrong:4222",
@@ -122,6 +123,76 @@ func TestNATSVariablesAreUnprefixed(t *testing.T) {
 	if cfg.NATSURL != "nats://right:4222" {
 		t.Errorf("NATSURL = %q; NATS_URL is the platform-wide name and MEDIAD_NATS_URL is not read",
 			cfg.NATSURL)
+	}
+}
+
+// NATS_MEDIAD_USER/PASS is this process's own least-privilege identity in config/nats.conf; the
+// unprefixed pair is the shared operator credential and only the fallback.
+func TestNATSCredentialsPreferTheServicePair(t *testing.T) {
+	cfg, err := config.Load(env(minimal(map[string]string{
+		"NATS_USER":        "optimiq",
+		"NATS_PASS":        "shared",
+		"NATS_MEDIAD_USER": "optimiq-mediad",
+		"NATS_MEDIAD_PASS": "scoped",
+	})))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.NATSUser != "optimiq-mediad" || cfg.NATSPass != "scoped" {
+		t.Errorf("credentials = %q/%q; the mediad pair outranks the shared one", cfg.NATSUser, cfg.NATSPass)
+	}
+}
+
+// A deployment that has not split its credentials keeps working unchanged.
+func TestNATSCredentialsFallBackToTheSharedPair(t *testing.T) {
+	cfg, err := config.Load(env(minimal(map[string]string{
+		"NATS_USER": "optimiq",
+		"NATS_PASS": "shared",
+	})))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.NATSUser != "optimiq" || cfg.NATSPass != "shared" {
+		t.Errorf("credentials = %q/%q; the shared pair is the fallback", cfg.NATSUser, cfg.NATSPass)
+	}
+}
+
+// Falling back from a half-set service pair would silently hand this process the OPERATOR identity
+// and hide the typo behind a working connection. It is refused instead.
+func TestHalfAServiceCredentialIsRefusedEvenWithASharedPair(t *testing.T) {
+	_, err := config.Load(env(minimal(map[string]string{
+		"NATS_USER":        "optimiq",
+		"NATS_PASS":        "shared",
+		"NATS_MEDIAD_USER": "optimiq-mediad",
+	})))
+	if err == nil {
+		t.Fatal("Load: expected a half-set NATS_MEDIAD pair to be refused")
+	}
+	if !strings.Contains(err.Error(), "NATS_MEDIAD_USER is set but NATS_MEDIAD_PASS is not") {
+		t.Errorf("error = %v; it should name the pair that is half set", err)
+	}
+}
+
+// TLS is OFF unless configured: the shipped broker serves plaintext and its tls block lives in the
+// compose.tls.yaml overlay, so a client that demanded TLS by default could never connect to it.
+func TestTLSIsOffUnlessConfigured(t *testing.T) {
+	cfg, err := config.Load(env(minimal(nil)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.NATSTLSCA != "" || cfg.NATSTLSEnabled {
+		t.Errorf("tls = %q/%v; both must default off", cfg.NATSTLSCA, cfg.NATSTLSEnabled)
+	}
+
+	withCA, err := config.Load(env(minimal(map[string]string{
+		"NATS_TLS_CA":      "/etc/nats/certs/ca.pem",
+		"NATS_TLS_ENABLED": "true",
+	})))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if withCA.NATSTLSCA != "/etc/nats/certs/ca.pem" || !withCA.NATSTLSEnabled {
+		t.Errorf("tls = %q/%v", withCA.NATSTLSCA, withCA.NATSTLSEnabled)
 	}
 }
 

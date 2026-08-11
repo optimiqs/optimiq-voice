@@ -83,9 +83,22 @@ func run() error {
 		}),
 	}
 	// Only when configured: an empty pair means a broker with no authentication, which is what the
-	// integration rig runs. config.Load has already refused a half-set pair.
+	// integration rig runs. config.Load has already refused a half-set pair, and has already
+	// preferred NATS_MEDIAD_USER/PASS over the shared pair — so this is the `mediad` user, whose
+	// permissions in config/nats.conf are the four rpc.media.v1 subjects, media.evt.v1.> and the
+	// media-sessions bucket. A subject outside that set fails as an authorization violation on the
+	// publish, not at connect.
 	if cfg.NATSUser != "" {
 		natsOpts = append(natsOpts, nats.UserInfo(cfg.NATSUser, cfg.NATSPass))
+	}
+	// Transport security, off unless configured. RootCAs both enables TLS and pins the bundle, so
+	// it covers the private-CA case on its own; Secure is the system-trust-store case. Neither set
+	// leaves the connection plaintext, which is what the broker in compose.yaml serves.
+	switch {
+	case cfg.NATSTLSCA != "":
+		natsOpts = append(natsOpts, nats.RootCAs(cfg.NATSTLSCA))
+	case cfg.NATSTLSEnabled:
+		natsOpts = append(natsOpts, nats.Secure())
 	}
 
 	conn, err := nats.Connect(cfg.NATSURL, natsOpts...)

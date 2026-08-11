@@ -232,33 +232,37 @@ one that died — which is what makes the KV snapshot usable for failover instea
 
 ## Configuration
 
-| Variable                              | Default                  | Notes                                                                                       |
-| ------------------------------------- | ------------------------ | ------------------------------------------------------------------------------------------- |
-| `ARI_URL`                             | `http://localhost:8088`  | With or without `/ari`                                                                      |
-| `ARI_USERNAME` / `ARI_PASSWORD`       | `ari` / — (required)     | A missing password stops the process at boot                                                |
-| `ARI_APP`                             | `optimiq-engine`         | The `Stasis()` application name                                                             |
-| `ARI_SUBSCRIBE_ALL`                   | `false`                  | `true` means one engine sees every tenant's channels                                        |
-| `NATS_URL`                            | `nats://localhost:4222`  |                                                                                             |
-| `ENGINE_ENSURE_STREAMS`               | `true`                   | Applies the `@optimiq-voice/events` definitions                                             |
-| `ENGINE_PORT` / `ENGINE_HOST`         | `4010` / `0.0.0.0`       | `/healthz` and `/livez` only                                                                |
-| `ENGINE_DEFAULT_ORGANIZATION_ID`      | unset                    | Dev only — see below                                                                        |
-| `ENGINE_DRAIN_TIMEOUT_MS`             | `30000`                  |                                                                                             |
-| `ENGINE_INBOUND_ANNOUNCEMENT`         | unset                    | Pre-routing only; a plan overrides it                                                       |
-| `ENGINE_ROUTING_ENABLED`              | `true`                   | Off leaves the pre-routing ring/answer program                                              |
-| `ENGINE_ROUTING_RPC_TIMEOUT_MS`       | `2000`                   | Deadline for `rpc.routing.v1.resolve`                                                       |
-| `ENGINE_EXTENSION_DIAL_TEMPLATE`      | `PJSIP/{number}`         | `{number}` is substituted                                                                   |
-| `ENGINE_TRUNK_DIAL_TEMPLATE`          | `PJSIP/{number}@{trunk}` | `{number}` and `{trunk}` are substituted                                                    |
-| `ENGINE_DEFAULT_RING_TIMEOUT_SECONDS` | `30`                     | When neither node nor member specifies one                                                  |
-| `ENGINE_PROMPT_MEDIA_PREFIX`          | `sound:`                 | How a bare prompt id is rendered                                                            |
-| `ENGINE_UNAVAILABLE_ANNOUNCEMENT`     | `sound:unavailable`      | Unresolvable media and the stubbed node kinds                                               |
-| `ENGINE_VOICEMAIL_GREETING`           | `sound:unavailable`      | Played when the box has no greeting of its own                                              |
-| `ENGINE_MEDIA_OBJECT_ROOT`            | unset                    | Where the object store is mounted INSIDE Asterisk. Unset = greetings and messages fall back |
-| `ENGINE_VOICEMAIL_PIN_PROMPT`         | `sound:vm-password`      | Asked before a mailbox with a PIN opens                                                     |
-| `ENGINE_VOICEMAIL_PIN_INVALID_PROMPT` | `sound:vm-incorrect`     | Played between failed attempts                                                              |
-| `ENGINE_VOICEMAIL_PIN_ATTEMPTS`       | `3`                      | Then the call is refused with `CALL_REJECTED`                                               |
-| `ENGINE_VOICEMAIL_MENU_TIMEOUT_MS`    | `5000`                   | Wait for a control digit after a message plays                                              |
-| `ENGINE_VOICEMAIL_RPC_TIMEOUT_MS`     | `3000`                   | Deadline for `rpc.voicemail.v1.list`                                                        |
-| `ENGINE_RECORDING_FORMAT`             | `wav`                    |                                                                                             |
+| Variable                                | Default                  | Notes                                                                                       |
+| --------------------------------------- | ------------------------ | ------------------------------------------------------------------------------------------- |
+| `ARI_URL`                               | `http://localhost:8088`  | With or without `/ari`                                                                      |
+| `ARI_USERNAME` / `ARI_PASSWORD`         | `ari` / — (required)     | A missing password stops the process at boot                                                |
+| `ARI_APP`                               | `optimiq-engine`         | The `Stasis()` application name                                                             |
+| `ARI_SUBSCRIBE_ALL`                     | `false`                  | `true` means one engine sees every tenant's channels                                        |
+| `NATS_URL`                              | `nats://localhost:4222`  |                                                                                             |
+| `NATS_ENGINE_USER` / `NATS_ENGINE_PASS` | unset                    | This process's own broker identity; see `config/nats.conf`                                  |
+| `NATS_USER` / `NATS_PASS`               | unset                    | The shared operator credential — the fallback when the pair above is absent                 |
+| `NATS_TLS_CA`                           | unset                    | CA bundle path. Enables TLS and pins that CA; unset is plaintext                            |
+| `NATS_TLS_ENABLED`                      | `false`                  | TLS against the system trust store instead                                                  |
+| `ENGINE_ENSURE_STREAMS`                 | `true`                   | Applies the `@optimiq-voice/events` definitions                                             |
+| `ENGINE_PORT` / `ENGINE_HOST`           | `4010` / `0.0.0.0`       | `/healthz` and `/livez` only                                                                |
+| `ENGINE_DEFAULT_ORGANIZATION_ID`        | unset                    | Dev only — see below                                                                        |
+| `ENGINE_DRAIN_TIMEOUT_MS`               | `30000`                  |                                                                                             |
+| `ENGINE_INBOUND_ANNOUNCEMENT`           | unset                    | Pre-routing only; a plan overrides it                                                       |
+| `ENGINE_ROUTING_ENABLED`                | `true`                   | Off leaves the pre-routing ring/answer program                                              |
+| `ENGINE_ROUTING_RPC_TIMEOUT_MS`         | `2000`                   | Deadline for `rpc.routing.v1.resolve`                                                       |
+| `ENGINE_EXTENSION_DIAL_TEMPLATE`        | `PJSIP/{number}`         | `{number}` is substituted                                                                   |
+| `ENGINE_TRUNK_DIAL_TEMPLATE`            | `PJSIP/{number}@{trunk}` | `{number}` and `{trunk}` are substituted                                                    |
+| `ENGINE_DEFAULT_RING_TIMEOUT_SECONDS`   | `30`                     | When neither node nor member specifies one                                                  |
+| `ENGINE_PROMPT_MEDIA_PREFIX`            | `sound:`                 | How a bare prompt id is rendered                                                            |
+| `ENGINE_UNAVAILABLE_ANNOUNCEMENT`       | `sound:unavailable`      | Unresolvable media and the stubbed node kinds                                               |
+| `ENGINE_VOICEMAIL_GREETING`             | `sound:unavailable`      | Played when the box has no greeting of its own                                              |
+| `ENGINE_MEDIA_OBJECT_ROOT`              | unset                    | Where the object store is mounted INSIDE Asterisk. Unset = greetings and messages fall back |
+| `ENGINE_VOICEMAIL_PIN_PROMPT`           | `sound:vm-password`      | Asked before a mailbox with a PIN opens                                                     |
+| `ENGINE_VOICEMAIL_PIN_INVALID_PROMPT`   | `sound:vm-incorrect`     | Played between failed attempts                                                              |
+| `ENGINE_VOICEMAIL_PIN_ATTEMPTS`         | `3`                      | Then the call is refused with `CALL_REJECTED`                                               |
+| `ENGINE_VOICEMAIL_MENU_TIMEOUT_MS`      | `5000`                   | Wait for a control digit after a message plays                                              |
+| `ENGINE_VOICEMAIL_RPC_TIMEOUT_MS`       | `3000`                   | Deadline for `rpc.voicemail.v1.list`                                                        |
+| `ENGINE_RECORDING_FORMAT`               | `wav`                    |                                                                                             |
 
 **The dialplan no longer has to set `OPTIMIQ_ORG_ID`.** It still wins when it is set — see
 "Attributing a call to a tenant" — but a carrier trunk pointed at `optimiq-inbound-untrusted`

@@ -7,7 +7,7 @@ import {
 	sql,
 	withCdrWriterScope,
 } from "@optimiq-voice/cdr-db";
-import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
+import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import { getLogger } from "@optimiq-voice/logging";
 import { isArchivingObjectStore } from "../../storage";
 import { CDR_DATABASE, CDR_ENV, CDR_RECORDING_STORE } from "../shared/cdr.tokens";
@@ -136,7 +136,7 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 		try {
 			this.connection = await connect({
 				servers: this.env.NATS_URL,
-				...natsCredentials(this.env),
+				...natsConnectionOptions(this.env, "api"),
 				name: "optimiq-api-cdr-recordings",
 				maxReconnectAttempts: -1,
 				reconnectTimeWait: 1_000,

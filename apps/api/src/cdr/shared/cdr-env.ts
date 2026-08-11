@@ -73,11 +73,21 @@ export const cdrEnvSchema = z.object({
 	NATS_URL: natsUrl,
 
 	/**
-	 * How the durable writers authenticate to that broker. Unprefixed and shared with every other
-	 * service; see `config/nats.conf`.
+	 * How the durable writers authenticate to that broker.
+	 *
+	 * `NATS_API_USER` / `NATS_API_PASS` are this process's own least-privilege identity, with
+	 * `NATS_USER` / `NATS_PASS` as the operator fallback — see `pbx-env.ts` for the full note and
+	 * `config/nats.conf` for the permission set. The two writers here need `cdr.leg.v1.*` and
+	 * `calls.evt.v1.*.*.channel.record.*` deliveries, both of which the `api` user is granted.
 	 */
 	NATS_USER: natsCredential,
 	NATS_PASS: natsCredential,
+	NATS_API_USER: natsCredential,
+	NATS_API_PASS: natsCredential,
+
+	/** Broker transport security; off unless set. See `pbx-env.ts`. */
+	NATS_TLS_CA: z.string().min(1).optional(),
+	NATS_TLS_ENABLED: z.string().optional(),
 
 	CDR_DATABASE_MAX_CONNECTIONS: z.coerce.number().int().min(2).max(100).default(10),
 

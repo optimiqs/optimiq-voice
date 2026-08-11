@@ -2,7 +2,7 @@ import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } fro
 import { connect, type JetStreamManager, type KV, type NatsConnection } from "nats";
 // Subpath imports for the same reason `routing-cache.publisher.ts` uses them: `apps/api`'s tooling
 // tsconfig still relaxes `strictNullChecks` for its legacy files, and `validate.ts` needs it.
-import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
+import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import { DID_INDEX_KV, ensureKvBuckets, kvKeyFor } from "@optimiq-voice/events/streams";
 import { didIndexToken } from "@optimiq-voice/events/subjects";
 import { getLogger } from "@optimiq-voice/logging";
@@ -103,7 +103,7 @@ export class DidIndexPublisher implements OnModuleInit, OnApplicationShutdown {
 			// shutdown ordering for the sake of one TCP socket.
 			this.connection = await connect({
 				servers: this.env.NATS_URL,
-				...natsCredentials(this.env),
+				...natsConnectionOptions(this.env, "api"),
 				name: "optimiq-api-did-index",
 				maxReconnectAttempts: -1,
 				reconnectTimeWait: 1_000,

@@ -1,5 +1,5 @@
 import { Transport } from "@nestjs/microservices";
-import { natsCredentials } from "@optimiq-voice/config/nats-credentials";
+import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import { RPC_SUBJECTS } from "@optimiq-voice/events/subjects";
 import { getLogger } from "@optimiq-voice/logging";
 import { isPbxSliceConfigured, loadPbxEnv } from "./shared/pbx-env";
@@ -39,7 +39,7 @@ export async function registerPbxTransport(app: INestApplication): Promise<boole
 			transport: Transport.NATS,
 			options: {
 				servers: [env.NATS_URL],
-				...natsCredentials(env),
+				...natsConnectionOptions(env, "api"),
 				name: "optimiq-api-routing-rpc",
 				maxReconnectAttempts: -1,
 				reconnectTimeWait: 1_000,

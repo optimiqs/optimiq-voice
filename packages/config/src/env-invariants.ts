@@ -13,6 +13,20 @@ export interface EnvInvariantConfig {
 	API_NATS_URL?: string;
 	NATS_USER?: string;
 	NATS_PASS?: string;
+	/**
+	 * The least-privilege identities `config/nats.conf` defines, one per service. A deployment that
+	 * has split its credentials passes only the pair its own container needs, so any whole pair
+	 * here satisfies the broker-credential invariant on its own — see
+	 * `assertProductionNatsCredentials`.
+	 */
+	NATS_API_USER?: string;
+	NATS_API_PASS?: string;
+	NATS_ENGINE_USER?: string;
+	NATS_ENGINE_PASS?: string;
+	NATS_MEDIAD_USER?: string;
+	NATS_MEDIAD_PASS?: string;
+	NATS_SIPD_USER?: string;
+	NATS_SIPD_PASS?: string;
 	AUTH_SECRET?: string;
 	AUTH_URL?: string;
 	AUTH_COOKIE_DOMAIN?: string;
@@ -177,14 +191,53 @@ function assertProductionSecrets(config: EnvInvariantConfig): void {
  * that has not yet applied the config would come up connected to an OPEN broker, which is worse.
  */
 function assertProductionNatsCredentials(config: EnvInvariantConfig): void {
-	// Unconditional: production has already been made to prove it has a broker URL a few lines
-	// above, so "configured a backbone but not how to authenticate to it" is the only state left.
+	// Every per-service password is placeholder-checked whether or not it is the one this process
+	// will use, because this file runs in a container whose environment is written by the same
+	// hand that writes the broker's — a `changeme` left in `NATS_MEDIAD_PASS` is a broker that will
+	// refuse the media plane, and finding that out here beats finding it out at the first call.
+	for (const [key] of PER_SERVICE_NATS_PASSWORDS) {
+		const password = config[key];
+		if (password !== undefined && isPlaceholderSecret(password)) {
+			throw new Error(`${key} still uses the .env.example placeholder value.`);
+		}
+	}
+
+	// A process may authenticate as ITSELF rather than as the shared identity — `NATS_API_USER` and
+	// friends, the least-privilege users in `config/nats.conf`. A deployment that has split its
+	// credentials passes only the pair its own service needs, so demanding `NATS_USER` here would
+	// refuse to boot exactly the configuration this check wants people to reach.
+	//
+	// Any WHOLE pair satisfies it. A half-set pair does not, and is left to `natsCredentials` to
+	// name precisely at the connection site.
+	const hasServicePair = PER_SERVICE_NATS_PASSWORDS.some(
+		([passKey, userKey]) => isSet(config[passKey]) && isSet(config[userKey]),
+	);
+	if (hasServicePair) {
+		return;
+	}
+
+	// Otherwise the shared pair is the only way this process can authenticate, so it is required.
+	// Production has already been made to prove it has a broker URL a few lines above, so
+	// "configured a backbone but not how to authenticate to it" is the only state left.
 	requirePresent("NATS_USER", config.NATS_USER);
 	requirePresent("NATS_PASS", config.NATS_PASS);
 
 	if (isPlaceholderSecret(config.NATS_PASS)) {
 		throw new Error("NATS_PASS still uses the .env.example placeholder value.");
 	}
+}
+
+/** `[password key, user key]` for each least-privilege identity `config/nats.conf` defines. */
+const PER_SERVICE_NATS_PASSWORDS = [
+	["NATS_API_PASS", "NATS_API_USER"],
+	["NATS_ENGINE_PASS", "NATS_ENGINE_USER"],
+	["NATS_MEDIAD_PASS", "NATS_MEDIAD_USER"],
+	["NATS_SIPD_PASS", "NATS_SIPD_USER"],
+] as const satisfies readonly (readonly [keyof EnvInvariantConfig, keyof EnvInvariantConfig])[];
+
+/** Present and not just whitespace — the same emptiness `requirePresent` enforces. */
+function isSet(value: string | undefined): boolean {
+	return value !== undefined && value.trim() !== "";
 }
 
 /**

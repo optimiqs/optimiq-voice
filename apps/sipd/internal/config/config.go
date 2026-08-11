@@ -48,21 +48,39 @@ type Config struct {
 	// NATSURL is the backbone. NATS_URL, default nats://127.0.0.1:4222.
 	NATSURL string
 
-	// NATSUser and NATSPass authenticate to it. NATS_USER / NATS_PASS.
+	// NATSUser and NATSPass authenticate to it. NATS_SIPD_USER / NATS_SIPD_PASS, falling back to
+	// the unprefixed NATS_USER / NATS_PASS.
 	//
-	// The broker requires authentication (config/nats.conf); these are the same two unprefixed
-	// names apps/api and apps/engine read, because it is one identity for the whole platform
-	// account and splitting the variable names per service would only make them drift.
+	// The broker requires authentication (config/nats.conf), and the prefixed pair is this
+	// process's OWN identity there. The `sipd` user may publish `sip.reg.v1.>`, request
+	// `rpc.sip.v1.credential` and use the `registrations` KV bucket; it subscribes to no business
+	// subject at all, because sipd's request surface is SIP rather than NATS. It cannot write a
+	// CDR leg, cannot read the dial plan and cannot see another plane's events — which is the
+	// point, for the process that terminates SIP from the internet.
+	//
+	// The unprefixed fallback is what keeps a deployment that has not split its credentials
+	// working unchanged.
 	//
 	// Both empty is legal and means "a broker with no authentication configured" — the SIPp rig and
-	// the integration tests start one of those per run. One set without the other is NOT legal: it
-	// is a rename applied to half a pair, and the broker would answer every connect with an
-	// authorization violation that this process would spend its life retrying.
+	// the integration tests start one of those per run. One set without the other is NOT legal,
+	// PER PAIR: it is a rename applied to half a pair, and the broker would answer every connect
+	// with an authorization violation that this process would spend its life retrying.
 	//
 	// They are options rather than userinfo in NATSURL because the URL is logged: the boot line,
 	// every reconnect and the connect error itself all carry it.
 	NATSUser string
 	NATSPass string
+
+	// NATSTLSCA is the path to a PEM bundle the broker's certificate must chain to. NATS_TLS_CA.
+	// Empty is PLAINTEXT unless NATSTLSEnabled says otherwise — the shipped broker listens without
+	// TLS and its `tls` block lives in the `compose.tls.yaml` overlay, so a client that demanded
+	// TLS by default would fail to connect on every checkout that has not generated certificates.
+	NATSTLSCA string
+
+	// NATSTLSEnabled turns on TLS against the SYSTEM trust store. NATS_TLS_ENABLED. Setting
+	// NATSTLSCA implies it; the two names exist because a private CA and a public issuer are
+	// genuinely different configurations.
+	NATSTLSEnabled bool
 
 	// Expiry policy, in seconds on the wire.
 	//   SIPD_MIN_EXPIRES     default 60   — below this a REGISTER gets 423 Interval Too Brief
@@ -161,15 +179,21 @@ func Load(getenv Getenv) (Config, error) {
 		ListenAddr:         stringOr(getenv, "SIPD_LISTEN_ADDR", "0.0.0.0:5060"),
 		Realm:              strings.TrimSpace(getenv("SIPD_REALM")),
 		NATSURL:            stringOr(getenv, "NATS_URL", "nats://127.0.0.1:4222"),
-		NATSUser:           strings.TrimSpace(getenv("NATS_USER")),
-		NATSPass:           strings.TrimSpace(getenv("NATS_PASS")),
+		NATSTLSCA:          strings.TrimSpace(getenv("NATS_TLS_CA")),
 		NonceSecret:        getenv("SIPD_NONCE_SECRET"),
 		CredentialsFile:    getenv("SIPD_CREDENTIALS_FILE"),
 		ProvisionSecretKey: strings.TrimSpace(getenv("SIPD_PROVISION_SECRET_KEY")),
 		UserAgent:          stringOr(getenv, "SIPD_USER_AGENT", "optimiq-sipd"),
 	}
 
+	// The per-service pair first, the shared pair as the fallback. Collected into `problems` so a
+	// half-set pair is reported alongside every other configuration error rather than on its own.
+	cfg.NATSUser, cfg.NATSPass, problems = resolveNATSCredentials(getenv, "SIPD", problems)
+
 	var err error
+	if cfg.NATSTLSEnabled, err = boolOr(getenv, "NATS_TLS_ENABLED", false); err != nil {
+		fail("%v", err)
+	}
 	if cfg.EnableUDP, err = boolOr(getenv, "SIPD_UDP", true); err != nil {
 		fail("%v", err)
 	}
@@ -224,15 +248,6 @@ func Load(getenv Getenv) (Config, error) {
 	if cfg.ListenAddr == "" {
 		fail("SIPD_LISTEN_ADDR must not be empty")
 	}
-	// Half a credential is a typo, not a configuration. Caught here so it costs a startup error
-	// rather than an authorization violation on every reconnect for the life of the process.
-	if (cfg.NATSUser == "") != (cfg.NATSPass == "") {
-		set, missing := "NATS_USER", "NATS_PASS"
-		if cfg.NATSUser == "" {
-			set, missing = "NATS_PASS", "NATS_USER"
-		}
-		fail("%s is set but %s is not: NATS authentication needs both", set, missing)
-	}
 	if !cfg.EnableUDP && !cfg.EnableTCP {
 		fail("SIPD_UDP and SIPD_TCP are both false: sipd would accept no traffic at all")
 	}
@@ -275,6 +290,43 @@ func Load(getenv Getenv) (Config, error) {
 
 // ErrInvalid marks a configuration problem, for callers that want to branch on it.
 var ErrInvalid = errors.New("invalid sipd configuration")
+
+// resolveNATSCredentials reads the broker identity, preferring this service's own.
+//
+// `NATS_<SERVICE>_USER` / `NATS_<SERVICE>_PASS` win when BOTH are set — that is the least-privilege
+// user `config/nats.conf` defines for this process. Otherwise the shared `NATS_USER` / `NATS_PASS`
+// are used, which is what a deployment that has not split its credentials, the SIPp rig and the
+// integration tests still supply. Both absent is a broker with no authentication, which is legal.
+//
+// A HALF-SET pair is refused PER PAIR, and refused rather than ignored: falling back from a
+// half-set `NATS_SIPD_*` to the shared pair would hand this process the operator identity and hide
+// the typo behind a working connection, which is the failure this check exists to prevent. It is
+// collected into `problems` rather than returned so one startup message carries every
+// configuration error at once.
+func resolveNATSCredentials(getenv Getenv, service string, problems []string) (string, string, []string) {
+	scopedUserKey, scopedPassKey := "NATS_"+service+"_USER", "NATS_"+service+"_PASS"
+
+	for _, pair := range [2][2]string{
+		{scopedUserKey, scopedPassKey},
+		{"NATS_USER", "NATS_PASS"},
+	} {
+		user := strings.TrimSpace(getenv(pair[0]))
+		pass := strings.TrimSpace(getenv(pair[1]))
+
+		switch {
+		case user != "" && pass != "":
+			return user, pass, problems
+		case user != "":
+			return "", "", append(problems, fmt.Sprintf(
+				"%s is set but %s is not: NATS authentication needs both", pair[0], pair[1]))
+		case pass != "":
+			return "", "", append(problems, fmt.Sprintf(
+				"%s is set but %s is not: NATS authentication needs both", pair[1], pair[0]))
+		}
+	}
+
+	return "", "", problems
+}
 
 func stringOr(getenv Getenv, key, fallback string) string {
 	if value := strings.TrimSpace(getenv(key)); value != "" {
