@@ -3,6 +3,8 @@ import {
 	mediaAllocateSessionRequestSchema,
 	mediaBridgeSessionsRequestSchema,
 	mediaReleaseSessionRequestSchema,
+	mediaStartPlaybackRequestSchema,
+	mediaStopPlaybackRequestSchema,
 	mediaUnbridgeSessionsRequestSchema,
 	RPC_SUBJECTS,
 } from "@optimiq-voice/events";
@@ -63,6 +65,8 @@ describe("request framing", () => {
 		await port.createBridge({ bridgeId: "bridge-1" });
 		await port.addToBridge("bridge-1", ["leg-a", "leg-b"]);
 		await port.destroyBridge("bridge-1");
+		await port.play("leg-a", { media: ["sound:welcome"], playbackRef: "pb-1", language: "en" });
+		await port.stopPlayback("pb-1");
 		await port.releaseSession(SESSION);
 
 		const schemas: Record<string, { parse(value: unknown): unknown }> = {
@@ -70,6 +74,8 @@ describe("request framing", () => {
 			[RPC_SUBJECTS.mediaBridgeSessions]: mediaBridgeSessionsRequestSchema,
 			[RPC_SUBJECTS.mediaUnbridgeSessions]: mediaUnbridgeSessionsRequestSchema,
 			[RPC_SUBJECTS.mediaReleaseSession]: mediaReleaseSessionRequestSchema,
+			[RPC_SUBJECTS.mediaStartPlayback]: mediaStartPlaybackRequestSchema,
+			[RPC_SUBJECTS.mediaStopPlayback]: mediaStopPlaybackRequestSchema,
 		};
 		expect(transport.requests.length).toBeGreaterThan(0);
 		for (const request of transport.requests) {
@@ -286,6 +292,150 @@ describe("watchChannel", () => {
 	});
 });
 
+describe("playback (rung 1)", () => {
+	it("starts a playback and hands back the caller's own reference", async () => {
+		const { port, transport } = newPort();
+
+		const handle = await port.play("leg-a", {
+			media: ["sound:welcome", "sound:menu"],
+			playbackRef: "pb-1",
+		});
+
+		// The CALLER's reference, not the reply's. They are equal by contract, and returning the one
+		// the caller already holds means a lost reply cannot produce a handle it does not recognise.
+		expect(handle.playbackRef).toBe("pb-1");
+
+		const payload = transport.on(RPC_SUBJECTS.mediaStartPlayback)[0]?.payload as Record<
+			string,
+			unknown
+		>;
+		// A leg id IS a session id under this driver: both are engine-assigned, so there is no
+		// mapping table to lose on a restart.
+		expect(payload["sessionId"]).toBe("leg-a");
+		expect(payload["playbackRef"]).toBe("pb-1");
+		expect(payload["media"]).toEqual(["sound:welcome", "sound:menu"]);
+	});
+
+	it("passes the media ref through untranslated", async () => {
+		// `routing/media-refs.ts` has already rendered the domain MediaRef into the media server's
+		// flat vocabulary. Translating it a second time here would put the prompt library's layout
+		// on both sides of the seam.
+		const { port, transport } = newPort();
+
+		await port.play("leg-a", { media: ["sound:/mnt/prompts/greeting"], playbackRef: "pb-1" });
+
+		const payload = transport.on(RPC_SUBJECTS.mediaStartPlayback)[0]?.payload as Record<
+			string,
+			unknown
+		>;
+		expect(payload["media"]).toEqual(["sound:/mnt/prompts/greeting"]);
+	});
+
+	it("omits language rather than sending an empty one", async () => {
+		const { port, transport } = newPort();
+
+		await port.play("leg-a", { media: ["sound:welcome"], playbackRef: "pb-1" });
+
+		const payload = transport.on(RPC_SUBJECTS.mediaStartPlayback)[0]?.payload as Record<
+			string,
+			unknown
+		>;
+		expect("language" in payload).toBe(false);
+	});
+
+	it("carries language when the caller has an opinion", async () => {
+		const { port, transport } = newPort();
+
+		await port.play("leg-a", { media: ["sound:welcome"], playbackRef: "pb-1", language: "es" });
+
+		const payload = transport.on(RPC_SUBJECTS.mediaStartPlayback)[0]?.payload as Record<
+			string,
+			unknown
+		>;
+		expect(payload["language"]).toBe("es");
+	});
+
+	it("returns as soon as playback has started, without waiting for the prompt to end", async () => {
+		// The contract the whole barge-in path rests on: `play` hands back a handle the moment audio
+		// begins, and the END of the prompt is a JetStream event nothing above this seam consumes.
+		const { port, transport } = newPort();
+
+		await port.play("leg-a", { media: ["sound:welcome"], playbackRef: "pb-1" });
+
+		expect(transport.on(RPC_SUBJECTS.mediaStartPlayback)).toHaveLength(1);
+		expect(transport.on(RPC_SUBJECTS.mediaStopPlayback)).toHaveLength(0);
+	});
+
+	it("stops a playback by reference alone", async () => {
+		// `MediaPort.stopPlayback(playbackRef)` has no channel id to give, so neither does the wire.
+		const { port, transport } = newPort();
+
+		await port.stopPlayback("pb-1");
+
+		const payload = transport.on(RPC_SUBJECTS.mediaStopPlayback)[0]?.payload as Record<
+			string,
+			unknown
+		>;
+		expect(payload).toEqual({ playbackRef: "pb-1" });
+	});
+
+	it("treats stopping an already-finished playback as a no-op", async () => {
+		// The COMMON path, not an edge case: `gather` stops its prompt whatever ended the
+		// collection, so a caller who listens to the whole menu produces this on every call.
+		const { port, transport } = newPort();
+		transport.reply(RPC_SUBJECTS.mediaStopPlayback, {
+			ok: true,
+			playbackRef: "pb-1",
+			stopped: false,
+			instanceId: "mediad-fake",
+		});
+
+		await expect(port.stopPlayback("pb-1")).resolves.toBeUndefined();
+	});
+
+	it("surfaces a refused media scheme as a typed command refusal", async () => {
+		// A generator scheme is an argument this media plane cannot serve, not an operation it does
+		// not have — so it is a MediaCommandRefusedError with mediad's own reason on it, and the
+		// caller can route the leg to Asterisk instead of reading a message.
+		const { port, transport } = newPort();
+		transport.reply(RPC_SUBJECTS.mediaStartPlayback, {
+			ok: false,
+			sessionId: "leg-a",
+			playbackRef: "pb-1",
+			instanceId: "mediad-7c9f",
+			reason: "not_supported",
+			error: "tone: is a generator scheme mediad has no synthesiser for",
+		});
+
+		const attempt = port.play("leg-a", { media: ["tone://ring"], playbackRef: "pb-1" });
+		await expect(attempt).rejects.toThrow(MediaCommandRefusedError);
+		try {
+			await attempt;
+		} catch (error) {
+			const refusal = error as MediaCommandRefusedError;
+			expect(refusal.reason).toBe("not_supported");
+			expect(refusal.instanceId).toBe("mediad-7c9f");
+		}
+	});
+
+	it("surfaces a missing prompt as a refusal rather than silence", async () => {
+		// The defect this whole vocabulary exists to prevent is a play that reports success and
+		// sends nothing, so a prompt mediad cannot read must reach the caller as an error.
+		const { port, transport } = newPort();
+		transport.reply(RPC_SUBJECTS.mediaStartPlayback, {
+			ok: false,
+			sessionId: "leg-a",
+			playbackRef: "pb-1",
+			reason: "bad_request",
+			error: "sound:missing: audio: no such prompt",
+		});
+
+		await expect(
+			port.play("leg-a", { media: ["sound:missing"], playbackRef: "pb-1" }),
+		).rejects.toThrow(MediaCommandRefusedError);
+	});
+});
+
 describe("the not-supported map", () => {
 	/**
 	 * Every unreached rung fails LOUDLY. A media plane that quietly accepted `record` would produce
@@ -300,8 +450,6 @@ describe("the not-supported map", () => {
 			"signalling",
 			(port) => port.originate({ endpoint: "PJSIP/1001", application: "app", channelId: "leg-b" }),
 		],
-		["play", "rung 1", (port) => port.play("leg-a", { media: ["sound:hi"], playbackRef: "p1" })],
-		["stopPlayback", "rung 1", (port) => port.stopPlayback("p1")],
 		["getVariable", "dialplan", (port) => port.getVariable("leg-a", "X")],
 		["setVariable", "dialplan", (port) => port.setVariable("leg-a", "X", "1")],
 		["sendDtmf", "rung 3", (port) => port.sendDtmf("leg-a", { digits: "1" })],
@@ -358,6 +506,10 @@ describe("the not-supported map", () => {
 			"hangup",
 			"channelExists",
 			"watchChannel",
+			// Rung 1. `play` and `stopPlayback` moved out of the refused list when mediad learned to
+			// source frames from a file — see the playback describe block above.
+			"play",
+			"stopPlayback",
 		];
 		const refused = refusals.map(([operation]) => operation);
 		const methods = [...supported, ...refused].sort();

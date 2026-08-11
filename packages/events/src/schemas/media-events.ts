@@ -128,6 +128,64 @@ export const mediaSessionRtpTimeoutDataSchema = z.object({
 	remoteAddress: z.string().max(64).optional(),
 });
 
+/**
+ * Why a playback stopped.
+ *
+ * Three outcomes, and the reason a consumer cares which is that only one of them is a defect:
+ * `completed` and `stopped` are both the system working (a prompt that ran out, and a caller who
+ * barged in), while `error` is a leg that was told a prompt would play and heard silence.
+ */
+export const MEDIA_PLAYBACK_END_REASONS = [
+	/** The last frame was sent. The caller heard the whole prompt. */
+	"completed",
+	/**
+	 * `rpc.media.v1.stop-playback`, or the session ending underneath it.
+	 *
+	 * The COMMON case and not an exceptional one: every `gather` stops its own prompt the moment
+	 * collection ends, so a healthy IVR produces one of these per menu.
+	 */
+	"stopped",
+	/** The frame source failed mid-playback. `detail` is whatever could be said about it. */
+	"error",
+] as const;
+
+export const mediaPlaybackEndReasonSchema = z.enum(MEDIA_PLAYBACK_END_REASONS);
+export type MediaPlaybackEndReason = (typeof MEDIA_PLAYBACK_END_REASONS)[number];
+
+/**
+ * `playback.finished` — a prompt stopped, and why.
+ *
+ * ## The engine does not branch on this, and it is published anyway
+ *
+ * `MediaPort.play` returns as soon as audio has STARTED, and the orchestrator consumes a twelve
+ * member `MediaEvent` union with no playback member in it: on the ARI path `PlaybackFinished` is
+ * one of the events `toMediaEvent` deliberately drops, because nothing above the seam waits for a
+ * prompt to end. `mediad`'s mapping mirrors that exactly — `toMediaEventFromMediad` answers
+ * `undefined` — so adding this event changes no engine behaviour and adds no union member. That is
+ * the point: a union member nobody branches on is a shape two media servers would have to agree on
+ * for no reason.
+ *
+ * What it is for is the same thing `session.rtp-timeout` is for. A playback that ends `error` is a
+ * caller sitting in silence where a menu should be, on a call that is otherwise perfectly healthy,
+ * and it is invisible to every other signal the platform has: the command already answered `ok`,
+ * the session is still up, and no CDR field records it. Publishing it durably is what turns "the
+ * caller says nothing played" from an unreproducible ticket into a lookup by session id.
+ *
+ * It is also the only place `playedMs` exists. The engine's `PlaybackResult.elapsedMs` measures how
+ * long the COMMAND took, not how much audio the far end actually received, and on a barge-in those
+ * two numbers are not close.
+ */
+export const mediaPlaybackFinishedDataSchema = z.object({
+	...sessionIdentityShape,
+	/** The reference the engine assigned in `rpc.media.v1.start-playback`. */
+	playbackRef: z.string().min(1).max(128),
+	reason: mediaPlaybackEndReasonSchema,
+	/** How much audio actually reached the far end, in milliseconds. See the note above. */
+	playedMs: z.int().min(0),
+	/** Free text for the `error` reason, and for anything an operator would want in a log line. */
+	detail: z.string().max(512).optional(),
+});
+
 export const MEDIA_EVENT_DEFINITIONS = {
 	"session.ended": defineEvent("media", "session.ended", mediaSessionEndedDataSchema),
 	"session.rtp-timeout": defineEvent(
@@ -135,6 +193,7 @@ export const MEDIA_EVENT_DEFINITIONS = {
 		"session.rtp-timeout",
 		mediaSessionRtpTimeoutDataSchema,
 	),
+	"playback.finished": defineEvent("media", "playback.finished", mediaPlaybackFinishedDataSchema),
 } as const;
 
 export type MediaEventDefinitions = typeof MEDIA_EVENT_DEFINITIONS;
@@ -151,12 +210,14 @@ export type MediaEventDataOf<TType extends MediaSessionEvent> = z.infer<
 export const mediaEventSchema = z.discriminatedUnion("type", [
 	MEDIA_EVENT_DEFINITIONS["session.ended"].envelope,
 	MEDIA_EVENT_DEFINITIONS["session.rtp-timeout"].envelope,
+	MEDIA_EVENT_DEFINITIONS["playback.finished"].envelope,
 ]);
 
 export type MediaEventEnvelope = z.infer<typeof mediaEventSchema>;
 
 export type MediaSessionEndedData = z.infer<typeof mediaSessionEndedDataSchema>;
 export type MediaSessionRtpTimeoutData = z.infer<typeof mediaSessionRtpTimeoutDataSchema>;
+export type MediaPlaybackFinishedData = z.infer<typeof mediaPlaybackFinishedDataSchema>;
 
 /**
  * Input for {@link makeMediaEvent}. The subject is derived from `orgId` and `data.sessionId`, so a

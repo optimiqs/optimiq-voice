@@ -11,10 +11,10 @@ import type { HangupCause } from "@optimiq-voice/telephony";
  * stops at this file. `ari-mapping.ts` translates Asterisk's names; this translates `mediad`'s. The
  * layer above never learns there are two.
  *
- * ## Two events in, one member out
+ * ## Three events in, one member out
  *
- * `mediad` publishes two things and the orchestrator branches on one of them, so the mapping is not
- * symmetric — and that asymmetry is the interesting part.
+ * `mediad` publishes three things and the orchestrator branches on one of them, so the mapping is
+ * not symmetric — and that asymmetry is the interesting part.
  *
  * - `session.ended` becomes `leg-ended`, the member the CDR is written from. It is the only media
  *   event that means "this leg is over".
@@ -22,6 +22,14 @@ import type { HangupCause } from "@optimiq-voice/telephony";
  *   a `session.ended` whose reason is `rtp-timeout`, and emitting both would tear the leg down
  *   twice: once on the warning and once on the fact. The reason survives on the `leg-ended` it
  *   causes, which is where a consumer asking "why did that call drop" looks.
+ * - `playback.finished` maps to NOTHING either, and this one is a deliberate MIRROR of the ARI
+ *   path rather than an omission. `MediaPort.play` returns as soon as audio has STARTED — the verb
+ *   executor says so in as many words, because barge-in must not hold a fiber for the length of a
+ *   prompt — so nothing above this seam waits for a prompt to end. `toMediaEvent` drops Asterisk's
+ *   `PlaybackFinished` for exactly that reason, and adding a union member here would mean two media
+ *   planes agreeing on a shape no consumer branches on. The event is still PUBLISHED, because
+ *   `reason: error` is a caller in silence where a menu should be and nothing else records it; it
+ *   is read by whoever is asking that question, not by the orchestrator.
  *
  * Answering `undefined` for an event the engine does not act on is the same contract `toMediaEvent`
  * has, for the same reason: the decision about what to drop belongs to the layer that knows what it
@@ -78,7 +86,9 @@ export function toMediaEventFromMediad(envelope: MediaEventEnvelope): MediaEvent
 			causeCode: mapped.code,
 		};
 	}
-	// `session.rtp-timeout` — see the file header. The ended event that follows carries the reason.
+	// `session.rtp-timeout` and `playback.finished` — see the file header. The first is the
+	// diagnosis of an `ended` that follows and carries the reason; the second has no consumer above
+	// this seam on either driver, because `play` never waited for it.
 	return undefined;
 }
 

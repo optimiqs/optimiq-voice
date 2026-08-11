@@ -2,6 +2,8 @@ import {
 	mediaAllocateSessionResponseSchema,
 	mediaBridgeSessionsResponseSchema,
 	mediaReleaseSessionResponseSchema,
+	mediaStartPlaybackResponseSchema,
+	mediaStopPlaybackResponseSchema,
 	mediaUnbridgeSessionsResponseSchema,
 	RPC_SUBJECTS,
 } from "@optimiq-voice/events";
@@ -33,7 +35,7 @@ import type { HangupCause } from "@optimiq-voice/telephony";
  *
  * ## The coverage map, and why it is the whole point of this file
  *
- * `MediaPort` has 24 methods because Asterisk can do 24 things. `mediad` can do four of them today,
+ * `MediaPort` has 24 methods because Asterisk can do 24 things. `mediad` can do nine of them today,
  * and the honest expression of that is not a partial implementation that pretends — it is an
  * implementation where every unreached rung throws {@link MediaOperationNotSupportedError} naming
  * the capability and the rung it arrives on.
@@ -47,18 +49,25 @@ import type { HangupCause } from "@optimiq-voice/telephony";
  *   hangup              rpc.media.v1.release-session — the MEDIA half of a teardown
  *   channelExists       answered from this adapter's own session registry
  *   watchChannel        satisfied by construction: mediad events are org-wide, not per-leg
+ *   play                rpc.media.v1.start-playback — rung 1, a session sourcing from a file
+ *   stopPlayback        rpc.media.v1.stop-playback, keyed by reference alone
  *
  * NOT SUPPORTED — throws, naming the rung
  *   answer, ring                       SIP responses; apps/sipd owns signalling (design doc §5)
  *   originate                          creating a leg is signalling, not media
  *   getVariable, setVariable           channel variables are a dialplan concept mediad has none of
- *   play, stopPlayback                 file playback — rung 1's second half, not built in this wave
  *   sendDtmf                           generating digits — rung 3
  *   record, stopRecording, snoop       rung 4
  *   startMusicOnHold, stopMusicOnHold  rung 5
  *   hold, unhold                       rung 5, and half signalling besides
  *   mute, unmute                       rung 5
  * ```
+ *
+ * `play` is supported for the media refs `apps/engine/src/routing/media-refs.ts` actually emits —
+ * `sound:`, which is what every domain `MediaRef` renders into. Asterisk's GENERATOR schemes are
+ * refused by `mediad` at the wire with `not_supported` and the scheme named, which is a
+ * {@link MediaCommandRefusedError} here rather than a capability refusal: the operation exists, this
+ * media plane cannot serve that argument.
  *
  * ## Why `createBridge` needs no round trip
  *
@@ -246,6 +255,67 @@ export class MediadMediaPort implements MediaPort {
 	}
 
 	/**
+	 * Plays audio towards the leg's far end. Rung 1 of `plans/mediad-design.md` §2.
+	 *
+	 * ## It returns when playback has STARTED, and that is the contract
+	 *
+	 * `MediaPort.play` hands back a handle the moment audio begins, never when the prompt ends. The
+	 * verb executor says so directly, and barge-in depends on it: a caller who presses a digit must
+	 * be able to interrupt without this call holding a fiber for the length of the menu. So this is
+	 * one 1 s command, and the end of the prompt is a `media.evt.v1.…playback.finished` event.
+	 *
+	 * ## Why nothing here waits for that event
+	 *
+	 * Because nothing above the seam does. The orchestrator's twelve-member `MediaEvent` union has
+	 * no playback member, and on the ARI path `PlaybackFinished` is one of the events `toMediaEvent`
+	 * deliberately drops. `mediad-event-mapping.ts` mirrors that exactly, which is what makes a
+	 * confirmation IVR or a voicemail greeting behave identically on either driver: both learn a
+	 * prompt started from the command's reply and stop it by reference, and neither waits.
+	 *
+	 * ## The media ref is passed through, not translated
+	 *
+	 * `apps/engine/src/routing/media-refs.ts` has already rendered every domain `MediaRef` into the
+	 * media server's flat vocabulary, and `mediad` resolves the one member of it that names a file:
+	 * `sound:`. Asterisk's generators — `tone:`, `digits:`, `number:`, `characters:` — are refused
+	 * by `mediad` as `not_supported` with the scheme in the message, which surfaces here as a
+	 * {@link MediaCommandRefusedError} the caller can route around. Translating them into something
+	 * `mediad` would accept is not possible: they are a synthesiser, not a path.
+	 */
+	async play(channelId: string, request: PlayRequest): Promise<PlaybackHandle> {
+		await this.call(
+			RPC_SUBJECTS.mediaStartPlayback,
+			{
+				sessionId: channelId,
+				playbackRef: request.playbackRef,
+				media: [...request.media],
+				...(request.language === undefined ? {} : { language: request.language }),
+			},
+			mediaStartPlaybackResponseSchema,
+		);
+		// The CALLER's reference, not the reply's. They are equal by contract — `playbackRef` is
+		// client-assigned so a stop can name it without holding server state — and returning the one
+		// the caller already holds means a lost reply cannot produce a handle it does not recognise.
+		return { playbackRef: request.playbackRef };
+	}
+
+	/**
+	 * Stops a prompt by reference. Stopping an already-finished playback is a no-op.
+	 *
+	 * The no-op is the COMMON path rather than an edge case: `gather` stops its prompt the moment
+	 * collection ends, whatever ended it, so a caller who listens to the whole menu and then presses
+	 * a digit produces exactly this on every call. `mediad` answers `ok: true, stopped: false` for
+	 * it, so this resolves rather than throwing — which is what the interface promises and what the
+	 * barge-in path in `plan-walker.ts` is written against.
+	 */
+	async stopPlayback(playbackRef: string): Promise<void> {
+		await this.call(
+			RPC_SUBJECTS.mediaStopPlayback,
+			{ playbackRef },
+			mediaStopPlaybackResponseSchema,
+		);
+	}
+
+	/**
 	 * Satisfied by construction, which is why it is not a refusal.
 	 *
 	 * `watchChannel` exists because ARI's narrow subscription STOPS when a channel leaves the
@@ -273,17 +343,6 @@ export class MediadMediaPort implements MediaPort {
 	async ring(channelId: string): Promise<void> {
 		void channelId;
 		return this.refuse("ring", "SIP signalling, which apps/sipd owns (design doc §5)");
-	}
-
-	async play(channelId: string, request: PlayRequest): Promise<PlaybackHandle> {
-		void channelId;
-		void request;
-		return this.refuse("play", "file playback (rung 1)");
-	}
-
-	async stopPlayback(playbackRef: string): Promise<void> {
-		void playbackRef;
-		return this.refuse("stopPlayback", "file playback (rung 1)");
 	}
 
 	async getVariable(channelId: string, name: string): Promise<string | undefined> {

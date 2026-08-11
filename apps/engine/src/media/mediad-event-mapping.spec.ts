@@ -42,6 +42,21 @@ function timedOut() {
 	});
 }
 
+function playbackFinished(reason: "completed" | "stopped" | "error" = "stopped") {
+	return makeMediaEvent("playback.finished", {
+		orgId: ORG,
+		source: "mediad",
+		data: {
+			sessionId: SESSION,
+			instanceId: "mediad-1",
+			callId: CALL,
+			playbackRef: "pb-1",
+			reason,
+			playedMs: 1_240,
+		},
+	});
+}
+
 /** A consumer receives JSON, not the object the builder returned. */
 function overTheWire(value: unknown): unknown {
 	return JSON.parse(JSON.stringify(value)) as unknown;
@@ -91,6 +106,19 @@ describe("toMediaEventFromMediad", () => {
 	it("drops session.rtp-timeout, because the ended event that follows carries the reason", () => {
 		expect(toMediaEventFromMediad(timedOut())).toBeUndefined();
 	});
+
+	/**
+	 * A deliberate MIRROR of the ARI path, not an omission. `toMediaEvent` drops Asterisk's
+	 * `PlaybackFinished` because `MediaPort.play` returns as soon as audio has STARTED and nothing
+	 * above the seam waits for a prompt to end. Raising a member here would make the two drivers
+	 * disagree about a shape no consumer branches on — and would give the mediad driver a behaviour
+	 * a confirmation IVR was never written against.
+	 */
+	it("drops playback.finished on every reason, exactly as the ARI path drops PlaybackFinished", () => {
+		for (const reason of ["completed", "stopped", "error"] as const) {
+			expect(toMediaEventFromMediad(playbackFinished(reason))).toBeUndefined();
+		}
+	});
 });
 
 describe("decodeMediadEvent", () => {
@@ -107,6 +135,20 @@ describe("decodeMediadEvent", () => {
 		expect(decoded).toBeDefined();
 		expect(decoded?.event).toBeUndefined();
 		expect(decoded?.envelope.type).toBe("session.rtp-timeout");
+	});
+
+	it("validates a playback.finished without raising a domain event", () => {
+		// It still has to PARSE: the payload is written by a Go process, and a decoder that dropped
+		// the type before validating would hide a drift the CI gate exists to catch.
+		const envelope = playbackFinished("error");
+		const decoded = decodeMediadEvent(envelope.subject, overTheWire(envelope));
+		expect(decoded).toBeDefined();
+		expect(decoded?.event).toBeUndefined();
+		expect(decoded?.envelope.type).toBe("playback.finished");
+		if (decoded?.envelope.type === "playback.finished") {
+			expect(decoded.envelope.data.playbackRef).toBe("pb-1");
+			expect(decoded.envelope.data.playedMs).toBe(1_240);
+		}
 	});
 
 	/**

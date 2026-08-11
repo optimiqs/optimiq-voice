@@ -54,6 +54,8 @@ describe("subject roots", () => {
 			mediaBridgeSessions: "rpc.media.v1.bridge-sessions",
 			mediaUnbridgeSessions: "rpc.media.v1.unbridge-sessions",
 			mediaReleaseSession: "rpc.media.v1.release-session",
+			mediaStartPlayback: "rpc.media.v1.start-playback",
+			mediaStopPlayback: "rpc.media.v1.stop-playback",
 			engineParkHandoff: "rpc.engine.v1.park-handoff",
 		});
 	});

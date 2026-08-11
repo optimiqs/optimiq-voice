@@ -14,7 +14,8 @@ import { createHash } from "node:crypto";
  * sip.reg.v1.<orgId>.<aorHash>.<event>       event = registered | unregistered | expired
  * queue.evt.v1.<orgId>.<queueId>.<event>     event = caller.joined | … | agent.state
  * voicemail.evt.v1.<orgId>.<mailboxId>.<event>  event = message.left | mwi.updated
- * media.evt.v1.<orgId>.<sessionId>.<event>   event = session.ended | session.rtp-timeout
+ * media.evt.v1.<orgId>.<sessionId>.<event>   event = session.ended | session.rtp-timeout |
+ *                                                    playback.finished
  * cdr.leg.v1.<orgId>                         one subject per org; event type is in the envelope
  * audit.evt.v1.<orgId>
  * provision.evt.v1.<orgId>
@@ -25,6 +26,8 @@ import { createHash } from "node:crypto";
  * rpc.media.v1.bridge-sessions
  * rpc.media.v1.unbridge-sessions
  * rpc.media.v1.release-session
+ * rpc.media.v1.start-playback
+ * rpc.media.v1.stop-playback
  * rpc.engine.v1.park-handoff.<instanceTok>   engine -> engine; the OWNING instance answers
  * ```
  *
@@ -73,7 +76,7 @@ export const RPC_SUBJECTS = {
 	/**
 	 * The media-plane command surface: `apps/engine` (TypeScript) → `apps/mediad` (Go).
 	 *
-	 * These four are the FIRST subjects on this backbone whose responder is Go and whose caller is
+	 * These are the FIRST subjects on this backbone whose responder is Go and whose caller is
 	 * TypeScript, which inverts the framing obligation every other subject carries — see the
 	 * "raw NATS on both ends" note at the head of `schemas/rpc.ts`.
 	 */
@@ -81,6 +84,16 @@ export const RPC_SUBJECTS = {
 	mediaBridgeSessions: `rpc.media.${SUBJECT_VERSION}.bridge-sessions`,
 	mediaUnbridgeSessions: `rpc.media.${SUBJECT_VERSION}.unbridge-sessions`,
 	mediaReleaseSession: `rpc.media.${SUBJECT_VERSION}.release-session`,
+	/**
+	 * Rung 1's playback pair, added when `mediad` learned to source frames from a file.
+	 *
+	 * `stop-playback` is keyed by `playbackRef` ALONE and carries no session id, because
+	 * `MediaPort.stopPlayback(playbackRef)` has none to give: the engine stops a prompt from a
+	 * barge-in handler that holds a reference and nothing else. `mediad` therefore indexes live
+	 * playbacks by reference — see `apps/mediad/internal/rtp`.
+	 */
+	mediaStartPlayback: `rpc.media.${SUBJECT_VERSION}.start-playback`,
+	mediaStopPlayback: `rpc.media.${SUBJECT_VERSION}.stop-playback`,
 	/**
 	 * The engine-to-engine command surface. A PREFIX, not a complete subject.
 	 *
@@ -208,7 +221,7 @@ export type VoicemailEvent = (typeof VOICEMAIL_EVENTS)[number];
  * command is a synchronous question inside a call setup; these two are facts about a session that
  * outlive the asking, and the engine acts on them by tearing a leg down.
  *
- * Only two members, and both exist because something branches on them:
+ * Every member exists because something reads it:
  *
  * - `session.ended` is the fact. It carries the reason, so one consumer can tell a session that was
  *   released in the normal course of a hangup from one that died — which is the difference between
@@ -217,10 +230,15 @@ export type VoicemailEvent = (typeof VOICEMAIL_EVENTS)[number];
  *   It is separate rather than folded in because it is actionable on its own: audio stopped while
  *   the signalling plane still believes the call is up, which is the single most common shape of a
  *   "the call was still connected but we could not hear each other" report.
+ * - `playback.finished` says a prompt stopped and WHY. The engine does not branch on it — see the
+ *   note on {@link mediaPlaybackFinishedDataSchema} — and it is published anyway for the same
+ *   reason `session.rtp-timeout` is: `reason: error` is a media failure on a call that is still up,
+ *   and without a durable record of it "the caller says they never heard the menu" has no evidence
+ *   behind it at all.
  *
- * There is deliberately no `session.allocated` or `session.bridged`: both are the successful reply
- * to a command the engine issued and is still holding, so publishing them would be telling the
- * caller something it already knows.
+ * There is deliberately no `session.allocated`, `session.bridged` or `playback.started`: all three
+ * are the successful reply to a command the engine issued and is still holding, so publishing them
+ * would be telling the caller something it already knows.
  *
  * Named `MEDIA_SESSION_EVENTS` rather than `MEDIA_EVENTS`, breaking the `CALL_EVENTS` /
  * `QUEUE_EVENTS` pattern on purpose: `apps/engine` already owns a domain type called `MediaEvent`
@@ -228,7 +246,11 @@ export type VoicemailEvent = (typeof VOICEMAIL_EVENTS)[number];
  * import both is the `mediad` adapter. Two different `MediaEvent`s in one import list is a rename
  * waiting to be applied to the wrong one.
  */
-export const MEDIA_SESSION_EVENTS = ["session.ended", "session.rtp-timeout"] as const;
+export const MEDIA_SESSION_EVENTS = [
+	"session.ended",
+	"session.rtp-timeout",
+	"playback.finished",
+] as const;
 export type MediaSessionEvent = (typeof MEDIA_SESSION_EVENTS)[number];
 
 /**

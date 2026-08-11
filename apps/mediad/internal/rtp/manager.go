@@ -95,6 +95,14 @@ type Lifecycle interface {
 	SessionEnded(session SessionSummary, reason EndReason)
 	// RTPTimedOut is called before the SessionEnded that follows it, and only for that reason.
 	RTPTimedOut(session SessionSummary, silentFor time.Duration)
+	// PlaybackFinished is called exactly once per started playback, however it ended.
+	//
+	// Including when the SESSION ended under it, which is why the summary is passed rather than
+	// looked up: by the time this runs the session may already be closed and out of the map. On
+	// that path the ordering against SessionEnded is not guaranteed and does not need to be — both
+	// carry the session id, and a consumer asking "did the prompt play" is reading `playedMs`, not
+	// inferring it from arrival order.
+	PlaybackFinished(session SessionSummary, playback PlaybackSummary)
 }
 
 // SessionSummary is a session's facts, flattened, so a Lifecycle implementation never holds a
@@ -129,6 +137,8 @@ type Manager struct {
 	// design doc open question 5.
 	echoDiagnostic bool
 	lifecycle      Lifecycle
+	// ticker is handed to every session it creates. See ManagerOptions.Ticker.
+	ticker func(time.Duration) (<-chan time.Time, func())
 
 	mu       sync.Mutex
 	sessions map[string]*Session
@@ -138,7 +148,13 @@ type Manager struct {
 	// because unbridge addresses a bridge by id and a session pair cannot be looked up from one. The
 	// peer pointers are the packet path's view; this is the control surface's.
 	bridges map[string][2]string
-	closed  bool
+	// playbacks maps a playback reference to the session playing it.
+	//
+	// Held HERE and not only on the session because `rpc.media.v1.stop-playback` carries a
+	// reference and NOTHING ELSE — `MediaPort.stopPlayback(playbackRef)` has no channel id to give
+	// — so without this index a stop would have to scan every live session on the instance.
+	playbacks map[string]string
+	closed    bool
 
 	// running tracks each session's read goroutine so Drain can wait for the packet path to stop
 	// before the process exits, rather than exiting with sockets still being read.
@@ -164,6 +180,8 @@ type ManagerOptions struct {
 	Logger *slog.Logger
 	// Now is the clock, for tests.
 	Now func() time.Time
+	// Ticker builds every session's playback pacing clock. Nil is a real 20 ms ticker.
+	Ticker func(time.Duration) (<-chan time.Time, func())
 }
 
 // NewManager builds a Manager.
@@ -184,8 +202,10 @@ func NewManager(opts ManagerOptions) (*Manager, error) {
 		echoDiagnostic: opts.EchoDiagnostic,
 		lifecycle:      opts.Lifecycle,
 		now:            opts.Now,
+		ticker:         opts.Ticker,
 		sessions:       make(map[string]*Session),
 		bridges:        make(map[string][2]string),
+		playbacks:      make(map[string]string),
 	}
 	if manager.rtpTimeout <= 0 {
 		manager.rtpTimeout = opts.IdleAfter
@@ -256,6 +276,7 @@ func (m *Manager) Allocate(opts AllocateOptions) (Descriptor, error) {
 		AudioPayloadType:          audioPT,
 		TelephoneEventPayloadType: opts.TelephoneEventPayloadType,
 		Logger:                    m.log,
+		Ticker:                    m.ticker,
 	})
 	if err != nil {
 		_ = ports.Close()
@@ -434,6 +455,97 @@ func (m *Manager) detachLocked(bridgeID string, pair [2]string) {
 	delete(m.bridges, bridgeID)
 }
 
+// StartPlayback plays a decoded clip towards one session's far end.
+//
+// It returns when the prompt is RUNNING, not when it has finished — see Session.StartPlayback for
+// why, and Playback for what replacing the peer's audio does and does not interrupt.
+//
+// The reference is indexed here so a later `stop-playback`, which carries nothing but the
+// reference, can find the session without scanning. The index is cleaned by the watcher below,
+// however the playback ended, so a completed prompt does not leave a reference behind that a late
+// stop would match against a session that has since started a different one.
+func (m *Manager) StartPlayback(sessionID string, opts PlaybackOptions) error {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return ErrClosed
+	}
+	session, ok := m.sessions[sessionID]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrUnknownSession, sessionID)
+	}
+	m.mu.Unlock()
+
+	// Started OUTSIDE the lock: it spawns a goroutine and touches the socket, and holding the map's
+	// mutex across that would serialise every prompt on the instance behind the slowest one.
+	playback, err := session.StartPlayback(opts)
+	if err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	m.playbacks[opts.Ref] = sessionID
+	m.mu.Unlock()
+
+	m.running.Add(1)
+	go func() {
+		defer m.running.Done()
+		<-playback.Done()
+
+		m.mu.Lock()
+		// Only if it is still OURS: a superseding playback with the same reference would otherwise
+		// have its index entry deleted by the one it replaced.
+		if owner, ok := m.playbacks[opts.Ref]; ok && owner == sessionID &&
+			session.ActivePlayback() == nil {
+			delete(m.playbacks, opts.Ref)
+		}
+		m.mu.Unlock()
+
+		summary := playback.Summary()
+		if summary.Reason == PlaybackError {
+			m.log.Warn("a playback failed; the far end heard part of a prompt or none of it",
+				"sessionId", sessionID, "playbackRef", summary.Ref,
+				"playedMs", summary.PlayedMs, "detail", summary.Detail)
+		}
+		if m.lifecycle != nil {
+			m.lifecycle.PlaybackFinished(session.Summary(), summary)
+		}
+	}()
+
+	m.log.Info("playback started",
+		"sessionId", sessionID, "playbackRef", opts.Ref, "frames", len(opts.Frames))
+	return nil
+}
+
+// StopPlayback interrupts a playback by reference and reports the session it was on.
+//
+// Answering `false` for a reference nothing is playing is a SUCCESS at the wire, not an error: a
+// caller who lets a menu run to the end and then presses a digit produces exactly this on every
+// call, because `gather` stops its prompt whatever ended the collection.
+func (m *Manager) StopPlayback(ref string) (string, bool) {
+	m.mu.Lock()
+	sessionID, ok := m.playbacks[ref]
+	var session *Session
+	if ok {
+		session = m.sessions[sessionID]
+	}
+	m.mu.Unlock()
+
+	if session == nil {
+		return sessionID, false
+	}
+	return sessionID, session.StopPlayback(ref)
+}
+
+// PlaybackSessionOf reports which session holds a playback reference, if any.
+func (m *Manager) PlaybackSessionOf(ref string) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sessionID, ok := m.playbacks[ref]
+	return sessionID, ok
+}
+
 // BridgeOf reports which bridge a session is in, if any. Read by the session directory writer.
 func (m *Manager) BridgeOf(sessionID string) (string, bool) {
 	m.mu.Lock()
@@ -452,6 +564,20 @@ func (m *Manager) Get(sessionID string) (*Session, bool) {
 	defer m.mu.Unlock()
 	session, ok := m.sessions[sessionID]
 	return session, ok
+}
+
+// AudioPayloadType reports the G.711 type a live session answered with.
+//
+// The control surface's one question about a leg, answered as a value rather than by handing it the
+// session — see the note on control.Sessions.
+func (m *Manager) AudioPayloadType(sessionID string) (uint8, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session, ok := m.sessions[sessionID]
+	if !ok {
+		return 0, false
+	}
+	return session.AudioPayloadType(), true
 }
 
 // Len is the number of live sessions.

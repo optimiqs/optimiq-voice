@@ -7,6 +7,7 @@ import (
 
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/directory"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/sdp"
@@ -376,6 +377,173 @@ func (s *Server) refuseRelease(sessionID, reason, message string) []byte {
 		InstanceID: stringPtr(s.instanceID),
 		Reason:     &code,
 		Error:      stringPtr(message),
+	})
+}
+
+// HandleStartPlayback plays a prompt towards a session's far end. Rung 1 of the ladder.
+//
+// The order of operations is the same shape as allocate's, and for the same reason: everything that
+// can be REFUSED is done before anything that changes state.
+//
+//  1. Validate the payload.
+//  2. Find the session, because the clip has to be decoded into the law THAT LEG answered. Decoding
+//     first and discovering the leg is A-law afterwards would mean throwing the work away — or,
+//     worse, sending it.
+//  3. Read and decode the files. This is the slow step (a disk read and an encode) and it happens
+//     BEFORE a single frame is scheduled, so a playback that reports `ok` is one whose audio is
+//     already in memory. It is also why this subject's deadline is 1 s where the rest are 500 ms.
+//  4. Start it, which returns as soon as the prompt is running.
+func (s *Server) HandleStartPlayback(data []byte) []byte {
+	var request contract.MediaStartPlaybackRequest
+	if err := json.Unmarshal(data, &request); err != nil {
+		return s.refusePlayback("", "", ReasonBadRequest,
+			fmt.Sprintf("malformed start-playback request: %v", err))
+	}
+	switch {
+	case request.SessionID == "":
+		return s.refusePlayback("", request.PlaybackRef, ReasonBadRequest, "sessionId is required")
+	case request.PlaybackRef == "":
+		return s.refusePlayback(request.SessionID, "", ReasonBadRequest,
+			"playbackRef is required and must be assigned by the caller: stop-playback carries nothing else")
+	case len(request.Media) == 0:
+		// A play of nothing answered `ok` would report a prompt that never happened, which is the
+		// silent failure the whole refusal vocabulary exists to prevent.
+		return s.refusePlayback(request.SessionID, request.PlaybackRef, ReasonBadRequest,
+			"media is required: a playback needs at least one media reference")
+	}
+
+	payloadType, ok := s.sessions.AudioPayloadType(request.SessionID)
+	if !ok {
+		return s.refusePlayback(request.SessionID, request.PlaybackRef,
+			s.locateRefusal([]string{request.SessionID}),
+			fmt.Sprintf("no session %s on this instance", request.SessionID))
+	}
+
+	if !s.library.Configured() {
+		return s.refusePlayback(request.SessionID, request.PlaybackRef, ReasonNotSupported,
+			"this instance has no prompt library: set MEDIAD_SOUNDS_DIR to the directory prompts are mounted at")
+	}
+
+	encoding := rtp.EncodingFor(payloadType)
+	clip, err := s.library.LoadAll(request.Media, encoding)
+	if err != nil {
+		reason := playbackRefusalFor(err)
+		s.log.Warn("refusing a playback",
+			"sessionId", request.SessionID, "playbackRef", request.PlaybackRef,
+			"media", request.Media, "reason", reason, "error", err)
+		return s.refusePlayback(request.SessionID, request.PlaybackRef, reason, err.Error())
+	}
+
+	startErr := s.sessions.StartPlayback(request.SessionID, rtp.PlaybackOptions{
+		Ref:      request.PlaybackRef,
+		Frames:   clip.Frames,
+		Encoding: clip.Encoding,
+	})
+	if startErr != nil {
+		reason := ReasonInternal
+		switch {
+		case errors.Is(startErr, rtp.ErrUnknownSession):
+			reason = ReasonUnknown
+		case errors.Is(startErr, rtp.ErrClosed):
+			reason = ReasonShuttingDown
+		case errors.Is(startErr, rtp.ErrNoRemote):
+			// The leg has not sent a packet yet, so symmetric RTP has taught us nowhere to send.
+			// `bad_request` rather than `internal`: the engine asked for a prompt on a leg that is
+			// not carrying media, which is a sequencing bug in the call flow rather than a fault
+			// here, and retrying the same request will fail the same way.
+			reason = ReasonBadRequest
+		case errors.Is(startErr, rtp.ErrPlaybackPayloadType):
+			reason = ReasonNotSupported
+		}
+		s.log.Warn("refusing a playback",
+			"sessionId", request.SessionID, "playbackRef", request.PlaybackRef,
+			"reason", reason, "error", startErr)
+		return s.refusePlayback(request.SessionID, request.PlaybackRef, reason, startErr.Error())
+	}
+
+	return encode(s.log, contract.MediaStartPlaybackResponse{
+		Ok:          true,
+		SessionID:   request.SessionID,
+		PlaybackRef: request.PlaybackRef,
+		InstanceID:  stringPtr(s.instanceID),
+	})
+}
+
+// playbackRefusalFor classifies a library failure onto the wire's refusal vocabulary.
+//
+// The split that matters is `bad_request` — a file that is broken, so retrying these bytes fails
+// the same way and somebody has to fix the prompt — against `not_supported`, which is a capability
+// this rung does not have and which the engine answers by routing the leg to Asterisk. A 44.1 kHz
+// prompt is the second: Asterisk plays it happily, mediad does not resample, and that is exactly
+// the per-capability cutover working as designed rather than a failed call.
+func playbackRefusalFor(err error) string {
+	switch {
+	case errors.Is(err, audio.ErrNoLibrary),
+		errors.Is(err, audio.ErrUnsupportedScheme),
+		errors.Is(err, audio.ErrUnsupportedRate),
+		errors.Is(err, audio.ErrUnsupportedChannels),
+		errors.Is(err, audio.ErrUnsupportedFormat):
+		return ReasonNotSupported
+	case errors.Is(err, audio.ErrNotFound),
+		errors.Is(err, audio.ErrOutsideLibrary),
+		errors.Is(err, audio.ErrNotRIFF),
+		errors.Is(err, audio.ErrTruncated),
+		errors.Is(err, audio.ErrTooLarge),
+		errors.Is(err, audio.ErrEmpty):
+		return ReasonBadRequest
+	default:
+		return ReasonInternal
+	}
+}
+
+func (s *Server) refusePlayback(sessionID, playbackRef, reason, message string) []byte {
+	code := contract.MediaStartPlaybackResponseReason(reason)
+	return encode(s.log, contract.MediaStartPlaybackResponse{
+		Ok:          false,
+		SessionID:   sessionID,
+		PlaybackRef: playbackRef,
+		InstanceID:  stringPtr(s.instanceID),
+		Reason:      &code,
+		Error:       stringPtr(message),
+	})
+}
+
+// HandleStopPlayback interrupts a prompt by reference.
+//
+// A stop for a reference nothing is playing is `ok:true, stopped:false` — a SUCCESS, and the COMMON
+// case rather than an edge one. Every `gather` stops its own prompt the moment collection ends,
+// whatever ended it, so a caller who listens to the whole menu and then presses a digit produces
+// exactly this on every single call. `MediaPort` states the rule directly: stopping an
+// already-finished playback is a no-op.
+func (s *Server) HandleStopPlayback(data []byte) []byte {
+	var request contract.MediaStopPlaybackRequest
+	if err := json.Unmarshal(data, &request); err != nil {
+		return s.refuseStopPlayback("", ReasonBadRequest,
+			fmt.Sprintf("malformed stop-playback request: %v", err))
+	}
+	if request.PlaybackRef == "" {
+		return s.refuseStopPlayback("", ReasonBadRequest, "playbackRef is required")
+	}
+
+	sessionID, stopped := s.sessions.StopPlayback(request.PlaybackRef)
+
+	return encode(s.log, contract.MediaStopPlaybackResponse{
+		Ok:          true,
+		PlaybackRef: request.PlaybackRef,
+		Stopped:     stopped,
+		SessionID:   stringPtr(sessionID),
+		InstanceID:  stringPtr(s.instanceID),
+	})
+}
+
+func (s *Server) refuseStopPlayback(playbackRef, reason, message string) []byte {
+	code := contract.MediaStopPlaybackResponseReason(reason)
+	return encode(s.log, contract.MediaStopPlaybackResponse{
+		Ok:          false,
+		PlaybackRef: playbackRef,
+		InstanceID:  stringPtr(s.instanceID),
+		Reason:      &code,
+		Error:       stringPtr(message),
 	})
 }
 

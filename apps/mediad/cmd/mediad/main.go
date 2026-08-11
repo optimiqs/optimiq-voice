@@ -28,6 +28,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/config"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/control"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/directory"
@@ -85,7 +86,7 @@ func run() error {
 	// Only when configured: an empty pair means a broker with no authentication, which is what the
 	// integration rig runs. config.Load has already refused a half-set pair, and has already
 	// preferred NATS_MEDIAD_USER/PASS over the shared pair — so this is the `mediad` user, whose
-	// permissions in config/nats.conf are the four rpc.media.v1 subjects, media.evt.v1.> and the
+	// permissions in config/nats.conf are the six rpc.media.v1 subjects, media.evt.v1.> and the
 	// media-sessions bucket. A subject outside that set fails as an authorization violation on the
 	// publish, not at connect.
 	if cfg.NATSUser != "" {
@@ -145,9 +146,19 @@ func run() error {
 		return err
 	}
 
+	library := audio.NewLibrary(cfg.SoundsDir)
+	if !library.Configured() {
+		// WARN and carry on rather than refuse to boot: every rung below playback still works, and
+		// a deployment cutting over bridged calls first has no prompt store yet by design. The
+		// refusal happens per command, by name, which is where an operator can act on it.
+		log.Warn("no prompt library is configured; every playback will be refused as not_supported",
+			"hint", "set MEDIAD_SOUNDS_DIR to the directory prompts are mounted at")
+	}
+
 	server, err := control.NewServer(control.ServerOptions{
 		Sessions:   manager,
 		Directory:  sessionDirectory,
+		Library:    library,
 		InstanceID: cfg.InstanceID,
 		PublicAddr: cfg.PublicIP,
 		Logger:     log,
@@ -172,7 +183,10 @@ func run() error {
 			control.SubjectBridgeSessions,
 			control.SubjectUnbridgeSessions,
 			control.SubjectReleaseSession,
+			control.SubjectStartPlayback,
+			control.SubjectStopPlayback,
 		},
+		"soundsDir", cfg.SoundsDir,
 		"queueGroup", queueGroup,
 		"rtpTimeout", cfg.RTPTimeout.String(),
 		"idleTimeout", cfg.SessionIdleTimeout.String())
@@ -183,8 +197,9 @@ func run() error {
 		log.Warn("MEDIAD_ECHO_DIAGNOSTIC is on: every session ECHOES and no call will connect. " +
 			"This is a diagnostic mode; turn it off to serve traffic.")
 	}
-	log.Info("mediad serves rung 2 (bridged calls): G.711 passthrough, RFC 4733 DTMF, two-party " +
-		"relay. Recording, MOH, conferencing and T.38 are still Asterisk's — see plans/mediad-design.md")
+	log.Info("mediad serves rungs 1-2 (file playback and bridged calls): G.711 passthrough, RFC 4733 " +
+		"DTMF, two-party relay, WAV prompts. Recording, MOH, conferencing and T.38 are still " +
+		"Asterisk's — see plans/mediad-design.md")
 
 	var group sync.WaitGroup
 	group.Add(1)

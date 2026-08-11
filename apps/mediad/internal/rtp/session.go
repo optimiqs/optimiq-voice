@@ -85,13 +85,17 @@ const maxPacketSize = 1500
 
 // Stats is a session's counters, copied out under lock for logging and for the control surface.
 type Stats struct {
-	PacketsReceived  uint64
-	PacketsSent      uint64
-	BytesReceived    uint64
-	Malformed        uint64
-	UnsupportedPT    uint64
-	ForeignSource    uint64
-	LastPacketUnixMs int64
+	PacketsReceived uint64
+	PacketsSent     uint64
+	BytesReceived   uint64
+	Malformed       uint64
+	UnsupportedPT   uint64
+	ForeignSource   uint64
+	// SuppressedByPlayback counts peer frames dropped because a prompt was playing towards this
+	// leg. Counted rather than silent: "the other party could not be heard for six seconds" is a
+	// support ticket, and this is the number that explains it was a prompt rather than a fault.
+	SuppressedByPlayback uint64
+	LastPacketUnixMs     int64
 }
 
 // Session owns one RTP/RTCP port pair for the life of one call leg.
@@ -143,6 +147,29 @@ type Session struct {
 	// The counter is 32-bit and truncated on use because Go has no atomic uint16.
 	sequence atomic.Uint32
 
+	// lastTimestamp is the RTP timestamp this session most recently put on the wire.
+	//
+	// Written by the relay (which keeps the SENDER's timestamp, so this only records it) and read
+	// and advanced by playback (which has its own clock). Keeping the two on one counter is what
+	// makes a prompt starting mid-call continue the stream's timestamp rather than reset it — see
+	// Session.nextPlaybackTimestamp.
+	lastTimestamp atomic.Uint32
+
+	// playback is the prompt currently sourcing this session's outbound frames, or nil.
+	//
+	// An atomic POINTER rather than a mutex-guarded field because it is read on the peer's packet
+	// path — 50 times a second per bridged call, in forward — and written twice per prompt.
+	playback atomic.Pointer[Playback]
+
+	// markNextForward makes the next relayed packet carry the RTP marker bit. Set when a playback
+	// ends, because the outbound stream is switching back to the peer's timestamp clock and a
+	// receiver needs to be told a new talkspurt begins rather than left to read the jump as loss.
+	markNextForward atomic.Bool
+
+	// newTicker builds the playback pacing clock. Swapped in tests so a prompt is stepped frame by
+	// frame without a suite that sleeps for the length of every clip it plays.
+	newTicker func(time.Duration) (<-chan time.Time, func())
+
 	statsMu sync.Mutex
 	stats   Stats
 
@@ -172,6 +199,9 @@ type Options struct {
 	// SSRC forces the synchronisation source. Zero means "generate one". Tests set it; nothing
 	// else should.
 	SSRC uint32
+	// Ticker builds the playback pacing clock, defaulting to time.NewTicker. Tests substitute a
+	// channel they drive by hand.
+	Ticker func(time.Duration) (<-chan time.Time, func())
 }
 
 // NewSession takes ownership of a port pair.
@@ -204,9 +234,15 @@ func NewSession(opts Options) (*Session, error) {
 		}
 	}
 
+	ticker := opts.Ticker
+	if ticker == nil {
+		ticker = systemTicker
+	}
+
 	return &Session{
 		ID:                        opts.ID,
 		SSRC:                      ssrc,
+		newTicker:                 ticker,
 		OrgID:                     opts.OrgID,
 		CallID:                    opts.CallID,
 		LegID:                     opts.LegID,
@@ -218,6 +254,12 @@ func NewSession(opts Options) (*Session, error) {
 		done:                      make(chan struct{}),
 		createdAt:                 time.Now(),
 	}, nil
+}
+
+// systemTicker is the production playback clock: a real 20 ms ticker.
+func systemTicker(interval time.Duration) (<-chan time.Time, func()) {
+	ticker := time.NewTicker(interval)
+	return ticker.C, ticker.Stop
 }
 
 // randomSSRC draws a non-zero 32-bit identifier.
@@ -412,6 +454,16 @@ func (s *Session) relay(packet *pionrtp.Packet) {
 // own — which is what keeps the two directions of a bridge from sharing anything but the payload
 // bytes.
 func (s *Session) forward(packet *pionrtp.Packet, sourceTelephoneEventPT uint8) {
+	if s.playback.Load() != nil {
+		// A prompt is playing towards this leg, and a session has ONE outbound stream. Interleaving
+		// the peer's frames into it would put two unrelated timestamp clocks under one SSRC, which
+		// is the one thing a jitter buffer cannot untangle. See the Playback doc for why REPLACE is
+		// the rung 1 rule and what it deliberately does not interrupt — the digits travelling the
+		// other way, which is how barge-in works.
+		s.count(func(st *Stats) { st.SuppressedByPlayback++ })
+		return
+	}
+
 	to := s.Remote()
 	if to == nil {
 		// The far end of this leg has not spoken yet, so there is no address to send to. Symmetric
@@ -432,6 +484,12 @@ func (s *Session) forward(packet *pionrtp.Packet, sourceTelephoneEventPT uint8) 
 		payloadType = s.telephoneEventPayloadType
 	}
 
+	// The marker survives the relay, and is additionally FORCED on the first packet after a prompt
+	// ends: the outbound stream is switching back from the playback clock to the peer's, and a
+	// receiver told "new talkspurt" resumes cleanly where one left to infer a timestamp jump answers
+	// with concealment noise.
+	marker := packet.Marker || s.markNextForward.Swap(false)
+
 	out := pionrtp.Packet{
 		Header: pionrtp.Header{
 			Version:        2,
@@ -439,7 +497,7 @@ func (s *Session) forward(packet *pionrtp.Packet, sourceTelephoneEventPT uint8) 
 			SequenceNumber: s.nextSequence(),
 			Timestamp:      packet.Timestamp,
 			SSRC:           s.SSRC,
-			Marker:         packet.Marker,
+			Marker:         marker,
 		},
 		Payload: packet.Payload,
 	}
@@ -449,6 +507,7 @@ func (s *Session) forward(packet *pionrtp.Packet, sourceTelephoneEventPT uint8) 
 		s.log.Debug("cannot marshal a relayed packet", "error", err)
 		return
 	}
+	s.lastTimestamp.Store(packet.Timestamp)
 	if _, err := s.ports.RTP.WriteToUDP(encoded, to); err != nil {
 		// Per-packet and self-correcting. A call is not torn down because one frame did not make it
 		// out, and logging every send failure on a congested link is how a media server fills a

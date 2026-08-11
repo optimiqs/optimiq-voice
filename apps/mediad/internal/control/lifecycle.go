@@ -148,6 +148,63 @@ func (a *LifecycleAnnouncer) RTPTimedOut(session rtp.SessionSummary, silentFor t
 	}, "session.rtp-timeout", session.SessionID)
 }
 
+// PlaybackFinished publishes `playback.finished`.
+//
+// # Why this is announced at all, when nothing branches on it
+//
+// The engine does not act on it: `MediaPort.play` returns the moment audio STARTS, the twelve-member
+// `MediaEvent` union has no playback member, and `mediad-event-mapping.ts` answers `undefined` for
+// this type — exactly as the ARI path drops `PlaybackFinished`. Adding a union member nobody
+// branches on would be making two media planes agree on a shape for no reason.
+//
+// It is published because of the `error` reason. A playback that fails is a caller sitting in
+// silence where a menu should be, on a call that is otherwise perfectly healthy: the command already
+// answered `ok`, the session is still up, and nothing else on this backbone records it. This is the
+// same argument that makes `session.rtp-timeout` worth publishing while mapping to nothing.
+//
+// It does NOT touch the session directory. A prompt ending is not a session ending, and deleting
+// the entry here would make the leg uncommandable from a neighbouring instance the moment its
+// greeting finished.
+func (a *LifecycleAnnouncer) PlaybackFinished(
+	session rtp.SessionSummary,
+	playback rtp.PlaybackSummary,
+) {
+	if a.publisher == nil || session.OrgID == "" {
+		return
+	}
+
+	envelope, err := a.envelope(session, contract.EventTypeMediaPlaybackFinished)
+	if err != nil {
+		a.log.Warn("cannot build a playback.finished envelope",
+			"sessionId", session.SessionID, "playbackRef", playback.Ref, "error", err)
+		return
+	}
+
+	data := contract.MediaPlaybackFinishedData{
+		SessionID:   session.SessionID,
+		InstanceID:  a.instanceID,
+		CallID:      stringPtr(session.CallID),
+		LegID:       stringPtr(session.LegID),
+		PlaybackRef: playback.Ref,
+		Reason:      contract.MediaPlaybackFinishedReason(playback.Reason),
+		PlayedMs:    playback.PlayedMs,
+		Detail:      stringPtr(playback.Detail),
+	}
+
+	go a.publish(func(ctx context.Context) error {
+		return a.publisher.PlaybackFinished(ctx,
+			contract.Envelope[contract.MediaPlaybackFinishedData]{
+				ID:      envelope.id,
+				At:      envelope.at,
+				OrgID:   session.OrgID,
+				Subject: envelope.subject,
+				Type:    contract.EventTypeMediaPlaybackFinished,
+				Source:  mediaevents.Source,
+				Data:    data,
+			})
+	}, "playback.finished", session.SessionID)
+}
+
 // envelopeHeader is the three values every envelope needs that are derived rather than copied.
 type envelopeHeader struct {
 	id      string

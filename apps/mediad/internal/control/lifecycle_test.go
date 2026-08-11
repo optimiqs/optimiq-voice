@@ -212,3 +212,94 @@ func TestAnnouncerWithoutAPublisherStillCleansUp(t *testing.T) {
 		t.Error("the directory entry survived a teardown with no publisher")
 	}
 }
+
+// `playback.finished` is published even though nothing branches on it, for the same reason
+// `session.rtp-timeout` is: `reason: error` is a caller sitting in silence where a menu should be,
+// on a call that is otherwise healthy, and nothing else on this backbone records it.
+func TestPlaybackFinishedPublishesEveryReason(t *testing.T) {
+	for _, reason := range []rtp.PlaybackEndReason{
+		rtp.PlaybackCompleted,
+		rtp.PlaybackStopped,
+		rtp.PlaybackError,
+	} {
+		t.Run(string(reason), func(t *testing.T) {
+			announcer, publisher, _ := newAnnouncer(t)
+
+			announcer.PlaybackFinished(summary(), rtp.PlaybackSummary{
+				Ref:      "pb-1",
+				Reason:   reason,
+				PlayedMs: 1_240,
+				Detail:   "detail",
+			})
+
+			waitFor(t, "the playback.finished event", func() bool {
+				return len(publisher.PlaybackEvents()) == 1
+			})
+			envelope := publisher.PlaybackEvents()[0]
+
+			if envelope.Subject != "media.evt.v1."+testOrg+"."+testSession+".playback.finished" {
+				t.Errorf("subject = %q", envelope.Subject)
+			}
+			if envelope.Source != "mediad" {
+				t.Errorf("source = %q, want mediad", envelope.Source)
+			}
+			if envelope.ID == "" {
+				t.Error("the envelope has no id; nothing collapses a retried publish")
+			}
+			if string(envelope.Data.Reason) != string(reason) {
+				t.Errorf("reason = %q, want %q", envelope.Data.Reason, reason)
+			}
+			if envelope.Data.PlaybackRef != "pb-1" {
+				t.Errorf("playbackRef = %q, want pb-1", envelope.Data.PlaybackRef)
+			}
+			// playedMs is what actually reached the far end, which on a barge-in is nothing like
+			// the length of the clip.
+			if envelope.Data.PlayedMs != 1_240 {
+				t.Errorf("playedMs = %d, want 1240", envelope.Data.PlayedMs)
+			}
+			if envelope.Data.InstanceID != thisNode {
+				t.Errorf("instanceId = %q, want %q", envelope.Data.InstanceID, thisNode)
+			}
+		})
+	}
+}
+
+// A prompt ending is not a session ending. Deleting the entry here would make the leg
+// uncommandable from a neighbouring instance the moment its greeting finished.
+func TestPlaybackFinishedLeavesTheDirectoryAlone(t *testing.T) {
+	announcer, _, dir := newAnnouncer(t)
+	if err := dir.Put(context.Background(), directory.Entry{
+		SessionID:  testSession,
+		InstanceID: thisNode,
+		OrgID:      testOrg,
+		CallID:     testCall,
+		Address:    "203.0.113.10",
+		RTPPort:    30002,
+		RTCPPort:   30003,
+	}); err != nil {
+		t.Fatalf("seeding the directory: %v", err)
+	}
+
+	announcer.PlaybackFinished(summary(), rtp.PlaybackSummary{
+		Ref: "pb-1", Reason: rtp.PlaybackCompleted, PlayedMs: 400,
+	})
+
+	if dir.Len() != 1 {
+		t.Error("a finished prompt removed the session's directory entry")
+	}
+}
+
+func TestPlaybackFinishedSkipsASessionWithNoOrg(t *testing.T) {
+	announcer, publisher, _ := newAnnouncer(t)
+	orphan := summary()
+	orphan.OrgID = ""
+
+	announcer.PlaybackFinished(orphan, rtp.PlaybackSummary{
+		Ref: "pb-1", Reason: rtp.PlaybackCompleted,
+	})
+
+	time.Sleep(20 * time.Millisecond)
+	if len(publisher.PlaybackEvents()) != 0 {
+		t.Error("an event was published on a subject with no org token")
+	}
+}

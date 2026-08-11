@@ -141,6 +141,19 @@ type Config struct {
 	// permanent capacity loss until restart, so the backstop matters more than its precision.
 	SessionIdleTimeout time.Duration
 
+	// SoundsDir is the directory `rpc.media.v1.start-playback` resolves `sound:` references under.
+	// MEDIAD_SOUNDS_DIR, default empty.
+	//
+	// Empty is legal and means this instance REFUSES every playback with `not_supported`, which the
+	// engine answers by routing the leg to Asterisk. That is the correct default for a rung-1
+	// cutover: a deployment opts into mediad playback by mounting a prompt store, and one that has
+	// not must fail loudly rather than answer `ok` and send silence at a caller.
+	//
+	// It is the same mount Asterisk gets as `ENGINE_OBJECT_MEDIA_ROOT`, deliberately, so one
+	// `sound:` string resolves on either plane while both are serving calls. See the package doc on
+	// internal/audio for why a mounted directory and not an HTTP fetch from apps/api.
+	SoundsDir string
+
 	// LogLevel is MEDIAD_LOG_LEVEL (debug|info|warn|error), default info.
 	LogLevel slog.Level
 
@@ -211,6 +224,7 @@ func Load(getenv Getenv) (Config, error) {
 		fail("%v", err)
 	}
 	cfg.InstanceID = stringOr(getenv, "MEDIAD_INSTANCE_ID", defaultInstanceID())
+	cfg.SoundsDir = strings.TrimSpace(getenv("MEDIAD_SOUNDS_DIR"))
 	if cfg.ShutdownTimeout, err = durationOr(getenv, "MEDIAD_SHUTDOWN_TIMEOUT", 10*time.Second); err != nil {
 		fail("%v", err)
 	}

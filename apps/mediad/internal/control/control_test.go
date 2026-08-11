@@ -13,6 +13,7 @@ import (
 
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/control"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/directory"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
@@ -56,6 +57,20 @@ type stubSessions struct {
 	bridges    map[string][]string
 	nextPort   int
 	audioForce uint8
+
+	// The playback half of the packet path, stubbed the same way the rest of it is.
+	playbackErr    error
+	playbackStarts []playbackCall
+	playbackStops  []string
+	playing        map[string]string
+	// codecFor overrides what AudioPayloadType reports for a session, so a test can put a prompt on
+	// an A-law leg without going anywhere near a socket.
+	codecFor map[string]uint8
+}
+
+type playbackCall struct {
+	sessionID string
+	opts      rtp.PlaybackOptions
 }
 
 type bridgeCall struct {
@@ -68,6 +83,8 @@ func newStub() *stubSessions {
 	return &stubSessions{
 		live:     make(map[string]bool),
 		bridges:  make(map[string][]string),
+		playing:  make(map[string]string),
+		codecFor: make(map[string]uint8),
 		nextPort: 30000,
 	}
 }
@@ -139,6 +156,47 @@ func (s *stubSessions) Release(sessionID string) bool {
 	return false
 }
 
+func (s *stubSessions) StartPlayback(sessionID string, opts rtp.PlaybackOptions) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.playbackStarts = append(s.playbackStarts, playbackCall{sessionID, opts})
+	if s.playbackErr != nil {
+		return s.playbackErr
+	}
+	s.playing[opts.Ref] = sessionID
+	return nil
+}
+
+func (s *stubSessions) StopPlayback(playbackRef string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.playbackStops = append(s.playbackStops, playbackRef)
+	sessionID, ok := s.playing[playbackRef]
+	if !ok {
+		return "", false
+	}
+	delete(s.playing, playbackRef)
+	return sessionID, true
+}
+
+func (s *stubSessions) AudioPayloadType(sessionID string) (uint8, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.live[sessionID] {
+		return 0, false
+	}
+	if forced, ok := s.codecFor[sessionID]; ok {
+		return forced, true
+	}
+	return rtp.PayloadTypePCMU, true
+}
+
+func (s *stubSessions) playbackCalls() []playbackCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]playbackCall(nil), s.playbackStarts...)
+}
+
 func (s *stubSessions) allocateCalls() []rtp.AllocateOptions {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -149,9 +207,19 @@ type rig struct {
 	server   *control.Server
 	sessions *stubSessions
 	dir      *directory.FakeStore
+	// prompts is the directory MEDIAD_SOUNDS_DIR points at for this rig, so a playback test can
+	// write a fixture into it.
+	prompts string
 }
 
 func newRig(t *testing.T) *rig {
+	t.Helper()
+	return newRigWithLibrary(t, t.TempDir())
+}
+
+// newRigWithLibrary builds a rig whose prompt library is rooted at `prompts`. An empty root is a
+// deployment that has not mounted a prompt store, which must refuse every playback by name.
+func newRigWithLibrary(t *testing.T, prompts string) *rig {
 	t.Helper()
 	sessions := newStub()
 	dir := directory.NewFakeStore()
@@ -159,6 +227,7 @@ func newRig(t *testing.T) *rig {
 	server, err := control.NewServer(control.ServerOptions{
 		Sessions:   sessions,
 		Directory:  dir,
+		Library:    audio.NewLibrary(prompts),
 		InstanceID: thisNode,
 		PublicAddr: netip.MustParseAddr("203.0.113.10"),
 		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -166,7 +235,7 @@ func newRig(t *testing.T) *rig {
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	return &rig{server: server, sessions: sessions, dir: dir}
+	return &rig{server: server, sessions: sessions, dir: dir, prompts: prompts}
 }
 
 func mustJSON(t *testing.T, value any) []byte {

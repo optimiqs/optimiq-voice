@@ -76,6 +76,21 @@ export class FakeMediadTransport implements MediadTransport {
 					sessionIds: [],
 					instanceId: "mediad-fake",
 				};
+			case RPC_SUBJECTS.mediaStartPlayback:
+				return {
+					ok: true,
+					sessionId: request["sessionId"],
+					playbackRef: request["playbackRef"],
+					instanceId: "mediad-fake",
+				};
+			case RPC_SUBJECTS.mediaStopPlayback:
+				return {
+					ok: true,
+					playbackRef: request["playbackRef"],
+					stopped: true,
+					sessionId: "leg-a",
+					instanceId: "mediad-fake",
+				};
 			case RPC_SUBJECTS.mediaReleaseSession:
 				return {
 					ok: true,

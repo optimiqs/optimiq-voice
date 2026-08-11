@@ -375,3 +375,29 @@ func TestLoadWithNilGetenvFallsBackToTheProcessEnvironment(t *testing.T) {
 		t.Fatal("Load(nil) succeeded; the test process has no MEDIAD_PUBLIC_IP set")
 	}
 }
+
+// MEDIAD_SOUNDS_DIR has no default, and that is the decision rather than an omission: an instance
+// with no prompt library REFUSES every playback by name, and the engine routes those legs to
+// Asterisk. Defaulting it to a directory that probably does not exist would turn a clear refusal
+// into a per-call "no such file".
+func TestSoundsDirDefaultsToUnset(t *testing.T) {
+	cfg, err := config.Load(env(minimal(nil)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SoundsDir != "" {
+		t.Errorf("SoundsDir = %q, want empty", cfg.SoundsDir)
+	}
+}
+
+func TestSoundsDirIsTrimmed(t *testing.T) {
+	cfg, err := config.Load(env(minimal(map[string]string{
+		"MEDIAD_SOUNDS_DIR": "  /var/lib/optimiq/prompts  ",
+	})))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SoundsDir != "/var/lib/optimiq/prompts" {
+		t.Errorf("SoundsDir = %q, want the trimmed path", cfg.SoundsDir)
+	}
+}

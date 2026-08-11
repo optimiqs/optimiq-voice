@@ -40,6 +40,7 @@ const Source = "mediad"
 type Publisher interface {
 	SessionEnded(ctx context.Context, envelope contract.Envelope[contract.MediaSessionEndedData]) error
 	SessionRTPTimeout(ctx context.Context, envelope contract.Envelope[contract.MediaSessionRTPTimeoutData]) error
+	PlaybackFinished(ctx context.Context, envelope contract.Envelope[contract.MediaPlaybackFinishedData]) error
 }
 
 // JetStreamPublisher publishes into the MEDIA stream.
@@ -70,6 +71,14 @@ func (p *JetStreamPublisher) SessionEnded(
 func (p *JetStreamPublisher) SessionRTPTimeout(
 	ctx context.Context,
 	envelope contract.Envelope[contract.MediaSessionRTPTimeoutData],
+) error {
+	return publish(ctx, p.js, envelope)
+}
+
+// PlaybackFinished publishes a `playback.finished` event.
+func (p *JetStreamPublisher) PlaybackFinished(
+	ctx context.Context,
+	envelope contract.Envelope[contract.MediaPlaybackFinishedData],
 ) error {
 	return publish(ctx, p.js, envelope)
 }
@@ -105,9 +114,10 @@ const PublishTimeout = 2 * time.Second
 // RecordingPublisher captures envelopes in memory instead of publishing them. It backs the unit
 // tests, exactly as sipd's does.
 type RecordingPublisher struct {
-	mu       sync.Mutex
-	ended    []contract.Envelope[contract.MediaSessionEndedData]
-	timedOut []contract.Envelope[contract.MediaSessionRTPTimeoutData]
+	mu        sync.Mutex
+	ended     []contract.Envelope[contract.MediaSessionEndedData]
+	timedOut  []contract.Envelope[contract.MediaSessionRTPTimeoutData]
+	playbacks []contract.Envelope[contract.MediaPlaybackFinishedData]
 }
 
 var _ Publisher = (*RecordingPublisher)(nil)
@@ -135,6 +145,24 @@ func (p *RecordingPublisher) SessionRTPTimeout(
 	defer p.mu.Unlock()
 	p.timedOut = append(p.timedOut, envelope)
 	return nil
+}
+
+// PlaybackFinished implements Publisher.
+func (p *RecordingPublisher) PlaybackFinished(
+	_ context.Context,
+	envelope contract.Envelope[contract.MediaPlaybackFinishedData],
+) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.playbacks = append(p.playbacks, envelope)
+	return nil
+}
+
+// PlaybackEvents returns a copy of the recorded `playback.finished` events.
+func (p *RecordingPublisher) PlaybackEvents() []contract.Envelope[contract.MediaPlaybackFinishedData] {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]contract.Envelope[contract.MediaPlaybackFinishedData](nil), p.playbacks...)
 }
 
 // EndedEvents returns a copy of the recorded `session.ended` events.

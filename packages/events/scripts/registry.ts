@@ -241,6 +241,7 @@ export const EVENT_ENTRIES: readonly EventEntry[] = [
 
 	mediaEntry("session.ended", "MediaSessionEnded"),
 	mediaEntry("session.rtp-timeout", "MediaSessionRTPTimeout"),
+	mediaEntry("playback.finished", "MediaPlaybackFinished"),
 
 	{
 		family: "cdr",
@@ -343,6 +344,20 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		timeoutMs: RPC_CONTRACTS["rpc.media.v1.release-session"].timeoutMs,
 		request: RPC_CONTRACTS["rpc.media.v1.release-session"].request,
 		response: RPC_CONTRACTS["rpc.media.v1.release-session"].response,
+	},
+	{
+		subject: "rpc.media.v1.start-playback",
+		goName: "MediaStartPlayback",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.start-playback"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.start-playback"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.start-playback"].response,
+	},
+	{
+		subject: "rpc.media.v1.stop-playback",
+		goName: "MediaStopPlayback",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.stop-playback"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.stop-playback"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.stop-playback"].response,
 	},
 	// Engine to engine, and the only subject here whose emitted constant is a PREFIX: the wire
 	// subject appends the owning instance's token. Emitted anyway, because the Go side reads the

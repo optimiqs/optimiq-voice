@@ -834,6 +834,126 @@ export const MEDIA_RELEASE_SESSION_RPC = defineRpc(
 	500,
 );
 
+/**
+ * `rpc.media.v1.start-playback` — play audio from a file towards the session's far end.
+ *
+ * Rung 1's second half (`plans/mediad-design.md` §2): a session sourcing frames from a file instead
+ * of from a socket. It is the command behind the engine's `play` verb, and therefore behind every
+ * IVR prompt, every voicemail greeting and the "press 1 to accept" of a confirmed transfer.
+ *
+ * ## Why `media` is an array of media-server URIs
+ *
+ * Because {@link https://github.com/optimiqs/optimiq-voice/blob/main/apps/engine/src/media/media-port.ts | `PlayRequest.media`}
+ * already is: ARI plays a list in sequence and the engine's seam inherited that. `mediad`
+ * concatenates the clips into one frame stream, which is the same user-visible behaviour with none
+ * of the state a queue would need.
+ *
+ * The only scheme `mediad` resolves is `sound:`, which is exactly what
+ * `apps/engine/src/routing/media-refs.ts` renders every domain `MediaRef` into. Asterisk's
+ * GENERATOR schemes — `tone:`, `digits:`, `number:`, `characters:` — are refused `not_supported` by
+ * name rather than skipped: a media plane that silently dropped one element of a prompt list would
+ * play half a sentence, which is worse than the engine routing the leg to Asterisk.
+ *
+ * ## Why the reply comes back when playback has STARTED, not when it has finished
+ *
+ * `MediaPort.play` returns a handle the moment audio begins — the verb executor says so in as many
+ * words, and barge-in depends on it: a caller who presses a digit must be able to interrupt without
+ * the engine holding a fiber open for the length of the prompt. So this is a 500 ms command like
+ * every other one in the family, and the END of the playback is a JetStream event
+ * (`media.evt.v1.<orgId>.<sessionId>.playback.finished`), not a slow reply.
+ *
+ * ## Why `playbackRef` is caller-assigned
+ *
+ * The same reason `sessionId` is, plus one more: {@link mediaStopPlaybackRequestSchema} carries
+ * NOTHING ELSE, so the reference has to be a name the engine already knows.
+ */
+export const mediaStartPlaybackRequestSchema = z.object({
+	...mediaCommandShape,
+	/** Caller-assigned handle. `stop-playback` names it, and so does `playback.finished`. */
+	playbackRef: z.string().min(1).max(128),
+	/**
+	 * Media URIs, played in sequence. At least one — a play of nothing is a caller bug, and
+	 * answering `ok` to it would report a prompt that never happened.
+	 */
+	media: z.array(z.string().min(1).max(512)).min(1).max(16),
+	/**
+	 * The language the prompt should be served in, when the caller has an opinion.
+	 *
+	 * Accepted and currently IGNORED by `mediad`, which resolves a path and reads a file. It is on
+	 * the contract because `PlayRequest.language` is on the seam above it and dropping a field at
+	 * the adapter would make the two drivers silently disagree about what was asked for; a prompt
+	 * library with per-language variants is the wave that gives it meaning.
+	 */
+	language: z.string().min(1).max(32).optional(),
+});
+
+export const mediaStartPlaybackResponseSchema = z.object({
+	ok: z.boolean(),
+	sessionId: z.string().min(1).max(128),
+	playbackRef: z.string().min(1).max(128),
+	instanceId: z.string().min(1).max(128).optional(),
+	reason: mediaRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type MediaStartPlaybackRequest = z.infer<typeof mediaStartPlaybackRequestSchema>;
+export type MediaStartPlaybackResponse = z.infer<typeof mediaStartPlaybackResponseSchema>;
+
+export const MEDIA_START_PLAYBACK_RPC = defineRpc(
+	RPC_SUBJECTS.mediaStartPlayback,
+	mediaStartPlaybackRequestSchema,
+	mediaStartPlaybackResponseSchema,
+	// Longer than the other four, and for a reason that is visible in the handler: this one READS A
+	// FILE off disk and encodes it before it answers, where the rest bind a socket or move a pointer.
+	// Still on a call path — the caller is listening to silence until the prompt starts — so it is
+	// bounded well inside the second at which a person assumes the menu is broken.
+	1_000,
+);
+
+/**
+ * `rpc.media.v1.stop-playback` — interrupt a playback started by
+ * {@link mediaStartPlaybackRequestSchema}.
+ *
+ * ## Why there is no `sessionId`
+ *
+ * Because `MediaPort.stopPlayback(playbackRef)` has none. Barge-in is the caller of this command —
+ * the `gather` verb stops its prompt the moment collection ends, whatever ended it — and it holds a
+ * reference and nothing else. Threading a session id onto the seam purely so this payload could
+ * carry one would be shaping the engine's interface around a lookup `mediad` can do for itself.
+ *
+ * ## Idempotent, and a stop of a finished playback is a SUCCESS
+ *
+ * `ok: true, stopped: false`, exactly like `unbridged` and `released` above it. `MediaPort` states
+ * the rule directly — "stopping an already-finished playback is a no-op" — and it is the common
+ * case rather than an edge one: a caller who lets the menu play to the end and then presses a digit
+ * produces exactly this, on every single call.
+ */
+export const mediaStopPlaybackRequestSchema = z.object({
+	playbackRef: z.string().min(1).max(128),
+});
+
+export const mediaStopPlaybackResponseSchema = z.object({
+	ok: z.boolean(),
+	playbackRef: z.string().min(1).max(128),
+	/** False when there was nothing playing. A SUCCESS, not a failure — see the note above. */
+	stopped: z.boolean().default(false),
+	/** The session the playback was on, when there was one. Logging and correlation only. */
+	sessionId: z.string().min(1).max(128).optional(),
+	instanceId: z.string().min(1).max(128).optional(),
+	reason: mediaRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type MediaStopPlaybackRequest = z.infer<typeof mediaStopPlaybackRequestSchema>;
+export type MediaStopPlaybackResponse = z.infer<typeof mediaStopPlaybackResponseSchema>;
+
+export const MEDIA_STOP_PLAYBACK_RPC = defineRpc(
+	RPC_SUBJECTS.mediaStopPlayback,
+	mediaStopPlaybackRequestSchema,
+	mediaStopPlaybackResponseSchema,
+	500,
+);
+
 // ---------------------------------------------------------------------------------------------
 // rpc.engine.v1.park-handoff — engine → engine, when a park is retrieved from the wrong node
 // ---------------------------------------------------------------------------------------------
@@ -995,5 +1115,7 @@ export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.mediaBridgeSessions]: MEDIA_BRIDGE_SESSIONS_RPC,
 	[RPC_SUBJECTS.mediaUnbridgeSessions]: MEDIA_UNBRIDGE_SESSIONS_RPC,
 	[RPC_SUBJECTS.mediaReleaseSession]: MEDIA_RELEASE_SESSION_RPC,
+	[RPC_SUBJECTS.mediaStartPlayback]: MEDIA_START_PLAYBACK_RPC,
+	[RPC_SUBJECTS.mediaStopPlayback]: MEDIA_STOP_PLAYBACK_RPC,
 	[RPC_SUBJECTS.engineParkHandoff]: PARK_HANDOFF_RPC,
 } as const;

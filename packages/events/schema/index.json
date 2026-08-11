@@ -232,6 +232,13 @@
 			"goType": "MediaSessionRTPTimeoutData"
 		},
 		{
+			"family": "media",
+			"type": "playback.finished",
+			"subject": "media.evt.v1.<orgId>.<sessionId>.playback.finished",
+			"dataSchema": "events/media.playback.finished.schema.json",
+			"goType": "MediaPlaybackFinishedData"
+		},
+		{
 			"family": "cdr",
 			"type": "cdr.leg.write",
 			"subject": "cdr.leg.v1.<orgId>",
@@ -339,6 +346,22 @@
 			"responseSchema": "rpc/rpc.media.v1.release-session.response.schema.json",
 			"goRequestType": "MediaReleaseSessionRequest",
 			"goResponseType": "MediaReleaseSessionResponse"
+		},
+		{
+			"subject": "rpc.media.v1.start-playback",
+			"timeoutMs": 1000,
+			"requestSchema": "rpc/rpc.media.v1.start-playback.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.start-playback.response.schema.json",
+			"goRequestType": "MediaStartPlaybackRequest",
+			"goResponseType": "MediaStartPlaybackResponse"
+		},
+		{
+			"subject": "rpc.media.v1.stop-playback",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.media.v1.stop-playback.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.stop-playback.response.schema.json",
+			"goRequestType": "MediaStopPlaybackRequest",
+			"goResponseType": "MediaStopPlaybackResponse"
 		},
 		{
 			"subject": "rpc.engine.v1.park-handoff",

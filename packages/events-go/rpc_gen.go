@@ -31,6 +31,8 @@ const (
 	SubjectMediaBridgeSessionsRPC   = "rpc.media.v1.bridge-sessions"
 	SubjectMediaUnbridgeSessionsRPC = "rpc.media.v1.unbridge-sessions"
 	SubjectMediaReleaseSessionRPC   = "rpc.media.v1.release-session"
+	SubjectMediaStartPlaybackRPC    = "rpc.media.v1.start-playback"
+	SubjectMediaStopPlaybackRPC     = "rpc.media.v1.stop-playback"
 	SubjectParkHandoffRPC           = "rpc.engine.v1.park-handoff"
 )
 
@@ -44,6 +46,8 @@ const (
 	TimeoutMediaBridgeSessionsRPC   = 500 * time.Millisecond
 	TimeoutMediaUnbridgeSessionsRPC = 500 * time.Millisecond
 	TimeoutMediaReleaseSessionRPC   = 500 * time.Millisecond
+	TimeoutMediaStartPlaybackRPC    = 1000 * time.Millisecond
+	TimeoutMediaStopPlaybackRPC     = 500 * time.Millisecond
 	TimeoutParkHandoffRPC           = 3000 * time.Millisecond
 )
 
@@ -627,6 +631,112 @@ func (v MediaReleaseSessionResponseReason) Valid() bool {
 }
 
 func (v MediaReleaseSessionResponseReason) String() string { return string(v) }
+
+// MediaStartPlaybackRequest is the request body of rpc.media.v1.start-playback.
+type MediaStartPlaybackRequest struct {
+	SessionID   string   `json:"sessionId"`
+	PlaybackRef string   `json:"playbackRef"`
+	Media       []string `json:"media"`
+	Language    *string  `json:"language,omitempty"`
+}
+
+// MediaStartPlaybackResponse is the reply body of rpc.media.v1.start-playback.
+type MediaStartPlaybackResponse struct {
+	Ok          bool                              `json:"ok"`
+	SessionID   string                            `json:"sessionId"`
+	PlaybackRef string                            `json:"playbackRef"`
+	InstanceID  *string                           `json:"instanceId,omitempty"`
+	Reason      *MediaStartPlaybackResponseReason `json:"reason,omitempty"`
+	Error       *string                           `json:"error,omitempty"`
+}
+
+// MediaStartPlaybackResponseReason is the closed vocabulary of MediaStartPlaybackResponse.reason.
+type MediaStartPlaybackResponseReason string
+
+const (
+	MediaStartPlaybackResponseReasonBadRequest     MediaStartPlaybackResponseReason = "bad_request"
+	MediaStartPlaybackResponseReasonCapacity       MediaStartPlaybackResponseReason = "capacity"
+	MediaStartPlaybackResponseReasonShuttingDown   MediaStartPlaybackResponseReason = "shutting_down"
+	MediaStartPlaybackResponseReasonUnknownSession MediaStartPlaybackResponseReason = "unknown_session"
+	MediaStartPlaybackResponseReasonWrongInstance  MediaStartPlaybackResponseReason = "wrong_instance"
+	MediaStartPlaybackResponseReasonNotSupported   MediaStartPlaybackResponseReason = "not_supported"
+	MediaStartPlaybackResponseReasonInternal       MediaStartPlaybackResponseReason = "internal"
+)
+
+// MediaStartPlaybackResponseReasonValues lists every member of the vocabulary, in contract order.
+var MediaStartPlaybackResponseReasonValues = []MediaStartPlaybackResponseReason{
+	MediaStartPlaybackResponseReasonBadRequest,
+	MediaStartPlaybackResponseReasonCapacity,
+	MediaStartPlaybackResponseReasonShuttingDown,
+	MediaStartPlaybackResponseReasonUnknownSession,
+	MediaStartPlaybackResponseReasonWrongInstance,
+	MediaStartPlaybackResponseReasonNotSupported,
+	MediaStartPlaybackResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the MediaStartPlaybackResponseReason vocabulary.
+func (v MediaStartPlaybackResponseReason) Valid() bool {
+	for _, candidate := range MediaStartPlaybackResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaStartPlaybackResponseReason) String() string { return string(v) }
+
+// MediaStopPlaybackRequest is the request body of rpc.media.v1.stop-playback.
+type MediaStopPlaybackRequest struct {
+	PlaybackRef string `json:"playbackRef"`
+}
+
+// MediaStopPlaybackResponse is the reply body of rpc.media.v1.stop-playback.
+type MediaStopPlaybackResponse struct {
+	Ok          bool                             `json:"ok"`
+	PlaybackRef string                           `json:"playbackRef"`
+	Stopped     bool                             `json:"stopped"`
+	SessionID   *string                          `json:"sessionId,omitempty"`
+	InstanceID  *string                          `json:"instanceId,omitempty"`
+	Reason      *MediaStopPlaybackResponseReason `json:"reason,omitempty"`
+	Error       *string                          `json:"error,omitempty"`
+}
+
+// MediaStopPlaybackResponseReason is the closed vocabulary of MediaStopPlaybackResponse.reason.
+type MediaStopPlaybackResponseReason string
+
+const (
+	MediaStopPlaybackResponseReasonBadRequest     MediaStopPlaybackResponseReason = "bad_request"
+	MediaStopPlaybackResponseReasonCapacity       MediaStopPlaybackResponseReason = "capacity"
+	MediaStopPlaybackResponseReasonShuttingDown   MediaStopPlaybackResponseReason = "shutting_down"
+	MediaStopPlaybackResponseReasonUnknownSession MediaStopPlaybackResponseReason = "unknown_session"
+	MediaStopPlaybackResponseReasonWrongInstance  MediaStopPlaybackResponseReason = "wrong_instance"
+	MediaStopPlaybackResponseReasonNotSupported   MediaStopPlaybackResponseReason = "not_supported"
+	MediaStopPlaybackResponseReasonInternal       MediaStopPlaybackResponseReason = "internal"
+)
+
+// MediaStopPlaybackResponseReasonValues lists every member of the vocabulary, in contract order.
+var MediaStopPlaybackResponseReasonValues = []MediaStopPlaybackResponseReason{
+	MediaStopPlaybackResponseReasonBadRequest,
+	MediaStopPlaybackResponseReasonCapacity,
+	MediaStopPlaybackResponseReasonShuttingDown,
+	MediaStopPlaybackResponseReasonUnknownSession,
+	MediaStopPlaybackResponseReasonWrongInstance,
+	MediaStopPlaybackResponseReasonNotSupported,
+	MediaStopPlaybackResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the MediaStopPlaybackResponseReason vocabulary.
+func (v MediaStopPlaybackResponseReason) Valid() bool {
+	for _, candidate := range MediaStopPlaybackResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaStopPlaybackResponseReason) String() string { return string(v) }
 
 // ParkHandoffRequest is the request body of rpc.engine.v1.park-handoff.
 type ParkHandoffRequest struct {

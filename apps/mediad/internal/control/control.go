@@ -42,6 +42,7 @@ import (
 	"github.com/nats-io/nats.go"
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/directory"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
@@ -56,6 +57,8 @@ const (
 	SubjectBridgeSessions   = contract.SubjectMediaBridgeSessionsRPC
 	SubjectUnbridgeSessions = contract.SubjectMediaUnbridgeSessionsRPC
 	SubjectReleaseSession   = contract.SubjectMediaReleaseSessionRPC
+	SubjectStartPlayback    = contract.SubjectMediaStartPlaybackRPC
+	SubjectStopPlayback     = contract.SubjectMediaStopPlaybackRPC
 )
 
 // Refusal codes. Values come from the contract; these names exist so a handler reads as prose.
@@ -78,12 +81,22 @@ type Sessions interface {
 	Bridge(bridgeID, first, second string) error
 	Unbridge(bridgeID string) ([]string, bool)
 	Release(sessionID string) bool
+	StartPlayback(sessionID string, opts rtp.PlaybackOptions) error
+	StopPlayback(playbackRef string) (string, bool)
+	// AudioPayloadType reports the G.711 type a live session answered with, and whether it exists.
+	//
+	// A VALUE and not the *rtp.Session it came from, deliberately: the control surface needs
+	// exactly one fact about the leg — which companding law to decode the clip into, because a
+	// µ-law prompt on an A-law leg is a rasp rather than a wrong-sounding voice — and handing it a
+	// live session would put the packet path's internals inside a NATS callback.
+	AudioPayloadType(sessionID string) (uint8, bool)
 }
 
 // Server answers the v1 command subjects.
 type Server struct {
 	sessions   Sessions
 	dir        directory.Store
+	library    *audio.Library
 	log        *slog.Logger
 	instanceID string
 	publicAddr netip.Addr
@@ -95,6 +108,9 @@ type ServerOptions struct {
 	Sessions Sessions
 	// Directory records session ownership. Required — see the package doc on directory.
 	Directory directory.Store
+	// Library resolves the prompts `start-playback` names. Nil is an unconfigured library, which
+	// REFUSES every playback rather than answering ok and sending nothing.
+	Library *audio.Library
 	// InstanceID names this process on the wire and in the directory. Required.
 	InstanceID string
 	// PublicAddr is what goes into an SDP answer's `c=` line. Required.
@@ -119,9 +135,14 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	if log == nil {
 		log = slog.Default()
 	}
+	library := opts.Library
+	if library == nil {
+		library = audio.NewLibrary("")
+	}
 	return &Server{
 		sessions:   opts.Sessions,
 		dir:        opts.Directory,
+		library:    library,
 		log:        log,
 		instanceID: opts.InstanceID,
 		publicAddr: opts.PublicAddr,
@@ -151,6 +172,8 @@ func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscrip
 		{SubjectBridgeSessions, s.HandleBridgeSessions},
 		{SubjectUnbridgeSessions, s.HandleUnbridgeSessions},
 		{SubjectReleaseSession, s.HandleReleaseSession},
+		{SubjectStartPlayback, s.HandleStartPlayback},
+		{SubjectStopPlayback, s.HandleStopPlayback},
 	}
 
 	subscriptions := make([]*nats.Subscription, 0, len(handlers))

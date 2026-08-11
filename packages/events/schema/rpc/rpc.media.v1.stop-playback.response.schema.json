@@ -1,0 +1,46 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"ok": {
+			"type": "boolean"
+		},
+		"playbackRef": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"stopped": {
+			"default": false,
+			"type": "boolean"
+		},
+		"sessionId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"instanceId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"reason": {
+			"type": "string",
+			"enum": [
+				"bad_request",
+				"capacity",
+				"shutting_down",
+				"unknown_session",
+				"wrong_instance",
+				"not_supported",
+				"internal"
+			]
+		},
+		"error": {
+			"type": "string",
+			"maxLength": 512
+		}
+	},
+	"required": ["ok", "playbackRef", "stopped"],
+	"additionalProperties": false
+}

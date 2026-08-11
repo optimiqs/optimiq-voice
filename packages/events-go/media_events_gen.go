@@ -12,6 +12,7 @@ package events
 const (
 	EventTypeMediaSessionEnded      = "session.ended"
 	EventTypeMediaSessionRTPTimeout = "session.rtp-timeout"
+	EventTypeMediaPlaybackFinished  = "playback.finished"
 )
 
 // MediaSessionEndedData is the payload of the "session.ended" event.
@@ -78,3 +79,46 @@ type MediaSessionRTPTimeoutData struct {
 	SilentForMs     int     `json:"silentForMs"`
 	RemoteAddress   *string `json:"remoteAddress,omitempty"`
 }
+
+// MediaPlaybackFinishedData is the payload of the "playback.finished" event.
+//
+// Subject: media.evt.v1.<orgId>.<sessionId>.playback.finished
+// Envelope: Envelope[MediaPlaybackFinishedData]
+type MediaPlaybackFinishedData struct {
+	SessionID   string                      `json:"sessionId"`
+	InstanceID  string                      `json:"instanceId"`
+	CallID      *string                     `json:"callId,omitempty"`
+	LegID       *string                     `json:"legId,omitempty"`
+	PlaybackRef string                      `json:"playbackRef"`
+	Reason      MediaPlaybackFinishedReason `json:"reason"`
+	PlayedMs    int                         `json:"playedMs"`
+	Detail      *string                     `json:"detail,omitempty"`
+}
+
+// MediaPlaybackFinishedReason is the closed vocabulary of MediaPlaybackFinishedData.reason.
+type MediaPlaybackFinishedReason string
+
+const (
+	MediaPlaybackFinishedReasonCompleted MediaPlaybackFinishedReason = "completed"
+	MediaPlaybackFinishedReasonStopped   MediaPlaybackFinishedReason = "stopped"
+	MediaPlaybackFinishedReasonError     MediaPlaybackFinishedReason = "error"
+)
+
+// MediaPlaybackFinishedReasonValues lists every member of the vocabulary, in contract order.
+var MediaPlaybackFinishedReasonValues = []MediaPlaybackFinishedReason{
+	MediaPlaybackFinishedReasonCompleted,
+	MediaPlaybackFinishedReasonStopped,
+	MediaPlaybackFinishedReasonError,
+}
+
+// Valid reports whether v is a member of the MediaPlaybackFinishedReason vocabulary.
+func (v MediaPlaybackFinishedReason) Valid() bool {
+	for _, candidate := range MediaPlaybackFinishedReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaPlaybackFinishedReason) String() string { return string(v) }
