@@ -14,6 +14,7 @@ import type { EngineEnv } from "../config/engine-env";
 import type { MediaEvent } from "../media/media-event";
 import type { CallEventPublisher } from "../nats/call-event-publisher.service";
 import type { JetStreamService } from "../nats/jetstream.service";
+import type { ParkHandoffService } from "../nats/park-handoff.service";
 import type { DidIndexSource } from "../routing/did-index.source";
 import type { RoutingArtifactSource } from "../routing/routing-artifact.source";
 import type { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
@@ -40,6 +41,21 @@ const NO_DID_INDEX = {
 const NO_MAILBOX = {
 	list: async () => ({ found: false, messages: [], reason: "no responder in this spec" }),
 } as unknown as VoicemailMailboxRpcSource;
+
+/**
+ * A park-handoff seam that answers nothing.
+ *
+ * Every spec in this file is a SINGLE instance, so no claim it reads can name a foreign owner and
+ * nothing here ever reaches the wire. It is wired rather than cast away because the orchestrator
+ * registers its handler on this object at construction — a missing one would fail in the
+ * constructor rather than in the test that cared.
+ */
+const NO_PARK_HANDOFF = {
+	setHandler: () => undefined,
+	handoff: async () => {
+		throw new Error("no cross-instance park handoff in this spec");
+	},
+} as unknown as ParkHandoffService;
 
 /**
  * Orchestrator specs, driven entirely by fakes.
@@ -146,6 +162,7 @@ function harness(env: EngineEnv = fakeEnv()) {
 		...(fakeQueueOrchestratorArgs() as [never, never, never, never, never]),
 		new ParkRegistry(),
 		new CallControlRegistry(),
+		NO_PARK_HANDOFF,
 	);
 
 	return {
@@ -537,6 +554,7 @@ describe("resilience", () => {
 			...(fakeQueueOrchestratorArgs() as [never, never, never, never, never]),
 			new ParkRegistry(),
 			new CallControlRegistry(),
+			NO_PARK_HANDOFF,
 		);
 
 		await expect(

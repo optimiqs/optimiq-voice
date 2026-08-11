@@ -1,9 +1,13 @@
 import { describe, expect, it } from "bun:test";
+import { kvKeyFor } from "@optimiq-voice/events";
 import { makeFakeMediaPort } from "../media/media-port.fake";
+import { FakeClaimBucket } from "../nats/claim-store.fake";
 import { CallSignalBus, legSignalKey, recordingSignalKey } from "../routing/call-signals";
-import { ParkRegistry } from "../routing/park-registry";
+import { CLAIM_LEASE_MS, ParkRegistry } from "../routing/park-registry";
 import { CallControl, pickupGroupFilter } from "./call-control";
+import { ParkHandoffError } from "./park-handoff";
 import type { FakeMediaPortOptions } from "../media/media-port.fake";
+import type { ClaimBucket } from "../nats/claim-store";
 import type {
 	CallControlHost,
 	ControlledLeg,
@@ -12,7 +16,8 @@ import type {
 	RouteOutcome,
 	RouteRequest,
 } from "./call-control";
-import type { CallEvent } from "@optimiq-voice/events";
+import type { ParkHandoffClient } from "./park-handoff";
+import type { CallEvent, ParkClaim } from "@optimiq-voice/events";
 import type { CallState, ChannelFlag, ChannelState, HangupCause } from "@optimiq-voice/telephony";
 
 /**
@@ -131,11 +136,23 @@ interface HarnessOptions {
 	readonly route?: (leg: ControlledLeg, request: RouteRequest) => Promise<RouteOutcome>;
 	readonly ringing?: readonly PickupCandidate[];
 	readonly lot?: ParkLot | undefined;
+	/** Shared park claims, for the specs that need two instances on one bucket. */
+	readonly claims?: ClaimBucket<ParkClaim>;
+	/** This instance's identity. Only meaningful together with {@link HarnessOptions.claims}. */
+	readonly instanceId?: string;
+	/** The engine-to-engine seam. Absent means "no cross-instance retrieval", as in production. */
+	readonly parkHandoff?: ParkHandoffClient;
+	/** The clock, shared by call control and the claim leases. */
+	readonly now?: () => number;
 }
 
 function harness(options: HarnessOptions = {}) {
 	const signals = new CallSignalBus();
+	const now = options.now ?? (() => 1_000);
 	const parks = new ParkRegistry();
+	if (options.claims !== undefined) {
+		parks.bindClaims(options.claims, options.instanceId ?? "engine-a", now);
+	}
 	const published: PublishedEvent[] = [];
 	const routes: RouteRequest[] = [];
 	const legs = new Map<string, FakeLeg>(
@@ -190,9 +207,10 @@ function harness(options: HarnessOptions = {}) {
 		signals,
 		parks,
 		host,
+		...(options.parkHandoff === undefined ? {} : { parkHandoff: options.parkHandoff }),
 		settings: { application: "optimiq-engine", recordingFormat: "wav" },
 		newId: () => `id-${String(++counter)}`,
-		now: () => 1_000,
+		now,
 		setTimer: (fn, ms) => {
 			timers.push({ fn, ms });
 			return { cancel: () => undefined };
@@ -412,6 +430,348 @@ describe("retrieval", () => {
 
 		expect(result.ok).toBe(false);
 		expect(h.parks.at(LOT.parkLotId, 401)?.mediaChannelId).toBe("c");
+	});
+});
+
+// ---------------------------------------------------------------------------------------------
+// Cross-instance retrieval
+// ---------------------------------------------------------------------------------------------
+
+/** The `park-claims` key orbit 401 is held under. Read directly, to assert the orbit is freed. */
+const ORBIT_KEY = kvKeyFor.parkClaim(ORG, LOT.parkLotId, 401);
+
+/**
+ * Two engines behind one media server, sharing one `park-claims` bucket.
+ *
+ * The arrangement the whole feature exists for: a caller is parked by the engine handling THEIR
+ * call, and collected from the engine handling the phone that dialled the orbit — a different
+ * process, with a different leg registry, holding none of the other's channels.
+ *
+ * `owner.control.acceptParkHandoff` is wired in as the retriever's transport, which is exactly what
+ * `ParkHandoffService` does over NATS. The request crosses a real seam and both sides are real; the
+ * only thing missing is the broker, which `test/engine-integration.spec.ts` supplies.
+ */
+function twoInstances(
+	options: {
+		readonly ownerMedia?: FakeMediaPortOptions;
+		readonly beforeHandoff?: () => Promise<void>;
+		readonly transport?: ParkHandoffClient;
+	} = {},
+) {
+	const bucket = new FakeClaimBucket<ParkClaim>();
+	const caller = fakeLeg("c");
+	const owner = harness({
+		legs: [caller],
+		claims: bucket,
+		instanceId: "engine-owner",
+		...(options.ownerMedia === undefined ? {} : { media: options.ownerMedia }),
+	});
+
+	const handoffs: string[] = [];
+	const transport: ParkHandoffClient = options.transport ?? {
+		handoff: async (ownerInstanceId, request) => {
+			handoffs.push(ownerInstanceId);
+			await options.beforeHandoff?.();
+			return await owner.control.acceptParkHandoff(request);
+		},
+	};
+
+	const retriever = fakeLeg("r");
+	const collector = harness({
+		legs: [retriever],
+		claims: bucket.peer(),
+		instanceId: "engine-collector",
+		parkHandoff: transport,
+	});
+
+	return { bucket, owner, collector, caller, retriever, handoffs };
+}
+
+describe("cross-instance retrieval", () => {
+	it("leaves the same-instance path alone: a local orbit never reaches the wire", async () => {
+		const caller = fakeLeg("c");
+		const retriever = fakeLeg("r");
+		const h = harness({
+			legs: [caller, retriever],
+			claims: new FakeClaimBucket<ParkClaim>(),
+			instanceId: "engine-a",
+			parkHandoff: {
+				handoff: async () => {
+					throw new Error("the local path must not issue a handoff");
+				},
+			},
+		});
+		await h.control.park(caller);
+
+		const result = await h.control.unpark(retriever, { orbit: "401" });
+
+		expect(result.ok).toBe(true);
+		expect(h.media.methods()).toEqual([
+			"startMusicOnHold",
+			"stopMusicOnHold",
+			"createBridge",
+			"addToBridge",
+		]);
+		expect(retriever.bridgePeers).toEqual(["leg-c"]);
+	});
+
+	it("asks the owning instance, which moves the media and frees the orbit", async () => {
+		const { bucket, owner, collector, caller, retriever, handoffs } = twoInstances();
+		await owner.control.park(caller);
+
+		const result = await collector.control.unpark(retriever, { orbit: "401" });
+
+		expect(result).toEqual({ ok: true, detail: "retrieved orbit 401 from engine-owner" });
+		expect(handoffs).toEqual(["engine-owner"]);
+		// The OWNER does the media, all of it. The retriever's own media server is untouched.
+		expect(owner.media.methods()).toEqual([
+			"startMusicOnHold",
+			"stopMusicOnHold",
+			"createBridge",
+			"addToBridge",
+		]);
+		expect(collector.media.methods()).toEqual([]);
+		// Both legs end up in one bridge, each one's state moved by the process that owns it.
+		expect(retriever.bridgeId).toBe(caller.bridgeId);
+		expect(retriever.bridgePeers).toEqual(["leg-c"]);
+		expect(caller.bridgePeers).toEqual([undefined, "leg-r"]);
+		expect(caller.callStates).toEqual(["held", "unheld", "active"]);
+		expect(caller.flags.has("park")).toBe(false);
+		expect(owner.parks.at(LOT.parkLotId, 401)).toBeUndefined();
+		expect(bucket.entries.has(ORBIT_KEY)).toBe(false);
+	});
+
+	it("files the unpark on the owner's leg and the bridge on the retriever's", async () => {
+		const { owner, collector, caller, retriever } = twoInstances();
+		await owner.control.park(caller);
+		await collector.control.unpark(retriever, { orbit: "401" });
+
+		expect(owner.eventsOf("call.unparked")[0]).toMatchObject({
+			legId: "leg-c",
+			data: { slot: "401", reason: "retrieved", retrievedByLegId: "leg-r" },
+		});
+		expect(collector.eventsOf("call.unparked")).toHaveLength(0);
+		expect(collector.eventsOf("channel.bridged")[0]).toMatchObject({
+			legId: "leg-r",
+			data: { peerLegId: "leg-c", mode: "full" },
+		});
+	});
+
+	it("loses the race honestly when the call is collected while the handoff is in flight", async () => {
+		let owner: ReturnType<typeof harness> | undefined;
+		const pair = twoInstances({
+			beforeHandoff: async () => {
+				// A colleague on the OWNING instance dials the orbit first. The claim the retriever
+				// read is a snapshot, and this is what makes it stale mid-flight.
+				await owner?.control.unpark(fakeLeg("local"), { orbit: "401" });
+			},
+		});
+		owner = pair.owner;
+		await pair.owner.control.park(pair.caller);
+
+		const result = await pair.collector.control.unpark(pair.retriever, { orbit: "401" });
+
+		expect(result).toEqual({ ok: false, reason: "nothing is parked on orbit 401" });
+		expect(pair.retriever.bridgeId).toBeUndefined();
+	});
+
+	it("refuses when the orbit holds a different call than the request named", async () => {
+		const { owner, caller } = twoInstances();
+		await owner.control.park(caller);
+
+		const response = await owner.control.acceptParkHandoff({
+			orgId: ORG,
+			parkLotId: LOT.parkLotId,
+			slot: 401,
+			// The claim was reaped and re-taken between the retriever's read and its request.
+			mediaChannelId: "somebody-else",
+			retrieverInstanceId: "engine-collector",
+			retrieverMediaChannelId: "r",
+			retrieverLegId: "leg-r",
+			bridgeId: "bridge-x",
+		});
+
+		expect(response).toMatchObject({ ok: false, reason: "claim_superseded" });
+		expect(owner.parks.at(LOT.parkLotId, 401)?.mediaChannelId).toBe("c");
+	});
+
+	it("answers a request from another tenant as though the orbit were empty", async () => {
+		const { owner, caller } = twoInstances();
+		await owner.control.park(caller);
+
+		const response = await owner.control.acceptParkHandoff({
+			orgId: "0195c0f0-1c2f-7000-8000-0000000000ff",
+			parkLotId: LOT.parkLotId,
+			slot: 401,
+			mediaChannelId: "c",
+			retrieverInstanceId: "engine-collector",
+			retrieverMediaChannelId: "r",
+			retrieverLegId: "leg-r",
+			bridgeId: "bridge-x",
+		});
+
+		expect(response).toMatchObject({ ok: false, reason: "not_parked" });
+		expect(owner.parks.at(LOT.parkLotId, 401)?.mediaChannelId).toBe("c");
+	});
+
+	it("refuses when the retriever's channel is on a media server the owner cannot see", async () => {
+		const { owner, collector, caller, retriever } = twoInstances({
+			ownerMedia: { knowsChannel: (channelId) => channelId === "c" },
+		});
+		await owner.control.park(caller);
+
+		const result = await collector.control.unpark(retriever, { orbit: "401" });
+
+		expect(result).toEqual({
+			ok: false,
+			reason:
+				"the call on orbit 401 is parked on an engine that does not share this media server, so it cannot be retrieved from here",
+		});
+		// Nothing moved, so the caller is still collectable from the instance that holds them.
+		expect(owner.parks.at(LOT.parkLotId, 401)?.mediaChannelId).toBe("c");
+		expect(owner.media.methods()).toEqual(["startMusicOnHold"]);
+	});
+
+	it("puts the caller back in their orbit when the owner's bridge is refused", async () => {
+		const { owner, collector, caller, retriever } = twoInstances({
+			ownerMedia: { bridgeFails: true },
+		});
+		await owner.control.park(caller);
+
+		const result = await collector.control.unpark(retriever, { orbit: "401" });
+
+		expect(result.ok).toBe(false);
+		expect(owner.parks.at(LOT.parkLotId, 401)?.mediaChannelId).toBe("c");
+		expect(owner.media.methods()).toContain("startMusicOnHold");
+		expect(retriever.bridgeId).toBeUndefined();
+	});
+
+	it("reports an owner that did not answer, and leaves the call where it is", async () => {
+		const { bucket, owner, collector, caller, retriever } = twoInstances({
+			transport: {
+				handoff: async (ownerInstanceId) => {
+					throw new ParkHandoffError(ownerInstanceId, "no reply within 3000ms");
+				},
+			},
+		});
+		await owner.control.park(caller);
+
+		const result = await collector.control.unpark(retriever, { orbit: "401" });
+
+		expect(result).toEqual({
+			ok: false,
+			reason:
+				"the engine holding orbit 401 (engine-owner) did not answer; the call could not be retrieved",
+		});
+		// Still parked, still claimed, still collectable — a timeout is not a retrieval.
+		expect(owner.parks.at(LOT.parkLotId, 401)?.mediaChannelId).toBe("c");
+		expect(bucket.entries.has(ORBIT_KEY)).toBe(true);
+	});
+
+	it("says so plainly when no handoff transport is wired at all", async () => {
+		const bucket = new FakeClaimBucket<ParkClaim>();
+		const caller = fakeLeg("c");
+		const owner = harness({ legs: [caller], claims: bucket, instanceId: "engine-owner" });
+		await owner.control.park(caller);
+
+		const retriever = fakeLeg("r");
+		const collector = harness({
+			legs: [retriever],
+			claims: bucket.peer(),
+			instanceId: "engine-collector",
+		});
+
+		expect(await collector.control.unpark(retriever, { orbit: "401" })).toEqual({
+			ok: false,
+			reason:
+				"the call on orbit 401 is parked on another engine instance (engine-owner) and cannot be retrieved from here",
+		});
+	});
+});
+
+describe("retrieval from an engine that has died", () => {
+	const PARKED_AT = 1_000;
+	const COLLECTED_AT = PARKED_AT + CLAIM_LEASE_MS + 1;
+
+	/** The owner parks, then stops heartbeating: the collector's clock is a full lease later. */
+	function afterTheLease(retrieverMedia?: FakeMediaPortOptions) {
+		const bucket = new FakeClaimBucket<ParkClaim>();
+		const caller = fakeLeg("c");
+		const owner = harness({
+			legs: [caller],
+			claims: bucket,
+			instanceId: "engine-dead",
+			now: () => PARKED_AT,
+		});
+		const retriever = fakeLeg("r");
+		const collector = harness({
+			legs: [retriever],
+			claims: bucket.peer(),
+			instanceId: "engine-live",
+			now: () => COLLECTED_AT,
+			parkHandoff: {
+				handoff: async () => {
+					throw new Error("a dead instance is never asked anything");
+				},
+			},
+			...(retrieverMedia === undefined ? {} : { media: retrieverMedia }),
+		});
+		return { bucket, owner, collector, caller, retriever };
+	}
+
+	it("takes the claim over and collects the caller the dead engine left behind", async () => {
+		const { bucket, owner, collector, caller, retriever } = afterTheLease();
+		await owner.control.park(caller);
+
+		const result = await collector.control.unpark(retriever, { orbit: "401" });
+
+		expect(result).toEqual({ ok: true, detail: "retrieved orbit 401 from engine-dead" });
+		expect(collector.media.methods()).toEqual(["stopMusicOnHold", "createBridge", "addToBridge"]);
+		expect(retriever.bridgePeers).toEqual(["leg-c"]);
+		expect(collector.eventsOf("channel.bridged")[0]).toMatchObject({
+			legId: "leg-r",
+			data: { peerLegId: "leg-c" },
+		});
+		// The orbit is freed rather than inherited: this instance holds no leg for that channel and
+		// has nothing to heartbeat for.
+		expect(bucket.entries.has(ORBIT_KEY)).toBe(false);
+		expect(collector.parks.at(LOT.parkLotId, 401)).toBeUndefined();
+	});
+
+	it("refuses, and frees the orbit, when the channel went with the engine", async () => {
+		const { bucket, owner, collector, caller, retriever } = afterTheLease({
+			knowsChannel: () => false,
+		});
+		await owner.control.park(caller);
+
+		const result = await collector.control.unpark(retriever, { orbit: "401" });
+
+		expect(result).toEqual({
+			ok: false,
+			reason:
+				"the call on orbit 401 was parked by an engine that has gone (engine-dead) and is no longer reachable",
+		});
+		expect(collector.media.methods()).toEqual([]);
+		expect(bucket.entries.has(ORBIT_KEY)).toBe(false);
+	});
+
+	it("lets exactly one of two retrievers collect the orphan", async () => {
+		const { bucket, owner, collector, caller, retriever } = afterTheLease();
+		await owner.control.park(caller);
+
+		const second = fakeLeg("r2");
+		const rival = harness({
+			legs: [second],
+			claims: bucket.peer(),
+			instanceId: "engine-live-2",
+			now: () => COLLECTED_AT,
+		});
+
+		expect((await collector.control.unpark(retriever, { orbit: "401" })).ok).toBe(true);
+		expect(await rival.control.unpark(second, { orbit: "401" })).toEqual({
+			ok: false,
+			reason: "nothing is parked on orbit 401",
+		});
 	});
 });
 

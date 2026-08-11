@@ -19,7 +19,8 @@
 		"mediaAllocateSession": "rpc.media.v1.allocate-session",
 		"mediaBridgeSessions": "rpc.media.v1.bridge-sessions",
 		"mediaUnbridgeSessions": "rpc.media.v1.unbridge-sessions",
-		"mediaReleaseSession": "rpc.media.v1.release-session"
+		"mediaReleaseSession": "rpc.media.v1.release-session",
+		"engineParkHandoff": "rpc.engine.v1.park-handoff"
 	},
 	"queueScopeAll": "_all",
 	"aorSubjectTokens": [

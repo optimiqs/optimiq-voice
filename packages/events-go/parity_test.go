@@ -182,6 +182,7 @@ func TestParityConstants(t *testing.T) {
 		"mediaBridgeSessions":   SubjectMediaBridgeSessionsRPC,
 		"mediaUnbridgeSessions": SubjectMediaUnbridgeSessionsRPC,
 		"mediaReleaseSession":   SubjectMediaReleaseSessionRPC,
+		"engineParkHandoff":     SubjectParkHandoffRPC,
 	}
 	if !reflect.DeepEqual(rpc, g.RPCSubjects) {
 		t.Errorf("rpc subjects = %v, golden %v", rpc, g.RPCSubjects)

@@ -45,6 +45,9 @@ import {
  * Rule of thumb: if a subject has, or could have, a non-TypeScript participant, serve it raw so
  * that the contract is the wire. If it is Nest-to-Nest, `@MessagePattern` is fine — but the
  * generated Go structs for it are then documentation, not a usable client.
+ *
+ * There is one exception to the second half, and it is `rpc.engine.v1.park-handoff`: Nest on both
+ * ends and raw anyway, because its subject is not a constant. See its own note.
  */
 
 /** A request-reply contract: one subject, one request schema, one response schema. */
@@ -592,6 +595,156 @@ export const MEDIA_RELEASE_SESSION_RPC = defineRpc(
 	500,
 );
 
+// ---------------------------------------------------------------------------------------------
+// rpc.engine.v1.park-handoff — engine → engine, when a park is retrieved from the wrong node
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Why a park handoff was refused.
+ *
+ * As with the media plane: a refusal is a REPLY. The retriever branches on this code and never on
+ * `error`, because the four interesting outcomes need four different things said to the person who
+ * dialled the orbit — "somebody already took that call", "that caller has hung up", "the call is
+ * there but I cannot reach it", and "try again".
+ */
+export const PARK_HANDOFF_REFUSAL_REASONS = [
+	/** Malformed payload, or a required field missing. Retrying the same bytes fails the same way. */
+	"bad_request",
+	/**
+	 * This instance holds no park on that orbit.
+	 *
+	 * The RACE answer, and the common one: the claim the retriever read was a snapshot, and between
+	 * the read and this request the call was collected locally, timed out back to its parker, or
+	 * hung up. The retriever must say "no longer parked", NOT "parked elsewhere" — the search is
+	 * over either way, but only one of those sends somebody looking for another engine.
+	 */
+	"not_parked",
+	/**
+	 * The orbit IS held here, by a different channel than the one the request named.
+	 *
+	 * A claim that was reaped and re-taken between the read and the request: the slot now holds
+	 * somebody else's caller. Bridging them would connect the retriever to a stranger, which is the
+	 * exact failure the whole claim mechanism exists to prevent, so it is refused rather than
+	 * treated as a near-enough match.
+	 */
+	"claim_superseded",
+	/** The parked leg has gone — hung up between the claim and the move. Nothing to hand over. */
+	"channel_gone",
+	/**
+	 * The retriever's own channel is not visible to this instance's media server.
+	 *
+	 * The handoff bridges two channels from ONE side (see
+	 * {@link parkHandoffRequestSchema}), which holds only while both engines drive the same media
+	 * server. Two engines on two Asterisks is a supported deployment and a call parked on one of
+	 * them genuinely cannot be collected from the other yet — so it is named, rather than surfacing
+	 * as a media error the retriever cannot interpret.
+	 */
+	"unreachable_channel",
+	/**
+	 * The media server refused the move. The caller has been put BACK in their orbit and is still
+	 * collectable — from the owning instance, and by a retry of this request.
+	 */
+	"media_failed",
+	/** This instance is draining. Do not retry HERE. */
+	"shutting_down",
+	/** Anything else. */
+	"internal",
+] as const;
+
+export const parkHandoffRefusalReasonSchema = z.enum(PARK_HANDOFF_REFUSAL_REASONS);
+export type ParkHandoffRefusalReason = (typeof PARK_HANDOFF_REFUSAL_REASONS)[number];
+
+/**
+ * `rpc.engine.v1.park-handoff` — collect a call parked on ANOTHER engine instance.
+ *
+ * ## RAW NATS ON BOTH ENDS, even though both ends are NestJS
+ *
+ * The other raw family (`rpc.media.v1.*`) is raw because one end is Go. This one is raw for a
+ * different reason, and it is worth stating because "both ends are Nest, so `@MessagePattern` is
+ * fine" is the rule of thumb at the head of this file and this is the exception to it.
+ *
+ * The subject carries an INSTANCE TOKEN — `rpc.engine.v1.park-handoff.<instanceToken>`, built by
+ * `subjectFor.engineParkHandoffRpc`. A Nest `@MessagePattern` is a fixed string decided at class
+ * decoration time, and a `ClientProxy` sends to a pattern rather than to a subject; neither end can
+ * express "the subject depends on which process is answering". The engine already holds a raw
+ * connection (`apps/engine/src/nats/jetstream.service.ts`) and already speaks raw to `mediad`, so
+ * the same transport serves this at no cost.
+ *
+ * ## Why the OWNING instance does the whole media move
+ *
+ * The obvious alternative is a split: the owner puts its parked channel in a bridge and answers
+ * with the bridge id, and the retriever adds its own channel to it. That is tidier on paper and
+ * worse in practice — it needs a SECOND round trip to undo the first when the retriever's half
+ * fails, and until that round trip lands the caller is sitting in a bridge with nobody in it and no
+ * longer in a lot anybody can dial. So the owner does both halves and the request carries the
+ * retriever's channel: one operation, one outcome, and a failure path
+ * ({@link ParkRegistry.restore}, on the owner) that already exists.
+ *
+ * The tradeoff, stated plainly: this works because both engines drive the SAME media server, where
+ * a channel id is meaningful to either of them. Under the ARI driver that is the deployment the
+ * `park-claims` bucket was built for in the first place — several engines behind one Asterisk. The
+ * owner pre-flights the retriever's channel and refuses `unreachable_channel` when it cannot see
+ * it, so the unsupported deployment fails with its own name rather than as a bridge error.
+ *
+ * ## Why the request names the parked channel
+ *
+ * Fencing. The retriever read the claim, and the claim may be stale by the time this arrives —
+ * reaped and re-taken by a different caller. Naming the `mediaChannelId` it expects turns that from
+ * "connected to a stranger" into `claim_superseded`.
+ */
+export const parkHandoffRequestSchema = z.object({
+	/** The tenant. Both legs must belong to it; the owner re-checks rather than trusting it. */
+	orgId: z.uuid(),
+	parkLotId: z.string().min(1).max(128),
+	/** The orbit being collected. */
+	slot: z.int().min(0).max(1_000_000),
+	/** The parked leg the retriever expects to find there. See the fencing note above. */
+	mediaChannelId: z.string().min(1).max(128),
+	/** The instance asking, for the owner's log and for a loop check. */
+	retrieverInstanceId: z.string().min(1).max(128),
+	/** The channel to bridge the parked caller to: the phone that dialled the orbit. */
+	retrieverMediaChannelId: z.string().min(1).max(128),
+	/** The retriever's leg id, which lands on the parked leg's CDR as its peer. */
+	retrieverLegId: z.string().min(1).max(128),
+	/**
+	 * The bridge to build, assigned by the CALLER for the same reason `sessionId` is on the media
+	 * plane: a request whose reply is lost must still name a thing the retriever can identify.
+	 */
+	bridgeId: z.string().min(1).max(128),
+});
+
+export const parkHandoffResponseSchema = z.object({
+	ok: z.boolean(),
+	parkLotId: z.string().max(128),
+	slot: z.int().min(0).max(1_000_000),
+	/** The instance that answered. Always present, including on a refusal, for the retriever's log. */
+	instanceId: z.string().min(1).max(128),
+	/** The bridge both legs are now in. Present exactly when `ok`. */
+	bridgeId: z.string().min(1).max(128).optional(),
+	/** The parked leg's ids, so the retriever can set its own CDR peer and log the pair. */
+	legId: z.string().min(1).max(128).optional(),
+	callId: z.string().min(1).max(128).optional(),
+	/** When the call went into the lot, so the retriever can report how long it waited. */
+	parkedAtMs: z.int().min(0).optional(),
+	reason: parkHandoffRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type ParkHandoffRequest = z.infer<typeof parkHandoffRequestSchema>;
+export type ParkHandoffResponse = z.infer<typeof parkHandoffResponseSchema>;
+
+export const PARK_HANDOFF_RPC = defineRpc(
+	RPC_SUBJECTS.engineParkHandoff,
+	parkHandoffRequestSchema,
+	parkHandoffResponseSchema,
+	// Longer than the media plane's 500 ms, and deliberately so: this is not one socket operation
+	// but a KV release plus three media-server calls on the far side, any of which is an HTTP round
+	// trip under the ARI driver. It is still on a call path — somebody is holding a handset waiting
+	// to be connected — so it is bounded well under the two seconds at which a person assumes the
+	// feature is broken and hangs up.
+	3_000,
+);
+
 /** Every request-reply contract, keyed by subject. */
 export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.routingResolve]: ROUTING_RESOLVE_RPC,
@@ -602,4 +755,5 @@ export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.mediaBridgeSessions]: MEDIA_BRIDGE_SESSIONS_RPC,
 	[RPC_SUBJECTS.mediaUnbridgeSessions]: MEDIA_UNBRIDGE_SESSIONS_RPC,
 	[RPC_SUBJECTS.mediaReleaseSession]: MEDIA_RELEASE_SESSION_RPC,
+	[RPC_SUBJECTS.engineParkHandoff]: PARK_HANDOFF_RPC,
 } as const;

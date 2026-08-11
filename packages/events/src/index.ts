@@ -66,6 +66,7 @@ export {
 	didIndexToken,
 	EVENT_FAMILIES,
 	eventFamilyForSubject,
+	instanceSubjectToken,
 	isCallEvent,
 	isEventName,
 	isQueueEvent,

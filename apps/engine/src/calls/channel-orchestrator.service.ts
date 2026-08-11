@@ -8,6 +8,7 @@ import { isDtmfDigit } from "@optimiq-voice/telephony";
 import { CallEventPublisher } from "../nats/call-event-publisher.service";
 import { JetStreamService } from "../nats/jetstream.service";
 import { CALLS_EFFECT_RUNTIME, ENGINE_ENV, MEDIA_PORT } from "../nats/nats.tokens";
+import { ParkHandoffService } from "../nats/park-handoff.service";
 import { AgentStateStore } from "../queue/agent-state.store";
 import { QueueEventPublisher } from "../queue/queue-event-publisher.service";
 import { QueueMembershipSource } from "../queue/queue-membership.source";
@@ -156,12 +157,14 @@ export class ChannelOrchestrator {
 		private readonly queueCursors: QueueCursors,
 		private readonly parks: ParkRegistry,
 		private readonly callControl: CallControlRegistry,
+		private readonly parkHandoff: ParkHandoffService,
 	) {
 		this.control = new CallControl({
 			media: this.media,
 			signals: this.signals,
 			parks: this.parks,
 			host: this.callControlHost(),
+			parkHandoff: this.parkHandoff,
 			// A getter rather than the runtime itself: `this.midCall` is built from `this.control`, so
 			// it does not exist yet at this point in the constructor.
 			consultationKeys: {
@@ -193,6 +196,21 @@ export class ChannelOrchestrator {
 			port: this.control,
 			legFor: (mediaChannelId) => this.controlledLegFor(mediaChannelId),
 		});
+		// The other end of the same feature: this instance answers for the calls IT has parked. A
+		// drain refuses rather than half-performing one — the retriever is told to look elsewhere,
+		// and the caller rings back to whoever parked them when the lot times out.
+		this.parkHandoff.setHandler(async (request) =>
+			this.draining
+				? {
+						ok: false,
+						parkLotId: request.parkLotId,
+						slot: request.slot,
+						instanceId: this.parks.instanceId,
+						reason: "shutting_down",
+						error: "this instance is draining",
+					}
+				: await this.control.acceptParkHandoff(request),
+		);
 	}
 
 	/** Live legs this instance is handling. `/healthz` and the drain both read it. */

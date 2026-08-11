@@ -25,6 +25,7 @@ import { createHash } from "node:crypto";
  * rpc.media.v1.bridge-sessions
  * rpc.media.v1.unbridge-sessions
  * rpc.media.v1.release-session
+ * rpc.engine.v1.park-handoff.<instanceTok>   engine -> engine; the OWNING instance answers
  * ```
  *
  * The version token (`v1`) is a MAJOR version and is part of the subject, not the payload: a
@@ -70,6 +71,20 @@ export const RPC_SUBJECTS = {
 	mediaBridgeSessions: `rpc.media.${SUBJECT_VERSION}.bridge-sessions`,
 	mediaUnbridgeSessions: `rpc.media.${SUBJECT_VERSION}.unbridge-sessions`,
 	mediaReleaseSession: `rpc.media.${SUBJECT_VERSION}.release-session`,
+	/**
+	 * The engine-to-engine command surface. A PREFIX, not a complete subject.
+	 *
+	 * Every other entry here is a subject any responder may serve, because any instance of the
+	 * responding service can answer. This one cannot be: a parked call lives on ONE engine
+	 * instance's media channel, and only that instance can move it. So the instance's own token is
+	 * appended — see {@link subjectFor.engineParkHandoff} — and the requester addresses the owner
+	 * it read out of the `park-claims` bucket rather than whichever engine answers first.
+	 *
+	 * A queue group on a flat subject would have been the other option and is wrong for the same
+	 * reason: a queue delivers to one member, chosen by the server, and seven times out of eight
+	 * that member is not the one holding the call.
+	 */
+	engineParkHandoff: `rpc.engine.${SUBJECT_VERSION}.park-handoff`,
 } as const;
 
 /**
@@ -293,6 +308,33 @@ export function aorSubjectToken(aor: string): string {
 }
 
 /**
+ * Stable subject token for a service instance id.
+ *
+ * An instance id is whatever the operator (or the container runtime) called the process:
+ * `ENGINE_INSTANCE_ID`, defaulting to `HOSTNAME`. Most of the time that is already one subject
+ * token — `engine`, `engine-2`, `engine-7d9f4c-xk2lp` — and it is returned VERBATIM, because a
+ * subject an operator can read is a subject an operator can `nats sub` while a call is stuck in a
+ * lot. Some of the time it is not: an FQDN hostname carries dots, and a dot is a token separator,
+ * so `engine.eu-west.internal` would silently become four tokens and address a subject nobody
+ * subscribes to.
+ *
+ * So: verbatim when it is a token, and the first 32 hex characters of its SHA-256 when it is not.
+ * Both ends compute it from the same string — the owner from its own configured id, the retriever
+ * from the `instanceId` it read out of the claim — so the two always agree, whichever branch runs.
+ *
+ * @throws {SubjectTokenError} when the id is empty.
+ */
+export function instanceSubjectToken(instanceId: string): string {
+	const normalized = instanceId.trim();
+	if (normalized.length === 0) {
+		throw new SubjectTokenError("instanceId", instanceId);
+	}
+	return TOKEN_PATTERN.test(normalized)
+		? normalized
+		: createHash("sha256").update(normalized).digest("hex").slice(0, 32);
+}
+
+/**
  * Stable key token for a DID, for the `did-index` KV bucket.
  *
  * An E.164 number is stored as `+441632960111` and dialled as `441632960111`, `+441632960111` or
@@ -368,6 +410,16 @@ export const subjectFor = {
 	/** `rpc.sip.v1.credential` */
 	sipCredentialRpc(): string {
 		return RPC_SUBJECTS.sipCredential;
+	},
+	/**
+	 * `rpc.engine.v1.park-handoff.<instanceToken>` — addressed at ONE engine instance.
+	 *
+	 * The token comes from {@link instanceSubjectToken}, so a responder subscribing with its own
+	 * id and a requester building the subject from the claim's `instanceId` land on the same
+	 * string. See {@link RPC_SUBJECTS.engineParkHandoff} for why this is not a flat subject.
+	 */
+	engineParkHandoffRpc(instanceId: string): string {
+		return `${RPC_SUBJECTS.engineParkHandoff}.${instanceSubjectToken(instanceId)}`;
 	},
 } as const;
 

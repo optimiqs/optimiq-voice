@@ -5,6 +5,7 @@ import {
 	CALL_EVENTS,
 	EVENT_FAMILIES,
 	eventFamilyForSubject,
+	instanceSubjectToken,
 	isCallEvent,
 	isEventName,
 	isQueueEvent,
@@ -52,6 +53,7 @@ describe("subject roots", () => {
 			mediaBridgeSessions: "rpc.media.v1.bridge-sessions",
 			mediaUnbridgeSessions: "rpc.media.v1.unbridge-sessions",
 			mediaReleaseSession: "rpc.media.v1.release-session",
+			engineParkHandoff: "rpc.engine.v1.park-handoff",
 		});
 	});
 
@@ -143,6 +145,44 @@ describe("aorSubjectToken", () => {
 
 	it("rejects an empty AOR", () => {
 		expect(() => aorSubjectToken("   ")).toThrow(SubjectTokenError);
+	});
+});
+
+describe("instanceSubjectToken", () => {
+	it("passes a token-shaped instance id through verbatim, so the subject stays readable", () => {
+		expect(instanceSubjectToken("engine")).toBe("engine");
+		expect(instanceSubjectToken("engine-7d9f4c-xk2lp")).toBe("engine-7d9f4c-xk2lp");
+		expect(instanceSubjectToken("  engine-2  ")).toBe("engine-2");
+	});
+
+	it("hashes an id that could not be one token, so an FQDN hostname does not become four", () => {
+		const token = instanceSubjectToken("engine.eu-west.internal");
+		expect(token).toMatch(/^[0-9a-f]{32}$/);
+		expect(isSubjectToken(token)).toBe(true);
+		expect(instanceSubjectToken("engine.eu-west.internal")).toBe(token);
+	});
+
+	it("separates two instances that differ only by a separator", () => {
+		expect(instanceSubjectToken("engine.a")).not.toBe(instanceSubjectToken("engine-a"));
+	});
+
+	it("rejects an empty instance id", () => {
+		expect(() => instanceSubjectToken("   ")).toThrow(SubjectTokenError);
+	});
+});
+
+describe("subjectFor.engineParkHandoffRpc", () => {
+	it("addresses the owning instance, and both ends build the same subject", () => {
+		expect(subjectFor.engineParkHandoffRpc("engine-2")).toBe("rpc.engine.v1.park-handoff.engine-2");
+		expect(subjectFor.engineParkHandoffRpc("engine.eu-west.internal")).toBe(
+			`${RPC_SUBJECTS.engineParkHandoff}.${instanceSubjectToken("engine.eu-west.internal")}`,
+		);
+	});
+
+	it("is covered by the wildcard an operator would grant or subscribe with", () => {
+		expect(
+			matchesSubject(`${RPC_SUBJECTS.engineParkHandoff}.*`, subjectFor.engineParkHandoffRpc("e1")),
+		).toBe(true);
 	});
 });
 

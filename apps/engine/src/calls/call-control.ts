@@ -8,10 +8,19 @@ import {
 } from "@optimiq-voice/telephony";
 import { legSignalKey, recordingSignalKey } from "../routing/call-signals";
 import { parkSlotFor } from "../routing/park-registry";
+import { parkHandoffRefusal } from "./park-handoff";
 import type { MediaPort } from "../media/media-port";
 import type { CallSignalBus, LegSignal } from "../routing/call-signals";
 import type { ParkedCall, ParkRegistry, ParkResult } from "../routing/park-registry";
-import type { CallEvent, ParkEndReason, PickupKind } from "@optimiq-voice/events";
+import type { ParkHandoffClient } from "./park-handoff";
+import type {
+	CallEvent,
+	ParkEndReason,
+	ParkHandoffRefusalReason,
+	ParkHandoffRequest,
+	ParkHandoffResponse,
+	PickupKind,
+} from "@optimiq-voice/events";
 import type {
 	CallState,
 	ChannelFlag,
@@ -222,6 +231,15 @@ export interface CallControlDependencies {
 	readonly signals: CallSignalBus;
 	readonly parks: ParkRegistry;
 	readonly host: CallControlHost;
+	/**
+	 * The engine-to-engine seam a cross-instance park retrieval goes through.
+	 *
+	 * Optional, and its absence is a supported deployment rather than a degraded one: a single
+	 * engine behind a media server never sees a claim it does not own, so there is nothing to ask
+	 * anybody. Absent, {@link CallControl.unpark} answers a foreign orbit with the same refusal it
+	 * gave before the RPC existed.
+	 */
+	readonly parkHandoff?: ParkHandoffClient;
 	/**
 	 * Where an attended transfer's cancel key is armed and disarmed.
 	 *
@@ -742,6 +760,19 @@ export class CallControl implements CallControlPort {
 	 * The claim is exclusive (see `ParkRegistry.claim`), so two extensions dialling one orbit
 	 * produce one connection and one honest "that call is no longer parked" — never two legs
 	 * bridged to one caller.
+	 *
+	 * ## Three ways this ends, and only the first is local
+	 *
+	 * A park lot is addressed by number from every phone in the building, and the phone that dials
+	 * 401 lands on whichever engine instance is handling ITS call — which is very often not the one
+	 * holding the caller. So:
+	 *
+	 * - the orbit is held HERE → the bridge is built here, below. Untouched, and the fast path.
+	 * - the orbit is held by a LIVE instance → {@link CallControl.unparkFromOwner} asks that
+	 *   instance to hand the call over.
+	 * - the orbit is held by an instance that stopped heartbeating →
+	 *   {@link CallControl.unparkFromDeadOwner} takes the claim and tries to collect the channel it
+	 *   left behind.
 	 */
 	async unpark(leg: ControlledLeg, request: UnparkRequest = {}): Promise<CallControlResult> {
 		const refusal = this.refuseIfUnusable(leg, "unpark");
@@ -763,12 +794,10 @@ export class CallControl implements CallControlPort {
 
 		const claimed = await this.deps.parks.claim(lot.parkLotId, slot, leg.organizationId);
 		if (claimed.kind === "elsewhere") {
-			// The honest answer, and the reason the registry distinguishes it from an empty slot: the
-			// caller IS parked, just not on a leg this process holds. Telling the retriever "nothing is
-			// parked there" would read as "somebody already collected them" and end the search.
-			return refuse(
-				`the call on orbit ${String(slot)} is parked on another engine instance (${claimed.instanceId}) and cannot be retrieved from here yet`,
-			);
+			return await this.unparkFromOwner(leg, slot, claimed.instanceId, claimed.entry);
+		}
+		if (claimed.kind === "stale") {
+			return await this.unparkFromDeadOwner(leg, slot, claimed.instanceId, claimed.entry);
 		}
 		if (claimed.kind !== "claimed") {
 			return refuse(`nothing is parked on orbit ${String(slot)}`);
@@ -832,6 +861,327 @@ export class CallControl implements CallControlPort {
 			mode: "full",
 		});
 		return ok(`retrieved orbit ${String(parked.slot)}`);
+	}
+
+	/**
+	 * Collects a call parked on ANOTHER live engine instance.
+	 *
+	 * ## The owner does the media, and this side only bookkeeps
+	 *
+	 * The request carries this leg's channel and a bridge id, and the owning instance builds the
+	 * whole bridge — stops the hold music, creates the bridge, puts both channels in it. See the
+	 * note on `parkHandoffRequestSchema` for why the work is not split across the two instances: a
+	 * split needs a second round trip to undo the first, and until it lands the caller is out of the
+	 * lot and in a bridge with nobody in it.
+	 *
+	 * What is left here is exactly what only this process can do — move its own leg's state machine
+	 * and record who it ended up talking to.
+	 *
+	 * ## Every failure is the retriever's to report
+	 *
+	 * The owner answers every request it dislikes, including the ones that mean "you were too late".
+	 * A SILENCE is different in kind: it means the owner died between the claim read and now, and
+	 * this leg is told the call could not be reached rather than that it is gone — because it may
+	 * well not be, and the next attempt takes the stale-owner path instead.
+	 */
+	private async unparkFromOwner(
+		leg: ControlledLeg,
+		slot: number,
+		ownerInstanceId: string,
+		parked: ParkedCall,
+	): Promise<CallControlResult> {
+		const client = this.deps.parkHandoff;
+		if (client === undefined) {
+			// No handoff transport wired: a single-instance deployment, or a spec. The honest answer
+			// is the one this method replaced, and it is still the honest answer.
+			return refuse(
+				`the call on orbit ${String(slot)} is parked on another engine instance (${ownerInstanceId}) and cannot be retrieved from here`,
+			);
+		}
+
+		const bridgeId = this.newId();
+		let response: ParkHandoffResponse;
+		try {
+			response = await client.handoff(ownerInstanceId, {
+				orgId: leg.organizationId,
+				parkLotId: parked.parkLotId,
+				slot,
+				mediaChannelId: parked.mediaChannelId,
+				retrieverInstanceId: this.deps.parks.instanceId,
+				retrieverMediaChannelId: leg.mediaChannelId,
+				retrieverLegId: leg.legId,
+				bridgeId,
+			});
+		} catch (error) {
+			this.log("a park handoff got no answer", {
+				parkLotId: parked.parkLotId,
+				slot,
+				ownerInstanceId,
+				err: String(error),
+			});
+			return refuse(
+				`the engine holding orbit ${String(slot)} (${ownerInstanceId}) did not answer; the call could not be retrieved`,
+			);
+		}
+
+		if (!response.ok) {
+			this.log("a park handoff was refused", {
+				parkLotId: parked.parkLotId,
+				slot,
+				ownerInstanceId,
+				reason: response.reason,
+			});
+			return refuse(parkHandoffRefusal(slot, response.reason, response.error));
+		}
+
+		this.adoptHandedOffCall(leg, response.bridgeId ?? bridgeId, response.legId);
+		await this.publishQuietly(leg, "channel.bridged", {
+			legId: leg.legId,
+			...(response.legId === undefined ? {} : { peerLegId: response.legId }),
+			bridgeId: response.bridgeId ?? bridgeId,
+			mode: "full",
+		});
+		return ok(`retrieved orbit ${String(slot)} from ${ownerInstanceId}`);
+	}
+
+	/**
+	 * Collects a call whose owning instance stopped heartbeating.
+	 *
+	 * ## Why this is attempted at all, rather than reported as an empty slot
+	 *
+	 * Because the caller may still be there. An engine that died did not hang up the channels it was
+	 * holding — under the ARI driver those channels belong to the media server, and a call parked
+	 * with hold music goes on playing hold music to somebody who is still waiting to be collected.
+	 * Answering "nothing is parked on 401" to the colleague who was told to pick it up abandons a
+	 * live caller on the say-so of a missed heartbeat.
+	 *
+	 * ## What makes it safe
+	 *
+	 * Two things, in order. The claim is won with a compare-and-set first, so of two extensions
+	 * dialling a dead instance's orbit exactly one proceeds. Then the channel is PROVED to exist on
+	 * this instance's media server before anything is moved — which is also the check that keeps
+	 * this honest across media servers: an engine behind a different Asterisk cannot see the channel
+	 * and refuses, rather than building a bridge with one live participant.
+	 *
+	 * ## What is deliberately not done
+	 *
+	 * This instance does not adopt the orphan channel as a leg. It has no aggregate, no CDR and no
+	 * state machine for it, and inventing one would file a second billing record for a call another
+	 * instance already opened. The channel is bridged, the orbit is freed, and the pair is reported
+	 * on the retriever's own leg — which is the leg that has a CDR to carry it.
+	 */
+	private async unparkFromDeadOwner(
+		leg: ControlledLeg,
+		slot: number,
+		deadInstanceId: string,
+		parked: ParkedCall,
+	): Promise<CallControlResult> {
+		if (!(await this.deps.parks.takeOverStale(parked))) {
+			// Renewed, re-taken, or collected by whoever raced us here.
+			return refuse(`nothing is parked on orbit ${String(slot)}`);
+		}
+
+		let reachable = false;
+		try {
+			reachable = await this.deps.media.channelExists(parked.mediaChannelId);
+		} catch {
+			reachable = false;
+		}
+		if (!reachable) {
+			// The dead instance took the call with it, or it is on a media server this one cannot
+			// see. Either way the orbit is holding nobody, so it is freed rather than left to expire.
+			await this.deps.parks.discard(parked.organizationId, parked.parkLotId, slot);
+			return refuse(
+				`the call on orbit ${String(slot)} was parked by an engine that has gone (${deadInstanceId}) and is no longer reachable`,
+			);
+		}
+
+		const bridgeId = this.newId();
+		try {
+			await this.deps.media.stopMusicOnHold(parked.mediaChannelId);
+			await this.deps.media.createBridge({ bridgeId, name: `unpark-${parked.callId}` });
+			await this.deps.media.addToBridge(bridgeId, [leg.mediaChannelId, parked.mediaChannelId]);
+		} catch (error) {
+			// No `restore` here, unlike the local path: restoring means putting the call back under a
+			// claim this instance would then have to heartbeat for a leg it does not hold. The claim
+			// is dropped instead, which leaves the channel exactly as the dead instance left it and
+			// the orbit free for the next park.
+			await this.deps.parks.discard(parked.organizationId, parked.parkLotId, slot);
+			return refuse(`the parked call could not be connected: ${String(error)}`);
+		}
+
+		await this.deps.parks.discard(parked.organizationId, parked.parkLotId, slot);
+		this.adoptHandedOffCall(leg, bridgeId, parked.legId);
+		this.log("collected a call from an engine that stopped heartbeating", {
+			parkLotId: parked.parkLotId,
+			slot,
+			deadInstanceId,
+			mediaChannelId: parked.mediaChannelId,
+		});
+		await this.publishQuietly(leg, "channel.bridged", {
+			legId: leg.legId,
+			peerLegId: parked.legId,
+			bridgeId,
+			mode: "full",
+		});
+		return ok(`retrieved orbit ${String(slot)} from ${deadInstanceId}`);
+	}
+
+	/**
+	 * Answers `rpc.engine.v1.park-handoff`: hands a call THIS instance has parked to another one.
+	 *
+	 * ## Guard first, then claim, then move — and never the other way round
+	 *
+	 * Every check that can be made without disturbing anything is made before the park is taken out
+	 * of the registry: the orbit is held here, it is held by the channel the requester named, it
+	 * belongs to the requester's tenant, its leg is alive, and the requester's own channel is
+	 * visible to this media server. A refusal at any of those leaves the caller exactly where they
+	 * were, still collectable by the next person to dial the orbit.
+	 *
+	 * The claim is only released once all of that holds, and the release is what settles the race
+	 * against a LOCAL retrieval happening at the same instant — `ParkRegistry.claim` removes before
+	 * it returns, so one of the two gets the entry and the other gets `not_parked`.
+	 *
+	 * ## Never throws
+	 *
+	 * The caller is a NATS subscription handler. An unhandled rejection there ends the subscription
+	 * and this instance stops answering handoffs for every parked call it holds, silently, until
+	 * somebody notices calls stuck in lots.
+	 */
+	async acceptParkHandoff(request: ParkHandoffRequest): Promise<ParkHandoffResponse> {
+		const base = {
+			parkLotId: request.parkLotId,
+			slot: request.slot,
+			instanceId: this.deps.parks.instanceId,
+		} as const;
+		const deny = (reason: ParkHandoffRefusalReason, error?: string): ParkHandoffResponse => ({
+			...base,
+			ok: false,
+			reason,
+			...(error === undefined ? {} : { error }),
+		});
+
+		try {
+			const occupant = this.deps.parks.at(request.parkLotId, request.slot);
+			if (occupant === undefined) {
+				return deny("not_parked", "this instance holds no park on that orbit");
+			}
+			if (occupant.organizationId !== request.orgId) {
+				// A cross-tenant request. Answered as though the orbit were empty on purpose: the
+				// requester learns nothing about another organization's lot, and there is no honest
+				// sense in which the call it asked for is there.
+				return deny("not_parked", "this instance holds no park on that orbit");
+			}
+			if (occupant.mediaChannelId !== request.mediaChannelId) {
+				return deny(
+					"claim_superseded",
+					"the orbit holds a different call than the one the request named",
+				);
+			}
+
+			const parkedLeg = this.deps.host.legFor(occupant.mediaChannelId);
+			if (parkedLeg === undefined || parkedLeg.isTearingDown) {
+				return deny("channel_gone", "the parked leg has gone");
+			}
+
+			let reachable = false;
+			try {
+				reachable = await this.deps.media.channelExists(request.retrieverMediaChannelId);
+			} catch (error) {
+				return deny("internal", `the retriever's channel could not be checked: ${String(error)}`);
+			}
+			if (!reachable) {
+				return deny(
+					"unreachable_channel",
+					"this instance's media server does not know the retriever's channel",
+				);
+			}
+
+			const claimed = await this.deps.parks.claim(request.parkLotId, request.slot, request.orgId);
+			if (claimed.kind !== "claimed") {
+				return deny("not_parked", "the call was collected while the handoff was in flight");
+			}
+			const parked = claimed.entry;
+
+			this.transitionPark(parked.mediaChannelId, "retrieving");
+			this.cancelParkTimeout(parked.mediaChannelId);
+
+			try {
+				await this.deps.media.stopMusicOnHold(parked.mediaChannelId);
+				await this.deps.media.createBridge({
+					bridgeId: request.bridgeId,
+					name: `unpark-${parked.callId}`,
+				});
+				await this.deps.media.addToBridge(request.bridgeId, [
+					parked.mediaChannelId,
+					request.retrieverMediaChannelId,
+				]);
+			} catch (error) {
+				// Same recovery as a local retrieval: back in the orbit, music on, still collectable.
+				if (await this.deps.parks.restore(parked)) {
+					this.transitionPark(parked.mediaChannelId, "parked");
+					await this.deps.media
+						.startMusicOnHold(parked.mediaChannelId, parked.mohClass)
+						.catch(() => undefined);
+				}
+				return deny("media_failed", String(error));
+			}
+
+			this.transitionPark(parked.mediaChannelId, "retrieved");
+			this.parkStates.delete(parked.mediaChannelId);
+
+			parkedLeg.removeFlag("park");
+			parkedLeg.setBridge(request.bridgeId);
+			parkedLeg.moveTo("exchanging-media");
+			parkedLeg.moveCallStateTo("unheld");
+			parkedLeg.moveCallStateTo("active");
+			parkedLeg.setBridgePeer(request.retrieverLegId);
+
+			await this.publishQuietly(parkedLeg, "call.unparked", {
+				legId: parkedLeg.legId,
+				parkLotId: parked.parkLotId,
+				slot: String(parked.slot),
+				reason: "retrieved" satisfies ParkEndReason,
+				retrievedByLegId: request.retrieverLegId,
+				durationMs: Math.max(0, this.now() - parked.parkedAtMs),
+			});
+			this.log("handed a parked call to another engine instance", {
+				parkLotId: parked.parkLotId,
+				slot: parked.slot,
+				retrieverInstanceId: request.retrieverInstanceId,
+			});
+
+			return {
+				...base,
+				ok: true,
+				bridgeId: request.bridgeId,
+				legId: parkedLeg.legId,
+				callId: parked.callId,
+				parkedAtMs: parked.parkedAtMs,
+			};
+		} catch (error) {
+			return deny("internal", String(error));
+		}
+	}
+
+	/**
+	 * Puts this leg into a bridge somebody else built.
+	 *
+	 * Both cross-instance paths end here, and neither of them touches the parked leg's state —
+	 * that leg belongs to another process (or, for a dead owner, to no process at all). The peer
+	 * link is therefore recorded in ONE direction, which is the honest half: this leg's CDR names
+	 * who it was connected to, and the other leg's CDR is the owning instance's to write.
+	 */
+	private adoptHandedOffCall(
+		leg: ControlledLeg,
+		bridgeId: string,
+		peerLegId: string | undefined,
+	): void {
+		leg.setBridge(bridgeId);
+		leg.moveTo("exchanging-media");
+		if (peerLegId !== undefined) {
+			leg.setBridgePeer(peerLegId);
+		}
 	}
 
 	// -------------------------------------------------------------------------------------------

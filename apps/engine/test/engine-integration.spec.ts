@@ -15,6 +15,8 @@ import {
 	DID_INDEX_KV,
 	ensureKvBuckets,
 	kvKeyFor,
+	PARK_CLAIMS_KV,
+	parkClaimSchema,
 	QUEUE_MEMBERSHIP_KV,
 	ROUTING_CACHE_KV,
 	parseSubject,
@@ -24,10 +26,20 @@ import {
 } from "@optimiq-voice/events";
 import { ROUTING_ARTIFACT_VERSION, routingCacheKey } from "@optimiq-voice/routing";
 import { AppModule } from "../src/app.module";
+import { CallControl } from "../src/calls/call-control";
 import { callIdForAriChannel, legIdForAriChannel } from "../src/calls/channel-identity";
 import { ChannelOrchestrator } from "../src/calls/channel-orchestrator.service";
+import { ParkHandoffError } from "../src/calls/park-handoff";
 import { AriConnectionService } from "../src/media/ari-connection.service";
-import type { AnyEventEnvelope } from "@optimiq-voice/events";
+import { makeFakeMediaPort } from "../src/media/media-port.fake";
+import { KvClaimBucket } from "../src/nats/claim-store";
+import { ParkHandoffService } from "../src/nats/park-handoff.service";
+import { CallSignalBus } from "../src/routing/call-signals";
+import { ParkRegistry } from "../src/routing/park-registry";
+import type { CallControlHost, ControlledLeg, ParkLot } from "../src/calls/call-control";
+import type { EngineEnv } from "../src/config/engine-env";
+import type { JetStreamService } from "../src/nats/jetstream.service";
+import type { AnyEventEnvelope, ParkClaim } from "@optimiq-voice/events";
 import type { PlanNode, RoutingArtifact } from "@optimiq-voice/routing";
 import type { ChannelSnapshot } from "@optimiq-voice/telephony";
 
@@ -1092,6 +1104,83 @@ suite("engine end-to-end", () => {
 		expect(bLeg?.destinationRef).toBe(EXTENSION_ID);
 	}, 180_000);
 
+	it("hands a call parked on one engine instance to a retriever on another", async () => {
+		// Two simulated engines against the LIVE broker: two connections, two `park-claims` views,
+		// two registries, two handoff responders. What the unit specs cannot prove is exactly what
+		// is proved here — that the claim one process writes is the claim the other reads, and that
+		// the request reaches the OWNER's subject rather than whichever instance answers first.
+		const owner = await parkInstance(natsUrl, "engine-it-owner");
+		const collector = await parkInstance(natsUrl, "engine-it-collector");
+
+		try {
+			const caller = itLeg("park-it-caller");
+			const retriever = itLeg("park-it-retriever");
+			owner.legs.set(caller.mediaChannelId, caller);
+			collector.legs.set(retriever.mediaChannelId, retriever);
+			const parked = await owner.control.park(caller);
+			expect(parked.result.ok).toBe(true);
+			expect(parked.slot).toBe(PARK_IT_LOT.slotStart);
+
+			// The collector has no leg, no channel and no local entry for that orbit. All it has is
+			// the claim, and the claim names the owner.
+			const seen = await collector.parks.claim(
+				PARK_IT_LOT.parkLotId,
+				PARK_IT_LOT.slotStart,
+				ORG_ID,
+			);
+			expect(seen).toMatchObject({ kind: "elsewhere", instanceId: "engine-it-owner" });
+
+			const result = await collector.control.unpark(retriever, {
+				orbit: String(PARK_IT_LOT.slotStart),
+			});
+
+			expect(result).toEqual({
+				ok: true,
+				detail: `retrieved orbit ${String(PARK_IT_LOT.slotStart)} from engine-it-owner`,
+			});
+			// The owner moved the media; the collector moved nothing but its own leg's state.
+			expect(owner.media.methods()).toEqual([
+				"startMusicOnHold",
+				"stopMusicOnHold",
+				"createBridge",
+				"addToBridge",
+			]);
+			expect(collector.media.methods()).toEqual([]);
+			expect(retriever.bridgeId).toBe(caller.bridgeId);
+			// And the orbit is free again in the shared bucket, not merely in one process's map.
+			expect(owner.parks.at(PARK_IT_LOT.parkLotId, PARK_IT_LOT.slotStart)).toBeUndefined();
+			expect(
+				(await collector.parks.claim(PARK_IT_LOT.parkLotId, PARK_IT_LOT.slotStart, ORG_ID)).kind,
+			).toBe("absent");
+		} finally {
+			await owner.close();
+			await collector.close();
+		}
+	}, 60_000);
+
+	it("times out rather than being answered by the wrong instance", async () => {
+		// The negative half of the addressing decision. A queue group on a flat subject would have
+		// this request answered by whichever engine was picked; an instance-scoped subject leaves it
+		// unanswered, which is the honest outcome when the instance named is not running.
+		const collector = await parkInstance(natsUrl, "engine-it-lonely");
+		try {
+			await expect(
+				collector.handoffs.handoff("engine-it-nobody-is-home", {
+					orgId: ORG_ID,
+					parkLotId: PARK_IT_LOT.parkLotId,
+					slot: PARK_IT_LOT.slotStart,
+					mediaChannelId: "nothing",
+					retrieverInstanceId: "engine-it-lonely",
+					retrieverMediaChannelId: "nothing-either",
+					retrieverLegId: "leg-nothing",
+					bridgeId: "bridge-nothing",
+				}),
+			).rejects.toThrow(ParkHandoffError);
+		} finally {
+			await collector.close();
+		}
+	}, 60_000);
+
 	it("stops admitting calls once a drain begins", async () => {
 		const orchestrator = app.get(ChannelOrchestrator);
 		await orchestrator.drain(0);
@@ -1103,6 +1192,122 @@ suite("engine end-to-end", () => {
 		expect(body.status).toBe("degraded");
 	}, 30_000);
 });
+
+// ---------------------------------------------------------------------------------------------
+// Cross-instance park retrieval
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The lot the park-handoff scenario uses, kept away from anything the routed calls touch.
+ *
+ * Its own lot id, so the claim key it produces cannot collide with a run of this suite against a
+ * broker that has other state in the `park-claims` bucket.
+ */
+const PARK_IT_LOT: ParkLot = {
+	parkLotId: "0195c0f0-1c2f-7000-8000-0000000000f9",
+	slotStart: 901,
+	slotEnd: 902,
+	timeoutSeconds: 0,
+};
+
+/** A leg with just enough behaviour for the park paths, recording what was done to it. */
+function itLeg(id: string): ControlledLeg & { bridgeId: string | undefined } {
+	const leg = {
+		mediaChannelId: id,
+		legId: `leg-${id}`,
+		callId: `call-${id}`,
+		organizationId: ORG_ID,
+		isTearingDown: false,
+		isAnswered: true,
+		bridgeId: undefined as string | undefined,
+		peerMediaChannelId: undefined,
+		callerIdNumber: `n-${id}`,
+		moveTo: () => true,
+		moveCallStateTo: () => true,
+		setBridge: (bridgeId: string | undefined) => {
+			leg.bridgeId = bridgeId;
+		},
+		setBridgePeer: () => undefined,
+		addFlag: () => undefined,
+		removeFlag: () => undefined,
+		markHangup: () => undefined,
+		detach: () => undefined,
+	};
+	return leg;
+}
+
+/**
+ * One simulated engine instance: its own connection, its own `park-claims` view, its own registry,
+ * its own call control and its own handoff responder.
+ *
+ * Everything except the media server and the leg registry is the REAL production object, on the
+ * real broker. That is the point: a unit spec can prove the two halves of a handoff agree with each
+ * other, and only this can prove they agree through JetStream KV and a NATS subject.
+ */
+async function parkInstance(natsUrl: string, instanceId: string) {
+	const connection = await connect({
+		servers: natsUrl,
+		name: `engine-integration-${instanceId}`,
+		...harnessNatsOptions(),
+	});
+	const manager = await connection.jetstreamManager();
+	await ensureKvBuckets(manager, [PARK_CLAIMS_KV]);
+
+	const parks = new ParkRegistry();
+	parks.bindClaims(
+		new KvClaimBucket<ParkClaim>(
+			await connection.jetstream().views.kv(PARK_CLAIMS_KV.name),
+			parkClaimSchema as never,
+			PARK_CLAIMS_KV.name,
+		),
+		instanceId,
+	);
+
+	const jetstream = {
+		rawConnection: connection,
+		parkClaims: { isConfigured: true },
+	} as unknown as JetStreamService;
+	const handoffs = new ParkHandoffService(
+		{ ENGINE_INSTANCE_ID: instanceId } as EngineEnv,
+		jetstream,
+	);
+
+	const legs = new Map<string, ControlledLeg>();
+	const media = makeFakeMediaPort();
+	const host: CallControlHost = {
+		legFor: (mediaChannelId) => legs.get(mediaChannelId),
+		ringingFor: async () => [],
+		publish: async () => undefined,
+		route: async () => ({ status: "aborted", notes: [] }),
+		parkLotFor: async () => PARK_IT_LOT,
+		parkLotForSlot: async () => PARK_IT_LOT,
+	};
+	const control = new CallControl({
+		media,
+		signals: new CallSignalBus(),
+		parks,
+		host,
+		parkHandoff: handoffs,
+		// No real timers: a park in this scenario is collected within milliseconds, and a pending
+		// `setTimeout` would outlive the test.
+		setTimer: () => ({ cancel: () => undefined }),
+	});
+
+	handoffs.setHandler(async (request) => await control.acceptParkHandoff(request));
+	handoffs.onApplicationBootstrap();
+
+	return {
+		parks,
+		control,
+		handoffs,
+		media,
+		legs,
+		close: async (): Promise<void> => {
+			handoffs.onApplicationShutdown();
+			await connection.close();
+		},
+	};
+}
 
 /** The `callId` token of a `calls.evt.v1.<org>.<call>.<event>` subject. */
 function subjectCallId(subject: string): string {

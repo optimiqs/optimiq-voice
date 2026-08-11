@@ -30,6 +30,7 @@ const (
 	SubjectMediaBridgeSessionsRPC   = "rpc.media.v1.bridge-sessions"
 	SubjectMediaUnbridgeSessionsRPC = "rpc.media.v1.unbridge-sessions"
 	SubjectMediaReleaseSessionRPC   = "rpc.media.v1.release-session"
+	SubjectParkHandoffRPC           = "rpc.engine.v1.park-handoff"
 )
 
 const (
@@ -41,6 +42,7 @@ const (
 	TimeoutMediaBridgeSessionsRPC   = 500 * time.Millisecond
 	TimeoutMediaUnbridgeSessionsRPC = 500 * time.Millisecond
 	TimeoutMediaReleaseSessionRPC   = 500 * time.Millisecond
+	TimeoutParkHandoffRPC           = 3000 * time.Millisecond
 )
 
 // RoutingResolveRequest is the request body of rpc.routing.v1.resolve.
@@ -503,3 +505,67 @@ func (v MediaReleaseSessionResponseReason) Valid() bool {
 }
 
 func (v MediaReleaseSessionResponseReason) String() string { return string(v) }
+
+// ParkHandoffRequest is the request body of rpc.engine.v1.park-handoff.
+type ParkHandoffRequest struct {
+	OrgID                   string `json:"orgId"`
+	ParkLotID               string `json:"parkLotId"`
+	Slot                    int    `json:"slot"`
+	MediaChannelID          string `json:"mediaChannelId"`
+	RetrieverInstanceID     string `json:"retrieverInstanceId"`
+	RetrieverMediaChannelID string `json:"retrieverMediaChannelId"`
+	RetrieverLegID          string `json:"retrieverLegId"`
+	BridgeID                string `json:"bridgeId"`
+}
+
+// ParkHandoffResponse is the reply body of rpc.engine.v1.park-handoff.
+type ParkHandoffResponse struct {
+	Ok         bool                       `json:"ok"`
+	ParkLotID  string                     `json:"parkLotId"`
+	Slot       int                        `json:"slot"`
+	InstanceID string                     `json:"instanceId"`
+	BridgeID   *string                    `json:"bridgeId,omitempty"`
+	LegID      *string                    `json:"legId,omitempty"`
+	CallID     *string                    `json:"callId,omitempty"`
+	ParkedAtMs *int                       `json:"parkedAtMs,omitempty"`
+	Reason     *ParkHandoffResponseReason `json:"reason,omitempty"`
+	Error      *string                    `json:"error,omitempty"`
+}
+
+// ParkHandoffResponseReason is the closed vocabulary of ParkHandoffResponse.reason.
+type ParkHandoffResponseReason string
+
+const (
+	ParkHandoffResponseReasonBadRequest         ParkHandoffResponseReason = "bad_request"
+	ParkHandoffResponseReasonNotParked          ParkHandoffResponseReason = "not_parked"
+	ParkHandoffResponseReasonClaimSuperseded    ParkHandoffResponseReason = "claim_superseded"
+	ParkHandoffResponseReasonChannelGone        ParkHandoffResponseReason = "channel_gone"
+	ParkHandoffResponseReasonUnreachableChannel ParkHandoffResponseReason = "unreachable_channel"
+	ParkHandoffResponseReasonMediaFailed        ParkHandoffResponseReason = "media_failed"
+	ParkHandoffResponseReasonShuttingDown       ParkHandoffResponseReason = "shutting_down"
+	ParkHandoffResponseReasonInternal           ParkHandoffResponseReason = "internal"
+)
+
+// ParkHandoffResponseReasonValues lists every member of the vocabulary, in contract order.
+var ParkHandoffResponseReasonValues = []ParkHandoffResponseReason{
+	ParkHandoffResponseReasonBadRequest,
+	ParkHandoffResponseReasonNotParked,
+	ParkHandoffResponseReasonClaimSuperseded,
+	ParkHandoffResponseReasonChannelGone,
+	ParkHandoffResponseReasonUnreachableChannel,
+	ParkHandoffResponseReasonMediaFailed,
+	ParkHandoffResponseReasonShuttingDown,
+	ParkHandoffResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the ParkHandoffResponseReason vocabulary.
+func (v ParkHandoffResponseReason) Valid() bool {
+	for _, candidate := range ParkHandoffResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v ParkHandoffResponseReason) String() string { return string(v) }

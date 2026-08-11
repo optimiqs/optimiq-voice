@@ -254,7 +254,26 @@ describe("two engine instances on one bucket", () => {
 		const { a, b } = pair();
 		await parkedSlot(a, "c1");
 		const result = await b.claim(LOT_ID, 401, ORG);
-		expect(result).toEqual({ kind: "elsewhere", instanceId: "engine-a" });
+		expect(result.kind).toBe("elsewhere");
+		expect(result).toMatchObject({ instanceId: "engine-a" });
+	});
+
+	it("hands the retriever the whole park, so a handoff can be fenced against the channel", async () => {
+		const { a, b } = pair();
+		await parkedSlot(a, "c1");
+		const result = await b.claim(LOT_ID, 401, ORG);
+		if (result.kind !== "elsewhere") {
+			throw new Error(`expected elsewhere, got ${result.kind}`);
+		}
+		expect(result.entry).toEqual({
+			parkLotId: LOT_ID,
+			slot: 401,
+			mediaChannelId: "c1",
+			legId: "leg-c1",
+			callId: "call-c1",
+			organizationId: ORG,
+			parkedAtMs: 1_000,
+		});
 	});
 
 	it("still answers absent for a slot nobody holds", async () => {
@@ -288,7 +307,7 @@ describe("stale claims", () => {
 		expect(claimAt(bucket, 401).instanceId).toBe("engine-live");
 	});
 
-	it("treats an expired claim as an empty slot for a retriever, not as a call elsewhere", async () => {
+	it("reports an expired claim as stale, naming the instance that went quiet", async () => {
 		let now = NOW;
 		const bucket = new FakeClaimBucket<ParkClaim>();
 		const dead = new ParkRegistry();
@@ -298,7 +317,65 @@ describe("stale claims", () => {
 		now = NOW + CLAIM_LEASE_MS + 1;
 		const live = new ParkRegistry();
 		live.bindClaims(bucket.peer(), "engine-live", () => now);
+		const result = await live.claim(LOT_ID, 401, ORG);
+		if (result.kind !== "stale") {
+			throw new Error(`expected stale, got ${result.kind}`);
+		}
+		expect(result.instanceId).toBe("engine-dead");
+		expect(result.entry.mediaChannelId).toBe("c1");
+	});
+
+	it("lets exactly one retriever win a stale claim, and leaves the loser with nothing", async () => {
+		let now = NOW;
+		const bucket = new FakeClaimBucket<ParkClaim>();
+		const dead = new ParkRegistry();
+		dead.bindClaims(bucket, "engine-dead", () => now);
+		await parkedSlot(dead, "c1");
+
+		now = NOW + CLAIM_LEASE_MS + 1;
+		const first = new ParkRegistry();
+		first.bindClaims(bucket.peer(), "engine-1", () => now);
+		const second = new ParkRegistry();
+		second.bindClaims(bucket.peer(), "engine-2", () => now);
+		const parked = { ...entry("c1"), slot: 401 };
+
+		expect(await first.takeOverStale(parked)).toBe(true);
+		expect(claimAt(bucket, 401).instanceId).toBe("engine-1");
+		// The claim the loser reads is now FRESH and owned by the winner, so it is not takeable.
+		expect(await second.takeOverStale(parked)).toBe(false);
+	});
+
+	it("refuses to take over a claim that is still within its lease", async () => {
+		const bucket = new FakeClaimBucket<ParkClaim>();
+		const owner = new ParkRegistry();
+		owner.bindClaims(bucket, "engine-a", () => NOW);
+		await parkedSlot(owner, "c1");
+
+		const other = new ParkRegistry();
+		other.bindClaims(bucket.peer(), "engine-b", () => NOW + CLAIM_LEASE_MS - 1);
+		expect(await other.takeOverStale({ ...entry("c1"), slot: 401 })).toBe(false);
+		expect(claimAt(bucket, 401).instanceId).toBe("engine-a");
+	});
+
+	it("frees the orbit outright when a taken-over call turns out to be gone", async () => {
+		let now = NOW;
+		const bucket = new FakeClaimBucket<ParkClaim>();
+		const dead = new ParkRegistry();
+		dead.bindClaims(bucket, "engine-dead", () => now);
+		await parkedSlot(dead, "c1");
+
+		now = NOW + CLAIM_LEASE_MS + 1;
+		const live = new ParkRegistry();
+		live.bindClaims(bucket.peer(), "engine-live", () => now);
+		await live.takeOverStale({ ...entry("c1"), slot: 401 });
+		await live.discard(ORG, LOT_ID, 401);
+		expect(bucket.entries.has(kvKeyFor.parkClaim(ORG, LOT_ID, 401))).toBe(false);
 		expect((await live.claim(LOT_ID, 401, ORG)).kind).toBe("absent");
+	});
+
+	it("has no stale claims to take over when claims are local", async () => {
+		const registry = new ParkRegistry();
+		expect(await registry.takeOverStale({ ...entry("c1"), slot: 401 })).toBe(false);
 	});
 
 	it("does not take over a claim that is still within its lease", async () => {

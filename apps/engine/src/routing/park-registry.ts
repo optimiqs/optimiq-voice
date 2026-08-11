@@ -50,13 +50,22 @@ import type { ParkSlotRangeBounds } from "@optimiq-voice/telephony";
  * takes over an expired claim rather than treating it as an occupied slot. Without that, a crash
  * removes orbits from a tenant's lot permanently.
  *
- * ## What is NOT in this wave
+ * ## Cross-instance RETRIEVAL
  *
- * **Cross-instance RETRIEVAL.** A claim is enough to make the SLOT exclusive; it is not enough to
- * bridge a caller whose channel this process does not hold. {@link ParkRegistry.claim} therefore
- * reports `elsewhere` for a slot owned by another instance, and the retriever is told the truth —
- * "that call is parked on another node" — rather than the much worse "nothing is parked there". The
- * media handoff needs an instance-to-instance RPC and is deliberately its own wave.
+ * A claim is enough to make the SLOT exclusive; it is not enough to bridge a caller whose channel
+ * this process does not hold. So {@link ParkRegistry.claim} does not answer with a bare "somebody
+ * else has it" — it answers with WHICH somebody and WHAT they are holding, in three distinct shapes
+ * the retriever recovers from differently:
+ *
+ * - `elsewhere` — a live claim on another instance. The retriever asks that instance to hand the
+ *   call over, over `rpc.engine.v1.park-handoff` (see `apps/engine/src/calls/park-handoff.ts`).
+ * - `stale` — a claim whose owner stopped heartbeating. Nobody can be asked; the retriever wins the
+ *   claim with {@link ParkRegistry.takeOverStale} and decides for itself whether the channel the
+ *   dead instance left behind is still on the media server.
+ * - `absent` — nothing, anywhere.
+ *
+ * This registry stays out of the media entirely: it says who owns what, and `CallControl` moves the
+ * audio.
  */
 
 /** One call sitting in an orbit slot. */
@@ -95,10 +104,24 @@ export type ParkClaimResult =
 	/** Nothing is on that orbit, anywhere. */
 	| { readonly kind: "absent" }
 	/**
-	 * A call IS on that orbit, on another engine instance. Not retrievable from here yet, and
-	 * reported distinctly so the caller can say so rather than claim the slot was empty.
+	 * A call IS on that orbit, on another engine instance whose claim is LIVE.
+	 *
+	 * The entry is reconstructed from the claim record, which is why the record carries the whole
+	 * park and not just a slot number: the retriever needs the parked channel's id to fence its
+	 * handoff request (see `rpc.engine.v1.park-handoff`) against a claim that was reaped and
+	 * re-taken between the read and the request.
 	 */
-	| { readonly kind: "elsewhere"; readonly instanceId: string };
+	| { readonly kind: "elsewhere"; readonly instanceId: string; readonly entry: ParkedCall }
+	/**
+	 * A call was on that orbit and its owner stopped heartbeating.
+	 *
+	 * Distinct from `elsewhere`, because the recoveries are opposite: a live owner is ASKED to hand
+	 * the call over, while a dead one cannot be asked anything and the retriever must decide for
+	 * itself whether the channel it left behind is still there. Distinct from `absent` — which is
+	 * what this used to be — because "the claim is stale" is not the same fact as "nothing was ever
+	 * here", and only one of them has a caller who may still be on hold at the end of it.
+	 */
+	| { readonly kind: "stale"; readonly instanceId: string; readonly entry: ParkedCall };
 
 /**
  * How long a claim is believable without a heartbeat.
@@ -132,7 +155,7 @@ export class ParkRegistry {
 	private readonly claims = new Map<string, HeldClaim>();
 
 	private bucket: ClaimBucket<ParkClaim> = new UnclaimedBucket<ParkClaim>();
-	private instanceId = "engine-local";
+	private instance = "engine-local";
 	private now: () => number = Date.now;
 
 	/**
@@ -149,13 +172,24 @@ export class ParkRegistry {
 		now: () => number = Date.now,
 	): void {
 		this.bucket = bucket;
-		this.instanceId = instanceId;
+		this.instance = instanceId;
 		this.now = now;
 	}
 
 	/** Whether claims are shared. `false` means single-instance, by deployment choice. */
 	get isShared(): boolean {
 		return this.bucket.isConfigured;
+	}
+
+	/**
+	 * This process's identity, as every claim it writes records it.
+	 *
+	 * Read by the cross-instance retrieval path so the requester it puts on the wire and the owner
+	 * a claim names are the same string by construction, rather than by two call sites agreeing to
+	 * read the same environment variable.
+	 */
+	get instanceId(): string {
+		return this.instance;
 	}
 
 	/** Calls parked on this process. `/healthz` and the specs read it. */
@@ -288,12 +322,76 @@ export class ParkRegistry {
 		if (remote === undefined) {
 			return { kind: "absent" };
 		}
+		const entry = entryFromClaim(remote.value);
 		if (isClaimExpired(remote.value, this.now())) {
-			// The owner is gone and so is the call it was holding. Nothing to retrieve, and the claim
-			// is left for the next parker to take over rather than deleted from under a live owner.
-			return { kind: "absent" };
+			// The owner stopped heartbeating. The claim is LEFT in place rather than deleted — a
+			// delete here would race the next parker's `create` — and the retriever is told which
+			// instance went quiet, so it can decide whether the channel that instance left behind is
+			// still reachable. See {@link ParkRegistry.takeOverStale}.
+			return { kind: "stale", instanceId: remote.value.instanceId, entry };
 		}
-		return { kind: "elsewhere", instanceId: remote.value.instanceId };
+		return { kind: "elsewhere", instanceId: remote.value.instanceId, entry };
+	}
+
+	/**
+	 * Wins an EXPIRED claim, so this instance may collect the orphan channel it names.
+	 *
+	 * The compare-and-set is the whole point: two extensions dialling one orbit whose owner died
+	 * both read the same stale claim, and exactly one of them may go on to bridge the caller. The
+	 * loser is told the orbit is empty, which by then it is.
+	 *
+	 * Nothing is recorded locally. A won takeover is not a park — this instance has no leg, no
+	 * aggregate and no CDR for the channel; it has permission to move it, once. The winner
+	 * {@link ParkRegistry.discard}s the key when it is done, either way.
+	 *
+	 * Returns `false` when the claim was renewed, re-taken or removed in between, and when no
+	 * bucket is configured at all (a single-instance deployment has no stale claims by
+	 * construction, so a takeover there would be taking over from itself).
+	 */
+	async takeOverStale(entry: ParkedCall): Promise<boolean> {
+		if (!this.bucket.isConfigured) {
+			return false;
+		}
+		let key: string;
+		try {
+			key = kvKeyFor.parkClaim(entry.organizationId, entry.parkLotId, entry.slot);
+		} catch {
+			return false;
+		}
+		const current = await this.bucket.get(key);
+		const now = this.now();
+		if (current === undefined || !isClaimExpired(current.value, now)) {
+			return false;
+		}
+		const won = await this.bucket.update(key, this.claimRecord(entry, now), current.revision);
+		if (won.kind !== "written") {
+			return false;
+		}
+		this.logger.info(
+			{ key, previousOwner: current.value.instanceId },
+			"took over an expired park claim to retrieve the call it was holding",
+		);
+		return true;
+	}
+
+	/**
+	 * Deletes an orbit's claim outright.
+	 *
+	 * Only the stale-takeover path uses it, and only for a claim it just won: a retrieval that
+	 * bridged the orphan channel must free the orbit, and one that found the channel gone must free
+	 * it too — a slot held by a claim nobody will ever release is an orbit removed from the tenant
+	 * until its lease elapses. Every other release goes through {@link ParkRegistry.claim}, which
+	 * proves local ownership first.
+	 */
+	async discard(organizationId: string, parkLotId: string, slot: number): Promise<void> {
+		if (!this.bucket.isConfigured) {
+			return;
+		}
+		try {
+			await this.bucket.release(kvKeyFor.parkClaim(organizationId, parkLotId, slot));
+		} catch {
+			// A key that could not be deleted is reaped at its expiry, which is what the expiry is for.
+		}
 	}
 
 	/**
@@ -451,7 +549,7 @@ export class ParkRegistry {
 	private claimRecord(entry: ParkedCall, nowMs: number): ParkClaim {
 		return {
 			orgId: entry.organizationId,
-			instanceId: this.instanceId,
+			instanceId: this.instance,
 			claimedAt: entry.parkedAtMs,
 			heartbeatAt: nowMs,
 			expiresAt: nowMs + CLAIM_LEASE_MS,
@@ -491,6 +589,28 @@ export class ParkRegistry {
 		}
 		return entry;
 	}
+}
+
+/**
+ * The park a claim record describes.
+ *
+ * The claim carries every field a {@link ParkedCall} has, for exactly this: an instance that never
+ * held the call must be able to reason about it — to fence a handoff request against the channel it
+ * expects, to report how long the caller waited, and to name the leg on the retriever's CDR.
+ */
+function entryFromClaim(claim: ParkClaim): ParkedCall {
+	return {
+		parkLotId: claim.parkLotId,
+		slot: claim.slot,
+		mediaChannelId: claim.mediaChannelId,
+		legId: claim.legId,
+		callId: claim.callId,
+		organizationId: claim.orgId,
+		parkedAtMs: claim.parkedAtMs,
+		...(claim.parkedByLegId === undefined ? {} : { parkedByLegId: claim.parkedByLegId }),
+		...(claim.parkedByNumber === undefined ? {} : { parkedByNumber: claim.parkedByNumber }),
+		...(claim.mohClass === undefined ? {} : { mohClass: claim.mohClass }),
+	};
 }
 
 /**

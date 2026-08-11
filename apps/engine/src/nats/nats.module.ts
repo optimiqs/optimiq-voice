@@ -6,6 +6,7 @@ import { CallEventPublisher } from "./call-event-publisher.service";
 import { ENVELOPE_ONLY_SERIALIZER } from "./envelope.serializer";
 import { JetStreamService } from "./jetstream.service";
 import { CALL_EVENTS_CLIENT, ENGINE_ENV, ROUTING_RPC_CLIENT } from "./nats.tokens";
+import { ParkHandoffService } from "./park-handoff.service";
 import type { EngineEnv } from "../config/engine-env";
 
 /**
@@ -79,7 +80,8 @@ import type { EngineEnv } from "../config/engine-env";
 		{ provide: ENGINE_ENV, useFactory: () => loadEngineEnv() },
 		JetStreamService,
 		CallEventPublisher,
+		ParkHandoffService,
 	],
-	exports: [ClientsModule, ENGINE_ENV, JetStreamService, CallEventPublisher],
+	exports: [ClientsModule, ENGINE_ENV, JetStreamService, CallEventPublisher, ParkHandoffService],
 })
 export class NatsModule {}

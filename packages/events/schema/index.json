@@ -331,6 +331,14 @@
 			"responseSchema": "rpc/rpc.media.v1.release-session.response.schema.json",
 			"goRequestType": "MediaReleaseSessionRequest",
 			"goResponseType": "MediaReleaseSessionResponse"
+		},
+		{
+			"subject": "rpc.engine.v1.park-handoff",
+			"timeoutMs": 3000,
+			"requestSchema": "rpc/rpc.engine.v1.park-handoff.request.schema.json",
+			"responseSchema": "rpc/rpc.engine.v1.park-handoff.response.schema.json",
+			"goRequestType": "ParkHandoffRequest",
+			"goResponseType": "ParkHandoffResponse"
 		}
 	]
 }

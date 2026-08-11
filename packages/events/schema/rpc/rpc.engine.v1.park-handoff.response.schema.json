@@ -1,0 +1,62 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"ok": {
+			"type": "boolean"
+		},
+		"parkLotId": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"slot": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 1000000
+		},
+		"instanceId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"bridgeId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"legId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"callId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"parkedAtMs": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 9007199254740991
+		},
+		"reason": {
+			"type": "string",
+			"enum": [
+				"bad_request",
+				"not_parked",
+				"claim_superseded",
+				"channel_gone",
+				"unreachable_channel",
+				"media_failed",
+				"shutting_down",
+				"internal"
+			]
+		},
+		"error": {
+			"type": "string",
+			"maxLength": 512
+		}
+	},
+	"required": ["ok", "parkLotId", "slot", "instanceId"],
+	"additionalProperties": false
+}

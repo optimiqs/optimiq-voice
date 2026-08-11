@@ -73,6 +73,15 @@ export interface FakeMediaPortOptions {
 	readonly recordFails?: boolean;
 	/** Makes the music class unavailable, which every hold path has to survive. */
 	readonly musicOnHoldFails?: boolean;
+	/**
+	 * Which channels this media server can see.
+	 *
+	 * Everything, unless a spec narrows it. Narrowing it is how the cross-instance park handoff is
+	 * exercised: an engine behind a DIFFERENT media server cannot see the other side's channel, and
+	 * that is the check standing between "refuse honestly" and "build a bridge with one participant
+	 * in it".
+	 */
+	readonly knowsChannel?: (channelId: string) => boolean;
 }
 
 export interface FakeMediaPort extends MediaPort {
@@ -131,7 +140,8 @@ export function makeFakeMediaPort(options: FakeMediaPortOptions = {}): FakeMedia
 		setVariable: async (_channelId: string, name: string, value: string): Promise<void> => {
 			variables[name] = value;
 		},
-		channelExists: async (): Promise<boolean> => true,
+		channelExists: async (channelId: string): Promise<boolean> =>
+			options.knowsChannel?.(channelId) ?? true,
 		watchChannel: async (channelId: string): Promise<void> => {
 			record("watchChannel", channelId);
 		},
