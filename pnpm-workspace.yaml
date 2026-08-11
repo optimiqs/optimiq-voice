@@ -144,3 +144,13 @@ catalog:
 
 overrides:
   effect: 4.0.0-beta.83
+  # Security floors for vulnerable transitive ranges (Dependabot). Version-scoped so already-safe
+  # instances keep their own resolution. react-router arrives via nuqs; find-my-way 9.6.0 via
+  # @nestjs/platform-fastify's pin; js-yaml/serialize-javascript via mocha+commitlint (dev-only);
+  # esbuild 0.18 via the @esbuild-kit loader inside better-auth's drizzle-kit 0.31, which nothing
+  # here ever executes.
+  "react-router@<7.18.2": "^7.18.2"
+  "find-my-way@<9.7.0": "^9.7.0"
+  "js-yaml@<4.3.1": "^4.3.1"
+  "serialize-javascript@<7.0.5": "^7.0.5"
+  "esbuild@<0.25.0": "^0.25.0"
