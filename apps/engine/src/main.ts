@@ -6,6 +6,7 @@ import { AppModule } from "./app.module";
 import { ChannelOrchestrator } from "./calls/channel-orchestrator.service";
 import { loadEngineEnv } from "./config/engine-env";
 import { AriConnectionService } from "./media/ari-connection.service";
+import { MediadService } from "./media/mediad.service";
 
 /**
  * The engine's bootstrap.
@@ -47,6 +48,7 @@ async function bootstrap(): Promise<void> {
 	logger.info({ port: env.ENGINE_PORT, host: env.ENGINE_HOST }, "engine HTTP listener up");
 
 	const ari = app.get(AriConnectionService);
+	const mediad = app.get(MediadService);
 	const orchestrator = app.get(ChannelOrchestrator);
 
 	ari.setEventHandler((event) => {
@@ -55,8 +57,15 @@ async function bootstrap(): Promise<void> {
 		// `void` is safe rather than a swallowed failure.
 		void orchestrator.handleEvent(event);
 	});
+	mediad.setEventHandler((event) => {
+		void orchestrator.handleEvent(event);
+	});
 
 	await ari.start();
+	// A no-op unless ENGINE_MEDIA_DRIVER=mediad. Without this call the driver's commands go out
+	// and no events ever come back — no teardown, no CDR — which is why it sits beside ari.start()
+	// rather than being left to a module hook: the handler-then-socket order is the same contract.
+	await mediad.start();
 	logger.info({ app: env.ARI_APP }, "engine ready");
 
 	installShutdownHandlers({ app, orchestrator, env, logger });
