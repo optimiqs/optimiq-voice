@@ -76,6 +76,31 @@ describe("queueTabHref", () => {
 	});
 });
 
+describe("the settings area", () => {
+	/**
+	 * `/settings/routing` and `/routing` are different pages with different permissions — the first
+	 * is the organization's compiled-against defaults (`settings.*`), the second is the four tabs of
+	 * rows a call is matched against (`routes.*`). Nesting the settings one under `/settings` is
+	 * what makes `getPagePermissions` inherit the right side of that split by ancestry.
+	 */
+	it("nests every settings tab under the settings page", () => {
+		for (const url of [
+			routes.members,
+			routes.apiKeys,
+			routes.notifications,
+			routes.routingSettings,
+			routes.emergencyAddresses,
+		]) {
+			expect(url.startsWith(`${routes.settings}/`)).toBe(true);
+		}
+	});
+
+	it("keeps the routing settings off the routing page's path", () => {
+		expect(routes.routingSettings).toBe("/settings/routing");
+		expect(routes.routingSettings.startsWith(`${routes.routing}/`)).toBe(false);
+	});
+});
+
 describe("detail routes", () => {
 	/**
 	 * Nested under the list's path, which is what makes `getPagePermissions` inherit the list's

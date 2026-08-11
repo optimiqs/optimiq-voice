@@ -36,6 +36,16 @@ export const routes = {
 	emergencyAddresses: "/settings/emergency-addresses",
 	/** The `notifications` category of the settings cascade — voicemail-to-email and its from-name. */
 	notifications: "/settings/notifications",
+	/**
+	 * The `routing` category of the settings cascade — the eight names the routing compiler reads.
+	 *
+	 * Under `/settings`, not under `/routing`, even though the compiler is what consumes them.
+	 * `/routing` is the four tabs of ROWS a call is matched against and is gated by `routes.*`;
+	 * these are organization-wide defaults gated by `settings.*`, exactly like every other tab of
+	 * the settings area. Putting them on `/routing` would have meant a fifth tab with a different
+	 * permission from the other four.
+	 */
+	routingSettings: "/settings/routing",
 
 	/**
 	 * Detail views, for the four entities that own a child collection.

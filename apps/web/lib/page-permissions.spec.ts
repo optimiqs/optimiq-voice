@@ -98,3 +98,47 @@ describe("canAccessPage", () => {
 		expect(canAccessPage("/some/future/route", [])).toBe(true);
 	});
 });
+
+/**
+ * The two settings-cascade screens.
+ *
+ * Both read `GET …/org-settings/categories/:category`, which `OrgSettingsController` guards with
+ * `settings.read`, and both save through a `PATCH` guarded with `settings.write`. This map's whole
+ * job is to say what the API says — the failure it exists to prevent is a nav tab that is visible
+ * and a page that 403s.
+ */
+describe("the settings cascade screens", () => {
+	it("gates both categories on settings.read", () => {
+		expect(getPagePermissions(routes.notifications)?.permissions).toEqual(["settings.read"]);
+		expect(getPagePermissions(routes.routingSettings)?.permissions).toEqual(["settings.read"]);
+	});
+
+	/**
+	 * NOT `routes.read`. A caller with `routes.read` and no settings grant can edit inbound routes
+	 * all day and still cannot read this category, so naming `routes.read` here would show them a
+	 * tab the API refuses.
+	 */
+	it("does not borrow the routing page's permissions", () => {
+		expect(getPagePermissions(routes.routing)?.permissions).not.toEqual(
+			getPagePermissions(routes.routingSettings)?.permissions,
+		);
+	});
+
+	/**
+	 * The read/write split is deliberate: a role that can see the organization's policy but not
+	 * change it should SEE it, read-only, rather than be told the page does not exist. The page
+	 * gates saving with `RequirePermission permissions={["settings.write"]}`.
+	 */
+	it("lets a plain user read them and an owner write them", () => {
+		const user = resolveRolePermissions("user");
+		const owner = resolveRolePermissions("owner");
+		expect(canAccessPage(routes.routingSettings, user)).toBe(true);
+		expect(user.includes("settings.write")).toBe(false);
+		expect(canAccessPage(routes.routingSettings, owner)).toBe(true);
+		expect(owner.includes("settings.write")).toBe(true);
+	});
+
+	it("refuses a caller with no settings grant at all", () => {
+		expect(canAccessPage(routes.routingSettings, ["routes.read", "routes.publish"])).toBe(false);
+	});
+});

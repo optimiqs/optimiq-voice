@@ -118,6 +118,11 @@ export const queryKeys = {
 	 * `pbx` so an org switch and the coarse PBX sweeps both reach it — `org_setting` is a routing
 	 * input (`affectsRouting("org_setting")` is true), so a settings save recompiles the artifact
 	 * and the compile view has to be invalidated with it.
+	 *
+	 * The category is the last SEGMENT rather than baked into a key per category, and that is what
+	 * keeps `notifications` and `routing` in separate cache entries while a single screen's save can
+	 * still invalidate only its own. Two screens read this today; nothing about the key changes when
+	 * a third category is catalogued.
 	 */
 	orgSettingsCatalog: () => ["pbx", "org-settings-catalog"] as const,
 	orgSettingsCategory: (organizationId: string, category: string) =>

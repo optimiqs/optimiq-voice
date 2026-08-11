@@ -13,6 +13,7 @@ const TABS = [
 	{ title: "Members", url: routes.members },
 	{ title: "API keys", url: routes.apiKeys },
 	{ title: "Notifications", url: routes.notifications },
+	{ title: "Routing", url: routes.routingSettings },
 	{ title: "Emergency", url: routes.emergencyAddresses },
 ] as const;
 

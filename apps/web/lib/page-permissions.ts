@@ -80,6 +80,20 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, PageRequirement>> = {
 	 * not exist.
 	 */
 	[routes.notifications]: { permissions: ["settings.read"] },
+	/**
+	 * The routing settings.
+	 *
+	 * `settings.read`, not `routes.read`, for the reason the route itself lives under `/settings`:
+	 * `OrgSettingsController` guards `GET …/categories/:category` with `settings.read` and `PATCH`
+	 * with `settings.write`, and this map's whole job is to say what the API says. A caller with
+	 * `routes.read` and no settings grant can edit inbound routes all day and still cannot read this
+	 * category — naming `routes.read` here would show them a tab that 403s.
+	 *
+	 * Declared explicitly rather than inherited from `/settings`, which resolves to the same
+	 * requirement today: an inherited answer would silently follow `/settings` if that ever changed,
+	 * and these are the settings a live call is compiled from.
+	 */
+	[routes.routingSettings]: { permissions: ["settings.read"] },
 };
 
 /** True when `path` matches `pattern`, treating any `[segment]` in the pattern as a wildcard. */
