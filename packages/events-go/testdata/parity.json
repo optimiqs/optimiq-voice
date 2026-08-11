@@ -829,7 +829,13 @@
 		"registration": ["registered", "unregistered", "expired"],
 		"queue": ["caller.joined", "caller.answered", "caller.abandoned", "agent.state"],
 		"voicemail": ["message.left", "mwi.updated"],
-		"media": ["session.ended", "session.rtp-timeout", "playback.finished", "recording.finished"]
+		"media": [
+			"session.ended",
+			"session.rtp-timeout",
+			"playback.finished",
+			"recording.finished",
+			"dtmf.received"
+		]
 	},
 	"eventTypes": [
 		{
@@ -996,6 +1002,11 @@
 			"family": "media",
 			"type": "recording.finished",
 			"goType": "MediaRecordingFinishedData"
+		},
+		{
+			"family": "media",
+			"type": "dtmf.received",
+			"goType": "MediaDtmfReceivedData"
 		},
 		{
 			"family": "cdr",

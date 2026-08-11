@@ -266,6 +266,58 @@ func (a *LifecycleAnnouncer) RecordingFinished(
 	}, "recording.finished", session.SessionID)
 }
 
+// DtmfReceived publishes `dtmf.received`.
+//
+// # One event per KEYPRESS, and the de-duplication is below this line
+//
+// RFC 4733 sends a digit as an update packet every 20 ms plus three copies of the END packet, so
+// the packet path decodes and collapses them (see `rtp.dtmfDetector`) and this method is handed the
+// digit. Publishing per packet would put the de-duplication in every consumer, and the first one to
+// get it wrong is a `gather` that fills a four-digit PIN from one press.
+//
+// # Why it is announced at all, when a bridged digit already reaches the far end
+//
+// Because the engine is not the far end. A relayed telephone-event packet is heard by the peer LEG;
+// this event is what tells the ORCHESTRATOR a key was pressed, which is how the confirmation IVR
+// answers "press 1 to accept", how feature codes are collected, and how a `gather` terminates. The
+// two are independent by design: the relay continues untouched while this fires, exactly as ARI
+// raises `ChannelDtmfReceived` on a channel that is happily bridged.
+//
+// It does NOT touch the session directory. A keypress is not a session ending.
+func (a *LifecycleAnnouncer) DtmfReceived(session rtp.SessionSummary, digit rtp.DtmfDigit) {
+	if a.publisher == nil || session.OrgID == "" {
+		return
+	}
+
+	envelope, err := a.envelope(session, contract.EventTypeMediaDtmfReceived)
+	if err != nil {
+		a.log.Warn("cannot build a dtmf.received envelope",
+			"sessionId", session.SessionID, "error", err)
+		return
+	}
+
+	data := contract.MediaDtmfReceivedData{
+		SessionID:  session.SessionID,
+		InstanceID: a.instanceID,
+		CallID:     stringPtr(session.CallID),
+		LegID:      stringPtr(session.LegID),
+		Digit:      digit.Digit,
+		DurationMs: digit.DurationMs,
+	}
+
+	go a.publish(func(ctx context.Context) error {
+		return a.publisher.DtmfReceived(ctx, contract.Envelope[contract.MediaDtmfReceivedData]{
+			ID:      envelope.id,
+			At:      envelope.at,
+			OrgID:   session.OrgID,
+			Subject: envelope.subject,
+			Type:    contract.EventTypeMediaDtmfReceived,
+			Source:  mediaevents.Source,
+			Data:    data,
+		})
+	}, "dtmf.received", session.SessionID)
+}
+
 // envelopeHeader is the three values every envelope needs that are derived rather than copied.
 type envelopeHeader struct {
 	id      string

@@ -42,6 +42,7 @@ type Publisher interface {
 	SessionRTPTimeout(ctx context.Context, envelope contract.Envelope[contract.MediaSessionRTPTimeoutData]) error
 	PlaybackFinished(ctx context.Context, envelope contract.Envelope[contract.MediaPlaybackFinishedData]) error
 	RecordingFinished(ctx context.Context, envelope contract.Envelope[contract.MediaRecordingFinishedData]) error
+	DtmfReceived(ctx context.Context, envelope contract.Envelope[contract.MediaDtmfReceivedData]) error
 }
 
 // JetStreamPublisher publishes into the MEDIA stream.
@@ -92,6 +93,14 @@ func (p *JetStreamPublisher) RecordingFinished(
 	return publish(ctx, p.js, envelope)
 }
 
+// DtmfReceived publishes a `dtmf.received` event.
+func (p *JetStreamPublisher) DtmfReceived(
+	ctx context.Context,
+	envelope contract.Envelope[contract.MediaDtmfReceivedData],
+) error {
+	return publish(ctx, p.js, envelope)
+}
+
 func publish[T any](
 	ctx context.Context,
 	js jetstream.JetStream,
@@ -128,6 +137,7 @@ type RecordingPublisher struct {
 	timedOut   []contract.Envelope[contract.MediaSessionRTPTimeoutData]
 	playbacks  []contract.Envelope[contract.MediaPlaybackFinishedData]
 	recordings []contract.Envelope[contract.MediaRecordingFinishedData]
+	digits     []contract.Envelope[contract.MediaDtmfReceivedData]
 }
 
 var _ Publisher = (*RecordingPublisher)(nil)
@@ -177,6 +187,24 @@ func (p *RecordingPublisher) RecordingFinished(
 	defer p.mu.Unlock()
 	p.recordings = append(p.recordings, envelope)
 	return nil
+}
+
+// DtmfReceived implements Publisher.
+func (p *RecordingPublisher) DtmfReceived(
+	_ context.Context,
+	envelope contract.Envelope[contract.MediaDtmfReceivedData],
+) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.digits = append(p.digits, envelope)
+	return nil
+}
+
+// DtmfEvents returns a copy of the recorded `dtmf.received` events.
+func (p *RecordingPublisher) DtmfEvents() []contract.Envelope[contract.MediaDtmfReceivedData] {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]contract.Envelope[contract.MediaDtmfReceivedData](nil), p.digits...)
 }
 
 // RecordingEvents returns a copy of the recorded `recording.finished` events.

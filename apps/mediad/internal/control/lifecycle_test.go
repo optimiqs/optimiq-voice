@@ -303,3 +303,80 @@ func TestPlaybackFinishedSkipsASessionWithNoOrg(t *testing.T) {
 		t.Error("an event was published on a subject with no org token")
 	}
 }
+
+// One keypress, one event, on the session's own subject.
+//
+// The de-duplication itself lives in the packet path (`rtp.dtmfDetector`); what this asserts is the
+// half the announcer owns — that a detected digit becomes a `dtmf.received` envelope whose subject,
+// org and instance are the ones a consumer keys on, and that the payload carries the digit as a
+// CHARACTER rather than the RFC 4733 event code, because that is what a dialplan compares against.
+func TestDtmfReceivedPublishesOneEventPerKeypress(t *testing.T) {
+	announcer, publisher, _ := newAnnouncer(t)
+
+	announcer.DtmfReceived(summary(), rtp.DtmfDigit{
+		Digit: "#", DurationMs: 120, EndedBy: rtp.DtmfEndedByEndBit,
+	})
+
+	waitFor(t, "the dtmf.received event", func() bool {
+		return len(publisher.DtmfEvents()) == 1
+	})
+	envelope := publisher.DtmfEvents()[0]
+
+	if envelope.Subject != "media.evt.v1."+testOrg+"."+testSession+".dtmf.received" {
+		t.Errorf("subject = %q", envelope.Subject)
+	}
+	if envelope.Source != "mediad" {
+		t.Errorf("source = %q, want mediad", envelope.Source)
+	}
+	if envelope.ID == "" {
+		t.Error("the envelope has no id")
+	}
+	if envelope.Data.Digit != "#" {
+		t.Errorf("digit = %q, want #", envelope.Data.Digit)
+	}
+	if envelope.Data.DurationMs != 120 {
+		t.Errorf("durationMs = %d, want 120", envelope.Data.DurationMs)
+	}
+	if envelope.Data.InstanceID != thisNode {
+		t.Errorf("instanceId = %q, want %q", envelope.Data.InstanceID, thisNode)
+	}
+	if envelope.Data.SessionID != testSession {
+		t.Errorf("sessionId = %q, want %q", envelope.Data.SessionID, testSession)
+	}
+}
+
+// A keypress is not a session ending. Removing the entry here would make the leg uncommandable from
+// a neighbouring instance the moment the caller touched the keypad.
+func TestDtmfReceivedLeavesTheDirectoryAlone(t *testing.T) {
+	announcer, _, dir := newAnnouncer(t)
+	if err := dir.Put(context.Background(), directory.Entry{
+		SessionID:  testSession,
+		InstanceID: thisNode,
+		OrgID:      testOrg,
+		CallID:     testCall,
+		Address:    "203.0.113.10",
+		RTPPort:    30002,
+		RTCPPort:   30003,
+	}); err != nil {
+		t.Fatalf("seeding the directory: %v", err)
+	}
+
+	announcer.DtmfReceived(summary(), rtp.DtmfDigit{Digit: "1", DurationMs: 100})
+
+	if dir.Len() != 1 {
+		t.Error("a keypress removed the session's directory entry")
+	}
+}
+
+func TestDtmfReceivedSkipsASessionWithNoOrg(t *testing.T) {
+	announcer, publisher, _ := newAnnouncer(t)
+	orphan := summary()
+	orphan.OrgID = ""
+
+	announcer.DtmfReceived(orphan, rtp.DtmfDigit{Digit: "1", DurationMs: 100})
+
+	time.Sleep(20 * time.Millisecond)
+	if len(publisher.DtmfEvents()) != 0 {
+		t.Error("an event was published on a subject with no org token")
+	}
+}

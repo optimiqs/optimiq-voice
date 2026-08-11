@@ -103,6 +103,12 @@ type Lifecycle interface {
 	// carry the session id, and a consumer asking "did the prompt play" is reading `playedMs`, not
 	// inferring it from arrival order.
 	PlaybackFinished(session SessionSummary, playback PlaybackSummary)
+	// DtmfReceived is called once per detected KEYPRESS, never once per RFC 4733 packet.
+	//
+	// It fires whether or not the session is bridged — a leg collecting a PIN has no peer — and it
+	// does not stop the packet being relayed to one that does. Called from the session's read
+	// goroutine, so an implementation must not block on anything slower than a channel send.
+	DtmfReceived(session SessionSummary, digit DtmfDigit)
 	// RecordingFinished is called exactly once per started recording, after the file is on disk.
 	//
 	// Unlike PlaybackFinished, the ordering here IS guaranteed: when a session ends under a live
@@ -147,6 +153,8 @@ type Manager struct {
 	lifecycle      Lifecycle
 	// ticker is handed to every session it creates. See ManagerOptions.Ticker.
 	ticker func(time.Duration) (<-chan time.Time, func())
+	// dtmfMaxDigit bounds one detected digit on every session it creates.
+	dtmfMaxDigit time.Duration
 
 	mu       sync.Mutex
 	sessions map[string]*Session
@@ -193,6 +201,9 @@ type ManagerOptions struct {
 	Now func() time.Time
 	// Ticker builds every session's playback pacing clock. Nil is a real 20 ms ticker.
 	Ticker func(time.Duration) (<-chan time.Time, func())
+	// DtmfMaxDigitDuration bounds one DETECTED digit on every session this manager creates. Zero
+	// means DefaultDtmfMaxDigitDuration.
+	DtmfMaxDigitDuration time.Duration
 }
 
 // NewManager builds a Manager.
@@ -214,6 +225,7 @@ func NewManager(opts ManagerOptions) (*Manager, error) {
 		lifecycle:      opts.Lifecycle,
 		now:            opts.Now,
 		ticker:         opts.Ticker,
+		dtmfMaxDigit:   opts.DtmfMaxDigitDuration,
 		sessions:       make(map[string]*Session),
 		bridges:        make(map[string][2]string),
 		playbacks:      make(map[string]string),
@@ -289,6 +301,8 @@ func (m *Manager) Allocate(opts AllocateOptions) (Descriptor, error) {
 		TelephoneEventPayloadType: opts.TelephoneEventPayloadType,
 		Logger:                    m.log,
 		Ticker:                    m.ticker,
+		OnDtmf:                    m.announceDtmf,
+		DtmfMaxDigitDuration:      m.dtmfMaxDigit,
 	})
 	if err != nil {
 		_ = ports.Close()
@@ -365,6 +379,13 @@ func (m *Manager) Release(sessionID string) bool {
 // arrive to a consumer that has already written the CDR and moved on — and the file, which exists
 // and is perfectly good, would never be archived. Waiting is bounded by a flush and a rename.
 func (m *Manager) closeAndAnnounce(session *Session, reason EndReason) {
+	// A digit still open when the leg went away, surfaced before anything else is said about the
+	// session. It is the backstop for a far end that began a tone and stopped sending entirely: the
+	// arrival-driven cutoff never fires because nothing arrives, and the engine tears the leg down on
+	// `session.ended`, so a keypress announced after it would reach a consumer that had already
+	// finished with the call.
+	session.FlushDtmf()
+
 	summary := session.Summary()
 	recording := session.ActiveRecording()
 
@@ -397,6 +418,18 @@ func (m *Manager) awaitRecording(session SessionSummary, recording *Recording) {
 
 // recordingFinaliseTimeout bounds the wait above. See awaitRecording.
 const recordingFinaliseTimeout = 5 * time.Second
+
+// announceDtmf hands one detected keypress to the Lifecycle.
+//
+// Deliberately trivial, and deliberately not indexed by anything: unlike a playback or a recording,
+// a digit has no reference and nothing can be done to it after the fact. It is a fact about a leg,
+// so it needs the leg's summary and nothing else.
+func (m *Manager) announceDtmf(session *Session, digit DtmfDigit) {
+	if m.lifecycle == nil {
+		return
+	}
+	m.lifecycle.DtmfReceived(session.Summary(), digit)
+}
 
 // announceRecording cleans the reference index and tells the Lifecycle, exactly once.
 //

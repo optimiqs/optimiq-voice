@@ -266,6 +266,57 @@ export const mediaRecordingFinishedDataSchema = z.object({
 	detail: z.string().max(512).optional(),
 });
 
+/**
+ * `dtmf.received` — a party pressed a key, and the media plane decoded it.
+ *
+ * ## Exactly one of these per keypress, and that is the whole difficulty
+ *
+ * RFC 4733 sends ONE digit as MANY packets: an update every 20 ms while the tone lasts, then a
+ * final packet carrying the END bit which §2.5.1.4 requires the sender to transmit three times back
+ * to back. A naive detector that published per packet would turn a 100 ms keypress into eight
+ * `dtmf.received` events, and an IVR collecting a four-digit PIN would fill on the first one. So the
+ * de-duplication is `apps/mediad`'s and this event is the DIGIT, not the packet — `mediad` surfaces
+ * it once, at the END bit, and drops the two retransmissions that follow.
+ *
+ * ## Why there is no `dtmf.started`
+ *
+ * The marker bit on the first packet of a digit is a real signal and nothing above this seam could
+ * use it. `MediaPort` has no "a tone began" operation, the ARI path publishes only
+ * `ChannelDtmfReceived` (which Asterisk also raises at the END of the tone), and a consumer handed
+ * both would have to decide which one a `gather` should count. One event per digit is what the
+ * driver being replaced does, and matching it is what lets the confirmation IVR and the feature-code
+ * collector run unchanged on either plane.
+ *
+ * ## Detection is a TAP, not a consumption
+ *
+ * A digit that arrives on a bridged session is still RELAYED to the peer byte for byte — that is
+ * rung 2's DTMF-is-free property and it must survive rung 3's receive half, because the far end of
+ * an attended transfer is entitled to hear the keypress the caller made. The event fires regardless
+ * of whether the session is bridged, exactly as ARI's `ChannelDtmfReceived` fires on a channel
+ * whether or not it is in a bridge.
+ */
+export const mediaDtmfReceivedDataSchema = z.object({
+	...sessionIdentityShape,
+	/**
+	 * The key, as one character: `0`-`9`, `*`, `#`, or `A`-`D`.
+	 *
+	 * A STRING rather than an RFC 4733 event code, because that is the vocabulary every consumer
+	 * already speaks: `MediaPort.sendDtmf` takes characters, `plan-walker`'s `gather` matches
+	 * characters, and the ARI path delivers characters. Handing the engine an integer would make the
+	 * two drivers disagree about a value that is compared against dialplan digits.
+	 */
+	digit: z.string().regex(/^[0-9A-D*#]$/),
+	/**
+	 * How long the tone lasted, in milliseconds, as the SENDER measured it.
+	 *
+	 * Derived from the telephone-event duration field — the digit's own RTP clock — and never from
+	 * the receiver's wall clock, which would fold this network's jitter into a number describing
+	 * somebody's finger. It is the same field `ChannelDtmfReceived.duration_ms` carries, so a
+	 * consumer that thresholds on it behaves the same on both planes.
+	 */
+	durationMs: z.int().min(0),
+});
+
 export const MEDIA_EVENT_DEFINITIONS = {
 	"session.ended": defineEvent("media", "session.ended", mediaSessionEndedDataSchema),
 	"session.rtp-timeout": defineEvent(
@@ -279,6 +330,7 @@ export const MEDIA_EVENT_DEFINITIONS = {
 		"recording.finished",
 		mediaRecordingFinishedDataSchema,
 	),
+	"dtmf.received": defineEvent("media", "dtmf.received", mediaDtmfReceivedDataSchema),
 } as const;
 
 export type MediaEventDefinitions = typeof MEDIA_EVENT_DEFINITIONS;
@@ -297,6 +349,7 @@ export const mediaEventSchema = z.discriminatedUnion("type", [
 	MEDIA_EVENT_DEFINITIONS["session.rtp-timeout"].envelope,
 	MEDIA_EVENT_DEFINITIONS["playback.finished"].envelope,
 	MEDIA_EVENT_DEFINITIONS["recording.finished"].envelope,
+	MEDIA_EVENT_DEFINITIONS["dtmf.received"].envelope,
 ]);
 
 export type MediaEventEnvelope = z.infer<typeof mediaEventSchema>;
@@ -305,6 +358,7 @@ export type MediaSessionEndedData = z.infer<typeof mediaSessionEndedDataSchema>;
 export type MediaSessionRtpTimeoutData = z.infer<typeof mediaSessionRtpTimeoutDataSchema>;
 export type MediaPlaybackFinishedData = z.infer<typeof mediaPlaybackFinishedDataSchema>;
 export type MediaRecordingFinishedData = z.infer<typeof mediaRecordingFinishedDataSchema>;
+export type MediaDtmfReceivedData = z.infer<typeof mediaDtmfReceivedDataSchema>;
 
 /**
  * Input for {@link makeMediaEvent}. The subject is derived from `orgId` and `data.sessionId`, so a

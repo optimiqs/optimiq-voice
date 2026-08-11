@@ -11,9 +11,9 @@ import type { HangupCause } from "@optimiq-voice/telephony";
  * stops at this file. `ari-mapping.ts` translates Asterisk's names; this translates `mediad`'s. The
  * layer above never learns there are two.
  *
- * ## Four events in, three members out
+ * ## Five events in, four members out
  *
- * `mediad` publishes four things and the orchestrator branches on two of them, so the mapping is
+ * `mediad` publishes five things and the orchestrator branches on three of them, so the mapping is
  * not symmetric — and that asymmetry is the interesting part.
  *
  * - `session.ended` becomes `leg-ended`, the member the CDR is written from. It is the only media
@@ -38,6 +38,13 @@ import type { HangupCause } from "@optimiq-voice/telephony";
  *   `RecordingFailed` are distinct ARI events, and the callers branch on the distinction: a failure
  *   means there is no file, so no voicemail message is filed and no recording key lands on the CDR.
  *   Folding them together would make a caller treat a missing file as a zero-length one.
+ * - `dtmf.received` becomes `dtmf-received`, the member `calls/ari-mapping.ts` already produces
+ *   from `ChannelDtmfReceived` — the SAME member, with the same three fields, which is the entire
+ *   point of this rung. The orchestrator's `onDtmf` feeds the `DtmfInbox` that the confirmation
+ *   IVR, the feature-code collector and voicemail's digit terminator all read, and none of them
+ *   changes by a character to run on this driver. The only translation is the one every member on
+ *   this list makes: `sessionId` is the engine's channel id, because under this driver both are the
+ *   same engine-assigned string.
  *
  * Answering `undefined` for an event the engine does not act on is the same contract `toMediaEvent`
  * has, for the same reason: the decision about what to drop belongs to the layer that knows what it
@@ -92,6 +99,18 @@ export function toMediaEventFromMediad(envelope: MediaEventEnvelope): MediaEvent
 			channelId: envelope.data.sessionId,
 			cause: mapped.cause,
 			causeCode: mapped.code,
+		};
+	}
+	if (envelope.type === "dtmf.received") {
+		// One event per KEYPRESS. `mediad` has already collapsed RFC 4733's update packets and the
+		// three END retransmissions into one digit, exactly as Asterisk collapses them before raising
+		// `ChannelDtmfReceived` — so this mapping is a rename and nothing more, and that is the
+		// property the rung was built for: the layer above cannot tell which plane pressed the key.
+		return {
+			type: "dtmf-received",
+			channelId: envelope.data.sessionId,
+			digit: envelope.data.digit,
+			durationMs: envelope.data.durationMs,
 		};
 	}
 	if (envelope.type === "recording.finished") {

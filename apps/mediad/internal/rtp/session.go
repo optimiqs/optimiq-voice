@@ -102,8 +102,18 @@ type Stats struct {
 	// DtmfPacketsSent counts RFC 4733 telephone-event packets this session ORIGINATED. It does not
 	// count relayed ones, which are somebody else's digits passing through and are already in
 	// PacketsSent.
-	DtmfPacketsSent  uint64
-	LastPacketUnixMs int64
+	DtmfPacketsSent uint64
+	// DtmfPacketsReceived counts telephone-event packets that arrived on this session, and
+	// DtmfDigitsReceived counts the keypresses they were de-duplicated into.
+	//
+	// Both, because the RATIO is the diagnostic. RFC 4733 sends one digit as an update every 20 ms
+	// plus three END copies, so a healthy 100 ms keypress is roughly eight packets to one digit; a
+	// pair of numbers that are equal means the de-duplication is not running and an IVR is seeing
+	// every press eight times, which is otherwise only visible as "the menu picks an option before
+	// I finish".
+	DtmfPacketsReceived uint64
+	DtmfDigitsReceived  uint64
+	LastPacketUnixMs    int64
 }
 
 // Session owns one RTP/RTCP port pair for the life of one call leg.
@@ -178,6 +188,14 @@ type Session struct {
 	// its packets into the middle of a digit somebody else is still sending.
 	dtmfMu sync.Mutex
 
+	// dtmfIn is the RECEIVE-side detector: the state machine that turns the several packets of one
+	// RFC 4733 digit back into one keypress. Entirely separate from the two fields above, which
+	// GENERATE digits towards the far end — the two directions share nothing but the payload format.
+	dtmfIn *dtmfDetector
+	// onDtmf is told about each detected digit, on the read goroutine. Set once before the read loop
+	// starts, so it needs no synchronisation of its own.
+	onDtmf func(*Session, DtmfDigit)
+
 	// recording is the file this session's audio is being written to, or nil. Read on the packet
 	// path on both directions; see Recording for what it captures and what it does not.
 	recording atomic.Pointer[Recording]
@@ -223,6 +241,13 @@ type Options struct {
 	// Ticker builds the playback pacing clock, defaulting to time.NewTicker. Tests substitute a
 	// channel they drive by hand.
 	Ticker func(time.Duration) (<-chan time.Time, func())
+	// OnDtmf is called with each digit DETECTED on the receive path, from the read goroutine.
+	//
+	// Optional: a session with none still decodes and de-duplicates, it just tells nobody, which is
+	// what every packet-path unit test wants. The Manager sets it to an announcement.
+	OnDtmf func(*Session, DtmfDigit)
+	// DtmfMaxDigitDuration bounds one detected digit; zero means DefaultDtmfMaxDigitDuration.
+	DtmfMaxDigitDuration time.Duration
 }
 
 // NewSession takes ownership of a port pair.
@@ -271,6 +296,8 @@ func NewSession(opts Options) (*Session, error) {
 		ports:                     opts.Ports,
 		audioPayloadType:          opts.AudioPayloadType,
 		telephoneEventPayloadType: opts.TelephoneEventPayloadType,
+		dtmfIn:                    newDtmfDetector(opts.DtmfMaxDigitDuration),
+		onDtmf:                    opts.OnDtmf,
 		log:                       logger.With("sessionId", opts.ID, "rtpPort", opts.Ports.Port, "ssrc", ssrc),
 		done:                      make(chan struct{}),
 		createdAt:                 time.Now(),
@@ -401,6 +428,13 @@ func (s *Session) handlePacket(raw []byte, from *net.UDPAddr) {
 	if recorder := s.recording.Load(); recorder != nil && packet.PayloadType == s.audioPayloadType {
 		recorder.Received(packet.Payload)
 	}
+
+	// The DTMF tap, and it is a TAP: the packet carries on into the relay below untouched, so a
+	// digit still crosses a bridge byte for byte the way it has since rung 2. Detection ADDS an
+	// event; it never consumes a packet. It is also here rather than inside the relay, for the same
+	// reason the recording tap is: a leg is entitled to have its keypresses noticed whether or not
+	// it has a peer — an IVR collecting a PIN is a session bridged to nothing at all.
+	s.tapDtmf(&packet, now)
 
 	switch s.mode {
 	case ModeEcho:

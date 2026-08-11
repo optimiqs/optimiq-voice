@@ -1,12 +1,12 @@
 # `apps/mediad` — the Go media plane
 
-**Status:** **rungs 1–4 shipped** — SDP offer/answer, bridged G.711 calls with RFC 4733 DTMF,
-WAV file playback with barge-in, DTMF GENERATION, WAV recording of one or both directions, an RTP
-session directory in NATS KV, and a lifecycle event family. The contract is promoted to
-`packages/events` as `rpc.media.v1.*` + `media.evt.v1.*`, and `apps/engine` has a real
-`MediadMediaPort` behind `ENGINE_MEDIA_DRIVER=ari|mediad` (default `ari`). **Asterisk 22 is still
-the media plane for every deployment that has not opted in, and for every rung above 4 in all of
-them — plus DTMF DETECTION, which is rung 3's receive half and is not built.**
+**Status:** **rungs 1–4 shipped, rung 3 now complete on both sides** — SDP offer/answer, bridged
+G.711 calls with RFC 4733 DTMF, WAV file playback with barge-in, DTMF generation AND DETECTION, WAV
+recording of one or both directions, an RTP session directory in NATS KV, and a lifecycle event
+family. The contract is promoted to `packages/events` as `rpc.media.v1.*` + `media.evt.v1.*`, and
+`apps/engine` has a real `MediadMediaPort` behind `ENGINE_MEDIA_DRIVER=ari|mediad` (default `ari`).
+**Asterisk 22 is still the media plane for every deployment that has not opted in, and for every
+rung above 4 in all of them.**
 **Plan refs:** §3.3 (polyglot), §3.4 option E + option table, §3.5 (NATS), PG (parallel Go track), §8 risk 1.
 **Peer:** `apps/sipd` (SIP edge, same track, same idiom).
 
@@ -30,7 +30,9 @@ executor mentions either media server.
 behind the same engine contract as `packages/media-ari`, cut over per capability.
 
 **Rungs 0 through 4 are built.** Rung 1's negotiation half arrived with rung 2, because bridging
-needs SDP; its playback half arrived next; rungs 3 (send) and 4 are this wave. What exists:
+needs SDP; its playback half arrived next; rung 3's send half and rung 4 arrived together; rung 3's
+receive half — detection — is this wave, and it is what completes the ladder up to rung 4. What
+exists:
 
 - a port-pair allocator over a configured range, which **binds** rather than counts;
 - an RTP `Session` that receives, learns its far end from the packets themselves, and can put audio
@@ -39,9 +41,10 @@ needs SDP; its playback half arrived next; rungs 3 (send) and 4 are this wave. W
 - a two-party RELAY, which is what a bridged call is;
 - WAV decoding to G.711, 20 ms packetisation, and a session that sources frames from a file
   instead of a socket — replacing the peer's audio while it plays and resuming the relay after;
-- RFC 4733 digit GENERATION into the send path, under the leg's own negotiated payload type;
+- RFC 4733 digit GENERATION into the send path, under the leg's own negotiated payload type, and
+  DETECTION out of the receive path — one keypress per digit, however many packets carried it;
 - a WAV recorder that tees one direction or sums both, and finalises rather than truncating;
-- a promoted `rpc.media.v1.*` command surface and a `media.evt.v1.*` lifecycle family;
+- a promoted `rpc.media.v1.*` command surface and a five-member `media.evt.v1.*` event family;
 - a NATS KV session directory, so a second instance can route or refuse correctly;
 - a drain that does not leak ports and says on the wire that it cost audio.
 
@@ -67,17 +70,17 @@ in front of the same session model, argued for on its own merits.
 Per §3.4's sequencing rule, cutover is **per capability**, not per service. Asterisk keeps serving
 everything not yet on a proven rung. Each rung is independently revertible by configuration.
 
-| #   | Rung                                | What it adds                                                                               | Why here                                                                                                                        | Gate                                                                                            |
-| --- | ----------------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| 0   | **Substrate** _(done)_              | Port allocation, RTP receive/send, latching, control surface, drain                        | Everything else consumes it                                                                                                     | Unit suite, race-clean                                                                          |
-| 1   | **SDP + one-legged media** _(done)_ | `pion/sdp` offer/answer, real negotiation, `inactive`/`sendrecv`, playback of a file       | The first rung that requires signalling integration; forces the sipd↔mediad boundary (§5) to be real                            | A call answered by mediad hears a prompt; MOS on the prompt                                     |
-| 2   | **Bridged calls** _(done)_          | Two sessions forwarding to each other; the minimal op set in §3.3                          | §3.4's named first cutover. Two-party audio is ~80% of PBX traffic                                                              | Engine integration suite green against mediad; SIPp basic-call; MOS/jitter vs Asterisk baseline |
-| 3   | **DTMF (RFC 4733)** _(send done)_   | GENERATING digits into the send path. Detection out of the receive stream is not built     | IVR, voicemail PINs and attended transfer all break without it. Forwarding was free at rung 2; originating a digit was not      | Every DTMF unit test in the engine passes against mediad                                        |
-| 4   | **Recording** _(done)_              | Tee a session to a WAV file — one direction or both, mixed. No `snoop` primitive: see §6.2 | §3.4's second named rung. A session already IS both directions, so the Asterisk tap channel has nothing to be                   | Byte-comparable recording of a scripted call; retention/S3 path unchanged                       |
-| 5   | **MOH + park/hold**                 | A session sourcing from a loop instead of a peer                                           | Small once rung 1 exists (playback with a different source)                                                                     | Held-call audio; re-INVITE interop                                                              |
-| 6   | **Conference mix-minus**            | N-way mixing, per-participant minus-self                                                   | §3.4's third rung, and the hard one — this is where jambonz/LiveKit spent years. Needs a jitter buffer (§6) to sound acceptable | MOS at 3/5/10 participants; CPU per conference                                                  |
-| 7   | **Opus / G.722 + transcoding**      | Wideband, and the first real DSP                                                           | Deliberately after mixing: a mixer must decode anyway, so the codec layer is cheaper to build once mixing forces it             | Interop matrix; CPU per transcoded leg                                                          |
-| 8   | **T.38**                            | Fax                                                                                        | §3.4 says last, and it is right: fax is a different protocol wearing RTP's clothes, low volume, high fiddliness                 | A real fax round trip                                                                           |
+| #   | Rung                                | What it adds                                                                               | Why here                                                                                                                                                 | Gate                                                                                            |
+| --- | ----------------------------------- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| 0   | **Substrate** _(done)_              | Port allocation, RTP receive/send, latching, control surface, drain                        | Everything else consumes it                                                                                                                              | Unit suite, race-clean                                                                          |
+| 1   | **SDP + one-legged media** _(done)_ | `pion/sdp` offer/answer, real negotiation, `inactive`/`sendrecv`, playback of a file       | The first rung that requires signalling integration; forces the sipd↔mediad boundary (§5) to be real                                                     | A call answered by mediad hears a prompt; MOS on the prompt                                     |
+| 2   | **Bridged calls** _(done)_          | Two sessions forwarding to each other; the minimal op set in §3.3                          | §3.4's named first cutover. Two-party audio is ~80% of PBX traffic                                                                                       | Engine integration suite green against mediad; SIPp basic-call; MOS/jitter vs Asterisk baseline |
+| 3   | **DTMF (RFC 4733)** _(done)_        | GENERATING digits into the send path, and DETECTING them out of the receive path           | IVR, voicemail PINs and attended transfer all break without it. Forwarding was free at rung 2; originating a digit was not, and neither was noticing one | Every DTMF unit test in the engine passes against mediad                                        |
+| 4   | **Recording** _(done)_              | Tee a session to a WAV file — one direction or both, mixed. No `snoop` primitive: see §6.2 | §3.4's second named rung. A session already IS both directions, so the Asterisk tap channel has nothing to be                                            | Byte-comparable recording of a scripted call; retention/S3 path unchanged                       |
+| 5   | **MOH + park/hold**                 | A session sourcing from a loop instead of a peer                                           | Small once rung 1 exists (playback with a different source)                                                                                              | Held-call audio; re-INVITE interop                                                              |
+| 6   | **Conference mix-minus**            | N-way mixing, per-participant minus-self                                                   | §3.4's third rung, and the hard one — this is where jambonz/LiveKit spent years. Needs a jitter buffer (§6) to sound acceptable                          | MOS at 3/5/10 participants; CPU per conference                                                  |
+| 7   | **Opus / G.722 + transcoding**      | Wideband, and the first real DSP                                                           | Deliberately after mixing: a mixer must decode anyway, so the codec layer is cheaper to build once mixing forces it                                      | Interop matrix; CPU per transcoded leg                                                          |
+| 8   | **T.38**                            | Fax                                                                                        | §3.4 says last, and it is right: fax is a different protocol wearing RTP's clothes, low volume, high fiddliness                                          | A real fax round trip                                                                           |
 
 Asterisk is retired (§P6) only after rung 8. `packages/media-ari` and `apps/asterisk` stay until
 then — they are the media plane, not scaffolding to delete early.
@@ -168,8 +171,14 @@ vocabulary permanently in the service built to replace it.
 
 The engine's `ari/` directory was renamed `media/` as part of it (open question 1, §10).
 
-**The asymmetry worth knowing about:** `mediad` publishes two events and the union gains one
-member. `session.ended` becomes `leg-ended` — the member the CDR is written from. `session.rtp-timeout`
+**The asymmetry worth knowing about:** `mediad` publishes five events and three of them map, to
+members that all already existed. `session.ended` becomes `leg-ended` — the member the CDR is
+written from. `recording.finished` splits into `recording-finished` / `recording-failed`.
+`dtmf.received` becomes `dtmf-received`, which `calls/ari-mapping.ts` produces identically from
+`ChannelDtmfReceived` — and that is why rung 3's receive half needed **zero** changes above
+`src/media/`: the confirmation IVR, the feature-code collector and voicemail's digit collection all
+read the orchestrator's `DtmfInbox`, and none of them can tell which plane filled it.
+`session.rtp-timeout`
 maps to NOTHING, because it is the diagnosis that immediately precedes a `session.ended` whose reason
 is `rtp-timeout`, and raising both would tear the leg down twice: once on the warning and once on the
 fact it warned about. The reason survives on the `leg-ended` it caused, which is where a consumer
@@ -291,6 +300,7 @@ this payload could carry one would be shaping the seam around a lookup the media
 | `media.evt.v1.<orgId>.<sessionId>.session.rtp-timeout` | JetStream publish | `MEDIA` |
 | `media.evt.v1.<orgId>.<sessionId>.playback.finished`   | JetStream publish | `MEDIA` |
 | `media.evt.v1.<orgId>.<sessionId>.recording.finished`  | JetStream publish | `MEDIA` |
+| `media.evt.v1.<orgId>.<sessionId>.dtmf.received`       | JetStream publish | `MEDIA` |
 
 **`playback.finished` maps to no `MediaEvent` member, and that is a MIRROR of the ARI path rather
 than a gap.** `MediaPort.play` returns as soon as audio has STARTED — the verb executor says so, and
@@ -570,10 +580,88 @@ keypresses — and synthesising an audible tone into the G.711 stream means writ
 which is the same deferral `tone://` carries at `start-playback`. The engine answers either by
 routing the leg to Asterisk, which has both.
 
-**Detection is NOT built, and the ladder's rung 3 wording covers both halves.** `mediad` relays
-telephone-event payloads without decoding them, so there is no `dtmf.received` event and no
-`dtmf-received` `MediaEvent` from this driver. That is what makes `terminateOn` unimplementable at
-rung 4 (below), and it is the next thing this rung needs.
+### 6.1.1 DTMF detection: one keypress out of many packets (rung 3's receive half)
+
+**A digit is many packets and exactly one event, and that is the whole shape decision.** RFC 4733
+spreads one keypress across an update packet every 20 ms — each carrying the timestamp the digit
+STARTED at and a duration field that grows — followed by an END packet the sender transmits three
+times back to back (§2.5.1.4, the same rule generation obeys above). A detector that published per
+packet would turn a 100 ms press into eight events, and a `gather` collecting a four-digit PIN would
+fill on the first one. So the de-duplication lives in `mediad`, below the wire contract, and
+`media.evt.v1.<org>.<session>.dtmf.received` carries the DIGIT.
+
+**The identity of a digit is its timestamp, not its marker bit.** Every packet of one digit shares
+the start timestamp; the next digit gets a new one. That makes the timestamp a per-digit identity
+that survives everything the network does, and it is why the detector never reads the marker at all:
+the marker is one bit on ONE packet, so a detector keyed on it loses a whole keypress to a single
+lost datagram and loses every keypress from a sender that forgets to set it — which is a real and
+common bug. Interdigit sequencing is therefore free, and "11" is two presses rather than one long
+one without any timer.
+
+**Four ways a digit closes, and exactly one of them can fire per digit** — a single `surfaced` flag
+on the in-flight digit is the gate all four share, so "exactly once" is a property of one line
+rather than of four call sites agreeing:
+
+- **the END bit**, the normal case. The second and third copies find the digit surfaced and are
+  dropped. So does an update packet reordered BEHIND the END, and so does an END that arrived AHEAD
+  of its own updates — the digit is surfaced on whichever packet with that timestamp says it is over.
+- **the next digit.** A new start timestamp closes an unsurfaced predecessor, which is what makes a
+  PIN typed at human speed survive the loss of all three END copies on one of its digits: the next
+  key press recovers it in a few hundred milliseconds rather than at the cutoff.
+- **the max-duration cutoff**, `DefaultDtmfMaxDigitDuration` = 5 s. It is evaluated on ARRIVING
+  packets rather than by a timer per digit: while the leg is sending anything at all — and the audio
+  that resumes the instant a tone ends is the common case — the deadline is met within one frame,
+  with no goroutine and no clock to inject. Five seconds is far longer than any human keypress and
+  comfortably inside the 8.19 s at which the 16-bit duration field wraps at 8 kHz, so a cut-off digit
+  still carries a duration that means what it says.
+- **the session ending.** The backstop for the genuinely degenerate case — a far end that began a
+  tone and stopped sending entirely, so no arrival ever evaluates the cutoff. It is flushed on the
+  teardown path BEFORE `session.ended`, because the engine tears the leg down on that event and a
+  keypress announced after it reaches a consumer that has finished with the call.
+
+**The reordering tolerance is exactly one digit deep, and that is a decision rather than a limit
+nobody measured.** The detector remembers two timestamps: the digit arriving and the one before it.
+A packet reordered anywhere inside its own digit is recognised and dropped, and so is one that
+arrives after the next digit has started. A packet delayed past TWO digit boundaries would be read
+as a third digit — and two digits apart is a tone plus an interdigit gap, on the order of 150–200 ms
+even from a fast typist, which no path a call is still usable on reorders by. Remembering more would
+mean a history whose size is a guess, defending against a network on which the audio has already
+failed.
+
+**Detection is a TAP, not a consumption, and one test asserts both halves.** The packet still goes
+on to the relay, byte for byte, with rung 2's header rewrite renumbering the payload type between
+two legs that negotiated differently — the far end of an attended transfer is entitled to hear the
+key the caller pressed. And the event fires whether or not the session is bridged, exactly as ARI's
+`ChannelDtmfReceived` fires on a channel in no bridge at all: a leg collecting a PIN has no peer, and
+a detector wired into the forwarding path would be silent for precisely the case detection exists
+for. The tap sits next to the recording tap in `handlePacket`, for the same reason.
+
+**`durationMs` is the SENDER's number**, converted from the telephone-event duration field at the
+8 kHz RTP clock, and never a wall clock at this end — that would fold this network's jitter into a
+number describing somebody's finger. A cut-off digit reports the largest duration the sender claimed
+rather than how long we waited. Largest and not latest, because RTP reorders and the field only ever
+grows at the source.
+
+**What is deliberately NOT on the wire:** the reason a digit closed. `mediad` records it
+(`DtmfEndedBy`) for its own logs and tests, because "this keypress arrived without its END packet" is
+the only evidence that an IVR's occasional slow response is the network rather than the IVR. It is
+not in the contract, because the engine does not branch on it and a vocabulary two media planes must
+agree on for nobody's benefit is exactly what §3.2 exists to prevent. There is no `dtmf.started`
+either: the marker bit is a real signal, but `MediaPort` has no operation to hang on it, ARI raises
+nothing equivalent, and a consumer handed both would have to decide which one a `gather` counts.
+
+**Non-keypad events are dropped rather than translated.** RFC 4733 §3.2 codes 0–15 are the sixteen
+DTMF keys; 16 is hook flash and everything above belongs to the tone tables in §4. A `gather`
+matching on a string cannot contain any of them, so inventing a character would be handing the
+dialplan something no rule can match. Lower-case is not emitted either — the value is compared
+against dialplan digits, and two spellings of one key is a feature code that works on some phones.
+
+**`terminateOn` is now implementable, and is deliberately not implemented in this wave.**
+`start-recording` refuses it `not_supported` today because there was no way to see a digit; there now
+is, and closing it is a recorder that stops on a detected digit plus one field threaded through the
+handler. It is named as follow-up (§10 question 10) rather than folded in here, because voicemail —
+the caller that needs it — also needs `beep`, which needs the tone generator §10 question 11 defers,
+so implementing one of the two changes nothing about which plane serves a voicemail.
 
 ### 6.2 Recording: a session is already both directions (rung 4)
 
@@ -650,8 +738,11 @@ written. It also carries `bytes`, which nothing else on this backbone can supply
 
 - **`beep`** needs a tone generator `mediad` does not have. A voicemail whose beep never sounds is a
   caller talking over the tail of the greeting with the first words of every message clipped.
-- **`terminateOn`** needs DTMF DETECTION, which is rung 3's receive half and is not built. A
-  recording that ignored `#` would run to `maxDurationMs` on every voicemail.
+- **`terminateOn`** needed DTMF DETECTION, which rung 3's receive half now provides — so this is the
+  one refusal on the list that is a WIRING gap rather than a missing capability. It is still refused
+  until the recorder is taught to stop on a detected digit (§10 question 10), because a recording
+  that ignored `#` would run to `maxDurationMs` on every voicemail, and answering `ok` while ignoring
+  the argument is the silent failure this design keeps rejecting.
 
 Both are `not_supported` with the capability named, so the engine routes that leg to Asterisk.
 **The practical consequence, stated rather than hidden: `plan-walker`'s voicemail node sends both,
@@ -798,7 +889,61 @@ with the codegen drift gate in `ci.yaml`.
 
 ## 9. What the waves shipped
 
-### 9.1 Rungs 3 and 4 — DTMF generation and recording (this wave)
+### 9.0 Rung 3's receive half — DTMF detection (this wave)
+
+```
+packages/events/
+├── src/subjects.ts               dtmf.received in MEDIA_SESSION_EVENTS
+├── src/schemas/media-events.ts   mediaDtmfReceivedDataSchema — {digit, durationMs, …identity}
+└── scripts/registry.ts           the codegen entry, MediaDtmfReceived
+
+packages/events-go/               regenerated: MediaDtmfReceivedData, EventTypeMediaDtmfReceived,
+                                  registry_gen.go, parity.json
+
+apps/mediad/
+├── internal/rtp/dtmfdetect.go    NEW. The per-session detector: telephone-event parse, the
+│                                 timestamp-keyed digit identity, the surfaced-once gate and its
+│                                 four closes, the one-digit reorder memory, the session tap
+├── internal/rtp/session.go       the receive tap in handlePacket, the OnDtmf hook, two counters
+├── internal/rtp/manager.go       Lifecycle.DtmfReceived, the teardown flush, DtmfMaxDigitDuration
+├── internal/events/events.go     Publisher.DtmfReceived + the recorder
+└── internal/control/lifecycle.go the dtmf.received announcer
+
+apps/engine/src/media/
+└── mediad-event-mapping.ts       dtmf.received -> the EXISTING dtmf-received union member
+```
+
+**Configuration added: none.** The max-digit cutoff is a bound rather than a policy — five seconds
+is outside every real keypress and inside the duration field's own wrap — so it is a constant with a
+`ManagerOptions` override that only the suite uses. An env var would be a knob whose only correct
+value is the default.
+
+**Nothing engine-side either, and that is the result rather than a convenience.** `MediaEvent`
+already had `dtmf-received` with exactly the three fields this event carries, `toMediaEvent` already
+produced it from `ChannelDtmfReceived`, and `channel-orchestrator.service.ts` already dispatched it
+into `onDtmf`. The whole engine change is eleven lines in `mediad-event-mapping.ts`;
+`src/calls/`, `src/routing/` and `src/nats/` are untouched.
+
+**NATS: no permission change, verified rather than assumed.** `apps/mediad`'s publish grant is
+`media.evt.v1.>` — a wildcard chosen precisely because the event token is DOTTED and
+`media.evt.v1.*.*.*` would match none of these — so the fifth event needs nothing, exactly as rung
+1's third and rung 4's fourth did not. (`config/nats.conf`'s comment still says "four
+session-lifecycle events"; the grant is right and the count is one behind.)
+
+**Verified.** `apps/mediad` 321 tests race-clean (up from 307), `go build`/`go vet` clean;
+`packages/events` 289 (up from 285); `packages/events-go` parity green with byte-reproducible
+codegen (generated twice, byte-identical); `apps/engine` 972 unit specs (up from 968), typecheck and
+build clean, and the integration suite 12/12 unchanged on the ARI path. A live round trip against a
+real broker running the repo's real `config/nats.conf` — so the permission grant was exercised, not
+asserted — drove the whole wire on the `mediad` identity with the engine identity as a raw core
+subscriber: two legs allocated over raw NATS with SDP, negotiating telephone-event 96 and 101, then
+bridged; one keypress injected at a test socket as RFC 4733 sends it (five update packets, marker on
+the first, three END copies) produced **all eight packets relayed to the peer** — renumbered 96 → 101,
+timestamps preserved, marker intact, three END copies forwarded — and **exactly one**
+`media.evt.v1.<org>.<sessionA>.dtmf.received` carrying `digit: "4"`, `durationMs: 100`, the instance
+id and the call id.
+
+### 9.1 Rungs 3 and 4 — DTMF generation and recording (the wave before)
 
 ```
 packages/events/
@@ -987,20 +1132,23 @@ a call to it, which needs `apps/sipd`'s proxy — see §10 question 4.
    refusals are the per-capability cutover working exactly as designed; what is missing is the
    caller, not the capability.
 
-10. **NEW: rung 3's receive half — DTMF DETECTION — is not built, and it is what rung 4's
-    `terminateOn` is waiting on.** `mediad` relays telephone-event payloads without decoding them,
-    so there is no `dtmf.received` event and no `dtmf-received` `MediaEvent` from this driver. Every
-    IVR that collects digits therefore still runs on Asterisk. It is the smallest remaining piece of
-    rung 3 and the highest-value next one: the packets already arrive at `handlePacket`, the union
-    member already exists, and the work is a decoder plus one event plus its mapping. Detection also
-    has a shape decision attached that generation did not — RFC 4733 sends a digit as many packets,
-    so a detector has to de-duplicate on the END bit rather than raise an event per packet.
+10. **DTMF DETECTION is built; `terminateOn` is now a WIRING gap rather than a missing capability.**
+    ~~Rung 3's receive half is not built~~ — it is, in §6.1.1: a keypress on any session becomes one
+    `dtmf.received`, mapped into the `dtmf-received` union member the orchestrator already consumed,
+    so the confirmation IVR and feature codes work on this driver unchanged. What is still open is
+    the CALLER: `start-recording` continues to refuse `terminateOn` by name, because refusing an
+    argument is honest and accepting one it ignores is a voicemail that runs to `maxDurationMs` on
+    every message. Closing it is small and local to `mediad` — the recorder gains a terminator set
+    and stops on a matching digit from the detector it now has — and it is deferred because
+    voicemail, the only caller that sends it, also sends `beep`, which needs the tone generator in
+    question 11. Implementing one without the other moves no call off Asterisk.
 
-11. **NEW: there is no tone generator, and two features now name it.** `tone://` at
+11. **There is no tone generator, and two features name it.** `tone://` at
     `start-playback` and `beep` at `start-recording` are the same missing piece. It is small (a sine
     into the leg's companding law, generated once, played through the existing playback path) and it
-    is deferred rather than built because neither caller can use `mediad` for other reasons today —
-    voicemail also needs `terminateOn`. It should arrive with, or just before, DTMF detection.
+    is deferred rather than built because neither caller can use `mediad` for other reasons today.
+    Detection has now landed, so `terminateOn` is a small local change (question 10) and this is the
+    LAST thing standing between voicemail and this driver — which is what makes it the next one.
 
 12. **What does graceful drain mean for a media server?** Unchanged, and now one dependency closer:
     the session directory exists, so an instance can enumerate what it holds and another can find it.
@@ -1016,6 +1164,17 @@ a call to it, which needs `apps/sipd`'s proxy — see §10 question 4.
     `originate` by design, so nothing can drive a whole call through `mediad` until `sipd` terminates
     the dialog and hands the engine an offer. Re-test the post-dial delay of the extra hop when it
     lands; if it is material, the coupling has to be argued for explicitly rather than discovered.
+
+    **DESIGNED, not built: `plans/sipd-invite-design.md`.** §5's answer holds — the engine stays the
+    courier and `sipd` gets no `mediad` client — but the design does require **one change inside
+    `mediad`**, and it is the one this document deliberately deferred. A B-leg has no offer, so
+    `mediaAllocateSessionRequestSchema`'s "v1 ANSWERS offers… generating an offer for a leg the
+    engine is originating arrives with the rung that needs it" is now the rung: `rpc.media.v1.create-offer`
+    and `rpc.media.v1.accept-answer`, symmetric with `allocate-session`, so that `mediad` writes the
+    outbound offer and `sipd` still never picks a codec. That design also supplies what open questions
+    12 and 15 have been waiting on — `rpc.sip.v1.reinvite` is the authenticated re-INVITE a graceful
+    drain needs to MOVE a session, and its slice 1 is the first time a real phone can hear rung 1's
+    prompt. Post-dial delay is question 2 there and is still unmeasured.
 
 14. **RTCP: when?** Still bound and unread. It carries the receiver reports that are the only in-band
     signal of call quality, and §8.4's MOS/jitter gate wants them. It did not block rung 2 — a relay

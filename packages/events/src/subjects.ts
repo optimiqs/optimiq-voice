@@ -15,7 +15,8 @@ import { createHash } from "node:crypto";
  * queue.evt.v1.<orgId>.<queueId>.<event>     event = caller.joined | … | agent.state
  * voicemail.evt.v1.<orgId>.<mailboxId>.<event>  event = message.left | mwi.updated
  * media.evt.v1.<orgId>.<sessionId>.<event>   event = session.ended | session.rtp-timeout |
- *                                                    playback.finished | recording.finished
+ *                                                    playback.finished | recording.finished |
+ *                                                    dtmf.received
  * cdr.leg.v1.<orgId>                         one subject per org; event type is in the envelope
  * audit.evt.v1.<orgId>
  * provision.evt.v1.<orgId>
@@ -263,10 +264,20 @@ export type VoicemailEvent = (typeof VOICEMAIL_EVENTS)[number];
  *   before the bytes are on disk is a truncated recording nobody notices until it is played back,
  *   so this one is emitted after the WAV header has been patched, the file fsynced and renamed
  *   into place.
+ * - `dtmf.received` is one KEYPRESS, and the word "one" is the contract. RFC 4733 spreads a single
+ *   digit over an update packet every 20 ms plus three copies of the END packet, so the
+ *   de-duplication lives in `apps/mediad` and never above it: the engine branches on this the way
+ *   it branches on ARI's `ChannelDtmfReceived`, and a `gather` collecting a four-digit PIN would
+ *   fill on the first keypress if the packets leaked through. It maps to the `dtmf-received` member
+ *   the orchestrator already consumes, which is the whole point — the confirmation IVR and the
+ *   feature-code collector work on either media plane with no change at all.
  *
  * There is deliberately no `session.allocated`, `session.bridged`, `playback.started` or
  * `recording.started`: all four are the successful reply to a command the engine issued and is
- * still holding, so publishing them would be telling the caller something it already knows.
+ * still holding, so publishing them would be telling the caller something it already knows. There
+ * is no `dtmf.started` either, for a nearby reason: the marker bit that begins a digit is real, but
+ * nothing above the seam has an operation to hang on it and the driver being replaced does not
+ * raise one, so a consumer handed both would have to decide which one a `gather` counts.
  *
  * Named `MEDIA_SESSION_EVENTS` rather than `MEDIA_EVENTS`, breaking the `CALL_EVENTS` /
  * `QUEUE_EVENTS` pattern on purpose: `apps/engine` already owns a domain type called `MediaEvent`
@@ -279,6 +290,7 @@ export const MEDIA_SESSION_EVENTS = [
 	"session.rtp-timeout",
 	"playback.finished",
 	"recording.finished",
+	"dtmf.received",
 ] as const;
 export type MediaSessionEvent = (typeof MEDIA_SESSION_EVENTS)[number];
 

@@ -246,6 +246,13 @@
 			"goType": "MediaRecordingFinishedData"
 		},
 		{
+			"family": "media",
+			"type": "dtmf.received",
+			"subject": "media.evt.v1.<orgId>.<sessionId>.dtmf.received",
+			"dataSchema": "events/media.dtmf.received.schema.json",
+			"goType": "MediaDtmfReceivedData"
+		},
+		{
 			"family": "cdr",
 			"type": "cdr.leg.write",
 			"subject": "cdr.leg.v1.<orgId>",

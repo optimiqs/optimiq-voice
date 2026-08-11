@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { makeMediaEvent, MEDIA_RECORDING_END_REASONS } from "./media-events";
+import {
+	makeMediaEvent,
+	mediaDtmfReceivedDataSchema,
+	MEDIA_RECORDING_END_REASONS,
+} from "./media-events";
 import {
 	mediaSendDtmfRequestSchema,
 	mediaSendDtmfResponseSchema,
@@ -196,5 +200,90 @@ describe("media.evt.v1 recording.finished", () => {
 			},
 		});
 		expect(event.data.bytes).toBe(128_044);
+	});
+});
+
+/**
+ * Rung 3's RECEIVE half — the digit a party PRESSED, as opposed to the one `send-dtmf` originates.
+ *
+ * There is no command half to assert here, because detection is not something the engine asks for:
+ * a session decodes what arrives on it, always, and the engine is told. What the contract has to
+ * pin is the unit — ONE keypress, one character — because RFC 4733 puts a single digit on the wire
+ * as an update every 20 ms plus three copies of the END packet, and a payload that let a batch or a
+ * packet through would push the de-duplication into every consumer.
+ */
+describe("media.evt.v1 dtmf.received", () => {
+	it("derives its subject from the session, like every event in the family", () => {
+		const event = makeMediaEvent("dtmf.received", {
+			orgId: ORG,
+			source: "mediad",
+			data: {
+				sessionId: SESSION,
+				instanceId: "mediad-7c9f",
+				callId: CALL,
+				legId: "leg-1",
+				digit: "7",
+				durationMs: 130,
+			},
+		});
+		expect(event.subject).toBe(`media.evt.v1.${ORG}.${SESSION}.dtmf.received`);
+		expect(event.type).toBe("dtmf.received");
+		expect(event.data.digit).toBe("7");
+	});
+
+	it("accepts every key an RFC 4733 keypad can send, and only those", () => {
+		for (const digit of ["0", "5", "9", "*", "#", "A", "B", "C", "D"]) {
+			expect(
+				mediaDtmfReceivedDataSchema.safeParse({
+					sessionId: SESSION,
+					instanceId: "mediad-7c9f",
+					digit,
+					durationMs: 100,
+				}).success,
+			).toBe(true);
+		}
+		// Lower case is refused rather than normalised: the value is compared against dialplan
+		// digits, and two spellings of one key is a feature code that matches on some phones.
+		for (const digit of ["a", "E", "!", ""]) {
+			expect(
+				mediaDtmfReceivedDataSchema.safeParse({
+					sessionId: SESSION,
+					instanceId: "mediad-7c9f",
+					digit,
+					durationMs: 100,
+				}).success,
+			).toBe(false);
+		}
+	});
+
+	it("refuses more than one key in one event", () => {
+		// One event is one PRESS. Letting "12" through would mean a media plane could batch, and a
+		// `gather` counting presses would be short by one for the rest of the collection.
+		expect(
+			mediaDtmfReceivedDataSchema.safeParse({
+				sessionId: SESSION,
+				instanceId: "mediad-7c9f",
+				digit: "12",
+				durationMs: 100,
+			}).success,
+		).toBe(false);
+	});
+
+	it("requires the duration, because a consumer may threshold on it", () => {
+		expect(
+			mediaDtmfReceivedDataSchema.safeParse({
+				sessionId: SESSION,
+				instanceId: "mediad-7c9f",
+				digit: "1",
+			}).success,
+		).toBe(false);
+		expect(
+			mediaDtmfReceivedDataSchema.safeParse({
+				sessionId: SESSION,
+				instanceId: "mediad-7c9f",
+				digit: "1",
+				durationMs: -1,
+			}).success,
+		).toBe(false);
 	});
 });

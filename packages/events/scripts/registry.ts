@@ -243,6 +243,7 @@ export const EVENT_ENTRIES: readonly EventEntry[] = [
 	mediaEntry("session.rtp-timeout", "MediaSessionRTPTimeout"),
 	mediaEntry("playback.finished", "MediaPlaybackFinished"),
 	mediaEntry("recording.finished", "MediaRecordingFinished"),
+	mediaEntry("dtmf.received", "MediaDtmfReceived"),
 
 	{
 		family: "cdr",

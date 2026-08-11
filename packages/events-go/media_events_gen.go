@@ -14,6 +14,7 @@ const (
 	EventTypeMediaSessionRTPTimeout = "session.rtp-timeout"
 	EventTypeMediaPlaybackFinished  = "playback.finished"
 	EventTypeMediaRecordingFinished = "recording.finished"
+	EventTypeMediaDtmfReceived      = "dtmf.received"
 )
 
 // MediaSessionEndedData is the payload of the "session.ended" event.
@@ -199,3 +200,16 @@ func (v MediaRecordingFinishedDirection) Valid() bool {
 }
 
 func (v MediaRecordingFinishedDirection) String() string { return string(v) }
+
+// MediaDtmfReceivedData is the payload of the "dtmf.received" event.
+//
+// Subject: media.evt.v1.<orgId>.<sessionId>.dtmf.received
+// Envelope: Envelope[MediaDtmfReceivedData]
+type MediaDtmfReceivedData struct {
+	SessionID  string  `json:"sessionId"`
+	InstanceID string  `json:"instanceId"`
+	CallID     *string `json:"callId,omitempty"`
+	LegID      *string `json:"legId,omitempty"`
+	Digit      string  `json:"digit"`
+	DurationMs int     `json:"durationMs"`
+}

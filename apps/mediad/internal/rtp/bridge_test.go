@@ -521,6 +521,7 @@ type recordingLifecycle struct {
 	timedOut   []timeoutCall
 	playbacks  []rtp.PlaybackSummary
 	recordings []rtp.RecordingSummary
+	digits     []rtp.DtmfDigit
 }
 
 type endedCall struct {
@@ -555,6 +556,19 @@ func (l *recordingLifecycle) RecordingFinished(_ rtp.SessionSummary, recording r
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.recordings = append(l.recordings, recording)
+}
+
+func (l *recordingLifecycle) DtmfReceived(_ rtp.SessionSummary, digit rtp.DtmfDigit) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.digits = append(l.digits, digit)
+}
+
+// detectedDigits copies out the keypresses the packet path announced.
+func (l *recordingLifecycle) detectedDigits() []rtp.DtmfDigit {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]rtp.DtmfDigit(nil), l.digits...)
 }
 
 // recordingSummaries copies out what the packet path announced about finished recordings.

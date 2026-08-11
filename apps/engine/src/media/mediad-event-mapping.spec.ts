@@ -76,6 +76,21 @@ function recordingFinished(reason: MediaRecordingEndReason = "stopped", detail?:
 	});
 }
 
+function dtmfReceived(digit = "7", durationMs = 130) {
+	return makeMediaEvent("dtmf.received", {
+		orgId: ORG,
+		source: "mediad",
+		data: {
+			sessionId: SESSION,
+			instanceId: "mediad-1",
+			callId: CALL,
+			legId: "leg-1",
+			digit,
+			durationMs,
+		},
+	});
+}
+
 /** A consumer receives JSON, not the object the builder returned. */
 function overTheWire(value: unknown): unknown {
 	return JSON.parse(JSON.stringify(value)) as unknown;
@@ -180,6 +195,34 @@ describe("toMediaEventFromMediad", () => {
 		});
 	});
 
+	/**
+	 * The whole point of rung 3's receive half: this produces the SAME union member, with the same
+	 * three fields, that `calls/ari-mapping.ts` produces from `ChannelDtmfReceived`. The
+	 * confirmation IVR, the feature-code collector and voicemail's digit terminator all read the
+	 * orchestrator's `DtmfInbox`, and none of them can tell which media plane filled it.
+	 */
+	it("turns dtmf.received into the same dtmf-received member the ARI path produces", () => {
+		expect(toMediaEventFromMediad(dtmfReceived())).toEqual({
+			type: "dtmf-received",
+			// mediad's session id IS the engine's channel id under this driver: both are the same
+			// engine-assigned string, so there is no mapping table to lose on a restart.
+			channelId: SESSION,
+			digit: "7",
+			durationMs: 130,
+		});
+	});
+
+	it("carries every key an RFC 4733 keypad can send, as a character", () => {
+		// A character rather than an event code, because that is what a dialplan compares against —
+		// `gather`'s match set and the feature-code table are both strings.
+		for (const digit of ["0", "9", "*", "#", "A", "D"]) {
+			expect(toMediaEventFromMediad(dtmfReceived(digit))).toMatchObject({
+				type: "dtmf-received",
+				digit,
+			});
+		}
+	});
+
 	it("never leaves a failed recording without a reason", () => {
 		// A caller logs this and files no message; an empty string would be a voicemail that vanished
 		// with nothing attached to explain it.
@@ -233,6 +276,29 @@ describe("decodeMediadEvent", () => {
 			expect(decoded.envelope.data.bytes).toBe(64_044);
 			expect(decoded.envelope.data.direction).toBe("both");
 		}
+	});
+
+	it("validates and translates a keypress off the wire", () => {
+		const envelope = dtmfReceived("*", 90);
+		const decoded = decodeMediadEvent(envelope.subject, overTheWire(envelope));
+		expect(decoded?.event).toEqual({
+			type: "dtmf-received",
+			channelId: SESSION,
+			digit: "*",
+			durationMs: 90,
+		});
+	});
+
+	it("refuses a keypress that is not one key", () => {
+		// One event is one PRESS. A payload carrying "12" would mean the media plane had batched two
+		// keys into one event, and a `gather` counting presses would be short by one for the rest of
+		// the collection.
+		const subject = subjectFor.media(ORG, SESSION, "dtmf.received");
+		const envelope = overTheWire(dtmfReceived()) as { data: Record<string, unknown> };
+		envelope.data.digit = "12";
+		expect(decodeMediadEvent(subject, envelope)).toBeUndefined();
+		envelope.data.digit = "E";
+		expect(decodeMediadEvent(subject, envelope)).toBeUndefined();
 	});
 
 	/**
