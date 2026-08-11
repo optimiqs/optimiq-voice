@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { PLAN_NODE_KINDS } from "@optimiq-voice/routing";
-import { planDestinationOf } from "./plan-destination";
+import { planDestinationOf, sameDestination } from "./plan-destination";
 import {
 	extensionNode,
 	hangupNode,
@@ -131,5 +131,51 @@ describe("planDestinationOf", () => {
 			"hangup",
 			"time-condition",
 		]);
+	});
+});
+
+/**
+ * The comparison the walk uses to avoid reporting the same place twice.
+ *
+ * Cheap to get subtly wrong — two queues differ only by their ref, and a comparison on the type
+ * alone would silently stop reporting the second one.
+ */
+describe("sameDestination", () => {
+	it("is true for two readings of the same node", () => {
+		expect(
+			sameDestination(
+				{ destinationType: "queue", destinationRef: "q-1" },
+				{ destinationType: "queue", destinationRef: "q-1" },
+			),
+		).toBe(true);
+	});
+
+	it("distinguishes two rows of the SAME kind", () => {
+		expect(
+			sameDestination(
+				{ destinationType: "queue", destinationRef: "q-1" },
+				{ destinationType: "queue", destinationRef: "q-2" },
+			),
+		).toBe(false);
+	});
+
+	it("distinguishes a ref-less destination from one that names a row", () => {
+		expect(sameDestination({ destinationType: "external" }, { destinationType: "external" })).toBe(
+			true,
+		);
+		expect(
+			sameDestination(
+				{ destinationType: "extension" },
+				{ destinationType: "extension", destinationRef: "ext-1" },
+			),
+		).toBe(false);
+	});
+
+	it("treats the absence of a destination as different from any destination", () => {
+		expect(sameDestination(undefined, { destinationType: "queue", destinationRef: "q-1" })).toBe(
+			false,
+		);
+		// Two absences ARE the same, which is what keeps a walk through nothing but gates quiet.
+		expect(sameDestination(undefined, undefined)).toBe(true);
 	});
 });

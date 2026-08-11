@@ -22,6 +22,7 @@ import {
 } from "./plan-fixtures.fake";
 import { composeCallerId, PlanWalker } from "./plan-walker";
 import type { FakeMediaPortOptions } from "../media/media-port.fake";
+import type { PlanDestination } from "./plan-destination";
 import type {
 	PlanWalkerSettings,
 	VoicemailMailboxSource,
@@ -101,6 +102,7 @@ function harness(options: HarnessOptions = {}) {
 	const states: ChannelState[] = [];
 	/** One ordered list across both ports, so "answered AFTER originate" is directly assertable. */
 	const timeline: string[] = [];
+	const destinations: PlanDestination[] = [];
 	const gathers = [...(options.gathers ?? [])];
 	const failed = new Set<string>(options.failVerbs ?? []);
 
@@ -241,6 +243,12 @@ function harness(options: HarnessOptions = {}) {
 		},
 		settings: { answerTimeoutMs: 200, ...options.settings },
 		peerLegId: (mediaChannelId) => `leg-of-${mediaChannelId}`,
+		onDestination: async (destination) => {
+			// Onto the SAME timeline as the verbs, because the only thing worth asserting about this
+			// hook is when it fires relative to the node that reported it.
+			timeline.push(`destination:${destination.destinationType}`);
+			destinations.push(destination);
+		},
 		...(options.voicemail === undefined ? {} : { voicemail: options.voicemail }),
 		...(options.mailbox === undefined ? {} : { mailbox: options.mailbox }),
 		newId: () => {
@@ -251,7 +259,18 @@ function harness(options: HarnessOptions = {}) {
 		delay: async () => undefined,
 	});
 
-	return { walker, media, signals, verbs, published, states, state, channel, timeline };
+	return {
+		walker,
+		media,
+		signals,
+		verbs,
+		published,
+		states,
+		state,
+		channel,
+		timeline,
+		destinations,
+	};
 }
 
 const NOW = new Date("2026-08-05T12:00:00.000Z");
@@ -309,6 +328,55 @@ describe("hangup nodes", () => {
 		expect(outcome.status).toBe("hangup");
 		expect(outcome.hangupCause).toBe("NORMAL_TEMPORARY_FAILURE");
 		expect(outcome.notes.join(" ")).toContain("missing from the artifact");
+	});
+});
+
+/**
+ * `onDestination` — the hook that exists entirely for WHEN it fires.
+ *
+ * The walk's own result carries the same destination, and for a call that ends up bridged the two
+ * are interchangeable. For a call the walk HANGS UP they are not: the leg is torn down from inside
+ * the walk, the CDR is written by the teardown, and a destination reported afterwards arrives after
+ * the record it belonged in. See the hook's own note.
+ */
+describe("destinations reported during the walk", () => {
+	it("reports a destination BEFORE the node that owns it does anything", async () => {
+		const h = harness();
+		await h.walker.walk(walkInput([playbackNode("p", { promptId: "welcome" })]));
+
+		// Not merely "somewhere before the play": before the ANSWER, which is the first thing a
+		// playback node does and already too late for a caller who hangs up during the greeting.
+		expect(h.timeline[0]).toBe("destination:playback");
+		expect(h.timeline.filter((entry) => entry.startsWith("verb:")).length).toBeGreaterThan(0);
+	});
+
+	it("reports one destination per destination-bearing node, in the order they were entered", async () => {
+		const h = harness({ reactions: { "PJSIP/1001": { kind: "answer" } } });
+		const outcome = await h.walker.walk(
+			walkInput([
+				ivrMenuNode("ivr", { maxTimeouts: 0, timeoutNodeId: "ext" }),
+				extensionNode("ext"),
+			]),
+		);
+
+		expect(h.destinations.map((destination) => destination.destinationType)).toEqual([
+			"ivr-menu",
+			"extension",
+		]);
+		expect(h.destinations.at(-1)).toEqual(outcome.destination as PlanDestination);
+	});
+
+	it("reports nothing for a plan of steps and terminals, so an unrouted CDR stays unrouted", async () => {
+		const h = harness();
+		await h.walker.walk(
+			walkInput([
+				timeConditionNode("tc", { matchNodeId: "h", noMatchNodeId: "h" }),
+				hangupNode("h", "NORMAL_CLEARING"),
+			]),
+		);
+
+		// A gate and a terminal are not places a call went. See `planDestinationOf`.
+		expect(h.destinations).toEqual([]);
 	});
 });
 

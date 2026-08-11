@@ -41,6 +41,7 @@ import { MidCallFeatureRuntime } from "./mid-call-features";
 import type { EngineEnv } from "../config/engine-env";
 import type { MediaChannelSnapshot, MediaEvent } from "../media/media-event";
 import type { MediaPort } from "../media/media-port";
+import type { PlanDestination } from "../routing/plan-destination";
 import type {
 	OriginatedLeg,
 	OriginatedLegHooks,
@@ -681,15 +682,7 @@ export class ChannelOrchestrator {
 			mailboxes: artifact.internal.mailboxes,
 		});
 
-		if (outcome.destination !== undefined) {
-			// Written as channel variables so the KV mirror carries them too: a failover that picks
-			// this leg up from another instance must be able to write the same CDR.
-			aggregate.setVariable(DESTINATION_TYPE_VARIABLE, outcome.destination.destinationType);
-			if (outcome.destination.destinationRef !== undefined) {
-				aggregate.setVariable(DESTINATION_REF_VARIABLE, outcome.destination.destinationRef);
-			}
-			await this.jetstream.putChannel(aggregate.snapshot);
-		}
+		await this.mirrorAfterWalk(aggregate);
 
 		this.logger.info(
 			{
@@ -741,6 +734,9 @@ export class ChannelOrchestrator {
 				cursor: this.queueCursors,
 			},
 			control: this.walkerCallControlFor(aggregate),
+			onDestination: async (destination) => {
+				await this.recordDestination(aggregate, destination);
+			},
 			...(extra.beforeBridge === undefined ? {} : { beforeBridge: extra.beforeBridge }),
 			log: (message, detail) => {
 				this.logger.info({ channelId: aggregate.channelId, ...detail }, message);
@@ -942,15 +938,10 @@ export class ChannelOrchestrator {
 			mailboxes: artifact.internal.mailboxes,
 		});
 
-		if (outcome.destination !== undefined) {
-			// The transferred leg's CDR must say where it ENDED UP, not where it was going when the
-			// transfer took it.
-			aggregate.setVariable(DESTINATION_TYPE_VARIABLE, outcome.destination.destinationType);
-			if (outcome.destination.destinationRef !== undefined) {
-				aggregate.setVariable(DESTINATION_REF_VARIABLE, outcome.destination.destinationRef);
-			}
-			await this.jetstream.putChannel(aggregate.snapshot);
-		}
+		// The transferred leg's CDR says where it ENDED UP, not where it was going when the transfer
+		// took it: the walker's `onDestination` hook overwrote the variables as the new walk entered
+		// each destination, and the last one it entered is the one the record keeps.
+		await this.mirrorAfterWalk(aggregate);
 
 		return {
 			status: outcome.status,
@@ -1732,6 +1723,57 @@ export class ChannelOrchestrator {
 		}
 		peer.markHangup({ cause: "NORMAL_CLEARING", at: Date.now(), initiatedByEngine: true });
 		await this.hangupQuietly(peer.ariChannelId, "NORMAL_CLEARING");
+	}
+
+	/**
+	 * Records where a walk has just arrived, while the leg is still up.
+	 *
+	 * Written as channel variables so the KV mirror carries them too: a failover that picks this leg
+	 * up from another instance must be able to write the same CDR.
+	 *
+	 * Called from the walker's `onDestination` hook rather than from the walk's result, and that
+	 * timing is the fix for a race that produced wrong CDRs rather than merely late ones. A walk
+	 * ending in a hangup — a queue nobody is staffing, an IVR out of retries — hangs the leg up from
+	 * INSIDE the walk; `ChannelDestroyed` then arrives on the ARI socket and writes the CDR, and it
+	 * has a real chance of getting there before the walk's own return. When it did, a caller who had
+	 * demonstrably been put in a queue was filed under `destinationType: "unknown"`, and the
+	 * post-walk write that followed put the leg back into the `channels` bucket a moment after the
+	 * teardown had deleted it — a live-channel entry for a call that was over.
+	 *
+	 * A leg that has already gone is skipped rather than mirrored: see the guard below.
+	 */
+	private async recordDestination(
+		aggregate: ChannelAggregate,
+		destination: PlanDestination,
+	): Promise<void> {
+		aggregate.setVariable(DESTINATION_TYPE_VARIABLE, destination.destinationType);
+		if (destination.destinationRef !== undefined) {
+			aggregate.setVariable(DESTINATION_REF_VARIABLE, destination.destinationRef);
+		}
+		// The variables are set either way — an in-flight CDR reads them from the snapshot, not from
+		// KV — but the bucket must not be written for a leg whose entry has already been deleted, or
+		// the mirror keeps a live channel for a call that is over.
+		if (aggregate.isTearingDown) {
+			return;
+		}
+		await this.jetstream.putChannel(aggregate.snapshot);
+	}
+
+	/**
+	 * Flushes the leg's snapshot once a walk is over.
+	 *
+	 * A walk mutates the leg as it goes — the bridge a conference put it in, the state it moved to,
+	 * the destination it arrived at — and the mirror has to end up carrying all of it. This used to
+	 * be folded into the post-walk destination write, which meant it happened only for a walk that
+	 * FOUND a destination and, worse, happened even for a leg the walk had already hung up: the
+	 * teardown deletes the entry, and a write landing after it left a live channel in the bucket for
+	 * a call that was over.
+	 */
+	private async mirrorAfterWalk(aggregate: ChannelAggregate): Promise<void> {
+		if (aggregate.isTearingDown) {
+			return;
+		}
+		await this.jetstream.putChannel(aggregate.snapshot);
 	}
 
 	private async writeCdr(

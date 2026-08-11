@@ -2,6 +2,7 @@ import { Controller, Get, HttpCode, HttpStatus, Res } from "@nestjs/common";
 import { ChannelOrchestrator } from "../calls/channel-orchestrator.service";
 import { AriConnectionService } from "../media/ari-connection.service";
 import { JetStreamService } from "../nats/jetstream.service";
+import { ParkHandoffService } from "../nats/park-handoff.service";
 import type { FastifyReply } from "fastify";
 
 /**
@@ -19,6 +20,18 @@ import type { FastifyReply } from "fastify";
  * it looks alive, it answers health checks, and it silently answers no calls, because every call
  * begins with a `StasisStart` on that socket. So the socket, not the HTTP port, is what "healthy"
  * means here.
+ *
+ * ## Why `park` is reported but never decides the status
+ *
+ * A park-handoff responder is a MULTI-INSTANCE facility: an instance answers for the calls it has
+ * parked so a colleague on another instance can collect them. A single-instance deployment
+ * configures no shared claim bucket and therefore opens no subscription, and that is a correct
+ * state, not a degraded one — see `ParkHandoffService.onApplicationBootstrap`. Folding it into
+ * `status` would take every single-instance deployment out of its load balancer's rotation.
+ *
+ * The status computation is the deciding contract here, not the payload: the container
+ * `HEALTHCHECK` in `apps/engine/Dockerfile` reads `response.ok` and nothing else, so a section
+ * added to the body cannot affect it, and a section that changed `status` would.
  */
 @Controller()
 export class HealthController {
@@ -26,6 +39,7 @@ export class HealthController {
 		private readonly ari: AriConnectionService,
 		private readonly jetstream: JetStreamService,
 		private readonly orchestrator: ChannelOrchestrator,
+		private readonly parkHandoff: ParkHandoffService,
 	) {}
 
 	@Get("/healthz")
@@ -53,6 +67,7 @@ export class HealthController {
 		const ariConnected = this.ari.isConnected;
 		const natsReady = this.jetstream.isReady;
 		const draining = this.orchestrator.isDraining;
+		const park = this.parkHandoff.stats;
 
 		return {
 			status: ariConnected && natsReady && !draining ? "ok" : "degraded",
@@ -68,6 +83,11 @@ export class HealthController {
 			nats: {
 				connected: natsReady,
 				server: this.jetstream.serverUrl,
+			},
+			park: {
+				listening: park.listening,
+				subject: this.parkHandoff.subject,
+				served: park.served,
 			},
 		};
 	}
@@ -87,5 +107,19 @@ export interface HealthReport {
 	readonly nats: {
 		readonly connected: boolean;
 		readonly server: string;
+	};
+	/**
+	 * The cross-instance park plane, as this instance participates in it.
+	 *
+	 * `listening: false` with a `served` of zero is the ordinary single-instance answer. On a
+	 * multi-instance deployment it is the one thing worth an alert: it means calls parked here
+	 * cannot be collected from any other instance, and the only symptom a user reports is an orbit
+	 * that rings back instead of connecting.
+	 */
+	readonly park: {
+		readonly listening: boolean;
+		/** The instance-scoped subject this engine answers on, so an operator can `nats req` it. */
+		readonly subject: string;
+		readonly served: number;
 	};
 }

@@ -4,7 +4,7 @@ import { RETRYABLE_HANGUP_CAUSES } from "@optimiq-voice/telephony";
 import { QueueSession } from "../queue/queue-session";
 import { legSignalKey, recordingSignalKey } from "./call-signals";
 import { DEFAULT_MEDIA_REF_SETTINGS, resolveMediaRef, translateMediaRef } from "./media-refs";
-import { planDestinationOf } from "./plan-destination";
+import { planDestinationOf, sameDestination } from "./plan-destination";
 import { verifyPinDigest, verifyVoicemailPin } from "./voicemail-pin";
 import type { MediaPort } from "../media/media-port";
 import type {
@@ -344,6 +344,25 @@ export interface PlanWalkerDependencies {
 	 */
 	readonly control?: WalkerCallControl;
 	/**
+	 * Told the moment the walk ENTERS a destination-bearing node, rather than once it is over.
+	 *
+	 * The timing is the whole point, and it is a correctness fix rather than an optimisation. A walk
+	 * that ends in a hangup — a queue nobody is staffing, an IVR out of retries, a closed time
+	 * condition — hangs the leg up from inside {@link PlanWalker.walk}. The media server's
+	 * `ChannelDestroyed` then races the walk's own return: whichever wins, the CDR is written by the
+	 * hangup path, and if it wins the record says `destinationType: "unknown"` for a caller who
+	 * demonstrably reached a queue. Reporting the destination on ENTRY closes the window, because by
+	 * then the leg is still up and no teardown has started.
+	 *
+	 * It is also what makes the mirrored snapshot true mid-call: a leg sitting in a queue for four
+	 * minutes now names the queue in the `channels` bucket, so an instance that picks it up after a
+	 * failover writes the same CDR this one would have.
+	 *
+	 * Called once per destination-bearing node the walk enters, never with the same destination
+	 * twice in a row.
+	 */
+	readonly onDestination?: (destination: PlanDestination) => Promise<void>;
+	/**
 	 * Run just before the A-leg is joined to whatever the walk found.
 	 *
 	 * Exists for one caller and one reason: a transferred leg is held with music for the whole time
@@ -637,8 +656,12 @@ export class PlanWalker {
 
 			this.visited.push(nodeId);
 			const destination = planDestinationOf(node);
-			if (destination !== undefined) {
+			if (destination !== undefined && !sameDestination(this.destination, destination)) {
 				this.destination = destination;
+				// Awaited: the point of reporting here rather than at the end is that the leg is still
+				// up, and a hook that ran after the next node had already hung it up would be back
+				// where it started. See `PlanWalkerDependencies.onDestination`.
+				await this.deps.onDestination?.(destination);
 			}
 
 			let result: StepResult;

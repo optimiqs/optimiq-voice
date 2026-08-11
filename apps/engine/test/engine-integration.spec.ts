@@ -86,9 +86,22 @@ const PID = String(process.pid);
 const NATS_CONTAINER = `optimiq-engine-it-nats-${PID}`;
 const ASTERISK_CONTAINER = `optimiq-engine-it-asterisk-${PID}`;
 const ASTERISK_IMAGE = `optimiq-voice/asterisk-it:${PID}`;
-const NATS_PORT = 4225;
-const ARI_PORT = 8189;
-const ENGINE_PORT = 4019;
+
+/**
+ * A per-process slot, so two runs of this suite can be in flight at once.
+ *
+ * The container NAMES have always carried the pid; the host ports did not, which made that
+ * precaution ineffective — a second run died in `beforeAll` on `Bind for 0.0.0.0:4225 failed: port
+ * is already allocated`, and did so before a single test executed. That failure reads as "0 pass, 1
+ * fail" and is worth recognising on sight, because it looks nothing like a test failing.
+ *
+ * Fifty slots rather than a free-port search: the search is three sockets and a race of its own,
+ * and this suite is run by a developer and by CI, neither of which has fifty copies of it going.
+ */
+const PORT_SLOT = process.pid % 50;
+const NATS_PORT = 4225 + PORT_SLOT;
+const ARI_PORT = 8189 + PORT_SLOT;
+const ENGINE_PORT = 4019 + PORT_SLOT;
 
 const ARI_USERNAME = "ari";
 const ARI_PASSWORD = "engine-integration-secret";
@@ -517,9 +530,22 @@ suite("engine end-to-end", () => {
 	it("reports healthy once ARI and NATS are both up", async () => {
 		const response = await fetch(`http://127.0.0.1:${String(ENGINE_PORT)}/healthz`);
 		expect(response.status).toBe(200);
-		const body = (await response.json()) as { status: string; ari: { connected: boolean } };
+		const body = (await response.json()) as {
+			status: string;
+			ari: { connected: boolean };
+			park: { listening: boolean; subject: string; served: number };
+		};
 		expect(body.status).toBe("ok");
 		expect(body.ari.connected).toBe(true);
+
+		// The park section, against a REAL container graph. `health.controller.spec.ts` proves the
+		// payload; only this proves the controller can obtain `ParkHandoffService` at all — it comes
+		// from a different module than every other dependency the report reads, and a provider Nest
+		// cannot resolve is a boot failure, not a wrong field.
+		expect(body.park.subject).toBe(subjectFor.engineParkHandoffRpc("engine"));
+		expect(body.park.served).toBe(0);
+		// Listening, because this run has a `park-claims` bucket: `ENGINE_ENSURE_STREAMS` created it.
+		expect(body.park.listening).toBe(true);
 	});
 
 	it("routes a DID through an IVR to an extension, bridges it, and files the CDR", async () => {

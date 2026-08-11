@@ -76,3 +76,21 @@ export function planDestinationOf(node: PlanNode): PlanDestination | undefined {
 		}
 	}
 }
+
+/**
+ * Whether two destinations name the same place.
+ *
+ * Exists so the walk can report a destination the moment it enters one without reporting the same
+ * one twice: a node revisited by a retry loop — an IVR replaying its greeting, a queue re-entered
+ * after a failed transfer — is the same destination, and a second report would be a second KV write
+ * saying nothing new.
+ */
+export function sameDestination(
+	left: PlanDestination | undefined,
+	right: PlanDestination | undefined,
+): boolean {
+	return (
+		left?.destinationType === right?.destinationType &&
+		left?.destinationRef === right?.destinationRef
+	);
+}

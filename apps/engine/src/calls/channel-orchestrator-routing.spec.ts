@@ -192,6 +192,14 @@ interface HarnessOptions {
 	readonly didIndex?: Pick<DidIndexSource, "organizationFor">;
 	/** A mailbox source for the `*97` cases. Defaults to one that answers "unreadable". */
 	readonly mailbox?: Pick<VoicemailMailboxRpcSource, "list">;
+	/**
+	 * What the media server delivers after the A-leg is answered, in place of the `Up` state change.
+	 *
+	 * The one seam that lets a spec make an event land in the MIDDLE of a walk. Everything else here
+	 * drives events from outside, after `awaitWalks`, which is the one shape of arrival the engine
+	 * never has to worry about.
+	 */
+	readonly onAnswered?: () => MediaEvent;
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -210,7 +218,8 @@ function harness(options: HarnessOptions = {}) {
 			}
 			queueMicrotask(() => {
 				void holder.orchestrator?.handleEvent(
-					mediaEvent("ChannelStateChange", { channel: channel({ state: "Up" }) }),
+					options.onAnswered?.() ??
+						mediaEvent("ChannelStateChange", { channel: channel({ state: "Up" }) }),
 				);
 			});
 		},
@@ -468,6 +477,64 @@ describe("CDR destination enrichment", () => {
 		);
 
 		expect(h.cdrs[0]?.data).toMatchObject({ destinationType: "unknown", destinationRef: null });
+	});
+
+	/**
+	 * The caller hangs up mid-walk, which is the case the destination used to be lost in.
+	 *
+	 * A walk records where it went; the teardown writes the CDR. While the destination was recorded
+	 * from the walk's RESULT, those two raced whenever the leg went away before the walk returned —
+	 * a caller hanging up on a greeting, and, deterministically enough to fail an integration run
+	 * about one time in four, a queue ejecting a caller nobody was there to answer. The loser was
+	 * always the CDR: a caller who had demonstrably reached a menu was filed as `unknown`.
+	 */
+	const IVR_ID = "0195c0f0-1c2f-7000-8000-0000000000f9";
+
+	function hangsUpDuringTheGreeting() {
+		return harness({
+			artifact: artifactWith(
+				[
+					...TERMINALS,
+					{
+						id: "ivr:1",
+						kind: "ivr-menu",
+						ivrMenuId: IVR_ID,
+						digitTimeoutMs: 10,
+						interDigitTimeoutMs: 10,
+						maxDigits: 1,
+						maxFailures: 0,
+						maxTimeouts: 0,
+						directDialEnabled: false,
+						options: [],
+					} as PlanNode,
+				],
+				"ivr:1",
+			),
+			// `ChannelDestroyed` instead of the `Up` the answer was waiting for: the leg dies, and the
+			// CDR is written, while the walk is still inside the IVR node.
+			onAnswered: () => mediaEvent("ChannelDestroyed", { channel: channel(), cause: 16 }),
+		});
+	}
+
+	it("has already recorded the destination when a mid-walk teardown writes the CDR", async () => {
+		const h = hangsUpDuringTheGreeting();
+		await arrive(h);
+
+		expect(h.cdrs).toHaveLength(1);
+		expect(h.cdrs[0]?.data).toMatchObject({
+			destinationType: "ivr-menu",
+			destinationRef: IVR_ID,
+		});
+	});
+
+	it("does not put a leg the walk hung up back into the channels bucket", async () => {
+		const h = hangsUpDuringTheGreeting();
+		await arrive(h);
+
+		// The teardown deleted the entry. A mirror written after it — which is what the post-walk
+		// destination write did — leaves a live channel in the bucket for a call that is over, and
+		// nothing ever comes back to clear it.
+		expect([...h.kv.keys()]).toEqual([]);
 	});
 });
 
