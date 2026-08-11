@@ -9,7 +9,7 @@ import {
 	trunkDialNode,
 } from "./plan-fixtures.fake";
 import { PlanWalker } from "./plan-walker";
-import type { OriginatedLeg, WalkerChannel, WalkInput } from "./plan-walker";
+import type { OriginatedLeg, PlanWalkerSettings, WalkerChannel, WalkInput } from "./plan-walker";
 import type { CallEvent } from "@optimiq-voice/events";
 import type { FollowMeDestination, FollowMePlan, PlanNode } from "@optimiq-voice/routing";
 import type { HangupCause, Verb, VerbResult } from "@optimiq-voice/telephony";
@@ -44,6 +44,7 @@ interface HarnessOptions {
 	/** How each originated endpoint behaves. Keyed by a substring of the endpoint. */
 	readonly reactions?: Record<string, LegReaction>;
 	readonly detached?: boolean;
+	readonly settings?: Partial<PlanWalkerSettings>;
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -135,7 +136,7 @@ function harness(options: HarnessOptions = {}) {
 		publish: async (type, data) => {
 			published.push({ type, data });
 		},
-		settings: { answerTimeoutMs: 200 },
+		settings: { answerTimeoutMs: 200, ...options.settings },
 		peerLegId: (mediaChannelId) => `leg-of-${mediaChannelId}`,
 		legs: {
 			originated: (leg) => originatedLegs.push(leg),
@@ -578,8 +579,11 @@ describe("follow-me legs and their CDRs", () => {
 		expect(h.published.map((event) => event.type)).toContain("channel.bridged");
 	});
 
-	it("notes a hop that asked for answer confirmation, and dials it anyway", async () => {
-		const h = harness();
+	it("dials a hop that asked for answer confirmation, and does not bridge it unasked", async () => {
+		const h = harness({
+			reactions: { "PJSIP/1002": { kind: "answer" } },
+			settings: { confirmAttempts: 1, confirmTimeoutMs: 20 },
+		});
 		const outcome = await h.walker.walk(
 			walkInput([
 				extensionNode("ext", {
@@ -591,7 +595,8 @@ describe("follow-me legs and their CDRs", () => {
 		);
 
 		expect(h.media.originated()).toHaveLength(1);
-		expect(outcome.notes.join(" ")).toContain("answer confirmation, which is not implemented yet");
+		expect(h.bridged).toHaveLength(0);
+		expect(outcome.notes.join(" ")).toContain("did not confirm the call");
 	});
 });
 

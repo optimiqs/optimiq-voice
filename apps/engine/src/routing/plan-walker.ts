@@ -72,7 +72,9 @@ import type {
  *
  * Real: `extension` (including its follow-me ladder — both strategies, on-net and off-net hops, the
  * ladder's own timeouts, and the extension's own no-answer branch behind it), `ring-group` (both
- * strategies, with lose-race), `ivr-menu` (retries, invalid
+ * strategies, with lose-race). Both honour `confirmRequired`: a leg marked for it has to press the
+ * accept digit before it counts as answered at all, which is what keeps a mobile's own voicemail
+ * from winning a hop — see {@link PlanWalker.confirmAnswer}. Also real: `ivr-menu` (retries, invalid
  * and timeout branches, submenu recursion), `time-condition`, `trunk-dial` (failover honouring
  * `continueOnCauses`), `external`, `playback`, `hangup`, and `queue` — music on hold, position
  * announcements, all six distribution strategies with tier rules, agent state and wrap-up, delegated
@@ -212,6 +214,22 @@ export interface PlanWalkerSettings {
 	 * and far above the rate at which a KV point read costs anything.
 	 */
 	readonly conferenceClaimPollMs: number;
+	/**
+	 * Asked of a leg that has to CONFIRM before it may be bridged.
+	 *
+	 * `screen-callee-options` is Asterisk's own call-screening prompt and is in the core sound
+	 * package — it opens with "dial 1 if you wish this call to be answered", which is the question
+	 * being asked, so a stock install confirms without a prompt pack. A deployment with a recorded
+	 * "press 1 to accept this call" points `ENGINE_CONFIRM_PROMPT` at it; a ring group with a
+	 * `confirmPromptId` of its own overrides both.
+	 */
+	readonly confirmPrompt: string;
+	/** The one digit that accepts. Anything else is a decline. */
+	readonly confirmAcceptDigit: string;
+	/** Prompts a confirming leg hears before it is given up on. */
+	readonly confirmAttempts: number;
+	/** How long one prompt waits for a digit. Long: a mobile's speaker has to reach an ear first. */
+	readonly confirmTimeoutMs: number;
 	readonly mediaRefs: MediaRefSettings;
 }
 
@@ -249,6 +267,10 @@ export const DEFAULT_PLAN_WALKER_SETTINGS: PlanWalkerSettings = {
 	// enough that a forgotten leg does not hold a channel until the process restarts.
 	conferenceModeratorWaitMs: 600_000,
 	conferenceClaimPollMs: 2_000,
+	confirmPrompt: "sound:screen-callee-options",
+	confirmAcceptDigit: "1",
+	confirmAttempts: 2,
+	confirmTimeoutMs: 15_000,
 	mediaRefs: DEFAULT_MEDIA_REF_SETTINGS,
 };
 
@@ -511,7 +533,51 @@ interface DialAttempt {
 	readonly delaySeconds: number;
 	readonly callerId?: string;
 	readonly variables?: Readonly<Record<string, string>>;
+	/**
+	 * Answer confirmation for this leg. Absent means an answer is an answer.
+	 *
+	 * Present means the leg has to press a digit before it counts as answered AT ALL — see {@link
+	 * PlanWalker.confirmAnswer}. The distinction lives on the attempt rather than on the node so that
+	 * one hop of a ladder can confirm and the next one not, which is exactly the configuration the
+	 * feature exists for: the desk phone is trusted, the mobile is not.
+	 */
+	readonly confirm?: ConfirmRequest;
 }
+
+/** What one confirming leg is asked, and how long it is given to answer. */
+interface ConfirmRequest {
+	/** Media URI, already translated. */
+	readonly media: string;
+	readonly acceptDigit: string;
+	readonly attempts: number;
+	readonly timeoutMs: number;
+}
+
+/**
+ * How a confirmation ended.
+ *
+ * Only `accepted` may be bridged. Every other value is the leg NOT having answered, and the four of
+ * them are kept apart because they land the walk in different places: a declining callee lets the
+ * ladder continue, a caller who hung up ends the walk, and a media plane that cannot play the
+ * question is a deployment fault somebody has to read in a log.
+ */
+type ConfirmVerdict =
+	/** The accept digit arrived. */
+	| "accepted"
+	/** Wrong digit or silence, for every attempt. */
+	| "declined"
+	/** The confirming leg went away mid-question. */
+	| "leg-gone"
+	/** The CALLER went away. Nothing left to bridge to. */
+	| "caller-gone"
+	/** The media plane refused to play the question. Fails closed: see {@link PlanWalker.confirmAnswer}. */
+	| "unplayable";
+
+/** What ended one round of the question: a digit, silence, or the whole thing being over. */
+type ConfirmStep =
+	| { readonly kind: "digit"; readonly digit: string }
+	| { readonly kind: "timeout" }
+	| { readonly kind: "terminal"; readonly verdict: ConfirmVerdict };
 
 type DialOutcome =
 	| { readonly kind: "answered"; readonly mediaChannelId: string; readonly index: number }
@@ -1167,14 +1233,9 @@ export class PlanWalker {
 			);
 			return undefined;
 		}
-		if (hop.confirmRequired) {
-			this.note(
-				`follow-me hop "${hop.destination}" of extension ${node.number} asks for answer confirmation, which is not implemented yet; the hop was dialled without it`,
-			);
-		}
-
 		const timeoutSeconds =
 			hop.timeoutSeconds || node.timeoutSeconds || this.settings.defaultRingTimeoutSeconds;
+		const confirm = hop.confirmRequired ? this.confirmRequest() : undefined;
 
 		if (target.kind === "extension") {
 			return {
@@ -1184,6 +1245,7 @@ export class PlanWalker {
 				timeoutSeconds,
 				delaySeconds: hop.delaySeconds,
 				callerId: this.callerIdFor(input),
+				...(confirm === undefined ? {} : { confirm }),
 			};
 		}
 
@@ -1222,6 +1284,22 @@ export class PlanWalker {
 					input.callerIdNumber ??
 					this.deps.channel.callerIdNumber,
 			),
+			...(confirm === undefined ? {} : { confirm }),
+		};
+	}
+
+	/**
+	 * The confirmation this deployment asks for, with a node's own prompt when it has one.
+	 *
+	 * Assembled once per attempt rather than read out of the settings inside the dial loop, because
+	 * the prompt is the one part a ring group may override and the loop should not have to know that.
+	 */
+	private confirmRequest(promptId?: string): ConfirmRequest {
+		return {
+			media: resolveMediaRef({ promptId }, this.settings.mediaRefs) ?? this.settings.confirmPrompt,
+			acceptDigit: this.settings.confirmAcceptDigit,
+			attempts: Math.max(1, this.settings.confirmAttempts),
+			timeoutMs: Math.max(1, this.settings.confirmTimeoutMs),
 		};
 	}
 
@@ -1249,11 +1327,13 @@ export class PlanWalker {
 				);
 				continue;
 			}
-			if (member.confirmRequired || node.confirmEnabled) {
-				this.note(
-					`ring group "${node.ringGroupId}" asks for answer confirmation, which is not implemented yet; the member was dialled without it`,
-				);
-			}
+			// The compiler has already folded the group's own switch into every member
+			// (`member.confirmRequired || group.confirmEnabled`); the group field is read again here
+			// only so an artifact written before that fold still confirms.
+			const confirm =
+				member.confirmRequired || node.confirmEnabled
+					? this.confirmRequest(node.confirmPromptId)
+					: undefined;
 			attempts.push({
 				endpoint: this.endpointForExtension(target.number),
 				label: `extension ${target.number}`,
@@ -1264,6 +1344,7 @@ export class PlanWalker {
 					this.settings.defaultRingTimeoutSeconds,
 				delaySeconds: member.delaySeconds,
 				callerId: this.callerIdFor(input, node.callerIdNamePrefix),
+				...(confirm === undefined ? {} : { confirm }),
 			});
 		}
 
@@ -2641,6 +2722,15 @@ export class PlanWalker {
 	 * The losers are hung up BEFORE the winner is bridged, not after. A member who picks up a
 	 * millisecond after the race is decided must hear the call end rather than be joined to a bridge
 	 * they were not selected for.
+	 *
+	 * ## A leg that has to confirm does not win by answering
+	 *
+	 * It wins by pressing the accept digit, and the race stays OPEN underneath it: the other phones
+	 * go on ringing for the whole time a mobile is being asked the question, because the thing that
+	 * answered may be its voicemail and giving it the race would hand the caller to it. Two legs
+	 * that answer within a millisecond of each other are therefore both asked, and the first one to
+	 * accept takes the call — `resolveOutcome` is single-shot, so the second acceptance lands on a
+	 * settled race and that leg is torn down with the rest of the losers.
 	 */
 	private async dialSimultaneous(
 		attempts: readonly DialAttempt[],
@@ -2649,6 +2739,8 @@ export class PlanWalker {
 	): Promise<DialOutcome> {
 		const channelIds = attempts.map(() => this.newId());
 		const unwatchers: (() => void)[] = [];
+		const abortConfirmations: (() => void)[] = [];
+		const confirming = new Set<number>();
 		const ended = new Set<number>();
 		let settled = false;
 		let resolveOutcome: (outcome: DialOutcome) => void = () => undefined;
@@ -2664,6 +2756,28 @@ export class PlanWalker {
 			};
 		});
 
+		/**
+		 * One leg is out of the race, for whatever reason.
+		 *
+		 * `cause` is absent when the leg was not ANSWERED-and-then-lost but never counted as answered
+		 * at all — a declined confirmation. A race in which every leg declined ends as a timeout and
+		 * therefore on the no-answer branch, because nobody accepted the call, which is not the same
+		 * fact as everybody rejecting it.
+		 */
+		const legIsOut = (index: number, cause?: HangupCause): void => {
+			if (cause !== undefined) {
+				lastCause = cause;
+			}
+			ended.add(index);
+			if (ended.size === attempts.length) {
+				resolveOutcome(
+					lastCause === undefined
+						? { kind: "timeout" }
+						: { kind: "failed", cause: lastCause, index },
+				);
+			}
+		};
+
 		const overall = setTimeout(
 			() => {
 				resolveOutcome({ kind: "timeout" });
@@ -2678,19 +2792,39 @@ export class PlanWalker {
 
 		for (const index of attempts.keys()) {
 			const channelId = channelIds[index] as string;
+			const attempt = attempts[index] as DialAttempt;
 			unwatchers.push(
 				this.deps.signals.watch(legSignalKey(channelId), (signal) => {
 					const leg = signal as LegSignal;
 					if (leg.kind === "answered" || leg.kind === "entered") {
-						resolveOutcome({ kind: "answered", mediaChannelId: channelId, index });
+						const confirm = attempt.confirm;
+						if (confirm === undefined) {
+							resolveOutcome({ kind: "answered", mediaChannelId: channelId, index });
+							return;
+						}
+						// Claimed once per leg: `entered` and `answered` both arrive for one leg, and
+						// asking the same phone the same question twice would collect its `1` for the
+						// first question and time the second one out.
+						if (confirming.has(index) || ended.has(index) || settled) {
+							return;
+						}
+						confirming.add(index);
+						void this.confirmRacingLeg(channelId, attempt, confirm, {
+							abortable: (abort) => abortConfirmations.push(abort),
+							accepted: () => {
+								resolveOutcome({ kind: "answered", mediaChannelId: channelId, index });
+							},
+							callerGone: () => {
+								resolveOutcome({ kind: "aborted" });
+							},
+							rejected: () => {
+								legIsOut(index);
+							},
+						});
 						return;
 					}
 					if (leg.kind === "ended") {
-						lastCause = leg.cause;
-						ended.add(index);
-						if (ended.size === attempts.length) {
-							resolveOutcome({ kind: "failed", cause: leg.cause, index });
-						}
+						legIsOut(index, leg.cause);
 					}
 				}),
 			);
@@ -2706,11 +2840,7 @@ export class PlanWalker {
 					return;
 				}
 				await this.originate(attempt, channelIds[index] as string, index, (cause) => {
-					lastCause = cause;
-					ended.add(index);
-					if (ended.size === attempts.length) {
-						resolveOutcome({ kind: "failed", cause, index });
-					}
+					legIsOut(index, cause);
 				});
 			}),
 		);
@@ -2719,6 +2849,12 @@ export class PlanWalker {
 		clearTimeout(overall);
 		for (const unwatch of unwatchers) {
 			unwatch();
+		}
+		// A question nobody is waiting for the answer to. The loser it was being asked of is hung up
+		// below, and on a real media server that would end it anyway — but a confirmation left running
+		// against a leg that no longer exists is a listener on the bus for the rest of the process.
+		for (const abort of abortConfirmations) {
+			abort();
 		}
 
 		const winner = outcome.kind === "answered" ? outcome.mediaChannelId : undefined;
@@ -2787,10 +2923,251 @@ export class PlanWalker {
 		unwatch();
 		unwatchCaller();
 
-		if (outcome.kind !== "answered") {
+		// The confirmation installs its own watchers, and it does so with no `await` between here and
+		// there, so nothing this leg does can fall between the two subscriptions.
+		const settledOutcome =
+			outcome.kind === "answered" && attempt.confirm !== undefined
+				? this.settleConfirm(await this.confirmAnswer(channelId, attempt.confirm), outcome, attempt)
+				: outcome;
+
+		if (settledOutcome.kind !== "answered") {
 			await this.hangupQuietly(channelId, "ORIGINATOR_CANCEL");
 		}
-		return outcome;
+		return settledOutcome;
+	}
+
+	/**
+	 * A confirmation verdict, as the dial that is waiting on it reads it.
+	 *
+	 * Everything except an acceptance is the leg NOT HAVING ANSWERED — a `timeout`, which is exactly
+	 * what the ladder would have seen had the phone rung out — rather than a `failed` with a cause.
+	 * The difference is not cosmetic: a cause reaches `stopOnCauses`, and a mobile whose voicemail
+	 * picked up and declined would then stop a sequential ladder dead on the hop before the one the
+	 * user is actually sitting next to.
+	 */
+	private settleConfirm(
+		verdict: ConfirmVerdict,
+		answered: DialOutcome,
+		attempt: DialAttempt,
+	): DialOutcome {
+		if (verdict === "accepted") {
+			return answered;
+		}
+		if (verdict === "caller-gone") {
+			this.note(`${attempt.label} was being asked to confirm when the caller hung up`);
+			return { kind: "aborted" };
+		}
+		this.noteConfirmVerdict(verdict, attempt);
+		return { kind: "timeout" };
+	}
+
+	/** One racing leg's confirmation, run without settling the race it is still part of. */
+	private async confirmRacingLeg(
+		mediaChannelId: string,
+		attempt: DialAttempt,
+		confirm: ConfirmRequest,
+		hooks: {
+			readonly abortable: (abort: () => void) => void;
+			readonly accepted: () => void;
+			readonly callerGone: () => void;
+			readonly rejected: () => void;
+		},
+	): Promise<void> {
+		let verdict: ConfirmVerdict;
+		try {
+			verdict = await this.confirmAnswer(mediaChannelId, confirm, hooks.abortable);
+		} catch (error) {
+			// Never throws into the signal callback that started it: that path runs on the media
+			// server's event socket, where an exception takes every other live call with it.
+			this.log("a confirmation failed", { mediaChannelId, err: String(error) });
+			verdict = "unplayable";
+		}
+
+		if (verdict === "accepted") {
+			hooks.accepted();
+			return;
+		}
+		if (verdict === "caller-gone") {
+			this.note(`${attempt.label} was being asked to confirm when the caller hung up`);
+			hooks.callerGone();
+			return;
+		}
+		this.noteConfirmVerdict(verdict, attempt);
+		// Hung up here rather than by the race's own loser cleanup: the race is still open, and this
+		// leg has to stop ringing (or stop being connected to a voicemail greeting) NOW.
+		await this.hangupQuietly(mediaChannelId, "ORIGINATOR_CANCEL");
+		hooks.rejected();
+	}
+
+	private noteConfirmVerdict(verdict: ConfirmVerdict, attempt: DialAttempt): void {
+		switch (verdict) {
+			case "leg-gone": {
+				this.note(`${attempt.label} hung up before it confirmed the call`);
+				return;
+			}
+			case "unplayable": {
+				// The mediad rung this deployment is on cannot play audio, so the question was never
+				// asked. Bridging anyway is the exact defect confirmation exists to prevent — a
+				// mobile's voicemail taking the call — so it fails CLOSED and says why.
+				this.note(
+					`${attempt.label} could not be asked to confirm (this media plane cannot play audio); the leg was treated as unconfirmed and dropped`,
+				);
+				return;
+			}
+			default: {
+				this.note(`${attempt.label} did not confirm the call; it was dropped`);
+			}
+		}
+	}
+
+	/**
+	 * Asks an answered leg to accept the call, and reports whether it did.
+	 *
+	 * ## Why this exists
+	 *
+	 * A ladder hop to a mobile is answered by whichever of two things gets there first: the person,
+	 * or the carrier's voicemail. Both look identical to a switch — a `200 OK` — so a switch that
+	 * treats an answer as an answer hands the caller to a voicemail box that is not the one they were
+	 * ringing, and every later hop of the ladder is skipped because the call was "answered". The only
+	 * cure is to ask for something a machine will not do: press a digit.
+	 *
+	 * ## It fails closed, in every direction
+	 *
+	 * Silence, the wrong digit, a leg that hangs up, a media plane that cannot play the question —
+	 * all of them are "unconfirmed", and unconfirmed is never bridged. The one that is easiest to get
+	 * wrong is the last: `mediad` refuses `play` on the rungs below file playback, and a confirmation
+	 * that treated a refusal as "well, connect them anyway" would be worse than no confirmation at
+	 * all, because it would be silently absent exactly where the deployment believed it was on.
+	 *
+	 * ## The digits arrive on the signal bus
+	 *
+	 * Not through a `gather` verb: a verb runs against the leg the walk owns (the CALLER), and this
+	 * question is asked of the callee. See `LegSignal`'s `dtmf` member for why an originated leg has
+	 * no DTMF inbox of its own.
+	 */
+	private async confirmAnswer(
+		mediaChannelId: string,
+		confirm: ConfirmRequest,
+		abortable?: (abort: () => void) => void,
+	): Promise<ConfirmVerdict> {
+		let terminal: ConfirmVerdict | undefined;
+		let settleTerminal: (verdict: ConfirmVerdict) => void = () => undefined;
+		let offerDigit: ((digit: string) => void) | undefined;
+
+		const terminalPromise = new Promise<ConfirmStep>((resolve) => {
+			settleTerminal = (verdict) => {
+				if (terminal !== undefined) {
+					return;
+				}
+				terminal = verdict;
+				resolve({ kind: "terminal", verdict });
+			};
+		});
+
+		const unwatchLeg = this.deps.signals.watch(legSignalKey(mediaChannelId), (signal) => {
+			const leg = signal as LegSignal;
+			if (leg.kind === "ended") {
+				settleTerminal("leg-gone");
+				return;
+			}
+			if (leg.kind === "dtmf") {
+				offerDigit?.(leg.digit);
+			}
+		});
+		// The caller is not in a bridge yet — they are hearing ringback — so their hangup arrives
+		// here as an ordinary leg signal rather than as anything the walk would otherwise notice
+		// mid-question. Without this, a callee would go on being asked to accept a call from
+		// somebody who left thirty seconds ago.
+		const unwatchCaller = this.deps.signals.watch(
+			legSignalKey(this.deps.channel.mediaChannelId),
+			(signal) => {
+				if ((signal as LegSignal).kind === "ended") {
+					settleTerminal("caller-gone");
+				}
+			},
+		);
+		abortable?.(() => {
+			settleTerminal("leg-gone");
+		});
+
+		try {
+			for (let round = 0; round < confirm.attempts; round += 1) {
+				if (terminal !== undefined) {
+					break;
+				}
+				if (this.abandoned) {
+					return "caller-gone";
+				}
+
+				const playbackRef = this.newId();
+				try {
+					await this.deps.media.play(mediaChannelId, {
+						media: [confirm.media],
+						playbackRef,
+					});
+				} catch (error) {
+					this.log("could not ask a leg to confirm", { mediaChannelId, err: String(error) });
+					return "unplayable";
+				}
+
+				const digit = this.awaitConfirmDigit(confirm.timeoutMs, (offer) => {
+					offerDigit = offer;
+				});
+				const step = await Promise.race([terminalPromise, digit.promise]);
+				digit.cancel();
+				offerDigit = undefined;
+				// The prompt is stopped whatever happened: a leg that pressed `1` two syllables in
+				// must not hear the rest of the question, and an already-finished playback is a no-op.
+				await this.stopPlaybackQuietly(playbackRef);
+
+				if (step.kind === "terminal") {
+					return step.verdict;
+				}
+				if (step.kind === "digit" && step.digit === confirm.acceptDigit) {
+					return "accepted";
+				}
+				// A wrong digit costs an attempt exactly as silence does. A phone in a pocket presses
+				// things, and re-asking forever is how a caller waits out a whole ladder on one hop.
+			}
+		} finally {
+			unwatchLeg();
+			unwatchCaller();
+		}
+
+		return terminal ?? "declined";
+	}
+
+	/** One digit, or silence. Cancellable, so a lost race does not leave a timer holding a closure. */
+	private awaitConfirmDigit(
+		timeoutMs: number,
+		register: (offer: (digit: string) => void) => void,
+	): { readonly promise: Promise<ConfirmStep>; readonly cancel: () => void } {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const promise = new Promise<ConfirmStep>((resolve) => {
+			timer = setTimeout(() => {
+				resolve({ kind: "timeout" });
+			}, timeoutMs);
+			timer.unref?.();
+			register((digit) => {
+				resolve({ kind: "digit", digit });
+			});
+		});
+		return {
+			promise,
+			cancel: () => {
+				if (timer !== undefined) {
+					clearTimeout(timer);
+				}
+			},
+		};
+	}
+
+	private async stopPlaybackQuietly(playbackRef: string): Promise<void> {
+		try {
+			await this.deps.media.stopPlayback(playbackRef);
+		} catch (error) {
+			this.log("failed to stop a confirmation prompt", { playbackRef, err: String(error) });
+		}
 	}
 
 	/**

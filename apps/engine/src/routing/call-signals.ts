@@ -31,6 +31,20 @@ export type LegSignal =
 	| { readonly kind: "answered" }
 	/** The leg reached the Stasis application: it is ours to bridge. */
 	| { readonly kind: "entered" }
+	/**
+	 * One digit the party on THIS leg pressed.
+	 *
+	 * The A-leg's digits reach an application through {@link
+	 * import("../verbs/dtmf-registry").DtmfRegistry}, keyed by the leg's domain id — which a leg the
+	 * walker originated does not have, because it is deliberately never filed as a call of its own.
+	 * So a B-leg's digits would otherwise reach nobody at all, and answer confirmation ("press 1 to
+	 * accept this call") is exactly a question asked of a B-leg.
+	 *
+	 * Republished here rather than by giving originated legs an aggregate: the whole reason a B-leg
+	 * has none is that filing one produces a second CDR for one call, and one boolean question is not
+	 * worth reversing that.
+	 */
+	| { readonly kind: "dtmf"; readonly digit: string }
 	| { readonly kind: "ended"; readonly cause: HangupCause; readonly causeCode: number };
 
 /** What can happen to a recording the walker started. */

@@ -831,12 +831,25 @@ describe("ring groups", () => {
 		expect(outcome.notes.join(" ")).toContain("no dialable members");
 	});
 
-	it("reports answer confirmation as an unimplemented gap rather than silently skipping it", async () => {
-		const h = harness({ reactions: { "PJSIP/1001": { kind: "answer" } } });
+	it("asks a confirming member the group's own prompt, and does not bridge one that stays silent", async () => {
+		const h = harness({
+			reactions: {
+				"PJSIP/1001": { kind: "answer" },
+				"PJSIP/1002": { kind: "reject", cause: "NO_ANSWER" },
+			},
+			settings: { confirmAttempts: 1, confirmTimeoutMs: 20 },
+		});
 		const outcome = await h.walker.walk(
-			walkInput(group({ confirmEnabled: true, confirmPromptId: "press-1" })),
+			walkInput(
+				group({ confirmEnabled: true, confirmPromptId: "press-1", timeoutNodeId: "timeout" }),
+			),
 		);
-		expect(outcome.notes.join(" ")).toContain("answer confirmation");
+
+		expect(
+			h.media.calls.filter((call) => call.method === "play").map((call) => call.args[1]),
+		).toEqual([{ media: ["sound:press-1"], playbackRef: expect.any(String) }]);
+		expect(outcome.visited).toContain("timeout");
+		expect(h.media.hungUp().map((leg) => leg.cause)).toContain("ORIGINATOR_CANCEL");
 	});
 
 	it("prefixes the group's caller-id name onto the presented identity", async () => {

@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "bun:test";
 import { parseAriEvent } from "@optimiq-voice/media-ari";
 import { makeFakeMediaPort } from "../media/media-port.fake";
 import { fakeQueueOrchestratorArgs } from "../queue/queue-services.fake";
-import { CallSignalBus } from "../routing/call-signals";
+import { CallSignalBus, legSignalKey } from "../routing/call-signals";
 import { ConferenceRegistry } from "../routing/conference-registry";
 import { ParkRegistry } from "../routing/park-registry";
 import { DtmfRegistry } from "../verbs/dtmf-registry";
@@ -346,6 +346,30 @@ describe("progress", () => {
 		expect(typesOf(h.published)).toEqual(["channel.dtmf"]);
 		expect(h.published[0]?.data).toMatchObject({ digit: "7", durationMs: 130, source: "rfc2833" });
 		expect(h.dtmf.size).toBe(1);
+	});
+
+	it("republishes a digit on the signal bus, including for a leg it does not track", async () => {
+		const h = await arrived();
+		const heard: string[] = [];
+		h.signals.watch(legSignalKey("originated-leg"), (signal) => {
+			if (signal.kind === "dtmf") {
+				heard.push(signal.digit);
+			}
+		});
+
+		// A leg the plan walker originated has no aggregate — it is deliberately never filed as a
+		// call of its own — so this is the ONLY way its digits reach anything, and answer
+		// confirmation is a question asked of exactly such a leg.
+		await h.orchestrator.handleEvent(
+			mediaEvent("ChannelDtmfReceived", {
+				channel: channel({ id: "originated-leg" }),
+				digit: "1",
+				duration_ms: 120,
+			}),
+		);
+
+		expect(heard).toEqual(["1"]);
+		expect(h.published).toEqual([]);
 	});
 
 	it("drops a non-DTMF symbol rather than publishing an invalid event", async () => {

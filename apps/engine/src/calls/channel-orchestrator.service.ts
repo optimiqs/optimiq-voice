@@ -1277,6 +1277,10 @@ export class ChannelOrchestrator {
 			voicemailPinInvalidPrompt: this.env.ENGINE_VOICEMAIL_PIN_INVALID_PROMPT,
 			voicemailPinAttempts: this.env.ENGINE_VOICEMAIL_PIN_ATTEMPTS,
 			voicemailMenuTimeoutMs: this.env.ENGINE_VOICEMAIL_MENU_TIMEOUT_MS,
+			confirmPrompt: this.env.ENGINE_CONFIRM_PROMPT,
+			confirmAcceptDigit: this.env.ENGINE_CONFIRM_ACCEPT_DIGIT,
+			confirmAttempts: this.env.ENGINE_CONFIRM_ATTEMPTS,
+			confirmTimeoutMs: this.env.ENGINE_CONFIRM_TIMEOUT_MS,
 			mediaRefs: {
 				promptPrefix: this.env.ENGINE_PROMPT_MEDIA_PREFIX,
 				fallbackMedia: this.env.ENGINE_UNAVAILABLE_ANNOUNCEMENT,
@@ -1407,15 +1411,26 @@ export class ChannelOrchestrator {
 
 	private async onDtmf(mediaChannelId: string, digit: string, durationMs: number): Promise<void> {
 		const aggregate = this.registry.byAriChannelId(mediaChannelId);
-		if (aggregate === undefined) {
-			return;
-		}
-		if (!isDtmfDigit(digit.toUpperCase())) {
-			this.logger.warn({ digit, channelId: aggregate.channelId }, "ignoring a non-DTMF symbol");
+		const pressed = digit.toUpperCase();
+		if (!isDtmfDigit(pressed)) {
+			this.logger.warn(
+				{ digit, channelId: aggregate?.channelId ?? mediaChannelId },
+				"ignoring a non-DTMF symbol",
+			);
 			return;
 		}
 
-		const event = dtmfEventFrom({ digit: digit.toUpperCase(), durationMs });
+		// Before the aggregate check, because the leg that most needs this has none: a leg the plan
+		// walker originated is deliberately not filed as a call of its own, so its digits have no
+		// inbox to land in and answer confirmation would never hear the `1`. Unwatched keys are a
+		// no-op, so an ordinary A-leg pays one map lookup for it.
+		this.signals.emit(legSignalKey(mediaChannelId), { kind: "dtmf", digit: pressed });
+
+		if (aggregate === undefined) {
+			return;
+		}
+
+		const event = dtmfEventFrom({ digit: pressed, durationMs });
 
 		// The mid-call runtime gets first refusal, and ONLY when nothing is collecting: a running
 		// `gather` is an application that asked for these digits, and handing one to a feature code

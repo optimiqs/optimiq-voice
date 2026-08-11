@@ -221,6 +221,35 @@ export const engineEnvSchema = z.object({
 	/** How long to wait for a control digit after a voicemail message finishes playing. */
 	ENGINE_VOICEMAIL_MENU_TIMEOUT_MS: z.coerce.number().int().min(500).max(60_000).default(5_000),
 
+	/**
+	 * Asked of a leg that has to CONFIRM before it may be bridged.
+	 *
+	 * Answer confirmation is what stops a mobile's own voicemail from winning a follow-me hop: the
+	 * leg that answered is asked to press a digit, and only a machine that cannot will fail.
+	 * `screen-callee-options` is Asterisk's own call-screening prompt — "dial 1 if you wish this call
+	 * to be answered" — and is in the core sound package, so a stock install confirms with no prompt
+	 * pack. Point this at a recorded "press 1 to accept this call" when there is one.
+	 */
+	ENGINE_CONFIRM_PROMPT: z.string().min(1).default("sound:screen-callee-options"),
+
+	/** The one digit that accepts a confirming call. Anything else is a decline. */
+	ENGINE_CONFIRM_ACCEPT_DIGIT: z
+		.string()
+		.regex(/^[0-9*#]$/)
+		.default("1"),
+
+	/** Prompts a confirming leg hears before the call is taken away from it. */
+	ENGINE_CONFIRM_ATTEMPTS: z.coerce.number().int().min(1).max(5).default(2),
+
+	/**
+	 * How long one confirmation prompt waits for a digit.
+	 *
+	 * Deliberately long: the leg has just been answered, which on a mobile means the phone is still
+	 * travelling towards an ear, and a budget that expires before the prompt has been heard sends
+	 * every call on the ladder to the next hop.
+	 */
+	ENGINE_CONFIRM_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(60_000).default(15_000),
+
 	/** Deadline for `rpc.voicemail.v1.list`. The caller is already connected and listening. */
 	ENGINE_VOICEMAIL_RPC_TIMEOUT_MS: z.coerce.number().int().min(100).max(30_000).default(3_000),
 
