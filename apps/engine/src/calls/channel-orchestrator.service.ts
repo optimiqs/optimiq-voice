@@ -25,6 +25,8 @@ import { CallSignalBus, legSignalKey, recordingSignalKey } from "../routing/call
 import { CLAIM_HEARTBEAT_INTERVAL_MS } from "../routing/claim-timing";
 import { ConferenceRegistry } from "../routing/conference-registry";
 import { DidIndexSource } from "../routing/did-index.source";
+import { ExtensionFeatureRpcPort } from "../routing/extension-feature.source";
+import { LastCallerRpcSource } from "../routing/last-caller.source";
 import { ParkRegistry } from "../routing/park-registry";
 import { PlanWalker } from "../routing/plan-walker";
 import { RoutingArtifactSource } from "../routing/routing-artifact.source";
@@ -207,6 +209,8 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		private readonly jetstream: JetStreamService,
 		private readonly routing: RoutingArtifactSource,
 		private readonly mailbox: VoicemailMailboxRpcSource,
+		private readonly extensionFeatures: ExtensionFeatureRpcPort,
+		private readonly lastCaller: LastCallerRpcSource,
 		private readonly didIndex: DidIndexSource,
 		private readonly signals: CallSignalBus,
 		private readonly conferences: ConferenceRegistry,
@@ -958,6 +962,25 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			legs: this.legHooksFor(aggregate),
 			voicemail: this.voicemailPortFor(aggregate),
 			mailbox: this.mailbox,
+			// The two self-service seams: the WRITE behind `*72`/`*74`/`*76`/`*78`/`*21` and the ledger
+			// read behind `*69`. Both are stateless over the shared rpc client, so one instance serves
+			// every walk — see `routing.module.ts`.
+			features: this.extensionFeatures,
+			lastCaller: this.lastCaller,
+			// `greetings` is deliberately ABSENT, and `*99` therefore announces "not available" and
+			// records nothing.
+			//
+			// The runtime is complete (`PlanWalker.recordGreetingCode`) and so is the port; what does not
+			// exist is a CONTRACT to carry a recorded greeting to the control plane. A greeting is not a
+			// `voicemail.message.left` — filing one is a two-row write (clear the incumbent, activate the
+			// new one) inside a recompile, which `voicemail-greetings.service.ts` explains at length and
+			// which `voicemailMessageLeftDataSchema` cannot express. Publishing it as a message would put
+			// somebody's greeting in their own inbox and light their MWI lamp.
+			//
+			// Wiring a port that could not file would be the one outcome the runtime is built to avoid:
+			// a user who records thirty seconds of their voice and is told it worked. So the seam stays
+			// open until `packages/events` carries the subject, and the caller is told the truth in the
+			// meantime.
 			// The ACD plane, passed as a bundle rather than five constructor arguments to the walker:
 			// a queue node needs all five or none of them, and a walk that had four would fail in the
 			// middle of somebody's hold music rather than at construction.
@@ -1107,6 +1130,41 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 					extension: request.extension,
 				});
 				return result.ok ? { ok: true } : { ok: false, reason: result.reason };
+			},
+			/**
+			 * `*69`'s return call, resolved as if the caller had dialled the digits themselves.
+			 *
+			 * Internal FIRST and outbound only if nothing matched, which is the same two-step and the
+			 * same order {@link resolveRoute} uses for a call arriving on an internal context — and it
+			 * is where the toll gate lives. `routeLeg` alone would have been the internal half only,
+			 * and an extension whose last caller was a mobile is the case `*69` mostly exists for.
+			 *
+			 * That this walks a SECOND plan on the same leg is deliberate and is not new: a blind
+			 * transfer does exactly this, through this method's own `routeLeg`. The outer walk stops as
+			 * soon as this returns, so the two never run at once.
+			 */
+			dial: async (request) => {
+				const internal = await this.routeLeg(leg, {
+					destination: request.destination,
+					context: "internal",
+				});
+				if (internal.status !== "unresolved") {
+					return {
+						status: internal.status,
+						...(internal.cause === undefined ? {} : { cause: internal.cause }),
+					};
+				}
+				const outbound = await this.routeLeg(leg, {
+					destination: request.destination,
+					context: "outbound",
+				});
+				return {
+					status: outbound.status,
+					...(outbound.cause === undefined ? {} : { cause: outbound.cause }),
+					...(outbound.status === "unresolved"
+						? { reason: outbound.notes.join("; ") || internal.notes.join("; ") }
+						: {}),
+				};
 			},
 		};
 	}

@@ -314,6 +314,22 @@
 			"goResponseType": "VoicemailListResponse"
 		},
 		{
+			"subject": "rpc.pbx.v1.extension-feature",
+			"timeoutMs": 5000,
+			"requestSchema": "rpc/rpc.pbx.v1.extension-feature.request.schema.json",
+			"responseSchema": "rpc/rpc.pbx.v1.extension-feature.response.schema.json",
+			"goRequestType": "ExtensionFeatureRequest",
+			"goResponseType": "ExtensionFeatureResponse"
+		},
+		{
+			"subject": "rpc.pbx.v1.last-caller",
+			"timeoutMs": 3000,
+			"requestSchema": "rpc/rpc.pbx.v1.last-caller.request.schema.json",
+			"responseSchema": "rpc/rpc.pbx.v1.last-caller.response.schema.json",
+			"goRequestType": "LastCallerRequest",
+			"goResponseType": "LastCallerResponse"
+		},
+		{
 			"subject": "rpc.sip.v1.credential",
 			"timeoutMs": 500,
 			"requestSchema": "rpc/rpc.sip.v1.credential.request.schema.json",

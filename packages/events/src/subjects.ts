@@ -22,6 +22,8 @@ import { createHash } from "node:crypto";
  * provision.evt.v1.<orgId>
  * rpc.routing.v1.resolve                     request-reply, not JetStream
  * rpc.authz.v1.check
+ * rpc.pbx.v1.extension-feature               engine -> api; a handset writing its own state
+ * rpc.pbx.v1.last-caller                     engine -> api; `*69`, answered from cdr-db
  * rpc.sip.v1.credential
  * rpc.media.v1.allocate-session              engine -> mediad; RAW NATS both ends (see rpc.ts)
  * rpc.media.v1.bridge-sessions
@@ -67,6 +69,25 @@ export const RPC_SUBJECTS = {
 	routingResolve: `rpc.routing.${SUBJECT_VERSION}.resolve`,
 	authzCheck: `rpc.authz.${SUBJECT_VERSION}.check`,
 	voicemailList: `rpc.voicemail.${SUBJECT_VERSION}.list`,
+	/**
+	 * A user changing their OWN forwarding, do-not-disturb or follow-me from a handset:
+	 * `apps/engine` → `apps/api`.
+	 *
+	 * The engine holds no database handle, and `extension` is `pbx-db` — so `*72`, `*74`, `*76`,
+	 * `*78` and `*21` cannot be anything but a request-reply to the process that owns the row. It
+	 * is a write, unlike every other subject the engine calls, which is why the responder treats
+	 * `extensionNumber` as a CLAIM to be resolved rather than as an identity to be trusted.
+	 */
+	pbxExtensionFeature: `rpc.pbx.${SUBJECT_VERSION}.extension-feature`,
+	/**
+	 * `*69` — who rang this extension last: `apps/engine` → `apps/api`.
+	 *
+	 * Separate from the subject above because it is a READ, and a read of a different database:
+	 * the answer lives in `cdr-db`'s `call_legs`, not in `pbx-db`. Folding a query into a
+	 * mutation's subject would have put a partitioned time-series scan behind a name that says
+	 * "feature", and would have made the two impossible to grant separately at the broker.
+	 */
+	pbxLastCaller: `rpc.pbx.${SUBJECT_VERSION}.last-caller`,
 	sipCredential: `rpc.sip.${SUBJECT_VERSION}.credential`,
 	/**
 	 * The SIP edge asking the call engine to execute a phone's REFER: `apps/sipd` (Go) → the
@@ -491,6 +512,14 @@ export const subjectFor = {
 	/** `rpc.authz.v1.check` */
 	authzCheckRpc(): string {
 		return RPC_SUBJECTS.authzCheck;
+	},
+	/** `rpc.pbx.v1.extension-feature` */
+	pbxExtensionFeatureRpc(): string {
+		return RPC_SUBJECTS.pbxExtensionFeature;
+	},
+	/** `rpc.pbx.v1.last-caller` */
+	pbxLastCallerRpc(): string {
+		return RPC_SUBJECTS.pbxLastCaller;
 	},
 	/** `rpc.sip.v1.credential` */
 	sipCredentialRpc(): string {

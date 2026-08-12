@@ -21,6 +21,8 @@ import type { OriginateCallPath, OriginateService } from "../nats/originate.serv
 import type { ParkHandoffService } from "../nats/park-handoff.service";
 import type { SipTransferCallPath, SipTransferService } from "../nats/sip-transfer.service";
 import type { DidIndexSource } from "../routing/did-index.source";
+import type { ExtensionFeatureRpcPort } from "../routing/extension-feature.source";
+import type { LastCallerRpcSource } from "../routing/last-caller.source";
 import type { RoutingArtifactSource } from "../routing/routing-artifact.source";
 import type { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
 import type { ControlledLeg } from "./call-control";
@@ -48,6 +50,21 @@ const NO_DID_INDEX = {
 const NO_MAILBOX = {
 	list: async () => ({ found: false, messages: [], reason: "no responder in this spec" }),
 } as unknown as VoicemailMailboxRpcSource;
+
+/**
+ * Feature-code seams that refuse.
+ *
+ * These specs are about the orchestrator's own wiring, not about `*72` or `*69` — those live in
+ * `routing/plan-walker-features.spec.ts`, where the walker's ports are faked directly. Refusing
+ * here keeps a star code dialled by accident from reaching a broker that is not running.
+ */
+const NO_FEATURES = {
+	apply: async () => ({ applied: false, enabled: false, reason: "no responder in this spec" }),
+} as unknown as ExtensionFeatureRpcPort;
+
+const NO_LAST_CALLER = {
+	lookup: async () => ({ found: false, reason: "no responder in this spec" }),
+} as unknown as LastCallerRpcSource;
 
 /**
  * A park-handoff seam that answers nothing.
@@ -331,6 +348,8 @@ function harness(options: HarnessOptions = {}) {
 		// No mailbox responder in a spec, which is also the production state until the API side
 		// lands: a `*97` announces the mailbox as unavailable rather than as empty.
 		(options.mailbox ?? NO_MAILBOX) as VoicemailMailboxRpcSource,
+		NO_FEATURES,
+		NO_LAST_CALLER,
 		(options.didIndex ?? NO_DID_INDEX) as DidIndexSource,
 		signals,
 		new ConferenceRegistry(),

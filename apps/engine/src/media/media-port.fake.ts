@@ -1,3 +1,4 @@
+import { MediaOperationNotSupportedError } from "./media-not-supported.error";
 import type {
 	BridgeHandle,
 	CreateBridgeRequest,
@@ -63,6 +64,8 @@ export interface FakeMediaPortOptions {
 	 */
 	readonly onSnoop?: (request: SnoopRequest) => void;
 	readonly snoopFails?: boolean;
+	/** Makes `echo` refuse, which is how a media plane that cannot echo (`mediad`) is exercised. */
+	readonly echoFails?: boolean;
 	/**
 	 * Called after `answer`, so a spec can deliver the `Up` state change a real media server sends.
 	 *
@@ -211,6 +214,12 @@ export function makeFakeMediaPort(options: FakeMediaPortOptions = {}): FakeMedia
 		},
 		sendDtmf: async (channelId: string, request: SendDtmfRequest): Promise<void> => {
 			record("sendDtmf", channelId, request);
+		},
+		echo: async (channelId: string): Promise<void> => {
+			record("echo", channelId);
+			if (options.echoFails === true) {
+				throw new MediaOperationNotSupportedError("echo", "Asterisk's Echo() application", "fake");
+			}
 		},
 		snoop: async (request: SnoopRequest): Promise<OriginatedChannel> => {
 			record("snoop", request);

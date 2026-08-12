@@ -25,6 +25,8 @@ const (
 	SubjectRoutingResolveRPC        = "rpc.routing.v1.resolve"
 	SubjectAuthzCheckRPC            = "rpc.authz.v1.check"
 	SubjectVoicemailListRPC         = "rpc.voicemail.v1.list"
+	SubjectExtensionFeatureRPC      = "rpc.pbx.v1.extension-feature"
+	SubjectLastCallerRPC            = "rpc.pbx.v1.last-caller"
 	SubjectSipCredentialRPC         = "rpc.sip.v1.credential"
 	SubjectSipTransferRPC           = "rpc.sip.v1.transfer"
 	SubjectMediaAllocateSessionRPC  = "rpc.media.v1.allocate-session"
@@ -44,6 +46,8 @@ const (
 	TimeoutRoutingResolveRPC        = 2000 * time.Millisecond
 	TimeoutAuthzCheckRPC            = 1000 * time.Millisecond
 	TimeoutVoicemailListRPC         = 3000 * time.Millisecond
+	TimeoutExtensionFeatureRPC      = 5000 * time.Millisecond
+	TimeoutLastCallerRPC            = 3000 * time.Millisecond
 	TimeoutSipCredentialRPC         = 500 * time.Millisecond
 	TimeoutSipTransferRPC           = 2000 * time.Millisecond
 	TimeoutMediaAllocateSessionRPC  = 500 * time.Millisecond
@@ -225,6 +229,106 @@ func (v VoicemailListResponseMessagesFolder) Valid() bool {
 }
 
 func (v VoicemailListResponseMessagesFolder) String() string { return string(v) }
+
+// ExtensionFeatureRequest is the request body of rpc.pbx.v1.extension-feature.
+type ExtensionFeatureRequest struct {
+	OrgID           string                         `json:"orgId"`
+	ExtensionNumber string                         `json:"extensionNumber"`
+	Feature         ExtensionFeatureRequestFeature `json:"feature"`
+	Enabled         bool                           `json:"enabled"`
+	Destination     *string                        `json:"destination,omitempty"`
+	CallID          *string                        `json:"callId,omitempty"`
+}
+
+// ExtensionFeatureRequestFeature is the closed vocabulary of ExtensionFeatureRequest.feature.
+type ExtensionFeatureRequestFeature string
+
+const (
+	ExtensionFeatureRequestFeatureForwardAll      ExtensionFeatureRequestFeature = "forward-all"
+	ExtensionFeatureRequestFeatureForwardBusy     ExtensionFeatureRequestFeature = "forward-busy"
+	ExtensionFeatureRequestFeatureForwardNoAnswer ExtensionFeatureRequestFeature = "forward-no-answer"
+	ExtensionFeatureRequestFeatureDoNotDisturb    ExtensionFeatureRequestFeature = "do-not-disturb"
+	ExtensionFeatureRequestFeatureFollowMe        ExtensionFeatureRequestFeature = "follow-me"
+)
+
+// ExtensionFeatureRequestFeatureValues lists every member of the vocabulary, in contract order.
+var ExtensionFeatureRequestFeatureValues = []ExtensionFeatureRequestFeature{
+	ExtensionFeatureRequestFeatureForwardAll,
+	ExtensionFeatureRequestFeatureForwardBusy,
+	ExtensionFeatureRequestFeatureForwardNoAnswer,
+	ExtensionFeatureRequestFeatureDoNotDisturb,
+	ExtensionFeatureRequestFeatureFollowMe,
+}
+
+// Valid reports whether v is a member of the ExtensionFeatureRequestFeature vocabulary.
+func (v ExtensionFeatureRequestFeature) Valid() bool {
+	for _, candidate := range ExtensionFeatureRequestFeatureValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v ExtensionFeatureRequestFeature) String() string { return string(v) }
+
+// ExtensionFeatureResponse is the reply body of rpc.pbx.v1.extension-feature.
+type ExtensionFeatureResponse struct {
+	Applied     bool                            `json:"applied"`
+	Feature     ExtensionFeatureResponseFeature `json:"feature"`
+	Enabled     bool                            `json:"enabled"`
+	Destination *string                         `json:"destination,omitempty"`
+	Reason      *string                         `json:"reason,omitempty"`
+}
+
+// ExtensionFeatureResponseFeature is the closed vocabulary of ExtensionFeatureResponse.feature.
+type ExtensionFeatureResponseFeature string
+
+const (
+	ExtensionFeatureResponseFeatureForwardAll      ExtensionFeatureResponseFeature = "forward-all"
+	ExtensionFeatureResponseFeatureForwardBusy     ExtensionFeatureResponseFeature = "forward-busy"
+	ExtensionFeatureResponseFeatureForwardNoAnswer ExtensionFeatureResponseFeature = "forward-no-answer"
+	ExtensionFeatureResponseFeatureDoNotDisturb    ExtensionFeatureResponseFeature = "do-not-disturb"
+	ExtensionFeatureResponseFeatureFollowMe        ExtensionFeatureResponseFeature = "follow-me"
+)
+
+// ExtensionFeatureResponseFeatureValues lists every member of the vocabulary, in contract order.
+var ExtensionFeatureResponseFeatureValues = []ExtensionFeatureResponseFeature{
+	ExtensionFeatureResponseFeatureForwardAll,
+	ExtensionFeatureResponseFeatureForwardBusy,
+	ExtensionFeatureResponseFeatureForwardNoAnswer,
+	ExtensionFeatureResponseFeatureDoNotDisturb,
+	ExtensionFeatureResponseFeatureFollowMe,
+}
+
+// Valid reports whether v is a member of the ExtensionFeatureResponseFeature vocabulary.
+func (v ExtensionFeatureResponseFeature) Valid() bool {
+	for _, candidate := range ExtensionFeatureResponseFeatureValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v ExtensionFeatureResponseFeature) String() string { return string(v) }
+
+// LastCallerRequest is the request body of rpc.pbx.v1.last-caller.
+type LastCallerRequest struct {
+	OrgID           string  `json:"orgId"`
+	ExtensionNumber string  `json:"extensionNumber"`
+	WithinHours     int     `json:"withinHours"`
+	CallID          *string `json:"callId,omitempty"`
+}
+
+// LastCallerResponse is the reply body of rpc.pbx.v1.last-caller.
+type LastCallerResponse struct {
+	Found        bool       `json:"found"`
+	CallerNumber *string    `json:"callerNumber,omitempty"`
+	CallerName   *string    `json:"callerName,omitempty"`
+	At           *EventTime `json:"at,omitempty"`
+	Reason       *string    `json:"reason,omitempty"`
+}
 
 // SipCredentialRequest is the request body of rpc.sip.v1.credential.
 type SipCredentialRequest struct {

@@ -1,0 +1,27 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"applied": {
+			"type": "boolean"
+		},
+		"feature": {
+			"type": "string",
+			"enum": ["forward-all", "forward-busy", "forward-no-answer", "do-not-disturb", "follow-me"]
+		},
+		"enabled": {
+			"default": false,
+			"type": "boolean"
+		},
+		"destination": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"reason": {
+			"type": "string",
+			"maxLength": 256
+		}
+	},
+	"required": ["applied", "feature", "enabled"],
+	"additionalProperties": false
+}

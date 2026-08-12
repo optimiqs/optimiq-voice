@@ -298,6 +298,24 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		request: RPC_CONTRACTS["rpc.voicemail.v1.list"].request,
 		response: RPC_CONTRACTS["rpc.voicemail.v1.list"].response,
 	},
+	// The handset's own feature state, and the `*69` lookup behind it. Both are TypeScript on both
+	// ends today, so these structs are documentation rather than a wire contract — emitted anyway,
+	// because the emitter's rule is "every RPC subject", and a subject that quietly opted out would
+	// be the one nobody notices is missing when a Go caller for it appears.
+	{
+		subject: "rpc.pbx.v1.extension-feature",
+		goName: "ExtensionFeature",
+		timeoutMs: RPC_CONTRACTS["rpc.pbx.v1.extension-feature"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.pbx.v1.extension-feature"].request,
+		response: RPC_CONTRACTS["rpc.pbx.v1.extension-feature"].response,
+	},
+	{
+		subject: "rpc.pbx.v1.last-caller",
+		goName: "LastCaller",
+		timeoutMs: RPC_CONTRACTS["rpc.pbx.v1.last-caller"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.pbx.v1.last-caller"].request,
+		response: RPC_CONTRACTS["rpc.pbx.v1.last-caller"].response,
+	},
 	{
 		subject: "rpc.sip.v1.credential",
 		goName: "SipCredential",

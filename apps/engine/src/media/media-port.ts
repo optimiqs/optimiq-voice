@@ -278,4 +278,28 @@ export interface MediaPort {
 	 * before calling this — see {@link SnoopRequest}.
 	 */
 	snoop(request: SnoopRequest): Promise<OriginatedChannel>;
+
+	/**
+	 * Loop this leg's own audio back to it — `*43`, the echo test.
+	 *
+	 * ## Why it is a port operation and not a composition of the ones above
+	 *
+	 * There is no arrangement of `play`, `record`, `snoop` and `addToBridge` that echoes a caller to
+	 * themselves. A mixing bridge deliberately does NOT feed a member its own audio (that is what
+	 * makes conferences usable), a snoop hears the leg but has nowhere to put what it hears, and
+	 * record/play is a file round trip measured in seconds. Echo is a primitive of the media plane,
+	 * so it belongs on the media plane's interface.
+	 *
+	 * ## The leg leaves the engine's application, and that is the point
+	 *
+	 * An echo test has no routing left in it: there is nothing to decide, nothing to bridge, and no
+	 * next node. The Asterisk driver therefore hands the channel to `Echo()` in the dialplan and the
+	 * caller stays there until they hang up. The walk that called this is OVER — it reports
+	 * `bridged`, the walk status that means "the walk is finished and the call is up", exactly as a
+	 * parked call does. `watchChannel` keeps the CDR arriving after the channel leaves Stasis.
+	 *
+	 * @throws {import("./media-not-supported.error").MediaOperationNotSupportedError} when the
+	 * selected media plane cannot echo. The caller announces rather than leaving the line silent.
+	 */
+	echo(channelId: string): Promise<void>;
 }

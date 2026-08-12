@@ -21,6 +21,8 @@ import { EmergencyAddressesController } from "./emergency-addresses/emergency-ad
 import { EmergencyAddressesService } from "./emergency-addresses/emergency-addresses.service";
 import { EmergencyConsumer } from "./emergency-addresses/emergency-consumer.service";
 import { EmergencyNotificationService } from "./emergency-addresses/emergency-notification.service";
+import { ExtensionFeatureRpcController } from "./extensions/extension-feature-rpc.controller";
+import { ExtensionFeatureService } from "./extensions/extension-feature.service";
 import { ExtensionsController } from "./extensions/extensions.controller";
 import { ExtensionsService } from "./extensions/extensions.service";
 import { FeatureCodesController } from "./feature-codes/feature-codes.controller";
@@ -210,6 +212,16 @@ const logger = getLogger("api.pbx");
 		RoutingController,
 		RoutingRpcController,
 		VoicemailRpcController,
+		/**
+		 * A handset writing its OWN forwarding, do-not-disturb or follow-me.
+		 *
+		 * Beside the other two broker responders because it is the same transport and the same rule:
+		 * one `app.connectMicroservice` for the application, so a controller declared here subscribes
+		 * its subject at boot. It is the only one of the three that WRITES, which is why the number it
+		 * is handed is resolved against the tenant before anything is written rather than trusted —
+		 * see `extension-feature.service.ts`.
+		 */
+		ExtensionFeatureRpcController,
 		/**
 		 * The change ledger's read surface.
 		 *
@@ -476,6 +488,7 @@ const logger = getLogger("api.pbx");
 			],
 		},
 		ExtensionsService,
+		ExtensionFeatureService,
 		PhoneNumbersService,
 		TrunksService,
 		InboundRoutesService,

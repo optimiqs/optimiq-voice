@@ -20,7 +20,7 @@ import type { ConferenceRegistry } from "./conference-registry";
 import type { MediaRefSettings } from "./media-refs";
 import type { PlanDestination } from "./plan-destination";
 import type { TrunkCapacityPort } from "./trunk-capacity";
-import type { CallEvent } from "@optimiq-voice/events";
+import type { CallEvent, ExtensionFeature } from "@optimiq-voice/events";
 import type {
 	CompiledTimeCondition,
 	ConferencePlanNode,
@@ -97,10 +97,22 @@ import type {
  * points both at one node. `feature-code` now serves directed (`**<ext>`) and group (`*8`) pickup
  * for real, through the same call-control runtime.
  *
- * Placeholder, and honest about it: `voicemail` records but has no mailbox, no MWI and no email;
- * `feature-code` serves `*97` as that placeholder and answers everything else with an announcement;
- * `application` announces and hangs up. Every one of them adds a line to {@link WalkOutcome.notes},
- * so a call that hit a gap says so in the log rather than looking like a routing bug.
+ * Also real, and the reason this class grew a second half: the SELF-SERVICE star codes.
+ * `*72`/`*74`/`*76` (forward all / busy / no answer), `*78` (do not disturb) and `*21` (follow me)
+ * send `rpc.pbx.v1.extension-feature` and confirm or refuse audibly; `*69` reads the call ledger
+ * over `rpc.pbx.v1.last-caller` and dials the result back through the same routing the caller would
+ * have got by hand; `*43` hands the leg to the media plane's echo; `*99` records a mailbox greeting
+ * behind the same PIN gate `*97` uses. `*97` and `*98` are now reachable from the star-code
+ * CATALOGUE rather than only from the `voicemailPrefix` settings — see
+ * {@link PlanWalker.voicemailCode} for the gap that closed. Every one of them needs its port
+ * ({@link PlanWalkerDependencies.features}, `lastCaller`, `greetings`, `control`); without one the
+ * code announces and says so, which is exactly what it did before this wave.
+ *
+ * Placeholder, and honest about it: `voicemail` records but has no MWI and no email; the remaining
+ * feature codes (`intercom`, `paging`, `record-toggle`, `eavesdrop`, `transfer`, `queue-toggle`,
+ * `agent-status`) answer with an announcement; `application` announces and hangs up. Every one of
+ * them adds a line to {@link WalkOutcome.notes}, so a call that hit a gap says so in the log rather
+ * than looking like a routing bug.
  */
 
 /** The A-leg, as the walker sees it. Every member is live: the orchestrator owns the state. */
@@ -159,6 +171,28 @@ export interface WalkerCallControl {
 		readonly kind: "directed" | "group";
 		readonly extension: string;
 	}): Promise<{ readonly ok: boolean; readonly reason?: string }>;
+	/**
+	 * Re-enters routing for a number this walk decided to dial on the caller's behalf — `*69`.
+	 *
+	 * The walker holds the artifact's whole node table, so it can find an EXTENSION by number
+	 * without help; what it cannot do is resolve an arbitrary string, because that needs the number
+	 * index and the outbound match table, neither of which travels with a plan. `*69` returning a
+	 * mobile is exactly that case, and the alternative to this seam would be the walker inventing a
+	 * trunk for a number it read out of a CDR — the toll-fraud boundary, given away by a feature.
+	 *
+	 * The orchestrator answers it by resolving the digits as if the CALLER had dialled them:
+	 * internal first, then outbound, where the toll-class gate, the outbound kill switch and the
+	 * call-block screen all apply. So `*69` can never reach somewhere the same handset could not.
+	 *
+	 * The outcome mirrors a walk's, because that is what happens on the other side: `unresolved`
+	 * means nothing matched and the leg is untouched; every other value means a walk ran on this leg
+	 * and has already left it wherever it left it.
+	 */
+	dial(request: { readonly destination: string }): Promise<{
+		readonly status: WalkStatus | "unresolved";
+		readonly cause?: HangupCause;
+		readonly reason?: string;
+	}>;
 }
 
 /** Deployment-shaped knobs. All of them have defaults; none of them is a routing decision. */
@@ -194,6 +228,32 @@ export interface PlanWalkerSettings {
 	readonly voicemailGreeting: string;
 	/** Played for the node kinds this slice does not implement. */
 	readonly unavailableAnnouncement: string;
+	/**
+	 * Played when a feature code SWITCHED SOMETHING ON, and its opposite when it switched it off.
+	 *
+	 * Two announcements rather than one confirmation tone, because a bare `*72` is a TOGGLE and the
+	 * caller pressed the same digits either way: a single beep would leave them with no idea whether
+	 * their calls now go to their mobile or back to their desk, which is precisely the question they
+	 * dialled the code to settle. `activated` and `de-activated` are in Asterisk's core sound
+	 * package — the same standard the PIN prompts hold to — so this works on a stock install with no
+	 * prompt pack.
+	 */
+	readonly featureActivatedAnnouncement: string;
+	readonly featureDeactivatedAnnouncement: string;
+	/**
+	 * Played to a caller who dialled `*43`, before the echo starts.
+	 *
+	 * A prompt rather than dropping straight into echo, because an echo test with no preamble is
+	 * indistinguishable from a broken call: the caller hears themselves a beat later and assumes the
+	 * line is faulty. `demo-echotest` is Asterisk's own wording for exactly this and ships with the
+	 * core sounds; a deployment with no such file gets a failed playback, which is noted and does not
+	 * stop the echo.
+	 */
+	readonly echoTestPrompt: string;
+	/** Longest greeting `*99` will record. Beyond it the recording is closed and filed as it stands. */
+	readonly greetingMaxSeconds: number;
+	/** Played after `*99` has filed a greeting, so the user knows it took. */
+	readonly greetingRecordedAnnouncement: string;
 	/** Asked for before a mailbox with a PIN is opened. */
 	readonly voicemailPinPrompt: string;
 	/** Played after a wrong PIN, before the next attempt. */
@@ -260,6 +320,16 @@ export const DEFAULT_PLAN_WALKER_SETTINGS: PlanWalkerSettings = {
 	recordingFormat: "wav",
 	voicemailGreeting: "sound:unavailable",
 	unavailableAnnouncement: "sound:unavailable",
+	// `activated`, `de-activated` and `demo-echotest` are all in Asterisk's core sound package, so
+	// the feature codes confirm themselves on a stock install with no prompt pack — the same
+	// standard the PIN and confirmation prompts hold to.
+	featureActivatedAnnouncement: "sound:activated",
+	featureDeactivatedAnnouncement: "sound:de-activated",
+	echoTestPrompt: "sound:demo-echotest",
+	// A minute. A greeting people actually listen to is fifteen seconds; the cap is there to stop a
+	// forgotten handset writing an hour of room noise into the media store, not to shape the message.
+	greetingMaxSeconds: 60,
+	greetingRecordedAnnouncement: "sound:activated",
 	// `vm-password` and `vm-incorrect` are in Asterisk's core sound package, so a PIN challenge
 	// works on a stock install with no prompt pack — the same standard the digit readback holds to.
 	voicemailPinPrompt: "sound:vm-password",
@@ -331,6 +401,25 @@ export interface PlanWalkerDependencies {
 	 * announces the mailbox as unavailable — never as empty.
 	 */
 	readonly mailbox?: VoicemailMailboxSource;
+	/**
+	 * Where `*99` files the greeting it just recorded.
+	 *
+	 * Absent means `*99` announces "not available" and records NOTHING — deliberately in that order.
+	 * A code that answered, played a beep, took thirty seconds of somebody's voice and then had
+	 * nowhere to put it would leave the user believing their greeting is live, which is a worse
+	 * outcome than the announcement and is discovered by the first caller who reaches the mailbox.
+	 */
+	readonly greetings?: VoicemailGreetingPort;
+	/**
+	 * Where `*72`, `*74`, `*76`, `*78` and `*21` send the change they were dialled to make.
+	 *
+	 * Absent means those codes announce and hang up exactly as they did before this wave. It is a
+	 * port rather than a direct RPC call for the reason `mailbox` is: "no responder" is a state these
+	 * runtimes have to handle correctly, so it must be as easy to write a test for as a success is.
+	 */
+	readonly features?: ExtensionFeaturePort;
+	/** Where `*69` asks who rang. Absent means the code announces, exactly as it did before. */
+	readonly lastCaller?: LastCallerSource;
 	/**
 	 * The ACD plane: the roster source, the agent state machine, the queue event publisher and the
 	 * per-process line and cursor.
@@ -476,6 +565,109 @@ export interface VoicemailMailboxSource {
 	 * as `found: false` — a broker timeout and a responder saying "no" are the same fact to a caller.
 	 */
 	list(request: VoicemailListingRequest): Promise<VoicemailListing>;
+}
+
+/** A greeting a user has just recorded over `*99`, on its way to their mailbox. */
+export interface RecordedGreeting {
+	readonly voicemailBoxId: string;
+	readonly mailboxNumber: string;
+	/** Minted by the walker, so a redelivered publish files one greeting rather than two. */
+	readonly greetingId: string;
+	readonly recordingId: string;
+	readonly objectKey: string;
+	readonly durationMs: number;
+	/**
+	 * Which greeting was recorded.
+	 *
+	 * `unavailable` and nothing else, because `*99` is one code: which of a box's greetings a code
+	 * records is a product decision the CATALOGUE would have to express (a second code, or an
+	 * argument), and the catalogue says `voicemail-record-greeting` takes no argument. The field is
+	 * here rather than implied so the day a `*99` variant is added, the consumer does not have to
+	 * guess what the existing one meant.
+	 */
+	readonly kind: "unavailable";
+}
+
+/**
+ * Where `*99` files what it recorded.
+ *
+ * A port, on the same terms as {@link VoicemailPort}: the greeting has to become a
+ * `voicemail_greeting` row and an ACTIVE one, which is a two-row write inside a recompile that only
+ * the control plane can make (see `voicemail-greetings.service.ts`). The engine records the audio
+ * and says so; it never files a row.
+ */
+export interface VoicemailGreetingPort {
+	/** @throws when the greeting could not be filed. The walk announces rather than confirming. */
+	greetingRecorded(greeting: RecordedGreeting): Promise<void>;
+}
+
+/** One feature change a handset asked for. `feature` is the contract's own vocabulary. */
+export interface ExtensionFeatureChange {
+	readonly organizationId: string;
+	/** The CALLING extension's number — the same identity `*97` opens a mailbox with. */
+	readonly extensionNumber: string;
+	readonly feature: ExtensionFeature;
+	readonly enabled: boolean;
+	/** Where to forward, for the three forwarding features. Ignored by DND and follow-me. */
+	readonly destination?: string;
+	readonly callId?: string;
+}
+
+/**
+ * What came back.
+ *
+ * `applied` is the only field the walk branches on, and the separation from `enabled` is the point:
+ * "nothing was written" and "it is now off" are different things to say to somebody, and a runtime
+ * that read `enabled` alone would play the de-activation announcement for a refusal.
+ */
+export interface ExtensionFeatureOutcome {
+	readonly applied: boolean;
+	/** The state AFTER the write. Only meaningful when `applied`. */
+	readonly enabled: boolean;
+	readonly destination?: string;
+	readonly reason?: string;
+}
+
+/**
+ * Where a feature code sends the change it was dialled to make.
+ *
+ * A port for the reason {@link VoicemailMailboxSource} is one: a spec should not need a broker, and
+ * "no responder" is a path these runtimes must get right — a caller who is told nothing assumes
+ * forwarding is on, and the person who rings them afterwards is the one who finds out it is not.
+ */
+export interface ExtensionFeaturePort {
+	/**
+	 * @throws when the port could not be reached at all. The walk catches it and treats it exactly as
+	 * `applied: false`.
+	 */
+	apply(change: ExtensionFeatureChange): Promise<ExtensionFeatureOutcome>;
+}
+
+/** What `*69` asks. */
+export interface LastCallerLookup {
+	readonly organizationId: string;
+	readonly extensionNumber: string;
+	readonly callId?: string;
+}
+
+/**
+ * Who rang last.
+ *
+ * `found: true` with no `callerNumber` is the WITHHELD caller and is deliberately not a miss: there
+ * was a call, and there is nothing to dial. The walk announces both, and the notes tell them apart.
+ */
+export interface LastCallerResult {
+	readonly found: boolean;
+	readonly callerNumber?: string;
+	readonly callerName?: string;
+	/** ISO 8601, for the walk's notes. */
+	readonly at?: string;
+	readonly reason?: string;
+}
+
+export interface LastCallerSource {
+	/** @throws when the source could not be reached. The walk treats it as `found: false`. */
+	lookup(request: LastCallerLookup): Promise<LastCallerResult>;
 }
 
 /** One leg the walk is about to create, as the orchestrator needs to file it. */
@@ -635,6 +827,37 @@ type DialOutcome =
 	| { readonly kind: "aborted" };
 
 const MILLIS_PER_SECOND = 1_000;
+
+/**
+ * The catalogue's action names, mapped onto the contract's feature names.
+ *
+ * Two vocabularies rather than one, and deliberately: `FeatureCodeAction` is what a TENANT's
+ * star-code table can hold (twenty entries, most of which are not extension state at all), and
+ * `ExtensionFeature` is the closed set of columns a handset may write. Collapsing them would either
+ * put `paging` in a contract that writes extension rows or force the catalogue to be named after
+ * the database. The map is where they meet, and a code with no entry here is simply not a feature
+ * this RPC can serve.
+ */
+const FEATURE_FOR_ACTION: Readonly<Record<string, ExtensionFeature | undefined>> = {
+	"call-forward-all": "forward-all",
+	"call-forward-busy": "forward-busy",
+	"call-forward-no-answer": "forward-no-answer",
+	"do-not-disturb": "do-not-disturb",
+	"follow-me": "follow-me",
+};
+
+/**
+ * The three codes whose dialled digits are a DESTINATION.
+ *
+ * `*78` and `*21` take no argument (`FEATURE_CODE_ARGUMENT_MODE` says `none`), so digits after them
+ * are not theirs to read — and reading them anyway would make a mis-dialled `*7812` set do-not-
+ * disturb "to 12" instead of failing to match anything.
+ */
+const FORWARD_ACTIONS: ReadonlySet<string> = new Set([
+	"call-forward-all",
+	"call-forward-busy",
+	"call-forward-no-answer",
+]);
 
 export class PlanWalker {
 	private readonly settings: PlanWalkerSettings;
@@ -841,10 +1064,31 @@ export class PlanWalker {
 	/**
 	 * Star codes.
 	 *
-	 * `voicemail-check` is served by the voicemail placeholder for whatever the code's own target
-	 * says; everything else announces and hangs up. That is not laziness — a `*78` that silently
-	 * did nothing would leave a user believing DND is on, and a caller who then rings them would be
-	 * the one who finds out.
+	 * ## What is served here, and what is served by going somewhere else
+	 *
+	 * A code with a `targetNodeId` has already been resolved by the compiler — a `*5` pinned to one
+	 * park lot is the only one today — and is simply followed. Everything else is a RUNTIME, and
+	 * they divide into three kinds:
+	 *
+	 * - **Navigation.** `*97` and `*98` do not need a runtime at all: the artifact's mailbox table
+	 *   already names a `check` node and a `leave` node per box, so the code's job is to pick the
+	 *   right one and hand the walk over to the voicemail runtime that has served the
+	 *   `voicemailCheckPrefix` path since it was written. See {@link voicemailCode}.
+	 * - **Call control.** `**<ext>` and `*8` take somebody else's ringing call over.
+	 * - **A write, or a read, that only the control plane can make.** The five self-service codes
+	 *   (`*72`, `*74`, `*76`, `*78`, `*21`) and `*69` are requests over the broker, because the
+	 *   engine holds no database handle. Every one of them announces rather than falling silent when
+	 *   nothing answers — a `*78` that quietly did nothing leaves a user believing DND is on, and the
+	 *   caller who then rings them is the one who finds out.
+	 *
+	 * `*43` and `*99` are the two that need the media plane rather than the control plane.
+	 *
+	 * ## What is still not implemented, and says so
+	 *
+	 * `intercom`, `paging`, `record-toggle`, `eavesdrop`, `transfer`, `queue-toggle` and
+	 * `agent-status` announce and add a note. Four of them have runtimes elsewhere in the engine
+	 * (mid-call features, the ACD) that this seam is not yet wired to; the other three have none.
+	 * Either way the caller is told, which is the whole point of the announcement.
 	 */
 	private async featureCodeNode(
 		node: Extract<PlanNode, { kind: "feature-code" }>,
@@ -853,25 +1097,597 @@ export class PlanWalker {
 		if (node.targetNodeId !== undefined) {
 			return { kind: "goto", nodeId: node.targetNodeId };
 		}
-		if (node.action === "call-pickup" || node.action === "group-pickup") {
-			return await this.pickupCode(node, input);
+
+		switch (node.action) {
+			case "call-pickup":
+			case "group-pickup": {
+				return await this.pickupCode(node, input);
+			}
+			case "voicemail-check":
+			case "voicemail-direct": {
+				return await this.voicemailCode(node, input);
+			}
+			case "voicemail-record-greeting": {
+				return await this.recordGreetingCode(node, input);
+			}
+			case "call-forward-all":
+			case "call-forward-busy":
+			case "call-forward-no-answer":
+			case "do-not-disturb":
+			case "follow-me": {
+				return await this.extensionFeatureCode(node, input);
+			}
+			case "redial": {
+				return await this.redialCode(node, input);
+			}
+			case "echo-test": {
+				return await this.echoTestCode(node);
+			}
+			default: {
+				this.note(`feature code ${node.code} (${node.action}) is not implemented yet`);
+				return await this.announceAndHangup(
+					this.settings.unavailableAnnouncement,
+					"FACILITY_NOT_IMPLEMENTED",
+				);
+			}
 		}
-		if (node.action === "voicemail-check" || node.action === "voicemail-direct") {
-			// A feature code with no target compiled to nothing to go to: the tenant has the code but
-			// no mailbox behind it. Announcing that is the honest answer — the alternative is a `*97`
-			// that plays a greeting and hangs up, which a user reads as "my voicemail is broken".
+	}
+
+	/**
+	 * `*97` and `*98` — reaching a mailbox from the CATALOGUE rather than from a prefix setting.
+	 *
+	 * ## The gap this closes
+	 *
+	 * `packages/routing` compiles a `voicemail-check` feature code to a `feature-code` node with no
+	 * `targetNodeId` — `featureCodeTarget` resolves `call-park`'s pinned lot and nothing else — so
+	 * until now the ONLY way to reach a mailbox was `settings.voicemailCheckPrefix`. A tenant on the
+	 * default catalogue had `*97` in their star-code table, saw it in the admin UI, dialled it, and
+	 * got "not available". The prefix and the code were two doors to one room and only one of them
+	 * was fitted.
+	 *
+	 * ## Why the fix is here rather than in the compiler
+	 *
+	 * The artifact already carries everything needed: `internal.mailboxes` is keyed by mailbox number
+	 * and names both a `leave` and a `check` node per box. Teaching the compiler to point the code at
+	 * one of them would mean choosing at COMPILE time which mailbox `*97` opens, and the answer
+	 * depends on who dialled it — a fact the compiler does not have. So the code resolves the mailbox
+	 * the way `*97` always has (the calling extension's) and hands the walk to the node the compiler
+	 * already built.
+	 *
+	 * `*98` takes the mailbox as its argument, which is what `FEATURE_CODE_ARGUMENT_MODE` says
+	 * (`required`), and leaves a message in it — the caller is a colleague dropping a note, not the
+	 * owner, so there is no PIN and no menu.
+	 */
+	private async voicemailCode(
+		node: Extract<PlanNode, { kind: "feature-code" }>,
+		input: WalkInput,
+	): Promise<StepResult> {
+		const direct = node.action === "voicemail-direct";
+		const claimed = direct
+			? input.featureArgument?.trim()
+			: (input.callerIdNumber ?? this.deps.channel.callerIdNumber)?.trim();
+
+		if (claimed === undefined || claimed === "") {
 			this.note(
-				`feature code ${node.code} (${node.action}) resolved to no mailbox node; nothing to open`,
+				direct
+					? `feature code ${node.code} needs the mailbox to leave a message in`
+					: `feature code ${node.code} was dialled by a caller with no number; there is no mailbox to open`,
 			);
 			return await this.announceAndHangup(
 				this.settings.unavailableAnnouncement,
 				"INVALID_NUMBER_FORMAT",
 			);
 		}
-		this.note(`feature code ${node.code} (${node.action}) is not implemented yet`);
+
+		const entry = input.mailboxes?.[claimed];
+		if (entry === undefined) {
+			// The honest answer, and NOT "you have no messages": the tenant has the code and this
+			// number has no box behind it, which a user reads as a configuration problem rather than as
+			// a broken mailbox.
+			this.note(
+				`feature code ${node.code} (${node.action}) found no mailbox for ${claimed}; nothing to open`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		this.note(
+			direct
+				? `feature code ${node.code} is leaving a message in mailbox ${entry.mailboxNumber}`
+				: `feature code ${node.code} is opening mailbox ${entry.mailboxNumber}`,
+		);
+		return { kind: "goto", nodeId: direct ? entry.leaveNodeId : entry.checkNodeId };
+	}
+
+	/**
+	 * `*72`, `*74`, `*76`, `*78` and `*21` — a user changing their own state from their own handset.
+	 *
+	 * ## The identity is the phone, and it is a CLAIM on the other side
+	 *
+	 * The caller's number is the same authenticated identity `*97` opens a mailbox with: the call
+	 * came from that extension, which is exactly as strong as the phone on the desk and is the
+	 * classic PBX default. The responder does not trust it — it resolves the number inside the
+	 * tenant's scope before writing anything — which is why this end can send it plainly.
+	 *
+	 * ## Set versus toggle
+	 *
+	 * The three forwarding codes take an OPTIONAL argument (`FEATURE_CODE_ARGUMENT_MODE`), and the
+	 * two readings are different operations: `*72<number>` SETS, `*72` alone TOGGLES. A toggle needs
+	 * to know the current state, and the artifact answers that for three of the five features — see
+	 * {@link currentFeatureState} for the two it cannot and what is done about them.
+	 *
+	 * ## Both outcomes are audible
+	 *
+	 * `applied: true` plays the activation or de-activation announcement — which one depends on the
+	 * state that came BACK, not on what was asked for, so a race with an admin editing the same row
+	 * tells the user what is true rather than what they intended. `applied: false`, a timeout and a
+	 * missing port all play "not available". Nothing here ends in silence, because a user who hears
+	 * nothing assumes it worked.
+	 */
+	private async extensionFeatureCode(
+		node: Extract<PlanNode, { kind: "feature-code" }>,
+		input: WalkInput,
+	): Promise<StepResult> {
+		const port = this.deps.features;
+		if (port === undefined) {
+			this.note(
+				`feature code ${node.code} (${node.action}) was dialled but this walk has no feature port`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		const caller = (input.callerIdNumber ?? this.deps.channel.callerIdNumber)?.trim();
+		if (caller === undefined || caller === "") {
+			this.note(
+				`feature code ${node.code} (${node.action}) was dialled by a caller with no number; there is no extension to change`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		const feature = FEATURE_FOR_ACTION[node.action];
+		if (feature === undefined) {
+			this.note(`feature code ${node.code} (${node.action}) is not an extension feature`);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		const destination = FORWARD_ACTIONS.has(node.action)
+			? (input.featureArgument?.trim() ?? "")
+			: "";
+		// Digits after the code mean SET; the code alone means toggle. A destination on a code that
+		// has none (`*78`, `*21`) is ignored rather than refused — the contract says the field is
+		// meaningless there, and refusing over it would be a refusal the user cannot act on.
+		const enabled = destination === "" ? !this.currentFeatureState(feature, caller, input) : true;
+
+		let outcome: ExtensionFeatureOutcome;
+		try {
+			outcome = await port.apply({
+				organizationId: this.deps.channel.organizationId,
+				extensionNumber: caller,
+				feature,
+				enabled,
+				...(destination === "" ? {} : { destination }),
+				callId: this.deps.channel.callId,
+			});
+		} catch (error) {
+			// A thrown port and a refusing one are the same fact to the caller. Kept as a catch rather
+			// than pushed onto every implementation so a port that forgets is still safe here.
+			this.note(
+				`feature code ${node.code} (${node.action}) could not be applied: ${String(error)}`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"NORMAL_TEMPORARY_FAILURE",
+			);
+		}
+
+		if (!outcome.applied) {
+			this.note(
+				`feature code ${node.code} (${node.action}) was refused: ${outcome.reason ?? "no reason given"}`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"NORMAL_TEMPORARY_FAILURE",
+			);
+		}
+
+		this.note(
+			`feature code ${node.code} (${node.action}) is now ${outcome.enabled ? "on" : "off"} for extension ${caller}${
+				outcome.destination === undefined ? "" : ` (destination ${outcome.destination})`
+			}`,
+		);
 		return await this.announceAndHangup(
-			this.settings.unavailableAnnouncement,
-			"FACILITY_NOT_IMPLEMENTED",
+			outcome.enabled
+				? this.settings.featureActivatedAnnouncement
+				: this.settings.featureDeactivatedAnnouncement,
+			"NORMAL_CLEARING",
+		);
+	}
+
+	/**
+	 * What the artifact says this feature is currently doing for the caller's extension.
+	 *
+	 * ## Three of the five are readable, and two are not
+	 *
+	 * The walk holds the artifact's whole node table (a resolve hands over `artifact.nodes` by
+	 * reference), so the caller's own `extension` node is findable by number, and it carries:
+	 * `forwardAllNodeId` — present exactly when forward-all is on — `doNotDisturb`, and `followMe`,
+	 * present exactly when the ladder is switched on and has hops.
+	 *
+	 * `busyNodeId` and `noAnswerNodeId` cannot answer the same question, and no amount of care here
+	 * would change that: the compiler writes the FORWARD target into those fields when forwarding is
+	 * on and the mailbox into them when it is not, so both states produce a populated field. A
+	 * reading based on the node's KIND would be a guess that breaks the day somebody forwards to a
+	 * colleague whose extension happens to have voicemail.
+	 *
+	 * So a bare `*74`/`*76` is treated as "currently on", which makes the toggle a CLEAR. That is the
+	 * safe direction and it is chosen deliberately: clearing keeps the stored destination (the
+	 * responder guarantees it), so the cost of guessing wrong is a user who hears "de-activated" and
+	 * presses again with the number — while guessing the other way would silently divert somebody's
+	 * calls to a destination they configured months ago. Setting is always unambiguous:
+	 * `*74<number>` never consults this.
+	 */
+	private currentFeatureState(
+		feature: ExtensionFeature,
+		callerNumber: string,
+		input: WalkInput,
+	): boolean {
+		if (feature === "forward-busy" || feature === "forward-no-answer") {
+			return true;
+		}
+		const node = this.extensionNodeFor(callerNumber, input);
+		if (node === undefined) {
+			// No extension node for the caller means the walk cannot see their configuration at all —
+			// an off-net caller who reached an internal context, or an artifact that does not contain
+			// them. Treated as "on" for the same reason the two unreadable features are: the inverse is
+			// a clear, and a clear is the harmless half of a wrong guess.
+			this.note(
+				`extension ${callerNumber} is not in this artifact; the ${feature} toggle assumed it was on`,
+			);
+			return true;
+		}
+		if (feature === "forward-all") {
+			return node.forwardAllNodeId !== undefined;
+		}
+		if (feature === "do-not-disturb") {
+			return node.doNotDisturb;
+		}
+		return node.followMe !== undefined;
+	}
+
+	/** The caller's own `extension` node, found by number in the artifact's table. */
+	private extensionNodeFor(callerNumber: string, input: WalkInput): ExtensionPlanNode | undefined {
+		for (const candidate of Object.values(input.plan.nodes)) {
+			if (candidate.kind === "extension" && candidate.number === callerNumber) {
+				return candidate;
+			}
+		}
+		return undefined;
+	}
+
+	/**
+	 * `*69` — call back whoever rang this extension last.
+	 *
+	 * ## Two ways to reach the number, and the order matters
+	 *
+	 * An INTERNAL caller is already in the artifact: their `extension` node is in the table the walk
+	 * is holding, so the return call is a `goto` onto it. That is not a shortcut, it is the better
+	 * answer — the walk re-enters the extension runtime and therefore honours the callee's own
+	 * forwarding, their follow-me ladder and their no-answer branch, exactly as if the digits had
+	 * been dialled by hand.
+	 *
+	 * An EXTERNAL caller is not, and cannot be: turning `+15551234567` into a trunk needs the number
+	 * index and the outbound match table, neither of which travels with a plan. That is what
+	 * {@link WalkerCallControl.dial} is for, and the orchestrator answers it by resolving the digits
+	 * as if the caller had dialled them — so the toll-class gate, the outbound kill switch and the
+	 * call-block screen all apply and `*69` can never reach somewhere the same handset could not.
+	 *
+	 * ## `found: true` with no number is not a miss
+	 *
+	 * A withheld caller means there WAS a call and there is nothing to dial. Both it and an empty
+	 * window announce, because to the person holding the handset they are the same outcome; the
+	 * notes tell them apart for the support ticket.
+	 */
+	private async redialCode(
+		node: Extract<PlanNode, { kind: "feature-code" }>,
+		input: WalkInput,
+	): Promise<StepResult> {
+		const source = this.deps.lastCaller;
+		if (source === undefined) {
+			this.note(
+				`feature code ${node.code} (${node.action}) was dialled but this walk has no last-caller source`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		const caller = (input.callerIdNumber ?? this.deps.channel.callerIdNumber)?.trim();
+		if (caller === undefined || caller === "") {
+			this.note(
+				`feature code ${node.code} was dialled by a caller with no number; there is no extension to look up`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		let result: LastCallerResult;
+		try {
+			result = await source.lookup({
+				organizationId: this.deps.channel.organizationId,
+				extensionNumber: caller,
+				callId: this.deps.channel.callId,
+			});
+		} catch (error) {
+			this.note(`feature code ${node.code} could not read the call ledger: ${String(error)}`);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"NORMAL_TEMPORARY_FAILURE",
+			);
+		}
+
+		const number = result.callerNumber?.trim();
+		if (!result.found || number === undefined || number === "") {
+			this.note(
+				result.found
+					? `feature code ${node.code}: the last caller to ${caller} withheld their number`
+					: `feature code ${node.code}: nobody has called ${caller} recently (${result.reason ?? "empty window"})`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"NO_ROUTE_DESTINATION",
+			);
+		}
+
+		const internal = this.extensionNodeFor(number, input);
+		if (internal !== undefined) {
+			this.note(`feature code ${node.code} is returning the call from extension ${number}`);
+			return { kind: "goto", nodeId: internal.id };
+		}
+
+		const control = this.deps.control;
+		if (control === undefined) {
+			this.note(
+				`feature code ${node.code} found ${number}, which is not an extension in this artifact, and this walk has no call-control runtime to dial it`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		this.note(`feature code ${node.code} is returning the call to ${number}`);
+		const outcome = await control.dial({ destination: number });
+		switch (outcome.status) {
+			case "bridged": {
+				return { kind: "bridged" };
+			}
+			case "aborted": {
+				return { kind: "aborted" };
+			}
+			case "unresolved": {
+				this.note(`${number} could not be dialled back: ${outcome.reason ?? "nothing matched it"}`);
+				return await this.announceAndHangup(
+					this.settings.unavailableAnnouncement,
+					"NO_ROUTE_DESTINATION",
+				);
+			}
+			default: {
+				// A walk ran on this leg and has already ended it. `terminate` skips the hangup verb on a
+				// leg that is tearing down, so returning the cause records it without touching the leg
+				// twice.
+				return { kind: "hangup", cause: outcome.cause ?? "NORMAL_CLEARING" };
+			}
+		}
+	}
+
+	/**
+	 * `*43` — the echo test.
+	 *
+	 * ## Why the walk ENDS here rather than continuing
+	 *
+	 * There is nothing left to route: the leg is handed to the media plane's echo and stays there
+	 * until the caller hangs up. `bridged` is the walk status that means "the walk is over and the
+	 * call is up" — the same one a parked call reports, and for the same reason — and it is what
+	 * stops the orchestrator from tearing the leg down when the walk returns.
+	 *
+	 * ## The prompt is played first, and its failure is not fatal
+	 *
+	 * An echo with no preamble is indistinguishable from a fault: the caller hears themselves a beat
+	 * late and hangs up thinking the line is broken. But a deployment missing the sound file is not
+	 * a reason to refuse the test, so a failed playback is noted and the echo proceeds.
+	 *
+	 * A media plane that cannot echo at all (`mediad` refuses by name) announces instead — the caller
+	 * is told, and the log names the driver.
+	 */
+	private async echoTestCode(
+		node: Extract<PlanNode, { kind: "feature-code" }>,
+	): Promise<StepResult> {
+		if (!(await this.ensureAnswered())) {
+			return { kind: "aborted" };
+		}
+
+		const played = await this.deps.execute({ verb: "play", media: this.settings.echoTestPrompt });
+		if (played === undefined) {
+			this.note(
+				`feature code ${node.code}: the echo-test prompt could not be played; the echo was started anyway`,
+			);
+		}
+
+		try {
+			await this.deps.media.echo(this.deps.channel.mediaChannelId);
+		} catch (error) {
+			this.note(`feature code ${node.code}: this media plane cannot echo (${String(error)})`);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		this.note(`feature code ${node.code} handed the leg to the media plane's echo`);
+		return { kind: "bridged" };
+	}
+
+	/**
+	 * `*99` — recording a mailbox greeting from the handset.
+	 *
+	 * ## Nothing is recorded that cannot be filed
+	 *
+	 * The port is checked BEFORE the beep, and that ordering is the whole design. A code that
+	 * answered, prompted, took thirty seconds of somebody's voice and then had nowhere to put it
+	 * would leave them believing their greeting is live — discovered later by a caller who hears the
+	 * deployment's default announcement instead. The same rule governs the end: a greeting that could
+	 * not be filed plays "not available", never the confirmation.
+	 *
+	 * ## The mailbox and the PIN are `*97`'s
+	 *
+	 * The box is the calling extension's, found in the artifact's mailbox table exactly as a check
+	 * finds it, and the PIN gate is the same one — read off the `check` node the mailbox entry names,
+	 * so a box with a PIN cannot have its greeting replaced by whoever is standing at the desk. A box
+	 * with no digest is not challenged, which is the same deliberate default {@link
+	 * challengeVoicemailPin} documents.
+	 *
+	 * ## An empty recording is not a greeting
+	 *
+	 * A zero-length or failed recording is discarded with a note rather than filed, on the same rule
+	 * the message path holds to: an active greeting containing silence is worse than no greeting,
+	 * because the box stops announcing itself and nothing says why.
+	 */
+	private async recordGreetingCode(
+		node: Extract<PlanNode, { kind: "feature-code" }>,
+		input: WalkInput,
+	): Promise<StepResult> {
+		const port = this.deps.greetings;
+		if (port === undefined) {
+			this.note(
+				`feature code ${node.code} (${node.action}) was dialled but this walk has nowhere to file a greeting; nothing was recorded`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		const caller = (input.callerIdNumber ?? this.deps.channel.callerIdNumber)?.trim();
+		const entry = caller === undefined || caller === "" ? undefined : input.mailboxes?.[caller];
+		if (entry === undefined) {
+			this.note(
+				`feature code ${node.code} found no mailbox for ${caller ?? "an unknown caller"}; there is no greeting to record`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		if (!(await this.ensureAnswered())) {
+			return { kind: "aborted" };
+		}
+
+		// The `check` node is where the compiler put the box's PIN digest, so the gate `*97` applies is
+		// reachable from here without a second source of truth about what a mailbox's secret is.
+		const checkNode = input.plan.nodes[entry.checkNodeId];
+		if (checkNode !== undefined && checkNode.kind === "voicemail") {
+			const authenticated = await this.challengeVoicemailPin(checkNode, entry.mailboxNumber);
+			if (authenticated.kind !== "granted") {
+				return authenticated.result;
+			}
+		}
+
+		const recordingId = this.newId();
+		const format = this.settings.recordingFormat;
+		const objectKey = `${this.deps.channel.organizationId}/${this.deps.channel.callId}/${recordingId}.${format}`;
+		const maxSeconds = this.settings.greetingMaxSeconds;
+		// Subscribed BEFORE the record call, for the reason the message path documents: a very short
+		// recording can finish before the HTTP response arrives.
+		const finished = this.waitForRecording(recordingId, (maxSeconds + 5) * MILLIS_PER_SECOND);
+
+		try {
+			await this.deps.media.record(this.deps.channel.mediaChannelId, {
+				name: recordingId,
+				format,
+				maxDurationSeconds: maxSeconds,
+				maxSilenceSeconds: 5,
+				beep: true,
+				terminateOn: "#",
+			});
+		} catch (error) {
+			finished.cancel();
+			this.note(
+				`feature code ${node.code}: the greeting recording failed to start: ${String(error)}`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"NORMAL_TEMPORARY_FAILURE",
+			);
+		}
+
+		await this.deps.publish("channel.record.started", {
+			legId: this.deps.channel.channelId,
+			recordingId,
+			objectKey,
+			// The recording taxonomy has no `greeting` member, so this is filed as `voicemail` — which
+			// is what it is, media belonging to a mailbox. The GREETING is identified by the port call
+			// below rather than by this event, which exists for the recording lifecycle and the CDR.
+			kind: "voicemail",
+		});
+
+		const result = await finished.promise;
+
+		await this.deps.publish("channel.record.stopped", {
+			legId: this.deps.channel.channelId,
+			recordingId,
+			objectKey,
+			durationMs: result.durationMs,
+			reason: result.reason,
+		});
+
+		if (result.reason === "failed" || result.durationMs <= 0) {
+			this.note(
+				`feature code ${node.code}: the greeting recording produced no audio (${result.reason}); the mailbox's greeting was left alone`,
+			);
+			return await this.announceAndHangup(this.settings.unavailableAnnouncement, "NORMAL_CLEARING");
+		}
+
+		try {
+			await port.greetingRecorded({
+				voicemailBoxId: entry.voicemailBoxId,
+				mailboxNumber: entry.mailboxNumber,
+				greetingId: this.newId(),
+				recordingId,
+				objectKey,
+				durationMs: result.durationMs,
+				kind: "unavailable",
+			});
+		} catch (error) {
+			this.note(
+				`feature code ${node.code}: the greeting was recorded into ${objectKey} but could NOT be filed: ${String(error)}`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"NORMAL_TEMPORARY_FAILURE",
+			);
+		}
+
+		this.note(
+			`feature code ${node.code} recorded a new greeting for mailbox ${entry.mailboxNumber}`,
+		);
+		return await this.announceAndHangup(
+			this.settings.greetingRecordedAnnouncement,
+			"NORMAL_CLEARING",
 		);
 	}
 

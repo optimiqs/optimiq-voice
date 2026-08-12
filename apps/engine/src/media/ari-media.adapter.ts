@@ -198,4 +198,39 @@ export class AriMediaAdapter implements MediaPort {
 		});
 		return { channelId: channel.id, name: channel.name };
 	}
+
+	/**
+	 * `*43` — hand the leg to `Echo()` in the dialplan.
+	 *
+	 * ARI has no "execute this application" verb, by design: the REST interface exposes the media
+	 * primitives and leaves the application layer to the client. The one door back into Asterisk's
+	 * own applications is `POST /channels/{id}/continue`, so the echo test is a dialplan extension
+	 * ({@link ECHO_CONTEXT}, in `apps/asterisk/config/extensions.conf`) that the channel is sent to.
+	 *
+	 * The channel leaves Stasis when it goes, which is why {@link MediaPort.echo} says so in its own
+	 * contract rather than leaving the caller to discover it: nothing the walker does afterwards
+	 * would reach this leg. `watchChannel` was called when the leg was accepted, so `ChannelDestroyed`
+	 * still arrives and the CDR is still written.
+	 *
+	 * A deployment whose dialplan does not carry the context gets a `404`/`409` from ARI, which
+	 * propagates as the failure it is — the walker announces "not available" rather than dropping the
+	 * caller into silence in a context that does not exist.
+	 */
+	async echo(channelId: string): Promise<void> {
+		await this.client.channels.continueInDialplan(channelId, {
+			context: ECHO_CONTEXT,
+			extension: ECHO_EXTENSION,
+			priority: 1,
+		});
+	}
 }
+
+/**
+ * The dialplan the echo test is handed to.
+ *
+ * Constants rather than settings: this is not a deployment choice, it is the contract between the
+ * engine's ARI driver and `apps/asterisk/config/extensions.conf`, which ship together. A knob here
+ * would only let the two disagree.
+ */
+const ECHO_CONTEXT = "optimiq-echo";
+const ECHO_EXTENSION = "s";

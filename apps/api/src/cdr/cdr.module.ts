@@ -3,6 +3,8 @@ import { getLogger } from "@optimiq-voice/logging";
 import { createObjectStore, describeObjectStore, loadStorageEnv } from "../storage";
 import { CdrController } from "./query/cdr.controller";
 import { CdrService } from "./query/cdr.service";
+import { LastCallerRpcController } from "./query/last-caller-rpc.controller";
+import { LastCallerService } from "./query/last-caller.service";
 import { CdrRecordingRetentionSweeper } from "./recordings/recording-retention-sweeper.service";
 import { CdrRecordingsController } from "./recordings/recordings.controller";
 import { RecordingsService } from "./recordings/recordings.service";
@@ -41,7 +43,18 @@ const logger = getLogger("api.cdr");
  * billing ledger, and one consumer straddling both would make that impossible to guarantee.
  */
 @Module({
-	controllers: [CdrController, CdrRecordingsController],
+	controllers: [
+		CdrController,
+		CdrRecordingsController,
+		/**
+		 * `*69`, answered from the ledger this area already owns.
+		 *
+		 * The area's first broker responder, and it needs no transport: the microservice
+		 * `registerPbxTransport` connects is application-wide. See `last-caller.service.ts` for why the
+		 * read lives here rather than in `PbxModule` beside the feature WRITE it is paired with.
+		 */
+		LastCallerRpcController,
+	],
 	providers: [
 		{ provide: CDR_ENV, useFactory: (): CdrEnv => loadCdrEnv() },
 		{
@@ -73,6 +86,7 @@ const logger = getLogger("api.cdr");
 			inject: [CDR_ENV],
 		},
 		CdrService,
+		LastCallerService,
 		RecordingsService,
 		CdrLegWriter,
 		CdrRecordingWriter,
@@ -83,6 +97,7 @@ const logger = getLogger("api.cdr");
 		CDR_DATABASE,
 		CDR_RECORDING_STORE,
 		CdrService,
+		LastCallerService,
 		RecordingsService,
 		CdrRecordingRetentionSweeper,
 	],

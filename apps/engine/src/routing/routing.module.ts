@@ -3,6 +3,8 @@ import { CallSignalBus } from "./call-signals";
 import { ClaimHeartbeatService } from "./claim-heartbeat.service";
 import { ConferenceRegistry } from "./conference-registry";
 import { DidIndexSource } from "./did-index.source";
+import { ExtensionFeatureRpcPort } from "./extension-feature.source";
+import { LastCallerRpcSource } from "./last-caller.source";
 import { ParkRegistry } from "./park-registry";
 import { RoutingArtifactSource } from "./routing-artifact.source";
 import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
@@ -18,6 +20,10 @@ import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
  * lookup that decides which tenant a call belongs to before any of the above can be scoped.
  * {@link VoicemailMailboxRpcSource} joins them because it is stateless over the same rpc client
  * proxy and there is nothing per-call about "ask the control plane what is in this mailbox".
+ * {@link ExtensionFeatureRpcPort} and {@link LastCallerRpcSource} join it on exactly those terms —
+ * one rpc client, no per-call state, and a pair of counters a health check reads. They are here
+ * rather than in `CallsModule` for the reason the mailbox source is: the star codes that use them
+ * are executed by the plan walker, and the walker's collaborators are this module's.
  * {@link ConferenceRegistry} joins them because it is the one destination whose state outlives a
  * single walk: two callers dialing the same room are two walks that have to reach one bridge, and
  * a second registry would put them in two. {@link ParkRegistry} joins them for the same reason,
@@ -40,6 +46,8 @@ import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
 		RoutingArtifactSource,
 		DidIndexSource,
 		VoicemailMailboxRpcSource,
+		ExtensionFeatureRpcPort,
+		LastCallerRpcSource,
 		ConferenceRegistry,
 		ParkRegistry,
 		ClaimHeartbeatService,
@@ -49,6 +57,8 @@ import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
 		RoutingArtifactSource,
 		DidIndexSource,
 		VoicemailMailboxRpcSource,
+		ExtensionFeatureRpcPort,
+		LastCallerRpcSource,
 		ConferenceRegistry,
 		ParkRegistry,
 		ClaimHeartbeatService,

@@ -242,6 +242,159 @@ export const VOICEMAIL_LIST_RPC = defineRpc(
 );
 
 // ---------------------------------------------------------------------------------------------
+// rpc.pbx.v1.extension-feature — engine → api, when a handset presses `*72`/`*74`/`*76`/`*78`/`*21`
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The self-service half of forwarding, do-not-disturb and follow-me.
+ *
+ * ## Why this is the only write the engine makes
+ *
+ * `extension.forward_all_enabled` and its four siblings are already compiled into every routing
+ * artifact — the compiler resolves them into `forwardAllNodeId`, `busyNodeId` and `noAnswerNodeId`
+ * and the walker has honoured them since the day extensions were compiled. What was missing was
+ * the other direction: a user could only change them from the admin UI, so `*72` announced itself
+ * as unimplemented on a system that already routed forwarding perfectly.
+ *
+ * The columns live in `pbx-db`, which the API owns and the engine has no handle on, so the press
+ * has to become a request. FusionPBX did the same thing through ESL ("call forward/DND writes
+ * extension flags", frozen inventory §Features); this is that seam with a schema on it.
+ *
+ * ## `extensionNumber` is a claim, exactly as `mailboxNumber` is
+ *
+ * The engine knows which extension dialled because the call arrived from it, and that is as strong
+ * as the phone on the desk — the same authentication `*97` accepts. It is NOT authorization: a
+ * request on the broker proves only that something reached the broker. The responder therefore
+ * resolves the number inside `withTenantScope(orgId)` and refuses a number that is not an enabled
+ * extension of that organization, rather than writing whatever row it is handed.
+ *
+ * ## `enabled: false` never clears the destination
+ *
+ * The columns are a flag/destination pair precisely so switching forwarding off does not lose the
+ * number the user configured — see `extensions-schema.ts`. A clear therefore writes the flag and
+ * leaves the destination alone, which is what makes `*72` followed later by a bare `*72` a toggle
+ * rather than a re-typing exercise.
+ *
+ * ## The reply is what the caller HEARS
+ *
+ * `applied` decides between the confirmation tone and the "unavailable" announcement, so a refusal
+ * must arrive as a reply rather than as a timeout: a user who is told nothing assumes forwarding is
+ * on, and the person who then rings them is the one who finds out it is not. `reason` is for the
+ * log; the handset is never told which of the refusals happened.
+ */
+export const extensionFeatureSchema = z.enum([
+	"forward-all",
+	"forward-busy",
+	"forward-no-answer",
+	"do-not-disturb",
+	"follow-me",
+]);
+
+export const extensionFeatureRequestSchema = z.object({
+	orgId: z.uuid(),
+	/** The calling extension's number, as the engine authenticated it. A claim — see above. */
+	extensionNumber: z.string().min(1).max(32),
+	feature: extensionFeatureSchema,
+	/** The state being asked for. `false` clears the flag and keeps the stored destination. */
+	enabled: z.boolean(),
+	/**
+	 * Where to forward, for the three forwarding features when `enabled` is true.
+	 *
+	 * Ignored by `do-not-disturb` and `follow-me`, which have no destination of their own: a
+	 * ladder's hops are configured from the admin UI and `*21` only flips its switch.
+	 */
+	destination: dialStringSchema.optional(),
+	/** Present when the change came off a live call; for logging correlation only. */
+	callId: z.uuid().optional(),
+});
+
+export const extensionFeatureResponseSchema = z.object({
+	/** False means nothing was written. The handset hears the unavailable announcement. */
+	applied: z.boolean(),
+	feature: extensionFeatureSchema,
+	/** The state AFTER the write, or the state as it still stands when `applied` is false. */
+	enabled: z.boolean().default(false),
+	/** The stored destination after the write, when the feature has one. */
+	destination: z.string().max(128).optional(),
+	/** Why the change was refused, for the support ticket. Never played to the handset. */
+	reason: z.string().max(256).optional(),
+});
+
+export type ExtensionFeature = z.infer<typeof extensionFeatureSchema>;
+export type ExtensionFeatureRequest = z.infer<typeof extensionFeatureRequestSchema>;
+export type ExtensionFeatureResponse = z.infer<typeof extensionFeatureResponseSchema>;
+
+export const EXTENSION_FEATURE_RPC = defineRpc(
+	RPC_SUBJECTS.pbxExtensionFeature,
+	extensionFeatureRequestSchema,
+	extensionFeatureResponseSchema,
+	// The longest deadline in this file, and the only one that covers a WRITE. The responder does
+	// not just update a column: it recompiles the tenant's whole routing artifact inside the same
+	// transaction (compile-on-write), because a `*72` whose artifact still says "ring the desk" is
+	// a `*72` that did not happen. A caller listening to a moment of silence before the
+	// confirmation tone is a far better outcome than a confirmation that outran the change.
+	5_000,
+);
+
+// ---------------------------------------------------------------------------------------------
+// rpc.pbx.v1.last-caller — engine → api, when a handset presses `*69`
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * `*69` — call the last person who rang me back.
+ *
+ * ## Why the CDR and not a KV projection
+ *
+ * The engine sees every inbound leg, so it could keep its own "last caller" bucket. It should not:
+ * that bucket would be a second copy of a fact `cdr-db.call_legs` already stores durably, it would
+ * be empty after a restart or a rebalance, and it would have to be written on the call path for a
+ * feature pressed once a week. `call_legs` already carries `(organization_id, to_number)` as an
+ * index and `started_at` as its partition key, so the newest inbound leg towards an extension is
+ * one bounded index scan.
+ *
+ * FreeSWITCH backs `*69` with its own key-value store (frozen reference §Other capabilities). This
+ * is the same fact sourced from the ledger that was going to record it anyway.
+ *
+ * ## Bounded in time, always
+ *
+ * `call_legs` is partitioned by `started_at`, so an unbounded "most recent" query is a scan of
+ * every partition that exists. `withinHours` bounds it, and a lookup that finds nothing inside the
+ * window answers `found: false` rather than reaching further back — a `*69` that dials somebody
+ * from three months ago is a wrong number, not a feature.
+ */
+export const lastCallerRequestSchema = z.object({
+	orgId: z.uuid(),
+	/** The calling extension's number, as the engine authenticated it. A claim, as above. */
+	extensionNumber: z.string().min(1).max(32),
+	/** How far back to look. Bounded because the leg table is partitioned by time. */
+	withinHours: z.int().min(1).max(720).default(168),
+	callId: z.uuid().optional(),
+});
+
+export const lastCallerResponseSchema = z.object({
+	/** False means "nobody rang this extension inside the window", or that the lookup failed. */
+	found: z.boolean(),
+	/** The number to dial back. Absent with `found: true` means the caller withheld their number. */
+	callerNumber: dialStringSchema.optional(),
+	callerName: z.string().max(128).optional(),
+	/** When that leg started, ISO 8601. For the log and the walk's notes. */
+	at: z.iso.datetime().optional(),
+	reason: z.string().max(256).optional(),
+});
+
+export type LastCallerRequest = z.infer<typeof lastCallerRequestSchema>;
+export type LastCallerResponse = z.infer<typeof lastCallerResponseSchema>;
+
+export const LAST_CALLER_RPC = defineRpc(
+	RPC_SUBJECTS.pbxLastCaller,
+	lastCallerRequestSchema,
+	lastCallerResponseSchema,
+	// The same budget the mailbox listing gets, for the same reason: the caller is already
+	// connected and a slow reply costs dead air rather than a call that never connected.
+	3_000,
+);
+
+// ---------------------------------------------------------------------------------------------
 // rpc.sip.v1.credential — sipd → api, on every REGISTER that answers a digest challenge
 // ---------------------------------------------------------------------------------------------
 
@@ -1572,6 +1725,8 @@ export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.routingResolve]: ROUTING_RESOLVE_RPC,
 	[RPC_SUBJECTS.authzCheck]: AUTHZ_CHECK_RPC,
 	[RPC_SUBJECTS.voicemailList]: VOICEMAIL_LIST_RPC,
+	[RPC_SUBJECTS.pbxExtensionFeature]: EXTENSION_FEATURE_RPC,
+	[RPC_SUBJECTS.pbxLastCaller]: LAST_CALLER_RPC,
 	[RPC_SUBJECTS.sipCredential]: SIP_CREDENTIAL_RPC,
 	[RPC_SUBJECTS.sipTransfer]: SIP_TRANSFER_RPC,
 	[RPC_SUBJECTS.mediaAllocateSession]: MEDIA_ALLOCATE_SESSION_RPC,

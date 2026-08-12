@@ -2175,10 +2175,12 @@ describe("feature codes", () => {
 
 		expect(verbNames(h.verbs)).toEqual(["answer", "play", "hangup"]);
 		expect(outcome.hangupCause).toBe("INVALID_NUMBER_FORMAT");
-		expect(outcome.notes.join(" ")).toContain("resolved to no mailbox node");
+		// The code is in the catalogue and this caller has no box behind it. Announcing says so; the
+		// alternative is a `*97` that plays a greeting and hangs up, which reads as a broken mailbox.
+		expect(outcome.notes.join(" ")).toContain("found no mailbox");
 	});
 
-	it("announces and hangs up for every other code, rather than doing nothing", async () => {
+	it("announces and hangs up for a code with no runtime, rather than doing nothing", async () => {
 		const h = harness();
 		const outcome = await h.walker.walk(
 			walkInput([
@@ -2186,8 +2188,8 @@ describe("feature codes", () => {
 					id: "f",
 					kind: "feature-code",
 					featureCodeId: "fc-2",
-					code: "*78",
-					action: "do-not-disturb",
+					code: "*80",
+					action: "intercom",
 				} as PlanNode,
 			]),
 		);

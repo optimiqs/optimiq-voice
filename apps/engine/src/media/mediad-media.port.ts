@@ -606,6 +606,28 @@ export class MediadMediaPort implements MediaPort {
 		);
 	}
 
+	/**
+	 * Loops a leg's audio back to itself — REFUSED, and for the same reason `snoop` is: the thing
+	 * being asked for is an Asterisk application, not a media capability this relay is missing.
+	 *
+	 * The Asterisk driver serves `*43` by handing the channel to `Echo()` in the dialplan, which is
+	 * a door `mediad` does not have and should not grow: it has no dialplan, and a relay that
+	 * reflected a session's own packets back at it would be inventing an application on the far side
+	 * of the seam that exists to keep applications OFF it.
+	 *
+	 * So the refusal names the operation rather than a rung. The walker announces "not available",
+	 * and a deployment that wants an echo test sets `ENGINE_MEDIA_DRIVER=ari` — which is exactly the
+	 * per-capability cutover `plans/mediad-design.md` §2 describes.
+	 */
+	async echo(channelId: string): Promise<void> {
+		void channelId;
+		return this.refuse(
+			"echo",
+			"Asterisk's Echo() application, which is a dialplan application rather than a media " +
+				"capability this relay is missing",
+		);
+	}
+
 	// --- internals -------------------------------------------------------------------------------
 
 	/**
