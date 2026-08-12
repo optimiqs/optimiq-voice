@@ -16,6 +16,15 @@ export const routes = {
 	acceptInvitation: (invitationId: string) => `/accept-invitation/${invitationId}`,
 
 	overview: "/",
+	/**
+	 * The in-browser softphone — the user's own extension, registered over sipd's WSS transport.
+	 *
+	 * Session-only in `page-permissions.ts` (no entry): the gate is not a permission but a fact — the
+	 * caller holds an extension — which the page resolves from `GET /api/v1/me/softphone` and the
+	 * docked widget hides itself on. A `softphone.*` grant would be the wrong tool: every user with a
+	 * seat is entitled to their own line, and none of the existing roles model "may use a phone".
+	 */
+	softphone: "/softphone",
 	extensions: "/extensions",
 	devices: "/devices",
 	numbers: "/numbers",
@@ -144,6 +153,17 @@ export const routes = {
 	settings: "/settings",
 	members: "/settings/members",
 	apiKeys: "/settings/api-keys",
+	/**
+	 * White-label branding — product name, logo, primary/accent colours, support address and custom
+	 * domain, applied as `--role-*` theme overrides across the app.
+	 *
+	 * A settings tab because it IS organization-wide policy of the same shape every other tab holds.
+	 * Read is gated by `settings.read` and the save by `branding.write` — the W14 backend minted
+	 * `branding.write` but no `branding.read`, the same read-wide / write-narrow split
+	 * `recordings.configure` uses. The colour/name/logo endpoints themselves are the remaining wire-up
+	 * seam (`lib/branding/client.ts`).
+	 */
+	branding: "/settings/branding",
 	emergencyAddresses: "/settings/emergency-addresses",
 	/** The `notifications` category of the settings cascade — voicemail-to-email and its from-name. */
 	notifications: "/settings/notifications",

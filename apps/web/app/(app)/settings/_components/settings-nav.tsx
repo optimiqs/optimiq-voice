@@ -19,6 +19,7 @@ import { useAppSession } from "../../_context/session-context";
 const TABS = [
 	{ title: "General", url: routes.settings },
 	{ title: "Members", url: routes.members },
+	{ title: "Branding", url: routes.branding },
 	{ title: "API keys", url: routes.apiKeys },
 	{ title: "Notifications", url: routes.notifications },
 	{ title: "Routing", url: routes.routingSettings },

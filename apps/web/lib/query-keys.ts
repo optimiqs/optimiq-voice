@@ -290,4 +290,25 @@ export const queryKeys = {
 	 */
 	myAgentSession: (organizationId: string) =>
 		["organizations", organizationId, "pbx", "queue-agents", "session", "me"] as const,
+
+	/**
+	 * The caller's own softphone credentials — `GET /api/v1/me/softphone`.
+	 *
+	 * Org-scoped because the answer is the caller's extension IN this organization: a user with a
+	 * seat in two tenants has a different extension (and a different SIP password) in each, and an
+	 * org switch must not hand the softphone the previous tenant's credentials. The plaintext
+	 * password lives only in this cache entry, so the org-switch sweep that clears the tree is also
+	 * what expires it.
+	 */
+	softphoneCredentials: (organizationId: string) =>
+		["organizations", organizationId, "softphone", "credentials"] as const,
+
+	/**
+	 * The organization's white-label branding — `GET /api/v1/branding`.
+	 *
+	 * Org-scoped: branding is per-tenant, and the resolved product name / colours a user sees must
+	 * follow the active organization. The login page reads branding by HOST instead (a public,
+	 * pre-auth endpoint) and is not part of this cache — there is no session there to key it on.
+	 */
+	branding: (organizationId: string) => ["organizations", organizationId, "branding"] as const,
 } as const;

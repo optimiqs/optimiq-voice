@@ -4,8 +4,10 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Badge } from "~/components/ui/badge";
 import { focusRingInset } from "~/components/ui/focus-ring";
+import { brandLogoSrc } from "~/lib/branding/contracts";
 import { cn } from "~/lib/cn";
 import { canAccessPage } from "~/lib/page-permissions";
+import { useBrand } from "../_context/branding-context";
 import { useAppSession } from "../_context/session-context";
 import { isNavItemActive, NAV_SECTIONS, type NavItem } from "./nav-config";
 import { OrganizationSwitcher } from "./organization-switcher";
@@ -53,7 +55,35 @@ export function Sidebar() {
 			</div>
 
 			<UserMenu />
+			<BrandFooter />
 		</nav>
+	);
+}
+
+/**
+ * The product wordmark, driven by the resolved branding rather than a hard-coded string.
+ *
+ * Small and at the foot of the sidebar: the organization's own name is at the TOP (the switcher),
+ * so this is the PLATFORM identity, which white-label makes the reseller's. It reads from
+ * `useBrand()`, so a tenant that set a product name and logo sees theirs here, and everyone else
+ * sees the default — the same read that drives the theme colours.
+ */
+function BrandFooter() {
+	const brand = useBrand();
+	const logoSrc = brandLogoSrc(brand);
+	return (
+		<div className="flex items-center gap-2 px-2 pt-1 text-xs text-subtle-foreground">
+			{logoSrc ? (
+				// A tenant logo is an arbitrary URL / data URI; rendered as a background rather than an
+				// <img> so it stays oxlint-clean and handles data: URIs with no next/image config.
+				<span
+					aria-hidden="true"
+					className="size-4 shrink-0 rounded-[3px] bg-contain bg-center bg-no-repeat"
+					style={{ backgroundImage: `url(${JSON.stringify(logoSrc)})` }}
+				/>
+			) : null}
+			<span className="truncate">{brand.productName}</span>
+		</div>
 	);
 }
 

@@ -173,6 +173,17 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, PageRequirement>> = {
 	 */
 	[routes.webhooks]: { permissions: ["webhooks.read"] },
 	[routes.settings]: { permissions: ["settings.read"] },
+	/**
+	 * White-label branding.
+	 *
+	 * `settings.read` for the READ, because the W14 backend minted `branding.write` but no
+	 * `branding.read` — branding is an organization-wide setting whose window is not itself
+	 * sensitive, so it reads on the settings grant and only its WRITE is narrower. That is exactly
+	 * the split `recordings.configure` uses (see `/settings/recordings`). The page gates its save on
+	 * `branding.write` with `RequirePermission`, so a role that can read settings sees the screen
+	 * read-only without the narrower grant.
+	 */
+	[routes.branding]: { permissions: ["settings.read"] },
 	[routes.members]: { permissions: ["members.read"] },
 	[routes.apiKeys]: { permissions: ["api-keys.read", "api-keys.read.own"] },
 	/**

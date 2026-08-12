@@ -59,7 +59,10 @@ export interface NavSection {
 export const NAV_SECTIONS: readonly NavSection[] = [
 	{
 		label: "Overview",
-		items: [{ title: "Dashboard", url: routes.overview, icon: GaugeIcon }],
+		items: [
+			{ title: "Dashboard", url: routes.overview, icon: GaugeIcon },
+			{ title: "Softphone", url: routes.softphone, icon: KeypadIcon },
+		],
 	},
 	{
 		label: "Telephony",
