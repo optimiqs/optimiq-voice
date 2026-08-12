@@ -68,3 +68,41 @@ export {
 	uuidV7EntityId,
 	uuidV7PrimaryKey,
 } from "./schema/primitives";
+export {
+	organizationBranding,
+	organizationHierarchy,
+} from "./schema/platform/organization-platform-schema";
+export {
+	type BrandingPatch,
+	type BrandingRow,
+	readBranding,
+	readBrandingByCustomDomain,
+	upsertBranding,
+} from "./platform-branding";
+export {
+	type ChildOrganizationRow,
+	createChildOrganization,
+	hasChildren,
+	type HierarchyRow,
+	listChildOrganizations,
+	listResellerOrganizationIds,
+	readHierarchy,
+	setChildSuspended,
+	upsertHierarchy,
+} from "./platform-hierarchy";
+export {
+	listMailTemplates,
+	type MailTemplateRow,
+	readMailTemplate,
+	upsertMailTemplate,
+} from "./platform-mail-templates";
+export {
+	createSsoProvider,
+	deleteSsoProvider,
+	listEnabledSsoProviders,
+	listSsoProviders,
+	readSsoProvider,
+	type SsoProviderInput,
+	type SsoProviderRow,
+	updateSsoProvider,
+} from "./platform-sso";

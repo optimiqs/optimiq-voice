@@ -455,6 +455,23 @@ export const PERMISSIONS = [
 	"webhooks.read",
 	"webhooks.write",
 
+	/**
+	 * White-label branding — the product name, logo, colours, support address and custom host a
+	 * tenant (or a reseller, as the default its children inherit) presents to its users.
+	 *
+	 * ONE entry, and it is a write. Reading the EFFECTIVE branding is not a power worth its own
+	 * grant: it is presentation configuration a preferences screen renders, so the authenticated
+	 * read rides `settings.read` like the rest of the settings cascade, and the pre-auth theming
+	 * read the web shell makes by request host is `@PublicRoute` — it returns only brand fields for
+	 * one host and reaches no tenant data, so no permission gates it at all. What earns a named grant
+	 * is CHANGING the brand: a custom domain and a logo are the tenant's identity to its own users,
+	 * and pointing a host at this platform is closer to `webhooks.write` (an outward-facing surface)
+	 * than to editing a preference. It rides its own resource for the same reason `security.*` and
+	 * `webhooks.*` do — `settings.write` is held by the roles that manage ordinary configuration, and
+	 * this is not that.
+	 */
+	"branding.write",
+
 	// --- Platform and tenancy ------------------------------------------------
 	"settings.read",
 	"settings.write",
@@ -504,6 +521,46 @@ export const PERMISSIONS = [
 	"provisioning.read",
 	"provisioning.write",
 	"provisioning.tokens",
+
+	/**
+	 * The reseller (parent-tenant) surface — administering the child organizations under a reseller.
+	 *
+	 * TWO entries, and the count is defended the way this registry asks. `read` lists the children,
+	 * their identity and their aggregate usage; `write` creates a child, suspends or reinstates one,
+	 * and sets the reseller relationship. There is no `reseller.delete`: a child is an organization,
+	 * and deleting one is `organization`-plugin territory guarded by better-auth's own `owner` gate,
+	 * not a reseller power — suspension, not destruction, is what a parent tenant does.
+	 *
+	 * ## Why these are safe to hand the `admin` template, unlike a real platform-operator grant
+	 *
+	 * Holding `reseller.write` is INERT on an ordinary tenant. The reseller surface is gated twice:
+	 * the endpoint requires this permission AND requires the session's own organization to carry the
+	 * platform `is_reseller` flag (a control-plane fact set outside these five per-tenant templates,
+	 * on the untenanted `organization_hierarchy` row). An admin of a normal organization holds the
+	 * permission and reaches nothing, because their org is not a reseller. This is the distinction
+	 * the `org-limits.write` note gestures at: the reseller hierarchy is the platform-operator home
+	 * those quotas were waiting for, and the capability check — not a role template — is what makes it
+	 * a real cross-tenant boundary. Row reach is then narrowed by `assertMayAct`: a reseller only ever
+	 * touches children whose `parent_organization_id` is its own org, the same row check
+	 * `queue-agent-session.service.ts` uses for `.own`.
+	 */
+	"reseller.read",
+	"reseller.write",
+
+	/**
+	 * Configuring the organization's SSO identity providers — the per-org OIDC IdP an admin points
+	 * their members' sign-in at.
+	 *
+	 * ONE entry, and it is `configure` rather than a read/write pair, because there is nothing to
+	 * read that is not a secret: a provider row is an issuer, a client id and a client SECRET, and the
+	 * secret never leaves the process. Listing which IdPs an org has configured, and creating,
+	 * editing or removing one, are the same administrative act on the same sensitive rows, done by
+	 * the same person — the split a read/write pair buys elsewhere (a wide reader, a narrow writer)
+	 * has no audience here. It is its own resource rather than a ride on `settings.write` for the
+	 * `security.*`/`webhooks.*` reason: pointing an organization's authentication at an external IdP
+	 * is a credential-class power, not ordinary configuration.
+	 */
+	"sso.configure",
 ] as const;
 
 export type Permission = (typeof PERMISSIONS)[number];
@@ -1311,6 +1368,55 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 				description:
 					"Create, edit and remove webhook endpoints, and rotate their signing secrets. An " +
 					"endpoint receives a copy of every event it subscribes to.",
+			},
+		],
+	},
+	{
+		resource: "branding",
+		label: "Branding",
+		description:
+			"White-label appearance: product name, logo, colours, support address and custom domain.",
+		permissions: [
+			{
+				permission: "branding.write",
+				label: "Manage branding",
+				description:
+					"Set the organization's product name, logo, colours, support email and custom domain. " +
+					"A reseller's own branding is the default its child organizations inherit.",
+			},
+		],
+	},
+	{
+		resource: "reseller",
+		label: "Reseller",
+		description:
+			"Administering the child organizations under a reseller: listing, provisioning, suspending " +
+			"and aggregate usage. Active only for organizations the platform has flagged as resellers.",
+		permissions: [
+			{
+				permission: "reseller.read",
+				label: "View child organizations",
+				description: "List the organizations under this reseller and their aggregate usage.",
+			},
+			{
+				permission: "reseller.write",
+				label: "Manage child organizations",
+				description:
+					"Create a child organization, suspend or reinstate one, and set the reseller relationship.",
+			},
+		],
+	},
+	{
+		resource: "sso",
+		label: "Single sign-on",
+		description: "The organization's SSO identity providers and how members sign in through them.",
+		permissions: [
+			{
+				permission: "sso.configure",
+				label: "Configure SSO",
+				description:
+					"Add, edit and remove the organization's OIDC identity providers. Client secrets are " +
+					"never returned.",
 			},
 		],
 	},

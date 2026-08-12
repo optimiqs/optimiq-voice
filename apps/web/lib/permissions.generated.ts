@@ -104,6 +104,7 @@ export const PERMISSIONS = [
 	"security.write",
 	"webhooks.read",
 	"webhooks.write",
+	"branding.write",
 	"settings.read",
 	"settings.write",
 	"settings.read.own",
@@ -121,6 +122,9 @@ export const PERMISSIONS = [
 	"provisioning.read",
 	"provisioning.write",
 	"provisioning.tokens",
+	"reseller.read",
+	"reseller.write",
+	"sso.configure",
 ] as const;
 
 export type Permission = (typeof PERMISSIONS)[number];
@@ -807,6 +811,47 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 		],
 	},
 	{
+		resource: "branding",
+		label: "Branding",
+		description: "White-label appearance: product name, logo, colours, support address and custom domain.",
+		permissions: [
+			{
+				permission: "branding.write",
+				label: "Manage branding",
+				description: "Set the organization's product name, logo, colours, support email and custom domain. A reseller's own branding is the default its child organizations inherit.",
+			},
+		],
+	},
+	{
+		resource: "reseller",
+		label: "Reseller",
+		description: "Administering the child organizations under a reseller: listing, provisioning, suspending and aggregate usage. Active only for organizations the platform has flagged as resellers.",
+		permissions: [
+			{
+				permission: "reseller.read",
+				label: "View child organizations",
+				description: "List the organizations under this reseller and their aggregate usage.",
+			},
+			{
+				permission: "reseller.write",
+				label: "Manage child organizations",
+				description: "Create a child organization, suspend or reinstate one, and set the reseller relationship.",
+			},
+		],
+	},
+	{
+		resource: "sso",
+		label: "Single sign-on",
+		description: "The organization's SSO identity providers and how members sign in through them.",
+		permissions: [
+			{
+				permission: "sso.configure",
+				label: "Configure SSO",
+				description: "Add, edit and remove the organization's OIDC identity providers. Client secrets are never returned.",
+			},
+		],
+	},
+	{
 		resource: "settings",
 		label: "Settings",
 		description: "The organization settings cascade and platform defaults.",
@@ -1045,6 +1090,7 @@ export const SYSTEM_ROLE_TEMPLATES: readonly SystemRoleTemplate[] = [
 			"security.write",
 			"webhooks.read",
 			"webhooks.write",
+			"branding.write",
 			"settings.read",
 			"settings.write",
 			"settings.read.own",
@@ -1062,6 +1108,9 @@ export const SYSTEM_ROLE_TEMPLATES: readonly SystemRoleTemplate[] = [
 			"provisioning.read",
 			"provisioning.write",
 			"provisioning.tokens",
+			"reseller.read",
+			"reseller.write",
+			"sso.configure",
 		],
 	},
 	{
@@ -1165,6 +1214,7 @@ export const SYSTEM_ROLE_TEMPLATES: readonly SystemRoleTemplate[] = [
 			"security.write",
 			"webhooks.read",
 			"webhooks.write",
+			"branding.write",
 			"settings.read",
 			"settings.write",
 			"settings.read.own",
@@ -1181,6 +1231,9 @@ export const SYSTEM_ROLE_TEMPLATES: readonly SystemRoleTemplate[] = [
 			"provisioning.read",
 			"provisioning.write",
 			"provisioning.tokens",
+			"reseller.read",
+			"reseller.write",
+			"sso.configure",
 		],
 	},
 	{
