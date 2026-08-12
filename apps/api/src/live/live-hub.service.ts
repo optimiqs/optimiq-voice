@@ -3,6 +3,7 @@ import { connect, type KV, KvWatchInclude, type NatsConnection, type Subscriptio
 import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import {
 	agentStateEntrySchema,
+	queueWaitingRecordSchema,
 	callEventSchema,
 	liveChannelSchema,
 	queueEventSchema,
@@ -12,6 +13,7 @@ import {
 } from "@optimiq-voice/events/schemas";
 import {
 	AGENT_STATE_KV,
+	QUEUE_WAITING_KV,
 	CHANNELS_KV,
 	ensureKvBuckets,
 	REGISTRATIONS_KV,
@@ -105,10 +107,15 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 			});
 			const manager = await this.connection.jetstreamManager();
 			if (this.env.PBX_ENSURE_KV_BUCKETS) {
-				await ensureKvBuckets(manager, [REGISTRATIONS_KV, CHANNELS_KV, AGENT_STATE_KV]);
+				await ensureKvBuckets(manager, [
+					REGISTRATIONS_KV,
+					CHANNELS_KV,
+					AGENT_STATE_KV,
+					QUEUE_WAITING_KV,
+				]);
 			}
 			const jetstream = manager.jetstream();
-			for (const definition of [REGISTRATIONS_KV, CHANNELS_KV, AGENT_STATE_KV]) {
+			for (const definition of [REGISTRATIONS_KV, CHANNELS_KV, AGENT_STATE_KV, QUEUE_WAITING_KV]) {
 				this.buckets.set(definition.name, await jetstream.views.kv(definition.name));
 			}
 			logger.info({ servers: this.env.NATS_URL }, "live hub connected");
@@ -364,12 +371,10 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 			logger.warn({ organizationId, source, key }, "dropping an unparseable live KV entry");
 			return undefined;
 		}
-		const schema =
-			source === "registrations-kv"
-				? registrationBindingSchema
-				: source === "channels-kv"
-					? liveChannelSchema
-					: agentStateEntrySchema;
+		const schema = SCHEMA_FOR_KV_SOURCE[source as keyof typeof SCHEMA_FOR_KV_SOURCE];
+		if (schema === undefined) {
+			return undefined;
+		}
 		const result = schema.safeParse(decoded);
 		if (!result.success) {
 			this.dropped += 1;
@@ -567,4 +572,20 @@ const BUCKET_FOR_SOURCE: Readonly<Partial<Record<LiveSource, string>>> = {
 	"registrations-kv": REGISTRATIONS_KV.name,
 	"channels-kv": CHANNELS_KV.name,
 	"agent-state-kv": AGENT_STATE_KV.name,
+	"queue-waiting-kv": QUEUE_WAITING_KV.name,
 };
+
+/**
+ * The value schema for each KV-backed source.
+ *
+ * A table rather than the ternary chain this used to be. The chain's last arm was a default, so a
+ * source added without a case would have been parsed as an agent-state entry, failed, and been
+ * dropped silently — a live topic that produces nothing, with an error log that names the wrong
+ * schema. A table with a `satisfies` cannot be added to without saying which shape it carries.
+ */
+const SCHEMA_FOR_KV_SOURCE = {
+	"registrations-kv": registrationBindingSchema,
+	"channels-kv": liveChannelSchema,
+	"agent-state-kv": agentStateEntrySchema,
+	"queue-waiting-kv": queueWaitingRecordSchema,
+} as const;

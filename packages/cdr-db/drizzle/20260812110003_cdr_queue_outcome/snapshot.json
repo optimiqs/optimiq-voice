@@ -1,0 +1,1944 @@
+{
+  "version": "8",
+  "dialect": "postgres",
+  "id": "3aa15e12-bfce-4bfe-8e37-10f763241493",
+  "prevIds": [
+    "1abc4e01-4d5f-4780-b11f-ad716094985e"
+  ],
+  "ddl": [
+    {
+      "isRlsEnabled": true,
+      "name": "call_legs",
+      "entityType": "tables",
+      "schema": "public"
+    },
+    {
+      "isRlsEnabled": true,
+      "name": "call_events",
+      "entityType": "tables",
+      "schema": "public"
+    },
+    {
+      "isRlsEnabled": true,
+      "name": "recordings",
+      "entityType": "tables",
+      "schema": "public"
+    },
+    {
+      "isRlsEnabled": false,
+      "name": "cdr_write_quarantine",
+      "entityType": "tables",
+      "schema": "public"
+    },
+    {
+      "isRlsEnabled": true,
+      "name": "cdr_export_job",
+      "entityType": "tables",
+      "schema": "public"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "id",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "organization_id",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "call_id",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "leg",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "originating_leg_id",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "bridge_leg_id",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "direction",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "sip_call_id",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "from_number",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "from_name",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "to_number",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "destination_type",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "destination_ref",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "routing_context",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "application_ref",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "queue_ref",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "integer",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "queue_wait_ms",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "queue_outcome",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "queue_agent_ref",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "ivr_ref",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "ring_group_ref",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "account_code",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "timestamp with time zone",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "started_at",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "timestamp with time zone",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "answered_at",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "timestamp with time zone",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "ended_at",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "integer",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "0",
+      "generated": null,
+      "identity": null,
+      "name": "duration_ms",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "integer",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "0",
+      "generated": null,
+      "identity": null,
+      "name": "billsec_ms",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "integer",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "pdd_ms",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "'NONE'",
+      "generated": null,
+      "identity": null,
+      "name": "hangup_cause",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "smallint",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "0",
+      "generated": null,
+      "identity": null,
+      "name": "hangup_cause_code",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "hangup_side",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "disposition",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "read_codec",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "write_codec",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "remote_media_address",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "numeric(4,2)",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "mos",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "numeric(8,2)",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "jitter_ms",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "numeric(5,2)",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "packet_loss_pct",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "recording_key",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "'none'",
+      "generated": null,
+      "identity": null,
+      "name": "transcription_status",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "jsonb",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "'{}'",
+      "generated": null,
+      "identity": null,
+      "name": "raw",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "timestamp with time zone",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "now()",
+      "generated": null,
+      "identity": null,
+      "name": "created_at",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "id",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_events"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "organization_id",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_events"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "call_id",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_events"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "leg_id",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_events"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "event",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_events"
+    },
+    {
+      "type": "timestamp with time zone",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "at",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_events"
+    },
+    {
+      "type": "jsonb",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "'{}'",
+      "generated": null,
+      "identity": null,
+      "name": "data",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "call_events"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "id",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "organization_id",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "call_id",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "leg_id",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "kind",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "object_key",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "type": "integer",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "0",
+      "generated": null,
+      "identity": null,
+      "name": "duration_ms",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "type": "bigint",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "0",
+      "generated": null,
+      "identity": null,
+      "name": "size_bytes",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "type": "timestamp with time zone",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "retention_until",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "type": "timestamp with time zone",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "deleted_at",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "type": "timestamp with time zone",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "now()",
+      "generated": null,
+      "identity": null,
+      "name": "created_at",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "type": "timestamp with time zone",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "now()",
+      "generated": null,
+      "identity": null,
+      "name": "updated_at",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "id",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_write_quarantine"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "organization_id",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_write_quarantine"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "stream",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_write_quarantine"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "subject",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_write_quarantine"
+    },
+    {
+      "type": "bigint",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "stream_sequence",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_write_quarantine"
+    },
+    {
+      "type": "integer",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "1",
+      "generated": null,
+      "identity": null,
+      "name": "delivery_count",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_write_quarantine"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "reason",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_write_quarantine"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "detail",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_write_quarantine"
+    },
+    {
+      "type": "jsonb",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "'{}'",
+      "generated": null,
+      "identity": null,
+      "name": "payload",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_write_quarantine"
+    },
+    {
+      "type": "timestamp with time zone",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "now()",
+      "generated": null,
+      "identity": null,
+      "name": "quarantined_at",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_write_quarantine"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "id",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "type": "uuid",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "organization_id",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "requested_by",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "'queued'",
+      "generated": null,
+      "identity": null,
+      "name": "status",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "type": "jsonb",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "'{}'",
+      "generated": null,
+      "identity": null,
+      "name": "filters",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "type": "timestamp with time zone",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "range_from",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "type": "timestamp with time zone",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "range_to",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "type": "timestamp with time zone",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "claimed_at",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "type": "integer",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "0",
+      "generated": null,
+      "identity": null,
+      "name": "attempts",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "object_key",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "type": "integer",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "0",
+      "generated": null,
+      "identity": null,
+      "name": "row_count",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "type": "bigint",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "0",
+      "generated": null,
+      "identity": null,
+      "name": "size_bytes",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "failure_reason",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "type": "text",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "failure_detail",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "type": "timestamp with time zone",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "completed_at",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "type": "timestamp with time zone",
+      "typeSchema": null,
+      "notNull": false,
+      "dimensions": 0,
+      "default": null,
+      "generated": null,
+      "identity": null,
+      "name": "expires_at",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "type": "timestamp with time zone",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "now()",
+      "generated": null,
+      "identity": null,
+      "name": "created_at",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "type": "timestamp with time zone",
+      "typeSchema": null,
+      "notNull": true,
+      "dimensions": 0,
+      "default": "now()",
+      "generated": null,
+      "identity": null,
+      "name": "updated_at",
+      "entityType": "columns",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "organization_id",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        },
+        {
+          "value": "started_at",
+          "isExpression": false,
+          "asc": false,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "call_legs_organization_started_idx",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "call_id",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "call_legs_call_idx",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "organization_id",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        },
+        {
+          "value": "from_number",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "call_legs_organization_from_idx",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "organization_id",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        },
+        {
+          "value": "to_number",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "call_legs_organization_to_idx",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "organization_id",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        },
+        {
+          "value": "started_at",
+          "isExpression": false,
+          "asc": false,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": false,
+      "where": "recording_key is not null",
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "call_legs_recording_idx",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "organization_id",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        },
+        {
+          "value": "queue_ref",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        },
+        {
+          "value": "started_at",
+          "isExpression": false,
+          "asc": false,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": false,
+      "where": "queue_outcome is not null",
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "call_legs_queue_idx",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "organization_id",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        },
+        {
+          "value": "at",
+          "isExpression": false,
+          "asc": false,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "call_events_organization_at_idx",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "call_events"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "leg_id",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        },
+        {
+          "value": "at",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "call_events_leg_idx",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "call_events"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "call_id",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "call_events_call_idx",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "call_events"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "object_key",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "recordings_object_key_key",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "organization_id",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        },
+        {
+          "value": "created_at",
+          "isExpression": false,
+          "asc": false,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "recordings_organization_created_idx",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "call_id",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "recordings_call_idx",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "leg_id",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "recordings_leg_idx",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "retention_until",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": false,
+      "where": "deleted_at is null and retention_until is not null",
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "recordings_retention_idx",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "quarantined_at",
+          "isExpression": false,
+          "asc": false,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "cdr_write_quarantine_at_idx",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "cdr_write_quarantine"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "organization_id",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "cdr_write_quarantine_organization_idx",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "cdr_write_quarantine"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "created_at",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": false,
+      "where": "status in ('queued', 'running')",
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "cdr_export_job_pending_idx",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "organization_id",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        },
+        {
+          "value": "created_at",
+          "isExpression": false,
+          "asc": false,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "cdr_export_job_organization_created_idx",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "nameExplicit": true,
+      "columns": [
+        {
+          "value": "expires_at",
+          "isExpression": false,
+          "asc": true,
+          "nullsFirst": false,
+          "opclass": null
+        }
+      ],
+      "isUnique": false,
+      "where": "object_key is not null and expires_at is not null",
+      "with": "",
+      "method": "btree",
+      "concurrently": false,
+      "name": "cdr_export_job_expiry_idx",
+      "entityType": "indexes",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "columns": [
+        "id",
+        "started_at"
+      ],
+      "nameExplicit": true,
+      "name": "call_legs_pkey",
+      "entityType": "pks",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "columns": [
+        "id",
+        "at"
+      ],
+      "nameExplicit": true,
+      "name": "call_events_pkey",
+      "entityType": "pks",
+      "schema": "public",
+      "table": "call_events"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "recordings_pkey",
+      "schema": "public",
+      "table": "recordings",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "cdr_write_quarantine_pkey",
+      "schema": "public",
+      "table": "cdr_write_quarantine",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "cdr_export_job_pkey",
+      "schema": "public",
+      "table": "cdr_export_job",
+      "entityType": "pks"
+    },
+    {
+      "value": "\"leg\" in ('a', 'b')",
+      "name": "call_legs_leg_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "value": "\"direction\" in ('inbound', 'outbound', 'internal')",
+      "name": "call_legs_direction_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "value": "\"destination_type\" in ('extension', 'queue', 'ivr', 'ring_group', 'voicemail', 'conference', 'trunk', 'external', 'application', 'time_condition', 'park', 'paging', 'unknown')",
+      "name": "call_legs_destination_type_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "value": "\"hangup_cause\" in ('NONE', 'UNALLOCATED_NUMBER', 'NO_ROUTE_TRANSIT_NET', 'NO_ROUTE_DESTINATION', 'CHANNEL_UNACCEPTABLE', 'CALL_AWARDED_DELIVERED', 'NORMAL_CLEARING', 'USER_BUSY', 'NO_USER_RESPONSE', 'NO_ANSWER', 'SUBSCRIBER_ABSENT', 'CALL_REJECTED', 'NUMBER_CHANGED', 'REDIRECTION_TO_NEW_DESTINATION', 'EXCHANGE_ROUTING_ERROR', 'DESTINATION_OUT_OF_ORDER', 'INVALID_NUMBER_FORMAT', 'FACILITY_REJECTED', 'RESPONSE_TO_STATUS_ENQUIRY', 'NORMAL_UNSPECIFIED', 'NORMAL_CIRCUIT_CONGESTION', 'NETWORK_OUT_OF_ORDER', 'NORMAL_TEMPORARY_FAILURE', 'SWITCH_CONGESTION', 'ACCESS_INFO_DISCARDED', 'REQUESTED_CHAN_UNAVAIL', 'PRE_EMPTED', 'FACILITY_NOT_SUBSCRIBED', 'OUTGOING_CALL_BARRED', 'INCOMING_CALL_BARRED', 'BEARERCAPABILITY_NOTAUTH', 'BEARERCAPABILITY_NOTAVAIL', 'SERVICE_UNAVAILABLE', 'BEARERCAPABILITY_NOTIMPL', 'CHAN_NOT_IMPLEMENTED', 'FACILITY_NOT_IMPLEMENTED', 'SERVICE_NOT_IMPLEMENTED', 'INVALID_CALL_REFERENCE', 'INCOMPATIBLE_DESTINATION', 'INVALID_MSG_UNSPECIFIED', 'MANDATORY_IE_MISSING', 'MESSAGE_TYPE_NONEXIST', 'WRONG_MESSAGE', 'IE_NONEXIST', 'INVALID_IE_CONTENTS', 'WRONG_CALL_STATE', 'RECOVERY_ON_TIMER_EXPIRE', 'MANDATORY_IE_LENGTH_ERROR', 'PROTOCOL_ERROR', 'INTERWORKING', 'ORIGINATOR_CANCEL', 'LOSE_RACE', 'BLIND_TRANSFER', 'ATTENDED_TRANSFER', 'ALLOTTED_TIMEOUT', 'USER_CHALLENGE', 'MEDIA_TIMEOUT', 'PICKED_OFF', 'USER_NOT_REGISTERED', 'PROGRESS_TIMEOUT', 'INVALID_GATEWAY', 'GATEWAY_DOWN', 'INVALID_URL', 'INVALID_PROFILE', 'NO_PICKUP', 'SRTP_READ_ERROR')",
+      "name": "call_legs_hangup_cause_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "value": "\"hangup_side\" in ('caller', 'callee', 'system')",
+      "name": "call_legs_hangup_side_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "value": "\"disposition\" in ('answered', 'no-answer', 'busy', 'failed', 'voicemail')",
+      "name": "call_legs_disposition_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "value": "\"transcription_status\" in ('none', 'pending', 'processing', 'completed', 'failed')",
+      "name": "call_legs_transcription_status_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "value": "\"duration_ms\" >= 0 and \"billsec_ms\" >= 0",
+      "name": "call_legs_duration_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "value": "\"queue_outcome\" in ('answered', 'caller-hangup', 'timeout', 'overflow', 'no-agents', 'exit-key')",
+      "name": "call_legs_queue_outcome_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "value": "\"queue_wait_ms\" is null or \"queue_wait_ms\" >= 0",
+      "name": "call_legs_queue_wait_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "value": "\"event\" in ('created', 'routing', 'progress', 'early-media', 'answered', 'bridged', 'unbridged', 'held', 'unheld', 'parked', 'unparked', 'dtmf', 'transfer', 'record-started', 'record-stopped', 'playback-started', 'playback-stopped', 'queue-joined', 'queue-answered', 'queue-abandoned', 'voicemail-left', 'hangup')",
+      "name": "call_events_event_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "call_events"
+    },
+    {
+      "value": "\"kind\" in ('call', 'voicemail', 'conference')",
+      "name": "recordings_kind_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "value": "\"duration_ms\" >= 0 and \"size_bytes\" >= 0",
+      "name": "recordings_size_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "value": "\"reason\" in ('unreadable', 'foreign-subject', 'rejected', 'exhausted')",
+      "name": "cdr_write_quarantine_reason_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "cdr_write_quarantine"
+    },
+    {
+      "value": "\"delivery_count\" >= 1",
+      "name": "cdr_write_quarantine_delivery_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "cdr_write_quarantine"
+    },
+    {
+      "value": "\"status\" in ('queued', 'running', 'succeeded', 'failed')",
+      "name": "cdr_export_job_status_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "value": "\"failure_reason\" is null or \"failure_reason\" in ('too-many-rows', 'storage', 'internal')",
+      "name": "cdr_export_job_failure_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "value": "\"range_to\" > \"range_from\"",
+      "name": "cdr_export_job_range_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "value": "\"row_count\" >= 0 and \"size_bytes\" >= 0",
+      "name": "cdr_export_job_size_check",
+      "entityType": "checks",
+      "schema": "public",
+      "table": "cdr_export_job"
+    },
+    {
+      "superuser": false,
+      "createDb": false,
+      "createRole": false,
+      "inherit": false,
+      "canLogin": false,
+      "replication": false,
+      "bypassRls": false,
+      "connLimit": -1,
+      "password": null,
+      "validUntil": null,
+      "name": "cdr_tenant_tls",
+      "entityType": "roles"
+    },
+    {
+      "as": "PERMISSIVE",
+      "for": "SELECT",
+      "roles": [
+        "cdr_tenant_tls"
+      ],
+      "using": "organization_id = nullif(current_setting('cdr_tenant_tls.organization_id', true), '')::uuid",
+      "withCheck": null,
+      "name": "call_legs_tenant_select",
+      "entityType": "policies",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "as": "PERMISSIVE",
+      "for": "INSERT",
+      "roles": [
+        "cdr_tenant_tls"
+      ],
+      "using": null,
+      "withCheck": "organization_id = nullif(current_setting('cdr_tenant_tls.organization_id', true), '')::uuid",
+      "name": "call_legs_tenant_insert",
+      "entityType": "policies",
+      "schema": "public",
+      "table": "call_legs"
+    },
+    {
+      "as": "PERMISSIVE",
+      "for": "SELECT",
+      "roles": [
+        "cdr_tenant_tls"
+      ],
+      "using": "organization_id = nullif(current_setting('cdr_tenant_tls.organization_id', true), '')::uuid",
+      "withCheck": null,
+      "name": "call_events_tenant_select",
+      "entityType": "policies",
+      "schema": "public",
+      "table": "call_events"
+    },
+    {
+      "as": "PERMISSIVE",
+      "for": "INSERT",
+      "roles": [
+        "cdr_tenant_tls"
+      ],
+      "using": null,
+      "withCheck": "organization_id = nullif(current_setting('cdr_tenant_tls.organization_id', true), '')::uuid",
+      "name": "call_events_tenant_insert",
+      "entityType": "policies",
+      "schema": "public",
+      "table": "call_events"
+    },
+    {
+      "as": "PERMISSIVE",
+      "for": "ALL",
+      "roles": [
+        "cdr_tenant_tls"
+      ],
+      "using": "organization_id = nullif(current_setting('cdr_tenant_tls.organization_id', true), '')::uuid",
+      "withCheck": "organization_id = nullif(current_setting('cdr_tenant_tls.organization_id', true), '')::uuid",
+      "name": "recordings_tenant_isolation",
+      "entityType": "policies",
+      "schema": "public",
+      "table": "recordings"
+    },
+    {
+      "as": "PERMISSIVE",
+      "for": "ALL",
+      "roles": [
+        "cdr_tenant_tls"
+      ],
+      "using": "organization_id = nullif(current_setting('cdr_tenant_tls.organization_id', true), '')::uuid",
+      "withCheck": "organization_id = nullif(current_setting('cdr_tenant_tls.organization_id', true), '')::uuid",
+      "name": "cdr_export_job_tenant_isolation",
+      "entityType": "policies",
+      "schema": "public",
+      "table": "cdr_export_job"
+    }
+  ],
+  "renames": []
+}

@@ -11,6 +11,9 @@ import {
 	permissionForTopic,
 	sourcesForTopic,
 } from "../../src/live/live-topics";
+import type { LiveTopic } from "../../src/live/live-topics";
+
+const QUEUE = "019fd3c2-2222-76be-a6b3-b0f1914e39b6";
 
 /**
  * The live channel's topic grammar and permission mapping.
@@ -153,5 +156,34 @@ describe("the permission mapping", () => {
 		expect(mayReadTopic(["extensions.read.own"], { kind: "registrations" })).to.equal(false);
 		// …and the documented direction that DOES hold.
 		expect(mayReadTopic(["cdr.read"], { kind: "active-calls" })).to.equal(true);
+	});
+});
+
+/**
+ * The waiting line as a live source.
+ *
+ * What a wallboard needs from a queue topic is three numbers — how many are holding, where each of
+ * them stands, how long the front of the line has been there — and all three are one KV record. The
+ * assertion that matters is that it is a SNAPSHOT source: a wallboard opening at 09:05 must be shown
+ * the callers who joined at 09:04, and a stream-only topic can only ever show it what has happened
+ * since it connected.
+ */
+describe("the queue waiting line", () => {
+	it("is a source of the queue topic, alongside the events and the agent states", () => {
+		expect(sourcesForTopic({ kind: "queue", queueId: QUEUE })).to.include("queue-waiting-kv");
+	});
+
+	it("is not a source of any other topic, because the line is per queue", () => {
+		for (const kind of LIVE_TOPIC_KINDS) {
+			if (kind === "queue") {
+				continue;
+			}
+			expect(sourcesForTopic({ kind } as LiveTopic)).to.not.include("queue-waiting-kv");
+		}
+	});
+
+	/** Reading the line is reading the queue. Nothing new to gate, and nothing quietly widened. */
+	it("adds no permission of its own — the queue topic's gate already covers it", () => {
+		expect(permissionForTopic({ kind: "queue", queueId: QUEUE })).to.equal("queues.monitor");
 	});
 });

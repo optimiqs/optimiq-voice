@@ -57,6 +57,9 @@ import { planNodeReferences } from "./plan";
 import { checkCallBlock } from "./resolve";
 import {
 	isOptionalSnapshotCollection,
+	QUEUE_EXIT_KEYS,
+	QUEUE_PRIORITY_MAX,
+	QUEUE_PRIORITY_MIN,
 	SNAPSHOT_COLLECTIONS,
 	tollClassCovers,
 	VOICEMAIL_LEAVE_GREETING_PRECEDENCE,
@@ -778,7 +781,10 @@ class Compiler {
 				return this.ringGroupNodeById(ref, subject, path);
 			}
 			case "queue": {
-				return this.queueNodeById(ref, subject, path);
+				// The only entity destination whose DATA changes the node it resolves to. See
+				// `queuePriorityOverride` for why, and for why the answer is a distinct node rather
+				// than a field the walk carries.
+				return this.queueNodeById(ref, destination, subject, path);
 			}
 			case "voicemail": {
 				return this.voicemailNodeById(ref, "leave", subject, path);
@@ -1407,7 +1413,12 @@ class Compiler {
 		return id;
 	}
 
-	private queueNodeById(ref: string, subject: DiagnosticSubject, path: string): PlanNodeId | null {
+	private queueNodeById(
+		ref: string,
+		from: Destination | null,
+		subject: DiagnosticSubject,
+		path: string,
+	): PlanNodeId | null {
 		const entry = this.queuesById.get(ref);
 		if (entry === undefined) {
 			return this.missingTarget("queue", ref, subject, path);
@@ -1415,16 +1426,94 @@ class Compiler {
 		if (!entry.enabled) {
 			return this.disabledTarget("queue", entry.name, subject, path);
 		}
-		return this.queueNode(entry);
+		return this.queueNode(entry, this.queuePriorityOverride(from, entry, subject, path));
 	}
 
-	private queueNode(entry: OrgRoutingSnapshot["queues"][number]): PlanNodeId {
-		const id = `queue:${entry.id}`;
+	/**
+	 * The per-entry caller priority a `queue` destination may carry, as
+	 * `destination_data.args.priority`.
+	 *
+	 * ## Why `args` and not a column
+	 *
+	 * Because the fact belongs to the EDGE, not to either end of it. "Platinum customers reach
+	 * Support at priority 800" is a property of the IVR option, and it is different from what the
+	 * same option means when it points at the same queue from the after-hours menu. A column on
+	 * `queue` could only say one thing for the whole queue (which is `default_priority`, and it is
+	 * there), and a column on `ivr_menu_option` would have to be repeated on every other table that
+	 * can point at a queue — inbound routes, time conditions, call flows, ring-group failovers.
+	 * `destination_data` is the one place every one of those already has.
+	 *
+	 * ## Why an out-of-range value is a WARNING and not an error
+	 *
+	 * A malformed priority is a caller who waits their turn instead of jumping the line. That is the
+	 * queue working normally, which is a very different cost from refusing to compile the tenant's
+	 * whole artifact — and refusing would take every unrelated route down with it. The warning names
+	 * the value so the form that produced it can be fixed; the call still gets answered meanwhile.
+	 */
+	private queuePriorityOverride(
+		from: Destination | null,
+		entry: OrgRoutingSnapshot["queues"][number],
+		subject: DiagnosticSubject,
+		path: string,
+	): number | undefined {
+		const raw = from?.destinationData?.args?.priority;
+		if (raw === undefined) {
+			return undefined;
+		}
+		const value = typeof raw === "number" ? raw : Number(raw);
+		if (!Number.isInteger(value) || value < QUEUE_PRIORITY_MIN || value > QUEUE_PRIORITY_MAX) {
+			this.bag.warning(
+				"invalid-queue-priority",
+				`Queue "${entry.name}" was pointed at with a caller priority of ${JSON.stringify(raw)}, which is not a whole number between ${String(QUEUE_PRIORITY_MIN)} and ${String(QUEUE_PRIORITY_MAX)}. Callers arriving this way take the queue's default priority instead.`,
+				subject,
+				path,
+			);
+			return undefined;
+		}
+		return value;
+	}
+
+	/**
+	 * One queue, at one entry priority.
+	 *
+	 * ## Why the priority is in the node ID
+	 *
+	 * The node table is deduplicated by id, so two references to one queue must produce one node —
+	 * otherwise the artifact grows a node per reference and "every reference resolves" stops meaning
+	 * anything. But two references at DIFFERENT priorities are genuinely different behaviour, and
+	 * collapsing them would silently make the second one's priority disappear. Folding the override
+	 * into the id gives both properties: same override, same node; different override, different
+	 * node; and the id is still a pure function of its inputs, so a recompile of an unchanged
+	 * snapshot produces the same artifact hash.
+	 *
+	 * Every node minted this way carries the same `queueId`, which is what keeps them one queue
+	 * everywhere it matters — one roster, one waiting line, one set of events. A priority that
+	 * produced a second QUEUE rather than a second door into it would not be a priority at all.
+	 */
+	private queueNode(
+		entry: OrgRoutingSnapshot["queues"][number],
+		priorityOverride?: number,
+	): PlanNodeId {
+		const priority = priorityOverride ?? entry.defaultPriority ?? QUEUE_PRIORITY_MIN;
+		const id =
+			priorityOverride === undefined
+				? `queue:${entry.id}`
+				: `queue:${entry.id}:p${String(priorityOverride)}`;
 		if (this.claimed.has(id)) {
 			return id;
 		}
 		this.claimed.add(id);
 		const subject: DiagnosticSubject = { kind: "queue", id: entry.id, name: entry.name };
+		const exitNodeId = this.namedDestinationNode(entry, "exit", subject) ?? undefined;
+		const exitKey = normalizeExitKey(entry.exitKey);
+		if (exitKey !== undefined && exitNodeId === undefined) {
+			this.bag.warning(
+				"queue-exit-key-without-destination",
+				`Queue "${entry.name}" has exit key "${exitKey}" but no exit destination, so a caller who presses it is hung up rather than sent anywhere.`,
+				subject,
+				"exitKey",
+			);
+		}
 		const node: PlanNode = compact({
 			id,
 			kind: "queue",
@@ -1443,7 +1532,12 @@ class Compiler {
 			maxWaitNoAgentSeconds: entry.maxWaitNoAgentSeconds,
 			announcePositionEnabled: entry.announcePositionEnabled,
 			announceFrequencySeconds: entry.announceFrequencySeconds,
-			recordEnabled: entry.recordEnabled,
+			recordPolicy: entry.recordPolicy ?? "none",
+			exitKey,
+			exitNodeId,
+			priority,
+			abandonedResumeAllowed: entry.abandonedResumeAllowed ?? false,
+			discardAbandonedAfterSeconds: entry.discardAbandonedAfterSeconds ?? 0,
 			timeoutNodeId: this.namedDestinationNode(entry, "timeout", subject) ?? undefined,
 		}) as PlanNode;
 		this.nodes.set(id, node);
@@ -3985,6 +4079,24 @@ function sortRecordKeys<T>(record: Readonly<Record<string, T>>): Readonly<Record
  * Every artifact object goes through this, because `{ a: 1, b: undefined }` and `{ a: 1 }` are the
  * same value to a consumer but different to `JSON.stringify` — and therefore to the artifact hash.
  */
+/**
+ * A queue exit key, or `undefined` when the column says the queue has none.
+ *
+ * Upper-cased before the membership test so a tenant who typed `d` gets the DTMF `D` rather than a
+ * silently disabled exit key, and rejected outright otherwise. A value the database's own check
+ * constraint would have refused can still arrive here — from a fixture, from a loader that has not
+ * been taught the column, or from a snapshot built by hand for a diagnostic — and the engine
+ * compares this against a `DtmfEvent.digit` with `===`, so anything that would never match must not
+ * reach it wearing the costume of a configured feature.
+ */
+function normalizeExitKey(value: string | null | undefined): string | undefined {
+	const trimmed = value?.trim().toUpperCase();
+	if (trimmed === undefined || trimmed === "") {
+		return undefined;
+	}
+	return (QUEUE_EXIT_KEYS as readonly string[]).includes(trimmed) ? trimmed : undefined;
+}
+
 function compact<T extends Record<string, unknown>>(value: T): T {
 	const out: Record<string, unknown> = {};
 	for (const key of Object.keys(value)) {

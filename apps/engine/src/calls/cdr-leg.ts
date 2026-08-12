@@ -98,6 +98,19 @@ export interface CdrLegInput {
 	 * UUID, and an `external` node's "ref" is an E.164 string that would fail validation.
 	 */
 	readonly destinationRef?: string;
+	/**
+	 * The queue's verdict on this caller's stay, when the walk put them in one.
+	 *
+	 * Separate from `destinationType` / `destinationRef` even though both name the same queue,
+	 * because they answer different questions and only one of them survives the walk continuing: a
+	 * caller whose queue timed out into a voicemail box has `destinationType: "voicemail"` by the end
+	 * (the walk moved on) and a queue outcome of `timeout`. Losing the second is how a queue that
+	 * serves nobody reports a perfect service level.
+	 */
+	readonly queueRef?: string;
+	readonly queueWaitMs?: number;
+	readonly queueOutcome?: NonNullable<CdrLegWriteData["queueOutcome"]>;
+	readonly queueAgentRef?: string;
 }
 
 /**
@@ -137,5 +150,58 @@ export function buildCdrLegWrite(input: CdrLegInput): CdrLegWriteData {
 		hangupCauseCode: input.hangupCauseCode,
 		hangupSide: input.hangupSide,
 		disposition: dispositionFor({ answeredAt, hangupCause: input.hangupCause }),
+
+		// Omitted entirely rather than sent as null on a leg that never touched a queue. The payload
+		// is a `looseObject` whose unmapped keys land in `call_legs.raw`, so a null here would be a
+		// null in the ledger's JSON for every direct call in the tenant.
+		...(input.queueRef === undefined ? {} : { queueRef: input.queueRef }),
+		...(input.queueWaitMs === undefined ? {} : { queueWaitMs: input.queueWaitMs }),
+		...(input.queueOutcome === undefined ? {} : { queueOutcome: input.queueOutcome }),
+		...(input.queueAgentRef === undefined ? {} : { queueAgentRef: input.queueAgentRef }),
 	};
+}
+
+/**
+ * Reads the queue verdict back off a leg's channel variables.
+ *
+ * All four or none: a leg carrying a wait with no outcome, or an outcome with no queue, is a leg
+ * whose variables were half-written by a process that died mid-walk, and half a verdict in a service
+ * level is worse than none. The wait parses defensively for the same reason it is stored as a
+ * string — channel variables have no types, and a media server that echoed something unexpected must
+ * not put `NaN` into an integer column.
+ */
+export function queueLegOf(variables: Readonly<Record<string, string | undefined>>): {
+	queueRef?: string;
+	queueWaitMs?: number;
+	queueOutcome?: NonNullable<CdrLegWriteData["queueOutcome"]>;
+	queueAgentRef?: string;
+} {
+	const queueRef = variables.OPTIMIQ_QUEUE_REF;
+	const outcome = variables.OPTIMIQ_QUEUE_OUTCOME;
+	if (queueRef === undefined || outcome === undefined || !isQueueOutcome(outcome)) {
+		return {};
+	}
+	const waitMs = Number(variables.OPTIMIQ_QUEUE_WAIT_MS);
+	const agentRef = variables.OPTIMIQ_QUEUE_AGENT_REF;
+	return {
+		queueRef,
+		queueOutcome: outcome,
+		...(Number.isFinite(waitMs) && waitMs >= 0 ? { queueWaitMs: Math.round(waitMs) } : {}),
+		// Only ever meaningful on an answer, and refused otherwise: an agent id beside an abandonment
+		// would make "who took this call" answerable for a call nobody took.
+		...(agentRef === undefined || outcome !== "answered" ? {} : { queueAgentRef: agentRef }),
+	};
+}
+
+const QUEUE_OUTCOMES: readonly string[] = [
+	"answered",
+	"caller-hangup",
+	"timeout",
+	"overflow",
+	"no-agents",
+	"exit-key",
+];
+
+function isQueueOutcome(value: string): value is NonNullable<CdrLegWriteData["queueOutcome"]> {
+	return QUEUE_OUTCOMES.includes(value);
 }

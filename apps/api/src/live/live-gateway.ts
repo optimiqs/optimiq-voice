@@ -566,6 +566,7 @@ const SNAPSHOT_SOURCES: ReadonlySet<LiveSource> = new Set<LiveSource>([
 	"registrations-kv",
 	"channels-kv",
 	"agent-state-kv",
+	"queue-waiting-kv",
 ]);
 
 /**

@@ -406,6 +406,8 @@ func TestParityKVKeys(t *testing.T) {
 			got, err = DIDIndexKVKey(tc.Args[0])
 		case "queueMembership":
 			got, err = QueueMembershipKVKey(tc.Args[0], tc.Args[1])
+		case "queueWaiting":
+			got, err = QueueWaitingKVKey(tc.Args[0], tc.Args[1])
 		case "mediaSession":
 			got, err = MediaSessionKVKey(tc.Args[0])
 		default:

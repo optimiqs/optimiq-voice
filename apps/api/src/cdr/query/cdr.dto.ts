@@ -6,6 +6,7 @@ import {
 	HANGUP_CAUSES,
 	RECORDING_KINDS,
 } from "@optimiq-voice/cdr-db";
+import { DEFAULT_SLA_SECONDS, MAX_SLA_SECONDS } from "./queue-stats";
 
 /**
  * The query contract for the reporting surface.
@@ -60,6 +61,26 @@ const dialFilter = z
 	.max(32)
 	.regex(/^[+*#0-9A-Za-z._-]+$/u, "must be a dialable string")
 	.optional();
+
+/**
+ * `GET /cdr/queue-stats` — service level over a window.
+ *
+ * The window shape is shared with every other reporting query here, so `MAX_RANGE_DAYS` applies
+ * unchanged: this is a live aggregate, not a rollup, and a year of a large tenant belongs on the
+ * export path. `slaSeconds` is a query parameter rather than a stored setting because it is a
+ * QUESTION, not a configuration — a supervisor comparing "how are we at 20 seconds" against "how
+ * are we at 60" is doing the normal thing with this endpoint, and a column would make that two
+ * writes and a race.
+ */
+export const queueStatsQuerySchema = z.strictObject({
+	from: z.iso.datetime({ offset: true }).or(z.iso.datetime()).optional(),
+	to: z.iso.datetime({ offset: true }).or(z.iso.datetime()).optional(),
+	/** One queue, or every queue with traffic in the window. */
+	queueId: z.uuid().optional(),
+	slaSeconds: z.coerce.number().int().min(1).max(MAX_SLA_SECONDS).default(DEFAULT_SLA_SECONDS),
+});
+
+export type QueueStatsQueryDto = z.infer<typeof queueStatsQuerySchema>;
 
 const timeRangeShape = {
 	/** Inclusive lower bound on `started_at`. Defaults to 24 hours before `to`. */

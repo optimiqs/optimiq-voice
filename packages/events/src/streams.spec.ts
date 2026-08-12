@@ -281,6 +281,7 @@ describe("kv bucket definitions", () => {
 			"park-claims",
 			"conference-claims",
 			"media-sessions",
+			"queue-waiting",
 		]);
 	});
 
@@ -324,6 +325,7 @@ describe("kv bucket definitions", () => {
 			"queue-membership",
 			"park-claims",
 			"conference-claims",
+			"queue-waiting",
 		]) {
 			expect(KV_BUCKETS.find((bucket) => bucket.name === name)?.storage).toBe("file");
 		}
@@ -404,5 +406,22 @@ describe("kvKeyFor", () => {
 	it("rejects a claim token that would break the key namespace", () => {
 		expect(() => kvKeyFor.parkClaim(ORG, "lot.one", 401)).toThrow(SubjectTokenError);
 		expect(() => kvKeyFor.conferenceClaim("", createEntityId())).toThrow(SubjectTokenError);
+	});
+
+	/**
+	 * The roster and the line share a key STRING and not a bucket, which is the point of asserting
+	 * it: a reader that wants both facts about one queue builds the key once. A change that made
+	 * them diverge would not break anything visibly — it would just quietly turn one lookup into
+	 * two — so it is pinned here rather than left to be noticed.
+	 */
+	it("keys one queue's roster and its waiting line identically, in two buckets", () => {
+		const queue = createEntityId();
+		expect(kvKeyFor.queueWaiting(ORG, queue)).toBe(`${ORG}.${queue}`);
+		expect(kvKeyFor.queueWaiting(ORG, queue)).toBe(kvKeyFor.queueMembership(ORG, queue));
+	});
+
+	it("rejects a waiting-line token that would break the key namespace", () => {
+		expect(() => kvKeyFor.queueWaiting(ORG, "queue.one")).toThrow(SubjectTokenError);
+		expect(() => kvKeyFor.queueWaiting("", createEntityId())).toThrow(SubjectTokenError);
 	});
 });

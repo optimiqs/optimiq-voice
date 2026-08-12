@@ -141,7 +141,10 @@ export function queueNode(id: string, overrides: Partial<QueuePlanNode> = {}): Q
 		maxWaitNoAgentSeconds: 0,
 		announcePositionEnabled: false,
 		announceFrequencySeconds: 60,
-		recordEnabled: false,
+		recordPolicy: "none",
+		priority: 0,
+		abandonedResumeAllowed: false,
+		discardAbandonedAfterSeconds: 0,
 		...overrides,
 	};
 }

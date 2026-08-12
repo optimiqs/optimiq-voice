@@ -88,6 +88,18 @@ export const DIAGNOSTIC_CODES = [
 	/** An extension is absent from a directory because its mailbox has no recorded name. */
 	"directory-entry-skipped",
 
+	// --- the contact-centre block ---------------------------------------------------------------
+	/**
+	 * A `queue` destination carried a caller priority that is not a whole number in range.
+	 *
+	 * A warning and not an error, because the consequence is a caller who waits their turn — the
+	 * queue working normally — whereas refusing the compile would take every unrelated route in the
+	 * tenant down with it over one mistyped form field.
+	 */
+	"invalid-queue-priority",
+	/** A queue has an exit key and no exit destination, so pressing it hangs the caller up. */
+	"queue-exit-key-without-destination",
+
 	// --- emergency dialing (Kari's Law / RAY BAUM'S Act) ----------------------------------------
 	/** A DID carries no `emergencyAddressId`, so it cannot serve as an ELIN for the organization. */
 	"missing-emergency-address",

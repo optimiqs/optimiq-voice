@@ -229,7 +229,7 @@ export function aQueue(overrides: Partial<QueueInput> = {}): QueueInput {
 		maxWaitNoAgentSeconds: 0,
 		announcePositionEnabled: false,
 		announceFrequencySeconds: 60,
-		recordEnabled: false,
+		recordPolicy: "none",
 		...overrides,
 	};
 }

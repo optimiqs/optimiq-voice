@@ -14,8 +14,16 @@ import {
 	listCallLegsForCall,
 	listRecordingsForLegs,
 } from "./cdr.repository";
-import type { CdrCallQuery, CdrLegQuery, CdrListQuery, ResolvedTimeRange } from "./cdr.dto";
+import { readQueueStats } from "./queue-stats";
+import type {
+	CdrCallQuery,
+	CdrLegQuery,
+	CdrListQuery,
+	QueueStatsQueryDto,
+	ResolvedTimeRange,
+} from "./cdr.dto";
 import type { CallLegDetailRow, CallLegListRow, RecordingListRow } from "./cdr.repository";
+import type { QueueStatsRow } from "./queue-stats";
 import type { AppSession } from "@optimiq-voice/auth";
 import type { CdrDatabaseClient } from "@optimiq-voice/cdr-db";
 
@@ -41,6 +49,13 @@ import type { CdrDatabaseClient } from "@optimiq-voice/cdr-db";
  * configuration — hundreds of rows, counted for free — and this one is a billing journal that grows
  * without bound. A shared envelope would have made the wrong query cheap to write.
  */
+
+export interface QueueStatsEnvelope {
+	readonly data: readonly QueueStatsRow[];
+	/** Echoed so a widget can label its own percentage without re-reading its own query string. */
+	readonly slaSeconds: number;
+	readonly range: { readonly from: string; readonly to: string };
+}
 
 export interface CdrListEnvelope {
 	readonly data: readonly CallLegListRow[];
@@ -84,6 +99,40 @@ export class CdrService {
 			throw new CdrRangeTooWideException(MAX_RANGE_DAYS, days);
 		}
 		return range;
+	}
+
+	/**
+	 * Queue service level over a window.
+	 *
+	 * One tenant-scoped transaction and one grouped aggregate, exactly like every other read here —
+	 * the organization is never a predicate, RLS is the filter. The `range` travels back in the
+	 * envelope for the same reason the listing's does: a widget rendering "last 24 hours" should be
+	 * showing the window the SERVER resolved, not the one it thinks it asked for.
+	 *
+	 * `MAX_RANGE_DAYS` applies unchanged through {@link CdrService.range}, and it is the right
+	 * ceiling for the same reason it is on the listing: this is a live aggregate over a partitioned
+	 * ledger, not a rollup, so a request's cost is proportional to the window it names.
+	 */
+	async queueStats(session: AppSession, query: QueueStatsQueryDto): Promise<QueueStatsEnvelope> {
+		const organizationId = this.organizationId(session);
+		const range = this.range(query);
+
+		const rows = await this.database.withTenantScope(
+			organizationId,
+			async (transaction) =>
+				await readQueueStats(transaction, {
+					from: range.from,
+					to: range.to,
+					slaSeconds: query.slaSeconds,
+					...(query.queueId === undefined ? {} : { queueId: query.queueId }),
+				}),
+		);
+
+		return {
+			data: rows,
+			slaSeconds: query.slaSeconds,
+			range: { from: range.from.toISOString(), to: range.to.toISOString() },
+		};
 	}
 
 	/**

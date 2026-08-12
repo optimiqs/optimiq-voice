@@ -99,6 +99,7 @@ export const LIVE_SOURCES = [
 	"channels-kv",
 	"call-events",
 	"agent-state-kv",
+	"queue-waiting-kv",
 	"queue-events",
 	"voicemail-events",
 	"trunk-events",
@@ -108,7 +109,16 @@ export type LiveSource = (typeof LIVE_SOURCES)[number];
 export const LIVE_TOPIC_SOURCES = {
 	registrations: ["registrations-kv"],
 	"active-calls": ["channels-kv", "call-events"],
-	queue: ["queue-events", "agent-state-kv"],
+	/**
+	 * Three sources, and each answers a question the other two cannot.
+	 *
+	 * `queue-waiting-kv` is the LINE — who is holding, in what order, and since when — so a wallboard
+	 * gets waiting-count, positions and longest-wait from one snapshot frame and a watch, instead of
+	 * reconstructing them by replaying joins and abandonments it may have missed. `agent-state-kv` is
+	 * the roster's live half. `queue-events` is what CHANGED, which is what turns "an agent answered"
+	 * into a row that moves rather than a table that redraws.
+	 */
+	queue: ["queue-events", "agent-state-kv", "queue-waiting-kv"],
 	"agent-state": ["agent-state-kv", "queue-events"],
 	/**
 	 * One source, and no bucket behind it.

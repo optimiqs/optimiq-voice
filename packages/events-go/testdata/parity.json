@@ -607,6 +607,11 @@
 			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"
 		},
 		{
+			"builder": "queueWaiting",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"],
+			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"
+		},
+		{
 			"builder": "mediaSession",
 			"args": ["0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53"],
 			"key": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53"
@@ -839,6 +844,16 @@
 			"storage": "file",
 			"maxValueSizeBytes": 4096,
 			"maxBytes": 134217728,
+			"numReplicas": 1
+		},
+		{
+			"name": "queue-waiting",
+			"description": "Queue -> the leased waiting line and abandoned-resume tombstones, under CAS.",
+			"ttlMs": 21600000,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 262144,
+			"maxBytes": 268435456,
 			"numReplicas": 1
 		}
 	],

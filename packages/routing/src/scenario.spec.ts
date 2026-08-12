@@ -258,7 +258,7 @@ const ACME: OrgRoutingSnapshot = {
 			maxWaitNoAgentSeconds: 60,
 			announcePositionEnabled: true,
 			announceFrequencySeconds: 60,
-			recordEnabled: true,
+			recordPolicy: "all",
 			timeoutDestinationType: "voicemail",
 			timeoutDestinationRef: "vm-main",
 		},

@@ -5,6 +5,7 @@ import {
 	CALL_LEG_SIDES,
 	HANGUP_CAUSES,
 	HANGUP_SIDES,
+	QUEUE_OUTCOMES,
 } from "@optimiq-voice/cdr-db";
 import type {
 	CallDestinationType,
@@ -13,6 +14,7 @@ import type {
 	CallLegSide,
 	HangupCause,
 	HangupSide,
+	QueueOutcome,
 } from "@optimiq-voice/cdr-db";
 
 /**
@@ -74,6 +76,10 @@ const MAPPED_KEYS = new Set([
 	"hangupCauseCode",
 	"hangupSide",
 	"disposition",
+	"queueRef",
+	"queueWaitMs",
+	"queueOutcome",
+	"queueAgentRef",
 ]);
 
 /**
@@ -157,6 +163,18 @@ export interface CallLegInsertValues {
 	readonly hangupCauseCode: number;
 	readonly hangupSide: HangupSide | null;
 	readonly disposition: CallDisposition;
+	/**
+	 * The queue's verdict on the caller's stay. All four or none — see the mapping.
+	 *
+	 * Explicitly `null` rather than optional, unlike the payload they come from: these are INSERT
+	 * values, and an omitted key and a null column are the same row while an omitted key and an
+	 * absent field are not the same object. Spelling the absence keeps "this leg never touched a
+	 * queue" a thing the type can be asked about.
+	 */
+	readonly queueRef: string | null;
+	readonly queueWaitMs: number | null;
+	readonly queueOutcome: QueueOutcome | null;
+	readonly queueAgentRef: string | null;
 	readonly raw: Record<string, unknown>;
 }
 
@@ -340,6 +358,32 @@ export function mapCdrLegWrite(
 		raw._writer = { coercions };
 	}
 
+	// The queue verdict, all four or none. A leg carrying a wait with no outcome is a leg whose
+	// producer died mid-walk, and half a verdict in a service level is worse than none — a wait with
+	// no outcome would be counted by an average and by nothing else, which is the shape of a number
+	// that is quietly wrong. An unrecognised outcome is a coercion rather than a rejection, for the
+	// same reason `destinationType` is: the row is worth keeping without it.
+	const queueRef = asUuid(payload.queueRef);
+	const outcomeRaw = asString(payload.queueOutcome);
+	const queueOutcome =
+		outcomeRaw !== undefined && (QUEUE_OUTCOMES as readonly string[]).includes(outcomeRaw)
+			? (outcomeRaw as QueueOutcome)
+			: undefined;
+	if (outcomeRaw !== undefined && queueOutcome === undefined) {
+		record("queueOutcome", payload.queueOutcome, "null");
+	}
+	const queueLeg =
+		queueRef === null || queueOutcome === undefined
+			? { queueRef: null, queueWaitMs: null, queueOutcome: null, queueAgentRef: null }
+			: {
+					queueRef,
+					queueOutcome,
+					queueWaitMs: asNonNegativeInt(payload.queueWaitMs),
+					// Only on an answer. An agent id beside an abandonment would make "who took this
+					// call" answerable for a call nobody took.
+					queueAgentRef: queueOutcome === "answered" ? asUuid(payload.queueAgentRef) : null,
+				};
+
 	return {
 		values: {
 			id,
@@ -363,6 +407,7 @@ export function mapCdrLegWrite(
 			hangupCauseCode,
 			hangupSide,
 			disposition,
+			...queueLeg,
 			raw,
 		},
 		coercions,

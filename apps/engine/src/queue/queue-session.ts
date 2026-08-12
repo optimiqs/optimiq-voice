@@ -1,7 +1,7 @@
 import { isStaffing } from "./agent-state";
 import { selectAgents } from "./queue-strategy";
 import type { QueueCandidate } from "./queue-strategy";
-import type { AgentStateEntry, QueueMembership } from "@optimiq-voice/events";
+import type { AgentStateEntry, QueueMembership, QueueResumeTombstone } from "@optimiq-voice/events";
 import type { QueuePlanNode } from "@optimiq-voice/routing";
 import type { HangupCause } from "@optimiq-voice/telephony";
 
@@ -33,24 +33,37 @@ import type { HangupCause } from "@optimiq-voice/telephony";
  *
  * ## What is real and what is honestly missing
  *
- * Real: joining, music on hold, position announcements, all six strategies, tier rules, per-agent
- * no-answer/busy/reject penalties, `maxNoAnswer` taking an agent out of distribution, both wait
- * deadlines, wrap-up, and the three caller-facing queue events in the right order with the right
- * wait statistics.
+ * Real: joining, music on hold, all six strategies, tier rules, per-agent no-answer/busy/reject
+ * penalties, `maxNoAnswer` taking an agent out of distribution, both wait deadlines, wrap-up, and the
+ * caller-facing queue events in the right order with the right wait statistics.
+ *
+ * Real since the contact-centre wave, and each of them a line that used to be in the "missing" list
+ * below:
+ *
+ * - **Position is cluster-wide.** {@link QueueWaitingPort} is a compare-and-set record in the
+ *   `queue-waiting` bucket holding the whole line, so "you are caller number four" is true with three
+ *   engines behind one media server. When it cannot be read the session announces NOTHING rather than
+ *   the number this process could have guessed — see {@link QueueSession.announceIfDue}.
+ * - **Recording is honoured**, as a {@link import("@optimiq-voice/routing").RecordPolicy} rather than
+ *   the boolean this used to read only to write a note about, and it starts at the ANSWER.
+ * - **Priority is real.** It comes off the plan node (the queue's default, or the per-entry override
+ *   the compiler minted a distinct node for) and orders the shared line. What it costs is written down
+ *   at length in `queue-waiting.ts`: strict priority, no ageing, bounded by the queue's own deadlines.
+ * - **Abandoned-resume works**, keyed by caller number, with the promise and the removal written in
+ *   one operation. Who else can collect that promise is on `queueResumeTombstoneSchema`.
+ * - **Exit keys** end a caller's stay on a single DTMF digit, observed non-blockingly inside the same
+ *   loop as everything else.
+ * - **Per-tier announcements** override the queue's whisper for the agent who took the call.
  *
  * Missing, and noted on the walk rather than faked:
  *
- * - **Position is per engine instance.** {@link QueuePositionPort} counts the callers THIS process
- *   is holding. With one engine that is the true position; with several it is a lower bound. A
- *   cluster-wide position needs a shared counter (a KV entry per queue, or a JetStream ordered
- *   consumer), which is a backbone change rather than a runtime one.
- * - **`recordEnabled` is not honoured.** Recording a queue call is the same unimplemented feature as
- *   recording a ring-group call, and belongs with the recording work rather than here.
- * - **Priority is always 0.** `queue.caller.joined` carries a priority the plan node does not have;
- *   `pbx-db` has no priority column either, so there is nothing to read. Reported as 0, which is
- *   what "unprioritised" means on that scale.
- * - **`abandonedResumeAllowed`** (a caller who rings back keeps their place) needs state that
- *   outlives the call. Not attempted.
+ * - **Recording is best-effort.** A media plane that cannot tap, or a media server that refuses one,
+ *   costs the call its recording and not its existence. A tenant with a legal obligation to record
+ *   needs the opposite — a REFUSED call with a spoken reason — and that is a setting nobody has asked
+ *   for yet rather than a behaviour to guess at. See {@link QueueSession.startRecording}.
+ * - **One digit per poll pass.** A caller who presses four keys in a second has the first of them
+ *   acted on; the rest stay in the leg's buffer for whatever they reach next. Fine for a one-digit
+ *   exit key, and the reason this is a poll rather than a `gather` is on {@link QueueCallPort.pollDigit}.
  */
 
 // ---------------------------------------------------------------------------------------------
@@ -145,6 +158,38 @@ export interface QueueCallPort {
 	hangupAnsweredAgent(mediaChannelId: string): Promise<void>;
 	/** Joins the caller to an answered agent leg. `onEnded` fires when that leg goes away. */
 	bridge(mediaChannelId: string, onEnded: () => void): Promise<boolean>;
+	/**
+	 * The next DTMF digit this caller has pressed, or `undefined` when they have pressed none.
+	 *
+	 * ## Non-blocking, and why it has to be
+	 *
+	 * The wait loop already has a structure — one pass, re-read everything, do one thing — and the
+	 * exit key has to live inside it rather than beside it. A blocking `gather` would be a second
+	 * concurrent thing happening to the caller: it holds the leg's collection open for its whole
+	 * timeout, so an announcement that fell due mid-gather would either be delayed or would play into
+	 * a collection nobody expected, and two of them running at once on one leg throws outright. A
+	 * poll that returns immediately composes with everything the loop already does.
+	 *
+	 * ## It observes rather than consumes
+	 *
+	 * The walker implements this by watching the leg's signal bus, which is fed before the digit is
+	 * offered to anything else. So a digit the queue ignores is still in the leg's DTMF buffer for
+	 * whatever the caller reaches next — which is the behaviour type-ahead depends on, and is why
+	 * `4` pressed in a queue that has no exit key still reaches the IVR the timeout branch sends them
+	 * to. The queue takes no digit away from anybody; it only leaves the moment it sees its own.
+	 *
+	 * `undefined` from an implementation that cannot observe digits at all is a queue with no working
+	 * exit key, which is exactly what every queue had before.
+	 */
+	pollDigit(): string | undefined;
+	/**
+	 * Starts recording the conversation, once the agent is bridged in.
+	 *
+	 * Returns whether recording is now running. `false` is not fatal and never stops the call — see
+	 * {@link QueueSession.startRecording} for why a queue whose media plane cannot record answers the
+	 * caller anyway and says so on the walk.
+	 */
+	startRecording(): Promise<boolean>;
 	/** A prompt id as a playable media reference, or `undefined` when it resolves to nothing. */
 	resolvePrompt(promptId: string | undefined): string | undefined;
 	/** A number as playable digit sounds, for the position announcement. */
@@ -212,6 +257,7 @@ export interface QueueEventPort {
 		readonly position: number;
 		readonly priority: number;
 		readonly callerNumber?: string;
+		readonly resumed?: boolean;
 	}): Promise<void>;
 	callerAnswered(input: {
 		readonly orgId: string;
@@ -229,17 +275,80 @@ export interface QueueEventPort {
 		readonly legId: string;
 		readonly waitMs: number;
 		readonly position?: number;
-		readonly reason: "caller-hangup" | "timeout" | "overflow" | "no-agents";
+		readonly reason: "caller-hangup" | "timeout" | "overflow" | "no-agents" | "exit-key";
+		readonly exitKey?: string;
 	}): Promise<void>;
 }
 
-/** Where a caller stands in the line this process is holding. */
-export interface QueuePositionPort {
-	/** Adds the caller and returns their 1-based position. */
-	join(orgId: string, queueId: string, callId: string): number;
-	/** Their position now, which shrinks as callers ahead of them are answered. */
-	positionOf(orgId: string, queueId: string, callId: string): number;
-	leave(orgId: string, queueId: string, callId: string): void;
+/**
+ * Where a caller stands in the CLUSTER's line for this queue.
+ *
+ * Replaces the in-process counter this used to have. That counter answered from the callers one
+ * engine happened to be holding, so with three instances every announced position was a lower bound
+ * and a priority order was three separate orders. See `queue-waiting.ts` for the record, the
+ * comparator and the starvation stance; see `queue-waiting.store.ts` for the compare-and-set.
+ *
+ * Every method is async and none of them may throw: the implementation is a KV round trip, and a
+ * broken line must cost a caller their POSITION ANNOUNCEMENT, never their call.
+ */
+export interface QueueWaitingPort {
+	join(request: QueueWaitingJoin): Promise<QueueWaitingView>;
+	/** Re-reads the line and renews this caller's lease when it is due. Called each poll pass. */
+	refresh(request: QueueWaitingRefresh): Promise<QueueWaitingView>;
+	/** Removes the caller, writing a resume tombstone in the same operation when one is asked for. */
+	leave(request: QueueWaitingLeave): Promise<void>;
+}
+
+export interface QueueWaitingJoin {
+	readonly orgId: string;
+	readonly queueId: string;
+	readonly callId: string;
+	readonly legId: string;
+	readonly priority: number;
+	readonly callerNumber?: string;
+	readonly instanceId: string;
+	readonly now: number;
+	/** Whether a live tombstone for `callerNumber` may be claimed to restore their old place. */
+	readonly resumeAllowed: boolean;
+}
+
+export interface QueueWaitingRefresh {
+	readonly orgId: string;
+	readonly queueId: string;
+	readonly callId: string;
+	readonly legId: string;
+	readonly priority: number;
+	readonly callerNumber?: string;
+	readonly instanceId: string;
+	/** The order this caller holds — restored, not recomputed, if the entry has to be rewritten. */
+	readonly joinedAt: number;
+	readonly now: number;
+}
+
+export interface QueueWaitingLeave {
+	readonly orgId: string;
+	readonly queueId: string;
+	readonly callId: string;
+	readonly now: number;
+	readonly tombstone?: QueueResumeTombstone;
+}
+
+/** What the line says about one caller. */
+export interface QueueWaitingView {
+	/**
+	 * 1-based position, or 0 for "not known".
+	 *
+	 * 0 is a real answer and the session acts on it: the record could not be read, or this caller is
+	 * not in it. It declines to announce rather than announcing a number it guessed, because a caller
+	 * told "you are number one" four times running has been lied to four times.
+	 */
+	readonly position: number;
+	readonly waiting: number;
+	readonly longestWaitMs: number;
+	/** True when a `join` claimed a tombstone and restored this caller's earlier place. */
+	readonly resumed: boolean;
+	/** The instant this caller's place is ordered by. Their arrival, or the one they resumed. */
+	readonly joinedAt: number;
 }
 
 /** Which agent this queue distributed to last. Per queue, per process; see `round-robin`. */
@@ -253,7 +362,7 @@ export interface QueueServices {
 	readonly membership: QueueMembershipPort;
 	readonly agents: AgentStatePort;
 	readonly events: QueueEventPort;
-	readonly positions: QueuePositionPort;
+	readonly waiting: QueueWaitingPort;
 	readonly cursor: QueueCursorPort;
 }
 
@@ -264,6 +373,8 @@ export interface QueueSessionSettings {
 	readonly agentRingTimeoutSeconds: number;
 	/** Injected so `random` is deterministic in a spec. */
 	readonly random: () => number;
+	/** This engine process, written onto the caller's waiting-line entry. */
+	readonly instanceId: string;
 	/** Injected so release retries are deterministic without making production timers ref the process. */
 	readonly scheduleReleaseRetry: (callback: () => Promise<void>, delayMs: number) => void;
 }
@@ -272,6 +383,7 @@ export const DEFAULT_QUEUE_SESSION_SETTINGS: QueueSessionSettings = {
 	pollIntervalMs: 1_000,
 	agentRingTimeoutSeconds: 20,
 	random: Math.random,
+	instanceId: "engine",
 	scheduleReleaseRetry: (callback, delayMs) => {
 		const timer = setTimeout(() => {
 			void callback();
@@ -291,6 +403,15 @@ export type QueueOutcome =
 	  }
 	/** The caller hung up while waiting. Nothing left to route. */
 	| { readonly kind: "abandoned"; readonly waitMs: number }
+	/**
+	 * The caller pressed the queue's exit key. The walker takes the queue's exit branch.
+	 *
+	 * A separate outcome from `timeout` even though both end in "take a branch", because they are
+	 * opposite facts about the same caller: one ran out of patience and one made a choice, and an SLA
+	 * report that could not tell them apart would show a queue whose exit key works well as a queue
+	 * that times people out. The digit travels so the walker's note and the event can name it.
+	 */
+	| { readonly kind: "exit-key"; readonly digit: string; readonly waitMs: number }
 	/** The leg went away underneath the session before it could join. */
 	| { readonly kind: "aborted" }
 	/** The roster could not be obtained. Distinguished from "no agents" deliberately. */
@@ -321,9 +442,23 @@ export class QueueSession {
 	private readonly transitionRetries = new Map<string, OwnedTransitionRetry>();
 	/** The frozen order `sequential` walks; computed on the first pass and never recomputed. */
 	private frozenOrder: readonly string[] | undefined;
+	/** When this caller's WAIT started. Always their real arrival, even when their place is older. */
 	private joinedAt = 0;
+	/**
+	 * The instant the shared line ORDERS this caller by.
+	 *
+	 * Equal to {@link joinedAt} for everybody except a resumed caller, whose place is the one they
+	 * had before they hung up. The two are separate fields because they answer different questions
+	 * and conflating them would corrupt both: `waitMs` on every event would include the minutes the
+	 * resumed caller was not on the phone (an SLA report of a queue nobody was waiting in), and using
+	 * the arrival for the order would put them at the back, which is the feature not working.
+	 */
+	private orderedAt = 0;
 	private position = 0;
+	private waiting = 0;
+	private priority = 0;
 	private lastAnnouncedAt = 0;
+	private recording = false;
 
 	constructor(
 		private readonly node: QueuePlanNode,
@@ -347,29 +482,90 @@ export class QueueSession {
 		}
 
 		this.joinedAt = this.call.now();
+		this.orderedAt = this.joinedAt;
 		this.lastAnnouncedAt = this.joinedAt;
-		this.position = this.services.positions.join(
-			this.call.organizationId,
-			this.node.queueId,
-			this.call.callId,
-		);
+		this.priority = this.node.priority;
 
-		await this.publishJoined();
-
-		if (this.node.recordEnabled) {
+		const joined = await this.services.waiting.join({
+			orgId: this.call.organizationId,
+			queueId: this.node.queueId,
+			callId: this.call.callId,
+			legId: this.call.callerLegId,
+			priority: this.priority,
+			instanceId: this.settings.instanceId,
+			now: this.joinedAt,
+			resumeAllowed: this.node.abandonedResumeAllowed,
+			...(this.call.callerNumber === undefined ? {} : { callerNumber: this.call.callerNumber }),
+		});
+		this.applyView(joined);
+		if (joined.resumed) {
+			this.orderedAt = joined.joinedAt;
+			// The priority may have been restored upward with the place — see the store's `join`.
+			this.priority = Math.max(this.priority, this.node.priority);
 			this.call.note(
-				`queue "${this.node.queueId}" asks for call recording, which is not implemented for queues yet; the call was taken without it`,
+				`queue "${this.node.queueId}": this caller rang back inside the ${String(this.node.discardAbandonedAfterSeconds)}s window and was restored to the place they had before they hung up`,
 			);
 		}
 
+		await this.publishJoined(joined.resumed);
+
+		let outcome: QueueOutcome;
 		try {
-			return await this.wait();
+			outcome = await this.wait();
 		} catch (error) {
 			this.call.note(`queue "${this.node.queueId}" failed: ${String(error)}`);
-			return { kind: "failed", reason: String(error) };
-		} finally {
-			this.services.positions.leave(this.call.organizationId, this.node.queueId, this.call.callId);
+			outcome = { kind: "failed", reason: String(error) };
 		}
+		// Outside the try, and after the outcome is known, because WHY the caller left decides
+		// whether their place is held for them. A `finally` that ran before the outcome existed could
+		// only ever leave unconditionally, and would either hold a place for somebody an agent
+		// answered or hold none for the person who hung up — which is the whole feature.
+		await this.leaveLine(outcome);
+		return outcome;
+	}
+
+	/**
+	 * Takes the caller out of the shared line, with a resume promise when they earned one.
+	 *
+	 * Exactly one outcome earns one: `abandoned`, which is the caller hanging up while waiting. Not
+	 * a timeout — the queue decided that, and the caller is being sent somewhere by configuration, so
+	 * holding a place they did not choose to leave would mean their call-back jumped the line ahead of
+	 * people who never gave up. Not an exit key, for a stronger version of the same reason: they chose
+	 * to stop waiting. Not `answered`, obviously. Not `failed` or `aborted`, because a place restored
+	 * on the strength of an infrastructure fault is a place nobody can account for.
+	 */
+	private async leaveLine(outcome: QueueOutcome): Promise<void> {
+		const now = this.call.now();
+		const callerNumber = this.call.callerNumber;
+		const holdsPlace =
+			outcome.kind === "abandoned" &&
+			this.node.abandonedResumeAllowed &&
+			this.node.discardAbandonedAfterSeconds > 0 &&
+			callerNumber !== undefined &&
+			callerNumber !== "";
+
+		await this.services.waiting.leave({
+			orgId: this.call.organizationId,
+			queueId: this.node.queueId,
+			callId: this.call.callId,
+			now,
+			...(holdsPlace
+				? {
+						tombstone: {
+							callerNumber: callerNumber as string,
+							joinedAt: this.orderedAt,
+							priority: this.priority,
+							abandonedAt: now,
+							expiresAt: now + this.node.discardAbandonedAfterSeconds * MILLIS_PER_SECOND,
+						},
+					}
+				: {}),
+		});
+	}
+
+	private applyView(view: QueueWaitingView): void {
+		this.position = view.position;
+		this.waiting = view.waiting;
 	}
 
 	// -------------------------------------------------------------------------------------------
@@ -383,6 +579,15 @@ export class QueueSession {
 		for (;;) {
 			if (this.call.isTearingDown) {
 				return await this.abandon("caller-hangup");
+			}
+
+			// Before anything else on the pass. A caller who has pressed the exit key has stopped
+			// being a queued caller, and every line below this — the roster read, the deadlines, the
+			// selection — is work on their behalf that they have just told us not to do. Checking it
+			// first is also what makes the key feel instant rather than "some time in the next second".
+			const exit = await this.exitKeyPressed();
+			if (exit !== undefined) {
+				return exit;
 			}
 
 			const waited = this.waitedMs();
@@ -410,18 +615,87 @@ export class QueueSession {
 				return await this.timeOut(deadline);
 			}
 
-			const candidate = this.nextCandidates(membership, states, waited);
-			if (candidate.length === 0) {
+			const selection = this.nextCandidates(membership, states, waited);
+			if (selection.candidates.length === 0 || !this.mayOffer(selection.eligible)) {
 				await this.announceIfDue();
 				await this.call.delay(this.settings.pollIntervalMs);
 				continue;
 			}
 
-			const offered = await this.offer(membership, candidate);
+			const offered = await this.offer(membership, selection.candidates);
 			if (offered !== undefined) {
 				return offered;
 			}
 		}
+	}
+
+	/**
+	 * Whether this caller may ring anybody yet, given who is ahead of them.
+	 *
+	 * ## The gate, and why it is a bound rather than a turnstile
+	 *
+	 * A caller may offer when their rank in the shared line is at most the number of agents currently
+	 * eligible. Rank 1 with one free agent offers; ranks 1, 2 and 3 with three free agents all offer,
+	 * and the reservation's compare-and-set sorts out who gets whom; rank 3 with one free agent waits,
+	 * which is precisely how a priority-800 caller who arrived a moment ago gets the phone before a
+	 * priority-0 caller who has been holding.
+	 *
+	 * The obvious alternative — only rank 1 may offer — is a turnstile, and it is wrong in a way that
+	 * costs real money: a queue with five free agents would serve one caller per poll interval,
+	 * turning an instant answer for five people into a five-second staircase, and doing it precisely
+	 * during the traffic spike that made five people call at once. The bound gives the same ordering
+	 * guarantee with none of the serialisation, because the thing that must be exclusive (the AGENT)
+	 * is already made exclusive by `reserve`.
+	 *
+	 * ## It opens when the line is unknown
+	 *
+	 * A rank of 0 means the record could not be read. The gate then passes, and that is deliberate: a
+	 * broker hiccup must degrade priority ordering, not stop a queue distributing calls. The failure
+	 * this direction is "for a few seconds the queue behaved exactly as it did before priorities
+	 * existed"; the other direction is a queue that silently answers nobody while the wallboard fills
+	 * up, which is an outage nobody would attribute to a KV read.
+	 */
+	private mayOffer(eligibleAgents: number): boolean {
+		if (this.position <= 0) {
+			return true;
+		}
+		return this.position <= Math.max(1, eligibleAgents);
+	}
+
+	/**
+	 * The exit key, checked once per pass.
+	 *
+	 * Digits that are NOT the exit key are ignored here and deliberately left in the leg's buffer —
+	 * see {@link QueueCallPort.pollDigit}. Only one digit is taken per pass, which is enough: the pass
+	 * runs every poll interval, and a caller who mashes four keys has the first of them answered
+	 * within a second rather than having three of them silently discarded.
+	 */
+	private async exitKeyPressed(): Promise<QueueOutcome | undefined> {
+		const key = this.node.exitKey;
+		if (key === undefined || key === "") {
+			return undefined;
+		}
+		const digit = this.call.pollDigit();
+		if (digit === undefined || digit.toUpperCase() !== key.toUpperCase()) {
+			return undefined;
+		}
+
+		const waitMs = this.waitedMs();
+		this.call.note(
+			`queue "${this.node.queueId}": the caller pressed the exit key "${key}" after ${String(Math.round(waitMs / MILLIS_PER_SECOND))}s and left the queue`,
+		);
+		await this.call.stopMusicOnHold();
+		await this.services.events.callerAbandoned({
+			orgId: this.call.organizationId,
+			queueId: this.node.queueId,
+			callId: this.call.callId,
+			legId: this.call.callerLegId,
+			waitMs,
+			reason: "exit-key",
+			exitKey: key,
+			...(this.position > 0 ? { position: this.position } : {}),
+		});
+		return { kind: "exit-key", digit: key, waitMs };
 	}
 
 	/**
@@ -466,7 +740,7 @@ export class QueueSession {
 		membership: QueueMembership,
 		states: ReadonlyMap<string, AgentStateEntry>,
 		waitedMs: number,
-	): readonly QueueCandidate[] {
+	): { readonly candidates: readonly QueueCandidate[]; readonly eligible: number } {
 		const now = this.call.now();
 		const excluded = new Set(
 			[...this.tried.entries()].filter(([, until]) => until > now).map(([agentId]) => agentId),
@@ -485,8 +759,12 @@ export class QueueSession {
 			...(cursor === undefined ? {} : { roundRobinAfterAgentId: cursor }),
 		});
 
+		// The count BEFORE the fan-out narrows it to one. That is what the admission gate needs: "how
+		// many phones could be ringing right now", not "how many this caller is about to ring".
+		const eligible = selection.ordered.length;
+
 		if (selection.fanOut === "all") {
-			return selection.ordered;
+			return { candidates: selection.ordered, eligible };
 		}
 
 		if (this.node.strategy === "sequential") {
@@ -496,15 +774,18 @@ export class QueueSession {
 			for (const agentId of frozen) {
 				const candidate = byId.get(agentId);
 				if (candidate !== undefined) {
-					return [candidate];
+					return { candidates: [candidate], eligible };
 				}
 			}
 			// Everybody on the frozen list has been tried or has gone. The pass is over; the loop
 			// keeps waiting, and the next selection re-freezes only if the order was never set.
-			return [];
+			return { candidates: [], eligible };
 		}
 
-		return selection.ordered.length === 0 ? [] : [selection.ordered[0] as QueueCandidate];
+		return {
+			candidates: selection.ordered.length === 0 ? [] : [selection.ordered[0] as QueueCandidate],
+			eligible,
+		};
 	}
 
 	// -------------------------------------------------------------------------------------------
@@ -650,11 +931,19 @@ export class QueueSession {
 			strategy: this.node.strategy,
 		});
 
-		await this.whisperToAgent(mediaChannelId);
+		await this.whisperToAgent(mediaChannelId, membership, agentId);
 
 		const bridged = await this.call.bridge(mediaChannelId, () => {
 			void this.startWrapUp(membership, agentId);
 		});
+
+		// AFTER the bridge, and only after a successful one. Recording is a tap on a bridged
+		// conversation (`CallControl.startRecording`), so there is nothing to tap until the two legs
+		// are joined — and a recording started against a bridge that failed would be an object with
+		// one side of a conversation that never happened, filed under the tenant's retention policy.
+		if (bridged) {
+			await this.startRecording();
+		}
 
 		if (!bridged) {
 			// The answer was real and the bridge was not. The agent is on a leg that is about to be
@@ -687,8 +976,19 @@ export class QueueSession {
 	 * caller who has already waited in a queue because a sound file is missing would be a much larger
 	 * outage than the one it reported.
 	 */
-	private async whisperToAgent(mediaChannelId: string): Promise<void> {
-		const promptId = this.node.agentWhisperPromptId;
+	private async whisperToAgent(
+		mediaChannelId: string,
+		membership: QueueMembership,
+		agentId: string,
+	): Promise<void> {
+		// The TIER's prompt wins over the queue's, and falls back to it. A tier prompt exists to say
+		// something the queue's cannot — "this reached you because level 2 opened, so they have
+		// already waited" — and playing both would be two announcements in the second an agent has
+		// before they speak. Falling back rather than going silent is what makes the tier column
+		// optional: a queue where one level has a prompt and the others do not still whispers to
+		// everybody.
+		const tier = membership.agents.find((agent) => agent.agentId === agentId);
+		const promptId = tier?.announcePromptId ?? this.node.agentWhisperPromptId;
 		if (promptId === undefined || promptId.trim() === "") {
 			return;
 		}
@@ -708,6 +1008,53 @@ export class QueueSession {
 		} catch (error) {
 			this.call.note(
 				`queue "${this.node.queueId}": the agent whisper prompt failed (${String(error)}); the agent was bridged without it`,
+			);
+		}
+	}
+
+	/**
+	 * Starts the call recording the queue's policy asks for.
+	 *
+	 * ## Which policies record, and why `inbound` does
+	 *
+	 * `all` and `inbound`. A queued call is INBOUND from the queue's point of view whichever direction
+	 * the leg that reached the queue was travelling — somebody waited and an agent took them — so a
+	 * policy of `inbound` on a queue means "record what this queue distributes". `outbound` therefore
+	 * never records here, and `on-demand` deliberately does not either: that is the policy that means
+	 * "the agent starts it by hand", and a queue that pre-empted them would make the record-toggle
+	 * feature code a no-op and the policy a lie.
+	 *
+	 * ## A failure is a note, never a hangup
+	 *
+	 * The three ways this fails are a media plane that never decodes audio (a relay-only bridge cannot
+	 * be tapped), a media server that refuses the tap, and a leg that is already being recorded. None
+	 * of them is worth dropping a call a customer has already queued for. They are all worth a line on
+	 * the walk, because "why is there no recording for this call?" is a compliance question and
+	 * "nothing happened" is not an answer to it.
+	 *
+	 * The honest limitation, recorded rather than hidden: this makes recording BEST-EFFORT, and a
+	 * tenant with a legal obligation to record needs the call REFUSED when it cannot be. That is a
+	 * different setting (a `record_required` flag whose failure is a hangup with a spoken reason) and
+	 * a different conversation with the operator, and inventing it here would mean choosing on their
+	 * behalf which of two liabilities they prefer.
+	 */
+	private async startRecording(): Promise<void> {
+		const policy = this.node.recordPolicy;
+		if (policy !== "all" && policy !== "inbound") {
+			return;
+		}
+		try {
+			this.recording = await this.call.startRecording();
+		} catch (error) {
+			this.recording = false;
+			this.call.note(
+				`queue "${this.node.queueId}": recording could not be started (${String(error)}); the call was connected without it`,
+			);
+			return;
+		}
+		if (!this.recording) {
+			this.call.note(
+				`queue "${this.node.queueId}" has a record policy of "${policy}" and the recording could not be started; the call was connected without it`,
 			);
 		}
 	}
@@ -974,6 +1321,24 @@ export class QueueSession {
 	 * same approach the voicemail box readback takes, so this works with no prompt pack and no TTS.
 	 */
 	private async announceIfDue(): Promise<void> {
+		// The line is re-read on EVERY pass, not only when an announcement is due, because the
+		// position is also the admission gate's input — a caller who only refreshed once a minute
+		// would spend that minute deciding whether to ring anybody from a rank that is up to a minute
+		// stale. The read is a point get; the lease renewal inside it is throttled separately.
+		this.applyView(
+			await this.services.waiting.refresh({
+				orgId: this.call.organizationId,
+				queueId: this.node.queueId,
+				callId: this.call.callId,
+				legId: this.call.callerLegId,
+				priority: this.priority,
+				instanceId: this.settings.instanceId,
+				joinedAt: this.orderedAt,
+				now: this.call.now(),
+				...(this.call.callerNumber === undefined ? {} : { callerNumber: this.call.callerNumber }),
+			}),
+		);
+
 		if (!this.node.announcePositionEnabled || this.node.announceFrequencySeconds <= 0) {
 			return;
 		}
@@ -981,13 +1346,19 @@ export class QueueSession {
 		if (now - this.lastAnnouncedAt < this.node.announceFrequencySeconds * MILLIS_PER_SECOND) {
 			return;
 		}
-		this.lastAnnouncedAt = now;
 
-		this.position = this.services.positions.positionOf(
-			this.call.organizationId,
-			this.node.queueId,
-			this.call.callId,
-		);
+		if (this.position <= 0) {
+			// The shared line could not be read, so there is no position to announce. Silence and a
+			// note, rather than the number this process could have guessed from its own callers: a
+			// guess is what the counter this replaced did, and it is how a caller who is ninth is told
+			// four times that they are third. `lastAnnouncedAt` is deliberately NOT advanced, so the
+			// next pass that CAN read the line announces immediately rather than a minute later.
+			this.call.note(
+				`queue "${this.node.queueId}": the shared waiting line could not be read, so no position was announced`,
+			);
+			return;
+		}
+		this.lastAnnouncedAt = now;
 
 		await this.call.stopMusicOnHold();
 		const preamble = this.call.resolvePrompt(this.node.announcePromptId);
@@ -1003,16 +1374,18 @@ export class QueueSession {
 		await this.startMusic();
 	}
 
-	private async publishJoined(): Promise<void> {
+	private async publishJoined(resumed: boolean): Promise<void> {
 		await this.services.events.callerJoined({
 			orgId: this.call.organizationId,
 			queueId: this.node.queueId,
 			callId: this.call.callId,
 			legId: this.call.callerLegId,
+			// The event's floor is 1 and an unreadable line has no position, so the fallback stays.
+			// It is a floor on the WIRE, not a guess in the runtime: `this.position` is left at 0 and
+			// the announcement declines, which is the difference that matters.
 			position: Math.max(1, this.position),
-			// The plan node has no priority and neither does `pbx-db`'s queue table. 0 is what
-			// "unprioritised" means on the event's 0-1000 scale; inventing one would be worse.
-			priority: 0,
+			priority: this.priority,
+			...(resumed ? { resumed: true } : {}),
 			...(this.call.callerNumber === undefined ? {} : { callerNumber: this.call.callerNumber }),
 		});
 	}

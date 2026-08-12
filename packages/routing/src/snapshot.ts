@@ -96,6 +96,44 @@ export const RING_GROUP_STRATEGIES = ["simultaneous", "sequential"] as const;
 
 export type RingGroupStrategy = (typeof RING_GROUP_STRATEGIES)[number];
 
+/**
+ * Mirrored from `pbx-db` `queues-schema.ts`.
+ *
+ * The caller-priority scale: higher dequeues first, and 0 means unprioritised. It is the same range
+ * `queue.caller.joined` has always published on, so nothing between the database, the compiler, the
+ * engine and a wallboard has to rescale.
+ */
+export const QUEUE_PRIORITY_MIN = 0;
+export const QUEUE_PRIORITY_MAX = 1000;
+
+/**
+ * The DTMF symbols a queue exit key may be.
+ *
+ * The sixteen a phone can actually send, and no others — the compiler normalises against this rather
+ * than trusting the column's check constraint, because an artifact compiled from a snapshot loader
+ * that did not select the column, or from a fixture, has never met that constraint.
+ */
+export const QUEUE_EXIT_KEYS = [
+	"0",
+	"1",
+	"2",
+	"3",
+	"4",
+	"5",
+	"6",
+	"7",
+	"8",
+	"9",
+	"*",
+	"#",
+	"A",
+	"B",
+	"C",
+	"D",
+] as const;
+
+export type QueueExitKey = (typeof QUEUE_EXIT_KEYS)[number];
+
 /** Mirrored from `pbx-db` `queues-schema.ts`. */
 export const QUEUE_STRATEGIES = [
 	"longest-idle",
@@ -500,7 +538,24 @@ export interface QueueInput extends RoutingEntityInput {
 	readonly maxWaitNoAgentSeconds: number;
 	readonly announcePositionEnabled: boolean;
 	readonly announceFrequencySeconds: number;
-	readonly recordEnabled: boolean;
+	/**
+	 * `queue.record_policy` — the same vocabulary `extension` and `trunk` carry, which replaced a
+	 * `recordEnabled` boolean no runtime honoured.
+	 *
+	 * Optional for the rollout reason every other new field on this interface is optional: a loader
+	 * that has not been taught the column yet produces a queue that records nothing, which is what
+	 * every queue did before, rather than one the compiler refuses.
+	 */
+	readonly recordPolicy?: RecordPolicy | null;
+	/** The single DTMF digit a waiting caller may press to leave. Null/absent disables it. */
+	readonly exitKey?: string | null;
+	readonly exitDestinationType?: DestinationInput["destinationType"] | null;
+	readonly exitDestinationRef?: string | null;
+	readonly exitDestinationData?: DestinationInput["destinationData"];
+	/** `queue.default_priority`. A referring destination may override it per entry. */
+	readonly defaultPriority?: number | null;
+	readonly abandonedResumeAllowed?: boolean | null;
+	readonly discardAbandonedAfterSeconds?: number | null;
 	readonly timeoutDestinationType?: DestinationInput["destinationType"] | null;
 	readonly timeoutDestinationRef?: string | null;
 	readonly timeoutDestinationData?: DestinationInput["destinationData"];

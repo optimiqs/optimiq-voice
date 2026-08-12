@@ -486,6 +486,33 @@ var MediaSessionsKV = KVBucketDefinition{
 	NumReplicas:  1,
 }
 
+// QueueWaitingKV holds one queue's leased waiting line and its abandoned-resume tombstones.
+//
+// "You are caller number four" was a lie in a cluster: the count came from an in-process map, so
+// every engine counted only the callers it held and each announced a number that was too small.
+// Three features needed the same missing fact — the position itself, caller priority (an order needs
+// everybody in it, or two instances each order their own half), and abandoned-resume (the line has
+// to remember somebody who is no longer on it).
+//
+// One key per queue holding the whole line, like QueueMembershipKV and for a stronger version of the
+// same reason: a position is a RANK, so it is not answerable from one caller's own row. Every write
+// is a compare-and-set against the revision it read.
+//
+// Entries carry their own expiresAt because a single-key record cannot have per-caller server-side
+// expiry, and a crashed engine that left its callers in the line would make every survivor's
+// position too large — the exact failure this bucket exists to fix, inverted. The six-hour TTL
+// matches ChannelsKV: longer than any call, shorter than a shift.
+var QueueWaitingKV = KVBucketDefinition{
+	Name:         "queue-waiting",
+	Description:  "Queue -> the leased waiting line and abandoned-resume tombstones, under CAS.",
+	TTL:          6 * time.Hour,
+	History:      1,
+	Storage:      StorageFile,
+	MaxValueSize: 256 * 1024,
+	MaxBytes:     256 * mib,
+	NumReplicas:  1,
+}
+
 // KVBuckets lists every bucket the backbone owns, in apply order.
 var KVBuckets = []KVBucketDefinition{
 	RegistrationsKV,
@@ -498,6 +525,7 @@ var KVBuckets = []KVBucketDefinition{
 	ParkClaimsKV,
 	ConferenceClaimsKV,
 	MediaSessionsKV,
+	QueueWaitingKV,
 }
 
 // KVBucketByName looks a bucket definition up by name.
@@ -627,6 +655,24 @@ func DIDIndexKVKey(did string) (string, error) {
 // a per-agent key would mean a range read per queued caller, and a partially-applied write would
 // produce a roster the control plane never held.
 func QueueMembershipKVKey(orgID, queueID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	queue, err := token("queueId", queueID)
+	if err != nil {
+		return "", err
+	}
+	return org + "." + queue, nil
+}
+
+// QueueWaitingKVKey builds the queue-waiting key <orgId>.<queueId>: one entry per queue, holding its
+// whole line.
+//
+// Deliberately the same key SHAPE as QueueMembershipKVKey, in a different bucket. The roster and the
+// line are both per-queue facts with different writers, different lifetimes and different TTLs, and
+// a reader wanting "everything about queue X" gets it from two point gets on one key string.
+func QueueWaitingKVKey(orgID, queueID string) (string, error) {
 	org, err := token("orgId", orgID)
 	if err != nil {
 		return "", err

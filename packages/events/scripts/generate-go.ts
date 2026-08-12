@@ -1081,6 +1081,11 @@ function parityGolden(): unknown {
 				args: [ORG_A, QUEUE_A],
 				key: kvKeyFor.queueMembership(ORG_A, QUEUE_A),
 			},
+			{
+				builder: "queueWaiting",
+				args: [ORG_A, QUEUE_A],
+				key: kvKeyFor.queueWaiting(ORG_A, QUEUE_A),
+			},
 			{ builder: "mediaSession", args: [SESSION_A], key: kvKeyFor.mediaSession(SESSION_A) },
 		],
 		streams: EVENT_STREAMS.map((definition: StreamDefinition) => ({ ...definition })),

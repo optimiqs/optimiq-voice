@@ -22,7 +22,8 @@ import { SipTransferService } from "../nats/sip-transfer.service";
 import { AgentStateStore } from "../queue/agent-state.store";
 import { QueueEventPublisher } from "../queue/queue-event-publisher.service";
 import { QueueMembershipSource } from "../queue/queue-membership.source";
-import { QueueCursors, QueuePositions } from "../queue/queue-registry";
+import { QueueCursors } from "../queue/queue-registry";
+import { QueueWaitingStore } from "../queue/queue-waiting.store";
 import { CallSignalBus, legSignalKey, recordingSignalKey } from "../routing/call-signals";
 import { CLAIM_HEARTBEAT_INTERVAL_MS } from "../routing/claim-timing";
 import { ConferenceRegistry } from "../routing/conference-registry";
@@ -43,7 +44,7 @@ import { DtmfRegistry } from "../verbs/dtmf-registry";
 import { callDirectionFrom, dialStringOr, hangupSideFor } from "./ari-mapping";
 import { CallControl, pickupGroupFilter } from "./call-control";
 import { CallControlRegistry } from "./call-control-registry";
-import { buildCdrLegWrite } from "./cdr-leg";
+import { buildCdrLegWrite, queueLegOf } from "./cdr-leg";
 import { ChannelAggregate } from "./channel-aggregate";
 import {
 	callIdForAriChannel,
@@ -67,6 +68,7 @@ import type {
 	PlanWalkerSettings,
 	VoicemailPort,
 	WalkerCallControl,
+	WalkerQueueOutcome,
 	WalkerChannel,
 } from "../routing/plan-walker";
 import type { VerbDispatchOutcome } from "../session/application-sessions";
@@ -99,6 +101,18 @@ import type {
 /** Channel variables the routing walk writes back, so the KV mirror carries the decision too. */
 const DESTINATION_TYPE_VARIABLE = "OPTIMIQ_DESTINATION_TYPE";
 const DESTINATION_REF_VARIABLE = "OPTIMIQ_DESTINATION_REF";
+/**
+ * The queue's verdict on a caller's stay, mirrored onto the leg exactly as the destination is.
+ *
+ * Channel variables and not walk state, for the reason `recordDestination` gives: the CDR is written
+ * by whichever of the teardown and the walk's return gets there first, and only the variables are
+ * visible to both. They also travel into the `channels` bucket, so an instance that picks the leg up
+ * after a failover writes the same CDR this one would have.
+ */
+const QUEUE_REF_VARIABLE = "OPTIMIQ_QUEUE_REF";
+const QUEUE_WAIT_MS_VARIABLE = "OPTIMIQ_QUEUE_WAIT_MS";
+const QUEUE_OUTCOME_VARIABLE = "OPTIMIQ_QUEUE_OUTCOME";
+const QUEUE_AGENT_REF_VARIABLE = "OPTIMIQ_QUEUE_AGENT_REF";
 /**
  * The leg this one was bridged to.
  *
@@ -229,7 +243,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		private readonly queueMembership: QueueMembershipSource,
 		private readonly agentState: AgentStateStore,
 		private readonly queueEvents: QueueEventPublisher,
-		private readonly queuePositions: QueuePositions,
+		private readonly queueWaiting: QueueWaitingStore,
 		private readonly queueCursors: QueueCursors,
 		private readonly parks: ParkRegistry,
 		private readonly callControl: CallControlRegistry,
@@ -1069,7 +1083,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				membership: this.queueMembership,
 				agents: this.agentState,
 				events: this.queueEvents,
-				positions: this.queuePositions,
+				waiting: this.queueWaiting,
 				cursor: this.queueCursors,
 			},
 			control: this.walkerCallControlFor(aggregate),
@@ -1112,6 +1126,9 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			trunkCapacity: this.trunkCapacity,
 			onDestination: async (destination) => {
 				await this.recordDestination(aggregate, destination);
+			},
+			onQueueOutcome: async (outcome) => {
+				await this.recordQueueOutcome(aggregate, outcome);
 			},
 			...(extra.beforeBridge === undefined ? {} : { beforeBridge: extra.beforeBridge }),
 			log: (message, detail) => {
@@ -2526,6 +2543,30 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	}
 
 	/**
+	 * Mirrors a queue's verdict onto the leg, so the CDR carries it whichever path writes the row.
+	 *
+	 * The same shape as {@link recordDestination}, including the teardown guard: the variables are
+	 * set either way — an in-flight CDR reads them from the snapshot — but the bucket must not be
+	 * written for a leg whose entry the teardown has already deleted, or the mirror keeps a live
+	 * channel for a call that is over.
+	 */
+	private async recordQueueOutcome(
+		aggregate: ChannelAggregate,
+		outcome: WalkerQueueOutcome,
+	): Promise<void> {
+		aggregate.setVariable(QUEUE_REF_VARIABLE, outcome.queueId);
+		aggregate.setVariable(QUEUE_WAIT_MS_VARIABLE, String(outcome.waitMs));
+		aggregate.setVariable(QUEUE_OUTCOME_VARIABLE, outcome.outcome);
+		if (outcome.agentId !== undefined) {
+			aggregate.setVariable(QUEUE_AGENT_REF_VARIABLE, outcome.agentId);
+		}
+		if (aggregate.isTearingDown) {
+			return;
+		}
+		await this.jetstream.putChannel(aggregate.snapshot);
+	}
+
+	/**
 	 * Flushes the leg's snapshot once a walk is over.
 	 *
 	 * A walk mutates the leg as it goes — the bridge a conference put it in, the state it moved to,
@@ -2575,6 +2616,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				...(bridgeLegId === undefined ? {} : { bridgeLegId }),
 				...(destinationType === undefined ? {} : { destinationType }),
 				...(destinationRef === undefined ? {} : { destinationRef }),
+				...queueLegOf(aggregate.snapshot.variables),
 			});
 			const envelope = makeCdrLegWriteEvent({
 				id: data.id,

@@ -33,6 +33,8 @@ export interface QueueRosterTierRow {
 	readonly extensionNumber: string | null;
 	readonly level: number;
 	readonly position: number;
+	/** `queue_tier.announce_prompt_id` — the agent-side prompt for THIS tier. */
+	readonly announcePromptId: string | null;
 	readonly wrapUpSeconds: number;
 	readonly maxNoAnswer: number;
 	readonly noAnswerDelaySeconds: number;
@@ -167,6 +169,11 @@ function toSeat(tier: QueueRosterTierRow, template: string): QueueMembershipAgen
 		...(tier.extensionId === null ? {} : { extensionId: tier.extensionId }),
 		level: tier.level,
 		position: tier.position,
+		// `?? undefined`, not `?? null`: `queueMembershipAgentSchema.announcePromptId` is OPTIONAL, and
+		// a `null` would be rejected by the parse that guards every roster this file writes. NULL in
+		// the column means "this tier has nothing of its own to say", which the engine reads as "fall
+		// back to the queue's whisper" — so absent is exactly the right spelling of it.
+		...(tier.announcePromptId === null ? {} : { announcePromptId: tier.announcePromptId }),
 		wrapUpSeconds: tier.wrapUpSeconds,
 		maxNoAnswer: tier.maxNoAnswer,
 		noAnswerDelaySeconds: tier.noAnswerDelaySeconds,

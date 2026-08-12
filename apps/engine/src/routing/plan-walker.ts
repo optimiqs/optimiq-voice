@@ -14,6 +14,7 @@ import type {
 	QueueDialAttempt,
 	QueueDialOutcome,
 	QueueServices,
+	QueueOutcome,
 	QueueSessionSettings,
 } from "../queue/queue-session";
 import type { CallSignalBus, LegSignal } from "./call-signals";
@@ -190,6 +191,21 @@ export interface WalkerApplicationPort {
 	>;
 }
 
+/** What a queued caller's stay produced, as the CDR records it. */
+export interface WalkerQueueOutcome {
+	readonly queueId: string;
+	readonly waitMs: number;
+	readonly outcome:
+		| "answered"
+		| "caller-hangup"
+		| "timeout"
+		| "overflow"
+		| "no-agents"
+		| "exit-key";
+	/** The `queue_agent` who took the call. Only ever set on `answered`. */
+	readonly agentId?: string;
+}
+
 export interface WalkerCallControl {
 	/** Parks the A-leg. `orbit` is what the caller dialled after the code, when they dialled one. */
 	park(request: {
@@ -260,6 +276,19 @@ export interface WalkerCallControl {
 		/** Where the supervisor starts. Always `eavesdrop` from `*0`; DTMF moves it afterwards. */
 		readonly mode: SupervisionMode;
 	}): Promise<{ readonly ok: boolean; readonly reason?: string }>;
+	/**
+	 * Starts recording the conversation the A-leg is in — the seam a queue's record policy reaches.
+	 *
+	 * Optional on this interface, unlike its siblings, because it arrived with the contact-centre
+	 * wave and a walk built against an older control port must keep working: its absence is a queue
+	 * that connects the call and notes that it could not record, which is exactly the degradation
+	 * every other missing port here produces.
+	 *
+	 * The same operation the record-toggle feature code performs, deliberately, so that a queue
+	 * recording is indistinguishable downstream from an on-demand one — one `channel.record.started`,
+	 * one object key, one retention rule, one signed-URL endpoint.
+	 */
+	startRecording?(): Promise<{ readonly ok: boolean; readonly reason?: string }>;
 }
 
 /**
@@ -648,6 +677,20 @@ export interface PlanWalkerDependencies {
 	 */
 	readonly onDestination?: (destination: PlanDestination) => Promise<void>;
 	/**
+	 * Run when a queued caller's stay ends, however it ends.
+	 *
+	 * Symmetric with {@link onDestination} and reported at the same moment for the same reason: the
+	 * walk may hang the leg up immediately afterwards (a queue with no timeout branch does exactly
+	 * that), and `ChannelDestroyed` races the walk's own return. A caller who demonstrably waited
+	 * four minutes and abandoned must not be filed with no wait and no outcome because the teardown
+	 * won.
+	 *
+	 * What it reports is the QUEUE's verdict, not the leg's. A caller the queue timed out into a
+	 * voicemail box has a leg that ends `answered` and a queue outcome of `timeout`, and an SLA built
+	 * on the disposition would call that a served call.
+	 */
+	readonly onQueueOutcome?: (outcome: WalkerQueueOutcome) => Promise<void>;
+	/**
 	 * Run just before the A-leg is joined to whatever the walk found.
 	 *
 	 * Exists for one caller and one reason: a transferred leg is held with music for the whole time
@@ -1028,6 +1071,16 @@ type DialOutcome =
 const MILLIS_PER_SECOND = 1_000;
 
 /**
+ * Digits held for a queued caller's exit key before the oldest is dropped.
+ *
+ * Small on purpose, and much smaller than the leg inbox's 64. This buffer exists for ONE decision —
+ * "did they press the exit key?" — which the session asks once a second, so anything past a handful
+ * is a caller drumming on the keypad rather than input anybody is going to act on. The leg's own
+ * inbox keeps the full history for whatever the caller reaches next; this is a peephole onto it.
+ */
+const MAX_QUEUE_BUFFERED_DIGITS = 8;
+
+/**
  * The catalogue's action names, mapped onto the contract's feature names.
  *
  * Two vocabularies rather than one, and deliberately: `FeatureCodeAction` is what a TENANT's
@@ -1067,6 +1120,8 @@ export class PlanWalker {
 	private readonly notes: string[] = [];
 	private readonly visited: PlanNodeId[] = [];
 	private destination: PlanDestination | undefined;
+	/** Closes the queued caller's DTMF watch. Set for the life of one queue node, and only then. */
+	private queueDigitUnwatch: (() => void) | undefined;
 
 	constructor(private readonly deps: PlanWalkerDependencies) {
 		this.settings = { ...DEFAULT_PLAN_WALKER_SETTINGS, ...deps.settings };
@@ -4457,7 +4512,17 @@ export class PlanWalker {
 			...this.deps.queueSettings,
 		});
 
-		const outcome = await session.run();
+		let outcome: QueueOutcome;
+		try {
+			outcome = await session.run();
+			await this.reportQueueOutcome(node, outcome);
+		} finally {
+			// The digit watch outlives nothing: a queued caller who is bridged to an agent is having a
+			// conversation, and a watch still pushing their DTMF into an array nobody reads is a leak
+			// with a caller's keypresses in it.
+			this.queueDigitUnwatch?.();
+			this.queueDigitUnwatch = undefined;
+		}
 
 		switch (outcome.kind) {
 			case "answered": {
@@ -4466,12 +4531,61 @@ export class PlanWalker {
 			case "timeout": {
 				return this.branch(node.timeoutNodeId, "ALLOTTED_TIMEOUT");
 			}
+			case "exit-key": {
+				// `NORMAL_CLEARING` and not `ALLOTTED_TIMEOUT`, which is the whole difference between
+				// this branch and the one above it. A caller who pressed a key made a choice and the
+				// call ended normally; a caller who timed out did not, and an SLA report built on the
+				// cause would otherwise count a working exit key as a queue that runs out of patience.
+				return this.branch(node.exitNodeId, "NORMAL_CLEARING");
+			}
 			case "abandoned":
 			case "aborted": {
 				return { kind: "aborted" };
 			}
 			default: {
 				return { kind: "hangup", cause: "NORMAL_TEMPORARY_FAILURE" };
+			}
+		}
+	}
+
+	/**
+	 * Translates the session's outcome into the CDR's vocabulary and reports it.
+	 *
+	 * `failed` and `aborted` deliberately report NOTHING. Neither is a fact about the caller's stay:
+	 * `failed` is the roster being unreadable, and `aborted` is the leg going away before the session
+	 * could join the line. Filing either as an abandonment would put an infrastructure fault into a
+	 * tenant's service level, where it would look exactly like callers giving up — which is the one
+	 * reading a supervisor must not be handed.
+	 */
+	private async reportQueueOutcome(node: QueuePlanNode, outcome: QueueOutcome): Promise<void> {
+		const report = this.deps.onQueueOutcome;
+		if (report === undefined) {
+			return;
+		}
+		switch (outcome.kind) {
+			case "answered": {
+				await report({
+					queueId: node.queueId,
+					waitMs: outcome.waitMs,
+					outcome: "answered",
+					agentId: outcome.agentId,
+				});
+				return;
+			}
+			case "abandoned": {
+				await report({ queueId: node.queueId, waitMs: outcome.waitMs, outcome: "caller-hangup" });
+				return;
+			}
+			case "exit-key": {
+				await report({ queueId: node.queueId, waitMs: outcome.waitMs, outcome: "exit-key" });
+				return;
+			}
+			case "timeout": {
+				await report({ queueId: node.queueId, waitMs: outcome.waitMs, outcome: outcome.reason });
+				return;
+			}
+			default: {
+				return;
 			}
 		}
 	}
@@ -4486,6 +4600,33 @@ export class PlanWalker {
 	 */
 	private queueCallPort(): QueueCallPort {
 		const { channel, media, execute } = this.deps;
+		// The exit key's digit source, opened for the life of the queued call and closed when the
+		// session returns.
+		//
+		// The signal bus rather than the leg's DTMF inbox, and the choice is worth stating because
+		// both would work. The bus is fed by `onDtmf` BEFORE the digit is offered to anything else,
+		// carries no collection state, and needs nothing threaded through the walker's dependencies —
+		// it is already here for answer confirmation and for supervision escalation. Reading the
+		// inbox instead would mean CONSUMING the digit, which is the wrong default: a `4` pressed in a
+		// queue with no exit key belongs to whatever the caller reaches next, and type-ahead into an
+		// overflow IVR is a thing experienced callers do on purpose.
+		//
+		// The cost of observing rather than consuming is that a digit which IS the exit key is also
+		// left in the buffer. Harmless: the session leaves the queue on it, and the branch it takes
+		// gets one stale digit at most — the same thing that happens today when a caller types over a
+		// greeting.
+		const digits: string[] = [];
+		const unwatch = this.deps.signals?.watch(legSignalKey(channel.mediaChannelId), (signal) => {
+			if (signal.kind === "dtmf") {
+				// Bounded, because a caller holding for twenty minutes on a numeric keypad is a real
+				// thing and this array has no other reader when the queue has no exit key.
+				if (digits.length >= MAX_QUEUE_BUFFERED_DIGITS) {
+					digits.shift();
+				}
+				digits.push(signal.digit);
+			}
+		});
+		this.queueDigitUnwatch = unwatch;
 		return {
 			get isTearingDown(): boolean {
 				return channel.isTearingDown;
@@ -4536,6 +4677,25 @@ export class PlanWalker {
 				await this.hangupQuietly(mediaChannelId, "NORMAL_TEMPORARY_FAILURE"),
 			bridge: async (mediaChannelId, onEnded) =>
 				(await this.bridgeWith(mediaChannelId, onEnded)).kind === "bridged",
+			pollDigit: () => digits.shift(),
+			startRecording: async () => {
+				// The same seam the record-toggle feature code uses, so a queue recording is
+				// indistinguishable from an on-demand one downstream: one `channel.record.started`, one
+				// object key, one retention rule. A walk with no call-control port announces nothing and
+				// records nothing, which is what an engine with no such port already does everywhere.
+				const control = this.deps.control;
+				if (control?.startRecording === undefined) {
+					this.note(
+						"queue call recording was asked for but this walk has no call-control port; the call was connected without it",
+					);
+					return false;
+				}
+				const outcome = await control.startRecording();
+				if (!outcome.ok && outcome.reason !== undefined) {
+					this.note(`queue call recording was refused: ${outcome.reason}`);
+				}
+				return outcome.ok;
+			},
 			resolvePrompt: (promptId) => resolveMediaRef({ promptId }, this.settings.mediaRefs),
 			spellNumber: (value) => this.spellNumber(value),
 			note: (message) => {

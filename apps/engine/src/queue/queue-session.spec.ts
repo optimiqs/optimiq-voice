@@ -62,10 +62,16 @@ interface HarnessOptions {
 	readonly afterCallAvailableFailures?: number;
 	/** Iterations of the wait loop before the fake pulls the caller. Guards a runaway. */
 	readonly budget?: number;
+	/** Digits the caller presses, offered one per `pollDigit` — exactly as the signal watch feeds it. */
+	readonly digits?: readonly string[];
+	/** The media plane refuses the recording. The call must still connect. */
+	readonly recordingFails?: boolean;
+	readonly recordingThrows?: boolean;
 }
 
 interface Harness {
 	readonly session: QueueSession;
+	readonly node: QueuePlanNode;
 	readonly services: FakeQueueServices;
 	readonly timeline: string[];
 	readonly dialled: QueueDialAttempt[][];
@@ -161,6 +167,7 @@ function harness(options: HarnessOptions = {}): Harness {
 	const notes: string[] = [];
 	const dialled: QueueDialAttempt[][] = [];
 	const script = [...(options.dials ?? [{ kind: "no-answer" as const }])];
+	const pressed = [...(options.digits ?? [])];
 	const state = { tearingDown: false, iterations: 0 };
 	const budget = options.budget ?? 20;
 	let onAgentLegEnded: (() => void) | undefined;
@@ -249,6 +256,18 @@ function harness(options: HarnessOptions = {}): Harness {
 			onAgentLegEnded = onEnded;
 			return options.bridgeFails !== true;
 		},
+		pollDigit: () => pressed.shift(),
+		// On the SAME timeline as the bridge, for the reason the whisper is: what a recording spec is
+		// about is the ORDER — the tap is taken after the two legs are joined, because there is
+		// nothing to tap before that — and a separate recorder would let a recording started against a
+		// bridge that never happened pass.
+		startRecording: async () => {
+			timeline.push("record:start");
+			if (options.recordingThrows === true) {
+				throw new Error("the media server refused a tap");
+			}
+			return options.recordingFails !== true;
+		},
 		resolvePrompt: (promptId) => (promptId === undefined ? undefined : `sound:${promptId}`),
 		spellNumber: (value) => [...value].map((digit) => `sound:digits/${digit}`),
 		note: (message) => {
@@ -267,6 +286,7 @@ function harness(options: HarnessOptions = {}): Harness {
 	};
 
 	return {
+		node,
 		session: new QueueSession(node, call, services, {
 			pollIntervalMs: 1_000,
 			agentRingTimeoutSeconds: 20,
@@ -381,10 +401,63 @@ describe("joining a queue", () => {
 		expect(h.dialled).toEqual([]);
 	});
 
-	it("notes that queue recording is not implemented rather than silently dropping it", async () => {
-		const h = harness({ node: { recordEnabled: true }, dials: [{ kind: "answer" }] });
+	it("records the call once the agent is bridged, when the policy asks for it", async () => {
+		const h = harness({ node: { recordPolicy: "all" }, dials: [{ kind: "answer" }] });
 		await h.session.run();
-		expect(h.notes.join(" ")).toContain("call recording");
+		// The order is the assertion: a tap on a bridge that does not exist yet has nothing to tap.
+		expect(h.timeline.indexOf("record:start")).toBeGreaterThan(
+			h.timeline.indexOf("bridge:media-a"),
+		);
+	});
+
+	it("records on `inbound`, because a queued call is inbound to the queue", async () => {
+		const h = harness({ node: { recordPolicy: "inbound" }, dials: [{ kind: "answer" }] });
+		await h.session.run();
+		expect(h.timeline).toContain("record:start");
+	});
+
+	/**
+	 * `on-demand` means the AGENT starts it, and a queue that pre-empted them would make the
+	 * record-toggle feature code a no-op and the policy a lie.
+	 */
+	it("leaves `on-demand` and `outbound` to somebody else", async () => {
+		for (const recordPolicy of ["on-demand", "outbound", "none"] as const) {
+			const h = harness({ node: { recordPolicy }, dials: [{ kind: "answer" }] });
+			await h.session.run();
+			expect(h.timeline).not.toContain("record:start");
+		}
+	});
+
+	it("connects the call anyway when the recording is refused, and says so", async () => {
+		const h = harness({
+			node: { recordPolicy: "all" },
+			dials: [{ kind: "answer" }],
+			recordingFails: true,
+		});
+		const outcome = await h.session.run();
+		expect(outcome.kind).toBe("answered");
+		expect(h.notes.join(" ")).toContain("recording could not be started");
+	});
+
+	it("connects the call anyway when the recording THROWS, which is a different failure", async () => {
+		const h = harness({
+			node: { recordPolicy: "all" },
+			dials: [{ kind: "answer" }],
+			recordingThrows: true,
+		});
+		const outcome = await h.session.run();
+		expect(outcome.kind).toBe("answered");
+		expect(h.notes.join(" ")).toContain("recording could not be started");
+	});
+
+	it("does not record a bridge that failed, because there is nothing to tap", async () => {
+		const h = harness({
+			node: { recordPolicy: "all" },
+			dials: [{ kind: "answer" }],
+			bridgeFails: true,
+		});
+		await h.session.run();
+		expect(h.timeline).not.toContain("record:start");
 	});
 });
 
@@ -1023,7 +1096,7 @@ describe("the caller hangs up", () => {
 	it("gives the caller's place back to the line when they leave", async () => {
 		const h = harness({ dials: [{ kind: "answer" }] });
 		await h.session.run();
-		expect(h.services.positions.waitingCount).toBe(0);
+		expect(h.services.waiting.waitingCount).toBe(0);
 	});
 });
 
@@ -1085,5 +1158,222 @@ describe("position announcements", () => {
 		await h.session.run();
 		const announceAt = h.timeline.indexOf("play:sound:digits/1");
 		expect(h.timeline.indexOf("moh:start", announceAt)).toBeGreaterThan(announceAt);
+	});
+});
+
+// =================================================================================================
+// Exit keys
+// =================================================================================================
+
+/**
+ * A waiting caller pressing a key to leave.
+ *
+ * The digit source in the harness is a queue drained one entry per `pollDigit`, which is exactly
+ * what the walker's signal watch produces: the session sees at most one digit per pass, and the
+ * ones it does not want are left alone.
+ */
+describe("exit keys", () => {
+	it("leaves the queue on the configured digit", async () => {
+		const h = harness({ node: { exitKey: "9" }, digits: ["9"] });
+		const outcome = await h.session.run();
+		expect(outcome.kind).toBe("exit-key");
+		expect(h.dialled).toEqual([]);
+	});
+
+	it("stops the hold music before handing the caller on", async () => {
+		const h = harness({ node: { exitKey: "9" }, digits: ["9"] });
+		await h.session.run();
+		expect(h.timeline[h.timeline.length - 1]).toBe("moh:stop");
+	});
+
+	it("publishes an abandonment the SLA can tell apart from a timeout", async () => {
+		const h = harness({ node: { exitKey: "9" }, digits: ["9"] });
+		await h.session.run();
+		const abandoned = h.services.events.recorded.find((event) => event.type === "caller.abandoned");
+		expect(abandoned?.data.reason).toBe("exit-key");
+		expect(abandoned?.data.exitKey).toBe("9");
+	});
+
+	it("ignores a digit that is not the exit key, and keeps distributing", async () => {
+		const h = harness({ node: { exitKey: "9" }, digits: ["4"], dials: [{ kind: "answer" }] });
+		const outcome = await h.session.run();
+		expect(outcome.kind).toBe("answered");
+	});
+
+	it("does nothing at all for a queue with no exit key", async () => {
+		const h = harness({ digits: ["9"], dials: [{ kind: "answer" }] });
+		const outcome = await h.session.run();
+		expect(outcome.kind).toBe("answered");
+	});
+
+	/** A tenant who typed `d` gets the DTMF `D`; the compiler upper-cases, and so does this. */
+	it("matches case-insensitively, so a letter key works whichever way it was typed", async () => {
+		const h = harness({ node: { exitKey: "D" }, digits: ["d"] });
+		expect((await h.session.run()).kind).toBe("exit-key");
+	});
+
+	it("does not hold a place for a caller who chose to leave", async () => {
+		const h = harness({
+			node: { exitKey: "9", abandonedResumeAllowed: true, discardAbandonedAfterSeconds: 60 },
+			digits: ["9"],
+		});
+		await h.session.run();
+		expect(h.services.waiting.waitingCount).toBe(0);
+	});
+});
+
+// =================================================================================================
+// The shared line: position, priority and resume
+// =================================================================================================
+
+describe("the shared waiting line", () => {
+	it("reports the caller's real position on `caller.joined`", async () => {
+		const h = harness({ dials: [{ kind: "answer" }] });
+		await h.session.run();
+		const joined = h.services.events.recorded.find((event) => event.type === "caller.joined");
+		expect(joined?.data.position).toBe(1);
+	});
+
+	it("carries the node's priority onto the event, instead of the constant 0 it used to", async () => {
+		const h = harness({ node: { priority: 800 }, dials: [{ kind: "answer" }] });
+		await h.session.run();
+		const joined = h.services.events.recorded.find((event) => event.type === "caller.joined");
+		expect(joined?.data.priority).toBe(800);
+	});
+
+	/**
+	 * The admission gate, from the low-priority caller's side. One free agent and somebody ahead of
+	 * them in the shared line means they wait — which is what makes priority a priority rather than
+	 * a field on an event.
+	 */
+	it("holds a caller back while somebody ahead of them is unserved and only one agent is free", async () => {
+		const h = harness({ agents: [fakeAgent("a")], budget: 3 });
+		// Somebody else is already in the line, at a higher priority, on another instance.
+		await h.services.waiting.join({
+			orgId: ORG,
+			queueId: h.node.queueId,
+			callId: OTHER_CALL_ID,
+			legId: LEG_ID,
+			priority: 900,
+			instanceId: "engine-2",
+			now: h.clock.now,
+			resumeAllowed: false,
+		});
+		await h.session.run();
+		expect(h.dialled).toEqual([]);
+	});
+
+	/**
+	 * …and the bound, from the other side. Three free agents means the first three in the line may
+	 * all ring at once. A turnstile that only let rank 1 offer would turn an instant answer for three
+	 * people into a three-second staircase, precisely during the spike that made three people call.
+	 */
+	it("lets a caller ring when there are as many free agents as there are people ahead of them", async () => {
+		const h = harness({
+			agents: [fakeAgent("a"), fakeAgent("b", { position: 2 }), fakeAgent("c", { position: 3 })],
+			dials: [{ kind: "answer" }],
+		});
+		await h.services.waiting.join({
+			orgId: ORG,
+			queueId: h.node.queueId,
+			callId: OTHER_CALL_ID,
+			legId: LEG_ID,
+			priority: 900,
+			instanceId: "engine-2",
+			now: h.clock.now,
+			resumeAllowed: false,
+		});
+		expect((await h.session.run()).kind).toBe("answered");
+	});
+
+	it("holds a place for a caller who hung up, when the queue allows it", async () => {
+		const h = harness({
+			node: { abandonedResumeAllowed: true, discardAbandonedAfterSeconds: 60 },
+			dials: [{ kind: "caller-gone" }],
+		});
+		await h.session.run();
+		const claimed = await h.services.waiting.join({
+			orgId: ORG,
+			queueId: h.node.queueId,
+			callId: OTHER_CALL_ID,
+			legId: LEG_ID,
+			priority: 0,
+			callerNumber: "+15551234567",
+			instanceId: "engine-1",
+			now: h.clock.now,
+			resumeAllowed: true,
+		});
+		expect(claimed.resumed).toBe(true);
+	});
+
+	it("holds no place when the queue does not allow resuming", async () => {
+		const h = harness({ dials: [{ kind: "caller-gone" }] });
+		await h.session.run();
+		const claimed = await h.services.waiting.join({
+			orgId: ORG,
+			queueId: h.node.queueId,
+			callId: OTHER_CALL_ID,
+			legId: LEG_ID,
+			priority: 0,
+			callerNumber: "+15551234567",
+			instanceId: "engine-1",
+			now: h.clock.now,
+			resumeAllowed: true,
+		});
+		expect(claimed.resumed).toBe(false);
+	});
+
+	/** A caller an agent answered did not lose their place; there is nothing to hold. */
+	it("holds no place for a caller who was answered", async () => {
+		const h = harness({
+			node: { abandonedResumeAllowed: true, discardAbandonedAfterSeconds: 60 },
+			dials: [{ kind: "answer" }],
+		});
+		await h.session.run();
+		const claimed = await h.services.waiting.join({
+			orgId: ORG,
+			queueId: h.node.queueId,
+			callId: OTHER_CALL_ID,
+			legId: LEG_ID,
+			priority: 0,
+			callerNumber: "+15551234567",
+			instanceId: "engine-1",
+			now: h.clock.now,
+			resumeAllowed: true,
+		});
+		expect(claimed.resumed).toBe(false);
+	});
+});
+
+// =================================================================================================
+// Per-tier announcements
+// =================================================================================================
+
+describe("per-tier agent announcements", () => {
+	it("plays the tier's prompt to the agent instead of the queue's", async () => {
+		const h = harness({
+			node: { agentWhisperPromptId: "queue-prompt" },
+			agents: [fakeAgent("a", { announcePromptId: "tier-prompt" })],
+			dials: [{ kind: "answer" }],
+		});
+		await h.session.run();
+		expect(h.timeline).toContain("whisper:media-a:sound:tier-prompt");
+		expect(h.timeline).not.toContain("whisper:media-a:sound:queue-prompt");
+	});
+
+	it("falls back to the queue's whisper for an agent whose tier has none", async () => {
+		const h = harness({
+			node: { agentWhisperPromptId: "queue-prompt" },
+			agents: [fakeAgent("a")],
+			dials: [{ kind: "answer" }],
+		});
+		await h.session.run();
+		expect(h.timeline).toContain("whisper:media-a:sound:queue-prompt");
+	});
+
+	it("whispers nothing when neither the tier nor the queue has a prompt", async () => {
+		const h = harness({ agents: [fakeAgent("a")], dials: [{ kind: "answer" }] });
+		await h.session.run();
+		expect(h.timeline.some((entry) => entry.startsWith("whisper:"))).toBe(false);
 	});
 });

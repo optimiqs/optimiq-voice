@@ -2326,7 +2326,10 @@ describe("node kinds that are not implemented yet", () => {
 					maxWaitNoAgentSeconds: 0,
 					announcePositionEnabled: false,
 					announceFrequencySeconds: 60,
-					recordEnabled: false,
+					recordPolicy: "none",
+					priority: 0,
+					abandonedResumeAllowed: false,
+					discardAbandonedAfterSeconds: 0,
 				},
 			] as PlanNode[]),
 		);

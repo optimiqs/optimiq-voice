@@ -213,7 +213,10 @@ function seedArtifact(): RoutingArtifact {
 			maxWaitNoAgentSeconds: 0,
 			announcePositionEnabled: false,
 			announceFrequencySeconds: 60,
-			recordEnabled: false,
+			recordPolicy: "none",
+			priority: 0,
+			abandonedResumeAllowed: false,
+			discardAbandonedAfterSeconds: 0,
 			timeoutNodeId: "hangup:NORMAL_CLEARING",
 		} as PlanNode,
 		{
@@ -236,7 +239,10 @@ function seedArtifact(): RoutingArtifact {
 			maxWaitNoAgentSeconds: 2,
 			announcePositionEnabled: false,
 			announceFrequencySeconds: 60,
-			recordEnabled: false,
+			recordPolicy: "none",
+			priority: 0,
+			abandonedResumeAllowed: false,
+			discardAbandonedAfterSeconds: 0,
 			timeoutNodeId: "hangup:NORMAL_CLEARING",
 		} as PlanNode,
 	];

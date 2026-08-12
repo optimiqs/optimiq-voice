@@ -10,7 +10,12 @@ import { DIRECTORY_SEARCH_FIELDS } from "./directory-schema";
 import { EXTENSION_USER_ROLES, RECORD_POLICIES, TOLL_CLASSES } from "./extensions-schema";
 import { FEATURE_CODE_ACTIONS } from "./features-schema";
 import { PROMPT_KINDS } from "./media-schema";
-import { QUEUE_AGENT_STATUSES, QUEUE_STRATEGIES } from "./queues-schema";
+import {
+	QUEUE_AGENT_STATUSES,
+	QUEUE_PRIORITY_MAX,
+	QUEUE_PRIORITY_MIN,
+	QUEUE_STRATEGIES,
+} from "./queues-schema";
 import { pbxRelations } from "./relations";
 import { SIP_ACL_SCOPES } from "./security-schema";
 import { pbxTables } from "./tables";
@@ -932,5 +937,77 @@ describe("organization limits", () => {
 			(candidate) => candidate.config.name === "org_limit_organization_key",
 		);
 		expect(index?.config.unique).toBe(true);
+	});
+});
+
+/**
+ * The contact-centre block on `queue` and `queue_tier`.
+ *
+ * The two constraints are the ones worth having in the DATABASE rather than only in a DTO, and the
+ * reason is the same for both: the engine compares these values with `===` and arithmetic, so a row
+ * that got past a form is a feature that silently never fires. An exit key of `"1 "` is a queue
+ * whose exit key does nothing, configured by an operator who watched themselves configure it.
+ */
+describe("queue contact-centre settings", () => {
+	const config = getTableConfig(pbxTables.queue);
+	const columns = new Map(config.columns.map((column) => [column.name, column]));
+
+	it("replaced the boolean nobody honoured with the record policy everything else uses", () => {
+		expect(columns.get("record_policy")?.notNull).toBe(true);
+		expect(columns.get("record_policy")?.default).toBe("none");
+		expect(columns.has("record_enabled")).toBe(false);
+	});
+
+	it("keeps the exit key nullable, because most queues have none", () => {
+		expect(columns.get("exit_key")?.notNull).toBe(false);
+		expect(columns.get("exit_key")?.hasDefault).toBe(false);
+	});
+
+	it("constrains the exit key to one DTMF symbol in the database, not only in a form", () => {
+		expect(config.checks.map((check) => check.name)).toContain("queue_exit_key_shape_check");
+	});
+
+	it("gives the exit key a full destination trio with the same shape check as the timeout one", () => {
+		for (const name of ["exit_destination_type", "exit_destination_ref", "exit_destination_data"]) {
+			expect(columns.has(name), name).toBe(true);
+		}
+		expect(config.checks.map((check) => check.name)).toContain(
+			"queue_exit_destination_shape_check",
+		);
+	});
+
+	/** 0 is `unprioritised`, which is what every queue was before the column existed. */
+	it("defaults the priority to the bottom of the scale, and pins the scale", () => {
+		expect(columns.get("default_priority")?.notNull).toBe(true);
+		expect(columns.get("default_priority")?.default).toBe(QUEUE_PRIORITY_MIN);
+		expect(config.checks.map((check) => check.name)).toContain(
+			"queue_default_priority_range_check",
+		);
+		expect(QUEUE_PRIORITY_MAX).toBe(1000);
+	});
+});
+
+/**
+ * The per-tier agent announcement.
+ *
+ * Nullable and defaultless, like the queue whisper it overrides and for the same reason: the absence
+ * of one is the normal state, and the column has to be able to say so — a tier with no prompt falls
+ * back to the queue's, which is what every tier did before the column existed.
+ */
+describe("tier announcements", () => {
+	const config = getTableConfig(pbxTables.queueTier);
+	const column = config.columns.find((candidate) => candidate.name === "announce_prompt_id");
+
+	it("is a nullable uuid with no default", () => {
+		expect(column).toBeDefined();
+		expect(column?.notNull).toBe(false);
+		expect(column?.hasDefault).toBe(false);
+	});
+
+	it("sets null on delete, so losing a prompt costs a tier its cue and not the tenant its tier", () => {
+		const foreignKey = config.foreignKeys.find((candidate) =>
+			candidate.reference().columns.some((entry) => entry.name === "announce_prompt_id"),
+		);
+		expect(foreignKey?.onDelete).toBe("set null");
 	});
 });

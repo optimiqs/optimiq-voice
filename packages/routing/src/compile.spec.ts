@@ -33,6 +33,7 @@ import {
 } from "./fixtures";
 import { planNodeReferences } from "./plan";
 import { emptySnapshot } from "./snapshot";
+import type { RoutingArtifact } from "./artifact";
 import type {
 	ExtensionPlanNode,
 	IvrMenuPlanNode,
@@ -1533,5 +1534,152 @@ describe("compile — failure surface", () => {
 	it("never puts an error diagnostic on an artifact", () => {
 		const artifact = compiled(aSnapshot({ ringGroups: [aRingGroup()] }));
 		expect(artifact.diagnostics.every((entry) => entry.severity !== "error")).toBe(true);
+	});
+});
+
+/**
+ * The contact-centre block on the queue node.
+ *
+ * Two of these are about node IDENTITY rather than about a field, and those are the ones worth
+ * having: the compiler now mints more than one node per queue row, and the properties that must
+ * survive that are (a) the same override deduplicates to one node, so an artifact cannot grow a node
+ * per reference, and (b) every node minted from one row keeps one `queueId`, because everything
+ * downstream — the roster, the waiting line, the events — keys on it. A change that broke the second
+ * would split one queue into several silently: two lines, two position counters, and a wallboard
+ * showing a queue nobody configured.
+ */
+describe("compile — queue contact-centre settings", () => {
+	function queueOf(artifact: RoutingArtifact, id = "queue:q-1"): QueuePlanNode {
+		return artifact.nodes[id] as QueuePlanNode;
+	}
+
+	it("carries the record policy, replacing the boolean nothing honoured", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue({ recordPolicy: "all" })] }));
+		expect(queueOf(artifact).recordPolicy).toBe("all");
+		expect(artifact.nodes["queue:q-1"]).not.toHaveProperty("recordEnabled");
+	});
+
+	it("defaults a queue whose loader has not been taught the column to recording nothing", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue({ recordPolicy: undefined })] }));
+		expect(queueOf(artifact).recordPolicy).toBe("none");
+	});
+
+	it("compiles the exit key and its destination", () => {
+		const artifact = compiled(
+			aSnapshot({
+				voicemailBoxes: [aVoicemailBox()],
+				queues: [
+					aQueue({ exitKey: "9", exitDestinationType: "voicemail", exitDestinationRef: "vm-1" }),
+				],
+			}),
+		);
+		expect(queueOf(artifact).exitKey).toBe("9");
+		expect(queueOf(artifact).exitNodeId).toBe("voicemail:vm-1:leave");
+	});
+
+	it("upper-cases a letter key rather than silently disabling it", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue({ exitKey: "d" })] }));
+		expect(queueOf(artifact).exitKey).toBe("D");
+	});
+
+	it("drops a key no phone could send, so the engine never compares against it", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue({ exitKey: "99" })] }));
+		expect(artifact.nodes["queue:q-1"]).not.toHaveProperty("exitKey");
+	});
+
+	it("warns when a key has nowhere to send the caller", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue({ exitKey: "9" })] }));
+		expect(artifact.diagnostics.map((entry) => entry.code)).toContain(
+			"queue-exit-key-without-destination",
+		);
+	});
+
+	it("takes the queue's default priority when nothing overrides it", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue({ defaultPriority: 300 })] }));
+		expect(queueOf(artifact).priority).toBe(300);
+	});
+
+	it("mints a distinct node for a reference that overrides the priority", () => {
+		const artifact = compiled(
+			aSnapshot({
+				queues: [aQueue({ defaultPriority: 0 })],
+				inboundRoutes: [
+					anInboundRoute({
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { priority: 800 } },
+					}),
+				],
+			}),
+		);
+		const node = queueOf(artifact, "queue:q-1:p800");
+		expect(node.priority).toBe(800);
+		// The identity that keeps two doors one queue.
+		expect(node.queueId).toBe("q-1");
+	});
+
+	/**
+	 * Two doors at one priority are one door. The base `queue:q-1` is always minted — it is the
+	 * queue's own entrance, at its default priority — so what this asserts is that the OVERRIDE adds
+	 * exactly one node however many references carry it, which is the property that stops an
+	 * artifact growing a node per reference.
+	 */
+	it("gives two references at the same priority one node", () => {
+		const artifact = compiled(
+			aSnapshot({
+				queues: [aQueue()],
+				inboundRoutes: [
+					anInboundRoute({
+						id: "in-1",
+						matchPattern: "+15551230001",
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { priority: 800 } },
+					}),
+					anInboundRoute({
+						id: "in-2",
+						matchPattern: "+15551230002",
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { priority: 800 } },
+					}),
+				],
+			}),
+		);
+		const queueNodes = Object.keys(artifact.nodes)
+			.filter((id) => id.startsWith("queue:q-1"))
+			.sort();
+		expect(queueNodes).toEqual(["queue:q-1", "queue:q-1:p800"]);
+	});
+
+	/**
+	 * A caller who waits their turn, and a warning — not a refusal that would take every unrelated
+	 * route in the tenant down with it over one mistyped form field.
+	 */
+	it("warns and falls back to the default when the override is out of range", () => {
+		const artifact = compiled(
+			aSnapshot({
+				queues: [aQueue({ defaultPriority: 10 })],
+				inboundRoutes: [
+					anInboundRoute({
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { priority: 5000 } },
+					}),
+				],
+			}),
+		);
+		expect(artifact.diagnostics.map((entry) => entry.code)).toContain("invalid-queue-priority");
+		expect(queueOf(artifact).priority).toBe(10);
+	});
+
+	it("carries the abandoned-resume window onto the node", () => {
+		const artifact = compiled(
+			aSnapshot({
+				queues: [aQueue({ abandonedResumeAllowed: true, discardAbandonedAfterSeconds: 120 })],
+			}),
+		);
+		expect(queueOf(artifact).abandonedResumeAllowed).toBe(true);
+		expect(queueOf(artifact).discardAbandonedAfterSeconds).toBe(120);
 	});
 });

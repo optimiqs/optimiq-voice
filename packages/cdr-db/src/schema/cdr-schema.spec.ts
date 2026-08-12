@@ -4,6 +4,7 @@ import { CDR_PARTITION_KEYS, PARTITIONED_CDR_TABLES } from "../partitions";
 import { cdrTenantRlsPreflightPlan } from "../rls-preflight-plan";
 import { callEvents } from "./call-event-schema";
 import { callLegs } from "./call-leg-schema";
+import { CALL_DISPOSITIONS, QUEUE_OUTCOMES } from "./enums";
 import { cdrSchema } from "./index";
 import { cdrWriteQuarantine } from "./quarantine-schema";
 import { recordings } from "./recording-schema";
@@ -98,6 +99,7 @@ describe("call_legs", () => {
 			"call_legs_organization_from_idx",
 			"call_legs_organization_started_idx",
 			"call_legs_organization_to_idx",
+			"call_legs_queue_idx",
 			"call_legs_recording_idx",
 		]);
 	});
@@ -129,6 +131,8 @@ describe("call_legs", () => {
 			"call_legs_hangup_cause_check",
 			"call_legs_hangup_side_check",
 			"call_legs_leg_check",
+			"call_legs_queue_outcome_check",
+			"call_legs_queue_wait_check",
 			"call_legs_transcription_status_check",
 		]);
 	});
@@ -224,5 +228,54 @@ describe("recordings", () => {
 		expect(names).toContain("retention_until");
 		expect(names).toContain("deleted_at");
 		expect(names).toContain("updated_at");
+	});
+});
+
+/**
+ * The queue leg.
+ *
+ * `queue_ref` has existed since the baseline and was never written by anything; the three columns
+ * beside it are what turn "this call went to a queue" into a service level. What is asserted here is
+ * the half a report would get silently wrong: that every column is NULLABLE (a `queue_wait_ms` of 0
+ * on a direct extension call is a zero every average would then include), and that the index the
+ * stats query runs on is PARTIAL, so the rows it serves are not paid for on every insert by the
+ * majority of calls that never went near a queue.
+ */
+describe("the queue leg", () => {
+	const config = getTableConfig(callLegs);
+	const columns = new Map(config.columns.map((column) => [column.name, column]));
+
+	it("keeps every queue column nullable, because most legs never touched a queue", () => {
+		for (const name of ["queue_ref", "queue_wait_ms", "queue_outcome", "queue_agent_ref"]) {
+			expect(columns.get(name)?.notNull, name).toBe(false);
+			expect(columns.get(name)?.hasDefault, name).toBe(false);
+		}
+	});
+
+	it("indexes the queue reporting path partially, so an unqueued call pays nothing for it", () => {
+		const index = config.indexes.find((entry) => entry.config.name === "call_legs_queue_idx");
+		expect(index).toBeDefined();
+		expect(index?.config.where).toBeDefined();
+		expect(index?.config.columns.map((column) => (column as { name?: string }).name)).toEqual([
+			"organization_id",
+			"queue_ref",
+			"started_at",
+		]);
+	});
+
+	/**
+	 * A queue verdict is not a leg disposition. A caller the queue timed out into a voicemail box has
+	 * a leg that ends `answered`, and an SLA built on the disposition would report a queue nobody
+	 * staffs as fully served.
+	 */
+	it("keeps the queue outcome vocabulary separate from the leg disposition", () => {
+		expect(QUEUE_OUTCOMES).toContain("exit-key");
+		expect(QUEUE_OUTCOMES).toContain("no-agents");
+		for (const outcome of QUEUE_OUTCOMES) {
+			if (outcome === "answered") {
+				continue;
+			}
+			expect(CALL_DISPOSITIONS as readonly string[]).not.toContain(outcome);
+		}
 	});
 });

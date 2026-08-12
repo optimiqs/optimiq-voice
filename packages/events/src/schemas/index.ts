@@ -202,10 +202,18 @@ export {
 	queueAgentContactKindSchema,
 	queueMembershipAgentSchema,
 	queueMembershipSchema,
+	QUEUE_WAITING_MAX_ENTRIES,
+	QUEUE_WAITING_MAX_TOMBSTONES,
+	queueResumeTombstoneSchema,
+	queueWaitingEntrySchema,
+	queueWaitingRecordSchema,
 	type AgentStateEntry,
 	type QueueAgentContactKind,
 	type QueueMembership,
 	type QueueMembershipAgent,
+	type QueueResumeTombstone,
+	type QueueWaitingEntry,
+	type QueueWaitingRecord,
 } from "./queue-state";
 export {
 	aorSchema,

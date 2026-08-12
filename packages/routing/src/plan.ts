@@ -300,7 +300,44 @@ export interface QueuePlanNode extends PlanNodeBase {
 	readonly maxWaitNoAgentSeconds: number;
 	readonly announcePositionEnabled: boolean;
 	readonly announceFrequencySeconds: number;
-	readonly recordEnabled: boolean;
+	/**
+	 * When the engine records a call this queue distributed.
+	 *
+	 * The same {@link RecordPolicy} `extension` and `trunk` nodes carry, replacing a `recordEnabled`
+	 * boolean that no runtime ever honoured — the queue session read it only to write a note saying
+	 * it had not. One vocabulary, so an operator asking "why was this call recorded?" gets one
+	 * answer from one kind of field wherever they look.
+	 *
+	 * A queued call is INBOUND from the queue's point of view, so `inbound` and `all` both record.
+	 * The recording starts at the ANSWER, not at the join: hold music is not evidence, and recording
+	 * it would file every abandoned call under the tenant's retention policy.
+	 */
+	readonly recordPolicy: RecordPolicy;
+	/**
+	 * The single DTMF digit a WAITING caller may press to leave the line for {@link exitNodeId}.
+	 *
+	 * Absent means the queue has no exit key, which is what every queue had before. Present without
+	 * an `exitNodeId` is possible and means the digit is accepted and the caller is hung up — the
+	 * compiler warns about it rather than dropping the key, because "press 9 and the call ends" is a
+	 * configuration somebody might mean and a silently ignored key is one nobody can debug.
+	 */
+	readonly exitKey?: string;
+	readonly exitNodeId?: PlanNodeId;
+	/**
+	 * The priority a caller entering THROUGH THIS NODE starts with. Higher dequeues first.
+	 *
+	 * On the node rather than only on the queue because the same queue can be entered at different
+	 * priorities — an IVR option for platinum customers is exactly that — and the compiler mints a
+	 * separate node per distinct override so the two entrances are different nodes over one queue id.
+	 * Everything downstream (the roster, the waiting line, the events) keys on `queueId`, so the two
+	 * nodes share one line, which is the whole point: a priority that produced a second queue would
+	 * not be a priority.
+	 */
+	readonly priority: number;
+	/** Whether a caller who hung up may reclaim their place on a call-back. */
+	readonly abandonedResumeAllowed: boolean;
+	/** How long that place is held. Also the resume tombstone's TTL. */
+	readonly discardAbandonedAfterSeconds: number;
 	readonly timeoutNodeId?: PlanNodeId;
 }
 

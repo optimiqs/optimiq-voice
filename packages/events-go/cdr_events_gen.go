@@ -20,26 +20,30 @@ const (
 // Subject: cdr.leg.v1.<orgId>
 // Envelope: Envelope[CDRLegWriteData]
 type CDRLegWriteData struct {
-	ID               string        `json:"id"`
-	CallID           string        `json:"callId"`
-	Leg              LegSide       `json:"leg"`
-	OriginatingLegID *string       `json:"originatingLegId,omitempty"`
-	BridgeLegID      *string       `json:"bridgeLegId,omitempty"`
-	Direction        CallDirection `json:"direction"`
-	FromNumber       string        `json:"fromNumber"`
-	FromName         *string       `json:"fromName,omitempty"`
-	ToNumber         string        `json:"toNumber"`
-	DestinationType  string        `json:"destinationType"`
-	DestinationRef   *string       `json:"destinationRef,omitempty"`
-	StartedAt        EventTime     `json:"startedAt"`
-	AnsweredAt       *EventTime    `json:"answeredAt,omitempty"`
-	EndedAt          *EventTime    `json:"endedAt,omitempty"`
-	DurationMs       int           `json:"durationMs"`
-	BillsecMs        int           `json:"billsecMs"`
-	HangupCause      string        `json:"hangupCause"`
-	HangupCauseCode  int           `json:"hangupCauseCode"`
-	HangupSide       *HangupSide   `json:"hangupSide,omitempty"`
-	Disposition      string        `json:"disposition"`
+	ID               string                   `json:"id"`
+	CallID           string                   `json:"callId"`
+	Leg              LegSide                  `json:"leg"`
+	OriginatingLegID *string                  `json:"originatingLegId,omitempty"`
+	BridgeLegID      *string                  `json:"bridgeLegId,omitempty"`
+	Direction        CallDirection            `json:"direction"`
+	FromNumber       string                   `json:"fromNumber"`
+	FromName         *string                  `json:"fromName,omitempty"`
+	ToNumber         string                   `json:"toNumber"`
+	DestinationType  string                   `json:"destinationType"`
+	DestinationRef   *string                  `json:"destinationRef,omitempty"`
+	StartedAt        EventTime                `json:"startedAt"`
+	AnsweredAt       *EventTime               `json:"answeredAt,omitempty"`
+	EndedAt          *EventTime               `json:"endedAt,omitempty"`
+	DurationMs       int                      `json:"durationMs"`
+	BillsecMs        int                      `json:"billsecMs"`
+	HangupCause      string                   `json:"hangupCause"`
+	HangupCauseCode  int                      `json:"hangupCauseCode"`
+	HangupSide       *HangupSide              `json:"hangupSide,omitempty"`
+	Disposition      string                   `json:"disposition"`
+	QueueRef         *string                  `json:"queueRef,omitempty"`
+	QueueWaitMs      *int                     `json:"queueWaitMs,omitempty"`
+	QueueOutcome     *CDRLegWriteQueueOutcome `json:"queueOutcome,omitempty"`
+	QueueAgentRef    *string                  `json:"queueAgentRef,omitempty"`
 
 	// Extra carries every key outside the pinned contract, verbatim. The TS schema is a
 	// z.looseObject (see cdr-events.ts) precisely so a producer running ahead of the
@@ -88,4 +92,42 @@ var knownKeysCDRLegWriteData = map[string]struct{}{
 	"hangupCauseCode":  {},
 	"hangupSide":       {},
 	"disposition":      {},
+	"queueRef":         {},
+	"queueWaitMs":      {},
+	"queueOutcome":     {},
+	"queueAgentRef":    {},
 }
+
+// CDRLegWriteQueueOutcome is the closed vocabulary of CDRLegWriteData.queueOutcome.
+type CDRLegWriteQueueOutcome string
+
+const (
+	CDRLegWriteQueueOutcomeAnswered     CDRLegWriteQueueOutcome = "answered"
+	CDRLegWriteQueueOutcomeCallerHangup CDRLegWriteQueueOutcome = "caller-hangup"
+	CDRLegWriteQueueOutcomeTimeout      CDRLegWriteQueueOutcome = "timeout"
+	CDRLegWriteQueueOutcomeOverflow     CDRLegWriteQueueOutcome = "overflow"
+	CDRLegWriteQueueOutcomeNoAgents     CDRLegWriteQueueOutcome = "no-agents"
+	CDRLegWriteQueueOutcomeExitKey      CDRLegWriteQueueOutcome = "exit-key"
+)
+
+// CDRLegWriteQueueOutcomeValues lists every member of the vocabulary, in contract order.
+var CDRLegWriteQueueOutcomeValues = []CDRLegWriteQueueOutcome{
+	CDRLegWriteQueueOutcomeAnswered,
+	CDRLegWriteQueueOutcomeCallerHangup,
+	CDRLegWriteQueueOutcomeTimeout,
+	CDRLegWriteQueueOutcomeOverflow,
+	CDRLegWriteQueueOutcomeNoAgents,
+	CDRLegWriteQueueOutcomeExitKey,
+}
+
+// Valid reports whether v is a member of the CDRLegWriteQueueOutcome vocabulary.
+func (v CDRLegWriteQueueOutcome) Valid() bool {
+	for _, candidate := range CDRLegWriteQueueOutcomeValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v CDRLegWriteQueueOutcome) String() string { return string(v) }

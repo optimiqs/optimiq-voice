@@ -744,6 +744,65 @@ export const MEDIA_SESSIONS_KV: KvBucketDefinition = {
 	numReplicas: 1,
 };
 
+/**
+ * `queue-waiting` — who is in one queue's line, right now, across every engine instance.
+ *
+ * ## The problem it exists for
+ *
+ * "You are caller number four" was a lie in a cluster. The count came from an in-process map
+ * (`QueuePositions`), so with three engines behind one media server each of them counted only the
+ * callers it happened to be holding and every one of them announced a number that was too small.
+ * Three separate features turned out to need the same missing fact:
+ *
+ * 1. **Position**, which is that fact directly.
+ * 2. **Priority**, which is meaningless without it — "higher priority dequeues first" is a statement
+ *    about an ORDER, and an order needs everybody in it. Two instances each ordering their own half
+ *    of the line will happily serve a normal caller ahead of a VIP.
+ * 3. **Abandoned-resume**, which needs the line to remember a caller who is no longer on it.
+ *
+ * ## One key per queue, holding the whole line
+ *
+ * The same decision as {@link QUEUE_MEMBERSHIP_KV} and for a stronger version of the same reason.
+ * Position is not answerable from one caller's own row — it is a RANK, so a reader needs every row
+ * at once — and a per-caller key would make each announcement a range read plus N gets, while a
+ * partially-applied multi-key write would produce a line that no engine ever held. One key makes the
+ * line atomic, the read a point get, and the write a compare-and-set against a revision.
+ *
+ * The cost is contention: every join, leave and lease renewal on a busy queue writes one key. That
+ * is bounded by design — renewals are throttled to a fraction of the lease, joins and leaves happen
+ * at human speed, and a lost CAS is retried against the newer value rather than being an error. It
+ * is the same trade `queue-membership` makes and it is the right way round: a queue with fifty
+ * people waiting has fifty writes a minute, not fifty a second.
+ *
+ * ## Why entries carry a lease, and why the bucket TTL cannot replace it
+ *
+ * The record is one key, so per-caller server-side expiry is not available: a crashed engine would
+ * otherwise leave its callers in the line for ever, and every survivor would be told they were
+ * further back than they are — the exact failure this bucket exists to fix, inverted. So each entry
+ * carries an `expiresAt` that its owning session pushes forward while the caller is really still
+ * waiting, exactly as a park claim does, and any writer prunes entries past theirs on its way past.
+ * The bucket TTL is a backstop for the whole record, nothing more.
+ *
+ * ## Why it has a TTL at all, unlike the two configuration buckets
+ *
+ * Because it is LIVE STATE and its staleness self-corrects: a line nobody is joining is a line that
+ * should evaporate. Six hours matches {@link CHANNELS_KV} for the same reason — it is longer than
+ * any call and shorter than a shift, so a crashed instance's residue cannot outlive the day.
+ */
+export const QUEUE_WAITING_KV: KvBucketDefinition = {
+	name: "queue-waiting",
+	description: "Queue -> the leased waiting line and abandoned-resume tombstones, under CAS.",
+	ttlMs: 6 * HOUR_MS,
+	history: 1,
+	storage: "file",
+	// A line of 500 at ~200 bytes each plus as many tombstones, with headroom. `queueWaitingRecord`
+	// caps both arrays below that, so the cap is enforced by the writer rather than discovered as a
+	// rejected write in the middle of an incident.
+	maxValueSizeBytes: 256 * 1024,
+	maxBytes: 256 * MIB,
+	numReplicas: 1,
+};
+
 export const KV_BUCKETS: readonly KvBucketDefinition[] = [
 	REGISTRATIONS_KV,
 	CHANNELS_KV,
@@ -755,6 +814,7 @@ export const KV_BUCKETS: readonly KvBucketDefinition[] = [
 	PARK_CLAIMS_KV,
 	CONFERENCE_CLAIMS_KV,
 	MEDIA_SESSIONS_KV,
+	QUEUE_WAITING_KV,
 ];
 
 /** The KV wire options for a bucket definition. */
@@ -887,6 +947,21 @@ export const kvKeyFor = {
 	 * read a point get.
 	 */
 	queueMembership(orgId: string, queueId: string): string {
+		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("queueId", queueId)}`;
+	},
+	/**
+	 * `queue-waiting`: `<orgId>.<queueId>` — one entry per queue, holding its whole line.
+	 *
+	 * Deliberately the same key SHAPE as {@link kvKeyFor.queueMembership}, in a different bucket.
+	 * The roster and the line are both per-queue facts with different writers, different lifetimes
+	 * and different TTLs, and a reader that wanted "everything about queue X" gets it from two point
+	 * gets on one key string rather than from a join.
+	 *
+	 * Not keyed per waiting CALLER, for the reason on {@link QUEUE_WAITING_KV}: a position is a rank
+	 * over the whole line, so a per-caller key would turn every announcement into a range read and
+	 * would let a half-applied write produce an order nobody ever held.
+	 */
+	queueWaiting(orgId: string, queueId: string): string {
 		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("queueId", queueId)}`;
 	},
 	/**

@@ -20,6 +20,7 @@ import {
 	PARK_CLAIMS_KV,
 	parkClaimSchema,
 	QUEUE_MEMBERSHIP_KV,
+	QUEUE_WAITING_KV,
 	ROUTING_CACHE_KV,
 	subjectFor,
 } from "@optimiq-voice/events";
@@ -77,6 +78,7 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	private didIndexKv: KV | undefined;
 	private queueMembershipKv: KV | undefined;
 	private agentStateKv: KV | undefined;
+	private queueWaitingKv: KV | undefined;
 	private parkClaimsBucket: ClaimBucket<ParkClaim> = new UnclaimedBucket<ParkClaim>();
 	private conferenceClaimsBucket: ClaimBucket<ConferenceClaim> =
 		new UnclaimedBucket<ConferenceClaim>();
@@ -167,6 +169,12 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		// plane has ever run does not discover their absence on its first queued caller.
 		this.queueMembershipKv = await this.jetstream.views.kv(QUEUE_MEMBERSHIP_KV.name);
 		this.agentStateKv = await this.jetstream.views.kv(AGENT_STATE_KV.name);
+		// The waiting line. Written by EVERY engine instance holding a caller for the queue, which is
+		// what makes it the one ACD bucket whose write discipline is not optional — see
+		// `queue-waiting.store.ts`. Opened here for the same reason the two above it are: an engine
+		// that boots before the control plane has ever run must not discover the bucket's absence
+		// from its first queued caller.
+		this.queueWaitingKv = await this.jetstream.views.kv(QUEUE_WAITING_KV.name);
 		// The two CLAIM buckets. Both are written and read by this engine and by every other instance
 		// of it, and by nothing else — see `claim-store.ts` for why they are wrapped in a
 		// compare-and-set surface rather than exposed raw the way the read-mostly buckets are.
@@ -275,6 +283,23 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	 */
 	get agentState(): KV | undefined {
 		return this.agentStateKv;
+	}
+
+	/**
+	 * The `queue-waiting` bucket, for {@link import("../queue/queue-waiting.store").QueueWaitingStore}.
+	 *
+	 * Raw, and not wrapped as a {@link ClaimBucket} the way the two claim buckets are, because the
+	 * record is JOINTLY held: `create` never means "I won", deleting the key would evict every other
+	 * instance's callers, and the operation that matters is read-modify-write rather than claim.
+	 * Wrapping it in the claim vocabulary would have made the store translate between two meanings of
+	 * "lost" on every write.
+	 *
+	 * `undefined` before `onModuleInit` has run, or after shutdown — which the store reads as "no
+	 * shared line configured" and answers from an in-process record, exactly as a single-instance
+	 * deployment should.
+	 */
+	get queueWaiting(): KV | undefined {
+		return this.queueWaitingKv;
 	}
 
 	/**
@@ -650,6 +675,7 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		this.didIndexKv = undefined;
 		this.queueMembershipKv = undefined;
 		this.agentStateKv = undefined;
+		this.queueWaitingKv = undefined;
 		this.parkClaimsBucket = new UnclaimedBucket<ParkClaim>();
 		this.conferenceClaimsBucket = new UnclaimedBucket<ConferenceClaim>();
 		this.channelRevisions.clear();
