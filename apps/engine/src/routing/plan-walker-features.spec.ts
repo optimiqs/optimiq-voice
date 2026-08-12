@@ -565,6 +565,45 @@ describe("recording a mailbox greeting", () => {
 		expect(outcome.hangupCause).toBe("NORMAL_CLEARING");
 	});
 
+	it("hands the filing port everything the contract needs to ingest the audio", async () => {
+		// The port is a process-wide singleton over the shared rpc client — it has no call to close
+		// over — so the tenant, the object key and the call travel WITH the greeting. The key is the
+		// same one the `channel.record.*` pair carries, which is what lets the responder open the file
+		// the media server has just written and what lets an operator find it when filing fails.
+		const h = harness({ greetings: "accepts" });
+		await h.walker.walk(walkInput(greetingPlan(), { mailboxes: { [CALLER]: MAILBOX } }));
+
+		const filed = h.filed[0];
+		expect(filed?.organizationId).toBe(ORG_ID);
+		expect(filed?.callId).toBe(CALL_ID);
+		// `<orgId>/<callId>/<recordingId>.<format>`: the layout `mediaStartRecordingResponse.objectKey`
+		// defines and the one the API's recordings root is mounted against.
+		expect(filed?.objectKey).toBe(`${ORG_ID}/${CALL_ID}/${filed?.recordingId ?? ""}.wav`);
+		// A minted id per greeting, so a retried request files one row rather than two racing for the
+		// single active slot — and distinct from the recording's, which names the audio and not the row.
+		expect(filed?.greetingId).not.toBe(filed?.recordingId);
+	});
+
+	it("does not confirm a greeting the responder REFUSED, only one it filed", async () => {
+		// The end-to-end shape of the wired path: `VoicemailGreetingRpcPort` turns `applied: false`
+		// into a throw carrying the responder's reason, so a refusal and an unreachable broker reach
+		// the walk identically — and both play the announcement rather than the confirmation.
+		const refusing = harness({ greetings: "throws" });
+		const refused = await refusing.walker.walk(
+			walkInput(greetingPlan(), { mailboxes: { [CALLER]: MAILBOX } }),
+		);
+		expect(played(refusing.verbs)).toEqual([UNAVAILABLE]);
+
+		const accepting = harness({ greetings: "accepts" });
+		const accepted = await accepting.walker.walk(
+			walkInput(greetingPlan(), { mailboxes: { [CALLER]: MAILBOX } }),
+		);
+		expect(played(accepting.verbs)).toEqual([
+			DEFAULT_PLAN_WALKER_SETTINGS.greetingRecordedAnnouncement,
+		]);
+		expect(refused.hangupCause).not.toBe(accepted.hangupCause);
+	});
+
 	it("publishes the recording pair, so the object has a lifecycle like any other", async () => {
 		const h = harness({ greetings: "accepts" });
 		await h.walker.walk(walkInput(greetingPlan(), { mailboxes: { [CALLER]: MAILBOX } }));
@@ -611,6 +650,10 @@ describe("recording a mailbox greeting", () => {
 		expect(played(h.verbs)).toEqual([UNAVAILABLE]);
 		expect(outcome.hangupCause).toBe("NORMAL_TEMPORARY_FAILURE");
 		expect(outcome.notes.join(" ")).toContain("could NOT be filed");
+		// The note names the object, and that is the point of it: the audio exists on the shared
+		// volume under this key, so a greeting the responder could not file is one an operator can
+		// still recover by hand.
+		expect(outcome.notes.join(" ")).toContain(`${ORG_ID}/${CALL_ID}/`);
 	});
 
 	it("refuses a caller with no mailbox of their own", async () => {

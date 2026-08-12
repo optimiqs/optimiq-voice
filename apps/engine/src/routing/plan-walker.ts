@@ -569,6 +569,16 @@ export interface VoicemailMailboxSource {
 
 /** A greeting a user has just recorded over `*99`, on its way to their mailbox. */
 export interface RecordedGreeting {
+	/**
+	 * The tenant.
+	 *
+	 * On the request rather than closed over by the port, unlike {@link VoicemailMessage} — the
+	 * difference is what the two ports ARE. The voicemail sink is built per call
+	 * (`voicemailPortFor(aggregate)`), so it already knows whose call it is; this one is a
+	 * process-wide singleton over the shared rpc client, exactly like {@link ExtensionFeaturePort}
+	 * and {@link LastCallerSource}, and every one of those carries its tenant in the call.
+	 */
+	readonly organizationId: string;
 	readonly voicemailBoxId: string;
 	readonly mailboxNumber: string;
 	/** Minted by the walker, so a redelivered publish files one greeting rather than two. */
@@ -586,6 +596,8 @@ export interface RecordedGreeting {
 	 * guess what the existing one meant.
 	 */
 	readonly kind: "unavailable";
+	/** The call the greeting was recorded on. Logging correlation only. */
+	readonly callId?: string;
 }
 
 /**
@@ -1664,6 +1676,7 @@ export class PlanWalker {
 
 		try {
 			await port.greetingRecorded({
+				organizationId: this.deps.channel.organizationId,
 				voicemailBoxId: entry.voicemailBoxId,
 				mailboxNumber: entry.mailboxNumber,
 				greetingId: this.newId(),
@@ -1671,6 +1684,7 @@ export class PlanWalker {
 				objectKey,
 				durationMs: result.durationMs,
 				kind: "unavailable",
+				callId: this.deps.channel.callId,
 			});
 		} catch (error) {
 			this.note(

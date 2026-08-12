@@ -17,6 +17,7 @@
 		"voicemailList": "rpc.voicemail.v1.list",
 		"pbxExtensionFeature": "rpc.pbx.v1.extension-feature",
 		"pbxLastCaller": "rpc.pbx.v1.last-caller",
+		"pbxFileGreeting": "rpc.pbx.v1.file-greeting",
 		"sipCredential": "rpc.sip.v1.credential",
 		"sipTransfer": "rpc.sip.v1.transfer",
 		"mediaAllocateSession": "rpc.media.v1.allocate-session",

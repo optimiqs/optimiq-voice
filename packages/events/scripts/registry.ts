@@ -317,6 +317,13 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		response: RPC_CONTRACTS["rpc.pbx.v1.last-caller"].response,
 	},
 	{
+		subject: "rpc.pbx.v1.file-greeting",
+		goName: "FileGreeting",
+		timeoutMs: RPC_CONTRACTS["rpc.pbx.v1.file-greeting"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.pbx.v1.file-greeting"].request,
+		response: RPC_CONTRACTS["rpc.pbx.v1.file-greeting"].response,
+	},
+	{
 		subject: "rpc.sip.v1.credential",
 		goName: "SipCredential",
 		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.credential"].timeoutMs,

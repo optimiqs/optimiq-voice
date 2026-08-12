@@ -12,6 +12,7 @@ import { makeQueueEvent, queueEventSchema } from "./queue-events";
 import { makeRegistrationEvent, registrationEventSchema } from "./registration-events";
 import {
 	AUTHZ_CHECK_RPC,
+	FILE_GREETING_RPC,
 	ORIGINATE_REFUSAL_REASONS,
 	ORIGINATE_RPC,
 	ROUTING_RESOLVE_RPC,
@@ -628,6 +629,51 @@ describe("rpc contracts", () => {
 				],
 			}).success,
 		).toBe(false);
+	});
+
+	it("pins the greeting-filing contract to its subject and defaults its slot", () => {
+		expect(FILE_GREETING_RPC.subject).toBe("rpc.pbx.v1.file-greeting");
+		const request = FILE_GREETING_RPC.request.parse({
+			orgId: ORG,
+			voicemailBoxId: createEntityId(),
+			mailboxNumber: "1001",
+			greetingId: createEntityId(),
+			objectKey: `${ORG}/${CALL}/rec.wav`,
+			durationMs: 4_200,
+		});
+		// `*99` is one code and the catalogue gives it no argument, so the slot it fills is a default
+		// rather than something every caller has to remember to send.
+		expect(request.kind).toBe("unavailable");
+	});
+
+	it("refuses a greeting with no audio in it", () => {
+		// The floor is the rule the walk already applies: an ACTIVE greeting containing silence stops
+		// a mailbox announcing itself and says nothing about why, so an empty recording is discarded
+		// rather than filed. A zero arriving here is a caller that skipped that, and the schema is the
+		// second place it cannot get through.
+		expect(
+			FILE_GREETING_RPC.request.safeParse({
+				orgId: ORG,
+				voicemailBoxId: createEntityId(),
+				mailboxNumber: "1001",
+				greetingId: createEntityId(),
+				objectKey: `${ORG}/${CALL}/rec.wav`,
+				durationMs: 0,
+			}).success,
+		).toBe(false);
+	});
+
+	it("separates a greeting that was stored from one that is being heard", () => {
+		// `applied` and `active` are two fields for the same reason `applied` and `enabled` are on the
+		// feature subject: a greeting that was filed and not activated is a different fact from one
+		// that was not filed, and a runtime reading only the first would confirm a recording nobody
+		// will ever hear.
+		const refused = FILE_GREETING_RPC.response.parse({
+			applied: false,
+			kind: "unavailable",
+			reason: "no such mailbox",
+		});
+		expect(refused.active).toBe(false);
 	});
 });
 

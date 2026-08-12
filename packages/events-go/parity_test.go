@@ -179,6 +179,7 @@ func TestParityConstants(t *testing.T) {
 		"voicemailList":         SubjectVoicemailListRPC,
 		"pbxExtensionFeature":   SubjectExtensionFeatureRPC,
 		"pbxLastCaller":         SubjectLastCallerRPC,
+		"pbxFileGreeting":       SubjectFileGreetingRPC,
 		"sipCredential":         SubjectSipCredentialRPC,
 		"sipTransfer":           SubjectSipTransferRPC,
 		"mediaAllocateSession":  SubjectMediaAllocateSessionRPC,

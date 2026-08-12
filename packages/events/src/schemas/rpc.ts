@@ -395,6 +395,169 @@ export const LAST_CALLER_RPC = defineRpc(
 );
 
 // ---------------------------------------------------------------------------------------------
+// rpc.pbx.v1.file-greeting — engine → api, when a handset finishes recording over `*99`
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Which of a mailbox's greetings a recording occupies.
+ *
+ * The same four slots `voicemail_greeting.kind` has, restated here rather than imported: this
+ * package is the contract and must not depend on the control plane's schema package, and a Go
+ * caller gets the enum from the generated code rather than from a Drizzle table. `*99` records
+ * `unavailable` today — the catalogue's `voicemail-record-greeting` takes no argument — and the
+ * other three are on the wire so that a second code, or an argument, does not need a new subject.
+ */
+export const VOICEMAIL_GREETING_KINDS = ["unavailable", "busy", "name", "temporary"] as const;
+export const voicemailGreetingKindSchema = z.enum(VOICEMAIL_GREETING_KINDS);
+export type VoicemailGreetingKind = (typeof VOICEMAIL_GREETING_KINDS)[number];
+
+/**
+ * `*99` — filing the greeting a user has just recorded from their handset.
+ *
+ * ## Why this is not `voicemail.message.left`
+ *
+ * The engine already has a way to say "I recorded audio for this mailbox", and it is deliberately
+ * NOT reused. `voicemailMessageLeftData` files a row in `voicemail_message`, archives the audio and
+ * publishes `mwi.updated` — so a greeting sent down that path would land in the recorder's own
+ * inbox and light their lamp, and the mailbox would still answer with the deployment's default
+ * announcement. The two look alike at the microphone and are opposite facts afterwards: a message
+ * is something a mailbox RECEIVED, a greeting is what it SAYS.
+ *
+ * ## Why request-reply and not an event
+ *
+ * Filing a greeting is a two-row write — clear the incumbent active greeting of that kind, insert
+ * the new one — inside a recompile, because `voicemail_greeting` is a routing input and the
+ * compiler embeds the active recording into the mailbox's `leave` node.
+ * `voicemail-greetings.service.ts` sets out at length why those statements cannot be split. An
+ * event would give the engine no way to know whether any of it happened, and `*99`'s whole design
+ * rests on the opposite: the port is checked BEFORE the beep, and the confirmation is played only
+ * once the greeting is filed. A user who is told their greeting is live when it is not discovers it
+ * from the first caller who reaches the mailbox, which is the one outcome the runtime exists to
+ * prevent.
+ *
+ * ## `mailboxNumber` is a claim, exactly as it is on `rpc.voicemail.v1.list`
+ *
+ * The engine knows which mailbox because the call came from the extension that owns it and the
+ * box's PIN gate — the same one `*97` applies — was satisfied. That is authentication of the
+ * strength of the phone on the desk, and it is not authorization: a request on a shared broker
+ * proves only that something reached the broker. So the responder loads the box under
+ * `withTenantScope(orgId)` and refuses a box whose own `mailbox_number` is not the claimed one,
+ * rather than replacing the greeting of whatever id it is handed.
+ *
+ * ## THE AUDIO IS A KEY, NOT BYTES
+ *
+ * This is the shape decision worth the paragraph. The request carries `objectKey` — the recording's
+ * key relative to the shared object root, `<orgId>/<callId>/<recordingId>.<ext>`, exactly as
+ * `voicemailMessageLeftData.objectKey` carries a message's and exactly what
+ * `mediaStartRecordingResponse.objectKey` defines. Three reasons, in the order they bite:
+ *
+ * 1. **The engine never holds the bytes.** The media server writes the file itself, straight onto
+ *    the mount every process in the deployment shares (`media-storage.ts` has the whole picture);
+ *    the engine only ever learns a name for it. A payload of audio would mean the call path reading
+ *    a file off disk purely to hand it back to a process that can already open it.
+ * 2. **NATS request-reply is not a file transport.** A minute of 8 kHz PCM is most of a megabyte,
+ *    which is a broker's default maximum payload; the ceiling would be reached by a greeting a
+ *    user is entitled to record, and the failure would arrive as a disconnect rather than a
+ *    refusal.
+ * 3. **The key is already the vocabulary.** The recording has a `channel.record.started` /
+ *    `channel.record.stopped` pair carrying the same key, so the greeting, the CDR's recording row
+ *    and the archive all name one object rather than three copies of one sound.
+ *
+ * What the responder does with it is an INGEST rather than a rename: it reads the object, checks
+ * that it really is audio, and writes a copy under the media library's own layout
+ * (`greetings/<org>/<box>/<greetingId>.<ext>`), because that is where the compiler expects a
+ * greeting to live and where the greeting's HTTP lifecycle — preview, relabel, delete — can reach
+ * it. A copy and not a move: the source object is still what `channel.record.stopped` named, and
+ * moving it would break the recording row that names it.
+ *
+ * ## The reply is what the caller HEARS
+ *
+ * `applied` decides between the confirmation and the "not available" announcement, so a refusal
+ * must arrive as a reply rather than as a timeout — the same rule `rpc.pbx.v1.extension-feature`
+ * states, and it costs more here: the user has just spent thirty seconds recording, and silence
+ * would leave them believing it worked.
+ */
+export const fileGreetingRequestSchema = z.object({
+	orgId: z.uuid(),
+	/** The box the walk resolved from the artifact's mailbox table. Re-checked against the claim. */
+	voicemailBoxId: z.uuid(),
+	/** The mailbox number the walk authenticated. A CLAIM — see above. */
+	mailboxNumber: z.string().min(1).max(32),
+	/**
+	 * Minted by the engine, and it becomes the `voicemail_greeting` row id.
+	 *
+	 * The same idempotence `voicemailMessageLeftData.messageId` buys: a request whose reply was lost
+	 * and is retried files ONE greeting rather than two rows racing for the single active slot.
+	 */
+	greetingId: z.uuid(),
+	/** Which slot the recording fills. `*99` records `unavailable`; see the enum. */
+	kind: voicemailGreetingKindSchema.default("unavailable"),
+	/**
+	 * The recorded audio, as a key under the shared object root. See "THE AUDIO IS A KEY" above.
+	 *
+	 * 1024 matches `voicemailMessageSummarySchema.objectKey` and `recordings.object_key`, which is
+	 * the same string in a database column.
+	 */
+	objectKey: z.string().min(1).max(1_024),
+	/**
+	 * The media server's own handle for the capture — the file-name stem inside {@link objectKey}.
+	 *
+	 * Optional and carried for correlation only: it is what joins this request to the
+	 * `channel.record.started` / `channel.record.stopped` pair in a support ticket. A responder that
+	 * ignores it is correct.
+	 */
+	recordingId: z.string().min(1).max(128).optional(),
+	/**
+	 * How long the recording is, as the media server reported it.
+	 *
+	 * At least one millisecond, and the floor is load bearing rather than tidy: an empty recording
+	 * is DISCARDED by the walk before this request is made, because an active greeting containing
+	 * silence stops a mailbox announcing itself and says nothing about why. A zero arriving here is
+	 * therefore a caller that skipped that rule, and it is refused by the schema rather than filed.
+	 */
+	durationMs: z.int().min(1),
+	/** Present when the greeting came off a live call; for logging correlation only. */
+	callId: z.uuid().optional(),
+});
+
+export const fileGreetingResponseSchema = z.object({
+	/** False means nothing was filed. The handset hears the unavailable announcement. */
+	applied: z.boolean(),
+	kind: voicemailGreetingKindSchema,
+	/**
+	 * Whether this greeting is now the ACTIVE one for its kind.
+	 *
+	 * Separate from `applied` for the reason `enabled` is separate from it on the feature subject: a
+	 * greeting that was stored and not activated is a different fact from one that was not stored,
+	 * and a runtime that read only `applied` would confirm a recording nobody will ever hear.
+	 */
+	active: z.boolean().default(false),
+	/** Echoed so a reply can be attributed without the caller holding per-request state. */
+	greetingId: z.uuid().optional(),
+	/** Where the library filed it — `greetings/<org>/<box>/<greetingId>.<ext>`. Diagnostics. */
+	objectKey: z.string().max(1_024).optional(),
+	/** Why the greeting was refused, for the support ticket. Never played to the handset. */
+	reason: z.string().max(256).optional(),
+});
+
+export type FileGreetingRequest = z.infer<typeof fileGreetingRequestSchema>;
+export type FileGreetingResponse = z.infer<typeof fileGreetingResponseSchema>;
+
+export const FILE_GREETING_RPC = defineRpc(
+	RPC_SUBJECTS.pbxFileGreeting,
+	fileGreetingRequestSchema,
+	fileGreetingResponseSchema,
+	// The same five seconds `rpc.pbx.v1.extension-feature` gets, and for its reason plus one more.
+	// The responder recompiles the tenant's whole routing artifact inside the write's transaction,
+	// because a greeting whose artifact still names the old recording is a greeting that did not
+	// happen; and before that it COPIES the audio into the library, which is a minute of PCM at
+	// worst, on the volume the media server just wrote it to. A caller listening to a moment of
+	// silence before the confirmation is a far better outcome than a confirmation that outran the
+	// file.
+	5_000,
+);
+
+// ---------------------------------------------------------------------------------------------
 // rpc.sip.v1.credential — sipd → api, on every REGISTER that answers a digest challenge
 // ---------------------------------------------------------------------------------------------
 
@@ -1727,6 +1890,7 @@ export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.voicemailList]: VOICEMAIL_LIST_RPC,
 	[RPC_SUBJECTS.pbxExtensionFeature]: EXTENSION_FEATURE_RPC,
 	[RPC_SUBJECTS.pbxLastCaller]: LAST_CALLER_RPC,
+	[RPC_SUBJECTS.pbxFileGreeting]: FILE_GREETING_RPC,
 	[RPC_SUBJECTS.sipCredential]: SIP_CREDENTIAL_RPC,
 	[RPC_SUBJECTS.sipTransfer]: SIP_TRANSFER_RPC,
 	[RPC_SUBJECTS.mediaAllocateSession]: MEDIA_ALLOCATE_SESSION_RPC,

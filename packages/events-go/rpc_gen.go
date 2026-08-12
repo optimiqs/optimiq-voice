@@ -27,6 +27,7 @@ const (
 	SubjectVoicemailListRPC         = "rpc.voicemail.v1.list"
 	SubjectExtensionFeatureRPC      = "rpc.pbx.v1.extension-feature"
 	SubjectLastCallerRPC            = "rpc.pbx.v1.last-caller"
+	SubjectFileGreetingRPC          = "rpc.pbx.v1.file-greeting"
 	SubjectSipCredentialRPC         = "rpc.sip.v1.credential"
 	SubjectSipTransferRPC           = "rpc.sip.v1.transfer"
 	SubjectMediaAllocateSessionRPC  = "rpc.media.v1.allocate-session"
@@ -48,6 +49,7 @@ const (
 	TimeoutVoicemailListRPC         = 3000 * time.Millisecond
 	TimeoutExtensionFeatureRPC      = 5000 * time.Millisecond
 	TimeoutLastCallerRPC            = 3000 * time.Millisecond
+	TimeoutFileGreetingRPC          = 5000 * time.Millisecond
 	TimeoutSipCredentialRPC         = 500 * time.Millisecond
 	TimeoutSipTransferRPC           = 2000 * time.Millisecond
 	TimeoutMediaAllocateSessionRPC  = 500 * time.Millisecond
@@ -329,6 +331,89 @@ type LastCallerResponse struct {
 	At           *EventTime `json:"at,omitempty"`
 	Reason       *string    `json:"reason,omitempty"`
 }
+
+// FileGreetingRequest is the request body of rpc.pbx.v1.file-greeting.
+type FileGreetingRequest struct {
+	OrgID          string                  `json:"orgId"`
+	VoicemailBoxID string                  `json:"voicemailBoxId"`
+	MailboxNumber  string                  `json:"mailboxNumber"`
+	GreetingID     string                  `json:"greetingId"`
+	Kind           FileGreetingRequestKind `json:"kind"`
+	ObjectKey      string                  `json:"objectKey"`
+	RecordingID    *string                 `json:"recordingId,omitempty"`
+	DurationMs     int                     `json:"durationMs"`
+	CallID         *string                 `json:"callId,omitempty"`
+}
+
+// FileGreetingRequestKind is the closed vocabulary of FileGreetingRequest.kind.
+type FileGreetingRequestKind string
+
+const (
+	FileGreetingRequestKindUnavailable FileGreetingRequestKind = "unavailable"
+	FileGreetingRequestKindBusy        FileGreetingRequestKind = "busy"
+	FileGreetingRequestKindName        FileGreetingRequestKind = "name"
+	FileGreetingRequestKindTemporary   FileGreetingRequestKind = "temporary"
+)
+
+// FileGreetingRequestKindValues lists every member of the vocabulary, in contract order.
+var FileGreetingRequestKindValues = []FileGreetingRequestKind{
+	FileGreetingRequestKindUnavailable,
+	FileGreetingRequestKindBusy,
+	FileGreetingRequestKindName,
+	FileGreetingRequestKindTemporary,
+}
+
+// Valid reports whether v is a member of the FileGreetingRequestKind vocabulary.
+func (v FileGreetingRequestKind) Valid() bool {
+	for _, candidate := range FileGreetingRequestKindValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v FileGreetingRequestKind) String() string { return string(v) }
+
+// FileGreetingResponse is the reply body of rpc.pbx.v1.file-greeting.
+type FileGreetingResponse struct {
+	Applied    bool                     `json:"applied"`
+	Kind       FileGreetingResponseKind `json:"kind"`
+	Active     bool                     `json:"active"`
+	GreetingID *string                  `json:"greetingId,omitempty"`
+	ObjectKey  *string                  `json:"objectKey,omitempty"`
+	Reason     *string                  `json:"reason,omitempty"`
+}
+
+// FileGreetingResponseKind is the closed vocabulary of FileGreetingResponse.kind.
+type FileGreetingResponseKind string
+
+const (
+	FileGreetingResponseKindUnavailable FileGreetingResponseKind = "unavailable"
+	FileGreetingResponseKindBusy        FileGreetingResponseKind = "busy"
+	FileGreetingResponseKindName        FileGreetingResponseKind = "name"
+	FileGreetingResponseKindTemporary   FileGreetingResponseKind = "temporary"
+)
+
+// FileGreetingResponseKindValues lists every member of the vocabulary, in contract order.
+var FileGreetingResponseKindValues = []FileGreetingResponseKind{
+	FileGreetingResponseKindUnavailable,
+	FileGreetingResponseKindBusy,
+	FileGreetingResponseKindName,
+	FileGreetingResponseKindTemporary,
+}
+
+// Valid reports whether v is a member of the FileGreetingResponseKind vocabulary.
+func (v FileGreetingResponseKind) Valid() bool {
+	for _, candidate := range FileGreetingResponseKindValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v FileGreetingResponseKind) String() string { return string(v) }
 
 // SipCredentialRequest is the request body of rpc.sip.v1.credential.
 type SipCredentialRequest struct {

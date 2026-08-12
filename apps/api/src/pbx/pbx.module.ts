@@ -88,6 +88,8 @@ import {
 } from "./time-conditions/time-conditions.service";
 import { TrunksController } from "./trunks/trunks.controller";
 import { TrunksService } from "./trunks/trunks.service";
+import { FileGreetingRpcController } from "./voicemail-boxes/file-greeting-rpc.controller";
+import { FileGreetingService } from "./voicemail-boxes/file-greeting.service";
 import { VoicemailBoxesController } from "./voicemail-boxes/voicemail-boxes.controller";
 import { VoicemailBoxesService } from "./voicemail-boxes/voicemail-boxes.service";
 import { VoicemailConsumer } from "./voicemail-boxes/voicemail-consumer.service";
@@ -222,6 +224,17 @@ const logger = getLogger("api.pbx");
 		 * see `extension-feature.service.ts`.
 		 */
 		ExtensionFeatureRpcController,
+		/**
+		 * A handset filing the greeting it has just recorded into its own mailbox.
+		 *
+		 * The fourth broker responder, and the one that made `*99` more than a runtime: the walker has
+		 * been able to record a greeting since the feature-code wave, and had nowhere to send it,
+		 * because filing one is a two-row write inside a recompile and no subject carried that. It is
+		 * declared here rather than beside the greeting CRUD controller for the reason all four of
+		 * these are together: they share one transport, and what a reader needs to see in one place is
+		 * every subject this application answers.
+		 */
+		FileGreetingRpcController,
 		/**
 		 * The change ledger's read surface.
 		 *
@@ -527,6 +540,7 @@ const logger = getLogger("api.pbx");
 		VoicemailMwiPublisher,
 		VoicemailMessagesService,
 		VoicemailGreetingsService,
+		FileGreetingService,
 		VoicemailEmailService,
 		VoicemailTranscriptionService,
 		VoicemailTranscriptionSweeper,

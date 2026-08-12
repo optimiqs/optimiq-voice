@@ -330,6 +330,14 @@
 			"goResponseType": "LastCallerResponse"
 		},
 		{
+			"subject": "rpc.pbx.v1.file-greeting",
+			"timeoutMs": 5000,
+			"requestSchema": "rpc/rpc.pbx.v1.file-greeting.request.schema.json",
+			"responseSchema": "rpc/rpc.pbx.v1.file-greeting.response.schema.json",
+			"goRequestType": "FileGreetingRequest",
+			"goResponseType": "FileGreetingResponse"
+		},
+		{
 			"subject": "rpc.sip.v1.credential",
 			"timeoutMs": 500,
 			"requestSchema": "rpc/rpc.sip.v1.credential.request.schema.json",

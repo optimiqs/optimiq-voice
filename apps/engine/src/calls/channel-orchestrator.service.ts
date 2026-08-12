@@ -31,6 +31,7 @@ import { ParkRegistry } from "../routing/park-registry";
 import { PlanWalker } from "../routing/plan-walker";
 import { RoutingArtifactSource } from "../routing/routing-artifact.source";
 import { TrunkCapacityRegistry } from "../routing/trunk-capacity";
+import { VoicemailGreetingRpcPort } from "../routing/voicemail-greeting.source";
 import { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
 import { dtmfEventFrom } from "../verbs/dtmf-inbox";
 import { DtmfRegistry } from "../verbs/dtmf-registry";
@@ -211,6 +212,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		private readonly mailbox: VoicemailMailboxRpcSource,
 		private readonly extensionFeatures: ExtensionFeatureRpcPort,
 		private readonly lastCaller: LastCallerRpcSource,
+		private readonly greetings: VoicemailGreetingRpcPort,
 		private readonly didIndex: DidIndexSource,
 		private readonly signals: CallSignalBus,
 		private readonly conferences: ConferenceRegistry,
@@ -962,25 +964,25 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			legs: this.legHooksFor(aggregate),
 			voicemail: this.voicemailPortFor(aggregate),
 			mailbox: this.mailbox,
-			// The two self-service seams: the WRITE behind `*72`/`*74`/`*76`/`*78`/`*21` and the ledger
-			// read behind `*69`. Both are stateless over the shared rpc client, so one instance serves
-			// every walk — see `routing.module.ts`.
+			// The three self-service seams: the WRITE behind `*72`/`*74`/`*76`/`*78`/`*21`, the ledger
+			// read behind `*69`, and the greeting `*99` files. All three are stateless over the shared
+			// rpc client, so one instance serves every walk — see `routing.module.ts`.
 			features: this.extensionFeatures,
 			lastCaller: this.lastCaller,
-			// `greetings` is deliberately ABSENT, and `*99` therefore announces "not available" and
-			// records nothing.
+			// `greetings` was deliberately absent for one wave, and this is the wire that closed it.
+			// The runtime and the port were finished together with the rest of the feature codes; what
+			// did not exist was a CONTRACT to carry a recorded greeting to the control plane, because a
+			// greeting is not a `voicemail.message.left` — filing one is a two-row write (clear the
+			// incumbent, activate the new one) inside a recompile, which
+			// `voicemail-greetings.service.ts` explains at length and which
+			// `voicemailMessageLeftDataSchema` cannot express. `rpc.pbx.v1.file-greeting` is that
+			// contract, and `VoicemailGreetingRpcPort` is this end of it.
 			//
-			// The runtime is complete (`PlanWalker.recordGreetingCode`) and so is the port; what does not
-			// exist is a CONTRACT to carry a recorded greeting to the control plane. A greeting is not a
-			// `voicemail.message.left` — filing one is a two-row write (clear the incumbent, activate the
-			// new one) inside a recompile, which `voicemail-greetings.service.ts` explains at length and
-			// which `voicemailMessageLeftDataSchema` cannot express. Publishing it as a message would put
-			// somebody's greeting in their own inbox and light their MWI lamp.
-			//
-			// Wiring a port that could not file would be the one outcome the runtime is built to avoid:
-			// a user who records thirty seconds of their voice and is told it worked. So the seam stays
-			// open until `packages/events` carries the subject, and the caller is told the truth in the
-			// meantime.
+			// The port check that runs BEFORE the beep stays exactly where it was: with a port wired,
+			// the check passes and the recording happens; without one — a deployment with no rpc client
+			// — `*99` still announces "not available" and records nothing, rather than taking thirty
+			// seconds of somebody's voice it has nowhere to put.
+			greetings: this.greetings,
 			// The ACD plane, passed as a bundle rather than five constructor arguments to the walker:
 			// a queue node needs all five or none of them, and a walk that had four would fail in the
 			// middle of somebody's hold music rather than at construction.

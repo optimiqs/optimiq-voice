@@ -50,6 +50,7 @@ describe("subject roots", () => {
 			voicemailList: "rpc.voicemail.v1.list",
 			pbxExtensionFeature: "rpc.pbx.v1.extension-feature",
 			pbxLastCaller: "rpc.pbx.v1.last-caller",
+			pbxFileGreeting: "rpc.pbx.v1.file-greeting",
 			sipCredential: "rpc.sip.v1.credential",
 			sipTransfer: "rpc.sip.v1.transfer",
 			mediaAllocateSession: "rpc.media.v1.allocate-session",
@@ -107,6 +108,7 @@ describe("subjectFor", () => {
 		expect(subjectFor.authzCheckRpc()).toBe("rpc.authz.v1.check");
 		expect(subjectFor.pbxExtensionFeatureRpc()).toBe("rpc.pbx.v1.extension-feature");
 		expect(subjectFor.pbxLastCallerRpc()).toBe("rpc.pbx.v1.last-caller");
+		expect(subjectFor.pbxFileGreetingRpc()).toBe("rpc.pbx.v1.file-greeting");
 		expect(subjectFor.sipCredentialRpc()).toBe("rpc.sip.v1.credential");
 		expect(subjectFor.sipTransferRpc()).toBe("rpc.sip.v1.transfer");
 	});

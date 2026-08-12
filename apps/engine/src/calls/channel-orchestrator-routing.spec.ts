@@ -24,6 +24,7 @@ import type { DidIndexSource } from "../routing/did-index.source";
 import type { ExtensionFeatureRpcPort } from "../routing/extension-feature.source";
 import type { LastCallerRpcSource } from "../routing/last-caller.source";
 import type { RoutingArtifactSource } from "../routing/routing-artifact.source";
+import type { VoicemailGreetingRpcPort } from "../routing/voicemail-greeting.source";
 import type { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
 import type { ControlledLeg } from "./call-control";
 import type { CallEventOf, CdrLegWriteEnvelope, SipTransferRequest } from "@optimiq-voice/events";
@@ -65,6 +66,19 @@ const NO_FEATURES = {
 const NO_LAST_CALLER = {
 	lookup: async () => ({ found: false, reason: "no responder in this spec" }),
 } as unknown as LastCallerRpcSource;
+
+/**
+ * A greeting sink that refuses, on the same terms as the two above it.
+ *
+ * `*99` is specced in `routing/plan-walker-features.spec.ts` against a fake port. A throw here is
+ * what a walk with no responder sees, and it keeps a star code dialled by accident in one of these
+ * specs from reaching a broker that is not running.
+ */
+const NO_GREETINGS = {
+	greetingRecorded: async (): Promise<void> => {
+		throw new Error("no responder in this spec");
+	},
+} as unknown as VoicemailGreetingRpcPort;
 
 /**
  * A park-handoff seam that answers nothing.
@@ -350,6 +364,7 @@ function harness(options: HarnessOptions = {}) {
 		(options.mailbox ?? NO_MAILBOX) as VoicemailMailboxRpcSource,
 		NO_FEATURES,
 		NO_LAST_CALLER,
+		NO_GREETINGS,
 		(options.didIndex ?? NO_DID_INDEX) as DidIndexSource,
 		signals,
 		new ConferenceRegistry(),

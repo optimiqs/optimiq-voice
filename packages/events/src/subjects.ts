@@ -24,6 +24,7 @@ import { createHash } from "node:crypto";
  * rpc.authz.v1.check
  * rpc.pbx.v1.extension-feature               engine -> api; a handset writing its own state
  * rpc.pbx.v1.last-caller                     engine -> api; `*69`, answered from cdr-db
+ * rpc.pbx.v1.file-greeting                   engine -> api; `*99`, a recorded greeting filed
  * rpc.sip.v1.credential
  * rpc.media.v1.allocate-session              engine -> mediad; RAW NATS both ends (see rpc.ts)
  * rpc.media.v1.bridge-sessions
@@ -88,6 +89,17 @@ export const RPC_SUBJECTS = {
 	 * "feature", and would have made the two impossible to grant separately at the broker.
 	 */
 	pbxLastCaller: `rpc.pbx.${SUBJECT_VERSION}.last-caller`,
+	/**
+	 * `*99` — the greeting a user has just recorded from their handset, filed into their mailbox:
+	 * `apps/engine` → `apps/api`.
+	 *
+	 * The second WRITE the engine makes, and a different one from `extension-feature` above: that
+	 * one changes a column, this one files a row and moves audio into the media library. It is its
+	 * own subject rather than a member of the feature family because it carries an OBJECT KEY and
+	 * because the two are worth granting separately at the broker — a process that may toggle
+	 * forwarding is not thereby a process that may replace what a mailbox says.
+	 */
+	pbxFileGreeting: `rpc.pbx.${SUBJECT_VERSION}.file-greeting`,
 	sipCredential: `rpc.sip.${SUBJECT_VERSION}.credential`,
 	/**
 	 * The SIP edge asking the call engine to execute a phone's REFER: `apps/sipd` (Go) → the
@@ -520,6 +532,10 @@ export const subjectFor = {
 	/** `rpc.pbx.v1.last-caller` */
 	pbxLastCallerRpc(): string {
 		return RPC_SUBJECTS.pbxLastCaller;
+	},
+	/** `rpc.pbx.v1.file-greeting` */
+	pbxFileGreetingRpc(): string {
+		return RPC_SUBJECTS.pbxFileGreeting;
 	},
 	/** `rpc.sip.v1.credential` */
 	sipCredentialRpc(): string {
