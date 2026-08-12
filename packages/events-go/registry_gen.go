@@ -49,6 +49,12 @@ var EventTypes = []EventTypeInfo{
 	{Family: FamilyRegistration, Type: EventTypeRegistrationRegistered, SubjectTemplate: "sip.reg.v1.<orgId>.<aorHash>.registered"},
 	{Family: FamilyRegistration, Type: EventTypeRegistrationUnregistered, SubjectTemplate: "sip.reg.v1.<orgId>.<aorHash>.unregistered"},
 	{Family: FamilyRegistration, Type: EventTypeRegistrationExpired, SubjectTemplate: "sip.reg.v1.<orgId>.<aorHash>.expired"},
+	{Family: FamilySIPDialog, Type: EventTypeSIPDialogProgressed, SubjectTemplate: "sip.evt.v1.<orgId>.<legId>.dialog.progressed"},
+	{Family: FamilySIPDialog, Type: EventTypeSIPDialogAnswered, SubjectTemplate: "sip.evt.v1.<orgId>.<legId>.dialog.answered"},
+	{Family: FamilySIPDialog, Type: EventTypeSIPDialogHeld, SubjectTemplate: "sip.evt.v1.<orgId>.<legId>.dialog.held"},
+	{Family: FamilySIPDialog, Type: EventTypeSIPDialogResumed, SubjectTemplate: "sip.evt.v1.<orgId>.<legId>.dialog.resumed"},
+	{Family: FamilySIPDialog, Type: EventTypeSIPDialogTerminated, SubjectTemplate: "sip.evt.v1.<orgId>.<legId>.dialog.terminated"},
+	{Family: FamilySIPDialog, Type: EventTypeSIPDialogDTMF, SubjectTemplate: "sip.evt.v1.<orgId>.<legId>.dialog.dtmf"},
 	{Family: FamilyQueue, Type: EventTypeQueueCallerJoined, SubjectTemplate: "queue.evt.v1.<orgId>.<queueId>.caller.joined"},
 	{Family: FamilyQueue, Type: EventTypeQueueCallerAnswered, SubjectTemplate: "queue.evt.v1.<orgId>.<queueId>.caller.answered"},
 	{Family: FamilyQueue, Type: EventTypeQueueCallerAbandoned, SubjectTemplate: "queue.evt.v1.<orgId>.<queueId>.caller.abandoned"},
@@ -135,6 +141,18 @@ func NewDataFor(eventType string) any {
 		return new(RegistrationUnregisteredData)
 	case EventTypeRegistrationExpired:
 		return new(RegistrationExpiredData)
+	case EventTypeSIPDialogProgressed:
+		return new(SIPDialogProgressedData)
+	case EventTypeSIPDialogAnswered:
+		return new(SIPDialogAnsweredData)
+	case EventTypeSIPDialogHeld:
+		return new(SIPDialogHeldData)
+	case EventTypeSIPDialogResumed:
+		return new(SIPDialogResumedData)
+	case EventTypeSIPDialogTerminated:
+		return new(SIPDialogTerminatedData)
+	case EventTypeSIPDialogDTMF:
+		return new(SIPDialogDTMFData)
 	case EventTypeQueueCallerJoined:
 		return new(QueueCallerJoinedData)
 	case EventTypeQueueCallerAnswered:

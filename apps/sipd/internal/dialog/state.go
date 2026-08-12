@@ -239,6 +239,41 @@ var (
 	ErrCancelTooLate = errors.New("dialog: the CANCEL arrived after the final response")
 )
 
+// The rest of SIP_DIALOG_REFUSAL_REASONS, as errors.
+//
+// # Why they live here and not next to the NATS responder that reports them
+//
+// The four above were declared when only the dialog machine could raise them. These five are raised
+// by the ORIGINATE path — a lookup that found no registration, a trunk this edge holds no
+// configuration for, a target that will not resolve — which is a different file in a different
+// package. Putting them there would split one closed vocabulary across two packages and give the
+// responder two switches to keep in step.
+//
+// So the whole of SIP_DIALOG_REFUSAL_REASONS is here, which is what the paragraph above already
+// claims this block is, and `errors.Is` at the command boundary turns any of the nine into a wire
+// reason without a single string comparison anywhere else.
+var (
+	// ErrUnregisteredTarget is an originate to an AOR with no live binding. The engine's
+	// `USER_NOT_REGISTERED`, and NOT an error: a phone that is unplugged is the ordinary case, which
+	// is why it is a named refusal rather than an internal failure.
+	ErrUnregisteredTarget = errors.New("dialog: the target address of record has no live registration")
+	// ErrUnknownTrunk is an originate naming a trunk this edge holds no configuration for. It means
+	// the trunk directory has not reached this instance — not that the trunk does not exist — so the
+	// engine's recovery is to try another instance rather than to fail the call.
+	ErrUnknownTrunk = errors.New("dialog: no configuration for that trunk")
+	// ErrNoRoute is a DNS or transport failure reaching the target. NOTHING was sent, which is the
+	// part that matters: the engine may safely re-originate this leg somewhere else.
+	ErrNoRoute = errors.New("dialog: the target could not be reached")
+	// ErrCapacity is a trunk's maxChannels or this instance's own dialog cap. A LOAD signal, and the
+	// one refusal here whose correct handling is to try a different instance rather than to give up.
+	ErrCapacity = errors.New("dialog: the capacity limit for that target is reached")
+	// ErrNotSupported is a command this build understands and cannot serve. `reinvite` answers it
+	// until sipgo has a re-INVITE at all (design §9.2), and answering it is strictly better than the
+	// alternative: a hold that silently no-opped is a call whose media direction is whatever the last
+	// answer happened to say, and nobody finds that until a customer is overheard.
+	ErrNotSupported = errors.New("dialog: this build cannot serve that command")
+)
+
 // transition is the whole machine: a pure function of role, state and trigger.
 //
 // Every "no" is one of the four errors above, so a caller never has to infer a reason from a state

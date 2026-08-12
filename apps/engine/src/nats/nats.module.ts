@@ -11,6 +11,7 @@ import { OriginateService } from "./originate.service";
 import { ParkHandoffService } from "./park-handoff.service";
 import { SessionAnnounceService } from "./session-announce.service";
 import { SessionVerbService } from "./session-verb.service";
+import { SipInviteService } from "./sip-invite.service";
 import { SipTransferService } from "./sip-transfer.service";
 import type { EngineEnv } from "../config/engine-env";
 
@@ -90,6 +91,7 @@ import type { EngineEnv } from "../config/engine-env";
 		ParkHandoffService,
 		SessionAnnounceService,
 		SessionVerbService,
+		SipInviteService,
 		SipTransferService,
 	],
 	exports: [
@@ -102,6 +104,7 @@ import type { EngineEnv } from "../config/engine-env";
 		ParkHandoffService,
 		SessionAnnounceService,
 		SessionVerbService,
+		SipInviteService,
 		SipTransferService,
 	],
 })

@@ -673,6 +673,17 @@ func TestOptionsAndUnsupportedMethods(t *testing.T) {
 	}, "\r\n"))
 	tx = siptest.NewServerTxRecorder(invite)
 	h.registrar.HandleUnsupported(invite, tx)
+	// Terminated BEFORE the recorder is read, and only on the INVITE transaction.
+	//
+	// A final response to an INVITE puts sipgo's server transaction into Completed, which arms
+	// RFC 3261 §17.2.1's Timer G and retransmits that response from a timer goroutine until the ACK
+	// or Timer H. `siptest.ServerTxRecorder` takes no lock, so that goroutine writes the same slice
+	// this test reads — a data race `go test -race` finds, in sipgo's recorder rather than in
+	// anything this package wrote, and one that survives the test function by half a second.
+	//
+	// Terminating first stops the FSM while the response we care about is already recorded. It is
+	// what a real transport does when the ACK arrives, so nothing about the assertion changes.
+	tx.Terminate()
 	res = lastResponse(t, tx)
 	if res.StatusCode != 501 {
 		t.Errorf("INVITE = %d, want 501 Not Implemented", res.StatusCode)

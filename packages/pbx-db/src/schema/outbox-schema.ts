@@ -46,8 +46,27 @@ import { tenantIsolationPolicy } from "../tenant";
  * tenant that is owed a publish" is not a question a tenant-scoped transaction can ask.
  */
 
-/** The KV projections a committed write can owe. */
-export const PROJECTION_NAMES = ["routing-cache", "did-index", "queue-membership"] as const;
+/**
+ * The KV projections a committed write can owe.
+ *
+ * Plain `text` in the column below rather than a PostgreSQL enum, which is what makes adding a name
+ * here a code change and not a migration — deliberate, because the set grows whenever a new derived
+ * read model lands and an `ALTER TYPE` in the middle of a deploy is a worse failure than an unknown
+ * string in a diagnostics column.
+ *
+ * `trunks` and `sip-acl` joined when the SIP edge got its own read models. Both are durable for the
+ * same reason the first three are and one that is sharper: their buckets have a zero TTL, so a lost
+ * publish never self-corrects — a stale `trunks` entry is an outbound outage for a tenant, and a
+ * stale `sip-acl` entry is either a carrier silently blocked or a network still admitted by a rule
+ * that was deleted.
+ */
+export const PROJECTION_NAMES = [
+	"routing-cache",
+	"did-index",
+	"queue-membership",
+	"trunks",
+	"sip-acl",
+] as const;
 export type ProjectionName = (typeof PROJECTION_NAMES)[number];
 
 export const projectionOutbox = pgTable.withRLS(

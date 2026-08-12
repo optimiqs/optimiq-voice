@@ -46,6 +46,7 @@
 		"zod": "catalog:"
 	},
 	"devDependencies": {
+		"@optimiq-voice/telephony": "workspace:*",
 		"@types/bun": "catalog:",
 		"tsx": "^4.23.7",
 		"typescript": "^5.9.3"

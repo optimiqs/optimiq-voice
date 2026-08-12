@@ -58,17 +58,7 @@ func (e *executor) Handle(ctx context.Context, d *dialog.Dialog, effect dialog.E
 			"legId", d.LegID, "reason", effect.Detail)
 		return nil
 	case dialog.EffectPublish:
-		e.handler.publish(Event{
-			Kind:        effect.Event,
-			LegID:       d.LegID,
-			OrgID:       d.OrgID,
-			CallID:      d.CallID,
-			SIPCallID:   d.Identity.SIPCallID,
-			Cause:       effect.Cause,
-			Termination: effect.Termination,
-			Detail:      effect.Detail,
-			At:          e.handler.now(),
-		})
+		e.handler.publish(e.eventFor(d, effect))
 		return nil
 	case dialog.EffectStartSessionTimer:
 		e.armSessionTimer(d)
@@ -93,6 +83,86 @@ func (e *executor) Handle(ctx context.Context, d *dialog.Dialog, effect dialog.E
 	default:
 		return nil
 	}
+}
+
+// eventFor reads one publishable event off the dialog and the effect that produced it.
+//
+// # Why it reads the DIALOG rather than carrying everything on the effect
+//
+// The state machine's Effect is deliberately narrow: a kind, a status line, a body, and the three
+// terminal facts. Widening it to carry the dialog triple, the role, the setup time and the billsec
+// would put a wire payload's field set inside a pure state machine that has no business knowing one
+// exists — and it would be redundant, because this runs ON the dialog's own goroutine, immediately
+// after Apply mutated it, so the dialog is the freshest and the only consistent source for all of
+// them.
+//
+// The one thing it does NOT do is decide anything. Every field is read; nothing is derived, defaulted
+// or repaired here, so a payload that is wrong is a state machine that was wrong, and there is one
+// place to look.
+func (e *executor) eventFor(d *dialog.Dialog, effect dialog.Effect) Event {
+	now := e.handler.now()
+	event := Event{
+		Kind:      effect.Event,
+		LegID:     d.LegID,
+		OrgID:     d.OrgID,
+		CallID:    d.CallID,
+		SIPCallID: d.Identity.SIPCallID,
+		LocalTag:  d.Identity.LocalTag,
+		RemoteTag: d.Identity.RemoteTag,
+		Role:      d.Role,
+		Status:    effect.Status,
+		Detail:    effect.Detail,
+		At:        now,
+	}
+
+	switch effect.Event {
+	case dialog.EventProgressed:
+		// A 18x with a body committed an answer, and that is exactly what "early media" means on this
+		// event — not "the far end is ringing", which every 180 also is.
+		if len(effect.Body) > 0 {
+			event.HasEarlyMedia = true
+			event.SDPAnswer = string(effect.Body)
+		}
+		if event.Status == 0 {
+			// A UAC leg's `progressed` comes from a response we RECEIVED, so the effect carries no
+			// status line of its own. 180 is the honest default: the trigger that produced it is
+			// TriggerRemoteEarly, which by definition is an 18x that created an early dialog.
+			event.Status = 180
+		}
+
+	case dialog.EventAnswered:
+		event.SDPAnswer = string(effect.Body)
+		if answered := d.AnsweredAt(); !answered.IsZero() {
+			// Post-dial delay, measured on the only plane that sees both the INVITE and the answer.
+			// Negative is impossible by construction and is clamped rather than sent, because a
+			// negative setup time on a percentile plot is worse than a missing one.
+			if setup := answered.Sub(d.CreatedAt()); setup > 0 {
+				event.SetupMs = int(setup / time.Millisecond)
+			}
+		}
+
+	case dialog.EventHeld, dialog.EventResumed:
+		// The far end's DECLARED direction, read back off the dialog rather than re-parsed from the
+		// body: internal/dialog already committed it, and parsing the same bytes twice is two chances
+		// to disagree about whether a call is on hold.
+		event.Direction = d.RemoteDirection()
+
+	case dialog.EventTerminated:
+		event.Cause = effect.Cause
+		event.Termination = effect.Termination
+		event.Initiator = d.Initiator()
+		event.CauseFromReasonHeader = d.CauseFromReasonHeader()
+		if answered := d.AnsweredAt(); !answered.IsZero() {
+			ended := d.EndedAt()
+			if ended.IsZero() {
+				ended = now
+			}
+			if billed := ended.Sub(answered); billed > 0 {
+				event.AnsweredForSeconds = int(billed / time.Second)
+			}
+		}
+	}
+	return event
 }
 
 // respondToInvite writes a response on the INVITE server transaction.

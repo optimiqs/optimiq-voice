@@ -72,6 +72,11 @@ type golden struct {
 		Token string `json:"token"`
 	} `json:"aorSubjectTokens"`
 
+	InstanceSubjectTokens []struct {
+		InstanceID string `json:"instanceId"`
+		Token      string `json:"token"`
+	} `json:"instanceSubjectTokens"`
+
 	DIDIndexTokens []struct {
 		DID   string `json:"did"`
 		Token string `json:"token"`
@@ -163,6 +168,7 @@ func TestParityConstants(t *testing.T) {
 	roots := map[string]string{
 		"call":         SubjectRootCall,
 		"registration": SubjectRootRegistration,
+		"sipDialog":    SubjectRootSIPDialog,
 		"queue":        SubjectRootQueue,
 		"voicemail":    SubjectRootVoicemail,
 		"media":        SubjectRootMedia,
@@ -184,6 +190,12 @@ func TestParityConstants(t *testing.T) {
 		"pbxFileGreeting":         SubjectFileGreetingRPC,
 		"sipCredential":           SubjectSipCredentialRPC,
 		"sipTransfer":             SubjectSipTransferRPC,
+		"sipInvite":               SubjectSipInviteRPC,
+		"sipRing":                 SubjectSipRingRPC,
+		"sipAnswer":               SubjectSipAnswerRPC,
+		"sipHangup":               SubjectSipHangupRPC,
+		"sipReinvite":             SubjectSipReinviteRPC,
+		"sipOriginate":            SubjectSipOriginateRPC,
 		"mediaAllocateSession":    SubjectMediaAllocateSessionRPC,
 		"mediaBridgeSessions":     SubjectMediaBridgeSessionsRPC,
 		"mediaUnbridgeSessions":   SubjectMediaUnbridgeSessionsRPC,
@@ -225,6 +237,25 @@ func TestParityAORSubjectToken(t *testing.T) {
 	}
 }
 
+func TestParityInstanceSubjectToken(t *testing.T) {
+	for _, tc := range loadGolden(t).InstanceSubjectTokens {
+		token, err := InstanceSubjectToken(tc.InstanceID)
+		if err != nil {
+			t.Errorf("InstanceSubjectToken(%q): %v", tc.InstanceID, err)
+			continue
+		}
+		if token != tc.Token {
+			// A Go/TS disagreement here is a command published to a subject nobody subscribes: the
+			// engine addresses rpc.sip.v1.<verb>.<tok> and apps/sipd listens on a different <tok>.
+			t.Errorf("InstanceSubjectToken(%q) = %q, golden %q", tc.InstanceID, token, tc.Token)
+		}
+	}
+
+	if _, err := InstanceSubjectToken("   "); err == nil {
+		t.Error("InstanceSubjectToken(blank) should reject: an empty instance id has no token")
+	}
+}
+
 func TestParityDIDIndexToken(t *testing.T) {
 	for _, tc := range loadGolden(t).DIDIndexTokens {
 		tok, err := DIDIndexToken(tc.DID)
@@ -251,6 +282,8 @@ func TestParitySubjectBuilders(t *testing.T) {
 			got = must(CallSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "registration":
 			got = must(RegistrationSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
+		case "sipDialog":
+			got = must(SIPDialogSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "queue":
 			got = must(QueueSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "voicemail":
@@ -297,6 +330,12 @@ func TestParitySubjectFilters(t *testing.T) {
 			got = must(RegistrationsForAORFilter(tc.Args[0], tc.Args[1]))
 		case "registrationEventInOrg":
 			got = must(RegistrationEventInOrgFilter(tc.Args[0], tc.Args[1]))
+		case "allSipDialogs":
+			got = AllSIPDialogsFilter()
+		case "sipDialogsInOrg":
+			got = must(SIPDialogsInOrgFilter(tc.Args[0]))
+		case "sipDialog":
+			got = must(SIPDialogFilter(tc.Args[0], tc.Args[1]))
 		case "allQueues":
 			got = AllQueuesFilter()
 		case "queuesInOrg":
@@ -413,6 +452,12 @@ func TestParityKVKeys(t *testing.T) {
 			got, err = QueueWaitingKVKey(tc.Args[0], tc.Args[1])
 		case "mediaSession":
 			got, err = MediaSessionKVKey(tc.Args[0])
+		case "sipDialog":
+			got, err = SIPDialogKVKey(tc.Args[0])
+		case "trunk":
+			got, err = TrunkKVKey(tc.Args[0], tc.Args[1])
+		case "sipAcl":
+			got, err = SIPACLKVKey(tc.Args[0])
 		default:
 			t.Fatalf("golden names KV key builder %q, which this package does not implement", tc.Builder)
 		}

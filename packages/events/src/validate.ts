@@ -7,6 +7,7 @@ import { mediaEventSchema } from "./schemas/media-events";
 import { provisionEventSchema } from "./schemas/provision-events";
 import { queueEventSchema } from "./schemas/queue-events";
 import { registrationEventSchema } from "./schemas/registration-events";
+import { sipDialogEventSchema } from "./schemas/sip-dialog-events";
 import { trunkEventSchema } from "./schemas/trunk-events";
 import { voicemailEventSchema } from "./schemas/voicemail-events";
 import { parseSubject, type EventFamily } from "./subjects";
@@ -24,6 +25,7 @@ import type { EventValidationError } from "./errors";
 export const EVENT_SCHEMAS_BY_FAMILY = {
 	call: callEventSchema,
 	registration: registrationEventSchema,
+	sipDialog: sipDialogEventSchema,
 	queue: queueEventSchema,
 	voicemail: voicemailEventSchema,
 	media: mediaEventSchema,
@@ -39,6 +41,7 @@ export type EventSchemasByFamily = typeof EVENT_SCHEMAS_BY_FAMILY;
 export const anyEventSchema = z.union([
 	callEventSchema,
 	registrationEventSchema,
+	sipDialogEventSchema,
 	queueEventSchema,
 	voicemailEventSchema,
 	mediaEventSchema,

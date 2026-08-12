@@ -13,6 +13,7 @@ import (
 
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/credentials"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/dialog"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/kv"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/profile"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/registrar"
 )
@@ -41,29 +42,70 @@ type Responder interface {
 
 // EventSink publishes one `sip.evt.v1` event.
 //
-// # Why this is an interface with a logging default
+// # Why this is still an interface now that the contract exists
 //
-// The subject family, its schemas, the SIP stream and the `sipd` user's grant for it are all in
-// packages/events, packages/events-go and config/nats.conf — none of which is this module's to add
-// (design §10.2 and §10.5 specify all four). So the seam is here, the default implementation logs
-// at info with every field the event would carry, and the day the contract lands this becomes a
-// JetStream publisher of forty lines. Nothing silently drops: an event that cannot be published is
-// visible in the log with the same fields it would have had on the wire.
+// It was a seam because the subject family did not exist. It stays a seam for a different and more
+// durable reason: a deployment with no broker — the SIPp rig, an integration test, a laptop — must
+// still be able to run the INVITE path, and the honest behaviour there is a log line carrying every
+// field the event would have had rather than a publish that fails on every call. LogEventSink is
+// that; PublishingSink (publisher.go) is the production one, and it builds the contract's own
+// envelopes so the subject and the payload cannot disagree with the TypeScript consumer.
 type EventSink interface {
 	Publish(ctx context.Context, event Event) error
 }
 
-// Event is one dialog event, ready for the envelope it does not yet have.
+// Event is one dialog event, in this package's vocabulary rather than the contract's.
+//
+// # Why a struct of our own and not the generated payload
+//
+// Six generated payloads with no common interface cannot be produced by one effect handler, and a
+// handler that switched on the event kind to build six different structs would put the contract's
+// shape inside the executor — where a schema change becomes an edit to the code that writes 200 OK
+// to a socket. So the executor fills ONE struct from the dialog, and the mapping onto six envelopes
+// lives in one file next door (publisher.go) that touches no transaction and no timer.
+//
+// Every field is either on the dialog or on the effect that produced the event. Nothing here is
+// inferred.
 type Event struct {
-	Kind        dialog.DialogEvent
-	LegID       string
-	OrgID       string
-	CallID      string
-	SIPCallID   string
-	Cause       int
-	Termination dialog.TerminationReason
-	Detail      string
-	At          time.Time
+	Kind      dialog.DialogEvent
+	LegID     string
+	OrgID     string
+	CallID    string
+	SIPCallID string
+	// LocalTag and RemoteTag complete the dialog triple the contract carries as `identity`. It is a
+	// LOOKUP KEY on the far side and never an authorisation — the rule
+	// `sipTransferRequestSchema.sipCallId` states — and it travels so a packet capture can be lined
+	// up against a leg id nothing on the wire contains.
+	LocalTag  string
+	RemoteTag string
+	// Role is which end of the INVITE we are, and it is what makes `dialog.answered` mean two
+	// different moments without ambiguity: the ACK for a UAS leg, the 2xx for a UAC one.
+	Role dialog.Role
+	// Status is the SIP status that produced the event, for `progressed` and `terminated`.
+	Status int
+	// HasEarlyMedia and SDPAnswer describe a 183 that committed an answer.
+	HasEarlyMedia bool
+	SDPAnswer     string
+	// Direction is the media direction a hold or a resume moved the far end to.
+	Direction dialog.Direction
+	// Cause, Termination, Initiator and CauseFromReasonHeader are the terminal event's four
+	// independent facts: why, how, who, and whether the why was stated or derived.
+	Cause                 int
+	Termination           dialog.TerminationReason
+	Initiator             dialog.Initiator
+	CauseFromReasonHeader bool
+	// SetupMs is the time from the INVITE to the answer — the post-dial-delay number, measured on
+	// the only plane that can see both ends of it.
+	SetupMs int
+	// AnsweredForSeconds is billsec, counted from the moment the call was genuinely up in this
+	// role rather than from when a bridge happened to be built.
+	AnsweredForSeconds int
+	// Digit and DurationMs carry a SIP INFO keypress. RFC 4733 in-band digits are the media plane's.
+	Digit      string
+	DurationMs int
+	// Detail is free text for the log. It never reaches the wire.
+	Detail string
+	At     time.Time
 }
 
 // LogEventSink is the default EventSink: one structured log line per event.
@@ -83,10 +125,13 @@ func (s LogEventSink) Publish(_ context.Context, event Event) error {
 		"orgId", event.OrgID,
 		"callId", event.CallID,
 		"sipCallId", event.SIPCallID,
+		"role", event.Role.String(),
+		"status", event.Status,
 		"cause", event.Cause,
 		"termination", string(event.Termination),
+		"initiator", string(event.Initiator),
 		"detail", event.Detail,
-		"unpublished", "sip.evt.v1 has no contract yet; see the wave report")
+		"unpublished", "no JetStream publisher is wired; run with a broker to publish sip.evt.v1")
 	return nil
 }
 
@@ -112,6 +157,17 @@ type Options struct {
 	Port Port
 	// Requester sends the BYEs, ACKs and CANCELs this edge originates.
 	Requester Requester
+	// Caller places the INVITEs this edge originates. Optional: without it `rpc.sip.v1.originate` is
+	// refused `not_supported` by name, which is the honest answer for a deployment wired without a
+	// SIP client — and a better one than a nil dereference on the first outbound call.
+	Caller Caller
+	// Bindings is the location service, read to resolve a `{kind:"aor"}` originate. Optional, and
+	// its absence refuses those originates rather than failing the whole handler: an inbound-only
+	// deployment is a real configuration.
+	Bindings kv.Store
+	// Trunks is the carrier directory, read to resolve a `{kind:"trunk"}` originate. Optional on the
+	// same argument.
+	Trunks TrunkDirectory
 	// Responder retransmits a 2xx until it is ACKed.
 	Responder Responder
 	// Events publishes the dialog family.
@@ -175,6 +231,9 @@ type Handler struct {
 	profiles  *profile.Set
 	port      Port
 	requester Requester
+	caller    Caller
+	bindings  kv.Store
+	trunks    TrunkDirectory
 	responder Responder
 	events    EventSink
 	contact   sip.Uri
@@ -264,6 +323,9 @@ func New(opts Options) (*Handler, error) {
 		profiles:      opts.Profiles,
 		port:          opts.Port,
 		requester:     opts.Requester,
+		caller:        opts.Caller,
+		bindings:      opts.Bindings,
+		trunks:        opts.Trunks,
 		responder:     opts.Responder,
 		events:        opts.Events,
 		contact:       opts.Contact,
@@ -681,11 +743,13 @@ func (h *Handler) HandleBye(req *sip.Request, tx sip.ServerTransaction) {
 	h.withLeg(target.LegID, func(session *dialog.Session, state *legState) {
 		ctx, cancel := context.WithTimeout(h.baseCtx, 5*time.Second)
 		defer cancel()
+		cause, stated := causeOfBye(req)
 		_, err := session.Do(ctx, func(d *dialog.Dialog) (dialog.Outcome, error) {
 			state.pending, state.pendingTx = req, tx
 			return d.Apply(dialog.Input{
-				Trigger: dialog.TriggerRemoteBye,
-				Cause:   causeOfBye(req),
+				Trigger:               dialog.TriggerRemoteBye,
+				Cause:                 cause,
+				CauseFromReasonHeader: stated,
 			})
 		})
 		if err != nil {
@@ -817,13 +881,18 @@ func (h *Handler) HandleInfo(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	h.log.Info("dtmf", "legId", target.LegID, "digit", digit, "durationMs", duration)
 	h.publish(Event{
-		Kind:      dialog.EventDTMF,
-		LegID:     target.LegID,
-		OrgID:     target.OrgID,
-		CallID:    target.CallID,
-		SIPCallID: target.Identity.SIPCallID,
-		Detail:    digit,
-		At:        h.now(),
+		Kind:       dialog.EventDTMF,
+		LegID:      target.LegID,
+		OrgID:      target.OrgID,
+		CallID:     target.CallID,
+		SIPCallID:  target.Identity.SIPCallID,
+		LocalTag:   target.Identity.LocalTag,
+		RemoteTag:  target.Identity.RemoteTag,
+		Role:       target.Role,
+		Digit:      digit,
+		DurationMs: duration,
+		Detail:     digit,
+		At:         h.now(),
 	})
 	h.respond(tx, req, statusOK, "OK")
 }
@@ -1006,13 +1075,18 @@ func (h *Handler) send(tx sip.ServerTransaction, res *sip.Response) {
 // causeOfBye reads the RFC 3326 Reason header off a BYE, which is the only way to learn WHY the
 // far end hung up. Absent means normal clearing, because that is what a BYE means when nobody says
 // otherwise.
-func causeOfBye(req *sip.Request) int {
+//
+// The second result says the cause was STATED rather than assumed, and it travels all the way to
+// `dialog.terminated.causeFromReasonHeader`. It is not bookkeeping: a stated cause is better
+// evidence than a derived one, and when two CDRs for one call disagree, the one whose cause the far
+// end put on the wire is the one to believe.
+func causeOfBye(req *sip.Request) (cause int, stated bool) {
 	for _, header := range req.GetHeaders("Reason") {
 		if cause, found := dialog.CauseFromReason(header.Value()); found {
-			return cause
+			return cause, true
 		}
 	}
-	return dialog.CauseNormalClearing
+	return dialog.CauseNormalClearing, false
 }
 
 func retryAfterDetail(after time.Duration) string {

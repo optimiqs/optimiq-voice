@@ -74,6 +74,7 @@ export {
 	isEventName,
 	isQueueEvent,
 	isRegistrationEvent,
+	isSipDialogEvent,
 	isSubjectToken,
 	isMediaSessionEvent,
 	isTrunkEvent,
@@ -86,6 +87,7 @@ export {
 	QUEUE_SCOPE_ALL,
 	REGISTRATION_EVENTS,
 	RPC_SUBJECTS,
+	SIP_DIALOG_EVENTS,
 	SUBJECT_ROOTS,
 	SUBJECT_VERSION,
 	subjectFilterFor,
@@ -100,6 +102,7 @@ export {
 	type ParsedSubject,
 	type QueueEvent,
 	type RegistrationEvent,
+	type SipDialogEvent,
 	type TrunkEvent,
 	type VoicemailEvent,
 } from "./subjects";

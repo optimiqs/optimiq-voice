@@ -96,6 +96,23 @@ type Config struct {
 	// (`kind: "ip-auth"` in the schema). For those this machine stays at StateUnregistered
 	// forever, and that is the correct state rather than a failure.
 	Register bool
+	// Kind is the carrier's authentication shape: `register` (we send REGISTER with a digest
+	// credential) or `ip-auth` (the carrier authenticates our source IP). It mirrors the column, and
+	// it is what Register below is derived from at ingestion.
+	Kind string
+	// SIPDomain is the domain presented in From and To — usually the carrier's realm. It is NOT our
+	// own: a carrier that does not recognise the domain in a From refuses the INVITE, usually with a
+	// bare 403 and no explanation.
+	SIPDomain string
+	// SIPProxy is where INVITEs go, as a host or host:port.
+	//
+	// Distinct from Registrar, and the two are separated because the columns are: a carrier may take
+	// registrations at one address and calls at another, and collapsing them works right up until the
+	// first carrier that does not.
+	SIPProxy string
+	// Transport is the transport to use, lower-cased. Empty means "let the stack decide", which in
+	// practice is UDP.
+	Transport string
 	// Registrar is where the REGISTER goes, as a host or host:port.
 	Registrar string
 	// SecondaryRegistrar is the failover target. Empty means there is none, and a failing trunk

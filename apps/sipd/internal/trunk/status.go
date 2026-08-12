@@ -13,18 +13,31 @@ import (
 
 // Publisher emits `trunk.status.changed`.
 //
-// # What is here and what is not
+// # Both halves now exist
 //
-// The EVENT exists: `TrunkStatusChangedData` is generated in packages/events-go, the subject
-// builder is `TrunkSubject`, and the TRUNKS stream carries it to "the pbx writer" that owns the
-// `trunk.status*` columns. What does NOT exist is a grant: the `sipd` user in config/nats.conf may
-// publish `sip.reg.v1.>` and two RPC subjects and nothing else, so a publish onto `trunk.evt.v1.>`
-// from this process is an authorization violation today.
+// The EVENT was always there: `TrunkStatusChangedData` is generated in packages/events-go, the
+// subject builder is `TrunkSubject`, and the TRUNKS stream carries it to the pbx writer that owns
+// the `trunk.status*` columns. What was missing was a GRANT — the `sipd` user could publish
+// `sip.reg.v1.>` and two RPC subjects and nothing else, so a publish onto `trunk.evt.v1.>` from this
+// process was an authorization violation. That grant is part of this wave, and JetStreamPublisher
+// is now the DEFAULT wherever a broker is present (see cmd/sipd).
 //
-// So the interface has two implementations. The JetStream one is correct and will work the moment
-// the grant is added; the logging one is the default, and it prints exactly what would have been
-// published. A deployment therefore either publishes or says loudly that it cannot — it never
-// silently drops a carrier outage.
+// LogPublisher stays, and not as a vestige. A deployment without a broker — the SIPp rig, an
+// integration run, a laptop — still has a registration state machine that changes state, and the
+// honest behaviour there is one line per transition carrying every field the event would have had.
+// So a deployment either publishes or says loudly that it cannot; it never silently drops a carrier
+// outage.
+//
+// # The subject is derived, not hand-composed
+//
+// Every family this edge publishes has a named constructor in packages/events-go that derives the
+// subject from the payload — `NewRegistrationRegisteredEnvelope`, `NewSIPDialogTerminatedEnvelope` —
+// and the trunk family now has `NewTrunkStatusChangedEnvelope` too. statusEnvelope below builds its
+// payload and hands it to that constructor rather than composing `TrunkSubject` and `NewEnvelope` by
+// hand, so the subject and the payload cannot name different trunks: the constructor is the single
+// place that pairs them. The trunk id is a PARAMETER there rather than a payload field, because the
+// facts that changed (status, reason, endpoint) are the payload and the identity is the subject's
+// job — see the constructor's own note.
 type Publisher interface {
 	StatusChanged(ctx context.Context, trunk Config, status Status, reason string) error
 }
@@ -83,10 +96,6 @@ func statusEnvelope(
 	source string,
 	at time.Time,
 ) (contract.Envelope[contract.TrunkStatusChangedData], error) {
-	subject, err := contract.TrunkSubject(trunk.OrgID, trunk.TrunkID, contract.EventTypeTrunkStatusChanged)
-	if err != nil {
-		return contract.Envelope[contract.TrunkStatusChangedData]{}, err
-	}
 	value := contract.TrunkStatusChangedStatus(status)
 	if !value.Valid() {
 		return contract.Envelope[contract.TrunkStatusChangedData]{},
@@ -101,17 +110,23 @@ func statusEnvelope(
 		copied := endpoint
 		data.Endpoint = &copied
 	}
-	return contract.NewEnvelope(contract.EventTypeTrunkStatusChanged,
+	// The constructor derives trunk.evt.v1.<orgId>.<trunkId>.status.changed from OrgID + trunkID and
+	// pairs it with this payload, so a subject and a body about different trunks cannot be built.
+	return contract.NewTrunkStatusChangedEnvelope(trunk.TrunkID,
 		contract.EnvelopeInput[contract.TrunkStatusChangedData]{
-			OrgID:   trunk.OrgID,
-			Subject: subject,
-			Source:  source,
-			At:      at,
-			Data:    data,
-		}), nil
+			OrgID:  trunk.OrgID,
+			Source: source,
+			At:     at,
+			Data:   data,
+		})
 }
 
-// LogPublisher prints what it would have published. It is the default until the NATS grant exists.
+// LogPublisher prints what it would have published.
+//
+// It is the fallback for a deployment with no broker, not the default any more. Everything the
+// JetStream publisher would have put on the wire is in the log line, including the subject, so a
+// developer running without NATS can still see that a trunk went down and can still check the
+// subject is the one they expect.
 type LogPublisher struct{ Log *slog.Logger }
 
 var _ Publisher = LogPublisher{}
@@ -133,7 +148,7 @@ func (p LogPublisher) StatusChanged(_ context.Context, trunk Config, status Stat
 		"status", string(status),
 		"reason", reason,
 		"subject", subject,
-		"unpublished", "the sipd NATS user has no trunk.evt.v1 grant; see the wave report")
+		"unpublished", "no broker is configured; run with NATS to publish trunk.evt.v1")
 	return nil
 }
 

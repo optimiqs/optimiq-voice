@@ -19,6 +19,7 @@ import type { CallEventPublisher } from "../nats/call-event-publisher.service";
 import type { JetStreamService } from "../nats/jetstream.service";
 import type { OriginateCallPath, OriginateService } from "../nats/originate.service";
 import type { ParkHandoffService } from "../nats/park-handoff.service";
+import type { SipInviteCallPath, SipInviteService } from "../nats/sip-invite.service";
 import type { SipTransferCallPath, SipTransferService } from "../nats/sip-transfer.service";
 import type { DidIndexSource } from "../routing/did-index.source";
 import type { ExtensionFeatureRpcPort } from "../routing/extension-feature.source";
@@ -157,6 +158,35 @@ function fakeOriginate(): {
 		attached: () => {
 			if (attached === undefined) {
 				throw new Error("the orchestrator attached no originate call path");
+			}
+			return attached;
+		},
+	};
+}
+
+/**
+ * A sip-invite responder that keeps the call path instead of serving it.
+ *
+ * The same arrangement as {@link fakeOriginate} above. The broker half — framing, the toll-fraud
+ * refusal, the Replaces gate — is proven in `nats/sip-invite.service.spec.ts` with a fake call path;
+ * this is the other side of the seam, and having it here is what lets a spec admit a call the way
+ * `apps/sipd` does.
+ */
+function fakeSipInvite(): {
+	readonly service: SipInviteService;
+	readonly attached: () => SipInviteCallPath;
+} {
+	let attached: SipInviteCallPath | undefined;
+	const service = {
+		attach: (callPath: SipInviteCallPath) => {
+			attached = callPath;
+		},
+	} as unknown as SipInviteService;
+	return {
+		service,
+		attached: () => {
+			if (attached === undefined) {
+				throw new Error("the orchestrator attached no sip invite call path");
 			}
 			return attached;
 		},
@@ -362,6 +392,7 @@ function harness(options: HarnessOptions = {}) {
 
 	const sipTransfer = fakeSipTransfer();
 	const originate = fakeOriginate();
+	const sipInvite = fakeSipInvite();
 
 	const orchestrator = new ChannelOrchestrator(
 		env,
@@ -387,6 +418,7 @@ function harness(options: HarnessOptions = {}) {
 		NO_PARK_HANDOFF,
 		sipTransfer.service,
 		originate.service,
+		sipInvite.service,
 	);
 
 	holder.orchestrator = orchestrator;

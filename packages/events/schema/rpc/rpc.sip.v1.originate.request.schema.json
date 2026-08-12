@@ -1,0 +1,83 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"legId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"orgId": {
+			"type": "string",
+			"format": "uuid",
+			"pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+		},
+		"callId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"target": {
+			"type": "object",
+			"properties": {
+				"kind": {
+					"type": "string",
+					"enum": ["aor", "trunk", "uri"]
+				},
+				"aor": {
+					"type": "string",
+					"minLength": 3,
+					"maxLength": 512
+				},
+				"trunkId": {
+					"type": "string",
+					"format": "uuid",
+					"pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+				},
+				"number": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 128
+				},
+				"uri": {
+					"type": "string",
+					"minLength": 3,
+					"maxLength": 1024
+				}
+			},
+			"required": ["kind"],
+			"additionalProperties": false
+		},
+		"callerIdNumber": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"callerIdName": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"sdpOffer": {
+			"type": "string",
+			"maxLength": 16384
+		},
+		"ringTimeoutMs": {
+			"type": "integer",
+			"minimum": 1000,
+			"maximum": 600000
+		},
+		"headers": {
+			"type": "object",
+			"propertyNames": {
+				"type": "string",
+				"maxLength": 64
+			},
+			"additionalProperties": {
+				"type": "string",
+				"maxLength": 512
+			}
+		}
+	},
+	"required": ["legId", "orgId", "callId", "target", "sdpOffer"],
+	"additionalProperties": false
+}

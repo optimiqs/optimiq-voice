@@ -30,11 +30,12 @@ var (
 // the far end which host to send mid-dialog requests to (design §6.1). A second process cannot
 // receive the BYE and cannot retransmit the 2xx, so there is nothing to distribute.
 //
-// What IS distributed is a CLAIM — one record per dialog in a `sip-dialogs` KV bucket, carrying a
+// What IS distributed is a CLAIM — one record per dialog in the `sip-dialogs` KV bucket, carrying a
 // lease its owner heartbeats (design §6.2). The claim exists for exactly one job: reaping. When an
 // instance dies, a survivor finds the expired claims and publishes the terminations their owner
 // never got to, so the engine writes CDR rows for calls that ended when a pod was rescheduled.
-// It is NOT failover; nothing can fail a dialog over.
+// It is NOT failover; nothing can fail a dialog over. See ClaimStore below, and internal/reaper for
+// the sweep that reads it.
 //
 // # Ownership
 //
@@ -345,13 +346,18 @@ func (s *Store) Claims() []Claim {
 
 // ClaimStore is the `sip-dialogs` bucket, as an interface.
 //
-// # Why this is an interface with a memory implementation today
+// # Why this is an interface now that the bucket exists
 //
 // The bucket DEFINITION — its name, TTL, storage and limits — belongs in packages/events-go
 // alongside every other one, so sipd cannot disagree with the TypeScript services about what it is
-// talking to (the rule internal/kv states). That definition does not exist yet and is not this
-// module's to add. So the seam is here, the memory implementation backs the tests and a
-// single-instance deployment, and the NATS one is a forty-line file the moment the contract lands.
+// talking to (the rule internal/kv states). It has LANDED, as `contract.SIPDialogsKV` plus
+// `contract.SIPDialogKVKey`, and NATSClaimStore in claims.go is the implementation.
+//
+// The seam stays for the reason internal/kv's own MemoryStore stays: the unit suite runs with no
+// broker and no socket, and a claim store that could only be a bucket would make every dialog test
+// an integration test. MemoryClaimStore is therefore still here and still NOT a deployment option
+// for more than one instance — a claim only one process can see reaps nothing, which is the one
+// thing the bucket exists for.
 //
 // Every method takes a context because the real one is network I/O on a shutdown path.
 type ClaimStore interface {

@@ -30,9 +30,12 @@ jobs:
         with:
           go-version: "1.26.x"
 
+      # apps/mediad is named here alongside the other two. Its `paths` filter above already brought
+      # this workflow to life on a mediad change; the steps then checked everything except the module
+      # that changed, which is the worst shape a gate can have — green, and about the wrong code.
       - name: Verify formatting
         run: |
-          unformatted="$(gofmt -l ./apps/sipd ./packages/events-go)"
+          unformatted="$(gofmt -l ./apps/sipd ./apps/mediad ./packages/events-go)"
           if [ -n "$unformatted" ]; then
             echo "gofmt would rewrite these files:" >&2
             echo "$unformatted" >&2
@@ -41,11 +44,17 @@ jobs:
 
       # `./...` from the workspace root is not a module path; the modules are named explicitly.
       - name: Vet
-        run: go vet ./apps/sipd/... ./packages/events-go/...
+        run: go vet ./apps/sipd/... ./apps/mediad/... ./packages/events-go/...
 
       # Integration suites need docker and are gated twice (build tag + env var), so they run here
       # explicitly rather than as a side effect of `go test ./...`.
       - name: Integration tests
         env:
           RUN_SIPD_INTEGRATION: "1"
-        run: go test -tags integration -timeout 10m ./apps/sipd/...
+        run: go test -tags integration -timeout 10m ./apps/mediad/... ./apps/sipd/...
+        # apps/mediad is in the package list and has no `integration`-tagged files today, so this
+        # runs its ordinary tests a second time — cheap, and it means a mediad integration suite is
+        # covered by the gate on the day it is WRITTEN rather than on the day somebody remembers to
+        # add it here. Named alongside sipd rather than given its own step precisely because there
+        # is no second gate variable to set: `RUN_SIPD_INTEGRATION` guards sipd's own files, and
+        # inventing a `RUN_MEDIAD_INTEGRATION` that nothing reads would be a lie in a config file.

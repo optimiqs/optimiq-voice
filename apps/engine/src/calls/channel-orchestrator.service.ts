@@ -19,6 +19,7 @@ import { OriginateService } from "../nats/originate.service";
 import { ParkHandoffService } from "../nats/park-handoff.service";
 import { SessionAnnounceService } from "../nats/session-announce.service";
 import { SessionVerbService } from "../nats/session-verb.service";
+import { SipInviteService } from "../nats/sip-invite.service";
 import { SipTransferService } from "../nats/sip-transfer.service";
 import { AgentStateStore } from "../queue/agent-state.store";
 import { QueueEventPublisher } from "../queue/queue-event-publisher.service";
@@ -51,9 +52,11 @@ import {
 	callIdForAriChannel,
 	legIdForAriChannel,
 	normalizeSipCallId,
+	REPLACES_LEG_ID_VARIABLE,
 	resolveOrganizationId,
 	SIP_CALL_ID_CHANNEL_FUNCTION,
 	SIP_CALL_ID_VARIABLE,
+	SIPD_INSTANCE_ID_VARIABLE,
 } from "./channel-identity";
 import { ChannelRegistry } from "./channel-registry";
 import { MidCallFeatureRuntime } from "./mid-call-features";
@@ -63,6 +66,7 @@ import type { MediaChannelSnapshot, MediaEvent } from "../media/media-event";
 import type { MediaDirection, MediaPort } from "../media/media-port";
 import type { ConferenceControlOutcome } from "../nats/conference-control.service";
 import type { OriginatePlacement } from "../nats/originate.service";
+import type { SipInviteAdmission, SipReplacesAuthorization } from "../nats/sip-invite.service";
 import type { ConferenceMember } from "../routing/conference-registry";
 import type { PlanDestination } from "../routing/plan-destination";
 import type {
@@ -92,6 +96,7 @@ import type {
 	ConferenceControlRequest,
 	LegSide,
 	OriginateRequest,
+	SipInviteRequest,
 } from "@optimiq-voice/events";
 import type {
 	ExecutionPlan,
@@ -269,6 +274,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		private readonly parkHandoff: ParkHandoffService,
 		private readonly sipTransfer: SipTransferService,
 		private readonly originate: OriginateService,
+		private readonly sipInvite: SipInviteService,
 		/**
 		 * Optional, and LAST, so the spec harnesses — which construct this class positionally and
 		 * never feed it a trunk transition — need not fake a publisher. The deployed module always
@@ -369,6 +375,13 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		// Click-to-call, arriving from `apps/api` on `rpc.engine.v1.originate`. Same push, same reason.
 		this.originate.attach({
 			place: async (request) => await this.placeOriginatedCall(request),
+		});
+		// A call arriving on the SIP edge, asking to be admitted. Same push, same reason — and the one
+		// place on this list where the responder decides something before the call path is asked: the
+		// toll-fraud check on `routingContext` is `SipInviteService`'s, because it needs no call.
+		this.sipInvite.attach({
+			authorizeReplaces: async (request) => await this.authorizeInviteReplaces(request),
+			admit: async (request) => await this.placeInvitedCall(request),
 		});
 		// The session protocol. Built here rather than injected for the reason `CallControl` is: it
 		// needs the verb executor and the channel registry, both of which are this class's, and a
@@ -831,6 +844,18 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		await this.jetstream.putChannel(aggregate.snapshot);
 
 		aggregate.transitionTo("executing");
+
+		// A third program, chosen by a channel variable exactly as the two below it are chosen by
+		// configuration. An INVITE carrying an authorised RFC 3891 `Replaces` has no plan to walk: it
+		// does not resolve a destination, it TAKES one that already exists. Walking a plan for it would
+		// dial the transfer target a second time, which is the failure `runReplacesProgram` is written
+		// out to avoid. Everything above this line — attribution, the ceiling, the KV claim,
+		// `channel.created`, the registry, the CDR — is the same code for all three.
+		const replacedLegId = aggregate.snapshot.variables[REPLACES_LEG_ID_VARIABLE];
+		if (replacedLegId !== undefined && replacedLegId !== "") {
+			this.startReplacesProgram(aggregate, replacedLegId);
+			return;
+		}
 
 		if (this.env.ENGINE_ROUTING_ENABLED) {
 			this.startRoutedProgram(aggregate, channel);
@@ -3175,6 +3200,27 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		channel: MediaChannelSnapshot,
 		organizationId: string,
 	): Promise<boolean> {
+		if (await this.isWithinConcurrencyCeiling(organizationId)) {
+			return true;
+		}
+		this.logger.info(
+			{ ariChannelId: channel.id, organizationId },
+			"rejecting a new call: the organization is at its simultaneous-call ceiling",
+		);
+		await this.hangupQuietly(channel.id, "SWITCH_CONGESTION");
+		return false;
+	}
+
+	/**
+	 * The quota question on its own, with no channel and no teardown.
+	 *
+	 * Split out of {@link admitWithinConcurrencyCeiling} for the SIP edge's admission RPC, which must
+	 * answer the SAME question BEFORE any leg exists: a call arriving there is refused with a reason
+	 * that becomes a `503`, and hanging up a channel that has not been created — which is what the
+	 * combined version would try to do — is both impossible and the wrong shape. Two callers, one
+	 * predicate, so a tenant's ceiling can never come to mean two different things on two planes.
+	 */
+	private async isWithinConcurrencyCeiling(organizationId: string): Promise<boolean> {
 		const artifact = await this.routing.get(organizationId).catch((error: unknown) => {
 			this.logger.warn(
 				{ organizationId, err: String(error) },
@@ -3186,18 +3232,9 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		if (ceiling === undefined) {
 			return true;
 		}
-
-		const live = this.registry.liveCountFor(organizationId);
-		if (live < ceiling) {
-			return true;
-		}
-
-		this.logger.info(
-			{ ariChannelId: channel.id, organizationId, live, ceiling },
-			"rejecting a new call: the organization is at its simultaneous-call ceiling",
-		);
-		await this.hangupQuietly(channel.id, "SWITCH_CONGESTION");
-		return false;
+		// `<` and not `<=`, for the reason `assertWithinLimit` uses in the API: the count is taken
+		// BEFORE this leg is added, so at ten of ten this one would be the eleventh.
+		return this.registry.liveCountFor(organizationId) < ceiling;
 	}
 
 	/** Hangs a channel up without letting a media-server failure become the caller's problem. */
@@ -3212,16 +3249,26 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	/**
 	 * Reads the engine's channel variables in one pass. Absent variables come back `undefined`.
 	 *
-	 * Four of the five are stored under the name they are read by. The fifth is not: the SIP
+	 * Four of the first five are stored under the name they are read by. The fifth is not: the SIP
 	 * `Call-ID` is READ from a dialplan function and STORED under an `OPTIMIQ_` name, because a
 	 * variable is what survives into the KV snapshot and what a dialplan can pre-stamp, while the
 	 * function is what the media server actually answers. Hence a pair per entry rather than a name.
+	 *
+	 * ## Two entries have no `read`, and that is the whole distinction
+	 *
+	 * The variables the SIP edge stamps — which instance holds the dialog, and which leg an authorised
+	 * `Replaces` is taking over — exist on NO media server. There is nothing to ask: `MediadMediaPort`
+	 * refuses `getVariable` outright and Asterisk has never heard of them. An entry with no `read` is
+	 * therefore inline-or-absent, which saves a round trip per call per variable on the ARI plane and,
+	 * more importantly, says what is true: these are facts the ARRIVAL carried, not facts a media
+	 * server holds. Whatever this method returns is what lands on the aggregate and in the `channels`
+	 * bucket, so a variable that is not read here is a variable a failover cannot recover.
 	 */
 	private async readEngineVariables(
 		channel: MediaChannelSnapshot,
 	): Promise<Record<string, string | undefined>> {
 		const fromEvent = channel.variables;
-		const names: readonly { readonly variable: string; readonly read: string }[] = [
+		const names: readonly { readonly variable: string; readonly read?: string }[] = [
 			{ variable: "OPTIMIQ_ORG_ID", read: "OPTIMIQ_ORG_ID" },
 			{ variable: "OPTIMIQ_CALL_DIRECTION", read: "OPTIMIQ_CALL_DIRECTION" },
 			{ variable: "OPTIMIQ_ROUTING_CONTEXT", read: "OPTIMIQ_ROUTING_CONTEXT" },
@@ -3229,14 +3276,19 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			// because it is the only thing that is true of every originated leg and of nothing else.
 			{ variable: "OPTIMIQ_LEG", read: "OPTIMIQ_LEG" },
 			{ variable: SIP_CALL_ID_VARIABLE, read: SIP_CALL_ID_CHANNEL_FUNCTION },
+			{ variable: SIPD_INSTANCE_ID_VARIABLE },
+			{ variable: REPLACES_LEG_ID_VARIABLE },
 		];
 		const entries = await Promise.all(
 			names.map(async ({ variable, read }) => {
 				// The event's variables are only populated when the media server is configured to
 				// export them with every event, so they are an optimisation, never the truth.
-				const inline = fromEvent[variable] ?? fromEvent[read];
+				const inline = fromEvent[variable] ?? (read === undefined ? undefined : fromEvent[read]);
 				if (inline !== undefined && inline !== "") {
 					return [variable, inline] as const;
+				}
+				if (read === undefined) {
+					return [variable, undefined] as const;
 				}
 				try {
 					return [variable, await this.media.getVariable(channel.id, read)] as const;
@@ -3497,6 +3549,458 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			legId: legIdForAriChannel(request.originateId),
 			endpoint: plan.endpoint,
 		};
+	}
+
+	// -------------------------------------------------------------------------------------------
+	// The SIP edge's admission path
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * Admits a call arriving on `apps/sipd`, and files it as an ORDINARY A-leg.
+	 *
+	 * ## The seam, and why it is the same one click-to-call uses
+	 *
+	 * The whole value of this path is that there is no second one. The leg is filed through
+	 * {@link onLegArrived}, which means it gets `attributeCall`'s ladder, the concurrency ceiling, the
+	 * `channels` KV claim, `channel.created`, the registry, the routing walk, the plan walker, the
+	 * teardown and the CDR — all of it the same code an Asterisk call runs. `plans/sipd-invite-design.md`
+	 * §7.1 states the requirement in one sentence: "above the seam, the engine cannot tell the
+	 * difference and must not try". A dedicated `admitSipCall` that published its own events and drove
+	 * its own state machine would have been quicker to write and would have made every later feature —
+	 * follow-me, queues, park, call blocking, time conditions — a thing that works on one plane.
+	 *
+	 * So this method's entire job is to turn an admission REQUEST into a {@link MediaChannelSnapshot}
+	 * that the arrival path already knows how to read, and to answer the questions the arrival path
+	 * cannot answer with a REASON rather than by hanging a channel up. A refused INVITE has no channel
+	 * to hang up: the reply IS the refusal, and the edge turns it into a SIP status a stranger sees.
+	 *
+	 * ## The identity decision, stated because it is subtle
+	 *
+	 * The edge minted `legId` before it asked, for the same reason `mediaAllocateSessionRequestSchema`
+	 * makes session ids caller-assigned: the engine must be able to hang up a leg whose admission
+	 * reply it never saw. That string becomes the engine's MEDIA CHANNEL ID — the key every registry,
+	 * signal, claim and KV entry is keyed by — exactly as `originateId` does for a click-to-call. The
+	 * domain leg id and call id are then DERIVED from it by `legIdForAriChannel` /
+	 * `callIdForAriChannel`, and that derivation is not decoration: it is what makes a leg id survive
+	 * an engine restart and a failover onto another replica, which a random id in a lost `Map` cannot
+	 * do. So one string names the dialog, the media session and the leg's channel, and the ids that
+	 * reach the CDR and the event subjects are the ones every other path produces.
+	 *
+	 * ## Idempotency
+	 *
+	 * On the client-assigned `legId`, exactly as the click-to-call path is on `originateId`. A retry of
+	 * an admission whose reply was lost finds a leg this instance is already tracking and is answered
+	 * with the ids of the call it already admitted. Without it, a one-second deadline against a busy
+	 * engine would file one INVITE as two calls, with two CDR rows and two routing walks racing to
+	 * dial the same extension.
+	 *
+	 * ## The driver gate, which is the cutover gate
+	 *
+	 * A leg admitted here takes its media from `mediad`: the composite `MediaPort` of §3.2 answers a
+	 * SIP INVITE by handing the offer to `rpc.media.v1.allocate-session` and putting the SDP that comes
+	 * back into `rpc.sip.v1.answer`. Asterisk cannot serve such a call at all — `apps/sipd` holds no
+	 * ARI credential, and there is no Asterisk channel for it to name, so `MediaPort.answer` would be
+	 * asked for a channel id that does not exist anywhere. That is the one illegal combination §3.5
+	 * names and refuses at boot, and until `ENGINE_SIGNALLING_DRIVER` exists to refuse it there, this
+	 * is where it is refused: per call, by name, with the deployment spelled out in the log.
+	 *
+	 * The reason is `internal`, and it was chosen over the four alternatives on purpose.
+	 * `SIP_INVITE_REFUSAL_REASONS` has no `not_supported` — deliberately, because every entry on that
+	 * list must become a SIP status a STRANGER sees, and "this deployment is misconfigured" is not
+	 * something to explain to a caller. `unattributed` and `unknown_target` are `404`s and would tell
+	 * the caller their number does not exist, sending them to check a dial string that is perfectly
+	 * correct. `congestion` is a `503` and would make a carrier fail the call over to another engine,
+	 * where the identical misconfiguration would refuse it again — a retry storm that hides the cause.
+	 * `internal` is a `500`: the caller learns the fault is ours, the carrier does not retry into it,
+	 * and the operator gets the log line below, which is the only artefact that can actually fix this.
+	 */
+	private async placeInvitedCall(request: SipInviteRequest): Promise<SipInviteAdmission> {
+		const existing = this.registry.byAriChannelId(request.legId);
+		if (existing !== undefined) {
+			// The retry path. Answered `admitted` rather than refused: the edge asked whether we would
+			// take this call and we have, which is the same outcome by any measure it can act on.
+			return {
+				kind: "admitted",
+				orgId: existing.organizationId,
+				callId: existing.callId,
+				legId: existing.channelId,
+				...(existing.snapshot.profile.context === undefined
+					? {}
+					: { routingContext: existing.snapshot.profile.context }),
+				direction: callDirectionFrom(existing.snapshot.variables.OPTIMIQ_CALL_DIRECTION),
+			};
+		}
+
+		if (this.draining || !this.registry.isAccepting) {
+			// The edge answers this one `503` WITH a `Retry-After`, which is the header that makes a
+			// carrier fail over instead of retrying into a pod that is closing.
+			return {
+				kind: "refused",
+				reason: "shutting_down",
+				error: "this engine instance is draining",
+			};
+		}
+
+		if (this.env.ENGINE_MEDIA_DRIVER !== "mediad") {
+			this.logger.error(
+				{
+					legId: request.legId,
+					sipdInstanceId: request.sipdInstanceId,
+					mediaDriver: this.env.ENGINE_MEDIA_DRIVER,
+				},
+				"refusing a call from the sip edge: this deployment signals on apps/sipd and serves media " +
+					"on Asterisk, which is the one combination plans/sipd-invite-design.md §3.5 refuses. " +
+					"apps/sipd holds no ARI credential and there is no Asterisk channel this leg could " +
+					"name, so the call would ring and never get audio. Set ENGINE_MEDIA_DRIVER=mediad, or " +
+					"point this tenant's phones and DIDs back at Asterisk.",
+			);
+			return {
+				kind: "refused",
+				reason: "internal",
+				error:
+					`this engine serves media on ${this.env.ENGINE_MEDIA_DRIVER} and cannot carry a call ` +
+					"signalled by apps/sipd",
+			};
+		}
+
+		const organizationId = await this.attributeInvitedCall(request);
+		if (organizationId === undefined) {
+			this.logger.info(
+				{ legId: request.legId, dialed: request.to.number, authentication: request.authentication },
+				"refusing a call from the sip edge: no credential organization and no did-index entry",
+			);
+			return {
+				kind: "refused",
+				reason: "unattributed",
+				error: `nothing on this platform owns ${request.to.number}`,
+			};
+		}
+
+		// Asked HERE and not left to the arrival path, because the arrival path's version hangs a
+		// channel up and there is no channel yet — the caller learns this as a `503` on their INVITE
+		// instead of as a call that connects and is dropped. Same predicate either way, so a tenant's
+		// ceiling means the same thing on both planes.
+		if (!(await this.isWithinConcurrencyCeiling(organizationId))) {
+			this.logger.info(
+				{ legId: request.legId, organizationId },
+				"refusing a call from the sip edge: the organization is at its simultaneous-call ceiling",
+			);
+			return {
+				kind: "refused",
+				reason: "congestion",
+				error: "this organization is at its simultaneous-call ceiling",
+			};
+		}
+
+		const snapshot = this.invitedChannelSnapshot(request, organizationId);
+		await this.onLegArrived(snapshot);
+
+		const aggregate = this.registry.byAriChannelId(request.legId);
+		if (aggregate === undefined) {
+			// The arrival path admitted nothing. On this path that means exactly one thing — the
+			// `channels` KV compare-and-set did not name this replica — and it is deliberately NOT
+			// reported as `congestion`: a `503` would make a carrier fail the call over, and the
+			// instance that WON the claim is already serving it, so the failover would ring the caller a
+			// second time for a call that is going through. `internal` is a `500` the edge does not
+			// retry, and the winner carries on.
+			this.logger.warn(
+				{ legId: request.legId, organizationId },
+				"the sip edge's call was not admitted locally; another replica holds the channel claim",
+			);
+			return {
+				kind: "refused",
+				reason: "internal",
+				error: "this engine could not take exclusive ownership of the leg",
+			};
+		}
+
+		return {
+			kind: "admitted",
+			orgId: aggregate.organizationId,
+			callId: aggregate.callId,
+			legId: aggregate.channelId,
+			routingContext: aggregate.snapshot.profile.context,
+			// Read off the VARIABLE and not off `snapshot.direction`, which is a different fact:
+			// `ChannelSnapshot.direction` is the SIGNALLING direction and has only two values, so
+			// `internal` maps onto `inbound` there. The edge is being told the CALL direction — what
+			// the tenant is billed for and what the plan resolved in — which is the reading every
+			// other consumer of this variable already takes.
+			direction: callDirectionFrom(aggregate.snapshot.variables.OPTIMIQ_CALL_DIRECTION),
+		};
+	}
+
+	/**
+	 * Which tenant an arriving INVITE belongs to.
+	 *
+	 * The split `plans/sipd-invite-design.md` §4.2 calls load-bearing: the EDGE owns "is this sender
+	 * allowed to send me an INVITE" — a digest against the realm's credentials, or a trunk ACL match —
+	 * and the ENGINE owns "whose call is it". So a `orgId` on the request means a digest resolved a
+	 * credential and is the strongest signal there is, exactly as `OPTIMIQ_ORG_ID` on a channel is;
+	 * everything else goes down the same `did-index` ladder every inbound call already uses, which is
+	 * the whole reason that bucket is not organization-scoped.
+	 *
+	 * Reusing {@link attributeCall} rather than writing a second ladder is not tidiness. The ladder's
+	 * ORDER is a security property — the development fallback is last on purpose, so a box with
+	 * `ENGINE_DEFAULT_ORGANIZATION_ID` set cannot answer another tenant's DID as its own — and a
+	 * second copy of it is a second place for that order to be got wrong.
+	 */
+	private async attributeInvitedCall(request: SipInviteRequest): Promise<string | undefined> {
+		return await this.attributeCall(
+			{ id: request.legId, dialedNumber: request.to.number, variables: {} },
+			// Passed as a VARIABLE rather than short-circuited above, so the entity-id validation in
+			// `resolveOrganizationId` applies to an org the edge sent exactly as it applies to one a
+			// dialplan stamped. A malformed uuid from either source must fall through to the index
+			// rather than become a tenant.
+			request.orgId === undefined ? {} : { OPTIMIQ_ORG_ID: request.orgId },
+		);
+	}
+
+	/**
+	 * The arriving INVITE as the arrival path reads it.
+	 *
+	 * Every one of the five variables `readEngineVariables` looks for is stamped here, and that is the
+	 * point rather than an optimisation. Under this plane there is no media server to read a variable
+	 * OFF — `MediadMediaPort` refuses `getVariable` because channel variables are a dialplan concept —
+	 * so the snapshot's `variables` map stops being "an OPTIMISATION, never the source of truth"
+	 * (`media-event.ts`) and becomes the only truth there is. `plans/sipd-invite-design.md` §3.4 calls
+	 * that a strengthening of the contract rather than a violation of it, and it is: the field's rule
+	 * is that the engine falls back to reading each one over the port, and here the port would read
+	 * the same map.
+	 *
+	 * `OPTIMIQ_LEG` is stamped `a` explicitly. Absent would work — the check is `=== "b"` — but a
+	 * missing variable makes `readEngineVariables` attempt a port read that this driver refuses, once
+	 * per call, for a value we already know.
+	 *
+	 * `name` is `sipd/<instance>` rather than a channel name, because there is no channel and inventing
+	 * an Asterisk-looking one would put a fiction on the CDR. What a channel name is FOR on this plane
+	 * is telling an operator which process to look in, and that is exactly what this says.
+	 */
+	private invitedChannelSnapshot(
+		request: SipInviteRequest,
+		organizationId: string,
+	): MediaChannelSnapshot {
+		// Narrowed, never widened. The responder has already refused a trunk-authenticated INVITE that
+		// asked for a trunk-capable context, so what arrives here is a context the sender may have —
+		// and a digest-authenticated one keeps it, which is what lets a desk phone dial out.
+		const routingContext = request.routingContext;
+		return {
+			id: request.legId,
+			name: `sipd/${request.sipdInstanceId}`,
+			...(request.from.name === undefined ? {} : { callerName: request.from.name }),
+			callerNumber: request.from.number,
+			dialedNumber: request.to.number,
+			context: routingContext,
+			variables: {
+				OPTIMIQ_ORG_ID: organizationId,
+				// A digest-authenticated INVITE is an extension dialling: `internal`, which takes the
+				// internal-then-outbound ladder. A trunk INVITE is a carrier delivering a DID and is
+				// resolved against the DID table, which is what `inbound` selects.
+				OPTIMIQ_CALL_DIRECTION: request.authentication === "digest" ? "internal" : "inbound",
+				OPTIMIQ_ROUTING_CONTEXT: routingContext,
+				OPTIMIQ_LEG: "a",
+				[SIP_CALL_ID_VARIABLE]: request.sipCallId,
+				// The address every later command on this leg is sent to. See `channel-identity.ts`.
+				[SIPD_INSTANCE_ID_VARIABLE]: request.sipdInstanceId,
+				...(request.replacesLegId === undefined
+					? {}
+					: { [REPLACES_LEG_ID_VARIABLE]: request.replacesLegId }),
+			},
+		};
+	}
+
+	/**
+	 * Whether the sender of an INVITE carrying `Replaces` may take over the dialog it named.
+	 *
+	 * ## What this can honestly establish, and what it cannot
+	 *
+	 * The obvious check — "is the sender a party to the call being replaced" — is WRONG here, and
+	 * getting that wrong would refuse every legitimate attended transfer there is. RFC 5589 §7 spells
+	 * the flow out: A talks to B, B consults C, B REFERs C to A with `Replaces` naming the A↔B dialog,
+	 * and **C** sends the INVITE. C was never a party to A↔B. A check for party membership would
+	 * therefore reject exactly the case the header exists for.
+	 *
+	 * What actually authorises C is RFC 3891's own model: the `Replaces` triple — `Call-ID`, `to-tag`
+	 * and `from-tag` — is a shared secret. Both tags are random tokens chosen by the two ends, so
+	 * knowing all three is evidence that a party to that dialog told you, and the RFC's security
+	 * consideration is precisely that a UAS must match all three and must not act on a partial match.
+	 * **The process that can do that match is `apps/sipd`,** because it holds the dialog and its tags —
+	 * the engine does not, and `channel-identity.ts` records why it never did on the ARI plane either:
+	 * Asterisk does not expose a PJSIP session's local and remote tags as readable values at all. So
+	 * `replacesLegId` on the request means "the triple matched, exactly, against a dialog on this
+	 * instance", and that is a fact only the edge could have produced.
+	 *
+	 * The engine's half is the half the edge cannot see:
+	 *
+	 * 1. **A digest-authenticated sender.** A trunk is refused outright. A carrier has no legitimate
+	 *    reason to replace a dialog on this platform, and giving an unauthenticated stranger a path
+	 *    into an existing conversation is the same toll-fraud boundary §8.3 draws, applied to a header
+	 *    instead of a context.
+	 * 2. **A leg this instance actually holds**, resolved by leg id and — because the arrival path
+	 *    indexes it — falling back to the SIP `Call-ID` the transfer responder already resolves on.
+	 *    Nothing on another replica: entitlement is checked where the bridge is.
+	 * 3. **The same tenant.** The triple is a secret, but a secret that leaked across an organization
+	 *    boundary must still not move a call between tenants.
+	 * 4. **`early-only`, honoured.** When the header carried the flag, replacing a CONFIRMED dialog is
+	 *    forbidden by RFC 3891 §3, and a UAS that ignored it would let a race resolve into somebody
+	 *    being cut out of a conversation they were already having.
+	 *
+	 * ## Why every failure is a refusal and never a downgrade
+	 *
+	 * Both alternatives were available and both are worse than `403`. Treating an unverifiable
+	 * `Replaces` as permission is a call-hijack primitive. Silently DROPPING it and routing the INVITE
+	 * as an ordinary call is worse still, because it looks like it worked: the transfer target rings a
+	 * second time, the transferor's consultation leg is never taken out of anything, and the party who
+	 * was supposed to be handed over is left holding a call nobody is coming back to. RFC 3891 §3 is
+	 * explicit that a UAS which cannot honour the header responds `481`/`501` rather than ignoring it.
+	 * Refusing gives the transferring phone an immediate failure it can recover the consultation from.
+	 */
+	private async authorizeInviteReplaces(
+		request: SipInviteRequest,
+	): Promise<SipReplacesAuthorization> {
+		if (request.authentication !== "digest") {
+			return {
+				kind: "refused",
+				error: "a Replaces is only honoured for a digest-authenticated sender",
+			};
+		}
+		const replaces = request.replaces;
+		const replacesLegId = request.replacesLegId;
+		if (replaces === undefined || replacesLegId === undefined) {
+			return { kind: "refused", error: "the Replaces header did not resolve to a leg at the edge" };
+		}
+
+		// Resolved by the edge's leg id ALONE. Falling back to the SIP `Call-ID` index — which the
+		// transfer responder does resolve on — was available and is refused here, because it would
+		// authorise on strictly LESS evidence than the edge already applied: a `Call-ID` match ignores
+		// both tags, and RFC 3891's whole security argument is that all three must match. A second,
+		// weaker resolution would make the stronger one decorative.
+		const replaced = this.registry.byAriChannelId(replacesLegId);
+		if (replaced === undefined || replaced.isTearingDown) {
+			return {
+				kind: "refused",
+				error: "no live leg on this engine holds the dialog that Replaces named",
+			};
+		}
+		if (request.orgId === undefined || replaced.organizationId !== request.orgId) {
+			return { kind: "refused", error: "that dialog belongs to another organization" };
+		}
+		if (replaces.earlyOnly && replaced.isAnswered) {
+			// RFC 3891 §3: `early-only` means "replace this only if it has not been answered". The
+			// header is how a UAC says "I am completing a transfer of a call that never connected", and
+			// honouring it is what stops a lost race from cutting somebody out of a live conversation.
+			return {
+				kind: "refused",
+				error: "the Replaces carried early-only and the dialog it named is already confirmed",
+			};
+		}
+
+		// The MEDIA channel id, which on this plane is the edge's own leg id — the same string
+		// {@link REPLACES_LEG_ID_VARIABLE} carries onto the new leg, so the program that completes the
+		// transfer resolves exactly the leg this ladder authorised and never a second candidate.
+		return { kind: "authorized", replacedLegId: replaced.ariChannelId };
+	}
+
+	/**
+	 * Completes an authorised `Replaces`: answer the new leg, put it where the old one was, and end
+	 * the old one.
+	 *
+	 * Detached, exactly as {@link startRoutedProgram} is and for the same reason: it awaits media
+	 * events that are delivered through the same handler that started it, so awaiting it from inside
+	 * the arrival path would make the call wait for events that cannot be processed until the call
+	 * stops waiting.
+	 *
+	 * ## Why `CallControl.bridge` does the whole job
+	 *
+	 * The replaced leg is in a bridge with its peer. `bridge` joins the new leg to the PEER's existing
+	 * bridge rather than building a second one, so for a moment the bridge has three members and the
+	 * conversation never breaks — and then the replaced leg is hung up and leaves it. That ordering is
+	 * the feature: hanging the replaced leg up FIRST would tear its bridge down under the peer and
+	 * leave the remaining party in silence for as long as the new leg took to arrive, which on a
+	 * congested media plane is exactly long enough to hang up.
+	 *
+	 * `ATTENDED_TRANSFER` is the cause on the replaced leg, so its CDR row says what happened to it
+	 * rather than reporting a `NORMAL_CLEARING` indistinguishable from the party simply hanging up.
+	 * The edge reports the same thing from its own side as `dialog.terminated{reason: "replaced"}`.
+	 */
+	private startReplacesProgram(aggregate: ChannelAggregate, replacedLegId: string): void {
+		const key = aggregate.ariChannelId;
+		const program = this.runReplacesProgram(aggregate, replacedLegId)
+			.catch(async (error: unknown) => {
+				this.logger.error(
+					{ channelId: aggregate.channelId, replacedLegId, err: String(error) },
+					"completing a Replaces failed; the call is being torn down",
+				);
+				await this.hangupQuietly(aggregate.ariChannelId, "NORMAL_TEMPORARY_FAILURE");
+			})
+			.finally(() => {
+				this.walks.delete(key);
+			});
+		// Tracked as a walk so the drain and the integration suite have the same settlement point they
+		// have for a routing walk. It is not a routing walk, but it is exactly as detached as one.
+		this.walks.set(key, program);
+	}
+
+	private async runReplacesProgram(
+		aggregate: ChannelAggregate,
+		replacedLegId: string,
+	): Promise<void> {
+		const replaced = this.controlledLegFor(replacedLegId);
+		if (replaced === undefined || replaced.isTearingDown) {
+			// Between authorisation and here the replaced call ended — the ordinary race when a
+			// transferor's consultation collapses. There is nothing to join, and routing the INVITE as a
+			// fresh call now would dial the transfer target a second time.
+			this.logger.info(
+				{ channelId: aggregate.channelId, replacedLegId },
+				"the leg a Replaces named went away before the transfer could complete",
+			);
+			await this.hangupQuietly(aggregate.ariChannelId, "ORIGINATOR_CANCEL");
+			return;
+		}
+		const peerMediaChannelId = replaced.peerMediaChannelId;
+		const peer =
+			peerMediaChannelId === undefined ? undefined : this.controlledLegFor(peerMediaChannelId);
+		if (peer === undefined) {
+			// A dialog with nobody on the other side of it: the replaced leg was in an IVR, a queue or a
+			// voicemail box rather than in a conversation. There is no seat to take, and RFC 3891 has
+			// nothing to say about replacing a party that is talking to the PBX itself.
+			this.logger.info(
+				{ channelId: aggregate.channelId, replacedLegId },
+				"the leg a Replaces named is not bridged to anybody; nothing to take over",
+			);
+			await this.hangupQuietly(aggregate.ariChannelId, "NORMAL_TEMPORARY_FAILURE");
+			return;
+		}
+
+		const answered = await this.execute(aggregate, { verb: "answer" });
+		if (answered === undefined || aggregate.isTearingDown) {
+			return;
+		}
+
+		const leg = this.controlledLegFor(aggregate.ariChannelId);
+		if (leg === undefined) {
+			return;
+		}
+		const bridged = await this.control.bridge(leg, { peerLegId: peer.legId });
+		if (!bridged.result.ok) {
+			this.logger.warn(
+				{ channelId: aggregate.channelId, replacedLegId, reason: bridged.result.reason },
+				"could not bridge a Replaces into the call it named",
+			);
+			await this.hangupQuietly(aggregate.ariChannelId, "NORMAL_TEMPORARY_FAILURE");
+			return;
+		}
+
+		// Last, and only once the new party is already in the bridge. See the method note above.
+		await this.hangupQuietly(replaced.mediaChannelId, "ATTENDED_TRANSFER");
+		this.logger.info(
+			{
+				channelId: aggregate.channelId,
+				replacedLegId,
+				peerLegId: peer.legId,
+				bridgeId: bridged.bridgeId,
+			},
+			"completed an attended transfer arriving as an INVITE with Replaces",
+		);
 	}
 }
 

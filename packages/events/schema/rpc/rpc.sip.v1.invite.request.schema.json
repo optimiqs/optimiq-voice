@@ -1,0 +1,181 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"legId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"sipdInstanceId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"orgId": {
+			"type": "string",
+			"format": "uuid",
+			"pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+		},
+		"authentication": {
+			"type": "string",
+			"enum": ["digest", "trunk-acl"]
+		},
+		"profile": {
+			"type": "string",
+			"maxLength": 64
+		},
+		"routingContext": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 64
+		},
+		"from": {
+			"type": "object",
+			"properties": {
+				"number": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 128
+				},
+				"name": {
+					"type": "string",
+					"maxLength": 128
+				},
+				"aor": {
+					"type": "string",
+					"maxLength": 512
+				},
+				"uri": {
+					"type": "string",
+					"maxLength": 1024
+				}
+			},
+			"required": ["number"],
+			"additionalProperties": false
+		},
+		"to": {
+			"type": "object",
+			"properties": {
+				"number": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 128
+				},
+				"name": {
+					"type": "string",
+					"maxLength": 128
+				},
+				"aor": {
+					"type": "string",
+					"maxLength": 512
+				},
+				"uri": {
+					"type": "string",
+					"maxLength": 1024
+				}
+			},
+			"required": ["number"],
+			"additionalProperties": false
+		},
+		"sipCallId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 256
+		},
+		"fromTag": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"trunkId": {
+			"type": "string",
+			"format": "uuid",
+			"pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+		},
+		"sourceAddress": {
+			"type": "string",
+			"maxLength": 64
+		},
+		"transport": {
+			"type": "string",
+			"enum": ["udp", "tcp", "tls", "ws", "wss"]
+		},
+		"hasOffer": {
+			"default": false,
+			"type": "boolean"
+		},
+		"sdpOffer": {
+			"type": "string",
+			"maxLength": 16384
+		},
+		"mediaHint": {
+			"type": "object",
+			"properties": {
+				"signallingSource": {
+					"type": "string",
+					"maxLength": 64
+				},
+				"advertisedMedia": {
+					"type": "string",
+					"maxLength": 64
+				},
+				"mismatch": {
+					"default": false,
+					"type": "boolean"
+				},
+				"private": {
+					"default": false,
+					"type": "boolean"
+				}
+			},
+			"required": ["mismatch", "private"],
+			"additionalProperties": false
+		},
+		"userAgent": {
+			"type": "string",
+			"maxLength": 256
+		},
+		"replaces": {
+			"type": "object",
+			"properties": {
+				"callId": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 256
+				},
+				"toTag": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 128
+				},
+				"fromTag": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 128
+				},
+				"earlyOnly": {
+					"default": false,
+					"type": "boolean"
+				}
+			},
+			"required": ["callId", "toTag", "fromTag", "earlyOnly"],
+			"additionalProperties": false
+		},
+		"replacesLegId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		}
+	},
+	"required": [
+		"legId",
+		"sipdInstanceId",
+		"authentication",
+		"routingContext",
+		"from",
+		"to",
+		"sipCallId",
+		"hasOffer"
+	],
+	"additionalProperties": false
+}

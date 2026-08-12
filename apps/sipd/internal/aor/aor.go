@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/emiago/sipgo/sip"
+	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/kv"
 )
@@ -47,9 +48,12 @@ const DefaultQ = 1.0
 // than a second vocabulary. The value the registrar writes stays backward compatible: the
 // highest-priority contact continues to populate the flat `contact`/`transport`/`sourceAddress`
 // fields that `registrationBindingSchema` defines, and the set travels alongside in `contacts`.
-// The schema is `.loose()`, so an older reader ignores the new field and keeps working — but the
-// field does need adding to the Zod schema before any reader can rely on it, and that is a
-// cross-boundary change named in the wave report rather than made here.
+//
+// `registrationBindingSchema.contacts` now EXISTS — an optional, `.loose()`, ten-element array — so
+// this is no longer a shape waiting for a contract. The two halves are written together by
+// ApplyToBinding and read together by FromBinding, and the wire type they meet at is kv.Contact.
+// The schema being `.loose()` is still what lets this struct carry `q`, `regId`, `callId` and
+// `cseq`, which the array's element does not name and this process needs to round-trip.
 type Contact struct {
 	// URI is the contact exactly as the device offered it, parameters included.
 	URI string `json:"contact"`
@@ -355,12 +359,39 @@ func ParseInstance(header *sip.ContactHeader) string {
 	return strings.Trim(strings.Trim(strings.TrimSpace(raw), `"`), "<>")
 }
 
-// FromBinding lifts the single-contact binding the registrar writes today into a one-element set.
+// FromBinding lifts a stored binding into a set.
 //
-// It is the compatibility path, and it is what makes this package deployable before the KV value
-// shape changes: a reader that finds no `contacts` array still gets a set, and every caller below
-// works on sets from day one.
+// # Two shapes, one reader
+//
+// A binding written before `contacts` existed carries one flat contact and no array; one written
+// since carries both. This function is the single place that asks which, so no caller has to — the
+// same job `contactsOf` does on the TypeScript side, and for the same reason: "does this binding
+// have a contacts array" asked at four call sites is four chances to answer it differently.
+//
+// The ARRAY wins when it is present, and the flat fields are not merged in on top of it. They are
+// a COPY of the array's head by construction (see ApplyToBinding), so merging them would either
+// change nothing or, on a binding some other writer had corrupted, silently duplicate the primary
+// contact into the fork set — and a duplicated contact is a phone that rings twice.
 func FromBinding(binding kv.Binding) Set {
+	if len(binding.Contacts) > 0 {
+		contacts := make([]Contact, 0, len(binding.Contacts))
+		for _, stored := range binding.Contacts {
+			contacts = append(contacts, Contact{
+				URI:           stored.URI,
+				Transport:     string(stored.Transport),
+				SourceAddress: stored.SourceAddress,
+				UserAgent:     stored.UserAgent,
+				Instance:      stored.Instance,
+				RegID:         stored.RegID,
+				Q:             stored.Q,
+				CallID:        stored.CallID,
+				CSeq:          stored.CSeq,
+				RegisteredAt:  stored.RegisteredAt.Time,
+				ExpiresAt:     stored.ExpiresAt.Time,
+			})
+		}
+		return Set{contacts: contacts}
+	}
 	if binding.Contact == "" {
 		return Set{}
 	}
@@ -378,24 +409,78 @@ func FromBinding(binding kv.Binding) Set {
 	}}}
 }
 
-// ApplyToBinding writes a set back onto a binding, keeping the flat fields pointed at the primary
-// contact.
+// ApplyToBinding writes a set back onto a binding: the whole set into `contacts`, and the flat
+// fields pointed at the primary.
 //
-// That is the whole backward-compatibility contract in one function: an existing reader — the
-// engine's location lookup, an admin UI's device list — sees the same `contact`, `transport` and
-// `sourceAddress` it always saw, now describing the preferred device rather than the only one, and
-// a reader that knows about the set reads the set.
+// That is the whole backward-compatibility contract in one function, and the reason it is ONE
+// function rather than two. An existing reader — the engine's location lookup, an admin UI's device
+// list — sees the same `contact`, `transport` and `sourceAddress` it always saw, now describing the
+// preferred device rather than the only one; a reader that knows about the set reads the set; and
+// the two cannot drift, because there is no code path that writes one without writing the other.
+//
+// The order written is PREFERENCE order, so `contacts[0]` is the primary and the flat fields are a
+// copy of it. A reader that wants the fork order gets it without sorting, which matters because the
+// engine's `dialSimultaneous` forks in the order it is handed and RFC 3261 §16.6's ordering is not
+// something two processes should each re-derive.
+//
+// The set is capped at ten on the way out, matching `registrationBindingSchema.contacts.max(10)`.
+// A binding that exceeded it would be REFUSED by every TypeScript reader — the whole value, not the
+// eleventh contact — so a registrar that wrote eleven would take an AOR offline rather than lose one
+// device. The cap that normally applies is SIPD_MAX_CONTACTS and is enforced by Set.Bind long
+// before this; this is the backstop that keeps the value parseable whatever happens upstream.
 func ApplyToBinding(binding kv.Binding, set Set) kv.Binding {
-	primary, found := set.Primary()
-	if !found {
+	ordered := set.Contacts()
+	if len(ordered) == 0 {
 		binding.Contact = ""
+		binding.Contacts = nil
 		return binding
 	}
+	if len(ordered) > MaxStoredContacts {
+		ordered = ordered[:MaxStoredContacts]
+	}
+
+	stored := make([]kv.Contact, 0, len(ordered))
+	for _, contact := range ordered {
+		transport := contract.SIPTransport(contact.Transport)
+		if transport == "" {
+			// The element schema requires a transport and closes the vocabulary. A contact recorded
+			// without one is a bug upstream; inheriting the binding's is the honest repair, because
+			// every contact on one AOR that this registrar wrote arrived over some transport it knew.
+			transport = binding.Transport
+		}
+		stored = append(stored, kv.Contact{
+			URI:           contact.URI,
+			Transport:     transport,
+			UserAgent:     contact.UserAgent,
+			SourceAddress: contact.SourceAddress,
+			DeviceID:      binding.DeviceID,
+			Instance:      contact.Instance,
+			RegID:         contact.RegID,
+			Q:             contact.Q,
+			CallID:        contact.CallID,
+			CSeq:          contact.CSeq,
+			RegisteredAt:  contract.EventTime{Time: contact.RegisteredAt},
+			ExpiresAt:     contract.EventTime{Time: contact.ExpiresAt},
+		})
+	}
+
+	primary := ordered[0]
 	binding.Contact = primary.URI
 	binding.SourceAddress = primary.SourceAddress
 	binding.UserAgent = primary.UserAgent
 	binding.Instance = primary.Instance
 	binding.CallID = primary.CallID
 	binding.CSeq = primary.CSeq
+	if transport := contract.SIPTransport(primary.Transport); transport != "" {
+		binding.Transport = transport
+	}
+	binding.Contacts = stored
 	return binding
 }
+
+// MaxStoredContacts is the ceiling `registrationBindingSchema.contacts` states, restated here
+// because this is the writer and a writer that exceeds a reader's bound produces a value nobody can
+// parse. Ten: an AOR with more than ten live bindings is a misconfigured provisioning run or a
+// device in a REGISTER loop, and forking to eleven endpoints is a way to ring an entire office from
+// one call rather than a feature anybody asked for.
+const MaxStoredContacts = 10

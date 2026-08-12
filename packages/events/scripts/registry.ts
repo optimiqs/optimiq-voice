@@ -8,6 +8,7 @@ import { PROVISION_EVENT_DEFINITIONS } from "../src/schemas/provision-events";
 import { QUEUE_EVENT_DEFINITIONS } from "../src/schemas/queue-events";
 import { REGISTRATION_EVENT_DEFINITIONS } from "../src/schemas/registration-events";
 import { RPC_CONTRACTS } from "../src/schemas/rpc";
+import { SIP_DIALOG_EVENT_DEFINITIONS } from "../src/schemas/sip-dialog-events";
 import {
 	agentStatusSchema,
 	bridgeModeSchema,
@@ -166,6 +167,20 @@ function registrationEntry(
 	};
 }
 
+function sipDialogEntry(
+	type: keyof typeof SIP_DIALOG_EVENT_DEFINITIONS,
+	goName: string,
+): EventEntry {
+	return {
+		family: "sipDialog",
+		type,
+		goName: `${goName}Data`,
+		goConst: `EventType${goName}`,
+		data: SIP_DIALOG_EVENT_DEFINITIONS[type].data,
+		subjectTemplate: `sip.evt.v1.<orgId>.<legId>.${type}`,
+	};
+}
+
 function queueEntry(type: keyof typeof QUEUE_EVENT_DEFINITIONS, goName: string): EventEntry {
 	return {
 		family: "queue",
@@ -263,6 +278,13 @@ export const EVENT_ENTRIES: readonly EventEntry[] = [
 	registrationEntry("registered", "RegistrationRegistered"),
 	registrationEntry("unregistered", "RegistrationUnregistered"),
 	registrationEntry("expired", "RegistrationExpired"),
+
+	sipDialogEntry("dialog.progressed", "SIPDialogProgressed"),
+	sipDialogEntry("dialog.answered", "SIPDialogAnswered"),
+	sipDialogEntry("dialog.held", "SIPDialogHeld"),
+	sipDialogEntry("dialog.resumed", "SIPDialogResumed"),
+	sipDialogEntry("dialog.terminated", "SIPDialogTerminated"),
+	sipDialogEntry("dialog.dtmf", "SIPDialogDTMF"),
 
 	queueEntry("caller.joined", "QueueCallerJoined"),
 	queueEntry("caller.answered", "QueueCallerAnswered"),
@@ -375,6 +397,52 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.transfer"].timeoutMs,
 		request: RPC_CONTRACTS["rpc.sip.v1.transfer"].request,
 		response: RPC_CONTRACTS["rpc.sip.v1.transfer"].response,
+	},
+	// The INVITE path. `invite` is the one Go CALLER here — the edge asking the engine for admission
+	// — and the five below it are Go RESPONDERS, which makes this family the first on the backbone
+	// that crosses the language border in both directions on adjacent subjects. Every one of these
+	// structs is a real wire contract rather than documentation.
+	{
+		subject: "rpc.sip.v1.invite",
+		goName: "SipInvite",
+		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.invite"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.sip.v1.invite"].request,
+		response: RPC_CONTRACTS["rpc.sip.v1.invite"].response,
+	},
+	{
+		subject: "rpc.sip.v1.ring",
+		goName: "SipRing",
+		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.ring"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.sip.v1.ring"].request,
+		response: RPC_CONTRACTS["rpc.sip.v1.ring"].response,
+	},
+	{
+		subject: "rpc.sip.v1.answer",
+		goName: "SipAnswer",
+		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.answer"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.sip.v1.answer"].request,
+		response: RPC_CONTRACTS["rpc.sip.v1.answer"].response,
+	},
+	{
+		subject: "rpc.sip.v1.hangup",
+		goName: "SipHangup",
+		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.hangup"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.sip.v1.hangup"].request,
+		response: RPC_CONTRACTS["rpc.sip.v1.hangup"].response,
+	},
+	{
+		subject: "rpc.sip.v1.reinvite",
+		goName: "SipReinvite",
+		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.reinvite"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.sip.v1.reinvite"].request,
+		response: RPC_CONTRACTS["rpc.sip.v1.reinvite"].response,
+	},
+	{
+		subject: "rpc.sip.v1.originate",
+		goName: "SipOriginate",
+		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.originate"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.sip.v1.originate"].request,
+		response: RPC_CONTRACTS["rpc.sip.v1.originate"].response,
 	},
 	// The media plane. Unlike every entry above, the RESPONDER for these is Go: apps/mediad
 	// unmarshals the generated request structs and marshals the generated response ones, which is
@@ -536,6 +604,7 @@ export const ENVELOPE_SCHEMA = baseEventEnvelopeSchema;
 export const FAMILY_ORDER: readonly EventFamily[] = [
 	"call",
 	"registration",
+	"sipDialog",
 	"queue",
 	"voicemail",
 	"media",
@@ -549,6 +618,7 @@ export const FAMILY_ORDER: readonly EventFamily[] = [
 export const FAMILY_FILE: Readonly<Record<EventFamily, string>> = {
 	call: "call_events",
 	registration: "registration_events",
+	sipDialog: "sip_dialog_events",
 	queue: "queue_events",
 	voicemail: "voicemail_events",
 	media: "media_events",

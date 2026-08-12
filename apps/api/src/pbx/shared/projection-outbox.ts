@@ -39,9 +39,11 @@ import type { PbxMutationEvent } from "./pbx.repository";
  *
  * ## One obligation is discharged by any later publish of the same projection
  *
- * All three publishes are **whole-organization reconciles**: `RoutingCachePublisher.publish` writes
+ * All five publishes are **whole-organization reconciles**: `RoutingCachePublisher.publish` writes
  * the organization's entire compiled artifact, `DidIndexPublisher.syncOrganization` reconciles
- * every DID it owns, `QueueMembershipPublisher.syncOrganization` re-projects every queue. A
+ * every DID it owns, `QueueMembershipPublisher.syncOrganization` re-projects every queue,
+ * `TrunkDirectoryPublisher.syncOrganization` re-projects every trunk and
+ * `SipAclPublisher.syncOrganization` re-projects every ACL entry. A
  * successful publish therefore discharges not one obligation but every outstanding obligation for
  * that organization and projection, because the state it just pushed is at least as new as all of
  * them. Ten edits in a burst become one publish and ten marks, which is what a bulk import needs.
@@ -99,12 +101,52 @@ export function affectsQueueMembership(tableName: string): boolean {
 }
 
 /**
+ * The tables whose mutation changes the carrier directory the SIP edge dials.
+ *
+ * One table, and the list exists anyway rather than an inline string comparison, for two reasons.
+ * It keeps the shape identical to the roster's above, so the three predicates in this file read as
+ * one mechanism; and `trunk` is the table most likely to grow a child (a per-trunk ACL row is
+ * already named as a follow-up in `plans/sipd-invite-design.md` §8.2), at which point the addition
+ * is one string here and nothing else.
+ *
+ * `outbound_route` is deliberately NOT here even though it names trunks: it holds an ordered
+ * failover list in `trunk_priority`, which is a ROUTING fact the compiled artifact already carries.
+ * Nothing about which trunks a route prefers changes how any of them is dialled.
+ */
+export const TRUNK_DIRECTORY_TABLES: readonly string[] = ["trunk"];
+
+export function affectsTrunkDirectory(tableName: string): boolean {
+	return TRUNK_DIRECTORY_TABLES.includes(tableName);
+}
+
+/**
+ * The tables whose mutation changes the SIP edge's admission list.
+ *
+ * `sip_acl_entry` is absent from `packages/routing`'s `ROUTING_TABLE_TO_ENTITY`, so
+ * `affectsRouting("sip_acl_entry")` is false and `onArtifactCompiled` never fires for it —
+ * `security/sip-acl.resource.ts` states that and its consequence in full. This predicate on the
+ * `onMutation` seam is therefore not a shortcut past the artifact; it is the ONLY hook the table has.
+ */
+export const SIP_ACL_TABLES: readonly string[] = ["sip_acl_entry"];
+
+export function affectsSipAcl(tableName: string): boolean {
+	return SIP_ACL_TABLES.includes(tableName);
+}
+
+/**
  * Which projections a committed write owes.
  *
  * `artifactChanged` is `CompiledWrite.changed` — false when the recompile produced the same
  * `snapshotHash`, which means the bucket already holds the right value and there is nothing owed.
  * The DID index rides on the same evidence for the reason `pbx.module.ts` records: the set of
  * phone numbers is part of the hashed snapshot, so an unchanged hash means an unchanged index.
+ *
+ * `trunks` and `sip-acl` ride on the TABLE and not on the artifact, and a write to `trunk` can
+ * therefore owe three projections at once. That is not double counting: `affectsRouting("trunk")` is
+ * true because an outbound route's failover list names trunks, while the directory carries the
+ * carrier's dialable address — two different facts derived from one row, published to two buckets
+ * with two different readers. Owing both is what stops a renamed proxy from waiting for a recompile
+ * that happened not to change the snapshot hash.
  */
 export function projectionsOwedBy(
 	tableName: string,
@@ -116,6 +158,12 @@ export function projectionsOwedBy(
 	}
 	if (affectsQueueMembership(tableName)) {
 		owed.push("queue-membership");
+	}
+	if (affectsTrunkDirectory(tableName)) {
+		owed.push("trunks");
+	}
+	if (affectsSipAcl(tableName)) {
+		owed.push("sip-acl");
 	}
 	return owed;
 }

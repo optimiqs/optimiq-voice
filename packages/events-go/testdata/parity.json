@@ -4,6 +4,7 @@
 	"subjectRoots": {
 		"call": "calls.evt.v1",
 		"registration": "sip.reg.v1",
+		"sipDialog": "sip.evt.v1",
 		"queue": "queue.evt.v1",
 		"voicemail": "voicemail.evt.v1",
 		"media": "media.evt.v1",
@@ -21,6 +22,12 @@
 		"pbxFileGreeting": "rpc.pbx.v1.file-greeting",
 		"sipCredential": "rpc.sip.v1.credential",
 		"sipTransfer": "rpc.sip.v1.transfer",
+		"sipInvite": "rpc.sip.v1.invite",
+		"sipRing": "rpc.sip.v1.ring",
+		"sipAnswer": "rpc.sip.v1.answer",
+		"sipHangup": "rpc.sip.v1.hangup",
+		"sipReinvite": "rpc.sip.v1.reinvite",
+		"sipOriginate": "rpc.sip.v1.originate",
 		"mediaAllocateSession": "rpc.media.v1.allocate-session",
 		"mediaBridgeSessions": "rpc.media.v1.bridge-sessions",
 		"mediaUnbridgeSessions": "rpc.media.v1.unbridge-sessions",
@@ -69,6 +76,32 @@
 		{
 			"aor": "sip:a@b",
 			"token": "45d0e5cfd8660c7beff53cde59993ebd"
+		}
+	],
+	"instanceSubjectTokens": [
+		{
+			"instanceId": "sipd",
+			"token": "sipd"
+		},
+		{
+			"instanceId": "sipd-2",
+			"token": "sipd-2"
+		},
+		{
+			"instanceId": "engine-7d9f4c-xk2lp",
+			"token": "engine-7d9f4c-xk2lp"
+		},
+		{
+			"instanceId": "  sipd  ",
+			"token": "sipd"
+		},
+		{
+			"instanceId": "sipd.eu-west.internal",
+			"token": "8a3ed32acf85ae4ef218ac5cb23944d5"
+		},
+		{
+			"instanceId": "host name with spaces",
+			"token": "81d85f6559bf928d3971848b0b668f62"
 		}
 	],
 	"didIndexTokens": [
@@ -129,6 +162,24 @@
 				"expired"
 			],
 			"subject": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.7b81c6319a152fcef543d42203656b77.expired"
+		},
+		{
+			"builder": "sipDialog",
+			"args": [
+				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d",
+				"dialog.answered"
+			],
+			"subject": "sip.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d.dialog.answered"
+		},
+		{
+			"builder": "sipDialog",
+			"args": [
+				"01930a11-2233-7445-8899-aabbccddeeff",
+				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d",
+				"dialog.terminated"
+			],
+			"subject": "sip.evt.v1.01930a11-2233-7445-8899-aabbccddeeff.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d.dialog.terminated"
 		},
 		{
 			"builder": "queue",
@@ -250,6 +301,21 @@
 			"filter": "registrationEventInOrg",
 			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "expired"],
 			"result": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.*.expired"
+		},
+		{
+			"filter": "allSipDialogs",
+			"args": [],
+			"result": "sip.evt.v1.>"
+		},
+		{
+			"filter": "sipDialogsInOrg",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
+			"result": "sip.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.>"
+		},
+		{
+			"filter": "sipDialog",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d"],
+			"result": "sip.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d.>"
 		},
 		{
 			"filter": "allQueues",
@@ -618,6 +684,26 @@
 			"builder": "mediaSession",
 			"args": ["0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53"],
 			"key": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53"
+		},
+		{
+			"builder": "sipDialog",
+			"args": ["0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d"],
+			"key": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d"
+		},
+		{
+			"builder": "trunk",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57"],
+			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57"
+		},
+		{
+			"builder": "sipAcl",
+			"args": ["203.0.113.0/24"],
+			"key": "203-0-113-0-24"
+		},
+		{
+			"builder": "sipAcl",
+			"args": ["2001:db8::/32"],
+			"key": "2001-db8---32"
 		}
 	],
 	"streams": [
@@ -645,6 +731,20 @@
 			"maxAgeMs": 86400000,
 			"maxMsgs": -1,
 			"maxBytes": 1073741824,
+			"maxMsgsPerSubject": -1,
+			"duplicateWindowMs": 120000,
+			"numReplicas": 1
+		},
+		{
+			"name": "SIP",
+			"description": "SIP dialog lifecycle from apps/sipd (sipd-invite-design §3.3, §10.2).",
+			"subjects": ["sip.evt.v1.>"],
+			"retention": "limits",
+			"storage": "file",
+			"discard": "old",
+			"maxAgeMs": 604800000,
+			"maxMsgs": -1,
+			"maxBytes": 4294967296,
 			"maxMsgsPerSubject": -1,
 			"duplicateWindowMs": 120000,
 			"numReplicas": 1
@@ -857,6 +957,36 @@
 			"storage": "file",
 			"maxValueSizeBytes": 262144,
 			"maxBytes": 268435456,
+			"numReplicas": 1
+		},
+		{
+			"name": "sip-dialogs",
+			"description": "SIP dialog -> owning sipd instance, under a heartbeated lease, for reaping.",
+			"ttlMs": 21600000,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 4096,
+			"maxBytes": 134217728,
+			"numReplicas": 1
+		},
+		{
+			"name": "trunks",
+			"description": "Trunk -> its dialable SIP configuration, for the edge's outbound and registration.",
+			"ttlMs": 0,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 8192,
+			"maxBytes": 134217728,
+			"numReplicas": 1
+		},
+		{
+			"name": "sip-acl",
+			"description": "Source network -> tenant, scope and action, for the SIP edge's trunk admission.",
+			"ttlMs": 0,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 4096,
+			"maxBytes": 134217728,
 			"numReplicas": 1
 		}
 	],
@@ -1073,6 +1203,36 @@
 			"family": "registration",
 			"type": "expired",
 			"goType": "RegistrationExpiredData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.progressed",
+			"goType": "SIPDialogProgressedData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.answered",
+			"goType": "SIPDialogAnsweredData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.held",
+			"goType": "SIPDialogHeldData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.resumed",
+			"goType": "SIPDialogResumedData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.terminated",
+			"goType": "SIPDialogTerminatedData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.dtmf",
+			"goType": "SIPDialogDTMFData"
 		},
 		{
 			"family": "queue",

@@ -1,0 +1,22 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"legId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"cause": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 1023
+		},
+		"detail": {
+			"type": "string",
+			"maxLength": 256
+		}
+	},
+	"required": ["legId"],
+	"additionalProperties": false
+}

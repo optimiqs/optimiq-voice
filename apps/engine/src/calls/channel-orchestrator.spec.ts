@@ -15,6 +15,7 @@ import { DtmfRegistry } from "../verbs/dtmf-registry";
 import { makeVerbExecutorRuntime } from "../verbs/verb-executor";
 import { toMediaEvent } from "./ari-mapping";
 import { CallControlRegistry } from "./call-control-registry";
+import { callIdForAriChannel, legIdForAriChannel } from "./channel-identity";
 import { ChannelOrchestrator } from "./channel-orchestrator.service";
 import type { EngineEnv } from "../config/engine-env";
 import type { MediaEvent } from "../media/media-event";
@@ -22,6 +23,7 @@ import type { CallEventPublisher } from "../nats/call-event-publisher.service";
 import type { JetStreamService } from "../nats/jetstream.service";
 import type { OriginateCallPath, OriginateService } from "../nats/originate.service";
 import type { ParkHandoffService } from "../nats/park-handoff.service";
+import type { SipInviteCallPath, SipInviteService } from "../nats/sip-invite.service";
 import type { SipTransferCallPath, SipTransferService } from "../nats/sip-transfer.service";
 import type { DidIndexSource } from "../routing/did-index.source";
 import type { ExtensionFeatureRpcPort } from "../routing/extension-feature.source";
@@ -30,7 +32,12 @@ import type { RoutingArtifactSource } from "../routing/routing-artifact.source";
 import type { SupervisorAuthzRpcPort } from "../routing/supervisor-authz.source";
 import type { VoicemailGreetingRpcPort } from "../routing/voicemail-greeting.source";
 import type { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
-import type { CallEventOf, CdrLegWriteEnvelope, SipTransferRequest } from "@optimiq-voice/events";
+import type {
+	CallEventOf,
+	CdrLegWriteEnvelope,
+	SipInviteRequest,
+	SipTransferRequest,
+} from "@optimiq-voice/events";
 import type { ChannelSnapshot } from "@optimiq-voice/telephony";
 
 /**
@@ -166,6 +173,35 @@ function fakeOriginate(): {
 }
 
 /**
+ * A sip-invite responder that keeps the call path instead of serving it.
+ *
+ * The same arrangement as {@link fakeOriginate} above. The broker half — framing, the toll-fraud
+ * refusal, the Replaces gate — is proven in `nats/sip-invite.service.spec.ts` with a fake call path;
+ * this is the other side of the seam, and having it here is what lets a spec admit a call the way
+ * `apps/sipd` does.
+ */
+function fakeSipInvite(): {
+	readonly service: SipInviteService;
+	readonly attached: () => SipInviteCallPath;
+} {
+	let attached: SipInviteCallPath | undefined;
+	const service = {
+		attach: (callPath: SipInviteCallPath) => {
+			attached = callPath;
+		},
+	} as unknown as SipInviteService;
+	return {
+		service,
+		attached: () => {
+			if (attached === undefined) {
+				throw new Error("the orchestrator attached no sip invite call path");
+			}
+			return attached;
+		},
+	};
+}
+
+/**
  * Orchestrator specs, driven entirely by fakes.
  *
  * Every collaborator the orchestrator has is a port: the media server, the event publisher and
@@ -229,6 +265,8 @@ interface HarnessOptions {
 	readonly claimResult?: "claimed" | "owned" | "unavailable";
 	readonly renewResult?: "renewed" | "lost" | "unavailable";
 	readonly beforeEventPublish?: (type: string) => Promise<void>;
+	/** A did-index that answers, for the one path where attribution is not stamped on the leg. */
+	readonly didIndex?: DidIndexSource;
 }
 
 function harness(env: EngineEnv = fakeEnv(), options: HarnessOptions = {}) {
@@ -372,6 +410,7 @@ function harness(env: EngineEnv = fakeEnv(), options: HarnessOptions = {}) {
 
 	const sipTransfer = fakeSipTransfer();
 	const originate = fakeOriginate();
+	const sipInvite = fakeSipInvite();
 
 	const orchestrator = new ChannelOrchestrator(
 		env,
@@ -386,7 +425,7 @@ function harness(env: EngineEnv = fakeEnv(), options: HarnessOptions = {}) {
 		NO_LAST_CALLER,
 		NO_GREETINGS,
 		NO_SUPERVISION,
-		NO_DID_INDEX,
+		options.didIndex ?? NO_DID_INDEX,
 		signals,
 		new ConferenceRegistry(),
 		...(fakeQueueOrchestratorArgs() as [never, never, never, never, never]),
@@ -395,6 +434,7 @@ function harness(env: EngineEnv = fakeEnv(), options: HarnessOptions = {}) {
 		NO_PARK_HANDOFF,
 		sipTransfer.service,
 		originate.service,
+		sipInvite.service,
 	);
 
 	return {
@@ -412,6 +452,7 @@ function harness(env: EngineEnv = fakeEnv(), options: HarnessOptions = {}) {
 		signals,
 		routing,
 		sipCallPath: sipTransfer.attached,
+		sipInviteCallPath: sipInvite.attached,
 	};
 }
 
@@ -1491,11 +1532,240 @@ describe("resilience", () => {
 			NO_PARK_HANDOFF,
 			fakeSipTransfer().service,
 			fakeOriginate().service,
+			fakeSipInvite().service,
 		);
 
 		await expect(
 			orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] })),
 		).resolves.toBeUndefined();
 		expect(orchestrator.activeChannelCount).toBe(1);
+	});
+});
+
+/**
+ * The SIP edge's admission path, from the orchestrator's side of the seam.
+ *
+ * The broker half — framing, the toll-fraud refusal, the `Replaces` gate — is proven in
+ * `nats/sip-invite.service.spec.ts` with a fake call path. What is proven HERE is the claim the
+ * design rests on: a call admitted from `apps/sipd` is filed by the SAME arrival path an Asterisk
+ * call takes, with the same derived ids, the same KV claim and the same `channel.created`. If that
+ * stops being true, every feature above it becomes a thing that works on one plane.
+ */
+const SIPD_LEG = "0195c0f0-1c2f-7000-8000-0000000000aa";
+
+function inviteRequest(overrides: Record<string, unknown> = {}): SipInviteRequest {
+	return {
+		legId: SIPD_LEG,
+		sipdInstanceId: "sipd-7c9f",
+		orgId: ORG,
+		authentication: "digest",
+		routingContext: "internal",
+		from: { number: "1001", name: "Ada Lovelace", aor: "sip:1001@acme.example.com" },
+		to: { number: "1002" },
+		sipCallId: "a84b4c76e66710@pc33",
+		hasOffer: true,
+		sdpOffer: "v=0\r\n",
+		...overrides,
+	} as SipInviteRequest;
+}
+
+/**
+ * A carrier's INVITE: no credential organization, and the untrusted inbound context.
+ *
+ * The tenant is the ENGINE's to resolve for this one — the edge authenticated a source ADDRESS, not
+ * a subscriber — which is exactly why the `did-index` bucket is not organization-scoped.
+ */
+function trunkInviteRequest(overrides: Record<string, unknown> = {}): SipInviteRequest {
+	const request = inviteRequest({
+		authentication: "trunk-acl",
+		routingContext: "inbound-untrusted",
+		from: { number: "+15551230000" },
+		...overrides,
+	}) as SipInviteRequest & { orgId?: string };
+	delete request.orgId;
+	return request;
+}
+
+/** The only legal media plane for a call signalled by `apps/sipd`. See `plans/sipd-invite-design.md` §3.5. */
+function sipdEnv(overrides: Partial<EngineEnv> = {}): EngineEnv {
+	return fakeEnv({ ENGINE_MEDIA_DRIVER: "mediad", ...overrides });
+}
+
+describe("admitting a call from the sip edge", () => {
+	it("files it as an ordinary A-leg, with the ids every other path derives", async () => {
+		const h = harness(sipdEnv());
+
+		const admission = await h.sipInviteCallPath().admit(inviteRequest());
+
+		expect(admission).toEqual({
+			kind: "admitted",
+			orgId: ORG,
+			// Derived from the edge's leg id, not invented: that derivation is what makes a leg id
+			// survive a restart and a failover onto another replica.
+			callId: callIdForAriChannel(SIPD_LEG),
+			legId: legIdForAriChannel(SIPD_LEG),
+			routingContext: "internal",
+			direction: "internal",
+		});
+		expect(h.orchestrator.activeChannelCount).toBe(1);
+	});
+
+	it("publishes the same channel.created an Asterisk arrival does, with a real SIP Call-ID", async () => {
+		const h = harness(sipdEnv());
+
+		await h.sipInviteCallPath().admit(inviteRequest());
+
+		const created = h.published.find((event) => event.type === "channel.created");
+		expect(created?.data).toMatchObject({
+			legId: legIdForAriChannel(SIPD_LEG),
+			leg: "a",
+			direction: "internal",
+			from: { number: "1001", name: "Ada Lovelace" },
+			to: { number: "1002" },
+			// The field the ARI plane has to read off a channel function. Here it arrives natively.
+			sipCallId: "a84b4c76e66710@pc33",
+		});
+	});
+
+	it("stamps the edge instance on the leg, so a later command knows who to address", async () => {
+		const h = harness(sipdEnv());
+
+		await h.sipInviteCallPath().admit(inviteRequest());
+
+		const snapshot = h.kv.get(
+			`${ORG}.${callIdForAriChannel(SIPD_LEG)}.${legIdForAriChannel(SIPD_LEG)}`,
+		);
+		expect(snapshot?.variables).toMatchObject({
+			OPTIMIQ_SIPD_INSTANCE_ID: "sipd-7c9f",
+			OPTIMIQ_LEG: "a",
+			OPTIMIQ_ROUTING_CONTEXT: "internal",
+		});
+	});
+
+	it("answers a retry with the call it already admitted, rather than admitting it twice", async () => {
+		const h = harness(sipdEnv());
+
+		const first = await h.sipInviteCallPath().admit(inviteRequest());
+		const second = await h.sipInviteCallPath().admit(inviteRequest());
+
+		expect(second).toEqual(first);
+		// Without idempotency a one-second deadline against a busy engine files one INVITE as two
+		// calls, with two CDR rows and two walks racing to dial the same extension.
+		expect(h.orchestrator.activeChannelCount).toBe(1);
+	});
+
+	it("resolves a trunk call's tenant through the did-index, exactly as an inbound call does", async () => {
+		const h = harness(sipdEnv(), {
+			didIndex: {
+				organizationFor: async () => ({
+					organizationId: ORG,
+					phoneNumberId: "pn-1",
+					enabled: true,
+				}),
+			} as unknown as DidIndexSource,
+		});
+
+		const admission = await h
+			.sipInviteCallPath()
+			.admit(trunkInviteRequest({ to: { number: "+441632960111" } }));
+
+		expect(admission).toMatchObject({ kind: "admitted", orgId: ORG, direction: "inbound" });
+	});
+});
+
+describe("refusing a call from the sip edge", () => {
+	it("refuses when this deployment signals on sipd and serves media on Asterisk", async () => {
+		// The one illegal combination. `apps/sipd` holds no ARI credential and there is no Asterisk
+		// channel this leg could name, so the call would ring and never get audio — which is the
+		// defect class the whole design spends its budget avoiding.
+		const h = harness(fakeEnv({ ENGINE_MEDIA_DRIVER: "ari" }));
+
+		const admission = await h.sipInviteCallPath().admit(inviteRequest());
+
+		expect(admission).toMatchObject({ kind: "refused", reason: "internal" });
+		expect(h.orchestrator.activeChannelCount).toBe(0);
+	});
+
+	it("refuses a call nothing on this platform owns", async () => {
+		const h = harness(sipdEnv());
+
+		const admission = await h.sipInviteCallPath().admit(trunkInviteRequest());
+
+		// `404` on the wire, and the honest answer: no credential organization and no did-index entry.
+		expect(admission).toMatchObject({ kind: "refused", reason: "unattributed" });
+	});
+
+	it("refuses with shutting_down while draining, so the carrier fails over", async () => {
+		const h = harness(sipdEnv());
+		await h.orchestrator.drain();
+
+		const admission = await h.sipInviteCallPath().admit(inviteRequest());
+
+		expect(admission).toMatchObject({ kind: "refused", reason: "shutting_down" });
+	});
+});
+
+describe("authorising a Replaces", () => {
+	const replaces = { callId: "aa11@1.2.3.4", toTag: "b2", fromTag: "c3", earlyOnly: false };
+
+	it("refuses a Replaces from a carrier, whatever dialog it named", async () => {
+		const h = harness(sipdEnv());
+		await h.sipInviteCallPath().admit(inviteRequest());
+
+		const verdict = await h.sipInviteCallPath().authorizeReplaces?.(
+			inviteRequest({
+				legId: "0195c0f0-1c2f-7000-8000-0000000000ab",
+				authentication: "trunk-acl",
+				replaces,
+				replacesLegId: SIPD_LEG,
+			}),
+		);
+
+		// A carrier has no legitimate reason to insert itself into a conversation on this platform.
+		expect(verdict).toMatchObject({ kind: "refused" });
+	});
+
+	it("refuses when no live leg on this engine holds the dialog", async () => {
+		const h = harness(sipdEnv());
+
+		const verdict = await h
+			.sipInviteCallPath()
+			.authorizeReplaces?.(inviteRequest({ replaces, replacesLegId: "leg-nobody-holds" }));
+
+		expect(verdict).toMatchObject({ kind: "refused" });
+	});
+
+	it("refuses a dialog in another organization, even with the triple right", async () => {
+		const h = harness(sipdEnv());
+		await h.sipInviteCallPath().admit(inviteRequest());
+
+		const verdict = await h.sipInviteCallPath().authorizeReplaces?.(
+			inviteRequest({
+				legId: "0195c0f0-1c2f-7000-8000-0000000000ab",
+				orgId: "0195c0f0-1c2f-7000-8000-000000000002",
+				replaces,
+				replacesLegId: SIPD_LEG,
+			}),
+		);
+
+		expect(verdict).toMatchObject({ kind: "refused" });
+	});
+
+	it("authorises a digest-authenticated party of the same tenant against a leg it holds", async () => {
+		const h = harness(sipdEnv());
+		await h.sipInviteCallPath().admit(inviteRequest());
+
+		const verdict = await h.sipInviteCallPath().authorizeReplaces?.(
+			inviteRequest({
+				legId: "0195c0f0-1c2f-7000-8000-0000000000ab",
+				replaces,
+				replacesLegId: SIPD_LEG,
+			}),
+		);
+
+		// The triple was matched at the edge — the only process holding the tags — and everything the
+		// engine can add on top of it holds. Note that the sender is deliberately NOT required to be a
+		// party to the replaced call: RFC 5589's attended transfer has the TRANSFER TARGET send this.
+		expect(verdict).toMatchObject({ kind: "authorized", replacedLegId: SIPD_LEG });
 	});
 });

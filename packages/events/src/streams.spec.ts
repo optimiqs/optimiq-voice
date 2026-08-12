@@ -78,6 +78,7 @@ describe("stream definitions", () => {
 		expect(EVENT_STREAMS.map((stream) => stream.name)).toEqual([
 			"CALLS",
 			"REGISTRATIONS",
+			"SIP",
 			"QUEUES",
 			"VOICEMAIL",
 			"MEDIA",
@@ -282,6 +283,9 @@ describe("kv bucket definitions", () => {
 			"conference-claims",
 			"media-sessions",
 			"queue-waiting",
+			"sip-dialogs",
+			"trunks",
+			"sip-acl",
 		]);
 	});
 
@@ -293,16 +297,19 @@ describe("kv bucket definitions", () => {
 	});
 
 	/**
-	 * The two CONFIGURATION buckets must not expire. `did-index` and `queue-membership` both hold
-	 * derived configuration rather than live state, and an expired entry is an outage produced by a
-	 * timer rather than by a change: an inbound call to a valid DID rejected with `INVALID_PROFILE`,
-	 * or a staffed queue that suddenly has no agents and ejects every caller to its timeout branch.
+	 * The CONFIGURATION buckets must not expire. `did-index`, `queue-membership`, `trunks` and
+	 * `sip-acl` all hold derived configuration rather than live state, and an expired entry is an
+	 * outage produced by a timer rather than by a change: an inbound call to a valid DID rejected with
+	 * `INVALID_PROFILE`, a staffed queue that suddenly has no agents and ejects every caller to its
+	 * timeout branch, an outbound call over a perfectly good trunk that stops resolving — and, in the
+	 * `sip-acl` case, a `deny` entry that evaporates on a timer, which is a security boundary failing
+	 * OPEN rather than closed.
 	 *
 	 * Everything else holds live state whose staleness self-corrects — a registration refreshes, a
 	 * channel ends, an agent's status is rewritten on their next transition — so a TTL is a safety
 	 * net rather than a hazard.
 	 */
-	const CONFIGURATION_BUCKETS = ["did-index", "queue-membership"];
+	const CONFIGURATION_BUCKETS = ["did-index", "queue-membership", "trunks", "sip-acl"];
 
 	it("gives every LIVE-STATE bucket a TTL, and the configuration buckets none", () => {
 		for (const bucket of KV_BUCKETS) {
@@ -370,6 +377,29 @@ describe("kvKeyFor", () => {
 	it("rejects a token that would break the key namespace", () => {
 		expect(() => kvKeyFor.routingCache(ORG, "inbound.did")).toThrow(SubjectTokenError);
 		expect(() => kvKeyFor.registration("", "abc")).toThrow(SubjectTokenError);
+	});
+
+	/**
+	 * The SIP edge's three keys, and the one transformation in this whole file.
+	 *
+	 * `sipDialog` is the third non-org-scoped key, for the reason `didIndex` and `mediaSession` are:
+	 * the reader does not know the tenant. `sipAcl` is the fourth, and it is the only key that has to
+	 * REWRITE its argument — a CIDR carries `.`, `/` and, for IPv6, `:`, and none of the three
+	 * survives as a key token. The folding is asserted against the same vectors `packages/events-go`
+	 * checks, because a control plane and an edge that folded differently would write and read two
+	 * different keys and the ACL would silently admit nobody.
+	 */
+	it("builds the SIP edge's keys, folding a CIDR into one token", () => {
+		expect(kvKeyFor.sipDialog(leg)).toBe(leg);
+		expect(kvKeyFor.trunk(ORG, call)).toBe(`${ORG}.${call}`);
+		expect(kvKeyFor.sipAcl("203.0.113.0/24")).toBe("203-0-113-0-24");
+		// IPv6 too: `sip_acl_entry.network` is a PostgreSQL `cidr`, so a folder that handled only the
+		// v4 separators would throw on the first IPv6 carrier.
+		expect(kvKeyFor.sipAcl("2001:db8::/32")).toBe("2001-db8---32");
+	});
+
+	it("refuses a network with nothing usable in it", () => {
+		expect(() => kvKeyFor.sipAcl("   ")).toThrow(SubjectTokenError);
 	});
 
 	/**

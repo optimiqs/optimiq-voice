@@ -53,6 +53,35 @@ const (
 	ReasonShuttingDown TerminationReason = "shutting-down"
 )
 
+// Initiator says WHO ended a dialog, alongside the reason that says how and the cause that says
+// why.
+//
+// A third field rather than a refinement of the second, because the reason and the initiator are
+// genuinely independent: a `rejected` is LOCAL when this edge refused admission and REMOTE when the
+// far end answered `486 Busy Here`, and both carry Q.850 17. A CDR that folded them together could
+// not tell a call the platform blocked from a call the callee declined — which is the first question
+// asked about every disputed minute.
+//
+// The values are the contract's verbatim (`SIPDialogTerminatedInitiator`), so the string here is the
+// string on the wire and there is no second spelling to keep in step.
+type Initiator string
+
+const (
+	// InitiatorLocal is this side: an admission refusal, an `rpc.sip.v1.hangup`, a drain.
+	InitiatorLocal Initiator = "local"
+	// InitiatorRemote is the far end: a BYE, a CANCEL, a final failure response to our INVITE.
+	InitiatorRemote Initiator = "remote"
+	// InitiatorTimer is nobody: Timer B, an unACKed 2xx, an RFC 4028 expiry, a ring timeout, or a
+	// reaper finding an expired claim. It is separate from `local` because "our timer fired" and "we
+	// decided" are the same actor and completely different incidents.
+	InitiatorTimer Initiator = "timer"
+)
+
+// Valid reports whether the initiator is one of the three the contract knows.
+func (i Initiator) Valid() bool {
+	return i == InitiatorLocal || i == InitiatorRemote || i == InitiatorTimer
+}
+
 // EffectKind is one thing the owner of a dialog must DO as a result of a trigger.
 //
 // # Why effects rather than method calls

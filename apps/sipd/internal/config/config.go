@@ -71,14 +71,17 @@ type Config struct {
 	TLSCertFile string
 	TLSKeyFile  string
 
-	// EnableInvite turns on the INVITE surface: the dialog layer, the admission RPC and every
-	// mid-dialog method. SIPD_INVITE, default FALSE.
+	// EnableInvite turns on the INVITE surface: the dialog layer, the admission RPC, the engine's
+	// five-subject command surface, the trunk directory, the `sip-acl` watch and the claim reaper.
+	// SIPD_INVITE, default FALSE.
 	//
-	// Off by default and it must stay that way until the engine serves `rpc.sip.v1.invite`. With no
-	// responder every INVITE is answered 503 after the admission deadline, which is a WORSE answer
-	// than the honest 501 the registrar gives today: a 503 tells a carrier to retry here shortly,
-	// and a 501 tells it this element does not do that. Turning it on is a deliberate act by a
-	// deployment that has the other half.
+	// Still off by default, and the REASON has changed rather than gone away. It is no longer "no
+	// engine serves `rpc.sip.v1.invite`" — one does. It is that turning this on converts a registrar
+	// into a call-processing element, and that has a blast radius nobody should acquire by upgrading
+	// a binary: the front end must become dialog-affine (a mid-dialog request that lands on the wrong
+	// instance is answered 481, design §6.4), the `trunks` and `sip-acl` buckets must be written by
+	// apps/api, and this process starts subscribing to business subjects for the first time. Turning
+	// it on is a deliberate act by a deployment that has all of that.
 	EnableInvite bool
 	// InstanceID is this process's identity on the backbone: it stamps every `sip-dialogs` claim and
 	// is the token engine commands for these dialogs are addressed at. SIPD_INSTANCE_ID, defaulting
@@ -105,17 +108,29 @@ type Config struct {
 	// than unlimited because an unbounded contact set is a fork that rings twenty stale bindings.
 	MaxContactsPerAOR int
 
-	// TrunkACL is the carrier-facing source-address allow list, as `cidr[=trunkId]` entries
-	// separated by commas. SIPD_TRUNK_ACL, empty by default.
+	// TrunkACL is an OVERRIDE on the carrier-facing source-address allow list, as `cidr[=trunkId]`
+	// entries separated by commas. SIPD_TRUNK_ACL, empty by default and expected to stay empty.
 	//
-	// Empty means NO external profile is built, and therefore that no unauthenticated INVITE can be
-	// admitted at all. That is the safe default and it is the only safe default: an external
-	// profile with an empty ACL accepts INVITEs from the whole internet, which internal/profile
-	// refuses to construct.
+	// # It is no longer the source, and it was deliberately not removed
 	//
-	// It is configuration rather than a watched read model because the read model does not exist —
-	// design §8.1 specifies a `sip-acl` KV bucket written by apps/api, and that is a cross-boundary
-	// change. The seam is internal/profile.NewACL, which takes a compiled list from anywhere.
+	// The source is the `sip-acl` KV bucket (design §8.1): organization-scoped in PostgreSQL, written
+	// non-org-scoped by apps/api because the reader does not know the tenant, and WATCHED here rather
+	// than read per INVITE — a KV get per INVITE is a broker round trip inside a SIP transaction on
+	// the one code path an attacker controls the rate of. internal/acl is the ingestion.
+	//
+	// Deleting this variable outright was the tidier change and it loses on two situations that are
+	// both real. A deployment whose control plane cannot yet write the bucket has no other way to
+	// admit a carrier; and an operator who needs one address admitted RIGHT NOW during an incident
+	// cannot wait for a database write to propagate through apps/api. So it survives as an override
+	// that is recompiled alongside every bucket update and is never removed by one — which is what
+	// makes the second case trustworthy rather than a race.
+	//
+	// Empty is now the NORMAL state and no longer means "no external profile". The profile is built
+	// whenever the bucket is reachable, because an external profile whose ACL is empty refuses every
+	// carrier — Match has no default allow and no constructor can give it one — so building it early
+	// costs nothing and saves a restart the first time a tenant adds a trunk. A value that is SET and
+	// names nothing usable is still a boot failure: that is a typo, and a typo in an anti-toll-fraud
+	// boundary that silently did nothing is exactly what this check exists for.
 	TrunkACL string
 	// ExternalListenAddr is where the carrier-facing profile listens, when a TrunkACL is configured.
 	// SIPD_EXTERNAL_LISTEN_ADDR, default empty, meaning the external profile shares the main

@@ -1,0 +1,53 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"legId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"callId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"instanceId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"role": {
+			"type": "string",
+			"enum": ["uas", "uac"]
+		},
+		"identity": {
+			"type": "object",
+			"properties": {
+				"sipCallId": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 256
+				},
+				"localTag": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 128
+				},
+				"remoteTag": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 128
+				}
+			},
+			"required": ["sipCallId"],
+			"additionalProperties": false
+		},
+		"direction": {
+			"type": "string",
+			"enum": ["sendrecv", "recvonly"]
+		}
+	},
+	"required": ["legId", "callId", "instanceId", "role", "identity", "direction"],
+	"additionalProperties": false
+}

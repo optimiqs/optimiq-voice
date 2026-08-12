@@ -58,6 +58,11 @@ type Input struct {
 	// Cause overrides the derived Q.850 cause. `rpc.sip.v1.hangup` sets it; everything else leaves
 	// it zero and lets the message decide.
 	Cause int
+	// CauseFromReasonHeader says the Cause above was READ off an RFC 3326 `Reason` header rather
+	// than chosen. It is the one bit that lets a consumer prefer stated evidence over derived
+	// evidence, and re-deriving the cause from the status code when the far end told us plainly
+	// would be discarding better evidence for worse.
+	CauseFromReasonHeader bool
 	// RemoteTag is the far end's tag on the message that triggered this, used to tell a
 	// retransmitted 2xx from a forked one (design §9.7).
 	RemoteTag string
@@ -122,6 +127,15 @@ type Dialog struct {
 	// that publishes the terminal event.
 	cause       int
 	termination TerminationReason
+	// initiator is WHO ended it, which is a different question from how and cannot be derived from
+	// the reason: a `rejected` is ours when we refused admission and theirs when they answered 486,
+	// and a CDR that cannot tell those apart cannot tell a blocked call from a busy one.
+	initiator Initiator
+	// causeFromReasonHeader records that the Q.850 cause came off an RFC 3326 `Reason` header rather
+	// than being derived from a status code. It travels on the terminal event because a cause the
+	// far end STATED is better evidence than one this edge inferred, and a consumer that cannot tell
+	// them apart cannot know which of two disagreeing CDRs to believe.
+	causeFromReasonHeader bool
 	// terminalPublished stops the terminal event being emitted twice when two paths end one dialog
 	// — a BYE crossing our BYE is the ordinary case, and two `leg-ended` events for one leg is two
 	// CDR rows for one call.
@@ -203,6 +217,13 @@ func (d *Dialog) Cause() int { return d.cause }
 // Termination reports how the dialog ended, empty until it has.
 func (d *Dialog) Termination() TerminationReason { return d.termination }
 
+// Initiator reports WHO ended the dialog, empty until it has ended.
+func (d *Dialog) Initiator() Initiator { return d.initiator }
+
+// CauseFromReasonHeader reports whether the recorded Q.850 cause was stated by the far end in an
+// RFC 3326 `Reason` header rather than derived here from a status code.
+func (d *Dialog) CauseFromReasonHeader() bool { return d.causeFromReasonHeader }
+
 // CreatedAt, AnsweredAt and EndedAt are the three instants a CDR row is built from. AnsweredAt is
 // the ACK for a UAS leg and the 2xx for a UAC leg, which is what makes `billsec` start where the
 // caller started paying rather than where the bridge happened to be built.
@@ -224,6 +245,11 @@ func (d *Dialog) Apply(in Input) (Outcome, error) {
 	at := in.At
 	if at.IsZero() {
 		at = d.now()
+	}
+
+	if in.CauseFromReasonHeader {
+		// Latched rather than assigned: it accompanies the cause, and the cause is first-write-wins.
+		d.causeFromReasonHeader = true
 	}
 
 	next, err := transition(d.Role, d.state, in.Trigger)
@@ -320,7 +346,7 @@ func (d *Dialog) effectsFor(in Input, from, next State, at time.Time) []Effect {
 		if status == 0 {
 			status, reason = StatusForCause(cause)
 		}
-		d.recordTermination(cause, ReasonRejected, at)
+		d.recordTermination(cause, ReasonRejected, InitiatorLocal, at)
 		return append([]Effect{{Kind: EffectRespond, Status: status, Reason: reason}},
 			d.terminalEffects(cause, ReasonRejected)...)
 
@@ -368,14 +394,14 @@ func (d *Dialog) effectsFor(in Input, from, next State, at time.Time) []Effect {
 				Detail: "a BYE before the ACK is proof the 2xx arrived",
 			})
 		}
-		d.recordTermination(cause, ReasonBye, at)
+		d.recordTermination(cause, ReasonBye, InitiatorRemote, at)
 		return append(effects, d.terminalEffects(cause, ReasonBye)...)
 
 	case TriggerRemoteCancel:
 		// sipgo's transaction layer has already answered the CANCEL 200 and driven the INVITE
 		// transaction to 487 (`sip/transaction_layer.go:154-185`). What it does NOT do is tell
 		// anybody, which is the whole reason this trigger exists.
-		d.recordTermination(CauseNormalClearing, ReasonCancelled, at)
+		d.recordTermination(CauseNormalClearing, ReasonCancelled, InitiatorRemote, at)
 		return d.terminalEffects(CauseNormalClearing, ReasonCancelled)
 
 	case TriggerRemoteProvisional:
@@ -410,7 +436,7 @@ func (d *Dialog) effectsFor(in Input, from, next State, at time.Time) []Effect {
 
 	case TriggerRemoteFailure:
 		cause := d.resolveCause(in, CauseForStatus(in.Status))
-		d.recordTermination(cause, ReasonRejected, at)
+		d.recordTermination(cause, ReasonRejected, InitiatorRemote, at)
 		// No ACK effect: sipgo's client transaction ACKs a non-2xx itself (RFC 3261 §17.1.1.3), and
 		// a second ACK from here would be a stray message on a dead transaction.
 		return d.terminalEffects(cause, ReasonRejected)
@@ -424,7 +450,7 @@ func (d *Dialog) effectsFor(in Input, from, next State, at time.Time) []Effect {
 		if reason == "" {
 			reason = ReasonBye
 		}
-		d.recordTermination(cause, reason, at)
+		d.recordTermination(cause, reason, d.initiator, at)
 		return d.terminalEffects(cause, reason)
 
 	case TriggerTimeout:
@@ -444,6 +470,12 @@ func (d *Dialog) hangupEffects(in Input, from State, at time.Time) []Effect {
 	alreadyRequested := d.hangupRequested
 	d.hangupRequested = true
 	d.cause = cause
+	// Recorded HERE and not only at the terminal event, because the paths that end a BYE-shaped
+	// hangup — TriggerTeardownComplete, and the ACK that releases a deferred BYE — arrive later with
+	// no memory of who asked. Without this the engine's own hangup would be filed as `timer`.
+	if d.initiator == "" {
+		d.initiator = InitiatorLocal
+	}
 
 	switch from {
 	case StateInit, StateProceeding, StateEarly:
@@ -452,7 +484,7 @@ func (d *Dialog) hangupEffects(in Input, from State, at time.Time) []Effect {
 			// transaction. 487 is reserved for a CANCEL we actually received; a hangup from the
 			// engine is a decision, not a caller giving up.
 			status, reason := StatusForCause(cause)
-			d.recordTermination(cause, ReasonRejected, at)
+			d.recordTermination(cause, ReasonRejected, InitiatorLocal, at)
 			return append([]Effect{{Kind: EffectRespond, Status: status, Reason: reason}},
 				d.terminalEffects(cause, ReasonRejected)...)
 		}
@@ -544,13 +576,13 @@ func (d *Dialog) remoteAnswerEffects(in Input, from State, at time.Time) []Effec
 func (d *Dialog) timeoutEffects(in Input, from State, at time.Time) []Effect {
 	switch in.Timeout {
 	case TimeoutInvite:
-		d.recordTermination(CauseNoUserResponse, ReasonTimeout, at)
+		d.recordTermination(CauseNoUserResponse, ReasonTimeout, InitiatorTimer, at)
 		return d.terminalEffects(CauseNoUserResponse, ReasonTimeout)
 
 	case TimeoutAck:
 		// RFC 3261 §13.3.1.4: when the 2xx has been retransmitted for 64×T1 with no ACK, the UAS
 		// SHOULD send a BYE. The dialog exists — the far end just never confirmed it.
-		d.recordTermination(CauseRecoveryOnTimerExpire, ReasonTimeout, at)
+		d.recordTermination(CauseRecoveryOnTimerExpire, ReasonTimeout, InitiatorTimer, at)
 		effects := []Effect{
 			{Kind: EffectSendBye, Cause: CauseRecoveryOnTimerExpire,
 				Detail: "the 2xx was never ACKed (RFC 3261 §13.3.1.4)"},
@@ -561,7 +593,7 @@ func (d *Dialog) timeoutEffects(in Input, from State, at time.Time) []Effect {
 	case TimeoutSession:
 		// RFC 4028 §10: the refresh never came. Whoever notices tears the call down, and the Reason
 		// header says which timer did it so the far end's CDR agrees with ours.
-		d.recordTermination(CauseRecoveryOnTimerExpire, ReasonTimeout, at)
+		d.recordTermination(CauseRecoveryOnTimerExpire, ReasonTimeout, InitiatorTimer, at)
 		effects := []Effect{
 			{Kind: EffectSendBye, Cause: CauseRecoveryOnTimerExpire,
 				Detail: "the session timer expired (RFC 4028 §10)"},
@@ -570,7 +602,7 @@ func (d *Dialog) timeoutEffects(in Input, from State, at time.Time) []Effect {
 		return append(effects, d.terminalEffects(CauseRecoveryOnTimerExpire, ReasonTimeout)...)
 
 	default: // TimeoutRing
-		d.recordTermination(CauseNoAnswer, ReasonTimeout, at)
+		d.recordTermination(CauseNoAnswer, ReasonTimeout, InitiatorTimer, at)
 		switch {
 		case d.Role == RoleUAS && !from.Answered():
 			status, reason := StatusForCause(CauseNoAnswer)
@@ -595,11 +627,25 @@ func (d *Dialog) resolveCause(in Input, fallback int) int {
 	return fallback
 }
 
-// recordTermination stamps how and when the dialog ended, without publishing anything.
-func (d *Dialog) recordTermination(cause int, reason TerminationReason, at time.Time) {
+// recordTermination stamps how, why, by whom and when the dialog ended, without publishing
+// anything.
+//
+// The FIRST recording wins, for every field. A BYE crossing our own BYE is the ordinary
+// simultaneous-hangup case, and the honest account of that call is the one that reached the machine
+// first — re-stamping it would make a call the engine ended read as a call the caller ended, which
+// is the difference a support desk is looking at when it asks "who hung up".
+func (d *Dialog) recordTermination(
+	cause int,
+	reason TerminationReason,
+	initiator Initiator,
+	at time.Time,
+) {
 	if d.cause == 0 || d.termination == "" {
 		d.cause = cause
 		d.termination = reason
+		if initiator != "" {
+			d.initiator = initiator
+		}
 	}
 	if d.endedAt.IsZero() {
 		d.endedAt = at

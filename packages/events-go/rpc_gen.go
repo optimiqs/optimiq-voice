@@ -30,6 +30,12 @@ const (
 	SubjectFileGreetingRPC          = "rpc.pbx.v1.file-greeting"
 	SubjectSipCredentialRPC         = "rpc.sip.v1.credential"
 	SubjectSipTransferRPC           = "rpc.sip.v1.transfer"
+	SubjectSipInviteRPC             = "rpc.sip.v1.invite"
+	SubjectSipRingRPC               = "rpc.sip.v1.ring"
+	SubjectSipAnswerRPC             = "rpc.sip.v1.answer"
+	SubjectSipHangupRPC             = "rpc.sip.v1.hangup"
+	SubjectSipReinviteRPC           = "rpc.sip.v1.reinvite"
+	SubjectSipOriginateRPC          = "rpc.sip.v1.originate"
 	SubjectMediaAllocateSessionRPC  = "rpc.media.v1.allocate-session"
 	SubjectMediaBridgeSessionsRPC   = "rpc.media.v1.bridge-sessions"
 	SubjectMediaUnbridgeSessionsRPC = "rpc.media.v1.unbridge-sessions"
@@ -59,6 +65,12 @@ const (
 	TimeoutFileGreetingRPC          = 5000 * time.Millisecond
 	TimeoutSipCredentialRPC         = 500 * time.Millisecond
 	TimeoutSipTransferRPC           = 2000 * time.Millisecond
+	TimeoutSipInviteRPC             = 1000 * time.Millisecond
+	TimeoutSipRingRPC               = 500 * time.Millisecond
+	TimeoutSipAnswerRPC             = 1000 * time.Millisecond
+	TimeoutSipHangupRPC             = 500 * time.Millisecond
+	TimeoutSipReinviteRPC           = 1000 * time.Millisecond
+	TimeoutSipOriginateRPC          = 1000 * time.Millisecond
 	TimeoutMediaAllocateSessionRPC  = 500 * time.Millisecond
 	TimeoutMediaBridgeSessionsRPC   = 500 * time.Millisecond
 	TimeoutMediaUnbridgeSessionsRPC = 500 * time.Millisecond
@@ -571,6 +583,555 @@ func (v SipTransferResponseReason) Valid() bool {
 }
 
 func (v SipTransferResponseReason) String() string { return string(v) }
+
+// SipInviteRequest is the request body of rpc.sip.v1.invite.
+type SipInviteRequest struct {
+	LegID          string                         `json:"legId"`
+	SipdInstanceID string                         `json:"sipdInstanceId"`
+	OrgID          *string                        `json:"orgId,omitempty"`
+	Authentication SipInviteRequestAuthentication `json:"authentication"`
+	Profile        *string                        `json:"profile,omitempty"`
+	RoutingContext string                         `json:"routingContext"`
+	From           SipInviteRequestFrom           `json:"from"`
+	To             SipInviteRequestTo             `json:"to"`
+	SIPCallID      string                         `json:"sipCallId"`
+	FromTag        *string                        `json:"fromTag,omitempty"`
+	TrunkID        *string                        `json:"trunkId,omitempty"`
+	SourceAddress  *string                        `json:"sourceAddress,omitempty"`
+	Transport      *SIPTransport                  `json:"transport,omitempty"`
+	HasOffer       bool                           `json:"hasOffer"`
+	SDPOffer       *string                        `json:"sdpOffer,omitempty"`
+	MediaHint      *SipInviteRequestMediaHint     `json:"mediaHint,omitempty"`
+	UserAgent      *string                        `json:"userAgent,omitempty"`
+	Replaces       *SipInviteRequestReplaces      `json:"replaces,omitempty"`
+	ReplacesLegID  *string                        `json:"replacesLegId,omitempty"`
+}
+
+// SipInviteRequestAuthentication is the closed vocabulary of SipInviteRequest.authentication.
+type SipInviteRequestAuthentication string
+
+const (
+	SipInviteRequestAuthenticationDigest   SipInviteRequestAuthentication = "digest"
+	SipInviteRequestAuthenticationTrunkAcl SipInviteRequestAuthentication = "trunk-acl"
+)
+
+// SipInviteRequestAuthenticationValues lists every member of the vocabulary, in contract order.
+var SipInviteRequestAuthenticationValues = []SipInviteRequestAuthentication{
+	SipInviteRequestAuthenticationDigest,
+	SipInviteRequestAuthenticationTrunkAcl,
+}
+
+// Valid reports whether v is a member of the SipInviteRequestAuthentication vocabulary.
+func (v SipInviteRequestAuthentication) Valid() bool {
+	for _, candidate := range SipInviteRequestAuthenticationValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SipInviteRequestAuthentication) String() string { return string(v) }
+
+// SipInviteRequestFrom is a payload fragment of the contract.
+type SipInviteRequestFrom struct {
+	Number string  `json:"number"`
+	Name   *string `json:"name,omitempty"`
+	AOR    *string `json:"aor,omitempty"`
+	URI    *string `json:"uri,omitempty"`
+}
+
+// SipInviteRequestTo is a payload fragment of the contract.
+type SipInviteRequestTo struct {
+	Number string  `json:"number"`
+	Name   *string `json:"name,omitempty"`
+	AOR    *string `json:"aor,omitempty"`
+	URI    *string `json:"uri,omitempty"`
+}
+
+// SipInviteRequestMediaHint is a payload fragment of the contract.
+type SipInviteRequestMediaHint struct {
+	SignallingSource *string `json:"signallingSource,omitempty"`
+	AdvertisedMedia  *string `json:"advertisedMedia,omitempty"`
+	Mismatch         bool    `json:"mismatch"`
+	Private          bool    `json:"private"`
+}
+
+// SipInviteRequestReplaces is a payload fragment of the contract.
+type SipInviteRequestReplaces struct {
+	CallID    string `json:"callId"`
+	ToTag     string `json:"toTag"`
+	FromTag   string `json:"fromTag"`
+	EarlyOnly bool   `json:"earlyOnly"`
+}
+
+// SipInviteResponse is the reply body of rpc.sip.v1.invite.
+type SipInviteResponse struct {
+	Ok             bool                     `json:"ok"`
+	LegID          string                   `json:"legId"`
+	OrgID          *string                  `json:"orgId,omitempty"`
+	CallID         *string                  `json:"callId,omitempty"`
+	InstanceID     *string                  `json:"instanceId,omitempty"`
+	RoutingContext *string                  `json:"routingContext,omitempty"`
+	Direction      *CallDirection           `json:"direction,omitempty"`
+	Reason         *SipInviteResponseReason `json:"reason,omitempty"`
+	Error          *string                  `json:"error,omitempty"`
+}
+
+// SipInviteResponseReason is the closed vocabulary of SipInviteResponse.reason.
+type SipInviteResponseReason string
+
+const (
+	SipInviteResponseReasonUnattributed  SipInviteResponseReason = "unattributed"
+	SipInviteResponseReasonUnknownTarget SipInviteResponseReason = "unknown_target"
+	SipInviteResponseReasonNotPermitted  SipInviteResponseReason = "not_permitted"
+	SipInviteResponseReasonCongestion    SipInviteResponseReason = "congestion"
+	SipInviteResponseReasonShuttingDown  SipInviteResponseReason = "shutting_down"
+	SipInviteResponseReasonBadRequest    SipInviteResponseReason = "bad_request"
+	SipInviteResponseReasonInternal      SipInviteResponseReason = "internal"
+)
+
+// SipInviteResponseReasonValues lists every member of the vocabulary, in contract order.
+var SipInviteResponseReasonValues = []SipInviteResponseReason{
+	SipInviteResponseReasonUnattributed,
+	SipInviteResponseReasonUnknownTarget,
+	SipInviteResponseReasonNotPermitted,
+	SipInviteResponseReasonCongestion,
+	SipInviteResponseReasonShuttingDown,
+	SipInviteResponseReasonBadRequest,
+	SipInviteResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the SipInviteResponseReason vocabulary.
+func (v SipInviteResponseReason) Valid() bool {
+	for _, candidate := range SipInviteResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SipInviteResponseReason) String() string { return string(v) }
+
+// SipRingRequest is the request body of rpc.sip.v1.ring.
+type SipRingRequest struct {
+	LegID     string  `json:"legId"`
+	Status    int     `json:"status"`
+	SDPAnswer *string `json:"sdpAnswer,omitempty"`
+}
+
+// SipRingResponse is the reply body of rpc.sip.v1.ring.
+type SipRingResponse struct {
+	Ok         bool                   `json:"ok"`
+	LegID      string                 `json:"legId"`
+	InstanceID *string                `json:"instanceId,omitempty"`
+	Reason     *SipRingResponseReason `json:"reason,omitempty"`
+	Error      *string                `json:"error,omitempty"`
+}
+
+// SipRingResponseReason is the closed vocabulary of SipRingResponse.reason.
+type SipRingResponseReason string
+
+const (
+	SipRingResponseReasonBadRequest         SipRingResponseReason = "bad_request"
+	SipRingResponseReasonUnknownDialog      SipRingResponseReason = "unknown_dialog"
+	SipRingResponseReasonWrongInstance      SipRingResponseReason = "wrong_instance"
+	SipRingResponseReasonDialogGone         SipRingResponseReason = "dialog_gone"
+	SipRingResponseReasonInvalidState       SipRingResponseReason = "invalid_state"
+	SipRingResponseReasonUnregisteredTarget SipRingResponseReason = "unregistered_target"
+	SipRingResponseReasonUnknownTrunk       SipRingResponseReason = "unknown_trunk"
+	SipRingResponseReasonNoRoute            SipRingResponseReason = "no_route"
+	SipRingResponseReasonCapacity           SipRingResponseReason = "capacity"
+	SipRingResponseReasonShuttingDown       SipRingResponseReason = "shutting_down"
+	SipRingResponseReasonNotSupported       SipRingResponseReason = "not_supported"
+	SipRingResponseReasonInternal           SipRingResponseReason = "internal"
+)
+
+// SipRingResponseReasonValues lists every member of the vocabulary, in contract order.
+var SipRingResponseReasonValues = []SipRingResponseReason{
+	SipRingResponseReasonBadRequest,
+	SipRingResponseReasonUnknownDialog,
+	SipRingResponseReasonWrongInstance,
+	SipRingResponseReasonDialogGone,
+	SipRingResponseReasonInvalidState,
+	SipRingResponseReasonUnregisteredTarget,
+	SipRingResponseReasonUnknownTrunk,
+	SipRingResponseReasonNoRoute,
+	SipRingResponseReasonCapacity,
+	SipRingResponseReasonShuttingDown,
+	SipRingResponseReasonNotSupported,
+	SipRingResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the SipRingResponseReason vocabulary.
+func (v SipRingResponseReason) Valid() bool {
+	for _, candidate := range SipRingResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SipRingResponseReason) String() string { return string(v) }
+
+// SipAnswerRequest is the request body of rpc.sip.v1.answer.
+type SipAnswerRequest struct {
+	LegID     string `json:"legId"`
+	SDPAnswer string `json:"sdpAnswer"`
+}
+
+// SipAnswerResponse is the reply body of rpc.sip.v1.answer.
+type SipAnswerResponse struct {
+	Ok         bool                     `json:"ok"`
+	LegID      string                   `json:"legId"`
+	InstanceID *string                  `json:"instanceId,omitempty"`
+	Reason     *SipAnswerResponseReason `json:"reason,omitempty"`
+	Error      *string                  `json:"error,omitempty"`
+	SentAt     *EventTime               `json:"sentAt,omitempty"`
+}
+
+// SipAnswerResponseReason is the closed vocabulary of SipAnswerResponse.reason.
+type SipAnswerResponseReason string
+
+const (
+	SipAnswerResponseReasonBadRequest         SipAnswerResponseReason = "bad_request"
+	SipAnswerResponseReasonUnknownDialog      SipAnswerResponseReason = "unknown_dialog"
+	SipAnswerResponseReasonWrongInstance      SipAnswerResponseReason = "wrong_instance"
+	SipAnswerResponseReasonDialogGone         SipAnswerResponseReason = "dialog_gone"
+	SipAnswerResponseReasonInvalidState       SipAnswerResponseReason = "invalid_state"
+	SipAnswerResponseReasonUnregisteredTarget SipAnswerResponseReason = "unregistered_target"
+	SipAnswerResponseReasonUnknownTrunk       SipAnswerResponseReason = "unknown_trunk"
+	SipAnswerResponseReasonNoRoute            SipAnswerResponseReason = "no_route"
+	SipAnswerResponseReasonCapacity           SipAnswerResponseReason = "capacity"
+	SipAnswerResponseReasonShuttingDown       SipAnswerResponseReason = "shutting_down"
+	SipAnswerResponseReasonNotSupported       SipAnswerResponseReason = "not_supported"
+	SipAnswerResponseReasonInternal           SipAnswerResponseReason = "internal"
+)
+
+// SipAnswerResponseReasonValues lists every member of the vocabulary, in contract order.
+var SipAnswerResponseReasonValues = []SipAnswerResponseReason{
+	SipAnswerResponseReasonBadRequest,
+	SipAnswerResponseReasonUnknownDialog,
+	SipAnswerResponseReasonWrongInstance,
+	SipAnswerResponseReasonDialogGone,
+	SipAnswerResponseReasonInvalidState,
+	SipAnswerResponseReasonUnregisteredTarget,
+	SipAnswerResponseReasonUnknownTrunk,
+	SipAnswerResponseReasonNoRoute,
+	SipAnswerResponseReasonCapacity,
+	SipAnswerResponseReasonShuttingDown,
+	SipAnswerResponseReasonNotSupported,
+	SipAnswerResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the SipAnswerResponseReason vocabulary.
+func (v SipAnswerResponseReason) Valid() bool {
+	for _, candidate := range SipAnswerResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SipAnswerResponseReason) String() string { return string(v) }
+
+// SipHangupRequest is the request body of rpc.sip.v1.hangup.
+type SipHangupRequest struct {
+	LegID  string  `json:"legId"`
+	Cause  *int    `json:"cause,omitempty"`
+	Detail *string `json:"detail,omitempty"`
+}
+
+// SipHangupResponse is the reply body of rpc.sip.v1.hangup.
+type SipHangupResponse struct {
+	Ok         bool                     `json:"ok"`
+	LegID      string                   `json:"legId"`
+	InstanceID *string                  `json:"instanceId,omitempty"`
+	Reason     *SipHangupResponseReason `json:"reason,omitempty"`
+	Error      *string                  `json:"error,omitempty"`
+	Method     *SipHangupResponseMethod `json:"method,omitempty"`
+}
+
+// SipHangupResponseReason is the closed vocabulary of SipHangupResponse.reason.
+type SipHangupResponseReason string
+
+const (
+	SipHangupResponseReasonBadRequest         SipHangupResponseReason = "bad_request"
+	SipHangupResponseReasonUnknownDialog      SipHangupResponseReason = "unknown_dialog"
+	SipHangupResponseReasonWrongInstance      SipHangupResponseReason = "wrong_instance"
+	SipHangupResponseReasonDialogGone         SipHangupResponseReason = "dialog_gone"
+	SipHangupResponseReasonInvalidState       SipHangupResponseReason = "invalid_state"
+	SipHangupResponseReasonUnregisteredTarget SipHangupResponseReason = "unregistered_target"
+	SipHangupResponseReasonUnknownTrunk       SipHangupResponseReason = "unknown_trunk"
+	SipHangupResponseReasonNoRoute            SipHangupResponseReason = "no_route"
+	SipHangupResponseReasonCapacity           SipHangupResponseReason = "capacity"
+	SipHangupResponseReasonShuttingDown       SipHangupResponseReason = "shutting_down"
+	SipHangupResponseReasonNotSupported       SipHangupResponseReason = "not_supported"
+	SipHangupResponseReasonInternal           SipHangupResponseReason = "internal"
+)
+
+// SipHangupResponseReasonValues lists every member of the vocabulary, in contract order.
+var SipHangupResponseReasonValues = []SipHangupResponseReason{
+	SipHangupResponseReasonBadRequest,
+	SipHangupResponseReasonUnknownDialog,
+	SipHangupResponseReasonWrongInstance,
+	SipHangupResponseReasonDialogGone,
+	SipHangupResponseReasonInvalidState,
+	SipHangupResponseReasonUnregisteredTarget,
+	SipHangupResponseReasonUnknownTrunk,
+	SipHangupResponseReasonNoRoute,
+	SipHangupResponseReasonCapacity,
+	SipHangupResponseReasonShuttingDown,
+	SipHangupResponseReasonNotSupported,
+	SipHangupResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the SipHangupResponseReason vocabulary.
+func (v SipHangupResponseReason) Valid() bool {
+	for _, candidate := range SipHangupResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SipHangupResponseReason) String() string { return string(v) }
+
+// SipHangupResponseMethod is the closed vocabulary of SipHangupResponse.method.
+type SipHangupResponseMethod string
+
+const (
+	SipHangupResponseMethodBye      SipHangupResponseMethod = "bye"
+	SipHangupResponseMethodCancel   SipHangupResponseMethod = "cancel"
+	SipHangupResponseMethodRespond  SipHangupResponseMethod = "respond"
+	SipHangupResponseMethodDeferred SipHangupResponseMethod = "deferred"
+	SipHangupResponseMethodNone     SipHangupResponseMethod = "none"
+)
+
+// SipHangupResponseMethodValues lists every member of the vocabulary, in contract order.
+var SipHangupResponseMethodValues = []SipHangupResponseMethod{
+	SipHangupResponseMethodBye,
+	SipHangupResponseMethodCancel,
+	SipHangupResponseMethodRespond,
+	SipHangupResponseMethodDeferred,
+	SipHangupResponseMethodNone,
+}
+
+// Valid reports whether v is a member of the SipHangupResponseMethod vocabulary.
+func (v SipHangupResponseMethod) Valid() bool {
+	for _, candidate := range SipHangupResponseMethodValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SipHangupResponseMethod) String() string { return string(v) }
+
+// SipReinviteRequest is the request body of rpc.sip.v1.reinvite.
+type SipReinviteRequest struct {
+	LegID    string                   `json:"legId"`
+	SDPOffer string                   `json:"sdpOffer"`
+	Intent   SipReinviteRequestIntent `json:"intent"`
+}
+
+// SipReinviteRequestIntent is the closed vocabulary of SipReinviteRequest.intent.
+type SipReinviteRequestIntent string
+
+const (
+	SipReinviteRequestIntentHold    SipReinviteRequestIntent = "hold"
+	SipReinviteRequestIntentResume  SipReinviteRequestIntent = "resume"
+	SipReinviteRequestIntentMove    SipReinviteRequestIntent = "move"
+	SipReinviteRequestIntentRefresh SipReinviteRequestIntent = "refresh"
+)
+
+// SipReinviteRequestIntentValues lists every member of the vocabulary, in contract order.
+var SipReinviteRequestIntentValues = []SipReinviteRequestIntent{
+	SipReinviteRequestIntentHold,
+	SipReinviteRequestIntentResume,
+	SipReinviteRequestIntentMove,
+	SipReinviteRequestIntentRefresh,
+}
+
+// Valid reports whether v is a member of the SipReinviteRequestIntent vocabulary.
+func (v SipReinviteRequestIntent) Valid() bool {
+	for _, candidate := range SipReinviteRequestIntentValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SipReinviteRequestIntent) String() string { return string(v) }
+
+// SipReinviteResponse is the reply body of rpc.sip.v1.reinvite.
+type SipReinviteResponse struct {
+	Ok         bool                       `json:"ok"`
+	LegID      string                     `json:"legId"`
+	InstanceID *string                    `json:"instanceId,omitempty"`
+	Reason     *SipReinviteResponseReason `json:"reason,omitempty"`
+	Error      *string                    `json:"error,omitempty"`
+	SDPAnswer  *string                    `json:"sdpAnswer,omitempty"`
+}
+
+// SipReinviteResponseReason is the closed vocabulary of SipReinviteResponse.reason.
+type SipReinviteResponseReason string
+
+const (
+	SipReinviteResponseReasonBadRequest         SipReinviteResponseReason = "bad_request"
+	SipReinviteResponseReasonUnknownDialog      SipReinviteResponseReason = "unknown_dialog"
+	SipReinviteResponseReasonWrongInstance      SipReinviteResponseReason = "wrong_instance"
+	SipReinviteResponseReasonDialogGone         SipReinviteResponseReason = "dialog_gone"
+	SipReinviteResponseReasonInvalidState       SipReinviteResponseReason = "invalid_state"
+	SipReinviteResponseReasonUnregisteredTarget SipReinviteResponseReason = "unregistered_target"
+	SipReinviteResponseReasonUnknownTrunk       SipReinviteResponseReason = "unknown_trunk"
+	SipReinviteResponseReasonNoRoute            SipReinviteResponseReason = "no_route"
+	SipReinviteResponseReasonCapacity           SipReinviteResponseReason = "capacity"
+	SipReinviteResponseReasonShuttingDown       SipReinviteResponseReason = "shutting_down"
+	SipReinviteResponseReasonNotSupported       SipReinviteResponseReason = "not_supported"
+	SipReinviteResponseReasonInternal           SipReinviteResponseReason = "internal"
+)
+
+// SipReinviteResponseReasonValues lists every member of the vocabulary, in contract order.
+var SipReinviteResponseReasonValues = []SipReinviteResponseReason{
+	SipReinviteResponseReasonBadRequest,
+	SipReinviteResponseReasonUnknownDialog,
+	SipReinviteResponseReasonWrongInstance,
+	SipReinviteResponseReasonDialogGone,
+	SipReinviteResponseReasonInvalidState,
+	SipReinviteResponseReasonUnregisteredTarget,
+	SipReinviteResponseReasonUnknownTrunk,
+	SipReinviteResponseReasonNoRoute,
+	SipReinviteResponseReasonCapacity,
+	SipReinviteResponseReasonShuttingDown,
+	SipReinviteResponseReasonNotSupported,
+	SipReinviteResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the SipReinviteResponseReason vocabulary.
+func (v SipReinviteResponseReason) Valid() bool {
+	for _, candidate := range SipReinviteResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SipReinviteResponseReason) String() string { return string(v) }
+
+// SipOriginateRequest is the request body of rpc.sip.v1.originate.
+type SipOriginateRequest struct {
+	LegID          string                    `json:"legId"`
+	OrgID          string                    `json:"orgId"`
+	CallID         string                    `json:"callId"`
+	Target         SipOriginateRequestTarget `json:"target"`
+	CallerIDNumber *string                   `json:"callerIdNumber,omitempty"`
+	CallerIDName   *string                   `json:"callerIdName,omitempty"`
+	SDPOffer       string                    `json:"sdpOffer"`
+	RingTimeoutMs  *int                      `json:"ringTimeoutMs,omitempty"`
+	Headers        map[string]string         `json:"headers,omitempty"`
+}
+
+// SipOriginateRequestTarget is a payload fragment of the contract.
+type SipOriginateRequestTarget struct {
+	Kind    SipOriginateRequestTargetKind `json:"kind"`
+	AOR     *string                       `json:"aor,omitempty"`
+	TrunkID *string                       `json:"trunkId,omitempty"`
+	Number  *string                       `json:"number,omitempty"`
+	URI     *string                       `json:"uri,omitempty"`
+}
+
+// SipOriginateRequestTargetKind is the closed vocabulary of SipOriginateRequestTarget.kind.
+type SipOriginateRequestTargetKind string
+
+const (
+	SipOriginateRequestTargetKindAOR   SipOriginateRequestTargetKind = "aor"
+	SipOriginateRequestTargetKindTrunk SipOriginateRequestTargetKind = "trunk"
+	SipOriginateRequestTargetKindURI   SipOriginateRequestTargetKind = "uri"
+)
+
+// SipOriginateRequestTargetKindValues lists every member of the vocabulary, in contract order.
+var SipOriginateRequestTargetKindValues = []SipOriginateRequestTargetKind{
+	SipOriginateRequestTargetKindAOR,
+	SipOriginateRequestTargetKindTrunk,
+	SipOriginateRequestTargetKindURI,
+}
+
+// Valid reports whether v is a member of the SipOriginateRequestTargetKind vocabulary.
+func (v SipOriginateRequestTargetKind) Valid() bool {
+	for _, candidate := range SipOriginateRequestTargetKindValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SipOriginateRequestTargetKind) String() string { return string(v) }
+
+// SipOriginateResponse is the reply body of rpc.sip.v1.originate.
+type SipOriginateResponse struct {
+	Ok         bool                        `json:"ok"`
+	LegID      string                      `json:"legId"`
+	InstanceID *string                     `json:"instanceId,omitempty"`
+	Reason     *SipOriginateResponseReason `json:"reason,omitempty"`
+	Error      *string                     `json:"error,omitempty"`
+	RequestURI *string                     `json:"requestUri,omitempty"`
+	SIPCallID  *string                     `json:"sipCallId,omitempty"`
+}
+
+// SipOriginateResponseReason is the closed vocabulary of SipOriginateResponse.reason.
+type SipOriginateResponseReason string
+
+const (
+	SipOriginateResponseReasonBadRequest         SipOriginateResponseReason = "bad_request"
+	SipOriginateResponseReasonUnknownDialog      SipOriginateResponseReason = "unknown_dialog"
+	SipOriginateResponseReasonWrongInstance      SipOriginateResponseReason = "wrong_instance"
+	SipOriginateResponseReasonDialogGone         SipOriginateResponseReason = "dialog_gone"
+	SipOriginateResponseReasonInvalidState       SipOriginateResponseReason = "invalid_state"
+	SipOriginateResponseReasonUnregisteredTarget SipOriginateResponseReason = "unregistered_target"
+	SipOriginateResponseReasonUnknownTrunk       SipOriginateResponseReason = "unknown_trunk"
+	SipOriginateResponseReasonNoRoute            SipOriginateResponseReason = "no_route"
+	SipOriginateResponseReasonCapacity           SipOriginateResponseReason = "capacity"
+	SipOriginateResponseReasonShuttingDown       SipOriginateResponseReason = "shutting_down"
+	SipOriginateResponseReasonNotSupported       SipOriginateResponseReason = "not_supported"
+	SipOriginateResponseReasonInternal           SipOriginateResponseReason = "internal"
+)
+
+// SipOriginateResponseReasonValues lists every member of the vocabulary, in contract order.
+var SipOriginateResponseReasonValues = []SipOriginateResponseReason{
+	SipOriginateResponseReasonBadRequest,
+	SipOriginateResponseReasonUnknownDialog,
+	SipOriginateResponseReasonWrongInstance,
+	SipOriginateResponseReasonDialogGone,
+	SipOriginateResponseReasonInvalidState,
+	SipOriginateResponseReasonUnregisteredTarget,
+	SipOriginateResponseReasonUnknownTrunk,
+	SipOriginateResponseReasonNoRoute,
+	SipOriginateResponseReasonCapacity,
+	SipOriginateResponseReasonShuttingDown,
+	SipOriginateResponseReasonNotSupported,
+	SipOriginateResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the SipOriginateResponseReason vocabulary.
+func (v SipOriginateResponseReason) Valid() bool {
+	for _, candidate := range SipOriginateResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SipOriginateResponseReason) String() string { return string(v) }
 
 // MediaAllocateSessionRequest is the request body of rpc.media.v1.allocate-session.
 type MediaAllocateSessionRequest struct {

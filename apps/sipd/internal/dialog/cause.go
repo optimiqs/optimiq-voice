@@ -5,57 +5,75 @@ import (
 	"strings"
 
 	"github.com/emiago/sipgo/sip"
+	events "github.com/optimiqs/optimiq-voice/packages/events-go"
 )
 
 // The Q.850 causes this edge names. Bare integers at a call site are how a 16 becomes a 17 in
 // review, and every one of these ends up on a CDR row that somebody bills from.
+//
+// # One table, and this is the copy that is no longer one
+//
+// The VALUES come from packages/events-go/hangup_causes_gen.go, which is generated from
+// packages/telephony/src/hangup-causes.ts — the taxonomy's canonical home, pinned by its own spec
+// against the frozen reference §6. Until that generator landed this file held a second hand-written
+// copy of the same numbers, which is precisely the drift the rest of this repository spends a
+// codegen step avoiding: a re-coded cause silently changes outbound failover on the TypeScript side
+// and silently changes what this edge reports on the Go side, and nothing would have caught the
+// disagreement.
+//
+// The NAMES stay local, and that is not laziness. `CauseUserBusy` reads correctly beside a 486 in
+// the table below, where `events.HangupCodeUserBusy` would read as an import; and the SIP -> Q.850
+// mapping itself IS the edge's own knowledge (RFC 3398), which nothing outside the SIP stack has an
+// opinion about. What moved is the answer to "what number is USER_BUSY", which two languages were
+// answering separately.
 const (
 	// CauseUnallocatedNumber is Q.850 1. SIP 404.
-	CauseUnallocatedNumber = 1
+	CauseUnallocatedNumber = events.HangupCodeUnallocatedNumber
 	// CauseNoRouteDestination is Q.850 3. SIP 404 from a proxy that could not route.
-	CauseNoRouteDestination = 3
+	CauseNoRouteDestination = events.HangupCodeNoRouteDestination
 	// CauseNormalClearing is Q.850 16: somebody hung up, and nothing went wrong.
-	CauseNormalClearing = 16
+	CauseNormalClearing = events.HangupCodeNormalClearing
 	// CauseUserBusy is Q.850 17. SIP 486.
-	CauseUserBusy = 17
+	CauseUserBusy = events.HangupCodeUserBusy
 	// CauseNoUserResponse is Q.850 18. SIP 408 — the far end never answered anything.
-	CauseNoUserResponse = 18
+	CauseNoUserResponse = events.HangupCodeNoUserResponse
 	// CauseNoAnswer is Q.850 19: it rang and nobody picked up. SIP 480 in the ring-timeout sense.
-	CauseNoAnswer = 19
+	CauseNoAnswer = events.HangupCodeNoAnswer
 	// CauseSubscriberAbsent is Q.850 20. SIP 480 when the target has no live registration.
-	CauseSubscriberAbsent = 20
+	CauseSubscriberAbsent = events.HangupCodeSubscriberAbsent
 	// CauseCallRejected is Q.850 21. SIP 403 and 603 — a deliberate refusal.
-	CauseCallRejected = 21
+	CauseCallRejected = events.HangupCodeCallRejected
 	// CauseNumberChanged is Q.850 22. SIP 410.
-	CauseNumberChanged = 22
+	CauseNumberChanged = events.HangupCodeNumberChanged
 	// CauseDestinationOutOfOrder is Q.850 27. SIP 502.
-	CauseDestinationOutOfOrder = 27
+	CauseDestinationOutOfOrder = events.HangupCodeDestinationOutOfOrder
 	// CauseInvalidNumberFormat is Q.850 28. SIP 484.
-	CauseInvalidNumberFormat = 28
+	CauseInvalidNumberFormat = events.HangupCodeInvalidNumberFormat
 	// CauseFacilityRejected is Q.850 29. SIP 501 and 503-with-no-better-idea.
-	CauseFacilityRejected = 29
+	CauseFacilityRejected = events.HangupCodeFacilityRejected
 	// CauseNormalUnspecified is Q.850 31: the honest "something ended it and we do not know what".
-	CauseNormalUnspecified = 31
-	// CauseNoCircuitAvailable is Q.850 34. SIP 503 from a trunk at capacity.
-	CauseNoCircuitAvailable = 34
+	CauseNormalUnspecified = events.HangupCodeNormalUnspecified
+	// CauseNoCircuitAvailable is Q.850 34. SIP 503 from a trunk at capacity. NORMAL_CIRCUIT_CONGESTION
+	// upstream; the local name says what an operator reading a SIP log is looking for.
+	CauseNoCircuitAvailable = events.HangupCodeNormalCircuitCongestion
 	// CauseNetworkOutOfOrder is Q.850 38. SIP 503 with no route at all.
-	CauseNetworkOutOfOrder = 38
+	CauseNetworkOutOfOrder = events.HangupCodeNetworkOutOfOrder
 	// CauseTemporaryFailure is Q.850 41. SIP 503, and the cause a reaped dialog carries when its
 	// owning instance died (design §6.2, "instance-lost").
-	CauseTemporaryFailure = 41
+	CauseTemporaryFailure = events.HangupCodeNormalTemporaryFailure
 	// CauseSwitchCongestion is Q.850 42. SIP 503 under load shedding.
-	CauseSwitchCongestion = 42
+	CauseSwitchCongestion = events.HangupCodeSwitchCongestion
 	// CauseRequestedChanUnavail is Q.850 44. SIP 503.
-	CauseRequestedChanUnavail = 44
+	CauseRequestedChanUnavail = events.HangupCodeRequestedChanUnavail
 	// CauseBearerCapabilityNotAvail is Q.850 58. SIP 488 — the far end and mediad cannot agree.
-	CauseBearerCapabilityNotAvail = 58
+	CauseBearerCapabilityNotAvail = events.HangupCodeBearercapabilityNotavail
 	// CauseIncompatibleDestination is Q.850 88. SIP 488 in the codec sense (design §5.2).
-	CauseIncompatibleDestination = 88
+	CauseIncompatibleDestination = events.HangupCodeIncompatibleDestination
 	// CauseRecoveryOnTimerExpire is Q.850 102: every timeout, including RFC 4028 session-timer
 	// expiry and a 2xx that was never ACKed.
-	CauseRecoveryOnTimerExpire = 102
+	CauseRecoveryOnTimerExpire = events.HangupCodeRecoveryOnTimerExpire
 	// CauseInterworking is Q.850 127: a status we have no better opinion about.
-	CauseInterworking = 127
+	CauseInterworking = events.HangupCodeInterworking
 )
 
 // causeForStatus is the RFC 3398 §7.2.4.1 table, plus the handful of points that table leaves to

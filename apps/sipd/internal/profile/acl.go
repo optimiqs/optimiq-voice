@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"sort"
 	"strings"
+	"sync/atomic"
 )
 
 // Action is what an ACL entry does when it matches.
@@ -27,8 +28,8 @@ func (a Action) Valid() bool { return a == ActionAllow || a == ActionDeny }
 // The shape mirrors `sip_acl_entry` in packages/pbx-db (a native PostgreSQL `cidr`, an action, a
 // priority and a scope described as "the anti-toll-fraud boundary"), deliberately, because design
 // §8.1 says the entries reach this edge as a derived read model written by apps/api and WATCHED
-// here rather than read per INVITE. That read model does not exist yet; this type is what it
-// deserialises into, and the evaluator below is what it compiles to.
+// here rather than read per INVITE. That read model is `contract.SIPACLKV`; internal/acl watches it
+// and compiles it into these, and the evaluator below is what matches against them.
 type Entry struct {
 	// Prefix is the network. A single host is a /32 or /128 and needs no special case.
 	Prefix netip.Prefix
@@ -87,7 +88,15 @@ func ParseEntry(cidr string, action Action, priority int, trunkID, label string)
 // matched against an address with no allocation and no I/O. Rebuilding on a watch update is a
 // pointer swap.
 type ACL struct {
-	entries []Entry
+	// entries is an atomic pointer rather than a plain slice so a watch update is a POINTER SWAP and
+	// a match on the request path takes no lock at all. The alternative — an RWMutex — would put a
+	// lock acquisition inside a SIP transaction on the one code path an attacker controls the rate
+	// of, which is the same argument that keeps this evaluator out of KV in the first place.
+	entries atomic.Pointer[[]Entry]
+	// watched records that this ACL is fed by a KV watch rather than fixed at boot. It changes
+	// exactly one thing — whether an EMPTY ACL is a valid external profile — and see Profile.Validate
+	// for why that is safe rather than a loosening.
+	watched bool
 	// defaultAllow is what happens when nothing matches. It is FALSE for every ACL this package
 	// builds and there is no constructor that sets it true: an ACL whose default is allow is not an
 	// ACL, and the one place a profile wants "everyone" is the internal profile, which authenticates
@@ -96,12 +105,49 @@ type ACL struct {
 }
 
 // NewACL compiles entries into an evaluator.
+func NewACL(entries []Entry) *ACL {
+	acl := &ACL{}
+	acl.store(entries)
+	return acl
+}
+
+// NewWatchedACL compiles entries into an evaluator that expects to be Replaced.
+//
+// It is a separate constructor rather than a flag on NewACL because the difference is a SECURITY
+// property and a caller should have to type it: a watched ACL may legitimately be empty at boot,
+// and a fixed one may not.
+func NewWatchedACL(entries []Entry) *ACL {
+	acl := &ACL{watched: true}
+	acl.store(entries)
+	return acl
+}
+
+// Replace swaps the whole entry set, compiled and sorted.
+//
+// Wholesale rather than incremental, and that is the load-bearing choice. An ACL applied in pieces
+// has moments where a deny has been removed and its replacement has not yet arrived, and on an
+// anti-toll-fraud boundary a moment is all an automated scanner needs. The watcher therefore
+// accumulates a complete set and swaps it, so every read sees either the old policy or the new one
+// and never a blend of the two.
+func (a *ACL) Replace(entries []Entry) {
+	if a == nil {
+		return
+	}
+	a.store(entries)
+}
+
+// store compiles and installs an entry set.
 //
 // The sort is the whole implementation: most specific first (a /32 beats a /24), then priority,
-// then deny before allow at equal specificity and priority. That last tie-break is deliberate and
-// is the only defensible one — when a configuration is ambiguous, the safe reading of an
-// anti-toll-fraud boundary is the closed one.
-func NewACL(entries []Entry) *ACL {
+// then deny before allow at equal specificity and priority.
+//
+// Two notes on the ordering, because both are easy to get backwards. `sip_acl_entry.priority` is
+// documented as "lower first", and this sorts DESCENDING — because Entry.Priority is documented as
+// "higher wins" and the ingestion path is what inverts the column (see internal/acl). Keeping the
+// inversion at the border rather than here means this evaluator has one rule instead of two. And the
+// deny-before-allow tie-break is the only defensible one: when a configuration is ambiguous, the
+// safe reading of an anti-toll-fraud boundary is the closed one.
+func (a *ACL) store(entries []Entry) {
 	compiled := append([]Entry(nil), entries...)
 	sort.SliceStable(compiled, func(i, j int) bool {
 		left, right := compiled[i], compiled[j]
@@ -113,7 +159,28 @@ func NewACL(entries []Entry) *ACL {
 		}
 		return left.Action == ActionDeny && right.Action == ActionAllow
 	})
-	return &ACL{entries: compiled}
+	a.entries.Store(&compiled)
+}
+
+// load reads the current entry set. A nil pointer is an ACL that was never compiled, which matches
+// nothing — the same answer an empty one gives, and the safe one.
+func (a *ACL) load() []Entry {
+	if a == nil {
+		return nil
+	}
+	entries := a.entries.Load()
+	if entries == nil {
+		return nil
+	}
+	return *entries
+}
+
+// Watched reports whether this ACL is fed by a KV watch.
+func (a *ACL) Watched() bool {
+	if a == nil {
+		return false
+	}
+	return a.watched
 }
 
 // Len reports how many entries the ACL holds. Diagnostics and the boot log.
@@ -121,7 +188,7 @@ func (a *ACL) Len() int {
 	if a == nil {
 		return 0
 	}
-	return len(a.entries)
+	return len(a.load())
 }
 
 // Match evaluates one source address.
@@ -129,14 +196,18 @@ func (a *ACL) Len() int {
 // The address is the OBSERVED transport source, `host:port` or a bare host. Never a header: an ACL
 // that matched on a Via or a From would be an ACL an attacker writes.
 func (a *ACL) Match(source string) (Entry, bool) {
-	if a == nil || len(a.entries) == 0 {
+	entries := a.load()
+	if len(entries) == 0 {
+		// An address matching NOTHING is refused (design §8.1). An empty ACL matches nothing, so an
+		// ACL whose bucket has not loaded yet refuses every carrier — which is the correct direction
+		// to fail: an outbound outage an operator notices, rather than an open relay nobody does.
 		return Entry{}, false
 	}
 	address, ok := addressOf(source)
 	if !ok {
 		return Entry{}, false
 	}
-	for _, entry := range a.entries {
+	for _, entry := range entries {
 		if entry.Prefix.Contains(address) {
 			return entry, entry.Action == ActionAllow
 		}

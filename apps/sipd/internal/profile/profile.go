@@ -181,10 +181,22 @@ func (p Profile) Validate() error {
 			problems = append(problems,
 				"an external profile must authenticate by trunk ACL: digest against a carrier is a credential we do not have")
 		}
-		if p.ACL.Len() == 0 {
+		if p.ACL.Len() == 0 && !p.ACL.Watched() {
 			problems = append(problems,
 				"an external profile with an empty ACL accepts INVITEs from the whole internet")
 		}
+		// A WATCHED ACL may be empty at boot, and that is a narrowing rather than a loosening.
+		//
+		// The sentence above is about `defaultAllow`, which no constructor in this package sets and
+		// which is therefore always false — so an empty ACL matches NOTHING and refuses every carrier
+		// (design §8.1: "an address matching nothing is REFUSED"). The check exists because a
+		// STATICALLY configured empty ACL means an operator misconfigured SIPD_TRUNK_ACL and would
+		// rather be told at boot than discover it when a carrier is refused.
+		//
+		// A watched one is different in kind: it is empty for the milliseconds between the profile
+		// being built and the `sip-acl` bucket's initial replay landing, and refusing to boot for that
+		// would mean a broker that is briefly slow takes the whole SIP edge down — including REGISTER,
+		// which has nothing to do with this ACL. So the empty window is allowed and it fails CLOSED.
 		if p.Context != ContextUntrusted {
 			problems = append(problems,
 				"an external profile must resolve in the untrusted context, or an inbound PSTN call can dial back out through a trunk")

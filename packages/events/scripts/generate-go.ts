@@ -4,6 +4,12 @@ import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import {
+	EXTENDED_HANGUP_CAUSES,
+	HANGUP_CAUSE_CODES,
+	type HangupCause,
+	Q850_HANGUP_CAUSES,
+} from "@optimiq-voice/telephony";
 import { makeAuditEvent } from "../src/schemas/audit-events";
 import { makeCallEvent } from "../src/schemas/call-events";
 import { makeCdrLegWriteEvent } from "../src/schemas/cdr-events";
@@ -24,6 +30,7 @@ import {
 	aorSubjectToken,
 	CALL_EVENTS,
 	didIndexToken,
+	instanceSubjectToken,
 	matchesSubject,
 	MEDIA_SESSION_EVENTS,
 	parseSubject,
@@ -224,6 +231,191 @@ function emitJsonSchemas(): {
 // 2 — Go structs
 // ------------------------------------------------------------------------------------------------
 
+/**
+ * `SCREAMING_SNAKE` → `PascalCase`, for a Go identifier built from a cause name.
+ *
+ * Deliberately naive: it upper-cases the first rune of each underscore-separated run and lower-cases
+ * the rest, so `BEARERCAPABILITY_NOTAUTH` becomes `BearercapabilityNotauth` rather than anything
+ * cleverer. A table of special cases here would be a second opinion about a name whose authority is
+ * `packages/telephony`, and the generated identifier only has to be stable and unambiguous — it is
+ * never the value on the wire, which stays the SCREAMING_SNAKE string.
+ */
+function goCauseIdentifier(cause: string): string {
+	return cause
+		.split("_")
+		.map((part) => part.charAt(0) + part.slice(1).toLowerCase())
+		.join("");
+}
+
+/**
+ * The Q.850 table, in Go — generated from `@optimiq-voice/telephony`, which is the authority.
+ *
+ * ## The direction, stated once, because it was the open question
+ *
+ * TypeScript already HAD the canonical table (`packages/telephony/src/hangup-causes.ts`, pinned by
+ * its own spec against the frozen reference §6), and `apps/sipd/internal/dialog/cause.go` had grown
+ * a hand-written subset of the same numbers. Two hand-written copies of a table whose values end up
+ * on billed CDR rows is the drift this repository already spends a codegen step avoiding everywhere
+ * else, so the Go side becomes a GENERATED COPY and the TypeScript side stays the source. The
+ * alternative — moving the table into Go and generating TypeScript — would put a domain vocabulary
+ * that the routing executor, the session protocol and the CDR writer all key off behind a Go build.
+ *
+ * `sipd` keeps its `Cause*` constants (they read well at a SIP call site and the SIP→Q.850 mapping
+ * is genuinely the edge's own knowledge); their VALUES now come from here, so a re-coded cause is a
+ * one-line change in one file rather than a silent disagreement between two.
+ *
+ * ## Why this is in `events-go` rather than a `telephony-go` module
+ *
+ * `apps/sipd` and `apps/mediad` already depend on `packages/events-go` and on nothing else shared.
+ * A second Go module for one table would be a `go.work` entry, a `replace` directive in two `go.mod`
+ * files and a release step, bought for tidiness alone.
+ *
+ * ## Not the schema's business
+ *
+ * `hangupCauseSchema` still validates the SHAPE and not the membership, for the reason its own
+ * JSDoc gives: carriers keep inventing causes, and an unrecognised one must reach the CDR writer
+ * rather than being terminated at the broker edge. Generating this table does not close that door —
+ * nothing here is used to reject a payload.
+ */
+function emitHangupCauses(): void {
+	const emitter = new GoFileEmitter({ namedEnums: [] });
+	const all = [...Q850_HANGUP_CAUSES, ...EXTENDED_HANGUP_CAUSES] as readonly HangupCause[];
+
+	emitter.declareRaw(
+		"type:HangupCause",
+		[
+			"// HangupCause is a hangup-cause NAME — the value stored on `call_legs.hangup_cause` and",
+			"// carried by `cdr.leg.v1` and the `dialog.terminated` event.",
+			"//",
+			"// A plain string type rather than a closed enum, deliberately: a cause this build does not",
+			"// know must still reach the CDR writer, which stores the numeric code verbatim and falls back",
+			"// to NORMAL_UNSPECIFIED.",
+			"type HangupCause string",
+		].join("\n"),
+	);
+
+	emitter.declareRaw(
+		"consts:HangupCause",
+		[
+			"// The named causes. Q.850 1-127 first, then the FreeSWITCH extensions.",
+			"const (",
+			...all.map(
+				(cause) =>
+					`\tHangupCause${goCauseIdentifier(cause)} HangupCause = ${JSON.stringify(cause)}`,
+			),
+			")",
+		].join("\n"),
+	);
+
+	emitter.declareRaw(
+		"consts:HangupCode",
+		[
+			"// The numeric code for each named cause, as untyped constants.",
+			"//",
+			"// Constants rather than only the map below, because a Go caller that wants a compile-time",
+			"// constant cannot get one out of a map — `apps/sipd/internal/dialog/cause.go` defines its",
+			"// whole Cause* set in terms of these.",
+			"const (",
+			...all.map(
+				(cause) => `\tHangupCode${goCauseIdentifier(cause)} = ${HANGUP_CAUSE_CODES[cause]}`,
+			),
+			")",
+		].join("\n"),
+	);
+
+	emitter.declareRaw(
+		"var:Q850HangupCauses",
+		[
+			"// Q850HangupCauses lists the Q.850 members, in contract order.",
+			"var Q850HangupCauses = []HangupCause{",
+			...Q850_HANGUP_CAUSES.map((cause) => `\tHangupCause${goCauseIdentifier(cause)},`),
+			"}",
+			"",
+			"// ExtendedHangupCauses lists the FreeSWITCH extensions, in contract order.",
+			"var ExtendedHangupCauses = []HangupCause{",
+			...EXTENDED_HANGUP_CAUSES.map((cause) => `\tHangupCause${goCauseIdentifier(cause)},`),
+			"}",
+			"",
+			"// HangupCauses lists every named cause, Q.850 first. Contract order, matching",
+			"// HANGUP_CAUSES in packages/telephony.",
+			"var HangupCauses = append(append([]HangupCause{}, Q850HangupCauses...), ExtendedHangupCauses...)",
+		].join("\n"),
+	);
+
+	emitter.declareRaw(
+		"var:HangupCauseCodes",
+		[
+			"// HangupCauseCodes maps a cause name onto its numeric code.",
+			"var HangupCauseCodes = map[HangupCause]int{",
+			...all.map(
+				(cause) =>
+					`\tHangupCause${goCauseIdentifier(cause)}: HangupCode${goCauseIdentifier(cause)},`,
+			),
+			"}",
+			"",
+			"// HangupCauseNames maps a numeric code back onto its name.",
+			"//",
+			"// Built from the same generated pairs as HangupCauseCodes, so the two cannot diverge — the",
+			"// property HANGUP_CAUSE_NAMES gets in TypeScript by construction.",
+			"var HangupCauseNames = func() map[int]HangupCause {",
+			"\tnames := make(map[int]HangupCause, len(HangupCauseCodes))",
+			"\tfor cause, code := range HangupCauseCodes {",
+			"\t\tnames[code] = cause",
+			"\t}",
+			"\treturn names",
+			"}()",
+		].join("\n"),
+	);
+
+	emitter.declareRaw(
+		"func:HangupCauseHelpers",
+		[
+			"// HangupCauseCodeOf returns the numeric code for a cause name, and whether it is a name this",
+			'// contract knows. An unknown name yields 0, which is NONE — the "no cause recorded" sentinel',
+			"// and never a real outcome, so a caller that ignores the boolean cannot bill from it.",
+			"func HangupCauseCodeOf(cause HangupCause) (int, bool) {",
+			"\tcode, found := HangupCauseCodes[cause]",
+			"\treturn code, found",
+			"}",
+			"",
+			"// HangupCauseFromCode returns the name for a numeric code.",
+			"//",
+			"// Only the ~65 points a softswitch actually emits are named; anything else a carrier sends is",
+			"// stored as its raw code with NORMAL_UNSPECIFIED, which is why this reports absence rather",
+			"// than inventing a name.",
+			"func HangupCauseFromCode(code int) (HangupCause, bool) {",
+			"\tcause, found := HangupCauseNames[code]",
+			"\treturn cause, found",
+			"}",
+			"",
+			"// IsHangupCause reports whether a string arriving from the wire is a name this contract knows.",
+			"func IsHangupCause(value string) bool {",
+			"\t_, found := HangupCauseCodes[HangupCause(value)]",
+			"\treturn found",
+			"}",
+		].join("\n"),
+	);
+
+	writeText(
+		join(GO_DIR, "hangup_causes_gen.go"),
+		emitter.render(
+			[
+				"The Q.850 hangup-cause taxonomy, plus the FreeSWITCH extensions.",
+				"",
+				"Authority: packages/telephony/src/hangup-causes.ts, itself pinned against the frozen",
+				"reference §6 by its own spec. This is a GENERATED COPY so that Go and TypeScript read one",
+				"table: renaming a member is a breaking change for every stored CDR row, and re-coding one",
+				"silently changes outbound failover, so neither may be decided twice.",
+				"",
+				"apps/sipd/internal/dialog/cause.go defines its Cause* constants in terms of the HangupCode*",
+				"constants here. The SIP status -> Q.850 mapping stays in sipd: that one IS the edge's own",
+				"knowledge (RFC 3398), and nothing outside the SIP stack has an opinion about it.",
+			],
+			"events",
+		),
+	);
+}
+
 function emitGo(
 	eventSchemas: Map<string, JsonSchema>,
 	rpcSchemas: Map<string, { request: JsonSchema; response: JsonSchema }>,
@@ -253,6 +445,8 @@ function emitGo(
 			"events",
 		),
 	);
+
+	emitHangupCauses();
 
 	// -- one file per family ----------------------------------------------------------------------
 	for (const family of FAMILY_ORDER) {
@@ -432,6 +626,19 @@ const DID_CASES = [
 	"+1 (212) 555-0100",
 	"+1-212-555-0100",
 	"0044 1632 960111",
+];
+
+// Instance ids that exercise both branches of instanceSubjectToken: verbatim when the id is already
+// one subject token, SHA-256/32-hex when it carries a dot or punctuation. The engine builds
+// rpc.sip.v1.<verb>.<tok> from these and apps/sipd subscribes with them, so a Go/TS disagreement is a
+// command addressed at a subject nobody is listening on.
+const INSTANCE_ID_CASES = [
+	"sipd",
+	"sipd-2",
+	"engine-7d9f4c-xk2lp",
+	"  sipd  ",
+	"sipd.eu-west.internal",
+	"host name with spaces",
 ];
 
 const AOR_CASES = [
@@ -868,6 +1075,18 @@ function parityGolden(): unknown {
 			subject: subjectFor.registration(ORG_A, aorSubjectToken(AOR_CASES[4] as string), "expired"),
 		},
 		{
+			builder: "sipDialog",
+			args: [ORG_A, LEG_A, "dialog.answered"],
+			subject: subjectFor.sipDialog(ORG_A, LEG_A, "dialog.answered"),
+		},
+		{
+			// A dotted event on the second root that begins `sip.`, so a Go builder that confused
+			// `sip.evt` with `sip.reg` fails here rather than at three in the morning.
+			builder: "sipDialog",
+			args: [ORG_B, LEG_A, "dialog.terminated"],
+			subject: subjectFor.sipDialog(ORG_B, LEG_A, "dialog.terminated"),
+		},
+		{
 			builder: "queue",
 			args: [ORG_A, QUEUE_A, "caller.joined"],
 			subject: subjectFor.queue(ORG_A, QUEUE_A, "caller.joined"),
@@ -936,6 +1155,17 @@ function parityGolden(): unknown {
 			filter: "registrationEventInOrg",
 			args: [ORG_A, "expired"],
 			result: subjectFilterFor.registrationEventInOrg(ORG_A, "expired"),
+		},
+		{ filter: "allSipDialogs", args: [], result: subjectFilterFor.allSipDialogs() },
+		{
+			filter: "sipDialogsInOrg",
+			args: [ORG_A],
+			result: subjectFilterFor.sipDialogsInOrg(ORG_A),
+		},
+		{
+			filter: "sipDialog",
+			args: [ORG_A, LEG_A],
+			result: subjectFilterFor.sipDialog(ORG_A, LEG_A),
 		},
 		{ filter: "allQueues", args: [], result: subjectFilterFor.allQueues() },
 		{ filter: "queuesInOrg", args: [ORG_A], result: subjectFilterFor.queuesInOrg(ORG_A) },
@@ -1037,6 +1267,10 @@ function parityGolden(): unknown {
 		rpcSubjects: RPC_SUBJECTS,
 		queueScopeAll: QUEUE_SCOPE_ALL,
 		aorSubjectTokens: AOR_CASES.map((aor) => ({ aor, token: aorSubjectToken(aor) })),
+		instanceSubjectTokens: INSTANCE_ID_CASES.map((instanceId) => ({
+			instanceId,
+			token: instanceSubjectToken(instanceId),
+		})),
 		didIndexTokens: DID_CASES.map((did) => ({ did, token: didIndexToken(did) })),
 		subjectBuilders,
 		subjectFilters,
@@ -1087,6 +1321,13 @@ function parityGolden(): unknown {
 				key: kvKeyFor.queueWaiting(ORG_A, QUEUE_A),
 			},
 			{ builder: "mediaSession", args: [SESSION_A], key: kvKeyFor.mediaSession(SESSION_A) },
+			{ builder: "sipDialog", args: [LEG_A], key: kvKeyFor.sipDialog(LEG_A) },
+			{ builder: "trunk", args: [ORG_A, TRUNK_A], key: kvKeyFor.trunk(ORG_A, TRUNK_A) },
+			// The one key in this file that TRANSFORMS its argument. Both writers and the reader go
+			// through one function; these vectors are what makes "both" true across the language
+			// border, and a Go folder that dropped the slash would produce a key nobody else writes.
+			{ builder: "sipAcl", args: ["203.0.113.0/24"], key: kvKeyFor.sipAcl("203.0.113.0/24") },
+			{ builder: "sipAcl", args: ["2001:db8::/32"], key: kvKeyFor.sipAcl("2001:db8::/32") },
 		],
 		streams: EVENT_STREAMS.map((definition: StreamDefinition) => ({ ...definition })),
 		kvBuckets: KV_BUCKETS.map((definition: KvBucketDefinition) => ({ ...definition })),

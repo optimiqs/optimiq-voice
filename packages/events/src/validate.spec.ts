@@ -8,6 +8,7 @@ import { makeMediaEvent } from "./schemas/media-events";
 import { makeProvisionEvent } from "./schemas/provision-events";
 import { makeQueueEvent } from "./schemas/queue-events";
 import { makeRegistrationEvent } from "./schemas/registration-events";
+import { makeSipDialogEvent } from "./schemas/sip-dialog-events";
 import { makeTrunkEvent } from "./schemas/trunk-events";
 import { makeVoicemailEvent } from "./schemas/voicemail-events";
 import { EVENT_FAMILIES, RPC_SUBJECTS, subjectFor } from "./subjects";
@@ -47,6 +48,21 @@ const samples = {
 			contact: "sip:1001@10.0.0.5",
 			transport: "udp",
 			expiresInSeconds: 300,
+		},
+	}),
+	sipDialog: makeSipDialogEvent("dialog.terminated", {
+		orgId: ORG,
+		source: "sipd",
+		data: {
+			legId: LEG,
+			callId: CALL,
+			instanceId: "sipd-7c9f",
+			role: "uas",
+			identity: { sipCallId: "a84b4c76e66710@pc33", localTag: "9f2a", remoteTag: "31c8" },
+			reason: "bye",
+			cause: 16,
+			causeFromReasonHeader: false,
+			initiator: "remote",
 		},
 	}),
 	queue: makeQueueEvent("caller.abandoned", {

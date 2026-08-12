@@ -33,6 +33,7 @@ const ORG = "018f2b7c-0000-7000-8000-0000000000aa";
 const CALL = "018f2b7c-0000-7000-8000-0000000000bb";
 const QUEUE = "018f2b7c-0000-7000-8000-0000000000cc";
 const TRUNK = "018f2b7c-0000-7000-8000-0000000000dd";
+const LEG = "018f2b7c-0000-7000-8000-0000000000ee";
 const AOR_HASH = aorSubjectToken("sip:1001@acme.example.com");
 
 describe("subject roots", () => {
@@ -41,6 +42,7 @@ describe("subject roots", () => {
 		expect(SUBJECT_ROOTS).toEqual({
 			call: "calls.evt.v1",
 			registration: "sip.reg.v1",
+			sipDialog: "sip.evt.v1",
 			queue: "queue.evt.v1",
 			voicemail: "voicemail.evt.v1",
 			media: "media.evt.v1",
@@ -58,6 +60,12 @@ describe("subject roots", () => {
 			pbxFileGreeting: "rpc.pbx.v1.file-greeting",
 			sipCredential: "rpc.sip.v1.credential",
 			sipTransfer: "rpc.sip.v1.transfer",
+			sipInvite: "rpc.sip.v1.invite",
+			sipRing: "rpc.sip.v1.ring",
+			sipAnswer: "rpc.sip.v1.answer",
+			sipHangup: "rpc.sip.v1.hangup",
+			sipReinvite: "rpc.sip.v1.reinvite",
+			sipOriginate: "rpc.sip.v1.originate",
 			mediaAllocateSession: "rpc.media.v1.allocate-session",
 			mediaBridgeSessions: "rpc.media.v1.bridge-sessions",
 			mediaUnbridgeSessions: "rpc.media.v1.unbridge-sessions",
@@ -97,6 +105,7 @@ describe("subject roots", () => {
 			"provision",
 			"queue",
 			"registration",
+			"sipDialog",
 			"trunk",
 			"voicemail",
 		]);
@@ -110,6 +119,9 @@ describe("subjectFor", () => {
 		);
 		expect(subjectFor.registration(ORG, AOR_HASH, "registered")).toBe(
 			`sip.reg.v1.${ORG}.${AOR_HASH}.registered`,
+		);
+		expect(subjectFor.sipDialog(ORG, LEG, "dialog.terminated")).toBe(
+			`sip.evt.v1.${ORG}.${LEG}.dialog.terminated`,
 		);
 		expect(subjectFor.queue(ORG, QUEUE, "caller.joined")).toBe(
 			`queue.evt.v1.${ORG}.${QUEUE}.caller.joined`,
@@ -214,6 +226,37 @@ describe("subjectFor.engineParkHandoffRpc", () => {
 		expect(
 			matchesSubject(`${RPC_SUBJECTS.engineParkHandoff}.*`, subjectFor.engineParkHandoffRpc("e1")),
 		).toBe(true);
+	});
+});
+
+describe("the sipd command surface", () => {
+	it("keeps admission and originate FLAT, because neither has an owner yet", () => {
+		expect(subjectFor.sipInviteRpc()).toBe("rpc.sip.v1.invite");
+		expect(subjectFor.sipOriginateRpc()).toBe("rpc.sip.v1.originate");
+	});
+
+	it("addresses the four dialog commands at the instance HOLDING the dialog", () => {
+		expect(subjectFor.sipRingRpc("sipd-7c9f")).toBe("rpc.sip.v1.ring.sipd-7c9f");
+		expect(subjectFor.sipAnswerRpc("sipd-7c9f")).toBe("rpc.sip.v1.answer.sipd-7c9f");
+		expect(subjectFor.sipHangupRpc("sipd-7c9f")).toBe("rpc.sip.v1.hangup.sipd-7c9f");
+		expect(subjectFor.sipReinviteRpc("sipd-7c9f")).toBe("rpc.sip.v1.reinvite.sipd-7c9f");
+	});
+
+	it("hashes an instance id that is not one token, so both ends still agree", () => {
+		expect(subjectFor.sipAnswerRpc("sipd.eu-west.internal")).toBe(
+			`${RPC_SUBJECTS.sipAnswer}.${instanceSubjectToken("sipd.eu-west.internal")}`,
+		);
+	});
+
+	it("is covered by the one-token wildcard nats.conf grants", () => {
+		for (const [prefix, build] of [
+			[RPC_SUBJECTS.sipRing, subjectFor.sipRingRpc],
+			[RPC_SUBJECTS.sipAnswer, subjectFor.sipAnswerRpc],
+			[RPC_SUBJECTS.sipHangup, subjectFor.sipHangupRpc],
+			[RPC_SUBJECTS.sipReinvite, subjectFor.sipReinviteRpc],
+		] as const) {
+			expect(matchesSubject(`${prefix}.*`, build("sipd-1"))).toBe(true);
+		}
 	});
 });
 
@@ -349,6 +392,15 @@ describe("parseSubject round trip", () => {
 		if (parsed.kind !== "registration") throw new Error("unreachable");
 		expect(parsed.aorHash).toBe(AOR_HASH);
 		expect(subjectFor.registration(parsed.orgId, parsed.aorHash, parsed.event)).toBe(subject);
+	});
+
+	it("reverses a sip dialog subject", () => {
+		const subject = subjectFor.sipDialog(ORG, LEG, "dialog.terminated");
+		const parsed = parseSubjectOrThrow(subject);
+		if (parsed.kind !== "sip-dialog") throw new Error("unreachable");
+		expect(parsed.legId).toBe(LEG);
+		expect(parsed.family).toBe("sipDialog");
+		expect(subjectFor.sipDialog(parsed.orgId, parsed.legId, parsed.event)).toBe(subject);
 	});
 
 	it("reverses a queue subject", () => {

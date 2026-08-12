@@ -35,6 +35,8 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/acl"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/command"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/config"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/credentials"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/dialog"
@@ -44,9 +46,12 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/mwi"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/presence"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/profile"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/reaper"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/registrar"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/sipevents"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/subscribe"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/transfer"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/trunk"
 )
 
 func main() {
@@ -217,15 +222,109 @@ func run() error {
 	server.OnRefer(transfers.HandleRefer)
 	server.OnSubscribe(subscriptions.HandleSubscribe)
 
+	var group sync.WaitGroup
+	errs := make(chan error, 8)
+
+	// The two watched read models, and the state they feed.
+	//
+	// Both are opened BEFORE the INVITE surface and both are non-fatal when absent, and the two
+	// halves of that are deliberate. Opened first, because the ACL is a security boundary and an
+	// INVITE listener that started accepting traffic before its ACL had loaded would be admitting
+	// carriers on an empty policy — which fails closed, but fails closed at the cost of a carrier
+	// outage nobody asked for. Non-fatal, because these buckets are written by apps/api: a control
+	// plane that has not deployed yet must not stop this edge from serving REGISTER, which has
+	// nothing to do with either of them.
+	trunkDirectory := trunk.NewDirectory(log)
+	if cfg.EnableInvite {
+		// The status publisher is the JetStream one whenever there is a broker, which by this point
+		// there always is — the process refuses to start without one. LogPublisher survives for the
+		// no-broker development case and is chosen by the same condition, so a deployment either
+		// publishes or says loudly that it cannot and never silently drops a carrier outage.
+		var statusPublisher trunk.Publisher = trunk.NewJetStreamPublisher(js, config.EventSource)
+		if conn == nil {
+			statusPublisher = trunk.LogPublisher{Log: log}
+		}
+
+		registrarClient, err := trunk.NewClientRegistrar(sipClient, trunk.RegistrarOptions{
+			Contact:   contactURI(cfg),
+			UserAgent: cfg.UserAgent,
+		})
+		if err != nil {
+			return err
+		}
+		supervisor, err := trunk.NewSupervisor(trunk.SupervisorOptions{
+			Registrar: registrarClient,
+			Publisher: statusPublisher,
+			Logger:    log,
+		})
+		if err != nil {
+			return err
+		}
+		defer supervisor.Stop()
+
+		// The directory drives the supervisor. This is the wire internal/trunk's package comment has
+		// been describing as missing: "nothing delivers trunk configuration to sipd today… this
+		// package defines the struct it NEEDS, takes it from a caller, and names the ingestion seam".
+		// The seam is the `trunks` bucket, and this is the caller.
+		trunkDirectory.OnChange(func() { supervisor.Apply(ctx, trunkDirectory.Configs()) })
+
+		if bucket, err := trunk.OpenDirectoryBucket(ctx, js); err != nil {
+			log.Warn("no trunk directory is available; every originate to a trunk will be refused "+
+				"unknown_trunk and no carrier registration will be attempted",
+				"bucket", contract.TrunksKV.Name, "error", err)
+		} else if _, err := trunk.Watch(ctx, bucket, trunkDirectory); err != nil {
+			log.Warn("cannot watch the trunk directory", "error", err)
+		}
+	}
+
+	// The dialog table and its claim bucket.
+	//
+	// The claim store is the NATS one whenever the bucket can be opened. The memory one is not a
+	// fallback in the ordinary sense — it lets a single instance work and reaps NOTHING, because a
+	// claim only one process can see is a claim no survivor can act on — so a deployment that lands
+	// on it gets a warning naming the consequence rather than a silent downgrade.
+	dialogs := dialog.NewStore(dialog.StoreOptions{InstanceID: cfg.InstanceID})
+	var claimStore dialog.ClaimStore
+	var claims dialog.ClaimStore = dialog.NewMemoryClaimStore()
+	if cfg.EnableInvite {
+		if store, err := dialog.OpenClaims(ctx, js); err != nil {
+			log.Warn("cannot open the sip-dialogs bucket; this instance's dialogs will not be reaped "+
+				"if it dies, and the engine will hold channels for calls that ended with it",
+				"bucket", contract.SIPDialogsKV.Name, "error", err)
+		} else {
+			claimStore = store
+			claims = store
+		}
+	}
+
+	// The dialog event publisher. JetStream when there is a broker, which there always is by this
+	// point — the process refuses to start without one — so the seam exists for the tests rather
+	// than for a degraded production mode.
+	dialogEvents := sipevents.NewJetStreamPublisher(js)
+
 	// The INVITE surface, off unless SIPD_INVITE says otherwise.
 	//
-	// Off is the honest default and it must stay so until apps/engine serves `rpc.sip.v1.invite`:
-	// with no responder every INVITE is answered 503 after the admission deadline, and a 503 tells
-	// a carrier to retry HERE shortly, whereas the 501 the registrar answers today tells it this
-	// element does not place calls. Turning it on is a deliberate act by a deployment that has the
-	// other half.
+	// Off is still the default, and the reason has CHANGED rather than gone away. It is no longer
+	// "no engine serves rpc.sip.v1.invite" — one does now — it is that turning this on makes a
+	// registrar into a call-processing element, which is a deployment decision with a blast radius
+	// (dialog affinity at the load balancer, a trunk directory, an ACL bucket) that nobody should
+	// acquire by upgrading a binary.
 	if cfg.EnableInvite {
-		invites, err := newInviteHandler(cfg, server, sipClient, authenticator, credentialStore, ctx, log)
+		invites, err := newInviteHandler(inviteDeps{
+			cfg:         cfg,
+			server:      server,
+			client:      sipClient,
+			conn:        conn,
+			bindings:    bindings,
+			trunks:      trunkDirectory,
+			dialogs:     dialogs,
+			claims:      claims,
+			events:      dialogEvents,
+			auth:        authenticator,
+			credentials: credentialStore,
+			ctx:         ctx,
+			log:         log,
+		})
 		if err != nil {
 			return err
 		}
@@ -235,6 +334,58 @@ func run() error {
 		server.OnCancel(invites.HandleCancel)
 		server.OnUpdate(invites.HandleUpdate)
 		server.OnInfo(invites.HandleInfo)
+
+		// The engine's command surface. Attached AFTER the SIP handlers are registered, so a command
+		// can never arrive for a dialog whose handler is not yet installed — which would be a 200 OK
+		// this process could not write.
+		commands, err := command.NewServer(command.Options{
+			Dialogs:    invites,
+			InstanceID: cfg.InstanceID,
+			Logger:     log,
+		})
+		if err != nil {
+			return err
+		}
+		subscriptionsForCommands, err := commands.Subscribe(conn)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			for _, subscription := range subscriptionsForCommands {
+				if err := subscription.Unsubscribe(); err != nil {
+					log.Debug("unsubscribing a command subject", "error", err)
+				}
+			}
+		}()
+		log.Info("dialog command surface ready",
+			"instanceId", cfg.InstanceID,
+			"instanceToken", commands.Token(),
+			"subjects", commands.Subjects(),
+			"originateQueueGroup", command.OriginateQueueGroup)
+
+		// The claim reaper. It is what turns a dead instance's calls into CDR rows the engine would
+		// otherwise never receive (design §6.2), and it is wired only when there is a bucket to sweep
+		// — with the memory claim store there is nothing another instance could ever see.
+		if claimStore != nil && dialogEvents != nil {
+			sweeper, err := reaper.New(reaper.Options{
+				Store:      claimStore,
+				Dialogs:    dialogs,
+				Events:     dialogEvents,
+				InstanceID: cfg.InstanceID,
+				Logger:     log,
+			})
+			if err != nil {
+				return err
+			}
+			group.Add(1)
+			go func() {
+				defer group.Done()
+				if err := sweeper.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					errs <- err
+				}
+			}()
+		}
+
 		defer func() {
 			if !invites.Wait(cfg.ShutdownTimeout) {
 				log.Warn("some dialog work was still in flight at shutdown")
@@ -244,9 +395,6 @@ func run() error {
 
 	// Everything else — MESSAGE, PUBLISH, … — is honestly refused rather than half-answered.
 	server.OnNoRoute(reg.HandleUnsupported)
-
-	var group sync.WaitGroup
-	errs := make(chan error, 8)
 
 	group.Add(1)
 	go func() {
@@ -471,8 +619,31 @@ func newSubscribeHandler(
 	return handler, nil
 }
 
+// inviteDeps is everything the INVITE surface needs, as one struct.
+//
+// A struct rather than thirteen positional parameters, and the reason is not cosmetic: the previous
+// signature had six, four of which were pointers to different services, and this wave adds seven
+// more. A call site with thirteen positional arguments is one transposition away from handing the
+// dialog store to the claim store's slot — which compiles, and which would produce a process that
+// heartbeats an empty table while its real dialogs go unclaimed.
+type inviteDeps struct {
+	cfg         config.Config
+	server      *sipgo.Server
+	client      *sipgo.Client
+	conn        *nats.Conn
+	bindings    kv.Store
+	trunks      *trunk.Directory
+	dialogs     *dialog.Store
+	claims      dialog.ClaimStore
+	events      sipevents.Publisher
+	auth        *registrar.Authenticator
+	credentials credentials.Store
+	ctx         context.Context
+	log         *slog.Logger
+}
+
 // newInviteHandler wires the INVITE surface: two listener profiles, the dialog table, the same
-// digest authenticator every other handler uses, and the engine seam.
+// digest authenticator every other handler uses, the engine seam, and the outbound half.
 //
 // # The two profiles, and why they are structure rather than a comment
 //
@@ -481,27 +652,37 @@ func newSubscribeHandler(
 // authentication, different NAT policy and — the load-bearing one — different ROUTING CONTEXTS: a
 // digest-authenticated call resolves in the tenant's internal context and a trunk-matched one in
 // the untrusted context, which is what stops an inbound PSTN call from dialling back out through a
-// trunk. The external profile exists only when SIPD_TRUNK_ACL names at least one network, because
-// internal/profile refuses to construct an external profile with an empty ACL.
-func newInviteHandler(
-	cfg config.Config,
-	server *sipgo.Server,
-	client *sipgo.Client,
-	authenticator *registrar.Authenticator,
-	credentialStore credentials.Store,
-	ctx context.Context,
-	log *slog.Logger,
-) (*invite.Handler, error) {
-	profiles, err := buildProfiles(cfg)
+// trunk.
+//
+// # The engine seam is real now
+//
+// `rpc.sip.v1.invite` exists and is served, so the Port is the NATS one. RefusingPort survives for
+// the deployment that genuinely has no broker, and it is the honest production behaviour for that
+// state rather than a stub: every INVITE is answered 503 with a Retry-After and the log says why.
+func newInviteHandler(deps inviteDeps) (*invite.Handler, error) {
+	cfg, log := deps.cfg, deps.log
+
+	profiles, aclWatcher, err := buildProfiles(deps.ctx, cfg, deps.conn, log)
 	if err != nil {
 		return nil, err
 	}
-	requester, err := invite.NewClientRequester(client)
+	requester, err := invite.NewClientRequester(deps.client)
+	if err != nil {
+		return nil, err
+	}
+	caller, err := invite.NewClientCaller(deps.client)
+	if err != nil {
+		return nil, err
+	}
+	port, err := invite.NewNATSPort(deps.conn, invite.NATSOptions{})
+	if err != nil {
+		return nil, err
+	}
+	sink, err := invite.NewPublishingSink(deps.events, cfg.InstanceID, log)
 	if err != nil {
 		return nil, err
 	}
 
-	dialogs := dialog.NewStore(dialog.StoreOptions{InstanceID: cfg.InstanceID})
 	timers := dialog.TimerPolicy{
 		Enabled:            cfg.EnableSessionTimers,
 		MinSE:              cfg.MinSE,
@@ -511,24 +692,25 @@ func newInviteHandler(
 	}
 
 	handler, err := invite.New(invite.Options{
-		Realm:       cfg.Realm,
-		Auth:        authenticator,
-		Credentials: credentialStore,
-		Dialogs:     dialogs,
-		// The `sip-dialogs` bucket does not exist in packages/events-go, so the claim store is the
-		// in-process one: a single instance works, and nothing reaps a dead peer's calls. The
-		// contract change that closes it is named in the wave report.
-		Claims:       dialog.NewMemoryClaimStore(),
+		Realm:        cfg.Realm,
+		Auth:         deps.auth,
+		Credentials:  deps.credentials,
+		Dialogs:      deps.dialogs,
+		Claims:       deps.claims,
 		Profiles:     profiles,
-		Port:         invite.RefusingPort{Reason: invite.ReasonShuttingDown},
+		Port:         port,
 		Requester:    requester,
-		Responder:    server,
+		Caller:       caller,
+		Bindings:     deps.bindings,
+		Trunks:       deps.trunks,
+		Responder:    deps.server,
+		Events:       sink,
 		Contact:      contactURI(cfg),
 		InstanceID:   cfg.InstanceID,
 		Timers:       timers,
 		Logger:       log,
 		ServerHeader: cfg.UserAgent,
-		BaseContext:  ctx,
+		BaseContext:  deps.ctx,
 		NewLegID:     contract.NewEventID,
 	})
 	if err != nil {
@@ -538,14 +720,32 @@ func newInviteHandler(
 	log.Info("INVITE handling ready",
 		"instanceId", cfg.InstanceID,
 		"profiles", len(profiles.Profiles()),
+		"admissionSubject", port.Subject(),
+		"admissionTimeout", port.Timeout(),
+		"eventRoot", contract.SubjectRootSIPDialog,
+		"aclEntries", aclWatcher.Len(),
+		"trunks", deps.trunks.Len(),
 		"sessionTimers", cfg.EnableSessionTimers)
-	log.Warn("the INVITE surface is enabled and no engine serves rpc.sip.v1.invite: " +
-		"every call will be refused 503 with a Retry-After until that responder exists")
 	return handler, nil
 }
 
-// buildProfiles turns the configuration into the trust boundaries the INVITE handler enforces.
-func buildProfiles(cfg config.Config) (*profile.Set, error) {
+// buildProfiles turns the configuration and the `sip-acl` bucket into the trust boundaries the
+// INVITE handler enforces.
+//
+// # The external profile now exists whenever a bucket does
+//
+// It used to exist only when SIPD_TRUNK_ACL named a network, because that was the only source of
+// entries. Now the source is the watched bucket, and the profile is built whenever either the
+// bucket can be opened or the override names something. An external profile whose ACL is empty
+// refuses every carrier — `Match` has no default allow and there is no constructor that could give
+// it one — so building it early costs nothing and saves a restart the first time a tenant adds a
+// trunk.
+func buildProfiles(
+	ctx context.Context,
+	cfg config.Config,
+	conn *nats.Conn,
+	log *slog.Logger,
+) (*profile.Set, *acl.Watcher, error) {
 	listeners := make([]profile.Listener, 0, 5)
 	if cfg.EnableUDP {
 		listeners = append(listeners, profile.Listener{Network: "udp", Addr: cfg.ListenAddr})
@@ -569,16 +769,42 @@ func buildProfiles(cfg config.Config) (*profile.Set, error) {
 		})
 	}
 
-	internal := profile.Internal("internal", listeners...)
-	if strings.TrimSpace(cfg.TrunkACL) == "" {
-		return profile.NewSet(internal)
+	overrides, err := parseTrunkACL(cfg.TrunkACL)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	entries, err := parseTrunkACL(cfg.TrunkACL)
+	carrierACL := profile.NewWatchedACL(overrides)
+	watcher, err := acl.NewWatcher(carrierACL, overrides, log)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	external := profile.External("external", profile.NewACL(entries))
+
+	bucketAvailable := false
+	if conn != nil {
+		if js, err := jetstream.New(conn); err == nil {
+			if bucket, err := acl.OpenBucket(ctx, js); err != nil {
+				log.Warn("no sip-acl bucket is available; unauthenticated INVITEs are refused unless "+
+					"SIPD_TRUNK_ACL names their source",
+					"bucket", contract.SIPACLKV.Name, "error", err)
+			} else if _, err := acl.Watch(ctx, bucket, watcher); err != nil {
+				log.Warn("cannot watch the sip-acl bucket", "error", err)
+			} else {
+				bucketAvailable = true
+			}
+		}
+	}
+
+	internal := profile.Internal("internal", listeners...)
+	if !bucketAvailable && len(overrides) == 0 {
+		// Nothing can ever admit an unauthenticated INVITE, so there is no external boundary to
+		// declare. That is the safe state and it is the one this process has always had by default:
+		// every INVITE is challenged for a digest.
+		set, err := profile.NewSet(internal)
+		return set, watcher, err
+	}
+
+	external := profile.External("external", carrierACL)
 	if cfg.ExternalListenAddr != "" {
 		// A socket of its own, which is the stronger separation: the profile is then chosen by the
 		// address the packet ARRIVED ON, which no sender can influence, rather than by the address
@@ -588,12 +814,29 @@ func buildProfiles(cfg config.Config) (*profile.Set, error) {
 			{Network: "tcp", Addr: cfg.ExternalListenAddr},
 		}
 	}
-	return profile.NewSet(internal, external)
+	set, err := profile.NewSet(internal, external)
+	return set, watcher, err
 }
 
 // parseTrunkACL reads `cidr[=trunkId]` entries separated by commas.
+//
+// # It is an OVERRIDE now, not the source
+//
+// The source is the `sip-acl` bucket. This variable survives as an escape hatch and is deliberately
+// not removed, for two situations that are both real: a deployment whose control plane cannot yet
+// write the bucket, and an operator who needs one address admitted RIGHT NOW during an incident and
+// cannot wait for a database write to propagate. Entries from here are recompiled alongside every
+// bucket update and are never removed by one, which is what makes the second case trustworthy.
+//
+// Empty is now legal and is the expected state, where it used to build no external profile at all.
+// A value that is set and names nothing usable is still an error: it is a typo, and a typo in an
+// anti-toll-fraud boundary that silently did nothing is exactly the failure this check exists for.
 func parseTrunkACL(raw string) ([]profile.Entry, error) {
-	fields := strings.Split(raw, ",")
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil
+	}
+	fields := strings.Split(trimmed, ",")
 	entries := make([]profile.Entry, 0, len(fields))
 	for _, field := range fields {
 		field = strings.TrimSpace(field)
@@ -601,6 +844,10 @@ func parseTrunkACL(raw string) ([]profile.Entry, error) {
 			continue
 		}
 		network, trunkID, _ := strings.Cut(field, "=")
+		// Priority zero, which OUTRANKS every bucket entry: acl.priorityOf negates the column, whose
+		// values are positive, so a bucket entry compiles to a negative priority and an override to
+		// zero. That is the intent — an override exists to win — and it is stated here because the
+		// arithmetic is not obvious at either end on its own.
 		entry, err := profile.ParseEntry(network, profile.ActionAllow, 0, strings.TrimSpace(trunkID), "SIPD_TRUNK_ACL")
 		if err != nil {
 			return nil, fmt.Errorf("SIPD_TRUNK_ACL: %w", err)

@@ -70,6 +70,20 @@ export interface TrunkStatusMessage {
  * (cross-checked against the envelope), so a forged id in the payload cannot reach another
  * tenant's row.
  *
+ * ## The consequence for the `trunks` KV read model, stated rather than left to be rediscovered
+ *
+ * Bypassing `TrunksService` also bypasses the repository, so this writer fires neither
+ * `onArtifactCompiled` nor `onMutation` and `TrunkDirectoryPublisher` never hears about it. **That
+ * is correct and nothing here should grow a hook.** The write touches exactly `status`,
+ * `status_changed_at`, `status_reason` and `status_latency_ms`, and `trunkDirectoryEntrySchema`
+ * excludes all four on purpose — reachability is a TRANSITION and travels as
+ * `trunk.evt.v1.….status.changed`, which is the event this consumer is reading. Republishing the
+ * directory here would push a value whose only difference is the `updated_at` that Drizzle's
+ * `$onUpdateFn` moved, waking every watching `sipd` instance on every OPTIONS flap — the same
+ * "wobbly peer becomes load" failure reason 2 above rejects, one process further out. The full
+ * argument, including why a status tick is the wrong thing to repair a lost publish with, is in
+ * `trunk-directory.publisher.ts`'s header.
+ *
  * ## Ordering across redeliveries
  *
  * JetStream orders a subject's messages, but a NAKed delivery is re-offered AFTER newer messages

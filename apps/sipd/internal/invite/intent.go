@@ -8,11 +8,16 @@
 // design §4.2's: sipd owns "is this sender allowed to send me an INVITE", the engine owns "whose
 // call is it".
 //
-// The Port is the seam. Its production implementation is a NATS request against
-// `rpc.sip.v1.invite`, which does not exist yet — the subject, its schemas and the engine responder
-// are all outside this module's boundary. So the interface is here, two fakes are here, and the
-// exact contract the engine must serve is written on Admission and in the report that accompanies
-// this work. Everything up to the seam is real and tested; nothing pretends the far side is.
+// The Port is the seam, and its production implementation now EXISTS: client.go is a raw NATS
+// request against `rpc.sip.v1.invite`, whose schemas are in packages/events and whose responder is
+// in apps/engine. RefusingPort survives beside it and is not a stub — it is the honest production
+// behaviour for a deployment with no broker, answering every INVITE 503 with a Retry-After and
+// logging why, rather than pretending a call could have been placed.
+//
+// This package also owns the OUTBOUND half now (originate.go): the engine's `rpc.sip.v1.originate`
+// resolves an AOR against this edge's own location service or a trunk against the watched directory,
+// and places a UAC INVITE. It still picks no codec in either direction — inbound it forwards an
+// offer it does not parse, outbound one it did not write.
 package invite
 
 import (

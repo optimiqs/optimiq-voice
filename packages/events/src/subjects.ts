@@ -12,6 +12,9 @@ import { createHash } from "node:crypto";
  * ```text
  * calls.evt.v1.<orgId>.<callId>.<event>      event = channel.created … channel.destroyed
  * sip.reg.v1.<orgId>.<aorHash>.<event>       event = registered | unregistered | expired
+ * sip.evt.v1.<orgId>.<legId>.<event>         event = dialog.progressed | dialog.answered |
+ *                                                    dialog.held | dialog.resumed |
+ *                                                    dialog.terminated | dialog.dtmf
  * queue.evt.v1.<orgId>.<queueId>.<event>     event = caller.joined | … | agent.state
  * voicemail.evt.v1.<orgId>.<mailboxId>.<event>  event = message.left | mwi.updated
  * media.evt.v1.<orgId>.<sessionId>.<event>   event = session.ended | session.rtp-timeout |
@@ -27,6 +30,12 @@ import { createHash } from "node:crypto";
  * rpc.pbx.v1.last-caller                     engine -> api; `*69`, answered from cdr-db
  * rpc.pbx.v1.file-greeting                   engine -> api; `*99`, a recorded greeting filed
  * rpc.sip.v1.credential
+ * rpc.sip.v1.invite                          sipd -> engine; ADMISSION only (queue group)
+ * rpc.sip.v1.ring.<sipdInstanceTok>          engine -> sipd; the instance HOLDING the dialog
+ * rpc.sip.v1.answer.<sipdInstanceTok>
+ * rpc.sip.v1.hangup.<sipdInstanceTok>
+ * rpc.sip.v1.reinvite.<sipdInstanceTok>
+ * rpc.sip.v1.originate                       engine -> sipd; ANY instance answers (queue group)
  * rpc.media.v1.allocate-session              engine -> mediad; RAW NATS both ends (see rpc.ts)
  * rpc.media.v1.bridge-sessions
  * rpc.media.v1.unbridge-sessions
@@ -65,6 +74,16 @@ export const SUBJECT_VERSION = "v1";
 export const SUBJECT_ROOTS = {
 	call: `calls.evt.${SUBJECT_VERSION}`,
 	registration: `sip.reg.${SUBJECT_VERSION}`,
+	/**
+	 * SIP DIALOG lifecycle from `apps/sipd` — a second root under `sip.`, alongside `sip.reg`.
+	 *
+	 * A second root rather than a second event family under `sip.reg` because the two differ by two
+	 * orders of magnitude in volume and by their whole purpose: a registration transition is presence,
+	 * and a `dialog.terminated` is CDR evidence carrying a real Q.850 cause. They are carried by
+	 * different streams with different retention for exactly that reason (`SIP_STREAM` versus
+	 * `REGISTRATIONS_STREAM`), and one root per stream is how every other family here is shaped.
+	 */
+	sipDialog: `sip.evt.${SUBJECT_VERSION}`,
 	queue: `queue.evt.${SUBJECT_VERSION}`,
 	voicemail: `voicemail.evt.${SUBJECT_VERSION}`,
 	media: `media.evt.${SUBJECT_VERSION}`,
@@ -120,6 +139,55 @@ export const RPC_SUBJECTS = {
 	 * wait for framing a Go caller never sends. See `schemas/rpc.ts`.
 	 */
 	sipTransfer: `rpc.sip.${SUBJECT_VERSION}.transfer`,
+	/**
+	 * ADMISSION: the SIP edge asking the call engine whether it will take an arriving INVITE at all.
+	 *
+	 * FLAT and queue-grouped, like `rpc.sip.v1.transfer` and unlike the five command subjects below
+	 * it. The asymmetry is the whole shape of the INVITE path (`plans/sipd-invite-design.md` §4.2):
+	 * an arriving call has no owner yet, so whichever engine answers becomes the owner — which is
+	 * precisely what a queue group picks for you — while every command AFTER admission is addressed
+	 * at the one `sipd` process that holds the dialog.
+	 *
+	 * It decides ADMISSION ONLY, never the outcome. A routing walk rings for thirty seconds and a
+	 * request-reply with a sixty-second deadline is a subscription wearing one's clothes; so the
+	 * reply says "yes, and this is the tenant and call id I filed it under", and the ringing, the
+	 * answer and the teardown all arrive later as commands and events.
+	 */
+	sipInvite: `rpc.sip.${SUBJECT_VERSION}.invite`,
+	/**
+	 * The dialog command surface: `apps/engine` (TypeScript) → `apps/sipd` (Go). A PREFIX, not a
+	 * complete subject — see {@link subjectFor.sipRingRpc} and its three siblings.
+	 *
+	 * Instance-addressed for the reason `park-handoff` is, in its strongest form: a SIP dialog's
+	 * transaction state, its retransmission timers and its socket are all LOCAL to one process, and
+	 * its `Contact` header tells the far end which host to send mid-dialog requests to (RFC 3261
+	 * §12.1.1). A second `sipd` cannot answer this call, cannot retransmit its 2xx and cannot BYE it.
+	 * A queue group would deliver each command to a member chosen by the server, and seven times out
+	 * of eight that member is not the one holding the dialog.
+	 *
+	 * The engine learns which instance from the admission reply's own `sipdInstanceId` (for an
+	 * inbound leg) or from the `originate` reply (for an outbound one) — never from a directory
+	 * lookup, because the fact travelled with the leg that created it.
+	 */
+	sipRing: `rpc.sip.${SUBJECT_VERSION}.ring`,
+	/** @see {@link RPC_SUBJECTS.sipRing} — instance-addressed, {@link subjectFor.sipAnswerRpc}. */
+	sipAnswer: `rpc.sip.${SUBJECT_VERSION}.answer`,
+	/** @see {@link RPC_SUBJECTS.sipRing} — instance-addressed, {@link subjectFor.sipHangupRpc}. */
+	sipHangup: `rpc.sip.${SUBJECT_VERSION}.hangup`,
+	/** @see {@link RPC_SUBJECTS.sipRing} — instance-addressed, {@link subjectFor.sipReinviteRpc}. */
+	sipReinvite: `rpc.sip.${SUBJECT_VERSION}.reinvite`,
+	/**
+	 * OUTBOUND: the engine asking the SIP edge to place a call. FLAT and queue-grouped, and the one
+	 * `sipd` command subject that is.
+	 *
+	 * The same distinction `engineOriginate` draws against `engineParkHandoff`: the four subjects
+	 * above act on a dialog that ALREADY exists on exactly one process, while this one CREATES the
+	 * dialog and therefore has no owner to find. **Any** `sipd` may place an outbound call, so the
+	 * reply carries the `instanceId` that took it — and the engine addresses every subsequent command
+	 * on that leg at exactly that instance, the same pattern `mediaAllocateSessionResponseSchema`
+	 * already uses for a media session.
+	 */
+	sipOriginate: `rpc.sip.${SUBJECT_VERSION}.originate`,
 	/**
 	 * The media-plane command surface: `apps/engine` (TypeScript) → `apps/mediad` (Go).
 	 *
@@ -404,6 +472,43 @@ export type CallEvent = (typeof CALL_EVENTS)[number];
 export const REGISTRATION_EVENTS = ["registered", "unregistered", "expired"] as const;
 export type RegistrationEvent = (typeof REGISTRATION_EVENTS)[number];
 
+/**
+ * SIP dialog lifecycle — what `apps/sipd` TELLS, as opposed to what it is ASKED (`rpc.sip.v1.*`).
+ *
+ * The same ask-over-core / tell-over-JetStream split as `MEDIA_SESSION_EVENTS`, and the same
+ * discipline about which facts earn a member. Each of these six maps onto a member of the engine's
+ * existing `MediaEvent` union (`apps/engine/src/media/media-event.ts`) — the union is NOT extended,
+ * because a member nobody branches on is a shape three services would have to agree on for no
+ * reason. `plans/sipd-invite-design.md` §3.3 is the mapping table.
+ *
+ * - `dialog.progressed` is a `18x`: `ringing`, or `early` when the response carried SDP.
+ * - `dialog.answered` is the ACK for a UAS leg and the `2xx` for a UAC leg. The asymmetry is not
+ *   sloppiness — it is the moment the call is genuinely up in each direction, and `billsec` counts
+ *   from it.
+ * - `dialog.held` / `dialog.resumed` are a re-INVITE or UPDATE moving the far end to `sendonly` /
+ *   `inactive` and back.
+ * - `dialog.terminated` carries a REAL Q.850 cause, which is the one thing this plane knows and a
+ *   media plane cannot: `mediad` never saw a SIP response and picks the closest cause it can defend,
+ *   while `sipd` maps the status through RFC 3398 and lets an RFC 3326 `Reason` header win verbatim.
+ * - `dialog.dtmf` is SIP INFO digits ONLY. RFC 4733 is `mediad`'s, and a consumer handed both would
+ *   have to decide which one a `gather` counts.
+ *
+ * Three members of the engine's union are deliberately never produced here, and each absence is a
+ * decision argued in §3.3: `leg-arrived` (it is the admission RPC's caller-side, not an event),
+ * `leg-left` (a SIP dialog either exists or it does not — there is no dialplan to leave) and
+ * `hangup-requested` (under `sipd` there is no "afterwards": a BYE IS the termination, and emitting
+ * both from one wire event would tear the leg down twice).
+ */
+export const SIP_DIALOG_EVENTS = [
+	"dialog.progressed",
+	"dialog.answered",
+	"dialog.held",
+	"dialog.resumed",
+	"dialog.terminated",
+	"dialog.dtmf",
+] as const;
+export type SipDialogEvent = (typeof SIP_DIALOG_EVENTS)[number];
+
 /** Queue/ACD vocabulary. */
 export const QUEUE_EVENTS = [
 	"caller.joined",
@@ -514,6 +619,7 @@ export const QUEUE_SCOPE_ALL = "_all";
 export const EVENT_FAMILIES = [
 	"call",
 	"registration",
+	"sipDialog",
 	"queue",
 	"voicemail",
 	"media",
@@ -677,6 +783,23 @@ export const subjectFor = {
 	registration(orgId: string, aorHash: string, event: RegistrationEvent | (string & {})): string {
 		return `${SUBJECT_ROOTS.registration}.${assertToken("orgId", orgId)}.${assertToken("aorHash", aorHash)}.${assertEvent(event)}`;
 	},
+	/**
+	 * `sip.evt.v1.<orgId>.<legId>.<event>` — one SIP dialog's lifecycle.
+	 *
+	 * The middle token is the LEG id, and that is the whole of `plans/sipd-invite-design.md` §3.1 in
+	 * one line: one string names the leg, the `mediad` session and the `sipd` dialog. The SIP dialog
+	 * identifier — `Call-ID` plus tags — is data on the payload and never the key, because a
+	 * `Call-ID` is phone-chosen, arbitrary-length and full of characters {@link isSubjectToken}
+	 * rejects.
+	 *
+	 * Every subject in this family carries a REAL tenant. That is why admission is an RPC rather than
+	 * an event: for a trunk INVITE the edge does not know the org until the engine answers, and a
+	 * family that started before admission would need an `_unknown` token and a re-publish once the
+	 * tenant was learned.
+	 */
+	sipDialog(orgId: string, legId: string, event: string): string {
+		return `${SUBJECT_ROOTS.sipDialog}.${assertToken("orgId", orgId)}.${assertToken("legId", legId)}.${assertEvent(event)}`;
+	},
 	/** `queue.evt.v1.<orgId>.<queueId>.<event>` */
 	queue(orgId: string, queueId: string, event: QueueEvent | (string & {})): string {
 		return `${SUBJECT_ROOTS.queue}.${assertToken("orgId", orgId)}.${assertToken("queueId", queueId)}.${assertEvent(event)}`;
@@ -745,6 +868,37 @@ export const subjectFor = {
 	/** `rpc.sip.v1.transfer` */
 	sipTransferRpc(): string {
 		return RPC_SUBJECTS.sipTransfer;
+	},
+	/** `rpc.sip.v1.invite` — flat, queue-grouped. See {@link RPC_SUBJECTS.sipInvite}. */
+	sipInviteRpc(): string {
+		return RPC_SUBJECTS.sipInvite;
+	},
+	/**
+	 * `rpc.sip.v1.ring.<instanceToken>` — addressed at the ONE `sipd` holding the dialog.
+	 *
+	 * The token comes from {@link instanceSubjectToken}, so the `sipd` subscribing with its own
+	 * configured id and the engine building the subject from the `sipdInstanceId` it was told on
+	 * admission land on the same string. See {@link RPC_SUBJECTS.sipRing} for why a queue group
+	 * cannot serve this.
+	 */
+	sipRingRpc(instanceId: string): string {
+		return `${RPC_SUBJECTS.sipRing}.${instanceSubjectToken(instanceId)}`;
+	},
+	/** `rpc.sip.v1.answer.<instanceToken>`. @see {@link subjectFor.sipRingRpc} */
+	sipAnswerRpc(instanceId: string): string {
+		return `${RPC_SUBJECTS.sipAnswer}.${instanceSubjectToken(instanceId)}`;
+	},
+	/** `rpc.sip.v1.hangup.<instanceToken>`. @see {@link subjectFor.sipRingRpc} */
+	sipHangupRpc(instanceId: string): string {
+		return `${RPC_SUBJECTS.sipHangup}.${instanceSubjectToken(instanceId)}`;
+	},
+	/** `rpc.sip.v1.reinvite.<instanceToken>`. @see {@link subjectFor.sipRingRpc} */
+	sipReinviteRpc(instanceId: string): string {
+		return `${RPC_SUBJECTS.sipReinvite}.${instanceSubjectToken(instanceId)}`;
+	},
+	/** `rpc.sip.v1.originate` — flat, queue-grouped. See {@link RPC_SUBJECTS.sipOriginate}. */
+	sipOriginateRpc(): string {
+		return RPC_SUBJECTS.sipOriginate;
 	},
 	/** `rpc.engine.v1.originate` — flat, queue-grouped. See {@link RPC_SUBJECTS.engineOriginate}. */
 	engineOriginateRpc(): string {
@@ -841,6 +995,28 @@ export const subjectFilterFor = {
 	},
 	registrationEventInOrg(orgId: string, event: RegistrationEvent | (string & {})): string {
 		return `${SUBJECT_ROOTS.registration}.${assertToken("orgId", orgId)}.*.${assertEvent(event)}`;
+	},
+
+	/**
+	 * Every SIP dialog event, every org — the `SIP` stream's own subject list, and the filter the
+	 * engine subscribes with.
+	 *
+	 * The engine reads this family on a CORE subscription, not a durable consumer, for the identical
+	 * reason it reads `media.evt.v1.>` that way: it wants a leg torn down NOW and must not pay for an
+	 * ack round trip on the call path. The stream exists behind it so a `dialog.terminated` that the
+	 * engine missed is still CDR evidence somebody can replay.
+	 */
+	allSipDialogs(): string {
+		return `${SUBJECT_ROOTS.sipDialog}.>`;
+	},
+	sipDialogsInOrg(orgId: string): string {
+		return `${SUBJECT_ROOTS.sipDialog}.${assertToken("orgId", orgId)}.>`;
+	},
+	sipDialog(orgId: string, legId: string): string {
+		return `${SUBJECT_ROOTS.sipDialog}.${assertToken("orgId", orgId)}.${assertToken("legId", legId)}.>`;
+	},
+	sipDialogEventInOrg(orgId: string, event: SipDialogEvent | (string & {})): string {
+		return `${SUBJECT_ROOTS.sipDialog}.${assertToken("orgId", orgId)}.*.${assertEvent(event)}`;
 	},
 
 	allQueues(): string {
@@ -945,6 +1121,14 @@ export type ParsedSubject =
 			readonly version: string;
 			readonly orgId: string;
 			readonly aorHash: string;
+			readonly event: string;
+	  }
+	| {
+			readonly kind: "sip-dialog";
+			readonly family: "sipDialog";
+			readonly version: string;
+			readonly orgId: string;
+			readonly legId: string;
 			readonly event: string;
 	  }
 	| {
@@ -1054,6 +1238,17 @@ export function parseSubject(subject: string): ParsedSubject | undefined {
 			event: event.join("."),
 		};
 	}
+	if (prefix === "sip.evt" && rest.length >= 3) {
+		const [orgId, legId, ...event] = rest as [string, string, ...string[]];
+		return {
+			kind: "sip-dialog",
+			family: "sipDialog",
+			version,
+			orgId,
+			legId,
+			event: event.join("."),
+		};
+	}
 	if (prefix === "queue.evt" && rest.length >= 3) {
 		const [orgId, queueId, ...event] = rest as [string, string, ...string[]];
 		return { kind: "queue", family: "queue", version, orgId, queueId, event: event.join(".") };
@@ -1116,6 +1311,10 @@ export function isCallEvent(value: string): value is CallEvent {
 
 export function isRegistrationEvent(value: string): value is RegistrationEvent {
 	return (REGISTRATION_EVENTS as readonly string[]).includes(value);
+}
+
+export function isSipDialogEvent(value: string): value is SipDialogEvent {
+	return (SIP_DIALOG_EVENTS as readonly string[]).includes(value);
 }
 
 export function isQueueEvent(value: string): value is QueueEvent {

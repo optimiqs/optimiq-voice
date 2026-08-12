@@ -105,6 +105,10 @@ describe("webhook selectors", () => {
 			"media",
 			"provision",
 			"registration",
+			// The SIP edge's dialog lifecycle. Unserved because `call` already carries every one of
+			// these transitions in business terms — serving both would deliver one call twice, in two
+			// vocabularies, one of which leaks SIP and pod identity. See webhook-selectors.ts.
+			"sipDialog",
 			// Deliberately unserved, not forgotten: a raw status transition is the wrong shape for
 			// the outage callback an integrator actually wants (no damping, a flap per POST). See
 			// the family-by-family note in webhook-selectors.ts; the status reaches tenants via

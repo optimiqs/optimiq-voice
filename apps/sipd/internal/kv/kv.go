@@ -51,6 +51,67 @@ type Binding struct {
 	ExpiresAt    contract.EventTime `json:"expiresAt"`
 	// ExpiresInSeconds is the interval GRANTED, which is not always the one requested.
 	ExpiresInSeconds int `json:"expiresInSeconds"`
+
+	// Contacts is EVERY live contact for this AOR, when there is more than one device.
+	//
+	// # Additive, and the flat fields above stay
+	//
+	// One AOR routinely has several devices — a desk phone and a softphone registered as the same
+	// extension is the normal case — and until this field existed the second REGISTER simply
+	// overwrote the first, so a call rang whichever handset had refreshed most recently and the
+	// other was invisible.
+	//
+	// Adding them could have been done by REPLACING Contact / Transport / SourceAddress with this
+	// slice, and that would have been the tidier shape and the wrong change. Three readers across
+	// two languages already consume the flat fields, and a value shape that arrives before every
+	// reader has been taught about it is a registration that reads as UNREGISTERED — a phone that
+	// cannot be called, produced by a deploy ordering detail. So the flat fields REMAIN and
+	// describe the PRIMARY contact, this slice is optional, and a reader that has never heard of it
+	// behaves exactly as it did before. `registrationBindingSchema` is `.loose()` for the same
+	// reason and carries the identical argument.
+	//
+	// The registrar keeps the two in step BY CONSTRUCTION: aor.ApplyToBinding writes both from one
+	// Set, the primary is Contacts[0], and its fields are copied outward on the same call. A value
+	// where they disagree is a bug in this writer, and a reader should trust the flat fields —
+	// they are the ones every reader has always used.
+	Contacts []Contact `json:"contacts,omitempty"`
+}
+
+// Contact is one device bound to an address of record, as the bucket holds it.
+//
+// The JSON tags match `registrationBindingSchema.contacts`' element exactly for the six fields that
+// schema names, and carry four more — q, regId, callId, cseq — that it does not. That is legal and
+// deliberate: the element schema is `.loose()`, and those four are what make a stored contact
+// round-trip back into an aor.Contact without losing the RFC 3261 §16.6 preference or the RFC 3261
+// §10.3 step 6 ordering check. A TypeScript reader ignores them; this process needs them.
+//
+// It is declared HERE rather than in internal/aor, even though internal/aor is where the model
+// lives, because internal/aor imports this package and the reverse would be a cycle. The bucket's
+// value shape belongs to the package that owns the bucket.
+type Contact struct {
+	// URI is the contact exactly as the device offered it, parameters included. Never routable on
+	// its own from outside this process: a device behind NAT advertises a private address here,
+	// which is what SourceAddress exists for.
+	URI       string                `json:"contact"`
+	Transport contract.SIPTransport `json:"transport"`
+	UserAgent string                `json:"userAgent,omitempty"`
+	// SourceAddress is the observed signalling peer, host:port. The address that actually works.
+	SourceAddress string `json:"sourceAddress,omitempty"`
+	DeviceID      string `json:"deviceId,omitempty"`
+	// Instance is the device's `+sip.instance` (RFC 5626) — the only identity a device has that
+	// survives a changed port, and therefore the one a `{kind:"aor"}` originate should name.
+	Instance string `json:"instance,omitempty"`
+	// RegID is the RFC 5626 `reg-id`: one device with two flows (wifi and cellular) registers twice
+	// with the same instance and different reg-ids, and both are legitimately live.
+	RegID int `json:"regId,omitempty"`
+	// Q is the RFC 3261 §20.10 preference, higher first.
+	Q float64 `json:"q,omitempty"`
+	// CallID and CSeq identify this contact's registration dialog.
+	CallID string `json:"callId,omitempty"`
+	CSeq   uint32 `json:"cseq,omitempty"`
+
+	RegisteredAt contract.EventTime `json:"registeredAt"`
+	ExpiresAt    contract.EventTime `json:"expiresAt"`
 }
 
 // Key returns the bucket key for the binding, <orgId>.<aorHash>, via the shared builder.

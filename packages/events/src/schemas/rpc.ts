@@ -5,6 +5,7 @@ import {
 	destinationTypeSchema,
 	dialStringSchema,
 	dtmfDigitSchema,
+	hangupCauseCodeSchema,
 	hangupCauseSchema,
 	sipTransportSchema,
 	tapModeSchema,
@@ -909,6 +910,668 @@ export const SIP_TRANSFER_RPC = defineRpc(
 	// generous for the work and short enough that a sick engine produces a failed transfer the user
 	// can retry rather than a phone stuck mid-transfer.
 	2_000,
+);
+
+// ---------------------------------------------------------------------------------------------
+// rpc.sip.v1.invite — sipd → engine, ADMISSION
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Why the engine refused to admit an arriving INVITE.
+ *
+ * **This list is unlike every other refusal vocabulary on this backbone, and the difference is the
+ * point: each entry must become a SIP status a STRANGER sees.** Choosing that mapping in the engine
+ * would put SIP vocabulary in a process that has no dialog; choosing it in `apps/sipd` from a
+ * free-text string would put guesswork on the edge. So the list is small and closed, the table that
+ * turns it into a status lives in `apps/sipd/internal/invite/port.go`, and every entry is justified
+ * by what the caller should do next rather than by what went wrong internally.
+ *
+ * | reason | SIP | why |
+ * | --- | --- | --- |
+ * | `unattributed` | `404 Not Found` | no credential org and no `did-index` entry — nobody owns it |
+ * | `unknown_target` | `404 Not Found` | the dialled number resolves to nothing in this tenant's plan |
+ * | `not_permitted` | `403 Forbidden` | authenticated, but not for this context — the toll-fraud line |
+ * | `congestion` | `503` | tenant or trunk channel cap |
+ * | `shutting_down` | `503` + `Retry-After` | drain; the header is what makes a carrier fail OVER |
+ * | `bad_request` | `400 Bad Request` | malformed payload |
+ * | `internal` | `500` | anything else |
+ *
+ * And a refusal is always a REPLY, never a silence — the rule `MEDIA_REFUSAL_REASONS` states. Here
+ * it has teeth beyond good manners: a silent engine leaves the edge holding an INVITE server
+ * transaction until the caller's Timer B, and the caller hears thirty-two seconds of nothing. A
+ * `sipd` whose request times out answers `503` on its own authority and logs the timeout as
+ * DISTINCT from a refusal, exactly as `apps/sipd/internal/transfer/client.go` already does.
+ */
+export const SIP_INVITE_REFUSAL_REASONS = [
+	"unattributed",
+	"unknown_target",
+	"not_permitted",
+	"congestion",
+	"shutting_down",
+	"bad_request",
+	"internal",
+] as const;
+export const sipInviteRefusalReasonSchema = z.enum(SIP_INVITE_REFUSAL_REASONS);
+export type SipInviteRefusalReason = (typeof SIP_INVITE_REFUSAL_REASONS)[number];
+
+/** How the sender proved it may send this INVITE. It decides which context the engine may resolve in. */
+export const sipAuthenticationSchema = z.enum(["digest", "trunk-acl"]);
+export type SipAuthentication = z.infer<typeof sipAuthenticationSchema>;
+
+/** An SDP body, carried opaquely. 16 KiB matches `sdpSchema`'s bound in the media contracts. */
+const sipSdpSchema = z.string().max(16 * 1024);
+
+/** One end of the call as the SIP edge understands it. */
+export const sipPartySchema = z.object({
+	/** What a dial plan consumes: the user part and nothing else. A plan takes a string, not a URI. */
+	number: dialStringSchema,
+	/** The display name when the far end supplied one. PII-adjacent, presentation only. */
+	name: z.string().max(128).optional(),
+	/**
+	 * The canonical address of record.
+	 *
+	 * For the CALLER on a digest-authenticated INVITE this is rebuilt FROM THE CREDENTIAL and never
+	 * copied from the `From` header — the rule `apps/sipd/internal/transfer/handler.go` states as
+	 * "mixing those two up is how an authorisation check becomes decorative". For a trunk call there
+	 * is no credential, so it is absent rather than guessed.
+	 */
+	aor: z.string().max(512).optional(),
+	/** The address verbatim, for the log and for refusing a foreign domain explicitly one day. */
+	uri: z.string().max(1024).optional(),
+});
+
+/**
+ * What the edge observed about where the far end wants its media, versus where its signalling came
+ * from.
+ *
+ * `apps/sipd` does not parse SDP beyond the connection line — it holds no codec knowledge in either
+ * direction (`plans/sipd-invite-design.md` §5.2) — but it DOES know the transport source of the
+ * packet, which is a fact `mediad` cannot learn from the body alone. Carrying the disagreement makes
+ * a NAT latch an EXPECTATION rather than a surprise: the media plane can be told to accept a first
+ * packet from an address the offer never named, instead of discovering it as a timeout.
+ */
+export const sipMediaHintSchema = z.object({
+	/** Where the SIP packets came from, `host:port`. */
+	signallingSource: z.string().max(64).optional(),
+	/** The address in the SDP's connection line, host only. */
+	advertisedMedia: z.string().max(64).optional(),
+	/** The two disagree — the evidence for expecting a latch. */
+	mismatch: z.boolean().default(false),
+	/**
+	 * The advertised media address is in an RFC 1918 / RFC 4193 range.
+	 *
+	 * Proof rather than suspicion, and worth its own field: no packet from a private address reached
+	 * us over the internet, so a latch is certain rather than likely.
+	 */
+	private: z.boolean().default(false),
+});
+
+/** An RFC 3891 `Replaces`, parsed. Identical in shape to `sipTransferRequestSchema.replaces`. */
+export const sipReplacesSchema = z.object({
+	callId: z.string().min(1).max(256),
+	toTag: z.string().min(1).max(128),
+	fromTag: z.string().min(1).max(128),
+	/** The `early-only` flag, which forbids replacing a CONFIRMED dialog. */
+	earlyOnly: z.boolean().default(false),
+});
+
+/**
+ * `rpc.sip.v1.invite` — the SIP edge asking the call engine whether it will take an arriving call.
+ *
+ * ## RAW NATS ON BOTH ENDS
+ *
+ * Go caller (`apps/sipd/internal/invite`), TypeScript responder — the same inversion as
+ * `rpc.sip.v1.transfer`, and the same obligation. A Nest `@MessagePattern` would expect framing a Go
+ * caller never sends and would simply never answer, which on this subject means every INVITE times
+ * out into a `503`.
+ *
+ * ## Admission is synchronous; everything after it is not
+ *
+ * The single most important sentence about this subject. A routing walk is not fast — a ring group
+ * rings for thirty seconds and may then fall through to voicemail — so a request-reply that returned
+ * the call's OUTCOME would need a sixty-second deadline, and a request-reply with a sixty-second
+ * deadline is a subscription wearing one's clothes on a transport with no redelivery. So exactly one
+ * step is synchronous and it decides ADMISSION ONLY: "will you take this call at all", answered with
+ * the tenant, the call id and the instance that took it. The ringing, the answer and the teardown
+ * arrive later as `rpc.sip.v1.*` commands and `sip.evt.v1` events.
+ *
+ * The precedent is one level down in the same process: `apps/sipd/internal/transfer/handler.go`
+ * sends `202 Accepted` BEFORE its RPC, because RFC 3515 §2.4.2 makes accepting a REFER mean "I will
+ * try and I will tell you". `100 Trying` is out before this request for the same reason.
+ *
+ * ## Who resolves the tenant, and why that split is load-bearing
+ *
+ * `sipd` owns "is this sender allowed to send me an INVITE" — digest against the realm's credentials,
+ * or a trunk ACL match for a carrier. The engine owns "whose call is it" — `attributeCall` already
+ * does this in three ordered steps, and the `did-index` bucket exists precisely because the reader
+ * does not know the tenant. So {@link orgId} is present ONLY when a digest resolved a credential, and
+ * the reply carries the org the engine resolved.
+ *
+ * It is also why the event family starts AFTER admission: `sip.evt.v1.<orgId>.<legId>.<event>` needs
+ * a real tenant in the subject, and for a trunk INVITE the edge does not have one until this reply.
+ *
+ * ## The toll-fraud check the engine must perform
+ *
+ * {@link routingContext} is what the EDGE believes it may resolve in. Sending it does not make it
+ * true — it makes it CHECKABLE on the side that can enforce it. **The responder must refuse
+ * `not_permitted` when the context is trunk-capable and {@link authentication} was `trunk-acl`**,
+ * the same division of labour `rpc.sip.v1.transfer` uses when it puts the "is the referrer on this
+ * call" check in the engine because the edge cannot answer it.
+ */
+export const sipInviteRequestSchema = z.object({
+	/**
+	 * The leg id, minted by the EDGE before this request is sent.
+	 *
+	 * One string names the leg, the `mediad` session and the `sipd` dialog (§3.1), and minting it
+	 * before the RPC is what lets the engine hang up a leg whose admission reply it never saw — the
+	 * identical argument `mediaAllocateSessionRequestSchema` makes for caller-assigned session ids.
+	 */
+	legId: z.string().min(1).max(128),
+	/**
+	 * The `sipd` instance holding the dialog. Every subsequent command for this leg is addressed at
+	 * it, because a dialog lives on exactly one process and no other one can answer, retransmit or
+	 * BYE it.
+	 */
+	sipdInstanceId: z.string().min(1).max(128),
+	/** The tenant, present ONLY when a digest resolved a credential. Absent for a trunk. */
+	orgId: z.uuid().optional(),
+	authentication: sipAuthenticationSchema,
+	/** The trust boundary the call arrived on, so a refusal record says which one admitted it. */
+	profile: z.string().max(64).optional(),
+	/** See the toll-fraud note above. The engine may narrow this and must never widen it. */
+	routingContext: z.string().min(1).max(64),
+	from: sipPartySchema,
+	to: sipPartySchema,
+	/** Recorded verbatim, asserted to be nothing. A LOOKUP KEY and never an authorisation. */
+	sipCallId: z.string().min(1).max(256),
+	fromTag: z.string().max(128).optional(),
+	/** Set when an ACL entry attributed the source to a carrier. */
+	trunkId: z.uuid().optional(),
+	sourceAddress: z.string().max(64).optional(),
+	transport: sipTransportSchema.optional(),
+	/** Whether the INVITE carried a body at all. A delayed-offer INVITE is legal and rare. */
+	hasOffer: z.boolean().default(false),
+	/**
+	 * The offer, verbatim and unparsed.
+	 *
+	 * **The one field on this contract whose placement was argued both ways** (§10.3, §11.7). It is
+	 * HERE rather than fetched later because the engine is the courier for SDP: it will hand these
+	 * bytes to `rpc.media.v1.allocate-session` within milliseconds, and the alternative — a second
+	 * round trip back to the edge for them — puts a broker RTT in the middle of an INVITE for no
+	 * gain. It costs one copy on a request that is happening anyway. Re-open it once post-dial delay
+	 * has a measured number.
+	 */
+	sdpOffer: sipSdpSchema.optional(),
+	mediaHint: sipMediaHintSchema.optional(),
+	userAgent: z.string().max(256).optional(),
+	/**
+	 * The RFC 3891 `Replaces` this INVITE carried — a phone completing an attended transfer against
+	 * a dialog we hold.
+	 *
+	 * Both this and {@link replacesLegId} travel because the two halves are in different processes:
+	 * the DIALOG is replaced at the edge, and the CALL the replaced leg belonged to has to be
+	 * re-bridged in the engine. Sending only the SIP identifiers would make the engine re-derive a
+	 * leg id the edge is already holding.
+	 */
+	replaces: sipReplacesSchema.optional(),
+	/**
+	 * The leg the `Replaces` triple resolved to ON THIS INSTANCE, when it resolved at all.
+	 *
+	 * Present is not permission. The engine still owns the authorization question — is this party
+	 * entitled to replace that dialog — for the same reason `sipTransferRequestSchema` puts the
+	 * "is the referrer on this call" check there: the edge digest-authenticated the sender and can
+	 * see that it holds the named dialog, but it cannot see who is a party to the CALL.
+	 */
+	replacesLegId: z.string().min(1).max(128).optional(),
+});
+
+export const sipInviteResponseSchema = z.object({
+	ok: z.boolean(),
+	/** Echoed so a reply cannot be applied to the wrong leg. */
+	legId: z.string().min(1).max(128),
+	/**
+	 * The tenant the engine resolved. For a trunk call this is the first time the edge learns it, and
+	 * it is what makes every `sip.evt.v1` subject carry a real org. Present exactly when `ok`.
+	 */
+	orgId: z.uuid().optional(),
+	/** The engine's call id — the token in `calls.evt.v1.<org>.<callId>.>`. Present when `ok`. */
+	callId: z.string().min(1).max(128).optional(),
+	/** The ENGINE instance that took the call. Always present, refusal included, for the edge's log. */
+	instanceId: z.string().min(1).max(128).optional(),
+	/** What the engine actually resolved in, which may be NARROWER than what was asked for. */
+	routingContext: z.string().max(64).optional(),
+	/** `inbound` or `outbound`, as the engine filed it. */
+	direction: callDirectionSchema.optional(),
+	reason: sipInviteRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type SipInviteRequest = z.infer<typeof sipInviteRequestSchema>;
+export type SipInviteResponse = z.infer<typeof sipInviteResponseSchema>;
+
+export const SIP_INVITE_RPC = defineRpc(
+	RPC_SUBJECTS.sipInvite,
+	sipInviteRequestSchema,
+	sipInviteResponseSchema,
+	// One second, and neither of this file's two usual justifications applies cleanly.
+	//
+	// It is not the 500 ms of `rpc.sip.v1.credential`, which sits inside a REGISTER transaction that
+	// is retransmitting behind it. `100 Trying` is already on the wire here and nothing retransmits.
+	// It is not the 2 s of `rpc.sip.v1.transfer` either, because that one is bounded by somebody
+	// watching a handset and this one is bounded by somebody HOLDING one, listening to silence: the
+	// time from INVITE to `180` now includes this round trip plus the routing walk's first step.
+	//
+	// So: bounded well inside the two seconds every RPC on this backbone is bounded inside, and long
+	// enough that a busy engine answers rather than being declared absent. A timeout is answered
+	// `503` by the edge on its own authority and logged as distinct from a refusal.
+	1_000,
+);
+
+// ---------------------------------------------------------------------------------------------
+// rpc.sip.v1.{ring,answer,hangup,reinvite,originate} — engine → sipd, the dialog command surface
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Why a dialog command was refused.
+ *
+ * Modelled on {@link MEDIA_REFUSAL_REASONS} and governed by the same rule: a refusal is a REPLY, the
+ * caller branches on this code and never on the human-readable `error`, and a responder that simply
+ * does not answer a request it dislikes is indistinguishable from a crashed one.
+ *
+ * The vocabulary is shared by all five commands rather than split per subject, because the five
+ * refuse the same things for the same reasons and a caller that had to learn five overlapping
+ * enumerations would end up switching on strings.
+ */
+export const SIP_DIALOG_REFUSAL_REASONS = [
+	/** Malformed payload, or a required field missing. Retrying the same bytes fails the same way. */
+	"bad_request",
+	/** No dialog with that leg id on this instance. 481 on the wire if it were one. */
+	"unknown_dialog",
+	/**
+	 * The dialog belongs to ANOTHER `sipd` instance.
+	 *
+	 * Reachable here in a way it is not on `rpc.sip.v1.transfer`, and that is the point: these
+	 * subjects are instance-addressed, so this answer means the caller's idea of who owns the leg is
+	 * stale — a `sipd` was restarted and something is still addressing the old token. Do not retry
+	 * here; the leg is gone with the process that held it (§6.4).
+	 */
+	"wrong_instance",
+	/**
+	 * The dialog existed and has just ended — the CANCEL/answer race, decided by construction.
+	 *
+	 * One goroutine owns one dialog, so a CANCEL and an `answer` are two messages on one channel and
+	 * exactly one wins. The loser is refused BY NAME rather than left ambiguous, and the engine
+	 * treats it as it already treats `channel_gone` from the transfer responder.
+	 */
+	"dialog_gone",
+	/** The command does not apply in the dialog's current state — an `answer` on an answered call. */
+	"invalid_state",
+	/** An originate to an AOR with no live registration. The engine's `USER_NOT_REGISTERED`. */
+	"unregistered_target",
+	/** An originate naming a trunk this edge does not hold configuration for. */
+	"unknown_trunk",
+	/** DNS or transport failure reaching the target. Nothing was sent. */
+	"no_route",
+	/** A trunk's `maxChannels`, or this instance's own dialog cap. A LOAD signal. */
+	"capacity",
+	/** This instance is draining. Do not retry HERE — originate somewhere else. */
+	"shutting_down",
+	/**
+	 * The command is understood and this build cannot serve it.
+	 *
+	 * `reinvite` answers this until slice 5, which is the honest state: `sipgo` has no re-INVITE at
+	 * all (§9.2), and a hold that silently no-opped would be a call whose media direction is whatever
+	 * the last answer happened to say.
+	 */
+	"not_supported",
+	/** Anything else. */
+	"internal",
+] as const;
+export const sipDialogRefusalReasonSchema = z.enum(SIP_DIALOG_REFUSAL_REASONS);
+export type SipDialogRefusalReason = (typeof SIP_DIALOG_REFUSAL_REASONS)[number];
+
+/**
+ * The fields every dialog command reply carries.
+ *
+ * `instanceId` is always present, refusal included, because the caller's next move on a
+ * `wrong_instance` is to work out who DID answer.
+ */
+const sipDialogResponseBase = {
+	ok: z.boolean(),
+	legId: z.string().min(1).max(128),
+	instanceId: z.string().min(1).max(128).optional(),
+	reason: sipDialogRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+};
+
+/**
+ * `rpc.sip.v1.ring` — send a provisional response on a leg the edge has not answered.
+ *
+ * `180 Ringing` WITHOUT a body at slice 1. Early media — a `183` carrying an answer — is deferred to
+ * the slice that has something to put in it, and the reason to defer rather than build is exact: a
+ * `183` with an answer COMMITS the offer/answer exchange, and the subsequent `200 OK` must then
+ * repeat that same answer (RFC 3261 §13.2.1). Getting it wrong produces a call that connects and has
+ * no audio, which is the defect class this whole design spends its budget avoiding.
+ *
+ * `mediad`'s allocate is idempotent on `sessionId`, so when early media does arrive the same allocate
+ * returns the same session and the same SDP and re-using the answer costs nothing.
+ */
+export const sipRingRequestSchema = z.object({
+	legId: z.string().min(1).max(128),
+	/** 180 by default. 183 requires {@link sdpAnswer}; 181 and 182 are legal and unused. */
+	status: z.int().min(180).max(183).default(180),
+	/**
+	 * The answer to put in a `183 Session Progress`. Absent means `180 Ringing` with no body.
+	 *
+	 * Refused `not_supported` until early media ships — see the note above on why a half-built early
+	 * media path is worse than none.
+	 */
+	sdpAnswer: sipSdpSchema.optional(),
+});
+
+export const sipRingResponseSchema = z.object({ ...sipDialogResponseBase });
+
+export type SipRingRequest = z.infer<typeof sipRingRequestSchema>;
+export type SipRingResponse = z.infer<typeof sipRingResponseSchema>;
+
+export const SIP_RING_RPC = defineRpc(
+	RPC_SUBJECTS.sipRing,
+	sipRingRequestSchema,
+	sipRingResponseSchema,
+	// 500 ms. Everything behind it is a state transition and one write to a socket, and a caller
+	// is listening to silence until the 180 lands.
+	500,
+);
+
+/**
+ * `rpc.sip.v1.answer` — put a `200 OK` with this body on the socket.
+ *
+ * ## It replies when the 2xx IS WRITTEN, not when the ACK arrives
+ *
+ * **The single most important consequence of `sipgo`'s shape for this whole design** (§4.6), and the
+ * reason the deadline below is 1000 ms rather than the thirty-two seconds the SIP transaction may
+ * take. `sipgo`'s `DialogServerSession.WriteResponse` BLOCKS the calling goroutine until the ACK or
+ * 64×T1 ≈ 32 s, retransmitting the 2xx per RFC 6026. An RPC wrapped around that block would time out
+ * on every call whose ACK is even slightly late, and the engine would re-issue an `answer` against a
+ * call that is already up.
+ *
+ * So the command handler hands the response to the dialog's own goroutine and answers immediately,
+ * and the ACK is reported later as `sip.evt.v1.…dialog.answered`. This mirrors `rpc.media.v1.send-dtmf`,
+ * which answers when injection has STARTED.
+ *
+ * Idempotent on `legId`, like every command here: a timed-out `answer` may be re-issued, and the
+ * second one is refused `invalid_state` rather than answering the call twice.
+ */
+export const sipAnswerRequestSchema = z.object({
+	legId: z.string().min(1).max(128),
+	/**
+	 * The answer `mediad` wrote, verbatim. Required: a `200 OK` to an offer with no body is a call
+	 * that connects to silence, which is exactly the failure mode this contract exists to prevent.
+	 */
+	sdpAnswer: sipSdpSchema,
+});
+
+export const sipAnswerResponseSchema = z.object({
+	...sipDialogResponseBase,
+	/** When the 2xx went on the socket. Present when `ok`, and the anchor for a post-dial-delay plot. */
+	sentAt: z.iso.datetime().optional(),
+});
+
+export type SipAnswerRequest = z.infer<typeof sipAnswerRequestSchema>;
+export type SipAnswerResponse = z.infer<typeof sipAnswerResponseSchema>;
+
+export const SIP_ANSWER_RPC = defineRpc(
+	RPC_SUBJECTS.sipAnswer,
+	sipAnswerRequestSchema,
+	sipAnswerResponseSchema,
+	// One second, and NOT the 32 s its SIP transaction can take — see the note above. What is inside
+	// the budget is a mailbox hop onto the dialog's goroutine and one socket write.
+	1_000,
+);
+
+/**
+ * `rpc.sip.v1.hangup` — end this leg with this cause.
+ *
+ * **The edge chooses the METHOD, from the dialog state it owns**: a BYE if the dialog is confirmed, a
+ * CANCEL if we are a UAC in an early dialog, a `4xx`/`5xx`/`6xx` final if we are a UAS that has not
+ * answered. The engine says "end this leg with this cause" and nothing more, which is exactly what
+ * `MediaPort.hangup(channelId, cause)` already says and is why no method field appears here — a
+ * caller that could pick the method could pick a wrong one, and the process that knows is the one
+ * holding the CSeq.
+ *
+ * Two RFC 3261 deferrals are the edge's too, and they are why a hangup can succeed without anything
+ * leaving immediately: a BYE MUST NOT go out on a 2xx we sent and that has not been ACKed (§15), and
+ * a CANCEL has nothing to match against before a provisional response arrives (§9.1). Both cases
+ * answer `ok` and send when they may.
+ */
+export const sipHangupRequestSchema = z.object({
+	legId: z.string().min(1).max(128),
+	/**
+	 * The Q.850 cause, which becomes an RFC 3326 `Reason` header on the BYE and, on an unanswered
+	 * UAS leg, chooses the failure status the caller sees.
+	 */
+	cause: hangupCauseCodeSchema.optional(),
+	/** Free text for the log and the `Reason` header's `text=` parameter. Never a branch. */
+	detail: z.string().max(256).optional(),
+});
+
+export const sipHangupResponseSchema = z.object({
+	...sipDialogResponseBase,
+	/**
+	 * What the edge actually sent, or `deferred` when RFC 3261 says it may not send yet.
+	 *
+	 * Reported rather than hidden because "the hangup succeeded and no packet left" is otherwise
+	 * indistinguishable from a bug, and because a `deferred` is the one outcome where a later
+	 * `dialog.terminated` is genuinely still owed.
+	 */
+	method: z.enum(["bye", "cancel", "respond", "deferred", "none"]).optional(),
+});
+
+export type SipHangupRequest = z.infer<typeof sipHangupRequestSchema>;
+export type SipHangupResponse = z.infer<typeof sipHangupResponseSchema>;
+
+export const SIP_HANGUP_RPC = defineRpc(
+	RPC_SUBJECTS.sipHangup,
+	sipHangupRequestSchema,
+	sipHangupResponseSchema,
+	// 500 ms. A state transition and one socket write, like `ring`.
+	500,
+);
+
+/**
+ * `rpc.sip.v1.reinvite` — re-point or re-negotiate a confirmed dialog.
+ *
+ * Declared in full and refused `not_supported` until slice 5, deliberately rather than omitted. Two
+ * things are waiting on it and both are named in the peer designs, so the subject existing is what
+ * lets them be planned against:
+ *
+ * - **Hold.** `CallControl.hold` calls `media.hold(...)`, which on this plane means "re-INVITE the
+ *   far end with `a=sendonly`".
+ * - **`mediad`'s graceful drain.** `plans/mediad-design.md` §10 q12 says the missing piece is the
+ *   MOVE, and that repointing a far end needs an authenticated re-INVITE from the signalling plane,
+ *   "so this cannot be finished inside `mediad` at all". This is that command.
+ *
+ * `sipgo` supplies none of it (§9.2): `DialogServerSession.inviteTx` is the ORIGINAL transaction and
+ * nothing swaps it, there is no offer/answer version tracking, and RFC 3261 §14.2 glare — `491
+ * Request Pending` plus the asymmetric retry interval — is absent entirely. Shipping a re-INVITE
+ * without glare handling would let a hold issued at the same moment the far end holds produce two
+ * dialogs each believing they own an outstanding offer, with the media direction decided by whichever
+ * answer landed last. That is why this refuses rather than half-works.
+ */
+export const sipReinviteRequestSchema = z.object({
+	legId: z.string().min(1).max(128),
+	/** The new offer, written by `mediad`. The edge forwards bytes it does not parse. */
+	sdpOffer: sipSdpSchema,
+	/**
+	 * What the re-INVITE is FOR, so the edge can publish `dialog.held` / `dialog.resumed` rather than
+	 * making the engine infer intent from a body neither process parses.
+	 */
+	intent: z.enum(["hold", "resume", "move", "refresh"]).default("move"),
+});
+
+export const sipReinviteResponseSchema = z.object({
+	...sipDialogResponseBase,
+	/** The far end's answer, when it came back inside the deadline. */
+	sdpAnswer: sipSdpSchema.optional(),
+});
+
+export type SipReinviteRequest = z.infer<typeof sipReinviteRequestSchema>;
+export type SipReinviteResponse = z.infer<typeof sipReinviteResponseSchema>;
+
+export const SIP_REINVITE_RPC = defineRpc(
+	RPC_SUBJECTS.sipReinvite,
+	sipReinviteRequestSchema,
+	sipReinviteResponseSchema,
+	// One second: it replies when the re-INVITE is on the socket, on the same reasoning as `answer`.
+	// The far end's answer is a full transaction away and arrives as an event.
+	1_000,
+);
+
+/**
+ * Where an outbound leg is going.
+ *
+ * ## Why a structured target and not a dial template
+ *
+ * `OriginateRequest.endpoint` is "technology + resource in the media server's vocabulary"
+ * (`PJSIP/1001`), produced by substituting `ENGINE_EXTENSION_DIAL_TEMPLATE` /
+ * `ENGINE_TRUNK_DIAL_TEMPLATE`, where `{trunk}` is the trunk's NAME column. New templates —
+ * `sip:{number}@{trunk}` — were the smaller change and lose on substance: a template hides
+ * everything that makes a trunk dialable. The `trunk` row holds `sipProxy`, `outboundProxy`,
+ * `authUser`, `sipSecretRef`, `transport` and `registerExpiresSeconds`, none of which is expressible
+ * as `{number}` and `{trunk}`, and a template carrying only the NAME would force the edge to
+ * re-resolve a trunk against a database it holds no handle on.
+ *
+ * So `endpoint` stays exactly as it is for the ARI adapter, and this rides alongside it.
+ *
+ * ## Where the AOR lookup happens is itself a decision
+ *
+ * Today `PJSIP/1001` makes Asterisk consult its own registrar. Under `sipd` the lookup moves into the
+ * process that OWNS the location service and already writes it. That deletes a duplicate registrar
+ * rather than adding a hop.
+ *
+ * ## Why a tagged object rather than a discriminated union
+ *
+ * A `z.discriminatedUnion` reads better in TypeScript and does not survive the border: Go has no sum
+ * type, so `packages/events-go` would emit either an `any` or a hand-written unmarshaller, and a
+ * hand-written unmarshaller is exactly the kind of second opinion the codegen exists to prevent. So
+ * the shape is one struct with a `kind` and three optional groups, and the pairing is enforced by
+ * {@link sipDialTargetSchema}'s refinement rather than by the type system — checked identically on
+ * both sides because both sides run the same validation, one against the schema and one against the
+ * generated struct's required-field switch.
+ */
+export const SIP_DIAL_TARGET_KINDS = ["aor", "trunk", "uri"] as const;
+export const sipDialTargetKindSchema = z.enum(SIP_DIAL_TARGET_KINDS);
+export type SipDialTargetKind = (typeof SIP_DIAL_TARGET_KINDS)[number];
+
+export const sipDialTargetSchema = z
+	.object({
+		kind: sipDialTargetKindSchema,
+		/** `kind: "aor"` — `sip:1001@realm`. The edge reads its own `registrations` bucket. */
+		aor: z.string().min(3).max(512).optional(),
+		/** `kind: "trunk"` — the edge reads the trunk directory for proxy, credentials and transport. */
+		trunkId: z.uuid().optional(),
+		/** `kind: "trunk"` — the number to dial over it. */
+		number: dialStringSchema.optional(),
+		/** `kind: "uri"` — a fully-qualified target, e.g. a REFER into another domain. */
+		uri: z.string().min(3).max(1024).optional(),
+	})
+	.superRefine((target, context) => {
+		const required = { aor: ["aor"], trunk: ["trunkId", "number"], uri: ["uri"] }[target.kind];
+		for (const field of required) {
+			if (target[field as "aor" | "trunkId" | "number" | "uri"] === undefined) {
+				context.addIssue({
+					code: "custom",
+					path: [field],
+					message: `is required when kind is "${target.kind}"`,
+				});
+			}
+		}
+	});
+export type SipDialTarget = z.infer<typeof sipDialTargetSchema>;
+
+/**
+ * `rpc.sip.v1.originate` — the engine asking the edge to place a call.
+ *
+ * FLAT and queue-grouped, the one command subject in this family that is: the four above it act on a
+ * dialog that already exists on one process, and this one CREATES the dialog and has no owner to
+ * find. **The reply carries the `instanceId` that took it, and the engine addresses every subsequent
+ * command on that leg at exactly that instance** — the same pattern
+ * `mediaAllocateSessionResponseSchema.instanceId` established for a media session.
+ *
+ * ## It replies when the INVITE is SENT, not when it is answered
+ *
+ * The same split `MediaPort.originate` already has — it returns an `OriginatedChannel`, not an
+ * answered call. The `2xx` arrives later as `sip.evt.v1.…dialog.answered`, and a `18x` as
+ * `dialog.progressed`.
+ *
+ * ## The edge holds no codec knowledge in EITHER direction
+ *
+ * {@link sdpOffer} is written by `rpc.media.v1.create-offer`, because a B-leg has no offer — we are
+ * the one calling. `mediad` offers exactly what `mediad` can serve, and a callee that answers with
+ * something else is refused at `accept-answer`. `sipd` forwards an offer it did not write, exactly as
+ * inbound it forwards one it does not parse. `trunk.codecPrefs` is therefore ADVISORY until the rung
+ * that can serve it: a trunk configured for Opus gets a G.711 offer and the ROW is wrong rather than
+ * the call.
+ *
+ * ## Forking stays in the engine
+ *
+ * The edge does not implement SIP forking and will not. The engine already forks, and forks better:
+ * `dialSimultaneous` mints one channel id per attempt, installs a watcher on each BEFORE any
+ * originate is issued, settles on the first answer and gives the loser `LOSE_RACE` — with a
+ * `ChannelAggregate` and therefore a CDR row per attempt. An edge that forked would have to reproduce
+ * the race, the per-attempt accounting and the confirmation flow in a process that has no CDR and no
+ * plan. It grows multiple CONTACTS per AOR and reports them; the engine originates one dialog each.
+ */
+export const sipOriginateRequestSchema = z.object({
+	/**
+	 * The leg id, minted by the ENGINE — the mirror of the inbound direction, where the edge mints it.
+	 * Either way one string names the leg, the dialog and the media session.
+	 */
+	legId: z.string().min(1).max(128),
+	orgId: z.uuid(),
+	callId: z.string().min(1).max(128),
+	target: sipDialTargetSchema,
+	/** What to present. Advisory in the same sense `originateRequestSchema.callerIdNumber` is. */
+	callerIdNumber: dialStringSchema.optional(),
+	callerIdName: z.string().max(128).optional(),
+	/** The offer `mediad` wrote for this leg. See the codec note above. */
+	sdpOffer: sipSdpSchema,
+	/**
+	 * How long to leave the INVITE outstanding before CANCELling it.
+	 *
+	 * Bounded rather than open, for the reason `originateRequestSchema.ringTimeoutSeconds` gives: an
+	 * originate that rings forever is a dialog and an RTP port pair held by nobody.
+	 */
+	ringTimeoutMs: z.int().min(1_000).max(600_000).optional(),
+	/**
+	 * Extra headers to put on the INVITE — `X-` headers a tenant's carrier expects, and the call id
+	 * correlation the support desk asks for.
+	 *
+	 * Deliberately not a free-for-all: the edge refuses any name that would let a caller forge a
+	 * routing or authentication header, because a contract that let the engine write `From` would
+	 * make the edge's own authorisation decorative.
+	 */
+	headers: z.record(z.string().max(64), z.string().max(512)).optional(),
+});
+
+export const sipOriginateResponseSchema = z.object({
+	...sipDialogResponseBase,
+	/** The URI the INVITE actually went to, after the AOR or trunk lookup. Diagnostics. */
+	requestUri: z.string().max(1024).optional(),
+	/** The dialog's `Call-ID`, so a capture can be lined up before any event has been published. */
+	sipCallId: z.string().max(256).optional(),
+});
+
+export type SipOriginateRequest = z.infer<typeof sipOriginateRequestSchema>;
+export type SipOriginateResponse = z.infer<typeof sipOriginateResponseSchema>;
+
+export const SIP_ORIGINATE_RPC = defineRpc(
+	RPC_SUBJECTS.sipOriginate,
+	sipOriginateRequestSchema,
+	sipOriginateResponseSchema,
+	// One second: a registration lookup or a trunk directory read, then one INVITE on a socket. It
+	// replies when the INVITE has been SENT, so the far end's ringing is not inside this budget.
+	1_000,
 );
 
 // ---------------------------------------------------------------------------------------------
@@ -2805,6 +3468,12 @@ export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.pbxFileGreeting]: FILE_GREETING_RPC,
 	[RPC_SUBJECTS.sipCredential]: SIP_CREDENTIAL_RPC,
 	[RPC_SUBJECTS.sipTransfer]: SIP_TRANSFER_RPC,
+	[RPC_SUBJECTS.sipInvite]: SIP_INVITE_RPC,
+	[RPC_SUBJECTS.sipRing]: SIP_RING_RPC,
+	[RPC_SUBJECTS.sipAnswer]: SIP_ANSWER_RPC,
+	[RPC_SUBJECTS.sipHangup]: SIP_HANGUP_RPC,
+	[RPC_SUBJECTS.sipReinvite]: SIP_REINVITE_RPC,
+	[RPC_SUBJECTS.sipOriginate]: SIP_ORIGINATE_RPC,
 	[RPC_SUBJECTS.mediaAllocateSession]: MEDIA_ALLOCATE_SESSION_RPC,
 	[RPC_SUBJECTS.mediaBridgeSessions]: MEDIA_BRIDGE_SESSIONS_RPC,
 	[RPC_SUBJECTS.mediaUnbridgeSessions]: MEDIA_UNBRIDGE_SESSIONS_RPC,

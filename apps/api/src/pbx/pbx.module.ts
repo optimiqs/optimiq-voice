@@ -94,6 +94,7 @@ import { RoutingRpcController } from "./routing/routing-rpc.controller";
 import { RoutingController } from "./routing/routing.controller";
 import { RoutingService } from "./routing/routing.service";
 import { SipAclEntriesController } from "./security/sip-acl.controller";
+import { affectsSipAcl, SipAclPublisher } from "./security/sip-acl.publisher";
 import { SipAclEntriesService } from "./security/sip-acl.service";
 import { SipAuthEventQueryService } from "./security/sip-auth-event-query.service";
 import { SipAuthEventController } from "./security/sip-auth-event.controller";
@@ -125,6 +126,7 @@ import {
 	TranslationRulesetsService,
 	TranslationRulesService,
 } from "./translations/translations.service";
+import { affectsTrunkDirectory, TrunkDirectoryPublisher } from "./trunks/trunk-directory.publisher";
 import { TrunkStatusConsumer } from "./trunks/trunk-status-consumer.service";
 import { TrunksController } from "./trunks/trunks.controller";
 import { TrunksService } from "./trunks/trunks.service";
@@ -149,6 +151,7 @@ import { WebhooksService } from "./webhooks/webhooks.service";
 import type { ObjectStore } from "../storage";
 import type { TranscriptionEnv, TranscriptionProvider } from "../transcription";
 import type { PbxEnv } from "./shared/pbx-env";
+import type { ProjectionName } from "./shared/projection-outbox";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
 const logger = getLogger("api.pbx");
@@ -453,6 +456,10 @@ const logger = getLogger("api.pbx");
 		RoutingCachePublisher,
 		DidIndexPublisher,
 		QueueMembershipPublisher,
+		// The two SIP-edge read models, beside the three the engine reads. Declared before
+		// `ProjectionOutboxSweeper`, which injects all five.
+		SipAclPublisher,
+		TrunkDirectoryPublisher,
 		AgentStatePublisher,
 		ProjectionOutboxSweeper,
 		AuditLogService,
@@ -463,6 +470,8 @@ const logger = getLogger("api.pbx");
 				publisher: RoutingCachePublisher,
 				didIndex: DidIndexPublisher,
 				queueMembership: QueueMembershipPublisher,
+				trunkDirectory: TrunkDirectoryPublisher,
+				sipAcl: SipAclPublisher,
 				env: PbxEnv,
 				audit: AuditLogService,
 			) => {
@@ -481,7 +490,7 @@ const logger = getLogger("api.pbx");
 				 */
 				const discharge = (
 					organizationId: string,
-					projection: "routing-cache" | "did-index" | "queue-membership",
+					projection: ProjectionName,
 					cutoff: Date,
 				): void => {
 					if (env.NATS_URL === undefined) {
@@ -579,24 +588,81 @@ const logger = getLogger("api.pbx");
 					 * during shutdown into an unhandled rejection that kills the process.
 					 */
 					onMutation: (event) => {
-						if (!affectsQueueMembership(event.tableName)) {
-							return;
-						}
 						const cutoff = new Date();
-						queueMembership
-							.syncOrganization(event.organizationId)
-							.then((result) => {
-								if (!result.skipped) {
-									discharge(event.organizationId, "queue-membership", cutoff);
-								}
-							})
-							.catch((cause) => {
-								logger.error(
-									cause,
-									`queue-membership sync failed for organization ${event.organizationId} ` +
-										`after a ${event.operation} on ${event.tableName}`,
-								);
-							});
+						if (affectsQueueMembership(event.tableName)) {
+							queueMembership
+								.syncOrganization(event.organizationId)
+								.then((result) => {
+									if (!result.skipped) {
+										discharge(event.organizationId, "queue-membership", cutoff);
+									}
+								})
+								.catch((cause) => {
+									logger.error(
+										cause,
+										`queue-membership sync failed for organization ${event.organizationId} ` +
+											`after a ${event.operation} on ${event.tableName}`,
+									);
+								});
+						}
+						/**
+						 * The carrier directory, on this seam and NOT on `onArtifactCompiled`.
+						 *
+						 * `affectsRouting("trunk")` is true, so a trunk write does recompile and the
+						 * artifact seam does fire — which makes riding on it look available and is exactly
+						 * why the choice is worth recording. It would be wrong twice. The artifact seam is
+						 * gated on `compiled.changed`, and the snapshot hash covers what the COMPILER reads
+						 * from the row; a carrier that changed only its `sip_proxy` can leave that hash
+						 * untouched and would then never reach the edge. And the artifact seam is silent for
+						 * a table that does not recompile at all, which is the case the ACL below is in. One
+						 * seam, one predicate per bucket, is the shape that cannot develop a hole.
+						 *
+						 * `TrunkStatusConsumer` writes `trunk` without passing through the repository and so
+						 * never arrives here. That is deliberate and the full argument is in
+						 * `trunks/trunk-directory.publisher.ts`'s header: it writes exactly the four
+						 * `status*` columns the directory value excludes.
+						 */
+						if (affectsTrunkDirectory(event.tableName)) {
+							trunkDirectory
+								.syncOrganization(event.organizationId)
+								.then((result) => {
+									if (!result.skipped) {
+										discharge(event.organizationId, "trunks", cutoff);
+									}
+								})
+								.catch((cause) => {
+									logger.error(
+										cause,
+										`trunks sync failed for organization ${event.organizationId} ` +
+											`after a ${event.operation} on ${event.tableName}`,
+									);
+								});
+						}
+						/**
+						 * The admission list. `sip_acl_entry` is absent from `ROUTING_TABLE_TO_ENTITY`, so
+						 * `affectsRouting` is false, no artifact is compiled and no `onArtifactCompiled`
+						 * ever fires — this seam is not the better hook for it, it is the ONLY one.
+						 *
+						 * A contested network is left pending, exactly as a `did-index` conflict is: the KV
+						 * key is the network alone and two rows have landed on it, the publisher refuses to
+						 * pick, and leaving the obligation owed is what puts a human in front of it.
+						 */
+						if (affectsSipAcl(event.tableName)) {
+							sipAcl
+								.syncOrganization(event.organizationId)
+								.then((result) => {
+									if (!result.skipped && result.conflicts.length === 0) {
+										discharge(event.organizationId, "sip-acl", cutoff);
+									}
+								})
+								.catch((cause) => {
+									logger.error(
+										cause,
+										`sip-acl sync failed for organization ${event.organizationId} ` +
+											`after a ${event.operation} on ${event.tableName}`,
+									);
+								});
+						}
 					},
 				});
 			},
@@ -605,6 +671,8 @@ const logger = getLogger("api.pbx");
 				RoutingCachePublisher,
 				DidIndexPublisher,
 				QueueMembershipPublisher,
+				TrunkDirectoryPublisher,
+				SipAclPublisher,
 				PBX_ENV,
 				AuditLogService,
 			],
@@ -727,6 +795,8 @@ const logger = getLogger("api.pbx");
 		RoutingCachePublisher,
 		DidIndexPublisher,
 		QueueMembershipPublisher,
+		SipAclPublisher,
+		TrunkDirectoryPublisher,
 		AgentStatePublisher,
 		ProjectionOutboxSweeper,
 		VoicemailMessagesService,
