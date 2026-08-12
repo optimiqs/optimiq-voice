@@ -78,9 +78,11 @@ describe("stream definitions", () => {
 		expect(EVENT_STREAMS.map((stream) => stream.name)).toEqual([
 			"CALLS",
 			"REGISTRATIONS",
+			"SIP",
 			"QUEUES",
 			"VOICEMAIL",
 			"MEDIA",
+			"TRUNKS",
 			"CDR",
 			"AUDIT",
 			"PROVISION",
@@ -100,6 +102,7 @@ describe("stream definitions", () => {
 			subjectFor.call(ORG, createEntityId(), "channel.created"),
 			subjectFor.registration(ORG, "a".repeat(32), "registered"),
 			subjectFor.queue(ORG, createEntityId(), "caller.joined"),
+			subjectFor.trunk(ORG, createEntityId(), "status.changed"),
 			subjectFor.cdrLeg(ORG),
 			subjectFor.audit(ORG),
 			subjectFor.provision(ORG),
@@ -278,7 +281,12 @@ describe("kv bucket definitions", () => {
 			"queue-membership",
 			"park-claims",
 			"conference-claims",
+			"shared-line-state",
 			"media-sessions",
+			"queue-waiting",
+			"sip-dialogs",
+			"trunks",
+			"sip-acl",
 		]);
 	});
 
@@ -290,16 +298,19 @@ describe("kv bucket definitions", () => {
 	});
 
 	/**
-	 * The two CONFIGURATION buckets must not expire. `did-index` and `queue-membership` both hold
-	 * derived configuration rather than live state, and an expired entry is an outage produced by a
-	 * timer rather than by a change: an inbound call to a valid DID rejected with `INVALID_PROFILE`,
-	 * or a staffed queue that suddenly has no agents and ejects every caller to its timeout branch.
+	 * The CONFIGURATION buckets must not expire. `did-index`, `queue-membership`, `trunks` and
+	 * `sip-acl` all hold derived configuration rather than live state, and an expired entry is an
+	 * outage produced by a timer rather than by a change: an inbound call to a valid DID rejected with
+	 * `INVALID_PROFILE`, a staffed queue that suddenly has no agents and ejects every caller to its
+	 * timeout branch, an outbound call over a perfectly good trunk that stops resolving — and, in the
+	 * `sip-acl` case, a `deny` entry that evaporates on a timer, which is a security boundary failing
+	 * OPEN rather than closed.
 	 *
 	 * Everything else holds live state whose staleness self-corrects — a registration refreshes, a
 	 * channel ends, an agent's status is rewritten on their next transition — so a TTL is a safety
 	 * net rather than a hazard.
 	 */
-	const CONFIGURATION_BUCKETS = ["did-index", "queue-membership"];
+	const CONFIGURATION_BUCKETS = ["did-index", "queue-membership", "trunks", "sip-acl"];
 
 	it("gives every LIVE-STATE bucket a TTL, and the configuration buckets none", () => {
 		for (const bucket of KV_BUCKETS) {
@@ -322,6 +333,7 @@ describe("kv bucket definitions", () => {
 			"queue-membership",
 			"park-claims",
 			"conference-claims",
+			"queue-waiting",
 		]) {
 			expect(KV_BUCKETS.find((bucket) => bucket.name === name)?.storage).toBe("file");
 		}
@@ -369,6 +381,29 @@ describe("kvKeyFor", () => {
 	});
 
 	/**
+	 * The SIP edge's three keys, and the one transformation in this whole file.
+	 *
+	 * `sipDialog` is the third non-org-scoped key, for the reason `didIndex` and `mediaSession` are:
+	 * the reader does not know the tenant. `sipAcl` is the fourth, and it is the only key that has to
+	 * REWRITE its argument — a CIDR carries `.`, `/` and, for IPv6, `:`, and none of the three
+	 * survives as a key token. The folding is asserted against the same vectors `packages/events-go`
+	 * checks, because a control plane and an edge that folded differently would write and read two
+	 * different keys and the ACL would silently admit nobody.
+	 */
+	it("builds the SIP edge's keys, folding a CIDR into one token", () => {
+		expect(kvKeyFor.sipDialog(leg)).toBe(leg);
+		expect(kvKeyFor.trunk(ORG, call)).toBe(`${ORG}.${call}`);
+		expect(kvKeyFor.sipAcl("203.0.113.0/24")).toBe("203-0-113-0-24");
+		// IPv6 too: `sip_acl_entry.network` is a PostgreSQL `cidr`, so a folder that handled only the
+		// v4 separators would throw on the first IPv6 carrier.
+		expect(kvKeyFor.sipAcl("2001:db8::/32")).toBe("2001-db8---32");
+	});
+
+	it("refuses a network with nothing usable in it", () => {
+		expect(() => kvKeyFor.sipAcl("   ")).toThrow(SubjectTokenError);
+	});
+
+	/**
 	 * The claim keys. The ORBIT is the key and not the channel, which is the entire point: two
 	 * instances racing for slot 401 must collide on one key, or they both succeed and the collision
 	 * is discovered by a caller reaching the wrong person.
@@ -399,8 +434,31 @@ describe("kvKeyFor", () => {
 		expect(kvKeyFor.conferenceClaim(ORG, room)).toBe(`${ORG}.${room}`);
 	});
 
+	it("keys a shared-line seizure by the line id, not by its dialled number", () => {
+		const line = createEntityId();
+		expect(kvKeyFor.sharedLineState(ORG, line)).toBe(`${ORG}.${line}`);
+		expect(() => kvKeyFor.sharedLineState(ORG, "line.one")).toThrow(SubjectTokenError);
+	});
+
 	it("rejects a claim token that would break the key namespace", () => {
 		expect(() => kvKeyFor.parkClaim(ORG, "lot.one", 401)).toThrow(SubjectTokenError);
 		expect(() => kvKeyFor.conferenceClaim("", createEntityId())).toThrow(SubjectTokenError);
+	});
+
+	/**
+	 * The roster and the line share a key STRING and not a bucket, which is the point of asserting
+	 * it: a reader that wants both facts about one queue builds the key once. A change that made
+	 * them diverge would not break anything visibly — it would just quietly turn one lookup into
+	 * two — so it is pinned here rather than left to be noticed.
+	 */
+	it("keys one queue's roster and its waiting line identically, in two buckets", () => {
+		const queue = createEntityId();
+		expect(kvKeyFor.queueWaiting(ORG, queue)).toBe(`${ORG}.${queue}`);
+		expect(kvKeyFor.queueWaiting(ORG, queue)).toBe(kvKeyFor.queueMembership(ORG, queue));
+	});
+
+	it("rejects a waiting-line token that would break the key namespace", () => {
+		expect(() => kvKeyFor.queueWaiting(ORG, "queue.one")).toThrow(SubjectTokenError);
+		expect(() => kvKeyFor.queueWaiting("", createEntityId())).toThrow(SubjectTokenError);
 	});
 });

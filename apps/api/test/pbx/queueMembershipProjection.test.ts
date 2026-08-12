@@ -22,6 +22,7 @@ const QUEUE_B = "019fd3c2-3333-76be-a6b3-b0f1914e39b6";
 const AGENT_A = "019fd3c2-4444-76be-a6b3-b0f1914e39b6";
 const AGENT_B = "019fd3c2-5555-76be-a6b3-b0f1914e39b6";
 const EXTENSION = "019fd3c2-6666-76be-a6b3-b0f1914e39b6";
+const PROMPT = "019fd3c2-7777-76be-a6b3-b0f1914e39b6";
 const NOW = new Date("2026-08-06T09:00:00.000Z");
 
 function queueRow(overrides: Partial<QueueRosterQueueRow> = {}): QueueRosterQueueRow {
@@ -47,6 +48,7 @@ function tierRow(overrides: Partial<QueueRosterTierRow> = {}): QueueRosterTierRo
 		extensionNumber: "1001",
 		level: 1,
 		position: 1,
+		announcePromptId: null,
 		wrapUpSeconds: 10,
 		maxNoAnswer: 3,
 		noAnswerDelaySeconds: 30,
@@ -124,7 +126,10 @@ describe("projectQueueMemberships", () => {
 		const { memberships, unreachable } = projectQueueMemberships(
 			ORG,
 			[queueRow()],
-			[tierRow({ extensionId: null, extensionNumber: null }), tierRow({ agentId: AGENT_B, position: 2 })],
+			[
+				tierRow({ extensionId: null, extensionNumber: null }),
+				tierRow({ agentId: AGENT_B, position: 2 }),
+			],
 			options,
 		);
 		expect(memberships[0]?.agents).to.have.length(1);
@@ -138,7 +143,14 @@ describe("projectQueueMemberships", () => {
 		const { unreachable } = projectQueueMemberships(
 			ORG,
 			[queueRow()],
-			[tierRow({ contactKind: "external", contact: null, extensionId: null, extensionNumber: null })],
+			[
+				tierRow({
+					contactKind: "external",
+					contact: null,
+					extensionId: null,
+					extensionNumber: null,
+				}),
+			],
 			options,
 		);
 		expect(unreachable[0]?.reason).to.equal("no-contact");
@@ -225,5 +237,35 @@ describe("renderExtensionDialString", () => {
 		expect(renderExtensionDialString("SIP/{number}@{number}.local", "1001")).to.equal(
 			"SIP/1001@1001.local",
 		);
+	});
+});
+
+/**
+ * The per-tier agent announcement.
+ *
+ * Two cases, and the second is the one that matters: NULL must arrive as ABSENT, not as `null`.
+ * `queueMembershipAgentSchema.announcePromptId` is optional, so a `null` would fail the parse that
+ * guards every roster this projection writes — and the failure would be a whole queue's roster
+ * missing from the bucket, which the engine reads as "this queue cannot be distributed" and reports
+ * as an infrastructure fault on the first caller.
+ */
+describe("per-tier agent announcements", () => {
+	it("carries a tier's prompt onto the seat", () => {
+		const projection = projectQueueMemberships(
+			ORG,
+			[queueRow()],
+			[tierRow({ announcePromptId: PROMPT })],
+			{ extensionDialTemplate: "PJSIP/{number}", now: NOW },
+		);
+		expect(projection.memberships[0]?.agents[0]?.announcePromptId).to.equal(PROMPT);
+	});
+
+	it("omits it entirely when the tier has none, so the parse cannot reject the roster", () => {
+		const projection = projectQueueMemberships(ORG, [queueRow()], [tierRow()], {
+			extensionDialTemplate: "PJSIP/{number}",
+			now: NOW,
+		});
+		const seat = projection.memberships[0]?.agents[0];
+		expect(seat).to.not.have.property("announcePromptId");
 	});
 });

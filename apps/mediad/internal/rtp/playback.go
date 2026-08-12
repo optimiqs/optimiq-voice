@@ -44,6 +44,10 @@ type PlaybackSummary struct {
 	Reason   PlaybackEndReason
 	PlayedMs int
 	Detail   string
+	// Kind is what the audio was. Diagnostic; see PlaybackKind. It is NOT on the wire, because the
+	// engine branches on the reference and a vocabulary two media planes would have to agree on for
+	// nobody's benefit is what design doc §3.2 exists to prevent.
+	Kind PlaybackKind
 }
 
 // PlaybackOptions is one prompt, already decoded and cut into frames.
@@ -56,7 +60,38 @@ type PlaybackOptions struct {
 	// Encoding is the law Frames are in. Checked against the session's, because a µ-law prompt on
 	// an A-law leg is a loud rasp rather than a wrong-sounding voice.
 	Encoding audio.Encoding
+	// Loop makes the frames repeat until something stops the playback. Rung 5.
+	//
+	// This one field is the whole of "a session sourcing from a LOOP instead of a peer" — the ladder's
+	// description of rung 5 — and it is one field because rung 1 already built everything underneath
+	// it. Music on hold is a looping clip, a ringback cadence is a looping clip, and the only thing
+	// that made them a separate rung was that nothing had asked the frame source to wrap yet.
+	//
+	// A looping playback never ends `completed`, because it has no end. It ends `stopped` — by
+	// `stop-playback`, by an unhold, by a superseding prompt, or by the session going away — which is
+	// why `playedMs` is the only honest measure of how long a caller heard it.
+	Loop bool
+	// Kind labels what the audio IS, for the log line and for the summary. See PlaybackKind.
+	Kind PlaybackKind
 }
+
+// PlaybackKind is what a playback is for. Diagnostic only: the packet path treats all three
+// identically, and the wire contract carries a reference rather than a kind.
+//
+// It exists because "playback ref 018f… finished" is a line nobody can act on, while "the hold music
+// on session 018f… stopped" is one an operator reads as an explanation for a complaint about a held
+// caller hearing silence.
+type PlaybackKind string
+
+// The three things a playback can be.
+const (
+	// PlaybackPrompt is a file the engine asked for. The rung-1 case.
+	PlaybackPrompt PlaybackKind = "prompt"
+	// PlaybackMusicOnHold is a hold loop, started by a hold or by a music command.
+	PlaybackMusicOnHold PlaybackKind = "moh"
+	// PlaybackTone is a generated call-progress tone.
+	PlaybackTone PlaybackKind = "tone"
+)
 
 // Playback is one prompt in flight on one session.
 //
@@ -89,6 +124,8 @@ type PlaybackOptions struct {
 type Playback struct {
 	ref     string
 	frames  [][]byte
+	loop    bool
+	kind    PlaybackKind
 	session *Session
 
 	// sent counts frames actually written, which is what `playedMs` is derived from. It is NOT the
@@ -151,9 +188,15 @@ func (s *Session) StartPlayback(opts PlaybackOptions) (*Playback, error) {
 		return nil, ErrUnknownSession
 	}
 
+	kind := opts.Kind
+	if kind == "" {
+		kind = PlaybackPrompt
+	}
 	playback := &Playback{
 		ref:     opts.Ref,
 		frames:  opts.Frames,
+		loop:    opts.Loop,
+		kind:    kind,
 		session: s,
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
@@ -210,7 +253,12 @@ func (p *Playback) run() {
 	ticks, stopTicker := p.session.newTicker(audio.FrameDurationMs * time.Millisecond)
 	defer stopTicker()
 
-	for index := range p.frames {
+	// `first` and not `index == 0`: a looping source comes back round to index 0 on every wrap, and
+	// re-asserting the marker there would tell the receiver a new talkspurt begins every time the
+	// hold music repeats. The marker belongs to the moment the STREAM changed clocks, which happens
+	// once, at the start.
+	first := true
+	for index := 0; index < len(p.frames); index++ {
 		select {
 		case <-p.stop:
 			p.finish(PlaybackStopped, "")
@@ -229,13 +277,24 @@ func (p *Playback) run() {
 		// a timestamp discontinuity inside one SSRC. Marker is exactly how a sender tells a receiver
 		// "reset your expectation, a new talkspurt begins here" instead of letting the jitter buffer
 		// read the jump as catastrophic loss.
-		sent, err := p.session.sendPlaybackFrame(p.frames[index], index == 0)
+		sent, err := p.session.sendPlaybackFrame(p.frames[index], first)
 		if err != nil {
 			p.finish(PlaybackError, err.Error())
 			return
 		}
+		first = false
 		if sent {
 			p.sent.Add(1)
+		}
+
+		if p.loop && index == len(p.frames)-1 {
+			// The wrap. Nothing else changes: the same socket, the same SSRC, the same sequence
+			// counter, and a timestamp that keeps advancing by one frame — so the far end cannot tell
+			// the wrap from any other frame boundary, which is exactly the property a hold loop needs.
+			// The clip's own edges have to meet cleanly for it to sound seamless, and that is a
+			// property of the FILE rather than of this loop; see internal/audio on why the generated
+			// cadences contain whole numbers of cycles.
+			index = -1
 		}
 	}
 	p.finish(PlaybackCompleted, "")
@@ -248,6 +307,7 @@ func (p *Playback) finish(reason PlaybackEndReason, detail string) {
 			Reason:   reason,
 			PlayedMs: p.Sent() * audio.FrameDurationMs,
 			Detail:   detail,
+			Kind:     p.kind,
 		}
 		// The next relayed packet carries a marker for the same reason the first played one did:
 		// the stream is about to switch back to the peer's timestamp clock.
@@ -301,7 +361,7 @@ func (s *Session) sendPlaybackFrame(payload []byte, marker bool) (bool, error) {
 		// nothing" into an event with a reason on it.
 		return false, fmt.Errorf("rtp: sending a playback frame to %s: %w", to, err)
 	}
-	s.count(func(st *Stats) { st.PacketsSent++ })
+	s.countSent(uint32(len(payload)))
 
 	// The SEND half of a `both` recording. A prompt played AT the recorded party is part of what
 	// happened on that leg, so a recording of both directions holds it — which is exactly what an

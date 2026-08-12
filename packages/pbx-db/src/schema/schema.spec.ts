@@ -3,27 +3,45 @@ import { getTableName, Table } from "drizzle-orm";
 import { getTableConfig } from "drizzle-orm/pg-core";
 import { DESTINATION_TYPES, DestinationColumnPrefixError } from "../destinations";
 import { pbxTenantContext } from "../tenant";
+import { CALL_FLOW_MODES } from "./call-flows-schema";
 import { CARRIER_PROVIDERS } from "./carrier-schema";
 import { destinationCheck, namedDestinationColumns } from "./columns";
+import { DIRECTORY_SEARCH_FIELDS } from "./directory-schema";
 import { EXTENSION_USER_ROLES, RECORD_POLICIES, TOLL_CLASSES } from "./extensions-schema";
+import { FAX_DIRECTIONS, FAX_MESSAGE_STATUSES } from "./fax-schema";
 import { FEATURE_CODE_ACTIONS } from "./features-schema";
-import { QUEUE_AGENT_STATUSES, QUEUE_STRATEGIES } from "./queues-schema";
+import { PROMPT_KINDS } from "./media-schema";
+import {
+	QUEUE_AGENT_STATUSES,
+	QUEUE_PRIORITY_MAX,
+	QUEUE_PRIORITY_MIN,
+	QUEUE_STRATEGIES,
+} from "./queues-schema";
 import { pbxRelations } from "./relations";
 import { SIP_ACL_SCOPES } from "./security-schema";
+import { SHARED_LINE_STRATEGIES } from "./shared-lines-schema";
 import { pbxTables } from "./tables";
+import { TIME_CONDITION_OVERRIDES } from "./time-conditions-schema";
 import { VOICEMAIL_FOLDERS, VOICEMAIL_TRANSCRIPTION_STATUSES } from "./voicemail-schema";
 
 const tables = Object.values(pbxTables);
 
 const CONST_TUPLES = {
+	CALL_FLOW_MODES,
 	CARRIER_PROVIDERS,
 	DESTINATION_TYPES,
+	DIRECTORY_SEARCH_FIELDS,
 	EXTENSION_USER_ROLES,
+	FAX_DIRECTIONS,
+	FAX_MESSAGE_STATUSES,
 	FEATURE_CODE_ACTIONS,
+	PROMPT_KINDS,
 	QUEUE_AGENT_STATUSES,
 	QUEUE_STRATEGIES,
 	RECORD_POLICIES,
+	SHARED_LINE_STRATEGIES,
 	SIP_ACL_SCOPES,
+	TIME_CONDITION_OVERRIDES,
 	TOLL_CLASSES,
 	VOICEMAIL_FOLDERS,
 	VOICEMAIL_TRANSCRIPTION_STATUSES,
@@ -48,15 +66,57 @@ describe("tenant tables", () => {
 	});
 
 	/**
-	 * `user_setting` was a cascade level nothing read. It is gone, and this is here so it cannot
-	 * come back as a table before the thing that would read it does — a user-scoped setting
-	 * catalogue, an `.own` permission pair and a resolver. See `settings-schema.ts`.
+	 * `user_setting` is BACK — this test used to assert its absence, and the inversion is the
+	 * point. The table was dropped because it was a cascade level nothing read, and the drop note
+	 * in `settings-schema.ts` named four prerequisites for its return: a user-scoped setting
+	 * catalogue, the `settings.read.own`/`settings.write.own` pair, a resolver, and a surface. All
+	 * four exist now, so the assertion flips from "it must not come back" to "it is here, shaped
+	 * the way the resolver needs it".
+	 *
+	 * Only the SCHEMA half of the prerequisites is assertable here: the catalogue, the resolver
+	 * and the surface live in `apps/api`, and `pbx-db` cannot import an application that depends
+	 * on it. Their assertions live where they live — `apps/api/test/pbx/orgSettings.test.ts` pins
+	 * that the catalogue marks a NON-EMPTY user-scoped set and that `resolveForUser` applies
+	 * `code default → org_setting → user_setting`. The permission pair is pinned by
+	 * `packages/auth`'s own registry spec.
 	 */
-	it("registers no settings level below the organization", () => {
+	it("registers the user settings level below the organization, shaped for the resolver", () => {
 		const names = tables.map((table) => getTableName(table));
 		expect(names).toContain("org_setting");
-		expect(names).not.toContain("user_setting");
-		expect(Object.keys(pbxTables)).not.toContain("userSetting");
+		expect(names).toContain("user_setting");
+		expect(Object.keys(pbxTables)).toContain("userSetting");
+
+		const config = getTableConfig(pbxTables.userSetting);
+		const columns = new Map(config.columns.map((column) => [column.name, column]));
+
+		// The owner: a better-auth user id from another database. TEXT and FK-less on purpose —
+		// this side does not own the identifier's shape, and a malformed id must be an unmatchable
+		// row rather than a cast error that rolls back a preferences save.
+		expect(columns.get("user_id")?.getSQLType()).toBe("text");
+		expect(columns.get("user_id")?.notNull).toBe(true);
+		expect(config.foreignKeys).toEqual([]);
+
+		// The same value shape as `org_setting`, because the resolver overlays the levels by name.
+		expect(columns.get("value")?.getSQLType()).toBe("jsonb");
+		expect(columns.get("value_type")?.default).toBe("string");
+		expect(columns.get("enabled")?.default).toBe(true);
+
+		// One override per person per setting, and the preferences screen's read path.
+		const unique = config.indexes.find(
+			(candidate) => candidate.config.name === "user_setting_organization_user_category_name_key",
+		);
+		expect(unique?.config.unique).toBe(true);
+		expect(unique?.config.columns.map((entry) => ("name" in entry ? entry.name : ""))).toEqual([
+			"organization_id",
+			"user_id",
+			"category",
+			"name",
+		]);
+		expect(
+			config.indexes.some(
+				(candidate) => candidate.config.name === "user_setting_organization_user_idx",
+			),
+		).toBe(true);
 	});
 
 	it("scopes every table to an organization and enables row-level security", () => {
@@ -137,6 +197,10 @@ describe("tenant tables", () => {
 		// `organization_id`; this one is partial over the two working statuses and is the size of the
 		// backlog rather than of the table.
 		"voicemail_message_transcription_sweep_idx",
+		// The outbound fax send queue, and the same argument once more: the send worker asks "which
+		// outbound faxes ANYWHERE still owe a send?" on the untenanted handle with no session
+		// organization. Partial over the two working statuses, the size of the backlog, not the table.
+		"fax_message_send_queue_idx",
 	]);
 
 	it("leads every composite index with organization_id so the tenant predicate is usable", () => {
@@ -256,6 +320,255 @@ describe("pickup groups", () => {
 			index.config.columns.map((entry) => ("name" in entry ? entry.name : "")),
 		);
 		expect(indexed).not.toContain("pickup_group");
+	});
+});
+
+/**
+ * Call screening.
+ *
+ * One boolean, and the two things worth pinning are the two a later change could quietly take away.
+ * It must stay NOT NULL with a `false` default, because that default is what every extension that
+ * existed before screening did gets, and the only safe reading of such a row is "nobody asked for
+ * this" — a `true` default would put a name-recording prompt on the front of every inbound call in
+ * every tenant that upgraded. And it must stay a boolean rather than becoming a mode enum: the
+ * external-only scope is a decision the engine implements, not a column the tenant configures.
+ */
+describe("call screening", () => {
+	const column = getTableConfig(pbxTables.extension).columns.find(
+		(candidate) => candidate.name === "call_screening",
+	);
+
+	it("is a NOT NULL boolean that is off by default", () => {
+		expect(column).toBeDefined();
+		expect(column?.getSQLType()).toBe("boolean");
+		expect(column?.notNull).toBe(true);
+		expect(column?.default).toBe(false);
+	});
+});
+
+/**
+ * Whisper-on-answer.
+ *
+ * Nullable and defaultless, because the absence of a whisper is the normal state and the column has
+ * to be able to say so: a queue with no whisper prompt bridges the agent straight through, which is
+ * what every queue did before the column existed. It references `prompt` like its two caller-facing
+ * siblings do, and `set null` on delete for the same reason they use it — losing a prompt should
+ * cost a queue its whisper, not cost the tenant the queue.
+ */
+describe("agent whisper", () => {
+	const config = getTableConfig(pbxTables.queue);
+	const column = config.columns.find((candidate) => candidate.name === "agent_whisper_prompt_id");
+
+	it("is a nullable uuid with no default", () => {
+		expect(column).toBeDefined();
+		expect(column?.getSQLType()).toBe("uuid");
+		expect(column?.notNull).toBe(false);
+		expect(column?.hasDefault).toBe(false);
+	});
+
+	it("references the prompt library, so a deleted prompt cannot dangle", () => {
+		const foreignKey = config.foreignKeys.find((candidate) =>
+			candidate.reference().columns.some((entry) => entry.name === "agent_whisper_prompt_id"),
+		);
+		expect(foreignKey).toBeDefined();
+		expect(getTableName(foreignKey?.reference().foreignTable ?? pbxTables.prompt)).toBe("prompt");
+		expect(foreignKey?.onDelete).toBe("set null");
+	});
+});
+
+/**
+ * Paging groups.
+ *
+ * What is pinned here is the shape a page depends on and nothing else: that membership is a REAL
+ * table with two cascading foreign keys (a member that dangles is a page that reaches fewer people
+ * than the operator believes it does, silently), that the ordinal is NOT NULL (the fan-out order is
+ * the operator's, not the loader's), that the group's number stays nullable behind a partial unique
+ * index (a group reachable only through `*81` has none, and several such groups must not collide on
+ * NULL), and that both tables carry their tenant-isolation policy.
+ */
+describe("paging groups", () => {
+	const groupConfig = getTableConfig(pbxTables.pagingGroup);
+	const memberConfig = getTableConfig(pbxTables.pagingGroupMember);
+	const groupColumns = new Map(groupConfig.columns.map((column) => [column.name, column]));
+	const memberColumns = new Map(memberConfig.columns.map((column) => [column.name, column]));
+
+	it("names the group's dialable number nullable, so `*81`-only groups stay expressible", () => {
+		const column = groupColumns.get("extension_number");
+		expect(column).toBeDefined();
+		expect(column?.getSQLType()).toBe("text");
+		expect(column?.notNull).toBe(false);
+		expect(column?.hasDefault).toBe(false);
+	});
+
+	it("makes the number index partial, so two groups without one do not collide", () => {
+		const index = groupConfig.indexes.find(
+			(candidate) => candidate.config.name === "paging_group_organization_extension_number_key",
+		);
+		expect(index?.config.unique).toBe(true);
+		expect(index?.config.where).toBeDefined();
+		expect(JSON.stringify(index?.config.where?.queryChunks)).toContain("extension_number");
+	});
+
+	it("defaults to a one-way announcement with a thirty-second leg budget", () => {
+		expect(groupColumns.get("duplex")?.getSQLType()).toBe("boolean");
+		expect(groupColumns.get("duplex")?.notNull).toBe(true);
+		expect(groupColumns.get("duplex")?.default).toBe(false);
+		expect(groupColumns.get("timeout_seconds")?.getSQLType()).toBe("integer");
+		expect(groupColumns.get("timeout_seconds")?.notNull).toBe(true);
+		expect(groupColumns.get("timeout_seconds")?.default).toBe(30);
+		expect(groupColumns.get("enabled")?.default).toBe(true);
+	});
+
+	/**
+	 * A page ENDS. Every other entity that receives a call carries a destination trio for what
+	 * happens next; this one must not grow one by accident, because there is no "next".
+	 */
+	it("carries no destination trio, because a page has no continuation", () => {
+		const names = groupConfig.columns.map((column) => column.name);
+		expect(names.filter((name) => name.endsWith("destination_type"))).toEqual([]);
+	});
+
+	it("holds membership on its own table, ordered and cascading from both parents", () => {
+		expect(memberColumns.get("ordinal")?.getSQLType()).toBe("integer");
+		expect(memberColumns.get("ordinal")?.notNull).toBe(true);
+		expect(memberColumns.get("paging_group_id")?.notNull).toBe(true);
+		expect(memberColumns.get("extension_id")?.notNull).toBe(true);
+		expect(memberColumns.get("enabled")?.default).toBe(true);
+
+		const targets = memberConfig.foreignKeys.map((foreignKey) => ({
+			column: foreignKey.reference().columns[0]?.name,
+			table: getTableName(foreignKey.reference().foreignTable),
+			onDelete: foreignKey.onDelete,
+		}));
+		expect(targets).toContainEqual({
+			column: "paging_group_id",
+			table: "paging_group",
+			onDelete: "cascade",
+		});
+		expect(targets).toContainEqual({
+			column: "extension_id",
+			table: "extension",
+			onDelete: "cascade",
+		});
+	});
+
+	it("refuses a duplicate member and a duplicate position within one group", () => {
+		const unique = memberConfig.indexes
+			.filter((candidate) => candidate.config.unique)
+			.map((candidate) => ({
+				name: candidate.config.name,
+				columns: candidate.config.columns.map((entry) => ("name" in entry ? entry.name : "")),
+			}));
+		expect(unique).toContainEqual({
+			name: "paging_group_member_group_extension_key",
+			columns: ["organization_id", "paging_group_id", "extension_id"],
+		});
+		expect(unique).toContainEqual({
+			name: "paging_group_member_group_ordinal_key",
+			columns: ["organization_id", "paging_group_id", "ordinal"],
+		});
+	});
+
+	it("isolates both tables by tenant under the harness naming convention", () => {
+		expect(groupConfig.policies.map((policy) => policy.name)).toEqual([
+			"paging_group_tenant_isolation",
+		]);
+		expect(memberConfig.policies.map((policy) => policy.name)).toEqual([
+			"paging_group_member_tenant_isolation",
+		]);
+		expect(groupConfig.enableRLS).toBe(true);
+		expect(memberConfig.enableRLS).toBe(true);
+	});
+});
+
+describe("shared lines", () => {
+	const lineConfig = getTableConfig(pbxTables.sharedLine);
+	const appearanceConfig = getTableConfig(pbxTables.sharedLineAppearance);
+	const lineColumns = new Map(lineConfig.columns.map((column) => [column.name, column]));
+	const appearanceColumns = new Map(
+		appearanceConfig.columns.map((column) => [column.name, column]),
+	);
+
+	it("names the line's dialable number nullable, so shared-key-only lines stay expressible", () => {
+		const column = lineColumns.get("extension_number");
+		expect(column).toBeDefined();
+		expect(column?.getSQLType()).toBe("text");
+		expect(column?.notNull).toBe(false);
+		expect(column?.hasDefault).toBe(false);
+	});
+
+	it("makes the number index partial, so two lines without one do not collide", () => {
+		const index = lineConfig.indexes.find(
+			(candidate) => candidate.config.name === "shared_line_organization_extension_number_key",
+		);
+		expect(index?.config.unique).toBe(true);
+		expect(index?.config.where).toBeDefined();
+		expect(JSON.stringify(index?.config.where?.queryChunks)).toContain("extension_number");
+	});
+
+	it("defaults to simultaneous ringing, a one-minute hold recall, and no barge-in", () => {
+		expect(lineColumns.get("strategy")?.getSQLType()).toBe("text");
+		expect(lineColumns.get("strategy")?.notNull).toBe(true);
+		expect(lineColumns.get("strategy")?.default).toBe("simultaneous");
+		expect(lineColumns.get("ring_timeout_seconds")?.default).toBe(30);
+		expect(lineColumns.get("hold_recall_timeout_seconds")?.getSQLType()).toBe("integer");
+		expect(lineColumns.get("hold_recall_timeout_seconds")?.notNull).toBe(true);
+		expect(lineColumns.get("hold_recall_timeout_seconds")?.default).toBe(60);
+		expect(lineColumns.get("barge_in_enabled")?.getSQLType()).toBe("boolean");
+		expect(lineColumns.get("barge_in_enabled")?.default).toBe(false);
+		expect(lineColumns.get("enabled")?.default).toBe(true);
+	});
+
+	it("holds appearances on their own table, ordered and cascading from both parents", () => {
+		expect(appearanceColumns.get("ordinal")?.getSQLType()).toBe("integer");
+		expect(appearanceColumns.get("ordinal")?.notNull).toBe(true);
+		expect(appearanceColumns.get("shared_line_id")?.notNull).toBe(true);
+		expect(appearanceColumns.get("extension_id")?.notNull).toBe(true);
+		expect(appearanceColumns.get("enabled")?.default).toBe(true);
+
+		const targets = appearanceConfig.foreignKeys.map((foreignKey) => ({
+			column: foreignKey.reference().columns[0]?.name,
+			table: getTableName(foreignKey.reference().foreignTable),
+			onDelete: foreignKey.onDelete,
+		}));
+		expect(targets).toContainEqual({
+			column: "shared_line_id",
+			table: "shared_line",
+			onDelete: "cascade",
+		});
+		expect(targets).toContainEqual({
+			column: "extension_id",
+			table: "extension",
+			onDelete: "cascade",
+		});
+	});
+
+	it("refuses a duplicate appearance and a duplicate index within one line", () => {
+		const unique = appearanceConfig.indexes
+			.filter((candidate) => candidate.config.unique)
+			.map((candidate) => ({
+				name: candidate.config.name,
+				columns: candidate.config.columns.map((entry) => ("name" in entry ? entry.name : "")),
+			}));
+		expect(unique).toContainEqual({
+			name: "shared_line_appearance_line_extension_key",
+			columns: ["organization_id", "shared_line_id", "extension_id"],
+		});
+		expect(unique).toContainEqual({
+			name: "shared_line_appearance_line_ordinal_key",
+			columns: ["organization_id", "shared_line_id", "ordinal"],
+		});
+	});
+
+	it("isolates both tables by tenant under the harness naming convention", () => {
+		expect(lineConfig.policies.map((policy) => policy.name)).toEqual([
+			"shared_line_tenant_isolation",
+		]);
+		expect(appearanceConfig.policies.map((policy) => policy.name)).toEqual([
+			"shared_line_appearance_tenant_isolation",
+		]);
+		expect(lineConfig.enableRLS).toBe(true);
+		expect(appearanceConfig.enableRLS).toBe(true);
 	});
 });
 
@@ -419,5 +732,494 @@ describe("time condition rules", () => {
 		expect(columnNames).toContain("destination_type");
 		expect(columnNames).toContain("nomatch_destination_type");
 		expect(columnNames).toContain("timezone");
+	});
+});
+
+/**
+ * The T2 admin block.
+ *
+ * One describe rather than nine, because what is worth pinning about these tables is the handful of
+ * decisions a later edit could quietly reverse — not their column lists, which the generic
+ * assertions above already cover for every table in the registry.
+ */
+describe("call flows", () => {
+	const config = getTableConfig(pbxTables.callFlow);
+	const columns = new Map(config.columns.map((column) => [column.name, column]));
+
+	/**
+	 * THE decision. A mode kept only in a live-state bucket would make a flip free of a recompile and
+	 * would also make the compiled artifact an incomplete answer to "where do this tenant's calls go
+	 * right now" — see the schema header for why the park-slot precedent puts it on this side.
+	 */
+	it("persists the mode as a column, so a flip survives every process restarting", () => {
+		expect(columns.get("mode")?.getSQLType()).toBe("text");
+		expect(columns.get("mode")?.notNull).toBe(true);
+		expect(columns.get("mode")?.default).toBe("day");
+	});
+
+	it("refuses a mode outside the vocabulary", () => {
+		const constraint = config.checks.find((check) => check.name === "call_flow_mode_check");
+		expect(constraint).toBeDefined();
+	});
+
+	/**
+	 * A switch with one position is not a switch. `namedDestinationColumns` produces nullable
+	 * columns, so the NON-optional shape check is the only thing making the night trio mandatory.
+	 */
+	it("requires BOTH destinations, day and night", () => {
+		const names = config.checks.map((check) => check.name);
+		expect(names).toContain("call_flow_destination_shape_check");
+		expect(names).toContain("call_flow_night_destination_shape_check");
+		const night = config.checks.find(
+			(check) => check.name === "call_flow_night_destination_shape_check",
+		);
+		// An `optional` trio's check opens with the all-NULL clause. This one must not.
+		expect(JSON.stringify(night?.value.queryChunks)).not.toContain(
+			"night_destination_type is null and night_destination_ref is null",
+		);
+	});
+
+	it("keeps the toggle code and the dialable number nullable and separately unique", () => {
+		expect(columns.get("feature_code")?.notNull).toBe(false);
+		expect(columns.get("extension_number")?.notNull).toBe(false);
+		for (const name of [
+			"call_flow_organization_feature_code_key",
+			"call_flow_organization_extension_number_key",
+		]) {
+			const index = config.indexes.find((candidate) => candidate.config.name === name);
+			expect(index?.config.unique, name).toBe(true);
+			expect(index?.config.where, name).toBeDefined();
+		}
+	});
+});
+
+describe("time condition manual override", () => {
+	const config = getTableConfig(pbxTables.timeCondition);
+	const columns = new Map(config.columns.map((column) => [column.name, column]));
+
+	it("defaults to obeying the clock", () => {
+		expect(columns.get("override")?.getSQLType()).toBe("text");
+		expect(columns.get("override")?.notNull).toBe(true);
+		expect(columns.get("override")?.default).toBe("auto");
+	});
+
+	it("constrains the override to the vocabulary the compiler switches on", () => {
+		expect(config.checks.map((check) => check.name)).toContain("time_condition_override_check");
+	});
+
+	it("carries its own toggle code, unique only among conditions that have one", () => {
+		expect(columns.get("override_feature_code")?.notNull).toBe(false);
+		const index = config.indexes.find(
+			(candidate) =>
+				candidate.config.name === "time_condition_organization_override_feature_code_key",
+		);
+		expect(index?.config.unique).toBe(true);
+		expect(index?.config.where).toBeDefined();
+	});
+});
+
+describe("pin numbers", () => {
+	const setConfig = getTableConfig(pbxTables.pinSet);
+	const entryConfig = getTableConfig(pbxTables.pinSetEntry);
+	const entryColumns = new Map(entryConfig.columns.map((column) => [column.name, column]));
+
+	/**
+	 * The whole argument of `pins-schema.ts` in one assertion: upstream's column is the PIN, ours is
+	 * a digest, and a column called `pin_number` reappearing here would be the change that undoes it.
+	 */
+	it("stores a digest and never a PIN", () => {
+		const names = entryConfig.columns.map((column) => column.name);
+		expect(names).toContain("pin_hash");
+		expect(names).not.toContain("pin");
+		expect(names).not.toContain("pin_number");
+		expect(entryColumns.get("pin_hash")?.notNull).toBe(true);
+	});
+
+	/** The identity a CDR names. An array position would shift under a delete; a row does not. */
+	it("gives every code a stable ordinal and a label, unique within its set", () => {
+		expect(entryColumns.get("ordinal")?.notNull).toBe(true);
+		expect(entryColumns.get("label")?.notNull).toBe(false);
+		const index = entryConfig.indexes.find(
+			(candidate) => candidate.config.name === "pin_set_entry_set_ordinal_key",
+		);
+		expect(index?.config.unique).toBe(true);
+	});
+
+	it("bounds the attempts, because unbounded retries make a four-digit PIN free to guess", () => {
+		const columns = new Map(setConfig.columns.map((column) => [column.name, column]));
+		expect(columns.get("max_attempts")?.notNull).toBe(true);
+		expect(columns.get("max_attempts")?.default).toBe(3);
+	});
+
+	it("removes the gate rather than the route when a set is deleted", () => {
+		const route = getTableConfig(pbxTables.outboundRoute);
+		const key = route.foreignKeys.find(
+			(foreignKey) => foreignKey.reference().columns[0]?.name === "pin_set_id",
+		);
+		expect(key === undefined ? undefined : getTableName(key.reference().foreignTable)).toBe(
+			"pin_set",
+		);
+		expect(key?.onDelete).toBe("set null");
+	});
+});
+
+describe("number translation rulesets", () => {
+	const ruleConfig = getTableConfig(pbxTables.translationRule);
+	const columns = new Map(ruleConfig.columns.map((column) => [column.name, column]));
+
+	/**
+	 * A rule REWRITES, and only a regex with capture groups can. `exact` and `prefix` have no way to
+	 * say "keep the last ten digits", so a `match_kind` column here would be three-quarters dead.
+	 */
+	it("is regex-only: a rewrite has no other match kind", () => {
+		const names = ruleConfig.columns.map((column) => column.name);
+		expect(names).toContain("match_pattern");
+		expect(names).toContain("replacement");
+		expect(names).not.toContain("match_kind");
+		expect(columns.get("match_pattern")?.notNull).toBe(true);
+		expect(columns.get("replacement")?.notNull).toBe(true);
+	});
+
+	it("orders the pipeline and keeps two rules out of one position", () => {
+		expect(columns.get("ordinal")?.notNull).toBe(true);
+		const index = ruleConfig.indexes.find(
+			(candidate) => candidate.config.name === "translation_rule_ruleset_ordinal_key",
+		);
+		expect(index?.config.unique).toBe(true);
+	});
+
+	/** Attachable to BOTH sides — that is the reusability the inline mechanism cannot express. */
+	it("attaches to an outbound route and to a trunk's inbound caller id", () => {
+		const route = getTableConfig(pbxTables.outboundRoute);
+		const trunk = getTableConfig(pbxTables.trunk);
+		expect(route.columns.map((column) => column.name)).toContain("translation_ruleset_id");
+		expect(trunk.columns.map((column) => column.name)).toContain("inbound_translation_ruleset_id");
+		for (const config of [route, trunk]) {
+			const key = config.foreignKeys.find((foreignKey) =>
+				foreignKey.reference().columns[0]?.name.endsWith("translation_ruleset_id"),
+			);
+			expect(key?.onDelete).toBe("set null");
+		}
+	});
+});
+
+describe("destination aliases", () => {
+	const config = getTableConfig(pbxTables.destinationAlias);
+	const names = config.columns.map((column) => column.name);
+
+	/**
+	 * The deviation from FusionPBX's "Bridges", asserted rather than only argued: an alias names a
+	 * destination trio, and a `dial_string` column reappearing here would be the toll gate reopening.
+	 */
+	it("names a destination trio, never a raw dial string", () => {
+		expect(names).toContain("destination_type");
+		expect(names).not.toContain("dial_string");
+		expect(names).not.toContain("bridge");
+		expect(config.checks.map((check) => check.name)).toContain(
+			"destination_alias_destination_shape_check",
+		);
+	});
+});
+
+describe("audio streams", () => {
+	const config = getTableConfig(pbxTables.audioStream);
+	const columns = new Map(config.columns.map((column) => [column.name, column]));
+
+	/**
+	 * The fallback is what stops a driver that cannot play a remote URL from dropping the call in
+	 * silence, so its check is NOT the optional one every other secondary trio gets.
+	 */
+	it("requires somewhere to go when the stream cannot be played", () => {
+		const check = config.checks.find(
+			(candidate) => candidate.name === "audio_stream_fallback_destination_shape_check",
+		);
+		expect(check).toBeDefined();
+		expect(JSON.stringify(check?.value.queryChunks)).not.toContain(
+			"fallback_destination_type is null and fallback_destination_ref is null",
+		);
+	});
+
+	it("defaults to answering, and to playing until the caller hangs up", () => {
+		expect(columns.get("answer_first")?.default).toBe(true);
+		expect(columns.get("max_seconds")?.default).toBe(0);
+		expect(columns.get("url")?.notNull).toBe(true);
+	});
+});
+
+describe("phrases", () => {
+	const promptConfig = getTableConfig(pbxTables.prompt);
+	const stepConfig = getTableConfig(pbxTables.phraseStep);
+
+	/** A phrase IS a prompt row, which is what makes every `*_prompt_id` accept one for free. */
+	it("is a prompt kind rather than a table of its own", () => {
+		expect(PROMPT_KINDS).toContain("phrase");
+	});
+
+	it("loosens object_key only for a phrase, and says so in a constraint", () => {
+		const objectKey = promptConfig.columns.find((column) => column.name === "object_key");
+		expect(objectKey?.notNull).toBe(false);
+		expect(promptConfig.checks.map((check) => check.name)).toContain(
+			"prompt_object_key_kind_check",
+		);
+	});
+
+	/**
+	 * A step's audio is `restrict`, not `cascade`: cascading would silently SHORTEN a phrase when
+	 * somebody deleted a prompt, and "your call is number in the queue" is worse than a refused
+	 * delete. The phrase side cascades, because deleting the phrase should take its steps.
+	 */
+	it("cascades from the phrase and restricts from the audio", () => {
+		const byColumn = new Map(
+			stepConfig.foreignKeys.map((foreignKey) => [
+				foreignKey.reference().columns[0]?.name,
+				foreignKey,
+			]),
+		);
+		expect(byColumn.get("phrase_id")?.onDelete).toBe("cascade");
+		expect(byColumn.get("prompt_id")?.onDelete).toBe("restrict");
+	});
+});
+
+describe("dial-by-name directory", () => {
+	const config = getTableConfig(pbxTables.dialByNameDirectory);
+	const columns = new Map(config.columns.map((column) => [column.name, column]));
+
+	it("asks for three digits by default and searches the surname", () => {
+		expect(columns.get("min_digits")?.default).toBe(3);
+		expect(columns.get("search_field")?.default).toBe("last-name");
+		expect(config.checks.map((check) => check.name)).toContain(
+			"dial_by_name_directory_search_field_check",
+		);
+	});
+});
+
+describe("speed dials", () => {
+	const config = getTableConfig(pbxTables.speedDial);
+	const names = config.columns.map((column) => column.name);
+
+	/**
+	 * A bare number would be a dial string with no route matched, which is the same toll-gate bypass
+	 * `destination_alias` refuses. The trio is what keeps a speed dial inside outbound routing.
+	 */
+	it("points at a destination trio rather than a number", () => {
+		expect(names).toContain("destination_type");
+		expect(names).not.toContain("number");
+		expect(config.checks.map((check) => check.name)).toContain(
+			"speed_dial_destination_shape_check",
+		);
+	});
+
+	it("makes the code unique within the organization", () => {
+		const index = config.indexes.find(
+			(candidate) => candidate.config.name === "speed_dial_organization_code_key",
+		);
+		expect(index?.config.unique).toBe(true);
+	});
+});
+
+describe("organization limits", () => {
+	const config = getTableConfig(pbxTables.orgLimit);
+	const columns = new Map(config.columns.map((column) => [column.name, column]));
+
+	/**
+	 * Every column nullable, because this table arrives after tenants exist and a number in a column
+	 * would silently cap every organization already running.
+	 */
+	it("treats an unset limit as no limit", () => {
+		for (const name of ["max_extensions", "max_trunks", "max_concurrent_calls", "max_storage_mb"]) {
+			expect(columns.get(name)?.notNull, name).toBe(false);
+			expect(columns.get(name)?.hasDefault, name).toBe(false);
+		}
+	});
+
+	it("holds at most one row per organization", () => {
+		const index = config.indexes.find(
+			(candidate) => candidate.config.name === "org_limit_organization_key",
+		);
+		expect(index?.config.unique).toBe(true);
+	});
+});
+
+/**
+ * The contact-centre block on `queue` and `queue_tier`.
+ *
+ * The two constraints are the ones worth having in the DATABASE rather than only in a DTO, and the
+ * reason is the same for both: the engine compares these values with `===` and arithmetic, so a row
+ * that got past a form is a feature that silently never fires. An exit key of `"1 "` is a queue
+ * whose exit key does nothing, configured by an operator who watched themselves configure it.
+ */
+describe("queue contact-centre settings", () => {
+	const config = getTableConfig(pbxTables.queue);
+	const columns = new Map(config.columns.map((column) => [column.name, column]));
+
+	it("replaced the boolean nobody honoured with the record policy everything else uses", () => {
+		expect(columns.get("record_policy")?.notNull).toBe(true);
+		expect(columns.get("record_policy")?.default).toBe("none");
+		expect(columns.has("record_enabled")).toBe(false);
+	});
+
+	it("keeps the exit key nullable, because most queues have none", () => {
+		expect(columns.get("exit_key")?.notNull).toBe(false);
+		expect(columns.get("exit_key")?.hasDefault).toBe(false);
+	});
+
+	it("constrains the exit key to one DTMF symbol in the database, not only in a form", () => {
+		expect(config.checks.map((check) => check.name)).toContain("queue_exit_key_shape_check");
+	});
+
+	it("gives the exit key a full destination trio with the same shape check as the timeout one", () => {
+		for (const name of ["exit_destination_type", "exit_destination_ref", "exit_destination_data"]) {
+			expect(columns.has(name), name).toBe(true);
+		}
+		expect(config.checks.map((check) => check.name)).toContain(
+			"queue_exit_destination_shape_check",
+		);
+	});
+
+	/** 0 is `unprioritised`, which is what every queue was before the column existed. */
+	it("defaults the priority to the bottom of the scale, and pins the scale", () => {
+		expect(columns.get("default_priority")?.notNull).toBe(true);
+		expect(columns.get("default_priority")?.default).toBe(QUEUE_PRIORITY_MIN);
+		expect(config.checks.map((check) => check.name)).toContain(
+			"queue_default_priority_range_check",
+		);
+		expect(QUEUE_PRIORITY_MAX).toBe(1000);
+	});
+});
+
+/**
+ * The per-tier agent announcement.
+ *
+ * Nullable and defaultless, like the queue whisper it overrides and for the same reason: the absence
+ * of one is the normal state, and the column has to be able to say so — a tier with no prompt falls
+ * back to the queue's, which is what every tier did before the column existed.
+ */
+describe("tier announcements", () => {
+	const config = getTableConfig(pbxTables.queueTier);
+	const column = config.columns.find((candidate) => candidate.name === "announce_prompt_id");
+
+	it("is a nullable uuid with no default", () => {
+		expect(column).toBeDefined();
+		expect(column?.notNull).toBe(false);
+		expect(column?.hasDefault).toBe(false);
+	});
+
+	it("sets null on delete, so losing a prompt costs a tier its cue and not the tenant its tier", () => {
+		const foreignKey = config.foreignKeys.find((candidate) =>
+			candidate.reference().columns.some((entry) => entry.name === "announce_prompt_id"),
+		);
+		expect(foreignKey?.onDelete).toBe("set null");
+	});
+});
+
+/**
+ * The conference-depth block on `conference`.
+ *
+ * Three columns, and the two BEEP flags are the ones worth pinning here rather than only in a DTO:
+ * a room whose entry tone silently defaulted off is a room where a third party can join a
+ * conversation and nobody in it is told. That is a privacy property, and a privacy property that
+ * lives only in a form is one an insert bypasses.
+ */
+describe("conference depth", () => {
+	const config = getTableConfig(pbxTables.conference);
+	const columns = new Map(config.columns.map((column) => [column.name, column]));
+
+	it("replaced the boolean nobody honoured with the record policy everything else uses", () => {
+		// The same swap `queue` made, one wave earlier, and for the same reason: `record_enabled` was
+		// read by nothing, and a tenant who can say `on-demand` for an extension and only yes/no for
+		// a room is looking at an inconsistency rather than a decision.
+		expect(columns.get("record_policy")?.notNull).toBe(true);
+		expect(columns.get("record_policy")?.default).toBe("none");
+		expect(columns.has("record_enabled")).toBe(false);
+	});
+
+	it("defaults both tones ON, because a silent arrival is an untold third party", () => {
+		for (const name of ["entry_tone_enabled", "exit_tone_enabled"]) {
+			expect(columns.get(name)?.notNull, name).toBe(true);
+			expect(columns.get(name)?.default, name).toBe(true);
+		}
+	});
+
+	/**
+	 * A beep and a name announcement are different costs and different features. A large room usually
+	 * wants the tone and not three seconds of somebody's recorded voice per arrival, which is not a
+	 * preference one flag could express.
+	 */
+	it("keeps the tones separate from the name announcement", () => {
+		expect(columns.get("announce_join_leave")?.notNull).toBe(true);
+		expect(columns.get("announce_join_leave")?.default).toBe(true);
+	});
+});
+
+describe("fax servers and messages", () => {
+	const serverConfig = getTableConfig(pbxTables.faxServer);
+	const messageConfig = getTableConfig(pbxTables.faxMessage);
+	const serverColumns = new Map(serverConfig.columns.map((column) => [column.name, column]));
+	const messageColumns = new Map(messageConfig.columns.map((column) => [column.name, column]));
+
+	it("binds a fax server to its DID nullably, so a server can exist before a number is bound", () => {
+		const column = serverColumns.get("phone_number_id");
+		expect(column?.getSQLType()).toBe("uuid");
+		expect(column?.notNull).toBe(false);
+		const fk = serverConfig.foreignKeys.find(
+			(candidate) => candidate.reference().columns[0]?.name === "phone_number_id",
+		);
+		expect(fk?.reference().foreignTable && getTableName(fk.reference().foreignTable)).toBe(
+			"phone_number",
+		);
+		// Releasing the number must not delete the server or cascade through its message history.
+		expect(fk?.onDelete).toBe("set null");
+	});
+
+	it("names the internal number nullable, like a paging group's, so DID-only servers stay valid", () => {
+		const column = serverColumns.get("extension_number");
+		expect(column?.getSQLType()).toBe("text");
+		expect(column?.notNull).toBe(false);
+		expect(column?.hasDefault).toBe(false);
+	});
+
+	it("carries the retry policy on the server with safe defaults", () => {
+		expect(serverColumns.get("retry_attempts")?.default).toBe(3);
+		expect(serverColumns.get("retry_backoff_seconds")?.default).toBe(60);
+		expect(serverColumns.get("enabled")?.default).toBe(true);
+	});
+
+	it("keeps both the fax-to-email and the email-to-fax seams as nullable addresses", () => {
+		expect(serverColumns.get("email_to_address")?.notNull).toBe(false);
+		expect(serverColumns.get("email_from_address")?.notNull).toBe(false);
+	});
+
+	it("files a message off its server, cascading, with the queue's safe off-state default", () => {
+		expect(messageColumns.get("status")?.default).toBe("queued");
+		expect(messageColumns.get("direction")?.notNull).toBe(true);
+		const fk = messageConfig.foreignKeys.find(
+			(candidate) => candidate.reference().columns[0]?.name === "fax_server_id",
+		);
+		expect(fk?.reference().foreignTable && getTableName(fk.reference().foreignTable)).toBe(
+			"fax_server",
+		);
+		expect(fk?.onDelete).toBe("cascade");
+	});
+
+	it("carries the object key nullable, filled after inbound download / before outbound store", () => {
+		expect(messageColumns.get("object_key")?.notNull).toBe(false);
+	});
+
+	it("dedupes an inbound redelivery on a per-tenant unique carrier fax id", () => {
+		const unique = messageConfig.indexes.find(
+			(candidate) => candidate.config.name === "fax_message_organization_telnyx_fax_id_key",
+		);
+		expect(unique?.config.unique).toBe(true);
+	});
+
+	it("isolates both tables by tenant under the harness naming convention", () => {
+		expect(serverConfig.policies.map((policy) => policy.name)).toEqual([
+			"fax_server_tenant_isolation",
+		]);
+		expect(messageConfig.policies.map((policy) => policy.name)).toEqual([
+			"fax_message_tenant_isolation",
+		]);
+		expect(serverConfig.enableRLS).toBe(true);
+		expect(messageConfig.enableRLS).toBe(true);
 	});
 });

@@ -60,6 +60,33 @@ export interface CallLegRow {
 	readonly disposition: CallDisposition;
 	readonly recordingKey: string | null;
 	readonly transcriptionStatus: TranscriptionStatus;
+	/**
+	 * Which authorisation code let this leg dial out, when one was demanded.
+	 *
+	 * A PIN set attached to an outbound route challenges the caller before any trunk is offered the
+	 * call, and the engine records WHICH code answered — `call_legs.auth_pin_ordinal` is the entry's
+	 * position in the set and `auth_pin_label` is the human name beside it ("Night desk"). The digits
+	 * are never here: they are stored as a digest and the label is what a bill is read against.
+	 *
+	 * All-or-nothing, and the writer enforces it (`cdr-leg-mapping.ts` nulls the label when the
+	 * ordinal is absent), so a label without an ordinal is not a state this app has to render. The
+	 * ordinal is legitimately `0` — the first code in a set — which is why nothing here may test it
+	 * for truthiness.
+	 *
+	 * ## Both are OPTIONAL, and that is the honest mirror rather than a hedge
+	 *
+	 * The columns exist and the writer fills them, but `LEG_LIST_COLUMNS` and `LEG_DETAIL_COLUMNS` in
+	 * `apps/api/src/cdr/query/cdr.repository.ts` do not select them yet — and `raw` cannot stand in,
+	 * because both keys are in `MAPPED_KEYS` and are therefore stripped out of the passthrough blob.
+	 * So a leg read today arrives with the keys ABSENT rather than null, and typing them as
+	 * `number | null` would be this app asserting a projection the server does not have.
+	 *
+	 * `?` rather than `| null` alone is what makes the renderer's `== null` test correct for both the
+	 * "not selected" and the "no code was demanded" cases, and what makes widening the projection a
+	 * change with no diff on this side.
+	 */
+	readonly authPinOrdinal?: number | null;
+	readonly authPinLabel?: string | null;
 }
 
 /** The detail view adds the media-quality block and the passthrough jsonb. */
@@ -104,6 +131,92 @@ export interface CallDetail {
 	readonly recordings: readonly RecordingRow[];
 }
 
+// ---------------------------------------------------------------------------------------------
+// Exports — asking the ledger a question too big to answer in a request
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Where an export job is in its lifecycle. Mirrors `CDR_EXPORT_STATUSES` in `@optimiq-voice/cdr-db`.
+ *
+ * Two of the four are TERMINAL (`succeeded`, `failed`) and two are not, and that distinction is
+ * load-bearing rather than cosmetic: it is what a polling client stops on. See
+ * {@link isSettledExportStatus} in `./client.ts`, which is the single place this app decides.
+ *
+ * `running` is a CLAIM rather than a phase — the row carries `claimedAt` and a worker that dies
+ * mid-write leaves a job stuck in it until the lease is reclaimed. So a job that has read `running`
+ * for a while is not necessarily progressing, and the screen does not promise that it is.
+ */
+export const CDR_EXPORT_STATUSES = ["queued", "running", "succeeded", "failed"] as const;
+export type CdrExportStatus = (typeof CDR_EXPORT_STATUSES)[number];
+
+/**
+ * Why an export produced no file. Mirrors `CDR_EXPORT_FAILURES`.
+ *
+ * A closed set so a client can switch on it and say something useful, and `too-many-rows` is the
+ * member that matters: it is the one a REQUESTER can act on, by narrowing the window, and it is
+ * the one that proves the cap is not a truncation. See {@link CdrExportRow.failureDetail}.
+ */
+export const CDR_EXPORT_FAILURES = ["too-many-rows", "storage", "internal"] as const;
+export type CdrExportFailure = (typeof CDR_EXPORT_FAILURES)[number];
+
+/**
+ * One export job.
+ *
+ * ## Nullability is the column's, not a guess
+ *
+ * The server's repository derives this shape from the Drizzle columns and keeps `| null` where the
+ * column is nullable, precisely because half the interesting fields are branched on: `objectKey`
+ * being `null` is how this app knows there is no file to fetch, and `failureReason` is how it knows
+ * why. Flattening either to a non-null type would make the download button render on a job that
+ * has nothing behind it.
+ *
+ * `rowCount` and `sizeBytes` are `notNull` with a default of `0`, so a queued job legitimately
+ * reports zero rows — that is "not counted yet", not "no calls matched". The screen renders them
+ * only on a job that finished.
+ *
+ * ## `filters` is the QUESTION, echoed back
+ *
+ * The job pins the filters as the DTO parsed them, so re-reading an old job reproduces what was
+ * asked rather than what the same query would return today. That is the whole reason exports are
+ * rows and not outbox entries: re-deriving "the last 92 days" a day later produces a different file
+ * from the one somebody downloaded.
+ *
+ * It is `unknown`-valued rather than typed as `CdrListQuery`: it is whatever the DTO accepted at
+ * the time the job was created, and a build that has since gained a filter must still be able to
+ * render a job that predates it. `describeExportFilters` in `./client.ts` reads it defensively.
+ */
+export interface CdrExportRow {
+	readonly id: string;
+	readonly status: CdrExportStatus;
+	/** The `user.id` that asked. `null` on a job whose requester was not a person. */
+	readonly requestedBy: string | null;
+	readonly filters: Readonly<Record<string, unknown>>;
+	/** The window the server RESOLVED, lifted out of `filters` so it needs no parsing. */
+	readonly rangeFrom: string;
+	readonly rangeTo: string;
+	readonly attempts: number;
+	/** `null` until there is a file, and forever on a failure. Never rendered; see the note above. */
+	readonly objectKey: string | null;
+	readonly rowCount: number;
+	readonly sizeBytes: number;
+	readonly failureReason: CdrExportFailure | null;
+	/** A sentence for a human, written by the worker. Never a stack. */
+	readonly failureDetail: string | null;
+	readonly completedAt: string | null;
+	/** When the FILE stops being downloadable. The job row outlives it. */
+	readonly expiresAt: string | null;
+	readonly createdAt: string;
+}
+
+/**
+ * A short-lived, signed URL for one export's CSV.
+ *
+ * The same shape as {@link RecordingDownloadLink} and the same bearer-credential warning, with one
+ * difference at the far end: the response is served `content-disposition: attachment`, because the
+ * only thing anybody does with this file is save it.
+ */
+export type CdrExportDownloadLink = RecordingDownloadLink;
+
 /**
  * A short-lived, signed URL for one recording's media.
  *
@@ -115,4 +228,79 @@ export interface RecordingDownloadLink {
 	readonly url: string;
 	readonly expiresAt: string;
 	readonly expiresInSeconds: number;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Queue service level
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One queue's numbers over a window, mirroring `QueueStatsRow` in
+ * `apps/api/src/cdr/query/queue-stats.ts`.
+ *
+ * ## The queue is a UUID and stays one
+ *
+ * `queueId` is `call_legs.queue_ref` and this database holds no queue NAMES — the endpoint does not
+ * join `pbx-db` to label the rows, because that is a cross-database join this architecture does not
+ * have. So the caller labels them from `GET /queues`, which every screen rendering these has
+ * already fetched. A queue deleted since the window will appear here as an id with no name, and
+ * that is the honest answer rather than a row silently dropped.
+ *
+ * ## Why `offered` is not `answered + abandoned`
+ *
+ * There are six endings and only one of them is being served. A caller the queue timed out into a
+ * voicemail box has a leg that ended `answered` in call terms, and counting them as served is how a
+ * queue nobody staffs reports perfectly — which is exactly the failure `queue_outcome` exists to
+ * stop being invisible.
+ */
+export interface QueueStatsRow {
+	readonly queueId: string;
+	/** Every call the queue was asked to serve: answered plus every way of not being. */
+	readonly offered: number;
+	readonly answered: number;
+	/** The caller hung up while holding. The number a supervisor reacts to. */
+	readonly abandoned: number;
+	/** A wait deadline expired and the queue took its timeout branch. */
+	readonly timedOut: number;
+	/** Nobody was logged in at all. Distinct from `timedOut`, because the fix is different. */
+	readonly noAgents: number;
+	/** The caller pressed the exit key. A CHOICE, which is why it is not folded into `abandoned`. */
+	readonly exited: number;
+	/**
+	 * Mean wait across ANSWERED calls only.
+	 *
+	 * Answered only, deliberately, and worth repeating on this side because a chart that mixed them
+	 * would be the classic contact-centre metric that reports the opposite of what happened: an
+	 * average including abandonments falls when callers give up sooner, so a queue getting worse
+	 * shows a shrinking hold time.
+	 */
+	readonly averageAnswerWaitMs: number;
+	readonly averageAbandonWaitMs: number;
+	/** The worst wait any answered caller had. An average hides exactly this. */
+	readonly longestAnswerWaitMs: number;
+	/**
+	 * Answered inside the target as a percentage of OFFERED, to one decimal — and `null` when
+	 * nothing was offered.
+	 *
+	 * The null is not a missing value to be coalesced away: a queue with no traffic has no service
+	 * level, and rendering it as 0% would put an idle queue and a failing one in the same colour on
+	 * a wallboard. Every renderer of this field has to say "no traffic", not "0%".
+	 */
+	readonly serviceLevelPct: number | null;
+	/** How many offered calls beat the target — the numerator, exposed so the maths is checkable. */
+	readonly withinTarget: number;
+}
+
+/**
+ * `GET /cdr/queue-stats`.
+ *
+ * Carries the resolved window and the target it was computed against, both of which are rendered:
+ * the server DEFAULTS an absent range and the SLA seconds are a question rather than a stored
+ * setting, so a page that showed neither would be reporting a percentage against a target the
+ * reader cannot see.
+ */
+export interface QueueStatsEnvelope {
+	readonly data: readonly QueueStatsRow[];
+	readonly slaSeconds: number;
+	readonly range: { readonly from: string; readonly to: string };
 }

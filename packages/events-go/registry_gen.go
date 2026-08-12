@@ -34,14 +34,27 @@ var EventTypes = []EventTypeInfo{
 	{Family: FamilyCall, Type: EventTypeChannelDestroyed, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.channel.destroyed"},
 	{Family: FamilyCall, Type: EventTypeConferenceJoined, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.conference.joined"},
 	{Family: FamilyCall, Type: EventTypeConferenceLeft, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.conference.left"},
+	{Family: FamilyCall, Type: EventTypeConferenceParticipantUpdated, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.conference.participant.updated"},
+	{Family: FamilyCall, Type: EventTypeConferenceLocked, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.conference.locked"},
+	{Family: FamilyCall, Type: EventTypeConferenceUnlocked, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.conference.unlocked"},
 	{Family: FamilyCall, Type: EventTypeCallParked, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.call.parked"},
 	{Family: FamilyCall, Type: EventTypeCallUnparked, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.call.unparked"},
 	{Family: FamilyCall, Type: EventTypeCallTransferred, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.call.transferred"},
 	{Family: FamilyCall, Type: EventTypeCallPickedUp, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.call.picked-up"},
 	{Family: FamilyCall, Type: EventTypeCallEmergencyDialed, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.call.emergency.dialed"},
+	{Family: FamilyCall, Type: EventTypeCallTapStarted, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.call.tap.started"},
+	{Family: FamilyCall, Type: EventTypeCallTapEnded, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.call.tap.ended"},
+	{Family: FamilyCall, Type: EventTypeCallPagingStarted, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.call.paging.started"},
+	{Family: FamilyCall, Type: EventTypeCallPagingEnded, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.call.paging.ended"},
 	{Family: FamilyRegistration, Type: EventTypeRegistrationRegistered, SubjectTemplate: "sip.reg.v1.<orgId>.<aorHash>.registered"},
 	{Family: FamilyRegistration, Type: EventTypeRegistrationUnregistered, SubjectTemplate: "sip.reg.v1.<orgId>.<aorHash>.unregistered"},
 	{Family: FamilyRegistration, Type: EventTypeRegistrationExpired, SubjectTemplate: "sip.reg.v1.<orgId>.<aorHash>.expired"},
+	{Family: FamilySIPDialog, Type: EventTypeSIPDialogProgressed, SubjectTemplate: "sip.evt.v1.<orgId>.<legId>.dialog.progressed"},
+	{Family: FamilySIPDialog, Type: EventTypeSIPDialogAnswered, SubjectTemplate: "sip.evt.v1.<orgId>.<legId>.dialog.answered"},
+	{Family: FamilySIPDialog, Type: EventTypeSIPDialogHeld, SubjectTemplate: "sip.evt.v1.<orgId>.<legId>.dialog.held"},
+	{Family: FamilySIPDialog, Type: EventTypeSIPDialogResumed, SubjectTemplate: "sip.evt.v1.<orgId>.<legId>.dialog.resumed"},
+	{Family: FamilySIPDialog, Type: EventTypeSIPDialogTerminated, SubjectTemplate: "sip.evt.v1.<orgId>.<legId>.dialog.terminated"},
+	{Family: FamilySIPDialog, Type: EventTypeSIPDialogDTMF, SubjectTemplate: "sip.evt.v1.<orgId>.<legId>.dialog.dtmf"},
 	{Family: FamilyQueue, Type: EventTypeQueueCallerJoined, SubjectTemplate: "queue.evt.v1.<orgId>.<queueId>.caller.joined"},
 	{Family: FamilyQueue, Type: EventTypeQueueCallerAnswered, SubjectTemplate: "queue.evt.v1.<orgId>.<queueId>.caller.answered"},
 	{Family: FamilyQueue, Type: EventTypeQueueCallerAbandoned, SubjectTemplate: "queue.evt.v1.<orgId>.<queueId>.caller.abandoned"},
@@ -53,6 +66,7 @@ var EventTypes = []EventTypeInfo{
 	{Family: FamilyMedia, Type: EventTypeMediaPlaybackFinished, SubjectTemplate: "media.evt.v1.<orgId>.<sessionId>.playback.finished"},
 	{Family: FamilyMedia, Type: EventTypeMediaRecordingFinished, SubjectTemplate: "media.evt.v1.<orgId>.<sessionId>.recording.finished"},
 	{Family: FamilyMedia, Type: EventTypeMediaDtmfReceived, SubjectTemplate: "media.evt.v1.<orgId>.<sessionId>.dtmf.received"},
+	{Family: FamilyTrunk, Type: EventTypeTrunkStatusChanged, SubjectTemplate: "trunk.evt.v1.<orgId>.<trunkId>.status.changed"},
 	{Family: FamilyCDR, Type: EventTypeCDRLegWrite, SubjectTemplate: "cdr.leg.v1.<orgId>"},
 	{Family: FamilyAudit, Type: EventTypeAuditRecorded, SubjectTemplate: "audit.evt.v1.<orgId>"},
 	{Family: FamilyProvision, Type: EventTypeProvisionDeviceRequested, SubjectTemplate: "provision.evt.v1.<orgId>"},
@@ -97,6 +111,12 @@ func NewDataFor(eventType string) any {
 		return new(ConferenceJoinedData)
 	case EventTypeConferenceLeft:
 		return new(ConferenceLeftData)
+	case EventTypeConferenceParticipantUpdated:
+		return new(ConferenceParticipantUpdatedData)
+	case EventTypeConferenceLocked:
+		return new(ConferenceLockedData)
+	case EventTypeConferenceUnlocked:
+		return new(ConferenceUnlockedData)
 	case EventTypeCallParked:
 		return new(CallParkedData)
 	case EventTypeCallUnparked:
@@ -107,12 +127,32 @@ func NewDataFor(eventType string) any {
 		return new(CallPickedUpData)
 	case EventTypeCallEmergencyDialed:
 		return new(CallEmergencyDialedData)
+	case EventTypeCallTapStarted:
+		return new(CallTapStartedData)
+	case EventTypeCallTapEnded:
+		return new(CallTapEndedData)
+	case EventTypeCallPagingStarted:
+		return new(CallPagingStartedData)
+	case EventTypeCallPagingEnded:
+		return new(CallPagingEndedData)
 	case EventTypeRegistrationRegistered:
 		return new(RegistrationRegisteredData)
 	case EventTypeRegistrationUnregistered:
 		return new(RegistrationUnregisteredData)
 	case EventTypeRegistrationExpired:
 		return new(RegistrationExpiredData)
+	case EventTypeSIPDialogProgressed:
+		return new(SIPDialogProgressedData)
+	case EventTypeSIPDialogAnswered:
+		return new(SIPDialogAnsweredData)
+	case EventTypeSIPDialogHeld:
+		return new(SIPDialogHeldData)
+	case EventTypeSIPDialogResumed:
+		return new(SIPDialogResumedData)
+	case EventTypeSIPDialogTerminated:
+		return new(SIPDialogTerminatedData)
+	case EventTypeSIPDialogDTMF:
+		return new(SIPDialogDTMFData)
 	case EventTypeQueueCallerJoined:
 		return new(QueueCallerJoinedData)
 	case EventTypeQueueCallerAnswered:
@@ -135,6 +175,8 @@ func NewDataFor(eventType string) any {
 		return new(MediaRecordingFinishedData)
 	case EventTypeMediaDtmfReceived:
 		return new(MediaDtmfReceivedData)
+	case EventTypeTrunkStatusChanged:
+		return new(TrunkStatusChangedData)
 	case EventTypeCDRLegWrite:
 		return new(CDRLegWriteData)
 	case EventTypeAuditRecorded:

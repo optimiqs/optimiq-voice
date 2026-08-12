@@ -38,6 +38,12 @@ type Credential struct {
 	// the registration event so the admin UI can join a live binding to inventory.
 	DeviceID    string
 	ExtensionID string
+	// SharedLineNumber and AppearanceIndex describe this account's place in a shared line appearance
+	// (SLA), when it has one. They come from the credential reply, travel onto the binding, and are
+	// what the INVITE path stamps as a `Call-Info` appearance-index header so the phone lights the
+	// right line key. Nil for an ordinary extension that is not part of a shared line.
+	SharedLineNumber *string
+	AppearanceIndex  *int
 }
 
 // Store resolves a SIP username within a realm.

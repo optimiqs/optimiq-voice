@@ -1,20 +1,26 @@
 import { describe, expect, it } from "bun:test";
 import {
+	aCallFlow,
 	aConference,
+	aDirectory,
 	anExtension,
 	anIvrMenu,
 	anIvrOption,
 	anOutboundRoute,
+	aPagingGroup,
 	aParkLot,
 	aPhoneNumber,
 	aQueue,
 	aRingGroup,
 	aRingGroupMember,
+	aSharedLine,
 	aSnapshot,
+	aStream,
 	aTimeCondition,
 	aTimeRule,
 	aTrunk,
 	aVoicemailBox,
+	aVoicemailGreeting,
 	compiled,
 } from "./fixtures";
 import { PLAN_NODE_KINDS, planNodeIds, planNodeReferences, reachableNodeIds } from "./plan";
@@ -28,6 +34,8 @@ const artifact = compiled(
 		voicemailBoxes: [aVoicemailBox()],
 		conferences: [aConference()],
 		parkLots: [aParkLot({ timeoutDestinationType: "extension", timeoutDestinationRef: "ext-1" })],
+		pagingGroups: [aPagingGroup()],
+		sharedLines: [aSharedLine()],
 		queues: [aQueue({ timeoutDestinationType: "voicemail", timeoutDestinationRef: "vm-1" })],
 		ringGroups: [aRingGroup({ timeoutDestinationType: "queue", timeoutDestinationRef: "q-1" })],
 		ringGroupDestinations: [aRingGroupMember()],
@@ -79,6 +87,13 @@ const artifact = compiled(
 		trunks: [aTrunk()],
 		outboundRoutes: [anOutboundRoute()],
 		phoneNumbers: [aPhoneNumber({ destinationType: "ivr", destinationRef: "ivr-1" })],
+		// The T2 admin block's three node kinds. The directory carries no entries here (nobody has a
+		// recorded name in this fixture) and still emits its node — an empty directory is a warning,
+		// not a missing node, because a tenant builds one before anybody records a name.
+		callFlows: [aCallFlow()],
+		audioStreams: [aStream()],
+		directories: [aDirectory()],
+		voicemailGreetings: [aVoicemailGreeting()],
 	}),
 );
 
@@ -89,6 +104,20 @@ function kindsIn(nodes: PlanNodeTable): ReadonlySet<string> {
 describe("plan node vocabulary", () => {
 	it("has no duplicate kinds", () => {
 		expect(new Set(PLAN_NODE_KINDS).size).toBe(PLAN_NODE_KINDS.length);
+	});
+
+	/**
+	 * Pinned, because a kind added here is an artifact-version bump: a reader compiled against the
+	 * previous version meets a `kind` it has no case for, mid-call. Counting them is how the bump
+	 * stops being something somebody has to remember.
+	 */
+	it("names nineteen kinds", () => {
+		expect(PLAN_NODE_KINDS).toHaveLength(19);
+		expect(PLAN_NODE_KINDS).toContain("paging");
+		expect(PLAN_NODE_KINDS).toContain("call-flow");
+		expect(PLAN_NODE_KINDS).toContain("stream");
+		expect(PLAN_NODE_KINDS).toContain("dial-by-name");
+		expect(PLAN_NODE_KINDS).toContain("shared-line");
 	});
 
 	it("emits every kind except playback from a fully wired organization", () => {
@@ -126,6 +155,11 @@ describe("planNodeReferences", () => {
 		const references = planNodeReferences(artifact.nodes["ring-group:rg-1"] as PlanNode);
 		expect(references).toContain("extension:ext-1");
 		expect(references).toContain("queue:q-1");
+	});
+
+	it("lists a shared line's appearances", () => {
+		const references = planNodeReferences(artifact.nodes["shared-line:sl-1"] as PlanNode);
+		expect(references).toContain("extension:ext-1");
 	});
 
 	it("lists an IVR menu's options and branches", () => {

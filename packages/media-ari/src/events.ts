@@ -2,10 +2,20 @@ import { AriEventParseError } from "./errors";
 import {
 	ariBridgeSchema,
 	ariChannelSchema,
+	ariEndpointSchema,
 	ariLiveRecordingSchema,
+	ariPeerSchema,
 	ariPlaybackSchema,
 } from "./models";
-import type { AriBridge, AriCallerId, AriChannel, AriLiveRecording, AriPlayback } from "./models";
+import type {
+	AriBridge,
+	AriCallerId,
+	AriChannel,
+	AriEndpoint,
+	AriLiveRecording,
+	AriPeer,
+	AriPlayback,
+} from "./models";
 
 /**
  * The ARI event vocabulary, as a discriminated union on `type`.
@@ -13,7 +23,7 @@ import type { AriBridge, AriCallerId, AriChannel, AriLiveRecording, AriPlayback 
  * ## Scope
  *
  * Only the events the engine consumes are given a typed shape. Everything else Asterisk emits —
- * and it emits a great deal, from `PeerStatusChange` to `ContactStatusChange` — arrives as
+ * and it emits a great deal, from `ContactStatusChange` to `DeviceStateChanged` — arrives as
  * {@link AriUnknownEvent}, which keeps its raw payload. Dropping unknown events at this edge would
  * mean a new Asterisk release silently loses information the engine could have logged; typing all
  * ~60 of them would mean maintaining a schema for events nobody reads.
@@ -59,6 +69,7 @@ export const ARI_EVENT_TYPES = [
 	"ChannelEnteredBridge",
 	"ChannelLeftBridge",
 	"Dial",
+	"PeerStatusChange",
 ] as const;
 
 export type AriEventType = (typeof ARI_EVENT_TYPES)[number];
@@ -234,6 +245,25 @@ export interface AriDialEvent extends AriEventBase {
 }
 
 /**
+ * A peer's qualify status changed — `Reachable`, `Unreachable`, `Unknown`, `Created`, `Removed`.
+ *
+ * The OPTIONS pinger's verdict on a trunk. Asterisk qualifies every PJSIP endpoint that carries a
+ * `qualify_frequency` and raises this on the TRANSITION, not on every ping — which is exactly the
+ * shape the trunk write-back wants, and why this event graduated out of {@link AriUnknownEvent}.
+ * Delivered only when the application subscribes beyond its own channels (`subscribeAll`), which
+ * the engine's ARI connection is configured for.
+ *
+ * `endpoint` is optional structurally rather than semantically: Asterisk always sends one, but a
+ * frame that lost it still parses, and the consumer (the engine's trunk-status mapping) answers
+ * `undefined` for it rather than this parser inventing an endpoint name to satisfy a type.
+ */
+export interface AriPeerStatusChangeEvent extends AriEventBase {
+	readonly type: "PeerStatusChange";
+	readonly endpoint?: AriEndpoint;
+	readonly peer: AriPeer;
+}
+
+/**
  * Any event this adapter does not model. The raw payload is retained so the engine can log it,
  * count it, or grow a typed member for it later without a protocol change.
  */
@@ -266,6 +296,7 @@ export type AriEvent =
 	| AriChannelEnteredBridgeEvent
 	| AriChannelLeftBridgeEvent
 	| AriDialEvent
+	| AriPeerStatusChangeEvent
 	| AriUnknownEvent;
 
 /** Narrows the union by event name. */
@@ -371,6 +402,31 @@ function parseRecording(raw: RawEvent, ariType: string): AriLiveRecording {
 	if (!result.success) {
 		throw new AriEventParseError(
 			`${ariType}.recording is not a valid LiveRecording: ${result.error.issues.map((issue) => issue.message).join(", ")}`,
+			ariType,
+		);
+	}
+	return result.data;
+}
+
+function parsePeer(raw: RawEvent, ariType: string): AriPeer {
+	const result = ariPeerSchema.safeParse(requireObject(raw.peer, "peer", ariType));
+	if (!result.success) {
+		throw new AriEventParseError(
+			`${ariType}.peer is not a valid Peer: ${result.error.issues.map((issue) => issue.message).join(", ")}`,
+			ariType,
+		);
+	}
+	return result.data;
+}
+
+function parseOptionalEndpoint(raw: RawEvent, ariType: string): AriEndpoint | undefined {
+	if (raw.endpoint === undefined) {
+		return undefined;
+	}
+	const result = ariEndpointSchema.safeParse(requireObject(raw.endpoint, "endpoint", ariType));
+	if (!result.success) {
+		throw new AriEventParseError(
+			`${ariType}.endpoint is not a valid Endpoint: ${result.error.issues.map((issue) => issue.message).join(", ")}`,
 			ariType,
 		);
 	}
@@ -515,6 +571,13 @@ export function parseAriEvent(payload: unknown): AriEvent {
 				forwarded: parseOptionalChannel(raw, "forwarded", ariType),
 				dialstring: optionalString(raw, "dialstring"),
 				dialstatus: optionalString(raw, "dialstatus") ?? "",
+			};
+		case "PeerStatusChange":
+			return {
+				...base,
+				type: "PeerStatusChange",
+				endpoint: parseOptionalEndpoint(raw, ariType),
+				peer: parsePeer(raw, ariType),
 			};
 		default:
 			return { ...base, type: "Unknown", ariType, raw };

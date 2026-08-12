@@ -1,5 +1,8 @@
 import { Inject, Module, type OnApplicationShutdown } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
+import { AuthModule } from "../auth/auth.module";
+import { AuthzCheckRpcController } from "../auth/authz/authz-check-rpc.controller";
+import { AuthzService } from "../auth/authz/authz.service";
 import { createObjectStore, describeObjectStore, loadStorageEnv } from "../storage";
 import {
 	createTranscriptionProvider,
@@ -8,21 +11,51 @@ import {
 } from "../transcription";
 import { AuditLogQueryService } from "./audit-log/audit-log-query.service";
 import { AuditLogController } from "./audit-log/audit-log.controller";
+import { CallBlockController } from "./call-block/call-block.controller";
+import { CallBlockService } from "./call-block/call-block.service";
+import { CallFlowPresencePublisher } from "./call-flows/call-flow-presence.publisher";
+import { CallFlowsController } from "./call-flows/call-flows.controller";
+import { CallFlowsService, TimeConditionOverrideService } from "./call-flows/call-flows.service";
 import { CallsController } from "./calls/calls.controller";
 import { CallsService } from "./calls/calls.service";
 import { CarrierWebhookController } from "./carrier/carrier-webhook.controller";
 import { CarrierController, CarrierTrunkController } from "./carrier/carrier.controller";
 import { carrierProviders } from "./carrier/carrier.providers";
 import { CarrierService } from "./carrier/carrier.service";
+import { ConferenceControlClient } from "./conferences/conference-control.client";
+import { ConferenceModerationController } from "./conferences/conference-moderation.controller";
+import { ConferenceModerationService } from "./conferences/conference-moderation.service";
 import { ConferencePinService } from "./conferences/conference-pin.service";
 import { ConferencesController } from "./conferences/conferences.controller";
 import { ConferencesService } from "./conferences/conferences.service";
+import {
+	AudioStreamsController,
+	DestinationAliasesController,
+	DirectoriesController,
+	SpeedDialsController,
+} from "./dial-plan/dial-plan.controller";
+import {
+	AudioStreamsService,
+	DestinationAliasesService,
+	DialByNameDirectoriesService,
+	SpeedDialsService,
+} from "./dial-plan/dial-plan.service";
 import { EmergencyAddressesController } from "./emergency-addresses/emergency-addresses.controller";
 import { EmergencyAddressesService } from "./emergency-addresses/emergency-addresses.service";
 import { EmergencyConsumer } from "./emergency-addresses/emergency-consumer.service";
 import { EmergencyNotificationService } from "./emergency-addresses/emergency-notification.service";
+import { ExtensionFeatureRpcController } from "./extensions/extension-feature-rpc.controller";
+import { ExtensionFeatureService } from "./extensions/extension-feature.service";
 import { ExtensionsController } from "./extensions/extensions.controller";
 import { ExtensionsService } from "./extensions/extensions.service";
+import { FaxEmailService } from "./fax/fax-email.service";
+import { loadFaxEnv } from "./fax/fax-env";
+import { FaxInboundService } from "./fax/fax-inbound.service";
+import { createFaxMediaFetch } from "./fax/fax-media";
+import { FaxSendWorker } from "./fax/fax-send-worker.service";
+import { FaxController } from "./fax/fax.controller";
+import { FaxService } from "./fax/fax.service";
+import { FAX_ENV, FAX_MEDIA_FETCH, FAX_STORE } from "./fax/fax.tokens";
 import { FeatureCodesController } from "./feature-codes/feature-codes.controller";
 import { FeatureCodesService } from "./feature-codes/feature-codes.service";
 import { InboundRoutesController } from "./inbound-routes/inbound-routes.controller";
@@ -31,14 +64,25 @@ import { IvrMenusController } from "./ivr-menus/ivr-menus.controller";
 import { IvrMenuOptionsService, IvrMenusService } from "./ivr-menus/ivr-menus.service";
 import { MohClassesController } from "./moh-classes/moh-classes.controller";
 import { MohClassesService } from "./moh-classes/moh-classes.service";
+import { OrgLimitsController } from "./org-limits/org-limits.controller";
+import { OrgLimitsService } from "./org-limits/org-limits.service";
 import { OrgSettingsController } from "./org-settings/org-settings.controller";
 import { OrgSettingsService } from "./org-settings/org-settings.service";
 import { OutboundRoutesController } from "./outbound-routes/outbound-routes.controller";
 import { OutboundRoutesService } from "./outbound-routes/outbound-routes.service";
+import { PagingGroupsController } from "./paging-groups/paging-groups.controller";
+import {
+	PagingGroupMembersService,
+	PagingGroupsService,
+} from "./paging-groups/paging-groups.service";
 import { ParkLotsController } from "./park-lots/park-lots.controller";
 import { ParkLotsService } from "./park-lots/park-lots.service";
 import { PhoneNumbersController } from "./phone-numbers/phone-numbers.controller";
 import { PhoneNumbersService } from "./phone-numbers/phone-numbers.service";
+import { PhrasesController } from "./phrases/phrases.controller";
+import { PhrasesService, PhraseStepsService } from "./phrases/phrases.service";
+import { PinSetsController } from "./pin-sets/pin-sets.controller";
+import { PinSetEntriesService, PinSetsService } from "./pin-sets/pin-sets.service";
 import { PromptsController } from "./prompts/prompts.controller";
 import { PromptsService } from "./prompts/prompts.service";
 import { AgentStatePublisher } from "./queues/agent-state.publisher";
@@ -58,10 +102,16 @@ import { RoutingRpcController } from "./routing/routing-rpc.controller";
 import { RoutingController } from "./routing/routing.controller";
 import { RoutingService } from "./routing/routing.service";
 import { SipAclEntriesController } from "./security/sip-acl.controller";
+import { affectsSipAcl, SipAclPublisher } from "./security/sip-acl.publisher";
 import { SipAclEntriesService } from "./security/sip-acl.service";
 import { SipAuthEventQueryService } from "./security/sip-auth-event-query.service";
 import { SipAuthEventController } from "./security/sip-auth-event.controller";
 import { SipAuthEventService } from "./security/sip-auth-event.service";
+import { SharedLinesController } from "./shared-lines/shared-lines.controller";
+import {
+	SharedLineAppearancesService,
+	SharedLinesService,
+} from "./shared-lines/shared-lines.service";
 import { AuditLogService } from "./shared/audit-log.service";
 import { createPbxDatabase } from "./shared/pbx-database";
 import { loadPbxEnv } from "./shared/pbx-env";
@@ -84,8 +134,17 @@ import {
 	TimeConditionRulesService,
 	TimeConditionsService,
 } from "./time-conditions/time-conditions.service";
+import { TranslationRulesetsController } from "./translations/translations.controller";
+import {
+	TranslationRulesetsService,
+	TranslationRulesService,
+} from "./translations/translations.service";
+import { affectsTrunkDirectory, TrunkDirectoryPublisher } from "./trunks/trunk-directory.publisher";
+import { TrunkStatusConsumer } from "./trunks/trunk-status-consumer.service";
 import { TrunksController } from "./trunks/trunks.controller";
 import { TrunksService } from "./trunks/trunks.service";
+import { FileGreetingRpcController } from "./voicemail-boxes/file-greeting-rpc.controller";
+import { FileGreetingService } from "./voicemail-boxes/file-greeting.service";
 import { VoicemailBoxesController } from "./voicemail-boxes/voicemail-boxes.controller";
 import { VoicemailBoxesService } from "./voicemail-boxes/voicemail-boxes.service";
 import { VoicemailConsumer } from "./voicemail-boxes/voicemail-consumer.service";
@@ -104,7 +163,9 @@ import { WebhooksController } from "./webhooks/webhooks.controller";
 import { WebhooksService } from "./webhooks/webhooks.service";
 import type { ObjectStore } from "../storage";
 import type { TranscriptionEnv, TranscriptionProvider } from "../transcription";
+import type { FaxEnv } from "./fax/fax-env";
 import type { PbxEnv } from "./shared/pbx-env";
+import type { ProjectionName } from "./shared/projection-outbox";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
 const logger = getLogger("api.pbx");
@@ -135,7 +196,45 @@ const logger = getLogger("api.pbx");
  * broker outage degrades the cache rather than the API.
  */
 @Module({
+	/**
+	 * The auth slice, imported for ONE thing: `AUTH_REPOSITORY`, which `AuthzService` needs.
+	 *
+	 * This is the first import this module has had, so the direction is worth defending. The
+	 * alternative was to declare the authz responder in `AuthModule` and have that module import
+	 * this one, and it is the wrong way round twice over. `AuthModule` is the slice that boots on
+	 * `DATABASE_URL`/`AUTH_SECRET`/`AUTH_URL` ALONE — `main.ts` mounts it for deployments that have
+	 * no telephony database at all, and `verify-auth-slice.ts` mounts it by itself — so importing
+	 * `PbxModule` from it would make the authentication surface require `PBX_DATABASE_URL`. And the
+	 * responder needs `PBX_DATABASE` anyway, which only this module owns.
+	 *
+	 * `LiveModule` already does exactly this (`imports: [AuthModule, PbxModule]`), so the shape is
+	 * the area's own precedent rather than a new one, and the module instance is the same singleton
+	 * the root composes — importing it here builds no second pool and registers no second guard.
+	 *
+	 * WHAT HAPPENS WHEN ONLY ONE SLICE IS CONFIGURED. Nothing, in both directions, and that is the
+	 * point: `main.ts` computes `pbxAreaEnabled = authSliceEnabled && isPbxAreaEnabled()`, so this
+	 * module is never mounted without the auth slice — the pairing is a precondition of the area,
+	 * not an assumption this file makes. With the auth slice alone (no `PBX_DATABASE_URL`) the whole
+	 * of `PbxModule` is skipped, the controller below is never constructed, and `rpc.authz.v1.check`
+	 * simply goes unanswered — which an engine sees as a timeout and must, per its own contract,
+	 * treat as a refusal. That is the correct behaviour for a deployment with no extensions to
+	 * supervise, and it is louder than the alternative would be: a responder that mounted anyway and
+	 * answered `allowed: false` for every extension would look identical to a permissions problem
+	 * and send somebody auditing roles for an afternoon.
+	 */
+	imports: [AuthModule],
 	controllers: [
+		/**
+		 * `rpc.authz.v1.check` — declared here, defined in `../auth/authz/`.
+		 *
+		 * The split is deliberate. The FILES belong beside `resolveRolePermissions` and the membership
+		 * repository, because that is what they are about and that is where the next person changing
+		 * how a role expands will be looking. The WIRING belongs here, because this is the module that
+		 * owns `PBX_DATABASE` — the responder's second lookup crosses into the telephony database to
+		 * turn an extension number into a user — and because a reader asking "what subjects does this
+		 * application answer?" gets the whole list from one `controllers` array.
+		 */
+		AuthzCheckRpcController,
 		ExtensionsController,
 		PhoneNumbersController,
 		TrunksController,
@@ -144,11 +243,27 @@ const logger = getLogger("api.pbx");
 		TimeConditionsController,
 		IvrMenusController,
 		RingGroupsController,
+		PagingGroupsController,
+		SharedLinesController,
 		QueuesController,
 		QueueAgentsController,
 		QueueAgentSessionController,
 		ConferencesController,
+		ConferenceModerationController,
 		ParkLotsController,
+		// The T2 admin block. `CallFlowsController` also owns the time-condition override, because
+		// that endpoint is guarded by `call-flows.toggle` — see the controller's own note.
+		CallFlowsController,
+		PinSetsController,
+		TranslationRulesetsController,
+		DestinationAliasesController,
+		AudioStreamsController,
+		DirectoriesController,
+		SpeedDialsController,
+		// A phrase is a `prompt` row, so it is guarded by `recordings.*` and sits beside the library
+		// rather than inside the admin block's own grants. See the controller's header.
+		PhrasesController,
+		OrgLimitsController,
 		/**
 		 * Click-to-call, and the integrator surface beside it.
 		 *
@@ -172,6 +287,17 @@ const logger = getLogger("api.pbx");
 		PromptsController,
 		EmergencyAddressesController,
 		FeatureCodesController,
+		/**
+		 * Caller screening, mounted beside the star codes because they share a schema file and a
+		 * question: what the tenant's dial plan does BEFORE it looks anything up.
+		 *
+		 * The routing package has enforced `call_block_rule` on all three resolution paths since the
+		 * compiler learned `checkCallBlock`; this controller is the first way to put a row in it that
+		 * is not `psql`. `affectsRouting("call_block_rule")` is TRUE, so it goes through the same
+		 * repository and the same compile-on-write as the other resources here — a saved rule is
+		 * enforced on the next call, not on the next publish.
+		 */
+		CallBlockController,
 		/**
 		 * The settings cascade's middle level.
 		 *
@@ -211,6 +337,27 @@ const logger = getLogger("api.pbx");
 		RoutingRpcController,
 		VoicemailRpcController,
 		/**
+		 * A handset writing its OWN forwarding, do-not-disturb or follow-me.
+		 *
+		 * Beside the other two broker responders because it is the same transport and the same rule:
+		 * one `app.connectMicroservice` for the application, so a controller declared here subscribes
+		 * its subject at boot. It is the only one of the three that WRITES, which is why the number it
+		 * is handed is resolved against the tenant before anything is written rather than trusted —
+		 * see `extension-feature.service.ts`.
+		 */
+		ExtensionFeatureRpcController,
+		/**
+		 * A handset filing the greeting it has just recorded into its own mailbox.
+		 *
+		 * The fourth broker responder, and the one that made `*99` more than a runtime: the walker has
+		 * been able to record a greeting since the feature-code wave, and had nowhere to send it,
+		 * because filing one is a two-row write inside a recompile and no subject carried that. It is
+		 * declared here rather than beside the greeting CRUD controller for the reason all four of
+		 * these are together: they share one transport, and what a reader needs to see in one place is
+		 * every subject this application answers.
+		 */
+		FileGreetingRpcController,
+		/**
 		 * The change ledger's read surface.
 		 *
 		 * In the PBX area rather than beside the reporting one because `audit_log` is a `pbx-db`
@@ -243,10 +390,44 @@ const logger = getLogger("api.pbx");
 		CarrierController,
 		CarrierTrunkController,
 		CarrierWebhookController,
+		FaxController,
 	],
 	providers: [
+		/**
+		 * The authz responder's collaborator. Two injected handles, one per database — see its header
+		 * for why `extension_user.userId` cannot be joined and must be looked up twice.
+		 */
+		AuthzService,
 		...carrierProviders,
 		CarrierService,
+		/**
+		 * The fax slice: carrier-edge fax servers, inbox/outbox, the send worker and fax-to-email.
+		 *
+		 * Its own env, store and media fetcher, kept beside the services that use them. The store is a
+		 * fifth object class rooted at `FAX_OBJECT_ROOT` — unlike prompts, greetings and voicemail it
+		 * is never read by Asterisk off the shared mount, so it is the one class an operator can place
+		 * anywhere. The media fetcher is the one seam in this API that downloads a remote URL into the
+		 * store, injected so a test drives it without a network.
+		 */
+		{ provide: FAX_ENV, useFactory: (): FaxEnv => loadFaxEnv() },
+		{
+			provide: FAX_STORE,
+			useFactory: (env: FaxEnv): ObjectStore => {
+				const storage = loadStorageEnv();
+				const store = createObjectStore(storage, { root: env.FAX_OBJECT_ROOT });
+				logger.info(
+					{ root: env.FAX_OBJECT_ROOT, driver: store.driver },
+					`fax documents: ${describeObjectStore(store, storage)}`,
+				);
+				return store;
+			},
+			inject: [FAX_ENV],
+		},
+		{ provide: FAX_MEDIA_FETCH, useFactory: () => createFaxMediaFetch() },
+		FaxService,
+		FaxEmailService,
+		FaxInboundService,
+		FaxSendWorker,
 		SipCredentialsService,
 		SipCredentialsResponder,
 		{ provide: PBX_ENV, useFactory: (): PbxEnv => loadPbxEnv() },
@@ -319,6 +500,10 @@ const logger = getLogger("api.pbx");
 		RoutingCachePublisher,
 		DidIndexPublisher,
 		QueueMembershipPublisher,
+		// The two SIP-edge read models, beside the three the engine reads. Declared before
+		// `ProjectionOutboxSweeper`, which injects all five.
+		SipAclPublisher,
+		TrunkDirectoryPublisher,
 		AgentStatePublisher,
 		ProjectionOutboxSweeper,
 		AuditLogService,
@@ -329,6 +514,8 @@ const logger = getLogger("api.pbx");
 				publisher: RoutingCachePublisher,
 				didIndex: DidIndexPublisher,
 				queueMembership: QueueMembershipPublisher,
+				trunkDirectory: TrunkDirectoryPublisher,
+				sipAcl: SipAclPublisher,
 				env: PbxEnv,
 				audit: AuditLogService,
 			) => {
@@ -347,7 +534,7 @@ const logger = getLogger("api.pbx");
 				 */
 				const discharge = (
 					organizationId: string,
-					projection: "routing-cache" | "did-index" | "queue-membership",
+					projection: ProjectionName,
 					cutoff: Date,
 				): void => {
 					if (env.NATS_URL === undefined) {
@@ -445,24 +632,81 @@ const logger = getLogger("api.pbx");
 					 * during shutdown into an unhandled rejection that kills the process.
 					 */
 					onMutation: (event) => {
-						if (!affectsQueueMembership(event.tableName)) {
-							return;
-						}
 						const cutoff = new Date();
-						queueMembership
-							.syncOrganization(event.organizationId)
-							.then((result) => {
-								if (!result.skipped) {
-									discharge(event.organizationId, "queue-membership", cutoff);
-								}
-							})
-							.catch((cause) => {
-								logger.error(
-									cause,
-									`queue-membership sync failed for organization ${event.organizationId} ` +
-										`after a ${event.operation} on ${event.tableName}`,
-								);
-							});
+						if (affectsQueueMembership(event.tableName)) {
+							queueMembership
+								.syncOrganization(event.organizationId)
+								.then((result) => {
+									if (!result.skipped) {
+										discharge(event.organizationId, "queue-membership", cutoff);
+									}
+								})
+								.catch((cause) => {
+									logger.error(
+										cause,
+										`queue-membership sync failed for organization ${event.organizationId} ` +
+											`after a ${event.operation} on ${event.tableName}`,
+									);
+								});
+						}
+						/**
+						 * The carrier directory, on this seam and NOT on `onArtifactCompiled`.
+						 *
+						 * `affectsRouting("trunk")` is true, so a trunk write does recompile and the
+						 * artifact seam does fire — which makes riding on it look available and is exactly
+						 * why the choice is worth recording. It would be wrong twice. The artifact seam is
+						 * gated on `compiled.changed`, and the snapshot hash covers what the COMPILER reads
+						 * from the row; a carrier that changed only its `sip_proxy` can leave that hash
+						 * untouched and would then never reach the edge. And the artifact seam is silent for
+						 * a table that does not recompile at all, which is the case the ACL below is in. One
+						 * seam, one predicate per bucket, is the shape that cannot develop a hole.
+						 *
+						 * `TrunkStatusConsumer` writes `trunk` without passing through the repository and so
+						 * never arrives here. That is deliberate and the full argument is in
+						 * `trunks/trunk-directory.publisher.ts`'s header: it writes exactly the four
+						 * `status*` columns the directory value excludes.
+						 */
+						if (affectsTrunkDirectory(event.tableName)) {
+							trunkDirectory
+								.syncOrganization(event.organizationId)
+								.then((result) => {
+									if (!result.skipped) {
+										discharge(event.organizationId, "trunks", cutoff);
+									}
+								})
+								.catch((cause) => {
+									logger.error(
+										cause,
+										`trunks sync failed for organization ${event.organizationId} ` +
+											`after a ${event.operation} on ${event.tableName}`,
+									);
+								});
+						}
+						/**
+						 * The admission list. `sip_acl_entry` is absent from `ROUTING_TABLE_TO_ENTITY`, so
+						 * `affectsRouting` is false, no artifact is compiled and no `onArtifactCompiled`
+						 * ever fires — this seam is not the better hook for it, it is the ONLY one.
+						 *
+						 * A contested network is left pending, exactly as a `did-index` conflict is: the KV
+						 * key is the network alone and two rows have landed on it, the publisher refuses to
+						 * pick, and leaving the obligation owed is what puts a human in front of it.
+						 */
+						if (affectsSipAcl(event.tableName)) {
+							sipAcl
+								.syncOrganization(event.organizationId)
+								.then((result) => {
+									if (!result.skipped && result.conflicts.length === 0) {
+										discharge(event.organizationId, "sip-acl", cutoff);
+									}
+								})
+								.catch((cause) => {
+									logger.error(
+										cause,
+										`sip-acl sync failed for organization ${event.organizationId} ` +
+											`after a ${event.operation} on ${event.tableName}`,
+									);
+								});
+						}
 					},
 				});
 			},
@@ -471,13 +715,25 @@ const logger = getLogger("api.pbx");
 				RoutingCachePublisher,
 				DidIndexPublisher,
 				QueueMembershipPublisher,
+				TrunkDirectoryPublisher,
+				SipAclPublisher,
 				PBX_ENV,
 				AuditLogService,
 			],
 		},
 		ExtensionsService,
+		ExtensionFeatureService,
 		PhoneNumbersService,
 		TrunksService,
+		/**
+		 * The trunk status write-back: the durable consumer of `trunk.evt.v1.*.*.status.changed`,
+		 * and the ONLY thing that writes the `trunk.status*` columns. Registered unconditionally,
+		 * on the terms `EmergencyConsumer` below records: without `NATS_URL` it logs once at boot
+		 * and stays idle. It deliberately does NOT go through `TrunksService` — see its own header
+		 * for why the DTO cannot carry these columns and why `affectsRouting("trunk")` makes the
+		 * repository path wrong for a status tick.
+		 */
+		TrunkStatusConsumer,
 		InboundRoutesService,
 		OutboundRoutesService,
 		TimeConditionsService,
@@ -486,14 +742,34 @@ const logger = getLogger("api.pbx");
 		IvrMenuOptionsService,
 		RingGroupsService,
 		RingGroupDestinationsService,
+		PagingGroupsService,
+		PagingGroupMembersService,
+		SharedLinesService,
+		SharedLineAppearancesService,
 		QueuesService,
 		QueueAgentsService,
 		QueueTiersService,
 		QueueAgentSessionService,
 		ConferencesService,
 		ConferencePinService,
+		ConferenceControlClient,
+		ConferenceModerationService,
 		ParkLotsService,
+		CallFlowPresencePublisher,
+		CallFlowsService,
+		TimeConditionOverrideService,
+		PinSetsService,
+		PinSetEntriesService,
+		TranslationRulesetsService,
+		TranslationRulesService,
+		DestinationAliasesService,
+		AudioStreamsService,
+		DialByNameDirectoriesService,
+		SpeedDialsService,
+		OrgLimitsService,
 		PromptsService,
+		PhrasesService,
+		PhraseStepsService,
 		MohClassesService,
 		EmergencyAddressesService,
 		/**
@@ -508,12 +784,14 @@ const logger = getLogger("api.pbx");
 		EmergencyNotificationService,
 		EmergencyConsumer,
 		FeatureCodesService,
+		CallBlockService,
 		OrgSettingsService,
 		VoicemailBoxesService,
 		VoicemailPinService,
 		VoicemailMwiPublisher,
 		VoicemailMessagesService,
 		VoicemailGreetingsService,
+		FileGreetingService,
 		VoicemailEmailService,
 		VoicemailTranscriptionService,
 		VoicemailTranscriptionSweeper,
@@ -563,11 +841,14 @@ const logger = getLogger("api.pbx");
 		RoutingCachePublisher,
 		DidIndexPublisher,
 		QueueMembershipPublisher,
+		SipAclPublisher,
+		TrunkDirectoryPublisher,
 		AgentStatePublisher,
 		ProjectionOutboxSweeper,
 		VoicemailMessagesService,
 		VoicemailMwiPublisher,
 		VoicemailTranscriptionSweeper,
+		TrunkStatusConsumer,
 		PromptsService,
 	],
 })

@@ -3,7 +3,7 @@ import { kvKeyFor } from "@optimiq-voice/events";
 import { FakeClaimBucket } from "../nats/claim-store.fake";
 import { ConferenceRegistry } from "./conference-registry";
 import { CLAIM_LEASE_MS } from "./park-registry";
-import type { ConferenceMember } from "./conference-registry";
+import type { ConferenceJoin } from "./conference-registry";
 import type { ConferenceClaim } from "@optimiq-voice/events";
 
 /**
@@ -20,7 +20,7 @@ const ORG = "0195c0f0-1c2f-7000-8000-000000000001";
 const OTHER_ORG = "0195c0f0-1c2f-7000-8000-000000000002";
 const NOW = 1_700_000_000_000;
 
-function member(id: string, moderator = false): ConferenceMember {
+function member(id: string, moderator = false): ConferenceJoin {
 	return { mediaChannelId: id, legId: `leg-${id}`, moderator, joinedAtMs: 0 };
 }
 
@@ -417,5 +417,154 @@ describe("when a configured bucket cannot be reached", () => {
 		const departure = await registry.leave(ROOM, "a");
 		expect(departure.member?.mediaChannelId).toBe("a");
 		expect(registry.room(ROOM)).toBeUndefined();
+	});
+});
+
+// ---------------------------------------------------------------------------------------------
+// Moderation
+// ---------------------------------------------------------------------------------------------
+
+describe("member state", () => {
+	/**
+	 * A member is found by LEG id and removed by MEDIA CHANNEL id, and the asymmetry is deliberate: a
+	 * media channel id is the engine's private handle onto a media server, and a control plane that
+	 * had to know one would be holding an Asterisk-ism.
+	 */
+	it("finds a member by the leg id the control plane actually holds", async () => {
+		const registry = new ConferenceRegistry();
+		await registry.join(ROOM, member("a"), { newBridgeId: "b-1", maxMembers: 0 });
+
+		expect(registry.memberByLeg(ROOM, "leg-a")?.mediaChannelId).toBe("a");
+		expect(registry.memberByLeg(ROOM, "a")).toBeUndefined();
+	});
+
+	it("seats every arrival unmuted, undeafened and at unity", async () => {
+		const registry = new ConferenceRegistry();
+		await registry.join(ROOM, member("a"), { newBridgeId: "b-1", maxMembers: 0 });
+
+		expect(registry.memberByLeg(ROOM, "leg-a")).toMatchObject({
+			muted: false,
+			deafened: false,
+			talkGainPercent: 100,
+			listenGainPercent: 100,
+		});
+	});
+
+	/**
+	 * A PATCH and not a replacement. A moderator deafening somebody must not lift a mute another
+	 * moderator applied — the same argument the media plane's additive mute makes one layer down.
+	 */
+	it("leaves untouched fields alone", async () => {
+		const registry = new ConferenceRegistry();
+		await registry.join(ROOM, member("a"), { newBridgeId: "b-1", maxMembers: 0 });
+
+		registry.setMemberState(ROOM, "leg-a", { muted: true });
+		const after = registry.setMemberState(ROOM, "leg-a", { deafened: true });
+
+		expect(after).toMatchObject({ muted: true, deafened: true });
+	});
+
+	/**
+	 * Without this, a room whose only moderator was PROMOTED mid-meeting would hold its
+	 * `waitForModerator` callers forever, waiting for somebody already in the room.
+	 */
+	it("opens the moderator gate when a member is promoted", async () => {
+		const registry = new ConferenceRegistry();
+		await registry.join(ROOM, member("a"), { newBridgeId: "b-1", maxMembers: 0 });
+		const waiter = registry.awaitModerator(ROOM);
+		let arrived = false;
+		void waiter.arrived.then(() => {
+			arrived = true;
+		});
+
+		registry.setMemberState(ROOM, "leg-a", { moderator: true });
+		await waiter.arrived;
+
+		expect(arrived).toBe(true);
+	});
+
+	it("answers undefined for a member this instance does not hold", async () => {
+		const registry = new ConferenceRegistry();
+		await registry.join(ROOM, member("a"), { newBridgeId: "b-1", maxMembers: 0 });
+		expect(registry.setMemberState(ROOM, "leg-nobody", { muted: true })).toBeUndefined();
+	});
+});
+
+describe("locking a room", () => {
+	it("refuses a joiner and says so differently from a full room", async () => {
+		const registry = new ConferenceRegistry();
+		await registry.join(ROOM, member("a"), { newBridgeId: "b-1", maxMembers: 0 });
+		await registry.setLocked(ROOM, true);
+
+		// Local rooms lock locally, and a single-instance deployment has no neighbour to walk around.
+		expect(registry.room(ROOM)?.locked).toBe(true);
+	});
+
+	/**
+	 * THE reason the flag lives in the claim. A lock held in one instance's memory is a lock a caller
+	 * walks around by landing on a neighbour, which on a fleet of eight happens seven times out of
+	 * eight.
+	 */
+	it("is honoured by an instance that did not set it", async () => {
+		const { a, b } = cluster();
+		await a.join(ROOM, member("a"), { newBridgeId: "b-1", ...OPTIONS });
+		await b.join(ROOM, member("b"), { newBridgeId: "b-2", ...OPTIONS });
+
+		const locked = await a.setLocked(ROOM, true, { organizationId: ORG, byUserId: "user-1" });
+		expect(locked.kind).toBe("set");
+
+		const refused = await b.join(ROOM, member("c"), { newBridgeId: "b-3", ...OPTIONS });
+		expect(refused.kind).toBe("locked");
+	});
+
+	/**
+	 * Every write to a conference claim rewrites the WHOLE value — a join, a leave and a heartbeat
+	 * all rebuild it — so the one that forgot to carry the flag would silently unlock a live meeting
+	 * on somebody's timer.
+	 */
+	it("survives a heartbeat, a join and a leave", async () => {
+		const { a, b } = cluster();
+		await a.join(ROOM, member("a"), { newBridgeId: "b-1", ...OPTIONS });
+		await b.join(ROOM, member("b"), { newBridgeId: "b-2", ...OPTIONS });
+		await a.setLocked(ROOM, true, { organizationId: ORG });
+
+		await a.heartbeat();
+		await b.heartbeat();
+		await b.leave(ROOM, "b", ORG);
+
+		expect((await a.join(ROOM, member("c"), { newBridgeId: "b-4", ...OPTIONS })).kind).toBe(
+			"locked",
+		);
+	});
+
+	it("unlocks, and the room admits again", async () => {
+		const { a, b } = cluster();
+		await a.join(ROOM, member("a"), { newBridgeId: "b-1", ...OPTIONS });
+		await a.setLocked(ROOM, true, { organizationId: ORG });
+		await a.setLocked(ROOM, false, { organizationId: ORG });
+
+		expect((await b.join(ROOM, member("b"), { newBridgeId: "b-2", ...OPTIONS })).kind).toBe(
+			"joined",
+		);
+	});
+
+	/**
+	 * The lock travels on the poll a held caller already runs. A moderator who locks from a phone
+	 * registered on another instance is exactly the case `refresh` exists for.
+	 */
+	it("reaches an instance through the moderator-gate poll", async () => {
+		const { a, b } = cluster();
+		await a.join(ROOM, member("a"), { newBridgeId: "b-1", ...OPTIONS });
+		await b.join(ROOM, member("b"), { newBridgeId: "b-2", ...OPTIONS });
+
+		await a.setLocked(ROOM, true, { organizationId: ORG });
+		await b.refresh(ROOM, ORG);
+
+		expect(b.room(ROOM, ORG)?.locked).toBe(true);
+	});
+
+	it("refuses to lock a room this instance is not in", async () => {
+		const registry = new ConferenceRegistry();
+		expect((await registry.setLocked(ROOM, true)).kind).toBe("unknown-conference");
 	});
 });

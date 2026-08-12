@@ -2,16 +2,20 @@ import { z } from "zod";
 import { agentStatusSchema } from "./telephony";
 
 /**
- * The two ACD KV VALUE contracts: `queue-membership` and `agent-state`.
+ * The three ACD KV VALUE contracts: `queue-membership`, `agent-state` and `queue-waiting`.
  *
  * ## Why these are in `packages/events` and not in either application
  *
- * Both buckets are written by one process and read by another. `queue-membership` is written by
- * `apps/api` when a tier or an agent changes and read by `apps/engine` on every queued caller;
- * `agent-state` is written by BOTH (the API on login/logout/pause, the engine on ring/answer/wrap-up)
- * and read by both plus the wallboard. A shape agreed in a comment across two repositories' worth of
- * code is a shape that drifts, and the failure mode is silent: a roster the engine reads as empty
- * ejects every caller to the queue's timeout branch and looks exactly like "nobody is logged in".
+ * Each bucket is written by one process and read by another — or, in two cases, written by several
+ * at once. `queue-membership` is written by `apps/api` when a tier or an agent changes and read by
+ * `apps/engine` on every queued caller; `agent-state` is written by BOTH (the API on
+ * login/logout/pause, the engine on ring/answer/wrap-up) and read by both plus the wallboard;
+ * `queue-waiting` is written by EVERY engine instance holding a caller and read by all of them plus
+ * the wallboard, which is why it is the one whose write discipline (compare-and-set, always) is part
+ * of the contract rather than a convention. A shape agreed in a comment across two repositories'
+ * worth of code is a shape that drifts, and the failure mode is silent: a roster the engine reads as
+ * empty ejects every caller to the queue's timeout branch and looks exactly like "nobody is logged
+ * in".
  *
  * `packages/events` already owns the bucket DEFINITIONS (`streams.ts`) and the key builders
  * (`kvKeyFor`). The values belong with them for the same reason the event payloads belong with the
@@ -27,11 +31,18 @@ import { agentStatusSchema } from "./telephony";
  * Go process that applies definitions must apply all of them. The values do not. If a Go consumer
  * ever needs a roster, adding one registry entry is the change — and it will be a deliberate one.
  *
- * ## Timestamps are ISO strings, not epoch millis
+ * ## Timestamps are ISO strings, not epoch millis — except in `queue-waiting`
  *
- * Consistent with every envelope on the backbone (`at`, `receivedAt`, `statusChangedAt`). A KV value
- * is read by hand as often as by code during an incident, and `2026-08-05T12:00:00.000Z` answers
- * "when did this agent go on break" without a calculator.
+ * The first two are consistent with every envelope on the backbone (`at`, `receivedAt`,
+ * `statusChangedAt`). A KV value is read by hand as often as by code during an incident, and
+ * `2026-08-05T12:00:00.000Z` answers "when did this agent go on break" without a calculator.
+ *
+ * `queue-waiting` breaks that, and `claims.ts` already broke it the same way for the same reason:
+ * its timestamps are not read, they are COMPARED, on the call path, once a second per waiting caller
+ * — ranking a line and testing a lease. A comparison that has to `Date.parse` first is a comparison
+ * somebody eventually writes as a string compare, and the resulting bug is a line in the wrong
+ * order rather than a crash. Legibility loses to a hot loop exactly twice in this package, and both
+ * times it is written down.
  */
 
 // ---------------------------------------------------------------------------------------------
@@ -71,6 +82,20 @@ export const queueMembershipAgentSchema = z.object({
 	level: z.int().min(1).max(100),
 	/** Order within a tier. The tie-break every ordered strategy falls back to. */
 	position: z.int().min(1).max(1000),
+	/**
+	 * `queue_tier.announce_prompt_id` — played to THIS agent instead of the queue's whisper when a
+	 * call distributed by this tier reaches them.
+	 *
+	 * On the roster rather than in the plan node, and that is the whole reason it can exist at all: a
+	 * tier is a membership fact, the artifact has never carried tiers, and putting a per-tier prompt
+	 * in the plan would force a recompile of every route in the tenant each time a supervisor moved
+	 * somebody between levels. It travels with the seat, exactly like `wrapUpSeconds` and the three
+	 * penalty delays beside it.
+	 *
+	 * A bare prompt id, like `agentWhisperPromptId` on the node: the engine resolves it through the
+	 * same media-ref path and falls back to the queue's whisper when it is absent or unresolvable.
+	 */
+	announcePromptId: z.uuid().optional(),
 	/** How long after a call this agent is held out of distribution. Overrides the queue's. */
 	wrapUpSeconds: z.int().min(0).max(3600),
 	/** Consecutive no-answers before the agent is taken out of distribution entirely. */
@@ -178,3 +203,124 @@ export const agentStateEntrySchema = z.object({
 });
 
 export type AgentStateEntry = z.infer<typeof agentStateEntrySchema>;
+
+// ---------------------------------------------------------------------------------------------
+// queue-waiting
+// ---------------------------------------------------------------------------------------------
+
+/** Hard ceilings on the record, so a writer refuses before the bucket does. */
+export const QUEUE_WAITING_MAX_ENTRIES = 500;
+export const QUEUE_WAITING_MAX_TOMBSTONES = 500;
+
+/**
+ * One caller standing in one queue's line, as every engine instance sees them.
+ *
+ * ## Epoch millis, not ISO strings
+ *
+ * The exception to this file's own rule, and the same exception `claims.ts` makes for the same
+ * reason: `joinedAt` and `expiresAt` are compared against a clock on the CALL PATH — every waiting
+ * caller re-ranks the line once a second — and a comparison that has to parse a date first is a
+ * comparison somebody eventually writes as a string compare. `agent-state`'s `since` is read by a
+ * wallboard and by one comparator; these are read by every caller in the queue, every second.
+ *
+ * ## `joinedAt` is the ORDER, and it is not always when this call arrived
+ *
+ * That distinction is the entire abandoned-resume feature. A caller who hung up at position 3 and
+ * rings back inside the window is re-inserted carrying the joinedAt they ORIGINALLY had, so the line
+ * puts them back where they were rather than at the end. Every other reader treats it as "when they
+ * joined", which is exactly what it means to them.
+ *
+ * ## The lease
+ *
+ * `expiresAt` is pushed forward by the session that owns the entry while the caller is really still
+ * on the line, and `instanceId` says which process is doing the pushing. An entry past its expiry is
+ * pruned by whichever writer next touches the record — see `QUEUE_WAITING_KV` for why a per-entry
+ * server-side TTL is not available and why that matters more here than anywhere else.
+ */
+export const queueWaitingEntrySchema = z.object({
+	callId: z.uuid(),
+	legId: z.uuid(),
+	/** Higher dequeues first. Same 0-1000 scale as `queue.caller.joined`. */
+	priority: z.int().min(0).max(1000),
+	/** Epoch millis. The order within a priority, and what a resume restores. */
+	joinedAt: z.number(),
+	/** The engine process holding this caller's leg. */
+	instanceId: z.string().min(1).max(128),
+	/** Epoch millis. Past this with no renewal, any writer may prune the entry. */
+	expiresAt: z.number(),
+	/** For the wallboard, and the key an abandoned-resume tombstone would be written under. */
+	callerNumber: z.string().max(128).optional(),
+});
+
+export type QueueWaitingEntry = z.infer<typeof queueWaitingEntrySchema>;
+
+/**
+ * A place held for a caller who hung up while waiting.
+ *
+ * ## Keyed by the caller's NUMBER, and what that costs
+ *
+ * There is nothing else to key it on. The caller is gone: their call id died with their leg, and the
+ * only thing they will present when they ring back is the number their phone sends. So the promise
+ * is "this NUMBER may resume", and the consequence has to be stated rather than discovered — a
+ * switchboard, a call box, a household landline or any shared line presents one number for many
+ * people, and the second person to ring in from it would be handed the first person's place. That is
+ * why `queue.abandoned_resume_allowed` defaults to false and why its comment says who should turn it
+ * on.
+ *
+ * A number that is withheld or absent gets no tombstone at all, rather than sharing an "unknown"
+ * bucket with every other anonymous caller — which would hand the promise to whoever rang next.
+ *
+ * ## One resume per tombstone
+ *
+ * The entry is deleted the moment it is adopted, in the same compare-and-set that inserts the
+ * resumed caller. Without that, one abandoned call would let the same number jump the line as often
+ * as it liked for the whole window, which is a queue-priority bypass anybody can dial.
+ */
+export const queueResumeTombstoneSchema = z.object({
+	/** The caller's number, as the engine read it off the leg. The lookup key. */
+	callerNumber: z.string().min(1).max(128),
+	/** The `joinedAt` the resumed caller inherits — their old place in the line. */
+	joinedAt: z.number(),
+	/** The priority they had. Restored too: a VIP who was cut off is still a VIP. */
+	priority: z.int().min(0).max(1000),
+	/** When they gave up. For the log, and for a wallboard that wants to show near-misses. */
+	abandonedAt: z.number(),
+	/** Epoch millis, `now + discard_abandoned_after_seconds`. Past it the promise is gone. */
+	expiresAt: z.number(),
+});
+
+export type QueueResumeTombstone = z.infer<typeof queueResumeTombstoneSchema>;
+
+/**
+ * One queue's line and its outstanding resume promises, as the `queue-waiting` bucket holds them.
+ *
+ * ## Why the tombstones share the record rather than living in their own keys
+ *
+ * Because every write already touches this key. A caller abandoning is a `leave` — a compare-and-set
+ * that removes their entry — and writing the tombstone in the SAME write makes "they left the line
+ * and their place is being held" one atomic fact instead of two that can disagree. A separate key
+ * would add a second write on the unhappiest path in the feature (the caller has already hung up) and
+ * would introduce a state where a caller is out of the line with no promise recorded, or has a promise
+ * recorded while still in the line.
+ *
+ * ## Both arrays are capped, and the caps are enforced by the writer
+ *
+ * `QUEUE_WAITING_MAX_ENTRIES` / `QUEUE_WAITING_MAX_TOMBSTONES` are below what the bucket's
+ * `maxValueSizeBytes` would accept, on purpose: a write that is refused by the SERVER for being too
+ * large arrives as an unavailability in the middle of an incident, whereas a cap the writer knows
+ * about is a queue that stops handing out new promises and says so. The line's cap is the one that
+ * matters least in practice — a queue with 500 people waiting has a staffing problem, not a bucket
+ * problem — and a caller who cannot be inserted is still served, with a position the engine reports
+ * as unknown rather than wrong.
+ */
+export const queueWaitingRecordSchema = z.object({
+	orgId: z.uuid(),
+	queueId: z.uuid(),
+	/** Ordered by nothing in particular on the wire; the RANK is computed, never stored. */
+	entries: z.array(queueWaitingEntrySchema).max(QUEUE_WAITING_MAX_ENTRIES),
+	tombstones: z.array(queueResumeTombstoneSchema).max(QUEUE_WAITING_MAX_TOMBSTONES),
+	/** Epoch millis of the last write. For the log and for a stale-record check by eye. */
+	updatedAt: z.number(),
+});
+
+export type QueueWaitingRecord = z.infer<typeof queueWaitingRecordSchema>;

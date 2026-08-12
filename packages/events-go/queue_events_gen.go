@@ -26,6 +26,7 @@ type QueueCallerJoinedData struct {
 	Position     int     `json:"position"`
 	Priority     int     `json:"priority"`
 	CallerNumber *string `json:"callerNumber,omitempty"`
+	Resumed      *bool   `json:"resumed,omitempty"`
 }
 
 // QueueCallerAnsweredData is the payload of the "caller.answered" event.
@@ -84,6 +85,7 @@ type QueueCallerAbandonedData struct {
 	WaitMs   int                         `json:"waitMs"`
 	Position *int                        `json:"position,omitempty"`
 	Reason   *QueueCallerAbandonedReason `json:"reason,omitempty"`
+	ExitKey  *string                     `json:"exitKey,omitempty"`
 }
 
 // QueueCallerAbandonedReason is the closed vocabulary of QueueCallerAbandonedData.reason.
@@ -94,6 +96,7 @@ const (
 	QueueCallerAbandonedReasonTimeout      QueueCallerAbandonedReason = "timeout"
 	QueueCallerAbandonedReasonOverflow     QueueCallerAbandonedReason = "overflow"
 	QueueCallerAbandonedReasonNoAgents     QueueCallerAbandonedReason = "no-agents"
+	QueueCallerAbandonedReasonExitKey      QueueCallerAbandonedReason = "exit-key"
 )
 
 // QueueCallerAbandonedReasonValues lists every member of the vocabulary, in contract order.
@@ -102,6 +105,7 @@ var QueueCallerAbandonedReasonValues = []QueueCallerAbandonedReason{
 	QueueCallerAbandonedReasonTimeout,
 	QueueCallerAbandonedReasonOverflow,
 	QueueCallerAbandonedReasonNoAgents,
+	QueueCallerAbandonedReasonExitKey,
 }
 
 // Valid reports whether v is a member of the QueueCallerAbandonedReason vocabulary.

@@ -112,6 +112,46 @@ export const REGISTRATIONS_STREAM: StreamDefinition = {
 	numReplicas: 1,
 };
 
+/**
+ * `SIP` — SIP dialog lifecycle from the signalling edge (`apps/sipd`).
+ *
+ * A NEW stream rather than an extension of `REGISTRATIONS`, and the two facts that decide it are
+ * volume and purpose. Registration transitions and dialog lifecycle differ by two orders of
+ * magnitude — a phone re-registers every few minutes, a busy tenant sets up thousands of calls an
+ * hour — and they are kept for different reasons: a `registered` is presence, and a
+ * `dialog.terminated` is CDR EVIDENCE carrying the only real Q.850 cause this platform ever sees.
+ * `streams.ts` already models one stream per family, and this is a family.
+ *
+ * ## `discard: old`, and why this is not CDR
+ *
+ * The stream is the transition log behind live state, not the ledger. The engine reads this family
+ * on a CORE subscription for the reason it reads `media.evt.v1.>` that way — it wants a leg torn
+ * down NOW and must not pay for an ack round trip on the call path — and the durable record of what
+ * a call cost is `cdr.leg.v1`, which does discard `new` precisely because losing one is losing
+ * money. Losing a dialog event costs the answer to "why did that call fail", which is worth keeping
+ * and is not worth blocking a publisher for.
+ *
+ * ## Seven days
+ *
+ * Longer than `MEDIA`'s two and shorter than `VOICEMAIL`'s thirty. The question this stream answers
+ * is "what happened to that call" — asked by a support desk with a CDR row in front of them, about
+ * a call from this week — and a week covers "it happened last Friday" reported on a Thursday.
+ */
+export const SIP_STREAM: StreamDefinition = {
+	name: "SIP",
+	description: "SIP dialog lifecycle from apps/sipd (sipd-invite-design §3.3, §10.2).",
+	subjects: [subjectFilterFor.allSipDialogs()],
+	retention: "limits",
+	storage: "file",
+	discard: "old",
+	maxAgeMs: 7 * DAY_MS,
+	maxMsgs: -1,
+	maxBytes: 4 * GIB,
+	maxMsgsPerSubject: -1,
+	duplicateWindowMs: 2 * MINUTE_MS,
+	numReplicas: 1,
+};
+
 /** `QUEUES` — ACD caller/agent events. Kept a week so wallboards and reports can backfill. */
 export const QUEUES_STREAM: StreamDefinition = {
 	name: "QUEUES",
@@ -180,6 +220,33 @@ export const MEDIA_STREAM: StreamDefinition = {
 };
 
 /**
+ * `TRUNKS` — carrier reachability transitions on their way to the `trunk.status*` columns.
+ *
+ * Modelled on `REGISTRATIONS`, because it is the same kind of stream one hop out: the edge's
+ * verdict on whether a peer answers, where the persisted row is the eventually-consistent view and
+ * the stream is the transition log behind it. `discard: old` for the same reason too — a newer
+ * status supersedes a lost one, and the durable writer only ever wants the latest truth per trunk.
+ *
+ * 7 days rather than registration's 24 hours: a trunk transition is RARE (the producer publishes
+ * changes, not qualify ticks), so the stream is nearly empty at any retention, and a week is what
+ * lets "when did carrier-a start flapping?" be answered on Monday about a weekend.
+ */
+export const TRUNKS_STREAM: StreamDefinition = {
+	name: "TRUNKS",
+	description: "Carrier trunk status transitions consumed durably by the pbx writer (audit 4.5).",
+	subjects: [subjectFilterFor.allTrunks()],
+	retention: "limits",
+	storage: "file",
+	discard: "old",
+	maxAgeMs: 7 * DAY_MS,
+	maxMsgs: -1,
+	maxBytes: 1 * GIB,
+	maxMsgsPerSubject: -1,
+	duplicateWindowMs: 2 * MINUTE_MS,
+	numReplicas: 1,
+};
+
+/**
  * `CDR` — per-leg call records on their way to `cdr-db`. "Replay = rebuild": the 30-day window is
  * how far back the CDR table can be reconstructed from the log alone. A wider `duplicate_window`
  * than the rest because a crash-looping writer may retry the same leg minutes later.
@@ -235,9 +302,11 @@ export const PROVISION_STREAM: StreamDefinition = {
 export const EVENT_STREAMS: readonly StreamDefinition[] = [
 	CALLS_STREAM,
 	REGISTRATIONS_STREAM,
+	SIP_STREAM,
 	QUEUES_STREAM,
 	VOICEMAIL_STREAM,
 	MEDIA_STREAM,
+	TRUNKS_STREAM,
 	CDR_STREAM,
 	AUDIT_STREAM,
 	PROVISION_STREAM,
@@ -690,6 +759,38 @@ export const CONFERENCE_CLAIMS_KV: KvBucketDefinition = {
 };
 
 /**
+ * `shared-line-state` — which appearance has seized a shared line, across engine instances.
+ *
+ * ## The invariant this exists for
+ *
+ * **A shared line is seized by one appearance at a time.** When the boss's desk answers the call on
+ * the shared line, the assistant's key must go busy — otherwise the assistant grabs a call that is
+ * already someone's. That is the same exclusivity a park orbit needs, and it is taken the same way:
+ * the answering appearance `create`s this key, and an appearance that loses the create reads the
+ * winner off the value and lights its lamp remote-active rather than joining the call. An in-process
+ * map holds that within one engine and says nothing across two, so the claim lives HERE.
+ *
+ * ## Why the TTL matches the claim buckets
+ *
+ * Fifteen minutes, like `park-claims` and `conference-claims`, for the same reason: a crashed
+ * instance that held a line must not keep it seized forever. The owner heartbeats for as long as the
+ * call is up; a claim past its `expiresAt` with no heartbeat is reapable, so a dead holder's line
+ * frees for the next seizure. The record's own `expiresAt` is what a reaper reads; the bucket TTL is
+ * the backstop.
+ */
+export const SHARED_LINE_STATE_KV: KvBucketDefinition = {
+	name: "shared-line-state",
+	description:
+		"Shared-line seizure ownership across engine instances, taken under compare-and-set.",
+	ttlMs: 15 * MINUTE_MS,
+	history: 1,
+	storage: "file",
+	maxValueSizeBytes: 4 * 1024,
+	maxBytes: 128 * MIB,
+	numReplicas: 1,
+};
+
+/**
  * `media-sessions` — which `mediad` instance holds which RTP session.
  *
  * The full argument for its existence, its shape and its key is on
@@ -716,6 +817,202 @@ export const MEDIA_SESSIONS_KV: KvBucketDefinition = {
 	numReplicas: 1,
 };
 
+/**
+ * `queue-waiting` — who is in one queue's line, right now, across every engine instance.
+ *
+ * ## The problem it exists for
+ *
+ * "You are caller number four" was a lie in a cluster. The count came from an in-process map
+ * (`QueuePositions`), so with three engines behind one media server each of them counted only the
+ * callers it happened to be holding and every one of them announced a number that was too small.
+ * Three separate features turned out to need the same missing fact:
+ *
+ * 1. **Position**, which is that fact directly.
+ * 2. **Priority**, which is meaningless without it — "higher priority dequeues first" is a statement
+ *    about an ORDER, and an order needs everybody in it. Two instances each ordering their own half
+ *    of the line will happily serve a normal caller ahead of a VIP.
+ * 3. **Abandoned-resume**, which needs the line to remember a caller who is no longer on it.
+ *
+ * ## One key per queue, holding the whole line
+ *
+ * The same decision as {@link QUEUE_MEMBERSHIP_KV} and for a stronger version of the same reason.
+ * Position is not answerable from one caller's own row — it is a RANK, so a reader needs every row
+ * at once — and a per-caller key would make each announcement a range read plus N gets, while a
+ * partially-applied multi-key write would produce a line that no engine ever held. One key makes the
+ * line atomic, the read a point get, and the write a compare-and-set against a revision.
+ *
+ * The cost is contention: every join, leave and lease renewal on a busy queue writes one key. That
+ * is bounded by design — renewals are throttled to a fraction of the lease, joins and leaves happen
+ * at human speed, and a lost CAS is retried against the newer value rather than being an error. It
+ * is the same trade `queue-membership` makes and it is the right way round: a queue with fifty
+ * people waiting has fifty writes a minute, not fifty a second.
+ *
+ * ## Why entries carry a lease, and why the bucket TTL cannot replace it
+ *
+ * The record is one key, so per-caller server-side expiry is not available: a crashed engine would
+ * otherwise leave its callers in the line for ever, and every survivor would be told they were
+ * further back than they are — the exact failure this bucket exists to fix, inverted. So each entry
+ * carries an `expiresAt` that its owning session pushes forward while the caller is really still
+ * waiting, exactly as a park claim does, and any writer prunes entries past theirs on its way past.
+ * The bucket TTL is a backstop for the whole record, nothing more.
+ *
+ * ## Why it has a TTL at all, unlike the two configuration buckets
+ *
+ * Because it is LIVE STATE and its staleness self-corrects: a line nobody is joining is a line that
+ * should evaporate. Six hours matches {@link CHANNELS_KV} for the same reason — it is longer than
+ * any call and shorter than a shift, so a crashed instance's residue cannot outlive the day.
+ */
+export const QUEUE_WAITING_KV: KvBucketDefinition = {
+	name: "queue-waiting",
+	description: "Queue -> the leased waiting line and abandoned-resume tombstones, under CAS.",
+	ttlMs: 6 * HOUR_MS,
+	history: 1,
+	storage: "file",
+	// A line of 500 at ~200 bytes each plus as many tombstones, with headroom. `queueWaitingRecord`
+	// caps both arrays below that, so the cap is enforced by the writer rather than discovered as a
+	// rejected write in the middle of an incident.
+	maxValueSizeBytes: 256 * 1024,
+	maxBytes: 256 * MIB,
+	numReplicas: 1,
+};
+
+/**
+ * `sip-dialogs` — which `sipd` instance holds which SIP dialog, under a heartbeated lease.
+ *
+ * ## A CLAIM, not a directory — and that is where it diverges from `media-sessions`
+ *
+ * `plans/mediad-design.md` §6.3 argues that the media directory needs no `expiresAt` because
+ * "nothing races for a media session". Something races here: **a dead owner's dialogs must be reaped
+ * by somebody.** A dialog's transaction state, its retransmission timers and its socket are all
+ * local (§6.1), so a crashed `sipd` is N dropped calls and there is no failover that could change
+ * that. What there IS, is a survivor who can notice: a `sipd` that finds an expired claim it does
+ * not own publishes `dialog.terminated{reason: "instance-lost"}` on the dead owner's behalf, and the
+ * engine writes a CDR from a `leg-ended` it would otherwise never have received. Without this
+ * bucket, a rescheduled pod's calls are channels the engine holds for ever and rows nobody bills.
+ *
+ * **The directory's job is reaping, not failover.** Worth stating plainly, because the alternative
+ * is discovering it during an incident.
+ *
+ * ## Not organization-scoped
+ *
+ * The THIRD exception after `did-index` and `media-sessions`, for the identical reason: the reader
+ * does not know the tenant. An engine reconciling a `legId` from a `leg-ended`, or a second `sipd`
+ * reaping a dead peer, has no org to prefix with. The org travels in the value.
+ *
+ * ## One writer
+ *
+ * `sipd` writes it; the engine reads it. The temptation is to let the engine write its own instance
+ * id into the same record so the REFER path could find the owning ENGINE — and it should be refused,
+ * because two writers on one key is a compare-and-set protocol nobody needs. The engine's half comes
+ * for free anyway: `kvKeyFor.channel(orgId, callId, legId)` is a direct get against `channels`, so
+ * an instance that finds a live entry it does not itself hold already knows the difference between
+ * "this call ended" and "ask my neighbour" — which is what finally lets
+ * `SIP_TRANSFER_REFUSAL_REASONS.wrong_instance` be raised truthfully for the first time.
+ *
+ * ## Why the TTL is six hours and the record still carries `expiresAt`
+ *
+ * Six matches `channels` and `media-sessions`: a dialog lives exactly as long as a call leg. The
+ * bucket TTL is the BACKSTOP; the record's own lease is what a reaper reads, because server-side
+ * expiry cannot distinguish "the owner stopped heartbeating" from "the value was written a long time
+ * ago and is still correct" — the same argument `PARK_CLAIMS_KV` makes.
+ */
+export const SIP_DIALOGS_KV: KvBucketDefinition = {
+	name: "sip-dialogs",
+	description: "SIP dialog -> owning sipd instance, under a heartbeated lease, for reaping.",
+	ttlMs: 6 * HOUR_MS,
+	history: 1,
+	storage: "file",
+	maxValueSizeBytes: 4 * 1024,
+	maxBytes: 128 * MIB,
+	numReplicas: 1,
+};
+
+/**
+ * `trunks` — the carrier directory the SIP edge dials and registers against.
+ *
+ * ## Why the edge cannot read this from the database
+ *
+ * The same seam `queue-membership` and `did-index` occupy, one process further out. `apps/sipd` is
+ * Go, holds no `pbx-db` handle and must not grow one — a database on the INVITE path is the thing
+ * this architecture spends its budget avoiding, and the INVITE path is the one code path an attacker
+ * controls the rate of. Nor can the routing artifact carry it: `plan-walker` substitutes a trunk's
+ * NAME into a dial template, and a name is not dialable. The row holds `sipProxy`, `outboundProxy`,
+ * `authUser`, `sipSecretRef`, `transport` and `registerExpiresSeconds`, and every one of those is
+ * needed to place one INVITE.
+ *
+ * So: a derived read model, written by `apps/api` from the `trunk` table and rebuildable from it,
+ * exactly as `did-index.publisher.ts` writes its bucket. `sipd` reads it at boot and WATCHES it, so
+ * a trunk edited in the admin UI reaches the registration FSM without a restart — which is what
+ * replaces the `SIPD_TRUNK_ACL` environment variable that could only be changed by redeploying.
+ *
+ * ## Org-scoped, unlike its sibling below
+ *
+ * `sipd` originates on behalf of a tenant the engine has already named, so the reader DOES know the
+ * organization here — the ordinary case, and the ordinary key shape. The ACL bucket is the one that
+ * cannot be, because an inbound packet arrives before anybody knows whose it is.
+ *
+ * ## Why the TTL is zero
+ *
+ * CONFIGURATION, not live state — the same argument as `did-index` and `queue-membership`. An
+ * expiring entry means an outbound call to a perfectly valid trunk stops resolving, which is an
+ * outage produced by a timer rather than by a change. Live trunk REACHABILITY is the other half and
+ * travels as `trunk.evt.v1.…status.changed`, which is an event precisely because it changes.
+ *
+ * **The secret is not in here.** `sipSecretRef` is a handle into the secret manager, exactly as it is
+ * in the column, and the value it names never lands in the broker.
+ */
+export const TRUNKS_KV: KvBucketDefinition = {
+	name: "trunks",
+	description: "Trunk -> its dialable SIP configuration, for the edge's outbound and registration.",
+	// 0 = never expire. Read the note above before changing this.
+	ttlMs: 0,
+	history: 1,
+	storage: "file",
+	maxValueSizeBytes: 8 * 1024,
+	maxBytes: 128 * MIB,
+	numReplicas: 1,
+};
+
+/**
+ * `sip-acl` — the source networks the SIP edge accepts unauthenticated traffic from.
+ *
+ * ## The boundary this is
+ *
+ * The first slice where an unauthenticated stranger can send this platform a packet that costs it
+ * work. `sip_acl_entry` already has the right shape in `pbx-db` — a native PostgreSQL `cidr`, an
+ * `action`, a `priority` and a `scope` whose values are described in that schema as "the
+ * anti-toll-fraud boundary" — and it is organization-scoped, which is exactly the problem: **the
+ * reader does not know the organization.** Same problem as `did-index`, same answer.
+ *
+ * ## Not org-scoped, and WATCHED rather than read
+ *
+ * The fourth non-org-scoped bucket. Its key is a network token, because a network is what an
+ * arriving packet has; the tenant, the scope and the action travel in the value.
+ *
+ * And `sipd` compiles the entries into an in-process longest-prefix match at boot and on every
+ * watch update, rather than doing a KV get per INVITE. A get per INVITE is a broker round trip
+ * INSIDE a SIP transaction on the one code path whose rate an attacker chooses — the cheapest
+ * denial of service available against this design, bought for nothing.
+ *
+ * ## Why the TTL is zero
+ *
+ * The strongest version of the `did-index` argument. An expiring ACL entry does not fail closed in
+ * any useful sense — it fails a legitimate carrier's calls while nobody changed anything — and an
+ * expiring `deny` entry fails OPEN, which is a security boundary evaporating on a timer. Entries are
+ * written when configured and deleted when removed; nothing else may remove one.
+ */
+export const SIP_ACL_KV: KvBucketDefinition = {
+	name: "sip-acl",
+	description: "Source network -> tenant, scope and action, for the SIP edge's trunk admission.",
+	// 0 = never expire. Read the note above before changing this — an expiring `deny` fails OPEN.
+	ttlMs: 0,
+	history: 1,
+	storage: "file",
+	maxValueSizeBytes: 4 * 1024,
+	maxBytes: 128 * MIB,
+	numReplicas: 1,
+};
+
 export const KV_BUCKETS: readonly KvBucketDefinition[] = [
 	REGISTRATIONS_KV,
 	CHANNELS_KV,
@@ -726,7 +1023,12 @@ export const KV_BUCKETS: readonly KvBucketDefinition[] = [
 	QUEUE_MEMBERSHIP_KV,
 	PARK_CLAIMS_KV,
 	CONFERENCE_CLAIMS_KV,
+	SHARED_LINE_STATE_KV,
 	MEDIA_SESSIONS_KV,
+	QUEUE_WAITING_KV,
+	SIP_DIALOGS_KV,
+	TRUNKS_KV,
+	SIP_ACL_KV,
 ];
 
 /** The KV wire options for a bucket definition. */
@@ -862,6 +1164,21 @@ export const kvKeyFor = {
 		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("queueId", queueId)}`;
 	},
 	/**
+	 * `queue-waiting`: `<orgId>.<queueId>` — one entry per queue, holding its whole line.
+	 *
+	 * Deliberately the same key SHAPE as {@link kvKeyFor.queueMembership}, in a different bucket.
+	 * The roster and the line are both per-queue facts with different writers, different lifetimes
+	 * and different TTLs, and a reader that wanted "everything about queue X" gets it from two point
+	 * gets on one key string rather than from a join.
+	 *
+	 * Not keyed per waiting CALLER, for the reason on {@link QUEUE_WAITING_KV}: a position is a rank
+	 * over the whole line, so a per-caller key would turn every announcement into a range read and
+	 * would let a half-applied write produce an order nobody ever held.
+	 */
+	queueWaiting(orgId: string, queueId: string): string {
+		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("queueId", queueId)}`;
+	},
+	/**
 	 * `park-claims`: `<orgId>.<parkLotId>.<slot>` — the ORBIT is the key, because the orbit is what
 	 * has to be exclusive.
 	 *
@@ -886,6 +1203,16 @@ export const kvKeyFor = {
 		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("conferenceId", conferenceId)}`;
 	},
 	/**
+	 * `shared-line-state`: `<orgId>.<sharedLineId>` — one entry per shared line.
+	 *
+	 * By the line's id and not its dialled number, for the reason the conference claim gives: a
+	 * tenant may renumber a shared line while a call is up on it, and a key that moved underneath a
+	 * live seizure would strand the holders on a claim nobody can find again.
+	 */
+	sharedLineState(orgId: string, sharedLineId: string): string {
+		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("sharedLineId", sharedLineId)}`;
+	},
+	/**
 	 * `media-sessions`: the session id, and nothing else.
 	 *
 	 * The second key in this file that is not organization-scoped, and for the same reason as
@@ -896,6 +1223,54 @@ export const kvKeyFor = {
 	 */
 	mediaSession(sessionId: string): string {
 		return assertKeyToken("sessionId", sessionId);
+	},
+	/**
+	 * `sip-dialogs`: the leg id, and nothing else.
+	 *
+	 * The THIRD non-org-scoped key here, for the same reason as {@link kvKeyFor.mediaSession} — and
+	 * for one more that is specific to this bucket: the reader that matters most is a SURVIVING
+	 * `sipd` sweeping a dead peer's claims, and it has neither the org nor any way to guess it. The
+	 * org travels in the value. See {@link SIP_DIALOGS_KV}.
+	 */
+	sipDialog(legId: string): string {
+		return assertKeyToken("legId", legId);
+	},
+	/**
+	 * `trunks`: `<orgId>.<trunkId>` — one entry per trunk, holding its whole dialable configuration.
+	 *
+	 * Org-scoped, because the edge originates on behalf of a tenant the engine has already named, and
+	 * because an operator answering "what does this tenant dial out over?" should get it from one
+	 * range read.
+	 */
+	trunk(orgId: string, trunkId: string): string {
+		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("trunkId", trunkId)}`;
+	},
+	/**
+	 * `sip-acl`: the network, with `.`, `/` and `:` folded to `-`.
+	 *
+	 * The FOURTH non-org-scoped key, and the only one whose key needs a transformation at all. A CIDR
+	 * is `203.0.113.0/24` or `2001:db8::/32`, and none of the dots, the slash or the colons survives
+	 * as a KV key token — dots would silently become four tokens, and neither `/` nor `:` is in
+	 * `TOKEN_PATTERN` at all. **All three separators fold, not just the v4 pair**: `sip_acl_entry.network`
+	 * is a PostgreSQL `cidr`, which holds IPv6 as readily as IPv4, and a folder that handled only v4
+	 * would throw on the first IPv6 carrier — at write time in the control plane, or at boot in the
+	 * edge, both of which are worse places to find out than here.
+	 *
+	 * Both writers (the control plane, from the stored `cidr`) and the reader (the edge, at boot and
+	 * on watch) go through this one function, which is what makes the two agree.
+	 *
+	 * The result stays readable by inspection — `203-0-113-0-24`, `2001-db8---32`, where the run of
+	 * three dashes is the `::` — which matters because an operator debugging a refused carrier reads
+	 * these keys with `nats kv ls`. The mapping is not injective over ARBITRARY strings, and does not
+	 * need to be: the only inputs are values PostgreSQL's `cidr` type already accepted and normalised,
+	 * and no two distinct normalised CIDRs fold to the same key. This deliberately does NOT normalise
+	 * the network itself — a second normaliser here would be a second opinion about what a network is.
+	 *
+	 * @throws {SubjectTokenError} when the value contains no usable characters.
+	 */
+	sipAcl(network: string): string {
+		const folded = network.trim().replaceAll(/[./:]/gu, "-");
+		return assertKeyToken("network", folded);
 	},
 } as const;
 

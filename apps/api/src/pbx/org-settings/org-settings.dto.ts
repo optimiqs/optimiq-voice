@@ -88,8 +88,19 @@ export type CategoryPatchResult =
  *
  * Returns every issue rather than throwing on the first, so a form can attach a message to each
  * offending input in one round trip — the same contract `parseDto` gives for a body.
+ *
+ * `options.scope` is the user surface's extra gate: `PATCH …/me/categories/:category` passes
+ * `"user"`, and a catalogued name whose descriptor is organization-scoped is then refused with an
+ * issue that NAMES the setting — a 400 the form can attach to the field — rather than silently
+ * writing a `user_setting` row the resolver would ignore forever. The org surface passes nothing
+ * and accepts every catalogued name, because the organization level may set anything, including
+ * the defaults its members will override.
  */
-export function parseCategoryPatch(category: string, patch: CategoryPatch): CategoryPatchResult {
+export function parseCategoryPatch(
+	category: string,
+	patch: CategoryPatch,
+	options: { readonly scope?: "user" } = {},
+): CategoryPatchResult {
 	const issues: CategoryPatchIssue[] = [];
 	const values = new Map<string, unknown>();
 
@@ -100,6 +111,16 @@ export function parseCategoryPatch(category: string, patch: CategoryPatch): Cate
 				field: name,
 				code: "unrecognized_keys",
 				message: `"${name}" is not a setting in the "${category}" category`,
+			});
+			continue;
+		}
+		if (options.scope === "user" && descriptor.scope !== "user") {
+			issues.push({
+				field: name,
+				code: "not_user_scoped",
+				message:
+					`"${name}" is an organization-level setting and cannot be overridden per user; ` +
+					`it is set through PATCH /api/v1/org-settings/categories/${category}`,
 			});
 			continue;
 		}

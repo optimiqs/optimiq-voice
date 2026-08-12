@@ -20,9 +20,12 @@ import {
 	PARK_CLAIMS_KV,
 	parkClaimSchema,
 	QUEUE_MEMBERSHIP_KV,
+	QUEUE_WAITING_KV,
 	ROUTING_CACHE_KV,
+	sharedLineStateSchema,
 	subjectFor,
 } from "@optimiq-voice/events";
+import { SHARED_LINE_STATE_KV } from "@optimiq-voice/events/streams";
 import { getLogger } from "@optimiq-voice/logging";
 import {
 	CHANNEL_OWNERSHIP_LEASE_MS,
@@ -37,6 +40,7 @@ import type {
 	CdrLegWriteEnvelope,
 	ConferenceClaim,
 	ParkClaim,
+	SharedLineState,
 	VoicemailEventEnvelope,
 } from "@optimiq-voice/events";
 import type { ChannelSnapshot } from "@optimiq-voice/telephony";
@@ -77,9 +81,12 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	private didIndexKv: KV | undefined;
 	private queueMembershipKv: KV | undefined;
 	private agentStateKv: KV | undefined;
+	private queueWaitingKv: KV | undefined;
 	private parkClaimsBucket: ClaimBucket<ParkClaim> = new UnclaimedBucket<ParkClaim>();
 	private conferenceClaimsBucket: ClaimBucket<ConferenceClaim> =
 		new UnclaimedBucket<ConferenceClaim>();
+	private sharedLineStateBucket: ClaimBucket<SharedLineState> =
+		new UnclaimedBucket<SharedLineState>();
 	/** Last channels-KV revision this replica proved it owns, by canonical channel key. */
 	private readonly channelRevisions = new Map<string, number>();
 	/** Lease expiry written by the last acknowledged create/update for each locally-owned channel. */
@@ -167,6 +174,12 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		// plane has ever run does not discover their absence on its first queued caller.
 		this.queueMembershipKv = await this.jetstream.views.kv(QUEUE_MEMBERSHIP_KV.name);
 		this.agentStateKv = await this.jetstream.views.kv(AGENT_STATE_KV.name);
+		// The waiting line. Written by EVERY engine instance holding a caller for the queue, which is
+		// what makes it the one ACD bucket whose write discipline is not optional — see
+		// `queue-waiting.store.ts`. Opened here for the same reason the two above it are: an engine
+		// that boots before the control plane has ever run must not discover the bucket's absence
+		// from its first queued caller.
+		this.queueWaitingKv = await this.jetstream.views.kv(QUEUE_WAITING_KV.name);
 		// The two CLAIM buckets. Both are written and read by this engine and by every other instance
 		// of it, and by nothing else — see `claim-store.ts` for why they are wrapped in a
 		// compare-and-set surface rather than exposed raw the way the read-mostly buckets are.
@@ -179,6 +192,15 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 			await this.jetstream.views.kv(CONFERENCE_CLAIMS_KV.name),
 			conferenceClaimSchema as never,
 			CONFERENCE_CLAIMS_KV.name,
+		);
+		// The shared-line seizure bucket. Written and read by this engine and by every other instance of
+		// it, and by nothing else — see `claim-store.ts` and `SharedLineRegistry` for why a shared line
+		// is seized under compare-and-set exactly as a park orbit is. The bucket itself is created by
+		// `ensureKvBuckets` above, since `SHARED_LINE_STATE_KV` is in `KV_BUCKETS`.
+		this.sharedLineStateBucket = new KvClaimBucket<SharedLineState>(
+			await this.jetstream.views.kv(SHARED_LINE_STATE_KV.name),
+			sharedLineStateSchema as never,
+			SHARED_LINE_STATE_KV.name,
 		);
 		this.ready = true;
 	}
@@ -278,6 +300,23 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	}
 
 	/**
+	 * The `queue-waiting` bucket, for {@link import("../queue/queue-waiting.store").QueueWaitingStore}.
+	 *
+	 * Raw, and not wrapped as a {@link ClaimBucket} the way the two claim buckets are, because the
+	 * record is JOINTLY held: `create` never means "I won", deleting the key would evict every other
+	 * instance's callers, and the operation that matters is read-modify-write rather than claim.
+	 * Wrapping it in the claim vocabulary would have made the store translate between two meanings of
+	 * "lost" on every write.
+	 *
+	 * `undefined` before `onModuleInit` has run, or after shutdown — which the store reads as "no
+	 * shared line configured" and answers from an in-process record, exactly as a single-instance
+	 * deployment should.
+	 */
+	get queueWaiting(): KV | undefined {
+		return this.queueWaitingKv;
+	}
+
+	/**
 	 * The `park-claims` bucket, as a compare-and-set surface.
 	 *
 	 * Wrapped rather than raw — the opposite decision from `routingCache` and `queueMembership` —
@@ -295,6 +334,11 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	/** The `conference-claims` bucket. Same contract, same reasoning, as {@link parkClaims}. */
 	get conferenceClaims(): ClaimBucket<ConferenceClaim> {
 		return this.conferenceClaimsBucket;
+	}
+
+	/** The `shared-line-state` bucket. Same contract, same reasoning, as {@link parkClaims}. */
+	get sharedLineState(): ClaimBucket<SharedLineState> {
+		return this.sharedLineStateBucket;
 	}
 
 	/**
@@ -650,8 +694,10 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		this.didIndexKv = undefined;
 		this.queueMembershipKv = undefined;
 		this.agentStateKv = undefined;
+		this.queueWaitingKv = undefined;
 		this.parkClaimsBucket = new UnclaimedBucket<ParkClaim>();
 		this.conferenceClaimsBucket = new UnclaimedBucket<ConferenceClaim>();
+		this.sharedLineStateBucket = new UnclaimedBucket<SharedLineState>();
 		this.channelRevisions.clear();
 		this.channelLeaseExpiries.clear();
 		this.channelOperations.clear();

@@ -99,6 +99,36 @@ export const SIP_CALL_ID_VARIABLE = "OPTIMIQ_SIP_CALL_ID";
 export const SIP_CALL_ID_CHANNEL_FUNCTION = "CHANNEL(pjsip,call-id)";
 
 /**
+ * Which `apps/sipd` instance holds the SIP dialog for this leg.
+ *
+ * A channel VARIABLE for the same reason {@link SIP_CALL_ID_VARIABLE} is one, and here the argument
+ * is sharper because the value is an ADDRESS rather than a label. Every command for a leg on the
+ * signalling plane — `ring`, `answer`, `hangup`, `reinvite` — is addressed at one instance, because a
+ * dialog lives on exactly one process and no other one can answer, retransmit or BYE it
+ * (`plans/sipd-invite-design.md` §6.1). A field on the aggregate would live only in the process that
+ * died; a variable is mirrored into the `channels` KV bucket, so an engine that picks this leg up
+ * after a failover can still hang it up. An engine that could not would leave a caller connected to a
+ * call nobody is accounting for.
+ *
+ * Absent on every ARI leg, which is the honest reading: there is no edge instance to address.
+ */
+export const SIPD_INSTANCE_ID_VARIABLE = "OPTIMIQ_SIPD_INSTANCE_ID";
+
+/**
+ * The leg an arriving INVITE's RFC 3891 `Replaces` was AUTHORISED to take over.
+ *
+ * Written by the admission path once entitlement has been established — never before — and read by
+ * the arrival path to choose the leg's program. It is what makes a `Replaces` INVITE take the
+ * re-bridge branch rather than the routing walk, without a second arrival path and without the
+ * orchestrator holding a side map a failover would lose.
+ *
+ * Its presence is a decision that has already been made. Nothing downstream re-checks entitlement,
+ * and nothing may write this variable from anywhere but the authorisation ladder — the same
+ * discipline `CHANNEL_OWNER_INSTANCE_VARIABLE` has, where the variable IS the claim.
+ */
+export const REPLACES_LEG_ID_VARIABLE = "OPTIMIQ_REPLACES_LEG_ID";
+
+/**
  * The channel variables the engine reads off a channel at `StasisStart`.
  *
  * The last one is not read by its own name — see {@link SIP_CALL_ID_CHANNEL_FUNCTION} — but it is

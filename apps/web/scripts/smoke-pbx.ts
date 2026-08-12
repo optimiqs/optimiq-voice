@@ -619,25 +619,98 @@ async function main(): Promise<void> {
 			"/voicemail",
 			"/ivr",
 			"/ring-groups",
+			// Paging groups, gated by `paging-groups.read` — which the owner used here holds. Only the
+			// list is asserted: a group's detail view needs an id, and the seed does not create one.
+			"/paging-groups",
+			// Shared line appearances, gated by `shared-lines.read` — which the owner used here holds.
+			// Only the list is asserted: a line's detail view needs an id, and the seed does not create
+			// one.
+			"/shared-lines",
 			"/queues",
 			"/queues?tab=agents",
 			"/conferences",
+			// The live moderation surface, and the only tab on this page that opens a WebSocket. It is
+			// a `?tab=` view of one subject rather than a route, so a tab that 404s or crashes would
+			// otherwise be invisible to a route list — and this one renders nothing at all until the
+			// live topic answers, which is exactly the shape of failure a smoke run should catch.
+			"/conferences?tab=live",
 			"/park-lots",
-			// The media library, and its second tab. Both are `?tab=` views of one page, so a tab
-			// that 404s or crashes would otherwise be invisible to a route list.
+			// The media library and its two other tabs. All three are `?tab=` views of one page, so a
+			// tab that 404s or crashes would otherwise be invisible to a route list — and `phrases` is
+			// the one whose grant is NOT the page's (`recordings.*` against `settings.*`), so a 200
+			// here proves the tab renders for a caller who holds both. The owner used here does.
 			"/media",
 			"/media?tab=prompts",
+			"/media?tab=phrases",
 			"/routing",
 			"/routing?tab=outbound",
 			"/routing?tab=time-conditions",
+			// Number translations, the sixth Routing tab. It rides `routes.*` rather than
+			// `dial-plan.*` — a ruleset is only meaningful attached to a route or a trunk — which is
+			// why it is here and not on `/dial-plan`.
+			"/routing?tab=translations",
 			"/routing?tab=feature-codes",
 			"/routing?tab=tools",
 			`/ivr/${ivrMenuId}`,
 			`/ring-groups/${ringGroupId}`,
 			`/queues/${seededQueueId}`,
 			`/routing/time-conditions/${timeConditionId}`,
-			// A settings sub-screen, which is a real route rather than a tab.
+			// The T2 admin block. Call flows and the authorisation codes are routes of their own
+			// because they are gated by resources of their own (`call-flows.*`, `pin-sets.*`); the
+			// four dial-plan tables share `dial-plan.*` and are therefore tabs of one page, so a tab
+			// that 404s or crashes would otherwise be invisible to a route list. The owner used here
+			// holds all three families.
+			"/call-flows",
+			"/pin-sets",
+			"/dial-plan",
+			"/dial-plan?tab=streams",
+			"/dial-plan?tab=directories",
+			"/dial-plan?tab=speed-dials",
+			// Caller screening, gated by `call-block.read` — a route of its own rather than a fifth
+			// tab of `/routing`, because the two are gated by different resources. The owner used
+			// here holds it.
+			"/call-block",
+			// The settings sub-screens, which are real routes rather than tabs.
 			"/settings/emergency-addresses",
+			// The organization quotas. Gated by `org-limits.read`, which is the only tab in the
+			// settings area whose permission is not a settings grant — a 200 here proves the route
+			// map agrees with `OrgLimitsController` about that.
+			"/settings/limits",
+			// The `recordings` category of the settings cascade. Reads on `settings.read` and saves
+			// on `recordings.configure` — the only category with a per-category permission override,
+			// so a 200 here proves the read side of that split as well as the route.
+			"/settings/recordings",
+			// The user level of the cascade, gated by `settings.read.own`. It renders before its
+			// first request resolves, so a 200 proves the route and the shell; the `GET …/me`
+			// contract is exercised below.
+			"/settings/me",
+			// The SIP security area and its second tab. The auth-failure ledger is only reachable —
+			// and only renderable — through the query state, so a tab that 404s or crashes would
+			// otherwise be invisible to a route list. Both are gated by `security.read`, which the
+			// owner used here holds.
+			"/security",
+			"/security?tab=auth-failures",
+			// The change ledger (`audit.read`) and the webhook subscriptions (`webhooks.read`). Both
+			// render before their first request resolves, so a 200 here proves the route and the shell,
+			// not the endpoint — the endpoint contracts are asserted by `lib/pbx/*.spec.ts` against the
+			// DTOs they mirror.
+			"/audit-log",
+			"/webhooks",
+			/**
+			 * The wallboard and one queue's operator panel.
+			 *
+			 * Both are gated by `queues.monitor` alone — the panel inherits it by ancestry — which is
+			 * neither `queues.read` nor `cdr.read`, and a 200 here is what proves the route map agrees
+			 * with `live-topics.ts` and the cdr controller about that. The owner used here holds all
+			 * three, so this asserts the ROUTE rather than the narrowest role; the permission split
+			 * itself is asserted in `lib/page-permissions.spec.ts`.
+			 *
+			 * The panel is included with a real id rather than left to the list: it is the only screen
+			 * in the app that mounts a live topic AND a cdr aggregate on first paint, and a crash in
+			 * either would be invisible to a route list that stopped at the index.
+			 */
+			"/wallboard",
+			`/wallboard/${seededQueueId}`,
 		];
 		const routeFailures: string[] = [];
 		for (const route of routes) {
@@ -972,16 +1045,77 @@ async function main(): Promise<void> {
 			announceFrequencySeconds: 30,
 			tierRulesApply: true,
 			tierRuleWaitSeconds: 10,
-			recordEnabled: false,
+			/**
+			 * A record POLICY, not the `recordEnabled` boolean this body used to carry.
+			 *
+			 * The column was replaced and `createQueueDto` is a `strictObject`, so the old key is now a
+			 * 400 naming it rather than a field quietly ignored — which is exactly what the queue form
+			 * was sending until this wave. Sending the new spelling here is what keeps the smoke and the
+			 * dialog telling the same story.
+			 */
+			recordPolicy: "none",
+			/** Upper-cased by the DTO before validation, so this is also the normalisation's smoke. */
+			exitKey: "2",
+			defaultPriority: 0,
 			enabled: true,
-			// The queue form's own trio writer, so the smoke exercises the code the dialog runs.
+			// The queue form's own trio writer, so the smoke exercises the code the dialog runs — now
+			// for BOTH of the queue's trios, which is the only row in the schema carrying two optional
+			// ones.
 			...writeDestination({ type: "extension", ref: agentExtensionId, data: null }, "timeout"),
+			...writeDestination({ type: "hangup", ref: null, data: null }, "exit"),
 		});
 		const queueId = rowId(queue);
 		check(
 			"create queue -> 201 with the settings the dialog sends",
-			queue.status === 201 && data(queue).strategy === "longest-idle",
-			`status ${queue.status}`,
+			queue.status === 201 &&
+				data(queue).strategy === "longest-idle" &&
+				data(queue).recordPolicy === "none" &&
+				data(queue).exitKey === "2" &&
+				data(queue).exitDestinationType === "hangup",
+			`status ${queue.status}, ${JSON.stringify({
+				recordPolicy: data(queue).recordPolicy,
+				exitKey: data(queue).exitKey,
+				exitDestinationType: data(queue).exitDestinationType,
+			})}`,
+		);
+
+		/**
+		 * The boolean the column no longer has. A strict object answers it with a 400 rather than
+		 * dropping it, which is the whole reason the mirror had to change rather than being left to
+		 * "the server will ignore what it does not know".
+		 */
+		const staleBoolean = await client("PATCH", `/api/v1/queues/${queueId}`, {
+			recordEnabled: true,
+		});
+		check(
+			"the recordEnabled boolean is refused outright, not silently ignored",
+			staleBoolean.status === 400,
+			`status ${staleBoolean.status}`,
+		);
+
+		/** One character, and one a phone can send. The engine compares it with `===`. */
+		const badExitKey = await client("PATCH", `/api/v1/queues/${queueId}`, { exitKey: "22" });
+		check(
+			"a multi-digit exit key is refused, as the form refuses it",
+			badExitKey.status === 400,
+			`status ${badExitKey.status}`,
+		);
+
+		const lowerExitKey = await client("PATCH", `/api/v1/queues/${queueId}`, { exitKey: "d" });
+		check(
+			"a lower-case DTMF letter is upper-cased rather than rejected",
+			lowerExitKey.status === 200 && data(lowerExitKey).exitKey === "D",
+			`status ${lowerExitKey.status}, exitKey ${JSON.stringify(data(lowerExitKey).exitKey)}`,
+		);
+
+		/** Higher dequeues first, on the 0-1000 scale `queue.caller.joined` already publishes on. */
+		const outOfRangePriority = await client("PATCH", `/api/v1/queues/${queueId}`, {
+			defaultPriority: 1001,
+		});
+		check(
+			"the caller-priority scale stops at 1000, as the mirror says",
+			outOfRangePriority.status === 400,
+			`status ${outOfRangePriority.status}`,
 		);
 
 		/**
@@ -1171,7 +1305,7 @@ async function main(): Promise<void> {
 			name: `Smoke room ${RUN_ID}`,
 			roomNumber: `9${RUN_DIGITS}`,
 			maxMembers: 25,
-			recordEnabled: false,
+			recordPolicy: "none",
 			announceJoinLeave: true,
 			waitForModerator: false,
 			enabled: true,
@@ -1920,6 +2054,22 @@ async function main(): Promise<void> {
 		// --- 17. devices: the provisioning contract, as the screen builds it ------------------------
 		console.log("\n17. devices and provisioning");
 		await runDeviceChecks(client);
+
+		// --- 18. caller screening: the CRUD the call-block screen is built on ------------------------
+		console.log("\n18. call blocking");
+		await runCallBlockChecks(client);
+
+		// --- 19. the settings cascade's two new surfaces --------------------------------------------
+		console.log("\n19. recording retention and the user cascade");
+		await runSettingsCascadeChecks(client);
+
+		// --- 20. the T2 admin block: the verbs that are not a PATCH ----------------------------------
+		console.log("\n20. the admin block: call flows, PIN sets, translations, the dial plan, limits");
+		await runAdminBlockChecks(client);
+
+		// --- 21. phrases: the ordered half of the media library -------------------------------------
+		console.log("\n21. phrases and their ordered steps");
+		await runPhraseChecks(client, upload);
 	} finally {
 		next?.kill("SIGTERM");
 		apiProcess.kill("SIGTERM");
@@ -2074,3 +2224,840 @@ function firstId(response: JsonResponse): string {
 }
 
 await main();
+
+/**
+ * Caller screening, exercised with the exact bodies `call-block-rule-dialog.tsx` builds.
+ *
+ * The claims worth making here are the three no unit test can reach, and all three are about the
+ * DTO's deliberate refusals rather than about the happy path:
+ *
+ * 1. The pattern is validated by the ROUTER, not by the schema. An uncompilable regex has to be a
+ *    refusal that ROLLS BACK and addresses `pattern`, because the form renders it on that field —
+ *    a 422 that maps to no field is a form that shows nothing.
+ * 2. `hitCount` and `lastHitAt` are refused with a 400 rather than dropped, which is why the form
+ *    must not send them "for completeness": it would fail every save.
+ * 3. Both come back on every read, because "this rule has never matched anything" is the one thing
+ *    a screening list can say that no other column can.
+ */
+async function runCallBlockChecks(client: Client): Promise<void> {
+	const pattern = `+1999${RUN_DIGITS}`.slice(0, 16);
+	const created = await client("POST", "/api/v1/call-block-rules", {
+		pattern,
+		matchKind: "exact",
+		direction: "inbound",
+		action: "block",
+		label: "Smoke screening rule",
+		enabled: true,
+	});
+	const ruleId = rowId(created);
+	check(
+		"the create body the screening dialog builds is accepted",
+		created.status === 201 && data(created).pattern === pattern,
+		`status ${created.status}`,
+	);
+
+	check(
+		"and the row comes back with the two counters the screen renders as evidence",
+		data(created).hitCount === 0 && data(created).lastHitAt === null,
+		`hitCount ${String(data(created).hitCount)}, lastHitAt ${String(data(created).lastHitAt)}`,
+	);
+
+	/**
+	 * The counters are enforcement's. A form that offered them would not be ignored — it would be
+	 * refused, which is why this is a 400 and not a silently dropped key.
+	 */
+	const forged = await client("PATCH", `/api/v1/call-block-rules/${ruleId}`, { hitCount: 400 });
+	check(
+		"a forged hit counter is refused by the DTO rather than dropped",
+		forged.status === 400,
+		`status ${forged.status}`,
+	);
+
+	/**
+	 * The pattern box has no client-side regex check precisely because this refusal exists. It has
+	 * to roll back and it has to name the field, or the dialog renders an error nowhere.
+	 */
+	const uncompilable = await client("POST", "/api/v1/call-block-rules", {
+		pattern: "(",
+		matchKind: "regex",
+		direction: "inbound",
+		action: "block",
+		enabled: true,
+	});
+	const patternErrors = pbxFieldErrors(asApiError(uncompilable));
+	check(
+		"an uncompilable expression is refused and the message lands on the pattern field",
+		uncompilable.status >= 400 && Boolean(patternErrors.pattern),
+		`status ${uncompilable.status}, fields ${Object.keys(patternErrors).join(",") || "none"}`,
+	);
+
+	const listed = await client("GET", "/api/v1/call-block-rules?page=1&limit=25");
+	const rows = Array.isArray(listed.body.data)
+		? (listed.body.data as Record<string, unknown>[])
+		: [];
+	check(
+		"the list is the paged envelope the shared list scaffold reads",
+		listed.status === 200 &&
+			typeof listed.body.total === "number" &&
+			rows.some((row) => row.id === ruleId),
+		`status ${listed.status}, ${rows.length} rows`,
+	);
+
+	/**
+	 * The direction is part of the identity — the unique index is `(organization, direction,
+	 * pattern)` — so the same number screened outbound is a second row rather than a conflict. The
+	 * form offers three directions on exactly that basis.
+	 */
+	const outbound = await client("POST", "/api/v1/call-block-rules", {
+		pattern,
+		matchKind: "exact",
+		direction: "outbound",
+		action: "block",
+		enabled: true,
+	});
+	const duplicate = await client("POST", "/api/v1/call-block-rules", {
+		pattern,
+		matchKind: "exact",
+		direction: "inbound",
+		action: "allow",
+		enabled: true,
+	});
+	check(
+		"the same pattern in another direction is a new row, and in the same direction a conflict",
+		outbound.status === 201 && duplicate.status === 409,
+		`outbound ${outbound.status}, duplicate ${duplicate.status}`,
+	);
+
+	await client("DELETE", `/api/v1/call-block-rules/${rowId(outbound)}`);
+	const removed = await client("DELETE", `/api/v1/call-block-rules/${ruleId}`);
+	check(
+		"a screening rule deletes cleanly — nothing in the dial plan can point at one",
+		removed.status === 200,
+		`status ${removed.status}`,
+	);
+}
+
+/**
+ * The `recordings` settings category and the user level of the cascade.
+ *
+ * Two surfaces, one contract shape, and the interesting claims are about the vocabulary rather than
+ * about the round trip: `0` has to mean KEEP FOR EVER on the wire the way the screen says it does,
+ * and `PATCH …/me` has to REFUSE an organization-level name by naming it rather than writing a row
+ * the resolver would ignore for ever.
+ */
+async function runSettingsCascadeChecks(client: Client): Promise<void> {
+	const read = await client("GET", "/api/v1/org-settings/categories/recordings");
+	check(
+		"the recordings category resolves with retentionDays present, defaulting to keep-for-ever",
+		read.status === 200 && typeof data(read).retentionDays === "number",
+		`status ${read.status}, retentionDays ${String(data(read).retentionDays)}`,
+	);
+
+	const saved = await client("PATCH", "/api/v1/org-settings/categories/recordings", {
+		retentionDays: 30,
+	});
+	check(
+		"the retention window saves through the category facade the form uses",
+		saved.status === 200 && data(saved).retentionDays === 30,
+		`status ${saved.status}`,
+	);
+
+	/** `0` is a value, not an absence — the same vocabulary `CDR_RECORDING_RETENTION_DAYS` uses. */
+	const forever = await client("PATCH", "/api/v1/org-settings/categories/recordings", {
+		retentionDays: 0,
+	});
+	const outOfRange = await client("PATCH", "/api/v1/org-settings/categories/recordings", {
+		retentionDays: 3_651,
+	});
+	check(
+		"zero is accepted as keep-for-ever and the ten-year ceiling is enforced",
+		forever.status === 200 && data(forever).retentionDays === 0 && outOfRange.status === 400,
+		`zero ${forever.status}, over ${outOfRange.status}`,
+	);
+
+	const own = await client("GET", "/api/v1/org-settings/me");
+	const ownData = data(own);
+	const notifications = (ownData.notifications ?? {}) as Record<string, unknown>;
+	check(
+		"GET /org-settings/me answers grouped by category with the user-scoped names resolved",
+		own.status === 200 &&
+			typeof notifications.voicemailToEmailIncludeLink === "boolean" &&
+			typeof notifications.voicemailToEmailIncludeTranscription === "boolean",
+		`status ${own.status}, categories ${Object.keys(ownData).join(",") || "none"}`,
+	);
+
+	const savedOwn = await client("PATCH", "/api/v1/org-settings/me/categories/notifications", {
+		voicemailToEmailIncludeLink: false,
+		voicemailToEmailIncludeTranscription: true,
+	});
+	check(
+		"the two preferences the page renders save as a user-level override",
+		savedOwn.status === 200 && data(savedOwn).voicemailToEmailIncludeLink === false,
+		`status ${savedOwn.status}`,
+	);
+
+	/**
+	 * The refusal that keeps this page honest. An organization-level name sent to the user endpoint
+	 * is a 400 NAMING the setting rather than a `user_setting` row the resolver would ignore for
+	 * ever — which is why the page renders only the two the catalogue marks user-scoped, and why a
+	 * third control would be a visible failure rather than a silent one.
+	 */
+	const refused = await client("PATCH", "/api/v1/org-settings/me/categories/notifications", {
+		voicemailToEmailEnabled: false,
+	});
+	const refusedFields = pbxFieldErrors(asApiError(refused));
+	check(
+		"an organization-level setting sent to the user endpoint is refused and named",
+		refused.status === 400 && Boolean(refusedFields.voicemailToEmailEnabled),
+		`status ${refused.status}, fields ${Object.keys(refusedFields).join(",") || "none"}`,
+	);
+
+	// Put the organization back where the fixture left it, so a second run starts clean.
+	await client("PATCH", "/api/v1/org-settings/me/categories/notifications", {
+		voicemailToEmailIncludeLink: true,
+		voicemailToEmailIncludeTranscription: true,
+	});
+}
+
+/**
+ * The T2 admin block, end to end.
+ *
+ * Four of the six things this exercises are verbs that are NOT a `PATCH`, and every one of them is
+ * a place a screen could be wrong in a way no unit test reaches: a toggle guarded by a different
+ * grant from the edit form beside it, an override that lives under `/call-flows` and writes a time
+ * condition, a PIN that goes in and never comes back, and a singleton reached without an id.
+ *
+ * Attaching a PIN set to an outbound route, a ruleset to either end, and a star code to a time
+ * condition are all writes now — the four columns the compiler already read gained DTO fields, so
+ * the checks below write them and read them back. They used to pin the 400 that proved no DTO
+ * declared them, which is what kept those fields read-only on screen; the same checks now fail if a
+ * write is ever refused again, which is the direction that matters once the forms are pickers.
+ */
+async function runAdminBlockChecks(client: Client): Promise<void> {
+	// --- named destinations, streams, directories and speed dials ---------------------------------
+	const alias = await client("POST", "/api/v1/destination-aliases", {
+		name: `Smoke alias ${RUN_ID}`,
+		description: "Front desk",
+		enabled: true,
+		...writeDestination({ type: "hangup", ref: null, data: null }, ""),
+	});
+	const aliasId = rowId(alias);
+	check(
+		"the create body the named-destination dialog builds is accepted",
+		alias.status === 201 && data(alias).destinationType === "hangup",
+		`status ${alias.status}`,
+	);
+
+	/**
+	 * The security check the stream form restates, proved against the server rather than trusted:
+	 * the set of things a tenant may cause the media server to OPEN is a decision about what the
+	 * media server will read, and `file://` is a URL.
+	 */
+	const badStream = await client("POST", "/api/v1/audio-streams", {
+		name: `Bad stream ${RUN_ID}`,
+		url: "file:///etc/passwd",
+		...writeDestination({ type: "hangup", ref: null, data: null }, "fallback"),
+	});
+	const badStreamFields = pbxFieldErrors(asApiError(badStream));
+	check(
+		"a non-http stream URL is refused and the message lands on the url field",
+		badStream.status === 400 && badStreamFields.url !== undefined,
+		`status ${badStream.status}, fields ${Object.keys(badStreamFields).join(",")}`,
+	);
+
+	const stream = await client("POST", "/api/v1/audio-streams", {
+		name: `Smoke stream ${RUN_ID}`,
+		url: "https://stream.example.com/smoke.mp3",
+		answerFirst: true,
+		maxSeconds: 0,
+		enabled: true,
+		...writeDestination({ type: "hangup", ref: null, data: null }, "fallback"),
+	});
+	const streamId = rowId(stream);
+	check(
+		"a stream's REQUIRED fallback trio round-trips under the prefix the picker writes",
+		stream.status === 201 && data(stream).fallbackDestinationType === "hangup",
+		`status ${stream.status}`,
+	);
+
+	/** The trio is not optional here, unlike every other secondary trio in the area. */
+	const noFallback = await client("POST", "/api/v1/audio-streams", {
+		name: `No fallback ${RUN_ID}`,
+		url: "https://stream.example.com/none.mp3",
+	});
+	check(
+		"a stream with no fallback is refused, which is why the form marks it required",
+		noFallback.status === 400 || noFallback.status === 422,
+		`status ${noFallback.status}`,
+	);
+
+	const directory = await client("POST", "/api/v1/directories", {
+		name: `Smoke directory ${RUN_ID}`,
+		searchField: "last-name",
+		minDigits: 3,
+		maxFailures: 3,
+		enabled: true,
+	});
+	const directoryId = rowId(directory);
+	check(
+		"a directory saves with no member list, because its entries are derived from the extensions",
+		directory.status === 201 && data(directory).searchField === "last-name",
+		`status ${directory.status}`,
+	);
+
+	const speedDial = await client("POST", "/api/v1/speed-dials", {
+		code: `*8${RUN_DIGITS.slice(0, 2)}`,
+		label: `Smoke speed dial ${RUN_ID}`,
+		enabled: true,
+		...writeDestination({ type: "alias", ref: aliasId, data: null }, ""),
+	});
+	const speedDialId = rowId(speedDial);
+	check(
+		"a speed dial points at a destination trio rather than a dial string, alias included",
+		speedDial.status === 201 && data(speedDial).destinationRef === aliasId,
+		`status ${speedDial.status}`,
+	);
+
+	// --- call flows, and the toggle that is a different grant --------------------------------------
+	const flow = await client("POST", "/api/v1/call-flows", {
+		name: `Smoke flow ${RUN_ID}`,
+		featureCode: `*28${RUN_DIGITS.slice(0, 1)}`,
+		enabled: true,
+		...writeDestination({ type: "alias", ref: aliasId, data: null }, ""),
+		...writeDestination({ type: "hangup", ref: null, data: null }, "night"),
+	});
+	const flowId = rowId(flow);
+	check(
+		"a call flow saves with BOTH trios and starts in day mode",
+		flow.status === 201 &&
+			data(flow).destinationType === "alias" &&
+			data(flow).nightDestinationType === "hangup" &&
+			data(flow).mode === "day",
+		`status ${flow.status}, mode ${String(data(flow).mode)}`,
+	);
+
+	/**
+	 * The switch is not a field. A `PATCH` carrying `mode` is a 400 naming it, which is what makes
+	 * the dialog's missing mode control a contract rather than an omission.
+	 */
+	const patchedMode = await client("PATCH", `/api/v1/call-flows/${flowId}`, { mode: "night" });
+	check(
+		"a PATCH cannot move the switch, which is why the edit dialog has no mode control",
+		patchedMode.status === 400,
+		`status ${patchedMode.status}`,
+	);
+
+	const toggled = await client("POST", `/api/v1/call-flows/${flowId}/toggle`, { mode: "night" });
+	check(
+		"the toggle endpoint moves it and answers with the row the list re-renders",
+		toggled.status === 201 && data(toggled).mode === "night",
+		`status ${toggled.status}, mode ${String(data(toggled).mode)}`,
+	);
+
+	/** Sending the target state explicitly is what makes the button idempotent under a double click. */
+	const toggledAgain = await client("POST", `/api/v1/call-flows/${flowId}/toggle`, {
+		mode: "night",
+	});
+	check(
+		"sending the mode explicitly is idempotent, so two fast clicks do not cancel out",
+		toggledAgain.status === 201 && data(toggledAgain).mode === "night",
+		`mode ${String(data(toggledAgain).mode)}`,
+	);
+
+	// --- the time-condition override, which lives under /call-flows -------------------------------
+	const conditions = await client("GET", "/api/v1/time-conditions?page=1&limit=1");
+	const conditionId = firstId(conditions);
+	check(
+		"a time condition row carries the override columns the list and detail page render",
+		Object.hasOwn((conditions.body.data as Record<string, unknown>[])[0] ?? {}, "override"),
+		Object.keys((conditions.body.data as Record<string, unknown>[])[0] ?? {}).join(","),
+	);
+
+	const forced = await client(
+		"POST",
+		`/api/v1/call-flows/time-conditions/${conditionId}/override`,
+		{
+			override: "forced-no-match",
+		},
+	);
+	check(
+		"the override endpoint writes a TIME CONDITION from under /call-flows, and answers with it",
+		forced.status === 201 && data(forced).override === "forced-no-match",
+		`status ${forced.status}, override ${String(data(forced).override)}`,
+	);
+
+	const released = await client(
+		"POST",
+		`/api/v1/call-flows/time-conditions/${conditionId}/override`,
+		{ override: "auto" },
+	);
+	check(
+		"and hands the clock back, which is the state the select's first option means",
+		released.status === 201 && data(released).override === "auto",
+		`override ${String(data(released).override)}`,
+	);
+
+	/**
+	 * The column exists, the compiler screens it against the feature-code catalogue, and the DTO now
+	 * accepts it — so the card offers it. `*291` is chosen because nothing in the seeded catalogue is
+	 * a prefix of it; a code that collided would come back as a compile rollback, not a 400.
+	 */
+	const overrideCode = await client("PATCH", `/api/v1/time-conditions/${conditionId}`, {
+		overrideFeatureCode: "*291",
+	});
+	check(
+		"the override star code is writable, which is why the card renders an input",
+		overrideCode.status === 200 && data(overrideCode).overrideFeatureCode === "*291",
+		`status ${overrideCode.status}, code ${String(data(overrideCode).overrideFeatureCode)}`,
+	);
+
+	/** `null` is how the form's "no star code" option says what it means, and how it is unassigned. */
+	const clearedCode = await client("PATCH", `/api/v1/time-conditions/${conditionId}`, {
+		overrideFeatureCode: null,
+	});
+	check(
+		"and null clears it, so a lamp key is unassigned without deleting the condition",
+		clearedCode.status === 200 && data(clearedCode).overrideFeatureCode === null,
+		`status ${clearedCode.status}, code ${String(data(clearedCode).overrideFeatureCode)}`,
+	);
+
+	// --- translation rulesets and their ordered rules ----------------------------------------------
+	const ruleset = await client("POST", "/api/v1/translation-rulesets", {
+		name: `Smoke ruleset ${RUN_ID}`,
+		description: "E.164 normalisation",
+		enabled: true,
+	});
+	const rulesetId = rowId(ruleset);
+	check(
+		"a ruleset is created through routes.write rather than a resource of its own",
+		ruleset.status === 201,
+		`status ${ruleset.status}`,
+	);
+
+	const strip = await client("POST", `/api/v1/translation-rulesets/${rulesetId}/rules`, {
+		label: "Strip the international prefix",
+		matchPattern: "^00(\\d+)$",
+		replacement: "$1",
+		ordinal: 0,
+		enabled: true,
+	});
+	const plus = await client("POST", `/api/v1/translation-rulesets/${rulesetId}/rules`, {
+		label: "Add the plus",
+		matchPattern: "^(\\d+)$",
+		replacement: "+$1",
+		ordinal: 1,
+		enabled: true,
+	});
+	check(
+		"both halves of a pipeline save, including an EMPTY-capable replacement",
+		strip.status === 201 && plus.status === 201,
+		`status ${strip.status}/${plus.status}`,
+	);
+
+	/**
+	 * The security boundary the form deliberately does not duplicate: a replacement that can emit
+	 * `@` could put a second host into a request URI. It is refused by the compiler inside the write
+	 * transaction, so it has to surface as a rollback the dialog can render — not as a stored rule.
+	 */
+	const unsafe = await client("POST", `/api/v1/translation-rulesets/${rulesetId}/rules`, {
+		matchPattern: "^(\\d+)$",
+		replacement: "$1@evil.example",
+		ordinal: 2,
+	});
+	check(
+		"an unsafe replacement is refused by the compiler rather than accepted by the edge",
+		unsafe.status >= 400,
+		`status ${unsafe.status}`,
+	);
+
+	/** The order IS the semantics here, so it is rewritten in one transaction. */
+	const reordered = await client("PUT", `/api/v1/translation-rulesets/${rulesetId}/rules/reorder`, {
+		ids: [rowId(plus), rowId(strip)],
+	});
+	check(
+		"the whole pipeline is reordered in one request, as the detail page sends it",
+		reordered.status === 200,
+		`status ${reordered.status}`,
+	);
+
+	// --- PIN sets, and the code that goes in and never comes back ----------------------------------
+	const pinSet = await client("POST", "/api/v1/pin-sets", {
+		name: `Smoke codes ${RUN_ID}`,
+		description: "International calling",
+		maxAttempts: 3,
+		digitTimeoutMs: 8000,
+		enabled: true,
+	});
+	const pinSetId = rowId(pinSet);
+	check("a PIN set is created", pinSet.status === 201, `status ${pinSet.status}`);
+
+	const entry = await client("POST", `/api/v1/pin-sets/${pinSetId}/entries`, {
+		label: "Night desk",
+		ordinal: 0,
+		enabled: true,
+		pin: "48213",
+	});
+	const entryId = rowId(entry);
+	check(
+		"a code and its digest are created in ONE request, so there is no ungated window",
+		entry.status === 201 && !Object.hasOwn(data(entry), "pinHash"),
+		`status ${entry.status}, keys ${Object.keys(data(entry)).join(",")}`,
+	);
+
+	const reset = await client("PUT", `/api/v1/pin-sets/${pinSetId}/entries/${entryId}/pin`, {
+		pin: "90517",
+	});
+	check(
+		"replacing a code leaves the label and the ordinal — the identity a call record names",
+		reset.status === 200 &&
+			data(reset).label === "Night desk" &&
+			data(reset).ordinal === 0 &&
+			!Object.hasOwn(data(reset), "pinHash"),
+		`status ${reset.status}`,
+	);
+
+	const entryList = await client("GET", `/api/v1/pin-sets/${pinSetId}/entries`);
+	const entryRows = (entryList.body.data as Record<string, unknown>[]) ?? [];
+	check(
+		"and no digest is ever on a row the codes table renders",
+		entryRows.every((row) => !Object.hasOwn(row, "pinHash")),
+		Object.keys(entryRows[0] ?? {}).join(","),
+	);
+
+	// --- the three attachments, which the request body now carries --------------------------------
+	/**
+	 * The reason the outbound-route and trunk dialogs render these as pickers. The columns were
+	 * always compiled; what they lacked was a DTO field, and this used to assert the 400 that proved
+	 * it. Each is written and read back, because a key a strict object accepted and the repository
+	 * dropped would look identical to a working write from the form's side.
+	 */
+	const routes = await client("GET", "/api/v1/outbound-routes?page=1&limit=1");
+	const outboundRouteId = firstId(routes);
+	const gated = await client("PATCH", `/api/v1/outbound-routes/${outboundRouteId}`, { pinSetId });
+	const rewritten = await client("PATCH", `/api/v1/outbound-routes/${outboundRouteId}`, {
+		translationRulesetId: rulesetId,
+	});
+	const trunks = await client("GET", "/api/v1/trunks?page=1&limit=1");
+	const trunkId = firstId(trunks);
+	const inbound = await client("PATCH", `/api/v1/trunks/${trunkId}`, {
+		inboundTranslationRulesetId: rulesetId,
+	});
+	check(
+		"all three attachments are writable, and each answers with the id it stored",
+		gated.status === 200 &&
+			data(gated).pinSetId === pinSetId &&
+			rewritten.status === 200 &&
+			data(rewritten).translationRulesetId === rulesetId &&
+			inbound.status === 200 &&
+			data(inbound).inboundTranslationRulesetId === rulesetId,
+		`pinSet ${gated.status}/${String(data(gated).pinSetId)}, ruleset ${rewritten.status}/${String(data(rewritten).translationRulesetId)}, trunk ${inbound.status}/${String(data(inbound).inboundTranslationRulesetId)}`,
+	);
+
+	/**
+	 * The other half of making them writable: both columns are `on delete set null` in the schema and
+	 * both resources refuse the delete anyway, so a set three routes are gated by cannot vanish and
+	 * quietly widen who may dial internationally. Only reachable now that a route can be attached.
+	 */
+	const gatedSetDelete = await client("DELETE", `/api/v1/pin-sets/${pinSetId}`);
+	check(
+		"a PIN set an outbound route is gated by cannot be deleted out from under it",
+		gatedSetDelete.status === 409 &&
+			pbxErrorCode(asApiError(gatedSetDelete)) === "PBX_REFERENCED" &&
+			pbxReferences(asApiError(gatedSetDelete)).length > 0,
+		`status ${gatedSetDelete.status}, ${pbxReferences(asApiError(gatedSetDelete)).length} references`,
+	);
+
+	/** `null` detaches, which is what the picker's "None" option sends. */
+	const detachedPin = await client("PATCH", `/api/v1/outbound-routes/${outboundRouteId}`, {
+		pinSetId: null,
+		translationRulesetId: null,
+	});
+	const detachedTrunk = await client("PATCH", `/api/v1/trunks/${trunkId}`, {
+		inboundTranslationRulesetId: null,
+	});
+	check(
+		"and null detaches all three, which is what the pickers' None option sends",
+		detachedPin.status === 200 &&
+			data(detachedPin).pinSetId === null &&
+			data(detachedPin).translationRulesetId === null &&
+			detachedTrunk.status === 200 &&
+			data(detachedTrunk).inboundTranslationRulesetId === null,
+		`route ${detachedPin.status}, trunk ${detachedTrunk.status}`,
+	);
+
+	// --- organization limits: a singleton, and a usage report with two honest gaps -----------------
+	const limits = await client("PUT", "/api/v1/org-limits", {
+		maxExtensions: 50,
+		maxTrunks: null,
+		maxConcurrentCalls: 25,
+		maxStorageMb: 1024,
+	});
+	check(
+		"the limits are a PUT of the COMPLETE set, and null removes a ceiling",
+		limits.status === 200 && data(limits).maxExtensions === 50 && data(limits).maxTrunks === null,
+		`status ${limits.status}`,
+	);
+
+	const usage = await client("GET", "/api/v1/org-limits/usage");
+	const usageEntries =
+		(data(usage).entries as {
+			limit: string;
+			used: number;
+			ceiling: number | null;
+			ratio: number | null;
+			measured: boolean;
+		}[]) ?? [];
+	const concurrent = usageEntries.find((row) => row.limit === "maxConcurrentCalls");
+	check(
+		"the usage report answers one line per limit, in the order the page renders them",
+		usage.status === 200 &&
+			usageEntries.map((row) => row.limit).join(",") ===
+				"maxExtensions,maxTrunks,maxConcurrentCalls,maxStorageMb",
+		usageEntries.map((row) => row.limit).join(","),
+	);
+	/**
+	 * The line the page must NOT draw a bar for, and it is the response that says so rather than a
+	 * hard-coded limit name in the browser.
+	 *
+	 * `measured: false` is what stops a zero being read as "nobody is on a call right now" — a much
+	 * more confident statement than "this is not counted here" — and `ratio: null` is what stops a
+	 * bar being drawn from that zero at all. It used to be `0`, which drew an empty bar beside a real
+	 * ceiling. The other three lines are counted and must keep saying so.
+	 */
+	check(
+		"simultaneous calls report a real ceiling, no usage, and no ratio to draw a bar from",
+		concurrent?.ceiling === 25 &&
+			concurrent.used === 0 &&
+			concurrent.measured === false &&
+			concurrent.ratio === null,
+		JSON.stringify(concurrent),
+	);
+	check(
+		"and the other three lines are measured, so the page keeps drawing their bars",
+		usageEntries.filter((row) => row.limit !== "maxConcurrentCalls").every((row) => row.measured),
+		usageEntries.map((row) => `${row.limit}:${String(row.measured)}`).join(", "),
+	);
+	check(
+		"and the exact byte total is carried beside the rounded megabytes",
+		typeof data(usage).storageBytes === "number",
+		String(data(usage).storageBytes),
+	);
+
+	// --- tear down, in dependency order -----------------------------------------------------------
+	await client("DELETE", `/api/v1/speed-dials/${speedDialId}`);
+	await client("DELETE", `/api/v1/call-flows/${flowId}`);
+
+	/** A named destination cannot be deleted while a speed dial or a flow still names it. */
+	const aliasDeleted = await client("DELETE", `/api/v1/destination-aliases/${aliasId}`);
+	check(
+		"the named destination deletes once nothing points at it any more",
+		aliasDeleted.status === 200,
+		`status ${aliasDeleted.status}`,
+	);
+
+	await client("DELETE", `/api/v1/directories/${directoryId}`);
+	await client("DELETE", `/api/v1/audio-streams/${streamId}`);
+	await client("DELETE", `/api/v1/pin-sets/${pinSetId}`);
+	const rulesetDeleted = await client("DELETE", `/api/v1/translation-rulesets/${rulesetId}`);
+	check(
+		"and the ruleset deletes with its rules",
+		rulesetDeleted.status === 200,
+		`status ${rulesetDeleted.status}`,
+	);
+}
+
+/**
+ * The phrases surface, exercised with the exact bodies the media screens build.
+ *
+ * ## Why this needs a live server rather than a unit test
+ *
+ * Every claim below is about a rule that lives on the SERVER and cannot be reproduced in a schema,
+ * because each one needs to read a row rather than a field:
+ *
+ * 1. **A phrase is a `prompt` row and `/phrases` is the only way to make one.** `POST /prompts` does
+ *    not exist — a library entry is born through a multipart upload — so this is the one create in
+ *    the media area that is ordinary JSON. The response has to carry `kind: "phrase"` and a null
+ *    object key, which is the pair the table's check constraint permits and the pair `PhraseRow`
+ *    narrows to.
+ * 2. **Nesting is refused, as a field error.** A step whose `promptId` names another phrase is a 400
+ *    addressed at `promptId`, which is what lets the step dialog attach the message to the picker
+ *    the user just used. A schema cannot state this: it sees a uuid, not the row behind it.
+ * 3. **A prompt a phrase plays cannot be deleted.** `phrase_step.prompt_id` is the only
+ *    `on delete restrict` column in the schema, and the site is declared with `idColumn: "phrase_id"`
+ *    so the 409 names the PHRASE. This is the assertion `referenceHref`'s new `phrase` case exists
+ *    for — until a phrase exists, "every referrer resolves somewhere fixable" is vacuously true of
+ *    that kind.
+ * 4. **The reorder is a whole-list write.** The endpoint refuses anything that is not an exact
+ *    permutation, which is what makes a stale editor's reorder a recoverable 400 rather than a
+ *    silent scramble.
+ *
+ * The uploader is threaded in rather than a prompt id, because a phrase needs library entries that
+ * outlive it for exactly as long as the step does — and creating them here keeps the fixture's
+ * teardown in one place.
+ */
+async function runPhraseChecks(client: Client, upload: Uploader): Promise<void> {
+	const wav = makeWav();
+
+	const first = await upload(
+		"/api/v1/prompts",
+		{ bytes: wav, name: "your-call-is-number.wav", type: "audio/wav" },
+		{ name: `smoke-phrase-a-${RUN_ID}` },
+	);
+	const second = await upload(
+		"/api/v1/prompts",
+		{ bytes: wav, name: "in-the-queue.wav", type: "audio/wav" },
+		{ name: `smoke-phrase-b-${RUN_ID}` },
+	);
+	const firstPromptId = rowId(first);
+	const secondPromptId = rowId(second);
+	check(
+		"two library entries upload, which is what a phrase is assembled out of",
+		first.status === 201 && second.status === 201,
+		`status ${first.status}/${second.status}`,
+	);
+
+	// --- the phrase itself ------------------------------------------------------------------------
+
+	const phrase = await client("POST", "/api/v1/phrases", { name: `Smoke phrase ${RUN_ID}` });
+	const phraseId = rowId(phrase);
+	check(
+		"a phrase is created by an ordinary JSON POST, with no file anywhere near it",
+		phrase.status === 201 && data(phrase).kind === "phrase" && data(phrase).objectKey === null,
+		`status ${phrase.status}, kind ${String(data(phrase).kind)}, objectKey ${JSON.stringify(
+			data(phrase).objectKey,
+		)}`,
+	);
+
+	/**
+	 * `kind` and `objectKey` are not fields, they are what MAKES the row a phrase — so the strict DTO
+	 * refuses them, and the create dialog therefore has no control for either. A client that could
+	 * send them could produce a library entry with no file behind it.
+	 */
+	const stamped = await client("POST", "/api/v1/phrases", {
+		name: `Smoke stamped ${RUN_ID}`,
+		kind: "prompt",
+	});
+	check(
+		"and the row's discriminator cannot be sent by a client",
+		stamped.status === 400,
+		`status ${stamped.status}`,
+	);
+
+	/**
+	 * The two surfaces share one table, and the URL's noun is load-bearing on purpose: reading a
+	 * library entry through `/phrases/:id` is a 404 rather than a row, so a caller who holds one id
+	 * does not effectively hold all of them.
+	 */
+	const wrongNoun = await client("GET", `/api/v1/phrases/${firstPromptId}`);
+	check(
+		"a library entry's id is a 404 on the phrases surface, not a redirect",
+		wrongNoun.status === 404,
+		`status ${wrongNoun.status}`,
+	);
+
+	// --- steps ------------------------------------------------------------------------------------
+
+	const stepOne = await client("POST", `/api/v1/phrases/${phraseId}/steps`, {
+		promptId: firstPromptId,
+		ordinal: 0,
+		enabled: true,
+	});
+	const stepTwo = await client("POST", `/api/v1/phrases/${phraseId}/steps`, {
+		promptId: secondPromptId,
+		ordinal: 1,
+		enabled: true,
+	});
+	const stepOneId = rowId(stepOne);
+	const stepTwoId = rowId(stepTwo);
+	check(
+		"the create body the step dialog builds is accepted, ordinal and all",
+		stepOne.status === 201 && stepTwo.status === 201,
+		`status ${stepOne.status}/${stepTwo.status}`,
+	);
+
+	/** The rule the form restates and cannot prove: a step plays a recording, never another phrase. */
+	const nested = await client("POST", `/api/v1/phrases/${phraseId}/steps`, {
+		promptId: phraseId,
+		ordinal: 2,
+	});
+	const nestedFields = pbxFieldErrors(asApiError(nested));
+	check(
+		"a step naming another phrase is refused, with the message on the promptId field",
+		nested.status === 400 && nestedFields.promptId !== undefined,
+		`status ${nested.status}, fields ${Object.keys(nestedFields).join(",")}`,
+	);
+
+	// --- the order is the sentence ----------------------------------------------------------------
+
+	const reordered = await client("PUT", `/api/v1/phrases/${phraseId}/steps/reorder`, {
+		ids: [stepTwoId, stepOneId],
+	});
+	// The reorder envelope's `data` is an ARRAY — the collection as stored — rather than the single
+	// row every other mutation carries, so it is read off the body directly.
+	const reorderedRows = (reordered.body.data ?? []) as { id: string; ordinal: number }[];
+	check(
+		"the whole order is rewritten in one request, and the reply carries what was stored",
+		reordered.status === 200 && reorderedRows[0]?.id === stepTwoId,
+		`status ${reordered.status}, ${reorderedRows.map((row) => row.id.slice(0, 8)).join(",")}`,
+	);
+
+	/**
+	 * Anything that is not an exact permutation is refused. That is what makes a stale editor's Move
+	 * up a recoverable 400 rather than a silently scrambled sentence — and it is why the detail page
+	 * does no optimistic swap.
+	 */
+	const partial = await client("PUT", `/api/v1/phrases/${phraseId}/steps/reorder`, {
+		ids: [stepTwoId],
+	});
+	check(
+		"a reorder that is not an exact permutation is refused rather than half-applied",
+		partial.status >= 400,
+		`status ${partial.status}`,
+	);
+
+	// --- the delete that must be refused, and the link out of it -----------------------------------
+
+	const refusedPrompt = await client("DELETE", `/api/v1/prompts/${firstPromptId}`);
+	const phraseReferences: readonly EntityReference[] = pbxReferences(asApiError(refusedPrompt));
+	check(
+		"deleting a recording a phrase plays is refused, naming the phrase rather than the step",
+		refusedPrompt.status === 409 &&
+			phraseReferences.some((reference) => reference.kind === "phrase"),
+		`status ${refusedPrompt.status}, ${phraseReferences.map((r) => r.kind).join(", ")}`,
+	);
+	/**
+	 * The reason `referenceHref` needed a `phrase` case at all. The site is declared with
+	 * `nameColumn: null`, so there is no name to prefill a search box with — a list fallback would
+	 * have landed the user on a page of phrases with no indication which one is holding the delete.
+	 */
+	check(
+		"and that referrer resolves to the phrase's own page, by id",
+		phraseReferences.length > 0 &&
+			phraseReferences.every((reference) => referenceHref(reference) !== undefined) &&
+			phraseReferences.some((reference) =>
+				(referenceHref(reference) ?? "").startsWith("/media/phrases/"),
+			),
+		phraseReferences.map((reference) => referenceHref(reference) ?? "—").join(", "),
+	);
+
+	// --- tear down, in dependency order -----------------------------------------------------------
+
+	await client("DELETE", `/api/v1/phrases/${phraseId}/steps/${stepOneId}`);
+	await client("DELETE", `/api/v1/phrases/${phraseId}/steps/${stepTwoId}`);
+
+	/** With no step pointing at it, the recording deletes — which is the other half of the restrict. */
+	const promptDeleted = await client("DELETE", `/api/v1/prompts/${firstPromptId}`);
+	check(
+		"the recording deletes once no step plays it any more",
+		promptDeleted.status === 200,
+		`status ${promptDeleted.status}`,
+	);
+	await client("DELETE", `/api/v1/prompts/${secondPromptId}`);
+
+	const phraseDeleted = await client("DELETE", `/api/v1/phrases/${phraseId}`);
+	check(
+		"and the phrase deletes through its own surface",
+		phraseDeleted.status === 200,
+		`status ${phraseDeleted.status}`,
+	);
+}

@@ -4,6 +4,7 @@ import { ENGINE_ENV, MEDIA_PORT } from "../nats/nats.tokens";
 import { AriConnectionService } from "./ari-connection.service";
 import { AriMediaAdapter } from "./ari-media.adapter";
 import { MediadService } from "./mediad.service";
+import { SipdService } from "./sipd.service";
 import type { EngineEnv } from "../config/engine-env";
 import type { MediaPort } from "./media-port";
 
@@ -31,6 +32,11 @@ import type { MediaPort } from "./media-port";
 	providers: [
 		AriConnectionService,
 		MediadService,
+		// The signalling plane's EVENT half. Not a `MEDIA_PORT` candidate and never will be: it serves
+		// no command, it only turns `sip.evt.v1` into the same union the two drivers above produce. It
+		// is constructed unconditionally for the reason the other two are — the factory below stays a
+		// one-line choice — and starts only on a deployment that signals on `apps/sipd`.
+		SipdService,
 		{
 			provide: MEDIA_PORT,
 			useFactory: (env: EngineEnv, ari: AriConnectionService, mediad: MediadService): MediaPort => {
@@ -49,6 +55,6 @@ import type { MediaPort } from "./media-port";
 			inject: [ENGINE_ENV, AriConnectionService, MediadService],
 		},
 	],
-	exports: [AriConnectionService, MediadService, MEDIA_PORT],
+	exports: [AriConnectionService, MediadService, SipdService, MEDIA_PORT],
 })
 export class AriModule {}

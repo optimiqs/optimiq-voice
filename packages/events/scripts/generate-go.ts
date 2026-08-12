@@ -4,6 +4,12 @@ import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import {
+	EXTENDED_HANGUP_CAUSES,
+	HANGUP_CAUSE_CODES,
+	type HangupCause,
+	Q850_HANGUP_CAUSES,
+} from "@optimiq-voice/telephony";
 import { makeAuditEvent } from "../src/schemas/audit-events";
 import { makeCallEvent } from "../src/schemas/call-events";
 import { makeCdrLegWriteEvent } from "../src/schemas/cdr-events";
@@ -11,6 +17,7 @@ import { makeMediaEvent } from "../src/schemas/media-events";
 import { makeProvisionEvent } from "../src/schemas/provision-events";
 import { makeQueueEvent } from "../src/schemas/queue-events";
 import { makeRegistrationEvent } from "../src/schemas/registration-events";
+import { makeTrunkEvent } from "../src/schemas/trunk-events";
 import { makeVoicemailEvent } from "../src/schemas/voicemail-events";
 import {
 	EVENT_STREAMS,
@@ -23,6 +30,7 @@ import {
 	aorSubjectToken,
 	CALL_EVENTS,
 	didIndexToken,
+	instanceSubjectToken,
 	matchesSubject,
 	MEDIA_SESSION_EVENTS,
 	parseSubject,
@@ -34,6 +42,7 @@ import {
 	SUBJECT_VERSION,
 	subjectFilterFor,
 	subjectFor,
+	TRUNK_EVENTS,
 	VOICEMAIL_EVENTS,
 } from "../src/subjects";
 import { GoFileEmitter, pascal, type JsonSchema } from "./go-emitter";
@@ -222,6 +231,191 @@ function emitJsonSchemas(): {
 // 2 — Go structs
 // ------------------------------------------------------------------------------------------------
 
+/**
+ * `SCREAMING_SNAKE` → `PascalCase`, for a Go identifier built from a cause name.
+ *
+ * Deliberately naive: it upper-cases the first rune of each underscore-separated run and lower-cases
+ * the rest, so `BEARERCAPABILITY_NOTAUTH` becomes `BearercapabilityNotauth` rather than anything
+ * cleverer. A table of special cases here would be a second opinion about a name whose authority is
+ * `packages/telephony`, and the generated identifier only has to be stable and unambiguous — it is
+ * never the value on the wire, which stays the SCREAMING_SNAKE string.
+ */
+function goCauseIdentifier(cause: string): string {
+	return cause
+		.split("_")
+		.map((part) => part.charAt(0) + part.slice(1).toLowerCase())
+		.join("");
+}
+
+/**
+ * The Q.850 table, in Go — generated from `@optimiq-voice/telephony`, which is the authority.
+ *
+ * ## The direction, stated once, because it was the open question
+ *
+ * TypeScript already HAD the canonical table (`packages/telephony/src/hangup-causes.ts`, pinned by
+ * its own spec against the frozen reference §6), and `apps/sipd/internal/dialog/cause.go` had grown
+ * a hand-written subset of the same numbers. Two hand-written copies of a table whose values end up
+ * on billed CDR rows is the drift this repository already spends a codegen step avoiding everywhere
+ * else, so the Go side becomes a GENERATED COPY and the TypeScript side stays the source. The
+ * alternative — moving the table into Go and generating TypeScript — would put a domain vocabulary
+ * that the routing executor, the session protocol and the CDR writer all key off behind a Go build.
+ *
+ * `sipd` keeps its `Cause*` constants (they read well at a SIP call site and the SIP→Q.850 mapping
+ * is genuinely the edge's own knowledge); their VALUES now come from here, so a re-coded cause is a
+ * one-line change in one file rather than a silent disagreement between two.
+ *
+ * ## Why this is in `events-go` rather than a `telephony-go` module
+ *
+ * `apps/sipd` and `apps/mediad` already depend on `packages/events-go` and on nothing else shared.
+ * A second Go module for one table would be a `go.work` entry, a `replace` directive in two `go.mod`
+ * files and a release step, bought for tidiness alone.
+ *
+ * ## Not the schema's business
+ *
+ * `hangupCauseSchema` still validates the SHAPE and not the membership, for the reason its own
+ * JSDoc gives: carriers keep inventing causes, and an unrecognised one must reach the CDR writer
+ * rather than being terminated at the broker edge. Generating this table does not close that door —
+ * nothing here is used to reject a payload.
+ */
+function emitHangupCauses(): void {
+	const emitter = new GoFileEmitter({ namedEnums: [] });
+	const all = [...Q850_HANGUP_CAUSES, ...EXTENDED_HANGUP_CAUSES] as readonly HangupCause[];
+
+	emitter.declareRaw(
+		"type:HangupCause",
+		[
+			"// HangupCause is a hangup-cause NAME — the value stored on `call_legs.hangup_cause` and",
+			"// carried by `cdr.leg.v1` and the `dialog.terminated` event.",
+			"//",
+			"// A plain string type rather than a closed enum, deliberately: a cause this build does not",
+			"// know must still reach the CDR writer, which stores the numeric code verbatim and falls back",
+			"// to NORMAL_UNSPECIFIED.",
+			"type HangupCause string",
+		].join("\n"),
+	);
+
+	emitter.declareRaw(
+		"consts:HangupCause",
+		[
+			"// The named causes. Q.850 1-127 first, then the FreeSWITCH extensions.",
+			"const (",
+			...all.map(
+				(cause) =>
+					`\tHangupCause${goCauseIdentifier(cause)} HangupCause = ${JSON.stringify(cause)}`,
+			),
+			")",
+		].join("\n"),
+	);
+
+	emitter.declareRaw(
+		"consts:HangupCode",
+		[
+			"// The numeric code for each named cause, as untyped constants.",
+			"//",
+			"// Constants rather than only the map below, because a Go caller that wants a compile-time",
+			"// constant cannot get one out of a map — `apps/sipd/internal/dialog/cause.go` defines its",
+			"// whole Cause* set in terms of these.",
+			"const (",
+			...all.map(
+				(cause) => `\tHangupCode${goCauseIdentifier(cause)} = ${HANGUP_CAUSE_CODES[cause]}`,
+			),
+			")",
+		].join("\n"),
+	);
+
+	emitter.declareRaw(
+		"var:Q850HangupCauses",
+		[
+			"// Q850HangupCauses lists the Q.850 members, in contract order.",
+			"var Q850HangupCauses = []HangupCause{",
+			...Q850_HANGUP_CAUSES.map((cause) => `\tHangupCause${goCauseIdentifier(cause)},`),
+			"}",
+			"",
+			"// ExtendedHangupCauses lists the FreeSWITCH extensions, in contract order.",
+			"var ExtendedHangupCauses = []HangupCause{",
+			...EXTENDED_HANGUP_CAUSES.map((cause) => `\tHangupCause${goCauseIdentifier(cause)},`),
+			"}",
+			"",
+			"// HangupCauses lists every named cause, Q.850 first. Contract order, matching",
+			"// HANGUP_CAUSES in packages/telephony.",
+			"var HangupCauses = append(append([]HangupCause{}, Q850HangupCauses...), ExtendedHangupCauses...)",
+		].join("\n"),
+	);
+
+	emitter.declareRaw(
+		"var:HangupCauseCodes",
+		[
+			"// HangupCauseCodes maps a cause name onto its numeric code.",
+			"var HangupCauseCodes = map[HangupCause]int{",
+			...all.map(
+				(cause) =>
+					`\tHangupCause${goCauseIdentifier(cause)}: HangupCode${goCauseIdentifier(cause)},`,
+			),
+			"}",
+			"",
+			"// HangupCauseNames maps a numeric code back onto its name.",
+			"//",
+			"// Built from the same generated pairs as HangupCauseCodes, so the two cannot diverge — the",
+			"// property HANGUP_CAUSE_NAMES gets in TypeScript by construction.",
+			"var HangupCauseNames = func() map[int]HangupCause {",
+			"\tnames := make(map[int]HangupCause, len(HangupCauseCodes))",
+			"\tfor cause, code := range HangupCauseCodes {",
+			"\t\tnames[code] = cause",
+			"\t}",
+			"\treturn names",
+			"}()",
+		].join("\n"),
+	);
+
+	emitter.declareRaw(
+		"func:HangupCauseHelpers",
+		[
+			"// HangupCauseCodeOf returns the numeric code for a cause name, and whether it is a name this",
+			'// contract knows. An unknown name yields 0, which is NONE — the "no cause recorded" sentinel',
+			"// and never a real outcome, so a caller that ignores the boolean cannot bill from it.",
+			"func HangupCauseCodeOf(cause HangupCause) (int, bool) {",
+			"\tcode, found := HangupCauseCodes[cause]",
+			"\treturn code, found",
+			"}",
+			"",
+			"// HangupCauseFromCode returns the name for a numeric code.",
+			"//",
+			"// Only the ~65 points a softswitch actually emits are named; anything else a carrier sends is",
+			"// stored as its raw code with NORMAL_UNSPECIFIED, which is why this reports absence rather",
+			"// than inventing a name.",
+			"func HangupCauseFromCode(code int) (HangupCause, bool) {",
+			"\tcause, found := HangupCauseNames[code]",
+			"\treturn cause, found",
+			"}",
+			"",
+			"// IsHangupCause reports whether a string arriving from the wire is a name this contract knows.",
+			"func IsHangupCause(value string) bool {",
+			"\t_, found := HangupCauseCodes[HangupCause(value)]",
+			"\treturn found",
+			"}",
+		].join("\n"),
+	);
+
+	writeText(
+		join(GO_DIR, "hangup_causes_gen.go"),
+		emitter.render(
+			[
+				"The Q.850 hangup-cause taxonomy, plus the FreeSWITCH extensions.",
+				"",
+				"Authority: packages/telephony/src/hangup-causes.ts, itself pinned against the frozen",
+				"reference §6 by its own spec. This is a GENERATED COPY so that Go and TypeScript read one",
+				"table: renaming a member is a breaking change for every stored CDR row, and re-coding one",
+				"silently changes outbound failover, so neither may be decided twice.",
+				"",
+				"apps/sipd/internal/dialog/cause.go defines its Cause* constants in terms of the HangupCode*",
+				"constants here. The SIP status -> Q.850 mapping stays in sipd: that one IS the edge's own",
+				"knowledge (RFC 3398), and nothing outside the SIP stack has an opinion about it.",
+			],
+			"events",
+		),
+	);
+}
+
 function emitGo(
 	eventSchemas: Map<string, JsonSchema>,
 	rpcSchemas: Map<string, { request: JsonSchema; response: JsonSchema }>,
@@ -251,6 +445,8 @@ function emitGo(
 			"events",
 		),
 	);
+
+	emitHangupCauses();
 
 	// -- one file per family ----------------------------------------------------------------------
 	for (const family of FAMILY_ORDER) {
@@ -407,6 +603,11 @@ const DEVICE_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b50";
 const MAILBOX_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51";
 const MESSAGE_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b52";
 const SESSION_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53";
+/** The supervisor's own leg and call, for the tap samples: a tap names two calls, never one. */
+const SUPERVISOR_LEG_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b54";
+const SUPERVISOR_CALL_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b55";
+const PAGING_GROUP_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b56";
+const TRUNK_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57";
 const MEDIAD_INSTANCE = "mediad-7c9f2a1b";
 /** DIDs in the two shapes the index has to reconcile: as stored, and as a carrier delivers it. */
 const DID_STORED = "+441632960111";
@@ -425,6 +626,19 @@ const DID_CASES = [
 	"+1 (212) 555-0100",
 	"+1-212-555-0100",
 	"0044 1632 960111",
+];
+
+// Instance ids that exercise both branches of instanceSubjectToken: verbatim when the id is already
+// one subject token, SHA-256/32-hex when it carries a dot or punctuation. The engine builds
+// rpc.sip.v1.<verb>.<tok> from these and apps/sipd subscribes with them, so a Go/TS disagreement is a
+// command addressed at a subject nobody is listening on.
+const INSTANCE_ID_CASES = [
+	"sipd",
+	"sipd-2",
+	"engine-7d9f4c-xk2lp",
+	"  sipd  ",
+	"sipd.eu-west.internal",
+	"host name with spaces",
 ];
 
 const AOR_CASES = [
@@ -504,6 +718,79 @@ function eventSamples(): readonly {
 				objectKey: "recordings/2026/08/05/leg-a.wav",
 				kind: "call",
 				stereo: false,
+			},
+		}),
+	});
+
+	samples.push({
+		name: "call.tap.started",
+		goType: "CallTapStartedData",
+		envelope: makeCallEvent("call.tap.started", {
+			...next(),
+			orgId: ORG_A,
+			// The subject is the MONITORED call, not the supervisor's — see the schema's own note.
+			callId: CALL_A,
+			data: {
+				legId: SUPERVISOR_LEG_A,
+				mode: "whisper",
+				supervisorExtension: "1900",
+				targetExtension: "1001",
+				targetLegId: LEG_A,
+				previousMode: "eavesdrop",
+				supervisorCallId: SUPERVISOR_CALL_A,
+			},
+		}),
+	});
+	samples.push({
+		name: "call.tap.ended",
+		goType: "CallTapEndedData",
+		envelope: makeCallEvent("call.tap.ended", {
+			...next(),
+			orgId: ORG_A,
+			callId: CALL_A,
+			data: {
+				legId: SUPERVISOR_LEG_A,
+				mode: "whisper",
+				supervisorExtension: "1900",
+				targetExtension: "1001",
+				reason: "target-ended",
+				durationMs: 42_000,
+			},
+		}),
+	});
+	samples.push({
+		name: "call.paging.started",
+		goType: "CallPagingStartedData",
+		envelope: makeCallEvent("call.paging.started", {
+			...next(),
+			orgId: ORG_A,
+			callId: CALL_A,
+			data: {
+				legId: LEG_A,
+				pagingGroupId: PAGING_GROUP_A,
+				pagingGroupName: "Warehouse",
+				dialed: "*81300",
+				pagerExtension: "1001",
+				memberCount: 12,
+				// Two handsets were unregistered. The whole point of carrying both numbers.
+				answeredCount: 10,
+				oneWay: true,
+			},
+		}),
+	});
+	samples.push({
+		name: "call.paging.ended",
+		goType: "CallPagingEndedData",
+		envelope: makeCallEvent("call.paging.ended", {
+			...next(),
+			orgId: ORG_A,
+			callId: CALL_A,
+			data: {
+				legId: LEG_A,
+				pagingGroupId: PAGING_GROUP_A,
+				pagingGroupName: "Warehouse",
+				durationMs: 9_500,
+				answeredCount: 10,
 			},
 		}),
 	});
@@ -673,6 +960,23 @@ function eventSamples(): readonly {
 	});
 
 	samples.push({
+		name: "trunk.status.changed",
+		goType: "TrunkStatusChangedData",
+		envelope: makeTrunkEvent("status.changed", {
+			...next(),
+			source: "engine",
+			orgId: ORG_A,
+			trunkId: TRUNK_A,
+			data: {
+				status: "down",
+				reason: "Unreachable",
+				latencyMs: 1_240,
+				endpoint: "carrier-a",
+			},
+		}),
+	});
+
+	samples.push({
 		name: "cdr.leg.write",
 		goType: "CDRLegWriteData",
 		envelope: makeCdrLegWriteEvent({
@@ -771,6 +1075,18 @@ function parityGolden(): unknown {
 			subject: subjectFor.registration(ORG_A, aorSubjectToken(AOR_CASES[4] as string), "expired"),
 		},
 		{
+			builder: "sipDialog",
+			args: [ORG_A, LEG_A, "dialog.answered"],
+			subject: subjectFor.sipDialog(ORG_A, LEG_A, "dialog.answered"),
+		},
+		{
+			// A dotted event on the second root that begins `sip.`, so a Go builder that confused
+			// `sip.evt` with `sip.reg` fails here rather than at three in the morning.
+			builder: "sipDialog",
+			args: [ORG_B, LEG_A, "dialog.terminated"],
+			subject: subjectFor.sipDialog(ORG_B, LEG_A, "dialog.terminated"),
+		},
+		{
 			builder: "queue",
 			args: [ORG_A, QUEUE_A, "caller.joined"],
 			subject: subjectFor.queue(ORG_A, QUEUE_A, "caller.joined"),
@@ -799,6 +1115,11 @@ function parityGolden(): unknown {
 			builder: "media",
 			args: [ORG_A, SESSION_A, "session.rtp-timeout"],
 			subject: subjectFor.media(ORG_A, SESSION_A, "session.rtp-timeout"),
+		},
+		{
+			builder: "trunk",
+			args: [ORG_A, TRUNK_A, "status.changed"],
+			subject: subjectFor.trunk(ORG_A, TRUNK_A, "status.changed"),
 		},
 		{ builder: "cdrLeg", args: [ORG_A], subject: subjectFor.cdrLeg(ORG_A) },
 		{ builder: "audit", args: [ORG_A], subject: subjectFor.audit(ORG_A) },
@@ -835,6 +1156,17 @@ function parityGolden(): unknown {
 			args: [ORG_A, "expired"],
 			result: subjectFilterFor.registrationEventInOrg(ORG_A, "expired"),
 		},
+		{ filter: "allSipDialogs", args: [], result: subjectFilterFor.allSipDialogs() },
+		{
+			filter: "sipDialogsInOrg",
+			args: [ORG_A],
+			result: subjectFilterFor.sipDialogsInOrg(ORG_A),
+		},
+		{
+			filter: "sipDialog",
+			args: [ORG_A, LEG_A],
+			result: subjectFilterFor.sipDialog(ORG_A, LEG_A),
+		},
 		{ filter: "allQueues", args: [], result: subjectFilterFor.allQueues() },
 		{ filter: "queuesInOrg", args: [ORG_A], result: subjectFilterFor.queuesInOrg(ORG_A) },
 		{ filter: "queue", args: [ORG_A, QUEUE_A], result: subjectFilterFor.queue(ORG_A, QUEUE_A) },
@@ -867,6 +1199,13 @@ function parityGolden(): unknown {
 			args: [ORG_A, "session.ended"],
 			result: subjectFilterFor.mediaEventInOrg(ORG_A, "session.ended"),
 		},
+		{ filter: "allTrunks", args: [], result: subjectFilterFor.allTrunks() },
+		{ filter: "trunksInOrg", args: [ORG_A], result: subjectFilterFor.trunksInOrg(ORG_A) },
+		{
+			filter: "trunkStatusInOrg",
+			args: [ORG_A],
+			result: subjectFilterFor.trunkStatusInOrg(ORG_A),
+		},
 		{ filter: "allCdrLegs", args: [], result: subjectFilterFor.allCdrLegs() },
 		{ filter: "cdrLegsInOrg", args: [ORG_A], result: subjectFilterFor.cdrLegsInOrg(ORG_A) },
 		{ filter: "allAudit", args: [], result: subjectFilterFor.allAudit() },
@@ -881,6 +1220,7 @@ function parityGolden(): unknown {
 		subjectFor.queue(ORG_A, QUEUE_A, "caller.joined"),
 		subjectFor.voicemail(ORG_A, MAILBOX_A, "message.left"),
 		subjectFor.media(ORG_A, SESSION_A, "session.rtp-timeout"),
+		subjectFor.trunk(ORG_A, TRUNK_A, "status.changed"),
 		subjectFor.cdrLeg(ORG_A),
 		subjectFor.audit(ORG_A),
 		subjectFor.provision(ORG_A),
@@ -927,6 +1267,10 @@ function parityGolden(): unknown {
 		rpcSubjects: RPC_SUBJECTS,
 		queueScopeAll: QUEUE_SCOPE_ALL,
 		aorSubjectTokens: AOR_CASES.map((aor) => ({ aor, token: aorSubjectToken(aor) })),
+		instanceSubjectTokens: INSTANCE_ID_CASES.map((instanceId) => ({
+			instanceId,
+			token: instanceSubjectToken(instanceId),
+		})),
 		didIndexTokens: DID_CASES.map((did) => ({ did, token: didIndexToken(did) })),
 		subjectBuilders,
 		subjectFilters,
@@ -971,7 +1315,19 @@ function parityGolden(): unknown {
 				args: [ORG_A, QUEUE_A],
 				key: kvKeyFor.queueMembership(ORG_A, QUEUE_A),
 			},
+			{
+				builder: "queueWaiting",
+				args: [ORG_A, QUEUE_A],
+				key: kvKeyFor.queueWaiting(ORG_A, QUEUE_A),
+			},
 			{ builder: "mediaSession", args: [SESSION_A], key: kvKeyFor.mediaSession(SESSION_A) },
+			{ builder: "sipDialog", args: [LEG_A], key: kvKeyFor.sipDialog(LEG_A) },
+			{ builder: "trunk", args: [ORG_A, TRUNK_A], key: kvKeyFor.trunk(ORG_A, TRUNK_A) },
+			// The one key in this file that TRANSFORMS its argument. Both writers and the reader go
+			// through one function; these vectors are what makes "both" true across the language
+			// border, and a Go folder that dropped the slash would produce a key nobody else writes.
+			{ builder: "sipAcl", args: ["203.0.113.0/24"], key: kvKeyFor.sipAcl("203.0.113.0/24") },
+			{ builder: "sipAcl", args: ["2001:db8::/32"], key: kvKeyFor.sipAcl("2001:db8::/32") },
 		],
 		streams: EVENT_STREAMS.map((definition: StreamDefinition) => ({ ...definition })),
 		kvBuckets: KV_BUCKETS.map((definition: KvBucketDefinition) => ({ ...definition })),
@@ -984,6 +1340,7 @@ function parityGolden(): unknown {
 			queue: [...QUEUE_EVENTS],
 			voicemail: [...VOICEMAIL_EVENTS],
 			media: [...MEDIA_SESSION_EVENTS],
+			trunk: [...TRUNK_EVENTS],
 		},
 		eventTypes: EVENT_ENTRIES.map((entry) => ({
 			family: entry.family,

@@ -139,6 +139,48 @@ export class RoutingArtifactSource implements OnModuleInit, OnApplicationShutdow
 		return await pending;
 	}
 
+	/**
+	 * Resolves a media-server endpoint name back to the trunk row it dials.
+	 *
+	 * The dial template (`PJSIP/{number}@{trunk}`) substitutes the trunk's NAME for `{trunk}`, so
+	 * the PJSIP endpoint the qualify pings IS the trunk name — and the compiled artifact's
+	 * `trunk-dial` attempts carry both that name and the `trunkId` beside it, which makes the
+	 * artifact the reverse index this lookup needs. The scan walks every artifact this process
+	 * holds, because a `PeerStatusChange` arrives with no organization on it at all: the
+	 * organization is the ANSWER here, not an input.
+	 *
+	 * Memory-only, deliberately. A qualify tick must not become a KV read or a compile — the miss
+	 * path exists for calls, which have a caller waiting, and a trunk status has nobody waiting.
+	 * The cache is well populated in practice because the KV watch above `remember`s every
+	 * artifact any API instance compiles, not only the ones this engine has routed calls with; an
+	 * endpoint this process cannot name is reported as unresolved and the publisher says so once.
+	 *
+	 * A linear scan and not an index, on the numbers: artifacts are per-organization, trunk-dial
+	 * nodes are a handful per artifact, and a transition (not a tick — see `toMediaEvent`) is the
+	 * only caller. An index would be a second copy of the artifacts to keep coherent for an event
+	 * that fires when a carrier goes down.
+	 */
+	findTrunkEndpoint(
+		endpointName: string,
+	): { readonly organizationId: string; readonly trunkId: string } | undefined {
+		for (const entry of this.cache.values()) {
+			for (const node of Object.values(entry.artifact.nodes)) {
+				if (node.kind !== "trunk-dial") {
+					continue;
+				}
+				for (const attempt of node.attempts) {
+					if (attempt.name === endpointName) {
+						return {
+							organizationId: entry.artifact.organizationId,
+							trunkId: attempt.trunkId,
+						};
+					}
+				}
+			}
+		}
+		return undefined;
+	}
+
 	/** Drops one organization's memory copy. The KV watch calls it; so may an operator endpoint. */
 	invalidate(organizationId: string): void {
 		if (this.cache.delete(organizationId)) {

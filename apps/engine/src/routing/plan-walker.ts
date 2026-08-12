@@ -2,8 +2,14 @@ import { createEntityId } from "@optimiq-voice/identifiers";
 import { evaluateTimeCondition, matchPattern } from "@optimiq-voice/routing";
 import { RETRYABLE_HANGUP_CAUSES } from "@optimiq-voice/telephony";
 import { QueueSession } from "../queue/queue-session";
+import { AUTO_ANSWER_VARIABLES } from "./auto-answer";
 import { legSignalKey, recordingSignalKey } from "./call-signals";
-import { DEFAULT_MEDIA_REF_SETTINGS, resolveMediaRef, translateMediaRef } from "./media-refs";
+import {
+	DEFAULT_MEDIA_REF_SETTINGS,
+	resolveMediaRef,
+	resolveMediaRefOrExplain,
+	translateMediaRef,
+} from "./media-refs";
 import { planDestinationOf, sameDestination } from "./plan-destination";
 import { orderTrunkAttempts } from "./trunk-selection";
 import { verifyPinDigest, verifyVoicemailPin } from "./voicemail-pin";
@@ -13,6 +19,7 @@ import type {
 	QueueDialAttempt,
 	QueueDialOutcome,
 	QueueServices,
+	QueueOutcome,
 	QueueSessionSettings,
 } from "../queue/queue-session";
 import type { CallSignalBus, LegSignal } from "./call-signals";
@@ -20,20 +27,27 @@ import type { ConferenceRegistry } from "./conference-registry";
 import type { MediaRefSettings } from "./media-refs";
 import type { PlanDestination } from "./plan-destination";
 import type { TrunkCapacityPort } from "./trunk-capacity";
-import type { CallEvent } from "@optimiq-voice/events";
+import type { CallEvent, ExtensionFeature } from "@optimiq-voice/events";
 import type {
+	ApplicationPlanNode,
 	CompiledTimeCondition,
+	CompiledPinEntry,
+	CompiledPinSet,
 	ConferencePlanNode,
+	DialByNamePlanNode,
+	DirectoryEntry,
 	ExecutionPlan,
 	ExtensionPlanNode,
 	FollowMeDestination,
 	FollowMePlan,
 	IvrMenuPlanNode,
 	MailboxEntry,
+	PagingPlanNode,
 	PlanNode,
 	PlanNodeId,
 	QueuePlanNode,
 	RingGroupPlanNode,
+	StreamPlanNode,
 	TrunkDialPlanNode,
 	VoicemailPlanNode,
 } from "@optimiq-voice/routing";
@@ -97,10 +111,29 @@ import type {
  * points both at one node. `feature-code` now serves directed (`**<ext>`) and group (`*8`) pickup
  * for real, through the same call-control runtime.
  *
- * Placeholder, and honest about it: `voicemail` records but has no mailbox, no MWI and no email;
- * `feature-code` serves `*97` as that placeholder and answers everything else with an announcement;
- * `application` announces and hangs up. Every one of them adds a line to {@link WalkOutcome.notes},
- * so a call that hit a gap says so in the log rather than looking like a routing bug.
+ * Also real, and the reason this class grew a second half: the SELF-SERVICE star codes.
+ * `*72`/`*74`/`*76` (forward all / busy / no answer), `*78` (do not disturb) and `*21` (follow me)
+ * send `rpc.pbx.v1.extension-feature` and confirm or refuse audibly; `*69` reads the call ledger
+ * over `rpc.pbx.v1.last-caller` and dials the result back through the same routing the caller would
+ * have got by hand; `*43` hands the leg to the media plane's echo; `*99` records a mailbox greeting
+ * behind the same PIN gate `*97` uses. `*97` and `*98` are now reachable from the star-code
+ * CATALOGUE rather than only from the `voicemailPrefix` settings — see
+ * {@link PlanWalker.voicemailCode} for the gap that closed. Every one of them needs its port
+ * ({@link PlanWalkerDependencies.features}, `lastCaller`, `greetings`, `control`, `application`);
+ * without one the code or destination announces and says so, which is exactly what it did before
+ * this wave.
+ *
+ Supervision and intercom joined them in this wave: `*0` authorizes against
+ * {@link PlanWalkerDependencies.supervision} and hands the tap to `control.monitor`, `*80` dials an
+ * extension with the auto-answer headers, and a `paging` node fans out to a whole group.
+ *
+ * Placeholder, and honest about it: `voicemail` records but has no MWI and no email; the remaining
+ * feature codes (`record-toggle`, `transfer`, `queue-toggle`, `agent-status`, and `paging` as a
+ * CODE rather than a node) answer with an announcement; call
+ * screening is implemented behind a default-off setting whose remaining seams
+ * {@link PlanWalker.screenCall} names one by one. Every one of them adds a line to
+ * {@link WalkOutcome.notes}, so a call that hit a gap says so in the log rather than looking like a
+ * routing bug.
  */
 
 /** The A-leg, as the walker sees it. Every member is live: the orchestrator owns the state. */
@@ -141,6 +174,63 @@ export interface WalkerChannel {
  * Absent means the park lot and the pickup codes announce and hang up exactly as they did before
  * this wave, and say so in the notes.
  */
+/**
+ * Hands the A-leg to a named external application — the `application` destination.
+ *
+ * ## Why a seam, and why it is the ONLY one shaped like this
+ *
+ * Every other port here answers a question and returns. This one takes the call away: from the
+ * moment it is entered until the promise settles, something outside this process is deciding what
+ * the caller hears. That is the destination's whole meaning, and it is why the node awaits rather
+ * than dispatching — a walk that carried on would run the plan's failover path underneath a live
+ * conversation.
+ *
+ * The runtime is `apps/engine/src/session/application-sessions.ts`. It is a PORT here, and optional,
+ * for the reason every optional dependency on this interface is: a spec about an IVR should not have
+ * to stand up a broker, and an engine with no control plane reachable should announce rather than
+ * hang, which is exactly what its absence produces.
+ */
+export interface WalkerApplicationPort {
+	run(request: {
+		readonly application: string;
+		readonly arguments?: Readonly<Record<string, string>>;
+	}): Promise<
+		| { readonly kind: "unavailable"; readonly reason: string }
+		| { readonly kind: "hangup"; readonly cause: HangupCause }
+		| { readonly kind: "aborted" }
+	>;
+}
+
+/** What a queued caller's stay produced, as the CDR records it. */
+export interface WalkerQueueOutcome {
+	readonly queueId: string;
+	readonly waitMs: number;
+	readonly outcome:
+		| "answered"
+		| "caller-hangup"
+		| "timeout"
+		| "overflow"
+		| "no-agents"
+		| "exit-key";
+	/** The `queue_agent` who took the call. Only ever set on `answered`. */
+	readonly agentId?: string;
+}
+
+/**
+ * Which authorisation code opened an outbound route, as the CDR records it.
+ *
+ * Never the digits — see {@link PlanWalkerDependencies.onPinAuthorization}. The `ordinal` is the
+ * identity a tenant chose in a form ("code 3, the night desk"), which is why it is a value and not
+ * a row position, and the `label` is the same fact in words for a report that has no set to join
+ * against.
+ */
+export interface PinAuthorization {
+	readonly pinSetId: string;
+	readonly pinSetEntryId: string;
+	readonly ordinal: number;
+	readonly label?: string;
+}
+
 export interface WalkerCallControl {
 	/** Parks the A-leg. `orbit` is what the caller dialled after the code, when they dialled one. */
 	park(request: {
@@ -159,6 +249,113 @@ export interface WalkerCallControl {
 		readonly kind: "directed" | "group";
 		readonly extension: string;
 	}): Promise<{ readonly ok: boolean; readonly reason?: string }>;
+	/**
+	 * Re-enters routing for a number this walk decided to dial on the caller's behalf — `*69`.
+	 *
+	 * The walker holds the artifact's whole node table, so it can find an EXTENSION by number
+	 * without help; what it cannot do is resolve an arbitrary string, because that needs the number
+	 * index and the outbound match table, neither of which travels with a plan. `*69` returning a
+	 * mobile is exactly that case, and the alternative to this seam would be the walker inventing a
+	 * trunk for a number it read out of a CDR — the toll-fraud boundary, given away by a feature.
+	 *
+	 * The orchestrator answers it by resolving the digits as if the CALLER had dialled them:
+	 * internal first, then outbound, where the toll-class gate, the outbound kill switch and the
+	 * call-block screen all apply. So `*69` can never reach somewhere the same handset could not.
+	 *
+	 * The outcome mirrors a walk's, because that is what happens on the other side: `unresolved`
+	 * means nothing matched and the leg is untouched; every other value means a walk ran on this leg
+	 * and has already left it wherever it left it.
+	 */
+	dial(request: { readonly destination: string }): Promise<{
+		readonly status: WalkStatus | "unresolved";
+		readonly cause?: HangupCause;
+		readonly reason?: string;
+	}>;
+	/**
+	 * Joins the A-leg to a conversation somebody else is having — `*0`, and the DTMF escalation
+	 * that follows it.
+	 *
+	 * ## Why this is a seam and not something the walker does itself
+	 *
+	 * For the same reason `pickup` is. The walker holds a PLAN — one call's node table — and a
+	 * supervision request is about a call it has never heard of: finding the live legs of extension
+	 * `1001` means scanning the engine's channel registry, which is instance state the walker
+	 * deliberately has no handle on. The orchestrator owns that index (it is the same scan
+	 * `ringingCandidates` does for `*8`), so it owns this.
+	 *
+	 * The walker's remaining job is the part that IS routing: reading the argument, refusing without
+	 * one, and — before any of this is called — asking whether the caller is allowed. Authorization
+	 * happens on the walker's side of the seam on purpose, so that a future caller of `monitor`
+	 * cannot reach a tap by skipping the gate.
+	 *
+	 * ## The outcome is `bridged` or a reason
+	 *
+	 * `ok` means the supervisor's leg is in a bridge with a tap and the walk is over, exactly as it
+	 * is over after a queue answer. Everything else is a string the walk turns into an announcement:
+	 * nobody is on a call, the media plane cannot tap, the target hung up during setup. None of them
+	 * may end in silence.
+	 */
+	monitor(request: {
+		/** The extension whose conversation is being joined. */
+		readonly extension: string;
+		/** Where the supervisor starts. Always `eavesdrop` from `*0`; DTMF moves it afterwards. */
+		readonly mode: SupervisionMode;
+	}): Promise<{ readonly ok: boolean; readonly reason?: string }>;
+	/**
+	 * Starts recording the conversation the A-leg is in — the seam a queue's record policy reaches.
+	 *
+	 * Optional on this interface, unlike its siblings, because it arrived with the contact-centre
+	 * wave and a walk built against an older control port must keep working: its absence is a queue
+	 * that connects the call and notes that it could not record, which is exactly the degradation
+	 * every other missing port here produces.
+	 *
+	 * The same operation the record-toggle feature code performs, deliberately, so that a queue
+	 * recording is indistinguishable downstream from an on-demand one — one `channel.record.started`,
+	 * one object key, one retention rule, one signed-URL endpoint.
+	 */
+	startRecording?(): Promise<{ readonly ok: boolean; readonly reason?: string }>;
+}
+
+/**
+ * What a supervisor is doing to a call they did not place.
+ *
+ * Mirrors `TAP_MODES` in `packages/events` rather than importing it, on the same terms the rest of
+ * this file mirrors domain vocabularies: the walker's contract is with its own callers, and a type
+ * alias here that happened to be structurally identical is exactly what the parity specs are for.
+ */
+export type SupervisionMode = "eavesdrop" | "whisper" | "barge";
+
+/** What the walker asks the control plane before it lets anybody listen. */
+export interface SupervisorAuthzRequest {
+	readonly organizationId: string;
+	/** The handset that dialled `*0`, as the SIP edge authenticated it. A claim — see the port. */
+	readonly extensionNumber: string;
+	/** The extension it asked to monitor. Carried so a denial can name what was refused. */
+	readonly targetExtension: string;
+	/** The supervisor's own call, for correlation in the responder's audit line. */
+	readonly callId?: string;
+}
+
+export interface SupervisorDecision {
+	readonly allowed: boolean;
+	/** Why not. For the LOG and the support ticket; never played to the handset. */
+	readonly reason?: string;
+}
+
+/**
+ * The gate in front of `*0`.
+ *
+ * A port rather than a compiled flag because the answer belongs to the permission model, not to
+ * telephony — see `supervisor-authz.source.ts` for the whole argument. Optional on
+ * {@link PlanWalkerDependencies} in the sense that a walk built without one REFUSES: there is no
+ * "no port, therefore allowed" branch anywhere in this file, and there must never be one.
+ */
+export interface SupervisorAuthzPort {
+	/**
+	 * @returns a decision. Implementations do not throw — a failure is a DENIAL, because the
+	 * alternative is a broker outage during which anyone may listen to anything.
+	 */
+	authorize(request: SupervisorAuthzRequest): Promise<SupervisorDecision>;
 }
 
 /** Deployment-shaped knobs. All of them have defaults; none of them is a routing decision. */
@@ -194,6 +391,32 @@ export interface PlanWalkerSettings {
 	readonly voicemailGreeting: string;
 	/** Played for the node kinds this slice does not implement. */
 	readonly unavailableAnnouncement: string;
+	/**
+	 * Played when a feature code SWITCHED SOMETHING ON, and its opposite when it switched it off.
+	 *
+	 * Two announcements rather than one confirmation tone, because a bare `*72` is a TOGGLE and the
+	 * caller pressed the same digits either way: a single beep would leave them with no idea whether
+	 * their calls now go to their mobile or back to their desk, which is precisely the question they
+	 * dialled the code to settle. `activated` and `de-activated` are in Asterisk's core sound
+	 * package — the same standard the PIN prompts hold to — so this works on a stock install with no
+	 * prompt pack.
+	 */
+	readonly featureActivatedAnnouncement: string;
+	readonly featureDeactivatedAnnouncement: string;
+	/**
+	 * Played to a caller who dialled `*43`, before the echo starts.
+	 *
+	 * A prompt rather than dropping straight into echo, because an echo test with no preamble is
+	 * indistinguishable from a broken call: the caller hears themselves a beat later and assumes the
+	 * line is faulty. `demo-echotest` is Asterisk's own wording for exactly this and ships with the
+	 * core sounds; a deployment with no such file gets a failed playback, which is noted and does not
+	 * stop the echo.
+	 */
+	readonly echoTestPrompt: string;
+	/** Longest greeting `*99` will record. Beyond it the recording is closed and filed as it stands. */
+	readonly greetingMaxSeconds: number;
+	/** Played after `*99` has filed a greeting, so the user knows it took. */
+	readonly greetingRecordedAnnouncement: string;
 	/** Asked for before a mailbox with a PIN is opened. */
 	readonly voicemailPinPrompt: string;
 	/** Played after a wrong PIN, before the next attempt. */
@@ -207,6 +430,30 @@ export interface PlanWalkerSettings {
 	readonly voicemailMenuTimeoutMs: number;
 	/** Replays of one message before `2` stops being honoured. */
 	readonly voicemailMaxReplays: number;
+	/**
+	 * Asked for before a pin-gated OUTBOUND route is dialled.
+	 *
+	 * `agent-pass` is Asterisk's own "please enter your password" and is in the core sound package,
+	 * so an authorisation-code gate works on a stock install with no prompt pack — the same standard
+	 * the mailbox and room PIN prompts hold to. A PIN set that carries its own `promptId` overrides
+	 * it, which is what a tenant who recorded "please enter your international calling code" gets.
+	 */
+	readonly outboundPinPrompt: string;
+	/** Played after a wrong authorisation code, before the next attempt. */
+	readonly outboundPinInvalidPrompt: string;
+	/** Played when the attempts are exhausted, before the call is refused. */
+	readonly outboundPinFailurePrompt: string;
+	/**
+	 * Longest authorisation code that will be collected.
+	 *
+	 * The ATTEMPT budget is not here: it is `CompiledPinSet.maxAttempts`, per set, because how many
+	 * guesses an international-calling code is worth is a tenant's decision and they made it in a
+	 * form. The digit timeout is per set too (`digitTimeoutMs`). Only the ceiling on how many digits
+	 * a code may be is a platform fact, and it exists so a caller leaning on a key cannot make the
+	 * gather run forever.
+	 */
+	readonly outboundPinMaxDigits: number;
+	readonly outboundPinInterDigitTimeoutMs: number;
 	/** Asked for before a room with a PIN is opened. */
 	readonly conferencePinPrompt: string;
 	/** Played after a wrong room PIN, before the next attempt. */
@@ -218,6 +465,37 @@ export interface PlanWalkerSettings {
 	readonly conferencePinInterDigitTimeoutMs: number;
 	/** Played when a room is at `maxMembers`. */
 	readonly conferenceFullAnnouncement: string;
+	/**
+	 * Played when a moderator has LOCKED the room.
+	 *
+	 * A different prompt from {@link conferenceFullAnnouncement}, and a different sound file, because
+	 * they ask the caller to do opposite things: a full room admits them the moment somebody leaves,
+	 * and a locked one does not admit them until the meeting is over. `conf-locked` is Asterisk's own
+	 * word for exactly this state, which is why the FULL announcement is the one that had to move —
+	 * it was borrowing this prompt while there was nothing to lock.
+	 */
+	readonly conferenceLockedAnnouncement: string;
+	/**
+	 * Beeped INTO the room when a participant joins, and its partner when one leaves.
+	 *
+	 * `tone:` and not `sound:`, and that is the whole reason these can be defaulted at all: a tone is
+	 * GENERATED, so a stock deployment with no prompt pack still beeps. `mediad` synthesises it and
+	 * Asterisk has a tone zone; neither needs a file mounted.
+	 */
+	readonly conferenceEntryTone: string;
+	readonly conferenceExitTone: string;
+	/**
+	 * Played to the room around a name announcement, when `announceJoinLeave` is on.
+	 *
+	 * The NAME itself is not here, and its absence is the honest half of this feature: announcing who
+	 * joined needs a recording of the participant saying their name, which needs a record-and-hold
+	 * step at the gate and a place to keep the clip for the life of the room. This release plays the
+	 * generic form — "someone has joined the conference" — which is what every stock prompt package
+	 * ships and what an operator can act on. The per-participant recording is named as the seam in
+	 * `conferenceNode`.
+	 */
+	readonly conferenceJoinAnnouncement: string;
+	readonly conferenceLeaveAnnouncement: string;
 	/** How long a participant holds for a moderator before the call is given up on. */
 	readonly conferenceModeratorWaitMs: number;
 	/**
@@ -246,6 +524,89 @@ export interface PlanWalkerSettings {
 	readonly confirmAttempts: number;
 	/** How long one prompt waits for a digit. Long: a mobile's speaker has to reach an ear first. */
 	readonly confirmTimeoutMs: number;
+	/**
+	 * How long an intercom's auto-answered leg has to come up before the code gives up.
+	 *
+	 * Much shorter than an ordinary ring timeout, and that is the point: an intercom that has not
+	 * auto-answered within a few seconds is a handset that is NOT configured to auto-answer, and what
+	 * the caller wants then is to be told so, not to stand there listening to a phone ring across the
+	 * office. Five seconds is roughly two rings — long enough to cover a slow re-registration, short
+	 * enough that the failure is obviously a failure.
+	 */
+	readonly intercomTimeoutSeconds: number;
+	/**
+	 * Whether the CALL SCREENING runtime runs at all. Default `false`, deliberately.
+	 *
+	 * The plumbing is complete — `ExtensionPlanNode.callScreening` is compiled, read, and honoured in
+	 * the documented precedence chain — and the runtime behind this flag is honest but partial; the
+	 * remaining seams are named on {@link PlanWalker.screenCall}. Shipping it default-ON would put
+	 * fifteen seconds of "record your name" on the front of every external call to every extension a
+	 * tenant happened to have ticked the box for, and the first person to find out would be a
+	 * customer. Default-OFF means a tenant who ticked the box gets what they got before (the phone
+	 * rings), which is the safe half of the difference, and a deployment that wants to try the
+	 * feature turns it on knowing what is missing.
+	 */
+	readonly callScreeningEnabled: boolean;
+	/**
+	 * Asked of an external caller before their name is recorded.
+	 *
+	 * `vm-rec-name` is Asterisk's own "record your name after the tone" prompt and is in the core
+	 * sound package, so screening works on a stock install with no prompt pack — the same standard
+	 * the PIN and confirmation prompts hold to.
+	 */
+	readonly screeningRecordPrompt: string;
+	/** Longest name a screened caller may record before the recording is closed as it stands. */
+	readonly screeningRecordSeconds: number;
+	/**
+	 * Played to the CALLEE immediately before the recorded name.
+	 *
+	 * `priv-callerintros` is Asterisk's own "call from" fragment, which is exactly the sentence being
+	 * assembled: this prompt, then the caller's own voice, then the accept/reject question.
+	 */
+	readonly screeningIntroPrompt: string;
+
+	// --- dial by name ----------------------------------------------------------------------------
+	/**
+	 * The directory's opening prompt, when the node names none of its own.
+	 *
+	 * Every default in this block is one of `app_directory`'s own sounds, for the reason every other
+	 * default in this file is a core sound: a tenant who switched dial-by-name on and recorded
+	 * nothing still gets a working directory rather than silence with a gather behind it.
+	 */
+	readonly directoryGreeting: string;
+	/** Played before each RETRY. `dir-instr` is "enter the first letters of the name". */
+	readonly directoryInstructions: string;
+	/** Played when the digits match nobody, when the node names no prompt of its own. */
+	readonly directoryNoMatchPrompt: string;
+	/**
+	 * The two halves of "please press 1 to select this person", and the digit between them.
+	 *
+	 * Three settings for one sentence because the verb surface plays ONE media per `play`, and
+	 * Asterisk assembles this sentence from `dir-multi1` + the spoken digit + `dir-multi2`. Building
+	 * it the same way means the accept digit can be changed without re-recording anything: the
+	 * spoken digit is rendered as `digits:<n>`, which is a GENERATED media the media server
+	 * synthesises, so there is no file to be missing.
+	 */
+	readonly directorySelectPrefix: string;
+	readonly directorySelectSuffix: string;
+	/** The one digit that connects. Anything else moves on to the next match. */
+	readonly directorySelectDigit: string;
+	/** Longest name-spelling a caller may enter before the gather closes. */
+	readonly directoryMaxDigits: number;
+	readonly directoryTimeoutMs: number;
+	readonly directoryInterDigitTimeoutMs: number;
+	/** How long one offered name waits for its accept digit. Short: the caller is listening for it. */
+	readonly directorySelectTimeoutMs: number;
+	/**
+	 * How many matching people are offered before the caller is asked to spell more.
+	 *
+	 * A bound rather than the whole list, because a caller who typed `S` in a company of four
+	 * hundred should be asked for more letters, not read four hundred names. The compiler cannot
+	 * make this decision — it does not know how long the audience will listen — so it compiles every
+	 * entry and this decides how many of them one round offers.
+	 */
+	readonly directoryMaxOffers: number;
+
 	readonly mediaRefs: MediaRefSettings;
 }
 
@@ -260,6 +621,16 @@ export const DEFAULT_PLAN_WALKER_SETTINGS: PlanWalkerSettings = {
 	recordingFormat: "wav",
 	voicemailGreeting: "sound:unavailable",
 	unavailableAnnouncement: "sound:unavailable",
+	// `activated`, `de-activated` and `demo-echotest` are all in Asterisk's core sound package, so
+	// the feature codes confirm themselves on a stock install with no prompt pack — the same
+	// standard the PIN and confirmation prompts hold to.
+	featureActivatedAnnouncement: "sound:activated",
+	featureDeactivatedAnnouncement: "sound:de-activated",
+	echoTestPrompt: "sound:demo-echotest",
+	// A minute. A greeting people actually listen to is fifteen seconds; the cap is there to stop a
+	// forgotten handset writing an hour of room noise into the media store, not to shape the message.
+	greetingMaxSeconds: 60,
+	greetingRecordedAnnouncement: "sound:activated",
 	// `vm-password` and `vm-incorrect` are in Asterisk's core sound package, so a PIN challenge
 	// works on a stock install with no prompt pack — the same standard the digit readback holds to.
 	voicemailPinPrompt: "sound:vm-password",
@@ -273,13 +644,30 @@ export const DEFAULT_PLAN_WALKER_SETTINGS: PlanWalkerSettings = {
 	// `conf-getpin`, `conf-invalidpin` and `conf-locked` are all in Asterisk's core sound package,
 	// so a PIN-gated room works on a stock install with no prompt pack — the same standard the
 	// mailbox challenge holds to.
+	outboundPinPrompt: "sound:agent-pass",
+	outboundPinInvalidPrompt: "sound:auth-incorrect",
+	outboundPinFailurePrompt: "sound:auth-thankyou",
+	outboundPinMaxDigits: 12,
+	outboundPinInterDigitTimeoutMs: 3_000,
 	conferencePinPrompt: "sound:conf-getpin",
 	conferencePinInvalidPrompt: "sound:conf-invalidpin",
 	conferencePinAttempts: 3,
 	conferencePinMaxDigits: 10,
 	conferencePinTimeoutMs: 10_000,
 	conferencePinInterDigitTimeoutMs: 3_000,
-	conferenceFullAnnouncement: "sound:conf-locked",
+	// `conf-full` and `conf-locked` are both in Asterisk's core sound package, and they were one
+	// prompt until there was something to lock: the FULL announcement used to borrow `conf-locked`,
+	// which told a caller the meeting was closed when it was merely busy.
+	conferenceFullAnnouncement: "sound:conf-full",
+	conferenceLockedAnnouncement: "sound:conf-locked",
+	// GENERATED, not files. See the fields: a tone needs no prompt pack, so the beeps work on a
+	// stock install of either media plane.
+	conferenceEntryTone: "tone:beep",
+	conferenceExitTone: "tone:beep",
+	// `conf-hasjoin` and `conf-hasleft` are the stock generic forms. See the fields for why the
+	// per-participant recording is not in this release.
+	conferenceJoinAnnouncement: "sound:conf-hasjoin",
+	conferenceLeaveAnnouncement: "sound:conf-hasleft",
 	// Ten minutes. Long enough that a moderator who is late still finds their meeting, short
 	// enough that a forgotten leg does not hold a channel until the process restarts.
 	conferenceModeratorWaitMs: 600_000,
@@ -288,6 +676,24 @@ export const DEFAULT_PLAN_WALKER_SETTINGS: PlanWalkerSettings = {
 	confirmAcceptDigit: "1",
 	confirmAttempts: 2,
 	confirmTimeoutMs: 15_000,
+	intercomTimeoutSeconds: 5,
+	// OFF. See the field.
+	callScreeningEnabled: false,
+	// `vm-rec-name` and `priv-callerintros` are both in Asterisk's core sound package.
+	screeningRecordPrompt: "sound:vm-rec-name",
+	screeningRecordSeconds: 5,
+	screeningIntroPrompt: "sound:priv-callerintros",
+	directoryGreeting: "sound:dir-intro",
+	directoryInstructions: "sound:dir-instr",
+	directoryNoMatchPrompt: "sound:dir-nomatch",
+	directorySelectPrefix: "sound:dir-multi1",
+	directorySelectSuffix: "sound:dir-multi2",
+	directorySelectDigit: "1",
+	directoryMaxDigits: 10,
+	directoryTimeoutMs: 10_000,
+	directoryInterDigitTimeoutMs: 3_000,
+	directorySelectTimeoutMs: 5_000,
+	directoryMaxOffers: 5,
 	mediaRefs: DEFAULT_MEDIA_REF_SETTINGS,
 };
 
@@ -332,6 +738,39 @@ export interface PlanWalkerDependencies {
 	 */
 	readonly mailbox?: VoicemailMailboxSource;
 	/**
+	 * Where `*99` files the greeting it just recorded.
+	 *
+	 * Absent means `*99` announces "not available" and records NOTHING — deliberately in that order.
+	 * A code that answered, played a beep, took thirty seconds of somebody's voice and then had
+	 * nowhere to put it would leave the user believing their greeting is live, which is a worse
+	 * outcome than the announcement and is discovered by the first caller who reaches the mailbox.
+	 */
+	readonly greetings?: VoicemailGreetingPort;
+	/**
+	 * Where `*72`, `*74`, `*76`, `*78` and `*21` send the change they were dialled to make.
+	 *
+	 * Absent means those codes announce and hang up exactly as they did before this wave. It is a
+	 * port rather than a direct RPC call for the reason `mailbox` is: "no responder" is a state these
+	 * runtimes have to handle correctly, so it must be as easy to write a test for as a success is.
+	 */
+	readonly features?: ExtensionFeaturePort;
+	/** Where `*69` asks who rang. Absent means the code announces, exactly as it did before. */
+	readonly lastCaller?: LastCallerSource;
+	/**
+	 * The gate in front of `*0`.
+	 *
+	 * Optional in the same shape as its neighbours and NOT in the same spirit. Every other optional
+	 * port here degrades to "the feature announces and hangs up"; this one degrades to the same
+	 * announcement for the opposite reason. Absent does not mean "supervision is unconfigured, so
+	 * allow it" — it means the engine has no way to establish that this handset may listen to
+	 * somebody else's conversation, and the only safe reading of that is no.
+	 *
+	 * Written down here because it is the one place in this file where "port is undefined" must be a
+	 * DENIAL rather than a degradation, and the next person adding a supervision path will read this
+	 * declaration before they read the runtime.
+	 */
+	readonly supervision?: SupervisorAuthzPort;
+	/**
 	 * The ACD plane: the roster source, the agent state machine, the queue event publisher and the
 	 * per-process line and cursor.
 	 *
@@ -361,6 +800,15 @@ export interface PlanWalkerDependencies {
 	 */
 	readonly control?: WalkerCallControl;
 	/**
+	 * The session protocol, for the `application` destination.
+	 *
+	 * Absent means an `application` node announces and hangs up with `FACILITY_NOT_IMPLEMENTED`,
+	 * which is what it did for every wave before this one and is still the right answer on a
+	 * deployment with no broker: the destination exists, nothing can serve it, and the caller is
+	 * told rather than left listening.
+	 */
+	readonly application?: WalkerApplicationPort;
+	/**
 	 * Told the moment the walk ENTERS a destination-bearing node, rather than once it is over.
 	 *
 	 * The timing is the whole point, and it is a correctness fix rather than an optimisation. A walk
@@ -379,6 +827,35 @@ export interface PlanWalkerDependencies {
 	 * twice in a row.
 	 */
 	readonly onDestination?: (destination: PlanDestination) => Promise<void>;
+	/**
+	 * Run when a queued caller's stay ends, however it ends.
+	 *
+	 * Symmetric with {@link onDestination} and reported at the same moment for the same reason: the
+	 * walk may hang the leg up immediately afterwards (a queue with no timeout branch does exactly
+	 * that), and `ChannelDestroyed` races the walk's own return. A caller who demonstrably waited
+	 * four minutes and abandoned must not be filed with no wait and no outcome because the teardown
+	 * won.
+	 *
+	 * What it reports is the QUEUE's verdict, not the leg's. A caller the queue timed out into a
+	 * voicemail box has a leg that ends `answered` and a queue outcome of `timeout`, and an SLA built
+	 * on the disposition would call that a served call.
+	 */
+	readonly onQueueOutcome?: (outcome: WalkerQueueOutcome) => Promise<void>;
+	/**
+	 * Run when an authorisation code has opened an outbound route, before the first trunk is offered.
+	 *
+	 * Reported on SUCCESS only, and reported at the moment of success for exactly the reason
+	 * {@link onDestination} is: the call is about to be dialled and may end in any number of ways,
+	 * and a CDR written by whichever of teardown and return gets there first must already know which
+	 * code paid for it. A refusal is not reported here because a refused call did not spend anything
+	 * — it appears in the walk's notes and in the leg's hangup cause, which is where "somebody tried
+	 * three wrong codes" belongs.
+	 *
+	 * The ORDINAL and the LABEL, never the digits. That is the whole point of hashing a PIN in the
+	 * first place: the record has to answer "who authorised this call to Paraguay" and must not be a
+	 * place to go looking for a code to reuse.
+	 */
+	readonly onPinAuthorization?: (authorization: PinAuthorization) => Promise<void>;
 	/**
 	 * Run just before the A-leg is joined to whatever the walk found.
 	 *
@@ -476,6 +953,121 @@ export interface VoicemailMailboxSource {
 	 * as `found: false` — a broker timeout and a responder saying "no" are the same fact to a caller.
 	 */
 	list(request: VoicemailListingRequest): Promise<VoicemailListing>;
+}
+
+/** A greeting a user has just recorded over `*99`, on its way to their mailbox. */
+export interface RecordedGreeting {
+	/**
+	 * The tenant.
+	 *
+	 * On the request rather than closed over by the port, unlike {@link VoicemailMessage} — the
+	 * difference is what the two ports ARE. The voicemail sink is built per call
+	 * (`voicemailPortFor(aggregate)`), so it already knows whose call it is; this one is a
+	 * process-wide singleton over the shared rpc client, exactly like {@link ExtensionFeaturePort}
+	 * and {@link LastCallerSource}, and every one of those carries its tenant in the call.
+	 */
+	readonly organizationId: string;
+	readonly voicemailBoxId: string;
+	readonly mailboxNumber: string;
+	/** Minted by the walker, so a redelivered publish files one greeting rather than two. */
+	readonly greetingId: string;
+	readonly recordingId: string;
+	readonly objectKey: string;
+	readonly durationMs: number;
+	/**
+	 * Which greeting was recorded.
+	 *
+	 * `unavailable` and nothing else, because `*99` is one code: which of a box's greetings a code
+	 * records is a product decision the CATALOGUE would have to express (a second code, or an
+	 * argument), and the catalogue says `voicemail-record-greeting` takes no argument. The field is
+	 * here rather than implied so the day a `*99` variant is added, the consumer does not have to
+	 * guess what the existing one meant.
+	 */
+	readonly kind: "unavailable";
+	/** The call the greeting was recorded on. Logging correlation only. */
+	readonly callId?: string;
+}
+
+/**
+ * Where `*99` files what it recorded.
+ *
+ * A port, on the same terms as {@link VoicemailPort}: the greeting has to become a
+ * `voicemail_greeting` row and an ACTIVE one, which is a two-row write inside a recompile that only
+ * the control plane can make (see `voicemail-greetings.service.ts`). The engine records the audio
+ * and says so; it never files a row.
+ */
+export interface VoicemailGreetingPort {
+	/** @throws when the greeting could not be filed. The walk announces rather than confirming. */
+	greetingRecorded(greeting: RecordedGreeting): Promise<void>;
+}
+
+/** One feature change a handset asked for. `feature` is the contract's own vocabulary. */
+export interface ExtensionFeatureChange {
+	readonly organizationId: string;
+	/** The CALLING extension's number — the same identity `*97` opens a mailbox with. */
+	readonly extensionNumber: string;
+	readonly feature: ExtensionFeature;
+	readonly enabled: boolean;
+	/** Where to forward, for the three forwarding features. Ignored by DND and follow-me. */
+	readonly destination?: string;
+	readonly callId?: string;
+}
+
+/**
+ * What came back.
+ *
+ * `applied` is the only field the walk branches on, and the separation from `enabled` is the point:
+ * "nothing was written" and "it is now off" are different things to say to somebody, and a runtime
+ * that read `enabled` alone would play the de-activation announcement for a refusal.
+ */
+export interface ExtensionFeatureOutcome {
+	readonly applied: boolean;
+	/** The state AFTER the write. Only meaningful when `applied`. */
+	readonly enabled: boolean;
+	readonly destination?: string;
+	readonly reason?: string;
+}
+
+/**
+ * Where a feature code sends the change it was dialled to make.
+ *
+ * A port for the reason {@link VoicemailMailboxSource} is one: a spec should not need a broker, and
+ * "no responder" is a path these runtimes must get right — a caller who is told nothing assumes
+ * forwarding is on, and the person who rings them afterwards is the one who finds out it is not.
+ */
+export interface ExtensionFeaturePort {
+	/**
+	 * @throws when the port could not be reached at all. The walk catches it and treats it exactly as
+	 * `applied: false`.
+	 */
+	apply(change: ExtensionFeatureChange): Promise<ExtensionFeatureOutcome>;
+}
+
+/** What `*69` asks. */
+export interface LastCallerLookup {
+	readonly organizationId: string;
+	readonly extensionNumber: string;
+	readonly callId?: string;
+}
+
+/**
+ * Who rang last.
+ *
+ * `found: true` with no `callerNumber` is the WITHHELD caller and is deliberately not a miss: there
+ * was a call, and there is nothing to dial. The walk announces both, and the notes tell them apart.
+ */
+export interface LastCallerResult {
+	readonly found: boolean;
+	readonly callerNumber?: string;
+	readonly callerName?: string;
+	/** ISO 8601, for the walk's notes. */
+	readonly at?: string;
+	readonly reason?: string;
+}
+
+export interface LastCallerSource {
+	/** @throws when the source could not be reached. The walk treats it as `found: false`. */
+	lookup(request: LastCallerLookup): Promise<LastCallerResult>;
 }
 
 /** One leg the walk is about to create, as the orchestrator needs to file it. */
@@ -595,8 +1187,16 @@ interface DialAttempt {
 
 /** What one confirming leg is asked, and how long it is given to answer. */
 interface ConfirmRequest {
-	/** Media URI, already translated. */
-	readonly media: string;
+	/**
+	 * Media URIs, already translated, played in order as ONE prompt.
+	 *
+	 * A list rather than a string because call screening asks a question assembled from three pieces
+	 * — "call from", the caller's own recorded voice, "press 1 to accept" — and the media server
+	 * plays a sequence natively ({@link import("../media/media-port").PlayRequest.media} is already a
+	 * list). Concatenating them into one file would mean rendering audio on the call path; issuing
+	 * three plays would mean three playback handles, and barge-in would stop one of them.
+	 */
+	readonly media: readonly string[];
 	readonly acceptDigit: string;
 	readonly attempts: number;
 	readonly timeoutMs: number;
@@ -636,6 +1236,47 @@ type DialOutcome =
 
 const MILLIS_PER_SECOND = 1_000;
 
+/**
+ * Digits held for a queued caller's exit key before the oldest is dropped.
+ *
+ * Small on purpose, and much smaller than the leg inbox's 64. This buffer exists for ONE decision —
+ * "did they press the exit key?" — which the session asks once a second, so anything past a handful
+ * is a caller drumming on the keypad rather than input anybody is going to act on. The leg's own
+ * inbox keeps the full history for whatever the caller reaches next; this is a peephole onto it.
+ */
+const MAX_QUEUE_BUFFERED_DIGITS = 8;
+
+/**
+ * The catalogue's action names, mapped onto the contract's feature names.
+ *
+ * Two vocabularies rather than one, and deliberately: `FeatureCodeAction` is what a TENANT's
+ * star-code table can hold (twenty entries, most of which are not extension state at all), and
+ * `ExtensionFeature` is the closed set of columns a handset may write. Collapsing them would either
+ * put `paging` in a contract that writes extension rows or force the catalogue to be named after
+ * the database. The map is where they meet, and a code with no entry here is simply not a feature
+ * this RPC can serve.
+ */
+const FEATURE_FOR_ACTION: Readonly<Record<string, ExtensionFeature | undefined>> = {
+	"call-forward-all": "forward-all",
+	"call-forward-busy": "forward-busy",
+	"call-forward-no-answer": "forward-no-answer",
+	"do-not-disturb": "do-not-disturb",
+	"follow-me": "follow-me",
+};
+
+/**
+ * The three codes whose dialled digits are a DESTINATION.
+ *
+ * `*78` and `*21` take no argument (`FEATURE_CODE_ARGUMENT_MODE` says `none`), so digits after them
+ * are not theirs to read — and reading them anyway would make a mis-dialled `*7812` set do-not-
+ * disturb "to 12" instead of failing to match anything.
+ */
+const FORWARD_ACTIONS: ReadonlySet<string> = new Set([
+	"call-forward-all",
+	"call-forward-busy",
+	"call-forward-no-answer",
+]);
+
 export class PlanWalker {
 	private readonly settings: PlanWalkerSettings;
 	private readonly newId: () => string;
@@ -645,6 +1286,8 @@ export class PlanWalker {
 	private readonly notes: string[] = [];
 	private readonly visited: PlanNodeId[] = [];
 	private destination: PlanDestination | undefined;
+	/** Closes the queued caller's DTMF watch. Set for the life of one queue node, and only then. */
+	private queueDigitUnwatch: (() => void) | undefined;
 
 	constructor(private readonly deps: PlanWalkerDependencies) {
 		this.settings = { ...DEFAULT_PLAN_WALKER_SETTINGS, ...deps.settings };
@@ -743,6 +1386,9 @@ export class PlanWalker {
 			case "time-condition": {
 				return this.timeConditionNode(node, input);
 			}
+			case "call-flow": {
+				return this.callFlowNode(node);
+			}
 			case "extension": {
 				return await this.extensionNode(node, input);
 			}
@@ -773,11 +1419,26 @@ export class PlanWalker {
 			case "park": {
 				return await this.parkNode(node, input);
 			}
+			case "paging": {
+				return await this.pagingNode(node, input);
+			}
+			case "application": {
+				return await this.applicationNode(node);
+			}
+			case "stream": {
+				return await this.streamNode(node);
+			}
+			case "dial-by-name": {
+				return await this.dialByNameNode(node);
+			}
 			default: {
-				// `application`: a real destination with a real runtime that does not exist yet.
-				// Announcing and hanging up is a worse product than the real thing and a better one
-				// than silence.
-				this.note(`node kind "${node.kind}" is not implemented yet; announced and hung up`);
+				// Unreachable: every member of `PlanNodeKind` has a case above, and TypeScript proves it
+				// — `node` is `never` here, which is why the note reads it back through a cast. The arm
+				// stays because a node kind added to `packages/routing` and not to this switch has to
+				// land somewhere, and "announced and hung up, and said so in the notes" is a better
+				// place for it than an unhandled `undefined`.
+				const unreachable = node as { readonly kind: string };
+				this.note(`node kind "${unreachable.kind}" is not implemented yet; announced and hung up`);
 				return await this.announceAndHangup(
 					this.settings.unavailableAnnouncement,
 					"FACILITY_NOT_IMPLEMENTED",
@@ -839,12 +1500,57 @@ export class PlanWalker {
 	}
 
 	/**
+	 * A day/night switch, mid-walk.
+	 *
+	 * The resolver already applies the switch at the ENTRY point — `followGates` walks call flows
+	 * exactly as it walks time conditions — so a plan handed to this walker normally has the gate
+	 * behind it. This case is for the other way in: an IVR option, a ring group's timeout or a
+	 * call-flow branch that points at another flow, all of which reach one part-way through a walk
+	 * where no resolver is left to apply it.
+	 *
+	 * There is no clock and no state to read: the mode is a COLUMN, compiled into the node, which is
+	 * the whole argument `call-flows-schema.ts` makes against keeping it in a live-state bucket. So
+	 * this is a branch and nothing more, and a flow flipped after the artifact was compiled is a
+	 * recompile away rather than a stale read — the same eventual consistency every other compiled
+	 * fact on this walk already has.
+	 */
+	private callFlowNode(node: Extract<PlanNode, { kind: "call-flow" }>): StepResult {
+		this.note(`call flow "${node.label ?? node.callFlowId}" is in ${node.mode} mode`);
+		return { kind: "goto", nodeId: node.mode === "day" ? node.dayNodeId : node.nightNodeId };
+	}
+
+	/**
 	 * Star codes.
 	 *
-	 * `voicemail-check` is served by the voicemail placeholder for whatever the code's own target
-	 * says; everything else announces and hangs up. That is not laziness — a `*78` that silently
-	 * did nothing would leave a user believing DND is on, and a caller who then rings them would be
-	 * the one who finds out.
+	 * ## What is served here, and what is served by going somewhere else
+	 *
+	 * A code with a `targetNodeId` has already been resolved by the compiler — a `*5` pinned to one
+	 * park lot is the only one today — and is simply followed. Everything else is a RUNTIME, and
+	 * they divide into three kinds:
+	 *
+	 * - **Navigation.** `*97` and `*98` do not need a runtime at all: the artifact's mailbox table
+	 *   already names a `check` node and a `leave` node per box, so the code's job is to pick the
+	 *   right one and hand the walk over to the voicemail runtime that has served the
+	 *   `voicemailCheckPrefix` path since it was written. See {@link voicemailCode}.
+	 * - **Call control.** `**<ext>` and `*8` take somebody else's ringing call over.
+	 * - **A write, or a read, that only the control plane can make.** The five self-service codes
+	 *   (`*72`, `*74`, `*76`, `*78`, `*21`) and `*69` are requests over the broker, because the
+	 *   engine holds no database handle. Every one of them announces rather than falling silent when
+	 *   nothing answers — a `*78` that quietly did nothing leaves a user believing DND is on, and the
+	 *   caller who then rings them is the one who finds out.
+	 *
+	 * `*43` and `*99` are the two that need the media plane rather than the control plane.
+	 *
+	 * ## What is still not implemented, and says so
+	 *
+	 * `record-toggle`, `transfer`, `queue-toggle`, `agent-status` and a `paging` CODE that the
+	 * compiler did not point at a `paging` node all announce and add a note. Two of them have
+	 * runtimes elsewhere in the engine (mid-call features, the ACD) that this seam is not yet wired
+	 * to; the rest have none. Either way the caller is told, which is the whole point of the
+	 * announcement.
+	 *
+	 * `eavesdrop` and `intercom` LEFT this list in this wave — see {@link PlanWalker.eavesdropCode}
+	 * and {@link PlanWalker.intercomCode}.
 	 */
 	private async featureCodeNode(
 		node: Extract<PlanNode, { kind: "feature-code" }>,
@@ -853,25 +1559,817 @@ export class PlanWalker {
 		if (node.targetNodeId !== undefined) {
 			return { kind: "goto", nodeId: node.targetNodeId };
 		}
-		if (node.action === "call-pickup" || node.action === "group-pickup") {
-			return await this.pickupCode(node, input);
+
+		switch (node.action) {
+			case "call-pickup":
+			case "group-pickup": {
+				return await this.pickupCode(node, input);
+			}
+			case "voicemail-check":
+			case "voicemail-direct": {
+				return await this.voicemailCode(node, input);
+			}
+			case "voicemail-record-greeting": {
+				return await this.recordGreetingCode(node, input);
+			}
+			case "call-forward-all":
+			case "call-forward-busy":
+			case "call-forward-no-answer":
+			case "do-not-disturb":
+			case "follow-me": {
+				return await this.extensionFeatureCode(node, input);
+			}
+			case "redial": {
+				return await this.redialCode(node, input);
+			}
+			case "echo-test": {
+				return await this.echoTestCode(node);
+			}
+			case "eavesdrop": {
+				return await this.eavesdropCode(node, input);
+			}
+			case "intercom": {
+				return await this.intercomCode(node, input);
+			}
+			default: {
+				this.note(`feature code ${node.code} (${node.action}) is not implemented yet`);
+				return await this.announceAndHangup(
+					this.settings.unavailableAnnouncement,
+					"FACILITY_NOT_IMPLEMENTED",
+				);
+			}
 		}
-		if (node.action === "voicemail-check" || node.action === "voicemail-direct") {
-			// A feature code with no target compiled to nothing to go to: the tenant has the code but
-			// no mailbox behind it. Announcing that is the honest answer — the alternative is a `*97`
-			// that plays a greeting and hangs up, which a user reads as "my voicemail is broken".
+	}
+
+	/**
+	 * `*97` and `*98` — reaching a mailbox from the CATALOGUE rather than from a prefix setting.
+	 *
+	 * ## The gap this closes
+	 *
+	 * `packages/routing` compiles a `voicemail-check` feature code to a `feature-code` node with no
+	 * `targetNodeId` — `featureCodeTarget` resolves `call-park`'s pinned lot and nothing else — so
+	 * until now the ONLY way to reach a mailbox was `settings.voicemailCheckPrefix`. A tenant on the
+	 * default catalogue had `*97` in their star-code table, saw it in the admin UI, dialled it, and
+	 * got "not available". The prefix and the code were two doors to one room and only one of them
+	 * was fitted.
+	 *
+	 * ## Why the fix is here rather than in the compiler
+	 *
+	 * The artifact already carries everything needed: `internal.mailboxes` is keyed by mailbox number
+	 * and names both a `leave` and a `check` node per box. Teaching the compiler to point the code at
+	 * one of them would mean choosing at COMPILE time which mailbox `*97` opens, and the answer
+	 * depends on who dialled it — a fact the compiler does not have. So the code resolves the mailbox
+	 * the way `*97` always has (the calling extension's) and hands the walk to the node the compiler
+	 * already built.
+	 *
+	 * `*98` takes the mailbox as its argument, which is what `FEATURE_CODE_ARGUMENT_MODE` says
+	 * (`required`), and leaves a message in it — the caller is a colleague dropping a note, not the
+	 * owner, so there is no PIN and no menu.
+	 */
+	/**
+	 * `*0<ext>` — a supervisor listening to somebody else's live call.
+	 *
+	 * ## The order is the security property
+	 *
+	 * Authorize, THEN resolve, THEN tap. Not because it reads better, but because the two obvious
+	 * alternatives both leak. Resolving first and authorizing second turns `*0` into an oracle: a
+	 * handset with no grant learns, from which announcement it hears, whether extension 1001 is on
+	 * the phone right now — which is exactly the fact supervision exists to control access to.
+	 * Tapping first and authorizing second is worse in the way that needs no explanation.
+	 *
+	 * So the gate runs before anything about the target is looked up, and a denial is
+	 * indistinguishable from "nobody is on a call": both play the unavailable announcement, and the
+	 * difference lives in the walk's notes and the responder's log, where the person who is allowed
+	 * to know can find it.
+	 *
+	 * ## A missing port DENIES
+	 *
+	 * See {@link PlanWalkerDependencies.supervision}. Every other optional port here degrades to an
+	 * announcement because the feature cannot run; this one refuses because the engine cannot
+	 * establish that it may. There is deliberately no branch that reads "no port, therefore allow".
+	 *
+	 * ## Where it goes next
+	 *
+	 * The tap and the DTMF escalation live behind {@link WalkerCallControl.monitor}, because both
+	 * need the channel registry and the mid-call feature runtime, which are instance state the
+	 * walker has no handle on. What stays here is what is genuinely routing: the argument, the
+	 * refusals, and the gate.
+	 */
+	private async eavesdropCode(
+		node: Extract<PlanNode, { kind: "feature-code" }>,
+		input: WalkInput,
+	): Promise<StepResult> {
+		const caller = (input.callerIdNumber ?? this.deps.channel.callerIdNumber)?.trim();
+		if (caller === undefined || caller === "") {
 			this.note(
-				`feature code ${node.code} (${node.action}) resolved to no mailbox node; nothing to open`,
+				`feature code ${node.code} (${node.action}) was dialled by a caller with no number; there is nobody to authorize`,
 			);
 			return await this.announceAndHangup(
 				this.settings.unavailableAnnouncement,
 				"INVALID_NUMBER_FORMAT",
 			);
 		}
-		this.note(`feature code ${node.code} (${node.action}) is not implemented yet`);
+
+		const target = input.featureArgument?.trim() ?? "";
+		if (target === "") {
+			this.note(`feature code ${node.code} needs the extension whose call is being monitored`);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		if (target === caller) {
+			// Monitoring your own call is either a mis-dial or an attempt to hear your own audio path,
+			// and the media plane would happily build it: a tap on your own leg bridged to your own
+			// leg is a feedback loop. Refused with its own note so the mis-dial is legible.
+			this.note(`feature code ${node.code} was dialled against the caller's own extension`);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		const gate = this.deps.supervision;
+		if (gate === undefined) {
+			this.note(
+				`feature code ${node.code} (${node.action}) was dialled but this walk has no supervision gate; the request is DENIED`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_SUBSCRIBED",
+			);
+		}
+
+		const decision = await gate.authorize({
+			organizationId: this.deps.channel.organizationId,
+			extensionNumber: caller,
+			targetExtension: target,
+			callId: this.deps.channel.callId,
+		});
+		if (!decision.allowed) {
+			this.note(
+				`feature code ${node.code}: extension ${caller} may not monitor ${target} (${decision.reason ?? "no reason given"})`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_SUBSCRIBED",
+			);
+		}
+
+		const control = this.deps.control;
+		if (control === undefined) {
+			this.note(
+				`feature code ${node.code} (${node.action}) was dialled but this walk has no call-control runtime`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		// `*0` always STARTS silent. Whisper and barge are reached by pressing a digit while already
+		// listening, which is the FreeSWITCH convention (`4`/`5`/`6`) the escalation implements — a
+		// supervisor who dials in should never be audible before they have decided to be.
+		const outcome = await control.monitor({ extension: target, mode: "eavesdrop" });
+		if (!outcome.ok) {
+			this.note(
+				`feature code ${node.code}: ${target} could not be monitored (${outcome.reason ?? "no reason given"})`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"NORMAL_TEMPORARY_FAILURE",
+			);
+		}
+
+		this.note(`feature code ${node.code}: extension ${caller} is monitoring ${target}`);
+		// The walk is over and the leg is up, exactly as it is after a queue answer or a park: the
+		// supervisor stays in the tap bridge until one side goes away.
+		return { kind: "bridged" };
+	}
+
+	/**
+	 * `*80<ext>` — talk into somebody's speakerphone without them picking it up.
+	 *
+	 * ## It is an ordinary dial with one variable set
+	 *
+	 * Everything about an intercom is an ordinary extension dial — the same endpoint template, the
+	 * same leg hooks and therefore the same B-leg CDR, the same bridge — except that the INVITE
+	 * carries {@link import("./auto-answer").AUTO_ANSWER_VARIABLES}, which asks the handset to answer
+	 * itself. That is deliberately the whole difference: an intercom implemented as its own dial path
+	 * would be a second place for the leg accounting to drift, and a call whose CDR did not say which
+	 * extension it reached because it took the "special" route.
+	 *
+	 * ## The target is resolved from the ARTIFACT, not dialled as digits
+	 *
+	 * `extensionNodeFor` finds the compiled `extension` node for the number, which is what makes an
+	 * unknown or disabled extension a REFUSAL rather than an INVITE to an endpoint the media server
+	 * has never heard of. It also means an intercom can only ever reach an internal extension, which
+	 * is the correct boundary: `*80` plus a mobile number would be an auto-answer request sent to a
+	 * carrier, and there is no such thing.
+	 *
+	 * The extension's own forwarding, DND and follow-me are deliberately NOT honoured — this dials
+	 * the endpoint directly. An intercom that followed a forward would announce into the voicemail of
+	 * a colleague who is not at their desk, or into a mobile in somebody's pocket, and the entire
+	 * premise of the feature is that there is a speaker in a known room.
+	 *
+	 * ## A short deadline, and an announcement when it passes
+	 *
+	 * {@link PlanWalkerSettings.intercomTimeoutSeconds}. A handset that has not auto-answered in a
+	 * few seconds is one that was never configured to, and the caller needs to hear that rather than
+	 * listen to a phone ring somewhere they cannot see.
+	 */
+	private async intercomCode(
+		node: Extract<PlanNode, { kind: "feature-code" }>,
+		input: WalkInput,
+	): Promise<StepResult> {
+		const target = input.featureArgument?.trim() ?? "";
+		if (target === "") {
+			this.note(`feature code ${node.code} needs the extension to talk to`);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		const extension = this.extensionNodeFor(target, input);
+		if (extension === undefined) {
+			// Unknown and DISABLED are the same answer here, and that is not a shortcut: the compiler
+			// leaves a disabled extension out of the artifact entirely, so "no node" is the only signal
+			// this walk gets and inventing a distinction would mean inventing the fact behind it.
+			this.note(`feature code ${node.code}: no extension ${target} in this organization's plan`);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		await this.deps.execute({ verb: "ringing" });
+		this.deps.channel.moveTo("executing");
+
+		const outcome = await this.dialOne(
+			{
+				endpoint: this.endpointForExtension(extension.number),
+				label: `intercom to extension ${extension.number}`,
+				destinationNumber: extension.number,
+				timeoutSeconds: this.settings.intercomTimeoutSeconds,
+				delaySeconds: 0,
+				callerId: this.callerIdFor(input),
+				variables: AUTO_ANSWER_VARIABLES,
+			},
+			0,
+		);
+
+		if (outcome.kind === "answered") {
+			this.note(`feature code ${node.code}: intercom to extension ${extension.number} is up`);
+			return await this.bridgeWith(outcome.mediaChannelId);
+		}
+		if (outcome.kind === "aborted") {
+			return { kind: "aborted" };
+		}
+
+		// Never a branch onto the extension's own no-answer node. A handset that did not auto-answer
+		// has not "not answered a call" — the caller asked to speak into a room and the room did not
+		// open, and sending them to that extension's voicemail would record an announcement nobody
+		// asked to leave.
+		this.note(
+			`feature code ${node.code}: extension ${extension.number} did not auto-answer the intercom (${outcome.kind === "failed" ? outcome.cause : "no answer"})`,
+		);
+		return await this.announceAndHangup(this.settings.unavailableAnnouncement, "NO_ANSWER");
+	}
+
+	private async voicemailCode(
+		node: Extract<PlanNode, { kind: "feature-code" }>,
+		input: WalkInput,
+	): Promise<StepResult> {
+		const direct = node.action === "voicemail-direct";
+		const claimed = direct
+			? input.featureArgument?.trim()
+			: (input.callerIdNumber ?? this.deps.channel.callerIdNumber)?.trim();
+
+		if (claimed === undefined || claimed === "") {
+			this.note(
+				direct
+					? `feature code ${node.code} needs the mailbox to leave a message in`
+					: `feature code ${node.code} was dialled by a caller with no number; there is no mailbox to open`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		const entry = input.mailboxes?.[claimed];
+		if (entry === undefined) {
+			// The honest answer, and NOT "you have no messages": the tenant has the code and this
+			// number has no box behind it, which a user reads as a configuration problem rather than as
+			// a broken mailbox.
+			this.note(
+				`feature code ${node.code} (${node.action}) found no mailbox for ${claimed}; nothing to open`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		this.note(
+			direct
+				? `feature code ${node.code} is leaving a message in mailbox ${entry.mailboxNumber}`
+				: `feature code ${node.code} is opening mailbox ${entry.mailboxNumber}`,
+		);
+		return { kind: "goto", nodeId: direct ? entry.leaveNodeId : entry.checkNodeId };
+	}
+
+	/**
+	 * `*72`, `*74`, `*76`, `*78` and `*21` — a user changing their own state from their own handset.
+	 *
+	 * ## The identity is the phone, and it is a CLAIM on the other side
+	 *
+	 * The caller's number is the same authenticated identity `*97` opens a mailbox with: the call
+	 * came from that extension, which is exactly as strong as the phone on the desk and is the
+	 * classic PBX default. The responder does not trust it — it resolves the number inside the
+	 * tenant's scope before writing anything — which is why this end can send it plainly.
+	 *
+	 * ## Set versus toggle
+	 *
+	 * The three forwarding codes take an OPTIONAL argument (`FEATURE_CODE_ARGUMENT_MODE`), and the
+	 * two readings are different operations: `*72<number>` SETS, `*72` alone TOGGLES. A toggle needs
+	 * to know the current state, and the artifact answers that for three of the five features — see
+	 * {@link currentFeatureState} for the two it cannot and what is done about them.
+	 *
+	 * ## Both outcomes are audible
+	 *
+	 * `applied: true` plays the activation or de-activation announcement — which one depends on the
+	 * state that came BACK, not on what was asked for, so a race with an admin editing the same row
+	 * tells the user what is true rather than what they intended. `applied: false`, a timeout and a
+	 * missing port all play "not available". Nothing here ends in silence, because a user who hears
+	 * nothing assumes it worked.
+	 */
+	private async extensionFeatureCode(
+		node: Extract<PlanNode, { kind: "feature-code" }>,
+		input: WalkInput,
+	): Promise<StepResult> {
+		const port = this.deps.features;
+		if (port === undefined) {
+			this.note(
+				`feature code ${node.code} (${node.action}) was dialled but this walk has no feature port`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		const caller = (input.callerIdNumber ?? this.deps.channel.callerIdNumber)?.trim();
+		if (caller === undefined || caller === "") {
+			this.note(
+				`feature code ${node.code} (${node.action}) was dialled by a caller with no number; there is no extension to change`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		const feature = FEATURE_FOR_ACTION[node.action];
+		if (feature === undefined) {
+			this.note(`feature code ${node.code} (${node.action}) is not an extension feature`);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		const destination = FORWARD_ACTIONS.has(node.action)
+			? (input.featureArgument?.trim() ?? "")
+			: "";
+		// Digits after the code mean SET; the code alone means toggle. A destination on a code that
+		// has none (`*78`, `*21`) is ignored rather than refused — the contract says the field is
+		// meaningless there, and refusing over it would be a refusal the user cannot act on.
+		const enabled = destination === "" ? !this.currentFeatureState(feature, caller, input) : true;
+
+		let outcome: ExtensionFeatureOutcome;
+		try {
+			outcome = await port.apply({
+				organizationId: this.deps.channel.organizationId,
+				extensionNumber: caller,
+				feature,
+				enabled,
+				...(destination === "" ? {} : { destination }),
+				callId: this.deps.channel.callId,
+			});
+		} catch (error) {
+			// A thrown port and a refusing one are the same fact to the caller. Kept as a catch rather
+			// than pushed onto every implementation so a port that forgets is still safe here.
+			this.note(
+				`feature code ${node.code} (${node.action}) could not be applied: ${String(error)}`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"NORMAL_TEMPORARY_FAILURE",
+			);
+		}
+
+		if (!outcome.applied) {
+			this.note(
+				`feature code ${node.code} (${node.action}) was refused: ${outcome.reason ?? "no reason given"}`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"NORMAL_TEMPORARY_FAILURE",
+			);
+		}
+
+		this.note(
+			`feature code ${node.code} (${node.action}) is now ${outcome.enabled ? "on" : "off"} for extension ${caller}${
+				outcome.destination === undefined ? "" : ` (destination ${outcome.destination})`
+			}`,
+		);
 		return await this.announceAndHangup(
-			this.settings.unavailableAnnouncement,
-			"FACILITY_NOT_IMPLEMENTED",
+			outcome.enabled
+				? this.settings.featureActivatedAnnouncement
+				: this.settings.featureDeactivatedAnnouncement,
+			"NORMAL_CLEARING",
+		);
+	}
+
+	/**
+	 * What the artifact says this feature is currently doing for the caller's extension.
+	 *
+	 * ## Three of the five are readable, and two are not
+	 *
+	 * The walk holds the artifact's whole node table (a resolve hands over `artifact.nodes` by
+	 * reference), so the caller's own `extension` node is findable by number, and it carries:
+	 * `forwardAllNodeId` — present exactly when forward-all is on — `doNotDisturb`, and `followMe`,
+	 * present exactly when the ladder is switched on and has hops.
+	 *
+	 * `busyNodeId` and `noAnswerNodeId` cannot answer the same question, and no amount of care here
+	 * would change that: the compiler writes the FORWARD target into those fields when forwarding is
+	 * on and the mailbox into them when it is not, so both states produce a populated field. A
+	 * reading based on the node's KIND would be a guess that breaks the day somebody forwards to a
+	 * colleague whose extension happens to have voicemail.
+	 *
+	 * So a bare `*74`/`*76` is treated as "currently on", which makes the toggle a CLEAR. That is the
+	 * safe direction and it is chosen deliberately: clearing keeps the stored destination (the
+	 * responder guarantees it), so the cost of guessing wrong is a user who hears "de-activated" and
+	 * presses again with the number — while guessing the other way would silently divert somebody's
+	 * calls to a destination they configured months ago. Setting is always unambiguous:
+	 * `*74<number>` never consults this.
+	 */
+	private currentFeatureState(
+		feature: ExtensionFeature,
+		callerNumber: string,
+		input: WalkInput,
+	): boolean {
+		if (feature === "forward-busy" || feature === "forward-no-answer") {
+			return true;
+		}
+		const node = this.extensionNodeFor(callerNumber, input);
+		if (node === undefined) {
+			// No extension node for the caller means the walk cannot see their configuration at all —
+			// an off-net caller who reached an internal context, or an artifact that does not contain
+			// them. Treated as "on" for the same reason the two unreadable features are: the inverse is
+			// a clear, and a clear is the harmless half of a wrong guess.
+			this.note(
+				`extension ${callerNumber} is not in this artifact; the ${feature} toggle assumed it was on`,
+			);
+			return true;
+		}
+		if (feature === "forward-all") {
+			return node.forwardAllNodeId !== undefined;
+		}
+		if (feature === "do-not-disturb") {
+			return node.doNotDisturb;
+		}
+		return node.followMe !== undefined;
+	}
+
+	/** The caller's own `extension` node, found by number in the artifact's table. */
+	private extensionNodeFor(callerNumber: string, input: WalkInput): ExtensionPlanNode | undefined {
+		for (const candidate of Object.values(input.plan.nodes)) {
+			if (candidate.kind === "extension" && candidate.number === callerNumber) {
+				return candidate;
+			}
+		}
+		return undefined;
+	}
+
+	/**
+	 * `*69` — call back whoever rang this extension last.
+	 *
+	 * ## Two ways to reach the number, and the order matters
+	 *
+	 * An INTERNAL caller is already in the artifact: their `extension` node is in the table the walk
+	 * is holding, so the return call is a `goto` onto it. That is not a shortcut, it is the better
+	 * answer — the walk re-enters the extension runtime and therefore honours the callee's own
+	 * forwarding, their follow-me ladder and their no-answer branch, exactly as if the digits had
+	 * been dialled by hand.
+	 *
+	 * An EXTERNAL caller is not, and cannot be: turning `+15551234567` into a trunk needs the number
+	 * index and the outbound match table, neither of which travels with a plan. That is what
+	 * {@link WalkerCallControl.dial} is for, and the orchestrator answers it by resolving the digits
+	 * as if the caller had dialled them — so the toll-class gate, the outbound kill switch and the
+	 * call-block screen all apply and `*69` can never reach somewhere the same handset could not.
+	 *
+	 * ## `found: true` with no number is not a miss
+	 *
+	 * A withheld caller means there WAS a call and there is nothing to dial. Both it and an empty
+	 * window announce, because to the person holding the handset they are the same outcome; the
+	 * notes tell them apart for the support ticket.
+	 */
+	private async redialCode(
+		node: Extract<PlanNode, { kind: "feature-code" }>,
+		input: WalkInput,
+	): Promise<StepResult> {
+		const source = this.deps.lastCaller;
+		if (source === undefined) {
+			this.note(
+				`feature code ${node.code} (${node.action}) was dialled but this walk has no last-caller source`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		const caller = (input.callerIdNumber ?? this.deps.channel.callerIdNumber)?.trim();
+		if (caller === undefined || caller === "") {
+			this.note(
+				`feature code ${node.code} was dialled by a caller with no number; there is no extension to look up`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		let result: LastCallerResult;
+		try {
+			result = await source.lookup({
+				organizationId: this.deps.channel.organizationId,
+				extensionNumber: caller,
+				callId: this.deps.channel.callId,
+			});
+		} catch (error) {
+			this.note(`feature code ${node.code} could not read the call ledger: ${String(error)}`);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"NORMAL_TEMPORARY_FAILURE",
+			);
+		}
+
+		const number = result.callerNumber?.trim();
+		if (!result.found || number === undefined || number === "") {
+			this.note(
+				result.found
+					? `feature code ${node.code}: the last caller to ${caller} withheld their number`
+					: `feature code ${node.code}: nobody has called ${caller} recently (${result.reason ?? "empty window"})`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"NO_ROUTE_DESTINATION",
+			);
+		}
+
+		const internal = this.extensionNodeFor(number, input);
+		if (internal !== undefined) {
+			this.note(`feature code ${node.code} is returning the call from extension ${number}`);
+			return { kind: "goto", nodeId: internal.id };
+		}
+
+		const control = this.deps.control;
+		if (control === undefined) {
+			this.note(
+				`feature code ${node.code} found ${number}, which is not an extension in this artifact, and this walk has no call-control runtime to dial it`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		this.note(`feature code ${node.code} is returning the call to ${number}`);
+		const outcome = await control.dial({ destination: number });
+		switch (outcome.status) {
+			case "bridged": {
+				return { kind: "bridged" };
+			}
+			case "aborted": {
+				return { kind: "aborted" };
+			}
+			case "unresolved": {
+				this.note(`${number} could not be dialled back: ${outcome.reason ?? "nothing matched it"}`);
+				return await this.announceAndHangup(
+					this.settings.unavailableAnnouncement,
+					"NO_ROUTE_DESTINATION",
+				);
+			}
+			default: {
+				// A walk ran on this leg and has already ended it. `terminate` skips the hangup verb on a
+				// leg that is tearing down, so returning the cause records it without touching the leg
+				// twice.
+				return { kind: "hangup", cause: outcome.cause ?? "NORMAL_CLEARING" };
+			}
+		}
+	}
+
+	/**
+	 * `*43` — the echo test.
+	 *
+	 * ## Why the walk ENDS here rather than continuing
+	 *
+	 * There is nothing left to route: the leg is handed to the media plane's echo and stays there
+	 * until the caller hangs up. `bridged` is the walk status that means "the walk is over and the
+	 * call is up" — the same one a parked call reports, and for the same reason — and it is what
+	 * stops the orchestrator from tearing the leg down when the walk returns.
+	 *
+	 * ## The prompt is played first, and its failure is not fatal
+	 *
+	 * An echo with no preamble is indistinguishable from a fault: the caller hears themselves a beat
+	 * late and hangs up thinking the line is broken. But a deployment missing the sound file is not
+	 * a reason to refuse the test, so a failed playback is noted and the echo proceeds.
+	 *
+	 * A media plane that cannot echo at all (`mediad` refuses by name) announces instead — the caller
+	 * is told, and the log names the driver.
+	 */
+	private async echoTestCode(
+		node: Extract<PlanNode, { kind: "feature-code" }>,
+	): Promise<StepResult> {
+		if (!(await this.ensureAnswered())) {
+			return { kind: "aborted" };
+		}
+
+		const played = await this.deps.execute({ verb: "play", media: this.settings.echoTestPrompt });
+		if (played === undefined) {
+			this.note(
+				`feature code ${node.code}: the echo-test prompt could not be played; the echo was started anyway`,
+			);
+		}
+
+		try {
+			await this.deps.media.echo(this.deps.channel.mediaChannelId);
+		} catch (error) {
+			this.note(`feature code ${node.code}: this media plane cannot echo (${String(error)})`);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		this.note(`feature code ${node.code} handed the leg to the media plane's echo`);
+		return { kind: "bridged" };
+	}
+
+	/**
+	 * `*99` — recording a mailbox greeting from the handset.
+	 *
+	 * ## Nothing is recorded that cannot be filed
+	 *
+	 * The port is checked BEFORE the beep, and that ordering is the whole design. A code that
+	 * answered, prompted, took thirty seconds of somebody's voice and then had nowhere to put it
+	 * would leave them believing their greeting is live — discovered later by a caller who hears the
+	 * deployment's default announcement instead. The same rule governs the end: a greeting that could
+	 * not be filed plays "not available", never the confirmation.
+	 *
+	 * ## The mailbox and the PIN are `*97`'s
+	 *
+	 * The box is the calling extension's, found in the artifact's mailbox table exactly as a check
+	 * finds it, and the PIN gate is the same one — read off the `check` node the mailbox entry names,
+	 * so a box with a PIN cannot have its greeting replaced by whoever is standing at the desk. A box
+	 * with no digest is not challenged, which is the same deliberate default {@link
+	 * challengeVoicemailPin} documents.
+	 *
+	 * ## An empty recording is not a greeting
+	 *
+	 * A zero-length or failed recording is discarded with a note rather than filed, on the same rule
+	 * the message path holds to: an active greeting containing silence is worse than no greeting,
+	 * because the box stops announcing itself and nothing says why.
+	 */
+	private async recordGreetingCode(
+		node: Extract<PlanNode, { kind: "feature-code" }>,
+		input: WalkInput,
+	): Promise<StepResult> {
+		const port = this.deps.greetings;
+		if (port === undefined) {
+			this.note(
+				`feature code ${node.code} (${node.action}) was dialled but this walk has nowhere to file a greeting; nothing was recorded`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		const caller = (input.callerIdNumber ?? this.deps.channel.callerIdNumber)?.trim();
+		const entry = caller === undefined || caller === "" ? undefined : input.mailboxes?.[caller];
+		if (entry === undefined) {
+			this.note(
+				`feature code ${node.code} found no mailbox for ${caller ?? "an unknown caller"}; there is no greeting to record`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		if (!(await this.ensureAnswered())) {
+			return { kind: "aborted" };
+		}
+
+		// The `check` node is where the compiler put the box's PIN digest, so the gate `*97` applies is
+		// reachable from here without a second source of truth about what a mailbox's secret is.
+		const checkNode = input.plan.nodes[entry.checkNodeId];
+		if (checkNode !== undefined && checkNode.kind === "voicemail") {
+			const authenticated = await this.challengeVoicemailPin(checkNode, entry.mailboxNumber);
+			if (authenticated.kind !== "granted") {
+				return authenticated.result;
+			}
+		}
+
+		const recordingId = this.newId();
+		const format = this.settings.recordingFormat;
+		const objectKey = `${this.deps.channel.organizationId}/${this.deps.channel.callId}/${recordingId}.${format}`;
+		const maxSeconds = this.settings.greetingMaxSeconds;
+		// Subscribed BEFORE the record call, for the reason the message path documents: a very short
+		// recording can finish before the HTTP response arrives.
+		const finished = this.waitForRecording(recordingId, (maxSeconds + 5) * MILLIS_PER_SECOND);
+
+		try {
+			await this.deps.media.record(this.deps.channel.mediaChannelId, {
+				name: recordingId,
+				format,
+				maxDurationSeconds: maxSeconds,
+				maxSilenceSeconds: 5,
+				beep: true,
+				terminateOn: "#",
+			});
+		} catch (error) {
+			finished.cancel();
+			this.note(
+				`feature code ${node.code}: the greeting recording failed to start: ${String(error)}`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"NORMAL_TEMPORARY_FAILURE",
+			);
+		}
+
+		await this.deps.publish("channel.record.started", {
+			legId: this.deps.channel.channelId,
+			recordingId,
+			objectKey,
+			// The recording taxonomy has no `greeting` member, so this is filed as `voicemail` — which
+			// is what it is, media belonging to a mailbox. The GREETING is identified by the port call
+			// below rather than by this event, which exists for the recording lifecycle and the CDR.
+			kind: "voicemail",
+		});
+
+		const result = await finished.promise;
+
+		await this.deps.publish("channel.record.stopped", {
+			legId: this.deps.channel.channelId,
+			recordingId,
+			objectKey,
+			durationMs: result.durationMs,
+			reason: result.reason,
+		});
+
+		if (result.reason === "failed" || result.durationMs <= 0) {
+			this.note(
+				`feature code ${node.code}: the greeting recording produced no audio (${result.reason}); the mailbox's greeting was left alone`,
+			);
+			return await this.announceAndHangup(this.settings.unavailableAnnouncement, "NORMAL_CLEARING");
+		}
+
+		try {
+			await port.greetingRecorded({
+				organizationId: this.deps.channel.organizationId,
+				voicemailBoxId: entry.voicemailBoxId,
+				mailboxNumber: entry.mailboxNumber,
+				greetingId: this.newId(),
+				recordingId,
+				objectKey,
+				durationMs: result.durationMs,
+				kind: "unavailable",
+				callId: this.deps.channel.callId,
+			});
+		} catch (error) {
+			this.note(
+				`feature code ${node.code}: the greeting was recorded into ${objectKey} but could NOT be filed: ${String(error)}`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"NORMAL_TEMPORARY_FAILURE",
+			);
+		}
+
+		this.note(
+			`feature code ${node.code} recorded a new greeting for mailbox ${entry.mailboxNumber}`,
+		);
+		return await this.announceAndHangup(
+			this.settings.greetingRecordedAnnouncement,
+			"NORMAL_CLEARING",
 		);
 	}
 
@@ -1047,6 +2545,304 @@ export class PlanWalker {
 	}
 
 	// -------------------------------------------------------------------------------------------
+	// Paging
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * `*81` — one voice into every handset in a group.
+	 *
+	 * ## Why this is NOT `dialSimultaneous`
+	 *
+	 * It looks like a ring-all and it is the opposite of one. `dialSimultaneous` is a RACE: it
+	 * settles on the first answer and hangs every other leg up with `LOSE_RACE`, which is exactly
+	 * right for a ring group and exactly what would silence a page — the first handset to auto-answer
+	 * would win and the other eleven would be cancelled. A page is a FAN-IN: every leg that comes up
+	 * joins the same bridge, and there is no winner.
+	 *
+	 * So the shared primitive is the one below the race, {@link PlanWalker.originate} — the same leg
+	 * hooks, the same CDR-correct B-legs, the same `legSignalKey` subscription established before the
+	 * originate so a fast auto-answer cannot outrun it. What is not reused is the settling logic,
+	 * because the settling logic is the part that is wrong here.
+	 *
+	 * ## One-way pages mute the MEMBERS, and why that is the right primitive
+	 *
+	 * `duplex: false` means the group hears the pager and cannot be heard. There is no "listen only"
+	 * bridge membership in this port, and there does not need to be: `mute(channel, "in")` stops
+	 * audio coming FROM that party (Asterisk's convention, the same one
+	 * {@link import("../media/media-port").TapRequest} documents for `spy`), so a muted member is
+	 * present in the mix as a listener only. Doing it the other way round — muting `out` — would
+	 * deafen the member, which is the entire content of the page.
+	 *
+	 * It is applied per member AFTER they join rather than at originate time, because a mute is a
+	 * property of a live channel and there is nothing to mute before one exists.
+	 *
+	 * A real page would not need any of this. Multicast paging (which every vendor template in
+	 * `apps/api/src/provisioning/catalog/templates/` supports as a key type) sends one RTP stream to
+	 * a multicast group and the handsets play it with no signalling at all — no legs, no bridge, no
+	 * mute, and no per-phone channel on the media server. That is a different feature with a
+	 * different failure mode (no delivery report at all), and it is why `call.paging.started` carries
+	 * `answeredCount`: this implementation can say who actually heard it, and multicast cannot.
+	 *
+	 * ## Zero answered members is not a failure
+	 *
+	 * It is a page nobody heard, which the pager must be told about — they are about to speak into a
+	 * bridge with nothing in it and believe the warehouse was warned. Announced, hung up, and noted.
+	 * The alternative (leaving them talking to an empty bridge) is the exact failure the
+	 * `answeredCount` field exists to make visible.
+	 */
+	private async pagingNode(node: PagingPlanNode, input: WalkInput): Promise<StepResult> {
+		const groupName = node.label ?? node.pagingGroupId;
+		const members = node.members.filter((number) => number.trim() !== "");
+		if (members.length === 0) {
+			this.note(`paging group "${groupName}" has no members to page`);
+			return await this.announceAndHangup(this.settings.unavailableAnnouncement, "NO_ANSWER");
+		}
+
+		if (!(await this.ensureAnswered())) {
+			return { kind: "aborted" };
+		}
+
+		const bridgeId = this.newId();
+		try {
+			await this.deps.media.createBridge({ bridgeId, name: `paging-${node.pagingGroupId}` });
+			await this.deps.media.addToBridge(bridgeId, [this.deps.channel.mediaChannelId]);
+		} catch (error) {
+			this.log("failed to open a paging bridge", { bridgeId, err: String(error) });
+			this.note(`paging group "${groupName}" could not be opened: ${String(error)}`);
+			return { kind: "hangup", cause: "NORMAL_TEMPORARY_FAILURE" };
+		}
+		this.deps.channel.setBridge(bridgeId);
+		this.deps.channel.moveTo("exchanging-media");
+
+		const joined = await this.fanOutPage(node, members, bridgeId, input);
+
+		if (joined.length === 0) {
+			this.deps.channel.setBridge(undefined);
+			await this.destroyBridgeQuietly(bridgeId);
+			this.note(
+				`paging group "${groupName}" was opened but none of its ${String(members.length)} members answered`,
+			);
+			return await this.announceAndHangup(this.settings.unavailableAnnouncement, "NO_ANSWER");
+		}
+
+		const startedAtMs = this.deps.now?.() ?? Date.now();
+		await this.deps.publish("call.paging.started", {
+			legId: this.deps.channel.channelId,
+			pagingGroupId: node.pagingGroupId,
+			pagingGroupName: groupName,
+			...(input.originalDialedNumber === undefined ? {} : { dialed: input.originalDialedNumber }),
+			...(this.deps.channel.callerIdNumber === undefined
+				? {}
+				: { pagerExtension: this.deps.channel.callerIdNumber }),
+			memberCount: members.length,
+			answeredCount: joined.length,
+			oneWay: !node.duplex,
+		});
+
+		this.note(
+			`paging group "${groupName}": ${String(joined.length)} of ${String(members.length)} members joined${node.duplex ? "" : " (one-way)"}`,
+		);
+
+		// The PAGER's own death ends the page. Nothing else is watching this leg: the walk returns
+		// `bridged` and the orchestrator takes over — the same handover a conference join makes.
+		const unwatch = this.deps.signals.watch(
+			legSignalKey(this.deps.channel.mediaChannelId),
+			(signal) => {
+				if ((signal as LegSignal).kind !== "ended") {
+					return;
+				}
+				unwatch();
+				void this.endPage(node, groupName, bridgeId, joined, startedAtMs);
+			},
+		);
+
+		return { kind: "bridged" };
+	}
+
+	/**
+	 * Originates to every member at once and returns the ones that came up.
+	 *
+	 * The whole fan-out settles on ONE deadline — the node's `timeoutSeconds` — rather than per leg,
+	 * because a page is a single event in the room: a handset that joins eight seconds after the
+	 * pager started talking has missed the message, so there is nothing to be gained by waiting for
+	 * it and something to be lost (the pager holding a silent line wondering whether to start).
+	 *
+	 * Each member is joined to the bridge the instant its own leg arrives, not at the end, so the
+	 * phones that ARE quick are already listening while the slow ones are still ringing.
+	 */
+	private async fanOutPage(
+		node: PagingPlanNode,
+		members: readonly string[],
+		bridgeId: string,
+		input: WalkInput,
+	): Promise<readonly string[]> {
+		const channelIds = members.map(() => this.newId());
+		const unwatchers: (() => void)[] = [];
+		const joined = new Set<string>();
+		const settledLegs = new Set<number>();
+		const pending: Promise<void>[] = [];
+
+		let resolveAll: () => void = () => undefined;
+		const everyone = new Promise<void>((resolve) => {
+			resolveAll = resolve;
+		});
+		const legIsSettled = (index: number): void => {
+			settledLegs.add(index);
+			if (settledLegs.size === members.length) {
+				resolveAll();
+			}
+		};
+
+		for (const index of members.keys()) {
+			const channelId = channelIds[index] as string;
+			const number = members[index] as string;
+			unwatchers.push(
+				this.deps.signals.watch(legSignalKey(channelId), (signal) => {
+					const leg = signal as LegSignal;
+					if (leg.kind === "ended") {
+						legIsSettled(index);
+						return;
+					}
+					if ((leg.kind !== "answered" && leg.kind !== "entered") || joined.has(channelId)) {
+						return;
+					}
+					// Claimed once: `entered` and `answered` both arrive for one leg, and adding a
+					// channel to a bridge twice is a second membership the teardown does not know about.
+					joined.add(channelId);
+					pending.push(this.joinPagedMember(node, channelId, number, bridgeId));
+					legIsSettled(index);
+				}),
+			);
+		}
+
+		// Every watcher is in place before the first INVITE, so no handset's auto-answer can outrun
+		// its subscription. The same rule `dialSimultaneous` follows, and the same race.
+		await Promise.all(
+			members.map(async (number, index) => {
+				await this.originate(
+					{
+						endpoint: this.endpointForExtension(number),
+						label: `extension ${number}`,
+						destinationNumber: number,
+						timeoutSeconds: node.timeoutSeconds || this.settings.defaultRingTimeoutSeconds,
+						delaySeconds: 0,
+						callerId: this.callerIdFor(input),
+						variables: AUTO_ANSWER_VARIABLES,
+					},
+					channelIds[index] as string,
+					index,
+					() => {
+						legIsSettled(index);
+					},
+				);
+			}),
+		);
+
+		const deadline = new Promise<void>((resolve) => {
+			const timer = setTimeout(
+				resolve,
+				Math.max(1, node.timeoutSeconds || this.settings.defaultRingTimeoutSeconds) *
+					MILLIS_PER_SECOND,
+			);
+			timer.unref?.();
+		});
+		await Promise.race([everyone, deadline]);
+
+		for (const unwatch of unwatchers) {
+			unwatch();
+		}
+		// The joins started inside the watchers; awaited here so a member that is still being added
+		// when the deadline fires is either in the bridge or reported as failed before the count is
+		// published. A page whose `answeredCount` disagreed with the bridge would be a delivery report
+		// that lies in the direction that matters.
+		await Promise.all(pending);
+
+		// Every leg that never came up is cancelled. `ORIGINATOR_CANCEL` and not `LOSE_RACE`: nobody
+		// lost anything, the page simply started without them.
+		for (const [index, channelId] of channelIds.entries()) {
+			if (joined.has(channelId)) {
+				continue;
+			}
+			settledLegs.add(index);
+			await this.hangupQuietly(channelId, "ORIGINATOR_CANCEL");
+		}
+
+		return channelIds.filter((channelId) => joined.has(channelId));
+	}
+
+	/** Puts one answered member in the bridge, and mutes them when the page is one-way. */
+	private async joinPagedMember(
+		node: PagingPlanNode,
+		channelId: string,
+		number: string,
+		bridgeId: string,
+	): Promise<void> {
+		try {
+			await this.deps.media.addToBridge(bridgeId, [channelId]);
+			this.deps.legs?.bridged(channelId, bridgeId);
+		} catch (error) {
+			this.note(`extension ${number} answered the page but could not be joined: ${String(error)}`);
+			await this.hangupQuietly(channelId, "NORMAL_TEMPORARY_FAILURE");
+			return;
+		}
+		if (node.duplex) {
+			return;
+		}
+		try {
+			// `in` — audio coming FROM the member. See the method note on `pagingNode`.
+			await this.deps.media.mute(channelId, "in");
+		} catch (error) {
+			// A member who cannot be muted is a member the room can hear. Noted rather than dropped:
+			// the page still reaches them, and a one-way page with one live microphone in it is a far
+			// better outcome than one handset fewer.
+			this.note(
+				`extension ${number} joined a one-way page but could not be muted, so they can be heard: ${String(error)}`,
+			);
+		}
+	}
+
+	/** The pager hung up: members are released, the bridge goes, and the page is bounded. */
+	private async endPage(
+		node: PagingPlanNode,
+		groupName: string,
+		bridgeId: string,
+		joined: readonly string[],
+		startedAtMs: number,
+	): Promise<void> {
+		let stillConnected = 0;
+		for (const channelId of joined) {
+			try {
+				if (await this.deps.media.channelExists(channelId)) {
+					stillConnected += 1;
+				}
+			} catch {
+				// An unanswerable "does it exist" is not worth a branch: the member is counted as gone,
+				// and the hangup below tolerates a channel that is already dead either way.
+			}
+			await this.hangupQuietly(channelId, "NORMAL_CLEARING");
+		}
+
+		this.deps.channel.setBridge(undefined);
+		await this.destroyBridgeQuietly(bridgeId);
+
+		await this.deps.publish("call.paging.ended", {
+			legId: this.deps.channel.channelId,
+			pagingGroupId: node.pagingGroupId,
+			pagingGroupName: groupName,
+			durationMs: Math.max(0, (this.deps.now?.() ?? Date.now()) - startedAtMs),
+			answeredCount: stillConnected,
+		});
+	}
+
+	private async destroyBridgeQuietly(bridgeId: string): Promise<void> {
+		try {
+			await this.deps.media.destroyBridge(bridgeId);
+		} catch (error) {
+			this.log("failed to destroy a bridge", { bridgeId, err: String(error) });
+		}
+	}
+
+	// -------------------------------------------------------------------------------------------
 	// IVR
 	// -------------------------------------------------------------------------------------------
 
@@ -1171,6 +2967,9 @@ export class PlanWalker {
 		// After forward-all and DND, before the endpoint: a ladder REPLACES the plain dial. Both of
 		// the checks above outrank it — a user who has switched everything through to a colleague
 		// or gone on do-not-disturb has said something more specific than "find me".
+		if (node.callScreening === true && this.screeningApplies(node, input)) {
+			return await this.screenCall(node, input);
+		}
 		if (node.followMe !== undefined) {
 			return await this.followMeNode(node, node.followMe, input);
 		}
@@ -1197,6 +2996,175 @@ export class PlanWalker {
 			noAnswerNodeId: node.noAnswerNodeId,
 			notRegisteredNodeId: node.notRegisteredNodeId,
 		});
+	}
+
+	/**
+	 * Whether this particular call is one the screen should be applied to.
+	 *
+	 * Two gates, and they are gates for different reasons.
+	 *
+	 * **The setting** ({@link PlanWalkerSettings.callScreeningEnabled}) is off by default and is a
+	 * DEPLOYMENT decision, not a tenant one — see the field for why a partially-landed runtime does
+	 * not ship on by default.
+	 *
+	 * **"External"** is a product rule the artifact deliberately does not express (see
+	 * `ExtensionPlanNode.callScreening`: internal callers are never screened, and that is not
+	 * configurable because it is not a configuration). The definition chosen here is: *the caller's
+	 * number does not name an `extension` node in this artifact.* That is what {@link extensionNodeFor}
+	 * answers, and it is the same test `*69` uses to decide whether a return call is an on-net `goto`
+	 * or an outbound dial — one definition of "one of ours", used twice.
+	 *
+	 * Its limits, stated rather than discovered:
+	 *
+	 * - A caller with NO number is treated as external. That is the safe reading — a withheld number
+	 *   is exactly the call somebody turns screening on for — but it also means a badly-configured
+	 *   trunk that strips caller id would screen every call it delivers.
+	 * - The comparison is exact-string. An internal caller whose number reaches this walk in a
+	 *   different form from the one compiled onto their extension node (a `+E.164` prefix from an
+	 *   inbound route's manipulation, say) reads as external and gets screened. The artifact's number
+	 *   index is the thing that would normalise this, and the walk does not carry it.
+	 * - It says nothing about TRUST. An external caller is not a hostile one and an internal caller is
+	 *   not authenticated by this test; it is a routing fact, and screening is a courtesy feature.
+	 */
+	private screeningApplies(node: ExtensionPlanNode, input: WalkInput): boolean {
+		if (!this.settings.callScreeningEnabled) {
+			this.note(
+				`extension ${node.number} has call screening configured, but this deployment has the screening runtime switched off; the phone was rung`,
+			);
+			return false;
+		}
+		const caller = (input.callerIdNumber ?? this.deps.channel.callerIdNumber)?.trim();
+		if (caller === undefined || caller === "") {
+			return true;
+		}
+		return this.extensionNodeFor(caller, input) === undefined;
+	}
+
+	/**
+	 * Ask an external caller who they are, and let the callee decide.
+	 *
+	 * ## The shape, and why it is the CONFIRMATION machinery rather than a new one
+	 *
+	 * A screen is exactly an answer confirmation with a different question. The walker already has
+	 * one — {@link ConfirmRequest}, used by ring groups and follow-me — and its contract is precisely
+	 * the one screening needs: the callee's leg does not count as ANSWERED until they press the
+	 * accept digit, so a refusal falls through the ordinary dial machinery as a leg that never
+	 * answered and lands on the extension's own `noAnswerNodeId`. That is the required behaviour for
+	 * `2`, for a wrong key, and for silence, with no branch of its own — and it means a screened call
+	 * reaches the same mailbox an unanswered one would.
+	 *
+	 * `attempts: 1`, unlike an ordinary confirmation, and that is the one deliberate difference: a
+	 * confirmation re-asks because a mobile in a pocket may have missed the question, whereas a
+	 * screen has already played the caller's own voice and the callee has decided. Re-asking would
+	 * make `2` mean "ask me again".
+	 *
+	 * ## What is NOT finished, precisely
+	 *
+	 * 1. **The caller hears silence while the callee decides.** The leg is ANSWERED (it had to be, to
+	 *    record) so there is no ringback, and nothing is played over the gap. The seam is one
+	 *    `startMusicOnHold` before the dial and one `stopMusicOnHold` in `bridgeWith`'s
+	 *    `beforeBridge` hook — the same pair a transferred leg already uses — and it is not done here
+	 *    because `beforeBridge` is currently owned by the orchestrator's transfer path and taking it
+	 *    over from inside a node would silently break a transfer that screens.
+	 * 2. **The recorded name is never cleaned up.** It is written to the media server's recording
+	 *    store under a walk-minted id and nothing deletes it, because the engine has no lifecycle for
+	 *    a transient recording — `channel.record.started`/`stopped` exist to hand an object to the
+	 *    uploader, which is the opposite of what this needs. The seam is a `kind: "screening"` on the
+	 *    recording taxonomy in `packages/events` plus a retention rule, and neither exists.
+	 * 3. **A failed recording screens with the intro and no name.** Deliberate: the callee still gets
+	 *    the accept/reject question, which is most of the feature, and refusing the call because a
+	 *    recording failed would drop calls over a media fault. It is noted on the walk.
+	 * 4. **Only the plain dial is screened.** A follow-me ladder outranks screening in the precedence
+	 *    chain above, so a user with both gets the ladder and no screen. That is the honest reading of
+	 *    "a ladder REPLACES the plain dial" and not an oversight — screening every hop of a ladder
+	 *    would ask a mobile to accept a call it is holding to the caller's ear.
+	 */
+	private async screenCall(node: ExtensionPlanNode, input: WalkInput): Promise<StepResult> {
+		if (!(await this.ensureAnswered())) {
+			return { kind: "aborted" };
+		}
+
+		const recordingId = this.newId();
+		const name = await this.recordCallerName(recordingId);
+		if (name === undefined) {
+			this.note(
+				`extension ${node.number}: the screening name recording produced nothing; the callee was asked without it`,
+			);
+		}
+
+		await this.deps.execute({ verb: "ringing" });
+		this.deps.channel.moveTo("executing");
+
+		const outcome = await this.dialSequential(
+			[
+				{
+					endpoint: this.endpointForExtension(node.number),
+					label: `extension ${node.number}`,
+					destinationNumber: node.number,
+					timeoutSeconds: node.timeoutSeconds || this.settings.defaultRingTimeoutSeconds,
+					delaySeconds: 0,
+					callerId: this.callerIdFor(input),
+					confirm: {
+						media: [
+							this.settings.screeningIntroPrompt,
+							...(name === undefined ? [] : [name]),
+							this.settings.confirmPrompt,
+						],
+						acceptDigit: this.settings.confirmAcceptDigit,
+						// One round. See the method note.
+						attempts: 1,
+						timeoutMs: Math.max(1, this.settings.confirmTimeoutMs),
+					},
+				},
+			],
+			[],
+		);
+
+		return await this.settleDial(outcome, {
+			busyNodeId: node.busyNodeId,
+			noAnswerNodeId: node.noAnswerNodeId,
+			notRegisteredNodeId: node.notRegisteredNodeId,
+		});
+	}
+
+	/**
+	 * Records the caller saying their name, and returns it as something the callee's leg can play.
+	 *
+	 * `recording:<name>` is one of the media server's own schemes — `media-refs.ts` lists it among
+	 * `NATIVE_SCHEMES` and passes it through untranslated — so the string this returns is exactly
+	 * what a `play` on the CALLEE's channel needs, with no round trip through the object store and
+	 * no `MediaRef` that would have to be resolved against a mount that is usually not configured.
+	 *
+	 * `undefined` means there is no name to play: the recording failed, produced no audio, or the
+	 * media server refused it. The screen still runs — see {@link screenCall}.
+	 */
+	private async recordCallerName(recordingId: string): Promise<string | undefined> {
+		await this.deps.execute({ verb: "play", media: this.settings.screeningRecordPrompt });
+
+		const maxSeconds = this.settings.screeningRecordSeconds;
+		// Subscribed BEFORE the record call, for the reason every recording path here documents: a
+		// very short recording can finish before the HTTP response arrives.
+		const finished = this.waitForRecording(recordingId, (maxSeconds + 5) * MILLIS_PER_SECOND);
+		try {
+			await this.deps.media.record(this.deps.channel.mediaChannelId, {
+				name: recordingId,
+				format: this.settings.recordingFormat,
+				maxDurationSeconds: maxSeconds,
+				maxSilenceSeconds: 2,
+				beep: true,
+				terminateOn: "#",
+			});
+		} catch (error) {
+			finished.cancel();
+			this.note(`the screening name recording failed to start: ${String(error)}`);
+			return undefined;
+		}
+
+		const result = await finished.promise;
+		if (result.reason === "failed" || result.durationMs <= 0) {
+			return undefined;
+		}
+		return `recording:${recordingId}`;
 	}
 
 	/**
@@ -1353,7 +3321,9 @@ export class PlanWalker {
 	 */
 	private confirmRequest(promptId?: string): ConfirmRequest {
 		return {
-			media: resolveMediaRef({ promptId }, this.settings.mediaRefs) ?? this.settings.confirmPrompt,
+			media: [
+				resolveMediaRef({ promptId }, this.settings.mediaRefs) ?? this.settings.confirmPrompt,
+			],
 			acceptDigit: this.settings.confirmAcceptDigit,
 			attempts: Math.max(1, this.settings.confirmAttempts),
 			timeoutMs: Math.max(1, this.settings.confirmTimeoutMs),
@@ -1513,6 +3483,15 @@ export class PlanWalker {
 		if (attempts.length === 0) {
 			this.note(`trunk-dial node "${node.id}" has no trunks configured`);
 			return this.branch(node.failoverNodeId, "NETWORK_OUT_OF_ORDER");
+		}
+
+		// The authorisation gate, before the first INVITE and before `ringing`. Both halves of that
+		// ordering matter: a code collected after the carrier has been offered the call is a code
+		// collected too late to stop it, and a caller who hears ringback and is then asked for a PIN
+		// has been told the call is going through.
+		const authorized = await this.challengeOutboundPin(node, number);
+		if (authorized.kind === "denied") {
+			return authorized.result;
 		}
 
 		await this.deps.execute({ verb: "ringing" });
@@ -1716,6 +3695,79 @@ export class PlanWalker {
 	 * registry — which is what makes `maxMembers` and "has a moderator arrived?" correct across
 	 * walks — but the media join is deferred until the gate opens.
 	 */
+	/**
+	 * Hands the call to a named external application and waits for it to finish.
+	 *
+	 * ## The three outcomes, and why one of them is an announcement
+	 *
+	 * `unavailable` — nobody has claimed this application, or the control plane could not be reached
+	 * — takes the destination's failure path, which on this platform is an announcement and a hangup
+	 * with `FACILITY_NOT_IMPLEMENTED`. That choice is the whole reason the session protocol's
+	 * registration is a NATS subject rather than a directory: a claim that does not exist produces
+	 * `no responders available` synchronously, so the caller hears the announcement immediately
+	 * instead of after a request timeout. Dead air is never an outcome here.
+	 *
+	 * `hangup` is the application ending the call, with the cause it chose, so a CDR reads
+	 * `CALL_REJECTED` when the integration rejected the caller rather than `NORMAL_CLEARING` for
+	 * everything.
+	 *
+	 * `aborted` is the leg going away underneath the application — the caller hung up, or the media
+	 * server dropped the channel. There is nothing left to walk, and no verb to send.
+	 *
+	 * ## The leg is NOT answered first
+	 *
+	 * Unlike `conference` or `voicemail`, which cannot work on an unanswered leg, an application is
+	 * given the call exactly as it found it and decides for itself. That is the point of the
+	 * `answered` field on the announcement: a screen-pop integration wants to inspect the caller and
+	 * hand the call on WITHOUT answering, because answering starts billing a caller for a call they
+	 * never got. Pre-answering here would take that decision away and would make an
+	 * `application` destination more expensive than the dial plan it replaced.
+	 */
+	private async applicationNode(node: ApplicationPlanNode): Promise<StepResult> {
+		const application = this.deps.application;
+		if (application === undefined) {
+			this.note(
+				`application "${node.application}" was reached but this walk has no session runtime; announced and hung up`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		this.note(`handing the call to application "${node.application}"`);
+		const outcome = await application.run({
+			application: node.application,
+			// The plan models `args` as `string | number | boolean`; the wire carries text. Flattened
+			// here rather than in the runtime because this is where the plan's type is still visible.
+			...(node.args === undefined
+				? {}
+				: {
+						arguments: Object.fromEntries(
+							Object.entries(node.args).map(([key, value]) => [key, String(value)]),
+						),
+					}),
+		});
+
+		switch (outcome.kind) {
+			case "unavailable": {
+				this.note(`application "${node.application}" did not take the call: ${outcome.reason}`);
+				return await this.announceAndHangup(
+					this.settings.unavailableAnnouncement,
+					"FACILITY_NOT_IMPLEMENTED",
+				);
+			}
+			case "aborted": {
+				this.note(`the leg went away while application "${node.application}" held it`);
+				return { kind: "aborted" };
+			}
+			default: {
+				this.note(`application "${node.application}" ended the call with ${outcome.cause}`);
+				return { kind: "hangup", cause: outcome.cause };
+			}
+		}
+	}
+
 	private async conferenceNode(node: ConferencePlanNode): Promise<StepResult> {
 		const registry = this.deps.conferences;
 		if (registry === undefined) {
@@ -1757,6 +3809,19 @@ export class PlanWalker {
 				`conference room ${node.roomNumber} is at its limit of ${node.maxMembers} members; the caller was refused`,
 			);
 			return await this.announceAndHangup(this.settings.conferenceFullAnnouncement, "USER_BUSY");
+		}
+		if (joined.kind === "locked") {
+			// A DIFFERENT announcement from the full one, and that is the whole reason the lock is a
+			// separate result: a full room admits this caller the moment somebody leaves, and a locked
+			// one does not admit them until the meeting is over. Telling them the same thing would have
+			// them redialling for an hour.
+			this.note(
+				`conference room ${node.roomNumber} is locked; the caller was refused with ${String(joined.memberCount)} in the room`,
+			);
+			return await this.announceAndHangup(
+				this.settings.conferenceLockedAnnouncement,
+				"CALL_REJECTED",
+			);
 		}
 		if (joined.kind === "claims-unavailable") {
 			// The room's claim could not be taken. Joining anyway would put this caller in a bridge no
@@ -1821,14 +3886,12 @@ export class PlanWalker {
 			memberCount: room?.memberCount ?? joined.room.memberCount,
 		});
 
-		if (node.recordEnabled) {
-			// Said out loud rather than silently ignored: a tenant who ticked "record this room" and
-			// finds no recording has a compliance problem, and a note in the call log is the
-			// difference between finding out now and finding out at the hearing.
-			this.note(
-				`conference room ${node.roomNumber} is configured to record, which this release does not implement`,
-			);
-		}
+		// The arrival, HEARD. Ordered after the media join and after the event, so a room hears the
+		// beep for somebody who is actually in it — a tone played before the bridge join would announce
+		// a participant whose media add then failed.
+		await this.announceConferenceArrival(node, bridgeId, "join");
+
+		await this.recordConference(node, joined.created);
 
 		// The leg's own death is what removes it from the room. Nothing else is watching it: the
 		// walk returns `bridged` and the orchestrator takes over from here.
@@ -1844,6 +3907,525 @@ export class PlanWalker {
 		);
 
 		return { kind: "bridged" };
+	}
+
+	/**
+	 * Beeps the room, and says somebody came or went.
+	 *
+	 * ## Into the ROOM, not at the caller
+	 *
+	 * The media reference is played at the BRIDGE, not at this leg, which is what makes it an
+	 * announcement rather than a private noise: everybody already in the meeting is the audience, and
+	 * the arriving participant hearing their own beep is a side effect of being in the bridge by then.
+	 * The ARI driver plays into a bridge directly; `mediad` mixes a playback into the room the same
+	 * way. Both are `MediaPort.play` addressed at the bridge id.
+	 *
+	 * ## The tone and the announcement are two settings and two costs
+	 *
+	 * `entryToneEnabled` is a quarter of a second of generated audio and needs nothing mounted.
+	 * `announceJoinLeave` is a spoken clause and needs a prompt package. A large room usually wants
+	 * the first and not the second — which is a preference `conference.announce_join_leave` alone
+	 * could not express, and is why the columns are separate.
+	 *
+	 * ## What is NOT announced, and the seam for it
+	 *
+	 * The participant's NAME. Announcing "Priya has joined" needs a recording of Priya saying so,
+	 * captured at the gate before the room is entered and kept for the life of the meeting — a record
+	 * step in `challengeConferencePin`, a per-member media ref on `ConferenceMember`, and a decision
+	 * about where the clip lives. This release plays the stock generic form instead, which is what
+	 * `conf-hasjoin` says, and says so here rather than shipping a flag that does less than its name.
+	 *
+	 * Never throws. A beep that could not be played is a meeting that carries on; failing the join
+	 * over its sound effect would drop a participant to protect an announcement.
+	 */
+	private async announceConferenceArrival(
+		node: ConferencePlanNode,
+		bridgeId: string,
+		event: "join" | "leave",
+	): Promise<void> {
+		const joining = event === "join";
+		const media: string[] = [];
+		// `!== false` and not `=== true`: the flags default ON at every layer, and the compiler emits
+		// them only when a tenant switched them off. An artifact from before the columns existed must
+		// beep — a participant who cannot tell a third party arrived is one who does not know the
+		// conversation stopped being private.
+		if ((joining ? node.entryToneEnabled : node.exitToneEnabled) !== false) {
+			media.push(joining ? this.settings.conferenceEntryTone : this.settings.conferenceExitTone);
+		}
+		if (node.announceJoinLeave !== false) {
+			media.push(
+				joining
+					? this.settings.conferenceJoinAnnouncement
+					: this.settings.conferenceLeaveAnnouncement,
+			);
+		}
+		if (media.length === 0) {
+			return;
+		}
+
+		try {
+			await this.deps.media.play(bridgeId, { media, playbackRef: this.newId() });
+		} catch (error) {
+			// Noted rather than swallowed, because "the beeps stopped working" is a question somebody
+			// asks about a room and a silent catch is not an answer to it.
+			this.note(
+				`conference room ${node.roomNumber} could not play its ${event} announcement: ${String(error)}`,
+			);
+		}
+	}
+
+	/**
+	 * Starts the room's recording, when the tenant asked for one and this is the member who opens it.
+	 *
+	 * ## Once per ROOM, not once per participant
+	 *
+	 * `created` is the gate, and it is the registry's answer to "is this instance now responsible for
+	 * a bridge?". A recording per participant would produce N files of one meeting, N retention
+	 * clocks and N signed URLs for the same audio — and, worse, N copies of every other participant's
+	 * voice, since each one records the whole mix.
+	 *
+	 * The consequence is stated rather than hidden: on a room split across instances, EACH instance's
+	 * first joiner opens a recording, so a cluster produces one file per participating instance. That
+	 * is a real limitation of recording a jointly-held room from its members, and the fix is a
+	 * recorder that is a member of the room in its own right — the seam is `ConferenceClaim` growing
+	 * a `recorderInstanceId` the first writer takes and every other instance defers to.
+	 *
+	 * ## Which policies record, and why three of five behave alike
+	 *
+	 * `all`, `inbound` and `outbound` all record. Every leg in a conference is inbound TO the room,
+	 * so there is no outbound half to leave out — the values are accepted because the vocabulary is
+	 * shared with `extension` and `queue`, and refusing three of five on one table would be a second,
+	 * narrower vocabulary wearing the same name. `on-demand` deliberately does NOT start one: it
+	 * means "somebody presses the record key", and the key is a mid-call feature that already works.
+	 *
+	 * BEST-EFFORT, exactly as a queue's is, and for the same reason with the same caveat: a media
+	 * plane that cannot record is not worth dropping a meeting over, and a tenant with a legal
+	 * obligation to record needs the call REFUSED instead — which is a different setting and a
+	 * different conversation with the operator.
+	 */
+	private async recordConference(node: ConferencePlanNode, created: boolean): Promise<void> {
+		const policy = node.recordPolicy;
+		if (policy === "none" || policy === "on-demand") {
+			return;
+		}
+		if (!created) {
+			// Somebody already opened it. Not a failure and not worth a note: this is every participant
+			// after the first, on every recorded room.
+			return;
+		}
+
+		const control = this.deps.control;
+		if (control?.startRecording === undefined) {
+			// A tenant who ticked "record this room" and finds no recording has a compliance problem,
+			// and a note in the call log is the difference between finding out now and finding out at
+			// the hearing.
+			this.note(
+				`conference room ${node.roomNumber} has a record policy of "${policy}" and this walk has no call-control port; the room was opened without a recording`,
+			);
+			return;
+		}
+
+		try {
+			const outcome = await control.startRecording();
+			if (!outcome.ok) {
+				this.note(
+					`conference room ${node.roomNumber} has a record policy of "${policy}" and the recording was refused${
+						outcome.reason === undefined ? "" : `: ${outcome.reason}`
+					}; the room was opened without it`,
+				);
+			}
+		} catch (error) {
+			this.note(
+				`conference room ${node.roomNumber} recording could not be started (${String(error)}); the room was opened without it`,
+			);
+		}
+	}
+
+	/**
+	 * The outbound route's authorisation-code gate.
+	 *
+	 * ## What it is for, and why it fails CLOSED where the compiler fails open
+	 *
+	 * A PIN on an outbound route is a spending control: it is the difference between "anyone who can
+	 * reach a handset can dial Paraguay" and "anyone who knows the code can". So the runtime refuses
+	 * the call on a wrong code, on an unreadable digest, and on exhausted attempts.
+	 *
+	 * That is the OPPOSITE of what the compiler does with the same data, and the two are not in
+	 * conflict — they are refusing different things. `compilePinSet` fails OPEN: a set that is
+	 * missing, disabled, or whose every digest this release cannot parse produces a warning and NO
+	 * gate, because taking a tenant's phones down to protect a gate they can re-create in a form is
+	 * the worse outcome. But once a gate has been compiled, the artifact is asserting that this route
+	 * is gated, and a runtime that then waved a caller through on a digest it could not read would
+	 * make the gate decorative. `CompiledPinSet.entries` is documented as never empty for exactly
+	 * this reason: by the time it reaches here, every entry is one the compiler could read.
+	 *
+	 * ## The attempt budget is the tenant's, not the platform's
+	 *
+	 * `maxAttempts` and `digitTimeoutMs` come off the set, because how many guesses an international
+	 * calling code is worth is a decision somebody made in a form. Only the digit CEILING is a
+	 * platform fact, and it exists so a caller leaning on a key cannot make the gather run forever.
+	 *
+	 * ## The call is not answered to ask
+	 *
+	 * {@link ensureAnswered} is called, because a gather on an unanswered leg collects nothing —
+	 * this is a gate the caller has to interact with, unlike the concurrency ceiling the orchestrator
+	 * refuses at the door without answering. The cost is that a refused call is a connected call in
+	 * the tenant's own CDR, which is correct here: the caller reached the system and was told no.
+	 */
+	private async challengeOutboundPin(
+		node: TrunkDialPlanNode,
+		number: string,
+	): Promise<
+		{ readonly kind: "granted" } | { readonly kind: "denied"; readonly result: StepResult }
+	> {
+		const set = node.pinSet;
+		if (set === undefined) {
+			return { kind: "granted" };
+		}
+		if (!(await this.ensureAnswered())) {
+			return { kind: "denied", result: { kind: "aborted" } };
+		}
+
+		const prompt =
+			resolveMediaRef({ promptId: set.promptId }, this.settings.mediaRefs) ??
+			this.settings.outboundPinPrompt;
+
+		for (let attempt = 0; attempt < Math.max(1, set.maxAttempts); attempt += 1) {
+			if (this.deps.channel.isTearingDown) {
+				return { kind: "denied", result: { kind: "aborted" } };
+			}
+
+			const result = await this.deps.execute({
+				verb: "gather",
+				maxDigits: this.settings.outboundPinMaxDigits,
+				terminators: ["#"],
+				timeoutMs: set.digitTimeoutMs,
+				interDigitTimeoutMs: this.settings.outboundPinInterDigitTimeoutMs,
+				media: prompt,
+			});
+			if (result === undefined) {
+				return { kind: "denied", result: { kind: "hangup", cause: "NORMAL_TEMPORARY_FAILURE" } };
+			}
+			const collection = collectionOf(result);
+			if (collection?.endReason === "hangup") {
+				return { kind: "denied", result: { kind: "aborted" } };
+			}
+
+			const digits = collection?.digits.join("") ?? "";
+			const matched = await this.matchPinEntry(set, digits);
+			if (matched.kind === "matched") {
+				// Reported BEFORE the dial, for the reason `onDestination` is: the call may end in any
+				// number of ways from here, and the CDR must already know which code paid for it.
+				await this.deps.onPinAuthorization?.({
+					pinSetId: set.pinSetId,
+					pinSetEntryId: matched.entry.pinSetEntryId,
+					ordinal: matched.entry.ordinal,
+					...(matched.entry.label === undefined ? {} : { label: matched.entry.label }),
+				});
+				this.log("an authorisation code opened an outbound route", {
+					pinSet: set.name,
+					ordinal: matched.entry.ordinal,
+				});
+				return { kind: "granted" };
+			}
+			if (matched.kind === "unreadable") {
+				// A defect and not a wrong guess: the compiler refuses to embed a digest it cannot read,
+				// so reaching here means the artifact came from something that skipped that check.
+				// Retrying would only burn the caller's remaining attempts against a broken gate.
+				this.note(
+					`PIN set "${set.name}" carries a digest this release cannot verify (${matched.failure}); the route was refused`,
+				);
+				return {
+					kind: "denied",
+					result: await this.announceAndHangup(
+						this.settings.unavailableAnnouncement,
+						"NORMAL_TEMPORARY_FAILURE",
+					),
+				};
+			}
+			await this.deps.execute({ verb: "play", media: this.settings.outboundPinInvalidPrompt });
+		}
+
+		// `CALL_REJECTED` and not `NORMAL_CLEARING`: a report that cannot tell a refused authorisation
+		// from a caller who changed their mind cannot answer "is somebody guessing our codes?".
+		this.note(
+			`the call to ${number} failed ${String(set.maxAttempts)} authorisation-code attempts against PIN set "${set.name}"`,
+		);
+		const failure =
+			resolveMediaRef({ promptId: set.failurePromptId }, this.settings.mediaRefs) ??
+			this.settings.outboundPinFailurePrompt;
+		return { kind: "denied", result: await this.announceAndHangup(failure, "CALL_REJECTED") };
+	}
+
+	/**
+	 * The entered digits against every code in the set, in ordinal order.
+	 *
+	 * Every entry is checked even after one has matched — no early `break` on the FIRST match beyond
+	 * returning it — because the loop must not exit early on a MISS either: an implementation that
+	 * returned as soon as one digest mismatched would only ever accept code number one. An empty
+	 * entry is refused without a KDF call, which is `verifyPinDigest`'s own `empty-pin` answer and is
+	 * repeated here so a caller who pressed `#` immediately does not consume scrypt work per code.
+	 */
+	private async matchPinEntry(
+		set: CompiledPinSet,
+		digits: string,
+	): Promise<
+		| { readonly kind: "matched"; readonly entry: CompiledPinEntry }
+		| { readonly kind: "mismatch" }
+		| { readonly kind: "unreadable"; readonly failure: string }
+	> {
+		if (digits === "") {
+			return { kind: "mismatch" };
+		}
+		for (const entry of set.entries) {
+			const verified = await verifyPinDigest(digits, entry.pinHash);
+			if (verified.ok) {
+				return { kind: "matched", entry };
+			}
+			if (verified.failure === "malformed-hash" || verified.failure === "kdf-error") {
+				return { kind: "unreadable", failure: verified.failure };
+			}
+		}
+		return { kind: "mismatch" };
+	}
+
+	/**
+	 * A remote audio source, and the fallback that is the whole point of the node.
+	 *
+	 * ## This announces nothing and never hangs up
+	 *
+	 * Every other "we cannot do this" path in this walker ends in {@link announceAndHangup}. This one
+	 * ends in a `goto`, because `StreamPlanNode.fallbackNodeId` is NOT optional — the compiler
+	 * requires it precisely so that a source no media server can open produces a ROUTED call rather
+	 * than an announcement. A caller who reached a shop-radio node whose stream is down should hear
+	 * the shop's IVR, not "the number you have dialled is not available".
+	 *
+	 * ## Why the fallback is taken today, always
+	 *
+	 * `resolveMediaRefOrExplain` refuses every `http(s)` source, and that refusal was verified
+	 * against both drivers rather than assumed — the reason is on that function. So this runtime is,
+	 * for now, an honest recording of an unplayable source: it resolves, notes exactly why the
+	 * platform cannot open it, and branches. That is a different thing from the node kind having no
+	 * case at all, which is what it had before: the walk used to fall into the unimplemented arm,
+	 * announce "unavailable" and HANG UP, discarding a fallback branch the tenant configured.
+	 *
+	 * When the remote-fetch rung lands behind the seam in `media-refs.ts`, the resolution starts
+	 * coming back `playable` and this method plays it. Nothing else here changes.
+	 */
+	private async streamNode(node: StreamPlanNode): Promise<StepResult> {
+		const resolution = resolveMediaRefOrExplain(node.url, this.settings.mediaRefs);
+		if (resolution.kind === "unplayable") {
+			this.note(
+				`audio stream ${node.audioStreamId} could not be played (${resolution.reason}); the call took the stream's fallback`,
+			);
+			return { kind: "goto", nodeId: node.fallbackNodeId };
+		}
+
+		// Only when the source is actually playable. Answering first and then discovering we cannot
+		// play would bill the tenant for a connected call that produced nothing but a branch.
+		if (node.answerFirst && !(await this.ensureAnswered())) {
+			return { kind: "aborted" };
+		}
+
+		const played = await this.deps.execute({ verb: "play", media: resolution.media });
+		if (played === undefined) {
+			this.note(
+				`audio stream ${node.audioStreamId} failed to play; the call took the stream's fallback`,
+			);
+		}
+		// The fallback is taken when the stream ENDS too, not only when it fails — `maxSeconds` of
+		// zero means "until the caller hangs up", and a caller who is still there when a finite
+		// stream finishes must go somewhere rather than sit in silence.
+		return { kind: "goto", nodeId: node.fallbackNodeId };
+	}
+
+	/**
+	 * Dial by name: spell a colleague, hear who matched, press a digit, get connected.
+	 *
+	 * Modelled on {@link ivrMenuNode} — answer, gather with the prompt riding the gather so barge-in
+	 * works, budget the failures, branch on exhaustion — and different from it in the one way that
+	 * makes this feature possible at all: the LIST is compiled. `DialByNamePlanNode.entries` is
+	 * sorted by `digits`, so matching is a prefix scan over an array rather than a query, which is
+	 * what lets the engine answer "who is S-M-I" while holding no database handle.
+	 *
+	 * ## Every name that is offered can be spoken
+	 *
+	 * This platform has no text-to-speech, so a directory that offered an entry it could not SAY
+	 * would produce "for, press one" — which is worse than not offering the person. The compiler
+	 * already drops extensions whose mailbox never recorded a name (`directory-entry-skipped`), so
+	 * `DirectoryEntry.nameMedia` is documented as never absent. It can still fail to RENDER on a
+	 * deployment whose object store is not mounted, and that case is skipped here with a note naming
+	 * the entry rather than played as silence.
+	 *
+	 * ## Why a bounded number of matches is offered
+	 *
+	 * A caller who typed one letter in a company of four hundred should be asked for more letters,
+	 * not read four hundred names. The compiler cannot make that call — it does not know how long an
+	 * audience will listen — so it compiles everyone and `directoryMaxOffers` decides how many one
+	 * round reads out.
+	 */
+	private async dialByNameNode(node: DialByNamePlanNode): Promise<StepResult> {
+		if (!(await this.ensureAnswered())) {
+			return { kind: "aborted" };
+		}
+		if (node.entries.length === 0) {
+			// The compiler warns `empty-directory` for this and still emits the node, because a
+			// directory whose every member lost their recorded name is a real state. Announce rather
+			// than gather: asking somebody to spell a name that can match nobody is a worse minute.
+			this.note(
+				`directory ${node.directoryId} has no entries that can be spoken; announced and hung up`,
+			);
+			return await this.announceAndHangup(
+				this.settings.directoryNoMatchPrompt,
+				"NO_ROUTE_DESTINATION",
+			);
+		}
+
+		let failures = 0;
+		let attempt = 0;
+
+		while (failures <= node.maxFailures) {
+			if (this.deps.channel.isTearingDown) {
+				return { kind: "aborted" };
+			}
+
+			const greeting =
+				attempt === 0
+					? (resolveMediaRef({ promptId: node.greetingPromptId }, this.settings.mediaRefs) ??
+						this.settings.directoryGreeting)
+					: this.settings.directoryInstructions;
+			attempt += 1;
+
+			const result = await this.deps.execute({
+				verb: "gather",
+				maxDigits: this.settings.directoryMaxDigits,
+				terminators: ["#"],
+				timeoutMs: this.settings.directoryTimeoutMs,
+				interDigitTimeoutMs: this.settings.directoryInterDigitTimeoutMs,
+				media: greeting,
+			});
+			if (result === undefined) {
+				return { kind: "hangup", cause: "NORMAL_TEMPORARY_FAILURE" };
+			}
+			const collection = collectionOf(result);
+			if (collection?.endReason === "hangup") {
+				return { kind: "aborted" };
+			}
+
+			const digits = collection?.digits.join("") ?? "";
+			// Too few digits and no digits are the same failure with different causes, and both are
+			// answered the same way: too few letters cannot narrow a directory, and the caller has to
+			// be asked again either way.
+			const matches =
+				digits.length < node.minDigits
+					? []
+					: node.entries.filter((entry) => entry.digits.startsWith(digits));
+
+			if (matches.length === 0) {
+				failures += 1;
+				if (failures > node.maxFailures) {
+					break;
+				}
+				await this.playPrompt(node.invalidPromptId);
+				if (node.invalidPromptId === undefined) {
+					await this.deps.execute({
+						verb: "play",
+						media: this.settings.directoryNoMatchPrompt,
+					});
+				}
+				continue;
+			}
+
+			const offered = await this.offerDirectoryMatches(
+				matches.slice(0, this.settings.directoryMaxOffers),
+			);
+			if (offered.kind === "selected") {
+				return { kind: "goto", nodeId: offered.entry.targetNodeId };
+			}
+			if (offered.kind === "aborted") {
+				return { kind: "aborted" };
+			}
+			if (offered.kind === "failed") {
+				return { kind: "hangup", cause: "NORMAL_TEMPORARY_FAILURE" };
+			}
+
+			// Everyone offered, nobody accepted. That is a failed round, not a hangup: the caller may
+			// have spelt the wrong name, and asking again is what a receptionist would do.
+			failures += 1;
+			if (failures > node.maxFailures) {
+				break;
+			}
+		}
+
+		// Out of attempts. The timeout branch when the tenant configured one, and otherwise a cause
+		// that says what happened — never `NORMAL_CLEARING`, which reads as "the caller hung up".
+		this.note(
+			`directory ${node.directoryId} was left after ${String(failures)} unsuccessful attempts`,
+		);
+		return this.branch(node.timeoutNodeId, "NO_USER_RESPONSE");
+	}
+
+	/**
+	 * Reads out each match and waits for the accept digit.
+	 *
+	 * The sentence is assembled the way `app_directory` assembles it — the recorded name, "please
+	 * press", the digit, "to select this person" — because the verb surface plays one media per
+	 * `play` and because building it from those parts means the accept digit is configurable without
+	 * re-recording anything: it is rendered as `digits:<n>`, a GENERATED media, so there is no file
+	 * to be missing.
+	 *
+	 * The gather rides the trailing fragment, so a caller who already knows which colleague they want
+	 * can press the digit over it instead of waiting out the sentence.
+	 */
+	private async offerDirectoryMatches(
+		matches: readonly DirectoryEntry[],
+	): Promise<
+		| { readonly kind: "selected"; readonly entry: DirectoryEntry }
+		| { readonly kind: "exhausted" }
+		| { readonly kind: "aborted" }
+		| { readonly kind: "failed" }
+	> {
+		for (const entry of matches) {
+			if (this.deps.channel.isTearingDown) {
+				return { kind: "aborted" };
+			}
+			const name = translateMediaRef(entry.nameMedia, this.settings.mediaRefs);
+			if (name === undefined) {
+				// Skipped rather than offered silently. `nameMedia` is compiled as never absent, so this
+				// is a deployment whose object store is not mounted for the media server, and the note
+				// names the extension so an operator can tell which of the two it is.
+				this.note(
+					`directory entry for extension ${entry.extensionNumber} has a recorded name this deployment cannot render; it was not offered`,
+				);
+				continue;
+			}
+
+			await this.deps.execute({ verb: "play", media: name });
+			await this.deps.execute({ verb: "play", media: this.settings.directorySelectPrefix });
+			await this.deps.execute({
+				verb: "play",
+				media: `digits:${this.settings.directorySelectDigit}`,
+			});
+			const result = await this.deps.execute({
+				verb: "gather",
+				maxDigits: 1,
+				terminators: ["#"],
+				timeoutMs: this.settings.directorySelectTimeoutMs,
+				interDigitTimeoutMs: this.settings.directoryInterDigitTimeoutMs,
+				media: this.settings.directorySelectSuffix,
+			});
+			if (result === undefined) {
+				return { kind: "failed" };
+			}
+			const collection = collectionOf(result);
+			if (collection?.endReason === "hangup") {
+				return { kind: "aborted" };
+			}
+			if (collection?.digits.join("") === this.settings.directorySelectDigit) {
+				return { kind: "selected", entry };
+			}
+		}
+		return { kind: "exhausted" };
 	}
 
 	/**
@@ -2063,8 +4645,17 @@ export class PlanWalker {
 				moderator,
 				memberCount: departure.memberCount,
 				durationMs: Math.max(0, (this.deps.now ?? Date.now)() - joinedAtMs),
+				// `hung-up` and not `kicked`: this path is the leg's own death. A moderator's removal
+				// publishes its own `conference.left` from the control responder, with the reason and
+				// the user who did it, because that is the fact a report has to be able to tell apart.
+				reason: "hung-up",
 			});
 			this.deps.channel.setBridge(undefined);
+			// Only into a room that still exists. Beeping an empty bridge on the way to destroying it
+			// is a playback nobody hears and a media command that races the teardown.
+			if (!departure.emptied) {
+				await this.announceConferenceArrival(node, bridgeId, "leave");
+			}
 			if (departure.emptied) {
 				await this.deps.media.destroyBridge(bridgeId);
 			}
@@ -2641,7 +5232,17 @@ export class PlanWalker {
 			...this.deps.queueSettings,
 		});
 
-		const outcome = await session.run();
+		let outcome: QueueOutcome;
+		try {
+			outcome = await session.run();
+			await this.reportQueueOutcome(node, outcome);
+		} finally {
+			// The digit watch outlives nothing: a queued caller who is bridged to an agent is having a
+			// conversation, and a watch still pushing their DTMF into an array nobody reads is a leak
+			// with a caller's keypresses in it.
+			this.queueDigitUnwatch?.();
+			this.queueDigitUnwatch = undefined;
+		}
 
 		switch (outcome.kind) {
 			case "answered": {
@@ -2650,12 +5251,61 @@ export class PlanWalker {
 			case "timeout": {
 				return this.branch(node.timeoutNodeId, "ALLOTTED_TIMEOUT");
 			}
+			case "exit-key": {
+				// `NORMAL_CLEARING` and not `ALLOTTED_TIMEOUT`, which is the whole difference between
+				// this branch and the one above it. A caller who pressed a key made a choice and the
+				// call ended normally; a caller who timed out did not, and an SLA report built on the
+				// cause would otherwise count a working exit key as a queue that runs out of patience.
+				return this.branch(node.exitNodeId, "NORMAL_CLEARING");
+			}
 			case "abandoned":
 			case "aborted": {
 				return { kind: "aborted" };
 			}
 			default: {
 				return { kind: "hangup", cause: "NORMAL_TEMPORARY_FAILURE" };
+			}
+		}
+	}
+
+	/**
+	 * Translates the session's outcome into the CDR's vocabulary and reports it.
+	 *
+	 * `failed` and `aborted` deliberately report NOTHING. Neither is a fact about the caller's stay:
+	 * `failed` is the roster being unreadable, and `aborted` is the leg going away before the session
+	 * could join the line. Filing either as an abandonment would put an infrastructure fault into a
+	 * tenant's service level, where it would look exactly like callers giving up — which is the one
+	 * reading a supervisor must not be handed.
+	 */
+	private async reportQueueOutcome(node: QueuePlanNode, outcome: QueueOutcome): Promise<void> {
+		const report = this.deps.onQueueOutcome;
+		if (report === undefined) {
+			return;
+		}
+		switch (outcome.kind) {
+			case "answered": {
+				await report({
+					queueId: node.queueId,
+					waitMs: outcome.waitMs,
+					outcome: "answered",
+					agentId: outcome.agentId,
+				});
+				return;
+			}
+			case "abandoned": {
+				await report({ queueId: node.queueId, waitMs: outcome.waitMs, outcome: "caller-hangup" });
+				return;
+			}
+			case "exit-key": {
+				await report({ queueId: node.queueId, waitMs: outcome.waitMs, outcome: "exit-key" });
+				return;
+			}
+			case "timeout": {
+				await report({ queueId: node.queueId, waitMs: outcome.waitMs, outcome: outcome.reason });
+				return;
+			}
+			default: {
+				return;
 			}
 		}
 	}
@@ -2670,6 +5320,33 @@ export class PlanWalker {
 	 */
 	private queueCallPort(): QueueCallPort {
 		const { channel, media, execute } = this.deps;
+		// The exit key's digit source, opened for the life of the queued call and closed when the
+		// session returns.
+		//
+		// The signal bus rather than the leg's DTMF inbox, and the choice is worth stating because
+		// both would work. The bus is fed by `onDtmf` BEFORE the digit is offered to anything else,
+		// carries no collection state, and needs nothing threaded through the walker's dependencies —
+		// it is already here for answer confirmation and for supervision escalation. Reading the
+		// inbox instead would mean CONSUMING the digit, which is the wrong default: a `4` pressed in a
+		// queue with no exit key belongs to whatever the caller reaches next, and type-ahead into an
+		// overflow IVR is a thing experienced callers do on purpose.
+		//
+		// The cost of observing rather than consuming is that a digit which IS the exit key is also
+		// left in the buffer. Harmless: the session leaves the queue on it, and the branch it takes
+		// gets one stale digit at most — the same thing that happens today when a caller types over a
+		// greeting.
+		const digits: string[] = [];
+		const unwatch = this.deps.signals?.watch(legSignalKey(channel.mediaChannelId), (signal) => {
+			if (signal.kind === "dtmf") {
+				// Bounded, because a caller holding for twenty minutes on a numeric keypad is a real
+				// thing and this array has no other reader when the queue has no exit key.
+				if (digits.length >= MAX_QUEUE_BUFFERED_DIGITS) {
+					digits.shift();
+				}
+				digits.push(signal.digit);
+			}
+		});
+		this.queueDigitUnwatch = unwatch;
 		return {
 			get isTearingDown(): boolean {
 				return channel.isTearingDown;
@@ -2681,6 +5358,23 @@ export class PlanWalker {
 			ensureAnswered: async () => await this.ensureAnswered(),
 			play: async (playable: string) =>
 				(await execute({ verb: "play", media: playable })) !== undefined,
+			playToAgent: async (mediaChannelId: string, playable: string) => {
+				// `media.play` directly rather than the `play` VERB, because a verb is bound to the
+				// A-leg — the verb executor's whole context is the channel the walk is routing — and
+				// this plays at a leg the walk originated. The playback ref is minted here for the same
+				// reason it is minted everywhere else in this file: the client names it so it can be
+				// stopped without holding server state, even though nothing stops this one.
+				try {
+					await media.play(mediaChannelId, {
+						media: [playable],
+						playbackRef: this.newId(),
+					});
+					return true;
+				} catch (error) {
+					this.log("failed to whisper to a queue agent", { mediaChannelId, err: String(error) });
+					return false;
+				}
+			},
 			startMusicOnHold: async (mohClass?: string) => {
 				try {
 					await media.startMusicOnHold(channel.mediaChannelId, mohClass);
@@ -2703,6 +5397,25 @@ export class PlanWalker {
 				await this.hangupQuietly(mediaChannelId, "NORMAL_TEMPORARY_FAILURE"),
 			bridge: async (mediaChannelId, onEnded) =>
 				(await this.bridgeWith(mediaChannelId, onEnded)).kind === "bridged",
+			pollDigit: () => digits.shift(),
+			startRecording: async () => {
+				// The same seam the record-toggle feature code uses, so a queue recording is
+				// indistinguishable from an on-demand one downstream: one `channel.record.started`, one
+				// object key, one retention rule. A walk with no call-control port announces nothing and
+				// records nothing, which is what an engine with no such port already does everywhere.
+				const control = this.deps.control;
+				if (control?.startRecording === undefined) {
+					this.note(
+						"queue call recording was asked for but this walk has no call-control port; the call was connected without it",
+					);
+					return false;
+				}
+				const outcome = await control.startRecording();
+				if (!outcome.ok && outcome.reason !== undefined) {
+					this.note(`queue call recording was refused: ${outcome.reason}`);
+				}
+				return outcome.ok;
+			},
 			resolvePrompt: (promptId) => resolveMediaRef({ promptId }, this.settings.mediaRefs),
 			spellNumber: (value) => this.spellNumber(value),
 			note: (message) => {
@@ -3271,7 +5984,7 @@ export class PlanWalker {
 				const playbackRef = this.newId();
 				try {
 					await this.deps.media.play(mediaChannelId, {
-						media: [confirm.media],
+						media: [...confirm.media],
 						playbackRef,
 					});
 				} catch (error) {

@@ -213,7 +213,10 @@ function seedArtifact(): RoutingArtifact {
 			maxWaitNoAgentSeconds: 0,
 			announcePositionEnabled: false,
 			announceFrequencySeconds: 60,
-			recordEnabled: false,
+			recordPolicy: "none",
+			priority: 0,
+			abandonedResumeAllowed: false,
+			discardAbandonedAfterSeconds: 0,
 			timeoutNodeId: "hangup:NORMAL_CLEARING",
 		} as PlanNode,
 		{
@@ -224,7 +227,7 @@ function seedArtifact(): RoutingArtifact {
 			requiresPin: false,
 			maxMembers: 0,
 			waitForModerator: false,
-			recordEnabled: false,
+			recordPolicy: "none",
 		} as PlanNode,
 		{
 			id: `queue:${EMPTY_QUEUE_ID}`,
@@ -236,7 +239,10 @@ function seedArtifact(): RoutingArtifact {
 			maxWaitNoAgentSeconds: 2,
 			announcePositionEnabled: false,
 			announceFrequencySeconds: 60,
-			recordEnabled: false,
+			recordPolicy: "none",
+			priority: 0,
+			abandonedResumeAllowed: false,
+			discardAbandonedAfterSeconds: 0,
 			timeoutNodeId: "hangup:NORMAL_CLEARING",
 		} as PlanNode,
 	];
@@ -1346,7 +1352,9 @@ async function parkInstance(natsUrl: string, instanceId: string) {
 	const media = makeFakeMediaPort();
 	const host: CallControlHost = {
 		legFor: (mediaChannelId) => legs.get(mediaChannelId),
+		legByLegId: (legId) => [...legs.values()].find((leg) => leg.legId === legId),
 		ringingFor: async () => [],
+		activeCallsFor: () => [],
 		publish: async () => undefined,
 		route: async () => ({ status: "aborted", notes: [] }),
 		parkLotFor: async () => PARK_IT_LOT,

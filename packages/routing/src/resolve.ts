@@ -26,6 +26,7 @@ import { matchFeatureCode } from "./feature-codes";
 import { applyDigitManipulation, matchPattern } from "./patterns";
 import { tollClassCovers } from "./snapshot";
 import { evaluateTimeCondition } from "./time-conditions";
+import { applyTranslationRuleset } from "./translations";
 import type {
 	CompiledCallBlockRule,
 	EmergencyRule,
@@ -38,6 +39,7 @@ import type {
 import type { Diagnostic } from "./diagnostics";
 import type { ExecutionPlan, PlanNode, PlanNodeId } from "./plan";
 import type { CallBlockAction, CallBlockDirection, TollClass } from "./snapshot";
+import type { TimeConditionEvaluation } from "./time-conditions";
 
 /** How far a chain of time-condition gates may be followed before it is called a loop. */
 export const MAX_GATE_DEPTH = 16;
@@ -48,6 +50,15 @@ export interface ResolveInboundInput {
 	readonly callerNumber?: string;
 	readonly callerName?: string;
 	readonly now: Date;
+	/**
+	 * The trunk the call arrived on, when the caller knows it.
+	 *
+	 * Only used to look up that trunk's caller-id normalisation. Optional because not every inbound
+	 * leg has one — a call from a WebRTC client or an internally originated leg has no trunk — and
+	 * because a caller that has not learned to pass it is a rollout state rather than a bug: the
+	 * number is then screened exactly as it arrived, which is what every release before this one did.
+	 */
+	readonly trunkId?: string;
 }
 
 export interface ResolveInternalInput {
@@ -233,11 +244,17 @@ interface GateWalk {
 }
 
 /**
- * Follows time-condition nodes until a node that actually does something.
+ * Follows gate nodes until a node that actually does something.
  *
  * The gate is evaluated here rather than by the engine so that the plan handed over is already the
  * answer for *this* instant. The nodes stay in the table so a call-flow inspector can still show
  * which gate was crossed.
+ *
+ * Two kinds are gates: a `time-condition`, whose answer is the clock (or an override), and a
+ * `call-flow`, whose answer is a switch somebody threw. They are followed by the same walk because
+ * they compose — a DID pointing at a call flow whose night branch is a time condition is the
+ * ordinary way an after-hours override is built — and because a walk that handled only one of them
+ * would hand the engine a plan that still had a gate in front of it.
  */
 function followGates(artifact: RoutingArtifact, entryNodeId: PlanNodeId, now: Date): GateWalk {
 	const diagnostics: Diagnostic[] = [];
@@ -245,6 +262,16 @@ function followGates(artifact: RoutingArtifact, entryNodeId: PlanNodeId, now: Da
 
 	for (let depth = 0; depth < MAX_GATE_DEPTH; depth += 1) {
 		const node = artifact.nodes[nodeId];
+		if (node !== undefined && node.kind === "call-flow") {
+			diagnostics.push({
+				severity: "info",
+				code: node.mode === "day" ? "time-condition-open" : "time-condition-closed",
+				message: `Call flow "${node.label ?? node.callFlowId}" is in ${node.mode} mode.`,
+				subject: { kind: "call-flow", id: node.callFlowId, name: node.label },
+			});
+			nodeId = node.mode === "day" ? node.dayNodeId : node.nightNodeId;
+			continue;
+		}
 		if (node === undefined || node.kind !== "time-condition") {
 			return { nodeId, diagnostics };
 		}
@@ -262,7 +289,7 @@ function followGates(artifact: RoutingArtifact, entryNodeId: PlanNodeId, now: Da
 		diagnostics.push({
 			severity: "info",
 			code: evaluation.matched ? "time-condition-open" : "time-condition-closed",
-			message: `Time condition "${condition.name}" evaluated ${evaluation.matched ? "open" : "closed"} at ${evaluation.at.date} ${pad2(evaluation.at.hour)}:${pad2(evaluation.at.minute)} ${condition.timezone}.`,
+			message: timeConditionMessage(condition.name, condition.timezone, evaluation),
 			subject: { kind: "time-condition", id: condition.id, name: condition.name },
 		});
 		const next = evaluation.matched ? node.matchNodeId : node.noMatchNodeId;
@@ -282,6 +309,26 @@ function followGates(artifact: RoutingArtifact, entryNodeId: PlanNodeId, now: Da
 
 function pad2(value: number): string {
 	return value < 10 ? `0${value}` : String(value);
+}
+
+/**
+ * The one-line explanation of a gate's answer.
+ *
+ * The clock is always named, override or not, because the support question is "why did this go to
+ * voicemail at 2pm on a Tuesday" and the clock is half of that answer. When an override is in force
+ * the sentence says so and says the rules were NOT read, which is the other half — without it a
+ * reader is left comparing the rule list against the timestamp and finding they disagree.
+ */
+function timeConditionMessage(
+	name: string,
+	timezone: string,
+	evaluation: TimeConditionEvaluation,
+): string {
+	const clock = `${evaluation.at.date} ${pad2(evaluation.at.hour)}:${pad2(evaluation.at.minute)} ${timezone}`;
+	if (evaluation.overridden !== undefined) {
+		return `Time condition "${name}" is manually overridden to ${evaluation.overridden}, so it evaluated ${evaluation.matched ? "open" : "closed"} at ${clock} without reading its rules.`;
+	}
+	return `Time condition "${name}" evaluated ${evaluation.matched ? "open" : "closed"} at ${clock}.`;
 }
 
 /** Evaluates a route's gate. `null` means "no gate"; `false` with no closed branch means "skip me". */
@@ -307,7 +354,7 @@ function gateOutcome(
 	diagnostics.push({
 		severity: "info",
 		code: evaluation.matched ? "time-condition-open" : "time-condition-closed",
-		message: `Time condition "${condition.name}" evaluated ${evaluation.matched ? "open" : "closed"} at ${evaluation.at.date} ${pad2(evaluation.at.hour)}:${pad2(evaluation.at.minute)} ${condition.timezone}.`,
+		message: timeConditionMessage(condition.name, condition.timezone, evaluation),
 		subject: { kind: "time-condition", id: condition.id, name: condition.name },
 	});
 	return evaluation.matched
@@ -330,9 +377,13 @@ function gateOutcome(
  */
 export function resolveInbound(
 	artifact: RoutingArtifact,
-	input: ResolveInboundInput,
+	rawInput: ResolveInboundInput,
 ): ResolvedRoute {
 	const diagnostics: Diagnostic[] = [];
+	// FIRST, before the screen and before the rule walk. The whole point of a per-trunk ruleset is
+	// that a tenant's blocklist should not have to know which carrier presented `0044…` and which
+	// presented `+44…`.
+	const input = normaliseInboundCaller(artifact, rawInput, diagnostics);
 	const blockRule = checkCallBlock(artifact.callBlock, input.callerNumber, "inbound");
 	let blocked: BlockOutcome | undefined;
 
@@ -424,6 +475,49 @@ export function resolveInbound(
 	});
 }
 
+/**
+ * Applies the arriving trunk's caller-id normalisation, if it has one.
+ *
+ * Returns the input unchanged whenever there is nothing to do — no trunk, no ruleset, no rule that
+ * matched — so the common path allocates nothing. A rewrite that took place is an `info` diagnostic
+ * naming the ruleset, because "the blocklist did not fire on the number the carrier sent" is only
+ * explicable if the walk records that the number changed.
+ */
+function normaliseInboundCaller(
+	artifact: RoutingArtifact,
+	input: ResolveInboundInput,
+	diagnostics: Diagnostic[],
+): ResolveInboundInput {
+	const caller = input.callerNumber;
+	if (input.trunkId === undefined || caller === undefined || caller.length === 0) {
+		return input;
+	}
+	const ruleset = artifact.inbound.inboundTranslations?.[input.trunkId];
+	if (ruleset === undefined || ruleset.rules.length === 0) {
+		return input;
+	}
+	const outcome = applyTranslationRuleset(ruleset, caller);
+	if (outcome.overflowed) {
+		diagnostics.push({
+			severity: "warning",
+			code: "number-translated",
+			message: `Ruleset "${ruleset.name}" would have grown caller id ${caller} past the length bound; it was used as it arrived.`,
+			subject: { kind: "translation-ruleset", id: ruleset.id, name: ruleset.name },
+		});
+		return input;
+	}
+	if (outcome.value === caller) {
+		return input;
+	}
+	diagnostics.push({
+		severity: "info",
+		code: "number-translated",
+		message: `Ruleset "${ruleset.name}" normalised the inbound caller id ${caller} to ${outcome.value}.`,
+		subject: { kind: "translation-ruleset", id: ruleset.id, name: ruleset.name },
+	});
+	return { ...input, callerNumber: outcome.value };
+}
+
 function matchInboundRule(
 	rule: InboundRule,
 	input: ResolveInboundInput,
@@ -491,9 +585,11 @@ function prefixedCallerName(
 /**
  * Resolves a call between two internal parties.
  *
- * Order is fixed and is part of the contract: feature codes, voicemail prefixes, exact internal
- * numbers, park slots. Feature codes first because they begin with `*` and no internal number may;
- * voicemail prefixes before numbers so `*99200` is a mailbox and not an extension named `*99200`.
+ * Order is fixed and is part of the contract: feature codes, voicemail prefixes, speed dials, exact
+ * internal numbers, park slots. Feature codes first because they begin with `*` and no internal
+ * number may; voicemail prefixes before numbers so `*99200` is a mailbox and not an extension named
+ * `*99200`; speed dials after the codes because a code must always win, and before the numbers
+ * because a bare-numeric code has to be reachable at all.
  */
 export function resolveInternal(
 	artifact: RoutingArtifact,
@@ -563,6 +659,26 @@ export function resolveInternal(
 			matchedRuleId: mailbox.voicemailBoxId,
 			matchedRuleName: `${entry.prefix}${mailboxNumber}`,
 			reason: `matched voicemail prefix ${entry.prefix}`,
+			diagnostics,
+		});
+	}
+
+	// AFTER the feature codes and the voicemail prefixes, BEFORE the exact numbers. The ordering and
+	// its argument are in `speed-dials-schema.ts`: a feature code must always win (an unguarded `*01`
+	// would otherwise be swallowed by the seeded `*0` eavesdrop code and its required argument), and
+	// a numeric code has to be reachable before the number map is consulted.
+	const speedDial = artifact.internal.speedDials?.[input.dialed];
+	if (speedDial !== undefined) {
+		const walk = followGates(artifact, speedDial.nodeId, input.now);
+		diagnostics.push(...walk.diagnostics);
+		return compactRoute({
+			matched: true,
+			context: "internal",
+			plan: planFrom(artifact, walk.nodeId),
+			matchedRuleId: speedDial.speedDialId,
+			matchedRuleName: speedDial.code,
+			callerIdNumber: input.from,
+			reason: `matched speed dial ${speedDial.code} ("${speedDial.label}")`,
 			diagnostics,
 		});
 	}
@@ -729,10 +845,16 @@ export function resolveOutbound(
 			});
 		}
 
-		const dialedNumber = applyDigitManipulation(
+		const manipulated = applyDigitManipulation(
 			{ stripDigits: rule.stripDigits, prependDigits: rule.prependDigits ?? null },
 			input.dialed,
 		);
+		// The shared ruleset runs SECOND, on the number the inline pair produced. See
+		// `translations-schema.ts`: the inline pair turns what fingers did into the number meant, and
+		// the ruleset normalises that for the wire — a ruleset that ran first would have to know about
+		// every route's outside-line prefix, which is the coupling the shared layer exists to remove.
+		const dialedNumber =
+			manipulated === null ? null : applyRouteTranslation(rule, manipulated, diagnostics);
 		if (dialedNumber === null) {
 			diagnostics.push({
 				severity: "warning",
@@ -784,6 +906,37 @@ export function resolveOutbound(
 		reason: `no outbound route matched ${input.dialed}`,
 		diagnostics,
 	});
+}
+
+/** Runs a matched route's shared ruleset over the already-manipulated number. */
+function applyRouteTranslation(
+	rule: OutboundRule,
+	dialed: string,
+	diagnostics: Diagnostic[],
+): string {
+	const ruleset = rule.translation;
+	if (ruleset === undefined || ruleset.rules.length === 0) {
+		return dialed;
+	}
+	const outcome = applyTranslationRuleset(ruleset, dialed);
+	if (outcome.overflowed) {
+		diagnostics.push({
+			severity: "warning",
+			code: "number-translated",
+			message: `Ruleset "${ruleset.name}" would have grown ${dialed} past the length bound; route "${rule.name}" dialed it unchanged.`,
+			subject: { kind: "translation-ruleset", id: ruleset.id, name: ruleset.name },
+		});
+		return dialed;
+	}
+	if (outcome.value !== dialed) {
+		diagnostics.push({
+			severity: "info",
+			code: "number-translated",
+			message: `Ruleset "${ruleset.name}" rewrote ${dialed} to ${outcome.value} for route "${rule.name}".`,
+			subject: { kind: "translation-ruleset", id: ruleset.id, name: ruleset.name },
+		});
+	}
+	return outcome.value;
 }
 
 function matchOutboundRule(

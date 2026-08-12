@@ -29,6 +29,14 @@ export const pbxRelations = defineRelations(pbxTables, (r) => ({
 		deviceLines: r.many.deviceLine({ from: r.extension.id, to: r.deviceLine.extensionId }),
 		voicemailBoxes: r.many.voicemailBox({ from: r.extension.id, to: r.voicemailBox.extensionId }),
 		queueAgents: r.many.queueAgent({ from: r.extension.id, to: r.queueAgent.extensionId }),
+		pagingGroupMemberships: r.many.pagingGroupMember({
+			from: r.extension.id,
+			to: r.pagingGroupMember.extensionId,
+		}),
+		sharedLineAppearances: r.many.sharedLineAppearance({
+			from: r.extension.id,
+			to: r.sharedLineAppearance.extensionId,
+		}),
 	},
 	extensionUser: {
 		extension: r.one.extension({
@@ -85,6 +93,31 @@ export const pbxRelations = defineRelations(pbxTables, (r) => ({
 			from: r.phoneNumber.id,
 			to: r.inboundRoute.phoneNumberId,
 		}),
+		faxServers: r.many.faxServer({
+			from: r.phoneNumber.id,
+			to: r.faxServer.phoneNumberId,
+		}),
+	},
+
+	// --- Fax ---------------------------------------------------------------------------------
+	faxServer: {
+		// Optional: the DID reference is nullable and `set null`, so a server can exist unbound.
+		phoneNumber: r.one.phoneNumber({
+			from: r.faxServer.phoneNumberId,
+			to: r.phoneNumber.id,
+		}),
+		messages: r.many.faxMessage({
+			from: r.faxServer.id,
+			to: r.faxMessage.faxServerId,
+		}),
+	},
+	faxMessage: {
+		// Not optional: a message row whose server is gone cannot exist — the foreign key cascades.
+		faxServer: r.one.faxServer({
+			from: r.faxMessage.faxServerId,
+			to: r.faxServer.id,
+			optional: false,
+		}),
 	},
 
 	// --- Routing -----------------------------------------------------------------------------
@@ -99,6 +132,11 @@ export const pbxRelations = defineRelations(pbxTables, (r) => ({
 		timeCondition: r.one.timeCondition({
 			from: r.outboundRoute.timeConditionId,
 			to: r.timeCondition.id,
+		}),
+		pinSet: r.one.pinSet({ from: r.outboundRoute.pinSetId, to: r.pinSet.id }),
+		translationRuleset: r.one.translationRuleset({
+			from: r.outboundRoute.translationRulesetId,
+			to: r.translationRuleset.id,
 		}),
 	},
 	timeCondition: {
@@ -159,6 +197,51 @@ export const pbxRelations = defineRelations(pbxTables, (r) => ({
 		ringGroup: r.one.ringGroup({
 			from: r.ringGroupDestination.ringGroupId,
 			to: r.ringGroup.id,
+			optional: false,
+		}),
+	},
+
+	// --- Paging ------------------------------------------------------------------------------
+	pagingGroup: {
+		members: r.many.pagingGroupMember({
+			from: r.pagingGroup.id,
+			to: r.pagingGroupMember.pagingGroupId,
+		}),
+	},
+	pagingGroupMember: {
+		pagingGroup: r.one.pagingGroup({
+			from: r.pagingGroupMember.pagingGroupId,
+			to: r.pagingGroup.id,
+			optional: false,
+		}),
+		// Not optional: a member row whose extension is gone cannot exist — the foreign key cascades
+		// the delete rather than leaving a member pointing at nothing, which is the whole reason
+		// membership is a table and not a text list.
+		extension: r.one.extension({
+			from: r.pagingGroupMember.extensionId,
+			to: r.extension.id,
+			optional: false,
+		}),
+	},
+
+	// --- Shared lines ------------------------------------------------------------------------
+	sharedLine: {
+		appearances: r.many.sharedLineAppearance({
+			from: r.sharedLine.id,
+			to: r.sharedLineAppearance.sharedLineId,
+		}),
+	},
+	sharedLineAppearance: {
+		sharedLine: r.one.sharedLine({
+			from: r.sharedLineAppearance.sharedLineId,
+			to: r.sharedLine.id,
+			optional: false,
+		}),
+		// Not optional, for the same reason a paging member is not: the FK cascades the delete
+		// rather than leaving an appearance pointing at a line or extension that is gone.
+		extension: r.one.extension({
+			from: r.sharedLineAppearance.extensionId,
+			to: r.extension.id,
 			optional: false,
 		}),
 	},
@@ -233,6 +316,74 @@ export const pbxRelations = defineRelations(pbxTables, (r) => ({
 	},
 	parkLot: {
 		mohClass: r.one.mohClass({ from: r.parkLot.mohClassId, to: r.mohClass.id }),
+	},
+
+	// --- T2 admin block ------------------------------------------------------------------------
+	//
+	// Six of these nine tables have no relation at all, and that is the honest configuration rather
+	// than an omission: `call_flow`, `destination_alias`, `audio_stream`, `dial_by_name_directory`,
+	// `speed_dial` and `org_limit` carry destination trios and nothing else, and a trio is
+	// deliberately NOT a relation — `destination_ref` has no single target table, which is the whole
+	// point of this file's header. `schema.spec.ts` asserts one key per table, so they are declared
+	// empty rather than absent.
+	callFlow: {},
+	destinationAlias: {},
+	audioStream: {},
+	dialByNameDirectory: {},
+	speedDial: {},
+	orgLimit: {},
+	pinSet: {
+		entries: r.many.pinSetEntry({ from: r.pinSet.id, to: r.pinSetEntry.pinSetId }),
+		outboundRoutes: r.many.outboundRoute({ from: r.pinSet.id, to: r.outboundRoute.pinSetId }),
+	},
+	pinSetEntry: {
+		pinSet: r.one.pinSet({
+			from: r.pinSetEntry.pinSetId,
+			to: r.pinSet.id,
+			optional: false,
+		}),
+	},
+	translationRuleset: {
+		rules: r.many.translationRule({
+			from: r.translationRuleset.id,
+			to: r.translationRule.translationRulesetId,
+		}),
+		outboundRoutes: r.many.outboundRoute({
+			from: r.translationRuleset.id,
+			to: r.outboundRoute.translationRulesetId,
+		}),
+		trunks: r.many.trunk({
+			from: r.translationRuleset.id,
+			to: r.trunk.inboundTranslationRulesetId,
+		}),
+	},
+	translationRule: {
+		translationRuleset: r.one.translationRuleset({
+			from: r.translationRule.translationRulesetId,
+			to: r.translationRuleset.id,
+			optional: false,
+		}),
+	},
+	// Both sides point at `prompt`, which is what makes a phrase a prompt row rather than a table of
+	// its own — see `PROMPT_KINDS`. Named `phrase` and `audio` so a reader is never left wondering
+	// which of two `prompt` relations is the container and which is the content.
+	phraseStep: {
+		phrase: r.one.prompt({
+			from: r.phraseStep.phraseId,
+			to: r.prompt.id,
+			optional: false,
+		}),
+		audio: r.one.prompt({
+			from: r.phraseStep.promptId,
+			to: r.prompt.id,
+			optional: false,
+		}),
+	},
+	trunk: {
+		inboundTranslationRuleset: r.one.translationRuleset({
+			from: r.trunk.inboundTranslationRulesetId,
+			to: r.translationRuleset.id,
+		}),
 	},
 }));
 

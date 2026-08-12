@@ -356,6 +356,7 @@ export async function readRosterRows(
 				agent.extensionId === null ? null : (extensionNumbersById.get(agent.extensionId) ?? null),
 			level: tier.level,
 			position: tier.position,
+			announcePromptId: tier.announcePromptId,
 			wrapUpSeconds: agent.wrapUpSeconds,
 			maxNoAnswer: agent.maxNoAnswer,
 			noAnswerDelaySeconds: agent.noAnswerDelaySeconds,

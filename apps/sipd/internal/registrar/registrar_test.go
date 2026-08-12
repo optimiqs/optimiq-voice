@@ -293,6 +293,40 @@ func TestRegisterChallengesThenBinds(t *testing.T) {
 	}
 }
 
+// A credential that names a shared line appearance must carry that appearance onto the binding, so
+// the INVITE path can stamp a Call-Info appearance-index header on the call to this phone. Same
+// reply→Credential→Binding thread the deviceId travels, one field further along.
+func TestSharedLineAppearanceFlowsFromCredentialToBinding(t *testing.T) {
+	sharedLine := "2000"
+	appearance := 2
+	lookup := staticCredentials{credential: credentials.Credential{
+		OrgID:            testOrg,
+		Username:         testUser,
+		Realm:            testRealm,
+		HA1:              credentials.HA1(testUser, testRealm, testPass),
+		DeviceID:         "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b50",
+		ExtensionID:      "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51",
+		SharedLineNumber: &sharedLine,
+		AppearanceIndex:  &appearance,
+	}}
+	h := newHarness(t, lookup)
+
+	if res := h.register(contactHeader("sip:1001@203.0.113.9:5060", "expires=600")); res.StatusCode != 200 {
+		t.Fatalf("REGISTER = %d", res.StatusCode)
+	}
+
+	binding, found := h.binding()
+	if !found {
+		t.Fatal("no binding was written to the location service")
+	}
+	if binding.SharedLineNumber == nil || *binding.SharedLineNumber != sharedLine {
+		t.Errorf("binding.SharedLineNumber = %v, want %q", binding.SharedLineNumber, sharedLine)
+	}
+	if binding.AppearanceIndex == nil || *binding.AppearanceIndex != appearance {
+		t.Errorf("binding.AppearanceIndex = %v, want %d", binding.AppearanceIndex, appearance)
+	}
+}
+
 func TestRefreshKeepsTheOriginalRegistrationInstant(t *testing.T) {
 	h := newHarness(t, nil)
 
@@ -673,6 +707,17 @@ func TestOptionsAndUnsupportedMethods(t *testing.T) {
 	}, "\r\n"))
 	tx = siptest.NewServerTxRecorder(invite)
 	h.registrar.HandleUnsupported(invite, tx)
+	// Terminated BEFORE the recorder is read, and only on the INVITE transaction.
+	//
+	// A final response to an INVITE puts sipgo's server transaction into Completed, which arms
+	// RFC 3261 §17.2.1's Timer G and retransmits that response from a timer goroutine until the ACK
+	// or Timer H. `siptest.ServerTxRecorder` takes no lock, so that goroutine writes the same slice
+	// this test reads — a data race `go test -race` finds, in sipgo's recorder rather than in
+	// anything this package wrote, and one that survives the test function by half a second.
+	//
+	// Terminating first stops the FSM while the response we care about is already recorded. It is
+	// what a real transport does when the ACK arrives, so nothing about the assertion changes.
+	tx.Terminate()
 	res = lastResponse(t, tx)
 	if res.StatusCode != 501 {
 		t.Errorf("INVITE = %d, want 501 Not Implemented", res.StatusCode)

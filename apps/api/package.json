@@ -21,6 +21,8 @@
 		"prebuild": "rimraf ./dist tsconfig.tsbuildinfo tsconfig.build.tsbuildinfo",
 		"rebuild:did-index": "tsx scripts/rebuild-did-index.ts",
 		"rebuild:queue-membership": "tsx scripts/rebuild-queue-membership.ts",
+		"rebuild:sip-acl": "tsx scripts/rebuild-sip-acl.ts",
+		"rebuild:trunks": "tsx scripts/rebuild-trunks.ts",
 		"seed:cdr": "tsx scripts/seed-cdr-demo.ts",
 		"seed:pbx": "tsx scripts/seed-pbx-demo.ts",
 		"start:dev": "nodemon --exec tsx --watch src src/main.ts",

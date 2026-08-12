@@ -19,6 +19,13 @@ export const createTrunkDto = z.strictObject({
 	registerExpiresSeconds: resettable(z.int().min(30).max(86_400)),
 	transport: z.enum(SIP_TRANSPORTS).optional(),
 	codecPrefs: z.string().max(128).nullish(),
+	/**
+	 * Normalises the caller id ARRIVING on this trunk, before anything reads it. Nothing composes
+	 * with it — a trunk has no inline manipulation — so it runs first and alone. A ruleset that is
+	 * missing or disabled is a `dangling-translation-ruleset` warning from the compiler, not a
+	 * refusal here: an absent rewrite is a trunk that still carries calls.
+	 */
+	inboundTranslationRulesetId: z.uuid().nullish(),
 	maxChannels: z.int().min(1).max(10_000).nullish(),
 	callerIdNumberOverride: z.string().max(32).nullish(),
 	enabled: z.boolean().optional(),

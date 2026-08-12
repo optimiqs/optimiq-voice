@@ -336,6 +336,52 @@ describe("invalidation", () => {
 	});
 });
 
+describe("findTrunkEndpoint", () => {
+	const TRUNK = "0195c0f0-1c2f-7000-8000-0000000000b1";
+	const trunkNodes = {
+		"trunk-dial:route-1": {
+			id: "trunk-dial:route-1",
+			kind: "trunk-dial",
+			outboundRouteId: "route-1",
+			tollClass: "national",
+			attempts: [
+				{
+					trunkId: TRUNK,
+					name: "carrier-a",
+					kind: "register",
+					sipDomain: "sip.carrier-a.example",
+					sipProxy: "sip.carrier-a.example",
+					transport: "udp",
+					order: 1,
+				},
+			],
+			continueOnCauses: [],
+			recordEnabled: false,
+		},
+	};
+
+	it("resolves a PJSIP endpoint name to the trunk row the artifact's attempts carry", async () => {
+		const h = harness({ seed: { [routingCacheKey(ORG)]: { ...artifact(), nodes: trunkNodes } } });
+		await h.source.get(ORG);
+
+		expect(h.source.findTrunkEndpoint("carrier-a")).toEqual({
+			organizationId: ORG,
+			trunkId: TRUNK,
+		});
+	});
+
+	it("answers undefined for an unknown endpoint without touching KV or the resolve rpc", async () => {
+		// Memory only, by contract: a qualify tick must never become a KV read or a compile.
+		const h = harness({ seed: { [routingCacheKey(ORG)]: { ...artifact(), nodes: trunkNodes } } });
+		await h.source.get(ORG);
+		const kvReadsBefore = h.kv.gets();
+
+		expect(h.source.findTrunkEndpoint("carrier-z")).toBeUndefined();
+		expect(h.kv.gets()).toBe(kvReadsBefore);
+		expect(h.sent).toHaveLength(0);
+	});
+});
+
 /** Lets the detached watch loop run. */
 async function settle(): Promise<void> {
 	for (let index = 0; index < 8; index += 1) {

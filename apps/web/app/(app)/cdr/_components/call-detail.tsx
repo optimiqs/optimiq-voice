@@ -119,6 +119,28 @@ function CallLegLine({
 				 * true thing in the pair.
 				 */}
 				<Detail label="Cause code" value={String(leg.hangupCauseCode)} />
+				{/*
+				 * The authorisation code that let this leg dial out, when one was demanded.
+				 *
+				 * `== null` and not a truthiness test: ordinal `0` is the FIRST code in a PIN set, and a
+				 * falsy check would hide the one leg most likely to be somebody's shared front-desk code.
+				 * It also covers the two absences at once — a leg where no code was demanded, and a leg
+				 * read through a projection that does not carry the columns yet. See `CallLegRow`.
+				 *
+				 * The label may legitimately be null while the ordinal is not: an entry in a PIN set need
+				 * not be named. "Authorised by code 3" is still the whole of what was recorded, and is
+				 * enough to find the entry in the set.
+				 */}
+				{leg.authPinOrdinal == null ? null : (
+					<Detail
+						label="Authorised by"
+						value={
+							leg.authPinLabel == null
+								? `code ${String(leg.authPinOrdinal)}`
+								: `code ${String(leg.authPinOrdinal)} (${leg.authPinLabel})`
+						}
+					/>
+				)}
 			</dl>
 
 			{recordings.length > 0 ? (

@@ -1,6 +1,8 @@
 import { expect } from "chai";
 import {
 	affectsQueueMembership,
+	affectsSipAcl,
+	affectsTrunkDirectory,
 	backoffMs,
 	isDue,
 	payloadOf,
@@ -56,6 +58,49 @@ describe("projectionsOwedBy", () => {
 	it("keeps the roster tables in one place for the repository and the publisher", () => {
 		expect(affectsQueueMembership("extension")).to.equal(true);
 		expect(affectsQueueMembership("voicemail_message")).to.equal(false);
+	});
+
+	/**
+	 * `sip_acl_entry` is absent from `ROUTING_TABLE_TO_ENTITY`, so it never recompiles and
+	 * `onArtifactCompiled` never fires for it. Without its own predicate here it would owe NOTHING,
+	 * which is the failure this asserts against: a write to the toll-fraud boundary that the fast
+	 * path published and the sweeper could never republish if that publish were lost.
+	 */
+	it("owes the ACL for the one table whose only hook is the mutation seam", () => {
+		expect(projectionsOwedBy("sip_acl_entry", false)).to.deep.equal(["sip-acl"]);
+	});
+
+	/**
+	 * A `trunk` write owes THREE, and the overlap is deliberate rather than double counting.
+	 * `affectsRouting("trunk")` is true because an outbound route's failover list names trunks,
+	 * while the `trunks` bucket carries the carrier's DIALABLE address — two different facts derived
+	 * from one row, published to two buckets with two different readers.
+	 *
+	 * The directory rides on the table and not on `artifactChanged`, which is what stops a renamed
+	 * `sip_proxy` from waiting for a recompile that happened not to move the snapshot hash. The
+	 * second assertion is that case: nothing the compiler reads changed, and the edge is still owed.
+	 */
+	it("owes the carrier directory off the table, not off the artifact", () => {
+		expect(projectionsOwedBy("trunk", true)).to.deep.equal([
+			"routing-cache",
+			"did-index",
+			"trunks",
+		]);
+		expect(projectionsOwedBy("trunk", false)).to.deep.equal(["trunks"]);
+	});
+
+	/**
+	 * The status write-back is the one `trunk` writer that must NOT produce an obligation, and it
+	 * does not — because it bypasses the repository entirely and so never reaches `announce()`.
+	 * There is nothing to assert about it here; the assertion is in the shape of the seam, and the
+	 * argument is in `trunk-directory.publisher.ts`. What IS assertable is that the two new tables
+	 * live in one place, as the roster's do.
+	 */
+	it("keeps the edge tables in one place for the repository and the publishers", () => {
+		expect(affectsTrunkDirectory("trunk")).to.equal(true);
+		expect(affectsTrunkDirectory("outbound_route")).to.equal(false);
+		expect(affectsSipAcl("sip_acl_entry")).to.equal(true);
+		expect(affectsSipAcl("sip_auth_event")).to.equal(false);
 	});
 });
 

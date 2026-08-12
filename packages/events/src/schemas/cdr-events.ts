@@ -67,6 +67,88 @@ export const cdrLegWriteDataSchema = z.looseObject({
 	hangupCauseCode: hangupCauseCodeSchema,
 	hangupSide: hangupSideSchema.nullish(),
 	disposition: dispositionSchema,
+
+	// --- the queue leg ---------------------------------------------------------------------------
+	/**
+	 * What happened to this caller in the queue they reached, when they reached one.
+	 *
+	 * ## Why the ledger and not the event stream
+	 *
+	 * `queue.evt.v1.*` already carries every one of these facts, durably and replayably, and a
+	 * wallboard reads them live. What it cannot answer is the question a supervisor asks on Monday
+	 * morning: "what was our service level last week, by queue, by hour". That is an aggregate over a
+	 * time window on rows that are already partitioned by time and already scoped by RLS — which is a
+	 * SQL query over `call_legs`, and rebuilding one from a stream on every request would be a scan
+	 * of a log with no index on any of the columns being asked about.
+	 *
+	 * So the queue outcome is written where every other per-call fact is written, beside the numbers,
+	 * the timestamps and the disposition it will be reported alongside.
+	 *
+	 * ## Why all four are optional
+	 *
+	 * A leg that never touched a queue carries none of them, which is most legs. Optionality here is
+	 * not a rollout affordance — it is the domain: `queueWaitMs` on a direct extension call would be
+	 * a zero that an average would then include, and an average hold time computed over every call in
+	 * the tenant is a number that is wrong in a direction nobody notices.
+	 */
+	queueRef: z.uuid().nullish(),
+	/**
+	 * How long the caller held before the queue let them go, one way or another.
+	 *
+	 * The SLA numerator's input, and the same value `queue.caller.answered` / `caller.abandoned`
+	 * publish — deliberately, so a live wallboard and a historical report cannot disagree about what
+	 * "wait" means. It is the time between joining the line and leaving it, and it excludes the
+	 * agent's ring time, because a caller who was already talking to somebody was not waiting.
+	 */
+	queueWaitMs: z.int().min(0).nullish(),
+	/**
+	 * How the caller's stay ended. The DISCRIMINATOR every queue report groups by.
+	 *
+	 * The same vocabulary as `queue.caller.abandoned`'s `reason` plus `answered`, which is what makes
+	 * the two surfaces comparable. `exit-key` stays distinct from `overflow` for the reason it does
+	 * there: one caller chose to stop waiting and the other had the choice made for them, and only
+	 * one of those tells a supervisor their exit key is working.
+	 */
+	queueOutcome: z
+		.enum(["answered", "caller-hangup", "timeout", "overflow", "no-agents", "exit-key"])
+		.nullish(),
+	/**
+	 * The `queue_agent` who took the call. Absent on every outcome except `answered`.
+	 *
+	 * A queue-agent row id, not a user id: `cdr-db` holds no user ids at all and this does not change
+	 * that. An agent's identity is resolvable through `queue_agent` in `pbx-db` by whoever is allowed
+	 * to see it, which keeps the ledger free of the one kind of identifier its access model has never
+	 * had to reason about.
+	 */
+	queueAgentRef: z.uuid().nullish(),
+
+	// --- the authorisation code that paid for an outbound call -----------------------------------
+	/**
+	 * Which code opened the gated outbound route this leg took, when it took one.
+	 *
+	 * ## The ordinal and the label, never the digits
+	 *
+	 * A PIN on an outbound route is a spending control, so the question the ledger exists to answer
+	 * is "who authorised this call to Paraguay". The answer a tenant recognises is the ordinal and
+	 * the label they typed into a form — "code 3, the night desk" — and that is deliberately ALL that
+	 * travels: `pin_set_entry` stores a scrypt digest and never the plaintext upstream kept, and
+	 * putting the code on the event stream would undo that in one field. The engine's walker is where
+	 * the digits stop; everything downstream of it sees an identity.
+	 *
+	 * ## Why the label as well as the ordinal
+	 *
+	 * `cdr-db` holds no `pin_set` rows to join against — that is `pbx-db`, a different database with
+	 * a different access model — so a report that had only the ordinal could say "code 3" and nothing
+	 * more. Carrying the label denormalises on purpose, and the denormalisation is the point: a label
+	 * that is renamed in `pbx-db` six months later must not retroactively rewrite what a call record
+	 * says happened.
+	 *
+	 * Both absent on every call that took no gated route, which is nearly all of them. A refused code
+	 * produces no leg-level field at all — the call ends `CALL_REJECTED` and the attempts are in the
+	 * engine's log, because a refusal spent nothing and has no authorisation to record.
+	 */
+	authPinOrdinal: z.int().min(0).nullish(),
+	authPinLabel: z.string().max(128).nullish(),
 });
 
 export const CDR_LEG_WRITE = defineEvent("cdr", "cdr.leg.write", cdrLegWriteDataSchema);

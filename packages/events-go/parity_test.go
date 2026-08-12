@@ -29,6 +29,7 @@ type goldenParsedSubject struct {
 	QueueID   string `json:"queueId"`
 	MailboxID string `json:"mailboxId"`
 	SessionID string `json:"sessionId"`
+	TrunkID   string `json:"trunkId"`
 	Event     string `json:"event"`
 	Service   string `json:"service"`
 	Method    string `json:"method"`
@@ -70,6 +71,11 @@ type golden struct {
 		AOR   string `json:"aor"`
 		Token string `json:"token"`
 	} `json:"aorSubjectTokens"`
+
+	InstanceSubjectTokens []struct {
+		InstanceID string `json:"instanceId"`
+		Token      string `json:"token"`
+	} `json:"instanceSubjectTokens"`
 
 	DIDIndexTokens []struct {
 		DID   string `json:"did"`
@@ -162,9 +168,11 @@ func TestParityConstants(t *testing.T) {
 	roots := map[string]string{
 		"call":         SubjectRootCall,
 		"registration": SubjectRootRegistration,
+		"sipDialog":    SubjectRootSIPDialog,
 		"queue":        SubjectRootQueue,
 		"voicemail":    SubjectRootVoicemail,
 		"media":        SubjectRootMedia,
+		"trunk":        SubjectRootTrunk,
 		"cdrLeg":       SubjectRootCDRLeg,
 		"audit":        SubjectRootAudit,
 		"provision":    SubjectRootProvision,
@@ -174,22 +182,38 @@ func TestParityConstants(t *testing.T) {
 	}
 
 	rpc := map[string]string{
-		"routingResolve":        SubjectRoutingResolveRPC,
-		"authzCheck":            SubjectAuthzCheckRPC,
-		"voicemailList":         SubjectVoicemailListRPC,
-		"sipCredential":         SubjectSipCredentialRPC,
-		"sipTransfer":           SubjectSipTransferRPC,
-		"mediaAllocateSession":  SubjectMediaAllocateSessionRPC,
-		"mediaBridgeSessions":   SubjectMediaBridgeSessionsRPC,
-		"mediaUnbridgeSessions": SubjectMediaUnbridgeSessionsRPC,
-		"mediaReleaseSession":   SubjectMediaReleaseSessionRPC,
-		"mediaStartPlayback":    SubjectMediaStartPlaybackRPC,
-		"mediaStopPlayback":     SubjectMediaStopPlaybackRPC,
-		"mediaSendDtmf":         SubjectMediaSendDtmfRPC,
-		"mediaStartRecording":   SubjectMediaStartRecordingRPC,
-		"mediaStopRecording":    SubjectMediaStopRecordingRPC,
-		"engineOriginate":       SubjectOriginateRPC,
-		"engineParkHandoff":     SubjectParkHandoffRPC,
+		"routingResolve":          SubjectRoutingResolveRPC,
+		"authzCheck":              SubjectAuthzCheckRPC,
+		"voicemailList":           SubjectVoicemailListRPC,
+		"pbxExtensionFeature":     SubjectExtensionFeatureRPC,
+		"pbxLastCaller":           SubjectLastCallerRPC,
+		"pbxFileGreeting":         SubjectFileGreetingRPC,
+		"sipCredential":           SubjectSipCredentialRPC,
+		"sipTransfer":             SubjectSipTransferRPC,
+		"sipInvite":               SubjectSipInviteRPC,
+		"sipRing":                 SubjectSipRingRPC,
+		"sipAnswer":               SubjectSipAnswerRPC,
+		"sipHangup":               SubjectSipHangupRPC,
+		"sipReinvite":             SubjectSipReinviteRPC,
+		"sipOriginate":            SubjectSipOriginateRPC,
+		"mediaAllocateSession":    SubjectMediaAllocateSessionRPC,
+		"mediaBridgeSessions":     SubjectMediaBridgeSessionsRPC,
+		"mediaUnbridgeSessions":   SubjectMediaUnbridgeSessionsRPC,
+		"mediaReleaseSession":     SubjectMediaReleaseSessionRPC,
+		"mediaStartPlayback":      SubjectMediaStartPlaybackRPC,
+		"mediaStopPlayback":       SubjectMediaStopPlaybackRPC,
+		"mediaSendDtmf":           SubjectMediaSendDtmfRPC,
+		"mediaStartRecording":     SubjectMediaStartRecordingRPC,
+		"mediaStopRecording":      SubjectMediaStopRecordingRPC,
+		"mediaTapSession":         SubjectMediaTapSessionRPC,
+		"mediaUntapSession":       SubjectMediaUntapSessionRPC,
+		"mediaMuteSession":        SubjectMediaMuteSessionRPC,
+		"mediaHoldSession":        SubjectMediaHoldSessionRPC,
+		"engineOriginate":         SubjectOriginateRPC,
+		"engineParkHandoff":       SubjectParkHandoffRPC,
+		"engineSessionVerb":       SubjectSessionVerbRPC,
+		"engineConferenceControl": SubjectConferenceControlRPC,
+		"sessionAnnounce":         SubjectSessionAnnounceRPC,
 	}
 	if !reflect.DeepEqual(rpc, g.RPCSubjects) {
 		t.Errorf("rpc subjects = %v, golden %v", rpc, g.RPCSubjects)
@@ -210,6 +234,25 @@ func TestParityAORSubjectToken(t *testing.T) {
 
 	if _, err := AORSubjectToken("   "); err == nil {
 		t.Error("AORSubjectToken(blank) should reject: an empty AOR has no stable token")
+	}
+}
+
+func TestParityInstanceSubjectToken(t *testing.T) {
+	for _, tc := range loadGolden(t).InstanceSubjectTokens {
+		token, err := InstanceSubjectToken(tc.InstanceID)
+		if err != nil {
+			t.Errorf("InstanceSubjectToken(%q): %v", tc.InstanceID, err)
+			continue
+		}
+		if token != tc.Token {
+			// A Go/TS disagreement here is a command published to a subject nobody subscribes: the
+			// engine addresses rpc.sip.v1.<verb>.<tok> and apps/sipd listens on a different <tok>.
+			t.Errorf("InstanceSubjectToken(%q) = %q, golden %q", tc.InstanceID, token, tc.Token)
+		}
+	}
+
+	if _, err := InstanceSubjectToken("   "); err == nil {
+		t.Error("InstanceSubjectToken(blank) should reject: an empty instance id has no token")
 	}
 }
 
@@ -239,12 +282,16 @@ func TestParitySubjectBuilders(t *testing.T) {
 			got = must(CallSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "registration":
 			got = must(RegistrationSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
+		case "sipDialog":
+			got = must(SIPDialogSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "queue":
 			got = must(QueueSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "voicemail":
 			got = must(VoicemailSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "media":
 			got = must(MediaSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
+		case "trunk":
+			got = must(TrunkSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "cdrLeg":
 			got = must(CDRLegSubject(tc.Args[0]))
 		case "audit":
@@ -283,6 +330,12 @@ func TestParitySubjectFilters(t *testing.T) {
 			got = must(RegistrationsForAORFilter(tc.Args[0], tc.Args[1]))
 		case "registrationEventInOrg":
 			got = must(RegistrationEventInOrgFilter(tc.Args[0], tc.Args[1]))
+		case "allSipDialogs":
+			got = AllSIPDialogsFilter()
+		case "sipDialogsInOrg":
+			got = must(SIPDialogsInOrgFilter(tc.Args[0]))
+		case "sipDialog":
+			got = must(SIPDialogFilter(tc.Args[0], tc.Args[1]))
 		case "allQueues":
 			got = AllQueuesFilter()
 		case "queuesInOrg":
@@ -307,6 +360,12 @@ func TestParitySubjectFilters(t *testing.T) {
 			got = must(MediaSessionFilter(tc.Args[0], tc.Args[1]))
 		case "mediaEventInOrg":
 			got = must(MediaEventInOrgFilter(tc.Args[0], tc.Args[1]))
+		case "allTrunks":
+			got = AllTrunksFilter()
+		case "trunksInOrg":
+			got = must(TrunksInOrgFilter(tc.Args[0]))
+		case "trunkStatusInOrg":
+			got = must(TrunkStatusInOrgFilter(tc.Args[0]))
 		case "allCdrLegs":
 			got = AllCDRLegsFilter()
 		case "cdrLegsInOrg":
@@ -351,6 +410,7 @@ func TestParityParseSubject(t *testing.T) {
 			QueueID:   parsed.QueueID,
 			MailboxID: parsed.MailboxID,
 			SessionID: parsed.SessionID,
+			TrunkID:   parsed.TrunkID,
 			Event:     parsed.Event,
 			Service:   parsed.Service,
 			Method:    parsed.Method,
@@ -388,8 +448,16 @@ func TestParityKVKeys(t *testing.T) {
 			got, err = DIDIndexKVKey(tc.Args[0])
 		case "queueMembership":
 			got, err = QueueMembershipKVKey(tc.Args[0], tc.Args[1])
+		case "queueWaiting":
+			got, err = QueueWaitingKVKey(tc.Args[0], tc.Args[1])
 		case "mediaSession":
 			got, err = MediaSessionKVKey(tc.Args[0])
+		case "sipDialog":
+			got, err = SIPDialogKVKey(tc.Args[0])
+		case "trunk":
+			got, err = TrunkKVKey(tc.Args[0], tc.Args[1])
+		case "sipAcl":
+			got, err = SIPACLKVKey(tc.Args[0])
 		default:
 			t.Fatalf("golden names KV key builder %q, which this package does not implement", tc.Builder)
 		}
@@ -479,6 +547,8 @@ func TestParityVocabularies(t *testing.T) {
 		"RecordingStopReason": asStrings(RecordingStopReasonValues),
 		"SIPTransport":        asStrings(SIPTransportValues),
 		"AgentStatus":         asStrings(AgentStatusValues),
+		"TapMode":             asStrings(TapModeValues),
+		"TapEndReason":        asStrings(TapEndReasonValues),
 	}
 	if !reflect.DeepEqual(named, g.Vocabularies) {
 		t.Errorf("telephony vocabularies = %v, golden %v", named, g.Vocabularies)
@@ -490,6 +560,7 @@ func TestParityVocabularies(t *testing.T) {
 		"queue":        EventTypesOfFamily(FamilyQueue),
 		"voicemail":    EventTypesOfFamily(FamilyVoicemail),
 		"media":        EventTypesOfFamily(FamilyMedia),
+		"trunk":        EventTypesOfFamily(FamilyTrunk),
 	}
 	if !reflect.DeepEqual(events, g.EventVocabularies) {
 		t.Errorf("event vocabularies = %v, golden %v", events, g.EventVocabularies)

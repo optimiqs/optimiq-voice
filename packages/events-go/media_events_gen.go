@@ -22,16 +22,17 @@ const (
 // Subject: media.evt.v1.<orgId>.<sessionId>.session.ended
 // Envelope: Envelope[MediaSessionEndedData]
 type MediaSessionEndedData struct {
-	SessionID       string                  `json:"sessionId"`
-	InstanceID      string                  `json:"instanceId"`
-	CallID          *string                 `json:"callId,omitempty"`
-	LegID           *string                 `json:"legId,omitempty"`
-	RtpPort         int                     `json:"rtpPort"`
-	PacketsReceived int                     `json:"packetsReceived"`
-	PacketsSent     int                     `json:"packetsSent"`
-	Reason          MediaSessionEndedReason `json:"reason"`
-	DurationMs      int                     `json:"durationMs"`
-	Detail          *string                 `json:"detail,omitempty"`
+	SessionID       string                    `json:"sessionId"`
+	InstanceID      string                    `json:"instanceId"`
+	CallID          *string                   `json:"callId,omitempty"`
+	LegID           *string                   `json:"legId,omitempty"`
+	RtpPort         int                       `json:"rtpPort"`
+	PacketsReceived int                       `json:"packetsReceived"`
+	PacketsSent     int                       `json:"packetsSent"`
+	Reason          MediaSessionEndedReason   `json:"reason"`
+	DurationMs      int                       `json:"durationMs"`
+	Detail          *string                   `json:"detail,omitempty"`
+	Quality         *MediaSessionEndedQuality `json:"quality,omitempty"`
 }
 
 // MediaSessionEndedReason is the closed vocabulary of MediaSessionEndedData.reason.
@@ -65,6 +66,19 @@ func (v MediaSessionEndedReason) Valid() bool {
 }
 
 func (v MediaSessionEndedReason) String() string { return string(v) }
+
+// MediaSessionEndedQuality is a payload fragment of the contract.
+type MediaSessionEndedQuality struct {
+	InboundJitterMs      float64 `json:"inboundJitterMs"`
+	ReportedLossFraction float64 `json:"reportedLossFraction"`
+	ReportedLossTotal    int     `json:"reportedLossTotal"`
+	ReportedJitterMs     float64 `json:"reportedJitterMs"`
+	RoundTripMs          float64 `json:"roundTripMs"`
+	ReportsReceived      int     `json:"reportsReceived"`
+	ReportsSent          int     `json:"reportsSent"`
+	Malformed            int     `json:"malformed"`
+	LastReportUnixMs     int     `json:"lastReportUnixMs"`
+}
 
 // MediaSessionRTPTimeoutData is the payload of the "session.rtp-timeout" event.
 //

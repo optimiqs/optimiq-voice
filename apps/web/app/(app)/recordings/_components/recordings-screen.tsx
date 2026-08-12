@@ -223,6 +223,24 @@ export function RecordingsScreen() {
 				</Link>{" "}
 				and expand the call — every leg shows its own media.
 			</p>
+
+			{/*
+			 * The retention column shows the window each row was STAMPED with when it was written, not
+			 * the policy in force now — the two differ for every recording made before the policy last
+			 * changed, which is why the link says "for new recordings" rather than "the policy".
+			 */}
+			<p className="max-w-prose text-xs text-muted-foreground">
+				The retention column is the window each recording was stamped with when it was written.
+				Changing{" "}
+				<Link
+					href={routes.recordingSettings}
+					className="text-primary underline-offset-4 hover:underline"
+				>
+					how long recordings are kept
+				</Link>{" "}
+				applies to new recordings and never re-stamps these. Deleting one removes the audio
+				immediately and leaves the row behind as a record that it existed.
+			</p>
 		</>
 	);
 }

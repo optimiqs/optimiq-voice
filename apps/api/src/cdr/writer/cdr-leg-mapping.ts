@@ -5,6 +5,7 @@ import {
 	CALL_LEG_SIDES,
 	HANGUP_CAUSES,
 	HANGUP_SIDES,
+	QUEUE_OUTCOMES,
 } from "@optimiq-voice/cdr-db";
 import type {
 	CallDestinationType,
@@ -13,6 +14,7 @@ import type {
 	CallLegSide,
 	HangupCause,
 	HangupSide,
+	QueueOutcome,
 } from "@optimiq-voice/cdr-db";
 
 /**
@@ -24,7 +26,7 @@ import type {
  * `hangupCause` and `disposition` are constrained STRINGS in `@optimiq-voice/events`, not enums,
  * "so new destination types arrive with new PBX features and must not require an `events`
  * release". `cdr-db` is the authority on the value domains, and it enforces them with `check`
- * constraints. Something has to sit between "any lower-kebab string" and "one of twelve
+ * constraints. Something has to sit between "any lower-kebab string" and "one of thirteen
  * snake_case values", and if that something is not a named, tested function then it is an
  * unhandled `23514` in the consume loop at three in the morning.
  *
@@ -74,6 +76,12 @@ const MAPPED_KEYS = new Set([
 	"hangupCauseCode",
 	"hangupSide",
 	"disposition",
+	"queueRef",
+	"queueWaitMs",
+	"queueOutcome",
+	"queueAgentRef",
+	"authPinOrdinal",
+	"authPinLabel",
 ]);
 
 /**
@@ -102,6 +110,23 @@ const DESTINATION_TYPE_ALIASES: Readonly<Record<string, CallDestinationType>> = 
 	time_condition: "time_condition",
 	"trunk-dial": "trunk",
 	trunk: "trunk",
+	/**
+	 * Both spellings of a page, because the two vocabularies name it differently at each end and the
+	 * writer sees both: `paging` is the plan-node kind the engine copies out of the walk, and
+	 * `paging-group` is the `pbx-db` destination type a row carries when something ROUTED into an
+	 * announcement. `cdr-db` spells the reporting value `paging` — the group is named by
+	 * `destination_ref`, so repeating "group" in the type would be the column saying it twice.
+	 *
+	 * This pair used to be absent, and the fallback below turned every paged leg into `unknown`.
+	 * That was the wrong kind of inaccuracy to leave: a page originates one auto-answered leg per
+	 * member, so an announcement to fifty desks is fifty unattributable rows, and `unknown` stops
+	 * meaning "rare residue" the first time somebody uses the overhead pager. The fix needed the
+	 * value in `CALL_DESTINATION_TYPES` and a migration widening `call_legs_destination_type_check`;
+	 * both landed with this entry, because an alias pointing at a value the check constraint refuses
+	 * is not a fix, it is a `23514` moved from the report to the consume loop.
+	 */
+	paging: "paging",
+	"paging-group": "paging",
 
 	// Steps, not destinations. See the file header.
 	playback: "unknown",
@@ -140,6 +165,20 @@ export interface CallLegInsertValues {
 	readonly hangupCauseCode: number;
 	readonly hangupSide: HangupSide | null;
 	readonly disposition: CallDisposition;
+	/**
+	 * The queue's verdict on the caller's stay. All four or none — see the mapping.
+	 *
+	 * Explicitly `null` rather than optional, unlike the payload they come from: these are INSERT
+	 * values, and an omitted key and a null column are the same row while an omitted key and an
+	 * absent field are not the same object. Spelling the absence keeps "this leg never touched a
+	 * queue" a thing the type can be asked about.
+	 */
+	readonly queueRef: string | null;
+	readonly queueWaitMs: number | null;
+	readonly queueOutcome: QueueOutcome | null;
+	readonly queueAgentRef: string | null;
+	readonly authPinOrdinal: number | null;
+	readonly authPinLabel: string | null;
 	readonly raw: Record<string, unknown>;
 }
 
@@ -177,6 +216,21 @@ function asDate(value: unknown): Date | null {
 }
 
 /** The two duration columns are `notNull default 0` with a `>= 0` check; anything else is zero. */
+/**
+ * A non-negative integer, or `null` when there is not one.
+ *
+ * Distinct from {@link asNonNegativeInt}, which floors an absence to zero because its callers are
+ * durations and a call with no duration lasted no time. An absent ORDINAL is not "code zero" — it is
+ * "this call was not gated" — and collapsing the two would put every ungated call in the tenant into
+ * a report of who authorised what.
+ */
+function asOptionalNonNegativeInt(value: unknown): number | null {
+	if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+		return null;
+	}
+	return value;
+}
+
 function asNonNegativeInt(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.trunc(value) : 0;
 }
@@ -323,6 +377,50 @@ export function mapCdrLegWrite(
 		raw._writer = { coercions };
 	}
 
+	// The queue verdict, all four or none. A leg carrying a wait with no outcome is a leg whose
+	// producer died mid-walk, and half a verdict in a service level is worse than none — a wait with
+	// no outcome would be counted by an average and by nothing else, which is the shape of a number
+	// that is quietly wrong. An unrecognised outcome is a coercion rather than a rejection, for the
+	// same reason `destinationType` is: the row is worth keeping without it.
+	const queueRef = asUuid(payload.queueRef);
+	const outcomeRaw = asString(payload.queueOutcome);
+	const queueOutcome =
+		outcomeRaw !== undefined && (QUEUE_OUTCOMES as readonly string[]).includes(outcomeRaw)
+			? (outcomeRaw as QueueOutcome)
+			: undefined;
+	if (outcomeRaw !== undefined && queueOutcome === undefined) {
+		record("queueOutcome", payload.queueOutcome, "null");
+	}
+	const queueLeg =
+		queueRef === null || queueOutcome === undefined
+			? { queueRef: null, queueWaitMs: null, queueOutcome: null, queueAgentRef: null }
+			: {
+					queueRef,
+					queueOutcome,
+					queueWaitMs: asNonNegativeInt(payload.queueWaitMs),
+					// Only on an answer. An agent id beside an abandonment would make "who took this
+					// call" answerable for a call nobody took.
+					queueAgentRef: queueOutcome === "answered" ? asUuid(payload.queueAgentRef) : null,
+				};
+
+	/**
+	 * The authorisation code that opened a gated outbound route, when one did.
+	 *
+	 * The ORDINAL is what makes the pair real: a label with no ordinal is a string a producer put on
+	 * a call that was never gated, and it would show up in a report as an authorisation that did not
+	 * happen. So the label is only taken when the ordinal is, and the label is truncated rather than
+	 * refused for the reason `fromName` is — a long label is a form somebody over-filled, not a
+	 * payload worth quarantining a billing record over.
+	 */
+	const ordinal = asOptionalNonNegativeInt(payload.authPinOrdinal);
+	const authorization =
+		ordinal === null
+			? { authPinOrdinal: null, authPinLabel: null }
+			: {
+					authPinOrdinal: ordinal,
+					authPinLabel: asString(payload.authPinLabel)?.slice(0, 128) ?? null,
+				};
+
 	return {
 		values: {
 			id,
@@ -346,6 +444,8 @@ export function mapCdrLegWrite(
 			hangupCauseCode,
 			hangupSide,
 			disposition,
+			...queueLeg,
+			...authorization,
 			raw,
 		},
 		coercions,

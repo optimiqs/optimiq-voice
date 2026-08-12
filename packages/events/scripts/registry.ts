@@ -8,6 +8,7 @@ import { PROVISION_EVENT_DEFINITIONS } from "../src/schemas/provision-events";
 import { QUEUE_EVENT_DEFINITIONS } from "../src/schemas/queue-events";
 import { REGISTRATION_EVENT_DEFINITIONS } from "../src/schemas/registration-events";
 import { RPC_CONTRACTS } from "../src/schemas/rpc";
+import { SIP_DIALOG_EVENT_DEFINITIONS } from "../src/schemas/sip-dialog-events";
 import {
 	agentStatusSchema,
 	bridgeModeSchema,
@@ -18,7 +19,10 @@ import {
 	recordingKindSchema,
 	recordingStopReasonSchema,
 	sipTransportSchema,
+	tapEndReasonSchema,
+	tapModeSchema,
 } from "../src/schemas/telephony";
+import { TRUNK_EVENT_DEFINITIONS } from "../src/schemas/trunk-events";
 import { VOICEMAIL_EVENT_DEFINITIONS } from "../src/schemas/voicemail-events";
 import type { EventFamily } from "../src/subjects";
 
@@ -109,6 +113,18 @@ export const NAMED_ENUMS: readonly NamedEnum[] = [
 		doc: "ACD agent status. Drives queue distribution and the wallboard.",
 		values: enumValues(agentStatusSchema),
 	},
+	{
+		goName: "TapMode",
+		source: "telephony.ts TAP_MODES",
+		doc: "What a supervisor is doing to a call they did not place: eavesdrop, whisper or barge.",
+		values: enumValues(tapModeSchema),
+	},
+	{
+		goName: "TapEndReason",
+		source: "telephony.ts TAP_END_REASONS",
+		doc: "How a supervisor's tap ended. Distinguishes the monitored call ending from the supervisor leaving.",
+		values: enumValues(tapEndReasonSchema),
+	},
 ];
 
 /** One event type's contract: subject family, envelope `type`, payload schema, Go names. */
@@ -151,6 +167,20 @@ function registrationEntry(
 	};
 }
 
+function sipDialogEntry(
+	type: keyof typeof SIP_DIALOG_EVENT_DEFINITIONS,
+	goName: string,
+): EventEntry {
+	return {
+		family: "sipDialog",
+		type,
+		goName: `${goName}Data`,
+		goConst: `EventType${goName}`,
+		data: SIP_DIALOG_EVENT_DEFINITIONS[type].data,
+		subjectTemplate: `sip.evt.v1.<orgId>.<legId>.${type}`,
+	};
+}
+
 function queueEntry(type: keyof typeof QUEUE_EVENT_DEFINITIONS, goName: string): EventEntry {
 	return {
 		family: "queue",
@@ -184,6 +214,17 @@ function mediaEntry(type: keyof typeof MEDIA_EVENT_DEFINITIONS, goName: string):
 		goConst: `EventType${goName}`,
 		data: MEDIA_EVENT_DEFINITIONS[type].data,
 		subjectTemplate: `media.evt.v1.<orgId>.<sessionId>.${type}`,
+	};
+}
+
+function trunkEntry(type: keyof typeof TRUNK_EVENT_DEFINITIONS, goName: string): EventEntry {
+	return {
+		family: "trunk",
+		type,
+		goName: `${goName}Data`,
+		goConst: `EventType${goName}`,
+		data: TRUNK_EVENT_DEFINITIONS[type].data,
+		subjectTemplate: `trunk.evt.v1.<orgId>.<trunkId>.${type}`,
 	};
 }
 
@@ -221,15 +262,29 @@ export const EVENT_ENTRIES: readonly EventEntry[] = [
 	callEntry("channel.destroyed", "ChannelDestroyed"),
 	callEntry("conference.joined", "ConferenceJoined"),
 	callEntry("conference.left", "ConferenceLeft"),
+	callEntry("conference.participant.updated", "ConferenceParticipantUpdated"),
+	callEntry("conference.locked", "ConferenceLocked"),
+	callEntry("conference.unlocked", "ConferenceUnlocked"),
 	callEntry("call.parked", "CallParked"),
 	callEntry("call.unparked", "CallUnparked"),
 	callEntry("call.transferred", "CallTransferred"),
 	callEntry("call.picked-up", "CallPickedUp"),
 	callEntry("call.emergency.dialed", "CallEmergencyDialed"),
+	callEntry("call.tap.started", "CallTapStarted"),
+	callEntry("call.tap.ended", "CallTapEnded"),
+	callEntry("call.paging.started", "CallPagingStarted"),
+	callEntry("call.paging.ended", "CallPagingEnded"),
 
 	registrationEntry("registered", "RegistrationRegistered"),
 	registrationEntry("unregistered", "RegistrationUnregistered"),
 	registrationEntry("expired", "RegistrationExpired"),
+
+	sipDialogEntry("dialog.progressed", "SIPDialogProgressed"),
+	sipDialogEntry("dialog.answered", "SIPDialogAnswered"),
+	sipDialogEntry("dialog.held", "SIPDialogHeld"),
+	sipDialogEntry("dialog.resumed", "SIPDialogResumed"),
+	sipDialogEntry("dialog.terminated", "SIPDialogTerminated"),
+	sipDialogEntry("dialog.dtmf", "SIPDialogDTMF"),
 
 	queueEntry("caller.joined", "QueueCallerJoined"),
 	queueEntry("caller.answered", "QueueCallerAnswered"),
@@ -244,6 +299,8 @@ export const EVENT_ENTRIES: readonly EventEntry[] = [
 	mediaEntry("playback.finished", "MediaPlaybackFinished"),
 	mediaEntry("recording.finished", "MediaRecordingFinished"),
 	mediaEntry("dtmf.received", "MediaDtmfReceived"),
+
+	trunkEntry("status.changed", "TrunkStatusChanged"),
 
 	{
 		family: "cdr",
@@ -298,6 +355,31 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		request: RPC_CONTRACTS["rpc.voicemail.v1.list"].request,
 		response: RPC_CONTRACTS["rpc.voicemail.v1.list"].response,
 	},
+	// The handset's own feature state, and the `*69` lookup behind it. Both are TypeScript on both
+	// ends today, so these structs are documentation rather than a wire contract — emitted anyway,
+	// because the emitter's rule is "every RPC subject", and a subject that quietly opted out would
+	// be the one nobody notices is missing when a Go caller for it appears.
+	{
+		subject: "rpc.pbx.v1.extension-feature",
+		goName: "ExtensionFeature",
+		timeoutMs: RPC_CONTRACTS["rpc.pbx.v1.extension-feature"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.pbx.v1.extension-feature"].request,
+		response: RPC_CONTRACTS["rpc.pbx.v1.extension-feature"].response,
+	},
+	{
+		subject: "rpc.pbx.v1.last-caller",
+		goName: "LastCaller",
+		timeoutMs: RPC_CONTRACTS["rpc.pbx.v1.last-caller"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.pbx.v1.last-caller"].request,
+		response: RPC_CONTRACTS["rpc.pbx.v1.last-caller"].response,
+	},
+	{
+		subject: "rpc.pbx.v1.file-greeting",
+		goName: "FileGreeting",
+		timeoutMs: RPC_CONTRACTS["rpc.pbx.v1.file-greeting"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.pbx.v1.file-greeting"].request,
+		response: RPC_CONTRACTS["rpc.pbx.v1.file-greeting"].response,
+	},
 	{
 		subject: "rpc.sip.v1.credential",
 		goName: "SipCredential",
@@ -315,6 +397,52 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.transfer"].timeoutMs,
 		request: RPC_CONTRACTS["rpc.sip.v1.transfer"].request,
 		response: RPC_CONTRACTS["rpc.sip.v1.transfer"].response,
+	},
+	// The INVITE path. `invite` is the one Go CALLER here — the edge asking the engine for admission
+	// — and the five below it are Go RESPONDERS, which makes this family the first on the backbone
+	// that crosses the language border in both directions on adjacent subjects. Every one of these
+	// structs is a real wire contract rather than documentation.
+	{
+		subject: "rpc.sip.v1.invite",
+		goName: "SipInvite",
+		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.invite"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.sip.v1.invite"].request,
+		response: RPC_CONTRACTS["rpc.sip.v1.invite"].response,
+	},
+	{
+		subject: "rpc.sip.v1.ring",
+		goName: "SipRing",
+		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.ring"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.sip.v1.ring"].request,
+		response: RPC_CONTRACTS["rpc.sip.v1.ring"].response,
+	},
+	{
+		subject: "rpc.sip.v1.answer",
+		goName: "SipAnswer",
+		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.answer"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.sip.v1.answer"].request,
+		response: RPC_CONTRACTS["rpc.sip.v1.answer"].response,
+	},
+	{
+		subject: "rpc.sip.v1.hangup",
+		goName: "SipHangup",
+		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.hangup"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.sip.v1.hangup"].request,
+		response: RPC_CONTRACTS["rpc.sip.v1.hangup"].response,
+	},
+	{
+		subject: "rpc.sip.v1.reinvite",
+		goName: "SipReinvite",
+		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.reinvite"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.sip.v1.reinvite"].request,
+		response: RPC_CONTRACTS["rpc.sip.v1.reinvite"].response,
+	},
+	{
+		subject: "rpc.sip.v1.originate",
+		goName: "SipOriginate",
+		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.originate"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.sip.v1.originate"].request,
+		response: RPC_CONTRACTS["rpc.sip.v1.originate"].response,
 	},
 	// The media plane. Unlike every entry above, the RESPONDER for these is Go: apps/mediad
 	// unmarshals the generated request structs and marshals the generated response ones, which is
@@ -382,6 +510,42 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		request: RPC_CONTRACTS["rpc.media.v1.stop-recording"].request,
 		response: RPC_CONTRACTS["rpc.media.v1.stop-recording"].response,
 	},
+	// Supervision. The one media pair emitted BEFORE its responder exists: `mediad` refuses the
+	// operation today (asymmetric routing is a mix, which is rung 6) and the Go structs are emitted
+	// anyway, because the whole argument for declaring the full shape now — see
+	// `plans/mediad-design.md` §10 question 4 — is that the rung-6 mixer must be able to satisfy
+	// this contract by arriving rather than by renegotiating it.
+	{
+		subject: "rpc.media.v1.tap-session",
+		goName: "MediaTapSession",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.tap-session"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.tap-session"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.tap-session"].response,
+	},
+	{
+		subject: "rpc.media.v1.untap-session",
+		goName: "MediaUntapSession",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.untap-session"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.untap-session"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.untap-session"].response,
+	},
+	// Rung 5's two state commands. Their Manager halves have existed and been tested since rung 5
+	// landed; what they had no way of reaching was the wire, so `MediadMediaPort` refused hold,
+	// unhold, mute, unmute and music-on-hold by name. These are the subjects that let it stop.
+	{
+		subject: "rpc.media.v1.mute-session",
+		goName: "MediaMuteSession",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.mute-session"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.mute-session"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.mute-session"].response,
+	},
+	{
+		subject: "rpc.media.v1.hold-session",
+		goName: "MediaHoldSession",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.hold-session"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.hold-session"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.hold-session"].response,
+	},
 	// Control plane to engine: click-to-call. No Go participant today either, and emitted for the
 	// same reason the entry below it is — the Go side reads the same taxonomy, and a subject the
 	// generated package does not name reads as a subject that does not exist.
@@ -402,6 +566,35 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		request: RPC_CONTRACTS["rpc.engine.v1.park-handoff"].request,
 		response: RPC_CONTRACTS["rpc.engine.v1.park-handoff"].response,
 	},
+	// The session protocol. Both are PREFIXES — the wire subject appends an instance token
+	// (`session-verb`) or an org and application token (`announce`) — and both are emitted for the
+	// reason the two entries above are: the Go side reads the same taxonomy, and a subject the
+	// generated package does not name reads as a subject that does not exist.
+	{
+		subject: "rpc.engine.v1.session-verb",
+		goName: "SessionVerb",
+		timeoutMs: RPC_CONTRACTS["rpc.engine.v1.session-verb"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.engine.v1.session-verb"].request,
+		response: RPC_CONTRACTS["rpc.engine.v1.session-verb"].response,
+	},
+	// In-conference moderation, api to engine. A PREFIX like the two above it — the wire subject
+	// appends the token of an instance that has members in the room — and emitted for the same
+	// reason: the Go side reads the same taxonomy, and a subject the generated package does not
+	// name reads as a subject that does not exist.
+	{
+		subject: "rpc.engine.v1.conference-control",
+		goName: "ConferenceControl",
+		timeoutMs: RPC_CONTRACTS["rpc.engine.v1.conference-control"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.engine.v1.conference-control"].request,
+		response: RPC_CONTRACTS["rpc.engine.v1.conference-control"].response,
+	},
+	{
+		subject: "rpc.session.v1.announce",
+		goName: "SessionAnnounce",
+		timeoutMs: RPC_CONTRACTS["rpc.session.v1.announce"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.session.v1.announce"].request,
+		response: RPC_CONTRACTS["rpc.session.v1.announce"].response,
+	},
 ];
 
 /** The base envelope, emitted as JSON Schema only — its Go form is hand-written `Envelope[T]`. */
@@ -411,9 +604,11 @@ export const ENVELOPE_SCHEMA = baseEventEnvelopeSchema;
 export const FAMILY_ORDER: readonly EventFamily[] = [
 	"call",
 	"registration",
+	"sipDialog",
 	"queue",
 	"voicemail",
 	"media",
+	"trunk",
 	"cdr",
 	"audit",
 	"provision",
@@ -423,9 +618,11 @@ export const FAMILY_ORDER: readonly EventFamily[] = [
 export const FAMILY_FILE: Readonly<Record<EventFamily, string>> = {
 	call: "call_events",
 	registration: "registration_events",
+	sipDialog: "sip_dialog_events",
 	queue: "queue_events",
 	voicemail: "voicemail_events",
 	media: "media_events",
+	trunk: "trunk_events",
 	cdr: "cdr_events",
 	audit: "audit_events",
 	provision: "provision_events",

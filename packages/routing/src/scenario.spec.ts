@@ -258,7 +258,7 @@ const ACME: OrgRoutingSnapshot = {
 			maxWaitNoAgentSeconds: 60,
 			announcePositionEnabled: true,
 			announceFrequencySeconds: 60,
-			recordEnabled: true,
+			recordPolicy: "all",
 			timeoutDestinationType: "voicemail",
 			timeoutDestinationRef: "vm-main",
 		},
@@ -272,7 +272,7 @@ const ACME: OrgRoutingSnapshot = {
 			requiresPin: true,
 			maxMembers: 20,
 			waitForModerator: true,
-			recordEnabled: false,
+			recordPolicy: "none",
 		},
 	],
 	parkLots: [

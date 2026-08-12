@@ -1,6 +1,9 @@
 package events
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // JetStream stream and KV bucket definitions — the Go mirror of packages/events/src/streams.ts.
 //
@@ -110,6 +113,32 @@ var RegistrationsStream = StreamDefinition{
 	NumReplicas:       1,
 }
 
+// SIPStream carries SIP dialog lifecycle from this process.
+//
+// A NEW stream rather than an extension of REGISTRATIONS, decided by volume and purpose.
+// Registration transitions and dialog lifecycle differ by two orders of magnitude, and they are kept
+// for different reasons: a `registered` is presence, and a `dialog.terminated` is CDR EVIDENCE
+// carrying the only real Q.850 cause this platform ever sees.
+//
+// discard: old, because this is the transition log behind live state and not the ledger — the
+// engine reads the family on a CORE subscription so a leg is torn down now, and cdr.leg.v1 is what
+// discards `new`. Seven days: longer than MEDIA's two and shorter than VOICEMAIL's thirty, because
+// the question it answers is "what happened to that call", asked this week with a CDR row in hand.
+var SIPStream = StreamDefinition{
+	Name:              "SIP",
+	Description:       "SIP dialog lifecycle from apps/sipd (sipd-invite-design §3.3, §10.2).",
+	Subjects:          []string{AllSIPDialogsFilter()},
+	Retention:         RetentionLimits,
+	Storage:           StorageFile,
+	Discard:           DiscardOld,
+	MaxAge:            7 * 24 * time.Hour,
+	MaxMsgs:           Unlimited,
+	MaxBytes:          4 * gib,
+	MaxMsgsPerSubject: Unlimited,
+	DuplicateWindow:   2 * time.Minute,
+	NumReplicas:       1,
+}
+
 // QueuesStream carries ACD caller/agent events. Kept a week so wallboards and reports can backfill.
 var QueuesStream = StreamDefinition{
 	Name:              "QUEUES",
@@ -163,6 +192,29 @@ var MediaStream = StreamDefinition{
 	Storage:           StorageFile,
 	Discard:           DiscardOld,
 	MaxAge:            48 * time.Hour,
+	MaxMsgs:           Unlimited,
+	MaxBytes:          1 * gib,
+	MaxMsgsPerSubject: Unlimited,
+	DuplicateWindow:   2 * time.Minute,
+	NumReplicas:       1,
+}
+
+// TrunksStream carries carrier reachability transitions on their way to the trunk.status* columns.
+//
+// Modelled on RegistrationsStream, because it is the same kind of stream one hop out: the edge's
+// verdict on whether a peer answers, where the persisted row is the eventually-consistent view and
+// the stream is the transition log behind it. Seven days rather than registration's 24 hours: a
+// trunk transition is rare (the producer publishes changes, not qualify ticks), so the stream is
+// nearly empty at any retention, and a week lets "when did carrier-a start flapping?" be answered
+// on Monday about a weekend.
+var TrunksStream = StreamDefinition{
+	Name:              "TRUNKS",
+	Description:       "Carrier trunk status transitions consumed durably by the pbx writer (audit 4.5).",
+	Subjects:          []string{AllTrunksFilter()},
+	Retention:         RetentionLimits,
+	Storage:           StorageFile,
+	Discard:           DiscardOld,
+	MaxAge:            7 * 24 * time.Hour,
 	MaxMsgs:           Unlimited,
 	MaxBytes:          1 * gib,
 	MaxMsgsPerSubject: Unlimited,
@@ -224,9 +276,11 @@ var ProvisionStream = StreamDefinition{
 var EventStreams = []StreamDefinition{
 	CallsStream,
 	RegistrationsStream,
+	SIPStream,
 	QueuesStream,
 	VoicemailStream,
 	MediaStream,
+	TrunksStream,
 	CDRStream,
 	AuditStream,
 	ProvisionStream,
@@ -435,6 +489,28 @@ var ConferenceClaimsKV = KVBucketDefinition{
 	NumReplicas:  1,
 }
 
+// SharedLineStateKV holds which appearance has seized a shared line, across engine instances.
+//
+// A shared line is seized by one appearance at a time: when one desk answers the call on it, the
+// others' keys go busy so a colleague does not grab a call that is already someone's. That is the
+// same exclusivity a park orbit needs and it is taken the same way — the answering appearance
+// creates the key, a loser reads the winner and lights its lamp remote-active. The fifteen-minute
+// TTL matches the other claim buckets so a crashed holder's line frees for the next seizure.
+//
+// Like ParkClaimsKV and ConferenceClaimsKV, declared but not written from Go: seizing a shared line
+// is an engine-owned operation, and the lamp reaches the phone over the presence -> dialog-info path
+// sipd already watches.
+var SharedLineStateKV = KVBucketDefinition{
+	Name:         "shared-line-state",
+	Description:  "Shared-line seizure ownership across engine instances, taken under compare-and-set.",
+	TTL:          15 * time.Minute,
+	History:      1,
+	Storage:      StorageFile,
+	MaxValueSize: 4 * 1024,
+	MaxBytes:     128 * mib,
+	NumReplicas:  1,
+}
+
 // MediaSessionsKV maps an RTP session to the mediad instance that holds it.
 //
 // rpc.media.v1.* is served by a QUEUE GROUP, so NATS hands each request to whichever mediad happens
@@ -462,6 +538,111 @@ var MediaSessionsKV = KVBucketDefinition{
 	NumReplicas:  1,
 }
 
+// QueueWaitingKV holds one queue's leased waiting line and its abandoned-resume tombstones.
+//
+// "You are caller number four" was a lie in a cluster: the count came from an in-process map, so
+// every engine counted only the callers it held and each announced a number that was too small.
+// Three features needed the same missing fact — the position itself, caller priority (an order needs
+// everybody in it, or two instances each order their own half), and abandoned-resume (the line has
+// to remember somebody who is no longer on it).
+//
+// One key per queue holding the whole line, like QueueMembershipKV and for a stronger version of the
+// same reason: a position is a RANK, so it is not answerable from one caller's own row. Every write
+// is a compare-and-set against the revision it read.
+//
+// Entries carry their own expiresAt because a single-key record cannot have per-caller server-side
+// expiry, and a crashed engine that left its callers in the line would make every survivor's
+// position too large — the exact failure this bucket exists to fix, inverted. The six-hour TTL
+// matches ChannelsKV: longer than any call, shorter than a shift.
+var QueueWaitingKV = KVBucketDefinition{
+	Name:         "queue-waiting",
+	Description:  "Queue -> the leased waiting line and abandoned-resume tombstones, under CAS.",
+	TTL:          6 * time.Hour,
+	History:      1,
+	Storage:      StorageFile,
+	MaxValueSize: 256 * 1024,
+	MaxBytes:     256 * mib,
+	NumReplicas:  1,
+}
+
+// SIPDialogsKV maps a SIP dialog to the sipd instance that holds it, under a heartbeated lease.
+//
+// A CLAIM, not a directory — and that is where it diverges from MediaSessionsKV, whose note says
+// "nothing races for a media session". Something races here, and it is not two writers: it is a
+// REAPER against a corpse. A dialog's sockets, timers and CSeq are local to one process, so when a
+// sipd dies its calls die with it and nothing can fail them over. What must not also die is the
+// ENGINE's knowledge that they ended — without it the engine holds channels for calls that ended
+// when a pod was rescheduled, and no CDR is ever written for any of them.
+//
+// So the record carries a lease its owner heartbeats, exactly as a park claim does, and a surviving
+// instance that finds an expired claim publishes dialog.terminated{reason: "instance-lost"} on the
+// dead owner's behalf. The directory's job is REAPING, not failover.
+//
+// Not organization-scoped: the third exception after did-index and media-sessions, and for the
+// identical reason — a survivor sweeping a dead peer's claims has no org to prefix with. The
+// six-hour TTL matches ChannelsKV and is a BACKSTOP; the record's own expiresAt is what a reaper
+// reads, because server-side expiry cannot tell "the owner stopped heartbeating" from "this was
+// written a long time ago and is still correct".
+var SIPDialogsKV = KVBucketDefinition{
+	Name:         "sip-dialogs",
+	Description:  "SIP dialog -> owning sipd instance, under a heartbeated lease, for reaping.",
+	TTL:          6 * time.Hour,
+	History:      1,
+	Storage:      StorageFile,
+	MaxValueSize: 4 * 1024,
+	MaxBytes:     128 * mib,
+	NumReplicas:  1,
+}
+
+// TrunksKV holds the carrier directory this process dials and registers against.
+//
+// A derived read model written by apps/api from the trunk table, the same seam did-index and
+// queue-membership occupy. This process is Go, holds no pbx-db handle and must not grow one — a
+// database on the INVITE path is what this architecture spends its budget avoiding — and the
+// routing artifact cannot carry it either, because plan-walker substitutes a trunk's NAME into a
+// dial template and a name is not dialable. It is read at boot and WATCHED, so a trunk edited in the
+// admin UI reaches the registration FSM without a restart, which is what replaces SIPD_TRUNK_ACL.
+//
+// Org-scoped, unlike SIPACLKV below: this process originates on behalf of a tenant the engine has
+// already named. TTL zero because it is CONFIGURATION — an expiring entry is an outbound outage
+// produced by a timer rather than by a change. The SECRET is not in here; the value carries a handle
+// into the secret manager, exactly as the column does.
+var TrunksKV = KVBucketDefinition{
+	Name:         "trunks",
+	Description:  "Trunk -> its dialable SIP configuration, for the edge's outbound and registration.",
+	TTL:          0,
+	History:      1,
+	Storage:      StorageFile,
+	MaxValueSize: 8 * 1024,
+	MaxBytes:     128 * mib,
+	NumReplicas:  1,
+}
+
+// SIPACLKV holds the source networks this edge accepts unauthenticated traffic from.
+//
+// sip_acl_entry is organization-scoped and the reader is not: an INVITE from a carrier arrives
+// carrying a source address and nothing else. Same problem as did-index, same answer — a derived,
+// non-org-scoped bucket written by apps/api from the table.
+//
+// WATCHED and compiled into an in-process longest-prefix match, never read per INVITE: a get per
+// INVITE is a broker round trip inside a SIP transaction on the one code path an attacker controls
+// the rate of. Evaluation is lowest priority first, ties broken by the most specific prefix, first
+// match wins — and an address matching NOTHING is refused.
+//
+// TTL zero, and this is the strongest version of that argument anywhere in this file: an expiring
+// allow entry fails a legitimate carrier while nobody changed anything, and an expiring DENY entry
+// fails OPEN — a security boundary evaporating on a timer.
+var SIPACLKV = KVBucketDefinition{
+	Name:         "sip-acl",
+	Description:  "Source network -> tenant, scope and action, for the SIP edge's trunk admission.",
+	TTL:          0,
+	History:      1,
+	Storage:      StorageFile,
+	MaxValueSize: 4 * 1024,
+	MaxBytes:     128 * mib,
+	NumReplicas:  1,
+}
+
 // KVBuckets lists every bucket the backbone owns, in apply order.
 var KVBuckets = []KVBucketDefinition{
 	RegistrationsKV,
@@ -473,7 +654,12 @@ var KVBuckets = []KVBucketDefinition{
 	QueueMembershipKV,
 	ParkClaimsKV,
 	ConferenceClaimsKV,
+	SharedLineStateKV,
 	MediaSessionsKV,
+	QueueWaitingKV,
+	SIPDialogsKV,
+	TrunksKV,
+	SIPACLKV,
 }
 
 // KVBucketByName looks a bucket definition up by name.
@@ -614,6 +800,24 @@ func QueueMembershipKVKey(orgID, queueID string) (string, error) {
 	return org + "." + queue, nil
 }
 
+// QueueWaitingKVKey builds the queue-waiting key <orgId>.<queueId>: one entry per queue, holding its
+// whole line.
+//
+// Deliberately the same key SHAPE as QueueMembershipKVKey, in a different bucket. The roster and the
+// line are both per-queue facts with different writers, different lifetimes and different TTLs, and
+// a reader wanting "everything about queue X" gets it from two point gets on one key string.
+func QueueWaitingKVKey(orgID, queueID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	queue, err := token("queueId", queueID)
+	if err != nil {
+		return "", err
+	}
+	return org + "." + queue, nil
+}
+
 // MediaSessionKVKey builds the media-sessions key: the session id, and nothing else.
 //
 // The second key here that is not organization-scoped, and for the same reason as DIDIndexKVKey:
@@ -622,4 +826,49 @@ func QueueMembershipKVKey(orgID, queueID string) (string, error) {
 // could be prefixed would be shaping the wire around a key format. The org travels in the value.
 func MediaSessionKVKey(sessionID string) (string, error) {
 	return token("sessionId", sessionID)
+}
+
+// SIPDialogKVKey builds the sip-dialogs key: the leg id, and nothing else.
+//
+// The THIRD non-org-scoped key here, for the same reason as MediaSessionKVKey — and for one more
+// that is specific to this bucket: the reader that matters most is a SURVIVING sipd sweeping a dead
+// peer's claims, and it has neither the org nor any way to guess it. The org travels in the value.
+func SIPDialogKVKey(legID string) (string, error) {
+	return token("legId", legID)
+}
+
+// TrunkKVKey builds the trunks key <orgId>.<trunkId>: one entry per trunk, holding its whole
+// dialable configuration.
+func TrunkKVKey(orgID, trunkID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	trunk, err := token("trunkId", trunkID)
+	if err != nil {
+		return "", err
+	}
+	return org + "." + trunk, nil
+}
+
+// SIPACLKVKey builds the sip-acl key: the network with ".", "/" and ":" folded to "-".
+//
+// The FOURTH non-org-scoped key, and the only one needing a transformation at all. A CIDR is
+// "203.0.113.0/24" or "2001:db8::/32", and none of the dots, the slash or the colons survives as a
+// KV key token — dots would silently become four tokens, and neither "/" nor ":" is in the token
+// pattern at all. ALL THREE separators fold, not just the v4 pair: sip_acl_entry.network is a
+// PostgreSQL cidr, which holds IPv6 as readily as IPv4, and a folder that handled only v4 would fail
+// on the first IPv6 carrier — at boot, which is a worse place to find out than here.
+//
+// Both the writer (the control plane, from the stored cidr) and this reader go through one function,
+// which is what makes the two agree.
+//
+// The result stays readable by inspection — "203-0-113-0-24", "2001-db8---32", where the run of
+// three dashes is the "::" — which matters because an operator debugging a refused carrier reads
+// these keys with `nats kv ls`. The mapping is not injective over ARBITRARY strings and does not
+// need to be: the only inputs are values PostgreSQL's cidr type already accepted and normalised. It
+// deliberately does NOT normalise the network itself.
+func SIPACLKVKey(network string) (string, error) {
+	folded := strings.NewReplacer(".", "-", "/", "-", ":", "-").Replace(strings.TrimSpace(network))
+	return token("network", folded)
 }

@@ -9,6 +9,7 @@ import { JetStreamService } from "../nats/jetstream.service";
 import { ENGINE_ENV } from "../nats/nats.tokens";
 import { ConferenceRegistry } from "./conference-registry";
 import { ParkRegistry } from "./park-registry";
+import { SharedLineRegistry } from "./shared-line-registry";
 import type { EngineEnv } from "../config/engine-env";
 
 /**
@@ -52,6 +53,7 @@ export class ClaimHeartbeatService implements OnApplicationBootstrap, OnApplicat
 		private readonly jetstream: JetStreamService,
 		private readonly parks: ParkRegistry,
 		private readonly conferences: ConferenceRegistry,
+		private readonly sharedLines: SharedLineRegistry,
 	) {}
 
 	/** What `/healthz` reports about the claim plane. */
@@ -67,6 +69,7 @@ export class ClaimHeartbeatService implements OnApplicationBootstrap, OnApplicat
 		const instanceId = this.env.ENGINE_INSTANCE_ID;
 		this.parks.bindClaims(this.jetstream.parkClaims, instanceId);
 		this.conferences.bindClaims(this.jetstream.conferenceClaims, instanceId);
+		this.sharedLines.bindClaims(this.jetstream.sharedLineState, instanceId);
 
 		if (!this.parks.isShared) {
 			// No bucket configured: a single-instance deployment, by choice. No timer, no round trips,
@@ -116,6 +119,7 @@ export class ClaimHeartbeatService implements OnApplicationBootstrap, OnApplicat
 		try {
 			await this.parks.heartbeat();
 			await this.conferences.heartbeat();
+			await this.sharedLines.heartbeat();
 		} catch (error) {
 			// A throw here would come from the broker client, and an unhandled one on an interval takes
 			// the process down mid-shift. The lease outlives several missed ticks by design.

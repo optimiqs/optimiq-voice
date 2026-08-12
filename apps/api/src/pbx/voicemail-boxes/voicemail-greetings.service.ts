@@ -128,57 +128,81 @@ export class VoicemailGreetingsService {
 
 		const audio = await readUploadedAudio(request, this.env.PBX_MEDIA_MAX_UPLOAD_BYTES);
 		const fields = parseDto(uploadGreetingFieldsDto, audio.fields);
-		const kind: VoicemailGreetingKind = fields.kind ?? "unavailable";
-		const active = fields.active ?? true;
 
-		const greetingId = createEntityId();
-		const objectKey = buildObjectKey(
-			"greeting",
+		const written = await this.putAndInsert({
 			organizationId,
-			[boxId],
-			greetingId,
-			audio.format.extension,
-		);
-		// The object first, for the reason `prompts.service.ts` sets out: a file with no row is
-		// inert, a row with no file plays silence at a caller.
-		await this.store.put(objectKey, audio.bytes, { contentType: audio.format.contentType });
+			boxId,
+			greetingId: createEntityId(),
+			kind: fields.kind ?? "unavailable",
+			active: fields.active ?? true,
+			label: fields.label ?? audio.fileName,
+			durationMs: audio.durationMs,
+			audio: {
+				bytes: audio.bytes,
+				contentType: audio.format.contentType,
+				extension: audio.format.extension,
+			},
+		});
 
-		try {
-			const written = await this.write(organizationId, async (transaction) => {
-				if (active) {
-					await deactivate(transaction, boxId, kind);
-				}
-				const inserted = await transaction
-					.insert(voicemailGreeting)
-					.values({
-						id: greetingId,
-						organizationId,
-						voicemailBoxId: boxId,
-						kind,
-						label: fields.label ?? audio.fileName,
-						objectKey,
-						durationMs: audio.durationMs ?? null,
-						active,
-					})
-					.returning();
-				return inserted[0] as unknown as Record<string, unknown>;
-			});
+		return {
+			data: written.row,
+			warnings: [
+				...written.compiled.warnings.map(toWireDiagnostic),
+				...audio.warnings.map((message) => ({
+					severity: "warning" as const,
+					code: "media-format",
+					message,
+				})),
+			],
+		};
+	}
 
-			return {
-				data: written.row,
-				warnings: [
-					...written.compiled.warnings.map(toWireDiagnostic),
-					...audio.warnings.map((message) => ({
-						severity: "warning" as const,
-						code: "media-format",
-						message,
-					})),
-				],
-			};
-		} catch (cause) {
-			await this.unlink(objectKey);
-			throw cause;
-		}
+	/**
+	 * Files a greeting a caller recorded from their handset over `*99`.
+	 *
+	 * The broker's entry point into this service, and it deliberately joins the HTTP upload at
+	 * {@link VoicemailGreetingsService.putAndInsert} rather than beside it. Everything that makes a
+	 * greeting hard — the partial unique index, the two-row activation, the recompile inside the same
+	 * transaction, the object that is unlinked when the transaction rolls back — is a property of
+	 * THAT method, and a second copy of it reached from the broker would be a second chance to get
+	 * the ordering wrong on a path nobody watches. What arrives from the engine is bytes and a slot;
+	 * what happens to them is what happens to an admin's upload.
+	 *
+	 * The caller has already resolved the mailbox claim and read the audio — see
+	 * `file-greeting.service.ts`, which is where the request's identity is checked and where the
+	 * refusals are named. This method assumes both and does the write.
+	 *
+	 * `active: true` is not a parameter, and that is the difference from an upload: `*99` exists to
+	 * change what a mailbox says, so a greeting recorded and left inactive would be a feature that
+	 * played its confirmation tone and did nothing.
+	 *
+	 * @throws whatever the transaction throws, including the 422 an unsound recompile produces. The
+	 *   responder turns it into `applied: false`; nothing here is allowed to be a broker timeout.
+	 */
+	async fileRecordedGreeting(input: {
+		readonly organizationId: string;
+		readonly boxId: string;
+		readonly greetingId: string;
+		readonly kind: VoicemailGreetingKind;
+		readonly label: string;
+		readonly durationMs: number;
+		readonly audio: {
+			readonly bytes: Buffer;
+			readonly contentType: string;
+			readonly extension: string;
+		};
+	}): Promise<{ readonly row: Record<string, unknown>; readonly objectKey: string }> {
+		const written = await this.putAndInsert({
+			organizationId: input.organizationId,
+			boxId: input.boxId,
+			greetingId: input.greetingId,
+			kind: input.kind,
+			active: true,
+			label: input.label,
+			durationMs: input.durationMs,
+			audio: input.audio,
+		});
+		return { row: written.row, objectKey: written.objectKey };
 	}
 
 	/**
@@ -365,6 +389,72 @@ export class VoicemailGreetingsService {
 	// -------------------------------------------------------------------------------------------
 	// The write seam
 	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * Stores the audio, then files the row that names it — the whole of "a new greeting arrives".
+	 *
+	 * Two callers, one body: the admin's multipart upload and the handset's `*99`. They differ only
+	 * in where the bytes came from and in whether the slot may be left inactive, so everything below
+	 * that line is shared rather than reproduced — the object-before-row ordering, the two-row
+	 * activation and the unlink that runs when the transaction does not commit.
+	 *
+	 * **The object goes first**, for the reason `prompts.service.ts` sets out: a file with no row is
+	 * inert and reapable, a row with no file plays silence at a caller. The `catch` is the other half
+	 * of that bargain — the row did not land, so the object it would have named must not survive.
+	 */
+	private async putAndInsert(input: {
+		readonly organizationId: string;
+		readonly boxId: string;
+		readonly greetingId: string;
+		readonly kind: VoicemailGreetingKind;
+		readonly active: boolean;
+		readonly label: string;
+		readonly durationMs: number | undefined;
+		readonly audio: {
+			readonly bytes: Buffer;
+			readonly contentType: string;
+			readonly extension: string;
+		};
+	}): Promise<{
+		readonly row: Record<string, unknown>;
+		readonly compiled: CompiledWrite;
+		readonly objectKey: string;
+	}> {
+		const objectKey = buildObjectKey(
+			"greeting",
+			input.organizationId,
+			[input.boxId],
+			input.greetingId,
+			input.audio.extension,
+		);
+		await this.store.put(objectKey, input.audio.bytes, { contentType: input.audio.contentType });
+
+		try {
+			const written = await this.write(input.organizationId, async (transaction) => {
+				if (input.active) {
+					await deactivate(transaction, input.boxId, input.kind);
+				}
+				const inserted = await transaction
+					.insert(voicemailGreeting)
+					.values({
+						id: input.greetingId,
+						organizationId: input.organizationId,
+						voicemailBoxId: input.boxId,
+						kind: input.kind,
+						label: input.label,
+						objectKey,
+						durationMs: input.durationMs ?? null,
+						active: input.active,
+					})
+					.returning();
+				return inserted[0] as unknown as Record<string, unknown>;
+			});
+			return { row: written.row, compiled: written.compiled, objectKey };
+		} catch (cause) {
+			await this.unlink(objectKey);
+			throw cause;
+		}
+	}
 
 	/**
 	 * One tenant transaction: the caller's statements, then compile-on-write, then the publish.

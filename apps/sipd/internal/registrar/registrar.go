@@ -408,6 +408,8 @@ func (r *Registrar) bind(
 		SourceAddress:    req.Source(),
 		DeviceID:         credential.DeviceID,
 		ExtensionID:      credential.ExtensionID,
+		SharedLineNumber: credential.SharedLineNumber,
+		AppearanceIndex:  credential.AppearanceIndex,
 		CallID:           headerValue(req, "Call-ID"),
 		CSeq:             cseqOf(req),
 		Instance:         paramOr(contact, "+sip.instance"),

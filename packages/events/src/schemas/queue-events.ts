@@ -23,6 +23,16 @@ export const queueCallerJoinedDataSchema = z.object({
 	priority: z.int().min(0).max(1000),
 	/** The caller's number, for the wallboard. */
 	callerNumber: z.string().max(128).optional(),
+	/**
+	 * True when this caller rang back inside the queue's discard window and was restored to the
+	 * place they had before they hung up (`queue.abandoned_resume_allowed`).
+	 *
+	 * Worth reporting rather than leaving implicit, because without it a wallboard shows a caller
+	 * arriving at position 2 ahead of somebody who has been holding for a minute and the supervisor
+	 * watching it has no way to tell a restored place from a bug. Absent means what it has always
+	 * meant: a caller who joined at the back.
+	 */
+	resumed: z.boolean().optional(),
 });
 
 /** `caller.answered` — an agent took the call; the wait is over. */
@@ -38,14 +48,31 @@ export const queueCallerAnsweredDataSchema = z.object({
 		.optional(),
 });
 
-/** `caller.abandoned` — the caller hung up, timed out, or exited to an overflow destination. */
+/**
+ * `caller.abandoned` — the caller left the line without an agent taking them.
+ *
+ * ## Why one event covers five different endings
+ *
+ * Because an SLA report asks one question — "did this caller get served?" — and every value of
+ * `reason` is a no. Splitting them into separate events would make "offered calls" a sum over four
+ * subjects that nobody remembers to keep in step, and the first time somebody adds a fifth ending
+ * every existing report would silently under-count. The discriminator is a field precisely so that
+ * adding an ending cannot break the arithmetic.
+ *
+ * `exit-key` is the newest of them and is deliberately NOT folded into `overflow`. A caller who
+ * pressed 2 to leave a voicemail chose to stop waiting; a caller sent to an overflow destination had
+ * the choice made for them. They belong in the same "not served by an agent" bucket for the SLA and
+ * in different rows on the report a supervisor reads to decide whether the exit key is working.
+ */
 export const queueCallerAbandonedDataSchema = z.object({
 	callId: z.uuid(),
 	legId: z.uuid(),
 	waitMs: z.int().min(0),
 	/** Position at the moment of abandonment — how close they got. */
 	position: z.int().min(1).optional(),
-	reason: z.enum(["caller-hangup", "timeout", "overflow", "no-agents"]).optional(),
+	reason: z.enum(["caller-hangup", "timeout", "overflow", "no-agents", "exit-key"]).optional(),
+	/** The digit they pressed, when `reason` is `exit-key`. Which key was used is the report. */
+	exitKey: z.string().min(1).max(1).optional(),
 });
 
 /** `agent.state` — the agent's status changed. Drives distribution and the wallboard. */

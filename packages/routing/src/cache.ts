@@ -105,6 +105,12 @@ export const ROUTING_TABLE_TO_ENTITY: Readonly<Record<string, RoutingEntityKind>
 	moh_class: "mohClasses",
 	conference: "conferences",
 	park_lot: "parkLots",
+	paging_group: "pagingGroups",
+	// Both halves of the group map to the same collection, because the snapshot nests membership
+	// inside the group (see `PagingGroupInput`). Adding or removing one handset changes who hears an
+	// announcement, which is a compiled fact, so a write to the child evicts exactly as a write to
+	// the parent does.
+	paging_group_member: "pagingGroups",
 	feature_code: "featureCodes",
 	call_block_rule: "callBlockRules",
 	// A routing input as of E911: a DID's `emergency_address_id` picks the organization's ELIN, and
@@ -112,6 +118,35 @@ export const ROUTING_TABLE_TO_ENTITY: Readonly<Record<string, RoutingEntityKind>
 	// what an emergency call presents, which is a compiled fact.
 	emergency_address: "emergencyAddresses",
 	org_setting: "settings",
+	// A routing input as of the concurrent-call ceiling: `max_concurrent_calls` is compiled into
+	// `CompiledRoutingSettings` and enforced by the engine at admission, so raising a tenant's cap
+	// has to reach a running engine the same way any other configuration change does. It maps to
+	// `settings` because that is the snapshot field it lands in — one eviction, one recompile,
+	// whichever of the two tables moved.
+	org_limit: "settings",
+
+	// --- The T2 admin block ---------------------------------------------------------------------
+	call_flow: "callFlows",
+	pin_set: "pinSets",
+	pin_set_entry: "pinSetEntries",
+	translation_ruleset: "translationRulesets",
+	translation_rule: "translationRules",
+	destination_alias: "destinationAliases",
+	audio_stream: "audioStreams",
+	// The media library became a routing input the day a phrase became a prompt row: which prompt
+	// ids are SEQUENCES is a compiled fact, and renaming a file is not — but the table cannot tell
+	// the two apart, so every write to it recompiles. The cost is bounded by `isArtifactFresh`,
+	// which compares content hashes and skips the KV round trip when nothing routing reads moved.
+	prompt: "prompts",
+	phrase_step: "phraseSteps",
+	dial_by_name_directory: "directories",
+	speed_dial: "speedDials",
+	shared_line: "sharedLines",
+	// Both halves map to the same collection, because the snapshot nests appearances inside the line
+	// (see `SharedLineInput`). Moving one desk onto or off a shared line changes who the line rings
+	// and which button lights, which is a compiled fact, so a write to the appearance evicts exactly
+	// as a write to the line does.
+	shared_line_appearance: "sharedLines",
 } as const;
 
 export function isRoutingEntityKind(value: string): value is RoutingEntityKind {

@@ -17,6 +17,7 @@ import {
 	uuidV7PrimaryKey,
 } from "@optimiq-voice/db";
 import { appendOnlyTenantPolicies, tenantIsolationPolicy } from "../tenant";
+import { trunk } from "./trunks-schema";
 
 /**
  * Network ACLs, the authentication-failure ledger, and the change ledger.
@@ -41,6 +42,52 @@ export const sipAclEntry = pgTable.withRLS(
 		scope: text("scope").$type<SipAclScope>().notNull().default("registration"),
 		/** Lower first. Ties are broken by the most specific prefix. */
 		priority: integer("priority").notNull().default(100),
+		/**
+		 * The carrier this network belongs to, when the rule is about one carrier rather than the
+		 * tenant at large.
+		 *
+		 * ## The hole it fills
+		 *
+		 * `trunks-schema.ts` has `kind: "ip-auth"` — "the carrier authenticates our source IP" — and
+		 * no field for WHICH source addresses we accept, while this table has the networks and no idea
+		 * which trunk they belong to. `plans/sipd-invite-design.md` §8.2 put the choice between a
+		 * `trunk_acl` child table and this column at slice 3 and said this one is smaller; it is also
+		 * the one that keeps a single ACL evaluator, which is the part that matters — a second table
+		 * would be a second set of precedence rules for the same decision.
+		 *
+		 * Carrying the association is what lets a matched packet be ATTRIBUTED to a carrier, which is
+		 * what puts a `trunkId` on the admission request and ultimately a trunk on the CDR.
+		 *
+		 * ## Null is the default, and it means the whole organization
+		 *
+		 * Every row that existed before this column means exactly what it meant, which is what makes
+		 * the migration backward-compatible without a backfill: the entry admits or denies for the
+		 * tenant and attributes nothing. `sipAclEntrySchema` documents the published side of the same
+		 * fact as "admits without attributing".
+		 *
+		 * ## `cascade`, and why `set null` is the one option that would be wrong
+		 *
+		 * Deleting a trunk deletes the networks that existed only to admit it. That is the safe
+		 * direction under the rule the edge evaluates by — an address matching nothing is REFUSED — so
+		 * the carrier's networks stop being admitted at the moment the carrier stops existing.
+		 *
+		 * `set null` would take a rule scoped to one carrier and silently WIDEN it into a rule for the
+		 * whole organization, which is an access-control boundary loosening as a side effect of an
+		 * unrelated delete and the single worst outcome available here. A 409 that refused the delete
+		 * was the other candidate and is what `TRUNK_RESOURCE` does for outbound routes; it is wrong
+		 * here because an outbound route survives its trunk as a route with a broken leg an operator
+		 * can repair, whereas an ACL entry for a carrier that no longer exists has no meaning left to
+		 * repair — the only resolution an operator could reach is the deletion this performs.
+		 *
+		 * ## The unique index is deliberately NOT widened to include it
+		 *
+		 * `(organization_id, scope, network)` stays as it is, so one network still gets one rule. Two
+		 * rows for the same network naming different trunks would be legal under a widened index and
+		 * unpublishable under `kvKeyFor.sipAcl`, whose key is the network alone — `sip-acl.publisher.ts`
+		 * refuses a contested key rather than picking a winner, so widening here would manufacture
+		 * exactly the collision that publisher exists to report.
+		 */
+		trunkId: uuidEntityId("trunk_id").references(() => trunk.id, { onDelete: "cascade" }),
 		description: text("description"),
 		enabled: boolean("enabled").notNull().default(true),
 		...auditTimestampColumns(),

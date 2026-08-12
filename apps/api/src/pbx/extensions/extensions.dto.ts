@@ -53,6 +53,13 @@ export const createExtensionDto = z.strictObject({
 	emergencyCallerIdName: z.string().max(128).nullish(),
 	emergencyCallerIdNumber: z.string().max(32).nullish(),
 	voicemailEnabled: z.boolean().optional(),
+	/**
+	 * Screen external callers: record a name, play it to the extension, 1 accepts / 2 rejects.
+	 * The column compiles into the artifact today; the walk's runtime ships behind a default-off
+	 * setting (`callScreeningEnabled` in the engine), and a follow-me ladder outranks screening —
+	 * both stated on the form so the toggle never promises behaviour the walk does not deliver.
+	 */
+	callScreening: z.boolean().optional(),
 	doNotDisturb: z.boolean().optional(),
 	forwardAllEnabled: z.boolean().optional(),
 	forwardAllDestination: dialableString.nullish(),

@@ -129,10 +129,19 @@ jobs:
           go-version: "1.26.x"
           cache-dependency-path: |
             apps/sipd/go.sum
+            apps/mediad/go.sum
             packages/events-go/go.sum
 
       - name: Test apps/sipd
         working-directory: apps/sipd
+        run: go test ./...
+
+      # The media plane. Absent from this job until now, which meant the process with RTP sockets
+      # open to the internet was the one module nothing ran on a pull request — a gap rather than a
+      # decision. Its own step rather than a `go test ./...` from the workspace root, matching the
+      # two around it: the root is not a module path, and a per-module step names which one failed.
+      - name: Test apps/mediad
+        working-directory: apps/mediad
         run: go test ./...
 
       - name: Test packages/events-go

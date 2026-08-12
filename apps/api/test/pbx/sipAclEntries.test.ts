@@ -32,6 +32,7 @@ import type { AppSession, Permission } from "@optimiq-voice/auth";
 
 const ORG = "019fd3c2-1111-76be-a6b3-b0f1914e39b6";
 const USER = "019fd3c2-9999-76be-a6b3-b0f1914e39b6";
+const TRUNK = "019fd3c2-3333-76be-a6b3-b0f1914e39b6";
 
 function sessionFor(): AppSession {
 	return {
@@ -157,6 +158,52 @@ describe("sip ACL entry DTOs", () => {
 	it("lets PATCH send one field at a time", () => {
 		expect(updateSipAclEntryDto.safeParse({ enabled: false }).success).to.equal(true);
 		expect(updateSipAclEntryDto.safeParse({ network: "10.0.0.1/24" }).success).to.equal(false);
+	});
+
+	/**
+	 * The per-trunk binding — `plans/sipd-invite-design.md` §8.2's open question, closed as a column
+	 * on this table rather than a `trunk_acl` child table because one ACL evaluator is worth more
+	 * than the shape.
+	 */
+	it("carries a trunk binding through create", () => {
+		const parsed = createSipAclEntryDto.parse({
+			network: "203.0.113.0/24",
+			scope: "trunk",
+			trunkId: TRUNK,
+		});
+		expect(parsed.trunkId).to.equal(TRUNK);
+	});
+
+	/**
+	 * Absent means the entry applies to the whole organization, which is what every row meant before
+	 * the column existed. Omitting it must therefore stay legal, or the migration would have been
+	 * backward-incompatible at the API rather than at the database.
+	 */
+	it("leaves the binding out when nothing was said, which means the whole organization", () => {
+		const parsed = createSipAclEntryDto.parse({ network: "203.0.113.0/24", scope: "trunk" });
+		expect(parsed.trunkId).to.equal(undefined);
+	});
+
+	/**
+	 * `null` CLEARS it and `undefined` leaves it alone. Without the first, an entry bound to the
+	 * wrong trunk could only be un-bound by deleting the row and retyping the CIDR — and retyping a
+	 * CIDR to fix a dropdown is how the wrong network gets allowed.
+	 */
+	it("tells 'clear the binding' apart from 'do not touch it' on PATCH", () => {
+		expect(updateSipAclEntryDto.parse({ trunkId: null }).trunkId).to.equal(null);
+		expect(Object.hasOwn(updateSipAclEntryDto.parse({ enabled: false }), "trunkId")).to.equal(
+			false,
+		);
+	});
+
+	it("refuses a binding that is not an id", () => {
+		expect(
+			createSipAclEntryDto.safeParse({
+				network: "203.0.113.0/24",
+				scope: "trunk",
+				trunkId: "Telnyx",
+			}).success,
+		).to.equal(false);
 	});
 });
 

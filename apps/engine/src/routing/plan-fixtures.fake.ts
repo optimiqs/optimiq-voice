@@ -141,7 +141,10 @@ export function queueNode(id: string, overrides: Partial<QueuePlanNode> = {}): Q
 		maxWaitNoAgentSeconds: 0,
 		announcePositionEnabled: false,
 		announceFrequencySeconds: 60,
-		recordEnabled: false,
+		recordPolicy: "none",
+		priority: 0,
+		abandonedResumeAllowed: false,
+		discardAbandonedAfterSeconds: 0,
 		...overrides,
 	};
 }
@@ -160,7 +163,7 @@ export function conferenceNode(
 		// about the PIN gate does not have to remember to raise a cap it never mentioned.
 		maxMembers: 0,
 		waitForModerator: false,
-		recordEnabled: false,
+		recordPolicy: "none",
 		...overrides,
 	};
 }

@@ -7,6 +7,7 @@ import { ChannelOrchestrator } from "./calls/channel-orchestrator.service";
 import { loadEngineEnv } from "./config/engine-env";
 import { AriConnectionService } from "./media/ari-connection.service";
 import { MediadService } from "./media/mediad.service";
+import { SipdService } from "./media/sipd.service";
 import { StartupMediaEventBuffer } from "./media/startup-media-event-buffer";
 
 /**
@@ -50,6 +51,8 @@ async function bootstrap(): Promise<void> {
 	const mediad = app.get(MediadService);
 	const orchestrator = app.get(ChannelOrchestrator);
 
+	const sipd = app.get(SipdService);
+
 	const source = env.ENGINE_MEDIA_DRIVER === "ari" ? ari : mediad;
 	const startupEvents = new StartupMediaEventBuffer(
 		async (event) => await orchestrator.handleEvent(event),
@@ -57,8 +60,19 @@ async function bootstrap(): Promise<void> {
 	source.setEventHandler((event) => {
 		startupEvents.push(event);
 	});
+	// The signalling plane is a SECOND source into the same buffer, not an alternative to the first.
+	// Under the split plane a leg's facts arrive from two processes — `mediad` reports what happened
+	// to the audio and `sipd` reports what happened to the dialog — and both map into one union, so
+	// both go through the same recovery buffer and the same handler. A `dialog.terminated` that
+	// arrived during hydration must be replayed in arrival order beside a `session.ended`, or a leg
+	// admitted moments earlier is held forever. `SipdService.start()` is a no-op on a deployment that
+	// does not signal on `apps/sipd`.
+	sipd.setEventHandler((event) => {
+		startupEvents.push(event);
+	});
 
 	await source.start();
+	await sipd.start();
 	await orchestrator.hydrateChannels();
 	await startupEvents.replay();
 

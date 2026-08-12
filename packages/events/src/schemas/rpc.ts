@@ -4,7 +4,12 @@ import {
 	callDirectionSchema,
 	destinationTypeSchema,
 	dialStringSchema,
+	dtmfDigitSchema,
+	hangupCauseCodeSchema,
+	hangupCauseSchema,
 	sipTransportSchema,
+	tapModeSchema,
+	transferKindSchema,
 } from "./telephony";
 
 /**
@@ -130,8 +135,34 @@ export const ROUTING_RESOLVE_RPC = defineRpc(
 
 export const authzCheckRequestSchema = z.object({
 	orgId: z.uuid(),
+	/**
+	 * WHO is asking. Four kinds, and `extension` is the one that needs the argument.
+	 *
+	 * An extension looks like a resource — it is a row in `pbx-db` with a number on it, and every
+	 * other subject on this platform is a principal with a user id. It is on this list anyway,
+	 * because of what the engine actually has at the moment it needs an answer. A supervisor picks
+	 * up a desk phone and dials `*0<extension>`. The engine authenticated that caller the only way a
+	 * phone can be authenticated: the call arrived from a REGISTERED EXTENSION. There is no session,
+	 * no cookie and no user id anywhere in the call — the same identity `*72` writes forwarding
+	 * with, and the same one `*97` opens a mailbox with. A check keyed on `user` could therefore
+	 * never be made from a handset at all, and the alternative to naming this subject type is that
+	 * every feature reachable from a phone is either unauthorized or authorized by whichever
+	 * runtime happens to be asking. That is the choice this entry closes.
+	 *
+	 * When `type` is `extension`, `id` is the extension NUMBER — not its uuid — scoped by `orgId`,
+	 * because the number is what the engine holds and asking it to carry a primary key it never
+	 * learned would put the resolution in the wrong process.
+	 *
+	 * And the number is a **CLAIM**, never an identity to be trusted, exactly as
+	 * `rpc.pbx.v1.extension-feature` says of its own `extensionNumber`: a request on a shared broker
+	 * proves only that something reached the broker. The responder must resolve the number to an
+	 * extension row **inside the tenant's own scope**, then that row to its primary linked user,
+	 * then that user's membership role, and answer on the permissions that produces. A responder
+	 * that skipped a hop would be answering `allowed: true` for whatever number it was handed,
+	 * which on THIS subject means handing a stranger the audio of somebody's live call.
+	 */
 	subject: z.object({
-		type: z.enum(["user", "api-key", "service"]),
+		type: z.enum(["user", "api-key", "service", "extension"]),
 		id: z.string().min(1).max(128),
 	}),
 	/** `<resource>.<action>[.<scope>]` strings from the permission registry in `packages/auth`. */
@@ -242,6 +273,322 @@ export const VOICEMAIL_LIST_RPC = defineRpc(
 );
 
 // ---------------------------------------------------------------------------------------------
+// rpc.pbx.v1.extension-feature — engine → api, when a handset presses `*72`/`*74`/`*76`/`*78`/`*21`
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The self-service half of forwarding, do-not-disturb and follow-me.
+ *
+ * ## Why this is the only write the engine makes
+ *
+ * `extension.forward_all_enabled` and its four siblings are already compiled into every routing
+ * artifact — the compiler resolves them into `forwardAllNodeId`, `busyNodeId` and `noAnswerNodeId`
+ * and the walker has honoured them since the day extensions were compiled. What was missing was
+ * the other direction: a user could only change them from the admin UI, so `*72` announced itself
+ * as unimplemented on a system that already routed forwarding perfectly.
+ *
+ * The columns live in `pbx-db`, which the API owns and the engine has no handle on, so the press
+ * has to become a request. FusionPBX did the same thing through ESL ("call forward/DND writes
+ * extension flags", frozen inventory §Features); this is that seam with a schema on it.
+ *
+ * ## `extensionNumber` is a claim, exactly as `mailboxNumber` is
+ *
+ * The engine knows which extension dialled because the call arrived from it, and that is as strong
+ * as the phone on the desk — the same authentication `*97` accepts. It is NOT authorization: a
+ * request on the broker proves only that something reached the broker. The responder therefore
+ * resolves the number inside `withTenantScope(orgId)` and refuses a number that is not an enabled
+ * extension of that organization, rather than writing whatever row it is handed.
+ *
+ * ## `enabled: false` never clears the destination
+ *
+ * The columns are a flag/destination pair precisely so switching forwarding off does not lose the
+ * number the user configured — see `extensions-schema.ts`. A clear therefore writes the flag and
+ * leaves the destination alone, which is what makes `*72` followed later by a bare `*72` a toggle
+ * rather than a re-typing exercise.
+ *
+ * ## The reply is what the caller HEARS
+ *
+ * `applied` decides between the confirmation tone and the "unavailable" announcement, so a refusal
+ * must arrive as a reply rather than as a timeout: a user who is told nothing assumes forwarding is
+ * on, and the person who then rings them is the one who finds out it is not. `reason` is for the
+ * log; the handset is never told which of the refusals happened.
+ */
+export const extensionFeatureSchema = z.enum([
+	"forward-all",
+	"forward-busy",
+	"forward-no-answer",
+	"do-not-disturb",
+	"follow-me",
+]);
+
+export const extensionFeatureRequestSchema = z.object({
+	orgId: z.uuid(),
+	/** The calling extension's number, as the engine authenticated it. A claim — see above. */
+	extensionNumber: z.string().min(1).max(32),
+	feature: extensionFeatureSchema,
+	/** The state being asked for. `false` clears the flag and keeps the stored destination. */
+	enabled: z.boolean(),
+	/**
+	 * Where to forward, for the three forwarding features when `enabled` is true.
+	 *
+	 * Ignored by `do-not-disturb` and `follow-me`, which have no destination of their own: a
+	 * ladder's hops are configured from the admin UI and `*21` only flips its switch.
+	 */
+	destination: dialStringSchema.optional(),
+	/** Present when the change came off a live call; for logging correlation only. */
+	callId: z.uuid().optional(),
+});
+
+export const extensionFeatureResponseSchema = z.object({
+	/** False means nothing was written. The handset hears the unavailable announcement. */
+	applied: z.boolean(),
+	feature: extensionFeatureSchema,
+	/** The state AFTER the write, or the state as it still stands when `applied` is false. */
+	enabled: z.boolean().default(false),
+	/** The stored destination after the write, when the feature has one. */
+	destination: z.string().max(128).optional(),
+	/** Why the change was refused, for the support ticket. Never played to the handset. */
+	reason: z.string().max(256).optional(),
+});
+
+export type ExtensionFeature = z.infer<typeof extensionFeatureSchema>;
+export type ExtensionFeatureRequest = z.infer<typeof extensionFeatureRequestSchema>;
+export type ExtensionFeatureResponse = z.infer<typeof extensionFeatureResponseSchema>;
+
+export const EXTENSION_FEATURE_RPC = defineRpc(
+	RPC_SUBJECTS.pbxExtensionFeature,
+	extensionFeatureRequestSchema,
+	extensionFeatureResponseSchema,
+	// The longest deadline in this file, and the only one that covers a WRITE. The responder does
+	// not just update a column: it recompiles the tenant's whole routing artifact inside the same
+	// transaction (compile-on-write), because a `*72` whose artifact still says "ring the desk" is
+	// a `*72` that did not happen. A caller listening to a moment of silence before the
+	// confirmation tone is a far better outcome than a confirmation that outran the change.
+	5_000,
+);
+
+// ---------------------------------------------------------------------------------------------
+// rpc.pbx.v1.last-caller — engine → api, when a handset presses `*69`
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * `*69` — call the last person who rang me back.
+ *
+ * ## Why the CDR and not a KV projection
+ *
+ * The engine sees every inbound leg, so it could keep its own "last caller" bucket. It should not:
+ * that bucket would be a second copy of a fact `cdr-db.call_legs` already stores durably, it would
+ * be empty after a restart or a rebalance, and it would have to be written on the call path for a
+ * feature pressed once a week. `call_legs` already carries `(organization_id, to_number)` as an
+ * index and `started_at` as its partition key, so the newest inbound leg towards an extension is
+ * one bounded index scan.
+ *
+ * FreeSWITCH backs `*69` with its own key-value store (frozen reference §Other capabilities). This
+ * is the same fact sourced from the ledger that was going to record it anyway.
+ *
+ * ## Bounded in time, always
+ *
+ * `call_legs` is partitioned by `started_at`, so an unbounded "most recent" query is a scan of
+ * every partition that exists. `withinHours` bounds it, and a lookup that finds nothing inside the
+ * window answers `found: false` rather than reaching further back — a `*69` that dials somebody
+ * from three months ago is a wrong number, not a feature.
+ */
+export const lastCallerRequestSchema = z.object({
+	orgId: z.uuid(),
+	/** The calling extension's number, as the engine authenticated it. A claim, as above. */
+	extensionNumber: z.string().min(1).max(32),
+	/** How far back to look. Bounded because the leg table is partitioned by time. */
+	withinHours: z.int().min(1).max(720).default(168),
+	callId: z.uuid().optional(),
+});
+
+export const lastCallerResponseSchema = z.object({
+	/** False means "nobody rang this extension inside the window", or that the lookup failed. */
+	found: z.boolean(),
+	/** The number to dial back. Absent with `found: true` means the caller withheld their number. */
+	callerNumber: dialStringSchema.optional(),
+	callerName: z.string().max(128).optional(),
+	/** When that leg started, ISO 8601. For the log and the walk's notes. */
+	at: z.iso.datetime().optional(),
+	reason: z.string().max(256).optional(),
+});
+
+export type LastCallerRequest = z.infer<typeof lastCallerRequestSchema>;
+export type LastCallerResponse = z.infer<typeof lastCallerResponseSchema>;
+
+export const LAST_CALLER_RPC = defineRpc(
+	RPC_SUBJECTS.pbxLastCaller,
+	lastCallerRequestSchema,
+	lastCallerResponseSchema,
+	// The same budget the mailbox listing gets, for the same reason: the caller is already
+	// connected and a slow reply costs dead air rather than a call that never connected.
+	3_000,
+);
+
+// ---------------------------------------------------------------------------------------------
+// rpc.pbx.v1.file-greeting — engine → api, when a handset finishes recording over `*99`
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Which of a mailbox's greetings a recording occupies.
+ *
+ * The same four slots `voicemail_greeting.kind` has, restated here rather than imported: this
+ * package is the contract and must not depend on the control plane's schema package, and a Go
+ * caller gets the enum from the generated code rather than from a Drizzle table. `*99` records
+ * `unavailable` today — the catalogue's `voicemail-record-greeting` takes no argument — and the
+ * other three are on the wire so that a second code, or an argument, does not need a new subject.
+ */
+export const VOICEMAIL_GREETING_KINDS = ["unavailable", "busy", "name", "temporary"] as const;
+export const voicemailGreetingKindSchema = z.enum(VOICEMAIL_GREETING_KINDS);
+export type VoicemailGreetingKind = (typeof VOICEMAIL_GREETING_KINDS)[number];
+
+/**
+ * `*99` — filing the greeting a user has just recorded from their handset.
+ *
+ * ## Why this is not `voicemail.message.left`
+ *
+ * The engine already has a way to say "I recorded audio for this mailbox", and it is deliberately
+ * NOT reused. `voicemailMessageLeftData` files a row in `voicemail_message`, archives the audio and
+ * publishes `mwi.updated` — so a greeting sent down that path would land in the recorder's own
+ * inbox and light their lamp, and the mailbox would still answer with the deployment's default
+ * announcement. The two look alike at the microphone and are opposite facts afterwards: a message
+ * is something a mailbox RECEIVED, a greeting is what it SAYS.
+ *
+ * ## Why request-reply and not an event
+ *
+ * Filing a greeting is a two-row write — clear the incumbent active greeting of that kind, insert
+ * the new one — inside a recompile, because `voicemail_greeting` is a routing input and the
+ * compiler embeds the active recording into the mailbox's `leave` node.
+ * `voicemail-greetings.service.ts` sets out at length why those statements cannot be split. An
+ * event would give the engine no way to know whether any of it happened, and `*99`'s whole design
+ * rests on the opposite: the port is checked BEFORE the beep, and the confirmation is played only
+ * once the greeting is filed. A user who is told their greeting is live when it is not discovers it
+ * from the first caller who reaches the mailbox, which is the one outcome the runtime exists to
+ * prevent.
+ *
+ * ## `mailboxNumber` is a claim, exactly as it is on `rpc.voicemail.v1.list`
+ *
+ * The engine knows which mailbox because the call came from the extension that owns it and the
+ * box's PIN gate — the same one `*97` applies — was satisfied. That is authentication of the
+ * strength of the phone on the desk, and it is not authorization: a request on a shared broker
+ * proves only that something reached the broker. So the responder loads the box under
+ * `withTenantScope(orgId)` and refuses a box whose own `mailbox_number` is not the claimed one,
+ * rather than replacing the greeting of whatever id it is handed.
+ *
+ * ## THE AUDIO IS A KEY, NOT BYTES
+ *
+ * This is the shape decision worth the paragraph. The request carries `objectKey` — the recording's
+ * key relative to the shared object root, `<orgId>/<callId>/<recordingId>.<ext>`, exactly as
+ * `voicemailMessageLeftData.objectKey` carries a message's and exactly what
+ * `mediaStartRecordingResponse.objectKey` defines. Three reasons, in the order they bite:
+ *
+ * 1. **The engine never holds the bytes.** The media server writes the file itself, straight onto
+ *    the mount every process in the deployment shares (`media-storage.ts` has the whole picture);
+ *    the engine only ever learns a name for it. A payload of audio would mean the call path reading
+ *    a file off disk purely to hand it back to a process that can already open it.
+ * 2. **NATS request-reply is not a file transport.** A minute of 8 kHz PCM is most of a megabyte,
+ *    which is a broker's default maximum payload; the ceiling would be reached by a greeting a
+ *    user is entitled to record, and the failure would arrive as a disconnect rather than a
+ *    refusal.
+ * 3. **The key is already the vocabulary.** The recording has a `channel.record.started` /
+ *    `channel.record.stopped` pair carrying the same key, so the greeting, the CDR's recording row
+ *    and the archive all name one object rather than three copies of one sound.
+ *
+ * What the responder does with it is an INGEST rather than a rename: it reads the object, checks
+ * that it really is audio, and writes a copy under the media library's own layout
+ * (`greetings/<org>/<box>/<greetingId>.<ext>`), because that is where the compiler expects a
+ * greeting to live and where the greeting's HTTP lifecycle — preview, relabel, delete — can reach
+ * it. A copy and not a move: the source object is still what `channel.record.stopped` named, and
+ * moving it would break the recording row that names it.
+ *
+ * ## The reply is what the caller HEARS
+ *
+ * `applied` decides between the confirmation and the "not available" announcement, so a refusal
+ * must arrive as a reply rather than as a timeout — the same rule `rpc.pbx.v1.extension-feature`
+ * states, and it costs more here: the user has just spent thirty seconds recording, and silence
+ * would leave them believing it worked.
+ */
+export const fileGreetingRequestSchema = z.object({
+	orgId: z.uuid(),
+	/** The box the walk resolved from the artifact's mailbox table. Re-checked against the claim. */
+	voicemailBoxId: z.uuid(),
+	/** The mailbox number the walk authenticated. A CLAIM — see above. */
+	mailboxNumber: z.string().min(1).max(32),
+	/**
+	 * Minted by the engine, and it becomes the `voicemail_greeting` row id.
+	 *
+	 * The same idempotence `voicemailMessageLeftData.messageId` buys: a request whose reply was lost
+	 * and is retried files ONE greeting rather than two rows racing for the single active slot.
+	 */
+	greetingId: z.uuid(),
+	/** Which slot the recording fills. `*99` records `unavailable`; see the enum. */
+	kind: voicemailGreetingKindSchema.default("unavailable"),
+	/**
+	 * The recorded audio, as a key under the shared object root. See "THE AUDIO IS A KEY" above.
+	 *
+	 * 1024 matches `voicemailMessageSummarySchema.objectKey` and `recordings.object_key`, which is
+	 * the same string in a database column.
+	 */
+	objectKey: z.string().min(1).max(1_024),
+	/**
+	 * The media server's own handle for the capture — the file-name stem inside {@link objectKey}.
+	 *
+	 * Optional and carried for correlation only: it is what joins this request to the
+	 * `channel.record.started` / `channel.record.stopped` pair in a support ticket. A responder that
+	 * ignores it is correct.
+	 */
+	recordingId: z.string().min(1).max(128).optional(),
+	/**
+	 * How long the recording is, as the media server reported it.
+	 *
+	 * At least one millisecond, and the floor is load bearing rather than tidy: an empty recording
+	 * is DISCARDED by the walk before this request is made, because an active greeting containing
+	 * silence stops a mailbox announcing itself and says nothing about why. A zero arriving here is
+	 * therefore a caller that skipped that rule, and it is refused by the schema rather than filed.
+	 */
+	durationMs: z.int().min(1),
+	/** Present when the greeting came off a live call; for logging correlation only. */
+	callId: z.uuid().optional(),
+});
+
+export const fileGreetingResponseSchema = z.object({
+	/** False means nothing was filed. The handset hears the unavailable announcement. */
+	applied: z.boolean(),
+	kind: voicemailGreetingKindSchema,
+	/**
+	 * Whether this greeting is now the ACTIVE one for its kind.
+	 *
+	 * Separate from `applied` for the reason `enabled` is separate from it on the feature subject: a
+	 * greeting that was stored and not activated is a different fact from one that was not stored,
+	 * and a runtime that read only `applied` would confirm a recording nobody will ever hear.
+	 */
+	active: z.boolean().default(false),
+	/** Echoed so a reply can be attributed without the caller holding per-request state. */
+	greetingId: z.uuid().optional(),
+	/** Where the library filed it — `greetings/<org>/<box>/<greetingId>.<ext>`. Diagnostics. */
+	objectKey: z.string().max(1_024).optional(),
+	/** Why the greeting was refused, for the support ticket. Never played to the handset. */
+	reason: z.string().max(256).optional(),
+});
+
+export type FileGreetingRequest = z.infer<typeof fileGreetingRequestSchema>;
+export type FileGreetingResponse = z.infer<typeof fileGreetingResponseSchema>;
+
+export const FILE_GREETING_RPC = defineRpc(
+	RPC_SUBJECTS.pbxFileGreeting,
+	fileGreetingRequestSchema,
+	fileGreetingResponseSchema,
+	// The same five seconds `rpc.pbx.v1.extension-feature` gets, and for its reason plus one more.
+	// The responder recompiles the tenant's whole routing artifact inside the write's transaction,
+	// because a greeting whose artifact still names the old recording is a greeting that did not
+	// happen; and before that it COPIES the audio into the library, which is a minute of PCM at
+	// worst, on the volume the media server just wrote it to. A caller listening to a moment of
+	// silence before the confirmation is a far better outcome than a confirmation that outran the
+	// file.
+	5_000,
+);
+
+// ---------------------------------------------------------------------------------------------
 // rpc.sip.v1.credential — sipd → api, on every REGISTER that answers a digest challenge
 // ---------------------------------------------------------------------------------------------
 
@@ -309,6 +656,23 @@ export const sipCredentialResponseSchema = z.object({
 		.optional(),
 	deviceId: z.uuid().optional(),
 	extensionId: z.uuid().optional(),
+	/**
+	 * The shared-line appearance this account holds, when the extension appears on a shared line.
+	 *
+	 * This is how a registering device learns its appearance index without sipd growing a database
+	 * handle or a second read model: the appearance index is a per-(extension) fact the control plane
+	 * already computes into the routing artifact, and the credential reply is the one message that
+	 * already travels from that control plane to the edge on REGISTER. sipd carries these onto the
+	 * binding and stamps `Call-Info: <sip:number@domain>;appearance-index=N` onto the INVITE and the
+	 * dialog-info NOTIFY it sends to the appearance, so the phone lights the right shared-line key.
+	 *
+	 * The number is the shared line's own dialable number (absent for a shared-key-only line); the
+	 * index is the appearance's ordinal on the line. An extension that appears on several shared lines
+	 * reports its lowest-ordinal line here — per-call appearance-slot assignment across simultaneous
+	 * calls is the BroadWorks dynamic behaviour and a named seam beyond this static button model.
+	 */
+	sharedLineNumber: z.string().max(64).optional(),
+	appearanceIndex: z.number().int().nonnegative().optional(),
 	/** Why the lookup could not be answered, for the support ticket. Never shown to a phone. */
 	reason: z.string().max(256).optional(),
 });
@@ -566,6 +930,668 @@ export const SIP_TRANSFER_RPC = defineRpc(
 );
 
 // ---------------------------------------------------------------------------------------------
+// rpc.sip.v1.invite — sipd → engine, ADMISSION
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Why the engine refused to admit an arriving INVITE.
+ *
+ * **This list is unlike every other refusal vocabulary on this backbone, and the difference is the
+ * point: each entry must become a SIP status a STRANGER sees.** Choosing that mapping in the engine
+ * would put SIP vocabulary in a process that has no dialog; choosing it in `apps/sipd` from a
+ * free-text string would put guesswork on the edge. So the list is small and closed, the table that
+ * turns it into a status lives in `apps/sipd/internal/invite/port.go`, and every entry is justified
+ * by what the caller should do next rather than by what went wrong internally.
+ *
+ * | reason | SIP | why |
+ * | --- | --- | --- |
+ * | `unattributed` | `404 Not Found` | no credential org and no `did-index` entry — nobody owns it |
+ * | `unknown_target` | `404 Not Found` | the dialled number resolves to nothing in this tenant's plan |
+ * | `not_permitted` | `403 Forbidden` | authenticated, but not for this context — the toll-fraud line |
+ * | `congestion` | `503` | tenant or trunk channel cap |
+ * | `shutting_down` | `503` + `Retry-After` | drain; the header is what makes a carrier fail OVER |
+ * | `bad_request` | `400 Bad Request` | malformed payload |
+ * | `internal` | `500` | anything else |
+ *
+ * And a refusal is always a REPLY, never a silence — the rule `MEDIA_REFUSAL_REASONS` states. Here
+ * it has teeth beyond good manners: a silent engine leaves the edge holding an INVITE server
+ * transaction until the caller's Timer B, and the caller hears thirty-two seconds of nothing. A
+ * `sipd` whose request times out answers `503` on its own authority and logs the timeout as
+ * DISTINCT from a refusal, exactly as `apps/sipd/internal/transfer/client.go` already does.
+ */
+export const SIP_INVITE_REFUSAL_REASONS = [
+	"unattributed",
+	"unknown_target",
+	"not_permitted",
+	"congestion",
+	"shutting_down",
+	"bad_request",
+	"internal",
+] as const;
+export const sipInviteRefusalReasonSchema = z.enum(SIP_INVITE_REFUSAL_REASONS);
+export type SipInviteRefusalReason = (typeof SIP_INVITE_REFUSAL_REASONS)[number];
+
+/** How the sender proved it may send this INVITE. It decides which context the engine may resolve in. */
+export const sipAuthenticationSchema = z.enum(["digest", "trunk-acl"]);
+export type SipAuthentication = z.infer<typeof sipAuthenticationSchema>;
+
+/** An SDP body, carried opaquely. 16 KiB matches `sdpSchema`'s bound in the media contracts. */
+const sipSdpSchema = z.string().max(16 * 1024);
+
+/** One end of the call as the SIP edge understands it. */
+export const sipPartySchema = z.object({
+	/** What a dial plan consumes: the user part and nothing else. A plan takes a string, not a URI. */
+	number: dialStringSchema,
+	/** The display name when the far end supplied one. PII-adjacent, presentation only. */
+	name: z.string().max(128).optional(),
+	/**
+	 * The canonical address of record.
+	 *
+	 * For the CALLER on a digest-authenticated INVITE this is rebuilt FROM THE CREDENTIAL and never
+	 * copied from the `From` header — the rule `apps/sipd/internal/transfer/handler.go` states as
+	 * "mixing those two up is how an authorisation check becomes decorative". For a trunk call there
+	 * is no credential, so it is absent rather than guessed.
+	 */
+	aor: z.string().max(512).optional(),
+	/** The address verbatim, for the log and for refusing a foreign domain explicitly one day. */
+	uri: z.string().max(1024).optional(),
+});
+
+/**
+ * What the edge observed about where the far end wants its media, versus where its signalling came
+ * from.
+ *
+ * `apps/sipd` does not parse SDP beyond the connection line — it holds no codec knowledge in either
+ * direction (`plans/sipd-invite-design.md` §5.2) — but it DOES know the transport source of the
+ * packet, which is a fact `mediad` cannot learn from the body alone. Carrying the disagreement makes
+ * a NAT latch an EXPECTATION rather than a surprise: the media plane can be told to accept a first
+ * packet from an address the offer never named, instead of discovering it as a timeout.
+ */
+export const sipMediaHintSchema = z.object({
+	/** Where the SIP packets came from, `host:port`. */
+	signallingSource: z.string().max(64).optional(),
+	/** The address in the SDP's connection line, host only. */
+	advertisedMedia: z.string().max(64).optional(),
+	/** The two disagree — the evidence for expecting a latch. */
+	mismatch: z.boolean().default(false),
+	/**
+	 * The advertised media address is in an RFC 1918 / RFC 4193 range.
+	 *
+	 * Proof rather than suspicion, and worth its own field: no packet from a private address reached
+	 * us over the internet, so a latch is certain rather than likely.
+	 */
+	private: z.boolean().default(false),
+});
+
+/** An RFC 3891 `Replaces`, parsed. Identical in shape to `sipTransferRequestSchema.replaces`. */
+export const sipReplacesSchema = z.object({
+	callId: z.string().min(1).max(256),
+	toTag: z.string().min(1).max(128),
+	fromTag: z.string().min(1).max(128),
+	/** The `early-only` flag, which forbids replacing a CONFIRMED dialog. */
+	earlyOnly: z.boolean().default(false),
+});
+
+/**
+ * `rpc.sip.v1.invite` — the SIP edge asking the call engine whether it will take an arriving call.
+ *
+ * ## RAW NATS ON BOTH ENDS
+ *
+ * Go caller (`apps/sipd/internal/invite`), TypeScript responder — the same inversion as
+ * `rpc.sip.v1.transfer`, and the same obligation. A Nest `@MessagePattern` would expect framing a Go
+ * caller never sends and would simply never answer, which on this subject means every INVITE times
+ * out into a `503`.
+ *
+ * ## Admission is synchronous; everything after it is not
+ *
+ * The single most important sentence about this subject. A routing walk is not fast — a ring group
+ * rings for thirty seconds and may then fall through to voicemail — so a request-reply that returned
+ * the call's OUTCOME would need a sixty-second deadline, and a request-reply with a sixty-second
+ * deadline is a subscription wearing one's clothes on a transport with no redelivery. So exactly one
+ * step is synchronous and it decides ADMISSION ONLY: "will you take this call at all", answered with
+ * the tenant, the call id and the instance that took it. The ringing, the answer and the teardown
+ * arrive later as `rpc.sip.v1.*` commands and `sip.evt.v1` events.
+ *
+ * The precedent is one level down in the same process: `apps/sipd/internal/transfer/handler.go`
+ * sends `202 Accepted` BEFORE its RPC, because RFC 3515 §2.4.2 makes accepting a REFER mean "I will
+ * try and I will tell you". `100 Trying` is out before this request for the same reason.
+ *
+ * ## Who resolves the tenant, and why that split is load-bearing
+ *
+ * `sipd` owns "is this sender allowed to send me an INVITE" — digest against the realm's credentials,
+ * or a trunk ACL match for a carrier. The engine owns "whose call is it" — `attributeCall` already
+ * does this in three ordered steps, and the `did-index` bucket exists precisely because the reader
+ * does not know the tenant. So {@link orgId} is present ONLY when a digest resolved a credential, and
+ * the reply carries the org the engine resolved.
+ *
+ * It is also why the event family starts AFTER admission: `sip.evt.v1.<orgId>.<legId>.<event>` needs
+ * a real tenant in the subject, and for a trunk INVITE the edge does not have one until this reply.
+ *
+ * ## The toll-fraud check the engine must perform
+ *
+ * {@link routingContext} is what the EDGE believes it may resolve in. Sending it does not make it
+ * true — it makes it CHECKABLE on the side that can enforce it. **The responder must refuse
+ * `not_permitted` when the context is trunk-capable and {@link authentication} was `trunk-acl`**,
+ * the same division of labour `rpc.sip.v1.transfer` uses when it puts the "is the referrer on this
+ * call" check in the engine because the edge cannot answer it.
+ */
+export const sipInviteRequestSchema = z.object({
+	/**
+	 * The leg id, minted by the EDGE before this request is sent.
+	 *
+	 * One string names the leg, the `mediad` session and the `sipd` dialog (§3.1), and minting it
+	 * before the RPC is what lets the engine hang up a leg whose admission reply it never saw — the
+	 * identical argument `mediaAllocateSessionRequestSchema` makes for caller-assigned session ids.
+	 */
+	legId: z.string().min(1).max(128),
+	/**
+	 * The `sipd` instance holding the dialog. Every subsequent command for this leg is addressed at
+	 * it, because a dialog lives on exactly one process and no other one can answer, retransmit or
+	 * BYE it.
+	 */
+	sipdInstanceId: z.string().min(1).max(128),
+	/** The tenant, present ONLY when a digest resolved a credential. Absent for a trunk. */
+	orgId: z.uuid().optional(),
+	authentication: sipAuthenticationSchema,
+	/** The trust boundary the call arrived on, so a refusal record says which one admitted it. */
+	profile: z.string().max(64).optional(),
+	/** See the toll-fraud note above. The engine may narrow this and must never widen it. */
+	routingContext: z.string().min(1).max(64),
+	from: sipPartySchema,
+	to: sipPartySchema,
+	/** Recorded verbatim, asserted to be nothing. A LOOKUP KEY and never an authorisation. */
+	sipCallId: z.string().min(1).max(256),
+	fromTag: z.string().max(128).optional(),
+	/** Set when an ACL entry attributed the source to a carrier. */
+	trunkId: z.uuid().optional(),
+	sourceAddress: z.string().max(64).optional(),
+	transport: sipTransportSchema.optional(),
+	/** Whether the INVITE carried a body at all. A delayed-offer INVITE is legal and rare. */
+	hasOffer: z.boolean().default(false),
+	/**
+	 * The offer, verbatim and unparsed.
+	 *
+	 * **The one field on this contract whose placement was argued both ways** (§10.3, §11.7). It is
+	 * HERE rather than fetched later because the engine is the courier for SDP: it will hand these
+	 * bytes to `rpc.media.v1.allocate-session` within milliseconds, and the alternative — a second
+	 * round trip back to the edge for them — puts a broker RTT in the middle of an INVITE for no
+	 * gain. It costs one copy on a request that is happening anyway. Re-open it once post-dial delay
+	 * has a measured number.
+	 */
+	sdpOffer: sipSdpSchema.optional(),
+	mediaHint: sipMediaHintSchema.optional(),
+	userAgent: z.string().max(256).optional(),
+	/**
+	 * The RFC 3891 `Replaces` this INVITE carried — a phone completing an attended transfer against
+	 * a dialog we hold.
+	 *
+	 * Both this and {@link replacesLegId} travel because the two halves are in different processes:
+	 * the DIALOG is replaced at the edge, and the CALL the replaced leg belonged to has to be
+	 * re-bridged in the engine. Sending only the SIP identifiers would make the engine re-derive a
+	 * leg id the edge is already holding.
+	 */
+	replaces: sipReplacesSchema.optional(),
+	/**
+	 * The leg the `Replaces` triple resolved to ON THIS INSTANCE, when it resolved at all.
+	 *
+	 * Present is not permission. The engine still owns the authorization question — is this party
+	 * entitled to replace that dialog — for the same reason `sipTransferRequestSchema` puts the
+	 * "is the referrer on this call" check there: the edge digest-authenticated the sender and can
+	 * see that it holds the named dialog, but it cannot see who is a party to the CALL.
+	 */
+	replacesLegId: z.string().min(1).max(128).optional(),
+});
+
+export const sipInviteResponseSchema = z.object({
+	ok: z.boolean(),
+	/** Echoed so a reply cannot be applied to the wrong leg. */
+	legId: z.string().min(1).max(128),
+	/**
+	 * The tenant the engine resolved. For a trunk call this is the first time the edge learns it, and
+	 * it is what makes every `sip.evt.v1` subject carry a real org. Present exactly when `ok`.
+	 */
+	orgId: z.uuid().optional(),
+	/** The engine's call id — the token in `calls.evt.v1.<org>.<callId>.>`. Present when `ok`. */
+	callId: z.string().min(1).max(128).optional(),
+	/** The ENGINE instance that took the call. Always present, refusal included, for the edge's log. */
+	instanceId: z.string().min(1).max(128).optional(),
+	/** What the engine actually resolved in, which may be NARROWER than what was asked for. */
+	routingContext: z.string().max(64).optional(),
+	/** `inbound` or `outbound`, as the engine filed it. */
+	direction: callDirectionSchema.optional(),
+	reason: sipInviteRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type SipInviteRequest = z.infer<typeof sipInviteRequestSchema>;
+export type SipInviteResponse = z.infer<typeof sipInviteResponseSchema>;
+
+export const SIP_INVITE_RPC = defineRpc(
+	RPC_SUBJECTS.sipInvite,
+	sipInviteRequestSchema,
+	sipInviteResponseSchema,
+	// One second, and neither of this file's two usual justifications applies cleanly.
+	//
+	// It is not the 500 ms of `rpc.sip.v1.credential`, which sits inside a REGISTER transaction that
+	// is retransmitting behind it. `100 Trying` is already on the wire here and nothing retransmits.
+	// It is not the 2 s of `rpc.sip.v1.transfer` either, because that one is bounded by somebody
+	// watching a handset and this one is bounded by somebody HOLDING one, listening to silence: the
+	// time from INVITE to `180` now includes this round trip plus the routing walk's first step.
+	//
+	// So: bounded well inside the two seconds every RPC on this backbone is bounded inside, and long
+	// enough that a busy engine answers rather than being declared absent. A timeout is answered
+	// `503` by the edge on its own authority and logged as distinct from a refusal.
+	1_000,
+);
+
+// ---------------------------------------------------------------------------------------------
+// rpc.sip.v1.{ring,answer,hangup,reinvite,originate} — engine → sipd, the dialog command surface
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Why a dialog command was refused.
+ *
+ * Modelled on {@link MEDIA_REFUSAL_REASONS} and governed by the same rule: a refusal is a REPLY, the
+ * caller branches on this code and never on the human-readable `error`, and a responder that simply
+ * does not answer a request it dislikes is indistinguishable from a crashed one.
+ *
+ * The vocabulary is shared by all five commands rather than split per subject, because the five
+ * refuse the same things for the same reasons and a caller that had to learn five overlapping
+ * enumerations would end up switching on strings.
+ */
+export const SIP_DIALOG_REFUSAL_REASONS = [
+	/** Malformed payload, or a required field missing. Retrying the same bytes fails the same way. */
+	"bad_request",
+	/** No dialog with that leg id on this instance. 481 on the wire if it were one. */
+	"unknown_dialog",
+	/**
+	 * The dialog belongs to ANOTHER `sipd` instance.
+	 *
+	 * Reachable here in a way it is not on `rpc.sip.v1.transfer`, and that is the point: these
+	 * subjects are instance-addressed, so this answer means the caller's idea of who owns the leg is
+	 * stale — a `sipd` was restarted and something is still addressing the old token. Do not retry
+	 * here; the leg is gone with the process that held it (§6.4).
+	 */
+	"wrong_instance",
+	/**
+	 * The dialog existed and has just ended — the CANCEL/answer race, decided by construction.
+	 *
+	 * One goroutine owns one dialog, so a CANCEL and an `answer` are two messages on one channel and
+	 * exactly one wins. The loser is refused BY NAME rather than left ambiguous, and the engine
+	 * treats it as it already treats `channel_gone` from the transfer responder.
+	 */
+	"dialog_gone",
+	/** The command does not apply in the dialog's current state — an `answer` on an answered call. */
+	"invalid_state",
+	/** An originate to an AOR with no live registration. The engine's `USER_NOT_REGISTERED`. */
+	"unregistered_target",
+	/** An originate naming a trunk this edge does not hold configuration for. */
+	"unknown_trunk",
+	/** DNS or transport failure reaching the target. Nothing was sent. */
+	"no_route",
+	/** A trunk's `maxChannels`, or this instance's own dialog cap. A LOAD signal. */
+	"capacity",
+	/** This instance is draining. Do not retry HERE — originate somewhere else. */
+	"shutting_down",
+	/**
+	 * The command is understood and this build cannot serve it.
+	 *
+	 * `reinvite` answers this until slice 5, which is the honest state: `sipgo` has no re-INVITE at
+	 * all (§9.2), and a hold that silently no-opped would be a call whose media direction is whatever
+	 * the last answer happened to say.
+	 */
+	"not_supported",
+	/** Anything else. */
+	"internal",
+] as const;
+export const sipDialogRefusalReasonSchema = z.enum(SIP_DIALOG_REFUSAL_REASONS);
+export type SipDialogRefusalReason = (typeof SIP_DIALOG_REFUSAL_REASONS)[number];
+
+/**
+ * The fields every dialog command reply carries.
+ *
+ * `instanceId` is always present, refusal included, because the caller's next move on a
+ * `wrong_instance` is to work out who DID answer.
+ */
+const sipDialogResponseBase = {
+	ok: z.boolean(),
+	legId: z.string().min(1).max(128),
+	instanceId: z.string().min(1).max(128).optional(),
+	reason: sipDialogRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+};
+
+/**
+ * `rpc.sip.v1.ring` — send a provisional response on a leg the edge has not answered.
+ *
+ * `180 Ringing` WITHOUT a body at slice 1. Early media — a `183` carrying an answer — is deferred to
+ * the slice that has something to put in it, and the reason to defer rather than build is exact: a
+ * `183` with an answer COMMITS the offer/answer exchange, and the subsequent `200 OK` must then
+ * repeat that same answer (RFC 3261 §13.2.1). Getting it wrong produces a call that connects and has
+ * no audio, which is the defect class this whole design spends its budget avoiding.
+ *
+ * `mediad`'s allocate is idempotent on `sessionId`, so when early media does arrive the same allocate
+ * returns the same session and the same SDP and re-using the answer costs nothing.
+ */
+export const sipRingRequestSchema = z.object({
+	legId: z.string().min(1).max(128),
+	/** 180 by default. 183 requires {@link sdpAnswer}; 181 and 182 are legal and unused. */
+	status: z.int().min(180).max(183).default(180),
+	/**
+	 * The answer to put in a `183 Session Progress`. Absent means `180 Ringing` with no body.
+	 *
+	 * Refused `not_supported` until early media ships — see the note above on why a half-built early
+	 * media path is worse than none.
+	 */
+	sdpAnswer: sipSdpSchema.optional(),
+});
+
+export const sipRingResponseSchema = z.object({ ...sipDialogResponseBase });
+
+export type SipRingRequest = z.infer<typeof sipRingRequestSchema>;
+export type SipRingResponse = z.infer<typeof sipRingResponseSchema>;
+
+export const SIP_RING_RPC = defineRpc(
+	RPC_SUBJECTS.sipRing,
+	sipRingRequestSchema,
+	sipRingResponseSchema,
+	// 500 ms. Everything behind it is a state transition and one write to a socket, and a caller
+	// is listening to silence until the 180 lands.
+	500,
+);
+
+/**
+ * `rpc.sip.v1.answer` — put a `200 OK` with this body on the socket.
+ *
+ * ## It replies when the 2xx IS WRITTEN, not when the ACK arrives
+ *
+ * **The single most important consequence of `sipgo`'s shape for this whole design** (§4.6), and the
+ * reason the deadline below is 1000 ms rather than the thirty-two seconds the SIP transaction may
+ * take. `sipgo`'s `DialogServerSession.WriteResponse` BLOCKS the calling goroutine until the ACK or
+ * 64×T1 ≈ 32 s, retransmitting the 2xx per RFC 6026. An RPC wrapped around that block would time out
+ * on every call whose ACK is even slightly late, and the engine would re-issue an `answer` against a
+ * call that is already up.
+ *
+ * So the command handler hands the response to the dialog's own goroutine and answers immediately,
+ * and the ACK is reported later as `sip.evt.v1.…dialog.answered`. This mirrors `rpc.media.v1.send-dtmf`,
+ * which answers when injection has STARTED.
+ *
+ * Idempotent on `legId`, like every command here: a timed-out `answer` may be re-issued, and the
+ * second one is refused `invalid_state` rather than answering the call twice.
+ */
+export const sipAnswerRequestSchema = z.object({
+	legId: z.string().min(1).max(128),
+	/**
+	 * The answer `mediad` wrote, verbatim. Required: a `200 OK` to an offer with no body is a call
+	 * that connects to silence, which is exactly the failure mode this contract exists to prevent.
+	 */
+	sdpAnswer: sipSdpSchema,
+});
+
+export const sipAnswerResponseSchema = z.object({
+	...sipDialogResponseBase,
+	/** When the 2xx went on the socket. Present when `ok`, and the anchor for a post-dial-delay plot. */
+	sentAt: z.iso.datetime().optional(),
+});
+
+export type SipAnswerRequest = z.infer<typeof sipAnswerRequestSchema>;
+export type SipAnswerResponse = z.infer<typeof sipAnswerResponseSchema>;
+
+export const SIP_ANSWER_RPC = defineRpc(
+	RPC_SUBJECTS.sipAnswer,
+	sipAnswerRequestSchema,
+	sipAnswerResponseSchema,
+	// One second, and NOT the 32 s its SIP transaction can take — see the note above. What is inside
+	// the budget is a mailbox hop onto the dialog's goroutine and one socket write.
+	1_000,
+);
+
+/**
+ * `rpc.sip.v1.hangup` — end this leg with this cause.
+ *
+ * **The edge chooses the METHOD, from the dialog state it owns**: a BYE if the dialog is confirmed, a
+ * CANCEL if we are a UAC in an early dialog, a `4xx`/`5xx`/`6xx` final if we are a UAS that has not
+ * answered. The engine says "end this leg with this cause" and nothing more, which is exactly what
+ * `MediaPort.hangup(channelId, cause)` already says and is why no method field appears here — a
+ * caller that could pick the method could pick a wrong one, and the process that knows is the one
+ * holding the CSeq.
+ *
+ * Two RFC 3261 deferrals are the edge's too, and they are why a hangup can succeed without anything
+ * leaving immediately: a BYE MUST NOT go out on a 2xx we sent and that has not been ACKed (§15), and
+ * a CANCEL has nothing to match against before a provisional response arrives (§9.1). Both cases
+ * answer `ok` and send when they may.
+ */
+export const sipHangupRequestSchema = z.object({
+	legId: z.string().min(1).max(128),
+	/**
+	 * The Q.850 cause, which becomes an RFC 3326 `Reason` header on the BYE and, on an unanswered
+	 * UAS leg, chooses the failure status the caller sees.
+	 */
+	cause: hangupCauseCodeSchema.optional(),
+	/** Free text for the log and the `Reason` header's `text=` parameter. Never a branch. */
+	detail: z.string().max(256).optional(),
+});
+
+export const sipHangupResponseSchema = z.object({
+	...sipDialogResponseBase,
+	/**
+	 * What the edge actually sent, or `deferred` when RFC 3261 says it may not send yet.
+	 *
+	 * Reported rather than hidden because "the hangup succeeded and no packet left" is otherwise
+	 * indistinguishable from a bug, and because a `deferred` is the one outcome where a later
+	 * `dialog.terminated` is genuinely still owed.
+	 */
+	method: z.enum(["bye", "cancel", "respond", "deferred", "none"]).optional(),
+});
+
+export type SipHangupRequest = z.infer<typeof sipHangupRequestSchema>;
+export type SipHangupResponse = z.infer<typeof sipHangupResponseSchema>;
+
+export const SIP_HANGUP_RPC = defineRpc(
+	RPC_SUBJECTS.sipHangup,
+	sipHangupRequestSchema,
+	sipHangupResponseSchema,
+	// 500 ms. A state transition and one socket write, like `ring`.
+	500,
+);
+
+/**
+ * `rpc.sip.v1.reinvite` — re-point or re-negotiate a confirmed dialog.
+ *
+ * Declared in full and refused `not_supported` until slice 5, deliberately rather than omitted. Two
+ * things are waiting on it and both are named in the peer designs, so the subject existing is what
+ * lets them be planned against:
+ *
+ * - **Hold.** `CallControl.hold` calls `media.hold(...)`, which on this plane means "re-INVITE the
+ *   far end with `a=sendonly`".
+ * - **`mediad`'s graceful drain.** `plans/mediad-design.md` §10 q12 says the missing piece is the
+ *   MOVE, and that repointing a far end needs an authenticated re-INVITE from the signalling plane,
+ *   "so this cannot be finished inside `mediad` at all". This is that command.
+ *
+ * `sipgo` supplies none of it (§9.2): `DialogServerSession.inviteTx` is the ORIGINAL transaction and
+ * nothing swaps it, there is no offer/answer version tracking, and RFC 3261 §14.2 glare — `491
+ * Request Pending` plus the asymmetric retry interval — is absent entirely. Shipping a re-INVITE
+ * without glare handling would let a hold issued at the same moment the far end holds produce two
+ * dialogs each believing they own an outstanding offer, with the media direction decided by whichever
+ * answer landed last. That is why this refuses rather than half-works.
+ */
+export const sipReinviteRequestSchema = z.object({
+	legId: z.string().min(1).max(128),
+	/** The new offer, written by `mediad`. The edge forwards bytes it does not parse. */
+	sdpOffer: sipSdpSchema,
+	/**
+	 * What the re-INVITE is FOR, so the edge can publish `dialog.held` / `dialog.resumed` rather than
+	 * making the engine infer intent from a body neither process parses.
+	 */
+	intent: z.enum(["hold", "resume", "move", "refresh"]).default("move"),
+});
+
+export const sipReinviteResponseSchema = z.object({
+	...sipDialogResponseBase,
+	/** The far end's answer, when it came back inside the deadline. */
+	sdpAnswer: sipSdpSchema.optional(),
+});
+
+export type SipReinviteRequest = z.infer<typeof sipReinviteRequestSchema>;
+export type SipReinviteResponse = z.infer<typeof sipReinviteResponseSchema>;
+
+export const SIP_REINVITE_RPC = defineRpc(
+	RPC_SUBJECTS.sipReinvite,
+	sipReinviteRequestSchema,
+	sipReinviteResponseSchema,
+	// One second: it replies when the re-INVITE is on the socket, on the same reasoning as `answer`.
+	// The far end's answer is a full transaction away and arrives as an event.
+	1_000,
+);
+
+/**
+ * Where an outbound leg is going.
+ *
+ * ## Why a structured target and not a dial template
+ *
+ * `OriginateRequest.endpoint` is "technology + resource in the media server's vocabulary"
+ * (`PJSIP/1001`), produced by substituting `ENGINE_EXTENSION_DIAL_TEMPLATE` /
+ * `ENGINE_TRUNK_DIAL_TEMPLATE`, where `{trunk}` is the trunk's NAME column. New templates —
+ * `sip:{number}@{trunk}` — were the smaller change and lose on substance: a template hides
+ * everything that makes a trunk dialable. The `trunk` row holds `sipProxy`, `outboundProxy`,
+ * `authUser`, `sipSecretRef`, `transport` and `registerExpiresSeconds`, none of which is expressible
+ * as `{number}` and `{trunk}`, and a template carrying only the NAME would force the edge to
+ * re-resolve a trunk against a database it holds no handle on.
+ *
+ * So `endpoint` stays exactly as it is for the ARI adapter, and this rides alongside it.
+ *
+ * ## Where the AOR lookup happens is itself a decision
+ *
+ * Today `PJSIP/1001` makes Asterisk consult its own registrar. Under `sipd` the lookup moves into the
+ * process that OWNS the location service and already writes it. That deletes a duplicate registrar
+ * rather than adding a hop.
+ *
+ * ## Why a tagged object rather than a discriminated union
+ *
+ * A `z.discriminatedUnion` reads better in TypeScript and does not survive the border: Go has no sum
+ * type, so `packages/events-go` would emit either an `any` or a hand-written unmarshaller, and a
+ * hand-written unmarshaller is exactly the kind of second opinion the codegen exists to prevent. So
+ * the shape is one struct with a `kind` and three optional groups, and the pairing is enforced by
+ * {@link sipDialTargetSchema}'s refinement rather than by the type system — checked identically on
+ * both sides because both sides run the same validation, one against the schema and one against the
+ * generated struct's required-field switch.
+ */
+export const SIP_DIAL_TARGET_KINDS = ["aor", "trunk", "uri"] as const;
+export const sipDialTargetKindSchema = z.enum(SIP_DIAL_TARGET_KINDS);
+export type SipDialTargetKind = (typeof SIP_DIAL_TARGET_KINDS)[number];
+
+export const sipDialTargetSchema = z
+	.object({
+		kind: sipDialTargetKindSchema,
+		/** `kind: "aor"` — `sip:1001@realm`. The edge reads its own `registrations` bucket. */
+		aor: z.string().min(3).max(512).optional(),
+		/** `kind: "trunk"` — the edge reads the trunk directory for proxy, credentials and transport. */
+		trunkId: z.uuid().optional(),
+		/** `kind: "trunk"` — the number to dial over it. */
+		number: dialStringSchema.optional(),
+		/** `kind: "uri"` — a fully-qualified target, e.g. a REFER into another domain. */
+		uri: z.string().min(3).max(1024).optional(),
+	})
+	.superRefine((target, context) => {
+		const required = { aor: ["aor"], trunk: ["trunkId", "number"], uri: ["uri"] }[target.kind];
+		for (const field of required) {
+			if (target[field as "aor" | "trunkId" | "number" | "uri"] === undefined) {
+				context.addIssue({
+					code: "custom",
+					path: [field],
+					message: `is required when kind is "${target.kind}"`,
+				});
+			}
+		}
+	});
+export type SipDialTarget = z.infer<typeof sipDialTargetSchema>;
+
+/**
+ * `rpc.sip.v1.originate` — the engine asking the edge to place a call.
+ *
+ * FLAT and queue-grouped, the one command subject in this family that is: the four above it act on a
+ * dialog that already exists on one process, and this one CREATES the dialog and has no owner to
+ * find. **The reply carries the `instanceId` that took it, and the engine addresses every subsequent
+ * command on that leg at exactly that instance** — the same pattern
+ * `mediaAllocateSessionResponseSchema.instanceId` established for a media session.
+ *
+ * ## It replies when the INVITE is SENT, not when it is answered
+ *
+ * The same split `MediaPort.originate` already has — it returns an `OriginatedChannel`, not an
+ * answered call. The `2xx` arrives later as `sip.evt.v1.…dialog.answered`, and a `18x` as
+ * `dialog.progressed`.
+ *
+ * ## The edge holds no codec knowledge in EITHER direction
+ *
+ * {@link sdpOffer} is written by `rpc.media.v1.create-offer`, because a B-leg has no offer — we are
+ * the one calling. `mediad` offers exactly what `mediad` can serve, and a callee that answers with
+ * something else is refused at `accept-answer`. `sipd` forwards an offer it did not write, exactly as
+ * inbound it forwards one it does not parse. `trunk.codecPrefs` is therefore ADVISORY until the rung
+ * that can serve it: a trunk configured for Opus gets a G.711 offer and the ROW is wrong rather than
+ * the call.
+ *
+ * ## Forking stays in the engine
+ *
+ * The edge does not implement SIP forking and will not. The engine already forks, and forks better:
+ * `dialSimultaneous` mints one channel id per attempt, installs a watcher on each BEFORE any
+ * originate is issued, settles on the first answer and gives the loser `LOSE_RACE` — with a
+ * `ChannelAggregate` and therefore a CDR row per attempt. An edge that forked would have to reproduce
+ * the race, the per-attempt accounting and the confirmation flow in a process that has no CDR and no
+ * plan. It grows multiple CONTACTS per AOR and reports them; the engine originates one dialog each.
+ */
+export const sipOriginateRequestSchema = z.object({
+	/**
+	 * The leg id, minted by the ENGINE — the mirror of the inbound direction, where the edge mints it.
+	 * Either way one string names the leg, the dialog and the media session.
+	 */
+	legId: z.string().min(1).max(128),
+	orgId: z.uuid(),
+	callId: z.string().min(1).max(128),
+	target: sipDialTargetSchema,
+	/** What to present. Advisory in the same sense `originateRequestSchema.callerIdNumber` is. */
+	callerIdNumber: dialStringSchema.optional(),
+	callerIdName: z.string().max(128).optional(),
+	/** The offer `mediad` wrote for this leg. See the codec note above. */
+	sdpOffer: sipSdpSchema,
+	/**
+	 * How long to leave the INVITE outstanding before CANCELling it.
+	 *
+	 * Bounded rather than open, for the reason `originateRequestSchema.ringTimeoutSeconds` gives: an
+	 * originate that rings forever is a dialog and an RTP port pair held by nobody.
+	 */
+	ringTimeoutMs: z.int().min(1_000).max(600_000).optional(),
+	/**
+	 * Extra headers to put on the INVITE — `X-` headers a tenant's carrier expects, and the call id
+	 * correlation the support desk asks for.
+	 *
+	 * Deliberately not a free-for-all: the edge refuses any name that would let a caller forge a
+	 * routing or authentication header, because a contract that let the engine write `From` would
+	 * make the edge's own authorisation decorative.
+	 */
+	headers: z.record(z.string().max(64), z.string().max(512)).optional(),
+});
+
+export const sipOriginateResponseSchema = z.object({
+	...sipDialogResponseBase,
+	/** The URI the INVITE actually went to, after the AOR or trunk lookup. Diagnostics. */
+	requestUri: z.string().max(1024).optional(),
+	/** The dialog's `Call-ID`, so a capture can be lined up before any event has been published. */
+	sipCallId: z.string().max(256).optional(),
+});
+
+export type SipOriginateRequest = z.infer<typeof sipOriginateRequestSchema>;
+export type SipOriginateResponse = z.infer<typeof sipOriginateResponseSchema>;
+
+export const SIP_ORIGINATE_RPC = defineRpc(
+	RPC_SUBJECTS.sipOriginate,
+	sipOriginateRequestSchema,
+	sipOriginateResponseSchema,
+	// One second: a registration lookup or a trunk directory read, then one INVITE on a socket. It
+	// replies when the INVITE has been SENT, so the far end's ringing is not inside this budget.
+	1_000,
+);
+
+// ---------------------------------------------------------------------------------------------
 // rpc.media.v1.* — engine → mediad, the media plane's command surface
 // ---------------------------------------------------------------------------------------------
 
@@ -734,27 +1760,69 @@ export const MEDIA_ALLOCATE_SESSION_RPC = defineRpc(
 );
 
 /**
- * `rpc.media.v1.bridge-sessions` — start relaying RTP between two allocated sessions.
+ * `rpc.media.v1.bridge-sessions` — put two or more allocated sessions in one conversation.
  *
- * Exactly two, and the schema says so. Two-party audio is a RELAY: each session forwards its
- * payload to the other, no decode, no mix, no jitter buffer. N-way is mixing, which needs all three
- * of those, and is rung 6 of `plans/mediad-design.md` §2 — a three-element array here would be a
- * contract promising something the media plane cannot do.
+ * ## Two is a relay, three is a room, and the caller does not have to know which
+ *
+ * This schema said `.length(2)` for four rungs, and the JSDoc above it promised that the limit
+ * would lift when rung 6 arrived: "N-way is mixing, which needs a decode, a jitter buffer and a
+ * mix-minus per participant, and a three-element array here would be a contract promising something
+ * the media plane cannot do." Rung 6 arrived — `apps/mediad/internal/rtp/conference.go` is the
+ * mixer, and `tap-session` has been converting two-party bridges into rooms since it landed — so
+ * the promise is kept here rather than by growing a second subject.
+ *
+ * Which mechanism serves a request is the responder's business and deliberately not the caller's:
+ * two sessions become a RELAY (each forwards its payload to the other; no decode, no buffer, no
+ * added delay) and three or more become a ROOM (a jitter buffer, a decode and a mix-minus per
+ * member). An engine asking for a conference bridge writes the same command it writes for a
+ * two-party call, and the sixty milliseconds of playout delay a mix costs are a property of the
+ * arrangement rather than of the request.
+ *
+ * ## Why the ceiling is eight rather than unbounded
+ *
+ * The mixer sums every member's decoded audio once per member per frame, fifty times a second, so
+ * the cost is quadratic in the room and the number where that stops being free is a capacity
+ * decision one process gets to make. Eight is where this platform's mixer is measured, it is above
+ * every room a small business actually holds, and — the reason it is a SCHEMA bound and not a
+ * runtime one — a caller that asks for nine gets a validation error naming the field instead of a
+ * refusal three hops later with half a room already mixing.
+ *
+ * A larger room is a real feature and it is not this: it needs a mixer that maintains one sum and
+ * subtracts each member from it, which is a different algorithm rather than a bigger constant.
+ * Raising this number without writing that is how a conference of thirty makes every other call on
+ * the instance stutter.
  *
  * `bridgeId` is caller-assigned for the same reason `sessionId` is, and because the engine's
- * `MediaPort` already mints one in `createBridge` before any leg joins.
+ * `MediaPort` already mints one in `createBridge` before any leg joins. A room keeps the BRIDGE's
+ * id — the engine tears down what it created, under the name it created it with.
  */
+export const MEDIA_BRIDGE_MAX_SESSIONS = 8;
+
 export const mediaBridgeSessionsRequestSchema = z.object({
 	bridgeId: z.string().min(1).max(128),
-	/** The two sessions to relay between. Order is not significant; the relay is bidirectional. */
-	sessionIds: z.array(z.string().min(1).max(128)).length(2),
+	/**
+	 * The sessions to put in one conversation. Order is not significant — a relay is bidirectional
+	 * and a mix is symmetric — with one exception the caller should know about: on a request that
+	 * CONVERTS an existing two-party call into a room, the media plane resolves the `a`/`b` letters
+	 * of {@link mediaTapSessionRequestSchema} from join order unless a `targetSide` says otherwise.
+	 */
+	sessionIds: z.array(z.string().min(1).max(128)).min(2).max(MEDIA_BRIDGE_MAX_SESSIONS),
 });
 
 export const mediaBridgeSessionsResponseSchema = z.object({
 	ok: z.boolean(),
 	bridgeId: z.string().min(1).max(128),
-	/** The sessions actually relaying. Empty on a refusal. */
-	sessionIds: z.array(z.string().max(128)).max(2).default([]),
+	/** The sessions actually in the conversation. Empty on a refusal. */
+	sessionIds: z.array(z.string().max(128)).max(MEDIA_BRIDGE_MAX_SESSIONS).default([]),
+	/**
+	 * Whether this arrangement is a MIX rather than a relay — three or more members, or two that
+	 * were already in a room.
+	 *
+	 * On the reply because it is the one fact an operator needs to explain "the call developed
+	 * sixty milliseconds of delay the moment the third person joined", and because it is not
+	 * derivable from `sessionIds.length` alone: a two-party call that a tap converted stays mixed.
+	 */
+	mixed: z.boolean().default(false),
 	instanceId: z.string().min(1).max(128).optional(),
 	reason: mediaRefusalReasonSchema.optional(),
 	error: z.string().max(512).optional(),
@@ -789,7 +1857,13 @@ export const mediaUnbridgeSessionsResponseSchema = z.object({
 	bridgeId: z.string().min(1).max(128),
 	/** False when there was no such relay. A SUCCESS, not a failure — see the note above. */
 	unbridged: z.boolean().default(false),
-	sessionIds: z.array(z.string().max(128)).max(2).default([]),
+	/**
+	 * Everybody who was in the conversation. Bounded by
+	 * {@link MEDIA_BRIDGE_MAX_SESSIONS} rather than by two, because since rung 6 a `bridgeId` may
+	 * name a ROOM: tearing one down returns every member, and a cap of two would have truncated the
+	 * list of legs the engine still has to account for.
+	 */
+	sessionIds: z.array(z.string().max(128)).max(MEDIA_BRIDGE_MAX_SESSIONS).default([]),
 	instanceId: z.string().min(1).max(128).optional(),
 	reason: mediaRefusalReasonSchema.optional(),
 	error: z.string().max(512).optional(),
@@ -1236,6 +2310,337 @@ export const MEDIA_STOP_RECORDING_RPC = defineRpc(
 );
 
 // ---------------------------------------------------------------------------------------------
+// rpc.media.v1.tap-session — engine → mediad, supervision (eavesdrop / whisper / barge)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Which side of a two-party call a tap is talking about.
+ *
+ * `a` and `b` are the same leg roles `packages/telephony`'s `LEG_ROLES` names — the originating
+ * side and the side originated for it — so a supervisor coaching "the agent" says `speakTo: "b"`
+ * on an inbound customer call and the media plane needs no idea what an agent is. `both` and
+ * `none` complete the lattice, and `none` is only ever meaningful on `speakTo`: a tap that heard
+ * nothing would be a session allocated for no reason.
+ */
+export const MEDIA_TAP_SIDES = ["a", "b", "both", "none"] as const;
+export const mediaTapSideSchema = z.enum(MEDIA_TAP_SIDES);
+export type MediaTapSide = (typeof MEDIA_TAP_SIDES)[number];
+
+/**
+ * `rpc.media.v1.tap-session` — join a session's conversation on ASYMMETRIC terms.
+ *
+ * ## This is deliberately not a snoop, and the difference is the whole contract
+ *
+ * `plans/mediad-design.md` §10 question 4 settles it: `MediaPort.snoop` is refused by this media
+ * plane permanently, because a snoop channel exists only to give ARI something to address — a tap
+ * has to BE a channel there, so it is one. Reproducing that here would mean a session with no port
+ * publishing a `leg-arrived` for a leg that does not exist, which is precisely the "emit synthetic
+ * ARI events forever" outcome §3.2 exists to prevent.
+ *
+ * So supervision is specified as what it actually is: a THIRD PARTICIPANT in a bridge whose
+ * contribution is routed differently per peer. `hear` says which peers' audio reaches the
+ * supervisor; `speakTo` says which peers the supervisor's audio reaches. The three industry
+ * features fall out as three points, and there is no branch anywhere for which one it is:
+ *
+ * ```text
+ * eavesdrop   hear: "both"   speakTo: "none"
+ * whisper     hear: "both"   speakTo: "b"      (or "a" — whichever leg is the coached one)
+ * barge       hear: "both"   speakTo: "both"
+ * ```
+ *
+ * ## Why the full shape ships before the implementation does
+ *
+ * `mediad` refuses this today: v1 relays RTP without decoding it, and routing one participant's
+ * audio to one peer and not the other is a MIX, which is rung 6. Declaring the whole shape now is
+ * the point rather than an oversight — a tap IS a mix-minus participant (`speakTo: "none"` is a
+ * participant subtracted from everybody's mix; `speakTo: "a"` is one that appears in exactly one
+ * peer's), so the rung-6 mixer serves this contract by ARRIVING. Had `*0` been built against
+ * `snoop` instead, the cutover would have had to either invent a channel concept this plane does
+ * not have or break a shipped feature's wire format.
+ *
+ * ## Ids and lifecycle
+ *
+ * `tapSessionId` is the supervisor's OWN allocated session — the tap is a participant, so it has a
+ * port and an SDP like any other leg, and it was allocated by `allocate-session` before this call.
+ * `targetSessionId` is any session in the conversation being joined; the media plane resolves the
+ * bridge from it, which is why the caller does not have to know a bridge id it may never have seen
+ * (on this driver a bridge only exists once two members are in it).
+ *
+ * `tapId` is caller-assigned for the same reason `bridgeId` and `sessionId` are: the engine must be
+ * able to untap something whose reply it never received.
+ */
+export const mediaTapSessionRequestSchema = z.object({
+	/** Caller-assigned handle for the tap itself. See above. */
+	tapId: z.string().min(1).max(128),
+	/** The supervisor's own allocated session — a real participant with a real port. */
+	tapSessionId: z.string().min(1).max(128),
+	/** Any session in the conversation being joined; the bridge is resolved from it. */
+	targetSessionId: z.string().min(1).max(128),
+	/**
+	 * Which side of the conversation {@link targetSessionId} IS — `a` or `b`.
+	 *
+	 * ## The convention this replaces, and why it needed replacing
+	 *
+	 * `hear` and `speakTo` name a SIDE of a two-party call, so serving them requires knowing which
+	 * side each session is on. Until this field existed the media plane fixed the only convention it
+	 * could defend from the ids in the request — **`a` is the target session and `b` is the other
+	 * party** — and enforced it by joining the two legs to the room in TARGET-FIRST order when it
+	 * converted a relay into a mix. That works, and it puts the obligation in the wrong place: the
+	 * engine has to pass, as `targetSessionId`, the leg it would have called side `a`, which is a
+	 * rule living in prose on both sides of a language border.
+	 *
+	 * `MediaPort.TapRequest` has carried `targetSide` since supervision was specified, because on
+	 * ARI a tap is a direction on one channel and "speak to the agent" is only implementable once
+	 * you know whether this channel is the agent. This is that field reaching the wire, so the
+	 * engine states the fact it already holds instead of encoding it in an argument's position.
+	 *
+	 * ## Absent keeps the old convention, on purpose
+	 *
+	 * Optional rather than required, and absent means exactly what it meant before: the target is
+	 * side `a` and the other party is side `b`. An engine that has not been taught to send it
+	 * behaves as it always did, which is what lets the two ends roll independently — the rule this
+	 * package's README states for every additive change.
+	 *
+	 * Meaningless in a room of more than two, where `a`/`b` are refused by name rather than
+	 * resolved to whoever happens to be second in the join order.
+	 */
+	targetSide: z.enum(["a", "b"]).optional(),
+	/**
+	 * Which peers the supervisor hears. `none` is accepted by the enum and refused by the
+	 * responder: a participant that hears nothing and (for an eavesdrop) says nothing is a port
+	 * pair burning for no reason, and answering `ok` to it would hide a caller's bug.
+	 */
+	hear: mediaTapSideSchema.default("both"),
+	/** Which peers hear the supervisor. `none` is the silent case and is the common one. */
+	speakTo: mediaTapSideSchema.default("none"),
+	/**
+	 * The feature's own name for this combination, carried for the media plane's LOG only.
+	 *
+	 * Not authoritative: `hear`/`speakTo` are the contract, and a responder that branched on this
+	 * instead would be able to disagree with them. It is here because "mediad opened a barge on
+	 * session X" is a line an operator can read and `hear=both speakTo=both` is one they have to
+	 * decode at three in the morning.
+	 */
+	mode: tapModeSchema.optional(),
+});
+
+export const mediaTapSessionResponseSchema = z.object({
+	ok: z.boolean(),
+	tapId: z.string().min(1).max(128),
+	/** The bridge the tap joined, when it joined one. Empty on a refusal. */
+	bridgeId: z.string().max(128).optional(),
+	/** The sessions the tap is party to. Empty on a refusal. */
+	sessionIds: z.array(z.string().max(128)).max(8).default([]),
+	instanceId: z.string().min(1).max(128).optional(),
+	reason: mediaRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type MediaTapSessionRequest = z.infer<typeof mediaTapSessionRequestSchema>;
+export type MediaTapSessionResponse = z.infer<typeof mediaTapSessionResponseSchema>;
+
+export const MEDIA_TAP_SESSION_RPC = defineRpc(
+	RPC_SUBJECTS.mediaTapSession,
+	mediaTapSessionRequestSchema,
+	mediaTapSessionResponseSchema,
+	// The same 500 ms every other media command carries, and for the same reason: a supervisor
+	// pressing `*0` is listening to silence until this returns.
+	500,
+);
+
+/**
+ * `rpc.media.v1.untap-session` — remove the tap, leave the conversation running.
+ *
+ * Keyed by `tapId` alone, exactly as `stop-playback` and `stop-recording` are keyed by their own
+ * references: the engine's `MediaPort.stopTap(tapId)` carries nothing else, and a lookup by
+ * reference is one the media plane can do without a scan.
+ *
+ * Idempotent. Untapping something already gone answers `ok: true, untapped: false` — the engine
+ * retries an untap when a reply is lost, and a monitored conversation that survived the retry is
+ * not a failure. It also NEVER ends the monitored call: a supervisor hanging up must leave the
+ * customer talking to the agent, which is the one behaviour a mistake here would get wrong in the
+ * most visible possible way.
+ */
+export const mediaUntapSessionRequestSchema = z.object({
+	tapId: z.string().min(1).max(128),
+});
+
+export const mediaUntapSessionResponseSchema = z.object({
+	ok: z.boolean(),
+	tapId: z.string().min(1).max(128),
+	/** False when there was no such tap. A SUCCESS, not a failure — see the note above. */
+	untapped: z.boolean().default(false),
+	instanceId: z.string().min(1).max(128).optional(),
+	reason: mediaRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type MediaUntapSessionRequest = z.infer<typeof mediaUntapSessionRequestSchema>;
+export type MediaUntapSessionResponse = z.infer<typeof mediaUntapSessionResponseSchema>;
+
+export const MEDIA_UNTAP_SESSION_RPC = defineRpc(
+	RPC_SUBJECTS.mediaUntapSession,
+	mediaUntapSessionRequestSchema,
+	mediaUntapSessionResponseSchema,
+	500,
+);
+
+// ---------------------------------------------------------------------------------------------
+// rpc.media.v1.mute-session / hold-session — engine → mediad, rung 5's two state commands
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Which half of a leg's audio path a mute applies to.
+ *
+ * The same three values `MediaPort.mute(channelId, direction)` uses and the same meanings ARI gives
+ * them, so the two drivers cannot disagree about what a mute did. `in` is audio arriving FROM the
+ * leg — the party cannot be heard; `out` is audio sent TO it — the party cannot hear.
+ *
+ * The default is `both`, which is ARI's own default for a mute with no direction. Matching it
+ * matters more than picking the direction this platform would have chosen on its own.
+ */
+export const MEDIA_DIRECTIONS = ["in", "out", "both"] as const;
+export const mediaDirectionSchema = z.enum(MEDIA_DIRECTIONS);
+export type MediaDirection = (typeof MEDIA_DIRECTIONS)[number];
+
+/**
+ * `rpc.media.v1.mute-session` — stop audio flowing in one or both directions of one leg.
+ *
+ * ## Additive, and that is the contract rather than an implementation detail
+ *
+ * Muting `in` on a leg already muted `out` leaves BOTH muted. The alternative — a direction field
+ * that replaces whatever was there — would make `mute(in)` on a leg that already could not hear
+ * into an unmute of the direction nobody mentioned, which is how a conference participant gets
+ * their audio back because somebody muted their microphone.
+ *
+ * `unmute: true` is what lifts one. One subject rather than a `mute-session`/`unmute-session` pair
+ * because the two carry identical fields and differ in one bit — the same reasoning
+ * {@link mediaHoldSessionRequestSchema} follows, and the opposite of the playback and recording
+ * pairs, whose stop halves carry a reference and no other field at all.
+ *
+ * ## What it deliberately does NOT do
+ *
+ * It is not visible in SIP. A muted leg's far end is told nothing, its hold key does not light, and
+ * it keeps sending. That is the whole difference from `hold-session` below, and it is why a
+ * conference `*6` is this subject and an agent pressing hold is that one.
+ *
+ * It also does not gate DTMF DETECTION. A muted participant pressing `*6` to unmute themselves is
+ * the single most common thing a muted participant does, and a media plane that suppressed the
+ * keypress with the audio would make the unmute unreachable by exactly the people who need it.
+ */
+export const mediaMuteSessionRequestSchema = z.object({
+	...mediaCommandShape,
+	/** Which half of the path. `both` when omitted, which is ARI's default. */
+	direction: mediaDirectionSchema.default("both"),
+	/** `true` lifts the mute on {@link direction} instead of applying it. */
+	unmute: z.boolean().default(false),
+});
+
+export const mediaMuteSessionResponseSchema = z.object({
+	ok: z.boolean(),
+	sessionId: z.string().min(1).max(128),
+	/** The state AFTER the command: whether audio from the leg is suppressed. */
+	mutedIn: z.boolean().default(false),
+	/** The state AFTER the command: whether audio to the leg is suppressed. */
+	mutedOut: z.boolean().default(false),
+	instanceId: z.string().min(1).max(128).optional(),
+	reason: mediaRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type MediaMuteSessionRequest = z.infer<typeof mediaMuteSessionRequestSchema>;
+export type MediaMuteSessionResponse = z.infer<typeof mediaMuteSessionResponseSchema>;
+
+export const MEDIA_MUTE_SESSION_RPC = defineRpc(
+	RPC_SUBJECTS.mediaMuteSession,
+	mediaMuteSessionRequestSchema,
+	mediaMuteSessionResponseSchema,
+	// The family's 500 ms. Two atomic flags and a log line — there is no I/O on this path at all,
+	// which is exactly what separates it from `hold-session` below.
+	500,
+);
+
+/**
+ * `rpc.media.v1.hold-session` — take a leg out of the conversation, optionally with music.
+ *
+ * ## Hold is a statement about the CONVERSATION, and mute is one about a direction
+ *
+ * `MediaPort` keeps them apart deliberately (`hold` is "SIGNALLING only, and deliberately separate
+ * from startMusicOnHold") and so does this pair of subjects. A held party does not hear the other
+ * side and the other side does not hear them; a muted party is one direction of one leg. A leg that
+ * was muted before it was held stays muted when it is unheld, which is only expressible because
+ * these are two commands over two pieces of state.
+ *
+ * The SIGNALLING half — the re-INVITE that lights the far end's hold key — is `apps/sipd`'s and
+ * reaches the media plane as a repeat `allocate-session` carrying the new `direction`. This subject
+ * is the media plane's own half, and an engine uses both, together or separately: a call held
+ * mid-attended-transfer wants the music without the re-INVITE, because renegotiating twice in three
+ * seconds is how phones drop audio.
+ *
+ * ## `music` is a media reference and the responder resolves it
+ *
+ * `moh:<class>` for a hold-music class, `sound:<name>` for a specific clip, `tone:silence` for a
+ * deliberately silent hold — the same vocabulary `start-playback` takes, resolved through the same
+ * library. Absent is a legal hold with NO music, which is what an instance with no music mounted
+ * does: the caller hears silence, the conversation is still suppressed, and nothing pretends a file
+ * existed.
+ *
+ * The hold STANDS even when the music cannot start. Failing a hold over its soundtrack would be
+ * putting music ahead of privacy, and the party who pressed hold still expects the other side to
+ * stop hearing them.
+ *
+ * ## Idempotent, in the shape every stop on this family uses
+ *
+ * `unhold: true` on a leg that was not held answers `ok: true, held: false` — a SUCCESS. The engine
+ * retries an unhold after a lost reply, and a retry that answered "failed" would make a working
+ * recovery look like a broken one. Holding a held leg re-points its music and answers `ok`.
+ */
+export const mediaHoldSessionRequestSchema = z.object({
+	...mediaCommandShape,
+	/** `true` returns the leg to the conversation and stops the music this hold started. */
+	unhold: z.boolean().default(false),
+	/**
+	 * What the held party hears. `moh:<class>`, `sound:<name>`, `tone:silence`, or absent for a
+	 * silent hold. Ignored when {@link unhold} is set.
+	 */
+	music: z.string().min(1).max(512).optional(),
+	/**
+	 * Caller-assigned reference for the music loop, so a `stop-playback` can name it.
+	 *
+	 * Optional because a hold with no music has no loop to name, and the responder mints one from
+	 * the session id when music was asked for without a reference — an engine that only wants the
+	 * suppression should not have to invent an id for a playback it will never stop by hand.
+	 */
+	musicRef: z.string().min(1).max(128).optional(),
+});
+
+export const mediaHoldSessionResponseSchema = z.object({
+	ok: z.boolean(),
+	sessionId: z.string().min(1).max(128),
+	/** The state AFTER the command. `false` on an unhold of a leg that was not held — see above. */
+	held: z.boolean().default(false),
+	/** The reference the music loop is playing under, when there is one. */
+	musicRef: z.string().max(128).optional(),
+	instanceId: z.string().min(1).max(128).optional(),
+	reason: mediaRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type MediaHoldSessionRequest = z.infer<typeof mediaHoldSessionRequestSchema>;
+export type MediaHoldSessionResponse = z.infer<typeof mediaHoldSessionResponseSchema>;
+
+export const MEDIA_HOLD_SESSION_RPC = defineRpc(
+	RPC_SUBJECTS.mediaHoldSession,
+	mediaHoldSessionRequestSchema,
+	mediaHoldSessionResponseSchema,
+	// One second, not the family's 500 ms, and `start-playback` is the precedent: a hold that names
+	// music READS AND DECODES A FILE before it answers, so the reply means the loop is in memory
+	// rather than that the request was accepted for consideration. That disk read is the whole
+	// difference, and it is why `mute-session` above keeps the shorter budget.
+	1_000,
+);
+
+// ---------------------------------------------------------------------------------------------
 // rpc.engine.v1.originate — api → engine, click-to-call
 // ---------------------------------------------------------------------------------------------
 
@@ -1567,13 +2972,525 @@ export const PARK_HANDOFF_RPC = defineRpc(
 	3_000,
 );
 
+// ---------------------------------------------------------------------------------------------
+// rpc.session.v1.announce.<orgId>.<application> — engine → api, when a call reaches an application
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The session protocol's front door: a call has walked into an `application` destination and the
+ * engine is offering it to whoever holds that application's socket.
+ *
+ * ## Why an offer and not a notification
+ *
+ * A caller is on the line while this is outstanding. The engine has to know, before it does
+ * anything else, whether an application is going to take control of the leg or whether it must run
+ * the destination's failure path — which is an announcement, because the alternative is dead air on
+ * a call somebody's dial plan deliberately routed here. A published event cannot answer that; a
+ * request can, and `no responders available` answers it INSTANTLY when nobody has claimed the
+ * application (see {@link RPC_SUBJECTS.sessionAnnounce} for why the subject carries the name).
+ *
+ * ## What the answer contains, and what it does not
+ *
+ * `sessionId` and nothing else. The control plane does not get to rewrite the call: it cannot
+ * change the caller id, cannot choose a different application and cannot pre-answer. Everything it
+ * wants to do to the leg it does afterwards, one verb at a time, over
+ * {@link RPC_SUBJECTS.engineSessionVerb} — where each command is authorised, guarded and logged on
+ * its own. An accept that could also carry instructions would be a second, unaudited verb channel.
+ */
+export const SESSION_ANNOUNCE_REFUSAL_REASONS = [
+	/** Nothing is registered for this application, or the socket went away mid-announce. */
+	"no-application",
+	/** The socket is registered but already holds as many sessions as it declared it can. */
+	"at-capacity",
+	/** The control plane is draining. */
+	"shutting-down",
+	"bad_request",
+	"internal",
+] as const;
+
+export const sessionAnnounceRefusalReasonSchema = z.enum(SESSION_ANNOUNCE_REFUSAL_REASONS);
+export type SessionAnnounceRefusalReason = (typeof SESSION_ANNOUNCE_REFUSAL_REASONS)[number];
+
+export const sessionAnnounceRequestSchema = z.object({
+	orgId: z.uuid(),
+	/** The application name as the dial plan spelled it. Also a token of the subject. */
+	application: z.string().min(1).max(128),
+	callId: z.string().min(1).max(128),
+	legId: z.string().min(1).max(128),
+	/**
+	 * The engine instance that owns the leg — the ADDRESS every later verb is sent to.
+	 *
+	 * Payload here, unlike the park handoff's `instanceId`, and the asymmetry is the point: a park
+	 * handoff is addressed AT an instance the requester already knows, so carrying it in the body
+	 * would be two places that could disagree. This one travels the other way — the responder learns
+	 * it here and can learn it nowhere else, because a control plane holds no channel registry.
+	 */
+	instanceId: z.string().min(1).max(128),
+	direction: callDirectionSchema,
+	/** Whether the leg has already answered. An application must not assume it has. */
+	answered: z.boolean(),
+	callerIdNumber: dialStringSchema.optional(),
+	callerIdName: z.string().max(128).optional(),
+	/** What the caller dialled to get here, after the plan's normalisation. */
+	dialedNumber: dialStringSchema.optional(),
+	/**
+	 * The destination's `args`, flattened to strings.
+	 *
+	 * The plan node models these as `string | number | boolean` and they arrive here as text,
+	 * because the only consumer is an application that typed them into a form. Preserving the three
+	 * JSON types across a wire, a Go struct and a browser would buy an integration nothing and would
+	 * cost the Go emitter a union it cannot express.
+	 */
+	arguments: z.record(z.string().min(1).max(64), z.string().max(512)).optional(),
+	at: z.iso.datetime(),
+});
+
+export const sessionAnnounceResponseSchema = z.object({
+	accepted: z.boolean(),
+	/** The control plane's handle for this session. Present exactly when `accepted`. */
+	sessionId: z.string().min(1).max(128).optional(),
+	reason: sessionAnnounceRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type SessionAnnounceRequest = z.infer<typeof sessionAnnounceRequestSchema>;
+export type SessionAnnounceResponse = z.infer<typeof sessionAnnounceResponseSchema>;
+
+export const SESSION_ANNOUNCE_RPC = defineRpc(
+	RPC_SUBJECTS.sessionAnnounce,
+	sessionAnnounceRequestSchema,
+	sessionAnnounceResponseSchema,
+	// Two seconds, and the shortest budget of any subject on a call path here. Everything this
+	// asks for is in memory on the far side — is a socket registered, and does it have room — so a
+	// reply that takes longer than this is a control plane in trouble, and the honest thing to do
+	// with a caller listening to silence is to stop waiting and announce.
+	2_000,
+);
+
+// ---------------------------------------------------------------------------------------------
+// rpc.engine.v1.session-verb.<instanceToken> — api → engine, one command on one leg
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The verbs the session protocol will carry.
+ *
+ * A CLOSED list, and deliberately shorter than `packages/telephony`'s 28-member `Verb` union: it is
+ * exactly what `apps/engine`'s verb executor implements. The eight it omits — `earlyMedia`, `say`,
+ * `stopSay`, `playbackControl`, `stream`, `stopStream`, `streamGather`, `stopStreamGather` — are
+ * refused by the executor for stated reasons, and refusing them HERE, at the wire, is a better
+ * answer than accepting a command and failing it one hop later: an application gets the refusal
+ * from its own schema validation instead of from a call that is already in progress.
+ *
+ * When one of them lands, it is added here and to the executor in the same change. That coupling is
+ * the feature.
+ */
+export const SESSION_VERBS = [
+	"answer",
+	"ringing",
+	"play",
+	"stopPlay",
+	"gather",
+	"record",
+	"dial",
+	"bridge",
+	"unbridge",
+	"transfer",
+	"hold",
+	"unhold",
+	"park",
+	"unpark",
+	"playDtmf",
+	"mute",
+	"unmute",
+	"setVariable",
+	"sleep",
+	"hangup",
+] as const;
+
+export const sessionVerbNameSchema = z.enum(SESSION_VERBS);
+export type SessionVerbName = (typeof SESSION_VERBS)[number];
+
+/** One leg a session's `dial` may originate, in the order the engine will try them. */
+export const sessionDialTargetSchema = z.object({
+	destination: dialStringSchema,
+	/**
+	 * The routing namespace to resolve the destination in.
+	 *
+	 * `internal` then `outbound` when omitted, which is exactly what `*69` does — and the reason
+	 * this field exists rather than the engine always guessing: an application that means "ring
+	 * extension 1001" and an application that means "dial the PSTN number 1001" are asking for
+	 * different things, and only one of them may pass the toll gate.
+	 */
+	context: z.enum(["internal", "outbound"]).optional(),
+});
+
+/**
+ * Every argument any verb in {@link SESSION_VERBS} takes, as one flat object.
+ *
+ * ## Why flat, and not a discriminated union
+ *
+ * Because this contract crosses a language border. `packages/events-go`'s emitter turns each schema
+ * here into a Go struct, and it has no representation for a tagged union — a `z.discriminatedUnion`
+ * emits `anyOf`, which the emitter refuses rather than guesses at. The alternatives were to keep the
+ * verb payload out of the contract entirely (an opaque blob, so neither end could validate it) or to
+ * emit twenty request schemas for one subject. A flat argument record with a `verb` discriminant
+ * beside it is the same shape ESL's `execute <app> <args>` and ARI's operation bodies have, for the
+ * same reason, and it keeps ONE schema per subject.
+ *
+ * The cost is real and worth naming: a `play` carrying `maxDigits` validates here and is ignored by
+ * the engine. What is NOT lost is the important half — the engine narrows on `verb` and reads only
+ * the fields that verb has, so a missing REQUIRED argument is still a typed refusal rather than an
+ * `undefined` reaching the media server.
+ */
+export const sessionVerbArgumentsSchema = z.object({
+	// play / gather / stopPlay
+	/** `sound:`/`object://` media reference for `play`, or a `gather` prompt. */
+	media: z.string().max(512).optional(),
+	playbackRef: z.string().max(128).optional(),
+	loop: z.int().min(0).max(1_000).optional(),
+	terminators: z.array(dtmfDigitSchema).max(16).optional(),
+	// gather
+	maxDigits: z.int().min(1).max(64).optional(),
+	timeoutMs: z.int().min(0).max(600_000).optional(),
+	interDigitTimeoutMs: z.int().min(0).max(600_000).optional(),
+	regex: z.string().max(256).optional(),
+	// record
+	maxDurationMs: z
+		.int()
+		.min(0)
+		.max(24 * 60 * 60 * 1_000)
+		.optional(),
+	silenceStopMs: z.int().min(0).max(600_000).optional(),
+	beep: z.boolean().optional(),
+	format: z.enum(["wav", "mp3", "ogg"]).optional(),
+	// dial
+	targets: z.array(sessionDialTargetSchema).min(1).max(16).optional(),
+	/**
+	 * `sequential` only, today.
+	 *
+	 * `simultaneous` is accepted by the schema and REFUSED by the engine, which is the honest split:
+	 * ring-all with lose-race semantics and CDR-correct losers is the plan walker's, and a second
+	 * originator in the verb executor would be a second, subtly different one. Declaring the value
+	 * means an application that wants it gets a refusal naming it, rather than a validation error
+	 * that reads like the field does not exist.
+	 */
+	strategy: z.enum(["sequential", "simultaneous"]).optional(),
+	continueOnCauses: z.array(hangupCauseSchema).max(32).optional(),
+	// bridge
+	/** The DOMAIN leg id to join to — never a media-server channel id. */
+	peerLegId: z.string().max(128).optional(),
+	// transfer
+	transferKind: transferKindSchema.optional(),
+	destination: dialStringSchema.optional(),
+	destinationContext: z.string().max(64).optional(),
+	fallbackDestination: dialStringSchema.optional(),
+	cancelKey: dtmfDigitSchema.optional(),
+	// hold / park / unpark
+	musicOnHold: z.string().max(128).optional(),
+	soft: z.boolean().optional(),
+	lot: z.string().max(128).optional(),
+	orbit: z.string().max(32).optional(),
+	// playDtmf
+	digits: z.array(dtmfDigitSchema).min(1).max(64).optional(),
+	toneDurationMs: z.int().min(0).max(10_000).optional(),
+	// mute / unmute
+	direction: z.enum(["in", "out", "both"]).optional(),
+	// sleep
+	durationMs: z.int().min(0).max(600_000).optional(),
+	// setVariable
+	name: z.string().max(128).optional(),
+	value: z.string().max(1_024).optional(),
+	scope: z.enum(["channel", "export", "global"]).optional(),
+	// hangup
+	cause: hangupCauseSchema.optional(),
+});
+
+export const sessionVerbRequestSchema = z.object({
+	orgId: z.uuid(),
+	/** The session the announcement opened. Checked against the leg — see the response's refusals. */
+	sessionId: z.string().min(1).max(128),
+	callId: z.string().min(1).max(128),
+	legId: z.string().min(1).max(128),
+	verb: sessionVerbNameSchema,
+	arguments: sessionVerbArgumentsSchema.optional(),
+});
+
+/**
+ * Why a verb did not run. Distinct from a verb that ran and ended badly, which is `ok` with an
+ * `endReason` — a `gather` that timed out did exactly what it was asked to.
+ */
+export const SESSION_VERB_REFUSAL_REASONS = [
+	"bad_request",
+	/** No leg with that id on this instance: it ended, or the session named someone else's call. */
+	"unknown-leg",
+	/** The session id does not match the one this leg was announced under. */
+	"session-mismatch",
+	/** The executor refused it — tearing down, no media path, or a scope it does not implement. */
+	"not-permitted",
+	/** The executor does not implement this verb yet. */
+	"unsupported",
+	"shutting-down",
+	"internal",
+] as const;
+
+export const sessionVerbRefusalReasonSchema = z.enum(SESSION_VERB_REFUSAL_REASONS);
+export type SessionVerbRefusalReason = (typeof SESSION_VERB_REFUSAL_REASONS)[number];
+
+/**
+ * What one verb did.
+ *
+ * Flat for the same reason the arguments are, and with the same trade: every result field any verb
+ * can produce lives here, and a verb fills in the ones it has. The discriminant is `verb`, echoed
+ * back so a client that pipelined two commands can tell the answers apart.
+ */
+export const sessionVerbResponseSchema = z.object({
+	ok: z.boolean(),
+	verb: sessionVerbNameSchema,
+	/** The instance that answered. Always present, including on a refusal, for the caller's log. */
+	instanceId: z.string().min(1).max(128),
+	/** How the verb ended. Present exactly when `ok`. */
+	endReason: z
+		.enum(["completed", "terminator", "timeout", "cancelled", "hangup", "failed"])
+		.optional(),
+	reason: sessionVerbRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+	// play
+	playbackRef: z.string().max(128).optional(),
+	elapsedMs: z.int().min(0).optional(),
+	// gather
+	digits: z.array(dtmfDigitSchema).max(64).optional(),
+	// record
+	recordingId: z.string().max(128).optional(),
+	mediaRef: z.string().max(512).optional(),
+	durationMs: z.int().min(0).optional(),
+	format: z.string().max(16).optional(),
+	// dial
+	/** Which entry of `targets` answered, when one did. */
+	answeredTargetIndex: z.int().min(0).optional(),
+	cause: hangupCauseSchema.optional(),
+	// bridge
+	bridgeId: z.string().max(128).optional(),
+});
+
+export type SessionVerbRequest = z.infer<typeof sessionVerbRequestSchema>;
+export type SessionVerbResponse = z.infer<typeof sessionVerbResponseSchema>;
+export type SessionVerbArguments = z.infer<typeof sessionVerbArgumentsSchema>;
+export type SessionDialTarget = z.infer<typeof sessionDialTargetSchema>;
+
+export const SESSION_VERB_RPC = defineRpc(
+	RPC_SUBJECTS.engineSessionVerb,
+	sessionVerbRequestSchema,
+	sessionVerbResponseSchema,
+	// Thirty seconds, and by far the longest budget on this backbone — because unlike every other
+	// subject here, some of these verbs are supposed to take a long time. A `gather` waits for a
+	// person to finish dialling and a `dial` waits for a phone to be answered; both are bounded by
+	// their own `timeoutMs`, which the schema caps at ten minutes, and neither is "slow" at twenty
+	// seconds. This deadline therefore is not a latency budget, it is a LIVENESS one: past it the
+	// engine is not thinking, it is gone, and the control plane should tell the socket so rather
+	// than hold a verb open forever. An application that wants a longer ring sends `dial` with the
+	// timeout it wants and reads the result off the call events.
+	30_000,
+);
+
+// ---------------------------------------------------------------------------------------------
+// rpc.engine.v1.conference-control.<instanceToken> — api → engine, moderating a live room
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * What a moderator can do to a live conference.
+ *
+ * A CLOSED list, and the split down the middle of it is the important part: the first five act on
+ * ONE MEMBER and the last two act on the ROOM. That difference decides who can serve the command —
+ * a member lives on exactly one engine instance's media channel, a room's lock is cluster state
+ * held in the `conference-claims` value — and it is why {@link conferenceControlRequestSchema}
+ * makes `memberRef` conditionally required rather than always.
+ *
+ * `deaf` is `mute` in the other direction and is a separate verb rather than a direction argument
+ * on `mute`, because they are different acts with different consequences: muting somebody stops the
+ * room hearing them, deafening them stops them hearing the room, and a moderation UI that offered
+ * one control with a direction dropdown would be describing a mixer rather than a meeting.
+ *
+ * `volume` is here and is REFUSED by one of the two media drivers, which is stated on the response
+ * rather than hidden: see {@link CONFERENCE_CONTROL_REFUSAL_REASONS}.
+ */
+export const CONFERENCE_CONTROL_ACTIONS = [
+	/** The room stops hearing this member. `*6` from the handset does the same thing. */
+	"mute",
+	"unmute",
+	/** This member stops hearing the room. Their own audio still reaches it unless also muted. */
+	"deaf",
+	"undeaf",
+	/**
+	 * Remove this member from the room.
+	 *
+	 * It does NOT hang the call up, and the difference matters to whoever is holding the phone: a
+	 * kicked participant is out of the meeting and still on a call the engine can route somewhere
+	 * — today, to a goodbye announcement and a hangup, which is a routing decision and therefore
+	 * the engine's rather than the media plane's.
+	 */
+	"kick",
+	/**
+	 * Re-level one member's contribution to the mix, or what they hear of it.
+	 *
+	 * Servable only on a media plane that MIXES. See the `not-servable` refusal.
+	 */
+	"volume",
+	/** The room stops admitting new participants. Acts on the room; carries no `memberRef`. */
+	"lock",
+	"unlock",
+] as const;
+
+export const conferenceControlActionSchema = z.enum(CONFERENCE_CONTROL_ACTIONS);
+export type ConferenceControlAction = (typeof CONFERENCE_CONTROL_ACTIONS)[number];
+
+/** The two verbs that act on the room rather than on one member. */
+export const CONFERENCE_ROOM_ACTIONS = ["lock", "unlock"] as const;
+
+/**
+ * `rpc.engine.v1.conference-control.<instanceToken>` — one moderation command on one live room.
+ *
+ * ## Instance-addressed, and the address is read out of the claim
+ *
+ * See {@link RPC_SUBJECTS.engineConferenceControl}. The short version: a room is jointly held, so
+ * there is no single instance that owns it, but every MEMBER is on exactly one instance's media
+ * channel and only that instance can mute it. The control plane reads the room's
+ * `conference-claims` value, which already names every instance with unexpired members in it, and
+ * addresses each in turn until one answers something other than `unknown-member`.
+ *
+ * ## `memberRef` is the LEG id, not a media channel id
+ *
+ * The control plane never sees a media channel id and must not: it is the engine's own handle onto
+ * a media server, it changes when the media driver changes, and a REST path segment carrying one
+ * would be an Asterisk-ism in a URL. The leg id is what `conference.joined` publishes, which is the
+ * only place the control plane learns a participant exists at all, so it is the only identifier
+ * both ends already share.
+ *
+ * ## Room verbs go to any contributor, and the lock lands in the CLAIM
+ *
+ * `lock` is not a fact about one instance's copy of the room — a join landing on a neighbour has to
+ * be refused too, or the lock is a suggestion. So the instance that serves it writes the flag into
+ * the shared claim under compare-and-set, and every joiner reads it on the join path it already
+ * reads the member cap on. Which contributor serves the command is therefore irrelevant, and a
+ * deployment with no claim bucket configured is single-instance by choice and locks locally.
+ */
+export const conferenceControlRequestSchema = z.object({
+	orgId: z.uuid(),
+	/** The room, as `conference.id`. The same id `conference.joined` carries. */
+	conferenceId: z.uuid(),
+	action: conferenceControlActionSchema,
+	/**
+	 * The member to act on — a LEG id. Required for every action except `lock` and `unlock`, and
+	 * refused as `bad-request` when it is missing.
+	 */
+	memberRef: z.string().min(1).max(128).optional(),
+	/**
+	 * Gain for `volume`, in PERCENT of unity, 0–400.
+	 *
+	 * Percent rather than decibels because the only caller is a slider in a moderation panel and a
+	 * dB scale would need a curve at both ends to be usable; percent rather than the mixer's own
+	 * Q8 fixed point because that is an implementation's unit and this is a contract. 100 is
+	 * unchanged, 0 is silent, and the ceiling is 400 because a member amplified past four times
+	 * unity is clipping rather than louder.
+	 */
+	gainPercent: z.int().min(0).max(400).optional(),
+	/**
+	 * Which half of `volume` to set. `talk` is the member's contribution TO the room, `listen` is
+	 * what they hear OF it. `both` when omitted.
+	 */
+	gainScope: z.enum(["talk", "listen", "both"]).optional(),
+	/** Who asked, for the audit trail and the log line. The control plane's user id. */
+	byUserId: z.uuid().optional(),
+});
+
+/**
+ * Why a moderation command did not run.
+ *
+ * `not-servable` is the one worth reading twice. It is not "this engine is broken" and not "this
+ * release has not built it" — it is **the media plane under this call cannot express the request**,
+ * and the caller's recovery is to stop offering the control rather than to retry. Today it is
+ * produced by exactly one combination: `volume` on the ARI driver, which can mute a channel and has
+ * no per-participant gain on a mixing bridge at all. `error` names the driver so an operator can
+ * see why the same button worked on a different call.
+ */
+export const CONFERENCE_CONTROL_REFUSAL_REASONS = [
+	/** Malformed payload, a missing `memberRef`, or a `gainPercent` on something that is not `volume`. */
+	"bad-request",
+	/** No room with that id on this instance. The caller should try the next contributor. */
+	"unknown-conference",
+	/** The room is here and that member is not. The caller should try the next contributor. */
+	"unknown-member",
+	/**
+	 * The media plane under this call cannot serve the action. NOT a rung and NOT a retry — see
+	 * the note above.
+	 */
+	"not-servable",
+	/** The media plane accepted the idea and refused the command. `error` carries its reason. */
+	"media-refused",
+	"shutting-down",
+	"internal",
+] as const;
+
+export const conferenceControlRefusalReasonSchema = z.enum(CONFERENCE_CONTROL_REFUSAL_REASONS);
+export type ConferenceControlRefusalReason = (typeof CONFERENCE_CONTROL_REFUSAL_REASONS)[number];
+
+/**
+ * What one moderation command did.
+ *
+ * It answers with the member's WHOLE state afterwards rather than an acknowledgement, for the
+ * reason `conference.participant.updated` carries the whole state: a moderation panel that applied
+ * a delta to a row it had drawn from a missed frame would show a mute button that disagrees with
+ * the mixer.
+ */
+export const conferenceControlResponseSchema = z.object({
+	ok: z.boolean(),
+	action: conferenceControlActionSchema,
+	/** The instance that answered. Always present, including on a refusal, for the caller's log. */
+	instanceId: z.string().min(1).max(128),
+	/** Members in the room, cluster-wide, after the command. */
+	memberCount: z.int().min(0).default(0),
+	/** Whether the room is admitting new participants. Present on every reply that found the room. */
+	locked: z.boolean().optional(),
+	/** The member acted on, echoed back, when the action named one. */
+	memberRef: z.string().max(128).optional(),
+	/** The member's state AFTER the command. Absent on a `kick` and on the room verbs. */
+	muted: z.boolean().optional(),
+	deafened: z.boolean().optional(),
+	moderator: z.boolean().optional(),
+	talkGainPercent: z.int().min(0).max(400).optional(),
+	listenGainPercent: z.int().min(0).max(400).optional(),
+	reason: conferenceControlRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type ConferenceControlRequest = z.infer<typeof conferenceControlRequestSchema>;
+export type ConferenceControlResponse = z.infer<typeof conferenceControlResponseSchema>;
+
+export const CONFERENCE_CONTROL_RPC = defineRpc(
+	RPC_SUBJECTS.engineConferenceControl,
+	conferenceControlRequestSchema,
+	conferenceControlResponseSchema,
+	// Two seconds. Everything on the far side is in memory except one media command, whose own
+	// budget is 500 ms — so this is that plus a claim write plus room to be wrong about the network,
+	// and past it the instance is not thinking, it is gone. The api tries the next contributor.
+	2_000,
+);
+
 /** Every request-reply contract, keyed by subject. */
 export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.routingResolve]: ROUTING_RESOLVE_RPC,
 	[RPC_SUBJECTS.authzCheck]: AUTHZ_CHECK_RPC,
 	[RPC_SUBJECTS.voicemailList]: VOICEMAIL_LIST_RPC,
+	[RPC_SUBJECTS.pbxExtensionFeature]: EXTENSION_FEATURE_RPC,
+	[RPC_SUBJECTS.pbxLastCaller]: LAST_CALLER_RPC,
+	[RPC_SUBJECTS.pbxFileGreeting]: FILE_GREETING_RPC,
 	[RPC_SUBJECTS.sipCredential]: SIP_CREDENTIAL_RPC,
 	[RPC_SUBJECTS.sipTransfer]: SIP_TRANSFER_RPC,
+	[RPC_SUBJECTS.sipInvite]: SIP_INVITE_RPC,
+	[RPC_SUBJECTS.sipRing]: SIP_RING_RPC,
+	[RPC_SUBJECTS.sipAnswer]: SIP_ANSWER_RPC,
+	[RPC_SUBJECTS.sipHangup]: SIP_HANGUP_RPC,
+	[RPC_SUBJECTS.sipReinvite]: SIP_REINVITE_RPC,
+	[RPC_SUBJECTS.sipOriginate]: SIP_ORIGINATE_RPC,
 	[RPC_SUBJECTS.mediaAllocateSession]: MEDIA_ALLOCATE_SESSION_RPC,
 	[RPC_SUBJECTS.mediaBridgeSessions]: MEDIA_BRIDGE_SESSIONS_RPC,
 	[RPC_SUBJECTS.mediaUnbridgeSessions]: MEDIA_UNBRIDGE_SESSIONS_RPC,
@@ -1583,6 +3500,13 @@ export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.mediaSendDtmf]: MEDIA_SEND_DTMF_RPC,
 	[RPC_SUBJECTS.mediaStartRecording]: MEDIA_START_RECORDING_RPC,
 	[RPC_SUBJECTS.mediaStopRecording]: MEDIA_STOP_RECORDING_RPC,
+	[RPC_SUBJECTS.mediaTapSession]: MEDIA_TAP_SESSION_RPC,
+	[RPC_SUBJECTS.mediaUntapSession]: MEDIA_UNTAP_SESSION_RPC,
+	[RPC_SUBJECTS.mediaMuteSession]: MEDIA_MUTE_SESSION_RPC,
+	[RPC_SUBJECTS.mediaHoldSession]: MEDIA_HOLD_SESSION_RPC,
 	[RPC_SUBJECTS.engineOriginate]: ORIGINATE_RPC,
 	[RPC_SUBJECTS.engineParkHandoff]: PARK_HANDOFF_RPC,
+	[RPC_SUBJECTS.engineSessionVerb]: SESSION_VERB_RPC,
+	[RPC_SUBJECTS.engineConferenceControl]: CONFERENCE_CONTROL_RPC,
+	[RPC_SUBJECTS.sessionAnnounce]: SESSION_ANNOUNCE_RPC,
 } as const;

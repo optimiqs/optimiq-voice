@@ -1,4 +1,10 @@
 import { z } from "zod";
+import {
+	type TelnyxFaxEventType,
+	type TelnyxFaxWebhookPayload,
+	isTelnyxFaxEvent,
+	telnyxFaxWebhookPayloadSchema,
+} from "../resources/faxes";
 import { numberOrderSchema } from "../resources/number-orders";
 
 /**
@@ -13,15 +19,18 @@ import { numberOrderSchema } from "../resources/number-orders";
  * webhooks this file rejects, which is the correct and visible outcome rather than a silent
  * mis-parse.
  *
- * ## There is exactly one event type worth handling
+ * ## The event types worth handling
  *
- * `number_order.complete`. There is no `number_order.status_update` — that string is the
- * *OpenAPI webhook key*, not the value Telnyx puts in `event_type` — and there are **no
- * `phone_number.*` events at all**: number state changes are polled, not pushed.
+ * `number_order.complete` for provisioning, and the `fax.*` family for Programmable Fax. There is
+ * no `number_order.status_update` — that string is the *OpenAPI webhook key*, not the value Telnyx
+ * puts in `event_type` — and there are **no `phone_number.*` events at all**: number state changes
+ * are polled, not pushed.
  *
  * `number_order.complete` fires for both outcomes, so the branch is on
  * `data.payload.status` (`success` | `failure`), never on the event type. Getting that backwards
- * produces a system that treats every failed order as a success.
+ * produces a system that treats every failed order as a success. The fax family, by contrast, names
+ * the outcome in `event_type` (`fax.delivered` vs `fax.failed`), with the terminal detail — page
+ * count, failure reason — in the payload.
  *
  * ## Duplicates are expected
  *
@@ -106,4 +115,31 @@ export function asNumberOrderWebhook(
 		return undefined;
 	}
 	return { ...event, eventType: TELNYX_NUMBER_ORDER_EVENT, order: order.data };
+}
+
+/** The narrowed shape for any of the `fax.*` events, inbound or outbound. */
+export interface TelnyxFaxWebhook extends TelnyxWebhookEvent {
+	readonly eventType: TelnyxFaxEventType;
+	readonly fax: TelnyxFaxWebhookPayload;
+}
+
+/**
+ * Narrows a parsed event to a fax event, or `undefined` when it is something else.
+ *
+ * Two gates, and both matter. First the `event_type` must be one of the six fax events this
+ * integration models — an unmodelled `fax.*` (Telnyx adds them) is logged-and-200'd, not acted on.
+ * Then the payload is re-validated with the fax payload schema rather than trusted: a signed webhook
+ * body is still attacker-influenced input, and "signed by Telnyx" is not "shaped the way our fax
+ * handler expects". A body that passes the signature but fails the schema is a shape drift to fix in
+ * `reference/telnyx-api.md`, surfaced by the consumer as an unhandled event rather than a crash.
+ */
+export function asFaxWebhook(event: TelnyxWebhookEvent): TelnyxFaxWebhook | undefined {
+	if (!isTelnyxFaxEvent(event.eventType)) {
+		return undefined;
+	}
+	const fax = telnyxFaxWebhookPayloadSchema.safeParse(event.payload);
+	if (!fax.success) {
+		return undefined;
+	}
+	return { ...event, eventType: event.eventType, fax: fax.data };
 }

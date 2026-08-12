@@ -5,12 +5,13 @@ import {
 	hangupCauseForTransfer,
 	INITIAL_PARK_STATE,
 	INITIAL_TRANSFER_STATE,
+	supportsMediaBug,
 	supportsRecording,
 } from "@optimiq-voice/telephony";
 import { legSignalKey, recordingSignalKey } from "../routing/call-signals";
 import { parkSlotFor } from "../routing/park-registry";
 import { parkHandoffRefusal } from "./park-handoff";
-import type { MediaPort } from "../media/media-port";
+import type { MediaPort, TapHandle, TapSide } from "../media/media-port";
 import type { CallSignalBus, LegSignal } from "../routing/call-signals";
 import type { ParkedCall, ParkRegistry, ParkResult } from "../routing/park-registry";
 import type { ParkHandoffClient } from "./park-handoff";
@@ -21,6 +22,8 @@ import type {
 	ParkHandoffRequest,
 	ParkHandoffResponse,
 	PickupKind,
+	TapEndReason,
+	TapMode,
 } from "@optimiq-voice/events";
 import type {
 	CallState,
@@ -132,6 +135,22 @@ export interface PickupCandidate {
 	readonly ringingSinceMs: number;
 }
 
+/**
+ * A live conversation a supervisor may join, and the one fact the media plane needs about it.
+ *
+ * `side` is the datum that makes `whisper` implementable at all: "speak to the agent" is only a
+ * direction on a channel once you know whether this channel IS the agent. See
+ * {@link import("../media/media-port").TapRequest.targetSide}.
+ */
+export interface SupervisionTarget {
+	/** The monitored extension's OWN leg — the one that gets tapped. */
+	readonly leg: ControlledLeg;
+	/** Which side of the conversation {@link leg} is: `b` on a call it received, `a` on one it placed. */
+	readonly side: "a" | "b";
+	/** When the leg was created, so the OLDEST match wins deterministically. */
+	readonly startedAtMs: number;
+}
+
 /** A park lot, as the compiled artifact describes it. */
 export interface ParkLot {
 	readonly parkLotId: string;
@@ -175,6 +194,21 @@ export interface CallControlHost {
 	/** The leg with this media id, or `undefined` when this process is not handling it. */
 	legFor(mediaChannelId: string): ControlledLeg | undefined;
 	/**
+	 * The leg with this DOMAIN id, or `undefined` when this process is not handling it.
+	 *
+	 * The second lookup on this host, and the reason it exists rather than being folded into
+	 * {@link legFor}: the two take different keys and neither can be derived from the other without
+	 * a scan. Everything INSIDE the engine addresses a leg by its media-server channel id, because
+	 * that is what the media plane's events carry. Everything OUTSIDE it — a CDR row, a call event,
+	 * a webhook, and now a session-protocol `bridge` verb — addresses it by the domain leg id,
+	 * because a media channel id is an implementation detail of whichever driver is loaded and
+	 * changes if the call is re-created.
+	 *
+	 * So this is the seam an external application's leg reference lands on, and it is deliberately
+	 * the ONLY one: nothing above the engine is ever handed a media channel id to send back.
+	 */
+	legByLegId(legId: string): ControlledLeg | undefined;
+	/**
 	 * Phones currently being alerted for `extension`, longest-ringing first.
 	 *
 	 * Asynchronous because a GROUP pickup has to know the caller's pickup group, and that lives in
@@ -183,6 +217,19 @@ export interface CallControlHost {
 	 * receptionist answering the warehouse's call.
 	 */
 	ringingFor(leg: ControlledLeg, extension: string): Promise<readonly PickupCandidate[]>;
+	/**
+	 * Answered calls at `extension` that this engine is holding, OLDEST FIRST.
+	 *
+	 * Synchronous, unlike {@link ringingFor}, and the difference is not an inconsistency: a group
+	 * pickup has to know the caller's pickup group, which lives in the compiled artifact and is
+	 * fetched on a cache miss. "Which of my legs belongs to extension 1001?" is answered by the
+	 * channel registry alone, and making it a promise would advertise an await that never awaits
+	 * anything.
+	 *
+	 * The ORDER is the contract, not the implementation's convenience — see
+	 * {@link CallControl.monitor} for why oldest wins.
+	 */
+	activeCallsFor(leg: ControlledLeg, extension: string): readonly SupervisionTarget[];
 	publish(leg: ControlledLeg, type: CallEvent, data: Record<string, unknown>): Promise<void>;
 	/** Resolves `destination` through the organization's artifact and walks the plan on this leg. */
 	route(leg: ControlledLeg, request: RouteRequest): Promise<RouteOutcome>;
@@ -204,7 +251,13 @@ export interface CallControlSettings {
 	readonly application: string;
 	/** Container on-demand recordings are written in. */
 	readonly recordingFormat: string;
-	/** How long to wait for a snoop channel to reach the application before giving up. */
+	/**
+	 * How long to wait for a snoop channel to reach the application before giving up.
+	 *
+	 * Shared by recording and by supervision, because on the ARI driver both materialise as the same
+	 * object — a snoop channel entering the engine's own Stasis application — and a deployment whose
+	 * media server is slow enough to miss one budget is slow enough to miss the other.
+	 */
 	readonly snoopTimeoutMs: number;
 	/** How long to wait for `RecordingFinished` after a stop before publishing anyway. */
 	readonly recordingStopTimeoutMs: number;
@@ -249,6 +302,22 @@ export interface CallControlDependencies {
 	 */
 	readonly consultationKeys?: {
 		arm(mediaChannelId: string, digit: DtmfDigit): void;
+		disarm(mediaChannelId: string): void;
+	};
+	/**
+	 * Where a supervisor's mode keys — `4`/`5`/`6` — are armed and disarmed.
+	 *
+	 * The same seam as {@link consultationKeys}, one layer along, and armed and disarmed by the same
+	 * rule: HERE, at the moment the tap is opened and the moment it is taken down, rather than by
+	 * whoever called `monitor`. Three digits left armed on a leg whose tap has ended would swallow
+	 * them for the rest of that call, and the two places a tap ends (a hangup on either side, and an
+	 * escalation's own teardown) are inside this class.
+	 *
+	 * Optional so a spec about supervision needs no DTMF machinery, which is the rule every optional
+	 * dependency here follows.
+	 */
+	readonly supervisionKeys?: {
+		arm(mediaChannelId: string, escalate: (mode: TapMode) => Promise<void>): void;
 		disarm(mediaChannelId: string): void;
 	};
 	readonly settings?: Partial<CallControlSettings>;
@@ -349,6 +418,71 @@ export interface PickupRequest {
 	readonly extension: string;
 }
 
+export interface MonitorRequest {
+	/** The extension whose conversation is being joined. */
+	readonly extension: string;
+	/** Where the supervisor starts. `eavesdrop` from `*0`; the mode keys move it afterwards. */
+	readonly mode: TapMode;
+	/**
+	 * The handset that dialled `*0`, as the SIP edge authenticated it.
+	 *
+	 * For the EVENTS only. The gate that decided this handset may listen ran in the plan walker,
+	 * before this method was reachable — see {@link import("../routing/plan-walker").PlanWalker} —
+	 * and nothing here re-derives authority from this string.
+	 */
+	readonly supervisorExtension: string;
+}
+
+/**
+ * One destination a `dial` verb should try, in order.
+ *
+ * Deliberately just a destination and a context — NOT an endpoint, a trunk or a dial string. The
+ * verb re-enters ROUTING for each entry, which is what makes an application's `dial` obey the same
+ * outbound rules, the same caller-id policy and the same toll gates a handset does. An application
+ * that could name a trunk directly would be a way to dial internationally from a tenant that has
+ * international calling switched off, and the whole reason `*69` was built on `route` rather than
+ * on `originate` was to avoid exactly that.
+ */
+export interface DialLegTarget {
+	readonly destination: string;
+	/** `internal` first then `outbound` when omitted — the same walk `*69` performs. */
+	readonly context?: "internal" | "outbound";
+}
+
+export interface DialLegRequest {
+	readonly targets: readonly DialLegTarget[];
+	/**
+	 * Causes that allow the dial to move on to the next target.
+	 *
+	 * Empty or absent means STOP at the first failure, never "try everything": retrying a
+	 * `CALL_REJECTED` down a list is how a toll-fraud loop is written by accident. The same rule
+	 * `DialVerb.continueOnCauses` states in `packages/telephony`.
+	 */
+	readonly continueOnCauses?: readonly HangupCause[];
+}
+
+export interface DialLegOutcome {
+	readonly result: CallControlResult;
+	/** Which entry of `targets` answered, when one did. */
+	readonly answeredTargetIndex?: number;
+	/** The cause of the last attempt that did not connect. */
+	readonly cause?: HangupCause;
+	/** Whether the leg is now bridged to the target and no longer this application's to talk to. */
+	readonly bridged: boolean;
+	readonly notes: readonly string[];
+}
+
+/** Join this leg to another one this engine is holding, addressed by DOMAIN leg id. */
+export interface BridgeLegRequest {
+	readonly peerLegId: string;
+}
+
+export interface BridgeLegOutcome {
+	readonly result: CallControlResult;
+	/** The bridge both legs are now in. Present exactly when the result is `ok`. */
+	readonly bridgeId?: string;
+}
+
 export interface StartRecordingRequest {
 	readonly maxDurationMs?: number;
 	readonly silenceStopMs?: number;
@@ -366,8 +500,12 @@ export interface CallControlPort {
 	completeTransfer(leg: ControlledLeg): Promise<CallControlResult>;
 	cancelTransfer(leg: ControlledLeg): Promise<CallControlResult>;
 	pickup(leg: ControlledLeg, request: PickupRequest): Promise<CallControlResult>;
+	monitor(leg: ControlledLeg, request: MonitorRequest): Promise<CallControlResult>;
 	startRecording(leg: ControlledLeg, request?: StartRecordingRequest): Promise<RecordingOutcome>;
 	stopRecording(leg: ControlledLeg): Promise<CallControlResult>;
+	dial(leg: ControlledLeg, request: DialLegRequest): Promise<DialLegOutcome>;
+	bridge(leg: ControlledLeg, request: BridgeLegRequest): Promise<BridgeLegOutcome>;
+	unbridge(leg: ControlledLeg): Promise<CallControlResult>;
 	/** Whether an attended transfer initiated by this leg is waiting to be completed. */
 	hasPendingTransfer(mediaChannelId: string): boolean;
 	/** Told by the orchestrator when a leg goes away, so held music, slots and taps are released. */
@@ -420,6 +558,71 @@ interface RecordingSession {
 /** A parked call and the timer that will ring it back. */
 interface ParkTimer {
 	readonly cancel: () => void;
+}
+
+/**
+ * A supervisor listening to somebody else's conversation.
+ *
+ * Keyed by the SUPERVISOR's media channel id throughout, because that is the leg this runtime was
+ * given and the leg whose death ends the tap. Everything about the monitored side is captured here
+ * rather than looked up again on teardown: by the time a `target-ended` teardown runs, the monitored
+ * aggregate is on its way out of the registry, and a session that had to re-resolve it would publish
+ * `call.tap.ended` for some taps and not others depending on who won a race.
+ */
+interface TapSession {
+	readonly tapId: string;
+	handle: TapHandle;
+	readonly supervisorLeg: ControlledLeg;
+	readonly supervisorExtension: string;
+	/** The monitored leg. Live getters, so a teardown reads its current state. */
+	readonly targetLeg: ControlledLeg;
+	readonly targetExtension: string;
+	readonly targetSide: "a" | "b";
+	mode: TapMode;
+	readonly startedAtMs: number;
+	/** Drops the watcher on the monitored leg, so a torn-down tap stops listening for its death. */
+	stopWatching: () => void;
+}
+
+/**
+ * The three supervision features, as two arguments to one media primitive.
+ *
+ * Exported and pure because this table IS the feature. Everything around it — minting ids, waiting
+ * for the tap to enter the application, publishing — is plumbing that would look the same for any
+ * mode, and this is the part where getting a value backwards puts a supervisor's coaching into the
+ * CUSTOMER's ear. A spec pins it directly rather than inferring it from a tap request three awaits
+ * deep in a harness.
+ *
+ * ```text
+ * eavesdrop   hear both, speak to nobody          silent monitoring
+ * whisper     hear both, speak to the MONITORED   coaching; the other party hears nothing
+ * barge       hear both, speak to both            a third person in the conversation
+ * ```
+ *
+ * `monitoredSide` is the side the SUPERVISED EXTENSION is on — `b` on a call it received, `a` on one
+ * it placed — and it appears here for one reason: whisper is the only mode whose answer depends on
+ * it, and "coach the agent" is a statement about a PARTY. Passing `hear`/`speakTo` down as sides
+ * rather than as directions is what keeps that translation in the media adapter, where the
+ * `in`/`out` inversion is documented once instead of being re-derived per feature.
+ *
+ * `hear` is `both` in all three because there is no product for a supervisor who hears half a
+ * conversation. It is written out rather than hoisted so the table reads as a table.
+ */
+export function tapSidesFor(
+	mode: TapMode,
+	monitoredSide: "a" | "b",
+): { readonly hear: TapSide; readonly speakTo: TapSide } {
+	switch (mode) {
+		case "eavesdrop": {
+			return { hear: "both", speakTo: "none" };
+		}
+		case "whisper": {
+			return { hear: "both", speakTo: monitoredSide };
+		}
+		case "barge": {
+			return { hear: "both", speakTo: "both" };
+		}
+	}
 }
 
 /**
@@ -490,6 +693,8 @@ export class CallControl implements CallControlPort {
 	private readonly holds = new Map<string, HeldLeg>();
 	private readonly consultations = new Map<string, Consultation>();
 	private readonly recordings = new Map<string, RecordingSession>();
+	/** Live taps, keyed by the SUPERVISOR's media channel id. See {@link TapSession}. */
+	private readonly taps = new Map<string, TapSession>();
 	private readonly parkTimers = new Map<string, ParkTimer>();
 	/** `parkStates` and `transferStates` exist to make the machines' guards real, not decorative. */
 	private readonly parkStates = new Map<string, ParkState>();
@@ -508,9 +713,21 @@ export class CallControl implements CallControlPort {
 			});
 	}
 
-	/** Legs this process is holding, parking, consulting on or recording. `/healthz` reads it. */
+	/** Legs this process is holding, parking, consulting on, recording or monitoring. `/healthz` reads it. */
 	get activeOperationCount(): number {
-		return this.holds.size + this.consultations.size + this.recordings.size + this.parkTimers.size;
+		return (
+			this.holds.size +
+			this.consultations.size +
+			this.recordings.size +
+			this.parkTimers.size +
+			this.taps.size
+		);
+	}
+
+	/** The tap this leg is running, if any. Read by the specs and by the escalation keys. */
+	tapFor(mediaChannelId: string): { readonly tapId: string; readonly mode: TapMode } | undefined {
+		const session = this.taps.get(mediaChannelId);
+		return session === undefined ? undefined : { tapId: session.tapId, mode: session.mode };
 	}
 
 	hasPendingTransfer(mediaChannelId: string): boolean {
@@ -1681,6 +1898,358 @@ export class CallControl implements CallControlPort {
 	}
 
 	// -------------------------------------------------------------------------------------------
+	// Supervision
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * Joins this leg to a conversation it is not part of — `*0`, and eavesdrop/whisper/barge.
+	 *
+	 * ## What this method is NOT responsible for
+	 *
+	 * Authorization. The gate ran in the plan walker, before `*0` could reach this seam, and it ran
+	 * there deliberately so that a future caller cannot get a tap by skipping it — see
+	 * {@link import("../routing/plan-walker").SupervisorAuthzPort}. Nothing below re-derives
+	 * authority from {@link MonitorRequest.supervisorExtension}; that string is event data.
+	 *
+	 * ## The media plane has to be holding samples
+	 *
+	 * A tap reads DECODED audio, so it is only possible on a bridge whose mode decodes — `media` and
+	 * nothing else ({@link import("@optimiq-voice/telephony").supportsMediaBug}). Checked here,
+	 * against the driver's declared {@link MediaPort.bridgeMode}, rather than inferred from whatever
+	 * a relay-only plane returns when asked to snoop, for the reason
+	 * {@link CallControl.startRecording} gives at length: "this media plane cannot do it" is a
+	 * deployment fact and "the media server refused" is an incident, and only one is worth paging
+	 * about.
+	 *
+	 * ## Finding the call, and why the OLDEST one wins
+	 *
+	 * The registry is scanned for an answered, live, un-detached leg in the same organization whose
+	 * `destinationNumber` or `callerIdNumber` is the target extension — a phone that was CALLED and a
+	 * phone that CALLED, which are the two ways an extension is on a call. A busy extension routinely
+	 * has more than one (a held call and an active one), so a rule is needed, and oldest is the one
+	 * that is both deterministic across instances and most likely right: somebody asking to listen to
+	 * extension 1001 means the conversation that has been going on, not the one that started while
+	 * they were dialling the code.
+	 *
+	 * **The registry is per engine instance, and that is a real limitation, not a rounding error.**
+	 * `*0` today reaches a call THIS process is holding and no other. In a cluster, a supervisor
+	 * whose own leg landed on instance B cannot monitor a call instance A is carrying, and what they
+	 * hear is the "nobody is on a call" announcement — indistinguishable, by design, from a denial.
+	 * The cross-instance answer already exists in outline: `apps/engine/src/presence/presence.service.ts`
+	 * maintains the `channels` KV bucket indexed per extension, which is exactly the index this scan
+	 * is a local copy of. Making `*0` cluster-wide means reading that bucket to find the OWNING
+	 * instance and then handing the request to it over an RPC, the way
+	 * `apps/engine/src/calls/park-handoff.ts` already hands a park retrieval across instances. That
+	 * is deliberately NOT built here: a supervision handoff needs the tap to be created next to the
+	 * monitored leg's media and the supervisor's leg to be bridged to it across two media servers,
+	 * which is a media-plane question rather than a routing one.
+	 *
+	 * ## The tap is watched before it exists
+	 *
+	 * On the ARI driver the tap materialises as a snoop channel entering the engine's own Stasis
+	 * application, and it gets there BEFORE the HTTP response returns. A channel the orchestrator has
+	 * never heard of is filed as a new inbound call, so the signal key is watched first — the same
+	 * rule, and the same mechanism, that makes {@link CallControl.startRecording} and every
+	 * originated B-leg safe.
+	 *
+	 * ## Never throws
+	 *
+	 * Every path returns a {@link CallControlResult}. The walker turns a refusal into an
+	 * announcement, and a supervisor who dialled `*0` and got silence would assume they were
+	 * listening — which is the one failure mode this feature must not have.
+	 */
+	async monitor(leg: ControlledLeg, request: MonitorRequest): Promise<CallControlResult> {
+		if (leg.isTearingDown) {
+			return refuse("the leg is tearing down, so it cannot be used for monitoring");
+		}
+		if (!supportsMediaBug(this.deps.media.bridgeMode)) {
+			return refuse(
+				`this media plane bridges in ${this.deps.media.bridgeMode} mode, which never decodes the audio, so a call on it cannot be monitored`,
+			);
+		}
+		if (this.taps.has(leg.mediaChannelId)) {
+			return refuse("this leg is already monitoring a call");
+		}
+
+		const extension = request.extension.trim();
+		if (extension === "") {
+			return refuse("monitoring needs the extension whose call is being joined");
+		}
+
+		const target = this.deps.host
+			.activeCallsFor(leg, extension)
+			.find((candidate) => !candidate.leg.isTearingDown);
+		if (target === undefined) {
+			return refuse(`nobody at extension ${extension} is on a call this engine is handling`);
+		}
+
+		// `*0` is dialled from an idle handset, so the supervisor's leg has not answered — the walker
+		// deliberately did not answer it, exactly as it does not answer before a pickup, so that a
+		// request that finds nothing has not started billing anybody. Answered here, at the moment
+		// there is something to connect them to.
+		try {
+			await this.deps.media.answer(leg.mediaChannelId);
+		} catch (error) {
+			return refuse(`the supervisor's leg could not be answered: ${String(error)}`);
+		}
+
+		const opened = await this.openTap(leg, target, extension, request.mode);
+		if (!opened.ok) {
+			return refuse(opened.reason);
+		}
+
+		const session: TapSession = {
+			tapId: opened.tapId,
+			handle: opened.handle,
+			supervisorLeg: leg,
+			supervisorExtension: request.supervisorExtension,
+			targetLeg: target.leg,
+			targetExtension: extension,
+			targetSide: target.side,
+			mode: request.mode,
+			startedAtMs: this.now(),
+			stopWatching: () => undefined,
+		};
+		this.taps.set(leg.mediaChannelId, session);
+		this.armTapTeardown(session);
+
+		leg.setBridge(session.handle.bridgeId);
+		leg.moveTo("exchanging-media");
+		// No `setBridgePeer`: the thing on the other side of this bridge is a TAP, which has no domain
+		// leg id and no CDR, and writing the monitored party's id there would make the supervisor's
+		// record claim a bridge that the monitored party's record does not agree exists.
+
+		await this.publishTapStarted(session);
+		return ok(`monitoring extension ${extension} in ${request.mode} mode`);
+	}
+
+	/**
+	 * Moves a live tap to another mode — the `4`/`5`/`6` keys.
+	 *
+	 * ## Why it re-taps instead of adjusting the one that is running
+	 *
+	 * Because the driver cannot adjust it. On ARI a tap IS a snoop channel, and `spy` and `whisper`
+	 * are arguments to `POST /channels/{id}/snoop` — properties fixed when the channel is created.
+	 * There is no `PUT` and no `snoop/{id}` resource to modify: `packages/media-ari`'s channel
+	 * surface exposes `snoop` and nothing that would change one, because Asterisk offers nothing that
+	 * would. So an escalation is a new tap, and the old one is stopped first so the supervisor is
+	 * never briefly in two bridges hearing the same conversation twice.
+	 *
+	 * ## Two events, in this order
+	 *
+	 * `call.tap.ended{reason:"escalated"}` and then `call.tap.started{previousMode}`. Not one
+	 * `changed` event, because the pair is what makes a compliance timeline reconstructable: each
+	 * interval a call was monitored is bounded by its own start and end with the mode that applied
+	 * during it, and a single mutation event would leave a reader integrating a mode change over an
+	 * interval that has no end. `previousMode` is what distinguishes the second `started` from a
+	 * fresh one.
+	 *
+	 * A failed re-tap leaves NO tap: the old one is already gone, the new one did not open, and the
+	 * supervisor is dropped rather than left in a bridge with nothing in it. `failed` is the end
+	 * reason, and the leg is hung up because a supervisor holding a silent line believes they are
+	 * still listening.
+	 */
+	async escalate(mediaChannelId: string, mode: TapMode): Promise<CallControlResult> {
+		const session = this.taps.get(mediaChannelId);
+		if (session === undefined) {
+			return refuse("this leg is not monitoring a call");
+		}
+		if (session.mode === mode) {
+			// Pressing the key you are already on is not an error and must not cost a re-tap: tearing
+			// the audio down and building it back would put a gap in the supervisor's ear for nothing.
+			return ok(`already monitoring in ${mode} mode`);
+		}
+		if (session.targetLeg.isTearingDown || session.supervisorLeg.isTearingDown) {
+			return refuse("the call being monitored is going away");
+		}
+
+		const previousMode = session.mode;
+		await this.stopTapQuietly(session.handle);
+		await this.publishTapEnded(session, "escalated");
+
+		const opened = await this.openTap(
+			session.supervisorLeg,
+			{ leg: session.targetLeg, side: session.targetSide, startedAtMs: session.startedAtMs },
+			session.targetExtension,
+			mode,
+		);
+		if (!opened.ok) {
+			session.stopWatching();
+			this.taps.delete(mediaChannelId);
+			this.deps.supervisionKeys?.disarm(mediaChannelId);
+			await this.publishTapEnded(session, "failed");
+			await this.hangupQuietly(mediaChannelId, "NORMAL_TEMPORARY_FAILURE");
+			return refuse(opened.reason);
+		}
+
+		session.handle = opened.handle;
+		session.mode = mode;
+		session.supervisorLeg.setBridge(session.handle.bridgeId);
+		await this.publishTapStarted(session, previousMode);
+		return ok(`monitoring extension ${session.targetExtension} in ${mode} mode`);
+	}
+
+	/**
+	 * Creates one tap and waits for it to reach the application.
+	 *
+	 * Shared by {@link monitor} and {@link escalate} because an escalation is literally a second
+	 * tap, and two copies of "mint three ids, subscribe, tap, wait, clean up on failure" is two
+	 * places for the subscribe-before-tap ordering to be got wrong.
+	 */
+	private async openTap(
+		leg: ControlledLeg,
+		target: SupervisionTarget,
+		extension: string,
+		mode: TapMode,
+	): Promise<
+		| { readonly ok: true; readonly tapId: string; readonly handle: TapHandle }
+		| { readonly ok: false; readonly reason: string }
+	> {
+		const tapId = this.newId();
+		const tapChannelId = this.newId();
+		const bridgeId = this.newId();
+		const sides = tapSidesFor(mode, target.side);
+
+		// BEFORE the tap is asked for. See the method note on `monitor`.
+		const entered = this.awaitLegEntered(tapChannelId, this.settings.snoopTimeoutMs);
+		let handle: TapHandle;
+		try {
+			handle = await this.deps.media.tap({
+				tapId,
+				targetChannelId: target.leg.mediaChannelId,
+				targetSide: target.side,
+				supervisorChannelId: leg.mediaChannelId,
+				tapChannelId,
+				bridgeId,
+				application: this.settings.application,
+				hear: sides.hear,
+				speakTo: sides.speakTo,
+				mode,
+			});
+		} catch (error) {
+			entered.cancel();
+			return {
+				ok: false,
+				reason: `the media plane refused a tap on extension ${extension}: ${String(error)}`,
+			};
+		}
+
+		if (!(await entered.promise)) {
+			// Quietly, and both halves: `stopTap` takes the bridge down and the hangup takes the
+			// channel with it, and neither may touch the conversation that was being listened to.
+			await this.stopTapQuietly(handle);
+			await this.hangupQuietly(tapChannelId, "NORMAL_TEMPORARY_FAILURE");
+			return { ok: false, reason: "the tap never reached the engine's application" };
+		}
+
+		return { ok: true, tapId, handle };
+	}
+
+	/**
+	 * Wires a tap's two possible endings, and arms the mode keys.
+	 *
+	 * The two endings are NOT symmetrical, which is the whole reason this is written out:
+	 *
+	 * - The MONITORED call ends → the tap is dead anyway (the snoop dies with the channel it was
+	 *   spying on) and the supervisor is left holding a line with nothing on it. They are hung up.
+	 * - The SUPERVISOR hangs up → the monitored call carries on. Nothing about their leg going away
+	 *   may reach the other conversation, which is the invariant {@link MediaPort.stopTap} states
+	 *   and which this method exists to make true. The supervisor's own teardown arrives through
+	 *   {@link onLegEnded}, not through a watcher here.
+	 */
+	private armTapTeardown(session: TapSession): void {
+		this.deps.supervisionKeys?.arm(session.supervisorLeg.mediaChannelId, async (mode) => {
+			await this.escalate(session.supervisorLeg.mediaChannelId, mode);
+		});
+
+		const unwatch = this.deps.signals.watch(
+			legSignalKey(session.targetLeg.mediaChannelId),
+			(signal) => {
+				if ((signal as LegSignal).kind !== "ended") {
+					return;
+				}
+				unwatch();
+				void this.endTap(session, "target-ended", true);
+			},
+		);
+		session.stopWatching = unwatch;
+	}
+
+	/**
+	 * Takes a tap down and publishes the fact.
+	 *
+	 * `call.tap.ended` is published BEFORE the media teardown, which is the opposite of the order
+	 * every other operation here uses, and the reason is the `target-ended` case: the monitored leg
+	 * is being destroyed at this instant and the aggregate that names its call is on its way out of
+	 * the registry, so an event published after two awaited media round trips would be published for
+	 * a call the publisher can no longer identify. A compliance report that silently loses the END of
+	 * some monitored intervals is worse than one whose last event precedes its last packet by a
+	 * millisecond. Stopping the tap afterwards is safe by construction — it never touches the
+	 * monitored conversation.
+	 */
+	private async endTap(
+		session: TapSession,
+		reason: TapEndReason,
+		hangUpSupervisor: boolean,
+	): Promise<void> {
+		if (this.taps.get(session.supervisorLeg.mediaChannelId) !== session) {
+			return;
+		}
+		this.taps.delete(session.supervisorLeg.mediaChannelId);
+		session.stopWatching();
+		this.deps.supervisionKeys?.disarm(session.supervisorLeg.mediaChannelId);
+
+		await this.publishTapEnded(session, reason);
+		await this.stopTapQuietly(session.handle);
+		if (hangUpSupervisor && !session.supervisorLeg.isTearingDown) {
+			await this.hangupQuietly(session.supervisorLeg.mediaChannelId, "NORMAL_CLEARING");
+		}
+	}
+
+	/**
+	 * `call.tap.started`, on the MONITORED call.
+	 *
+	 * The event belongs to the call being listened to, not to the supervisor's — that is what the
+	 * contract says and it is the only choice that makes the feature auditable: "was this
+	 * conversation monitored, and by whom?" is a question asked of a call id somebody has in front of
+	 * them, and answering it from the supervisor's call id would mean scanning every tap ever opened.
+	 * `supervisorCallId` carries the other direction so the two can be joined without a scan.
+	 */
+	private async publishTapStarted(session: TapSession, previousMode?: TapMode): Promise<void> {
+		await this.publishQuietly(session.targetLeg, "call.tap.started", {
+			// The SUPERVISOR's leg, on the monitored call's envelope. Deliberately: the tap channel
+			// has no leg id, and the field names the party doing the listening.
+			legId: session.supervisorLeg.legId,
+			mode: session.mode,
+			supervisorExtension: session.supervisorExtension,
+			targetExtension: session.targetExtension,
+			targetLegId: session.targetLeg.legId,
+			supervisorCallId: session.supervisorLeg.callId,
+			...(previousMode === undefined ? {} : { previousMode }),
+		});
+	}
+
+	private async publishTapEnded(session: TapSession, reason: TapEndReason): Promise<void> {
+		await this.publishQuietly(session.targetLeg, "call.tap.ended", {
+			legId: session.supervisorLeg.legId,
+			mode: session.mode,
+			supervisorExtension: session.supervisorExtension,
+			targetExtension: session.targetExtension,
+			reason,
+			durationMs: Math.max(0, this.now() - session.startedAtMs),
+		});
+	}
+
+	/** Idempotent by contract; a tap that is already gone is not a failure. See {@link MediaPort.stopTap}. */
+	private async stopTapQuietly(handle: TapHandle): Promise<void> {
+		try {
+			await this.deps.media.stopTap(handle);
+		} catch (error) {
+			this.log("failed to stop a tap", { tapId: handle.tapId, err: String(error) });
+		}
+	}
+
+	// -------------------------------------------------------------------------------------------
 	// On-demand recording
 	// -------------------------------------------------------------------------------------------
 
@@ -1838,6 +2407,235 @@ export class CallControl implements CallControlPort {
 	}
 
 	// -------------------------------------------------------------------------------------------
+	// Dial and bridge — the session protocol's leg surface
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * Originates towards each target in turn and connects the first that answers.
+	 *
+	 * ## Why this goes through routing and does not originate
+	 *
+	 * Every target is resolved by {@link CallControlHost.route}, which is the same path `*69` takes
+	 * and the same path an inbound call takes. That means an application's `dial` gets, for free and
+	 * without being able to opt out of them: the organization's outbound routes, its caller-id
+	 * policy, its trunk selection and capacity limits, its call-block list and its emergency
+	 * handling. The verb executor could have called `MediaPort.originate` directly and skipped all
+	 * of it — which is precisely why it does not. An integration is the least trusted caller on this
+	 * platform and the one most likely to be holding a leaked API key, and a dial that bypassed the
+	 * toll gate would make the session protocol the cheapest way to defraud a tenant.
+	 *
+	 * The cost is that this is SEQUENTIAL, one target at a time. Ring-all with lose-race semantics
+	 * and CDR-correct losers lives in the plan walker, which owns origination; a second originator
+	 * here would be a second, subtly different one. `simultaneous` is refused at the verb, by name,
+	 * rather than silently downgraded — see the verb executor.
+	 *
+	 * ## `continueOnCauses` is the only thing that moves to the next target
+	 *
+	 * A target that connects ends the dial. A target that fails ends it too, UNLESS its cause is in
+	 * the list the application supplied. Absent means "stop", never "keep going": a list that
+	 * defaulted to retrying would turn one `CALL_REJECTED` into sixteen attempts down somebody
+	 * else's number range.
+	 */
+	async dial(leg: ControlledLeg, request: DialLegRequest): Promise<DialLegOutcome> {
+		const notes: string[] = [];
+		if (leg.isTearingDown) {
+			return {
+				result: refuse("the leg is tearing down, so it cannot be used for dial"),
+				bridged: false,
+				notes,
+			};
+		}
+		if (request.targets.length === 0) {
+			return { result: refuse("a dial needs at least one target"), bridged: false, notes };
+		}
+
+		const continueOn = new Set<HangupCause>(request.continueOnCauses ?? []);
+		let lastCause: HangupCause | undefined;
+
+		for (const [index, target] of request.targets.entries()) {
+			// `internal` then `outbound` when the application did not say, which is the walk `*69`
+			// performs: an extension number is not a PSTN number, and trying the toll-bearing context
+			// first would put every internal dial through the outbound rules.
+			const contexts: readonly ("internal" | "outbound")[] =
+				target.context === undefined ? ["internal", "outbound"] : [target.context];
+
+			let outcome: RouteOutcome | undefined;
+			for (const context of contexts) {
+				outcome = await this.deps.host.route(leg, { destination: target.destination, context });
+				notes.push(...outcome.notes);
+				if (outcome.status !== "unresolved") {
+					break;
+				}
+			}
+			if (outcome === undefined || outcome.status === "unresolved") {
+				notes.push(`nothing matched ${target.destination}`);
+				// An unresolved destination is not a hangup cause, so it does not consult
+				// `continueOnCauses` — there was no attempt to continue FROM. The list is about calls
+				// that were placed and failed, and a number that does not route was never placed.
+				continue;
+			}
+			if (outcome.status === "bridged") {
+				return {
+					result: ok(`dialled ${target.destination}`),
+					answeredTargetIndex: index,
+					bridged: true,
+					notes,
+				};
+			}
+			if (outcome.status === "aborted") {
+				// The A-leg went away underneath the dial. There is nobody left to try for.
+				return { result: refuse("the leg went away during the dial"), bridged: false, notes };
+			}
+			lastCause = outcome.cause;
+			if (outcome.cause === undefined || !continueOn.has(outcome.cause)) {
+				return {
+					result: refuse(`${target.destination} did not answer: ${outcome.cause ?? "unknown"}`),
+					bridged: false,
+					...(lastCause === undefined ? {} : { cause: lastCause }),
+					notes,
+				};
+			}
+			notes.push(`${target.destination} failed with ${outcome.cause}; continuing`);
+		}
+
+		return {
+			result: refuse("no target answered"),
+			bridged: false,
+			...(lastCause === undefined ? {} : { cause: lastCause }),
+			notes,
+		};
+	}
+
+	/**
+	 * Joins this leg to another this engine is holding — the `uuid_bridge` equivalent.
+	 *
+	 * ## The tenancy check is the first thing here and is not optional
+	 *
+	 * The peer is named by an application, over a socket, as an opaque string. Everything else in
+	 * this class receives a leg the engine looked up for itself; this is the one operation whose
+	 * TARGET is caller-supplied, which makes it the one place a cross-tenant bridge could be built
+	 * by asking for it. Two legs in different organizations sharing a media bridge is two customers
+	 * on one another's calls, so the organization comparison happens before any media command and
+	 * the refusal deliberately does not distinguish "not yours" from "does not exist" — an
+	 * application that could tell the two apart could enumerate another tenant's live legs.
+	 *
+	 * ## Reuse the peer's bridge when it has one; create one when neither does
+	 *
+	 * Joining an existing bridge rather than building a second is what makes `bridge` work on a leg
+	 * that is already in a conversation — the application is adding this leg to that call, which is
+	 * what an operator means by it. Both legs are pulled out of any OTHER bridge first, because a
+	 * channel in two bridges is a media loop.
+	 */
+	async bridge(leg: ControlledLeg, request: BridgeLegRequest): Promise<BridgeLegOutcome> {
+		const refusal = this.refuseIfUnusable(leg, "bridge");
+		if (refusal !== undefined) {
+			return { result: refusal };
+		}
+		const peer = this.deps.host.legByLegId(request.peerLegId);
+		if (peer === undefined || peer.organizationId !== leg.organizationId) {
+			return { result: refuse(`no leg ${request.peerLegId} on this engine`) };
+		}
+		if (peer.legId === leg.legId) {
+			return { result: refuse("a leg cannot be bridged to itself") };
+		}
+		const peerRefusal = this.refuseIfUnusable(peer, "bridge");
+		if (peerRefusal !== undefined && !peerRefusal.ok) {
+			return { result: refuse(`leg ${peer.legId} is not usable: ${peerRefusal.reason}`) };
+		}
+		if (this.holds.has(leg.mediaChannelId) || this.holds.has(peer.mediaChannelId)) {
+			// Bridging a held leg would put a live conversation on top of hold music, and would leave
+			// the hold record pointing at a bridge that no longer exists. `unhold` first.
+			return { result: refuse("one of the legs is on hold; release it before bridging") };
+		}
+
+		const existing = peer.bridgeId;
+		const bridgeId = existing ?? this.newId();
+		try {
+			if (existing === undefined) {
+				await this.deps.media.createBridge({ bridgeId, name: `session-${leg.callId}` });
+			}
+			for (const member of [leg, peer]) {
+				const held = member.bridgeId;
+				if (held !== undefined && held !== bridgeId) {
+					await this.deps.media.removeFromBridge(held, [member.mediaChannelId]);
+				}
+			}
+			const joining = [
+				leg.mediaChannelId,
+				...(existing === undefined ? [peer.mediaChannelId] : []),
+			];
+			await this.deps.media.addToBridge(bridgeId, joining);
+		} catch (error) {
+			return { result: refuse(`the legs could not be bridged: ${String(error)}`) };
+		}
+
+		leg.setBridge(bridgeId);
+		peer.setBridge(bridgeId);
+		leg.moveTo("exchanging-media");
+		peer.moveTo("exchanging-media");
+		// Both directions, while both legs are up: each CDR carries the other's id whichever dies
+		// first. The same rule every other bridge in this file follows.
+		leg.setBridgePeer(peer.legId);
+		peer.setBridgePeer(leg.legId);
+
+		await this.publishQuietly(leg, "channel.bridged", {
+			legId: leg.legId,
+			peerLegId: peer.legId,
+			bridgeId,
+			mode: this.deps.media.bridgeMode,
+		});
+		return { result: ok(`bridged to ${peer.legId}`), bridgeId };
+	}
+
+	/**
+	 * Takes the leg out of its bridge WITHOUT hanging anything up.
+	 *
+	 * The distinction from `hangup` is the whole verb: after this the application still has the leg
+	 * and can play to it, gather from it or dial somewhere else with it, and the far end is still up
+	 * and is somebody else's problem. Nobody is hung up here, ever — a `bridge` that tore its peer
+	 * down would make "put this caller back in the IVR" impossible to express.
+	 *
+	 * The bridge itself is destroyed when this leg was one of two in it, because a mixing bridge with
+	 * one member is a resource on the media server that nothing will ever come back for. A bridge
+	 * with a third member (a conference, a tap) is left alone.
+	 */
+	async unbridge(leg: ControlledLeg): Promise<CallControlResult> {
+		const bridgeId = leg.bridgeId;
+		if (bridgeId === undefined) {
+			return refuse("the leg is not in a bridge");
+		}
+		// Resolved BEFORE the pointers are cleared: `peerOf` reads `leg.peerMediaChannelId`, and after
+		// `setBridgePeer(undefined)` there is nothing left to resolve.
+		const peer = this.peerOf(leg);
+		try {
+			await this.deps.media.removeFromBridge(bridgeId, [leg.mediaChannelId]);
+		} catch (error) {
+			return refuse(`the leg could not be taken out of its bridge: ${String(error)}`);
+		}
+
+		leg.setBridge(undefined);
+		leg.setBridgePeer(undefined);
+		if (peer !== undefined && peer.bridgeId === bridgeId) {
+			peer.setBridgePeer(undefined);
+		}
+
+		if (peer !== undefined) {
+			// `channel.unbridged` REQUIRES a peer id — the event's whole content is which two legs
+			// stopped hearing each other, and one of them is not that. A leg leaving a bridge whose
+			// other member this instance cannot name (it was reaped, or it is a tap) is therefore not
+			// published rather than published with a hole in it; the leg's own lifecycle events still
+			// say everything a consumer needs about the leg.
+			await this.publishQuietly(leg, "channel.unbridged", {
+				legId: leg.legId,
+				peerLegId: peer.legId,
+				bridgeId,
+				reason: "session-unbridge",
+			});
+		}
+		return ok(`left bridge ${bridgeId}`);
+	}
+
+	// -------------------------------------------------------------------------------------------
 	// Teardown
 	// -------------------------------------------------------------------------------------------
 
@@ -1853,6 +2651,14 @@ export class CallControl implements CallControlPort {
 
 		if (this.recordings.has(mediaChannelId) && leg !== undefined) {
 			await this.stopRecording(leg);
+		}
+
+		// The SUPERVISOR hung up. The monitored conversation carries on — that is the invariant
+		// `MediaPort.stopTap` states — so nothing here touches the other legs, and the supervisor is
+		// not hung up again by the teardown that is already ending them.
+		const tap = this.taps.get(mediaChannelId);
+		if (tap !== undefined) {
+			await this.endTap(tap, "supervisor-ended", false);
 		}
 
 		// A transferor who hangs up mid-consultation IS the completion signal. This is the classic
@@ -1900,10 +2706,14 @@ export class CallControl implements CallControlPort {
 		for (const timer of this.parkTimers.values()) {
 			timer.cancel();
 		}
+		for (const tap of this.taps.values()) {
+			tap.stopWatching();
+		}
 		this.consultations.clear();
 		this.parkTimers.clear();
 		this.holds.clear();
 		this.recordings.clear();
+		this.taps.clear();
 		this.parkStates.clear();
 	}
 

@@ -19,12 +19,17 @@ import type { FeatureCodeAction } from "@optimiq-voice/pbx-db";
  *    specifically so the feature-code form could show a park-lot picker instead.
  *
  * So the accepted keys are declared **per action**, in {@link FEATURE_CODE_PARAM_SCHEMAS}, and the
- * list is derived from what `packages/routing` actually reads. Today that is exactly one key:
- * `call-park` may pin a lot with `params.lotId`, which the compiler resolves into a park node
- * (`compile.ts`, `featureCodeTarget`). Every other action takes no parameters — not "none yet, so
- * anything goes", but none: a key the compiler and the engine both ignore is dead configuration
- * that reads as a setting. Teaching an action a parameter means teaching `packages/routing` to read
- * it first, and then adding it here.
+ * list is derived from what `packages/routing` actually reads. Today that is exactly two keys, both
+ * resolved by the same function (`compile.ts`, `featureCodeTarget`): `call-park` may pin a lot with
+ * `params.lotId`, and `paging` may pin a group with `params.groupId`. Every other action takes no
+ * parameters — not "none yet, so anything goes", but none: a key the compiler and the engine both
+ * ignore is dead configuration that reads as a setting. Teaching an action a parameter means
+ * teaching `packages/routing` to read it first, and then adding it here.
+ *
+ * `intercom` is the instructive non-entry. It plainly HAS a target, and it still takes no
+ * parameters, because its target is the extension dialed after the code rather than a row an
+ * administrator chose — the distinction this declaration is really about is not "does the action
+ * have an argument" but "is the argument something a compiler can resolve once".
  *
  * ## What a PATCH may say about the pair
  *
@@ -57,7 +62,7 @@ export const FEATURE_CODE_PARAM_SCHEMAS: Readonly<Record<FeatureCodeAction, z.Zo
 	"voicemail-check": noParams,
 	"voicemail-direct": noParams,
 	"voicemail-record-greeting": noParams,
-	/** The one parameterised action: pin the orbit, or omit it and take any free slot. */
+	/** Pin the orbit, or omit it and take any free slot. */
 	"call-park": z.strictObject({ lotId: z.uuid().optional() }),
 	"call-pickup": noParams,
 	"group-pickup": noParams,
@@ -66,8 +71,18 @@ export const FEATURE_CODE_PARAM_SCHEMAS: Readonly<Record<FeatureCodeAction, z.Zo
 	"call-forward-no-answer": noParams,
 	"do-not-disturb": noParams,
 	"follow-me": noParams,
+	/**
+	 * `intercom` stays parameterless, and that is a decision rather than an omission.
+	 *
+	 * Its argument is the extension dialed AFTER the code — `*80` then `1001` — which is a live
+	 * keypress the engine resolves per call, not a stored parameter a compiler could pin. Giving it
+	 * an `extensionId` here would turn a code that reaches any desk in the building into a code that
+	 * reaches exactly one, which is the opposite of what an intercom is for. `compile.ts`'s
+	 * `featureCodeTarget` says the same thing from the other side and deliberately does not read it.
+	 */
 	intercom: noParams,
-	paging: noParams,
+	/** Pin the group this code announces into, or omit it and let the dialed digits choose. */
+	paging: z.strictObject({ groupId: z.uuid().optional() }),
 	"record-toggle": noParams,
 	redial: noParams,
 	"echo-test": noParams,
@@ -83,13 +98,18 @@ export const FEATURE_CODE_PARAM_SCHEMAS: Readonly<Record<FeatureCodeAction, z.Zo
  * `entity` carries the destination type whose list populates the picker, which is the same
  * vocabulary `destinationType` uses — so the web app reuses the picker it already has rather than
  * learning a second way to choose a park lot.
+ *
+ * `entityType` is a union of the types actually used rather than the whole `DestinationType`
+ * catalogue: the narrower type is what makes "which pickers does this endpoint ask a client to
+ * render?" answerable from the declaration, and widening it to every destination type would promise
+ * a picker for `hangup`.
  */
 export interface FeatureCodeParamField {
 	readonly name: string;
 	readonly label: string;
 	readonly description: string;
 	readonly kind: "entity";
-	readonly entityType: "park";
+	readonly entityType: "park" | "paging-group";
 	readonly required: boolean;
 }
 
@@ -118,8 +138,19 @@ export const FEATURE_CODE_PARAM_FIELDS: Readonly<
 	"call-forward-no-answer": [],
 	"do-not-disturb": [],
 	"follow-me": [],
+	// Nothing to render: the target is dialed after the code, so the control is the keypad.
 	intercom: [],
-	paging: [],
+	paging: [
+		{
+			name: "groupId",
+			label: "Paging group",
+			description:
+				"Which group this code announces into. Leave it empty to page the group the caller dials after the code.",
+			kind: "entity",
+			entityType: "paging-group",
+			required: false,
+		},
+	],
 	"record-toggle": [],
 	redial: [],
 	"echo-test": [],
@@ -168,7 +199,8 @@ const featureCodeShape = {
 	/**
 	 * Whatever the action accepts, per {@link FEATURE_CODE_PARAM_SCHEMAS}. `null` clears it.
 	 *
-	 * Only `call-park` accepts anything today (`{ lotId }`); every other action rejects every key.
+	 * Only `call-park` (`{ lotId }`) and `paging` (`{ groupId }`) accept anything today; every other
+	 * action rejects every key.
 	 */
 	params: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).nullish(),
 	label: z.string().max(128).nullish(),

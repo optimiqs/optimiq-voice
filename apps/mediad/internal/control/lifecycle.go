@@ -81,6 +81,7 @@ func (a *LifecycleAnnouncer) SessionEnded(session rtp.SessionSummary, reason rtp
 		return
 	}
 
+	quality := qualityOf(session.Quality)
 	data := contract.MediaSessionEndedData{
 		SessionID:       session.SessionID,
 		InstanceID:      a.instanceID,
@@ -91,6 +92,7 @@ func (a *LifecycleAnnouncer) SessionEnded(session rtp.SessionSummary, reason rtp
 		PacketsSent:     int(session.Stats.PacketsSent),
 		Reason:          contract.MediaSessionEndedReason(reason),
 		DurationMs:      int(session.Duration.Milliseconds()),
+		Quality:         &quality,
 	}
 
 	go a.publish(func(ctx context.Context) error {
@@ -104,6 +106,30 @@ func (a *LifecycleAnnouncer) SessionEnded(session rtp.SessionSummary, reason rtp
 			Data:    data,
 		})
 	}, "session.ended", session.SessionID)
+}
+
+// qualityOf carries the RTCP view of a leg onto the wire.
+//
+// It exists at all because `SessionSummary.Quality` recorded a CONTRACT GAP rather than a decision:
+// the numbers have been measured, tested and available since rung 7, and `session.ended` had no
+// field for any of them, so a mediad that knew exactly why a call sounded bad had nowhere to say so.
+//
+// The struct is ALWAYS sent, never elided on all-zeroes, and that is the point of the optional field
+// on the other side of the wire. `reportsReceived: 0` is a fact about the ENDPOINT — it sends no
+// RTCP — and is different from the field being absent, which is what a media plane with no RTCP at
+// all produces. Dropping the object when every number is zero would collapse those two into one.
+func qualityOf(quality rtp.QualityStats) contract.MediaSessionEndedQuality {
+	return contract.MediaSessionEndedQuality{
+		InboundJitterMs:      quality.InboundJitterMs,
+		ReportedLossFraction: quality.ReportedLossFraction,
+		ReportedLossTotal:    int(quality.ReportedLossTotal),
+		ReportedJitterMs:     quality.ReportedJitterMs,
+		RoundTripMs:          quality.RoundTripMs,
+		ReportsReceived:      int(quality.ReportsReceived),
+		ReportsSent:          int(quality.ReportsSent),
+		Malformed:            int(quality.Malformed),
+		LastReportUnixMs:     int(quality.LastReportUnixMs),
+	}
 }
 
 // RTPTimedOut publishes `session.rtp-timeout`.

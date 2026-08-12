@@ -22,10 +22,10 @@ import type { EventFamily } from "@optimiq-voice/events/subjects";
  * `type`, with the organization taken from the delivered subject and compared against the
  * subscription's own tenant by the dispatcher. A selector is a filter on WHAT, never on WHOSE.
  *
- * ## Why these four families and not the other four
+ * ## Why these four families and not the other six
  *
  * `call`, `queue`, `voicemail` and `cdr` are the ones an integrator has a use for: a screen-pop, a
- * wallboard, a missed-message alert, a billing export. The four that are absent are absent for
+ * wallboard, a missed-message alert, a billing export. The six that are absent are absent for
  * reasons rather than for effort:
  *
  * - `media` is the RTP plane's own lifecycle (`apps/mediad` session ended, playback finished). It
@@ -35,10 +35,28 @@ import type { EventFamily } from "@optimiq-voice/events/subjects";
  *   spine rather than a fact about a call. A tenant that wants "is this phone online" has the
  *   live channel and the device list, both of which answer it without a webhook per REGISTER —
  *   and a phone re-registering every sixty seconds is a delivery rate nobody asked for.
+ * - `sipDialog` is `sip.evt.v1` — the SIP edge's own dialog lifecycle (`dialog.progressed`,
+ *   `dialog.answered`, `dialog.held`, `dialog.resumed`, `dialog.terminated`, `dialog.dtmf`). It is
+ *   the closest thing on this list to a family an integrator would ACCEPT if offered, and that is
+ *   precisely why it must not be: every one of those transitions already has a business-level
+ *   equivalent in `call` — `channel.ringing`, `channel.answered`, `channel.hangup` — and serving
+ *   both would deliver one phone call twice, in two vocabularies, to a consumer with no way to tell
+ *   that the two are the same call. Whichever one they built against would then be the contract, and
+ *   half of them would have built against SIP. The `media` argument applies on top: a dialog event is
+ *   keyed by a leg id and a `sipd` instance, so acting on it means acting on where our pods happen to
+ *   be. The signalling plane is an implementation of the call, not a second account of it.
  * - `audit` is the change ledger. It has a read API guarded by `audit.read`, and streaming it to an
  *   endpoint whose configuration is itself an audited change is a loop worth thinking about before
  *   opening.
  * - `provision` is device provisioning attempts, which carry credential-adjacent detail.
+ * - `trunk` is the one whose absence is closest to being wrong, so the reasoning is recorded in
+ *   full: a carrier going down is exactly the fact an integrator wants a callback for. But what
+ *   they want is an ALERT, and `trunk.status.changed` is a raw transition — a flapping trunk is a
+ *   POST per flap with no damping, no "still down" reminder and no resolution pairing, and
+ *   serving the raw event now would freeze that shape into the integrator contract before the
+ *   alerting semantics exist. The status still reaches tenants today through the trunk list's
+ *   persisted columns and the `trunks` live topic; when outage callbacks are built, they should
+ *   be built as alerts (damped, paired, resendable), not as this event with a URL on it.
  *
  * Adding one later is one entry in {@link WEBHOOK_FAMILIES} plus its stream in the dispatcher.
  */

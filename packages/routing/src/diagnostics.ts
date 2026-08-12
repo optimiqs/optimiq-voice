@@ -39,6 +39,10 @@ export const DIAGNOSTIC_CODES = [
 	"ivr-cycle",
 	/** A ring group has no enabled destinations, so every call to it dead-ends. */
 	"empty-ring-group",
+	/** A paging group has no reachable members, so an announcement to it is heard by nobody. */
+	"empty-paging-group",
+	/** A shared line has no reachable appearances, so a call to it rings nobody. */
+	"empty-shared-line",
 	/** An outbound route's trunk list is empty after unknown/disabled trunks are dropped. */
 	"empty-trunk-list",
 	/** An outbound route names a trunk id that is not in the snapshot. */
@@ -61,6 +65,52 @@ export const DIAGNOSTIC_CODES = [
 	"dangling-voicemail-greeting",
 	/** A mailbox's `pinHash` is not in the format `voicemail-pin.ts` defines, so it is not enforced. */
 	"invalid-pin-hash",
+
+	// --- the T2 admin block ----------------------------------------------------------------------
+	/** A destination alias points at another alias, and the chain loops or is too deep to expand. */
+	"alias-cycle",
+	/** An audio stream's URL is not an `http(s)` URL a media server may be asked to open. */
+	"invalid-stream-url",
+	/** A phrase has no playable steps, or one of its steps names another phrase. */
+	"invalid-phrase",
+	/** A phrase step points at a prompt that is not in the snapshot. */
+	"dangling-phrase-step",
+	/** A translation rule's regex does not compile, or its replacement could emit non-dialable text. */
+	"invalid-translation-rule",
+	/** A route or trunk names a translation ruleset that is not in the snapshot, or is disabled. */
+	"dangling-translation-ruleset",
+	/** An outbound route names a PIN set that is not in the snapshot, is disabled, or has no code. */
+	"unusable-pin-set",
+	/** A speed-dial code is not dialable, or collides with a feature code or an internal number. */
+	"conflicting-speed-dial",
+	/** A directory would offer nobody: no extension has a recorded name to speak. */
+	"empty-directory",
+	/** Two people in a directory spell to the same digits, so a caller cannot tell them apart. */
+	"directory-name-collision",
+	/** An extension is absent from a directory because its mailbox has no recorded name. */
+	"directory-entry-skipped",
+
+	// --- the contact-centre block ---------------------------------------------------------------
+	/**
+	 * A `queue` destination carried a caller priority that is not a whole number in range.
+	 *
+	 * A warning and not an error, because the consequence is a caller who waits their turn — the
+	 * queue working normally — whereas refusing the compile would take every unrelated route in the
+	 * tenant down with it over one mistyped form field.
+	 */
+	"invalid-queue-priority",
+	/** A queue has an exit key and no exit destination, so pressing it hangs the caller up. */
+	"queue-exit-key-without-destination",
+
+	// --- organization quotas ----------------------------------------------------------------------
+	/**
+	 * An organization limit is not a number the engine can enforce, so it was not applied.
+	 *
+	 * A warning and not an error, for the reason `invalid-queue-priority` is: the artifact is still
+	 * routable without the ceiling, and refusing the compile would take every call in the tenant down
+	 * to report a quota nobody is currently hitting.
+	 */
+	"invalid-org-limit",
 
 	// --- emergency dialing (Kari's Law / RAY BAUM'S Act) ----------------------------------------
 	/** A DID carries no `emergencyAddressId`, so it cannot serve as an ELIN for the organization. */
@@ -121,6 +171,8 @@ export const DIAGNOSTIC_CODES = [
 	"time-condition-closed",
 	/** The dialed string matched the emergency table; every configurable gate was bypassed. */
 	"emergency-call",
+	/** A translation ruleset rewrote a number, or would have and was refused for over-running. */
+	"number-translated",
 ] as const;
 
 export type DiagnosticCode = (typeof DIAGNOSTIC_CODES)[number];

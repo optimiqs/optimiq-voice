@@ -116,6 +116,46 @@ export class FakeMediadTransport implements MediadTransport {
 					sessionId: "leg-a",
 					instanceId: "mediad-fake",
 				};
+			case RPC_SUBJECTS.mediaMuteSession:
+				// Additive, exactly as the real one is: the reply carries the state AFTER the command,
+				// and a fake that echoed the request back would let a caller that derived its answer
+				// from the request pass a test the real responder would fail.
+				return {
+					ok: true,
+					sessionId: request["sessionId"],
+					mutedIn:
+						request["unmute"] !== true &&
+						(request["direction"] === "in" || request["direction"] === "both"),
+					mutedOut:
+						request["unmute"] !== true &&
+						(request["direction"] === "out" || request["direction"] === "both"),
+					instanceId: "mediad-fake",
+				};
+			case RPC_SUBJECTS.mediaHoldSession:
+				return {
+					ok: true,
+					sessionId: request["sessionId"],
+					held: request["unhold"] !== true,
+					...(request["musicRef"] === undefined ? {} : { musicRef: request["musicRef"] }),
+					instanceId: "mediad-fake",
+				};
+			case RPC_SUBJECTS.mediaTapSession:
+				return {
+					ok: true,
+					tapId: request["tapId"],
+					// The room mediad actually used, which on a converted two-party call is the BRIDGE's
+					// own id rather than one the caller minted — the case the adapter has to carry.
+					bridgeId: "converted-bridge",
+					sessionIds: [request["targetSessionId"], request["tapSessionId"]],
+					instanceId: "mediad-fake",
+				};
+			case RPC_SUBJECTS.mediaUntapSession:
+				return {
+					ok: true,
+					tapId: request["tapId"],
+					untapped: true,
+					instanceId: "mediad-fake",
+				};
 			case RPC_SUBJECTS.mediaReleaseSession:
 				return {
 					ok: true,

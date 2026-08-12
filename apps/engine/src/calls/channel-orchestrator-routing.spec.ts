@@ -19,9 +19,14 @@ import type { CallEventPublisher } from "../nats/call-event-publisher.service";
 import type { JetStreamService } from "../nats/jetstream.service";
 import type { OriginateCallPath, OriginateService } from "../nats/originate.service";
 import type { ParkHandoffService } from "../nats/park-handoff.service";
+import type { SipInviteCallPath, SipInviteService } from "../nats/sip-invite.service";
 import type { SipTransferCallPath, SipTransferService } from "../nats/sip-transfer.service";
 import type { DidIndexSource } from "../routing/did-index.source";
+import type { ExtensionFeatureRpcPort } from "../routing/extension-feature.source";
+import type { LastCallerRpcSource } from "../routing/last-caller.source";
 import type { RoutingArtifactSource } from "../routing/routing-artifact.source";
+import type { SupervisorAuthzRpcPort } from "../routing/supervisor-authz.source";
+import type { VoicemailGreetingRpcPort } from "../routing/voicemail-greeting.source";
 import type { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
 import type { ControlledLeg } from "./call-control";
 import type { CallEventOf, CdrLegWriteEnvelope, SipTransferRequest } from "@optimiq-voice/events";
@@ -48,6 +53,45 @@ const NO_DID_INDEX = {
 const NO_MAILBOX = {
 	list: async () => ({ found: false, messages: [], reason: "no responder in this spec" }),
 } as unknown as VoicemailMailboxRpcSource;
+
+/**
+ * Feature-code seams that refuse.
+ *
+ * These specs are about the orchestrator's own wiring, not about `*72` or `*69` — those live in
+ * `routing/plan-walker-features.spec.ts`, where the walker's ports are faked directly. Refusing
+ * here keeps a star code dialled by accident from reaching a broker that is not running.
+ */
+const NO_FEATURES = {
+	apply: async () => ({ applied: false, enabled: false, reason: "no responder in this spec" }),
+} as unknown as ExtensionFeatureRpcPort;
+
+const NO_LAST_CALLER = {
+	lookup: async () => ({ found: false, reason: "no responder in this spec" }),
+} as unknown as LastCallerRpcSource;
+
+/**
+ * A greeting sink that refuses, on the same terms as the two above it.
+ *
+ * `*99` is specced in `routing/plan-walker-features.spec.ts` against a fake port. A throw here is
+ * what a walk with no responder sees, and it keeps a star code dialled by accident in one of these
+ * specs from reaching a broker that is not running.
+ */
+const NO_GREETINGS = {
+	greetingRecorded: async (): Promise<void> => {
+		throw new Error("no responder in this spec");
+	},
+} as unknown as VoicemailGreetingRpcPort;
+
+/**
+ * A supervision gate that DENIES, which is the only safe default for a fake.
+ *
+ * The one port in the engine that must fail closed: `*0` is specced in
+ * `routing/plan-walker-features.spec.ts` against a fake that answers both ways, and an orchestrator
+ * spec that accidentally dialled it must not discover a tap. See `supervisor-authz.source.ts`.
+ */
+const NO_SUPERVISION = {
+	authorize: async () => ({ allowed: false, reason: "no responder in this spec" }),
+} as unknown as SupervisorAuthzRpcPort;
 
 /**
  * A park-handoff seam that answers nothing.
@@ -114,6 +158,35 @@ function fakeOriginate(): {
 		attached: () => {
 			if (attached === undefined) {
 				throw new Error("the orchestrator attached no originate call path");
+			}
+			return attached;
+		},
+	};
+}
+
+/**
+ * A sip-invite responder that keeps the call path instead of serving it.
+ *
+ * The same arrangement as {@link fakeOriginate} above. The broker half — framing, the toll-fraud
+ * refusal, the Replaces gate — is proven in `nats/sip-invite.service.spec.ts` with a fake call path;
+ * this is the other side of the seam, and having it here is what lets a spec admit a call the way
+ * `apps/sipd` does.
+ */
+function fakeSipInvite(): {
+	readonly service: SipInviteService;
+	readonly attached: () => SipInviteCallPath;
+} {
+	let attached: SipInviteCallPath | undefined;
+	const service = {
+		attach: (callPath: SipInviteCallPath) => {
+			attached = callPath;
+		},
+	} as unknown as SipInviteService;
+	return {
+		service,
+		attached: () => {
+			if (attached === undefined) {
+				throw new Error("the orchestrator attached no sip invite call path");
 			}
 			return attached;
 		},
@@ -319,6 +392,7 @@ function harness(options: HarnessOptions = {}) {
 
 	const sipTransfer = fakeSipTransfer();
 	const originate = fakeOriginate();
+	const sipInvite = fakeSipInvite();
 
 	const orchestrator = new ChannelOrchestrator(
 		env,
@@ -331,6 +405,10 @@ function harness(options: HarnessOptions = {}) {
 		// No mailbox responder in a spec, which is also the production state until the API side
 		// lands: a `*97` announces the mailbox as unavailable rather than as empty.
 		(options.mailbox ?? NO_MAILBOX) as VoicemailMailboxRpcSource,
+		NO_FEATURES,
+		NO_LAST_CALLER,
+		NO_GREETINGS,
+		NO_SUPERVISION,
 		(options.didIndex ?? NO_DID_INDEX) as DidIndexSource,
 		signals,
 		new ConferenceRegistry(),
@@ -340,6 +418,7 @@ function harness(options: HarnessOptions = {}) {
 		NO_PARK_HANDOFF,
 		sipTransfer.service,
 		originate.service,
+		sipInvite.service,
 	);
 
 	holder.orchestrator = orchestrator;
@@ -680,6 +759,97 @@ describe("drain with routing on", () => {
 		const h = harness({ artifact: artifactWith(TERMINALS, "hangup:NORMAL_CLEARING") });
 		await arrive(h);
 		expect(h.orchestrator.activeWalkCount).toBe(0);
+	});
+});
+
+// =================================================================================================
+// The organization's simultaneous-call ceiling
+// =================================================================================================
+
+/**
+ * `org_limit.max_concurrent_calls`, enforced at admission.
+ *
+ * The column existed, was writable, was rendered on a page, and was enforced by nothing. What these
+ * specs pin is the two decisions that make the gate correct rather than merely present:
+ *
+ * 1. **A refused call consumes nothing.** No KV claim, no `channel.created`, no registry entry. Any
+ *    one of those would make the refusal itself occupy a slot, so an organization at its ceiling
+ *    would ratchet downwards with every call it turned away.
+ * 2. **`SWITCH_CONGESTION`, not `NORMAL_TEMPORARY_FAILURE`.** The drain uses the latter precisely so
+ *    a carrier fails the call over to another instance, which is exactly wrong here: every other
+ *    instance is subject to the same quota and would refuse it too.
+ */
+describe("the organization's simultaneous-call ceiling", () => {
+	function cappedArtifact(maxConcurrentCalls: number): RoutingArtifact {
+		const base = artifactWith(TERMINALS, "hangup:NORMAL_CLEARING");
+		return { ...base, settings: { ...base.settings, maxConcurrentCalls } } as RoutingArtifact;
+	}
+
+	/** A second arrival under a ceiling of one, with the first leg still live. */
+	async function secondArrival(artifact: RoutingArtifact) {
+		const h = harness({ artifact });
+		// The first call is admitted and left UP: no `ChannelDestroyed`, so it is still occupying a
+		// slot when the second arrives. A terminal plan would hang it up and free the slot again.
+		await h.orchestrator.handleEvent(
+			mediaEvent("StasisStart", { channel: channel({ id: "1754400000.1" }), args: [] }),
+		);
+		await h.orchestrator.awaitWalks();
+		const before = h.media.calls.length;
+		const publishedBefore = h.published.length;
+
+		await h.orchestrator.handleEvent(
+			mediaEvent("StasisStart", { channel: channel({ id: "1754400000.2" }), args: [] }),
+		);
+		await h.orchestrator.awaitWalks();
+		return { h, before, publishedBefore };
+	}
+
+	it("admits every call when the tenant has no ceiling", async () => {
+		const h = harness({ artifact: artifactWith(TERMINALS, "hangup:NORMAL_CLEARING") });
+		await arrive(h);
+
+		expect(h.published.map((event) => event.type)).toContain("channel.created");
+	});
+
+	it("refuses the call over the cap with a cause that says congestion, not failover", async () => {
+		const { h, before } = await secondArrival(cappedArtifact(1));
+
+		expect(h.media.calls.slice(before)).toEqual([
+			{ method: "hangup", args: ["1754400000.2", "SWITCH_CONGESTION"] },
+		]);
+	});
+
+	/** The half that stops a full tenant ratcheting downwards on every call it turns away. */
+	it("publishes nothing and claims nothing for a call it refused", async () => {
+		const { h, publishedBefore } = await secondArrival(cappedArtifact(1));
+
+		expect(h.published.slice(publishedBefore)).toEqual([]);
+		expect(h.kv.has("1754400000.2")).toBe(false);
+	});
+
+	/** At one of one the SECOND call is the one over the line — the `>=` the API's counter uses. */
+	it("admits up to the ceiling and refuses only past it", async () => {
+		const { h, before } = await secondArrival(cappedArtifact(2));
+
+		expect(h.media.calls.slice(before)).not.toContainEqual({
+			method: "hangup",
+			args: ["1754400000.2", "SWITCH_CONGESTION"],
+		});
+	});
+
+	/**
+	 * A quota this process could not read must not become an outage. A tenant whose artifact has not
+	 * compiled yet is a tenant with no ceiling, which is what they had before this gate existed.
+	 */
+	it("admits when there is no artifact to read a ceiling from", async () => {
+		const h = harness();
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
+		await h.orchestrator.awaitWalks();
+
+		expect(h.media.calls).not.toContainEqual({
+			method: "hangup",
+			args: [ARI_CHANNEL, "SWITCH_CONGESTION"],
+		});
 	});
 });
 

@@ -6,6 +6,11 @@ import { MissingActiveOrganizationError } from "@optimiq-voice/auth";
 import { makeTestModuleRuntime } from "@optimiq-voice/effect-runtime";
 import { ExtensionsService } from "../../src/pbx/extensions/extensions.service";
 import { IvrMenuOptionsService } from "../../src/pbx/ivr-menus/ivr-menus.service";
+import { OrgLimitsService } from "../../src/pbx/org-limits/org-limits.service";
+import {
+	PagingGroupMembersService,
+	PagingGroupsService,
+} from "../../src/pbx/paging-groups/paging-groups.service";
 import {
 	PbxEntityNotFoundFailure,
 	PbxEntityReferencedFailure,
@@ -83,10 +88,23 @@ function fakeRuntime(overrides: Partial<PbxRepositoryInterface>): {
 	return { runtime: makeTestModuleRuntime(PbxRepository, layer), calls };
 }
 
+/**
+ * An organization with no quotas.
+ *
+ * These specs are about the generic service's plumbing — the tenant argument, the resource
+ * descriptor, the actor — and `ExtensionsService` is the resource they happen to use. Its create
+ * path now asks about the extension quota first, so it needs one; an unlimited organization is what
+ * every tenant is until somebody sets a ceiling, and it keeps the quota out of assertions that are
+ * not about it. `orgLimits.test.ts` is where the enforcement itself is tested.
+ */
+const NO_LIMITS = {
+	assertMayCreate: async () => undefined,
+} as unknown as OrgLimitsService;
+
 describe("PbxResourceService", () => {
 	it("passes the session's organization as the repository's first argument", async () => {
 		const { runtime, calls } = fakeRuntime({});
-		const service = new ExtensionsService(runtime);
+		const service = new ExtensionsService(runtime, NO_LIMITS);
 		await service.list(sessionFor(ORGANIZATION_ID), { page: 1, limit: 20 } as never);
 		expect(calls[0]?.method).to.equal("list");
 		expect(calls[0]?.args[0]).to.equal(ORGANIZATION_ID);
@@ -94,7 +112,7 @@ describe("PbxResourceService", () => {
 
 	it("passes its own resource descriptor, not one the caller chose", async () => {
 		const { runtime, calls } = fakeRuntime({});
-		await new ExtensionsService(runtime).get(sessionFor(ORGANIZATION_ID), "abc");
+		await new ExtensionsService(runtime, NO_LIMITS).get(sessionFor(ORGANIZATION_ID), "abc");
 		const resource = calls[0]?.args[1] as { kind: string; tableName: string };
 		expect(resource.kind).to.equal("extension");
 		expect(resource.tableName).to.equal("extension");
@@ -102,7 +120,7 @@ describe("PbxResourceService", () => {
 
 	it("refuses to act on a session with no active organization", async () => {
 		const { runtime, calls } = fakeRuntime({});
-		const service = new ExtensionsService(runtime);
+		const service = new ExtensionsService(runtime, NO_LIMITS);
 		let thrown: unknown;
 		try {
 			await service.list(sessionFor(null), { page: 1, limit: 20 } as never);
@@ -124,10 +142,13 @@ describe("PbxResourceService", () => {
 					totalPages: 3,
 				})) as never,
 		});
-		const result = await new ExtensionsService(runtime).list(sessionFor(ORGANIZATION_ID), {
-			page: 2,
-			limit: 20,
-		} as never);
+		const result = await new ExtensionsService(runtime, NO_LIMITS).list(
+			sessionFor(ORGANIZATION_ID),
+			{
+				page: 2,
+				limit: 20,
+			} as never,
+		);
 		expect(result).to.deep.equal({
 			data: [{ id: "a" }],
 			total: 41,
@@ -139,7 +160,10 @@ describe("PbxResourceService", () => {
 
 	it("wraps a single row as { data }", async () => {
 		const { runtime } = fakeRuntime({});
-		const result = await new ExtensionsService(runtime).get(sessionFor(ORGANIZATION_ID), "abc");
+		const result = await new ExtensionsService(runtime, NO_LIMITS).get(
+			sessionFor(ORGANIZATION_ID),
+			"abc",
+		);
 		expect(result).to.deep.equal({ data: { id: "row" } });
 	});
 
@@ -159,7 +183,10 @@ describe("PbxResourceService", () => {
 					],
 				})) as never,
 		});
-		const result = await new ExtensionsService(runtime).create(sessionFor(ORGANIZATION_ID), {});
+		const result = await new ExtensionsService(runtime, NO_LIMITS).create(
+			sessionFor(ORGANIZATION_ID),
+			{},
+		);
 		expect(result.warnings).to.have.length(1);
 		expect(result.warnings[0]?.code).to.equal("empty-ring-group");
 		expect(result.warnings[0]?.field).to.equal("destinations");
@@ -167,7 +194,7 @@ describe("PbxResourceService", () => {
 
 	it("always returns a warnings array, even when there is nothing to say", async () => {
 		const { runtime } = fakeRuntime({});
-		const result = await new ExtensionsService(runtime).update(
+		const result = await new ExtensionsService(runtime, NO_LIMITS).update(
 			sessionFor(ORGANIZATION_ID),
 			"id",
 			{},
@@ -182,7 +209,7 @@ describe("PbxResourceService", () => {
 		});
 		let thrown: unknown;
 		try {
-			await new ExtensionsService(runtime).get(sessionFor(ORGANIZATION_ID), "x");
+			await new ExtensionsService(runtime, NO_LIMITS).get(sessionFor(ORGANIZATION_ID), "x");
 		} catch (error) {
 			thrown = error;
 		}
@@ -208,7 +235,7 @@ describe("PbxResourceService", () => {
 		});
 		let thrown: HttpException | undefined;
 		try {
-			await new ExtensionsService(runtime).create(sessionFor(ORGANIZATION_ID), {});
+			await new ExtensionsService(runtime, NO_LIMITS).create(sessionFor(ORGANIZATION_ID), {});
 		} catch (error) {
 			thrown = error as HttpException;
 		}
@@ -232,7 +259,7 @@ describe("PbxResourceService", () => {
 		});
 		let thrown: HttpException | undefined;
 		try {
-			await new ExtensionsService(runtime).remove(sessionFor(ORGANIZATION_ID), "rg");
+			await new ExtensionsService(runtime, NO_LIMITS).remove(sessionFor(ORGANIZATION_ID), "rg");
 		} catch (error) {
 			thrown = error as HttpException;
 		}
@@ -245,7 +272,7 @@ describe("PbxResourceService", () => {
 		});
 		let thrown: HttpException | undefined;
 		try {
-			await new ExtensionsService(runtime).get(sessionFor(ORGANIZATION_ID), "x");
+			await new ExtensionsService(runtime, NO_LIMITS).get(sessionFor(ORGANIZATION_ID), "x");
 		} catch (error) {
 			thrown = error as HttpException;
 		}
@@ -284,5 +311,144 @@ describe("PbxChildResourceService", () => {
 		});
 		const result = await new IvrMenuOptionsService(runtime).list(sessionFor(ORGANIZATION_ID), "m");
 		expect(result).to.deep.equal({ data: [{ id: "a" }, { id: "b" }] });
+	});
+});
+
+/**
+ * Paging groups, over the same fake.
+ *
+ * The seam is the point here too, and one part of it is specific to this slice: a paging group is
+ * the entity a `*81` code may pin in `params.groupId`, a reference no foreign key expresses, so the
+ * 409 on a referenced delete is the only thing standing between deleting a group and a recompile
+ * failing on somebody else's unrelated save two hours later. That the failure carries the JSONB
+ * path as its field is what lets the admin UI say WHICH code is holding the group.
+ */
+describe("PagingGroupsService", () => {
+	it("passes the session's organization as the repository's first argument", async () => {
+		const { runtime, calls } = fakeRuntime({});
+		await new PagingGroupsService(runtime).list(sessionFor(ORGANIZATION_ID), {
+			page: 1,
+			limit: 20,
+		} as never);
+		expect(calls[0]?.method).to.equal("list");
+		expect(calls[0]?.args[0]).to.equal(ORGANIZATION_ID);
+	});
+
+	it("passes its own resource descriptor, not one the caller chose", async () => {
+		const { runtime, calls } = fakeRuntime({});
+		await new PagingGroupsService(runtime).get(sessionFor(ORGANIZATION_ID), "pg");
+		const resource = calls[0]?.args[1] as {
+			kind: string;
+			tableName: string;
+			destinationType: string;
+		};
+		expect(resource.kind).to.equal("paging-group");
+		expect(resource.tableName).to.equal("paging_group");
+		// Something has to be able to point at a group, or an IVR option could never reach one.
+		expect(resource.destinationType).to.equal("paging-group");
+	});
+
+	it("refuses to act on a session with no active organization", async () => {
+		const { runtime, calls } = fakeRuntime({});
+		let thrown: unknown;
+		try {
+			await new PagingGroupsService(runtime).list(sessionFor(null), {
+				page: 1,
+				limit: 20,
+			} as never);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).to.be.instanceOf(MissingActiveOrganizationError);
+		expect(calls).to.have.length(0);
+	});
+
+	it("returns the mutation envelope apps/web expects, warnings included", async () => {
+		const { runtime } = fakeRuntime({});
+		const result = await new PagingGroupsService(runtime).create(sessionFor(ORGANIZATION_ID), {
+			name: "Warehouse",
+		});
+		expect(result).to.deep.equal({ data: { id: "row" }, warnings: [] });
+	});
+
+	it("surfaces a delete refused by a feature code as a 409 naming params.groupId", async () => {
+		const { runtime } = fakeRuntime({
+			remove: (() =>
+				Effect.fail(
+					new PbxEntityReferencedFailure({
+						kind: "paging-group",
+						id: "pg",
+						references: [{ kind: "feature-code", id: "fc", name: "*81", field: "params.groupId" }],
+					}),
+				)) as never,
+		});
+		let thrown: HttpException | undefined;
+		try {
+			await new PagingGroupsService(runtime).remove(sessionFor(ORGANIZATION_ID), "pg");
+		} catch (error) {
+			thrown = error as HttpException;
+		}
+		expect(thrown?.getStatus()).to.equal(409);
+		const body = thrown?.getResponse() as { references?: readonly { field?: string }[] };
+		expect(body.references?.[0]?.field).to.equal("params.groupId");
+	});
+});
+
+describe("PagingGroupMembersService", () => {
+	it("threads the group id through every member operation", async () => {
+		const { runtime, calls } = fakeRuntime({});
+		const service = new PagingGroupMembersService(runtime);
+		const session = sessionFor(ORGANIZATION_ID);
+		await service.list(session, "group");
+		await service.create(session, "group", { extensionId: "ext", ordinal: 0 });
+		await service.update(session, "group", "member", { enabled: false });
+		await service.remove(session, "group", "member");
+
+		expect(calls.map((entry) => entry.method)).to.deep.equal([
+			"listChildren",
+			"createChild",
+			"updateChild",
+			"removeChild",
+		]);
+		for (const entry of calls) {
+			expect(entry.args[0]).to.equal(ORGANIZATION_ID);
+			expect(entry.args[2]).to.equal("group");
+		}
+	});
+
+	/**
+	 * The reorder returns the collection, not an acknowledgement.
+	 *
+	 * A page is fanned out in ordinal order, so the caller has to render what the server stored
+	 * rather than the optimistic order it sent — and `paging_group_member` has a unique
+	 * `(group, ordinal)` index, so a client that assumed its own order took hold would be wrong in
+	 * exactly the case that matters: the one where the write was rejected.
+	 */
+	it("hands back the reordered collection", async () => {
+		// Recorded in the override rather than read off `calls`: an override replaces the recording
+		// stub, so the arguments have to be captured by whoever replaced it.
+		let received: readonly unknown[] = [];
+		const { runtime } = fakeRuntime({
+			reorderChildren: ((...args: unknown[]) => {
+				received = args;
+				return Effect.succeed({
+					row: [
+						{ id: "b", ordinal: 0 },
+						{ id: "a", ordinal: 1 },
+					],
+					warnings: [],
+				});
+			}) as never,
+		});
+		const result = await new PagingGroupMembersService(runtime).reorder(
+			sessionFor(ORGANIZATION_ID),
+			"group",
+			["b", "a"],
+		);
+		expect(received[0]).to.equal(ORGANIZATION_ID);
+		expect(received[2]).to.equal("group");
+		expect(received[3]).to.deep.equal(["b", "a"]);
+		expect(result.data.map((row) => row.id)).to.deep.equal(["b", "a"]);
+		expect(result.warnings).to.deep.equal([]);
 	});
 });

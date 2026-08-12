@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/netip"
@@ -78,6 +79,54 @@ type stubSessions struct {
 	recordingStops  []string
 	recording       map[string]string
 	tenancy         map[string][2]string
+
+	// Rung 5's renegotiation record and rung 6's tap pair.
+	directions []directionCall
+	tapErr     error
+	taps       []rtp.TapOptions
+	untaps     []string
+	tapped     map[string]string
+
+	// Rung 5's state pair, reaching the wire. `muted` is a pair of flags per session because a mute
+	// is ADDITIVE and a stub that replaced them would let a handler bug pass: the whole reason the
+	// handler reads the state back is that it cannot derive it from the request.
+	muteErr    error
+	mutes      []muteCall
+	muted      map[string][2]bool
+	holdErr    error
+	holds      []holdCall
+	unholds    []string
+	held       map[string]string
+	holdActive map[string]bool
+
+	// Rung 6's room, reached through `bridge-sessions` rather than only through a tap.
+	joinErr     error
+	joins       []joinCall
+	conferences map[string][]string
+	destroyed   []string
+}
+
+type muteCall struct {
+	sessionID string
+	direction rtp.MediaDirection
+	unmute    bool
+}
+
+type holdCall struct {
+	sessionID string
+	opts      rtp.HoldOptions
+}
+
+type joinCall struct {
+	conferenceID string
+	sessionID    string
+	opts         rtp.JoinOptions
+}
+
+type directionCall struct {
+	sessionID string
+	muteIn    bool
+	muteOut   bool
 }
 
 type dtmfCall struct {
@@ -110,6 +159,11 @@ func newStub() *stubSessions {
 		telephoneEventFor: make(map[string]uint8),
 		recording:         make(map[string]string),
 		tenancy:           make(map[string][2]string),
+		tapped:            make(map[string]string),
+		muted:             make(map[string][2]bool),
+		held:              make(map[string]string),
+		holdActive:        make(map[string]bool),
+		conferences:       make(map[string][]string),
 		nextPort:          30000,
 	}
 }
@@ -127,9 +181,11 @@ func (s *stubSessions) Allocate(opts rtp.AllocateOptions) (rtp.Descriptor, error
 	s.nextPort += 2
 	s.live[opts.SessionID] = true
 
-	audio := opts.AudioPayloadType
+	payloadType := opts.AudioPayloadType
+	format := opts.Format
 	if s.audioForce != 0 {
-		audio = s.audioForce
+		payloadType = s.audioForce
+		format = formatForPayloadType(payloadType)
 	}
 	mode := rtp.ModeRelay
 	if opts.Inactive {
@@ -142,9 +198,23 @@ func (s *stubSessions) Allocate(opts rtp.AllocateOptions) (rtp.Descriptor, error
 		RTCPPort:                  port + 1,
 		SSRC:                      0xfeedface,
 		Mode:                      mode,
-		AudioPayloadType:          audio,
+		AudioPayloadType:          payloadType,
+		Format:                    format,
 		TelephoneEventPayloadType: opts.TelephoneEventPayloadType,
 	}, nil
+}
+
+// formatForPayloadType is the stub's own version of what SDP negotiation would have decided, for the
+// tests that force a codec onto a leg without going near a socket.
+func formatForPayloadType(payloadType uint8) audio.Format {
+	switch payloadType {
+	case rtp.PayloadTypePCMA:
+		return audio.FormatALaw
+	case rtp.PayloadTypeG722:
+		return audio.FormatG722
+	default:
+		return audio.FormatULaw
+	}
 }
 
 func (s *stubSessions) Bridge(bridgeID, first, second string) error {
@@ -246,6 +316,171 @@ func (s *stubSessions) StopRecording(recordingRef string) (string, bool) {
 	return sessionID, true
 }
 
+// The rung 5 and rung 6 halves. `ApplyDirection` records what a renegotiation asked for so the
+// allocate tests can assert that a `sendonly` offer actually moved the gate rather than merely being
+// accepted; the tap pair stands in for the mixer the same way `Bridge` stands in for the relay.
+
+func (s *stubSessions) ApplyDirection(sessionID string, muteIn, muteOut bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.directions = append(s.directions, directionCall{sessionID, muteIn, muteOut})
+	if !s.live[sessionID] {
+		return rtp.ErrUnknownSession
+	}
+	return nil
+}
+
+func (s *stubSessions) Tap(opts rtp.TapOptions) (rtp.TapResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.taps = append(s.taps, opts)
+	if s.tapErr != nil {
+		return rtp.TapResult{}, s.tapErr
+	}
+	s.tapped[opts.TapID] = opts.TapSessionID
+	return rtp.TapResult{
+		ConferenceID: "conference-" + opts.TargetSessionID,
+		SessionIDs:   []string{opts.TargetSessionID, opts.TapSessionID},
+		Converted:    true,
+	}, nil
+}
+
+// The rung-5 state pair. `Mute` is ADDITIVE here exactly as the real one is, so a handler that
+// derived its reply from the request instead of reading the state back would fail these tests.
+func (s *stubSessions) Mute(sessionID string, direction rtp.MediaDirection) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mutes = append(s.mutes, muteCall{sessionID, direction, false})
+	if s.muteErr != nil {
+		return s.muteErr
+	}
+	if !s.live[sessionID] {
+		return fmt.Errorf("%w: %s", rtp.ErrUnknownSession, sessionID)
+	}
+	state := s.muted[sessionID]
+	if direction == rtp.DirectionIn || direction == rtp.DirectionBoth {
+		state[0] = true
+	}
+	if direction == rtp.DirectionOut || direction == rtp.DirectionBoth {
+		state[1] = true
+	}
+	s.muted[sessionID] = state
+	return nil
+}
+
+func (s *stubSessions) Unmute(sessionID string, direction rtp.MediaDirection) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mutes = append(s.mutes, muteCall{sessionID, direction, true})
+	if s.muteErr != nil {
+		return s.muteErr
+	}
+	if !s.live[sessionID] {
+		return fmt.Errorf("%w: %s", rtp.ErrUnknownSession, sessionID)
+	}
+	state := s.muted[sessionID]
+	if direction == rtp.DirectionIn || direction == rtp.DirectionBoth {
+		state[0] = false
+	}
+	if direction == rtp.DirectionOut || direction == rtp.DirectionBoth {
+		state[1] = false
+	}
+	s.muted[sessionID] = state
+	return nil
+}
+
+func (s *stubSessions) MuteState(sessionID string) (in, out, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.live[sessionID] {
+		return false, false, false
+	}
+	state := s.muted[sessionID]
+	return state[0], state[1], true
+}
+
+func (s *stubSessions) Hold(sessionID string, opts rtp.HoldOptions) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.holds = append(s.holds, holdCall{sessionID, opts})
+	if s.holdErr != nil {
+		return s.holdErr
+	}
+	if !s.live[sessionID] {
+		return fmt.Errorf("%w: %s", rtp.ErrUnknownSession, sessionID)
+	}
+	s.holdActive[sessionID] = true
+	// The music only "starts" when there are frames, which is what makes a silent hold — an empty
+	// clip, or a leg that has not sent a packet — visibly different in the reply.
+	if len(opts.MusicFrames) > 0 {
+		s.held[sessionID] = opts.MusicRef
+	}
+	return nil
+}
+
+func (s *stubSessions) Unhold(sessionID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.unholds = append(s.unholds, sessionID)
+	if s.holdErr != nil {
+		return false, s.holdErr
+	}
+	if !s.live[sessionID] {
+		return false, fmt.Errorf("%w: %s", rtp.ErrUnknownSession, sessionID)
+	}
+	was := s.holdActive[sessionID]
+	delete(s.holdActive, sessionID)
+	delete(s.held, sessionID)
+	return was, nil
+}
+
+func (s *stubSessions) HoldState(sessionID string) (bool, string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.live[sessionID] {
+		return false, "", false
+	}
+	return s.holdActive[sessionID], s.held[sessionID], true
+}
+
+func (s *stubSessions) JoinConference(
+	conferenceID, sessionID string,
+	opts rtp.JoinOptions,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.joins = append(s.joins, joinCall{conferenceID, sessionID, opts})
+	if s.joinErr != nil {
+		return s.joinErr
+	}
+	if !s.live[sessionID] {
+		return fmt.Errorf("%w: %s", rtp.ErrUnknownSession, sessionID)
+	}
+	s.conferences[conferenceID] = append(s.conferences[conferenceID], sessionID)
+	return nil
+}
+
+func (s *stubSessions) DestroyConference(conferenceID string) ([]string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.destroyed = append(s.destroyed, conferenceID)
+	members, ok := s.conferences[conferenceID]
+	delete(s.conferences, conferenceID)
+	return members, ok
+}
+
+func (s *stubSessions) Untap(tapID string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.untaps = append(s.untaps, tapID)
+	sessionID, ok := s.tapped[tapID]
+	if !ok {
+		return "", false
+	}
+	delete(s.tapped, tapID)
+	return sessionID, true
+}
+
 func (s *stubSessions) TelephoneEventPayloadType(sessionID string) (uint8, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -286,6 +521,18 @@ func (s *stubSessions) playbackCalls() []playbackCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]playbackCall(nil), s.playbackStarts...)
+}
+
+func (s *stubSessions) tapCalls() []rtp.TapOptions {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]rtp.TapOptions(nil), s.taps...)
+}
+
+func (s *stubSessions) directionCalls() []directionCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]directionCall(nil), s.directions...)
 }
 
 func (s *stubSessions) allocateCalls() []rtp.AllocateOptions {
@@ -512,10 +759,13 @@ func TestAllocateAnInactiveLeg(t *testing.T) {
 }
 
 func TestAllocateRefusals(t *testing.T) {
-	noG711 := strings.NewReplacer(
-		"m=audio 41000 RTP/AVP 0 8 101", "m=audio 41000 RTP/AVP 9 111",
-		"a=rtpmap:0 PCMU/8000", "a=rtpmap:9 G722/8000",
-		"a=rtpmap:8 PCMA/8000", "a=rtpmap:111 opus/48000/2",
+	// RUNG 7 CHANGED WHAT THIS OFFER HAS TO CONTAIN. It used to be G.722 plus Opus, because those
+	// were the two codecs mediad could not carry; both are negotiable now, so the "no common codec"
+	// case needs codecs this build genuinely has no answer for.
+	noCommonCodec := strings.NewReplacer(
+		"m=audio 41000 RTP/AVP 0 8 101", "m=audio 41000 RTP/AVP 96 97",
+		"a=rtpmap:0 PCMU/8000", "a=rtpmap:96 AMR-WB/16000",
+		"a=rtpmap:8 PCMA/8000", "a=rtpmap:97 iLBC/8000",
 	).Replace(offerBody)
 
 	cases := []struct {
@@ -560,14 +810,7 @@ func TestAllocateRefusals(t *testing.T) {
 			// A perfectly valid offer this media plane cannot serve. The engine's recovery is to
 			// route the leg to Asterisk, not to fix the bytes and retry — a different reason code.
 			name:       "no common codec",
-			mutate:     func(rq *contract.MediaAllocateSessionRequest) { rq.SDPOffer = noG711 },
-			wantReason: control.ReasonNotSupported,
-		},
-		{
-			// Hold is rung 5. Answering sendrecv to a sendonly request would put a held caller back
-			// into the conversation, so it is refused by name rather than downgraded.
-			name:       "hold is not supported yet",
-			mutate:     func(rq *contract.MediaAllocateSessionRequest) { rq.Direction = "sendonly" },
+			mutate:     func(rq *contract.MediaAllocateSessionRequest) { rq.SDPOffer = noCommonCodec },
 			wantReason: control.ReasonNotSupported,
 		},
 		{
@@ -697,23 +940,41 @@ func TestBridgeRelaysTwoSessionsAndNotesItInTheDirectory(t *testing.T) {
 }
 
 func TestBridgeRefusals(t *testing.T) {
-	t.Run("three sessions is a conference, not a bridge", func(t *testing.T) {
+	// THREE SESSIONS USED TO BE REFUSED HERE, naming rung 6. Rung 6 arrived, and the case that
+	// asserted the refusal now asserts the capability — see TestBridgeSeatsThreeSessionsInARoom in
+	// rung567_test.go. What survives is the CEILING: a room this mixer cannot hold is still a
+	// not-supported refusal that names the reason, because the engine's recovery for it is the one
+	// every capability gap gets.
+	t.Run("a room larger than the mixer holds", func(t *testing.T) {
 		r := newRig(t)
+		ids := make([]string, 9)
+		for i := range ids {
+			ids[i] = "leg-" + string(rune('a'+i))
+		}
 		response := decodeBridge(t, r.server.HandleBridgeSessions(
-			mustJSON(t, contract.MediaBridgeSessionsRequest{
-				BridgeID:   "bridge-1",
-				SessionIDs: []string{"a", "b", "c"},
-			})))
+			mustJSON(t, contract.MediaBridgeSessionsRequest{BridgeID: "bridge-1", SessionIDs: ids})))
 		if response.Ok {
-			t.Fatal("a three-way bridge was accepted")
+			t.Fatal("a nine-member room was accepted")
 		}
 		if response.Reason == nil || string(*response.Reason) != control.ReasonNotSupported {
 			t.Errorf("reason = %v, want not_supported", response.Reason)
 		}
-		if response.Error == nil || !strings.Contains(*response.Error, "rung 6") {
-			// A not-supported refusal must name the capability, so the reader knows whether to wait
+		if response.Error == nil || !strings.Contains(*response.Error, "running-sum") {
+			// A not-supported refusal must name what is missing, so the reader knows whether to wait
 			// for it or design around it.
 			t.Errorf("the refusal does not name the missing capability: %v", response.Error)
+		}
+	})
+
+	t.Run("fewer than two is not a conversation", func(t *testing.T) {
+		r := newRig(t)
+		response := decodeBridge(t, r.server.HandleBridgeSessions(
+			mustJSON(t, contract.MediaBridgeSessionsRequest{
+				BridgeID:   "bridge-1",
+				SessionIDs: []string{"a"},
+			})))
+		if response.Ok || response.Reason == nil || string(*response.Reason) != control.ReasonBadRequest {
+			t.Errorf("a one-session bridge was not refused as bad_request: %+v", response)
 		}
 	})
 
@@ -930,4 +1191,36 @@ func TestSubscribeRequiresAConnection(t *testing.T) {
 	if _, err := r.server.Subscribe(nil, "mediad"); err == nil {
 		t.Error("Subscribe accepted a nil connection")
 	}
+}
+
+func (s *stubSessions) muteCalls() []muteCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]muteCall(nil), s.mutes...)
+}
+
+func (s *stubSessions) holdCalls() []holdCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]holdCall(nil), s.holds...)
+}
+
+func (s *stubSessions) joinCalls() []joinCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]joinCall(nil), s.joins...)
+}
+
+func (s *stubSessions) destroyedConferences() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.destroyed...)
+}
+
+// bridgeCallsMade is the two-party RELAY path's record. A room must not go down it: two members
+// relay byte for byte with no buffer and no decode, and three cannot.
+func (s *stubSessions) bridgeCallsMade() []bridgeCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]bridgeCall(nil), s.bridged...)
 }

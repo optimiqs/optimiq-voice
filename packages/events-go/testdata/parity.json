@@ -4,9 +4,11 @@
 	"subjectRoots": {
 		"call": "calls.evt.v1",
 		"registration": "sip.reg.v1",
+		"sipDialog": "sip.evt.v1",
 		"queue": "queue.evt.v1",
 		"voicemail": "voicemail.evt.v1",
 		"media": "media.evt.v1",
+		"trunk": "trunk.evt.v1",
 		"cdrLeg": "cdr.leg.v1",
 		"audit": "audit.evt.v1",
 		"provision": "provision.evt.v1"
@@ -15,8 +17,17 @@
 		"routingResolve": "rpc.routing.v1.resolve",
 		"authzCheck": "rpc.authz.v1.check",
 		"voicemailList": "rpc.voicemail.v1.list",
+		"pbxExtensionFeature": "rpc.pbx.v1.extension-feature",
+		"pbxLastCaller": "rpc.pbx.v1.last-caller",
+		"pbxFileGreeting": "rpc.pbx.v1.file-greeting",
 		"sipCredential": "rpc.sip.v1.credential",
 		"sipTransfer": "rpc.sip.v1.transfer",
+		"sipInvite": "rpc.sip.v1.invite",
+		"sipRing": "rpc.sip.v1.ring",
+		"sipAnswer": "rpc.sip.v1.answer",
+		"sipHangup": "rpc.sip.v1.hangup",
+		"sipReinvite": "rpc.sip.v1.reinvite",
+		"sipOriginate": "rpc.sip.v1.originate",
 		"mediaAllocateSession": "rpc.media.v1.allocate-session",
 		"mediaBridgeSessions": "rpc.media.v1.bridge-sessions",
 		"mediaUnbridgeSessions": "rpc.media.v1.unbridge-sessions",
@@ -26,8 +37,15 @@
 		"mediaSendDtmf": "rpc.media.v1.send-dtmf",
 		"mediaStartRecording": "rpc.media.v1.start-recording",
 		"mediaStopRecording": "rpc.media.v1.stop-recording",
+		"mediaTapSession": "rpc.media.v1.tap-session",
+		"mediaUntapSession": "rpc.media.v1.untap-session",
+		"mediaMuteSession": "rpc.media.v1.mute-session",
+		"mediaHoldSession": "rpc.media.v1.hold-session",
 		"engineOriginate": "rpc.engine.v1.originate",
-		"engineParkHandoff": "rpc.engine.v1.park-handoff"
+		"engineParkHandoff": "rpc.engine.v1.park-handoff",
+		"engineSessionVerb": "rpc.engine.v1.session-verb",
+		"engineConferenceControl": "rpc.engine.v1.conference-control",
+		"sessionAnnounce": "rpc.session.v1.announce"
 	},
 	"queueScopeAll": "_all",
 	"aorSubjectTokens": [
@@ -58,6 +76,32 @@
 		{
 			"aor": "sip:a@b",
 			"token": "45d0e5cfd8660c7beff53cde59993ebd"
+		}
+	],
+	"instanceSubjectTokens": [
+		{
+			"instanceId": "sipd",
+			"token": "sipd"
+		},
+		{
+			"instanceId": "sipd-2",
+			"token": "sipd-2"
+		},
+		{
+			"instanceId": "engine-7d9f4c-xk2lp",
+			"token": "engine-7d9f4c-xk2lp"
+		},
+		{
+			"instanceId": "  sipd  ",
+			"token": "sipd"
+		},
+		{
+			"instanceId": "sipd.eu-west.internal",
+			"token": "8a3ed32acf85ae4ef218ac5cb23944d5"
+		},
+		{
+			"instanceId": "host name with spaces",
+			"token": "81d85f6559bf928d3971848b0b668f62"
 		}
 	],
 	"didIndexTokens": [
@@ -120,6 +164,24 @@
 			"subject": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.7b81c6319a152fcef543d42203656b77.expired"
 		},
 		{
+			"builder": "sipDialog",
+			"args": [
+				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d",
+				"dialog.answered"
+			],
+			"subject": "sip.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d.dialog.answered"
+		},
+		{
+			"builder": "sipDialog",
+			"args": [
+				"01930a11-2233-7445-8899-aabbccddeeff",
+				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d",
+				"dialog.terminated"
+			],
+			"subject": "sip.evt.v1.01930a11-2233-7445-8899-aabbccddeeff.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d.dialog.terminated"
+		},
+		{
 			"builder": "queue",
 			"args": [
 				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -168,6 +230,15 @@
 				"session.rtp-timeout"
 			],
 			"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.session.rtp-timeout"
+		},
+		{
+			"builder": "trunk",
+			"args": [
+				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57",
+				"status.changed"
+			],
+			"subject": "trunk.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57.status.changed"
 		},
 		{
 			"builder": "cdrLeg",
@@ -232,6 +303,21 @@
 			"result": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.*.expired"
 		},
 		{
+			"filter": "allSipDialogs",
+			"args": [],
+			"result": "sip.evt.v1.>"
+		},
+		{
+			"filter": "sipDialogsInOrg",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
+			"result": "sip.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.>"
+		},
+		{
+			"filter": "sipDialog",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d"],
+			"result": "sip.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d.>"
+		},
+		{
 			"filter": "allQueues",
 			"args": [],
 			"result": "queue.evt.v1.>"
@@ -290,6 +376,21 @@
 			"filter": "mediaEventInOrg",
 			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "session.ended"],
 			"result": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.*.session.ended"
+		},
+		{
+			"filter": "allTrunks",
+			"args": [],
+			"result": "trunk.evt.v1.>"
+		},
+		{
+			"filter": "trunksInOrg",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
+			"result": "trunk.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.>"
+		},
+		{
+			"filter": "trunkStatusInOrg",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
+			"result": "trunk.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.*.status.changed"
 		},
 		{
 			"filter": "allCdrLegs",
@@ -376,6 +477,17 @@
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"sessionId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53",
 				"event": "session.rtp-timeout"
+			}
+		},
+		{
+			"subject": "trunk.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57.status.changed",
+			"parsed": {
+				"kind": "trunk",
+				"family": "trunk",
+				"version": "v1",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"trunkId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57",
+				"event": "status.changed"
 			}
 		},
 		{
@@ -564,9 +676,34 @@
 			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"
 		},
 		{
+			"builder": "queueWaiting",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"],
+			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"
+		},
+		{
 			"builder": "mediaSession",
 			"args": ["0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53"],
 			"key": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53"
+		},
+		{
+			"builder": "sipDialog",
+			"args": ["0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d"],
+			"key": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d"
+		},
+		{
+			"builder": "trunk",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57"],
+			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57"
+		},
+		{
+			"builder": "sipAcl",
+			"args": ["203.0.113.0/24"],
+			"key": "203-0-113-0-24"
+		},
+		{
+			"builder": "sipAcl",
+			"args": ["2001:db8::/32"],
+			"key": "2001-db8---32"
 		}
 	],
 	"streams": [
@@ -594,6 +731,20 @@
 			"maxAgeMs": 86400000,
 			"maxMsgs": -1,
 			"maxBytes": 1073741824,
+			"maxMsgsPerSubject": -1,
+			"duplicateWindowMs": 120000,
+			"numReplicas": 1
+		},
+		{
+			"name": "SIP",
+			"description": "SIP dialog lifecycle from apps/sipd (sipd-invite-design §3.3, §10.2).",
+			"subjects": ["sip.evt.v1.>"],
+			"retention": "limits",
+			"storage": "file",
+			"discard": "old",
+			"maxAgeMs": 604800000,
+			"maxMsgs": -1,
+			"maxBytes": 4294967296,
 			"maxMsgsPerSubject": -1,
 			"duplicateWindowMs": 120000,
 			"numReplicas": 1
@@ -634,6 +785,20 @@
 			"storage": "file",
 			"discard": "old",
 			"maxAgeMs": 172800000,
+			"maxMsgs": -1,
+			"maxBytes": 1073741824,
+			"maxMsgsPerSubject": -1,
+			"duplicateWindowMs": 120000,
+			"numReplicas": 1
+		},
+		{
+			"name": "TRUNKS",
+			"description": "Carrier trunk status transitions consumed durably by the pbx writer (audit 4.5).",
+			"subjects": ["trunk.evt.v1.>"],
+			"retention": "limits",
+			"storage": "file",
+			"discard": "old",
+			"maxAgeMs": 604800000,
 			"maxMsgs": -1,
 			"maxBytes": 1073741824,
 			"maxMsgsPerSubject": -1,
@@ -775,9 +940,59 @@
 			"numReplicas": 1
 		},
 		{
+			"name": "shared-line-state",
+			"description": "Shared-line seizure ownership across engine instances, taken under compare-and-set.",
+			"ttlMs": 900000,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 4096,
+			"maxBytes": 134217728,
+			"numReplicas": 1
+		},
+		{
 			"name": "media-sessions",
 			"description": "RTP session -> owning mediad instance, for per-instance command routing.",
 			"ttlMs": 21600000,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 4096,
+			"maxBytes": 134217728,
+			"numReplicas": 1
+		},
+		{
+			"name": "queue-waiting",
+			"description": "Queue -> the leased waiting line and abandoned-resume tombstones, under CAS.",
+			"ttlMs": 21600000,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 262144,
+			"maxBytes": 268435456,
+			"numReplicas": 1
+		},
+		{
+			"name": "sip-dialogs",
+			"description": "SIP dialog -> owning sipd instance, under a heartbeated lease, for reaping.",
+			"ttlMs": 21600000,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 4096,
+			"maxBytes": 134217728,
+			"numReplicas": 1
+		},
+		{
+			"name": "trunks",
+			"description": "Trunk -> its dialable SIP configuration, for the edge's outbound and registration.",
+			"ttlMs": 0,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 8192,
+			"maxBytes": 134217728,
+			"numReplicas": 1
+		},
+		{
+			"name": "sip-acl",
+			"description": "Source network -> tenant, scope and action, for the SIP edge's trunk admission.",
+			"ttlMs": 0,
 			"history": 1,
 			"storage": "file",
 			"maxValueSizeBytes": 4096,
@@ -802,7 +1017,9 @@
 			"wrap-up",
 			"on-break",
 			"unavailable"
-		]
+		],
+		"TapMode": ["eavesdrop", "whisper", "barge"],
+		"TapEndReason": ["supervisor-ended", "target-ended", "escalated", "failed"]
 	},
 	"eventVocabularies": {
 		"call": [
@@ -821,11 +1038,18 @@
 			"channel.destroyed",
 			"conference.joined",
 			"conference.left",
+			"conference.participant.updated",
+			"conference.locked",
+			"conference.unlocked",
 			"call.parked",
 			"call.unparked",
 			"call.transferred",
 			"call.picked-up",
-			"call.emergency.dialed"
+			"call.emergency.dialed",
+			"call.tap.started",
+			"call.tap.ended",
+			"call.paging.started",
+			"call.paging.ended"
 		],
 		"registration": ["registered", "unregistered", "expired"],
 		"queue": ["caller.joined", "caller.answered", "caller.abandoned", "agent.state"],
@@ -836,7 +1060,8 @@
 			"playback.finished",
 			"recording.finished",
 			"dtmf.received"
-		]
+		],
+		"trunk": ["status.changed"]
 	},
 	"eventTypes": [
 		{
@@ -916,6 +1141,21 @@
 		},
 		{
 			"family": "call",
+			"type": "conference.participant.updated",
+			"goType": "ConferenceParticipantUpdatedData"
+		},
+		{
+			"family": "call",
+			"type": "conference.locked",
+			"goType": "ConferenceLockedData"
+		},
+		{
+			"family": "call",
+			"type": "conference.unlocked",
+			"goType": "ConferenceUnlockedData"
+		},
+		{
+			"family": "call",
 			"type": "call.parked",
 			"goType": "CallParkedData"
 		},
@@ -940,6 +1180,26 @@
 			"goType": "CallEmergencyDialedData"
 		},
 		{
+			"family": "call",
+			"type": "call.tap.started",
+			"goType": "CallTapStartedData"
+		},
+		{
+			"family": "call",
+			"type": "call.tap.ended",
+			"goType": "CallTapEndedData"
+		},
+		{
+			"family": "call",
+			"type": "call.paging.started",
+			"goType": "CallPagingStartedData"
+		},
+		{
+			"family": "call",
+			"type": "call.paging.ended",
+			"goType": "CallPagingEndedData"
+		},
+		{
 			"family": "registration",
 			"type": "registered",
 			"goType": "RegistrationRegisteredData"
@@ -953,6 +1213,36 @@
 			"family": "registration",
 			"type": "expired",
 			"goType": "RegistrationExpiredData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.progressed",
+			"goType": "SIPDialogProgressedData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.answered",
+			"goType": "SIPDialogAnsweredData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.held",
+			"goType": "SIPDialogHeldData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.resumed",
+			"goType": "SIPDialogResumedData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.terminated",
+			"goType": "SIPDialogTerminatedData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.dtmf",
+			"goType": "SIPDialogDTMFData"
 		},
 		{
 			"family": "queue",
@@ -1008,6 +1298,11 @@
 			"family": "media",
 			"type": "dtmf.received",
 			"goType": "MediaDtmfReceivedData"
+		},
+		{
+			"family": "trunk",
+			"type": "status.changed",
+			"goType": "TrunkStatusChangedData"
 		},
 		{
 			"family": "cdr",
@@ -1121,10 +1416,92 @@
 			}
 		},
 		{
+			"name": "call.tap.started",
+			"goType": "CallTapStartedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0004",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.tap.started",
+				"type": "call.tap.started",
+				"source": "sipd",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b54",
+					"mode": "whisper",
+					"supervisorExtension": "1900",
+					"targetExtension": "1001",
+					"targetLegId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d",
+					"previousMode": "eavesdrop",
+					"supervisorCallId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b55"
+				}
+			}
+		},
+		{
+			"name": "call.tap.ended",
+			"goType": "CallTapEndedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0005",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.tap.ended",
+				"type": "call.tap.ended",
+				"source": "sipd",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b54",
+					"mode": "whisper",
+					"supervisorExtension": "1900",
+					"targetExtension": "1001",
+					"reason": "target-ended",
+					"durationMs": 42000
+				}
+			}
+		},
+		{
+			"name": "call.paging.started",
+			"goType": "CallPagingStartedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0006",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.paging.started",
+				"type": "call.paging.started",
+				"source": "sipd",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d",
+					"pagingGroupId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b56",
+					"pagingGroupName": "Warehouse",
+					"dialed": "*81300",
+					"pagerExtension": "1001",
+					"memberCount": 12,
+					"answeredCount": 10,
+					"oneWay": true
+				}
+			}
+		},
+		{
+			"name": "call.paging.ended",
+			"goType": "CallPagingEndedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0007",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.paging.ended",
+				"type": "call.paging.ended",
+				"source": "sipd",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d",
+					"pagingGroupId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b56",
+					"pagingGroupName": "Warehouse",
+					"durationMs": 9500,
+					"answeredCount": 10
+				}
+			}
+		},
+		{
 			"name": "registration.registered",
 			"goType": "RegistrationRegisteredData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0004",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0008",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.9c99510034b54c0217012ab2d10512d0.registered",
@@ -1147,7 +1524,7 @@
 			"name": "registration.unregistered",
 			"goType": "RegistrationUnregisteredData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0005",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0009",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.9c99510034b54c0217012ab2d10512d0.unregistered",
@@ -1166,7 +1543,7 @@
 			"name": "registration.expired",
 			"goType": "RegistrationExpiredData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0006",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000a",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "01930a11-2233-7445-8899-aabbccddeeff",
 				"subject": "sip.reg.v1.01930a11-2233-7445-8899-aabbccddeeff.b01d8d8fae1e7a2d85f57232951b4b2c.expired",
@@ -1185,7 +1562,7 @@
 			"name": "queue.caller.joined",
 			"goType": "QueueCallerJoinedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0007",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000b",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "queue.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e.caller.joined",
@@ -1204,7 +1581,7 @@
 			"name": "queue.agent.state",
 			"goType": "QueueAgentStateData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0008",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000c",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "queue.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293._all.agent.state",
@@ -1223,7 +1600,7 @@
 			"name": "voicemail.message.left",
 			"goType": "VoicemailMessageLeftData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0009",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000d",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51.message.left",
@@ -1249,7 +1626,7 @@
 			"name": "voicemail.mwi.updated",
 			"goType": "VoicemailMWIUpdatedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000a",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000e",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51.mwi.updated",
@@ -1268,7 +1645,7 @@
 			"name": "media.session.ended",
 			"goType": "MediaSessionEndedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000b",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000f",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.session.ended",
@@ -1291,7 +1668,7 @@
 			"name": "media.session.rtp-timeout",
 			"goType": "MediaSessionRTPTimeoutData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000c",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0010",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.session.rtp-timeout",
@@ -1310,10 +1687,28 @@
 			}
 		},
 		{
+			"name": "trunk.status.changed",
+			"goType": "TrunkStatusChangedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0011",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "trunk.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57.status.changed",
+				"type": "status.changed",
+				"source": "engine",
+				"data": {
+					"status": "down",
+					"reason": "Unreachable",
+					"latencyMs": 1240,
+					"endpoint": "carrier-a"
+				}
+			}
+		},
+		{
 			"name": "cdr.leg.write",
 			"goType": "CDRLegWriteData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000d",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0012",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "cdr.leg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -1352,7 +1747,7 @@
 			"name": "audit.recorded",
 			"goType": "AuditRecordedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000e",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0013",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "audit.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -1386,7 +1781,7 @@
 			"name": "provision.device.rejected",
 			"goType": "ProvisionDeviceRejectedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000f",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0014",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "provision.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",

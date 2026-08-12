@@ -1,0 +1,2 @@
+ALTER TABLE "sip_acl_entry" ADD COLUMN "trunk_id" uuid;--> statement-breakpoint
+ALTER TABLE "sip_acl_entry" ADD CONSTRAINT "sip_acl_entry_trunk_id_trunk_id_fkey" FOREIGN KEY ("trunk_id") REFERENCES "trunk"("id") ON DELETE CASCADE;

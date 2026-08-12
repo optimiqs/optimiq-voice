@@ -6,9 +6,11 @@
 	"subjectRoots": {
 		"call": "calls.evt.v1",
 		"registration": "sip.reg.v1",
+		"sipDialog": "sip.evt.v1",
 		"queue": "queue.evt.v1",
 		"voicemail": "voicemail.evt.v1",
 		"media": "media.evt.v1",
+		"trunk": "trunk.evt.v1",
 		"cdrLeg": "cdr.leg.v1",
 		"audit": "audit.evt.v1",
 		"provision": "provision.evt.v1"
@@ -121,6 +123,27 @@
 		},
 		{
 			"family": "call",
+			"type": "conference.participant.updated",
+			"subject": "calls.evt.v1.<orgId>.<callId>.conference.participant.updated",
+			"dataSchema": "events/call.conference.participant.updated.schema.json",
+			"goType": "ConferenceParticipantUpdatedData"
+		},
+		{
+			"family": "call",
+			"type": "conference.locked",
+			"subject": "calls.evt.v1.<orgId>.<callId>.conference.locked",
+			"dataSchema": "events/call.conference.locked.schema.json",
+			"goType": "ConferenceLockedData"
+		},
+		{
+			"family": "call",
+			"type": "conference.unlocked",
+			"subject": "calls.evt.v1.<orgId>.<callId>.conference.unlocked",
+			"dataSchema": "events/call.conference.unlocked.schema.json",
+			"goType": "ConferenceUnlockedData"
+		},
+		{
+			"family": "call",
 			"type": "call.parked",
 			"subject": "calls.evt.v1.<orgId>.<callId>.call.parked",
 			"dataSchema": "events/call.call.parked.schema.json",
@@ -155,6 +178,34 @@
 			"goType": "CallEmergencyDialedData"
 		},
 		{
+			"family": "call",
+			"type": "call.tap.started",
+			"subject": "calls.evt.v1.<orgId>.<callId>.call.tap.started",
+			"dataSchema": "events/call.call.tap.started.schema.json",
+			"goType": "CallTapStartedData"
+		},
+		{
+			"family": "call",
+			"type": "call.tap.ended",
+			"subject": "calls.evt.v1.<orgId>.<callId>.call.tap.ended",
+			"dataSchema": "events/call.call.tap.ended.schema.json",
+			"goType": "CallTapEndedData"
+		},
+		{
+			"family": "call",
+			"type": "call.paging.started",
+			"subject": "calls.evt.v1.<orgId>.<callId>.call.paging.started",
+			"dataSchema": "events/call.call.paging.started.schema.json",
+			"goType": "CallPagingStartedData"
+		},
+		{
+			"family": "call",
+			"type": "call.paging.ended",
+			"subject": "calls.evt.v1.<orgId>.<callId>.call.paging.ended",
+			"dataSchema": "events/call.call.paging.ended.schema.json",
+			"goType": "CallPagingEndedData"
+		},
+		{
 			"family": "registration",
 			"type": "registered",
 			"subject": "sip.reg.v1.<orgId>.<aorHash>.registered",
@@ -174,6 +225,48 @@
 			"subject": "sip.reg.v1.<orgId>.<aorHash>.expired",
 			"dataSchema": "events/registration.expired.schema.json",
 			"goType": "RegistrationExpiredData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.progressed",
+			"subject": "sip.evt.v1.<orgId>.<legId>.dialog.progressed",
+			"dataSchema": "events/sipDialog.dialog.progressed.schema.json",
+			"goType": "SIPDialogProgressedData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.answered",
+			"subject": "sip.evt.v1.<orgId>.<legId>.dialog.answered",
+			"dataSchema": "events/sipDialog.dialog.answered.schema.json",
+			"goType": "SIPDialogAnsweredData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.held",
+			"subject": "sip.evt.v1.<orgId>.<legId>.dialog.held",
+			"dataSchema": "events/sipDialog.dialog.held.schema.json",
+			"goType": "SIPDialogHeldData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.resumed",
+			"subject": "sip.evt.v1.<orgId>.<legId>.dialog.resumed",
+			"dataSchema": "events/sipDialog.dialog.resumed.schema.json",
+			"goType": "SIPDialogResumedData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.terminated",
+			"subject": "sip.evt.v1.<orgId>.<legId>.dialog.terminated",
+			"dataSchema": "events/sipDialog.dialog.terminated.schema.json",
+			"goType": "SIPDialogTerminatedData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.dtmf",
+			"subject": "sip.evt.v1.<orgId>.<legId>.dialog.dtmf",
+			"dataSchema": "events/sipDialog.dialog.dtmf.schema.json",
+			"goType": "SIPDialogDTMFData"
 		},
 		{
 			"family": "queue",
@@ -253,6 +346,13 @@
 			"goType": "MediaDtmfReceivedData"
 		},
 		{
+			"family": "trunk",
+			"type": "status.changed",
+			"subject": "trunk.evt.v1.<orgId>.<trunkId>.status.changed",
+			"dataSchema": "events/trunk.status.changed.schema.json",
+			"goType": "TrunkStatusChangedData"
+		},
+		{
 			"family": "cdr",
 			"type": "cdr.leg.write",
 			"subject": "cdr.leg.v1.<orgId>",
@@ -314,6 +414,30 @@
 			"goResponseType": "VoicemailListResponse"
 		},
 		{
+			"subject": "rpc.pbx.v1.extension-feature",
+			"timeoutMs": 5000,
+			"requestSchema": "rpc/rpc.pbx.v1.extension-feature.request.schema.json",
+			"responseSchema": "rpc/rpc.pbx.v1.extension-feature.response.schema.json",
+			"goRequestType": "ExtensionFeatureRequest",
+			"goResponseType": "ExtensionFeatureResponse"
+		},
+		{
+			"subject": "rpc.pbx.v1.last-caller",
+			"timeoutMs": 3000,
+			"requestSchema": "rpc/rpc.pbx.v1.last-caller.request.schema.json",
+			"responseSchema": "rpc/rpc.pbx.v1.last-caller.response.schema.json",
+			"goRequestType": "LastCallerRequest",
+			"goResponseType": "LastCallerResponse"
+		},
+		{
+			"subject": "rpc.pbx.v1.file-greeting",
+			"timeoutMs": 5000,
+			"requestSchema": "rpc/rpc.pbx.v1.file-greeting.request.schema.json",
+			"responseSchema": "rpc/rpc.pbx.v1.file-greeting.response.schema.json",
+			"goRequestType": "FileGreetingRequest",
+			"goResponseType": "FileGreetingResponse"
+		},
+		{
 			"subject": "rpc.sip.v1.credential",
 			"timeoutMs": 500,
 			"requestSchema": "rpc/rpc.sip.v1.credential.request.schema.json",
@@ -328,6 +452,54 @@
 			"responseSchema": "rpc/rpc.sip.v1.transfer.response.schema.json",
 			"goRequestType": "SipTransferRequest",
 			"goResponseType": "SipTransferResponse"
+		},
+		{
+			"subject": "rpc.sip.v1.invite",
+			"timeoutMs": 1000,
+			"requestSchema": "rpc/rpc.sip.v1.invite.request.schema.json",
+			"responseSchema": "rpc/rpc.sip.v1.invite.response.schema.json",
+			"goRequestType": "SipInviteRequest",
+			"goResponseType": "SipInviteResponse"
+		},
+		{
+			"subject": "rpc.sip.v1.ring",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.sip.v1.ring.request.schema.json",
+			"responseSchema": "rpc/rpc.sip.v1.ring.response.schema.json",
+			"goRequestType": "SipRingRequest",
+			"goResponseType": "SipRingResponse"
+		},
+		{
+			"subject": "rpc.sip.v1.answer",
+			"timeoutMs": 1000,
+			"requestSchema": "rpc/rpc.sip.v1.answer.request.schema.json",
+			"responseSchema": "rpc/rpc.sip.v1.answer.response.schema.json",
+			"goRequestType": "SipAnswerRequest",
+			"goResponseType": "SipAnswerResponse"
+		},
+		{
+			"subject": "rpc.sip.v1.hangup",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.sip.v1.hangup.request.schema.json",
+			"responseSchema": "rpc/rpc.sip.v1.hangup.response.schema.json",
+			"goRequestType": "SipHangupRequest",
+			"goResponseType": "SipHangupResponse"
+		},
+		{
+			"subject": "rpc.sip.v1.reinvite",
+			"timeoutMs": 1000,
+			"requestSchema": "rpc/rpc.sip.v1.reinvite.request.schema.json",
+			"responseSchema": "rpc/rpc.sip.v1.reinvite.response.schema.json",
+			"goRequestType": "SipReinviteRequest",
+			"goResponseType": "SipReinviteResponse"
+		},
+		{
+			"subject": "rpc.sip.v1.originate",
+			"timeoutMs": 1000,
+			"requestSchema": "rpc/rpc.sip.v1.originate.request.schema.json",
+			"responseSchema": "rpc/rpc.sip.v1.originate.response.schema.json",
+			"goRequestType": "SipOriginateRequest",
+			"goResponseType": "SipOriginateResponse"
 		},
 		{
 			"subject": "rpc.media.v1.allocate-session",
@@ -402,6 +574,38 @@
 			"goResponseType": "MediaStopRecordingResponse"
 		},
 		{
+			"subject": "rpc.media.v1.tap-session",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.media.v1.tap-session.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.tap-session.response.schema.json",
+			"goRequestType": "MediaTapSessionRequest",
+			"goResponseType": "MediaTapSessionResponse"
+		},
+		{
+			"subject": "rpc.media.v1.untap-session",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.media.v1.untap-session.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.untap-session.response.schema.json",
+			"goRequestType": "MediaUntapSessionRequest",
+			"goResponseType": "MediaUntapSessionResponse"
+		},
+		{
+			"subject": "rpc.media.v1.mute-session",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.media.v1.mute-session.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.mute-session.response.schema.json",
+			"goRequestType": "MediaMuteSessionRequest",
+			"goResponseType": "MediaMuteSessionResponse"
+		},
+		{
+			"subject": "rpc.media.v1.hold-session",
+			"timeoutMs": 1000,
+			"requestSchema": "rpc/rpc.media.v1.hold-session.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.hold-session.response.schema.json",
+			"goRequestType": "MediaHoldSessionRequest",
+			"goResponseType": "MediaHoldSessionResponse"
+		},
+		{
 			"subject": "rpc.engine.v1.originate",
 			"timeoutMs": 5000,
 			"requestSchema": "rpc/rpc.engine.v1.originate.request.schema.json",
@@ -416,6 +620,30 @@
 			"responseSchema": "rpc/rpc.engine.v1.park-handoff.response.schema.json",
 			"goRequestType": "ParkHandoffRequest",
 			"goResponseType": "ParkHandoffResponse"
+		},
+		{
+			"subject": "rpc.engine.v1.session-verb",
+			"timeoutMs": 30000,
+			"requestSchema": "rpc/rpc.engine.v1.session-verb.request.schema.json",
+			"responseSchema": "rpc/rpc.engine.v1.session-verb.response.schema.json",
+			"goRequestType": "SessionVerbRequest",
+			"goResponseType": "SessionVerbResponse"
+		},
+		{
+			"subject": "rpc.engine.v1.conference-control",
+			"timeoutMs": 2000,
+			"requestSchema": "rpc/rpc.engine.v1.conference-control.request.schema.json",
+			"responseSchema": "rpc/rpc.engine.v1.conference-control.response.schema.json",
+			"goRequestType": "ConferenceControlRequest",
+			"goResponseType": "ConferenceControlResponse"
+		},
+		{
+			"subject": "rpc.session.v1.announce",
+			"timeoutMs": 2000,
+			"requestSchema": "rpc/rpc.session.v1.announce.request.schema.json",
+			"responseSchema": "rpc/rpc.session.v1.announce.response.schema.json",
+			"goRequestType": "SessionAnnounceRequest",
+			"goResponseType": "SessionAnnounceResponse"
 		}
 	]
 }

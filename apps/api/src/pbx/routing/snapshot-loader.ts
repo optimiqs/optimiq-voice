@@ -1,6 +1,10 @@
 import {
+	audioStream,
 	callBlockRule,
+	callFlow,
 	conference,
+	destinationAlias,
+	dialByNameDirectory,
 	emergencyAddress,
 	eq,
 	extension,
@@ -9,16 +13,28 @@ import {
 	ivrMenu,
 	ivrMenuOption,
 	mohClass,
+	orgLimit,
 	orgSetting,
 	outboundRoute,
+	pagingGroup,
+	pagingGroupMember,
 	parkLot,
 	type PbxDatabaseTransaction,
 	phoneNumber,
+	phraseStep,
+	pinSet,
+	pinSetEntry,
+	prompt,
 	queue,
 	ringGroup,
 	ringGroupDestination,
+	sharedLine,
+	sharedLineAppearance,
+	speedDial,
 	timeCondition,
 	timeConditionRule,
+	translationRule,
+	translationRuleset,
 	trunk,
 	voicemailBox,
 	voicemailGreeting,
@@ -40,7 +56,7 @@ import type { OrgRoutingSnapshot, RoutingSettingsInput } from "@optimiq-voice/ro
  *    is exactly what `select … where organization_id = $1` returns. The compiler owns every join
  *    and sorts everything it walks, which is what makes its output deterministic.
  *
- * Twenty-one statements, no joins, run inside the caller's tenant transaction — so RLS scopes them
+ * Twenty-three statements, no joins, run inside the caller's tenant transaction — so RLS scopes them
  * and `organization_id` never appears in a predicate here. That is deliberate: the policy is the
  * filter, and duplicating it in the query would make a missing policy invisible.
  *
@@ -74,6 +90,13 @@ import type { OrgRoutingSnapshot, RoutingSettingsInput } from "@optimiq-voice/ro
  * first active row per box/kind, so the artifact is deterministic whatever order arrives), and a
  * `where active` here would hand the compiler a pre-made decision it is supposed to make.
  *
+ * `pagingGroups` arrived the same way and is loaded on the same terms: OPTIONAL on
+ * `OrgRoutingSnapshot`, so the compiler shipped `*81` before this loader could see a group, and
+ * until it could, `params.groupId` resolved to nothing and every page compiled to a code that
+ * announces into an empty room. Its two statements are the group and its members; the projection
+ * below explains why the members are the one child collection this file nests rather than passes
+ * through flat.
+ *
  * The reads are issued as one `Promise.all` batch: they are independent, they are all on the same
  * connection inside one transaction (so postgres.js pipelines them), and the compile-on-write path
  * runs this on every mutation.
@@ -98,12 +121,28 @@ export async function loadOrgRoutingSnapshot(
 		voicemailBoxes,
 		conferences,
 		parkLots,
+		pagingGroups,
+		pagingGroupMembers,
+		sharedLines,
+		sharedLineAppearances,
 		featureCodes,
 		callBlockRules,
 		mohClasses,
 		voicemailGreetings,
 		emergencyAddresses,
 		settingRows,
+		callFlows,
+		pinSets,
+		pinSetEntries,
+		translationRulesets,
+		translationRules,
+		destinationAliases,
+		audioStreams,
+		prompts,
+		phraseSteps,
+		directories,
+		speedDials,
+		limitRows,
 	] = await Promise.all([
 		transaction.select().from(extension),
 		transaction.select().from(phoneNumber),
@@ -120,17 +159,40 @@ export async function loadOrgRoutingSnapshot(
 		transaction.select().from(voicemailBox),
 		transaction.select().from(conference),
 		transaction.select().from(parkLot),
+		transaction.select().from(pagingGroup),
+		transaction.select().from(pagingGroupMember),
+		transaction.select().from(sharedLine),
+		transaction.select().from(sharedLineAppearance),
 		transaction.select().from(featureCode),
 		transaction.select().from(callBlockRule),
 		transaction.select().from(mohClass),
 		transaction.select().from(voicemailGreeting),
 		transaction.select().from(emergencyAddress),
 		transaction.select().from(orgSetting).where(eq(orgSetting.category, ROUTING_SETTINGS_CATEGORY)),
+		// The T2 admin block. Eleven more statements on the same connection inside the same
+		// transaction, pipelined by postgres.js like the twenty-three above them, and every one of
+		// them unfiltered and unjoined per the two rules in this file's header.
+		transaction.select().from(callFlow),
+		transaction.select().from(pinSet),
+		transaction.select().from(pinSetEntry),
+		transaction.select().from(translationRuleset),
+		transaction.select().from(translationRule),
+		transaction.select().from(destinationAlias),
+		transaction.select().from(audioStream),
+		transaction.select().from(prompt),
+		transaction.select().from(phraseStep),
+		transaction.select().from(dialByNameDirectory),
+		transaction.select().from(speedDial),
+		// The organization's quota row. A SINGLETON — `org_limit_organization_key` makes it at most
+		// one — folded into `settings` below rather than carried as a collection, for the reason
+		// `RoutingSettingsInput.maxConcurrentCalls` gives: `canonicalizeSnapshot` hashes `settings`
+		// on an explicit line and a new top-level field would be silently outside the hash.
+		transaction.select().from(orgLimit),
 	]);
 
 	return {
 		organizationId,
-		settings: readRoutingSettings(settingRows),
+		settings: readRoutingSettings(settingRows, limitRows[0]),
 		extensions: extensions.map((row) => ({
 			id: row.id,
 			enabled: row.enabled,
@@ -167,6 +229,13 @@ export async function loadOrgRoutingSnapshot(
 			 * else's normalisation to say what this tenant's phones do.
 			 */
 			pickupGroup: row.pickupGroup ?? undefined,
+			/**
+			 * Raw, not `?? undefined`: the column is `notNull().default(false)`, so there is no third
+			 * state to preserve. "Screening is off" and "the operator has not thought about screening"
+			 * are the same fact about how this extension answers a call, and the compiler is entitled
+			 * to read a boolean as a boolean.
+			 */
+			callScreening: row.callScreening,
 		})),
 		phoneNumbers: phoneNumbers.map((row) => ({
 			id: row.id,
@@ -194,6 +263,7 @@ export async function loadOrgRoutingSnapshot(
 			transport: row.transport,
 			codecPrefs: row.codecPrefs,
 			maxChannels: row.maxChannels,
+			inboundTranslationRulesetId: row.inboundTranslationRulesetId,
 			callerIdNumberOverride: row.callerIdNumberOverride,
 		})),
 		inboundRoutes: inboundRoutes.map((row) => ({
@@ -231,6 +301,8 @@ export async function loadOrgRoutingSnapshot(
 			failoverDestinationData: row.failoverDestinationData,
 			callerIdNumberOverride: row.callerIdNumberOverride,
 			recordEnabled: row.recordEnabled,
+			pinSetId: row.pinSetId,
+			translationRulesetId: row.translationRulesetId,
 		})),
 		timeConditions: timeConditions.map((row) => ({
 			id: row.id,
@@ -243,6 +315,8 @@ export async function loadOrgRoutingSnapshot(
 			nomatchDestinationType: row.nomatchDestinationType,
 			nomatchDestinationRef: row.nomatchDestinationRef,
 			nomatchDestinationData: row.nomatchDestinationData,
+			override: row.override,
+			overrideFeatureCode: row.overrideFeatureCode,
 		})),
 		timeConditionRules: timeConditionRules.map((row) => ({
 			id: row.id,
@@ -329,10 +403,25 @@ export async function loadOrgRoutingSnapshot(
 			maxWaitNoAgentSeconds: row.maxWaitNoAgentSeconds,
 			announcePositionEnabled: row.announcePositionEnabled,
 			announceFrequencySeconds: row.announceFrequencySeconds,
-			recordEnabled: row.recordEnabled,
+			recordPolicy: row.recordPolicy,
+			exitKey: row.exitKey,
+			exitDestinationType: row.exitDestinationType,
+			exitDestinationRef: row.exitDestinationRef,
+			exitDestinationData: row.exitDestinationData,
+			defaultPriority: row.defaultPriority,
+			abandonedResumeAllowed: row.abandonedResumeAllowed,
+			discardAbandonedAfterSeconds: row.discardAbandonedAfterSeconds,
 			timeoutDestinationType: row.timeoutDestinationType,
 			timeoutDestinationRef: row.timeoutDestinationRef,
 			timeoutDestinationData: row.timeoutDestinationData,
+			/**
+			 * `?? undefined` for the reason `pickupGroup` documents above: the column is nullable and
+			 * `QueueInput.agentWhisperPromptId` is OPTIONAL, so NULL means "no whisper" and must arrive
+			 * as absent. Passing `null` through would be a queue that whispers a prompt it does not
+			 * have — or, in the compiler's terms, a `dangling-prompt` diagnostic for a reference nobody
+			 * made.
+			 */
+			agentWhisperPromptId: row.agentWhisperPromptId ?? undefined,
 		})),
 		voicemailBoxes: voicemailBoxes.map((row) => ({
 			id: row.id,
@@ -358,7 +447,14 @@ export async function loadOrgRoutingSnapshot(
 			maxMembers: row.maxMembers,
 			mohClassId: row.mohClassId,
 			waitForModerator: row.waitForModerator,
-			recordEnabled: row.recordEnabled,
+			recordPolicy: row.recordPolicy,
+			// The three flags that decide what a room SOUNDS like when somebody arrives. Until they
+			// were loaded, `announce_join_leave` was a column a tenant could set, an API could write
+			// and nothing could read — the snapshotHash was identical with it on or off, so the
+			// artifact never changed and the engine never learned.
+			entryToneEnabled: row.entryToneEnabled,
+			exitToneEnabled: row.exitToneEnabled,
+			announceJoinLeave: row.announceJoinLeave,
 			// Both digests, for the same reason `voicemail_box.pin_hash` is loaded: the gate is
 			// applied on the call path by a process with no database handle. `packages/routing`
 			// parses them and refuses to embed one it cannot read — and, unlike a mailbox, a room
@@ -380,6 +476,69 @@ export async function loadOrgRoutingSnapshot(
 			timeoutDestinationType: row.timeoutDestinationType,
 			timeoutDestinationRef: row.timeoutDestinationRef,
 			timeoutDestinationData: row.timeoutDestinationData,
+		})),
+		/**
+		 * The one collection whose children are NESTED rather than flat, and not by this loader's
+		 * choice: `PagingGroupInput.members` is declared that way, and the reason is recorded on the
+		 * type — a member is an `(extension, position)` pair with no id anything can point at, so a
+		 * second top-level collection for it would buy a `SNAPSHOT_COLLECTIONS` entry and a
+		 * cache-invalidation entry in exchange for expressing a list.
+		 *
+		 * The read is still two flat statements and no join, which is rule 2: the grouping happens
+		 * here, in memory, over rows RLS already scoped. Members arrive in ordinal order because the
+		 * loader sorts them — the compiler sorts by `ordinal` again on its own side, and both are
+		 * true statements about determinism rather than one relying on the other.
+		 *
+		 * Disabled groups and disabled members are both loaded, per rule 1. A member switched off is
+		 * a fact the compiler keeps by dropping it from the compiled fan-out, not by never seeing it.
+		 */
+		pagingGroups: pagingGroups.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			name: row.name,
+			extensionNumber: row.extensionNumber,
+			duplex: row.duplex,
+			timeoutSeconds: row.timeoutSeconds,
+			members: pagingGroupMembers
+				.filter((member) => member.pagingGroupId === row.id)
+				.sort((left, right) => left.ordinal - right.ordinal || (left.id < right.id ? -1 : 1))
+				.map((member) => ({
+					extensionId: member.extensionId,
+					ordinal: member.ordinal,
+					enabled: member.enabled,
+				})),
+		})),
+		/**
+		 * Shared lines, with their appearances nested — the paging-group precedent exactly.
+		 *
+		 * `SharedLineInput.appearances` is declared nested for the same reason `PagingGroupInput.members`
+		 * is: an appearance is an `(extension, ordinal)` pair with no id anything points at, so a second
+		 * top-level collection for it would buy a `SNAPSHOT_COLLECTIONS` entry and a cache-invalidation
+		 * entry in exchange for expressing a list. The read is still two flat statements and no join
+		 * (rule 2); the grouping happens here, over rows RLS already scoped.
+		 *
+		 * Members arrive in ordinal order because the loader sorts them — the compiler sorts by `ordinal`
+		 * again on its own side, both true statements about determinism rather than one relying on the
+		 * other. Disabled lines and disabled appearances are both loaded (rule 1): an appearance switched
+		 * off is a fact the compiler keeps by dropping it from the compiled line, not by never seeing it.
+		 */
+		sharedLines: sharedLines.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			name: row.name,
+			extensionNumber: row.extensionNumber,
+			strategy: row.strategy,
+			ringTimeoutSeconds: row.ringTimeoutSeconds,
+			holdRecallTimeoutSeconds: row.holdRecallTimeoutSeconds,
+			bargeInEnabled: row.bargeInEnabled,
+			appearances: sharedLineAppearances
+				.filter((appearance) => appearance.sharedLineId === row.id)
+				.sort((left, right) => left.ordinal - right.ordinal || (left.id < right.id ? -1 : 1))
+				.map((appearance) => ({
+					extensionId: appearance.extensionId,
+					ordinal: appearance.ordinal,
+					enabled: appearance.enabled,
+				})),
 		})),
 		featureCodes: featureCodes.map((row) => ({
 			id: row.id,
@@ -430,6 +589,127 @@ export async function loadOrgRoutingSnapshot(
 			label: row.label,
 			validated: row.validated,
 		})),
+
+		// --- the T2 admin block ------------------------------------------------------------------
+		callFlows: callFlows.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			name: row.name,
+			extensionNumber: row.extensionNumber,
+			featureCode: row.featureCode,
+			mode: row.mode,
+			destinationType: row.destinationType,
+			destinationRef: row.destinationRef,
+			destinationData: row.destinationData,
+			nightDestinationType: row.nightDestinationType,
+			nightDestinationRef: row.nightDestinationRef,
+			nightDestinationData: row.nightDestinationData,
+		})),
+		pinSets: pinSets.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			name: row.name,
+			promptId: row.promptId,
+			failurePromptId: row.failurePromptId,
+			maxAttempts: row.maxAttempts,
+			digitTimeoutMs: row.digitTimeoutMs,
+		})),
+		/**
+		 * The digests travel, and this is the second place in this loader that carries one.
+		 *
+		 * The same rule `voicemail_box.pin_hash` follows and for the same reason: the engine
+		 * challenges the caller on the call path, in a process holding no database handle, so the
+		 * digest is in the artifact or the gate cannot exist. `label` and `ordinal` come with it
+		 * because they are what a CDR records — the digits never are.
+		 */
+		pinSetEntries: pinSetEntries.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			pinSetId: row.pinSetId,
+			ordinal: row.ordinal,
+			label: row.label,
+			pinHash: row.pinHash,
+		})),
+		translationRulesets: translationRulesets.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			name: row.name,
+		})),
+		translationRules: translationRules.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			translationRulesetId: row.translationRulesetId,
+			ordinal: row.ordinal,
+			label: row.label,
+			matchPattern: row.matchPattern,
+			replacement: row.replacement,
+		})),
+		destinationAliases: destinationAliases.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			name: row.name,
+			destinationType: row.destinationType,
+			destinationRef: row.destinationRef,
+			destinationData: row.destinationData,
+		})),
+		audioStreams: audioStreams.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			name: row.name,
+			url: row.url,
+			answerFirst: row.answerFirst,
+			maxSeconds: row.maxSeconds,
+			fallbackDestinationType: row.fallbackDestinationType,
+			fallbackDestinationRef: row.fallbackDestinationRef,
+			fallbackDestinationData: row.fallbackDestinationData,
+		})),
+		/**
+		 * Three columns of the media library, and no more.
+		 *
+		 * The compiler needs to know which prompt ids are PHRASES (so it can expand them) and which
+		 * are audio (so it can refuse a nested phrase). The object key, the duration and the checksum
+		 * belong to the media layer; nothing about them changes a routing decision, and shipping a
+		 * tenant's whole file list into a KV bucket every engine can read would be a cost with no
+		 * routing upside.
+		 */
+		prompts: prompts.map((row) => ({
+			id: row.id,
+			// `prompt` has no `enabled` column — a file is present or it is not — so every row is
+			// enabled. Stated here rather than left to a reader wondering where the column went.
+			enabled: true,
+			name: row.name,
+			kind: row.kind,
+		})),
+		phraseSteps: phraseSteps.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			phraseId: row.phraseId,
+			promptId: row.promptId,
+			ordinal: row.ordinal,
+		})),
+		directories: directories.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			name: row.name,
+			extensionNumber: row.extensionNumber,
+			searchField: row.searchField,
+			minDigits: row.minDigits,
+			greetingPromptId: row.greetingPromptId,
+			invalidPromptId: row.invalidPromptId,
+			maxFailures: row.maxFailures,
+			timeoutDestinationType: row.timeoutDestinationType,
+			timeoutDestinationRef: row.timeoutDestinationRef,
+			timeoutDestinationData: row.timeoutDestinationData,
+		})),
+		speedDials: speedDials.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			code: row.code,
+			label: row.label,
+			destinationType: row.destinationType,
+			destinationRef: row.destinationRef,
+			destinationData: row.destinationData,
+		})),
 	};
 }
 
@@ -442,14 +722,38 @@ interface SettingRow {
 	readonly enabled: boolean;
 }
 
+/** The one column of `org_limit` that routing reads. The other three are enforced at create. */
+interface LimitRow {
+	readonly maxConcurrentCalls: number | null;
+}
+
 /**
- * Projects `org_setting` rows onto {@link RoutingSettingsInput}.
+ * Projects `org_setting` rows — and the organization's single `org_limit` row — onto
+ * {@link RoutingSettingsInput}.
  *
- * Only the eight names the compiler declares are read; anything else in the `routing` category is
+ * Only the names the compiler declares are read; anything else in the `routing` category is
  * ignored rather than passed through, so a stray row cannot change how calls are routed. A
  * disabled row is treated as absent, which is what the settings cascade means by `enabled`.
+ *
+ * ## Two tables, one settings object
+ *
+ * `org_limit` is a different table with a different write surface and a different grant
+ * (`org-limits.write`, owner-only until W14), and it lands here anyway. The reason is the hash:
+ * `canonicalizeSnapshot` names `settings` on an explicit line and derives the rest from
+ * `SNAPSHOT_COLLECTIONS`, so a top-level sibling would be outside `snapshotHash` — the same
+ * dead-column trap this file's header describes for `announce_join_leave` and `pin_hash`, moved up a
+ * level and correspondingly harder to notice. Both tables map to the `settings` entity kind in
+ * `ROUTING_TABLE_TO_ENTITY`, so a write to either evicts and recompiles once.
+ *
+ * Three of the four limits are absent on purpose. `maxExtensions`, `maxTrunks` and `maxStorageMb`
+ * are enforced at CREATE, in the transaction that inserts the row — there is a row to refuse and a
+ * person to tell. Compiling them would put a number in the artifact that nothing reads, which is
+ * the trap running in the other direction.
  */
-export function readRoutingSettings(rows: readonly SettingRow[]): RoutingSettingsInput {
+export function readRoutingSettings(
+	rows: readonly SettingRow[],
+	limits?: LimitRow,
+): RoutingSettingsInput {
 	const byName = new Map(rows.filter((row) => row.enabled).map((row) => [row.name, row.value]));
 
 	const asString = (name: string): string | undefined => {
@@ -501,5 +805,12 @@ export function readRoutingSettings(rows: readonly SettingRow[]): RoutingSetting
 					),
 				}
 			: {}),
+		// NULL is unlimited and so is a missing row, and the two are collapsed to an ABSENT KEY
+		// rather than to `null` — the compiler reads both the same way, and an absent key keeps the
+		// canonical snapshot of a tenant with no quota row byte-identical to what it was before this
+		// column was loaded. Which is what makes adding it a no-op for every tenant that has none.
+		...(limits?.maxConcurrentCalls === undefined || limits.maxConcurrentCalls === null
+			? {}
+			: { maxConcurrentCalls: limits.maxConcurrentCalls }),
 	};
 }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+	DESTINATION_TYPE_LABELS,
 	describeDestination,
 	destinationFieldNames,
 	destinationKind,
@@ -40,6 +41,45 @@ describe("destinationFieldNames", () => {
 		expect(destinationFieldNames("nomatch").ref).toBe("nomatchDestinationRef");
 		expect(destinationFieldNames("failover").ref).toBe("failoverDestinationRef");
 		expect(destinationFieldNames("invalid").data).toBe("invalidDestinationData");
+	});
+
+	/**
+	 * The T2 admin block's two prefixes, and the only two REQUIRED secondary trios in the schema.
+	 *
+	 * A call flow's `night` is the other half of a switch and a stream's `fallback` is the branch
+	 * taken when a driver cannot open a remote URL at all — neither is a "leave it unset and release
+	 * the call" branch like `timeout` or `invalid`. The names are asserted for the reason the others
+	 * are: they are what the server addresses an issue at, and a mismatch means a required-field error
+	 * that lands on no control.
+	 */
+	it("names the call-flow and stream trios the API addresses", () => {
+		expect(destinationFieldNames("night")).toEqual({
+			type: "nightDestinationType",
+			ref: "nightDestinationRef",
+			data: "nightDestinationData",
+		});
+		expect(destinationFieldNames("fallback")).toEqual({
+			type: "fallbackDestinationType",
+			ref: "fallbackDestinationRef",
+			data: "fallbackDestinationData",
+		});
+	});
+
+	/**
+	 * A queue's exit key, which is the second OPTIONAL trio on one row.
+	 *
+	 * Asserted on its own because `queue` is now the only entity carrying two of these — `timeout`
+	 * and `exit` — and the whole reason the picker takes a prefix is that a form holding two trios
+	 * must address them separately. A dialog that wrote both under `timeout` would silently make the
+	 * exit key point wherever the wait cap does, which is a caller who pressed 2 being sent to the
+	 * overflow they were trying to escape.
+	 */
+	it("names the queue's exit trio, the second optional one on a single row", () => {
+		expect(destinationFieldNames("exit")).toEqual({
+			type: "exitDestinationType",
+			ref: "exitDestinationRef",
+			data: "exitDestinationData",
+		});
 	});
 });
 
@@ -208,6 +248,40 @@ describe("selectableDestinationTypes", () => {
 		expect(destinationTarget("external")).toBeUndefined();
 		expect(destinationTarget("application")).toBeUndefined();
 		expect(destinationTarget("hangup")).toBeUndefined();
+	});
+
+	/**
+	 * The T2 admin block's four, every one of them entity-backed and every one offerable from the day
+	 * it landed — unlike `queue`, `conference` and `park`, which spent a wave hidden because they had
+	 * no list to populate from.
+	 *
+	 * `alias` is the one worth asserting rather than assuming. It compiles FLAT — an alias produces no
+	 * plan node, it resolves to whatever its target resolved to — so there is a real temptation to
+	 * treat it as something other than an ordinary entity destination. It is not: it has a ref, a
+	 * table and a list, and the picker needs to know nothing else about it.
+	 */
+	it("offers the admin block's four, alias included", () => {
+		const offered = selectableDestinationTypes(null);
+		expect(offered).toContain("call-flow");
+		expect(offered).toContain("stream");
+		expect(offered).toContain("dial-by-name");
+		expect(offered).toContain("alias");
+
+		expect(destinationTarget("call-flow")?.path).toBe("/call-flows");
+		expect(destinationTarget("stream")?.path).toBe("/audio-streams");
+		expect(destinationTarget("dial-by-name")?.path).toBe("/directories");
+		expect(destinationTarget("alias")?.path).toBe("/destination-aliases");
+	});
+
+	/**
+	 * Named for what it DOES rather than for its table.
+	 *
+	 * "Destination alias" is the row's name, and in a select of places a call can go it would read as
+	 * a synonym for the word above it. The label is asserted because it is the sort of thing a
+	 * consistency pass would "correct" back to the table name.
+	 */
+	it("labels an alias as a named destination rather than as its table", () => {
+		expect(DESTINATION_TYPE_LABELS.alias).toBe("Named destination");
 	});
 });
 

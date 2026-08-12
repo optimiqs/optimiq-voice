@@ -57,7 +57,55 @@ var (
 	ErrOutsideLibrary = errors.New("audio: the media reference escapes the prompt library")
 	// ErrNotFound means the reference resolved to a path with no file at it.
 	ErrNotFound = errors.New("audio: no such prompt")
+	// ErrMixedSources means a request combined a LOOPING reference with something else.
+	//
+	// Its own sentinel because it is the one refusal on this path that is about the REQUEST rather
+	// than about a file: concatenating a menu prompt onto the end of a music-on-hold loop produces
+	// a prompt nobody ever reaches, and concatenating one onto a ringback cadence produces a
+	// cadence with a sentence inside it. Both are the caller having asked for something that cannot
+	// mean anything, so both are refused by name rather than served in whichever order they arrived.
+	ErrMixedSources = errors.New("audio: a looping reference cannot be concatenated with another")
 )
+
+// The media schemes this build resolves, beyond `sound:`.
+const (
+	// SchemeSound is a file in the prompt library. What every engine `MediaRef` renders into.
+	SchemeSound = "sound:"
+	// SchemeTone is a generated call-progress tone. See tone.go.
+	SchemeTone = "tone:"
+	// SchemeMOH is a music-on-hold class: a looping file under `<root>/moh/`.
+	//
+	// A SCHEME rather than a `sound:` path with a loop flag, because the thing being named is a
+	// deployment's hold music by CLASS — the same vocabulary ARI's `channels.startMoh(mohClass)`
+	// uses — and the mapping from a class to a file is the media plane's business. An engine that
+	// had to know the layout would be a second source of truth about this instance's disk.
+	SchemeMOH = "moh:"
+)
+
+// DefaultMOHClass is the class a `moh:` reference with no name resolves to, matching Asterisk's own
+// `default` music class so one engine-side setting serves both planes during the cutover.
+const DefaultMOHClass = "default"
+
+// mohDirectory is the subdirectory of the prompt library hold music lives in.
+//
+// A convention rather than a second environment variable. MEDIAD_SOUNDS_DIR is already the mount a
+// deployment shares with Asterisk, hold music is prompt audio, and a second mount to configure would
+// be a second thing to get wrong for no capability anybody gains.
+const mohDirectory = "moh"
+
+// Source is what a playback request resolved to: the audio, and whether it repeats.
+//
+// The loop flag lives HERE rather than on the wire because it is a property of what was ASKED FOR
+// rather than of how the caller wants it played. `moh:` is hold music and hold music repeats; a
+// ringback cadence repeats because ringing persists; a prompt and a beep do not. A caller that could
+// set the flag independently could ask for a looping voicemail greeting, which is a call nobody can
+// end.
+type Source struct {
+	Clip *Clip
+	Loop bool
+	// Description names what was resolved, for the log line on a hold that started music.
+	Description string
+}
 
 // NewLibrary roots a library at a directory. An empty root is legal and refuses every load, which
 // is the state of a deployment that has not mounted a prompt store yet.
@@ -117,6 +165,81 @@ func (l *Library) LoadAll(refs []string, encoding Encoding) (*Clip, error) {
 	return combined, nil
 }
 
+// LoadSource resolves a whole playback request, which is where the three schemes are told apart.
+//
+// # Why the schemes cannot be mixed
+//
+// A LOOPING source has no end, so anything concatenated after it is audio no caller ever reaches.
+// Rather than silently dropping the tail — or, worse, playing a menu once at the top of an infinite
+// hold loop — a request that combines one with anything else is refused naming both. `sound:` refs
+// concatenate with each other exactly as they always have, because that is ARI's own behaviour and
+// what a multi-clause prompt needs.
+func (l *Library) LoadSource(refs []string, encoding Encoding) (*Source, error) {
+	if len(refs) == 0 {
+		return nil, fmt.Errorf("%w: a playback needs at least one media reference", ErrNotFound)
+	}
+
+	for _, ref := range refs {
+		trimmed := strings.TrimSpace(ref)
+		switch {
+		case strings.HasPrefix(trimmed, SchemeTone):
+			if len(refs) != 1 {
+				return nil, fmt.Errorf("%w: %q is a tone and %d references were given",
+					ErrMixedSources, trimmed, len(refs))
+			}
+			tone, err := ParseTone(strings.TrimPrefix(trimmed, SchemeTone))
+			if err != nil {
+				return nil, err
+			}
+			clip, err := tone.Generate(encoding)
+			if err != nil {
+				return nil, err
+			}
+			return &Source{Clip: clip, Loop: tone.Loop, Description: SchemeTone + tone.Name}, nil
+
+		case strings.HasPrefix(trimmed, SchemeMOH):
+			if len(refs) != 1 {
+				return nil, fmt.Errorf("%w: %q is music on hold and %d references were given",
+					ErrMixedSources, trimmed, len(refs))
+			}
+			return l.loadMOH(strings.TrimPrefix(trimmed, SchemeMOH), encoding)
+		}
+	}
+
+	clip, err := l.LoadAll(refs, encoding)
+	if err != nil {
+		return nil, err
+	}
+	return &Source{Clip: clip, Loop: false, Description: strings.Join(refs, "+")}, nil
+}
+
+// loadMOH resolves a music-on-hold class to a looping clip.
+//
+// The class maps to `<root>/moh/<class>.wav` and nothing cleverer. A DIRECTORY of clips played in
+// sequence — which is what Asterisk's `moh` classes are — is deliberately not built here: it needs a
+// shuffle policy, a per-session position and a decision about what happens when the directory
+// changes under a live call, and none of those is a decision this rung has to make in order for a
+// held caller to hear music. Naming the single-file form as the shape means adding the directory
+// form later is additive rather than a change to what a class MEANS.
+func (l *Library) loadMOH(class string, encoding Encoding) (*Source, error) {
+	name := strings.TrimSpace(class)
+	if name == "" {
+		name = DefaultMOHClass
+	}
+	// A class is one path element, always. It becomes a filename, so a separator in it is a
+	// traversal and a dot-segment is one with extra steps — refused for exactly the reason a
+	// recording reference is.
+	if strings.ContainsAny(name, `/\`) || name == "." || name == ".." {
+		return nil, fmt.Errorf("%w: a music class is one name, got %q", ErrOutsideLibrary, class)
+	}
+
+	clip, err := l.Load(SchemeSound+mohDirectory+"/"+name, encoding)
+	if err != nil {
+		return nil, err
+	}
+	return &Source{Clip: clip, Loop: true, Description: SchemeMOH + name}, nil
+}
+
 // Resolve turns a media reference into an absolute path inside the library.
 //
 // # Which schemes resolve, and why the rest are refused BY NAME
@@ -145,13 +268,18 @@ func (l *Library) Resolve(ref string) (string, error) {
 	}
 
 	trimmed := strings.TrimSpace(ref)
-	name, found := strings.CutPrefix(trimmed, "sound:")
+	name, found := strings.CutPrefix(trimmed, SchemeSound)
 	if !found {
 		scheme, _, hasScheme := strings.Cut(trimmed, ":")
 		if !hasScheme {
-			return "", fmt.Errorf("%w: %q names no scheme; mediad resolves sound: only", ErrUnsupportedScheme, trimmed)
+			return "", fmt.Errorf("%w: %q names no scheme; mediad resolves sound:, tone: and moh:",
+				ErrUnsupportedScheme, trimmed)
 		}
-		return "", fmt.Errorf("%w: %q is a generator scheme mediad has no synthesiser for; it resolves sound: only",
+		// `tone:` and `moh:` never reach here — LoadSource takes them first — so anything with a
+		// scheme at this point is one of Asterisk's remaining generators (`digits:`, `number:`,
+		// `characters:`), which are a text-to-speech problem wearing a media reference's clothes.
+		return "", fmt.Errorf(
+			"%w: %q is a generator scheme mediad has no synthesiser for; it resolves sound:, tone: and moh:",
 			ErrUnsupportedScheme, scheme+":")
 	}
 

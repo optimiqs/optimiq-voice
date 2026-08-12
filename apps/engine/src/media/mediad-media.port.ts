@@ -1,13 +1,17 @@
 import {
 	mediaAllocateSessionResponseSchema,
 	mediaBridgeSessionsResponseSchema,
+	mediaHoldSessionResponseSchema,
+	mediaMuteSessionResponseSchema,
 	mediaReleaseSessionResponseSchema,
 	mediaSendDtmfResponseSchema,
 	mediaStartPlaybackResponseSchema,
 	mediaStartRecordingResponseSchema,
 	mediaStopPlaybackResponseSchema,
 	mediaStopRecordingResponseSchema,
+	mediaTapSessionResponseSchema,
 	mediaUnbridgeSessionsResponseSchema,
+	mediaUntapSessionResponseSchema,
 	RPC_SUBJECTS,
 } from "@optimiq-voice/events";
 import { getLogger } from "@optimiq-voice/logging";
@@ -28,6 +32,8 @@ import type {
 	RecordingHandle,
 	SendDtmfRequest,
 	SnoopRequest,
+	TapHandle,
+	TapRequest,
 } from "./media-port";
 import type { MediadTransport } from "./mediad-transport";
 import type { MediaAllocateSessionResponse } from "@optimiq-voice/events";
@@ -38,7 +44,7 @@ import type { BridgeMode, HangupCause } from "@optimiq-voice/telephony";
  *
  * ## The coverage map, and why it is the whole point of this file
  *
- * `MediaPort` has 24 methods because Asterisk can do 24 things. `mediad` can do twelve of them
+ * `MediaPort` has 27 methods because Asterisk can do 27 things. `mediad` can do twenty of them
  * today, and the honest expression of that is not a partial implementation that pretends — it is an
  * implementation where every unreached rung throws {@link MediaOperationNotSupportedError} naming
  * the capability and the rung it arrives on.
@@ -46,7 +52,7 @@ import type { BridgeMode, HangupCause } from "@optimiq-voice/telephony";
  * ```text
  * SUPPORTED
  *   createBridge        local: a relay with no members is nothing on the wire (see below)
- *   addToBridge         rpc.media.v1.bridge-sessions, at exactly two members
+ *   addToBridge         rpc.media.v1.bridge-sessions — two is a relay, three or more is a room
  *   removeFromBridge    rpc.media.v1.unbridge-sessions
  *   destroyBridge       rpc.media.v1.unbridge-sessions
  *   hangup              rpc.media.v1.release-session — the MEDIA half of a teardown
@@ -57,6 +63,11 @@ import type { BridgeMode, HangupCause } from "@optimiq-voice/telephony";
  *   sendDtmf            rpc.media.v1.send-dtmf — rung 3, RFC 4733 under the leg's own type
  *   record              rpc.media.v1.start-recording — rung 4, one direction (see the method)
  *   stopRecording       rpc.media.v1.stop-recording, keyed by reference alone
+ *   tap, stopTap        rpc.media.v1.tap-session — rung 6, a mix-minus participant
+ *   mute, unmute        rpc.media.v1.mute-session — rung 5, one direction of one leg
+ *   hold, unhold        rpc.media.v1.hold-session — rung 5, the MEDIA half (see the method)
+ *   startMusicOnHold    rpc.media.v1.start-playback of a `moh:` ref — rung 5 (see the method)
+ *   stopMusicOnHold     rpc.media.v1.stop-playback of the reference this adapter minted
  *
  * NOT SUPPORTED — throws, naming the capability
  *   answer, ring                       SIP responses; apps/sipd owns signalling (design doc §5)
@@ -64,10 +75,20 @@ import type { BridgeMode, HangupCause } from "@optimiq-voice/telephony";
  *   getVariable, setVariable           channel variables are a dialplan concept mediad has none of
  *   snoop                              an Asterisk-ism this media plane does not need — a session
  *                                      records both directions directly. NOT a rung; see the method
- *   startMusicOnHold, stopMusicOnHold  rung 5
- *   hold, unhold                       rung 5, and half signalling besides
- *   mute, unmute                       rung 5
+ *   echo                               an Asterisk APPLICATION, not a media capability. NOT a rung
  * ```
+ *
+ * ## What is still missing and is NOT on this map, because `MediaPort` cannot say it
+ *
+ * **Per-participant gain in a room.** `apps/mediad/internal/rtp/mixer.go`'s `Member.SetGain(rx, tx)`
+ * exists, is atomic and is applied on every mixed frame — and there is no subject that reaches it,
+ * because `JoinOptions.GainRx/GainTx` are only ever set at join time by a caller inside the process.
+ * So a moderator's volume slider is a typed refusal on BOTH drivers rather than on one: ARI has no
+ * per-participant gain on a mixing bridge at all, and this plane has the mechanism and no wire. The
+ * seam is a `rpc.media.v1.conference-gain` carrying `{bridgeId, sessionId, talkGainPercent,
+ * listenGainPercent}` — one subject, one handler, one `SetGain` call — and it is deliberately not in
+ * this wave: a contract for a control only one of two drivers could ever serve is worth declaring
+ * once the surface above it has a second reason to exist.
  *
  * Two rung-4 arguments are refused at the WIRE rather than here, with the same distinction `play`
  * draws for `tone:`: the operation exists and this media plane cannot serve that argument. `beep`
@@ -105,6 +126,22 @@ import type { BridgeMode, HangupCause } from "@optimiq-voice/telephony";
  */
 const MILLIS_PER_SECOND = 1_000;
 
+/** `mediad`'s own default music class, and Asterisk's. See `audio.DefaultMOHClass`. */
+const DEFAULT_MOH_CLASS = "default";
+
+/**
+ * The reference a leg's hold-music loop plays under.
+ *
+ * DERIVED from the channel id rather than random, and that is the point: `MediaPort.stopMusicOnHold`
+ * carries a channel and `rpc.media.v1.stop-playback` is keyed by a reference, so something has to
+ * join the two — and a derivation survives a process restart where a Map does not. A caller left
+ * listening to hold music because the engine that started it was replaced is a worse failure than
+ * any this saves.
+ */
+function musicRefFor(channelId: string): string {
+	return `moh:${channelId}`;
+}
+
 export class MediadMediaPort implements MediaPort {
 	/**
 	 * v1 relays RTP without decoding it — the header is rewritten and the payload is passed through
@@ -131,6 +168,14 @@ export class MediadMediaPort implements MediaPort {
 
 	/** Sessions this adapter believes are allocated on `mediad`, so `channelExists` can answer. */
 	private readonly sessions = new Set<string>();
+
+	/**
+	 * Which playback reference each leg's hold-music loop is running under.
+	 *
+	 * A cache and not the source of truth, which is why {@link stopMusicOnHold} falls back to
+	 * recomputing the reference: the map is lost on a restart and the loop is not.
+	 */
+	private readonly music = new Map<string, string>();
 
 	constructor(
 		private readonly transport: MediadTransport,
@@ -244,11 +289,18 @@ export class MediadMediaPort implements MediaPort {
 	}
 
 	/**
-	 * Joins legs to a bridge, issuing the relay once there are exactly two.
+	 * Joins legs to a bridge, issuing the command once there are at least two.
 	 *
-	 * A third member is refused rather than dropped: N-way audio is MIXING, which needs a decode, a
-	 * jitter buffer and a mix-minus per participant, and is rung 6. Silently relaying the first two
-	 * would put the third participant in a room they cannot hear.
+	 * A third member USED TO BE REFUSED here, naming rung 6, because N-way audio is mixing and this
+	 * plane relayed. Rung 6 arrived and `bridge-sessions` now takes two to eight, so a conference
+	 * bridge is the same call a two-party one is — which member of the pair is a relay and which is a
+	 * mix is `mediad`'s decision, made from the count, and deliberately not stated here. An adapter
+	 * that named the mechanism would be holding an opinion about a mixer it cannot see.
+	 *
+	 * The re-send on every arrival is not waste and is not a retry. A room's membership is the WHOLE
+	 * list, not a delta — `mediad` seats everybody named and destroys a room it could not finish
+	 * building — so a fourth member joining is one command carrying four ids. The alternative, a
+	 * per-member add, would need a second subject whose failure mode is a half-built room.
 	 */
 	async addToBridge(bridgeId: string, channelIds: readonly string[]): Promise<void> {
 		const members = this.bridges.get(bridgeId) ?? new Set<string>();
@@ -257,12 +309,6 @@ export class MediadMediaPort implements MediaPort {
 		}
 		this.bridges.set(bridgeId, members);
 
-		if (members.size > 2) {
-			throw new MediaOperationNotSupportedError(
-				"addToBridge with more than two legs",
-				"conference mix-minus (rung 6)",
-			);
-		}
 		if (members.size < 2) {
 			// One member is a leg waiting for its peer — the normal state between an A-leg answering
 			// and a B-leg being dialled. There is nothing to relay yet and nothing to report.
@@ -515,6 +561,120 @@ export class MediadMediaPort implements MediaPort {
 		await Promise.resolve();
 	}
 
+	// --- rung 5: hold, mute, and music -----------------------------------------------------------
+
+	/**
+	 * Plays a hold-music class at the leg WITHOUT taking it out of the conversation.
+	 *
+	 * ## Why this is a playback and not `hold-session`
+	 *
+	 * `MediaPort` says so directly — "start music on hold from a configured class. Separate from
+	 * hold, which is signalling" — and the case that needs the separation is a queue: a caller
+	 * hearing hold music is very much still in a conversation with the queue, and holding them would
+	 * make them inaudible to the agent who then answers to silence. So this is `start-playback` of a
+	 * looping `moh:` reference, exactly what it is on Asterisk, where `channels.startMoh` is a
+	 * playback too.
+	 *
+	 * ## The reference is minted here, and that is what makes {@link stopMusicOnHold} possible
+	 *
+	 * `MediaPort.stopMusicOnHold(channelId)` carries a CHANNEL and no reference, while
+	 * `stop-playback` is keyed by reference and carries no session — the two do not meet, and the
+	 * only place that can join them is the adapter that started the loop. So the reference is
+	 * derived from the channel id rather than random: a restart loses this map, and a
+	 * deterministically-named loop is one a later stop can still name. Asterisk needs none of this
+	 * because `channels.stopMoh` is addressed by channel; this is the adapter absorbing that
+	 * difference, which is what an adapter is for.
+	 *
+	 * The class defaults to `default`, which is `mediad`'s own default class and Asterisk's.
+	 */
+	async startMusicOnHold(channelId: string, mohClass?: string): Promise<void> {
+		const playbackRef = musicRefFor(channelId);
+		await this.call(
+			RPC_SUBJECTS.mediaStartPlayback,
+			{
+				sessionId: channelId,
+				playbackRef,
+				media: [`moh:${mohClass ?? DEFAULT_MOH_CLASS}`],
+			},
+			mediaStartPlaybackResponseSchema,
+		);
+		this.music.set(channelId, playbackRef);
+	}
+
+	/**
+	 * Stops the loop {@link startMusicOnHold} started. Stopping one that already finished is a no-op.
+	 *
+	 * It falls back to the derived reference when this process did not start the loop, which is the
+	 * case that matters after a restart: `mediad` still has the playback running under a name this
+	 * adapter can recompute, and refusing to stop it because a Map is empty would leave a caller
+	 * listening to hold music nobody is holding.
+	 */
+	async stopMusicOnHold(channelId: string): Promise<void> {
+		const playbackRef = this.music.get(channelId) ?? musicRefFor(channelId);
+		this.music.delete(channelId);
+		await this.call(
+			RPC_SUBJECTS.mediaStopPlayback,
+			{ playbackRef },
+			mediaStopPlaybackResponseSchema,
+		);
+	}
+
+	/**
+	 * Takes the leg out of the conversation — the MEDIA half of a hold.
+	 *
+	 * Not the whole of one, and the boundary is worth being exact about: the SIP re-INVITE that
+	 * lights the far end's hold key is `apps/sipd`'s, and an engine that wants both sends both. This
+	 * suppresses both directions so the other party stops hearing them, which is the half a caller
+	 * notices immediately and the half a compliance review asks about.
+	 *
+	 * No music. `MediaPort.hold` takes no class and `startMusicOnHold` is the separate call for it,
+	 * so passing one here would be this adapter deciding that a held party should hear something —
+	 * a decision the interface deliberately leaves to the caller, because "the held caller hears the
+	 * queue's music" and "the holding agent hears nothing" are two different commands about two
+	 * different legs.
+	 */
+	async hold(channelId: string): Promise<void> {
+		await this.call(
+			RPC_SUBJECTS.mediaHoldSession,
+			{ sessionId: channelId, unhold: false },
+			mediaHoldSessionResponseSchema,
+		);
+	}
+
+	/** Puts the leg back in the conversation. Unholding a leg that was not held is a no-op. */
+	async unhold(channelId: string): Promise<void> {
+		await this.call(
+			RPC_SUBJECTS.mediaHoldSession,
+			{ sessionId: channelId, unhold: true },
+			mediaHoldSessionResponseSchema,
+		);
+	}
+
+	/**
+	 * Gates one or both directions of the leg without touching the bridge.
+	 *
+	 * ADDITIVE, which is the contract's word and the reason it is worth repeating here: muting `in`
+	 * on a leg already muted `out` leaves both set. The reply carries the state afterwards; this
+	 * method returns `void` because {@link MediaPort} does, so the state is discarded here and read
+	 * by whoever asked through the surface above.
+	 */
+	async mute(channelId: string, direction: MediaDirection): Promise<void> {
+		await this.call(
+			RPC_SUBJECTS.mediaMuteSession,
+			{ sessionId: channelId, direction, unmute: false },
+			mediaMuteSessionResponseSchema,
+		);
+	}
+
+	/** Lifts a mute on one or both directions. Lifts only what it names. */
+	async unmute(channelId: string, direction: MediaDirection): Promise<void> {
+		await this.call(
+			RPC_SUBJECTS.mediaMuteSession,
+			{ sessionId: channelId, direction, unmute: true },
+			mediaMuteSessionResponseSchema,
+		);
+	}
+
 	// --- MediaPort: not supported at this rung ---------------------------------------------------
 
 	async answer(channelId: string): Promise<void> {
@@ -545,39 +705,6 @@ export class MediadMediaPort implements MediaPort {
 		return this.refuse("originate", "SIP signalling, which apps/sipd owns (design doc §5)");
 	}
 
-	async startMusicOnHold(channelId: string, mohClass?: string): Promise<void> {
-		void channelId;
-		void mohClass;
-		return this.refuse("startMusicOnHold", "music on hold (rung 5)");
-	}
-
-	async stopMusicOnHold(channelId: string): Promise<void> {
-		void channelId;
-		return this.refuse("stopMusicOnHold", "music on hold (rung 5)");
-	}
-
-	async hold(channelId: string): Promise<void> {
-		void channelId;
-		return this.refuse("hold", "hold (rung 5), which is also a SIP re-INVITE apps/sipd owns");
-	}
-
-	async unhold(channelId: string): Promise<void> {
-		void channelId;
-		return this.refuse("unhold", "hold (rung 5), which is also a SIP re-INVITE apps/sipd owns");
-	}
-
-	async mute(channelId: string, direction: MediaDirection): Promise<void> {
-		void channelId;
-		void direction;
-		return this.refuse("mute", "per-direction muting (rung 5)");
-	}
-
-	async unmute(channelId: string, direction: MediaDirection): Promise<void> {
-		void channelId;
-		void direction;
-		return this.refuse("unmute", "per-direction muting (rung 5)");
-	}
-
 	/**
 	 * Creates a channel that listens to another one — REFUSED, and this is the one refusal on this
 	 * driver that is not a rung.
@@ -603,6 +730,98 @@ export class MediadMediaPort implements MediaPort {
 			"snoop",
 			"a snoop tap, which this media plane does not need: a session records both directions " +
 				"directly (see startRecording with direction 'both')",
+		);
+	}
+
+	/**
+	 * Loops a leg's audio back to itself — REFUSED, and for the same reason `snoop` is: the thing
+	 * being asked for is an Asterisk application, not a media capability this relay is missing.
+	 *
+	 * The Asterisk driver serves `*43` by handing the channel to `Echo()` in the dialplan, which is
+	 * a door `mediad` does not have and should not grow: it has no dialplan, and a relay that
+	 * reflected a session's own packets back at it would be inventing an application on the far side
+	 * of the seam that exists to keep applications OFF it.
+	 *
+	 * So the refusal names the operation rather than a rung. The walker announces "not available",
+	 * and a deployment that wants an echo test sets `ENGINE_MEDIA_DRIVER=ari` — which is exactly the
+	 * per-capability cutover `plans/mediad-design.md` §2 describes.
+	 */
+	/**
+	 * A supervisor joining a conversation on asymmetric terms. Rung 6.
+	 *
+	 * ## The distinction from {@link snoop} directly above is the whole design
+	 *
+	 * `snoop` is refused PERMANENTLY because it asks for an Asterisk-ism — a tap that has to be its
+	 * own channel — that this plane has no need of and could only fake. `tap` asks for something
+	 * real: routing one participant's audio to one peer and not the other, which is a MIX. That was
+	 * rung 6 and is now built, and it was served by the mixer ARRIVING rather than by the contract
+	 * being renegotiated — which is exactly what `plans/mediad-design.md` §10 question 4 predicted
+	 * when it insisted the full `hear`/`speakTo` shape ship before any responder existed.
+	 *
+	 * ## What is passed, and what is deliberately dropped
+	 *
+	 * `targetSide` is passed, and it closes the one gap the first implementation named out loud: the
+	 * media plane used to fix the convention "`a` is the target session" and rely on the engine
+	 * ordering its arguments to match. The engine knows which leg is the target — the supervision
+	 * runtime taps the extension it was asked to monitor — so it states the fact instead.
+	 *
+	 * `tapChannelId` and `bridgeId` are dropped, and that is not a lost field. Both exist because on
+	 * ARI a tap materialises as a CHANNEL that enters the engine's own Stasis application, so it must
+	 * be watchable before it exists; here the tap is the supervisor's own already-allocated session
+	 * and the room is resolved from the target. `TapRequest` says so directly: "a driver with no
+	 * channel concept simply ignores both".
+	 *
+	 * The returned handle echoes the caller's ids so `stopTap` names what the caller holds.
+	 */
+	async tap(request: TapRequest): Promise<TapHandle> {
+		const reply = await this.call(
+			RPC_SUBJECTS.mediaTapSession,
+			{
+				tapId: request.tapId,
+				tapSessionId: request.supervisorChannelId,
+				targetSessionId: request.targetChannelId,
+				targetSide: request.targetSide,
+				hear: request.hear,
+				speakTo: request.speakTo,
+				...(request.mode === undefined ? {} : { mode: request.mode }),
+			},
+			mediaTapSessionResponseSchema,
+		);
+		return {
+			tapId: request.tapId,
+			tapChannelId: request.supervisorChannelId,
+			// The room mediad actually put the tap in, which on a converted two-party call is the
+			// bridge's own id and not the one the caller minted for a bridge this plane never made.
+			bridgeId: reply.bridgeId ?? request.bridgeId,
+		};
+	}
+
+	/**
+	 * Ends a tap, leaving the monitored conversation running.
+	 *
+	 * Idempotent: untapping something already gone answers `ok: true, untapped: false`, so this
+	 * resolves rather than throwing — the engine retries an untap on teardown, and a monitored call
+	 * that outlived the retry is not a failure.
+	 *
+	 * What it never does is convert the conversation back to a relay. That is `mediad`'s decision and
+	 * is recorded there: switching a live call from mix to relay means dropping the buffered frames
+	 * and resetting both codecs mid-sentence, to give back sixty milliseconds the call has already
+	 * had.
+	 */
+	async stopTap(tap: TapHandle): Promise<void> {
+		await this.call(
+			RPC_SUBJECTS.mediaUntapSession,
+			{ tapId: tap.tapId },
+			mediaUntapSessionResponseSchema,
+		);
+	}
+
+	async echo(channelId: string): Promise<void> {
+		void channelId;
+		return this.refuse(
+			"echo",
+			"Asterisk's Echo() application, which is a dialplan application rather than a media " +
+				"capability this relay is missing",
 		);
 	}
 

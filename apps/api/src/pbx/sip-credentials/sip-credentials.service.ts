@@ -1,7 +1,17 @@
 import { createHash } from "node:crypto";
 import { Inject, Injectable } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
-import { and, deviceLine, eq, extension, orgSetting, sql } from "@optimiq-voice/pbx-db";
+import {
+	and,
+	asc,
+	deviceLine,
+	eq,
+	extension,
+	orgSetting,
+	sharedLine,
+	sharedLineAppearance,
+	sql,
+} from "@optimiq-voice/pbx-db";
 import { loadProvisioningEnv } from "../../provisioning/provisioning-env";
 import { deriveSipPassword } from "../../provisioning/render/provision-secret";
 import { PBX_DATABASE } from "../shared/pbx.tokens";
@@ -107,6 +117,21 @@ export class SipCredentialsService {
 			return refuse("PROVISION_SIP_SECRET_KEY is not configured on this API");
 		}
 
+		/**
+		 * The appearance this account holds, when its extension is on a shared line.
+		 *
+		 * Resolved AFTER the credential — it changes nothing about whether the REGISTER authenticates,
+		 * it only tells the device which shared-line key to light. sipd carries `sharedLineNumber` and
+		 * `appearanceIndex` onto the binding and stamps `Call-Info: <sip:number@domain>;appearance-index=N`
+		 * onto the INVITE and the dialog-info NOTIFY, so the phone lights the right button. An extension
+		 * with no appearance simply leaves both fields absent, which is the ordinary reply this API has
+		 * always sent.
+		 */
+		const appearance =
+			line.extensionId === null
+				? undefined
+				: await this.findSharedLineAppearance(organizationId, line.extensionId);
+
 		return {
 			found: true,
 			enabled: true,
@@ -116,7 +141,52 @@ export class SipCredentialsService {
 			ha1,
 			deviceId: line.deviceId ?? undefined,
 			extensionId: line.extensionId ?? undefined,
+			...(appearance === undefined
+				? {}
+				: {
+						...(appearance.sharedLineNumber === null
+							? {}
+							: { sharedLineNumber: appearance.sharedLineNumber }),
+						appearanceIndex: appearance.appearanceIndex,
+					}),
 		};
+	}
+
+	/**
+	 * The shared-line appearance this extension holds, or `undefined` when it is on none.
+	 *
+	 * One appearance is reported even when the extension is on several: the LOWEST-ordinal enabled
+	 * appearance on the LOWEST-ordinal enabled line, which is the static button model the response
+	 * schema documents — per-call appearance-slot assignment across simultaneous calls is the
+	 * BroadWorks dynamic behaviour and a named seam beyond it. Both the line and the appearance must be
+	 * enabled: a disabled line lights no lamp, and a disabled appearance is a button switched off.
+	 *
+	 * Scoped by the tenant the credential already resolved, so RLS is the filter and `organization_id`
+	 * never appears in a predicate here — the same posture as `findLine`.
+	 */
+	private async findSharedLineAppearance(
+		organizationId: string,
+		extensionId: string,
+	): Promise<{ sharedLineNumber: string | null; appearanceIndex: number } | undefined> {
+		return await this.database.withTenantScope(organizationId, async (transaction) => {
+			const rows = await transaction
+				.select({
+					sharedLineNumber: sharedLine.extensionNumber,
+					appearanceIndex: sharedLineAppearance.ordinal,
+				})
+				.from(sharedLineAppearance)
+				.innerJoin(sharedLine, eq(sharedLine.id, sharedLineAppearance.sharedLineId))
+				.where(
+					and(
+						eq(sharedLineAppearance.extensionId, extensionId),
+						eq(sharedLineAppearance.enabled, true),
+						eq(sharedLine.enabled, true),
+					),
+				)
+				.orderBy(asc(sharedLineAppearance.ordinal), asc(sharedLine.id))
+				.limit(1);
+			return rows[0];
+		});
 	}
 
 	private derive(

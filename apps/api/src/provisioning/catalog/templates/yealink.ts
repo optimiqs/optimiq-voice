@@ -1,3 +1,4 @@
+import { AUTO_ANSWER_ALERT_INFO } from "../../auto-answer";
 import { cfgValue, renderSettingsAsCfg } from "../format";
 import type { RenderContext, RenderKey, RenderLine } from "../render-context";
 import type { VendorTemplate } from "../template";
@@ -166,6 +167,45 @@ function renderKey(key: RenderKey): readonly string[] {
 	return entries;
 }
 
+/**
+ * Auto-answer, which on Yealink is the INTERCOM feature and not the `auto_answer` parameter.
+ *
+ * The trap is `account.N.auto_answer`, which exists, is called what you would search for, and is
+ * wrong: it answers EVERY inbound call on that line, unconditionally and forever. Configuring it
+ * here would turn a desk phone into an open microphone that anybody who can dial the extension can
+ * open. The header-triggered behaviour lives under `features.intercom.*` instead: with
+ * `features.intercom.allow = 1` the phone answers an INVITE whose `Alert-Info` carries
+ * `info=alert-autoanswer` — the token {@link AUTO_ANSWER_ALERT_INFO} owns — and rings normally for
+ * everything else.
+ *
+ * All four parameters are written explicitly rather than left to their defaults. Yealink's defaults
+ * for this family (`allow` 1, `tone` 1, `mute` 0, `barge` 0) are documented and are also exactly the
+ * values a phone that somebody has already touched will not have; a provisioned file that omits a
+ * parameter leaves whatever the handset last had, which is how one phone in a fleet ends up silently
+ * different from the other thirty-nine.
+ *
+ * `barge` stays OFF, and it is the only one of the four that is a policy choice rather than a
+ * transcription of the vendor's default. Barge answers the intercom while the user is on another
+ * call, putting that call on hold — which is right for an emergency page and wrong for the ordinary
+ * case, and a deployment that wants it can set `features.intercom.barge` through the settings
+ * cascade. Defaulting a fleet into "an intercom can interrupt any conversation" is not a default to
+ * ship silently.
+ */
+function autoAnswerEntries(): readonly string[] {
+	return [
+		`# auto-answer for INVITEs carrying "Alert-Info: ${AUTO_ANSWER_ALERT_INFO}"`,
+		"features.intercom.allow = 1",
+		// The warning tone before the microphone opens. A phone that answers silently is a phone
+		// whose owner cannot tell that it did, which is the one thing this feature must never be.
+		"features.intercom.tone = 1",
+		// Not muted on answer: a muted intercom is a page nobody can reply to, and the two-way case
+		// is what supervision and intercom are for.
+		"features.intercom.mute = 0",
+		// See the note above: off is a decision, not a copied default.
+		"features.intercom.barge = 0",
+	];
+}
+
 export const YEALINK_TEMPLATE: VendorTemplate = {
 	id: "0192a1c0-0000-7000-8000-000000000001",
 	vendor: "yealink",
@@ -190,16 +230,20 @@ export const YEALINK_TEMPLATE: VendorTemplate = {
 			`# rendered ${context.renderedAt.toISOString()}`,
 			"",
 			...context.lines.flatMap((line) => [...renderAccount(line), ""]),
+			...autoAnswerEntries(),
+			"",
 			...context.keys.flatMap((key) => renderKey(key)),
 		];
 		return `${body.join("\n")}${renderSettingsAsCfg(context.settings)}\n`;
 	},
 	sources: [
 		"Yealink Administrator's Guide for SIP-T2/T3/T4/T5/CP92X IP Phones V86.5 — `#!version:1.0.0.1` banner, boot/CFG file naming and per-model common-file codes, `account.X.*` table, `linekey.X.*` / `programablekey.X.*` / `expkey.X.*` and the numeric key-type table",
+		"Yealink Administrator's Guide V86 — `features.intercom.allow` / `.mute` / `.tone` / `.barge`, and the `Alert-Info: info=alert-autoanswer` trigger for answering an intercom INVITE automatically",
 	],
 	caveats: [
 		"Our `line` and `memory` key categories both render to `linekey`, which is the only DSS-key namespace this firmware line has — so a device using both categories at the same index renders two blocks and the later wins. Use one category per Yealink device.",
 		"`dtmf`, `transfer` and `url` have no verified Yealink line-key type code and render as `0` (N/A) rather than a guessed number.",
+		"Auto-answer is configured as the INTERCOM feature (`features.intercom.*`), not as `account.N.auto_answer` — the latter answers every inbound call unconditionally and would turn the handset into an open microphone. `features.intercom.barge` is left at 0, so an intercom will not interrupt a call already in progress; a deployment that wants emergency paging to barge must override it through the settings cascade.",
 		"Yealink caches user edits in `<mac>-local.cfg`; with `static.auto_provision.custom.protect = 1` a provisioned value will not override one the user changed on the handset.",
 		"Not validated against physical hardware.",
 	],

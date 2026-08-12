@@ -2,6 +2,7 @@ package rtp
 
 import (
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -99,6 +100,19 @@ type RecordingOptions struct {
 	MaxDuration time.Duration
 	// MaxSilence stops it after this much continuous quiet. Zero means no limit.
 	MaxSilence time.Duration
+	// TerminateOn is the set of DTMF digits that end the recording, or empty for none.
+	//
+	// plans/mediad-design.md §10 question 10: this was refused `not_supported` while rung 3's RECEIVE
+	// half did not exist, and stayed refused for one more wave after it did because "closing it is a
+	// recorder that stops on a detected digit plus one field threaded through the handler" and
+	// voicemail — the only caller that sends it — also needed the tone generator for `beep`. Both
+	// arrive together in this wave, which is what makes the pair worth closing: implementing either
+	// alone would have moved no call off Asterisk.
+	//
+	// The digits are matched against the DETECTOR's output, so a `#` typed by a caller ends their
+	// message with the same de-duplication every other consumer of a keypress gets — one event per
+	// press, however many packets carried it.
+	TerminateOn string
 }
 
 // RecordingSummary is a finished recording's facts, flattened for a Lifecycle implementation.
@@ -145,7 +159,9 @@ type Recording struct {
 	stopOnce sync.Once
 	stop     chan struct{}
 	stopWith atomic.Pointer[RecordingEndReason]
-	done     chan struct{}
+	// terminator is the digit that ended the recording, when one did. Reported in `detail`.
+	terminator atomic.Pointer[string]
+	done       chan struct{}
 
 	finishOnce sync.Once
 	summary    RecordingSummary
@@ -172,6 +188,23 @@ func (r *Recording) Dropped() int { return int(r.dropped.Load()) }
 
 // Stop finalises the recording. Idempotent; a stop of a finished recording does nothing.
 func (r *Recording) Stop() { r.stopFor(RecordingStopped) }
+
+// terminateOn ends the recording when a detected digit is in its terminator set.
+//
+// It reports whether it matched, so the caller can log the difference between "a digit arrived" and
+// "a digit ended a message". The reason on the wire is `stopped` rather than a new vocabulary member:
+// `MediaRecordingFinishedReason` has five values and the engine branches on `error` alone, so adding
+// a sixth would be two media planes agreeing on a shape nobody reads. WHICH digit ended it goes in
+// `detail`, which the contract already carries — and which is the only part a person investigating a
+// truncated voicemail actually wants.
+func (r *Recording) terminateOn(digit string) bool {
+	if r.opts.TerminateOn == "" || !strings.Contains(r.opts.TerminateOn, digit) {
+		return false
+	}
+	r.terminator.Store(&digit)
+	r.stopFor(RecordingStopped)
+	return true
+}
 
 func (r *Recording) stopFor(reason RecordingEndReason) {
 	r.stopOnce.Do(func() {
@@ -371,6 +404,9 @@ func (r *Recording) finish(reason RecordingEndReason) {
 			return
 		}
 		detail := ""
+		if digit := r.terminator.Load(); digit != nil {
+			detail = "terminated on " + *digit
+		}
 		if dropped := r.Dropped(); dropped > 0 {
 			// Surfaced rather than buried in a counter nobody reads: a recording with gaps in it is
 			// a recording somebody will play back and complain about, and this is the only place

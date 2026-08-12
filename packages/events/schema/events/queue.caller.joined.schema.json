@@ -25,6 +25,9 @@
 		"callerNumber": {
 			"type": "string",
 			"maxLength": 128
+		},
+		"resumed": {
+			"type": "boolean"
 		}
 	},
 	"required": ["callId", "legId", "position", "priority"],

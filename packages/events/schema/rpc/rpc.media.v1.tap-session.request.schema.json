@@ -1,0 +1,41 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"tapId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"tapSessionId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"targetSessionId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"targetSide": {
+			"type": "string",
+			"enum": ["a", "b"]
+		},
+		"hear": {
+			"default": "both",
+			"type": "string",
+			"enum": ["a", "b", "both", "none"]
+		},
+		"speakTo": {
+			"default": "none",
+			"type": "string",
+			"enum": ["a", "b", "both", "none"]
+		},
+		"mode": {
+			"type": "string",
+			"enum": ["eavesdrop", "whisper", "barge"]
+		}
+	},
+	"required": ["tapId", "tapSessionId", "targetSessionId", "hear", "speakTo"],
+	"additionalProperties": false
+}

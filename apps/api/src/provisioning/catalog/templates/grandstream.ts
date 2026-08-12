@@ -1,3 +1,4 @@
+import { AUTO_ANSWER_CALL_INFO } from "../../auto-answer";
 import { renderSettingsAsXmlElements, xmlEscape, xmlValue } from "../format";
 import type { RenderContext, RenderKey, RenderLine } from "../render-context";
 import type { VendorTemplate } from "../template";
@@ -174,6 +175,46 @@ function renderKeys(keys: readonly RenderKey[]): readonly string[] {
 		});
 }
 
+/**
+ * Auto-answer — the one vendor of the five that does not read `Alert-Info` at all.
+ *
+ * Grandstream's feature is named "Allow Auto Answer by Call-Info", and what it matches is
+ * `answer-after=` on a **`Call-Info`** header: the Broadsoft/Cisco convention rather than the
+ * Yealink/Snom one. That is a header difference and not a token difference, which is why
+ * `packages/…/auto-answer.ts` exports a second constant rather than trying to pick a spelling that
+ * satisfies everybody. A switch paging a mixed fleet has to send both headers; a phone ignores the
+ * one it was not configured for, so sending both costs nothing.
+ *
+ * ## Why P-NAMES in an alias document, which this template otherwise never writes
+ *
+ * The two parameters are corroborated as `P298` ("Allow Auto Answer by Call-Info", 0/1) and `P2356`
+ * ("Custom Call-Info for Auto Answer"). Their ALIAS names are not — they appear in no Grandstream
+ * document this build could read, and the class comment above explains at length what a template
+ * that invents a parameter name buys: a setting the phone silently ignores, indistinguishable from
+ * one it applied. So the corroborated names are written and the uncorroborated ones are not, which
+ * is the same trade `fanvil.ts` makes when it renders an unverified key as `Type 0`.
+ *
+ * The risk this takes is bounded and worth stating. A `<config version="2">` document is a list of
+ * independent `<item>` elements; an item whose NAME the firmware does not recognise is dropped on
+ * its own, and does not invalidate the account credentials three lines above it. The "mixing the
+ * dialects breaks the document" warning in the class comment is about writing ALIAS names under
+ * `version="1"`, which is a whole-document dialect mismatch. This is the other direction and is
+ * per-item. Still UNVERIFIED — see `caveats`.
+ */
+function autoAnswerItems(): readonly string[] {
+	return [
+		// "Allow Auto Answer by Call-Info" — 0 No, 1 Yes, default 0.
+		item("P298", 1),
+		/*
+		 * "Custom Call-Info for Auto Answer": the string the phone looks for in the Call-Info header.
+		 * Set explicitly rather than left empty, because an empty value on this parameter is
+		 * documented as "any Call-Info", and a handset that auto-answers on ANY Call-Info header will
+		 * eventually be opened by a carrier or an SBC that adds one for its own reasons.
+		 */
+		item("P2356", AUTO_ANSWER_CALL_INFO),
+	];
+}
+
 export const GRANDSTREAM_TEMPLATE: VendorTemplate = {
 	id: "0192a1c0-0000-7000-8000-000000000003",
 	vendor: "grandstream",
@@ -193,6 +234,7 @@ export const GRANDSTREAM_TEMPLATE: VendorTemplate = {
 			// below to a P-value produces a document the phone silently ignores.
 			'\t<config version="2">',
 			...context.lines.flatMap((line) => renderAccount(line)),
+			...autoAnswerItems(),
 			...renderKeys(context.keys),
 			...(settings.length === 0 ? [] : [settings]),
 			"\t</config>",
@@ -205,6 +247,7 @@ export const GRANDSTREAM_TEMPLATE: VendorTemplate = {
 		"Grandstream GRP261x/262x/263x Administration Guide — alias dialect, filename request order `cfg<mac>.xml → cfg<mac> → cfg<model>.xml → cfg.xml → dev<mac>.cfg → external.cfg`, P8467",
 		"Grandstream GXP21xx Administration Guide, Table 24 — VPK mode table (string and integer forms)",
 		"Grandstream-authored configuration templates — account P-value cross-check (P271/P270/P47/P48/P35/P36/P34/P3/P31/P32/P130), the `(N+2)×100` per-account block, VPK P1363/P1364/P1465/P1466",
+		'Grandstream P-code tables and the GXP/GRP administration guides — `P298` "Allow Auto Answer by Call-Info" (0 No / 1 Yes, default 0) and `P2356` "Custom Call-Info for Auto Answer"; the feature reads the Call-Info header and not Alert-Info',
 	],
 	caveats: [
 		"String key modes are used specifically to avoid the VPK integer conflict: the GXP21xx table gives Line=0/SpeedDial=10/BLF=11 while the dynamic-VPK scale gives SpeedDial=0/BLF=1/Line=31. Which scale a GRP26xx uses for fixed line VPKs is UNVERIFIED and contradictory across Grandstream's own documents.",
@@ -213,6 +256,8 @@ export const GRANDSTREAM_TEMPLATE: VendorTemplate = {
 		"A VPK's `account` is 0-indexed while account parameters are 1-indexed.",
 		"Dynamic VPKs must be contiguous, so a key's slot is its position among configured keys rather than its `keyIndex` — unlike every other vendor in this catalogue.",
 		"A non-default registrar port is written into `sip.server.1.address` as `host:port`; `sip.localPort` is the phone's own listener and is deliberately not used for it.",
+		"This is the ONLY vendor in the catalogue that does not auto-answer on `Alert-Info`. Its feature reads `Call-Info` and matches `answer-after=0`, so an originator that sends only the Alert-Info header will page every other vendor and ring this one.",
+		"UNVERIFIED: the two auto-answer parameters are written as the corroborated P-NAMES `P298` and `P2356` because their alias-dialect names could not be found in any Grandstream document. An unrecognised `<item name>` is expected to be dropped on its own rather than to invalidate the document, but that per-item behaviour has not been confirmed on hardware. Configure auto-answer in the phone's web UI, export the configuration, and read back the names it uses.",
 		"Not validated against physical hardware.",
 	],
 };

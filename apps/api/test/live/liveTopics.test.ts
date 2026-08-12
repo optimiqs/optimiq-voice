@@ -11,6 +11,9 @@ import {
 	permissionForTopic,
 	sourcesForTopic,
 } from "../../src/live/live-topics";
+import type { LiveTopic } from "../../src/live/live-topics";
+
+const QUEUE = "019fd3c2-2222-76be-a6b3-b0f1914e39b6";
 
 /**
  * The live channel's topic grammar and permission mapping.
@@ -55,8 +58,18 @@ describe("parseLiveTopic", () => {
 		expect(parseLiveTopic("calls.evt.v1.>")).to.equal(undefined);
 	});
 
+	it("accepts the trunks topic", () => {
+		expect(parseLiveTopic("trunks")).to.deep.equal({ kind: "trunks" });
+	});
+
 	it("round-trips through the wire form", () => {
-		for (const name of ["registrations", "active-calls", "agent-state", `queue:${QUEUE_ID}`]) {
+		for (const name of [
+			"registrations",
+			"active-calls",
+			"agent-state",
+			"trunks",
+			`queue:${QUEUE_ID}`,
+		]) {
 			const topic = parseLiveTopic(name);
 			expect(topic, name).to.not.equal(undefined);
 			expect(formatLiveTopic(topic!)).to.equal(name);
@@ -75,15 +88,24 @@ describe("the permission mapping", () => {
 	it("reads active calls from the channel bucket AND the call stream", () => {
 		// A bucket says what IS and a stream says what CHANGED. A wallboard with only the first
 		// would have to redraw a whole table to show one leg answering.
-		expect(sourcesForTopic({ kind: "active-calls" })).to.deep.equal([
-			"channels-kv",
-			"call-events",
-		]);
+		expect(sourcesForTopic({ kind: "active-calls" })).to.deep.equal(["channels-kv", "call-events"]);
 	});
 
 	it("gates queue and agent-state on queues.monitor", () => {
 		expect(permissionForTopic({ kind: "queue", queueId: QUEUE_ID })).to.equal("queues.monitor");
 		expect(permissionForTopic({ kind: "agent-state" })).to.equal("queues.monitor");
+	});
+
+	/**
+	 * The voicemail argument, applied to carriers: the topic carries the same status word, reason
+	 * and round-trip time `GET /trunks` already returns to anyone holding `trunks.read`, so gating
+	 * "the same row, sooner" differently from the list would either protect nothing or leak the
+	 * carrier roster. One stream source and no bucket — the current statuses are the `trunk.status*`
+	 * columns the page has already fetched.
+	 */
+	it("gates trunks on trunks.read and reads only the trunk event stream", () => {
+		expect(permissionForTopic({ kind: "trunks" })).to.equal("trunks.read");
+		expect(sourcesForTopic({ kind: "trunks" })).to.deep.equal(["trunk-events"]);
 	});
 
 	/**
@@ -106,7 +128,15 @@ describe("the permission mapping", () => {
 		expect(mayReadTopic(agent, { kind: "agent-state" })).to.equal(true);
 		expect(mayReadTopic(agent, { kind: "registrations" })).to.equal(false);
 		expect(mayReadTopic(agent, { kind: "active-calls" })).to.equal(false);
-		expect([...allowedTopicKinds(agent)].sort()).to.deep.equal(["agent-state", "queue"]);
+		// `conferences` joins the list, and that is the intended shape rather than a widening: an
+		// agent already holds `conferences.read` and can list the tenant's rooms over HTTP, so a live
+		// feed of which of them are running is the same page one field wider and sooner. Moderating
+		// one is a different grant they do not hold.
+		expect([...allowedTopicKinds(agent)].sort()).to.deep.equal([
+			"agent-state",
+			"conferences",
+			"queue",
+		]);
 	});
 
 	it("gives a manager everything, which is what a supervisor's wallboard needs", () => {
@@ -134,5 +164,34 @@ describe("the permission mapping", () => {
 		expect(mayReadTopic(["extensions.read.own"], { kind: "registrations" })).to.equal(false);
 		// …and the documented direction that DOES hold.
 		expect(mayReadTopic(["cdr.read"], { kind: "active-calls" })).to.equal(true);
+	});
+});
+
+/**
+ * The waiting line as a live source.
+ *
+ * What a wallboard needs from a queue topic is three numbers — how many are holding, where each of
+ * them stands, how long the front of the line has been there — and all three are one KV record. The
+ * assertion that matters is that it is a SNAPSHOT source: a wallboard opening at 09:05 must be shown
+ * the callers who joined at 09:04, and a stream-only topic can only ever show it what has happened
+ * since it connected.
+ */
+describe("the queue waiting line", () => {
+	it("is a source of the queue topic, alongside the events and the agent states", () => {
+		expect(sourcesForTopic({ kind: "queue", queueId: QUEUE })).to.include("queue-waiting-kv");
+	});
+
+	it("is not a source of any other topic, because the line is per queue", () => {
+		for (const kind of LIVE_TOPIC_KINDS) {
+			if (kind === "queue") {
+				continue;
+			}
+			expect(sourcesForTopic({ kind } as LiveTopic)).to.not.include("queue-waiting-kv");
+		}
+	});
+
+	/** Reading the line is reading the queue. Nothing new to gate, and nothing quietly widened. */
+	it("adds no permission of its own — the queue topic's gate already covers it", () => {
+		expect(permissionForTopic({ kind: "queue", queueId: QUEUE })).to.equal("queues.monitor");
 	});
 });

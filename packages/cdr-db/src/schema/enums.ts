@@ -31,6 +31,19 @@ export const CALL_DESTINATION_TYPES = [
 	"application",
 	"time_condition",
 	"park",
+	/**
+	 * A paging group. Appended rather than folded into `application`, which is where a paged leg
+	 * would otherwise land.
+	 *
+	 * The alternative was to leave it out and let `cdr-leg-mapping.ts` alias `paging` to `unknown`,
+	 * which is what it did before this value existed. That is not a small inaccuracy: a page
+	 * originates one auto-answered leg per member, so the busiest announcement in the building is
+	 * also the largest single producer of legs the reports cannot attribute — "unknown" would stop
+	 * being a rare residue and become the second-largest destination in the table. The check
+	 * constraint is one `drop`/`add` pair away from accepting it, which is precisely the property
+	 * this file's header keeps text-plus-check for.
+	 */
+	"paging",
 	"unknown",
 ] as const;
 export type CallDestinationType = (typeof CALL_DESTINATION_TYPES)[number];
@@ -42,6 +55,30 @@ export type HangupSide = (typeof HANGUP_SIDES)[number];
 /** Reporting outcome of the leg. Authoritative for billing together with `answered_at`. */
 export const CALL_DISPOSITIONS = ["answered", "no-answer", "busy", "failed", "voicemail"] as const;
 export type CallDisposition = (typeof CALL_DISPOSITIONS)[number];
+
+/**
+ * How a caller's stay in a queue ended.
+ *
+ * Deliberately NOT `CALL_DISPOSITIONS`, which is about the LEG: a queued caller whose leg ends
+ * `answered` may have been answered by an agent, or by the voicemail box their queue's timeout
+ * branch sent them to, and an SLA that could not tell those apart would report a queue nobody is
+ * staffing as fully served. This is the queue's own verdict, and it is the column every contact-
+ * centre report groups by.
+ *
+ * The five failures mirror `queue.caller.abandoned`'s `reason` exactly, so a live wallboard and a
+ * historical report cannot drift into two vocabularies for one fact. `exit-key` stays distinct from
+ * `overflow` because one caller chose to stop waiting and the other had the choice made for them —
+ * only one of those tells a supervisor their exit key is working.
+ */
+export const QUEUE_OUTCOMES = [
+	"answered",
+	"caller-hangup",
+	"timeout",
+	"overflow",
+	"no-agents",
+	"exit-key",
+] as const;
+export type QueueOutcome = (typeof QUEUE_OUTCOMES)[number];
 
 /** Lifecycle of the async transcription pipeline; a late-arriving field on the leg. */
 export const TRANSCRIPTION_STATUSES = [

@@ -15,6 +15,8 @@ import { CdrLegMappingError, mapCdrLegWrite } from "../../src/cdr/writer/cdr-leg
 const ORG = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
 const LEG = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c";
 const CALL = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d";
+const QUEUE = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a6a";
+const AGENT = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a6b";
 
 function payload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
 	return {
@@ -73,6 +75,21 @@ describe("cdr.leg.write → call_legs", () => {
 		}
 	});
 
+	/**
+	 * A paged leg is attributed, not filed under `unknown`.
+	 *
+	 * Both spellings arrive in practice — `paging` is the plan-node kind the engine copies out of the
+	 * walk, `paging-group` is the `pbx-db` destination type on a row that routed into an announcement
+	 * — and a page produces one leg per member, so getting this wrong would not lose a row here and
+	 * there: it would make `unknown` the second-largest destination in the reports.
+	 */
+	it("attributes a page to the group rather than filing it under unknown", () => {
+		for (const received of ["paging", "paging-group"]) {
+			const result = mapCdrLegWrite(ORG, payload({ destinationType: received }));
+			expect(result.values.destinationType, received).to.equal("paging");
+		}
+	});
+
 	it("maps plan steps that are not destinations to unknown", () => {
 		for (const step of ["playback", "feature-code", "hangup"]) {
 			const result = mapCdrLegWrite(ORG, payload({ destinationType: step }));
@@ -83,9 +100,7 @@ describe("cdr.leg.write → call_legs", () => {
 	it("never produces a destination type the column would refuse", () => {
 		for (const received of ["ring-group", "ivr-menu", "who-knows", "", "playback"]) {
 			const result = mapCdrLegWrite(ORG, payload({ destinationType: received }));
-			expect(CALL_DESTINATION_TYPES as readonly string[]).to.include(
-				result.values.destinationType,
-			);
+			expect(CALL_DESTINATION_TYPES as readonly string[]).to.include(result.values.destinationType);
 		}
 	});
 
@@ -108,16 +123,25 @@ describe("cdr.leg.write → call_legs", () => {
 	});
 
 	it("keeps a non-UUID destination ref in raw instead of discarding it", () => {
-		const result = mapCdrLegWrite(ORG, payload({ destinationType: "external", destinationRef: "+441134960000" }));
+		const result = mapCdrLegWrite(
+			ORG,
+			payload({ destinationType: "external", destinationRef: "+441134960000" }),
+		);
 
 		expect(result.values.destinationRef).to.equal(null);
 		expect(result.values.raw.destinationRefRaw).to.equal("+441134960000");
 	});
 
+	/**
+	 * `queueRef` used to be this test's example of an unmapped key, and it is now a column — which is
+	 * the whole point of the behaviour: a producer running ahead of the schema has its extra fields
+	 * kept rather than dropped, and the day the column arrives they move without a backfill. The
+	 * example moved to `ivrRef`, which is the next column in `call_legs` waiting for a writer.
+	 */
 	it("passes unknown payload keys through to raw", () => {
-		const result = mapCdrLegWrite(ORG, payload({ queueRef: "q-1", sipDisposition: "200 OK" }));
+		const result = mapCdrLegWrite(ORG, payload({ ivrRef: "ivr-1", sipDisposition: "200 OK" }));
 
-		expect(result.values.raw.queueRef).to.equal("q-1");
+		expect(result.values.raw.ivrRef).to.equal("ivr-1");
 		expect(result.values.raw.sipDisposition).to.equal("200 OK");
 	});
 
@@ -154,5 +178,125 @@ describe("cdr.leg.write → call_legs", () => {
 		const result = mapCdrLegWrite(ORG, payload({ endedAt: null }));
 
 		expect(result.values.endedAt).to.equal(null);
+	});
+});
+
+/**
+ * The queue verdict.
+ *
+ * All four columns or none. Half a verdict in a service level is worse than none: a wait with no
+ * outcome is counted by an average and by nothing else, which is the shape of a number that is
+ * quietly wrong for a quarter before anybody notices.
+ */
+describe("the queue leg", () => {
+	function queued(overrides: Record<string, unknown> = {}) {
+		return mapCdrLegWrite(ORG, {
+			...payload(),
+			queueRef: QUEUE,
+			queueOutcome: "answered",
+			queueWaitMs: 12_000,
+			queueAgentRef: AGENT,
+			...overrides,
+		}).values;
+	}
+
+	it("maps a served queue call", () => {
+		const values = queued();
+		expect(values.queueRef).to.equal(QUEUE);
+		expect(values.queueOutcome).to.equal("answered");
+		expect(values.queueWaitMs).to.equal(12_000);
+		expect(values.queueAgentRef).to.equal(AGENT);
+	});
+
+	it("leaves every column null on a leg that never touched a queue", () => {
+		const values = mapCdrLegWrite(ORG, payload()).values;
+		expect(values.queueRef).to.equal(null);
+		expect(values.queueOutcome).to.equal(null);
+		expect(values.queueWaitMs).to.equal(null);
+		expect(values.queueAgentRef).to.equal(null);
+	});
+
+	it("drops the whole verdict when the outcome is missing, rather than storing half of it", () => {
+		const values = queued({ queueOutcome: undefined });
+		expect(values.queueRef).to.equal(null);
+		expect(values.queueWaitMs).to.equal(null);
+	});
+
+	it("drops the whole verdict when the queue is missing", () => {
+		const values = queued({ queueRef: undefined });
+		expect(values.queueOutcome).to.equal(null);
+	});
+
+	/** An agent id beside an abandonment would make "who took this call" answerable for nobody. */
+	it("refuses an agent on any outcome but an answer", () => {
+		const values = queued({ queueOutcome: "caller-hangup" });
+		expect(values.queueOutcome).to.equal("caller-hangup");
+		expect(values.queueAgentRef).to.equal(null);
+	});
+
+	it("records a coercion for an outcome nobody has taught it, and keeps the row", () => {
+		const mapped = mapCdrLegWrite(ORG, {
+			...payload(),
+			queueRef: QUEUE,
+			queueOutcome: "eaten-by-a-bear",
+		});
+		expect(mapped.values.queueOutcome).to.equal(null);
+		expect(mapped.coercions.map((entry) => entry.field)).to.include("queueOutcome");
+	});
+});
+
+/**
+ * The authorisation code that paid for a gated outbound call.
+ *
+ * Two columns, and the ORDINAL is what makes the pair real: a label with no ordinal is a string a
+ * producer put on a call that was never gated, and it would show up in a report as an authorisation
+ * that did not happen. The digits are not in the contract at all — see `cdr-events.ts` — so the one
+ * thing that cannot be tested here is the one thing that matters most, and it is pinned at the
+ * source instead, in `plan-walker-admin-block.spec.ts`.
+ */
+describe("the authorising PIN", () => {
+	it("maps the ordinal and the label a gated route recorded", () => {
+		const values = mapCdrLegWrite(ORG, {
+			...payload(),
+			authPinOrdinal: 3,
+			authPinLabel: "Night desk",
+		}).values;
+		expect(values.authPinOrdinal).to.equal(3);
+		expect(values.authPinLabel).to.equal("Night desk");
+	});
+
+	it("leaves both null on a call that took no gated route", () => {
+		const values = mapCdrLegWrite(ORG, payload()).values;
+		expect(values.authPinOrdinal).to.equal(null);
+		expect(values.authPinLabel).to.equal(null);
+	});
+
+	/** An ordinal of zero is a real ordinal. It must not be collapsed onto "not gated". */
+	it("keeps a zero ordinal, which is a code and not an absence", () => {
+		const values = mapCdrLegWrite(ORG, { ...payload(), authPinOrdinal: 0 }).values;
+		expect(values.authPinOrdinal).to.equal(0);
+	});
+
+	it("drops a label that arrives without an ordinal, rather than storing half a fact", () => {
+		const values = mapCdrLegWrite(ORG, { ...payload(), authPinLabel: "Night desk" }).values;
+		expect(values.authPinOrdinal).to.equal(null);
+		expect(values.authPinLabel).to.equal(null);
+	});
+
+	/** A long label is a form somebody over-filled, not a billing record worth quarantining. */
+	it("truncates an over-long label instead of refusing the row", () => {
+		const values = mapCdrLegWrite(ORG, {
+			...payload(),
+			authPinOrdinal: 1,
+			authPinLabel: "x".repeat(400),
+		}).values;
+		expect(values.authPinLabel).to.have.lengthOf(128);
+	});
+
+	it("ignores an ordinal that is not a whole non-negative number", () => {
+		for (const ordinal of [-1, 1.5, "3", null]) {
+			const values = mapCdrLegWrite(ORG, { ...payload(), authPinOrdinal: ordinal }).values;
+			expect(values.authPinOrdinal, JSON.stringify(ordinal)).to.equal(null);
+		}
 	});
 });

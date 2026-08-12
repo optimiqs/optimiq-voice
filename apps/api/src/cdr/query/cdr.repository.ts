@@ -79,6 +79,11 @@ const LEG_DETAIL_COLUMNS = {
 	mos: callLegs.mos,
 	jitterMs: callLegs.jitterMs,
 	packetLossPct: callLegs.packetLossPct,
+	// The outbound PIN that authorised this leg, ordinal and label only — the digits stop at the
+	// walker. Denormalised (there is no `pin_set` in this database to join), so the label is the
+	// name as it stood when the call was placed and a later rename does not rewrite history.
+	authPinOrdinal: callLegs.authPinOrdinal,
+	authPinLabel: callLegs.authPinLabel,
 	raw: callLegs.raw,
 	createdAt: callLegs.createdAt,
 } as const;

@@ -40,7 +40,13 @@ describe("cdr tenant RLS preflight plan", () => {
 		expect(cdrTenantRlsPreflightPlan.schemaName).toBe("public");
 	});
 
-	it("declares the two ledgers append-only and recordings read-write", () => {
+	/**
+	 * The whole list, in order, so a table added to this database cannot arrive without somebody
+	 * choosing its mode. That is the point of asserting the exact array rather than a membership:
+	 * the DEFAULT for a new table is "nobody thought about it", and the append-only guarantee is a
+	 * privilege fact that no policy edit can restore once it has been given away.
+	 */
+	it("declares the two ledgers append-only and the two lifecycles read-write", () => {
 		expect(
 			cdrTenantRlsPreflightPlan.expectations.map((expectation) => [
 				expectation.table,
@@ -49,6 +55,8 @@ describe("cdr tenant RLS preflight plan", () => {
 		).toEqual([
 			["call_events", "append-only"],
 			["call_legs", "append-only"],
+			// An export job is claimed, advanced and completed — every transition an UPDATE.
+			["cdr_export_job", "read-write"],
 			["recordings", "read-write"],
 		]);
 		expect(CDR_APPEND_ONLY_TABLES).toEqual(["call_events", "call_legs"]);
@@ -74,6 +82,7 @@ describe("cdr tenant RLS preflight plan", () => {
 		const result = evaluateTenantRlsPreflight(cdrTenantRlsPreflightPlan, [
 			healthy("call_events"),
 			healthy("call_legs", { tenantRoleHasForbiddenPrivileges: true }),
+			healthy("cdr_export_job"),
 			healthy("recordings"),
 		]);
 
@@ -85,6 +94,7 @@ describe("cdr tenant RLS preflight plan", () => {
 		const result = evaluateTenantRlsPreflight(cdrTenantRlsPreflightPlan, [
 			healthy("call_events"),
 			healthy("call_legs", { tenantPolicyCount: 3 }),
+			healthy("cdr_export_job"),
 			healthy("recordings"),
 		]);
 
@@ -96,6 +106,7 @@ describe("cdr tenant RLS preflight plan", () => {
 		const result = evaluateTenantRlsPreflight(cdrTenantRlsPreflightPlan, [
 			healthy("call_events"),
 			healthy("call_legs"),
+			healthy("cdr_export_job"),
 			healthy("recordings", { rowSecurity: false }),
 		]);
 

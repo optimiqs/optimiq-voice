@@ -3,15 +3,20 @@ import { connect, type KV, KvWatchInclude, type NatsConnection, type Subscriptio
 import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import {
 	agentStateEntrySchema,
+	conferenceClaimSchema,
+	queueWaitingRecordSchema,
 	callEventSchema,
 	liveChannelSchema,
 	queueEventSchema,
 	registrationBindingSchema,
+	trunkEventSchema,
 	voicemailEventSchema,
 } from "@optimiq-voice/events/schemas";
 import {
 	AGENT_STATE_KV,
+	QUEUE_WAITING_KV,
 	CHANNELS_KV,
+	CONFERENCE_CLAIMS_KV,
 	ensureKvBuckets,
 	REGISTRATIONS_KV,
 } from "@optimiq-voice/events/streams";
@@ -104,11 +109,33 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 			});
 			const manager = await this.connection.jetstreamManager();
 			if (this.env.PBX_ENSURE_KV_BUCKETS) {
-				await ensureKvBuckets(manager, [REGISTRATIONS_KV, CHANNELS_KV, AGENT_STATE_KV]);
+				await ensureKvBuckets(manager, [
+					REGISTRATIONS_KV,
+					CHANNELS_KV,
+					AGENT_STATE_KV,
+					QUEUE_WAITING_KV,
+				]);
 			}
 			const jetstream = manager.jetstream();
-			for (const definition of [REGISTRATIONS_KV, CHANNELS_KV, AGENT_STATE_KV]) {
+			for (const definition of [REGISTRATIONS_KV, CHANNELS_KV, AGENT_STATE_KV, QUEUE_WAITING_KV]) {
 				this.buckets.set(definition.name, await jetstream.views.kv(definition.name));
+			}
+			// Bound but NEVER ensured, unlike the four above, and the asymmetry is the point:
+			// `conference-claims` is an ownership record between engine instances that this identity may
+			// read and may not write (`config/nats.conf`), so a control plane that created it would be
+			// deciding the replicas and history of a bucket the call path depends on. A deployment where
+			// no conference has ever run therefore has no bucket, and the conferences topic simply has
+			// no snapshot until one does.
+			try {
+				this.buckets.set(
+					CONFERENCE_CLAIMS_KV.name,
+					await jetstream.views.kv(CONFERENCE_CLAIMS_KV.name),
+				);
+			} catch (error) {
+				logger.info(
+					{ err: error },
+					"no conference-claims bucket yet; the conferences topic will carry events only",
+				);
 			}
 			logger.info({ servers: this.env.NATS_URL }, "live hub connected");
 		} catch (error) {
@@ -363,12 +390,10 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 			logger.warn({ organizationId, source, key }, "dropping an unparseable live KV entry");
 			return undefined;
 		}
-		const schema =
-			source === "registrations-kv"
-				? registrationBindingSchema
-				: source === "channels-kv"
-					? liveChannelSchema
-					: agentStateEntrySchema;
+		const schema = SCHEMA_FOR_KV_SOURCE[source as keyof typeof SCHEMA_FOR_KV_SOURCE];
+		if (schema === undefined) {
+			return undefined;
+		}
 		const result = schema.safeParse(decoded);
 		if (!result.success) {
 			this.dropped += 1;
@@ -534,6 +559,22 @@ const SUBJECT_FILTER_FOR_SOURCE: Readonly<
 	 */
 	"voicemail-events": (organizationId) =>
 		subjectFilterFor.voicemailEventInOrg(organizationId, "mwi.updated"),
+	/**
+	 * The whole family, unlike the voicemail entry above, and the asymmetry is deliberate: the
+	 * family's one event IS the topic's payload, and there is no sibling on the root whose bytes
+	 * `trunks.read` should not see. If a second trunk event ever joins the family, this is the
+	 * line that decides whether it rides the topic.
+	 */
+	"trunk-events": (organizationId) => subjectFilterFor.trunksInOrg(organizationId),
+	/**
+	 * `calls.evt.v1.<org>.*.conference.>` and NOT the whole call family, which is the same filtering
+	 * decision `voicemail-events` makes and for a sharper reason. The conference events share a
+	 * SUBJECT ROOT with every channel transition in the tenant, and this topic is gated on
+	 * `conferences.read` where `active-calls` is gated on `cdr.read`. A subscriber holding one and
+	 * not the other must not be handed the other's feed because the two families happen to live under
+	 * one prefix — so the narrowing happens at the BROKER, and those bytes never leave it.
+	 */
+	"conference-events": (organizationId) => subjectFilterFor.conferenceEventsInOrg(organizationId),
 };
 
 /** Which contract each stream source's payloads are parsed against. */
@@ -541,13 +582,21 @@ const EVENT_SCHEMA_FOR_SOURCE: Readonly<
 	Partial<
 		Record<
 			LiveSource,
-			typeof callEventSchema | typeof queueEventSchema | typeof voicemailEventSchema
+			| typeof callEventSchema
+			| typeof queueEventSchema
+			| typeof voicemailEventSchema
+			| typeof trunkEventSchema
 		>
 	>
 > = {
 	"call-events": callEventSchema,
 	"queue-events": queueEventSchema,
 	"voicemail-events": voicemailEventSchema,
+	"trunk-events": trunkEventSchema,
+	// The same union `active-calls` parses against, because these ARE call events — the filter is
+	// what makes the topic narrow, not a second schema. A separate one would be a second opinion
+	// about a shape one package already owns.
+	"conference-events": callEventSchema,
 };
 
 /** Which bucket each KV-backed source reads. Stream sources map to `undefined`. */
@@ -555,4 +604,26 @@ const BUCKET_FOR_SOURCE: Readonly<Partial<Record<LiveSource, string>>> = {
 	"registrations-kv": REGISTRATIONS_KV.name,
 	"channels-kv": CHANNELS_KV.name,
 	"agent-state-kv": AGENT_STATE_KV.name,
+	"queue-waiting-kv": QUEUE_WAITING_KV.name,
+	"conference-claims-kv": CONFERENCE_CLAIMS_KV.name,
 };
+
+/**
+ * The value schema for each KV-backed source.
+ *
+ * A table rather than the ternary chain this used to be. The chain's last arm was a default, so a
+ * source added without a case would have been parsed as an agent-state entry, failed, and been
+ * dropped silently — a live topic that produces nothing, with an error log that names the wrong
+ * schema. A table with a `satisfies` cannot be added to without saying which shape it carries.
+ */
+const SCHEMA_FOR_KV_SOURCE = {
+	"registrations-kv": registrationBindingSchema,
+	"channels-kv": liveChannelSchema,
+	"agent-state-kv": agentStateEntrySchema,
+	"queue-waiting-kv": queueWaitingRecordSchema,
+	// A CLAIM rather than a purpose-built projection. It carries the room's bridge, its per-instance
+	// contributions and its lock, which is a complete answer to "which meetings are running and how
+	// big are they" — and it is written on a path that has to succeed anyway, so the live view costs
+	// no new writer. See LIVE_TOPIC_SOURCES.conferences for what it deliberately does not carry.
+	"conference-claims-kv": conferenceClaimSchema,
+} as const;

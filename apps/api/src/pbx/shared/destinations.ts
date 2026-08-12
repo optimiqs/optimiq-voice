@@ -34,7 +34,17 @@ import type { DestinationIssueWire } from "./pbx.errors";
  * `<prefix>_destination_type` / `_ref` / `_data`; the Drizzle keys are
  * `<prefix>DestinationType` etc.
  */
-export type DestinationPrefix = "" | "failover" | "nomatch" | "timeout" | "invalid";
+export type DestinationPrefix =
+	| ""
+	| "failover"
+	| "nomatch"
+	| "timeout"
+	| "invalid"
+	// The T2 admin block's two. `night` is a call flow's other position and `fallback` is where a
+	// stream goes when it ends or cannot be played; both are REQUIRED trios, which the schema
+	// enforces with a non-optional shape check even though the columns are nullable.
+	| "night"
+	| "fallback";
 
 /** Where one destination trio lives, and whether the row is allowed not to have one. */
 export interface DestinationField {
@@ -193,6 +203,26 @@ export const DESTINATION_SITES: readonly DestinationSite[] = [
 	{ table: "queue", kind: "queue", prefix: "timeout_", nameColumn: "name" },
 	{ table: "park_lot", kind: "park-lot", prefix: "timeout_", nameColumn: "name" },
 	{ table: "voicemail_option", kind: "voicemail-option", prefix: "", nameColumn: "label" },
+
+	// --- the T2 admin block ---------------------------------------------------------------------
+	//
+	// Both halves of a call flow's switch, because deleting the extension the DAY branch points at
+	// must be refused just as loudly as deleting the night one — a switch with one working position
+	// is the failure this feature can have and the one nobody would notice until five o'clock.
+	{ table: "call_flow", kind: "call-flow", prefix: "", nameColumn: "name" },
+	{ table: "call_flow", kind: "call-flow", prefix: "night_", nameColumn: "name" },
+	// An alias produces no plan node — it expands flat — but it is still a POINTER, and a dangling
+	// one fails the next compile rather than this delete. Scanning it is what turns that into a 409
+	// naming the alias instead of a 422 on somebody else's unrelated save.
+	{ table: "destination_alias", kind: "destination-alias", prefix: "", nameColumn: "name" },
+	{ table: "audio_stream", kind: "audio-stream", prefix: "fallback_", nameColumn: "name" },
+	{
+		table: "dial_by_name_directory",
+		kind: "dial-by-name-directory",
+		prefix: "timeout_",
+		nameColumn: "name",
+	},
+	{ table: "speed_dial", kind: "speed-dial", prefix: "", nameColumn: "label" },
 ];
 
 /**
@@ -241,9 +271,24 @@ export async function findDestinationReferences(
 /** Non-destination foreign keys the CRUD layer also refuses to orphan. */
 export interface ScalarReferenceSite {
 	readonly table: string;
+	/** The entity a refused delete names. Usually `table`'s own kind — see {@link idColumn}. */
 	readonly kind: string;
 	readonly column: string;
 	readonly nameColumn: string | null;
+	/**
+	 * Which column identifies the thing the USER has to go and fix. Defaults to `id`.
+	 *
+	 * For nearly every site the referring row is the thing to fix: an IVR menu naming a prompt is an
+	 * IVR menu somebody opens and re-points. A CHILD row is not — `phrase_step` has no screen of its
+	 * own, and handing a user a step id would name a row they cannot navigate to. So that site sets
+	 * `idColumn: "phrase_id"` and a `kind` to match, and the 409 names the PHRASE, which is the row
+	 * with the form on it.
+	 *
+	 * The rows are de-duplicated on `(kind, id)` for the same reason this exists: a phrase is allowed
+	 * to play the same prompt twice — that is the composition `phrases-schema.ts` points at instead
+	 * of nesting — and listing it twice would make one phrase look like two.
+	 */
+	readonly idColumn?: string;
 }
 
 export async function findScalarReferences(
@@ -252,19 +297,26 @@ export async function findScalarReferences(
 	id: string,
 ): Promise<readonly EntityReference[]> {
 	const references: EntityReference[] = [];
+	const seen = new Set<string>();
 	for (const site of sites) {
 		const nameExpression =
 			site.nameColumn === null ? sql`null` : sql`${sql.identifier(site.nameColumn)}::text`;
 		const rows = await transaction.execute(sql`
-			select id::text as id, ${nameExpression} as name
+			select distinct ${sql.identifier(site.idColumn ?? "id")}::text as id, ${nameExpression} as name
 			from ${sql.identifier(site.table)}
 			where ${sql.identifier(site.column)} = ${id}::uuid
 			limit 25
 		`);
 		for (const row of readRows(rows)) {
+			const referenceId = String(row.id);
+			const key = `${site.kind}:${referenceId}`;
+			if (seen.has(key)) {
+				continue;
+			}
+			seen.add(key);
 			references.push({
 				kind: site.kind,
-				id: String(row.id),
+				id: referenceId,
 				name: row.name === null || row.name === undefined ? null : String(row.name),
 				field: site.column,
 			});
@@ -323,6 +375,38 @@ export async function findParkLotFeatureCodeReferences(
 		id: String(row.id),
 		name: row.name === null || row.name === undefined ? null : String(row.name),
 		field: "params.lotId",
+	}));
+}
+
+/**
+ * Feature codes that pin this paging group in `params.groupId`.
+ *
+ * The same hole as `params.lotId` above, one feature along: `*81` may name a specific group and the
+ * compiler resolves it (`compile.ts`, `featureCodeTarget`, which reads `groupId` for `paging`
+ * exactly as it reads `lotId` for `call-park`). The reference lives inside `jsonb`, so no foreign
+ * key expresses it and the generic scan — which only looks at `<prefix>destination_ref` columns —
+ * cannot see it.
+ *
+ * Kept as a second function rather than folded into a parameterised one with the key and kind as
+ * arguments: there are two of these, they are four lines each, and the day a third arrives the
+ * question worth asking is why routing keeps putting foreign keys in a `jsonb` bag — not how to
+ * make the workaround more general.
+ */
+export async function findPagingGroupFeatureCodeReferences(
+	transaction: PbxDatabaseTransaction,
+	pagingGroupId: string,
+): Promise<readonly EntityReference[]> {
+	const rows = await transaction.execute(sql`
+		select id::text as id, code::text as name
+		from feature_code
+		where params ->> 'groupId' = ${pagingGroupId}
+		limit 25
+	`);
+	return readRows(rows).map((row) => ({
+		kind: "feature-code",
+		id: String(row.id),
+		name: row.name === null || row.name === undefined ? null : String(row.name),
+		field: "params.groupId",
 	}));
 }
 

@@ -6,19 +6,21 @@ import {
 	SIP_TRANSPORT_SETTING,
 } from "../../provisioning/catalog/transport-preference";
 import { ROUTING_SETTINGS_CATEGORY } from "../routing/snapshot-loader";
+import type { Permission } from "@optimiq-voice/auth";
 import type { SettingValueType } from "@optimiq-voice/pbx-db";
 
 /**
- * What `org_setting` is allowed to hold, declared in code.
+ * What `org_setting` and `user_setting` are allowed to hold, declared in code.
  *
- * ## The table models a cascade, not a record
+ * ## The tables model a cascade, not a record
  *
  * `packages/pbx-db`'s `settings-schema.ts` states the design: platform defaults live in CODE, not
  * in a table, because "a default row nobody wrote is indistinguishable from a deliberate override,
  * and a code-owned default is versioned, typed and reviewable". The resolution order is
- * `code default → org_setting → user_setting`, and the row is `(category, name, jsonb value,
- * value_type)` — five columns that can express anything, which is exactly the problem this file
- * solves.
+ * `code default → org_setting → user_setting` — all three levels real now that `user_setting` is
+ * back and {@link resolveForUser} reads it, where for a long stretch this sentence described one
+ * level and an aspiration — and the row is `(category, name, jsonb value, value_type)` — five
+ * columns that can express anything, which is exactly the problem this file solves.
  *
  * A free-form `(category, name, value)` write endpoint has the failure mode `feature-codes.dto.ts`
  * records for its `params` bag, one level worse: a typo is accepted, saved, and read by nothing,
@@ -52,6 +54,20 @@ export const NOTIFICATION_SETTINGS_CATEGORY = "notifications";
  */
 export const PROVISION_SETTINGS_CATEGORY = "provision";
 
+/**
+ * Which cascade level may override a setting below the organization.
+ *
+ * An enum naming the LEVEL rather than a `userScoped` boolean, for two reasons. First, the
+ * vocabulary already exists: `provisioning/catalog/cascade.ts` names its levels
+ * (`model → organization → profile → device`), and this cascade's levels deserve the same
+ * spelling — `scope: "user"` reads as "the user level may override this", where `userScoped: true`
+ * reads as a fact about visibility and invites the misreading "only a user may see it". Second, a
+ * boolean is a door that only opens once; if a level ever lands between the two (a team, a site),
+ * an enum grows a member and a boolean becomes a migration.
+ */
+export const SETTING_SCOPES = ["organization", "user"] as const;
+export type SettingScope = (typeof SETTING_SCOPES)[number];
+
 export interface SettingDescriptor {
 	readonly category: string;
 	/** camelCase, matching the names `readRoutingSettings` already reads. */
@@ -63,10 +79,20 @@ export interface SettingDescriptor {
 	readonly schema: z.ZodType;
 	/** The platform default — the first level of the cascade, and why a tenant needs no rows. */
 	readonly defaultValue: unknown;
+	/**
+	 * The deepest level that may override this setting. `organization` — the default — means the
+	 * cascade stops at `org_setting` and {@link resolveForUser} IGNORES any `user_setting` row
+	 * with this name. `user` is a claim with teeth: it is what lets `PATCH /org-settings/me/…`
+	 * accept the name, and it is only ever given to settings that are genuinely one person's
+	 * presentation preference rather than anyone's policy.
+	 */
+	readonly scope: SettingScope;
 }
 
-function descriptor(input: SettingDescriptor): SettingDescriptor {
-	return input;
+function descriptor(
+	input: Omit<SettingDescriptor, "scope"> & { readonly scope?: SettingScope },
+): SettingDescriptor {
+	return { ...input, scope: input.scope ?? "organization" };
 }
 
 /**
@@ -86,6 +112,15 @@ function descriptor(input: SettingDescriptor): SettingDescriptor {
  * Both must be on. The org switch can only ever narrow.
  */
 export const NOTIFICATION_SETTINGS: readonly SettingDescriptor[] = [
+	/**
+	 * Deliberately NOT user-scoped, while its two `include*` siblings below are. The user answer
+	 * to "do I want voicemail email at all?" already has a home: `voicemail_box.email_mode`
+	 * (`none` / `notify` / `attach`), a per-mailbox column the delivery path reads first. A
+	 * `user_setting` row for the same question would be a second source of truth, and the two
+	 * would disagree the first time somebody changed one through a screen that did not know about
+	 * the other. This org-level switch stays a policy — the tenant's kill switch — and the
+	 * per-person switch stays on the mailbox.
+	 */
 	descriptor({
 		category: NOTIFICATION_SETTINGS_CATEGORY,
 		name: "voicemailToEmailEnabled",
@@ -97,6 +132,14 @@ export const NOTIFICATION_SETTINGS: readonly SettingDescriptor[] = [
 		schema: z.boolean(),
 		defaultValue: true,
 	}),
+	/**
+	 * The first of the two user-scoped settings in the catalogue, and the shape of the argument
+	 * for both: whether MY notification carries a playback link is a presentation preference with
+	 * no per-mailbox column, no compliance dimension (the link is signed and expiring either way —
+	 * the org decides whether audio may leave at all with `voicemailToEmailEnabled`), and no
+	 * reader other than the mail renderer. Nothing about one person's taste here narrows or widens
+	 * anybody else's mail.
+	 */
 	descriptor({
 		category: NOTIFICATION_SETTINGS_CATEGORY,
 		name: "voicemailToEmailIncludeLink",
@@ -107,7 +150,9 @@ export const NOTIFICATION_SETTINGS: readonly SettingDescriptor[] = [
 			"the message id inside the signature and expires within minutes.",
 		schema: z.boolean(),
 		defaultValue: true,
+		scope: "user",
 	}),
+	/** User-scoped on the same argument as `voicemailToEmailIncludeLink` above. */
 	descriptor({
 		category: NOTIFICATION_SETTINGS_CATEGORY,
 		name: "voicemailToEmailIncludeTranscription",
@@ -118,6 +163,7 @@ export const NOTIFICATION_SETTINGS: readonly SettingDescriptor[] = [
 			"enabled and one is available.",
 		schema: z.boolean(),
 		defaultValue: true,
+		scope: "user",
 	}),
 	descriptor({
 		category: NOTIFICATION_SETTINGS_CATEGORY,
@@ -182,6 +228,10 @@ export const NOTIFICATION_SETTINGS: readonly SettingDescriptor[] = [
  * compiler reads and MUST NOT: a name here that the loader does not read is a setting a user can
  * save and no call will ever observe. They are catalogued so the same validated write path covers
  * them, because before this resource existed they had no write path at all.
+ *
+ * None of them is user-scoped, and none can become so by accident of a copied `scope: "user"`
+ * line: the compiler reads these into ONE artifact per tenant, so a per-user override would be a
+ * value the snapshot loader never sees — saved, shown, and observed by no call.
  */
 export const ROUTING_SETTINGS: readonly SettingDescriptor[] = [
 	descriptor({
@@ -310,12 +360,75 @@ export const PROVISION_SETTINGS: readonly SettingDescriptor[] = [
 	}),
 ];
 
+export const RECORDING_SETTINGS_CATEGORY = "recordings";
+export const RECORDING_RETENTION_SETTING = "retentionDays";
+
+/**
+ * The recording policy the tenant may set for itself.
+ *
+ * One setting, and its default is chosen to be INDISTINGUISHABLE from the platform env's:
+ * `CDR_RECORDING_RETENTION_DAYS` says `0` means keep for ever, so this says exactly the same
+ * thing with exactly the same bounds — two vocabularies for one number is how a tenant sets "30"
+ * and gets a month while the operator reads "30" and expects a fortnight. Organization-scoped and
+ * NEVER user-scoped: retention of recorded calls is a compliance posture, the same class of
+ * decision as `voicemailToEmailEnabled`'s kill switch, and no individual's preference can shorten
+ * or extend how long the organization keeps evidence.
+ *
+ * How the value reaches the recording write path — which lives in the CDR area, over a different
+ * database — is `recording-retention-policy.service.ts`'s story.
+ */
+export const RECORDING_SETTINGS: readonly SettingDescriptor[] = [
+	descriptor({
+		category: RECORDING_SETTINGS_CATEGORY,
+		name: RECORDING_RETENTION_SETTING,
+		valueType: "number",
+		label: "Recording retention (days)",
+		description:
+			"How many days a call recording is kept before it is purged. 0 keeps recordings " +
+			"indefinitely. The window is stamped when a recording is written; changing it never " +
+			"re-stamps recordings that already exist.",
+		schema: z.int().min(0).max(3_650),
+		defaultValue: 0,
+	}),
+];
+
 /** Every catalogued setting, in one list. */
 export const SETTING_CATALOG: readonly SettingDescriptor[] = [
 	...NOTIFICATION_SETTINGS,
 	...ROUTING_SETTINGS,
 	...PROVISION_SETTINGS,
+	...RECORDING_SETTINGS,
 ];
+
+/**
+ * Per-category permission overrides for the category read/write routes.
+ *
+ * `@RequirePermissions` on the controller stays the FLOOR (`settings.read` / `settings.write`),
+ * because a decorator is static metadata and the category is a path parameter — the same
+ * reasoning `queue-agent-session.service.ts` records for its row-dependent rule. This map is the
+ * second check, consulted in the service against `session.permissions` with `hasPermission`.
+ *
+ * `recordings` is the entry that closes a debt: `recordings.configure` has existed in the
+ * registry since it was declared ("Set always-on, on-demand, pause-and-mask and retention rules")
+ * and enforced nothing, while `settings.write` — held by every role that manages ordinary tenant
+ * configuration — would have let anyone with the settings screen shorten the organization's
+ * evidence window. Reading the window stays `settings.read`: the retention policy is not itself
+ * sensitive, and a settings screen that cannot show the current window cannot explain what
+ * `recordings.configure` would change.
+ */
+export const CATEGORY_PERMISSIONS: Partial<
+	Record<string, { readonly read: Permission; readonly write: Permission }>
+> = {
+	[RECORDING_SETTINGS_CATEGORY]: { read: "settings.read", write: "recordings.configure" },
+};
+
+/** The permissions guarding one category — the override, or the settings pair every route floors on. */
+export function categoryPermissions(category: string): {
+	readonly read: Permission;
+	readonly write: Permission;
+} {
+	return CATEGORY_PERMISSIONS[category] ?? { read: "settings.read", write: "settings.write" };
+}
 
 const BY_KEY = new Map(SETTING_CATALOG.map((entry) => [`${entry.category} ${entry.name}`, entry]));
 
@@ -331,6 +444,18 @@ export function findSetting(category: string, name: string): SettingDescriptor |
 export function settingsInCategory(category: string): readonly SettingDescriptor[] {
 	return SETTING_CATALOG.filter((entry) => entry.category === category);
 }
+
+/** The settings in one category that the user level may override. */
+export function userScopedSettingsInCategory(category: string): readonly SettingDescriptor[] {
+	return settingsInCategory(category).filter((entry) => entry.scope === "user");
+}
+
+/** The categories with at least one user-scoped setting — what `GET …/me` iterates. */
+export const USER_SCOPED_CATEGORIES: readonly string[] = [
+	...new Set(
+		SETTING_CATALOG.filter((entry) => entry.scope === "user").map((entry) => entry.category),
+	),
+];
 
 /** Whether a string is one of the five `value_type` values the column accepts. */
 export function isSettingValueType(value: string): value is SettingValueType {
@@ -369,6 +494,56 @@ export function resolveCategory(
 	return resolved;
 }
 
+/** The row shape both resolvers take: what the two settings tables have in common. */
+export interface SettingRowInput {
+	readonly name: string;
+	readonly value: unknown;
+	readonly enabled: boolean;
+}
+
+/**
+ * The whole cascade for one person: `code default → org_setting → user_setting`.
+ *
+ * Built ON {@link resolveCategory} rather than beside it, so the first two levels can never
+ * disagree between the two resolvers — the org half of this answer IS `resolveCategory`'s answer,
+ * and this function only decides what the third level may do to it. Three rules, each the same
+ * shape as one the cascade already has:
+ *
+ * - A user row for a setting the catalogue does NOT mark user-scoped is **ignored, not an
+ *   error** — a catalogue can tighten (a setting demoted from `user` to `organization` scope),
+ *   and the rows written under the old catalogue must degrade to the organization's answer
+ *   rather than break every read. The same reason `resolveCategory` ignores an uncatalogued name.
+ * - A **disabled row is absent**, exactly as at the organization level — one rule, stated once,
+ *   so "why is my preference not taking effect?" has the same answer as the org question.
+ * - A user value that no longer satisfies its schema falls back to the level ABOVE it — the
+ *   organization's resolution, not the code default, because the org level was valid and is what
+ *   this person would see with no override at all.
+ *
+ * Pure, like `resolveCategory` and `provisioning/catalog/cascade.ts`'s `resolveSettings`, so the
+ * rule table is directly testable without a database. No `explainSettings`-style provenance
+ * function yet, deliberately: `cascade.ts` only grew one for a UI panel that needed it, and no
+ * caller needs it here — the preferences screen shows the inherited value by reading the org
+ * category, which it already can.
+ */
+export function resolveForUser(
+	category: string,
+	orgRows: readonly SettingRowInput[],
+	userRows: readonly SettingRowInput[],
+): Record<string, unknown> {
+	const resolved = resolveCategory(category, orgRows);
+	const stored = new Map(userRows.filter((row) => row.enabled).map((row) => [row.name, row.value]));
+	for (const entry of userScopedSettingsInCategory(category)) {
+		if (!stored.has(entry.name)) {
+			continue;
+		}
+		const parsed = entry.schema.safeParse(stored.get(entry.name));
+		if (parsed.success) {
+			resolved[entry.name] = parsed.data;
+		}
+	}
+	return resolved;
+}
+
 /** The catalogue as a client reads it: no zod, one entry per setting. */
 export interface WireSettingDescriptor {
 	readonly category: string;
@@ -377,6 +552,8 @@ export interface WireSettingDescriptor {
 	readonly label: string;
 	readonly description: string;
 	readonly defaultValue: unknown;
+	/** On the wire so a preferences screen knows which settings `PATCH …/me` will accept. */
+	readonly scope: SettingScope;
 }
 
 export function toWireCatalog(): readonly WireSettingDescriptor[] {
@@ -387,5 +564,6 @@ export function toWireCatalog(): readonly WireSettingDescriptor[] {
 		label: entry.label,
 		description: entry.description,
 		defaultValue: entry.defaultValue,
+		scope: entry.scope,
 	}));
 }

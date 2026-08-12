@@ -14,17 +14,28 @@
  */
 
 import { z } from "zod";
+import { networkIssue, normalizeNetwork } from "./cidr";
 import {
+	CALL_BLOCK_ACTIONS,
+	CALL_BLOCK_DIRECTIONS,
+	CALL_BLOCK_MATCH_KINDS,
+	DIRECTORY_SEARCH_FIELDS,
 	FEATURE_CODE_ACTIONS,
 	MOH_SOURCES,
 	IVR_OPTION_MATCH_KINDS,
 	QUEUE_AGENT_CONTACT_KINDS,
 	QUEUE_AGENT_STATUSES,
+	QUEUE_EXIT_KEY_PATTERN,
+	QUEUE_PRIORITY_MAX,
+	QUEUE_PRIORITY_MIN,
 	QUEUE_STRATEGIES,
 	RECORD_POLICIES,
 	RING_GROUP_STRATEGIES,
 	ROUTE_MATCH_KINDS,
 	ROUTING_CONTEXTS,
+	SHARED_LINE_STRATEGIES,
+	SIP_ACL_ACTIONS,
+	SIP_ACL_SCOPES,
 	SIP_TRANSPORTS,
 	TOLL_CLASSES,
 	TRUNK_KINDS,
@@ -61,6 +72,32 @@ export const dialableString = z
 	.regex(/^[+*#0-9A-Za-z._-]+$/u, "Must be a dialable string");
 
 export const displayName = z.string().trim().min(1, "Required").max(128, "At most 128 characters");
+
+/**
+ * A star code or short code a phone can dial: `*281`, `*01`, `8001`.
+ *
+ * Mirrors `shortCode` in `apps/api/src/pbx/shared/dto.ts`, and it is deliberately NOT
+ * {@link internalNumber}: a code MAY begin with `*` and an extension may not — that space belongs to
+ * the feature codes, and a code that lives in it has to be screened against them, which the COMPILER
+ * does. Nothing here checks for a collision, because a collision is a fact about the whole tenant
+ * rather than about this row: the compiler's diagnostic is what says "`*281` already answers to
+ * something", and it runs inside the write transaction.
+ */
+export const shortCode = z
+	.string()
+	.trim()
+	.min(1, "Required")
+	.max(10, "At most 10 characters")
+	.regex(/^[*#]?[0-9*#]+$/u, "Digits, optionally led by * or #");
+
+/** An optional short code: blank clears it, anything else must be a dialable code. */
+const optionalShortCode = z
+	.string()
+	.trim()
+	.refine((value) => value === "" || shortCode.safeParse(value).success, {
+		message: "Digits, optionally led by * or #",
+	})
+	.transform((value) => (value.length === 0 ? null : value));
 
 /**
  * A text control that may be left blank.
@@ -204,6 +241,15 @@ function extensionSchema(sipSecretRef: SecretRefField) {
 		 * `null` is the documented "no group, fall back to organization-wide pickup".
 		 */
 		pickupGroup: optionalText(64),
+		/**
+		 * Screen external callers before this extension is rung.
+		 *
+		 * A plain boolean with no conditional partner, unlike `confirmEnabled`/`confirmPromptId` on a
+		 * ring group: the prompts a screen plays are deployment settings on the walker
+		 * (`screeningRecordPrompt`, `screeningIntroPrompt`), not columns on the extension, so there is
+		 * nothing on this form for the switch to gate.
+		 */
+		callScreening: z.boolean(),
 		callTimeoutSeconds: optionalInt(5, 300),
 		maxRegistrations: optionalInt(1, 20),
 		mohClassId: optionalReference(),
@@ -296,6 +342,20 @@ export const trunkFormSchema = z.strictObject({
 	maxChannels: optionalInt(1, 10_000),
 	codecPrefs: optionalText(128),
 	callerIdNumberOverride: optionalText(32),
+	/**
+	 * The ruleset that rewrites an arriving caller's number, and the first thing that touches a call
+	 * on this trunk.
+	 *
+	 * Writable since `updateTrunkDto` declared it (`inboundTranslationRulesetId: z.uuid().nullish()`);
+	 * it was rendered as a read-only fact before that, because a select wired to a strict DTO that did
+	 * not declare the field produced a 400 naming a column the user had just chosen from a list.
+	 *
+	 * Nothing composes with it — a trunk has no inline strip or prepend — so it runs first and ALONE,
+	 * before the screening list, the inbound routes or the call record read the caller's number. That
+	 * is the opposite of the outbound side, where a ruleset runs after the route's own digits; see
+	 * {@link outboundRouteFormSchema}.
+	 */
+	inboundTranslationRulesetId: optionalReference(),
 	enabled: z.boolean(),
 });
 export type TrunkFormValues = z.input<typeof trunkFormSchema>;
@@ -346,6 +406,31 @@ export const outboundRouteFormSchema = z.strictObject({
 	trunkIds: z.array(z.uuid()).max(20, "At most 20 trunks"),
 	timeConditionId: z.string().trim(),
 	callerIdNumberOverride: optionalText(32),
+	/**
+	 * The shared ruleset, applied AFTER this route's own `stripDigits` and `prependDigits`.
+	 *
+	 * The order is the reason both live in one section on the form: strip and prepend turn what
+	 * somebody's fingers did into the number they meant — dropping the 9 for an outside line — and the
+	 * ruleset then normalises that number for the wire. A ruleset that ran first would have to know
+	 * about every route's outside-line prefix, which is the coupling the shared layer exists to
+	 * remove.
+	 *
+	 * Writable since `updateOutboundRouteDto` declared it; it was a read-only fact before that.
+	 */
+	translationRulesetId: optionalReference(),
+	/**
+	 * The codes a caller must enter before any trunk is offered the call.
+	 *
+	 * The blast radius is money, which is why a PIN set is a resource of its own on the server rather
+	 * than a ride on `routes.*` — but ATTACHING one is an edit to the route, so it is `routes.write`
+	 * like every other field here, and this schema does not gate it separately.
+	 *
+	 * Clearing it is `null` rather than an absent key, which is what {@link optionalReference} is for
+	 * and is unusually load-bearing on this column: an omitted key leaves the stored id alone, so a
+	 * form that dropped an emptied selector would let an operator remove the challenge, press Save,
+	 * and still be asked for a code on the next call with nothing on screen disagreeing.
+	 */
+	pinSetId: optionalReference(),
 	recordEnabled: z.boolean(),
 	enabled: z.boolean(),
 });
@@ -357,6 +442,36 @@ export const timeConditionFormSchema = z.strictObject({
 	enabled: z.boolean(),
 });
 export type TimeConditionFormValues = z.input<typeof timeConditionFormSchema>;
+
+/**
+ * The star code that cycles a condition's override, edited on its own.
+ *
+ * ## Why it is not a field of {@link timeConditionFormSchema}
+ *
+ * Both reach the same `PATCH /time-conditions/:id` and both need `time-conditions.write`, so a
+ * second schema buys nothing at the endpoint. It buys something on screen: the code belongs beside
+ * the override control, which is where somebody reading "how do I force this open from a handset"
+ * is looking, and that control lives on the condition's page rather than in its settings dialog
+ * because pressing the override is `call-flows.toggle` — the receptionist's grant — and the dialog
+ * is not reachable with it.
+ *
+ * Two controls writing one column from two places would be worse than one control in the wrong
+ * place. `PATCH` leaves an absent key alone, so this form's save cannot clobber a name the dialog is
+ * holding, and the dialog's save cannot clobber this code.
+ *
+ * Blank clears it: `null` is a real state (no code answers for this condition) and the column takes
+ * no empty string. The digits themselves are checked against {@link shortCode}, mirroring the DTO's
+ * `overrideFeatureCode: shortCode.nullish()` — and nothing here checks for a COLLISION with the
+ * feature-code catalogue, because that is a fact about the whole tenant rather than about this row.
+ * The compiler's diagnostic is what says "`*281` already answers to something", inside the write
+ * transaction.
+ */
+export const timeConditionOverrideCodeFormSchema = z.strictObject({
+	overrideFeatureCode: optionalShortCode,
+});
+export type TimeConditionOverrideCodeFormValues = z.input<
+	typeof timeConditionOverrideCodeFormSchema
+>;
 
 const wallClock = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/u, "Must be HH:MM, 24-hour");
 const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, "Must be YYYY-MM-DD");
@@ -476,9 +591,160 @@ export const ringGroupMemberFormSchema = z.strictObject({
 export type RingGroupMemberFormValues = z.input<typeof ringGroupMemberFormSchema>;
 
 /**
+ * A paging group, mirroring `apps/api/src/pbx/paging-groups/paging-groups.dto.ts`.
+ *
+ * Shorter than its ring-group sibling by exactly the thing that makes it a page rather than a call:
+ * there is no destination trio and no strategy. A page has nowhere to continue to — the pager
+ * speaks, the handsets auto-answer, and the announcement ends when the pager hangs up — so there is
+ * no "when nobody answers" branch to configure, because a page does not wait for an answer.
+ *
+ * `timeoutSeconds` is therefore NOT a ring time. It is how long ONE member's auto-answered leg may
+ * take to come up before it is given up on, which is why the server's ceiling is 300 rather than the
+ * ring group's 600: 600 is how long a HUMAN is given to pick up, and nothing here is waiting for a
+ * human.
+ */
+export const pagingGroupFormSchema = z.strictObject({
+	name: displayName,
+	/**
+	 * Blank is legal and means "no number": a group reachable only through the `*81` feature code has
+	 * none, and forcing one would make an operator invent digits that then collide with an extension.
+	 * {@link optionalDigits} sends that blank as `null`, which the nullable column takes as "clear it".
+	 */
+	extensionNumber: optionalDigits(16),
+	duplex: z.boolean(),
+	timeoutSeconds: optionalInt(5, 300),
+	enabled: z.boolean(),
+});
+export type PagingGroupFormValues = z.input<typeof pagingGroupFormSchema>;
+
+/**
+ * One handset in a group.
+ *
+ * `extensionId` is REQUIRED and is a plain reference rather than a destination, which is the whole
+ * difference from a ring-group member: the engine originates an auto-answered leg to the member, and
+ * only a registered endpoint can be told to pick up. An external number over a trunk cannot, so the
+ * form offers extensions and nothing else.
+ *
+ * Not {@link optionalReference}: blank is not "clear it" here, it is a member that pages nobody.
+ */
+export const pagingGroupMemberFormSchema = z.strictObject({
+	extensionId: z
+		.string()
+		.trim()
+		.min(1, "Required")
+		.refine((value) => z.uuid().safeParse(value).success, "Pick one from the list"),
+	ordinal: optionalInt(0, 1000),
+	enabled: z.boolean(),
+});
+export type PagingGroupMemberFormValues = z.input<typeof pagingGroupMemberFormSchema>;
+
+/**
+ * A shared line, mirroring `apps/api/src/pbx/shared-lines/shared-lines.dto.ts`.
+ *
+ * Structurally a paging group with a strategy and two timeouts, and NO destination trio for the same
+ * reason: a shared line never routes a call out. Its whole point is the state it keeps after the
+ * answer, which lives in a KV claim the engine arbitrates. A `z.strictObject` is what keeps a trio
+ * out — the server would answer a body carrying one with a 400 naming the field.
+ *
+ * `ringTimeoutSeconds` and `holdRecallTimeoutSeconds` are both `resettable` on the server
+ * (`notNull().default(30)` and `notNull().default(60)`), so an emptied box sends `null` meaning "put
+ * the server default back". The one that reads differently is the RECALL timeout: `0` is a REAL
+ * value the column takes — it disables recall and the line holds indefinitely — so it is kept rather
+ * than treated as blank, and only an empty control becomes `null`. That is why its floor is 0 and
+ * the ring timeout's is 5.
+ */
+export const sharedLineFormSchema = z.strictObject({
+	name: displayName,
+	/**
+	 * Blank is legal and means "no number": a line that is only a shared KEY across a boss and an
+	 * assistant is reached through its member buttons, not a dialable number, and forcing one would
+	 * make an operator invent digits that then collide with an extension. {@link optionalDigits} sends
+	 * the blank as `null`, which the nullable partial-unique column takes as "clear it".
+	 */
+	extensionNumber: optionalDigits(16),
+	strategy: z.enum(SHARED_LINE_STRATEGIES),
+	/** How long each appearance is rung before the offer moves on. Bounds match a ring group's. */
+	ringTimeoutSeconds: optionalInt(5, 600),
+	/**
+	 * How long a held call may sit before it recalls every appearance. `0` disables recall — the line
+	 * holds indefinitely — which the floor of 0 admits as a real value rather than a blank. Blank
+	 * itself restores the server default, the ordinary `resettable` reading.
+	 */
+	holdRecallTimeoutSeconds: optionalInt(0, 3600),
+	/**
+	 * Whether an idle appearance may join a call already up on the line (the boss/admin "barge"). The
+	 * flag is stored and compiled; the live barge-in media join is a deferred seam awaiting the media
+	 * plane, so this records intent. Off by default, because a line any appearance can silently join
+	 * is a privacy surprise rather than a default.
+	 */
+	bargeInEnabled: z.boolean(),
+	enabled: z.boolean(),
+});
+export type SharedLineFormValues = z.input<typeof sharedLineFormSchema>;
+
+/**
+ * One appearance in a shared line.
+ *
+ * `extensionId` is REQUIRED and a plain reference rather than a destination, which is the whole
+ * difference from a ring-group member and the same shape a paging member has: the engine originates
+ * a leg to a registered endpoint and the credential path tells that device which button to light, so
+ * only a real extension can be an appearance. Not {@link optionalReference}: blank is not "clear it"
+ * here, it is an appearance that lights nobody's button.
+ *
+ * `ordinal` is the APPEARANCE INDEX — the button position and the `Call-Info` appearance-index — not
+ * a display order, which is why the collection has a reorder endpoint and why `(line, ordinal)` is
+ * unique.
+ */
+export const sharedLineAppearanceFormSchema = z.strictObject({
+	extensionId: z
+		.string()
+		.trim()
+		.min(1, "Required")
+		.refine((value) => z.uuid().safeParse(value).success, "Pick one from the list"),
+	ordinal: optionalInt(0, 1000),
+	enabled: z.boolean(),
+});
+export type SharedLineAppearanceFormValues = z.input<typeof sharedLineAppearanceFormSchema>;
+
+/**
+ * A caller-screening rule, mirroring `apps/api/src/pbx/call-block/call-block.dto.ts`.
+ *
+ * ## `pattern` is length-bounded and nothing else, deliberately
+ *
+ * The obvious schema — a discriminated union that validates the string against `matchKind` — was
+ * the server's first draft too, and it was dropped there for a reason that applies twice as hard
+ * here. `compilePattern` in `@optimiq-voice/routing` is the function whose opinion decides whether
+ * a rule can be ENFORCED, and `compileCallBlock` runs it inside the write transaction: an
+ * uncompilable pattern is a 422 addressed at `pattern` that rolls the insert back, and an
+ * unanchored regex is a warning carried in the mutation envelope and rendered next to the field.
+ *
+ * A regex validator in the browser would be a THIRD opinion — after the compiler's and the DTO's —
+ * and the three would disagree on the first interesting input, with this one being the copy that
+ * refuses a rule the engine would happily enforce. So the bound is a LENGTH bound, matching the
+ * DTO's `min(1).max(256)`, because a regex may legitimately contain almost anything.
+ *
+ * ## What is absent, and why a strict object is what keeps it absent
+ *
+ * `hitCount` and `lastHitAt` are enforcement counters. The server's `z.strictObject` answers a
+ * client that sends one with a 400 naming the field rather than dropping it silently, so a form
+ * that offered them would fail the whole save rather than ignore two controls. `z.strictObject`
+ * here is what stops a copied block from adding them.
+ */
+export const callBlockRuleFormSchema = z.strictObject({
+	pattern: z.string().trim().min(1, "Required").max(256, "At most 256 characters"),
+	matchKind: z.enum(CALL_BLOCK_MATCH_KINDS),
+	direction: z.enum(CALL_BLOCK_DIRECTIONS),
+	action: z.enum(CALL_BLOCK_ACTIONS),
+	/** Blank clears the note; the column is `nullish` on the server and `""` would be stored. */
+	label: optionalText(128),
+	enabled: z.boolean(),
+});
+export type CallBlockRuleFormValues = z.input<typeof callBlockRuleFormSchema>;
+
+/**
  * A queue's own settings — everything the DTO calls a knob, and nothing about who answers it.
  *
- * The three audio columns are here now that `/moh-classes` and `/prompts` exist to select from, and
+ * The four audio columns are here now that `/moh-classes` and `/prompts` exist to select from, and
  * they behave differently from every other optional field on this form: an emptied numeric knob
  * sends `null` meaning "put the server default back", while an emptied SELECTOR sends `null`
  * meaning "play nothing at all". Both are `null` on the wire and the difference is entirely in the
@@ -491,6 +757,14 @@ export const queueFormSchema = z.strictObject({
 	mohClassId: optionalReference(),
 	greetingPromptId: optionalReference(),
 	announcePromptId: optionalReference(),
+	/**
+	 * Played to the ANSWERING AGENT alone, before the caller is bridged in.
+	 *
+	 * The same helper as the two above and the opposite side of the bridge: those two play to the
+	 * caller, this one never does. Blank clears it, because the column is nullable — an agent with no
+	 * whisper simply gets the call.
+	 */
+	agentWhisperPromptId: optionalReference(),
 	/** 0 disables the cap and callers wait indefinitely. */
 	maxWaitSeconds: optionalInt(0, 86_400),
 	maxWaitNoAgentSeconds: optionalInt(0, 86_400),
@@ -502,7 +776,31 @@ export const queueFormSchema = z.strictObject({
 	tierRulesApply: z.boolean(),
 	tierRuleWaitSeconds: optionalInt(0, 3600),
 	tierRuleNoAgentNoWait: z.boolean(),
-	recordEnabled: z.boolean(),
+	/**
+	 * NOT `optionalInt`'s enum cousin and deliberately not resettable: `none` is a real member of
+	 * the set rather than a server default somebody might want back, so a form's "do not record" is
+	 * a value the column can say for itself. It replaced a `recordEnabled` boolean the API no longer
+	 * accepts at all — a strict object answers the old key with a 400.
+	 */
+	recordPolicy: z.enum(RECORD_POLICIES),
+	/**
+	 * The single DTMF digit a waiting caller may press to leave. Blank removes it.
+	 *
+	 * Upper-cased before the check, exactly as the server's DTO does it, so a tenant who types `d`
+	 * gets the DTMF `D` rather than a rejected form. The two spellings are not equivalent anywhere
+	 * below this line — the engine compares this against a digit with `===` — so normalising in the
+	 * browser is what makes the control and the column agree rather than what makes the form lenient.
+	 */
+	exitKey: z
+		.string()
+		.trim()
+		.toUpperCase()
+		.refine((value) => value === "" || QUEUE_EXIT_KEY_PATTERN.test(value), {
+			message: "A single DTMF digit: 0-9, *, #, or A-D",
+		})
+		.transform((value) => (value.length === 0 ? null : value)),
+	/** Higher dequeues first. Empty restores the server's default, like every other knob here. */
+	defaultPriority: optionalInt(QUEUE_PRIORITY_MIN, QUEUE_PRIORITY_MAX),
 	enabled: z.boolean(),
 });
 export type QueueFormValues = z.input<typeof queueFormSchema>;
@@ -564,6 +862,15 @@ export const queueTierFormSchema = z.strictObject({
 	level: optionalInt(1, 100),
 	/** Order within the level, which `top-down` and `round-robin` walk in. */
 	position: optionalInt(1, 1000),
+	/**
+	 * The whisper played to the agent when a call distributed by THIS tier reaches them, in place of
+	 * the queue's own. Blank clears it and the queue's whisper takes over again.
+	 *
+	 * {@link optionalReference} rather than a required one, and the emptied case means "clear it"
+	 * rather than "use the default" — the column is nullable, and falling back to the queue IS the
+	 * cleared behaviour rather than a stored default being restored.
+	 */
+	announcePromptId: optionalReference(),
 });
 export type QueueTierFormValues = z.input<typeof queueTierFormSchema>;
 
@@ -579,8 +886,12 @@ export const conferenceFormSchema = z.strictObject({
 	roomNumber: internalNumber,
 	maxMembers: optionalInt(2, 1000),
 	mohClassId: optionalReference(),
-	recordEnabled: z.boolean(),
+	/** The vocabulary extensions, trunks and queues use — it replaced a conference-only boolean. */
+	recordPolicy: z.enum(RECORD_POLICIES),
 	announceJoinLeave: z.boolean(),
+	/** Join/leave beeps, distinct from the recorded-name playback above. */
+	entryToneEnabled: z.boolean(),
+	exitToneEnabled: z.boolean(),
 	waitForModerator: z.boolean(),
 	enabled: z.boolean(),
 });
@@ -672,6 +983,231 @@ export function parseDialPatterns(text: string): string[] {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The T2 admin block
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A call flow — the day/night switch.
+ *
+ * `mode` is absent and its absence is the contract: `createCallFlowDto` and `updateCallFlowDto` both
+ * omit it, because moving the switch is `POST /call-flows/:id/toggle` behind `call-flows.toggle`
+ * rather than a field behind `call-flows.write`. `z.strictObject` here is what stops a copied block
+ * from adding it — the server would answer a body carrying `mode` with a 400 naming the field.
+ *
+ * The two destination trios are not here either, for the reason every trio is held beside its form
+ * rather than inside it: they are three columns each and the picker owns them. BOTH are required,
+ * which is unusual — a flow with one position is not a switch — and the dialog passes
+ * `{ required: true }` to `validateDestinationValue` for each.
+ */
+export const callFlowFormSchema = z.strictObject({
+	name: displayName,
+	/** Blank is legal: a flow reached only by its toggle code has no number of its own. */
+	extensionNumber: optionalDigits(16),
+	/**
+	 * The star code that toggles the flow, and the key a BLF lamp is provisioned with.
+	 *
+	 * Upstream numbers these `*28` plus a per-flow suffix, and nothing here enforces that shape — the
+	 * suffix is the tenant's. The check that matters is the compile-time screen against the
+	 * feature-code catalogue, because two mechanisms answering the same digits is a collision with no
+	 * runtime symptom beyond the wrong one winning.
+	 */
+	featureCode: optionalShortCode,
+	enabled: z.boolean(),
+});
+export type CallFlowFormValues = z.input<typeof callFlowFormSchema>;
+
+/**
+ * A PIN set — the list, never a code.
+ *
+ * Nothing on this form reaches a secret, and there is no field that could: the codes live on the
+ * entries and are set through an endpoint that hashes them. See {@link pinSchema}.
+ */
+export const pinSetFormSchema = z.strictObject({
+	name: displayName,
+	description: optionalText(512),
+	/** What the caller hears when they are asked for a code, and when they get it wrong. */
+	promptId: optionalReference(),
+	failurePromptId: optionalReference(),
+	/**
+	 * Three is the universal telephone answer and the bound below it is the reason: a four-digit PIN
+	 * behind unbounded retries is a keypad away from being brute forced during one long call.
+	 */
+	maxAttempts: optionalInt(1, 10),
+	digitTimeoutMs: optionalInt(1000, 60_000),
+	enabled: z.boolean(),
+});
+export type PinSetFormValues = z.input<typeof pinSetFormSchema>;
+
+/**
+ * One code's metadata — and deliberately not the code.
+ *
+ * `ordinal` is {@link requiredInt} rather than {@link optionalInt}, which is the second time that
+ * helper has been needed and for a different reason from the first: `park_lot.slot_start` is
+ * required because the column has no default, and this is required because the ordinal is the
+ * IDENTITY a call detail record names ("code 3, the night desk"). A blank box is not "put it at the
+ * end", it is a code whose CDR label the server would have to invent. The dialog pre-fills the next
+ * free ordinal so the requirement is only ever met by somebody who cleared the box on purpose.
+ */
+export const pinSetEntryFormSchema = z.strictObject({
+	label: optionalText(128),
+	ordinal: requiredInt(0, 1000),
+	enabled: z.boolean(),
+});
+export type PinSetEntryFormValues = z.input<typeof pinSetEntryFormSchema>;
+
+/**
+ * The digits themselves.
+ *
+ * Four at the bottom because that is the shortest anybody actually uses; sixteen at the top is the
+ * server's. `keypadPinIssue` — the mailbox and conference rule — is deliberately NOT reused, and the
+ * difference is the server's rather than a lapse: `setPinDto` checks the length and the alphabet and
+ * nothing else, so importing the weak-PIN blocklist here would refuse a code the API would accept
+ * and leave the user with a message no round trip could have produced. The dialog says "avoid a
+ * repeated or counting code" as ADVICE beside the field instead, which is the honest shape for a
+ * rule this app does not get to enforce.
+ */
+export const pinSchema = z
+	.string()
+	.trim()
+	.min(4, "At least 4 digits")
+	.max(16, "At most 16 digits")
+	.regex(/^[0-9]+$/u, "Digits only — it is entered on a telephone keypad");
+
+/** A ruleset: a name for a pipeline. Everything that does anything is in its rules. */
+export const translationRulesetFormSchema = z.strictObject({
+	name: displayName,
+	description: optionalText(512),
+	enabled: z.boolean(),
+});
+export type TranslationRulesetFormValues = z.input<typeof translationRulesetFormSchema>;
+
+/**
+ * One rewrite.
+ *
+ * ## Neither half is validated beyond its length, and that is the server's decision restated
+ *
+ * `validateTranslationRule` in `@optimiq-voice/routing` is the function whose opinion decides
+ * whether a rule can be APPLIED — it compiles the regex, and it checks that the replacement can only
+ * ever emit dialable output — and it runs inside the write transaction. A `new RegExp(...)` here
+ * would be a second opinion that agrees today and disagrees the first time somebody writes a
+ * lookbehind, and the replacement allow-list is a SECURITY boundary (a replacement that can emit `@`
+ * is a rule that could put a second host into a request URI), which is not a check to duplicate in
+ * the half of the system an attacker controls.
+ *
+ * `replacement` may be EMPTY — that is how a strip rule is written — so it is a plain bounded string
+ * rather than {@link optionalText}, whose blank-means-null transform would send `null` for a column
+ * the server declares `z.string().max(256)`.
+ */
+export const translationRuleFormSchema = z.strictObject({
+	label: optionalText(128),
+	matchPattern: z.string().trim().min(1, "Required").max(256, "At most 256 characters"),
+	replacement: z.string().trim().max(256, "At most 256 characters"),
+	ordinal: requiredInt(0, 1000),
+	enabled: z.boolean(),
+});
+export type TranslationRuleFormValues = z.input<typeof translationRuleFormSchema>;
+
+/** A named destination: a name, a note, and the trio the picker holds beside this. */
+export const destinationAliasFormSchema = z.strictObject({
+	name: displayName,
+	description: optionalText(512),
+	enabled: z.boolean(),
+});
+export type DestinationAliasFormValues = z.input<typeof destinationAliasFormSchema>;
+
+/**
+ * A remote audio source.
+ *
+ * The `http(s)` rule is the one check on this form that is a SECURITY check rather than formatting,
+ * and it is why it is restated rather than left to the round trip: the set of things a tenant may
+ * cause the media server to open is a decision about what the media server will READ, and
+ * `file:///etc/passwd` is a URL. The server refuses it at the edge and the compiler refuses it again
+ * from the snapshot; this is the third copy and the least authoritative, which is the correct order.
+ */
+export const audioStreamFormSchema = z.strictObject({
+	name: displayName,
+	description: optionalText(512),
+	url: z
+		.string()
+		.trim()
+		.min(1, "Required")
+		.max(1024, "At most 1024 characters")
+		.refine((value) => /^https?:\/\//iu.test(value), "Must be an http or https URL")
+		.refine((value) => {
+			try {
+				void new URL(value);
+				return true;
+			} catch {
+				return false;
+			}
+		}, "Must be a valid absolute URL"),
+	answerFirst: z.boolean(),
+	/** Zero means "until the caller hangs up", which is what an always-on radio feed wants. */
+	maxSeconds: optionalInt(0, 86_400),
+	enabled: z.boolean(),
+});
+export type AudioStreamFormValues = z.input<typeof audioStreamFormSchema>;
+
+/**
+ * A dial-by-name directory.
+ *
+ * There is no member list to edit: the entries are DERIVED from the organization's extensions at
+ * compile time, keyed on the mailbox's recorded NAME greeting. That is why the form has a note
+ * rather than a picker — an extension with no recorded name is skipped with a compile warning, and
+ * the fix is on the mailbox rather than here.
+ */
+export const dialByNameDirectoryFormSchema = z.strictObject({
+	name: displayName,
+	extensionNumber: optionalDigits(16),
+	searchField: z.enum(DIRECTORY_SEARCH_FIELDS),
+	/**
+	 * Two at the bottom because a two-letter surname exists; six at the top because past that the
+	 * caller is spelling the whole name, which is the interaction a directory exists to avoid.
+	 */
+	minDigits: optionalInt(2, 6),
+	greetingPromptId: optionalReference(),
+	invalidPromptId: optionalReference(),
+	maxFailures: optionalInt(1, 10),
+	enabled: z.boolean(),
+});
+export type DialByNameDirectoryFormValues = z.input<typeof dialByNameDirectoryFormSchema>;
+
+/**
+ * An organization speed dial.
+ *
+ * `code` accepts both `*01` and `8001`, and neither shape is screened here: whether a code collides
+ * with a feature code or with an internal number is a fact about the whole tenant, so the compiler
+ * answers it inside the write transaction and the diagnostic rides out in the mutation envelope.
+ */
+export const speedDialFormSchema = z.strictObject({
+	code: shortCode,
+	label: displayName,
+	enabled: z.boolean(),
+});
+export type SpeedDialFormValues = z.input<typeof speedDialFormSchema>;
+
+/**
+ * The organization's four quotas.
+ *
+ * The one form in this file where a blank box means something other than "put the default back".
+ * Every column is nullable and `null` means NO CEILING — unlimited is the default and always has
+ * been, because this table arrived after tenants existed — so {@link optionalInt}'s blank-to-null
+ * transform is doing a different job here from the one it does on every other numeric field in this
+ * module. Clearing a box removes the limit; it does not restore one.
+ *
+ * The upper bounds are the server's and are not policy: they are the largest values that are not
+ * obviously a typo. A hundred thousand extensions is larger than any single tenant this platform
+ * will hold, and a ceiling that high is indistinguishable from none.
+ */
+export const orgLimitsFormSchema = z.strictObject({
+	maxExtensions: optionalInt(0, 100_000),
+	maxTrunks: optionalInt(0, 10_000),
+	maxConcurrentCalls: optionalInt(0, 100_000),
+	maxStorageMb: optionalInt(0, 10_000_000),
+});
+export type OrgLimitsFormValues = z.input<typeof orgLimitsFormSchema>;
+
+// ---------------------------------------------------------------------------------------------
 // The media library
 // ---------------------------------------------------------------------------------------------
 
@@ -749,6 +1285,52 @@ export const promptUploadFormSchema = z.strictObject({
 		.regex(/^$|^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/u, "Must be a language tag, e.g. en-US"),
 });
 export type PromptUploadFormValues = z.input<typeof promptUploadFormSchema>;
+
+/**
+ * A phrase: a name, and nothing else.
+ *
+ * One field is not a placeholder for a fuller form — it is the whole of `createPhraseDto`, and the
+ * absences are decisions the server states rather than fields nobody got to:
+ *
+ * - `kind` and `objectKey` are absent from the DTO and always will be. They are not fields, they are
+ *   what MAKES the row a phrase: the service stamps `kind: "phrase"` and leaves the object key null,
+ *   which is the exact pair `prompt_object_key_kind_check` permits. A client that could send either
+ *   could turn a phrase into a library entry with no file behind it.
+ * - `language` is absent because a phrase's language is whatever its steps' audio is, and a tag on
+ *   the sequence that disagreed with the recordings would be a tag that lies.
+ * - `mohClassId` is absent because an MOH file is a member of a class and a sequence is not a file.
+ *
+ * The SEQUENCE is a child collection and is not in this schema at all — see
+ * {@link phraseStepFormSchema}.
+ */
+export const phraseFormSchema = z.strictObject({
+	name: displayName,
+});
+export type PhraseFormValues = z.input<typeof phraseFormSchema>;
+
+/**
+ * One step of a phrase.
+ *
+ * ## `promptId` is required, and the form may not offer another phrase
+ *
+ * Nesting is refused by the server — `phrases.service.ts` answers a step whose `promptId` names a
+ * `kind = 'phrase'` row with a `PBX_VALIDATION_FAILED` addressed at `promptId`, and the compiler
+ * refuses the same shape a second time for rows that arrive by any other route. This schema cannot
+ * express that: it sees a uuid, not the row behind it, exactly as the DTO does. The refusal lives
+ * where the row is visible — the step dialog offers `kind: "prompt"` only, and checks the chosen id
+ * against the phrase list before it sends, so the message lands on the picker rather than arriving
+ * as a 400 after a round trip.
+ *
+ * `ordinal` is optional and bounded to the server's 0…1000. Blank means "append", which the dialog
+ * turns into the next free position: `(phrase, ordinal)` is unique, so an omitted key would be a
+ * collision rather than a default.
+ */
+export const phraseStepFormSchema = z.strictObject({
+	promptId: requiredReference,
+	ordinal: optionalInt(0, 1000),
+	enabled: z.boolean(),
+});
+export type PhraseStepFormValues = z.input<typeof phraseStepFormSchema>;
 
 /** A voicemail greeting upload: which slot it fills, what to call it, whether to use it now. */
 export const greetingUploadFormSchema = z.strictObject({
@@ -843,3 +1425,103 @@ function isStraightRun(pin: string): boolean {
 	}
 	return ascending || descending;
 }
+
+// ---------------------------------------------------------------------------------------------
+// SIP security
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One CIDR access rule.
+ *
+ * The network is checked with {@link networkIssue}, which is `sip-acl.dto.ts`'s pre-filter restated
+ * — including the host-bits rule, which is the one that catches the mistake an administrator
+ * actually makes. It is then NORMALISED, so a bare address and its `/32` are one row rather than
+ * two that collide on the server's unique index only after PostgreSQL has widened them.
+ *
+ * `scope` has no default here even though the column defaults to `registration`, for the reason the
+ * server's DTO gives: a caller who omitted the scope almost certainly did not mean "the one that
+ * governs whether phones can register". The form therefore makes it an explicit choice.
+ */
+export const sipAclEntryFormSchema = z.strictObject({
+	name: optionalText(128),
+	network: z
+		.string()
+		.trim()
+		.superRefine((value, context) => {
+			const issue = networkIssue(value);
+			if (issue !== undefined) {
+				context.addIssue({ code: "custom", message: issue });
+			}
+		})
+		.transform((value) => normalizeNetwork(value)),
+	action: z.enum(SIP_ACL_ACTIONS),
+	scope: z.enum(SIP_ACL_SCOPES),
+	priority: optionalInt(0, 10_000),
+	description: optionalText(512),
+	enabled: z.boolean(),
+});
+export type SipAclEntryFormValues = z.input<typeof sipAclEntryFormSchema>;
+
+// ---------------------------------------------------------------------------------------------
+// Webhooks
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A webhook subscription's scalar fields. The event selectors are not here — see below.
+ *
+ * ## `url` is checked for SHAPE only, and http is deliberately not refused
+ *
+ * The server's DTO checks the same two things this does: that it parses as an absolute http(s) URL,
+ * and that it carries no embedded credentials. The `https`-ONLY rule lives one layer up, in
+ * `WebhooksService`, because it depends on `PBX_WEBHOOK_ALLOW_INSECURE_URLS` — an environment
+ * variable this bundle cannot read. Refusing http here would break the development deployments that
+ * variable exists for; the deployments that enforce it answer with a 400 addressed at `url`, which
+ * lands on this control through `pbxFieldErrors`. The form says so beside the field rather than
+ * guessing.
+ *
+ * Nothing checks that the host resolves or that it is not a private address. The second is the
+ * interesting omission and it is the server's reasoning: DNS is not stable between a write-time
+ * check and the delivery, so the control that works belongs in the dispatcher — a fixed method, no
+ * redirects, a short timeout — and it is implemented there rather than pretended at here.
+ *
+ * ## `secret` blank means two different things, and both are correct
+ *
+ * On CREATE, blank means "generate one" — the server mints 256 bits and returns it exactly once, in
+ * the create response and nowhere else. On EDIT, blank means "leave the existing key alone": the
+ * secret is never returned by a read, so the field cannot be pre-filled, and a form that sent an
+ * empty string would rotate a working signature to nothing. The dialog omits the key entirely when
+ * this is `null`, which is what `PATCH` semantics turn into "unchanged".
+ *
+ * ## `eventSelectors` is validated separately
+ *
+ * The control that produces it is four checkboxes and a textarea rather than one input, so its
+ * message is attached by the dialog through `selectorListIssue` — the same division the destination
+ * picker uses. Putting it in this schema would key the message to a field name no control has.
+ */
+export const webhookFormSchema = z.strictObject({
+	description: optionalText(256),
+	url: z
+		.string()
+		.trim()
+		.min(1, "Required")
+		.max(2048, "At most 2048 characters")
+		.refine((value) => /^https?:\/\//iu.test(value), "Must be an http(s) URL")
+		.refine((value) => {
+			try {
+				const parsed = new URL(value);
+				return parsed.username === "" && parsed.password === "";
+			} catch {
+				return false;
+			}
+		}, "Must be a valid absolute URL, and must not carry a username or password"),
+	secret: z
+		.string()
+		.trim()
+		.refine(
+			(value) => value.length === 0 || (value.length >= 16 && value.length <= 256),
+			"A signing key is between 16 and 256 characters. Leave it blank to have one generated.",
+		)
+		.transform((value) => (value.length === 0 ? null : value)),
+	enabled: z.boolean(),
+});
+export type WebhookFormValues = z.input<typeof webhookFormSchema>;

@@ -1,5 +1,11 @@
 import { z } from "zod/v4";
-import { destinationShape, displayName, namedDestinationShape, patchOf } from "../shared/dto";
+import {
+	destinationShape,
+	displayName,
+	namedDestinationShape,
+	patchOf,
+	shortCode,
+} from "../shared/dto";
 
 /** `HH:MM`, 24-hour. Both ends of a wall-clock window are inclusive. */
 const wallClock = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/u, "must be HH:MM, 24-hour");
@@ -27,6 +33,16 @@ export const createTimeConditionDto = z.strictObject({
 	timezone: z.string().min(1).max(64).optional(),
 	...destinationShape(true),
 	...namedDestinationShape("nomatch"),
+	/**
+	 * The star code that cycles the override, and the key a BLF lamp watches.
+	 *
+	 * Shaped exactly like `call_flow.featureCode` and left unconstrained beyond that for the same
+	 * reason: the suffix is the tenant's, and the failure this feature can actually have is two
+	 * mechanisms answering the same digits — which the compile-time screen against the feature-code
+	 * catalogue sees and a regex at the edge cannot. The column's partial unique index makes a second
+	 * condition claiming the same code a write-time conflict rather than a silent second claimant.
+	 */
+	overrideFeatureCode: shortCode.nullish(),
 	enabled: z.boolean().optional(),
 });
 

@@ -94,12 +94,23 @@ func TestParseOffer(t *testing.T) {
 			wantDirection: sdp.DirectionSendOnly,
 		},
 		{
-			// The whole point of refusing rather than transcoding: this is what makes rung 2
-			// achievable with no DSP. The engine routes the leg to Asterisk instead.
-			name: "refuses an offer with no G.711 at all",
+			// RUNG 7 CHANGED THIS CASE. It used to assert that an offer of G.722 and Opus was refused
+			// because rung 2 had no codec but G.711 — "the whole point of refusing rather than
+			// transcoding". Both are negotiable now, so the offer is ACCEPTED at the offerer's own
+			// first preference, which is G.722.
+			name: "accepts a wideband offer at the offerer's preference",
 			body: offer("m=audio 41000 RTP/AVP 9 111",
 				"a=rtpmap:9 G722/8000",
 				"a=rtpmap:111 opus/48000/2"),
+			wantCodec:     sdp.CodecG722,
+			wantDirection: sdp.DirectionSendRecv,
+		},
+		{
+			// The refusal still exists; it just needs an offer with nothing mediad speaks in it.
+			name: "refuses an offer with no codec mediad carries",
+			body: offer("m=audio 41000 RTP/AVP 96 97",
+				"a=rtpmap:96 AMR-WB/16000",
+				"a=rtpmap:97 iLBC/8000"),
 			wantErr: sdp.ErrNoCommonCodec,
 		},
 		{

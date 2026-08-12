@@ -37,6 +37,31 @@ export class UnknownSettingCategoryException extends HttpException {
 	}
 }
 
+/**
+ * A category whose permission override the caller does not hold.
+ *
+ * A 403 that NAMES the missing permission, because the caller has already passed the decorator's
+ * floor (`settings.write`) and "forbidden" alone would read as a session problem. This is the
+ * error `CATEGORY_PERMISSIONS` exists to produce: the decorator is static metadata, the category
+ * is a path parameter, so the per-category check happens in the service and surfaces here.
+ */
+export class SettingCategoryForbiddenException extends HttpException {
+	constructor(category: string, permission: string) {
+		super(
+			{
+				statusCode: HttpStatus.FORBIDDEN,
+				code: "SETTING_CATEGORY_FORBIDDEN",
+				message:
+					`The "${category}" settings require the "${permission}" permission, ` +
+					"which your role does not hold.",
+				category,
+				permission,
+			},
+			HttpStatus.FORBIDDEN,
+		);
+	}
+}
+
 /** A patch whose keys or values the catalogue refuses. Carries every issue, not just the first. */
 export class InvalidSettingPatchException extends HttpException {
 	constructor(category: string, issues: readonly CategoryPatchIssue[]) {

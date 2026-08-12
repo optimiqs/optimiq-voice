@@ -27,12 +27,14 @@ import {
 	CALL_DISPOSITIONS,
 	CALL_LEG_SIDES,
 	HANGUP_SIDES,
+	QUEUE_OUTCOMES,
 	TRANSCRIPTION_STATUSES,
 	type CallDestinationType,
 	type CallDirection,
 	type CallDisposition,
 	type CallLegSide,
 	type HangupSide,
+	type QueueOutcome,
 	type TranscriptionStatus,
 } from "./enums";
 
@@ -100,7 +102,50 @@ export const callLegs = pgTable.withRLS(
 		routingContext: text("routing_context"),
 		/** Voice application / autopilot assistant that handled the leg. */
 		applicationRef: uuidEntityId("application_ref"),
+		/**
+		 * The queue this leg reached, and what happened to the caller in it.
+		 *
+		 * `queue_ref` predates the rest by a wave and was never written by anything — the routing
+		 * walk set `destination_type = 'queue'` and `destination_ref = <queueId>` and stopped there,
+		 * which is enough to find a queue's calls and not enough to report on them. The three columns
+		 * below are what turn "this call went to a queue" into a service-level answer, and the writer
+		 * now fills all four.
+		 *
+		 * All four are nullable and stay NULL on every leg that never touched a queue, which is most
+		 * of them. That is the domain rather than an omission: a `queue_wait_ms` of 0 on a direct
+		 * extension call would be a zero that every average then includes, and an average hold time
+		 * computed over a tenant's whole traffic is wrong in a direction nobody notices.
+		 */
 		queueRef: uuidEntityId("queue_ref"),
+		/** Joining the line to leaving it. Excludes the agent's ring time — see the event schema. */
+		queueWaitMs: integer("queue_wait_ms"),
+		queueOutcome: text("queue_outcome").$type<QueueOutcome>(),
+		/**
+		 * The `queue_agent` who took the call. Set only when `queue_outcome = 'answered'`.
+		 *
+		 * A queue-agent row id and NOT a user id: this database holds no user ids at all, and this
+		 * column does not change that. Which person sat in that seat is resolvable through
+		 * `queue_agent` in `pbx-db` by whoever is allowed to see it.
+		 */
+		queueAgentRef: uuidEntityId("queue_agent_ref"),
+		/**
+		 * Which authorisation code opened the outbound route this call took.
+		 *
+		 * Two columns and not one, and NEITHER of them is the digits. A PIN on an outbound route is a
+		 * spending control, so the question the ledger has to answer is "who authorised this call to
+		 * Paraguay" — and the answer a tenant recognises is the ordinal and the label they typed into
+		 * a form ("code 3, the night desk"), not a secret. Storing the code itself would make this
+		 * table the best place on the platform to go looking for one to reuse, which is the entire
+		 * reason `pin_set_entry` stores a scrypt digest and never the plaintext upstream kept.
+		 *
+		 * The LABEL is denormalised rather than joined, for the reason `account_code` is a text column:
+		 * this database holds no `pin_set` rows to join against, and a label that changed in `pbx-db`
+		 * six months after the call must not retroactively rewrite what the call record says.
+		 *
+		 * Null on every call that took no gated route, which is nearly all of them.
+		 */
+		authPinOrdinal: integer("auth_pin_ordinal"),
+		authPinLabel: text("auth_pin_label"),
 		ivrRef: uuidEntityId("ivr_ref"),
 		ringGroupRef: uuidEntityId("ring_group_ref"),
 		/** Billing tag carried from the extension or trunk. */
@@ -182,6 +227,20 @@ export const callLegs = pgTable.withRLS(
 			inTuple("transcription_status", TRANSCRIPTION_STATUSES),
 		),
 		check("call_legs_duration_check", sql`"duration_ms" >= 0 and "billsec_ms" >= 0`),
+		check("call_legs_queue_outcome_check", inTuple("queue_outcome", QUEUE_OUTCOMES)),
+		check("call_legs_queue_wait_check", sql`"queue_wait_ms" is null or "queue_wait_ms" >= 0`),
+		/**
+		 * The index the queue-statistics query runs on.
+		 *
+		 * Partial, on `queue_outcome is not null`, for the reason `call_legs_recording_idx` is partial
+		 * on `recording_key is not null`: the rows it serves are a small fraction of a tenant's
+		 * traffic, and an index over every leg would be paid for on every insert by every call that
+		 * never went near a queue. The column order is the query's: one organization, one queue, a
+		 * time window — which is also what lets the planner prune partitions before it reads a page.
+		 */
+		index("call_legs_queue_idx")
+			.on(table.organizationId, table.queueRef, table.startedAt.desc().nullsLast())
+			.where(sql`queue_outcome is not null`),
 
 		// Append-only ledger: SELECT + INSERT, two policies, no UPDATE/DELETE for the tenant role.
 		pgPolicy("call_legs_tenant_select", {

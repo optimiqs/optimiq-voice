@@ -28,14 +28,26 @@ export class ProvisioningCatalogController {
 	constructor(@Inject(PROVISIONING_ENV) private readonly env: ProvisioningEnv) {}
 
 	/**
-	 * `devices.read` rather than being unauthenticated.
+	 * `provisioning.read` rather than `devices.read`, and never unauthenticated.
 	 *
-	 * The catalogue itself is not a secret — it is five vendor names — but `missing` names the
-	 * environment variables an operator has not set, which is deployment reconnaissance. Behind the
-	 * same permission that lets you see the devices it describes is the right place for it.
+	 * The catalogue is not a secret — it is five vendor names — but `missing` names the environment
+	 * variables an operator has not set, which is deployment reconnaissance. So it is behind a
+	 * permission; the only question was which.
+	 *
+	 * It used to be `devices.read`, on the reasoning that this describes the devices that grant lets
+	 * you see. That reads well and is one resource off: the permission registry declares a
+	 * `provisioning` resource whose read entry is described as "inspect vendor catalogues and
+	 * rendered device configuration", which is this endpoint stated in advance and which was
+	 * enforcing nothing anywhere. A permission whose description names a route, guarding no route,
+	 * while that route is guarded by a neighbouring grant, is the exact shape the W7 permission
+	 * audit was looking for.
+	 *
+	 * `manager` gained `provisioning.read` in the same change, so no role lost the device form's
+	 * vendor list by this narrowing — what it loses is the ability to read the deployment's
+	 * configuration gaps from a role that has no reason to.
 	 */
 	@Get("catalog")
-	@RequirePermissions("devices.read")
+	@RequirePermissions("provisioning.read")
 	catalog(): { readonly data: ProvisioningCatalog } {
 		return {
 			data: {

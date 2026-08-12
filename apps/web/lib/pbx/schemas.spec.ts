@@ -1,7 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import {
+	audioStreamFormSchema,
+	callBlockRuleFormSchema,
+	callFlowFormSchema,
 	conferenceFormSchema,
 	dialableString,
+	dialByNameDirectoryFormSchema,
 	e164,
 	emergencyAddressFormSchema,
 	extensionFormSchema,
@@ -13,17 +17,32 @@ import {
 	keypadPinIssue,
 	mohClassFormSchema,
 	mohClassName,
+	orgLimitsFormSchema,
 	outboundRouteFormSchema,
+	pagingGroupFormSchema,
+	pagingGroupMemberFormSchema,
 	parkLotFormSchema,
 	parseDialPatterns,
 	phoneNumberFormSchema,
+	phraseFormSchema,
+	phraseStepFormSchema,
+	pinSchema,
+	pinSetEntryFormSchema,
+	pinSetFormSchema,
 	promptFormSchema,
 	queueAgentFormSchema,
 	queueFormSchema,
 	queueTierFormSchema,
 	ringGroupFormSchema,
+	sharedLineAppearanceFormSchema,
+	sharedLineFormSchema,
+	shortCode,
+	speedDialFormSchema,
+	timeConditionOverrideCodeFormSchema,
 	timeRuleFormSchema,
 	timezoneName,
+	translationRuleFormSchema,
+	trunkFormSchema,
 	voicemailBoxFormSchema,
 } from "./schemas";
 
@@ -83,6 +102,7 @@ describe("optional text", () => {
 			tollClass: "national",
 			recordPolicy: "none",
 			pickupGroup: "",
+			callScreening: false,
 			callTimeoutSeconds: "",
 			maxRegistrations: "",
 			mohClassId: "",
@@ -110,6 +130,7 @@ describe("optional text", () => {
 			tollClass: "national" as const,
 			recordPolicy: "none" as const,
 			pickupGroup: "",
+			callScreening: false,
 			callTimeoutSeconds: "",
 			maxRegistrations: "",
 			mohClassId: "",
@@ -134,6 +155,7 @@ describe("optional text", () => {
 			tollClass: "national" as const,
 			recordPolicy: "none" as const,
 			pickupGroup: "",
+			callScreening: false,
 			callTimeoutSeconds: "4",
 			maxRegistrations: "",
 			mohClassId: "",
@@ -170,6 +192,7 @@ describe("the pickup group", () => {
 		tollClass: "national" as const,
 		recordPolicy: "none" as const,
 		pickupGroup: "",
+		callScreening: false,
 		callTimeoutSeconds: "",
 		maxRegistrations: "",
 		mohClassId: "",
@@ -254,6 +277,8 @@ describe("outboundRouteFormSchema", () => {
 		trunkIds: [],
 		timeConditionId: "",
 		callerIdNumberOverride: "",
+		translationRulesetId: "",
+		pinSetId: "",
 		recordEnabled: false,
 		enabled: true,
 	};
@@ -277,6 +302,85 @@ describe("outboundRouteFormSchema", () => {
 		expect(outboundRouteFormSchema.safeParse({ ...base, trunkIds: ["not-a-uuid"] }).success).toBe(
 			false,
 		);
+	});
+
+	/**
+	 * The two attachments that became writable when the DTO declared them.
+	 *
+	 * Both were rendered as read-only facts while `updateOutboundRouteDto` did not accept them — a
+	 * select wired to a strict DTO produces a 400 naming a field the user had just chosen from a list
+	 * this app rendered. The DTO declares both now, so the form sends them, and the shape it sends is
+	 * what these assertions pin.
+	 */
+	it("clears the PIN set and the ruleset to null rather than to an empty string", () => {
+		const parsed = outboundRouteFormSchema.parse(base);
+		expect(parsed.pinSetId).toBeNull();
+		expect(parsed.translationRulesetId).toBeNull();
+	});
+
+	/**
+	 * `null` and not "leave it alone", which is the whole reason the transform exists. `PATCH` leaves
+	 * an ABSENT key alone, so a form that dropped an emptied selector would let an operator detach a
+	 * PIN set, press Save, and still be challenged on the next call — with the dialog showing no
+	 * challenge. The column is a uuid, so `""` is not the alternative either: Postgres answers it with
+	 * a `22P02` nobody can act on.
+	 */
+	it("keeps a chosen id and refuses anything that is not one", () => {
+		const id = "0193f2aa-0000-7000-8000-000000000001";
+		expect(outboundRouteFormSchema.parse({ ...base, pinSetId: id }).pinSetId).toBe(id);
+		expect(
+			outboundRouteFormSchema.parse({ ...base, translationRulesetId: id }).translationRulesetId,
+		).toBe(id);
+		expect(outboundRouteFormSchema.safeParse({ ...base, pinSetId: "not-a-uuid" }).success).toBe(
+			false,
+		);
+		expect(
+			outboundRouteFormSchema.safeParse({ ...base, translationRulesetId: "nope" }).success,
+		).toBe(false);
+	});
+});
+
+/**
+ * The trunk's inbound ruleset — the third of the three columns the W8 web wave had to render
+ * read-only, and the one whose composition order is different from the other two.
+ *
+ * Nothing composes with it: a trunk has no inline strip or prepend, so the ruleset runs first and
+ * alone, before the screening list, the inbound routes or the call record read the caller's number.
+ * On an outbound route the shared ruleset runs AFTER the route's own digits. The schemas cannot
+ * express either ordering; the forms' copy does, and these tests exist so the field itself cannot
+ * quietly go missing from the body.
+ */
+describe("trunkFormSchema", () => {
+	const base = {
+		name: "Carrier A",
+		kind: "register" as const,
+		sipDomain: "sip.example.net",
+		sipProxy: "sip.example.net",
+		outboundProxy: "",
+		authUser: "",
+		sipSecretRef: "",
+		transport: "udp" as const,
+		registerExpiresSeconds: "",
+		maxChannels: "",
+		codecPrefs: "",
+		callerIdNumberOverride: "",
+		inboundTranslationRulesetId: "",
+		enabled: true,
+	};
+
+	it("clears the inbound ruleset to null rather than to an empty string", () => {
+		expect(trunkFormSchema.parse(base).inboundTranslationRulesetId).toBeNull();
+	});
+
+	it("keeps a chosen ruleset and refuses anything that is not an id", () => {
+		const id = "0193f2aa-0000-7000-8000-000000000002";
+		expect(
+			trunkFormSchema.parse({ ...base, inboundTranslationRulesetId: id })
+				.inboundTranslationRulesetId,
+		).toBe(id);
+		expect(
+			trunkFormSchema.safeParse({ ...base, inboundTranslationRulesetId: "not-a-uuid" }).success,
+		).toBe(false);
 	});
 });
 
@@ -409,6 +513,7 @@ describe("queueFormSchema", () => {
 		mohClassId: "",
 		greetingPromptId: "",
 		announcePromptId: "",
+		agentWhisperPromptId: "",
 		maxWaitSeconds: "",
 		maxWaitNoAgentSeconds: "",
 		wrapUpSeconds: "",
@@ -419,7 +524,9 @@ describe("queueFormSchema", () => {
 		tierRulesApply: true,
 		tierRuleWaitSeconds: "",
 		tierRuleNoAgentNoWait: false,
-		recordEnabled: false,
+		recordPolicy: "none" as const,
+		exitKey: "",
+		defaultPriority: "",
 		enabled: true,
 	};
 
@@ -452,6 +559,43 @@ describe("queueFormSchema", () => {
 		expect(queueFormSchema.safeParse({ ...base, maxWaitSeconds: "86401" }).success).toBe(false);
 		expect(queueFormSchema.safeParse({ ...base, extensionNumber: "70a0" }).success).toBe(false);
 		expect(queueFormSchema.parse({ ...base, extensionNumber: "" }).extensionNumber).toBeNull();
+	});
+
+	/**
+	 * The boolean this replaced is not accepted by the server at all — `createQueueDto` is a
+	 * `strictObject`, so a body still carrying `recordEnabled` is a 400 naming the key rather than a
+	 * field being ignored. The strict object HERE is what stops a copied block from reintroducing it.
+	 */
+	it("carries a record POLICY and refuses the boolean it replaced", () => {
+		expect(queueFormSchema.parse({ ...base, recordPolicy: "all" }).recordPolicy).toBe("all");
+		expect(
+			queueFormSchema.safeParse({ ...base, recordEnabled: false, recordPolicy: undefined }).success,
+		).toBe(false);
+	});
+
+	/**
+	 * Upper-cased before validation, exactly as the server's DTO does it. The engine compares this
+	 * against a `DtmfEvent.digit` with `===`, so `d` and `D` are not equivalent anywhere below this
+	 * line — normalising here is what makes the control and the column agree rather than what makes
+	 * the form lenient.
+	 */
+	it("normalises the exit key the server's way and refuses anything a phone cannot send", () => {
+		expect(queueFormSchema.parse({ ...base, exitKey: "d" }).exitKey).toBe("D");
+		expect(queueFormSchema.parse({ ...base, exitKey: " 2 " }).exitKey).toBe("2");
+		expect(queueFormSchema.parse({ ...base, exitKey: "#" }).exitKey).toBe("#");
+		// Blank is how the column spells "no exit key at all", and it is `null` on the wire.
+		expect(queueFormSchema.parse({ ...base, exitKey: "" }).exitKey).toBeNull();
+		// Two digits is not an exit key: there is no inter-digit timeout running under hold music.
+		expect(queueFormSchema.safeParse({ ...base, exitKey: "22" }).success).toBe(false);
+		expect(queueFormSchema.safeParse({ ...base, exitKey: "E" }).success).toBe(false);
+	});
+
+	it("bounds the starting priority to the 0-1000 scale the events already publish on", () => {
+		expect(queueFormSchema.parse({ ...base, defaultPriority: "0" }).defaultPriority).toBe(0);
+		expect(queueFormSchema.parse({ ...base, defaultPriority: "1000" }).defaultPriority).toBe(1000);
+		expect(queueFormSchema.safeParse({ ...base, defaultPriority: "1001" }).success).toBe(false);
+		expect(queueFormSchema.safeParse({ ...base, defaultPriority: "-1" }).success).toBe(false);
+		expect(queueFormSchema.parse(base).defaultPriority).toBeNull();
 	});
 });
 
@@ -511,6 +655,7 @@ describe("queueTierFormSchema", () => {
 		queueAgentId: "0193f2aa-0000-7000-8000-000000000003",
 		level: "",
 		position: "",
+		announcePromptId: "",
 	};
 
 	/**
@@ -534,6 +679,369 @@ describe("queueTierFormSchema", () => {
 		expect(parsed.level).toBeNull();
 		expect(parsed.position).toBeNull();
 	});
+
+	/**
+	 * The tier's whisper is a NULLABLE column, so its emptied `null` means "clear it" rather than
+	 * "restore the default" — the opposite reading from the two knobs above, on the same wire value.
+	 * Clearing it is what hands the call back to the queue's own whisper.
+	 */
+	it("clears the tier whisper on empty and refuses anything that is not an id from the list", () => {
+		expect(queueTierFormSchema.parse(base).announcePromptId).toBeNull();
+		expect(
+			queueTierFormSchema.parse({
+				...base,
+				announcePromptId: "0193f2aa-0000-7000-8000-000000000004",
+			}).announcePromptId,
+		).toBe("0193f2aa-0000-7000-8000-000000000004");
+		expect(queueTierFormSchema.safeParse({ ...base, announcePromptId: "escalation" }).success).toBe(
+			false,
+		);
+	});
+});
+
+/**
+ * Paging groups, mirroring `paging-groups.dto.ts`.
+ *
+ * Two facts are asserted here rather than left to a round trip, because both are places where a
+ * paging group looks like a ring group and is not.
+ *
+ * The first is the NUMBER: it is genuinely optional, because a group reachable only through `*81`
+ * has none. A form that required one would make an operator invent digits, and the schema's unique
+ * index would then have them collide with an extension.
+ *
+ * The second is the TIMEOUT's ceiling. 300, not the ring group's 600, and the difference is not a
+ * rounding: a ring group's timeout is how long a HUMAN is given to pick up, while this is how long
+ * an AUTO-ANSWERED leg may take to come up. Copying the ring group's bound here would let a typo
+ * pin fan-out resources open for ten minutes on a group that never waits for anybody.
+ */
+describe("pagingGroupFormSchema", () => {
+	const base = {
+		name: "All handsets",
+		extensionNumber: "",
+		duplex: false,
+		timeoutSeconds: "",
+		enabled: true,
+	};
+
+	it("sends a blank number as null, because *81 is a complete way to reach a group", () => {
+		expect(pagingGroupFormSchema.parse(base).extensionNumber).toBeNull();
+		expect(pagingGroupFormSchema.parse({ ...base, extensionNumber: "8100" }).extensionNumber).toBe(
+			"8100",
+		);
+	});
+
+	it("refuses a number with letters in it", () => {
+		expect(pagingGroupFormSchema.safeParse({ ...base, extensionNumber: "81a0" }).success).toBe(
+			false,
+		);
+	});
+
+	/** `resettable` on the server: an emptied control means "put the default back", which is `null`. */
+	it("turns an emptied timeout into null rather than a zero", () => {
+		expect(pagingGroupFormSchema.parse(base).timeoutSeconds).toBeNull();
+		expect(pagingGroupFormSchema.parse({ ...base, timeoutSeconds: "30" }).timeoutSeconds).toBe(30);
+	});
+
+	it("holds the timeout to the server's 5 and 300, which are not the ring group's", () => {
+		expect(pagingGroupFormSchema.safeParse({ ...base, timeoutSeconds: "4" }).success).toBe(false);
+		expect(pagingGroupFormSchema.safeParse({ ...base, timeoutSeconds: "5" }).success).toBe(true);
+		expect(pagingGroupFormSchema.safeParse({ ...base, timeoutSeconds: "300" }).success).toBe(true);
+		expect(pagingGroupFormSchema.safeParse({ ...base, timeoutSeconds: "301" }).success).toBe(false);
+		expect(pagingGroupFormSchema.safeParse({ ...base, timeoutSeconds: "600" }).success).toBe(false);
+	});
+
+	/**
+	 * There is no destination trio on this form and there must not be one. A page has nowhere to
+	 * continue to, and a strict object is what stops a copied block from adding one silently.
+	 */
+	it("refuses a destination, because a page does not go anywhere when it ends", () => {
+		expect(
+			pagingGroupFormSchema.safeParse({ ...base, timeoutDestinationType: "voicemail" }).success,
+		).toBe(false);
+	});
+});
+
+/**
+ * A member, where the difference from a ring-group member is the whole design.
+ *
+ * A ring group's member is a DESTINATION and may be a mobile over a trunk. A paging member is an
+ * `extension_id` and may not be anything else, because the engine originates an auto-answered leg
+ * to it — an external number cannot be told to pick up. So the reference is REQUIRED here where
+ * every other selector on a PBX form treats blank as "clear it".
+ */
+describe("pagingGroupMemberFormSchema", () => {
+	const id = "019fd5fb-de54-700b-8826-8cf8ab5199af";
+	const base = { extensionId: id, ordinal: "0", enabled: true };
+
+	it("requires an extension, because a member with none pages nobody", () => {
+		expect(pagingGroupMemberFormSchema.safeParse({ ...base, extensionId: "" }).success).toBe(false);
+		expect(pagingGroupMemberFormSchema.safeParse({ ...base, extensionId: "  " }).success).toBe(
+			false,
+		);
+	});
+
+	it("refuses anything that is not a uuid, since the options ARE ids", () => {
+		expect(pagingGroupMemberFormSchema.safeParse({ ...base, extensionId: "1001" }).success).toBe(
+			false,
+		);
+		expect(pagingGroupMemberFormSchema.parse({ ...base, extensionId: ` ${id} ` }).extensionId).toBe(
+			id,
+		);
+	});
+
+	it("holds the ordinal to the server's 0 and 1000, and keeps a zero", () => {
+		expect(pagingGroupMemberFormSchema.parse(base).ordinal).toBe(0);
+		expect(pagingGroupMemberFormSchema.safeParse({ ...base, ordinal: "1000" }).success).toBe(true);
+		expect(pagingGroupMemberFormSchema.safeParse({ ...base, ordinal: "1001" }).success).toBe(false);
+		expect(pagingGroupMemberFormSchema.safeParse({ ...base, ordinal: "-1" }).success).toBe(false);
+	});
+
+	/** A member carries no destination and no timing of its own — both live on the group. */
+	it("refuses a destination and a per-member timeout", () => {
+		expect(
+			pagingGroupMemberFormSchema.safeParse({ ...base, destinationType: "extension" }).success,
+		).toBe(false);
+		expect(pagingGroupMemberFormSchema.safeParse({ ...base, timeoutSeconds: "10" }).success).toBe(
+			false,
+		);
+	});
+});
+
+/**
+ * Shared lines, mirroring `shared-lines.dto.ts`.
+ *
+ * Three facts are asserted rather than left to a round trip, because each is a place a shared line
+ * looks like a ring group or a paging group and is not.
+ *
+ * The NUMBER is genuinely optional: a line that is only a shared key across a boss and an assistant
+ * is reached through its member buttons, not a dialable number.
+ *
+ * The RECALL timeout's floor is 0, and 0 is a REAL value — it disables recall and the line holds
+ * indefinitely — where the ring timeout's floor is 5. Copying one bound onto the other would either
+ * forbid "hold forever" or admit a two-second ring nobody can answer.
+ *
+ * There is NO destination trio, and a strict object is what keeps a copied block from adding one — a
+ * shared line never routes a call out, its state lives in a KV claim.
+ */
+describe("sharedLineFormSchema", () => {
+	const base = {
+		name: "Front desk",
+		extensionNumber: "",
+		strategy: "simultaneous" as const,
+		ringTimeoutSeconds: "",
+		holdRecallTimeoutSeconds: "",
+		bargeInEnabled: false,
+		enabled: true,
+	};
+
+	it("sends a blank number as null, because a shared key needs no number of its own", () => {
+		expect(sharedLineFormSchema.parse(base).extensionNumber).toBeNull();
+		expect(sharedLineFormSchema.parse({ ...base, extensionNumber: "8500" }).extensionNumber).toBe(
+			"8500",
+		);
+	});
+
+	it("refuses a number with letters in it", () => {
+		expect(sharedLineFormSchema.safeParse({ ...base, extensionNumber: "85a0" }).success).toBe(
+			false,
+		);
+	});
+
+	/** `resettable` on the server: an emptied ring timeout means "put the default back", so `null`. */
+	it("turns an emptied ring timeout into null and holds it to 5 and 600", () => {
+		expect(sharedLineFormSchema.parse(base).ringTimeoutSeconds).toBeNull();
+		expect(sharedLineFormSchema.safeParse({ ...base, ringTimeoutSeconds: "4" }).success).toBe(
+			false,
+		);
+		expect(sharedLineFormSchema.safeParse({ ...base, ringTimeoutSeconds: "5" }).success).toBe(true);
+		expect(sharedLineFormSchema.safeParse({ ...base, ringTimeoutSeconds: "600" }).success).toBe(
+			true,
+		);
+		expect(sharedLineFormSchema.safeParse({ ...base, ringTimeoutSeconds: "601" }).success).toBe(
+			false,
+		);
+	});
+
+	/**
+	 * The recall timeout, where 0 is a value the column keeps rather than a blank. Its floor is 0 for
+	 * that reason, and an emptied box is `null` — the ordinary "restore the default".
+	 */
+	it("keeps a zero recall timeout, which disables recall, and nulls an emptied one", () => {
+		expect(
+			sharedLineFormSchema.parse({ ...base, holdRecallTimeoutSeconds: "0" })
+				.holdRecallTimeoutSeconds,
+		).toBe(0);
+		expect(sharedLineFormSchema.parse(base).holdRecallTimeoutSeconds).toBeNull();
+		expect(
+			sharedLineFormSchema.safeParse({ ...base, holdRecallTimeoutSeconds: "3600" }).success,
+		).toBe(true);
+		expect(
+			sharedLineFormSchema.safeParse({ ...base, holdRecallTimeoutSeconds: "3601" }).success,
+		).toBe(false);
+	});
+
+	it("offers only the two strategies the server has, and no more", () => {
+		expect(sharedLineFormSchema.safeParse({ ...base, strategy: "sequential" }).success).toBe(true);
+		expect(sharedLineFormSchema.safeParse({ ...base, strategy: "round-robin" }).success).toBe(
+			false,
+		);
+	});
+
+	/**
+	 * No destination trio, and it must not be one. A shared line never routes a call out — its state
+	 * lives in a KV claim — and a strict object is what stops a copied block from adding one silently.
+	 */
+	it("refuses a destination, because a shared line does not route a call out", () => {
+		expect(
+			sharedLineFormSchema.safeParse({ ...base, timeoutDestinationType: "voicemail" }).success,
+		).toBe(false);
+	});
+});
+
+/**
+ * An appearance, where the difference from a ring-group member is the whole design.
+ *
+ * An appearance carries an `extension_id` and may not be anything else, because the engine
+ * originates a leg to a registered endpoint and the credential path tells that device which button
+ * to light. So the reference is REQUIRED here where every other selector on a PBX form treats blank
+ * as "clear it" — a blank appearance lights nobody's button.
+ */
+describe("sharedLineAppearanceFormSchema", () => {
+	const id = "019fd5fb-de54-700b-8826-8cf8ab5199af";
+	const base = { extensionId: id, ordinal: "0", enabled: true };
+
+	it("requires an extension, because an appearance with none lights nobody's button", () => {
+		expect(sharedLineAppearanceFormSchema.safeParse({ ...base, extensionId: "" }).success).toBe(
+			false,
+		);
+		expect(sharedLineAppearanceFormSchema.safeParse({ ...base, extensionId: "  " }).success).toBe(
+			false,
+		);
+	});
+
+	it("refuses anything that is not a uuid, since the options ARE ids", () => {
+		expect(sharedLineAppearanceFormSchema.safeParse({ ...base, extensionId: "1001" }).success).toBe(
+			false,
+		);
+		expect(
+			sharedLineAppearanceFormSchema.parse({ ...base, extensionId: ` ${id} ` }).extensionId,
+		).toBe(id);
+	});
+
+	it("holds the ordinal to the server's 0 and 1000, and keeps a zero", () => {
+		expect(sharedLineAppearanceFormSchema.parse(base).ordinal).toBe(0);
+		expect(sharedLineAppearanceFormSchema.safeParse({ ...base, ordinal: "1000" }).success).toBe(
+			true,
+		);
+		expect(sharedLineAppearanceFormSchema.safeParse({ ...base, ordinal: "1001" }).success).toBe(
+			false,
+		);
+		expect(sharedLineAppearanceFormSchema.safeParse({ ...base, ordinal: "-1" }).success).toBe(
+			false,
+		);
+	});
+
+	/** An appearance carries no destination and no timing of its own — both live on the line. */
+	it("refuses a destination and a per-appearance timeout", () => {
+		expect(
+			sharedLineAppearanceFormSchema.safeParse({ ...base, destinationType: "extension" }).success,
+		).toBe(false);
+		expect(
+			sharedLineAppearanceFormSchema.safeParse({ ...base, ringTimeoutSeconds: "10" }).success,
+		).toBe(false);
+	});
+});
+
+/**
+ * The screening rule, where what the schema does NOT do is the whole design.
+ *
+ * `pattern` is bounded by length and by nothing else, because `compilePattern` runs inside the
+ * server's write transaction and is the only opinion that decides whether a rule can be enforced.
+ * These tests pin that absence: a regex the browser refuses is a rule the engine would have
+ * happily enforced, and a form that refused it would be lying about what the platform accepts.
+ */
+describe("callBlockRuleFormSchema", () => {
+	const base = {
+		pattern: "+12125550100",
+		matchKind: "exact" as const,
+		direction: "inbound" as const,
+		action: "block" as const,
+		label: "",
+		enabled: true,
+	};
+
+	it("takes an exact number, a prefix and a regular expression through the same field", () => {
+		expect(callBlockRuleFormSchema.safeParse(base).success).toBe(true);
+		expect(
+			callBlockRuleFormSchema.safeParse({ ...base, matchKind: "prefix", pattern: "+1212555" })
+				.success,
+		).toBe(true);
+		expect(
+			callBlockRuleFormSchema.safeParse({
+				...base,
+				matchKind: "regex",
+				pattern: "^\\+1212555\\d{4}$",
+			}).success,
+		).toBe(true);
+	});
+
+	/**
+	 * The rule this schema deliberately does not have. A regex is legal against `matchKind: "exact"`
+	 * as far as the edge is concerned — the compiler will treat it as a literal and say so — and a
+	 * client-side pairing check would refuse a save the server accepts.
+	 */
+	it("does not check the pattern against the match kind; the compiler does that", () => {
+		expect(
+			callBlockRuleFormSchema.safeParse({ ...base, matchKind: "exact", pattern: "^\\+1[0-9]+$" })
+				.success,
+		).toBe(true);
+		expect(
+			callBlockRuleFormSchema.safeParse({ ...base, matchKind: "regex", pattern: "(" }).success,
+		).toBe(true);
+	});
+
+	it("holds the pattern to the server's 1 and 256", () => {
+		expect(callBlockRuleFormSchema.safeParse({ ...base, pattern: "" }).success).toBe(false);
+		expect(callBlockRuleFormSchema.safeParse({ ...base, pattern: "   " }).success).toBe(false);
+		expect(callBlockRuleFormSchema.safeParse({ ...base, pattern: "9".repeat(256) }).success).toBe(
+			true,
+		);
+		expect(callBlockRuleFormSchema.safeParse({ ...base, pattern: "9".repeat(257) }).success).toBe(
+			false,
+		);
+	});
+
+	/** `label` is `nullish` on the server, so a cleared note is `null` and never a zero-length one. */
+	it("sends a blank label as null", () => {
+		expect(callBlockRuleFormSchema.parse(base).label).toBeNull();
+		expect(callBlockRuleFormSchema.parse({ ...base, label: " Robocaller " }).label).toBe(
+			"Robocaller",
+		);
+	});
+
+	it("offers no match kind the server has not got, including routes' `any`", () => {
+		expect(callBlockRuleFormSchema.safeParse({ ...base, matchKind: "any" }).success).toBe(false);
+		expect(callBlockRuleFormSchema.safeParse({ ...base, action: "hangup" }).success).toBe(false);
+		expect(callBlockRuleFormSchema.safeParse({ ...base, direction: "internal" }).success).toBe(
+			false,
+		);
+	});
+
+	/**
+	 * The two counters the enforcement side owns. The server answers a body carrying one with a 400
+	 * naming the field rather than dropping it, so a form that offered them would fail the whole
+	 * save — and a destination is refused for the reason `call_block_rule` has no trio at all: the
+	 * compiler maps `voicemail` to the CALLEE's own mailbox, not to somewhere a rule chose.
+	 */
+	it("refuses the hit counters and a destination, which the DTO would answer with a 400", () => {
+		expect(callBlockRuleFormSchema.safeParse({ ...base, hitCount: 4 }).success).toBe(false);
+		expect(
+			callBlockRuleFormSchema.safeParse({ ...base, lastHitAt: "2026-01-01T00:00:00.000Z" }).success,
+		).toBe(false);
+		expect(
+			callBlockRuleFormSchema.safeParse({ ...base, destinationType: "voicemail" }).success,
+		).toBe(false);
+	});
 });
 
 describe("conferenceFormSchema", () => {
@@ -542,8 +1050,10 @@ describe("conferenceFormSchema", () => {
 		roomNumber: "8000",
 		maxMembers: "",
 		mohClassId: "",
-		recordEnabled: false,
+		recordPolicy: "none",
 		announceJoinLeave: true,
+		entryToneEnabled: true,
+		exitToneEnabled: true,
 		waitForModerator: false,
 		enabled: true,
 	};
@@ -867,6 +1377,7 @@ const AUDIO_REFERENCE_FORMS = [
 			tollClass: "national",
 			recordPolicy: "none",
 			pickupGroup: "",
+			callScreening: false,
 			callTimeoutSeconds: "",
 			maxRegistrations: "",
 			mohClassId: "",
@@ -886,6 +1397,7 @@ const AUDIO_REFERENCE_FORMS = [
 			mohClassId: "",
 			greetingPromptId: "",
 			announcePromptId: "",
+			agentWhisperPromptId: "",
 			maxWaitSeconds: "",
 			maxWaitNoAgentSeconds: "",
 			wrapUpSeconds: "",
@@ -896,10 +1408,33 @@ const AUDIO_REFERENCE_FORMS = [
 			tierRulesApply: true,
 			tierRuleWaitSeconds: "",
 			tierRuleNoAgentNoWait: false,
-			recordEnabled: false,
+			recordPolicy: "none",
+			exitKey: "",
+			defaultPriority: "",
 			enabled: true,
 		},
-		columns: ["mohClassId", "greetingPromptId", "announcePromptId"],
+		/**
+		 * `agentWhisperPromptId` is the fourth, and it is the one that plays to the OTHER side of the
+		 * bridge — the answering agent alone, never the caller. Same helper, same null-on-blank rule.
+		 */
+		columns: ["mohClassId", "greetingPromptId", "announcePromptId", "agentWhisperPromptId"],
+	},
+	{
+		/**
+		 * The fifth prompt on the queues surface, and the only one that is not on the queue: a tier's
+		 * whisper replaces the queue's for calls THIS membership distributed. Same helper and the same
+		 * null-on-blank rule, which here means "hand the call back to the queue's whisper".
+		 */
+		label: "queueTierFormSchema",
+		schema: queueTierFormSchema,
+		base: {
+			queueId: "0193f2aa-0000-7000-8000-000000000002",
+			queueAgentId: "0193f2aa-0000-7000-8000-000000000003",
+			level: "",
+			position: "",
+			announcePromptId: "",
+		},
+		columns: ["announcePromptId"],
 	},
 	{
 		label: "ringGroupFormSchema",
@@ -947,8 +1482,10 @@ const AUDIO_REFERENCE_FORMS = [
 			roomNumber: "8000",
 			maxMembers: "",
 			mohClassId: "",
-			recordEnabled: false,
+			recordPolicy: "none",
 			announceJoinLeave: true,
+			entryToneEnabled: true,
+			exitToneEnabled: true,
 			waitForModerator: false,
 			enabled: true,
 		},
@@ -1053,5 +1590,413 @@ describe("keypadPinIssue, mirrored from voicemail-boxes.dto.ts", () => {
 	/** Two adjacent digits are not a run. The rule is about the WHOLE PIN counting. */
 	it("does not refuse a PIN that merely contains consecutive digits", () => {
 		expect(keypadPinIssue("1245")).toBeUndefined();
+	});
+});
+
+// ---------------------------------------------------------------------------------------------
+// The T2 admin block
+// ---------------------------------------------------------------------------------------------
+
+describe("shortCode, mirrored from shared/dto.ts", () => {
+	/**
+	 * Separate from `internalNumber` because a code MAY begin with `*`, and separate from
+	 * `dialableString` because a toggle code is not a destination — ten characters at most and no
+	 * letters. Both distinctions are the server's, and both are the sort of thing a consolidation
+	 * pass would collapse.
+	 */
+	it("accepts both a star code and a plain short code", () => {
+		expect(shortCode.safeParse("*281").success).toBe(true);
+		expect(shortCode.safeParse("#01").success).toBe(true);
+		expect(shortCode.safeParse("8001").success).toBe(true);
+	});
+
+	it("refuses letters, an empty code and anything over ten characters", () => {
+		expect(shortCode.safeParse("*28a").success).toBe(false);
+		expect(shortCode.safeParse("").success).toBe(false);
+		expect(shortCode.safeParse("*1234567890").success).toBe(false);
+	});
+
+	/**
+	 * A bare `*` is ACCEPTED, and the mirror keeps it that way on purpose.
+	 *
+	 * The server's regex is `^[*#]?[0-9*#]+$`, whose optional leading `[*#]` matches nothing and whose
+	 * body accepts `*` — so `"*"` is a legal code as far as the DTO is concerned. It is almost
+	 * certainly a mistake in a form, and refusing it here would still be wrong: this schema exists to
+	 * spare a round trip, not to hold an opinion the server does not. Whether a lone star can actually
+	 * be dialled is the compiler's screen against the feature-code catalogue, which is where a real
+	 * answer lives.
+	 */
+	it("accepts a bare star, because the server's own pattern does", () => {
+		expect(shortCode.safeParse("*").success).toBe(true);
+	});
+
+	/**
+	 * Nothing here screens a code against the feature-code catalogue or the internal numbers, and
+	 * that omission is deliberate: a collision is a fact about the whole ORGANIZATION, so the
+	 * compiler answers it inside the write transaction. A check here would be a second opinion that
+	 * refuses codes the tenant can legitimately use.
+	 */
+	it("does not pretend to know whether a code is already taken", () => {
+		expect(shortCode.safeParse("*97").success).toBe(true);
+	});
+});
+
+describe("callFlowFormSchema", () => {
+	const base = { name: "Main line", extensionNumber: "", featureCode: "", enabled: true };
+
+	it("accepts a flow reachable only by its toggle code", () => {
+		const parsed = callFlowFormSchema.parse(base);
+		expect(parsed.extensionNumber).toBeNull();
+		expect(parsed.featureCode).toBeNull();
+	});
+
+	it("clears a blank code to null rather than to an empty string", () => {
+		expect(callFlowFormSchema.parse({ ...base, featureCode: "  " }).featureCode).toBeNull();
+	});
+
+	it("keeps a real toggle code", () => {
+		expect(callFlowFormSchema.parse({ ...base, featureCode: "*281" }).featureCode).toBe("*281");
+	});
+
+	/**
+	 * `mode` is absent from the server's write DTOs — moving the switch is a different endpoint and a
+	 * different grant — and `z.strictObject` here is what stops a copied block from adding it. A body
+	 * carrying `mode` would be a 400 naming the field.
+	 */
+	it("refuses a mode, because the switch is not moved by a PATCH", () => {
+		expect(callFlowFormSchema.safeParse({ ...base, mode: "night" }).success).toBe(false);
+	});
+});
+
+describe("pinSetFormSchema and its entries", () => {
+	it("bounds the attempts at the server's one and ten", () => {
+		const base = {
+			name: "International",
+			description: "",
+			promptId: "",
+			failurePromptId: "",
+			maxAttempts: "3",
+			digitTimeoutMs: "8000",
+			enabled: true,
+		};
+		expect(pinSetFormSchema.safeParse(base).success).toBe(true);
+		expect(pinSetFormSchema.safeParse({ ...base, maxAttempts: "0" }).success).toBe(false);
+		expect(pinSetFormSchema.safeParse({ ...base, maxAttempts: "11" }).success).toBe(false);
+		// Blank means "use the server default", which is what every optional integer here means.
+		expect(pinSetFormSchema.parse({ ...base, maxAttempts: "" }).maxAttempts).toBeNull();
+	});
+
+	/**
+	 * The ordinal is REQUIRED, unlike almost every other integer on a PBX form, because it is the
+	 * identity a call detail record names — "authorised by code 3". A blank box is not "put it at the
+	 * end"; it is a code whose CDR label the server would have to invent.
+	 */
+	it("requires an ordinal on an entry", () => {
+		const base = { label: "Night desk", ordinal: "1", enabled: true };
+		expect(pinSetEntryFormSchema.safeParse(base).success).toBe(true);
+		expect(pinSetEntryFormSchema.safeParse({ ...base, ordinal: "" }).success).toBe(false);
+		expect(pinSetEntryFormSchema.safeParse({ ...base, ordinal: "1001" }).success).toBe(false);
+	});
+
+	/**
+	 * The code is NOT part of the entry schema. It is not a column on the row — it is a value the
+	 * endpoint hashes and discards — and a `strictObject` that declared it would invite the EDIT form
+	 * to send it too, which is how a blank box comes to mean "erase the credential".
+	 */
+	it("keeps the digits out of the entry's own shape", () => {
+		expect(
+			pinSetEntryFormSchema.safeParse({ label: "x", ordinal: "1", enabled: true, pin: "4821" })
+				.success,
+		).toBe(false);
+	});
+
+	/**
+	 * `pinSchema` mirrors `setPinDto` — four to sixteen digits — and deliberately does NOT reuse
+	 * `keypadPinIssue`, whose weak-PIN blocklist is the mailbox rule. Importing it here would refuse
+	 * a code the API accepts, leaving the user a message no round trip could have produced.
+	 */
+	it("mirrors the server's PIN rule rather than the mailbox's", () => {
+		expect(pinSchema.safeParse("4821").success).toBe(true);
+		expect(pinSchema.safeParse("1234567890123456").success).toBe(true);
+		expect(pinSchema.safeParse("482").success).toBe(false);
+		expect(pinSchema.safeParse("12345678901234567").success).toBe(false);
+		expect(pinSchema.safeParse("48a1").success).toBe(false);
+		// The mailbox rule would refuse both of these; this one does not, because the server does not.
+		expect(pinSchema.safeParse("1234").success).toBe(true);
+		expect(pinSchema.safeParse("0000").success).toBe(true);
+		expect(keypadPinIssue("1234")).toBeDefined();
+	});
+});
+
+describe("translationRuleFormSchema", () => {
+	const base = {
+		label: "",
+		matchPattern: "^00(\\d+)$",
+		replacement: "+$1",
+		ordinal: "0",
+		enabled: true,
+	};
+
+	/**
+	 * An EMPTY replacement is how a strip rule is written, so the field is a plain bounded string
+	 * rather than the blank-to-null helper every other optional text field uses. `null` would be a
+	 * 400: the column is `z.string().max(256)` on the server.
+	 */
+	it("accepts an empty replacement and keeps it a string", () => {
+		const parsed = translationRuleFormSchema.parse({ ...base, replacement: "" });
+		expect(parsed.replacement).toBe("");
+	});
+
+	it("requires a pattern and bounds both halves", () => {
+		expect(translationRuleFormSchema.safeParse({ ...base, matchPattern: "" }).success).toBe(false);
+		expect(
+			translationRuleFormSchema.safeParse({ ...base, matchPattern: "a".repeat(257) }).success,
+		).toBe(false);
+		expect(
+			translationRuleFormSchema.safeParse({ ...base, replacement: "0".repeat(257) }).success,
+		).toBe(false);
+	});
+
+	/**
+	 * Nothing here compiles the regex or screens the replacement, and that is the point:
+	 * `validateTranslationRule` in `@optimiq-voice/routing` runs inside the write transaction, and the
+	 * replacement allow-list is a SECURITY boundary — a replacement that can emit `@` could put a
+	 * second host into a request URI. A browser-side copy would disagree with it on the first
+	 * interesting input and would be the copy an attacker controls.
+	 */
+	it("leaves an unusable regex and an unsafe replacement to the compiler", () => {
+		expect(translationRuleFormSchema.safeParse({ ...base, matchPattern: "([" }).success).toBe(true);
+		expect(
+			translationRuleFormSchema.safeParse({ ...base, replacement: "$1@evil.example" }).success,
+		).toBe(true);
+	});
+});
+
+describe("audioStreamFormSchema", () => {
+	const base = {
+		name: "Traffic",
+		description: "",
+		url: "https://stream.example.com/traffic.mp3",
+		answerFirst: true,
+		maxSeconds: "0",
+		enabled: true,
+	};
+
+	it("accepts an http or https source", () => {
+		expect(audioStreamFormSchema.safeParse(base).success).toBe(true);
+		expect(
+			audioStreamFormSchema.safeParse({ ...base, url: "http://stream.example.com/x.mp3" }).success,
+		).toBe(true);
+	});
+
+	/**
+	 * The scheme rule is a SECURITY check, not formatting: the set of things a tenant may cause the
+	 * media server to open is a decision about what the media server will read, and
+	 * `file:///etc/passwd` is a URL. Refused at the edge, again by the compiler from the snapshot,
+	 * and here so the message lands on the field.
+	 */
+	it("refuses every scheme that is not http", () => {
+		for (const url of [
+			"file:///etc/passwd",
+			"ftp://x.example/a",
+			"gs://bucket/o",
+			"/relative.mp3",
+		]) {
+			expect(audioStreamFormSchema.safeParse({ ...base, url }).success).toBe(false);
+		}
+	});
+
+	/** Zero is "until the caller hangs up", which is what an always-on feed wants — not "no limit". */
+	it("accepts zero seconds and bounds the day", () => {
+		expect(audioStreamFormSchema.parse({ ...base, maxSeconds: "0" }).maxSeconds).toBe(0);
+		expect(audioStreamFormSchema.safeParse({ ...base, maxSeconds: "86401" }).success).toBe(false);
+	});
+});
+
+describe("dialByNameDirectoryFormSchema", () => {
+	const base = {
+		name: "Company directory",
+		extensionNumber: "411",
+		searchField: "last-name",
+		minDigits: "3",
+		greetingPromptId: "",
+		invalidPromptId: "",
+		maxFailures: "3",
+		enabled: true,
+	};
+
+	it("accepts the three search fields and refuses anything else", () => {
+		for (const searchField of ["last-name", "first-name", "full-name"]) {
+			expect(dialByNameDirectoryFormSchema.safeParse({ ...base, searchField }).success).toBe(true);
+		}
+		expect(
+			dialByNameDirectoryFormSchema.safeParse({ ...base, searchField: "surname" }).success,
+		).toBe(false);
+	});
+
+	/**
+	 * Two at the bottom because a two-letter surname exists; six at the top because past that the
+	 * caller is spelling the whole name, which is the interaction a directory exists to avoid.
+	 */
+	it("bounds the digits before matching at the server's two and six", () => {
+		expect(dialByNameDirectoryFormSchema.safeParse({ ...base, minDigits: "1" }).success).toBe(
+			false,
+		);
+		expect(dialByNameDirectoryFormSchema.safeParse({ ...base, minDigits: "7" }).success).toBe(
+			false,
+		);
+		expect(dialByNameDirectoryFormSchema.safeParse({ ...base, minDigits: "2" }).success).toBe(true);
+	});
+});
+
+describe("speedDialFormSchema", () => {
+	it("takes both code shapes, and requires a label", () => {
+		const base = { code: "*01", label: "Head office", enabled: true };
+		expect(speedDialFormSchema.safeParse(base).success).toBe(true);
+		expect(speedDialFormSchema.safeParse({ ...base, code: "8001" }).success).toBe(true);
+		expect(speedDialFormSchema.safeParse({ ...base, label: "" }).success).toBe(false);
+	});
+});
+
+describe("orgLimitsFormSchema", () => {
+	const base = {
+		maxExtensions: "50",
+		maxTrunks: "",
+		maxConcurrentCalls: "",
+		maxStorageMb: "1024",
+	};
+
+	/**
+	 * The one form in this module where a blank box does NOT mean "put the default back". Every
+	 * column is nullable and `null` means NO CEILING — unlimited is the default and always has been,
+	 * because the table arrived after tenants existed. So the same helper is doing a different job
+	 * here, and clearing a box removes the limit rather than restoring one.
+	 */
+	it("turns a blank ceiling into null, which the server reads as no limit", () => {
+		const parsed = orgLimitsFormSchema.parse(base);
+		expect(parsed.maxExtensions).toBe(50);
+		expect(parsed.maxTrunks).toBeNull();
+		expect(parsed.maxConcurrentCalls).toBeNull();
+		expect(parsed.maxStorageMb).toBe(1024);
+	});
+
+	/** Zero is a real ceiling: "this organization may hold no trunks" is expressible. */
+	it("accepts zero as a ceiling rather than treating it as absent", () => {
+		expect(orgLimitsFormSchema.parse({ ...base, maxTrunks: "0" }).maxTrunks).toBe(0);
+	});
+
+	it("bounds each axis at the server's ceiling", () => {
+		expect(orgLimitsFormSchema.safeParse({ ...base, maxExtensions: "100001" }).success).toBe(false);
+		expect(orgLimitsFormSchema.safeParse({ ...base, maxTrunks: "10001" }).success).toBe(false);
+		expect(orgLimitsFormSchema.safeParse({ ...base, maxStorageMb: "10000001" }).success).toBe(
+			false,
+		);
+		expect(orgLimitsFormSchema.safeParse({ ...base, maxExtensions: "-1" }).success).toBe(false);
+	});
+});
+
+/**
+ * A phrase: one field, and the absences are the contract.
+ *
+ * `createPhraseDto` is `{ name }` and stays that way. `kind` and `objectKey` are what MAKE the row a
+ * phrase rather than fields on it — the service stamps `kind: "phrase"` and leaves the key null,
+ * which is the exact pair `prompt_object_key_kind_check` permits — and a client that could send
+ * either could produce a library entry with no file behind it. `language` is absent because a
+ * phrase's language is its steps' audio, and `mohClassId` because a sequence is not a file.
+ *
+ * The strict object is what holds all of that: each of these keys is a 400 naming a field, so the
+ * refusal happens here rather than after a round trip.
+ */
+describe("phraseFormSchema", () => {
+	it("takes a name and nothing else", () => {
+		expect(phraseFormSchema.safeParse({ name: "Queue position" }).success).toBe(true);
+		expect(phraseFormSchema.safeParse({ name: "" }).success).toBe(false);
+	});
+
+	it("refuses the three fields the server would refuse", () => {
+		const base = { name: "Queue position" };
+		expect(phraseFormSchema.safeParse({ ...base, kind: "phrase" }).success).toBe(false);
+		expect(phraseFormSchema.safeParse({ ...base, objectKey: null }).success).toBe(false);
+		expect(phraseFormSchema.safeParse({ ...base, language: "en-US" }).success).toBe(false);
+	});
+});
+
+/**
+ * One step of a phrase.
+ *
+ * The rule this schema CANNOT state is the interesting one: a step may not name another phrase.
+ * Nesting is refused by `phrases.service.ts` with a `PBX_VALIDATION_FAILED` addressed at `promptId`,
+ * and by the compiler a second time for rows arriving any other way — neither of which a schema
+ * seeing a uuid can reproduce. The form does it with the data it has (the picker offers
+ * `kind: "prompt"` only, and the dialog checks the chosen id against the phrase list), and these
+ * tests hold the half that IS expressible.
+ */
+describe("phraseStepFormSchema", () => {
+	const base = {
+		promptId: "0193f2aa-0000-7000-8000-000000000001",
+		ordinal: "0",
+		enabled: true,
+	};
+
+	it("requires a recording", () => {
+		expect(phraseStepFormSchema.safeParse(base).success).toBe(true);
+		expect(phraseStepFormSchema.safeParse({ ...base, promptId: "" }).success).toBe(false);
+	});
+
+	/**
+	 * Position zero is the FIRST step, not an absent one — the first word of the sentence. A schema
+	 * that folded it into "unset" would make the opening step unaddressable.
+	 */
+	it("keeps position zero as a position", () => {
+		expect(phraseStepFormSchema.parse(base).ordinal).toBe(0);
+	});
+
+	/** Blank means "append", which the dialog turns into the next free slot before it sends. */
+	it("turns a blank position into null rather than into zero", () => {
+		expect(phraseStepFormSchema.parse({ ...base, ordinal: "" }).ordinal).toBeNull();
+	});
+
+	it("bounds the position at the server's own range", () => {
+		expect(phraseStepFormSchema.safeParse({ ...base, ordinal: "1001" }).success).toBe(false);
+		expect(phraseStepFormSchema.safeParse({ ...base, ordinal: "-1" }).success).toBe(false);
+		expect(phraseStepFormSchema.safeParse({ ...base, ordinal: "1000" }).success).toBe(true);
+	});
+});
+
+/**
+ * The star code that cycles a time condition's override.
+ *
+ * Writable now — `createTimeConditionDto`/`updateTimeConditionDto` declare
+ * `overrideFeatureCode: shortCode.nullish()` — where it used to be rendered as a fact because no
+ * endpoint accepted it in either direction. It rides `time-conditions.write` rather than the
+ * `call-flows.toggle` that PRESSES the override, which is why it is a schema of its own rather than
+ * a field of `timeConditionFormSchema`: the two controls live on different sides of a permission.
+ *
+ * Nothing here checks for a collision with the feature-code catalogue. That is a fact about the whole
+ * tenant, and the compiler raises it inside the write transaction.
+ */
+describe("timeConditionOverrideCodeFormSchema", () => {
+	it("takes the shapes a phone can dial", () => {
+		for (const code of ["*281", "*01", "8001", "#72"]) {
+			expect(
+				timeConditionOverrideCodeFormSchema.parse({ overrideFeatureCode: code })
+					.overrideFeatureCode,
+			).toBe(code);
+		}
+	});
+
+	/** Blank CLEARS the column. `null` is a real state: no code answers for this condition. */
+	it("turns a blank box into null rather than into an empty string", () => {
+		expect(
+			timeConditionOverrideCodeFormSchema.parse({ overrideFeatureCode: "  " }).overrideFeatureCode,
+		).toBeNull();
+	});
+
+	it("refuses anything a handset could not send", () => {
+		for (const code of ["12a4", "*2 8", "*2819999999"]) {
+			expect(
+				timeConditionOverrideCodeFormSchema.safeParse({ overrideFeatureCode: code }).success,
+			).toBe(false);
+		}
 	});
 });

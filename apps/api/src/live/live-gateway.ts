@@ -566,6 +566,11 @@ const SNAPSHOT_SOURCES: ReadonlySet<LiveSource> = new Set<LiveSource>([
 	"registrations-kv",
 	"channels-kv",
 	"agent-state-kv",
+	"queue-waiting-kv",
+	// The rooms. A console opening mid-meeting gets every running conference, its cluster-wide member
+	// count and its lock in one frame — which is what makes the topic usable at all, since the
+	// participant deltas that follow describe changes to a picture that has to already exist.
+	"conference-claims-kv",
 ]);
 
 /**

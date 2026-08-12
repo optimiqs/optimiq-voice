@@ -42,6 +42,26 @@ export function GaugeIcon(props: IconProps) {
 	);
 }
 
+/**
+ * The wallboard: a screen on a stand, with a line of bars on it.
+ *
+ * Deliberately not the gauge the dashboard uses and not the queue glyph: the wallboard is neither
+ * the overview nor the queue list, and a sidebar in which two entries carry one glyph is a sidebar
+ * where somebody clicks the wrong one on the way to a customer who is on hold.
+ */
+export function WallboardIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<rect x="3" y="4" width="18" height="12" rx="2" />
+			<path d="M8 20h8" />
+			<path d="M12 16v4" />
+			<path d="M8 12v-2" />
+			<path d="M12 12V8" />
+			<path d="M16 12v-3" />
+		</Glyph>
+	);
+}
+
 export function PhoneIcon(props: IconProps) {
 	return (
 		<Glyph {...props}>
@@ -172,6 +192,137 @@ export function MusicIcon(props: IconProps) {
 			<path d="M9 18V5l12-2v13" />
 			<path d="M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
 			<path d="M21 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+		</Glyph>
+	);
+}
+
+/**
+ * The change ledger: a page with ruled lines.
+ *
+ * Deliberately not a clock, which is `HistoryIcon` and already means "call history" in this
+ * sidebar. The two surfaces are the same SHAPE — a windowed, cursor-paged, append-only table — and
+ * a second clock two rows below the first would read as a second view of the same records.
+ */
+export function LedgerIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<path d="M5.5 3.5h13a1 1 0 0 1 1 1v15a1 1 0 0 1-1 1h-13a1 1 0 0 1-1-1v-15a1 1 0 0 1 1-1Z" />
+			<path d="M8.5 8h7M8.5 12h7M8.5 16h4" />
+		</Glyph>
+	);
+}
+
+/** SIP security: a shield. The allowlist is the toll-fraud gate, and the log is what it refused. */
+export function ShieldIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<path d="M12 2.75 4.5 5.5v6c0 4.4 3.1 8.4 7.5 9.75 4.4-1.35 7.5-5.35 7.5-9.75v-6L12 2.75Z" />
+			<path d="m9 12 2.2 2.2L15.5 10" />
+		</Glyph>
+	);
+}
+
+/**
+ * Webhooks: a signal leaving a node.
+ *
+ * An outward arc rather than a plug or a link glyph — what a subscription does is push an event out
+ * of this platform to somewhere else, which is the one thing a reader has to understand before
+ * they configure one.
+ */
+export function WebhookIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<circle cx="7" cy="17" r="2.5" />
+			<circle cx="17" cy="17" r="2.5" />
+			<circle cx="12" cy="5.5" r="2.5" />
+			<path d="M10.6 7.6 8 13M13.4 7.6 16 13M9.5 17h5" />
+		</Glyph>
+	);
+}
+
+/**
+ * Caller screening: a handset with a bar through it.
+ *
+ * Deliberately not a bare "no entry" circle and not `ShieldIcon`. A shield already means SIP
+ * security — who may reach the platform at all — and a screening rule is a decision about one
+ * caller on an otherwise working connection. The handset is what says the subject is a call, and
+ * the bar is what says the list can also let one through: an `allow` rule is the same glyph's
+ * subject, and a padlock or a shield would imply a wall that only ever refuses.
+ */
+export function BlockIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<path d="M6.2 3.2h-1.7A1.5 1.5 0 0 0 3 4.8c0 8.5 7.9 16.4 16.4 16.4a1.5 1.5 0 0 0 1.6-1.5v-1.8a1 1 0 0 0-.8-1l-3-.6a1 1 0 0 0-1 .4l-.8 1.1a13.6 13.6 0 0 1-5.4-5.4l1.1-.8a1 1 0 0 0 .4-1l-.6-3a1 1 0 0 0-1-.8Z" />
+			<path d="M21 3 15 9" />
+		</Glyph>
+	);
+}
+
+/**
+ * Paging: a megaphone, with the sound leaving it.
+ *
+ * Deliberately not a speaker or a group glyph. `UsersIcon` already means "a set of people" (ring
+ * groups, members) and a paging group is not a set of people — it is an ANNOUNCEMENT made at a set
+ * of handsets, which is the fact an administrator has to hold before they add a member to one.
+ */
+export function MegaphoneIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<path d="M4 10.5v3a1.5 1.5 0 0 0 1.5 1.5H8l8 4.5V6L8 10.5H5.5A1.5 1.5 0 0 0 4 12" />
+			<path d="M8 10.5V15" />
+			<path d="M18.5 9.5a3.5 3.5 0 0 1 0 5" />
+		</Glyph>
+	);
+}
+
+/**
+ * A call flow: a toggle switch, thrown to one side.
+ *
+ * Not a clock and not a sun/moon pair, which are the two obvious drafts and are both wrong in the
+ * same way: a call flow does NOT read the clock — that is a time condition, which already carries
+ * `RouteIcon`'s section — and it is not "night", it is a switch somebody moved. The knob sitting
+ * off-centre is the whole meaning: this thing has a position, and a person put it there.
+ */
+export function SwitchIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<rect x="2.5" y="7.5" width="19" height="9" rx="4.5" />
+			<path d="M16.5 14.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z" />
+		</Glyph>
+	);
+}
+
+/**
+ * Authorisation codes: a keypad.
+ *
+ * A keypad rather than `KeyIcon` (already the API-key glyph) or a padlock: what a PIN set gates is
+ * reached by TYPING DIGITS ON A HANDSET, and the keypad is the only glyph here that says the
+ * credential is nine keys long and entered by a person standing at a phone.
+ */
+export function KeypadIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<rect x="3.5" y="2.5" width="17" height="19" rx="2.5" />
+			<path d="M8 7h.01M12 7h.01M16 7h.01M8 11.5h.01M12 11.5h.01M16 11.5h.01M8 16h.01M12 16h.01M16 16h.01" />
+		</Glyph>
+	);
+}
+
+/**
+ * The dial plan's building blocks: three named things, wired to one point.
+ *
+ * `RouteIcon` is the dial plan's own section and means "a call takes a path". These are the NAMED
+ * pieces that path is assembled from — an alias, a stream, a directory, a speed dial — so the glyph
+ * is nodes rather than a road.
+ */
+export function BlocksIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<rect x="3" y="3" width="6" height="6" rx="1.5" />
+			<rect x="15" y="3" width="6" height="6" rx="1.5" />
+			<rect x="9" y="15" width="6" height="6" rx="1.5" />
+			<path d="M6 9v3h12V9" />
+			<path d="M12 12v3" />
 		</Glyph>
 	);
 }

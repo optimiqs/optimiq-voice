@@ -127,9 +127,43 @@ export const queryKeys = {
 	orgSettingsCatalog: () => ["pbx", "org-settings-catalog"] as const,
 	orgSettingsCategory: (organizationId: string, category: string) =>
 		["organizations", organizationId, "pbx", "org-settings", category] as const,
+	/**
+	 * The caller's OWN preferences — `user_setting`, the third level of the cascade.
+	 *
+	 * Carries no category segment, because `GET …/me` carries none either: it answers with every
+	 * user-scoped category at once, so there is one entry and one request however many categories
+	 * eventually have a user level. Splitting it per category here would invent a key granularity
+	 * the endpoint cannot serve.
+	 *
+	 * A sibling of `org-settings` rather than a child, and deliberately outside it: the coarse PBX
+	 * sweeps that a settings save fires must not evict this, because an ORGANIZATION write cannot
+	 * change one person's overrides — and a refetch of it costs a request most holders of
+	 * `settings.write` would not otherwise make. It still dies on an org switch, which is the one
+	 * eviction that genuinely matters here.
+	 */
+	ownSettings: (organizationId: string) =>
+		["organizations", organizationId, "pbx", "user-settings", "me"] as const,
 	/** The compile/simulate surface, which reads the whole configuration rather than one table. */
 	routingCompile: (organizationId: string) =>
 		["organizations", organizationId, "pbx", "routing", "compile"] as const,
+
+	/**
+	 * The organization's quotas, and what it is using against them.
+	 *
+	 * `orgLimits` is the invalidation handle a save reaches for and it takes the usage report with it,
+	 * which is the only reason they are nested: raising a ceiling changes every ratio on screen, and a
+	 * screen that showed "48 of 50" beside a limit somebody had just moved to 100 would be the one
+	 * thing this page exists to prevent.
+	 *
+	 * Under `pbx` so an org switch takes both, but deliberately NOT under a resource key: `org_limit`
+	 * is not in `ROUTING_TABLE_TO_ENTITY` and is not a routing input, so no mutation elsewhere in the
+	 * PBX area sweeps it — and none should. Creating an extension does change the usage COUNT, which
+	 * is why the usage query is the one thing on that page refetched on mount rather than trusted.
+	 */
+	orgLimits: (organizationId: string) =>
+		["organizations", organizationId, "pbx", "org-limits"] as const,
+	orgUsage: (organizationId: string) =>
+		["organizations", organizationId, "pbx", "org-limits", "usage"] as const,
 
 	/**
 	 * Which vendors this deployment can provision, and whether it is configured to provision at all.
@@ -175,10 +209,71 @@ export const queryKeys = {
 	/** One call's legs, keyed by call id — what an expanded row reads. */
 	cdrCall: (organizationId: string, callId: string) =>
 		["organizations", organizationId, "cdr", "call", callId] as const,
+	/**
+	 * Queue service level over a window.
+	 *
+	 * Under `cdr` because that is the endpoint it reads (`GET /cdr/queue-stats`) and because an org
+	 * switch must take it, even though it is gated by `queues.monitor` rather than by `cdr.read`.
+	 * NOT under `pbx/queues`: a queue EDIT cannot change what the ledger recorded last Tuesday, and
+	 * the coarse sweep every PBX mutation fires would otherwise refetch a wallboard's numbers each
+	 * time somebody renamed something.
+	 *
+	 * The whole query — window, target and optional queue — is the last segment, because a different
+	 * target is a different answer to a different question and must never share an entry. Entries
+	 * under it are POLLED (see `useQueueStats`), which is the second exception to `staleTime:
+	 * Infinity` in this app: a service level moves because calls ended, and no live topic says so.
+	 */
+	queueStats: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
+		["organizations", organizationId, "cdr", "queue-stats", query] as const,
 	recordings: (organizationId: string) =>
 		["organizations", organizationId, "cdr", "recordings"] as const,
 	recordingList: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
 		["organizations", organizationId, "cdr", "recordings", "list", query] as const,
+
+	/**
+	 * Export jobs — the one thing in this area that IS written by the UI, and therefore the one
+	 * thing here with a real invalidation handle.
+	 *
+	 * `cdrExports` is what a create and a delete sweep. It sits under `cdr` so an org switch takes
+	 * it, and it is deliberately NOT under `cdrList`: an export does not change the call ledger, so
+	 * queuing one must not evict the page of history somebody is reading.
+	 *
+	 * The query is the last segment for the reason every list key here has one — a `status` filter
+	 * is a different answer and must never share an entry with the unfiltered list. Note that unlike
+	 * every other key in this file, entries under it are POLLED (see `useCdrExportList`), which is
+	 * the one exception to `staleTime: Infinity` in the app: a job's status changes because a worker
+	 * somewhere finished, and there is no event on the socket to hear that from.
+	 */
+	cdrExports: (organizationId: string) =>
+		["organizations", organizationId, "cdr", "exports"] as const,
+	cdrExportList: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
+		["organizations", organizationId, "cdr", "exports", "list", query] as const,
+
+	/**
+	 * The two append-only ledgers.
+	 *
+	 * Organization-scoped like everything else, and for the sharpest version of the reason: a cached
+	 * page of another tenant's change history or attack log is the single worst thing an org switch
+	 * could leave behind.
+	 *
+	 * NOT under `pbx`, even though `sipAuthEvents` sits next to the ACL screen that IS a PBX
+	 * resource. The coarse `pbxResource` sweep every mutation fires would otherwise evict these on
+	 * every unrelated write, and there is nothing to evict: no mutation in this app can change a row
+	 * in either table — both are append-only by DATABASE PRIVILEGE, not by convention. Writing an
+	 * ACL rule does append an audit entry, and the screen does not pretend otherwise; the ledger is
+	 * refetched when somebody asks it to be, which is what a ledger with no total and a moving window
+	 * can honestly offer.
+	 *
+	 * The whole query — window, filters, limit and cursor — is the last segment, because two windows
+	 * are two answers and must never share an entry.
+	 */
+	auditLog: (organizationId: string) => ["organizations", organizationId, "audit-log"] as const,
+	auditLogList: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
+		["organizations", organizationId, "audit-log", "list", query] as const,
+	sipAuthEvents: (organizationId: string) =>
+		["organizations", organizationId, "sip-auth-events"] as const,
+	sipAuthEventList: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
+		["organizations", organizationId, "sip-auth-events", "list", query] as const,
 
 	/**
 	 * Agent availability.
@@ -195,4 +290,25 @@ export const queryKeys = {
 	 */
 	myAgentSession: (organizationId: string) =>
 		["organizations", organizationId, "pbx", "queue-agents", "session", "me"] as const,
+
+	/**
+	 * The caller's own softphone credentials — `GET /api/v1/me/softphone`.
+	 *
+	 * Org-scoped because the answer is the caller's extension IN this organization: a user with a
+	 * seat in two tenants has a different extension (and a different SIP password) in each, and an
+	 * org switch must not hand the softphone the previous tenant's credentials. The plaintext
+	 * password lives only in this cache entry, so the org-switch sweep that clears the tree is also
+	 * what expires it.
+	 */
+	softphoneCredentials: (organizationId: string) =>
+		["organizations", organizationId, "softphone", "credentials"] as const,
+
+	/**
+	 * The organization's white-label branding — `GET /api/v1/branding`.
+	 *
+	 * Org-scoped: branding is per-tenant, and the resolved product name / colours a user sees must
+	 * follow the active organization. The login page reads branding by HOST instead (a public,
+	 * pre-auth endpoint) and is not part of this cache — there is no session there to key it on.
+	 */
+	branding: (organizationId: string) => ["organizations", organizationId, "branding"] as const,
 } as const;

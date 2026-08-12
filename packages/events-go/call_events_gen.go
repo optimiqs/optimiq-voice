@@ -10,26 +10,33 @@ package events
 // Event types carried on the call family's subjects. The value is the envelope's
 // `type` discriminator, which is unique WITHIN the family only.
 const (
-	EventTypeChannelCreated       = "channel.created"
-	EventTypeChannelRinging       = "channel.ringing"
-	EventTypeChannelEarlyMedia    = "channel.early-media"
-	EventTypeChannelAnswered      = "channel.answered"
-	EventTypeChannelBridged       = "channel.bridged"
-	EventTypeChannelUnbridged     = "channel.unbridged"
-	EventTypeChannelHeld          = "channel.held"
-	EventTypeChannelUnheld        = "channel.unheld"
-	EventTypeChannelDTMF          = "channel.dtmf"
-	EventTypeChannelRecordStarted = "channel.record.started"
-	EventTypeChannelRecordStopped = "channel.record.stopped"
-	EventTypeChannelHangup        = "channel.hangup"
-	EventTypeChannelDestroyed     = "channel.destroyed"
-	EventTypeConferenceJoined     = "conference.joined"
-	EventTypeConferenceLeft       = "conference.left"
-	EventTypeCallParked           = "call.parked"
-	EventTypeCallUnparked         = "call.unparked"
-	EventTypeCallTransferred      = "call.transferred"
-	EventTypeCallPickedUp         = "call.picked-up"
-	EventTypeCallEmergencyDialed  = "call.emergency.dialed"
+	EventTypeChannelCreated               = "channel.created"
+	EventTypeChannelRinging               = "channel.ringing"
+	EventTypeChannelEarlyMedia            = "channel.early-media"
+	EventTypeChannelAnswered              = "channel.answered"
+	EventTypeChannelBridged               = "channel.bridged"
+	EventTypeChannelUnbridged             = "channel.unbridged"
+	EventTypeChannelHeld                  = "channel.held"
+	EventTypeChannelUnheld                = "channel.unheld"
+	EventTypeChannelDTMF                  = "channel.dtmf"
+	EventTypeChannelRecordStarted         = "channel.record.started"
+	EventTypeChannelRecordStopped         = "channel.record.stopped"
+	EventTypeChannelHangup                = "channel.hangup"
+	EventTypeChannelDestroyed             = "channel.destroyed"
+	EventTypeConferenceJoined             = "conference.joined"
+	EventTypeConferenceLeft               = "conference.left"
+	EventTypeConferenceParticipantUpdated = "conference.participant.updated"
+	EventTypeConferenceLocked             = "conference.locked"
+	EventTypeConferenceUnlocked           = "conference.unlocked"
+	EventTypeCallParked                   = "call.parked"
+	EventTypeCallUnparked                 = "call.unparked"
+	EventTypeCallTransferred              = "call.transferred"
+	EventTypeCallPickedUp                 = "call.picked-up"
+	EventTypeCallEmergencyDialed          = "call.emergency.dialed"
+	EventTypeCallTapStarted               = "call.tap.started"
+	EventTypeCallTapEnded                 = "call.tap.ended"
+	EventTypeCallPagingStarted            = "call.paging.started"
+	EventTypeCallPagingEnded              = "call.paging.ended"
 )
 
 // ChannelCreatedData is the payload of the "channel.created" event.
@@ -196,13 +203,81 @@ type ConferenceJoinedData struct {
 // Subject: calls.evt.v1.<orgId>.<callId>.conference.left
 // Envelope: Envelope[ConferenceLeftData]
 type ConferenceLeftData struct {
-	LegID        string `json:"legId"`
-	ConferenceID string `json:"conferenceId"`
-	RoomNumber   string `json:"roomNumber"`
-	BridgeID     string `json:"bridgeId"`
-	Moderator    bool   `json:"moderator"`
-	MemberCount  int    `json:"memberCount"`
-	DurationMs   *int   `json:"durationMs,omitempty"`
+	LegID        string                `json:"legId"`
+	ConferenceID string                `json:"conferenceId"`
+	RoomNumber   string                `json:"roomNumber"`
+	BridgeID     string                `json:"bridgeId"`
+	Moderator    bool                  `json:"moderator"`
+	MemberCount  int                   `json:"memberCount"`
+	DurationMs   *int                  `json:"durationMs,omitempty"`
+	Reason       *ConferenceLeftReason `json:"reason,omitempty"`
+	ByUserID     *string               `json:"byUserId,omitempty"`
+}
+
+// ConferenceLeftReason is the closed vocabulary of ConferenceLeftData.reason.
+type ConferenceLeftReason string
+
+const (
+	ConferenceLeftReasonHungUp    ConferenceLeftReason = "hung-up"
+	ConferenceLeftReasonKicked    ConferenceLeftReason = "kicked"
+	ConferenceLeftReasonRoomEnded ConferenceLeftReason = "room-ended"
+)
+
+// ConferenceLeftReasonValues lists every member of the vocabulary, in contract order.
+var ConferenceLeftReasonValues = []ConferenceLeftReason{
+	ConferenceLeftReasonHungUp,
+	ConferenceLeftReasonKicked,
+	ConferenceLeftReasonRoomEnded,
+}
+
+// Valid reports whether v is a member of the ConferenceLeftReason vocabulary.
+func (v ConferenceLeftReason) Valid() bool {
+	for _, candidate := range ConferenceLeftReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v ConferenceLeftReason) String() string { return string(v) }
+
+// ConferenceParticipantUpdatedData is the payload of the "conference.participant.updated" event.
+//
+// Subject: calls.evt.v1.<orgId>.<callId>.conference.participant.updated
+// Envelope: Envelope[ConferenceParticipantUpdatedData]
+type ConferenceParticipantUpdatedData struct {
+	LegID             string  `json:"legId"`
+	ConferenceID      string  `json:"conferenceId"`
+	RoomNumber        string  `json:"roomNumber"`
+	Muted             bool    `json:"muted"`
+	Deafened          bool    `json:"deafened"`
+	Moderator         bool    `json:"moderator"`
+	TalkGainPercent   int     `json:"talkGainPercent"`
+	ListenGainPercent int     `json:"listenGainPercent"`
+	ByUserID          *string `json:"byUserId,omitempty"`
+}
+
+// ConferenceLockedData is the payload of the "conference.locked" event.
+//
+// Subject: calls.evt.v1.<orgId>.<callId>.conference.locked
+// Envelope: Envelope[ConferenceLockedData]
+type ConferenceLockedData struct {
+	ConferenceID string  `json:"conferenceId"`
+	RoomNumber   string  `json:"roomNumber"`
+	MemberCount  int     `json:"memberCount"`
+	ByUserID     *string `json:"byUserId,omitempty"`
+}
+
+// ConferenceUnlockedData is the payload of the "conference.unlocked" event.
+//
+// Subject: calls.evt.v1.<orgId>.<callId>.conference.unlocked
+// Envelope: Envelope[ConferenceUnlockedData]
+type ConferenceUnlockedData struct {
+	ConferenceID string  `json:"conferenceId"`
+	RoomNumber   string  `json:"roomNumber"`
+	MemberCount  int     `json:"memberCount"`
+	ByUserID     *string `json:"byUserId,omitempty"`
 }
 
 // CallParkedData is the payload of the "call.parked" event.
@@ -349,4 +424,58 @@ type CallEmergencyDialedData struct {
 	Elin               *string `json:"elin,omitempty"`
 	EmergencyAddressID *string `json:"emergencyAddressId,omitempty"`
 	TrunkName          *string `json:"trunkName,omitempty"`
+}
+
+// CallTapStartedData is the payload of the "call.tap.started" event.
+//
+// Subject: calls.evt.v1.<orgId>.<callId>.call.tap.started
+// Envelope: Envelope[CallTapStartedData]
+type CallTapStartedData struct {
+	LegID               string   `json:"legId"`
+	Mode                TapMode  `json:"mode"`
+	SupervisorExtension string   `json:"supervisorExtension"`
+	TargetExtension     string   `json:"targetExtension"`
+	TargetLegID         *string  `json:"targetLegId,omitempty"`
+	PreviousMode        *TapMode `json:"previousMode,omitempty"`
+	SupervisorCallID    *string  `json:"supervisorCallId,omitempty"`
+}
+
+// CallTapEndedData is the payload of the "call.tap.ended" event.
+//
+// Subject: calls.evt.v1.<orgId>.<callId>.call.tap.ended
+// Envelope: Envelope[CallTapEndedData]
+type CallTapEndedData struct {
+	LegID               string       `json:"legId"`
+	Mode                TapMode      `json:"mode"`
+	SupervisorExtension string       `json:"supervisorExtension"`
+	TargetExtension     string       `json:"targetExtension"`
+	Reason              TapEndReason `json:"reason"`
+	DurationMs          *int         `json:"durationMs,omitempty"`
+}
+
+// CallPagingStartedData is the payload of the "call.paging.started" event.
+//
+// Subject: calls.evt.v1.<orgId>.<callId>.call.paging.started
+// Envelope: Envelope[CallPagingStartedData]
+type CallPagingStartedData struct {
+	LegID           string  `json:"legId"`
+	PagingGroupID   string  `json:"pagingGroupId"`
+	PagingGroupName string  `json:"pagingGroupName"`
+	Dialed          *string `json:"dialed,omitempty"`
+	PagerExtension  *string `json:"pagerExtension,omitempty"`
+	MemberCount     int     `json:"memberCount"`
+	AnsweredCount   int     `json:"answeredCount"`
+	OneWay          bool    `json:"oneWay"`
+}
+
+// CallPagingEndedData is the payload of the "call.paging.ended" event.
+//
+// Subject: calls.evt.v1.<orgId>.<callId>.call.paging.ended
+// Envelope: Envelope[CallPagingEndedData]
+type CallPagingEndedData struct {
+	LegID           string `json:"legId"`
+	PagingGroupID   string `json:"pagingGroupId"`
+	PagingGroupName string `json:"pagingGroupName"`
+	DurationMs      *int   `json:"durationMs,omitempty"`
+	AnsweredCount   *int   `json:"answeredCount,omitempty"`
 }

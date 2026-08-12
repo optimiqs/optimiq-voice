@@ -376,6 +376,18 @@ func (s *Session) announceDigit(digit DtmfDigit) {
 		s.log.Debug("a DTMF digit was closed without its END packet",
 			"digit", digit.Digit, "durationMs", digit.DurationMs, "endedBy", string(digit.EndedBy))
 	}
+
+	// The recorder's terminator, checked HERE rather than in the recorder's own tick loop because
+	// this is the one place a keypress exists as a keypress: the tick loop sees decoded audio frames,
+	// and a `#` is not in them. It runs before the announcement so that a voicemail whose `#` both
+	// ends the recording and reaches the orchestrator does those two things in the order a consumer
+	// expects — the file is closing before the engine is told the caller pressed the key that closed
+	// it.
+	if recorder := s.recording.Load(); recorder != nil && recorder.terminateOn(digit.Digit) {
+		s.log.Debug("a recording was terminated by a digit",
+			"digit", digit.Digit, "recordingRef", recorder.Ref())
+	}
+
 	if s.onDtmf != nil {
 		s.onDtmf(s, digit)
 	}

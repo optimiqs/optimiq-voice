@@ -3,11 +3,15 @@ import { ClientsModule, Transport } from "@nestjs/microservices";
 import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import { loadEngineEnv } from "../config/engine-env";
 import { CallEventPublisher } from "./call-event-publisher.service";
+import { ConferenceControlService } from "./conference-control.service";
 import { ENVELOPE_ONLY_SERIALIZER } from "./envelope.serializer";
 import { JetStreamService } from "./jetstream.service";
 import { CALL_EVENTS_CLIENT, ENGINE_ENV, ROUTING_RPC_CLIENT } from "./nats.tokens";
 import { OriginateService } from "./originate.service";
 import { ParkHandoffService } from "./park-handoff.service";
+import { SessionAnnounceService } from "./session-announce.service";
+import { SessionVerbService } from "./session-verb.service";
+import { SipInviteService } from "./sip-invite.service";
 import { SipTransferService } from "./sip-transfer.service";
 import type { EngineEnv } from "../config/engine-env";
 
@@ -82,8 +86,12 @@ import type { EngineEnv } from "../config/engine-env";
 		{ provide: ENGINE_ENV, useFactory: () => loadEngineEnv() },
 		JetStreamService,
 		CallEventPublisher,
+		ConferenceControlService,
 		OriginateService,
 		ParkHandoffService,
+		SessionAnnounceService,
+		SessionVerbService,
+		SipInviteService,
 		SipTransferService,
 	],
 	exports: [
@@ -91,8 +99,12 @@ import type { EngineEnv } from "../config/engine-env";
 		ENGINE_ENV,
 		JetStreamService,
 		CallEventPublisher,
+		ConferenceControlService,
 		OriginateService,
 		ParkHandoffService,
+		SessionAnnounceService,
+		SessionVerbService,
+		SipInviteService,
 		SipTransferService,
 	],
 })

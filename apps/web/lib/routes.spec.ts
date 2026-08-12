@@ -1,8 +1,16 @@
 import { describe, expect, it } from "bun:test";
 import {
+	CONFERENCE_TABS,
+	conferenceTabHref,
+	DIAL_PLAN_TABS,
+	dialPlanTabHref,
 	isPublicRoute,
+	MEDIA_TABS,
+	mediaTabHref,
 	queueTabHref,
 	routes,
+	ROUTING_TABS,
+	routingTabHref,
 	safeRedirectTarget,
 	signInWithRedirect,
 } from "./routes";
@@ -89,7 +97,9 @@ describe("the settings area", () => {
 			routes.apiKeys,
 			routes.notifications,
 			routes.routingSettings,
+			routes.recordingSettings,
 			routes.emergencyAddresses,
+			routes.mySettings,
 		]) {
 			expect(url.startsWith(`${routes.settings}/`)).toBe(true);
 		}
@@ -98,6 +108,35 @@ describe("the settings area", () => {
 	it("keeps the routing settings off the routing page's path", () => {
 		expect(routes.routingSettings).toBe("/settings/routing");
 		expect(routes.routingSettings.startsWith(`${routes.routing}/`)).toBe(false);
+	});
+
+	/**
+	 * The same split for recordings: `/recordings` is a cursor-paged ledger gated by
+	 * `recordings.read`, and `/settings/recordings` is one policy field gated by `settings.read`.
+	 * Nesting the second under the first would make `getPagePermissions` inherit the ledger's
+	 * requirement by ancestry, and a role that may set the retention window without reading the
+	 * recordings would then be shown a page the API refuses.
+	 */
+	it("keeps the recording policy off the recordings ledger's path", () => {
+		expect(routes.recordingSettings).toBe("/settings/recordings");
+		expect(routes.recordingSettings.startsWith(`${routes.recordings}/`)).toBe(false);
+	});
+});
+
+/**
+ * Caller screening is a route of its own, not a routing tab.
+ *
+ * The API gives it `call-block.*` rather than `routes.*` deliberately — the person maintaining a
+ * blocklist is whoever answered the phone, not the administrator who owns the dial plan — and a tab
+ * of `/routing` would inherit that page's requirement by ancestry, which is the disagreement
+ * `page-permissions.ts` exists to prevent. The same argument paging groups made against being a tab
+ * of ring groups.
+ */
+describe("call blocking", () => {
+	it("is a top-level route rather than a segment of the routing page", () => {
+		expect(routes.callBlock).toBe("/call-block");
+		expect(routes.callBlock.startsWith(`${routes.routing}/`)).toBe(false);
+		expect(ROUTING_TABS).not.toContain("call-block" as never);
 	});
 });
 
@@ -109,5 +148,115 @@ describe("detail routes", () => {
 	it("nests a queue's detail view under the queue list", () => {
 		expect(routes.queue("0193f2aa")).toBe(`${routes.queues}/0193f2aa`);
 		expect(routes.queue("0193f2aa").startsWith(`${routes.queues}/`)).toBe(true);
+	});
+});
+
+/**
+ * Where the T2 admin block landed, and why each choice is not the other one.
+ *
+ * Four surfaces arrived at once with four different permissions between them, and the rule this
+ * file has applied five times decided each: a page may only be a tab of another page when the two
+ * are gated by the SAME grant, because a tab inherits its parent's requirement by ancestry and
+ * `PAGE_PERMISSIONS` cannot name one permission and mean two.
+ */
+describe("the T2 admin block's placement", () => {
+	/**
+	 * Translations became a Routing TAB because a ruleset rides `routes.*` — it is only meaningful
+	 * attached to an outbound route or a trunk, so its power is the power `routes.write` already
+	 * grants. Filing it with the dial-plan tables under `dial-plan.*` would have hidden it from the
+	 * people who own the routes that carry it.
+	 */
+	it("makes number translations a routing tab and gives its rules a nested detail route", () => {
+		expect(ROUTING_TABS).toContain("translations");
+		expect(routingTabHref("translations")).toBe(`${routes.routing}?tab=translations`);
+		expect(routes.translationRuleset("0193f2aa").startsWith(`${routes.routing}/`)).toBe(true);
+	});
+
+	/**
+	 * Call flows went the other way, for the one reason that outranks tidiness here:
+	 * `call-flows.toggle` is the receptionist's grant, and the whole feature is that somebody who
+	 * owns no part of the dial plan can find this page at five o'clock. As the sixth tab of a page
+	 * called "Routing" it would not be findable by that person, and the route requirement could not
+	 * let them in without opening the other five tabs.
+	 */
+	it("gives call flows a route of their own rather than a sixth routing tab", () => {
+		expect(routes.callFlows).toBe("/call-flows");
+		expect(routes.callFlows.startsWith(`${routes.routing}/`)).toBe(false);
+		expect(ROUTING_TABS).not.toContain("call-flows" as never);
+	});
+
+	/** A PIN set gates money and has a resource of its own, so it cannot inherit anything else's. */
+	it("gives authorisation codes a route of their own, with the codes nested under it", () => {
+		expect(routes.pinSets).toBe("/pin-sets");
+		expect(routes.pinSet("0193f2aa")).toBe(`${routes.pinSets}/0193f2aa`);
+		expect(routes.pinSets.startsWith(`${routes.dialPlan}/`)).toBe(false);
+	});
+
+	/**
+	 * The four dial-plan tables share one permission family, which is the only thing that makes one
+	 * page over four tabs legal here. The default tab is the bare path for the reason every tab
+	 * strip in this file is: `nuqs` clears the default, so a link carrying it is rewritten on load.
+	 */
+	it("puts the four dial-plan tables on one page with the section in the query", () => {
+		expect(DIAL_PLAN_TABS).toEqual(["aliases", "streams", "directories", "speed-dials"]);
+		expect(dialPlanTabHref("aliases")).toBe(routes.dialPlan);
+		expect(dialPlanTabHref("streams")).toBe(`${routes.dialPlan}?tab=streams`);
+		// Translations are NOT a fifth tab — different permission, different page.
+		expect(DIAL_PLAN_TABS).not.toContain("translations" as never);
+	});
+
+	/**
+	 * The live conference view is a TAB, not a route and not a detail page.
+	 *
+	 * A room has no detail page by design — it is one flat row edited in a dialog — and the live view
+	 * could not be one anyway: the `conferences` topic's snapshot is the whole claims bucket, so
+	 * scoping it to one room would open the same org-wide subscription and discard all but one row.
+	 * Both tabs are gated by `conferences.read`, which is what makes one `PAGE_PERMISSIONS` line
+	 * enough.
+	 */
+	it("puts the live conference view on the conferences page with the section in the query", () => {
+		expect(CONFERENCE_TABS).toEqual(["rooms", "live"]);
+		expect(conferenceTabHref("rooms")).toBe(routes.conferences);
+		expect(conferenceTabHref("live")).toBe(`${routes.conferences}?tab=live`);
+	});
+
+	/** The quotas are a settings tab, so they inherit nothing from the PBX area's routes. */
+	it("nests the limits under the settings area", () => {
+		expect(routes.limits).toBe("/settings/limits");
+		expect(routes.limits.startsWith(`${routes.settings}/`)).toBe(true);
+	});
+});
+
+/**
+ * Phrases — the one placement in this file that breaks the rule the rest of it applies.
+ *
+ * The rule: a page may only be a tab of another page when the two are gated by the SAME grant,
+ * because a tab inherits its parent's requirement by ancestry. Hold music and prompts are
+ * `settings.*` and phrases are `recordings.*`, so by that rule phrases should be a route of their
+ * own — and they are not, because the rule's PURPOSE is to stop a `PAGE_PERMISSIONS` entry naming
+ * one grant and hiding a surface behind it. Here the route's grant is the wider of the two, so
+ * nothing is hidden from anyone: `settings.read` is held by every self-service role and
+ * `recordings.read` is an administrator's, so every holder of the narrower grant reaches the page.
+ * The panel refuses the reverse case in words rather than with an empty table.
+ *
+ * The DETAIL page cannot make that trade, and does not: it has no other tabs to justify the looser
+ * requirement, so `PAGE_PERMISSIONS` names it explicitly. That is asserted in
+ * `page-permissions.spec.ts`; what is asserted here is the path shape that makes it addressable.
+ */
+describe("phrases", () => {
+	it("is a third tab of the media page rather than a route of its own", () => {
+		expect(MEDIA_TABS).toEqual(["hold-music", "prompts", "phrases"]);
+		expect(mediaTabHref("hold-music")).toBe(routes.mediaLibrary);
+		expect(mediaTabHref("phrases")).toBe(`${routes.mediaLibrary}?tab=phrases`);
+	});
+
+	/**
+	 * Nested under `/media`, so the sequence lives beside the recordings it names — and under a
+	 * `phrases/` segment rather than directly under `/media/<id>`, which is what lets
+	 * `PAGE_PERMISSIONS` match it with a `[id]` wildcard without also matching a future `/media/<x>`.
+	 */
+	it("nests one phrase's page under the media area", () => {
+		expect(routes.phrase("0193f2aa")).toBe("/media/phrases/0193f2aa");
+		expect(routes.phrase("0193f2aa").startsWith(`${routes.mediaLibrary}/`)).toBe(true);
 	});
 });

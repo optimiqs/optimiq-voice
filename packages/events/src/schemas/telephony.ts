@@ -106,6 +106,35 @@ export const SIP_TRANSPORTS = ["udp", "tcp", "tls", "ws", "wss"] as const;
 export type SipTransport = (typeof SIP_TRANSPORTS)[number];
 export const sipTransportSchema = z.enum(SIP_TRANSPORTS);
 
+/**
+ * What a supervisor is doing to a call they did not place.
+ *
+ * The three terms every PBX in the industry uses, and they are three POINTS on the same two axes
+ * rather than three features: what the supervisor hears, and who can hear the supervisor. Naming
+ * them here rather than deriving them from the `hear`/`speakTo` pair keeps the audit trail
+ * readable — "extension 1001 barged into call X" is a sentence a compliance officer can act on,
+ * and `{hear: "both", speakTo: "both"}` is one they would have to decode.
+ *
+ * - `eavesdrop` — hear both parties, speak to neither. Silent monitoring.
+ * - `whisper` — hear both, speak only to the agent. Coaching; the customer hears nothing.
+ * - `barge` — hear both, speak to both. A third party in the conversation.
+ */
+export const TAP_MODES = ["eavesdrop", "whisper", "barge"] as const;
+export type TapMode = (typeof TAP_MODES)[number];
+export const tapModeSchema = z.enum(TAP_MODES);
+
+/**
+ * How a supervisor's tap ended.
+ *
+ * `target-ended` and `supervisor-ended` are the two normal outcomes and they are NOT the same
+ * fact: the first says the monitored call finished on its own, the second says the supervisor
+ * stopped listening while it carried on. A compliance report that collapsed them could not answer
+ * "was the rest of that call unmonitored?".
+ */
+export const TAP_END_REASONS = ["supervisor-ended", "target-ended", "escalated", "failed"] as const;
+export type TapEndReason = (typeof TAP_END_REASONS)[number];
+export const tapEndReasonSchema = z.enum(TAP_END_REASONS);
+
 /** ACD agent status. Drives queue distribution and the wallboard. */
 export const AGENT_STATUSES = [
 	"logged-out",

@@ -1,7 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import { createEntityId } from "@optimiq-voice/identifiers";
-import { conferenceClaimSchema, isClaimExpired, isClaimOwnedBy, parkClaimSchema } from "./claims";
-import type { ConferenceClaim, ParkClaim } from "./claims";
+import {
+	conferenceClaimSchema,
+	isClaimExpired,
+	isClaimOwnedBy,
+	parkClaimSchema,
+	sharedLineStateSchema,
+} from "./claims";
+import type { ConferenceClaim, ParkClaim, SharedLineState } from "./claims";
 
 /**
  * The claim contracts.
@@ -163,5 +169,48 @@ describe("the conference claim", () => {
 	it("passes an unknown field through rather than rejecting a newer writer", () => {
 		const parsed = conferenceClaimSchema.parse({ ...conferenceClaim(), lockedBy: "1001" });
 		expect((parsed as Record<string, unknown>).lockedBy).toBe("1001");
+	});
+});
+
+function sharedLineState(overrides: Partial<SharedLineState> = {}): SharedLineState {
+	return sharedLineStateSchema.parse({
+		orgId: ORG,
+		instanceId: INSTANCE,
+		claimedAt: NOW,
+		heartbeatAt: NOW,
+		expiresAt: NOW + 30_000,
+		sharedLineId: createEntityId(),
+		state: "seized",
+		heldByExtensionId: createEntityId(),
+		heldByAppearanceIndex: 1,
+		callId: createEntityId(),
+		legId: createEntityId(),
+		...overrides,
+	});
+}
+
+describe("shared-line seizure claim", () => {
+	it("owns a line for exactly one appearance, with the base claim fields", () => {
+		const claim = sharedLineState();
+		expect(claim.state).toBe("seized");
+		expect(claim.heldByAppearanceIndex).toBe(1);
+		expect(isClaimOwnedBy(claim, INSTANCE)).toBe(true);
+		expect(isClaimExpired(claim, NOW + 40_000)).toBe(true);
+	});
+
+	it("carries the hold instant only once the line is held, for the recall timer", () => {
+		const held = sharedLineState({ state: "held", heldAtMs: NOW + 5_000 });
+		expect(held.state).toBe("held");
+		expect(held.heldAtMs).toBe(NOW + 5_000);
+	});
+
+	it("refuses a state outside the seized/held pair and a fractional appearance index", () => {
+		expect(() => sharedLineState({ state: "parked" as never })).toThrow();
+		expect(() => sharedLineState({ heldByAppearanceIndex: 1.5 })).toThrow();
+	});
+
+	it("passes an unknown field through rather than rejecting a newer writer", () => {
+		const parsed = sharedLineStateSchema.parse({ ...sharedLineState(), bargedBy: "1002" });
+		expect((parsed as Record<string, unknown>).bargedBy).toBe("1002");
 	});
 });

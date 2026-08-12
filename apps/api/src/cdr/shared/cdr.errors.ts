@@ -140,3 +140,30 @@ export class CdrMediaGoneException extends HttpException {
 		);
 	}
 }
+
+/**
+ * Too many of this organization's exports are already owed work.
+ *
+ * A 429 rather than a 409, and the distinction is the one a client acts on: a conflict says "this
+ * request contradicts the current state", which invites a re-read and a different request. This
+ * says "the same request will work shortly", which is what it means — the worker takes one job at
+ * a time and the queue drains on its own.
+ *
+ * `retryAfterSeconds` is a hint rather than a header, because there is no honest number: how long
+ * a queue of five exports takes depends entirely on their windows. It is set to a minute, which is
+ * a polling interval and not a promise.
+ */
+export class CdrExportPendingLimitException extends HttpException {
+	constructor(maxPending: number) {
+		super(
+			{
+				statusCode: HttpStatus.TOO_MANY_REQUESTS,
+				code: "CDR_EXPORT_PENDING_LIMIT",
+				message: `This organization already has ${maxPending} exports queued or running. Wait for one to finish, or delete one you no longer need.`,
+				maxPending,
+				retryAfterSeconds: 60,
+			},
+			HttpStatus.TOO_MANY_REQUESTS,
+		);
+	}
+}

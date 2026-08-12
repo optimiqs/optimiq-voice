@@ -43,11 +43,13 @@
 
 import type { CompiledPattern } from "./patterns";
 import type {
+	CallFlowMode,
 	FeatureCodeAction,
 	FeatureCodeParams,
 	QueueStrategy,
 	RecordPolicy,
 	RingGroupStrategy,
+	SharedLineStrategy,
 	SipTransport,
 	TollClass,
 	TrunkKind,
@@ -70,12 +72,17 @@ export const PLAN_NODE_KINDS = [
 	"voicemail",
 	"conference",
 	"park",
+	"paging",
+	"shared-line",
 	"external",
 	"trunk-dial",
 	"application",
 	"playback",
 	"feature-code",
 	"time-condition",
+	"call-flow",
+	"stream",
+	"dial-by-name",
 	"hangup",
 ] as const;
 
@@ -122,6 +129,23 @@ export interface ExtensionPlanNode extends PlanNodeBase {
 	 * inspector renders when somebody asks why their pickup code did nothing.
 	 */
 	readonly pickupGroup?: string;
+	/**
+	 * Ask an EXTERNAL caller to record their name, and let this extension accept or reject the call
+	 * after hearing it.
+	 *
+	 * Present and `true` means the engine inserts the screen before the endpoint is rung: the caller
+	 * records, the callee hears "call from <recording>" and presses 1 to take it or 2 to refuse it, and
+	 * a refusal takes the same branch a busy leg would (`busyNodeId`) so the caller reaches voicemail
+	 * rather than silence. Absent means no screen, which is what every extension did before the flag
+	 * existed and is why it is optional rather than a required boolean — an old reader that ignores it
+	 * rings the endpoint, which is the safe half of the behaviour.
+	 *
+	 * INTERNAL callers are never screened, and that is not expressible here because it is not
+	 * configurable: a colleague already arrives with a name on the display, and screening them would
+	 * put ten seconds on the front of every internal call. The engine applies the rule; the artifact
+	 * only says whether the tenant asked for the feature.
+	 */
+	readonly callScreening?: boolean;
 	readonly mohClassId?: string;
 	/** The class's NAME, resolved from `mohClassId`. Absent means "the media server's default". */
 	readonly mohClass?: string;
@@ -261,11 +285,61 @@ export interface QueuePlanNode extends PlanNodeBase {
 	readonly mohClass?: string;
 	readonly greetingPromptId?: string;
 	readonly announcePromptId?: string;
+	/**
+	 * Played to the ANSWERING AGENT alone, before the caller is bridged in.
+	 *
+	 * A bare prompt id, like the two above it and unlike `mohClass`: a prompt is addressed by its row
+	 * id all the way down to the media layer, whereas a music-on-hold class has to become a NAME
+	 * before a media server will take it, which is the only reason that one is resolved here.
+	 *
+	 * The opposite side of the bridge from its two siblings, and that is the entire point — the
+	 * caller hears the greeting and the position announcements, the agent hears this, and a reader
+	 * that played it to both would be reading the agent their cue sheet out loud. Absent means the
+	 * agent is bridged straight through.
+	 */
+	readonly agentWhisperPromptId?: string;
 	readonly maxWaitSeconds: number;
 	readonly maxWaitNoAgentSeconds: number;
 	readonly announcePositionEnabled: boolean;
 	readonly announceFrequencySeconds: number;
-	readonly recordEnabled: boolean;
+	/**
+	 * When the engine records a call this queue distributed.
+	 *
+	 * The same {@link RecordPolicy} `extension` and `trunk` nodes carry, replacing a `recordEnabled`
+	 * boolean that no runtime ever honoured — the queue session read it only to write a note saying
+	 * it had not. One vocabulary, so an operator asking "why was this call recorded?" gets one
+	 * answer from one kind of field wherever they look.
+	 *
+	 * A queued call is INBOUND from the queue's point of view, so `inbound` and `all` both record.
+	 * The recording starts at the ANSWER, not at the join: hold music is not evidence, and recording
+	 * it would file every abandoned call under the tenant's retention policy.
+	 */
+	readonly recordPolicy: RecordPolicy;
+	/**
+	 * The single DTMF digit a WAITING caller may press to leave the line for {@link exitNodeId}.
+	 *
+	 * Absent means the queue has no exit key, which is what every queue had before. Present without
+	 * an `exitNodeId` is possible and means the digit is accepted and the caller is hung up — the
+	 * compiler warns about it rather than dropping the key, because "press 9 and the call ends" is a
+	 * configuration somebody might mean and a silently ignored key is one nobody can debug.
+	 */
+	readonly exitKey?: string;
+	readonly exitNodeId?: PlanNodeId;
+	/**
+	 * The priority a caller entering THROUGH THIS NODE starts with. Higher dequeues first.
+	 *
+	 * On the node rather than only on the queue because the same queue can be entered at different
+	 * priorities — an IVR option for platinum customers is exactly that — and the compiler mints a
+	 * separate node per distinct override so the two entrances are different nodes over one queue id.
+	 * Everything downstream (the roster, the waiting line, the events) keys on `queueId`, so the two
+	 * nodes share one line, which is the whole point: a priority that produced a second queue would
+	 * not be a priority.
+	 */
+	readonly priority: number;
+	/** Whether a caller who hung up may reclaim their place on a call-back. */
+	readonly abandonedResumeAllowed: boolean;
+	/** How long that place is held. Also the resume tombstone's TTL. */
+	readonly discardAbandonedAfterSeconds: number;
 	readonly timeoutNodeId?: PlanNodeId;
 }
 
@@ -345,7 +419,24 @@ export interface ConferencePlanNode extends PlanNodeBase {
 	readonly requiresPin: boolean;
 	readonly maxMembers: number;
 	readonly waitForModerator: boolean;
-	readonly recordEnabled: boolean;
+	/**
+	 * How much of the room is captured. `none` when the tenant asked for nothing, which is what the
+	 * `recordEnabled: false` this replaced always meant.
+	 *
+	 * Required and defaulted at compile time rather than optional, because the walker BRANCHES on it
+	 * and an absent field would make "the tenant asked for no recording" and "this artifact predates
+	 * the column" the same value at the one place the difference is a compliance question.
+	 */
+	readonly recordPolicy: RecordPolicy;
+	/**
+	 * Beep the room on a join and on a leave. Absent means TRUE — see the note on
+	 * `ConferenceInput.entryToneEnabled` for why the default is a privacy position — so the compiler
+	 * emits these only when they are switched OFF, which is what `compact()` produces anyway.
+	 */
+	readonly entryToneEnabled?: boolean;
+	readonly exitToneEnabled?: boolean;
+	/** Play each arrival's recorded name. Absent means TRUE, exactly like the two tones above. */
+	readonly announceJoinLeave?: boolean;
 	readonly mohClassId?: string;
 	/** The class's NAME, resolved from `mohClassId`. Absent means "the media server's default". */
 	readonly mohClass?: string;
@@ -366,6 +457,94 @@ export interface ParkPlanNode extends PlanNodeBase {
 	readonly mohClassId?: string;
 	/** The class's NAME, resolved from `mohClassId`. Absent means "the media server's default". */
 	readonly mohClass?: string;
+	readonly timeoutNodeId?: PlanNodeId;
+}
+
+/**
+ * Announce to a set of handsets at once.
+ *
+ * # Why members are NUMBERS and not endpoints
+ *
+ * The obvious alternative is to compile each member down to the dial string the engine will hand
+ * its media server — `PJSIP/1001` or whatever the deployment speaks. That would bake an
+ * Asterisk-ism into an artifact that outlives the engine release which wrote it. The engine already
+ * owns the dial template (`endpointForExtension` in plan-walker), it is the only component that
+ * knows what its channel driver is called, and it applies that template to every other kind of leg
+ * it originates. A page is not the place to invent a second answer.
+ *
+ * So the artifact carries the internal numbers, in order, and the engine turns them into endpoints
+ * the same way it always does. `extensionsByNumber` on the artifact is the index that makes the
+ * number a complete reference: everything else the engine needs about a member is one lookup away.
+ *
+ * # Why a disabled member is dropped at compile time
+ *
+ * A page's member list is a DELIVERY PROMISE — these handsets and no others will hear this. If the
+ * list carried disabled members the engine would have to re-derive who is really in it, on the call
+ * path, and two components would then be answering "who hears this page?" independently. Dropping
+ * them here means the compiled list is the answer, the call-flow inspector shows exactly what will
+ * happen, and a page that reaches fewer people than the operator expected is visible in the
+ * artifact instead of only in the room.
+ *
+ * A member whose extension is missing entirely is dropped too, but loudly — it earns a diagnostic
+ * naming the group, because a page silently reaching fewer people is the failure mode this whole
+ * design is arranged against.
+ *
+ * # There are no references, and no continuation
+ *
+ * A page does not go anywhere afterwards: the pager speaks and hangs up, and that is the end of the
+ * call. Hence no `timeoutNodeId`, no `thenNodeId`, and `planNodeReferences` returning nothing.
+ *
+ * # Multicast is out of scope
+ *
+ * The other way to page — one RTP stream to a group address, handsets subscribed to it — is NOT
+ * expressible here and is deliberately left for a later wave. It needs a multicast-capable network
+ * the tenant controls and per-model handset provisioning, neither of which is a routing fact, and
+ * half-expressing it (a flag with no address, an address with no provisioning) would be a field
+ * readers would have to guess the meaning of. This node is unicast fan-out and says so by having no
+ * way to say anything else.
+ */
+export interface PagingPlanNode extends PlanNodeBase {
+	readonly kind: "paging";
+	readonly pagingGroupId: string;
+	/** Member extension NUMBERS in ordinal order, already filtered to enabled members of enabled extensions. */
+	readonly members: readonly string[];
+	/** False is a one-way announcement: members hear the pager and cannot be heard. */
+	readonly duplex: boolean;
+	/** How long a member's auto-answered leg may take to come up before it is given up on. */
+	readonly timeoutSeconds: number;
+}
+
+/** One appearance on a shared line — one member extension's button. */
+export interface SharedLineAppearance {
+	/** The appearance index: the button position on the member's phone, and the `Call-Info` index. */
+	readonly appearanceIndex: number;
+	readonly extensionId: string;
+	/** The member's dialable number, carried so the engine can address the lamp without a lookup. */
+	readonly extensionNumber: string;
+	readonly targetNodeId: PlanNodeId;
+}
+
+/**
+ * A shared line: one seizable line that appears on several handsets at once.
+ *
+ * A call to the line's number reaches every appearance (the engine originates a leg per appearance
+ * and arbitrates the seizure), so this fans out the same way a ring group does — but the members are
+ * `appearance`s carrying a button INDEX, because the whole feature is what happens after the answer:
+ * the line stays a single seizable thing whose state every appearance sees. `holdRecallTimeoutSeconds`
+ * and `bargeInEnabled` are the engine-runtime policy the compiler carries here so the engine needs no
+ * database read to arm a recall or refuse a barge. Never empty in a compiled artifact.
+ */
+export interface SharedLinePlanNode extends PlanNodeBase {
+	readonly kind: "shared-line";
+	readonly sharedLineId: string;
+	/** The line's own dialable number. Absent for a shared-key-only line reached no other way. */
+	readonly number?: string;
+	readonly strategy: SharedLineStrategy;
+	readonly ringTimeoutSeconds: number;
+	readonly holdRecallTimeoutSeconds: number;
+	readonly bargeInEnabled: boolean;
+	/** In appearance-index order. Never empty — a line with no live appearance is a hard error. */
+	readonly appearances: readonly SharedLineAppearance[];
 	readonly timeoutNodeId?: PlanNodeId;
 }
 
@@ -441,6 +620,57 @@ export interface TrunkDialPlanNode extends PlanNodeBase {
 	readonly emergencyAddressId?: string;
 	/** Organization-level ELIN. The caller's own emergency caller id wins over it. */
 	readonly elin?: string;
+	/**
+	 * The authorisation codes a caller must satisfy before the FIRST attempt is offered.
+	 *
+	 * On the node rather than on `OutboundRule` because the node is what the engine walks: a resolver
+	 * hands over an `ExecutionPlan`, not the rule it matched, and a gate the walker cannot see is a
+	 * gate that does not exist. Optional, so an artifact compiled before PIN sets existed — and every
+	 * route that has no set — dials as it always did.
+	 *
+	 * The emergency node NEVER carries one. Kari's Law says `911` is dialable from any station with
+	 * no prefix and no permission, and an authorisation code is a permission; the compiler builds the
+	 * emergency node from no route at all, so this falls out rather than being enforced.
+	 */
+	readonly pinSet?: CompiledPinSet;
+}
+
+/**
+ * A compiled authorisation-code list.
+ *
+ * The digests travel in the artifact for exactly the reason `VoicemailPlanNode.pinHash` and
+ * `ConferencePlanNode.pinHash` do: the challenge happens on the call path, in a process holding no
+ * database handle. Same format, same parser, same constant-time verifier.
+ *
+ * An entry the compiler could not read is DROPPED rather than embedded, and a set whose entries are
+ * all unreadable compiles to no gate at all with a warning — the same fail-open-with-a-warning the
+ * mailbox PIN takes, and for the same reason: refusing every outbound call over a formatting change
+ * takes the tenant's phones down to protect a route they already decided to gate.
+ */
+export interface CompiledPinSet {
+	readonly pinSetId: string;
+	readonly name: string;
+	readonly maxAttempts: number;
+	readonly digitTimeoutMs: number;
+	readonly promptId?: string;
+	readonly failurePromptId?: string;
+	/** In `ordinal` order. Never empty — a set with no usable code compiles to no gate. */
+	readonly entries: readonly CompiledPinEntry[];
+}
+
+/**
+ * One authorisation code.
+ *
+ * `ordinal` and `label` are what the CDR records — "entry 3, the night desk" — and the digits never
+ * are. That is the whole of what upstream's plaintext column was needed for, and it is answerable
+ * without the secret because an entry has an identity of its own.
+ */
+export interface CompiledPinEntry {
+	readonly pinSetEntryId: string;
+	readonly ordinal: number;
+	readonly label?: string;
+	/** A digest in the `voicemail-pin.ts` format. Never a PIN. */
+	readonly pinHash: string;
 }
 
 /** Hand the leg to a named engine application (the `application` destination type). */
@@ -488,6 +718,106 @@ export interface TimeConditionPlanNode extends PlanNodeBase {
 	readonly noMatchNodeId?: PlanNodeId;
 }
 
+/**
+ * A day/night switch, resolved.
+ *
+ * # Why it is a node and not a flattened branch
+ *
+ * The compiler knows the mode — it is a column, and it is compiled in — so it could emit only the
+ * live branch and drop the other. It deliberately does not, for the reason `time-condition` is also
+ * a node the resolver walks through eagerly: a call-flow inspector has to be able to show WHY a
+ * call went where it went, and "the flow was in night mode and the night branch is voicemail" is
+ * only answerable if both branches survive into the artifact.
+ *
+ * The resolver follows it in `followGates` alongside time conditions, so the plan the engine
+ * receives already has the switch applied. The engine's walker also handles it, for the same reason
+ * it re-evaluates a time condition at the walk's instant: a caller can reach one part-way through a
+ * walk rather than only at the entry.
+ *
+ * `presenceKey` is the dialable string a BLF lamp is subscribed to — the flow's own feature code, or
+ * its number when it has no code. Carried so whichever process flips the mode can light the lamp
+ * without a second lookup, and absent when the flow has neither, which is a flow nothing can watch.
+ */
+export interface CallFlowPlanNode extends PlanNodeBase {
+	readonly kind: "call-flow";
+	readonly callFlowId: string;
+	readonly mode: CallFlowMode;
+	readonly dayNodeId: PlanNodeId;
+	readonly nightNodeId: PlanNodeId;
+	/** The feature code that toggles it, for the inspector and for the engine's runtime. */
+	readonly featureCode?: string;
+	/** The `presence` KV key a BLF lamp watches. Absent when the flow has no dialable identity. */
+	readonly presenceKey?: string;
+}
+
+/**
+ * Play a remote audio stream, then go somewhere.
+ *
+ * # `fallbackNodeId` is not optional, and that is the whole design
+ *
+ * Remote-URL playback is the one thing in this artifact whose availability depends on the media
+ * driver rather than on the configuration: ARI's `POST /channels/{id}/play` accepts `sound:`,
+ * `recording:`, `number:`, `digits:`, `characters:` and `tone:`, and an arbitrary `https://` is not
+ * among them — `apps/engine`'s `translateMediaRef` returns `undefined` for one and every runtime
+ * treats that as "announce the fallback". A stream node therefore always carries somewhere to go,
+ * and the compiler refuses one that does not, so a driver that cannot play the source produces a
+ * routed call rather than silence.
+ *
+ * The same branch covers the far more common failure: the URL is simply unreachable, because a
+ * remote source is somebody else's uptime.
+ */
+export interface StreamPlanNode extends PlanNodeBase {
+	readonly kind: "stream";
+	readonly audioStreamId: string;
+	/** `http(s)` only — validated at write time, because it decides what a media server opens. */
+	readonly url: string;
+	readonly answerFirst: boolean;
+	/** Zero means "until the caller hangs up". */
+	readonly maxSeconds: number;
+	/** Taken when the stream ends, times out, or cannot be played at all. Never absent. */
+	readonly fallbackNodeId: PlanNodeId;
+}
+
+/** One person a caller can reach by spelling their name. */
+export interface DirectoryEntry {
+	/** The name, mapped through the ITU keypad. What the caller's digits are matched against. */
+	readonly digits: string;
+	readonly extensionNumber: string;
+	/** The `extension` node to dial on selection. */
+	readonly targetNodeId: PlanNodeId;
+	/**
+	 * The mailbox's recorded-name greeting, as a domain `MediaRef`.
+	 *
+	 * Never absent, and that is what makes the list offerable: this platform has no text-to-speech,
+	 * so an entry whose name cannot be SPOKEN cannot be offered, and the compiler drops such
+	 * extensions with a warning rather than producing "for … press one".
+	 */
+	readonly nameMedia: string;
+	/** For the inspector and for a spoken position, never for matching. */
+	readonly label?: string;
+}
+
+/**
+ * Answer, ask for name digits, offer the matches, connect.
+ *
+ * The entries are COMPILED rather than searched at call time, for the reason every index in this
+ * artifact is: the engine holds no database handle. Compiling them also produces the one diagnostic
+ * that has no runtime symptom — two people whose names collide on the keypad.
+ */
+export interface DialByNamePlanNode extends PlanNodeBase {
+	readonly kind: "dial-by-name";
+	readonly directoryId: string;
+	/** How many digits the caller must enter before matching starts. */
+	readonly minDigits: number;
+	readonly maxFailures: number;
+	readonly greetingPromptId?: string;
+	readonly invalidPromptId?: string;
+	/** Sorted by `digits` then `extensionNumber`, so a prefix scan is a linear walk. */
+	readonly entries: readonly DirectoryEntry[];
+	/** Taken when the caller gives up, times out, or exhausts their attempts. */
+	readonly timeoutNodeId?: PlanNodeId;
+}
+
 /** The end of a chain. Every path in a compiled artifact terminates in one of these. */
 export interface HangupPlanNode extends PlanNodeBase {
 	readonly kind: "hangup";
@@ -502,12 +832,17 @@ export type PlanNode =
 	| VoicemailPlanNode
 	| ConferencePlanNode
 	| ParkPlanNode
+	| PagingPlanNode
+	| SharedLinePlanNode
 	| ExternalPlanNode
 	| TrunkDialPlanNode
 	| ApplicationPlanNode
 	| PlaybackPlanNode
 	| FeatureCodePlanNode
 	| TimeConditionPlanNode
+	| CallFlowPlanNode
+	| StreamPlanNode
+	| DialByNamePlanNode
 	| HangupPlanNode;
 
 export type PlanNodeOf<TKind extends PlanNodeKind> = Extract<PlanNode, { kind: TKind }>;
@@ -562,6 +897,17 @@ export function planNodeReferences(node: PlanNode): readonly PlanNodeId[] {
 		}
 		case "park": {
 			return compact([node.timeoutNodeId]);
+		}
+		case "paging": {
+			// Nothing. A page has no continuation — the members' legs are numbers rather than node
+			// references, and the call ends when the pager hangs up, so there is no branch to reach.
+			return [];
+		}
+		case "shared-line": {
+			return compact([
+				...node.appearances.map((appearance) => appearance.targetNodeId),
+				node.timeoutNodeId,
+			]);
 		}
 		case "trunk-dial": {
 			return compact([node.failoverNodeId]);

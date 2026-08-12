@@ -379,7 +379,8 @@ func (s *Session) sendDtmfPacket(event byte, end bool, duration, timestamp uint3
 		// will not do what the caller asked, and there is nothing later to make up for it.
 		return fmt.Errorf("rtp: sending a DTMF packet to %s: %w", to, err)
 	}
-	s.count(func(st *Stats) { st.PacketsSent++; st.DtmfPacketsSent++ })
+	s.countSent(uint32(len(payload)))
+	s.count(func(st *Stats) { st.DtmfPacketsSent++ })
 	return nil
 }
 

@@ -8,7 +8,9 @@ import {
 import { tenantIsolationPolicy } from "../tenant";
 import { destinationCheck, destinationColumns, namedDestinationColumns } from "./columns";
 import { phoneNumber } from "./numbers-schema";
+import { pinSet } from "./pins-schema";
 import { timeCondition } from "./time-conditions-schema";
+import { translationRuleset } from "./translations-schema";
 import type { TollClass } from "./extensions-schema";
 
 /**
@@ -100,6 +102,27 @@ export const outboundRoute = pgTable.withRLS(
 		}),
 		/** Taken when every trunk in `trunkPriority` fails. */
 		...namedDestinationColumns("failover"),
+		/**
+		 * The authorisation codes a caller must satisfy before any trunk is dialled.
+		 *
+		 * NULL is the overwhelmingly common case and means no challenge. `on delete set null` rather
+		 * than `restrict`: deleting a PIN set removes the gate, and while that widens access it does
+		 * so with a row an administrator explicitly deleted — whereas `restrict` would make deleting a
+		 * retired set a puzzle, and `cascade` would delete the ROUTE, which takes the tenant's
+		 * international calling down to remove a code list.
+		 */
+		pinSetId: uuidEntityId("pin_set_id").references(() => pinSet.id, { onDelete: "set null" }),
+		/**
+		 * The shared rewrite applied to the dialled number, AFTER this route's own strip/prepend.
+		 *
+		 * The composition order and its argument are in `translations-schema.ts`: the inline pair
+		 * turns what somebody's fingers did into the number they meant, and the ruleset normalises
+		 * that number for the wire.
+		 */
+		translationRulesetId: uuidEntityId("translation_ruleset_id").references(
+			() => translationRuleset.id,
+			{ onDelete: "set null" },
+		),
 		callerIdNumberOverride: text("caller_id_number_override"),
 		recordEnabled: boolean("record_enabled").notNull().default(false),
 		enabled: boolean("enabled").notNull().default(true),
@@ -116,6 +139,11 @@ export const outboundRoute = pgTable.withRLS(
 		index("outbound_route_organization_time_condition_idx").on(
 			table.organizationId,
 			table.timeConditionId,
+		),
+		index("outbound_route_organization_pin_set_idx").on(table.organizationId, table.pinSetId),
+		index("outbound_route_organization_translation_idx").on(
+			table.organizationId,
+			table.translationRulesetId,
 		),
 		destinationCheck("outbound_route", "failover", true),
 		tenantIsolationPolicy("outbound_route"),

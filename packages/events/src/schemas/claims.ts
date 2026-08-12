@@ -151,8 +151,77 @@ export const conferenceClaimSchema = z
 		contributions: z
 			.record(z.string().min(1).max(128), conferenceContributionSchema)
 			.refine((contributions) => Object.keys(contributions).length > 0),
+		/**
+		 * Whether the room has stopped admitting new participants.
+		 *
+		 * On the CLAIM and not on an instance's contribution, which is the whole point of putting it
+		 * here: a lock is a fact about the ROOM, and a joiner landing on a neighbour has to be refused
+		 * too or the lock is a suggestion. Every instance already reads this value on the join path —
+		 * it is where the cluster-wide member count comes from — so honouring a lock costs one field
+		 * read on a path that was going to read the value anyway.
+		 *
+		 * It is deliberately NOT leased like a contribution is. A contribution expires because its
+		 * owner may have crashed and its seats must stop counting; a lock has no owner to lose, and a
+		 * meeting that unlocked itself because an unrelated instance restarted would be a room the
+		 * moderator has to keep re-locking. It goes away when the room does — the last member out
+		 * releases the key.
+		 *
+		 * Optional, and absent means unlocked: a claim written by a release that predates this is a
+		 * room nobody has locked, which is what it was.
+		 */
+		locked: z.boolean().optional(),
+		/** The control-plane user who locked it, for the audit trail. Absent when unlocked. */
+		lockedByUserId: z.string().max(128).optional(),
+		lockedAtMs: z.number().optional(),
 	})
 	.loose();
 
 export type ConferenceClaim = z.infer<typeof conferenceClaimSchema>;
 export type ConferenceContribution = z.infer<typeof conferenceContributionSchema>;
+
+// ---------------------------------------------------------------------------------------------
+// shared-line-state
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A seized shared line, and who holds it.
+ *
+ * A shared line is a single seizable resource that appears on several handsets at once. When one
+ * appearance answers or originates on it the line is SEIZED, and every other appearance's key has to
+ * go busy so a colleague does not grab a call that is already someone's — the SLA/BLA "remote"
+ * dialog-info state. That is an exclusivity fact of exactly the shape a park slot is: the first
+ * appearance to `create` this key wins the line, and an appearance that loses the create reads the
+ * winner off the value and lights its lamp remote-active rather than dialling into a call in
+ * progress. So this extends `claimBaseSchema` and mirrors `parkClaimSchema`, not the jointly-held
+ * conference contribution — one holder at a time is the whole point.
+ *
+ * `state` distinguishes an ACTIVE seizure from a HELD one, and `heldAtMs` is what a recall timer
+ * reads: a line left on hold past its line's `hold_recall_timeout_seconds` rings every appearance
+ * back rather than stranding the caller on a holder who walked away. Barge-in — a second appearance
+ * joining a held call — is a fact about the same key (it would add the joiner to the value), but the
+ * media join needs the live bridge plane and is deliberately a named seam for this wave.
+ *
+ * Not in the Go codegen registry, for the reason the park and conference claims give: nothing in Go
+ * seizes a shared line — it is an engine-owned operation — so a Go struct here would pin a shape no
+ * Go process holds. The lamp reaches the phone over the existing `presence` -> dialog-info path,
+ * which sipd already watches.
+ */
+export const SHARED_LINE_STATES = ["seized", "held"] as const;
+export type SharedLineSeizureState = (typeof SHARED_LINE_STATES)[number];
+
+export const sharedLineStateSchema = claimBaseSchema
+	.extend({
+		sharedLineId: z.string().min(1),
+		/** Whether the holder is on the call or has parked it on hold, awaiting retrieval or recall. */
+		state: z.enum(SHARED_LINE_STATES),
+		/** The appearance that holds the line — its extension and its button index on the line. */
+		heldByExtensionId: z.string().min(1).max(128),
+		heldByAppearanceIndex: z.number().int().nonnegative(),
+		callId: z.string().min(1).max(128),
+		legId: z.string().min(1).max(128),
+		/** When the line went on hold. Read by the recall timer; absent while `state` is `seized`. */
+		heldAtMs: z.number().optional(),
+	})
+	.loose();
+
+export type SharedLineState = z.infer<typeof sharedLineStateSchema>;

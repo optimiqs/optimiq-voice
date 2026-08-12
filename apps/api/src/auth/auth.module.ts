@@ -6,10 +6,18 @@ import { clearAuthRuntime, publishAuthRuntime } from "./auth-platform.registry";
 import { type AuthPlatform, createAuthPlatform } from "./auth.platform";
 import { AuthService } from "./auth.service";
 import { AUTH_PLATFORM, AUTH_REPOSITORY } from "./auth.tokens";
+import { BrandingController } from "./branding/branding.controller";
+import { BrandingService } from "./branding/branding.service";
 import { CallTokenService } from "./call-token.service";
+import { MailTemplateController } from "./mail-templates/mail-template.controller";
+import { MailTemplateService } from "./mail-templates/mail-template.service";
 import { MeController } from "./me.controller";
 import { OrganizationsController } from "./organizations.controller";
 import { RequirePermissionsGuard } from "./require-permissions.guard";
+import { ResellerController } from "./reseller/reseller.controller";
+import { ResellerService } from "./reseller/reseller.service";
+import { SsoController } from "./sso/sso.controller";
+import { SsoService } from "./sso/sso.service";
 
 /**
  * The better-auth feature slice.
@@ -31,8 +39,19 @@ import { RequirePermissionsGuard } from "./require-permissions.guard";
 	 * that a global module happens to exist to find out where they go.
 	 */
 	imports: [MailModule],
-	controllers: [MeController, OrganizationsController],
+	controllers: [
+		MeController,
+		OrganizationsController,
+		ResellerController,
+		BrandingController,
+		SsoController,
+		MailTemplateController,
+	],
 	providers: [
+		ResellerService,
+		BrandingService,
+		SsoService,
+		MailTemplateService,
 		{
 			provide: AUTH_PLATFORM,
 			useFactory: (mailer: Mailer): AuthPlatform =>

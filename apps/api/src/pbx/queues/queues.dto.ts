@@ -2,7 +2,10 @@ import { z } from "zod/v4";
 import {
 	QUEUE_AGENT_CONTACT_KINDS,
 	QUEUE_AGENT_STATUSES,
+	QUEUE_PRIORITY_MAX,
+	QUEUE_PRIORITY_MIN,
 	QUEUE_STRATEGIES,
+	RECORD_POLICIES,
 } from "@optimiq-voice/pbx-db";
 import {
 	dialableString,
@@ -29,6 +32,8 @@ export const createQueueDto = z.strictObject({
 	mohClassId: z.uuid().nullish(),
 	greetingPromptId: z.uuid().nullish(),
 	announcePromptId: z.uuid().nullish(),
+	/** Played to the agent alone on answer, before the caller is connected. `null` clears it. */
+	agentWhisperPromptId: z.uuid().nullish(),
 	/** 0 disables the cap and callers wait indefinitely. */
 	maxWaitSeconds: resettable(z.int().min(0).max(86_400)),
 	/** Ejects callers this fast when no agent is logged in at all. 0 disables. */
@@ -42,7 +47,31 @@ export const createQueueDto = z.strictObject({
 	tierRulesApply: z.boolean().optional(),
 	tierRuleWaitSeconds: resettable(z.int().min(0).max(3600)),
 	tierRuleNoAgentNoWait: z.boolean().optional(),
-	recordEnabled: z.boolean().optional(),
+	/**
+	 * When the engine records what this queue distributes — the same vocabulary `extension` and
+	 * `trunk` carry, which replaced a `recordEnabled` boolean no runtime honoured.
+	 *
+	 * NOT `resettable`, unlike the numeric knobs above: this is an enum whose "off" value is a real
+	 * member (`none`) rather than a server default somebody might want to fall back to. A form's
+	 * "do not record" is `none`, which the column can say for itself.
+	 */
+	recordPolicy: z.enum(RECORD_POLICIES).optional(),
+	/**
+	 * The single DTMF digit a waiting caller may press to leave. `null` removes it.
+	 *
+	 * Upper-cased before validation so a tenant who types `d` gets the DTMF `D` rather than a
+	 * rejected form — the engine compares this against a digit with `===`, so the two spellings are
+	 * not equivalent anywhere below this line.
+	 */
+	exitKey: z
+		.string()
+		.trim()
+		.toUpperCase()
+		.regex(/^[0-9*#A-D]$/u, "An exit key must be a single DTMF digit (0-9, *, #, A-D).")
+		.nullish(),
+	...namedDestinationShape("exit"),
+	/** Higher dequeues first. An IVR may override it per entry through the destination's args. */
+	defaultPriority: resettable(z.int().min(QUEUE_PRIORITY_MIN).max(QUEUE_PRIORITY_MAX)),
 	...namedDestinationShape("timeout"),
 	enabled: z.boolean().optional(),
 });
@@ -132,6 +161,16 @@ export const createQueueTierDto = z.strictObject({
 	level: resettable(z.int().min(1).max(100)),
 	/** Order within the level, which `top-down` and `round-robin` walk in. */
 	position: resettable(z.int().min(1).max(1000)),
+	/**
+	 * Played to the AGENT alone when a call distributed by THIS tier reaches them, in place of the
+	 * queue's `agentWhisperPromptId`. `null` clears it and the queue's whisper takes over again.
+	 *
+	 * Writable here rather than on the queue because it is a fact about the tier — an escalation cue
+	 * for a level that is only reached after the one below it could not take the call. It is
+	 * therefore behind `queues.manage-agents` like everything else on this DTO, which is the right
+	 * gate: whoever staffs the levels is whoever knows what each level should be told.
+	 */
+	announcePromptId: z.uuid().nullish(),
 });
 
 export const updateQueueTierDto = patchOf(createQueueTierDto);

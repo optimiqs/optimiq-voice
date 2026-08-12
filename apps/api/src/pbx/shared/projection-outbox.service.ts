@@ -4,6 +4,8 @@ import { QueueMembershipPublisher } from "../queues/queue-membership.publisher";
 import { compileOnWrite } from "../routing/compile-on-write";
 import { DidIndexPublisher } from "../routing/did-index.publisher";
 import { RoutingCachePublisher } from "../routing/routing-cache.publisher";
+import { SipAclPublisher } from "../security/sip-acl.publisher";
+import { TrunkDirectoryPublisher } from "../trunks/trunk-directory.publisher";
 import { PBX_DATABASE, PBX_ENV } from "./pbx.tokens";
 import {
 	dischargeRows,
@@ -47,9 +49,10 @@ const logger = getLogger("api.pbx");
  * ## Idempotence is what makes a redundant sweep free
  *
  * Every publish here is a whole-organization reconcile against the CURRENT database — a KV `put` of
- * the artifact, a DID reconcile, a roster re-projection. Running one that was not needed writes the
- * same bytes that are already there (`queue-membership` does not even do that: `isSameRoster`
- * short-circuits it). So the sweeper never has to prove a row was really unpublished; it only has
+ * the artifact, a DID reconcile, a roster re-projection, a carrier-directory re-projection, an ACL
+ * re-projection. Running one that was not needed writes the same bytes that are already there
+ * (three of the five do not even do that: `isSameRoster`, `isSameTrunkEntry` and `isSameAclEntry`
+ * short-circuit it). So the sweeper never has to prove a row was really unpublished; it only has
  * to never MISS one, which is what the in-transaction insert guarantees.
  *
  * ## Re-derive, never replay
@@ -91,6 +94,8 @@ export class ProjectionOutboxSweeper implements OnModuleInit, OnApplicationShutd
 		@Inject(RoutingCachePublisher) private readonly routingCache: RoutingCachePublisher,
 		@Inject(DidIndexPublisher) private readonly didIndex: DidIndexPublisher,
 		@Inject(QueueMembershipPublisher) private readonly queueMembership: QueueMembershipPublisher,
+		@Inject(TrunkDirectoryPublisher) private readonly trunkDirectory: TrunkDirectoryPublisher,
+		@Inject(SipAclPublisher) private readonly sipAcl: SipAclPublisher,
 	) {}
 
 	get stats(): {
@@ -274,7 +279,8 @@ export class ProjectionOutboxSweeper implements OnModuleInit, OnApplicationShutd
 				lastError: group.lastError,
 			},
 			`a ${group.projection} projection has failed ${group.attempts} times and is still owed; ` +
-				`the engine is reading a stale ${group.projection} for this organization — ${REPAIR[group.projection]}`,
+				`${READER[group.projection]} is reading a stale ${group.projection} for this ` +
+				`organization — ${REPAIR[group.projection]}`,
 		);
 	}
 
@@ -286,6 +292,10 @@ export class ProjectionOutboxSweeper implements OnModuleInit, OnApplicationShutd
 				return this.didIndex.isReady;
 			case "queue-membership":
 				return this.queueMembership.isReady;
+			case "trunks":
+				return this.trunkDirectory.isReady;
+			case "sip-acl":
+				return this.sipAcl.isReady;
 		}
 	}
 
@@ -305,6 +315,38 @@ export class ProjectionOutboxSweeper implements OnModuleInit, OnApplicationShutd
 			const result = await this.queueMembership.syncOrganization(organizationId);
 			if (result.skipped) {
 				throw new Error("the queue-membership bucket is not open");
+			}
+			return;
+		}
+
+		// The two SIP-edge read models need no artifact either: both re-read their own table under the
+		// tenant's own RLS, which is the "re-derive, never replay" rule applied one process further
+		// out. Neither is worth compiling a routing artifact for, and `sip_acl_entry` could not
+		// produce one — it is not a routing input at all.
+		if (projection === "trunks") {
+			const result = await this.trunkDirectory.syncOrganization(organizationId);
+			if (result.skipped) {
+				throw new Error("the trunks bucket is not open");
+			}
+			return;
+		}
+
+		if (projection === "sip-acl") {
+			const result = await this.sipAcl.syncOrganization(organizationId);
+			if (result.skipped) {
+				throw new Error("the sip-acl bucket is not open");
+			}
+			if (result.conflicts.length > 0) {
+				// Not a transient failure and it must not be retried into the ground: the KV key for this
+				// bucket is the network alone and two rows have landed on one, which `sip-acl.publisher.ts`
+				// argues is a human decision (and, for the cross-tenant case, a gap in the key contract).
+				// Throwing is still right — the obligation genuinely was not met, and the contested
+				// network is REFUSED in the meantime — and the stuck report is how it reaches an operator
+				// with the tenant attached.
+				throw new Error(
+					`${String(result.conflicts.length)} sip-acl networks are contested and are therefore ` +
+						"refused; run scripts/rebuild-sip-acl.ts",
+				);
 			}
 			return;
 		}
@@ -350,11 +392,28 @@ export class ProjectionOutboxSweeper implements OnModuleInit, OnApplicationShutd
  */
 const SWEEP_BATCH = 200;
 
+/**
+ * Which process is degraded while a projection is owed.
+ *
+ * Named per projection because the sentence "the engine is reading a stale X" stopped being true
+ * when the SIP edge got read models of its own: nobody paging at 03:00 on a stuck `sip-acl` should
+ * have to work out that the affected process is `apps/sipd` and the symptom is a refused carrier.
+ */
+const READER: Record<ProjectionName, string> = {
+	"routing-cache": "the engine",
+	"did-index": "the engine",
+	"queue-membership": "the engine",
+	trunks: "the SIP edge",
+	"sip-acl": "the SIP edge",
+};
+
 /** Named per projection because an operator should not have to know which script rebuilds what. */
 const REPAIR: Record<ProjectionName, string> = {
 	"routing-cache": "POST /api/v1/routing/compile for this organization republishes it",
 	"did-index": "run scripts/rebuild-did-index.ts",
 	"queue-membership": "run scripts/rebuild-queue-membership.ts",
+	trunks: "run scripts/rebuild-trunks.ts",
+	"sip-acl": "run scripts/rebuild-sip-acl.ts",
 };
 
 export interface ProjectionSweepResult {
