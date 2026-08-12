@@ -9,6 +9,7 @@ import {
 	parseAgentState,
 	parseChannel,
 	parseRegistration,
+	parseTrunkStatusEvent,
 	type LiveChannel,
 	type LiveRegistration,
 } from "./store";
@@ -90,9 +91,9 @@ describe("applySnapshot", () => {
 	/** `loaded` is what lets a tile show a dash instead of a confidently wrong zero. */
 	it("marks the state loaded, even when the snapshot is empty", () => {
 		expect(emptyKvState().loaded).toBe(false);
-		expect(applySnapshot({ topic: "registrations", at: "t", rows: [] }, parseRegistration).loaded).toBe(
-			true,
-		);
+		expect(
+			applySnapshot({ topic: "registrations", at: "t", rows: [] }, parseRegistration).loaded,
+		).toBe(true);
 	});
 });
 
@@ -227,5 +228,72 @@ describe("the parsers", () => {
 		expect(parseAgentState({ agentId: "a", status: "available" })).not.toBe(undefined);
 		expect(parseAgentState({ agentId: "a" })).toBe(undefined);
 		expect(parseAgentState(null)).toBe(undefined);
+	});
+});
+
+/**
+ * The trunk status parser, which is the only one here that reads an ENVELOPE rather than a bucket
+ * value — `trunks` is a stream topic with no KV projection behind it, so the trunk it is about is
+ * carried in the subject rather than in a key.
+ *
+ * What these assert is the pair of things that would put something untrue on the trunks screen: a
+ * status word this build has no badge for, and a transition attributed to the wrong trunk.
+ */
+describe("parseTrunkStatusEvent", () => {
+	const TRUNK = "019fd3c2-2222-76be-a6b3-b0f1914e39b6";
+	const SUBJECT = `trunk.evt.v1.${ORG}.${TRUNK}.status.changed`;
+	const RECEIVED = "2026-08-06T09:00:05.000Z";
+
+	function envelope(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+		return {
+			subject: SUBJECT,
+			at: "2026-08-06T09:00:00.000Z",
+			data: { status: "down", reason: "Unreachable", latencyMs: 0 },
+			...overrides,
+		};
+	}
+
+	it("takes the trunk id from the subject, which is where the address lives", () => {
+		expect(parseTrunkStatusEvent(envelope(), RECEIVED)?.trunkId).toBe(TRUNK);
+	});
+
+	/**
+	 * The transition's own moment, not this tab's. A page opened after an outage started and then
+	 * handed a republished event would otherwise claim the carrier went down just now.
+	 */
+	it("prefers the envelope's timestamp over the moment the frame arrived", () => {
+		expect(parseTrunkStatusEvent(envelope(), RECEIVED)?.at).toBe("2026-08-06T09:00:00.000Z");
+		expect(parseTrunkStatusEvent(envelope({ at: undefined }), RECEIVED)?.at).toBe(RECEIVED);
+	});
+
+	/**
+	 * The five words `trunk.status` can hold. A sixth is a status the server has learned and this
+	 * build has not, and rendering it would paint an unstyled badge OVER the value the row already
+	 * carries — strictly worse than leaving the row's answer alone until the page is reloaded.
+	 */
+	it("refuses a status the column could not hold, so the row's own answer survives", () => {
+		for (const status of ["unknown", "up", "down", "degraded", "disabled"]) {
+			expect(parseTrunkStatusEvent(envelope({ data: { status } }), RECEIVED)?.status).toBe(status);
+		}
+		expect(parseTrunkStatusEvent(envelope({ data: { status: "flapping" } }), RECEIVED)).toBe(
+			undefined,
+		);
+		expect(parseTrunkStatusEvent(envelope({ data: { status: 3 } }), RECEIVED)).toBe(undefined);
+	});
+
+	it("refuses an envelope with no subject, no payload, or no trunk token in the subject", () => {
+		expect(parseTrunkStatusEvent(envelope({ subject: undefined }), RECEIVED)).toBe(undefined);
+		expect(parseTrunkStatusEvent(envelope({ data: undefined }), RECEIVED)).toBe(undefined);
+		expect(parseTrunkStatusEvent(envelope({ subject: "trunk.evt.v1" }), RECEIVED)).toBe(undefined);
+		expect(parseTrunkStatusEvent(null, RECEIVED)).toBe(undefined);
+	});
+
+	/** The two optional fields are omitted rather than nulled, so a caller's `??` reaches the row. */
+	it("omits the reason and the latency when the media server reported neither", () => {
+		const parsed = parseTrunkStatusEvent(envelope({ data: { status: "up" } }), RECEIVED);
+
+		expect(parsed).toEqual({ trunkId: TRUNK, status: "up", at: "2026-08-06T09:00:00.000Z" });
+		expect(parsed && "reason" in parsed).toBe(false);
+		expect(parsed && "latencyMs" in parsed).toBe(false);
 	});
 });

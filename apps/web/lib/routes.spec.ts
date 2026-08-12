@@ -3,6 +3,7 @@ import {
 	isPublicRoute,
 	queueTabHref,
 	routes,
+	ROUTING_TABS,
 	safeRedirectTarget,
 	signInWithRedirect,
 } from "./routes";
@@ -89,7 +90,9 @@ describe("the settings area", () => {
 			routes.apiKeys,
 			routes.notifications,
 			routes.routingSettings,
+			routes.recordingSettings,
 			routes.emergencyAddresses,
+			routes.mySettings,
 		]) {
 			expect(url.startsWith(`${routes.settings}/`)).toBe(true);
 		}
@@ -98,6 +101,35 @@ describe("the settings area", () => {
 	it("keeps the routing settings off the routing page's path", () => {
 		expect(routes.routingSettings).toBe("/settings/routing");
 		expect(routes.routingSettings.startsWith(`${routes.routing}/`)).toBe(false);
+	});
+
+	/**
+	 * The same split for recordings: `/recordings` is a cursor-paged ledger gated by
+	 * `recordings.read`, and `/settings/recordings` is one policy field gated by `settings.read`.
+	 * Nesting the second under the first would make `getPagePermissions` inherit the ledger's
+	 * requirement by ancestry, and a role that may set the retention window without reading the
+	 * recordings would then be shown a page the API refuses.
+	 */
+	it("keeps the recording policy off the recordings ledger's path", () => {
+		expect(routes.recordingSettings).toBe("/settings/recordings");
+		expect(routes.recordingSettings.startsWith(`${routes.recordings}/`)).toBe(false);
+	});
+});
+
+/**
+ * Caller screening is a route of its own, not a routing tab.
+ *
+ * The API gives it `call-block.*` rather than `routes.*` deliberately — the person maintaining a
+ * blocklist is whoever answered the phone, not the administrator who owns the dial plan — and a tab
+ * of `/routing` would inherit that page's requirement by ancestry, which is the disagreement
+ * `page-permissions.ts` exists to prevent. The same argument paging groups made against being a tab
+ * of ring groups.
+ */
+describe("call blocking", () => {
+	it("is a top-level route rather than a segment of the routing page", () => {
+		expect(routes.callBlock).toBe("/call-block");
+		expect(routes.callBlock.startsWith(`${routes.routing}/`)).toBe(false);
+		expect(ROUTING_TABS).not.toContain("call-block" as never);
 	});
 });
 

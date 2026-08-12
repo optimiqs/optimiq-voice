@@ -127,6 +127,22 @@ export const queryKeys = {
 	orgSettingsCatalog: () => ["pbx", "org-settings-catalog"] as const,
 	orgSettingsCategory: (organizationId: string, category: string) =>
 		["organizations", organizationId, "pbx", "org-settings", category] as const,
+	/**
+	 * The caller's OWN preferences — `user_setting`, the third level of the cascade.
+	 *
+	 * Carries no category segment, because `GET …/me` carries none either: it answers with every
+	 * user-scoped category at once, so there is one entry and one request however many categories
+	 * eventually have a user level. Splitting it per category here would invent a key granularity
+	 * the endpoint cannot serve.
+	 *
+	 * A sibling of `org-settings` rather than a child, and deliberately outside it: the coarse PBX
+	 * sweeps that a settings save fires must not evict this, because an ORGANIZATION write cannot
+	 * change one person's overrides — and a refetch of it costs a request most holders of
+	 * `settings.write` would not otherwise make. It still dies on an org switch, which is the one
+	 * eviction that genuinely matters here.
+	 */
+	ownSettings: (organizationId: string) =>
+		["organizations", organizationId, "pbx", "user-settings", "me"] as const,
 	/** The compile/simulate surface, which reads the whole configuration rather than one table. */
 	routingCompile: (organizationId: string) =>
 		["organizations", organizationId, "pbx", "routing", "compile"] as const,
@@ -179,6 +195,25 @@ export const queryKeys = {
 		["organizations", organizationId, "cdr", "recordings"] as const,
 	recordingList: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
 		["organizations", organizationId, "cdr", "recordings", "list", query] as const,
+
+	/**
+	 * Export jobs — the one thing in this area that IS written by the UI, and therefore the one
+	 * thing here with a real invalidation handle.
+	 *
+	 * `cdrExports` is what a create and a delete sweep. It sits under `cdr` so an org switch takes
+	 * it, and it is deliberately NOT under `cdrList`: an export does not change the call ledger, so
+	 * queuing one must not evict the page of history somebody is reading.
+	 *
+	 * The query is the last segment for the reason every list key here has one — a `status` filter
+	 * is a different answer and must never share an entry with the unfiltered list. Note that unlike
+	 * every other key in this file, entries under it are POLLED (see `useCdrExportList`), which is
+	 * the one exception to `staleTime: Infinity` in the app: a job's status changes because a worker
+	 * somewhere finished, and there is no event on the socket to hear that from.
+	 */
+	cdrExports: (organizationId: string) =>
+		["organizations", organizationId, "cdr", "exports"] as const,
+	cdrExportList: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
+		["organizations", organizationId, "cdr", "exports", "list", query] as const,
 
 	/**
 	 * The two append-only ledgers.

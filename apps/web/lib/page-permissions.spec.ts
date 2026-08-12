@@ -141,4 +141,80 @@ describe("the settings cascade screens", () => {
 	it("refuses a caller with no settings grant at all", () => {
 		expect(canAccessPage(routes.routingSettings, ["routes.read", "routes.publish"])).toBe(false);
 	});
+
+	/**
+	 * The recordings category reads on `settings.read` and writes on `recordings.configure`.
+	 *
+	 * `CATEGORY_PERMISSIONS` on the server puts the override on the WRITE alone, on the argument
+	 * that a screen which cannot show the current window cannot explain what the narrower grant
+	 * would change. So the page must be reachable for a role that holds only the read — the manager
+	 * template is exactly that role, and the assertion is what stops somebody "tightening" this
+	 * entry to `recordings.configure` and hiding the policy from everyone who cannot change it.
+	 */
+	it("opens the recording policy for a role that may read settings and not configure recordings", () => {
+		const manager = resolveRolePermissions("manager");
+		expect(getPagePermissions(routes.recordingSettings)?.permissions).toEqual(["settings.read"]);
+		expect(canAccessPage(routes.recordingSettings, manager)).toBe(true);
+		expect(manager.includes("recordings.configure")).toBe(false);
+	});
+});
+
+/**
+ * The user level of the cascade — the one page under `/settings` a self-service role can open.
+ */
+describe("my preferences", () => {
+	/**
+	 * `settings.read.own`, which is exactly what `GET /org-settings/me` is guarded with.
+	 *
+	 * The direction of `hasPermission` is what makes the choice safe rather than merely tidy: an
+	 * UNSCOPED grant covers its scopes, so an administrator holding `settings.read` reaches this
+	 * page too and nothing is hidden from them — while a scoped grant never covers the unscoped
+	 * requirement, so naming `settings.read` here would shut out a role that holds only the personal
+	 * one. The narrower requirement is therefore strictly more permissive in practice, which is the
+	 * opposite of how it reads and the reason it is asserted.
+	 */
+	it("is gated on settings.read.own, which the organization read also satisfies", () => {
+		expect(getPagePermissions(routes.mySettings)?.permissions).toEqual(["settings.read.own"]);
+		expect(canAccessPage(routes.mySettings, ["settings.read.own"])).toBe(true);
+		expect(canAccessPage(routes.mySettings, ["settings.read"])).toBe(true);
+		// …and the reverse does not hold, which is why this entry cannot say `settings.read`.
+		expect(canAccessPage(routes.settings, ["settings.read.own"])).toBe(false);
+		expect(canAccessPage(routes.mySettings, ["cdr.read"])).toBe(false);
+	});
+
+	/** Every role that manages nothing still gets its own preferences, which is the point of it. */
+	it("is reachable by a plain user, who can also write it", () => {
+		const user = resolveRolePermissions("user");
+		expect(canAccessPage(routes.mySettings, user)).toBe(true);
+		expect(user.includes("settings.write.own")).toBe(true);
+	});
+});
+
+/**
+ * Caller screening, gated by its own resource rather than by the dial plan's.
+ *
+ * The whole reason `call-block.*` exists as a separate resource is that a receptionist maintaining
+ * a blocklist should not need `routes.write`. These assertions hold the map to that: the manager
+ * template carries `call-block.read` and `call-block.write` and NOT `call-block.delete`, which is
+ * the split the API made because disabling a rule keeps its match history and deleting it destroys
+ * that.
+ */
+describe("call blocking", () => {
+	it("is gated on call-block.read alone", () => {
+		expect(getPagePermissions(routes.callBlock)?.permissions).toEqual(["call-block.read"]);
+		expect(canAccessPage(routes.callBlock, ["call-block.read"])).toBe(true);
+		expect(canAccessPage(routes.callBlock, ["routes.read", "routes.write"])).toBe(false);
+	});
+
+	it("opens for a manager, who may write a rule but not delete one", () => {
+		const manager = resolveRolePermissions("manager");
+		expect(canAccessPage(routes.callBlock, manager)).toBe(true);
+		expect(manager.includes("call-block.write")).toBe(true);
+		expect(manager.includes("call-block.delete")).toBe(false);
+	});
+
+	/** A plain user has no screening grant at all, so the nav entry is not shown to them either. */
+	it("is closed to a plain user", () => {
+		expect(canAccessPage(routes.callBlock, resolveRolePermissions("user"))).toBe(false);
+	});
 });

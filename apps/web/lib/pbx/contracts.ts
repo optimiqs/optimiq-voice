@@ -129,6 +129,43 @@ export type SipTransport = (typeof SIP_TRANSPORTS)[number];
 export const ROUTE_MATCH_KINDS = ["exact", "prefix", "regex", "any"] as const;
 export type RouteMatchKind = (typeof ROUTE_MATCH_KINDS)[number];
 
+/**
+ * Which side of a call a screening rule reads.
+ *
+ * `inbound` matches the CALLER's number, `outbound` matches the DIALED string, and `both` applies
+ * the rule to each in its own direction — which is how one row expresses "we do not talk to this
+ * number, in either direction". The three are not a display preference: the server's unique index
+ * is `(organization_id, direction, pattern)`, so the same pattern in two directions is two rows and
+ * `both` is a third, distinct one rather than a shorthand for the first two.
+ */
+export const CALL_BLOCK_DIRECTIONS = ["inbound", "outbound", "both"] as const;
+export type CallBlockDirection = (typeof CALL_BLOCK_DIRECTIONS)[number];
+
+/**
+ * What happens on a match.
+ *
+ * `allow` is NOT the absence of a rule — it is an entry that WINS over a `block` rule at the same
+ * specificity, which is the only way an allowlisted number escapes a broad prefix block. That makes
+ * it the dangerous member of this set rather than the harmless one, and it is why the API gives
+ * screening its own `call-block.write` instead of riding on `routes.write`: a grant that can write
+ * allow rules can quietly re-admit a caller the organization decided to exclude.
+ *
+ * `voicemail` carries no destination. The compiler sends the caller to the CALLEE's own mailbox —
+ * the box the dialed extension already owns — rather than to an arbitrary destination the rule
+ * picked, which is why `call_block_rule` has no destination trio and nothing in the picker points
+ * at one.
+ */
+export const CALL_BLOCK_ACTIONS = ["block", "allow", "reject", "voicemail"] as const;
+export type CallBlockAction = (typeof CALL_BLOCK_ACTIONS)[number];
+
+/**
+ * How `pattern` is read. Deliberately narrower than {@link ROUTE_MATCH_KINDS}, which also has
+ * `any`: a screening rule that matched everything would be a tenant-wide outage wearing a
+ * blocklist's name.
+ */
+export const CALL_BLOCK_MATCH_KINDS = ["exact", "prefix", "regex"] as const;
+export type CallBlockMatchKind = (typeof CALL_BLOCK_MATCH_KINDS)[number];
+
 export const IVR_OPTION_MATCH_KINDS = ["digit", "regex"] as const;
 export type IvrOptionMatchKind = (typeof IVR_OPTION_MATCH_KINDS)[number];
 
@@ -379,7 +416,25 @@ export interface TrunkRow extends EntityRow {
 	readonly codecPrefs: string | null;
 	readonly maxChannels: number | null;
 	readonly callerIdNumberOverride: string | null;
+	/**
+	 * The four columns the qualify loop writes, and the only ones on this row no request may set.
+	 *
+	 * `updateTrunkDto` excludes them deliberately — they are machine-written state, not tenant
+	 * configuration, and a PATCH that accepted them could forge a carrier outage — so a form must
+	 * never send one back. They arrive on every read because "when did this carrier last move, and
+	 * what did the media server actually say" is the first question asked of a trunk that is not
+	 * working.
+	 *
+	 * `statusChangedAt` is `null` on a trunk nothing has ever observed, which is a different fact
+	 * from `status: "unknown"` with a timestamp: the first means the pinger has not reported, the
+	 * second means it reported that it could not tell. `statusReason` is the media server's word
+	 * verbatim (`Reachable`, `Unreachable`) rather than this platform's five-member projection of
+	 * it, and `statusLatencyMs` is the qualify round trip when one was measured.
+	 */
 	readonly status: TrunkStatus;
+	readonly statusChangedAt: string | null;
+	readonly statusReason: string | null;
+	readonly statusLatencyMs: number | null;
 	readonly enabled: boolean;
 	/** Set once the trunk has been provisioned at the managed carrier; `null` for a BYO-SIP trunk. */
 	readonly carrierProvider: string | null;
@@ -651,6 +706,44 @@ export interface FeatureCodeParamField {
 export type FeatureCodeParamFields = Readonly<
 	Record<FeatureCodeAction, readonly FeatureCodeParamField[]>
 >;
+
+/**
+ * One caller-screening rule.
+ *
+ * ## `pattern` is one loose string, and that is the server's decision rather than a shortcut
+ *
+ * The column holds an exact number, a prefix, or a regular expression, and which one it is is
+ * `matchKind`'s business. The API's DTO deliberately refuses to validate the string against the
+ * kind, because the function whose opinion decides whether a rule can be ENFORCED is
+ * `compilePattern` in `@optimiq-voice/routing`, and it runs inside the write transaction: an
+ * unusable pattern is a 422 naming `pattern` that rolls the insert back, and an unanchored regex is
+ * a warning that rides out in the mutation envelope. A second regex validator here would be a
+ * second opinion, and the two would disagree on the first interesting input — so
+ * `callBlockRuleFormSchema` bounds the LENGTH and lets the compiler refuse what will not compile.
+ *
+ * ## `hitCount` and `lastHitAt` are read-only, and are the point of the screen
+ *
+ * They are counters the enforcement side writes, absent from both DTOs — `z.strictObject` means a
+ * client that sends one gets a 400 naming the field rather than a silent drop, so nothing here may
+ * put them in a request body. They are NOT secret columns: "this rule has never matched anything"
+ * is the single most useful thing a screening list can say, and hiding it would leave a stale
+ * blocklist looking identical to a working one.
+ *
+ * `lastHitAt` is `null` on a rule that has never fired, which is exactly the `hitCount: 0` case and
+ * is rendered as such rather than as a missing date.
+ */
+export interface CallBlockRuleRow extends EntityRow {
+	readonly pattern: string;
+	readonly matchKind: CallBlockMatchKind;
+	readonly direction: CallBlockDirection;
+	readonly action: CallBlockAction;
+	readonly label: string | null;
+	/** Written by enforcement, never by a request. See the note above. */
+	readonly hitCount: number;
+	/** ISO-8601, or `null` on a rule that has never matched a call. */
+	readonly lastHitAt: string | null;
+	readonly enabled: boolean;
+}
 
 export interface VoicemailBoxRow extends EntityRow {
 	readonly mailboxNumber: string;

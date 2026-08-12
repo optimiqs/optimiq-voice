@@ -221,6 +221,24 @@ export function WebhookIcon(props: IconProps) {
 }
 
 /**
+ * Caller screening: a handset with a bar through it.
+ *
+ * Deliberately not a bare "no entry" circle and not `ShieldIcon`. A shield already means SIP
+ * security — who may reach the platform at all — and a screening rule is a decision about one
+ * caller on an otherwise working connection. The handset is what says the subject is a call, and
+ * the bar is what says the list can also let one through: an `allow` rule is the same glyph's
+ * subject, and a padlock or a shield would imply a wall that only ever refuses.
+ */
+export function BlockIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<path d="M6.2 3.2h-1.7A1.5 1.5 0 0 0 3 4.8c0 8.5 7.9 16.4 16.4 16.4a1.5 1.5 0 0 0 1.6-1.5v-1.8a1 1 0 0 0-.8-1l-3-.6a1 1 0 0 0-1 .4l-.8 1.1a13.6 13.6 0 0 1-5.4-5.4l1.1-.8a1 1 0 0 0 .4-1l-.6-3a1 1 0 0 0-1-.8Z" />
+			<path d="M21 3 15 9" />
+		</Glyph>
+	);
+}
+
+/**
  * Paging: a megaphone, with the sound leaving it.
  *
  * Deliberately not a speaker or a group glyph. `UsersIcon` already means "a set of people" (ring

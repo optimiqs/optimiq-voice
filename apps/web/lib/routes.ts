@@ -35,6 +35,22 @@ export const routes = {
 	voicemail: "/voicemail",
 	conferences: "/conferences",
 	parkLots: "/park-lots",
+	/**
+	 * Caller screening — the allow/deny list.
+	 *
+	 * Its own route rather than a fifth tab of `/routing`, on exactly the precedent
+	 * {@link routes.pagingGroups} sets: the two are gated by different permissions
+	 * (`call-block.*` against `routes.*`), and a shared page would need a `PAGE_PERMISSIONS` entry
+	 * that named one of them and hid the other. `/routing`'s entry is already `mode: "any"` over
+	 * three grants, so adding a fourth would make the page reachable for a receptionist holding only
+	 * `call-block.read` and then show them four tabs the API refuses.
+	 *
+	 * The permission split is the API's and it is deliberate: `CallBlockController` argues that the
+	 * person who maintains a blocklist is whoever answered the phone, not the administrator who owns
+	 * the outbound routing table — so the screen has to be reachable without the dial plan, which a
+	 * tab of the dial plan cannot be.
+	 */
+	callBlock: "/call-block",
 	recordings: "/recordings",
 	cdr: "/cdr",
 	mediaLibrary: "/media",
@@ -77,6 +93,26 @@ export const routes = {
 	 * permission from the other four.
 	 */
 	routingSettings: "/settings/routing",
+	/**
+	 * The `recordings` category of the settings cascade — how long recorded calls are kept.
+	 *
+	 * Under `/settings` beside the other categories rather than as a panel on `/recordings`, on the
+	 * same reasoning that put the routing category here: `/recordings` is a windowed, cursor-paged
+	 * ledger gated by `recordings.read`, and this is one organization-wide policy field. They read
+	 * as the same subject and are not the same shape, and a settings form living on a ledger page
+	 * would be the only one in the app that did.
+	 */
+	recordingSettings: "/settings/recordings",
+	/**
+	 * The caller's own preferences — the user level of the settings cascade.
+	 *
+	 * A settings tab and not a route of its own, because it IS the settings area seen from one
+	 * person's end: same layout, same sub-navigation, same cascade, one level down. It is
+	 * nevertheless the only entry under `/settings` gated by a `.own` permission, which is what
+	 * makes it visible to a self-service user who can open nothing else in that area — see
+	 * `page-permissions.ts`.
+	 */
+	mySettings: "/settings/me",
 
 	/**
 	 * Detail views, for the five entities that own a child collection.

@@ -16,6 +16,9 @@
 import { z } from "zod";
 import { networkIssue, normalizeNetwork } from "./cidr";
 import {
+	CALL_BLOCK_ACTIONS,
+	CALL_BLOCK_DIRECTIONS,
+	CALL_BLOCK_MATCH_KINDS,
 	FEATURE_CODE_ACTIONS,
 	MOH_SOURCES,
 	IVR_OPTION_MATCH_KINDS,
@@ -534,6 +537,41 @@ export const pagingGroupMemberFormSchema = z.strictObject({
 	enabled: z.boolean(),
 });
 export type PagingGroupMemberFormValues = z.input<typeof pagingGroupMemberFormSchema>;
+
+/**
+ * A caller-screening rule, mirroring `apps/api/src/pbx/call-block/call-block.dto.ts`.
+ *
+ * ## `pattern` is length-bounded and nothing else, deliberately
+ *
+ * The obvious schema — a discriminated union that validates the string against `matchKind` — was
+ * the server's first draft too, and it was dropped there for a reason that applies twice as hard
+ * here. `compilePattern` in `@optimiq-voice/routing` is the function whose opinion decides whether
+ * a rule can be ENFORCED, and `compileCallBlock` runs it inside the write transaction: an
+ * uncompilable pattern is a 422 addressed at `pattern` that rolls the insert back, and an
+ * unanchored regex is a warning carried in the mutation envelope and rendered next to the field.
+ *
+ * A regex validator in the browser would be a THIRD opinion — after the compiler's and the DTO's —
+ * and the three would disagree on the first interesting input, with this one being the copy that
+ * refuses a rule the engine would happily enforce. So the bound is a LENGTH bound, matching the
+ * DTO's `min(1).max(256)`, because a regex may legitimately contain almost anything.
+ *
+ * ## What is absent, and why a strict object is what keeps it absent
+ *
+ * `hitCount` and `lastHitAt` are enforcement counters. The server's `z.strictObject` answers a
+ * client that sends one with a 400 naming the field rather than dropping it silently, so a form
+ * that offered them would fail the whole save rather than ignore two controls. `z.strictObject`
+ * here is what stops a copied block from adding them.
+ */
+export const callBlockRuleFormSchema = z.strictObject({
+	pattern: z.string().trim().min(1, "Required").max(256, "At most 256 characters"),
+	matchKind: z.enum(CALL_BLOCK_MATCH_KINDS),
+	direction: z.enum(CALL_BLOCK_DIRECTIONS),
+	action: z.enum(CALL_BLOCK_ACTIONS),
+	/** Blank clears the note; the column is `nullish` on the server and `""` would be stored. */
+	label: optionalText(128),
+	enabled: z.boolean(),
+});
+export type CallBlockRuleFormValues = z.input<typeof callBlockRuleFormSchema>;
 
 /**
  * A queue's own settings — everything the DTO calls a knob, and nothing about who answers it.

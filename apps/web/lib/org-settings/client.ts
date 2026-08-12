@@ -78,8 +78,25 @@ export interface RoutingSettings {
 	readonly emergencyNumbers: readonly string[];
 }
 
+/**
+ * The recording policy, typed.
+ *
+ * One setting, and `0` is not a missing value — it means KEEP INDEFINITELY, on exactly the terms
+ * the platform's own `CDR_RECORDING_RETENTION_DAYS` environment variable uses. The two vocabularies
+ * are identical on purpose: two spellings for one number is how a tenant sets "30" and gets a month
+ * while an operator reads "30" and expects a fortnight. So this is a plain `number` rather than a
+ * `number | null`, and the form's empty state has to be a real zero rather than a blank.
+ */
+export interface RecordingSettings {
+	readonly retentionDays: number;
+}
+
 export const NOTIFICATIONS_CATEGORY = "notifications";
 export const ROUTING_CATEGORY = "routing";
+export const RECORDINGS_CATEGORY = "recordings";
+
+/** The server's bound on `retentionDays`: ten years, and `0` for "for ever". */
+export const RECORDING_RETENTION_MAX_DAYS = 3_650;
 
 /**
  * The hangup causes the compiler will accept for `trunkContinueOnCauses`, offered as choices.
@@ -181,6 +198,107 @@ export function toRoutingSettings(data: Record<string, unknown>): RoutingSetting
 		outboundEnabled: data.outboundEnabled !== false,
 		trunkContinueOnCauses: stringList(data.trunkContinueOnCauses),
 		emergencyNumbers: stringList(data.emergencyNumbers),
+	};
+}
+
+/**
+ * Narrows the category's untyped answer to {@link RecordingSettings}.
+ *
+ * The fallback is `0` — the catalogue's own default, which means keep for ever — rather than a
+ * guessed window. Inventing a number here would be the worst possible failure of a version skew:
+ * a screen claiming this organization purges recordings after N days when nothing does.
+ *
+ * A negative or fractional value falls back too, because the column takes an integer between 0 and
+ * 3,650 and a stored value outside that is a row the server itself would resolve to the default.
+ */
+export function toRecordingSettings(data: Record<string, unknown>): RecordingSettings {
+	const value = data.retentionDays;
+	return {
+		retentionDays:
+			typeof value === "number" &&
+			Number.isInteger(value) &&
+			value >= 0 &&
+			value <= RECORDING_RETENTION_MAX_DAYS
+				? value
+				: 0,
+	};
+}
+
+// ---------------------------------------------------------------------------------------------
+// The user level of the cascade — `GET /org-settings/me`
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The categories that have at least one user-scoped setting, mirroring `USER_SCOPED_CATEGORIES`.
+ *
+ * One today, and the list is stated rather than derived from the response so the screen can render
+ * a section it knows how to word even before the request resolves — and, more usefully, so a
+ * category the server starts exposing that this build has no copy for is a visible omission rather
+ * than an untitled block of raw JSON.
+ */
+export const USER_SCOPED_CATEGORIES: readonly string[] = [NOTIFICATIONS_CATEGORY];
+
+/**
+ * The settings one person may override for themselves, in the `notifications` category.
+ *
+ * Deliberately a strict subset of {@link NotificationSettings}, and which fields are absent is the
+ * whole design. `voicemailToEmailEnabled` is the organization's kill switch and is NOT here: the
+ * per-person answer to "do I want voicemail email at all?" already lives on
+ * `voicemail_box.email_mode`, and a `user_setting` row for the same question would be a second
+ * source of truth that disagreed with the mailbox the first time somebody changed one. `fromName`
+ * and `replyTo` are not here because they are what the ORGANIZATION appears to be.
+ *
+ * What is left is exactly the two presentation preferences: whether MY notification carries a
+ * playback link and whether it carries the transcript. Neither narrows or widens anybody else's
+ * mail, and neither has a compliance dimension — the org decides whether audio may leave at all.
+ *
+ * A name the catalogue does not mark user-scoped is refused by the server with a 400 NAMING the
+ * setting rather than being written into a row the resolver would ignore for ever, so this mirror
+ * being wrong is a visible failure rather than a silent one.
+ */
+export interface OwnNotificationSettings {
+	readonly voicemailToEmailIncludeLink: boolean;
+	readonly voicemailToEmailIncludeTranscription: boolean;
+}
+
+/** `GET /org-settings/me` — every user-scoped setting, grouped by category and fully resolved. */
+export interface OwnSettingsEnvelope {
+	readonly data: Readonly<Record<string, Record<string, unknown>>>;
+}
+
+export async function fetchOwnSettings(): Promise<OwnSettingsEnvelope> {
+	return await apiFetch<OwnSettingsEnvelope>("/org-settings/me");
+}
+
+export async function patchOwnCategory(
+	category: string,
+	patch: Readonly<Record<string, unknown>>,
+): Promise<SettingCategoryMutation> {
+	return await apiFetch<SettingCategoryMutation>(
+		`/org-settings/me/categories/${encodeURIComponent(category)}`,
+		{ method: "PATCH", body: JSON.stringify(patch) },
+	);
+}
+
+/**
+ * Narrows the `notifications` block of `GET …/me` to {@link OwnNotificationSettings}.
+ *
+ * The values are RESOLVED through all three levels — code default, then the organization's row,
+ * then this person's — so a `true` here may be the organization's answer rather than one this user
+ * chose. That is the correct thing to bind a switch to: the control shows what is in force for
+ * them, and touching it writes the override that makes it theirs.
+ *
+ * The fallbacks repeat the catalogue's own defaults rather than inventing new ones, on the same
+ * terms as {@link toNotificationSettings}: the API always sends every user-scoped name, so they are
+ * belt-and-braces against a version skew rather than an expected path.
+ */
+export function toOwnNotificationSettings(
+	data: Readonly<Record<string, Record<string, unknown>>>,
+): OwnNotificationSettings {
+	const category = data[NOTIFICATIONS_CATEGORY] ?? {};
+	return {
+		voicemailToEmailIncludeLink: category.voicemailToEmailIncludeLink !== false,
+		voicemailToEmailIncludeTranscription: category.voicemailToEmailIncludeTranscription !== false,
 	};
 }
 

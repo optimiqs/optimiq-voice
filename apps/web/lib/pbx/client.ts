@@ -18,6 +18,7 @@ import type {
 	AuditCursorEnvelope,
 	AuditLogEntryRow,
 	AuditLogQueryParams,
+	CallBlockRuleRow,
 	CompileResult,
 	ConferencePinState,
 	ConferenceRow,
@@ -186,6 +187,41 @@ export const PBX_RESOURCES = {
 			delete: "feature-codes.delete",
 		},
 		displayName: (row) => (row.label ? `${row.code} · ${row.label}` : row.code),
+	}),
+	/**
+	 * Caller screening — the allow/deny list the engine has been honouring since `checkCallBlock`.
+	 *
+	 * `call-block.*` and NOT `routes.*`, which is the controller's own division and the reason this
+	 * is a resource rather than a fifth routing tab: the person who maintains a screening list is
+	 * whoever answered the phone — a receptionist adding the number that called nine times this
+	 * morning — and riding it on `routes.write` would mean the only way to let somebody block a
+	 * number is to hand them the dial plan. It cuts the other way too, and that is the half that
+	 * decided it: an `allow` rule lifts a number OUT of a broad prefix block, which is a power worth
+	 * naming in an audit row of its own rather than burying inside "edited routing".
+	 *
+	 * Three grants and not two. `delete` is split from `write` because disabling a rule and deleting
+	 * it are not the same act here: `enabled: false` leaves the row, its `hitCount` and its
+	 * `lastHitAt` in place — the evidence that this number was calling — and deleting it destroys
+	 * that. The same argument `security.delete` lost, decided the other way, because a security ACL
+	 * entry carries no history and a screening rule does.
+	 *
+	 * `affectsRouting: true` — `call_block_rule` IS in `ROUTING_TABLE_TO_ENTITY`, so every save here
+	 * recompiles the tenant's artifact inside the write transaction and the next call is screened
+	 * against it. `contracts.spec.ts` holds that against the routing package rather than trusting
+	 * this comment.
+	 */
+	callBlockRules: descriptor<CallBlockRuleRow>({
+		key: "call-block-rules",
+		affectsRouting: true,
+		path: "/call-block-rules",
+		label: "screening rule",
+		labelPlural: "Call blocking",
+		permissions: {
+			read: "call-block.read",
+			write: "call-block.write",
+			delete: "call-block.delete",
+		},
+		displayName: (row) => (row.label ? `${row.pattern} · ${row.label}` : row.pattern),
 	}),
 	ivrMenus: descriptor<IvrMenuRow>({
 		key: "ivr-menus",

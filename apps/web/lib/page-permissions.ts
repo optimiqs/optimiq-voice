@@ -47,6 +47,19 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, PageRequirement>> = {
 	 */
 	[routes.pagingGroups]: { permissions: ["paging-groups.read"] },
 	[routes.queues]: { permissions: ["queues.read"] },
+	/**
+	 * Caller screening.
+	 *
+	 * `call-block.read` alone, which is what `CallBlockController` guards its list and its get with.
+	 * There is no `.own` variant and there should not be: a screening list is one organization-wide
+	 * table, not a per-person one, and "the rules I wrote" is a question the audit log answers.
+	 *
+	 * Writing is `call-block.write` and deleting is `call-block.delete`; both are gated inside the
+	 * page with `usePermission` rather than here, because a role that can SEE which numbers are
+	 * screened and not change them is a real role — an operator reading the call history needs the
+	 * blocklist beside it to make sense of a call that never arrived.
+	 */
+	[routes.callBlock]: { permissions: ["call-block.read"] },
 	[routes.voicemail]: { permissions: ["voicemail.read", "voicemail.read.own"] },
 	[routes.conferences]: { permissions: ["conferences.read"] },
 	/**
@@ -133,6 +146,33 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, PageRequirement>> = {
 	 * and these are the settings a live call is compiled from.
 	 */
 	[routes.routingSettings]: { permissions: ["settings.read"] },
+	/**
+	 * The recording retention policy.
+	 *
+	 * `settings.read`, because that is what the category READ is guarded with. It is deliberately
+	 * not `recordings.configure`, even though that is the grant the save needs: `CATEGORY_PERMISSIONS`
+	 * on the server puts the override on the WRITE alone, on the argument that the retention window
+	 * is not itself sensitive and a settings screen that cannot show the current window cannot
+	 * explain what `recordings.configure` would change. So the page opens for anyone who can read
+	 * settings and renders read-only without the narrower grant.
+	 */
+	[routes.recordingSettings]: { permissions: ["settings.read"] },
+	/**
+	 * The caller's own preferences.
+	 *
+	 * `settings.read.own`, which is exactly what `GET /org-settings/me` is guarded with, and the
+	 * only entry in this map that names a `.own` grant on its own.
+	 *
+	 * It reads like the tightest entry here and is in fact the loosest, because of which way
+	 * `hasPermission` substitutes: an UNSCOPED grant covers its scopes, so everyone holding
+	 * `settings.read` reaches this page as well, while a scoped grant never covers the unscoped
+	 * requirement — so naming `settings.read` here would shut out a role that holds only the
+	 * personal one, on the one page in this area that is about them.
+	 *
+	 * Saving needs `settings.write.own` and is gated inside the page, not here: a role that may see
+	 * what is in force for it and not change it should see it.
+	 */
+	[routes.mySettings]: { permissions: ["settings.read.own"] },
 };
 
 /** True when `path` matches `pattern`, treating any `[segment]` in the pattern as a wildcard. */

@@ -639,8 +639,20 @@ async function main(): Promise<void> {
 			`/ring-groups/${ringGroupId}`,
 			`/queues/${seededQueueId}`,
 			`/routing/time-conditions/${timeConditionId}`,
-			// A settings sub-screen, which is a real route rather than a tab.
+			// Caller screening, gated by `call-block.read` — a route of its own rather than a fifth
+			// tab of `/routing`, because the two are gated by different resources. The owner used
+			// here holds it.
+			"/call-block",
+			// The settings sub-screens, which are real routes rather than tabs.
 			"/settings/emergency-addresses",
+			// The `recordings` category of the settings cascade. Reads on `settings.read` and saves
+			// on `recordings.configure` — the only category with a per-category permission override,
+			// so a 200 here proves the read side of that split as well as the route.
+			"/settings/recordings",
+			// The user level of the cascade, gated by `settings.read.own`. It renders before its
+			// first request resolves, so a 200 proves the route and the shell; the `GET …/me`
+			// contract is exercised below.
+			"/settings/me",
 			// The SIP security area and its second tab. The auth-failure ledger is only reachable —
 			// and only renderable — through the query state, so a tab that 404s or crashes would
 			// otherwise be invisible to a route list. Both are gated by `security.read`, which the
@@ -1935,6 +1947,14 @@ async function main(): Promise<void> {
 		// --- 17. devices: the provisioning contract, as the screen builds it ------------------------
 		console.log("\n17. devices and provisioning");
 		await runDeviceChecks(client);
+
+		// --- 18. caller screening: the CRUD the call-block screen is built on ------------------------
+		console.log("\n18. call blocking");
+		await runCallBlockChecks(client);
+
+		// --- 19. the settings cascade's two new surfaces --------------------------------------------
+		console.log("\n19. recording retention and the user cascade");
+		await runSettingsCascadeChecks(client);
 	} finally {
 		next?.kill("SIGTERM");
 		apiProcess.kill("SIGTERM");
@@ -2089,3 +2109,197 @@ function firstId(response: JsonResponse): string {
 }
 
 await main();
+
+/**
+ * Caller screening, exercised with the exact bodies `call-block-rule-dialog.tsx` builds.
+ *
+ * The claims worth making here are the three no unit test can reach, and all three are about the
+ * DTO's deliberate refusals rather than about the happy path:
+ *
+ * 1. The pattern is validated by the ROUTER, not by the schema. An uncompilable regex has to be a
+ *    refusal that ROLLS BACK and addresses `pattern`, because the form renders it on that field —
+ *    a 422 that maps to no field is a form that shows nothing.
+ * 2. `hitCount` and `lastHitAt` are refused with a 400 rather than dropped, which is why the form
+ *    must not send them "for completeness": it would fail every save.
+ * 3. Both come back on every read, because "this rule has never matched anything" is the one thing
+ *    a screening list can say that no other column can.
+ */
+async function runCallBlockChecks(client: Client): Promise<void> {
+	const pattern = `+1999${RUN_DIGITS}`.slice(0, 16);
+	const created = await client("POST", "/api/v1/call-block-rules", {
+		pattern,
+		matchKind: "exact",
+		direction: "inbound",
+		action: "block",
+		label: "Smoke screening rule",
+		enabled: true,
+	});
+	const ruleId = rowId(created);
+	check(
+		"the create body the screening dialog builds is accepted",
+		created.status === 201 && data(created).pattern === pattern,
+		`status ${created.status}`,
+	);
+
+	check(
+		"and the row comes back with the two counters the screen renders as evidence",
+		data(created).hitCount === 0 && data(created).lastHitAt === null,
+		`hitCount ${String(data(created).hitCount)}, lastHitAt ${String(data(created).lastHitAt)}`,
+	);
+
+	/**
+	 * The counters are enforcement's. A form that offered them would not be ignored — it would be
+	 * refused, which is why this is a 400 and not a silently dropped key.
+	 */
+	const forged = await client("PATCH", `/api/v1/call-block-rules/${ruleId}`, { hitCount: 400 });
+	check(
+		"a forged hit counter is refused by the DTO rather than dropped",
+		forged.status === 400,
+		`status ${forged.status}`,
+	);
+
+	/**
+	 * The pattern box has no client-side regex check precisely because this refusal exists. It has
+	 * to roll back and it has to name the field, or the dialog renders an error nowhere.
+	 */
+	const uncompilable = await client("POST", "/api/v1/call-block-rules", {
+		pattern: "(",
+		matchKind: "regex",
+		direction: "inbound",
+		action: "block",
+		enabled: true,
+	});
+	const patternErrors = pbxFieldErrors(asApiError(uncompilable));
+	check(
+		"an uncompilable expression is refused and the message lands on the pattern field",
+		uncompilable.status >= 400 && Boolean(patternErrors.pattern),
+		`status ${uncompilable.status}, fields ${Object.keys(patternErrors).join(",") || "none"}`,
+	);
+
+	const listed = await client("GET", "/api/v1/call-block-rules?page=1&limit=25");
+	const rows = Array.isArray(listed.body.data)
+		? (listed.body.data as Record<string, unknown>[])
+		: [];
+	check(
+		"the list is the paged envelope the shared list scaffold reads",
+		listed.status === 200 &&
+			typeof listed.body.total === "number" &&
+			rows.some((row) => row.id === ruleId),
+		`status ${listed.status}, ${rows.length} rows`,
+	);
+
+	/**
+	 * The direction is part of the identity — the unique index is `(organization, direction,
+	 * pattern)` — so the same number screened outbound is a second row rather than a conflict. The
+	 * form offers three directions on exactly that basis.
+	 */
+	const outbound = await client("POST", "/api/v1/call-block-rules", {
+		pattern,
+		matchKind: "exact",
+		direction: "outbound",
+		action: "block",
+		enabled: true,
+	});
+	const duplicate = await client("POST", "/api/v1/call-block-rules", {
+		pattern,
+		matchKind: "exact",
+		direction: "inbound",
+		action: "allow",
+		enabled: true,
+	});
+	check(
+		"the same pattern in another direction is a new row, and in the same direction a conflict",
+		outbound.status === 201 && duplicate.status === 409,
+		`outbound ${outbound.status}, duplicate ${duplicate.status}`,
+	);
+
+	await client("DELETE", `/api/v1/call-block-rules/${rowId(outbound)}`);
+	const removed = await client("DELETE", `/api/v1/call-block-rules/${ruleId}`);
+	check(
+		"a screening rule deletes cleanly — nothing in the dial plan can point at one",
+		removed.status === 200,
+		`status ${removed.status}`,
+	);
+}
+
+/**
+ * The `recordings` settings category and the user level of the cascade.
+ *
+ * Two surfaces, one contract shape, and the interesting claims are about the vocabulary rather than
+ * about the round trip: `0` has to mean KEEP FOR EVER on the wire the way the screen says it does,
+ * and `PATCH …/me` has to REFUSE an organization-level name by naming it rather than writing a row
+ * the resolver would ignore for ever.
+ */
+async function runSettingsCascadeChecks(client: Client): Promise<void> {
+	const read = await client("GET", "/api/v1/org-settings/categories/recordings");
+	check(
+		"the recordings category resolves with retentionDays present, defaulting to keep-for-ever",
+		read.status === 200 && typeof data(read).retentionDays === "number",
+		`status ${read.status}, retentionDays ${String(data(read).retentionDays)}`,
+	);
+
+	const saved = await client("PATCH", "/api/v1/org-settings/categories/recordings", {
+		retentionDays: 30,
+	});
+	check(
+		"the retention window saves through the category facade the form uses",
+		saved.status === 200 && data(saved).retentionDays === 30,
+		`status ${saved.status}`,
+	);
+
+	/** `0` is a value, not an absence — the same vocabulary `CDR_RECORDING_RETENTION_DAYS` uses. */
+	const forever = await client("PATCH", "/api/v1/org-settings/categories/recordings", {
+		retentionDays: 0,
+	});
+	const outOfRange = await client("PATCH", "/api/v1/org-settings/categories/recordings", {
+		retentionDays: 3_651,
+	});
+	check(
+		"zero is accepted as keep-for-ever and the ten-year ceiling is enforced",
+		forever.status === 200 && data(forever).retentionDays === 0 && outOfRange.status === 400,
+		`zero ${forever.status}, over ${outOfRange.status}`,
+	);
+
+	const own = await client("GET", "/api/v1/org-settings/me");
+	const ownData = data(own);
+	const notifications = (ownData.notifications ?? {}) as Record<string, unknown>;
+	check(
+		"GET /org-settings/me answers grouped by category with the user-scoped names resolved",
+		own.status === 200 &&
+			typeof notifications.voicemailToEmailIncludeLink === "boolean" &&
+			typeof notifications.voicemailToEmailIncludeTranscription === "boolean",
+		`status ${own.status}, categories ${Object.keys(ownData).join(",") || "none"}`,
+	);
+
+	const savedOwn = await client("PATCH", "/api/v1/org-settings/me/categories/notifications", {
+		voicemailToEmailIncludeLink: false,
+		voicemailToEmailIncludeTranscription: true,
+	});
+	check(
+		"the two preferences the page renders save as a user-level override",
+		savedOwn.status === 200 && data(savedOwn).voicemailToEmailIncludeLink === false,
+		`status ${savedOwn.status}`,
+	);
+
+	/**
+	 * The refusal that keeps this page honest. An organization-level name sent to the user endpoint
+	 * is a 400 NAMING the setting rather than a `user_setting` row the resolver would ignore for
+	 * ever — which is why the page renders only the two the catalogue marks user-scoped, and why a
+	 * third control would be a visible failure rather than a silent one.
+	 */
+	const refused = await client("PATCH", "/api/v1/org-settings/me/categories/notifications", {
+		voicemailToEmailEnabled: false,
+	});
+	const refusedFields = pbxFieldErrors(asApiError(refused));
+	check(
+		"an organization-level setting sent to the user endpoint is refused and named",
+		refused.status === 400 && Boolean(refusedFields.voicemailToEmailEnabled),
+		`status ${refused.status}, fields ${Object.keys(refusedFields).join(",") || "none"}`,
+	);
+
+	// Put the organization back where the fixture left it, so a second run starts clean.
+	await client("PATCH", "/api/v1/org-settings/me/categories/notifications", {
+		voicemailToEmailIncludeLink: true,
+		voicemailToEmailIncludeTranscription: true,
+	});
+}

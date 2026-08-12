@@ -2,6 +2,7 @@
 
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo, useState } from "react";
+import { queueTopic } from "~/lib/live/protocol";
 import {
 	applySnapshot,
 	applyUpdate,
@@ -12,16 +13,17 @@ import {
 	parseAgentState,
 	parseChannel,
 	parseRegistration,
+	parseTrunkStatusEvent,
 	type LiveAgentState,
 	type LiveChannel,
 	type LiveKvState,
 	type LiveRegistration,
+	type LiveTrunkStatus,
 } from "~/lib/live/store";
-import { queueTopic } from "~/lib/live/protocol";
 import { PBX_RESOURCES } from "~/lib/pbx/client";
 import { queryKeys } from "~/lib/query-keys";
-import { useActiveOrganization, usePermission } from "../_context/session-context";
 import { useLiveTopic } from "../_context/live-context";
+import { useActiveOrganization, usePermission } from "../_context/session-context";
 import type { LiveSnapshotEvent, LiveUpdateEvent } from "~/lib/live/client";
 
 /**
@@ -225,7 +227,11 @@ export function useLiveAgentStates(): LiveAgentStatesResult {
 
 export interface LiveQueueResult {
 	/** Callers currently waiting, keyed by call id, oldest first. */
-	readonly waiting: readonly { readonly callId: string; readonly since: string; readonly callerNumber?: string }[];
+	readonly waiting: readonly {
+		readonly callId: string;
+		readonly since: string;
+		readonly callerNumber?: string;
+	}[];
 	readonly loaded: boolean;
 	readonly permitted: boolean;
 }
@@ -280,9 +286,13 @@ export function useLiveQueue(queueId: string | null): LiveQueueResult {
 		}
 	}, []);
 
-	useLiveTopic(queueId === null ? null : queueTopic(queueId), { onUpdate }, {
-		enabled: permitted,
-	});
+	useLiveTopic(
+		queueId === null ? null : queueTopic(queueId),
+		{ onUpdate },
+		{
+			enabled: permitted,
+		},
+	);
 
 	return { waiting, loaded, permitted };
 }
@@ -362,4 +372,73 @@ export function useLiveVoicemail(): LiveVoicemailResult {
 	useLiveTopic("voicemail", { onUpdate }, { enabled: permitted });
 
 	return { counts, permitted };
+}
+
+// ---------------------------------------------------------------------------------------------
+// trunks
+// ---------------------------------------------------------------------------------------------
+
+export interface LiveTrunksResult {
+	/** Keyed by `trunk.id`. Empty until a carrier moves while the page is open. */
+	readonly statuses: ReadonlyMap<string, LiveTrunkStatus>;
+	readonly permitted: boolean;
+}
+
+/**
+ * Live trunk status, from `trunk.status.changed`.
+ *
+ * ## The map starts EMPTY, and overlays rather than replaces
+ *
+ * Exactly the voicemail shape, and for the same reason stated one topic over: there is no KV
+ * projection behind `trunks`, so there is no snapshot frame and the socket can only say what
+ * CHANGED while the page was open. The statuses a screen renders come from the HTTP list — the
+ * `trunk.status*` columns, which the API's durable consumer writes — and this map overlays the ones
+ * that have moved since. A caller reads `statuses.get(id) ?? row`, which is correct before any
+ * event and after one.
+ *
+ * Building a bucket to make a snapshot possible was the alternative, and the server rejected it on
+ * the grounds that it would be a third copy of a fact the columns hold and the list already
+ * returned.
+ *
+ * ## Why this does NOT invalidate the trunk list, where `useLiveAgentStates` does
+ *
+ * The agent case invalidates because the socket only knows the STATUS changed while the row carries
+ * `statusChangedAt` and everything else the table renders — only the server can say what those are
+ * now. Here the event carries all four of them: the status, the reason, the latency and the moment.
+ * There is nothing the row would tell us that the frame has not, so a refetch would be a request
+ * per carrier transition that returned what is already on screen — and a flapping peer would turn
+ * into list traffic. The persisted columns converge on their own through the API's consumer, and
+ * the next natural read picks them up.
+ *
+ * The consequence is stated rather than hidden: this overlay is per tab and does not survive a
+ * reload, which is fine, because after a reload the columns are the answer.
+ */
+export function useLiveTrunks(): LiveTrunksResult {
+	const permitted = usePermission("trunks.read");
+	const [statuses, setStatuses] = useState<ReadonlyMap<string, LiveTrunkStatus>>(() => new Map());
+
+	const onUpdate = useCallback((event: LiveUpdateEvent) => {
+		if (event.kind !== "status.changed") {
+			return;
+		}
+		const parsed = parseTrunkStatusEvent(event.data, event.at);
+		if (parsed === undefined) {
+			return;
+		}
+		setStatuses((previous) => {
+			const held = previous.get(parsed.trunkId);
+			// Same object back when nothing moved, so a republished transition does not re-render the
+			// whole table — the rule `applyUpdate` follows for the KV topics.
+			if (held?.status === parsed.status && held.at === parsed.at) {
+				return previous;
+			}
+			const next = new Map(previous);
+			next.set(parsed.trunkId, parsed);
+			return next;
+		});
+	}, []);
+
+	useLiveTopic("trunks", { onUpdate }, { enabled: permitted });
+
+	return { statuses, permitted };
 }

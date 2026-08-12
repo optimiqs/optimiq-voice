@@ -1,6 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import {
 	AUDIT_ACTOR_TYPES as SERVER_AUDIT_ACTOR_TYPES,
+	CALL_BLOCK_ACTIONS as SERVER_CALL_BLOCK_ACTIONS,
+	CALL_BLOCK_DIRECTIONS as SERVER_CALL_BLOCK_DIRECTIONS,
+	CALL_BLOCK_MATCH_KINDS as SERVER_CALL_BLOCK_MATCH_KINDS,
 	DESTINATION_TARGET_TABLES as SERVER_TARGET_TABLES,
 	DESTINATION_TYPE_KINDS as SERVER_TYPE_KINDS,
 	DESTINATION_TYPES as SERVER_DESTINATION_TYPES,
@@ -29,6 +32,9 @@ import {
 import { PBX_CHILDREN, PBX_RESOURCES } from "./client";
 import {
 	AUDIT_ACTOR_TYPES,
+	CALL_BLOCK_ACTIONS,
+	CALL_BLOCK_DIRECTIONS,
+	CALL_BLOCK_MATCH_KINDS,
 	DESTINATION_TYPE_KINDS,
 	DESTINATION_TYPES,
 	FEATURE_CODE_ACTIONS,
@@ -100,6 +106,30 @@ describe("closed sets mirrored from @optimiq-voice/pbx-db", () => {
 
 	it("route match kinds match", () => {
 		expect(ROUTE_MATCH_KINDS).toEqual([...SERVER_ROUTE_MATCH_KINDS]);
+	});
+
+	/**
+	 * The three closed sets a screening rule is built from.
+	 *
+	 * `CALL_BLOCK_ACTIONS` is the one worth failing loudly on, and the reason is which member does
+	 * what: `allow` WINS over `block` at the same specificity, so a select that offered the four in
+	 * a drifted order — or dropped one — would be the control by which somebody re-admits a caller
+	 * the organization decided to exclude, or fails to.
+	 *
+	 * `CALL_BLOCK_MATCH_KINDS` is deliberately NOT `ROUTE_MATCH_KINDS`: it has no `any`, because a
+	 * screening rule that matched everything would be a tenant-wide outage. Comparing them
+	 * separately is what stops the two lists being "tidied" into one.
+	 */
+	it("call block directions, actions and match kinds match, in order", () => {
+		expect(CALL_BLOCK_DIRECTIONS).toEqual([...SERVER_CALL_BLOCK_DIRECTIONS]);
+		expect(CALL_BLOCK_ACTIONS).toEqual([...SERVER_CALL_BLOCK_ACTIONS]);
+		expect(CALL_BLOCK_MATCH_KINDS).toEqual([...SERVER_CALL_BLOCK_MATCH_KINDS]);
+	});
+
+	/** Stated on its own, because "they are both match kinds" is exactly the tidy-up to prevent. */
+	it("keeps `any` out of the screening match kinds that routes have", () => {
+		expect(ROUTE_MATCH_KINDS).toContain("any");
+		expect([...CALL_BLOCK_MATCH_KINDS]).not.toContain("any");
 	});
 
 	it("IVR option match kinds match", () => {
@@ -310,6 +340,14 @@ const RESOURCE_TABLES: Readonly<Record<string, string>> = {
 	"sip-acl-entries": "sip_acl_entry",
 	"paging-groups": "paging_group",
 	webhooks: "webhook_subscription",
+	/**
+	 * A screening rule IS a routing input — the compiler builds `checkCallBlock`'s tables from it and
+	 * all three resolution paths consult them — so a save here republishes the artifact and the
+	 * compile panel has to say so. That it is nevertheless gated by `call-block.*` rather than
+	 * `routes.*` is a statement about who maintains it, not about what it feeds; the two questions
+	 * are answered in different places on purpose, and this map only answers the second.
+	 */
+	"call-block-rules": "call_block_rule",
 };
 
 const CHILD_TABLES: Readonly<Record<string, string>> = {
@@ -382,6 +420,19 @@ describe("affectsRouting, mirrored from @optimiq-voice/routing", () => {
 	it("says a dispatchable location is a routing input", () => {
 		expect(PBX_RESOURCES.emergencyAddresses.affectsRouting).toBe(true);
 		expect(SERVER_ROUTING_TABLES.emergency_address).toBe("emergencyAddresses");
+	});
+
+	/**
+	 * Screening, stated on its own for the same reason hold music is: the claim is easy to get
+	 * backwards from the permission. `call-block.*` is a resource of its own precisely BECAUSE the
+	 * people who maintain a blocklist are not the people who own the dial plan — which reads like
+	 * "not a routing input" and is the opposite of true. Every rule saved here is compiled into the
+	 * artifact inside the write transaction, so the compile view must be evicted with it.
+	 */
+	it("says a screening rule recompiles, even though it is not gated by routes.*", () => {
+		expect(PBX_RESOURCES.callBlockRules.affectsRouting).toBe(true);
+		expect(SERVER_ROUTING_TABLES.call_block_rule).toBeTruthy();
+		expect(PBX_RESOURCES.callBlockRules.permissions.read).toBe("call-block.read");
 	});
 
 	it("says a queue recompiles and its agents and tiers do not", () => {

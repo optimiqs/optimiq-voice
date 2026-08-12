@@ -3,10 +3,15 @@ import { queryKeys } from "../query-keys";
 import {
 	changedSettings,
 	NOTIFICATIONS_CATEGORY,
+	RECORDING_RETENTION_MAX_DAYS,
+	RECORDINGS_CATEGORY,
 	RETRYABLE_HANGUP_CAUSES,
 	ROUTING_CATEGORY,
 	toNotificationSettings,
+	toOwnNotificationSettings,
+	toRecordingSettings,
 	toRoutingSettings,
+	USER_SCOPED_CATEGORIES,
 } from "./client";
 import {
 	EMPTY_ROUTING_FORM,
@@ -53,9 +58,109 @@ const RESOLVED: Record<string, unknown> = {
 
 describe("category constants", () => {
 	/** These strings are the URL. A typo is a 404 the screen renders as an empty form. */
-	it("names the two catalogued categories exactly as the API does", () => {
+	it("names the three catalogued categories exactly as the API does", () => {
 		expect(NOTIFICATIONS_CATEGORY).toBe("notifications");
 		expect(ROUTING_CATEGORY).toBe("routing");
+		expect(RECORDINGS_CATEGORY).toBe("recordings");
+	});
+
+	/**
+	 * The categories `GET …/me` iterates, mirroring `USER_SCOPED_CATEGORIES`.
+	 *
+	 * `recordings` is deliberately NOT among them and must never join by accident: retention of
+	 * recorded calls is a compliance posture, and no individual's preference may shorten or extend
+	 * how long the organization keeps evidence. `routing` is out for a different reason — the
+	 * compiler reads those names into ONE artifact per tenant, so a per-user override would be a
+	 * value saved, shown, and observed by no call.
+	 */
+	it("exposes only the category that genuinely has a user level", () => {
+		expect([...USER_SCOPED_CATEGORIES]).toEqual([NOTIFICATIONS_CATEGORY]);
+		expect([...USER_SCOPED_CATEGORIES]).not.toContain(RECORDINGS_CATEGORY);
+		expect([...USER_SCOPED_CATEGORIES]).not.toContain(ROUTING_CATEGORY);
+	});
+});
+
+/**
+ * The recording policy, whose whole surface is one integer and whose whole risk is what that
+ * integer means.
+ */
+describe("toRecordingSettings", () => {
+	/**
+	 * `0` is "keep for ever", on exactly the terms `CDR_RECORDING_RETENTION_DAYS` uses. It is the
+	 * catalogue's default, so it is also what a tenant that has never opened the screen resolves to
+	 * — which means the fallback and the real value are indistinguishable here, and correctly so.
+	 */
+	it("reads zero as a real value rather than as an absence", () => {
+		expect(toRecordingSettings({ retentionDays: 0 })).toEqual({ retentionDays: 0 });
+		expect(toRecordingSettings({ retentionDays: 30 })).toEqual({ retentionDays: 30 });
+	});
+
+	/**
+	 * Never invent a window. A guessed number is the worst possible outcome of a version skew: a
+	 * screen claiming this organization purges after N days when nothing does, which somebody may
+	 * report to an auditor.
+	 */
+	it("falls back to keep-for-ever rather than to a guessed window", () => {
+		expect(toRecordingSettings({})).toEqual({ retentionDays: 0 });
+		expect(toRecordingSettings({ retentionDays: "30" })).toEqual({ retentionDays: 0 });
+		expect(toRecordingSettings({ retentionDays: -1 })).toEqual({ retentionDays: 0 });
+		expect(toRecordingSettings({ retentionDays: 1.5 })).toEqual({ retentionDays: 0 });
+	});
+
+	it("holds the server's ten-year ceiling", () => {
+		expect(RECORDING_RETENTION_MAX_DAYS).toBe(3_650);
+		expect(toRecordingSettings({ retentionDays: 3_650 })).toEqual({ retentionDays: 3_650 });
+		expect(toRecordingSettings({ retentionDays: 3_651 })).toEqual({ retentionDays: 0 });
+	});
+});
+
+/**
+ * The user level of the cascade.
+ *
+ * `GET …/me` answers with every user-scoped category grouped by name, already resolved through all
+ * three levels — so what these assert is that the narrowing reads the right block, and that the
+ * fallbacks repeat the catalogue's defaults rather than inventing an answer.
+ */
+describe("toOwnNotificationSettings", () => {
+	it("reads the notifications block and defaults both switches on", () => {
+		expect(toOwnNotificationSettings({})).toEqual({
+			voicemailToEmailIncludeLink: true,
+			voicemailToEmailIncludeTranscription: true,
+		});
+		expect(
+			toOwnNotificationSettings({
+				notifications: {
+					voicemailToEmailIncludeLink: false,
+					voicemailToEmailIncludeTranscription: true,
+				},
+			}),
+		).toEqual({
+			voicemailToEmailIncludeLink: false,
+			voicemailToEmailIncludeTranscription: true,
+		});
+	});
+
+	/**
+	 * The organization's kill switch may legitimately be present in the resolved block, because the
+	 * cascade resolves the WHOLE category. It must not leak into the shape this screen binds to:
+	 * only the two the catalogue marks user-scoped are writable through `PATCH …/me`, and a form
+	 * that sent a third would be refused with a 400 naming it.
+	 */
+	it("takes only the two user-scoped names, never the organization's own settings", () => {
+		const narrowed = toOwnNotificationSettings({
+			notifications: {
+				voicemailToEmailEnabled: false,
+				fromName: "Acme",
+				voicemailToEmailIncludeLink: true,
+				voicemailToEmailIncludeTranscription: false,
+			},
+		});
+
+		expect(Object.keys(narrowed).sort()).toEqual([
+			"voicemailToEmailIncludeLink",
+			"voicemailToEmailIncludeTranscription",
+		]);
+		expect(narrowed.voicemailToEmailIncludeTranscription).toBe(false);
 	});
 });
 
@@ -355,5 +460,36 @@ describe("query keys", () => {
 	/** Not organization-scoped: the catalogue describes the deployment's code, not the tenant. */
 	it("keeps the catalogue out of the organization scope", () => {
 		expect(queryKeys.orgSettingsCatalog()).toEqual(["pbx", "org-settings-catalog"]);
+	});
+
+	/**
+	 * The user level gets its own key, outside `org-settings`.
+	 *
+	 * Two properties, and both are what stops a settings save from touching it: it does not sit
+	 * under the `org-settings` prefix any category invalidation reaches, and it carries no category
+	 * segment because `GET …/me` answers with every user-scoped category at once. It DOES sit under
+	 * the organization, so an org switch takes it — a cached copy of the previous tenant's
+	 * preferences is the one eviction here that genuinely matters.
+	 */
+	it("files the caller's own preferences outside the org-settings prefix but inside the org", () => {
+		const own = queryKeys.ownSettings("org-1");
+
+		expect(own).toEqual(["organizations", "org-1", "pbx", "user-settings", "me"]);
+		expect(own.slice(0, 2)).toEqual(["organizations", "org-1"]);
+		expect(own).not.toContain("org-settings");
+		for (const category of [NOTIFICATIONS_CATEGORY, ROUTING_CATEGORY, RECORDINGS_CATEGORY]) {
+			expect(own).not.toEqual(queryKeys.orgSettingsCategory("org-1", category));
+		}
+	});
+
+	/** The recordings category is a third entry, not a share of the notifications one. */
+	it("gives the recordings category a cache entry of its own", () => {
+		expect(queryKeys.orgSettingsCategory("org-1", RECORDINGS_CATEGORY)).toEqual([
+			"organizations",
+			"org-1",
+			"pbx",
+			"org-settings",
+			"recordings",
+		]);
 	});
 });

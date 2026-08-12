@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+	callBlockRuleFormSchema,
 	conferenceFormSchema,
 	dialableString,
 	e164,
@@ -648,6 +649,98 @@ describe("pagingGroupMemberFormSchema", () => {
 		expect(pagingGroupMemberFormSchema.safeParse({ ...base, timeoutSeconds: "10" }).success).toBe(
 			false,
 		);
+	});
+});
+
+/**
+ * The screening rule, where what the schema does NOT do is the whole design.
+ *
+ * `pattern` is bounded by length and by nothing else, because `compilePattern` runs inside the
+ * server's write transaction and is the only opinion that decides whether a rule can be enforced.
+ * These tests pin that absence: a regex the browser refuses is a rule the engine would have
+ * happily enforced, and a form that refused it would be lying about what the platform accepts.
+ */
+describe("callBlockRuleFormSchema", () => {
+	const base = {
+		pattern: "+12125550100",
+		matchKind: "exact" as const,
+		direction: "inbound" as const,
+		action: "block" as const,
+		label: "",
+		enabled: true,
+	};
+
+	it("takes an exact number, a prefix and a regular expression through the same field", () => {
+		expect(callBlockRuleFormSchema.safeParse(base).success).toBe(true);
+		expect(
+			callBlockRuleFormSchema.safeParse({ ...base, matchKind: "prefix", pattern: "+1212555" })
+				.success,
+		).toBe(true);
+		expect(
+			callBlockRuleFormSchema.safeParse({
+				...base,
+				matchKind: "regex",
+				pattern: "^\\+1212555\\d{4}$",
+			}).success,
+		).toBe(true);
+	});
+
+	/**
+	 * The rule this schema deliberately does not have. A regex is legal against `matchKind: "exact"`
+	 * as far as the edge is concerned — the compiler will treat it as a literal and say so — and a
+	 * client-side pairing check would refuse a save the server accepts.
+	 */
+	it("does not check the pattern against the match kind; the compiler does that", () => {
+		expect(
+			callBlockRuleFormSchema.safeParse({ ...base, matchKind: "exact", pattern: "^\\+1[0-9]+$" })
+				.success,
+		).toBe(true);
+		expect(
+			callBlockRuleFormSchema.safeParse({ ...base, matchKind: "regex", pattern: "(" }).success,
+		).toBe(true);
+	});
+
+	it("holds the pattern to the server's 1 and 256", () => {
+		expect(callBlockRuleFormSchema.safeParse({ ...base, pattern: "" }).success).toBe(false);
+		expect(callBlockRuleFormSchema.safeParse({ ...base, pattern: "   " }).success).toBe(false);
+		expect(callBlockRuleFormSchema.safeParse({ ...base, pattern: "9".repeat(256) }).success).toBe(
+			true,
+		);
+		expect(callBlockRuleFormSchema.safeParse({ ...base, pattern: "9".repeat(257) }).success).toBe(
+			false,
+		);
+	});
+
+	/** `label` is `nullish` on the server, so a cleared note is `null` and never a zero-length one. */
+	it("sends a blank label as null", () => {
+		expect(callBlockRuleFormSchema.parse(base).label).toBeNull();
+		expect(callBlockRuleFormSchema.parse({ ...base, label: " Robocaller " }).label).toBe(
+			"Robocaller",
+		);
+	});
+
+	it("offers no match kind the server has not got, including routes' `any`", () => {
+		expect(callBlockRuleFormSchema.safeParse({ ...base, matchKind: "any" }).success).toBe(false);
+		expect(callBlockRuleFormSchema.safeParse({ ...base, action: "hangup" }).success).toBe(false);
+		expect(callBlockRuleFormSchema.safeParse({ ...base, direction: "internal" }).success).toBe(
+			false,
+		);
+	});
+
+	/**
+	 * The two counters the enforcement side owns. The server answers a body carrying one with a 400
+	 * naming the field rather than dropping it, so a form that offered them would fail the whole
+	 * save — and a destination is refused for the reason `call_block_rule` has no trio at all: the
+	 * compiler maps `voicemail` to the CALLEE's own mailbox, not to somewhere a rule chose.
+	 */
+	it("refuses the hit counters and a destination, which the DTO would answer with a 400", () => {
+		expect(callBlockRuleFormSchema.safeParse({ ...base, hitCount: 4 }).success).toBe(false);
+		expect(
+			callBlockRuleFormSchema.safeParse({ ...base, lastHitAt: "2026-01-01T00:00:00.000Z" }).success,
+		).toBe(false);
+		expect(
+			callBlockRuleFormSchema.safeParse({ ...base, destinationType: "voicemail" }).success,
+		).toBe(false);
 	});
 });
 

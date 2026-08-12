@@ -104,6 +104,92 @@ export interface CallDetail {
 	readonly recordings: readonly RecordingRow[];
 }
 
+// ---------------------------------------------------------------------------------------------
+// Exports — asking the ledger a question too big to answer in a request
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Where an export job is in its lifecycle. Mirrors `CDR_EXPORT_STATUSES` in `@optimiq-voice/cdr-db`.
+ *
+ * Two of the four are TERMINAL (`succeeded`, `failed`) and two are not, and that distinction is
+ * load-bearing rather than cosmetic: it is what a polling client stops on. See
+ * {@link isSettledExportStatus} in `./client.ts`, which is the single place this app decides.
+ *
+ * `running` is a CLAIM rather than a phase — the row carries `claimedAt` and a worker that dies
+ * mid-write leaves a job stuck in it until the lease is reclaimed. So a job that has read `running`
+ * for a while is not necessarily progressing, and the screen does not promise that it is.
+ */
+export const CDR_EXPORT_STATUSES = ["queued", "running", "succeeded", "failed"] as const;
+export type CdrExportStatus = (typeof CDR_EXPORT_STATUSES)[number];
+
+/**
+ * Why an export produced no file. Mirrors `CDR_EXPORT_FAILURES`.
+ *
+ * A closed set so a client can switch on it and say something useful, and `too-many-rows` is the
+ * member that matters: it is the one a REQUESTER can act on, by narrowing the window, and it is
+ * the one that proves the cap is not a truncation. See {@link CdrExportRow.failureDetail}.
+ */
+export const CDR_EXPORT_FAILURES = ["too-many-rows", "storage", "internal"] as const;
+export type CdrExportFailure = (typeof CDR_EXPORT_FAILURES)[number];
+
+/**
+ * One export job.
+ *
+ * ## Nullability is the column's, not a guess
+ *
+ * The server's repository derives this shape from the Drizzle columns and keeps `| null` where the
+ * column is nullable, precisely because half the interesting fields are branched on: `objectKey`
+ * being `null` is how this app knows there is no file to fetch, and `failureReason` is how it knows
+ * why. Flattening either to a non-null type would make the download button render on a job that
+ * has nothing behind it.
+ *
+ * `rowCount` and `sizeBytes` are `notNull` with a default of `0`, so a queued job legitimately
+ * reports zero rows — that is "not counted yet", not "no calls matched". The screen renders them
+ * only on a job that finished.
+ *
+ * ## `filters` is the QUESTION, echoed back
+ *
+ * The job pins the filters as the DTO parsed them, so re-reading an old job reproduces what was
+ * asked rather than what the same query would return today. That is the whole reason exports are
+ * rows and not outbox entries: re-deriving "the last 92 days" a day later produces a different file
+ * from the one somebody downloaded.
+ *
+ * It is `unknown`-valued rather than typed as `CdrListQuery`: it is whatever the DTO accepted at
+ * the time the job was created, and a build that has since gained a filter must still be able to
+ * render a job that predates it. `describeExportFilters` in `./client.ts` reads it defensively.
+ */
+export interface CdrExportRow {
+	readonly id: string;
+	readonly status: CdrExportStatus;
+	/** The `user.id` that asked. `null` on a job whose requester was not a person. */
+	readonly requestedBy: string | null;
+	readonly filters: Readonly<Record<string, unknown>>;
+	/** The window the server RESOLVED, lifted out of `filters` so it needs no parsing. */
+	readonly rangeFrom: string;
+	readonly rangeTo: string;
+	readonly attempts: number;
+	/** `null` until there is a file, and forever on a failure. Never rendered; see the note above. */
+	readonly objectKey: string | null;
+	readonly rowCount: number;
+	readonly sizeBytes: number;
+	readonly failureReason: CdrExportFailure | null;
+	/** A sentence for a human, written by the worker. Never a stack. */
+	readonly failureDetail: string | null;
+	readonly completedAt: string | null;
+	/** When the FILE stops being downloadable. The job row outlives it. */
+	readonly expiresAt: string | null;
+	readonly createdAt: string;
+}
+
+/**
+ * A short-lived, signed URL for one export's CSV.
+ *
+ * The same shape as {@link RecordingDownloadLink} and the same bearer-credential warning, with one
+ * difference at the far end: the response is served `content-disposition: attachment`, because the
+ * only thing anybody does with this file is save it.
+ */
+export type CdrExportDownloadLink = RecordingDownloadLink;
+
 /**
  * A short-lived, signed URL for one recording's media.
  *

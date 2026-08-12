@@ -8,13 +8,23 @@ import { canAccessPage } from "~/lib/page-permissions";
 import { routes } from "~/lib/routes";
 import { useAppSession } from "../../_context/session-context";
 
+/**
+ * The order is organization-first, person-last.
+ *
+ * "My preferences" is deliberately at the end rather than at the front: for the administrators who
+ * see the whole bar it is the least-used tab, and for a self-service user holding only
+ * `settings.read.own` it is the ONLY tab — so its position is invisible to exactly the people it
+ * would inconvenience.
+ */
 const TABS = [
 	{ title: "General", url: routes.settings },
 	{ title: "Members", url: routes.members },
 	{ title: "API keys", url: routes.apiKeys },
 	{ title: "Notifications", url: routes.notifications },
 	{ title: "Routing", url: routes.routingSettings },
+	{ title: "Recordings", url: routes.recordingSettings },
 	{ title: "Emergency", url: routes.emergencyAddresses },
+	{ title: "My preferences", url: routes.mySettings },
 ] as const;
 
 /**

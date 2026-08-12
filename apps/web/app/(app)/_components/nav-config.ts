@@ -1,4 +1,5 @@
 import {
+	BlockIcon,
 	ConferenceIcon,
 	DeviceIcon,
 	GaugeIcon,
@@ -90,6 +91,19 @@ export const NAV_SECTIONS: readonly NavSection[] = [
 			{ title: "Voicemail", url: routes.voicemail, icon: VoicemailIcon },
 			{ title: "Conferences", url: routes.conferences, icon: ConferenceIcon },
 			{ title: "Park lots", url: routes.parkLots, icon: ParkIcon },
+			/**
+			 * Caller screening, under "Call features" rather than under "Routing".
+			 *
+			 * A blocklist IS a routing input — `call_block_rule` is in `ROUTING_TABLE_TO_ENTITY` and a
+			 * save recompiles the artifact — so "Routing" is the defensible-looking choice and it is
+			 * the wrong one. These sections are a claim about WHO does something, not about which
+			 * table feeds the compiler: "Routing" is the dial plan an administrator owns, and
+			 * `CallBlockController` is explicit that the person who maintains a screening list is
+			 * whoever answered the phone. Filing it beside voicemail and park lots puts it with the
+			 * other things the front desk uses, which is where whoever is adding this morning's
+			 * nuisance number will look for it.
+			 */
+			{ title: "Call blocking", url: routes.callBlock, icon: BlockIcon },
 			/**
 			 * Hold music and the prompt library, on one page with the section in `?tab=`.
 			 *

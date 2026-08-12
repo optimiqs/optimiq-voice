@@ -196,6 +196,80 @@ export function parseAgentState(value: unknown): LiveAgentState | undefined {
 		: undefined;
 }
 
+/**
+ * One `trunk.status.changed` transition, addressed by the trunk it is about.
+ *
+ * ## Why this is a function over the ENVELOPE and not over a value
+ *
+ * The other three parsers here read a KV bucket entry: a bucket is a key→value map, the key is the
+ * identity, and the value is the whole payload. `trunks` has no bucket behind it — the current
+ * statuses live in the `trunk.status*` columns and the trunk list has already fetched them over
+ * HTTP, so a projection would be a third copy of something two places agree on. What the socket
+ * carries is a STREAM event, and a stream event has no key.
+ *
+ * So the identity comes from the SUBJECT: `trunk.evt.v1.<orgId>.<trunkId>.status.changed`, index 4.
+ * That is the same rule `packages/events` applies to `queueId`, `callId` and `mailboxId` — the
+ * addressed thing appears once, in the address — and it is why `useLiveVoicemail` reads its mailbox
+ * id the same way.
+ *
+ * ## What it refuses
+ *
+ * A payload whose `status` is not one of the five the column can hold, and a subject that does not
+ * have a trunk id where one belongs. Both are dropped rather than rendered: the server validated
+ * the event against the shared schema before it forwarded it, so this is the second line and exists
+ * because the browser ships on its own cadence — a build that met a sixth status word would
+ * otherwise paint an unstyled badge over a status the row already knows.
+ */
+export const LIVE_TRUNK_STATUSES: ReadonlySet<string> = new Set([
+	"unknown",
+	"up",
+	"down",
+	"degraded",
+	"disabled",
+]);
+
+export interface LiveTrunkStatus {
+	readonly trunkId: string;
+	readonly status: string;
+	/** The media server's word, verbatim (`Reachable`, `Unreachable`). Absent when it said nothing. */
+	readonly reason?: string;
+	readonly latencyMs?: number;
+	/** When the transition happened, from the envelope — never the moment this tab received it. */
+	readonly at: string;
+}
+
+export function parseTrunkStatusEvent(
+	envelope: unknown,
+	receivedAt: string,
+): LiveTrunkStatus | undefined {
+	if (!isRecord(envelope)) {
+		return undefined;
+	}
+	const subject = envelope.subject;
+	if (typeof subject !== "string") {
+		return undefined;
+	}
+	const trunkId = subject.split(".")[4];
+	if (trunkId === undefined || trunkId.length === 0) {
+		return undefined;
+	}
+	const payload = envelope.data;
+	if (!isRecord(payload)) {
+		return undefined;
+	}
+	const status = payload.status;
+	if (typeof status !== "string" || !LIVE_TRUNK_STATUSES.has(status)) {
+		return undefined;
+	}
+	return {
+		trunkId,
+		status,
+		...(typeof payload.reason === "string" ? { reason: payload.reason } : {}),
+		...(typeof payload.latencyMs === "number" ? { latencyMs: payload.latencyMs } : {}),
+		at: typeof envelope.at === "string" ? envelope.at : receivedAt,
+	};
+}
+
 /** The agent statuses that count as staffing a queue. Mirrors the engine's `isStaffing`. */
 export function isStaffing(status: string): boolean {
 	return status !== "logged-out";
