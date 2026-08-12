@@ -40,6 +40,8 @@ import { createHash } from "node:crypto";
  * rpc.media.v1.untap-session
  * rpc.engine.v1.originate                   api -> engine; ANY instance answers (queue group)
  * rpc.engine.v1.park-handoff.<instanceTok>   engine -> engine; the OWNING instance answers
+ * rpc.engine.v1.session-verb.<instanceTok>   api -> engine; the instance that OWNS the leg answers
+ * rpc.session.v1.announce.<org>.<appTok>     engine -> api; the replica holding the app's socket
  * ```
  *
  * The version token (`v1`) is a MAJOR version and is part of the subject, not the payload: a
@@ -193,6 +195,38 @@ export const RPC_SUBJECTS = {
 	 * that member is not the one holding the call.
 	 */
 	engineParkHandoff: `rpc.engine.${SUBJECT_VERSION}.park-handoff`,
+	/**
+	 * The session protocol's verb surface: an external application, through the control plane,
+	 * commanding one leg of a live call. A PREFIX, like `park-handoff` above and for the same
+	 * reason — a leg lives on ONE engine instance's media channel, and only that instance can act
+	 * on it.
+	 *
+	 * The address is not read out of a KV bucket, though, which is the one way it differs from the
+	 * park handoff: the announcement that started the session carried the owning `instanceId`, and
+	 * the control plane has held it for the life of the socket. A lookup would be a second source
+	 * of truth for a fact the session was opened with.
+	 */
+	engineSessionVerb: `rpc.engine.${SUBJECT_VERSION}.session-verb`,
+	/**
+	 * The session protocol's other half: a call has reached an `application` destination, and the
+	 * engine is asking whoever holds that application's socket to take it.
+	 *
+	 * A PREFIX, and the only subject on this list whose variable tail is not an instance token —
+	 * it is `<orgId>.<applicationToken>` (see {@link subjectFor.sessionAnnounceRpc}). **The subject
+	 * IS the registration.** A control-plane replica subscribes to exactly the applications whose
+	 * sockets it is holding and unsubscribes when the last one goes, so:
+	 *
+	 * - no directory has to be kept anywhere, and none can go stale;
+	 * - an application nobody has claimed produces `no responders available` IMMEDIATELY, which is
+	 *   what lets the walker take its failure path — an announcement — instead of leaving a caller
+	 *   listening to silence for the length of a request timeout;
+	 * - two replicas holding the same application share the arrivals, because the responders join a
+	 *   queue group named after it.
+	 *
+	 * `rpc.session.` and not `rpc.api.`: every other family here is named for the DOMAIN, and this
+	 * one's domain is the session protocol rather than the process that happens to terminate it.
+	 */
+	sessionAnnounce: `rpc.session.${SUBJECT_VERSION}.announce`,
 } as const;
 
 /**
@@ -516,6 +550,34 @@ export function instanceSubjectToken(instanceId: string): string {
 }
 
 /**
+ * Stable subject token for a session-protocol application name.
+ *
+ * An application name is whatever a tenant typed into the `application` destination — `autopilot`,
+ * `crm-screenpop`, `Sales IVR (new)`. Most are already one subject token and are returned VERBATIM,
+ * for the same reason {@link instanceSubjectToken} returns an instance id verbatim: a subject an
+ * operator can read is a subject an operator can `nats sub` while an integration is not being
+ * announced calls. The rest — anything with a space, a dot or punctuation — would silently become
+ * several tokens, or a subject nobody can subscribe to, so they hash.
+ *
+ * Case is NOT normalised, and that is deliberate rather than an oversight. The engine builds this
+ * token from the compiled plan node and the control plane builds it from what the socket claimed;
+ * if the two were folded to lower case, `Support` and `support` would become one registration and a
+ * tenant with both would have their calls delivered to whichever socket connected first. Two names
+ * that differ in case are two applications, and each gets its own subject.
+ *
+ * @throws {SubjectTokenError} when the name is empty.
+ */
+export function applicationSubjectToken(application: string): string {
+	const normalized = application.trim();
+	if (normalized.length === 0) {
+		throw new SubjectTokenError("application", application);
+	}
+	return TOKEN_PATTERN.test(normalized)
+		? normalized
+		: createHash("sha256").update(normalized).digest("hex").slice(0, 32);
+}
+
+/**
  * Stable key token for a DID, for the `did-index` KV bucket.
  *
  * An E.164 number is stored as `+441632960111` and dialled as `441632960111`, `+441632960111` or
@@ -632,6 +694,26 @@ export const subjectFor = {
 	 */
 	engineParkHandoffRpc(instanceId: string): string {
 		return `${RPC_SUBJECTS.engineParkHandoff}.${instanceSubjectToken(instanceId)}`;
+	},
+	/**
+	 * `rpc.engine.v1.session-verb.<instanceToken>` — addressed at the engine instance that owns the
+	 * leg the verb acts on. See {@link RPC_SUBJECTS.engineSessionVerb}.
+	 */
+	engineSessionVerbRpc(instanceId: string): string {
+		return `${RPC_SUBJECTS.engineSessionVerb}.${instanceSubjectToken(instanceId)}`;
+	},
+	/**
+	 * `rpc.session.v1.announce.<orgId>.<applicationToken>` — the subject that IS the registration.
+	 *
+	 * Two variable tokens rather than one, and the ORGANIZATION comes first: an application name is
+	 * a tenant's own string, so `crm` in one organization and `crm` in another are different
+	 * applications and must be different subjects. Putting the org first also means an operator can
+	 * watch one tenant's whole integration surface with `rpc.session.v1.announce.<org>.*`, and — the
+	 * reason that matters — it is the shape a per-tenant broker permission would take if one is ever
+	 * needed.
+	 */
+	sessionAnnounceRpc(orgId: string, application: string): string {
+		return `${RPC_SUBJECTS.sessionAnnounce}.${assertToken("orgId", orgId)}.${applicationSubjectToken(application)}`;
 	},
 } as const;
 

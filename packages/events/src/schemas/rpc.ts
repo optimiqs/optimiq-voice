@@ -4,8 +4,11 @@ import {
 	callDirectionSchema,
 	destinationTypeSchema,
 	dialStringSchema,
+	dtmfDigitSchema,
+	hangupCauseSchema,
 	sipTransportSchema,
 	tapModeSchema,
+	transferKindSchema,
 } from "./telephony";
 
 /**
@@ -2057,6 +2060,326 @@ export const PARK_HANDOFF_RPC = defineRpc(
 	3_000,
 );
 
+// ---------------------------------------------------------------------------------------------
+// rpc.session.v1.announce.<orgId>.<application> — engine → api, when a call reaches an application
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The session protocol's front door: a call has walked into an `application` destination and the
+ * engine is offering it to whoever holds that application's socket.
+ *
+ * ## Why an offer and not a notification
+ *
+ * A caller is on the line while this is outstanding. The engine has to know, before it does
+ * anything else, whether an application is going to take control of the leg or whether it must run
+ * the destination's failure path — which is an announcement, because the alternative is dead air on
+ * a call somebody's dial plan deliberately routed here. A published event cannot answer that; a
+ * request can, and `no responders available` answers it INSTANTLY when nobody has claimed the
+ * application (see {@link RPC_SUBJECTS.sessionAnnounce} for why the subject carries the name).
+ *
+ * ## What the answer contains, and what it does not
+ *
+ * `sessionId` and nothing else. The control plane does not get to rewrite the call: it cannot
+ * change the caller id, cannot choose a different application and cannot pre-answer. Everything it
+ * wants to do to the leg it does afterwards, one verb at a time, over
+ * {@link RPC_SUBJECTS.engineSessionVerb} — where each command is authorised, guarded and logged on
+ * its own. An accept that could also carry instructions would be a second, unaudited verb channel.
+ */
+export const SESSION_ANNOUNCE_REFUSAL_REASONS = [
+	/** Nothing is registered for this application, or the socket went away mid-announce. */
+	"no-application",
+	/** The socket is registered but already holds as many sessions as it declared it can. */
+	"at-capacity",
+	/** The control plane is draining. */
+	"shutting-down",
+	"bad_request",
+	"internal",
+] as const;
+
+export const sessionAnnounceRefusalReasonSchema = z.enum(SESSION_ANNOUNCE_REFUSAL_REASONS);
+export type SessionAnnounceRefusalReason = (typeof SESSION_ANNOUNCE_REFUSAL_REASONS)[number];
+
+export const sessionAnnounceRequestSchema = z.object({
+	orgId: z.uuid(),
+	/** The application name as the dial plan spelled it. Also a token of the subject. */
+	application: z.string().min(1).max(128),
+	callId: z.string().min(1).max(128),
+	legId: z.string().min(1).max(128),
+	/**
+	 * The engine instance that owns the leg — the ADDRESS every later verb is sent to.
+	 *
+	 * Payload here, unlike the park handoff's `instanceId`, and the asymmetry is the point: a park
+	 * handoff is addressed AT an instance the requester already knows, so carrying it in the body
+	 * would be two places that could disagree. This one travels the other way — the responder learns
+	 * it here and can learn it nowhere else, because a control plane holds no channel registry.
+	 */
+	instanceId: z.string().min(1).max(128),
+	direction: callDirectionSchema,
+	/** Whether the leg has already answered. An application must not assume it has. */
+	answered: z.boolean(),
+	callerIdNumber: dialStringSchema.optional(),
+	callerIdName: z.string().max(128).optional(),
+	/** What the caller dialled to get here, after the plan's normalisation. */
+	dialedNumber: dialStringSchema.optional(),
+	/**
+	 * The destination's `args`, flattened to strings.
+	 *
+	 * The plan node models these as `string | number | boolean` and they arrive here as text,
+	 * because the only consumer is an application that typed them into a form. Preserving the three
+	 * JSON types across a wire, a Go struct and a browser would buy an integration nothing and would
+	 * cost the Go emitter a union it cannot express.
+	 */
+	arguments: z.record(z.string().min(1).max(64), z.string().max(512)).optional(),
+	at: z.iso.datetime(),
+});
+
+export const sessionAnnounceResponseSchema = z.object({
+	accepted: z.boolean(),
+	/** The control plane's handle for this session. Present exactly when `accepted`. */
+	sessionId: z.string().min(1).max(128).optional(),
+	reason: sessionAnnounceRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type SessionAnnounceRequest = z.infer<typeof sessionAnnounceRequestSchema>;
+export type SessionAnnounceResponse = z.infer<typeof sessionAnnounceResponseSchema>;
+
+export const SESSION_ANNOUNCE_RPC = defineRpc(
+	RPC_SUBJECTS.sessionAnnounce,
+	sessionAnnounceRequestSchema,
+	sessionAnnounceResponseSchema,
+	// Two seconds, and the shortest budget of any subject on a call path here. Everything this
+	// asks for is in memory on the far side — is a socket registered, and does it have room — so a
+	// reply that takes longer than this is a control plane in trouble, and the honest thing to do
+	// with a caller listening to silence is to stop waiting and announce.
+	2_000,
+);
+
+// ---------------------------------------------------------------------------------------------
+// rpc.engine.v1.session-verb.<instanceToken> — api → engine, one command on one leg
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The verbs the session protocol will carry.
+ *
+ * A CLOSED list, and deliberately shorter than `packages/telephony`'s 28-member `Verb` union: it is
+ * exactly what `apps/engine`'s verb executor implements. The eight it omits — `earlyMedia`, `say`,
+ * `stopSay`, `playbackControl`, `stream`, `stopStream`, `streamGather`, `stopStreamGather` — are
+ * refused by the executor for stated reasons, and refusing them HERE, at the wire, is a better
+ * answer than accepting a command and failing it one hop later: an application gets the refusal
+ * from its own schema validation instead of from a call that is already in progress.
+ *
+ * When one of them lands, it is added here and to the executor in the same change. That coupling is
+ * the feature.
+ */
+export const SESSION_VERBS = [
+	"answer",
+	"ringing",
+	"play",
+	"stopPlay",
+	"gather",
+	"record",
+	"dial",
+	"bridge",
+	"unbridge",
+	"transfer",
+	"hold",
+	"unhold",
+	"park",
+	"unpark",
+	"playDtmf",
+	"mute",
+	"unmute",
+	"setVariable",
+	"sleep",
+	"hangup",
+] as const;
+
+export const sessionVerbNameSchema = z.enum(SESSION_VERBS);
+export type SessionVerbName = (typeof SESSION_VERBS)[number];
+
+/** One leg a session's `dial` may originate, in the order the engine will try them. */
+export const sessionDialTargetSchema = z.object({
+	destination: dialStringSchema,
+	/**
+	 * The routing namespace to resolve the destination in.
+	 *
+	 * `internal` then `outbound` when omitted, which is exactly what `*69` does — and the reason
+	 * this field exists rather than the engine always guessing: an application that means "ring
+	 * extension 1001" and an application that means "dial the PSTN number 1001" are asking for
+	 * different things, and only one of them may pass the toll gate.
+	 */
+	context: z.enum(["internal", "outbound"]).optional(),
+});
+
+/**
+ * Every argument any verb in {@link SESSION_VERBS} takes, as one flat object.
+ *
+ * ## Why flat, and not a discriminated union
+ *
+ * Because this contract crosses a language border. `packages/events-go`'s emitter turns each schema
+ * here into a Go struct, and it has no representation for a tagged union — a `z.discriminatedUnion`
+ * emits `anyOf`, which the emitter refuses rather than guesses at. The alternatives were to keep the
+ * verb payload out of the contract entirely (an opaque blob, so neither end could validate it) or to
+ * emit twenty request schemas for one subject. A flat argument record with a `verb` discriminant
+ * beside it is the same shape ESL's `execute <app> <args>` and ARI's operation bodies have, for the
+ * same reason, and it keeps ONE schema per subject.
+ *
+ * The cost is real and worth naming: a `play` carrying `maxDigits` validates here and is ignored by
+ * the engine. What is NOT lost is the important half — the engine narrows on `verb` and reads only
+ * the fields that verb has, so a missing REQUIRED argument is still a typed refusal rather than an
+ * `undefined` reaching the media server.
+ */
+export const sessionVerbArgumentsSchema = z.object({
+	// play / gather / stopPlay
+	/** `sound:`/`object://` media reference for `play`, or a `gather` prompt. */
+	media: z.string().max(512).optional(),
+	playbackRef: z.string().max(128).optional(),
+	loop: z.int().min(0).max(1_000).optional(),
+	terminators: z.array(dtmfDigitSchema).max(16).optional(),
+	// gather
+	maxDigits: z.int().min(1).max(64).optional(),
+	timeoutMs: z.int().min(0).max(600_000).optional(),
+	interDigitTimeoutMs: z.int().min(0).max(600_000).optional(),
+	regex: z.string().max(256).optional(),
+	// record
+	maxDurationMs: z
+		.int()
+		.min(0)
+		.max(24 * 60 * 60 * 1_000)
+		.optional(),
+	silenceStopMs: z.int().min(0).max(600_000).optional(),
+	beep: z.boolean().optional(),
+	format: z.enum(["wav", "mp3", "ogg"]).optional(),
+	// dial
+	targets: z.array(sessionDialTargetSchema).min(1).max(16).optional(),
+	/**
+	 * `sequential` only, today.
+	 *
+	 * `simultaneous` is accepted by the schema and REFUSED by the engine, which is the honest split:
+	 * ring-all with lose-race semantics and CDR-correct losers is the plan walker's, and a second
+	 * originator in the verb executor would be a second, subtly different one. Declaring the value
+	 * means an application that wants it gets a refusal naming it, rather than a validation error
+	 * that reads like the field does not exist.
+	 */
+	strategy: z.enum(["sequential", "simultaneous"]).optional(),
+	continueOnCauses: z.array(hangupCauseSchema).max(32).optional(),
+	// bridge
+	/** The DOMAIN leg id to join to — never a media-server channel id. */
+	peerLegId: z.string().max(128).optional(),
+	// transfer
+	transferKind: transferKindSchema.optional(),
+	destination: dialStringSchema.optional(),
+	destinationContext: z.string().max(64).optional(),
+	fallbackDestination: dialStringSchema.optional(),
+	cancelKey: dtmfDigitSchema.optional(),
+	// hold / park / unpark
+	musicOnHold: z.string().max(128).optional(),
+	soft: z.boolean().optional(),
+	lot: z.string().max(128).optional(),
+	orbit: z.string().max(32).optional(),
+	// playDtmf
+	digits: z.array(dtmfDigitSchema).min(1).max(64).optional(),
+	toneDurationMs: z.int().min(0).max(10_000).optional(),
+	// mute / unmute
+	direction: z.enum(["in", "out", "both"]).optional(),
+	// sleep
+	durationMs: z.int().min(0).max(600_000).optional(),
+	// setVariable
+	name: z.string().max(128).optional(),
+	value: z.string().max(1_024).optional(),
+	scope: z.enum(["channel", "export", "global"]).optional(),
+	// hangup
+	cause: hangupCauseSchema.optional(),
+});
+
+export const sessionVerbRequestSchema = z.object({
+	orgId: z.uuid(),
+	/** The session the announcement opened. Checked against the leg — see the response's refusals. */
+	sessionId: z.string().min(1).max(128),
+	callId: z.string().min(1).max(128),
+	legId: z.string().min(1).max(128),
+	verb: sessionVerbNameSchema,
+	arguments: sessionVerbArgumentsSchema.optional(),
+});
+
+/**
+ * Why a verb did not run. Distinct from a verb that ran and ended badly, which is `ok` with an
+ * `endReason` — a `gather` that timed out did exactly what it was asked to.
+ */
+export const SESSION_VERB_REFUSAL_REASONS = [
+	"bad_request",
+	/** No leg with that id on this instance: it ended, or the session named someone else's call. */
+	"unknown-leg",
+	/** The session id does not match the one this leg was announced under. */
+	"session-mismatch",
+	/** The executor refused it — tearing down, no media path, or a scope it does not implement. */
+	"not-permitted",
+	/** The executor does not implement this verb yet. */
+	"unsupported",
+	"shutting-down",
+	"internal",
+] as const;
+
+export const sessionVerbRefusalReasonSchema = z.enum(SESSION_VERB_REFUSAL_REASONS);
+export type SessionVerbRefusalReason = (typeof SESSION_VERB_REFUSAL_REASONS)[number];
+
+/**
+ * What one verb did.
+ *
+ * Flat for the same reason the arguments are, and with the same trade: every result field any verb
+ * can produce lives here, and a verb fills in the ones it has. The discriminant is `verb`, echoed
+ * back so a client that pipelined two commands can tell the answers apart.
+ */
+export const sessionVerbResponseSchema = z.object({
+	ok: z.boolean(),
+	verb: sessionVerbNameSchema,
+	/** The instance that answered. Always present, including on a refusal, for the caller's log. */
+	instanceId: z.string().min(1).max(128),
+	/** How the verb ended. Present exactly when `ok`. */
+	endReason: z
+		.enum(["completed", "terminator", "timeout", "cancelled", "hangup", "failed"])
+		.optional(),
+	reason: sessionVerbRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+	// play
+	playbackRef: z.string().max(128).optional(),
+	elapsedMs: z.int().min(0).optional(),
+	// gather
+	digits: z.array(dtmfDigitSchema).max(64).optional(),
+	// record
+	recordingId: z.string().max(128).optional(),
+	mediaRef: z.string().max(512).optional(),
+	durationMs: z.int().min(0).optional(),
+	format: z.string().max(16).optional(),
+	// dial
+	/** Which entry of `targets` answered, when one did. */
+	answeredTargetIndex: z.int().min(0).optional(),
+	cause: hangupCauseSchema.optional(),
+	// bridge
+	bridgeId: z.string().max(128).optional(),
+});
+
+export type SessionVerbRequest = z.infer<typeof sessionVerbRequestSchema>;
+export type SessionVerbResponse = z.infer<typeof sessionVerbResponseSchema>;
+export type SessionVerbArguments = z.infer<typeof sessionVerbArgumentsSchema>;
+export type SessionDialTarget = z.infer<typeof sessionDialTargetSchema>;
+
+export const SESSION_VERB_RPC = defineRpc(
+	RPC_SUBJECTS.engineSessionVerb,
+	sessionVerbRequestSchema,
+	sessionVerbResponseSchema,
+	// Thirty seconds, and by far the longest budget on this backbone — because unlike every other
+	// subject here, some of these verbs are supposed to take a long time. A `gather` waits for a
+	// person to finish dialling and a `dial` waits for a phone to be answered; both are bounded by
+	// their own `timeoutMs`, which the schema caps at ten minutes, and neither is "slow" at twenty
+	// seconds. This deadline therefore is not a latency budget, it is a LIVENESS one: past it the
+	// engine is not thinking, it is gone, and the control plane should tell the socket so rather
+	// than hold a verb open forever. An application that wants a longer ring sends `dial` with the
+	// timeout it wants and reads the result off the call events.
+	30_000,
+);
+
 /** Every request-reply contract, keyed by subject. */
 export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.routingResolve]: ROUTING_RESOLVE_RPC,
@@ -2080,4 +2403,6 @@ export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.mediaUntapSession]: MEDIA_UNTAP_SESSION_RPC,
 	[RPC_SUBJECTS.engineOriginate]: ORIGINATE_RPC,
 	[RPC_SUBJECTS.engineParkHandoff]: PARK_HANDOFF_RPC,
+	[RPC_SUBJECTS.engineSessionVerb]: SESSION_VERB_RPC,
+	[RPC_SUBJECTS.sessionAnnounce]: SESSION_ANNOUNCE_RPC,
 } as const;

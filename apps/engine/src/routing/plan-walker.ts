@@ -23,6 +23,7 @@ import type { PlanDestination } from "./plan-destination";
 import type { TrunkCapacityPort } from "./trunk-capacity";
 import type { CallEvent, ExtensionFeature } from "@optimiq-voice/events";
 import type {
+	ApplicationPlanNode,
 	CompiledTimeCondition,
 	ConferencePlanNode,
 	ExecutionPlan,
@@ -107,8 +108,9 @@ import type {
  * behind the same PIN gate `*97` uses. `*97` and `*98` are now reachable from the star-code
  * CATALOGUE rather than only from the `voicemailPrefix` settings — see
  * {@link PlanWalker.voicemailCode} for the gap that closed. Every one of them needs its port
- * ({@link PlanWalkerDependencies.features}, `lastCaller`, `greetings`, `control`); without one the
- * code announces and says so, which is exactly what it did before this wave.
+ * ({@link PlanWalkerDependencies.features}, `lastCaller`, `greetings`, `control`, `application`);
+ * without one the code or destination announces and says so, which is exactly what it did before
+ * this wave.
  *
  Supervision and intercom joined them in this wave: `*0` authorizes against
  * {@link PlanWalkerDependencies.supervision} and hands the tap to `control.monitor`, `*80` dials an
@@ -116,7 +118,7 @@ import type {
  *
  * Placeholder, and honest about it: `voicemail` records but has no MWI and no email; the remaining
  * feature codes (`record-toggle`, `transfer`, `queue-toggle`, `agent-status`, and `paging` as a
- * CODE rather than a node) answer with an announcement; `application` announces and hangs up; call
+ * CODE rather than a node) answer with an announcement; call
  * screening is implemented behind a default-off setting whose remaining seams
  * {@link PlanWalker.screenCall} names one by one. Every one of them adds a line to
  * {@link WalkOutcome.notes}, so a call that hit a gap says so in the log rather than looking like a
@@ -161,6 +163,33 @@ export interface WalkerChannel {
  * Absent means the park lot and the pickup codes announce and hang up exactly as they did before
  * this wave, and say so in the notes.
  */
+/**
+ * Hands the A-leg to a named external application — the `application` destination.
+ *
+ * ## Why a seam, and why it is the ONLY one shaped like this
+ *
+ * Every other port here answers a question and returns. This one takes the call away: from the
+ * moment it is entered until the promise settles, something outside this process is deciding what
+ * the caller hears. That is the destination's whole meaning, and it is why the node awaits rather
+ * than dispatching — a walk that carried on would run the plan's failover path underneath a live
+ * conversation.
+ *
+ * The runtime is `apps/engine/src/session/application-sessions.ts`. It is a PORT here, and optional,
+ * for the reason every optional dependency on this interface is: a spec about an IVR should not have
+ * to stand up a broker, and an engine with no control plane reachable should announce rather than
+ * hang, which is exactly what its absence produces.
+ */
+export interface WalkerApplicationPort {
+	run(request: {
+		readonly application: string;
+		readonly arguments?: Readonly<Record<string, string>>;
+	}): Promise<
+		| { readonly kind: "unavailable"; readonly reason: string }
+		| { readonly kind: "hangup"; readonly cause: HangupCause }
+		| { readonly kind: "aborted" }
+	>;
+}
+
 export interface WalkerCallControl {
 	/** Parks the A-leg. `orbit` is what the caller dialled after the code, when they dialled one. */
 	park(request: {
@@ -590,6 +619,15 @@ export interface PlanWalkerDependencies {
 	 * up exactly as it did before this wave.
 	 */
 	readonly control?: WalkerCallControl;
+	/**
+	 * The session protocol, for the `application` destination.
+	 *
+	 * Absent means an `application` node announces and hangs up with `FACILITY_NOT_IMPLEMENTED`,
+	 * which is what it did for every wave before this one and is still the right answer on a
+	 * deployment with no broker: the destination exists, nothing can serve it, and the caller is
+	 * told rather than left listening.
+	 */
+	readonly application?: WalkerApplicationPort;
 	/**
 	 * Told the moment the walk ENTERS a destination-bearing node, rather than once it is over.
 	 *
@@ -1160,11 +1198,17 @@ export class PlanWalker {
 			case "paging": {
 				return await this.pagingNode(node, input);
 			}
+			case "application": {
+				return await this.applicationNode(node);
+			}
 			default: {
-				// `application`: a real destination with a real runtime that does not exist yet.
-				// Announcing and hanging up is a worse product than the real thing and a better one
-				// than silence.
-				this.note(`node kind "${node.kind}" is not implemented yet; announced and hung up`);
+				// Unreachable: every member of `PlanNodeKind` has a case above, and TypeScript proves it
+				// — `node` is `never` here, which is why the note reads it back through a cast. The arm
+				// stays because a node kind added to `packages/routing` and not to this switch has to
+				// land somewhere, and "announced and hung up, and said so in the notes" is a better
+				// place for it than an unhandled `undefined`.
+				const unreachable = node as { readonly kind: string };
+				this.note(`node kind "${unreachable.kind}" is not implemented yet; announced and hung up`);
 				return await this.announceAndHangup(
 					this.settings.unavailableAnnouncement,
 					"FACILITY_NOT_IMPLEMENTED",
@@ -3392,6 +3436,79 @@ export class PlanWalker {
 	 * registry — which is what makes `maxMembers` and "has a moderator arrived?" correct across
 	 * walks — but the media join is deferred until the gate opens.
 	 */
+	/**
+	 * Hands the call to a named external application and waits for it to finish.
+	 *
+	 * ## The three outcomes, and why one of them is an announcement
+	 *
+	 * `unavailable` — nobody has claimed this application, or the control plane could not be reached
+	 * — takes the destination's failure path, which on this platform is an announcement and a hangup
+	 * with `FACILITY_NOT_IMPLEMENTED`. That choice is the whole reason the session protocol's
+	 * registration is a NATS subject rather than a directory: a claim that does not exist produces
+	 * `no responders available` synchronously, so the caller hears the announcement immediately
+	 * instead of after a request timeout. Dead air is never an outcome here.
+	 *
+	 * `hangup` is the application ending the call, with the cause it chose, so a CDR reads
+	 * `CALL_REJECTED` when the integration rejected the caller rather than `NORMAL_CLEARING` for
+	 * everything.
+	 *
+	 * `aborted` is the leg going away underneath the application — the caller hung up, or the media
+	 * server dropped the channel. There is nothing left to walk, and no verb to send.
+	 *
+	 * ## The leg is NOT answered first
+	 *
+	 * Unlike `conference` or `voicemail`, which cannot work on an unanswered leg, an application is
+	 * given the call exactly as it found it and decides for itself. That is the point of the
+	 * `answered` field on the announcement: a screen-pop integration wants to inspect the caller and
+	 * hand the call on WITHOUT answering, because answering starts billing a caller for a call they
+	 * never got. Pre-answering here would take that decision away and would make an
+	 * `application` destination more expensive than the dial plan it replaced.
+	 */
+	private async applicationNode(node: ApplicationPlanNode): Promise<StepResult> {
+		const application = this.deps.application;
+		if (application === undefined) {
+			this.note(
+				`application "${node.application}" was reached but this walk has no session runtime; announced and hung up`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		this.note(`handing the call to application "${node.application}"`);
+		const outcome = await application.run({
+			application: node.application,
+			// The plan models `args` as `string | number | boolean`; the wire carries text. Flattened
+			// here rather than in the runtime because this is where the plan's type is still visible.
+			...(node.args === undefined
+				? {}
+				: {
+						arguments: Object.fromEntries(
+							Object.entries(node.args).map(([key, value]) => [key, String(value)]),
+						),
+					}),
+		});
+
+		switch (outcome.kind) {
+			case "unavailable": {
+				this.note(`application "${node.application}" did not take the call: ${outcome.reason}`);
+				return await this.announceAndHangup(
+					this.settings.unavailableAnnouncement,
+					"FACILITY_NOT_IMPLEMENTED",
+				);
+			}
+			case "aborted": {
+				this.note(`the leg went away while application "${node.application}" held it`);
+				return { kind: "aborted" };
+			}
+			default: {
+				this.note(`application "${node.application}" ended the call with ${outcome.cause}`);
+				return { kind: "hangup", cause: outcome.cause };
+			}
+		}
+	}
+
 	private async conferenceNode(node: ConferencePlanNode): Promise<StepResult> {
 		const registry = this.deps.conferences;
 		if (registry === undefined) {

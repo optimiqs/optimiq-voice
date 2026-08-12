@@ -1,0 +1,233 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"orgId": {
+			"type": "string",
+			"format": "uuid",
+			"pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+		},
+		"sessionId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"callId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"legId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"verb": {
+			"type": "string",
+			"enum": [
+				"answer",
+				"ringing",
+				"play",
+				"stopPlay",
+				"gather",
+				"record",
+				"dial",
+				"bridge",
+				"unbridge",
+				"transfer",
+				"hold",
+				"unhold",
+				"park",
+				"unpark",
+				"playDtmf",
+				"mute",
+				"unmute",
+				"setVariable",
+				"sleep",
+				"hangup"
+			]
+		},
+		"arguments": {
+			"type": "object",
+			"properties": {
+				"media": {
+					"type": "string",
+					"maxLength": 512
+				},
+				"playbackRef": {
+					"type": "string",
+					"maxLength": 128
+				},
+				"loop": {
+					"type": "integer",
+					"minimum": 0,
+					"maximum": 1000
+				},
+				"terminators": {
+					"maxItems": 16,
+					"type": "array",
+					"items": {
+						"type": "string",
+						"pattern": "^[0-9*#A-D]$"
+					}
+				},
+				"maxDigits": {
+					"type": "integer",
+					"minimum": 1,
+					"maximum": 64
+				},
+				"timeoutMs": {
+					"type": "integer",
+					"minimum": 0,
+					"maximum": 600000
+				},
+				"interDigitTimeoutMs": {
+					"type": "integer",
+					"minimum": 0,
+					"maximum": 600000
+				},
+				"regex": {
+					"type": "string",
+					"maxLength": 256
+				},
+				"maxDurationMs": {
+					"type": "integer",
+					"minimum": 0,
+					"maximum": 86400000
+				},
+				"silenceStopMs": {
+					"type": "integer",
+					"minimum": 0,
+					"maximum": 600000
+				},
+				"beep": {
+					"type": "boolean"
+				},
+				"format": {
+					"type": "string",
+					"enum": ["wav", "mp3", "ogg"]
+				},
+				"targets": {
+					"minItems": 1,
+					"maxItems": 16,
+					"type": "array",
+					"items": {
+						"type": "object",
+						"properties": {
+							"destination": {
+								"type": "string",
+								"minLength": 1,
+								"maxLength": 128
+							},
+							"context": {
+								"type": "string",
+								"enum": ["internal", "outbound"]
+							}
+						},
+						"required": ["destination"],
+						"additionalProperties": false
+					}
+				},
+				"strategy": {
+					"type": "string",
+					"enum": ["sequential", "simultaneous"]
+				},
+				"continueOnCauses": {
+					"maxItems": 32,
+					"type": "array",
+					"items": {
+						"type": "string",
+						"minLength": 1,
+						"maxLength": 48,
+						"pattern": "^[A-Z][A-Z0-9_]*$"
+					}
+				},
+				"peerLegId": {
+					"type": "string",
+					"maxLength": 128
+				},
+				"transferKind": {
+					"type": "string",
+					"enum": ["blind", "attended"]
+				},
+				"destination": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 128
+				},
+				"destinationContext": {
+					"type": "string",
+					"maxLength": 64
+				},
+				"fallbackDestination": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 128
+				},
+				"cancelKey": {
+					"type": "string",
+					"pattern": "^[0-9*#A-D]$"
+				},
+				"musicOnHold": {
+					"type": "string",
+					"maxLength": 128
+				},
+				"soft": {
+					"type": "boolean"
+				},
+				"lot": {
+					"type": "string",
+					"maxLength": 128
+				},
+				"orbit": {
+					"type": "string",
+					"maxLength": 32
+				},
+				"digits": {
+					"minItems": 1,
+					"maxItems": 64,
+					"type": "array",
+					"items": {
+						"type": "string",
+						"pattern": "^[0-9*#A-D]$"
+					}
+				},
+				"toneDurationMs": {
+					"type": "integer",
+					"minimum": 0,
+					"maximum": 10000
+				},
+				"direction": {
+					"type": "string",
+					"enum": ["in", "out", "both"]
+				},
+				"durationMs": {
+					"type": "integer",
+					"minimum": 0,
+					"maximum": 600000
+				},
+				"name": {
+					"type": "string",
+					"maxLength": 128
+				},
+				"value": {
+					"type": "string",
+					"maxLength": 1024
+				},
+				"scope": {
+					"type": "string",
+					"enum": ["channel", "export", "global"]
+				},
+				"cause": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 48,
+					"pattern": "^[A-Z][A-Z0-9_]*$"
+				}
+			},
+			"additionalProperties": false
+		}
+	},
+	"required": ["orgId", "sessionId", "callId", "legId", "verb"],
+	"additionalProperties": false
+}

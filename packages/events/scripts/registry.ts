@@ -478,6 +478,24 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		request: RPC_CONTRACTS["rpc.engine.v1.park-handoff"].request,
 		response: RPC_CONTRACTS["rpc.engine.v1.park-handoff"].response,
 	},
+	// The session protocol. Both are PREFIXES — the wire subject appends an instance token
+	// (`session-verb`) or an org and application token (`announce`) — and both are emitted for the
+	// reason the two entries above are: the Go side reads the same taxonomy, and a subject the
+	// generated package does not name reads as a subject that does not exist.
+	{
+		subject: "rpc.engine.v1.session-verb",
+		goName: "SessionVerb",
+		timeoutMs: RPC_CONTRACTS["rpc.engine.v1.session-verb"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.engine.v1.session-verb"].request,
+		response: RPC_CONTRACTS["rpc.engine.v1.session-verb"].response,
+	},
+	{
+		subject: "rpc.session.v1.announce",
+		goName: "SessionAnnounce",
+		timeoutMs: RPC_CONTRACTS["rpc.session.v1.announce"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.session.v1.announce"].request,
+		response: RPC_CONTRACTS["rpc.session.v1.announce"].response,
+	},
 ];
 
 /** The base envelope, emitted as JSON Schema only — its Go form is hand-written `Envelope[T]`. */

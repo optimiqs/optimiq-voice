@@ -72,6 +72,7 @@ export const PERMISSIONS = [
 	"park-lots.write",
 	"park-lots.delete",
 	"calls.originate",
+	"calls.control",
 	"calls.supervise",
 	"recordings.read",
 	"recordings.read.own",
@@ -549,12 +550,17 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 	{
 		resource: "calls",
 		label: "Calls",
-		description: "Placing calls from the platform, and listening in on calls already in progress.",
+		description: "Placing calls from the platform, controlling them from an external application, and listening in on calls already in progress.",
 		permissions: [
 			{
 				permission: "calls.originate",
 				label: "Place calls",
 				description: "Ring an extension and connect it to a destination — the click-to-dial button. Off-net destinations are billed to the organization.",
+			},
+			{
+				permission: "calls.control",
+				label: "Control calls programmatically",
+				description: "Connect an external application to the session protocol and take control of every call the dial plan routes to it — answering, playing audio, collecting digits, recording, dialling and hanging up.",
 			},
 			{
 				permission: "calls.supervise",
@@ -870,6 +876,7 @@ export const SYSTEM_ROLE_TEMPLATES: readonly SystemRoleTemplate[] = [
 			"park-lots.write",
 			"park-lots.delete",
 			"calls.originate",
+			"calls.control",
 			"calls.supervise",
 			"recordings.read",
 			"recordings.read.own",
@@ -973,6 +980,7 @@ export const SYSTEM_ROLE_TEMPLATES: readonly SystemRoleTemplate[] = [
 			"park-lots.write",
 			"park-lots.delete",
 			"calls.originate",
+			"calls.control",
 			"calls.supervise",
 			"recordings.read",
 			"recordings.read.own",

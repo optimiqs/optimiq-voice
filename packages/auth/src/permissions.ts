@@ -163,8 +163,52 @@ export const PERMISSIONS = [
 	 * today, and `live-topics.ts` already recorded that the live feed rides `cdr.read` until a
 	 * wallboard role needs otherwise. Adding a permission for a surface that does not exist would
 	 * be spending the ceiling on documentation.
+	 *
+	 * That last paragraph is now out of date in one place and deliberately left standing as the
+	 * record: the surface arrived, and it brought `calls.control` with it. See below.
 	 */
 	"calls.originate",
+
+	/**
+	 * Taking control of a live call from outside the platform — the session protocol.
+	 *
+	 * The grant behind `GET /api/v1/session`: an external application opens a WebSocket, claims an
+	 * `application` name for the organization, and from then on every call the dial plan routes to
+	 * that name is handed to it — with the full verb surface, one command at a time, for as long as
+	 * the call lasts. `calls.originate` above predicted a permission like this and declined to mint
+	 * one on the grounds that "adding a permission for a surface that does not exist would be
+	 * spending the ceiling on documentation". The surface exists now.
+	 *
+	 * It is NOT a ride on `calls.originate`, and the difference is the direction of the power.
+	 * Origination makes one phone ring, once, and its blast radius is a trunk minute. This grant is
+	 * standing authority over calls that have not happened yet: the holder can answer a customer's
+	 * call, record it, dial a third party into it and hang it up, on every call for as long as the
+	 * socket stays open. A click-to-dial button and a programmable call flow are not the same
+	 * decision, and an administrator handing out the first should not silently be handing out the
+	 * second.
+	 *
+	 * It is NOT a ride on `routes.write` either, which is the other grant that decides where calls
+	 * go. That one is CONFIGURATION and it is where the `application` destination is created — but
+	 * creating the destination is naming a hole in the dial plan, and this is the permission to
+	 * stand in it. Two different people can reasonably hold those: the telephony administrator
+	 * points a DID at `crm`, and the integration's API key is what may then be `crm`.
+	 *
+	 * And it is NOT `calls.supervise`, though the two are the only grants here that reach live
+	 * audio. Supervision is a power over a call the holder was never part of, exercised silently,
+	 * and the entry above says why that makes it manager-only. This one only ever receives calls the
+	 * organization's own dial plan deliberately sent to it — a destination somebody configured, not
+	 * an arbitrary conversation the holder chose. It is the difference between answering a phone and
+	 * listening at a door.
+	 *
+	 * ONE entry, and the claim is inside it rather than beside it. A separate
+	 * `applications.register` was drafted, so that "may connect" and "may claim the name `crm`"
+	 * could be granted apart. It was dropped because there is nothing to do with the first without
+	 * the second: a session socket that has claimed no application receives no calls and can send no
+	 * verbs, so a grant for it would authorise an idle connection. The name a socket may claim is a
+	 * question of WHICH application, not of whether — and if that ever needs bounding, the answer is
+	 * a scoped variant here, not a second resource.
+	 */
+	"calls.control",
 
 	/**
 	 * Listening to a colleague's call while it is happening — `*0` supervision: monitor, whisper,
@@ -868,7 +912,9 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 	{
 		resource: "calls",
 		label: "Calls",
-		description: "Placing calls from the platform, and listening in on calls already in progress.",
+		description:
+			"Placing calls from the platform, controlling them from an external application, and " +
+			"listening in on calls already in progress.",
 		permissions: [
 			{
 				permission: "calls.originate",
@@ -876,6 +922,14 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 				description:
 					"Ring an extension and connect it to a destination — the click-to-dial button. " +
 					"Off-net destinations are billed to the organization.",
+			},
+			{
+				permission: "calls.control",
+				label: "Control calls programmatically",
+				description:
+					"Connect an external application to the session protocol and take control of every " +
+					"call the dial plan routes to it — answering, playing audio, collecting digits, " +
+					"recording, dialling and hanging up.",
 			},
 			{
 				permission: "calls.supervise",
@@ -1247,6 +1301,21 @@ const MANAGER_PERMISSIONS = [
 	 * when somebody edits this list.
 	 */
 	"calls.supervise",
+	/**
+	 * `calls.control` is NOT here, and it is the one `calls.*` grant a manager does not get.
+	 *
+	 * Not because it is more dangerous than supervision — nothing in this registry is — but because
+	 * it is a different KIND of decision. The two grants above are things a manager does to a call
+	 * that is happening in front of them, on a screen, one at a time. This one connects a piece of
+	 * software to the call path and leaves it there: every call the dial plan routes to that
+	 * application, from the moment the socket opens until somebody notices it is still open. That
+	 * is an integration, and choosing which software sits inside the phone system is an
+	 * administrator's call in the same way choosing which trunk carries the traffic is.
+	 *
+	 * If a tenant wants their floor manager to run the CRM integration, a custom role grants it —
+	 * which is exactly what custom roles are for, and is a decision with a name attached rather than
+	 * a capability forty people inherited.
+	 */
 	"members.read",
 	/**
 	 * Device provisioning, minus the credential.

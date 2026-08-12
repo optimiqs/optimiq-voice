@@ -1,0 +1,110 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"ok": {
+			"type": "boolean"
+		},
+		"verb": {
+			"type": "string",
+			"enum": [
+				"answer",
+				"ringing",
+				"play",
+				"stopPlay",
+				"gather",
+				"record",
+				"dial",
+				"bridge",
+				"unbridge",
+				"transfer",
+				"hold",
+				"unhold",
+				"park",
+				"unpark",
+				"playDtmf",
+				"mute",
+				"unmute",
+				"setVariable",
+				"sleep",
+				"hangup"
+			]
+		},
+		"instanceId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"endReason": {
+			"type": "string",
+			"enum": ["completed", "terminator", "timeout", "cancelled", "hangup", "failed"]
+		},
+		"reason": {
+			"type": "string",
+			"enum": [
+				"bad_request",
+				"unknown-leg",
+				"session-mismatch",
+				"not-permitted",
+				"unsupported",
+				"shutting-down",
+				"internal"
+			]
+		},
+		"error": {
+			"type": "string",
+			"maxLength": 512
+		},
+		"playbackRef": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"elapsedMs": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 9007199254740991
+		},
+		"digits": {
+			"maxItems": 64,
+			"type": "array",
+			"items": {
+				"type": "string",
+				"pattern": "^[0-9*#A-D]$"
+			}
+		},
+		"recordingId": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"mediaRef": {
+			"type": "string",
+			"maxLength": 512
+		},
+		"durationMs": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 9007199254740991
+		},
+		"format": {
+			"type": "string",
+			"maxLength": 16
+		},
+		"answeredTargetIndex": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 9007199254740991
+		},
+		"cause": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 48,
+			"pattern": "^[A-Z][A-Z0-9_]*$"
+		},
+		"bridgeId": {
+			"type": "string",
+			"maxLength": 128
+		}
+	},
+	"required": ["ok", "verb", "instanceId"],
+	"additionalProperties": false
+}

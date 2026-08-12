@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { createEntityId } from "@optimiq-voice/identifiers";
 import {
 	aorSubjectToken,
+	applicationSubjectToken,
 	CALL_EVENTS,
 	EVENT_FAMILIES,
 	eventFamilyForSubject,
@@ -70,6 +71,8 @@ describe("subject roots", () => {
 			mediaUntapSession: "rpc.media.v1.untap-session",
 			engineOriginate: "rpc.engine.v1.originate",
 			engineParkHandoff: "rpc.engine.v1.park-handoff",
+			engineSessionVerb: "rpc.engine.v1.session-verb",
+			sessionAnnounce: "rpc.session.v1.announce",
 		});
 	});
 
@@ -208,6 +211,71 @@ describe("subjectFor.engineParkHandoffRpc", () => {
 		expect(
 			matchesSubject(`${RPC_SUBJECTS.engineParkHandoff}.*`, subjectFor.engineParkHandoffRpc("e1")),
 		).toBe(true);
+	});
+});
+
+describe("subjectFor.engineSessionVerbRpc", () => {
+	it("addresses the instance that owns the leg", () => {
+		expect(subjectFor.engineSessionVerbRpc("engine-2")).toBe("rpc.engine.v1.session-verb.engine-2");
+	});
+
+	it("uses the SAME token the park handoff does, so one grant covers both shapes", () => {
+		const id = "engine.eu-west.internal";
+		expect(subjectFor.engineSessionVerbRpc(id)).toBe(
+			`${RPC_SUBJECTS.engineSessionVerb}.${instanceSubjectToken(id)}`,
+		);
+		expect(
+			matchesSubject(`${RPC_SUBJECTS.engineSessionVerb}.*`, subjectFor.engineSessionVerbRpc(id)),
+		).toBe(true);
+	});
+});
+
+describe("applicationSubjectToken", () => {
+	it("passes a plain application name through, so an operator can read the subject", () => {
+		expect(applicationSubjectToken("autopilot")).toBe("autopilot");
+		expect(applicationSubjectToken("  crm-screenpop  ")).toBe("crm-screenpop");
+	});
+
+	/**
+	 * The whole reason the helper exists: a name with a dot would become two subject tokens, so the
+	 * announce would be published on a subject with one more token than anybody subscribes to and
+	 * the call would silently take the failure path.
+	 */
+	it("hashes anything that is not one token", () => {
+		const token = applicationSubjectToken("Sales IVR (new)");
+		expect(token).toMatch(/^[0-9a-f]{32}$/u);
+		expect(applicationSubjectToken("app.one")).toMatch(/^[0-9a-f]{32}$/u);
+	});
+
+	/**
+	 * Case is NOT folded. Two names that differ only in case are two registrations, because folding
+	 * them would deliver one tenant's `Support` calls to whoever claimed `support` first.
+	 */
+	it("keeps case, so two spellings are two applications", () => {
+		expect(applicationSubjectToken("Support")).not.toBe(applicationSubjectToken("support"));
+	});
+
+	it("rejects an empty application name", () => {
+		expect(() => applicationSubjectToken("   ")).toThrow(SubjectTokenError);
+	});
+});
+
+describe("subjectFor.sessionAnnounceRpc", () => {
+	it("puts the organization before the application, so a tenant's names are its own", () => {
+		expect(subjectFor.sessionAnnounceRpc(ORG, "autopilot")).toBe(
+			`rpc.session.v1.announce.${ORG}.autopilot`,
+		);
+	});
+
+	it("separates the same application name in two organizations", () => {
+		const other = "018f2b7c-0000-7000-8000-0000000000ff";
+		expect(subjectFor.sessionAnnounceRpc(ORG, "crm")).not.toBe(
+			subjectFor.sessionAnnounceRpc(other, "crm"),
+		);
+	});
+
+	it("refuses an org id that is not a subject token", () => {
+		expect(() => subjectFor.sessionAnnounceRpc("*", "crm")).toThrow(SubjectTokenError);
 	});
 });
 

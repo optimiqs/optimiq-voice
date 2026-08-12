@@ -16,6 +16,8 @@ import { JetStreamService } from "../nats/jetstream.service";
 import { CALLS_EFFECT_RUNTIME, ENGINE_ENV, MEDIA_PORT } from "../nats/nats.tokens";
 import { OriginateService } from "../nats/originate.service";
 import { ParkHandoffService } from "../nats/park-handoff.service";
+import { SessionAnnounceService } from "../nats/session-announce.service";
+import { SessionVerbService } from "../nats/session-verb.service";
 import { SipTransferService } from "../nats/sip-transfer.service";
 import { AgentStateStore } from "../queue/agent-state.store";
 import { QueueEventPublisher } from "../queue/queue-event-publisher.service";
@@ -35,6 +37,7 @@ import { TrunkCapacityRegistry } from "../routing/trunk-capacity";
 import { TrunkStatusPublisher } from "../routing/trunk-status.publisher";
 import { VoicemailGreetingRpcPort } from "../routing/voicemail-greeting.source";
 import { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
+import { ApplicationSessions } from "../session/application-sessions";
 import { dtmfEventFrom } from "../verbs/dtmf-inbox";
 import { DtmfRegistry } from "../verbs/dtmf-registry";
 import { callDirectionFrom, dialStringOr, hangupSideFor } from "./ari-mapping";
@@ -66,6 +69,7 @@ import type {
 	WalkerCallControl,
 	WalkerChannel,
 } from "../routing/plan-walker";
+import type { VerbDispatchOutcome } from "../session/application-sessions";
 import type { VerbChannelContext, VerbExecutorRuntime } from "../verbs/verb-executor";
 import type {
 	CallControlHost,
@@ -179,6 +183,8 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	private draining = false;
 	/** Hold, transfer, park, pickup and on-demand recording, over the ports below. */
 	private readonly control: CallControl;
+	/** Calls this instance has handed to an external application. See `application-sessions.ts`. */
+	private readonly sessions: ApplicationSessions;
 	/** `*1` / `*3` / `*5` pressed mid-conversation, and the attended-transfer cancel key. */
 	private readonly midCall: MidCallFeatureRuntime;
 	/**
@@ -236,6 +242,14 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		 * provides it; `@Optional()` only widens what Nest tolerates, not what production wires.
 		 */
 		@Optional() private readonly trunkStatus?: TrunkStatusPublisher,
+		/**
+		 * The session protocol's two halves. Optional and last, for the same reason `trunkStatus` is:
+		 * the spec harnesses construct this class positionally and none of them speaks the session
+		 * protocol. Their absence is a real deployment — an engine whose `application` destinations
+		 * announce because there is no control plane to hand a call to — rather than a broken one.
+		 */
+		@Optional() private readonly sessionAnnounce?: SessionAnnounceService,
+		@Optional() private readonly sessionVerbs?: SessionVerbService,
 	) {
 		this.control = new CallControl({
 			media: this.media,
@@ -315,6 +329,37 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		// Click-to-call, arriving from `apps/api` on `rpc.engine.v1.originate`. Same push, same reason.
 		this.originate.attach({
 			place: async (request) => await this.placeOriginatedCall(request),
+		});
+		// The session protocol. Built here rather than injected for the reason `CallControl` is: it
+		// needs the verb executor and the channel registry, both of which are this class's, and a
+		// provider that reached back for them would be the Nest cycle `call-control-registry.ts`
+		// exists to break.
+		this.sessions = new ApplicationSessions({
+			announce: async (request) =>
+				(await this.sessionAnnounce?.announce(request)) ?? {
+					accepted: false,
+					reason: "no-application",
+					error: "this engine has no session client",
+				},
+			execute: async (legId, verb) => await this.executeForSession(legId, verb),
+			instanceId: this.env.ENGINE_INSTANCE_ID,
+			log: (message, detail) => {
+				this.logger.info(detail ?? {}, message);
+			},
+		});
+		// A draining instance refuses verbs rather than half-running them, exactly as it refuses park
+		// handoffs: it is about to hang its remaining legs up, and a `gather` accepted now would wait
+		// thirty seconds for digits on a channel this process is closing.
+		this.sessionVerbs?.attach({
+			execute: async (request) =>
+				this.draining
+					? {
+							ok: false,
+							verb: request.verb,
+							reason: "shutting-down",
+							error: "this instance is draining",
+						}
+					: await this.sessions.execute(request),
 		});
 	}
 
@@ -1028,6 +1073,42 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				cursor: this.queueCursors,
 			},
 			control: this.walkerCallControlFor(aggregate),
+			// The `application` destination. `run` blocks for the length of the session — see
+			// `applicationNode` — so this is the one walker port whose promise outlives the node.
+			application: {
+				run: async (request) => {
+					const outcome = await this.sessions.run({
+						application: request.application,
+						leg: {
+							legId: aggregate.channelId,
+							callId: aggregate.callId,
+							organizationId: aggregate.organizationId,
+							isAnswered: aggregate.isAnswered,
+							...(aggregate.snapshot.profile.callerIdNumber === undefined
+								? {}
+								: { callerIdNumber: aggregate.snapshot.profile.callerIdNumber }),
+							...(aggregate.snapshot.profile.callerIdName === undefined
+								? {}
+								: { callerIdName: aggregate.snapshot.profile.callerIdName }),
+						},
+						// The SIGNALLING direction, which is what an application needs to know: whether this
+						// call arrived at the platform or left it. The organizational `internal` third
+						// value is a classification the channel does not carry.
+						direction: aggregate.snapshot.direction === "outbound" ? "outbound" : "inbound",
+						...(aggregate.snapshot.profile.destinationNumber === undefined
+							? {}
+							: { dialedNumber: aggregate.snapshot.profile.destinationNumber }),
+						...(request.arguments === undefined ? {} : { arguments: request.arguments }),
+					});
+					// `sessionId` is bookkeeping the walker has no use for — it addresses nothing from
+					// there — so it is dropped at this seam rather than widening the walker's port.
+					return outcome.kind === "unavailable"
+						? { kind: "unavailable", reason: outcome.reason }
+						: outcome.kind === "aborted"
+							? { kind: "aborted" }
+							: { kind: "hangup", cause: outcome.cause };
+				},
+			},
 			trunkCapacity: this.trunkCapacity,
 			onDestination: async (destination) => {
 				await this.recordDestination(aggregate, destination);
@@ -1055,6 +1136,15 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	 */
 	private controlledLegFor(mediaChannelId: string): ControlledLeg | undefined {
 		const aggregate = this.registry.byAriChannelId(mediaChannelId);
+		return aggregate === undefined ? undefined : this.controlledLeg(aggregate);
+	}
+
+	/**
+	 * The same lookup keyed by the DOMAIN leg id — the identifier everything outside this process
+	 * uses. See {@link CallControlHost.legByLegId} for why both exist.
+	 */
+	private controlledLegByLegId(legId: string): ControlledLeg | undefined {
+		const aggregate = this.registry.byDomainChannelId(legId);
 		return aggregate === undefined ? undefined : this.controlledLeg(aggregate);
 	}
 
@@ -1121,6 +1211,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	private callControlHost(): CallControlHost {
 		return {
 			legFor: (mediaChannelId) => this.controlledLegFor(mediaChannelId),
+			legByLegId: (legId) => this.controlledLegByLegId(legId),
 			ringingFor: async (leg, extension) => await this.ringingCandidates(leg, extension),
 			activeCallsFor: (leg, extension) => this.supervisionTargets(leg, extension),
 			publish: async (leg, type, data) => {
@@ -1805,6 +1896,70 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		return undefined;
 	}
 
+	/**
+	 * Runs one verb for the session protocol, keeping the typed failure instead of collapsing it.
+	 *
+	 * The sibling of {@link ChannelOrchestrator.execute} and deliberately not a call into it: that
+	 * one answers a PLAN WALKER, whose only question is "did the verb work", and it turns every
+	 * failure into `undefined` with a log line. An external application needs the difference —
+	 * `unsupported` means stop asking, `not-permitted` means the leg is not in a state for this and
+	 * the reason says which — so this path preserves the failure's tag and message all the way to
+	 * the socket.
+	 */
+	private async executeForSession(legId: string, verb: Verb): Promise<VerbDispatchOutcome> {
+		const aggregate = this.registry.byDomainChannelId(legId);
+		if (aggregate === undefined) {
+			return { ok: false, reason: "internal", error: "this engine is no longer handling the leg" };
+		}
+		if (verb.verb === "hangup") {
+			// The same first-wins cause fix `execute` performs, and for the same reason: without it
+			// every call an application ended would report the media server's generic code instead of
+			// the cause the application chose.
+			aggregate.markHangup({
+				cause: verb.cause ?? "NORMAL_CLEARING",
+				at: Date.now(),
+				initiatedByEngine: true,
+			});
+		}
+
+		const context: VerbChannelContext = {
+			mediaChannelId: aggregate.ariChannelId,
+			channelId: aggregate.channelId,
+			isTearingDown: aggregate.isTearingDown,
+			hasMediaPath: aggregate.isAnswered,
+		};
+		const exit = await this.runtime.runPromiseExit((executor) => executor.dispatch(context, verb));
+		if (Exit.isSuccess(exit)) {
+			return { ok: true, result: exit.value };
+		}
+		const failure = Cause.findErrorOption(exit.cause);
+		if (failure._tag === "None") {
+			this.logger.error(
+				{ verb: verb.verb, channelId: legId, cause: Cause.pretty(exit.cause) },
+				"a session verb died rather than failing",
+			);
+			return { ok: false, reason: "internal", error: "the verb died" };
+		}
+		const error = failure.value;
+		switch (error._tag) {
+			case "UnsupportedVerbFailure":
+				return {
+					ok: false,
+					reason: "unsupported",
+					error: `the engine does not implement ${error.verb}`,
+				};
+			case "VerbNotPermittedFailure":
+				return { ok: false, reason: "not-permitted", error: error.reason };
+			case "MediaCommandFailure":
+				return { ok: false, reason: "not-permitted", error: error.detail };
+			default:
+				// `UnknownChannelFailure` — the leg vanished between the registry lookup above and the
+				// dispatch. Reported as `internal` rather than `unknown-leg`, which the session layer
+				// owns and which means something more specific: the SESSION does not name this leg.
+				return { ok: false, reason: "internal", error: `the leg ${error.channelId} is unknown` };
+		}
+	}
+
 	// -------------------------------------------------------------------------------------------
 	// Progress
 	// -------------------------------------------------------------------------------------------
@@ -2068,6 +2223,11 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		if (aggregate === undefined) {
 			return;
 		}
+		// Releases the walk an application has been holding, and does it BEFORE the state checks
+		// below so that a leg reaped in any state frees its session. An application whose caller hung
+		// up finds out from the call events on its socket; what this guarantees is that the ENGINE
+		// stops holding a promise for a channel that no longer exists.
+		this.sessions.legEnded(aggregate.channelId);
 		if (aggregate.state === "reporting") {
 			await this.finishReporting(aggregate, causeCode);
 			return;

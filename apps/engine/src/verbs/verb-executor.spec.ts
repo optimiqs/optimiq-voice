@@ -241,15 +241,10 @@ describe("failures", () => {
 
 	it("reports an unimplemented verb honestly rather than silently doing nothing", async () => {
 		const failure = failureValue(
-			await run(fakeMedia().port, ANSWERED, {
-				verb: "dial",
-				targets: [{ kind: "extension", destination: "1001" }],
-				strategy: "simultaneous",
-				timeoutMs: 30_000,
-			}),
+			await run(fakeMedia().port, ANSWERED, { verb: "say", text: "hi" }),
 		);
 		expect(failure).toBeInstanceOf(UnsupportedVerbFailure);
-		expect((failure as UnsupportedVerbFailure).verb).toBe("dial");
+		expect((failure as UnsupportedVerbFailure).verb).toBe("say");
 	});
 });
 
@@ -358,6 +353,18 @@ describe("call-control verbs", () => {
 					return { result: { ok: true }, recordingId: "rec-1", objectKey: "org/call/rec-1.wav" };
 				},
 				stopRecording: async () => ({ ok: true }),
+				dial: async (_leg, request) => {
+					calls.push({ verb: "dial", args: request });
+					return { result: { ok: true }, answeredTargetIndex: 0, bridged: true, notes: [] };
+				},
+				bridge: async (_leg, request) => {
+					calls.push({ verb: "bridge", args: request });
+					return { result: { ok: true }, bridgeId: "b-1" };
+				},
+				unbridge: async () => {
+					calls.push({ verb: "unbridge", args: undefined });
+					return { ok: true };
+				},
 				hasPendingTransfer: () => false,
 				onLegEnded: async () => undefined,
 				...port,
@@ -452,6 +459,103 @@ describe("call-control verbs", () => {
 		expect((failure as VerbNotPermittedFailure).reason).toContain("not handling the leg");
 	});
 
+	/**
+	 * The dial verb, and the four properties that matter about it. Each one is a decision recorded
+	 * in the executor and in `CallControlPort.dial`, so each gets an assertion here rather than a
+	 * comment somewhere.
+	 */
+	it("dials sequentially through the routing seam, so the toll gate applies", async () => {
+		const bound = boundExecutor();
+		const result = successValue(
+			await bound.dispatch({
+				verb: "dial",
+				strategy: "sequential",
+				timeoutMs: 30_000,
+				targets: [
+					{ kind: "extension", destination: "1001" },
+					{ kind: "external", destination: "+15551230000" },
+				],
+				continueOnCauses: ["USER_BUSY"],
+			}),
+		);
+		expect(result).toMatchObject({ verb: "dial", endReason: "completed", answeredTargetIndex: 0 });
+		expect(bound.calls[0]).toEqual({
+			verb: "dial",
+			args: {
+				targets: [
+					// No context on an extension: `internal` then `outbound`, the `*69` walk.
+					{ destination: "1001" },
+					// An external target resolves in the OUTBOUND rules, which is where the toll gate is.
+					{ destination: "+15551230000", context: "outbound" },
+				],
+				continueOnCauses: ["USER_BUSY"],
+			},
+		});
+	});
+
+	it("refuses ring-all by name rather than quietly dialling one target at a time", async () => {
+		const bound = boundExecutor();
+		const failure = failureValue(
+			await bound.dispatch({
+				verb: "dial",
+				strategy: "simultaneous",
+				timeoutMs: 30_000,
+				targets: [{ kind: "extension", destination: "1001" }],
+			}),
+		);
+		expect(failure).toBeInstanceOf(VerbNotPermittedFailure);
+		expect((failure as VerbNotPermittedFailure).reason).toContain("sequentially");
+		// And nothing was dialled — the refusal happens before the seam is touched.
+		expect(bound.calls).toEqual([]);
+	});
+
+	/**
+	 * "Nobody answered" is an ANSWER. Turning it into a typed failure would throw the hangup cause
+	 * away at the one point an application most needs it — deciding whether to try the next number
+	 * or send the caller to voicemail.
+	 */
+	it("returns a dial nobody answered as a result carrying the cause, not as a failure", async () => {
+		const bound = boundExecutor({
+			dial: async () => ({
+				result: { ok: false, reason: "no target answered" },
+				cause: "NO_ANSWER",
+				bridged: false,
+				notes: [],
+			}),
+		});
+		const result = successValue(
+			await bound.dispatch({
+				verb: "dial",
+				strategy: "sequential",
+				timeoutMs: 10_000,
+				targets: [{ kind: "extension", destination: "1001" }],
+			}),
+		);
+		expect(result).toMatchObject({ verb: "dial", endReason: "failed", cause: "NO_ANSWER" });
+	});
+
+	it("bridges by DOMAIN leg id — the only identifier anything outside the engine holds", async () => {
+		const bound = boundExecutor();
+		const result = successValue(await bound.dispatch({ verb: "bridge", legId: "leg-abc" }));
+		expect(result).toEqual({ verb: "bridge", endReason: "completed" });
+		expect(bound.calls[0]).toEqual({ verb: "bridge", args: { peerLegId: "leg-abc" } });
+	});
+
+	it("turns a refused bridge into a typed failure carrying the reason", async () => {
+		const bound = boundExecutor({
+			bridge: async () => ({ result: { ok: false, reason: "no leg leg-abc on this engine" } }),
+		});
+		const failure = failureValue(await bound.dispatch({ verb: "bridge", legId: "leg-abc" }));
+		expect(failure).toBeInstanceOf(VerbNotPermittedFailure);
+		expect((failure as VerbNotPermittedFailure).reason).toContain("no leg leg-abc");
+	});
+
+	it("unbridges without hanging anything up", async () => {
+		const bound = boundExecutor();
+		successValue(await bound.dispatch({ verb: "unbridge" }));
+		expect(bound.calls).toEqual([{ verb: "unbridge", args: undefined }]);
+	});
+
 	it("refuses park on a leg with no media path — an orbit nobody can hear is not a park", async () => {
 		const bound = boundExecutor();
 		const registry = new CallControlRegistry();
@@ -487,6 +591,9 @@ describe("dispatch coverage", () => {
 		"mute",
 		"unmute",
 		"sleep",
+		"dial",
+		"bridge",
+		"unbridge",
 	]);
 
 	it("handles every verb name in the protocol — implemented or explicitly unsupported", () => {
@@ -505,9 +612,6 @@ describe("dispatch coverage", () => {
 			{ verb: "playbackControl", action: "pause" },
 			{ verb: "say", text: "hello" },
 			{ verb: "stopSay" },
-			{ verb: "dial", targets: [], strategy: "simultaneous", timeoutMs: 1_000 },
-			{ verb: "bridge", legId: "x" },
-			{ verb: "unbridge" },
 			{ verb: "stream", direction: "both" },
 			{ verb: "stopStream" },
 			{ verb: "streamGather" },

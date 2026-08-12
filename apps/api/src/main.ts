@@ -20,6 +20,8 @@ import { isPbxAreaEnabled, registerPbxTransport } from "./pbx/pbx-bootstrap";
 import { PbxCdrPortsModule } from "./pbx/pbx-cdr-ports.module";
 import { PbxModule } from "./pbx/pbx.module";
 import { ProvisioningModule } from "./provisioning/provisioning.module";
+import { registerSessionTransport } from "./session/session-bootstrap";
+import { SessionModule } from "./session/session.module";
 import { assertStoragePreflight, loadStorageEnv } from "./storage";
 import {
 	assertTranscriptionPreflight,
@@ -188,7 +190,7 @@ async function bootstrap() {
 	 * the CDR consumers inject the tokens `@Optional()` and degrade to the platform env values.
 	 */
 	const extraModules = [
-		...(pbxAreaEnabled ? [PbxModule, ProvisioningModule, LiveModule] : []),
+		...(pbxAreaEnabled ? [PbxModule, ProvisioningModule, LiveModule, SessionModule] : []),
 		...(cdrAreaEnabled ? [CdrModule] : []),
 		...(pbxAreaEnabled && cdrAreaEnabled ? [PbxCdrPortsModule] : []),
 	];
@@ -233,6 +235,7 @@ async function bootstrap() {
 	if (pbxAreaEnabled) {
 		await registerPbxTransport(app);
 		await registerLiveTransport(app);
+		await registerSessionTransport(app);
 	}
 
 	await app.listen(HTTP_BRIDGE_PORT, "0.0.0.0");

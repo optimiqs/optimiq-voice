@@ -192,6 +192,7 @@ function harness(options: HarnessOptions = {}) {
 
 	const host: CallControlHost = {
 		legFor: (mediaChannelId) => legs.get(mediaChannelId),
+		legByLegId: (legId) => [...legs.values()].find((leg) => leg.legId === legId),
 		ringingFor: async () => options.ringing ?? [],
 		activeCallsFor: () => options.monitorable ?? [],
 		publish: async (leg, type, data) => {

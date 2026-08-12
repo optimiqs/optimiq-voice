@@ -63,6 +63,7 @@ export {
 } from "./streams";
 export {
 	aorSubjectToken,
+	applicationSubjectToken,
 	CALL_EVENTS,
 	didIndexToken,
 	EVENT_FAMILIES,

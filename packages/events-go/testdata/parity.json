@@ -33,7 +33,9 @@
 		"mediaTapSession": "rpc.media.v1.tap-session",
 		"mediaUntapSession": "rpc.media.v1.untap-session",
 		"engineOriginate": "rpc.engine.v1.originate",
-		"engineParkHandoff": "rpc.engine.v1.park-handoff"
+		"engineParkHandoff": "rpc.engine.v1.park-handoff",
+		"engineSessionVerb": "rpc.engine.v1.session-verb",
+		"sessionAnnounce": "rpc.session.v1.announce"
 	},
 	"queueScopeAll": "_all",
 	"aorSubjectTokens": [

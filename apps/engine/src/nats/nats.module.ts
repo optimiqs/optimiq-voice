@@ -8,6 +8,8 @@ import { JetStreamService } from "./jetstream.service";
 import { CALL_EVENTS_CLIENT, ENGINE_ENV, ROUTING_RPC_CLIENT } from "./nats.tokens";
 import { OriginateService } from "./originate.service";
 import { ParkHandoffService } from "./park-handoff.service";
+import { SessionAnnounceService } from "./session-announce.service";
+import { SessionVerbService } from "./session-verb.service";
 import { SipTransferService } from "./sip-transfer.service";
 import type { EngineEnv } from "../config/engine-env";
 
@@ -84,6 +86,8 @@ import type { EngineEnv } from "../config/engine-env";
 		CallEventPublisher,
 		OriginateService,
 		ParkHandoffService,
+		SessionAnnounceService,
+		SessionVerbService,
 		SipTransferService,
 	],
 	exports: [
@@ -93,6 +97,8 @@ import type { EngineEnv } from "../config/engine-env";
 		CallEventPublisher,
 		OriginateService,
 		ParkHandoffService,
+		SessionAnnounceService,
+		SessionVerbService,
 		SipTransferService,
 	],
 })

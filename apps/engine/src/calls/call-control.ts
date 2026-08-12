@@ -194,6 +194,21 @@ export interface CallControlHost {
 	/** The leg with this media id, or `undefined` when this process is not handling it. */
 	legFor(mediaChannelId: string): ControlledLeg | undefined;
 	/**
+	 * The leg with this DOMAIN id, or `undefined` when this process is not handling it.
+	 *
+	 * The second lookup on this host, and the reason it exists rather than being folded into
+	 * {@link legFor}: the two take different keys and neither can be derived from the other without
+	 * a scan. Everything INSIDE the engine addresses a leg by its media-server channel id, because
+	 * that is what the media plane's events carry. Everything OUTSIDE it — a CDR row, a call event,
+	 * a webhook, and now a session-protocol `bridge` verb — addresses it by the domain leg id,
+	 * because a media channel id is an implementation detail of whichever driver is loaded and
+	 * changes if the call is re-created.
+	 *
+	 * So this is the seam an external application's leg reference lands on, and it is deliberately
+	 * the ONLY one: nothing above the engine is ever handed a media channel id to send back.
+	 */
+	legByLegId(legId: string): ControlledLeg | undefined;
+	/**
 	 * Phones currently being alerted for `extension`, longest-ringing first.
 	 *
 	 * Asynchronous because a GROUP pickup has to know the caller's pickup group, and that lives in
@@ -418,6 +433,56 @@ export interface MonitorRequest {
 	readonly supervisorExtension: string;
 }
 
+/**
+ * One destination a `dial` verb should try, in order.
+ *
+ * Deliberately just a destination and a context — NOT an endpoint, a trunk or a dial string. The
+ * verb re-enters ROUTING for each entry, which is what makes an application's `dial` obey the same
+ * outbound rules, the same caller-id policy and the same toll gates a handset does. An application
+ * that could name a trunk directly would be a way to dial internationally from a tenant that has
+ * international calling switched off, and the whole reason `*69` was built on `route` rather than
+ * on `originate` was to avoid exactly that.
+ */
+export interface DialLegTarget {
+	readonly destination: string;
+	/** `internal` first then `outbound` when omitted — the same walk `*69` performs. */
+	readonly context?: "internal" | "outbound";
+}
+
+export interface DialLegRequest {
+	readonly targets: readonly DialLegTarget[];
+	/**
+	 * Causes that allow the dial to move on to the next target.
+	 *
+	 * Empty or absent means STOP at the first failure, never "try everything": retrying a
+	 * `CALL_REJECTED` down a list is how a toll-fraud loop is written by accident. The same rule
+	 * `DialVerb.continueOnCauses` states in `packages/telephony`.
+	 */
+	readonly continueOnCauses?: readonly HangupCause[];
+}
+
+export interface DialLegOutcome {
+	readonly result: CallControlResult;
+	/** Which entry of `targets` answered, when one did. */
+	readonly answeredTargetIndex?: number;
+	/** The cause of the last attempt that did not connect. */
+	readonly cause?: HangupCause;
+	/** Whether the leg is now bridged to the target and no longer this application's to talk to. */
+	readonly bridged: boolean;
+	readonly notes: readonly string[];
+}
+
+/** Join this leg to another one this engine is holding, addressed by DOMAIN leg id. */
+export interface BridgeLegRequest {
+	readonly peerLegId: string;
+}
+
+export interface BridgeLegOutcome {
+	readonly result: CallControlResult;
+	/** The bridge both legs are now in. Present exactly when the result is `ok`. */
+	readonly bridgeId?: string;
+}
+
 export interface StartRecordingRequest {
 	readonly maxDurationMs?: number;
 	readonly silenceStopMs?: number;
@@ -438,6 +503,9 @@ export interface CallControlPort {
 	monitor(leg: ControlledLeg, request: MonitorRequest): Promise<CallControlResult>;
 	startRecording(leg: ControlledLeg, request?: StartRecordingRequest): Promise<RecordingOutcome>;
 	stopRecording(leg: ControlledLeg): Promise<CallControlResult>;
+	dial(leg: ControlledLeg, request: DialLegRequest): Promise<DialLegOutcome>;
+	bridge(leg: ControlledLeg, request: BridgeLegRequest): Promise<BridgeLegOutcome>;
+	unbridge(leg: ControlledLeg): Promise<CallControlResult>;
 	/** Whether an attended transfer initiated by this leg is waiting to be completed. */
 	hasPendingTransfer(mediaChannelId: string): boolean;
 	/** Told by the orchestrator when a leg goes away, so held music, slots and taps are released. */
@@ -2336,6 +2404,235 @@ export class CallControl implements CallControlPort {
 			reason: outcome.reason,
 		});
 		return ok(session.recordingId);
+	}
+
+	// -------------------------------------------------------------------------------------------
+	// Dial and bridge — the session protocol's leg surface
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * Originates towards each target in turn and connects the first that answers.
+	 *
+	 * ## Why this goes through routing and does not originate
+	 *
+	 * Every target is resolved by {@link CallControlHost.route}, which is the same path `*69` takes
+	 * and the same path an inbound call takes. That means an application's `dial` gets, for free and
+	 * without being able to opt out of them: the organization's outbound routes, its caller-id
+	 * policy, its trunk selection and capacity limits, its call-block list and its emergency
+	 * handling. The verb executor could have called `MediaPort.originate` directly and skipped all
+	 * of it — which is precisely why it does not. An integration is the least trusted caller on this
+	 * platform and the one most likely to be holding a leaked API key, and a dial that bypassed the
+	 * toll gate would make the session protocol the cheapest way to defraud a tenant.
+	 *
+	 * The cost is that this is SEQUENTIAL, one target at a time. Ring-all with lose-race semantics
+	 * and CDR-correct losers lives in the plan walker, which owns origination; a second originator
+	 * here would be a second, subtly different one. `simultaneous` is refused at the verb, by name,
+	 * rather than silently downgraded — see the verb executor.
+	 *
+	 * ## `continueOnCauses` is the only thing that moves to the next target
+	 *
+	 * A target that connects ends the dial. A target that fails ends it too, UNLESS its cause is in
+	 * the list the application supplied. Absent means "stop", never "keep going": a list that
+	 * defaulted to retrying would turn one `CALL_REJECTED` into sixteen attempts down somebody
+	 * else's number range.
+	 */
+	async dial(leg: ControlledLeg, request: DialLegRequest): Promise<DialLegOutcome> {
+		const notes: string[] = [];
+		if (leg.isTearingDown) {
+			return {
+				result: refuse("the leg is tearing down, so it cannot be used for dial"),
+				bridged: false,
+				notes,
+			};
+		}
+		if (request.targets.length === 0) {
+			return { result: refuse("a dial needs at least one target"), bridged: false, notes };
+		}
+
+		const continueOn = new Set<HangupCause>(request.continueOnCauses ?? []);
+		let lastCause: HangupCause | undefined;
+
+		for (const [index, target] of request.targets.entries()) {
+			// `internal` then `outbound` when the application did not say, which is the walk `*69`
+			// performs: an extension number is not a PSTN number, and trying the toll-bearing context
+			// first would put every internal dial through the outbound rules.
+			const contexts: readonly ("internal" | "outbound")[] =
+				target.context === undefined ? ["internal", "outbound"] : [target.context];
+
+			let outcome: RouteOutcome | undefined;
+			for (const context of contexts) {
+				outcome = await this.deps.host.route(leg, { destination: target.destination, context });
+				notes.push(...outcome.notes);
+				if (outcome.status !== "unresolved") {
+					break;
+				}
+			}
+			if (outcome === undefined || outcome.status === "unresolved") {
+				notes.push(`nothing matched ${target.destination}`);
+				// An unresolved destination is not a hangup cause, so it does not consult
+				// `continueOnCauses` — there was no attempt to continue FROM. The list is about calls
+				// that were placed and failed, and a number that does not route was never placed.
+				continue;
+			}
+			if (outcome.status === "bridged") {
+				return {
+					result: ok(`dialled ${target.destination}`),
+					answeredTargetIndex: index,
+					bridged: true,
+					notes,
+				};
+			}
+			if (outcome.status === "aborted") {
+				// The A-leg went away underneath the dial. There is nobody left to try for.
+				return { result: refuse("the leg went away during the dial"), bridged: false, notes };
+			}
+			lastCause = outcome.cause;
+			if (outcome.cause === undefined || !continueOn.has(outcome.cause)) {
+				return {
+					result: refuse(`${target.destination} did not answer: ${outcome.cause ?? "unknown"}`),
+					bridged: false,
+					...(lastCause === undefined ? {} : { cause: lastCause }),
+					notes,
+				};
+			}
+			notes.push(`${target.destination} failed with ${outcome.cause}; continuing`);
+		}
+
+		return {
+			result: refuse("no target answered"),
+			bridged: false,
+			...(lastCause === undefined ? {} : { cause: lastCause }),
+			notes,
+		};
+	}
+
+	/**
+	 * Joins this leg to another this engine is holding — the `uuid_bridge` equivalent.
+	 *
+	 * ## The tenancy check is the first thing here and is not optional
+	 *
+	 * The peer is named by an application, over a socket, as an opaque string. Everything else in
+	 * this class receives a leg the engine looked up for itself; this is the one operation whose
+	 * TARGET is caller-supplied, which makes it the one place a cross-tenant bridge could be built
+	 * by asking for it. Two legs in different organizations sharing a media bridge is two customers
+	 * on one another's calls, so the organization comparison happens before any media command and
+	 * the refusal deliberately does not distinguish "not yours" from "does not exist" — an
+	 * application that could tell the two apart could enumerate another tenant's live legs.
+	 *
+	 * ## Reuse the peer's bridge when it has one; create one when neither does
+	 *
+	 * Joining an existing bridge rather than building a second is what makes `bridge` work on a leg
+	 * that is already in a conversation — the application is adding this leg to that call, which is
+	 * what an operator means by it. Both legs are pulled out of any OTHER bridge first, because a
+	 * channel in two bridges is a media loop.
+	 */
+	async bridge(leg: ControlledLeg, request: BridgeLegRequest): Promise<BridgeLegOutcome> {
+		const refusal = this.refuseIfUnusable(leg, "bridge");
+		if (refusal !== undefined) {
+			return { result: refusal };
+		}
+		const peer = this.deps.host.legByLegId(request.peerLegId);
+		if (peer === undefined || peer.organizationId !== leg.organizationId) {
+			return { result: refuse(`no leg ${request.peerLegId} on this engine`) };
+		}
+		if (peer.legId === leg.legId) {
+			return { result: refuse("a leg cannot be bridged to itself") };
+		}
+		const peerRefusal = this.refuseIfUnusable(peer, "bridge");
+		if (peerRefusal !== undefined && !peerRefusal.ok) {
+			return { result: refuse(`leg ${peer.legId} is not usable: ${peerRefusal.reason}`) };
+		}
+		if (this.holds.has(leg.mediaChannelId) || this.holds.has(peer.mediaChannelId)) {
+			// Bridging a held leg would put a live conversation on top of hold music, and would leave
+			// the hold record pointing at a bridge that no longer exists. `unhold` first.
+			return { result: refuse("one of the legs is on hold; release it before bridging") };
+		}
+
+		const existing = peer.bridgeId;
+		const bridgeId = existing ?? this.newId();
+		try {
+			if (existing === undefined) {
+				await this.deps.media.createBridge({ bridgeId, name: `session-${leg.callId}` });
+			}
+			for (const member of [leg, peer]) {
+				const held = member.bridgeId;
+				if (held !== undefined && held !== bridgeId) {
+					await this.deps.media.removeFromBridge(held, [member.mediaChannelId]);
+				}
+			}
+			const joining = [
+				leg.mediaChannelId,
+				...(existing === undefined ? [peer.mediaChannelId] : []),
+			];
+			await this.deps.media.addToBridge(bridgeId, joining);
+		} catch (error) {
+			return { result: refuse(`the legs could not be bridged: ${String(error)}`) };
+		}
+
+		leg.setBridge(bridgeId);
+		peer.setBridge(bridgeId);
+		leg.moveTo("exchanging-media");
+		peer.moveTo("exchanging-media");
+		// Both directions, while both legs are up: each CDR carries the other's id whichever dies
+		// first. The same rule every other bridge in this file follows.
+		leg.setBridgePeer(peer.legId);
+		peer.setBridgePeer(leg.legId);
+
+		await this.publishQuietly(leg, "channel.bridged", {
+			legId: leg.legId,
+			peerLegId: peer.legId,
+			bridgeId,
+			mode: this.deps.media.bridgeMode,
+		});
+		return { result: ok(`bridged to ${peer.legId}`), bridgeId };
+	}
+
+	/**
+	 * Takes the leg out of its bridge WITHOUT hanging anything up.
+	 *
+	 * The distinction from `hangup` is the whole verb: after this the application still has the leg
+	 * and can play to it, gather from it or dial somewhere else with it, and the far end is still up
+	 * and is somebody else's problem. Nobody is hung up here, ever — a `bridge` that tore its peer
+	 * down would make "put this caller back in the IVR" impossible to express.
+	 *
+	 * The bridge itself is destroyed when this leg was one of two in it, because a mixing bridge with
+	 * one member is a resource on the media server that nothing will ever come back for. A bridge
+	 * with a third member (a conference, a tap) is left alone.
+	 */
+	async unbridge(leg: ControlledLeg): Promise<CallControlResult> {
+		const bridgeId = leg.bridgeId;
+		if (bridgeId === undefined) {
+			return refuse("the leg is not in a bridge");
+		}
+		// Resolved BEFORE the pointers are cleared: `peerOf` reads `leg.peerMediaChannelId`, and after
+		// `setBridgePeer(undefined)` there is nothing left to resolve.
+		const peer = this.peerOf(leg);
+		try {
+			await this.deps.media.removeFromBridge(bridgeId, [leg.mediaChannelId]);
+		} catch (error) {
+			return refuse(`the leg could not be taken out of its bridge: ${String(error)}`);
+		}
+
+		leg.setBridge(undefined);
+		leg.setBridgePeer(undefined);
+		if (peer !== undefined && peer.bridgeId === bridgeId) {
+			peer.setBridgePeer(undefined);
+		}
+
+		if (peer !== undefined) {
+			// `channel.unbridged` REQUIRES a peer id — the event's whole content is which two legs
+			// stopped hearing each other, and one of them is not that. A leg leaving a bridge whose
+			// other member this instance cannot name (it was reaped, or it is a tap) is therefore not
+			// published rather than published with a hole in it; the leg's own lifecycle events still
+			// say everything a consumer needs about the leg.
+			await this.publishQuietly(leg, "channel.unbridged", {
+				legId: leg.legId,
+				peerLegId: peer.legId,
+				bridgeId,
+				reason: "session-unbridge",
+			});
+		}
+		return ok(`left bridge ${bridgeId}`);
 	}
 
 	// -------------------------------------------------------------------------------------------

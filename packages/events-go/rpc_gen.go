@@ -43,6 +43,8 @@ const (
 	SubjectMediaUntapSessionRPC     = "rpc.media.v1.untap-session"
 	SubjectOriginateRPC             = "rpc.engine.v1.originate"
 	SubjectParkHandoffRPC           = "rpc.engine.v1.park-handoff"
+	SubjectSessionVerbRPC           = "rpc.engine.v1.session-verb"
+	SubjectSessionAnnounceRPC       = "rpc.session.v1.announce"
 )
 
 const (
@@ -67,6 +69,8 @@ const (
 	TimeoutMediaUntapSessionRPC     = 500 * time.Millisecond
 	TimeoutOriginateRPC             = 5000 * time.Millisecond
 	TimeoutParkHandoffRPC           = 3000 * time.Millisecond
+	TimeoutSessionVerbRPC           = 30000 * time.Millisecond
+	TimeoutSessionAnnounceRPC       = 2000 * time.Millisecond
 )
 
 // RoutingResolveRequest is the request body of rpc.routing.v1.resolve.
@@ -1452,3 +1456,488 @@ func (v ParkHandoffResponseReason) Valid() bool {
 }
 
 func (v ParkHandoffResponseReason) String() string { return string(v) }
+
+// SessionVerbRequest is the request body of rpc.engine.v1.session-verb.
+type SessionVerbRequest struct {
+	OrgID     string                       `json:"orgId"`
+	SessionID string                       `json:"sessionId"`
+	CallID    string                       `json:"callId"`
+	LegID     string                       `json:"legId"`
+	Verb      SessionVerbRequestVerb       `json:"verb"`
+	Arguments *SessionVerbRequestArguments `json:"arguments,omitempty"`
+}
+
+// SessionVerbRequestVerb is the closed vocabulary of SessionVerbRequest.verb.
+type SessionVerbRequestVerb string
+
+const (
+	SessionVerbRequestVerbAnswer      SessionVerbRequestVerb = "answer"
+	SessionVerbRequestVerbRinging     SessionVerbRequestVerb = "ringing"
+	SessionVerbRequestVerbPlay        SessionVerbRequestVerb = "play"
+	SessionVerbRequestVerbStopPlay    SessionVerbRequestVerb = "stopPlay"
+	SessionVerbRequestVerbGather      SessionVerbRequestVerb = "gather"
+	SessionVerbRequestVerbRecord      SessionVerbRequestVerb = "record"
+	SessionVerbRequestVerbDial        SessionVerbRequestVerb = "dial"
+	SessionVerbRequestVerbBridge      SessionVerbRequestVerb = "bridge"
+	SessionVerbRequestVerbUnbridge    SessionVerbRequestVerb = "unbridge"
+	SessionVerbRequestVerbTransfer    SessionVerbRequestVerb = "transfer"
+	SessionVerbRequestVerbHold        SessionVerbRequestVerb = "hold"
+	SessionVerbRequestVerbUnhold      SessionVerbRequestVerb = "unhold"
+	SessionVerbRequestVerbPark        SessionVerbRequestVerb = "park"
+	SessionVerbRequestVerbUnpark      SessionVerbRequestVerb = "unpark"
+	SessionVerbRequestVerbPlayDTMF    SessionVerbRequestVerb = "playDtmf"
+	SessionVerbRequestVerbMute        SessionVerbRequestVerb = "mute"
+	SessionVerbRequestVerbUnmute      SessionVerbRequestVerb = "unmute"
+	SessionVerbRequestVerbSetVariable SessionVerbRequestVerb = "setVariable"
+	SessionVerbRequestVerbSleep       SessionVerbRequestVerb = "sleep"
+	SessionVerbRequestVerbHangup      SessionVerbRequestVerb = "hangup"
+)
+
+// SessionVerbRequestVerbValues lists every member of the vocabulary, in contract order.
+var SessionVerbRequestVerbValues = []SessionVerbRequestVerb{
+	SessionVerbRequestVerbAnswer,
+	SessionVerbRequestVerbRinging,
+	SessionVerbRequestVerbPlay,
+	SessionVerbRequestVerbStopPlay,
+	SessionVerbRequestVerbGather,
+	SessionVerbRequestVerbRecord,
+	SessionVerbRequestVerbDial,
+	SessionVerbRequestVerbBridge,
+	SessionVerbRequestVerbUnbridge,
+	SessionVerbRequestVerbTransfer,
+	SessionVerbRequestVerbHold,
+	SessionVerbRequestVerbUnhold,
+	SessionVerbRequestVerbPark,
+	SessionVerbRequestVerbUnpark,
+	SessionVerbRequestVerbPlayDTMF,
+	SessionVerbRequestVerbMute,
+	SessionVerbRequestVerbUnmute,
+	SessionVerbRequestVerbSetVariable,
+	SessionVerbRequestVerbSleep,
+	SessionVerbRequestVerbHangup,
+}
+
+// Valid reports whether v is a member of the SessionVerbRequestVerb vocabulary.
+func (v SessionVerbRequestVerb) Valid() bool {
+	for _, candidate := range SessionVerbRequestVerbValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SessionVerbRequestVerb) String() string { return string(v) }
+
+// SessionVerbRequestArguments is a payload fragment of the contract.
+type SessionVerbRequestArguments struct {
+	Media               *string                                  `json:"media,omitempty"`
+	PlaybackRef         *string                                  `json:"playbackRef,omitempty"`
+	Loop                *int                                     `json:"loop,omitempty"`
+	Terminators         []string                                 `json:"terminators,omitempty"`
+	MaxDigits           *int                                     `json:"maxDigits,omitempty"`
+	TimeoutMs           *int                                     `json:"timeoutMs,omitempty"`
+	InterDigitTimeoutMs *int                                     `json:"interDigitTimeoutMs,omitempty"`
+	Regex               *string                                  `json:"regex,omitempty"`
+	MaxDurationMs       *int                                     `json:"maxDurationMs,omitempty"`
+	SilenceStopMs       *int                                     `json:"silenceStopMs,omitempty"`
+	Beep                *bool                                    `json:"beep,omitempty"`
+	Format              *SessionVerbRequestArgumentsFormat       `json:"format,omitempty"`
+	Targets             []SessionVerbRequestArgumentsTargets     `json:"targets,omitempty"`
+	Strategy            *SessionVerbRequestArgumentsStrategy     `json:"strategy,omitempty"`
+	ContinueOnCauses    []string                                 `json:"continueOnCauses,omitempty"`
+	PeerLegID           *string                                  `json:"peerLegId,omitempty"`
+	TransferKind        *SessionVerbRequestArgumentsTransferKind `json:"transferKind,omitempty"`
+	Destination         *string                                  `json:"destination,omitempty"`
+	DestinationContext  *string                                  `json:"destinationContext,omitempty"`
+	FallbackDestination *string                                  `json:"fallbackDestination,omitempty"`
+	CancelKey           *string                                  `json:"cancelKey,omitempty"`
+	MusicOnHold         *string                                  `json:"musicOnHold,omitempty"`
+	Soft                *bool                                    `json:"soft,omitempty"`
+	Lot                 *string                                  `json:"lot,omitempty"`
+	Orbit               *string                                  `json:"orbit,omitempty"`
+	Digits              []string                                 `json:"digits,omitempty"`
+	ToneDurationMs      *int                                     `json:"toneDurationMs,omitempty"`
+	Direction           *SessionVerbRequestArgumentsDirection    `json:"direction,omitempty"`
+	DurationMs          *int                                     `json:"durationMs,omitempty"`
+	Name                *string                                  `json:"name,omitempty"`
+	Value               *string                                  `json:"value,omitempty"`
+	Scope               *SessionVerbRequestArgumentsScope        `json:"scope,omitempty"`
+	Cause               *string                                  `json:"cause,omitempty"`
+}
+
+// SessionVerbRequestArgumentsFormat is the closed vocabulary of SessionVerbRequestArguments.format.
+type SessionVerbRequestArgumentsFormat string
+
+const (
+	SessionVerbRequestArgumentsFormatWav SessionVerbRequestArgumentsFormat = "wav"
+	SessionVerbRequestArgumentsFormatMp3 SessionVerbRequestArgumentsFormat = "mp3"
+	SessionVerbRequestArgumentsFormatOgg SessionVerbRequestArgumentsFormat = "ogg"
+)
+
+// SessionVerbRequestArgumentsFormatValues lists every member of the vocabulary, in contract order.
+var SessionVerbRequestArgumentsFormatValues = []SessionVerbRequestArgumentsFormat{
+	SessionVerbRequestArgumentsFormatWav,
+	SessionVerbRequestArgumentsFormatMp3,
+	SessionVerbRequestArgumentsFormatOgg,
+}
+
+// Valid reports whether v is a member of the SessionVerbRequestArgumentsFormat vocabulary.
+func (v SessionVerbRequestArgumentsFormat) Valid() bool {
+	for _, candidate := range SessionVerbRequestArgumentsFormatValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SessionVerbRequestArgumentsFormat) String() string { return string(v) }
+
+// SessionVerbRequestArgumentsTargets is a payload fragment of the contract.
+type SessionVerbRequestArgumentsTargets struct {
+	Destination string                                     `json:"destination"`
+	Context     *SessionVerbRequestArgumentsTargetsContext `json:"context,omitempty"`
+}
+
+// SessionVerbRequestArgumentsTargetsContext is the closed vocabulary of SessionVerbRequestArgumentsTargets.context.
+type SessionVerbRequestArgumentsTargetsContext string
+
+const (
+	SessionVerbRequestArgumentsTargetsContextInternal SessionVerbRequestArgumentsTargetsContext = "internal"
+	SessionVerbRequestArgumentsTargetsContextOutbound SessionVerbRequestArgumentsTargetsContext = "outbound"
+)
+
+// SessionVerbRequestArgumentsTargetsContextValues lists every member of the vocabulary, in contract order.
+var SessionVerbRequestArgumentsTargetsContextValues = []SessionVerbRequestArgumentsTargetsContext{
+	SessionVerbRequestArgumentsTargetsContextInternal,
+	SessionVerbRequestArgumentsTargetsContextOutbound,
+}
+
+// Valid reports whether v is a member of the SessionVerbRequestArgumentsTargetsContext vocabulary.
+func (v SessionVerbRequestArgumentsTargetsContext) Valid() bool {
+	for _, candidate := range SessionVerbRequestArgumentsTargetsContextValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SessionVerbRequestArgumentsTargetsContext) String() string { return string(v) }
+
+// SessionVerbRequestArgumentsStrategy is the closed vocabulary of SessionVerbRequestArguments.strategy.
+type SessionVerbRequestArgumentsStrategy string
+
+const (
+	SessionVerbRequestArgumentsStrategySequential   SessionVerbRequestArgumentsStrategy = "sequential"
+	SessionVerbRequestArgumentsStrategySimultaneous SessionVerbRequestArgumentsStrategy = "simultaneous"
+)
+
+// SessionVerbRequestArgumentsStrategyValues lists every member of the vocabulary, in contract order.
+var SessionVerbRequestArgumentsStrategyValues = []SessionVerbRequestArgumentsStrategy{
+	SessionVerbRequestArgumentsStrategySequential,
+	SessionVerbRequestArgumentsStrategySimultaneous,
+}
+
+// Valid reports whether v is a member of the SessionVerbRequestArgumentsStrategy vocabulary.
+func (v SessionVerbRequestArgumentsStrategy) Valid() bool {
+	for _, candidate := range SessionVerbRequestArgumentsStrategyValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SessionVerbRequestArgumentsStrategy) String() string { return string(v) }
+
+// SessionVerbRequestArgumentsTransferKind is the closed vocabulary of SessionVerbRequestArguments.transferKind.
+type SessionVerbRequestArgumentsTransferKind string
+
+const (
+	SessionVerbRequestArgumentsTransferKindBlind    SessionVerbRequestArgumentsTransferKind = "blind"
+	SessionVerbRequestArgumentsTransferKindAttended SessionVerbRequestArgumentsTransferKind = "attended"
+)
+
+// SessionVerbRequestArgumentsTransferKindValues lists every member of the vocabulary, in contract order.
+var SessionVerbRequestArgumentsTransferKindValues = []SessionVerbRequestArgumentsTransferKind{
+	SessionVerbRequestArgumentsTransferKindBlind,
+	SessionVerbRequestArgumentsTransferKindAttended,
+}
+
+// Valid reports whether v is a member of the SessionVerbRequestArgumentsTransferKind vocabulary.
+func (v SessionVerbRequestArgumentsTransferKind) Valid() bool {
+	for _, candidate := range SessionVerbRequestArgumentsTransferKindValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SessionVerbRequestArgumentsTransferKind) String() string { return string(v) }
+
+// SessionVerbRequestArgumentsDirection is the closed vocabulary of SessionVerbRequestArguments.direction.
+type SessionVerbRequestArgumentsDirection string
+
+const (
+	SessionVerbRequestArgumentsDirectionIn   SessionVerbRequestArgumentsDirection = "in"
+	SessionVerbRequestArgumentsDirectionOut  SessionVerbRequestArgumentsDirection = "out"
+	SessionVerbRequestArgumentsDirectionBoth SessionVerbRequestArgumentsDirection = "both"
+)
+
+// SessionVerbRequestArgumentsDirectionValues lists every member of the vocabulary, in contract order.
+var SessionVerbRequestArgumentsDirectionValues = []SessionVerbRequestArgumentsDirection{
+	SessionVerbRequestArgumentsDirectionIn,
+	SessionVerbRequestArgumentsDirectionOut,
+	SessionVerbRequestArgumentsDirectionBoth,
+}
+
+// Valid reports whether v is a member of the SessionVerbRequestArgumentsDirection vocabulary.
+func (v SessionVerbRequestArgumentsDirection) Valid() bool {
+	for _, candidate := range SessionVerbRequestArgumentsDirectionValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SessionVerbRequestArgumentsDirection) String() string { return string(v) }
+
+// SessionVerbRequestArgumentsScope is the closed vocabulary of SessionVerbRequestArguments.scope.
+type SessionVerbRequestArgumentsScope string
+
+const (
+	SessionVerbRequestArgumentsScopeChannel SessionVerbRequestArgumentsScope = "channel"
+	SessionVerbRequestArgumentsScopeExport  SessionVerbRequestArgumentsScope = "export"
+	SessionVerbRequestArgumentsScopeGlobal  SessionVerbRequestArgumentsScope = "global"
+)
+
+// SessionVerbRequestArgumentsScopeValues lists every member of the vocabulary, in contract order.
+var SessionVerbRequestArgumentsScopeValues = []SessionVerbRequestArgumentsScope{
+	SessionVerbRequestArgumentsScopeChannel,
+	SessionVerbRequestArgumentsScopeExport,
+	SessionVerbRequestArgumentsScopeGlobal,
+}
+
+// Valid reports whether v is a member of the SessionVerbRequestArgumentsScope vocabulary.
+func (v SessionVerbRequestArgumentsScope) Valid() bool {
+	for _, candidate := range SessionVerbRequestArgumentsScopeValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SessionVerbRequestArgumentsScope) String() string { return string(v) }
+
+// SessionVerbResponse is the reply body of rpc.engine.v1.session-verb.
+type SessionVerbResponse struct {
+	Ok                  bool                          `json:"ok"`
+	Verb                SessionVerbResponseVerb       `json:"verb"`
+	InstanceID          string                        `json:"instanceId"`
+	EndReason           *SessionVerbResponseEndReason `json:"endReason,omitempty"`
+	Reason              *SessionVerbResponseReason    `json:"reason,omitempty"`
+	Error               *string                       `json:"error,omitempty"`
+	PlaybackRef         *string                       `json:"playbackRef,omitempty"`
+	ElapsedMs           *int                          `json:"elapsedMs,omitempty"`
+	Digits              []string                      `json:"digits,omitempty"`
+	RecordingID         *string                       `json:"recordingId,omitempty"`
+	MediaRef            *string                       `json:"mediaRef,omitempty"`
+	DurationMs          *int                          `json:"durationMs,omitempty"`
+	Format              *string                       `json:"format,omitempty"`
+	AnsweredTargetIndex *int                          `json:"answeredTargetIndex,omitempty"`
+	Cause               *string                       `json:"cause,omitempty"`
+	BridgeID            *string                       `json:"bridgeId,omitempty"`
+}
+
+// SessionVerbResponseVerb is the closed vocabulary of SessionVerbResponse.verb.
+type SessionVerbResponseVerb string
+
+const (
+	SessionVerbResponseVerbAnswer      SessionVerbResponseVerb = "answer"
+	SessionVerbResponseVerbRinging     SessionVerbResponseVerb = "ringing"
+	SessionVerbResponseVerbPlay        SessionVerbResponseVerb = "play"
+	SessionVerbResponseVerbStopPlay    SessionVerbResponseVerb = "stopPlay"
+	SessionVerbResponseVerbGather      SessionVerbResponseVerb = "gather"
+	SessionVerbResponseVerbRecord      SessionVerbResponseVerb = "record"
+	SessionVerbResponseVerbDial        SessionVerbResponseVerb = "dial"
+	SessionVerbResponseVerbBridge      SessionVerbResponseVerb = "bridge"
+	SessionVerbResponseVerbUnbridge    SessionVerbResponseVerb = "unbridge"
+	SessionVerbResponseVerbTransfer    SessionVerbResponseVerb = "transfer"
+	SessionVerbResponseVerbHold        SessionVerbResponseVerb = "hold"
+	SessionVerbResponseVerbUnhold      SessionVerbResponseVerb = "unhold"
+	SessionVerbResponseVerbPark        SessionVerbResponseVerb = "park"
+	SessionVerbResponseVerbUnpark      SessionVerbResponseVerb = "unpark"
+	SessionVerbResponseVerbPlayDTMF    SessionVerbResponseVerb = "playDtmf"
+	SessionVerbResponseVerbMute        SessionVerbResponseVerb = "mute"
+	SessionVerbResponseVerbUnmute      SessionVerbResponseVerb = "unmute"
+	SessionVerbResponseVerbSetVariable SessionVerbResponseVerb = "setVariable"
+	SessionVerbResponseVerbSleep       SessionVerbResponseVerb = "sleep"
+	SessionVerbResponseVerbHangup      SessionVerbResponseVerb = "hangup"
+)
+
+// SessionVerbResponseVerbValues lists every member of the vocabulary, in contract order.
+var SessionVerbResponseVerbValues = []SessionVerbResponseVerb{
+	SessionVerbResponseVerbAnswer,
+	SessionVerbResponseVerbRinging,
+	SessionVerbResponseVerbPlay,
+	SessionVerbResponseVerbStopPlay,
+	SessionVerbResponseVerbGather,
+	SessionVerbResponseVerbRecord,
+	SessionVerbResponseVerbDial,
+	SessionVerbResponseVerbBridge,
+	SessionVerbResponseVerbUnbridge,
+	SessionVerbResponseVerbTransfer,
+	SessionVerbResponseVerbHold,
+	SessionVerbResponseVerbUnhold,
+	SessionVerbResponseVerbPark,
+	SessionVerbResponseVerbUnpark,
+	SessionVerbResponseVerbPlayDTMF,
+	SessionVerbResponseVerbMute,
+	SessionVerbResponseVerbUnmute,
+	SessionVerbResponseVerbSetVariable,
+	SessionVerbResponseVerbSleep,
+	SessionVerbResponseVerbHangup,
+}
+
+// Valid reports whether v is a member of the SessionVerbResponseVerb vocabulary.
+func (v SessionVerbResponseVerb) Valid() bool {
+	for _, candidate := range SessionVerbResponseVerbValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SessionVerbResponseVerb) String() string { return string(v) }
+
+// SessionVerbResponseEndReason is the closed vocabulary of SessionVerbResponse.endReason.
+type SessionVerbResponseEndReason string
+
+const (
+	SessionVerbResponseEndReasonCompleted  SessionVerbResponseEndReason = "completed"
+	SessionVerbResponseEndReasonTerminator SessionVerbResponseEndReason = "terminator"
+	SessionVerbResponseEndReasonTimeout    SessionVerbResponseEndReason = "timeout"
+	SessionVerbResponseEndReasonCancelled  SessionVerbResponseEndReason = "cancelled"
+	SessionVerbResponseEndReasonHangup     SessionVerbResponseEndReason = "hangup"
+	SessionVerbResponseEndReasonFailed     SessionVerbResponseEndReason = "failed"
+)
+
+// SessionVerbResponseEndReasonValues lists every member of the vocabulary, in contract order.
+var SessionVerbResponseEndReasonValues = []SessionVerbResponseEndReason{
+	SessionVerbResponseEndReasonCompleted,
+	SessionVerbResponseEndReasonTerminator,
+	SessionVerbResponseEndReasonTimeout,
+	SessionVerbResponseEndReasonCancelled,
+	SessionVerbResponseEndReasonHangup,
+	SessionVerbResponseEndReasonFailed,
+}
+
+// Valid reports whether v is a member of the SessionVerbResponseEndReason vocabulary.
+func (v SessionVerbResponseEndReason) Valid() bool {
+	for _, candidate := range SessionVerbResponseEndReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SessionVerbResponseEndReason) String() string { return string(v) }
+
+// SessionVerbResponseReason is the closed vocabulary of SessionVerbResponse.reason.
+type SessionVerbResponseReason string
+
+const (
+	SessionVerbResponseReasonBadRequest      SessionVerbResponseReason = "bad_request"
+	SessionVerbResponseReasonUnknownLeg      SessionVerbResponseReason = "unknown-leg"
+	SessionVerbResponseReasonSessionMismatch SessionVerbResponseReason = "session-mismatch"
+	SessionVerbResponseReasonNotPermitted    SessionVerbResponseReason = "not-permitted"
+	SessionVerbResponseReasonUnsupported     SessionVerbResponseReason = "unsupported"
+	SessionVerbResponseReasonShuttingDown    SessionVerbResponseReason = "shutting-down"
+	SessionVerbResponseReasonInternal        SessionVerbResponseReason = "internal"
+)
+
+// SessionVerbResponseReasonValues lists every member of the vocabulary, in contract order.
+var SessionVerbResponseReasonValues = []SessionVerbResponseReason{
+	SessionVerbResponseReasonBadRequest,
+	SessionVerbResponseReasonUnknownLeg,
+	SessionVerbResponseReasonSessionMismatch,
+	SessionVerbResponseReasonNotPermitted,
+	SessionVerbResponseReasonUnsupported,
+	SessionVerbResponseReasonShuttingDown,
+	SessionVerbResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the SessionVerbResponseReason vocabulary.
+func (v SessionVerbResponseReason) Valid() bool {
+	for _, candidate := range SessionVerbResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SessionVerbResponseReason) String() string { return string(v) }
+
+// SessionAnnounceRequest is the request body of rpc.session.v1.announce.
+type SessionAnnounceRequest struct {
+	OrgID          string            `json:"orgId"`
+	Application    string            `json:"application"`
+	CallID         string            `json:"callId"`
+	LegID          string            `json:"legId"`
+	InstanceID     string            `json:"instanceId"`
+	Direction      CallDirection     `json:"direction"`
+	Answered       bool              `json:"answered"`
+	CallerIDNumber *string           `json:"callerIdNumber,omitempty"`
+	CallerIDName   *string           `json:"callerIdName,omitempty"`
+	DialedNumber   *string           `json:"dialedNumber,omitempty"`
+	Arguments      map[string]string `json:"arguments,omitempty"`
+	At             EventTime         `json:"at"`
+}
+
+// SessionAnnounceResponse is the reply body of rpc.session.v1.announce.
+type SessionAnnounceResponse struct {
+	Accepted  bool                           `json:"accepted"`
+	SessionID *string                        `json:"sessionId,omitempty"`
+	Reason    *SessionAnnounceResponseReason `json:"reason,omitempty"`
+	Error     *string                        `json:"error,omitempty"`
+}
+
+// SessionAnnounceResponseReason is the closed vocabulary of SessionAnnounceResponse.reason.
+type SessionAnnounceResponseReason string
+
+const (
+	SessionAnnounceResponseReasonNoApplication SessionAnnounceResponseReason = "no-application"
+	SessionAnnounceResponseReasonAtCapacity    SessionAnnounceResponseReason = "at-capacity"
+	SessionAnnounceResponseReasonShuttingDown  SessionAnnounceResponseReason = "shutting-down"
+	SessionAnnounceResponseReasonBadRequest    SessionAnnounceResponseReason = "bad_request"
+	SessionAnnounceResponseReasonInternal      SessionAnnounceResponseReason = "internal"
+)
+
+// SessionAnnounceResponseReasonValues lists every member of the vocabulary, in contract order.
+var SessionAnnounceResponseReasonValues = []SessionAnnounceResponseReason{
+	SessionAnnounceResponseReasonNoApplication,
+	SessionAnnounceResponseReasonAtCapacity,
+	SessionAnnounceResponseReasonShuttingDown,
+	SessionAnnounceResponseReasonBadRequest,
+	SessionAnnounceResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the SessionAnnounceResponseReason vocabulary.
+func (v SessionAnnounceResponseReason) Valid() bool {
+	for _, candidate := range SessionAnnounceResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SessionAnnounceResponseReason) String() string { return string(v) }

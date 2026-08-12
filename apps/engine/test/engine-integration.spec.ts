@@ -1346,6 +1346,7 @@ async function parkInstance(natsUrl: string, instanceId: string) {
 	const media = makeFakeMediaPort();
 	const host: CallControlHost = {
 		legFor: (mediaChannelId) => legs.get(mediaChannelId),
+		legByLegId: (legId) => [...legs.values()].find((leg) => leg.legId === legId),
 		ringingFor: async () => [],
 		activeCallsFor: () => [],
 		publish: async () => undefined,

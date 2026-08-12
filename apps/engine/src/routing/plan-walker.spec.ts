@@ -29,6 +29,7 @@ import type {
 	VoicemailMailboxSource,
 	VoicemailMessage,
 	VoicemailPort,
+	WalkerApplicationPort,
 	WalkerChannel,
 	WalkInput,
 } from "./plan-walker";
@@ -91,6 +92,8 @@ interface HarnessOptions {
 	readonly random?: () => number;
 	/** Absent means `maxChannels` is read and ignored, exactly as it is without this port. */
 	readonly trunkCapacity?: TrunkCapacityPort;
+	/** Absent means an `application` node announces, exactly as it does with no control plane. */
+	readonly application?: WalkerApplicationPort;
 }
 
 type LegReaction =
@@ -264,6 +267,7 @@ function harness(options: HarnessOptions = {}) {
 		...(options.voicemail === undefined ? {} : { voicemail: options.voicemail }),
 		...(options.mailbox === undefined ? {} : { mailbox: options.mailbox }),
 		...(options.trunkCapacity === undefined ? {} : { trunkCapacity: options.trunkCapacity }),
+		...(options.application === undefined ? {} : { application: options.application }),
 		random: options.random ?? ((): number => 0),
 		newId: () => {
 			counter += 1;
@@ -2202,21 +2206,88 @@ describe("feature codes", () => {
 	});
 });
 
-describe("node kinds that are not implemented yet", () => {
-	// `conference` and `park` both left this list when they gained real runtimes; each now behaves
-	// like `queue` — implemented, and falling back to the announcement when the walk was not given
-	// its registry. See `plan-walker-conference.spec.ts` and `plan-walker-park.spec.ts`.
-	for (const node of [{ id: "a", kind: "application", application: "autopilot" }] as PlanNode[]) {
-		it(`announces and hangs up for a \`${node.kind}\` node`, async () => {
-			const h = harness();
-			const outcome = await h.walker.walk(walkInput([node]));
+/**
+ * The `application` destination — the session protocol's entry point.
+ *
+ * `conference` and `park` used to share this block, and each left it when it gained a runtime.
+ * `application` was the last member and this is the change that emptied the list: the destination is
+ * implemented, and it falls back to the announcement when the walk was not given a session runtime,
+ * which is the same shape every other optional port here has.
+ */
+describe("the application destination", () => {
+	const NODE = { id: "a", kind: "application", application: "autopilot" } as PlanNode;
 
-			expect(outcome.hangupCause).toBe("FACILITY_NOT_IMPLEMENTED");
-			expect(outcome.notes.join(" ")).toContain(`"${node.kind}" is not implemented yet`);
-			expect(verbNames(h.verbs)).toEqual(["answer", "play", "hangup"]);
+	it("announces and hangs up when the walk has no session runtime", async () => {
+		const h = harness();
+		const outcome = await h.walker.walk(walkInput([NODE]));
+
+		expect(outcome.hangupCause).toBe("FACILITY_NOT_IMPLEMENTED");
+		expect(outcome.notes.join(" ")).toContain("no session runtime");
+		expect(verbNames(h.verbs)).toEqual(["answer", "play", "hangup"]);
+	});
+
+	/**
+	 * The failure path that matters most. An application name nobody has claimed is the ordinary
+	 * state of a half-configured integration, and the caller must hear something — never dead air,
+	 * and never a call that just stops.
+	 */
+	it("announces when no application takes the call, rather than leaving dead air", async () => {
+		const h = harness({
+			application: { run: async () => ({ kind: "unavailable", reason: "no-application" }) },
 		});
-	}
+		const outcome = await h.walker.walk(walkInput([NODE]));
 
+		expect(outcome.hangupCause).toBe("FACILITY_NOT_IMPLEMENTED");
+		expect(outcome.notes.join(" ")).toContain("did not take the call");
+		expect(verbNames(h.verbs)).toEqual(["answer", "play", "hangup"]);
+	});
+
+	/**
+	 * The leg is handed over EXACTLY as it was found. A screen-pop integration that wants to inspect
+	 * the caller and pass the call on must not have been billed for an answer it never asked for.
+	 */
+	it("hands the call over without answering it first", async () => {
+		const seen: { readonly application: string; readonly arguments?: unknown }[] = [];
+		const h = harness({
+			application: {
+				run: async (request) => {
+					seen.push(request);
+					return { kind: "hangup", cause: "CALL_REJECTED" };
+				},
+			},
+		});
+		const outcome = await h.walker.walk(
+			walkInput([
+				{
+					id: "a",
+					kind: "application",
+					application: "autopilot",
+					args: { queue: "sales", priority: 3, urgent: true },
+				} as PlanNode,
+			]),
+		);
+
+		// No `answer`, no `play`. The only verb is the teardown the walk performs once the application
+		// has said it is finished with the leg.
+		expect(verbNames(h.verbs)).toEqual(["hangup"]);
+		expect(outcome.hangupCause).toBe("CALL_REJECTED");
+		// The plan models args as `string | number | boolean`; the wire carries text.
+		expect(seen).toEqual([
+			{ application: "autopilot", arguments: { queue: "sales", priority: "3", urgent: "true" } },
+		]);
+	});
+
+	it("aborts the walk when the leg goes away underneath the application", async () => {
+		const h = harness({ application: { run: async () => ({ kind: "aborted" }) } });
+		const outcome = await h.walker.walk(walkInput([NODE]));
+
+		expect(outcome.status).toBe("aborted");
+		expect(outcome.hangupCause).toBe(undefined);
+		expect(verbNames(h.verbs)).toEqual([]);
+	});
+});
+
+describe("node kinds that are not implemented yet", () => {
 	it("announces a `park` node when the walk has no call-control runtime", async () => {
 		const h = harness();
 		const outcome = await h.walker.walk(

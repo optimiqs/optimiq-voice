@@ -12,6 +12,9 @@ import { makeQueueEvent, queueEventSchema } from "./queue-events";
 import { makeRegistrationEvent, registrationEventSchema } from "./registration-events";
 import {
 	AUTHZ_CHECK_RPC,
+	SESSION_ANNOUNCE_RPC,
+	SESSION_VERB_RPC,
+	SESSION_VERBS,
 	FILE_GREETING_RPC,
 	ORIGINATE_REFUSAL_REASONS,
 	ORIGINATE_RPC,
@@ -555,6 +558,85 @@ describe("rpc contracts", () => {
 		expect(
 			AUTHZ_CHECK_RPC.response.parse({ allowed: false, granted: [], missing: ["extension.read"] })
 				.allowed,
+		).toBe(false);
+	});
+
+	/**
+	 * The session protocol's two contracts. Both subjects are PREFIXES on the wire, so what is
+	 * pinned here is the prefix — the token that follows it is `subjects.spec.ts`'s business.
+	 */
+	it("pins the session announce contract, and its accept carries a session id", () => {
+		expect(SESSION_ANNOUNCE_RPC.subject).toBe("rpc.session.v1.announce");
+		const request = SESSION_ANNOUNCE_RPC.request.parse({
+			orgId: ORG,
+			application: "autopilot",
+			callId: createEntityId(),
+			legId: createEntityId(),
+			instanceId: "engine-1",
+			direction: "inbound",
+			answered: false,
+			at: new Date().toISOString(),
+		});
+		expect(request.answered).toBe(false);
+		expect(
+			SESSION_ANNOUNCE_RPC.response.parse({ accepted: false, reason: "no-application" }).accepted,
+		).toBe(false);
+	});
+
+	/**
+	 * The wire refuses a verb the executor does not implement, rather than accepting it and failing
+	 * one hop later on a call that is already up.
+	 */
+	it("carries only the verbs the engine implements", () => {
+		expect(SESSION_VERBS).toContain("dial");
+		expect(SESSION_VERBS).toContain("bridge");
+		expect(SESSION_VERBS).toContain("unbridge");
+		for (const absent of ["say", "earlyMedia", "stream", "playbackControl"]) {
+			expect(SESSION_VERBS).not.toContain(absent as never);
+		}
+		expect(
+			SESSION_VERB_RPC.request.safeParse({
+				orgId: ORG,
+				sessionId: "s-1",
+				callId: createEntityId(),
+				legId: createEntityId(),
+				verb: "say",
+			}).success,
+		).toBe(false);
+	});
+
+	it("validates a session verb both ways", () => {
+		expect(SESSION_VERB_RPC.subject).toBe("rpc.engine.v1.session-verb");
+		const request = SESSION_VERB_RPC.request.parse({
+			orgId: ORG,
+			sessionId: "s-1",
+			callId: createEntityId(),
+			legId: createEntityId(),
+			verb: "gather",
+			arguments: { maxDigits: 4, timeoutMs: 5_000, interDigitTimeoutMs: 2_000, terminators: ["#"] },
+		});
+		expect(request.arguments?.maxDigits).toBe(4);
+		expect(
+			SESSION_VERB_RPC.response.parse({
+				ok: true,
+				verb: "gather",
+				instanceId: "engine-1",
+				endReason: "completed",
+				digits: ["1", "2"],
+			}).digits,
+		).toEqual(["1", "2"]);
+	});
+
+	it("refuses a DTMF terminator that is not one digit", () => {
+		expect(
+			SESSION_VERB_RPC.request.safeParse({
+				orgId: ORG,
+				sessionId: "s-1",
+				callId: createEntityId(),
+				legId: createEntityId(),
+				verb: "gather",
+				arguments: { terminators: ["##"] },
+			}).success,
 		).toBe(false);
 	});
 

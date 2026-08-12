@@ -492,6 +492,22 @@
 			"responseSchema": "rpc/rpc.engine.v1.park-handoff.response.schema.json",
 			"goRequestType": "ParkHandoffRequest",
 			"goResponseType": "ParkHandoffResponse"
+		},
+		{
+			"subject": "rpc.engine.v1.session-verb",
+			"timeoutMs": 30000,
+			"requestSchema": "rpc/rpc.engine.v1.session-verb.request.schema.json",
+			"responseSchema": "rpc/rpc.engine.v1.session-verb.response.schema.json",
+			"goRequestType": "SessionVerbRequest",
+			"goResponseType": "SessionVerbResponse"
+		},
+		{
+			"subject": "rpc.session.v1.announce",
+			"timeoutMs": 2000,
+			"requestSchema": "rpc/rpc.session.v1.announce.request.schema.json",
+			"responseSchema": "rpc/rpc.session.v1.announce.response.schema.json",
+			"goRequestType": "SessionAnnounceRequest",
+			"goResponseType": "SessionAnnounceResponse"
 		}
 	]
 }

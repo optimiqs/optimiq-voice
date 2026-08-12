@@ -1,0 +1,24 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"accepted": {
+			"type": "boolean"
+		},
+		"sessionId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"reason": {
+			"type": "string",
+			"enum": ["no-application", "at-capacity", "shutting-down", "bad_request", "internal"]
+		},
+		"error": {
+			"type": "string",
+			"maxLength": 512
+		}
+	},
+	"required": ["accepted"],
+	"additionalProperties": false
+}
