@@ -64,6 +64,30 @@ export const DIAGNOSTIC_CODES = [
 	/** A mailbox's `pinHash` is not in the format `voicemail-pin.ts` defines, so it is not enforced. */
 	"invalid-pin-hash",
 
+	// --- the T2 admin block ----------------------------------------------------------------------
+	/** A destination alias points at another alias, and the chain loops or is too deep to expand. */
+	"alias-cycle",
+	/** An audio stream's URL is not an `http(s)` URL a media server may be asked to open. */
+	"invalid-stream-url",
+	/** A phrase has no playable steps, or one of its steps names another phrase. */
+	"invalid-phrase",
+	/** A phrase step points at a prompt that is not in the snapshot. */
+	"dangling-phrase-step",
+	/** A translation rule's regex does not compile, or its replacement could emit non-dialable text. */
+	"invalid-translation-rule",
+	/** A route or trunk names a translation ruleset that is not in the snapshot, or is disabled. */
+	"dangling-translation-ruleset",
+	/** An outbound route names a PIN set that is not in the snapshot, is disabled, or has no code. */
+	"unusable-pin-set",
+	/** A speed-dial code is not dialable, or collides with a feature code or an internal number. */
+	"conflicting-speed-dial",
+	/** A directory would offer nobody: no extension has a recorded name to speak. */
+	"empty-directory",
+	/** Two people in a directory spell to the same digits, so a caller cannot tell them apart. */
+	"directory-name-collision",
+	/** An extension is absent from a directory because its mailbox has no recorded name. */
+	"directory-entry-skipped",
+
 	// --- emergency dialing (Kari's Law / RAY BAUM'S Act) ----------------------------------------
 	/** A DID carries no `emergencyAddressId`, so it cannot serve as an ELIN for the organization. */
 	"missing-emergency-address",
@@ -123,6 +147,8 @@ export const DIAGNOSTIC_CODES = [
 	"time-condition-closed",
 	/** The dialed string matched the emergency table; every configurable gate was bypassed. */
 	"emergency-call",
+	/** A translation ruleset rewrote a number, or would have and was refused for over-running. */
+	"number-translated",
 ] as const;
 
 export type DiagnosticCode = (typeof DIAGNOSTIC_CODES)[number];

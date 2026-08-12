@@ -344,6 +344,8 @@ export interface TrunkInput extends RoutingEntityInput {
 	readonly codecPrefs?: string | null;
 	readonly maxChannels?: number | null;
 	readonly callerIdNumberOverride?: string | null;
+	/** The shared ruleset applied to caller id ARRIVING on this trunk, before anything reads it. */
+	readonly inboundTranslationRulesetId?: string | null;
 }
 
 /** One trunk in an outbound route's ordered failover list. Mirrors `pbx-db` `TrunkPriorityEntry`. */
@@ -385,12 +387,31 @@ export interface OutboundRouteInput extends RoutingEntityInput {
 	readonly failoverDestinationData?: DestinationInput["destinationData"];
 	readonly callerIdNumberOverride?: string | null;
 	readonly recordEnabled: boolean;
+	/** The authorisation codes a caller must satisfy before any trunk on this route is dialled. */
+	readonly pinSetId?: string | null;
+	/** The shared rewrite applied AFTER this route's own strip/prepend. See `translations.ts`. */
+	readonly translationRulesetId?: string | null;
 }
+
+/** Mirrored from `pbx-db` `time-conditions-schema.ts`. */
+export const TIME_CONDITION_OVERRIDES = ["auto", "forced-match", "forced-no-match"] as const;
+
+export type TimeConditionOverride = (typeof TIME_CONDITION_OVERRIDES)[number];
 
 export interface TimeConditionInput extends RoutingEntityInput, DestinationInput {
 	readonly name: string;
 	/** IANA zone. Every rule is evaluated in this zone. */
 	readonly timezone: string;
+	/**
+	 * The manual override, which short-circuits rule evaluation entirely.
+	 *
+	 * Optional for the rollout reason every late field here carries: a loader that does not select
+	 * the column produces a condition that obeys its clock, which is what every condition did before
+	 * the column existed.
+	 */
+	readonly override?: TimeConditionOverride | null;
+	/** The star code that cycles the override, and the key a BLF lamp watches. */
+	readonly overrideFeatureCode?: string | null;
 	readonly nomatchDestinationType?: DestinationInput["destinationType"] | null;
 	readonly nomatchDestinationRef?: string | null;
 	readonly nomatchDestinationData?: DestinationInput["destinationData"];
@@ -671,6 +692,166 @@ export interface CallBlockRuleInput extends RoutingEntityInput {
 	readonly label?: string | null;
 }
 
+/** Mirrored from `pbx-db` `call-flows-schema.ts`. */
+export const CALL_FLOW_MODES = ["day", "night"] as const;
+
+export type CallFlowMode = (typeof CALL_FLOW_MODES)[number];
+
+/**
+ * A day/night switch, mirroring `call_flow`.
+ *
+ * # Why the mode is here and not read live
+ *
+ * It is compiled, so a flip costs a recompile and the artifact stays a complete answer to "where do
+ * this tenant's calls go right now". `call-flows-schema.ts` argues it against the park-slot
+ * precedent at length: a park LOT's slot range is configuration and is compiled; a park SLOT's
+ * occupancy is live state and is not. A mode is on the first side of that line — it changes a few
+ * times a day, it must survive the fleet restarting, and an administrator edits it in a form as
+ * readily as a receptionist toggles it from a handset.
+ *
+ * Both trios are REQUIRED. A flow with one destination is not a flow, and the database says so with
+ * a non-optional shape check on the night trio.
+ */
+export interface CallFlowInput extends RoutingEntityInput, DestinationInput {
+	readonly name: string;
+	readonly extensionNumber?: string | null;
+	/** The star code that toggles the mode, and the key a BLF lamp watches. */
+	readonly featureCode?: string | null;
+	readonly mode: CallFlowMode;
+	readonly nightDestinationType?: DestinationInput["destinationType"] | null;
+	readonly nightDestinationRef?: string | null;
+	readonly nightDestinationData?: DestinationInput["destinationData"];
+}
+
+/** Mirrored from `pbx-db` `pins-schema.ts`. */
+export interface PinSetEntryInput extends RoutingEntityInput {
+	readonly pinSetId: string;
+	readonly ordinal: number;
+	readonly label?: string | null;
+	/**
+	 * The PIN digest, in the format `voicemail-pin.ts` defines. Never a PIN.
+	 *
+	 * Here for exactly the reason `VoicemailBoxInput.pinHash` and `ConferenceInput.pinHash` are: the
+	 * engine challenges the caller on the call path, in a process holding no database handle. One
+	 * format, one parser, one verifier — a second PIN format would be a second thing to get wrong.
+	 */
+	readonly pinHash: string;
+}
+
+/** An outbound authorisation-code list, mirroring `pin_set`. */
+export interface PinSetInput extends RoutingEntityInput {
+	readonly name: string;
+	readonly promptId?: string | null;
+	readonly failurePromptId?: string | null;
+	readonly maxAttempts: number;
+	readonly digitTimeoutMs: number;
+}
+
+/** One rewrite in a ruleset, mirroring `translation_rule`. */
+export interface TranslationRuleInput extends RoutingEntityInput {
+	readonly translationRulesetId: string;
+	readonly ordinal: number;
+	readonly label?: string | null;
+	/** JavaScript regex source. Capture groups feed `replacement`. */
+	readonly matchPattern: string;
+	/** Dialable characters plus `$n` back-references. An empty string deletes the match. */
+	readonly replacement: string;
+}
+
+/** A reusable, named digit-manipulation pipeline, mirroring `translation_ruleset`. */
+export interface TranslationRulesetInput extends RoutingEntityInput {
+	readonly name: string;
+}
+
+/**
+ * A named destination, mirroring `destination_alias`.
+ *
+ * FusionPBX's "Bridge" with the raw dial string removed — see `aliases-schema.ts`. It compiles
+ * FLAT: the compiler resolves `alias:<id>` to whatever the alias's own trio resolved to, and no
+ * alias node ever appears in the artifact.
+ */
+export interface DestinationAliasInput extends RoutingEntityInput, DestinationInput {
+	readonly name: string;
+}
+
+/**
+ * A remote audio source usable as a destination, mirroring `audio_stream`.
+ *
+ * The fallback trio is required rather than optional because remote-URL playback is the one
+ * capability in this snapshot whose availability depends on the media driver: ARI's
+ * `POST /channels/{id}/play` takes `sound:`, `recording:`, `number:`, `digits:`, `characters:` and
+ * `tone:`, and an arbitrary `https://` is not one of them. A stream with nowhere to go is a call
+ * dropped in silence on any driver that cannot play it.
+ */
+export interface AudioStreamInput extends RoutingEntityInput {
+	readonly name: string;
+	readonly url: string;
+	readonly answerFirst: boolean;
+	/** Zero means "until the caller hangs up". */
+	readonly maxSeconds: number;
+	readonly fallbackDestinationType?: DestinationInput["destinationType"] | null;
+	readonly fallbackDestinationRef?: string | null;
+	readonly fallbackDestinationData?: DestinationInput["destinationData"];
+}
+
+/**
+ * One step of a phrase, mirroring `phrase_step`.
+ *
+ * `phraseId` is a `prompt` row of kind `phrase`, and `promptId` is a `prompt` row that is not — a
+ * phrase IS a prompt, which is what makes it storable in the eight `*_prompt_id` foreign keys that
+ * already exist. See `media-schema.ts`.
+ */
+export interface PhraseStepInput extends RoutingEntityInput {
+	readonly phraseId: string;
+	readonly promptId: string;
+	readonly ordinal: number;
+}
+
+/**
+ * A `prompt` row, as far as routing is concerned.
+ *
+ * Only three fields, and only because of phrases: the compiler has to know which prompt ids are
+ * PHRASES (so it can expand them) and which are audio (so it can refuse a nested phrase). The
+ * object key, the duration and the checksum belong to the media layer; nothing about them changes a
+ * routing decision.
+ */
+export interface PromptInput extends RoutingEntityInput {
+	readonly name: string;
+	/** `"phrase"` marks a sequence; everything else is a single piece of audio. */
+	readonly kind: string;
+}
+
+/** Mirrored from `pbx-db` `directory-schema.ts`. */
+export const DIRECTORY_SEARCH_FIELDS = ["last-name", "first-name", "full-name"] as const;
+
+export type DirectorySearchField = (typeof DIRECTORY_SEARCH_FIELDS)[number];
+
+/**
+ * A dial-by-name directory, mirroring `dial_by_name_directory`.
+ *
+ * The compiler builds the digit map from the tenant's extensions and their mailboxes' recorded name
+ * greetings; there is nothing about the entries on this row, because there is nothing to store —
+ * membership is "every extension we can speak the name of", derived rather than curated.
+ */
+export interface DialByNameDirectoryInput extends RoutingEntityInput {
+	readonly name: string;
+	readonly extensionNumber?: string | null;
+	readonly searchField: DirectorySearchField;
+	readonly minDigits: number;
+	readonly greetingPromptId?: string | null;
+	readonly invalidPromptId?: string | null;
+	readonly maxFailures: number;
+	readonly timeoutDestinationType?: DestinationInput["destinationType"] | null;
+	readonly timeoutDestinationRef?: string | null;
+	readonly timeoutDestinationData?: DestinationInput["destinationData"];
+}
+
+/** An organization-wide short code, mirroring `speed_dial`. */
+export interface SpeedDialInput extends RoutingEntityInput, DestinationInput {
+	readonly code: string;
+	readonly label: string;
+}
+
 /**
  * The org settings routing reads. Everything here has a compiler default, because a tenant that
  * has never opened the settings page must still be routable.
@@ -735,6 +916,28 @@ export interface OrgRoutingSnapshot {
 	readonly callBlockRules: readonly CallBlockRuleInput[];
 	/** Optional — see the "optional collections" note in this file's header. */
 	readonly emergencyAddresses?: readonly EmergencyAddressInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly callFlows?: readonly CallFlowInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly pinSets?: readonly PinSetInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly pinSetEntries?: readonly PinSetEntryInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly translationRulesets?: readonly TranslationRulesetInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly translationRules?: readonly TranslationRuleInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly destinationAliases?: readonly DestinationAliasInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly audioStreams?: readonly AudioStreamInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly prompts?: readonly PromptInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly phraseSteps?: readonly PhraseStepInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly directories?: readonly DialByNameDirectoryInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly speedDials?: readonly SpeedDialInput[];
 }
 
 /**
@@ -767,6 +970,21 @@ export const SNAPSHOT_COLLECTIONS = [
 	"featureCodes",
 	"callBlockRules",
 	"emergencyAddresses",
+	// The T2 admin block. Every one is optional, which is the same rollout affordance the four before
+	// them took: `packages/routing` compiles them before the API's snapshot loader learns to select
+	// them, and a tenant whose loader has not caught up compiles exactly what every release before
+	// this one did.
+	"callFlows",
+	"pinSets",
+	"pinSetEntries",
+	"translationRulesets",
+	"translationRules",
+	"destinationAliases",
+	"audioStreams",
+	"prompts",
+	"phraseSteps",
+	"directories",
+	"speedDials",
 ] as const satisfies readonly (keyof OrgRoutingSnapshot)[];
 
 export type SnapshotCollection = (typeof SNAPSHOT_COLLECTIONS)[number];
@@ -789,6 +1007,17 @@ export const OPTIONAL_SNAPSHOT_COLLECTIONS = [
 	// loader has not caught up compiles no paging nodes, which is what every release before this one
 	// produced.
 	"pagingGroups",
+	"callFlows",
+	"pinSets",
+	"pinSetEntries",
+	"translationRulesets",
+	"translationRules",
+	"destinationAliases",
+	"audioStreams",
+	"prompts",
+	"phraseSteps",
+	"directories",
+	"speedDials",
 ] as const satisfies readonly SnapshotCollection[];
 
 export type OptionalSnapshotCollection = (typeof OPTIONAL_SNAPSHOT_COLLECTIONS)[number];
@@ -841,5 +1070,16 @@ export function emptySnapshot(organizationId: string): OrgRoutingSnapshot {
 		featureCodes: [],
 		callBlockRules: [],
 		emergencyAddresses: [],
+		callFlows: [],
+		pinSets: [],
+		pinSetEntries: [],
+		translationRulesets: [],
+		translationRules: [],
+		destinationAliases: [],
+		audioStreams: [],
+		prompts: [],
+		phraseSteps: [],
+		directories: [],
+		speedDials: [],
 	};
 }

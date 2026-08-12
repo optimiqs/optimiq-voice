@@ -1,6 +1,10 @@
 import {
+	audioStream,
 	callBlockRule,
+	callFlow,
 	conference,
+	destinationAlias,
+	dialByNameDirectory,
 	emergencyAddress,
 	eq,
 	extension,
@@ -16,11 +20,18 @@ import {
 	parkLot,
 	type PbxDatabaseTransaction,
 	phoneNumber,
+	phraseStep,
+	pinSet,
+	pinSetEntry,
+	prompt,
 	queue,
 	ringGroup,
 	ringGroupDestination,
+	speedDial,
 	timeCondition,
 	timeConditionRule,
+	translationRule,
+	translationRuleset,
 	trunk,
 	voicemailBox,
 	voicemailGreeting,
@@ -115,6 +126,17 @@ export async function loadOrgRoutingSnapshot(
 		voicemailGreetings,
 		emergencyAddresses,
 		settingRows,
+		callFlows,
+		pinSets,
+		pinSetEntries,
+		translationRulesets,
+		translationRules,
+		destinationAliases,
+		audioStreams,
+		prompts,
+		phraseSteps,
+		directories,
+		speedDials,
 	] = await Promise.all([
 		transaction.select().from(extension),
 		transaction.select().from(phoneNumber),
@@ -139,6 +161,20 @@ export async function loadOrgRoutingSnapshot(
 		transaction.select().from(voicemailGreeting),
 		transaction.select().from(emergencyAddress),
 		transaction.select().from(orgSetting).where(eq(orgSetting.category, ROUTING_SETTINGS_CATEGORY)),
+		// The T2 admin block. Eleven more statements on the same connection inside the same
+		// transaction, pipelined by postgres.js like the twenty-three above them, and every one of
+		// them unfiltered and unjoined per the two rules in this file's header.
+		transaction.select().from(callFlow),
+		transaction.select().from(pinSet),
+		transaction.select().from(pinSetEntry),
+		transaction.select().from(translationRuleset),
+		transaction.select().from(translationRule),
+		transaction.select().from(destinationAlias),
+		transaction.select().from(audioStream),
+		transaction.select().from(prompt),
+		transaction.select().from(phraseStep),
+		transaction.select().from(dialByNameDirectory),
+		transaction.select().from(speedDial),
 	]);
 
 	return {
@@ -214,6 +250,7 @@ export async function loadOrgRoutingSnapshot(
 			transport: row.transport,
 			codecPrefs: row.codecPrefs,
 			maxChannels: row.maxChannels,
+			inboundTranslationRulesetId: row.inboundTranslationRulesetId,
 			callerIdNumberOverride: row.callerIdNumberOverride,
 		})),
 		inboundRoutes: inboundRoutes.map((row) => ({
@@ -251,6 +288,8 @@ export async function loadOrgRoutingSnapshot(
 			failoverDestinationData: row.failoverDestinationData,
 			callerIdNumberOverride: row.callerIdNumberOverride,
 			recordEnabled: row.recordEnabled,
+			pinSetId: row.pinSetId,
+			translationRulesetId: row.translationRulesetId,
 		})),
 		timeConditions: timeConditions.map((row) => ({
 			id: row.id,
@@ -263,6 +302,8 @@ export async function loadOrgRoutingSnapshot(
 			nomatchDestinationType: row.nomatchDestinationType,
 			nomatchDestinationRef: row.nomatchDestinationRef,
 			nomatchDestinationData: row.nomatchDestinationData,
+			override: row.override,
+			overrideFeatureCode: row.overrideFeatureCode,
 		})),
 		timeConditionRules: timeConditionRules.map((row) => ({
 			id: row.id,
@@ -488,6 +529,127 @@ export async function loadOrgRoutingSnapshot(
 			id: row.id,
 			label: row.label,
 			validated: row.validated,
+		})),
+
+		// --- the T2 admin block ------------------------------------------------------------------
+		callFlows: callFlows.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			name: row.name,
+			extensionNumber: row.extensionNumber,
+			featureCode: row.featureCode,
+			mode: row.mode,
+			destinationType: row.destinationType,
+			destinationRef: row.destinationRef,
+			destinationData: row.destinationData,
+			nightDestinationType: row.nightDestinationType,
+			nightDestinationRef: row.nightDestinationRef,
+			nightDestinationData: row.nightDestinationData,
+		})),
+		pinSets: pinSets.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			name: row.name,
+			promptId: row.promptId,
+			failurePromptId: row.failurePromptId,
+			maxAttempts: row.maxAttempts,
+			digitTimeoutMs: row.digitTimeoutMs,
+		})),
+		/**
+		 * The digests travel, and this is the second place in this loader that carries one.
+		 *
+		 * The same rule `voicemail_box.pin_hash` follows and for the same reason: the engine
+		 * challenges the caller on the call path, in a process holding no database handle, so the
+		 * digest is in the artifact or the gate cannot exist. `label` and `ordinal` come with it
+		 * because they are what a CDR records — the digits never are.
+		 */
+		pinSetEntries: pinSetEntries.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			pinSetId: row.pinSetId,
+			ordinal: row.ordinal,
+			label: row.label,
+			pinHash: row.pinHash,
+		})),
+		translationRulesets: translationRulesets.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			name: row.name,
+		})),
+		translationRules: translationRules.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			translationRulesetId: row.translationRulesetId,
+			ordinal: row.ordinal,
+			label: row.label,
+			matchPattern: row.matchPattern,
+			replacement: row.replacement,
+		})),
+		destinationAliases: destinationAliases.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			name: row.name,
+			destinationType: row.destinationType,
+			destinationRef: row.destinationRef,
+			destinationData: row.destinationData,
+		})),
+		audioStreams: audioStreams.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			name: row.name,
+			url: row.url,
+			answerFirst: row.answerFirst,
+			maxSeconds: row.maxSeconds,
+			fallbackDestinationType: row.fallbackDestinationType,
+			fallbackDestinationRef: row.fallbackDestinationRef,
+			fallbackDestinationData: row.fallbackDestinationData,
+		})),
+		/**
+		 * Three columns of the media library, and no more.
+		 *
+		 * The compiler needs to know which prompt ids are PHRASES (so it can expand them) and which
+		 * are audio (so it can refuse a nested phrase). The object key, the duration and the checksum
+		 * belong to the media layer; nothing about them changes a routing decision, and shipping a
+		 * tenant's whole file list into a KV bucket every engine can read would be a cost with no
+		 * routing upside.
+		 */
+		prompts: prompts.map((row) => ({
+			id: row.id,
+			// `prompt` has no `enabled` column — a file is present or it is not — so every row is
+			// enabled. Stated here rather than left to a reader wondering where the column went.
+			enabled: true,
+			name: row.name,
+			kind: row.kind,
+		})),
+		phraseSteps: phraseSteps.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			phraseId: row.phraseId,
+			promptId: row.promptId,
+			ordinal: row.ordinal,
+		})),
+		directories: directories.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			name: row.name,
+			extensionNumber: row.extensionNumber,
+			searchField: row.searchField,
+			minDigits: row.minDigits,
+			greetingPromptId: row.greetingPromptId,
+			invalidPromptId: row.invalidPromptId,
+			maxFailures: row.maxFailures,
+			timeoutDestinationType: row.timeoutDestinationType,
+			timeoutDestinationRef: row.timeoutDestinationRef,
+			timeoutDestinationData: row.timeoutDestinationData,
+		})),
+		speedDials: speedDials.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			code: row.code,
+			label: row.label,
+			destinationType: row.destinationType,
+			destinationRef: row.destinationRef,
+			destinationData: row.destinationData,
 		})),
 	};
 }

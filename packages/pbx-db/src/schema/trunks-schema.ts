@@ -3,10 +3,12 @@ import {
 	auditTimestampColumns,
 	tenantOrganizationIdColumn,
 	utcTimestamp,
+	uuidEntityId,
 	uuidV7PrimaryKey,
 } from "@optimiq-voice/db";
 import { tenantIsolationPolicy } from "../tenant";
 import { carrierCheck, carrierColumns } from "./carrier-schema";
+import { translationRuleset } from "./translations-schema";
 import type { SipTransport } from "./devices-schema";
 
 /**
@@ -49,6 +51,19 @@ export const trunk = pgTable.withRLS(
 		/** Concurrency cap enforced by the engine before it offers a call to this trunk. */
 		maxChannels: integer("max_channels"),
 		callerIdNumberOverride: text("caller_id_number_override"),
+		/**
+		 * Normalises the caller id ARRIVING on this trunk, before anything reads it.
+		 *
+		 * The point of the shared layer at its clearest: one carrier presents `0044…`, the next
+		 * presents `+44…`, and without a rewrite the tenant's call-block list, their inbound routes and
+		 * their CDR all have to know which trunk a call came in on. Nothing composes with this — a
+		 * trunk has no inline manipulation — so it runs first and alone. `on delete set null` for the
+		 * reason the outbound one is: deleting a ruleset removes a rewrite, it does not delete a trunk.
+		 */
+		inboundTranslationRulesetId: uuidEntityId("inbound_translation_ruleset_id").references(
+			() => translationRuleset.id,
+			{ onDelete: "set null" },
+		),
 		status: text("status").$type<TrunkStatus>().notNull().default("unknown"),
 		statusChangedAt: utcTimestamp("status_changed_at"),
 		statusReason: text("status_reason"),
@@ -73,6 +88,10 @@ export const trunk = pgTable.withRLS(
 		uniqueIndex("trunk_organization_name_key").on(table.organizationId, table.name),
 		index("trunk_organization_enabled_idx").on(table.organizationId, table.enabled),
 		index("trunk_organization_status_idx").on(table.organizationId, table.status),
+		index("trunk_organization_inbound_translation_idx").on(
+			table.organizationId,
+			table.inboundTranslationRulesetId,
+		),
 		index("trunk_organization_carrier_idx").on(
 			table.organizationId,
 			table.carrierProvider,

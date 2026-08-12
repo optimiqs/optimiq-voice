@@ -44,6 +44,20 @@
  * a DID or an IVR option may point at a paging group ("press 4 for the warehouse tannoy"), and the
  * call ends when the pager hangs up. That is a property of the target, not of the trio, so it needs
  * nothing special here.
+ *
+ * # The T2 admin block's four additions
+ *
+ * `call-flow`, `stream` and `dial-by-name` are destinations in the ordinary sense: a call arrives,
+ * the entity decides what happens next, and every one of them compiles to a plan node of its own.
+ *
+ * `alias` is the odd one and is deliberately here anyway. It is FusionPBX's "bridge" — a named
+ * shortcut an administrator points twenty routes at so that moving the target is one edit — with
+ * the part this platform refuses removed: upstream a bridge is a raw FreeSWITCH dial STRING, which
+ * is an escape hatch straight past the toll gate (`sofia/gateway/…` reaches a carrier with no route,
+ * no toll class and no call-block screen). Ours names a destination trio instead, and the compiler
+ * expands it FLAT — an `alias` produces no plan node of its own, it resolves to whatever its target
+ * resolved to. So it is a macro that happens to be spelled as a destination type, which is the only
+ * way to make it usable everywhere a destination is without teaching every pointer a second column.
  */
 export const DESTINATION_TYPES = [
 	"extension",
@@ -55,6 +69,10 @@ export const DESTINATION_TYPES = [
 	"park",
 	"paging-group",
 	"time-condition",
+	"call-flow",
+	"stream",
+	"dial-by-name",
+	"alias",
 	"external",
 	"application",
 	"hangup",
@@ -75,6 +93,10 @@ export const DESTINATION_TYPE_KINDS: Readonly<Record<DestinationType, Destinatio
 	park: "entity",
 	"paging-group": "entity",
 	"time-condition": "entity",
+	"call-flow": "entity",
+	stream: "entity",
+	"dial-by-name": "entity",
+	alias: "entity",
 	external: "value",
 	application: "value",
 	hangup: "terminal",
@@ -94,6 +116,10 @@ export const DESTINATION_TARGET_TABLES: Readonly<Record<DestinationType, string 
 	park: "park_lot",
 	"paging-group": "paging_group",
 	"time-condition": "time_condition",
+	"call-flow": "call_flow",
+	stream: "audio_stream",
+	"dial-by-name": "dial_by_name_directory",
+	alias: "destination_alias",
 	external: null,
 	application: null,
 	hangup: null,

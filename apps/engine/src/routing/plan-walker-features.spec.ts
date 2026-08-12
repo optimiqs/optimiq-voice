@@ -1008,3 +1008,46 @@ describe("*80 — intercom", () => {
 		expect(played(h.verbs)).toEqual([UNAVAILABLE]);
 	});
 });
+
+/**
+ * A day/night switch reached mid-walk.
+ *
+ * The resolver applies the switch at the entry point, so this is the OTHER way in: an IVR option or
+ * a ring group's timeout that points at a flow, where no resolver is left to apply it. There is no
+ * clock and no live read — the mode is compiled onto the node — so what is asserted is that the
+ * walker takes the branch the artifact names and says which in the notes.
+ */
+describe("a call flow reached mid-walk", () => {
+	function flowNode(mode: "day" | "night"): PlanNode {
+		return {
+			id: "cf",
+			kind: "call-flow",
+			label: "Front desk",
+			callFlowId: "0195c0f0-1c2f-7000-8000-0000000000f1",
+			mode,
+			dayNodeId: "day",
+			nightNodeId: "night",
+			featureCode: "*281",
+			presenceKey: "*281",
+		} as PlanNode;
+	}
+
+	it("takes the branch the compiled mode names", async () => {
+		for (const [mode, cause] of [
+			["day", "NORMAL_CLEARING"],
+			["night", "USER_BUSY"],
+		] as const) {
+			const h = harness();
+			const outcome = await h.walker.walk(
+				walkInput([
+					flowNode(mode),
+					{ id: "day", kind: "hangup", cause: "NORMAL_CLEARING" } as PlanNode,
+					{ id: "night", kind: "hangup", cause: "USER_BUSY" } as PlanNode,
+				]),
+			);
+			expect(outcome.hangupCause, mode).toBe(cause);
+			expect(outcome.visited, mode).toEqual(["cf", mode]);
+			expect(outcome.notes.join(" "), mode).toContain(`in ${mode} mode`);
+		}
+	});
+});

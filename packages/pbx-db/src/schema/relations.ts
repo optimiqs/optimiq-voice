@@ -104,6 +104,11 @@ export const pbxRelations = defineRelations(pbxTables, (r) => ({
 			from: r.outboundRoute.timeConditionId,
 			to: r.timeCondition.id,
 		}),
+		pinSet: r.one.pinSet({ from: r.outboundRoute.pinSetId, to: r.pinSet.id }),
+		translationRuleset: r.one.translationRuleset({
+			from: r.outboundRoute.translationRulesetId,
+			to: r.translationRuleset.id,
+		}),
 	},
 	timeCondition: {
 		rules: r.many.timeConditionRule({
@@ -260,6 +265,74 @@ export const pbxRelations = defineRelations(pbxTables, (r) => ({
 	},
 	parkLot: {
 		mohClass: r.one.mohClass({ from: r.parkLot.mohClassId, to: r.mohClass.id }),
+	},
+
+	// --- T2 admin block ------------------------------------------------------------------------
+	//
+	// Six of these nine tables have no relation at all, and that is the honest configuration rather
+	// than an omission: `call_flow`, `destination_alias`, `audio_stream`, `dial_by_name_directory`,
+	// `speed_dial` and `org_limit` carry destination trios and nothing else, and a trio is
+	// deliberately NOT a relation — `destination_ref` has no single target table, which is the whole
+	// point of this file's header. `schema.spec.ts` asserts one key per table, so they are declared
+	// empty rather than absent.
+	callFlow: {},
+	destinationAlias: {},
+	audioStream: {},
+	dialByNameDirectory: {},
+	speedDial: {},
+	orgLimit: {},
+	pinSet: {
+		entries: r.many.pinSetEntry({ from: r.pinSet.id, to: r.pinSetEntry.pinSetId }),
+		outboundRoutes: r.many.outboundRoute({ from: r.pinSet.id, to: r.outboundRoute.pinSetId }),
+	},
+	pinSetEntry: {
+		pinSet: r.one.pinSet({
+			from: r.pinSetEntry.pinSetId,
+			to: r.pinSet.id,
+			optional: false,
+		}),
+	},
+	translationRuleset: {
+		rules: r.many.translationRule({
+			from: r.translationRuleset.id,
+			to: r.translationRule.translationRulesetId,
+		}),
+		outboundRoutes: r.many.outboundRoute({
+			from: r.translationRuleset.id,
+			to: r.outboundRoute.translationRulesetId,
+		}),
+		trunks: r.many.trunk({
+			from: r.translationRuleset.id,
+			to: r.trunk.inboundTranslationRulesetId,
+		}),
+	},
+	translationRule: {
+		translationRuleset: r.one.translationRuleset({
+			from: r.translationRule.translationRulesetId,
+			to: r.translationRuleset.id,
+			optional: false,
+		}),
+	},
+	// Both sides point at `prompt`, which is what makes a phrase a prompt row rather than a table of
+	// its own — see `PROMPT_KINDS`. Named `phrase` and `audio` so a reader is never left wondering
+	// which of two `prompt` relations is the container and which is the content.
+	phraseStep: {
+		phrase: r.one.prompt({
+			from: r.phraseStep.phraseId,
+			to: r.prompt.id,
+			optional: false,
+		}),
+		audio: r.one.prompt({
+			from: r.phraseStep.promptId,
+			to: r.prompt.id,
+			optional: false,
+		}),
+	},
+	trunk: {
+		inboundTranslationRuleset: r.one.translationRuleset({
+			from: r.trunk.inboundTranslationRulesetId,
+			to: r.translationRuleset.id,
+		}),
 	},
 }));
 

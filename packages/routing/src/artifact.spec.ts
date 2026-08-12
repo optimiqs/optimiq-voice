@@ -40,11 +40,12 @@ describe("ROUTING_ARTIFACT_VERSION", () => {
 	 * The version is the one number in the artifact that a reader in ANOTHER process compares
 	 * against its own compiled-in copy, so bumping it is a deployment event: every cached artifact
 	 * is discarded and every engine recompiles. A test that read the constant back would agree with
-	 * any value at all and would let the bump happen by accident. `2` is the `paging` node kind —
-	 * a kind a v1 reader has no case for, which is the only class of change that earns a bump.
+	 * any value at all and would let the bump happen by accident. `2` was the `paging` node kind and
+	 * `3` is the T2 admin block's three — `call-flow`, `stream` and `dial-by-name` — which is the
+	 * only class of change that earns a bump: a kind the previous reader has no case for.
 	 */
-	it("is 2, the version that introduced the paging node kind", () => {
-		expect(ROUTING_ARTIFACT_VERSION).toBe(2);
+	it("is 3, the version that introduced the T2 admin block's node kinds", () => {
+		expect(ROUTING_ARTIFACT_VERSION).toBe(3);
 	});
 
 	it("is stamped onto every compiled artifact", () => {

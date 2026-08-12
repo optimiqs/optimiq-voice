@@ -33,7 +33,7 @@
  *   route by a day.
  */
 
-import type { TimeRulePredicateInput } from "./snapshot";
+import type { TimeConditionOverride, TimeRulePredicateInput } from "./snapshot";
 
 /** A `HH:MM` 24-hour wall clock, inclusive at both ends of a window. */
 const TIME_OF_DAY_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)$/;
@@ -387,6 +387,16 @@ export interface CompiledTimeCondition {
 	readonly timezone: string;
 	/** In `ordinal` order. The first that matches wins. */
 	readonly rules: readonly CompiledTimeRule[];
+	/**
+	 * The manual override, when one is in force.
+	 *
+	 * Absent means `auto`, and absent is what an artifact compiled before overrides existed carries —
+	 * so a reader that does not know the field evaluates the clock, which is what every release
+	 * before this one did.
+	 */
+	readonly override?: TimeConditionOverride;
+	/** The code that cycles the override, and the `presence` key a BLF lamp watches. */
+	readonly overrideFeatureCode?: string;
 }
 
 export interface TimeConditionEvaluation {
@@ -394,20 +404,72 @@ export interface TimeConditionEvaluation {
 	readonly matchedRuleId?: string;
 	/** The zoned wall clock the decision was made against — the "why" for a support ticket. */
 	readonly at: ZonedInstant;
+	/**
+	 * Set when the answer came from the override rather than from the rules.
+	 *
+	 * The rules were NOT evaluated in that case, which is the point of an override and is also why
+	 * this field exists: "closed at 14:32 on a Tuesday" is a confusing thing to read in a support
+	 * ticket unless the next line says somebody pressed a key.
+	 */
+	readonly overridden?: TimeConditionOverride;
 }
 
-/** Evaluates a condition at an instant. Pure: the same arguments always give the same answer. */
+/**
+ * Evaluates a condition at an instant. Pure: the same arguments always give the same answer.
+ *
+ * # The override short-circuits, and does not merely bias
+ *
+ * A `forced-match` returns before a single rule is read. That is deliberate and is the difference
+ * between an override and a default: the office closed early for a funeral, and no amount of
+ * "Tuesday, 14:00–17:00" in the rule list is allowed to have an opinion about it. `matchedRuleId` is
+ * therefore absent under an override even when a rule WOULD have matched — reporting one would
+ * attribute the decision to a rule that was never consulted.
+ *
+ * The zoned instant is still computed and still returned, because the support answer is "it is
+ * 14:32 on a Tuesday in America/New_York AND somebody has forced this closed", and dropping the
+ * clock would leave the first half unanswerable.
+ */
 export function evaluateTimeCondition(
 	condition: CompiledTimeCondition,
 	instant: Date,
 ): TimeConditionEvaluation {
 	const at = zonedInstant(instant, condition.timezone);
+	if (condition.override === "forced-match") {
+		return { matched: true, at, overridden: "forced-match" };
+	}
+	if (condition.override === "forced-no-match") {
+		return { matched: false, at, overridden: "forced-no-match" };
+	}
 	for (const rule of condition.rules) {
 		if (ruleMatches(rule, at)) {
 			return { matched: true, matchedRuleId: rule.id, at };
 		}
 	}
 	return { matched: false, at };
+}
+
+/** The order `*NNN` cycles the override through. Dialing the code moves one step along this ring. */
+export const TIME_CONDITION_OVERRIDE_CYCLE: readonly TimeConditionOverride[] = [
+	"auto",
+	"forced-match",
+	"forced-no-match",
+];
+
+/**
+ * The next override in the cycle.
+ *
+ * A ring rather than a toggle because there are three states and a two-state toggle cannot reach the
+ * third. `auto → forced-match → forced-no-match → auto` puts the two useful destinations one and two
+ * presses away and always returns to obeying the clock, which is the state a tenant should end up in
+ * by pressing the key enough times rather than by finding the admin screen.
+ */
+export function nextTimeConditionOverride(
+	current: TimeConditionOverride | undefined,
+): TimeConditionOverride {
+	const index = TIME_CONDITION_OVERRIDE_CYCLE.indexOf(current ?? "auto");
+	return TIME_CONDITION_OVERRIDE_CYCLE[
+		(index + 1) % TIME_CONDITION_OVERRIDE_CYCLE.length
+	] as TimeConditionOverride;
 }
 
 /** Test seam: drops memoised `Intl` formatters. */

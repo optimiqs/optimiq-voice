@@ -71,6 +71,18 @@ export function planDestinationOf(node: PlanNode): PlanDestination | undefined {
 		case "trunk-dial": {
 			return { destinationType: node.kind, destinationRef: node.outboundRouteId };
 		}
+		case "stream": {
+			// The caller listened to a stream; that is where they went. Same terms as `paging`.
+			return { destinationType: node.kind, destinationRef: node.audioStreamId };
+		}
+		case "dial-by-name": {
+			// The DIRECTORY, not the extension the caller eventually selected. The walk reports every
+			// destination it enters and the extension node reports itself a moment later, so the CDR
+			// ends up naming the extension — which is right — while the directory is still visible in
+			// the walk's notes. Reporting only the extension would lose "they came through the
+			// directory", which is the one question a directory's owner ever asks of a report.
+			return { destinationType: node.kind, destinationRef: node.directoryId };
+		}
 		case "external":
 		case "application":
 		case "playback": {
@@ -78,7 +90,11 @@ export function planDestinationOf(node: PlanNode): PlanDestination | undefined {
 			return { destinationType: node.kind };
 		}
 		default: {
-			// `hangup`, `time-condition` — a terminal and a gate, neither of which is a destination.
+			// `hangup`, `time-condition` and `call-flow` — a terminal and two gates, none of which is
+			// a destination. A call that crossed a day/night switch and then rang an extension was
+			// destined for the EXTENSION; recording the switch would make every CDR behind one read
+			// `call-flow`, which is true and useless, and is exactly the argument `time-condition`
+			// already makes one line up.
 			return undefined;
 		}
 	}

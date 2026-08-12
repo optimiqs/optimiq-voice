@@ -127,8 +127,8 @@ describe("emptySnapshot", () => {
 		}
 	});
 
-	it("lists twenty-one collections", () => {
-		expect(SNAPSHOT_COLLECTIONS).toHaveLength(21);
+	it("lists thirty-two collections", () => {
+		expect(SNAPSHOT_COLLECTIONS).toHaveLength(32);
 	});
 
 	it("marks exactly the collections a loader may omit as optional", () => {
@@ -137,6 +137,19 @@ describe("emptySnapshot", () => {
 			"mohClasses",
 			"emergencyAddresses",
 			"pagingGroups",
+			// The T2 admin block, optional for the same rollout reason and no other: this package
+			// compiles them before the API's snapshot loader selects them.
+			"callFlows",
+			"pinSets",
+			"pinSetEntries",
+			"translationRulesets",
+			"translationRules",
+			"destinationAliases",
+			"audioStreams",
+			"prompts",
+			"phraseSteps",
+			"directories",
+			"speedDials",
 		]);
 	});
 

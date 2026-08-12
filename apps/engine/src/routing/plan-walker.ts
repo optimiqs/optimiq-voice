@@ -1165,6 +1165,9 @@ export class PlanWalker {
 			case "time-condition": {
 				return this.timeConditionNode(node, input);
 			}
+			case "call-flow": {
+				return this.callFlowNode(node);
+			}
 			case "extension": {
 				return await this.extensionNode(node, input);
 			}
@@ -1267,6 +1270,26 @@ export class PlanWalker {
 			return { kind: "hangup", cause: "NORMAL_CLEARING" };
 		}
 		return { kind: "goto", nodeId: next };
+	}
+
+	/**
+	 * A day/night switch, mid-walk.
+	 *
+	 * The resolver already applies the switch at the ENTRY point — `followGates` walks call flows
+	 * exactly as it walks time conditions — so a plan handed to this walker normally has the gate
+	 * behind it. This case is for the other way in: an IVR option, a ring group's timeout or a
+	 * call-flow branch that points at another flow, all of which reach one part-way through a walk
+	 * where no resolver is left to apply it.
+	 *
+	 * There is no clock and no state to read: the mode is a COLUMN, compiled into the node, which is
+	 * the whole argument `call-flows-schema.ts` makes against keeping it in a live-state bucket. So
+	 * this is a branch and nothing more, and a flow flipped after the artifact was compiled is a
+	 * recompile away rather than a stale read — the same eventual consistency every other compiled
+	 * fact on this walk already has.
+	 */
+	private callFlowNode(node: Extract<PlanNode, { kind: "call-flow" }>): StepResult {
+		this.note(`call flow "${node.label ?? node.callFlowId}" is in ${node.mode} mode`);
+		return { kind: "goto", nodeId: node.mode === "day" ? node.dayNodeId : node.nightNodeId };
 	}
 
 	/**

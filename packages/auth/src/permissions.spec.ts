@@ -142,9 +142,37 @@ describe("PERMISSIONS", () => {
 	 *
 	 * The instruction stands unchanged for whatever comes next.
 	 */
+	/**
+	 * And 101 to 108 by the T2 admin block — the largest single wave the registry has taken, and the
+	 * one where the ceiling did most of its work.
+	 *
+	 * Ten features arrived. A trio each would have been thirty permissions and would have put the
+	 * registry back inside sight of the ~940-entry model it replaced, so the budget was spent by
+	 * asking of each feature whether it has a power profile of its own:
+	 *
+	 * - `call-flows.*` (4) — a resource, plus a `toggle` that is genuinely a different job from
+	 *   `write`. The toggle also gates the time-condition override, because forcing a condition open
+	 *   and flipping a flow to night are one act on two tables.
+	 * - `pin-sets.*` (3) — a resource, because the blast radius is money. The same argument
+	 *   `numbers.order` and `calls.originate` each made.
+	 * - `dial-plan.*` (3) — FOUR tables under one resource (aliases, streams, speed dials,
+	 *   directories), because no role plausibly edits one and not the others.
+	 * - `org-limits.*` (2) — read wide, write owner-only, and honestly in the wrong place until W14.
+	 *
+	 * And three features spent nothing at all: number translations ride `routes.*` (they only exist
+	 * attached to a route or a trunk, and their power is a route's power), phrases ride
+	 * `recordings.*` (a phrase IS a prompt row), and the time-condition override rides
+	 * `call-flows.toggle` as above.
+	 *
+	 * The ceiling moves from 100 to 112 rather than to 108: a wave that lands exactly on the ceiling
+	 * has not been budgeted, it has been rounded to. Four spare is what the previous ceiling left and
+	 * is what this one leaves.
+	 *
+	 * The instruction stands unchanged for whatever comes next.
+	 */
 	it("stays within the size the collapsed FusionPBX model targets", () => {
 		expect(PERMISSIONS.length).toBeGreaterThanOrEqual(60);
-		expect(PERMISSIONS.length).toBeLessThanOrEqual(100);
+		expect(PERMISSIONS.length).toBeLessThanOrEqual(112);
 	});
 
 	it("contains no duplicates", () => {
@@ -189,6 +217,10 @@ describe("PERMISSIONS", () => {
 			"ivr",
 			"ring-groups",
 			"paging-groups",
+			"call-flows",
+			"pin-sets",
+			"dial-plan",
+			"org-limits",
 			"queues",
 			"voicemail",
 			"conferences",
@@ -256,6 +288,12 @@ describe("PERMISSIONS", () => {
 			"queues",
 			"conferences",
 			"park-lots",
+			// The T2 admin block's three CRUD resources. `org-limits` is absent on purpose: there is
+			// no delete, because a limit is cleared by nulling the column rather than by removing the
+			// one row an organization has.
+			"call-flows",
+			"pin-sets",
+			"dial-plan",
 		]) {
 			for (const action of ["read", "write", "delete"]) {
 				expect(flat.has(`${resource}.${action}`)).toBe(true);
@@ -337,6 +375,23 @@ describe("SYSTEM_ROLE_TEMPLATES", () => {
 	});
 
 	/**
+	 * The second owner-only grant, and the reason `ADMIN_PERMISSIONS` stopped being a one-exclusion
+	 * filter.
+	 *
+	 * A quota an administrator can raise is not a quota. This is not a real control-plane boundary —
+	 * an owner can still raise their own cap — and it is not pretending to be one; it is the narrowest
+	 * boundary this model can express until the reseller hierarchy gives limits a platform-operator
+	 * home. Asserted separately from `settings.write.all` so that a later wave moving it does so
+	 * deliberately.
+	 */
+	it("withholds the limit-raising grant from everyone but the owner", () => {
+		for (const template of SYSTEM_ROLE_TEMPLATES) {
+			if (template.id === "owner") continue;
+			expect(template.permissions).not.toContain("org-limits.write" as Permission);
+		}
+	});
+
+	/**
 	 * `secrets.read` and `secrets.rotate` used to head this list and have been retired — the table
 	 * they guarded went with the legacy platform, so they checked nothing (see
 	 * `RETIRED_PERMISSIONS`). What survives is the list's actual subject: the grants that reach a
@@ -396,6 +451,8 @@ describe("SYSTEM_ROLE_TEMPLATES", () => {
 			"ring-groups.write",
 			"paging-groups.write",
 			"ivr.write",
+			"call-flows.write",
+			"dial-plan.write",
 		] as Permission[]) {
 			expect(manager.has(permission)).toBe(true);
 		}
@@ -429,6 +486,14 @@ describe("SYSTEM_ROLE_TEMPLATES", () => {
 			"time-conditions.delete",
 			"feature-codes.delete",
 			"park-lots.delete",
+			"call-flows.delete",
+			"dial-plan.delete",
+			"pin-sets.delete",
+			// Not a delete, and here anyway: adding a code to a PIN set decides who may spend the
+			// tenant's money internationally, which is the same class of grant as `trunks.write`.
+			"pin-sets.write",
+			// The quota an administrator is not supposed to be able to raise. `owner` only.
+			"org-limits.write",
 		] as Permission[]) {
 			expect(manager.has(permission)).toBe(false);
 		}

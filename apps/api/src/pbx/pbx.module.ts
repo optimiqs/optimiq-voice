@@ -13,6 +13,9 @@ import { AuditLogQueryService } from "./audit-log/audit-log-query.service";
 import { AuditLogController } from "./audit-log/audit-log.controller";
 import { CallBlockController } from "./call-block/call-block.controller";
 import { CallBlockService } from "./call-block/call-block.service";
+import { CallFlowPresencePublisher } from "./call-flows/call-flow-presence.publisher";
+import { CallFlowsController } from "./call-flows/call-flows.controller";
+import { CallFlowsService, TimeConditionOverrideService } from "./call-flows/call-flows.service";
 import { CallsController } from "./calls/calls.controller";
 import { CallsService } from "./calls/calls.service";
 import { CarrierWebhookController } from "./carrier/carrier-webhook.controller";
@@ -22,6 +25,18 @@ import { CarrierService } from "./carrier/carrier.service";
 import { ConferencePinService } from "./conferences/conference-pin.service";
 import { ConferencesController } from "./conferences/conferences.controller";
 import { ConferencesService } from "./conferences/conferences.service";
+import {
+	AudioStreamsController,
+	DestinationAliasesController,
+	DirectoriesController,
+	SpeedDialsController,
+} from "./dial-plan/dial-plan.controller";
+import {
+	AudioStreamsService,
+	DestinationAliasesService,
+	DialByNameDirectoriesService,
+	SpeedDialsService,
+} from "./dial-plan/dial-plan.service";
 import { EmergencyAddressesController } from "./emergency-addresses/emergency-addresses.controller";
 import { EmergencyAddressesService } from "./emergency-addresses/emergency-addresses.service";
 import { EmergencyConsumer } from "./emergency-addresses/emergency-consumer.service";
@@ -38,6 +53,8 @@ import { IvrMenusController } from "./ivr-menus/ivr-menus.controller";
 import { IvrMenuOptionsService, IvrMenusService } from "./ivr-menus/ivr-menus.service";
 import { MohClassesController } from "./moh-classes/moh-classes.controller";
 import { MohClassesService } from "./moh-classes/moh-classes.service";
+import { OrgLimitsController } from "./org-limits/org-limits.controller";
+import { OrgLimitsService } from "./org-limits/org-limits.service";
 import { OrgSettingsController } from "./org-settings/org-settings.controller";
 import { OrgSettingsService } from "./org-settings/org-settings.service";
 import { OutboundRoutesController } from "./outbound-routes/outbound-routes.controller";
@@ -51,6 +68,8 @@ import { ParkLotsController } from "./park-lots/park-lots.controller";
 import { ParkLotsService } from "./park-lots/park-lots.service";
 import { PhoneNumbersController } from "./phone-numbers/phone-numbers.controller";
 import { PhoneNumbersService } from "./phone-numbers/phone-numbers.service";
+import { PinSetsController } from "./pin-sets/pin-sets.controller";
+import { PinSetEntriesService, PinSetsService } from "./pin-sets/pin-sets.service";
 import { PromptsController } from "./prompts/prompts.controller";
 import { PromptsService } from "./prompts/prompts.service";
 import { AgentStatePublisher } from "./queues/agent-state.publisher";
@@ -96,6 +115,11 @@ import {
 	TimeConditionRulesService,
 	TimeConditionsService,
 } from "./time-conditions/time-conditions.service";
+import { TranslationRulesetsController } from "./translations/translations.controller";
+import {
+	TranslationRulesetsService,
+	TranslationRulesService,
+} from "./translations/translations.service";
 import { TrunkStatusConsumer } from "./trunks/trunk-status-consumer.service";
 import { TrunksController } from "./trunks/trunks.controller";
 import { TrunksService } from "./trunks/trunks.service";
@@ -203,6 +227,16 @@ const logger = getLogger("api.pbx");
 		QueueAgentSessionController,
 		ConferencesController,
 		ParkLotsController,
+		// The T2 admin block. `CallFlowsController` also owns the time-condition override, because
+		// that endpoint is guarded by `call-flows.toggle` — see the controller's own note.
+		CallFlowsController,
+		PinSetsController,
+		TranslationRulesetsController,
+		DestinationAliasesController,
+		AudioStreamsController,
+		DirectoriesController,
+		SpeedDialsController,
+		OrgLimitsController,
 		/**
 		 * Click-to-call, and the integrator surface beside it.
 		 *
@@ -596,6 +630,18 @@ const logger = getLogger("api.pbx");
 		ConferencesService,
 		ConferencePinService,
 		ParkLotsService,
+		CallFlowPresencePublisher,
+		CallFlowsService,
+		TimeConditionOverrideService,
+		PinSetsService,
+		PinSetEntriesService,
+		TranslationRulesetsService,
+		TranslationRulesService,
+		DestinationAliasesService,
+		AudioStreamsService,
+		DialByNameDirectoriesService,
+		SpeedDialsService,
+		OrgLimitsService,
 		PromptsService,
 		MohClassesService,
 		EmergencyAddressesService,

@@ -1,7 +1,7 @@
 /**
  * The polymorphic destination trio, as the compiler sees it.
  *
- * This mirrors `packages/pbx-db/src/destinations.ts` — the same eleven types, the same
+ * This mirrors `packages/pbx-db/src/destinations.ts` — the same sixteen types, the same
  * entity/value/terminal kinds, the same shape rules. It is a *mirror* and not an import for the
  * reason set out at the top of `snapshot.ts`: the compiler must not depend on a database package.
  * `destinations.spec.ts` pins the vocabulary so the two copies cannot silently diverge, and the
@@ -23,6 +23,10 @@ export const DESTINATION_TYPES = [
 	"park",
 	"paging-group",
 	"time-condition",
+	"call-flow",
+	"stream",
+	"dial-by-name",
+	"alias",
 	"external",
 	"application",
 	"hangup",
@@ -48,6 +52,14 @@ export const DESTINATION_TYPE_KINDS: Readonly<Record<DestinationType, Destinatio
 	park: "entity",
 	"paging-group": "entity",
 	"time-condition": "entity",
+	"call-flow": "entity",
+	stream: "entity",
+	"dial-by-name": "entity",
+	// Entity-backed like the rest, and the only one that compiles to no node of its own: an alias
+	// resolves to whatever its target resolved to. See `aliases-schema.ts` for why the feature is a
+	// macro rather than FusionPBX's raw dial string, and `compile.ts` for the cycle guard flatness
+	// needs.
+	alias: "entity",
 	external: "value",
 	application: "value",
 	hangup: "terminal",
@@ -68,6 +80,10 @@ export const DESTINATION_TARGET_COLLECTIONS: Readonly<Record<DestinationType, st
 	park: "parkLots",
 	"paging-group": "pagingGroups",
 	"time-condition": "timeConditions",
+	"call-flow": "callFlows",
+	stream: "audioStreams",
+	"dial-by-name": "directories",
+	alias: "destinationAliases",
 	external: null,
 	application: null,
 	hangup: null,

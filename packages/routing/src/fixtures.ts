@@ -21,8 +21,12 @@ import {
 import type { RoutingArtifact } from "./artifact";
 import type { CompileResult } from "./compile";
 import type {
+	AudioStreamInput,
 	CallBlockRuleInput,
+	CallFlowInput,
 	ConferenceInput,
+	DestinationAliasInput,
+	DialByNameDirectoryInput,
 	EmergencyAddressInput,
 	ExtensionInput,
 	FeatureCodeInput,
@@ -35,11 +39,18 @@ import type {
 	PagingGroupInput,
 	ParkLotInput,
 	PhoneNumberInput,
+	PhraseStepInput,
+	PinSetEntryInput,
+	PinSetInput,
+	PromptInput,
 	QueueInput,
 	RingGroupDestinationInput,
 	RingGroupInput,
+	SpeedDialInput,
 	TimeConditionInput,
 	TimeConditionRuleInput,
+	TranslationRuleInput,
+	TranslationRulesetInput,
 	TrunkInput,
 	VoicemailBoxInput,
 	VoicemailGreetingInput,
@@ -344,6 +355,139 @@ export function aCallBlockRule(overrides: Partial<CallBlockRuleInput> = {}): Cal
 		matchKind: "prefix",
 		direction: "inbound",
 		action: "block",
+		...overrides,
+	};
+}
+
+export function aCallFlow(overrides: Partial<CallFlowInput> = {}): CallFlowInput {
+	return {
+		id: "cf-1",
+		enabled: true,
+		name: "Front desk",
+		featureCode: "*281",
+		mode: "day",
+		destinationType: "extension",
+		destinationRef: "ext-1",
+		nightDestinationType: "hangup",
+		...overrides,
+	};
+}
+
+export function anAlias(overrides: Partial<DestinationAliasInput> = {}): DestinationAliasInput {
+	return {
+		id: "alias-1",
+		enabled: true,
+		name: "The front desk",
+		destinationType: "extension",
+		destinationRef: "ext-1",
+		...overrides,
+	};
+}
+
+export function aStream(overrides: Partial<AudioStreamInput> = {}): AudioStreamInput {
+	return {
+		id: "stream-1",
+		enabled: true,
+		name: "Shop radio",
+		url: "https://media.example.com/radio.mp3",
+		answerFirst: true,
+		maxSeconds: 0,
+		fallbackDestinationType: "hangup",
+		...overrides,
+	};
+}
+
+export function aDirectory(
+	overrides: Partial<DialByNameDirectoryInput> = {},
+): DialByNameDirectoryInput {
+	return {
+		id: "dir-1",
+		enabled: true,
+		name: "Company directory",
+		searchField: "last-name",
+		minDigits: 3,
+		maxFailures: 3,
+		...overrides,
+	};
+}
+
+export function aSpeedDial(overrides: Partial<SpeedDialInput> = {}): SpeedDialInput {
+	return {
+		id: "sd-1",
+		enabled: true,
+		code: "*01",
+		label: "Head office",
+		destinationType: "extension",
+		destinationRef: "ext-1",
+		...overrides,
+	};
+}
+
+export function aPinSet(overrides: Partial<PinSetInput> = {}): PinSetInput {
+	return {
+		id: "pin-1",
+		enabled: true,
+		name: "International codes",
+		maxAttempts: 3,
+		digitTimeoutMs: 8000,
+		...overrides,
+	};
+}
+
+export function aPinEntry(overrides: Partial<PinSetEntryInput> = {}): PinSetEntryInput {
+	return {
+		id: "pin-entry-1",
+		enabled: true,
+		pinSetId: "pin-1",
+		ordinal: 1,
+		label: "Night desk",
+		pinHash: A_PIN_HASH,
+		...overrides,
+	};
+}
+
+export function aTranslationRuleset(
+	overrides: Partial<TranslationRulesetInput> = {},
+): TranslationRulesetInput {
+	return {
+		id: "tr-1",
+		enabled: true,
+		name: "E.164 normalisation",
+		...overrides,
+	};
+}
+
+export function aTranslationRule(
+	overrides: Partial<TranslationRuleInput> = {},
+): TranslationRuleInput {
+	return {
+		id: "trr-1",
+		enabled: true,
+		translationRulesetId: "tr-1",
+		ordinal: 1,
+		matchPattern: "^00(\\d+)$",
+		replacement: "+$1",
+		...overrides,
+	};
+}
+
+export function aPrompt(overrides: Partial<PromptInput> = {}): PromptInput {
+	return {
+		id: "prompt-1",
+		enabled: true,
+		name: "Greeting",
+		kind: "prompt",
+		...overrides,
+	};
+}
+
+export function aPhraseStep(overrides: Partial<PhraseStepInput> = {}): PhraseStepInput {
+	return {
+		id: "step-1",
+		enabled: true,
+		phraseId: "phrase-1",
+		promptId: "prompt-1",
+		ordinal: 1,
 		...overrides,
 	};
 }

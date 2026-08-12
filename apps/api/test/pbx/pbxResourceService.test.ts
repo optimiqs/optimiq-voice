@@ -6,6 +6,7 @@ import { MissingActiveOrganizationError } from "@optimiq-voice/auth";
 import { makeTestModuleRuntime } from "@optimiq-voice/effect-runtime";
 import { ExtensionsService } from "../../src/pbx/extensions/extensions.service";
 import { IvrMenuOptionsService } from "../../src/pbx/ivr-menus/ivr-menus.service";
+import { OrgLimitsService } from "../../src/pbx/org-limits/org-limits.service";
 import {
 	PagingGroupMembersService,
 	PagingGroupsService,
@@ -87,10 +88,23 @@ function fakeRuntime(overrides: Partial<PbxRepositoryInterface>): {
 	return { runtime: makeTestModuleRuntime(PbxRepository, layer), calls };
 }
 
+/**
+ * An organization with no quotas.
+ *
+ * These specs are about the generic service's plumbing — the tenant argument, the resource
+ * descriptor, the actor — and `ExtensionsService` is the resource they happen to use. Its create
+ * path now asks about the extension quota first, so it needs one; an unlimited organization is what
+ * every tenant is until somebody sets a ceiling, and it keeps the quota out of assertions that are
+ * not about it. `orgLimits.test.ts` is where the enforcement itself is tested.
+ */
+const NO_LIMITS = {
+	assertMayCreate: async () => undefined,
+} as unknown as OrgLimitsService;
+
 describe("PbxResourceService", () => {
 	it("passes the session's organization as the repository's first argument", async () => {
 		const { runtime, calls } = fakeRuntime({});
-		const service = new ExtensionsService(runtime);
+		const service = new ExtensionsService(runtime, NO_LIMITS);
 		await service.list(sessionFor(ORGANIZATION_ID), { page: 1, limit: 20 } as never);
 		expect(calls[0]?.method).to.equal("list");
 		expect(calls[0]?.args[0]).to.equal(ORGANIZATION_ID);
@@ -98,7 +112,7 @@ describe("PbxResourceService", () => {
 
 	it("passes its own resource descriptor, not one the caller chose", async () => {
 		const { runtime, calls } = fakeRuntime({});
-		await new ExtensionsService(runtime).get(sessionFor(ORGANIZATION_ID), "abc");
+		await new ExtensionsService(runtime, NO_LIMITS).get(sessionFor(ORGANIZATION_ID), "abc");
 		const resource = calls[0]?.args[1] as { kind: string; tableName: string };
 		expect(resource.kind).to.equal("extension");
 		expect(resource.tableName).to.equal("extension");
@@ -106,7 +120,7 @@ describe("PbxResourceService", () => {
 
 	it("refuses to act on a session with no active organization", async () => {
 		const { runtime, calls } = fakeRuntime({});
-		const service = new ExtensionsService(runtime);
+		const service = new ExtensionsService(runtime, NO_LIMITS);
 		let thrown: unknown;
 		try {
 			await service.list(sessionFor(null), { page: 1, limit: 20 } as never);
@@ -128,10 +142,13 @@ describe("PbxResourceService", () => {
 					totalPages: 3,
 				})) as never,
 		});
-		const result = await new ExtensionsService(runtime).list(sessionFor(ORGANIZATION_ID), {
-			page: 2,
-			limit: 20,
-		} as never);
+		const result = await new ExtensionsService(runtime, NO_LIMITS).list(
+			sessionFor(ORGANIZATION_ID),
+			{
+				page: 2,
+				limit: 20,
+			} as never,
+		);
 		expect(result).to.deep.equal({
 			data: [{ id: "a" }],
 			total: 41,
@@ -143,7 +160,10 @@ describe("PbxResourceService", () => {
 
 	it("wraps a single row as { data }", async () => {
 		const { runtime } = fakeRuntime({});
-		const result = await new ExtensionsService(runtime).get(sessionFor(ORGANIZATION_ID), "abc");
+		const result = await new ExtensionsService(runtime, NO_LIMITS).get(
+			sessionFor(ORGANIZATION_ID),
+			"abc",
+		);
 		expect(result).to.deep.equal({ data: { id: "row" } });
 	});
 
@@ -163,7 +183,10 @@ describe("PbxResourceService", () => {
 					],
 				})) as never,
 		});
-		const result = await new ExtensionsService(runtime).create(sessionFor(ORGANIZATION_ID), {});
+		const result = await new ExtensionsService(runtime, NO_LIMITS).create(
+			sessionFor(ORGANIZATION_ID),
+			{},
+		);
 		expect(result.warnings).to.have.length(1);
 		expect(result.warnings[0]?.code).to.equal("empty-ring-group");
 		expect(result.warnings[0]?.field).to.equal("destinations");
@@ -171,7 +194,7 @@ describe("PbxResourceService", () => {
 
 	it("always returns a warnings array, even when there is nothing to say", async () => {
 		const { runtime } = fakeRuntime({});
-		const result = await new ExtensionsService(runtime).update(
+		const result = await new ExtensionsService(runtime, NO_LIMITS).update(
 			sessionFor(ORGANIZATION_ID),
 			"id",
 			{},
@@ -186,7 +209,7 @@ describe("PbxResourceService", () => {
 		});
 		let thrown: unknown;
 		try {
-			await new ExtensionsService(runtime).get(sessionFor(ORGANIZATION_ID), "x");
+			await new ExtensionsService(runtime, NO_LIMITS).get(sessionFor(ORGANIZATION_ID), "x");
 		} catch (error) {
 			thrown = error;
 		}
@@ -212,7 +235,7 @@ describe("PbxResourceService", () => {
 		});
 		let thrown: HttpException | undefined;
 		try {
-			await new ExtensionsService(runtime).create(sessionFor(ORGANIZATION_ID), {});
+			await new ExtensionsService(runtime, NO_LIMITS).create(sessionFor(ORGANIZATION_ID), {});
 		} catch (error) {
 			thrown = error as HttpException;
 		}
@@ -236,7 +259,7 @@ describe("PbxResourceService", () => {
 		});
 		let thrown: HttpException | undefined;
 		try {
-			await new ExtensionsService(runtime).remove(sessionFor(ORGANIZATION_ID), "rg");
+			await new ExtensionsService(runtime, NO_LIMITS).remove(sessionFor(ORGANIZATION_ID), "rg");
 		} catch (error) {
 			thrown = error as HttpException;
 		}
@@ -249,7 +272,7 @@ describe("PbxResourceService", () => {
 		});
 		let thrown: HttpException | undefined;
 		try {
-			await new ExtensionsService(runtime).get(sessionFor(ORGANIZATION_ID), "x");
+			await new ExtensionsService(runtime, NO_LIMITS).get(sessionFor(ORGANIZATION_ID), "x");
 		} catch (error) {
 			thrown = error as HttpException;
 		}

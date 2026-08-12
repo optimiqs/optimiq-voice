@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import {
+	aCallFlow,
 	aConference,
+	aDirectory,
 	anExtension,
 	anIvrMenu,
 	anIvrOption,
@@ -12,10 +14,12 @@ import {
 	aRingGroup,
 	aRingGroupMember,
 	aSnapshot,
+	aStream,
 	aTimeCondition,
 	aTimeRule,
 	aTrunk,
 	aVoicemailBox,
+	aVoicemailGreeting,
 	compiled,
 } from "./fixtures";
 import { PLAN_NODE_KINDS, planNodeIds, planNodeReferences, reachableNodeIds } from "./plan";
@@ -81,6 +85,13 @@ const artifact = compiled(
 		trunks: [aTrunk()],
 		outboundRoutes: [anOutboundRoute()],
 		phoneNumbers: [aPhoneNumber({ destinationType: "ivr", destinationRef: "ivr-1" })],
+		// The T2 admin block's three node kinds. The directory carries no entries here (nobody has a
+		// recorded name in this fixture) and still emits its node — an empty directory is a warning,
+		// not a missing node, because a tenant builds one before anybody records a name.
+		callFlows: [aCallFlow()],
+		audioStreams: [aStream()],
+		directories: [aDirectory()],
+		voicemailGreetings: [aVoicemailGreeting()],
 	}),
 );
 
@@ -98,9 +109,12 @@ describe("plan node vocabulary", () => {
 	 * previous version meets a `kind` it has no case for, mid-call. Counting them is how the bump
 	 * stops being something somebody has to remember.
 	 */
-	it("names fifteen kinds", () => {
-		expect(PLAN_NODE_KINDS).toHaveLength(15);
+	it("names eighteen kinds", () => {
+		expect(PLAN_NODE_KINDS).toHaveLength(18);
 		expect(PLAN_NODE_KINDS).toContain("paging");
+		expect(PLAN_NODE_KINDS).toContain("call-flow");
+		expect(PLAN_NODE_KINDS).toContain("stream");
+		expect(PLAN_NODE_KINDS).toContain("dial-by-name");
 	});
 
 	it("emits every kind except playback from a fully wired organization", () => {

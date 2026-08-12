@@ -19,7 +19,7 @@ import {
  * the compiler would silently drop every route pointing at it, and only a pinned list catches that.
  */
 describe("destination vocabulary", () => {
-	it("names exactly the twelve pbx-db destination types", () => {
+	it("names exactly the sixteen pbx-db destination types", () => {
 		expect([...DESTINATION_TYPES]).toEqual([
 			"extension",
 			"ivr",
@@ -30,10 +30,25 @@ describe("destination vocabulary", () => {
 			"park",
 			"paging-group",
 			"time-condition",
+			"call-flow",
+			"stream",
+			"dial-by-name",
+			"alias",
 			"external",
 			"application",
 			"hangup",
 		]);
+	});
+
+	/**
+	 * `alias` is entity-backed and compiles to NO node — it resolves to whatever its target resolved
+	 * to. Pinned here because it is the one member of this vocabulary whose kind does not predict
+	 * what the compiler emits, and a later reader looking for an `alias` plan node needs to be told
+	 * there is not one.
+	 */
+	it("makes alias an entity destination that resolves through to its target", () => {
+		expect(destinationKind("alias")).toBe("entity");
+		expect(DESTINATION_TARGET_COLLECTIONS.alias).toBe("destinationAliases");
 	});
 
 	it("assigns a kind to every type", () => {

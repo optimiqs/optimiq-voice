@@ -309,7 +309,10 @@ export class PromptsService {
 				.from(prompt)
 				.where(eq(prompt.id, id))
 				.limit(1);
-			return found[0]?.objectKey;
+			// `object_key` became nullable when a PHRASE became a `prompt` row — a phrase names other
+			// rows' audio and owns none. `?? undefined` collapses "no row" and "a row with no file"
+			// onto the same answer, which is the right one: both mean there is nothing to unlink.
+			return found[0]?.objectKey ?? undefined;
 		});
 
 		const result = await runEffect(this.runtime, (repository) =>
@@ -368,7 +371,12 @@ export class PromptsService {
 				.select({ objectKey: prompt.objectKey })
 				.from(prompt)
 				.where(and(eq(prompt.mohClassId, mohClassId), eq(prompt.kind, "moh")));
-			return rows.map((row) => row.objectKey);
+			// Same reason as `remove` above: a phrase has no file. It also cannot be a `moh` row, so
+			// the filter already excludes every nullable case — the narrowing is here so a later
+			// widening of the filter cannot quietly start handing the object store a null.
+			return rows
+				.map((row) => row.objectKey)
+				.filter((objectKey): objectKey is string => objectKey !== null);
 		});
 	}
 
@@ -469,6 +477,13 @@ export class PromptsService {
 		// A token for a row that is not visible in the organization it names is indistinguishable
 		// from a forged one, and is answered identically.
 		if (row === undefined) {
+			throw new MediaLinkInvalidException();
+		}
+
+		// A phrase has no audio of its own — it names other rows' — so a media link for one has
+		// nothing to open. Answered as an invalid link rather than a 404 on the row, because the row
+		// exists and is perfectly valid; what does not exist is a file to stream.
+		if (row.objectKey === null) {
 			throw new MediaLinkInvalidException();
 		}
 

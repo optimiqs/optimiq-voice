@@ -135,6 +135,20 @@ export function namedDestinationShape<TPrefix extends string>(prefix: TPrefix) {
 	} & { [K in `${TPrefix}DestinationData`]: typeof destinationDataDto };
 }
 
+/**
+ * A star code or short code a phone can dial: `*281`, `*01`, `8001`.
+ *
+ * Separate from {@link internalNumber} because a code MAY begin with `*` and an extension may not —
+ * that space belongs to the feature codes, and a code that lives in it has to be screened against
+ * them, which the compiler does. Separate from {@link dialableString} because a toggle code is not a
+ * destination: it is ten characters at most and contains no letters.
+ */
+export const shortCode = z
+	.string()
+	.min(1)
+	.max(10)
+	.regex(/^[*#]?[0-9*#]+$/u, "must be digits, optionally led by * or #");
+
 /** A dialable string: digits plus the characters a PBX actually dials. */
 export const dialableString = z
 	.string()

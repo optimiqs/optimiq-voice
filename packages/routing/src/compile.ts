@@ -31,6 +31,7 @@ import { ROUTING_ARTIFACT_VERSION } from "./artifact";
 import { snapshotHash } from "./cache";
 import { destinationShapeIssues, isDestinationType } from "./destinations";
 import { DiagnosticBag } from "./diagnostics";
+import { directoryDigits } from "./dial-by-name";
 import {
 	EMERGENCY_CONTINUE_ON_CAUSES,
 	EMERGENCY_NODE_ID,
@@ -61,9 +62,11 @@ import {
 	VOICEMAIL_LEAVE_GREETING_PRECEDENCE,
 } from "./snapshot";
 import { compileTimePredicate, isKnownTimezone, validateTimePredicate } from "./time-conditions";
+import { validateTranslationRule } from "./translations";
 import { voicemailPinHashIssue } from "./voicemail-pin";
 import type {
 	CompiledCallBlockRule,
+	CompiledPhrase,
 	CompiledRoutingSettings,
 	EmergencyMatchTable,
 	EmergencyRule,
@@ -79,6 +82,7 @@ import type {
 	ParkSlotRange,
 	RouteTimeGate,
 	RoutingArtifact,
+	SpeedDialEntry,
 	VoicemailPrefixEntry,
 } from "./artifact";
 import type { Destination } from "./destinations";
@@ -86,6 +90,9 @@ import type { Diagnostic, DiagnosticSubject } from "./diagnostics";
 import type { CompiledFeatureCode } from "./feature-codes";
 import type { CompiledPattern } from "./patterns";
 import type {
+	CompiledPinEntry,
+	CompiledPinSet,
+	DirectoryEntry,
 	ExtensionPlanNode,
 	FollowMeDestination,
 	FollowMePlan,
@@ -94,7 +101,11 @@ import type {
 	RingGroupMember,
 } from "./plan";
 import type {
+	AudioStreamInput,
 	CallBlockAction,
+	CallFlowInput,
+	DestinationAliasInput,
+	DialByNameDirectoryInput,
 	EmergencyAddressInput,
 	ExtensionInput,
 	FollowMeTargetInput,
@@ -102,12 +113,18 @@ import type {
 	MohClassInput,
 	OrgRoutingSnapshot,
 	PagingGroupInput,
+	PhraseStepInput,
+	PinSetEntryInput,
+	PinSetInput,
+	PromptInput,
 	RingGroupDestinationInput,
 	TimeConditionRuleInput,
+	TranslationRuleInput,
 	VoicemailGreetingInput,
 	VoicemailGreetingKind,
 } from "./snapshot";
 import type { CompiledTimeCondition, CompiledTimeRule } from "./time-conditions";
+import type { CompiledTranslationRule, CompiledTranslationRuleset } from "./translations";
 import type { HangupCause } from "@optimiq-voice/telephony";
 
 /** Everything the compiler needs that is not in the snapshot. */
@@ -126,6 +143,35 @@ export type CompileResult =
 			readonly diagnostics: readonly Diagnostic[];
 	  }
 	| { readonly ok: false; readonly diagnostics: readonly Diagnostic[] };
+
+/**
+ * How deep an alias chain may be expanded.
+ *
+ * Aliases are macros and legitimately nest — "the front desk" pointing at "reception", pointing at a
+ * ring group — but a chain longer than a handful is a tenant who has lost track rather than a tenant
+ * who meant it, and the bound is what keeps a pathological configuration from being a compile that
+ * never finishes. The cycle check catches loops; this catches depth.
+ */
+const MAX_ALIAS_DEPTH = 8;
+
+/** What an organization speed-dial code may look like. Star-prefixed or bare digits, both dialable. */
+const SPEED_DIAL_CODE_PATTERN = /^[*#]?[0-9*#]{1,10}$/u;
+
+/**
+ * Whether a stream URL is one a media server may be asked to open.
+ *
+ * `http` and `https` and nothing else. The set of things a tenant can cause the media server to
+ * open is a security decision rather than a formatting one: `file:` would read the server's disk,
+ * and a scheme-less string is one a driver might interpret as a local path.
+ */
+function isPlayableStreamUrl(url: string): boolean {
+	try {
+		const parsed = new URL(url.trim());
+		return parsed.protocol === "http:" || parsed.protocol === "https:";
+	} catch {
+		return false;
+	}
+}
 
 /** Cause used when a destination points at something a tenant has switched off. */
 const DISABLED_TARGET_CAUSE: HangupCause = "SERVICE_UNAVAILABLE";
@@ -270,6 +316,25 @@ class Compiler {
 	/** Every internal number claimed so far, so the second claimant can be reported. */
 	private readonly internalNumbers = new Map<string, InternalNumberEntry>();
 
+	// --- the T2 admin block ---------------------------------------------------------------------
+	private readonly callFlowsById = new Map<string, CallFlowInput>();
+	private readonly aliasesById = new Map<string, DestinationAliasInput>();
+	private readonly streamsById = new Map<string, AudioStreamInput>();
+	private readonly directoriesById = new Map<string, DialByNameDirectoryInput>();
+	private readonly promptsById = new Map<string, PromptInput>();
+	private readonly phraseStepsByPhrase = new Map<string, PhraseStepInput[]>();
+	private readonly pinSetsById = new Map<string, PinSetInput>();
+	private readonly pinEntriesBySet = new Map<string, PinSetEntryInput[]>();
+	private readonly translationRulesetsById = new Map<string, CompiledTranslationRuleset>();
+	private readonly translationRulesByRuleset = new Map<string, TranslationRuleInput[]>();
+	/**
+	 * Aliases currently being expanded, innermost last.
+	 *
+	 * `claimed` cannot do this job: an alias produces no node to claim, so the ordinary
+	 * already-under-construction guard never sees one. This is the cycle guard flatness needs.
+	 */
+	private readonly aliasStack: string[] = [];
+
 	constructor(snapshot: OrgRoutingSnapshot, compiledAt: string) {
 		this.snapshot = snapshot;
 		this.compiledAt = compiledAt;
@@ -279,6 +344,10 @@ class Compiler {
 		this.index();
 		this.ensureWellKnownTerminals();
 		const settings = this.compileSettings();
+		// Before the time conditions and before every entity, because a route, a trunk and a time
+		// condition can all name a ruleset and none of them may compile against a half-built one.
+		this.compileTranslationRulesets();
+		const phrases = this.compilePhrases();
 		this.compileTimeConditions();
 		this.materialiseEntities();
 
@@ -317,6 +386,7 @@ class Compiler {
 			internal,
 			outbound,
 			callBlock,
+			...(Object.keys(phrases).length === 0 ? {} : { phrases }),
 			extensionsByNumber: extensionIndex,
 			diagnostics,
 		};
@@ -374,6 +444,33 @@ class Compiler {
 		}
 		for (const address of sortById(this.snapshot.emergencyAddresses ?? [])) {
 			this.emergencyAddressesById.set(address.id, address);
+		}
+		for (const flow of sortById(this.snapshot.callFlows ?? [])) {
+			this.callFlowsById.set(flow.id, flow);
+		}
+		for (const alias of sortById(this.snapshot.destinationAliases ?? [])) {
+			this.aliasesById.set(alias.id, alias);
+		}
+		for (const stream of sortById(this.snapshot.audioStreams ?? [])) {
+			this.streamsById.set(stream.id, stream);
+		}
+		for (const directory of sortById(this.snapshot.directories ?? [])) {
+			this.directoriesById.set(directory.id, directory);
+		}
+		for (const entry of sortById(this.snapshot.prompts ?? [])) {
+			this.promptsById.set(entry.id, entry);
+		}
+		for (const step of sortByOrdinal(this.snapshot.phraseSteps ?? [])) {
+			pushInto(this.phraseStepsByPhrase, step.phraseId, step);
+		}
+		for (const set of sortById(this.snapshot.pinSets ?? [])) {
+			this.pinSetsById.set(set.id, set);
+		}
+		for (const entry of sortByOrdinal(this.snapshot.pinSetEntries ?? [])) {
+			pushInto(this.pinEntriesBySet, entry.pinSetId, entry);
+		}
+		for (const rule of sortByOrdinal(this.snapshot.translationRules ?? [])) {
+			pushInto(this.translationRulesByRuleset, rule.translationRulesetId, rule);
 		}
 		this.indexVoicemailGreetings();
 		for (const option of sortByOrdinal(this.snapshot.ivrMenuOptions)) {
@@ -487,7 +584,10 @@ class Compiler {
 				);
 			}
 
-			if (rules.length === 0) {
+			// An overridden condition never reads its rules, so "no rules" is not the trap it usually
+			// is — a tenant who has forced a condition open has said what they want and does not need
+			// to be told the rule list is empty.
+			if (rules.length === 0 && (condition.override ?? "auto") === "auto") {
 				this.bag.warning(
 					"empty-time-condition",
 					`Time condition "${condition.name}" has no enabled rules, so it always takes its no-match branch.`,
@@ -495,12 +595,20 @@ class Compiler {
 				);
 			}
 
-			this.timeConditionsById.set(condition.id, {
-				id: condition.id,
-				name: condition.name,
-				timezone,
-				rules,
-			});
+			this.timeConditionsById.set(
+				condition.id,
+				compact({
+					id: condition.id,
+					name: condition.name,
+					timezone,
+					rules,
+					// `auto` is dropped rather than carried, so a condition nobody has overridden hashes
+					// exactly as it did before the column existed — which is what keeps this wave from
+					// moving every tenant's `snapshotHash` for a feature they are not using.
+					override: (condition.override ?? "auto") === "auto" ? undefined : condition.override,
+					overrideFeatureCode: condition.overrideFeatureCode ?? undefined,
+				}) as CompiledTimeCondition,
+			);
 		}
 	}
 
@@ -585,6 +693,33 @@ class Compiler {
 				);
 			}
 		}
+		for (const flow of sortById(this.snapshot.callFlows ?? [])) {
+			if (flow.enabled) {
+				this.callFlowNode(flow);
+			}
+		}
+		for (const stream of sortById(this.snapshot.audioStreams ?? [])) {
+			if (stream.enabled) {
+				this.streamNode(stream);
+			}
+		}
+		for (const directory of sortById(this.snapshot.directories ?? [])) {
+			if (directory.enabled) {
+				this.dialByNameNode(directory);
+			}
+		}
+		// Aliases LAST among the entity passes, and only to validate them: an alias emits no node, so
+		// this walk exists purely so a dangling or looping alias that nothing points at is still
+		// reported. Half-built configuration is the normal state of an admin UI.
+		for (const alias of sortById(this.snapshot.destinationAliases ?? [])) {
+			if (alias.enabled) {
+				this.aliasNode(
+					alias.id,
+					{ kind: "destination-alias", id: alias.id, name: alias.name },
+					"destination",
+				);
+			}
+		}
 	}
 
 	private hangupNode(cause: HangupCause): PlanNodeId {
@@ -659,6 +794,18 @@ class Compiler {
 			}
 			case "time-condition": {
 				return this.timeConditionNodeById(ref, subject, path);
+			}
+			case "call-flow": {
+				return this.callFlowNodeById(ref, subject, path);
+			}
+			case "stream": {
+				return this.streamNodeById(ref, subject, path);
+			}
+			case "dial-by-name": {
+				return this.dialByNameNodeById(ref, subject, path);
+			}
+			case "alias": {
+				return this.aliasNode(ref, subject, path);
 			}
 			case "external": {
 				return this.externalNode(destination.destinationData?.value ?? "", true);
@@ -1409,6 +1556,640 @@ class Compiler {
 	 * row the loader happened to return first. Sorting by id and keeping the FIRST makes the choice
 	 * deterministic whatever arrives.
 	 */
+
+	// -------------------------------------------------------------------------------------------
+	// The T2 admin block
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * Compiles the reusable rewrite pipelines, once, before anything can point at one.
+	 *
+	 * A ruleset with no usable rules is still compiled — as an empty pipeline — rather than dropped,
+	 * because a route that names it must not fall back to "no normalisation at all" silently. An
+	 * empty pipeline is a no-op the tenant can see in the artifact; a missing ruleset is a dangling
+	 * reference the compiler reports.
+	 */
+	private compileTranslationRulesets(): void {
+		for (const ruleset of sortById(this.snapshot.translationRulesets ?? [])) {
+			const rules: CompiledTranslationRule[] = [];
+			for (const rule of this.translationRulesByRuleset.get(ruleset.id) ?? []) {
+				if (!rule.enabled) {
+					continue;
+				}
+				const issues = validateTranslationRule(rule);
+				if (issues.length > 0) {
+					for (const issue of issues) {
+						this.bag.error(
+							"invalid-translation-rule",
+							issue.code === "unsafe-replacement"
+								? `Rule ${rule.ordinal} of ruleset "${ruleset.name}" has a replacement that could emit characters a dial string may not contain (${JSON.stringify(issue.value)}); only digits, +, * and # plus $n back-references are allowed.`
+								: `Rule ${rule.ordinal} of ruleset "${ruleset.name}" is not usable (${issue.code}).`,
+							{ kind: "translation-rule", id: rule.id },
+							issue.code === "unsafe-replacement" ? "replacement" : "matchPattern",
+						);
+					}
+					continue;
+				}
+				rules.push(
+					compact({
+						id: rule.id,
+						ordinal: rule.ordinal,
+						label: rule.label ?? undefined,
+						source: rule.matchPattern,
+						replacement: rule.replacement,
+					}) as CompiledTranslationRule,
+				);
+			}
+			this.translationRulesetsById.set(ruleset.id, {
+				id: ruleset.id,
+				name: ruleset.name,
+				rules,
+			});
+		}
+	}
+
+	/**
+	 * A ruleset reference, resolved.
+	 *
+	 * A dangling or disabled ruleset is a WARNING and not an error, for the reason a dangling
+	 * music-on-hold class is: the call still completes, it simply goes out with the digits the caller
+	 * dialed. Refusing to compile a tenant's whole routing because somebody deleted a normalisation
+	 * would take working calls down to fix cosmetics on the wire.
+	 */
+	private translationRuleset(
+		rulesetId: string | null | undefined,
+		subject: DiagnosticSubject,
+		path: string,
+	): CompiledTranslationRuleset | undefined {
+		const id = rulesetId ?? undefined;
+		if (id === undefined || id.trim() === "") {
+			return undefined;
+		}
+		if (this.snapshot.translationRulesets === undefined) {
+			// A loader that does not yet select the collection is a rollout state, not a dangling
+			// reference — the same rule `mohClassName` applies.
+			return undefined;
+		}
+		const compiled = this.translationRulesetsById.get(id);
+		const input = (this.snapshot.translationRulesets ?? []).find((entry) => entry.id === id);
+		if (compiled === undefined || input === undefined) {
+			this.bag.warning(
+				"dangling-translation-ruleset",
+				`Translation ruleset "${id}" is not in this snapshot; numbers are used as dialed.`,
+				subject,
+				path,
+			);
+			return undefined;
+		}
+		if (!input.enabled) {
+			this.bag.warning(
+				"dangling-translation-ruleset",
+				`Translation ruleset "${input.name}" is disabled; numbers are used as dialed.`,
+				subject,
+				path,
+			);
+			return undefined;
+		}
+		return compiled;
+	}
+
+	/**
+	 * Compiles every phrase into the artifact's lookup table.
+	 *
+	 * A phrase is a `prompt` row of kind `phrase`, so this walks the prompt collection rather than a
+	 * table of its own — see `media-schema.ts` for why that is the shape.
+	 *
+	 * Two things are refused rather than tolerated. A step naming another PHRASE is an error: it
+	 * would make the media layer recurse, and `phrases-schema.ts` argues that composition is
+	 * expressible by listing the steps twice. A step naming a prompt that is not in the snapshot is
+	 * dropped with a warning — that is the shape of a half-built phrase, which an admin UI produces
+	 * on the way to a finished one.
+	 *
+	 * A phrase with no playable step is not written to the table at all, so a reader's MISS always
+	 * means "play this id as a single file" and never "play nothing".
+	 */
+	private compilePhrases(): Readonly<Record<string, CompiledPhrase>> {
+		const phrases: Record<string, CompiledPhrase> = {};
+		for (const entry of sortById(this.snapshot.prompts ?? [])) {
+			if (entry.kind !== "phrase" || !entry.enabled) {
+				continue;
+			}
+			const subject: DiagnosticSubject = { kind: "phrase", id: entry.id, name: entry.name };
+			const steps: string[] = [];
+			for (const step of this.phraseStepsByPhrase.get(entry.id) ?? []) {
+				if (!step.enabled) {
+					continue;
+				}
+				const target = this.promptsById.get(step.promptId);
+				if (target === undefined) {
+					this.bag.warning(
+						"dangling-phrase-step",
+						`Step ${step.ordinal} of phrase "${entry.name}" names prompt "${step.promptId}", which is not in this snapshot; it was skipped.`,
+						subject,
+						`steps[${step.ordinal}]`,
+					);
+					continue;
+				}
+				if (target.kind === "phrase") {
+					this.bag.error(
+						"invalid-phrase",
+						`Step ${step.ordinal} of phrase "${entry.name}" names another phrase ("${target.name}"). Phrases do not nest; list the steps directly.`,
+						subject,
+						`steps[${step.ordinal}]`,
+					);
+					continue;
+				}
+				if (!target.enabled) {
+					continue;
+				}
+				steps.push(step.promptId);
+			}
+			if (steps.length === 0) {
+				this.bag.warning(
+					"invalid-phrase",
+					`Phrase "${entry.name}" has no playable steps; anything that names it falls back to the deployment's own announcement.`,
+					subject,
+				);
+				continue;
+			}
+			phrases[entry.id] = { promptId: entry.id, name: entry.name, steps };
+		}
+		return sortRecordKeys(phrases);
+	}
+
+	private callFlowNodeById(
+		ref: string,
+		subject: DiagnosticSubject,
+		path: string,
+	): PlanNodeId | null {
+		const flow = this.callFlowsById.get(ref);
+		if (flow === undefined) {
+			return this.missingTarget("call flow", ref, subject, path);
+		}
+		if (!flow.enabled) {
+			return this.disabledTarget("call flow", flow.name, subject, path);
+		}
+		return this.callFlowNode(flow);
+	}
+
+	/**
+	 * A day/night switch.
+	 *
+	 * BOTH branches are compiled whatever the mode says, and `planNodeReferences` reports both, so
+	 * the inactive one stays reachable. Emitting only the live branch would make flipping the switch
+	 * a jump to a node that is not in the table, and would leave a call-flow inspector unable to show
+	 * the tenant where the other position goes.
+	 *
+	 * A branch that does not resolve falls back to a hangup rather than dropping the node: a switch
+	 * with one working position is still a switch, and a caller who reaches the broken side should be
+	 * released with a cause rather than meeting an absent reference mid-call.
+	 */
+	private callFlowNode(flow: CallFlowInput): PlanNodeId {
+		const id = `call-flow:${flow.id}`;
+		if (this.claimed.has(id)) {
+			return id;
+		}
+		this.claimed.add(id);
+
+		const subject: DiagnosticSubject = { kind: "call-flow", id: flow.id, name: flow.name };
+		const dayNodeId =
+			this.destinationNode(
+				{
+					destinationType: flow.destinationType,
+					destinationRef: flow.destinationRef,
+					destinationData: flow.destinationData,
+				},
+				subject,
+				"destination",
+			) ?? this.hangupNode(DISABLED_TARGET_CAUSE);
+		const nightNodeId =
+			this.namedDestinationNode(flow, "night", subject) ?? this.hangupNode(DISABLED_TARGET_CAUSE);
+
+		this.nodes.set(
+			id,
+			compact({
+				id,
+				kind: "call-flow",
+				label: flow.name,
+				callFlowId: flow.id,
+				mode: flow.mode,
+				dayNodeId,
+				nightNodeId,
+				featureCode: flow.featureCode ?? undefined,
+				// The dialable string a BLF key is provisioned with. The code wins over the number:
+				// upstream provisions the code, and a flow that has both is watched at the code.
+				presenceKey: flow.featureCode ?? flow.extensionNumber ?? undefined,
+			}) as PlanNode,
+		);
+		return id;
+	}
+
+	private streamNodeById(ref: string, subject: DiagnosticSubject, path: string): PlanNodeId | null {
+		const stream = this.streamsById.get(ref);
+		if (stream === undefined) {
+			return this.missingTarget("audio stream", ref, subject, path);
+		}
+		if (!stream.enabled) {
+			return this.disabledTarget("audio stream", stream.name, subject, path);
+		}
+		return this.streamNode(stream);
+	}
+
+	/**
+	 * A remote audio source.
+	 *
+	 * The URL is re-checked here even though the DTO checked it, because the snapshot is DATA rather
+	 * than a database: a compiler that assumed the edge had validated would hand a media server a
+	 * `file:///etc/passwd` the moment anybody wrote a row by hand.
+	 *
+	 * The fallback is not optional — see `StreamPlanNode` — and a stream whose fallback does not
+	 * resolve gets a hangup rather than no node, so a driver that cannot play the source releases the
+	 * caller with a cause instead of leaving them on a silent line.
+	 */
+	private streamNode(stream: AudioStreamInput): PlanNodeId {
+		const id = `stream:${stream.id}`;
+		if (this.claimed.has(id)) {
+			return id;
+		}
+		this.claimed.add(id);
+
+		const subject: DiagnosticSubject = { kind: "audio-stream", id: stream.id, name: stream.name };
+		if (!isPlayableStreamUrl(stream.url)) {
+			this.bag.error(
+				"invalid-stream-url",
+				`Audio stream "${stream.name}" has URL ${JSON.stringify(stream.url)}, which is not an http(s) URL a media server may be asked to open.`,
+				subject,
+				"url",
+			);
+		}
+		const fallbackNodeId =
+			this.namedDestinationNode(stream, "fallback", subject) ??
+			this.hangupNode(DISABLED_TARGET_CAUSE);
+
+		this.nodes.set(
+			id,
+			compact({
+				id,
+				kind: "stream",
+				label: stream.name,
+				audioStreamId: stream.id,
+				url: stream.url,
+				answerFirst: stream.answerFirst,
+				maxSeconds: stream.maxSeconds,
+				fallbackNodeId,
+			}) as PlanNode,
+		);
+		return id;
+	}
+
+	private dialByNameNodeById(
+		ref: string,
+		subject: DiagnosticSubject,
+		path: string,
+	): PlanNodeId | null {
+		const directory = this.directoriesById.get(ref);
+		if (directory === undefined) {
+			return this.missingTarget("dial-by-name directory", ref, subject, path);
+		}
+		if (!directory.enabled) {
+			return this.disabledTarget("dial-by-name directory", directory.name, subject, path);
+		}
+		return this.dialByNameNode(directory);
+	}
+
+	/**
+	 * The digit map, built from the tenant's extensions and their recorded names.
+	 *
+	 * # Why an extension can be missing from its own tenant's directory
+	 *
+	 * There is no text-to-speech here, so the ONLY way to say "for Jane Smith, press one" is to play
+	 * the recording Jane made into her mailbox — the `name` greeting that `VOICEMAIL_GREETING_KINDS`
+	 * has always had and that, until this feature, nothing consumed. An extension whose mailbox has no
+	 * active `name` greeting therefore cannot be offered at all, and is dropped with a warning naming
+	 * it. See `directory-schema.ts` for why the two alternatives — a silent gap, or spelling the name
+	 * back letter by letter — are both worse.
+	 *
+	 * # The collision nobody would otherwise see
+	 *
+	 * Two people whose names map to the same digits produce a directory where a caller hears two
+	 * options and has no way to know which is which. It has no runtime symptom, so it is reported
+	 * here, where both entries are in hand.
+	 */
+	private dialByNameNode(directory: DialByNameDirectoryInput): PlanNodeId {
+		const id = `dial-by-name:${directory.id}`;
+		if (this.claimed.has(id)) {
+			return id;
+		}
+		this.claimed.add(id);
+
+		const subject: DiagnosticSubject = {
+			kind: "dial-by-name-directory",
+			id: directory.id,
+			name: directory.name,
+		};
+		const entries: DirectoryEntry[] = [];
+		const byDigits = new Map<string, string>();
+
+		for (const extension of sortById(this.snapshot.extensions)) {
+			if (!extension.enabled) {
+				continue;
+			}
+			const digits = directoryDigits(extension.label, directory.searchField);
+			if (digits.length === 0) {
+				continue;
+			}
+			const box = this.voicemailByExtension.get(extension.id);
+			const greeting =
+				box === undefined ? undefined : this.activeGreetings.get(greetingKey(box.id, "name"));
+			if (greeting === undefined || greeting.objectKey.trim().length === 0) {
+				this.bag.warning(
+					"directory-entry-skipped",
+					`Extension ${extension.number} ("${extension.label}") is not offered by directory "${directory.name}": its mailbox has no recorded name, and there is no way to speak the name without one.`,
+					subject,
+					"entries",
+				);
+				continue;
+			}
+			const clash = byDigits.get(digits);
+			if (clash !== undefined) {
+				this.bag.warning(
+					"directory-name-collision",
+					`Extensions ${clash} and ${extension.number} spell to the same digits (${digits}) in directory "${directory.name}"; a caller cannot tell the two options apart.`,
+					subject,
+					"entries",
+				);
+			} else {
+				byDigits.set(digits, extension.number);
+			}
+			entries.push({
+				digits,
+				extensionNumber: extension.number,
+				targetNodeId: this.extensionNode(extension),
+				nameMedia: objectMediaRef(greeting.objectKey),
+				...(extension.label.length === 0 ? {} : { label: extension.label }),
+			});
+		}
+
+		if (entries.length === 0) {
+			this.bag.warning(
+				"empty-directory",
+				`Directory "${directory.name}" can offer nobody: no enabled extension has a recorded name in its mailbox.`,
+				subject,
+			);
+		}
+
+		entries.sort(
+			(left, right) =>
+				(left.digits < right.digits ? -1 : left.digits > right.digits ? 1 : 0) ||
+				(left.extensionNumber < right.extensionNumber
+					? -1
+					: left.extensionNumber > right.extensionNumber
+						? 1
+						: 0),
+		);
+
+		this.nodes.set(
+			id,
+			compact({
+				id,
+				kind: "dial-by-name",
+				label: directory.name,
+				directoryId: directory.id,
+				minDigits: directory.minDigits,
+				maxFailures: directory.maxFailures,
+				greetingPromptId: directory.greetingPromptId ?? undefined,
+				invalidPromptId: directory.invalidPromptId ?? undefined,
+				entries,
+				timeoutNodeId: this.namedDestinationNode(directory, "timeout", subject) ?? undefined,
+			}) as PlanNode,
+		);
+		return id;
+	}
+
+	/**
+	 * Expands an alias to whatever its target resolved to.
+	 *
+	 * FLAT, which is the whole design: no `alias` node is ever written, so the artifact and the
+	 * call-flow inspector both show the real destination and the engine gains no node kind. See
+	 * `aliases-schema.ts` for why the feature is a macro rather than FusionPBX's raw dial string.
+	 *
+	 * The only thing flatness costs is this cycle guard. `claimed` cannot do the job — an alias
+	 * claims no id — so the expansion stack is walked explicitly and a repeat is an ERROR rather than
+	 * a warning: an alias that expands forever has no sound artifact to fall back to, which is
+	 * exactly the line this compiler's header draws between the two severities.
+	 */
+	private aliasNode(ref: string, subject: DiagnosticSubject, path: string): PlanNodeId | null {
+		const alias = this.aliasesById.get(ref);
+		if (alias === undefined) {
+			return this.missingTarget("destination alias", ref, subject, path);
+		}
+		if (!alias.enabled) {
+			return this.disabledTarget("destination alias", alias.name, subject, path);
+		}
+		if (this.aliasStack.includes(alias.id)) {
+			this.bag.error(
+				"alias-cycle",
+				`Destination alias "${alias.name}" is part of a loop (${[...this.aliasStack, alias.id].join(" -> ")}); an alias chain must end at a real destination.`,
+				{ kind: "destination-alias", id: alias.id, name: alias.name },
+				"destination",
+			);
+			return null;
+		}
+		if (this.aliasStack.length >= MAX_ALIAS_DEPTH) {
+			this.bag.error(
+				"alias-cycle",
+				`Destination alias "${alias.name}" is nested more than ${String(MAX_ALIAS_DEPTH)} deep; the chain was not expanded.`,
+				{ kind: "destination-alias", id: alias.id, name: alias.name },
+				"destination",
+			);
+			return null;
+		}
+
+		this.aliasStack.push(alias.id);
+		try {
+			return this.destinationNode(
+				{
+					destinationType: alias.destinationType,
+					destinationRef: alias.destinationRef,
+					destinationData: alias.destinationData,
+				},
+				{ kind: "destination-alias", id: alias.id, name: alias.name },
+				"destination",
+			);
+		} finally {
+			this.aliasStack.pop();
+		}
+	}
+
+	/**
+	 * The authorisation-code gate for one outbound route.
+	 *
+	 * Fails OPEN with a warning in every degraded case — a set that is missing, disabled, or whose
+	 * every digest this release cannot parse — and the reason is the same one `voicemailPinHash`
+	 * gives: refusing every call on a route because a digest format changed takes the tenant's phones
+	 * down to protect a gate they can re-create in a form. A set with SOME readable entries keeps
+	 * those and drops the rest, so a single corrupt row narrows the code list rather than removing it.
+	 */
+	private compilePinSet(
+		pinSetId: string | null | undefined,
+		subject: DiagnosticSubject,
+	): CompiledPinSet | undefined {
+		const id = pinSetId ?? undefined;
+		if (id === undefined || id.trim() === "") {
+			return undefined;
+		}
+		if (this.snapshot.pinSets === undefined) {
+			return undefined;
+		}
+		const set = this.pinSetsById.get(id);
+		if (set === undefined) {
+			this.bag.warning(
+				"unusable-pin-set",
+				`PIN set "${id}" is not in this snapshot; the route is NOT gated and calls go out unchallenged.`,
+				subject,
+				"pinSetId",
+			);
+			return undefined;
+		}
+		if (!set.enabled) {
+			this.bag.warning(
+				"unusable-pin-set",
+				`PIN set "${set.name}" is disabled; the route is NOT gated and calls go out unchallenged.`,
+				subject,
+				"pinSetId",
+			);
+			return undefined;
+		}
+
+		const entries: CompiledPinEntry[] = [];
+		for (const entry of this.pinEntriesBySet.get(set.id) ?? []) {
+			if (!entry.enabled) {
+				continue;
+			}
+			const issue = voicemailPinHashIssue(entry.pinHash);
+			if (issue !== undefined) {
+				this.bag.warning(
+					"invalid-pin-hash",
+					`Code ${entry.ordinal} of PIN set "${set.name}" has a digest this release cannot read (${issue}); that code will not be accepted.`,
+					subject,
+					"pinSetId",
+				);
+				continue;
+			}
+			entries.push(
+				compact({
+					pinSetEntryId: entry.id,
+					ordinal: entry.ordinal,
+					label: entry.label ?? undefined,
+					pinHash: entry.pinHash.trim(),
+				}) as CompiledPinEntry,
+			);
+		}
+
+		if (entries.length === 0) {
+			this.bag.warning(
+				"unusable-pin-set",
+				`PIN set "${set.name}" has no usable codes; the route is NOT gated and calls go out unchallenged.`,
+				subject,
+				"pinSetId",
+			);
+			return undefined;
+		}
+
+		return compact({
+			pinSetId: set.id,
+			name: set.name,
+			maxAttempts: set.maxAttempts,
+			digitTimeoutMs: set.digitTimeoutMs,
+			promptId: set.promptId ?? undefined,
+			failurePromptId: set.failurePromptId ?? undefined,
+			entries,
+		}) as CompiledPinSet;
+	}
+
+	/**
+	 * Organization speed dials, and the two collisions that would otherwise be invisible.
+	 *
+	 * A code that a FEATURE CODE would swallow is dropped: `*0` is seeded as eavesdrop with a
+	 * required argument, so an unguarded `*01` would be consumed as "eavesdrop on extension 1" and
+	 * the tenant would see the wrong thing happen rather than nothing. A numeric code additionally
+	 * goes through `claimNumber`, the same duplicate check every dialable entity uses, so a speed dial
+	 * numbered `200` collides loudly with extension 200 instead of shadowing it.
+	 */
+	private compileSpeedDials(
+		featureCodes: readonly CompiledFeatureCode[],
+	): Readonly<Record<string, SpeedDialEntry>> {
+		const entries: Record<string, SpeedDialEntry> = {};
+		for (const dial of sortById(this.snapshot.speedDials ?? [])) {
+			if (!dial.enabled) {
+				continue;
+			}
+			const subject: DiagnosticSubject = { kind: "speed-dial", id: dial.id, name: dial.code };
+			if (!SPEED_DIAL_CODE_PATTERN.test(dial.code)) {
+				this.bag.error(
+					"conflicting-speed-dial",
+					`Speed dial "${dial.code}" is not dialable; a code is one to ten characters from 0-9, *, #.`,
+					subject,
+					"code",
+				);
+				continue;
+			}
+			const clash = featureCodes.find(
+				(code) =>
+					code.code === dial.code ||
+					(code.argumentMode !== "none" && dial.code.startsWith(code.code)),
+			);
+			if (clash !== undefined) {
+				this.bag.error(
+					"conflicting-speed-dial",
+					`Speed dial "${dial.code}" can never be dialed: feature code "${clash.code}" is matched first and would consume it.`,
+					subject,
+					"code",
+				);
+				continue;
+			}
+			if (entries[dial.code] !== undefined) {
+				this.bag.error(
+					"conflicting-speed-dial",
+					`Speed dial code "${dial.code}" is defined more than once.`,
+					subject,
+					"code",
+				);
+				continue;
+			}
+			const nodeId = this.destinationNode(
+				{
+					destinationType: dial.destinationType,
+					destinationRef: dial.destinationRef,
+					destinationData: dial.destinationData,
+				},
+				subject,
+				"destination",
+			);
+			if (nodeId === null) {
+				continue;
+			}
+			entries[dial.code] = {
+				speedDialId: dial.id,
+				code: dial.code,
+				label: dial.label,
+				nodeId,
+			};
+			// A bare-numeric code is dialable in the same space extensions are, so it is claimed the
+			// same way. A star-prefixed one is not, and claiming it would put a `*` into a map whose
+			// keys the resolver reads as extension numbers.
+			if (/^[0-9]+$/u.test(dial.code)) {
+				this.claimNumber(dial.code, {
+					kind: "speed-dial",
+					entityId: dial.id,
+					nodeId,
+					name: dial.label,
+				});
+			}
+		}
+		return sortRecordKeys(entries);
+	}
+
 	private indexVoicemailGreetings(): void {
 		for (const greeting of sortById(this.snapshot.voicemailGreetings ?? [])) {
 			if (!greeting.active) {
@@ -1823,6 +2604,10 @@ class Compiler {
 		const voicemailPrefixes = this.compileVoicemailPrefixes(featureCodes);
 
 		this.claimInternalNumbers();
+		// After `claimInternalNumbers`, so a numeric speed dial that collides with an extension is
+		// reported against the SPEED DIAL — the later claimant is the one somebody just added.
+		const speedDials = this.compileSpeedDials(featureCodes);
+		this.reportToggleCodeCollisions(featureCodes);
 		this.reportEmergencyShadowing(emergency);
 		const parkSlots = this.compileParkSlots();
 
@@ -1831,6 +2616,7 @@ class Compiler {
 			featureCodes,
 			voicemailPrefixes,
 			mailboxes: this.compileMailboxes(),
+			...(Object.keys(speedDials).length === 0 ? {} : { speedDials }),
 			numbers: Object.fromEntries(
 				[...this.internalNumbers.entries()].sort(([left], [right]) =>
 					left < right ? -1 : left > right ? 1 : 0,
@@ -2063,6 +2849,94 @@ class Compiler {
 				name: room.name,
 			});
 		}
+		for (const flow of sortById(this.snapshot.callFlows ?? [])) {
+			if (!flow.enabled || flow.extensionNumber == null || flow.extensionNumber.length === 0) {
+				continue;
+			}
+			this.claimNumber(flow.extensionNumber, {
+				kind: "call-flow",
+				entityId: flow.id,
+				nodeId: this.callFlowNode(flow),
+				name: flow.name,
+			});
+		}
+		for (const directory of sortById(this.snapshot.directories ?? [])) {
+			if (
+				!directory.enabled ||
+				directory.extensionNumber == null ||
+				directory.extensionNumber.length === 0
+			) {
+				continue;
+			}
+			this.claimNumber(directory.extensionNumber, {
+				kind: "dial-by-name",
+				entityId: directory.id,
+				nodeId: this.dialByNameNode(directory),
+				name: directory.name,
+			});
+		}
+	}
+
+	/**
+	 * Screens the per-row toggle codes against the feature-code catalogue.
+	 *
+	 * `call_flow.feature_code` and `time_condition.override_feature_code` are dialable strings that
+	 * are NOT `feature_code` rows — deliberately, because they are instance-specific toggles rather
+	 * than members of a closed catalogue of actions. The cost of that choice is exactly this: two
+	 * mechanisms answering the same digits, with no runtime symptom beyond the wrong one winning.
+	 * So the compiler reports the overlap rather than letting a tenant discover it by pressing a key
+	 * and watching a different thing happen.
+	 *
+	 * An ERROR, not a warning: unlike a shadowed route, there is no reading of this configuration
+	 * under which the tenant gets what they asked for.
+	 */
+	private reportToggleCodeCollisions(featureCodes: readonly CompiledFeatureCode[]): void {
+		const seen = new Map<string, string>();
+		const check = (code: string | null | undefined, subject: DiagnosticSubject, path: string) => {
+			const value = code?.trim() ?? "";
+			if (value.length === 0) {
+				return;
+			}
+			const clash = featureCodes.find(
+				(entry) =>
+					entry.code === value || (entry.argumentMode !== "none" && value.startsWith(entry.code)),
+			);
+			if (clash !== undefined) {
+				this.bag.error(
+					"conflicting-feature-code",
+					`Toggle code "${value}" can never be dialed: feature code "${clash.code}" is matched first and would consume it.`,
+					subject,
+					path,
+				);
+				return;
+			}
+			const other = seen.get(value);
+			if (other !== undefined) {
+				this.bag.error(
+					"conflicting-feature-code",
+					`Toggle code "${value}" is claimed by both ${other} and ${subject.name ?? subject.id}.`,
+					subject,
+					path,
+				);
+				return;
+			}
+			seen.set(value, subject.name ?? subject.id);
+		};
+
+		for (const flow of sortById(this.snapshot.callFlows ?? [])) {
+			if (flow.enabled) {
+				check(flow.featureCode, { kind: "call-flow", id: flow.id, name: flow.name }, "featureCode");
+			}
+		}
+		for (const condition of sortById(this.snapshot.timeConditions)) {
+			if (condition.enabled) {
+				check(
+					condition.overrideFeatureCode,
+					{ kind: "time-condition", id: condition.id, name: condition.name },
+					"overrideFeatureCode",
+				);
+			}
+		}
 	}
 
 	private claimNumber(
@@ -2148,6 +3022,31 @@ class Compiler {
 	// -------------------------------------------------------------------------------------------
 	// Inbound context
 	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * Caller-id normalisation per trunk, for the inbound resolver.
+	 *
+	 * Keyed by `trunk.id` rather than folded into the rules, because the rewrite happens BEFORE the
+	 * rule walk and before the call-block screen: the whole point is that a tenant's blocklist should
+	 * not have to know which carrier a call arrived on.
+	 */
+	private compileInboundTranslations(): Readonly<Record<string, CompiledTranslationRuleset>> {
+		const byTrunk: Record<string, CompiledTranslationRuleset> = {};
+		for (const trunk of sortById(this.snapshot.trunks)) {
+			if (!trunk.enabled) {
+				continue;
+			}
+			const ruleset = this.translationRuleset(
+				trunk.inboundTranslationRulesetId,
+				{ kind: "trunk", id: trunk.id, name: trunk.name },
+				"inboundTranslationRulesetId",
+			);
+			if (ruleset !== undefined) {
+				byTrunk[trunk.id] = ruleset;
+			}
+		}
+		return sortRecordKeys(byTrunk);
+	}
 
 	private compileInbound(): InboundMatchTable {
 		const rules: InboundRule[] = [];
@@ -2271,10 +3170,12 @@ class Compiler {
 			}) as InboundDidDefault;
 		}
 
+		const inboundTranslations = this.compileInboundTranslations();
 		return {
 			rules: ordered,
 			didDefaults: sortRecordKeys(didDefaults),
 			noMatchNodeId: this.hangupNode(NO_MATCH_CAUSE),
+			...(Object.keys(inboundTranslations).length === 0 ? {} : { inboundTranslations }),
 		};
 	}
 
@@ -2473,6 +3374,9 @@ class Compiler {
 						recordEnabled: route.recordEnabled,
 						callerIdNumberOverride: route.callerIdNumberOverride ?? undefined,
 						failoverNodeId: failoverNodeId ?? undefined,
+						// The gate travels on the NODE, because the node is what the engine walks — a
+						// resolver hands over an `ExecutionPlan`, not the rule it matched.
+						pinSet: this.compilePinSet(route.pinSetId, subject),
 					}) as PlanNode,
 				);
 			}
@@ -2489,6 +3393,14 @@ class Compiler {
 					timeGate: this.routeTimeGate(route.timeConditionId, failoverNodeId, subject),
 					recordEnabled: route.recordEnabled,
 					callerIdNumberOverride: route.callerIdNumberOverride ?? undefined,
+					// AFTER the inline strip/prepend, which the resolver applies first. The order and
+					// its argument are in `translations-schema.ts`: the inline pair turns what fingers
+					// did into the number meant, and the ruleset normalises that for the wire.
+					translation: this.translationRuleset(
+						route.translationRulesetId,
+						subject,
+						"translationRulesetId",
+					),
 					destinationNodeId: nodeId,
 				}) as OutboundRule,
 			);

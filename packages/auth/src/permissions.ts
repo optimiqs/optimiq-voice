@@ -139,6 +139,89 @@ export const PERMISSIONS = [
 	"park-lots.delete",
 
 	/**
+	 * The day/night switch, and the one grant in this registry that a receptionist holds.
+	 *
+	 * `toggle` is separate from `write` because the two are different jobs done by different people.
+	 * `write` decides WHERE the day branch and the night branch go, which is configuration an
+	 * administrator sets once. `toggle` moves the switch, which is what somebody at the front desk
+	 * does at five o'clock and again when the office closes early for a funeral — it is the entire
+	 * reason the feature exists, and putting it behind `write` would mean the person who needs it
+	 * every day also holds the grant that re-points the tenant's inbound calls.
+	 *
+	 * It gates the TIME-CONDITION override as well, and that is a deliberate collapse rather than an
+	 * oversight. Forcing a time condition open and flipping a call flow to night are the same act —
+	 * a human overruling where calls go, right now — and they differ only in which table the state
+	 * lives in. A separate `time-conditions.override` would be a second name for one power, which is
+	 * the field-level granularity this registry exists to undo. Editing the RULES stays on
+	 * `time-conditions.write`, because that is configuration and not an override.
+	 */
+	"call-flows.read",
+	"call-flows.write",
+	"call-flows.delete",
+	"call-flows.toggle",
+
+	/**
+	 * Outbound authorisation codes.
+	 *
+	 * Its own resource rather than a ride on `routes.write`, and the argument is the one
+	 * `numbers.order` and `calls.originate` both made: the blast radius is money. A PIN set is the
+	 * gate in front of a tenant's expensive routes, and the same grant that adds a code removes one —
+	 * so a holder can make an international route dialable by everybody in the building. That is a
+	 * strictly larger power than re-ordering a trunk list, which is what `routes.write` otherwise
+	 * covers, and it belongs to somebody who can be named when the bill arrives.
+	 *
+	 * `read` is a real grant despite there being no secret to read: the digests never leave the
+	 * process, so what a reader sees is which routes are gated and by whose codes — which is exactly
+	 * what somebody diagnosing "why is this phone asking me for a number" needs.
+	 */
+	"pin-sets.read",
+	"pin-sets.write",
+	"pin-sets.delete",
+
+	/**
+	 * The named routing building blocks: destination aliases, audio streams, organization speed
+	 * dials, and the dial-by-name directory.
+	 *
+	 * ONE resource for four tables, and this is the collapse the registry's header asks every wave to
+	 * justify. The test is whether the four have DIFFERENT power profiles, and they do not: each is a
+	 * named thing an administrator points other routing at, none of them reaches a trunk except
+	 * through the outbound tables every other destination goes through, and there is no role that
+	 * plausibly edits one and not the others. Four trios would be twelve permissions expressing one
+	 * decision, which is precisely the ~940-permission shape this model replaced.
+	 *
+	 * Number-translation rulesets are NOT here, and are not a resource of their own either: they are
+	 * only meaningful attached to an outbound route or a trunk, and their power — deciding what goes
+	 * on the wire — is the power a route already has. They ride `routes.*`, which is the grant that
+	 * already decides which digits reach which carrier.
+	 *
+	 * Phrases are not here either, for the same reason one layer over: a phrase IS a `prompt` row, so
+	 * it rides `recordings.*` with the rest of the media library.
+	 */
+	"dial-plan.read",
+	"dial-plan.write",
+	"dial-plan.delete",
+
+	/**
+	 * Per-organization quotas, and the one entry in this registry that is honestly in the wrong place.
+	 *
+	 * A limit an administrator can raise is not a limit. The correct owner is a PLATFORM OPERATOR —
+	 * upstream's parent-domain, the reseller hierarchy this plan calls W14 — and that surface does not
+	 * exist yet. So the interim is stated rather than smuggled: `write` is held by `owner` alone, which
+	 * is the narrowest boundary this model can currently express, and `ADMIN_PERMISSIONS` excludes it
+	 * alongside `settings.write.all` for exactly that reason.
+	 *
+	 * It is not a real control-plane boundary and does not pretend to be one — an owner can raise
+	 * their own cap. What it buys is that the columns, the enforcement and the usage accounting exist
+	 * and are tested, so W14 moves a permission and a controller rather than building the feature.
+	 *
+	 * `read` is much wider, because the usage screen is a support tool: "you are at 48 of 50
+	 * extensions" is the answer to a ticket, and hiding it from the people who field those tickets
+	 * would make the limit surface as a create button that fails.
+	 */
+	"org-limits.read",
+	"org-limits.write",
+
+	/**
 	 * Placing a call from the platform: `POST /api/v1/calls`, the click-to-call button.
 	 *
 	 * ONE entry, and the first member of a `calls` resource that has never existed — so here is the
@@ -910,6 +993,116 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 		],
 	},
 	{
+		resource: "call-flows",
+		label: "Call flows",
+		description:
+			"The day/night switch: where calls go in each mode, and who may move the switch. Also " +
+			"gates the manual override on a time condition, which is the same act on a different table.",
+		permissions: [
+			{
+				permission: "call-flows.read",
+				label: "View call flows",
+				description: "Inspect flows, their two destinations and which mode each is in.",
+			},
+			{
+				permission: "call-flows.write",
+				label: "Manage call flows",
+				description:
+					"Create and edit flows, their destinations, their number and their toggle code.",
+			},
+			{
+				permission: "call-flows.delete",
+				label: "Delete call flows",
+				description: "Remove a call flow.",
+			},
+			{
+				permission: "call-flows.toggle",
+				label: "Switch between day and night",
+				description:
+					"Move a call flow between its day and night destinations, and force a time condition " +
+					"open or closed. The receptionist's grant: it changes where calls go right now and " +
+					"changes no configuration.",
+			},
+		],
+	},
+	{
+		resource: "pin-sets",
+		label: "Authorisation codes",
+		description:
+			"The PIN lists that gate expensive outbound routes. Codes are stored as digests and are " +
+			"never readable; a call detail record names which code authorised a call, never the code.",
+		permissions: [
+			{
+				permission: "pin-sets.read",
+				label: "View authorisation codes",
+				description:
+					"Inspect PIN sets, their labels and which routes they gate. The codes themselves are " +
+					"never returned.",
+			},
+			{
+				permission: "pin-sets.write",
+				label: "Manage authorisation codes",
+				description:
+					"Create and edit PIN sets, add and remove codes, and attach a set to an outbound route. " +
+					"A holder can make an expensive route dialable by everybody in the building.",
+			},
+			{
+				permission: "pin-sets.delete",
+				label: "Delete authorisation codes",
+				description: "Remove a PIN set, which removes the gate from every route that named it.",
+			},
+		],
+	},
+	{
+		resource: "dial-plan",
+		label: "Dial-plan building blocks",
+		description:
+			"Destination aliases, audio streams, organization speed dials and the dial-by-name " +
+			"directory — the named things other routing points at.",
+		permissions: [
+			{
+				permission: "dial-plan.read",
+				label: "View dial-plan building blocks",
+				description: "Inspect aliases, streams, speed dials and the directory.",
+			},
+			{
+				permission: "dial-plan.write",
+				label: "Manage dial-plan building blocks",
+				description:
+					"Create and edit aliases, streams, speed dials and directories. None of them reaches a " +
+					"carrier except through the outbound routes every destination goes through.",
+			},
+			{
+				permission: "dial-plan.delete",
+				label: "Delete dial-plan building blocks",
+				description: "Remove an alias, a stream, a speed dial or a directory.",
+			},
+		],
+	},
+	{
+		resource: "org-limits",
+		label: "Organization limits",
+		description:
+			"Per-organization quotas on extensions, trunks, simultaneous calls and stored audio, and " +
+			"the usage measured against them.",
+		permissions: [
+			{
+				permission: "org-limits.read",
+				label: "View limits and usage",
+				description:
+					"See the organization's quotas and what it is using. A support tool: it is the answer " +
+					'to "why did creating an extension fail".',
+			},
+			{
+				permission: "org-limits.write",
+				label: "Change limits",
+				description:
+					"Raise or lower the organization's own quotas. Held by the owner alone until the " +
+					"reseller hierarchy gives this a platform-operator home.",
+			},
+		],
+	},
+	{
 		resource: "calls",
 		label: "Calls",
 		description:
@@ -1223,6 +1416,26 @@ const AGENT_PERMISSIONS = [
 	 * `park-lots`, for a feature where getting it wrong is audible.
 	 */
 	"paging-groups.read",
+	/**
+	 * Read, and NOT toggle — which is worth stating because the opposite is the obvious reading.
+	 *
+	 * A call flow exists so a human at the front desk can move it, and the front desk is an agent. So
+	 * the tempting grant is `call-flows.toggle` here. It is not here for one structural reason: every
+	 * other grant this role holds is `own`-scoped, read-only or a wallboard, and `permissions.spec.ts`
+	 * asserts exactly that — the widest role an organization hands out does not get an org-wide write.
+	 * A toggle IS an org-wide write: it re-points every inbound call in the tenant.
+	 *
+	 * The receptionist still gets the feature, from the place they actually use it. Pressing `*281` on
+	 * a handset does not go through this registry at all — the engine trusts the authenticated
+	 * extension, exactly as it does for `*72` and `*78`, because a handset carries no session. What an
+	 * agent loses is the BUTTON in the admin UI, and the shape that would give it back is
+	 * `call-flows.toggle.own` bounded to flows an extension is bound to. It is not in the registry
+	 * because nothing serves it yet.
+	 *
+	 * `read` is here because a lamp on a phone and a list on a screen answer the same question, and an
+	 * agent who cannot see which flow is in which mode cannot tell whether pressing the key worked.
+	 */
+	"call-flows.read",
 ] as const satisfies readonly Permission[];
 
 const MANAGER_PERMISSIONS = [
@@ -1266,6 +1479,35 @@ const MANAGER_PERMISSIONS = [
 	"ring-groups.write",
 	// Read arrives with `AGENT_PERMISSIONS`; this is the half that edits the membership.
 	"paging-groups.write",
+	// Read arrives with `AGENT_PERMISSIONS`. `toggle` moves the switch and `write` re-points the
+	// branches; both are org-wide writes, which is what keeps them at this level. See the note beside
+	// `call-flows.read` in `AGENT_PERMISSIONS` for why the toggle is not one rung lower.
+	"call-flows.toggle",
+	"call-flows.write",
+	/**
+	 * The named building blocks, read and write.
+	 *
+	 * The same argument every other telephony CRUD grant on this list makes: a manager runs the phone
+	 * system day to day, and "point the shop-radio stream at the after-hours branch" is that job. The
+	 * delete stays with an administrator, like every other delete here.
+	 */
+	"dial-plan.read",
+	"dial-plan.write",
+	/**
+	 * Read, and NOT write.
+	 *
+	 * A manager diagnosing "the phone is asking me for a number" needs to see that a route is gated
+	 * and by which set. Adding a code to that set is a different act: it decides who may spend the
+	 * tenant's money on an international minute, and it belongs with somebody who can be named when
+	 * the bill arrives. The same split `numbers.order` made out of `numbers.write`.
+	 */
+	"pin-sets.read",
+	/**
+	 * The usage screen, which is a support tool: "you are at 48 of 50 extensions" is the answer to a
+	 * ticket, and a manager who cannot see it experiences the limit as a create button that fails.
+	 * `org-limits.write` is owner-only and is excluded from `ADMIN_PERMISSIONS` as well.
+	 */
+	"org-limits.read",
 	"queues.write",
 	"queues.manage-agents",
 	"voicemail.read",
@@ -1336,9 +1578,23 @@ const MANAGER_PERMISSIONS = [
 	"provisioning.write",
 ] as const satisfies readonly Permission[];
 
-/** Everything except the cross-organization platform scope. */
+/**
+ * Everything except the two grants that are not an administrator's to hold.
+ *
+ * `settings.write.all` is the cross-organization platform scope and has always been the definition
+ * of what `admin` does not get. `org-limits.write` joins it, and the reason is stated at its
+ * registry entry: a quota an administrator can raise is not a quota. Neither is a real
+ * control-plane boundary — an owner can still raise their own cap — but `owner` is the narrowest
+ * boundary this model can express until the reseller hierarchy (W14) gives limits a
+ * platform-operator home, and expressing it here is what makes that move a one-line change.
+ */
+const OWNER_ONLY_PERMISSIONS: ReadonlySet<string> = new Set<Permission>([
+	"settings.write.all",
+	"org-limits.write",
+]);
+
 const ADMIN_PERMISSIONS = PERMISSIONS.filter(
-	(permission) => permission !== "settings.write.all",
+	(permission) => !OWNER_ONLY_PERMISSIONS.has(permission),
 ) as readonly Permission[];
 
 export const SYSTEM_ROLE_TEMPLATES: readonly SystemRoleTemplate[] = [

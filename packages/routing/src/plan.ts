@@ -43,6 +43,7 @@
 
 import type { CompiledPattern } from "./patterns";
 import type {
+	CallFlowMode,
 	FeatureCodeAction,
 	FeatureCodeParams,
 	QueueStrategy,
@@ -77,6 +78,9 @@ export const PLAN_NODE_KINDS = [
 	"playback",
 	"feature-code",
 	"time-condition",
+	"call-flow",
+	"stream",
+	"dial-by-name",
 	"hangup",
 ] as const;
 
@@ -526,6 +530,57 @@ export interface TrunkDialPlanNode extends PlanNodeBase {
 	readonly emergencyAddressId?: string;
 	/** Organization-level ELIN. The caller's own emergency caller id wins over it. */
 	readonly elin?: string;
+	/**
+	 * The authorisation codes a caller must satisfy before the FIRST attempt is offered.
+	 *
+	 * On the node rather than on `OutboundRule` because the node is what the engine walks: a resolver
+	 * hands over an `ExecutionPlan`, not the rule it matched, and a gate the walker cannot see is a
+	 * gate that does not exist. Optional, so an artifact compiled before PIN sets existed — and every
+	 * route that has no set — dials as it always did.
+	 *
+	 * The emergency node NEVER carries one. Kari's Law says `911` is dialable from any station with
+	 * no prefix and no permission, and an authorisation code is a permission; the compiler builds the
+	 * emergency node from no route at all, so this falls out rather than being enforced.
+	 */
+	readonly pinSet?: CompiledPinSet;
+}
+
+/**
+ * A compiled authorisation-code list.
+ *
+ * The digests travel in the artifact for exactly the reason `VoicemailPlanNode.pinHash` and
+ * `ConferencePlanNode.pinHash` do: the challenge happens on the call path, in a process holding no
+ * database handle. Same format, same parser, same constant-time verifier.
+ *
+ * An entry the compiler could not read is DROPPED rather than embedded, and a set whose entries are
+ * all unreadable compiles to no gate at all with a warning — the same fail-open-with-a-warning the
+ * mailbox PIN takes, and for the same reason: refusing every outbound call over a formatting change
+ * takes the tenant's phones down to protect a route they already decided to gate.
+ */
+export interface CompiledPinSet {
+	readonly pinSetId: string;
+	readonly name: string;
+	readonly maxAttempts: number;
+	readonly digitTimeoutMs: number;
+	readonly promptId?: string;
+	readonly failurePromptId?: string;
+	/** In `ordinal` order. Never empty — a set with no usable code compiles to no gate. */
+	readonly entries: readonly CompiledPinEntry[];
+}
+
+/**
+ * One authorisation code.
+ *
+ * `ordinal` and `label` are what the CDR records — "entry 3, the night desk" — and the digits never
+ * are. That is the whole of what upstream's plaintext column was needed for, and it is answerable
+ * without the secret because an entry has an identity of its own.
+ */
+export interface CompiledPinEntry {
+	readonly pinSetEntryId: string;
+	readonly ordinal: number;
+	readonly label?: string;
+	/** A digest in the `voicemail-pin.ts` format. Never a PIN. */
+	readonly pinHash: string;
 }
 
 /** Hand the leg to a named engine application (the `application` destination type). */
@@ -573,6 +628,106 @@ export interface TimeConditionPlanNode extends PlanNodeBase {
 	readonly noMatchNodeId?: PlanNodeId;
 }
 
+/**
+ * A day/night switch, resolved.
+ *
+ * # Why it is a node and not a flattened branch
+ *
+ * The compiler knows the mode — it is a column, and it is compiled in — so it could emit only the
+ * live branch and drop the other. It deliberately does not, for the reason `time-condition` is also
+ * a node the resolver walks through eagerly: a call-flow inspector has to be able to show WHY a
+ * call went where it went, and "the flow was in night mode and the night branch is voicemail" is
+ * only answerable if both branches survive into the artifact.
+ *
+ * The resolver follows it in `followGates` alongside time conditions, so the plan the engine
+ * receives already has the switch applied. The engine's walker also handles it, for the same reason
+ * it re-evaluates a time condition at the walk's instant: a caller can reach one part-way through a
+ * walk rather than only at the entry.
+ *
+ * `presenceKey` is the dialable string a BLF lamp is subscribed to — the flow's own feature code, or
+ * its number when it has no code. Carried so whichever process flips the mode can light the lamp
+ * without a second lookup, and absent when the flow has neither, which is a flow nothing can watch.
+ */
+export interface CallFlowPlanNode extends PlanNodeBase {
+	readonly kind: "call-flow";
+	readonly callFlowId: string;
+	readonly mode: CallFlowMode;
+	readonly dayNodeId: PlanNodeId;
+	readonly nightNodeId: PlanNodeId;
+	/** The feature code that toggles it, for the inspector and for the engine's runtime. */
+	readonly featureCode?: string;
+	/** The `presence` KV key a BLF lamp watches. Absent when the flow has no dialable identity. */
+	readonly presenceKey?: string;
+}
+
+/**
+ * Play a remote audio stream, then go somewhere.
+ *
+ * # `fallbackNodeId` is not optional, and that is the whole design
+ *
+ * Remote-URL playback is the one thing in this artifact whose availability depends on the media
+ * driver rather than on the configuration: ARI's `POST /channels/{id}/play` accepts `sound:`,
+ * `recording:`, `number:`, `digits:`, `characters:` and `tone:`, and an arbitrary `https://` is not
+ * among them — `apps/engine`'s `translateMediaRef` returns `undefined` for one and every runtime
+ * treats that as "announce the fallback". A stream node therefore always carries somewhere to go,
+ * and the compiler refuses one that does not, so a driver that cannot play the source produces a
+ * routed call rather than silence.
+ *
+ * The same branch covers the far more common failure: the URL is simply unreachable, because a
+ * remote source is somebody else's uptime.
+ */
+export interface StreamPlanNode extends PlanNodeBase {
+	readonly kind: "stream";
+	readonly audioStreamId: string;
+	/** `http(s)` only — validated at write time, because it decides what a media server opens. */
+	readonly url: string;
+	readonly answerFirst: boolean;
+	/** Zero means "until the caller hangs up". */
+	readonly maxSeconds: number;
+	/** Taken when the stream ends, times out, or cannot be played at all. Never absent. */
+	readonly fallbackNodeId: PlanNodeId;
+}
+
+/** One person a caller can reach by spelling their name. */
+export interface DirectoryEntry {
+	/** The name, mapped through the ITU keypad. What the caller's digits are matched against. */
+	readonly digits: string;
+	readonly extensionNumber: string;
+	/** The `extension` node to dial on selection. */
+	readonly targetNodeId: PlanNodeId;
+	/**
+	 * The mailbox's recorded-name greeting, as a domain `MediaRef`.
+	 *
+	 * Never absent, and that is what makes the list offerable: this platform has no text-to-speech,
+	 * so an entry whose name cannot be SPOKEN cannot be offered, and the compiler drops such
+	 * extensions with a warning rather than producing "for … press one".
+	 */
+	readonly nameMedia: string;
+	/** For the inspector and for a spoken position, never for matching. */
+	readonly label?: string;
+}
+
+/**
+ * Answer, ask for name digits, offer the matches, connect.
+ *
+ * The entries are COMPILED rather than searched at call time, for the reason every index in this
+ * artifact is: the engine holds no database handle. Compiling them also produces the one diagnostic
+ * that has no runtime symptom — two people whose names collide on the keypad.
+ */
+export interface DialByNamePlanNode extends PlanNodeBase {
+	readonly kind: "dial-by-name";
+	readonly directoryId: string;
+	/** How many digits the caller must enter before matching starts. */
+	readonly minDigits: number;
+	readonly maxFailures: number;
+	readonly greetingPromptId?: string;
+	readonly invalidPromptId?: string;
+	/** Sorted by `digits` then `extensionNumber`, so a prefix scan is a linear walk. */
+	readonly entries: readonly DirectoryEntry[];
+	/** Taken when the caller gives up, times out, or exhausts their attempts. */
+	readonly timeoutNodeId?: PlanNodeId;
+}
+
 /** The end of a chain. Every path in a compiled artifact terminates in one of these. */
 export interface HangupPlanNode extends PlanNodeBase {
 	readonly kind: "hangup";
@@ -594,6 +749,9 @@ export type PlanNode =
 	| PlaybackPlanNode
 	| FeatureCodePlanNode
 	| TimeConditionPlanNode
+	| CallFlowPlanNode
+	| StreamPlanNode
+	| DialByNamePlanNode
 	| HangupPlanNode;
 
 export type PlanNodeOf<TKind extends PlanNodeKind> = Extract<PlanNode, { kind: TKind }>;

@@ -126,8 +126,11 @@ describe("planDestinationOf", () => {
 				mapped.add(kind);
 			}
 		}
-		// The only two kinds that intentionally have no destination.
+		// The only three kinds that intentionally have no destination: one terminal and two GATES. A
+		// call that crossed a day/night switch and then rang an extension was destined for the
+		// extension, exactly as one that crossed a time condition was.
 		expect([...PLAN_NODE_KINDS].filter((kind) => !mapped.has(kind)).sort()).toEqual([
+			"call-flow",
 			"hangup",
 			"time-condition",
 		]);
