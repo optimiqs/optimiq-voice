@@ -58,8 +58,40 @@ It shares one contract with every TypeScript service through
 | `REFER` — the desk phone's TRANSFER key: digest + registration check, `202`, `rpc.sip.v1.transfer`        | ✅     |
 | RFC 3515 progress reporting: `Event: refer;id=<cseq>` + `message/sipfrag` NOTIFY (`100` then `200`/`503`) | ✅     |
 | `OPTIONS` keepalive responder                                                                             | ✅     |
-| UDP + TCP listeners                                                                                       | ✅     |
+| UDP + TCP listeners, and TLS / WS / WSS (`SIPD_TLS`, `SIPD_WS`, `SIPD_WSS`)                               | ✅     |
 | Everything else → `501 Not Implemented`                                                                   | ✅     |
+
+### The INVITE surface (`SIPD_INVITE`, off by default)
+
+The dialog layer and the INVITE admission path are built and tested. They are **off by default**,
+and they must stay off until `apps/engine` serves `rpc.sip.v1.invite`: with no responder every call
+is refused `503` after the admission deadline, and a `503` tells a carrier to retry _here_ shortly,
+whereas the `501` the registrar answers today tells it this element does not place calls.
+
+| Behaviour                                                                                          | Status |
+| -------------------------------------------------------------------------------------------------- | ------ |
+| UAS/UAC dialog state machine — Init/Proceeding/Early/Established/Confirmed/Terminating/Terminated  | ✅     |
+| CANCEL after the 200 → `481`, and the dialog survives (RFC 3261 §9.2)                              | ✅     |
+| BYE before the ACK, honoured, and the 2xx retransmission stopped (RFC 5407 §3.1.2)                 | ✅     |
+| Hangup before the ACK → the BYE is DEFERRED until it arrives (RFC 3261 §15)                        | ✅     |
+| Hangup before any provisional → the CANCEL is deferred (RFC 3261 §9.1)                             | ✅     |
+| A hangup that races a 200 and loses → ACK then BYE, never a CANCEL                                 | ✅     |
+| A second 2xx from a forked branch → ACK then BYE (RFC 3261 §13.2.2.4)                              | ✅     |
+| RFC 6026 2xx-until-ACK retransmission, and the BYE at 64×T1 (RFC 3261 §13.3.1.4)                   | ✅     |
+| RFC 3398 status → Q.850 cause, with an RFC 3326 `Reason` header winning over it                    | ✅     |
+| re-INVITE and UPDATE: hold/unhold, target refresh, glare `491` (RFC 3261 §14.2), RFC 3311          | ✅     |
+| Session timers (RFC 4028): negotiation, `422` + `Min-SE`, `420`, refresher role, expiry teardown   | ✅     |
+| `Replaces` correlation and the replaced dialog's teardown on the 2xx (RFC 3891)                    | ✅     |
+| SIP INFO DTMF (`application/dtmf-relay`)                                                           | ✅     |
+| Internal / external listener PROFILES with distinct auth, NAT policy and routing context           | ✅     |
+| Trunk source-address ACL, longest-prefix with priorities and deny-wins ties                        | ✅     |
+| NAT: `rport`/`received`, Contact rewrite decisions, symmetric routing, media-latch hints           | ✅     |
+| Outbound trunk registration FSM: backoff with jitter, failover, `trunk.status.changed` transitions | ✅     |
+| Multi-contact AOR model: q-values, RFC 5626 instance/reg-id keys, `max_registrations` eviction     | ✅     |
+| The engine seam itself — `rpc.sip.v1.invite` and the command surface                               | ❌     |
+| Outbound INVITE (`originate`), and therefore any actual call                                       | ❌     |
+| `sip.evt.v1` publishing (no subject, schema, stream or NATS grant yet — it logs instead)           | ❌     |
+| STUN / TURN / ICE                                                                                  | ❌     |
 
 ### Explicitly NOT implemented yet
 
@@ -71,8 +103,8 @@ It shares one contract with every TypeScript service through
 | **Attended REFER (`Replaces`)**                                             | Parsed, carried on the contract as `kind: "attended"`, and refused `attended_unsupported` by the engine: joining two dialogs it never brokered is a different operation from the consultation transfer `CallControl` implements.                                                  |
 | **A REFER subscription state machine**                                      | RFC 3515's two notifications are sent; `Refer-Sub: false` (RFC 4488) is not negotiated, SUBSCRIBE refreshes are not honoured, and notifications are not retried past the transaction layer's own timers. A blind transfer reaches its final state in under two seconds.           |
 | **NAT traversal, `Record-Route`, `rport`/`received` rewriting on requests** | Comes with the proxy. Bindings already record the observed `sourceAddress`, which is the piece the proxy will need.                                                                                                                                                               |
-| **TLS and WSS listeners**                                                   | sipgo supports both (`ListenAndServeTLS`); wiring plus certificate management is a deployment story, not a code one.                                                                                                                                                              |
-| **Multiple simultaneous contacts per AOR**                                  | The location model is one binding per AOR. Forking to a desk phone _and_ a softphone needs a list-valued KV record; it is the first thing the proxy wave requires.                                                                                                                |
+| **DTLS-SRTP for the WSS softphone**                                         | `SIPD_WSS` delivers SIGNALLING for a browser client and no media: a WebRTC endpoint needs DTLS-SRTP and `apps/mediad` has no SRTP. Say so rather than shipping half a feature quietly.                                                                                            |
+| **Multiple simultaneous contacts per AOR, on the wire**                     | The MODEL is built and tested (`internal/aor`): q-values, RFC 5626 instance keys, a cap with an eviction rule. The registrar still writes one binding, because the list-valued field needs adding to `registrationBindingSchema` in `packages/events` first.                      |
 | **Multi-realm / multi-domain**                                              | One realm per process (`SIPD_REALM`). The `Registrar` holds no package-level state, so multi-realm is "construct more of them", not a rewrite.                                                                                                                                    |
 | **Nonce-count replay tracking**                                             | Deliberate — see `internal/registrar/auth.go`. Rate limiting and the anti-fraud consumer on the `REGISTRATIONS` stream are the real mitigation, and they are control-plane concerns (plan §5 T1).                                                                                 |
 | **`fail2ban`-style blocking**                                               | Same: `sipd` publishes the events, the control plane decides.                                                                                                                                                                                                                     |
@@ -82,32 +114,44 @@ It shares one contract with every TypeScript service through
 Everything is environmental; there are no flags. Invalid configuration fails at boot with **every**
 problem listed at once, not one per restart.
 
-| Variable                             | Default                 | Notes                                                                                                                                                                                                             |
-| ------------------------------------ | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SIPD_REALM`                         | — **required**          | Digest realm. Part of `HA1 = MD5(user:realm:pass)`, so changing it invalidates every credential. No default on purpose.                                                                                           |
-| `SIPD_LISTEN_ADDR`                   | `0.0.0.0:5060`          | Bound by both transports.                                                                                                                                                                                         |
-| `SIPD_UDP` / `SIPD_TCP`              | `true` / `true`         | Toggles. Leaving TCP off is not advisable: a REGISTER with a long Contact and several Vias exceeds the safe UDP MTU.                                                                                              |
-| `NATS_URL`                           | `nats://127.0.0.1:4222` | The backbone.                                                                                                                                                                                                     |
-| `NATS_SIPD_USER` / `NATS_SIPD_PASS`  | unset                   | This process's own broker identity. `config/nats.conf` lets the `sipd` user publish `sip.reg.v1.>`, request `rpc.sip.v1.credential` and use the `registrations` bucket — nothing else. Half a pair fails at boot. |
-| `NATS_USER` / `NATS_PASS`            | unset                   | The shared operator credential, used only when the pair above is absent. Both pairs unset is a broker with no authentication, which is what the SIPp rig runs.                                                    |
-| `NATS_TLS_CA`                        | unset                   | Path to a CA bundle. Setting it enables TLS and pins that CA. Unset is a plaintext connection.                                                                                                                    |
-| `NATS_TLS_ENABLED`                   | `false`                 | TLS against the system trust store, for a certificate from a public issuer. `NATS_TLS_CA` takes precedence.                                                                                                       |
-| `SIPD_MIN_EXPIRES`                   | `60`                    | Seconds. Below this a REGISTER gets `423` + `Min-Expires`.                                                                                                                                                        |
-| `SIPD_MAX_EXPIRES`                   | `3600`                  | Seconds. Above this the grant is silently clamped down.                                                                                                                                                           |
-| `SIPD_DEFAULT_EXPIRES`               | `300`                   | Seconds. Used when the REGISTER states no interval at all.                                                                                                                                                        |
-| `SIPD_NONCE_TTL`                     | `1m`                    | Go duration. How long a challenge stays usable.                                                                                                                                                                   |
-| `SIPD_NONCE_SECRET`                  | random per process      | **Set this fleet-wide before running more than one replica**, or a device challenged by instance A is rejected by instance B. 32+ random bytes.                                                                   |
-| `SIPD_SWEEP_INTERVAL`                | `5s`                    | How often lapsed bindings are noticed. Bounds event lateness, not binding lifetime.                                                                                                                               |
-| `SIPD_CREDENTIAL_SOURCE`             | `file`                  | `file` (development / the SIPp rig) or `nats` (**production** — `rpc.sip.v1.credential` against `apps/api`).                                                                                                      |
-| `SIPD_CREDENTIALS_FILE`              | —                       | Required when the source is `file`. See `config/credentials.example.json`.                                                                                                                                        |
-| `SIPD_CREDENTIAL_TIMEOUT`            | `500ms`                 | Per-request deadline for the credential RPC — the contract's own. It sits inside a REGISTER transaction and a phone's retransmission timer starts at 500 ms, so a slower reply competes with the retry it caused. |
-| `SIPD_CREDENTIAL_CACHE_TTL`          | `30s`                   | How long a resolved credential is reused. Short: the alternative to staleness is an account disabled minutes ago that still registers.                                                                            |
-| `SIPD_CREDENTIAL_NEGATIVE_CACHE_TTL` | `10s`                   | How long "no such account" / "disabled" is reused. This is the half that stops a username scanner becoming one database query per guess.                                                                          |
-| `SIPD_CREDENTIAL_CACHE_MAX_ENTRIES`  | `10000`                 | Cache ceiling. An unbounded negative cache keyed on an attacker-chosen username is a memory amplifier.                                                                                                            |
-| `SIPD_PROVISION_SECRET_KEY`          | —                       | **Normally unset.** Only the file store's derived form uses it (see below). Production sipd holds no derivation key at all.                                                                                       |
-| `SIPD_USER_AGENT`                    | `optimiq-sipd`          | `Server:` / `User-Agent:` header.                                                                                                                                                                                 |
-| `SIPD_LOG_LEVEL`                     | `info`                  | `debug` \| `info` \| `warn` \| `error`. Output is JSON on stdout (`log/slog`).                                                                                                                                    |
-| `SIPD_SHUTDOWN_TIMEOUT`              | `10s`                   | Bounds graceful shutdown.                                                                                                                                                                                         |
+| Variable                               | Default                 | Notes                                                                                                                                                                                                             |
+| -------------------------------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SIPD_REALM`                           | — **required**          | Digest realm. Part of `HA1 = MD5(user:realm:pass)`, so changing it invalidates every credential. No default on purpose.                                                                                           |
+| `SIPD_LISTEN_ADDR`                     | `0.0.0.0:5060`          | Bound by both transports.                                                                                                                                                                                         |
+| `SIPD_UDP` / `SIPD_TCP`                | `true` / `true`         | Toggles. Leaving TCP off is not advisable: a REGISTER with a long Contact and several Vias exceeds the safe UDP MTU.                                                                                              |
+| `SIPD_TLS` / `SIPD_WS` / `SIPD_WSS`    | `false`                 | The secure and WebSocket transports, each opt-in. `ws`/`wss` are RFC 7118 and are the ONLY transport a browser softphone has. TLS floors at 1.2.                                                                  |
+| `SIPD_TLS_LISTEN_ADDR`                 | `0.0.0.0:5061`          | The conventional SIP-over-TLS port.                                                                                                                                                                               |
+| `SIPD_WS_LISTEN_ADDR`                  | `0.0.0.0:5080`          | Plaintext WebSocket. A development origin only; anything a browser will load needs `wss`.                                                                                                                         |
+| `SIPD_WSS_LISTEN_ADDR`                 | `0.0.0.0:8089`          | The conventional SIP-over-WSS port.                                                                                                                                                                               |
+| `SIPD_TLS_CERT_FILE` / `_KEY_FILE`     | —                       | Required by `SIPD_TLS` and `SIPD_WSS`, and REFUSED when neither is on — a deployment with a certificate and no TLS believes it is encrypted and is not.                                                           |
+| `SIPD_INVITE`                          | `false`                 | The INVITE surface. **Leave it off** until `apps/engine` serves `rpc.sip.v1.invite`; without a responder every call is refused `503`.                                                                             |
+| `SIPD_INSTANCE_ID`                     | the hostname            | This process's identity on the backbone: it stamps every dialog claim and is the token engine commands are addressed at, because a dialog lives on ONE process.                                                   |
+| `SIPD_SESSION_TIMERS`                  | `false`                 | RFC 4028. Off because a one-sided timer is worse than none, and because mediad's RTP timeout already reaps a far end that vanished. Mandatory in front of a carrier that offers `Supported: timer`.               |
+| `SIPD_SESSION_EXPIRES` / `SIPD_MIN_SE` | `1800` / `90`           | Seconds. `SIPD_MIN_SE` may not go below 90 — RFC 4028 §4 sets that floor, and a shorter one turns every call into a re-INVITE storm.                                                                              |
+| `SIPD_MAX_CONTACTS`                    | `5`                     | Simultaneous registrations per AOR. The enforcement point for `extension.maxRegistrations`.                                                                                                                       |
+| `SIPD_TRUNK_ACL`                       | unset                   | `cidr[=trunkId]`, comma-separated. Empty builds NO external profile, so no unauthenticated INVITE can be admitted at all — the only safe default.                                                                 |
+| `SIPD_EXTERNAL_LISTEN_ADDR`            | unset                   | A socket of its own for the carrier profile. Stronger than sharing one: the profile is then chosen by the address the packet ARRIVED on, which no sender can influence.                                           |
+| `NATS_URL`                             | `nats://127.0.0.1:4222` | The backbone.                                                                                                                                                                                                     |
+| `NATS_SIPD_USER` / `NATS_SIPD_PASS`    | unset                   | This process's own broker identity. `config/nats.conf` lets the `sipd` user publish `sip.reg.v1.>`, request `rpc.sip.v1.credential` and use the `registrations` bucket — nothing else. Half a pair fails at boot. |
+| `NATS_USER` / `NATS_PASS`              | unset                   | The shared operator credential, used only when the pair above is absent. Both pairs unset is a broker with no authentication, which is what the SIPp rig runs.                                                    |
+| `NATS_TLS_CA`                          | unset                   | Path to a CA bundle. Setting it enables TLS and pins that CA. Unset is a plaintext connection.                                                                                                                    |
+| `NATS_TLS_ENABLED`                     | `false`                 | TLS against the system trust store, for a certificate from a public issuer. `NATS_TLS_CA` takes precedence.                                                                                                       |
+| `SIPD_MIN_EXPIRES`                     | `60`                    | Seconds. Below this a REGISTER gets `423` + `Min-Expires`.                                                                                                                                                        |
+| `SIPD_MAX_EXPIRES`                     | `3600`                  | Seconds. Above this the grant is silently clamped down.                                                                                                                                                           |
+| `SIPD_DEFAULT_EXPIRES`                 | `300`                   | Seconds. Used when the REGISTER states no interval at all.                                                                                                                                                        |
+| `SIPD_NONCE_TTL`                       | `1m`                    | Go duration. How long a challenge stays usable.                                                                                                                                                                   |
+| `SIPD_NONCE_SECRET`                    | random per process      | **Set this fleet-wide before running more than one replica**, or a device challenged by instance A is rejected by instance B. 32+ random bytes.                                                                   |
+| `SIPD_SWEEP_INTERVAL`                  | `5s`                    | How often lapsed bindings are noticed. Bounds event lateness, not binding lifetime.                                                                                                                               |
+| `SIPD_CREDENTIAL_SOURCE`               | `file`                  | `file` (development / the SIPp rig) or `nats` (**production** — `rpc.sip.v1.credential` against `apps/api`).                                                                                                      |
+| `SIPD_CREDENTIALS_FILE`                | —                       | Required when the source is `file`. See `config/credentials.example.json`.                                                                                                                                        |
+| `SIPD_CREDENTIAL_TIMEOUT`              | `500ms`                 | Per-request deadline for the credential RPC — the contract's own. It sits inside a REGISTER transaction and a phone's retransmission timer starts at 500 ms, so a slower reply competes with the retry it caused. |
+| `SIPD_CREDENTIAL_CACHE_TTL`            | `30s`                   | How long a resolved credential is reused. Short: the alternative to staleness is an account disabled minutes ago that still registers.                                                                            |
+| `SIPD_CREDENTIAL_NEGATIVE_CACHE_TTL`   | `10s`                   | How long "no such account" / "disabled" is reused. This is the half that stops a username scanner becoming one database query per guess.                                                                          |
+| `SIPD_CREDENTIAL_CACHE_MAX_ENTRIES`    | `10000`                 | Cache ceiling. An unbounded negative cache keyed on an attacker-chosen username is a memory amplifier.                                                                                                            |
+| `SIPD_PROVISION_SECRET_KEY`            | —                       | **Normally unset.** Only the file store's derived form uses it (see below). Production sipd holds no derivation key at all.                                                                                       |
+| `SIPD_USER_AGENT`                      | `optimiq-sipd`          | `Server:` / `User-Agent:` header.                                                                                                                                                                                 |
+| `SIPD_LOG_LEVEL`                       | `info`                  | `debug` \| `info` \| `warn` \| `error`. Output is JSON on stdout (`log/slog`).                                                                                                                                    |
+| `SIPD_SHUTDOWN_TIMEOUT`                | `10s`                   | Bounds graceful shutdown.                                                                                                                                                                                         |
 
 ## Running
 
@@ -252,6 +296,28 @@ RFC 2617 — so the server-side verifier is checked against something other than
 ```
 cmd/sipd/main.go              wiring, signals, graceful shutdown
 internal/config               environment → validated Config
+internal/dialog               THE DIALOG LAYER — the state machine behind INVITE
+  state.go                      State, Role, Trigger, and the pure transition table
+  dialog.go                     Dialog + Apply: the effects each legal move produces
+  effects.go                    the effect and event vocabularies
+  identity.go                   the RFC 3261 §12 triple — data on the record, never the key
+  cause.go                      RFC 3398 status→Q.850, RFC 3326 Reason, and the reverse
+  offer.go                      offer/answer, hold direction, RFC 3261 §14.1 glare backoff
+  timers.go                     RFC 4028 session-timer negotiation
+  reinvite.go                   re-INVITE and UPDATE, target refresh, 491
+  store.go                      the dialog table + the `sip-dialogs` claim and its reaper
+  session.go                    one goroutine per dialog: the mailbox that decides the races
+internal/invite               the INVITE surface: admission, mid-dialog methods, Replaces
+  intent.go                     INVITE → CallIntent, a pure function of the message
+  port.go                       the ENGINE SEAM: Port, Admission, the refusal table, two fakes
+  handler.go                    profile → auth → parse → dialog → admission
+  executor.go                   effects → the wire, incl. the RFC 6026 2xx loop
+  requests.go                   BYE / ACK / CANCEL builders, and the NAT destination split
+  replaces.go                   RFC 3891 correlation and the replaced dialog's teardown
+internal/nat                  rport/received, Contact rewrite, media-latch hints, keepalive
+internal/profile              the internal/external trust boundary, and the trunk ACL evaluator
+internal/trunk                the outbound gateway registration FSM and its status events
+internal/aor                  the multi-contact location model: q-values, caps, RFC 5626 keys
 internal/credentials          Credential + Store
   credentials.go                the Store interface, Credential, HA1
   file.go                       FileStore — development / SIPp rig, incl. the derived form

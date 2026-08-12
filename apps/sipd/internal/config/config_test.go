@@ -284,3 +284,138 @@ func TestLoadLeavesTLSOffUnlessConfigured(t *testing.T) {
 		t.Errorf("tls = %q / %v", withTLS.NATSTLSCA, withTLS.NATSTLSEnabled)
 	}
 }
+
+// The transports added with the INVITE wave: TLS, WS and WSS, each off by default and each with a
+// bind address of its own so a deployment can use the conventional ports.
+func TestTransportDefaults(t *testing.T) {
+	cfg, err := config.Load(env(minimal(nil)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.EnableTLS || cfg.EnableWS || cfg.EnableWSS {
+		t.Error("the secure and websocket transports must be opt-in")
+	}
+	if cfg.TLSListenAddr != "0.0.0.0:5061" || cfg.WSSListenAddr != "0.0.0.0:8089" {
+		t.Errorf("addresses = %q / %q, want the conventional SIP TLS and WSS ports",
+			cfg.TLSListenAddr, cfg.WSSListenAddr)
+	}
+	if cfg.EnableInvite {
+		t.Error("the INVITE surface must stay off until an engine serves rpc.sip.v1.invite: " +
+			"with no responder a 503 is a worse answer than the registrar's honest 501")
+	}
+	if cfg.EnableSessionTimers {
+		t.Error("session timers must be opt-in: a one-sided timer is worse than none")
+	}
+	if cfg.MaxContactsPerAOR != 5 {
+		t.Errorf("MaxContactsPerAOR = %d, want 5", cfg.MaxContactsPerAOR)
+	}
+	if cfg.InstanceID == "" {
+		t.Error("an instance id is required: a dialog lives on one process and its commands must reach it")
+	}
+}
+
+func TestTransportConfigurationIsValidated(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{
+			name: "TLS with no certificate",
+			env:  map[string]string{"SIPD_TLS": "true"},
+			want: "SIPD_TLS_CERT_FILE and SIPD_TLS_KEY_FILE are both required",
+		},
+		{
+			name: "WSS with no certificate",
+			env:  map[string]string{"SIPD_WSS": "true"},
+			want: "SIPD_TLS_CERT_FILE and SIPD_TLS_KEY_FILE are both required",
+		},
+		{
+			name: "a certificate with no secure transport enabled",
+			env: map[string]string{
+				"SIPD_TLS_CERT_FILE": "/etc/sipd/tls.crt",
+				"SIPD_TLS_KEY_FILE":  "/etc/sipd/tls.key",
+			},
+			want: "this deployment is plaintext and believes it is not",
+		},
+		{
+			name: "every listener disabled",
+			env:  map[string]string{"SIPD_UDP": "false", "SIPD_TCP": "false"},
+			want: "sipd would accept no traffic at all",
+		},
+		{
+			name: "two transports on one address",
+			env: map[string]string{
+				"SIPD_WS":             "true",
+				"SIPD_WS_LISTEN_ADDR": "0.0.0.0:5060",
+			},
+			want: "one socket cannot serve two transports",
+		},
+		{
+			name: "a session interval below the RFC 4028 floor",
+			env:  map[string]string{"SIPD_SESSION_TIMERS": "true", "SIPD_MIN_SE": "30"},
+			want: "at least 90 seconds",
+		},
+		{
+			name: "a session interval below the negotiated floor",
+			env: map[string]string{
+				"SIPD_SESSION_TIMERS":  "true",
+				"SIPD_MIN_SE":          "600",
+				"SIPD_SESSION_EXPIRES": "120",
+			},
+			want: "must not be below SIPD_MIN_SE",
+		},
+		{
+			name: "a zero contact cap",
+			env:  map[string]string{"SIPD_MAX_CONTACTS": "0"},
+			want: "SIPD_MAX_CONTACTS must be positive",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := config.Load(env(minimal(tc.env)))
+			if err == nil {
+				t.Fatal("Load must refuse this configuration")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestSecureTransportsLoadWhenFullyConfigured(t *testing.T) {
+	cfg, err := config.Load(env(minimal(map[string]string{
+		"SIPD_TLS":             "true",
+		"SIPD_WS":              "true",
+		"SIPD_WSS":             "true",
+		"SIPD_TLS_CERT_FILE":   "/etc/sipd/tls.crt",
+		"SIPD_TLS_KEY_FILE":    "/etc/sipd/tls.key",
+		"SIPD_INVITE":          "true",
+		"SIPD_INSTANCE_ID":     "sipd-7c9f",
+		"SIPD_SESSION_TIMERS":  "true",
+		"SIPD_SESSION_EXPIRES": "900",
+		"SIPD_MIN_SE":          "120",
+		"SIPD_MAX_CONTACTS":    "3",
+		"SIPD_TRUNK_ACL":       "203.0.113.0/24=trunk-telnyx",
+	})))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.EnableTLS || !cfg.EnableWS || !cfg.EnableWSS || !cfg.EnableInvite {
+		t.Error("every enabled transport must survive Load")
+	}
+	if cfg.InstanceID != "sipd-7c9f" {
+		t.Errorf("InstanceID = %q", cfg.InstanceID)
+	}
+	if cfg.SessionExpires != 900*time.Second || cfg.MinSE != 120*time.Second {
+		t.Errorf("session timers = %s / %s", cfg.SessionExpires, cfg.MinSE)
+	}
+	if cfg.MaxContactsPerAOR != 3 {
+		t.Errorf("MaxContactsPerAOR = %d", cfg.MaxContactsPerAOR)
+	}
+	if cfg.TrunkACL != "203.0.113.0/24=trunk-telnyx" {
+		t.Errorf("TrunkACL = %q", cfg.TrunkACL)
+	}
+}

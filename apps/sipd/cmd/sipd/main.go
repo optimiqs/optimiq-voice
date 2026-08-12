@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -35,10 +37,13 @@ import (
 
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/config"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/credentials"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/dialog"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/events"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/invite"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/kv"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/mwi"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/presence"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/profile"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/registrar"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/subscribe"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/transfer"
@@ -211,11 +216,37 @@ func run() error {
 	server.OnOptions(reg.HandleOptions)
 	server.OnRefer(transfers.HandleRefer)
 	server.OnSubscribe(subscriptions.HandleSubscribe)
-	// Everything else — INVITE, MESSAGE, PUBLISH, … — is honestly refused until the proxy wave.
+
+	// The INVITE surface, off unless SIPD_INVITE says otherwise.
+	//
+	// Off is the honest default and it must stay so until apps/engine serves `rpc.sip.v1.invite`:
+	// with no responder every INVITE is answered 503 after the admission deadline, and a 503 tells
+	// a carrier to retry HERE shortly, whereas the 501 the registrar answers today tells it this
+	// element does not place calls. Turning it on is a deliberate act by a deployment that has the
+	// other half.
+	if cfg.EnableInvite {
+		invites, err := newInviteHandler(cfg, server, sipClient, authenticator, credentialStore, ctx, log)
+		if err != nil {
+			return err
+		}
+		server.OnInvite(invites.HandleInvite)
+		server.OnAck(invites.HandleAck)
+		server.OnBye(invites.HandleBye)
+		server.OnCancel(invites.HandleCancel)
+		server.OnUpdate(invites.HandleUpdate)
+		server.OnInfo(invites.HandleInfo)
+		defer func() {
+			if !invites.Wait(cfg.ShutdownTimeout) {
+				log.Warn("some dialog work was still in flight at shutdown")
+			}
+		}()
+	}
+
+	// Everything else — MESSAGE, PUBLISH, … — is honestly refused rather than half-answered.
 	server.OnNoRoute(reg.HandleUnsupported)
 
 	var group sync.WaitGroup
-	errs := make(chan error, 4)
+	errs := make(chan error, 8)
 
 	group.Add(1)
 	go func() {
@@ -233,23 +264,64 @@ func run() error {
 		}
 	}()
 
-	listen := func(network string) {
+	// The TLS material, loaded ONCE at boot rather than per listener.
+	//
+	// Once, because a certificate that cannot be read must fail the process here — with the path in
+	// the message — rather than inside a goroutine whose error nobody is watching, leaving a
+	// deployment that believes it serves TLS and serves nothing on 5061.
+	var tlsConfig *tls.Config
+	if cfg.EnableTLS || cfg.EnableWSS {
+		certificate, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+		if err != nil {
+			return fmt.Errorf("loading the SIP TLS certificate from %s / %s: %w",
+				cfg.TLSCertFile, cfg.TLSKeyFile, err)
+		}
+		tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{certificate},
+			// TLS 1.2 is the floor. RFC 5630 §3.1.3 requires TLS for `sips:` and says nothing about
+			// versions; 1.2 is the lowest version with no known practical break and the highest
+			// floor every SIP handset in the field can actually reach — several vendors still ship
+			// stacks that cannot do 1.3.
+			MinVersion: tls.VersionTLS12,
+		}
+	}
+
+	listen := func(network, addr string) {
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			log.Info("listening", "network", network, "addr", cfg.ListenAddr, "realm", cfg.Realm)
-			// ListenAndServe closes its listener when ctx is done and returns; a post-shutdown
-			// error is the close itself, not a failure.
-			if err := server.ListenAndServe(ctx, network, cfg.ListenAddr); err != nil && ctx.Err() == nil {
+			log.Info("listening", "network", network, "addr", addr, "realm", cfg.Realm)
+			var err error
+			if strings.HasSuffix(network, "s") && tlsConfig != nil {
+				// ListenAndServeTLS closes its listener when ctx is done and returns; a
+				// post-shutdown error is the close itself, not a failure.
+				err = server.ListenAndServeTLS(ctx, network, addr, tlsConfig)
+			} else {
+				err = server.ListenAndServe(ctx, network, addr)
+			}
+			if err != nil && ctx.Err() == nil {
 				errs <- fmt.Errorf("%s listener: %w", network, err)
 			}
 		}()
 	}
 	if cfg.EnableUDP {
-		listen("udp")
+		listen("udp", cfg.ListenAddr)
 	}
 	if cfg.EnableTCP {
-		listen("tcp")
+		listen("tcp", cfg.ListenAddr)
+	}
+	if cfg.EnableTLS {
+		listen("tls", cfg.TLSListenAddr)
+	}
+	if cfg.EnableWS {
+		// SIP over WebSocket (RFC 7118). It is the only transport a browser has, and it delivers
+		// SIGNALLING only: a WebRTC endpoint needs DTLS-SRTP and apps/mediad has no SRTP, so a
+		// softphone can register and be rung and will hear nothing. Plaintext `ws` is for a
+		// development origin; anything a browser will actually load needs `wss`.
+		listen("ws", cfg.WSListenAddr)
+	}
+	if cfg.EnableWSS {
+		listen("wss", cfg.WSSListenAddr)
 	}
 
 	select {
@@ -397,6 +469,148 @@ func newSubscribeHandler(
 		"mwiSubject", mwi.Subject,
 		"maxExpiresSeconds", int(cfg.SubscribeMaxExpires/time.Second))
 	return handler, nil
+}
+
+// newInviteHandler wires the INVITE surface: two listener profiles, the dialog table, the same
+// digest authenticator every other handler uses, and the engine seam.
+//
+// # The two profiles, and why they are structure rather than a comment
+//
+// parity-audit row 1.26 records that the internal/external trust boundary is enforced today by
+// convention in a config file. Here it is two `profile.Profile` values with different
+// authentication, different NAT policy and — the load-bearing one — different ROUTING CONTEXTS: a
+// digest-authenticated call resolves in the tenant's internal context and a trunk-matched one in
+// the untrusted context, which is what stops an inbound PSTN call from dialling back out through a
+// trunk. The external profile exists only when SIPD_TRUNK_ACL names at least one network, because
+// internal/profile refuses to construct an external profile with an empty ACL.
+func newInviteHandler(
+	cfg config.Config,
+	server *sipgo.Server,
+	client *sipgo.Client,
+	authenticator *registrar.Authenticator,
+	credentialStore credentials.Store,
+	ctx context.Context,
+	log *slog.Logger,
+) (*invite.Handler, error) {
+	profiles, err := buildProfiles(cfg)
+	if err != nil {
+		return nil, err
+	}
+	requester, err := invite.NewClientRequester(client)
+	if err != nil {
+		return nil, err
+	}
+
+	dialogs := dialog.NewStore(dialog.StoreOptions{InstanceID: cfg.InstanceID})
+	timers := dialog.TimerPolicy{
+		Enabled:            cfg.EnableSessionTimers,
+		MinSE:              cfg.MinSE,
+		DefaultSE:          cfg.SessionExpires,
+		MaxSE:              cfg.SessionExpires * 4,
+		PreferLocalRefresh: true,
+	}
+
+	handler, err := invite.New(invite.Options{
+		Realm:       cfg.Realm,
+		Auth:        authenticator,
+		Credentials: credentialStore,
+		Dialogs:     dialogs,
+		// The `sip-dialogs` bucket does not exist in packages/events-go, so the claim store is the
+		// in-process one: a single instance works, and nothing reaps a dead peer's calls. The
+		// contract change that closes it is named in the wave report.
+		Claims:       dialog.NewMemoryClaimStore(),
+		Profiles:     profiles,
+		Port:         invite.RefusingPort{Reason: invite.ReasonShuttingDown},
+		Requester:    requester,
+		Responder:    server,
+		Contact:      contactURI(cfg),
+		InstanceID:   cfg.InstanceID,
+		Timers:       timers,
+		Logger:       log,
+		ServerHeader: cfg.UserAgent,
+		BaseContext:  ctx,
+		NewLegID:     contract.NewEventID,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	log.Info("INVITE handling ready",
+		"instanceId", cfg.InstanceID,
+		"profiles", len(profiles.Profiles()),
+		"sessionTimers", cfg.EnableSessionTimers)
+	log.Warn("the INVITE surface is enabled and no engine serves rpc.sip.v1.invite: " +
+		"every call will be refused 503 with a Retry-After until that responder exists")
+	return handler, nil
+}
+
+// buildProfiles turns the configuration into the trust boundaries the INVITE handler enforces.
+func buildProfiles(cfg config.Config) (*profile.Set, error) {
+	listeners := make([]profile.Listener, 0, 5)
+	if cfg.EnableUDP {
+		listeners = append(listeners, profile.Listener{Network: "udp", Addr: cfg.ListenAddr})
+	}
+	if cfg.EnableTCP {
+		listeners = append(listeners, profile.Listener{Network: "tcp", Addr: cfg.ListenAddr})
+	}
+	if cfg.EnableTLS {
+		listeners = append(listeners, profile.Listener{
+			Network: "tls", Addr: cfg.TLSListenAddr,
+			TLSCertFile: cfg.TLSCertFile, TLSKeyFile: cfg.TLSKeyFile,
+		})
+	}
+	if cfg.EnableWS {
+		listeners = append(listeners, profile.Listener{Network: "ws", Addr: cfg.WSListenAddr})
+	}
+	if cfg.EnableWSS {
+		listeners = append(listeners, profile.Listener{
+			Network: "wss", Addr: cfg.WSSListenAddr,
+			TLSCertFile: cfg.TLSCertFile, TLSKeyFile: cfg.TLSKeyFile,
+		})
+	}
+
+	internal := profile.Internal("internal", listeners...)
+	if strings.TrimSpace(cfg.TrunkACL) == "" {
+		return profile.NewSet(internal)
+	}
+
+	entries, err := parseTrunkACL(cfg.TrunkACL)
+	if err != nil {
+		return nil, err
+	}
+	external := profile.External("external", profile.NewACL(entries))
+	if cfg.ExternalListenAddr != "" {
+		// A socket of its own, which is the stronger separation: the profile is then chosen by the
+		// address the packet ARRIVED ON, which no sender can influence, rather than by the address
+		// it claims to come from.
+		external.Listeners = []profile.Listener{
+			{Network: "udp", Addr: cfg.ExternalListenAddr},
+			{Network: "tcp", Addr: cfg.ExternalListenAddr},
+		}
+	}
+	return profile.NewSet(internal, external)
+}
+
+// parseTrunkACL reads `cidr[=trunkId]` entries separated by commas.
+func parseTrunkACL(raw string) ([]profile.Entry, error) {
+	fields := strings.Split(raw, ",")
+	entries := make([]profile.Entry, 0, len(fields))
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		network, trunkID, _ := strings.Cut(field, "=")
+		entry, err := profile.ParseEntry(network, profile.ActionAllow, 0, strings.TrimSpace(trunkID), "SIPD_TRUNK_ACL")
+		if err != nil {
+			return nil, fmt.Errorf("SIPD_TRUNK_ACL: %w", err)
+		}
+		entries = append(entries, entry)
+	}
+	if len(entries) == 0 {
+		return nil, errors.New("SIPD_TRUNK_ACL is set but names no usable network")
+	}
+	return entries, nil
 }
 
 // contactURI is what this edge puts in the Contact header of its 202 and its notifications.

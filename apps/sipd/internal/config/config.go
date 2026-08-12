@@ -38,6 +38,90 @@ type Config struct {
 	EnableUDP bool
 	EnableTCP bool
 
+	// TLS, WS and WSS listeners. SIPD_TLS / SIPD_WS / SIPD_WSS, all default false, each with its
+	// own bind address so a deployment can put the secure transports on their conventional ports
+	// (5061 for TLS, 8089 for WSS) without moving the plaintext ones.
+	//
+	// # Why WS and WSS are here at all
+	//
+	// A browser cannot open a UDP or TCP socket. SIP over WebSocket (RFC 7118) is the ONLY transport
+	// a WebRTC softphone has, and parity-audit row 1.28 records that neither plane serves one today
+	// — which blocks the T3 softphone entirely. sipgo serves both (`Server.ServeWS`/`ServeWSS`, and
+	// `ListenAndServe` accepts "ws" and "wss" as network names), so this is wiring rather than
+	// implementation.
+	//
+	// # What a WSS listener does NOT deliver
+	//
+	// Audio. SDP stays vanilla here: a WebRTC endpoint needs DTLS-SRTP, and apps/mediad has no SRTP
+	// — plans/mediad-design.md §1 declined pion/webrtc deliberately and left "a separate ingress in
+	// front of the same session model" as an argument nobody has had yet. So WSS delivers
+	// SIGNALLING for a browser client and no media, and saying so is better than shipping half a
+	// feature quietly.
+	EnableTLS bool
+	EnableWS  bool
+	EnableWSS bool
+	// TLSListenAddr, WSListenAddr and WSSListenAddr are the bind addresses for those three.
+	TLSListenAddr string
+	WSListenAddr  string
+	WSSListenAddr string
+	// TLSCertFile and TLSKeyFile are the PEM certificate and key both TLS and WSS present. One pair
+	// for both: a deployment that needs different certificates for 5061 and 8089 needs two
+	// processes, and pretending otherwise would put certificate selection into a config file that
+	// cannot express SNI.
+	TLSCertFile string
+	TLSKeyFile  string
+
+	// EnableInvite turns on the INVITE surface: the dialog layer, the admission RPC and every
+	// mid-dialog method. SIPD_INVITE, default FALSE.
+	//
+	// Off by default and it must stay that way until the engine serves `rpc.sip.v1.invite`. With no
+	// responder every INVITE is answered 503 after the admission deadline, which is a WORSE answer
+	// than the honest 501 the registrar gives today: a 503 tells a carrier to retry here shortly,
+	// and a 501 tells it this element does not do that. Turning it on is a deliberate act by a
+	// deployment that has the other half.
+	EnableInvite bool
+	// InstanceID is this process's identity on the backbone: it stamps every `sip-dialogs` claim and
+	// is the token engine commands for these dialogs are addressed at. SIPD_INSTANCE_ID, defaulting
+	// to the hostname, because a dialog lives on one process and a command for it must reach that
+	// one.
+	InstanceID string
+
+	// Session timers (RFC 4028). SIPD_SESSION_TIMERS (default false), SIPD_SESSION_EXPIRES (1800)
+	// and SIPD_MIN_SE (90, the RFC's own floor).
+	//
+	// Off by default because a one-sided timer is worse than none and because mediad's RTP timeout
+	// already reaps a far end that vanished without a BYE. They become mandatory in front of a
+	// carrier that offers `Supported: timer`, which will tear the call down itself if it never sees
+	// a refresh.
+	EnableSessionTimers bool
+	SessionExpires      time.Duration
+	MinSE               time.Duration
+
+	// MaxContactsPerAOR caps simultaneous registrations for one address of record.
+	// SIPD_MAX_CONTACTS, default 5.
+	//
+	// It is the `extension.maxRegistrations` column's enforcement point. Five rather than one
+	// because a desk phone plus a softphone plus a mobile client is an ordinary user, and rather
+	// than unlimited because an unbounded contact set is a fork that rings twenty stale bindings.
+	MaxContactsPerAOR int
+
+	// TrunkACL is the carrier-facing source-address allow list, as `cidr[=trunkId]` entries
+	// separated by commas. SIPD_TRUNK_ACL, empty by default.
+	//
+	// Empty means NO external profile is built, and therefore that no unauthenticated INVITE can be
+	// admitted at all. That is the safe default and it is the only safe default: an external
+	// profile with an empty ACL accepts INVITEs from the whole internet, which internal/profile
+	// refuses to construct.
+	//
+	// It is configuration rather than a watched read model because the read model does not exist —
+	// design §8.1 specifies a `sip-acl` KV bucket written by apps/api, and that is a cross-boundary
+	// change. The seam is internal/profile.NewACL, which takes a compiled list from anywhere.
+	TrunkACL string
+	// ExternalListenAddr is where the carrier-facing profile listens, when a TrunkACL is configured.
+	// SIPD_EXTERNAL_LISTEN_ADDR, default empty, meaning the external profile shares the main
+	// listeners and is selected by source address.
+	ExternalListenAddr string
+
 	// Realm is the digest authentication realm presented in every challenge. SIPD_REALM.
 	//
 	// It is part of HA1 = MD5(username:realm:password), so changing it invalidates every stored
@@ -201,6 +285,24 @@ func Load(getenv Getenv) (Config, error) {
 		CredentialsFile:    getenv("SIPD_CREDENTIALS_FILE"),
 		ProvisionSecretKey: strings.TrimSpace(getenv("SIPD_PROVISION_SECRET_KEY")),
 		UserAgent:          stringOr(getenv, "SIPD_USER_AGENT", "optimiq-sipd"),
+		TLSListenAddr:      stringOr(getenv, "SIPD_TLS_LISTEN_ADDR", "0.0.0.0:5061"),
+		WSListenAddr:       stringOr(getenv, "SIPD_WS_LISTEN_ADDR", "0.0.0.0:5080"),
+		WSSListenAddr:      stringOr(getenv, "SIPD_WSS_LISTEN_ADDR", "0.0.0.0:8089"),
+		TLSCertFile:        strings.TrimSpace(getenv("SIPD_TLS_CERT_FILE")),
+		TLSKeyFile:         strings.TrimSpace(getenv("SIPD_TLS_KEY_FILE")),
+		InstanceID:         strings.TrimSpace(getenv("SIPD_INSTANCE_ID")),
+		TrunkACL:           strings.TrimSpace(getenv("SIPD_TRUNK_ACL")),
+		ExternalListenAddr: strings.TrimSpace(getenv("SIPD_EXTERNAL_LISTEN_ADDR")),
+	}
+	if cfg.InstanceID == "" {
+		// The hostname, because in every deployment this repository targets that is the pod name,
+		// which is exactly the granularity a per-instance command subject needs. A random id would
+		// work too and would make a restarted pod unaddressable by anything that cached the old one.
+		if hostname, err := os.Hostname(); err == nil {
+			cfg.InstanceID = hostname
+		} else {
+			cfg.InstanceID = "sipd"
+		}
 	}
 
 	// The per-service pair first, the shared pair as the fallback. Collected into `problems` so a
@@ -215,6 +317,30 @@ func Load(getenv Getenv) (Config, error) {
 		fail("%v", err)
 	}
 	if cfg.EnableTCP, err = boolOr(getenv, "SIPD_TCP", true); err != nil {
+		fail("%v", err)
+	}
+	if cfg.EnableTLS, err = boolOr(getenv, "SIPD_TLS", false); err != nil {
+		fail("%v", err)
+	}
+	if cfg.EnableWS, err = boolOr(getenv, "SIPD_WS", false); err != nil {
+		fail("%v", err)
+	}
+	if cfg.EnableWSS, err = boolOr(getenv, "SIPD_WSS", false); err != nil {
+		fail("%v", err)
+	}
+	if cfg.EnableInvite, err = boolOr(getenv, "SIPD_INVITE", false); err != nil {
+		fail("%v", err)
+	}
+	if cfg.EnableSessionTimers, err = boolOr(getenv, "SIPD_SESSION_TIMERS", false); err != nil {
+		fail("%v", err)
+	}
+	if cfg.SessionExpires, err = secondsOr(getenv, "SIPD_SESSION_EXPIRES", 1800); err != nil {
+		fail("%v", err)
+	}
+	if cfg.MinSE, err = secondsOr(getenv, "SIPD_MIN_SE", 90); err != nil {
+		fail("%v", err)
+	}
+	if cfg.MaxContactsPerAOR, err = intOr(getenv, "SIPD_MAX_CONTACTS", 5); err != nil {
 		fail("%v", err)
 	}
 	if cfg.MinExpires, err = secondsOr(getenv, "SIPD_MIN_EXPIRES", 60); err != nil {
@@ -274,8 +400,34 @@ func Load(getenv Getenv) (Config, error) {
 	if cfg.ListenAddr == "" {
 		fail("SIPD_LISTEN_ADDR must not be empty")
 	}
-	if !cfg.EnableUDP && !cfg.EnableTCP {
-		fail("SIPD_UDP and SIPD_TCP are both false: sipd would accept no traffic at all")
+	if !cfg.EnableUDP && !cfg.EnableTCP && !cfg.EnableTLS && !cfg.EnableWS && !cfg.EnableWSS {
+		fail("every listener is disabled: sipd would accept no traffic at all")
+	}
+	// A certificate is required for exactly the transports that terminate TLS, and refused for the
+	// ones that do not — a deployment that set a cert and forgot to enable TLS is one that believes
+	// it is encrypted and is not, which is the failure worth failing the boot for.
+	if (cfg.EnableTLS || cfg.EnableWSS) && (cfg.TLSCertFile == "" || cfg.TLSKeyFile == "") {
+		fail("SIPD_TLS_CERT_FILE and SIPD_TLS_KEY_FILE are both required when SIPD_TLS or SIPD_WSS is on")
+	}
+	if !cfg.EnableTLS && !cfg.EnableWSS && (cfg.TLSCertFile != "" || cfg.TLSKeyFile != "") {
+		fail("SIPD_TLS_CERT_FILE/SIPD_TLS_KEY_FILE are set but neither SIPD_TLS nor SIPD_WSS is on: " +
+			"this deployment is plaintext and believes it is not")
+	}
+	// Two listeners on one address is a bind failure at best and a silent race at worst.
+	if duplicate, found := duplicateListener(cfg); found {
+		fail("two listeners are configured on %s: one socket cannot serve two transports", duplicate)
+	}
+	if cfg.MaxContactsPerAOR <= 0 {
+		fail("SIPD_MAX_CONTACTS must be positive: zero would refuse every registration")
+	}
+	if cfg.EnableSessionTimers {
+		if cfg.MinSE < 90*time.Second {
+			fail("SIPD_MIN_SE must be at least 90 seconds (RFC 4028 §4 sets that floor), got %s", cfg.MinSE)
+		}
+		if cfg.SessionExpires < cfg.MinSE {
+			fail("SIPD_SESSION_EXPIRES (%s) must not be below SIPD_MIN_SE (%s)",
+				cfg.SessionExpires, cfg.MinSE)
+		}
 	}
 	if cfg.CredentialSource == CredentialSourceFile && cfg.CredentialsFile == "" {
 		fail("SIPD_CREDENTIALS_FILE is required when SIPD_CREDENTIAL_SOURCE=file")
@@ -324,6 +476,40 @@ func Load(getenv Getenv) (Config, error) {
 			strings.Join(problems, "\n  - "))
 	}
 	return cfg, nil
+}
+
+// duplicateListener reports the first bind address claimed by two enabled transports.
+//
+// It is a boot check rather than a runtime one because the runtime symptom is miserable: one
+// listener binds, the other fails, the error is logged by a goroutine nobody is watching, and half
+// the fleet's phones cannot reach the transport they were provisioned for.
+func duplicateListener(cfg Config) (string, bool) {
+	claimed := make(map[string]string, 5)
+	for _, listener := range [5]struct {
+		enabled bool
+		name    string
+		addr    string
+	}{
+		{cfg.EnableUDP, "SIPD_UDP", cfg.ListenAddr},
+		{cfg.EnableTCP, "SIPD_TCP", cfg.ListenAddr},
+		{cfg.EnableTLS, "SIPD_TLS", cfg.TLSListenAddr},
+		{cfg.EnableWS, "SIPD_WS", cfg.WSListenAddr},
+		{cfg.EnableWSS, "SIPD_WSS", cfg.WSSListenAddr},
+	} {
+		if !listener.enabled {
+			continue
+		}
+		// UDP and TCP legitimately share one address: they are different sockets on different
+		// protocols, which is why they have one SIPD_LISTEN_ADDR between them.
+		if listener.name == "SIPD_TCP" {
+			continue
+		}
+		if previous, taken := claimed[listener.addr]; taken {
+			return listener.addr + " (" + previous + " and " + listener.name + ")", true
+		}
+		claimed[listener.addr] = listener.name
+	}
+	return "", false
 }
 
 // ErrInvalid marks a configuration problem, for callers that want to branch on it.
