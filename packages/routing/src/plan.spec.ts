@@ -13,6 +13,7 @@ import {
 	aQueue,
 	aRingGroup,
 	aRingGroupMember,
+	aSharedLine,
 	aSnapshot,
 	aStream,
 	aTimeCondition,
@@ -34,6 +35,7 @@ const artifact = compiled(
 		conferences: [aConference()],
 		parkLots: [aParkLot({ timeoutDestinationType: "extension", timeoutDestinationRef: "ext-1" })],
 		pagingGroups: [aPagingGroup()],
+		sharedLines: [aSharedLine()],
 		queues: [aQueue({ timeoutDestinationType: "voicemail", timeoutDestinationRef: "vm-1" })],
 		ringGroups: [aRingGroup({ timeoutDestinationType: "queue", timeoutDestinationRef: "q-1" })],
 		ringGroupDestinations: [aRingGroupMember()],
@@ -109,12 +111,13 @@ describe("plan node vocabulary", () => {
 	 * previous version meets a `kind` it has no case for, mid-call. Counting them is how the bump
 	 * stops being something somebody has to remember.
 	 */
-	it("names eighteen kinds", () => {
-		expect(PLAN_NODE_KINDS).toHaveLength(18);
+	it("names nineteen kinds", () => {
+		expect(PLAN_NODE_KINDS).toHaveLength(19);
 		expect(PLAN_NODE_KINDS).toContain("paging");
 		expect(PLAN_NODE_KINDS).toContain("call-flow");
 		expect(PLAN_NODE_KINDS).toContain("stream");
 		expect(PLAN_NODE_KINDS).toContain("dial-by-name");
+		expect(PLAN_NODE_KINDS).toContain("shared-line");
 	});
 
 	it("emits every kind except playback from a fully wired organization", () => {
@@ -152,6 +155,11 @@ describe("planNodeReferences", () => {
 		const references = planNodeReferences(artifact.nodes["ring-group:rg-1"] as PlanNode);
 		expect(references).toContain("extension:ext-1");
 		expect(references).toContain("queue:q-1");
+	});
+
+	it("lists a shared line's appearances", () => {
+		const references = planNodeReferences(artifact.nodes["shared-line:sl-1"] as PlanNode);
+		expect(references).toContain("extension:ext-1");
 	});
 
 	it("lists an IVR menu's options and branches", () => {

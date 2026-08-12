@@ -10,7 +10,10 @@ import {
 	deviceProfileKey,
 	eq,
 	extension,
+	inArray,
 	orgSetting,
+	sharedLine,
+	sharedLineAppearance,
 	sql,
 	type PbxDatabaseClient,
 } from "@optimiq-voice/pbx-db";
@@ -156,6 +159,38 @@ export class ProvisionRepository {
 				.from(orgSetting)
 				.where(and(eq(orgSetting.category, "provision"), eq(orgSetting.enabled, true)));
 
+			/**
+			 * Which of this device's line extensions are appearances on an enabled shared line.
+			 *
+			 * This is what makes `device_line.shared_line` more than a manual flag: an extension that
+			 * is a shared-line appearance must render as a shared line even when nobody ticked the box,
+			 * because the appearance is what the credential path lights and sipd stamps into `Call-Info`.
+			 * `provision.service.ts` ORs the row's own flag with membership in this set.
+			 *
+			 * Keyed on the device's own line extensions, so it is a single indexed `IN` over at most a
+			 * handful of ids rather than a scan. Both the line and the appearance must be enabled — a
+			 * disabled line is not a shared line for anyone, and a disabled appearance is a button
+			 * switched off. The extension itself may be disabled and still be an appearance; that is the
+			 * line's problem, not this membership's, and the ordinary line-skip logic already handles it.
+			 */
+			const lineExtensionIds = lineRows
+				.map((row) => row.line.extensionId)
+				.filter((id): id is string => id !== null);
+			const sharedLineMemberRows =
+				lineExtensionIds.length === 0
+					? []
+					: await transaction
+							.selectDistinct({ extensionId: sharedLineAppearance.extensionId })
+							.from(sharedLineAppearance)
+							.innerJoin(sharedLine, eq(sharedLine.id, sharedLineAppearance.sharedLineId))
+							.where(
+								and(
+									inArray(sharedLineAppearance.extensionId, lineExtensionIds),
+									eq(sharedLineAppearance.enabled, true),
+									eq(sharedLine.enabled, true),
+								),
+							);
+
 			return {
 				device: deviceRow,
 				profile: profileRow,
@@ -163,6 +198,7 @@ export class ProvisionRepository {
 				keys: keyRows,
 				profileKeys: profileKeyRows,
 				organizationSettings: toSettings(settingRows),
+				sharedLineExtensionIds: new Set(sharedLineMemberRows.map((row) => row.extensionId)),
 			} as RenderSnapshot;
 		});
 	}
@@ -283,6 +319,14 @@ export interface RenderSnapshot {
 	readonly keys: readonly (typeof deviceKey.$inferSelect)[];
 	readonly profileKeys: readonly (typeof deviceProfileKey.$inferSelect)[];
 	readonly organizationSettings: ProvisioningSettings;
+	/**
+	 * The subset of this device's line extension ids that are appearances on an enabled shared line.
+	 *
+	 * A membership set, not a per-line flag: `provision.service.ts` ORs a line's own
+	 * `device_line.shared_line` with `has(extensionId)`, so a line whose extension is a shared-line
+	 * appearance renders as a shared line even when the manual flag was never set.
+	 */
+	readonly sharedLineExtensionIds: ReadonlySet<string>;
 }
 
 /** Re-exported so templates and the service can name key shapes without a schema import. */

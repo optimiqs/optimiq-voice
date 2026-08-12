@@ -281,6 +281,7 @@ describe("kv bucket definitions", () => {
 			"queue-membership",
 			"park-claims",
 			"conference-claims",
+			"shared-line-state",
 			"media-sessions",
 			"queue-waiting",
 			"sip-dialogs",
@@ -431,6 +432,12 @@ describe("kvKeyFor", () => {
 	it("keys a conference claim by the room id, not by its dialled number", () => {
 		const room = createEntityId();
 		expect(kvKeyFor.conferenceClaim(ORG, room)).toBe(`${ORG}.${room}`);
+	});
+
+	it("keys a shared-line seizure by the line id, not by its dialled number", () => {
+		const line = createEntityId();
+		expect(kvKeyFor.sharedLineState(ORG, line)).toBe(`${ORG}.${line}`);
+		expect(() => kvKeyFor.sharedLineState(ORG, "line.one")).toThrow(SubjectTokenError);
 	});
 
 	it("rejects a claim token that would break the key namespace", () => {

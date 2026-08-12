@@ -63,6 +63,12 @@ type Contact struct {
 	SourceAddress string `json:"sourceAddress,omitempty"`
 	// UserAgent is the device's own description of itself.
 	UserAgent string `json:"userAgent,omitempty"`
+	// SharedLineNumber and AppearanceIndex place this contact on a shared line appearance (SLA), when
+	// it has one. They ride from the binding through here so the INVITE path — which reads the PRIMARY
+	// contact — can stamp a `Call-Info` appearance-index header on the request to this phone. Nil for
+	// an ordinary contact.
+	SharedLineNumber *string `json:"sharedLineNumber,omitempty"`
+	AppearanceIndex  *int    `json:"appearanceIndex,omitempty"`
 	// Instance is the device's `+sip.instance` (RFC 5626). It is the ONLY stable identity a device
 	// has across a changed IP address or a changed port, which is what makes it the right key for
 	// "is this the same phone re-registering, or a second one".
@@ -377,17 +383,19 @@ func FromBinding(binding kv.Binding) Set {
 		contacts := make([]Contact, 0, len(binding.Contacts))
 		for _, stored := range binding.Contacts {
 			contacts = append(contacts, Contact{
-				URI:           stored.URI,
-				Transport:     string(stored.Transport),
-				SourceAddress: stored.SourceAddress,
-				UserAgent:     stored.UserAgent,
-				Instance:      stored.Instance,
-				RegID:         stored.RegID,
-				Q:             stored.Q,
-				CallID:        stored.CallID,
-				CSeq:          stored.CSeq,
-				RegisteredAt:  stored.RegisteredAt.Time,
-				ExpiresAt:     stored.ExpiresAt.Time,
+				URI:              stored.URI,
+				Transport:        string(stored.Transport),
+				SourceAddress:    stored.SourceAddress,
+				UserAgent:        stored.UserAgent,
+				SharedLineNumber: stored.SharedLineNumber,
+				AppearanceIndex:  stored.AppearanceIndex,
+				Instance:         stored.Instance,
+				RegID:            stored.RegID,
+				Q:                stored.Q,
+				CallID:           stored.CallID,
+				CSeq:             stored.CSeq,
+				RegisteredAt:     stored.RegisteredAt.Time,
+				ExpiresAt:        stored.ExpiresAt.Time,
 			})
 		}
 		return Set{contacts: contacts}
@@ -396,16 +404,18 @@ func FromBinding(binding kv.Binding) Set {
 		return Set{}
 	}
 	return Set{contacts: []Contact{{
-		URI:           binding.Contact,
-		Transport:     string(binding.Transport),
-		SourceAddress: binding.SourceAddress,
-		UserAgent:     binding.UserAgent,
-		Instance:      binding.Instance,
-		CallID:        binding.CallID,
-		CSeq:          binding.CSeq,
-		Q:             DefaultQ,
-		RegisteredAt:  binding.RegisteredAt.Time,
-		ExpiresAt:     binding.ExpiresAt.Time,
+		URI:              binding.Contact,
+		Transport:        string(binding.Transport),
+		SourceAddress:    binding.SourceAddress,
+		UserAgent:        binding.UserAgent,
+		SharedLineNumber: binding.SharedLineNumber,
+		AppearanceIndex:  binding.AppearanceIndex,
+		Instance:         binding.Instance,
+		CallID:           binding.CallID,
+		CSeq:             binding.CSeq,
+		Q:                DefaultQ,
+		RegisteredAt:     binding.RegisteredAt.Time,
+		ExpiresAt:        binding.ExpiresAt.Time,
 	}}}
 }
 
@@ -449,18 +459,20 @@ func ApplyToBinding(binding kv.Binding, set Set) kv.Binding {
 			transport = binding.Transport
 		}
 		stored = append(stored, kv.Contact{
-			URI:           contact.URI,
-			Transport:     transport,
-			UserAgent:     contact.UserAgent,
-			SourceAddress: contact.SourceAddress,
-			DeviceID:      binding.DeviceID,
-			Instance:      contact.Instance,
-			RegID:         contact.RegID,
-			Q:             contact.Q,
-			CallID:        contact.CallID,
-			CSeq:          contact.CSeq,
-			RegisteredAt:  contract.EventTime{Time: contact.RegisteredAt},
-			ExpiresAt:     contract.EventTime{Time: contact.ExpiresAt},
+			URI:              contact.URI,
+			Transport:        transport,
+			UserAgent:        contact.UserAgent,
+			SourceAddress:    contact.SourceAddress,
+			DeviceID:         binding.DeviceID,
+			SharedLineNumber: contact.SharedLineNumber,
+			AppearanceIndex:  contact.AppearanceIndex,
+			Instance:         contact.Instance,
+			RegID:            contact.RegID,
+			Q:                contact.Q,
+			CallID:           contact.CallID,
+			CSeq:             contact.CSeq,
+			RegisteredAt:     contract.EventTime{Time: contact.RegisteredAt},
+			ExpiresAt:        contract.EventTime{Time: contact.ExpiresAt},
 		})
 	}
 
@@ -468,6 +480,8 @@ func ApplyToBinding(binding kv.Binding, set Set) kv.Binding {
 	binding.Contact = primary.URI
 	binding.SourceAddress = primary.SourceAddress
 	binding.UserAgent = primary.UserAgent
+	binding.SharedLineNumber = primary.SharedLineNumber
+	binding.AppearanceIndex = primary.AppearanceIndex
 	binding.Instance = primary.Instance
 	binding.CallID = primary.CallID
 	binding.CSeq = primary.CSeq

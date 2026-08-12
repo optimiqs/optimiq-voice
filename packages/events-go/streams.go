@@ -489,6 +489,28 @@ var ConferenceClaimsKV = KVBucketDefinition{
 	NumReplicas:  1,
 }
 
+// SharedLineStateKV holds which appearance has seized a shared line, across engine instances.
+//
+// A shared line is seized by one appearance at a time: when one desk answers the call on it, the
+// others' keys go busy so a colleague does not grab a call that is already someone's. That is the
+// same exclusivity a park orbit needs and it is taken the same way — the answering appearance
+// creates the key, a loser reads the winner and lights its lamp remote-active. The fifteen-minute
+// TTL matches the other claim buckets so a crashed holder's line frees for the next seizure.
+//
+// Like ParkClaimsKV and ConferenceClaimsKV, declared but not written from Go: seizing a shared line
+// is an engine-owned operation, and the lamp reaches the phone over the presence -> dialog-info path
+// sipd already watches.
+var SharedLineStateKV = KVBucketDefinition{
+	Name:         "shared-line-state",
+	Description:  "Shared-line seizure ownership across engine instances, taken under compare-and-set.",
+	TTL:          15 * time.Minute,
+	History:      1,
+	Storage:      StorageFile,
+	MaxValueSize: 4 * 1024,
+	MaxBytes:     128 * mib,
+	NumReplicas:  1,
+}
+
 // MediaSessionsKV maps an RTP session to the mediad instance that holds it.
 //
 // rpc.media.v1.* is served by a QUEUE GROUP, so NATS hands each request to whichever mediad happens
@@ -632,6 +654,7 @@ var KVBuckets = []KVBucketDefinition{
 	QueueMembershipKV,
 	ParkClaimsKV,
 	ConferenceClaimsKV,
+	SharedLineStateKV,
 	MediaSessionsKV,
 	QueueWaitingKV,
 	SIPDialogsKV,

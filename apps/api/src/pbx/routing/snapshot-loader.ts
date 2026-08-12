@@ -28,6 +28,8 @@ import {
 	queue,
 	ringGroup,
 	ringGroupDestination,
+	sharedLine,
+	sharedLineAppearance,
 	speedDial,
 	timeCondition,
 	timeConditionRule,
@@ -121,6 +123,8 @@ export async function loadOrgRoutingSnapshot(
 		parkLots,
 		pagingGroups,
 		pagingGroupMembers,
+		sharedLines,
+		sharedLineAppearances,
 		featureCodes,
 		callBlockRules,
 		mohClasses,
@@ -157,6 +161,8 @@ export async function loadOrgRoutingSnapshot(
 		transaction.select().from(parkLot),
 		transaction.select().from(pagingGroup),
 		transaction.select().from(pagingGroupMember),
+		transaction.select().from(sharedLine),
+		transaction.select().from(sharedLineAppearance),
 		transaction.select().from(featureCode),
 		transaction.select().from(callBlockRule),
 		transaction.select().from(mohClass),
@@ -500,6 +506,38 @@ export async function loadOrgRoutingSnapshot(
 					extensionId: member.extensionId,
 					ordinal: member.ordinal,
 					enabled: member.enabled,
+				})),
+		})),
+		/**
+		 * Shared lines, with their appearances nested — the paging-group precedent exactly.
+		 *
+		 * `SharedLineInput.appearances` is declared nested for the same reason `PagingGroupInput.members`
+		 * is: an appearance is an `(extension, ordinal)` pair with no id anything points at, so a second
+		 * top-level collection for it would buy a `SNAPSHOT_COLLECTIONS` entry and a cache-invalidation
+		 * entry in exchange for expressing a list. The read is still two flat statements and no join
+		 * (rule 2); the grouping happens here, over rows RLS already scoped.
+		 *
+		 * Members arrive in ordinal order because the loader sorts them — the compiler sorts by `ordinal`
+		 * again on its own side, both true statements about determinism rather than one relying on the
+		 * other. Disabled lines and disabled appearances are both loaded (rule 1): an appearance switched
+		 * off is a fact the compiler keeps by dropping it from the compiled line, not by never seeing it.
+		 */
+		sharedLines: sharedLines.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			name: row.name,
+			extensionNumber: row.extensionNumber,
+			strategy: row.strategy,
+			ringTimeoutSeconds: row.ringTimeoutSeconds,
+			holdRecallTimeoutSeconds: row.holdRecallTimeoutSeconds,
+			bargeInEnabled: row.bargeInEnabled,
+			appearances: sharedLineAppearances
+				.filter((appearance) => appearance.sharedLineId === row.id)
+				.sort((left, right) => left.ordinal - right.ordinal || (left.id < right.id ? -1 : 1))
+				.map((appearance) => ({
+					extensionId: appearance.extensionId,
+					ordinal: appearance.ordinal,
+					enabled: appearance.enabled,
 				})),
 		})),
 		featureCodes: featureCodes.map((row) => ({

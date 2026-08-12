@@ -453,15 +453,17 @@ type SipCredentialRequest struct {
 
 // SipCredentialResponse is the reply body of rpc.sip.v1.credential.
 type SipCredentialResponse struct {
-	Found       bool    `json:"found"`
-	Enabled     bool    `json:"enabled"`
-	OrgID       *string `json:"orgId,omitempty"`
-	Username    *string `json:"username,omitempty"`
-	Realm       *string `json:"realm,omitempty"`
-	Ha1         *string `json:"ha1,omitempty"`
-	DeviceID    *string `json:"deviceId,omitempty"`
-	ExtensionID *string `json:"extensionId,omitempty"`
-	Reason      *string `json:"reason,omitempty"`
+	Found            bool    `json:"found"`
+	Enabled          bool    `json:"enabled"`
+	OrgID            *string `json:"orgId,omitempty"`
+	Username         *string `json:"username,omitempty"`
+	Realm            *string `json:"realm,omitempty"`
+	Ha1              *string `json:"ha1,omitempty"`
+	DeviceID         *string `json:"deviceId,omitempty"`
+	ExtensionID      *string `json:"extensionId,omitempty"`
+	SharedLineNumber *string `json:"sharedLineNumber,omitempty"`
+	AppearanceIndex  *int    `json:"appearanceIndex,omitempty"`
+	Reason           *string `json:"reason,omitempty"`
 }
 
 // SipTransferRequest is the request body of rpc.sip.v1.transfer.

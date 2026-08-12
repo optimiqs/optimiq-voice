@@ -759,6 +759,38 @@ export const CONFERENCE_CLAIMS_KV: KvBucketDefinition = {
 };
 
 /**
+ * `shared-line-state` — which appearance has seized a shared line, across engine instances.
+ *
+ * ## The invariant this exists for
+ *
+ * **A shared line is seized by one appearance at a time.** When the boss's desk answers the call on
+ * the shared line, the assistant's key must go busy — otherwise the assistant grabs a call that is
+ * already someone's. That is the same exclusivity a park orbit needs, and it is taken the same way:
+ * the answering appearance `create`s this key, and an appearance that loses the create reads the
+ * winner off the value and lights its lamp remote-active rather than joining the call. An in-process
+ * map holds that within one engine and says nothing across two, so the claim lives HERE.
+ *
+ * ## Why the TTL matches the claim buckets
+ *
+ * Fifteen minutes, like `park-claims` and `conference-claims`, for the same reason: a crashed
+ * instance that held a line must not keep it seized forever. The owner heartbeats for as long as the
+ * call is up; a claim past its `expiresAt` with no heartbeat is reapable, so a dead holder's line
+ * frees for the next seizure. The record's own `expiresAt` is what a reaper reads; the bucket TTL is
+ * the backstop.
+ */
+export const SHARED_LINE_STATE_KV: KvBucketDefinition = {
+	name: "shared-line-state",
+	description:
+		"Shared-line seizure ownership across engine instances, taken under compare-and-set.",
+	ttlMs: 15 * MINUTE_MS,
+	history: 1,
+	storage: "file",
+	maxValueSizeBytes: 4 * 1024,
+	maxBytes: 128 * MIB,
+	numReplicas: 1,
+};
+
+/**
  * `media-sessions` — which `mediad` instance holds which RTP session.
  *
  * The full argument for its existence, its shape and its key is on
@@ -991,6 +1023,7 @@ export const KV_BUCKETS: readonly KvBucketDefinition[] = [
 	QUEUE_MEMBERSHIP_KV,
 	PARK_CLAIMS_KV,
 	CONFERENCE_CLAIMS_KV,
+	SHARED_LINE_STATE_KV,
 	MEDIA_SESSIONS_KV,
 	QUEUE_WAITING_KV,
 	SIP_DIALOGS_KV,
@@ -1168,6 +1201,16 @@ export const kvKeyFor = {
 	 */
 	conferenceClaim(orgId: string, conferenceId: string): string {
 		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("conferenceId", conferenceId)}`;
+	},
+	/**
+	 * `shared-line-state`: `<orgId>.<sharedLineId>` — one entry per shared line.
+	 *
+	 * By the line's id and not its dialled number, for the reason the conference claim gives: a
+	 * tenant may renumber a shared line while a call is up on it, and a key that moved underneath a
+	 * live seizure would strand the holders on a claim nobody can find again.
+	 */
+	sharedLineState(orgId: string, sharedLineId: string): string {
+		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("sharedLineId", sharedLineId)}`;
 	},
 	/**
 	 * `media-sessions`: the session id, and nothing else.

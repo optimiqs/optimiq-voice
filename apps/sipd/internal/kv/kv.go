@@ -40,6 +40,13 @@ type Binding struct {
 	SourceAddress string `json:"sourceAddress,omitempty"`
 	DeviceID      string `json:"deviceId,omitempty"`
 	ExtensionID   string `json:"extensionId,omitempty"`
+	// SharedLineNumber and AppearanceIndex place this AOR on a shared line appearance (SLA), when it
+	// has one. They ride onto the binding from the credential so the INVITE path can stamp a
+	// `Call-Info` appearance-index header on the outbound request to this phone. Nil for an ordinary
+	// extension. Carried beside DeviceID because they answer the same question — which inventory row
+	// is this — for the SLA case.
+	SharedLineNumber *string `json:"sharedLineNumber,omitempty"`
+	AppearanceIndex  *int    `json:"appearanceIndex,omitempty"`
 	// CallID and CSeq identify the registration dialog, so a retransmission or an out-of-order
 	// REGISTER can be recognised (RFC 3261 §10.3 step 6).
 	CallID string `json:"callId,omitempty"`
@@ -98,6 +105,11 @@ type Contact struct {
 	// SourceAddress is the observed signalling peer, host:port. The address that actually works.
 	SourceAddress string `json:"sourceAddress,omitempty"`
 	DeviceID      string `json:"deviceId,omitempty"`
+	// SharedLineNumber and AppearanceIndex place this contact on a shared line appearance (SLA), when
+	// it has one — carried per-contact beside DeviceID so the primary contact's appearance survives
+	// the round-trip through the bucket into the INVITE path. Nil for an ordinary contact.
+	SharedLineNumber *string `json:"sharedLineNumber,omitempty"`
+	AppearanceIndex  *int    `json:"appearanceIndex,omitempty"`
 	// Instance is the device's `+sip.instance` (RFC 5626) — the only identity a device has that
 	// survives a changed port, and therefore the one a `{kind:"aor"}` originate should name.
 	Instance string `json:"instance,omitempty"`

@@ -20,6 +20,7 @@ import {
 	aQueue,
 	aRingGroup,
 	aRingGroupMember,
+	aSharedLine,
 	aSnapshot,
 	aTimeCondition,
 	aTimeRule,
@@ -41,6 +42,7 @@ import type {
 	PagingPlanNode,
 	QueuePlanNode,
 	RingGroupPlanNode,
+	SharedLinePlanNode,
 	TrunkDialPlanNode,
 } from "./plan";
 
@@ -983,6 +985,77 @@ describe("compile — ring groups", () => {
 			}),
 		);
 		expect((artifact.nodes["ring-group:rg-1"] as RingGroupPlanNode).members).toEqual([]);
+	});
+});
+
+describe("compile — shared lines", () => {
+	it("resolves appearances to extension nodes in appearance-index order", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension(), anExtension({ id: "ext-2", number: "1002" })],
+				sharedLines: [
+					aSharedLine({
+						appearances: [
+							{ extensionId: "ext-2", ordinal: 2, enabled: true },
+							{ extensionId: "ext-1", ordinal: 1, enabled: true },
+						],
+					}),
+				],
+			}),
+		);
+		const node = artifact.nodes["shared-line:sl-1"] as SharedLinePlanNode;
+		expect(node.appearances.map((appearance) => appearance.appearanceIndex)).toEqual([1, 2]);
+		expect(node.appearances.map((appearance) => appearance.targetNodeId)).toEqual([
+			"extension:ext-1",
+			"extension:ext-2",
+		]);
+		expect(node.holdRecallTimeoutSeconds).toBe(60);
+		expect(node.bargeInEnabled).toBe(false);
+	});
+
+	it("claims the line's number so dialling it reaches the node", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				sharedLines: [aSharedLine({ extensionNumber: "700" })],
+			}),
+		);
+		expect(artifact.internal.numbers["700"]).toEqual({
+			number: "700",
+			kind: "shared-line",
+			entityId: "sl-1",
+			nodeId: "shared-line:sl-1",
+		});
+	});
+
+	it("projects a member's appearance index into the extension index for the credential path", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				sharedLines: [aSharedLine({ extensionNumber: "700" })],
+			}),
+		);
+		expect(artifact.extensionsByNumber["1001"]?.sharedLineAppearances).toEqual([
+			{ sharedLineId: "sl-1", number: "700", appearanceIndex: 1 },
+		]);
+	});
+
+	it("warns about a shared line with no reachable appearance but still compiles it", () => {
+		const result = compileAttempt(aSnapshot({ sharedLines: [aSharedLine({ appearances: [] })] }));
+		expect(result.ok).toBe(true);
+		expect(codesOf(result)).toContain("empty-shared-line");
+	});
+
+	it("drops a disabled appearance", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				sharedLines: [
+					aSharedLine({ appearances: [{ extensionId: "ext-1", ordinal: 1, enabled: false }] }),
+				],
+			}),
+		);
+		expect((artifact.nodes["shared-line:sl-1"] as SharedLinePlanNode).appearances).toEqual([]);
 	});
 });
 

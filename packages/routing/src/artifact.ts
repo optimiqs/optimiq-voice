@@ -58,8 +58,17 @@ import type { CompiledTranslationRuleset } from "./translations";
  * `TimeConditionPlanNode`'s override handling, which a v2 reader ignores and evaluates the clock for)
  * or a new TABLE on this envelope (`phrases`, `speedDials`, `inboundTranslations`), which a v2
  * reader also ignores — neither of those would have been a bump on its own.
+ *
+ * # v3 → v4: the `shared-line` node kind
+ *
+ * One new member of `PlanNodeKind`, and a v3 reader has no case for it — the same argument `paging`
+ * and the T2 kinds make. The per-extension `sharedLineAppearances` projection on
+ * {@link ExtensionIndexEntry} that ships alongside it is an optional FIELD a v3 reader ignores, and
+ * the `"shared-line"` member added to {@link InternalNumberEntry}'s `kind` is a new value in an
+ * existing enum a v3 reader never reaches (it only lands on a key it compiled itself) — neither
+ * would have been a bump on its own. The node kind is what forces it.
  */
-export const ROUTING_ARTIFACT_VERSION = 3;
+export const ROUTING_ARTIFACT_VERSION = 4;
 
 /** The three routing namespaces. The rpc contract's `routingContext` is one of these. */
 export const ROUTING_CONTEXTS = ["inbound", "internal", "outbound"] as const;
@@ -155,6 +164,7 @@ export interface InternalNumberEntry {
 		| "voicemail"
 		| "call-flow"
 		| "dial-by-name"
+		| "shared-line"
 		// A BARE-NUMERIC speed dial only. A star-prefixed one lives in `speedDials`, because a `*` in
 		// this map's keys would be read as an extension number by everything that walks it.
 		| "speed-dial";
@@ -341,7 +351,25 @@ export interface ExtensionIndexEntry {
 	 * org-wide — the documented fallback, not a refusal.
 	 */
 	readonly pickupGroup?: string;
+	/**
+	 * The shared lines this extension appears on, and its appearance index on each.
+	 *
+	 * The same idiom as `pickupGroup`: a per-extension fact carried on the index so the process that
+	 * needs it — the credential responder answering a device's REGISTER — can turn an extension into
+	 * its appearance index without a second query. The responder projects the LOWEST-ordinal entry
+	 * here into the credential reply, which sipd stamps as the `Call-Info` appearance index so the
+	 * phone lights the right shared-line key. Absent means the extension is on no shared line.
+	 */
+	readonly sharedLineAppearances?: readonly ExtensionSharedLineAppearance[];
 	readonly nodeId: PlanNodeId;
+}
+
+/** One shared line an extension appears on, projected per-extension for the credential path. */
+export interface ExtensionSharedLineAppearance {
+	readonly sharedLineId: string;
+	/** The shared line's dialable number, when it has one. */
+	readonly number?: string;
+	readonly appearanceIndex: number;
 }
 
 /**

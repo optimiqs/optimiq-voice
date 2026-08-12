@@ -96,6 +96,11 @@ export const RING_GROUP_STRATEGIES = ["simultaneous", "sequential"] as const;
 
 export type RingGroupStrategy = (typeof RING_GROUP_STRATEGIES)[number];
 
+/** Mirrored from `pbx-db` `shared-lines-schema.ts`. */
+export const SHARED_LINE_STRATEGIES = ["simultaneous", "sequential"] as const;
+
+export type SharedLineStrategy = (typeof SHARED_LINE_STRATEGIES)[number];
+
 /**
  * Mirrored from `pbx-db` `queues-schema.ts`.
  *
@@ -755,6 +760,38 @@ export interface PagingGroupInput extends RoutingEntityInput {
 	readonly members: readonly PagingGroupMemberInput[];
 }
 
+/**
+ * A shared line and the appearances that ring on it.
+ *
+ * Membership is joined in rather than kept as a flat sibling collection, the same decision paging
+ * makes and for the same reason: an appearance is only ever named by its own line, so the flat
+ * form's one benefit — a child several kinds of parent can reference — does not apply, and it would
+ * cost a second collection, a hash-order entry and an index pass to express a list.
+ *
+ * `holdRecallTimeoutSeconds` and `bargeInEnabled` are carried because they are engine-runtime facts
+ * about the line the compiler has and the engine otherwise would not: a held call recalls on the
+ * line's own leash, and whether an idle appearance may join a call in progress is the line's policy,
+ * not a routing edge. `strategy` decides whether the appearances light and ring together or in
+ * ordinal order.
+ */
+export interface SharedLineInput extends RoutingEntityInput {
+	readonly name: string;
+	readonly extensionNumber?: string | null;
+	readonly strategy: SharedLineStrategy;
+	readonly ringTimeoutSeconds: number;
+	readonly holdRecallTimeoutSeconds: number;
+	readonly bargeInEnabled: boolean;
+	/** In any order — the compiler sorts by `ordinal`, as it does everywhere else. */
+	readonly appearances: readonly SharedLineAppearanceInput[];
+}
+
+export interface SharedLineAppearanceInput {
+	readonly extensionId: string;
+	/** The appearance index: the button position on the member's phone. */
+	readonly ordinal: number;
+	readonly enabled: boolean;
+}
+
 export interface FeatureCodeInput extends RoutingEntityInput {
 	/** Dialed string including the leading star, e.g. `*97`. */
 	readonly code: string;
@@ -1036,6 +1073,8 @@ export interface OrgRoutingSnapshot {
 	readonly directories?: readonly DialByNameDirectoryInput[];
 	/** Optional — see the "optional collections" note in this file's header. */
 	readonly speedDials?: readonly SpeedDialInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly sharedLines?: readonly SharedLineInput[];
 }
 
 /**
@@ -1083,6 +1122,7 @@ export const SNAPSHOT_COLLECTIONS = [
 	"phraseSteps",
 	"directories",
 	"speedDials",
+	"sharedLines",
 ] as const satisfies readonly (keyof OrgRoutingSnapshot)[];
 
 export type SnapshotCollection = (typeof SNAPSHOT_COLLECTIONS)[number];
@@ -1116,6 +1156,11 @@ export const OPTIONAL_SNAPSHOT_COLLECTIONS = [
 	"phraseSteps",
 	"directories",
 	"speedDials",
+	// Newest of all, and optional for the reason every collection after emergency addresses is: it
+	// ships after the API's snapshot loader was written, and a required field would make this package
+	// impossible to release before the loader learns to select `shared_line`. A tenant whose loader
+	// has not caught up compiles no shared-line nodes, which is what every release before this one did.
+	"sharedLines",
 ] as const satisfies readonly SnapshotCollection[];
 
 export type OptionalSnapshotCollection = (typeof OPTIONAL_SNAPSHOT_COLLECTIONS)[number];
@@ -1179,5 +1224,6 @@ export function emptySnapshot(organizationId: string): OrgRoutingSnapshot {
 		phraseSteps: [],
 		directories: [],
 		speedDials: [],
+		sharedLines: [],
 	};
 }

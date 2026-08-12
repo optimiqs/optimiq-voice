@@ -127,8 +127,8 @@ describe("emptySnapshot", () => {
 		}
 	});
 
-	it("lists thirty-two collections", () => {
-		expect(SNAPSHOT_COLLECTIONS).toHaveLength(32);
+	it("lists thirty-three collections", () => {
+		expect(SNAPSHOT_COLLECTIONS).toHaveLength(33);
 	});
 
 	it("marks exactly the collections a loader may omit as optional", () => {
@@ -150,6 +150,7 @@ describe("emptySnapshot", () => {
 			"phraseSteps",
 			"directories",
 			"speedDials",
+			"sharedLines",
 		]);
 	});
 

@@ -44,8 +44,8 @@ describe("ROUTING_ARTIFACT_VERSION", () => {
 	 * `3` is the T2 admin block's three — `call-flow`, `stream` and `dial-by-name` — which is the
 	 * only class of change that earns a bump: a kind the previous reader has no case for.
 	 */
-	it("is 3, the version that introduced the T2 admin block's node kinds", () => {
-		expect(ROUTING_ARTIFACT_VERSION).toBe(3);
+	it("is 4, the version that introduced the shared-line node kind", () => {
+		expect(ROUTING_ARTIFACT_VERSION).toBe(4);
 	});
 
 	it("is stamped onto every compiled artifact", () => {

@@ -732,6 +732,12 @@ func BuildNotify(
 	req.AppendHeader(cseq)
 	req.AppendHeader(sip.NewHeader("Event", event))
 	req.AppendHeader(sip.NewHeader("Subscription-State", state.String()))
+	// TODO(SLA): stamp Call-Info appearance-index on dialog-info NOTIFY once the subscription carries
+	// the appearance. Unlike the INVITE path — where the credential reply threads the appearance
+	// straight onto the binding this builder never sees — a dialog-info watcher's appearance lives on
+	// the WATCHED resource's binding, not on this subscription. Reaching it would mean resolving that
+	// binding at accept time and threading an appearance index onto Subscription; that is the seam,
+	// and the INVITE path is the delivered surface.
 	req.AppendHeader(&sip.ContactHeader{Address: contact})
 	if server != "" {
 		req.AppendHeader(sip.NewHeader("User-Agent", server))

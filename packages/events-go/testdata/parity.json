@@ -940,6 +940,16 @@
 			"numReplicas": 1
 		},
 		{
+			"name": "shared-line-state",
+			"description": "Shared-line seizure ownership across engine instances, taken under compare-and-set.",
+			"ttlMs": 900000,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 4096,
+			"maxBytes": 134217728,
+			"numReplicas": 1
+		},
+		{
 			"name": "media-sessions",
 			"description": "RTP session -> owning mediad instance, for per-instance command routing.",
 			"ttlMs": 21600000,

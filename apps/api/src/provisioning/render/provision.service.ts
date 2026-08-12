@@ -308,7 +308,19 @@ export class ProvisionService {
 				transport: resolveLineTransport(settings, row.line.transport),
 				outboundProxy: this.env.PROVISION_SIP_OUTBOUND_PROXY,
 				registerExpiresSeconds: row.line.registerExpiresSeconds,
-				sharedLine: row.line.sharedLine,
+				/**
+				 * Shared line, from the rows and no longer from the flag alone.
+				 *
+				 * `device_line.shared_line` is the manual override an administrator can still tick, but the
+				 * fact that decides a shared line is the APPEARANCE: an extension that is an enabled
+				 * appearance on an enabled shared line renders `shared_line` true whether or not anyone set
+				 * the column. `snapshot.sharedLineExtensionIds` is the membership the repository loaded for
+				 * exactly this device's line extensions, so the OR is a set lookup, not a re-query.
+				 */
+				sharedLine:
+					row.line.sharedLine ||
+					(row.line.extensionId !== null &&
+						snapshot.sharedLineExtensionIds.has(row.line.extensionId)),
 				label: row.line.label ?? undefined,
 				/**
 				 * The mailbox number is the extension number.

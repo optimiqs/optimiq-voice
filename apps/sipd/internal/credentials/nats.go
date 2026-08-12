@@ -227,12 +227,14 @@ func credentialFromReply(realm, username string, reply contract.SipCredentialRes
 	}
 
 	credential := Credential{
-		OrgID:       *reply.OrgID,
-		Username:    username,
-		Realm:       realm,
-		HA1:         strings.ToLower(strings.TrimSpace(*reply.Ha1)),
-		DeviceID:    optional(reply.DeviceID),
-		ExtensionID: optional(reply.ExtensionID),
+		OrgID:            *reply.OrgID,
+		Username:         username,
+		Realm:            realm,
+		HA1:              strings.ToLower(strings.TrimSpace(*reply.Ha1)),
+		DeviceID:         optional(reply.DeviceID),
+		ExtensionID:      optional(reply.ExtensionID),
+		SharedLineNumber: reply.SharedLineNumber,
+		AppearanceIndex:  reply.AppearanceIndex,
 	}
 	if err := credential.Validate(); err != nil {
 		return Credential{}, fmt.Errorf("%w: %w", ErrLookupFailed, err)

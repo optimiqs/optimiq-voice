@@ -20,6 +20,7 @@ import { ringGroup, ringGroupDestination } from "./ring-groups-schema";
 import { inboundRoute, outboundRoute } from "./routing-schema";
 import { auditLog, sipAclEntry, sipAuthEvent } from "./security-schema";
 import { orgSetting, userSetting } from "./settings-schema";
+import { sharedLine, sharedLineAppearance } from "./shared-lines-schema";
 import { speedDial } from "./speed-dials-schema";
 import { audioStream } from "./streams-schema";
 import { timeCondition, timeConditionRule } from "./time-conditions-schema";
@@ -80,6 +81,8 @@ export const pbxTables = {
 	queueTier,
 	ringGroup,
 	ringGroupDestination,
+	sharedLine,
+	sharedLineAppearance,
 	sipAclEntry,
 	sipAuthEvent,
 	speedDial,

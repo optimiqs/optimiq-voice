@@ -41,6 +41,8 @@ export const DIAGNOSTIC_CODES = [
 	"empty-ring-group",
 	/** A paging group has no reachable members, so an announcement to it is heard by nobody. */
 	"empty-paging-group",
+	/** A shared line has no reachable appearances, so a call to it rings nobody. */
+	"empty-shared-line",
 	/** An outbound route's trunk list is empty after unknown/disabled trunks are dropped. */
 	"empty-trunk-list",
 	/** An outbound route names a trunk id that is not in the snapshot. */

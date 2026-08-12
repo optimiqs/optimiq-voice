@@ -656,6 +656,23 @@ export const sipCredentialResponseSchema = z.object({
 		.optional(),
 	deviceId: z.uuid().optional(),
 	extensionId: z.uuid().optional(),
+	/**
+	 * The shared-line appearance this account holds, when the extension appears on a shared line.
+	 *
+	 * This is how a registering device learns its appearance index without sipd growing a database
+	 * handle or a second read model: the appearance index is a per-(extension) fact the control plane
+	 * already computes into the routing artifact, and the credential reply is the one message that
+	 * already travels from that control plane to the edge on REGISTER. sipd carries these onto the
+	 * binding and stamps `Call-Info: <sip:number@domain>;appearance-index=N` onto the INVITE and the
+	 * dialog-info NOTIFY it sends to the appearance, so the phone lights the right shared-line key.
+	 *
+	 * The number is the shared line's own dialable number (absent for a shared-key-only line); the
+	 * index is the appearance's ordinal on the line. An extension that appears on several shared lines
+	 * reports its lowest-ordinal line here — per-call appearance-slot assignment across simultaneous
+	 * calls is the BroadWorks dynamic behaviour and a named seam beyond this static button model.
+	 */
+	sharedLineNumber: z.string().max(64).optional(),
+	appearanceIndex: z.number().int().nonnegative().optional(),
 	/** Why the lookup could not be answered, for the support ticket. Never shown to a phone. */
 	reason: z.string().max(256).optional(),
 });

@@ -293,6 +293,40 @@ func TestRegisterChallengesThenBinds(t *testing.T) {
 	}
 }
 
+// A credential that names a shared line appearance must carry that appearance onto the binding, so
+// the INVITE path can stamp a Call-Info appearance-index header on the call to this phone. Same
+// reply→Credential→Binding thread the deviceId travels, one field further along.
+func TestSharedLineAppearanceFlowsFromCredentialToBinding(t *testing.T) {
+	sharedLine := "2000"
+	appearance := 2
+	lookup := staticCredentials{credential: credentials.Credential{
+		OrgID:            testOrg,
+		Username:         testUser,
+		Realm:            testRealm,
+		HA1:              credentials.HA1(testUser, testRealm, testPass),
+		DeviceID:         "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b50",
+		ExtensionID:      "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51",
+		SharedLineNumber: &sharedLine,
+		AppearanceIndex:  &appearance,
+	}}
+	h := newHarness(t, lookup)
+
+	if res := h.register(contactHeader("sip:1001@203.0.113.9:5060", "expires=600")); res.StatusCode != 200 {
+		t.Fatalf("REGISTER = %d", res.StatusCode)
+	}
+
+	binding, found := h.binding()
+	if !found {
+		t.Fatal("no binding was written to the location service")
+	}
+	if binding.SharedLineNumber == nil || *binding.SharedLineNumber != sharedLine {
+		t.Errorf("binding.SharedLineNumber = %v, want %q", binding.SharedLineNumber, sharedLine)
+	}
+	if binding.AppearanceIndex == nil || *binding.AppearanceIndex != appearance {
+		t.Errorf("binding.AppearanceIndex = %v, want %d", binding.AppearanceIndex, appearance)
+	}
+}
+
 func TestRefreshKeepsTheOriginalRegistrationInstant(t *testing.T) {
 	h := newHarness(t, nil)
 

@@ -156,6 +156,12 @@ type dialTarget struct {
 	// answered. Empty for an AOR or a bare URI.
 	authUser  string
 	authRealm string
+	// sharedLineNumber and appearanceIndex place this target on a shared line appearance (SLA), when
+	// the resolved AOR carries one. When appearanceIndex is non-nil the INVITE gets a `Call-Info`
+	// appearance-index header so the phone lights the right line key. Nil for an ordinary AOR, a
+	// trunk, or a bare URI.
+	sharedLineNumber *string
+	appearanceIndex  *int
 }
 
 // resolveTarget turns the contract's three-shaped target into one address.
@@ -231,6 +237,10 @@ func (h *Handler) resolveAOR(ctx context.Context, orgID, address string) (dialTa
 		destination: primary.SourceAddress,
 		from:        h.contact,
 		transport:   primary.Transport,
+		// The shared-line appearance travels with the primary contact, so a call to a phone that is
+		// one appearance of a shared line can be stamped with which appearance it is.
+		sharedLineNumber: primary.SharedLineNumber,
+		appearanceIndex:  primary.AppearanceIndex,
 	}
 	if target.transport == "" {
 		target.transport = strings.ToLower(string(binding.Transport))
@@ -344,6 +354,21 @@ func (h *Handler) buildOriginateInvite(
 	req.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
 	req.AppendHeader(sip.NewHeader("User-Agent", h.server))
 	req.AppendHeader(sip.NewHeader("Allow", "INVITE, ACK, CANCEL, BYE, UPDATE, INFO, OPTIONS, REFER, NOTIFY"))
+
+	// Shared line appearance: when the resolved target is one appearance of a shared line, tell the
+	// phone WHICH appearance so it lights the right line key (the same signal FreeSWITCH's SLA
+	// carries as an `appearance-index`). The number is the shared line's own number, falling back to
+	// the target user when the credential named none, and the domain is the request-URI host so the
+	// URI in the header is one the phone recognises. Omitted entirely for an ordinary extension.
+	if target.appearanceIndex != nil {
+		number := target.requestURI.User
+		if target.sharedLineNumber != nil && *target.sharedLineNumber != "" {
+			number = *target.sharedLineNumber
+		}
+		domain := target.requestURI.Host
+		req.AppendHeader(sip.NewHeader("Call-Info",
+			fmt.Sprintf("<sip:%s@%s>;appearance-index=%d", number, domain, *target.appearanceIndex)))
+	}
 
 	for name, value := range request.Headers {
 		if !headerAllowed(name) {

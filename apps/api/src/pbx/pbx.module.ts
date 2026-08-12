@@ -107,6 +107,11 @@ import { SipAclEntriesService } from "./security/sip-acl.service";
 import { SipAuthEventQueryService } from "./security/sip-auth-event-query.service";
 import { SipAuthEventController } from "./security/sip-auth-event.controller";
 import { SipAuthEventService } from "./security/sip-auth-event.service";
+import { SharedLinesController } from "./shared-lines/shared-lines.controller";
+import {
+	SharedLineAppearancesService,
+	SharedLinesService,
+} from "./shared-lines/shared-lines.service";
 import { AuditLogService } from "./shared/audit-log.service";
 import { createPbxDatabase } from "./shared/pbx-database";
 import { loadPbxEnv } from "./shared/pbx-env";
@@ -239,6 +244,7 @@ const logger = getLogger("api.pbx");
 		IvrMenusController,
 		RingGroupsController,
 		PagingGroupsController,
+		SharedLinesController,
 		QueuesController,
 		QueueAgentsController,
 		QueueAgentSessionController,
@@ -738,6 +744,8 @@ const logger = getLogger("api.pbx");
 		RingGroupDestinationsService,
 		PagingGroupsService,
 		PagingGroupMembersService,
+		SharedLinesService,
+		SharedLineAppearancesService,
 		QueuesService,
 		QueueAgentsService,
 		QueueTiersService,

@@ -49,6 +49,7 @@ import type {
 	QueueStrategy,
 	RecordPolicy,
 	RingGroupStrategy,
+	SharedLineStrategy,
 	SipTransport,
 	TollClass,
 	TrunkKind,
@@ -72,6 +73,7 @@ export const PLAN_NODE_KINDS = [
 	"conference",
 	"park",
 	"paging",
+	"shared-line",
 	"external",
 	"trunk-dial",
 	"application",
@@ -512,6 +514,40 @@ export interface PagingPlanNode extends PlanNodeBase {
 	readonly timeoutSeconds: number;
 }
 
+/** One appearance on a shared line — one member extension's button. */
+export interface SharedLineAppearance {
+	/** The appearance index: the button position on the member's phone, and the `Call-Info` index. */
+	readonly appearanceIndex: number;
+	readonly extensionId: string;
+	/** The member's dialable number, carried so the engine can address the lamp without a lookup. */
+	readonly extensionNumber: string;
+	readonly targetNodeId: PlanNodeId;
+}
+
+/**
+ * A shared line: one seizable line that appears on several handsets at once.
+ *
+ * A call to the line's number reaches every appearance (the engine originates a leg per appearance
+ * and arbitrates the seizure), so this fans out the same way a ring group does — but the members are
+ * `appearance`s carrying a button INDEX, because the whole feature is what happens after the answer:
+ * the line stays a single seizable thing whose state every appearance sees. `holdRecallTimeoutSeconds`
+ * and `bargeInEnabled` are the engine-runtime policy the compiler carries here so the engine needs no
+ * database read to arm a recall or refuse a barge. Never empty in a compiled artifact.
+ */
+export interface SharedLinePlanNode extends PlanNodeBase {
+	readonly kind: "shared-line";
+	readonly sharedLineId: string;
+	/** The line's own dialable number. Absent for a shared-key-only line reached no other way. */
+	readonly number?: string;
+	readonly strategy: SharedLineStrategy;
+	readonly ringTimeoutSeconds: number;
+	readonly holdRecallTimeoutSeconds: number;
+	readonly bargeInEnabled: boolean;
+	/** In appearance-index order. Never empty — a line with no live appearance is a hard error. */
+	readonly appearances: readonly SharedLineAppearance[];
+	readonly timeoutNodeId?: PlanNodeId;
+}
+
 /**
  * A literal number outside the organization.
  *
@@ -797,6 +833,7 @@ export type PlanNode =
 	| ConferencePlanNode
 	| ParkPlanNode
 	| PagingPlanNode
+	| SharedLinePlanNode
 	| ExternalPlanNode
 	| TrunkDialPlanNode
 	| ApplicationPlanNode
@@ -865,6 +902,12 @@ export function planNodeReferences(node: PlanNode): readonly PlanNodeId[] {
 			// Nothing. A page has no continuation — the members' legs are numbers rather than node
 			// references, and the call ends when the pager hangs up, so there is no branch to reach.
 			return [];
+		}
+		case "shared-line": {
+			return compact([
+				...node.appearances.map((appearance) => appearance.targetNodeId),
+				node.timeoutNodeId,
+			]);
 		}
 		case "trunk-dial": {
 			return compact([node.failoverNodeId]);

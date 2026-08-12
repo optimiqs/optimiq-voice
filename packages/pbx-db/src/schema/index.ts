@@ -27,6 +27,7 @@ export * from "./ring-groups-schema";
 export * from "./routing-schema";
 export * from "./security-schema";
 export * from "./settings-schema";
+export * from "./shared-lines-schema";
 export * from "./speed-dials-schema";
 export * from "./streams-schema";
 export * from "./tables";

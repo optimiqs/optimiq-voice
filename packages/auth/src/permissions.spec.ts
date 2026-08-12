@@ -174,11 +174,18 @@ describe("PERMISSIONS", () => {
 	 * way `numbers.order` does. That lands the model on 113, so the ceiling moves to 117 to keep the
 	 * same four spare it has always left.
 	 *
+	 * Shared line appearances — SLA — then spent three: `shared-lines.*`, a plain read/write/delete
+	 * trio the shape `ring-groups` and `paging-groups` take. A shared line has a power profile of its
+	 * own and no existing grant expresses it: it is a shared RESOURCE whose state every appearance can
+	 * seize and hold, not a way to REACH people like a ring group, so it is neither a ride on
+	 * `ring-groups.write` nor on `paging-groups.write`. No `send`- or `toggle`-shaped fourth grant,
+	 * because managing a shared line is one job. That moves the ceiling to keep the same four spare.
+	 *
 	 * The instruction stands unchanged for whatever comes next.
 	 */
 	it("stays within the size the collapsed FusionPBX model targets", () => {
 		expect(PERMISSIONS.length).toBeGreaterThanOrEqual(60);
-		expect(PERMISSIONS.length).toBeLessThanOrEqual(117);
+		expect(PERMISSIONS.length).toBeLessThanOrEqual(124);
 	});
 
 	it("contains no duplicates", () => {

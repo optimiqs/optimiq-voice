@@ -33,6 +33,10 @@ export const pbxRelations = defineRelations(pbxTables, (r) => ({
 			from: r.extension.id,
 			to: r.pagingGroupMember.extensionId,
 		}),
+		sharedLineAppearances: r.many.sharedLineAppearance({
+			from: r.extension.id,
+			to: r.sharedLineAppearance.extensionId,
+		}),
 	},
 	extensionUser: {
 		extension: r.one.extension({
@@ -215,6 +219,28 @@ export const pbxRelations = defineRelations(pbxTables, (r) => ({
 		// membership is a table and not a text list.
 		extension: r.one.extension({
 			from: r.pagingGroupMember.extensionId,
+			to: r.extension.id,
+			optional: false,
+		}),
+	},
+
+	// --- Shared lines ------------------------------------------------------------------------
+	sharedLine: {
+		appearances: r.many.sharedLineAppearance({
+			from: r.sharedLine.id,
+			to: r.sharedLineAppearance.sharedLineId,
+		}),
+	},
+	sharedLineAppearance: {
+		sharedLine: r.one.sharedLine({
+			from: r.sharedLineAppearance.sharedLineId,
+			to: r.sharedLine.id,
+			optional: false,
+		}),
+		// Not optional, for the same reason a paging member is not: the FK cascades the delete
+		// rather than leaving an appearance pointing at a line or extension that is gone.
+		extension: r.one.extension({
+			from: r.sharedLineAppearance.extensionId,
 			to: r.extension.id,
 			optional: false,
 		}),

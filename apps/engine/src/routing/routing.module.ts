@@ -7,6 +7,7 @@ import { ExtensionFeatureRpcPort } from "./extension-feature.source";
 import { LastCallerRpcSource } from "./last-caller.source";
 import { ParkRegistry } from "./park-registry";
 import { RoutingArtifactSource } from "./routing-artifact.source";
+import { SharedLineRegistry } from "./shared-line-registry";
 import { SupervisorAuthzRpcPort } from "./supervisor-authz.source";
 import { TrunkStatusPublisher } from "./trunk-status.publisher";
 import { VoicemailGreetingRpcPort } from "./voicemail-greeting.source";
@@ -70,6 +71,7 @@ import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
 		SupervisorAuthzRpcPort,
 		ConferenceRegistry,
 		ParkRegistry,
+		SharedLineRegistry,
 		ClaimHeartbeatService,
 	],
 	exports: [
@@ -84,6 +86,7 @@ import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
 		SupervisorAuthzRpcPort,
 		ConferenceRegistry,
 		ParkRegistry,
+		SharedLineRegistry,
 		ClaimHeartbeatService,
 	],
 })

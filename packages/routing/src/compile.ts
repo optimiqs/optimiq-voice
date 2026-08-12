@@ -74,6 +74,7 @@ import type {
 	EmergencyMatchTable,
 	EmergencyRule,
 	ExtensionIndexEntry,
+	ExtensionSharedLineAppearance,
 	InboundDidDefault,
 	InboundMatchTable,
 	InboundRule,
@@ -102,6 +103,7 @@ import type {
 	PlanNode,
 	PlanNodeId,
 	RingGroupMember,
+	SharedLineAppearance,
 } from "./plan";
 import type {
 	AudioStreamInput,
@@ -121,6 +123,7 @@ import type {
 	PinSetInput,
 	PromptInput,
 	RingGroupDestinationInput,
+	SharedLineInput,
 	TimeConditionRuleInput,
 	TranslationRuleInput,
 	VoicemailGreetingInput,
@@ -717,6 +720,11 @@ class Compiler {
 		for (const group of sortById(this.snapshot.pagingGroups ?? [])) {
 			if (group.enabled) {
 				this.pagingGroupNode(group);
+			}
+		}
+		for (const line of sortById(this.snapshot.sharedLines ?? [])) {
+			if (line.enabled) {
+				this.sharedLineNode(line);
 			}
 		}
 		for (const condition of sortById(this.snapshot.timeConditions)) {
@@ -2619,6 +2627,86 @@ class Compiler {
 		return id;
 	}
 
+	/**
+	 * A shared line: its appearances resolved to real extension nodes, in appearance-index order.
+	 *
+	 * The same fan-out shape as a ring group — each appearance becomes an `extension:<id>` the engine
+	 * originates to — but the members carry a button INDEX rather than a delay, because on a shared
+	 * line the ordinal is the appearance the phone lights and the number sipd stamps into `Call-Info`,
+	 * not a stagger. A dangling or disabled appearance is dropped with the same two-way diagnostic
+	 * paging draws, and a line left with none warns rather than failing: refusing to compile would
+	 * take a tenant's working calls down to report a mistake on one line.
+	 */
+	private sharedLineNode(line: SharedLineInput): PlanNodeId {
+		const id = `shared-line:${line.id}`;
+		if (this.claimed.has(id)) {
+			return id;
+		}
+		this.claimed.add(id);
+
+		const subject: DiagnosticSubject = { kind: "shared-line", id: line.id, name: line.name };
+		const appearances: SharedLineAppearance[] = [];
+		for (const appearance of [...line.appearances].sort(
+			(left, right) =>
+				left.ordinal - right.ordinal ||
+				(left.extensionId < right.extensionId ? -1 : left.extensionId > right.extensionId ? 1 : 0),
+		)) {
+			if (!appearance.enabled) {
+				continue;
+			}
+			const extension = this.extensionsById.get(appearance.extensionId);
+			if (extension === undefined) {
+				this.bag.warning(
+					"dangling-destination",
+					`Shared line "${line.name}" lists extension "${appearance.extensionId}", which is not in this organization's configuration; its appearance was dropped.`,
+					subject,
+					"appearances",
+				);
+				continue;
+			}
+			if (!extension.enabled) {
+				this.bag.warning(
+					"disabled-entity",
+					`Shared line "${line.name}" lists extension ${extension.number}, which is disabled; its appearance was dropped.`,
+					subject,
+					"appearances",
+				);
+				continue;
+			}
+			appearances.push({
+				appearanceIndex: appearance.ordinal,
+				extensionId: extension.id,
+				extensionNumber: extension.number,
+				targetNodeId: this.extensionNode(extension),
+			});
+		}
+
+		if (appearances.length === 0) {
+			this.bag.warning(
+				"empty-shared-line",
+				`Shared line "${line.name}" has no reachable appearances; a call to it rings nobody.`,
+				subject,
+			);
+		}
+
+		this.nodes.set(
+			id,
+			compact({
+				id,
+				kind: "shared-line",
+				label: line.name,
+				sharedLineId: line.id,
+				number: line.extensionNumber ?? undefined,
+				strategy: line.strategy,
+				ringTimeoutSeconds: line.ringTimeoutSeconds,
+				holdRecallTimeoutSeconds: line.holdRecallTimeoutSeconds,
+				bargeInEnabled: line.bargeInEnabled,
+				appearances,
+			}) as PlanNode,
+		);
+		return id;
+	}
+
 	private timeConditionNodeById(
 		ref: string,
 		subject: DiagnosticSubject,
@@ -2975,6 +3063,20 @@ class Compiler {
 				entityId: group.id,
 				nodeId: this.pagingGroupNode(group),
 				name: group.name,
+			});
+		}
+		for (const line of sortById(this.snapshot.sharedLines ?? [])) {
+			if (!line.enabled || line.extensionNumber == null || line.extensionNumber.length === 0) {
+				continue;
+			}
+			// A shared-key-only line has no number and is not claimed here; a numbered one is claimed
+			// through `claimNumber` like every dialable entity, so a line numbered the same as an
+			// extension collides loudly at compile time rather than at dial time.
+			this.claimNumber(line.extensionNumber, {
+				kind: "shared-line",
+				entityId: line.id,
+				nodeId: this.sharedLineNode(line),
+				name: line.name,
 			});
 		}
 		for (const room of sortById(this.snapshot.conferences)) {
@@ -3915,10 +4017,12 @@ class Compiler {
 
 	private compileExtensionIndex(): Readonly<Record<string, ExtensionIndexEntry>> {
 		const index: Record<string, ExtensionIndexEntry> = {};
+		const appearancesByExtension = this.buildSharedLineAppearanceIndex();
 		for (const extension of sortById(this.snapshot.extensions)) {
 			if (!extension.enabled) {
 				continue;
 			}
+			const sharedLineAppearances = appearancesByExtension.get(extension.id);
 			index[extension.number] = compact({
 				extensionId: extension.id,
 				number: extension.number,
@@ -3928,10 +4032,63 @@ class Compiler {
 				outboundCallerIdName: extension.outboundCallerIdName ?? undefined,
 				emergencyCallerIdNumber: extension.emergencyCallerIdNumber ?? undefined,
 				pickupGroup: pickupGroupOf(extension),
+				sharedLineAppearances:
+					sharedLineAppearances !== undefined && sharedLineAppearances.length > 0
+						? sharedLineAppearances
+						: undefined,
 				nodeId: this.extensionNode(extension),
 			}) as ExtensionIndexEntry;
 		}
 		return sortRecordKeys(index);
+	}
+
+	/**
+	 * Which shared lines each extension appears on, keyed by extension id, in appearance-index order.
+	 *
+	 * Built once and read by {@link compileExtensionIndex}: this is the per-extension projection the
+	 * credential responder reads to tell a registering device its `Call-Info` appearance index, the
+	 * same idiom `pickupGroup` follows. Disabled lines, disabled appearances and appearances pointing
+	 * at a missing or disabled extension are dropped, so the projection carries only what the phone
+	 * can actually light. Sorted by appearance index so the responder projecting the FIRST entry gets
+	 * the lowest-ordinal line deterministically.
+	 */
+	private buildSharedLineAppearanceIndex(): Map<string, ExtensionSharedLineAppearance[]> {
+		const byExtension = new Map<string, ExtensionSharedLineAppearance[]>();
+		for (const line of sortById(this.snapshot.sharedLines ?? [])) {
+			if (!line.enabled) {
+				continue;
+			}
+			for (const appearance of line.appearances) {
+				if (!appearance.enabled) {
+					continue;
+				}
+				const extension = this.extensionsById.get(appearance.extensionId);
+				if (extension === undefined || !extension.enabled) {
+					continue;
+				}
+				const list = byExtension.get(appearance.extensionId) ?? [];
+				list.push(
+					compact({
+						sharedLineId: line.id,
+						number: line.extensionNumber ?? undefined,
+						appearanceIndex: appearance.ordinal,
+					}) as ExtensionSharedLineAppearance,
+				);
+				byExtension.set(appearance.extensionId, list);
+			}
+		}
+		for (const list of byExtension.values()) {
+			list.sort(
+				(left, right) =>
+					left.appearanceIndex - right.appearanceIndex ||
+					(left.sharedLineId < right.sharedLineId
+						? -1
+						: left.sharedLineId > right.sharedLineId
+							? 1
+							: 0),
+			);
+		}
+		return byExtension;
 	}
 
 	// -------------------------------------------------------------------------------------------

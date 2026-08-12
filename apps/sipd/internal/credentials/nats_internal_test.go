@@ -15,6 +15,8 @@ import (
 
 func ptr(s string) *string { return &s }
 
+func ptrInt(i int) *int { return &i }
+
 const testHA1 = "425d0b350d19aaf57ebe7faea9c87e27"
 
 func TestCredentialFromReply(t *testing.T) {
@@ -45,6 +47,27 @@ func TestCredentialFromReply(t *testing.T) {
 				}
 				if c.DeviceID == "" {
 					t.Error("deviceId was dropped")
+				}
+			},
+		},
+		{
+			// A shared line appearance: the reply names the shared line's number and this account's
+			// appearance index, and both must reach the Credential so the INVITE path can stamp them.
+			name: "a shared line appearance",
+			reply: contract.SipCredentialResponse{
+				Found: true, Enabled: true,
+				OrgID: ptr(org), Ha1: ptr(testHA1),
+				Username: ptr(user), Realm: ptr(realm),
+				SharedLineNumber: ptr("2000"),
+				AppearanceIndex:  ptrInt(2),
+			},
+			check: func(t *testing.T, c Credential) {
+				t.Helper()
+				if c.SharedLineNumber == nil || *c.SharedLineNumber != "2000" {
+					t.Errorf("sharedLineNumber = %v, want 2000", c.SharedLineNumber)
+				}
+				if c.AppearanceIndex == nil || *c.AppearanceIndex != 2 {
+					t.Errorf("appearanceIndex = %v, want 2", c.AppearanceIndex)
 				}
 			},
 		},

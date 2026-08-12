@@ -58,6 +58,12 @@ export function planDestinationOf(node: PlanNode): PlanDestination | undefined {
 		case "park": {
 			return { destinationType: node.kind, destinationRef: node.parkLotId };
 		}
+		case "shared-line": {
+			// A shared line IS where the call went — the caller reached a seizable appearance — on the
+			// same terms as `conference` and `park`, and `shared_line.id` is the row behind it. Leaving it
+			// unmapped would make every SLA call in the CDR read `unknown`.
+			return { destinationType: node.kind, destinationRef: node.sharedLineId };
+		}
 		case "paging": {
 			// A page IS where the call went — the caller dialled a group and reached it — so it is a
 			// destination on exactly the terms its neighbours are, and `paging_group.id` is the row

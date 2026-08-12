@@ -4,9 +4,10 @@ import { ClaimHeartbeatService } from "./claim-heartbeat.service";
 import { CLAIM_HEARTBEAT_INTERVAL_MS } from "./claim-timing";
 import { ConferenceRegistry } from "./conference-registry";
 import { ParkRegistry } from "./park-registry";
+import { SharedLineRegistry } from "./shared-line-registry";
 import type { EngineEnv } from "../config/engine-env";
 import type { JetStreamService } from "../nats/jetstream.service";
-import type { ConferenceClaim, ParkClaim } from "@optimiq-voice/events";
+import type { ConferenceClaim, ParkClaim, SharedLineState } from "@optimiq-voice/events";
 
 /**
  * The bind-and-renew service.
@@ -46,15 +47,18 @@ function service(options: { readonly unconfigured?: boolean } = {}): {
 	const unconfigured = options.unconfigured === true;
 	const parkBucket = new FakeClaimBucket<ParkClaim>({ unconfigured });
 	const conferenceBucket = new FakeClaimBucket<ConferenceClaim>({ unconfigured });
+	const sharedLineBucket = new FakeClaimBucket<SharedLineState>({ unconfigured });
 	const parks = new ParkRegistry();
 	const conferences = new ConferenceRegistry();
+	const sharedLines = new SharedLineRegistry();
 	const jetstream = {
 		parkClaims: parkBucket,
 		conferenceClaims: conferenceBucket,
+		sharedLineState: sharedLineBucket,
 	} as unknown as JetStreamService;
 
 	return {
-		heartbeat: new ClaimHeartbeatService(env(), jetstream, parks, conferences),
+		heartbeat: new ClaimHeartbeatService(env(), jetstream, parks, conferences, sharedLines),
 		parks,
 		conferences,
 		parkBucket,
@@ -132,11 +136,13 @@ describe("a tick", () => {
 			},
 		} as unknown as ParkRegistry;
 		const conferences = new ConferenceRegistry();
+		const sharedLines = new SharedLineRegistry();
 		const jetstream = {
 			parkClaims: new FakeClaimBucket<ParkClaim>(),
 			conferenceClaims: new FakeClaimBucket<ConferenceClaim>(),
+			sharedLineState: new FakeClaimBucket<SharedLineState>(),
 		} as unknown as JetStreamService;
-		const heartbeat = new ClaimHeartbeatService(env(), jetstream, parks, conferences);
+		const heartbeat = new ClaimHeartbeatService(env(), jetstream, parks, conferences, sharedLines);
 
 		await heartbeat.tick();
 		expect(heartbeat.stats.failures).toBe(1);
@@ -164,11 +170,16 @@ describe("a tick", () => {
 				return 0;
 			},
 		} as unknown as ConferenceRegistry;
+		const sharedLines = {
+			bindClaims: () => undefined,
+			heartbeat: async () => 0,
+		} as unknown as SharedLineRegistry;
 		const jetstream = {
 			parkClaims: new FakeClaimBucket<ParkClaim>(),
 			conferenceClaims: new FakeClaimBucket<ConferenceClaim>(),
+			sharedLineState: new FakeClaimBucket<SharedLineState>(),
 		} as unknown as JetStreamService;
-		const heartbeat = new ClaimHeartbeatService(env(), jetstream, parks, conferences);
+		const heartbeat = new ClaimHeartbeatService(env(), jetstream, parks, conferences, sharedLines);
 		const originalSetInterval = globalThis.setInterval;
 		let timerTick: (() => void) | undefined;
 		globalThis.setInterval = ((callback: () => void) => {

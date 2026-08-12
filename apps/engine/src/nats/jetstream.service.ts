@@ -22,8 +22,10 @@ import {
 	QUEUE_MEMBERSHIP_KV,
 	QUEUE_WAITING_KV,
 	ROUTING_CACHE_KV,
+	sharedLineStateSchema,
 	subjectFor,
 } from "@optimiq-voice/events";
+import { SHARED_LINE_STATE_KV } from "@optimiq-voice/events/streams";
 import { getLogger } from "@optimiq-voice/logging";
 import {
 	CHANNEL_OWNERSHIP_LEASE_MS,
@@ -38,6 +40,7 @@ import type {
 	CdrLegWriteEnvelope,
 	ConferenceClaim,
 	ParkClaim,
+	SharedLineState,
 	VoicemailEventEnvelope,
 } from "@optimiq-voice/events";
 import type { ChannelSnapshot } from "@optimiq-voice/telephony";
@@ -82,6 +85,8 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	private parkClaimsBucket: ClaimBucket<ParkClaim> = new UnclaimedBucket<ParkClaim>();
 	private conferenceClaimsBucket: ClaimBucket<ConferenceClaim> =
 		new UnclaimedBucket<ConferenceClaim>();
+	private sharedLineStateBucket: ClaimBucket<SharedLineState> =
+		new UnclaimedBucket<SharedLineState>();
 	/** Last channels-KV revision this replica proved it owns, by canonical channel key. */
 	private readonly channelRevisions = new Map<string, number>();
 	/** Lease expiry written by the last acknowledged create/update for each locally-owned channel. */
@@ -187,6 +192,15 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 			await this.jetstream.views.kv(CONFERENCE_CLAIMS_KV.name),
 			conferenceClaimSchema as never,
 			CONFERENCE_CLAIMS_KV.name,
+		);
+		// The shared-line seizure bucket. Written and read by this engine and by every other instance of
+		// it, and by nothing else — see `claim-store.ts` and `SharedLineRegistry` for why a shared line
+		// is seized under compare-and-set exactly as a park orbit is. The bucket itself is created by
+		// `ensureKvBuckets` above, since `SHARED_LINE_STATE_KV` is in `KV_BUCKETS`.
+		this.sharedLineStateBucket = new KvClaimBucket<SharedLineState>(
+			await this.jetstream.views.kv(SHARED_LINE_STATE_KV.name),
+			sharedLineStateSchema as never,
+			SHARED_LINE_STATE_KV.name,
 		);
 		this.ready = true;
 	}
@@ -320,6 +334,11 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	/** The `conference-claims` bucket. Same contract, same reasoning, as {@link parkClaims}. */
 	get conferenceClaims(): ClaimBucket<ConferenceClaim> {
 		return this.conferenceClaimsBucket;
+	}
+
+	/** The `shared-line-state` bucket. Same contract, same reasoning, as {@link parkClaims}. */
+	get sharedLineState(): ClaimBucket<SharedLineState> {
+		return this.sharedLineStateBucket;
 	}
 
 	/**
@@ -678,6 +697,7 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		this.queueWaitingKv = undefined;
 		this.parkClaimsBucket = new UnclaimedBucket<ParkClaim>();
 		this.conferenceClaimsBucket = new UnclaimedBucket<ConferenceClaim>();
+		this.sharedLineStateBucket = new UnclaimedBucket<SharedLineState>();
 		this.channelRevisions.clear();
 		this.channelLeaseExpiries.clear();
 		this.channelOperations.clear();

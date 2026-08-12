@@ -141,6 +141,12 @@ export const ROUTING_TABLE_TO_ENTITY: Readonly<Record<string, RoutingEntityKind>
 	phrase_step: "phraseSteps",
 	dial_by_name_directory: "directories",
 	speed_dial: "speedDials",
+	shared_line: "sharedLines",
+	// Both halves map to the same collection, because the snapshot nests appearances inside the line
+	// (see `SharedLineInput`). Moving one desk onto or off a shared line changes who the line rings
+	// and which button lights, which is a compiled fact, so a write to the appearance evicts exactly
+	// as a write to the line does.
+	shared_line_appearance: "sharedLines",
 } as const;
 
 export function isRoutingEntityKind(value: string): value is RoutingEntityKind {

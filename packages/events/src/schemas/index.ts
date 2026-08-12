@@ -140,9 +140,13 @@ export {
 	isClaimExpired,
 	isClaimOwnedBy,
 	parkClaimSchema,
+	SHARED_LINE_STATES,
+	sharedLineStateSchema,
 	type ConferenceClaim,
 	type ConferenceContribution,
 	type ParkClaim,
+	type SharedLineSeizureState,
+	type SharedLineState,
 } from "./claims";
 export {
 	makeMediaEvent,

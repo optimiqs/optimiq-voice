@@ -46,6 +46,8 @@ import type {
 	QueueInput,
 	RingGroupDestinationInput,
 	RingGroupInput,
+	SharedLineAppearanceInput,
+	SharedLineInput,
 	SpeedDialInput,
 	TimeConditionInput,
 	TimeConditionRuleInput,
@@ -335,6 +337,27 @@ export function aPagingGroup(overrides: Partial<PagingGroupInput> = {}): PagingG
 		members: [{ extensionId: "ext-1", ordinal: 1, enabled: true }],
 		...overrides,
 	};
+}
+
+export function aSharedLine(overrides: Partial<SharedLineInput> = {}): SharedLineInput {
+	return {
+		id: "sl-1",
+		enabled: true,
+		name: "Front desk",
+		extensionNumber: "700",
+		strategy: "simultaneous",
+		ringTimeoutSeconds: 30,
+		holdRecallTimeoutSeconds: 60,
+		bargeInEnabled: false,
+		appearances: [{ extensionId: "ext-1", ordinal: 1, enabled: true }],
+		...overrides,
+	};
+}
+
+export function aSharedLineAppearance(
+	overrides: Partial<SharedLineAppearanceInput> = {},
+): SharedLineAppearanceInput {
+	return { extensionId: "ext-1", ordinal: 1, enabled: true, ...overrides };
 }
 
 export function aFeatureCode(overrides: Partial<FeatureCodeInput> = {}): FeatureCodeInput {

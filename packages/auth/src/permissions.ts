@@ -114,6 +114,10 @@ export const PERMISSIONS = [
 	"paging-groups.write",
 	"paging-groups.delete",
 
+	"shared-lines.read",
+	"shared-lines.write",
+	"shared-lines.delete",
+
 	"queues.read",
 	"queues.write",
 	"queues.delete",
@@ -954,6 +958,32 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 				permission: "paging-groups.delete",
 				label: "Delete paging groups",
 				description: "Remove a paging group.",
+			},
+		],
+	},
+	{
+		resource: "shared-lines",
+		label: "Shared lines",
+		description:
+			"Shared line appearances: one line that appears on several handsets at once, each on a " +
+			"button of its own, seized and held as a single resource.",
+		permissions: [
+			{
+				permission: "shared-lines.read",
+				label: "View shared lines",
+				description: "Inspect shared lines, their appearances and the button order.",
+			},
+			{
+				permission: "shared-lines.write",
+				label: "Manage shared lines",
+				description:
+					"Create and edit shared lines, add and remove appearances, and set the ring, " +
+					"hold-recall and barge-in behaviour.",
+			},
+			{
+				permission: "shared-lines.delete",
+				label: "Delete shared lines",
+				description: "Remove a shared line.",
 			},
 		],
 	},

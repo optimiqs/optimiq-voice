@@ -19,6 +19,7 @@ import {
 } from "./queues-schema";
 import { pbxRelations } from "./relations";
 import { SIP_ACL_SCOPES } from "./security-schema";
+import { SHARED_LINE_STRATEGIES } from "./shared-lines-schema";
 import { pbxTables } from "./tables";
 import { TIME_CONDITION_OVERRIDES } from "./time-conditions-schema";
 import { VOICEMAIL_FOLDERS, VOICEMAIL_TRANSCRIPTION_STATUSES } from "./voicemail-schema";
@@ -38,6 +39,7 @@ const CONST_TUPLES = {
 	QUEUE_AGENT_STATUSES,
 	QUEUE_STRATEGIES,
 	RECORD_POLICIES,
+	SHARED_LINE_STRATEGIES,
 	SIP_ACL_SCOPES,
 	TIME_CONDITION_OVERRIDES,
 	TOLL_CLASSES,
@@ -476,6 +478,97 @@ describe("paging groups", () => {
 		]);
 		expect(groupConfig.enableRLS).toBe(true);
 		expect(memberConfig.enableRLS).toBe(true);
+	});
+});
+
+describe("shared lines", () => {
+	const lineConfig = getTableConfig(pbxTables.sharedLine);
+	const appearanceConfig = getTableConfig(pbxTables.sharedLineAppearance);
+	const lineColumns = new Map(lineConfig.columns.map((column) => [column.name, column]));
+	const appearanceColumns = new Map(
+		appearanceConfig.columns.map((column) => [column.name, column]),
+	);
+
+	it("names the line's dialable number nullable, so shared-key-only lines stay expressible", () => {
+		const column = lineColumns.get("extension_number");
+		expect(column).toBeDefined();
+		expect(column?.getSQLType()).toBe("text");
+		expect(column?.notNull).toBe(false);
+		expect(column?.hasDefault).toBe(false);
+	});
+
+	it("makes the number index partial, so two lines without one do not collide", () => {
+		const index = lineConfig.indexes.find(
+			(candidate) => candidate.config.name === "shared_line_organization_extension_number_key",
+		);
+		expect(index?.config.unique).toBe(true);
+		expect(index?.config.where).toBeDefined();
+		expect(JSON.stringify(index?.config.where?.queryChunks)).toContain("extension_number");
+	});
+
+	it("defaults to simultaneous ringing, a one-minute hold recall, and no barge-in", () => {
+		expect(lineColumns.get("strategy")?.getSQLType()).toBe("text");
+		expect(lineColumns.get("strategy")?.notNull).toBe(true);
+		expect(lineColumns.get("strategy")?.default).toBe("simultaneous");
+		expect(lineColumns.get("ring_timeout_seconds")?.default).toBe(30);
+		expect(lineColumns.get("hold_recall_timeout_seconds")?.getSQLType()).toBe("integer");
+		expect(lineColumns.get("hold_recall_timeout_seconds")?.notNull).toBe(true);
+		expect(lineColumns.get("hold_recall_timeout_seconds")?.default).toBe(60);
+		expect(lineColumns.get("barge_in_enabled")?.getSQLType()).toBe("boolean");
+		expect(lineColumns.get("barge_in_enabled")?.default).toBe(false);
+		expect(lineColumns.get("enabled")?.default).toBe(true);
+	});
+
+	it("holds appearances on their own table, ordered and cascading from both parents", () => {
+		expect(appearanceColumns.get("ordinal")?.getSQLType()).toBe("integer");
+		expect(appearanceColumns.get("ordinal")?.notNull).toBe(true);
+		expect(appearanceColumns.get("shared_line_id")?.notNull).toBe(true);
+		expect(appearanceColumns.get("extension_id")?.notNull).toBe(true);
+		expect(appearanceColumns.get("enabled")?.default).toBe(true);
+
+		const targets = appearanceConfig.foreignKeys.map((foreignKey) => ({
+			column: foreignKey.reference().columns[0]?.name,
+			table: getTableName(foreignKey.reference().foreignTable),
+			onDelete: foreignKey.onDelete,
+		}));
+		expect(targets).toContainEqual({
+			column: "shared_line_id",
+			table: "shared_line",
+			onDelete: "cascade",
+		});
+		expect(targets).toContainEqual({
+			column: "extension_id",
+			table: "extension",
+			onDelete: "cascade",
+		});
+	});
+
+	it("refuses a duplicate appearance and a duplicate index within one line", () => {
+		const unique = appearanceConfig.indexes
+			.filter((candidate) => candidate.config.unique)
+			.map((candidate) => ({
+				name: candidate.config.name,
+				columns: candidate.config.columns.map((entry) => ("name" in entry ? entry.name : "")),
+			}));
+		expect(unique).toContainEqual({
+			name: "shared_line_appearance_line_extension_key",
+			columns: ["organization_id", "shared_line_id", "extension_id"],
+		});
+		expect(unique).toContainEqual({
+			name: "shared_line_appearance_line_ordinal_key",
+			columns: ["organization_id", "shared_line_id", "ordinal"],
+		});
+	});
+
+	it("isolates both tables by tenant under the harness naming convention", () => {
+		expect(lineConfig.policies.map((policy) => policy.name)).toEqual([
+			"shared_line_tenant_isolation",
+		]);
+		expect(appearanceConfig.policies.map((policy) => policy.name)).toEqual([
+			"shared_line_appearance_tenant_isolation",
+		]);
+		expect(lineConfig.enableRLS).toBe(true);
+		expect(appearanceConfig.enableRLS).toBe(true);
 	});
 });
 
