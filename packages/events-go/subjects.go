@@ -19,6 +19,7 @@ import (
 //	voicemail.evt.v1.<orgId>.<mailboxId>.<event>  event = message.left | mwi.updated
 //	media.evt.v1.<orgId>.<sessionId>.<event>   event = session.ended | session.rtp-timeout |
 //	                                                   playback.finished | recording.finished
+//	trunk.evt.v1.<orgId>.<trunkId>.<event>     event = status.changed
 //	cdr.leg.v1.<orgId>                         one subject per org; the type is in the envelope
 //	audit.evt.v1.<orgId>
 //	provision.evt.v1.<orgId>
@@ -42,6 +43,7 @@ const (
 	SubjectRootQueue        = "queue.evt." + SubjectVersion
 	SubjectRootVoicemail    = "voicemail.evt." + SubjectVersion
 	SubjectRootMedia        = "media.evt." + SubjectVersion
+	SubjectRootTrunk        = "trunk.evt." + SubjectVersion
 	SubjectRootCDRLeg       = "cdr.leg." + SubjectVersion
 	SubjectRootAudit        = "audit.evt." + SubjectVersion
 	SubjectRootProvision    = "provision.evt." + SubjectVersion
@@ -62,6 +64,7 @@ const (
 	FamilyQueue        EventFamily = "queue"
 	FamilyVoicemail    EventFamily = "voicemail"
 	FamilyMedia        EventFamily = "media"
+	FamilyTrunk        EventFamily = "trunk"
 	FamilyCDR          EventFamily = "cdr"
 	FamilyAudit        EventFamily = "audit"
 	FamilyProvision    EventFamily = "provision"
@@ -74,6 +77,7 @@ var EventFamilies = []EventFamily{
 	FamilyQueue,
 	FamilyVoicemail,
 	FamilyMedia,
+	FamilyTrunk,
 	FamilyCDR,
 	FamilyAudit,
 	FamilyProvision,
@@ -309,6 +313,28 @@ func MediaSubject(orgID, sessionID, event string) (string, error) {
 	return SubjectRootMedia + "." + org + "." + session + "." + name, nil
 }
 
+// TrunkSubject builds trunk.evt.v1.<orgId>.<trunkId>.<event>.
+//
+// trunkID is the trunk ROW id, not the trunk's name: the name is what the media server addresses
+// (it is the PJSIP endpoint), but a tenant may rename a trunk while it is down, and a subject that
+// moved under a rename would strand a durable consumer's ordering mid-outage. The name travels in
+// the payload.
+func TrunkSubject(orgID, trunkID, event string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	trunk, err := token("trunkId", trunkID)
+	if err != nil {
+		return "", err
+	}
+	name, err := eventName(event)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootTrunk + "." + org + "." + trunk + "." + name, nil
+}
+
 // CDRLegSubject builds cdr.leg.v1.<orgId> — a single ordered subject per org.
 func CDRLegSubject(orgID string) (string, error) {
 	org, err := token("orgId", orgID)
@@ -539,6 +565,30 @@ func MediaEventInOrgFilter(orgID, event string) (string, error) {
 	return SubjectRootMedia + "." + org + ".*." + name, nil
 }
 
+// AllTrunksFilter matches every trunk event — the TRUNKS stream's subjects.
+func AllTrunksFilter() string { return SubjectRootTrunk + ".>" }
+
+// TrunksInOrgFilter matches every trunk event of one org.
+func TrunksInOrgFilter(orgID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootTrunk + "." + org + ".>", nil
+}
+
+// TrunkStatusInOrgFilter matches status.changed across every trunk of one org.
+//
+// The event name is DOTTED, so the tail is two tokens and the trunk wildcard cannot be a ">":
+// trunk.evt.v1.<org>.> would be the whole family, and a trailing ".*.*" would match nothing.
+func TrunkStatusInOrgFilter(orgID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootTrunk + "." + org + ".*.status.changed", nil
+}
+
 // AllCDRLegsFilter matches every org's CDR subject. One token, so "*" not ">".
 func AllCDRLegsFilter() string { return SubjectRootCDRLeg + ".*" }
 
@@ -571,6 +621,7 @@ const (
 	KindQueue        SubjectKind = "queue"
 	KindVoicemail    SubjectKind = "voicemail"
 	KindMedia        SubjectKind = "media"
+	KindTrunk        SubjectKind = "trunk"
 	KindCDRLeg       SubjectKind = "cdr-leg"
 	KindAudit        SubjectKind = "audit"
 	KindProvision    SubjectKind = "provision"
@@ -597,6 +648,8 @@ type ParsedSubject struct {
 	MailboxID string
 	// SessionID is set for KindMedia.
 	SessionID string
+	// TrunkID is set for KindTrunk.
+	TrunkID string
 	// Event is the (possibly dotted) event name, for the four per-entity families.
 	//
 	// It is returned as a plain string, not a checked vocabulary member: a v1.n producer may emit
@@ -659,6 +712,11 @@ func ParseSubject(subject string) (ParsedSubject, bool) {
 		return ParsedSubject{
 			Kind: KindMedia, Family: string(FamilyMedia), Version: version,
 			OrgID: rest[0], SessionID: rest[1], Event: strings.Join(rest[2:], "."),
+		}, true
+	case prefix == "trunk.evt" && len(rest) >= 3:
+		return ParsedSubject{
+			Kind: KindTrunk, Family: string(FamilyTrunk), Version: version,
+			OrgID: rest[0], TrunkID: rest[1], Event: strings.Join(rest[2:], "."),
 		}, true
 	case prefix == "cdr.leg" && len(rest) == 1:
 		return ParsedSubject{

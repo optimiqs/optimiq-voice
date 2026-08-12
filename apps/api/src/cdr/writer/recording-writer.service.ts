@@ -1,4 +1,10 @@
-import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
+import {
+	Inject,
+	Injectable,
+	Optional,
+	type OnApplicationShutdown,
+	type OnModuleInit,
+} from "@nestjs/common";
 import { connect, type NatsConnection } from "nats";
 import {
 	buildCallLegEnrichmentQuery,
@@ -10,6 +16,7 @@ import {
 import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import { getLogger } from "@optimiq-voice/logging";
 import { isArchivingObjectStore } from "../../storage";
+import { RECORDING_RETENTION_POLICY } from "../recordings/retention-policy";
 import { CDR_DATABASE, CDR_ENV, CDR_RECORDING_STORE } from "../shared/cdr.tokens";
 import { quarantineMessage } from "./cdr-quarantine";
 import {
@@ -20,6 +27,7 @@ import {
 	type DurableMessage,
 } from "./durable-consumer";
 import type { ObjectStore } from "../../storage";
+import type { RecordingRetentionPolicy } from "../recordings/retention-policy";
 import type { CdrEnv } from "../shared/cdr-env";
 import type { CdrDatabaseClient, RecordingKind } from "@optimiq-voice/cdr-db";
 
@@ -109,6 +117,14 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 		@Inject(CDR_ENV) private readonly env: CdrEnv,
 		@Inject(CDR_DATABASE) private readonly database: CdrDatabaseClient,
 		@Inject(CDR_RECORDING_STORE) private readonly store: ObjectStore,
+		/**
+		 * The per-organization retention window, implemented on the PBX side of the port and
+		 * therefore OPTIONAL: `CdrModule` boots without the PBX area, and in that deployment this
+		 * is simply absent and the platform env decides — see `retention-policy.ts`.
+		 */
+		@Optional()
+		@Inject(RECORDING_RETENTION_POLICY)
+		private readonly retentionPolicy?: RecordingRetentionPolicy,
 	) {}
 
 	get stats(): {
@@ -294,15 +310,43 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 	 * When this recording becomes eligible for purging, or `null` for "keep indefinitely".
 	 *
 	 * Computed at WRITE time from the window in force now, never re-derived on the sweep — see
-	 * `CDR_RECORDING_RETENTION_DAYS`. `null` is the default and is what leaves a row invisible to
-	 * the sweeper forever, which is the pre-existing behaviour of every row already in the table.
+	 * `CDR_RECORDING_RETENTION_DAYS`. `null` leaves a row invisible to the sweeper forever, which
+	 * is the pre-existing behaviour of every row already in the table.
+	 *
+	 * The organization's own window wins when there is one: the port answers a number (an explicit
+	 * `0` included — the tenant may out-keep the platform) and the env is the fall-back for the
+	 * three absences — no PBX area mounted, no window ever set, or the policy read failing. The
+	 * failure case falls back rather than NAKs deliberately: redelivering a recording event
+	 * because a SETTINGS read failed would hold recording metadata hostage to the other database's
+	 * uptime, and stamping the platform floor is what every release before the port did for every
+	 * recording. Async now, so both call sites await it BEFORE opening their write transaction —
+	 * a cross-database read has no business inside `withCdrWriterScope`.
 	 */
-	private retentionUntil(): Date | null {
-		const days = this.env.CDR_RECORDING_RETENTION_DAYS;
+	private async retentionUntil(organizationId: string): Promise<Date | null> {
+		const days = await this.retentionDaysFor(organizationId);
 		if (days <= 0) {
 			return null;
 		}
 		return new Date(Date.now() + days * 24 * 60 * 60 * 1_000);
+	}
+
+	/** The org's window through the port, or the platform's `CDR_RECORDING_RETENTION_DAYS`. */
+	private async retentionDaysFor(organizationId: string): Promise<number> {
+		if (this.retentionPolicy !== undefined) {
+			try {
+				const days = await this.retentionPolicy.retentionDaysFor(organizationId);
+				if (days !== undefined) {
+					return days;
+				}
+			} catch (error) {
+				logger.warn(
+					{ organizationId, err: String(error) },
+					"could not read the organization's recording retention window; stamping the " +
+						"platform default for this recording",
+				);
+			}
+		}
+		return this.env.CDR_RECORDING_RETENTION_DAYS;
 	}
 
 	/** Creates the metadata row. Idempotent on `object_key`, which is unique across the bucket. */
@@ -311,6 +355,7 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 		callId: string,
 		data: RecordEventData,
 	): Promise<void> {
+		const retentionUntil = await this.retentionUntil(organizationId);
 		await withCdrWriterScope(this.database.adminDb, organizationId, async (transaction) => {
 			const written = await transaction
 				.insert(recordings)
@@ -322,7 +367,7 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 					objectKey: data.objectKey,
 					durationMs: 0,
 					sizeBytes: 0,
-					retentionUntil: this.retentionUntil(),
+					retentionUntil,
 				})
 				.onConflictDoNothing()
 				.returning({ id: recordings.id });
@@ -351,6 +396,7 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 		const durationMs = typeof data.durationMs === "number" ? Math.max(0, data.durationMs) : 0;
 		const sizeBytes = typeof data.bytes === "number" ? Math.max(0, data.bytes) : 0;
 		const usable = data.reason !== "failed" && durationMs > 0;
+		const retentionUntil = await this.retentionUntil(organizationId);
 
 		await withCdrWriterScope(this.database.adminDb, organizationId, async (transaction) => {
 			await transaction
@@ -363,7 +409,7 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 					objectKey: data.objectKey,
 					durationMs,
 					sizeBytes,
-					retentionUntil: this.retentionUntil(),
+					retentionUntil,
 				})
 				.onConflictDoUpdate({
 					target: recordings.objectKey,

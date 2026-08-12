@@ -180,6 +180,33 @@ export const MEDIA_STREAM: StreamDefinition = {
 };
 
 /**
+ * `TRUNKS` — carrier reachability transitions on their way to the `trunk.status*` columns.
+ *
+ * Modelled on `REGISTRATIONS`, because it is the same kind of stream one hop out: the edge's
+ * verdict on whether a peer answers, where the persisted row is the eventually-consistent view and
+ * the stream is the transition log behind it. `discard: old` for the same reason too — a newer
+ * status supersedes a lost one, and the durable writer only ever wants the latest truth per trunk.
+ *
+ * 7 days rather than registration's 24 hours: a trunk transition is RARE (the producer publishes
+ * changes, not qualify ticks), so the stream is nearly empty at any retention, and a week is what
+ * lets "when did carrier-a start flapping?" be answered on Monday about a weekend.
+ */
+export const TRUNKS_STREAM: StreamDefinition = {
+	name: "TRUNKS",
+	description: "Carrier trunk status transitions consumed durably by the pbx writer (audit 4.5).",
+	subjects: [subjectFilterFor.allTrunks()],
+	retention: "limits",
+	storage: "file",
+	discard: "old",
+	maxAgeMs: 7 * DAY_MS,
+	maxMsgs: -1,
+	maxBytes: 1 * GIB,
+	maxMsgsPerSubject: -1,
+	duplicateWindowMs: 2 * MINUTE_MS,
+	numReplicas: 1,
+};
+
+/**
  * `CDR` — per-leg call records on their way to `cdr-db`. "Replay = rebuild": the 30-day window is
  * how far back the CDR table can be reconstructed from the log alone. A wider `duplicate_window`
  * than the rest because a crash-looping writer may retry the same leg minutes later.
@@ -238,6 +265,7 @@ export const EVENT_STREAMS: readonly StreamDefinition[] = [
 	QUEUES_STREAM,
 	VOICEMAIL_STREAM,
 	MEDIA_STREAM,
+	TRUNKS_STREAM,
 	CDR_STREAM,
 	AUDIT_STREAM,
 	PROVISION_STREAM,

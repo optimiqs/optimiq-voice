@@ -12,6 +12,13 @@ import { cdrTenantContext } from "./cdr-context";
  * `recordings` is `read-write`: the retention lifecycle mutates `deleted_at`, and tenants may
  * correct ownership metadata.
  *
+ * `cdr_export_job` is `read-write` for the same class of reason, and the distinction is worth
+ * stating because it is the one that decides which mode a new table gets. The append-only tables
+ * are LEDGERS: a row records that something happened, and nothing that happens later can make it
+ * have happened differently. A recording row and an export row are LIFECYCLES: they are claimed,
+ * advanced and completed, and every one of those transitions is an UPDATE the tenant role has to
+ * be able to make.
+ *
  * `forceRowSecurity` is left false everywhere on purpose, and the harness asserts that in both
  * directions. The schema owner must stay able to bypass RLS: it runs the migrations, the
  * partition ensure/drop functions, and the writer's enrichment updates (see `writer.ts`).
@@ -26,6 +33,7 @@ export const cdrTenantRlsPreflightPlan: TenantRlsPreflightPlan = {
 	expectations: [
 		{ table: "call_events", mode: "append-only", forceRowSecurity: false },
 		{ table: "call_legs", mode: "append-only", forceRowSecurity: false },
+		{ table: "cdr_export_job", mode: "read-write", forceRowSecurity: false },
 		{ table: "recordings", mode: "read-write", forceRowSecurity: false },
 	],
 };

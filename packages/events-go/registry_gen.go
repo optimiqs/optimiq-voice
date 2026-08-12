@@ -57,6 +57,7 @@ var EventTypes = []EventTypeInfo{
 	{Family: FamilyMedia, Type: EventTypeMediaPlaybackFinished, SubjectTemplate: "media.evt.v1.<orgId>.<sessionId>.playback.finished"},
 	{Family: FamilyMedia, Type: EventTypeMediaRecordingFinished, SubjectTemplate: "media.evt.v1.<orgId>.<sessionId>.recording.finished"},
 	{Family: FamilyMedia, Type: EventTypeMediaDtmfReceived, SubjectTemplate: "media.evt.v1.<orgId>.<sessionId>.dtmf.received"},
+	{Family: FamilyTrunk, Type: EventTypeTrunkStatusChanged, SubjectTemplate: "trunk.evt.v1.<orgId>.<trunkId>.status.changed"},
 	{Family: FamilyCDR, Type: EventTypeCDRLegWrite, SubjectTemplate: "cdr.leg.v1.<orgId>"},
 	{Family: FamilyAudit, Type: EventTypeAuditRecorded, SubjectTemplate: "audit.evt.v1.<orgId>"},
 	{Family: FamilyProvision, Type: EventTypeProvisionDeviceRequested, SubjectTemplate: "provision.evt.v1.<orgId>"},
@@ -147,6 +148,8 @@ func NewDataFor(eventType string) any {
 		return new(MediaRecordingFinishedData)
 	case EventTypeMediaDtmfReceived:
 		return new(MediaDtmfReceivedData)
+	case EventTypeTrunkStatusChanged:
+		return new(TrunkStatusChangedData)
 	case EventTypeCDRLegWrite:
 		return new(CDRLegWriteData)
 	case EventTypeAuditRecorded:

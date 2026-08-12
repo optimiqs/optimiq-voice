@@ -48,15 +48,57 @@ describe("tenant tables", () => {
 	});
 
 	/**
-	 * `user_setting` was a cascade level nothing read. It is gone, and this is here so it cannot
-	 * come back as a table before the thing that would read it does — a user-scoped setting
-	 * catalogue, an `.own` permission pair and a resolver. See `settings-schema.ts`.
+	 * `user_setting` is BACK — this test used to assert its absence, and the inversion is the
+	 * point. The table was dropped because it was a cascade level nothing read, and the drop note
+	 * in `settings-schema.ts` named four prerequisites for its return: a user-scoped setting
+	 * catalogue, the `settings.read.own`/`settings.write.own` pair, a resolver, and a surface. All
+	 * four exist now, so the assertion flips from "it must not come back" to "it is here, shaped
+	 * the way the resolver needs it".
+	 *
+	 * Only the SCHEMA half of the prerequisites is assertable here: the catalogue, the resolver
+	 * and the surface live in `apps/api`, and `pbx-db` cannot import an application that depends
+	 * on it. Their assertions live where they live — `apps/api/test/pbx/orgSettings.test.ts` pins
+	 * that the catalogue marks a NON-EMPTY user-scoped set and that `resolveForUser` applies
+	 * `code default → org_setting → user_setting`. The permission pair is pinned by
+	 * `packages/auth`'s own registry spec.
 	 */
-	it("registers no settings level below the organization", () => {
+	it("registers the user settings level below the organization, shaped for the resolver", () => {
 		const names = tables.map((table) => getTableName(table));
 		expect(names).toContain("org_setting");
-		expect(names).not.toContain("user_setting");
-		expect(Object.keys(pbxTables)).not.toContain("userSetting");
+		expect(names).toContain("user_setting");
+		expect(Object.keys(pbxTables)).toContain("userSetting");
+
+		const config = getTableConfig(pbxTables.userSetting);
+		const columns = new Map(config.columns.map((column) => [column.name, column]));
+
+		// The owner: a better-auth user id from another database. TEXT and FK-less on purpose —
+		// this side does not own the identifier's shape, and a malformed id must be an unmatchable
+		// row rather than a cast error that rolls back a preferences save.
+		expect(columns.get("user_id")?.getSQLType()).toBe("text");
+		expect(columns.get("user_id")?.notNull).toBe(true);
+		expect(config.foreignKeys).toEqual([]);
+
+		// The same value shape as `org_setting`, because the resolver overlays the levels by name.
+		expect(columns.get("value")?.getSQLType()).toBe("jsonb");
+		expect(columns.get("value_type")?.default).toBe("string");
+		expect(columns.get("enabled")?.default).toBe(true);
+
+		// One override per person per setting, and the preferences screen's read path.
+		const unique = config.indexes.find(
+			(candidate) => candidate.config.name === "user_setting_organization_user_category_name_key",
+		);
+		expect(unique?.config.unique).toBe(true);
+		expect(unique?.config.columns.map((entry) => ("name" in entry ? entry.name : ""))).toEqual([
+			"organization_id",
+			"user_id",
+			"category",
+			"name",
+		]);
+		expect(
+			config.indexes.some(
+				(candidate) => candidate.config.name === "user_setting_organization_user_idx",
+			),
+		).toBe(true);
 	});
 
 	it("scopes every table to an organization and enables row-level security", () => {

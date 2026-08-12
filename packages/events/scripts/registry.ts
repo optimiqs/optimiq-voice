@@ -21,6 +21,7 @@ import {
 	tapEndReasonSchema,
 	tapModeSchema,
 } from "../src/schemas/telephony";
+import { TRUNK_EVENT_DEFINITIONS } from "../src/schemas/trunk-events";
 import { VOICEMAIL_EVENT_DEFINITIONS } from "../src/schemas/voicemail-events";
 import type { EventFamily } from "../src/subjects";
 
@@ -201,6 +202,17 @@ function mediaEntry(type: keyof typeof MEDIA_EVENT_DEFINITIONS, goName: string):
 	};
 }
 
+function trunkEntry(type: keyof typeof TRUNK_EVENT_DEFINITIONS, goName: string): EventEntry {
+	return {
+		family: "trunk",
+		type,
+		goName: `${goName}Data`,
+		goConst: `EventType${goName}`,
+		data: TRUNK_EVENT_DEFINITIONS[type].data,
+		subjectTemplate: `trunk.evt.v1.<orgId>.<trunkId>.${type}`,
+	};
+}
+
 function provisionEntry(
 	type: keyof typeof PROVISION_EVENT_DEFINITIONS,
 	goName: string,
@@ -262,6 +274,8 @@ export const EVENT_ENTRIES: readonly EventEntry[] = [
 	mediaEntry("playback.finished", "MediaPlaybackFinished"),
 	mediaEntry("recording.finished", "MediaRecordingFinished"),
 	mediaEntry("dtmf.received", "MediaDtmfReceived"),
+
+	trunkEntry("status.changed", "TrunkStatusChanged"),
 
 	{
 		family: "cdr",
@@ -476,6 +490,7 @@ export const FAMILY_ORDER: readonly EventFamily[] = [
 	"queue",
 	"voicemail",
 	"media",
+	"trunk",
 	"cdr",
 	"audit",
 	"provision",
@@ -488,6 +503,7 @@ export const FAMILY_FILE: Readonly<Record<EventFamily, string>> = {
 	queue: "queue_events",
 	voicemail: "voicemail_events",
 	media: "media_events",
+	trunk: "trunk_events",
 	cdr: "cdr_events",
 	audit: "audit_events",
 	provision: "provision_events",

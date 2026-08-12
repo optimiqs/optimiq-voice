@@ -8,6 +8,7 @@ import { makeMediaEvent } from "./schemas/media-events";
 import { makeProvisionEvent } from "./schemas/provision-events";
 import { makeQueueEvent } from "./schemas/queue-events";
 import { makeRegistrationEvent } from "./schemas/registration-events";
+import { makeTrunkEvent } from "./schemas/trunk-events";
 import { makeVoicemailEvent } from "./schemas/voicemail-events";
 import { EVENT_FAMILIES, RPC_SUBJECTS, subjectFor } from "./subjects";
 import {
@@ -83,6 +84,12 @@ const samples = {
 			reason: "released",
 			durationMs: 30_000,
 		},
+	}),
+	trunk: makeTrunkEvent("status.changed", {
+		orgId: ORG,
+		trunkId: createEntityId(),
+		source: "engine",
+		data: { status: "down", reason: "Unreachable", latencyMs: 900, endpoint: "carrier-a" },
 	}),
 	cdr: makeCdrLegWriteEvent({
 		orgId: ORG,

@@ -55,8 +55,18 @@ describe("parseLiveTopic", () => {
 		expect(parseLiveTopic("calls.evt.v1.>")).to.equal(undefined);
 	});
 
+	it("accepts the trunks topic", () => {
+		expect(parseLiveTopic("trunks")).to.deep.equal({ kind: "trunks" });
+	});
+
 	it("round-trips through the wire form", () => {
-		for (const name of ["registrations", "active-calls", "agent-state", `queue:${QUEUE_ID}`]) {
+		for (const name of [
+			"registrations",
+			"active-calls",
+			"agent-state",
+			"trunks",
+			`queue:${QUEUE_ID}`,
+		]) {
 			const topic = parseLiveTopic(name);
 			expect(topic, name).to.not.equal(undefined);
 			expect(formatLiveTopic(topic!)).to.equal(name);
@@ -75,15 +85,24 @@ describe("the permission mapping", () => {
 	it("reads active calls from the channel bucket AND the call stream", () => {
 		// A bucket says what IS and a stream says what CHANGED. A wallboard with only the first
 		// would have to redraw a whole table to show one leg answering.
-		expect(sourcesForTopic({ kind: "active-calls" })).to.deep.equal([
-			"channels-kv",
-			"call-events",
-		]);
+		expect(sourcesForTopic({ kind: "active-calls" })).to.deep.equal(["channels-kv", "call-events"]);
 	});
 
 	it("gates queue and agent-state on queues.monitor", () => {
 		expect(permissionForTopic({ kind: "queue", queueId: QUEUE_ID })).to.equal("queues.monitor");
 		expect(permissionForTopic({ kind: "agent-state" })).to.equal("queues.monitor");
+	});
+
+	/**
+	 * The voicemail argument, applied to carriers: the topic carries the same status word, reason
+	 * and round-trip time `GET /trunks` already returns to anyone holding `trunks.read`, so gating
+	 * "the same row, sooner" differently from the list would either protect nothing or leak the
+	 * carrier roster. One stream source and no bucket — the current statuses are the `trunk.status*`
+	 * columns the page has already fetched.
+	 */
+	it("gates trunks on trunks.read and reads only the trunk event stream", () => {
+		expect(permissionForTopic({ kind: "trunks" })).to.equal("trunks.read");
+		expect(sourcesForTopic({ kind: "trunks" })).to.deep.equal(["trunk-events"]);
 	});
 
 	/**

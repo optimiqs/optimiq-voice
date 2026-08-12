@@ -7,6 +7,7 @@ import {
 	liveChannelSchema,
 	queueEventSchema,
 	registrationBindingSchema,
+	trunkEventSchema,
 	voicemailEventSchema,
 } from "@optimiq-voice/events/schemas";
 import {
@@ -534,6 +535,13 @@ const SUBJECT_FILTER_FOR_SOURCE: Readonly<
 	 */
 	"voicemail-events": (organizationId) =>
 		subjectFilterFor.voicemailEventInOrg(organizationId, "mwi.updated"),
+	/**
+	 * The whole family, unlike the voicemail entry above, and the asymmetry is deliberate: the
+	 * family's one event IS the topic's payload, and there is no sibling on the root whose bytes
+	 * `trunks.read` should not see. If a second trunk event ever joins the family, this is the
+	 * line that decides whether it rides the topic.
+	 */
+	"trunk-events": (organizationId) => subjectFilterFor.trunksInOrg(organizationId),
 };
 
 /** Which contract each stream source's payloads are parsed against. */
@@ -541,13 +549,17 @@ const EVENT_SCHEMA_FOR_SOURCE: Readonly<
 	Partial<
 		Record<
 			LiveSource,
-			typeof callEventSchema | typeof queueEventSchema | typeof voicemailEventSchema
+			| typeof callEventSchema
+			| typeof queueEventSchema
+			| typeof voicemailEventSchema
+			| typeof trunkEventSchema
 		>
 	>
 > = {
 	"call-events": callEventSchema,
 	"queue-events": queueEventSchema,
 	"voicemail-events": voicemailEventSchema,
+	"trunk-events": trunkEventSchema,
 };
 
 /** Which bucket each KV-backed source reads. Stream sources map to `undefined`. */

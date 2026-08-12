@@ -22,10 +22,10 @@ import type { EventFamily } from "@optimiq-voice/events/subjects";
  * `type`, with the organization taken from the delivered subject and compared against the
  * subscription's own tenant by the dispatcher. A selector is a filter on WHAT, never on WHOSE.
  *
- * ## Why these four families and not the other four
+ * ## Why these four families and not the other five
  *
  * `call`, `queue`, `voicemail` and `cdr` are the ones an integrator has a use for: a screen-pop, a
- * wallboard, a missed-message alert, a billing export. The four that are absent are absent for
+ * wallboard, a missed-message alert, a billing export. The five that are absent are absent for
  * reasons rather than for effort:
  *
  * - `media` is the RTP plane's own lifecycle (`apps/mediad` session ended, playback finished). It
@@ -39,6 +39,14 @@ import type { EventFamily } from "@optimiq-voice/events/subjects";
  *   endpoint whose configuration is itself an audited change is a loop worth thinking about before
  *   opening.
  * - `provision` is device provisioning attempts, which carry credential-adjacent detail.
+ * - `trunk` is the one whose absence is closest to being wrong, so the reasoning is recorded in
+ *   full: a carrier going down is exactly the fact an integrator wants a callback for. But what
+ *   they want is an ALERT, and `trunk.status.changed` is a raw transition — a flapping trunk is a
+ *   POST per flap with no damping, no "still down" reminder and no resolution pairing, and
+ *   serving the raw event now would freeze that shape into the integrator contract before the
+ *   alerting semantics exist. The status still reaches tenants today through the trunk list's
+ *   persisted columns and the `trunks` live topic; when outage callbacks are built, they should
+ *   be built as alerts (damped, paired, resendable), not as this event with a URL on it.
  *
  * Adding one later is one entry in {@link WEBHOOK_FAMILIES} plus its stream in the dispatcher.
  */

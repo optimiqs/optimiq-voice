@@ -9,6 +9,7 @@
 		"queue": "queue.evt.v1",
 		"voicemail": "voicemail.evt.v1",
 		"media": "media.evt.v1",
+		"trunk": "trunk.evt.v1",
 		"cdrLeg": "cdr.leg.v1",
 		"audit": "audit.evt.v1",
 		"provision": "provision.evt.v1"
@@ -279,6 +280,13 @@
 			"subject": "media.evt.v1.<orgId>.<sessionId>.dtmf.received",
 			"dataSchema": "events/media.dtmf.received.schema.json",
 			"goType": "MediaDtmfReceivedData"
+		},
+		{
+			"family": "trunk",
+			"type": "status.changed",
+			"subject": "trunk.evt.v1.<orgId>.<trunkId>.status.changed",
+			"dataSchema": "events/trunk.status.changed.schema.json",
+			"goType": "TrunkStatusChangedData"
 		},
 		{
 			"family": "cdr",

@@ -7,6 +7,7 @@
 		"queue": "queue.evt.v1",
 		"voicemail": "voicemail.evt.v1",
 		"media": "media.evt.v1",
+		"trunk": "trunk.evt.v1",
 		"cdrLeg": "cdr.leg.v1",
 		"audit": "audit.evt.v1",
 		"provision": "provision.evt.v1"
@@ -175,6 +176,15 @@
 			"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.session.rtp-timeout"
 		},
 		{
+			"builder": "trunk",
+			"args": [
+				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57",
+				"status.changed"
+			],
+			"subject": "trunk.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57.status.changed"
+		},
+		{
 			"builder": "cdrLeg",
 			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
 			"subject": "cdr.leg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
@@ -297,6 +307,21 @@
 			"result": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.*.session.ended"
 		},
 		{
+			"filter": "allTrunks",
+			"args": [],
+			"result": "trunk.evt.v1.>"
+		},
+		{
+			"filter": "trunksInOrg",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
+			"result": "trunk.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.>"
+		},
+		{
+			"filter": "trunkStatusInOrg",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
+			"result": "trunk.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.*.status.changed"
+		},
+		{
 			"filter": "allCdrLegs",
 			"args": [],
 			"result": "cdr.leg.v1.*"
@@ -381,6 +406,17 @@
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"sessionId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53",
 				"event": "session.rtp-timeout"
+			}
+		},
+		{
+			"subject": "trunk.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57.status.changed",
+			"parsed": {
+				"kind": "trunk",
+				"family": "trunk",
+				"version": "v1",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"trunkId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57",
+				"event": "status.changed"
 			}
 		},
 		{
@@ -646,6 +682,20 @@
 			"numReplicas": 1
 		},
 		{
+			"name": "TRUNKS",
+			"description": "Carrier trunk status transitions consumed durably by the pbx writer (audit 4.5).",
+			"subjects": ["trunk.evt.v1.>"],
+			"retention": "limits",
+			"storage": "file",
+			"discard": "old",
+			"maxAgeMs": 604800000,
+			"maxMsgs": -1,
+			"maxBytes": 1073741824,
+			"maxMsgsPerSubject": -1,
+			"duplicateWindowMs": 120000,
+			"numReplicas": 1
+		},
+		{
 			"name": "CDR",
 			"description": "Per-leg CDR writes consumed durably by the cdr-db writer (plan §3.5).",
 			"subjects": ["cdr.leg.v1.*"],
@@ -847,7 +897,8 @@
 			"playback.finished",
 			"recording.finished",
 			"dtmf.received"
-		]
+		],
+		"trunk": ["status.changed"]
 	},
 	"eventTypes": [
 		{
@@ -1039,6 +1090,11 @@
 			"family": "media",
 			"type": "dtmf.received",
 			"goType": "MediaDtmfReceivedData"
+		},
+		{
+			"family": "trunk",
+			"type": "status.changed",
+			"goType": "TrunkStatusChangedData"
 		},
 		{
 			"family": "cdr",
@@ -1423,10 +1479,28 @@
 			}
 		},
 		{
+			"name": "trunk.status.changed",
+			"goType": "TrunkStatusChangedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0011",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "trunk.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57.status.changed",
+				"type": "status.changed",
+				"source": "engine",
+				"data": {
+					"status": "down",
+					"reason": "Unreachable",
+					"latencyMs": 1240,
+					"endpoint": "carrier-a"
+				}
+			}
+		},
+		{
 			"name": "cdr.leg.write",
 			"goType": "CDRLegWriteData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0011",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0012",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "cdr.leg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -1465,7 +1539,7 @@
 			"name": "audit.recorded",
 			"goType": "AuditRecordedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0012",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0013",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "audit.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -1499,7 +1573,7 @@
 			"name": "provision.device.rejected",
 			"goType": "ProvisionDeviceRejectedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0013",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0014",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "provision.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",

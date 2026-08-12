@@ -17,6 +17,7 @@ import { createHash } from "node:crypto";
  * media.evt.v1.<orgId>.<sessionId>.<event>   event = session.ended | session.rtp-timeout |
  *                                                    playback.finished | recording.finished |
  *                                                    dtmf.received
+ * trunk.evt.v1.<orgId>.<trunkId>.<event>     event = status.changed
  * cdr.leg.v1.<orgId>                         one subject per org; event type is in the envelope
  * audit.evt.v1.<orgId>
  * provision.evt.v1.<orgId>
@@ -62,6 +63,7 @@ export const SUBJECT_ROOTS = {
 	queue: `queue.evt.${SUBJECT_VERSION}`,
 	voicemail: `voicemail.evt.${SUBJECT_VERSION}`,
 	media: `media.evt.${SUBJECT_VERSION}`,
+	trunk: `trunk.evt.${SUBJECT_VERSION}`,
 	cdrLeg: `cdr.leg.${SUBJECT_VERSION}`,
 	audit: `audit.evt.${SUBJECT_VERSION}`,
 	provision: `provision.evt.${SUBJECT_VERSION}`,
@@ -385,6 +387,21 @@ export const MEDIA_SESSION_EVENTS = [
 export type MediaSessionEvent = (typeof MEDIA_SESSION_EVENTS)[number];
 
 /**
+ * Trunk vocabulary — the SIP edge's verdict on a carrier, written back to the control plane.
+ *
+ * One member, and the name is doing deliberate work: `status.changed` is a TRANSITION, not a
+ * heartbeat. The media server qualifies every trunk on a timer (`qualify_frequency`), but a
+ * qualify that confirms what everybody already believed is not an event — publishing every tick
+ * would put a per-trunk metronome on the stream and a `trunk` row UPDATE behind each beat. The
+ * producer therefore publishes only when the answer CHANGES, and the payload's `status` vocabulary
+ * is pinned to `TRUNK_STATUSES` in `packages/pbx-db` (`trunks-schema.ts`) because the whole point
+ * of the event is to land in that column: a value the column cannot hold is an event the consumer
+ * can only drop.
+ */
+export const TRUNK_EVENTS = ["status.changed"] as const;
+export type TrunkEvent = (typeof TRUNK_EVENTS)[number];
+
+/**
  * Reserved queue-scope token for events that belong to the org rather than to one queue —
  * in practice `agent.state`, since an agent has one status across every tier they sit in.
  * Wallboards subscribe to `queue.evt.v1.<org>.>` and therefore see both scopes.
@@ -401,6 +418,7 @@ export const EVENT_FAMILIES = [
 	"queue",
 	"voicemail",
 	"media",
+	"trunk",
 	"cdr",
 	"audit",
 	"provision",
@@ -550,6 +568,17 @@ export const subjectFor = {
 	media(orgId: string, sessionId: string, event: MediaSessionEvent | (string & {})): string {
 		return `${SUBJECT_ROOTS.media}.${assertToken("orgId", orgId)}.${assertToken("sessionId", sessionId)}.${assertEvent(event)}`;
 	},
+	/**
+	 * `trunk.evt.v1.<orgId>.<trunkId>.<event>` — a carrier trunk's reachability transitions.
+	 *
+	 * `trunkId` is the `trunk` row id, not the trunk's name: the name is what the media server
+	 * knows (it IS the PJSIP endpoint), but a tenant may rename a trunk while it is down, and a
+	 * subject that moved under a rename would strand a durable consumer's ordering mid-outage.
+	 * The producer resolves name → id before publishing; the name travels in the payload.
+	 */
+	trunk(orgId: string, trunkId: string, event: TrunkEvent | (string & {})): string {
+		return `${SUBJECT_ROOTS.trunk}.${assertToken("orgId", orgId)}.${assertToken("trunkId", trunkId)}.${assertEvent(event)}`;
+	},
 	/** `cdr.leg.v1.<orgId>` — a single ordered subject per org; the CDR writer consumes it. */
 	cdrLeg(orgId: string): string {
 		return `${SUBJECT_ROOTS.cdrLeg}.${assertToken("orgId", orgId)}`;
@@ -688,6 +717,26 @@ export const subjectFilterFor = {
 		return `${SUBJECT_ROOTS.media}.${assertToken("orgId", orgId)}.*.${assertEvent(event)}`;
 	},
 
+	/** Every trunk event, every org — the TRUNKS stream's own subject list. */
+	allTrunks(): string {
+		return `${SUBJECT_ROOTS.trunk}.>`;
+	},
+	/** Every trunk event of one org — what the live fan-out subscribes for a wallboard. */
+	trunksInOrg(orgId: string): string {
+		return `${SUBJECT_ROOTS.trunk}.${assertToken("orgId", orgId)}.>`;
+	},
+	/**
+	 * `status.changed` across every trunk of one org.
+	 *
+	 * The event name is DOTTED, so the tail is two tokens and the trunk wildcard cannot be a `>`:
+	 * `trunk.evt.v1.<org>.>` would be the whole family, and `trunk.evt.v1.<org>.*.*` would match
+	 * nothing at all. The same seven-token arithmetic governs the broker grants in
+	 * `config/nats.conf`.
+	 */
+	trunkStatusInOrg(orgId: string): string {
+		return `${SUBJECT_ROOTS.trunk}.${assertToken("orgId", orgId)}.*.status.changed`;
+	},
+
 	/** `cdr.leg.v1.*` — the CDR writer's filter; one token, so `*` not `>`. */
 	allCdrLegs(): string {
 		return `${SUBJECT_ROOTS.cdrLeg}.*`;
@@ -751,6 +800,14 @@ export type ParsedSubject =
 			readonly version: string;
 			readonly orgId: string;
 			readonly sessionId: string;
+			readonly event: string;
+	  }
+	| {
+			readonly kind: "trunk";
+			readonly family: "trunk";
+			readonly version: string;
+			readonly orgId: string;
+			readonly trunkId: string;
 			readonly event: string;
 	  }
 	| {
@@ -847,6 +904,10 @@ export function parseSubject(subject: string): ParsedSubject | undefined {
 		const [orgId, sessionId, ...event] = rest as [string, string, ...string[]];
 		return { kind: "media", family: "media", version, orgId, sessionId, event: event.join(".") };
 	}
+	if (prefix === "trunk.evt" && rest.length >= 3) {
+		const [orgId, trunkId, ...event] = rest as [string, string, ...string[]];
+		return { kind: "trunk", family: "trunk", version, orgId, trunkId, event: event.join(".") };
+	}
 	if (prefix === "cdr.leg" && rest.length === 1) {
 		return { kind: "cdr-leg", family: "cdr", version, orgId: rest[0] as string };
 	}
@@ -898,6 +959,10 @@ export function isVoicemailEvent(value: string): value is VoicemailEvent {
 
 export function isMediaSessionEvent(value: string): value is MediaSessionEvent {
 	return (MEDIA_SESSION_EVENTS as readonly string[]).includes(value);
+}
+
+export function isTrunkEvent(value: string): value is TrunkEvent {
+	return (TRUNK_EVENTS as readonly string[]).includes(value);
 }
 
 /**

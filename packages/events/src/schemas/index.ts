@@ -412,6 +412,21 @@ export {
 	type TransferKind,
 } from "./telephony";
 export {
+	makeTrunkEvent,
+	TRUNK_EVENT_DEFINITIONS,
+	TRUNK_STATUS_VALUES,
+	trunkEventSchema,
+	trunkStatusChangedDataSchema,
+	trunkStatusSchema,
+	type TrunkEventDataOf,
+	type TrunkEventDefinitions,
+	type TrunkEventEnvelope,
+	type TrunkEventInput,
+	type TrunkEventOf,
+	type TrunkStatusChangedData,
+	type TrunkStatusValue,
+} from "./trunk-events";
+export {
 	makeVoicemailEvent,
 	VOICEMAIL_EVENT_DEFINITIONS,
 	voicemailEventSchema,

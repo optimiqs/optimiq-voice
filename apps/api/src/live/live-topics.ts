@@ -21,6 +21,14 @@ import { hasPermission, type Permission } from "@optimiq-voice/auth";
  * | `queue:<id>`     | `queues.monitor`   | Literally "Watch live queue and agent state"            |
  * | `agent-state`    | `queues.monitor`   | Same surface, org-wide rather than per queue            |
  * | `voicemail`      | `voicemail.read`   | The counts, which is strictly less than the list        |
+ * | `trunks`         | `trunks.read`      | A status transition is one row of the trunk list, sooner |
+ *
+ * `trunks → trunks.read` follows the voicemail argument exactly: the topic carries
+ * `trunk.evt.v1.<org>.<trunk>.status.changed`, whose payload is a status word, a reason and a
+ * round-trip time — the same columns `GET /trunks` already returns to anyone holding
+ * `trunks.read`. Gating "the same row, sooner" more tightly than the list would protect nothing
+ * while making the status pill disagree with the page under it; gating it more loosely would leak
+ * the carrier roster to roles that may not see it.
  *
  * `voicemail → voicemail.read` needs no argument at all, and that is the point of saying so: the
  * topic carries `voicemail.evt.v1.<org>.<mailbox>.mwi.updated`, whose whole payload is a mailbox
@@ -56,6 +64,7 @@ export const LIVE_TOPIC_KINDS = [
 	"queue",
 	"agent-state",
 	"voicemail",
+	"trunks",
 ] as const;
 export type LiveTopicKind = (typeof LIVE_TOPIC_KINDS)[number];
 
@@ -65,6 +74,7 @@ export type LiveTopic =
 	| { readonly kind: "active-calls" }
 	| { readonly kind: "agent-state" }
 	| { readonly kind: "voicemail" }
+	| { readonly kind: "trunks" }
 	| { readonly kind: "queue"; readonly queueId: string };
 
 export const LIVE_TOPIC_PERMISSIONS = {
@@ -73,6 +83,7 @@ export const LIVE_TOPIC_PERMISSIONS = {
 	queue: "queues.monitor",
 	"agent-state": "queues.monitor",
 	voicemail: "voicemail.read",
+	trunks: "trunks.read",
 } as const satisfies Record<LiveTopicKind, Permission>;
 
 /**
@@ -90,6 +101,7 @@ export const LIVE_SOURCES = [
 	"agent-state-kv",
 	"queue-events",
 	"voicemail-events",
+	"trunk-events",
 ] as const;
 export type LiveSource = (typeof LIVE_SOURCES)[number];
 
@@ -108,6 +120,13 @@ export const LIVE_TOPIC_SOURCES = {
 	 * number changed while somebody was looking at it.
 	 */
 	voicemail: ["voicemail-events"],
+	/**
+	 * One source, and no bucket behind it, on exactly the voicemail argument above: the current
+	 * statuses live in the `trunk.status*` columns and the trunk list has already fetched them
+	 * over HTTP. The stream is what tells an open page a carrier's status moved while somebody
+	 * was looking at it.
+	 */
+	trunks: ["trunk-events"],
 } as const satisfies Record<LiveTopicKind, readonly LiveSource[]>;
 
 /** A UUID, which is what every queue id on this platform is (`packages/identifiers`). */
@@ -126,7 +145,8 @@ export function parseLiveTopic(value: string): LiveTopic | undefined {
 		value === "registrations" ||
 		value === "active-calls" ||
 		value === "agent-state" ||
-		value === "voicemail"
+		value === "voicemail" ||
+		value === "trunks"
 	) {
 		return { kind: value };
 	}

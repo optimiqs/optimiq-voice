@@ -105,6 +105,11 @@ describe("webhook selectors", () => {
 			"media",
 			"provision",
 			"registration",
+			// Deliberately unserved, not forgotten: a raw status transition is the wrong shape for
+			// the outage callback an integrator actually wants (no damping, a flap per POST). See
+			// the family-by-family note in webhook-selectors.ts; the status reaches tenants via
+			// the trunk list's persisted columns and the `trunks` live topic instead.
+			"trunk",
 		]);
 		for (const family of WEBHOOK_FAMILIES) {
 			expect(isWebhookFamily(family), family).to.equal(true);

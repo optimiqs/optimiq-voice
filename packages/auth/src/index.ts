@@ -50,6 +50,7 @@ export {
 	type PermissionGroup,
 	type PermissionScope,
 	PERMISSIONS,
+	RETIRED_PERMISSIONS,
 	SYSTEM_ROLE_IDS,
 	SYSTEM_ROLE_TEMPLATES,
 	type SystemRoleId,

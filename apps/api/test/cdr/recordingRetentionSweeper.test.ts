@@ -1,5 +1,9 @@
 import { expect } from "chai";
 import { CdrRecordingRetentionSweeper } from "../../src/cdr/recordings/recording-retention-sweeper.service";
+import type {
+	PurgedRecordingAuditEntry,
+	RecordingPurgeAudit,
+} from "../../src/cdr/recordings/purge-audit";
 import type { CdrEnv } from "../../src/cdr/shared/cdr-env";
 import type { ObjectStore } from "../../src/storage";
 import type { CdrDatabaseClient } from "@optimiq-voice/cdr-db";
@@ -66,8 +70,25 @@ function env(overrides: Partial<CdrEnv> = {}): CdrEnv {
 	} as CdrEnv;
 }
 
-function due(id: string, key: string): Record<string, string> {
-	return { id, organization_id: ORG, object_key: key };
+function due(id: string, key: string, organizationId: string = ORG): Record<string, string> {
+	return { id, organization_id: organizationId, object_key: key };
+}
+
+/** The purge-audit port, recorded call by call. `refuse` makes every call throw. */
+function fakeAudit(refuse = false): RecordingPurgeAudit & {
+	readonly calls: { organizationId: string; entries: readonly PurgedRecordingAuditEntry[] }[];
+} {
+	const calls: { organizationId: string; entries: readonly PurgedRecordingAuditEntry[] }[] = [];
+	return {
+		calls,
+		recordAudit: async (organizationId, entries) => {
+			if (refuse) {
+				throw new Error("the pbx database is unreachable");
+			}
+			calls.push({ organizationId, entries });
+			await Promise.resolve();
+		},
+	};
 }
 
 describe("recording retention sweeper", () => {
@@ -149,6 +170,90 @@ describe("recording retention sweeper", () => {
 		await sweeper.sweep();
 
 		expect(statements).to.have.length(0);
+	});
+
+	/**
+	 * The audit row on delete. The port is optional and the ledger lives in another database, so
+	 * the cases worth pinning are the seam's own rules: only what actually went is recorded,
+	 * grouped per organization, after the tombstone, and a refusing ledger costs a log line and
+	 * never the purge.
+	 */
+	it("records each purged recording through the audit port, grouped by organization", async () => {
+		const otherOrg = "0299b2c3-d4e5-7f60-8a9b-1c2d3e4f5a6b";
+		const { database, statements } = fakeDatabase([
+			[
+				due("r1", `${ORG}/call-1/r1.wav`),
+				due("r2", `${otherOrg}/call-2/r2.wav`, otherOrg),
+				due("r3", `${ORG}/call-3/r3.wav`),
+			],
+			[{ id: "r1" }, { id: "r2" }, { id: "r3" }],
+			[],
+		]);
+		const audit = fakeAudit();
+		const sweeper = new CdrRecordingRetentionSweeper(env(), database, fakeStore(), audit);
+
+		await sweeper.sweep();
+
+		expect(audit.calls).to.have.length(2);
+		expect(audit.calls[0]?.organizationId).to.equal(ORG);
+		expect(audit.calls[0]?.entries.map((entry) => entry.recordingId)).to.deep.equal(["r1", "r3"]);
+		expect(audit.calls[0]?.entries[0]?.objectKey).to.equal(`${ORG}/call-1/r1.wav`);
+		expect(audit.calls[1]?.organizationId).to.equal(otherOrg);
+		expect(audit.calls[1]?.entries.map((entry) => entry.recordingId)).to.deep.equal(["r2"]);
+		// After the tombstone: the worklist SELECT and the soft delete had both executed before the
+		// port was called — the ledger must never claim a purge the next pass will retry.
+		expect(statements.length).to.be.greaterThanOrEqual(2);
+	});
+
+	it("audits only the recordings whose object actually went", async () => {
+		const { database } = fakeDatabase([
+			[due("r1", "keeps/failing.wav"), due("r2", "goes/away.wav")],
+			[{ id: "r2" }],
+			[],
+		]);
+		const audit = fakeAudit();
+		const sweeper = new CdrRecordingRetentionSweeper(
+			env(),
+			database,
+			fakeStore(["keeps/failing.wav"]),
+			audit,
+		);
+
+		await sweeper.sweep();
+
+		expect(audit.calls).to.have.length(1);
+		expect(audit.calls[0]?.entries.map((entry) => entry.recordingId)).to.deep.equal(["r2"]);
+	});
+
+	it("keeps purging when the audit ledger refuses — the sweep is not hostage to pbx-db", async () => {
+		const { database } = fakeDatabase([[due("r1", "a.wav")], [{ id: "r1" }], []]);
+		const store = fakeStore();
+		const sweeper = new CdrRecordingRetentionSweeper(env(), database, store, fakeAudit(true));
+
+		const result = await sweeper.sweep();
+
+		expect(store.deleted).to.deep.equal(["a.wav"]);
+		expect(result.purged).to.equal(1);
+		expect(result.tombstoned).to.equal(1);
+		// The refusal was swallowed, not counted as a failed pass: nothing needs redoing.
+		expect(sweeper.stats.failed).to.equal(0);
+	});
+
+	it("makes no audit calls when nothing was purged, and none without the port", async () => {
+		const audit = fakeAudit();
+		const idle = new CdrRecordingRetentionSweeper(
+			env(),
+			fakeDatabase([[], [], []]).database,
+			fakeStore(),
+			audit,
+		);
+		await idle.sweep();
+		expect(audit.calls).to.deep.equal([]);
+
+		// The port absent entirely — the PBX area not mounted — is the same sweep as ever.
+		const { database } = fakeDatabase([[due("r1", "a.wav")], [{ id: "r1" }], []]);
+		const portless = new CdrRecordingRetentionSweeper(env(), database, fakeStore());
+		expect((await portless.sweep()).purged).to.equal(1);
 	});
 
 	it("arms no timer when the sweep is disabled or the writers are off", () => {

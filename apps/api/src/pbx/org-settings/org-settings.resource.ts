@@ -1,4 +1,4 @@
-import { orgSetting } from "@optimiq-voice/pbx-db";
+import { orgSetting, userSetting } from "@optimiq-voice/pbx-db";
 import type { PbxResource } from "../shared/pbx-resource";
 
 /**
@@ -28,6 +28,34 @@ export const ORG_SETTING_RESOURCE: PbxResource = {
 	// cannot repeat a row when two settings share a category and a name across a rename.
 	orderBy: [orgSetting.category, orgSetting.name, orgSetting.id],
 	enabledColumn: orgSetting.enabled,
+	destinations: [],
+	destinationType: null,
+};
+
+/**
+ * The cascade's third level — one person's overrides.
+ *
+ * A `PbxResource` for a DIFFERENT reason than `org_setting` above: `affectsRouting("user_setting")`
+ * is FALSE (the compiler reads nothing user-scoped, by the catalogue's own rule), so the repository
+ * runs no recompile for it. What routing writes through the repository buys here is the other half
+ * of the machinery — the change ledger. A preference write is still a mutation somebody made, and
+ * `audit-log.service.ts`'s whole argument ("a committed write must leave a trace") applies to
+ * "who turned their own transcription copy off" exactly as it does to an extension. Writing these
+ * rows with a bare `withTenantScope` upsert would be the one write path in the area that leaves no
+ * ledger row.
+ *
+ * No controller mounts raw CRUD over this resource, deliberately: the only surface is
+ * `/org-settings/me`, whose service pins `userId` to the session. A generic `PbxResourceService`
+ * over this declaration would accept a `userId` in a body, which is exactly the input the own-ness
+ * argument says must not exist.
+ */
+export const USER_SETTING_RESOURCE: PbxResource = {
+	kind: "user-setting",
+	tableName: "user_setting",
+	table: userSetting,
+	searchColumns: [userSetting.category, userSetting.name],
+	orderBy: [userSetting.category, userSetting.name, userSetting.id],
+	enabledColumn: userSetting.enabled,
 	destinations: [],
 	destinationType: null,
 };

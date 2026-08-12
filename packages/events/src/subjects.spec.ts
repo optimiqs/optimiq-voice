@@ -11,6 +11,7 @@ import {
 	isQueueEvent,
 	isRegistrationEvent,
 	isSubjectToken,
+	isTrunkEvent,
 	matchesSubject,
 	parseSubject,
 	parseSubjectOrThrow,
@@ -23,12 +24,14 @@ import {
 	subjectFilterFor,
 	subjectFor,
 	SubjectTokenError,
+	TRUNK_EVENTS,
 	UnknownSubjectError,
 } from "./subjects";
 
 const ORG = "018f2b7c-0000-7000-8000-0000000000aa";
 const CALL = "018f2b7c-0000-7000-8000-0000000000bb";
 const QUEUE = "018f2b7c-0000-7000-8000-0000000000cc";
+const TRUNK = "018f2b7c-0000-7000-8000-0000000000dd";
 const AOR_HASH = aorSubjectToken("sip:1001@acme.example.com");
 
 describe("subject roots", () => {
@@ -40,6 +43,7 @@ describe("subject roots", () => {
 			queue: "queue.evt.v1",
 			voicemail: "voicemail.evt.v1",
 			media: "media.evt.v1",
+			trunk: "trunk.evt.v1",
 			cdrLeg: "cdr.leg.v1",
 			audit: "audit.evt.v1",
 			provision: "provision.evt.v1",
@@ -87,6 +91,7 @@ describe("subject roots", () => {
 			"provision",
 			"queue",
 			"registration",
+			"trunk",
 			"voicemail",
 		]);
 	});
@@ -102,6 +107,9 @@ describe("subjectFor", () => {
 		);
 		expect(subjectFor.queue(ORG, QUEUE, "caller.joined")).toBe(
 			`queue.evt.v1.${ORG}.${QUEUE}.caller.joined`,
+		);
+		expect(subjectFor.trunk(ORG, TRUNK, "status.changed")).toBe(
+			`trunk.evt.v1.${ORG}.${TRUNK}.status.changed`,
 		);
 		expect(subjectFor.cdrLeg(ORG)).toBe(`cdr.leg.v1.${ORG}`);
 		expect(subjectFor.audit(ORG)).toBe(`audit.evt.v1.${ORG}`);
@@ -235,6 +243,15 @@ describe("parseSubject round trip", () => {
 		expect(subjectFor.queue(parsed.orgId, parsed.queueId, parsed.event)).toBe(subject);
 	});
 
+	it("reverses a trunk subject, rejoining the dotted event tail", () => {
+		const subject = subjectFor.trunk(ORG, TRUNK, "status.changed");
+		const parsed = parseSubjectOrThrow(subject);
+		if (parsed.kind !== "trunk") throw new Error("unreachable");
+		expect(parsed.trunkId).toBe(TRUNK);
+		expect(parsed.event).toBe("status.changed");
+		expect(subjectFor.trunk(parsed.orgId, parsed.trunkId, parsed.event)).toBe(subject);
+	});
+
 	it.each([
 		["cdr-leg", subjectFor.cdrLeg(ORG), subjectFor.cdrLeg],
 		["audit", subjectFor.audit(ORG), subjectFor.audit],
@@ -300,6 +317,7 @@ describe("subject filters", () => {
 		expect(subjectFilterFor.allCalls()).toBe("calls.evt.v1.>");
 		expect(subjectFilterFor.allRegistrations()).toBe("sip.reg.v1.>");
 		expect(subjectFilterFor.allQueues()).toBe("queue.evt.v1.>");
+		expect(subjectFilterFor.allTrunks()).toBe("trunk.evt.v1.>");
 		expect(subjectFilterFor.allCdrLegs()).toBe("cdr.leg.v1.*");
 		expect(subjectFilterFor.allAudit()).toBe("audit.evt.v1.*");
 		expect(subjectFilterFor.allProvision()).toBe("provision.evt.v1.*");
@@ -310,6 +328,7 @@ describe("subject filters", () => {
 			[subjectFilterFor.allCalls(), subjectFor.call(ORG, CALL, "channel.record.started")],
 			[subjectFilterFor.allRegistrations(), subjectFor.registration(ORG, AOR_HASH, "registered")],
 			[subjectFilterFor.allQueues(), subjectFor.queue(ORG, QUEUE, "caller.joined")],
+			[subjectFilterFor.allTrunks(), subjectFor.trunk(ORG, TRUNK, "status.changed")],
 			[subjectFilterFor.allCdrLegs(), subjectFor.cdrLeg(ORG)],
 			[subjectFilterFor.allAudit(), subjectFor.audit(ORG)],
 			[subjectFilterFor.allProvision(), subjectFor.provision(ORG)],
@@ -364,6 +383,25 @@ describe("subject filters", () => {
 		).toBe(false);
 	});
 
+	it("scopes trunks to one org, and status transitions across its trunks", () => {
+		const otherOrg = "018f2b7c-0000-7000-8000-0000000000ff";
+		const mine = subjectFor.trunk(ORG, TRUNK, "status.changed");
+		expect(matchesSubject(subjectFilterFor.trunksInOrg(ORG), mine)).toBe(true);
+		expect(
+			matchesSubject(
+				subjectFilterFor.trunksInOrg(ORG),
+				subjectFor.trunk(otherOrg, TRUNK, "status.changed"),
+			),
+		).toBe(false);
+		// The dotted-tail arithmetic the filter's own comment describes: the event is TWO tokens,
+		// so the trunk wildcard is a `*` followed by the literal tail, never a `>`.
+		expect(subjectFilterFor.trunkStatusInOrg(ORG)).toBe(`trunk.evt.v1.${ORG}.*.status.changed`);
+		expect(matchesSubject(subjectFilterFor.trunkStatusInOrg(ORG), mine)).toBe(true);
+		expect(
+			matchesSubject(subjectFilterFor.trunkStatusInOrg(ORG), `trunk.evt.v1.${ORG}.${TRUNK}.other`),
+		).toBe(false);
+	});
+
 	it("scopes single-token families to one org", () => {
 		expect(subjectFilterFor.cdrLegsInOrg(ORG)).toBe(subjectFor.cdrLeg(ORG));
 		expect(subjectFilterFor.auditInOrg(ORG)).toBe(subjectFor.audit(ORG));
@@ -394,7 +432,9 @@ describe("event-name guards", () => {
 		expect(CALL_EVENTS.every(isCallEvent)).toBe(true);
 		expect(REGISTRATION_EVENTS.every(isRegistrationEvent)).toBe(true);
 		expect(QUEUE_EVENTS.every(isQueueEvent)).toBe(true);
+		expect(TRUNK_EVENTS.every(isTrunkEvent)).toBe(true);
 		expect(isCallEvent("channel.teleported")).toBe(false);
+		expect(isTrunkEvent("status.qualified")).toBe(false);
 	});
 
 	it("accepts hierarchical event names but not malformed ones", () => {

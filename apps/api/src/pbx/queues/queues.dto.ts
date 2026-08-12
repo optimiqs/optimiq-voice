@@ -29,6 +29,8 @@ export const createQueueDto = z.strictObject({
 	mohClassId: z.uuid().nullish(),
 	greetingPromptId: z.uuid().nullish(),
 	announcePromptId: z.uuid().nullish(),
+	/** Played to the agent alone on answer, before the caller is connected. `null` clears it. */
+	agentWhisperPromptId: z.uuid().nullish(),
 	/** 0 disables the cap and callers wait indefinitely. */
 	maxWaitSeconds: resettable(z.int().min(0).max(86_400)),
 	/** Ejects callers this fast when no agent is logged in at all. 0 disables. */

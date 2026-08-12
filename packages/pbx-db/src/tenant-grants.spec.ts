@@ -12,11 +12,19 @@ import { PBX_APPEND_ONLY_TABLES, PBX_TENANT_TABLES } from "./rls-preflight-plan"
  */
 const migrationsFolder = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../drizzle");
 
-function readMigrationSql(): string {
+/**
+ * The migration SQL, one string per migration, in the order the journal applies them (the folder
+ * names lead with a timestamp, so a lexicographic sort IS application order). The order matters
+ * now: `user_setting` was granted in the baseline, dropped, and granted again when it returned,
+ * and only a reading that replays history can tell that apart from a grant that a later drop
+ * revoked.
+ */
+function readMigrationsInOrder(): readonly string[] {
 	return readdirSync(migrationsFolder, { withFileTypes: true })
 		.filter((entry) => entry.isDirectory())
-		.map((entry) => readFileSync(path.join(migrationsFolder, entry.name, "migration.sql"), "utf8"))
-		.join("\n");
+		.map((entry) => entry.name)
+		.sort((left, right) => left.localeCompare(right))
+		.map((name) => readFileSync(path.join(migrationsFolder, name, "migration.sql"), "utf8"));
 }
 
 /** Grant statements, split so a table name can be attributed to the privilege list above it. */
@@ -34,13 +42,17 @@ function grantBlocks(sql: string): { privileges: string; tables: readonly string
 }
 
 /**
- * Tables a later migration dropped.
+ * Tables one migration drops.
  *
  * A `DROP TABLE` takes its grants with it, so a table that was granted and then dropped is not a
  * privilege anybody holds — but the GRANT statement is still sitting in the migration history this
- * spec reads, and without this it would look like one. Subtracting the drops is what lets a table
- * be REMOVED from the schema without the spec demanding a revoke migration that Postgres does not
- * need.
+ * spec reads, and without accounting for the drop it would look like one. The drops used to be
+ * subtracted globally; that stopped being right the day `user_setting` came BACK — a global
+ * subtraction reads "granted, dropped, granted again" as "not granted", which is the opposite of
+ * what the database ends up holding. So the history is replayed instead: migration by migration,
+ * a drop erases the grants recorded so far and a later grant records a privilege the drop never
+ * saw. Within one migration the drops are applied first, which matches the only shape that exists
+ * (a re-creation grants in a LATER migration than the drop, never the same one).
  */
 function droppedTables(sql: string): ReadonlySet<string> {
 	return new Set(
@@ -50,14 +62,19 @@ function droppedTables(sql: string): ReadonlySet<string> {
 	);
 }
 
-const sql = readMigrationSql();
-const blocks = grantBlocks(sql);
-const dropped = droppedTables(sql);
-const grantedPrivileges = new Map<string, string>(
-	blocks
-		.flatMap((block) => block.tables.map((table) => [table, block.privileges] as const))
-		.filter(([table]) => !dropped.has(table)),
-);
+const migrations = readMigrationsInOrder();
+const sql = migrations.join("\n");
+const grantedPrivileges = new Map<string, string>();
+for (const migrationSql of migrations) {
+	for (const table of droppedTables(migrationSql)) {
+		grantedPrivileges.delete(table);
+	}
+	for (const block of grantBlocks(migrationSql)) {
+		for (const table of block.tables) {
+			grantedPrivileges.set(table, block.privileges);
+		}
+	}
+}
 
 describe("tenant role grants", () => {
 	it("grants schema usage exactly once", () => {

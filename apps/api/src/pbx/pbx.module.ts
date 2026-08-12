@@ -11,6 +11,8 @@ import {
 } from "../transcription";
 import { AuditLogQueryService } from "./audit-log/audit-log-query.service";
 import { AuditLogController } from "./audit-log/audit-log.controller";
+import { CallBlockController } from "./call-block/call-block.controller";
+import { CallBlockService } from "./call-block/call-block.service";
 import { CallsController } from "./calls/calls.controller";
 import { CallsService } from "./calls/calls.service";
 import { CarrierWebhookController } from "./carrier/carrier-webhook.controller";
@@ -94,6 +96,7 @@ import {
 	TimeConditionRulesService,
 	TimeConditionsService,
 } from "./time-conditions/time-conditions.service";
+import { TrunkStatusConsumer } from "./trunks/trunk-status-consumer.service";
 import { TrunksController } from "./trunks/trunks.controller";
 import { TrunksService } from "./trunks/trunks.service";
 import { FileGreetingRpcController } from "./voicemail-boxes/file-greeting-rpc.controller";
@@ -223,6 +226,17 @@ const logger = getLogger("api.pbx");
 		PromptsController,
 		EmergencyAddressesController,
 		FeatureCodesController,
+		/**
+		 * Caller screening, mounted beside the star codes because they share a schema file and a
+		 * question: what the tenant's dial plan does BEFORE it looks anything up.
+		 *
+		 * The routing package has enforced `call_block_rule` on all three resolution paths since the
+		 * compiler learned `checkCallBlock`; this controller is the first way to put a row in it that
+		 * is not `psql`. `affectsRouting("call_block_rule")` is TRUE, so it goes through the same
+		 * repository and the same compile-on-write as the other resources here — a saved rule is
+		 * enforced on the next call, not on the next publish.
+		 */
+		CallBlockController,
 		/**
 		 * The settings cascade's middle level.
 		 *
@@ -556,6 +570,15 @@ const logger = getLogger("api.pbx");
 		ExtensionFeatureService,
 		PhoneNumbersService,
 		TrunksService,
+		/**
+		 * The trunk status write-back: the durable consumer of `trunk.evt.v1.*.*.status.changed`,
+		 * and the ONLY thing that writes the `trunk.status*` columns. Registered unconditionally,
+		 * on the terms `EmergencyConsumer` below records: without `NATS_URL` it logs once at boot
+		 * and stays idle. It deliberately does NOT go through `TrunksService` — see its own header
+		 * for why the DTO cannot carry these columns and why `affectsRouting("trunk")` makes the
+		 * repository path wrong for a status tick.
+		 */
+		TrunkStatusConsumer,
 		InboundRoutesService,
 		OutboundRoutesService,
 		TimeConditionsService,
@@ -588,6 +611,7 @@ const logger = getLogger("api.pbx");
 		EmergencyNotificationService,
 		EmergencyConsumer,
 		FeatureCodesService,
+		CallBlockService,
 		OrgSettingsService,
 		VoicemailBoxesService,
 		VoicemailPinService,
@@ -649,6 +673,7 @@ const logger = getLogger("api.pbx");
 		VoicemailMessagesService,
 		VoicemailMwiPublisher,
 		VoicemailTranscriptionSweeper,
+		TrunkStatusConsumer,
 		PromptsService,
 	],
 })

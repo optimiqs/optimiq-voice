@@ -8,6 +8,7 @@ import { LastCallerRpcSource } from "./last-caller.source";
 import { ParkRegistry } from "./park-registry";
 import { RoutingArtifactSource } from "./routing-artifact.source";
 import { SupervisorAuthzRpcPort } from "./supervisor-authz.source";
+import { TrunkStatusPublisher } from "./trunk-status.publisher";
 import { VoicemailGreetingRpcPort } from "./voicemail-greeting.source";
 import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
 
@@ -54,6 +55,13 @@ import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
 	providers: [
 		CallSignalBus,
 		RoutingArtifactSource,
+		/**
+		 * The trunk-health producer. Here rather than in `CallsModule` because its two
+		 * collaborators are this module's: the artifact source that resolves an endpoint name back
+		 * to a trunk row, and (via the global NATS module) the event client. It holds no per-call
+		 * state — a trunk's reachability is a fact about the tenant, not about any walk.
+		 */
+		TrunkStatusPublisher,
 		DidIndexSource,
 		VoicemailMailboxRpcSource,
 		ExtensionFeatureRpcPort,
@@ -67,6 +75,7 @@ import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
 	exports: [
 		CallSignalBus,
 		RoutingArtifactSource,
+		TrunkStatusPublisher,
 		DidIndexSource,
 		VoicemailMailboxRpcSource,
 		ExtensionFeatureRpcPort,

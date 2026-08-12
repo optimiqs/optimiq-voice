@@ -34,7 +34,6 @@ export const PERMISSIONS = [
 	"devices.read.own",
 	"devices.write",
 	"devices.delete",
-	"devices.reboot",
 
 	"numbers.read",
 	"numbers.write",
@@ -57,7 +56,6 @@ export const PERMISSIONS = [
 	"trunks.read",
 	"trunks.write",
 	"trunks.delete",
-	"trunks.test",
 
 	// --- Routing -------------------------------------------------------------
 	"routes.read",
@@ -73,6 +71,34 @@ export const PERMISSIONS = [
 	"feature-codes.read",
 	"feature-codes.write",
 	"feature-codes.delete",
+
+	/**
+	 * Caller screening: the allow/deny list every inbound and outbound leg is checked against.
+	 *
+	 * Its own resource rather than a ride on `routes.*`, and the argument is the same shape as the
+	 * one that gave `security.*` its own pair. `routes.write` is the dial plan — which menu answers
+	 * which DID, which trunk carries which prefix — and it is held by whoever owns the telephony
+	 * configuration. A screening list is the organization's answer to a specific caller, and the
+	 * person who maintains it is whoever picked up the phone. Riding it on `routes.write` would mean
+	 * the only way to let a receptionist block a number is to hand them the outbound routing table.
+	 *
+	 * The reverse direction is what settled it. `block` is the harmless action; **`allow` is the
+	 * dangerous one**, because an allow rule is precisely what lifts a number back OUT of a broad
+	 * prefix block. Whoever holds this grant can quietly re-admit a caller the organization decided
+	 * to exclude, and that is a decision worth naming in its own audit row instead of appearing as
+	 * "edited routing".
+	 *
+	 * THREE entries, and the delete is the one that needed proving. Elsewhere in this registry a
+	 * rule-shaped resource gets no delete grant — `security.delete` and `webhooks.delete` were both
+	 * refused on the argument that disabling a rule and removing it stop the same thing with the
+	 * same consequence. A block rule breaks that tie because it accumulates evidence: `hit_count`
+	 * and `last_hit_at` are what turn "somebody added this number once" into "this number called
+	 * forty times last week". Disabling keeps that; deleting destroys it. That is a record, not a
+	 * rule, and destroying records is what a delete grant is for.
+	 */
+	"call-block.read",
+	"call-block.write",
+	"call-block.delete",
 
 	// --- Call features -------------------------------------------------------
 	"ivr.read",
@@ -107,7 +133,6 @@ export const PERMISSIONS = [
 	"conferences.read",
 	"conferences.write",
 	"conferences.delete",
-	"conferences.moderate",
 
 	"park-lots.read",
 	"park-lots.write",
@@ -275,6 +300,36 @@ export const PERMISSIONS = [
 	// --- Platform and tenancy ------------------------------------------------
 	"settings.read",
 	"settings.write",
+	/**
+	 * The user's own preferences — the third level of the settings cascade, and the pair that had
+	 * to exist before it could.
+	 *
+	 * `packages/pbx-db/src/schema/settings-schema.ts` dropped the `user_setting` table and named
+	 * four prerequisites for bringing it back: a catalogue of which settings are user-scoped at
+	 * all, this permission pair, a resolver, and a surface. These are the second of the four, and
+	 * they are a pair rather than a ride on the unscoped grants for a reason that runs the opposite
+	 * way to most `.own` entries in this registry.
+	 *
+	 * Elsewhere `.own` NARROWS a power an administrator also has: `extensions.read.own` is a slice
+	 * of `extensions.read`, and a manager holding the unscoped grant can do everything the scoped
+	 * one can. Here the unscoped grants are about a DIFFERENT ROW. `settings.write` edits the
+	 * organization's answer, which applies to everyone; `settings.write.own` edits one person's
+	 * override of it, which applies to nobody else. A manager who may set the tenant's default is
+	 * not thereby entitled to reach into a colleague's preferences and change them, and
+	 * `hasPermission`'s rule — an unscoped grant covers its scopes — would say they are.
+	 *
+	 * That is why the resolution of "own" is a ROW check in the service rather than a decorator
+	 * argument, exactly as `queue-agent-session.service.ts` argues for `queues.join.own`: the
+	 * decorator is an AND over a request and the rule here is about which row is being written.
+	 * The endpoint declares this grant as its floor and then proves the row belongs to the caller.
+	 *
+	 * `settings.read` (unscoped) stays in `SELF_SERVICE_PERMISSIONS` and is not replaced by
+	 * `settings.read.own`. Reading the organization's settings is how a preferences screen shows
+	 * what it is overriding — "inherited: on" needs the inherited value — and hiding it would make
+	 * a per-user override an unexplained toggle.
+	 */
+	"settings.read.own",
+	"settings.write.own",
 	"settings.write.all",
 
 	"members.read",
@@ -290,19 +345,73 @@ export const PERMISSIONS = [
 
 	"provisioning.read",
 	"provisioning.write",
-	"provisioning.templates",
 	"provisioning.tokens",
+] as const;
 
+export type Permission = (typeof PERMISSIONS)[number];
+
+/**
+ * Permissions that were declared, checked nothing, and have been removed.
+ *
+ * ## Why a list of things that are gone
+ *
+ * A permission the registry declares and no server ever checks is not neutral — it is a promise
+ * the UI can render and the server cannot keep. The role editor shows it, an administrator grants
+ * it believing it does something, and the endpoint it appears to describe either does not exist or
+ * is guarded by a different grant entirely. The parity audit found a dozen of these and called
+ * each one "a promise the UI can render and the server cannot keep", which is the right phrase for
+ * it.
+ *
+ * The fix for each was one of two things: guard the endpoint that obviously corresponds, or delete
+ * the entry. The ones below were deleted. This record exists so the deletion is a decision with a
+ * reason attached rather than a diff somebody re-adds in six months — and so
+ * `permissions.spec.ts` can assert that none of them has crept back into {@link PERMISSIONS}
+ * without an endpoint arriving with it.
+ *
+ * **Re-adding one is allowed, and the bar is the same as for any new entry**: the endpoint lands
+ * in the same change as the permission, with a `@RequirePermissions` on it. That is the rule the
+ * header at the top of this file already states; these ten are simply the evidence for why it
+ * matters.
+ *
+ * ## The four reasons, and which entries they cover
+ *
+ * **The subsystem was deleted.** `applications.*` and `secrets.*` guarded the legacy gRPC
+ * platform's voice-application and secret-storage services. Both tables were dropped
+ * (`apps/api/drizzle/20260806164427_drop_legacy_api_tables`), the services are gone, and
+ * `apps/api/src/core/db/schema.ts` records the removal. Six entries guarding six absences.
+ *
+ * **The action has no transport.** `devices.reboot` describes "send a remote reboot or resync
+ * request to a device" — a SIP `NOTIFY` with `Event: check-sync`. Nothing in this platform sends
+ * one: `apps/sipd` is a registrar and answers `501` to everything else, and the engine's ARI path
+ * has no out-of-dialog NOTIFY. `trunks.test` is the same shape one layer out — it described
+ * forcing a re-registration or placing a diagnostic call, and there is no on-demand probe to
+ * trigger. (Trunk health does now arrive, but it arrives from Asterisk's qualify pinger on its own
+ * schedule, which is a fact that is reported rather than an action anybody performs.)
+ *
+ * **The surface is deliberately not HTTP.** `conferences.moderate` — mute, kick, lock — governs a
+ * LIVE room, and `apps/api/src/pbx/conferences/conferences.controller.ts` says in its header that
+ * this is why the grant is unused there. Mid-call control is not exposed over HTTP at all on this
+ * platform; when it is, the grant comes back with it.
+ *
+ * **The thing it guards is code, not data.** `provisioning.templates` promised template CRUD.
+ * Templates are compiled-in TypeScript modules (`apps/api/src/provisioning/catalog/templates/`),
+ * reviewed and deployed like the rest of the source. There is no row to edit and no endpoint that
+ * could exist without first making templates data.
+ */
+export const RETIRED_PERMISSIONS = [
 	"applications.read",
 	"applications.write",
 	"applications.delete",
 	"applications.deploy",
-
+	"conferences.moderate",
+	"devices.reboot",
+	"provisioning.templates",
 	"secrets.read",
 	"secrets.rotate",
+	"trunks.test",
 ] as const;
 
-export type Permission = (typeof PERMISSIONS)[number];
+export type RetiredPermission = (typeof RETIRED_PERMISSIONS)[number];
 
 const PERMISSION_SET: ReadonlySet<string> = new Set<string>(PERMISSIONS);
 
@@ -390,11 +499,6 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 				label: "Delete devices",
 				description: "Remove a device and revoke its provisioning credentials.",
 			},
-			{
-				permission: "devices.reboot",
-				label: "Reboot devices",
-				description: "Send a remote reboot or resync request to a device.",
-			},
 		],
 	},
 	{
@@ -456,11 +560,6 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 				permission: "trunks.delete",
 				label: "Delete trunks",
 				description: "Remove a carrier connection.",
-			},
-			{
-				permission: "trunks.test",
-				label: "Test trunks",
-				description: "Force a re-registration or place a diagnostic call over a trunk.",
 			},
 		],
 	},
@@ -537,6 +636,30 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 				permission: "feature-codes.delete",
 				label: "Delete feature codes",
 				description: "Remove a star code from the dial plan.",
+			},
+		],
+	},
+	{
+		resource: "call-block",
+		label: "Caller screening",
+		description: "The allow and deny list every call is checked against before it is routed.",
+		permissions: [
+			{
+				permission: "call-block.read",
+				label: "View screening rules",
+				description: "List the blocked and allowed numbers, and how often each rule has matched.",
+			},
+			{
+				permission: "call-block.write",
+				label: "Manage screening rules",
+				description:
+					"Block or allow a caller. An allow rule overrides a broader block, so this grant can also re-admit a number the organization had excluded.",
+			},
+			{
+				permission: "call-block.delete",
+				label: "Delete screening rules",
+				description:
+					"Remove a rule permanently, discarding its match history. Disabling a rule keeps both.",
 			},
 		],
 	},
@@ -718,11 +841,6 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 				label: "Delete conferences",
 				description: "Remove a conference room.",
 			},
-			{
-				permission: "conferences.moderate",
-				label: "Moderate conferences",
-				description: "Mute, kick, lock and record a live conference.",
-			},
 		],
 	},
 	{
@@ -893,6 +1011,17 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 				description: "Override organization-level settings.",
 			},
 			{
+				permission: "settings.read.own",
+				label: "View own preferences",
+				description: "Read the acting user's own overrides of the organization's settings.",
+			},
+			{
+				permission: "settings.write.own",
+				label: "Edit own preferences",
+				description:
+					"Set or clear the acting user's own overrides. Only settings the catalogue marks user-scoped can be overridden, and only for the acting user.",
+			},
+			{
 				permission: "settings.write.all",
 				label: "Manage platform defaults",
 				description: "Change defaults that apply to every organization. Platform operators only.",
@@ -974,58 +1103,9 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 				description: "Edit provisioning settings and device profiles.",
 			},
 			{
-				permission: "provisioning.templates",
-				label: "Manage templates",
-				description: "Create and edit vendor configuration templates.",
-			},
-			{
 				permission: "provisioning.tokens",
 				label: "Manage provisioning tokens",
 				description: "Issue and revoke the per-device tokens that authenticate config pulls.",
-			},
-		],
-	},
-	{
-		resource: "applications",
-		label: "Voice applications",
-		description: "Programmable voice applications and AI assistants attached to routes.",
-		permissions: [
-			{
-				permission: "applications.read",
-				label: "View applications",
-				description: "List voice applications and their configuration.",
-			},
-			{
-				permission: "applications.write",
-				label: "Manage applications",
-				description: "Create and edit voice applications and assistant definitions.",
-			},
-			{
-				permission: "applications.delete",
-				label: "Delete applications",
-				description: "Remove a voice application.",
-			},
-			{
-				permission: "applications.deploy",
-				label: "Deploy applications",
-				description: "Point live traffic at an application version.",
-			},
-		],
-	},
-	{
-		resource: "secrets",
-		label: "Secrets",
-		description: "SIP credentials, carrier passwords and integration secrets.",
-		permissions: [
-			{
-				permission: "secrets.read",
-				label: "Reveal secrets",
-				description: "Read stored SIP and integration secrets in clear text.",
-			},
-			{
-				permission: "secrets.rotate",
-				label: "Rotate secrets",
-				description: "Regenerate a stored secret and invalidate the previous value.",
 			},
 		],
 	},
@@ -1056,6 +1136,14 @@ const SELF_SERVICE_PERMISSIONS = [
 	"api-keys.read.own",
 	"api-keys.write.own",
 	"settings.read",
+	/**
+	 * The narrowest role gets its own preferences, which is the point of the level existing.
+	 *
+	 * `settings.read` above it is the ORGANIZATION's answer and stays, because a preferences screen
+	 * that cannot show what it is overriding turns "inherited" into an unexplained blank.
+	 */
+	"settings.read.own",
+	"settings.write.own",
 ] as const satisfies readonly Permission[];
 
 const AGENT_PERMISSIONS = [
@@ -1090,7 +1178,6 @@ const MANAGER_PERMISSIONS = [
 	"extensions.assign",
 	"devices.read",
 	"devices.write",
-	"devices.reboot",
 	"numbers.read",
 	"numbers.assign",
 	"routes.read",
@@ -1099,6 +1186,25 @@ const MANAGER_PERMISSIONS = [
 	"time-conditions.write",
 	"feature-codes.read",
 	"feature-codes.write",
+	/**
+	 * A manager maintains the screening list; an agent does not, and the delete stays with admins.
+	 *
+	 * The read/write pair is here because blocking a number is day-to-day work on a phone system —
+	 * the same class of task as editing a ring group — and a manager who cannot do it has to raise a
+	 * ticket to stop a robocaller. It is NOT in `AGENT_PERMISSIONS` despite the obvious pull of "the
+	 * person who answered the phone should be able to block the caller", for the reason the registry
+	 * entry gives: the same grant that writes a `block` rule writes an `allow` rule, and an allow
+	 * rule lifts a number back out of a broader block. Handing the widest role in the organization
+	 * the ability to quietly re-admit an excluded caller is the wrong side of that trade. An
+	 * agent-level `call-block.write.own` bounded to inbound-and-block-only is the shape that would
+	 * work, and it is not in the registry because nothing serves it yet.
+	 *
+	 * `call-block.delete` is absent for the ordinary reason every delete is absent from this list —
+	 * and here it also destroys the `hitCount`/`lastHitAt` evidence, which is exactly what the
+	 * registry entry split the grant to protect.
+	 */
+	"call-block.read",
+	"call-block.write",
 	"ivr.read",
 	"ivr.write",
 	"ivr.publish",
@@ -1112,7 +1218,6 @@ const MANAGER_PERMISSIONS = [
 	"voicemail.write",
 	"voicemail.listen",
 	"conferences.write",
-	"conferences.moderate",
 	"park-lots.write",
 	"recordings.read",
 	"recordings.download",
@@ -1143,7 +1248,23 @@ const MANAGER_PERMISSIONS = [
 	 */
 	"calls.supervise",
 	"members.read",
-	"applications.read",
+	/**
+	 * Device provisioning, minus the credential.
+	 *
+	 * A manager sets up desk phones — that is the job — so they need the vendor catalogue the device
+	 * form renders from (`provisioning.read`) and the device profiles that decide what a phone's
+	 * config actually says (`provisioning.write`). Both arrived here in the W7 permission pass, when
+	 * the endpoints that serve them stopped being guarded by `devices.read`/`devices.write` and
+	 * started being guarded by the permissions whose descriptions had named them all along.
+	 *
+	 * `provisioning.tokens` is deliberately NOT here, and it is the whole reason the resource is
+	 * split three ways. A provisioning token is the secret a phone presents to fetch a configuration
+	 * file containing its SIP password, and this role's own description says "No carrier, secret or
+	 * provisioning-credential access". Before this pass the token endpoint rode `devices.write` and
+	 * every manager held it, which made that sentence false.
+	 */
+	"provisioning.read",
+	"provisioning.write",
 ] as const satisfies readonly Permission[];
 
 /** Everything except the cross-organization platform scope. */

@@ -1,4 +1,4 @@
-import { Inject, Injectable, type OnApplicationShutdown } from "@nestjs/common";
+import { Inject, Injectable, Optional, type OnApplicationShutdown } from "@nestjs/common";
 import * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
 import { makeCdrLegWriteEvent, makeVoicemailEvent, validateEvent } from "@optimiq-voice/events";
@@ -32,6 +32,7 @@ import { PlanWalker } from "../routing/plan-walker";
 import { RoutingArtifactSource } from "../routing/routing-artifact.source";
 import { SupervisorAuthzRpcPort } from "../routing/supervisor-authz.source";
 import { TrunkCapacityRegistry } from "../routing/trunk-capacity";
+import { TrunkStatusPublisher } from "../routing/trunk-status.publisher";
 import { VoicemailGreetingRpcPort } from "../routing/voicemail-greeting.source";
 import { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
 import { dtmfEventFrom } from "../verbs/dtmf-inbox";
@@ -229,6 +230,12 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		private readonly parkHandoff: ParkHandoffService,
 		private readonly sipTransfer: SipTransferService,
 		private readonly originate: OriginateService,
+		/**
+		 * Optional, and LAST, so the spec harnesses — which construct this class positionally and
+		 * never feed it a trunk transition — need not fake a publisher. The deployed module always
+		 * provides it; `@Optional()` only widens what Nest tolerates, not what production wires.
+		 */
+		@Optional() private readonly trunkStatus?: TrunkStatusPublisher,
 	) {
 		this.control = new CallControl({
 			media: this.media,
@@ -562,6 +569,12 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 					kind: "recording-failed",
 					reason: event.reason,
 				});
+				return;
+			case "trunk-endpoint-status":
+				// Not a call event at all: no channel, no registry entry, no signal. Handed to the
+				// trunk-status publisher, which resolves the endpoint to a trunk row and publishes
+				// the write-back event. `handle` never throws — see its own contract.
+				await this.trunkStatus?.handle(event);
 				return;
 		}
 	}

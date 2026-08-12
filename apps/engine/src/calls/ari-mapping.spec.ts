@@ -317,7 +317,67 @@ describe("toMediaEvent", () => {
 		expect(mapped("ChannelEnteredBridge", { bridge, channel: CHANNEL })).toBeUndefined();
 		expect(mapped("ChannelLeftBridge", { bridge, channel: CHANNEL })).toBeUndefined();
 		expect(mapped("Dial", { peer: CHANNEL, dialstatus: "ANSWER" })).toBeUndefined();
+		// PeerStatusChange is NOT in this list any more — the trunk write-back consumes it. What
+		// still drops is the frame that cannot name a trunk: no endpoint, or a non-PJSIP one.
 		expect(mapped("PeerStatusChange", { peer: { peer_status: "Reachable" } })).toBeUndefined();
+		expect(
+			mapped("PeerStatusChange", {
+				endpoint: { technology: "IAX2", resource: "legacy" },
+				peer: { peer_status: "Reachable" },
+			}),
+		).toBeUndefined();
+	});
+
+	it("maps PeerStatusChange to the trunk-endpoint-status the write-back publishes", () => {
+		expect(
+			mapped("PeerStatusChange", {
+				endpoint: { technology: "PJSIP", resource: "carrier-a", state: "offline" },
+				peer: { peer_status: "Unreachable", time: "1240" },
+			}),
+		).toEqual({
+			type: "trunk-endpoint-status",
+			endpoint: "carrier-a",
+			status: "down",
+			reason: "Unreachable",
+			latencyMs: 1240,
+		});
+		// Reachable carries the qualify RTT; a rider with no verdict reads as unknown, and the
+		// raw word is never invented — an empty one becomes the literal "unknown".
+		expect(
+			mapped("PeerStatusChange", {
+				endpoint: { technology: "PJSIP", resource: "carrier-a" },
+				peer: { peer_status: "Reachable", time: "24" },
+			}),
+		).toEqual({
+			type: "trunk-endpoint-status",
+			endpoint: "carrier-a",
+			status: "up",
+			reason: "Reachable",
+			latencyMs: 24,
+		});
+		expect(
+			mapped("PeerStatusChange", {
+				endpoint: { technology: "PJSIP", resource: "carrier-a" },
+				peer: {},
+			}),
+		).toEqual({
+			type: "trunk-endpoint-status",
+			endpoint: "carrier-a",
+			status: "unknown",
+			reason: "unknown",
+		});
+		// Lagged is the drivers-that-measure word for "answers, slowly": degraded, not down.
+		expect(
+			mapped("PeerStatusChange", {
+				endpoint: { technology: "PJSIP", resource: "carrier-a" },
+				peer: { peer_status: "Lagged", time: "not-a-number" },
+			}),
+		).toEqual({
+			type: "trunk-endpoint-status",
+			endpoint: "carrier-a",
+			status: "degraded",
+			reason: "Lagged",
+		});
 	});
 
 	it("accounts for EVERY ARI event type — no throw, and a decision either way", () => {
@@ -329,6 +389,7 @@ describe("toMediaEvent", () => {
 				mapped(type, {
 					channel: CHANNEL,
 					peer: CHANNEL,
+					endpoint: { technology: "PJSIP", resource: "carrier-a" },
 					bridge,
 					recording,
 					playback,
@@ -351,6 +412,7 @@ describe("toMediaEvent", () => {
 					mapped(type, {
 						channel: { ...CHANNEL, state: "Up" },
 						peer: CHANNEL,
+						endpoint: { technology: "PJSIP", resource: "carrier-a" },
 						bridge,
 						recording,
 						playback,

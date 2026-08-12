@@ -29,6 +29,7 @@ type goldenParsedSubject struct {
 	QueueID   string `json:"queueId"`
 	MailboxID string `json:"mailboxId"`
 	SessionID string `json:"sessionId"`
+	TrunkID   string `json:"trunkId"`
 	Event     string `json:"event"`
 	Service   string `json:"service"`
 	Method    string `json:"method"`
@@ -165,6 +166,7 @@ func TestParityConstants(t *testing.T) {
 		"queue":        SubjectRootQueue,
 		"voicemail":    SubjectRootVoicemail,
 		"media":        SubjectRootMedia,
+		"trunk":        SubjectRootTrunk,
 		"cdrLeg":       SubjectRootCDRLeg,
 		"audit":        SubjectRootAudit,
 		"provision":    SubjectRootProvision,
@@ -250,6 +252,8 @@ func TestParitySubjectBuilders(t *testing.T) {
 			got = must(VoicemailSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "media":
 			got = must(MediaSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
+		case "trunk":
+			got = must(TrunkSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "cdrLeg":
 			got = must(CDRLegSubject(tc.Args[0]))
 		case "audit":
@@ -312,6 +316,12 @@ func TestParitySubjectFilters(t *testing.T) {
 			got = must(MediaSessionFilter(tc.Args[0], tc.Args[1]))
 		case "mediaEventInOrg":
 			got = must(MediaEventInOrgFilter(tc.Args[0], tc.Args[1]))
+		case "allTrunks":
+			got = AllTrunksFilter()
+		case "trunksInOrg":
+			got = must(TrunksInOrgFilter(tc.Args[0]))
+		case "trunkStatusInOrg":
+			got = must(TrunkStatusInOrgFilter(tc.Args[0]))
 		case "allCdrLegs":
 			got = AllCDRLegsFilter()
 		case "cdrLegsInOrg":
@@ -356,6 +366,7 @@ func TestParityParseSubject(t *testing.T) {
 			QueueID:   parsed.QueueID,
 			MailboxID: parsed.MailboxID,
 			SessionID: parsed.SessionID,
+			TrunkID:   parsed.TrunkID,
 			Event:     parsed.Event,
 			Service:   parsed.Service,
 			Method:    parsed.Method,
@@ -497,6 +508,7 @@ func TestParityVocabularies(t *testing.T) {
 		"queue":        EventTypesOfFamily(FamilyQueue),
 		"voicemail":    EventTypesOfFamily(FamilyVoicemail),
 		"media":        EventTypesOfFamily(FamilyMedia),
+		"trunk":        EventTypesOfFamily(FamilyTrunk),
 	}
 	if !reflect.DeepEqual(events, g.EventVocabularies) {
 		t.Errorf("event vocabularies = %v, golden %v", events, g.EventVocabularies)

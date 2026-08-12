@@ -10,6 +10,7 @@ import {
 	PERMISSION_PATTERN,
 	PERMISSION_SCOPES,
 	PERMISSIONS,
+	RETIRED_PERMISSIONS,
 	SYSTEM_ROLE_IDS,
 	SYSTEM_ROLE_TEMPLATES,
 	type SystemRoleId,
@@ -200,11 +201,37 @@ describe("PERMISSIONS", () => {
 			"members",
 			"api-keys",
 			"provisioning",
-			"applications",
-			"secrets",
+			"call-block",
 		]) {
 			expect(resources).toContain(resource);
 		}
+	});
+
+	/**
+	 * The retired entries stay retired until the endpoint they describe arrives with them.
+	 *
+	 * `applications` and `secrets` used to be in the inventory above, which is why this test is
+	 * the shape it is rather than a shorter one: they were removed from the list of resources this
+	 * registry must cover in the same change that removed the permissions, and a list that only
+	 * says what must be present cannot say that. `RETIRED_PERMISSIONS` carries the reason for each
+	 * one; this asserts the reason is still being honoured.
+	 *
+	 * A re-added entry is not a failure of judgement, it is a failure of SEQUENCING: the rule the
+	 * registry header states is that a permission and the `@RequirePermissions` that checks it land
+	 * together. Bringing one back means deleting it from `RETIRED_PERMISSIONS` in the same commit
+	 * that adds the guard, which is a diff a reviewer can see.
+	 */
+	it("does not re-declare a permission that was retired for guarding nothing", () => {
+		const declared = new Set<string>(PERMISSIONS);
+		for (const retired of RETIRED_PERMISSIONS) {
+			expect(declared.has(retired), `${retired} is retired and must not be re-declared`).toBe(
+				false,
+			);
+		}
+	});
+
+	it("retires nothing twice and names each retirement once", () => {
+		expect(new Set(RETIRED_PERMISSIONS).size).toBe(RETIRED_PERMISSIONS.length);
 	});
 
 	/**
@@ -309,13 +336,16 @@ describe("SYSTEM_ROLE_TEMPLATES", () => {
 		}
 	});
 
-	it("keeps carrier, secret and provisioning-credential access out of non-admin roles", () => {
-		const restricted: Permission[] = [
-			"trunks.write",
-			"secrets.read",
-			"secrets.rotate",
-			"provisioning.tokens",
-		];
+	/**
+	 * `secrets.read` and `secrets.rotate` used to head this list and have been retired — the table
+	 * they guarded went with the legacy platform, so they checked nothing (see
+	 * `RETIRED_PERMISSIONS`). What survives is the list's actual subject: the grants that reach a
+	 * CREDENTIAL. `provisioning.tokens` issues the per-device secret a phone authenticates its
+	 * config pull with, and `trunks.write` sets the carrier password's handle. Neither belongs to a
+	 * role that runs the phone system day to day.
+	 */
+	it("keeps carrier and provisioning-credential access out of non-admin roles", () => {
+		const restricted: Permission[] = ["trunks.write", "provisioning.tokens"];
 		for (const template of SYSTEM_ROLE_TEMPLATES) {
 			if (template.id === "owner" || template.id === "admin") continue;
 			for (const permission of restricted) {

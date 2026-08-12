@@ -42,6 +42,7 @@ export {
 	REGISTRATIONS_STREAM,
 	ROUTING_CACHE_KV,
 	STREAM_SUBJECT_ROOTS,
+	TRUNKS_STREAM,
 	StreamDefinitionConflictError,
 	streamConfigFor,
 	streamNeedsUpdate,
@@ -73,6 +74,7 @@ export {
 	isRegistrationEvent,
 	isSubjectToken,
 	isMediaSessionEvent,
+	isTrunkEvent,
 	isVoicemailEvent,
 	matchesSubject,
 	MEDIA_SESSION_EVENTS,
@@ -87,6 +89,7 @@ export {
 	subjectFilterFor,
 	subjectFor,
 	SubjectTokenError,
+	TRUNK_EVENTS,
 	UnknownSubjectError,
 	VOICEMAIL_EVENTS,
 	type CallEvent,
@@ -95,6 +98,7 @@ export {
 	type ParsedSubject,
 	type QueueEvent,
 	type RegistrationEvent,
+	type TrunkEvent,
 	type VoicemailEvent,
 } from "./subjects";
 export {

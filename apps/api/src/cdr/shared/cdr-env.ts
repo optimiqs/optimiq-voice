@@ -154,7 +154,8 @@ export const cdrEnvSchema = z.object({
 	CDR_RECORDING_ROOT: z.string().min(1).default("/opt/optimiq-voice/recordings"),
 
 	/**
-	 * How long a call recording is kept before it is purged, in days.
+	 * How long a call recording is kept before it is purged, in days — the PLATFORM's answer,
+	 * used when an organization has not given its own.
 	 *
 	 * Stamped onto `recordings.retention_until` when the row is written, because that is the only
 	 * moment the policy in force is unambiguous: applying today's window retroactively to a row
@@ -166,15 +167,17 @@ export const cdrEnvSchema = z.object({
 	 * indefinitely: `retention_until` stays null and the sweeper never sees the row. That remains
 	 * the default because deleting a tenant's audio is not a thing to start doing on an upgrade.
 	 *
-	 * ## Why this is a platform setting and not (yet) a per-organization one
+	 * ## Where the per-organization window comes from
 	 *
-	 * The natural home for a tenant's own window is `org_setting`, which lives in `pbx-db` — a
-	 * different database with a different pool, deliberately never shared with this one
-	 * (`cdr.module.ts`). Reading it here would put a cross-database round trip on the recording
-	 * write path for every recording, and a `PbxDatabaseClient` into a module that has been
-	 * self-contained on purpose. A per-org window belongs on the event or in a cached policy
-	 * projection; until one of those exists, this is a platform-wide floor rather than a promise
-	 * the column cannot keep.
+	 * The tenant's own window is the `recordings.retentionDays` org setting (`org-settings.catalog.ts`,
+	 * guarded by `recordings.configure`), and it reaches this area WITHOUT the cross-database import
+	 * an earlier version of this comment refused: the CDR area owns a port
+	 * (`recordings/retention-policy.ts`), the PBX side implements it over a per-organization TTL
+	 * cache, and `recording-writer.service.ts` injects it `@Optional()`. The org value — including
+	 * an explicit `0` — wins whenever it exists; this variable decides for the three absences (no
+	 * PBX area mounted, no window ever set, the policy read failing). The refusal's grounds were
+	 * real and are still honoured — no `PbxDatabaseClient` in this module, and the cache keeps the
+	 * write path at one foreign query per organization per minute rather than one per recording.
 	 */
 	CDR_RECORDING_RETENTION_DAYS: z.coerce.number().int().min(0).max(3_650).default(0),
 
@@ -198,6 +201,73 @@ export const cdrEnvSchema = z.object({
 
 	/** Recordings purged in one pass. Bounded so one sweep cannot hold the pool for minutes. */
 	CDR_RECORDING_SWEEP_BATCH: z.coerce.number().int().min(1).max(1_000).default(200),
+
+	/**
+	 * Where CDR export objects live.
+	 *
+	 * A root of its own rather than a sub-prefix of `CDR_RECORDING_ROOT`, and the reason is a
+	 * property no other object class in this API has: **Asterisk never touches an export.** Every
+	 * other root here is on a volume the media server shares — which is exactly why
+	 * `object-store.factory.ts` has no branch that returns a bare `S3ObjectStore`, and why the S3
+	 * driver mirrors rather than replaces the filesystem. An export is written by this process and
+	 * read by this process, so it is the one class that could legitimately live only in a bucket.
+	 *
+	 * It still goes through `createObjectStore`, so today it mirrors like the rest. Separating the
+	 * root now is what makes moving it later a configuration change rather than a code change, and
+	 * it means an operator can put reports on a different volume from audio — different sizes,
+	 * different retention, different backup policy.
+	 */
+	CDR_EXPORT_ROOT: z.string().min(1).default("/opt/optimiq-voice/exports"),
+
+	/**
+	 * How often the export worker looks for a queued job. `0` disables it.
+	 *
+	 * Fifteen seconds, which is a latency budget rather than a load one: the poll is an index scan
+	 * over a partial index that is empty almost all of the time, and the number is chosen so a
+	 * person who clicks "Export" sees the job start moving before they wonder whether it worked.
+	 *
+	 * It runs under `CDR_WRITER_ENABLED` with the durable consumers and the recording sweep. Unlike
+	 * those, N replicas polling would still be CORRECT — the claim is a `skip locked` compare-and-set
+	 * — so this switch is about cost, and an operator who wants export throughput enables the writer
+	 * in more than one place on purpose.
+	 */
+	CDR_EXPORT_POLL_INTERVAL_MS: z.coerce.number().int().min(0).max(3_600_000).default(15_000),
+
+	/**
+	 * How long a claimed export may go quiet before another worker may take it.
+	 *
+	 * The claim commits immediately rather than holding a transaction across the export, so a worker
+	 * that dies mid-write leaves a row stuck in `running` that nothing would otherwise touch. This
+	 * is what unsticks it. Ten minutes: comfortably longer than the largest export a bounded row
+	 * count can produce, and short enough that a crash is not an outage.
+	 */
+	CDR_EXPORT_LEASE_MS: z.coerce.number().int().min(60_000).max(86_400_000).default(600_000),
+
+	/**
+	 * The most rows one export may contain before it is failed.
+	 *
+	 * FAILED, never truncated — a truncated CSV is a plausible-looking file with no marker saying
+	 * where it stopped, and somebody will total a column in it. The ceiling is really about memory:
+	 * `ObjectStore.put` takes a `Buffer`, so the whole file is assembled before it is stored, and a
+	 * hundred thousand legs is roughly 25 MB. Raising this far beyond that means growing a streaming
+	 * `upload` path on `MirroredObjectStore.put`, which names itself as the method that would.
+	 */
+	CDR_EXPORT_MAX_ROWS: z.coerce.number().int().min(1_000).max(2_000_000).default(100_000),
+
+	/**
+	 * How long a finished export stays downloadable, in hours.
+	 *
+	 * Expiring by DEFAULT, which is the opposite of `recordings.retention_until` (null, keep for
+	 * ever, until a policy says otherwise). The asymmetry is deliberate: a recording is the primary
+	 * record of a conversation and deleting it destroys something; an export is a derived copy of
+	 * the ledger sitting outside the ledger's own access controls, and a report nobody fetched in a
+	 * week is a liability rather than an asset. Seven days is long enough for a monthly reporting
+	 * cycle to be re-run rather than re-requested.
+	 *
+	 * Only the FILE expires. The job row — who asked, for what window, with what filters — survives,
+	 * because that is the record an audit of "who extracted the call history" reads.
+	 */
+	CDR_EXPORT_TTL_HOURS: z.coerce.number().int().min(1).max(8_760).default(168),
 });
 
 export type CdrEnv = z.infer<typeof cdrEnvSchema>;

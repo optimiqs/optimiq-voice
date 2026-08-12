@@ -1,6 +1,6 @@
 import { CALL_DIRECTIONS } from "@optimiq-voice/events";
 import { hangupCauseCode, hangupCauseFromCode } from "@optimiq-voice/telephony";
-import type { MediaChannelSnapshot, MediaEvent } from "../media/media-event";
+import type { MediaChannelSnapshot, MediaEvent, TrunkEndpointStatus } from "../media/media-event";
 import type { CallDirection, HangupSide, LegSide } from "@optimiq-voice/events";
 import type { AriChannel, AriEvent } from "@optimiq-voice/media-ari";
 import type { CallState, HangupCause } from "@optimiq-voice/telephony";
@@ -199,6 +199,45 @@ function mediaChannelSnapshot(channel: AriChannel): MediaChannelSnapshot {
 }
 
 /**
+ * ARI's qualify vocabulary → the domain's observable trunk statuses.
+ *
+ * `Reachable` and `Unreachable` are the two words PJSIP's OPTIONS pinger actually produces;
+ * `Lagged` belongs to the drivers that measure a threshold and is mapped to `degraded` so a
+ * carrier that answers slowly reads differently from one that does not answer. Everything else —
+ * `Unknown` (qualify disabled), `Created`, `Removed`, an empty rider, and whatever a future
+ * Asterisk invents — is `unknown`, because the honest reading of all of them is "the pinger has
+ * no verdict". The raw word travels beside the mapping (`reason`), so nothing is lost when a new
+ * word appears.
+ */
+export function trunkEndpointStatusFrom(peerStatus: string): TrunkEndpointStatus {
+	switch (peerStatus) {
+		case "Reachable":
+			return "up";
+		case "Unreachable":
+			return "down";
+		case "Lagged":
+			return "degraded";
+		default:
+			return "unknown";
+	}
+}
+
+/**
+ * The qualify round-trip, when the driver reported one.
+ *
+ * ARI's `peer.time` is a STRING, milliseconds, and only some channel drivers fill it in. A value
+ * that is not a non-negative number is treated as absent rather than published as zero: a lie
+ * about latency is worse than no latency, because an alerting rule diffs it.
+ */
+export function trunkQualifyLatencyMs(time: string | undefined): number | undefined {
+	if (time === undefined || time.trim() === "") {
+		return undefined;
+	}
+	const parsed = Number(time);
+	return Number.isFinite(parsed) && parsed >= 0 ? Math.round(parsed) : undefined;
+}
+
+/**
  * The Q.850 cause a bare hangup REQUEST is read as when the far end sent none.
  *
  * 16, "normal clearing": the request arrived, so somebody deliberately ended the call, and the only
@@ -305,6 +344,26 @@ export function toMediaEvent(event: AriEvent): MediaEvent | undefined {
 				recordingName: event.recording.name,
 				reason: event.recording.cause ?? UNKNOWN_RECORDING_FAILURE_REASON,
 			};
+		case "PeerStatusChange": {
+			// The qualify loop's transition — the ONE event on this seam that is not about a call.
+			// An event with no endpoint has nothing a trunk row could ever be resolved from, and a
+			// non-PJSIP technology is not a trunk on this platform, so both drop here rather than
+			// making the publisher reason about frames that cannot name a carrier.
+			const endpoint = event.endpoint;
+			if (endpoint === undefined || endpoint.technology !== "PJSIP") {
+				return undefined;
+			}
+			const latencyMs = trunkQualifyLatencyMs(event.peer.time);
+			return {
+				type: "trunk-endpoint-status",
+				endpoint: endpoint.resource,
+				status: trunkEndpointStatusFrom(event.peer.peer_status),
+				// The verbatim word, because the four-member status is a projection and the raw
+				// string is the only evidence left when a future Asterisk invents a fifth.
+				reason: event.peer.peer_status === "" ? "unknown" : event.peer.peer_status,
+				...(latencyMs === undefined ? {} : { latencyMs }),
+			};
+		}
 		default:
 			return undefined;
 	}

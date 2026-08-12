@@ -17,6 +17,7 @@ import { registerLiveTransport } from "./live/live-bootstrap";
 import { LiveModule } from "./live/live.module";
 import { assertMailPreflight, loadMailEnv, selectMailTransport } from "./mail";
 import { isPbxAreaEnabled, registerPbxTransport } from "./pbx/pbx-bootstrap";
+import { PbxCdrPortsModule } from "./pbx/pbx-cdr-ports.module";
 import { PbxModule } from "./pbx/pbx.module";
 import { ProvisioningModule } from "./provisioning/provisioning.module";
 import { assertStoragePreflight, loadStorageEnv } from "./storage";
@@ -179,9 +180,17 @@ async function bootstrap() {
 	 * would make such a deployment fail to boot on a `PBX_DATABASE_URL` it has no use for. This is
 	 * the seam `PbxModule`, `LiveModule` and `CdrModule` are already composed through.
 	 */
+	/**
+	 * `PbxCdrPortsModule` mounts only when BOTH areas do. It is the `@Global()` seam that hands
+	 * the CDR area two PBX-owned facts (the tenant's recording retention window, the purge audit
+	 * ledger) under CDR-owned tokens — see its header. With only the PBX area it would provide
+	 * answers nothing asks for; with only the CDR area it could not construct them; in both cases
+	 * the CDR consumers inject the tokens `@Optional()` and degrade to the platform env values.
+	 */
 	const extraModules = [
 		...(pbxAreaEnabled ? [PbxModule, ProvisioningModule, LiveModule] : []),
 		...(cdrAreaEnabled ? [CdrModule] : []),
+		...(pbxAreaEnabled && cdrAreaEnabled ? [PbxCdrPortsModule] : []),
 	];
 	const rootModule: Type<unknown> = authSliceEnabled
 		? createApiRootModule([AppModule], extraModules)

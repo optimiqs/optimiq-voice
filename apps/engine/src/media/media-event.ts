@@ -194,6 +194,40 @@ export interface MediaRecordingFailedEvent {
 	readonly reason: string;
 }
 
+/**
+ * What a qualify can actually observe about a peer, as the domain names it.
+ *
+ * Deliberately NOT the full `TRUNK_STATUSES` vocabulary from `pbx-db`: `disabled` is a
+ * control-plane decision recorded when a tenant flips the row, never a fact a ping can report, so
+ * a media server that could say it would be lying. The four members here are the observable
+ * subset, and they are assignable into the persisted vocabulary by construction.
+ */
+export const TRUNK_ENDPOINT_STATUSES = ["up", "down", "degraded", "unknown"] as const;
+export type TrunkEndpointStatus = (typeof TRUNK_ENDPOINT_STATUSES)[number];
+
+/**
+ * The media server's verdict on a trunk endpoint changed — the qualify loop's transition.
+ *
+ * The FIRST member of this union that is not about a call: it names an ENDPOINT, not a channel,
+ * and its consumer is the trunk-status publisher rather than any per-call state machine. It rides
+ * this union anyway because the alternative is a second event socket contract for one event, and
+ * because `mediad` will one day be the process running the qualifies and must be able to emit
+ * this shape natively like every other member.
+ *
+ * `endpoint` is the media server's name for the peer, which under the dial template
+ * (`PJSIP/{number}@{trunk}`) IS the trunk's name — the id-mapping back to a `trunk` row happens
+ * in the publisher, against the routing artifact, not here.
+ */
+export interface MediaTrunkEndpointStatusEvent {
+	readonly type: "trunk-endpoint-status";
+	readonly endpoint: string;
+	readonly status: TrunkEndpointStatus;
+	/** The media server's own word, verbatim (`Reachable`, `Unreachable`, …), for the record. */
+	readonly reason: string;
+	/** Qualify round-trip in milliseconds, when the media server measured one. */
+	readonly latencyMs?: number;
+}
+
 /** Every event a media server can tell this engine about. */
 export type MediaEvent =
 	| MediaLegArrivedEvent
@@ -207,7 +241,8 @@ export type MediaEvent =
 	| MediaLegUnheldEvent
 	| MediaRecordingStartedEvent
 	| MediaRecordingFinishedEvent
-	| MediaRecordingFailedEvent;
+	| MediaRecordingFailedEvent
+	| MediaTrunkEndpointStatusEvent;
 
 /**
  * The event names, as data.
@@ -228,6 +263,7 @@ export const MEDIA_EVENT_TYPES = [
 	"recording-started",
 	"recording-finished",
 	"recording-failed",
+	"trunk-endpoint-status",
 ] as const satisfies readonly MediaEvent["type"][];
 
 export type MediaEventType = (typeof MEDIA_EVENT_TYPES)[number];

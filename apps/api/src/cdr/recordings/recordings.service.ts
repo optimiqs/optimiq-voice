@@ -1,5 +1,6 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
+import { purgedRecordingSoftDeleteQuery } from "@optimiq-voice/cdr-db";
 import { getLogger } from "@optimiq-voice/logging";
 import { openMediaResponse } from "../../media/media-response";
 import { ObjectKeyOutsideRootError } from "../../storage";
@@ -181,6 +182,70 @@ export class RecordingsService {
 				expiresInSeconds: ttl,
 			},
 		};
+	}
+
+	/**
+	 * Deletes one recording on request: the object goes, the row becomes a tombstone.
+	 *
+	 * ## Why this exists now
+	 *
+	 * `recordings.delete` has been in the permission registry since it was written and there has
+	 * never been a `@Delete` on this controller — a grant an administrator could hand out believing
+	 * it did something, guarding nothing. This is the endpoint it always described.
+	 *
+	 * ## Objects first, row second — the sweep's ordering, and for the sweep's reason
+	 *
+	 * `recording-retention-sweeper.service.ts` argues it at length and the argument does not change
+	 * because a person pressed a button instead of a timer firing: a row tombstoned before its
+	 * object is gone is a recording this API refuses to play while the audio is still in the bucket
+	 * — deleted for the customer and retained for a subpoena, which is the worst of both. A store
+	 * that refuses the delete therefore fails the request and leaves the recording playable, so the
+	 * caller can try again rather than being told something happened that did not.
+	 *
+	 * ## A tombstone, not a `DELETE FROM`
+	 *
+	 * The row survives with `deleted_at` set, exactly as the retention sweep leaves it, and the
+	 * tombstone purge collects it after `DEFAULT_RECORDING_TOMBSTONE_MONTHS`. That is not
+	 * squeamishness about deletion: `call_legs.recording_key` points at this object, and a CDR row
+	 * whose recording reference resolves to nothing at all cannot tell a reader whether the
+	 * recording was deleted or never made. The tombstone is what makes the 410 — "it existed, it is
+	 * gone" — expressible, and `recordings.service.ts` and `cdr.repository.ts` already read it that
+	 * way everywhere else.
+	 *
+	 * Deleting a recording that is already a tombstone is a 410 rather than a 204. It is not
+	 * idempotence being refused — nothing changes either way — it is the endpoint declining to
+	 * report that it deleted something it did not.
+	 */
+	async delete(
+		session: AppSession,
+		id: string,
+	): Promise<{ readonly data: { readonly id: string } }> {
+		const organizationId = this.organizationId(session);
+		const row = await this.database.withTenantScope(
+			organizationId,
+			async (transaction) => await getRecording(transaction, id),
+		);
+		if (row === undefined) {
+			throw new CdrNotFoundException("recording", id);
+		}
+		if (row.deletedAt !== null) {
+			throw new CdrMediaGoneException();
+		}
+
+		// Idempotent on all three drivers — an object that is already gone is the state we wanted —
+		// so a retry after a partial failure costs nothing. A real transport failure propagates and
+		// the row stays untouched, which is the point of doing this first.
+		await this.store.delete(row.objectKey);
+
+		await this.database.withTenantScope(organizationId, async (transaction) => {
+			await transaction.execute(purgedRecordingSoftDeleteQuery(new Date(), [row.id]));
+		});
+
+		logger.info(
+			{ organizationId, recordingId: row.id, actorId: session.user.id },
+			"a recording was deleted on request",
+		);
+		return { data: { id: row.id } };
 	}
 
 	/**

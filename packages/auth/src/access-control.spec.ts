@@ -96,9 +96,16 @@ describe("buildOrganizationAccessControl", () => {
 
 	it("does not grant a template a permission outside its registry entry", () => {
 		const { roles } = buildOrganizationAccessControl();
-		// `user` is the smallest template; `secrets.read` belongs to `owner` alone.
-		expect(roles.user?.authorize({ secrets: ["read"] } as never).success).toBe(false);
-		expect(roles.owner?.authorize({ secrets: ["read"] } as never).success).toBe(true);
+		// `user` is the smallest template; `numbers.order` belongs to `owner` and `admin` alone.
+		//
+		// This used to read `secrets.read`, which was the sharpest example available: a grant only
+		// `owner` held. `secrets.*` has since been retired — the table it guarded was dropped with
+		// the legacy platform, so the permission checked nothing (see `RETIRED_PERMISSIONS`) — and
+		// `numbers.order` is the closest surviving pair. It is a real boundary rather than a
+		// convenient one: it spends the organization's money, and the registry entry argues at
+		// length for why it is not a ride on `numbers.write`.
+		expect(roles.user?.authorize({ numbers: ["order"] } as never).success).toBe(false);
+		expect(roles.owner?.authorize({ numbers: ["order"] } as never).success).toBe(true);
 	});
 
 	it("layers the membership role's plugin statements under each template", () => {

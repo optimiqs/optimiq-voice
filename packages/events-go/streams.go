@@ -170,6 +170,29 @@ var MediaStream = StreamDefinition{
 	NumReplicas:       1,
 }
 
+// TrunksStream carries carrier reachability transitions on their way to the trunk.status* columns.
+//
+// Modelled on RegistrationsStream, because it is the same kind of stream one hop out: the edge's
+// verdict on whether a peer answers, where the persisted row is the eventually-consistent view and
+// the stream is the transition log behind it. Seven days rather than registration's 24 hours: a
+// trunk transition is rare (the producer publishes changes, not qualify ticks), so the stream is
+// nearly empty at any retention, and a week lets "when did carrier-a start flapping?" be answered
+// on Monday about a weekend.
+var TrunksStream = StreamDefinition{
+	Name:              "TRUNKS",
+	Description:       "Carrier trunk status transitions consumed durably by the pbx writer (audit 4.5).",
+	Subjects:          []string{AllTrunksFilter()},
+	Retention:         RetentionLimits,
+	Storage:           StorageFile,
+	Discard:           DiscardOld,
+	MaxAge:            7 * 24 * time.Hour,
+	MaxMsgs:           Unlimited,
+	MaxBytes:          1 * gib,
+	MaxMsgsPerSubject: Unlimited,
+	DuplicateWindow:   2 * time.Minute,
+	NumReplicas:       1,
+}
+
 // CDRStream carries per-leg call records on their way to cdr-db. "Replay = rebuild": the 30-day
 // window is how far back the CDR table can be reconstructed from the log alone.
 var CDRStream = StreamDefinition{
@@ -227,6 +250,7 @@ var EventStreams = []StreamDefinition{
 	QueuesStream,
 	VoicemailStream,
 	MediaStream,
+	TrunksStream,
 	CDRStream,
 	AuditStream,
 	ProvisionStream,

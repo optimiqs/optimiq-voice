@@ -11,6 +11,7 @@ import { makeMediaEvent } from "../src/schemas/media-events";
 import { makeProvisionEvent } from "../src/schemas/provision-events";
 import { makeQueueEvent } from "../src/schemas/queue-events";
 import { makeRegistrationEvent } from "../src/schemas/registration-events";
+import { makeTrunkEvent } from "../src/schemas/trunk-events";
 import { makeVoicemailEvent } from "../src/schemas/voicemail-events";
 import {
 	EVENT_STREAMS,
@@ -34,6 +35,7 @@ import {
 	SUBJECT_VERSION,
 	subjectFilterFor,
 	subjectFor,
+	TRUNK_EVENTS,
 	VOICEMAIL_EVENTS,
 } from "../src/subjects";
 import { GoFileEmitter, pascal, type JsonSchema } from "./go-emitter";
@@ -411,6 +413,7 @@ const SESSION_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53";
 const SUPERVISOR_LEG_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b54";
 const SUPERVISOR_CALL_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b55";
 const PAGING_GROUP_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b56";
+const TRUNK_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57";
 const MEDIAD_INSTANCE = "mediad-7c9f2a1b";
 /** DIDs in the two shapes the index has to reconcile: as stored, and as a carrier delivers it. */
 const DID_STORED = "+441632960111";
@@ -750,6 +753,23 @@ function eventSamples(): readonly {
 	});
 
 	samples.push({
+		name: "trunk.status.changed",
+		goType: "TrunkStatusChangedData",
+		envelope: makeTrunkEvent("status.changed", {
+			...next(),
+			source: "engine",
+			orgId: ORG_A,
+			trunkId: TRUNK_A,
+			data: {
+				status: "down",
+				reason: "Unreachable",
+				latencyMs: 1_240,
+				endpoint: "carrier-a",
+			},
+		}),
+	});
+
+	samples.push({
 		name: "cdr.leg.write",
 		goType: "CDRLegWriteData",
 		envelope: makeCdrLegWriteEvent({
@@ -877,6 +897,11 @@ function parityGolden(): unknown {
 			args: [ORG_A, SESSION_A, "session.rtp-timeout"],
 			subject: subjectFor.media(ORG_A, SESSION_A, "session.rtp-timeout"),
 		},
+		{
+			builder: "trunk",
+			args: [ORG_A, TRUNK_A, "status.changed"],
+			subject: subjectFor.trunk(ORG_A, TRUNK_A, "status.changed"),
+		},
 		{ builder: "cdrLeg", args: [ORG_A], subject: subjectFor.cdrLeg(ORG_A) },
 		{ builder: "audit", args: [ORG_A], subject: subjectFor.audit(ORG_A) },
 		{ builder: "provision", args: [ORG_A], subject: subjectFor.provision(ORG_A) },
@@ -944,6 +969,13 @@ function parityGolden(): unknown {
 			args: [ORG_A, "session.ended"],
 			result: subjectFilterFor.mediaEventInOrg(ORG_A, "session.ended"),
 		},
+		{ filter: "allTrunks", args: [], result: subjectFilterFor.allTrunks() },
+		{ filter: "trunksInOrg", args: [ORG_A], result: subjectFilterFor.trunksInOrg(ORG_A) },
+		{
+			filter: "trunkStatusInOrg",
+			args: [ORG_A],
+			result: subjectFilterFor.trunkStatusInOrg(ORG_A),
+		},
 		{ filter: "allCdrLegs", args: [], result: subjectFilterFor.allCdrLegs() },
 		{ filter: "cdrLegsInOrg", args: [ORG_A], result: subjectFilterFor.cdrLegsInOrg(ORG_A) },
 		{ filter: "allAudit", args: [], result: subjectFilterFor.allAudit() },
@@ -958,6 +990,7 @@ function parityGolden(): unknown {
 		subjectFor.queue(ORG_A, QUEUE_A, "caller.joined"),
 		subjectFor.voicemail(ORG_A, MAILBOX_A, "message.left"),
 		subjectFor.media(ORG_A, SESSION_A, "session.rtp-timeout"),
+		subjectFor.trunk(ORG_A, TRUNK_A, "status.changed"),
 		subjectFor.cdrLeg(ORG_A),
 		subjectFor.audit(ORG_A),
 		subjectFor.provision(ORG_A),
@@ -1061,6 +1094,7 @@ function parityGolden(): unknown {
 			queue: [...QUEUE_EVENTS],
 			voicemail: [...VOICEMAIL_EVENTS],
 			media: [...MEDIA_SESSION_EVENTS],
+			trunk: [...TRUNK_EVENTS],
 		},
 		eventTypes: EVENT_ENTRIES.map((entry) => ({
 			family: entry.family,

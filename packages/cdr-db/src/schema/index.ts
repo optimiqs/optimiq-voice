@@ -20,6 +20,15 @@ export { callLegs, type CallLegRow, type NewCallLegRow } from "./call-leg-schema
 export { callEvents, type CallEventRow, type NewCallEventRow } from "./call-event-schema";
 export { recordings, type NewRecordingRow, type RecordingRow } from "./recording-schema";
 export {
+	CDR_EXPORT_FAILURES,
+	CDR_EXPORT_STATUSES,
+	cdrExportJob,
+	type CdrExportFailure,
+	type CdrExportJobRow,
+	type CdrExportStatus,
+	type NewCdrExportJobRow,
+} from "./export-schema";
+export {
 	CDR_QUARANTINE_REASONS,
 	cdrWriteQuarantine,
 	type CdrQuarantineReason,
@@ -29,6 +38,7 @@ export {
 
 import { callEvents } from "./call-event-schema";
 import { callLegs } from "./call-leg-schema";
+import { cdrExportJob } from "./export-schema";
 import { cdrWriteQuarantine } from "./quarantine-schema";
 import { recordings } from "./recording-schema";
 
@@ -36,6 +46,7 @@ import { recordings } from "./recording-schema";
 export const cdrSchema = {
 	callEvents,
 	callLegs,
+	cdrExportJob,
 	cdrWriteQuarantine,
 	recordings,
 } as const;
