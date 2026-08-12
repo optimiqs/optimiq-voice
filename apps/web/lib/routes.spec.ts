@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
+	CONFERENCE_TABS,
+	conferenceTabHref,
 	DIAL_PLAN_TABS,
 	dialPlanTabHref,
 	isPublicRoute,
@@ -199,6 +201,21 @@ describe("the T2 admin block's placement", () => {
 		expect(dialPlanTabHref("streams")).toBe(`${routes.dialPlan}?tab=streams`);
 		// Translations are NOT a fifth tab — different permission, different page.
 		expect(DIAL_PLAN_TABS).not.toContain("translations" as never);
+	});
+
+	/**
+	 * The live conference view is a TAB, not a route and not a detail page.
+	 *
+	 * A room has no detail page by design — it is one flat row edited in a dialog — and the live view
+	 * could not be one anyway: the `conferences` topic's snapshot is the whole claims bucket, so
+	 * scoping it to one room would open the same org-wide subscription and discard all but one row.
+	 * Both tabs are gated by `conferences.read`, which is what makes one `PAGE_PERMISSIONS` line
+	 * enough.
+	 */
+	it("puts the live conference view on the conferences page with the section in the query", () => {
+		expect(CONFERENCE_TABS).toEqual(["rooms", "live"]);
+		expect(conferenceTabHref("rooms")).toBe(routes.conferences);
+		expect(conferenceTabHref("live")).toBe(`${routes.conferences}?tab=live`);
 	});
 
 	/** The quotas are a settings tab, so they inherit nothing from the PBX area's routes. */

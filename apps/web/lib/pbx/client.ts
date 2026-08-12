@@ -1124,6 +1124,176 @@ export async function clearConferencePin(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Conference moderation — the live room, not the row
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * `/api/v1/conferences/:id/…` — the MEETING, as opposed to the configuration above it.
+ *
+ * A separate block from the PIN calls for the same reason the server keeps it in a separate
+ * controller: nothing here touches the `conference` row, and everything here is gone when the
+ * participant hangs up or the room empties. The two are also guarded differently — every route
+ * declares `conferences.read` and the service makes the real decision against `conferences.moderate`
+ * — so a caller that may set a room's PIN may still be refused a mute.
+ *
+ * ## The ACTION is in the path
+ *
+ * `POST …/participants/:ref/mute`, never `PATCH …/participants/:ref { muted: true }`. That is the
+ * server's choice and it is worth mirroring rather than smoothing over: a path verb has exactly one
+ * target, so there is no request a client can half-fill, and "POST …/kick" is what an audit trail
+ * needs to read back.
+ *
+ * ## `:ref` is a LEG id
+ *
+ * The identifier `conference.joined` publishes — `lib/live/store.ts` holds it as
+ * `LiveConferenceParticipant.legId` — and NOT a media channel id, which is the engine's private
+ * handle onto a media server. The server treats it as an opaque token, so it is percent-encoded
+ * here rather than assumed to be a UUID.
+ */
+
+export const CONFERENCE_PARTICIPANT_ACTIONS = ["mute", "unmute", "deaf", "undeaf", "kick"] as const;
+export type ConferenceParticipantAction = (typeof CONFERENCE_PARTICIPANT_ACTIONS)[number];
+
+/** Every verb this surface has, including the two that address a room rather than a person. */
+export type ConferenceModerationAction = ConferenceParticipantAction | "volume" | "lock" | "unlock";
+
+/**
+ * Which half of a member's level a volume command moves. Omitted means both, which is a slider.
+ *
+ * Every value is refused with a typed 501 on both drivers today — see
+ * {@link setConferenceParticipantVolume}.
+ */
+export const CONFERENCE_GAIN_SCOPES = ["talk", "listen", "both"] as const;
+export type ConferenceGainScope = (typeof CONFERENCE_GAIN_SCOPES)[number];
+
+/** Percent of unity, mirroring `setConferenceVolumeDto`. 100 is unchanged; 0 is silent. */
+export const CONFERENCE_GAIN_PERCENT_MIN = 0;
+export const CONFERENCE_GAIN_PERCENT_MAX = 400;
+
+/**
+ * What a moderation command answers with. Mirrors `ConferenceModerationView` in `apps/api`.
+ *
+ * It carries the member's WHOLE state rather than an acknowledgement, for the reason
+ * `conference.participant.updated` does — so a caller may render the answer directly instead of
+ * inferring what the command must have done.
+ */
+export interface ConferenceModerationView {
+	readonly conferenceId: string;
+	readonly action: ConferenceModerationAction;
+	/** People in the room, cluster-wide, AFTER the command. */
+	readonly memberCount: number;
+	readonly locked?: boolean;
+	readonly memberRef?: string;
+	readonly muted?: boolean;
+	readonly deafened?: boolean;
+	readonly moderator?: boolean;
+	readonly talkGainPercent?: number;
+	readonly listenGainPercent?: number;
+}
+
+/**
+ * The path a moderation command posts to.
+ *
+ * Exported, and built here rather than at each call site, because it is the one part of this
+ * surface a spec can pin without a server: a room action and a participant action differ only by two
+ * path segments, and a builder that put `:ref` on a `lock` would send a moderator's room command to
+ * a member who does not exist.
+ */
+export function conferenceModerationPath(
+	conferenceId: string,
+	action: ConferenceModerationAction,
+	memberRef?: string,
+): string {
+	if (action === "lock" || action === "unlock") {
+		return `/conferences/${conferenceId}/${action}`;
+	}
+	// Percent-encoded because the server documents the leg id as an OPAQUE token it does not
+	// validate the shape of. It is a UUID on this platform today, and encoding it costs nothing to
+	// stop being true.
+	return `/conferences/${conferenceId}/participants/${encodeURIComponent(memberRef ?? "")}/${action}`;
+}
+
+/**
+ * The body for a volume command.
+ *
+ * `gainPercent` is ROUNDED, which is not tidying: the server's DTO is `z.number().int()` and a
+ * slider bound to a numeric input can produce `99.5`, so an unrounded value would be a control that
+ * fails validation for a reason no operator could see. `scope` is omitted when unspecified, because
+ * an absent scope means "both" to the server and sending a value it would have defaulted anyway
+ * turns a single slider into a request that claims to have chosen.
+ */
+export function conferenceVolumeBody(
+	gainPercent: number,
+	scope?: ConferenceGainScope,
+): { readonly gainPercent: number; readonly scope?: ConferenceGainScope } {
+	return {
+		gainPercent: Math.round(gainPercent),
+		...(scope === undefined ? {} : { scope }),
+	};
+}
+
+/**
+ * Mutes, unmutes, deafens, undeafens or removes one participant.
+ *
+ * The body is `{}` and not absent, on the `applyAgentSessionAction` precedent: the server's DTO is
+ * `strictObject({})`, so a typo'd key is a 400 rather than a silently dropped value — and on this
+ * surface a dropped value would be the difference between muting somebody and doing nothing.
+ */
+export async function moderateConferenceParticipant(
+	conferenceId: string,
+	memberRef: string,
+	action: ConferenceParticipantAction,
+): Promise<ItemEnvelope<ConferenceModerationView>> {
+	return await apiFetch<ItemEnvelope<ConferenceModerationView>>(
+		conferenceModerationPath(conferenceId, action, memberRef),
+		{ method: "POST", body: JSON.stringify({}) },
+	);
+}
+
+/**
+ * Stops, or resumes, the room admitting new participants.
+ *
+ * The state is sent as the VERB rather than as a body field, which is what makes the control
+ * idempotent for a panel that has just rendered the current state: two fast clicks on Lock leave the
+ * room locked rather than back where it started. A room at its member cap is a different thing and
+ * gets a different announcement — full admits the next arrival when somebody leaves, locked does
+ * not admit anybody.
+ */
+export async function setConferenceLocked(
+	conferenceId: string,
+	locked: boolean,
+): Promise<ItemEnvelope<ConferenceModerationView>> {
+	return await apiFetch<ItemEnvelope<ConferenceModerationView>>(
+		conferenceModerationPath(conferenceId, locked ? "lock" : "unlock"),
+		{ method: "POST", body: JSON.stringify({}) },
+	);
+}
+
+/**
+ * Re-levels a participant — and is REFUSED with a typed 501 on every media plane this platform runs.
+ *
+ * It exists here rather than being omitted for the same reason the route exists rather than 404ing:
+ * what is missing is a WIRE, not a feature. Asterisk has no per-participant gain on a mixing bridge
+ * at all, and `apps/mediad`'s mixer has `Member.SetGain` with no command that reaches it. A client
+ * that hid the control would tell an operator this product does not do volume control; a client that
+ * offers it disabled, naming the `CONFERENCE_ACTION_NOT_SERVABLE` refusal, tells them the truth.
+ *
+ * So the only caller today is the one that would fire if the seam were built. See
+ * `conferenceModerationMessage` in `./errors.ts` for the words the refusal is rendered as.
+ */
+export async function setConferenceParticipantVolume(
+	conferenceId: string,
+	memberRef: string,
+	gainPercent: number,
+	scope?: ConferenceGainScope,
+): Promise<ItemEnvelope<ConferenceModerationView>> {
+	return await apiFetch<ItemEnvelope<ConferenceModerationView>>(
+		conferenceModerationPath(conferenceId, "volume", memberRef),
+		{ method: "POST", body: JSON.stringify(conferenceVolumeBody(gainPercent, scope)) },
+	);
+}
+
+// ---------------------------------------------------------------------------------------------
 // The media library
 // ---------------------------------------------------------------------------------------------
 

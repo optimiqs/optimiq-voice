@@ -625,6 +625,11 @@ async function main(): Promise<void> {
 			"/queues",
 			"/queues?tab=agents",
 			"/conferences",
+			// The live moderation surface, and the only tab on this page that opens a WebSocket. It is
+			// a `?tab=` view of one subject rather than a route, so a tab that 404s or crashes would
+			// otherwise be invisible to a route list — and this one renders nothing at all until the
+			// live topic answers, which is exactly the shape of failure a smoke run should catch.
+			"/conferences?tab=live",
 			"/park-lots",
 			// The media library, and its second tab. Both are `?tab=` views of one page, so a tab
 			// that 404s or crashes would otherwise be invisible to a route list.
@@ -2411,10 +2416,11 @@ async function runSettingsCascadeChecks(client: Client): Promise<void> {
  * grant from the edit form beside it, an override that lives under `/call-flows` and writes a time
  * condition, a PIN that goes in and never comes back, and a singleton reached without an id.
  *
- * What it deliberately does NOT try is attaching a PIN set to an outbound route or a ruleset to a
- * trunk. Those columns exist and the compiler reads them, and no write DTO declares them — the
- * refusal below is asserted rather than worked around, because it is the reason the two forms render
- * those fields read-only.
+ * Attaching a PIN set to an outbound route, a ruleset to either end, and a star code to a time
+ * condition are all writes now — the four columns the compiler already read gained DTO fields, so
+ * the checks below write them and read them back. They used to pin the 400 that proved no DTO
+ * declared them, which is what kept those fields read-only on screen; the same checks now fail if a
+ * write is ever refused again, which is the direction that matters once the forms are pickers.
  */
 async function runAdminBlockChecks(client: Client): Promise<void> {
 	// --- named destinations, streams, directories and speed dials ---------------------------------
@@ -2580,14 +2586,28 @@ async function runAdminBlockChecks(client: Client): Promise<void> {
 		`override ${String(data(released).override)}`,
 	);
 
-	/** The column exists, the compiler screens it, and no DTO accepts it — so no form offers it. */
+	/**
+	 * The column exists, the compiler screens it against the feature-code catalogue, and the DTO now
+	 * accepts it — so the card offers it. `*291` is chosen because nothing in the seeded catalogue is
+	 * a prefix of it; a code that collided would come back as a compile rollback, not a 400.
+	 */
 	const overrideCode = await client("PATCH", `/api/v1/time-conditions/${conditionId}`, {
 		overrideFeatureCode: "*291",
 	});
 	check(
-		"the override star code is not writable, which is why the card renders it read-only",
-		overrideCode.status === 400,
-		`status ${overrideCode.status}`,
+		"the override star code is writable, which is why the card renders an input",
+		overrideCode.status === 200 && data(overrideCode).overrideFeatureCode === "*291",
+		`status ${overrideCode.status}, code ${String(data(overrideCode).overrideFeatureCode)}`,
+	);
+
+	/** `null` is how the form's "no star code" option says what it means, and how it is unassigned. */
+	const clearedCode = await client("PATCH", `/api/v1/time-conditions/${conditionId}`, {
+		overrideFeatureCode: null,
+	});
+	check(
+		"and null clears it, so a lamp key is unassigned without deleting the condition",
+		clearedCode.status === 200 && data(clearedCode).overrideFeatureCode === null,
+		`status ${clearedCode.status}, code ${String(data(clearedCode).overrideFeatureCode)}`,
 	);
 
 	// --- translation rulesets and their ordered rules ----------------------------------------------
@@ -2693,11 +2713,12 @@ async function runAdminBlockChecks(client: Client): Promise<void> {
 		Object.keys(entryRows[0] ?? {}).join(","),
 	);
 
-	// --- the three attachments no request body may carry ------------------------------------------
+	// --- the three attachments, which the request body now carries --------------------------------
 	/**
-	 * The reason the outbound-route and trunk dialogs render these read-only. If any of the three
-	 * ever starts succeeding, those forms should become pickers in the same commit — and this check
-	 * is what will say so, by failing.
+	 * The reason the outbound-route and trunk dialogs render these as pickers. The columns were
+	 * always compiled; what they lacked was a DTO field, and this used to assert the 400 that proved
+	 * it. Each is written and read back, because a key a strict object accepted and the repository
+	 * dropped would look identical to a working write from the form's side.
 	 */
 	const routes = await client("GET", "/api/v1/outbound-routes?page=1&limit=1");
 	const outboundRouteId = firstId(routes);
@@ -2706,13 +2727,51 @@ async function runAdminBlockChecks(client: Client): Promise<void> {
 		translationRulesetId: rulesetId,
 	});
 	const trunks = await client("GET", "/api/v1/trunks?page=1&limit=1");
-	const inbound = await client("PATCH", `/api/v1/trunks/${firstId(trunks)}`, {
+	const trunkId = firstId(trunks);
+	const inbound = await client("PATCH", `/api/v1/trunks/${trunkId}`, {
 		inboundTranslationRulesetId: rulesetId,
 	});
 	check(
-		"none of the three new attachments is writable, which is what the two forms say on screen",
-		gated.status === 400 && rewritten.status === 400 && inbound.status === 400,
-		`pinSet ${gated.status}, ruleset ${rewritten.status}, trunk ${inbound.status}`,
+		"all three attachments are writable, and each answers with the id it stored",
+		gated.status === 200 &&
+			data(gated).pinSetId === pinSetId &&
+			rewritten.status === 200 &&
+			data(rewritten).translationRulesetId === rulesetId &&
+			inbound.status === 200 &&
+			data(inbound).inboundTranslationRulesetId === rulesetId,
+		`pinSet ${gated.status}/${String(data(gated).pinSetId)}, ruleset ${rewritten.status}/${String(data(rewritten).translationRulesetId)}, trunk ${inbound.status}/${String(data(inbound).inboundTranslationRulesetId)}`,
+	);
+
+	/**
+	 * The other half of making them writable: both columns are `on delete set null` in the schema and
+	 * both resources refuse the delete anyway, so a set three routes are gated by cannot vanish and
+	 * quietly widen who may dial internationally. Only reachable now that a route can be attached.
+	 */
+	const gatedSetDelete = await client("DELETE", `/api/v1/pin-sets/${pinSetId}`);
+	check(
+		"a PIN set an outbound route is gated by cannot be deleted out from under it",
+		gatedSetDelete.status === 409 &&
+			pbxErrorCode(asApiError(gatedSetDelete)) === "PBX_REFERENCED" &&
+			pbxReferences(asApiError(gatedSetDelete)).length > 0,
+		`status ${gatedSetDelete.status}, ${pbxReferences(asApiError(gatedSetDelete)).length} references`,
+	);
+
+	/** `null` detaches, which is what the picker's "None" option sends. */
+	const detachedPin = await client("PATCH", `/api/v1/outbound-routes/${outboundRouteId}`, {
+		pinSetId: null,
+		translationRulesetId: null,
+	});
+	const detachedTrunk = await client("PATCH", `/api/v1/trunks/${trunkId}`, {
+		inboundTranslationRulesetId: null,
+	});
+	check(
+		"and null detaches all three, which is what the pickers' None option sends",
+		detachedPin.status === 200 &&
+			data(detachedPin).pinSetId === null &&
+			data(detachedPin).translationRulesetId === null &&
+			detachedTrunk.status === 200 &&
+			data(detachedTrunk).inboundTranslationRulesetId === null,
+		`route ${detachedPin.status}, trunk ${detachedTrunk.status}`,
 	);
 
 	// --- organization limits: a singleton, and a usage report with two honest gaps -----------------

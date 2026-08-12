@@ -4,9 +4,13 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { queueTopic } from "~/lib/live/protocol";
 import {
+	applyConferenceSnapshot,
+	applyConferenceUpdate,
 	applySnapshot,
 	applyUpdate,
+	conferenceRoomViews,
 	countLiveCalls,
+	emptyConferenceState,
 	emptyKvState,
 	isChannelLive,
 	isRegistrationLive,
@@ -18,6 +22,8 @@ import {
 	rankWaiting,
 	type LiveAgentState,
 	type LiveChannel,
+	type LiveConferenceRoomView,
+	type LiveConferenceState,
 	type LiveKvState,
 	type LiveRegistration,
 	type LiveTrunkStatus,
@@ -502,4 +508,86 @@ export function useLiveTrunks(): LiveTrunksResult {
 	useLiveTopic("trunks", { onUpdate }, { enabled: permitted });
 
 	return { statuses, permitted };
+}
+
+// ---------------------------------------------------------------------------------------------
+// conferences
+// ---------------------------------------------------------------------------------------------
+
+export interface LiveConferencesResult {
+	/** Running rooms, busiest first. Empty is a real answer once `loaded` is true. */
+	readonly rooms: readonly LiveConferenceRoomView[];
+	readonly byConferenceId: ReadonlyMap<string, LiveConferenceRoomView>;
+	/** People across every running room, cluster-wide. */
+	readonly memberCount: number;
+	readonly loaded: boolean;
+	/** Whether this session may watch the topic. Acting on it is a SECOND grant. */
+	readonly permitted: boolean;
+}
+
+/**
+ * The meetings that are happening, and who is in them.
+ *
+ * ## Two upstreams, one hook, and a reducer that is not `useKvTopic`
+ *
+ * This is the second topic (after `queue:<id>`) that cannot use the generic KV hook, and for a
+ * sharper reason than that one had. `conferences` multiplexes the claims BUCKET and the conference
+ * event STREAM, and the two do not describe the same kind of thing: a claim is a room and an event
+ * is a person. A keyed map could not hold both, and a snapshot frame does not say which source
+ * produced it. So `lib/live/store.ts` holds a reducer over both halves and this hook does nothing
+ * but keep its result in state — the same division of labour every other topic here follows.
+ *
+ * ## Why it does not invalidate the conferences list
+ *
+ * `useLiveAgentStates` invalidates because the socket knows only that a status changed while the row
+ * carries everything else the table renders. Nothing about a live meeting is on the `conference`
+ * row — not the member count, not the lock, not a participant — so there is no fetched value a
+ * refetch would correct. The trunk hook makes the same call for the same reason.
+ *
+ * ## The clock
+ *
+ * One second, and only while a room is running. Two things need it: a member's time-in-room, which
+ * grows without anything arriving on the socket, and a contribution's LEASE, which is what makes a
+ * crashed instance's seats stop counting. A panel that only recomputed on a frame would hold a
+ * crashed instance's room on screen until some unrelated meeting produced an event. It does not tick
+ * for an empty topic, which matters for the same reason it does on a wallboard: a background tab
+ * re-deriving an empty array once a second is a core burnt to display nothing.
+ */
+export function useLiveConferences(): LiveConferencesResult {
+	const permitted = usePermission("conferences.read");
+	const [state, setState] = useState<LiveConferenceState>(() => emptyConferenceState());
+	const [tick, setTick] = useState(() => Date.now());
+
+	const onSnapshot = useCallback((event: LiveSnapshotEvent) => {
+		setState(applyConferenceSnapshot(event));
+	}, []);
+	const onUpdate = useCallback((event: LiveUpdateEvent) => {
+		setState((previous) => applyConferenceUpdate(previous, event));
+	}, []);
+
+	useLiveTopic("conferences", { onSnapshot, onUpdate }, { enabled: permitted });
+
+	const running = state.rooms.size;
+	useEffect(() => {
+		if (!permitted || running === 0) {
+			return;
+		}
+		const handle = setInterval(() => {
+			setTick(Date.now());
+		}, 1_000);
+		return () => {
+			clearInterval(handle);
+		};
+	}, [permitted, running]);
+
+	return useMemo(() => {
+		const rooms = conferenceRoomViews(state, tick);
+		const byConferenceId = new Map<string, LiveConferenceRoomView>();
+		let memberCount = 0;
+		for (const room of rooms) {
+			byConferenceId.set(room.conferenceId, room);
+			memberCount += room.memberCount;
+		}
+		return { rooms, byConferenceId, memberCount, loaded: state.loaded, permitted };
+	}, [state, tick, permitted]);
 }

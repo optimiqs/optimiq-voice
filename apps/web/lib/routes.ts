@@ -366,6 +366,37 @@ export function dialPlanTabHref(tab: DialPlanTab): string {
 }
 
 /**
+ * The Conferences page's two sections: the rooms, and the meetings happening in them.
+ *
+ * ## Why a tab and not a detail page
+ *
+ * A conference room has no detail page, deliberately — `conferences-screen.tsx` argues it: a room is
+ * one flat row edited in a dialog, because a call ENDS UP in a conference rather than passing
+ * through one, so there is no timeout branch and no child collection to give a page to.
+ *
+ * The live view could not be a room's page even if one existed. It is fed by the `conferences` live
+ * topic, whose snapshot is the whole `conference-claims` bucket — every running meeting in the
+ * organization, in one frame. Scoping that to one room would mean opening the same org-wide
+ * subscription and discarding all but one row, and would leave a moderator with no way to see that
+ * two other rooms are running without visiting each configured room in turn.
+ *
+ * ## Why not a second route
+ *
+ * Both sections are gated by `conferences.read` — the moderation routes declare it as their floor
+ * and make the real `conferences.moderate` decision in the service — so a second route would be a
+ * second `PAGE_PERMISSIONS` line saying exactly what this one says. The `?tab=` keeps "look at the
+ * meeting that is running" a link, which is the thing somebody pastes into a chat when a room needs
+ * a moderator.
+ */
+export const CONFERENCE_TABS = ["rooms", "live"] as const;
+
+export type ConferenceTab = (typeof CONFERENCE_TABS)[number];
+
+export function conferenceTabHref(tab: ConferenceTab): string {
+	return tab === "rooms" ? routes.conferences : `${routes.conferences}?tab=${tab}`;
+}
+
+/**
  * Prefixes reachable without a session.
  *
  * `/accept-invitation` is here on purpose: the invitation email is opened by someone who may have

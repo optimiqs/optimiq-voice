@@ -1,223 +1,69 @@
 "use client";
 
-import { useState } from "react";
-import { DeleteEntityDialog } from "~/components/pbx/delete-entity-dialog";
-import {
-	EnabledBadge,
-	ListPagination,
-	ListToolbar,
-	ResourceTable,
-	useListQueryState,
-} from "~/components/pbx/resource-list";
-import { RowActions } from "~/components/pbx/row-actions";
-import { Badge } from "~/components/ui/badge";
-import { Button } from "~/components/ui/button";
-import { MenuItem } from "~/components/ui/menu";
+import { parseAsStringLiteral, useQueryState } from "nuqs";
 import { PageHeader } from "~/components/ui/page-header";
-import { DEFAULT_PAGE_LIMIT, PBX_RESOURCES, type ConferencePinRole } from "~/lib/pbx/client";
-import { usePermission } from "../../_context/session-context";
-import { usePbxDelete, usePbxList } from "../../_hooks/use-pbx-queries";
-import { ConferenceDialog } from "./conference-dialog";
-import { ConferencePinDialog } from "./conference-pin-dialog";
-import type { ConferenceRow } from "~/lib/pbx/contracts";
+import { Tabs, TabsIndicator, TabsList, TabsPanel, TabsTrigger } from "~/components/ui/tabs";
+import { CONFERENCE_TABS, type ConferenceTab } from "~/lib/routes";
+import { LiveIndicator } from "../../queues/_components/agent-console";
+import { ConferencesPanel } from "./conferences-panel";
+import { LiveConferencesPanel } from "./live-conferences-panel";
 
 /**
- * Conference rooms.
+ * Conference rooms, and the meetings running in them: two views of one subject, on one page.
  *
- * A room has no destination of its own — a conference is where a call ENDS UP, not a step on the
- * way somewhere else, and a participant who leaves has hung up. So there is no timeout branch to
- * configure and no detail page: a room is one flat row, edited in a dialog over its list.
+ * The ROW and the MEETING are genuinely different things — editing a room's recording policy is
+ * forever and muting somebody lasts as long as they are on the call, which is why the API keeps them
+ * in two controllers behind two grants — but they are two views of the same room, and `lib/routes.ts`
+ * argues why that makes them tabs rather than a second route or a detail page that does not exist.
  *
- * What DOES point at a room — DIDs, IVR options, ring-group timeouts — is surfaced where it matters
- * most: the delete is refused while anything still targets it, and the confirmation names every
- * referrer as a link.
- *
- * ## The two PINs are row actions, and neither is a column
- *
- * The server never returns `pinHash` or `moderatorPinHash` — they are stripped from every response
- * — so there is nothing for a column to render: this table cannot say whether a room has a PIN, and
- * a column that guessed would be wrong in the direction that matters. The actions describe what
- * they DO instead, which is the honest version, exactly as the voicemail screen does for its
- * mailbox PIN.
- *
- * One dialog component serves both, keyed by the room AND the role: opening the moderator PIN for
- * one room after the participant PIN of another must not reuse the first dialog's typed digits.
+ * Both tabs are reachable with `conferences.read`. The live tab's CONTROLS are gated a second time,
+ * inside the panel, on `conferences.moderate`.
  */
+const TAB_LABELS: Readonly<Record<ConferenceTab, string>> = {
+	rooms: "Rooms",
+	live: "Active conferences",
+};
+
 export function ConferencesScreen() {
-	const resource = PBX_RESOURCES.conferences;
-	const { query, search, setSearch, enabledFilter, setEnabledFilter, page, setPage } =
-		useListQueryState();
-	const list = usePbxList(resource, query);
-	const remove = usePbxDelete(resource);
-
-	const canWrite = usePermission(resource.permissions.write);
-	const canDelete = usePermission(resource.permissions.delete);
-
-	const [editing, setEditing] = useState<ConferenceRow | null>(null);
-	const [dialogOpen, setDialogOpen] = useState(false);
-	const [pendingDelete, setPendingDelete] = useState<ConferenceRow | null>(null);
-	const [pinFor, setPinFor] = useState<{
-		readonly conference: ConferenceRow;
-		readonly role: ConferencePinRole;
-	} | null>(null);
-
-	const createButton = canWrite ? (
-		<Button
-			variant="primary"
-			onClick={() => {
-				setEditing(null);
-				setDialogOpen(true);
-			}}
-		>
-			New conference room
-		</Button>
-	) : null;
+	const [tab, setTab] = useQueryState(
+		"tab",
+		parseAsStringLiteral(CONFERENCE_TABS)
+			.withDefault("rooms")
+			.withOptions({ clearOnDefault: true }),
+	);
 
 	return (
 		<>
 			<PageHeader
 				title="Conferences"
 				description="Rooms people dial to end up in the same call. PINs are managed separately — the API hashes them behind an endpoint rather than accepting a digest here."
-				actions={createButton}
+				actions={tab === "live" ? <LiveIndicator /> : null}
 			/>
 
-			<ListToolbar
-				search={search}
-				onSearchChange={setSearch}
-				enabledFilter={enabledFilter}
-				onEnabledFilterChange={setEnabledFilter}
-				searchPlaceholder="Name or room number"
-			/>
+			<Tabs value={tab} onValueChange={(next) => void setTab(next as ConferenceTab)}>
+				<TabsList>
+					{CONFERENCE_TABS.map((value) => (
+						<TabsTrigger key={value} value={value}>
+							{TAB_LABELS[value]}
+						</TabsTrigger>
+					))}
+					<TabsIndicator />
+				</TabsList>
 
-			<ResourceTable
-				rows={list.rows}
-				isPending={list.query.isPending}
-				filtered={search.length > 0 || enabledFilter !== "all"}
-				emptyTitle="No conference rooms yet"
-				emptyDescription="A room is a number several people dial to end up in one call. Give it a number and a size."
-				emptyAction={createButton}
-				caption="Conference rooms in this organization"
-				columns={[
-					{
-						key: "roomNumber",
-						header: "Dial",
-						className: "font-mono font-medium whitespace-nowrap",
-						cell: (row) => row.roomNumber,
-					},
-					{ key: "name", header: "Name", className: "font-medium", cell: (row) => row.name },
-					{
-						key: "maxMembers",
-						header: "Seats",
-						cell: (row) => (
-							<span className="text-sm text-muted-foreground" data-tabular>
-								up to {row.maxMembers}
-							</span>
-						),
-					},
-					{
-						key: "behaviour",
-						header: "Behaviour",
-						cell: (row) => (
-							<div className="flex flex-wrap gap-1">
-								{row.waitForModerator ? <Badge tone="warning">Waits for moderator</Badge> : null}
-								{row.recordPolicy !== "none" ? <Badge tone="accent">Recorded</Badge> : null}
-								{row.announceJoinLeave ? <Badge tone="neutral">Announces</Badge> : null}
-								{!row.waitForModerator && row.recordPolicy === "none" && !row.announceJoinLeave
-									? "—"
-									: null}
-							</div>
-						),
-					},
-					{
-						key: "enabled",
-						header: "State",
-						cell: (row) => <EnabledBadge enabled={row.enabled} />,
-					},
-				]}
-				rowActions={(row) => (
-					<RowActions
-						label={`conference room ${row.roomNumber}`}
-						extra={
-							canWrite ? (
-								<>
-									<MenuItem onClick={() => setPinFor({ conference: row, role: "participant" })}>
-										Room PIN…
-									</MenuItem>
-									<MenuItem onClick={() => setPinFor({ conference: row, role: "moderator" })}>
-										Moderator PIN…
-									</MenuItem>
-								</>
-							) : null
-						}
-						onEdit={
-							canWrite
-								? () => {
-										setEditing(row);
-										setDialogOpen(true);
-									}
-								: undefined
-						}
-						onDelete={
-							canDelete
-								? () => {
-										remove.reset();
-										setPendingDelete(row);
-									}
-								: undefined
-						}
-					/>
-				)}
-			/>
-
-			<ListPagination
-				page={page}
-				limit={DEFAULT_PAGE_LIMIT}
-				total={list.total}
-				totalPages={list.totalPages}
-				onPageChange={setPage}
-			/>
-
-			<ConferenceDialog
-				key={editing?.id ?? "new"}
-				open={dialogOpen}
-				onOpenChange={setDialogOpen}
-				conference={editing}
-			/>
-
-			<ConferencePinDialog
-				key={`pin-${pinFor?.role ?? "none"}-${pinFor?.conference.id ?? "none"}`}
-				open={pinFor !== null}
-				onOpenChange={(open) => {
-					if (!open) {
-						setPinFor(null);
-					}
-				}}
-				conference={pinFor?.conference ?? null}
-				role={pinFor?.role ?? "participant"}
-			/>
-
-			<DeleteEntityDialog
-				open={pendingDelete !== null}
-				onOpenChange={(open) => {
-					if (!open) {
-						setPendingDelete(null);
-						remove.reset();
-					}
-				}}
-				entityLabel="conference room"
-				entityName={
-					pendingDelete ? `${pendingDelete.roomNumber} · ${pendingDelete.name}` : "this room"
-				}
-				description="Anyone in the room when it goes is unaffected; the number simply stops answering. Anything that routes calls into it must be re-pointed first — the delete is refused while anything still targets it."
-				pending={remove.isPending}
-				error={remove.error}
-				onConfirm={() => {
-					if (!pendingDelete) {
-						return;
-					}
-					remove.mutate(pendingDelete.id, { onSuccess: () => setPendingDelete(null) });
-				}}
-			/>
+				<TabsPanel value="rooms">
+					<ConferencesPanel />
+				</TabsPanel>
+				{/*
+				 * Mounted only while selected, which is Base UI's default (`keepMounted: false`) and is
+				 * relied on here rather than merely inherited: this panel's mount is what opens the
+				 * `conferences` live subscription, and that pulls the whole claims bucket plus every
+				 * conference event in the organization. Kept mounted behind a tab nobody is looking at,
+				 * every visit to the rooms list would open a live feed the visitor did not ask for.
+				 */}
+				<TabsPanel value="live">
+					<LiveConferencesPanel />
+				</TabsPanel>
+			</Tabs>
 		</>
 	);
 }
