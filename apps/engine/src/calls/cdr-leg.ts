@@ -193,6 +193,38 @@ export function queueLegOf(variables: Readonly<Record<string, string | undefined
 	};
 }
 
+/**
+ * The authorisation code that opened a gated outbound route, off the leg's variables.
+ *
+ * Symmetric with {@link queueLegOf} and mirrored the same way and for the same reason: the CDR is
+ * written by whichever of teardown and the walk's return gets there first, and only the channel
+ * variables are visible to both. They also travel into the `channels` bucket, so an instance that
+ * picks the leg up after a failover writes the same record this one would have.
+ *
+ * The ORDINAL is what makes the pair real. A label with no ordinal is not a partial authorisation,
+ * it is a variable somebody set on a call that was never gated, and it is dropped rather than
+ * reported. The digits are nowhere in this function because they are nowhere past the walker — see
+ * `PlanWalkerDependencies.onPinAuthorization`.
+ */
+export function authorizationOf(variables: Readonly<Record<string, string | undefined>>): {
+	authPinOrdinal?: number;
+	authPinLabel?: string;
+} {
+	const ordinal = Number(variables.OPTIMIQ_AUTH_PIN_ORDINAL);
+	if (
+		variables.OPTIMIQ_AUTH_PIN_ORDINAL === undefined ||
+		!Number.isInteger(ordinal) ||
+		ordinal < 0
+	) {
+		return {};
+	}
+	const label = variables.OPTIMIQ_AUTH_PIN_LABEL;
+	return {
+		authPinOrdinal: ordinal,
+		...(label === undefined || label === "" ? {} : { authPinLabel: label }),
+	};
+}
+
 const QUEUE_OUTCOMES: readonly string[] = [
 	"answered",
 	"caller-hangup",

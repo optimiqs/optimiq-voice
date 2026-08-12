@@ -12,9 +12,19 @@ import { ConflictException, HttpStatus } from "@nestjs/common";
  * of 50; disable one or ask for more").
  *
  * `maxConcurrentCalls` cannot be. There is no row to refuse: there is a CALL to refuse, and refusing
- * it late is a caller hearing congestion rather than an administrator seeing an error message. It is
- * compiled into the artifact and enforced by the engine at admission, alongside the per-trunk
- * ceiling `TrunkAttempt.maxChannels` already carries — different scope, same mechanism.
+ * it late is a caller hearing congestion rather than an administrator seeing an error message.
+ *
+ * That sentence used to describe an intention. It now describes a mechanism, and the mechanism is
+ * worth naming here because it is nowhere near this file: the column is folded into the routing
+ * snapshot's `settings` by `snapshot-loader.ts`, compiled onto
+ * `CompiledRoutingSettings.maxConcurrentCalls`, and enforced by the engine's channel orchestrator at
+ * StasisStart admission — before the KV claim, before `channel.created`, and with
+ * `SWITCH_CONGESTION`, which is the same cause the per-trunk ceiling
+ * (`TrunkAttempt.maxChannels`) refuses with. Different scope, same mechanism.
+ *
+ * The one thing this endpoint therefore CANNOT do is report the usage: the count lives in the
+ * engines, per replica, and is not a thing the control plane can ask for on a page load. See
+ * {@link OrgUsageEntry.measured}.
  *
  * `maxStorageMb` is enforced at upload for the same reason the counts are: there is a request to
  * refuse.
@@ -91,6 +101,20 @@ export interface OrgUsageEntry {
 	readonly ceiling: number | null;
 	/** `null` when there is no ceiling. A fraction rather than a percentage, so a UI decides. */
 	readonly ratio: number | null;
+	/**
+	 * Whether `used` is a MEASUREMENT or a placeholder.
+	 *
+	 * Three of the four limits are counted with a `select count(*)` in this process and are true at
+	 * the instant they were read. `maxConcurrentCalls` is not: simultaneous calls are live state the
+	 * engines hold, and the control plane has no way to ask that does not involve enumerating every
+	 * live leg on the platform on every page load. So its `used` is zero, and this flag is what stops
+	 * a screen from rendering that zero as "nobody is on a call right now" — which is a different and
+	 * much more confident statement than "this number is not measured here".
+	 *
+	 * The CEILING is real either way, and it is the fact an administrator came to this page for. It
+	 * is also, as of the admission gate, actually enforced — see `org-limits.ts`'s header.
+	 */
+	readonly measured: boolean;
 }
 
 export interface OrgUsageReport {
@@ -106,18 +130,27 @@ export interface OrgUsageReport {
 	readonly storageBytes: number;
 }
 
-/** Builds one usage line, with the ratio only where a ceiling exists to divide by. */
+/**
+ * Builds one usage line, with the ratio only where a ceiling exists to divide by.
+ *
+ * `measured` defaults to true because three of the four limits are counted, and the one that is not
+ * says so at its call site rather than every other one saying that it is. A line that is not
+ * measured also reports no RATIO: dividing a placeholder by a real ceiling produces a percentage
+ * that looks like a measurement, which is the exact confusion the flag exists to prevent.
+ */
 export function usageEntry(
 	limit: OrgLimitName,
 	used: number,
 	ceiling: number | null | undefined,
+	measured = true,
 ): OrgUsageEntry {
 	const bound = ceiling ?? null;
 	return {
 		limit,
 		used,
 		ceiling: bound,
-		ratio: bound === null || bound === 0 ? null : used / bound,
+		ratio: bound === null || bound === 0 || !measured ? null : used / bound,
+		measured,
 	};
 }
 

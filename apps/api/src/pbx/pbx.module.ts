@@ -71,6 +71,8 @@ import { ParkLotsController } from "./park-lots/park-lots.controller";
 import { ParkLotsService } from "./park-lots/park-lots.service";
 import { PhoneNumbersController } from "./phone-numbers/phone-numbers.controller";
 import { PhoneNumbersService } from "./phone-numbers/phone-numbers.service";
+import { PhrasesController } from "./phrases/phrases.controller";
+import { PhrasesService, PhraseStepsService } from "./phrases/phrases.service";
 import { PinSetsController } from "./pin-sets/pin-sets.controller";
 import { PinSetEntriesService, PinSetsService } from "./pin-sets/pin-sets.service";
 import { PromptsController } from "./prompts/prompts.controller";
@@ -240,6 +242,9 @@ const logger = getLogger("api.pbx");
 		AudioStreamsController,
 		DirectoriesController,
 		SpeedDialsController,
+		// A phrase is a `prompt` row, so it is guarded by `recordings.*` and sits beside the library
+		// rather than inside the admin block's own grants. See the controller's header.
+		PhrasesController,
 		OrgLimitsController,
 		/**
 		 * Click-to-call, and the integrator surface beside it.
@@ -649,6 +654,8 @@ const logger = getLogger("api.pbx");
 		SpeedDialsService,
 		OrgLimitsService,
 		PromptsService,
+		PhrasesService,
+		PhraseStepsService,
 		MohClassesService,
 		EmergencyAddressesService,
 		/**

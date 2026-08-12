@@ -80,6 +80,8 @@ const MAPPED_KEYS = new Set([
 	"queueWaitMs",
 	"queueOutcome",
 	"queueAgentRef",
+	"authPinOrdinal",
+	"authPinLabel",
 ]);
 
 /**
@@ -175,6 +177,8 @@ export interface CallLegInsertValues {
 	readonly queueWaitMs: number | null;
 	readonly queueOutcome: QueueOutcome | null;
 	readonly queueAgentRef: string | null;
+	readonly authPinOrdinal: number | null;
+	readonly authPinLabel: string | null;
 	readonly raw: Record<string, unknown>;
 }
 
@@ -212,6 +216,21 @@ function asDate(value: unknown): Date | null {
 }
 
 /** The two duration columns are `notNull default 0` with a `>= 0` check; anything else is zero. */
+/**
+ * A non-negative integer, or `null` when there is not one.
+ *
+ * Distinct from {@link asNonNegativeInt}, which floors an absence to zero because its callers are
+ * durations and a call with no duration lasted no time. An absent ORDINAL is not "code zero" — it is
+ * "this call was not gated" — and collapsing the two would put every ungated call in the tenant into
+ * a report of who authorised what.
+ */
+function asOptionalNonNegativeInt(value: unknown): number | null {
+	if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+		return null;
+	}
+	return value;
+}
+
 function asNonNegativeInt(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.trunc(value) : 0;
 }
@@ -384,6 +403,24 @@ export function mapCdrLegWrite(
 					queueAgentRef: queueOutcome === "answered" ? asUuid(payload.queueAgentRef) : null,
 				};
 
+	/**
+	 * The authorisation code that opened a gated outbound route, when one did.
+	 *
+	 * The ORDINAL is what makes the pair real: a label with no ordinal is a string a producer put on
+	 * a call that was never gated, and it would show up in a report as an authorisation that did not
+	 * happen. So the label is only taken when the ordinal is, and the label is truncated rather than
+	 * refused for the reason `fromName` is — a long label is a form somebody over-filled, not a
+	 * payload worth quarantining a billing record over.
+	 */
+	const ordinal = asOptionalNonNegativeInt(payload.authPinOrdinal);
+	const authorization =
+		ordinal === null
+			? { authPinOrdinal: null, authPinLabel: null }
+			: {
+					authPinOrdinal: ordinal,
+					authPinLabel: asString(payload.authPinLabel)?.slice(0, 128) ?? null,
+				};
+
 	return {
 		values: {
 			id,
@@ -408,6 +445,7 @@ export function mapCdrLegWrite(
 			hangupSide,
 			disposition,
 			...queueLeg,
+			...authorization,
 			raw,
 		},
 		coercions,

@@ -121,6 +121,34 @@ export const cdrLegWriteDataSchema = z.looseObject({
 	 * had to reason about.
 	 */
 	queueAgentRef: z.uuid().nullish(),
+
+	// --- the authorisation code that paid for an outbound call -----------------------------------
+	/**
+	 * Which code opened the gated outbound route this leg took, when it took one.
+	 *
+	 * ## The ordinal and the label, never the digits
+	 *
+	 * A PIN on an outbound route is a spending control, so the question the ledger exists to answer
+	 * is "who authorised this call to Paraguay". The answer a tenant recognises is the ordinal and
+	 * the label they typed into a form — "code 3, the night desk" — and that is deliberately ALL that
+	 * travels: `pin_set_entry` stores a scrypt digest and never the plaintext upstream kept, and
+	 * putting the code on the event stream would undo that in one field. The engine's walker is where
+	 * the digits stop; everything downstream of it sees an identity.
+	 *
+	 * ## Why the label as well as the ordinal
+	 *
+	 * `cdr-db` holds no `pin_set` rows to join against — that is `pbx-db`, a different database with
+	 * a different access model — so a report that had only the ordinal could say "code 3" and nothing
+	 * more. Carrying the label denormalises on purpose, and the denormalisation is the point: a label
+	 * that is renamed in `pbx-db` six months later must not retroactively rewrite what a call record
+	 * says happened.
+	 *
+	 * Both absent on every call that took no gated route, which is nearly all of them. A refused code
+	 * produces no leg-level field at all — the call ends `CALL_REJECTED` and the attempts are in the
+	 * engine's log, because a refusal spent nothing and has no authorisation to record.
+	 */
+	authPinOrdinal: z.int().min(0).nullish(),
+	authPinLabel: z.string().max(128).nullish(),
 });
 
 export const CDR_LEG_WRITE = defineEvent("cdr", "cdr.leg.write", cdrLegWriteDataSchema);

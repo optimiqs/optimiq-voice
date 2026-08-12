@@ -97,6 +97,80 @@ export function resolveMediaRefOr(
 	return resolveMediaRef(node, settings) ?? settings.fallbackMedia;
 }
 
+/**
+ * What a media server can be asked to do with one `MediaRef`.
+ *
+ * The typed half of {@link translateMediaRef}, added because one caller needs the REASON and not
+ * just the absence. `StreamPlanNode` compiles a mandatory `fallbackNodeId` precisely so that a
+ * source no driver can open produces a routed call rather than silence — and the note the walker
+ * leaves on that fallback is the only place an operator will ever learn WHY the stream did not
+ * play. "`translateMediaRef` returned undefined" is not that sentence; "no media server this
+ * platform ships can open an http(s) source" is.
+ */
+export type MediaRefResolution =
+	| { readonly kind: "playable"; readonly media: string }
+	| { readonly kind: "unplayable"; readonly reason: string };
+
+/**
+ * One `MediaRef` in the media server's vocabulary, or a refusal that says why.
+ *
+ * ## Remote sources, and why neither driver takes one
+ *
+ * This was checked rather than assumed, because the obvious hope is that ARI passes an `https://`
+ * URI through to Asterisk. It does — `AriMediaAdapter.play` puts whatever it is handed straight into
+ * `POST /channels/{id}/play` — but Asterisk's media vocabulary is `sound:`, `recording:`, `number:`,
+ * `digits:`, `characters:` and `tone:`, so the request comes back a 4xx and the caller hears the
+ * silence between issuing a verb and having it fail. Passing it through would move the failure from
+ * a place that can take a fallback branch to a place that cannot.
+ *
+ * `mediad` refuses by name and says so on the wire: `apps/mediad/internal/audio/library.go` resolves
+ * `sound:`, `tone:` and `moh:` out of a mounted directory and answers `ErrUnsupportedScheme` for
+ * anything else, deliberately — a fetch-and-stage rung would put a download on the call path.
+ *
+ * So the honest answer for both drivers is the same refusal, and the remote-fetch rung is still the
+ * seam this file's header describes. What changed is that the gap now has a NAME the walker can read
+ * out into a note.
+ */
+export function resolveMediaRefOrExplain(
+	ref: string,
+	settings: MediaRefSettings = DEFAULT_MEDIA_REF_SETTINGS,
+): MediaRefResolution {
+	const media = translateMediaRef(ref, settings);
+	if (media !== undefined) {
+		return { kind: "playable", media };
+	}
+	const trimmed = ref.trim();
+	if (trimmed === "") {
+		return { kind: "unplayable", reason: "the media reference is empty" };
+	}
+	if (REMOTE_SCHEMES.some((scheme) => trimmed.startsWith(scheme))) {
+		return {
+			kind: "unplayable",
+			reason:
+				"no media server this platform ships can open a remote source: Asterisk's media vocabulary " +
+				"has no http(s) scheme, and mediad plays only what is mounted. See media-refs.ts.",
+		};
+	}
+	if (trimmed.startsWith("tts://")) {
+		return { kind: "unplayable", reason: "there is no text-to-speech renderer on this platform" };
+	}
+	if (trimmed.startsWith("object://")) {
+		return {
+			kind: "unplayable",
+			reason:
+				"the object store is not mounted for the media server (set ENGINE_MEDIA_OBJECT_ROOT), or " +
+				"the key escapes it",
+		};
+	}
+	return {
+		kind: "unplayable",
+		reason: `"${trimmed}" is not a media reference this release renders`,
+	};
+}
+
+/** The schemes that name audio somewhere else on the network. Neither driver can open one. */
+const REMOTE_SCHEMES = ["http://", "https://", "stream://"] as const;
+
 /** One `MediaRef` in the media server's vocabulary, or `undefined` when it has no equivalent. */
 export function translateMediaRef(
 	ref: string,
@@ -127,8 +201,9 @@ export function translateMediaRef(
 	if (trimmed.startsWith("object://")) {
 		return objectMedia(trimmed.slice("object://".length), settings);
 	}
-	// `stream://`, `tts://`, `https://` — real sources with no direct ARI equivalent. See the
-	// header: reporting the gap beats playing silence.
+	// `stream://`, `tts://`, `http(s)://` — real sources with no direct ARI equivalent. See the
+	// header: reporting the gap beats playing silence, and {@link resolveMediaRefOrExplain} is what
+	// turns the gap into a sentence an operator can act on.
 	return undefined;
 }
 

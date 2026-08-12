@@ -507,7 +507,39 @@ class Compiler {
 			outboundEnabled: input.outboundEnabled ?? true,
 			outboundCallerIdNumber: input.outboundCallerIdNumber ?? undefined,
 			outboundCallerIdName: input.outboundCallerIdName ?? undefined,
+			maxConcurrentCalls: this.concurrentCallCeiling(input.maxConcurrentCalls),
 		}) as CompiledRoutingSettings;
+	}
+
+	/**
+	 * The organization's simultaneous-call ceiling, or `undefined` for unlimited.
+	 *
+	 * Four inputs collapse to unlimited and only one of them is a mistake. `undefined` is a loader
+	 * that does not select the column; `null` is a column with no ceiling set; a non-integer or a
+	 * negative is a value that reached the database some other way. Zero is the interesting one, and
+	 * it is read as UNLIMITED rather than as "refuse every call" — the same reading
+	 * `TrunkCapacityPort.reserve` gives `maxChannels`, and for the same reason: a tenant who typed a
+	 * zero into a quota field meant "no limit", and the alternative interpretation takes their phone
+	 * system down on a keystroke.
+	 *
+	 * A warning rather than an error for the malformed cases, because the artifact is still perfectly
+	 * routable without a ceiling — refusing the compile would take every call in the tenant down to
+	 * report a quota nobody is currently hitting.
+	 */
+	private concurrentCallCeiling(value: number | null | undefined): number | undefined {
+		if (value === undefined || value === null || value === 0) {
+			return undefined;
+		}
+		if (!Number.isInteger(value) || value < 0) {
+			this.bag.warning(
+				"invalid-org-limit",
+				`Organization simultaneous-call ceiling "${String(value)}" is not a whole number of calls; the ceiling was not applied.`,
+				undefined,
+				"settings.maxConcurrentCalls",
+			);
+			return undefined;
+		}
+		return value;
 	}
 
 	private trunkContinueOnCauses(): readonly HangupCause[] {

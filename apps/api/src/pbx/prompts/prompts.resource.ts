@@ -16,30 +16,34 @@ import type { PbxResource } from "../shared/pbx-resource";
  * of a class rather than a thing an IVR can be pointed at. The `prompt_organization_moh_class_idx`
  * index exists for exactly that listing.
  *
- * ## Why `prompt` is NOT a routing table, and what that costs
+ * ## Why `prompt` IS a routing table, which it did not used to be
  *
- * `affectsRouting("prompt")` is **false** — `prompt` is absent from `ROUTING_TABLE_TO_ENTITY` — so
- * every write here skips compile-on-write. That is correct today and it is worth stating why,
- * because it is correct for a reason that could stop being true:
+ * For most of this table's life `affectsRouting("prompt")` was false, and correctly: the compiler
+ * copies a `promptId` into a plan node **verbatim and unresolved** (`IvrMenuPlanNode.greetingPromptId`
+ * and five siblings), so renaming a file or replacing its audio changed nothing the artifact
+ * contained, and recompiling a tenant's whole call plan because somebody uploaded a WAV would have
+ * been pure cost.
  *
- * The compiler copies a `promptId` into a plan node **verbatim and unresolved**
- * (`IvrMenuPlanNode.greetingPromptId` and five siblings). It never looks the row up, never resolves
- * it to an object key, and never emits a dangling-prompt diagnostic. So renaming a prompt, or
- * replacing its audio, changes nothing the artifact contains — and recompiling a tenant's entire
- * call plan because somebody uploaded a file would be pure cost.
- *
- * **If that ever changes** — if the compiler starts resolving `promptId` to `object://<key>` the way
- * it already resolves `mohClassId` to a class name — then `prompt` MUST be added to
- * `ROUTING_TABLE_TO_ENTITY` in `packages/routing/src/cache.ts` in the same change, or artifacts go
- * stale the first time somebody re-uploads a greeting. Recorded here because this file is where a
- * reader asks the question.
+ * The T2 admin block ended that, by the one route that header anticipated: a PHRASE is a `prompt`
+ * row with `kind = "phrase"`, and **which prompt ids are sequences is a compiled fact** — the
+ * artifact carries a phrase table the media layer expands against. So `prompt` and `phrase_step` are
+ * both in `ROUTING_TABLE_TO_ENTITY` (`packages/routing/src/cache.ts`) and every write here
+ * recompiles. Renaming a file still changes nothing routing reads, and the table cannot tell the two
+ * apart; the cost is bounded by `isArtifactFresh`, which compares content hashes and skips the KV
+ * round trip when nothing moved.
  *
  * ## The reference guard
  *
- * Eight foreign keys point at this table and all eight are `on delete set null`, so the database
- * would accept a delete and silently return an IVR to its default announcement. The area's rule is
- * to refuse instead, so all eight are declared here — the same argument
- * `time-conditions.resource.ts` makes about `time_condition_id`, with more columns.
+ * Eight foreign keys point at this table with `on delete set null`, so the database would accept a
+ * delete and silently return an IVR to its default announcement. The area's rule is to refuse
+ * instead, so all eight are declared here — the same argument `time-conditions.resource.ts` makes
+ * about `time_condition_id`, with more columns.
+ *
+ * The ninth is `phrase_step.prompt_id`, and it is the odd one out: it is `on delete restrict`, the
+ * only such column in this schema, because cascading would silently SHORTEN a phrase ("your call is
+ * number seven in the queue" becoming "your call is number in the queue") and `set null` is not
+ * available — a step with no audio is not a step. Declared anyway, so a prompt three phrases play
+ * is a 409 naming those phrases rather than a raw foreign-key violation from the driver.
  */
 export const PROMPT_RESOURCE: PbxResource = {
 	kind: "prompt",
@@ -61,5 +65,16 @@ export const PROMPT_RESOURCE: PbxResource = {
 		{ table: "ring_group", kind: "ring-group", column: "ringback_prompt_id", nameColumn: "name" },
 		{ table: "queue", kind: "queue", column: "greeting_prompt_id", nameColumn: "name" },
 		{ table: "queue", kind: "queue", column: "announce_prompt_id", nameColumn: "name" },
+		// The `on delete restrict` one. Named here so the refusal is the area's 409 with the phrases
+		// listed, rather than a foreign-key violation that falls through to a 503. `idColumn` points
+		// the reference at the PHRASE rather than at the step, because a step has no screen and the
+		// phrase does — see `ScalarReferenceSite.idColumn`.
+		{
+			table: "phrase_step",
+			kind: "phrase",
+			column: "prompt_id",
+			idColumn: "phrase_id",
+			nameColumn: null,
+		},
 	],
 };

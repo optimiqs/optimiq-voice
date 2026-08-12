@@ -132,11 +132,14 @@ export class OrgLimitsService {
 			entries: [
 				usageEntry("maxExtensions", extensions, limits.maxExtensions),
 				usageEntry("maxTrunks", trunks, limits.maxTrunks),
-				// Not measurable from the control plane: simultaneous calls are live state the engine
-				// holds, and a number this endpoint invented would be wrong the moment it was read.
+				// Not measurable from the control plane: simultaneous calls are live state the engines
+				// hold, and a number this endpoint invented would be wrong the moment it was read.
 				// Reported as zero-used with its ceiling so the screen can still show the ceiling, which
-				// is the fact an administrator came for.
-				usageEntry("maxConcurrentCalls", 0, limits.maxConcurrentCalls),
+				// is the fact an administrator came for — and now, unlike when this line was written,
+				// a ceiling that is actually enforced: the engine refuses over-cap calls at admission.
+				// `measured: false` is what stops a screen from reading the zero as "nobody is on a
+				// call"; it also suppresses the ratio, so no bar is drawn from a placeholder.
+				usageEntry("maxConcurrentCalls", 0, limits.maxConcurrentCalls, false),
 				// The comparison DIVIDES rather than multiplying, so the rounding always goes the
 				// tenant's way: nobody is refused for a fraction of a megabyte.
 				usageEntry("maxStorageMb", Math.floor(storageBytes / 1_048_576), limits.maxStorageMb),

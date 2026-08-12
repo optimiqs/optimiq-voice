@@ -128,6 +128,24 @@ export const callLegs = pgTable.withRLS(
 		 * `queue_agent` in `pbx-db` by whoever is allowed to see it.
 		 */
 		queueAgentRef: uuidEntityId("queue_agent_ref"),
+		/**
+		 * Which authorisation code opened the outbound route this call took.
+		 *
+		 * Two columns and not one, and NEITHER of them is the digits. A PIN on an outbound route is a
+		 * spending control, so the question the ledger has to answer is "who authorised this call to
+		 * Paraguay" — and the answer a tenant recognises is the ordinal and the label they typed into
+		 * a form ("code 3, the night desk"), not a secret. Storing the code itself would make this
+		 * table the best place on the platform to go looking for one to reuse, which is the entire
+		 * reason `pin_set_entry` stores a scrypt digest and never the plaintext upstream kept.
+		 *
+		 * The LABEL is denormalised rather than joined, for the reason `account_code` is a text column:
+		 * this database holds no `pin_set` rows to join against, and a label that changed in `pbx-db`
+		 * six months after the call must not retroactively rewrite what the call record says.
+		 *
+		 * Null on every call that took no gated route, which is nearly all of them.
+		 */
+		authPinOrdinal: integer("auth_pin_ordinal"),
+		authPinLabel: text("auth_pin_label"),
 		ivrRef: uuidEntityId("ivr_ref"),
 		ringGroupRef: uuidEntityId("ring_group_ref"),
 		/** Billing tag carried from the extension or trunk. */

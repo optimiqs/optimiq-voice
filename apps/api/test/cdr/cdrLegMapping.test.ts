@@ -244,3 +244,59 @@ describe("the queue leg", () => {
 		expect(mapped.coercions.map((entry) => entry.field)).to.include("queueOutcome");
 	});
 });
+
+/**
+ * The authorisation code that paid for a gated outbound call.
+ *
+ * Two columns, and the ORDINAL is what makes the pair real: a label with no ordinal is a string a
+ * producer put on a call that was never gated, and it would show up in a report as an authorisation
+ * that did not happen. The digits are not in the contract at all — see `cdr-events.ts` — so the one
+ * thing that cannot be tested here is the one thing that matters most, and it is pinned at the
+ * source instead, in `plan-walker-admin-block.spec.ts`.
+ */
+describe("the authorising PIN", () => {
+	it("maps the ordinal and the label a gated route recorded", () => {
+		const values = mapCdrLegWrite(ORG, {
+			...payload(),
+			authPinOrdinal: 3,
+			authPinLabel: "Night desk",
+		}).values;
+		expect(values.authPinOrdinal).to.equal(3);
+		expect(values.authPinLabel).to.equal("Night desk");
+	});
+
+	it("leaves both null on a call that took no gated route", () => {
+		const values = mapCdrLegWrite(ORG, payload()).values;
+		expect(values.authPinOrdinal).to.equal(null);
+		expect(values.authPinLabel).to.equal(null);
+	});
+
+	/** An ordinal of zero is a real ordinal. It must not be collapsed onto "not gated". */
+	it("keeps a zero ordinal, which is a code and not an absence", () => {
+		const values = mapCdrLegWrite(ORG, { ...payload(), authPinOrdinal: 0 }).values;
+		expect(values.authPinOrdinal).to.equal(0);
+	});
+
+	it("drops a label that arrives without an ordinal, rather than storing half a fact", () => {
+		const values = mapCdrLegWrite(ORG, { ...payload(), authPinLabel: "Night desk" }).values;
+		expect(values.authPinOrdinal).to.equal(null);
+		expect(values.authPinLabel).to.equal(null);
+	});
+
+	/** A long label is a form somebody over-filled, not a billing record worth quarantining. */
+	it("truncates an over-long label instead of refusing the row", () => {
+		const values = mapCdrLegWrite(ORG, {
+			...payload(),
+			authPinOrdinal: 1,
+			authPinLabel: "x".repeat(400),
+		}).values;
+		expect(values.authPinLabel).to.have.lengthOf(128);
+	});
+
+	it("ignores an ordinal that is not a whole non-negative number", () => {
+		for (const ordinal of [-1, 1.5, "3", null]) {
+			const values = mapCdrLegWrite(ORG, { ...payload(), authPinOrdinal: ordinal }).values;
+			expect(values.authPinOrdinal, JSON.stringify(ordinal)).to.equal(null);
+		}
+	});
+});

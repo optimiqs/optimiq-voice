@@ -4,7 +4,12 @@ import { RETRYABLE_HANGUP_CAUSES } from "@optimiq-voice/telephony";
 import { QueueSession } from "../queue/queue-session";
 import { AUTO_ANSWER_VARIABLES } from "./auto-answer";
 import { legSignalKey, recordingSignalKey } from "./call-signals";
-import { DEFAULT_MEDIA_REF_SETTINGS, resolveMediaRef, translateMediaRef } from "./media-refs";
+import {
+	DEFAULT_MEDIA_REF_SETTINGS,
+	resolveMediaRef,
+	resolveMediaRefOrExplain,
+	translateMediaRef,
+} from "./media-refs";
 import { planDestinationOf, sameDestination } from "./plan-destination";
 import { orderTrunkAttempts } from "./trunk-selection";
 import { verifyPinDigest, verifyVoicemailPin } from "./voicemail-pin";
@@ -26,7 +31,11 @@ import type { CallEvent, ExtensionFeature } from "@optimiq-voice/events";
 import type {
 	ApplicationPlanNode,
 	CompiledTimeCondition,
+	CompiledPinEntry,
+	CompiledPinSet,
 	ConferencePlanNode,
+	DialByNamePlanNode,
+	DirectoryEntry,
 	ExecutionPlan,
 	ExtensionPlanNode,
 	FollowMeDestination,
@@ -38,6 +47,7 @@ import type {
 	PlanNodeId,
 	QueuePlanNode,
 	RingGroupPlanNode,
+	StreamPlanNode,
 	TrunkDialPlanNode,
 	VoicemailPlanNode,
 } from "@optimiq-voice/routing";
@@ -204,6 +214,21 @@ export interface WalkerQueueOutcome {
 		| "exit-key";
 	/** The `queue_agent` who took the call. Only ever set on `answered`. */
 	readonly agentId?: string;
+}
+
+/**
+ * Which authorisation code opened an outbound route, as the CDR records it.
+ *
+ * Never the digits — see {@link PlanWalkerDependencies.onPinAuthorization}. The `ordinal` is the
+ * identity a tenant chose in a form ("code 3, the night desk"), which is why it is a value and not
+ * a row position, and the `label` is the same fact in words for a report that has no set to join
+ * against.
+ */
+export interface PinAuthorization {
+	readonly pinSetId: string;
+	readonly pinSetEntryId: string;
+	readonly ordinal: number;
+	readonly label?: string;
 }
 
 export interface WalkerCallControl {
@@ -405,6 +430,30 @@ export interface PlanWalkerSettings {
 	readonly voicemailMenuTimeoutMs: number;
 	/** Replays of one message before `2` stops being honoured. */
 	readonly voicemailMaxReplays: number;
+	/**
+	 * Asked for before a pin-gated OUTBOUND route is dialled.
+	 *
+	 * `agent-pass` is Asterisk's own "please enter your password" and is in the core sound package,
+	 * so an authorisation-code gate works on a stock install with no prompt pack — the same standard
+	 * the mailbox and room PIN prompts hold to. A PIN set that carries its own `promptId` overrides
+	 * it, which is what a tenant who recorded "please enter your international calling code" gets.
+	 */
+	readonly outboundPinPrompt: string;
+	/** Played after a wrong authorisation code, before the next attempt. */
+	readonly outboundPinInvalidPrompt: string;
+	/** Played when the attempts are exhausted, before the call is refused. */
+	readonly outboundPinFailurePrompt: string;
+	/**
+	 * Longest authorisation code that will be collected.
+	 *
+	 * The ATTEMPT budget is not here: it is `CompiledPinSet.maxAttempts`, per set, because how many
+	 * guesses an international-calling code is worth is a tenant's decision and they made it in a
+	 * form. The digit timeout is per set too (`digitTimeoutMs`). Only the ceiling on how many digits
+	 * a code may be is a platform fact, and it exists so a caller leaning on a key cannot make the
+	 * gather run forever.
+	 */
+	readonly outboundPinMaxDigits: number;
+	readonly outboundPinInterDigitTimeoutMs: number;
 	/** Asked for before a room with a PIN is opened. */
 	readonly conferencePinPrompt: string;
 	/** Played after a wrong room PIN, before the next attempt. */
@@ -515,6 +564,49 @@ export interface PlanWalkerSettings {
 	 * assembled: this prompt, then the caller's own voice, then the accept/reject question.
 	 */
 	readonly screeningIntroPrompt: string;
+
+	// --- dial by name ----------------------------------------------------------------------------
+	/**
+	 * The directory's opening prompt, when the node names none of its own.
+	 *
+	 * Every default in this block is one of `app_directory`'s own sounds, for the reason every other
+	 * default in this file is a core sound: a tenant who switched dial-by-name on and recorded
+	 * nothing still gets a working directory rather than silence with a gather behind it.
+	 */
+	readonly directoryGreeting: string;
+	/** Played before each RETRY. `dir-instr` is "enter the first letters of the name". */
+	readonly directoryInstructions: string;
+	/** Played when the digits match nobody, when the node names no prompt of its own. */
+	readonly directoryNoMatchPrompt: string;
+	/**
+	 * The two halves of "please press 1 to select this person", and the digit between them.
+	 *
+	 * Three settings for one sentence because the verb surface plays ONE media per `play`, and
+	 * Asterisk assembles this sentence from `dir-multi1` + the spoken digit + `dir-multi2`. Building
+	 * it the same way means the accept digit can be changed without re-recording anything: the
+	 * spoken digit is rendered as `digits:<n>`, which is a GENERATED media the media server
+	 * synthesises, so there is no file to be missing.
+	 */
+	readonly directorySelectPrefix: string;
+	readonly directorySelectSuffix: string;
+	/** The one digit that connects. Anything else moves on to the next match. */
+	readonly directorySelectDigit: string;
+	/** Longest name-spelling a caller may enter before the gather closes. */
+	readonly directoryMaxDigits: number;
+	readonly directoryTimeoutMs: number;
+	readonly directoryInterDigitTimeoutMs: number;
+	/** How long one offered name waits for its accept digit. Short: the caller is listening for it. */
+	readonly directorySelectTimeoutMs: number;
+	/**
+	 * How many matching people are offered before the caller is asked to spell more.
+	 *
+	 * A bound rather than the whole list, because a caller who typed `S` in a company of four
+	 * hundred should be asked for more letters, not read four hundred names. The compiler cannot
+	 * make this decision — it does not know how long the audience will listen — so it compiles every
+	 * entry and this decides how many of them one round offers.
+	 */
+	readonly directoryMaxOffers: number;
+
 	readonly mediaRefs: MediaRefSettings;
 }
 
@@ -552,6 +644,11 @@ export const DEFAULT_PLAN_WALKER_SETTINGS: PlanWalkerSettings = {
 	// `conf-getpin`, `conf-invalidpin` and `conf-locked` are all in Asterisk's core sound package,
 	// so a PIN-gated room works on a stock install with no prompt pack — the same standard the
 	// mailbox challenge holds to.
+	outboundPinPrompt: "sound:agent-pass",
+	outboundPinInvalidPrompt: "sound:auth-incorrect",
+	outboundPinFailurePrompt: "sound:auth-thankyou",
+	outboundPinMaxDigits: 12,
+	outboundPinInterDigitTimeoutMs: 3_000,
 	conferencePinPrompt: "sound:conf-getpin",
 	conferencePinInvalidPrompt: "sound:conf-invalidpin",
 	conferencePinAttempts: 3,
@@ -586,6 +683,17 @@ export const DEFAULT_PLAN_WALKER_SETTINGS: PlanWalkerSettings = {
 	screeningRecordPrompt: "sound:vm-rec-name",
 	screeningRecordSeconds: 5,
 	screeningIntroPrompt: "sound:priv-callerintros",
+	directoryGreeting: "sound:dir-intro",
+	directoryInstructions: "sound:dir-instr",
+	directoryNoMatchPrompt: "sound:dir-nomatch",
+	directorySelectPrefix: "sound:dir-multi1",
+	directorySelectSuffix: "sound:dir-multi2",
+	directorySelectDigit: "1",
+	directoryMaxDigits: 10,
+	directoryTimeoutMs: 10_000,
+	directoryInterDigitTimeoutMs: 3_000,
+	directorySelectTimeoutMs: 5_000,
+	directoryMaxOffers: 5,
 	mediaRefs: DEFAULT_MEDIA_REF_SETTINGS,
 };
 
@@ -733,6 +841,21 @@ export interface PlanWalkerDependencies {
 	 * on the disposition would call that a served call.
 	 */
 	readonly onQueueOutcome?: (outcome: WalkerQueueOutcome) => Promise<void>;
+	/**
+	 * Run when an authorisation code has opened an outbound route, before the first trunk is offered.
+	 *
+	 * Reported on SUCCESS only, and reported at the moment of success for exactly the reason
+	 * {@link onDestination} is: the call is about to be dialled and may end in any number of ways,
+	 * and a CDR written by whichever of teardown and return gets there first must already know which
+	 * code paid for it. A refusal is not reported here because a refused call did not spend anything
+	 * — it appears in the walk's notes and in the leg's hangup cause, which is where "somebody tried
+	 * three wrong codes" belongs.
+	 *
+	 * The ORDINAL and the LABEL, never the digits. That is the whole point of hashing a PIN in the
+	 * first place: the record has to answer "who authorised this call to Paraguay" and must not be a
+	 * place to go looking for a code to reuse.
+	 */
+	readonly onPinAuthorization?: (authorization: PinAuthorization) => Promise<void>;
 	/**
 	 * Run just before the A-leg is joined to whatever the walk found.
 	 *
@@ -1301,6 +1424,12 @@ export class PlanWalker {
 			}
 			case "application": {
 				return await this.applicationNode(node);
+			}
+			case "stream": {
+				return await this.streamNode(node);
+			}
+			case "dial-by-name": {
+				return await this.dialByNameNode(node);
 			}
 			default: {
 				// Unreachable: every member of `PlanNodeKind` has a case above, and TypeScript proves it
@@ -3356,6 +3485,15 @@ export class PlanWalker {
 			return this.branch(node.failoverNodeId, "NETWORK_OUT_OF_ORDER");
 		}
 
+		// The authorisation gate, before the first INVITE and before `ringing`. Both halves of that
+		// ordering matter: a code collected after the carrier has been offered the call is a code
+		// collected too late to stop it, and a caller who hears ringback and is then asked for a PIN
+		// has been told the call is going through.
+		const authorized = await this.challengeOutboundPin(node, number);
+		if (authorized.kind === "denied") {
+			return authorized.result;
+		}
+
 		await this.deps.execute({ verb: "ringing" });
 		this.deps.channel.moveTo("executing");
 
@@ -3901,6 +4039,393 @@ export class PlanWalker {
 				`conference room ${node.roomNumber} recording could not be started (${String(error)}); the room was opened without it`,
 			);
 		}
+	}
+
+	/**
+	 * The outbound route's authorisation-code gate.
+	 *
+	 * ## What it is for, and why it fails CLOSED where the compiler fails open
+	 *
+	 * A PIN on an outbound route is a spending control: it is the difference between "anyone who can
+	 * reach a handset can dial Paraguay" and "anyone who knows the code can". So the runtime refuses
+	 * the call on a wrong code, on an unreadable digest, and on exhausted attempts.
+	 *
+	 * That is the OPPOSITE of what the compiler does with the same data, and the two are not in
+	 * conflict — they are refusing different things. `compilePinSet` fails OPEN: a set that is
+	 * missing, disabled, or whose every digest this release cannot parse produces a warning and NO
+	 * gate, because taking a tenant's phones down to protect a gate they can re-create in a form is
+	 * the worse outcome. But once a gate has been compiled, the artifact is asserting that this route
+	 * is gated, and a runtime that then waved a caller through on a digest it could not read would
+	 * make the gate decorative. `CompiledPinSet.entries` is documented as never empty for exactly
+	 * this reason: by the time it reaches here, every entry is one the compiler could read.
+	 *
+	 * ## The attempt budget is the tenant's, not the platform's
+	 *
+	 * `maxAttempts` and `digitTimeoutMs` come off the set, because how many guesses an international
+	 * calling code is worth is a decision somebody made in a form. Only the digit CEILING is a
+	 * platform fact, and it exists so a caller leaning on a key cannot make the gather run forever.
+	 *
+	 * ## The call is not answered to ask
+	 *
+	 * {@link ensureAnswered} is called, because a gather on an unanswered leg collects nothing —
+	 * this is a gate the caller has to interact with, unlike the concurrency ceiling the orchestrator
+	 * refuses at the door without answering. The cost is that a refused call is a connected call in
+	 * the tenant's own CDR, which is correct here: the caller reached the system and was told no.
+	 */
+	private async challengeOutboundPin(
+		node: TrunkDialPlanNode,
+		number: string,
+	): Promise<
+		{ readonly kind: "granted" } | { readonly kind: "denied"; readonly result: StepResult }
+	> {
+		const set = node.pinSet;
+		if (set === undefined) {
+			return { kind: "granted" };
+		}
+		if (!(await this.ensureAnswered())) {
+			return { kind: "denied", result: { kind: "aborted" } };
+		}
+
+		const prompt =
+			resolveMediaRef({ promptId: set.promptId }, this.settings.mediaRefs) ??
+			this.settings.outboundPinPrompt;
+
+		for (let attempt = 0; attempt < Math.max(1, set.maxAttempts); attempt += 1) {
+			if (this.deps.channel.isTearingDown) {
+				return { kind: "denied", result: { kind: "aborted" } };
+			}
+
+			const result = await this.deps.execute({
+				verb: "gather",
+				maxDigits: this.settings.outboundPinMaxDigits,
+				terminators: ["#"],
+				timeoutMs: set.digitTimeoutMs,
+				interDigitTimeoutMs: this.settings.outboundPinInterDigitTimeoutMs,
+				media: prompt,
+			});
+			if (result === undefined) {
+				return { kind: "denied", result: { kind: "hangup", cause: "NORMAL_TEMPORARY_FAILURE" } };
+			}
+			const collection = collectionOf(result);
+			if (collection?.endReason === "hangup") {
+				return { kind: "denied", result: { kind: "aborted" } };
+			}
+
+			const digits = collection?.digits.join("") ?? "";
+			const matched = await this.matchPinEntry(set, digits);
+			if (matched.kind === "matched") {
+				// Reported BEFORE the dial, for the reason `onDestination` is: the call may end in any
+				// number of ways from here, and the CDR must already know which code paid for it.
+				await this.deps.onPinAuthorization?.({
+					pinSetId: set.pinSetId,
+					pinSetEntryId: matched.entry.pinSetEntryId,
+					ordinal: matched.entry.ordinal,
+					...(matched.entry.label === undefined ? {} : { label: matched.entry.label }),
+				});
+				this.log("an authorisation code opened an outbound route", {
+					pinSet: set.name,
+					ordinal: matched.entry.ordinal,
+				});
+				return { kind: "granted" };
+			}
+			if (matched.kind === "unreadable") {
+				// A defect and not a wrong guess: the compiler refuses to embed a digest it cannot read,
+				// so reaching here means the artifact came from something that skipped that check.
+				// Retrying would only burn the caller's remaining attempts against a broken gate.
+				this.note(
+					`PIN set "${set.name}" carries a digest this release cannot verify (${matched.failure}); the route was refused`,
+				);
+				return {
+					kind: "denied",
+					result: await this.announceAndHangup(
+						this.settings.unavailableAnnouncement,
+						"NORMAL_TEMPORARY_FAILURE",
+					),
+				};
+			}
+			await this.deps.execute({ verb: "play", media: this.settings.outboundPinInvalidPrompt });
+		}
+
+		// `CALL_REJECTED` and not `NORMAL_CLEARING`: a report that cannot tell a refused authorisation
+		// from a caller who changed their mind cannot answer "is somebody guessing our codes?".
+		this.note(
+			`the call to ${number} failed ${String(set.maxAttempts)} authorisation-code attempts against PIN set "${set.name}"`,
+		);
+		const failure =
+			resolveMediaRef({ promptId: set.failurePromptId }, this.settings.mediaRefs) ??
+			this.settings.outboundPinFailurePrompt;
+		return { kind: "denied", result: await this.announceAndHangup(failure, "CALL_REJECTED") };
+	}
+
+	/**
+	 * The entered digits against every code in the set, in ordinal order.
+	 *
+	 * Every entry is checked even after one has matched — no early `break` on the FIRST match beyond
+	 * returning it — because the loop must not exit early on a MISS either: an implementation that
+	 * returned as soon as one digest mismatched would only ever accept code number one. An empty
+	 * entry is refused without a KDF call, which is `verifyPinDigest`'s own `empty-pin` answer and is
+	 * repeated here so a caller who pressed `#` immediately does not consume scrypt work per code.
+	 */
+	private async matchPinEntry(
+		set: CompiledPinSet,
+		digits: string,
+	): Promise<
+		| { readonly kind: "matched"; readonly entry: CompiledPinEntry }
+		| { readonly kind: "mismatch" }
+		| { readonly kind: "unreadable"; readonly failure: string }
+	> {
+		if (digits === "") {
+			return { kind: "mismatch" };
+		}
+		for (const entry of set.entries) {
+			const verified = await verifyPinDigest(digits, entry.pinHash);
+			if (verified.ok) {
+				return { kind: "matched", entry };
+			}
+			if (verified.failure === "malformed-hash" || verified.failure === "kdf-error") {
+				return { kind: "unreadable", failure: verified.failure };
+			}
+		}
+		return { kind: "mismatch" };
+	}
+
+	/**
+	 * A remote audio source, and the fallback that is the whole point of the node.
+	 *
+	 * ## This announces nothing and never hangs up
+	 *
+	 * Every other "we cannot do this" path in this walker ends in {@link announceAndHangup}. This one
+	 * ends in a `goto`, because `StreamPlanNode.fallbackNodeId` is NOT optional — the compiler
+	 * requires it precisely so that a source no media server can open produces a ROUTED call rather
+	 * than an announcement. A caller who reached a shop-radio node whose stream is down should hear
+	 * the shop's IVR, not "the number you have dialled is not available".
+	 *
+	 * ## Why the fallback is taken today, always
+	 *
+	 * `resolveMediaRefOrExplain` refuses every `http(s)` source, and that refusal was verified
+	 * against both drivers rather than assumed — the reason is on that function. So this runtime is,
+	 * for now, an honest recording of an unplayable source: it resolves, notes exactly why the
+	 * platform cannot open it, and branches. That is a different thing from the node kind having no
+	 * case at all, which is what it had before: the walk used to fall into the unimplemented arm,
+	 * announce "unavailable" and HANG UP, discarding a fallback branch the tenant configured.
+	 *
+	 * When the remote-fetch rung lands behind the seam in `media-refs.ts`, the resolution starts
+	 * coming back `playable` and this method plays it. Nothing else here changes.
+	 */
+	private async streamNode(node: StreamPlanNode): Promise<StepResult> {
+		const resolution = resolveMediaRefOrExplain(node.url, this.settings.mediaRefs);
+		if (resolution.kind === "unplayable") {
+			this.note(
+				`audio stream ${node.audioStreamId} could not be played (${resolution.reason}); the call took the stream's fallback`,
+			);
+			return { kind: "goto", nodeId: node.fallbackNodeId };
+		}
+
+		// Only when the source is actually playable. Answering first and then discovering we cannot
+		// play would bill the tenant for a connected call that produced nothing but a branch.
+		if (node.answerFirst && !(await this.ensureAnswered())) {
+			return { kind: "aborted" };
+		}
+
+		const played = await this.deps.execute({ verb: "play", media: resolution.media });
+		if (played === undefined) {
+			this.note(
+				`audio stream ${node.audioStreamId} failed to play; the call took the stream's fallback`,
+			);
+		}
+		// The fallback is taken when the stream ENDS too, not only when it fails — `maxSeconds` of
+		// zero means "until the caller hangs up", and a caller who is still there when a finite
+		// stream finishes must go somewhere rather than sit in silence.
+		return { kind: "goto", nodeId: node.fallbackNodeId };
+	}
+
+	/**
+	 * Dial by name: spell a colleague, hear who matched, press a digit, get connected.
+	 *
+	 * Modelled on {@link ivrMenuNode} — answer, gather with the prompt riding the gather so barge-in
+	 * works, budget the failures, branch on exhaustion — and different from it in the one way that
+	 * makes this feature possible at all: the LIST is compiled. `DialByNamePlanNode.entries` is
+	 * sorted by `digits`, so matching is a prefix scan over an array rather than a query, which is
+	 * what lets the engine answer "who is S-M-I" while holding no database handle.
+	 *
+	 * ## Every name that is offered can be spoken
+	 *
+	 * This platform has no text-to-speech, so a directory that offered an entry it could not SAY
+	 * would produce "for, press one" — which is worse than not offering the person. The compiler
+	 * already drops extensions whose mailbox never recorded a name (`directory-entry-skipped`), so
+	 * `DirectoryEntry.nameMedia` is documented as never absent. It can still fail to RENDER on a
+	 * deployment whose object store is not mounted, and that case is skipped here with a note naming
+	 * the entry rather than played as silence.
+	 *
+	 * ## Why a bounded number of matches is offered
+	 *
+	 * A caller who typed one letter in a company of four hundred should be asked for more letters,
+	 * not read four hundred names. The compiler cannot make that call — it does not know how long an
+	 * audience will listen — so it compiles everyone and `directoryMaxOffers` decides how many one
+	 * round reads out.
+	 */
+	private async dialByNameNode(node: DialByNamePlanNode): Promise<StepResult> {
+		if (!(await this.ensureAnswered())) {
+			return { kind: "aborted" };
+		}
+		if (node.entries.length === 0) {
+			// The compiler warns `empty-directory` for this and still emits the node, because a
+			// directory whose every member lost their recorded name is a real state. Announce rather
+			// than gather: asking somebody to spell a name that can match nobody is a worse minute.
+			this.note(
+				`directory ${node.directoryId} has no entries that can be spoken; announced and hung up`,
+			);
+			return await this.announceAndHangup(
+				this.settings.directoryNoMatchPrompt,
+				"NO_ROUTE_DESTINATION",
+			);
+		}
+
+		let failures = 0;
+		let attempt = 0;
+
+		while (failures <= node.maxFailures) {
+			if (this.deps.channel.isTearingDown) {
+				return { kind: "aborted" };
+			}
+
+			const greeting =
+				attempt === 0
+					? (resolveMediaRef({ promptId: node.greetingPromptId }, this.settings.mediaRefs) ??
+						this.settings.directoryGreeting)
+					: this.settings.directoryInstructions;
+			attempt += 1;
+
+			const result = await this.deps.execute({
+				verb: "gather",
+				maxDigits: this.settings.directoryMaxDigits,
+				terminators: ["#"],
+				timeoutMs: this.settings.directoryTimeoutMs,
+				interDigitTimeoutMs: this.settings.directoryInterDigitTimeoutMs,
+				media: greeting,
+			});
+			if (result === undefined) {
+				return { kind: "hangup", cause: "NORMAL_TEMPORARY_FAILURE" };
+			}
+			const collection = collectionOf(result);
+			if (collection?.endReason === "hangup") {
+				return { kind: "aborted" };
+			}
+
+			const digits = collection?.digits.join("") ?? "";
+			// Too few digits and no digits are the same failure with different causes, and both are
+			// answered the same way: too few letters cannot narrow a directory, and the caller has to
+			// be asked again either way.
+			const matches =
+				digits.length < node.minDigits
+					? []
+					: node.entries.filter((entry) => entry.digits.startsWith(digits));
+
+			if (matches.length === 0) {
+				failures += 1;
+				if (failures > node.maxFailures) {
+					break;
+				}
+				await this.playPrompt(node.invalidPromptId);
+				if (node.invalidPromptId === undefined) {
+					await this.deps.execute({
+						verb: "play",
+						media: this.settings.directoryNoMatchPrompt,
+					});
+				}
+				continue;
+			}
+
+			const offered = await this.offerDirectoryMatches(
+				matches.slice(0, this.settings.directoryMaxOffers),
+			);
+			if (offered.kind === "selected") {
+				return { kind: "goto", nodeId: offered.entry.targetNodeId };
+			}
+			if (offered.kind === "aborted") {
+				return { kind: "aborted" };
+			}
+			if (offered.kind === "failed") {
+				return { kind: "hangup", cause: "NORMAL_TEMPORARY_FAILURE" };
+			}
+
+			// Everyone offered, nobody accepted. That is a failed round, not a hangup: the caller may
+			// have spelt the wrong name, and asking again is what a receptionist would do.
+			failures += 1;
+			if (failures > node.maxFailures) {
+				break;
+			}
+		}
+
+		// Out of attempts. The timeout branch when the tenant configured one, and otherwise a cause
+		// that says what happened — never `NORMAL_CLEARING`, which reads as "the caller hung up".
+		this.note(
+			`directory ${node.directoryId} was left after ${String(failures)} unsuccessful attempts`,
+		);
+		return this.branch(node.timeoutNodeId, "NO_USER_RESPONSE");
+	}
+
+	/**
+	 * Reads out each match and waits for the accept digit.
+	 *
+	 * The sentence is assembled the way `app_directory` assembles it — the recorded name, "please
+	 * press", the digit, "to select this person" — because the verb surface plays one media per
+	 * `play` and because building it from those parts means the accept digit is configurable without
+	 * re-recording anything: it is rendered as `digits:<n>`, a GENERATED media, so there is no file
+	 * to be missing.
+	 *
+	 * The gather rides the trailing fragment, so a caller who already knows which colleague they want
+	 * can press the digit over it instead of waiting out the sentence.
+	 */
+	private async offerDirectoryMatches(
+		matches: readonly DirectoryEntry[],
+	): Promise<
+		| { readonly kind: "selected"; readonly entry: DirectoryEntry }
+		| { readonly kind: "exhausted" }
+		| { readonly kind: "aborted" }
+		| { readonly kind: "failed" }
+	> {
+		for (const entry of matches) {
+			if (this.deps.channel.isTearingDown) {
+				return { kind: "aborted" };
+			}
+			const name = translateMediaRef(entry.nameMedia, this.settings.mediaRefs);
+			if (name === undefined) {
+				// Skipped rather than offered silently. `nameMedia` is compiled as never absent, so this
+				// is a deployment whose object store is not mounted for the media server, and the note
+				// names the extension so an operator can tell which of the two it is.
+				this.note(
+					`directory entry for extension ${entry.extensionNumber} has a recorded name this deployment cannot render; it was not offered`,
+				);
+				continue;
+			}
+
+			await this.deps.execute({ verb: "play", media: name });
+			await this.deps.execute({ verb: "play", media: this.settings.directorySelectPrefix });
+			await this.deps.execute({
+				verb: "play",
+				media: `digits:${this.settings.directorySelectDigit}`,
+			});
+			const result = await this.deps.execute({
+				verb: "gather",
+				maxDigits: 1,
+				terminators: ["#"],
+				timeoutMs: this.settings.directorySelectTimeoutMs,
+				interDigitTimeoutMs: this.settings.directoryInterDigitTimeoutMs,
+				media: this.settings.directorySelectSuffix,
+			});
+			if (result === undefined) {
+				return { kind: "failed" };
+			}
+			const collection = collectionOf(result);
+			if (collection?.endReason === "hangup") {
+				return { kind: "aborted" };
+			}
+			if (collection?.digits.join("") === this.settings.directorySelectDigit) {
+				return { kind: "selected", entry };
+			}
+		}
+		return { kind: "exhausted" };
 	}
 
 	/**

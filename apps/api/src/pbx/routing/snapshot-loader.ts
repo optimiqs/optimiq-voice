@@ -13,6 +13,7 @@ import {
 	ivrMenu,
 	ivrMenuOption,
 	mohClass,
+	orgLimit,
 	orgSetting,
 	outboundRoute,
 	pagingGroup,
@@ -137,6 +138,7 @@ export async function loadOrgRoutingSnapshot(
 		phraseSteps,
 		directories,
 		speedDials,
+		limitRows,
 	] = await Promise.all([
 		transaction.select().from(extension),
 		transaction.select().from(phoneNumber),
@@ -175,11 +177,16 @@ export async function loadOrgRoutingSnapshot(
 		transaction.select().from(phraseStep),
 		transaction.select().from(dialByNameDirectory),
 		transaction.select().from(speedDial),
+		// The organization's quota row. A SINGLETON — `org_limit_organization_key` makes it at most
+		// one — folded into `settings` below rather than carried as a collection, for the reason
+		// `RoutingSettingsInput.maxConcurrentCalls` gives: `canonicalizeSnapshot` hashes `settings`
+		// on an explicit line and a new top-level field would be silently outside the hash.
+		transaction.select().from(orgLimit),
 	]);
 
 	return {
 		organizationId,
-		settings: readRoutingSettings(settingRows),
+		settings: readRoutingSettings(settingRows, limitRows[0]),
 		extensions: extensions.map((row) => ({
 			id: row.id,
 			enabled: row.enabled,
@@ -677,14 +684,38 @@ interface SettingRow {
 	readonly enabled: boolean;
 }
 
+/** The one column of `org_limit` that routing reads. The other three are enforced at create. */
+interface LimitRow {
+	readonly maxConcurrentCalls: number | null;
+}
+
 /**
- * Projects `org_setting` rows onto {@link RoutingSettingsInput}.
+ * Projects `org_setting` rows — and the organization's single `org_limit` row — onto
+ * {@link RoutingSettingsInput}.
  *
- * Only the eight names the compiler declares are read; anything else in the `routing` category is
+ * Only the names the compiler declares are read; anything else in the `routing` category is
  * ignored rather than passed through, so a stray row cannot change how calls are routed. A
  * disabled row is treated as absent, which is what the settings cascade means by `enabled`.
+ *
+ * ## Two tables, one settings object
+ *
+ * `org_limit` is a different table with a different write surface and a different grant
+ * (`org-limits.write`, owner-only until W14), and it lands here anyway. The reason is the hash:
+ * `canonicalizeSnapshot` names `settings` on an explicit line and derives the rest from
+ * `SNAPSHOT_COLLECTIONS`, so a top-level sibling would be outside `snapshotHash` — the same
+ * dead-column trap this file's header describes for `announce_join_leave` and `pin_hash`, moved up a
+ * level and correspondingly harder to notice. Both tables map to the `settings` entity kind in
+ * `ROUTING_TABLE_TO_ENTITY`, so a write to either evicts and recompiles once.
+ *
+ * Three of the four limits are absent on purpose. `maxExtensions`, `maxTrunks` and `maxStorageMb`
+ * are enforced at CREATE, in the transaction that inserts the row — there is a row to refuse and a
+ * person to tell. Compiling them would put a number in the artifact that nothing reads, which is
+ * the trap running in the other direction.
  */
-export function readRoutingSettings(rows: readonly SettingRow[]): RoutingSettingsInput {
+export function readRoutingSettings(
+	rows: readonly SettingRow[],
+	limits?: LimitRow,
+): RoutingSettingsInput {
 	const byName = new Map(rows.filter((row) => row.enabled).map((row) => [row.name, row.value]));
 
 	const asString = (name: string): string | undefined => {
@@ -736,5 +767,12 @@ export function readRoutingSettings(rows: readonly SettingRow[]): RoutingSetting
 					),
 				}
 			: {}),
+		// NULL is unlimited and so is a missing row, and the two are collapsed to an ABSENT KEY
+		// rather than to `null` — the compiler reads both the same way, and an absent key keeps the
+		// canonical snapshot of a tenant with no quota row byte-identical to what it was before this
+		// column was loaded. Which is what makes adding it a no-op for every tenant that has none.
+		...(limits?.maxConcurrentCalls === undefined || limits.maxConcurrentCalls === null
+			? {}
+			: { maxConcurrentCalls: limits.maxConcurrentCalls }),
 	};
 }

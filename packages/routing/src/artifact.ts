@@ -364,6 +364,18 @@ export interface CompiledRoutingSettings {
 	readonly outboundEnabled: boolean;
 	readonly outboundCallerIdNumber?: string;
 	readonly outboundCallerIdName?: string;
+	/**
+	 * The organization's simultaneous-call ceiling, enforced by the engine at ADMISSION.
+	 *
+	 * Absent means unlimited, and absent is what every artifact compiled before this field existed
+	 * carries — so a reader that finds it missing admits every call, which is what every release
+	 * before this one did. That is why this is not an artifact version bump: an optional field an
+	 * old reader ignores leaves it behaving exactly as it did.
+	 *
+	 * The value is a POLICY, not a count. Who counts, and how nearly right the count is, is the
+	 * engine's problem and is documented where it counts.
+	 */
+	readonly maxConcurrentCalls?: number;
 }
 
 /**

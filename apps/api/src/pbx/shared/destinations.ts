@@ -271,9 +271,24 @@ export async function findDestinationReferences(
 /** Non-destination foreign keys the CRUD layer also refuses to orphan. */
 export interface ScalarReferenceSite {
 	readonly table: string;
+	/** The entity a refused delete names. Usually `table`'s own kind — see {@link idColumn}. */
 	readonly kind: string;
 	readonly column: string;
 	readonly nameColumn: string | null;
+	/**
+	 * Which column identifies the thing the USER has to go and fix. Defaults to `id`.
+	 *
+	 * For nearly every site the referring row is the thing to fix: an IVR menu naming a prompt is an
+	 * IVR menu somebody opens and re-points. A CHILD row is not — `phrase_step` has no screen of its
+	 * own, and handing a user a step id would name a row they cannot navigate to. So that site sets
+	 * `idColumn: "phrase_id"` and a `kind` to match, and the 409 names the PHRASE, which is the row
+	 * with the form on it.
+	 *
+	 * The rows are de-duplicated on `(kind, id)` for the same reason this exists: a phrase is allowed
+	 * to play the same prompt twice — that is the composition `phrases-schema.ts` points at instead
+	 * of nesting — and listing it twice would make one phrase look like two.
+	 */
+	readonly idColumn?: string;
 }
 
 export async function findScalarReferences(
@@ -282,19 +297,26 @@ export async function findScalarReferences(
 	id: string,
 ): Promise<readonly EntityReference[]> {
 	const references: EntityReference[] = [];
+	const seen = new Set<string>();
 	for (const site of sites) {
 		const nameExpression =
 			site.nameColumn === null ? sql`null` : sql`${sql.identifier(site.nameColumn)}::text`;
 		const rows = await transaction.execute(sql`
-			select id::text as id, ${nameExpression} as name
+			select distinct ${sql.identifier(site.idColumn ?? "id")}::text as id, ${nameExpression} as name
 			from ${sql.identifier(site.table)}
 			where ${sql.identifier(site.column)} = ${id}::uuid
 			limit 25
 		`);
 		for (const row of readRows(rows)) {
+			const referenceId = String(row.id);
+			const key = `${site.kind}:${referenceId}`;
+			if (seen.has(key)) {
+				continue;
+			}
+			seen.add(key);
 			references.push({
 				kind: site.kind,
-				id: String(row.id),
+				id: referenceId,
 				name: row.name === null || row.name === undefined ? null : String(row.name),
 				field: site.column,
 			});

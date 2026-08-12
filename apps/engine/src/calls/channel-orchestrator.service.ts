@@ -45,7 +45,7 @@ import { DtmfRegistry } from "../verbs/dtmf-registry";
 import { callDirectionFrom, dialStringOr, hangupSideFor } from "./ari-mapping";
 import { CallControl, pickupGroupFilter } from "./call-control";
 import { CallControlRegistry } from "./call-control-registry";
-import { buildCdrLegWrite, queueLegOf } from "./cdr-leg";
+import { authorizationOf, buildCdrLegWrite, queueLegOf } from "./cdr-leg";
 import { ChannelAggregate } from "./channel-aggregate";
 import {
 	callIdForAriChannel,
@@ -71,6 +71,7 @@ import type {
 	PlanWalkerSettings,
 	VoicemailPort,
 	WalkerCallControl,
+	PinAuthorization,
 	WalkerQueueOutcome,
 	WalkerChannel,
 } from "../routing/plan-walker";
@@ -110,6 +111,15 @@ import type {
 /** Channel variables the routing walk writes back, so the KV mirror carries the decision too. */
 const DESTINATION_TYPE_VARIABLE = "OPTIMIQ_DESTINATION_TYPE";
 const DESTINATION_REF_VARIABLE = "OPTIMIQ_DESTINATION_REF";
+/**
+ * Which authorisation code opened a gated outbound route, mirrored exactly as the destination is.
+ *
+ * Channel variables and not walk state, for the reason `recordDestination` gives: the CDR is written
+ * by whichever of the teardown and the walk's return gets there first, and only the variables are
+ * visible to both. The ordinal and the label — never the digits, which stop at the walker.
+ */
+const AUTH_PIN_ORDINAL_VARIABLE = "OPTIMIQ_AUTH_PIN_ORDINAL";
+const AUTH_PIN_LABEL_VARIABLE = "OPTIMIQ_AUTH_PIN_LABEL";
 /**
  * The queue's verdict on a caller's stay, mirrored onto the leg exactly as the destination is.
  *
@@ -731,6 +741,10 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			return;
 		}
 
+		if (!(await this.admitWithinConcurrencyCeiling(channel, organizationId))) {
+			return;
+		}
+
 		const direction = callDirectionFrom(variables.OPTIMIQ_CALL_DIRECTION);
 		const admittedAt = Date.now();
 		const aggregate = ChannelAggregate.create({
@@ -1151,6 +1165,9 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			},
 			onQueueOutcome: async (outcome) => {
 				await this.recordQueueOutcome(aggregate, outcome);
+			},
+			onPinAuthorization: async (authorization) => {
+				await this.recordPinAuthorization(aggregate, authorization);
 			},
 			...(extra.beforeBridge === undefined ? {} : { beforeBridge: extra.beforeBridge }),
 			log: (message, detail) => {
@@ -2881,6 +2898,32 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	}
 
 	/**
+	 * Records which authorisation code paid for a gated outbound call.
+	 *
+	 * Written the moment the code is accepted and BEFORE the first trunk is offered, on exactly the
+	 * terms {@link recordDestination} sets out: the dial that follows may end in any number of ways,
+	 * and the CDR must already know who authorised it whichever of teardown and the walk's return
+	 * writes the row.
+	 *
+	 * The label is only mirrored when the set gave the entry one. An empty variable and an absent one
+	 * would be the same row, but they are not the same snapshot, and `authorizationOf` reads both
+	 * back as "no label" — writing the empty string would put a key in the bucket that means nothing.
+	 */
+	private async recordPinAuthorization(
+		aggregate: ChannelAggregate,
+		authorization: PinAuthorization,
+	): Promise<void> {
+		aggregate.setVariable(AUTH_PIN_ORDINAL_VARIABLE, String(authorization.ordinal));
+		if (authorization.label !== undefined && authorization.label !== "") {
+			aggregate.setVariable(AUTH_PIN_LABEL_VARIABLE, authorization.label);
+		}
+		if (aggregate.isTearingDown) {
+			return;
+		}
+		await this.jetstream.putChannel(aggregate.snapshot);
+	}
+
+	/**
 	 * Flushes the leg's snapshot once a walk is over.
 	 *
 	 * A walk mutates the leg as it goes — the bridge a conference put it in, the state it moved to,
@@ -2931,6 +2974,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				...(destinationType === undefined ? {} : { destinationType }),
 				...(destinationRef === undefined ? {} : { destinationRef }),
 				...queueLegOf(aggregate.snapshot.variables),
+				...authorizationOf(aggregate.snapshot.variables),
 			});
 			const envelope = makeCdrLegWriteEvent({
 				id: data.id,
@@ -3078,6 +3122,82 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		}
 		clearTimeout(timer);
 		this.durationCeilings.delete(mediaChannelId);
+	}
+
+	/**
+	 * The organization's simultaneous-call ceiling, enforced at the door.
+	 *
+	 * ## Why here and not at the trunk
+	 *
+	 * `TrunkAttempt.maxChannels` already caps what one CARRIER will accept, and it is enforced in
+	 * the plan walker where the INVITE is about to go out. This is a different quota with a
+	 * different meaning: `org_limit.max_concurrent_calls` is what the tenant has BOUGHT, so it has
+	 * to count internal extension-to-extension calls, conference legs and queue callers — none of
+	 * which reach a trunk. Enforcing it at `trunkDialNode` would let an organization with a ceiling
+	 * of ten hold two hundred internal calls and be refused only on the two hundred and first
+	 * outbound one.
+	 *
+	 * ## Why at THIS point in admission
+	 *
+	 * After the organization is resolved, because there is no quota to check without one. Before
+	 * `claimChannel`, and that ordering is the load-bearing half: a refused call must not take a KV
+	 * ownership claim it will never release, must not publish `channel.created` for a call that
+	 * never existed, and must not enter the registry it is being refused for being too full. Every
+	 * one of those would make the refusal itself consume a slot.
+	 *
+	 * ## The count, and how nearly right it is
+	 *
+	 * `ChannelRegistry.liveCountFor` counts THIS REPLICA's legs. The limitation is stated on that
+	 * method and is the same one `trunk-capacity.ts` accepts for the per-trunk ceiling: with N
+	 * engines the effective ceiling is N times the configured one. It is wrong by a known factor and
+	 * never in the dangerous direction — it can admit a call it should have refused, never the
+	 * reverse — and for the single-instance deployment this repo ships it is exact.
+	 *
+	 * The comparison is `>=` for the reason `assertWithinLimit` uses it in the API: the count is
+	 * taken BEFORE this leg is added, so at ten of ten this one would be the eleventh.
+	 *
+	 * ## The cause, and the absence of an announcement
+	 *
+	 * `SWITCH_CONGESTION`, which is what the per-trunk ceiling refuses with and what a carrier and a
+	 * report both read as "full, try again". Not `NORMAL_TEMPORARY_FAILURE`, which the drain uses
+	 * and which invites the carrier to fail the call over to another instance — that is exactly
+	 * wrong here, because every other instance is subject to the same quota and would refuse it too.
+	 *
+	 * No announcement, unlike a refusal inside the plan walker. The leg has not been answered; to
+	 * announce we would have to answer it, and answering a call in order to tell the caller we are
+	 * not taking it bills the tenant for the refusal and makes it a connected call in their own CDR.
+	 * A cause on an unanswered leg is what congestion is supposed to look like.
+	 *
+	 * Returns `true` when the call may proceed. A missing or unreadable artifact admits: a quota
+	 * this process could not read must not become an outage.
+	 */
+	private async admitWithinConcurrencyCeiling(
+		channel: MediaChannelSnapshot,
+		organizationId: string,
+	): Promise<boolean> {
+		const artifact = await this.routing.get(organizationId).catch((error: unknown) => {
+			this.logger.warn(
+				{ organizationId, err: String(error) },
+				"could not read the routing artifact to check the concurrent-call ceiling; admitting",
+			);
+			return undefined;
+		});
+		const ceiling = artifact?.settings.maxConcurrentCalls;
+		if (ceiling === undefined) {
+			return true;
+		}
+
+		const live = this.registry.liveCountFor(organizationId);
+		if (live < ceiling) {
+			return true;
+		}
+
+		this.logger.info(
+			{ ariChannelId: channel.id, organizationId, live, ceiling },
+			"rejecting a new call: the organization is at its simultaneous-call ceiling",
+		);
+		await this.hangupQuietly(channel.id, "SWITCH_CONGESTION");
+		return false;
 	}
 
 	/** Hangs a channel up without letting a media-server failure become the caller's problem. */

@@ -27,11 +27,17 @@ import {
 } from "../../src/pbx/dial-plan/dial-plan.resource";
 import { assertWithinLimit, usageEntry } from "../../src/pbx/org-limits/org-limits";
 import { writeOrgLimitsDto } from "../../src/pbx/org-limits/org-limits.dto";
+import {
+	createOutboundRouteDto,
+	updateOutboundRouteDto,
+} from "../../src/pbx/outbound-routes/outbound-routes.dto";
 import { createPinSetEntryDto, setPinDto } from "../../src/pbx/pin-sets/pin-sets.dto";
 import { PIN_SET_ENTRY_RESOURCE, PIN_SET_RESOURCE } from "../../src/pbx/pin-sets/pin-sets.resource";
 import { parseDto } from "../../src/pbx/shared/dto";
+import { updateTimeConditionDto } from "../../src/pbx/time-conditions/time-conditions.dto";
 import { createTranslationRuleDto } from "../../src/pbx/translations/translations.dto";
 import { TRANSLATION_RULESET_RESOURCE } from "../../src/pbx/translations/translations.resource";
+import { updateTrunkDto } from "../../src/pbx/trunks/trunks.dto";
 import type { Permission } from "@optimiq-voice/auth";
 
 /**
@@ -191,6 +197,88 @@ describe("call flow DTO", () => {
 	});
 });
 
+/**
+ * The four attachment columns, which the compiler always read and no DTO used to declare.
+ *
+ * All four are nullish, and `null` is the whole point of them: it is the only way a picker's "None"
+ * can say what it means, and for the two `on delete set null` foreign keys it is also the shape the
+ * delete guard leaves behind. Nothing here checks that the referenced row EXISTS or is enabled —
+ * that is `packages/routing`'s job (`unusable-pin-set`, `dangling-translation-ruleset`) and it
+ * happens inside the write transaction, because a fail-OPEN warning an admin can read beats a 400
+ * that cannot say which of missing / disabled / foreign it was.
+ */
+describe("the attachment DTOs", () => {
+	const route = {
+		name: "International",
+		tollClass: "international",
+		dialPatterns: ["^00\\d+$"],
+		trunkPriority: [],
+	};
+	const setId = "0195c0f0-1c2f-7000-8000-0000000000b1";
+
+	it("attaches a PIN set and a ruleset to an outbound route, and clears both with null", () => {
+		const attached = parseDto(createOutboundRouteDto, {
+			...route,
+			pinSetId: setId,
+			translationRulesetId: setId,
+		});
+		expect(attached.pinSetId).to.equal(setId);
+		expect(attached.translationRulesetId).to.equal(setId);
+
+		const cleared = parseDto(updateOutboundRouteDto, {
+			pinSetId: null,
+			translationRulesetId: null,
+		});
+		expect(cleared.pinSetId).to.equal(null);
+		expect(cleared.translationRulesetId).to.equal(null);
+	});
+
+	it("attaches an inbound ruleset to a trunk, and clears it with null", () => {
+		expect(parseDto(updateTrunkDto, { inboundTranslationRulesetId: setId })).to.deep.equal({
+			inboundTranslationRulesetId: setId,
+		});
+		expect(parseDto(updateTrunkDto, { inboundTranslationRulesetId: null })).to.deep.equal({
+			inboundTranslationRulesetId: null,
+		});
+	});
+
+	/** An id is a uuid, not a name — the same refusal the foreign key would make, made earlier. */
+	it("refuses an attachment that is not an id", () => {
+		for (const body of [{ pinSetId: "night-codes" }, { translationRulesetId: "" }]) {
+			expect(() => parseDto(updateOutboundRouteDto, body), JSON.stringify(body)).to.throw(
+				BadRequestException,
+			);
+		}
+		expect(() => parseDto(updateTrunkDto, { inboundTranslationRulesetId: 7 })).to.throw(
+			BadRequestException,
+		);
+	});
+
+	/**
+	 * Shaped like `call_flow.featureCode` and screened the same way. The regex here only says "a
+	 * phone could dial this"; the collision that actually breaks the feature — two mechanisms
+	 * answering the same digits — is a compile error, because it is not one the edge can see.
+	 */
+	it("takes a time condition's override star code, and clears it with null", () => {
+		expect(parseDto(updateTimeConditionDto, { overrideFeatureCode: "*291" })).to.deep.equal({
+			overrideFeatureCode: "*291",
+		});
+		expect(parseDto(updateTimeConditionDto, { overrideFeatureCode: null })).to.deep.equal({
+			overrideFeatureCode: null,
+		});
+		expect(() => parseDto(updateTimeConditionDto, { overrideFeatureCode: "night mode" })).to.throw(
+			BadRequestException,
+		);
+	});
+
+	/** The override STATE still is not a field: it moves through the endpoint under `/call-flows`. */
+	it("still refuses the override state, which belongs to the override endpoint", () => {
+		expect(() => parseDto(updateTimeConditionDto, { override: "forced-match" })).to.throw(
+			BadRequestException,
+		);
+	});
+});
+
 describe("PIN set DTO", () => {
 	/** The whole of the feature's security posture, at the edge. */
 	it("refuses a code anywhere in the entry body", () => {
@@ -334,10 +422,28 @@ describe("organization limits", () => {
 			used: 3,
 			ceiling: 10,
 			ratio: 0.3,
+			measured: true,
 		});
 		expect(usageEntry("maxTrunks", 3, null).ratio).to.equal(null);
 		// A zero ceiling is "none allowed", not "divide by zero".
 		expect(usageEntry("maxTrunks", 0, 0).ratio).to.equal(null);
+	});
+
+	/**
+	 * The one line of the report that is a placeholder rather than a measurement.
+	 *
+	 * Simultaneous calls are live state the engines hold, per replica; the control plane cannot ask
+	 * for the number on a page load. The CEILING is real and, since the admission gate, enforced —
+	 * so the line has to carry the ceiling and disclaim the count, and suppressing the ratio is what
+	 * stops a screen drawing a "0% of 25" bar that reads as "nobody is on a call right now".
+	 */
+	it("marks the simultaneous-call line unmeasured, and draws no ratio from a placeholder", () => {
+		const concurrent = usageEntry("maxConcurrentCalls", 0, 25, false);
+		expect(concurrent.measured).to.equal(false);
+		expect(concurrent.ceiling).to.equal(25);
+		expect(concurrent.ratio).to.equal(null);
+		// Everything else in the report is counted, and says so without its call site having to.
+		expect(usageEntry("maxExtensions", 1, 5).measured).to.equal(true);
 	});
 
 	/**

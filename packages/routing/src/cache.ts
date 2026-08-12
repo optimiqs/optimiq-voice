@@ -118,6 +118,12 @@ export const ROUTING_TABLE_TO_ENTITY: Readonly<Record<string, RoutingEntityKind>
 	// what an emergency call presents, which is a compiled fact.
 	emergency_address: "emergencyAddresses",
 	org_setting: "settings",
+	// A routing input as of the concurrent-call ceiling: `max_concurrent_calls` is compiled into
+	// `CompiledRoutingSettings` and enforced by the engine at admission, so raising a tenant's cap
+	// has to reach a running engine the same way any other configuration change does. It maps to
+	// `settings` because that is the snapshot field it lands in — one eviction, one recompile,
+	// whichever of the two tables moved.
+	org_limit: "settings",
 
 	// --- The T2 admin block ---------------------------------------------------------------------
 	call_flow: "callFlows",

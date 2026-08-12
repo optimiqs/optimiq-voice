@@ -964,6 +964,25 @@ export interface RoutingSettingsInput {
 	 * compiled-in `911` is the one routing decision a tenant does not get to switch off.
 	 */
 	readonly emergencyNumbers?: readonly string[];
+	/**
+	 * Simultaneous live channels this organization may hold, across every trunk and none.
+	 *
+	 * It is a SETTING here rather than a collection of its own, and rather than a top-level sibling
+	 * of `settings`, for one mechanical reason worth stating: `canonicalizeSnapshot` hashes
+	 * `organizationId`, `settings` and the members of `SNAPSHOT_COLLECTIONS`, and it names `settings`
+	 * on an explicit line. A new top-level field would be excluded from `snapshotHash` unless that
+	 * line were extended too — which is the dead-column trap this package's loader header warns
+	 * about, one level up. Riding `settings` is hashed for free.
+	 *
+	 * `null` and absent both mean unlimited, and they arrive from different places: `null` is the
+	 * column with no ceiling set, absent is a loader that does not select it. The compiler collapses
+	 * both to an absent key.
+	 *
+	 * The cap it expresses is NOT the same as `TrunkInput.maxChannels`, which is what one carrier
+	 * will accept. This is what the tenant has bought, so it counts internal calls, conference legs
+	 * and queue callers too — none of which touch a trunk.
+	 */
+	readonly maxConcurrentCalls?: number | null;
 }
 
 /** Everything the compiler is allowed to see about one organization. */

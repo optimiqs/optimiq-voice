@@ -731,6 +731,97 @@ describe("drain with routing on", () => {
 });
 
 // =================================================================================================
+// The organization's simultaneous-call ceiling
+// =================================================================================================
+
+/**
+ * `org_limit.max_concurrent_calls`, enforced at admission.
+ *
+ * The column existed, was writable, was rendered on a page, and was enforced by nothing. What these
+ * specs pin is the two decisions that make the gate correct rather than merely present:
+ *
+ * 1. **A refused call consumes nothing.** No KV claim, no `channel.created`, no registry entry. Any
+ *    one of those would make the refusal itself occupy a slot, so an organization at its ceiling
+ *    would ratchet downwards with every call it turned away.
+ * 2. **`SWITCH_CONGESTION`, not `NORMAL_TEMPORARY_FAILURE`.** The drain uses the latter precisely so
+ *    a carrier fails the call over to another instance, which is exactly wrong here: every other
+ *    instance is subject to the same quota and would refuse it too.
+ */
+describe("the organization's simultaneous-call ceiling", () => {
+	function cappedArtifact(maxConcurrentCalls: number): RoutingArtifact {
+		const base = artifactWith(TERMINALS, "hangup:NORMAL_CLEARING");
+		return { ...base, settings: { ...base.settings, maxConcurrentCalls } } as RoutingArtifact;
+	}
+
+	/** A second arrival under a ceiling of one, with the first leg still live. */
+	async function secondArrival(artifact: RoutingArtifact) {
+		const h = harness({ artifact });
+		// The first call is admitted and left UP: no `ChannelDestroyed`, so it is still occupying a
+		// slot when the second arrives. A terminal plan would hang it up and free the slot again.
+		await h.orchestrator.handleEvent(
+			mediaEvent("StasisStart", { channel: channel({ id: "1754400000.1" }), args: [] }),
+		);
+		await h.orchestrator.awaitWalks();
+		const before = h.media.calls.length;
+		const publishedBefore = h.published.length;
+
+		await h.orchestrator.handleEvent(
+			mediaEvent("StasisStart", { channel: channel({ id: "1754400000.2" }), args: [] }),
+		);
+		await h.orchestrator.awaitWalks();
+		return { h, before, publishedBefore };
+	}
+
+	it("admits every call when the tenant has no ceiling", async () => {
+		const h = harness({ artifact: artifactWith(TERMINALS, "hangup:NORMAL_CLEARING") });
+		await arrive(h);
+
+		expect(h.published.map((event) => event.type)).toContain("channel.created");
+	});
+
+	it("refuses the call over the cap with a cause that says congestion, not failover", async () => {
+		const { h, before } = await secondArrival(cappedArtifact(1));
+
+		expect(h.media.calls.slice(before)).toEqual([
+			{ method: "hangup", args: ["1754400000.2", "SWITCH_CONGESTION"] },
+		]);
+	});
+
+	/** The half that stops a full tenant ratcheting downwards on every call it turns away. */
+	it("publishes nothing and claims nothing for a call it refused", async () => {
+		const { h, publishedBefore } = await secondArrival(cappedArtifact(1));
+
+		expect(h.published.slice(publishedBefore)).toEqual([]);
+		expect(h.kv.has("1754400000.2")).toBe(false);
+	});
+
+	/** At one of one the SECOND call is the one over the line — the `>=` the API's counter uses. */
+	it("admits up to the ceiling and refuses only past it", async () => {
+		const { h, before } = await secondArrival(cappedArtifact(2));
+
+		expect(h.media.calls.slice(before)).not.toContainEqual({
+			method: "hangup",
+			args: ["1754400000.2", "SWITCH_CONGESTION"],
+		});
+	});
+
+	/**
+	 * A quota this process could not read must not become an outage. A tenant whose artifact has not
+	 * compiled yet is a tenant with no ceiling, which is what they had before this gate existed.
+	 */
+	it("admits when there is no artifact to read a ceiling from", async () => {
+		const h = harness();
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
+		await h.orchestrator.awaitWalks();
+
+		expect(h.media.calls).not.toContainEqual({
+			method: "hangup",
+			args: [ARI_CHANNEL, "SWITCH_CONGESTION"],
+		});
+	});
+});
+
+// =================================================================================================
 // B-leg CDRs
 // =================================================================================================
 

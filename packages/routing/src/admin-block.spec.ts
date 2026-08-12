@@ -311,6 +311,25 @@ describe("outbound PIN sets", () => {
 	});
 
 	/**
+	 * The dangling case, which became reachable the moment `pinSetId` gained a write DTO: the
+	 * snapshot is tenant-scoped, so a set belonging to another organization and a set that was
+	 * deleted are the same fact here — an id that is not in this snapshot. It fails OPEN like the
+	 * other two, and the warning is what tells the admin the gate they think they configured is not
+	 * there. An error would be worse: it would take every unrelated route in the tenant down.
+	 */
+	it("warns and leaves the route ungated when the set is not in this snapshot", () => {
+		const result = compileAttempt(
+			pinSnapshot({ outboundRoutes: [anOutboundRoute({ pinSetId: "pin-from-another-tenant" })] }),
+		);
+		expect(result.ok).toBe(true);
+		expect(codesOf(result)).toContain("unusable-pin-set");
+		const artifact = result.ok ? result.artifact : undefined;
+		expect((artifact?.nodes["trunk-dial:out-1"] as TrunkDialPlanNode | undefined)?.pinSet).toBe(
+			undefined,
+		);
+	});
+
+	/**
 	 * Kari's Law: `911` is dialable from any station with no prefix and no permission, and an
 	 * authorisation code is a permission. The emergency node is built from no route at all, so this
 	 * falls out — which is exactly why it is worth pinning.
@@ -730,5 +749,79 @@ describe("organization speed dials", () => {
 		expect(
 			resolveInternal(artifact, { from: "1001", dialed: "*02", now: NOON }).matchedRuleName,
 		).toBe("*02");
+	});
+});
+
+// -----------------------------------------------------------------------------------------------
+// The organization's simultaneous-call ceiling
+// -----------------------------------------------------------------------------------------------
+
+/**
+ * `org_limit.max_concurrent_calls`, compiled into the artifact for the engine to enforce.
+ *
+ * It rides `settings` rather than being a top-level field, and that is a mechanical decision worth
+ * a spec of its own: `canonicalizeSnapshot` hashes `organizationId`, `settings` and the members of
+ * `SNAPSHOT_COLLECTIONS`, naming `settings` on an explicit line. A sibling field would be OUTSIDE
+ * the hash, which means a tenant whose cap changed would keep serving the artifact compiled before
+ * it did — the dead-column trap the loader's header describes, one level up and correspondingly
+ * harder to notice.
+ *
+ * The rest is about what "unlimited" means, because four different inputs mean it and only one of
+ * them is a mistake.
+ */
+describe("the concurrent-call ceiling", () => {
+	function withCeiling(maxConcurrentCalls: number | null | undefined) {
+		return compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				...(maxConcurrentCalls === undefined ? {} : { settings: { maxConcurrentCalls } }),
+			}),
+		);
+	}
+
+	it("compiles a ceiling onto the artifact's settings", () => {
+		expect(withCeiling(25).settings.maxConcurrentCalls).toBe(25);
+	});
+
+	/**
+	 * All three absences collapse to an absent KEY rather than to a zero or a null, which is what
+	 * keeps a tenant with no quota row byte-identical to what they compiled to before this field
+	 * existed — and is why adding it was not an artifact version bump.
+	 */
+	it("omits the key entirely for a tenant with no ceiling", () => {
+		for (const value of [undefined, null] as const) {
+			const settings = withCeiling(value).settings;
+			expect(Object.hasOwn(settings, "maxConcurrentCalls")).toBe(false);
+		}
+	});
+
+	/**
+	 * Zero is UNLIMITED, not "refuse every call" — the same reading `TrunkCapacityPort.reserve`
+	 * gives `maxChannels`. A tenant who typed a zero into a quota field meant "no limit", and the
+	 * other interpretation takes their phone system down on a keystroke.
+	 */
+	it("reads a zero as unlimited rather than as a refusal of every call", () => {
+		expect(Object.hasOwn(withCeiling(0).settings, "maxConcurrentCalls")).toBe(false);
+	});
+
+	/**
+	 * A warning and not an error: the artifact is perfectly routable without a ceiling, and refusing
+	 * the compile would take every call in the tenant down to report a quota nobody is hitting.
+	 */
+	it("warns and applies no ceiling for a value that is not a whole number of calls", () => {
+		for (const value of [-5, 2.5]) {
+			const result = compileAttempt(
+				aSnapshot({ extensions: [anExtension()], settings: { maxConcurrentCalls: value } }),
+			);
+			expect(result.ok, String(value)).toBe(true);
+			expect(codesOf(result), String(value)).toContain("invalid-org-limit");
+			const artifact = result.ok ? result.artifact : undefined;
+			expect(Object.hasOwn(artifact?.settings ?? {}, "maxConcurrentCalls")).toBe(false);
+		}
+	});
+
+	/** The whole reason it lives on `settings`: a changed cap has to move the snapshot hash. */
+	it("moves the snapshot hash, so a raised cap reaches a running engine", () => {
+		expect(withCeiling(10).snapshotHash).not.toBe(withCeiling(20).snapshotHash);
 	});
 });

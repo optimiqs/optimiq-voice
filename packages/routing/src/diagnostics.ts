@@ -100,6 +100,16 @@ export const DIAGNOSTIC_CODES = [
 	/** A queue has an exit key and no exit destination, so pressing it hangs the caller up. */
 	"queue-exit-key-without-destination",
 
+	// --- organization quotas ----------------------------------------------------------------------
+	/**
+	 * An organization limit is not a number the engine can enforce, so it was not applied.
+	 *
+	 * A warning and not an error, for the reason `invalid-queue-priority` is: the artifact is still
+	 * routable without the ceiling, and refusing the compile would take every call in the tenant down
+	 * to report a quota nobody is currently hitting.
+	 */
+	"invalid-org-limit",
+
 	// --- emergency dialing (Kari's Law / RAY BAUM'S Act) ----------------------------------------
 	/** A DID carries no `emergencyAddressId`, so it cannot serve as an ELIN for the organization. */
 	"missing-emergency-address",

@@ -26,6 +26,18 @@ export const createOutboundRouteDto = z.strictObject({
 	trunkPriority: z.array(trunkPriorityEntry).max(20),
 	timeConditionId: z.uuid().nullish(),
 	...namedDestinationShape("failover"),
+	/**
+	 * The authorisation codes a caller must satisfy before any trunk on this route is dialled.
+	 *
+	 * `null` removes the gate, which is the same widening the column's `on delete set null` allows,
+	 * and it is the only way a form's "No PIN required" option can say what it means. Nothing is
+	 * checked here beyond the shape: a set that is disabled, foreign to this tenant, or empty of
+	 * usable codes is an `unusable-pin-set` warning from the compiler inside the write transaction —
+	 * a fail-OPEN the admin can see, rather than a 400 that hides which of the three it was.
+	 */
+	pinSetId: z.uuid().nullish(),
+	/** The shared rewrite applied to the dialled number, AFTER this route's own strip/prepend. */
+	translationRulesetId: z.uuid().nullish(),
 	callerIdNumberOverride: z.string().max(32).nullish(),
 	recordEnabled: z.boolean().optional(),
 	enabled: z.boolean().optional(),

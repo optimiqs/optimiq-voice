@@ -19,6 +19,9 @@ import type { ChannelAggregate } from "./channel-aggregate";
  * {@link add}. It has to be: the Call-ID is read off the media server, a B-leg's aggregate is
  * created BEFORE the leg exists to be read from, and a Local channel has no dialog at all — so this
  * index is sparse by nature and an `add` that demanded one would have nothing to give it.
+ *
+ * A FOURTH, by organization, exists for {@link liveCountFor} — see its note for why the count has to
+ * be O(1) and why it is maintained here rather than computed from {@link all}.
  */
 export class ChannelRegistry {
 	private readonly byAriId = new Map<string, ChannelAggregate>();
@@ -34,6 +37,16 @@ export class ChannelRegistry {
 	 * the lifetime of the process while pointing at calls that ended hours ago.
 	 */
 	private readonly sipDialogByAriId = new Map<string, string>();
+	/**
+	 * Organization → its live legs. Maintained in {@link add} / {@link remove} / {@link clear}.
+	 *
+	 * A fourth map rather than `all.filter(...)` because the one caller is on the CALL SETUP PATH:
+	 * the concurrent-call admission gate asks this question about every arriving call, and
+	 * {@link all} allocates a copy of every live leg on the instance before the filter even starts.
+	 * At a hundred concurrent calls that is a hundred-element array built per arrival to answer a
+	 * question a counter answers for free.
+	 */
+	private readonly byOrganization = new Map<string, Set<ChannelAggregate>>();
 	private acceptingNewCalls = true;
 
 	/** Whether new calls are still being admitted. `false` once a drain has begun. */
@@ -69,6 +82,35 @@ export class ChannelRegistry {
 	add(aggregate: ChannelAggregate): void {
 		this.byAriId.set(aggregate.ariChannelId, aggregate);
 		this.byChannelId.set(aggregate.channelId, aggregate);
+		const organization = this.byOrganization.get(aggregate.organizationId);
+		if (organization === undefined) {
+			this.byOrganization.set(aggregate.organizationId, new Set([aggregate]));
+			return;
+		}
+		organization.add(aggregate);
+	}
+
+	/**
+	 * How many legs this organization currently holds ON THIS REPLICA.
+	 *
+	 * The qualifier is the whole caveat and it is stated rather than hidden, on exactly the terms
+	 * `trunk-capacity.ts` states its own: the cluster-wide truth is the `channels` KV bucket, keyed
+	 * `<org>.<call>.<leg>`, and answering from it means listing and getting every live leg on the
+	 * platform on every arriving call. A CAS counter of its own costs two round trips on the call
+	 * setup path plus a reaper for a counter whose holder crashed.
+	 *
+	 * So this counts one process, which means **with N engines the effective ceiling is N times the
+	 * configured one**. That is wrong by a known factor and never wrong in the dangerous direction —
+	 * it can admit a call it should have refused, it can never refuse one it should have admitted —
+	 * and for the single-instance deployment this repo ships it is exact. A cluster-true counter is a
+	 * KV wave, and this method is the seam for it.
+	 *
+	 * Counts LEGS, not calls, which is what the quota means: `org_limit.max_concurrent_calls` is
+	 * "simultaneous live channels across the whole organization", and a call that has been bridged to
+	 * a desk phone is occupying two of them.
+	 */
+	liveCountFor(organizationId: string): number {
+		return this.byOrganization.get(organizationId)?.size ?? 0;
 	}
 
 	byAriChannelId(ariChannelId: string): ChannelAggregate | undefined {
@@ -122,6 +164,17 @@ export class ChannelRegistry {
 	remove(aggregate: ChannelAggregate): void {
 		this.byAriId.delete(aggregate.ariChannelId);
 		this.byChannelId.delete(aggregate.channelId);
+		const organization = this.byOrganization.get(aggregate.organizationId);
+		if (organization !== undefined) {
+			organization.delete(aggregate);
+			// The empty set is dropped rather than kept. A tenant whose calls have all ended must not
+			// leave a key behind: the map would otherwise grow to one entry per organization this
+			// process has ever served and never shrink, which is the leak `sipDialogByAriId` exists to
+			// prevent on the other index.
+			if (organization.size === 0) {
+				this.byOrganization.delete(aggregate.organizationId);
+			}
+		}
 		const sipCallId = this.sipDialogByAriId.get(aggregate.ariChannelId);
 		if (sipCallId !== undefined) {
 			this.sipDialogByAriId.delete(aggregate.ariChannelId);
@@ -138,5 +191,6 @@ export class ChannelRegistry {
 		this.byChannelId.clear();
 		this.bySipDialog.clear();
 		this.sipDialogByAriId.clear();
+		this.byOrganization.clear();
 	}
 }

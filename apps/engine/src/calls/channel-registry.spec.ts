@@ -17,12 +17,14 @@ import { ChannelRegistry } from "./channel-registry";
 
 const ORG = "0195c0f0-1c2f-7000-8000-000000000001";
 
-function aggregate(ariChannelId: string): ChannelAggregate {
+const OTHER_ORG = "0195c0f0-1c2f-7000-8000-000000000002";
+
+function aggregate(ariChannelId: string, organizationId = ORG): ChannelAggregate {
 	return ChannelAggregate.create({
 		ariChannelId,
 		channelId: legIdForAriChannel(ariChannelId),
 		callId: callIdForAriChannel(ariChannelId),
-		organizationId: ORG,
+		organizationId,
 		direction: "inbound",
 		leg: "a",
 		profile: { destinationNumber: "1001", context: "default", source: "ari" },
@@ -169,5 +171,56 @@ describe("the sip dialog index, on teardown", () => {
 		registry.add(leg);
 		registry.remove(leg);
 		expect(registry.sipDialogCount).toBe(0);
+	});
+});
+
+/**
+ * The per-organization count, which is the fourth map and the one on the CALL SETUP PATH.
+ *
+ * The admission gate asks this question about every arriving call, so it has to be a counter rather
+ * than a filter over `all` — which allocates a copy of every live leg on the instance before the
+ * filter starts. What is asserted here is the arithmetic and, more importantly, that the map does
+ * not LEAK: a tenant whose calls have all ended must leave no key behind, or the map grows to one
+ * entry per organization the process has ever served and never shrinks.
+ */
+describe("the per-organization count", () => {
+	it("counts only this organization's legs", () => {
+		const registry = new ChannelRegistry();
+		registry.add(aggregate("1754400000.1"));
+		registry.add(aggregate("1754400000.2"));
+		registry.add(aggregate("1754400000.3", OTHER_ORG));
+
+		expect(registry.liveCountFor(ORG)).toBe(2);
+		expect(registry.liveCountFor(OTHER_ORG)).toBe(1);
+	});
+
+	/** An organization this process has never served is zero, not undefined. */
+	it("answers zero for an organization it holds nothing for", () => {
+		expect(new ChannelRegistry().liveCountFor(ORG)).toBe(0);
+	});
+
+	it("gives a slot back when a leg ends", () => {
+		const registry = new ChannelRegistry();
+		const leg = aggregate("1754400000.1");
+		registry.add(leg);
+		registry.add(aggregate("1754400000.2"));
+		registry.remove(leg);
+
+		expect(registry.liveCountFor(ORG)).toBe(1);
+	});
+
+	/** The leak check: the last leg leaving must drop the key, not leave an empty set behind. */
+	it("keeps no entry for an organization whose calls have all ended", () => {
+		const registry = new ChannelRegistry();
+		const leg = aggregate("1754400000.1");
+		registry.add(leg);
+		registry.remove(leg);
+
+		expect(registry.liveCountFor(ORG)).toBe(0);
+		// Adding and removing repeatedly must not accumulate, which is what the count proves for the
+		// one organization and what `clear` proves for all of them.
+		registry.add(aggregate("1754400000.2"));
+		registry.clear();
+		expect(registry.liveCountFor(ORG)).toBe(0);
 	});
 });

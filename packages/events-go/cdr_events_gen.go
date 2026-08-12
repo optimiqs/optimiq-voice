@@ -44,6 +44,8 @@ type CDRLegWriteData struct {
 	QueueWaitMs      *int                     `json:"queueWaitMs,omitempty"`
 	QueueOutcome     *CDRLegWriteQueueOutcome `json:"queueOutcome,omitempty"`
 	QueueAgentRef    *string                  `json:"queueAgentRef,omitempty"`
+	AuthPinOrdinal   *int                     `json:"authPinOrdinal,omitempty"`
+	AuthPinLabel     *string                  `json:"authPinLabel,omitempty"`
 
 	// Extra carries every key outside the pinned contract, verbatim. The TS schema is a
 	// z.looseObject (see cdr-events.ts) precisely so a producer running ahead of the
@@ -96,6 +98,8 @@ var knownKeysCDRLegWriteData = map[string]struct{}{
 	"queueWaitMs":      {},
 	"queueOutcome":     {},
 	"queueAgentRef":    {},
+	"authPinOrdinal":   {},
+	"authPinLabel":     {},
 }
 
 // CDRLegWriteQueueOutcome is the closed vocabulary of CDRLegWriteData.queueOutcome.
