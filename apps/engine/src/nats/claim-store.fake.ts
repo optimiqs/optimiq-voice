@@ -1,4 +1,4 @@
-import type { ClaimBucket, ClaimWrite, Claimed } from "./claim-store";
+import type { ClaimBucket, ClaimRead, ClaimWrite } from "./claim-store";
 
 /**
  * An in-memory {@link ClaimBucket} with real revisions, so a registry's compare-and-set runs with
@@ -66,13 +66,15 @@ export class FakeClaimBucket<T> implements ClaimBucket<T> {
 		return this.entries.size;
 	}
 
-	async get(key: string): Promise<Claimed<T> | undefined> {
+	async get(key: string): Promise<ClaimRead<T>> {
 		this.calls.push({ method: "get", key });
 		if (this.failing) {
-			return undefined;
+			return { kind: "unavailable", reason: "the fake bucket is failing" };
 		}
 		const entry = this.entries.get(key);
-		return entry === undefined ? undefined : { value: entry.value as T, revision: entry.revision };
+		return entry === undefined
+			? { kind: "absent" }
+			: { kind: "present", claim: { value: entry.value as T, revision: entry.revision } };
 	}
 
 	async create(key: string, value: T): Promise<ClaimWrite<T>> {
@@ -105,9 +107,13 @@ export class FakeClaimBucket<T> implements ClaimBucket<T> {
 		return { kind: "written", revision: next };
 	}
 
-	async release(key: string): Promise<boolean> {
+	async release(key: string, revision: number): Promise<boolean> {
 		this.calls.push({ method: "release", key });
 		if (this.failing) {
+			return false;
+		}
+		const existing = this.entries.get(key);
+		if (existing === undefined || existing.revision !== revision) {
 			return false;
 		}
 		return this.entries.delete(key);

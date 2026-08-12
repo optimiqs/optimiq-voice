@@ -8,7 +8,8 @@ import {
 	parseParkSlot,
 } from "@optimiq-voice/telephony";
 import { UnclaimedBucket } from "../nats/claim-store";
-import type { ClaimBucket, Claimed } from "../nats/claim-store";
+import { CLAIM_LEASE_MS } from "./claim-timing";
+import type { ClaimBucket, ClaimRead } from "../nats/claim-store";
 import type { ParkClaim } from "@optimiq-voice/events";
 import type { ParkSlotRangeBounds } from "@optimiq-voice/telephony";
 
@@ -62,6 +63,8 @@ import type { ParkSlotRangeBounds } from "@optimiq-voice/telephony";
  * - `stale` — a claim whose owner stopped heartbeating. Nobody can be asked; the retriever wins the
  *   claim with {@link ParkRegistry.takeOverStale} and decides for itself whether the channel the
  *   dead instance left behind is still on the media server.
+ * - `claims-unavailable` — this instance still holds the local call, but could not prove the shared
+ *   claim was released. Retrieval is refused and the call remains parked.
  * - `absent` — nothing, anywhere.
  *
  * This registry stays out of the media entirely: it says who owns what, and `CallControl` moves the
@@ -103,6 +106,8 @@ export type ParkClaimResult =
 	| { readonly kind: "claimed"; readonly entry: ParkedCall }
 	/** Nothing is on that orbit, anywhere. */
 	| { readonly kind: "absent" }
+	/** The local call remains parked because exclusive retrieval could not be confirmed. */
+	| { readonly kind: "claims-unavailable"; readonly reason: string }
 	/**
 	 * A call IS on that orbit, on another engine instance whose claim is LIVE.
 	 *
@@ -123,18 +128,6 @@ export type ParkClaimResult =
 	 */
 	| { readonly kind: "stale"; readonly instanceId: string; readonly entry: ParkedCall };
 
-/**
- * How long a claim is believable without a heartbeat.
- *
- * Comfortably longer than {@link CLAIM_HEARTBEAT_INTERVAL_MS} so an instance under load, or a
- * broker that blipped, does not lose slots it is still serving — and far shorter than the bucket's
- * own TTL, so the reaping decision is the record's and not the server's.
- */
-export const CLAIM_LEASE_MS = 90_000;
-
-/** How often an owner pushes its claims' expiry forward. A third of the lease, as leases go. */
-export const CLAIM_HEARTBEAT_INTERVAL_MS = 30_000;
-
 interface HeldClaim {
 	readonly entry: ParkedCall;
 	/** The KV revision the claim was last written at. Quoted by every heartbeat and release. */
@@ -147,12 +140,16 @@ interface HeldClaim {
 export class ParkRegistry {
 	private readonly logger = getLogger("engine.park");
 
-	/** `parkLotId` → `slot` → entry. Two levels because a slot number is only unique within a lot. */
-	private readonly lots = new Map<string, Map<number, ParkedCall>>();
+	/** `organizationId` → `parkLotId` → `slot` → entry. */
+	private readonly lots = new Map<string, Map<string, Map<number, ParkedCall>>>();
 	/** `mediaChannelId` → the entry it occupies, so a hangup can release a slot in one lookup. */
 	private readonly byChannel = new Map<string, ParkedCall>();
 	/** `mediaChannelId` → the claim backing it. Empty when no bucket is configured. */
 	private readonly claims = new Map<string, HeldClaim>();
+	/** Claim revisions won solely to collect an orphaned channel. */
+	private readonly takeovers = new Map<string, number>();
+	/** Local channels whose revision-fenced claim release is in flight. */
+	private readonly retrieving = new Set<string>();
 
 	private bucket: ClaimBucket<ParkClaim> = new UnclaimedBucket<ParkClaim>();
 	private instance = "engine-local";
@@ -197,17 +194,17 @@ export class ParkRegistry {
 		return this.byChannel.size;
 	}
 
-	/** Every call in one lot on THIS instance, in ascending slot order. */
-	lot(parkLotId: string): readonly ParkedCall[] {
-		const slots = this.lots.get(parkLotId);
+	/** Every call in one tenant's lot on THIS instance, in ascending slot order. */
+	lot(parkLotId: string, organizationId?: string): readonly ParkedCall[] {
+		const slots = this.localLot(parkLotId, organizationId);
 		return slots === undefined
 			? []
 			: [...slots.values()].sort((left, right) => left.slot - right.slot);
 	}
 
 	/** The call in one orbit on this instance, or `undefined` when this instance does not hold it. */
-	at(parkLotId: string, slot: number): ParkedCall | undefined {
-		return this.lots.get(parkLotId)?.get(slot);
+	at(parkLotId: string, slot: number, organizationId?: string): ParkedCall | undefined {
+		return this.localLot(parkLotId, organizationId)?.get(slot);
 	}
 
 	/** Where a leg is parked, or `undefined` when it is not. */
@@ -246,7 +243,7 @@ export class ParkRegistry {
 		const maxAttempts = preferredSlot === undefined ? capacity : 1;
 
 		for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-			const slots = this.lots.get(entry.parkLotId);
+			const slots = this.localLot(entry.parkLotId, entry.organizationId);
 			const taken = new Set<number>([...(slots?.keys() ?? []), ...attempted]);
 			const chosen = nextFreeParkSlot(range, taken.values(), preferredSlot);
 
@@ -286,26 +283,52 @@ export class ParkRegistry {
 	/**
 	 * Takes a call OUT of its slot, exclusively.
 	 *
-	 * `claim` rather than `get` because that is what it does: the entry is removed before it is
-	 * returned, so the second of two simultaneous retrievals is told the truth. The LOCAL removal is
-	 * what settles a race between two extensions on this instance; the KV release is what stops
-	 * another instance from finding a claim for a call that has already been collected.
+	 * `claim` rather than `get` because that is what it does: the entry is exclusively reserved before
+	 * the shared claim is released, then removed before it is returned. The local reservation settles
+	 * a race between two extensions on this instance without exposing the still-live shared claim as
+	 * remote; the KV release stops another instance from finding a call already being collected.
+	 * When that release cannot be confirmed, the local entry is left intact and retrieval is refused.
 	 *
 	 * A slot held by another instance answers `elsewhere`. See the class note on why the media
 	 * handoff is not in this wave.
 	 */
 	async claim(parkLotId: string, slot: number, organizationId?: string): Promise<ParkClaimResult> {
-		// Read the backing claim BEFORE the local removal: `removeLocal` clears the claim index too,
-		// and looking it up afterwards would leave the KV key held by a call that has been collected —
-		// an orbit permanently removed from the lot, discovered only when it never comes free.
-		const occupant = this.at(parkLotId, slot);
-		const held = occupant === undefined ? undefined : this.claims.get(occupant.mediaChannelId);
-		const local = this.removeLocal(parkLotId, slot);
-		if (local !== undefined) {
-			if (held !== undefined) {
-				await this.bucket.release(held.key);
+		const occupant = this.at(parkLotId, slot, organizationId);
+		if (occupant !== undefined) {
+			if (this.retrieving.has(occupant.mediaChannelId)) {
+				return {
+					kind: "claims-unavailable",
+					reason: "a retrieval of this local orbit is already in progress",
+				};
 			}
-			return { kind: "claimed", entry: local };
+
+			const held = this.claims.get(occupant.mediaChannelId);
+			if (held === undefined) {
+				const local = this.removeLocal(parkLotId, slot, organizationId);
+				return local === undefined ? { kind: "absent" } : { kind: "claimed", entry: local };
+			}
+
+			// Keep the local indexes intact while the broker decides. Removing first makes a failed
+			// release look successful and lets a second local retrieval fall through to remote handoff.
+			this.retrieving.add(occupant.mediaChannelId);
+			try {
+				const released = await this.bucket.release(held.key, held.revision);
+				if (!released) {
+					return {
+						kind: "claims-unavailable",
+						reason: "the shared park claim could not be released at its recorded revision",
+					};
+				}
+				const local = this.removeLocal(parkLotId, slot, organizationId);
+				return local === undefined
+					? {
+							kind: "claims-unavailable",
+							reason: "the local park ended while its shared claim was being released",
+						}
+					: { kind: "claimed", entry: local };
+			} finally {
+				this.retrieving.delete(occupant.mediaChannelId);
+			}
 		}
 
 		if (!this.bucket.isConfigured) {
@@ -319,18 +342,21 @@ export class ParkRegistry {
 			return { kind: "absent" };
 		}
 		const remote = await this.readClaim(orgId, parkLotId, slot);
-		if (remote === undefined) {
+		if (remote.kind === "unavailable") {
+			return { kind: "claims-unavailable", reason: remote.reason };
+		}
+		if (remote.kind === "absent") {
 			return { kind: "absent" };
 		}
-		const entry = entryFromClaim(remote.value);
-		if (isClaimExpired(remote.value, this.now())) {
+		const entry = entryFromClaim(remote.claim.value);
+		if (isClaimExpired(remote.claim.value, this.now())) {
 			// The owner stopped heartbeating. The claim is LEFT in place rather than deleted — a
 			// delete here would race the next parker's `create` — and the retriever is told which
 			// instance went quiet, so it can decide whether the channel that instance left behind is
 			// still reachable. See {@link ParkRegistry.takeOverStale}.
-			return { kind: "stale", instanceId: remote.value.instanceId, entry };
+			return { kind: "stale", instanceId: remote.claim.value.instanceId, entry };
 		}
-		return { kind: "elsewhere", instanceId: remote.value.instanceId, entry };
+		return { kind: "elsewhere", instanceId: remote.claim.value.instanceId, entry };
 	}
 
 	/**
@@ -358,15 +384,17 @@ export class ParkRegistry {
 		} catch {
 			return false;
 		}
-		const current = await this.bucket.get(key);
+		const read = await this.bucket.get(key);
 		const now = this.now();
-		if (current === undefined || !isClaimExpired(current.value, now)) {
+		if (read.kind !== "present" || !isClaimExpired(read.claim.value, now)) {
 			return false;
 		}
+		const current = read.claim;
 		const won = await this.bucket.update(key, this.claimRecord(entry, now), current.revision);
 		if (won.kind !== "written") {
 			return false;
 		}
+		this.takeovers.set(key, won.revision);
 		this.logger.info(
 			{ key, previousOwner: current.value.instanceId },
 			"took over an expired park claim to retrieve the call it was holding",
@@ -388,7 +416,13 @@ export class ParkRegistry {
 			return;
 		}
 		try {
-			await this.bucket.release(kvKeyFor.parkClaim(organizationId, parkLotId, slot));
+			const key = kvKeyFor.parkClaim(organizationId, parkLotId, slot);
+			const revision = this.takeovers.get(key);
+			if (revision === undefined) {
+				return;
+			}
+			this.takeovers.delete(key);
+			await this.bucket.release(key, revision);
 		} catch {
 			// A key that could not be deleted is reaped at its expiry, which is what the expiry is for.
 		}
@@ -407,7 +441,7 @@ export class ParkRegistry {
 	 * already having a bad day.
 	 */
 	async restore(entry: ParkedCall): Promise<boolean> {
-		if (this.lots.get(entry.parkLotId)?.has(entry.slot) === true) {
+		if (this.localLot(entry.parkLotId, entry.organizationId)?.has(entry.slot) === true) {
 			return false;
 		}
 		const outcome = await this.takeClaim(entry);
@@ -429,13 +463,27 @@ export class ParkRegistry {
 	}
 
 	/**
+	 * Stops tracking an ended media channel without deleting its shared claim.
+	 *
+	 * Only teardown may use this. Normal retrieval must keep the local park until a revision-fenced
+	 * release succeeds; once media reports the channel ended, heartbeating it can only keep a dead
+	 * call's orbit alive. The shared claim is left untouched to expire naturally.
+	 */
+	forgetEnded(mediaChannelId: string): ParkedCall | undefined {
+		const entry = this.byChannel.get(mediaChannelId);
+		return entry === undefined
+			? undefined
+			: this.removeLocal(entry.parkLotId, entry.slot, entry.organizationId);
+	}
+
+	/**
 	 * Pushes every claim this instance holds forward.
 	 *
-	 * Called on a timer by whoever owns this registry's lifecycle. A claim whose heartbeat is LOST —
-	 * somebody else wrote the key — is dropped from the local cache rather than re-taken: another
-	 * instance believes it owns that orbit, and two owners is the state this whole file exists to
-	 * make impossible. The call itself is untouched; it simply stops being addressable by slot, which
-	 * is strictly better than being addressable by two instances at once.
+	 * Called on a timer by whoever owns this registry's lifecycle. A claim whose heartbeat is LOST to
+	 * another write from THIS instance adopts that write's revision: a slow overlapping pass renewed
+	 * the same claim first. A loss to another instance drops the local cache rather than fighting for
+	 * the orbit. The call itself is untouched; it simply stops being addressable by slot, which is
+	 * strictly better than being addressable by two instances at once.
 	 *
 	 * Returns how many claims were renewed, which is what a metric reads.
 	 */
@@ -449,6 +497,9 @@ export class ParkRegistry {
 		// A snapshot: a lost heartbeat DELETES from `claims`, and mutating a Map mid-iteration
 		// silently skips entries.
 		for (const [mediaChannelId, held] of Array.from(this.claims)) {
+			if (this.retrieving.has(mediaChannelId)) {
+				continue;
+			}
 			const record = this.claimRecord(held.entry, now);
 			const outcome = await this.bucket.update(held.key, record, held.revision);
 			if (outcome.kind === "written") {
@@ -457,12 +508,21 @@ export class ParkRegistry {
 				continue;
 			}
 			if (outcome.kind === "unavailable") {
-				// Keep the claim and try again next tick. The lease is three heartbeats long precisely
-				// so a blip does not cost a slot.
+				// Keep the claim and try again next tick. Three heartbeat opportunities occur strictly
+				// before expiry, so a blip does not cost a slot.
 				this.logger.warn(
 					{ key: held.key, reason: outcome.reason },
 					"a park claim could not be renewed; retrying on the next heartbeat",
 				);
+				continue;
+			}
+			if (this.retrieving.has(mediaChannelId)) {
+				// A release may have won while this heartbeat was awaiting its stale update. Let the
+				// retrieval settle the local indexes; if it lost, the next heartbeat reconciles them.
+				continue;
+			}
+			if (outcome.current?.value.instanceId === this.instance) {
+				held.revision = outcome.current.revision;
 				continue;
 			}
 			this.logger.warn(
@@ -470,7 +530,7 @@ export class ParkRegistry {
 				"a park claim was taken over by another instance; dropping it locally",
 			);
 			this.claims.delete(mediaChannelId);
-			this.removeLocal(held.entry.parkLotId, held.entry.slot);
+			this.removeLocal(held.entry.parkLotId, held.entry.slot, held.entry.organizationId);
 		}
 		return renewed;
 	}
@@ -480,6 +540,8 @@ export class ParkRegistry {
 		this.lots.clear();
 		this.byChannel.clear();
 		this.claims.clear();
+		this.takeovers.clear();
+		this.retrieving.clear();
 	}
 
 	// -------------------------------------------------------------------------------------------
@@ -538,11 +600,11 @@ export class ParkRegistry {
 		organizationId: string,
 		parkLotId: string,
 		slot: number,
-	): Promise<Claimed<ParkClaim> | undefined> {
+	): Promise<ClaimRead<ParkClaim>> {
 		try {
 			return await this.bucket.get(kvKeyFor.parkClaim(organizationId, parkLotId, slot));
-		} catch {
-			return undefined;
+		} catch (error) {
+			return { kind: "unavailable", reason: String(error) };
 		}
 	}
 
@@ -566,17 +628,23 @@ export class ParkRegistry {
 	}
 
 	private record(entry: ParkedCall, revision: number, key: string): void {
-		const slots = this.lots.get(entry.parkLotId) ?? new Map<number, ParkedCall>();
+		const organizationLots = this.lots.get(entry.organizationId) ?? new Map();
+		const slots = organizationLots.get(entry.parkLotId) ?? new Map<number, ParkedCall>();
 		slots.set(entry.slot, entry);
-		this.lots.set(entry.parkLotId, slots);
+		organizationLots.set(entry.parkLotId, slots);
+		this.lots.set(entry.organizationId, organizationLots);
 		this.byChannel.set(entry.mediaChannelId, entry);
 		if (this.bucket.isConfigured) {
 			this.claims.set(entry.mediaChannelId, { entry, revision, key });
 		}
 	}
 
-	private removeLocal(parkLotId: string, slot: number): ParkedCall | undefined {
-		const slots = this.lots.get(parkLotId);
+	private removeLocal(
+		parkLotId: string,
+		slot: number,
+		organizationId?: string,
+	): ParkedCall | undefined {
+		const slots = this.localLot(parkLotId, organizationId);
 		const entry = slots?.get(slot);
 		if (slots === undefined || entry === undefined) {
 			return undefined;
@@ -585,9 +653,35 @@ export class ParkRegistry {
 		this.byChannel.delete(entry.mediaChannelId);
 		this.claims.delete(entry.mediaChannelId);
 		if (slots.size === 0) {
-			this.lots.delete(parkLotId);
+			const organizationLots = this.lots.get(entry.organizationId);
+			organizationLots?.delete(parkLotId);
+			if (organizationLots?.size === 0) {
+				this.lots.delete(entry.organizationId);
+			}
 		}
 		return entry;
+	}
+
+	private localLot(
+		parkLotId: string,
+		organizationId?: string,
+	): Map<number, ParkedCall> | undefined {
+		if (organizationId !== undefined) {
+			return this.lots.get(organizationId)?.get(parkLotId);
+		}
+
+		let match: Map<number, ParkedCall> | undefined;
+		for (const organizationLots of this.lots.values()) {
+			const candidate = organizationLots.get(parkLotId);
+			if (candidate === undefined) {
+				continue;
+			}
+			if (match !== undefined) {
+				return undefined;
+			}
+			match = candidate;
+		}
+		return match;
 	}
 }
 
@@ -624,6 +718,8 @@ export function parkSlotFor(range: ParkSlotRangeBounds, dialed: string): number 
 	const slot = parseParkSlot(dialed);
 	return slot !== undefined && isParkSlotInRange(range, slot) ? slot : undefined;
 }
+
+export { CLAIM_HEARTBEAT_INTERVAL_MS, CLAIM_LEASE_MS } from "./claim-timing";
 
 /** Re-exported so a caller can assert ownership without importing the events package directly. */
 export { isClaimExpired, isClaimOwnedBy };

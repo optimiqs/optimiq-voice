@@ -33,6 +33,7 @@ interface HarnessOptions {
 	readonly reactions?: Record<string, LegReaction>;
 	readonly seed?: Readonly<Record<string, "available" | "logged-out">>;
 	readonly noServices?: boolean;
+	readonly onCallTransitionFails?: boolean;
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -50,6 +51,11 @@ function harness(options: HarnessOptions = {}) {
 	});
 	for (const agent of agents) {
 		services.agents.seed(agent.agentId, options.seed?.[agent.agentId] ?? "available");
+	}
+	if (options.onCallTransitionFails === true) {
+		const transition = services.agents.transition;
+		services.agents.transition = async (request) =>
+			request.to === "on-call" ? undefined : transition(request);
 	}
 
 	const reactionFor = (endpoint: string): LegReaction => {
@@ -191,6 +197,20 @@ describe("walking a queue node", () => {
 			endpoint: "PJSIP/2001",
 			destinationType: "queue",
 			destinationRef: QUEUE_ID,
+		});
+	});
+
+	it("hangs an answered leg up through the leg hooks when on-call promotion fails", async () => {
+		const h = harness({ reactions: { "PJSIP/2001": "answer" }, onCallTransitionFails: true });
+		await h.walker.walk({ plan: planOf([queueNode("q", { queueId: QUEUE_ID })]) });
+
+		expect(h.media.hungUp()).toContainEqual({
+			channelId: "id-1",
+			cause: "NORMAL_TEMPORARY_FAILURE",
+		});
+		expect(h.hungUpByWalker).toContainEqual({
+			channelId: "id-1",
+			cause: "NORMAL_TEMPORARY_FAILURE",
 		});
 	});
 

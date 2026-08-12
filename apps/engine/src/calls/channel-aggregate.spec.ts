@@ -30,10 +30,26 @@ describe("ChannelAggregate.create", () => {
 		expect(aggregate.isAnswered).toBe(false);
 	});
 
-	it("keeps the ARI id out of the published snapshot", () => {
+	it("keeps the media id only in the reserved recovery variable", () => {
 		const aggregate = makeAggregate();
 		expect(aggregate.ariChannelId).toBe("1754400000.1");
-		expect(JSON.stringify(aggregate.snapshot)).not.toContain("1754400000.1");
+		expect(aggregate.snapshot.variables.OPTIMIQ_MEDIA_CHANNEL_ID).toBe("1754400000.1");
+		expect(aggregate.snapshot.profile).not.toHaveProperty("mediaChannelId");
+	});
+
+	it("hydrates the media identity and terminal initiator from a KV snapshot", () => {
+		const original = makeAggregate();
+		original.markHangup({ cause: "NORMAL_CLEARING", at: 2_000, initiatedByEngine: true });
+		original.transitionTo("hangup");
+		original.transitionTo("reporting");
+
+		const hydrated = ChannelAggregate.hydrate(
+			JSON.parse(JSON.stringify(original.snapshot)) as typeof original.snapshot,
+		);
+
+		expect(hydrated.ariChannelId).toBe(original.ariChannelId);
+		expect(hydrated.state).toBe("reporting");
+		expect(hydrated.wasHungUpByEngine).toBe(true);
 	});
 
 	it("maps an internal call onto the inbound signalling direction", () => {
@@ -155,6 +171,7 @@ describe("flags and variables", () => {
 		expect(aggregate.snapshot.variables).toEqual({
 			OPTIMIQ_ORG_ID: ORG,
 			OPTIMIQ_CALL_DIRECTION: "inbound",
+			OPTIMIQ_MEDIA_CHANNEL_ID: "1754400000.1",
 		});
 	});
 

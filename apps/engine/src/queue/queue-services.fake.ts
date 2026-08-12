@@ -1,4 +1,4 @@
-import { assertAgentTransition } from "./agent-state";
+import { assertAgentTransition, isEligibleForDistribution } from "./agent-state";
 import { noAnswerCountOf } from "./agent-state.store";
 import { QueueCursors, QueuePositions } from "./queue-registry";
 import type {
@@ -97,6 +97,7 @@ export interface RecordedTransition {
 	readonly agentId: string;
 	readonly from: AgentStatus;
 	readonly to: AgentStatus;
+	readonly callId: string;
 	readonly availableAt?: number;
 	readonly noAnswerCount?: number;
 	readonly refused?: boolean;
@@ -138,17 +139,66 @@ export function makeFakeAgentStateStore(orgId: string, now: () => number): FakeA
 			}
 			return states;
 		},
+		readState: async (_orgId: string, agentId: string) => {
+			const entry = entries.get(agentId);
+			return entry === undefined ? { kind: "absent" as const } : { kind: "found" as const, entry };
+		},
+		reserve: async (request) => {
+			const current = entries.get(request.agentId);
+			if (!isEligibleForDistribution(current, request.now)) {
+				return undefined;
+			}
+			const next: AgentStateEntry = {
+				orgId: request.orgId,
+				agentId: request.agentId,
+				status: "ringing",
+				since: new Date(request.now).toISOString(),
+				previousStatus: current.status,
+				source: "engine",
+				callId: request.callId,
+				queueId: request.queueId,
+				...noAnswerCountOf(request.noAnswerCount, current.noAnswerCount),
+				...(request.legId === undefined ? {} : { legId: request.legId }),
+			};
+			entries.set(request.agentId, next);
+			transitions.push({
+				agentId: request.agentId,
+				from: current.status,
+				to: "ringing",
+				callId: request.callId,
+			});
+			return next;
+		},
 
 		transition: async (request: AgentTransitionRequest) => {
 			const current = entries.get(request.agentId);
 			const from: AgentStatus = current?.status ?? "logged-out";
+			if (
+				(from === "ringing" || from === "on-call" || from === "wrap-up") &&
+				current?.callId !== request.callId
+			) {
+				transitions.push({
+					agentId: request.agentId,
+					from,
+					to: request.to,
+					callId: request.callId,
+					refused: true,
+				});
+				return undefined;
+			}
 			if (from === request.to) {
 				return current;
 			}
 			try {
 				assertAgentTransition(from, request.to);
 			} catch {
-				transitions.push({ agentId: request.agentId, from, to: request.to, refused: true });
+				transitions.push({
+					agentId: request.agentId,
+					from,
+					to: request.to,
+					callId: request.callId,
+					refused: true,
+				});
 				return undefined;
 			}
 			const next: AgentStateEntry = {
@@ -163,7 +213,9 @@ export function makeFakeAgentStateStore(orgId: string, now: () => number): FakeA
 					: { availableAt: new Date(request.availableAt).toISOString() }),
 				...noAnswerCountOf(request.noAnswerCount, current?.noAnswerCount),
 				...(request.queueId === undefined ? {} : { queueId: request.queueId }),
-				...(request.callId === undefined ? {} : { callId: request.callId }),
+				...(request.to === "ringing" || request.to === "on-call" || request.to === "wrap-up"
+					? { callId: request.callId }
+					: {}),
 				...(request.legId === undefined ? {} : { legId: request.legId }),
 				...(request.reason === undefined ? {} : { reason: request.reason }),
 			};
@@ -172,6 +224,7 @@ export function makeFakeAgentStateStore(orgId: string, now: () => number): FakeA
 				agentId: request.agentId,
 				from,
 				to: request.to,
+				callId: request.callId,
 				...(request.availableAt === undefined ? {} : { availableAt: request.availableAt }),
 				...(request.noAnswerCount === undefined ? {} : { noAnswerCount: request.noAnswerCount }),
 			});

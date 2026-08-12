@@ -49,6 +49,7 @@ interface HarnessOptions {
 	/** The transfer never resolves: a routing walk that is still ringing somebody's phone. */
 	readonly slowTransfer?: boolean;
 	readonly parkResult?: ParkOutcome;
+	readonly artifactFor?: (organizationId: string) => Promise<RoutingArtifact | undefined>;
 }
 
 const DEFAULT_CODES = [
@@ -59,6 +60,20 @@ const DEFAULT_CODES = [
 	{ code: "*72", action: "call-forward-all" },
 	{ code: "*97", action: "voicemail-check" },
 ] as const;
+
+function featureArtifact(
+	codes: readonly { readonly code: string; readonly action: string }[] = DEFAULT_CODES,
+): RoutingArtifact {
+	return { internal: { featureCodes: codes } } as unknown as RoutingArtifact;
+}
+
+function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void } {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((settle) => {
+		resolve = settle;
+	});
+	return { promise, resolve };
+}
 
 function harness(options: HarnessOptions = {}): Harness {
 	const calls: Recorded[] = [];
@@ -115,13 +130,12 @@ function harness(options: HarnessOptions = {}): Harness {
 		recordingFor: () => (recording ? { recordingId: "rec-1" } : undefined),
 	};
 
-	const artifact = {
-		internal: { featureCodes: options.codes ?? DEFAULT_CODES },
-	} as unknown as RoutingArtifact;
+	const artifact = featureArtifact(options.codes);
 
 	const runtime = new MidCallFeatureRuntime({
 		control,
-		artifactFor: async () => (options.noArtifact === true ? undefined : artifact),
+		artifactFor:
+			options.artifactFor ?? (async () => (options.noArtifact === true ? undefined : artifact)),
 		now: () => clock,
 		setTimer: (fn, ms) => {
 			const timer = { at: clock + ms, fn, cancelled: false };
@@ -441,6 +455,9 @@ describe("lifecycle", () => {
 	it("forgets a leg that has gone away, and cancels its timer with it", async () => {
 		const h = harness();
 		await press(h, "*1");
+		// The runtime is keyed by the media id, not the domain leg id.
+		h.runtime.release(h.leg.legId);
+		expect(h.runtime.activeCaptureCount).toBe(1);
 		h.runtime.release("a");
 		expect(h.runtime.activeCaptureCount).toBe(0);
 
@@ -450,10 +467,59 @@ describe("lifecycle", () => {
 		expect(h.calls).toEqual([]);
 	});
 
+	it("invalidates queued digits while release waits on the artifact", async () => {
+		const lookup = deferred<RoutingArtifact | undefined>();
+		let requested = false;
+		const h = harness({
+			artifactFor: async () => {
+				requested = true;
+				return await lookup.promise;
+			},
+		});
+		const outcomes = Promise.all([h.runtime.offer(h.leg, "*"), h.runtime.offer(h.leg, "3")]);
+		await flush();
+		expect(requested).toBe(true);
+
+		h.runtime.release("a");
+		lookup.resolve(featureArtifact());
+
+		expect(await outcomes).toEqual(["pass-through", "pass-through"]);
+		await flush();
+		expect(h.runtime.activeCaptureCount).toBe(0);
+		expect(h.calls).toEqual([]);
+	});
+
+	it("invalidates a pending capture when the runtime is cleared for drain", async () => {
+		const lookup = deferred<RoutingArtifact | undefined>();
+		let requests = 0;
+		const h = harness({
+			artifactFor: async () => {
+				requests += 1;
+				return await lookup.promise;
+			},
+		});
+		const offered = h.runtime.offer(h.leg, "*");
+		await flush();
+		expect(requests).toBe(1);
+
+		h.runtime.clear();
+		lookup.resolve(featureArtifact());
+
+		expect(await offered).toBe("pass-through");
+		expect(await h.runtime.offer(h.leg, "*")).toBe("pass-through");
+		expect(requests).toBe(1);
+		h.advanceTo(DEFAULT_MID_CALL_FEATURE_SETTINGS.codeTimeoutMs + 1);
+		await flush();
+		expect(h.runtime.activeCaptureCount).toBe(0);
+		expect(h.calls).toEqual([]);
+	});
+
 	it("drops everything on clear", async () => {
 		const h = harness();
 		await press(h, "*1");
+		h.runtime.armCancelKey("a", "#");
 		h.runtime.clear();
 		expect(h.runtime.activeCaptureCount).toBe(0);
+		expect(await press(h, "#")).toEqual(["pass-through"]);
 	});
 });

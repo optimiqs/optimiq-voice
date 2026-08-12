@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it } from "bun:test";
 import { parseAriEvent } from "@optimiq-voice/media-ari";
 import { makeFakeMediaPort } from "../media/media-port.fake";
+import {
+	CHANNEL_OWNER_EXPIRES_AT_VARIABLE,
+	CHANNEL_OWNERSHIP_LEASE_MS,
+	channelOwnershipOf,
+	withChannelOwnership,
+} from "../nats/channel-ownership";
 import { fakeQueueOrchestratorArgs } from "../queue/queue-services.fake";
 import { CallSignalBus, legSignalKey } from "../routing/call-signals";
 import { ConferenceRegistry } from "../routing/conference-registry";
@@ -14,6 +20,7 @@ import type { EngineEnv } from "../config/engine-env";
 import type { MediaEvent } from "../media/media-event";
 import type { CallEventPublisher } from "../nats/call-event-publisher.service";
 import type { JetStreamService } from "../nats/jetstream.service";
+import type { OriginateCallPath, OriginateService } from "../nats/originate.service";
 import type { ParkHandoffService } from "../nats/park-handoff.service";
 import type { SipTransferCallPath, SipTransferService } from "../nats/sip-transfer.service";
 import type { DidIndexSource } from "../routing/did-index.source";
@@ -88,6 +95,34 @@ function fakeSipTransfer(): {
 }
 
 /**
+ * An originate responder that keeps the call path instead of serving it.
+ *
+ * The same arrangement as {@link fakeSipTransfer} above, and for the same reason: the broker half is
+ * proven in `nats/originate.service.spec.ts` with a fake call path, and this is the other side of
+ * the seam — what the orchestrator itself does when asked to place a click-to-call.
+ */
+function fakeOriginate(): {
+	readonly service: OriginateService;
+	readonly attached: () => OriginateCallPath;
+} {
+	let attached: OriginateCallPath | undefined;
+	const service = {
+		attach: (callPath: OriginateCallPath) => {
+			attached = callPath;
+		},
+	} as unknown as OriginateService;
+	return {
+		service,
+		attached: () => {
+			if (attached === undefined) {
+				throw new Error("the orchestrator attached no originate call path");
+			}
+			return attached;
+		},
+	};
+}
+
+/**
  * Orchestrator specs, driven entirely by fakes.
  *
  * Every collaborator the orchestrator has is a port: the media server, the event publisher and
@@ -103,6 +138,7 @@ interface PublishedEvent {
 	readonly type: string;
 	readonly orgId: string;
 	readonly callId: string;
+	readonly id?: string;
 	readonly data: Record<string, unknown>;
 }
 
@@ -111,6 +147,8 @@ function fakeEnv(overrides: Partial<EngineEnv> = {}): EngineEnv {
 		NODE_ENV: "test",
 		ENGINE_PORT: 4010,
 		ENGINE_HOST: "127.0.0.1",
+		ENGINE_INSTANCE_ID: "engine-test",
+		ENGINE_MEDIA_DRIVER: "ari",
 		ARI_URL: "http://asterisk:8088",
 		ARI_USERNAME: "ari",
 		ARI_PASSWORD: "secret",
@@ -140,7 +178,17 @@ function fakeEnv(overrides: Partial<EngineEnv> = {}): EngineEnv {
 	} as EngineEnv;
 }
 
-function harness(env: EngineEnv = fakeEnv()) {
+interface HarnessOptions {
+	readonly snapshots?: readonly ChannelSnapshot[];
+	readonly cdrFailures?: number;
+	readonly persistFailures?: number;
+	readonly channelKv?: Map<string, ChannelSnapshot>;
+	readonly claimResult?: "claimed" | "owned" | "unavailable";
+	readonly renewResult?: "renewed" | "lost" | "unavailable";
+	readonly beforeEventPublish?: (type: string) => Promise<void>;
+}
+
+function harness(env: EngineEnv = fakeEnv(), options: HarnessOptions = {}) {
 	const media = makeFakeMediaPort({ variables: { OPTIMIQ_ORG_ID: ORG } });
 	const mediaCalls = media.calls;
 	const variables = media.variables;
@@ -149,23 +197,121 @@ function harness(env: EngineEnv = fakeEnv()) {
 	const events = {
 		publish: async (
 			type: string,
-			input: { orgId: string; callId: string; data: Record<string, unknown> },
+			input: { orgId: string; callId: string; id?: string; data: Record<string, unknown> },
 		) => {
-			published.push({ type, orgId: input.orgId, callId: input.callId, data: input.data });
-			return undefined as unknown as CallEventOf<"channel.created">;
+			await options.beforeEventPublish?.(type);
+			published.push({
+				type,
+				orgId: input.orgId,
+				callId: input.callId,
+				id: input.id,
+				data: input.data,
+			});
+			return {} as CallEventOf<"channel.created">;
 		},
 	} as unknown as CallEventPublisher;
 
-	const kv = new Map<string, ChannelSnapshot>();
+	const kv = options.channelKv ?? new Map<string, ChannelSnapshot>();
+	for (const snapshot of options.snapshots ?? []) {
+		kv.set(`${snapshot.organizationId}.${snapshot.callId}.${snapshot.channelId}`, snapshot);
+	}
 	const cdrs: CdrLegWriteEnvelope[] = [];
+	const cdrAttempts: CdrLegWriteEnvelope[] = [];
+	const persistAttempts: ChannelSnapshot[] = [];
+	let cdrFailures = options.cdrFailures ?? 0;
+	let persistFailures = options.persistFailures ?? 0;
 	const jetstream = {
-		putChannel: async (snapshot: ChannelSnapshot) => {
-			kv.set(`${snapshot.organizationId}.${snapshot.callId}.${snapshot.channelId}`, snapshot);
+		putChannel: async (snapshot: ChannelSnapshot, now = Date.now()) => {
+			kv.set(
+				`${snapshot.organizationId}.${snapshot.callId}.${snapshot.channelId}`,
+				withChannelOwnership(snapshot, env.ENGINE_INSTANCE_ID, now + CHANNEL_OWNERSHIP_LEASE_MS),
+			);
+		},
+		persistChannel: async (snapshot: ChannelSnapshot, now = Date.now()) => {
+			persistAttempts.push(snapshot);
+			if (persistFailures > 0) {
+				persistFailures -= 1;
+				return false;
+			}
+			kv.set(
+				`${snapshot.organizationId}.${snapshot.callId}.${snapshot.channelId}`,
+				withChannelOwnership(snapshot, env.ENGINE_INSTANCE_ID, now + CHANNEL_OWNERSHIP_LEASE_MS),
+			);
+			return true;
 		},
 		deleteChannel: async (snapshot: ChannelSnapshot) => {
 			kv.delete(`${snapshot.organizationId}.${snapshot.callId}.${snapshot.channelId}`);
 		},
+		claimChannel: async (snapshot: ChannelSnapshot, now = Date.now()) => {
+			if (options.claimResult !== undefined) {
+				return options.claimResult;
+			}
+			const key = `${snapshot.organizationId}.${snapshot.callId}.${snapshot.channelId}`;
+			if (kv.has(key)) {
+				return "owned";
+			}
+			kv.set(
+				key,
+				withChannelOwnership(snapshot, env.ENGINE_INSTANCE_ID, now + CHANNEL_OWNERSHIP_LEASE_MS),
+			);
+			return "claimed";
+		},
+		adoptChannel: async (snapshot: ChannelSnapshot, now = Date.now()) => {
+			const key = `${snapshot.organizationId}.${snapshot.callId}.${snapshot.channelId}`;
+			const current = kv.get(key);
+			if (current === undefined) {
+				return "owned";
+			}
+			const ownership = channelOwnershipOf(current);
+			if (
+				ownership !== undefined &&
+				ownership.instanceId !== env.ENGINE_INSTANCE_ID &&
+				ownership.expiresAt > now
+			) {
+				return "owned";
+			}
+			kv.set(
+				key,
+				withChannelOwnership(current, env.ENGINE_INSTANCE_ID, now + CHANNEL_OWNERSHIP_LEASE_MS),
+			);
+			return "claimed";
+		},
+		renewChannel: async (snapshot: ChannelSnapshot, now = Date.now()) => {
+			if (options.renewResult !== undefined) {
+				if (options.renewResult === "lost") {
+					const key = `${snapshot.organizationId}.${snapshot.callId}.${snapshot.channelId}`;
+					kv.set(
+						key,
+						withChannelOwnership(snapshot, "engine-other", now + CHANNEL_OWNERSHIP_LEASE_MS),
+					);
+				}
+				return options.renewResult;
+			}
+			const key = `${snapshot.organizationId}.${snapshot.callId}.${snapshot.channelId}`;
+			kv.set(
+				key,
+				withChannelOwnership(snapshot, env.ENGINE_INSTANCE_ID, now + CHANNEL_OWNERSHIP_LEASE_MS),
+			);
+			return "renewed";
+		},
+		readChannel: async (organizationId: string, callId: string, channelId: string) =>
+			kv.get(`${organizationId}.${callId}.${channelId}`),
+		ownedChannelLeaseExpiresAt: (snapshot: ChannelSnapshot) =>
+			channelOwnershipOf(
+				kv.get(`${snapshot.organizationId}.${snapshot.callId}.${snapshot.channelId}`) ?? snapshot,
+			)?.expiresAt,
+		releaseChannelOwnership: async () => undefined,
+		channelSnapshots: async function* () {
+			for (const snapshot of kv.values()) {
+				yield snapshot;
+			}
+		},
 		publishCdrLeg: async (envelope: CdrLegWriteEnvelope) => {
+			cdrAttempts.push(envelope);
+			if (cdrFailures > 0) {
+				cdrFailures -= 1;
+				throw new Error("CDR stream unavailable");
+			}
 			cdrs.push(envelope);
 		},
 	} as unknown as JetStreamService;
@@ -182,6 +328,7 @@ function harness(env: EngineEnv = fakeEnv()) {
 	} as unknown as RoutingArtifactSource;
 
 	const sipTransfer = fakeSipTransfer();
+	const originate = fakeOriginate();
 
 	const orchestrator = new ChannelOrchestrator(
 		env,
@@ -200,6 +347,7 @@ function harness(env: EngineEnv = fakeEnv()) {
 		new CallControlRegistry(),
 		NO_PARK_HANDOFF,
 		sipTransfer.service,
+		originate.service,
 	);
 
 	return {
@@ -208,6 +356,8 @@ function harness(env: EngineEnv = fakeEnv()) {
 		published,
 		kv,
 		cdrs,
+		cdrAttempts,
+		persistAttempts,
 		variables,
 		dtmf,
 		mediaPort: media,
@@ -216,6 +366,24 @@ function harness(env: EngineEnv = fakeEnv()) {
 		routing,
 		sipCallPath: sipTransfer.attached,
 	};
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate() && Date.now() < deadline) {
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	if (!predicate()) {
+		throw new Error(`condition was not met within ${String(timeoutMs)}ms`);
+	}
+}
+
+function pendingCdrRetryCount(orchestrator: ChannelOrchestrator): number {
+	return (
+		orchestrator as unknown as {
+			cdrRetryTimers: ReadonlyMap<string, unknown>;
+		}
+	).cdrRetryTimers.size;
 }
 
 function channel(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -271,6 +439,12 @@ describe("inbound call arrival", () => {
 
 		expect(h.orchestrator.activeChannelCount).toBe(1);
 		expect(h.kv.size).toBe(1);
+		expect([...h.kv.values()][0]?.variables).toMatchObject({
+			OPTIMIQ_ENGINE_INSTANCE_ID: "engine-test",
+		});
+		expect(
+			Number([...h.kv.values()][0]?.variables[CHANNEL_OWNER_EXPIRES_AT_VARIABLE]),
+		).toBeGreaterThan(Date.now());
 		expect(h.mediaCalls.map((call) => call.method)).toEqual(["watchChannel", "ring", "answer"]);
 	});
 
@@ -321,6 +495,251 @@ describe("inbound call arrival", () => {
 
 		expect(typesOf(h.published)).toEqual(["channel.created"]);
 		expect(h.orchestrator.activeChannelCount).toBe(1);
+	});
+
+	it("admits a mediad leg on exactly one replica and keeps its later events on that owner", async () => {
+		const channelKv = new Map<string, ChannelSnapshot>();
+		const first = harness(
+			fakeEnv({ ENGINE_MEDIA_DRIVER: "mediad", ENGINE_INSTANCE_ID: "engine-a" }),
+			{ channelKv },
+		);
+		const second = harness(
+			fakeEnv({ ENGINE_MEDIA_DRIVER: "mediad", ENGINE_INSTANCE_ID: "engine-b" }),
+			{ channelKv },
+		);
+		const replicas = [first, second] as const;
+		const arrival: MediaEvent = {
+			type: "leg-arrived",
+			channel: {
+				id: ARI_CHANNEL,
+				name: "PJSIP/trunk-00000001",
+				callerName: "Ada",
+				callerNumber: "+15551234567",
+				dialedNumber: "+15559876543",
+				context: "local-ctx",
+				variables: { OPTIMIQ_ORG_ID: ORG },
+			},
+		};
+
+		// Both replicas receive the same arrival. KV create is the admission point that can lose.
+		await Promise.all(
+			replicas.map(async (replica) => await replica.orchestrator.handleEvent(arrival)),
+		);
+
+		expect(
+			replicas.reduce((sum, replica) => sum + replica.orchestrator.activeChannelCount, 0),
+		).toBe(1);
+		expect(replicas.flatMap((replica) => replica.published)).toHaveLength(1);
+		const owner = replicas.find((replica) => replica.orchestrator.activeChannelCount === 1);
+		const nonOwner = replicas.find((replica) => replica !== owner);
+		if (owner === undefined || nonOwner === undefined) {
+			throw new Error("the mediad admission race did not produce one owner and one loser");
+		}
+		expect(nonOwner.mediaCalls).toEqual([]);
+		expect([...channelKv.values()][0]?.variables.OPTIMIQ_ENGINE_INSTANCE_ID).toBe(
+			owner === first ? "engine-a" : "engine-b",
+		);
+
+		owner.published.length = 0;
+		nonOwner.published.length = 0;
+		// The feed remains broadcast, not queue-grouped. Both receive each event; only the owner has
+		// registry and signal state capable of acting on this channel's lifecycle.
+		const digit: MediaEvent = {
+			type: "dtmf-received",
+			channelId: ARI_CHANNEL,
+			digit: "7",
+			durationMs: 120,
+		};
+		await Promise.all(
+			replicas.map(async (replica) => await replica.orchestrator.handleEvent(digit)),
+		);
+		expect(replicas.flatMap((replica) => replica.published).map((event) => event.type)).toEqual([
+			"channel.dtmf",
+		]);
+
+		const ended: MediaEvent = {
+			type: "leg-ended",
+			channelId: ARI_CHANNEL,
+			cause: "NORMAL_CLEARING",
+			causeCode: 16,
+		};
+		await Promise.all(
+			replicas.map(async (replica) => await replica.orchestrator.handleEvent(ended)),
+		);
+		expect(replicas.flatMap((replica) => replica.cdrs)).toHaveLength(1);
+		expect(channelKv.size).toBe(0);
+		expect(owner.orchestrator.activeChannelCount).toBe(0);
+	});
+
+	it("admits an ARI leg on exactly one replica", async () => {
+		const channelKv = new Map<string, ChannelSnapshot>();
+		const replicas = [
+			harness(fakeEnv({ ENGINE_INSTANCE_ID: "engine-a" }), { channelKv }),
+			harness(fakeEnv({ ENGINE_INSTANCE_ID: "engine-b" }), { channelKv }),
+		] as const;
+		const arrival = mediaEvent("StasisStart", { channel: channel(), args: [] });
+
+		await Promise.all(
+			replicas.map(async (replica) => await replica.orchestrator.handleEvent(arrival)),
+		);
+
+		expect(
+			replicas.reduce((sum, replica) => sum + replica.orchestrator.activeChannelCount, 0),
+		).toBe(1);
+		expect(replicas.flatMap((replica) => replica.published)).toHaveLength(1);
+		expect([...channelKv.values()][0]?.variables.OPTIMIQ_ENGINE_INSTANCE_ID).toMatch(
+			/^engine-[ab]$/,
+		);
+	});
+
+	it("fails mediad admission closed when ownership cannot be established", async () => {
+		const h = harness(fakeEnv({ ENGINE_MEDIA_DRIVER: "mediad" }), {
+			claimResult: "unavailable",
+		});
+
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
+
+		expect(h.orchestrator.activeChannelCount).toBe(0);
+		expect(h.published).toEqual([]);
+		// It must not hang up a leg another replica may already own.
+		expect(h.mediaCalls).toEqual([]);
+	});
+
+	it("adopts and hydrates a mediad snapshot after its previous owner's lease expires", async () => {
+		const channelKv = new Map<string, ChannelSnapshot>();
+		const original = harness(
+			fakeEnv({ ENGINE_MEDIA_DRIVER: "mediad", ENGINE_INSTANCE_ID: "engine-a" }),
+			{ channelKv },
+		);
+		await original.orchestrator.handleEvent(
+			mediaEvent("StasisStart", { channel: channel(), args: [] }),
+		);
+		const [stored] = channelKv.values();
+		if (stored === undefined) {
+			throw new Error("the original owner did not mirror its channel");
+		}
+		channelKv.set(`${stored.organizationId}.${stored.callId}.${stored.channelId}`, {
+			...stored,
+			variables: {
+				...stored.variables,
+				[CHANNEL_OWNER_EXPIRES_AT_VARIABLE]: "1000",
+			},
+		});
+
+		const replacement = harness(
+			fakeEnv({ ENGINE_MEDIA_DRIVER: "mediad", ENGINE_INSTANCE_ID: "engine-b" }),
+			{ channelKv },
+		);
+		expect(await replacement.orchestrator.hydrateChannels(1_000)).toBe(1);
+		expect(replacement.orchestrator.activeChannelCount).toBe(1);
+		expect([...channelKv.values()][0]?.variables.OPTIMIQ_ENGINE_INSTANCE_ID).toBe("engine-b");
+
+		const internals = replacement.orchestrator as unknown as {
+			ownershipMaintenanceTimer?: ReturnType<typeof setInterval>;
+		};
+		expect(internals.ownershipMaintenanceTimer).toBeDefined();
+		await replacement.orchestrator.onApplicationShutdown();
+		expect(internals.ownershipMaintenanceTimer).toBeUndefined();
+	});
+
+	it("hydrates an ownerless ARI snapshot on exactly one replica", async () => {
+		const channelKv = new Map<string, ChannelSnapshot>();
+		const seed = harness(fakeEnv({ ENGINE_INSTANCE_ID: "engine-seed" }), { channelKv });
+		await seed.orchestrator.handleEvent(
+			mediaEvent("StasisStart", { channel: channel(), args: [] }),
+		);
+		const [stored] = channelKv.values();
+		if (stored === undefined) {
+			throw new Error("the seed replica did not mirror its channel");
+		}
+		const variables = { ...stored.variables };
+		delete variables.OPTIMIQ_ENGINE_INSTANCE_ID;
+		delete variables[CHANNEL_OWNER_EXPIRES_AT_VARIABLE];
+		channelKv.set(`${stored.organizationId}.${stored.callId}.${stored.channelId}`, {
+			...stored,
+			variables,
+		});
+		const replicas = [
+			harness(fakeEnv({ ENGINE_INSTANCE_ID: "engine-a" }), { channelKv }),
+			harness(fakeEnv({ ENGINE_INSTANCE_ID: "engine-b" }), { channelKv }),
+		] as const;
+
+		const hydrated = await Promise.all(
+			replicas.map(async (replica) => await replica.orchestrator.hydrateChannels(1_000)),
+		);
+
+		expect(hydrated[0] + hydrated[1]).toBe(1);
+		expect(
+			replicas.reduce((sum, replica) => sum + replica.orchestrator.activeChannelCount, 0),
+		).toBe(1);
+		expect([...channelKv.values()][0]?.variables.OPTIMIQ_ENGINE_INSTANCE_ID).toMatch(
+			/^engine-[ab]$/,
+		);
+		await Promise.all(
+			replicas.map(async (replica) => await replica.orchestrator.onApplicationShutdown()),
+		);
+	});
+
+	it("stops handling a mediad channel when its lease renewal loses", async () => {
+		const h = harness(fakeEnv({ ENGINE_MEDIA_DRIVER: "mediad" }), {
+			renewResult: "lost",
+		});
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
+		expect(h.orchestrator.activeChannelCount).toBe(1);
+
+		await h.orchestrator.maintainChannelOwnership(2_000);
+
+		expect(h.orchestrator.activeChannelCount).toBe(0);
+		expect(h.kv.size).toBe(1);
+		expect(h.mediaPort.hungUp()).toEqual([]);
+	});
+
+	it("self-fences after unavailable renewals outlive the last acknowledged lease", async () => {
+		const h = harness(fakeEnv(), { renewResult: "unavailable" });
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
+		const [stored] = h.kv.values();
+		if (stored === undefined) {
+			throw new Error("the channel was not mirrored");
+		}
+		h.kv.set(`${stored.organizationId}.${stored.callId}.${stored.channelId}`, {
+			...stored,
+			variables: {
+				...stored.variables,
+				[CHANNEL_OWNER_EXPIRES_AT_VARIABLE]: "1000",
+			},
+		});
+
+		await h.orchestrator.maintainChannelOwnership(999);
+		expect(h.orchestrator.activeChannelCount).toBe(1);
+		await h.orchestrator.maintainChannelOwnership(1_000);
+
+		expect(h.orchestrator.activeChannelCount).toBe(0);
+		expect(h.mediaPort.hungUp()).toEqual([]);
+	});
+
+	it("coalesces overlapping mediad ownership sweeps", async () => {
+		const h = harness(fakeEnv({ ENGINE_MEDIA_DRIVER: "mediad" }));
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
+		let renewals = 0;
+		let finishRenewal: (() => void) | undefined;
+		const renewal = new Promise<void>((resolve) => {
+			finishRenewal = resolve;
+		});
+		Object.assign(h.jetstream, {
+			renewChannel: async () => {
+				renewals += 1;
+				await renewal;
+				return "renewed" as const;
+			},
+		});
+
+		const first = h.orchestrator.maintainChannelOwnership(2_000);
+		const second = h.orchestrator.maintainChannelOwnership(3_000);
+		await Promise.resolve();
+		expect(renewals).toBe(1);
+		finishRenewal?.();
+		await Promise.all([first, second]);
+		expect(renewals).toBe(1);
 	});
 
 	it("reads the direction from a channel variable", async () => {
@@ -613,8 +1032,8 @@ describe("maximum call duration", () => {
 });
 
 describe("teardown", () => {
-	async function answered() {
-		const h = harness();
+	async function answered(options: HarnessOptions = {}) {
+		const h = harness(fakeEnv(), options);
 		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
 		await h.orchestrator.handleEvent(
 			mediaEvent("ChannelStateChange", { channel: channel({ state: "Up" }) }),
@@ -649,6 +1068,154 @@ describe("teardown", () => {
 		});
 		expect(h.kv.size).toBe(0);
 		expect(h.orchestrator.activeChannelCount).toBe(0);
+	});
+
+	it("autonomously retries a failed CDR with the same ids", async () => {
+		const h = await answered({ cdrFailures: 1 });
+		const ended = mediaEvent("ChannelDestroyed", {
+			channel: channel({ state: "Down" }),
+			cause: 16,
+			cause_txt: "Normal Clearing",
+		});
+
+		await h.orchestrator.handleEvent(ended);
+
+		expect(h.cdrs).toHaveLength(0);
+		expect(h.cdrAttempts).toHaveLength(1);
+		expect(h.kv.size).toBe(1);
+		expect([...h.kv.values()][0]?.state).toBe("reporting");
+		expect(h.orchestrator.activeChannelCount).toBe(1);
+		expect(pendingCdrRetryCount(h.orchestrator)).toBe(1);
+
+		await waitFor(() => h.cdrs.length === 1);
+
+		expect(h.cdrs).toHaveLength(1);
+		expect(h.cdrAttempts).toHaveLength(2);
+		expect(h.cdrAttempts[1]?.id).toBe(h.cdrAttempts[0]?.id);
+		expect(h.cdrAttempts[1]?.data.id).toBe(h.cdrAttempts[0]?.data.id);
+		expect(typesOf(h.published)).toEqual(["channel.hangup", "channel.destroyed"]);
+		expect(h.kv.size).toBe(0);
+		expect(h.orchestrator.activeChannelCount).toBe(0);
+		expect(pendingCdrRetryCount(h.orchestrator)).toBe(0);
+	});
+
+	it("strictly persists retry-stable terminal state before publishing terminal events", async () => {
+		let publicationStarted: (() => void) | undefined;
+		let releasePublication: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			publicationStarted = resolve;
+		});
+		const blocked = new Promise<void>((resolve) => {
+			releasePublication = resolve;
+		});
+		const h = await answered({
+			beforeEventPublish: async (type) => {
+				if (type === "channel.hangup") {
+					publicationStarted?.();
+					await blocked;
+				}
+			},
+		});
+
+		const ending = h.orchestrator.handleEvent(
+			mediaEvent("ChannelDestroyed", {
+				channel: channel({ state: "Down" }),
+				cause: 16,
+				cause_txt: "Normal Clearing",
+			}),
+		);
+		await started;
+
+		const recovery = [...h.kv.values()][0];
+		const publishedWhileBlocked = [...h.published];
+		const cdrAttemptsWhileBlocked = h.cdrAttempts.length;
+		releasePublication?.();
+		await ending;
+
+		expect(recovery?.state).toBe("reporting");
+		expect(recovery?.variables).toMatchObject({
+			OPTIMIQ_CDR_HANGUP_CAUSE_CODE: "16",
+		});
+		expect(recovery?.variables.OPTIMIQ_CDR_ID).toBeDefined();
+		expect(recovery?.variables.OPTIMIQ_TERMINAL_HANGUP_EVENT_ID).toBeDefined();
+		expect(recovery?.variables.OPTIMIQ_TERMINAL_DESTROYED_EVENT_ID).toBeDefined();
+		expect(recovery?.variables.OPTIMIQ_TERMINAL_EVENTS_PUBLISHED).toBeUndefined();
+		expect(publishedWhileBlocked).toEqual([]);
+		expect(cdrAttemptsWhileBlocked).toBe(0);
+		expect(h.published.map((event) => event.id)).toEqual([
+			recovery?.variables.OPTIMIQ_TERMINAL_HANGUP_EVENT_ID,
+			recovery?.variables.OPTIMIQ_TERMINAL_DESTROYED_EVENT_ID,
+		]);
+		expect(h.persistAttempts[1]?.variables.OPTIMIQ_TERMINAL_EVENTS_PUBLISHED).toBe("true");
+
+		const replacement = harness(fakeEnv(), {
+			snapshots: [JSON.parse(JSON.stringify(recovery)) as ChannelSnapshot],
+		});
+		expect(await replacement.orchestrator.hydrateChannels()).toBe(1);
+		expect(replacement.published.map((event) => event.id)).toEqual(
+			h.published.map((event) => event.id),
+		);
+		expect(typesOf(replacement.published)).toEqual(["channel.hangup", "channel.destroyed"]);
+		expect(replacement.cdrs).toHaveLength(1);
+	});
+
+	it("resumes a hydrated reporting snapshot without another media event", async () => {
+		const original = await answered({ cdrFailures: 100 });
+		const ended = mediaEvent("ChannelDestroyed", {
+			channel: channel({ state: "Down" }),
+			cause: 16,
+			cause_txt: "Normal Clearing",
+		});
+		await original.orchestrator.handleEvent(ended);
+		const recovery = [...original.kv.values()][0];
+		if (recovery === undefined) {
+			throw new Error("terminal recovery snapshot was not retained");
+		}
+		await original.orchestrator.onApplicationShutdown();
+		expect(pendingCdrRetryCount(original.orchestrator)).toBe(0);
+
+		const replacement = harness(fakeEnv(), {
+			snapshots: [JSON.parse(JSON.stringify(recovery)) as ChannelSnapshot],
+		});
+		expect(await replacement.orchestrator.hydrateChannels()).toBe(1);
+		expect(replacement.orchestrator.activeChannelCount).toBe(0);
+		expect(replacement.mediaCalls).toContainEqual({
+			method: "watchChannel",
+			args: [ARI_CHANNEL],
+		});
+		expect(replacement.cdrs).toHaveLength(1);
+		expect(replacement.cdrs[0]?.id).toBe(original.cdrAttempts[0]?.id);
+		expect(replacement.cdrs[0]?.data.id).toBe(original.cdrAttempts[0]?.data.id);
+		expect(replacement.published).toEqual([]);
+		expect(replacement.kv.size).toBe(0);
+		expect(replacement.orchestrator.activeChannelCount).toBe(0);
+	});
+
+	it("does not publish until the reporting snapshot persistence barrier succeeds", async () => {
+		const h = await answered({ persistFailures: 1 });
+		await h.orchestrator.handleEvent(
+			mediaEvent("ChannelDestroyed", {
+				channel: channel({ state: "Down" }),
+				cause: 16,
+				cause_txt: "Normal Clearing",
+			}),
+		);
+
+		expect(h.persistAttempts).toHaveLength(1);
+		expect(h.published).toEqual([]);
+		expect(h.cdrAttempts).toHaveLength(0);
+		expect(h.orchestrator.activeChannelCount).toBe(1);
+		expect(pendingCdrRetryCount(h.orchestrator)).toBe(1);
+		const stableId = h.persistAttempts[0]?.variables.OPTIMIQ_CDR_ID;
+
+		await waitFor(() => h.cdrs.length === 1);
+
+		expect(h.persistAttempts).toHaveLength(3);
+		expect(typesOf(h.published)).toEqual(["channel.hangup", "channel.destroyed"]);
+		expect(h.cdrs[0]?.id).toBe(stableId);
+		expect(h.cdrs[0]?.data.id).toBe(stableId);
+		expect(h.kv.size).toBe(0);
+		expect(pendingCdrRetryCount(h.orchestrator)).toBe(0);
 	});
 
 	it("keeps the cause the far end sent, not the one ChannelDestroyed reports later", async () => {
@@ -718,10 +1285,47 @@ describe("teardown", () => {
 		);
 		expect(h.dtmf.size).toBe(0);
 	});
+
+	it("releases mid-call state by media channel id throughout teardown", async () => {
+		const h = await answered();
+		const midCall = (
+			h.orchestrator as unknown as {
+				midCall: { release(mediaChannelId: string): void };
+			}
+		).midCall;
+		const originalRelease = midCall.release.bind(midCall);
+		const released: string[] = [];
+		midCall.release = (mediaChannelId) => {
+			released.push(mediaChannelId);
+			originalRelease(mediaChannelId);
+		};
+
+		await h.orchestrator.handleEvent({ type: "leg-left", channelId: ARI_CHANNEL });
+		await h.orchestrator.handleEvent({
+			type: "leg-ended",
+			channelId: ARI_CHANNEL,
+			cause: "NORMAL_CLEARING",
+			causeCode: 16,
+		});
+
+		expect(released).toEqual([ARI_CHANNEL, ARI_CHANNEL]);
+	});
 });
 
 describe("drain", () => {
 	let harnessInstance: ReturnType<typeof harness>;
+
+	async function reportingWithFailures() {
+		const h = harness(fakeEnv({ ENGINE_DRAIN_TIMEOUT_MS: 0 }), { cdrFailures: 100 });
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
+		await h.orchestrator.handleEvent(
+			mediaEvent("ChannelStateChange", { channel: channel({ state: "Up" }) }),
+		);
+		await h.orchestrator.handleEvent(
+			mediaEvent("ChannelDestroyed", { channel: channel({ state: "Down" }), cause: 16 }),
+		);
+		return h;
+	}
 
 	beforeEach(() => {
 		harnessInstance = harness(fakeEnv({ ENGINE_DRAIN_TIMEOUT_MS: 50 }));
@@ -760,6 +1364,47 @@ describe("drain", () => {
 			{ method: "hangup", args: [ARI_CHANNEL, "NORMAL_TEMPORARY_FAILURE"] },
 		]);
 	});
+
+	it("clears all mid-call runtime state before waiting", async () => {
+		const midCall = (
+			harnessInstance.orchestrator as unknown as {
+				midCall: { clear(): void };
+			}
+		).midCall;
+		const originalClear = midCall.clear.bind(midCall);
+		let clears = 0;
+		midCall.clear = () => {
+			clears += 1;
+			originalClear();
+		};
+
+		await harnessInstance.orchestrator.drain(0);
+
+		expect(clears).toBe(1);
+	});
+
+	it("stops retry timers on drain while retaining the durable reporting record", async () => {
+		const h = await reportingWithFailures();
+		expect(pendingCdrRetryCount(h.orchestrator)).toBe(1);
+
+		await h.orchestrator.drain(0);
+
+		expect(pendingCdrRetryCount(h.orchestrator)).toBe(0);
+		expect([...h.kv.values()][0]?.state).toBe("reporting");
+		const attempts = h.cdrAttempts.length;
+		await new Promise((resolve) => setTimeout(resolve, 150));
+		expect(h.cdrAttempts).toHaveLength(attempts);
+	});
+
+	it("stops retry timers on application shutdown without deleting the reporting record", async () => {
+		const h = await reportingWithFailures();
+		expect(pendingCdrRetryCount(h.orchestrator)).toBe(1);
+
+		await h.orchestrator.onApplicationShutdown();
+
+		expect(pendingCdrRetryCount(h.orchestrator)).toBe(0);
+		expect([...h.kv.values()][0]?.state).toBe("reporting");
+	});
 });
 
 describe("resilience", () => {
@@ -794,6 +1439,7 @@ describe("resilience", () => {
 			new CallControlRegistry(),
 			NO_PARK_HANDOFF,
 			fakeSipTransfer().service,
+			fakeOriginate().service,
 		);
 
 		await expect(

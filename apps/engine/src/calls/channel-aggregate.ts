@@ -18,6 +18,9 @@ import type {
 	HangupCause,
 } from "@optimiq-voice/telephony";
 
+const MEDIA_CHANNEL_ID_VARIABLE = "OPTIMIQ_MEDIA_CHANNEL_ID";
+const HANGUP_INITIATED_BY_ENGINE_VARIABLE = "OPTIMIQ_HANGUP_INITIATED_BY_ENGINE";
+
 /**
  * One call leg, as the engine holds it.
  *
@@ -29,8 +32,9 @@ import type {
  *    `assertCallStateTransition` BEFORE the field is written, per the oikos convention. An invalid
  *    transition throws and the write never happens, so the snapshot in KV is never a state the
  *    machine says is unreachable.
- * 2. **Keep the ARI id.** The ARI channel id is engine-local plumbing and must not leak into the
- *    snapshot, the events or the CDR — those speak in domain ids only. It lives here.
+ * 2. **Keep the media id private.** The media server's channel id is engine-local plumbing and
+ *    never reaches events or the CDR. It is mirrored as a reserved snapshot variable solely so a
+ *    replacement process can rebuild this wrapper before the terminal event arrives.
  *
  * No domain LOGIC lives here: nothing decides what a call should do next. That is the
  * orchestrator's job, and keeping this a state holder is what makes the orchestrator's decisions
@@ -47,6 +51,8 @@ export class ChannelAggregate {
 	private constructor(ariChannelId: string, snapshot: ChannelSnapshot) {
 		this.ariChannelId = ariChannelId;
 		this.snapshotValue = snapshot;
+		this.hangupInitiatedByEngine =
+			snapshot.variables[HANGUP_INITIATED_BY_ENGINE_VARIABLE] === "true";
 	}
 
 	/** Creates a leg in the initial state of both machines (`created` / `down`). */
@@ -73,9 +79,21 @@ export class ChannelAggregate {
 			callState: INITIAL_CALL_STATE,
 			flags: input.direction === "outbound" ? ["outbound"] : [],
 			profile: input.profile,
-			variables: input.variables ?? {},
+			variables: {
+				...input.variables,
+				[MEDIA_CHANNEL_ID_VARIABLE]: input.ariChannelId,
+			},
 			createdAt: input.createdAt,
 		});
+	}
+
+	/** Rebuilds the mutable wrapper around a snapshot read from the `channels` KV bucket. */
+	static hydrate(snapshot: ChannelSnapshot): ChannelAggregate {
+		const mediaChannelId = snapshot.variables[MEDIA_CHANNEL_ID_VARIABLE];
+		if (mediaChannelId === undefined || mediaChannelId.trim() === "") {
+			throw new TypeError("channel recovery snapshot has no media channel id");
+		}
+		return new ChannelAggregate(mediaChannelId, snapshot);
 	}
 
 	/** The KV-safe value. Frozen at the boundary so a caller cannot mutate engine state. */
@@ -252,6 +270,10 @@ export class ChannelAggregate {
 			...this.snapshotValue,
 			hangupCause: input.cause,
 			hangupAt: input.at,
+			variables: {
+				...this.snapshotValue.variables,
+				[HANGUP_INITIATED_BY_ENGINE_VARIABLE]: String(input.initiatedByEngine),
+			},
 		};
 		return true;
 	}

@@ -32,8 +32,9 @@ import type { EngineEnv } from "../config/engine-env";
  *
  * ## What a failed tick means, and what it deliberately does not do
  *
- * Nothing dramatic. The lease is three heartbeats long precisely so a broker blip does not cost a
- * tenant an orbit that is holding a live caller; a tick that fails logs and the next one succeeds.
+ * Nothing dramatic. Three heartbeat opportunities occur strictly before lease expiry so a broker
+ * blip does not cost a tenant an orbit that is holding a live caller; a failed tick logs and the
+ * next one succeeds.
  * The registries own the interesting half — a park claim another instance has taken over is DROPPED
  * locally rather than fought for, and a conference claim another participant's instance renewed
  * first is simply adopted — see their own `heartbeat` methods for why those two differ.
@@ -42,6 +43,7 @@ import type { EngineEnv } from "../config/engine-env";
 export class ClaimHeartbeatService implements OnApplicationBootstrap, OnApplicationShutdown {
 	private readonly logger = getLogger("engine.claims");
 	private timer: ReturnType<typeof setInterval> | undefined;
+	private activeTick: Promise<void> | undefined;
 	private ticks = 0;
 	private failures = 0;
 
@@ -93,8 +95,23 @@ export class ClaimHeartbeatService implements OnApplicationBootstrap, OnApplicat
 		}
 	}
 
-	/** One renewal pass. Exposed so a spec drives it without waiting for an interval. */
-	async tick(): Promise<void> {
+	/** One renewal pass. Overlapping timer and explicit calls share the pass already in flight. */
+	tick(): Promise<void> {
+		if (this.activeTick !== undefined) {
+			return this.activeTick;
+		}
+
+		const activeTick = this.runTick();
+		this.activeTick = activeTick;
+		void activeTick.finally(() => {
+			if (this.activeTick === activeTick) {
+				this.activeTick = undefined;
+			}
+		});
+		return activeTick;
+	}
+
+	private async runTick(): Promise<void> {
 		this.ticks += 1;
 		try {
 			await this.parks.heartbeat();

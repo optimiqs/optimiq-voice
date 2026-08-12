@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { FakeClaimBucket } from "../nats/claim-store.fake";
 import { ClaimHeartbeatService } from "./claim-heartbeat.service";
+import { CLAIM_HEARTBEAT_INTERVAL_MS } from "./claim-timing";
 import { ConferenceRegistry } from "./conference-registry";
 import { ParkRegistry } from "./park-registry";
 import type { EngineEnv } from "../config/engine-env";
@@ -20,10 +21,18 @@ const LOT = { slotStart: 401, slotEnd: 403 };
 const LOT_ID = "0195c0f0-1c2f-7000-8000-0000000000f1";
 const ORG = "0195c0f0-1c2f-7000-8000-000000000001";
 
+function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void } {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((settle) => {
+		resolve = settle;
+	});
+	return { promise, resolve };
+}
+
 function env(overrides: Partial<EngineEnv> = {}): EngineEnv {
 	return {
 		ENGINE_INSTANCE_ID: "engine-a",
-		ENGINE_CLAIM_HEARTBEAT_MS: 30_000,
+		ENGINE_CLAIM_HEARTBEAT_MS: CLAIM_HEARTBEAT_INTERVAL_MS,
 		...overrides,
 	} as EngineEnv;
 }
@@ -131,5 +140,62 @@ describe("a tick", () => {
 
 		await heartbeat.tick();
 		expect(heartbeat.stats.failures).toBe(1);
+	});
+
+	it("coalesces timer and explicit ticks while a renewal pass is still running", async () => {
+		const parkStarted = deferred<void>();
+		const finishPark = deferred<void>();
+		let parkPasses = 0;
+		let conferencePasses = 0;
+		const parks = {
+			isShared: true,
+			bindClaims: () => undefined,
+			heartbeat: async () => {
+				parkPasses += 1;
+				parkStarted.resolve();
+				await finishPark.promise;
+				return 0;
+			},
+		} as unknown as ParkRegistry;
+		const conferences = {
+			bindClaims: () => undefined,
+			heartbeat: async () => {
+				conferencePasses += 1;
+				return 0;
+			},
+		} as unknown as ConferenceRegistry;
+		const jetstream = {
+			parkClaims: new FakeClaimBucket<ParkClaim>(),
+			conferenceClaims: new FakeClaimBucket<ConferenceClaim>(),
+		} as unknown as JetStreamService;
+		const heartbeat = new ClaimHeartbeatService(env(), jetstream, parks, conferences);
+		const originalSetInterval = globalThis.setInterval;
+		let timerTick: (() => void) | undefined;
+		globalThis.setInterval = ((callback: () => void) => {
+			timerTick = callback;
+			return 0 as unknown as ReturnType<typeof setInterval>;
+		}) as typeof setInterval;
+
+		try {
+			heartbeat.onApplicationBootstrap();
+			if (timerTick === undefined) {
+				throw new Error("the heartbeat timer was not scheduled");
+			}
+			timerTick();
+			await parkStarted.promise;
+			const explicitTick = heartbeat.tick();
+			timerTick();
+
+			expect(parkPasses).toBe(1);
+			expect(conferencePasses).toBe(0);
+			finishPark.resolve();
+			await explicitTick;
+			expect(parkPasses).toBe(1);
+			expect(conferencePasses).toBe(1);
+			expect(heartbeat.stats.ticks).toBe(1);
+		} finally {
+			heartbeat.onApplicationShutdown();
+			globalThis.setInterval = originalSetInterval;
+		}
 	});
 });

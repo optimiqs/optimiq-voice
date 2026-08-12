@@ -766,7 +766,7 @@
 		},
 		{
 			"name": "conference-claims",
-			"description": "Conference room -> agreed bridge id and member count, under compare-and-set.",
+			"description": "Conference room -> agreed bridge id and leased instance contributions.",
 			"ttlMs": 900000,
 			"history": 1,
 			"storage": "file",

@@ -1,15 +1,28 @@
 import { Injectable } from "@nestjs/common";
 import { agentStateEntrySchema, kvKeyFor } from "@optimiq-voice/events";
 import { getLogger } from "@optimiq-voice/logging";
+import { isConflict } from "../nats/claim-store";
 import { JetStreamService } from "../nats/jetstream.service";
 import {
 	absentAgentState,
 	assertAgentTransition,
 	InvalidAgentTransitionError,
+	isEligibleForDistribution,
 } from "./agent-state";
 import { QueueEventPublisher } from "./queue-event-publisher.service";
-import type { AgentStatePort, AgentTransitionRequest } from "./queue-session";
+import type {
+	AgentReservationRequest,
+	AgentStatePort,
+	AgentStateRead,
+	AgentTransitionRequest,
+} from "./queue-session";
 import type { AgentStateEntry } from "@optimiq-voice/events";
+import type { KV } from "nats";
+
+type VersionedAgentStateRead =
+	| { readonly kind: "found"; readonly value: AgentStateEntry; readonly revision: number }
+	| { readonly kind: "absent" }
+	| { readonly kind: "unavailable" };
 
 /** The `noAnswerCount` a write should carry: the requested one, else the existing one, else none. */
 export function noAnswerCountOf(
@@ -25,13 +38,13 @@ export function noAnswerCountOf(
 /**
  * The engine's writer for the `agent-state` bucket.
  *
- * ## Read-guard-write, in that order, always
+ * ## Read-guard-compare-and-set, in that order, always
  *
  * Every transition reads the current entry, runs {@link assertAgentTransition} against it, and only
- * then writes. The read is not an optimisation — it is what the guard needs, and it is what makes a
- * refused transition possible at all. A blind `put` would let this process mark an agent `on-call`
- * who logged out thirty seconds ago, and the next thing that happened would be a caller waiting for
- * a phone that is switched off.
+ * then writes against the revision it read. The read is not an optimisation — it is what the guard
+ * needs, and its revision is what makes the guard remain true through the write. `create` refuses an
+ * entry that appeared after an absent read; `update` refuses an entry that changed after a present
+ * read. A blind `put` would let two callers reserve one agent or overwrite a concurrent logout.
  *
  * A refusal is `undefined`, not an exception, because every caller is a queued call: the session
  * reads `undefined` as "this agent is not mine to ring" and moves to the next candidate, which is
@@ -93,40 +106,91 @@ export class AgentStateStore implements AgentStatePort {
 
 		await Promise.all(
 			agentIds.map(async (agentId) => {
-				const entry = await this.read(orgId, agentId);
-				if (entry !== undefined) {
-					states.set(agentId, entry);
+				const read = await this.readState(orgId, agentId);
+				if (read.kind === "found") {
+					states.set(agentId, read.entry);
 				}
 			}),
 		);
 		return states;
 	}
 
-	/** One agent's entry, or `undefined` when it is absent or unreadable. */
-	async read(orgId: string, agentId: string): Promise<AgentStateEntry | undefined> {
+	async readState(orgId: string, agentId: string): Promise<AgentStateRead> {
 		const bucket = this.jetstream.agentState;
 		if (bucket === undefined) {
-			return undefined;
+			return { kind: "unavailable" };
 		}
 		let key: string;
 		try {
 			key = kvKeyFor.agentState(orgId, agentId);
 		} catch {
+			return { kind: "unavailable" };
+		}
+		const read = await this.readVersioned(bucket, key, orgId, agentId);
+		if (read.kind === "found") {
+			return { kind: "found", entry: read.value };
+		}
+		return read;
+	}
+
+	/**
+	 * Reserves an eligible entry with one revision-conditional write.
+	 *
+	 * This is deliberately separate from {@link transition}: an expired `wrap-up` belongs to its old
+	 * call for every normal transition, but distribution may atomically replace that stale ownership
+	 * with a new `ringing` owner. Re-checking the deadline here closes the selection-to-write race.
+	 */
+	async reserve(request: AgentReservationRequest): Promise<AgentStateEntry | undefined> {
+		const bucket = this.jetstream.agentState;
+		if (bucket === undefined) {
 			return undefined;
 		}
+
+		let key: string;
 		try {
-			const entry = await bucket.get(key);
-			if (entry === null || entry.value.length === 0) {
-				return undefined;
-			}
-			return agentStateEntrySchema.parse(JSON.parse(new TextDecoder().decode(entry.value)));
-		} catch (error) {
-			this.logger.warn(
-				{ orgId, agentId, err: String(error) },
-				"discarding an unreadable agent-state entry",
-			);
+			key = kvKeyFor.agentState(request.orgId, request.agentId);
+		} catch {
 			return undefined;
 		}
+
+		const read = await this.readVersioned(bucket, key, request.orgId, request.agentId);
+		if (read.kind !== "found" || !isEligibleForDistribution(read.value, request.now)) {
+			return undefined;
+		}
+
+		const next: AgentStateEntry = {
+			orgId: request.orgId,
+			agentId: request.agentId,
+			status: "ringing",
+			since: new Date(request.now).toISOString(),
+			previousStatus: read.value.status,
+			source: "engine",
+			callId: request.callId,
+			queueId: request.queueId,
+			...noAnswerCountOf(request.noAnswerCount, read.value.noAnswerCount),
+			...(request.legId === undefined ? {} : { legId: request.legId }),
+		};
+
+		try {
+			await bucket.update(key, new TextEncoder().encode(JSON.stringify(next)), read.revision);
+			this.writes += 1;
+		} catch (error) {
+			if (isConflict(error)) {
+				this.refusals += 1;
+			} else {
+				this.failures += 1;
+			}
+			return undefined;
+		}
+
+		await this.events.agentState({
+			orgId: request.orgId,
+			queueId: request.queueId,
+			agentId: request.agentId,
+			status: next.status,
+			previousStatus: read.value.status,
+		});
+		return next;
 	}
 
 	/**
@@ -137,6 +201,10 @@ export class AgentStateStore implements AgentStatePort {
 	 * first transition the engine attempts for an agent nobody has logged in is refused, which is
 	 * correct: distribution should never have selected them, and if it did, something upstream is
 	 * reading eligibility wrong.
+	 *
+	 * `ringing`, `on-call` and `wrap-up` are owned by the call recorded on the entry. Every promotion
+	 * or cleanup from one of those states must quote that same `callId`; a stale session is refused
+	 * before it can validate or write anything.
 	 */
 	async transition(request: AgentTransitionRequest): Promise<AgentStateEntry | undefined> {
 		const bucket = this.jetstream.agentState;
@@ -156,9 +224,30 @@ export class AgentStateStore implements AgentStatePort {
 		}
 
 		const now = Date.now();
-		const current =
-			(await this.read(request.orgId, request.agentId)) ??
-			absentAgentState(request.orgId, request.agentId, now);
+		const read = await this.readVersioned(bucket, key, request.orgId, request.agentId);
+		const stored = read.kind === "found" ? read : undefined;
+		const current = stored?.value ?? absentAgentState(request.orgId, request.agentId, now);
+
+		if (
+			(current.status === "ringing" ||
+				current.status === "on-call" ||
+				current.status === "wrap-up") &&
+			current.callId !== request.callId
+		) {
+			this.refusals += 1;
+			this.logger.warn(
+				{
+					orgId: request.orgId,
+					agentId: request.agentId,
+					from: current.status,
+					to: request.to,
+					callId: request.callId,
+					currentCallId: current.callId,
+				},
+				"refusing an agent state transition owned by another call",
+			);
+			return undefined;
+		}
 
 		if (current.status === request.to) {
 			// A no-op re-entry is not a transition. Returning the existing entry rather than writing
@@ -198,20 +287,40 @@ export class AgentStateStore implements AgentStatePort {
 			// being released for a third time must not have their history reset by a write that was
 			// not about the count.
 			...noAnswerCountOf(request.noAnswerCount, current.noAnswerCount),
-			...(request.callId === undefined ? {} : { callId: request.callId }),
+			...(request.to === "ringing" || request.to === "on-call" || request.to === "wrap-up"
+				? { callId: request.callId }
+				: {}),
 			...(request.legId === undefined ? {} : { legId: request.legId }),
 			...(request.queueId === undefined ? {} : { queueId: request.queueId }),
 			...(request.reason === undefined ? {} : { reason: request.reason }),
 		};
 
 		try {
-			await bucket.put(key, new TextEncoder().encode(JSON.stringify(next)));
+			const value = new TextEncoder().encode(JSON.stringify(next));
+			if (stored === undefined) {
+				await bucket.create(key, value);
+			} else {
+				await bucket.update(key, value, stored.revision);
+			}
 			this.writes += 1;
 		} catch (error) {
-			this.failures += 1;
+			const conflict = isConflict(error);
+			if (conflict) {
+				this.refusals += 1;
+			} else {
+				this.failures += 1;
+			}
 			this.logger.warn(
-				{ orgId: request.orgId, agentId: request.agentId, err: String(error) },
-				"failed to write agent state to KV; the transition was not applied",
+				{
+					orgId: request.orgId,
+					agentId: request.agentId,
+					from: current.status,
+					to: request.to,
+					err: String(error),
+				},
+				conflict
+					? "refusing an agent state transition because the entry changed concurrently"
+					: "failed to write agent state to KV; the transition was not applied",
 			);
 			return undefined;
 		}
@@ -226,5 +335,30 @@ export class AgentStateStore implements AgentStatePort {
 		});
 
 		return next;
+	}
+
+	private async readVersioned(
+		bucket: KV,
+		key: string,
+		orgId: string,
+		agentId: string,
+	): Promise<VersionedAgentStateRead> {
+		try {
+			const entry = await bucket.get(key);
+			if (entry === null || entry.value.length === 0) {
+				return { kind: "absent" };
+			}
+			return {
+				kind: "found",
+				value: agentStateEntrySchema.parse(JSON.parse(new TextDecoder().decode(entry.value))),
+				revision: entry.revision,
+			};
+		} catch (error) {
+			this.logger.warn(
+				{ orgId, agentId, err: String(error) },
+				"discarding an unreadable agent-state entry",
+			);
+			return { kind: "unavailable" };
+		}
 	}
 }

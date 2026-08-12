@@ -1,8 +1,8 @@
 import { Injectable } from "@nestjs/common";
-import { isClaimExpired, kvKeyFor } from "@optimiq-voice/events";
+import { kvKeyFor } from "@optimiq-voice/events";
 import { getLogger } from "@optimiq-voice/logging";
 import { UnclaimedBucket } from "../nats/claim-store";
-import { CLAIM_LEASE_MS } from "./park-registry";
+import { CLAIM_LEASE_MS } from "./claim-timing";
 import type { ClaimBucket, Claimed } from "../nats/claim-store";
 import type { ConferenceClaim } from "@optimiq-voice/events";
 
@@ -32,9 +32,11 @@ import type { ConferenceClaim } from "@optimiq-voice/events";
  *
  * A cap counted per instance is not a cap: a twenty-seat room admits forty across two nodes. A
  * moderator gate checked per instance is worse — a participant waits forever for somebody who is
- * already in the meeting. Both counts therefore live in the claim and move under compare-and-set, on
- * every join and every leave. The CAS retry is bounded: a join that keeps losing is a room being
- * hammered, and refusing on the call path beats spinning on it.
+ * already in the meeting. Each instance therefore writes its own leased contribution under
+ * compare-and-set. Cluster totals are derived from the unexpired contributions, so one crashed
+ * instance's members disappear without allowing another instance to change the shared bridge id.
+ * The CAS retry is bounded: a join that keeps losing is a room being hammered, and refusing on the
+ * call path beats spinning on it.
  *
  * ## Degradation: configured-and-down REFUSES
  *
@@ -123,7 +125,7 @@ interface MutableRoom {
 @Injectable()
 export class ConferenceRegistry {
 	private readonly logger = getLogger("engine.conference");
-	private readonly rooms = new Map<string, MutableRoom>();
+	private readonly rooms = new Map<string | undefined, Map<string, MutableRoom>>();
 
 	private bucket: ClaimBucket<ConferenceClaim> = new UnclaimedBucket<ConferenceClaim>();
 	private instanceId = "engine-local";
@@ -147,12 +149,16 @@ export class ConferenceRegistry {
 
 	/** Rooms this process is hosting. `/healthz` and the specs read it. */
 	get roomCount(): number {
-		return this.rooms.size;
+		let count = 0;
+		for (const organizationRooms of this.rooms.values()) {
+			count += organizationRooms.size;
+		}
+		return count;
 	}
 
 	/** A room's current state as this instance knows it, or `undefined` when nobody here is in it. */
-	room(conferenceId: string): ConferenceRoom | undefined {
-		const room = this.rooms.get(conferenceId);
+	room(conferenceId: string, organizationId?: string): ConferenceRoom | undefined {
+		const room = this.localRoomIfUnambiguous(conferenceId, organizationId);
 		return room === undefined ? undefined : snapshot(room);
 	}
 
@@ -202,19 +208,24 @@ export class ConferenceRegistry {
 
 		for (let attempt = 0; attempt < CAS_ATTEMPTS; attempt += 1) {
 			const now = this.now();
-			const current = await this.bucket.get(key);
+			const read = await this.bucket.get(key);
+			if (read.kind === "unavailable") {
+				return { kind: "claims-unavailable", reason: read.reason };
+			}
+			const current = read.kind === "present" ? read.claim : undefined;
+			const currentState = current === undefined ? undefined : this.claimState(current.value, now);
 
-			if (current === undefined || isClaimExpired(current.value, now)) {
+			if (current === undefined || currentState?.memberCount === 0) {
 				// Nobody holds the room, or its owner stopped heartbeating and the bridge went with it.
 				// Either way this joiner is the first one in.
 				const record = this.claimRecord({
 					orgId: organizationId,
 					conferenceId,
 					bridgeId: options.newBridgeId,
-					memberCount: 1,
-					moderatorPresent: member.moderator,
 					claimedAt: now,
 					nowMs: now,
+					localMemberCount: 1,
+					localModeratorPresent: member.moderator,
 				});
 				const written =
 					current === undefined
@@ -237,18 +248,24 @@ export class ConferenceRegistry {
 			// Somebody holds the room. The cap is checked against the CLUSTER-wide count, which is the
 			// whole reason it is in the claim. `> 0` because `maxMembers: 0` is "no limit", which is
 			// `pbx-db`'s default everywhere else in this schema.
-			if (options.maxMembers > 0 && current.value.memberCount >= options.maxMembers) {
-				return { kind: "full", memberCount: current.value.memberCount };
+			// `current` is defined here — the first-in branch above exits (return or continue) in
+			// every case — and so is `currentState`, but the compiler cannot tie two locals'
+			// undefined-ness together, so the derivation is restated rather than asserted.
+			const heldState = currentState ?? this.claimState(current.value, now);
+			if (options.maxMembers > 0 && heldState.memberCount >= options.maxMembers) {
+				return { kind: "full", memberCount: heldState.memberCount };
 			}
+			const existing = this.localRoomIfUnambiguous(conferenceId, organizationId);
 
 			const record = this.claimRecord({
 				orgId: organizationId,
 				conferenceId,
 				bridgeId: current.value.bridgeId,
-				memberCount: current.value.memberCount + 1,
-				moderatorPresent: current.value.moderatorPresent || member.moderator,
 				claimedAt: current.value.claimedAt,
 				nowMs: now,
+				current: current.value,
+				localMemberCount: (existing?.members.size ?? 0) + 1,
+				localModeratorPresent: existing?.moderatorPresent === true || member.moderator,
 			});
 			const written = await this.bucket.update(key, record, current.revision);
 			if (written.kind === "unavailable") {
@@ -258,7 +275,6 @@ export class ConferenceRegistry {
 				continue;
 			}
 
-			const existing = this.rooms.get(conferenceId);
 			// The winner's bridge id, always — including when this instance already had a room under a
 			// different id, which is a split being repaired.
 			const room = this.localRoom(conferenceId, current.value.bridgeId, organizationId);
@@ -266,9 +282,10 @@ export class ConferenceRegistry {
 			const created = existing === undefined;
 			room.members.set(member.mediaChannelId, member);
 			room.claim = { value: record, revision: written.revision };
-			room.memberCount = record.memberCount;
-			room.moderatorPresent = record.moderatorPresent;
-			if (record.moderatorPresent) {
+			const nextState = this.claimState(record, now);
+			room.memberCount = nextState.memberCount;
+			room.moderatorPresent = nextState.moderatorPresent;
+			if (nextState.moderatorPresent) {
 				this.releaseModeratorWaiters(room);
 			}
 			return { kind: "joined", room: snapshot(room), created };
@@ -294,8 +311,12 @@ export class ConferenceRegistry {
 	 * because a decrement for a member who never joined is how a room's count drifts below its real
 	 * size and lets a twenty-first person in.
 	 */
-	async leave(conferenceId: string, mediaChannelId: string): Promise<ConferenceDeparture> {
-		const room = this.rooms.get(conferenceId);
+	async leave(
+		conferenceId: string,
+		mediaChannelId: string,
+		organizationId?: string,
+	): Promise<ConferenceDeparture> {
+		const room = this.localRoomIfUnambiguous(conferenceId, organizationId);
 		if (room === undefined) {
 			return { memberCount: 0, emptied: false };
 		}
@@ -309,7 +330,7 @@ export class ConferenceRegistry {
 			// Waiters first: a caller holding for a moderator in a room that just emptied would
 			// otherwise hold forever, with nothing left to wake it.
 			this.releaseModeratorWaiters(room);
-			this.rooms.delete(conferenceId);
+			this.deleteLocalRoom(room);
 			return {
 				...(member === undefined ? {} : { member }),
 				memberCount: clusterCount,
@@ -332,11 +353,14 @@ export class ConferenceRegistry {
 	 * A moderator who joins on ANOTHER instance cannot fire this waiter. {@link refresh} is how the
 	 * holder notices; see the class note.
 	 */
-	awaitModerator(conferenceId: string): {
+	awaitModerator(
+		conferenceId: string,
+		organizationId?: string,
+	): {
 		readonly arrived: Promise<void>;
 		readonly cancel: () => void;
 	} {
-		const room = this.rooms.get(conferenceId);
+		const room = this.localRoomIfUnambiguous(conferenceId, organizationId);
 		if (room === undefined || room.moderatorPresent) {
 			return { arrived: Promise.resolve(), cancel: () => undefined };
 		}
@@ -363,23 +387,23 @@ export class ConferenceRegistry {
 	 *
 	 * Returns whether a moderator is now present, so the poller can stop.
 	 */
-	async refresh(conferenceId: string): Promise<boolean> {
-		const room = this.rooms.get(conferenceId);
+	async refresh(conferenceId: string, organizationId?: string): Promise<boolean> {
+		const room = this.localRoomIfUnambiguous(conferenceId, organizationId);
 		if (room === undefined) {
 			return false;
 		}
 		if (!this.bucket.isConfigured || room.organizationId === undefined) {
 			return room.moderatorPresent;
 		}
-		const current = await this.bucket.get(
-			kvKeyFor.conferenceClaim(room.organizationId, conferenceId),
-		);
-		if (current === undefined) {
+		const read = await this.bucket.get(kvKeyFor.conferenceClaim(room.organizationId, conferenceId));
+		if (read.kind !== "present") {
 			return room.moderatorPresent;
 		}
+		const current = read.claim;
 		room.claim = current;
-		room.memberCount = current.value.memberCount;
-		if (current.value.moderatorPresent && !room.moderatorPresent) {
+		const state = this.claimState(current.value, this.now());
+		room.memberCount = state.memberCount;
+		if (state.moderatorPresent && !room.moderatorPresent) {
 			room.moderatorPresent = true;
 			this.releaseModeratorWaiters(room);
 		}
@@ -401,7 +425,7 @@ export class ConferenceRegistry {
 			return 0;
 		}
 		let renewed = 0;
-		for (const room of this.rooms.values()) {
+		for (const room of this.allRooms()) {
 			const claim = room.claim;
 			if (claim === undefined || room.organizationId === undefined) {
 				continue;
@@ -412,14 +436,18 @@ export class ConferenceRegistry {
 				orgId: room.organizationId,
 				conferenceId: room.conferenceId,
 				bridgeId: room.bridgeId,
-				memberCount: claim.value.memberCount,
-				moderatorPresent: claim.value.moderatorPresent,
 				claimedAt: claim.value.claimedAt,
 				nowMs: now,
+				current: claim.value,
+				localMemberCount: room.members.size,
+				localModeratorPresent: [...room.members.values()].some((member) => member.moderator),
 			});
 			const written = await this.bucket.update(key, record, claim.revision);
 			if (written.kind === "written") {
 				room.claim = { value: record, revision: written.revision };
+				const state = this.claimState(record, now);
+				room.memberCount = state.memberCount;
+				room.moderatorPresent = state.moderatorPresent;
 				renewed += 1;
 				continue;
 			}
@@ -427,8 +455,9 @@ export class ConferenceRegistry {
 				// Another participant's instance renewed it. Adopt their revision and carry on.
 				if (written.current !== undefined) {
 					room.claim = written.current;
-					room.memberCount = written.current.value.memberCount;
-					room.moderatorPresent = written.current.value.moderatorPresent;
+					const state = this.claimState(written.current.value, now);
+					room.memberCount = state.memberCount;
+					room.moderatorPresent = state.moderatorPresent;
 				}
 				continue;
 			}
@@ -442,7 +471,7 @@ export class ConferenceRegistry {
 
 	/** Drops every room. Used by the drain and by specs. Does not touch the media server or KV. */
 	clear(): void {
-		for (const room of this.rooms.values()) {
+		for (const room of this.allRooms()) {
 			this.releaseModeratorWaiters(room);
 		}
 		this.rooms.clear();
@@ -454,11 +483,15 @@ export class ConferenceRegistry {
 	private joinLocal(
 		conferenceId: string,
 		member: ConferenceMember,
-		options: { readonly newBridgeId: string; readonly maxMembers: number },
+		options: {
+			readonly newBridgeId: string;
+			readonly maxMembers: number;
+			readonly organizationId?: string;
+		},
 	): ConferenceJoinResult {
-		const existing = this.rooms.get(conferenceId);
+		const existing = this.rooms.get(options.organizationId)?.get(conferenceId);
 		if (existing === undefined) {
-			const room = this.localRoom(conferenceId, options.newBridgeId);
+			const room = this.localRoom(conferenceId, options.newBridgeId, options.organizationId);
 			room.members.set(member.mediaChannelId, member);
 			room.memberCount = 1;
 			room.moderatorPresent = member.moderator;
@@ -484,33 +517,36 @@ export class ConferenceRegistry {
 		const key = kvKeyFor.conferenceClaim(room.organizationId, room.conferenceId);
 
 		for (let attempt = 0; attempt < CAS_ATTEMPTS; attempt += 1) {
-			const current = await this.bucket.get(key);
-			if (current === undefined) {
+			const read = await this.bucket.get(key);
+			if (read.kind !== "present") {
 				return room.members.size;
 			}
-			const next = Math.max(0, current.value.memberCount - 1);
-			if (next === 0) {
-				// The last member anywhere. Releasing the key rather than writing a zero: an empty room
-				// must not keep a bridge id alive that the media server is about to destroy.
-				await this.bucket.release(key);
-				room.claim = undefined;
-				return 0;
-			}
+			const current = read.claim;
+			const now = this.now();
 			const record = this.claimRecord({
 				orgId: room.organizationId,
 				conferenceId: room.conferenceId,
 				bridgeId: current.value.bridgeId,
-				memberCount: next,
-				// A moderator who leaves does not re-close the gate: people already talking must not be
-				// silently ejected, and the callers still holding were held on a promise that has fired.
-				moderatorPresent: current.value.moderatorPresent,
 				claimedAt: current.value.claimedAt,
-				nowMs: this.now(),
+				nowMs: now,
+				current: current.value,
+				localMemberCount: room.members.size,
+				localModeratorPresent: [...room.members.values()].some((member) => member.moderator),
 			});
+			const nextState = this.claimState(record, now);
+			if (nextState.memberCount === 0) {
+				// The last member anywhere. Releasing the key rather than writing a zero: an empty room
+				// must not keep a bridge id alive that the media server is about to destroy.
+				if (await this.bucket.release(key, current.revision)) {
+					room.claim = undefined;
+					return 0;
+				}
+				continue;
+			}
 			const written = await this.bucket.update(key, record, current.revision);
 			if (written.kind === "written") {
 				room.claim = { value: record, revision: written.revision };
-				return next;
+				return nextState.memberCount;
 			}
 			if (written.kind === "unavailable") {
 				// A leave is a teardown. Refusing it would strand a member in a room they have left, so
@@ -526,11 +562,8 @@ export class ConferenceRegistry {
 	}
 
 	private localRoom(conferenceId: string, bridgeId: string, organizationId?: string): MutableRoom {
-		const existing = this.rooms.get(conferenceId);
+		const existing = this.rooms.get(organizationId)?.get(conferenceId);
 		if (existing !== undefined) {
-			if (organizationId !== undefined) {
-				existing.organizationId = organizationId;
-			}
 			return existing;
 		}
 		const room: MutableRoom = {
@@ -542,30 +575,99 @@ export class ConferenceRegistry {
 			moderatorPresent: false,
 			...(organizationId === undefined ? {} : { organizationId }),
 		};
-		this.rooms.set(conferenceId, room);
+		const organizationRooms = this.rooms.get(organizationId) ?? new Map<string, MutableRoom>();
+		organizationRooms.set(conferenceId, room);
+		this.rooms.set(organizationId, organizationRooms);
 		return room;
+	}
+
+	private localRoomIfUnambiguous(
+		conferenceId: string,
+		organizationId?: string,
+	): MutableRoom | undefined {
+		if (organizationId !== undefined) {
+			return this.rooms.get(organizationId)?.get(conferenceId);
+		}
+
+		let match: MutableRoom | undefined;
+		for (const organizationRooms of this.rooms.values()) {
+			const candidate = organizationRooms.get(conferenceId);
+			if (candidate === undefined) {
+				continue;
+			}
+			if (match !== undefined) {
+				return undefined;
+			}
+			match = candidate;
+		}
+		return match;
+	}
+
+	private deleteLocalRoom(room: MutableRoom): void {
+		const organizationRooms = this.rooms.get(room.organizationId);
+		organizationRooms?.delete(room.conferenceId);
+		if (organizationRooms?.size === 0) {
+			this.rooms.delete(room.organizationId);
+		}
+	}
+
+	private *allRooms(): IterableIterator<MutableRoom> {
+		for (const organizationRooms of this.rooms.values()) {
+			yield* organizationRooms.values();
+		}
 	}
 
 	private claimRecord(input: {
 		readonly orgId: string;
 		readonly conferenceId: string;
 		readonly bridgeId: string;
-		readonly memberCount: number;
-		readonly moderatorPresent: boolean;
 		readonly claimedAt: number;
 		readonly nowMs: number;
+		readonly current?: ConferenceClaim;
+		readonly localMemberCount: number;
+		readonly localModeratorPresent: boolean;
 	}): ConferenceClaim {
+		const contributions =
+			input.current === undefined
+				? {}
+				: { ...this.claimState(input.current, input.nowMs).contributions };
+		delete contributions[this.instanceId];
+		if (input.localMemberCount > 0) {
+			contributions[this.instanceId] = {
+				memberCount: input.localMemberCount,
+				moderatorPresent: input.localModeratorPresent,
+				expiresAt: input.nowMs + CLAIM_LEASE_MS,
+			};
+		}
 		return {
 			orgId: input.orgId,
-			instanceId: this.instanceId,
 			claimedAt: input.claimedAt,
-			heartbeatAt: input.nowMs,
-			expiresAt: input.nowMs + CLAIM_LEASE_MS,
 			conferenceId: input.conferenceId,
 			bridgeId: input.bridgeId,
-			memberCount: input.memberCount,
-			moderatorPresent: input.moderatorPresent,
+			contributions,
 		};
+	}
+
+	private claimState(
+		claim: ConferenceClaim,
+		nowMs: number,
+	): {
+		readonly contributions: ConferenceClaim["contributions"];
+		readonly memberCount: number;
+		readonly moderatorPresent: boolean;
+	} {
+		const contributions: ConferenceClaim["contributions"] = {};
+		let memberCount = 0;
+		let moderatorPresent = false;
+		for (const [instanceId, contribution] of Object.entries(claim.contributions)) {
+			if (!Number.isFinite(contribution.expiresAt) || nowMs >= contribution.expiresAt) {
+				continue;
+			}
+			contributions[instanceId] = contribution;
+			memberCount += contribution.memberCount;
+			moderatorPresent ||= contribution.moderatorPresent;
+		}
+		return { contributions, memberCount, moderatorPresent };
 	}
 
 	private releaseModeratorWaiters(room: MutableRoom): void {

@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { parseAriEvent } from "@optimiq-voice/media-ari";
 import { ROUTING_ARTIFACT_VERSION } from "@optimiq-voice/routing";
 import { makeFakeMediaPort } from "../media/media-port.fake";
+import { CHANNEL_OWNERSHIP_LEASE_MS, withChannelOwnership } from "../nats/channel-ownership";
 import { fakeQueueOrchestratorArgs } from "../queue/queue-services.fake";
 import { CallSignalBus, legSignalKey } from "../routing/call-signals";
 import { ConferenceRegistry } from "../routing/conference-registry";
@@ -10,11 +11,13 @@ import { DtmfRegistry } from "../verbs/dtmf-registry";
 import { makeVerbExecutorRuntime } from "../verbs/verb-executor";
 import { toMediaEvent } from "./ari-mapping";
 import { CallControlRegistry } from "./call-control-registry";
+import { callIdForAriChannel, legIdForAriChannel } from "./channel-identity";
 import { ChannelOrchestrator } from "./channel-orchestrator.service";
 import type { EngineEnv } from "../config/engine-env";
 import type { MediaEvent } from "../media/media-event";
 import type { CallEventPublisher } from "../nats/call-event-publisher.service";
 import type { JetStreamService } from "../nats/jetstream.service";
+import type { OriginateCallPath, OriginateService } from "../nats/originate.service";
 import type { ParkHandoffService } from "../nats/park-handoff.service";
 import type { SipTransferCallPath, SipTransferService } from "../nats/sip-transfer.service";
 import type { DidIndexSource } from "../routing/did-index.source";
@@ -90,6 +93,34 @@ function fakeSipTransfer(): {
 }
 
 /**
+ * An originate responder that keeps the call path instead of serving it.
+ *
+ * The same arrangement as {@link fakeSipTransfer} above, and for the same reason: the broker half is
+ * proven in `nats/originate.service.spec.ts` with a fake call path, and this is the other side of
+ * the seam — what the orchestrator itself does when asked to place a click-to-call.
+ */
+function fakeOriginate(): {
+	readonly service: OriginateService;
+	readonly attached: () => OriginateCallPath;
+} {
+	let attached: OriginateCallPath | undefined;
+	const service = {
+		attach: (callPath: OriginateCallPath) => {
+			attached = callPath;
+		},
+	} as unknown as OriginateService;
+	return {
+		service,
+		attached: () => {
+			if (attached === undefined) {
+				throw new Error("the orchestrator attached no originate call path");
+			}
+			return attached;
+		},
+	};
+}
+
+/**
  * The orchestrator's ROUTING behaviour: resolve on `StasisStart`, walk the plan, and enrich the
  * CDR with where the call went.
  *
@@ -121,11 +152,14 @@ function fakeEnv(overrides: Partial<EngineEnv> = {}): EngineEnv {
 		NATS_URL: "nats://localhost:4222",
 		ENGINE_ENSURE_STREAMS: false,
 		ENGINE_DRAIN_TIMEOUT_MS: 1_000,
+		ENGINE_INSTANCE_ID: "engine-test",
 		ENGINE_ROUTING_ENABLED: true,
 		ENGINE_ROUTING_RPC_TIMEOUT_MS: 2_000,
+		ENGINE_MEDIA_DRIVER: "ari",
 		ENGINE_EXTENSION_DIAL_TEMPLATE: "PJSIP/{number}",
 		ENGINE_TRUNK_DIAL_TEMPLATE: "PJSIP/{number}@{trunk}",
 		ENGINE_DEFAULT_RING_TIMEOUT_SECONDS: 30,
+		ENGINE_PROGRESS_TIMEOUT_SECONDS: 0,
 		ENGINE_PROMPT_MEDIA_PREFIX: "sound:",
 		ENGINE_UNAVAILABLE_ANNOUNCEMENT: "sound:unavailable",
 		ENGINE_VOICEMAIL_GREETING: "sound:unavailable",
@@ -200,15 +234,21 @@ interface HarnessOptions {
 	 * never has to worry about.
 	 */
 	readonly onAnswered?: () => MediaEvent;
+	/** Makes `MediaPort.originate` refuse, which is how an unregistered extension presents. */
+	readonly originateFails?: boolean;
 }
 
 function harness(options: HarnessOptions = {}) {
+	const env = fakeEnv(options.env);
 	const signals = new CallSignalBus();
 	// The orchestrator is built below but has to be reachable from the media fake, because a real
 	// media server answers by DELIVERING AN EVENT — the whole point of `ensureAnswered`.
 	const holder: { orchestrator?: ChannelOrchestrator } = {};
 	const media = makeFakeMediaPort({
 		variables: options.variables ?? { OPTIMIQ_ORG_ID: ORG },
+		...(options.originateFails === true
+			? { originateFails: () => new Error("Endpoint not found") }
+			: {}),
 		onOriginate: (request) => {
 			signals.emit(legSignalKey(request.channelId), { kind: "answered" });
 		},
@@ -229,15 +269,35 @@ function harness(options: HarnessOptions = {}) {
 	const events = {
 		publish: async (type: string, input: { data: Record<string, unknown> }) => {
 			published.push({ type, data: input.data });
-			return undefined as unknown as CallEventOf<"channel.created">;
+			return {} as CallEventOf<"channel.created">;
 		},
 	} as unknown as CallEventPublisher;
 
 	const kv = new Map<string, ChannelSnapshot>();
 	const cdrs: CdrLegWriteEnvelope[] = [];
 	const jetstream = {
-		putChannel: async (snapshot: ChannelSnapshot) => {
-			kv.set(snapshot.channelId, snapshot);
+		putChannel: async (snapshot: ChannelSnapshot, now = Date.now()) => {
+			kv.set(
+				snapshot.channelId,
+				withChannelOwnership(snapshot, env.ENGINE_INSTANCE_ID, now + CHANNEL_OWNERSHIP_LEASE_MS),
+			);
+		},
+		persistChannel: async (snapshot: ChannelSnapshot, now = Date.now()) => {
+			kv.set(
+				snapshot.channelId,
+				withChannelOwnership(snapshot, env.ENGINE_INSTANCE_ID, now + CHANNEL_OWNERSHIP_LEASE_MS),
+			);
+			return true;
+		},
+		claimChannel: async (snapshot: ChannelSnapshot, now = Date.now()) => {
+			if (kv.has(snapshot.channelId)) {
+				return "owned";
+			}
+			kv.set(
+				snapshot.channelId,
+				withChannelOwnership(snapshot, env.ENGINE_INSTANCE_ID, now + CHANNEL_OWNERSHIP_LEASE_MS),
+			);
+			return "claimed";
 		},
 		deleteChannel: async (snapshot: ChannelSnapshot) => {
 			kv.delete(snapshot.channelId);
@@ -258,9 +318,10 @@ function harness(options: HarnessOptions = {}) {
 	});
 
 	const sipTransfer = fakeSipTransfer();
+	const originate = fakeOriginate();
 
 	const orchestrator = new ChannelOrchestrator(
-		fakeEnv(options.env),
+		env,
 		media,
 		runtime,
 		dtmf,
@@ -278,6 +339,7 @@ function harness(options: HarnessOptions = {}) {
 		new CallControlRegistry(),
 		NO_PARK_HANDOFF,
 		sipTransfer.service,
+		originate.service,
 	);
 
 	holder.orchestrator = orchestrator;
@@ -290,6 +352,7 @@ function harness(options: HarnessOptions = {}) {
 		signals,
 		dtmf,
 		sipCallPath: sipTransfer.attached,
+		originatePath: originate.attached,
 	};
 }
 
@@ -664,6 +727,15 @@ describe("B-leg CDRs", () => {
 		await arrive(h);
 		const bLegChannelId = h.media.originated()[0]?.channelId as string;
 		expect(bLegChannelId).toBeDefined();
+		const bLegSnapshot = [...h.kv.values()].find(
+			(snapshot) => snapshot.variables.OPTIMIQ_LEG === "b",
+		);
+		expect(bLegSnapshot?.variables).toMatchObject({
+			OPTIMIQ_ENGINE_INSTANCE_ID: "engine-test",
+		});
+		expect(Number(bLegSnapshot?.variables.OPTIMIQ_ENGINE_OWNER_EXPIRES_AT)).toBeGreaterThan(
+			Date.now(),
+		);
 
 		// Both legs end. The B-leg first, as a callee hanging up does.
 		await h.orchestrator.handleEvent(
@@ -954,5 +1026,156 @@ describe("sip dialog correlation", () => {
 		await expect(h.sipCallPath().isDialableTarget?.(leg as ControlledLeg, "1002")).resolves.toBe(
 			true,
 		);
+	});
+});
+
+/**
+ * Click-to-call, from the orchestrator's side of `rpc.engine.v1.originate`.
+ *
+ * The dial-plan half is `originate-plan.spec.ts` and the wire half is
+ * `nats/originate.service.spec.ts`; what is only provable here is the MEDIA request — that the A-leg
+ * is created towards the extension, in this engine's Stasis application, carrying the variables the
+ * ordinary routing path needs in order to treat it as an ordinary A-leg. That last point is the
+ * whole design: everything after the phone is answered is code that already existed.
+ */
+describe("placing a click-to-call", () => {
+	const EXTENSION_ID = "0195c0f0-1c2f-7000-8000-0000000000f1";
+	const ORIGINATE_ID = "0195c0f0-1c2f-7000-8000-0000000000a7";
+
+	function clickToCallArtifact(): RoutingArtifact {
+		const base = artifactWith(
+			[...TERMINALS, extensionNode("ext:1001", "1001", EXTENSION_ID)],
+			"ext:1001",
+		);
+		return {
+			...base,
+			internal: {
+				...base.internal,
+				numbers: {
+					"1002": { number: "1002", kind: "extension", nodeId: "ext:1001" },
+				},
+			},
+			extensionsByNumber: {
+				"1001": {
+					extensionId: EXTENSION_ID,
+					number: "1001",
+					tollClass: "national",
+					enabled: true,
+					nodeId: "ext:1001",
+				},
+			},
+		} as unknown as RoutingArtifact;
+	}
+
+	function originateRequest(overrides: Record<string, unknown> = {}) {
+		return {
+			orgId: ORG,
+			originateId: ORIGINATE_ID,
+			fromExtension: "1001",
+			to: "1002",
+			...overrides,
+		} as never;
+	}
+
+	it("rings the extension first, in this engine's Stasis app, as an ordinary A-leg", async () => {
+		const h = harness({ artifact: clickToCallArtifact() });
+
+		const placement = await h.originatePath().place(originateRequest());
+
+		expect(placement.kind).toBe("placed");
+		const originated = h.media.originated()[0];
+		expect(originated?.endpoint).toBe("PJSIP/1001");
+		expect(originated?.application).toBe("optimiq-engine");
+		// The caller's handle IS the channel id, which is what makes a retry idempotent.
+		expect(originated?.channelId).toBe(ORIGINATE_ID);
+		// No `OPTIMIQ_LEG`: this leg must be filed as an A-leg and routed, not signalled as a callee.
+		expect(originated?.variables?.OPTIMIQ_LEG).toBeUndefined();
+		expect(originated?.variables?.OPTIMIQ_ORG_ID).toBe(ORG);
+		expect(originated?.variables?.OPTIMIQ_ROUTING_CONTEXT).toBe("internal");
+		// The one new surface: an ARI origination has no dialplan, so the number travels as a variable.
+		expect(originated?.variables?.OPTIMIQ_DIALED_NUMBER).toBe("1002");
+	});
+
+	it("answers with ids derived from the channel, before the phone has rung", async () => {
+		const h = harness({ artifact: clickToCallArtifact() });
+
+		const placement = await h.originatePath().place(originateRequest());
+
+		expect(placement.kind === "placed" && placement.callId).toBe(callIdForAriChannel(ORIGINATE_ID));
+		expect(placement.kind === "placed" && placement.legId).toBe(legIdForAriChannel(ORIGINATE_ID));
+	});
+
+	it("passes the ring timeout through when the caller set one", async () => {
+		const h = harness({ artifact: clickToCallArtifact() });
+
+		await h.originatePath().place(originateRequest({ ringTimeoutSeconds: 45 }));
+
+		expect(h.media.originated()[0]?.timeoutSeconds).toBe(45);
+	});
+
+	it("refuses `extension_offline` when the media server has no contact to ring", async () => {
+		const h = harness({ artifact: clickToCallArtifact(), originateFails: true });
+
+		const placement = await h.originatePath().place(originateRequest());
+
+		expect(placement.kind === "refused" && placement.reason).toBe("extension_offline");
+	});
+
+	it("refuses `unknown_extension` for a number this tenant does not have", async () => {
+		const h = harness({ artifact: clickToCallArtifact() });
+
+		const placement = await h.originatePath().place(originateRequest({ fromExtension: "9999" }));
+
+		expect(placement.kind === "refused" && placement.reason).toBe("unknown_extension");
+		expect(h.media.originated()).toHaveLength(0);
+	});
+
+	it("refuses `invalid_target` for a destination the tenant's plan does not reach", async () => {
+		const h = harness({ artifact: clickToCallArtifact() });
+
+		const placement = await h.originatePath().place(originateRequest({ to: "+15551230000" }));
+
+		expect(placement.kind === "refused" && placement.reason).toBe("invalid_target");
+		expect(h.media.originated()).toHaveLength(0);
+	});
+
+	it("refuses `internal` when the tenant has no compiled plan, rather than blaming the extension", async () => {
+		const h = harness();
+
+		const placement = await h.originatePath().place(originateRequest());
+
+		expect(placement.kind === "refused" && placement.reason).toBe("internal");
+	});
+
+	it("refuses `not_supported` on a media driver that cannot originate", async () => {
+		const h = harness({
+			artifact: clickToCallArtifact(),
+			env: { ENGINE_MEDIA_DRIVER: "mediad" },
+		});
+
+		const placement = await h.originatePath().place(originateRequest());
+
+		expect(placement.kind === "refused" && placement.reason).toBe("not_supported");
+		expect(h.media.originated()).toHaveLength(0);
+	});
+
+	it("is idempotent: a retry of a lost reply does not ring the desk twice", async () => {
+		const h = harness({ artifact: clickToCallArtifact() });
+
+		const first = await h.originatePath().place(originateRequest());
+		// The channel now exists and has reached the application, exactly as a real one would.
+		await h.orchestrator.handleEvent(
+			mediaEvent("StasisStart", {
+				channel: channel({ id: ORIGINATE_ID, dialplan: { context: "", exten: "", priority: 1 } }),
+				args: [],
+			}),
+		);
+		const second = await h.originatePath().place(originateRequest());
+
+		expect(second.kind).toBe("placed");
+		expect(second.kind === "placed" && second.callId).toBe(
+			first.kind === "placed" ? first.callId : "",
+		);
+		expect(h.media.originated()).toHaveLength(1);
 	});
 });

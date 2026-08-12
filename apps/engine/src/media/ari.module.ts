@@ -22,11 +22,10 @@ import type { MediaPort } from "./media-port";
  * behaviour it had before the variable existed — zero behaviour change by default is what makes the
  * cutover revertible by configuration rather than by a rollback.
  *
- * Both services are constructed either way, and only the selected one does anything: `MediadService`
- * skips its boot probe and its subscription when it is not selected, and `AriConnectionService` only
- * opens its socket when `main.ts` calls `start()`. Constructing both keeps the factory below a
- * one-line choice rather than a conditional provider graph, which is the thing that would make the
- * seam hard to reason about again.
+ * Both services are constructed either way, and only the selected one creates a client or starts:
+ * `MediadService` skips its boot probe and subscription when it is not selected, while
+ * `AriConnectionService` does not even construct an `AriClient` under mediad. Constructing both
+ * providers keeps the factory below a one-line choice without making mediad require ARI credentials.
  */
 @Module({
 	providers: [

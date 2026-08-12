@@ -8,6 +8,7 @@ import type { ParkClaim } from "@optimiq-voice/events";
 const LOT = { slotStart: 401, slotEnd: 403 };
 const LOT_ID = "0195c0f0-1c2f-7000-8000-0000000000f1";
 const ORG = "0195c0f0-1c2f-7000-8000-000000000001";
+const OTHER_ORG = "0195c0f0-1c2f-7000-8000-000000000002";
 const OTHER_LOT_ID = "0195c0f0-1c2f-7000-8000-0000000000f2";
 const NOW = 1_700_000_000_000;
 
@@ -21,15 +22,23 @@ function claimAt(bucket: FakeClaimBucket<ParkClaim>, slot: number): ParkClaim {
 	return held.value as ParkClaim;
 }
 
-function entry(mediaChannelId: string): Omit<ParkedCall, "slot"> {
+function entry(mediaChannelId: string, organizationId = ORG): Omit<ParkedCall, "slot"> {
 	return {
 		parkLotId: LOT_ID,
 		mediaChannelId,
 		legId: `leg-${mediaChannelId}`,
 		callId: `call-${mediaChannelId}`,
-		organizationId: ORG,
+		organizationId,
 		parkedAtMs: 1_000,
 	};
+}
+
+function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void } {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((settle) => {
+		resolve = settle;
+	});
+	return { promise, resolve };
 }
 
 async function parkedSlot(registry: ParkRegistry, channel: string): Promise<number> {
@@ -109,6 +118,20 @@ describe("claiming an orbit — single instance", () => {
 		await registry.park(LOT, { ...entry("c2"), parkLotId: OTHER_LOT_ID }, 401);
 		expect(registry.at(LOT_ID, 401)?.mediaChannelId).toBe("c1");
 		expect(registry.at(OTHER_LOT_ID, 401)?.mediaChannelId).toBe("c2");
+	});
+
+	it("keeps identical lot ids and orbit numbers separate across organizations", async () => {
+		const registry = new ParkRegistry();
+		await registry.park(LOT, entry("org-a", ORG), 401);
+		await registry.park(LOT, entry("org-b", OTHER_ORG), 401);
+
+		expect(registry.at(LOT_ID, 401, ORG)?.mediaChannelId).toBe("org-a");
+		expect(registry.at(LOT_ID, 401, OTHER_ORG)?.mediaChannelId).toBe("org-b");
+		expect(registry.at(LOT_ID, 401)).toBeUndefined();
+
+		const claimed = await registry.claim(LOT_ID, 401, ORG);
+		expect(claimed.kind === "claimed" && claimed.entry.mediaChannelId).toBe("org-a");
+		expect(registry.at(LOT_ID, 401, OTHER_ORG)?.mediaChannelId).toBe("org-b");
 	});
 });
 
@@ -206,11 +229,64 @@ describe("the shared claim", () => {
 		expect(bucket.size).toBe(0);
 	});
 
+	it("refuses retrieval and keeps the local call parked when its claim cannot be released", async () => {
+		const { registry, bucket } = shared();
+		await parkedSlot(registry, "c1");
+		bucket.failing = true;
+
+		expect(await registry.claim(LOT_ID, 401, ORG)).toMatchObject({
+			kind: "claims-unavailable",
+		});
+		expect(registry.at(LOT_ID, 401, ORG)?.mediaChannelId).toBe("c1");
+		expect(registry.forChannel("c1")?.slot).toBe(401);
+	});
+
+	it("refuses a second local retrieval while the first is releasing the shared claim", async () => {
+		const { registry, bucket } = shared();
+		await parkedSlot(registry, "c1");
+		const releaseStarted = deferred<void>();
+		const finishRelease = deferred<void>();
+		const release = bucket.release.bind(bucket);
+		bucket.release = async (key, revision) => {
+			releaseStarted.resolve();
+			await finishRelease.promise;
+			return await release(key, revision);
+		};
+
+		const first = registry.claim(LOT_ID, 401, ORG);
+		await releaseStarted.promise;
+		const second = await registry.claim(LOT_ID, 401, ORG);
+
+		expect(second).toMatchObject({ kind: "claims-unavailable" });
+		expect(registry.at(LOT_ID, 401, ORG)?.mediaChannelId).toBe("c1");
+		finishRelease.resolve();
+		expect(await first).toMatchObject({ kind: "claimed", entry: { mediaChannelId: "c1" } });
+		expect(registry.at(LOT_ID, 401, ORG)).toBeUndefined();
+	});
+
 	it("releases the key when the parked leg hangs up", async () => {
 		const { registry, bucket } = shared();
 		await parkedSlot(registry, "c1");
 		await registry.release("c1");
 		expect(bucket.size).toBe(0);
+	});
+
+	it("does not delete a newer claim when a stale local owner releases", async () => {
+		const { registry, bucket } = shared();
+		await parkedSlot(registry, "c1");
+		const key = kvKeyFor.parkClaim(ORG, LOT_ID, 401);
+		const original = bucket.entries.get(key) as { value: ParkClaim; revision: number };
+		const newer = await bucket.update(
+			key,
+			{ ...original.value, instanceId: "engine-b", mediaChannelId: "c2" },
+			original.revision,
+		);
+		expect(newer.kind).toBe("written");
+
+		await registry.release("c1");
+		expect((bucket.entries.get(key)?.value as ParkClaim | undefined)?.instanceId).toBe("engine-b");
+		expect((bucket.entries.get(key)?.value as ParkClaim | undefined)?.mediaChannelId).toBe("c2");
+		expect(registry.at(LOT_ID, 401, ORG)?.mediaChannelId).toBe("c1");
 	});
 });
 
@@ -279,6 +355,15 @@ describe("two engine instances on one bucket", () => {
 	it("still answers absent for a slot nobody holds", async () => {
 		const { b } = pair();
 		expect((await b.claim(LOT_ID, 403, ORG)).kind).toBe("absent");
+	});
+
+	it("reports claims unavailable when a remote orbit cannot be read", async () => {
+		const bucket = new FakeClaimBucket<ParkClaim>({ failing: true });
+		const registry = new ParkRegistry();
+		registry.bindClaims(bucket, "engine-b", () => NOW);
+		expect(await registry.claim(LOT_ID, 401, ORG)).toMatchObject({
+			kind: "claims-unavailable",
+		});
 	});
 
 	it("refuses to restore into an orbit another instance took in the meantime", async () => {
@@ -373,6 +458,32 @@ describe("stale claims", () => {
 		expect((await live.claim(LOT_ID, 401, ORG)).kind).toBe("absent");
 	});
 
+	it("does not discard a newer claim after a stale takeover is superseded", async () => {
+		let now = NOW;
+		const bucket = new FakeClaimBucket<ParkClaim>();
+		const dead = new ParkRegistry();
+		dead.bindClaims(bucket, "engine-dead", () => now);
+		await parkedSlot(dead, "c1");
+
+		now = NOW + CLAIM_LEASE_MS + 1;
+		const live = new ParkRegistry();
+		live.bindClaims(bucket.peer(), "engine-live", () => now);
+		expect(await live.takeOverStale({ ...entry("c1"), slot: 401 })).toBe(true);
+
+		const key = kvKeyFor.parkClaim(ORG, LOT_ID, 401);
+		const takeover = bucket.entries.get(key) as { value: ParkClaim; revision: number };
+		await bucket.update(
+			key,
+			{ ...takeover.value, instanceId: "engine-new", mediaChannelId: "c2" },
+			takeover.revision,
+		);
+		await live.discard(ORG, LOT_ID, 401);
+
+		expect((bucket.entries.get(key)?.value as ParkClaim | undefined)?.instanceId).toBe(
+			"engine-new",
+		);
+	});
+
 	it("has no stale claims to take over when claims are local", async () => {
 		const registry = new ParkRegistry();
 		expect(await registry.takeOverStale({ ...entry("c1"), slot: 401 })).toBe(false);
@@ -423,6 +534,29 @@ describe("the heartbeat", () => {
 		expect(registry.at(LOT_ID, 401)).toBeUndefined();
 	});
 
+	it("adopts a newer revision written by this same instance", async () => {
+		const bucket = new FakeClaimBucket<ParkClaim>();
+		const registry = new ParkRegistry();
+		registry.bindClaims(bucket, "engine-a", () => NOW);
+		await parkedSlot(registry, "c1");
+
+		const key = kvKeyFor.parkClaim(ORG, LOT_ID, 401);
+		const original = bucket.entries.get(key) as { value: ParkClaim; revision: number };
+		const newer = await bucket.update(
+			key,
+			{ ...original.value, heartbeatAt: NOW + 1 },
+			original.revision,
+		);
+		if (newer.kind !== "written") {
+			throw new Error(`expected a newer claim revision, got ${newer.kind}`);
+		}
+
+		expect(await registry.heartbeat()).toBe(0);
+		expect(registry.at(LOT_ID, 401, ORG)?.mediaChannelId).toBe("c1");
+		expect(await registry.heartbeat()).toBe(1);
+		expect(bucket.entries.get(key)?.revision).toBeGreaterThan(newer.revision);
+	});
+
 	it("keeps a claim it could not renew, because the lease outlives a blip", async () => {
 		const bucket = new FakeClaimBucket<ParkClaim>();
 		const registry = new ParkRegistry();
@@ -438,6 +572,18 @@ describe("the heartbeat", () => {
 		const registry = new ParkRegistry();
 		await parkedSlot(registry, "c1");
 		expect(await registry.heartbeat()).toBe(0);
+	});
+
+	it("stops heartbeating a dead channel after teardown forgets it locally", async () => {
+		const { registry, bucket } = shared();
+		await parkedSlot(registry, "c1");
+		const key = kvKeyFor.parkClaim(ORG, LOT_ID, 401);
+		const revision = bucket.entries.get(key)?.revision;
+
+		expect(registry.forgetEnded("c1")?.mediaChannelId).toBe("c1");
+		expect(registry.at(LOT_ID, 401, ORG)).toBeUndefined();
+		expect(await registry.heartbeat()).toBe(0);
+		expect(bucket.entries.get(key)?.revision).toBe(revision);
 	});
 });
 

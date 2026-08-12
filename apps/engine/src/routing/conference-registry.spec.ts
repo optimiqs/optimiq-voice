@@ -17,6 +17,7 @@ import type { ConferenceClaim } from "@optimiq-voice/events";
 
 const ROOM = "conf-1";
 const ORG = "0195c0f0-1c2f-7000-8000-000000000001";
+const OTHER_ORG = "0195c0f0-1c2f-7000-8000-000000000002";
 const NOW = 1_700_000_000_000;
 
 function member(id: string, moderator = false): ConferenceMember {
@@ -59,6 +60,30 @@ describe("joining", () => {
 		expect(
 			(await registry.join(ROOM, member("a"), { newBridgeId: "b-1", maxMembers: 1 })).kind,
 		).toBe("joined");
+	});
+
+	it("keeps identical conference ids separate across organizations in local mode", async () => {
+		const registry = new ConferenceRegistry();
+		const first = await registry.join(ROOM, member("org-a"), {
+			newBridgeId: "bridge-a",
+			maxMembers: 0,
+			organizationId: ORG,
+		});
+		const second = await registry.join(ROOM, member("org-b"), {
+			newBridgeId: "bridge-b",
+			maxMembers: 0,
+			organizationId: OTHER_ORG,
+		});
+
+		expect(first).toMatchObject({ kind: "joined", created: true });
+		expect(second).toMatchObject({ kind: "joined", created: true });
+		expect(registry.room(ROOM, ORG)?.bridgeId).toBe("bridge-a");
+		expect(registry.room(ROOM, OTHER_ORG)?.bridgeId).toBe("bridge-b");
+		expect(registry.room(ROOM)).toBeUndefined();
+
+		await registry.leave(ROOM, "org-a", ORG);
+		expect(registry.room(ROOM, ORG)).toBeUndefined();
+		expect(registry.room(ROOM, OTHER_ORG)?.members[0]?.mediaChannelId).toBe("org-b");
 	});
 });
 
@@ -312,7 +337,9 @@ describe("the conference heartbeat", () => {
 		now = NOW + 30_000;
 		expect(await registry.heartbeat()).toBe(1);
 		const claim = bucket.entries.get(kvKeyFor.conferenceClaim(ORG, ROOM))?.value as ConferenceClaim;
-		expect(claim.expiresAt).toBe(now + CLAIM_LEASE_MS);
+		// Expiry lives per contribution now — the claim is held jointly, and a top-level expiry
+		// would let one instance's silence kill a room other instances are still heartbeating.
+		expect(claim.contributions["engine-a"]?.expiresAt).toBe(now + CLAIM_LEASE_MS);
 	});
 
 	/**
@@ -351,6 +378,19 @@ describe("when a configured bucket cannot be reached", () => {
 		const joined = await registry.join(ROOM, member("a"), { newBridgeId: "b-1", ...OPTIONS });
 		expect(joined.kind).toBe("claims-unavailable");
 		expect(registry.roomCount).toBe(0);
+	});
+
+	it("does not attempt to create a room after its claim read is unavailable", async () => {
+		const bucket = new FakeClaimBucket<ConferenceClaim>({ failing: true });
+		const registry = new ConferenceRegistry();
+		registry.bindClaims(bucket, "engine-a", () => NOW);
+
+		expect(
+			await registry.join(ROOM, member("a"), { newBridgeId: "b-1", ...OPTIONS }),
+		).toMatchObject({
+			kind: "claims-unavailable",
+		});
+		expect(bucket.calls.map((call) => call.method)).toEqual(["get"]);
 	});
 
 	it("refuses a join with no organization, because there is no key to claim under", async () => {

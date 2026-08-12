@@ -670,18 +670,17 @@ export const PARK_CLAIMS_KV: KvBucketDefinition = {
  * So the first joiner `create`s the claim carrying its bridge id; a joiner who loses the create
  * reads the winner's id and joins THAT bridge. The room is one room again.
  *
- * ## Member count lives here too, and that is what makes `maxMembers` real
+ * ## Per-instance membership lives here too, and that is what makes `maxMembers` real
  *
- * A cap enforced per instance is not a cap. The count is carried in the claim and moved under
- * compare-and-set on every join and leave, so the twenty-first participant is refused wherever they
- * land. The retry loop is bounded: a join that keeps losing the CAS is a room being hammered, and
- * refusing is better than spinning on the call path.
+ * A cap enforced per instance is not a cap. Each instance contributes its count, moderator presence,
+ * and expiry under compare-and-set. Totals come from unexpired contributions, so the twenty-first
+ * participant is refused wherever they land while a crashed instance's seats are eventually freed.
  *
  * TTL matches `park-claims` for the same reason — a crashed instance's room must not survive it.
  */
 export const CONFERENCE_CLAIMS_KV: KvBucketDefinition = {
 	name: "conference-claims",
-	description: "Conference room -> agreed bridge id and member count, under compare-and-set.",
+	description: "Conference room -> agreed bridge id and leased instance contributions.",
 	ttlMs: 15 * MINUTE_MS,
 	history: 1,
 	storage: "file",

@@ -24,7 +24,12 @@ import {
 	subjectFor,
 } from "@optimiq-voice/events";
 import { getLogger } from "@optimiq-voice/logging";
-import { KvClaimBucket, UnclaimedBucket } from "./claim-store";
+import {
+	CHANNEL_OWNERSHIP_LEASE_MS,
+	channelOwnershipOf,
+	withChannelOwnership,
+} from "./channel-ownership";
+import { isConflict, KvClaimBucket, UnclaimedBucket } from "./claim-store";
 import { ENGINE_ENV } from "./nats.tokens";
 import type { EngineEnv } from "../config/engine-env";
 import type { ClaimBucket } from "./claim-store";
@@ -75,6 +80,12 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	private parkClaimsBucket: ClaimBucket<ParkClaim> = new UnclaimedBucket<ParkClaim>();
 	private conferenceClaimsBucket: ClaimBucket<ConferenceClaim> =
 		new UnclaimedBucket<ConferenceClaim>();
+	/** Last channels-KV revision this replica proved it owns, by canonical channel key. */
+	private readonly channelRevisions = new Map<string, number>();
+	/** Lease expiry written by the last acknowledged create/update for each locally-owned channel. */
+	private readonly channelLeaseExpiries = new Map<string, number>();
+	/** Serializes each channel's CAS chain so two local events cannot race on the same revision. */
+	private readonly channelOperations = new Map<string, Promise<unknown>>();
 	private ready = false;
 
 	constructor(@Inject(ENGINE_ENV) private readonly env: EngineEnv) {}
@@ -297,17 +308,46 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	 * memory; losing a write costs a failover its detail, whereas letting the rejection propagate
 	 * would abort the call the write was describing.
 	 */
-	async putChannel(snapshot: ChannelSnapshot): Promise<void> {
+	async putChannel(snapshot: ChannelSnapshot, now = Date.now()): Promise<void> {
+		await this.persistChannel(snapshot, now);
+	}
+
+	/**
+	 * Persists a channel snapshot and reports whether JetStream acknowledged it.
+	 *
+	 * Live-state mirroring may ignore the result through {@link putChannel}. Terminal reporting may
+	 * not: this is its durability barrier, and a `false` result means no CDR publish may follow.
+	 */
+	async persistChannel(snapshot: ChannelSnapshot, now = Date.now()): Promise<boolean> {
 		const kv = this.channelsKv;
 		if (kv === undefined) {
-			return;
+			return false;
 		}
 		const key = kvKeyFor.channel(snapshot.organizationId, snapshot.callId, snapshot.channelId);
-		try {
-			await kv.put(key, new TextEncoder().encode(JSON.stringify(snapshot)));
-		} catch (error) {
-			this.logger.warn({ key, err: String(error) }, "failed to mirror channel state to KV");
-		}
+		return await this.serializeChannelOperation(key, async () => {
+			const revision = this.channelRevisions.get(key);
+			if (revision === undefined) {
+				return false;
+			}
+			const expiresAt = now + CHANNEL_OWNERSHIP_LEASE_MS;
+			try {
+				const next = await kv.update(
+					key,
+					encodeChannel(withChannelOwnership(snapshot, this.env.ENGINE_INSTANCE_ID, expiresAt)),
+					revision,
+				);
+				this.rememberChannelOwnership(key, next, expiresAt);
+				return true;
+			} catch (error) {
+				if (isConflict(error)) {
+					this.forgetChannelOwnership(key);
+					this.logger.warn({ key }, "lost channel ownership while mirroring state");
+					return false;
+				}
+				this.logger.warn({ key, err: String(error) }, "failed to mirror channel state to KV");
+				return false;
+			}
+		});
 	}
 
 	/** Removes a leg from the `channels` bucket once it is destroyed. */
@@ -317,11 +357,116 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 			return;
 		}
 		const key = kvKeyFor.channel(snapshot.organizationId, snapshot.callId, snapshot.channelId);
-		try {
-			await kv.delete(key);
-		} catch (error) {
-			this.logger.warn({ key, err: String(error) }, "failed to clear channel state from KV");
+		await this.serializeChannelOperation(key, async () => {
+			const revision = this.channelRevisions.get(key);
+			if (revision === undefined) {
+				return;
+			}
+			try {
+				await kv.delete(key, { previousSeq: revision });
+				this.forgetChannelOwnership(key);
+			} catch (error) {
+				if (isConflict(error)) {
+					this.forgetChannelOwnership(key);
+					this.logger.warn({ key }, "lost channel ownership before deleting state");
+					return;
+				}
+				this.logger.warn({ key, err: String(error) }, "failed to clear channel state from KV");
+			}
+		});
+	}
+
+	/**
+	 * Atomically admits a leg into this engine instance.
+	 *
+	 * This operation uses KV `create`, which can lose, before the orchestrator creates local state.
+	 * The ownership record is also the ordinary live-state snapshot, avoiding a second bucket to
+	 * reconcile for either ARI or mediad replicas.
+	 */
+	async claimChannel(snapshot: ChannelSnapshot, now = Date.now()): Promise<ChannelClaimResult> {
+		const kv = this.channelsKv;
+		if (kv === undefined) {
+			return "unavailable";
 		}
+		const key = kvKeyFor.channel(snapshot.organizationId, snapshot.callId, snapshot.channelId);
+		return await this.serializeChannelOperation(key, async () => {
+			const expiresAt = now + CHANNEL_OWNERSHIP_LEASE_MS;
+			const owned = withChannelOwnership(snapshot, this.env.ENGINE_INSTANCE_ID, expiresAt);
+			try {
+				const revision = await kv.create(key, encodeChannel(owned));
+				this.rememberChannelOwnership(key, revision, expiresAt);
+				return "claimed";
+			} catch (error) {
+				if (isConflict(error)) {
+					return await this.adoptChannelAt(kv, key, now, false);
+				}
+				this.logger.warn(
+					{ key, err: String(error) },
+					"failed to claim a channel; admission is closed to prevent duplicate ownership",
+				);
+				return "unavailable";
+			}
+		});
+	}
+
+	/** Takes over a legacy, same-instance, or expired snapshot with one revision-fenced write. */
+	async adoptChannel(snapshot: ChannelSnapshot, now = Date.now()): Promise<ChannelClaimResult> {
+		const kv = this.channelsKv;
+		if (kv === undefined) {
+			return "unavailable";
+		}
+		const key = kvKeyFor.channel(snapshot.organizationId, snapshot.callId, snapshot.channelId);
+		return await this.serializeChannelOperation(
+			key,
+			async () => await this.adoptChannelAt(kv, key, now, true),
+		);
+	}
+
+	/** Extends one locally-owned lease while preserving its latest aggregate snapshot. */
+	async renewChannel(snapshot: ChannelSnapshot, now = Date.now()): Promise<ChannelRenewResult> {
+		const kv = this.channelsKv;
+		if (kv === undefined) {
+			return "unavailable";
+		}
+		const key = kvKeyFor.channel(snapshot.organizationId, snapshot.callId, snapshot.channelId);
+		return await this.serializeChannelOperation(key, async () => {
+			const revision = this.channelRevisions.get(key);
+			if (revision === undefined) {
+				return "lost";
+			}
+			const expiresAt = now + CHANNEL_OWNERSHIP_LEASE_MS;
+			try {
+				const next = await kv.update(
+					key,
+					encodeChannel(withChannelOwnership(snapshot, this.env.ENGINE_INSTANCE_ID, expiresAt)),
+					revision,
+				);
+				this.rememberChannelOwnership(key, next, expiresAt);
+				return "renewed";
+			} catch (error) {
+				if (isConflict(error)) {
+					this.forgetChannelOwnership(key);
+					return "lost";
+				}
+				this.logger.warn({ key, err: String(error) }, "failed to renew channel ownership");
+				return "unavailable";
+			}
+		});
+	}
+
+	/** Expiry from the last ownership write JetStream acknowledged for this local channel. */
+	ownedChannelLeaseExpiresAt(snapshot: ChannelSnapshot): number | undefined {
+		return this.channelLeaseExpiries.get(
+			kvKeyFor.channel(snapshot.organizationId, snapshot.callId, snapshot.channelId),
+		);
+	}
+
+	/** Stops this process from issuing further CAS writes after the orchestrator self-fences. */
+	async releaseChannelOwnership(snapshot: ChannelSnapshot): Promise<void> {
+		const key = kvKeyFor.channel(snapshot.organizationId, snapshot.callId, snapshot.channelId);
+		await this.serializeChannelOperation(key, async () => {
+			this.forgetChannelOwnership(key);
+		});
 	}
 
 	/** Reads a mirrored snapshot back. Used by the integration suite and by failover recovery. */
@@ -339,6 +484,118 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 			return undefined;
 		}
 		return JSON.parse(new TextDecoder().decode(entry.value)) as ChannelSnapshot;
+	}
+
+	/** Iterates the current `channels` values once so the orchestrator can rebuild its local cache. */
+	async *channelSnapshots(): AsyncGenerator<ChannelSnapshot> {
+		const kv = this.channelsKv;
+		if (kv === undefined) {
+			return;
+		}
+
+		const keys = await kv.keys();
+		for await (const key of keys) {
+			const entry = await kv.get(key);
+			if (entry === null || entry.value.length === 0) {
+				continue;
+			}
+			try {
+				const snapshot = JSON.parse(new TextDecoder().decode(entry.value)) as ChannelSnapshot;
+				const expectedKey = kvKeyFor.channel(
+					snapshot.organizationId,
+					snapshot.callId,
+					snapshot.channelId,
+				);
+				if (key !== expectedKey) {
+					throw new Error(`snapshot belongs at ${expectedKey}`);
+				}
+				yield snapshot;
+			} catch (error) {
+				this.logger.warn(
+					{ key, err: String(error) },
+					"ignored an invalid channel recovery snapshot",
+				);
+			}
+		}
+	}
+
+	private async adoptChannelAt(
+		kv: KV,
+		key: string,
+		now: number,
+		allowSameOwner: boolean,
+	): Promise<ChannelClaimResult> {
+		let current: { readonly snapshot: ChannelSnapshot; readonly revision: number } | undefined;
+		try {
+			const entry = await kv.get(key);
+			if (entry === null || entry.value.length === 0) {
+				return "owned";
+			}
+			const snapshot = JSON.parse(new TextDecoder().decode(entry.value)) as ChannelSnapshot;
+			const expectedKey = kvKeyFor.channel(
+				snapshot.organizationId,
+				snapshot.callId,
+				snapshot.channelId,
+			);
+			if (expectedKey !== key) {
+				throw new Error(`snapshot belongs at ${expectedKey}`);
+			}
+			current = { snapshot, revision: entry.revision };
+		} catch (error) {
+			this.logger.warn({ key, err: String(error) }, "failed to read a channel owner");
+			return "unavailable";
+		}
+
+		const ownership = channelOwnershipOf(current.snapshot);
+		if (
+			ownership !== undefined &&
+			ownership.expiresAt > now &&
+			(ownership.instanceId !== this.env.ENGINE_INSTANCE_ID || !allowSameOwner)
+		) {
+			return "owned";
+		}
+
+		const expiresAt = now + CHANNEL_OWNERSHIP_LEASE_MS;
+		try {
+			const revision = await kv.update(
+				key,
+				encodeChannel(
+					withChannelOwnership(current.snapshot, this.env.ENGINE_INSTANCE_ID, expiresAt),
+				),
+				current.revision,
+			);
+			this.rememberChannelOwnership(key, revision, expiresAt);
+			return "claimed";
+		} catch (error) {
+			if (isConflict(error)) {
+				return "owned";
+			}
+			this.logger.warn({ key, err: String(error) }, "failed to adopt a channel");
+			return "unavailable";
+		}
+	}
+
+	private async serializeChannelOperation<T>(key: string, operation: () => Promise<T>): Promise<T> {
+		const previous = this.channelOperations.get(key) ?? Promise.resolve();
+		const current = previous.catch(() => undefined).then(operation);
+		this.channelOperations.set(key, current);
+		try {
+			return await current;
+		} finally {
+			if (this.channelOperations.get(key) === current) {
+				this.channelOperations.delete(key);
+			}
+		}
+	}
+
+	private rememberChannelOwnership(key: string, revision: number, expiresAt: number): void {
+		this.channelRevisions.set(key, revision);
+		this.channelLeaseExpiries.set(key, expiresAt);
+	}
+
+	private forgetChannelOwnership(key: string): void {
+		this.channelRevisions.delete(key);
+		this.channelLeaseExpiries.delete(key);
 	}
 
 	/**
@@ -395,6 +652,9 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		this.agentStateKv = undefined;
 		this.parkClaimsBucket = new UnclaimedBucket<ParkClaim>();
 		this.conferenceClaimsBucket = new UnclaimedBucket<ConferenceClaim>();
+		this.channelRevisions.clear();
+		this.channelLeaseExpiries.clear();
+		this.channelOperations.clear();
 		if (connection !== undefined && !connection.isClosed()) {
 			// `drain` flushes in-flight publishes before closing; `close` would drop them, and the
 			// publishes in flight during a shutdown are precisely the CDRs of the calls being
@@ -402,4 +662,11 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 			await connection.drain();
 		}
 	}
+}
+
+export type ChannelClaimResult = "claimed" | "owned" | "unavailable";
+export type ChannelRenewResult = "renewed" | "lost" | "unavailable";
+
+function encodeChannel(snapshot: ChannelSnapshot): Uint8Array {
+	return new TextEncoder().encode(JSON.stringify(snapshot));
 }

@@ -414,6 +414,22 @@ describe("retrieval", () => {
 		});
 	});
 
+	it("does not bridge when the shared claim cannot be released", async () => {
+		const bucket = new FakeClaimBucket<ParkClaim>();
+		const caller = fakeLeg("c");
+		const retriever = fakeLeg("r");
+		const h = harness({ legs: [caller, retriever], claims: bucket });
+		await h.control.park(caller);
+		bucket.failing = true;
+
+		const result = await h.control.unpark(retriever, { orbit: "401" });
+
+		expect(result).toMatchObject({ ok: false });
+		expect((result as { readonly reason: string }).reason).toContain("cannot be claimed right now");
+		expect(h.media.methods()).toEqual(["startMusicOnHold"]);
+		expect(h.parks.at(LOT.parkLotId, 401, ORG)?.mediaChannelId).toBe("c");
+	});
+
 	it("refuses a retrieval with no orbit and one outside every lot", async () => {
 		const h = harness();
 		expect((await h.control.unpark(fakeLeg("r"))).ok).toBe(false);
@@ -1286,6 +1302,24 @@ describe("teardown", () => {
 			reason: "abandoned",
 			slot: "401",
 		});
+	});
+
+	it("forgets an ended parked channel locally when its fenced release cannot be confirmed", async () => {
+		const caller = fakeLeg("c");
+		const bucket = new FakeClaimBucket<ParkClaim>();
+		const h = harness({ legs: [caller], claims: bucket });
+		await h.control.park(caller);
+		const key = kvKeyFor.parkClaim(ORG, LOT.parkLotId, 401);
+		const revision = bucket.entries.get(key)?.revision;
+		bucket.failing = true;
+
+		await h.control.onLegEnded("c");
+
+		expect(h.parks.forChannel("c")).toBeUndefined();
+		expect(h.parks.parkedCount).toBe(0);
+		bucket.failing = false;
+		expect(await h.parks.heartbeat()).toBe(0);
+		expect(bucket.entries.get(key)?.revision).toBe(revision);
 	});
 
 	it("forgets a held leg", async () => {

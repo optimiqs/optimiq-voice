@@ -29,6 +29,7 @@ import type { QueuePlanNode } from "@optimiq-voice/routing";
 
 const ORG = "0195c0f0-1c2f-7000-8000-000000000001";
 const CALL_ID = "0195c0f0-1c2f-7000-8000-0000000000c1";
+const OTHER_CALL_ID = "0195c0f0-1c2f-7000-8000-0000000000c2";
 const LEG_ID = "0195c0f0-1c2f-7000-8000-0000000000a1";
 const START = Date.parse("2026-08-05T12:00:00.000Z");
 
@@ -48,6 +49,13 @@ interface HarnessOptions {
 	readonly dials?: readonly DialScript[];
 	readonly bridgeFails?: boolean;
 	readonly answerFails?: boolean;
+	readonly stopMusicThrows?: boolean;
+	readonly dialThrows?: boolean;
+	readonly onCallTransitionFails?: boolean;
+	/** Number of release writes and their confirming reads that report broker unavailability. */
+	readonly releaseFailures?: number;
+	readonly wrapUpFailures?: number;
+	readonly afterCallAvailableFailures?: number;
 	/** Iterations of the wait loop before the fake pulls the caller. Guards a runaway. */
 	readonly budget?: number;
 }
@@ -59,6 +67,8 @@ interface Harness {
 	readonly dialled: QueueDialAttempt[][];
 	readonly notes: string[];
 	readonly clock: { now: number };
+	readonly scheduledReleaseRetries: readonly { readonly delayMs: number }[];
+	runNextReleaseRetry(): Promise<void>;
 	/** Fires the wrap-up hook the bridge registered, as the agent leg's death would. */
 	endAgentLeg(): void;
 }
@@ -81,6 +91,67 @@ function harness(options: HarnessOptions = {}): Harness {
 	for (const agent of agents) {
 		services.agents.seed(agent.agentId, options.seed?.[agent.agentId] ?? "available");
 	}
+	if (options.onCallTransitionFails === true) {
+		const transition = services.agents.transition;
+		services.agents.transition = async (request) =>
+			request.to === "on-call" ? undefined : transition(request);
+	}
+	let remainingReleaseFailures = options.releaseFailures ?? 0;
+	let releaseReadUnavailable = false;
+	if (remainingReleaseFailures > 0) {
+		const transition = services.agents.transition;
+		services.agents.transition = async (request) => {
+			if (
+				(request.to === "available" || request.to === "unavailable") &&
+				remainingReleaseFailures > 0
+			) {
+				remainingReleaseFailures -= 1;
+				releaseReadUnavailable = true;
+				return undefined;
+			}
+			return transition(request);
+		};
+		const readState = services.agents.readState;
+		services.agents.readState = async (orgId, agentId) => {
+			if (releaseReadUnavailable) {
+				releaseReadUnavailable = false;
+				return { kind: "unavailable" };
+			}
+			return readState(orgId, agentId);
+		};
+	}
+	let remainingWrapUpFailures = options.wrapUpFailures ?? 0;
+	let remainingAfterCallAvailableFailures = options.afterCallAvailableFailures ?? 0;
+	if (remainingWrapUpFailures > 0 || remainingAfterCallAvailableFailures > 0) {
+		const transition = services.agents.transition;
+		services.agents.transition = async (request) => {
+			const current = services.agents.entries.get(request.agentId);
+			const failWrapUp = request.to === "wrap-up" && remainingWrapUpFailures > 0;
+			const failAvailable =
+				request.to === "available" &&
+				(current?.status === "on-call" || current?.status === "wrap-up") &&
+				remainingAfterCallAvailableFailures > 0;
+			if (failWrapUp) {
+				remainingWrapUpFailures -= 1;
+				releaseReadUnavailable = true;
+				return undefined;
+			}
+			if (failAvailable) {
+				remainingAfterCallAvailableFailures -= 1;
+				releaseReadUnavailable = true;
+				return undefined;
+			}
+			return transition(request);
+		};
+		const readState = services.agents.readState;
+		services.agents.readState = async (orgId, agentId) => {
+			if (releaseReadUnavailable) {
+				releaseReadUnavailable = false;
+				return { kind: "unavailable" };
+			}
+			return readState(orgId, agentId);
+		};
+	}
 
 	const timeline: string[] = [];
 	const notes: string[] = [];
@@ -89,6 +160,10 @@ function harness(options: HarnessOptions = {}): Harness {
 	const state = { tearingDown: false, iterations: 0 };
 	const budget = options.budget ?? 20;
 	let onAgentLegEnded: (() => void) | undefined;
+	const scheduledReleaseRetries: {
+		readonly delayMs: number;
+		readonly run: () => Promise<void>;
+	}[] = [];
 
 	const call: QueueCallPort = {
 		get isTearingDown(): boolean {
@@ -111,10 +186,16 @@ function harness(options: HarnessOptions = {}): Harness {
 		},
 		stopMusicOnHold: async () => {
 			timeline.push("moh:stop");
+			if (options.stopMusicThrows === true) {
+				throw new Error("stop MOH failed");
+			}
 		},
 		dial: async (attempts, fanOut, ringTimeoutSeconds): Promise<QueueDialOutcome> => {
 			dialled.push([...attempts]);
 			timeline.push(`dial:${fanOut}:${attempts.map((a) => a.agentId).join(",")}`);
+			if (options.dialThrows === true) {
+				throw new Error("dial failed");
+			}
 			const step = (script.length > 1 ? script.shift() : script[0]) ?? { kind: "no-answer" };
 			// Ringing takes time. A fake that answered in zero milliseconds would make every wait
 			// statistic in these specs read as 0 and hide the one thing `caller.answered` is for.
@@ -143,6 +224,9 @@ function harness(options: HarnessOptions = {}): Harness {
 				}
 			}
 		},
+		hangupAnsweredAgent: async (mediaChannelId) => {
+			timeline.push(`hangup:${mediaChannelId}`);
+		},
 		bridge: async (mediaChannelId, onEnded) => {
 			timeline.push(`bridge:${mediaChannelId}`);
 			onAgentLegEnded = onEnded;
@@ -170,12 +254,23 @@ function harness(options: HarnessOptions = {}): Harness {
 			pollIntervalMs: 1_000,
 			agentRingTimeoutSeconds: 20,
 			random: () => 0,
+			scheduleReleaseRetry: (callback, delayMs) => {
+				scheduledReleaseRetries.push({ delayMs, run: callback });
+			},
 		}),
 		services,
 		timeline,
 		dialled,
 		notes,
 		clock,
+		scheduledReleaseRetries,
+		runNextReleaseRetry: async () => {
+			const retry = scheduledReleaseRetries.shift();
+			if (retry === undefined) {
+				throw new Error("no release retry is scheduled");
+			}
+			await retry.run();
+		},
 		endAgentLeg: () => {
 			onAgentLegEnded?.();
 		},
@@ -188,6 +283,12 @@ function eventTypes(h: Harness): string[] {
 
 function eventData(h: Harness, type: string): Record<string, unknown> | undefined {
 	return h.services.events.recorded.find((event) => event.type === type)?.data;
+}
+
+async function settleAgentLegHook(): Promise<void> {
+	await new Promise((resolve) => {
+		setTimeout(resolve, 0);
+	});
 }
 
 // =================================================================================================
@@ -303,6 +404,103 @@ describe("distributing to agents", () => {
 		await h.session.run();
 		const first = h.services.agents.transitions[0];
 		expect(first).toMatchObject({ agentId: "a", from: "available", to: "ringing" });
+	});
+
+	it("adopts an expired wrap-up reservation left by an old process", async () => {
+		const h = harness({ agents: [fakeAgent("a")], dials: [{ kind: "answer" }] });
+		h.services.agents.seed("a", "wrap-up", {
+			callId: OTHER_CALL_ID,
+			availableAt: new Date(START - 1).toISOString(),
+		});
+
+		const outcome = await h.session.run();
+
+		expect(outcome).toMatchObject({ kind: "answered", agentId: "a" });
+		expect(h.services.agents.transitions[0]).toMatchObject({
+			agentId: "a",
+			from: "wrap-up",
+			to: "ringing",
+			callId: CALL_ID,
+		});
+	});
+
+	it("releases the reserved agent when stopping music throws", async () => {
+		const h = harness({ stopMusicThrows: true });
+		const outcome = await h.session.run();
+		expect(outcome.kind).toBe("failed");
+		expect(h.services.agents.statusOf("a")).toBe("available");
+		expect(h.services.agents.transitions).toContainEqual({
+			agentId: "a",
+			from: "ringing",
+			to: "available",
+			callId: CALL_ID,
+		});
+	});
+
+	it("releases the reserved agent when dial throws", async () => {
+		const h = harness({ dialThrows: true });
+		const outcome = await h.session.run();
+		expect(outcome.kind).toBe("failed");
+		expect(h.services.agents.statusOf("a")).toBe("available");
+		expect(h.services.agents.transitions).toContainEqual({
+			agentId: "a",
+			from: "ringing",
+			to: "available",
+			callId: CALL_ID,
+		});
+	});
+
+	it("retains and retries a reservation after transient KV unavailability", async () => {
+		const h = harness({
+			agents: [fakeAgent("a")],
+			dials: [{ kind: "caller-gone" }],
+			releaseFailures: 1,
+		});
+
+		await h.session.run();
+		expect(h.services.agents.statusOf("a")).toBe("ringing");
+		expect(h.scheduledReleaseRetries.map((retry) => retry.delayMs)).toEqual([250]);
+
+		await h.runNextReleaseRetry();
+		expect(h.services.agents.statusOf("a")).toBe("available");
+		expect(h.scheduledReleaseRetries).toEqual([]);
+	});
+
+	it("uses one capped-backoff loop across repeated release failures", async () => {
+		const h = harness({
+			agents: [fakeAgent("a")],
+			dials: [{ kind: "caller-gone" }],
+			releaseFailures: 8,
+		});
+
+		await h.session.run();
+		const delays: number[] = [];
+		while (h.scheduledReleaseRetries.length > 0) {
+			expect(h.scheduledReleaseRetries).toHaveLength(1);
+			delays.push(h.scheduledReleaseRetries[0]?.delayMs as number);
+			await h.runNextReleaseRetry();
+		}
+
+		expect(delays).toEqual([250, 500, 1_000, 2_000, 4_000, 5_000, 5_000, 5_000]);
+		expect(h.services.agents.statusOf("a")).toBe("available");
+	});
+
+	it("stops retrying without overwriting a reservation now owned by another call", async () => {
+		const h = harness({
+			agents: [fakeAgent("a")],
+			dials: [{ kind: "caller-gone" }],
+			releaseFailures: 1,
+		});
+
+		await h.session.run();
+		h.services.agents.seed("a", "ringing", { callId: OTHER_CALL_ID });
+		await h.runNextReleaseRetry();
+
+		expect(h.services.agents.entries.get("a")).toMatchObject({
+			status: "ringing",
+			callId: OTHER_CALL_ID,
+		});
+		expect(h.scheduledReleaseRetries).toEqual([]);
 	});
 
 	it("skips an agent nobody has logged in", async () => {
@@ -452,6 +650,16 @@ describe("an agent answers", () => {
 		expect(h.timeline.indexOf("bridge:media-a")).toBeGreaterThan(-1);
 	});
 
+	it("hangs up the answered leg and does not publish or bridge when on-call promotion fails", async () => {
+		const h = harness({ dials: [{ kind: "answer" }], onCallTransitionFails: true });
+		const outcome = await h.session.run();
+		expect(outcome.kind).toBe("failed");
+		expect(eventTypes(h)).toEqual(["caller.joined"]);
+		expect(h.timeline).toContain("hangup:media-a");
+		expect(h.timeline.some((entry) => entry.startsWith("bridge:"))).toBe(false);
+		expect(h.services.agents.statusOf("a")).toBe("available");
+	});
+
 	it("publishes caller.answered with the wait the caller actually experienced", async () => {
 		const h = harness({ dials: [{ kind: "no-answer" }, { kind: "answer" }] });
 		const outcome = await h.session.run();
@@ -494,6 +702,65 @@ describe("an agent answers", () => {
 // =================================================================================================
 
 describe("wrap-up", () => {
+	it("retries a transient on-call-to-wrap-up failure before starting its deadline", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 5 })],
+			dials: [{ kind: "answer" }],
+			wrapUpFailures: 1,
+		});
+		await h.session.run();
+		h.endAgentLeg();
+		await settleAgentLegHook();
+
+		expect(h.services.agents.statusOf("a")).toBe("on-call");
+		expect(h.scheduledReleaseRetries.map((retry) => retry.delayMs)).toEqual([250]);
+		await h.runNextReleaseRetry();
+		await Promise.resolve();
+
+		expect(h.services.agents.transitions.some((transition) => transition.to === "wrap-up")).toBe(
+			true,
+		);
+		expect(h.services.agents.statusOf("a")).toBe("available");
+	});
+
+	it("retries repeated wrap-up-to-available failures with capped backoff", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 5 })],
+			dials: [{ kind: "answer" }],
+			afterCallAvailableFailures: 8,
+		});
+		await h.session.run();
+		h.endAgentLeg();
+		await settleAgentLegHook();
+
+		const delays: number[] = [];
+		while (h.scheduledReleaseRetries.length > 0) {
+			expect(h.scheduledReleaseRetries).toHaveLength(1);
+			delays.push(h.scheduledReleaseRetries[0]?.delayMs as number);
+			await h.runNextReleaseRetry();
+		}
+
+		expect(delays).toEqual([250, 500, 1_000, 2_000, 4_000, 5_000, 5_000, 5_000]);
+		expect(h.services.agents.statusOf("a")).toBe("available");
+	});
+
+	it("retries a transient direct on-call-to-available failure", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 0 })],
+			membership: { wrapUpSeconds: 0 },
+			dials: [{ kind: "answer" }],
+			afterCallAvailableFailures: 1,
+		});
+		await h.session.run();
+		h.endAgentLeg();
+		await settleAgentLegHook();
+
+		expect(h.services.agents.statusOf("a")).toBe("on-call");
+		expect(h.scheduledReleaseRetries.map((retry) => retry.delayMs)).toEqual([250]);
+		await h.runNextReleaseRetry();
+		expect(h.services.agents.statusOf("a")).toBe("available");
+	});
+
 	it("puts the agent into wrap-up with a deadline when their call ends", async () => {
 		const h = harness({
 			agents: [fakeAgent("a", { wrapUpSeconds: 15 })],

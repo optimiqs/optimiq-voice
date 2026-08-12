@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { HealthController } from "./health.controller";
 import type { ChannelOrchestrator } from "../calls/channel-orchestrator.service";
 import type { AriConnectionService } from "../media/ari-connection.service";
+import type { MediadService } from "../media/mediad.service";
 import type { JetStreamService } from "../nats/jetstream.service";
 import type { ParkHandoffService } from "../nats/park-handoff.service";
 import type { FastifyReply } from "fastify";
@@ -18,6 +19,9 @@ const PARK_SUBJECT = "rpc.engine.v1.park-handoff.engine-a";
 
 interface Parts {
 	readonly ariConnected?: boolean;
+	readonly mediaDriver?: "ari" | "mediad";
+	readonly mediadReady?: boolean;
+	readonly mediadReachable?: boolean;
 	readonly natsReady?: boolean;
 	readonly draining?: boolean;
 	readonly parkListening?: boolean;
@@ -32,6 +36,13 @@ function harness(parts: Parts = {}) {
 		asteriskVersion: "22.9.0",
 		eventCount: 41,
 	} as unknown as AriConnectionService;
+	const mediad = {
+		isSelected: parts.mediaDriver === "mediad",
+		isReady: parts.mediadReady ?? true,
+		isReachable: parts.mediadReachable ?? true,
+		subscriptionState: (parts.mediadReady ?? true) ? "subscribed" : "idle",
+		eventCount: 12,
+	} as unknown as MediadService;
 
 	const jetstream = {
 		isReady: parts.natsReady ?? true,
@@ -56,7 +67,7 @@ function harness(parts: Parts = {}) {
 		},
 	} as unknown as FastifyReply;
 
-	const controller = new HealthController(ari, jetstream, orchestrator, parkHandoff);
+	const controller = new HealthController(ari, mediad, jetstream, orchestrator, parkHandoff);
 	return { controller, reply, statuses };
 }
 
@@ -75,6 +86,30 @@ describe("/healthz", () => {
 		const report = h.controller.health(h.reply);
 
 		expect(report.park).toEqual({ listening: true, subject: PARK_SUBJECT, served: 7 });
+	});
+
+	it("uses mediad readiness and ignores the intentionally idle ARI socket", () => {
+		const h = harness({ mediaDriver: "mediad", mediadReady: true, ariConnected: false });
+		const report = h.controller.health(h.reply);
+
+		expect(report.status).toBe("ok");
+		expect(report.media).toEqual({ driver: "mediad", ready: true });
+		expect(report.ari.connected).toBe(false);
+		expect(report.mediad).toEqual({
+			reachable: true,
+			subscription: "subscribed",
+			eventsReceived: 12,
+		});
+		expect(h.statuses).toEqual([]);
+	});
+
+	it("reports degraded when the selected mediad feed is not ready", () => {
+		const h = harness({ mediaDriver: "mediad", mediadReady: false, ariConnected: true });
+		const report = h.controller.health(h.reply);
+
+		expect(report.status).toBe("degraded");
+		expect(report.media).toEqual({ driver: "mediad", ready: false });
+		expect(h.statuses).toEqual([503]);
 	});
 
 	it("stays ok when no park-handoff responder is listening", () => {

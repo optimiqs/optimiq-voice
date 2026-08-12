@@ -107,6 +107,8 @@ export interface QueueCallPort {
 		fanOut: "one" | "all",
 		ringTimeoutSeconds: number,
 	): Promise<QueueDialOutcome>;
+	/** Ends an answered agent leg that this queue could not claim, through the leg teardown hooks. */
+	hangupAnsweredAgent(mediaChannelId: string): Promise<void>;
 	/** Joins the caller to an answered agent leg. `onEnded` fires when that leg goes away. */
 	bridge(mediaChannelId: string, onEnded: () => void): Promise<boolean>;
 	/** A prompt id as a playable media reference, or `undefined` when it resolves to nothing. */
@@ -130,7 +132,8 @@ export interface AgentTransitionRequest {
 	readonly agentId: string;
 	readonly to: AgentStateEntry["status"];
 	readonly queueId: string;
-	readonly callId?: string;
+	/** The call that owns this state-machine step and every cleanup step that follows it. */
+	readonly callId: string;
 	readonly legId?: string;
 	/** Not eligible again before this instant. Wrap-up and the penalty delays both set it. */
 	readonly availableAt?: number;
@@ -139,13 +142,28 @@ export interface AgentTransitionRequest {
 	readonly reason?: string;
 }
 
+export interface AgentReservationRequest extends AgentTransitionRequest {
+	readonly to: "ringing";
+	/** The eligibility instant used to adopt an expired wrap-up entry. */
+	readonly now: number;
+}
+
+export type AgentStateRead =
+	| { readonly kind: "found"; readonly entry: AgentStateEntry }
+	| { readonly kind: "absent" }
+	| { readonly kind: "unavailable" };
+
 export interface AgentStatePort {
 	/** Live state for every agent on a roster. Missing ids mean "never seen", not "available". */
 	readStates(orgId: string, agentIds: readonly string[]): Promise<Map<string, AgentStateEntry>>;
+	/** A point read that distinguishes confirmed absence from an unreadable bucket. */
+	readState(orgId: string, agentId: string): Promise<AgentStateRead>;
+	/** CAS-reserves an available agent or atomically adopts an expired wrap-up entry. */
+	reserve(request: AgentReservationRequest): Promise<AgentStateEntry | undefined>;
 	/**
 	 * Applies a transition, guard-first. Returns the written entry, or `undefined` when the machine
-	 * refused it or the write failed — both of which the session treats as "this agent is not
-	 * mine to ring", never as success.
+	 * refused it or the write failed. Reservation cleanup must follow `undefined` with `readState`:
+	 * only a confirmed absence or ownership change makes a failed release complete.
 	 */
 	transition(request: AgentTransitionRequest): Promise<AgentStateEntry | undefined>;
 }
@@ -212,12 +230,20 @@ export interface QueueSessionSettings {
 	readonly agentRingTimeoutSeconds: number;
 	/** Injected so `random` is deterministic in a spec. */
 	readonly random: () => number;
+	/** Injected so release retries are deterministic without making production timers ref the process. */
+	readonly scheduleReleaseRetry: (callback: () => Promise<void>, delayMs: number) => void;
 }
 
 export const DEFAULT_QUEUE_SESSION_SETTINGS: QueueSessionSettings = {
 	pollIntervalMs: 1_000,
 	agentRingTimeoutSeconds: 20,
 	random: Math.random,
+	scheduleReleaseRetry: (callback, delayMs) => {
+		const timer = setTimeout(() => {
+			void callback();
+		}, delayMs);
+		timer.unref?.();
+	},
 };
 
 export type QueueOutcome =
@@ -237,11 +263,28 @@ export type QueueOutcome =
 	| { readonly kind: "failed"; readonly reason: string };
 
 const MILLIS_PER_SECOND = 1_000;
+const RELEASE_RETRY_INITIAL_MS = 250;
+const RELEASE_RETRY_MAX_MS = 5_000;
+
+interface AgentRelease {
+	readonly candidate: QueueCandidate;
+	readonly request: AgentTransitionRequest;
+}
+
+type OwnedTransitionResult = "succeeded" | "ownership-changed" | "retry";
+
+interface OwnedTransitionRetry {
+	readonly request: AgentTransitionRequest;
+	readonly promise: Promise<boolean>;
+	readonly resolve: (succeeded: boolean) => void;
+}
 
 export class QueueSession {
 	private readonly settings: QueueSessionSettings;
 	/** Agents this caller has already rung, and when they may be rung again. */
 	private readonly tried = new Map<string, number>();
+	/** At most one owned-state retry loop per agent in this session. */
+	private readonly transitionRetries = new Map<string, OwnedTransitionRetry>();
 	/** The frozen order `sequential` walks; computed on the first pass and never recomputed. */
 	private frozenOrder: readonly string[] | undefined;
 	private joinedAt = 0;
@@ -439,73 +482,82 @@ export class QueueSession {
 	 *
 	 * Returns `undefined` when the caller is still waiting — the loop's signal to try again.
 	 *
-	 * Agents are moved to `ringing` BEFORE the originate. That ordering is what stops two engine
-	 * instances distributing the same agent to two callers at once: the second instance's read sees
-	 * `ringing` and skips them. It is not a lock (KV `put` is last-writer-wins, not compare-and-set),
-	 * and the residual race is one double-ring, which the agent's phone rejects with `USER_BUSY` —
-	 * an outcome this loop already handles. A true reservation needs a compare-and-set on the entry's
-	 * revision, which is a follow-up.
+	 * Agents are moved to `ringing` BEFORE the originate. The state port applies that transition with
+	 * a revision-conditional write, so two engine instances racing from the same `available` revision
+	 * have exactly one winner. A refused write simply removes that candidate from this offer.
 	 */
 	private async offer(
 		membership: QueueMembership,
 		candidates: readonly QueueCandidate[],
 	): Promise<QueueOutcome | undefined> {
 		const reserved: QueueCandidate[] = [];
-		for (const candidate of candidates) {
-			const written = await this.services.agents.transition({
-				orgId: this.call.organizationId,
-				agentId: candidate.agent.agentId,
-				to: "ringing",
-				queueId: this.node.queueId,
-				callId: this.call.callId,
-				legId: this.call.callerLegId,
-			});
-			if (written !== undefined) {
-				reserved.push(candidate);
+		const pending = new Map<string, QueueCandidate>();
+		try {
+			for (const candidate of candidates) {
+				const written = await this.services.agents.reserve({
+					orgId: this.call.organizationId,
+					agentId: candidate.agent.agentId,
+					to: "ringing",
+					queueId: this.node.queueId,
+					callId: this.call.callId,
+					legId: this.call.callerLegId,
+					now: this.call.now(),
+				});
+				if (
+					(written?.previousStatus === "available" || written?.previousStatus === "wrap-up") &&
+					written.callId === this.call.callId
+				) {
+					reserved.push(candidate);
+					pending.set(candidate.agent.agentId, candidate);
+				}
 			}
-		}
 
-		if (reserved.length === 0) {
-			// Every candidate was taken between the read and the write. Not an error; the next pass
-			// sees the newer state. A short back-off stops this becoming a spin.
-			await this.call.delay(this.settings.pollIntervalMs);
+			if (reserved.length === 0) {
+				// Every candidate was taken between the read and the write. Not an error; the next pass
+				// sees the newer state. A short back-off stops this becoming a spin.
+				await this.call.delay(this.settings.pollIntervalMs);
+				return undefined;
+			}
+
+			await this.call.stopMusicOnHold();
+
+			const outcome = await this.call.dial(
+				reserved.map((candidate) => ({
+					agentId: candidate.agent.agentId,
+					endpoint: candidate.agent.contact,
+					label: `queue agent ${candidate.agent.name}`,
+					destinationNumber: candidate.agent.contact,
+					timeoutSeconds: this.settings.agentRingTimeoutSeconds,
+				})),
+				candidates.length > 1 || this.node.strategy === "ring-all" ? "all" : "one",
+				this.settings.agentRingTimeoutSeconds,
+			);
+
+			switch (outcome.kind) {
+				case "answered": {
+					return await this.answered(membership, pending, outcome.agentId, outcome.mediaChannelId);
+				}
+				case "aborted": {
+					await this.releaseAll(pending, undefined);
+					return await this.abandon("caller-hangup");
+				}
+				case "failed": {
+					await this.releaseAll(pending, outcome.cause);
+					break;
+				}
+				default: {
+					await this.releaseAll(pending, "NO_ANSWER");
+					break;
+				}
+			}
+
+			await this.startMusic();
 			return undefined;
+		} finally {
+			// Any exception after reservation leaves every still-ringing agent eligible again. Entries
+			// already settled above are removed from `pending`, so normal penalties are not overwritten.
+			await this.releaseAll(pending, undefined);
 		}
-
-		await this.call.stopMusicOnHold();
-
-		const outcome = await this.call.dial(
-			reserved.map((candidate) => ({
-				agentId: candidate.agent.agentId,
-				endpoint: candidate.agent.contact,
-				label: `queue agent ${candidate.agent.name}`,
-				destinationNumber: candidate.agent.contact,
-				timeoutSeconds: this.settings.agentRingTimeoutSeconds,
-			})),
-			candidates.length > 1 || this.node.strategy === "ring-all" ? "all" : "one",
-			this.settings.agentRingTimeoutSeconds,
-		);
-
-		switch (outcome.kind) {
-			case "answered": {
-				return await this.answered(membership, reserved, outcome.agentId, outcome.mediaChannelId);
-			}
-			case "aborted": {
-				await this.releaseAll(reserved, undefined);
-				return await this.abandon("caller-hangup");
-			}
-			case "failed": {
-				await this.releaseAll(reserved, outcome.cause);
-				break;
-			}
-			default: {
-				await this.releaseAll(reserved, "NO_ANSWER");
-				break;
-			}
-		}
-
-		await this.startMusic();
-		return undefined;
 	}
 
 	/**
@@ -523,13 +575,13 @@ export class QueueSession {
 	 */
 	private async answered(
 		membership: QueueMembership,
-		reserved: readonly QueueCandidate[],
+		reserved: Map<string, QueueCandidate>,
 		agentId: string,
 		mediaChannelId: string,
 	): Promise<QueueOutcome> {
 		const waitMs = this.waitedMs();
 
-		await this.services.agents.transition({
+		const onCall = await this.services.agents.transition({
 			orgId: this.call.organizationId,
 			agentId,
 			to: "on-call",
@@ -538,19 +590,21 @@ export class QueueSession {
 			legId: this.call.callerLegId,
 			noAnswerCount: 0,
 		});
+		if (
+			onCall === undefined ||
+			onCall.previousStatus !== "ringing" ||
+			onCall.callId !== this.call.callId
+		) {
+			await this.call.hangupAnsweredAgent(mediaChannelId);
+			return {
+				kind: "failed",
+				reason: "the answering agent could not be moved from ringing to on-call",
+			};
+		}
+		reserved.delete(agentId);
 		this.services.cursor.remember(this.call.organizationId, this.node.queueId, agentId);
 
-		for (const candidate of reserved) {
-			if (candidate.agent.agentId === agentId) {
-				continue;
-			}
-			await this.services.agents.transition({
-				orgId: this.call.organizationId,
-				agentId: candidate.agent.agentId,
-				to: "available",
-				queueId: this.node.queueId,
-			});
-		}
+		await this.releaseAll(reserved, undefined);
 
 		await this.services.events.callerAnswered({
 			orgId: this.call.organizationId,
@@ -588,30 +642,45 @@ export class QueueSession {
 	 * `maxNoAnswer` is the escape hatch: an agent who rings out that many times consecutively is
 	 * taken out of distribution entirely, because every further attempt costs the NEXT caller a full
 	 * ring timeout. Bringing them back is a login, which is the control plane's.
+	 *
+	 * A failed write does not forget the reservation. One unref'd retry loop keeps the original
+	 * request (and therefore the original penalty deadline) until the write succeeds or a fresh read
+	 * proves another call owns the entry.
 	 */
 	private async releaseAll(
-		reserved: readonly QueueCandidate[],
+		reserved: Map<string, QueueCandidate>,
 		cause: HangupCause | undefined,
 	): Promise<void> {
-		for (const candidate of reserved) {
-			await this.release(candidate, cause);
+		for (const [agentId, candidate] of reserved) {
+			if (this.transitionRetries.has(agentId)) {
+				continue;
+			}
+			const release = this.releaseFor(candidate, cause);
+			if (await this.release(release)) {
+				reserved.delete(agentId);
+			} else {
+				this.scheduleReleaseRetry(reserved, release, RELEASE_RETRY_INITIAL_MS);
+			}
 		}
 	}
 
-	private async release(candidate: QueueCandidate, cause: HangupCause | undefined): Promise<void> {
+	private releaseFor(candidate: QueueCandidate, cause: HangupCause | undefined): AgentRelease {
 		const agent = candidate.agent;
-		const now = this.call.now();
 
 		if (cause === undefined) {
-			await this.services.agents.transition({
-				orgId: this.call.organizationId,
-				agentId: agent.agentId,
-				to: "available",
-				queueId: this.node.queueId,
-			});
-			return;
+			return {
+				candidate,
+				request: {
+					orgId: this.call.organizationId,
+					agentId: agent.agentId,
+					to: "available",
+					queueId: this.node.queueId,
+					callId: this.call.callId,
+				},
+			};
 		}
 
+		const now = this.call.now();
 		const delaySeconds = penaltySecondsFor(cause, agent);
 		const noAnswerCount =
 			cause === "USER_BUSY" ? undefined : (candidate.state.noAnswerCount ?? 0) + 1;
@@ -626,25 +695,52 @@ export class QueueSession {
 			this.call.note(
 				`queue agent ${agent.name} reached ${String(agent.maxNoAnswer)} consecutive no-answers and was taken out of distribution`,
 			);
-			await this.services.agents.transition({
-				orgId: this.call.organizationId,
-				agentId: agent.agentId,
-				to: "unavailable",
-				queueId: this.node.queueId,
-				noAnswerCount,
-				reason: "max-no-answer",
-			});
-			return;
+			return {
+				candidate,
+				request: {
+					orgId: this.call.organizationId,
+					agentId: agent.agentId,
+					to: "unavailable",
+					queueId: this.node.queueId,
+					callId: this.call.callId,
+					noAnswerCount,
+					reason: "max-no-answer",
+				},
+			};
 		}
 
-		await this.services.agents.transition({
-			orgId: this.call.organizationId,
-			agentId: agent.agentId,
-			to: "available",
-			queueId: this.node.queueId,
-			availableAt: now + delaySeconds * MILLIS_PER_SECOND,
-			...(noAnswerCount === undefined ? {} : { noAnswerCount }),
-		});
+		return {
+			candidate,
+			request: {
+				orgId: this.call.organizationId,
+				agentId: agent.agentId,
+				to: "available",
+				queueId: this.node.queueId,
+				callId: this.call.callId,
+				availableAt: now + delaySeconds * MILLIS_PER_SECOND,
+				...(noAnswerCount === undefined ? {} : { noAnswerCount }),
+			},
+		};
+	}
+
+	private async release(release: AgentRelease): Promise<boolean> {
+		return (await this.tryOwnedTransition(release.request)) !== "retry";
+	}
+
+	private scheduleReleaseRetry(
+		reserved: Map<string, QueueCandidate>,
+		release: AgentRelease,
+		delayMs: number,
+	): void {
+		const agentId = release.candidate.agent.agentId;
+		if (this.transitionRetries.has(agentId)) {
+			return;
+		}
+		void this.retryOwnedTransition(release.request, release.candidate.agent.name, delayMs).then(
+			() => {
+				reserved.delete(agentId);
+			},
+		);
 	}
 
 	/**
@@ -664,32 +760,102 @@ export class QueueSession {
 		const seconds = agent?.wrapUpSeconds || membership.wrapUpSeconds;
 
 		if (seconds <= 0) {
-			await this.services.agents.transition({
+			await this.transitionOwnedWithRetry({
 				orgId: this.call.organizationId,
 				agentId,
 				to: "available",
 				queueId: this.node.queueId,
+				callId: this.call.callId,
 			});
 			return;
 		}
 
 		const until = this.call.now() + seconds * MILLIS_PER_SECOND;
-		await this.services.agents.transition({
+		const wrapped = await this.transitionOwnedWithRetry({
 			orgId: this.call.organizationId,
 			agentId,
 			to: "wrap-up",
 			queueId: this.node.queueId,
+			callId: this.call.callId,
 			availableAt: until,
 		});
+		if (!wrapped) {
+			return;
+		}
 
-		await this.call.delay(seconds * MILLIS_PER_SECOND);
+		await this.call.delay(Math.max(0, until - this.call.now()));
 
-		await this.services.agents.transition({
+		await this.transitionOwnedWithRetry({
 			orgId: this.call.organizationId,
 			agentId,
 			to: "available",
 			queueId: this.node.queueId,
+			callId: this.call.callId,
 		});
+	}
+
+	private async transitionOwnedWithRetry(request: AgentTransitionRequest): Promise<boolean> {
+		const result = await this.tryOwnedTransition(request);
+		if (result !== "retry") {
+			return result === "succeeded";
+		}
+		return await this.retryOwnedTransition(request, request.agentId, RELEASE_RETRY_INITIAL_MS);
+	}
+
+	private async tryOwnedTransition(
+		request: AgentTransitionRequest,
+	): Promise<OwnedTransitionResult> {
+		if ((await this.services.agents.transition(request)) !== undefined) {
+			return "succeeded";
+		}
+
+		const current = await this.services.agents.readState(request.orgId, request.agentId);
+		if (current.kind === "unavailable") {
+			return "retry";
+		}
+		if (current.kind === "absent" || !isOwnedByCall(current.entry, request.callId)) {
+			return "ownership-changed";
+		}
+		return "retry";
+	}
+
+	private retryOwnedTransition(
+		request: AgentTransitionRequest,
+		agentLabel: string,
+		delayMs: number,
+	): Promise<boolean> {
+		const existing = this.transitionRetries.get(request.agentId);
+		if (existing !== undefined) {
+			return existing.promise;
+		}
+
+		let resolveRetry: (succeeded: boolean) => void = () => undefined;
+		const promise = new Promise<boolean>((resolve) => {
+			resolveRetry = resolve;
+		});
+		const retry = { request, promise, resolve: resolveRetry };
+		this.transitionRetries.set(request.agentId, retry);
+
+		const schedule = (nextDelayMs: number): void => {
+			this.settings.scheduleReleaseRetry(async () => {
+				let result: OwnedTransitionResult = "retry";
+				try {
+					result = await this.tryOwnedTransition(request);
+				} catch (error) {
+					this.call.note(`transitioning queue agent ${agentLabel} failed: ${String(error)}`);
+				}
+
+				if (result !== "retry") {
+					this.transitionRetries.delete(request.agentId);
+					retry.resolve(result === "succeeded");
+					return;
+				}
+				schedule(Math.min(nextDelayMs * 2, RELEASE_RETRY_MAX_MS));
+			}, nextDelayMs);
+		};
+
+		schedule(delayMs);
+		return promise;
 	}
 
 	// -------------------------------------------------------------------------------------------
@@ -833,4 +999,11 @@ export function penaltySecondsFor(
 		return agent.rejectDelaySeconds;
 	}
 	return agent.noAnswerDelaySeconds;
+}
+
+function isOwnedByCall(entry: AgentStateEntry, callId: string): boolean {
+	return (
+		(entry.status === "ringing" || entry.status === "on-call" || entry.status === "wrap-up") &&
+		entry.callId === callId
+	);
 }

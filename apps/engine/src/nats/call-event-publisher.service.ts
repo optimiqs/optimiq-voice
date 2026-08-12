@@ -56,8 +56,9 @@ export class CallEventPublisher implements OnModuleInit, OnApplicationShutdown {
 	/**
 	 * Builds, validates and publishes one call event.
 	 *
-	 * Returns the envelope that was published, or `undefined` when the event was rejected — so a
-	 * caller that needs to assert ordering can, without having to re-derive the subject.
+	 * Returns the envelope handed to the broker, or `undefined` when validation or transport fails.
+	 * Callers that own a recoverable workflow can therefore distinguish success without re-deriving
+	 * the subject.
 	 */
 	async publish<TType extends CallEvent>(
 		type: TType,
@@ -65,6 +66,7 @@ export class CallEventPublisher implements OnModuleInit, OnApplicationShutdown {
 			readonly orgId: string;
 			readonly callId: string;
 			readonly data: CallEventDataOf<TType>;
+			readonly id?: string;
 			readonly at?: Date;
 			readonly correlationId?: string;
 		},
@@ -76,6 +78,7 @@ export class CallEventPublisher implements OnModuleInit, OnApplicationShutdown {
 				callId: input.callId,
 				source: "engine",
 				data: input.data,
+				id: input.id,
 				at: input.at,
 				correlationId: input.correlationId,
 			});

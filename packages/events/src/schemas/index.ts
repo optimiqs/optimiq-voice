@@ -125,10 +125,12 @@ export {
 export {
 	claimBaseSchema,
 	conferenceClaimSchema,
+	conferenceContributionSchema,
 	isClaimExpired,
 	isClaimOwnedBy,
 	parkClaimSchema,
 	type ConferenceClaim,
+	type ConferenceContribution,
 	type ParkClaim,
 } from "./claims";
 export {

@@ -499,7 +499,7 @@ export interface OriginatedLeg {
 /** Everything the orchestrator needs to know about the legs a walk owns. */
 export interface OriginatedLegHooks {
 	/** A leg is about to be created. Called BEFORE the originate, so no event can outrun it. */
-	originated(leg: OriginatedLeg): void;
+	originated(leg: OriginatedLeg): void | Promise<void>;
 	/**
 	 * The WALKER is ending this leg, with this cause.
 	 *
@@ -1777,7 +1777,11 @@ export class PlanWalker {
 			!joined.room.moderatorPresent &&
 			!(await this.holdForModerator(node, registry))
 		) {
-			await registry.leave(node.conferenceId, this.deps.channel.mediaChannelId);
+			await registry.leave(
+				node.conferenceId,
+				this.deps.channel.mediaChannelId,
+				this.deps.channel.organizationId,
+			);
 			return { kind: "aborted" };
 		}
 
@@ -1792,7 +1796,11 @@ export class PlanWalker {
 			});
 			await this.deps.media.addToBridge(bridgeId, [this.deps.channel.mediaChannelId]);
 		} catch (error) {
-			await registry.leave(node.conferenceId, this.deps.channel.mediaChannelId);
+			await registry.leave(
+				node.conferenceId,
+				this.deps.channel.mediaChannelId,
+				this.deps.channel.organizationId,
+			);
 			this.log("failed to join a conference bridge", { bridgeId, err: String(error) });
 			this.note(`joining conference room ${node.roomNumber} failed: ${String(error)}`);
 			return { kind: "hangup", cause: "NORMAL_TEMPORARY_FAILURE" };
@@ -1801,7 +1809,7 @@ export class PlanWalker {
 		this.deps.channel.setBridge(bridgeId);
 		this.deps.channel.moveTo("exchanging-media");
 
-		const room = registry.room(node.conferenceId);
+		const room = registry.room(node.conferenceId, this.deps.channel.organizationId);
 		await this.deps.publish("conference.joined", {
 			legId: this.deps.channel.channelId,
 			conferenceId: node.conferenceId,
@@ -1972,7 +1980,8 @@ export class PlanWalker {
 		this.note(`held in conference room ${node.roomNumber} until a moderator joins`);
 		await this.deps.media.startMusicOnHold(this.deps.channel.mediaChannelId, node.mohClass);
 
-		const waiter = registry.awaitModerator(node.conferenceId);
+		const organizationId = this.deps.channel.organizationId;
+		const waiter = registry.awaitModerator(node.conferenceId, organizationId);
 		let hungUp = false;
 		// A moderator who joins on ANOTHER instance cannot fire a local waiter, so the claim is
 		// re-read while the gate is closed. One poll per HELD caller, only while a gate is actually
@@ -1984,7 +1993,7 @@ export class PlanWalker {
 				if (!polling) {
 					return;
 				}
-				if (await registry.refresh(node.conferenceId)) {
+				if (await registry.refresh(node.conferenceId, organizationId)) {
 					return;
 				}
 			}
@@ -2017,10 +2026,10 @@ export class PlanWalker {
 		if (hungUp || this.deps.channel.isTearingDown) {
 			return false;
 		}
-		if (registry.room(node.conferenceId)?.moderatorPresent !== true) {
+		if (registry.room(node.conferenceId, organizationId)?.moderatorPresent !== true) {
 			// One last read before giving up: the moderator may have arrived on another instance
 			// between the last poll and the budget expiring.
-			if (await registry.refresh(node.conferenceId)) {
+			if (await registry.refresh(node.conferenceId, organizationId)) {
 				return true;
 			}
 			this.note(`no moderator joined conference room ${node.roomNumber} within the wait budget`);
@@ -2040,7 +2049,11 @@ export class PlanWalker {
 		if (registry === undefined) {
 			return;
 		}
-		const departure = await registry.leave(node.conferenceId, this.deps.channel.mediaChannelId);
+		const departure = await registry.leave(
+			node.conferenceId,
+			this.deps.channel.mediaChannelId,
+			this.deps.channel.organizationId,
+		);
 		try {
 			await this.deps.publish("conference.left", {
 				legId: this.deps.channel.channelId,
@@ -2686,6 +2699,8 @@ export class PlanWalker {
 			},
 			dial: async (attempts, fanOut, ringTimeoutSeconds) =>
 				await this.dialQueueAgents(attempts, fanOut, ringTimeoutSeconds),
+			hangupAnsweredAgent: async (mediaChannelId) =>
+				await this.hangupQuietly(mediaChannelId, "NORMAL_TEMPORARY_FAILURE"),
 			bridge: async (mediaChannelId, onEnded) =>
 				(await this.bridgeWith(mediaChannelId, onEnded)).kind === "bridged",
 			resolvePrompt: (promptId) => resolveMediaRef({ promptId }, this.settings.mediaRefs),
@@ -3359,21 +3374,20 @@ export class PlanWalker {
 		// BEFORE the media server is asked. A leg that answers instantly would otherwise deliver its
 		// `StasisStart` to an orchestrator that has never heard of it, and be filed as a new inbound
 		// call — the exact failure the `OPTIMIQ_LEG` check exists to prevent, one layer earlier.
-		this.deps.legs?.originated({
-			mediaChannelId: channelId,
-			endpoint: attempt.endpoint,
-			destinationNumber: attempt.destinationNumber,
-			label: attempt.label,
-			...(this.destination?.destinationType === undefined
-				? {}
-				: { destinationType: this.destination.destinationType }),
-			...(this.destination?.destinationRef === undefined
-				? {}
-				: { destinationRef: this.destination.destinationRef }),
-			...(attempt.callerId === undefined ? {} : { callerId: attempt.callerId }),
-		});
-
 		try {
+			await this.deps.legs?.originated({
+				mediaChannelId: channelId,
+				endpoint: attempt.endpoint,
+				destinationNumber: attempt.destinationNumber,
+				label: attempt.label,
+				...(this.destination?.destinationType === undefined
+					? {}
+					: { destinationType: this.destination.destinationType }),
+				...(this.destination?.destinationRef === undefined
+					? {}
+					: { destinationRef: this.destination.destinationRef }),
+				...(attempt.callerId === undefined ? {} : { callerId: attempt.callerId }),
+			});
 			await this.deps.media.originate({
 				endpoint: attempt.endpoint,
 				application: this.settings.application,

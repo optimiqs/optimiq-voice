@@ -20,8 +20,9 @@ import { createDeterministicEntityId, isEntityId } from "@optimiq-voice/identifi
  * `legId`, or the CDR gets written twice under two ids and the call appears twice on the bill. A
  * random id in a lost `Map` cannot do that; a pure function of the ARI id always can.
  *
- * The `cdr.leg.write` record id is the exception: it is a UUID **v7** minted at write time
- * (`createEntityId`), because it is the insert's idempotency key and must be time-ordered.
+ * The `cdr.leg.write` record id is the exception: it is a UUID **v7** minted when teardown enters
+ * reporting and persisted with the recovery snapshot, because retries need one time-ordered
+ * idempotency key rather than a fresh insert id per attempt.
  */
 
 /**
@@ -109,6 +110,23 @@ export const ENGINE_CHANNEL_VARIABLES = [
 	"OPTIMIQ_ROUTING_CONTEXT",
 	/** `b` on a leg the engine originated; absent on a leg that arrived from the outside. */
 	"OPTIMIQ_LEG",
+	/**
+	 * What this leg is DIALLING, when the channel itself cannot say.
+	 *
+	 * Every leg that arrives from the outside carries the number in its dialplan extension, and the
+	 * engine reads it off the channel — which is why this variable did not exist until something
+	 * created a channel with no dialplan at all. An ARI origination straight into the Stasis
+	 * application is exactly that: there is no extension, no context and no dialled digits, because
+	 * nothing was dialled. The number the leg is FOR has to travel some other way, and a channel
+	 * variable is the way the engine already moves facts onto a leg it is creating.
+	 *
+	 * Read by {@link import("./channel-orchestrator.service").ChannelOrchestrator} in preference to
+	 * `channel.dialedNumber` when resolving a route. What it deliberately does NOT feed is the
+	 * `did-index` attribution step: a variable-supplied number that could name a tenant would be a
+	 * way to file a call under somebody else's organization, and an originated leg always carries
+	 * `OPTIMIQ_ORG_ID` anyway, so attribution never needs to look at this.
+	 */
+	"OPTIMIQ_DIALED_NUMBER",
 	SIP_CALL_ID_VARIABLE,
 ] as const;
 

@@ -426,7 +426,7 @@ var ParkClaimsKV = KVBucketDefinition{
 // Like ParkClaimsKV, declared but not written from Go.
 var ConferenceClaimsKV = KVBucketDefinition{
 	Name:         "conference-claims",
-	Description:  "Conference room -> agreed bridge id and member count, under compare-and-set.",
+	Description:  "Conference room -> agreed bridge id and leased instance contributions.",
 	TTL:          15 * time.Minute,
 	History:      1,
 	Storage:      StorageFile,

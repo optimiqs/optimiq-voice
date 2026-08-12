@@ -26,13 +26,19 @@ import type { AriEventStream, AriStreamStatus } from "@optimiq-voice/media-ari";
 export class AriConnectionService implements OnApplicationShutdown {
 	private readonly logger = getLogger("engine.ari");
 
-	readonly client: AriClient;
+	private readonly ariClient: AriClient | undefined;
 	private stream: AriEventStream | undefined;
 	private handler: ((event: MediaEvent) => void) | undefined;
 	private version: string | undefined;
 
 	constructor(@Inject(ENGINE_ENV) private readonly env: EngineEnv) {
-		this.client = new AriClient({
+		if (!this.isSelected) {
+			return;
+		}
+		if (env.ARI_PASSWORD === undefined) {
+			throw new Error("ARI_PASSWORD is required when ENGINE_MEDIA_DRIVER=ari.");
+		}
+		this.ariClient = new AriClient({
 			baseUrl: env.ARI_URL,
 			username: env.ARI_USERNAME,
 			password: env.ARI_PASSWORD,
@@ -40,6 +46,19 @@ export class AriConnectionService implements OnApplicationShutdown {
 			subscribeAll: env.ARI_SUBSCRIBE_ALL,
 			timeoutMs: env.ARI_REQUEST_TIMEOUT_MS,
 		});
+	}
+
+	/** Whether ARI is the configured media driver for this process. */
+	get isSelected(): boolean {
+		return this.env.ENGINE_MEDIA_DRIVER === "ari";
+	}
+
+	/** The selected ARI client. Accessing it under the mediad driver is a wiring error. */
+	get client(): AriClient {
+		if (this.ariClient === undefined) {
+			throw new Error("ARI client requested while ENGINE_MEDIA_DRIVER=mediad.");
+		}
+		return this.ariClient;
 	}
 
 	get applicationName(): string {
@@ -80,11 +99,15 @@ export class AriConnectionService implements OnApplicationShutdown {
 	 * is running but deaf — which looks healthy and answers nothing.
 	 */
 	async start(): Promise<void> {
+		if (!this.isSelected) {
+			return;
+		}
 		if (this.handler === undefined) {
 			throw new Error("AriConnectionService.start() called before an event handler was set.");
 		}
 
-		const info = await this.client.ping();
+		const client = this.client;
+		const info = await client.ping();
 		this.version = info.version;
 		this.logger.info(
 			{ app: this.env.ARI_APP, asterisk: info.version },
@@ -92,7 +115,7 @@ export class AriConnectionService implements OnApplicationShutdown {
 		);
 
 		const handler = this.handler;
-		this.stream = this.client.createEventStream({
+		this.stream = client.createEventStream({
 			onEvent: (event) => {
 				// The seam, applied at the edge. An event with no domain meaning stops here rather
 				// than reaching a handler that would have to know ARI's names to ignore it.

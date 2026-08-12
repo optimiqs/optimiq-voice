@@ -49,6 +49,12 @@ export interface Claimed<T> {
 	readonly revision: number;
 }
 
+/** A claim read that keeps absence distinct from an unreadable or unreachable bucket. */
+export type ClaimRead<T> =
+	| { readonly kind: "present"; readonly claim: Claimed<T> }
+	| { readonly kind: "absent" }
+	| { readonly kind: "unavailable"; readonly reason: string };
+
 /**
  * The result of a write.
  *
@@ -67,14 +73,14 @@ export type ClaimWrite<T> =
 export interface ClaimBucket<T> {
 	/** Whether shared claims are configured at all. `false` means local-only, by deployment choice. */
 	readonly isConfigured: boolean;
-	/** The current value, or `undefined` when the key is free or unreadable. */
-	get(key: string): Promise<Claimed<T> | undefined>;
+	/** Reads the current value without conflating a free key with an unavailable bucket. */
+	get(key: string): Promise<ClaimRead<T>>;
 	/** Takes the key if nobody holds it. THE exclusivity primitive. */
 	create(key: string, value: T): Promise<ClaimWrite<T>>;
 	/** Replaces a value this process read at `revision`. Loses if anybody wrote in between. */
 	update(key: string, value: T, revision: number): Promise<ClaimWrite<T>>;
-	/** Releases the key. Returns whether the bucket confirmed it. */
-	release(key: string): Promise<boolean>;
+	/** Releases the key only if it is still at `revision`. Returns whether the bucket confirmed it. */
+	release(key: string, revision: number): Promise<boolean>;
 }
 
 /**
@@ -89,8 +95,8 @@ export interface ClaimBucket<T> {
 export class UnclaimedBucket<T> implements ClaimBucket<T> {
 	readonly isConfigured = false;
 
-	async get(_key: string): Promise<Claimed<T> | undefined> {
-		return undefined;
+	async get(_key: string): Promise<ClaimRead<T>> {
+		return { kind: "absent" };
 	}
 
 	async create(_key: string, _value: T): Promise<ClaimWrite<T>> {
@@ -101,7 +107,7 @@ export class UnclaimedBucket<T> implements ClaimBucket<T> {
 		return { kind: "written", revision: 0 };
 	}
 
-	async release(_key: string): Promise<boolean> {
+	async release(_key: string, _revision: number): Promise<boolean> {
 		return true;
 	}
 }
@@ -110,11 +116,8 @@ export class UnclaimedBucket<T> implements ClaimBucket<T> {
  * The JetStream KV implementation.
  *
  * The schema is supplied rather than assumed: a claim written by a newer release of another
- * instance must be readable by this one, and a claim that does not parse is treated as ABSENT
- * rather than as a hard failure — see {@link KvClaimBucket.get}. That direction is chosen for the
- * same reason `agent-state.store.ts` discards an unreadable entry: an unparseable claim held
- * forever is a resource permanently removed from the tenant, and the reaper is the only thing that
- * could free it.
+ * instance must be readable by this one. A value that does not parse is unavailable, not absent:
+ * treating bytes already stored under an exclusive key as free would allow a second owner.
  */
 export class KvClaimBucket<T> implements ClaimBucket<T> {
 	readonly isConfigured = true;
@@ -126,23 +129,20 @@ export class KvClaimBucket<T> implements ClaimBucket<T> {
 		private readonly bucketName: string,
 	) {}
 
-	async get(key: string): Promise<Claimed<T> | undefined> {
+	async get(key: string): Promise<ClaimRead<T>> {
 		try {
 			const entry = await this.kv.get(key);
 			if (entry === null || entry.value.length === 0) {
-				return undefined;
+				return { kind: "absent" };
 			}
 			const value = this.schema.parse(JSON.parse(new TextDecoder().decode(entry.value)));
-			return { value, revision: entry.revision };
+			return { kind: "present", claim: { value, revision: entry.revision } };
 		} catch (error) {
-			// Both branches land here on purpose: a broker that refused the read and a value that does
-			// not parse are equally "this process cannot act on what is there". The write that follows
-			// is a `create`, which fails safely if the key does in fact exist.
 			this.logger.warn(
 				{ bucket: this.bucketName, key, err: String(error) },
-				"discarding an unreadable claim",
+				"a claim could not be read; treating the key as unavailable",
 			);
-			return undefined;
+			return { kind: "unavailable", reason: String(error) };
 		}
 	}
 
@@ -155,7 +155,12 @@ export class KvClaimBucket<T> implements ClaimBucket<T> {
 				return { kind: "unavailable", reason: String(error) };
 			}
 			const current = await this.get(key);
-			return current === undefined ? { kind: "lost" } : { kind: "lost", current };
+			if (current.kind === "unavailable") {
+				return current;
+			}
+			return current.kind === "present"
+				? { kind: "lost", current: current.claim }
+				: { kind: "lost" };
 		}
 	}
 
@@ -168,15 +173,23 @@ export class KvClaimBucket<T> implements ClaimBucket<T> {
 				return { kind: "unavailable", reason: String(error) };
 			}
 			const current = await this.get(key);
-			return current === undefined ? { kind: "lost" } : { kind: "lost", current };
+			if (current.kind === "unavailable") {
+				return current;
+			}
+			return current.kind === "present"
+				? { kind: "lost", current: current.claim }
+				: { kind: "lost" };
 		}
 	}
 
-	async release(key: string): Promise<boolean> {
+	async release(key: string, revision: number): Promise<boolean> {
 		try {
-			await this.kv.delete(key);
+			await this.kv.delete(key, { previousSeq: revision });
 			return true;
 		} catch (error) {
+			if (isConflict(error)) {
+				return false;
+			}
 			// A claim that could not be deleted is not a lost call — it is a slot that will be reaped
 			// when its expiry passes, which is exactly what the expiry is for.
 			this.logger.warn(

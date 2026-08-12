@@ -805,6 +805,11 @@ export class CallControl implements CallControlPort {
 		if (claimed.kind === "stale") {
 			return await this.unparkFromDeadOwner(leg, slot, claimed.instanceId, claimed.entry);
 		}
+		if (claimed.kind === "claims-unavailable") {
+			return refuse(
+				`the call on orbit ${String(slot)} cannot be claimed right now: ${claimed.reason}`,
+			);
+		}
 		if (claimed.kind !== "claimed") {
 			return refuse(`nothing is parked on orbit ${String(slot)}`);
 		}
@@ -1044,9 +1049,9 @@ export class CallControl implements CallControlPort {
 	 * visible to this media server. A refusal at any of those leaves the caller exactly where they
 	 * were, still collectable by the next person to dial the orbit.
 	 *
-	 * The claim is only released once all of that holds, and the release is what settles the race
-	 * against a LOCAL retrieval happening at the same instant — `ParkRegistry.claim` removes before
-	 * it returns, so one of the two gets the entry and the other gets `not_parked`.
+	 * The claim is only released once all of that holds. `ParkRegistry.claim` reserves the local entry
+	 * across that await, so a LOCAL retrieval happening at the same instant is refused rather than
+	 * mistaking the still-live shared claim for a remote park. Only a confirmed release may bridge.
 	 *
 	 * ## Never throws
 	 *
@@ -1068,7 +1073,7 @@ export class CallControl implements CallControlPort {
 		});
 
 		try {
-			const occupant = this.deps.parks.at(request.parkLotId, request.slot);
+			const occupant = this.deps.parks.at(request.parkLotId, request.slot, request.orgId);
 			if (occupant === undefined) {
 				return deny("not_parked", "this instance holds no park on that orbit");
 			}
@@ -1104,6 +1109,9 @@ export class CallControl implements CallControlPort {
 			}
 
 			const claimed = await this.deps.parks.claim(request.parkLotId, request.slot, request.orgId);
+			if (claimed.kind === "claims-unavailable") {
+				return deny("internal", `the parked call could not be claimed: ${claimed.reason}`);
+			}
 			if (claimed.kind !== "claimed") {
 				return deny("not_parked", "the call was collected while the handoff was in flight");
 			}
@@ -1864,7 +1872,11 @@ export class CallControl implements CallControlPort {
 
 		const parked = this.deps.parks.forChannel(mediaChannelId);
 		if (parked !== undefined) {
-			await this.deps.parks.release(mediaChannelId);
+			try {
+				await this.deps.parks.release(mediaChannelId);
+			} finally {
+				this.deps.parks.forgetEnded(mediaChannelId);
+			}
 			this.cancelParkTimeout(mediaChannelId);
 			this.transitionPark(mediaChannelId, "abandoned");
 			this.parkStates.delete(mediaChannelId);

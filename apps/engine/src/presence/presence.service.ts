@@ -1,9 +1,11 @@
 import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
 import {
 	type ExtensionPresence,
+	isSubjectToken,
 	kvKeyFor,
 	type LiveChannel,
 	liveChannelSchema,
+	PRESENCE_KV,
 } from "@optimiq-voice/events";
 import { getLogger } from "@optimiq-voice/logging";
 import {
@@ -44,8 +46,8 @@ import type { EngineEnv } from "../config/engine-env";
  *
  * The cost is latency — one KV round trip between a leg changing and a lamp moving — and redundant
  * writes, since every replica computes and writes the same value. Both are bounded and neither is
- * load-bearing: BLF has always been eventually consistent, and the write is debounced on value, so
- * the steady state is silence.
+ * load-bearing: BLF has always been eventually consistent, and unchanged values are silent between
+ * the periodic refreshes needed to keep active calls ahead of the bucket TTL.
  *
  * ## Which extension a leg belongs to
  *
@@ -69,8 +71,8 @@ export class PresenceService implements OnModuleInit, OnApplicationShutdown {
 	private readonly channels = new Map<string, TrackedChannel>();
 	/** `<orgId> <extensionNumber>` → the leg keys currently attributed to it. */
 	private readonly byExtension = new Map<string, Set<string>>();
-	/** The last value written per presence key, so an unchanged aggregate writes nothing. */
-	private readonly published = new Map<string, string>();
+	/** Successfully written presence, including whether the bounded refresh pass made it due again. */
+	private readonly published = new Map<string, PublishedPresence>();
 
 	private stopped = false;
 	private watchAbort: (() => void) | undefined;
@@ -78,6 +80,11 @@ export class PresenceService implements OnModuleInit, OnApplicationShutdown {
 	/** Extension keys whose aggregate has to be recomputed on the next flush. */
 	private dirty = new Set<string>();
 	private flushTimer: ReturnType<typeof setTimeout> | undefined;
+	private refreshTimer: ReturnType<typeof setInterval> | undefined;
+	private flushing: Promise<boolean> | undefined;
+	private retryAttempt = 0;
+	/** Dirty work is held until the watch has replayed its complete current snapshot. */
+	private replaying = false;
 
 	constructor(
 		private readonly jetstream: JetStreamService,
@@ -86,15 +93,15 @@ export class PresenceService implements OnModuleInit, OnApplicationShutdown {
 	) {}
 
 	onModuleInit(): void {
+		this.replaying = true;
+		this.startRefreshLoop();
 		this.loop = this.runWatchLoop();
 	}
 
 	async onApplicationShutdown(): Promise<void> {
 		this.stopped = true;
-		if (this.flushTimer !== undefined) {
-			clearTimeout(this.flushTimer);
-			this.flushTimer = undefined;
-		}
+		this.cancelScheduledFlush();
+		this.stopRefreshLoop();
 		this.watchAbort?.();
 		this.watchAbort = undefined;
 		// Deliberately NOT clearing the bucket. Another replica is still watching the same channels
@@ -107,6 +114,11 @@ export class PresenceService implements OnModuleInit, OnApplicationShutdown {
 	/** How many live legs this instance is tracking. Exposed for the specs and for diagnostics. */
 	get trackedChannels(): number {
 		return this.channels.size;
+	}
+
+	/** Whether the one bounded refresh loop is active. Exposed for lifecycle diagnostics and specs. */
+	get refreshScheduled(): boolean {
+		return this.refreshTimer !== undefined;
 	}
 
 	// -------------------------------------------------------------------------------------------
@@ -125,7 +137,11 @@ export class PresenceService implements OnModuleInit, OnApplicationShutdown {
 			try {
 				// No `updatesOnly`: the initial replay is how a starting instance learns about the
 				// calls that were already up, which is the whole of its restart story.
-				const watch = await bucket.watch();
+				const watch = await bucket.watch({
+					initializedFn: () => {
+						this.finishReplay();
+					},
+				});
 				this.watchAbort = () => {
 					watch.stop();
 				};
@@ -149,14 +165,32 @@ export class PresenceService implements OnModuleInit, OnApplicationShutdown {
 			if (this.stopped) {
 				return;
 			}
-			// Everything this instance believes about live legs is now unverified. The mirror is
-			// dropped rather than kept: the reconnect replays the bucket from scratch, and holding
-			// stale legs across the gap would mean publishing presence for calls that ended while
-			// this process was not being told about them.
-			this.channels.clear();
-			this.byExtension.clear();
+			this.prepareForReplay();
 			await sleep(backoffMs(attempt));
 			attempt += 1;
+		}
+	}
+
+	private prepareForReplay(): void {
+		// Preserve every affected extension as dirty before dropping the unverified channel mirror.
+		// If a call ended during the gap, no DELETE exists in the new watch's current-value replay;
+		// the retained dirty key is what reconciles and removes its stale published presence.
+		for (const extension of this.byExtension.keys()) {
+			this.dirty.add(extension);
+		}
+		this.channels.clear();
+		this.byExtension.clear();
+		this.replaying = true;
+		this.cancelScheduledFlush();
+	}
+
+	private finishReplay(): void {
+		if (this.stopped) {
+			return;
+		}
+		this.replaying = false;
+		if (this.dirty.size > 0) {
+			this.scheduleFlush(PRESENCE_COALESCE_MS);
 		}
 	}
 
@@ -253,7 +287,7 @@ export class PresenceService implements OnModuleInit, OnApplicationShutdown {
 
 	private markDirty(extension: string): void {
 		this.dirty.add(extension);
-		if (this.flushTimer !== undefined || this.stopped) {
+		if (this.replaying) {
 			return;
 		}
 		// A COALESCING window, not a rate limit. One call setup writes several channel snapshots in
@@ -261,42 +295,120 @@ export class PresenceService implements OnModuleInit, OnApplicationShutdown {
 		// publishing after each would send a phone three NOTIFYs for one event, which on a busy
 		// extension is a lamp that visibly flickers. The window is short enough that a human cannot
 		// perceive it and long enough that a whole ARI burst lands inside one.
+		this.scheduleFlush(PRESENCE_COALESCE_MS);
+	}
+
+	private scheduleFlush(delayMs: number): void {
+		if (this.flushTimer !== undefined || this.flushing !== undefined || this.stopped) {
+			return;
+		}
 		this.flushTimer = setTimeout(() => {
 			this.flushTimer = undefined;
 			void this.flush();
-		}, PRESENCE_COALESCE_MS);
+		}, delayMs);
+		this.flushTimer.unref?.();
+	}
+
+	private cancelScheduledFlush(): void {
+		if (this.flushTimer === undefined) {
+			return;
+		}
+		clearTimeout(this.flushTimer);
+		this.flushTimer = undefined;
+	}
+
+	private startRefreshLoop(): void {
+		if (this.refreshTimer !== undefined) {
+			return;
+		}
+		this.refreshTimer = setInterval(() => {
+			this.refreshActivePresence();
+		}, PRESENCE_REFRESH_MS);
+		this.refreshTimer.unref?.();
+	}
+
+	private stopRefreshLoop(): void {
+		if (this.refreshTimer === undefined) {
+			return;
+		}
+		clearInterval(this.refreshTimer);
+		this.refreshTimer = undefined;
+	}
+
+	/** Test seam and bounded periodic pass: makes every currently active published key refresh due. */
+	refreshActivePresence(): void {
+		for (const published of this.published.values()) {
+			if (!this.byExtension.has(published.extension)) {
+				continue;
+			}
+			published.refreshDue = true;
+			this.dirty.add(published.extension);
+		}
+		if (!this.replaying && this.dirty.size > 0) {
+			this.scheduleFlush(PRESENCE_COALESCE_MS);
+		}
 	}
 
 	/** Recomputes and publishes every dirty extension. Exposed so a spec need not wait on a timer. */
 	async flush(): Promise<void> {
+		this.cancelScheduledFlush();
+		if (this.flushing !== undefined) {
+			await this.flushing;
+			return;
+		}
+
+		const flushing = this.flushDirty();
+		this.flushing = flushing;
+		let failed = false;
+		try {
+			failed = await flushing;
+		} finally {
+			this.flushing = undefined;
+			if (!failed) {
+				this.retryAttempt = 0;
+			}
+			if (!this.stopped && !this.replaying && this.dirty.size > 0) {
+				const delay = failed ? retryBackoffMs(this.retryAttempt) : PRESENCE_COALESCE_MS;
+				if (failed) {
+					this.retryAttempt += 1;
+				}
+				this.scheduleFlush(delay);
+			}
+		}
+	}
+
+	private async flushDirty(): Promise<boolean> {
 		const pending = this.dirty;
 		this.dirty = new Set<string>();
+		let failed = false;
 
 		for (const extension of pending) {
 			try {
 				await this.publish(extension);
 			} catch (error) {
+				failed = true;
+				this.dirty.add(extension);
 				this.logger.warn({ extension, err: String(error) }, "failed to publish presence");
 			}
 		}
+		return failed;
 	}
 
 	private async publish(extension: string): Promise<void> {
 		const bucket = this.jetstream.presence;
 		if (bucket === undefined) {
-			return;
+			throw new Error("the presence KV bucket is unavailable");
 		}
 		const [orgId, extensionNumber] = splitExtensionKey(extension);
 		if (orgId === undefined || extensionNumber === undefined) {
 			return;
 		}
-		if (!(await this.isExtension(orgId, extensionNumber))) {
-			// Filtered here rather than at attach time on purpose: the routing artifact is fetched
-			// asynchronously and may be a cache miss, and blocking the watch loop on an RPC would put
-			// the control plane in the path of reading a channel update.
+		// Candidate parsing rejects invalid tokens before they become dirty work. Keep this guard at
+		// the publication boundary too: malformed persisted state is a permanent skip, not a retryable
+		// KV failure that should log forever.
+		if (!isPresenceKeyToken(extensionNumber)) {
 			return;
 		}
-
 		const key = kvKeyFor.presence(orgId, extensionNumber);
 		const members = this.byExtension.get(extension);
 		const callStates = [...(members ?? [])]
@@ -308,9 +420,16 @@ export class PresenceService implements OnModuleInit, OnApplicationShutdown {
 			// bucket's own TTL eventually produces anyway and a reader that handles one handles both
 			// — and because an idle extension costs nothing to store rather than an entry per
 			// extension in the tenant, forever.
-			if (this.published.delete(key)) {
+			if (this.published.has(key)) {
 				await bucket.delete(key);
+				this.published.delete(key);
 			}
+			return;
+		}
+		if (!(await this.isExtension(orgId, extensionNumber))) {
+			// Filtered here rather than at attach time on purpose: the routing artifact is fetched
+			// asynchronously and may be a cache miss, and blocking the watch loop on an RPC would put
+			// the control plane in the path of reading a channel update.
 			return;
 		}
 
@@ -329,29 +448,47 @@ export class PresenceService implements OnModuleInit, OnApplicationShutdown {
 		// signature excludes `updatedAt` and `writtenBy` — including them would make every
 		// recomputation a change and defeat the whole thing.
 		const signature = `${state}:${value.channelCount}:${value.callStates?.join(",")}`;
-		if (this.published.get(key) === signature) {
+		const published = this.published.get(key);
+		if (published?.signature === signature && !published.refreshDue) {
 			return;
 		}
-		this.published.set(key, signature);
 		await bucket.put(key, new TextEncoder().encode(JSON.stringify(value)));
+		this.published.set(key, { extension, signature, refreshDue: false });
 	}
 
 	/**
 	 * Whether a number is a real extension of the tenant.
 	 *
 	 * The routing artifact is the authority and is already cached and watched by
-	 * {@link RoutingArtifactSource}, so this is a map lookup in the steady state. A tenant whose
-	 * artifact cannot be resolved publishes NO presence rather than presence for every number it saw:
-	 * an unfiltered fallback would key this bucket by every PSTN caller that has ever dialled in.
+	 * {@link RoutingArtifactSource}, so this is a map lookup in the steady state. A resolved artifact
+	 * without the number is an authoritative miss. An unavailable artifact is different: throwing
+	 * keeps the extension dirty and sends it through the normal publication retry backoff rather than
+	 * losing the only channel event that could publish it.
 	 */
 	private async isExtension(orgId: string, number: string): Promise<boolean> {
 		const artifact = await this.artifacts.get(orgId);
-		return artifact?.extensionsByNumber[number] !== undefined;
+		if (artifact === undefined) {
+			throw new Error(`the routing artifact for ${orgId} is unavailable`);
+		}
+		return artifact.extensionsByNumber[number] !== undefined;
 	}
 }
 
 /** The coalescing window for a burst of channel updates, in millis. */
 export const PRESENCE_COALESCE_MS = 120;
+
+/**
+ * One bounded refresh pass for all active keys at 80% of the bucket TTL. The one-minute margin keeps
+ * unchanged long calls alive without one timer per extension, while a crashed writer's keys still
+ * expire under the shared {@link PRESENCE_KV} definition.
+ */
+export const PRESENCE_REFRESH_MS = Math.floor(PRESENCE_KV.ttlMs * 0.8);
+
+interface PublishedPresence {
+	readonly extension: string;
+	readonly signature: string;
+	refreshDue: boolean;
+}
 
 interface TrackedChannel {
 	readonly orgId: string;
@@ -391,7 +528,7 @@ function candidateNumbers(channel: LiveChannel): readonly string[] {
 	const numbers = new Set<string>();
 	for (const candidate of [channel.profile?.destinationNumber, channel.profile?.callerIdNumber]) {
 		const trimmed = candidate?.trim();
-		if (trimmed !== undefined && trimmed !== "" && isKeyToken(trimmed)) {
+		if (trimmed !== undefined && isPresenceKeyToken(trimmed)) {
 			numbers.add(trimmed);
 		}
 	}
@@ -401,12 +538,12 @@ function candidateNumbers(channel: LiveChannel): readonly string[] {
 /**
  * Whether a number can be a KV key token at all.
  *
- * `kvKeyFor.presence` throws on anything with a dot, a space or a wildcard, and a throw inside the
- * watch loop over a caller-id string somebody dialled in with would stop presence for the whole
- * deployment. Checked here so the key builder is only ever called with something it accepts.
+ * `kvKeyFor.presence` accepts one NATS subject token. Media-server dial strings such as
+ * `Local/1001@optimiq-internal` are not tokens, and retrying them can never succeed. Checked here so
+ * invalid candidates never become dirty work and the key builder only receives accepted input.
  */
-function isKeyToken(value: string): boolean {
-	return value.length <= 64 && !/[\s.*>]/.test(value);
+function isPresenceKeyToken(value: string): boolean {
+	return value.length <= 64 && isSubjectToken(value);
 }
 
 function extensionKey(orgId: string, extensionNumber: string): string {
@@ -419,6 +556,11 @@ function splitExtensionKey(key: string): [string | undefined, string | undefined
 }
 
 function backoffMs(attempt: number): number {
+	return Math.min(30_000, 500 * 2 ** Math.min(attempt, 6));
+}
+
+/** Capped retry delay for failed presence writes: 500 ms → 30 s. */
+function retryBackoffMs(attempt: number): number {
 	return Math.min(30_000, 500 * 2 ** Math.min(attempt, 6));
 }
 

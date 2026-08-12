@@ -85,6 +85,16 @@ describe("buildCdrLegWrite", () => {
 		expect(isUuidV7EntityId(data.id)).toBe(true);
 	});
 
+	it("reuses a persisted record id for a terminal retry", () => {
+		const data = buildCdrLegWrite({
+			...base,
+			id: LEG,
+			snapshot: snapshot(),
+			endedAt: 1_010_000,
+		});
+		expect(data.id).toBe(LEG);
+	});
+
 	it("separates duration (what it cost the platform) from billsec (what it costs the tenant)", () => {
 		const data = buildCdrLegWrite({
 			...base,

@@ -195,7 +195,9 @@ function harness(options: HarnessOptions = {}) {
 		},
 		peerLegId: (mediaChannelId) => `leg-of-${mediaChannelId}`,
 		legs: {
-			originated: (leg) => originatedLegs.push(leg),
+			originated: (leg) => {
+				originatedLegs.push(leg);
+			},
 			hangingUp: (mediaChannelId, cause) => hangingUp.push({ mediaChannelId, cause }),
 			bridged: (mediaChannelId, bridgeId) => bridged.push({ mediaChannelId, bridgeId }),
 		},

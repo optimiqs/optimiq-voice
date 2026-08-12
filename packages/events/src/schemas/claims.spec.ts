@@ -37,14 +37,16 @@ function parkClaim(overrides: Partial<ParkClaim> = {}): ParkClaim {
 function conferenceClaim(overrides: Partial<ConferenceClaim> = {}): ConferenceClaim {
 	return conferenceClaimSchema.parse({
 		orgId: ORG,
-		instanceId: INSTANCE,
 		claimedAt: NOW,
-		heartbeatAt: NOW,
-		expiresAt: NOW + 30_000,
 		conferenceId: createEntityId(),
 		bridgeId: createEntityId(),
-		memberCount: 1,
-		moderatorPresent: false,
+		contributions: {
+			[INSTANCE]: {
+				memberCount: 1,
+				moderatorPresent: false,
+				expiresAt: NOW + 30_000,
+			},
+		},
 		...overrides,
 	});
 }
@@ -126,17 +128,36 @@ describe("the conference claim", () => {
 		expect(() => conferenceClaim({ bridgeId: "" })).toThrow();
 	});
 
-	it("carries the cluster-wide member count, which is what makes maxMembers a cap", () => {
-		expect(conferenceClaim({ memberCount: 20 }).memberCount).toBe(20);
+	it("carries each instance's member count and moderator presence independently", () => {
+		const claim = conferenceClaim({
+			contributions: {
+				[INSTANCE]: { memberCount: 20, moderatorPresent: true, expiresAt: NOW + 30_000 },
+				"engine-other": { memberCount: 3, moderatorPresent: false, expiresAt: NOW + 20_000 },
+			},
+		});
+
+		expect(claim.contributions[INSTANCE]).toEqual({
+			memberCount: 20,
+			moderatorPresent: true,
+			expiresAt: NOW + 30_000,
+		});
+		expect(claim.contributions["engine-other"]?.memberCount).toBe(3);
 	});
 
-	it("refuses a fractional or negative member count", () => {
-		expect(() => conferenceClaim({ memberCount: -1 })).toThrow();
-		expect(() => conferenceClaim({ memberCount: 1.5 })).toThrow();
+	it("refuses an empty contribution map", () => {
+		expect(() => conferenceClaim({ contributions: {} })).toThrow();
 	});
 
-	it("carries whether a moderator is present anywhere in the cluster", () => {
-		expect(conferenceClaim({ moderatorPresent: true }).moderatorPresent).toBe(true);
+	it("refuses a fractional, zero, or negative contribution count", () => {
+		for (const memberCount of [-1, 0, 1.5]) {
+			expect(() =>
+				conferenceClaim({
+					contributions: {
+						[INSTANCE]: { memberCount, moderatorPresent: false, expiresAt: NOW + 30_000 },
+					},
+				}),
+			).toThrow();
+		}
 	});
 
 	it("passes an unknown field through rather than rejecting a newer writer", () => {

@@ -2,6 +2,18 @@ import { describe, expect, it } from "bun:test";
 import { loadEngineEnv } from "./engine-env";
 
 describe("engine env", () => {
+	it("does not require ARI credentials when mediad is selected", () => {
+		const env = loadEngineEnv({ ENGINE_MEDIA_DRIVER: "mediad" });
+		expect(env.ENGINE_MEDIA_DRIVER).toBe("mediad");
+		expect(env.ARI_PASSWORD).toBeUndefined();
+	});
+
+	it("still requires ARI credentials when ARI is selected", () => {
+		expect(() => loadEngineEnv({ ENGINE_MEDIA_DRIVER: "ari" })).toThrow(
+			"ARI_PASSWORD: is required when ENGINE_MEDIA_DRIVER=ari",
+		);
+	});
+
 	it("treats an empty ENGINE_DEFAULT_ORGANIZATION_ID as unset", () => {
 		const env = loadEngineEnv({ ARI_PASSWORD: "x", ENGINE_DEFAULT_ORGANIZATION_ID: "" });
 		expect(env.ENGINE_DEFAULT_ORGANIZATION_ID).toBeUndefined();
@@ -32,8 +44,8 @@ describe("engine env", () => {
 	it("gives a bare deployment a working claim identity and heartbeat", () => {
 		const env = loadEngineEnv({ ARI_PASSWORD: "x" });
 		expect(env.ENGINE_INSTANCE_ID).toBe("engine");
-		// A third of the claim lease, so a claim survives two missed heartbeats.
-		expect(env.ENGINE_CLAIM_HEARTBEAT_MS).toBe(30_000);
+		// Just under a third of the lease, so the third opportunity precedes expiry.
+		expect(env.ENGINE_CLAIM_HEARTBEAT_MS).toBe(29_999);
 	});
 
 	it("takes the instance id an orchestrator supplies", () => {
@@ -42,9 +54,19 @@ describe("engine env", () => {
 		).toBe("engine-7f3a");
 	});
 
-	it("refuses a heartbeat so long that a claim would expire between ticks", () => {
-		expect(() =>
-			loadEngineEnv({ ARI_PASSWORD: "x", ENGINE_CLAIM_HEARTBEAT_MS: "600000" }),
-		).toThrow();
+	it("accepts the largest heartbeat interval whose third tick is before lease expiry", () => {
+		expect(
+			loadEngineEnv({ ARI_PASSWORD: "x", ENGINE_CLAIM_HEARTBEAT_MS: "29999" })
+				.ENGINE_CLAIM_HEARTBEAT_MS,
+		).toBe(29_999);
 	});
+
+	it.each(["30000", "90000"])(
+		"refuses heartbeat interval %s because the third tick must be strictly before expiry",
+		(value) => {
+			expect(() => loadEngineEnv({ ARI_PASSWORD: "x", ENGINE_CLAIM_HEARTBEAT_MS: value })).toThrow(
+				/ENGINE_CLAIM_HEARTBEAT_MS/u,
+			);
+		},
+	);
 });

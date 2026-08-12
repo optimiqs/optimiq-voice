@@ -72,6 +72,8 @@ export function dispositionFor(input: {
 
 /** Everything the CDR needs that the snapshot does not carry. */
 export interface CdrLegInput {
+	/** Stable UUID v7 persisted with the terminal snapshot, when this is a retryable write. */
+	readonly id?: string;
 	readonly snapshot: ChannelSnapshot;
 	readonly leg: LegSide;
 	readonly direction: CdrLegWriteData["direction"];
@@ -112,7 +114,7 @@ export function buildCdrLegWrite(input: CdrLegInput): CdrLegWriteData {
 	const answeredAt = snapshot.answeredAt;
 
 	return {
-		id: createEntityId(),
+		id: input.id ?? createEntityId(),
 		callId: snapshot.callId,
 		leg: input.leg,
 		originatingLegId: input.originatingLegId ?? null,

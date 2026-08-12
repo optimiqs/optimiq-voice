@@ -11,7 +11,7 @@ import { z } from "zod";
  * first is a wallboard that is a few seconds behind, and a stale answer to the second is two engine
  * instances both convinced they own orbit 401.
  *
- * So a claim carries three things no live-state value does:
+ * An exclusive park claim carries three things no live-state value does:
  *
  * 1. `instanceId` — the process that took it. A claim with somebody else's instance on it is not
  *    yours to release, and a claim you cannot find your own instance on is one you have lost.
@@ -20,6 +20,9 @@ import { z } from "zod";
  *    "this value is old and still correct".
  * 3. `heartbeatAt` — when the owner last said it was still alive. The thing that moves `expiresAt`
  *    forward for as long as the call is up.
+ *
+ * A conference is jointly held, so its liveness fields sit on each instance's contribution instead.
+ * That lets one crashed instance expire without making the surviving instances abandon the bridge.
  *
  * ## Why these are tolerant, like the rest of the KV contracts
  *
@@ -39,7 +42,7 @@ import { z } from "zod";
 // ---------------------------------------------------------------------------------------------
 
 /**
- * The fields every claim carries, whatever it is a claim ON.
+ * The fields every exclusively owned claim carries.
  *
  * Epoch MILLISECONDS rather than ISO strings, matching `live-state.ts`'s `channels` and for the
  * same reason: these are compared against a clock on the call path — `now >= expiresAt`, tens of
@@ -125,19 +128,31 @@ export type ParkClaim = z.infer<typeof parkClaimSchema>;
  * the create reads it and joins the WINNER's bridge on the shared media server, which is what turns
  * a split room back into one room.
  *
- * `memberCount` and `moderatorPresent` are aggregates across every instance, moved under
- * compare-and-set. They are what make `maxMembers` and "wait for the moderator" mean something on
- * more than one node — a cap counted per instance is not a cap, and a participant held for a
- * moderator who joined on another node waits forever.
+ * Each instance contributes only the members it owns. Readers discard expired contributions and
+ * derive `memberCount` and `moderatorPresent`; this is what lets a crashed instance's seats and
+ * moderator presence disappear while another instance keeps the room and bridge alive.
  */
-export const conferenceClaimSchema = claimBaseSchema
-	.extend({
+export const conferenceContributionSchema = z
+	.object({
+		memberCount: z.number().int().positive(),
+		moderatorPresent: z.boolean(),
+		/** Past this, this instance's members no longer count toward the room. */
+		expiresAt: z.number(),
+	})
+	.loose();
+
+export const conferenceClaimSchema = z
+	.object({
+		orgId: z.string().min(1),
+		claimedAt: z.number(),
 		conferenceId: z.string().min(1),
 		/** The media server's bridge id. Every instance joining this room uses THIS one. */
 		bridgeId: z.string().min(1).max(256),
-		memberCount: z.number().int().nonnegative(),
-		moderatorPresent: z.boolean(),
+		contributions: z
+			.record(z.string().min(1).max(128), conferenceContributionSchema)
+			.refine((contributions) => Object.keys(contributions).length > 0),
 	})
 	.loose();
 
 export type ConferenceClaim = z.infer<typeof conferenceClaimSchema>;
+export type ConferenceContribution = z.infer<typeof conferenceContributionSchema>;

@@ -1,6 +1,7 @@
 import { Controller, Get, HttpCode, HttpStatus, Res } from "@nestjs/common";
 import { ChannelOrchestrator } from "../calls/channel-orchestrator.service";
 import { AriConnectionService } from "../media/ari-connection.service";
+import { MediadService } from "../media/mediad.service";
 import { JetStreamService } from "../nats/jetstream.service";
 import { ParkHandoffService } from "../nats/park-handoff.service";
 import type { FastifyReply } from "fastify";
@@ -14,12 +15,12 @@ import type { FastifyReply } from "fastify";
  * new ones. Reporting `503` is how a load balancer is told to take it out of rotation while the
  * process keeps running — which is the entire point of a drain, as opposed to a restart.
  *
- * ## Why the ARI socket is the deciding dependency
+ * ## Why the selected media event feed is the deciding dependency
  *
- * An engine whose REST client works but whose event socket is down is the worst possible state:
- * it looks alive, it answers health checks, and it silently answers no calls, because every call
- * begins with a `StasisStart` on that socket. So the socket, not the HTTP port, is what "healthy"
- * means here.
+ * An engine whose command client works but whose selected event feed is down is the worst possible
+ * state: it looks alive, answers health checks, and silently loses call lifecycle. Under ARI that
+ * feed is the WebSocket; under mediad it is the `media.evt.v1.>` subscription after a successful
+ * responder probe. An unselected ARI socket is intentionally idle and cannot make mediad unhealthy.
  *
  * ## Why `park` is reported but never decides the status
  *
@@ -37,6 +38,7 @@ import type { FastifyReply } from "fastify";
 export class HealthController {
 	constructor(
 		private readonly ari: AriConnectionService,
+		private readonly mediad: MediadService,
 		private readonly jetstream: JetStreamService,
 		private readonly orchestrator: ChannelOrchestrator,
 		private readonly parkHandoff: ParkHandoffService,
@@ -65,20 +67,31 @@ export class HealthController {
 
 	private report(): HealthReport {
 		const ariConnected = this.ari.isConnected;
+		const mediaDriver = this.mediad.isSelected ? "mediad" : "ari";
+		const mediaReady = mediaDriver === "mediad" ? this.mediad.isReady : ariConnected;
 		const natsReady = this.jetstream.isReady;
 		const draining = this.orchestrator.isDraining;
 		const park = this.parkHandoff.stats;
 
 		return {
-			status: ariConnected && natsReady && !draining ? "ok" : "degraded",
+			status: mediaReady && natsReady && !draining ? "ok" : "degraded",
 			draining,
 			activeChannels: this.orchestrator.activeChannelCount,
+			media: {
+				driver: mediaDriver,
+				ready: mediaReady,
+			},
 			ari: {
 				connected: ariConnected,
 				stream: this.ari.streamStatus,
 				application: this.ari.applicationName,
 				asteriskVersion: this.ari.asteriskVersion,
 				eventsReceived: this.ari.eventCount,
+			},
+			mediad: {
+				reachable: this.mediad.isReachable,
+				subscription: this.mediad.subscriptionState,
+				eventsReceived: this.mediad.eventCount,
 			},
 			nats: {
 				connected: natsReady,
@@ -97,11 +110,20 @@ export interface HealthReport {
 	readonly status: "ok" | "degraded";
 	readonly draining: boolean;
 	readonly activeChannels: number;
+	readonly media: {
+		readonly driver: "ari" | "mediad";
+		readonly ready: boolean;
+	};
 	readonly ari: {
 		readonly connected: boolean;
 		readonly stream: string;
 		readonly application: string;
 		readonly asteriskVersion?: string;
+		readonly eventsReceived: number;
+	};
+	readonly mediad: {
+		readonly reachable: boolean;
+		readonly subscription: "idle" | "subscribed" | "closed";
 		readonly eventsReceived: number;
 	};
 	readonly nats: {

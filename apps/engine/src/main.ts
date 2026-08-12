@@ -7,6 +7,7 @@ import { ChannelOrchestrator } from "./calls/channel-orchestrator.service";
 import { loadEngineEnv } from "./config/engine-env";
 import { AriConnectionService } from "./media/ari-connection.service";
 import { MediadService } from "./media/mediad.service";
+import { StartupMediaEventBuffer } from "./media/startup-media-event-buffer";
 
 /**
  * The engine's bootstrap.
@@ -14,14 +15,15 @@ import { MediadService } from "./media/mediad.service";
  * The ORDER here is the contract, and it is written out rather than left to Nest's module
  * lifecycle because two of the steps are things Nest cannot know:
  *
- * 1. **Environment first.** A missing `ARI_PASSWORD` must stop the process before anything opens a
- *    socket, not surface as a `401` on the first inbound call.
- * 2. **Nest, then the HTTP listener.** `/healthz` must be answerable before the ARI socket opens,
- *    so an orchestrator that fails to connect is visible as `degraded` rather than as a process
- *    that never finished starting.
- * 3. **Handler, THEN socket.** The orchestrator is wired into the ARI connection before the socket
- *    is opened. A `StasisStart` that arrives with no handler registered is a call that rings until
- *    the carrier gives up.
+ * 1. **Environment first.** A missing `ARI_PASSWORD` under the ARI driver must stop the process
+ *    before anything opens a socket, not surface as a `401` on the first inbound call. The mediad
+ *    driver has no ARI dependency and therefore requires no Asterisk credential.
+ * 2. **Nest without a listener.** Providers initialise first, but no HTTP port opens while the
+ *    media source or recovered channel state is incomplete. A pod cannot report ready halfway
+ *    through replay.
+ * 3. **Handler, source, recovery, replay.** The selected event source starts into a bounded buffer
+ *    before channel KV is hydrated. Events received during recovery are then replayed serially in
+ *    arrival order, so no terminal event can slip between the snapshot read and local admission.
  * 4. **Explicit signal handling with a deadline.** Per the oikos bootstrap convention (§7): drain
  *    the calls, then close, then exit — and exit anyway if the drain overruns, because a pod that
  *    refuses to die is worse than one that drops the last few calls.
@@ -44,29 +46,25 @@ async function bootstrap(): Promise<void> {
 		abortOnError: false,
 	});
 
-	await app.listen({ port: env.ENGINE_PORT, host: env.ENGINE_HOST });
-	logger.info({ port: env.ENGINE_PORT, host: env.ENGINE_HOST }, "engine HTTP listener up");
-
 	const ari = app.get(AriConnectionService);
 	const mediad = app.get(MediadService);
 	const orchestrator = app.get(ChannelOrchestrator);
 
-	ari.setEventHandler((event) => {
-		// Fire-and-forget on purpose: awaiting here would serialise every channel's work behind
-		// every other channel's. `handleEvent` never rejects (it catches and logs), so the
-		// `void` is safe rather than a swallowed failure.
-		void orchestrator.handleEvent(event);
-	});
-	mediad.setEventHandler((event) => {
-		void orchestrator.handleEvent(event);
+	const source = env.ENGINE_MEDIA_DRIVER === "ari" ? ari : mediad;
+	const startupEvents = new StartupMediaEventBuffer(
+		async (event) => await orchestrator.handleEvent(event),
+	);
+	source.setEventHandler((event) => {
+		startupEvents.push(event);
 	});
 
-	await ari.start();
-	// A no-op unless ENGINE_MEDIA_DRIVER=mediad. Without this call the driver's commands go out
-	// and no events ever come back — no teardown, no CDR — which is why it sits beside ari.start()
-	// rather than being left to a module hook: the handler-then-socket order is the same contract.
-	await mediad.start();
-	logger.info({ app: env.ARI_APP }, "engine ready");
+	await source.start();
+	await orchestrator.hydrateChannels();
+	await startupEvents.replay();
+
+	await app.listen({ port: env.ENGINE_PORT, host: env.ENGINE_HOST });
+	logger.info({ port: env.ENGINE_PORT, host: env.ENGINE_HOST }, "engine HTTP listener up");
+	logger.info({ driver: env.ENGINE_MEDIA_DRIVER }, "engine ready");
 
 	installShutdownHandlers({ app, orchestrator, env, logger });
 }

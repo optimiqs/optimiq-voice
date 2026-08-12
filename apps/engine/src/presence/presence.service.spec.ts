@@ -3,10 +3,11 @@ import {
 	type ExtensionPresence,
 	kvKeyFor,
 	PRESENCE_DEVICE_STATES,
+	PRESENCE_KV,
 	extensionPresenceSchema,
 } from "@optimiq-voice/events";
 import { DEVICE_STATES } from "@optimiq-voice/telephony";
-import { PresenceService } from "./presence.service";
+import { PRESENCE_REFRESH_MS, PresenceService } from "./presence.service";
 import type { EngineEnv } from "../config/engine-env";
 import type { JetStreamService } from "../nats/jetstream.service";
 import type { RoutingArtifactSource } from "../routing/routing-artifact.source";
@@ -28,16 +29,38 @@ interface Written {
 	readonly value: ExtensionPresence;
 }
 
-function harness(extensions: readonly string[] = ["1001", "1002"]): {
+interface HarnessOptions {
+	readonly extensions?: readonly string[];
+	readonly putFailures?: number;
+	readonly deleteFailures?: number;
+	readonly channels?: unknown;
+	readonly resolveExtensions?: (orgId: string) => readonly string[] | undefined;
+}
+
+function harness(options: HarnessOptions = {}): {
 	readonly service: PresenceService;
 	readonly writes: Written[];
 	readonly deletes: string[];
+	readonly putAttempts: string[];
+	readonly deleteAttempts: string[];
+	readonly artifactLookups: string[];
+	readonly failNextPut: () => void;
 } {
 	const writes: Written[] = [];
 	const deletes: string[] = [];
+	const putAttempts: string[] = [];
+	const deleteAttempts: string[] = [];
+	const artifactLookups: string[] = [];
+	let putFailures = options.putFailures ?? 0;
+	let deleteFailures = options.deleteFailures ?? 0;
 
 	const presenceBucket = {
 		put: async (key: string, value: Uint8Array) => {
+			putAttempts.push(key);
+			if (putFailures > 0) {
+				putFailures -= 1;
+				throw new Error("simulated presence put failure");
+			}
 			// Parsed through the CONTRACT on the way in, so a value this service writes and the
 			// schema `apps/sipd` reads with cannot drift apart without a failure here.
 			writes.push({
@@ -49,31 +72,52 @@ function harness(extensions: readonly string[] = ["1001", "1002"]): {
 			return 1;
 		},
 		delete: async (key: string) => {
+			deleteAttempts.push(key);
+			if (deleteFailures > 0) {
+				deleteFailures -= 1;
+				throw new Error("simulated presence delete failure");
+			}
 			deletes.push(key);
 		},
 	};
 
 	const jetstream = {
-		channels: undefined,
+		channels: options.channels,
 		presence: presenceBucket,
 	} as unknown as JetStreamService;
 
+	const extensions = options.extensions ?? ["1001", "1002"];
+	const resolveExtensions =
+		options.resolveExtensions ?? ((orgId: string) => (orgId === ORG ? extensions : undefined));
 	const artifacts = {
-		get: async (orgId: string) =>
-			orgId === ORG
-				? {
+		get: async (orgId: string) => {
+			artifactLookups.push(orgId);
+			const resolvedExtensions = resolveExtensions(orgId);
+			return resolvedExtensions === undefined
+				? undefined
+				: {
 						extensionsByNumber: Object.fromEntries(
-							extensions.map((number) => [number, { number }]),
+							resolvedExtensions.map((number) => [number, { number }]),
 						),
-					}
-				: undefined,
+					};
+		},
 	} as unknown as RoutingArtifactSource;
 
 	const service = new PresenceService(jetstream, artifacts, {
 		ENGINE_INSTANCE_ID: "engine-a",
 	} as EngineEnv);
 
-	return { service, writes, deletes };
+	return {
+		service,
+		writes,
+		deletes,
+		putAttempts,
+		deleteAttempts,
+		artifactLookups,
+		failNextPut: () => {
+			putFailures += 1;
+		},
+	};
 }
 
 interface ChannelOptions {
@@ -86,7 +130,11 @@ interface ChannelOptions {
 	readonly hangupAt?: number;
 }
 
-function put(service: PresenceService, options: ChannelOptions): void {
+function channelPutEntry(options: ChannelOptions): {
+	readonly key: string;
+	readonly operation: "PUT";
+	readonly value: Uint8Array;
+} {
 	const orgId = options.orgId ?? ORG;
 	const callId = options.callId ?? "0195c0f0-1c2f-7000-8000-0000000000c1";
 	const snapshot = {
@@ -106,17 +154,66 @@ function put(service: PresenceService, options: ChannelOptions): void {
 		createdAt: 1_785_000_000_000,
 		hangupAt: options.hangupAt,
 	};
-	service.applyEntry(
-		kvKeyFor.channel(orgId, callId, options.channelId),
-		"PUT",
-		new TextEncoder().encode(JSON.stringify(snapshot)),
-	);
+	return {
+		key: kvKeyFor.channel(orgId, callId, options.channelId),
+		operation: "PUT",
+		value: new TextEncoder().encode(JSON.stringify(snapshot)),
+	};
+}
+
+function put(service: PresenceService, options: ChannelOptions): void {
+	const entry = channelPutEntry(options);
+	service.applyEntry(entry.key, entry.operation, entry.value);
 }
 
 function remove(service: PresenceService, options: ChannelOptions): void {
 	const orgId = options.orgId ?? ORG;
 	const callId = options.callId ?? "0195c0f0-1c2f-7000-8000-0000000000c1";
 	service.applyEntry(kvKeyFor.channel(orgId, callId, options.channelId), "DEL", new Uint8Array());
+}
+
+interface FakeWatchEntry {
+	readonly key: string;
+	readonly operation: "PUT" | "DEL" | "PURGE";
+	readonly value: Uint8Array;
+}
+
+function scriptedChannelWatches(replays: readonly (readonly FakeWatchEntry[])[]): {
+	readonly bucket: unknown;
+	readonly disconnects: (() => void)[];
+} {
+	const disconnects: (() => void)[] = [];
+	const bucket = {
+		watch: async (options?: { initializedFn?: () => void }) => {
+			const entries = replays[disconnects.length] ?? [];
+			let disconnect = (): void => undefined;
+			const disconnected = new Promise<void>((resolve) => {
+				disconnect = resolve;
+			});
+			disconnects.push(disconnect);
+			return {
+				stop: disconnect,
+				async *[Symbol.asyncIterator]() {
+					for (const entry of entries) {
+						yield entry;
+					}
+					options?.initializedFn?.();
+					await disconnected;
+				},
+			};
+		},
+	};
+	return { bucket, disconnects };
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() >= deadline) {
+			throw new Error("timed out waiting for presence state");
+		}
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
 }
 
 describe("the presence vocabulary", () => {
@@ -219,6 +316,55 @@ describe("PresenceService", () => {
 		expect(harnessed.writes.at(-1)?.value.state).toBe("held");
 	});
 
+	it("periodically republishes unchanged active presence before the bucket TTL", async () => {
+		put(harnessed.service, { channelId: "a", callState: "active", destinationNumber: "1001" });
+		await harnessed.service.flush();
+		expect(harnessed.writes).toHaveLength(1);
+
+		harnessed.service.refreshActivePresence();
+		await harnessed.service.flush();
+
+		expect(PRESENCE_REFRESH_MS).toBeLessThan(PRESENCE_KV.ttlMs);
+		expect(harnessed.writes).toHaveLength(2);
+		expect(harnessed.writes[1]).toMatchObject({
+			key: kvKeyFor.presence(ORG, "1001"),
+			value: { state: "active", channelCount: 1 },
+		});
+	});
+
+	it("retries a failed periodic refresh without another channel event", async () => {
+		put(harnessed.service, { channelId: "a", callState: "active", destinationNumber: "1001" });
+		await harnessed.service.flush();
+		harnessed.failNextPut();
+
+		harnessed.service.refreshActivePresence();
+		await harnessed.service.flush();
+		expect(harnessed.writes).toHaveLength(1);
+		expect(harnessed.putAttempts).toHaveLength(2);
+
+		await waitFor(() => harnessed.writes.length === 2);
+		expect(harnessed.putAttempts).toHaveLength(3);
+	});
+
+	it("requeues a failed put and records it as published only after the retry succeeds", async () => {
+		const failing = harness({ putFailures: 1 });
+		put(failing.service, { channelId: "a", callState: "active", destinationNumber: "1001" });
+
+		await failing.service.flush();
+		expect(failing.putAttempts).toHaveLength(1);
+		expect(failing.writes).toEqual([]);
+		await Promise.resolve();
+		expect(failing.putAttempts).toHaveLength(1);
+
+		await waitFor(() => failing.writes.length === 1);
+		expect(failing.putAttempts).toHaveLength(2);
+		expect(failing.writes).toHaveLength(1);
+
+		put(failing.service, { channelId: "a", callState: "active", destinationNumber: "1001" });
+		await failing.service.flush();
+		expect(failing.putAttempts).toHaveLength(2);
+	});
+
 	/**
 	 * Teardown CLEARS the key rather than writing `down`. An absent key is what the bucket's own
 	 * five-minute TTL produces anyway, so a reader that handles absence handles both — and an idle
@@ -233,6 +379,26 @@ describe("PresenceService", () => {
 
 		expect(harnessed.deletes).toEqual([kvKeyFor.presence(ORG, "1001")]);
 		expect(harnessed.service.trackedChannels).toBe(0);
+	});
+
+	it("requeues a failed delete and forgets the published key only after success", async () => {
+		const failing = harness({ deleteFailures: 1 });
+		put(failing.service, { channelId: "a", callState: "active", destinationNumber: "1001" });
+		await failing.service.flush();
+
+		remove(failing.service, { channelId: "a" });
+		await failing.service.flush();
+		expect(failing.deleteAttempts).toHaveLength(1);
+		expect(failing.deletes).toEqual([]);
+		await Promise.resolve();
+		expect(failing.deleteAttempts).toHaveLength(1);
+
+		await waitFor(() => failing.deletes.length === 1);
+		expect(failing.deleteAttempts).toHaveLength(2);
+		expect(failing.deletes).toEqual([kvKeyFor.presence(ORG, "1001")]);
+
+		await failing.service.flush();
+		expect(failing.deleteAttempts).toHaveLength(2);
 	});
 
 	it("does not delete a key it never wrote", async () => {
@@ -281,27 +447,40 @@ describe("PresenceService", () => {
 	 * bucket would grow an entry per number that has ever dialled the tenant.
 	 */
 	it("publishes nothing for a number that is not an extension of the tenant", async () => {
-		put(harnessed.service, {
+		const resolved = harness({ extensions: [] });
+		put(resolved.service, {
 			channelId: "a",
 			callState: "active",
-			callerIdNumber: "12125550100",
 			destinationNumber: "1001",
 		});
-		await harnessed.service.flush();
+		await resolved.service.flush();
+		await resolved.service.flush();
 
-		expect(harnessed.writes.map((write) => write.key)).toEqual([kvKeyFor.presence(ORG, "1001")]);
+		expect(resolved.writes).toEqual([]);
+		expect(resolved.artifactLookups).toEqual([ORG]);
 	});
 
-	it("publishes nothing for a tenant whose routing artifact cannot be resolved", async () => {
-		put(harnessed.service, {
-			orgId: OTHER_ORG,
+	it("retries an artifact outage and publishes after recovery without another channel event", async () => {
+		let available = false;
+		const recovering = harness({
+			resolveExtensions: (orgId) => (orgId === ORG && available ? ["1001"] : undefined),
+		});
+		put(recovering.service, {
 			channelId: "a",
 			callState: "active",
 			destinationNumber: "1001",
 		});
-		await harnessed.service.flush();
 
-		expect(harnessed.writes).toEqual([]);
+		await recovering.service.flush();
+		expect(recovering.writes).toEqual([]);
+		expect(recovering.artifactLookups).toEqual([ORG]);
+		await Promise.resolve();
+		expect(recovering.artifactLookups).toEqual([ORG]);
+
+		available = true;
+		await waitFor(() => recovering.writes.length === 1);
+		expect(recovering.artifactLookups).toEqual([ORG, ORG]);
+		expect(recovering.writes[0]?.key).toBe(kvKeyFor.presence(ORG, "1001"));
 	});
 
 	/**
@@ -309,7 +488,10 @@ describe("PresenceService", () => {
 	 * light one customer's lamps from another's calls.
 	 */
 	it("keys by tenant as well as by number", async () => {
-		const both = harness(["1001"]);
+		const both = harness({
+			extensions: ["1001"],
+			resolveExtensions: (orgId) => (orgId === ORG ? ["1001"] : []),
+		});
 		put(both.service, { channelId: "a", callState: "active", destinationNumber: "1001" });
 		put(both.service, {
 			orgId: OTHER_ORG,
@@ -329,15 +511,19 @@ describe("PresenceService", () => {
 	 * inside the watch loop over a caller-id string somebody dialled in with would stop presence for
 	 * the whole deployment.
 	 */
-	it("ignores a number that could not be a key token", async () => {
-		put(harnessed.service, {
+	it("permanently skips an invalid Local dial string before key or artifact lookup", async () => {
+		const unavailable = harness({ resolveExtensions: () => undefined });
+		put(unavailable.service, {
 			channelId: "a",
 			callState: "active",
-			callerIdNumber: "1001.1002",
-			destinationNumber: "1001",
+			destinationNumber: "Local/1001@optimiq-internal",
 		});
-		await harnessed.service.flush();
-		expect(harnessed.writes.map((write) => write.key)).toEqual([kvKeyFor.presence(ORG, "1001")]);
+		await unavailable.service.flush();
+		unavailable.service.refreshActivePresence();
+		await unavailable.service.flush();
+
+		expect(unavailable.artifactLookups).toEqual([]);
+		expect(unavailable.putAttempts).toEqual([]);
 	});
 
 	/**
@@ -366,5 +552,30 @@ describe("PresenceService", () => {
 		await harnessed.service.flush();
 
 		expect(harnessed.writes.at(-1)?.value.callStates).toEqual(["active", "ringing"]);
+	});
+
+	it("deletes stale presence when a reconnect replay no longer contains a tracked call", async () => {
+		const watches = scriptedChannelWatches([
+			[channelPutEntry({ channelId: "a", callState: "active", destinationNumber: "1001" })],
+			[],
+		]);
+		const watched = harness({ channels: watches.bucket });
+		watched.service.onModuleInit();
+		expect(watched.service.refreshScheduled).toBe(true);
+
+		try {
+			await waitFor(() => watched.writes.length === 1);
+			expect(watched.service.trackedChannels).toBe(1);
+
+			watches.disconnects[0]?.();
+			await waitFor(() => watches.disconnects.length >= 2);
+			await waitFor(() => watched.deletes.length === 1);
+
+			expect(watched.deletes).toEqual([kvKeyFor.presence(ORG, "1001")]);
+			expect(watched.service.trackedChannels).toBe(0);
+		} finally {
+			await watched.service.onApplicationShutdown();
+			expect(watched.service.refreshScheduled).toBe(false);
+		}
 	});
 });

@@ -1,4 +1,8 @@
 import { z } from "zod";
+import {
+	CLAIM_HEARTBEAT_INTERVAL_MS,
+	MAX_CLAIM_HEARTBEAT_INTERVAL_MS,
+} from "../routing/claim-timing";
 // Imported for its SIDE EFFECT: `@optimiq-voice/config` loads the root `.env` and hydrates
 // `APP_ENV_CONTENT` from a secret manager into `process.env`. That work must happen exactly once
 // and is not duplicated here.
@@ -20,8 +24,9 @@ import "@optimiq-voice/config";
  * `process.env` (oikos §6). Everything else injects the parsed {@link EngineEnv}.
  *
  * The failure mode is deliberate: `loadEngineEnv()` throws, and `main.ts` calls it before
- * `NestFactory.create`. A missing ARI password must stop the process at boot, not surface as a
- * `401` on the first inbound call.
+ * `NestFactory.create`. A missing ARI password must stop an ARI deployment at boot, not surface as
+ * a `401` on the first inbound call. A mediad deployment does not construct or start an ARI client,
+ * so requiring an unused Asterisk secret there would couple the replacement plane back to ARI.
  */
 
 /**
@@ -54,7 +59,7 @@ const port = (fallback: number) => z.coerce.number().int().min(1).max(65_535).de
 const durationMs = (fallback: number, max: number) =>
 	z.coerce.number().int().min(0).max(max).default(fallback);
 
-export const engineEnvSchema = z.object({
+const engineEnvObjectSchema = z.object({
 	NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
 
 	/** HTTP port for `/healthz`. The engine serves no product API. */
@@ -64,7 +69,7 @@ export const engineEnvSchema = z.object({
 	// ---- Asterisk ARI --------------------------------------------------------------------
 	ARI_URL: requiredUrl.default("http://localhost:8088"),
 	ARI_USERNAME: z.string().min(1).default("ari"),
-	ARI_PASSWORD: z.string().min(1),
+	ARI_PASSWORD: optionalCredential,
 	/** The Stasis application the dialplan hands channels to (`Stasis(optimiq-engine)`). */
 	ARI_APP: z.string().min(1).default("optimiq-engine"),
 	/**
@@ -302,10 +307,15 @@ export const engineEnvSchema = z.object({
 	/**
 	 * How often this process pushes its claims' expiry forward.
 	 *
-	 * A third of the claim lease, so a claim survives two missed heartbeats — a broker blip must not
-	 * cost a tenant an orbit that is holding a live caller.
+	 * Just under a third of the claim lease, so three heartbeat opportunities are strictly before
+	 * expiry. A broker blip must not cost a tenant an orbit that is holding a live caller.
 	 */
-	ENGINE_CLAIM_HEARTBEAT_MS: z.coerce.number().int().min(1_000).max(300_000).default(30_000),
+	ENGINE_CLAIM_HEARTBEAT_MS: z.coerce
+		.number()
+		.int()
+		.min(1_000)
+		.max(MAX_CLAIM_HEARTBEAT_INTERVAL_MS)
+		.default(CLAIM_HEARTBEAT_INTERVAL_MS),
 
 	/**
 	 * Which media plane this engine drives.
@@ -336,6 +346,16 @@ export const engineEnvSchema = z.object({
 	 * than the deadline means the instance is sick rather than busy.
 	 */
 	ENGINE_MEDIAD_RPC_TIMEOUT_MS: z.coerce.number().int().min(100).max(10_000).default(500),
+});
+
+export const engineEnvSchema = engineEnvObjectSchema.superRefine((env, context) => {
+	if (env.ENGINE_MEDIA_DRIVER === "ari" && env.ARI_PASSWORD === undefined) {
+		context.addIssue({
+			code: "custom",
+			path: ["ARI_PASSWORD"],
+			message: "is required when ENGINE_MEDIA_DRIVER=ari",
+		});
+	}
 });
 
 export type EngineEnv = z.infer<typeof engineEnvSchema>;

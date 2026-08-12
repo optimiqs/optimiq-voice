@@ -1,13 +1,20 @@
-import { Inject, Injectable } from "@nestjs/common";
+import { Inject, Injectable, type OnApplicationShutdown } from "@nestjs/common";
 import * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
 import { makeCdrLegWriteEvent, makeVoicemailEvent, validateEvent } from "@optimiq-voice/events";
+import { createEntityId } from "@optimiq-voice/identifiers";
 import { getLogger } from "@optimiq-voice/logging";
 import { resolveInbound, resolveInternal, resolveOutbound } from "@optimiq-voice/routing";
 import { isDtmfDigit } from "@optimiq-voice/telephony";
 import { CallEventPublisher } from "../nats/call-event-publisher.service";
+import {
+	CHANNEL_OWNER_EXPIRES_AT_VARIABLE,
+	CHANNEL_OWNER_INSTANCE_VARIABLE,
+	CHANNEL_OWNERSHIP_LEASE_MS,
+} from "../nats/channel-ownership";
 import { JetStreamService } from "../nats/jetstream.service";
 import { CALLS_EFFECT_RUNTIME, ENGINE_ENV, MEDIA_PORT } from "../nats/nats.tokens";
+import { OriginateService } from "../nats/originate.service";
 import { ParkHandoffService } from "../nats/park-handoff.service";
 import { SipTransferService } from "../nats/sip-transfer.service";
 import { AgentStateStore } from "../queue/agent-state.store";
@@ -15,6 +22,7 @@ import { QueueEventPublisher } from "../queue/queue-event-publisher.service";
 import { QueueMembershipSource } from "../queue/queue-membership.source";
 import { QueueCursors, QueuePositions } from "../queue/queue-registry";
 import { CallSignalBus, legSignalKey, recordingSignalKey } from "../routing/call-signals";
+import { CLAIM_HEARTBEAT_INTERVAL_MS } from "../routing/claim-timing";
 import { ConferenceRegistry } from "../routing/conference-registry";
 import { DidIndexSource } from "../routing/did-index.source";
 import { ParkRegistry } from "../routing/park-registry";
@@ -39,9 +47,11 @@ import {
 } from "./channel-identity";
 import { ChannelRegistry } from "./channel-registry";
 import { MidCallFeatureRuntime } from "./mid-call-features";
+import { planOriginate } from "./originate-plan";
 import type { EngineEnv } from "../config/engine-env";
 import type { MediaChannelSnapshot, MediaEvent } from "../media/media-event";
 import type { MediaPort } from "../media/media-port";
+import type { OriginatePlacement } from "../nats/originate.service";
 import type { PlanDestination } from "../routing/plan-destination";
 import type {
 	OriginatedLeg,
@@ -60,7 +70,7 @@ import type {
 	RouteOutcome,
 	RouteRequest,
 } from "./call-control";
-import type { CallDirection, CallEvent, LegSide } from "@optimiq-voice/events";
+import type { CallDirection, CallEvent, LegSide, OriginateRequest } from "@optimiq-voice/events";
 import type {
 	ExecutionPlan,
 	ParkPlanNode,
@@ -70,6 +80,7 @@ import type {
 import type {
 	CallerProfile,
 	CallState,
+	ChannelSnapshot,
 	HangupCause,
 	Verb,
 	VerbResult,
@@ -88,6 +99,19 @@ const DESTINATION_REF_VARIABLE = "OPTIMIQ_DESTINATION_REF";
  * snapshot an instance taking over a failover reads.
  */
 const BRIDGE_PEER_VARIABLE = "OPTIMIQ_BRIDGE_PEER_LEG_ID";
+/** Stable terminal identities and progress persisted for an acknowledged retry after failover. */
+const CDR_ID_VARIABLE = "OPTIMIQ_CDR_ID";
+const CDR_HANGUP_CAUSE_CODE_VARIABLE = "OPTIMIQ_CDR_HANGUP_CAUSE_CODE";
+const TERMINAL_HANGUP_EVENT_ID_VARIABLE = "OPTIMIQ_TERMINAL_HANGUP_EVENT_ID";
+const TERMINAL_DESTROYED_EVENT_ID_VARIABLE = "OPTIMIQ_TERMINAL_DESTROYED_EVENT_ID";
+const TERMINAL_EVENTS_PUBLISHED_VARIABLE = "OPTIMIQ_TERMINAL_EVENTS_PUBLISHED";
+const CDR_RETRY_INITIAL_DELAY_MS = 100;
+const CDR_RETRY_MAX_DELAY_MS = 30_000;
+
+function cdrRetryDelay(attempt: number): number {
+	const exponent = Math.min(Math.max(0, attempt), 16);
+	return Math.min(CDR_RETRY_INITIAL_DELAY_MS * 2 ** exponent, CDR_RETRY_MAX_DELAY_MS);
+}
 
 /**
  * The channel orchestrator — the engine's core.
@@ -117,6 +141,10 @@ const BRIDGE_PEER_VARIABLE = "OPTIMIQ_BRIDGE_PEER_LEG_ID";
  * 4. **Nothing here throws into the ARI socket.** A handler that throws inside a WebSocket
  *    callback is an unhandled rejection that takes the process — and therefore every live call —
  *    down. Failures are logged and, where they are the call's problem, the call is hung up.
+ * 5. **One live leg has one engine owner.** Before local state is created, the replica takes the
+ *    canonical `channels` KV key with compare-and-set. A loser neither admits nor hangs up the leg;
+ *    broadcast media events still reach every replica, and only the winner has registry state
+ *    capable of acting on them.
  *
  * ## Routing
  *
@@ -137,7 +165,7 @@ const BRIDGE_PEER_VARIABLE = "OPTIMIQ_BRIDGE_PEER_LEG_ID";
  * every B-leg as an inbound call with its own CDR.
  */
 @Injectable()
-export class ChannelOrchestrator {
+export class ChannelOrchestrator implements OnApplicationShutdown {
 	private readonly logger = getLogger("engine.calls");
 	private readonly registry = new ChannelRegistry();
 	/** Detached routing walks, so the drain and the integration suite can await settlement. */
@@ -161,6 +189,14 @@ export class ChannelOrchestrator {
 	 * call it was armed for. See {@link ChannelOrchestrator.armCallDurationCeiling}.
 	 */
 	private readonly durationCeilings = new Map<string, ReturnType<typeof setTimeout>>();
+	/** One capped-backoff terminal reporting retry timer per leg. */
+	private readonly cdrRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	private readonly cdrRetryAttempts = new Map<string, number>();
+	/** Coalesces a timer, a redelivered terminal event and startup recovery onto one reporting attempt. */
+	private readonly cdrWrites = new Map<string, Promise<void>>();
+	private cdrRetriesStopped = false;
+	private ownershipMaintenanceTimer: ReturnType<typeof setInterval> | undefined;
+	private ownershipMaintenance: Promise<void> | undefined;
 
 	constructor(
 		@Inject(ENGINE_ENV) private readonly env: EngineEnv,
@@ -183,6 +219,7 @@ export class ChannelOrchestrator {
 		private readonly callControl: CallControlRegistry,
 		private readonly parkHandoff: ParkHandoffService,
 		private readonly sipTransfer: SipTransferService,
+		private readonly originate: OriginateService,
 	) {
 		this.control = new CallControl({
 			media: this.media,
@@ -249,6 +286,10 @@ export class ChannelOrchestrator {
 			isDialableTarget: async (leg, destination) => await this.isDialableFromLeg(leg, destination),
 			transfer: async (leg, request) => await this.control.transfer(leg, request),
 		});
+		// Click-to-call, arriving from `apps/api` on `rpc.engine.v1.originate`. Same push, same reason.
+		this.originate.attach({
+			place: async (request) => await this.placeOriginatedCall(request),
+		});
 	}
 
 	/** Live legs this instance is handling. `/healthz` and the drain both read it. */
@@ -274,6 +315,162 @@ export class ChannelOrchestrator {
 	 */
 	async awaitWalks(): Promise<void> {
 		await Promise.allSettled(this.walks.values());
+	}
+
+	/** Rebuilds the local aggregate registry after the selected media event source starts buffering. */
+	async hydrateChannels(now = Date.now()): Promise<number> {
+		let hydrated = 0;
+		for await (const snapshot of this.jetstream.channelSnapshots()) {
+			if (await this.hydrateChannel(snapshot, now)) {
+				hydrated += 1;
+			}
+		}
+
+		this.startOwnershipMaintenance();
+		this.logger.info({ channels: hydrated }, "hydrated channel state from KV");
+		return hydrated;
+	}
+
+	/** Renews local leases and adopts snapshots whose previous owner stopped heartbeating. */
+	async maintainChannelOwnership(now = Date.now()): Promise<void> {
+		if (this.draining) {
+			return;
+		}
+		const inFlight = this.ownershipMaintenance;
+		if (inFlight !== undefined) {
+			await inFlight;
+			return;
+		}
+
+		const maintenance = this.runChannelOwnershipMaintenance(now);
+		this.ownershipMaintenance = maintenance;
+		try {
+			await maintenance;
+		} finally {
+			if (this.ownershipMaintenance === maintenance) {
+				this.ownershipMaintenance = undefined;
+			}
+		}
+	}
+
+	private async runChannelOwnershipMaintenance(now: number): Promise<void> {
+		const fenced = new Set<string>();
+		for (const aggregate of this.registry.all) {
+			const renewed = await this.jetstream.renewChannel(aggregate.snapshot, now);
+			if (renewed === "lost") {
+				await this.fenceChannel(aggregate, "the channels KV revision changed");
+				fenced.add(aggregate.ariChannelId);
+				continue;
+			}
+			if (renewed === "unavailable") {
+				const expiresAt = this.jetstream.ownedChannelLeaseExpiresAt(aggregate.snapshot);
+				if (expiresAt === undefined || now >= expiresAt) {
+					await this.fenceChannel(
+						aggregate,
+						expiresAt === undefined
+							? "no acknowledged lease expiry is available"
+							: `the last acknowledged lease expired at ${String(expiresAt)}`,
+					);
+					fenced.add(aggregate.ariChannelId);
+				}
+			}
+		}
+
+		for await (const snapshot of this.jetstream.channelSnapshots()) {
+			try {
+				if (fenced.has(ChannelAggregate.hydrate(snapshot).ariChannelId)) {
+					continue;
+				}
+			} catch {
+				// Let the ordinary hydration path log the malformed snapshot with its channel identity.
+			}
+			await this.hydrateChannel(snapshot, now);
+		}
+	}
+
+	private async hydrateChannel(snapshot: ChannelSnapshot, now: number): Promise<boolean> {
+		try {
+			const candidate = ChannelAggregate.hydrate(snapshot);
+			if (this.registry.byAriChannelId(candidate.ariChannelId) !== undefined) {
+				return false;
+			}
+			const claim = await this.jetstream.adoptChannel(snapshot, now);
+			if (claim !== "claimed") {
+				return false;
+			}
+			const recoverable =
+				(await this.jetstream.readChannel(
+					snapshot.organizationId,
+					snapshot.callId,
+					snapshot.channelId,
+				)) ?? snapshot;
+
+			if (recoverable.state === "destroyed") {
+				await this.jetstream.deleteChannel(recoverable);
+				return false;
+			}
+
+			const aggregate = ChannelAggregate.hydrate(recoverable);
+			this.registry.add(aggregate);
+			const sipCallId = normalizeSipCallId(recoverable.variables[SIP_CALL_ID_VARIABLE]);
+			if (sipCallId !== undefined) {
+				this.registry.indexSipDialog(aggregate, sipCallId);
+			}
+			try {
+				await this.media.watchChannel(aggregate.ariChannelId);
+			} catch (error) {
+				this.logger.warn(
+					{ ariChannelId: aggregate.ariChannelId, err: String(error) },
+					"could not restore the channel event subscription",
+				);
+			}
+			if (aggregate.state === "reporting") {
+				await this.finishReporting(aggregate, this.cdrCauseCodeFor(aggregate, 0));
+			}
+			return true;
+		} catch (error) {
+			this.logger.warn(
+				{ channelId: snapshot.channelId, callId: snapshot.callId, err: String(error) },
+				"ignored a channel snapshot that cannot be recovered",
+			);
+			return false;
+		}
+	}
+
+	private async fenceChannel(aggregate: ChannelAggregate, reason: string): Promise<void> {
+		if (this.registry.byAriChannelId(aggregate.ariChannelId) !== aggregate) {
+			return;
+		}
+		aggregate.detach();
+		this.registry.remove(aggregate);
+		this.dtmf.release(aggregate.channelId);
+		this.midCall.release(aggregate.ariChannelId);
+		this.disarmCallDurationCeiling(aggregate.ariChannelId);
+		this.clearCdrRetry(aggregate.ariChannelId);
+		await this.jetstream.releaseChannelOwnership(aggregate.snapshot);
+		this.logger.warn(
+			{ channelId: aggregate.channelId, callId: aggregate.callId, reason },
+			"stopped handling a channel after losing its ownership lease",
+		);
+	}
+
+	private startOwnershipMaintenance(): void {
+		if (this.draining || this.ownershipMaintenanceTimer !== undefined) {
+			return;
+		}
+		this.ownershipMaintenanceTimer = setInterval(() => {
+			void this.maintainChannelOwnership().catch((error: unknown) => {
+				this.logger.error({ err: String(error) }, "channel ownership maintenance failed");
+			});
+		}, CLAIM_HEARTBEAT_INTERVAL_MS);
+		this.ownershipMaintenanceTimer.unref?.();
+	}
+
+	private stopOwnershipMaintenance(): void {
+		if (this.ownershipMaintenanceTimer !== undefined) {
+			clearInterval(this.ownershipMaintenanceTimer);
+			this.ownershipMaintenanceTimer = undefined;
+		}
 	}
 
 	/**
@@ -422,6 +619,7 @@ export class ChannelOrchestrator {
 		}
 
 		const direction = callDirectionFrom(variables.OPTIMIQ_CALL_DIRECTION);
+		const admittedAt = Date.now();
 		const aggregate = ChannelAggregate.create({
 			ariChannelId: channel.id,
 			channelId: legIdForAriChannel(channel.id),
@@ -430,9 +628,28 @@ export class ChannelOrchestrator {
 			direction,
 			leg: "a",
 			profile: profileFrom(channel, variables.OPTIMIQ_ROUTING_CONTEXT),
-			variables: definedOnly(variables),
-			createdAt: Date.now(),
+			variables: {
+				...definedOnly(variables),
+				[CHANNEL_OWNER_INSTANCE_VARIABLE]: this.env.ENGINE_INSTANCE_ID,
+				[CHANNEL_OWNER_EXPIRES_AT_VARIABLE]: String(admittedAt + CHANNEL_OWNERSHIP_LEASE_MS),
+			},
+			createdAt: admittedAt,
 		});
+
+		const claim = await this.jetstream.claimChannel(aggregate.snapshot, admittedAt);
+		if (claim !== "claimed") {
+			// Never hang up here: `owned` means the winner is actively serving this exact leg, and
+			// `unavailable` cannot prove that no winner exists. Failing closed avoids split ownership.
+			this.logger.info(
+				{
+					mediaChannelId: channel.id,
+					organizationId,
+					claim,
+				},
+				"not admitting a leg this replica does not exclusively own",
+			);
+			return;
+		}
 
 		this.registry.add(aggregate);
 		// Read in the same batch as the other four variables, so indexing it costs no extra round trip.
@@ -687,8 +904,12 @@ export class ChannelOrchestrator {
 			now: new Date(),
 			...(route.dialedNumber === undefined ? {} : { dialedNumber: route.dialedNumber }),
 			// What the caller actually pressed, so the Kari's Law notification can say `9911` rather
-			// than the `911` the switch sent.
-			...(channel.dialedNumber === undefined ? {} : { originalDialedNumber: channel.dialedNumber }),
+			// than the `911` the switch sent. Same precedence as the resolve above: on an originated
+			// leg the digits are the ones the API was asked to dial, and the channel has none.
+			...(() => {
+				const pressed = aggregate.snapshot.variables.OPTIMIQ_DIALED_NUMBER ?? channel.dialedNumber;
+				return pressed === undefined ? {} : { originalDialedNumber: pressed };
+			})(),
 			...(route.callerIdNumber === undefined ? {} : { callerIdNumber: route.callerIdNumber }),
 			...(route.callerIdName === undefined ? {} : { callerIdName: route.callerIdName }),
 			...(route.featureArgument === undefined ? {} : { featureArgument: route.featureArgument }),
@@ -1125,10 +1346,11 @@ export class ChannelOrchestrator {
 	 */
 	private legHooksFor(aLeg: ChannelAggregate): OriginatedLegHooks {
 		return {
-			originated: (leg) => {
+			originated: async (leg) => {
 				if (this.registry.byAriChannelId(leg.mediaChannelId) !== undefined) {
 					return;
 				}
+				const admittedAt = Date.now();
 				const bLeg = ChannelAggregate.create({
 					ariChannelId: leg.mediaChannelId,
 					channelId: legIdForAriChannel(leg.mediaChannelId),
@@ -1149,6 +1371,8 @@ export class ChannelOrchestrator {
 					variables: {
 						OPTIMIQ_LEG: "b",
 						OPTIMIQ_ORIGINATING_LEG_ID: aLeg.channelId,
+						[CHANNEL_OWNER_INSTANCE_VARIABLE]: this.env.ENGINE_INSTANCE_ID,
+						[CHANNEL_OWNER_EXPIRES_AT_VARIABLE]: String(admittedAt + CHANNEL_OWNERSHIP_LEASE_MS),
 						...(leg.destinationType === undefined
 							? {}
 							: { [DESTINATION_TYPE_VARIABLE]: leg.destinationType }),
@@ -1156,15 +1380,19 @@ export class ChannelOrchestrator {
 							? {}
 							: { [DESTINATION_REF_VARIABLE]: leg.destinationRef }),
 					},
-					createdAt: Date.now(),
+					createdAt: admittedAt,
 				});
+				const claim = await this.jetstream.claimChannel(bLeg.snapshot, admittedAt);
+				if (claim !== "claimed") {
+					throw new Error(`cannot originate ${leg.mediaChannelId}: channel ownership is ${claim}`);
+				}
 				this.registry.add(bLeg);
 				// A B-leg is created, then immediately dialled: `initializing` is the state that says
 				// "the endpoint is known, the INVITE has not gone out yet".
 				bLeg.transitionTo("initializing");
 				bLeg.transitionTo("routing");
 				bLeg.transitionTo("executing");
-				void this.publishBLegCreated(bLeg, aLeg, leg);
+				await this.publishBLegCreated(bLeg, aLeg, leg);
 			},
 			hangingUp: (mediaChannelId, cause) => {
 				const aggregate = this.registry.byAriChannelId(mediaChannelId);
@@ -1287,7 +1515,12 @@ export class ChannelOrchestrator {
 		channel: MediaChannelSnapshot,
 	): ResolvedRoute {
 		const now = new Date();
-		const dialed = dialStringOr(channel.dialedNumber);
+		// The variable wins over the channel's own extension, and only an ORIGINATED leg has one:
+		// an ARI origination into the Stasis application creates a channel with no dialplan, so the
+		// number it is for cannot be read off it. See `OPTIMIQ_DIALED_NUMBER` in `channel-identity.ts`.
+		const dialed = dialStringOr(
+			aggregate.snapshot.variables.OPTIMIQ_DIALED_NUMBER ?? channel.dialedNumber,
+		);
 		const caller = channel.callerNumber?.trim();
 		const callerName = channel.callerName?.trim();
 		const context = aggregate.snapshot.variables.OPTIMIQ_ROUTING_CONTEXT;
@@ -1624,11 +1857,12 @@ export class ChannelOrchestrator {
 			return;
 		}
 		this.dtmf.release(aggregate.channelId);
-		this.midCall.release(aggregate.channelId);
+		this.midCall.release(mediaChannelId);
 	}
 
 	/**
-	 * The leg is gone. Publishes the terminal event pair and the CDR, then clears the KV mirror.
+	 * The leg is gone. Durably records terminal recovery state, publishes the terminal event pair and
+	 * the CDR, then clears the KV mirror.
 	 *
 	 * The order is load-bearing: `channel.hangup` (why it ended) before `channel.destroyed` (that
 	 * it ended) before `cdr.leg.write` (what it cost), and the KV entry is only cleared once the
@@ -1662,6 +1896,13 @@ export class ChannelOrchestrator {
 		if (aggregate === undefined) {
 			return;
 		}
+		if (aggregate.state === "reporting") {
+			await this.finishReporting(aggregate, causeCode);
+			return;
+		}
+		if (aggregate.state === "destroyed") {
+			return;
+		}
 
 		// BEFORE the cause is fixed and before the CDR is written, because two of these change what
 		// the record says: completing an attended transfer fixes this leg's cause as
@@ -1679,47 +1920,216 @@ export class ChannelOrchestrator {
 		aggregate.markHangup({ cause: reportedCause, at, initiatedByEngine: false });
 
 		this.dtmf.release(aggregate.channelId);
-		this.midCall.release(aggregate.channelId);
+		this.midCall.release(mediaChannelId);
 
 		aggregate.tryTransitionTo("hangup");
 		aggregate.tryCallStateTo("hangup");
 
-		const leg = legSideOf(aggregate);
+		await this.finishReporting(aggregate, causeCode);
+	}
+
+	/** Publishes retry-stable terminal facts and only then removes the aggregate and its snapshot. */
+	private async finishReporting(
+		aggregate: ChannelAggregate,
+		fallbackCauseCode: number,
+	): Promise<void> {
+		const mediaChannelId = aggregate.ariChannelId;
+		const inFlight = this.cdrWrites.get(mediaChannelId);
+		if (inFlight !== undefined) {
+			await inFlight;
+			return;
+		}
+
+		this.clearCdrRetryTimer(mediaChannelId);
+		const attempt = this.attemptFinishReporting(aggregate, fallbackCauseCode);
+		this.cdrWrites.set(mediaChannelId, attempt);
+		try {
+			await attempt;
+		} finally {
+			if (this.cdrWrites.get(mediaChannelId) === attempt) {
+				this.cdrWrites.delete(mediaChannelId);
+			}
+		}
+	}
+
+	private async attemptFinishReporting(
+		aggregate: ChannelAggregate,
+		fallbackCauseCode: number,
+	): Promise<void> {
+		const enteringReporting = aggregate.state === "hangup";
+		if (aggregate.state === "hangup") {
+			aggregate.transitionTo("reporting");
+		}
+		if (aggregate.state !== "reporting") {
+			return;
+		}
+
+		const variables = aggregate.snapshot.variables;
+		const hasTerminalEventIds =
+			variables[TERMINAL_HANGUP_EVENT_ID_VARIABLE] !== undefined ||
+			variables[TERMINAL_DESTROYED_EVENT_ID_VARIABLE] !== undefined;
+		// Reporting snapshots written before terminal event recovery was introduced can only have
+		// reached this state after publishing both events. Preserve that shipped behavior rather than
+		// replaying them once with newly invented IDs during an upgrade.
+		if (!enteringReporting && !hasTerminalEventIds) {
+			aggregate.setVariable(TERMINAL_EVENTS_PUBLISHED_VARIABLE, "true");
+		} else {
+			if (variables[TERMINAL_HANGUP_EVENT_ID_VARIABLE] === undefined) {
+				aggregate.setVariable(TERMINAL_HANGUP_EVENT_ID_VARIABLE, createEntityId());
+			}
+			if (variables[TERMINAL_DESTROYED_EVENT_ID_VARIABLE] === undefined) {
+				aggregate.setVariable(TERMINAL_DESTROYED_EVENT_ID_VARIABLE, createEntityId());
+			}
+		}
+		if (aggregate.snapshot.variables[CDR_ID_VARIABLE] === undefined) {
+			aggregate.setVariable(CDR_ID_VARIABLE, createEntityId());
+		}
+		if (aggregate.snapshot.variables[CDR_HANGUP_CAUSE_CODE_VARIABLE] === undefined) {
+			aggregate.setVariable(CDR_HANGUP_CAUSE_CODE_VARIABLE, String(fallbackCauseCode));
+		}
+		// A real barrier, not the best-effort live mirror. Publishing without this acknowledgement
+		// would leave neither the terminal events nor a recoverable reporting snapshot after a crash.
+		const persisted = await this.jetstream.persistChannel(aggregate.snapshot);
+		if (!persisted) {
+			this.logger.error(
+				{ channelId: aggregate.channelId, callId: aggregate.callId },
+				"failed to persist the terminal channel snapshot; deferring terminal reporting",
+			);
+			this.scheduleCdrRetry(aggregate, fallbackCauseCode);
+			return;
+		}
+
+		const causeCode = this.cdrCauseCodeFor(aggregate, fallbackCauseCode);
 		const cause = aggregate.hangupCause ?? "NORMAL_UNSPECIFIED";
-		const side = hangupSideFor({ leg, initiatedByEngine: aggregate.wasHungUpByEngine });
-
-		await this.events.publish("channel.hangup", {
-			orgId: aggregate.organizationId,
-			callId: aggregate.callId,
-			data: {
-				legId: aggregate.channelId,
-				cause,
-				// The RAW wire code, not the code of the named cause: an unnamed Q.850 point maps to
-				// `NORMAL_UNSPECIFIED` but its number is the only evidence of what really happened.
-				causeCode,
-				side,
-			},
+		const side = hangupSideFor({
+			leg: legSideOf(aggregate),
+			initiatedByEngine: aggregate.wasHungUpByEngine,
 		});
+		const endedAt = aggregate.snapshot.hangupAt ?? Date.now();
+		if (aggregate.snapshot.variables[TERMINAL_EVENTS_PUBLISHED_VARIABLE] !== "true") {
+			const hangupPublished = await this.events.publish("channel.hangup", {
+				orgId: aggregate.organizationId,
+				callId: aggregate.callId,
+				id: aggregate.snapshot.variables[TERMINAL_HANGUP_EVENT_ID_VARIABLE],
+				at: new Date(endedAt),
+				data: {
+					legId: aggregate.channelId,
+					cause,
+					// The RAW wire code, not the code of the named cause: an unnamed Q.850 point maps
+					// to `NORMAL_UNSPECIFIED`, but its number is the only evidence of what happened.
+					causeCode,
+					side,
+				},
+			});
+			if (hangupPublished === undefined) {
+				this.scheduleCdrRetry(aggregate, causeCode);
+				return;
+			}
 
-		aggregate.transitionTo("reporting");
+			const destroyedPublished = await this.events.publish("channel.destroyed", {
+				orgId: aggregate.organizationId,
+				callId: aggregate.callId,
+				id: aggregate.snapshot.variables[TERMINAL_DESTROYED_EVENT_ID_VARIABLE],
+				at: new Date(endedAt),
+				data: {
+					legId: aggregate.channelId,
+					durationMs: Math.max(0, endedAt - aggregate.snapshot.createdAt),
+				},
+			});
+			if (destroyedPublished === undefined) {
+				this.scheduleCdrRetry(aggregate, causeCode);
+				return;
+			}
 
-		const endedAt = aggregate.snapshot.hangupAt ?? at;
-		await this.events.publish("channel.destroyed", {
-			orgId: aggregate.organizationId,
-			callId: aggregate.callId,
-			data: {
-				legId: aggregate.channelId,
-				durationMs: Math.max(0, endedAt - aggregate.snapshot.createdAt),
-			},
-		});
+			aggregate.setVariable(TERMINAL_EVENTS_PUBLISHED_VARIABLE, "true");
+			if (!(await this.jetstream.persistChannel(aggregate.snapshot))) {
+				this.logger.error(
+					{ channelId: aggregate.channelId, callId: aggregate.callId },
+					"failed to persist terminal event progress; deferring the CDR",
+				);
+				this.scheduleCdrRetry(aggregate, causeCode);
+				return;
+			}
+		}
 
-		await this.writeCdr(aggregate, { cause, causeCode, side, endedAt });
+		const published = await this.writeCdr(aggregate, { cause, causeCode, side, endedAt });
+		if (!published) {
+			this.scheduleCdrRetry(aggregate, causeCode);
+			return;
+		}
 
+		this.clearCdrRetry(aggregate.ariChannelId);
 		aggregate.transitionTo("destroyed");
 		await this.jetstream.deleteChannel(aggregate.snapshot);
 		this.registry.remove(aggregate);
-
 		await this.endBridgePeer(aggregate);
+	}
+
+	private cdrCauseCodeFor(aggregate: ChannelAggregate, fallback: number): number {
+		const persisted = Number(aggregate.snapshot.variables[CDR_HANGUP_CAUSE_CODE_VARIABLE]);
+		return Number.isInteger(persisted) ? persisted : fallback;
+	}
+
+	private scheduleCdrRetry(aggregate: ChannelAggregate, fallbackCauseCode: number): void {
+		const mediaChannelId = aggregate.ariChannelId;
+		if (
+			this.cdrRetriesStopped ||
+			aggregate.state !== "reporting" ||
+			this.registry.byAriChannelId(mediaChannelId) !== aggregate ||
+			this.cdrRetryTimers.has(mediaChannelId)
+		) {
+			return;
+		}
+
+		const attempt = this.cdrRetryAttempts.get(mediaChannelId) ?? 0;
+		const delayMs = cdrRetryDelay(attempt);
+		this.cdrRetryAttempts.set(mediaChannelId, attempt + 1);
+		const timer = setTimeout(() => {
+			this.cdrRetryTimers.delete(mediaChannelId);
+			void this.finishReporting(aggregate, fallbackCauseCode).catch((error: unknown) => {
+				this.logger.error(
+					{ channelId: aggregate.channelId, callId: aggregate.callId, err: String(error) },
+					"an autonomous terminal reporting retry failed unexpectedly",
+				);
+				this.scheduleCdrRetry(aggregate, fallbackCauseCode);
+			});
+		}, delayMs);
+		timer.unref?.();
+		this.cdrRetryTimers.set(mediaChannelId, timer);
+	}
+
+	private clearCdrRetryTimer(mediaChannelId: string): void {
+		const timer = this.cdrRetryTimers.get(mediaChannelId);
+		if (timer !== undefined) {
+			clearTimeout(timer);
+			this.cdrRetryTimers.delete(mediaChannelId);
+		}
+	}
+
+	private clearCdrRetry(mediaChannelId: string): void {
+		this.clearCdrRetryTimer(mediaChannelId);
+		this.cdrRetryAttempts.delete(mediaChannelId);
+	}
+
+	private async stopCdrRetries(): Promise<void> {
+		this.cdrRetriesStopped = true;
+		for (const mediaChannelId of this.cdrRetryTimers.keys()) {
+			this.clearCdrRetryTimer(mediaChannelId);
+		}
+
+		// One final immediate attempt while JetStream is still available. A remaining failure keeps
+		// the reporting snapshot in KV for startup recovery rather than leaving a live timer behind.
+		const reporting = this.registry.all.filter((aggregate) => aggregate.state === "reporting");
+		await Promise.allSettled(
+			reporting.map(
+				async (aggregate) =>
+					await this.finishReporting(aggregate, this.cdrCauseCodeFor(aggregate, 0)),
+			),
+		);
+		for (const mediaChannelId of this.cdrRetryTimers.keys()) {
+			this.clearCdrRetryTimer(mediaChannelId);
+		}
+		this.cdrRetryAttempts.clear();
 	}
 
 	/**
@@ -1808,7 +2218,7 @@ export class ChannelOrchestrator {
 			readonly side: ReturnType<typeof hangupSideFor>;
 			readonly endedAt: number;
 		},
-	): Promise<void> {
+	): Promise<boolean> {
 		try {
 			// The destination the routing walk reached, mirrored onto the leg as channel variables
 			// so it survives a failover. Absent means the leg was never routed, and the CDR says
@@ -1821,6 +2231,7 @@ export class ChannelOrchestrator {
 			const originatingLegId = aggregate.snapshot.variables.OPTIMIQ_ORIGINATING_LEG_ID;
 			const bridgeLegId = aggregate.snapshot.variables[BRIDGE_PEER_VARIABLE];
 			const data = buildCdrLegWrite({
+				id: aggregate.snapshot.variables[CDR_ID_VARIABLE],
 				snapshot: aggregate.snapshot,
 				leg: legSideOf(aggregate),
 				direction: callDirectionFrom(aggregate.snapshot.variables.OPTIMIQ_CALL_DIRECTION),
@@ -1834,19 +2245,23 @@ export class ChannelOrchestrator {
 				...(destinationRef === undefined ? {} : { destinationRef }),
 			});
 			const envelope = makeCdrLegWriteEvent({
+				id: data.id,
+				at: new Date(input.endedAt),
 				orgId: aggregate.organizationId,
 				source: "engine",
 				data,
 			});
 			validateEvent(envelope.subject, envelope);
 			await this.jetstream.publishCdrLeg(envelope);
+			return true;
 		} catch (error) {
-			// Logged at ERROR and deliberately not rethrown: the leg is already gone, so there is
-			// nothing to fail. This is the line an operator alerts on — a missing CDR is revenue.
+			// The aggregate remains in `reporting` and in KV. A redelivered terminal event, including
+			// one received by a replacement process, retries this same idempotency key.
 			this.logger.error(
 				{ channelId: aggregate.channelId, callId: aggregate.callId, err: String(error) },
 				"failed to publish the CDR for a finished leg",
 			);
+			return false;
 		}
 	}
 
@@ -1867,10 +2282,12 @@ export class ChannelOrchestrator {
 	 */
 	async drain(timeoutMs: number = this.env.ENGINE_DRAIN_TIMEOUT_MS): Promise<void> {
 		this.draining = true;
+		this.stopOwnershipMaintenance();
 		this.registry.closeForNewCalls();
 		// Every walk is waiting on a signal that will never come once the calls are gone. Dropping
 		// the waiters lets the timers fire and the walks settle instead of holding the drain open.
 		this.signals.clear();
+		this.midCall.clear();
 		// Park timeouts and consultation watchers are the same problem one layer up: a lot's ringback
 		// timer would otherwise fire during the drain and route a call on an instance that is leaving.
 		this.control.clear();
@@ -1889,6 +2306,7 @@ export class ChannelOrchestrator {
 
 		const stragglers = this.registry.all;
 		if (stragglers.length === 0) {
+			await this.stopCdrRetries();
 			return;
 		}
 
@@ -1904,6 +2322,12 @@ export class ChannelOrchestrator {
 			});
 			await this.hangupQuietly(aggregate.ariChannelId, "NORMAL_TEMPORARY_FAILURE");
 		}
+		await this.stopCdrRetries();
+	}
+
+	async onApplicationShutdown(): Promise<void> {
+		this.stopOwnershipMaintenance();
+		await this.stopCdrRetries();
 	}
 
 	// -------------------------------------------------------------------------------------------
@@ -2118,6 +2542,153 @@ export class ChannelOrchestrator {
 			now: new Date(),
 		});
 		return resolved.matched && resolved.plan !== undefined;
+	}
+
+	/**
+	 * Places a click-to-call: ring the extension, and let the ordinary routing path dial the target
+	 * when it answers.
+	 *
+	 * ## The seam, and why it is this one
+	 *
+	 * There are three places a click-to-call could have been bolted on, and two of them are worse.
+	 *
+	 * It could have originated the TARGET first and bridged the extension to it afterwards, which is
+	 * what a naive `Originate` does — and which makes the far end listen to silence while somebody
+	 * wanders back to their desk, and bills the tenant for the attempt when they never do.
+	 *
+	 * It could have originated the extension and then driven the B-side itself, through
+	 * {@link routeLeg}. That is closer, and it is still wrong: `routeLeg` exists for a leg that is
+	 * ALREADY up and being re-pointed, so it resolves in the `internal` context and does not fall
+	 * through to outbound — a transfer must not become a way to dial anywhere. A click-to-call is not
+	 * a transfer; it is the extension's own first dial, and it must be resolved exactly as one.
+	 *
+	 * So the seam is the ORDINARY one. The A-leg is originated into the Stasis application with no
+	 * `OPTIMIQ_LEG`, which means `onLegArrived` files it as a new A-leg, `runRoutedProgram` resolves
+	 * it against the tenant's artifact through the same internal-then-outbound ladder any handset
+	 * gets, and the walker dials the target, publishes the events, mirrors the channels bucket and
+	 * writes the CDRs. Follow-me, ring groups, queues, time conditions and call blocking all apply,
+	 * for free, because none of this is a second code path.
+	 *
+	 * The one thing the ordinary path could not supply is the dialled number: an ARI origination
+	 * creates a channel with no dialplan, so there is nothing to read it off. That is the entire new
+	 * surface — one channel variable, `OPTIMIQ_DIALED_NUMBER`, preferred over the channel's own
+	 * extension in {@link resolveRoute}. See `channel-identity.ts` for why it does not feed
+	 * attribution.
+	 *
+	 * ## Idempotency
+	 *
+	 * `originateId` becomes the media channel id, so a retry of a request whose reply was lost finds
+	 * a channel this instance is already tracking and is answered with the ids of the call it already
+	 * placed. Without that, a five-second timeout on a slow media server would ring somebody's desk
+	 * twice for one click.
+	 */
+	private async placeOriginatedCall(request: OriginateRequest): Promise<OriginatePlacement> {
+		const existing = this.registry.byAriChannelId(request.originateId);
+		if (existing !== undefined) {
+			// The retry path. Answered `placed` rather than refused: the caller asked for a call to
+			// exist and it does, which is the same outcome by any measure the caller can act on.
+			return {
+				kind: "placed",
+				callId: existing.callId,
+				legId: existing.channelId,
+				endpoint: existing.snapshot.profile.channelName ?? "",
+			};
+		}
+
+		if (this.draining || !this.registry.isAccepting) {
+			return {
+				kind: "refused",
+				reason: "shutting_down",
+				error: "this engine instance is draining",
+			};
+		}
+		if (this.env.ENGINE_MEDIA_DRIVER !== "ari") {
+			// `apps/mediad` refuses origination by design — SIP signalling is `apps/sipd`'s. A named
+			// refusal beats letting `MediaPort.originate` throw and reporting every extension in the
+			// tenant as unregistered.
+			return {
+				kind: "refused",
+				reason: "not_supported",
+				error: `this engine's media driver (${this.env.ENGINE_MEDIA_DRIVER}) cannot originate`,
+			};
+		}
+
+		const artifact = await this.routing.get(request.orgId);
+		if (artifact === undefined) {
+			// NOT `unknown_extension`: the extension may well exist. What is missing is the compiled
+			// plan, which is the control plane's to publish, and saying "no such extension" here would
+			// send an integrator looking at their own configuration for our outage.
+			return {
+				kind: "refused",
+				reason: "internal",
+				error: `no routing artifact for organization ${request.orgId}`,
+			};
+		}
+
+		const plan = planOriginate(artifact, {
+			fromExtension: request.fromExtension,
+			to: request.to,
+			extensionDialTemplate: this.env.ENGINE_EXTENSION_DIAL_TEMPLATE,
+			now: new Date(),
+		});
+		if (!plan.ok) {
+			return { kind: "refused", reason: plan.reason, error: plan.error };
+		}
+
+		const callerId =
+			request.callerIdName ?? plan.callerIdName ?? request.callerIdNumber ?? plan.callerIdNumber;
+		const callerIdNumber = request.callerIdNumber ?? plan.callerIdNumber;
+		try {
+			await this.media.originate({
+				endpoint: plan.endpoint,
+				application: this.env.ARI_APP,
+				channelId: request.originateId,
+				...(callerIdNumber === undefined
+					? {}
+					: {
+							callerId:
+								callerId === callerIdNumber ? callerIdNumber : `"${callerId}" <${callerIdNumber}>`,
+						}),
+				...(request.ringTimeoutSeconds === undefined
+					? {}
+					: { timeoutSeconds: request.ringTimeoutSeconds }),
+				variables: {
+					OPTIMIQ_ORG_ID: request.orgId,
+					// `internal`, so the walk takes the internal-then-outbound ladder rather than being
+					// resolved against the DID table — this leg was not dialled from outside.
+					OPTIMIQ_CALL_DIRECTION: "internal",
+					OPTIMIQ_ROUTING_CONTEXT: "internal",
+					OPTIMIQ_DIALED_NUMBER: request.to,
+				},
+			});
+		} catch (error) {
+			// What `MediaPort.originate` throws for: an endpoint that is not configured, or one with no
+			// contact to send an INVITE to. The plan walker reads exactly this as "not registered", and
+			// so does the contract's `extension_offline`.
+			this.logger.info(
+				{
+					originateId: request.originateId,
+					orgId: request.orgId,
+					endpoint: plan.endpoint,
+					err: String(error),
+				},
+				"could not originate a click-to-call towards the extension",
+			);
+			return {
+				kind: "refused",
+				reason: "extension_offline",
+				error: `no contact for ${request.fromExtension}: ${String(error)}`,
+			};
+		}
+
+		// Derived, not invented, and derivable BEFORE the channel reaches Stasis — which is what lets
+		// this reply carry the ids while the phone is still ringing. See `channel-identity.ts`.
+		return {
+			kind: "placed",
+			callId: callIdForAriChannel(request.originateId),
+			legId: legIdForAriChannel(request.originateId),
+			endpoint: plan.endpoint,
+		};
 	}
 }
 

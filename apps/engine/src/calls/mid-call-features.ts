@@ -130,6 +130,10 @@ export class MidCallFeatureRuntime {
 	 * every other call's, which is the thing the concurrent dispatch exists to avoid.
 	 */
 	private readonly chains = new Map<string, Promise<unknown>>();
+	/** Identity tokens invalidated by release, including while an artifact lookup is awaiting. */
+	private readonly lifecycles = new Map<string, object>();
+	/** `clear` is the drain boundary: no later event may restart feature work. */
+	private stopped = false;
 	private readonly now: () => number;
 	private readonly setTimer: (fn: () => void, ms: number) => { readonly cancel: () => void };
 	private readonly log: (message: string, detail?: Record<string, unknown>) => void;
@@ -166,6 +170,9 @@ export class MidCallFeatureRuntime {
 	 * leg's table, which is why the machine is cached WITH the key it was built for.
 	 */
 	armCancelKey(mediaChannelId: string, digit: DtmfDigit): void {
+		if (this.stopped) {
+			return;
+		}
 		this.cancelKeys.set(mediaChannelId, digit);
 		this.dropCapture(mediaChannelId);
 	}
@@ -190,8 +197,15 @@ export class MidCallFeatureRuntime {
 	 * the digits an impatient party presses while they wait.
 	 */
 	async offer(leg: ControlledLeg, digit: string): Promise<MidCallDigitOutcome> {
+		if (this.stopped) {
+			return "pass-through";
+		}
+		const lifecycle = this.lifecycles.get(leg.mediaChannelId) ?? {};
+		this.lifecycles.set(leg.mediaChannelId, lifecycle);
 		const previous = this.chains.get(leg.mediaChannelId) ?? Promise.resolve();
-		const next = previous.then(async () => await this.decide(leg, digit));
+		const next = previous.then(async () =>
+			this.isCurrent(leg, lifecycle) ? await this.decide(leg, digit, lifecycle) : "pass-through",
+		);
 		// `catch` on the CHAIN only, not on what the caller awaits: a rejection must not stall every
 		// subsequent digit on this leg, and the caller still sees its own failure.
 		this.chains.set(
@@ -201,14 +215,18 @@ export class MidCallFeatureRuntime {
 		return await next;
 	}
 
-	private async decide(leg: ControlledLeg, digit: string): Promise<MidCallDigitOutcome> {
-		const capture = await this.captureFor(leg);
-		if (capture === undefined) {
+	private async decide(
+		leg: ControlledLeg,
+		digit: string,
+		lifecycle: object,
+	): Promise<MidCallDigitOutcome> {
+		const capture = await this.captureFor(leg, lifecycle);
+		if (capture === undefined || !this.isCurrent(leg, lifecycle)) {
 			return "pass-through";
 		}
 
 		const step = capture.machine.push(digit, this.now());
-		this.rearm(leg, capture, step.wakeAtMs);
+		this.rearm(leg, capture, step.wakeAtMs, lifecycle);
 
 		switch (step.kind) {
 			case "pass-through":
@@ -222,13 +240,14 @@ export class MidCallFeatureRuntime {
 				});
 				return "consumed";
 			case "execute":
-				void this.run(leg, capture, step.execution as MidCallFeatureExecution);
+				void this.run(leg, capture, step.execution as MidCallFeatureExecution, lifecycle);
 				return "consumed";
 		}
 	}
 
 	/** Forgets a leg's capture. Called when the leg goes away, and by the drain. */
 	release(mediaChannelId: string): void {
+		this.lifecycles.delete(mediaChannelId);
 		this.cancelKeys.delete(mediaChannelId);
 		this.chains.delete(mediaChannelId);
 		this.dropCapture(mediaChannelId);
@@ -236,6 +255,8 @@ export class MidCallFeatureRuntime {
 
 	/** Drops every capture. Used by the drain and by specs. */
 	clear(): void {
+		this.stopped = true;
+		this.lifecycles.clear();
 		// A snapshot: `dropCapture` deletes from the map it is iterating.
 		for (const mediaChannelId of Array.from(this.captures.keys())) {
 			this.dropCapture(mediaChannelId);
@@ -282,8 +303,8 @@ export class MidCallFeatureRuntime {
 	 * leaving voicemail is a leg whose digits belong to the application, and intercepting a `*` there
 	 * would break every menu that uses one.
 	 */
-	private async captureFor(leg: ControlledLeg): Promise<LegCapture | undefined> {
-		if (leg.isTearingDown || !leg.isAnswered || leg.bridgeId === undefined) {
+	private async captureFor(leg: ControlledLeg, lifecycle: object): Promise<LegCapture | undefined> {
+		if (!this.isCurrent(leg, lifecycle)) {
 			return undefined;
 		}
 		const cancelKey = this.cancelKeys.get(leg.mediaChannelId);
@@ -293,7 +314,7 @@ export class MidCallFeatureRuntime {
 		}
 
 		const table = await this.tableFor(leg.organizationId, cancelKey);
-		if (table.length === 0) {
+		if (table.length === 0 || !this.isCurrent(leg, lifecycle)) {
 			return undefined;
 		}
 		const capture: LegCapture = {
@@ -306,19 +327,27 @@ export class MidCallFeatureRuntime {
 	}
 
 	/** Re-arms the leg's inter-digit timer, or cancels it when the machine wants none. */
-	private rearm(leg: ControlledLeg, capture: LegCapture, wakeAtMs: number | undefined): void {
+	private rearm(
+		leg: ControlledLeg,
+		capture: LegCapture,
+		wakeAtMs: number | undefined,
+		lifecycle: object,
+	): void {
 		capture.timer?.cancel();
 		capture.timer = undefined;
-		if (wakeAtMs === undefined) {
+		if (wakeAtMs === undefined || !this.isCurrent(leg, lifecycle)) {
 			return;
 		}
 		const delay = Math.max(0, wakeAtMs - this.now());
 		capture.timer = this.setTimer(() => {
+			if (!this.isCurrent(leg, lifecycle)) {
+				return;
+			}
 			capture.timer = undefined;
 			const step = capture.machine.expire(wakeAtMs);
-			this.rearm(leg, capture, step.wakeAtMs);
+			this.rearm(leg, capture, step.wakeAtMs, lifecycle);
 			if (step.kind === "execute") {
-				void this.run(leg, capture, step.execution as MidCallFeatureExecution);
+				void this.run(leg, capture, step.execution as MidCallFeatureExecution, lifecycle);
 			} else if (step.kind === "abandoned") {
 				this.log("a mid-call feature code timed out", {
 					mediaChannelId: leg.mediaChannelId,
@@ -340,7 +369,11 @@ export class MidCallFeatureRuntime {
 		leg: ControlledLeg,
 		capture: LegCapture,
 		execution: MidCallFeatureExecution,
+		lifecycle: object,
 	): Promise<void> {
+		if (!this.isCurrent(leg, lifecycle)) {
+			return;
+		}
 		try {
 			const result = await this.perform(leg, execution);
 			if (!result.ok) {
@@ -358,7 +391,9 @@ export class MidCallFeatureRuntime {
 				err: String(error),
 			});
 		} finally {
-			capture.machine.settle();
+			if (this.isCurrent(leg, lifecycle)) {
+				capture.machine.settle();
+			}
 		}
 	}
 
@@ -415,5 +450,15 @@ export class MidCallFeatureRuntime {
 		capture.timer?.cancel();
 		capture.machine.cancel();
 		this.captures.delete(mediaChannelId);
+	}
+
+	private isCurrent(leg: ControlledLeg, lifecycle: object): boolean {
+		return (
+			!this.stopped &&
+			this.lifecycles.get(leg.mediaChannelId) === lifecycle &&
+			!leg.isTearingDown &&
+			leg.isAnswered &&
+			leg.bridgeId !== undefined
+		);
 	}
 }
