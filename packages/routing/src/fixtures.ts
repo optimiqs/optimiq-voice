@@ -32,6 +32,7 @@ import type {
 	MohClassInput,
 	OrgRoutingSnapshot,
 	OutboundRouteInput,
+	PagingGroupInput,
 	ParkLotInput,
 	PhoneNumberInput,
 	QueueInput,
@@ -309,6 +310,18 @@ export function aParkLot(overrides: Partial<ParkLotInput> = {}): ParkLotInput {
 		slotStart: 701,
 		slotEnd: 720,
 		timeoutSeconds: 120,
+		...overrides,
+	};
+}
+
+export function aPagingGroup(overrides: Partial<PagingGroupInput> = {}): PagingGroupInput {
+	return {
+		id: "pg-1",
+		enabled: true,
+		name: "All handsets",
+		duplex: false,
+		timeoutSeconds: 30,
+		members: [{ extensionId: "ext-1", ordinal: 1, enabled: true }],
 		...overrides,
 	};
 }

@@ -109,6 +109,27 @@ export const extension = pgTable.withRLS(
 		 * `extensionsByNumber`, never from this table.
 		 */
 		pickupGroup: text("pickup_group"),
+		/**
+		 * Screen EXTERNAL callers before this extension is rung.
+		 *
+		 * When it is on, a caller from outside the organization is asked to record their name; the
+		 * extension hears "call from <recording>" and presses 1 to accept the call or 2 to reject it.
+		 * A rejected call takes the same branch a busy one would, so the caller meets voicemail rather
+		 * than a dead line — the screen decides who gets through, not whether the caller is served.
+		 *
+		 * Scoped to external callers only, and that is a deliberate asymmetry rather than an
+		 * unfinished feature. An internal colleague already arrives with a name and a number on the
+		 * handset's display, so the recording adds nothing a glance does not already give; screening
+		 * them would put ten extra seconds on the front of every internal call in the building, which
+		 * is how a feature that helps with one nuisance caller a week becomes the thing everybody
+		 * asks to have switched off. The engine decides "external" the same way the rest of the call
+		 * path does: a leg that did not originate from an extension of this organization.
+		 *
+		 * Default off, because it lengthens every inbound call it touches — the caller records, the
+		 * callee listens, the callee decides — and a tenant that has never opened this page must not
+		 * discover the delay by taking a call.
+		 */
+		callScreening: boolean("call_screening").notNull().default(false),
 		tollClass: text("toll_class").$type<TollClass>().notNull().default("national"),
 		callTimeoutSeconds: integer("call_timeout_seconds").notNull().default(30),
 		maxRegistrations: integer("max_registrations").notNull().default(3),

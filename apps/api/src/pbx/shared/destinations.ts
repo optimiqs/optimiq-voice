@@ -327,6 +327,38 @@ export async function findParkLotFeatureCodeReferences(
 }
 
 /**
+ * Feature codes that pin this paging group in `params.groupId`.
+ *
+ * The same hole as `params.lotId` above, one feature along: `*81` may name a specific group and the
+ * compiler resolves it (`compile.ts`, `featureCodeTarget`, which reads `groupId` for `paging`
+ * exactly as it reads `lotId` for `call-park`). The reference lives inside `jsonb`, so no foreign
+ * key expresses it and the generic scan — which only looks at `<prefix>destination_ref` columns —
+ * cannot see it.
+ *
+ * Kept as a second function rather than folded into a parameterised one with the key and kind as
+ * arguments: there are two of these, they are four lines each, and the day a third arrives the
+ * question worth asking is why routing keeps putting foreign keys in a `jsonb` bag — not how to
+ * make the workaround more general.
+ */
+export async function findPagingGroupFeatureCodeReferences(
+	transaction: PbxDatabaseTransaction,
+	pagingGroupId: string,
+): Promise<readonly EntityReference[]> {
+	const rows = await transaction.execute(sql`
+		select id::text as id, code::text as name
+		from feature_code
+		where params ->> 'groupId' = ${pagingGroupId}
+		limit 25
+	`);
+	return readRows(rows).map((row) => ({
+		kind: "feature-code",
+		id: String(row.id),
+		name: row.name === null || row.name === undefined ? null : String(row.name),
+		field: "params.groupId",
+	}));
+}
+
+/**
  * Normalizes what `transaction.execute` hands back.
  *
  * drizzle-orm's postgres-js driver returns the driver's own result object, which is array-like but

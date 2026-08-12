@@ -127,8 +127,8 @@ describe("emptySnapshot", () => {
 		}
 	});
 
-	it("lists twenty collections", () => {
-		expect(SNAPSHOT_COLLECTIONS).toHaveLength(20);
+	it("lists twenty-one collections", () => {
+		expect(SNAPSHOT_COLLECTIONS).toHaveLength(21);
 	});
 
 	it("marks exactly the collections a loader may omit as optional", () => {
@@ -136,6 +136,7 @@ describe("emptySnapshot", () => {
 			"voicemailGreetings",
 			"mohClasses",
 			"emergencyAddresses",
+			"pagingGroups",
 		]);
 	});
 

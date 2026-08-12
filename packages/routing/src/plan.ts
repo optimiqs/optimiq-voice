@@ -70,6 +70,7 @@ export const PLAN_NODE_KINDS = [
 	"voicemail",
 	"conference",
 	"park",
+	"paging",
 	"external",
 	"trunk-dial",
 	"application",
@@ -122,6 +123,23 @@ export interface ExtensionPlanNode extends PlanNodeBase {
 	 * inspector renders when somebody asks why their pickup code did nothing.
 	 */
 	readonly pickupGroup?: string;
+	/**
+	 * Ask an EXTERNAL caller to record their name, and let this extension accept or reject the call
+	 * after hearing it.
+	 *
+	 * Present and `true` means the engine inserts the screen before the endpoint is rung: the caller
+	 * records, the callee hears "call from <recording>" and presses 1 to take it or 2 to refuse it, and
+	 * a refusal takes the same branch a busy leg would (`busyNodeId`) so the caller reaches voicemail
+	 * rather than silence. Absent means no screen, which is what every extension did before the flag
+	 * existed and is why it is optional rather than a required boolean — an old reader that ignores it
+	 * rings the endpoint, which is the safe half of the behaviour.
+	 *
+	 * INTERNAL callers are never screened, and that is not expressible here because it is not
+	 * configurable: a colleague already arrives with a name on the display, and screening them would
+	 * put ten seconds on the front of every internal call. The engine applies the rule; the artifact
+	 * only says whether the tenant asked for the feature.
+	 */
+	readonly callScreening?: boolean;
 	readonly mohClassId?: string;
 	/** The class's NAME, resolved from `mohClassId`. Absent means "the media server's default". */
 	readonly mohClass?: string;
@@ -261,6 +279,19 @@ export interface QueuePlanNode extends PlanNodeBase {
 	readonly mohClass?: string;
 	readonly greetingPromptId?: string;
 	readonly announcePromptId?: string;
+	/**
+	 * Played to the ANSWERING AGENT alone, before the caller is bridged in.
+	 *
+	 * A bare prompt id, like the two above it and unlike `mohClass`: a prompt is addressed by its row
+	 * id all the way down to the media layer, whereas a music-on-hold class has to become a NAME
+	 * before a media server will take it, which is the only reason that one is resolved here.
+	 *
+	 * The opposite side of the bridge from its two siblings, and that is the entire point — the
+	 * caller hears the greeting and the position announcements, the agent hears this, and a reader
+	 * that played it to both would be reading the agent their cue sheet out loud. Absent means the
+	 * agent is bridged straight through.
+	 */
+	readonly agentWhisperPromptId?: string;
 	readonly maxWaitSeconds: number;
 	readonly maxWaitNoAgentSeconds: number;
 	readonly announcePositionEnabled: boolean;
@@ -367,6 +398,60 @@ export interface ParkPlanNode extends PlanNodeBase {
 	/** The class's NAME, resolved from `mohClassId`. Absent means "the media server's default". */
 	readonly mohClass?: string;
 	readonly timeoutNodeId?: PlanNodeId;
+}
+
+/**
+ * Announce to a set of handsets at once.
+ *
+ * # Why members are NUMBERS and not endpoints
+ *
+ * The obvious alternative is to compile each member down to the dial string the engine will hand
+ * its media server — `PJSIP/1001` or whatever the deployment speaks. That would bake an
+ * Asterisk-ism into an artifact that outlives the engine release which wrote it. The engine already
+ * owns the dial template (`endpointForExtension` in plan-walker), it is the only component that
+ * knows what its channel driver is called, and it applies that template to every other kind of leg
+ * it originates. A page is not the place to invent a second answer.
+ *
+ * So the artifact carries the internal numbers, in order, and the engine turns them into endpoints
+ * the same way it always does. `extensionsByNumber` on the artifact is the index that makes the
+ * number a complete reference: everything else the engine needs about a member is one lookup away.
+ *
+ * # Why a disabled member is dropped at compile time
+ *
+ * A page's member list is a DELIVERY PROMISE — these handsets and no others will hear this. If the
+ * list carried disabled members the engine would have to re-derive who is really in it, on the call
+ * path, and two components would then be answering "who hears this page?" independently. Dropping
+ * them here means the compiled list is the answer, the call-flow inspector shows exactly what will
+ * happen, and a page that reaches fewer people than the operator expected is visible in the
+ * artifact instead of only in the room.
+ *
+ * A member whose extension is missing entirely is dropped too, but loudly — it earns a diagnostic
+ * naming the group, because a page silently reaching fewer people is the failure mode this whole
+ * design is arranged against.
+ *
+ * # There are no references, and no continuation
+ *
+ * A page does not go anywhere afterwards: the pager speaks and hangs up, and that is the end of the
+ * call. Hence no `timeoutNodeId`, no `thenNodeId`, and `planNodeReferences` returning nothing.
+ *
+ * # Multicast is out of scope
+ *
+ * The other way to page — one RTP stream to a group address, handsets subscribed to it — is NOT
+ * expressible here and is deliberately left for a later wave. It needs a multicast-capable network
+ * the tenant controls and per-model handset provisioning, neither of which is a routing fact, and
+ * half-expressing it (a flag with no address, an address with no provisioning) would be a field
+ * readers would have to guess the meaning of. This node is unicast fan-out and says so by having no
+ * way to say anything else.
+ */
+export interface PagingPlanNode extends PlanNodeBase {
+	readonly kind: "paging";
+	readonly pagingGroupId: string;
+	/** Member extension NUMBERS in ordinal order, already filtered to enabled members of enabled extensions. */
+	readonly members: readonly string[];
+	/** False is a one-way announcement: members hear the pager and cannot be heard. */
+	readonly duplex: boolean;
+	/** How long a member's auto-answered leg may take to come up before it is given up on. */
+	readonly timeoutSeconds: number;
 }
 
 /**
@@ -502,6 +587,7 @@ export type PlanNode =
 	| VoicemailPlanNode
 	| ConferencePlanNode
 	| ParkPlanNode
+	| PagingPlanNode
 	| ExternalPlanNode
 	| TrunkDialPlanNode
 	| ApplicationPlanNode
@@ -562,6 +648,11 @@ export function planNodeReferences(node: PlanNode): readonly PlanNodeId[] {
 		}
 		case "park": {
 			return compact([node.timeoutNodeId]);
+		}
+		case "paging": {
+			// Nothing. A page has no continuation — the members' legs are numbers rather than node
+			// references, and the call ends when the pager hangs up, so there is no branch to reach.
+			return [];
 		}
 		case "trunk-dial": {
 			return compact([node.failoverNodeId]);

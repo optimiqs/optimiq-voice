@@ -53,6 +53,7 @@ export const DESTINATION_TYPE_LABELS: Readonly<Record<DestinationType, string>> 
 	voicemail: "Voicemail box",
 	conference: "Conference",
 	park: "Park lot",
+	"paging-group": "Paging group",
 	"time-condition": "Time condition",
 	external: "External number",
 	application: "Engine application",
@@ -98,6 +99,7 @@ const DESTINATION_TARGETS: Partial<Record<DestinationType, DestinationTargetReso
 	voicemail: target(PBX_RESOURCES.voicemailBoxes),
 	conference: target(PBX_RESOURCES.conferences),
 	park: target(PBX_RESOURCES.parkLots),
+	"paging-group": target(PBX_RESOURCES.pagingGroups),
 	"time-condition": target(PBX_RESOURCES.timeConditions),
 };
 

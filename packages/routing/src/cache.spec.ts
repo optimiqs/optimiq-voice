@@ -73,6 +73,16 @@ describe("invalidation contract", () => {
 		expect(affectsRouting("ivr_menu_option")).toBe(true);
 	});
 
+	it("evicts on a change to either half of a paging group", () => {
+		// The membership table is not a snapshot collection of its own — the snapshot nests members
+		// inside their group — so nothing derives its eviction for us. Moving one handset out of a
+		// group changes who hears an announcement, which is a compiled fact, and a cached artifact
+		// that survived the move would page the wrong building.
+		expect(affectsRouting("paging_group")).toBe(true);
+		expect(affectsRouting("paging_group_member")).toBe(true);
+		expect(ROUTING_TABLE_TO_ENTITY.paging_group_member).toBe("pagingGroups");
+	});
+
 	it("evicts on a greeting or a music-on-hold rename", () => {
 		// Both are compiled INTO plan nodes, so a cached artifact survives a rename as a name nobody
 		// changed and a greeting nobody re-recorded. That is exactly the class of staleness this

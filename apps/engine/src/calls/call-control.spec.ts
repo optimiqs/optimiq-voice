@@ -4,7 +4,7 @@ import { makeFakeMediaPort } from "../media/media-port.fake";
 import { FakeClaimBucket } from "../nats/claim-store.fake";
 import { CallSignalBus, legSignalKey, recordingSignalKey } from "../routing/call-signals";
 import { CLAIM_LEASE_MS, ParkRegistry } from "../routing/park-registry";
-import { CallControl, pickupGroupFilter } from "./call-control";
+import { CallControl, pickupGroupFilter, tapSidesFor } from "./call-control";
 import { ParkHandoffError } from "./park-handoff";
 import type { FakeMediaPortOptions } from "../media/media-port.fake";
 import type { ClaimBucket } from "../nats/claim-store";
@@ -15,9 +15,10 @@ import type {
 	PickupCandidate,
 	RouteOutcome,
 	RouteRequest,
+	SupervisionTarget,
 } from "./call-control";
 import type { ParkHandoffClient } from "./park-handoff";
-import type { CallEvent, ParkClaim } from "@optimiq-voice/events";
+import type { CallEvent, ParkClaim, TapMode } from "@optimiq-voice/events";
 import type { CallState, ChannelFlag, ChannelState, HangupCause } from "@optimiq-voice/telephony";
 
 /**
@@ -135,6 +136,8 @@ interface HarnessOptions {
 	/** How the router answers. Defaults to bridging the leg to a freshly minted peer. */
 	readonly route?: (leg: ControlledLeg, request: RouteRequest) => Promise<RouteOutcome>;
 	readonly ringing?: readonly PickupCandidate[];
+	/** Answered calls `*0` can find, oldest first — what the orchestrator's registry scan produces. */
+	readonly monitorable?: readonly SupervisionTarget[];
 	readonly lot?: ParkLot | undefined;
 	/** Shared park claims, for the specs that need two instances on one bucket. */
 	readonly claims?: ClaimBucket<ParkClaim>;
@@ -144,6 +147,8 @@ interface HarnessOptions {
 	readonly parkHandoff?: ParkHandoffClient;
 	/** The clock, shared by call control and the claim leases. */
 	readonly now?: () => number;
+	/** The tap is created and never enters the application — the race `openTap` guards against. */
+	readonly tapNeverArrives?: boolean;
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -165,6 +170,15 @@ function harness(options: HarnessOptions = {}) {
 			signals.emit(legSignalKey(request.snoopChannelId), { kind: "entered" });
 			options.media?.onSnoop?.(request);
 		},
+		// A tap reaches Stasis before the HTTP response returns, which is exactly why the runtime
+		// subscribes first. Emitting synchronously from inside the call reproduces that race; a fake
+		// that emitted later would let a runtime that subscribed too late pass its specs.
+		onTap: (request) => {
+			if (options.tapNeverArrives !== true) {
+				signals.emit(legSignalKey(request.tapChannelId), { kind: "entered" });
+			}
+			options.media?.onTap?.(request);
+		},
 	});
 
 	// A real media server reports `RecordingFinished` when the object is CLOSED, which is the whole
@@ -179,6 +193,7 @@ function harness(options: HarnessOptions = {}) {
 	const host: CallControlHost = {
 		legFor: (mediaChannelId) => legs.get(mediaChannelId),
 		ringingFor: async () => options.ringing ?? [],
+		activeCallsFor: () => options.monitorable ?? [],
 		publish: async (leg, type, data) => {
 			published.push({ type, legId: leg.legId, data });
 		},
@@ -201,6 +216,7 @@ function harness(options: HarnessOptions = {}) {
 	};
 
 	const timers: { fn: () => void; ms: number }[] = [];
+	const supervisionKeys = new Map<string, (mode: TapMode) => Promise<void>>();
 	let counter = 0;
 	const control = new CallControl({
 		media,
@@ -208,7 +224,20 @@ function harness(options: HarnessOptions = {}) {
 		parks,
 		host,
 		...(options.parkHandoff === undefined ? {} : { parkHandoff: options.parkHandoff }),
-		settings: { application: "optimiq-engine", recordingFormat: "wav" },
+		// The real seam, not a stub: the mode keys are armed by this class and the spec has to be able
+		// to press them, which is what the escalation tests do through `supervisionKeys.press`.
+		supervisionKeys: {
+			arm: (mediaChannelId, escalate) => {
+				supervisionKeys.set(mediaChannelId, escalate);
+			},
+			disarm: (mediaChannelId) => {
+				supervisionKeys.delete(mediaChannelId);
+			},
+		},
+		// A short snoop budget, because two specs deliberately let a tap never arrive and the production
+		// default would make each of them wait five real seconds for a timer that has already been
+		// proved correct by the ones that do arrive.
+		settings: { application: "optimiq-engine", recordingFormat: "wav", snoopTimeoutMs: 100 },
 		newId: () => `id-${String(++counter)}`,
 		now,
 		setTimer: (fn, ms) => {
@@ -226,6 +255,7 @@ function harness(options: HarnessOptions = {}) {
 		routes,
 		timers,
 		legs,
+		supervisionKeys,
 		eventsOf: (type: CallEvent) => published.filter((event) => event.type === type),
 	};
 }
@@ -1337,5 +1367,393 @@ describe("teardown", () => {
 		expect(h.control.activeOperationCount).toBe(1);
 		h.control.clear();
 		expect(h.control.activeOperationCount).toBe(0);
+	});
+});
+
+// =================================================================================================
+// Supervision — `*0`, and the mode keys
+// =================================================================================================
+
+/**
+ * The mode table, pinned directly.
+ *
+ * Everything around a tap — minting ids, waiting for it to enter the application, publishing —
+ * would look the same whichever mode was asked for, so a suite that only exercised taps end to end
+ * would pass with the two `speakTo` values swapped. This is the one place where a value in the wrong
+ * column puts a supervisor's coaching into a CUSTOMER's ear, so it is asserted as a table.
+ */
+describe("tapSidesFor", () => {
+	it("is silent for eavesdrop, whatever side the monitored party is on", () => {
+		expect(tapSidesFor("eavesdrop", "a")).toEqual({ hear: "both", speakTo: "none" });
+		expect(tapSidesFor("eavesdrop", "b")).toEqual({ hear: "both", speakTo: "none" });
+	});
+
+	it("speaks ONLY to the monitored party for whisper, following which side they are", () => {
+		// The whole reason `monitoredSide` is a parameter: "coach the agent" is a statement about a
+		// PARTY, and the agent is the b-leg on a call they received and the a-leg on one they placed.
+		expect(tapSidesFor("whisper", "b")).toEqual({ hear: "both", speakTo: "b" });
+		expect(tapSidesFor("whisper", "a")).toEqual({ hear: "both", speakTo: "a" });
+	});
+
+	it("speaks to everybody for barge", () => {
+		expect(tapSidesFor("barge", "a")).toEqual({ hear: "both", speakTo: "both" });
+		expect(tapSidesFor("barge", "b")).toEqual({ hear: "both", speakTo: "both" });
+	});
+
+	it("always hears both parties — there is no product for half a conversation", () => {
+		for (const mode of ["eavesdrop", "whisper", "barge"] as const) {
+			for (const side of ["a", "b"] as const) {
+				expect(tapSidesFor(mode, side).hear).toBe("both");
+			}
+		}
+	});
+});
+
+describe("monitor", () => {
+	/** A supervisor's idle leg and the agent's live one, as the orchestrator's scan would offer them. */
+	function supervision(overrides: { readonly targetSide?: "a" | "b" } = {}) {
+		const supervisor = fakeLeg("sup", { isAnswered: false, callerIdNumber: "1900" });
+		const agent = fakeLeg("agent", { callerIdNumber: "2002" });
+		const customer = fakeLeg("cust");
+		bridgePair(agent, customer, "live-bridge");
+		return {
+			supervisor,
+			agent,
+			customer,
+			options: {
+				legs: [supervisor, agent, customer],
+				monitorable: [
+					{ leg: agent, side: overrides.targetSide ?? ("b" as const), startedAtMs: 100 },
+				],
+			},
+		};
+	}
+
+	it("taps the monitored leg and bridges the supervisor to it", async () => {
+		const s = supervision();
+		const h = harness(s.options);
+
+		const result = await h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+
+		expect(result.ok).toBe(true);
+		const tap = h.media.taps()[0];
+		expect(tap?.targetChannelId).toBe("agent");
+		expect(tap?.supervisorChannelId).toBe("sup");
+		expect(tap?.targetSide).toBe("b");
+		expect(tap?.hear).toBe("both");
+		expect(tap?.speakTo).toBe("none");
+		// The supervisor's leg is answered and put in the tap's bridge. `*0` is dialled from an idle
+		// handset, so nobody answered it before there was something to connect it to.
+		expect(h.media.methods()).toContain("answer");
+		expect(s.supervisor.bridgeId).toBe(tap?.bridgeId);
+		// And NOT given a bridge peer: the thing on the other side is a tap, which has no leg id.
+		expect(s.supervisor.bridgePeers).toEqual([]);
+	});
+
+	it("subscribes to the tap BEFORE creating it", async () => {
+		// The fake emits `entered` from inside `tap`, which is what a real snoop does — it reaches
+		// Stasis before the HTTP response. A runtime that subscribed afterwards would hang here.
+		const s = supervision();
+		const h = harness(s.options);
+		const result = await h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+		expect(result.ok).toBe(true);
+	});
+
+	it("publishes call.tap.started on the MONITORED call, naming the supervisor's leg", async () => {
+		const s = supervision();
+		const h = harness(s.options);
+		await h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+
+		const started = h.eventsOf("call.tap.started")[0];
+		// The envelope is the monitored call's — that is what makes "was this conversation monitored?"
+		// answerable from a call id somebody has in front of them.
+		expect(started?.legId).toBe("leg-agent");
+		expect(started?.data).toEqual({
+			legId: "leg-sup",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+			targetExtension: "2002",
+			targetLegId: "leg-agent",
+			supervisorCallId: "call-sup",
+		});
+		// No `previousMode` on the first start: that is what distinguishes "began monitoring" from
+		// "changed how they were monitoring".
+		expect(started?.data.previousMode).toBeUndefined();
+	});
+
+	it("refuses on a media plane that never decodes, without touching it", async () => {
+		const s = supervision();
+		const h = harness({ ...s.options, media: { bridgeMode: "proxy-media" } });
+
+		const result = await h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+
+		expect(result).toEqual({
+			ok: false,
+			reason:
+				"this media plane bridges in proxy-media mode, which never decodes the audio, so a call on it cannot be monitored",
+		});
+		expect(h.media.taps()).toEqual([]);
+	});
+
+	it("refuses when nobody at the extension is on a call this engine holds", async () => {
+		const supervisor = fakeLeg("sup", { isAnswered: false });
+		const h = harness({ legs: [supervisor], monitorable: [] });
+
+		const result = await h.control.monitor(supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+
+		expect(result).toEqual({
+			ok: false,
+			reason: "nobody at extension 2002 is on a call this engine is handling",
+		});
+	});
+
+	it("refuses a second tap on the same supervising leg", async () => {
+		const s = supervision();
+		const h = harness(s.options);
+		const request = {
+			extension: "2002",
+			mode: "eavesdrop" as const,
+			supervisorExtension: "1900",
+		};
+		await h.control.monitor(s.supervisor, request);
+
+		expect(await h.control.monitor(s.supervisor, request)).toEqual({
+			ok: false,
+			reason: "this leg is already monitoring a call",
+		});
+	});
+
+	it("cleans up and refuses when the tap never reaches the application", async () => {
+		const s = supervision();
+		const h = harness({ ...s.options, tapNeverArrives: true });
+
+		const result = await h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+
+		expect(result.ok).toBe(false);
+		expect(h.media.methods()).toContain("stopTap");
+		// The tap channel is hung up, and the monitored legs are untouched.
+		expect(h.media.hungUp().map((entry) => entry.channelId)).not.toContain("agent");
+		expect(h.control.tapFor("sup")).toBeUndefined();
+	});
+
+	it("refuses when the media plane rejects the tap outright, and never throws", async () => {
+		const s = supervision();
+		const h = harness({ ...s.options, media: { tapFails: true } });
+
+		const result = await h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+
+		expect(result.ok).toBe(false);
+		expect(result.ok === false ? result.reason : "").toContain("refused a tap on extension 2002");
+	});
+
+	it("whispers to the a-leg when the monitored extension PLACED the call", async () => {
+		const s = supervision({ targetSide: "a" });
+		const h = harness(s.options);
+
+		await h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "whisper",
+			supervisorExtension: "1900",
+		});
+
+		expect(h.media.taps()[0]?.speakTo).toBe("a");
+	});
+});
+
+describe("the supervisor's mode keys", () => {
+	function supervising() {
+		const supervisor = fakeLeg("sup", { isAnswered: false, callerIdNumber: "1900" });
+		const agent = fakeLeg("agent");
+		const customer = fakeLeg("cust");
+		bridgePair(agent, customer, "live-bridge");
+		const h = harness({
+			legs: [supervisor, agent, customer],
+			monitorable: [{ leg: agent, side: "b" as const, startedAtMs: 100 }],
+		});
+		return { h, supervisor, agent };
+	}
+
+	it("arms the escalation on the SUPERVISOR's leg and disarms it when the tap ends", async () => {
+		const s = supervising();
+		await s.h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+		expect(s.h.supervisionKeys.has("sup")).toBe(true);
+		// And on that leg only: nothing is armed on the people being listened to.
+		expect(s.h.supervisionKeys.has("agent")).toBe(false);
+
+		await s.h.control.onLegEnded("sup");
+		expect(s.h.supervisionKeys.has("sup")).toBe(false);
+	});
+
+	it("re-taps on an escalation, because a snoop's whisper direction is fixed at creation", async () => {
+		const s = supervising();
+		await s.h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+
+		await (s.h.supervisionKeys.get("sup") as (mode: TapMode) => Promise<void>)("whisper");
+
+		const taps = s.h.media.taps();
+		expect(taps).toHaveLength(2);
+		expect(taps[0]?.speakTo).toBe("none");
+		expect(taps[1]?.speakTo).toBe("b");
+		// The old one is taken down first, so the supervisor is never in two bridges at once.
+		const methods = s.h.media.methods();
+		expect(methods.indexOf("stopTap")).toBeLessThan(methods.lastIndexOf("tap"));
+		expect(s.h.control.tapFor("sup")?.mode).toBe("whisper");
+	});
+
+	it("publishes ended{escalated} and then started{previousMode}", async () => {
+		const s = supervising();
+		await s.h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+		await (s.h.supervisionKeys.get("sup") as (mode: TapMode) => Promise<void>)("barge");
+
+		// The pair, not a single `changed` event: each interval a call was monitored is bounded by its
+		// own start and end with the mode that applied during it.
+		const ended = s.h.eventsOf("call.tap.ended");
+		expect(ended).toHaveLength(1);
+		expect(ended[0]?.data).toMatchObject({
+			mode: "eavesdrop",
+			reason: "escalated",
+			targetExtension: "2002",
+		});
+
+		const started = s.h.eventsOf("call.tap.started");
+		expect(started).toHaveLength(2);
+		expect(started[1]?.data).toMatchObject({ mode: "barge", previousMode: "eavesdrop" });
+		// Both on the monitored call, exactly as the first one was.
+		expect(started[1]?.legId).toBe("leg-agent");
+	});
+
+	it("does nothing at all when the supervisor presses the mode they are already on", async () => {
+		// Tearing the audio down and building it back would put a gap in their ear for nothing.
+		const s = supervising();
+		await s.h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+		await (s.h.supervisionKeys.get("sup") as (mode: TapMode) => Promise<void>)("eavesdrop");
+
+		expect(s.h.media.taps()).toHaveLength(1);
+		expect(s.h.eventsOf("call.tap.ended")).toEqual([]);
+	});
+
+	it("refuses an escalation on a leg with no tap", async () => {
+		const s = supervising();
+		expect(await s.h.control.escalate("sup", "barge")).toEqual({
+			ok: false,
+			reason: "this leg is not monitoring a call",
+		});
+	});
+});
+
+describe("a tap ending", () => {
+	function supervising() {
+		const supervisor = fakeLeg("sup", { isAnswered: false, callerIdNumber: "1900" });
+		const agent = fakeLeg("agent");
+		const customer = fakeLeg("cust");
+		bridgePair(agent, customer, "live-bridge");
+		const h = harness({
+			legs: [supervisor, agent, customer],
+			monitorable: [{ leg: agent, side: "b" as const, startedAtMs: 100 }],
+		});
+		return { h, supervisor, agent, customer };
+	}
+
+	it("leaves the monitored call ALIVE when the supervisor hangs up", async () => {
+		// The invariant `MediaPort.stopTap` states, and the one worth a spec of its own: getting it
+		// wrong drops live customer calls every time somebody stops listening.
+		const s = supervising();
+		await s.h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+		s.h.media.calls.length = 0;
+
+		await s.h.control.onLegEnded("sup");
+
+		expect(s.h.media.methods()).toContain("stopTap");
+		// Nothing was hung up: not the agent, not the customer, and not the supervisor (whose leg is
+		// already going away — hanging it up again would be a second teardown).
+		expect(s.h.media.hungUp()).toEqual([]);
+		expect(s.agent.hangupCause).toBeUndefined();
+		expect(s.customer.hangupCause).toBeUndefined();
+
+		const ended = s.h.eventsOf("call.tap.ended")[0];
+		expect(ended?.data).toMatchObject({ reason: "supervisor-ended", mode: "eavesdrop" });
+		expect(ended?.data.durationMs).toBe(0);
+		expect(s.h.control.tapFor("sup")).toBeUndefined();
+	});
+
+	it("drops the supervisor when the MONITORED call ends", async () => {
+		const s = supervising();
+		await s.h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+		s.h.media.calls.length = 0;
+
+		s.h.signals.emit(legSignalKey("agent"), {
+			kind: "ended",
+			cause: "NORMAL_CLEARING",
+			causeCode: 16,
+		});
+		await flush();
+
+		// A supervisor left holding a line with nothing on it would believe they were still listening.
+		expect(s.h.media.hungUp().map((entry) => entry.channelId)).toEqual(["sup"]);
+		expect(s.h.eventsOf("call.tap.ended")[0]?.data).toMatchObject({ reason: "target-ended" });
+	});
+
+	it("counts a live tap, so a drain can wait for it", async () => {
+		const s = supervising();
+		await s.h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+		expect(s.h.control.activeOperationCount).toBe(1);
+		s.h.control.clear();
+		expect(s.h.control.activeOperationCount).toBe(0);
 	});
 });

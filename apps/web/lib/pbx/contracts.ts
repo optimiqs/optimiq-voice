@@ -81,6 +81,7 @@ export const DESTINATION_TYPES = [
 	"voicemail",
 	"conference",
 	"park",
+	"paging-group",
 	"time-condition",
 	"external",
 	"application",
@@ -103,6 +104,7 @@ export const DESTINATION_TYPE_KINDS: Readonly<Record<DestinationType, Destinatio
 	voicemail: "entity",
 	conference: "entity",
 	park: "entity",
+	"paging-group": "entity",
 	"time-condition": "entity",
 	external: "value",
 	application: "value",
@@ -481,6 +483,27 @@ export interface RingGroupRow extends EntityRow {
 	readonly timeoutDestinationType: DestinationType | null;
 	readonly timeoutDestinationRef: string | null;
 	readonly timeoutDestinationData: DestinationData | null;
+	readonly enabled: boolean;
+}
+
+/**
+ * A paging group. No destination trio — a page does not continue anywhere: the pager speaks, the
+ * handsets auto-answer, and the announcement ends when the pager hangs up. `duplex: false` is a
+ * one-way announcement; `true` is talkback (fifty open microphones, which is why `false` is the
+ * server default and this mirror states it rather than assuming it).
+ */
+export interface PagingGroupRow extends EntityRow {
+	readonly name: string;
+	readonly extensionNumber: string | null;
+	readonly duplex: boolean;
+	readonly timeoutSeconds: number;
+	readonly enabled: boolean;
+}
+
+export interface PagingGroupMemberRow extends EntityRow {
+	readonly pagingGroupId: string;
+	readonly extensionId: string;
+	readonly ordinal: number;
 	readonly enabled: boolean;
 }
 

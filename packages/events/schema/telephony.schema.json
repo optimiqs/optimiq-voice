@@ -55,6 +55,16 @@
 				"on-break",
 				"unavailable"
 			]
+		},
+		"TapMode": {
+			"description": "What a supervisor is doing to a call they did not place: eavesdrop, whisper or barge.",
+			"type": "string",
+			"enum": ["eavesdrop", "whisper", "barge"]
+		},
+		"TapEndReason": {
+			"description": "How a supervisor's tap ended. Distinguishes the monitored call ending from the supervisor leaving.",
+			"type": "string",
+			"enum": ["supervisor-ended", "target-ended", "escalated", "failed"]
 		}
 	}
 }

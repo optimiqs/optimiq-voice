@@ -27,6 +27,7 @@ import type { DidIndexSource } from "../routing/did-index.source";
 import type { ExtensionFeatureRpcPort } from "../routing/extension-feature.source";
 import type { LastCallerRpcSource } from "../routing/last-caller.source";
 import type { RoutingArtifactSource } from "../routing/routing-artifact.source";
+import type { SupervisorAuthzRpcPort } from "../routing/supervisor-authz.source";
 import type { VoicemailGreetingRpcPort } from "../routing/voicemail-greeting.source";
 import type { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
 import type { CallEventOf, CdrLegWriteEnvelope, SipTransferRequest } from "@optimiq-voice/events";
@@ -80,6 +81,17 @@ const NO_GREETINGS = {
 		throw new Error("no responder in this spec");
 	},
 } as unknown as VoicemailGreetingRpcPort;
+
+/**
+ * A supervision gate that DENIES, which is the only safe default for a fake.
+ *
+ * The one port in the engine that must fail closed: `*0` is specced in
+ * `routing/plan-walker-features.spec.ts` against a fake that answers both ways, and an orchestrator
+ * spec that accidentally dialled it must not discover a tap. See `supervisor-authz.source.ts`.
+ */
+const NO_SUPERVISION = {
+	authorize: async () => ({ allowed: false, reason: "no responder in this spec" }),
+} as unknown as SupervisorAuthzRpcPort;
 
 /**
  * A park-handoff seam that answers nothing.
@@ -373,6 +385,7 @@ function harness(env: EngineEnv = fakeEnv(), options: HarnessOptions = {}) {
 		NO_FEATURES,
 		NO_LAST_CALLER,
 		NO_GREETINGS,
+		NO_SUPERVISION,
 		NO_DID_INDEX,
 		signals,
 		new ConferenceRegistry(),
@@ -1468,6 +1481,7 @@ describe("resilience", () => {
 			NO_FEATURES,
 			NO_LAST_CALLER,
 			NO_GREETINGS,
+			NO_SUPERVISION,
 			NO_DID_INDEX,
 			h.signals,
 			new ConferenceRegistry(),

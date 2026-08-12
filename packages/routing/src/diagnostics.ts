@@ -39,6 +39,8 @@ export const DIAGNOSTIC_CODES = [
 	"ivr-cycle",
 	/** A ring group has no enabled destinations, so every call to it dead-ends. */
 	"empty-ring-group",
+	/** A paging group has no reachable members, so an announcement to it is heard by nobody. */
+	"empty-paging-group",
 	/** An outbound route's trunk list is empty after unknown/disabled trunks are dropped. */
 	"empty-trunk-list",
 	/** An outbound route names a trunk id that is not in the snapshot. */

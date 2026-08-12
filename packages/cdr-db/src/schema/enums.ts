@@ -31,6 +31,19 @@ export const CALL_DESTINATION_TYPES = [
 	"application",
 	"time_condition",
 	"park",
+	/**
+	 * A paging group. Appended rather than folded into `application`, which is where a paged leg
+	 * would otherwise land.
+	 *
+	 * The alternative was to leave it out and let `cdr-leg-mapping.ts` alias `paging` to `unknown`,
+	 * which is what it did before this value existed. That is not a small inaccuracy: a page
+	 * originates one auto-answered leg per member, so the busiest announcement in the building is
+	 * also the largest single producer of legs the reports cannot attribute — "unknown" would stop
+	 * being a rare residue and become the second-largest destination in the table. The check
+	 * constraint is one `drop`/`add` pair away from accepting it, which is precisely the property
+	 * this file's header keeps text-plus-check for.
+	 */
+	"paging",
 	"unknown",
 ] as const;
 export type CallDestinationType = (typeof CALL_DESTINATION_TYPES)[number];

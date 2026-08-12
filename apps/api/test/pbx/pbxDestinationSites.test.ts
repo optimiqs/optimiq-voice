@@ -10,6 +10,10 @@ import {
 	IVR_MENU_RESOURCE,
 } from "../../src/pbx/ivr-menus/ivr-menus.resource";
 import { OUTBOUND_ROUTE_RESOURCE } from "../../src/pbx/outbound-routes/outbound-routes.resource";
+import {
+	PAGING_GROUP_MEMBER_RESOURCE,
+	PAGING_GROUP_RESOURCE,
+} from "../../src/pbx/paging-groups/paging-groups.resource";
 import { PARK_LOT_RESOURCE } from "../../src/pbx/park-lots/park-lots.resource";
 import { PHONE_NUMBER_RESOURCE } from "../../src/pbx/phone-numbers/phone-numbers.resource";
 import {
@@ -76,6 +80,8 @@ const RESOURCES: readonly PbxResource[] = [
 	IVR_MENU_OPTION_RESOURCE,
 	RING_GROUP_RESOURCE,
 	RING_GROUP_DESTINATION_RESOURCE,
+	PAGING_GROUP_RESOURCE,
+	PAGING_GROUP_MEMBER_RESOURCE,
 	QUEUE_RESOURCE,
 	QUEUE_AGENT_RESOURCE,
 	QUEUE_TIER_RESOURCE,
@@ -90,6 +96,7 @@ const CHILD_RESOURCES: readonly PbxChildResource[] = [
 	TIME_CONDITION_RULE_RESOURCE,
 	IVR_MENU_OPTION_RESOURCE,
 	RING_GROUP_DESTINATION_RESOURCE,
+	PAGING_GROUP_MEMBER_RESOURCE,
 	QUEUE_TIER_RESOURCE,
 ];
 

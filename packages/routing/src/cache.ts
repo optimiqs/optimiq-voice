@@ -105,6 +105,12 @@ export const ROUTING_TABLE_TO_ENTITY: Readonly<Record<string, RoutingEntityKind>
 	moh_class: "mohClasses",
 	conference: "conferences",
 	park_lot: "parkLots",
+	paging_group: "pagingGroups",
+	// Both halves of the group map to the same collection, because the snapshot nests membership
+	// inside the group (see `PagingGroupInput`). Adding or removing one handset changes who hears an
+	// announcement, which is a compiled fact, so a write to the child evicts exactly as a write to
+	// the parent does.
+	paging_group_member: "pagingGroups",
 	feature_code: "featureCodes",
 	call_block_rule: "callBlockRules",
 	// A routing input as of E911: a DID's `emergency_address_id` picks the organization's ELIN, and

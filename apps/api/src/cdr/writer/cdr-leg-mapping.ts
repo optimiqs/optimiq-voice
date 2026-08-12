@@ -24,7 +24,7 @@ import type {
  * `hangupCause` and `disposition` are constrained STRINGS in `@optimiq-voice/events`, not enums,
  * "so new destination types arrive with new PBX features and must not require an `events`
  * release". `cdr-db` is the authority on the value domains, and it enforces them with `check`
- * constraints. Something has to sit between "any lower-kebab string" and "one of twelve
+ * constraints. Something has to sit between "any lower-kebab string" and "one of thirteen
  * snake_case values", and if that something is not a named, tested function then it is an
  * unhandled `23514` in the consume loop at three in the morning.
  *
@@ -102,6 +102,23 @@ const DESTINATION_TYPE_ALIASES: Readonly<Record<string, CallDestinationType>> = 
 	time_condition: "time_condition",
 	"trunk-dial": "trunk",
 	trunk: "trunk",
+	/**
+	 * Both spellings of a page, because the two vocabularies name it differently at each end and the
+	 * writer sees both: `paging` is the plan-node kind the engine copies out of the walk, and
+	 * `paging-group` is the `pbx-db` destination type a row carries when something ROUTED into an
+	 * announcement. `cdr-db` spells the reporting value `paging` — the group is named by
+	 * `destination_ref`, so repeating "group" in the type would be the column saying it twice.
+	 *
+	 * This pair used to be absent, and the fallback below turned every paged leg into `unknown`.
+	 * That was the wrong kind of inaccuracy to leave: a page originates one auto-answered leg per
+	 * member, so an announcement to fifty desks is fifty unattributable rows, and `unknown` stops
+	 * meaning "rare residue" the first time somebody uses the overhead pager. The fix needed the
+	 * value in `CALL_DESTINATION_TYPES` and a migration widening `call_legs_destination_type_check`;
+	 * both landed with this entry, because an alias pointing at a value the check constraint refuses
+	 * is not a fix, it is a `23514` moved from the report to the consume loop.
+	 */
+	paging: "paging",
+	"paging-group": "paging",
 
 	// Steps, not destinations. See the file header.
 	playback: "unknown",

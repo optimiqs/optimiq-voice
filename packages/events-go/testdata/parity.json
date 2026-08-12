@@ -29,6 +29,8 @@
 		"mediaSendDtmf": "rpc.media.v1.send-dtmf",
 		"mediaStartRecording": "rpc.media.v1.start-recording",
 		"mediaStopRecording": "rpc.media.v1.stop-recording",
+		"mediaTapSession": "rpc.media.v1.tap-session",
+		"mediaUntapSession": "rpc.media.v1.untap-session",
 		"engineOriginate": "rpc.engine.v1.originate",
 		"engineParkHandoff": "rpc.engine.v1.park-handoff"
 	},
@@ -805,7 +807,9 @@
 			"wrap-up",
 			"on-break",
 			"unavailable"
-		]
+		],
+		"TapMode": ["eavesdrop", "whisper", "barge"],
+		"TapEndReason": ["supervisor-ended", "target-ended", "escalated", "failed"]
 	},
 	"eventVocabularies": {
 		"call": [
@@ -828,7 +832,11 @@
 			"call.unparked",
 			"call.transferred",
 			"call.picked-up",
-			"call.emergency.dialed"
+			"call.emergency.dialed",
+			"call.tap.started",
+			"call.tap.ended",
+			"call.paging.started",
+			"call.paging.ended"
 		],
 		"registration": ["registered", "unregistered", "expired"],
 		"queue": ["caller.joined", "caller.answered", "caller.abandoned", "agent.state"],
@@ -941,6 +949,26 @@
 			"family": "call",
 			"type": "call.emergency.dialed",
 			"goType": "CallEmergencyDialedData"
+		},
+		{
+			"family": "call",
+			"type": "call.tap.started",
+			"goType": "CallTapStartedData"
+		},
+		{
+			"family": "call",
+			"type": "call.tap.ended",
+			"goType": "CallTapEndedData"
+		},
+		{
+			"family": "call",
+			"type": "call.paging.started",
+			"goType": "CallPagingStartedData"
+		},
+		{
+			"family": "call",
+			"type": "call.paging.ended",
+			"goType": "CallPagingEndedData"
 		},
 		{
 			"family": "registration",
@@ -1124,10 +1152,92 @@
 			}
 		},
 		{
+			"name": "call.tap.started",
+			"goType": "CallTapStartedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0004",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.tap.started",
+				"type": "call.tap.started",
+				"source": "sipd",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b54",
+					"mode": "whisper",
+					"supervisorExtension": "1900",
+					"targetExtension": "1001",
+					"targetLegId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d",
+					"previousMode": "eavesdrop",
+					"supervisorCallId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b55"
+				}
+			}
+		},
+		{
+			"name": "call.tap.ended",
+			"goType": "CallTapEndedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0005",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.tap.ended",
+				"type": "call.tap.ended",
+				"source": "sipd",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b54",
+					"mode": "whisper",
+					"supervisorExtension": "1900",
+					"targetExtension": "1001",
+					"reason": "target-ended",
+					"durationMs": 42000
+				}
+			}
+		},
+		{
+			"name": "call.paging.started",
+			"goType": "CallPagingStartedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0006",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.paging.started",
+				"type": "call.paging.started",
+				"source": "sipd",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d",
+					"pagingGroupId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b56",
+					"pagingGroupName": "Warehouse",
+					"dialed": "*81300",
+					"pagerExtension": "1001",
+					"memberCount": 12,
+					"answeredCount": 10,
+					"oneWay": true
+				}
+			}
+		},
+		{
+			"name": "call.paging.ended",
+			"goType": "CallPagingEndedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0007",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.paging.ended",
+				"type": "call.paging.ended",
+				"source": "sipd",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d",
+					"pagingGroupId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b56",
+					"pagingGroupName": "Warehouse",
+					"durationMs": 9500,
+					"answeredCount": 10
+				}
+			}
+		},
+		{
 			"name": "registration.registered",
 			"goType": "RegistrationRegisteredData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0004",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0008",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.9c99510034b54c0217012ab2d10512d0.registered",
@@ -1150,7 +1260,7 @@
 			"name": "registration.unregistered",
 			"goType": "RegistrationUnregisteredData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0005",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0009",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.9c99510034b54c0217012ab2d10512d0.unregistered",
@@ -1169,7 +1279,7 @@
 			"name": "registration.expired",
 			"goType": "RegistrationExpiredData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0006",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000a",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "01930a11-2233-7445-8899-aabbccddeeff",
 				"subject": "sip.reg.v1.01930a11-2233-7445-8899-aabbccddeeff.b01d8d8fae1e7a2d85f57232951b4b2c.expired",
@@ -1188,7 +1298,7 @@
 			"name": "queue.caller.joined",
 			"goType": "QueueCallerJoinedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0007",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000b",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "queue.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e.caller.joined",
@@ -1207,7 +1317,7 @@
 			"name": "queue.agent.state",
 			"goType": "QueueAgentStateData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0008",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000c",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "queue.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293._all.agent.state",
@@ -1226,7 +1336,7 @@
 			"name": "voicemail.message.left",
 			"goType": "VoicemailMessageLeftData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0009",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000d",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51.message.left",
@@ -1252,7 +1362,7 @@
 			"name": "voicemail.mwi.updated",
 			"goType": "VoicemailMWIUpdatedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000a",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000e",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51.mwi.updated",
@@ -1271,7 +1381,7 @@
 			"name": "media.session.ended",
 			"goType": "MediaSessionEndedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000b",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000f",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.session.ended",
@@ -1294,7 +1404,7 @@
 			"name": "media.session.rtp-timeout",
 			"goType": "MediaSessionRTPTimeoutData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000c",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0010",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.session.rtp-timeout",
@@ -1316,7 +1426,7 @@
 			"name": "cdr.leg.write",
 			"goType": "CDRLegWriteData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000d",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0011",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "cdr.leg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -1355,7 +1465,7 @@
 			"name": "audit.recorded",
 			"goType": "AuditRecordedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000e",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0012",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "audit.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -1389,7 +1499,7 @@
 			"name": "provision.device.rejected",
 			"goType": "ProvisionDeviceRejectedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000f",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0013",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "provision.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",

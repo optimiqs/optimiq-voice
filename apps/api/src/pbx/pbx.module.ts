@@ -1,5 +1,8 @@
 import { Inject, Module, type OnApplicationShutdown } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
+import { AuthModule } from "../auth/auth.module";
+import { AuthzCheckRpcController } from "../auth/authz/authz-check-rpc.controller";
+import { AuthzService } from "../auth/authz/authz.service";
 import { createObjectStore, describeObjectStore, loadStorageEnv } from "../storage";
 import {
 	createTranscriptionProvider,
@@ -37,6 +40,11 @@ import { OrgSettingsController } from "./org-settings/org-settings.controller";
 import { OrgSettingsService } from "./org-settings/org-settings.service";
 import { OutboundRoutesController } from "./outbound-routes/outbound-routes.controller";
 import { OutboundRoutesService } from "./outbound-routes/outbound-routes.service";
+import { PagingGroupsController } from "./paging-groups/paging-groups.controller";
+import {
+	PagingGroupMembersService,
+	PagingGroupsService,
+} from "./paging-groups/paging-groups.service";
 import { ParkLotsController } from "./park-lots/park-lots.controller";
 import { ParkLotsService } from "./park-lots/park-lots.service";
 import { PhoneNumbersController } from "./phone-numbers/phone-numbers.controller";
@@ -139,7 +147,45 @@ const logger = getLogger("api.pbx");
  * broker outage degrades the cache rather than the API.
  */
 @Module({
+	/**
+	 * The auth slice, imported for ONE thing: `AUTH_REPOSITORY`, which `AuthzService` needs.
+	 *
+	 * This is the first import this module has had, so the direction is worth defending. The
+	 * alternative was to declare the authz responder in `AuthModule` and have that module import
+	 * this one, and it is the wrong way round twice over. `AuthModule` is the slice that boots on
+	 * `DATABASE_URL`/`AUTH_SECRET`/`AUTH_URL` ALONE — `main.ts` mounts it for deployments that have
+	 * no telephony database at all, and `verify-auth-slice.ts` mounts it by itself — so importing
+	 * `PbxModule` from it would make the authentication surface require `PBX_DATABASE_URL`. And the
+	 * responder needs `PBX_DATABASE` anyway, which only this module owns.
+	 *
+	 * `LiveModule` already does exactly this (`imports: [AuthModule, PbxModule]`), so the shape is
+	 * the area's own precedent rather than a new one, and the module instance is the same singleton
+	 * the root composes — importing it here builds no second pool and registers no second guard.
+	 *
+	 * WHAT HAPPENS WHEN ONLY ONE SLICE IS CONFIGURED. Nothing, in both directions, and that is the
+	 * point: `main.ts` computes `pbxAreaEnabled = authSliceEnabled && isPbxAreaEnabled()`, so this
+	 * module is never mounted without the auth slice — the pairing is a precondition of the area,
+	 * not an assumption this file makes. With the auth slice alone (no `PBX_DATABASE_URL`) the whole
+	 * of `PbxModule` is skipped, the controller below is never constructed, and `rpc.authz.v1.check`
+	 * simply goes unanswered — which an engine sees as a timeout and must, per its own contract,
+	 * treat as a refusal. That is the correct behaviour for a deployment with no extensions to
+	 * supervise, and it is louder than the alternative would be: a responder that mounted anyway and
+	 * answered `allowed: false` for every extension would look identical to a permissions problem
+	 * and send somebody auditing roles for an afternoon.
+	 */
+	imports: [AuthModule],
 	controllers: [
+		/**
+		 * `rpc.authz.v1.check` — declared here, defined in `../auth/authz/`.
+		 *
+		 * The split is deliberate. The FILES belong beside `resolveRolePermissions` and the membership
+		 * repository, because that is what they are about and that is where the next person changing
+		 * how a role expands will be looking. The WIRING belongs here, because this is the module that
+		 * owns `PBX_DATABASE` — the responder's second lookup crosses into the telephony database to
+		 * turn an extension number into a user — and because a reader asking "what subjects does this
+		 * application answer?" gets the whole list from one `controllers` array.
+		 */
+		AuthzCheckRpcController,
 		ExtensionsController,
 		PhoneNumbersController,
 		TrunksController,
@@ -148,6 +194,7 @@ const logger = getLogger("api.pbx");
 		TimeConditionsController,
 		IvrMenusController,
 		RingGroupsController,
+		PagingGroupsController,
 		QueuesController,
 		QueueAgentsController,
 		QueueAgentSessionController,
@@ -270,6 +317,11 @@ const logger = getLogger("api.pbx");
 		CarrierWebhookController,
 	],
 	providers: [
+		/**
+		 * The authz responder's collaborator. Two injected handles, one per database — see its header
+		 * for why `extension_user.userId` cannot be joined and must be looked up twice.
+		 */
+		AuthzService,
 		...carrierProviders,
 		CarrierService,
 		SipCredentialsService,
@@ -512,6 +564,8 @@ const logger = getLogger("api.pbx");
 		IvrMenuOptionsService,
 		RingGroupsService,
 		RingGroupDestinationsService,
+		PagingGroupsService,
+		PagingGroupMembersService,
 		QueuesService,
 		QueueAgentsService,
 		QueueTiersService,

@@ -5,6 +5,7 @@ import {
 	destinationTypeSchema,
 	dialStringSchema,
 	sipTransportSchema,
+	tapModeSchema,
 } from "./telephony";
 
 /**
@@ -130,8 +131,34 @@ export const ROUTING_RESOLVE_RPC = defineRpc(
 
 export const authzCheckRequestSchema = z.object({
 	orgId: z.uuid(),
+	/**
+	 * WHO is asking. Four kinds, and `extension` is the one that needs the argument.
+	 *
+	 * An extension looks like a resource — it is a row in `pbx-db` with a number on it, and every
+	 * other subject on this platform is a principal with a user id. It is on this list anyway,
+	 * because of what the engine actually has at the moment it needs an answer. A supervisor picks
+	 * up a desk phone and dials `*0<extension>`. The engine authenticated that caller the only way a
+	 * phone can be authenticated: the call arrived from a REGISTERED EXTENSION. There is no session,
+	 * no cookie and no user id anywhere in the call — the same identity `*72` writes forwarding
+	 * with, and the same one `*97` opens a mailbox with. A check keyed on `user` could therefore
+	 * never be made from a handset at all, and the alternative to naming this subject type is that
+	 * every feature reachable from a phone is either unauthorized or authorized by whichever
+	 * runtime happens to be asking. That is the choice this entry closes.
+	 *
+	 * When `type` is `extension`, `id` is the extension NUMBER — not its uuid — scoped by `orgId`,
+	 * because the number is what the engine holds and asking it to carry a primary key it never
+	 * learned would put the resolution in the wrong process.
+	 *
+	 * And the number is a **CLAIM**, never an identity to be trusted, exactly as
+	 * `rpc.pbx.v1.extension-feature` says of its own `extensionNumber`: a request on a shared broker
+	 * proves only that something reached the broker. The responder must resolve the number to an
+	 * extension row **inside the tenant's own scope**, then that row to its primary linked user,
+	 * then that user's membership role, and answer on the permissions that produces. A responder
+	 * that skipped a hop would be answering `allowed: true` for whatever number it was handed,
+	 * which on THIS subject means handing a stranger the audio of somebody's live call.
+	 */
 	subject: z.object({
-		type: z.enum(["user", "api-key", "service"]),
+		type: z.enum(["user", "api-key", "service", "extension"]),
 		id: z.string().min(1).max(128),
 	}),
 	/** `<resource>.<action>[.<scope>]` strings from the permission registry in `packages/auth`. */
@@ -1552,6 +1579,153 @@ export const MEDIA_STOP_RECORDING_RPC = defineRpc(
 );
 
 // ---------------------------------------------------------------------------------------------
+// rpc.media.v1.tap-session — engine → mediad, supervision (eavesdrop / whisper / barge)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Which side of a two-party call a tap is talking about.
+ *
+ * `a` and `b` are the same leg roles `packages/telephony`'s `LEG_ROLES` names — the originating
+ * side and the side originated for it — so a supervisor coaching "the agent" says `speakTo: "b"`
+ * on an inbound customer call and the media plane needs no idea what an agent is. `both` and
+ * `none` complete the lattice, and `none` is only ever meaningful on `speakTo`: a tap that heard
+ * nothing would be a session allocated for no reason.
+ */
+export const MEDIA_TAP_SIDES = ["a", "b", "both", "none"] as const;
+export const mediaTapSideSchema = z.enum(MEDIA_TAP_SIDES);
+export type MediaTapSide = (typeof MEDIA_TAP_SIDES)[number];
+
+/**
+ * `rpc.media.v1.tap-session` — join a session's conversation on ASYMMETRIC terms.
+ *
+ * ## This is deliberately not a snoop, and the difference is the whole contract
+ *
+ * `plans/mediad-design.md` §10 question 4 settles it: `MediaPort.snoop` is refused by this media
+ * plane permanently, because a snoop channel exists only to give ARI something to address — a tap
+ * has to BE a channel there, so it is one. Reproducing that here would mean a session with no port
+ * publishing a `leg-arrived` for a leg that does not exist, which is precisely the "emit synthetic
+ * ARI events forever" outcome §3.2 exists to prevent.
+ *
+ * So supervision is specified as what it actually is: a THIRD PARTICIPANT in a bridge whose
+ * contribution is routed differently per peer. `hear` says which peers' audio reaches the
+ * supervisor; `speakTo` says which peers the supervisor's audio reaches. The three industry
+ * features fall out as three points, and there is no branch anywhere for which one it is:
+ *
+ * ```text
+ * eavesdrop   hear: "both"   speakTo: "none"
+ * whisper     hear: "both"   speakTo: "b"      (or "a" — whichever leg is the coached one)
+ * barge       hear: "both"   speakTo: "both"
+ * ```
+ *
+ * ## Why the full shape ships before the implementation does
+ *
+ * `mediad` refuses this today: v1 relays RTP without decoding it, and routing one participant's
+ * audio to one peer and not the other is a MIX, which is rung 6. Declaring the whole shape now is
+ * the point rather than an oversight — a tap IS a mix-minus participant (`speakTo: "none"` is a
+ * participant subtracted from everybody's mix; `speakTo: "a"` is one that appears in exactly one
+ * peer's), so the rung-6 mixer serves this contract by ARRIVING. Had `*0` been built against
+ * `snoop` instead, the cutover would have had to either invent a channel concept this plane does
+ * not have or break a shipped feature's wire format.
+ *
+ * ## Ids and lifecycle
+ *
+ * `tapSessionId` is the supervisor's OWN allocated session — the tap is a participant, so it has a
+ * port and an SDP like any other leg, and it was allocated by `allocate-session` before this call.
+ * `targetSessionId` is any session in the conversation being joined; the media plane resolves the
+ * bridge from it, which is why the caller does not have to know a bridge id it may never have seen
+ * (on this driver a bridge only exists once two members are in it).
+ *
+ * `tapId` is caller-assigned for the same reason `bridgeId` and `sessionId` are: the engine must be
+ * able to untap something whose reply it never received.
+ */
+export const mediaTapSessionRequestSchema = z.object({
+	/** Caller-assigned handle for the tap itself. See above. */
+	tapId: z.string().min(1).max(128),
+	/** The supervisor's own allocated session — a real participant with a real port. */
+	tapSessionId: z.string().min(1).max(128),
+	/** Any session in the conversation being joined; the bridge is resolved from it. */
+	targetSessionId: z.string().min(1).max(128),
+	/**
+	 * Which peers the supervisor hears. `none` is accepted by the enum and refused by the
+	 * responder: a participant that hears nothing and (for an eavesdrop) says nothing is a port
+	 * pair burning for no reason, and answering `ok` to it would hide a caller's bug.
+	 */
+	hear: mediaTapSideSchema.default("both"),
+	/** Which peers hear the supervisor. `none` is the silent case and is the common one. */
+	speakTo: mediaTapSideSchema.default("none"),
+	/**
+	 * The feature's own name for this combination, carried for the media plane's LOG only.
+	 *
+	 * Not authoritative: `hear`/`speakTo` are the contract, and a responder that branched on this
+	 * instead would be able to disagree with them. It is here because "mediad opened a barge on
+	 * session X" is a line an operator can read and `hear=both speakTo=both` is one they have to
+	 * decode at three in the morning.
+	 */
+	mode: tapModeSchema.optional(),
+});
+
+export const mediaTapSessionResponseSchema = z.object({
+	ok: z.boolean(),
+	tapId: z.string().min(1).max(128),
+	/** The bridge the tap joined, when it joined one. Empty on a refusal. */
+	bridgeId: z.string().max(128).optional(),
+	/** The sessions the tap is party to. Empty on a refusal. */
+	sessionIds: z.array(z.string().max(128)).max(8).default([]),
+	instanceId: z.string().min(1).max(128).optional(),
+	reason: mediaRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type MediaTapSessionRequest = z.infer<typeof mediaTapSessionRequestSchema>;
+export type MediaTapSessionResponse = z.infer<typeof mediaTapSessionResponseSchema>;
+
+export const MEDIA_TAP_SESSION_RPC = defineRpc(
+	RPC_SUBJECTS.mediaTapSession,
+	mediaTapSessionRequestSchema,
+	mediaTapSessionResponseSchema,
+	// The same 500 ms every other media command carries, and for the same reason: a supervisor
+	// pressing `*0` is listening to silence until this returns.
+	500,
+);
+
+/**
+ * `rpc.media.v1.untap-session` — remove the tap, leave the conversation running.
+ *
+ * Keyed by `tapId` alone, exactly as `stop-playback` and `stop-recording` are keyed by their own
+ * references: the engine's `MediaPort.stopTap(tapId)` carries nothing else, and a lookup by
+ * reference is one the media plane can do without a scan.
+ *
+ * Idempotent. Untapping something already gone answers `ok: true, untapped: false` — the engine
+ * retries an untap when a reply is lost, and a monitored conversation that survived the retry is
+ * not a failure. It also NEVER ends the monitored call: a supervisor hanging up must leave the
+ * customer talking to the agent, which is the one behaviour a mistake here would get wrong in the
+ * most visible possible way.
+ */
+export const mediaUntapSessionRequestSchema = z.object({
+	tapId: z.string().min(1).max(128),
+});
+
+export const mediaUntapSessionResponseSchema = z.object({
+	ok: z.boolean(),
+	tapId: z.string().min(1).max(128),
+	/** False when there was no such tap. A SUCCESS, not a failure — see the note above. */
+	untapped: z.boolean().default(false),
+	instanceId: z.string().min(1).max(128).optional(),
+	reason: mediaRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type MediaUntapSessionRequest = z.infer<typeof mediaUntapSessionRequestSchema>;
+export type MediaUntapSessionResponse = z.infer<typeof mediaUntapSessionResponseSchema>;
+
+export const MEDIA_UNTAP_SESSION_RPC = defineRpc(
+	RPC_SUBJECTS.mediaUntapSession,
+	mediaUntapSessionRequestSchema,
+	mediaUntapSessionResponseSchema,
+	500,
+);
+
+// ---------------------------------------------------------------------------------------------
 // rpc.engine.v1.originate — api → engine, click-to-call
 // ---------------------------------------------------------------------------------------------
 
@@ -1902,6 +2076,8 @@ export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.mediaSendDtmf]: MEDIA_SEND_DTMF_RPC,
 	[RPC_SUBJECTS.mediaStartRecording]: MEDIA_START_RECORDING_RPC,
 	[RPC_SUBJECTS.mediaStopRecording]: MEDIA_STOP_RECORDING_RPC,
+	[RPC_SUBJECTS.mediaTapSession]: MEDIA_TAP_SESSION_RPC,
+	[RPC_SUBJECTS.mediaUntapSession]: MEDIA_UNTAP_SESSION_RPC,
 	[RPC_SUBJECTS.engineOriginate]: ORIGINATE_RPC,
 	[RPC_SUBJECTS.engineParkHandoff]: PARK_HANDOFF_RPC,
 } as const;

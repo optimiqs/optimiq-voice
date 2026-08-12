@@ -48,6 +48,10 @@ interface HarnessOptions {
 	readonly seed?: Readonly<Record<string, "available" | "on-call" | "logged-out" | "on-break">>;
 	readonly dials?: readonly DialScript[];
 	readonly bridgeFails?: boolean;
+	/** The media server refuses the agent's whisper. The bridge must still happen. */
+	readonly whisperFails?: boolean;
+	/** The port throws outright, which is a different failure from a refusal and must also not block. */
+	readonly whisperThrows?: boolean;
 	readonly answerFails?: boolean;
 	readonly stopMusicThrows?: boolean;
 	readonly dialThrows?: boolean;
@@ -179,6 +183,19 @@ function harness(options: HarnessOptions = {}): Harness {
 		},
 		play: async (media: string) => {
 			timeline.push(`play:${media}`);
+			return true;
+		},
+		// On the SAME timeline as `play` and `bridge`, deliberately: what an agent-whisper spec is
+		// actually about is the ORDER — the agent hears their cue after the answer and before the
+		// bridge — and a separate recorder would let a whisper played into a live conversation pass.
+		playToAgent: async (mediaChannelId: string, media: string) => {
+			timeline.push(`whisper:${mediaChannelId}:${media}`);
+			if (options.whisperFails === true) {
+				return false;
+			}
+			if (options.whisperThrows === true) {
+				throw new Error("the media server refused the whisper");
+			}
 			return true;
 		},
 		startMusicOnHold: async (mohClass?: string) => {
@@ -648,6 +665,77 @@ describe("an agent answers", () => {
 		);
 		expect(onCallAt).toBeGreaterThanOrEqual(0);
 		expect(h.timeline.indexOf("bridge:media-a")).toBeGreaterThan(-1);
+	});
+
+	// ---------------------------------------------------------------------------------------------
+	// The agent's whisper
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * The cue an answering agent hears, and the caller does not.
+	 *
+	 * The whole feature is a matter of WHO and WHEN, so every assertion here is about the timeline
+	 * rather than about a return value: played at the agent's own leg, after the answer is settled,
+	 * before the bridge exists. A prompt one step later is a prompt the customer hears.
+	 */
+	it("plays the whisper at the AGENT's leg, after the answer and before the bridge", async () => {
+		const h = harness({
+			dials: [{ kind: "answer" }],
+			node: { agentWhisperPromptId: "sales-cue" },
+		});
+		await h.session.run();
+
+		const whisperAt = h.timeline.indexOf("whisper:media-a:sound:sales-cue");
+		const bridgeAt = h.timeline.indexOf("bridge:media-a");
+		expect(whisperAt).toBeGreaterThan(-1);
+		expect(bridgeAt).toBeGreaterThan(whisperAt);
+		// And never at the caller, who is still in the queue's hold music.
+		expect(h.timeline).not.toContain("play:sound:sales-cue");
+	});
+
+	it("plays nothing when the queue has no whisper prompt", async () => {
+		const h = harness({ dials: [{ kind: "answer" }] });
+		await h.session.run();
+		expect(h.timeline.some((entry) => entry.startsWith("whisper:"))).toBe(false);
+	});
+
+	it("bridges anyway when the playback is refused — an announcement is worth less than the call", async () => {
+		const h = harness({
+			dials: [{ kind: "answer" }],
+			node: { agentWhisperPromptId: "sales-cue" },
+			whisperFails: true,
+		});
+		const outcome = await h.session.run();
+
+		expect(outcome).toMatchObject({ kind: "answered", agentId: "a" });
+		expect(h.timeline).toContain("bridge:media-a");
+		expect(h.notes.join(" ")).toContain("could not be played");
+	});
+
+	it("bridges anyway when the playback THROWS, which is a different failure from a refusal", async () => {
+		const h = harness({
+			dials: [{ kind: "answer" }],
+			node: { agentWhisperPromptId: "sales-cue" },
+			whisperThrows: true,
+		});
+		const outcome = await h.session.run();
+
+		expect(outcome).toMatchObject({ kind: "answered", agentId: "a" });
+		expect(h.timeline).toContain("bridge:media-a");
+		expect(h.notes.join(" ")).toContain("agent whisper prompt failed");
+	});
+
+	it("bridges anyway when the prompt id resolves to no playable audio", async () => {
+		// The fake resolver answers `undefined` for a prompt it does not recognise, which is what the
+		// walker's own resolver does for a `tts://` or an unmounted `object://` ref.
+		const h = harness({
+			dials: [{ kind: "answer" }],
+			node: { agentWhisperPromptId: "   " },
+		});
+		const outcome = await h.session.run();
+
+		expect(outcome).toMatchObject({ kind: "answered", agentId: "a" });
+		expect(h.timeline.some((entry) => entry.startsWith("whisper:"))).toBe(false);
 	});
 
 	it("hangs up the answered leg and does not publish or bridge when on-call promotion fails", async () => {

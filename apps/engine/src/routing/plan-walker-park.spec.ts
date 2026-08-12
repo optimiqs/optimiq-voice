@@ -24,7 +24,7 @@ const CALL_ID = "0195c0f0-1c2f-7000-8000-0000000000c1";
 const ORG_ID = "0195c0f0-1c2f-7000-8000-000000000001";
 
 interface ControlCall {
-	readonly method: "park" | "unpark" | "pickup" | "dial";
+	readonly method: "park" | "unpark" | "pickup" | "dial" | "monitor";
 	readonly args: unknown;
 }
 
@@ -90,6 +90,13 @@ function harness(options: HarnessOptions = {}) {
 		pickup: async (request) => {
 			control.push({ method: "pickup", args: request });
 			return options.pickupResult ?? { ok: true };
+		},
+		// Present because the port declares it, not because these specs use it: `*0` is
+		// `plan-walker-features.spec.ts`'s subject. Recorded rather than ignored so a park spec that
+		// somehow reached supervision fails on an unexpected call rather than on silence.
+		monitor: async (request) => {
+			control.push({ method: "monitor", args: request });
+			return { ok: false, reason: "not used by these specs" };
 		},
 		// Present because the port declares it, not because these specs use it: `*69`'s return call is
 		// `plan-walker-features.spec.ts`'s subject. A fake that silently refused would be a fake that

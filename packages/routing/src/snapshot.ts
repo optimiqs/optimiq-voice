@@ -31,6 +31,7 @@
  * | `mohClasses`              | `moh_class`              | id → name, so a plan node can carry the name|
  * | `conferences`             | `conference`             | room number + PIN presence                 |
  * | `parkLots`                | `park_lot`               | slot range + timeout branch                |
+ * | `pagingGroups`            | `paging_group`           | members joined in, not a flat list          |
  * | `featureCodes`            | `feature_code`           | 1:1                                        |
  * | `callBlockRules`          | `call_block_rule`        | 1:1 minus the hit counters                 |
  * | `emergencyAddresses`      | `emergency_address`      | id, label and `validated` only             |
@@ -45,8 +46,8 @@
  *
  * # Optional collections
  *
- * Three collections — `mohClasses`, `voicemailGreetings` and `emergencyAddresses` — are declared
- * **optional** on
+ * Four collections — `mohClasses`, `voicemailGreetings`, `emergencyAddresses` and `pagingGroups` —
+ * are declared **optional** on
  * {@link OrgRoutingSnapshot} and listed in {@link OPTIONAL_SNAPSHOT_COLLECTIONS}. That is a
  * deliberate rollout affordance rather than a modelling accident: they were added after the API's
  * snapshot loader was written, and a required field would have made this package impossible to
@@ -294,6 +295,20 @@ export interface ExtensionInput extends RoutingEntityInput {
 	 * the documented fallback.
 	 */
 	readonly pickupGroup?: string | null;
+	/**
+	 * Whether an EXTERNAL caller is asked to record their name before this extension is rung, from
+	 * `extension.call_screening`.
+	 *
+	 * A compiled fact rather than a runtime lookup for the usual reason: the decision is taken at the
+	 * instant the leg is offered, by a process holding no database handle. Whose calls are screened —
+	 * external only, never a colleague — is the engine's rule and not a field, because it is not
+	 * something a tenant configures.
+	 *
+	 * Optional, like {@link ExtensionInput.followMe} and {@link ExtensionInput.pickupGroup}, so this
+	 * package stays compilable against a loader that does not yet select the column. Absent is read
+	 * as `false`, which is what every extension did before screening was compiled at all.
+	 */
+	readonly callScreening?: boolean | null;
 	readonly recordPolicy: RecordPolicy;
 	readonly mohClassId?: string | null;
 	readonly tollClass: TollClass;
@@ -450,6 +465,16 @@ export interface QueueInput extends RoutingEntityInput {
 	readonly mohClassId?: string | null;
 	readonly greetingPromptId?: string | null;
 	readonly announcePromptId?: string | null;
+	/**
+	 * Whisper-on-answer: played to the ANSWERING AGENT alone, before the caller is bridged in, from
+	 * `queue.agent_whisper_prompt_id`.
+	 *
+	 * A routing fact because it is a fact about the call: which prompt an agent hears depends on
+	 * which queue the call came from, and the queue is what this node is. Optional for the rollout
+	 * reason the other new fields here carry — a loader that does not select the column produces a
+	 * queue that bridges the agent straight through, which is what every queue did before.
+	 */
+	readonly agentWhisperPromptId?: string | null;
 	readonly maxWaitSeconds: number;
 	readonly maxWaitNoAgentSeconds: number;
 	readonly announcePositionEnabled: boolean;
@@ -584,6 +609,52 @@ export interface ParkLotInput extends RoutingEntityInput {
 	readonly timeoutDestinationData?: DestinationInput["destinationData"];
 }
 
+/**
+ * One handset in a paging group, mirroring `paging_group_member`.
+ *
+ * `extensionId` rather than a number, because the row stores a foreign key and the loader must not
+ * start resolving things: turning the id into the number a page dials is the compiler's job, and it
+ * is the step that produces the diagnostic when the extension is gone. `ordinal` is the fan-out
+ * order the operator chose, and `enabled` is a member switched off without being removed — a
+ * distinction the artifact keeps by dropping the member from the compiled list, not from the row.
+ *
+ * Not a {@link RoutingEntityInput} despite having an `enabled` column: it has no `id` the compiler
+ * ever needs — a member is identified by the pair it names, and nothing points at one.
+ */
+export interface PagingGroupMemberInput {
+	readonly extensionId: string;
+	readonly ordinal: number;
+	readonly enabled: boolean;
+}
+
+/**
+ * A paging group, mirroring `paging_group`.
+ *
+ * # Why the members are nested here and ring-group destinations are not
+ *
+ * Every other parent/child pair in this snapshot is two flat collections joined by the compiler,
+ * because that is what `select … where organization_id = $1` returns and it keeps the loader a
+ * projection. Membership is the exception, and deliberately: a `paging_group_member` row carries no
+ * destination trio, no delay, no timeout and no id anything else can point at — it is a
+ * `(extension, position)` pair and nothing more. A second top-level collection for it would add a
+ * `SNAPSHOT_COLLECTIONS` entry, a cache-invalidation entry and an index pass to express a list, and
+ * the flat form's one real benefit — a child that several parents or several *kinds* of parent can
+ * reference — does not apply to something only its own group can name.
+ *
+ * `duplex` is carried because it changes what the engine does with the member legs (one-way
+ * announcement versus talkback), and `timeoutSeconds` because it bounds how long it waits for one
+ * to come up. There is no destination trio: a page ends when the pager hangs up.
+ */
+export interface PagingGroupInput extends RoutingEntityInput {
+	readonly name: string;
+	readonly extensionNumber?: string | null;
+	/** `false` is a one-way announcement: members hear the pager and cannot be heard. */
+	readonly duplex: boolean;
+	readonly timeoutSeconds: number;
+	/** In any order — the compiler sorts by `ordinal`, as it does everywhere else. */
+	readonly members: readonly PagingGroupMemberInput[];
+}
+
 export interface FeatureCodeInput extends RoutingEntityInput {
 	/** Dialed string including the leading star, e.g. `*97`. */
 	readonly code: string;
@@ -658,6 +729,8 @@ export interface OrgRoutingSnapshot {
 	readonly mohClasses?: readonly MohClassInput[];
 	readonly conferences: readonly ConferenceInput[];
 	readonly parkLots: readonly ParkLotInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly pagingGroups?: readonly PagingGroupInput[];
 	readonly featureCodes: readonly FeatureCodeInput[];
 	readonly callBlockRules: readonly CallBlockRuleInput[];
 	/** Optional — see the "optional collections" note in this file's header. */
@@ -690,6 +763,7 @@ export const SNAPSHOT_COLLECTIONS = [
 	"mohClasses",
 	"conferences",
 	"parkLots",
+	"pagingGroups",
 	"featureCodes",
 	"callBlockRules",
 	"emergencyAddresses",
@@ -709,6 +783,12 @@ export const OPTIONAL_SNAPSHOT_COLLECTIONS = [
 	"voicemailGreetings",
 	"mohClasses",
 	"emergencyAddresses",
+	// Newest of the four, and optional for exactly the reason the other three are: paging shipped
+	// after the API's snapshot loader was written, and a required field would have made this package
+	// impossible to release before the loader learned to select `paging_group`. A tenant whose
+	// loader has not caught up compiles no paging nodes, which is what every release before this one
+	// produced.
+	"pagingGroups",
 ] as const satisfies readonly SnapshotCollection[];
 
 export type OptionalSnapshotCollection = (typeof OPTIONAL_SNAPSHOT_COLLECTIONS)[number];
@@ -757,6 +837,7 @@ export function emptySnapshot(organizationId: string): OrgRoutingSnapshot {
 		mohClasses: [],
 		conferences: [],
 		parkLots: [],
+		pagingGroups: [],
 		featureCodes: [],
 		callBlockRules: [],
 		emergencyAddresses: [],

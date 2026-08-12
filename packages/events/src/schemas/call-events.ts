@@ -15,6 +15,8 @@ import {
 	pickupKindSchema,
 	recordingKindSchema,
 	recordingStopReasonSchema,
+	tapEndReasonSchema,
+	tapModeSchema,
 	transferKindSchema,
 } from "./telephony";
 
@@ -258,6 +260,99 @@ export const callEmergencyDialedDataSchema = z.object({
 	trunkName: z.string().max(128).optional(),
 });
 
+/**
+ * `call.tap.started` — a supervisor is now listening to a call that is not theirs.
+ *
+ * ## Why the subject is the TARGET call, not the supervisor's
+ *
+ * Both are real calls with real ids, and the supervisor's leg has its own `channel.created`. The
+ * subject is the monitored one because that is the call anybody ever asks about: a compliance
+ * review starts from "this customer conversation" and needs to discover who was on it. Keyed the
+ * other way, finding the taps on a call would mean scanning every call in the org.
+ *
+ * `legId` is therefore the SUPERVISOR's leg — the one this event is news about — matching the
+ * convention `call.picked-up` uses, where `legId` is the party that acted.
+ *
+ * ## Published again on escalation
+ *
+ * `*0` starts in `eavesdrop` and DTMF moves it to `whisper` (5) or `barge` (6). Each transition
+ * publishes a fresh `started` carrying the new `mode`, with `previousMode` set. A single event
+ * with the final mode would mean a supervisor who listened silently for ten minutes and then
+ * barged is indistinguishable from one who barged immediately.
+ */
+export const callTapStartedDataSchema = z.object({
+	/** The supervisor's own leg — the party doing the listening. */
+	legId: z.uuid(),
+	mode: tapModeSchema,
+	/** The supervising extension, as the engine authenticated it. */
+	supervisorExtension: dialStringSchema,
+	/** The extension whose call is being monitored — what `*0` was dialled with. */
+	targetExtension: dialStringSchema,
+	/** The monitored party's leg inside the target call, when it is known. */
+	targetLegId: z.uuid().optional(),
+	/**
+	 * The mode this replaced, on an escalation. Absent on the first `started` of a tap, which is
+	 * what distinguishes "began monitoring" from "changed how they were monitoring".
+	 */
+	previousMode: tapModeSchema.optional(),
+	/** The supervisor's own call id, so the two calls can be joined without a scan. */
+	supervisorCallId: z.uuid().optional(),
+});
+
+/** `call.tap.ended` — the supervisor stopped listening. Bounds the monitored interval. */
+export const callTapEndedDataSchema = z.object({
+	legId: z.uuid(),
+	mode: tapModeSchema,
+	supervisorExtension: dialStringSchema,
+	targetExtension: dialStringSchema,
+	reason: tapEndReasonSchema,
+	/** How long the tap was open. Absent when the engine lost the start (a restart mid-tap). */
+	durationMs: z.int().min(0).optional(),
+});
+
+/**
+ * `call.paging.started` — a one-way announcement was opened to a group of handsets.
+ *
+ * `answeredCount` is the number of members whose phone actually auto-answered, and it is the
+ * point of the event: a page to a group of twelve where two phones were unregistered is a page
+ * the person making it believes reached everybody. `memberCount` is what was attempted, so the
+ * pair is a delivery report rather than an intention.
+ */
+export const callPagingStartedDataSchema = z.object({
+	/** The pager's own leg — the party talking. */
+	legId: z.uuid(),
+	/** `paging_group.id`. */
+	pagingGroupId: z.uuid(),
+	pagingGroupName: z.string().max(128),
+	/** The dial code that opened it, e.g. `*81` plus the group's number. */
+	dialed: dialStringSchema.optional(),
+	pagerExtension: dialStringSchema.optional(),
+	/** Members the page was offered to. */
+	memberCount: z.int().min(0),
+	/** Members whose handset came up. */
+	answeredCount: z.int().min(0),
+	/**
+	 * False for a talkback page, where members can answer back.
+	 *
+	 * Required rather than defaulted, because the publisher always knows: it is compiled onto the
+	 * paging node and the engine read it in order to decide which way to point the audio. A default
+	 * here would let a producer that forgot the field report a one-way announcement for a page the
+	 * whole warehouse could talk over.
+	 */
+	oneWay: z.boolean(),
+});
+
+/** `call.paging.ended` — the announcement finished and its bridge went away. */
+export const callPagingEndedDataSchema = z.object({
+	legId: z.uuid(),
+	pagingGroupId: z.uuid(),
+	pagingGroupName: z.string().max(128),
+	/** How long the page was open. */
+	durationMs: z.int().min(0).optional(),
+	/** Members still connected when it ended, for the "did anybody hang up early?" question. */
+	answeredCount: z.int().min(0).optional(),
+});
+
 /** Every call event contract, keyed by its `type` (which is also its subject event token). */
 export const CALL_EVENT_DEFINITIONS = {
 	"channel.created": defineEvent("call", "channel.created", channelCreatedDataSchema),
@@ -292,6 +387,10 @@ export const CALL_EVENT_DEFINITIONS = {
 		"call.emergency.dialed",
 		callEmergencyDialedDataSchema,
 	),
+	"call.tap.started": defineEvent("call", "call.tap.started", callTapStartedDataSchema),
+	"call.tap.ended": defineEvent("call", "call.tap.ended", callTapEndedDataSchema),
+	"call.paging.started": defineEvent("call", "call.paging.started", callPagingStartedDataSchema),
+	"call.paging.ended": defineEvent("call", "call.paging.ended", callPagingEndedDataSchema),
 } as const;
 
 export type CallEventDefinitions = typeof CALL_EVENT_DEFINITIONS;
@@ -327,6 +426,10 @@ export const callEventSchema = z.discriminatedUnion("type", [
 	CALL_EVENT_DEFINITIONS["call.transferred"].envelope,
 	CALL_EVENT_DEFINITIONS["call.picked-up"].envelope,
 	CALL_EVENT_DEFINITIONS["call.emergency.dialed"].envelope,
+	CALL_EVENT_DEFINITIONS["call.tap.started"].envelope,
+	CALL_EVENT_DEFINITIONS["call.tap.ended"].envelope,
+	CALL_EVENT_DEFINITIONS["call.paging.started"].envelope,
+	CALL_EVENT_DEFINITIONS["call.paging.ended"].envelope,
 ]);
 
 export type CallEventEnvelope = z.infer<typeof callEventSchema>;

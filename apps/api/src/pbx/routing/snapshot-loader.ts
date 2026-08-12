@@ -11,6 +11,8 @@ import {
 	mohClass,
 	orgSetting,
 	outboundRoute,
+	pagingGroup,
+	pagingGroupMember,
 	parkLot,
 	type PbxDatabaseTransaction,
 	phoneNumber,
@@ -40,7 +42,7 @@ import type { OrgRoutingSnapshot, RoutingSettingsInput } from "@optimiq-voice/ro
  *    is exactly what `select … where organization_id = $1` returns. The compiler owns every join
  *    and sorts everything it walks, which is what makes its output deterministic.
  *
- * Twenty-one statements, no joins, run inside the caller's tenant transaction — so RLS scopes them
+ * Twenty-three statements, no joins, run inside the caller's tenant transaction — so RLS scopes them
  * and `organization_id` never appears in a predicate here. That is deliberate: the policy is the
  * filter, and duplicating it in the query would make a missing policy invisible.
  *
@@ -74,6 +76,13 @@ import type { OrgRoutingSnapshot, RoutingSettingsInput } from "@optimiq-voice/ro
  * first active row per box/kind, so the artifact is deterministic whatever order arrives), and a
  * `where active` here would hand the compiler a pre-made decision it is supposed to make.
  *
+ * `pagingGroups` arrived the same way and is loaded on the same terms: OPTIONAL on
+ * `OrgRoutingSnapshot`, so the compiler shipped `*81` before this loader could see a group, and
+ * until it could, `params.groupId` resolved to nothing and every page compiled to a code that
+ * announces into an empty room. Its two statements are the group and its members; the projection
+ * below explains why the members are the one child collection this file nests rather than passes
+ * through flat.
+ *
  * The reads are issued as one `Promise.all` batch: they are independent, they are all on the same
  * connection inside one transaction (so postgres.js pipelines them), and the compile-on-write path
  * runs this on every mutation.
@@ -98,6 +107,8 @@ export async function loadOrgRoutingSnapshot(
 		voicemailBoxes,
 		conferences,
 		parkLots,
+		pagingGroups,
+		pagingGroupMembers,
 		featureCodes,
 		callBlockRules,
 		mohClasses,
@@ -120,6 +131,8 @@ export async function loadOrgRoutingSnapshot(
 		transaction.select().from(voicemailBox),
 		transaction.select().from(conference),
 		transaction.select().from(parkLot),
+		transaction.select().from(pagingGroup),
+		transaction.select().from(pagingGroupMember),
 		transaction.select().from(featureCode),
 		transaction.select().from(callBlockRule),
 		transaction.select().from(mohClass),
@@ -167,6 +180,13 @@ export async function loadOrgRoutingSnapshot(
 			 * else's normalisation to say what this tenant's phones do.
 			 */
 			pickupGroup: row.pickupGroup ?? undefined,
+			/**
+			 * Raw, not `?? undefined`: the column is `notNull().default(false)`, so there is no third
+			 * state to preserve. "Screening is off" and "the operator has not thought about screening"
+			 * are the same fact about how this extension answers a call, and the compiler is entitled
+			 * to read a boolean as a boolean.
+			 */
+			callScreening: row.callScreening,
 		})),
 		phoneNumbers: phoneNumbers.map((row) => ({
 			id: row.id,
@@ -333,6 +353,14 @@ export async function loadOrgRoutingSnapshot(
 			timeoutDestinationType: row.timeoutDestinationType,
 			timeoutDestinationRef: row.timeoutDestinationRef,
 			timeoutDestinationData: row.timeoutDestinationData,
+			/**
+			 * `?? undefined` for the reason `pickupGroup` documents above: the column is nullable and
+			 * `QueueInput.agentWhisperPromptId` is OPTIONAL, so NULL means "no whisper" and must arrive
+			 * as absent. Passing `null` through would be a queue that whispers a prompt it does not
+			 * have — or, in the compiler's terms, a `dangling-prompt` diagnostic for a reference nobody
+			 * made.
+			 */
+			agentWhisperPromptId: row.agentWhisperPromptId ?? undefined,
 		})),
 		voicemailBoxes: voicemailBoxes.map((row) => ({
 			id: row.id,
@@ -380,6 +408,37 @@ export async function loadOrgRoutingSnapshot(
 			timeoutDestinationType: row.timeoutDestinationType,
 			timeoutDestinationRef: row.timeoutDestinationRef,
 			timeoutDestinationData: row.timeoutDestinationData,
+		})),
+		/**
+		 * The one collection whose children are NESTED rather than flat, and not by this loader's
+		 * choice: `PagingGroupInput.members` is declared that way, and the reason is recorded on the
+		 * type — a member is an `(extension, position)` pair with no id anything can point at, so a
+		 * second top-level collection for it would buy a `SNAPSHOT_COLLECTIONS` entry and a
+		 * cache-invalidation entry in exchange for expressing a list.
+		 *
+		 * The read is still two flat statements and no join, which is rule 2: the grouping happens
+		 * here, in memory, over rows RLS already scoped. Members arrive in ordinal order because the
+		 * loader sorts them — the compiler sorts by `ordinal` again on its own side, and both are
+		 * true statements about determinism rather than one relying on the other.
+		 *
+		 * Disabled groups and disabled members are both loaded, per rule 1. A member switched off is
+		 * a fact the compiler keeps by dropping it from the compiled fan-out, not by never seeing it.
+		 */
+		pagingGroups: pagingGroups.map((row) => ({
+			id: row.id,
+			enabled: row.enabled,
+			name: row.name,
+			extensionNumber: row.extensionNumber,
+			duplex: row.duplex,
+			timeoutSeconds: row.timeoutSeconds,
+			members: pagingGroupMembers
+				.filter((member) => member.pagingGroupId === row.id)
+				.sort((left, right) => left.ordinal - right.ordinal || (left.id < right.id ? -1 : 1))
+				.map((member) => ({
+					extensionId: member.extensionId,
+					ordinal: member.ordinal,
+					enabled: member.enabled,
+				})),
 		})),
 		featureCodes: featureCodes.map((row) => ({
 			id: row.id,

@@ -101,6 +101,7 @@ import type {
 	IvrMenuOptionInput,
 	MohClassInput,
 	OrgRoutingSnapshot,
+	PagingGroupInput,
 	RingGroupDestinationInput,
 	TimeConditionRuleInput,
 	VoicemailGreetingInput,
@@ -251,6 +252,7 @@ class Compiler {
 	>();
 	private readonly conferencesById = new Map<string, OrgRoutingSnapshot["conferences"][number]>();
 	private readonly parkLotsById = new Map<string, OrgRoutingSnapshot["parkLots"][number]>();
+	private readonly pagingGroupsById = new Map<string, PagingGroupInput>();
 	private readonly phoneNumbersById = new Map<string, OrgRoutingSnapshot["phoneNumbers"][number]>();
 	private readonly trunksById = new Map<string, OrgRoutingSnapshot["trunks"][number]>();
 	private readonly timeConditionsById = new Map<string, CompiledTimeCondition>();
@@ -352,6 +354,11 @@ class Compiler {
 		}
 		for (const lot of sortById(this.snapshot.parkLots)) {
 			this.parkLotsById.set(lot.id, lot);
+		}
+		// `?? []`, because `pagingGroups` is an optional collection: a loader that has not learned to
+		// select `paging_group` yet is a rollout state, not a tenant with no paging.
+		for (const group of sortById(this.snapshot.pagingGroups ?? [])) {
+			this.pagingGroupsById.set(group.id, group);
 		}
 		for (const did of sortById(this.snapshot.phoneNumbers)) {
 			this.phoneNumbersById.set(did.id, did);
@@ -564,6 +571,11 @@ class Compiler {
 				this.parkNode(lot);
 			}
 		}
+		for (const group of sortById(this.snapshot.pagingGroups ?? [])) {
+			if (group.enabled) {
+				this.pagingGroupNode(group);
+			}
+		}
 		for (const condition of sortById(this.snapshot.timeConditions)) {
 			if (condition.enabled) {
 				this.timeConditionNodeById(
@@ -641,6 +653,9 @@ class Compiler {
 			}
 			case "park": {
 				return this.parkNodeById(ref, subject, path);
+			}
+			case "paging-group": {
+				return this.pagingGroupNodeById(ref, subject, path);
 			}
 			case "time-condition": {
 				return this.timeConditionNodeById(ref, subject, path);
@@ -737,6 +752,10 @@ class Compiler {
 			timeoutSeconds: extension.callTimeoutSeconds,
 			doNotDisturb: extension.doNotDisturb,
 			pickupGroup: pickupGroupOf(extension),
+			// `compact` drops `undefined`, so an extension that has not asked for screening carries no
+			// key at all — which is what makes the field's absence and `false` the same artifact, and
+			// therefore what keeps the hash stable across a loader that learns to select the column.
+			callScreening: extension.callScreening ?? undefined,
 			mohClassId: extension.mohClassId ?? undefined,
 			mohClass: this.mohClassName(extension.mohClassId, subject, "mohClassId"),
 			forwardAllNodeId: extension.forwardAllEnabled
@@ -1269,6 +1288,10 @@ class Compiler {
 			mohClass: this.mohClassName(entry.mohClassId, subject, "mohClassId"),
 			greetingPromptId: entry.greetingPromptId ?? undefined,
 			announcePromptId: entry.announcePromptId ?? undefined,
+			// Carried as an id, exactly like the two prompts above it: a prompt is addressed by row id
+			// the whole way down, and only `mohClass` needs resolving because only a media server
+			// insists on the NAME.
+			agentWhisperPromptId: entry.agentWhisperPromptId ?? undefined,
 			maxWaitSeconds: entry.maxWaitSeconds,
 			maxWaitNoAgentSeconds: entry.maxWaitNoAgentSeconds,
 			announcePositionEnabled: entry.announcePositionEnabled,
@@ -1576,6 +1599,106 @@ class Compiler {
 		return id;
 	}
 
+	private pagingGroupNodeById(
+		ref: string,
+		subject: DiagnosticSubject,
+		path: string,
+	): PlanNodeId | null {
+		const group = this.pagingGroupsById.get(ref);
+		if (group === undefined) {
+			return this.missingTarget("paging group", ref, subject, path);
+		}
+		if (!group.enabled) {
+			return this.disabledTarget("paging group", group.name, subject, path);
+		}
+		return this.pagingGroupNode(group);
+	}
+
+	/**
+	 * A paging group, compiled to the list of numbers the engine will announce to.
+	 *
+	 * Three ways a member leaves the compiled list, and they are deliberately not the same event:
+	 *
+	 * - the **member row** is disabled — silently. That is the operator saying "not this desk today",
+	 *   which is configuration working rather than configuration broken, and reporting it would put a
+	 *   warning on every group that has ever had somebody on leave.
+	 * - its **extension is not in the snapshot** — a `dangling-destination` warning naming the group
+	 *   and the id. A member pointing at nothing means the page reaches fewer handsets than whoever
+	 *   built the group believes, and that belief is only ever tested during an emergency.
+	 * - its **extension is disabled** — a `disabled-entity` warning, the same one every other
+	 *   destination raises. Told apart from the case above because the fix is different: one is
+	 *   "somebody deleted this desk", the other is "somebody switched it off".
+	 *
+	 * All warnings, never errors, and the group still compiles when it ends up EMPTY, because an
+	 * empty page is a configuration mistake and not an unsound artifact — exactly the line
+	 * `empty-ring-group` draws. Refusing to compile would take the tenant's working calls down to fix
+	 * an announcement nobody has made yet.
+	 */
+	private pagingGroupNode(group: PagingGroupInput): PlanNodeId {
+		const id = `paging:${group.id}`;
+		if (this.claimed.has(id)) {
+			return id;
+		}
+		this.claimed.add(id);
+
+		const subject: DiagnosticSubject = { kind: "paging-group", id: group.id, name: group.name };
+		const members: string[] = [];
+		for (const member of [...group.members].sort(
+			(left, right) =>
+				left.ordinal - right.ordinal ||
+				(left.extensionId < right.extensionId ? -1 : left.extensionId > right.extensionId ? 1 : 0),
+		)) {
+			if (!member.enabled) {
+				continue;
+			}
+			const extension = this.extensionsById.get(member.extensionId);
+			// `extensionsById` holds disabled extensions too — that is what makes the two misses below
+			// distinguishable at all, and the operator needs them distinguished because the fixes are
+			// not the same one.
+			if (extension === undefined) {
+				this.bag.warning(
+					"dangling-destination",
+					`Paging group "${group.name}" lists extension "${member.extensionId}", which is not in this organization's configuration; it was dropped from the page.`,
+					subject,
+					"members",
+				);
+				continue;
+			}
+			if (!extension.enabled) {
+				this.bag.warning(
+					"disabled-entity",
+					`Paging group "${group.name}" lists extension ${extension.number}, which is disabled; it was dropped from the page.`,
+					subject,
+					"members",
+				);
+				continue;
+			}
+			members.push(extension.number);
+		}
+
+		if (members.length === 0) {
+			this.bag.warning(
+				"empty-paging-group",
+				`Paging group "${group.name}" has no reachable members; a page to it announces to nobody.`,
+				subject,
+			);
+		}
+
+		this.nodes.set(
+			id,
+			compact({
+				id,
+				kind: "paging",
+				label: group.name,
+				pagingGroupId: group.id,
+				members,
+				duplex: group.duplex,
+				timeoutSeconds: group.timeoutSeconds,
+			}) as PlanNode,
+		);
+		return id;
+	}
+
 	private timeConditionNodeById(
 		ref: string,
 		subject: DiagnosticSubject,
@@ -1820,18 +1943,24 @@ class Compiler {
 	}
 
 	/**
-	 * A few feature codes name a concrete entity in `params` — `call-park` may pin a lot. Resolving
-	 * it at compile time is what lets the engine treat "park in lot X" and "park anywhere" as the
-	 * same code with a different node.
+	 * A few feature codes name a concrete entity in `params` — `call-park` may pin a lot, `paging`
+	 * may pin a group. Resolving it at compile time is what lets the engine treat "park in lot X" and
+	 * "park anywhere" as the same code with a different node.
+	 *
+	 * `intercom` is deliberately NOT here. Its argument is the extension the caller dialed after the
+	 * code (`*80` + `1001`), which is a live keypress and not a stored parameter — there is nothing
+	 * for a compiler to resolve, and pinning one would turn a code that reaches any desk into a code
+	 * that reaches one.
 	 */
 	private featureCodeTarget(entry: OrgRoutingSnapshot["featureCodes"][number]): PlanNodeId | null {
+		const subject: DiagnosticSubject = { kind: "feature-code", id: entry.id, name: entry.code };
 		const lotId = entry.params?.lotId;
 		if (entry.action === "call-park" && typeof lotId === "string" && lotId.length > 0) {
-			return this.parkNodeById(
-				lotId,
-				{ kind: "feature-code", id: entry.id, name: entry.code },
-				"params.lotId",
-			);
+			return this.parkNodeById(lotId, subject, "params.lotId");
+		}
+		const groupId = entry.params?.groupId;
+		if (entry.action === "paging" && typeof groupId === "string" && groupId.length > 0) {
+			return this.pagingGroupNodeById(groupId, subject, "params.groupId");
 		}
 		return null;
 	}
@@ -1907,6 +2036,20 @@ class Compiler {
 				entityId: entry.id,
 				nodeId: this.queueNode(entry),
 				name: entry.name,
+			});
+		}
+		for (const group of sortById(this.snapshot.pagingGroups ?? [])) {
+			if (!group.enabled || group.extensionNumber == null || group.extensionNumber.length === 0) {
+				continue;
+			}
+			// Through `claimNumber` like every other dialable entity, so a group numbered the same as an
+			// extension collides LOUDLY at compile time instead of quietly at dial time — where the
+			// tenant would discover it by paging the building when they meant to call a colleague.
+			this.claimNumber(group.extensionNumber, {
+				kind: "paging-group",
+				entityId: group.id,
+				nodeId: this.pagingGroupNode(group),
+				name: group.name,
 			});
 		}
 		for (const room of sortById(this.snapshot.conferences)) {

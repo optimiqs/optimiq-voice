@@ -1,5 +1,6 @@
 import { expect } from "chai";
 import { DEVICE_VENDORS } from "@optimiq-voice/pbx-db";
+import { AUTO_ANSWER_ALERT_INFO, AUTO_ANSWER_CALL_INFO } from "../../src/provisioning/auto-answer";
 import { explainSettings, resolveSettings } from "../../src/provisioning/catalog/cascade";
 import {
 	CATALOG_VENDORS,
@@ -315,6 +316,18 @@ describe("Yealink rendering", () => {
 		);
 		expect(withSettings.body).to.contain("features.dnd.enable = 1");
 	});
+
+	it("enables the INTERCOM feature for auto-answer, and not the unconditional auto_answer", () => {
+		expect(rendered.body).to.contain("features.intercom.allow = 1");
+		expect(rendered.body).to.contain("features.intercom.tone = 1");
+		expect(rendered.body).to.contain("features.intercom.mute = 0");
+		// Off deliberately: an intercom that interrupts a call in progress is a policy choice, not a
+		// default to ship.
+		expect(rendered.body).to.contain("features.intercom.barge = 0");
+		// `account.N.auto_answer` answers EVERY inbound call and would make the handset an open
+		// microphone. It must never appear.
+		expect(rendered.body).to.not.contain("auto_answer =");
+	});
 });
 
 describe("Poly rendering", () => {
@@ -364,6 +377,14 @@ describe("Poly rendering", () => {
 
 	it("does NOT claim the master manifest's filename", () => {
 		expect(rendered.filename).to.equal("001565abcdef-phone.cfg");
+	});
+
+	it("maps the auto-answer Alert-Info onto the ringAutoAnswer ring class", () => {
+		// Poly has no auto-answer FLAG: the feature is expressed as "when the Alert-Info field matches
+		// this string, apply this ring class", and the token is ours to choose — which is why it comes
+		// from the shared constant rather than from a Polycom-community convention.
+		expect(rendered.body).to.contain(`voIpProt.SIP.alertInfo.1.value="${AUTO_ANSWER_ALERT_INFO}"`);
+		expect(rendered.body).to.contain('voIpProt.SIP.alertInfo.1.class="ringAutoAnswer"');
 	});
 });
 
@@ -426,6 +447,16 @@ describe("Grandstream rendering", () => {
 		expect(alt.body).to.not.contain("localPort");
 	});
 
+	it("enables auto-answer by CALL-INFO, which is this vendor's difference from the other four", () => {
+		// Grandstream does not read Alert-Info at all. `P298` is the enable, `P2356` is the string it
+		// looks for in the Call-Info header — written as P-names because the alias names for these two
+		// could not be corroborated, and a guessed alias is a setting the phone silently ignores.
+		expect(rendered.body).to.contain('<item name="P298">1</item>');
+		expect(rendered.body).to.contain(`<item name="P2356">${AUTO_ANSWER_CALL_INFO}</item>`);
+		// An empty custom value means "any Call-Info", which a carrier or SBC can trip.
+		expect(rendered.body).to.not.contain('<item name="P2356"></item>');
+	});
+
 	it("packs VPKs contiguously, because a gap ends the list on this vendor", () => {
 		const sparse = renderWith(
 			templateFor("grandstream")!,
@@ -485,6 +516,16 @@ describe("Fanvil rendering", () => {
 		expect(rendered.body).to.contain("Fkey2 Value :+12125550100@1");
 	});
 
+	it("writes the intercom quartet under its own module, and never SIPn Auto Answer", () => {
+		expect(rendered.body).to.contain("<TELE CONFIG MODULE>");
+		expect(rendered.body).to.contain("Enable Intercom :1");
+		expect(rendered.body).to.contain("Intercom Tone :1");
+		expect(rendered.body).to.contain("Intercom Mute :0");
+		expect(rendered.body).to.contain("Intercom Barge :0");
+		// The unconditional per-line parameter, which would answer every inbound call.
+		expect(rendered.body).to.not.contain("Auto Answer :");
+	});
+
 	it("renders an unverified key kind as None rather than a guessed subtype letter", () => {
 		const park = renderWith(
 			templateFor("fanvil")!,
@@ -536,6 +577,16 @@ describe("Snom rendering", () => {
 		expect(rendered.body).to.contain('<fkey idx="0" context="1"');
 		expect(rendered.body).to.contain("blf sip:1002@pbx.example.com;user=phone");
 		expect(rendered.body).to.contain("speed +12125550100");
+	});
+
+	it("provisions answer_after_policy, because it defaults to OFF on modern firmware", () => {
+		// Phone-wide settings carry no `idx`: identity indices are 1-based, so an `idx="0"` here would
+		// address a slot that does not exist.
+		expect(rendered.body).to.contain('<answer_after_policy perm="RW">idle</answer_after_policy>');
+		expect(rendered.body).to.contain(
+			'<auto_connect_indication perm="RW">on</auto_connect_indication>',
+		);
+		expect(rendered.body).to.not.contain("<answer_after_policy idx=");
 	});
 
 	it("appends a non-default port to the host", () => {
@@ -593,6 +644,51 @@ describe("the generic template", () => {
 	it("says out loud that no phone will accept it", () => {
 		const rendered = renderWith(templateFor("generic")!, context({ vendor: "generic" }));
 		expect(rendered.body).to.contain("NOT a vendor provisioning format");
+	});
+});
+
+/**
+ * The one cross-vendor assertion in this file, and it earns its place: auto-answer is the only
+ * feature here where the phone's configuration has to agree with a literal the SWITCH sends. Every
+ * other parameter these templates write is wrong only if the template is wrong; this one is wrong if
+ * the two sides drift, and the drift is silent — the phone rings instead of answering and nobody
+ * finds out until somebody pages a room full of handsets that all sit there chirping.
+ */
+describe("auto-answer across the desk-phone vendors", () => {
+	const DESK_PHONES = ["yealink", "poly", "grandstream", "fanvil", "snom"] as const;
+
+	it("configures every desk phone to answer the signal, none of them by accident", () => {
+		// One marker per vendor, in that vendor's own dialect. Deliberately not a shared regex: the
+		// point of five templates is that the five formats do not resemble each other.
+		const marker: Record<(typeof DESK_PHONES)[number], string> = {
+			yealink: "features.intercom.allow = 1",
+			poly: 'voIpProt.SIP.alertInfo.1.class="ringAutoAnswer"',
+			grandstream: '<item name="P298">1</item>',
+			fanvil: "Enable Intercom :1",
+			snom: "answer_after_policy",
+		};
+		for (const vendor of DESK_PHONES) {
+			const rendered = renderWith(templateFor(vendor)!, context({ vendor }));
+			expect(rendered.body, vendor).to.contain(marker[vendor]);
+		}
+	});
+
+	it("puts the shared Alert-Info token on every vendor that matches the header as a string", () => {
+		// Poly is the only one of the five where WE choose the token, so it is the only one whose
+		// rendered document can be asserted to carry the constant verbatim. Yealink and Snom match a
+		// string their own firmware owns; Grandstream reads a different header entirely.
+		const poly = renderWith(templateFor("poly")!, context({ vendor: "poly" }));
+		expect(poly.body).to.contain(AUTO_ANSWER_ALERT_INFO);
+		expect(AUTO_ANSWER_ALERT_INFO).to.equal("info=alert-autoanswer");
+		expect(AUTO_ANSWER_CALL_INFO).to.equal("answer-after=0");
+	});
+
+	it("tells an administrator, through the catalogue, what was not verified", () => {
+		const entries = catalogEntries();
+		for (const vendor of ["grandstream", "fanvil"] as const) {
+			const entry = entries.find((candidate) => candidate.vendor === vendor);
+			expect(entry?.caveats.join(" "), vendor).to.contain("UNVERIFIED");
+		}
 	});
 });
 

@@ -155,6 +155,34 @@
 			"goType": "CallEmergencyDialedData"
 		},
 		{
+			"family": "call",
+			"type": "call.tap.started",
+			"subject": "calls.evt.v1.<orgId>.<callId>.call.tap.started",
+			"dataSchema": "events/call.call.tap.started.schema.json",
+			"goType": "CallTapStartedData"
+		},
+		{
+			"family": "call",
+			"type": "call.tap.ended",
+			"subject": "calls.evt.v1.<orgId>.<callId>.call.tap.ended",
+			"dataSchema": "events/call.call.tap.ended.schema.json",
+			"goType": "CallTapEndedData"
+		},
+		{
+			"family": "call",
+			"type": "call.paging.started",
+			"subject": "calls.evt.v1.<orgId>.<callId>.call.paging.started",
+			"dataSchema": "events/call.call.paging.started.schema.json",
+			"goType": "CallPagingStartedData"
+		},
+		{
+			"family": "call",
+			"type": "call.paging.ended",
+			"subject": "calls.evt.v1.<orgId>.<callId>.call.paging.ended",
+			"dataSchema": "events/call.call.paging.ended.schema.json",
+			"goType": "CallPagingEndedData"
+		},
+		{
 			"family": "registration",
 			"type": "registered",
 			"subject": "sip.reg.v1.<orgId>.<aorHash>.registered",
@@ -424,6 +452,22 @@
 			"responseSchema": "rpc/rpc.media.v1.stop-recording.response.schema.json",
 			"goRequestType": "MediaStopRecordingRequest",
 			"goResponseType": "MediaStopRecordingResponse"
+		},
+		{
+			"subject": "rpc.media.v1.tap-session",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.media.v1.tap-session.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.tap-session.response.schema.json",
+			"goRequestType": "MediaTapSessionRequest",
+			"goResponseType": "MediaTapSessionResponse"
+		},
+		{
+			"subject": "rpc.media.v1.untap-session",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.media.v1.untap-session.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.untap-session.response.schema.json",
+			"goRequestType": "MediaUntapSessionRequest",
+			"goResponseType": "MediaUntapSessionResponse"
 		},
 		{
 			"subject": "rpc.engine.v1.originate",

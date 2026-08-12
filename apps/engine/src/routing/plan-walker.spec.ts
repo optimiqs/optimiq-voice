@@ -2180,6 +2180,9 @@ describe("feature codes", () => {
 		expect(outcome.notes.join(" ")).toContain("found no mailbox");
 	});
 
+	// `*80` used to be this spec's example and gained a runtime; `*45` has not, which is the point —
+	// the catalogue is bigger than the set of codes that do something, and the ones that do nothing
+	// must SAY so rather than hanging up in silence.
 	it("announces and hangs up for a code with no runtime, rather than doing nothing", async () => {
 		const h = harness();
 		const outcome = await h.walker.walk(
@@ -2188,8 +2191,8 @@ describe("feature codes", () => {
 					id: "f",
 					kind: "feature-code",
 					featureCodeId: "fc-2",
-					code: "*80",
-					action: "intercom",
+					code: "*45",
+					action: "queue-toggle",
 				} as PlanNode,
 			]),
 		);

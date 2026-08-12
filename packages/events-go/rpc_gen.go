@@ -39,6 +39,8 @@ const (
 	SubjectMediaSendDtmfRPC         = "rpc.media.v1.send-dtmf"
 	SubjectMediaStartRecordingRPC   = "rpc.media.v1.start-recording"
 	SubjectMediaStopRecordingRPC    = "rpc.media.v1.stop-recording"
+	SubjectMediaTapSessionRPC       = "rpc.media.v1.tap-session"
+	SubjectMediaUntapSessionRPC     = "rpc.media.v1.untap-session"
 	SubjectOriginateRPC             = "rpc.engine.v1.originate"
 	SubjectParkHandoffRPC           = "rpc.engine.v1.park-handoff"
 )
@@ -61,6 +63,8 @@ const (
 	TimeoutMediaSendDtmfRPC         = 500 * time.Millisecond
 	TimeoutMediaStartRecordingRPC   = 1000 * time.Millisecond
 	TimeoutMediaStopRecordingRPC    = 500 * time.Millisecond
+	TimeoutMediaTapSessionRPC       = 500 * time.Millisecond
+	TimeoutMediaUntapSessionRPC     = 500 * time.Millisecond
 	TimeoutOriginateRPC             = 5000 * time.Millisecond
 	TimeoutParkHandoffRPC           = 3000 * time.Millisecond
 )
@@ -107,9 +111,10 @@ type AuthzCheckRequestSubject struct {
 type AuthzCheckRequestSubjectType string
 
 const (
-	AuthzCheckRequestSubjectTypeUser    AuthzCheckRequestSubjectType = "user"
-	AuthzCheckRequestSubjectTypeAPIKey  AuthzCheckRequestSubjectType = "api-key"
-	AuthzCheckRequestSubjectTypeService AuthzCheckRequestSubjectType = "service"
+	AuthzCheckRequestSubjectTypeUser      AuthzCheckRequestSubjectType = "user"
+	AuthzCheckRequestSubjectTypeAPIKey    AuthzCheckRequestSubjectType = "api-key"
+	AuthzCheckRequestSubjectTypeService   AuthzCheckRequestSubjectType = "service"
+	AuthzCheckRequestSubjectTypeExtension AuthzCheckRequestSubjectType = "extension"
 )
 
 // AuthzCheckRequestSubjectTypeValues lists every member of the vocabulary, in contract order.
@@ -117,6 +122,7 @@ var AuthzCheckRequestSubjectTypeValues = []AuthzCheckRequestSubjectType{
 	AuthzCheckRequestSubjectTypeUser,
 	AuthzCheckRequestSubjectTypeAPIKey,
 	AuthzCheckRequestSubjectTypeService,
+	AuthzCheckRequestSubjectTypeExtension,
 }
 
 // Valid reports whether v is a member of the AuthzCheckRequestSubjectType vocabulary.
@@ -1151,6 +1157,174 @@ func (v MediaStopRecordingResponseReason) Valid() bool {
 }
 
 func (v MediaStopRecordingResponseReason) String() string { return string(v) }
+
+// MediaTapSessionRequest is the request body of rpc.media.v1.tap-session.
+type MediaTapSessionRequest struct {
+	TapID           string                        `json:"tapId"`
+	TapSessionID    string                        `json:"tapSessionId"`
+	TargetSessionID string                        `json:"targetSessionId"`
+	Hear            MediaTapSessionRequestHear    `json:"hear"`
+	SpeakTo         MediaTapSessionRequestSpeakTo `json:"speakTo"`
+	Mode            *TapMode                      `json:"mode,omitempty"`
+}
+
+// MediaTapSessionRequestHear is the closed vocabulary of MediaTapSessionRequest.hear.
+type MediaTapSessionRequestHear string
+
+const (
+	MediaTapSessionRequestHearA    MediaTapSessionRequestHear = "a"
+	MediaTapSessionRequestHearB    MediaTapSessionRequestHear = "b"
+	MediaTapSessionRequestHearBoth MediaTapSessionRequestHear = "both"
+	MediaTapSessionRequestHearNone MediaTapSessionRequestHear = "none"
+)
+
+// MediaTapSessionRequestHearValues lists every member of the vocabulary, in contract order.
+var MediaTapSessionRequestHearValues = []MediaTapSessionRequestHear{
+	MediaTapSessionRequestHearA,
+	MediaTapSessionRequestHearB,
+	MediaTapSessionRequestHearBoth,
+	MediaTapSessionRequestHearNone,
+}
+
+// Valid reports whether v is a member of the MediaTapSessionRequestHear vocabulary.
+func (v MediaTapSessionRequestHear) Valid() bool {
+	for _, candidate := range MediaTapSessionRequestHearValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaTapSessionRequestHear) String() string { return string(v) }
+
+// MediaTapSessionRequestSpeakTo is the closed vocabulary of MediaTapSessionRequest.speakTo.
+type MediaTapSessionRequestSpeakTo string
+
+const (
+	MediaTapSessionRequestSpeakToA    MediaTapSessionRequestSpeakTo = "a"
+	MediaTapSessionRequestSpeakToB    MediaTapSessionRequestSpeakTo = "b"
+	MediaTapSessionRequestSpeakToBoth MediaTapSessionRequestSpeakTo = "both"
+	MediaTapSessionRequestSpeakToNone MediaTapSessionRequestSpeakTo = "none"
+)
+
+// MediaTapSessionRequestSpeakToValues lists every member of the vocabulary, in contract order.
+var MediaTapSessionRequestSpeakToValues = []MediaTapSessionRequestSpeakTo{
+	MediaTapSessionRequestSpeakToA,
+	MediaTapSessionRequestSpeakToB,
+	MediaTapSessionRequestSpeakToBoth,
+	MediaTapSessionRequestSpeakToNone,
+}
+
+// Valid reports whether v is a member of the MediaTapSessionRequestSpeakTo vocabulary.
+func (v MediaTapSessionRequestSpeakTo) Valid() bool {
+	for _, candidate := range MediaTapSessionRequestSpeakToValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaTapSessionRequestSpeakTo) String() string { return string(v) }
+
+// MediaTapSessionResponse is the reply body of rpc.media.v1.tap-session.
+type MediaTapSessionResponse struct {
+	Ok         bool                           `json:"ok"`
+	TapID      string                         `json:"tapId"`
+	BridgeID   *string                        `json:"bridgeId,omitempty"`
+	SessionIDs []string                       `json:"sessionIds"`
+	InstanceID *string                        `json:"instanceId,omitempty"`
+	Reason     *MediaTapSessionResponseReason `json:"reason,omitempty"`
+	Error      *string                        `json:"error,omitempty"`
+}
+
+// MediaTapSessionResponseReason is the closed vocabulary of MediaTapSessionResponse.reason.
+type MediaTapSessionResponseReason string
+
+const (
+	MediaTapSessionResponseReasonBadRequest     MediaTapSessionResponseReason = "bad_request"
+	MediaTapSessionResponseReasonCapacity       MediaTapSessionResponseReason = "capacity"
+	MediaTapSessionResponseReasonShuttingDown   MediaTapSessionResponseReason = "shutting_down"
+	MediaTapSessionResponseReasonUnknownSession MediaTapSessionResponseReason = "unknown_session"
+	MediaTapSessionResponseReasonWrongInstance  MediaTapSessionResponseReason = "wrong_instance"
+	MediaTapSessionResponseReasonNotSupported   MediaTapSessionResponseReason = "not_supported"
+	MediaTapSessionResponseReasonInternal       MediaTapSessionResponseReason = "internal"
+)
+
+// MediaTapSessionResponseReasonValues lists every member of the vocabulary, in contract order.
+var MediaTapSessionResponseReasonValues = []MediaTapSessionResponseReason{
+	MediaTapSessionResponseReasonBadRequest,
+	MediaTapSessionResponseReasonCapacity,
+	MediaTapSessionResponseReasonShuttingDown,
+	MediaTapSessionResponseReasonUnknownSession,
+	MediaTapSessionResponseReasonWrongInstance,
+	MediaTapSessionResponseReasonNotSupported,
+	MediaTapSessionResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the MediaTapSessionResponseReason vocabulary.
+func (v MediaTapSessionResponseReason) Valid() bool {
+	for _, candidate := range MediaTapSessionResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaTapSessionResponseReason) String() string { return string(v) }
+
+// MediaUntapSessionRequest is the request body of rpc.media.v1.untap-session.
+type MediaUntapSessionRequest struct {
+	TapID string `json:"tapId"`
+}
+
+// MediaUntapSessionResponse is the reply body of rpc.media.v1.untap-session.
+type MediaUntapSessionResponse struct {
+	Ok         bool                             `json:"ok"`
+	TapID      string                           `json:"tapId"`
+	Untapped   bool                             `json:"untapped"`
+	InstanceID *string                          `json:"instanceId,omitempty"`
+	Reason     *MediaUntapSessionResponseReason `json:"reason,omitempty"`
+	Error      *string                          `json:"error,omitempty"`
+}
+
+// MediaUntapSessionResponseReason is the closed vocabulary of MediaUntapSessionResponse.reason.
+type MediaUntapSessionResponseReason string
+
+const (
+	MediaUntapSessionResponseReasonBadRequest     MediaUntapSessionResponseReason = "bad_request"
+	MediaUntapSessionResponseReasonCapacity       MediaUntapSessionResponseReason = "capacity"
+	MediaUntapSessionResponseReasonShuttingDown   MediaUntapSessionResponseReason = "shutting_down"
+	MediaUntapSessionResponseReasonUnknownSession MediaUntapSessionResponseReason = "unknown_session"
+	MediaUntapSessionResponseReasonWrongInstance  MediaUntapSessionResponseReason = "wrong_instance"
+	MediaUntapSessionResponseReasonNotSupported   MediaUntapSessionResponseReason = "not_supported"
+	MediaUntapSessionResponseReasonInternal       MediaUntapSessionResponseReason = "internal"
+)
+
+// MediaUntapSessionResponseReasonValues lists every member of the vocabulary, in contract order.
+var MediaUntapSessionResponseReasonValues = []MediaUntapSessionResponseReason{
+	MediaUntapSessionResponseReasonBadRequest,
+	MediaUntapSessionResponseReasonCapacity,
+	MediaUntapSessionResponseReasonShuttingDown,
+	MediaUntapSessionResponseReasonUnknownSession,
+	MediaUntapSessionResponseReasonWrongInstance,
+	MediaUntapSessionResponseReasonNotSupported,
+	MediaUntapSessionResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the MediaUntapSessionResponseReason vocabulary.
+func (v MediaUntapSessionResponseReason) Valid() bool {
+	for _, candidate := range MediaUntapSessionResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaUntapSessionResponseReason) String() string { return string(v) }
 
 // OriginateRequest is the request body of rpc.engine.v1.originate.
 type OriginateRequest struct {

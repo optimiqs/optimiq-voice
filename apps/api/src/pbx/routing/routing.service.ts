@@ -289,6 +289,13 @@ export function destinationOf(node: PlanNode | undefined): {
 		case "park": {
 			return { destinationType, destinationRef: node.parkLotId };
 		}
+		// A page is row-backed like the rest, and it is also terminal — the announcement ends where
+		// it started. That makes no difference here: this function reports what the call REACHED, and
+		// "reached paging group X" is exactly as reportable as "reached queue Y". The kind travels
+		// verbatim as `paging`, which is what the compiler named the node.
+		case "paging": {
+			return { destinationType, destinationRef: node.pagingGroupId };
+		}
 		case "time-condition": {
 			return { destinationType, destinationRef: node.timeConditionId };
 		}

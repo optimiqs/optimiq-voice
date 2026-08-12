@@ -14,6 +14,7 @@ import {
 	anIvrMenu,
 	anIvrOption,
 	anOutboundRoute,
+	aPagingGroup,
 	aParkLot,
 	aPhoneNumber,
 	aQueue,
@@ -35,6 +36,8 @@ import { emptySnapshot } from "./snapshot";
 import type {
 	ExtensionPlanNode,
 	IvrMenuPlanNode,
+	PagingPlanNode,
+	QueuePlanNode,
 	RingGroupPlanNode,
 	TrunkDialPlanNode,
 } from "./plan";
@@ -978,6 +981,225 @@ describe("compile — ring groups", () => {
 			}),
 		);
 		expect((artifact.nodes["ring-group:rg-1"] as RingGroupPlanNode).members).toEqual([]);
+	});
+});
+
+describe("compile — paging groups", () => {
+	it("compiles member NUMBERS in ordinal order", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [
+					anExtension(),
+					anExtension({ id: "ext-2", number: "1002" }),
+					anExtension({ id: "ext-3", number: "1003" }),
+				],
+				pagingGroups: [
+					aPagingGroup({
+						members: [
+							{ extensionId: "ext-3", ordinal: 3, enabled: true },
+							{ extensionId: "ext-1", ordinal: 1, enabled: true },
+							{ extensionId: "ext-2", ordinal: 2, enabled: true },
+						],
+					}),
+				],
+			}),
+		);
+		const node = artifact.nodes["paging:pg-1"] as PagingPlanNode;
+		// Numbers, not endpoints and not ids: the engine owns the dial template.
+		expect(node.members).toEqual(["1001", "1002", "1003"]);
+		expect(node.duplex).toBe(false);
+		expect(node.timeoutSeconds).toBe(30);
+	});
+
+	it("carries the talkback flag when the group is duplex", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				pagingGroups: [aPagingGroup({ duplex: true, timeoutSeconds: 15 })],
+			}),
+		);
+		const node = artifact.nodes["paging:pg-1"] as PagingPlanNode;
+		expect(node.duplex).toBe(true);
+		expect(node.timeoutSeconds).toBe(15);
+	});
+
+	it("drops a disabled member silently", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension(), anExtension({ id: "ext-2", number: "1002" })],
+				pagingGroups: [
+					aPagingGroup({
+						members: [
+							{ extensionId: "ext-1", ordinal: 1, enabled: false },
+							{ extensionId: "ext-2", ordinal: 2, enabled: true },
+						],
+					}),
+				],
+			}),
+		);
+		expect(result.ok).toBe(true);
+		const node = (result.ok ? result.artifact.nodes["paging:pg-1"] : undefined) as PagingPlanNode;
+		expect(node.members).toEqual(["1002"]);
+		expect(codesOf(result)).not.toContain("dangling-destination");
+	});
+
+	it("drops a member whose extension is gone, and says so", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension()],
+				pagingGroups: [
+					aPagingGroup({
+						members: [
+							{ extensionId: "ext-1", ordinal: 1, enabled: true },
+							{ extensionId: "ext-missing", ordinal: 2, enabled: true },
+						],
+					}),
+				],
+			}),
+		);
+		// A warning, not an error: the artifact is sound, the page is just smaller than intended.
+		expect(result.ok).toBe(true);
+		const node = (result.ok ? result.artifact.nodes["paging:pg-1"] : undefined) as PagingPlanNode;
+		expect(node.members).toEqual(["1001"]);
+		const diagnostic = result.diagnostics.find((entry) => entry.code === "dangling-destination");
+		expect(diagnostic?.severity).toBe("warning");
+		expect(diagnostic?.message).toContain("All handsets");
+		expect(diagnostic?.message).toContain("ext-missing");
+	});
+
+	it("drops a member whose extension is disabled, and says which it was", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension({ enabled: false })],
+				pagingGroups: [aPagingGroup()],
+			}),
+		);
+		expect(result.ok).toBe(true);
+		const node = (result.ok ? result.artifact.nodes["paging:pg-1"] : undefined) as PagingPlanNode;
+		expect(node.members).toEqual([]);
+		// `disabled-entity`, not `dangling-destination`: the desk exists, somebody switched it off.
+		const diagnostic = result.diagnostics.find(
+			(entry) => entry.code === "disabled-entity" && entry.subject?.kind === "paging-group",
+		);
+		expect(diagnostic?.severity).toBe("warning");
+		expect(diagnostic?.message).toContain("1001");
+	});
+
+	it("warns about a group with no reachable members but still compiles it", () => {
+		const result = compileAttempt(aSnapshot({ pagingGroups: [aPagingGroup({ members: [] })] }));
+		expect(result.ok).toBe(true);
+		expect(codesOf(result)).toContain("empty-paging-group");
+	});
+
+	it("does not materialise a disabled group", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				pagingGroups: [aPagingGroup({ enabled: false })],
+			}),
+		);
+		expect(artifact.nodes["paging:pg-1"]).toBeUndefined();
+	});
+
+	it("claims a dialable internal number when the group has one", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				pagingGroups: [aPagingGroup({ extensionNumber: "8000" })],
+			}),
+		);
+		expect(artifact.internal.numbers["8000"]).toEqual({
+			number: "8000",
+			kind: "paging-group",
+			entityId: "pg-1",
+			nodeId: "paging:pg-1",
+		});
+	});
+
+	it("errors when a group's number collides with an extension", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension()],
+				pagingGroups: [aPagingGroup({ extensionNumber: "1001" })],
+			}),
+		);
+		expect(result.ok).toBe(false);
+		expect(codesOf(result)).toContain("duplicate-internal-number");
+	});
+
+	it("resolves a paging group named in a `*81` code's params", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				pagingGroups: [aPagingGroup()],
+				featureCodes: [
+					aFeatureCode({ code: "*81", action: "paging", params: { groupId: "pg-1" } }),
+				],
+			}),
+		);
+		expect(artifact.nodes["feature-code:fc-1"]).toMatchObject({ targetNodeId: "paging:pg-1" });
+	});
+
+	it("errors when a code names a paging group that does not exist", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				featureCodes: [
+					aFeatureCode({ code: "*81", action: "paging", params: { groupId: "nope" } }),
+				],
+			}),
+		);
+		expect(result.ok).toBe(false);
+		expect(codesOf(result)).toContain("dangling-destination");
+	});
+
+	/** `intercom` takes a live keypress, not a stored id — there is nothing to resolve. */
+	it("leaves an intercom code without a compile-time target", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				featureCodes: [aFeatureCode({ code: "*80", action: "intercom" })],
+			}),
+		);
+		expect(artifact.nodes["feature-code:fc-1"]).not.toHaveProperty("targetNodeId");
+	});
+
+	it("is reachable as a destination from an IVR option", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				pagingGroups: [aPagingGroup()],
+				ivrMenus: [anIvrMenu()],
+				ivrMenuOptions: [anIvrOption({ destinationType: "paging-group", destinationRef: "pg-1" })],
+			}),
+		);
+		const menu = artifact.nodes["ivr-menu:ivr-1"] as IvrMenuPlanNode;
+		expect(menu.options[0]?.targetNodeId).toBe("paging:pg-1");
+		// And it ends there: a page has no continuation to walk to.
+		expect(planNodeReferences(artifact.nodes["paging:pg-1"] as PagingPlanNode)).toEqual([]);
+	});
+});
+
+describe("compile — screening and whisper", () => {
+	it("carries call screening onto the extension node when it is on", () => {
+		const artifact = compiled(aSnapshot({ extensions: [anExtension({ callScreening: true })] }));
+		expect((artifact.nodes["extension:ext-1"] as ExtensionPlanNode).callScreening).toBe(true);
+	});
+
+	it("omits the flag entirely when it is unset, so absent and false are one artifact", () => {
+		const artifact = compiled(aSnapshot({ extensions: [anExtension()] }));
+		expect(artifact.nodes["extension:ext-1"]).not.toHaveProperty("callScreening");
+	});
+
+	it("carries the agent whisper prompt onto the queue node", () => {
+		const artifact = compiled(
+			aSnapshot({ queues: [aQueue({ agentWhisperPromptId: "prompt-9" })] }),
+		);
+		expect((artifact.nodes["queue:q-1"] as QueuePlanNode).agentWhisperPromptId).toBe("prompt-9");
+	});
+
+	it("omits the whisper when a queue has none", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue()] }));
+		expect(artifact.nodes["queue:q-1"]).not.toHaveProperty("agentWhisperPromptId");
 	});
 });
 

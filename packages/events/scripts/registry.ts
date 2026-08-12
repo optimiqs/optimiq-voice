@@ -18,6 +18,8 @@ import {
 	recordingKindSchema,
 	recordingStopReasonSchema,
 	sipTransportSchema,
+	tapEndReasonSchema,
+	tapModeSchema,
 } from "../src/schemas/telephony";
 import { VOICEMAIL_EVENT_DEFINITIONS } from "../src/schemas/voicemail-events";
 import type { EventFamily } from "../src/subjects";
@@ -108,6 +110,18 @@ export const NAMED_ENUMS: readonly NamedEnum[] = [
 		source: "telephony.ts AGENT_STATUSES",
 		doc: "ACD agent status. Drives queue distribution and the wallboard.",
 		values: enumValues(agentStatusSchema),
+	},
+	{
+		goName: "TapMode",
+		source: "telephony.ts TAP_MODES",
+		doc: "What a supervisor is doing to a call they did not place: eavesdrop, whisper or barge.",
+		values: enumValues(tapModeSchema),
+	},
+	{
+		goName: "TapEndReason",
+		source: "telephony.ts TAP_END_REASONS",
+		doc: "How a supervisor's tap ended. Distinguishes the monitored call ending from the supervisor leaving.",
+		values: enumValues(tapEndReasonSchema),
 	},
 ];
 
@@ -226,6 +240,10 @@ export const EVENT_ENTRIES: readonly EventEntry[] = [
 	callEntry("call.transferred", "CallTransferred"),
 	callEntry("call.picked-up", "CallPickedUp"),
 	callEntry("call.emergency.dialed", "CallEmergencyDialed"),
+	callEntry("call.tap.started", "CallTapStarted"),
+	callEntry("call.tap.ended", "CallTapEnded"),
+	callEntry("call.paging.started", "CallPagingStarted"),
+	callEntry("call.paging.ended", "CallPagingEnded"),
 
 	registrationEntry("registered", "RegistrationRegistered"),
 	registrationEntry("unregistered", "RegistrationUnregistered"),
@@ -406,6 +424,25 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		timeoutMs: RPC_CONTRACTS["rpc.media.v1.stop-recording"].timeoutMs,
 		request: RPC_CONTRACTS["rpc.media.v1.stop-recording"].request,
 		response: RPC_CONTRACTS["rpc.media.v1.stop-recording"].response,
+	},
+	// Supervision. The one media pair emitted BEFORE its responder exists: `mediad` refuses the
+	// operation today (asymmetric routing is a mix, which is rung 6) and the Go structs are emitted
+	// anyway, because the whole argument for declaring the full shape now — see
+	// `plans/mediad-design.md` §10 question 4 — is that the rung-6 mixer must be able to satisfy
+	// this contract by arriving rather than by renegotiating it.
+	{
+		subject: "rpc.media.v1.tap-session",
+		goName: "MediaTapSession",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.tap-session"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.tap-session"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.tap-session"].response,
+	},
+	{
+		subject: "rpc.media.v1.untap-session",
+		goName: "MediaUntapSession",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.untap-session"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.untap-session"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.untap-session"].response,
 	},
 	// Control plane to engine: click-to-call. No Go participant today either, and emitted for the
 	// same reason the entry below it is — the Go side reads the same taxonomy, and a subject the

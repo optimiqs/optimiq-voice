@@ -5,6 +5,7 @@ import {
 	anIvrMenu,
 	anIvrOption,
 	anOutboundRoute,
+	aPagingGroup,
 	aParkLot,
 	aPhoneNumber,
 	aQueue,
@@ -28,6 +29,7 @@ const artifact = compiled(
 		voicemailBoxes: [aVoicemailBox()],
 		conferences: [aConference()],
 		parkLots: [aParkLot({ timeoutDestinationType: "extension", timeoutDestinationRef: "ext-1" })],
+		pagingGroups: [aPagingGroup()],
 		queues: [aQueue({ timeoutDestinationType: "voicemail", timeoutDestinationRef: "vm-1" })],
 		ringGroups: [aRingGroup({ timeoutDestinationType: "queue", timeoutDestinationRef: "q-1" })],
 		ringGroupDestinations: [aRingGroupMember()],
@@ -89,6 +91,16 @@ function kindsIn(nodes: PlanNodeTable): ReadonlySet<string> {
 describe("plan node vocabulary", () => {
 	it("has no duplicate kinds", () => {
 		expect(new Set(PLAN_NODE_KINDS).size).toBe(PLAN_NODE_KINDS.length);
+	});
+
+	/**
+	 * Pinned, because a kind added here is an artifact-version bump: a reader compiled against the
+	 * previous version meets a `kind` it has no case for, mid-call. Counting them is how the bump
+	 * stops being something somebody has to remember.
+	 */
+	it("names fifteen kinds", () => {
+		expect(PLAN_NODE_KINDS).toHaveLength(15);
+		expect(PLAN_NODE_KINDS).toContain("paging");
 	});
 
 	it("emits every kind except playback from a fully wired organization", () => {

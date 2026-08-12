@@ -28,6 +28,8 @@ import type {
 	RecordingHandle,
 	SendDtmfRequest,
 	SnoopRequest,
+	TapHandle,
+	TapRequest,
 } from "./media-port";
 import type { MediadTransport } from "./mediad-transport";
 import type { MediaAllocateSessionResponse } from "@optimiq-voice/events";
@@ -38,7 +40,7 @@ import type { BridgeMode, HangupCause } from "@optimiq-voice/telephony";
  *
  * ## The coverage map, and why it is the whole point of this file
  *
- * `MediaPort` has 24 methods because Asterisk can do 24 things. `mediad` can do twelve of them
+ * `MediaPort` has 27 methods because Asterisk can do 27 things. `mediad` can do twelve of them
  * today, and the honest expression of that is not a partial implementation that pretends — it is an
  * implementation where every unreached rung throws {@link MediaOperationNotSupportedError} naming
  * the capability and the rung it arrives on.
@@ -64,6 +66,8 @@ import type { BridgeMode, HangupCause } from "@optimiq-voice/telephony";
  *   getVariable, setVariable           channel variables are a dialplan concept mediad has none of
  *   snoop                              an Asterisk-ism this media plane does not need — a session
  *                                      records both directions directly. NOT a rung; see the method
+ *   tap, stopTap                       rung 6: an asymmetric participant is a mix-minus member, and
+ *                                      a relay that never decodes has no samples to route
  *   startMusicOnHold, stopMusicOnHold  rung 5
  *   hold, unhold                       rung 5, and half signalling besides
  *   mute, unmute                       rung 5
@@ -619,6 +623,47 @@ export class MediadMediaPort implements MediaPort {
 	 * and a deployment that wants an echo test sets `ENGINE_MEDIA_DRIVER=ari` — which is exactly the
 	 * per-capability cutover `plans/mediad-design.md` §2 describes.
 	 */
+	/**
+	 * A supervisor joining a conversation on asymmetric terms — REFUSED, and this one IS a rung.
+	 *
+	 * The distinction from {@link snoop} directly above is the point, and it is the decision
+	 * `plans/mediad-design.md` §10 question 4 records. `snoop` is refused PERMANENTLY because it
+	 * asks for an Asterisk-ism — a tap that has to be its own channel — that this plane has no need
+	 * of and could only fake. `tap` asks for something real and genuinely missing: routing one
+	 * participant's audio to one peer and not the other is a MIX, and v1 relays RTP without ever
+	 * decoding it, so there are no samples to route.
+	 *
+	 * Which is exactly rung 6. A tap IS a mix-minus participant — `speakTo: "none"` is a member
+	 * subtracted from everybody's mix, `speakTo: "a"` is one that appears in a single peer's — so
+	 * the mixer that arrives for conferencing serves this contract without changing it. That is why
+	 * `rpc.media.v1.tap-session` already carries the full `hear`/`speakTo` shape while this method
+	 * throws: the wire format is settled, and only the implementation is pending.
+	 *
+	 * Until then `*0` announces "not available" on this driver and a deployment that wants
+	 * supervision sets `ENGINE_MEDIA_DRIVER=ari` — the per-capability cutover working as designed.
+	 */
+	async tap(request: TapRequest): Promise<TapHandle> {
+		void request;
+		return this.refuse(
+			"tap",
+			"asymmetric bridge participation (rung 6): routing one participant's audio to one peer " +
+				"and not the other is a mix, and this relay never decodes the samples",
+		);
+	}
+
+	/**
+	 * Ends a tap — REFUSED, because nothing on this driver can have started one.
+	 *
+	 * Refused rather than made a silent no-op, even though "there is no tap to stop" is arguably
+	 * true here. A caller reaching this has a tap it believes is open, and answering "done" to that
+	 * would be this driver telling the engine a supervisor had stopped listening. On a compliance
+	 * surface the wrong answer in that direction is the expensive one.
+	 */
+	async stopTap(tap: TapHandle): Promise<void> {
+		void tap;
+		return this.refuse("stopTap", "asymmetric bridge participation (rung 6)");
+	}
+
 	async echo(channelId: string): Promise<void> {
 		void channelId;
 		return this.refuse(

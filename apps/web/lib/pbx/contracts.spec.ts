@@ -236,6 +236,7 @@ describe("the destination picker's own tables", () => {
 			voicemail: "/voicemail-boxes",
 			conference: "/conferences",
 			park: "/park-lots",
+			"paging-group": "/paging-groups",
 			"time-condition": "/time-conditions",
 		};
 		for (const type of SERVER_DESTINATION_TYPES) {
@@ -307,6 +308,7 @@ const RESOURCE_TABLES: Readonly<Record<string, string>> = {
 	 * and this map does not.
 	 */
 	"sip-acl-entries": "sip_acl_entry",
+	"paging-groups": "paging_group",
 	webhooks: "webhook_subscription",
 };
 

@@ -191,6 +191,8 @@ func TestParityConstants(t *testing.T) {
 		"mediaSendDtmf":         SubjectMediaSendDtmfRPC,
 		"mediaStartRecording":   SubjectMediaStartRecordingRPC,
 		"mediaStopRecording":    SubjectMediaStopRecordingRPC,
+		"mediaTapSession":       SubjectMediaTapSessionRPC,
+		"mediaUntapSession":     SubjectMediaUntapSessionRPC,
 		"engineOriginate":       SubjectOriginateRPC,
 		"engineParkHandoff":     SubjectParkHandoffRPC,
 	}
@@ -482,6 +484,8 @@ func TestParityVocabularies(t *testing.T) {
 		"RecordingStopReason": asStrings(RecordingStopReasonValues),
 		"SIPTransport":        asStrings(SIPTransportValues),
 		"AgentStatus":         asStrings(AgentStatusValues),
+		"TapMode":             asStrings(TapModeValues),
+		"TapEndReason":        asStrings(TapEndReasonValues),
 	}
 	if !reflect.DeepEqual(named, g.Vocabularies) {
 		t.Errorf("telephony vocabularies = %v, golden %v", named, g.Vocabularies)

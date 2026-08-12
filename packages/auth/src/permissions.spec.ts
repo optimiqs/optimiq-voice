@@ -96,9 +96,54 @@ describe("PERMISSIONS", () => {
 	 * The instruction the ceiling carries stands unchanged for the next feature: prove the existing
 	 * grants cannot express the boundary, raise this number in the same change, and say why.
 	 */
+	/**
+	 * Raised from 96 to 97 by supervision — `calls.supervise` — with the proof the instruction above
+	 * demands, and it is the least arguable one this registry has recorded.
+	 *
+	 * Every other grant in the registry is a power over CONFIGURATION or over RECORDS. This is a
+	 * power over a PERSON: it lets one member listen to another member's live conversation with an
+	 * outside party while it is happening, and tells neither of them. No existing grant expresses
+	 * that, and the two that were drafted to carry it are both actively wrong:
+	 *
+	 * `queues.monitor` is the wallboard — aggregate depth, agent states, longest wait — and it is
+	 * deliberately an AGENT-level grant, because an agent who cannot see their own queue cannot work
+	 * it. Riding supervision on it would give every agent in every tenant the ability to listen to
+	 * every other agent, through a permission granted so a number could render on a screen.
+	 *
+	 * `recordings.listen` is after the fact, and — more to the point — a recording is an ARTEFACT the
+	 * subject can discover: it has a row, it is announced by the tenant's recording policy, and it
+	 * can be asked for. A monitor session leaves the subject nothing at all. That is the difference
+	 * the registry had no way to say before this entry.
+	 *
+	 * ONE and not three. `calls.whisper` and `calls.barge` were drafted and dropped: a monitor
+	 * session is a media tap that is already attached, so the holder moves between the three modes
+	 * by pressing a digit. A permission a holder escalates past by pressing `2` is a distinction a
+	 * reviewer cannot act on, and the consent boundary is crossed by the first mode anyway. It is the
+	 * same argument `security.delete` and `webhooks.delete` lost.
+	 *
+	 * The instruction stands unchanged for whatever comes next.
+	 */
+	/**
+	 * And 97 to 100 by paging groups — `paging-groups.read` / `.write` / `.delete`.
+	 *
+	 * Recorded honestly: those three arrived in the same wave as `calls.supervise` but from the
+	 * paging work, not from this one, so the argument for them belongs beside their entries in
+	 * `permissions.ts` and beside the resource they guard. What is asserted here is only the budget.
+	 *
+	 * The budget spends easily on this one. A paging group is a CRUD resource with a table, a
+	 * controller and a delete that destroys configuration somebody may need — the same shape as
+	 * `ring-groups.*` sitting immediately above it in the registry, which is why the trio is a trio
+	 * and why the test below ("gives every PBX CRUD resource its own read/write/delete trio") is the
+	 * one that would have caught it borrowing `ring-groups.*` instead. Borrowing is what the trio
+	 * test exists to stop: a ring group rings desks in turn and a paging group opens all of their
+	 * speakers at once, and making "may edit a hunt group" and "may broadcast into every office"
+	 * the same grant would be exactly the collapse this registry was built to undo.
+	 *
+	 * The instruction stands unchanged for whatever comes next.
+	 */
 	it("stays within the size the collapsed FusionPBX model targets", () => {
 		expect(PERMISSIONS.length).toBeGreaterThanOrEqual(60);
-		expect(PERMISSIONS.length).toBeLessThanOrEqual(96);
+		expect(PERMISSIONS.length).toBeLessThanOrEqual(100);
 	});
 
 	it("contains no duplicates", () => {
@@ -142,6 +187,7 @@ describe("PERMISSIONS", () => {
 			"feature-codes",
 			"ivr",
 			"ring-groups",
+			"paging-groups",
 			"queues",
 			"voicemail",
 			"conferences",
@@ -179,6 +225,7 @@ describe("PERMISSIONS", () => {
 			"time-conditions",
 			"feature-codes",
 			"ring-groups",
+			"paging-groups",
 			"queues",
 			"conferences",
 			"park-lots",
@@ -317,10 +364,32 @@ describe("SYSTEM_ROLE_TEMPLATES", () => {
 			"conferences.write",
 			"park-lots.write",
 			"ring-groups.write",
+			"paging-groups.write",
 			"ivr.write",
 		] as Permission[]) {
 			expect(manager.has(permission)).toBe(true);
 		}
+	});
+
+	/**
+	 * The supervision boundary, pinned where somebody widening a role will trip over it.
+	 *
+	 * `queues.monitor` and `calls.supervise` read like neighbours on a supervisor's screen and are
+	 * not: the first is aggregate queue STATE and is an agent-level grant on purpose, the second is
+	 * the audio of a live conversation neither party knows is being listened to. The defence for the
+	 * second is an audit row that names one person, which stops being a defence the moment the grant
+	 * reaches the broadest role an organization hands out. So the assertion is two-sided.
+	 */
+	it("keeps live-call supervision at manager and above while leaving the wallboard with agents", () => {
+		const agent = new Set<string>(getSystemRoleTemplate("agent").permissions);
+		const manager = new Set<string>(getSystemRoleTemplate("manager").permissions);
+
+		expect(agent.has("queues.monitor")).toBe(true);
+		expect(agent.has("calls.supervise")).toBe(false);
+		expect(manager.has("calls.supervise")).toBe(true);
+		expect(new Set<string>(getSystemRoleTemplate("user").permissions).has("calls.supervise")).toBe(
+			false,
+		);
 	});
 
 	/** Deleting telephony configuration stays with an administrator. */

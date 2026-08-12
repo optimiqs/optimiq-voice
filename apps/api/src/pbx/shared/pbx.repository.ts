@@ -16,6 +16,7 @@ import { compileOnWrite, requiresRecompile } from "../routing/compile-on-write";
 import {
 	assertDestinations,
 	findDestinationReferences,
+	findPagingGroupFeatureCodeReferences,
 	findParkLotFeatureCodeReferences,
 	findScalarReferences,
 	findTrunkReferences,
@@ -357,11 +358,15 @@ async function assertNotReferenced(
 		...(resource.scalarReferences === undefined
 			? []
 			: await findScalarReferences(transaction, resource.scalarReferences, id)),
-		// Two references live inside `jsonb` where no column — and therefore no generic scan — can
-		// reach them: an outbound route's trunk list, and a `call-park` code's pinned lot.
+		// Three references live inside `jsonb` where no column — and therefore no generic scan — can
+		// reach them: an outbound route's trunk list, a `call-park` code's pinned lot, and a `paging`
+		// code's pinned group.
 		...(resource.tableName === "trunk" ? await findTrunkReferences(transaction, id) : []),
 		...(resource.tableName === "park_lot"
 			? await findParkLotFeatureCodeReferences(transaction, id)
+			: []),
+		...(resource.tableName === "paging_group"
+			? await findPagingGroupFeatureCodeReferences(transaction, id)
 			: []),
 	];
 

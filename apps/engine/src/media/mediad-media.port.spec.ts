@@ -667,6 +667,37 @@ describe("the not-supported map", () => {
 		["unhold", "rung 5", (port) => port.unhold("leg-a")],
 		["mute", "rung 5", (port) => port.mute("leg-a", "both")],
 		["unmute", "rung 5", (port) => port.unmute("leg-a", "both")],
+		[
+			// Unlike `snoop` directly above, this one IS a rung. An asymmetric participant is a
+			// mix-minus member of a conference, and a relay that never decodes has no samples to
+			// route — so the capability is genuinely missing rather than an Asterisk-ism.
+			"tap",
+			"rung 6",
+			(port) =>
+				port.tap({
+					tapId: "tap-1",
+					targetChannelId: "leg-a",
+					targetSide: "b",
+					supervisorChannelId: "leg-s",
+					tapChannelId: "tap-chan-1",
+					bridgeId: "bridge-1",
+					application: "app",
+					hear: "both",
+					speakTo: "none",
+				}),
+		],
+		[
+			"stopTap",
+			"rung 6",
+			(port) => port.stopTap({ tapId: "tap-1", tapChannelId: "tap-chan-1", bridgeId: "bridge-1" }),
+		],
+		[
+			// Refused for the same reason `snoop` is — an Asterisk application rather than a media
+			// capability — and listed here because the map is only worth having if it is complete.
+			"echo",
+			"Asterisk's Echo() application",
+			(port) => port.echo("leg-a"),
+		],
 	];
 
 	for (const [operation, capabilityHint, call] of refusals) {
@@ -722,6 +753,7 @@ describe("the not-supported map", () => {
 			"channelExists",
 			"createBridge",
 			"destroyBridge",
+			"echo",
 			"getVariable",
 			"hangup",
 			"hold",
@@ -738,11 +770,15 @@ describe("the not-supported map", () => {
 			"stopMusicOnHold",
 			"stopPlayback",
 			"stopRecording",
+			"stopTap",
+			"tap",
 			"unhold",
 			"unmute",
 			"watchChannel",
 		];
 		expect(methods).toEqual(expected);
-		expect(methods).toHaveLength(24);
+		// One per `MediaPort` method. `bridgeMode` is a declaration, not a method, and is asserted in
+		// its own describe block above.
+		expect(methods).toHaveLength(27);
 	});
 });

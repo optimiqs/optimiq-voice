@@ -84,6 +84,10 @@ export const PERMISSIONS = [
 	"ring-groups.write",
 	"ring-groups.delete",
 
+	"paging-groups.read",
+	"paging-groups.write",
+	"paging-groups.delete",
+
 	"queues.read",
 	"queues.write",
 	"queues.delete",
@@ -136,6 +140,53 @@ export const PERMISSIONS = [
 	 * be spending the ceiling on documentation.
 	 */
 	"calls.originate",
+
+	/**
+	 * Listening to a colleague's call while it is happening — `*0` supervision: monitor, whisper,
+	 * barge.
+	 *
+	 * The second entry on `calls`, and the one with the largest blast radius in the whole registry.
+	 * Every other grant here is a power over CONFIGURATION or over RECORDS. This one is a power over
+	 * a **person**: the holder can put themselves inside a live conversation between a member of
+	 * this organization and someone who has never heard of this platform, and neither of them is
+	 * told. There is no other permission on this system that does that, which is the whole argument
+	 * for its existence — a boundary no existing grant can express is exactly the test the ceiling's
+	 * instruction asks for, and this is the clearest pass it has had.
+	 *
+	 * The two neighbours it is NOT, spelled out because both were drafted as the ride:
+	 *
+	 * It is not `queues.monitor`. That grant is a WALLBOARD: aggregate queue depth, agent states,
+	 * how long the longest caller has waited — and it is deliberately an AGENT-level grant, because
+	 * an agent who cannot see the queue they are working cannot do the job. It exposes counts about
+	 * calls, never the audio inside one. Riding supervision on it would hand every agent in every
+	 * tenant the ability to listen to every other agent, by way of a permission that was granted so
+	 * a number could render on a screen. That is the single worst privilege escalation this
+	 * registry could ship.
+	 *
+	 * It is not `recordings.listen` either, and the difference is not merely one of timing. A
+	 * recording is an ARTEFACT: it exists, it has a row, it is announced by whatever the tenant's
+	 * recording policy plays at the top of the call, and the person on the call can find out that it
+	 * was made and ask for it. Supervision leaves the subject nothing to find. The only trace of it
+	 * is the audit row this platform writes, which is why that row is not optional and why the
+	 * description below says so where an administrator granting the permission will read it.
+	 *
+	 * **Manager and above, never agent.** Not because a supervisor is senior — supervising is what a
+	 * team leader does all day, and a case could be made for an agent-level `calls.supervise.own`
+	 * bounded to a queue's tiers. It is because of who has to be NAMEABLE afterwards. In a
+	 * two-party-consent jurisdiction, silently listening to a call is a thing a specific identified
+	 * human did, and the defence is the audit trail that identifies them. A grant held by the
+	 * broadest role in an organization is a grant whose audit trail says "one of the forty people on
+	 * the floor". Held by managers, it says a name. When the scoped variant lands it must carry the
+	 * same property or it should not land.
+	 *
+	 * ONE entry, again. `calls.whisper` and `calls.barge` were drafted as separate grants on the
+	 * argument that whispering and barging are louder than listening. They were dropped because the
+	 * escalation between them is free: a monitor session is a media tap that is already attached, so
+	 * anybody holding `calls.supervise` can move between the three modes by pressing a digit, and a
+	 * permission a holder can escalate past by pressing `2` is a distinction a reviewer cannot act
+	 * on. The consent boundary is crossed by the first one.
+	 */
+	"calls.supervise",
 
 	// --- Media, reporting and audit -----------------------------------------
 	"recordings.read",
@@ -539,6 +590,31 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 		],
 	},
 	{
+		resource: "paging-groups",
+		label: "Paging groups",
+		description:
+			"Overhead announcements and talkback intercom, and the handsets each group auto-answers on.",
+		permissions: [
+			{
+				permission: "paging-groups.read",
+				label: "View paging groups",
+				description: "Inspect groups, their members and the fan-out order.",
+			},
+			{
+				permission: "paging-groups.write",
+				label: "Manage paging groups",
+				description:
+					"Create and edit groups, add and remove handsets, and switch a group between " +
+					"one-way announcement and talkback.",
+			},
+			{
+				permission: "paging-groups.delete",
+				label: "Delete paging groups",
+				description: "Remove a paging group.",
+			},
+		],
+	},
+	{
 		resource: "queues",
 		label: "Queues",
 		description: "Call queues, agents, tiers and live queue state.",
@@ -674,7 +750,7 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 	{
 		resource: "calls",
 		label: "Calls",
-		description: "Placing calls from the platform.",
+		description: "Placing calls from the platform, and listening in on calls already in progress.",
 		permissions: [
 			{
 				permission: "calls.originate",
@@ -682,6 +758,13 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 				description:
 					"Ring an extension and connect it to a destination — the click-to-dial button. " +
 					"Off-net destinations are billed to the organization.",
+			},
+			{
+				permission: "calls.supervise",
+				label: "Monitor live calls",
+				description:
+					"Listen to a colleague's call in progress, whisper to them, or join the conversation. " +
+					"Neither party is notified. Recorded on the audit trail every time it is used.",
 			},
 		],
 	},
@@ -983,6 +1066,21 @@ const AGENT_PERMISSIONS = [
 	"conferences.read",
 	// An agent parks calls with `*5`, so the lot list has to be readable to render where a call went.
 	"park-lots.read",
+	/**
+	 * An agent pages with `*81`, so the group list has to be readable for the same reason the lot
+	 * list is — with one difference worth stating, because it is the argument for reading and not
+	 * for writing.
+	 *
+	 * A page is the loudest thing this platform does: it auto-answers every handset in the group and
+	 * speaks into the room, whether or not anybody is standing there. The read grant is what turns
+	 * "*81 then which digits?" into a list of names, and an agent who cannot see the list either
+	 * memorises the numbers or pages the wrong floor — the failure mode is a warehouse hearing an
+	 * announcement meant for the dispatch desk, not a missing screen. The WRITE grant is a different
+	 * power entirely: it decides whose phone is in the group, which is to say whose desk can be
+	 * spoken through, and that belongs with the manager who owns the floor plan. The same split as
+	 * `park-lots`, for a feature where getting it wrong is audible.
+	 */
+	"paging-groups.read",
 ] as const satisfies readonly Permission[];
 
 const MANAGER_PERMISSIONS = [
@@ -1006,6 +1104,8 @@ const MANAGER_PERMISSIONS = [
 	"ivr.publish",
 	"ring-groups.read",
 	"ring-groups.write",
+	// Read arrives with `AGENT_PERMISSIONS`; this is the half that edits the membership.
+	"paging-groups.write",
 	"queues.write",
 	"queues.manage-agents",
 	"voicemail.read",
@@ -1030,6 +1130,18 @@ const MANAGER_PERMISSIONS = [
 	 * `extension_user` — and it is not in the registry because nothing serves it yet.
 	 */
 	"calls.originate",
+	/**
+	 * A manager may listen to a live call, and an agent may not — and unlike `calls.originate`
+	 * above, this one is not waiting for a scoped variant to soften it.
+	 *
+	 * The reason is in the entry itself: the defence for a silent monitor session is the audit row
+	 * that names who opened it. `AGENT_PERMISSIONS` is the widest role an organization hands out, so
+	 * granting it here would make that row say "somebody on the floor" — which is not a defence, it
+	 * is a list of suspects. `queues.monitor` is a deliberate agent-level grant and reads adjacent
+	 * on the wallboard; it is aggregate STATE and carries no audio, and the two must not be confused
+	 * when somebody edits this list.
+	 */
+	"calls.supervise",
 	"members.read",
 	"applications.read",
 ] as const satisfies readonly Permission[];

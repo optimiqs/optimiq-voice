@@ -1,3 +1,4 @@
+import { AUTO_ANSWER_ALERT_INFO } from "../../auto-answer";
 import { renderSettingsAsXmlAttributes, xmlValue } from "../format";
 import type { RenderContext, RenderKey, RenderLine } from "../render-context";
 import type { VendorTemplate } from "../template";
@@ -167,6 +168,41 @@ function renderKeys(keys: readonly RenderKey[], sipDomain: string): readonly str
 	return attributes;
 }
 
+/**
+ * Auto-answer, which on Poly is a RING CLASS rather than a feature flag.
+ *
+ * This is the vendor whose model is genuinely different from the other four. Poly has no "answer
+ * automatically when you see this header" switch. What it has is a table:
+ * `voIpProt.SIP.alertInfo.N.value` is a string compared against the incoming `Alert-Info` field, and
+ * `voIpProt.SIP.alertInfo.N.class` names the RING CLASS applied when it matches. One of the built-in
+ * classes — `ringAutoAnswer` — plays a short ring and then answers. So auto-answer is expressed here
+ * as "map this header to that ringer", and the mapping is the configuration.
+ *
+ * The consequence worth noticing is that Poly is the only one of the five where WE choose the token.
+ * The other vendors match a string their firmware owns; this one matches whatever we write into
+ * `.value`. That is why {@link AUTO_ANSWER_ALERT_INFO} is interpolated here rather than a Poly
+ * convention being hard-coded: `Ring Answer` and `Auto Answer` are the two strings the Polycom
+ * community uses, and either would have made this phone the odd one out on a switch that has to send
+ * one header to a mixed fleet.
+ *
+ * Index 1 is claimed, and it is the only entry this template writes. The table is positional and
+ * shared, so a deployment adding distinctive ringing through the settings cascade should start at 2.
+ * That is recorded in `caveats` because it is the kind of collision that presents as "paging stopped
+ * working after we added a ringtone".
+ */
+function autoAnswerAttributes(): readonly string[] {
+	return [
+		`voIpProt.SIP.alertInfo.1.value="${xmlValue(AUTO_ANSWER_ALERT_INFO)}"`,
+		/*
+		 * `ringAutoAnswer` — ring briefly, then answer. NOT `AUTO_ANSWER`, which some forum snippets
+		 * show: the built-in class that answers with no ring at all leaves the person whose phone it
+		 * is with no cue that their microphone opened, and the ring is the only indication this vendor
+		 * offers. The Yealink and Snom templates make the same choice through their own parameters.
+		 */
+		`voIpProt.SIP.alertInfo.1.class="ringAutoAnswer"`,
+	];
+}
+
 export const POLY_TEMPLATE: VendorTemplate = {
 	id: "0192a1c0-0000-7000-8000-000000000002",
 	vendor: "poly",
@@ -179,6 +215,7 @@ export const POLY_TEMPLATE: VendorTemplate = {
 	render: (context: RenderContext): string => {
 		const attributes = [
 			...context.lines.flatMap((line) => registrationAttributes(line, context.sipDomain)),
+			...autoAnswerAttributes(),
 			...renderKeys(context.keys, context.sipDomain),
 		];
 		const settings = renderSettingsAsXmlAttributes(context.settings);
@@ -199,12 +236,15 @@ export const POLY_TEMPLATE: VendorTemplate = {
 		"Poly Voice Software Administrator Guide (Edge E) — the same `reg.x.*` / `attendant.*` names carried over from VVX, and the exact `reg.x.server.y.transport` literals",
 		"Polycom, Provisioning with the Master Configuration File — `APP_FILE_PATH` / `CONFIG_FILES` / `MISC_FILES` semantics and the leftmost-wins ordering",
 		"Poly UC Software parameter reference — `attendant.resourceList.x.{address,label,type}`, `efk.efklist.x.*`, `efk.efksoftkey.x.*`, `msg.mwi.x.*`",
+		"Poly UC Software Parameter Reference Guide 7.2.0 — `voIpProt.SIP.alertInfo.x.value` / `.class`: the Alert-Info field is compared against `value` and the named ring class is applied, with `ringAutoAnswer` as the class that answers the call",
 	],
 	caveats: [
 		"A Poly phone fetches a MASTER config file first, and `CONFIG_FILES` is LEFTMOST-wins. This document is the settings file it must be pointed at; the master snippet is in plans/reference/device-provisioning-formats.md. Generating that manifest is a follow-up.",
 		"Speed dials are rendered as enhanced feature keys, which occupy soft keys rather than the line-key column — the physical placement will not match a Yealink of the same layout. Polycom's other speed-dial mechanism is a contact-directory file (`<MAC>-directory.xml`) that this build does not generate.",
 		"The phone WRITES its own `<MAC>-phone.cfg` and `<MAC>-web.cfg` override files. A provisioned value can appear ignored when such an override exists.",
 		"BLF and EFK entries are positional dense lists, so a key's `keyIndex` decides its ORDER but not its slot number.",
+		"Auto-answer occupies `voIpProt.SIP.alertInfo.1.*`. That table is positional and shared with distinctive ringing, so a deployment adding its own Alert-Info mappings through the settings cascade must start at index 2 — overwriting index 1 silently disables paging and intercom.",
+		"UNVERIFIED: whether `voIpProt.SIP.alertInfo.x.value` matches the Alert-Info field EXACTLY or as a substring. Poly's own examples use bare tokens (`Ring Answer`), while the header this platform sends is the parameter form `info=alert-autoanswer`. If a handset rings instead of answering, this comparison is the first thing to test.",
 		"Not validated against physical hardware.",
 	],
 };

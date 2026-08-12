@@ -1120,6 +1120,45 @@ a call to it, which needs `apps/sipd`'s proxy — see §10 question 4.
    an argument on `start-recording`. Reproducing the tap would mean a session with no port
    publishing a `leg-arrived` for a leg that does not exist. Full reasoning in §6.2.
 
+   **W6 addendum — the OTHER caller of `snoop` was supervision, and it has been re-specified so
+   that this refusal costs it nothing.** Answering question 4 for recording left a loose end the
+   parity audit named (rows 2.25/2.26): eavesdrop, whisper and barge were going to be built on
+   `MediaPort.snoop`, which means they would have been built on a primitive this driver refuses
+   permanently — a feature written twice, or a feature that silently requires
+   `ENGINE_MEDIA_DRIVER=ari` forever. **The project lead's decision, recorded here because it is
+   the thing that has to be true before the code is written: a tap is NOT a snoop channel at the
+   contract level. It is an ASYMMETRIC BRIDGE PARTICIPANT.**
+
+   The distinction is the whole point. A snoop channel is a listener glued to ONE leg, which is why
+   `SnoopRequest` names a `channelId` and a `spy` direction: on ARI there is nothing else to name.
+   A supervisor is not listening to a leg, they are joining a CONVERSATION on terms that differ per
+   direction — which is a statement about a call, not about a channel:
+
+   ```text
+   eavesdrop   hear both, speak to none      the supervisor is present and inaudible
+   whisper     hear both, speak to the agent coaching; the customer must not hear it
+   barge       hear both, speak to both      a third party in the conversation
+   ```
+
+   So `MediaPort.tap(target, { hear, speakTo })` names the call and the two directions, and the
+   three features are three argument combinations rather than three code paths. The ARI driver
+   satisfies it TODAY with the snoop channel it already has (`spy`/`whisper` map onto `hear`/
+   `speakTo`, and the tap is then bridged to the supervisor's own leg, which is the step
+   on-demand recording never needed) — so nothing about the Asterisk plane's behaviour changes.
+
+   **What this buys is that rung 6 implements it with no contract change.** `rpc.media.v1.tap-session`
+   is modelled on the `bridge-sessions` family and carries the full `hear`/`speakTo` shape from day
+   one, even though `MediadMediaPort.tap` refuses it today. Rung 6 is the mixer: N sources on a
+   common clock with mix-minus per participant. A tap IS a mix-minus participant — `speakTo: "none"`
+   is a participant whose contribution is subtracted from everybody's mix, `speakTo: "a"` is one
+   whose contribution appears in exactly one peer's mix — so the rung-6 mixer serves this contract by
+   arriving, not by being extended. Had the contract said `snoop`, rung 6 would have had to either
+   grow a channel-shaped concept it does not have or force a wire-format change on a shipped feature.
+
+   The refusal on `MediadMediaPort.tap` is therefore a RUNG (`asymmetric bridge participation
+(rung 6)`), unlike `snoop`'s, which stays permanent. That difference is the decision, written
+   down where the next person changing this file will see it.
+
 **Still open, and honestly so:**
 
 9. **NEW: rung 4 is complete and neither of its two callers can reach it yet.** The capability is
@@ -1238,3 +1277,28 @@ a call to it, which needs `apps/sipd`'s proxy — see §10 question 4.
 
     Recorded here rather than in the ladder because it is not a rung: it is a property every rung
     from 2 onward has to preserve once the edge is encrypted.
+
+19. **NEW: paging is unicast, and multicast RTP is deferred rather than forgotten.** W6 ships paging
+    groups as N auto-answered legs joined to one bridge with every member muted inbound. That is
+    correct, it works on any handset that honours an auto-answer header, and it is O(N) in RTP
+    streams: a page to sixty warehouse phones is sixty encoded streams out of the media plane for
+    one person talking. Every serious PBX solves that the same way — the phones join a multicast
+    group and the announcement is sent once — and both FreeSWITCH and the desk-phone fleet already
+    speak it.
+
+    It is out of scope here for a reason worth writing down rather than a shortage of time. Multicast
+    paging is not a feature of the call path at all: it is a second media transport with its own
+    address plan, its own TTL and IGMP behaviour, its own relationship to the switch fabric, and no
+    signalling — a phone configured for group `239.x.x.x:port` simply listens, forever, to whoever
+    can reach that address. That is a deployment-network capability and a **security surface**
+    (anything on the segment can page the building) before it is a `mediad` capability, and shipping
+    it as a side effect of `*81` would put an unauthenticated audio path into an office because a
+    star code needed to scale.
+
+    So the unicast path is the product, and multicast arrives when there is an operator asking for
+    it with a network to put it on. When it does, the shape is already clear: it is a PROPERTY OF
+    THE GROUP (an address, a port, a TTL on `paging_group`), it is a third source kind on the
+    playback path rather than a new bridge type, and it does not touch `MediaPort` — a page becomes
+    "send this stream there" instead of "originate to these members". The one thing that must not
+    happen in the meantime is a `paging_group` schema that assumes unicast so hard that adding an
+    address is a migration and a contract change; it is not, today.

@@ -7,6 +7,7 @@ import type {
 	RecordingOutcome,
 	TransferRequest,
 } from "./call-control";
+import type { TapMode } from "@optimiq-voice/events";
 import type { CompiledFeatureCode, RoutingArtifact } from "@optimiq-voice/routing";
 import type {
 	DtmfDigit,
@@ -91,6 +92,27 @@ export const MID_CALL_ACTION_BY_COMPILED_ACTION: Readonly<Record<string, MidCall
 	"call-park": "park",
 };
 
+/**
+ * The supervisor's mode keys, pressed while a tap is open.
+ *
+ * `4` eavesdrop, `5` whisper, `6` barge — **the FreeSWITCH `eavesdrop` convention**, digit for
+ * digit. That is the only reason these three numbers and not three others: a supervisor moving from
+ * a FusionPBX installation has the keys in muscle memory and on a laminated card beside their
+ * monitor, and a system that renumbered them for tidiness would be discovered by somebody
+ * accidentally barging into a customer call while trying to switch to silent monitoring. The cost of
+ * matching an existing convention is zero; the cost of not matching it is audible to a customer.
+ *
+ * Bare digits, not star codes, for the same reason: they are what FreeSWITCH binds. A supervisor is
+ * the only party who ever has these armed, they are armed only for the life of one tap, and the
+ * conversation they are listening to cannot see them — a supervisor's DTMF goes into the tap bridge,
+ * not into the monitored call.
+ */
+export const SUPERVISION_MODE_BY_DIGIT: Readonly<Record<string, TapMode>> = {
+	"4": "eavesdrop",
+	"5": "whisper",
+	"6": "barge",
+};
+
 export interface MidCallFeatureDependencies {
 	readonly control: MidCallFeatureControl;
 	/** The organization's compiled artifact, or `undefined` when it cannot be read. */
@@ -116,6 +138,8 @@ export class MidCallFeatureRuntime {
 	private readonly logger = getLogger("engine.mid-call-features");
 	private readonly captures = new Map<string, LegCapture>();
 	private readonly cancelKeys = new Map<string, DtmfDigit>();
+	/** Supervisors' mode keys, keyed by the supervisor's media channel id. See {@link armSupervisionKeys}. */
+	private readonly supervisions = new Map<string, (mode: TapMode) => Promise<void>>();
 	/**
 	 * One in-flight chain per leg, so digits are decided in the order they were pressed.
 	 *
@@ -185,6 +209,45 @@ export class MidCallFeatureRuntime {
 	}
 
 	/**
+	 * Arms {@link SUPERVISION_MODE_BY_DIGIT} on a supervisor's leg, for the life of one tap.
+	 *
+	 * ## Why this bypasses the machine rather than joining its table
+	 *
+	 * `MidCallFeatureMachine`'s table maps a CODE to a {@link MidCallFeatureAction}, and that union
+	 * is closed in `packages/telephony` — a supervision escalation would have to be added there, and
+	 * a new member of that union is a new member of `MID_CALL_ARGUMENT_MODE` and of the compiler's
+	 * catalogue vocabulary too. That would be the right shape for a code a TENANT can renumber, which
+	 * is what the machine's table exists to express, and these three digits are not that: they are
+	 * fixed by a foreign PBX's convention, they mean nothing on any leg that is not a supervisor's,
+	 * and they are armed and disarmed by one runtime for a few minutes at a time.
+	 *
+	 * So they are decided BEFORE the machine sees the digit, and they never enter the table. Two
+	 * consequences worth stating:
+	 *
+	 * - A supervisor's `4` never reaches `idle` and is therefore never passed through to the far end.
+	 *   That is correct — there is no far end to pass it to; the supervisor is bridged to a tap.
+	 * - A tenant whose catalogue happens to contain a code starting with `4` does not lose it, because
+	 *   nothing is armed on any leg that is not currently monitoring.
+	 *
+	 * ## The escalation is started, not awaited
+	 *
+	 * The same rule {@link run} follows, for the same reason: an escalation stops a tap and builds
+	 * another one, and the ARI event loop that delivered this digit cannot wait for two media round
+	 * trips. The caller gets `consumed` immediately.
+	 */
+	armSupervisionKeys(mediaChannelId: string, escalate: (mode: TapMode) => Promise<void>): void {
+		if (this.stopped) {
+			return;
+		}
+		this.supervisions.set(mediaChannelId, escalate);
+	}
+
+	/** Disarms them. Called when the tap ends, however it ended, and when the leg goes away. */
+	disarmSupervisionKeys(mediaChannelId: string): void {
+		this.supervisions.delete(mediaChannelId);
+	}
+
+	/**
 	 * Offers a digit from the media server.
 	 *
 	 * Returns whether the runtime CONSUMED it. A consumed digit must not reach the far end and must
@@ -200,6 +263,29 @@ export class MidCallFeatureRuntime {
 		if (this.stopped) {
 			return "pass-through";
 		}
+
+		// Ahead of the machine and ahead of the per-leg chain, because a supervisor's leg has no
+		// conversation for a digit to be passed through TO and nothing else on this leg can be
+		// collecting one. See `armSupervisionKeys`.
+		const escalate = this.supervisions.get(leg.mediaChannelId);
+		if (escalate !== undefined) {
+			const mode = SUPERVISION_MODE_BY_DIGIT[digit];
+			if (mode !== undefined) {
+				void escalate(mode).catch((error: unknown) => {
+					this.log("a supervision mode key failed", {
+						mediaChannelId: leg.mediaChannelId,
+						digit,
+						err: String(error),
+					});
+				});
+			}
+			// Every digit is swallowed while a tap is open, not just the three that mean something. A
+			// `7` forwarded to the tap bridge would be injected into the monitored conversation on any
+			// mode that speaks to it, and a supervisor pressing a stray key must not send DTMF into
+			// somebody else's call with a payment IVR on the other end.
+			return "consumed";
+		}
+
 		const lifecycle = this.lifecycles.get(leg.mediaChannelId) ?? {};
 		this.lifecycles.set(leg.mediaChannelId, lifecycle);
 		const previous = this.chains.get(leg.mediaChannelId) ?? Promise.resolve();
@@ -249,6 +335,7 @@ export class MidCallFeatureRuntime {
 	release(mediaChannelId: string): void {
 		this.lifecycles.delete(mediaChannelId);
 		this.cancelKeys.delete(mediaChannelId);
+		this.supervisions.delete(mediaChannelId);
 		this.chains.delete(mediaChannelId);
 		this.dropCapture(mediaChannelId);
 	}
@@ -262,6 +349,7 @@ export class MidCallFeatureRuntime {
 			this.dropCapture(mediaChannelId);
 		}
 		this.cancelKeys.clear();
+		this.supervisions.clear();
 		this.chains.clear();
 	}
 

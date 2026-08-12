@@ -294,3 +294,65 @@ func (v AgentStatus) Valid() bool {
 }
 
 func (v AgentStatus) String() string { return string(v) }
+
+// TapMode — What a supervisor is doing to a call they did not place: eavesdrop, whisper or barge.
+//
+// Source: packages/events/src/schemas/telephony.ts TAP_MODES.
+type TapMode string
+
+const (
+	TapModeEavesdrop TapMode = "eavesdrop"
+	TapModeWhisper   TapMode = "whisper"
+	TapModeBarge     TapMode = "barge"
+)
+
+// TapModeValues lists every member of the vocabulary, in contract order.
+var TapModeValues = []TapMode{
+	TapModeEavesdrop,
+	TapModeWhisper,
+	TapModeBarge,
+}
+
+// Valid reports whether v is a member of the TapMode vocabulary.
+func (v TapMode) Valid() bool {
+	for _, candidate := range TapModeValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v TapMode) String() string { return string(v) }
+
+// TapEndReason — How a supervisor's tap ended. Distinguishes the monitored call ending from the supervisor leaving.
+//
+// Source: packages/events/src/schemas/telephony.ts TAP_END_REASONS.
+type TapEndReason string
+
+const (
+	TapEndReasonSupervisorEnded TapEndReason = "supervisor-ended"
+	TapEndReasonTargetEnded     TapEndReason = "target-ended"
+	TapEndReasonEscalated       TapEndReason = "escalated"
+	TapEndReasonFailed          TapEndReason = "failed"
+)
+
+// TapEndReasonValues lists every member of the vocabulary, in contract order.
+var TapEndReasonValues = []TapEndReason{
+	TapEndReasonSupervisorEnded,
+	TapEndReasonTargetEnded,
+	TapEndReasonEscalated,
+	TapEndReasonFailed,
+}
+
+// Valid reports whether v is a member of the TapEndReason vocabulary.
+func (v TapEndReason) Valid() bool {
+	for _, candidate := range TapEndReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v TapEndReason) String() string { return string(v) }

@@ -29,6 +29,10 @@ export const pbxRelations = defineRelations(pbxTables, (r) => ({
 		deviceLines: r.many.deviceLine({ from: r.extension.id, to: r.deviceLine.extensionId }),
 		voicemailBoxes: r.many.voicemailBox({ from: r.extension.id, to: r.voicemailBox.extensionId }),
 		queueAgents: r.many.queueAgent({ from: r.extension.id, to: r.queueAgent.extensionId }),
+		pagingGroupMemberships: r.many.pagingGroupMember({
+			from: r.extension.id,
+			to: r.pagingGroupMember.extensionId,
+		}),
 	},
 	extensionUser: {
 		extension: r.one.extension({
@@ -159,6 +163,29 @@ export const pbxRelations = defineRelations(pbxTables, (r) => ({
 		ringGroup: r.one.ringGroup({
 			from: r.ringGroupDestination.ringGroupId,
 			to: r.ringGroup.id,
+			optional: false,
+		}),
+	},
+
+	// --- Paging ------------------------------------------------------------------------------
+	pagingGroup: {
+		members: r.many.pagingGroupMember({
+			from: r.pagingGroup.id,
+			to: r.pagingGroupMember.pagingGroupId,
+		}),
+	},
+	pagingGroupMember: {
+		pagingGroup: r.one.pagingGroup({
+			from: r.pagingGroupMember.pagingGroupId,
+			to: r.pagingGroup.id,
+			optional: false,
+		}),
+		// Not optional: a member row whose extension is gone cannot exist — the foreign key cascades
+		// the delete rather than leaving a member pointing at nothing, which is the whole reason
+		// membership is a table and not a text list.
+		extension: r.one.extension({
+			from: r.pagingGroupMember.extensionId,
+			to: r.extension.id,
 			optional: false,
 		}),
 	},

@@ -7,6 +7,7 @@ import { ExtensionFeatureRpcPort } from "./extension-feature.source";
 import { LastCallerRpcSource } from "./last-caller.source";
 import { ParkRegistry } from "./park-registry";
 import { RoutingArtifactSource } from "./routing-artifact.source";
+import { SupervisorAuthzRpcPort } from "./supervisor-authz.source";
 import { VoicemailGreetingRpcPort } from "./voicemail-greeting.source";
 import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
 
@@ -26,6 +27,13 @@ import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
  * health check reads. They are here
  * rather than in `CallsModule` for the reason the mailbox source is: the star codes that use them
  * are executed by the plan walker, and the walker's collaborators are this module's.
+ * {@link SupervisorAuthzRpcPort} joins them on those same terms with one difference worth writing
+ * down: its ABSENCE is not a degradation. Every other port here missing means a feature announces
+ * "not available"; this one missing means `*0` is refused, because the engine would have no way to
+ * establish that the handset may listen to somebody else's conversation. It is registered here so
+ * that the deployed engine always has it and the refusal branch stays a safety net rather than the
+ * normal path — see `supervisor-authz.source.ts` and `PlanWalkerDependencies.supervision`, which say
+ * the same thing from the two other ends.
  * {@link ConferenceRegistry} joins them because it is the one destination whose state outlives a
  * single walk: two callers dialing the same room are two walks that have to reach one bridge, and
  * a second registry would put them in two. {@link ParkRegistry} joins them for the same reason,
@@ -51,6 +59,7 @@ import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
 		ExtensionFeatureRpcPort,
 		LastCallerRpcSource,
 		VoicemailGreetingRpcPort,
+		SupervisorAuthzRpcPort,
 		ConferenceRegistry,
 		ParkRegistry,
 		ClaimHeartbeatService,
@@ -63,6 +72,7 @@ import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
 		ExtensionFeatureRpcPort,
 		LastCallerRpcSource,
 		VoicemailGreetingRpcPort,
+		SupervisorAuthzRpcPort,
 		ConferenceRegistry,
 		ParkRegistry,
 		ClaimHeartbeatService,

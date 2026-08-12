@@ -407,6 +407,10 @@ const DEVICE_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b50";
 const MAILBOX_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51";
 const MESSAGE_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b52";
 const SESSION_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53";
+/** The supervisor's own leg and call, for the tap samples: a tap names two calls, never one. */
+const SUPERVISOR_LEG_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b54";
+const SUPERVISOR_CALL_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b55";
+const PAGING_GROUP_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b56";
 const MEDIAD_INSTANCE = "mediad-7c9f2a1b";
 /** DIDs in the two shapes the index has to reconcile: as stored, and as a carrier delivers it. */
 const DID_STORED = "+441632960111";
@@ -504,6 +508,79 @@ function eventSamples(): readonly {
 				objectKey: "recordings/2026/08/05/leg-a.wav",
 				kind: "call",
 				stereo: false,
+			},
+		}),
+	});
+
+	samples.push({
+		name: "call.tap.started",
+		goType: "CallTapStartedData",
+		envelope: makeCallEvent("call.tap.started", {
+			...next(),
+			orgId: ORG_A,
+			// The subject is the MONITORED call, not the supervisor's — see the schema's own note.
+			callId: CALL_A,
+			data: {
+				legId: SUPERVISOR_LEG_A,
+				mode: "whisper",
+				supervisorExtension: "1900",
+				targetExtension: "1001",
+				targetLegId: LEG_A,
+				previousMode: "eavesdrop",
+				supervisorCallId: SUPERVISOR_CALL_A,
+			},
+		}),
+	});
+	samples.push({
+		name: "call.tap.ended",
+		goType: "CallTapEndedData",
+		envelope: makeCallEvent("call.tap.ended", {
+			...next(),
+			orgId: ORG_A,
+			callId: CALL_A,
+			data: {
+				legId: SUPERVISOR_LEG_A,
+				mode: "whisper",
+				supervisorExtension: "1900",
+				targetExtension: "1001",
+				reason: "target-ended",
+				durationMs: 42_000,
+			},
+		}),
+	});
+	samples.push({
+		name: "call.paging.started",
+		goType: "CallPagingStartedData",
+		envelope: makeCallEvent("call.paging.started", {
+			...next(),
+			orgId: ORG_A,
+			callId: CALL_A,
+			data: {
+				legId: LEG_A,
+				pagingGroupId: PAGING_GROUP_A,
+				pagingGroupName: "Warehouse",
+				dialed: "*81300",
+				pagerExtension: "1001",
+				memberCount: 12,
+				// Two handsets were unregistered. The whole point of carrying both numbers.
+				answeredCount: 10,
+				oneWay: true,
+			},
+		}),
+	});
+	samples.push({
+		name: "call.paging.ended",
+		goType: "CallPagingEndedData",
+		envelope: makeCallEvent("call.paging.ended", {
+			...next(),
+			orgId: ORG_A,
+			callId: CALL_A,
+			data: {
+				legId: LEG_A,
+				pagingGroupId: PAGING_GROUP_A,
+				pagingGroupName: "Warehouse",
+				durationMs: 9_500,
+				answeredCount: 10,
 			},
 		}),
 	});

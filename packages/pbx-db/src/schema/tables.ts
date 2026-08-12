@@ -7,6 +7,7 @@ import { ivrMenu, ivrMenuOption } from "./ivr-schema";
 import { mohClass, prompt } from "./media-schema";
 import { phoneNumber } from "./numbers-schema";
 import { projectionOutbox } from "./outbox-schema";
+import { pagingGroup, pagingGroupMember } from "./paging-schema";
 import { queue, queueAgent, queueTier } from "./queues-schema";
 import { ringGroup, ringGroupDestination } from "./ring-groups-schema";
 import { inboundRoute, outboundRoute } from "./routing-schema";
@@ -48,6 +49,8 @@ export const pbxTables = {
 	mohClass,
 	orgSetting,
 	outboundRoute,
+	pagingGroup,
+	pagingGroupMember,
 	parkLot,
 	phoneNumber,
 	projectionOutbox,

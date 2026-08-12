@@ -38,8 +38,18 @@ import type { CompiledTimeCondition } from "./time-conditions";
  * Bump on any change to the shapes in this file or in `plan.ts` that a reader compiled against the
  * previous version could misinterpret. A reader that finds an unexpected version must discard the
  * cache entry and recompile — never walk it, never "best effort".
+ *
+ * # v1 → v2: the `paging` node kind
+ *
+ * A new OPTIONAL FIELD is not a bump — an old reader ignores it and behaves as it did before, which
+ * is why `TrunkDialPlanNode.emergency` and `ExtensionPlanNode.pickupGroup` arrived without one. A
+ * new NODE KIND is different in kind, not in degree: a v1 reader switches over `node.kind` and has
+ * no case for `"paging"`, so it meets a node it cannot execute in the middle of a live call. There
+ * is no safe default for that — falling through would drop the call silently, and guessing would
+ * dial somebody. Discarding the cache entry and recompiling is the only honest answer, and the
+ * version is what tells the reader to do it.
  */
-export const ROUTING_ARTIFACT_VERSION = 1;
+export const ROUTING_ARTIFACT_VERSION = 2;
 
 /** The three routing namespaces. The rpc contract's `routingContext` is one of these. */
 export const ROUTING_CONTEXTS = ["inbound", "internal", "outbound"] as const;
@@ -115,7 +125,14 @@ export interface InboundDidDefault {
 /** What an internal number resolves to, and which entity claimed it. */
 export interface InternalNumberEntry {
 	readonly number: string;
-	readonly kind: "extension" | "ring-group" | "ivr-menu" | "queue" | "conference" | "voicemail";
+	readonly kind:
+		| "extension"
+		| "ring-group"
+		| "ivr-menu"
+		| "queue"
+		| "conference"
+		| "paging-group"
+		| "voicemail";
 	readonly entityId: string;
 	readonly nodeId: PlanNodeId;
 }

@@ -95,6 +95,40 @@ export interface QueueCallPort {
 	ensureAnswered(): Promise<boolean>;
 	/** Plays one media reference at the caller. `false` means the play failed. */
 	play(media: string): Promise<boolean>;
+	/**
+	 * Plays one media reference at an ANSWERED AGENT's leg, before it is bridged to the caller.
+	 *
+	 * ## Why this exists rather than the session reaching for a tap
+	 *
+	 * A tap ({@link import("../media/media-port").MediaPort.tap}) is the primitive for reaching a
+	 * party who is ALREADY in a conversation — it snoops one leg, bridges the snoop to a third leg,
+	 * and injects audio into one direction so that one of two people hears something the other does
+	 * not. Every part of that machinery exists to solve the problem of a live bridge, and at the
+	 * moment this is called there is no bridge: the agent has answered, the caller is still in the
+	 * queue hearing hold music, and the two legs have never met. Using a tap here would add a
+	 * channel, a bridge and a race to something a plain `play` on the agent's own channel already
+	 * does correctly — and would need the media plane to support media bugs, which would make an
+	 * agent whisper prompt refuse on a driver that a plain playback works fine on.
+	 *
+	 * So the whisper is a playback on a leg that is not yet bridged, and the caller cannot hear it
+	 * for the most robust possible reason: they are not connected to anything.
+	 *
+	 * ## It does NOT wait for the audio to finish
+	 *
+	 * Nothing in this engine can. `PlaybackFinished` is one of the ARI events `toMediaEvent`
+	 * deliberately drops, {@link CallSignalBus} has no playback key, and the `play` VERB returns as
+	 * soon as audio has started for exactly the same reason. So this returns once the media server
+	 * has accepted the playback, and a long whisper prompt may still be playing when the bridge is
+	 * built. On the ARI driver a playback is addressed to the CHANNEL and is not injected into the
+	 * bridge it later joins, so the caller still never hears it; the agent may hear the tail over the
+	 * first moment of the call. The seam that would fix it is a `playbackSignalKey` on the signal bus
+	 * plus republishing `PlaybackFinished` in `ari-mapping.ts`, and it is worth doing when something
+	 * else needs it too.
+	 *
+	 * `false` means the media server refused the playback. The caller MUST still be bridged — see
+	 * {@link QueueSession.answered}.
+	 */
+	playToAgent(mediaChannelId: string, media: string): Promise<boolean>;
 	startMusicOnHold(mohClass?: string): Promise<void>;
 	stopMusicOnHold(): Promise<void>;
 	/**
@@ -616,6 +650,8 @@ export class QueueSession {
 			strategy: this.node.strategy,
 		});
 
+		await this.whisperToAgent(mediaChannelId);
+
 		const bridged = await this.call.bridge(mediaChannelId, () => {
 			void this.startWrapUp(membership, agentId);
 		});
@@ -629,6 +665,51 @@ export class QueueSession {
 		}
 
 		return { kind: "answered", agentId, waitMs };
+	}
+
+	/**
+	 * The agent's cue, played to them and to nobody else, in the gap before the bridge.
+	 *
+	 * ## Where in the sequence, and why exactly here
+	 *
+	 * After `queue.caller.answered` and before `bridge`. Not earlier, because the agent is not
+	 * confirmed as the owner of this call until the `on-call` transition has been written and a
+	 * whisper played to somebody who then loses the call is a whisper about a customer they never
+	 * speak to. Not later, because after the bridge there is a conversation and the caller would hear
+	 * it — which is the one thing this prompt must never do.
+	 *
+	 * ## A failure does not stop the call
+	 *
+	 * The prompt is a courtesy — "this is the sales queue", "this caller has been waiting four
+	 * minutes" — and the call is the product. An announcement is worth less than the call, so a
+	 * missing prompt id, an unresolvable media ref and a media server that refuses the playback all
+	 * end the same way: a note on the walk, and the bridge is built regardless. Refusing to connect a
+	 * caller who has already waited in a queue because a sound file is missing would be a much larger
+	 * outage than the one it reported.
+	 */
+	private async whisperToAgent(mediaChannelId: string): Promise<void> {
+		const promptId = this.node.agentWhisperPromptId;
+		if (promptId === undefined || promptId.trim() === "") {
+			return;
+		}
+		const media = this.call.resolvePrompt(promptId);
+		if (media === undefined) {
+			this.call.note(
+				`queue "${this.node.queueId}" has an agent whisper prompt that resolves to no playable audio; the agent was bridged without it`,
+			);
+			return;
+		}
+		try {
+			if (!(await this.call.playToAgent(mediaChannelId, media))) {
+				this.call.note(
+					`queue "${this.node.queueId}": the agent whisper prompt could not be played; the agent was bridged without it`,
+				);
+			}
+		} catch (error) {
+			this.call.note(
+				`queue "${this.node.queueId}": the agent whisper prompt failed (${String(error)}); the agent was bridged without it`,
+			);
+		}
 	}
 
 	/**

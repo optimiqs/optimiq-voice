@@ -30,6 +30,7 @@ import { LastCallerRpcSource } from "../routing/last-caller.source";
 import { ParkRegistry } from "../routing/park-registry";
 import { PlanWalker } from "../routing/plan-walker";
 import { RoutingArtifactSource } from "../routing/routing-artifact.source";
+import { SupervisorAuthzRpcPort } from "../routing/supervisor-authz.source";
 import { TrunkCapacityRegistry } from "../routing/trunk-capacity";
 import { VoicemailGreetingRpcPort } from "../routing/voicemail-greeting.source";
 import { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
@@ -72,6 +73,7 @@ import type {
 	PickupCandidate,
 	RouteOutcome,
 	RouteRequest,
+	SupervisionTarget,
 } from "./call-control";
 import type { CallDirection, CallEvent, LegSide, OriginateRequest } from "@optimiq-voice/events";
 import type {
@@ -213,6 +215,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		private readonly extensionFeatures: ExtensionFeatureRpcPort,
 		private readonly lastCaller: LastCallerRpcSource,
 		private readonly greetings: VoicemailGreetingRpcPort,
+		private readonly supervision: SupervisorAuthzRpcPort,
 		private readonly didIndex: DidIndexSource,
 		private readonly signals: CallSignalBus,
 		private readonly conferences: ConferenceRegistry,
@@ -241,6 +244,16 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				},
 				disarm: (mediaChannelId) => {
 					this.midCall.disarmCancelKey(mediaChannelId);
+				},
+			},
+			// The supervisor's `4`/`5`/`6`, on the same terms and through the same getter-shaped
+			// indirection: `this.midCall` is built from `this.control` and does not exist yet here.
+			supervisionKeys: {
+				arm: (mediaChannelId, escalate) => {
+					this.midCall.armSupervisionKeys(mediaChannelId, escalate);
+				},
+				disarm: (mediaChannelId) => {
+					this.midCall.disarmSupervisionKeys(mediaChannelId);
 				},
 			},
 			settings: {
@@ -969,6 +982,13 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			// rpc client, so one instance serves every walk — see `routing.module.ts`.
 			features: this.extensionFeatures,
 			lastCaller: this.lastCaller,
+			// `*0`'s gate. Wired in exactly the same shape as its two neighbours above and with the
+			// OPPOSITE meaning when it is missing: `features` and `lastCaller` absent means the code
+			// announces because the feature cannot run, and `supervision` absent means the code refuses
+			// because the engine cannot establish that this handset MAY listen. That asymmetry is
+			// stated on `PlanWalkerDependencies.supervision` and enforced in `eavesdropCode`, which has
+			// no "no port, therefore allow" branch — this line exists so production never takes it.
+			supervision: this.supervision,
 			// `greetings` was deliberately absent for one wave, and this is the wire that closed it.
 			// The runtime and the port were finished together with the rest of the feature codes; what
 			// did not exist was a CONTRACT to carry a recorded greeting to the control plane, because a
@@ -1089,6 +1109,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		return {
 			legFor: (mediaChannelId) => this.controlledLegFor(mediaChannelId),
 			ringingFor: async (leg, extension) => await this.ringingCandidates(leg, extension),
+			activeCallsFor: (leg, extension) => this.supervisionTargets(leg, extension),
 			publish: async (leg, type, data) => {
 				const aggregate = this.registry.byDomainChannelId(leg.legId);
 				if (aggregate === undefined) {
@@ -1145,6 +1166,23 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			 * transfer does exactly this, through this method's own `routeLeg`. The outer walk stops as
 			 * soon as this returns, so the two never run at once.
 			 */
+			/**
+			 * `*0` — the supervisor's leg joining somebody else's conversation.
+			 *
+			 * A straight adaptation: everything interesting is in `CallControl.monitor`, and the
+			 * walker's contract differs from it only in that a walker outcome carries no `detail`. The
+			 * supervising extension is taken from the LEG's own caller id rather than from the walker,
+			 * because it is the identity the SIP edge authenticated and the identity the gate was
+			 * asked about — reading it back off the request would let the two disagree.
+			 */
+			monitor: async (request) => {
+				const result = await this.control.monitor(leg, {
+					extension: request.extension,
+					mode: request.mode,
+					supervisorExtension: leg.callerIdNumber ?? "",
+				});
+				return result.ok ? { ok: true } : { ok: false, reason: result.reason };
+			},
 			dial: async (request) => {
 				const internal = await this.routeLeg(leg, {
 					destination: request.destination,
@@ -1319,6 +1357,67 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		}
 
 		return candidates.sort((left, right) => left.ringingSinceMs - right.ringingSinceMs);
+	}
+
+	/**
+	 * Answered calls at an extension that THIS instance is holding, oldest first — what `*0` taps.
+	 *
+	 * The mirror image of {@link ringingCandidates} and deliberately written beside it, because the
+	 * two scans differ in exactly the ways the two features do:
+	 *
+	 * - A pickup wants a leg that is RINGING; supervision wants one that is ANSWERED.
+	 * - A pickup only ever looks at B-legs, because only a B-leg rings on somebody's behalf.
+	 *   Supervision looks at both, because an extension is equally on a call when it DIALLED one —
+	 *   so a leg matches if the extension is either what the leg was dialled to reach
+	 *   (`destinationNumber`, an inbound call) or the identity it presented (`callerIdNumber`, an
+	 *   outbound one).
+	 * - A pickup filters by pickup group; supervision's gate is a permission the control plane
+	 *   answered before this method was reachable, and re-deriving a second, telephony-shaped gate
+	 *   here would be a quieter copy of the permission model.
+	 *
+	 * `isDetached` is excluded along with `isTearingDown`: a detached leg is alive and belongs to
+	 * somebody else now (a pickup took it over), and tapping it would attach a supervisor to a
+	 * conversation whose routing has already moved on.
+	 *
+	 * `OPTIMIQ_LEG` gives the SIDE — the leg the engine dialled on somebody's behalf is `b` and
+	 * everything else is `a` — which is the one fact the media plane needs in order to make whisper
+	 * mean "speak to this party" rather than "inject into this direction". See
+	 * {@link import("../media/media-port").TapRequest.targetSide}.
+	 *
+	 * The instance-local limitation is stated at length on {@link CallControl.monitor}, which is
+	 * where the announcement a supervisor actually hears is decided.
+	 */
+	private supervisionTargets(leg: ControlledLeg, extension: string): readonly SupervisionTarget[] {
+		const wanted = extension.trim();
+		if (wanted === "") {
+			return [];
+		}
+		const targets: SupervisionTarget[] = [];
+
+		for (const aggregate of this.registry.all) {
+			if (
+				aggregate.organizationId !== leg.organizationId ||
+				aggregate.isTearingDown ||
+				aggregate.isDetached ||
+				!aggregate.isAnswered ||
+				aggregate.ariChannelId === leg.mediaChannelId
+			) {
+				continue;
+			}
+			const profile = aggregate.snapshot.profile;
+			if (profile.destinationNumber !== wanted && profile.callerIdNumber !== wanted) {
+				continue;
+			}
+			targets.push({
+				leg: this.controlledLeg(aggregate),
+				side: aggregate.snapshot.variables.OPTIMIQ_LEG === "b" ? "b" : "a",
+				startedAtMs: aggregate.snapshot.createdAt,
+			});
+		}
+
+		// Oldest first. The rule is stated on `CallControl.monitor`; the sort is here because this is
+		// where `createdAt` lives.
+		return targets.sort((left, right) => left.startedAtMs - right.startedAtMs);
 	}
 
 	/**

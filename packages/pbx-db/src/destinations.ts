@@ -39,6 +39,11 @@
  * `park`, `time-condition` and `hangup` are additions to the Phase-0 sketch: an inbound route
  * must be able to enter a time condition, a ring group must be able to park an unanswered call,
  * and every chain needs an explicit terminal so "no destination" is never expressed as NULL.
+ *
+ * `paging-group` is entity-backed like the rest, but it is the one destination that never continues:
+ * a DID or an IVR option may point at a paging group ("press 4 for the warehouse tannoy"), and the
+ * call ends when the pager hangs up. That is a property of the target, not of the trio, so it needs
+ * nothing special here.
  */
 export const DESTINATION_TYPES = [
 	"extension",
@@ -48,6 +53,7 @@ export const DESTINATION_TYPES = [
 	"voicemail",
 	"conference",
 	"park",
+	"paging-group",
 	"time-condition",
 	"external",
 	"application",
@@ -67,6 +73,7 @@ export const DESTINATION_TYPE_KINDS: Readonly<Record<DestinationType, Destinatio
 	voicemail: "entity",
 	conference: "entity",
 	park: "entity",
+	"paging-group": "entity",
 	"time-condition": "entity",
 	external: "value",
 	application: "value",
@@ -85,6 +92,7 @@ export const DESTINATION_TARGET_TABLES: Readonly<Record<DestinationType, string 
 	voicemail: "voicemail_box",
 	conference: "conference",
 	park: "park_lot",
+	"paging-group": "paging_group",
 	"time-condition": "time_condition",
 	external: null,
 	application: null,

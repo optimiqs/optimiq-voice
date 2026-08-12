@@ -13,6 +13,11 @@ import {
 } from "../../src/pbx/feature-codes/feature-codes.dto";
 import { updateIvrMenuDto } from "../../src/pbx/ivr-menus/ivr-menus.dto";
 import { createOutboundRouteDto } from "../../src/pbx/outbound-routes/outbound-routes.dto";
+import {
+	createPagingGroupDto,
+	createPagingGroupMemberDto,
+	updatePagingGroupDto,
+} from "../../src/pbx/paging-groups/paging-groups.dto";
 import { createParkLotDto, updateParkLotDto } from "../../src/pbx/park-lots/park-lots.dto";
 import { createPhoneNumberDto } from "../../src/pbx/phone-numbers/phone-numbers.dto";
 import {
@@ -165,6 +170,88 @@ describe("pbx DTOs", () => {
 		});
 	});
 
+	describe("paging groups", () => {
+		it("takes a name and nothing else, because every other column has a default", () => {
+			expect(createPagingGroupDto.safeParse({ name: "Warehouse" }).success).to.equal(true);
+			expect(createPagingGroupDto.safeParse({}).success).to.equal(false);
+		});
+
+		it("lets a group have no number, and lets one be cleared", () => {
+			// A group reached only through `*81` has no number, and forcing one would make an operator
+			// invent digits that then collide with an extension.
+			expect(
+				createPagingGroupDto.safeParse({ name: "Warehouse", extensionNumber: null }).success,
+			).to.equal(true);
+			expect(updatePagingGroupDto.safeParse({ extensionNumber: null }).success).to.equal(true);
+			// Digits only: the `*` space belongs to feature codes.
+			expect(
+				createPagingGroupDto.safeParse({ name: "Warehouse", extensionNumber: "*81" }).success,
+			).to.equal(false);
+		});
+
+		it("bounds the fan-out timeout rather than accepting a typo that pins legs open", () => {
+			for (const timeoutSeconds of [5, 30, 300]) {
+				expect(
+					createPagingGroupDto.safeParse({ name: "W", timeoutSeconds }).success,
+					String(timeoutSeconds),
+				).to.equal(true);
+			}
+			for (const timeoutSeconds of [0, 4, 301, 3.5]) {
+				expect(
+					createPagingGroupDto.safeParse({ name: "W", timeoutSeconds }).success,
+					String(timeoutSeconds),
+				).to.equal(false);
+			}
+			// `null` is the reset to the column's default, per the resettable contract below.
+			expect(createPagingGroupDto.safeParse({ name: "W", timeoutSeconds: null }).success).to.equal(
+				true,
+			);
+		});
+
+		/**
+		 * No destination trio on either table, and the DTO is where a client finds that out.
+		 *
+		 * A page ends when the pager hangs up: there is no unanswered state, so there is no timeout
+		 * branch. `strictObject` is what turns "the server ignored my timeout destination" into a 400
+		 * naming the key.
+		 */
+		it("refuses a destination on the group and on a member", () => {
+			expect(
+				createPagingGroupDto.safeParse({
+					name: "W",
+					timeoutDestinationType: "voicemail",
+					timeoutDestinationRef: "0193f2aa-0000-7000-8000-000000000001",
+				}).success,
+			).to.equal(false);
+			expect(
+				createPagingGroupMemberDto.safeParse({
+					extensionId: "0193f2aa-0000-7000-8000-000000000001",
+					ordinal: 0,
+					destinationType: "extension",
+				}).success,
+			).to.equal(false);
+		});
+
+		it("takes a member as an extension id and a position, and refuses a dial string", () => {
+			expect(
+				createPagingGroupMemberDto.safeParse({
+					extensionId: "0193f2aa-0000-7000-8000-000000000001",
+					ordinal: 0,
+				}).success,
+			).to.equal(true);
+			// An external number cannot be told to auto-answer, so it cannot be a member.
+			expect(
+				createPagingGroupMemberDto.safeParse({ extensionId: "+13105550188", ordinal: 0 }).success,
+			).to.equal(false);
+			expect(
+				createPagingGroupMemberDto.safeParse({
+					extensionId: "0193f2aa-0000-7000-8000-000000000001",
+				}).success,
+				"a member without a position would leave the fan-out order to the loader",
+			).to.equal(false);
+		});
+	});
+
 	describe("feature codes", () => {
 		it("requires a leading star", () => {
 			expect(createFeatureCodeDto.safeParse({ code: "97", action: "redial" }).success).to.equal(
@@ -181,7 +268,50 @@ describe("pbx DTOs", () => {
 			).to.equal(false);
 		});
 
-		it("accepts the one parameter the compiler reads, and only for its action", () => {
+		it("accepts a paging group pinned by id, and refuses anything that is not one", () => {
+			const groupId = "0193f2aa-0000-7000-8000-000000000002";
+			expect(
+				createFeatureCodeDto.safeParse({ code: "*81", action: "paging", params: { groupId } })
+					.success,
+			).to.equal(true);
+			// Omitted is legal and means something: `*81` takes the group from the digits dialled after
+			// it, so an unpinned code reaches every group rather than none.
+			expect(
+				createFeatureCodeDto.safeParse({ code: "*81", action: "paging", params: {} }).success,
+			).to.equal(true);
+			// Junk, in the three shapes a client actually sends it in.
+			for (const params of [
+				{ groupId: "the warehouse" },
+				{ groupId: 42 },
+				{ group_id: groupId },
+				{ groupId, lotId: groupId },
+			]) {
+				expect(
+					createFeatureCodeDto.safeParse({ code: "*81", action: "paging", params }).success,
+					JSON.stringify(params),
+				).to.equal(false);
+			}
+		});
+
+		/**
+		 * `intercom` looks parameterised and is not, which is the distinction the schema exists to
+		 * draw: its target is dialled after the code, so there is nothing for a compiler to resolve
+		 * and pinning one would turn a code that reaches any desk into a code that reaches one.
+		 */
+		it("refuses a pinned target on intercom, which resolves its own at dial time", () => {
+			expect(
+				createFeatureCodeDto.safeParse({
+					code: "*80",
+					action: "intercom",
+					params: { extensionId: "0193f2aa-0000-7000-8000-000000000003" },
+				}).success,
+			).to.equal(false);
+			expect(createFeatureCodeDto.safeParse({ code: "*80", action: "intercom" }).success).to.equal(
+				true,
+			);
+		});
+
+		it("accepts the parameters the compiler reads, and only for their own actions", () => {
 			const lotId = "0193f2aa-0000-7000-8000-000000000001";
 			expect(
 				createFeatureCodeDto.safeParse({ code: "*5", action: "call-park", params: { lotId } })
@@ -228,10 +358,20 @@ describe("pbx DTOs", () => {
 			expect(park).to.have.length(1);
 			expect(park[0]?.name).to.equal("lotId");
 			expect(park[0]?.entityType).to.equal("park");
-			// Every other action renders as "no parameters", which is a fact, not a gap.
+			const paging = FEATURE_CODE_PARAM_FIELDS.paging;
+			expect(paging).to.have.length(1);
+			expect(paging[0]?.name).to.equal("groupId");
+			// The entity type is the destination-type vocabulary, so the web app reuses its picker.
+			expect(paging[0]?.entityType).to.equal("paging-group");
+			expect(
+				paging[0]?.required,
+				"an unpinned *81 takes the group from the dialled digits",
+			).to.equal(false);
+			// Every other action renders as "no parameters", which is a fact, not a gap — `intercom`
+			// most of all, whose target is a keypress rather than a row a form could pick.
 			expect(
 				FEATURE_CODE_ACTIONS.filter((action) => FEATURE_CODE_PARAM_FIELDS[action].length > 0),
-			).to.deep.equal(["call-park"]);
+			).to.deep.equal(["call-park", "paging"]);
 		});
 	});
 

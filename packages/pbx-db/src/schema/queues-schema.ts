@@ -60,6 +60,26 @@ export const queue = pgTable.withRLS(
 		announcePromptId: uuidEntityId("announce_prompt_id").references(() => prompt.id, {
 			onDelete: "set null",
 		}),
+		/**
+		 * Whisper-on-answer: played to the ANSWERING AGENT alone, before the caller is bridged in.
+		 *
+		 * The announcement that tells an agent which queue the call came from — "Sales" — in the
+		 * second between them lifting the handset and saying hello. An agent staffing four queues
+		 * otherwise has to guess which script to open with, and guessing wrong in front of the
+		 * customer is the failure this exists to prevent.
+		 *
+		 * It is played to the agent leg ALONE and the caller hears nothing, which is the whole point:
+		 * a caller who heard "call from Sales queue" would be listening to the agent's cue sheet, and
+		 * the illusion that they reached a person rather than a routing table would be over. That is
+		 * why this is a separate column from `greetingPromptId` and `announcePromptId`, both of which
+		 * play to the caller — same media library, opposite side of the bridge.
+		 *
+		 * `set null` on delete, like every other prompt reference here: deleting a prompt should cost
+		 * a queue its whisper, not cost the tenant the queue.
+		 */
+		agentWhisperPromptId: uuidEntityId("agent_whisper_prompt_id").references(() => prompt.id, {
+			onDelete: "set null",
+		}),
 		maxWaitSeconds: integer("max_wait_seconds").notNull().default(0),
 		/** Eject callers this fast when no agent is logged in at all. 0 disables. */
 		maxWaitNoAgentSeconds: integer("max_wait_no_agent_seconds").notNull().default(0),

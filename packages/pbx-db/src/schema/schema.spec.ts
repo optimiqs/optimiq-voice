@@ -260,6 +260,164 @@ describe("pickup groups", () => {
 });
 
 /**
+ * Call screening.
+ *
+ * One boolean, and the two things worth pinning are the two a later change could quietly take away.
+ * It must stay NOT NULL with a `false` default, because that default is what every extension that
+ * existed before screening did gets, and the only safe reading of such a row is "nobody asked for
+ * this" — a `true` default would put a name-recording prompt on the front of every inbound call in
+ * every tenant that upgraded. And it must stay a boolean rather than becoming a mode enum: the
+ * external-only scope is a decision the engine implements, not a column the tenant configures.
+ */
+describe("call screening", () => {
+	const column = getTableConfig(pbxTables.extension).columns.find(
+		(candidate) => candidate.name === "call_screening",
+	);
+
+	it("is a NOT NULL boolean that is off by default", () => {
+		expect(column).toBeDefined();
+		expect(column?.getSQLType()).toBe("boolean");
+		expect(column?.notNull).toBe(true);
+		expect(column?.default).toBe(false);
+	});
+});
+
+/**
+ * Whisper-on-answer.
+ *
+ * Nullable and defaultless, because the absence of a whisper is the normal state and the column has
+ * to be able to say so: a queue with no whisper prompt bridges the agent straight through, which is
+ * what every queue did before the column existed. It references `prompt` like its two caller-facing
+ * siblings do, and `set null` on delete for the same reason they use it — losing a prompt should
+ * cost a queue its whisper, not cost the tenant the queue.
+ */
+describe("agent whisper", () => {
+	const config = getTableConfig(pbxTables.queue);
+	const column = config.columns.find((candidate) => candidate.name === "agent_whisper_prompt_id");
+
+	it("is a nullable uuid with no default", () => {
+		expect(column).toBeDefined();
+		expect(column?.getSQLType()).toBe("uuid");
+		expect(column?.notNull).toBe(false);
+		expect(column?.hasDefault).toBe(false);
+	});
+
+	it("references the prompt library, so a deleted prompt cannot dangle", () => {
+		const foreignKey = config.foreignKeys.find((candidate) =>
+			candidate.reference().columns.some((entry) => entry.name === "agent_whisper_prompt_id"),
+		);
+		expect(foreignKey).toBeDefined();
+		expect(getTableName(foreignKey?.reference().foreignTable ?? pbxTables.prompt)).toBe("prompt");
+		expect(foreignKey?.onDelete).toBe("set null");
+	});
+});
+
+/**
+ * Paging groups.
+ *
+ * What is pinned here is the shape a page depends on and nothing else: that membership is a REAL
+ * table with two cascading foreign keys (a member that dangles is a page that reaches fewer people
+ * than the operator believes it does, silently), that the ordinal is NOT NULL (the fan-out order is
+ * the operator's, not the loader's), that the group's number stays nullable behind a partial unique
+ * index (a group reachable only through `*81` has none, and several such groups must not collide on
+ * NULL), and that both tables carry their tenant-isolation policy.
+ */
+describe("paging groups", () => {
+	const groupConfig = getTableConfig(pbxTables.pagingGroup);
+	const memberConfig = getTableConfig(pbxTables.pagingGroupMember);
+	const groupColumns = new Map(groupConfig.columns.map((column) => [column.name, column]));
+	const memberColumns = new Map(memberConfig.columns.map((column) => [column.name, column]));
+
+	it("names the group's dialable number nullable, so `*81`-only groups stay expressible", () => {
+		const column = groupColumns.get("extension_number");
+		expect(column).toBeDefined();
+		expect(column?.getSQLType()).toBe("text");
+		expect(column?.notNull).toBe(false);
+		expect(column?.hasDefault).toBe(false);
+	});
+
+	it("makes the number index partial, so two groups without one do not collide", () => {
+		const index = groupConfig.indexes.find(
+			(candidate) => candidate.config.name === "paging_group_organization_extension_number_key",
+		);
+		expect(index?.config.unique).toBe(true);
+		expect(index?.config.where).toBeDefined();
+		expect(JSON.stringify(index?.config.where?.queryChunks)).toContain("extension_number");
+	});
+
+	it("defaults to a one-way announcement with a thirty-second leg budget", () => {
+		expect(groupColumns.get("duplex")?.getSQLType()).toBe("boolean");
+		expect(groupColumns.get("duplex")?.notNull).toBe(true);
+		expect(groupColumns.get("duplex")?.default).toBe(false);
+		expect(groupColumns.get("timeout_seconds")?.getSQLType()).toBe("integer");
+		expect(groupColumns.get("timeout_seconds")?.notNull).toBe(true);
+		expect(groupColumns.get("timeout_seconds")?.default).toBe(30);
+		expect(groupColumns.get("enabled")?.default).toBe(true);
+	});
+
+	/**
+	 * A page ENDS. Every other entity that receives a call carries a destination trio for what
+	 * happens next; this one must not grow one by accident, because there is no "next".
+	 */
+	it("carries no destination trio, because a page has no continuation", () => {
+		const names = groupConfig.columns.map((column) => column.name);
+		expect(names.filter((name) => name.endsWith("destination_type"))).toEqual([]);
+	});
+
+	it("holds membership on its own table, ordered and cascading from both parents", () => {
+		expect(memberColumns.get("ordinal")?.getSQLType()).toBe("integer");
+		expect(memberColumns.get("ordinal")?.notNull).toBe(true);
+		expect(memberColumns.get("paging_group_id")?.notNull).toBe(true);
+		expect(memberColumns.get("extension_id")?.notNull).toBe(true);
+		expect(memberColumns.get("enabled")?.default).toBe(true);
+
+		const targets = memberConfig.foreignKeys.map((foreignKey) => ({
+			column: foreignKey.reference().columns[0]?.name,
+			table: getTableName(foreignKey.reference().foreignTable),
+			onDelete: foreignKey.onDelete,
+		}));
+		expect(targets).toContainEqual({
+			column: "paging_group_id",
+			table: "paging_group",
+			onDelete: "cascade",
+		});
+		expect(targets).toContainEqual({
+			column: "extension_id",
+			table: "extension",
+			onDelete: "cascade",
+		});
+	});
+
+	it("refuses a duplicate member and a duplicate position within one group", () => {
+		const unique = memberConfig.indexes
+			.filter((candidate) => candidate.config.unique)
+			.map((candidate) => ({
+				name: candidate.config.name,
+				columns: candidate.config.columns.map((entry) => ("name" in entry ? entry.name : "")),
+			}));
+		expect(unique).toContainEqual({
+			name: "paging_group_member_group_extension_key",
+			columns: ["organization_id", "paging_group_id", "extension_id"],
+		});
+		expect(unique).toContainEqual({
+			name: "paging_group_member_group_ordinal_key",
+			columns: ["organization_id", "paging_group_id", "ordinal"],
+		});
+	});
+
+	it("isolates both tables by tenant under the harness naming convention", () => {
+		expect(groupConfig.policies.map((policy) => policy.name)).toEqual([
+			"paging_group_tenant_isolation",
+		]);
+		expect(memberConfig.policies.map((policy) => policy.name)).toEqual([
+			"paging_group_member_tenant_isolation",
+		]);
+		expect(groupConfig.enableRLS).toBe(true);
+		expect(memberConfig.enableRLS).toBe(true);
+	});
+});
+
+/**
  * Voicemail transcription state.
  *
  * The shape here is the whole safety story for a feature that is off by default, so the assertions

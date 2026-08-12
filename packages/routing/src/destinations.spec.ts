@@ -19,7 +19,7 @@ import {
  * the compiler would silently drop every route pointing at it, and only a pinned list catches that.
  */
 describe("destination vocabulary", () => {
-	it("names exactly the eleven pbx-db destination types", () => {
+	it("names exactly the twelve pbx-db destination types", () => {
 		expect([...DESTINATION_TYPES]).toEqual([
 			"extension",
 			"ivr",
@@ -28,6 +28,7 @@ describe("destination vocabulary", () => {
 			"voicemail",
 			"conference",
 			"park",
+			"paging-group",
 			"time-condition",
 			"external",
 			"application",

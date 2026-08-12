@@ -8,6 +8,7 @@ import type {
 	ExtensionFeatureOutcome,
 	LastCallerResult,
 	RecordedGreeting,
+	SupervisorAuthzRequest,
 	WalkerCallControl,
 	WalkerChannel,
 	WalkInput,
@@ -51,6 +52,25 @@ interface HarnessOptions {
 	readonly greetings?: "accepts" | "throws";
 	/** How a `*69` return call to a non-extension resolves. Absent means no call-control runtime. */
 	readonly dial?: { readonly status: WalkStatus | "unresolved"; readonly reason?: string };
+	/**
+	 * What the supervision GATE answers. Absent means the walk has no gate at all, which must DENY.
+	 *
+	 * A separate knob from {@link HarnessOptions.monitor} on purpose: the whole point of `*0` is that
+	 * the gate runs before the runtime, so a spec has to be able to allow one and refuse the other.
+	 */
+	readonly authorize?: boolean | "throws";
+	/** What the monitoring RUNTIME answers, once the gate has allowed the request. */
+	readonly monitor?: { readonly ok: boolean; readonly reason?: string };
+	/** Whether the walk gets a call-control runtime at all, independently of what it answers. */
+	readonly control?: boolean;
+	/**
+	 * Makes every originated leg die instead of answering.
+	 *
+	 * A DEATH rather than silence, because silence would make the spec wait out a real ring timeout to
+	 * assert something about the branch that is taken afterwards. What is under test is where the walk
+	 * goes when the leg does not come up, and both roads lead there.
+	 */
+	readonly silentOriginate?: boolean;
 	/** Makes the media plane refuse `echo`, which is what `mediad` does by name. */
 	readonly echoFails?: boolean;
 	/** How a started recording ends. Defaults to four seconds of audio. */
@@ -67,6 +87,8 @@ function harness(options: HarnessOptions = {}) {
 	const published: { readonly type: CallEvent }[] = [];
 	const changes: ExtensionFeatureChange[] = [];
 	const dials: { readonly destination: string }[] = [];
+	const monitors: { readonly extension: string; readonly mode: string }[] = [];
+	const authorized: SupervisorAuthzRequest[] = [];
 	const filed: RecordedGreeting[] = [];
 	const state = { answered: false, tearingDown: false };
 
@@ -76,7 +98,12 @@ function harness(options: HarnessOptions = {}) {
 		// and what it is there to prove is that the walk re-entered the extension runtime — not how
 		// long a phone rings, which `plan-walker.spec.ts` already owns.
 		onOriginate: (request) => {
-			signals.emit(legSignalKey(request.channelId), { kind: "answered" });
+			signals.emit(
+				legSignalKey(request.channelId),
+				options.silentOriginate === true
+					? { kind: "ended", cause: "USER_NOT_REGISTERED", causeCode: 21 }
+					: { kind: "answered" },
+			);
 		},
 		onRecord: (_channelId, request) => {
 			const reaction = options.recording ?? { kind: "finished" as const, durationMs: 4_200 };
@@ -135,6 +162,10 @@ function harness(options: HarnessOptions = {}) {
 		park: async () => ({ ok: false, reason: "not used by these specs" }),
 		unpark: async () => ({ ok: false, reason: "not used by these specs" }),
 		pickup: async () => ({ ok: false, reason: "not used by these specs" }),
+		monitor: async (request) => {
+			monitors.push(request);
+			return options.monitor ?? { ok: true };
+		},
 		dial: async (request) => {
 			dials.push(request);
 			return options.dial ?? { status: "bridged" };
@@ -188,7 +219,28 @@ function harness(options: HarnessOptions = {}) {
 						},
 					},
 				}),
-		...(options.dial === undefined && options.lastCaller === undefined ? {} : { control }),
+		...(options.authorize === undefined
+			? {}
+			: {
+					supervision: {
+						authorize: async (request: SupervisorAuthzRequest) => {
+							authorized.push(request);
+							if (options.authorize === "throws") {
+								// The PORT never throws — `supervisor-authz.source.ts` catches and denies — so a
+								// fake that threw would be testing a contract violation. It denies with the
+								// reason the real one uses for an unreachable broker.
+								return { allowed: false, reason: "the authorization service did not answer" };
+							}
+							return { allowed: options.authorize === true };
+						},
+					},
+				}),
+		...(options.dial === undefined &&
+		options.lastCaller === undefined &&
+		options.monitor === undefined &&
+		options.control !== true
+			? {}
+			: { control }),
 		newId: () => {
 			counter += 1;
 			return `id-${String(counter)}`;
@@ -196,7 +248,7 @@ function harness(options: HarnessOptions = {}) {
 		delay: async () => undefined,
 	});
 
-	return { walker, media, verbs, published, changes, dials, filed };
+	return { walker, media, verbs, published, changes, dials, filed, monitors, authorized };
 }
 
 /** The media a `play` verb was given, in order. The one thing a caller actually experiences. */
@@ -740,5 +792,219 @@ describe("voicemail reached from the star-code catalogue", () => {
 
 		expect(outcome.hangupCause).toBe("INVALID_NUMBER_FORMAT");
 		expect(outcome.notes.join(" ")).toContain("found no mailbox for 1001");
+	});
+});
+
+// =================================================================================================
+// `*0` — supervision
+// =================================================================================================
+
+/**
+ * The gate, and the fact that the announcement never tells you which side of it you were on.
+ *
+ * The assertion that carries the security property is a NEGATIVE one, and it is easy to write a
+ * suite that misses it: what matters is not that a denial announces, but that a denial announces the
+ * SAME THING as "nobody is on a call". A `*0` whose two outcomes sounded different would be an
+ * oracle — a handset with no grant could learn, from what it heard, whether extension 1001 is on the
+ * phone right now, which is precisely the fact supervision controls access to.
+ */
+describe("*0 — the supervision gate", () => {
+	const supervise = featureCodeNode("f", { action: "eavesdrop", code: "*0" });
+
+	it("DENIES when the walk has no supervision port, and never falls back to allowing", async () => {
+		// The one port in this file whose absence is not a degradation. Every other missing port means
+		// "the feature cannot run"; this one means "the engine cannot establish that it may".
+		const h = harness({ monitor: { ok: true } });
+		const outcome = await h.walker.walk(walkInput([supervise], { featureArgument: "2002" }));
+
+		expect(h.monitors).toEqual([]);
+		expect(played(h.verbs)).toEqual([UNAVAILABLE]);
+		expect(outcome.hangupCause).toBe("FACILITY_NOT_SUBSCRIBED");
+		expect(outcome.notes.join(" ")).toContain("DENIED");
+	});
+
+	it("asks the gate BEFORE anything about the target is looked up", async () => {
+		const h = harness({ authorize: true, monitor: { ok: true } });
+		await h.walker.walk(walkInput([supervise], { featureArgument: "2002" }));
+
+		expect(h.authorized).toEqual([
+			{
+				organizationId: ORG_ID,
+				extensionNumber: CALLER,
+				targetExtension: "2002",
+				callId: CALL_ID,
+			},
+		]);
+	});
+
+	it("plays the SAME announcement for a denial as for a target who is not on a call", async () => {
+		const denied = harness({ authorize: false, monitor: { ok: true } });
+		await denied.walker.walk(walkInput([supervise], { featureArgument: "2002" }));
+
+		const idle = harness({
+			authorize: true,
+			monitor: { ok: false, reason: "nobody at extension 2002 is on a call" },
+		});
+		await idle.walker.walk(walkInput([supervise], { featureArgument: "2002" }));
+
+		// Identical to the ear. The difference lives in the notes and the responder's log, where the
+		// person who is allowed to know can find it.
+		expect(played(denied.verbs)).toEqual(played(idle.verbs));
+		expect(played(denied.verbs)).toEqual([UNAVAILABLE]);
+		// And a denial never reaches the runtime at all, which is the other half of the same property.
+		expect(denied.monitors).toEqual([]);
+	});
+
+	it("treats an unreachable authorization service as a denial", async () => {
+		const h = harness({ authorize: "throws", monitor: { ok: true } });
+		const outcome = await h.walker.walk(walkInput([supervise], { featureArgument: "2002" }));
+
+		expect(h.monitors).toEqual([]);
+		expect(outcome.hangupCause).toBe("FACILITY_NOT_SUBSCRIBED");
+		expect(outcome.notes.join(" ")).toContain("did not answer");
+	});
+
+	it("refuses with no extension after the code, without asking the gate", async () => {
+		const h = harness({ authorize: true, monitor: { ok: true } });
+		const outcome = await h.walker.walk(walkInput([supervise]));
+
+		expect(h.authorized).toEqual([]);
+		expect(outcome.hangupCause).toBe("INVALID_NUMBER_FORMAT");
+		expect(played(h.verbs)).toEqual([UNAVAILABLE]);
+	});
+
+	it("refuses a *0 dialled against the caller's OWN extension", async () => {
+		// A tap on your own leg bridged to your own leg is a feedback loop the media plane would
+		// happily build.
+		const h = harness({ authorize: true, monitor: { ok: true } });
+		const outcome = await h.walker.walk(walkInput([supervise], { featureArgument: CALLER }));
+
+		expect(h.authorized).toEqual([]);
+		expect(h.monitors).toEqual([]);
+		expect(outcome.notes.join(" ")).toContain("caller's own extension");
+	});
+
+	it("refuses a caller with no number, because there is nobody to authorize", async () => {
+		const h = harness({ callerNumber: null, authorize: true, monitor: { ok: true } });
+		const outcome = await h.walker.walk(walkInput([supervise], { featureArgument: "2002" }));
+
+		expect(h.authorized).toEqual([]);
+		expect(outcome.hangupCause).toBe("INVALID_NUMBER_FORMAT");
+	});
+
+	it("starts SILENT when it is allowed, and ends the walk with the leg up", async () => {
+		const h = harness({ authorize: true, monitor: { ok: true } });
+		const outcome = await h.walker.walk(walkInput([supervise], { featureArgument: "2002" }));
+
+		// `eavesdrop` and nothing else. A supervisor who dialled in must never be audible before they
+		// have decided to be; whisper and barge are reached with the mode keys.
+		expect(h.monitors).toEqual([{ extension: "2002", mode: "eavesdrop" }]);
+		expect(outcome.status).toBe("bridged");
+		// Nothing is played at a supervisor who got what they asked for: the next thing they should
+		// hear is the conversation.
+		expect(played(h.verbs)).toEqual([]);
+	});
+
+	it("announces when the gate allows but the runtime cannot tap", async () => {
+		const h = harness({
+			authorize: true,
+			monitor: { ok: false, reason: "this media plane bridges in proxy-media mode" },
+		});
+		const outcome = await h.walker.walk(walkInput([supervise], { featureArgument: "2002" }));
+
+		expect(outcome.hangupCause).toBe("NORMAL_TEMPORARY_FAILURE");
+		expect(played(h.verbs)).toEqual([UNAVAILABLE]);
+		expect(outcome.notes.join(" ")).toContain("proxy-media");
+	});
+
+	it("refuses when the gate allows but the walk has no call-control runtime", async () => {
+		const h = harness({ authorize: true });
+		const outcome = await h.walker.walk(walkInput([supervise], { featureArgument: "2002" }));
+
+		expect(outcome.hangupCause).toBe("FACILITY_NOT_IMPLEMENTED");
+		expect(played(h.verbs)).toEqual([UNAVAILABLE]);
+	});
+});
+
+// =================================================================================================
+// `*80` — intercom
+// =================================================================================================
+
+/**
+ * The auto-answer headers are the assertion, because they are the entire feature.
+ *
+ * An intercom without them is an ordinary call to the same extension: it rings, somebody picks it
+ * up, and nobody notices anything is wrong until they are asked why the warehouse phone does not
+ * open by itself. So the specs check the ORIGINATE's variables, which is where a header goes on this
+ * media plane, rather than checking that a bridge happened.
+ */
+describe("*80 — intercom", () => {
+	const intercom = featureCodeNode("f", { action: "intercom", code: "*80" });
+
+	it("originates to the extension with BOTH auto-answer headers and bridges", async () => {
+		const h = harness({ control: true });
+		const outcome = await h.walker.walk(
+			walkInput([intercom, extensionNode("ext", { number: "2002" })], {
+				featureArgument: "2002",
+			}),
+		);
+
+		expect(outcome.status).toBe("bridged");
+		const originated = h.media.originated();
+		expect(originated).toHaveLength(1);
+		expect(originated[0]?.endpoint).toBe("PJSIP/2002");
+		// Both, always: three of the five vendor templates match `Alert-Info` and Grandstream matches
+		// `Call-Info`, so either header alone leaves a fleet half-deaf. See `auto-answer.ts`.
+		expect(originated[0]?.variables?.["PJSIP_HEADER(add,Alert-Info)"]).toBe(
+			"info=alert-autoanswer",
+		);
+		expect(originated[0]?.variables?.["PJSIP_HEADER(add,Call-Info)"]).toBe(
+			"<sip:localhost>;answer-after=0",
+		);
+	});
+
+	it("refuses with no extension after the code", async () => {
+		const h = harness({ control: true });
+		const outcome = await h.walker.walk(walkInput([intercom]));
+
+		expect(h.media.originated()).toEqual([]);
+		expect(played(h.verbs)).toEqual([UNAVAILABLE]);
+		expect(outcome.hangupCause).toBe("INVALID_NUMBER_FORMAT");
+	});
+
+	it("refuses an extension this organization's plan does not contain", async () => {
+		// Unknown and disabled are one answer: the compiler leaves a disabled extension out of the
+		// artifact entirely, so "no node" is the only signal the walk gets.
+		const h = harness({ control: true });
+		const outcome = await h.walker.walk(
+			walkInput([intercom, extensionNode("ext", { number: "2002" })], {
+				featureArgument: "3003",
+			}),
+		);
+
+		expect(h.media.originated()).toEqual([]);
+		expect(outcome.hangupCause).toBe("INVALID_NUMBER_FORMAT");
+		expect(outcome.notes.join(" ")).toContain("no extension 3003");
+	});
+
+	it("announces when the handset never auto-answers, and does NOT take its voicemail branch", async () => {
+		// A handset that did not auto-answer has not "failed to answer a call": the caller asked to
+		// speak into a room and the room did not open. Recording a message nobody asked to leave would
+		// be the wrong feature.
+		const h = harness({ control: true, silentOriginate: true });
+		const outcome = await h.walker.walk(
+			walkInput(
+				[
+					intercom,
+					extensionNode("ext", { number: "2002", noAnswerNodeId: "vm" }),
+					voicemailNode("vm", { mailboxNumber: "2002" }),
+				],
+				{ featureArgument: "2002" },
+			),
+		);
+
+		expect(outcome.visited).toEqual(["f"]);
+		expect(outcome.hangupCause).toBe("NO_ANSWER");
+		expect(played(h.verbs)).toEqual([UNAVAILABLE]);
 	});
 });

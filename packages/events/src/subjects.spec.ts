@@ -62,6 +62,8 @@ describe("subject roots", () => {
 			mediaSendDtmf: "rpc.media.v1.send-dtmf",
 			mediaStartRecording: "rpc.media.v1.start-recording",
 			mediaStopRecording: "rpc.media.v1.stop-recording",
+			mediaTapSession: "rpc.media.v1.tap-session",
+			mediaUntapSession: "rpc.media.v1.untap-session",
 			engineOriginate: "rpc.engine.v1.originate",
 			engineParkHandoff: "rpc.engine.v1.park-handoff",
 		});
@@ -427,6 +429,10 @@ describe("event-name guards", () => {
 			"call.transferred",
 			"call.picked-up",
 			"call.emergency.dialed",
+			"call.tap.started",
+			"call.tap.ended",
+			"call.paging.started",
+			"call.paging.ended",
 		]);
 	});
 });

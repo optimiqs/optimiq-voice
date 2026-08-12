@@ -1347,6 +1347,7 @@ async function parkInstance(natsUrl: string, instanceId: string) {
 	const host: CallControlHost = {
 		legFor: (mediaChannelId) => legs.get(mediaChannelId),
 		ringingFor: async () => [],
+		activeCallsFor: () => [],
 		publish: async () => undefined,
 		route: async () => ({ status: "aborted", notes: [] }),
 		parkLotFor: async () => PARK_IT_LOT,

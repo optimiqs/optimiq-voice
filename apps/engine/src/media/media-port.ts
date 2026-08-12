@@ -146,6 +146,111 @@ export interface SnoopRequest {
 }
 
 /**
+ * Which side of a monitored conversation a tap listens to, or speaks to.
+ *
+ * The same `a`/`b` leg roles `packages/telephony` names — the originating side and the side
+ * originated for it — rather than the `in`/`out` of {@link MediaDirection}. That is the whole
+ * distinction this vocabulary exists to draw: a DIRECTION is a property of one channel, and a SIDE
+ * is a party in a conversation. A supervisor coaching "the agent" is making a statement about a
+ * party, and only the adapter below this seam should have to know that on Asterisk the party is
+ * reached by injecting into one direction of one channel.
+ *
+ * `none` is only ever meaningful on `speakTo`.
+ */
+export type TapSide = "a" | "b" | "both" | "none";
+
+/**
+ * A supervisor joining a conversation they are not part of — `*0`, and eavesdrop/whisper/barge.
+ *
+ * ## Why this is not {@link SnoopRequest} with extra fields
+ *
+ * A snoop is a listener glued to ONE leg, because on ARI everything is addressed by channel id and
+ * a tap therefore has to BE a channel. That constraint is Asterisk's, not the domain's, and
+ * `plans/mediad-design.md` §10 question 4 records the decision it forced: `mediad` refuses `snoop`
+ * PERMANENTLY, so a supervision feature built on it would either be built twice or would pin `*0`
+ * to `ENGINE_MEDIA_DRIVER=ari` forever.
+ *
+ * So a tap is specified as what it actually is: an ASYMMETRIC BRIDGE PARTICIPANT. {@link hear} says
+ * which parties reach the supervisor, {@link speakTo} says which parties the supervisor reaches,
+ * and the three features in every PBX brochure are three argument combinations with no branch
+ * between them:
+ *
+ * ```text
+ * eavesdrop   hear: "both"   speakTo: "none"
+ * whisper     hear: "both"   speakTo: <the coached leg>
+ * barge       hear: "both"   speakTo: "both"
+ * ```
+ *
+ * That shape is also, exactly, a mix-minus participant — which is what rung 6 builds — so the day
+ * `mediad` can serve this, it serves it by arriving rather than by renegotiating a contract that
+ * already shipped.
+ *
+ * ## Every id is client-assigned, for the reason they always are here
+ *
+ * On the ARI driver the tap materialises as a snoop CHANNEL that enters the engine's own Stasis
+ * application, and a channel the orchestrator has never heard of is filed as a new inbound call.
+ * So {@link tapChannelId} must be watchable before it exists — the same rule
+ * {@link OriginateRequest.channelId} and {@link SnoopRequest.snoopChannelId} follow, for the same
+ * race. {@link bridgeId} follows from that: the tap and the supervisor's own leg have to meet
+ * somewhere, and a bridge the engine did not name is one it cannot tear down after a restart.
+ *
+ * A driver with no channel concept simply ignores both. That is not a wasted field — it is the
+ * adapter absorbing a difference between two media planes, which is what `MediadMediaPort` already
+ * does for `createBridge` (recorded locally, no round trip, because a relay with no members is
+ * nothing on the wire).
+ */
+export interface TapRequest {
+	/** Client-assigned handle for the tap itself; {@link MediaPort.stopTap} names it. */
+	readonly tapId: string;
+	/** Any leg in the conversation being joined. On ARI this is the leg that is snooped. */
+	readonly targetChannelId: string;
+	/**
+	 * Which side of that conversation {@link targetChannelId} IS.
+	 *
+	 * The datum that makes the side vocabulary implementable on a plane that addresses one channel
+	 * at a time: "speak to the agent" is a direction on this channel only once you know whether
+	 * this channel is the agent. The supervision runtime taps the extension it was asked to
+	 * monitor, so this is `b` on an inbound call and `a` on one that extension placed.
+	 */
+	readonly targetSide: "a" | "b";
+	/** The supervisor's own leg. Whatever the tap hears is joined to THIS. */
+	readonly supervisorChannelId: string;
+	/** Client-assigned identity for the tap participant. See the note above. */
+	readonly tapChannelId: string;
+	/** Client-assigned id for the bridge the tap and the supervisor's leg meet in. */
+	readonly bridgeId: string;
+	/** The application the tap is handed to. Must match the engine's own. */
+	readonly application: string;
+	/** Which parties the supervisor hears. `both` for all three features. */
+	readonly hear: TapSide;
+	/** Which parties hear the supervisor. `none` is the silent case, and is the default one. */
+	readonly speakTo: TapSide;
+	/**
+	 * The feature's own name for this combination — `eavesdrop`, `whisper`, `barge`.
+	 *
+	 * For LOGS only, and deliberately not authoritative: {@link hear} and {@link speakTo} are the
+	 * contract, and a driver that branched on this instead would be able to disagree with them.
+	 * It is carried because "opened a barge on channel X" is a line an operator can read at three
+	 * in the morning and `hear=both speakTo=both` is one they have to decode.
+	 */
+	readonly mode?: string;
+}
+
+/**
+ * A live tap, and everything {@link MediaPort.stopTap} needs to take it down.
+ *
+ * The handle carries the ids rather than the driver remembering them, so `AriMediaAdapter` stays
+ * stateless — a stopTap keyed only by `tapId` would force every driver to hold a map that an engine
+ * restart loses, on a feature whose failure mode is a supervisor silently still listening.
+ */
+export interface TapHandle {
+	readonly tapId: string;
+	/** The media-plane object the tap runs as. Equal to the request's on every driver today. */
+	readonly tapChannelId: string;
+	readonly bridgeId: string;
+}
+
+/**
  * Everything the engine asks a media server to do.
  *
  * Still deliberately small, and still domain-shaped. `transfer` and `park` are absent and will stay
@@ -278,6 +383,31 @@ export interface MediaPort {
 	 * before calling this — see {@link SnoopRequest}.
 	 */
 	snoop(request: SnoopRequest): Promise<OriginatedChannel>;
+
+	/**
+	 * Join a conversation on asymmetric terms — eavesdrop, whisper and barge.
+	 *
+	 * The tap enters the engine's own application on drivers that materialise it as a channel, so
+	 * the caller MUST watch {@link TapRequest.tapChannelId} before calling this. See
+	 * {@link TapRequest} for the whole argument about why this is not `snoop`.
+	 *
+	 * @throws {import("./media-not-supported.error").MediaOperationNotSupportedError} when the
+	 * selected media plane cannot route one participant's audio per peer. The caller ANNOUNCES —
+	 * a supervisor who dialled `*0` and got silence would assume they were listening.
+	 */
+	tap(request: TapRequest): Promise<TapHandle>;
+
+	/**
+	 * Take a tap down, leaving the monitored conversation running.
+	 *
+	 * The one invariant worth stating out loud: this must never end the call being monitored. A
+	 * supervisor hanging up has to leave the customer talking to the agent, and getting that wrong
+	 * would drop live customer calls every time somebody stopped listening.
+	 *
+	 * Idempotent. Stopping a tap that is already gone is a no-op, because the engine retries this
+	 * on teardown and a monitored call that outlived the retry is not a failure.
+	 */
+	stopTap(tap: TapHandle): Promise<void>;
 
 	/**
 	 * Loop this leg's own audio back to it — `*43`, the echo test.

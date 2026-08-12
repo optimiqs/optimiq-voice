@@ -2,6 +2,7 @@ import { createEntityId } from "@optimiq-voice/identifiers";
 import { evaluateTimeCondition, matchPattern } from "@optimiq-voice/routing";
 import { RETRYABLE_HANGUP_CAUSES } from "@optimiq-voice/telephony";
 import { QueueSession } from "../queue/queue-session";
+import { AUTO_ANSWER_VARIABLES } from "./auto-answer";
 import { legSignalKey, recordingSignalKey } from "./call-signals";
 import { DEFAULT_MEDIA_REF_SETTINGS, resolveMediaRef, translateMediaRef } from "./media-refs";
 import { planDestinationOf, sameDestination } from "./plan-destination";
@@ -30,6 +31,7 @@ import type {
 	FollowMePlan,
 	IvrMenuPlanNode,
 	MailboxEntry,
+	PagingPlanNode,
 	PlanNode,
 	PlanNodeId,
 	QueuePlanNode,
@@ -108,11 +110,17 @@ import type {
  * ({@link PlanWalkerDependencies.features}, `lastCaller`, `greetings`, `control`); without one the
  * code announces and says so, which is exactly what it did before this wave.
  *
+ Supervision and intercom joined them in this wave: `*0` authorizes against
+ * {@link PlanWalkerDependencies.supervision} and hands the tap to `control.monitor`, `*80` dials an
+ * extension with the auto-answer headers, and a `paging` node fans out to a whole group.
+ *
  * Placeholder, and honest about it: `voicemail` records but has no MWI and no email; the remaining
- * feature codes (`intercom`, `paging`, `record-toggle`, `eavesdrop`, `transfer`, `queue-toggle`,
- * `agent-status`) answer with an announcement; `application` announces and hangs up. Every one of
- * them adds a line to {@link WalkOutcome.notes}, so a call that hit a gap says so in the log rather
- * than looking like a routing bug.
+ * feature codes (`record-toggle`, `transfer`, `queue-toggle`, `agent-status`, and `paging` as a
+ * CODE rather than a node) answer with an announcement; `application` announces and hangs up; call
+ * screening is implemented behind a default-off setting whose remaining seams
+ * {@link PlanWalker.screenCall} names one by one. Every one of them adds a line to
+ * {@link WalkOutcome.notes}, so a call that hit a gap says so in the log rather than looking like a
+ * routing bug.
  */
 
 /** The A-leg, as the walker sees it. Every member is live: the orchestrator owns the state. */
@@ -193,6 +201,78 @@ export interface WalkerCallControl {
 		readonly cause?: HangupCause;
 		readonly reason?: string;
 	}>;
+	/**
+	 * Joins the A-leg to a conversation somebody else is having — `*0`, and the DTMF escalation
+	 * that follows it.
+	 *
+	 * ## Why this is a seam and not something the walker does itself
+	 *
+	 * For the same reason `pickup` is. The walker holds a PLAN — one call's node table — and a
+	 * supervision request is about a call it has never heard of: finding the live legs of extension
+	 * `1001` means scanning the engine's channel registry, which is instance state the walker
+	 * deliberately has no handle on. The orchestrator owns that index (it is the same scan
+	 * `ringingCandidates` does for `*8`), so it owns this.
+	 *
+	 * The walker's remaining job is the part that IS routing: reading the argument, refusing without
+	 * one, and — before any of this is called — asking whether the caller is allowed. Authorization
+	 * happens on the walker's side of the seam on purpose, so that a future caller of `monitor`
+	 * cannot reach a tap by skipping the gate.
+	 *
+	 * ## The outcome is `bridged` or a reason
+	 *
+	 * `ok` means the supervisor's leg is in a bridge with a tap and the walk is over, exactly as it
+	 * is over after a queue answer. Everything else is a string the walk turns into an announcement:
+	 * nobody is on a call, the media plane cannot tap, the target hung up during setup. None of them
+	 * may end in silence.
+	 */
+	monitor(request: {
+		/** The extension whose conversation is being joined. */
+		readonly extension: string;
+		/** Where the supervisor starts. Always `eavesdrop` from `*0`; DTMF moves it afterwards. */
+		readonly mode: SupervisionMode;
+	}): Promise<{ readonly ok: boolean; readonly reason?: string }>;
+}
+
+/**
+ * What a supervisor is doing to a call they did not place.
+ *
+ * Mirrors `TAP_MODES` in `packages/events` rather than importing it, on the same terms the rest of
+ * this file mirrors domain vocabularies: the walker's contract is with its own callers, and a type
+ * alias here that happened to be structurally identical is exactly what the parity specs are for.
+ */
+export type SupervisionMode = "eavesdrop" | "whisper" | "barge";
+
+/** What the walker asks the control plane before it lets anybody listen. */
+export interface SupervisorAuthzRequest {
+	readonly organizationId: string;
+	/** The handset that dialled `*0`, as the SIP edge authenticated it. A claim — see the port. */
+	readonly extensionNumber: string;
+	/** The extension it asked to monitor. Carried so a denial can name what was refused. */
+	readonly targetExtension: string;
+	/** The supervisor's own call, for correlation in the responder's audit line. */
+	readonly callId?: string;
+}
+
+export interface SupervisorDecision {
+	readonly allowed: boolean;
+	/** Why not. For the LOG and the support ticket; never played to the handset. */
+	readonly reason?: string;
+}
+
+/**
+ * The gate in front of `*0`.
+ *
+ * A port rather than a compiled flag because the answer belongs to the permission model, not to
+ * telephony — see `supervisor-authz.source.ts` for the whole argument. Optional on
+ * {@link PlanWalkerDependencies} in the sense that a walk built without one REFUSES: there is no
+ * "no port, therefore allowed" branch anywhere in this file, and there must never be one.
+ */
+export interface SupervisorAuthzPort {
+	/**
+	 * @returns a decision. Implementations do not throw — a failure is a DENIAL, because the
+	 * alternative is a broker outage during which anyone may listen to anything.
+	 */
+	authorize(request: SupervisorAuthzRequest): Promise<SupervisorDecision>;
 }
 
 /** Deployment-shaped knobs. All of them have defaults; none of them is a routing decision. */
@@ -306,6 +386,46 @@ export interface PlanWalkerSettings {
 	readonly confirmAttempts: number;
 	/** How long one prompt waits for a digit. Long: a mobile's speaker has to reach an ear first. */
 	readonly confirmTimeoutMs: number;
+	/**
+	 * How long an intercom's auto-answered leg has to come up before the code gives up.
+	 *
+	 * Much shorter than an ordinary ring timeout, and that is the point: an intercom that has not
+	 * auto-answered within a few seconds is a handset that is NOT configured to auto-answer, and what
+	 * the caller wants then is to be told so, not to stand there listening to a phone ring across the
+	 * office. Five seconds is roughly two rings — long enough to cover a slow re-registration, short
+	 * enough that the failure is obviously a failure.
+	 */
+	readonly intercomTimeoutSeconds: number;
+	/**
+	 * Whether the CALL SCREENING runtime runs at all. Default `false`, deliberately.
+	 *
+	 * The plumbing is complete — `ExtensionPlanNode.callScreening` is compiled, read, and honoured in
+	 * the documented precedence chain — and the runtime behind this flag is honest but partial; the
+	 * remaining seams are named on {@link PlanWalker.screenCall}. Shipping it default-ON would put
+	 * fifteen seconds of "record your name" on the front of every external call to every extension a
+	 * tenant happened to have ticked the box for, and the first person to find out would be a
+	 * customer. Default-OFF means a tenant who ticked the box gets what they got before (the phone
+	 * rings), which is the safe half of the difference, and a deployment that wants to try the
+	 * feature turns it on knowing what is missing.
+	 */
+	readonly callScreeningEnabled: boolean;
+	/**
+	 * Asked of an external caller before their name is recorded.
+	 *
+	 * `vm-rec-name` is Asterisk's own "record your name after the tone" prompt and is in the core
+	 * sound package, so screening works on a stock install with no prompt pack — the same standard
+	 * the PIN and confirmation prompts hold to.
+	 */
+	readonly screeningRecordPrompt: string;
+	/** Longest name a screened caller may record before the recording is closed as it stands. */
+	readonly screeningRecordSeconds: number;
+	/**
+	 * Played to the CALLEE immediately before the recorded name.
+	 *
+	 * `priv-callerintros` is Asterisk's own "call from" fragment, which is exactly the sentence being
+	 * assembled: this prompt, then the caller's own voice, then the accept/reject question.
+	 */
+	readonly screeningIntroPrompt: string;
 	readonly mediaRefs: MediaRefSettings;
 }
 
@@ -358,6 +478,13 @@ export const DEFAULT_PLAN_WALKER_SETTINGS: PlanWalkerSettings = {
 	confirmAcceptDigit: "1",
 	confirmAttempts: 2,
 	confirmTimeoutMs: 15_000,
+	intercomTimeoutSeconds: 5,
+	// OFF. See the field.
+	callScreeningEnabled: false,
+	// `vm-rec-name` and `priv-callerintros` are both in Asterisk's core sound package.
+	screeningRecordPrompt: "sound:vm-rec-name",
+	screeningRecordSeconds: 5,
+	screeningIntroPrompt: "sound:priv-callerintros",
 	mediaRefs: DEFAULT_MEDIA_REF_SETTINGS,
 };
 
@@ -420,6 +547,20 @@ export interface PlanWalkerDependencies {
 	readonly features?: ExtensionFeaturePort;
 	/** Where `*69` asks who rang. Absent means the code announces, exactly as it did before. */
 	readonly lastCaller?: LastCallerSource;
+	/**
+	 * The gate in front of `*0`.
+	 *
+	 * Optional in the same shape as its neighbours and NOT in the same spirit. Every other optional
+	 * port here degrades to "the feature announces and hangs up"; this one degrades to the same
+	 * announcement for the opposite reason. Absent does not mean "supervision is unconfigured, so
+	 * allow it" — it means the engine has no way to establish that this handset may listen to
+	 * somebody else's conversation, and the only safe reading of that is no.
+	 *
+	 * Written down here because it is the one place in this file where "port is undefined" must be a
+	 * DENIAL rather than a degradation, and the next person adding a supervision path will read this
+	 * declaration before they read the runtime.
+	 */
+	readonly supervision?: SupervisorAuthzPort;
 	/**
 	 * The ACD plane: the roster source, the agent state machine, the queue event publisher and the
 	 * per-process line and cursor.
@@ -799,8 +940,16 @@ interface DialAttempt {
 
 /** What one confirming leg is asked, and how long it is given to answer. */
 interface ConfirmRequest {
-	/** Media URI, already translated. */
-	readonly media: string;
+	/**
+	 * Media URIs, already translated, played in order as ONE prompt.
+	 *
+	 * A list rather than a string because call screening asks a question assembled from three pieces
+	 * — "call from", the caller's own recorded voice, "press 1 to accept" — and the media server
+	 * plays a sequence natively ({@link import("../media/media-port").PlayRequest.media} is already a
+	 * list). Concatenating them into one file would mean rendering audio on the call path; issuing
+	 * three plays would mean three playback handles, and barge-in would stop one of them.
+	 */
+	readonly media: readonly string[];
 	readonly acceptDigit: string;
 	readonly attempts: number;
 	readonly timeoutMs: number;
@@ -1008,6 +1157,9 @@ export class PlanWalker {
 			case "park": {
 				return await this.parkNode(node, input);
 			}
+			case "paging": {
+				return await this.pagingNode(node, input);
+			}
 			default: {
 				// `application`: a real destination with a real runtime that does not exist yet.
 				// Announcing and hanging up is a worse product than the real thing and a better one
@@ -1097,10 +1249,14 @@ export class PlanWalker {
 	 *
 	 * ## What is still not implemented, and says so
 	 *
-	 * `intercom`, `paging`, `record-toggle`, `eavesdrop`, `transfer`, `queue-toggle` and
-	 * `agent-status` announce and add a note. Four of them have runtimes elsewhere in the engine
-	 * (mid-call features, the ACD) that this seam is not yet wired to; the other three have none.
-	 * Either way the caller is told, which is the whole point of the announcement.
+	 * `record-toggle`, `transfer`, `queue-toggle`, `agent-status` and a `paging` CODE that the
+	 * compiler did not point at a `paging` node all announce and add a note. Two of them have
+	 * runtimes elsewhere in the engine (mid-call features, the ACD) that this seam is not yet wired
+	 * to; the rest have none. Either way the caller is told, which is the whole point of the
+	 * announcement.
+	 *
+	 * `eavesdrop` and `intercom` LEFT this list in this wave — see {@link PlanWalker.eavesdropCode}
+	 * and {@link PlanWalker.intercomCode}.
 	 */
 	private async featureCodeNode(
 		node: Extract<PlanNode, { kind: "feature-code" }>,
@@ -1134,6 +1290,12 @@ export class PlanWalker {
 			}
 			case "echo-test": {
 				return await this.echoTestCode(node);
+			}
+			case "eavesdrop": {
+				return await this.eavesdropCode(node, input);
+			}
+			case "intercom": {
+				return await this.intercomCode(node, input);
 			}
 			default: {
 				this.note(`feature code ${node.code} (${node.action}) is not implemented yet`);
@@ -1170,6 +1332,218 @@ export class PlanWalker {
 	 * (`required`), and leaves a message in it — the caller is a colleague dropping a note, not the
 	 * owner, so there is no PIN and no menu.
 	 */
+	/**
+	 * `*0<ext>` — a supervisor listening to somebody else's live call.
+	 *
+	 * ## The order is the security property
+	 *
+	 * Authorize, THEN resolve, THEN tap. Not because it reads better, but because the two obvious
+	 * alternatives both leak. Resolving first and authorizing second turns `*0` into an oracle: a
+	 * handset with no grant learns, from which announcement it hears, whether extension 1001 is on
+	 * the phone right now — which is exactly the fact supervision exists to control access to.
+	 * Tapping first and authorizing second is worse in the way that needs no explanation.
+	 *
+	 * So the gate runs before anything about the target is looked up, and a denial is
+	 * indistinguishable from "nobody is on a call": both play the unavailable announcement, and the
+	 * difference lives in the walk's notes and the responder's log, where the person who is allowed
+	 * to know can find it.
+	 *
+	 * ## A missing port DENIES
+	 *
+	 * See {@link PlanWalkerDependencies.supervision}. Every other optional port here degrades to an
+	 * announcement because the feature cannot run; this one refuses because the engine cannot
+	 * establish that it may. There is deliberately no branch that reads "no port, therefore allow".
+	 *
+	 * ## Where it goes next
+	 *
+	 * The tap and the DTMF escalation live behind {@link WalkerCallControl.monitor}, because both
+	 * need the channel registry and the mid-call feature runtime, which are instance state the
+	 * walker has no handle on. What stays here is what is genuinely routing: the argument, the
+	 * refusals, and the gate.
+	 */
+	private async eavesdropCode(
+		node: Extract<PlanNode, { kind: "feature-code" }>,
+		input: WalkInput,
+	): Promise<StepResult> {
+		const caller = (input.callerIdNumber ?? this.deps.channel.callerIdNumber)?.trim();
+		if (caller === undefined || caller === "") {
+			this.note(
+				`feature code ${node.code} (${node.action}) was dialled by a caller with no number; there is nobody to authorize`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		const target = input.featureArgument?.trim() ?? "";
+		if (target === "") {
+			this.note(`feature code ${node.code} needs the extension whose call is being monitored`);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		if (target === caller) {
+			// Monitoring your own call is either a mis-dial or an attempt to hear your own audio path,
+			// and the media plane would happily build it: a tap on your own leg bridged to your own
+			// leg is a feedback loop. Refused with its own note so the mis-dial is legible.
+			this.note(`feature code ${node.code} was dialled against the caller's own extension`);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		const gate = this.deps.supervision;
+		if (gate === undefined) {
+			this.note(
+				`feature code ${node.code} (${node.action}) was dialled but this walk has no supervision gate; the request is DENIED`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_SUBSCRIBED",
+			);
+		}
+
+		const decision = await gate.authorize({
+			organizationId: this.deps.channel.organizationId,
+			extensionNumber: caller,
+			targetExtension: target,
+			callId: this.deps.channel.callId,
+		});
+		if (!decision.allowed) {
+			this.note(
+				`feature code ${node.code}: extension ${caller} may not monitor ${target} (${decision.reason ?? "no reason given"})`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_SUBSCRIBED",
+			);
+		}
+
+		const control = this.deps.control;
+		if (control === undefined) {
+			this.note(
+				`feature code ${node.code} (${node.action}) was dialled but this walk has no call-control runtime`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"FACILITY_NOT_IMPLEMENTED",
+			);
+		}
+
+		// `*0` always STARTS silent. Whisper and barge are reached by pressing a digit while already
+		// listening, which is the FreeSWITCH convention (`4`/`5`/`6`) the escalation implements — a
+		// supervisor who dials in should never be audible before they have decided to be.
+		const outcome = await control.monitor({ extension: target, mode: "eavesdrop" });
+		if (!outcome.ok) {
+			this.note(
+				`feature code ${node.code}: ${target} could not be monitored (${outcome.reason ?? "no reason given"})`,
+			);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"NORMAL_TEMPORARY_FAILURE",
+			);
+		}
+
+		this.note(`feature code ${node.code}: extension ${caller} is monitoring ${target}`);
+		// The walk is over and the leg is up, exactly as it is after a queue answer or a park: the
+		// supervisor stays in the tap bridge until one side goes away.
+		return { kind: "bridged" };
+	}
+
+	/**
+	 * `*80<ext>` — talk into somebody's speakerphone without them picking it up.
+	 *
+	 * ## It is an ordinary dial with one variable set
+	 *
+	 * Everything about an intercom is an ordinary extension dial — the same endpoint template, the
+	 * same leg hooks and therefore the same B-leg CDR, the same bridge — except that the INVITE
+	 * carries {@link import("./auto-answer").AUTO_ANSWER_VARIABLES}, which asks the handset to answer
+	 * itself. That is deliberately the whole difference: an intercom implemented as its own dial path
+	 * would be a second place for the leg accounting to drift, and a call whose CDR did not say which
+	 * extension it reached because it took the "special" route.
+	 *
+	 * ## The target is resolved from the ARTIFACT, not dialled as digits
+	 *
+	 * `extensionNodeFor` finds the compiled `extension` node for the number, which is what makes an
+	 * unknown or disabled extension a REFUSAL rather than an INVITE to an endpoint the media server
+	 * has never heard of. It also means an intercom can only ever reach an internal extension, which
+	 * is the correct boundary: `*80` plus a mobile number would be an auto-answer request sent to a
+	 * carrier, and there is no such thing.
+	 *
+	 * The extension's own forwarding, DND and follow-me are deliberately NOT honoured — this dials
+	 * the endpoint directly. An intercom that followed a forward would announce into the voicemail of
+	 * a colleague who is not at their desk, or into a mobile in somebody's pocket, and the entire
+	 * premise of the feature is that there is a speaker in a known room.
+	 *
+	 * ## A short deadline, and an announcement when it passes
+	 *
+	 * {@link PlanWalkerSettings.intercomTimeoutSeconds}. A handset that has not auto-answered in a
+	 * few seconds is one that was never configured to, and the caller needs to hear that rather than
+	 * listen to a phone ring somewhere they cannot see.
+	 */
+	private async intercomCode(
+		node: Extract<PlanNode, { kind: "feature-code" }>,
+		input: WalkInput,
+	): Promise<StepResult> {
+		const target = input.featureArgument?.trim() ?? "";
+		if (target === "") {
+			this.note(`feature code ${node.code} needs the extension to talk to`);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		const extension = this.extensionNodeFor(target, input);
+		if (extension === undefined) {
+			// Unknown and DISABLED are the same answer here, and that is not a shortcut: the compiler
+			// leaves a disabled extension out of the artifact entirely, so "no node" is the only signal
+			// this walk gets and inventing a distinction would mean inventing the fact behind it.
+			this.note(`feature code ${node.code}: no extension ${target} in this organization's plan`);
+			return await this.announceAndHangup(
+				this.settings.unavailableAnnouncement,
+				"INVALID_NUMBER_FORMAT",
+			);
+		}
+
+		await this.deps.execute({ verb: "ringing" });
+		this.deps.channel.moveTo("executing");
+
+		const outcome = await this.dialOne(
+			{
+				endpoint: this.endpointForExtension(extension.number),
+				label: `intercom to extension ${extension.number}`,
+				destinationNumber: extension.number,
+				timeoutSeconds: this.settings.intercomTimeoutSeconds,
+				delaySeconds: 0,
+				callerId: this.callerIdFor(input),
+				variables: AUTO_ANSWER_VARIABLES,
+			},
+			0,
+		);
+
+		if (outcome.kind === "answered") {
+			this.note(`feature code ${node.code}: intercom to extension ${extension.number} is up`);
+			return await this.bridgeWith(outcome.mediaChannelId);
+		}
+		if (outcome.kind === "aborted") {
+			return { kind: "aborted" };
+		}
+
+		// Never a branch onto the extension's own no-answer node. A handset that did not auto-answer
+		// has not "not answered a call" — the caller asked to speak into a room and the room did not
+		// open, and sending them to that extension's voicemail would record an announcement nobody
+		// asked to leave.
+		this.note(
+			`feature code ${node.code}: extension ${extension.number} did not auto-answer the intercom (${outcome.kind === "failed" ? outcome.cause : "no answer"})`,
+		);
+		return await this.announceAndHangup(this.settings.unavailableAnnouncement, "NO_ANSWER");
+	}
+
 	private async voicemailCode(
 		node: Extract<PlanNode, { kind: "feature-code" }>,
 		input: WalkInput,
@@ -1877,6 +2251,304 @@ export class PlanWalker {
 	}
 
 	// -------------------------------------------------------------------------------------------
+	// Paging
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * `*81` — one voice into every handset in a group.
+	 *
+	 * ## Why this is NOT `dialSimultaneous`
+	 *
+	 * It looks like a ring-all and it is the opposite of one. `dialSimultaneous` is a RACE: it
+	 * settles on the first answer and hangs every other leg up with `LOSE_RACE`, which is exactly
+	 * right for a ring group and exactly what would silence a page — the first handset to auto-answer
+	 * would win and the other eleven would be cancelled. A page is a FAN-IN: every leg that comes up
+	 * joins the same bridge, and there is no winner.
+	 *
+	 * So the shared primitive is the one below the race, {@link PlanWalker.originate} — the same leg
+	 * hooks, the same CDR-correct B-legs, the same `legSignalKey` subscription established before the
+	 * originate so a fast auto-answer cannot outrun it. What is not reused is the settling logic,
+	 * because the settling logic is the part that is wrong here.
+	 *
+	 * ## One-way pages mute the MEMBERS, and why that is the right primitive
+	 *
+	 * `duplex: false` means the group hears the pager and cannot be heard. There is no "listen only"
+	 * bridge membership in this port, and there does not need to be: `mute(channel, "in")` stops
+	 * audio coming FROM that party (Asterisk's convention, the same one
+	 * {@link import("../media/media-port").TapRequest} documents for `spy`), so a muted member is
+	 * present in the mix as a listener only. Doing it the other way round — muting `out` — would
+	 * deafen the member, which is the entire content of the page.
+	 *
+	 * It is applied per member AFTER they join rather than at originate time, because a mute is a
+	 * property of a live channel and there is nothing to mute before one exists.
+	 *
+	 * A real page would not need any of this. Multicast paging (which every vendor template in
+	 * `apps/api/src/provisioning/catalog/templates/` supports as a key type) sends one RTP stream to
+	 * a multicast group and the handsets play it with no signalling at all — no legs, no bridge, no
+	 * mute, and no per-phone channel on the media server. That is a different feature with a
+	 * different failure mode (no delivery report at all), and it is why `call.paging.started` carries
+	 * `answeredCount`: this implementation can say who actually heard it, and multicast cannot.
+	 *
+	 * ## Zero answered members is not a failure
+	 *
+	 * It is a page nobody heard, which the pager must be told about — they are about to speak into a
+	 * bridge with nothing in it and believe the warehouse was warned. Announced, hung up, and noted.
+	 * The alternative (leaving them talking to an empty bridge) is the exact failure the
+	 * `answeredCount` field exists to make visible.
+	 */
+	private async pagingNode(node: PagingPlanNode, input: WalkInput): Promise<StepResult> {
+		const groupName = node.label ?? node.pagingGroupId;
+		const members = node.members.filter((number) => number.trim() !== "");
+		if (members.length === 0) {
+			this.note(`paging group "${groupName}" has no members to page`);
+			return await this.announceAndHangup(this.settings.unavailableAnnouncement, "NO_ANSWER");
+		}
+
+		if (!(await this.ensureAnswered())) {
+			return { kind: "aborted" };
+		}
+
+		const bridgeId = this.newId();
+		try {
+			await this.deps.media.createBridge({ bridgeId, name: `paging-${node.pagingGroupId}` });
+			await this.deps.media.addToBridge(bridgeId, [this.deps.channel.mediaChannelId]);
+		} catch (error) {
+			this.log("failed to open a paging bridge", { bridgeId, err: String(error) });
+			this.note(`paging group "${groupName}" could not be opened: ${String(error)}`);
+			return { kind: "hangup", cause: "NORMAL_TEMPORARY_FAILURE" };
+		}
+		this.deps.channel.setBridge(bridgeId);
+		this.deps.channel.moveTo("exchanging-media");
+
+		const joined = await this.fanOutPage(node, members, bridgeId, input);
+
+		if (joined.length === 0) {
+			this.deps.channel.setBridge(undefined);
+			await this.destroyBridgeQuietly(bridgeId);
+			this.note(
+				`paging group "${groupName}" was opened but none of its ${String(members.length)} members answered`,
+			);
+			return await this.announceAndHangup(this.settings.unavailableAnnouncement, "NO_ANSWER");
+		}
+
+		const startedAtMs = this.deps.now?.() ?? Date.now();
+		await this.deps.publish("call.paging.started", {
+			legId: this.deps.channel.channelId,
+			pagingGroupId: node.pagingGroupId,
+			pagingGroupName: groupName,
+			...(input.originalDialedNumber === undefined ? {} : { dialed: input.originalDialedNumber }),
+			...(this.deps.channel.callerIdNumber === undefined
+				? {}
+				: { pagerExtension: this.deps.channel.callerIdNumber }),
+			memberCount: members.length,
+			answeredCount: joined.length,
+			oneWay: !node.duplex,
+		});
+
+		this.note(
+			`paging group "${groupName}": ${String(joined.length)} of ${String(members.length)} members joined${node.duplex ? "" : " (one-way)"}`,
+		);
+
+		// The PAGER's own death ends the page. Nothing else is watching this leg: the walk returns
+		// `bridged` and the orchestrator takes over — the same handover a conference join makes.
+		const unwatch = this.deps.signals.watch(
+			legSignalKey(this.deps.channel.mediaChannelId),
+			(signal) => {
+				if ((signal as LegSignal).kind !== "ended") {
+					return;
+				}
+				unwatch();
+				void this.endPage(node, groupName, bridgeId, joined, startedAtMs);
+			},
+		);
+
+		return { kind: "bridged" };
+	}
+
+	/**
+	 * Originates to every member at once and returns the ones that came up.
+	 *
+	 * The whole fan-out settles on ONE deadline — the node's `timeoutSeconds` — rather than per leg,
+	 * because a page is a single event in the room: a handset that joins eight seconds after the
+	 * pager started talking has missed the message, so there is nothing to be gained by waiting for
+	 * it and something to be lost (the pager holding a silent line wondering whether to start).
+	 *
+	 * Each member is joined to the bridge the instant its own leg arrives, not at the end, so the
+	 * phones that ARE quick are already listening while the slow ones are still ringing.
+	 */
+	private async fanOutPage(
+		node: PagingPlanNode,
+		members: readonly string[],
+		bridgeId: string,
+		input: WalkInput,
+	): Promise<readonly string[]> {
+		const channelIds = members.map(() => this.newId());
+		const unwatchers: (() => void)[] = [];
+		const joined = new Set<string>();
+		const settledLegs = new Set<number>();
+		const pending: Promise<void>[] = [];
+
+		let resolveAll: () => void = () => undefined;
+		const everyone = new Promise<void>((resolve) => {
+			resolveAll = resolve;
+		});
+		const legIsSettled = (index: number): void => {
+			settledLegs.add(index);
+			if (settledLegs.size === members.length) {
+				resolveAll();
+			}
+		};
+
+		for (const index of members.keys()) {
+			const channelId = channelIds[index] as string;
+			const number = members[index] as string;
+			unwatchers.push(
+				this.deps.signals.watch(legSignalKey(channelId), (signal) => {
+					const leg = signal as LegSignal;
+					if (leg.kind === "ended") {
+						legIsSettled(index);
+						return;
+					}
+					if ((leg.kind !== "answered" && leg.kind !== "entered") || joined.has(channelId)) {
+						return;
+					}
+					// Claimed once: `entered` and `answered` both arrive for one leg, and adding a
+					// channel to a bridge twice is a second membership the teardown does not know about.
+					joined.add(channelId);
+					pending.push(this.joinPagedMember(node, channelId, number, bridgeId));
+					legIsSettled(index);
+				}),
+			);
+		}
+
+		// Every watcher is in place before the first INVITE, so no handset's auto-answer can outrun
+		// its subscription. The same rule `dialSimultaneous` follows, and the same race.
+		await Promise.all(
+			members.map(async (number, index) => {
+				await this.originate(
+					{
+						endpoint: this.endpointForExtension(number),
+						label: `extension ${number}`,
+						destinationNumber: number,
+						timeoutSeconds: node.timeoutSeconds || this.settings.defaultRingTimeoutSeconds,
+						delaySeconds: 0,
+						callerId: this.callerIdFor(input),
+						variables: AUTO_ANSWER_VARIABLES,
+					},
+					channelIds[index] as string,
+					index,
+					() => {
+						legIsSettled(index);
+					},
+				);
+			}),
+		);
+
+		const deadline = new Promise<void>((resolve) => {
+			const timer = setTimeout(
+				resolve,
+				Math.max(1, node.timeoutSeconds || this.settings.defaultRingTimeoutSeconds) *
+					MILLIS_PER_SECOND,
+			);
+			timer.unref?.();
+		});
+		await Promise.race([everyone, deadline]);
+
+		for (const unwatch of unwatchers) {
+			unwatch();
+		}
+		// The joins started inside the watchers; awaited here so a member that is still being added
+		// when the deadline fires is either in the bridge or reported as failed before the count is
+		// published. A page whose `answeredCount` disagreed with the bridge would be a delivery report
+		// that lies in the direction that matters.
+		await Promise.all(pending);
+
+		// Every leg that never came up is cancelled. `ORIGINATOR_CANCEL` and not `LOSE_RACE`: nobody
+		// lost anything, the page simply started without them.
+		for (const [index, channelId] of channelIds.entries()) {
+			if (joined.has(channelId)) {
+				continue;
+			}
+			settledLegs.add(index);
+			await this.hangupQuietly(channelId, "ORIGINATOR_CANCEL");
+		}
+
+		return channelIds.filter((channelId) => joined.has(channelId));
+	}
+
+	/** Puts one answered member in the bridge, and mutes them when the page is one-way. */
+	private async joinPagedMember(
+		node: PagingPlanNode,
+		channelId: string,
+		number: string,
+		bridgeId: string,
+	): Promise<void> {
+		try {
+			await this.deps.media.addToBridge(bridgeId, [channelId]);
+			this.deps.legs?.bridged(channelId, bridgeId);
+		} catch (error) {
+			this.note(`extension ${number} answered the page but could not be joined: ${String(error)}`);
+			await this.hangupQuietly(channelId, "NORMAL_TEMPORARY_FAILURE");
+			return;
+		}
+		if (node.duplex) {
+			return;
+		}
+		try {
+			// `in` — audio coming FROM the member. See the method note on `pagingNode`.
+			await this.deps.media.mute(channelId, "in");
+		} catch (error) {
+			// A member who cannot be muted is a member the room can hear. Noted rather than dropped:
+			// the page still reaches them, and a one-way page with one live microphone in it is a far
+			// better outcome than one handset fewer.
+			this.note(
+				`extension ${number} joined a one-way page but could not be muted, so they can be heard: ${String(error)}`,
+			);
+		}
+	}
+
+	/** The pager hung up: members are released, the bridge goes, and the page is bounded. */
+	private async endPage(
+		node: PagingPlanNode,
+		groupName: string,
+		bridgeId: string,
+		joined: readonly string[],
+		startedAtMs: number,
+	): Promise<void> {
+		let stillConnected = 0;
+		for (const channelId of joined) {
+			try {
+				if (await this.deps.media.channelExists(channelId)) {
+					stillConnected += 1;
+				}
+			} catch {
+				// An unanswerable "does it exist" is not worth a branch: the member is counted as gone,
+				// and the hangup below tolerates a channel that is already dead either way.
+			}
+			await this.hangupQuietly(channelId, "NORMAL_CLEARING");
+		}
+
+		this.deps.channel.setBridge(undefined);
+		await this.destroyBridgeQuietly(bridgeId);
+
+		await this.deps.publish("call.paging.ended", {
+			legId: this.deps.channel.channelId,
+			pagingGroupId: node.pagingGroupId,
+			pagingGroupName: groupName,
+			durationMs: Math.max(0, (this.deps.now?.() ?? Date.now()) - startedAtMs),
+			answeredCount: stillConnected,
+		});
+	}
+
+	private async destroyBridgeQuietly(bridgeId: string): Promise<void> {
+		try {
+			await this.deps.media.destroyBridge(bridgeId);
+		} catch (error) {
+			this.log("failed to destroy a bridge", { bridgeId, err: String(error) });
+		}
+	}
+
+	// -------------------------------------------------------------------------------------------
 	// IVR
 	// -------------------------------------------------------------------------------------------
 
@@ -2001,6 +2673,9 @@ export class PlanWalker {
 		// After forward-all and DND, before the endpoint: a ladder REPLACES the plain dial. Both of
 		// the checks above outrank it — a user who has switched everything through to a colleague
 		// or gone on do-not-disturb has said something more specific than "find me".
+		if (node.callScreening === true && this.screeningApplies(node, input)) {
+			return await this.screenCall(node, input);
+		}
 		if (node.followMe !== undefined) {
 			return await this.followMeNode(node, node.followMe, input);
 		}
@@ -2027,6 +2702,175 @@ export class PlanWalker {
 			noAnswerNodeId: node.noAnswerNodeId,
 			notRegisteredNodeId: node.notRegisteredNodeId,
 		});
+	}
+
+	/**
+	 * Whether this particular call is one the screen should be applied to.
+	 *
+	 * Two gates, and they are gates for different reasons.
+	 *
+	 * **The setting** ({@link PlanWalkerSettings.callScreeningEnabled}) is off by default and is a
+	 * DEPLOYMENT decision, not a tenant one — see the field for why a partially-landed runtime does
+	 * not ship on by default.
+	 *
+	 * **"External"** is a product rule the artifact deliberately does not express (see
+	 * `ExtensionPlanNode.callScreening`: internal callers are never screened, and that is not
+	 * configurable because it is not a configuration). The definition chosen here is: *the caller's
+	 * number does not name an `extension` node in this artifact.* That is what {@link extensionNodeFor}
+	 * answers, and it is the same test `*69` uses to decide whether a return call is an on-net `goto`
+	 * or an outbound dial — one definition of "one of ours", used twice.
+	 *
+	 * Its limits, stated rather than discovered:
+	 *
+	 * - A caller with NO number is treated as external. That is the safe reading — a withheld number
+	 *   is exactly the call somebody turns screening on for — but it also means a badly-configured
+	 *   trunk that strips caller id would screen every call it delivers.
+	 * - The comparison is exact-string. An internal caller whose number reaches this walk in a
+	 *   different form from the one compiled onto their extension node (a `+E.164` prefix from an
+	 *   inbound route's manipulation, say) reads as external and gets screened. The artifact's number
+	 *   index is the thing that would normalise this, and the walk does not carry it.
+	 * - It says nothing about TRUST. An external caller is not a hostile one and an internal caller is
+	 *   not authenticated by this test; it is a routing fact, and screening is a courtesy feature.
+	 */
+	private screeningApplies(node: ExtensionPlanNode, input: WalkInput): boolean {
+		if (!this.settings.callScreeningEnabled) {
+			this.note(
+				`extension ${node.number} has call screening configured, but this deployment has the screening runtime switched off; the phone was rung`,
+			);
+			return false;
+		}
+		const caller = (input.callerIdNumber ?? this.deps.channel.callerIdNumber)?.trim();
+		if (caller === undefined || caller === "") {
+			return true;
+		}
+		return this.extensionNodeFor(caller, input) === undefined;
+	}
+
+	/**
+	 * Ask an external caller who they are, and let the callee decide.
+	 *
+	 * ## The shape, and why it is the CONFIRMATION machinery rather than a new one
+	 *
+	 * A screen is exactly an answer confirmation with a different question. The walker already has
+	 * one — {@link ConfirmRequest}, used by ring groups and follow-me — and its contract is precisely
+	 * the one screening needs: the callee's leg does not count as ANSWERED until they press the
+	 * accept digit, so a refusal falls through the ordinary dial machinery as a leg that never
+	 * answered and lands on the extension's own `noAnswerNodeId`. That is the required behaviour for
+	 * `2`, for a wrong key, and for silence, with no branch of its own — and it means a screened call
+	 * reaches the same mailbox an unanswered one would.
+	 *
+	 * `attempts: 1`, unlike an ordinary confirmation, and that is the one deliberate difference: a
+	 * confirmation re-asks because a mobile in a pocket may have missed the question, whereas a
+	 * screen has already played the caller's own voice and the callee has decided. Re-asking would
+	 * make `2` mean "ask me again".
+	 *
+	 * ## What is NOT finished, precisely
+	 *
+	 * 1. **The caller hears silence while the callee decides.** The leg is ANSWERED (it had to be, to
+	 *    record) so there is no ringback, and nothing is played over the gap. The seam is one
+	 *    `startMusicOnHold` before the dial and one `stopMusicOnHold` in `bridgeWith`'s
+	 *    `beforeBridge` hook — the same pair a transferred leg already uses — and it is not done here
+	 *    because `beforeBridge` is currently owned by the orchestrator's transfer path and taking it
+	 *    over from inside a node would silently break a transfer that screens.
+	 * 2. **The recorded name is never cleaned up.** It is written to the media server's recording
+	 *    store under a walk-minted id and nothing deletes it, because the engine has no lifecycle for
+	 *    a transient recording — `channel.record.started`/`stopped` exist to hand an object to the
+	 *    uploader, which is the opposite of what this needs. The seam is a `kind: "screening"` on the
+	 *    recording taxonomy in `packages/events` plus a retention rule, and neither exists.
+	 * 3. **A failed recording screens with the intro and no name.** Deliberate: the callee still gets
+	 *    the accept/reject question, which is most of the feature, and refusing the call because a
+	 *    recording failed would drop calls over a media fault. It is noted on the walk.
+	 * 4. **Only the plain dial is screened.** A follow-me ladder outranks screening in the precedence
+	 *    chain above, so a user with both gets the ladder and no screen. That is the honest reading of
+	 *    "a ladder REPLACES the plain dial" and not an oversight — screening every hop of a ladder
+	 *    would ask a mobile to accept a call it is holding to the caller's ear.
+	 */
+	private async screenCall(node: ExtensionPlanNode, input: WalkInput): Promise<StepResult> {
+		if (!(await this.ensureAnswered())) {
+			return { kind: "aborted" };
+		}
+
+		const recordingId = this.newId();
+		const name = await this.recordCallerName(recordingId);
+		if (name === undefined) {
+			this.note(
+				`extension ${node.number}: the screening name recording produced nothing; the callee was asked without it`,
+			);
+		}
+
+		await this.deps.execute({ verb: "ringing" });
+		this.deps.channel.moveTo("executing");
+
+		const outcome = await this.dialSequential(
+			[
+				{
+					endpoint: this.endpointForExtension(node.number),
+					label: `extension ${node.number}`,
+					destinationNumber: node.number,
+					timeoutSeconds: node.timeoutSeconds || this.settings.defaultRingTimeoutSeconds,
+					delaySeconds: 0,
+					callerId: this.callerIdFor(input),
+					confirm: {
+						media: [
+							this.settings.screeningIntroPrompt,
+							...(name === undefined ? [] : [name]),
+							this.settings.confirmPrompt,
+						],
+						acceptDigit: this.settings.confirmAcceptDigit,
+						// One round. See the method note.
+						attempts: 1,
+						timeoutMs: Math.max(1, this.settings.confirmTimeoutMs),
+					},
+				},
+			],
+			[],
+		);
+
+		return await this.settleDial(outcome, {
+			busyNodeId: node.busyNodeId,
+			noAnswerNodeId: node.noAnswerNodeId,
+			notRegisteredNodeId: node.notRegisteredNodeId,
+		});
+	}
+
+	/**
+	 * Records the caller saying their name, and returns it as something the callee's leg can play.
+	 *
+	 * `recording:<name>` is one of the media server's own schemes — `media-refs.ts` lists it among
+	 * `NATIVE_SCHEMES` and passes it through untranslated — so the string this returns is exactly
+	 * what a `play` on the CALLEE's channel needs, with no round trip through the object store and
+	 * no `MediaRef` that would have to be resolved against a mount that is usually not configured.
+	 *
+	 * `undefined` means there is no name to play: the recording failed, produced no audio, or the
+	 * media server refused it. The screen still runs — see {@link screenCall}.
+	 */
+	private async recordCallerName(recordingId: string): Promise<string | undefined> {
+		await this.deps.execute({ verb: "play", media: this.settings.screeningRecordPrompt });
+
+		const maxSeconds = this.settings.screeningRecordSeconds;
+		// Subscribed BEFORE the record call, for the reason every recording path here documents: a
+		// very short recording can finish before the HTTP response arrives.
+		const finished = this.waitForRecording(recordingId, (maxSeconds + 5) * MILLIS_PER_SECOND);
+		try {
+			await this.deps.media.record(this.deps.channel.mediaChannelId, {
+				name: recordingId,
+				format: this.settings.recordingFormat,
+				maxDurationSeconds: maxSeconds,
+				maxSilenceSeconds: 2,
+				beep: true,
+				terminateOn: "#",
+			});
+		} catch (error) {
+			finished.cancel();
+			this.note(`the screening name recording failed to start: ${String(error)}`);
+			return undefined;
+		}
+
+		const result = await finished.promise;
+		if (result.reason === "failed" || result.durationMs <= 0) {
+			return undefined;
+		}
+		return `recording:${recordingId}`;
 	}
 
 	/**
@@ -2183,7 +3027,9 @@ export class PlanWalker {
 	 */
 	private confirmRequest(promptId?: string): ConfirmRequest {
 		return {
-			media: resolveMediaRef({ promptId }, this.settings.mediaRefs) ?? this.settings.confirmPrompt,
+			media: [
+				resolveMediaRef({ promptId }, this.settings.mediaRefs) ?? this.settings.confirmPrompt,
+			],
 			acceptDigit: this.settings.confirmAcceptDigit,
 			attempts: Math.max(1, this.settings.confirmAttempts),
 			timeoutMs: Math.max(1, this.settings.confirmTimeoutMs),
@@ -3511,6 +4357,23 @@ export class PlanWalker {
 			ensureAnswered: async () => await this.ensureAnswered(),
 			play: async (playable: string) =>
 				(await execute({ verb: "play", media: playable })) !== undefined,
+			playToAgent: async (mediaChannelId: string, playable: string) => {
+				// `media.play` directly rather than the `play` VERB, because a verb is bound to the
+				// A-leg — the verb executor's whole context is the channel the walk is routing — and
+				// this plays at a leg the walk originated. The playback ref is minted here for the same
+				// reason it is minted everywhere else in this file: the client names it so it can be
+				// stopped without holding server state, even though nothing stops this one.
+				try {
+					await media.play(mediaChannelId, {
+						media: [playable],
+						playbackRef: this.newId(),
+					});
+					return true;
+				} catch (error) {
+					this.log("failed to whisper to a queue agent", { mediaChannelId, err: String(error) });
+					return false;
+				}
+			},
 			startMusicOnHold: async (mohClass?: string) => {
 				try {
 					await media.startMusicOnHold(channel.mediaChannelId, mohClass);
@@ -4101,7 +4964,7 @@ export class PlanWalker {
 				const playbackRef = this.newId();
 				try {
 					await this.deps.media.play(mediaChannelId, {
-						media: [confirm.media],
+						media: [...confirm.media],
 						playbackRef,
 					});
 				} catch (error) {

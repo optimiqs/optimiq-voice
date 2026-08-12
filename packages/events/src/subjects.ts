@@ -35,6 +35,8 @@ import { createHash } from "node:crypto";
  * rpc.media.v1.send-dtmf
  * rpc.media.v1.start-recording
  * rpc.media.v1.stop-recording
+ * rpc.media.v1.tap-session               engine -> mediad; supervision, as an asymmetric member
+ * rpc.media.v1.untap-session
  * rpc.engine.v1.originate                   api -> engine; ANY instance answers (queue group)
  * rpc.engine.v1.park-handoff.<instanceTok>   engine -> engine; the OWNING instance answers
  * ```
@@ -151,6 +153,20 @@ export const RPC_SUBJECTS = {
 	mediaStartRecording: `rpc.media.${SUBJECT_VERSION}.start-recording`,
 	mediaStopRecording: `rpc.media.${SUBJECT_VERSION}.stop-recording`,
 	/**
+	 * Supervision: a third party joining a live conversation on ASYMMETRIC terms.
+	 *
+	 * The pair behind `*0` — eavesdrop, whisper and barge — and the one media subject on this list
+	 * whose responder cannot serve it yet. It is declared now anyway, in its FULL shape, and that is
+	 * a deliberate decision rather than speculative generality: see `plans/mediad-design.md` §10
+	 * question 4. The short version is that a tap is not a snoop channel. A snoop is a listener glued
+	 * to one leg, which is the only thing ARI can address; a supervisor is a participant whose
+	 * `hear` and `speakTo` differ, which is a statement about a CALL. Rung 6's mixer serves that by
+	 * arriving — a tap is a mix-minus participant — so shipping `*0` against this contract today
+	 * costs the cutover nothing, while shipping it against `snoop` would have cost it the feature.
+	 */
+	mediaTapSession: `rpc.media.${SUBJECT_VERSION}.tap-session`,
+	mediaUntapSession: `rpc.media.${SUBJECT_VERSION}.untap-session`,
+	/**
 	 * Click-to-call: the control plane asking the call engine to place a call.
 	 *
 	 * FLAT, and served on a queue group — the opposite of the entry below it, which is the only
@@ -251,6 +267,35 @@ export const CALL_EVENTS = [
 	 * message needs.
 	 */
 	"call.emergency.dialed",
+	/**
+	 * A supervisor started listening to somebody else's live call. **This is a compliance seam.**
+	 *
+	 * Silent monitoring is the one telephony feature whose entire value depends on the monitored
+	 * parties not noticing, which is exactly why it must leave a trail that does not depend on them
+	 * noticing either. Two-party-consent jurisdictions, PCI-DSS and every call-centre policy
+	 * document ask the same question after the fact — who listened to which call, when, and could
+	 * they be heard? — and the only process that knows is the one that opened the tap.
+	 *
+	 * So it is an event and not a log line: a log line lives on one engine and is rotated away,
+	 * while this rides the `CALLS` stream the audit writer and the webhook dispatcher already
+	 * consume. `mode` is on it because eavesdrop and barge are legally different acts, and it is
+	 * published again on ESCALATION — pressing `5` mid-tap is a new fact, not a continuation.
+	 */
+	"call.tap.started",
+	/** The tap ended. Pairs with `call.tap.started` to bound how long somebody listened. */
+	"call.tap.ended",
+	/**
+	 * A page was opened to a group: every member's handset auto-answered into a one-way bridge.
+	 *
+	 * Distinct from a `conference.joined` per member, which is what a page technically is
+	 * underneath: the fact anybody wants is "the warehouse was paged at 14:02 by extension 1001",
+	 * and rebuilding that from N join events means already knowing which bridge was a page.
+	 * `answeredCount` is how many handsets actually came up, which is the number that matters when
+	 * somebody asks whether the announcement was heard.
+	 */
+	"call.paging.started",
+	/** The page ended and its bridge was torn down. Pairs with `call.paging.started`. */
+	"call.paging.ended",
 ] as const;
 export type CallEvent = (typeof CALL_EVENTS)[number];
 

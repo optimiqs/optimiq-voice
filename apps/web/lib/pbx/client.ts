@@ -34,6 +34,7 @@ import type {
 	MutationEnvelope,
 	OutboundRouteRow,
 	PagedEnvelope,
+	PagingGroupRow,
 	ParkLotRow,
 	PhoneNumberRow,
 	PromptKind,
@@ -192,6 +193,19 @@ export const PBX_RESOURCES = {
 		label: "IVR menu",
 		labelPlural: "IVR menus",
 		permissions: { read: "ivr.read", write: "ivr.write", delete: "ivr.delete" },
+		displayName: (row) => row.name,
+	}),
+	pagingGroups: descriptor<PagingGroupRow>({
+		key: "paging-groups",
+		affectsRouting: true,
+		path: "/paging-groups",
+		label: "paging group",
+		labelPlural: "Paging groups",
+		permissions: {
+			read: "paging-groups.read",
+			write: "paging-groups.write",
+			delete: "paging-groups.delete",
+		},
 		displayName: (row) => row.name,
 	}),
 	ringGroups: descriptor<RingGroupRow>({

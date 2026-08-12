@@ -30,6 +30,10 @@ const (
 	EventTypeCallTransferred      = "call.transferred"
 	EventTypeCallPickedUp         = "call.picked-up"
 	EventTypeCallEmergencyDialed  = "call.emergency.dialed"
+	EventTypeCallTapStarted       = "call.tap.started"
+	EventTypeCallTapEnded         = "call.tap.ended"
+	EventTypeCallPagingStarted    = "call.paging.started"
+	EventTypeCallPagingEnded      = "call.paging.ended"
 )
 
 // ChannelCreatedData is the payload of the "channel.created" event.
@@ -349,4 +353,58 @@ type CallEmergencyDialedData struct {
 	Elin               *string `json:"elin,omitempty"`
 	EmergencyAddressID *string `json:"emergencyAddressId,omitempty"`
 	TrunkName          *string `json:"trunkName,omitempty"`
+}
+
+// CallTapStartedData is the payload of the "call.tap.started" event.
+//
+// Subject: calls.evt.v1.<orgId>.<callId>.call.tap.started
+// Envelope: Envelope[CallTapStartedData]
+type CallTapStartedData struct {
+	LegID               string   `json:"legId"`
+	Mode                TapMode  `json:"mode"`
+	SupervisorExtension string   `json:"supervisorExtension"`
+	TargetExtension     string   `json:"targetExtension"`
+	TargetLegID         *string  `json:"targetLegId,omitempty"`
+	PreviousMode        *TapMode `json:"previousMode,omitempty"`
+	SupervisorCallID    *string  `json:"supervisorCallId,omitempty"`
+}
+
+// CallTapEndedData is the payload of the "call.tap.ended" event.
+//
+// Subject: calls.evt.v1.<orgId>.<callId>.call.tap.ended
+// Envelope: Envelope[CallTapEndedData]
+type CallTapEndedData struct {
+	LegID               string       `json:"legId"`
+	Mode                TapMode      `json:"mode"`
+	SupervisorExtension string       `json:"supervisorExtension"`
+	TargetExtension     string       `json:"targetExtension"`
+	Reason              TapEndReason `json:"reason"`
+	DurationMs          *int         `json:"durationMs,omitempty"`
+}
+
+// CallPagingStartedData is the payload of the "call.paging.started" event.
+//
+// Subject: calls.evt.v1.<orgId>.<callId>.call.paging.started
+// Envelope: Envelope[CallPagingStartedData]
+type CallPagingStartedData struct {
+	LegID           string  `json:"legId"`
+	PagingGroupID   string  `json:"pagingGroupId"`
+	PagingGroupName string  `json:"pagingGroupName"`
+	Dialed          *string `json:"dialed,omitempty"`
+	PagerExtension  *string `json:"pagerExtension,omitempty"`
+	MemberCount     int     `json:"memberCount"`
+	AnsweredCount   int     `json:"answeredCount"`
+	OneWay          bool    `json:"oneWay"`
+}
+
+// CallPagingEndedData is the payload of the "call.paging.ended" event.
+//
+// Subject: calls.evt.v1.<orgId>.<callId>.call.paging.ended
+// Envelope: Envelope[CallPagingEndedData]
+type CallPagingEndedData struct {
+	LegID           string `json:"legId"`
+	PagingGroupID   string `json:"pagingGroupId"`
+	PagingGroupName string `json:"pagingGroupName"`
+	DurationMs      *int   `json:"durationMs,omitempty"`
+	AnsweredCount   *int   `json:"answeredCount,omitempty"`
 }

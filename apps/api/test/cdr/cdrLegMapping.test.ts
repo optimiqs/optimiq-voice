@@ -73,6 +73,21 @@ describe("cdr.leg.write → call_legs", () => {
 		}
 	});
 
+	/**
+	 * A paged leg is attributed, not filed under `unknown`.
+	 *
+	 * Both spellings arrive in practice — `paging` is the plan-node kind the engine copies out of the
+	 * walk, `paging-group` is the `pbx-db` destination type on a row that routed into an announcement
+	 * — and a page produces one leg per member, so getting this wrong would not lose a row here and
+	 * there: it would make `unknown` the second-largest destination in the reports.
+	 */
+	it("attributes a page to the group rather than filing it under unknown", () => {
+		for (const received of ["paging", "paging-group"]) {
+			const result = mapCdrLegWrite(ORG, payload({ destinationType: received }));
+			expect(result.values.destinationType, received).to.equal("paging");
+		}
+	});
+
 	it("maps plan steps that are not destinations to unknown", () => {
 		for (const step of ["playback", "feature-code", "hangup"]) {
 			const result = mapCdrLegWrite(ORG, payload({ destinationType: step }));
@@ -83,9 +98,7 @@ describe("cdr.leg.write → call_legs", () => {
 	it("never produces a destination type the column would refuse", () => {
 		for (const received of ["ring-group", "ivr-menu", "who-knows", "", "playback"]) {
 			const result = mapCdrLegWrite(ORG, payload({ destinationType: received }));
-			expect(CALL_DESTINATION_TYPES as readonly string[]).to.include(
-				result.values.destinationType,
-			);
+			expect(CALL_DESTINATION_TYPES as readonly string[]).to.include(result.values.destinationType);
 		}
 	});
 
@@ -108,7 +121,10 @@ describe("cdr.leg.write → call_legs", () => {
 	});
 
 	it("keeps a non-UUID destination ref in raw instead of discarding it", () => {
-		const result = mapCdrLegWrite(ORG, payload({ destinationType: "external", destinationRef: "+441134960000" }));
+		const result = mapCdrLegWrite(
+			ORG,
+			payload({ destinationType: "external", destinationRef: "+441134960000" }),
+		);
 
 		expect(result.values.destinationRef).to.equal(null);
 		expect(result.values.raw.destinationRefRaw).to.equal("+441134960000");
