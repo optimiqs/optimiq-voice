@@ -23,6 +23,14 @@ export const routes = {
 	routing: "/routing",
 	ivr: "/ivr",
 	ringGroups: "/ring-groups",
+	/**
+	 * Paging groups — one-way announcements and talkback intercom to a set of handsets.
+	 *
+	 * Its own route beside ring groups rather than a tab of one, because the two are gated by
+	 * different permissions (`paging-groups.*` against `ring-groups.*`) and a shared page would need
+	 * a `PAGE_PERMISSIONS` entry that named one of them and hid the other.
+	 */
+	pagingGroups: "/paging-groups",
 	queues: "/queues",
 	voicemail: "/voicemail",
 	conferences: "/conferences",
@@ -71,19 +79,20 @@ export const routes = {
 	routingSettings: "/settings/routing",
 
 	/**
-	 * Detail views, for the four entities that own a child collection.
+	 * Detail views, for the five entities that own a child collection.
 	 *
 	 * Everything else is edited in a dialog over its list, because everything else is one flat row
 	 * — a route for a form with no sub-resource is a page load the user pays for and a back button
-	 * that leaves the list. An IVR menu's options, a ring group's members, a time condition's rules
-	 * and a queue's tiers are collections with their own targets, which a dialog inside a dialog
-	 * cannot hold.
+	 * that leaves the list. An IVR menu's options, a ring group's members, a paging group's
+	 * handsets, a time condition's rules and a queue's tiers are collections with their own
+	 * targets, which a dialog inside a dialog cannot hold.
 	 *
 	 * They are nested under their list's path so `getPagePermissions` inherits the parent's
 	 * requirement by ancestry — `/ivr/<id>` needs `ivr.read` without `PAGE_PERMISSIONS` naming it.
 	 */
 	ivrMenu: (id: string) => `/ivr/${id}`,
 	ringGroup: (id: string) => `/ring-groups/${id}`,
+	pagingGroup: (id: string) => `/paging-groups/${id}`,
 	queue: (id: string) => `/queues/${id}`,
 	timeCondition: (id: string) => `/routing/time-conditions/${id}`,
 

@@ -220,6 +220,23 @@ export function WebhookIcon(props: IconProps) {
 	);
 }
 
+/**
+ * Paging: a megaphone, with the sound leaving it.
+ *
+ * Deliberately not a speaker or a group glyph. `UsersIcon` already means "a set of people" (ring
+ * groups, members) and a paging group is not a set of people — it is an ANNOUNCEMENT made at a set
+ * of handsets, which is the fact an administrator has to hold before they add a member to one.
+ */
+export function MegaphoneIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<path d="M4 10.5v3a1.5 1.5 0 0 0 1.5 1.5H8l8 4.5V6L8 10.5H5.5A1.5 1.5 0 0 0 4 12" />
+			<path d="M8 10.5V15" />
+			<path d="M18.5 9.5a3.5 3.5 0 0 1 0 5" />
+		</Glyph>
+	);
+}
+
 /** A dispatchable location: a map pin. */
 export function LocationIcon(props: IconProps) {
 	return (

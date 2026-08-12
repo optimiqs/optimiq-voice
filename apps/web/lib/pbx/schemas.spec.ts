@@ -14,6 +14,8 @@ import {
 	mohClassFormSchema,
 	mohClassName,
 	outboundRouteFormSchema,
+	pagingGroupFormSchema,
+	pagingGroupMemberFormSchema,
 	parkLotFormSchema,
 	parseDialPatterns,
 	phoneNumberFormSchema,
@@ -83,6 +85,7 @@ describe("optional text", () => {
 			tollClass: "national",
 			recordPolicy: "none",
 			pickupGroup: "",
+			callScreening: false,
 			callTimeoutSeconds: "",
 			maxRegistrations: "",
 			mohClassId: "",
@@ -110,6 +113,7 @@ describe("optional text", () => {
 			tollClass: "national" as const,
 			recordPolicy: "none" as const,
 			pickupGroup: "",
+			callScreening: false,
 			callTimeoutSeconds: "",
 			maxRegistrations: "",
 			mohClassId: "",
@@ -134,6 +138,7 @@ describe("optional text", () => {
 			tollClass: "national" as const,
 			recordPolicy: "none" as const,
 			pickupGroup: "",
+			callScreening: false,
 			callTimeoutSeconds: "4",
 			maxRegistrations: "",
 			mohClassId: "",
@@ -170,6 +175,7 @@ describe("the pickup group", () => {
 		tollClass: "national" as const,
 		recordPolicy: "none" as const,
 		pickupGroup: "",
+		callScreening: false,
 		callTimeoutSeconds: "",
 		maxRegistrations: "",
 		mohClassId: "",
@@ -409,6 +415,7 @@ describe("queueFormSchema", () => {
 		mohClassId: "",
 		greetingPromptId: "",
 		announcePromptId: "",
+		agentWhisperPromptId: "",
 		maxWaitSeconds: "",
 		maxWaitNoAgentSeconds: "",
 		wrapUpSeconds: "",
@@ -533,6 +540,114 @@ describe("queueTierFormSchema", () => {
 		const parsed = queueTierFormSchema.parse(base);
 		expect(parsed.level).toBeNull();
 		expect(parsed.position).toBeNull();
+	});
+});
+
+/**
+ * Paging groups, mirroring `paging-groups.dto.ts`.
+ *
+ * Two facts are asserted here rather than left to a round trip, because both are places where a
+ * paging group looks like a ring group and is not.
+ *
+ * The first is the NUMBER: it is genuinely optional, because a group reachable only through `*81`
+ * has none. A form that required one would make an operator invent digits, and the schema's unique
+ * index would then have them collide with an extension.
+ *
+ * The second is the TIMEOUT's ceiling. 300, not the ring group's 600, and the difference is not a
+ * rounding: a ring group's timeout is how long a HUMAN is given to pick up, while this is how long
+ * an AUTO-ANSWERED leg may take to come up. Copying the ring group's bound here would let a typo
+ * pin fan-out resources open for ten minutes on a group that never waits for anybody.
+ */
+describe("pagingGroupFormSchema", () => {
+	const base = {
+		name: "All handsets",
+		extensionNumber: "",
+		duplex: false,
+		timeoutSeconds: "",
+		enabled: true,
+	};
+
+	it("sends a blank number as null, because *81 is a complete way to reach a group", () => {
+		expect(pagingGroupFormSchema.parse(base).extensionNumber).toBeNull();
+		expect(pagingGroupFormSchema.parse({ ...base, extensionNumber: "8100" }).extensionNumber).toBe(
+			"8100",
+		);
+	});
+
+	it("refuses a number with letters in it", () => {
+		expect(pagingGroupFormSchema.safeParse({ ...base, extensionNumber: "81a0" }).success).toBe(
+			false,
+		);
+	});
+
+	/** `resettable` on the server: an emptied control means "put the default back", which is `null`. */
+	it("turns an emptied timeout into null rather than a zero", () => {
+		expect(pagingGroupFormSchema.parse(base).timeoutSeconds).toBeNull();
+		expect(pagingGroupFormSchema.parse({ ...base, timeoutSeconds: "30" }).timeoutSeconds).toBe(30);
+	});
+
+	it("holds the timeout to the server's 5 and 300, which are not the ring group's", () => {
+		expect(pagingGroupFormSchema.safeParse({ ...base, timeoutSeconds: "4" }).success).toBe(false);
+		expect(pagingGroupFormSchema.safeParse({ ...base, timeoutSeconds: "5" }).success).toBe(true);
+		expect(pagingGroupFormSchema.safeParse({ ...base, timeoutSeconds: "300" }).success).toBe(true);
+		expect(pagingGroupFormSchema.safeParse({ ...base, timeoutSeconds: "301" }).success).toBe(false);
+		expect(pagingGroupFormSchema.safeParse({ ...base, timeoutSeconds: "600" }).success).toBe(false);
+	});
+
+	/**
+	 * There is no destination trio on this form and there must not be one. A page has nowhere to
+	 * continue to, and a strict object is what stops a copied block from adding one silently.
+	 */
+	it("refuses a destination, because a page does not go anywhere when it ends", () => {
+		expect(
+			pagingGroupFormSchema.safeParse({ ...base, timeoutDestinationType: "voicemail" }).success,
+		).toBe(false);
+	});
+});
+
+/**
+ * A member, where the difference from a ring-group member is the whole design.
+ *
+ * A ring group's member is a DESTINATION and may be a mobile over a trunk. A paging member is an
+ * `extension_id` and may not be anything else, because the engine originates an auto-answered leg
+ * to it — an external number cannot be told to pick up. So the reference is REQUIRED here where
+ * every other selector on a PBX form treats blank as "clear it".
+ */
+describe("pagingGroupMemberFormSchema", () => {
+	const id = "019fd5fb-de54-700b-8826-8cf8ab5199af";
+	const base = { extensionId: id, ordinal: "0", enabled: true };
+
+	it("requires an extension, because a member with none pages nobody", () => {
+		expect(pagingGroupMemberFormSchema.safeParse({ ...base, extensionId: "" }).success).toBe(false);
+		expect(pagingGroupMemberFormSchema.safeParse({ ...base, extensionId: "  " }).success).toBe(
+			false,
+		);
+	});
+
+	it("refuses anything that is not a uuid, since the options ARE ids", () => {
+		expect(pagingGroupMemberFormSchema.safeParse({ ...base, extensionId: "1001" }).success).toBe(
+			false,
+		);
+		expect(pagingGroupMemberFormSchema.parse({ ...base, extensionId: ` ${id} ` }).extensionId).toBe(
+			id,
+		);
+	});
+
+	it("holds the ordinal to the server's 0 and 1000, and keeps a zero", () => {
+		expect(pagingGroupMemberFormSchema.parse(base).ordinal).toBe(0);
+		expect(pagingGroupMemberFormSchema.safeParse({ ...base, ordinal: "1000" }).success).toBe(true);
+		expect(pagingGroupMemberFormSchema.safeParse({ ...base, ordinal: "1001" }).success).toBe(false);
+		expect(pagingGroupMemberFormSchema.safeParse({ ...base, ordinal: "-1" }).success).toBe(false);
+	});
+
+	/** A member carries no destination and no timing of its own — both live on the group. */
+	it("refuses a destination and a per-member timeout", () => {
+		expect(
+			pagingGroupMemberFormSchema.safeParse({ ...base, destinationType: "extension" }).success,
+		).toBe(false);
+		expect(pagingGroupMemberFormSchema.safeParse({ ...base, timeoutSeconds: "10" }).success).toBe(
+			false,
+		);
 	});
 });
 
@@ -867,6 +982,7 @@ const AUDIO_REFERENCE_FORMS = [
 			tollClass: "national",
 			recordPolicy: "none",
 			pickupGroup: "",
+			callScreening: false,
 			callTimeoutSeconds: "",
 			maxRegistrations: "",
 			mohClassId: "",
@@ -886,6 +1002,7 @@ const AUDIO_REFERENCE_FORMS = [
 			mohClassId: "",
 			greetingPromptId: "",
 			announcePromptId: "",
+			agentWhisperPromptId: "",
 			maxWaitSeconds: "",
 			maxWaitNoAgentSeconds: "",
 			wrapUpSeconds: "",
@@ -899,7 +1016,11 @@ const AUDIO_REFERENCE_FORMS = [
 			recordEnabled: false,
 			enabled: true,
 		},
-		columns: ["mohClassId", "greetingPromptId", "announcePromptId"],
+		/**
+		 * `agentWhisperPromptId` is the fourth, and it is the one that plays to the OTHER side of the
+		 * bridge — the answering agent alone, never the caller. Same helper, same null-on-blank rule.
+		 */
+		columns: ["mohClassId", "greetingPromptId", "announcePromptId", "agentWhisperPromptId"],
 	},
 	{
 		label: "ringGroupFormSchema",

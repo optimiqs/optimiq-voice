@@ -48,6 +48,7 @@ function defaultsFor(queue: QueueRow | null): QueueFormValues {
 		mohClassId: queue?.mohClassId ?? "",
 		greetingPromptId: queue?.greetingPromptId ?? "",
 		announcePromptId: queue?.announcePromptId ?? "",
+		agentWhisperPromptId: queue?.agentWhisperPromptId ?? "",
 		maxWaitSeconds: seconds(queue?.maxWaitSeconds),
 		maxWaitNoAgentSeconds: seconds(queue?.maxWaitNoAgentSeconds),
 		wrapUpSeconds: seconds(queue?.wrapUpSeconds),
@@ -106,7 +107,7 @@ export function QueueDialog({
 			 * that is `notNull().default(n)`. `undefined` would leave the stored value alone on a
 			 * PATCH, which is a different intent and not the one an emptied input expresses.
 			 *
-			 * The three audio selectors send `null` too, and it means the other thing: those columns
+			 * The four audio selectors send `null` too, and it means the other thing: those columns
 			 * ARE nullable, so an emptied one clears the class or prompt rather than restoring a
 			 * default. Same value on the wire, opposite effect, and the difference is the column's.
 			 */
@@ -117,6 +118,7 @@ export function QueueDialog({
 				mohClassId: parsed.mohClassId,
 				greetingPromptId: parsed.greetingPromptId,
 				announcePromptId: parsed.announcePromptId,
+				agentWhisperPromptId: parsed.agentWhisperPromptId,
 				maxWaitSeconds: parsed.maxWaitSeconds,
 				maxWaitNoAgentSeconds: parsed.maxWaitNoAgentSeconds,
 				wrapUpSeconds: parsed.wrapUpSeconds,
@@ -171,7 +173,7 @@ export function QueueDialog({
 			footerNote={
 				queue === null
 					? "Agents are staffed on the queue's page once it exists, and that is a separate permission. A queue with nobody in it holds callers until the wait cap and then takes the timeout destination."
-					: "Hold music and the two prompts are chosen from the media library. Audio has to be uploaded there before it appears in these lists."
+					: "Hold music and the three prompts are chosen from the media library. Audio has to be uploaded there before it appears in these lists."
 			}
 		>
 			<FormSection title="Queue">
@@ -354,6 +356,36 @@ export function QueueDialog({
 							label="Tell callers their position"
 							description="Read out where they are in the queue at the interval above."
 							disabled={mutation.isPending}
+						/>
+					)}
+				</form.Field>
+			</FormSection>
+
+			{/*
+			 * A section of its own, and the separation is the point rather than tidiness.
+			 *
+			 * Everything above plays to the CALLER. This plays to the answering agent alone, in the
+			 * second between them lifting the handset and saying hello, and the caller hears none of
+			 * it. Filing it under "What the caller hears" would have put a control that must never
+			 * reach the caller in the list of things that do — which is exactly the mistake that turns
+			 * a cue sheet into the customer discovering they reached a routing table.
+			 */}
+			<FormSection
+				title="What the agent hears"
+				description="Played to whoever answers, before the caller is connected. The caller hears nothing of it."
+				columns={1}
+			>
+				<form.Field name="agentWhisperPromptId">
+					{(field) => (
+						<PromptSelect
+							id="queueAgentWhisperPromptId"
+							label="Whisper on answer"
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="Connect the caller straight away"
+							description="Played to the agent alone, before the caller is connected — usually the queue's name, so an agent staffing four queues knows which script to open with instead of guessing in front of the customer."
+							disabled={mutation.isPending}
+							error={errors.agentWhisperPromptId}
 						/>
 					)}
 				</form.Field>

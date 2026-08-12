@@ -619,6 +619,9 @@ async function main(): Promise<void> {
 			"/voicemail",
 			"/ivr",
 			"/ring-groups",
+			// Paging groups, gated by `paging-groups.read` — which the owner used here holds. Only the
+			// list is asserted: a group's detail view needs an id, and the seed does not create one.
+			"/paging-groups",
 			"/queues",
 			"/queues?tab=agents",
 			"/conferences",

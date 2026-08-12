@@ -34,6 +34,7 @@ import type {
 	MutationEnvelope,
 	OutboundRouteRow,
 	PagedEnvelope,
+	PagingGroupMemberRow,
 	PagingGroupRow,
 	ParkLotRow,
 	PhoneNumberRow,
@@ -435,6 +436,27 @@ export const PBX_CHILDREN = {
 		segment: "destinations",
 		label: "member",
 		parentPath: "/ring-groups",
+		displayName: (row) => `Member ${row.ordinal + 1}`,
+		affectsRouting: true,
+	}),
+	/**
+	 * The handsets one announcement reaches.
+	 *
+	 * `segment: "members"` and not `"destinations"`, which is the ring-group spelling and the
+	 * difference is the feature rather than a naming preference: a ring-group member is a
+	 * DESTINATION and may be a mobile over a trunk, while a paging member is an `extension_id`
+	 * foreign key because the engine has to originate an auto-answered leg to a registered endpoint.
+	 * An external number cannot be told to pick up.
+	 *
+	 * `affectsRouting: true` — `paging_group_member` IS in `ROUTING_TABLE_TO_ENTITY` (unlike
+	 * `queue_tier`, the other ordered child), because who a page reaches is compiled into the
+	 * artifact rather than read as live state at dial time.
+	 */
+	pagingGroupMembers: child<PagingGroupMemberRow>({
+		key: "members",
+		segment: "members",
+		label: "member",
+		parentPath: "/paging-groups",
 		displayName: (row) => `Member ${row.ordinal + 1}`,
 		affectsRouting: true,
 	}),

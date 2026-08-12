@@ -207,6 +207,15 @@ function extensionSchema(sipSecretRef: SecretRefField) {
 		 * `null` is the documented "no group, fall back to organization-wide pickup".
 		 */
 		pickupGroup: optionalText(64),
+		/**
+		 * Screen external callers before this extension is rung.
+		 *
+		 * A plain boolean with no conditional partner, unlike `confirmEnabled`/`confirmPromptId` on a
+		 * ring group: the prompts a screen plays are deployment settings on the walker
+		 * (`screeningRecordPrompt`, `screeningIntroPrompt`), not columns on the extension, so there is
+		 * nothing on this form for the switch to gate.
+		 */
+		callScreening: z.boolean(),
 		callTimeoutSeconds: optionalInt(5, 300),
 		maxRegistrations: optionalInt(1, 20),
 		mohClassId: optionalReference(),
@@ -479,9 +488,57 @@ export const ringGroupMemberFormSchema = z.strictObject({
 export type RingGroupMemberFormValues = z.input<typeof ringGroupMemberFormSchema>;
 
 /**
+ * A paging group, mirroring `apps/api/src/pbx/paging-groups/paging-groups.dto.ts`.
+ *
+ * Shorter than its ring-group sibling by exactly the thing that makes it a page rather than a call:
+ * there is no destination trio and no strategy. A page has nowhere to continue to — the pager
+ * speaks, the handsets auto-answer, and the announcement ends when the pager hangs up — so there is
+ * no "when nobody answers" branch to configure, because a page does not wait for an answer.
+ *
+ * `timeoutSeconds` is therefore NOT a ring time. It is how long ONE member's auto-answered leg may
+ * take to come up before it is given up on, which is why the server's ceiling is 300 rather than the
+ * ring group's 600: 600 is how long a HUMAN is given to pick up, and nothing here is waiting for a
+ * human.
+ */
+export const pagingGroupFormSchema = z.strictObject({
+	name: displayName,
+	/**
+	 * Blank is legal and means "no number": a group reachable only through the `*81` feature code has
+	 * none, and forcing one would make an operator invent digits that then collide with an extension.
+	 * {@link optionalDigits} sends that blank as `null`, which the nullable column takes as "clear it".
+	 */
+	extensionNumber: optionalDigits(16),
+	duplex: z.boolean(),
+	timeoutSeconds: optionalInt(5, 300),
+	enabled: z.boolean(),
+});
+export type PagingGroupFormValues = z.input<typeof pagingGroupFormSchema>;
+
+/**
+ * One handset in a group.
+ *
+ * `extensionId` is REQUIRED and is a plain reference rather than a destination, which is the whole
+ * difference from a ring-group member: the engine originates an auto-answered leg to the member, and
+ * only a registered endpoint can be told to pick up. An external number over a trunk cannot, so the
+ * form offers extensions and nothing else.
+ *
+ * Not {@link optionalReference}: blank is not "clear it" here, it is a member that pages nobody.
+ */
+export const pagingGroupMemberFormSchema = z.strictObject({
+	extensionId: z
+		.string()
+		.trim()
+		.min(1, "Required")
+		.refine((value) => z.uuid().safeParse(value).success, "Pick one from the list"),
+	ordinal: optionalInt(0, 1000),
+	enabled: z.boolean(),
+});
+export type PagingGroupMemberFormValues = z.input<typeof pagingGroupMemberFormSchema>;
+
+/**
  * A queue's own settings — everything the DTO calls a knob, and nothing about who answers it.
  *
- * The three audio columns are here now that `/moh-classes` and `/prompts` exist to select from, and
+ * The four audio columns are here now that `/moh-classes` and `/prompts` exist to select from, and
  * they behave differently from every other optional field on this form: an emptied numeric knob
  * sends `null` meaning "put the server default back", while an emptied SELECTOR sends `null`
  * meaning "play nothing at all". Both are `null` on the wire and the difference is entirely in the
@@ -494,6 +551,14 @@ export const queueFormSchema = z.strictObject({
 	mohClassId: optionalReference(),
 	greetingPromptId: optionalReference(),
 	announcePromptId: optionalReference(),
+	/**
+	 * Played to the ANSWERING AGENT alone, before the caller is bridged in.
+	 *
+	 * The same helper as the two above and the opposite side of the bridge: those two play to the
+	 * caller, this one never does. Blank clears it, because the column is nullable — an agent with no
+	 * whisper simply gets the call.
+	 */
+	agentWhisperPromptId: optionalReference(),
 	/** 0 disables the cap and callers wait indefinitely. */
 	maxWaitSeconds: optionalInt(0, 86_400),
 	maxWaitNoAgentSeconds: optionalInt(0, 86_400),

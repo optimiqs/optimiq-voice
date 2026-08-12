@@ -37,6 +37,15 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, PageRequirement>> = {
 	},
 	[routes.ivr]: { permissions: ["ivr.read"] },
 	[routes.ringGroups]: { permissions: ["ring-groups.read"] },
+	/**
+	 * `paging-groups.read`, which is what `PagingGroupsController` guards both the group list and its
+	 * nested `/members` with. NOT `ring-groups.read`, even though the two screens are siblings: a
+	 * role granted one and not the other would otherwise see a nav entry the API refuses.
+	 *
+	 * A group's detail view inherits this by ancestry, because `/paging-groups/<id>` is nested under
+	 * the list's path.
+	 */
+	[routes.pagingGroups]: { permissions: ["paging-groups.read"] },
 	[routes.queues]: { permissions: ["queues.read"] },
 	[routes.voicemail]: { permissions: ["voicemail.read", "voicemail.read.own"] },
 	[routes.conferences]: { permissions: ["conferences.read"] },

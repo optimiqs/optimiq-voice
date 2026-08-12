@@ -317,6 +317,12 @@ const CHILD_TABLES: Readonly<Record<string, string>> = {
 	destinations: "ring_group_destination",
 	rules: "time_condition_rule",
 	tiers: "queue_tier",
+	/**
+	 * The one ordered child that is NOT a `queue_tier` in disguise: `paging_group_member` is in
+	 * `ROUTING_TABLE_TO_ENTITY`, so adding or reordering a handset republishes the artifact, while
+	 * staffing a queue does not. The loop below is what holds the descriptor to that.
+	 */
+	members: "paging_group_member",
 };
 
 describe("affectsRouting, mirrored from @optimiq-voice/routing", () => {

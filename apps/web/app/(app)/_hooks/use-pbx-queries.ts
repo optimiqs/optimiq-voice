@@ -17,6 +17,7 @@ import {
 	getPbx,
 	listPbx,
 	listPbxChildren,
+	reorderPbxChildren,
 	updatePbx,
 	updatePbxChild,
 	type PbxChildDescriptor,
@@ -273,6 +274,35 @@ export function usePbxChildUpdate<TRow>(
 			if (!isFieldAddressable(error)) {
 				toast.error(pbxToastMessage(error, `Could not save the ${child.label}`));
 			}
+		},
+	});
+}
+
+/**
+ * Rewrites a child collection's order in ONE request.
+ *
+ * The mutation takes the COMPLETE list of ids in their new order, because that is what the server
+ * takes: it refuses anything that is not an exact permutation, which turns a stale editor's reorder
+ * into a recoverable 400 rather than a silent scramble. There is deliberately no optimistic update —
+ * the reply carries the collection as the server stored it, and the invalidation below is what puts
+ * it on screen. An optimistic swap would show an order that a refused permutation then reverted,
+ * which is the one moment a drag control must not lie.
+ */
+export function usePbxChildReorder<TRow>(
+	child: PbxChildDescriptor<TRow>,
+	parentResourceKey: string,
+	parentId: string | undefined,
+): UseMutationResult<MutationEnvelope<readonly TRow[]>, Error, readonly string[]> {
+	const invalidate = useInvalidatePbx(parentResourceKey, child.affectsRouting);
+
+	return useMutation({
+		mutationFn: (ids: readonly string[]) => reorderPbxChildren(child, parentId as string, ids),
+		onSuccess: async (result) => {
+			await invalidate();
+			announceSave(result.warnings, "Order saved");
+		},
+		onError: (error) => {
+			toast.error(pbxToastMessage(error, `Could not reorder the ${child.label} list`));
 		},
 	});
 }

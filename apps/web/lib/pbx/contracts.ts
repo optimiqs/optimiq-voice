@@ -306,6 +306,21 @@ export interface ExtensionRow extends EntityRow {
 	 * every form: leaving it blank is the behaviour a tenant had before groups existed.
 	 */
 	readonly pickupGroup: string | null;
+	/**
+	 * Screen EXTERNAL callers before this extension is rung.
+	 *
+	 * The caller records their name, the extension hears "call from <recording>" and presses a key
+	 * to accept; a rejected call takes the same branch an unanswered one would, so the caller meets
+	 * voicemail rather than a dead line. Internal callers are never screened — a colleague already
+	 * arrives with a name on the handset's display.
+	 *
+	 * `false` on a fresh row, because the feature lengthens every inbound call it touches. Note that
+	 * the column being on is not by itself enough: the engine's screening RUNTIME is behind a
+	 * deployment flag that ships off (`callScreeningEnabled` in `plan-walker.ts`), so an extension
+	 * with this set on a default deployment simply rings. The form says so rather than implying a
+	 * behaviour change nobody would observe.
+	 */
+	readonly callScreening: boolean;
 	readonly callTimeoutSeconds: number;
 	readonly maxRegistrations: number;
 	/**
@@ -523,6 +538,14 @@ export interface QueueRow extends EntityRow {
 	readonly mohClassId: string | null;
 	readonly greetingPromptId: string | null;
 	readonly announcePromptId: string | null;
+	/**
+	 * Whisper-on-answer: played to the ANSWERING AGENT alone, before the caller is bridged in.
+	 *
+	 * The opposite side of the bridge from `greetingPromptId` and `announcePromptId`, which both
+	 * play to the caller. A caller who heard the agent's cue sheet ("call from Sales queue") would
+	 * be listening to the routing table, which is the whole reason this is a separate column.
+	 */
+	readonly agentWhisperPromptId: string | null;
 	readonly maxWaitSeconds: number;
 	readonly maxWaitNoAgentSeconds: number;
 	readonly wrapUpSeconds: number;

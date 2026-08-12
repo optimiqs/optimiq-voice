@@ -92,6 +92,7 @@ function defaultsFor(extension: ExtensionRow | null): ExtensionFormValues {
 		tollClass: extension?.tollClass ?? "national",
 		recordPolicy: extension?.recordPolicy ?? "none",
 		pickupGroup: extension?.pickupGroup ?? "",
+		callScreening: extension?.callScreening ?? false,
 		callTimeoutSeconds:
 			extension?.callTimeoutSeconds === undefined ? "" : String(extension.callTimeoutSeconds),
 		maxRegistrations:
@@ -184,6 +185,7 @@ export function ExtensionDialog({
 				 * with nothing on screen disagreeing and `*8` still reaching their old colleagues.
 				 */
 				pickupGroup: parsed.pickupGroup,
+				callScreening: parsed.callScreening,
 				callTimeoutSeconds: parsed.callTimeoutSeconds ?? undefined,
 				maxRegistrations: parsed.maxRegistrations ?? undefined,
 				mohClassId: parsed.mohClassId,
@@ -431,6 +433,34 @@ export function ExtensionDialog({
 							field={field}
 							label="Do not disturb"
 							description="Calls skip this extension entirely."
+							disabled={mutation.isPending}
+						/>
+					)}
+				</form.Field>
+				{/*
+				 * Call screening.
+				 *
+				 * The description says three true things and no more, because every one of them is a
+				 * thing the operator would otherwise find out from a customer:
+				 *
+				 * 1. EXTERNAL callers only. The column's own note calls this a deliberate asymmetry — an
+				 *    internal colleague already arrives with a name on the handset's display, and
+				 *    screening them would put ten seconds on the front of every internal call in the
+				 *    building.
+				 * 2. The engine's screening RUNTIME is behind a deployment flag that ships OFF
+				 *    (`callScreeningEnabled` in `plan-walker.ts`), so on a stock deployment ticking this
+				 *    box changes nothing observable — the phone just rings. Saying "screening is on now"
+				 *    would be a lie the first support call would find.
+				 * 3. A follow-me ladder OUTRANKS screening in the walker's precedence chain, so a user
+				 *    with both gets the ladder and no screen. This dialog has the ladder editor right
+				 *    above, which makes it the one place that has to say so.
+				 */}
+				<form.Field name="callScreening">
+					{(field) => (
+						<SwitchField
+							field={field}
+							label="Screen external callers"
+							description="An outside caller is asked to record their name; this extension hears it and presses a key to accept or reject. A rejected call goes where an unanswered one would, so the caller still reaches voicemail. Internal colleagues are never screened. Two limits worth knowing: the screening runtime ships switched off, so until a deployment enables it this setting is stored and the phone simply rings; and a follow-me ladder replaces the plain dial, so an extension with a ladder is not screened."
 							disabled={mutation.isPending}
 						/>
 					)}

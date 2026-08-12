@@ -6,6 +6,7 @@ import {
 	HistoryIcon,
 	KeyIcon,
 	LedgerIcon,
+	MegaphoneIcon,
 	MenuIcon,
 	MusicIcon,
 	ParkIcon,
@@ -70,6 +71,16 @@ export const NAV_SECTIONS: readonly NavSection[] = [
 			{ title: "Routing", url: routes.routing, icon: RouteIcon },
 			{ title: "IVR menus", url: routes.ivr, icon: MenuIcon },
 			{ title: "Ring groups", url: routes.ringGroups, icon: UsersIcon },
+			/**
+			 * Beside ring groups, because the two answer the same question — "this set of handsets" —
+			 * and an administrator building one has usually just looked at the other.
+			 *
+			 * They are nevertheless opposite in the only way that matters at the handset: a ring group
+			 * RINGS and waits to be answered, a paging group auto-answers and speaks. That is why it is
+			 * a separate entry rather than a tab, and why it carries a megaphone rather than the group
+			 * glyph ring groups use.
+			 */
+			{ title: "Paging groups", url: routes.pagingGroups, icon: MegaphoneIcon },
 			{ title: "Queues", url: routes.queues, icon: QueueIcon },
 		],
 	},
