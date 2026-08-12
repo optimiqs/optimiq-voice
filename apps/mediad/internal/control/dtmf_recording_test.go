@@ -266,22 +266,25 @@ func TestStartRecordingRefusesWhatItCannotDoRatherThanDroppingIt(t *testing.T) {
 		name     string
 		mutate   func(*contract.MediaStartRecordingRequest)
 		contains string
+		// reason defaults to not_supported, which is what every capability refusal answers.
+		reason string
 	}{
 		{
-			// A voicemail whose beep never sounds is a caller talking over the tail of the greeting,
-			// and the first words of every message clipped.
-			name:     "beep, which needs a tone generator",
-			mutate:   func(rq *contract.MediaStartRecordingRequest) { beep := true; rq.Beep = &beep },
-			contains: "tone generator",
-		},
-		{
-			// Ending on a digit needs DTMF DETECTION, the receive half of rung 3, which is not built.
-			name: "terminateOn, which needs DTMF detection",
+			// RUNG 5 CLOSED THE OTHER TWO CASES THAT USED TO BE HERE. `beep` was refused because there
+			// was no tone generator and `terminateOn` because there was no DTMF detector; design doc
+			// §10 questions 10 and 11 recorded that both had to land together or no call would move
+			// off Asterisk, and they did. Both are asserted as SERVED in the tests below this one.
+			//
+			// What is still refused is a terminator no keypad can produce, and it is `bad_request`
+			// rather than `not_supported` for the usual reason: the capability exists and the request
+			// is wrong, so routing the leg to Asterisk would not help.
+			name: "a terminator that is not a DTMF digit",
 			mutate: func(rq *contract.MediaStartRecordingRequest) {
-				hash := "#"
-				rq.TerminateOn = &hash
+				bad := "z"
+				rq.TerminateOn = &bad
 			},
-			contains: "DTMF detection",
+			contains: "DTMF digits",
+			reason:   "bad_request",
 		},
 		{
 			// apps/api serves every recording as audio/wav and copies bytes it never inspects.
@@ -302,8 +305,12 @@ func TestStartRecordingRefusesWhatItCannotDoRatherThanDroppingIt(t *testing.T) {
 				t.Fatalf("%s answered ok; a media plane that quietly did nothing here is the worst "+
 					"defect shape this vocabulary exists to prevent", tc.name)
 			}
-			if response.Reason == nil || string(*response.Reason) != "not_supported" {
-				t.Errorf("reason = %v, want not_supported", response.Reason)
+			wantReason := tc.reason
+			if wantReason == "" {
+				wantReason = "not_supported"
+			}
+			if response.Reason == nil || string(*response.Reason) != wantReason {
+				t.Errorf("reason = %v, want %s", response.Reason, wantReason)
 			}
 			if response.Error == nil || !strings.Contains(*response.Error, tc.contains) {
 				t.Errorf("error = %v, want it to name %q", response.Error, tc.contains)

@@ -6,9 +6,25 @@
 // is what a bridged call is. Playback is the same substrate with a file as the source and recording
 // is the same substrate with a tee; both are later rungs.
 //
-// What it deliberately does NOT have is in plans/mediad-design.md §6: no jitter buffer (a relay
-// must not add one — the receiving endpoint already has one, and two in series make the call
-// worse), no transcoding, no packet loss concealment, no SRTP, no RTCP reading.
+// # What changed at rungs 5, 6 and 7, and what did not
+//
+// The relay is UNCHANGED and that is the design: two legs that agreed on a codec still forward
+// payloads byte for byte with no decode, no buffer and no added latency, exactly as design doc §6
+// requires — "a jitter buffer on a relay adds latency to fix jitter the receiving endpoint's own
+// buffer is already going to fix". What arrived alongside it is a second path, reachable only when
+// something asks for it:
+//
+//   - hold, mute and looping sources (rung 5) — two suppression gates and one field on a playback;
+//   - a CONFERENCE (rung 6) — N sessions decoded, aligned on one clock through a per-leg jitter
+//     buffer, summed with each participant's own contribution subtracted, and re-encoded per leg.
+//     The jitter buffer lives here and NOWHERE else; a bridged call never constructs one;
+//   - TRANSCODING (rung 7) — installed on a bridge only when the two legs answered differently, so
+//     passthrough remains the fast path;
+//   - RTCP is read, and sender reports are sent, which is what makes per-leg loss and round-trip
+//     time knowable at all.
+//
+// Still absent: packet-loss concealment, SRTP (design doc §10 question 18 — a real regression
+// surface now that the Asterisk plane has SDES), and any Opus codec (see internal/audio/g722.go).
 package rtp
 
 import (
@@ -25,6 +41,8 @@ import (
 	"time"
 
 	pionrtp "github.com/pion/rtp"
+
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 )
 
 // Mode is what a Session does with the RTP it receives.
@@ -71,11 +89,24 @@ const (
 	// whatever its own SDP negotiation settled on (see Session.telephoneEventPayloadType). This
 	// constant is what an answer proposes when the offer left the choice open.
 	PayloadTypeTelephoneEvent uint8 = 101
+	// PayloadTypeG722 is ITU-T G.722, RFC 3551 static PT 9. Rung 7.
+	PayloadTypeG722 uint8 = 9
 )
 
-// SupportedPayloadTypes is what a session accepts, in the order it would be offered.
+// FormatDefault is the zero value of audio.Format, restated here so the one place that has to treat
+// "unset" and "µ-law" as the same value can say WHY rather than compare against a literal.
+//
+// They are the same value on purpose: payload type 0 is µ-law, µ-law is the commonest negotiation on
+// earth, and a session constructed before rung 7 named a payload type and no codec. Making the zero
+// value the right answer for those callers is what let the codec field be added without an audit.
+const FormatDefault = audio.FormatULaw
+
+// SupportedPayloadTypes is the STATIC types a session accepts, in the order they would be offered.
+//
+// Opus is deliberately absent and cannot be added: it has no static payload type, so the number a
+// session accepts for it comes from the offer rather than from a list. See internal/sdp.
 func SupportedPayloadTypes() []uint8 {
-	return []uint8{PayloadTypePCMU, PayloadTypePCMA, PayloadTypeTelephoneEvent}
+	return []uint8{PayloadTypePCMU, PayloadTypePCMA, PayloadTypeG722, PayloadTypeTelephoneEvent}
 }
 
 // maxPacketSize bounds one read. A 20 ms G.711 frame is 160 bytes of payload plus a 12-byte
@@ -103,6 +134,24 @@ type Stats struct {
 	// count relayed ones, which are somebody else's digits passing through and are already in
 	// PacketsSent.
 	DtmfPacketsSent uint64
+	// SuppressedByHold counts frames dropped in either direction because the leg is on hold. Rung 5.
+	//
+	// Counted for the same reason SuppressedByPlayback is, and it answers a sharper question: "the
+	// caller says they were on hold for six minutes" is checkable against a number rather than
+	// against a memory.
+	SuppressedByHold uint64
+	// SuppressedByMute counts frames dropped in either direction by an explicit mute. Rung 5.
+	SuppressedByMute uint64
+	// Transcoded counts frames that were decoded and re-encoded on the way to this leg, because the
+	// two ends of the bridge negotiated different codecs. Rung 7.
+	//
+	// A counter rather than a log line because the interesting fact is the RATIO against PacketsSent:
+	// passthrough is the fast path and a deployment where most frames are transcoded is one whose
+	// endpoints are misconfigured, which is visible here and nowhere else.
+	Transcoded uint64
+	// MixedFramesSent counts frames this leg received from a CONFERENCE mix rather than from a
+	// two-party relay. Rung 6.
+	MixedFramesSent uint64
 	// DtmfPacketsReceived counts telephone-event packets that arrived on this session, and
 	// DtmfDigitsReceived counts the keypresses they were de-duplicated into.
 	//
@@ -136,10 +185,14 @@ type Session struct {
 	ports *PortPair
 	log   *slog.Logger
 
-	// audioPayloadType is the ONE G.711 type this session negotiated. Per-session rather than a
+	// audioPayloadType is the ONE audio type this session negotiated. Per-session rather than a
 	// package constant, because negotiation is per leg: one call can have a PCMU A-leg and a PCMA
 	// B-leg, and a session must drop what its own answer did not agree to.
 	audioPayloadType uint8
+	// format is what that payload type MEANS. Separate from the number because rung 7 introduced two
+	// codecs the number alone does not identify: G.722 is static type 9 but Opus is dynamic, so a
+	// payload type is a wire label and this is the codec.
+	format audio.Format
 	// telephoneEventPayloadType is the RFC 4733 type this session negotiated, or 0 for none.
 	telephoneEventPayloadType uint8
 
@@ -205,6 +258,31 @@ type Session struct {
 	// receiver needs to be told a new talkspurt begins rather than left to read the jump as loss.
 	markNextForward atomic.Bool
 
+	// held, mutedIn and mutedOut are rung 5's state. Atomics because the packet path reads all three
+	// per frame; see internal/rtp/hold.go for why hold and mute are separate flags rather than one
+	// mode, and for where each one gates.
+	held     atomic.Bool
+	mutedIn  atomic.Bool
+	mutedOut atomic.Bool
+	// hold serialises the compound hold change — two flags plus a music loop — so an unhold racing a
+	// hold cannot leave the two disagreeing.
+	hold holdState
+
+	// mixMember is this session's seat in a conference, or nil when it is relaying or idle. Rung 6.
+	//
+	// Its presence REPLACES the relay on the receive path: a mixed leg's packets go into a jitter
+	// buffer for the mixer to sample rather than straight out of a peer's socket, which is the whole
+	// structural difference between a two-party bridge and a conference.
+	mixMember atomic.Pointer[Member]
+
+	// transcode translates the peer's payloads into this session's codec, or nil when the two legs
+	// agreed. Rung 7, and nil is the FAST PATH the design keeps: passthrough remains byte-for-byte.
+	transcode atomic.Pointer[Transcoder]
+
+	// quality is the RTCP-facing view of this leg: arrival jitter measured here, and loss, jitter
+	// and round-trip time as the far end reported them. See rtcp.go.
+	quality qualityState
+
 	// newTicker builds the playback pacing clock. Swapped in tests so a prompt is stepped frame by
 	// frame without a suite that sleeps for the length of every clip it plays.
 	newTicker func(time.Duration) (<-chan time.Time, func())
@@ -229,8 +307,12 @@ type Options struct {
 	LegID  string
 	// Mode defaults to ModeRelay.
 	Mode Mode
-	// AudioPayloadType is the negotiated G.711 type. Defaults to PCMU.
+	// AudioPayloadType is the negotiated audio type. Defaults to PCMU.
 	AudioPayloadType uint8
+	// Format is the codec that payload type carries. Zero is FormatULaw, which is also what payload
+	// type 0 means, so a caller that predates rung 7 and sets only the number still gets the right
+	// codec — the one property that let this field be added without touching every call site.
+	Format audio.Format
 	// TelephoneEventPayloadType is the negotiated RFC 4733 type; 0 means the offer had none.
 	TelephoneEventPayloadType uint8
 	// Logger defaults to slog.Default().
@@ -248,6 +330,10 @@ type Options struct {
 	OnDtmf func(*Session, DtmfDigit)
 	// DtmfMaxDigitDuration bounds one detected digit; zero means DefaultDtmfMaxDigitDuration.
 	DtmfMaxDigitDuration time.Duration
+	// MuteIn and MuteOut start the session with one or both suppression gates up, which is what a
+	// leg whose answer was not `sendrecv` needs. Rung 5; see internal/rtp/hold.go.
+	MuteIn  bool
+	MuteOut bool
 }
 
 // NewSession takes ownership of a port pair.
@@ -285,7 +371,15 @@ func NewSession(opts Options) (*Session, error) {
 		ticker = systemTicker
 	}
 
-	return &Session{
+	format := opts.Format
+	if format == FormatDefault {
+		// A caller that named a payload type and no codec meant the codec that type has always meant.
+		// Only the STATIC types can be resolved this way; Opus is dynamic and must be named, which
+		// the control surface does because SDP is where its number comes from.
+		format = formatForStaticPayloadType(opts.AudioPayloadType)
+	}
+
+	session := &Session{
 		ID:                        opts.ID,
 		SSRC:                      ssrc,
 		newTicker:                 ticker,
@@ -295,13 +389,29 @@ func NewSession(opts Options) (*Session, error) {
 		mode:                      mode,
 		ports:                     opts.Ports,
 		audioPayloadType:          opts.AudioPayloadType,
+		format:                    format,
 		telephoneEventPayloadType: opts.TelephoneEventPayloadType,
 		dtmfIn:                    newDtmfDetector(opts.DtmfMaxDigitDuration),
 		onDtmf:                    opts.OnDtmf,
 		log:                       logger.With("sessionId", opts.ID, "rtpPort", opts.Ports.Port, "ssrc", ssrc),
 		done:                      make(chan struct{}),
 		createdAt:                 time.Now(),
-	}, nil
+	}
+	session.mutedIn.Store(opts.MuteIn)
+	session.mutedOut.Store(opts.MuteOut)
+	return session, nil
+}
+
+// formatForStaticPayloadType resolves RFC 3551's static assignments. See NewSession.
+func formatForStaticPayloadType(payloadType uint8) audio.Format {
+	switch payloadType {
+	case PayloadTypePCMA:
+		return audio.FormatALaw
+	case PayloadTypeG722:
+		return audio.FormatG722
+	default:
+		return audio.FormatULaw
+	}
 }
 
 // systemTicker is the production playback clock: a real 20 ms ticker.
@@ -420,6 +530,31 @@ func (s *Session) handlePacket(raw []byte, from *net.UDPAddr) {
 		return
 	}
 
+	// The arrival-jitter estimate, updated for EVERY accepted packet whether or not the leg is
+	// bridged, mixed, held or muted. It is the one measurement that describes the NETWORK rather
+	// than the call, and a leg whose audio is suppressed still has a network under it. See rtcp.go.
+	s.quality.observeArrival(&packet, now, s.clockRate())
+
+	// The DTMF tap, and it is a TAP: the packet carries on into the relay below untouched, so a
+	// digit still crosses a bridge byte for byte the way it has since rung 2. Detection ADDS an
+	// event; it never consumes a packet. It is also here rather than inside the relay, for the same
+	// reason the recording tap is: a leg is entitled to have its keypresses noticed whether or not
+	// it has a peer — an IVR collecting a PIN is a session bridged to nothing at all.
+	//
+	// It runs BEFORE the suppression gate below, and that ordering is the decision rather than an
+	// accident: a muted conference participant pressing `*6` to unmute themselves is the commonest
+	// thing a muted participant ever does, and a gate one line earlier would make the unmute code
+	// unreachable by exactly the people who need it.
+	s.tapDtmf(&packet, now)
+
+	if s.receiveSuppressed() {
+		// Held or muted inbound. The packet was received, counted and measured; it simply does not
+		// enter the conversation — not the peer's ear, not the mix, and not the recording, because a
+		// recording follows the conversation rather than the wire.
+		s.countSuppression()
+		return
+	}
+
 	// The recording tap, and it is HERE rather than in relay for a reason: a leg is recorded whether
 	// or not it is bridged. A voicemail message is a session with no peer at all, and a tap wired
 	// into the forwarding path would produce an empty file for exactly the case recording exists for.
@@ -429,12 +564,13 @@ func (s *Session) handlePacket(raw []byte, from *net.UDPAddr) {
 		recorder.Received(packet.Payload)
 	}
 
-	// The DTMF tap, and it is a TAP: the packet carries on into the relay below untouched, so a
-	// digit still crosses a bridge byte for byte the way it has since rung 2. Detection ADDS an
-	// event; it never consumes a packet. It is also here rather than inside the relay, for the same
-	// reason the recording tap is: a leg is entitled to have its keypresses noticed whether or not
-	// it has a peer — an IVR collecting a PIN is a session bridged to nothing at all.
-	s.tapDtmf(&packet, now)
+	// A seat in a conference REPLACES the relay: the frame goes into this leg's jitter buffer and the
+	// mixer samples it on its own clock. Rung 6, and the structural difference between a bridge and a
+	// conference is exactly this branch.
+	if member := s.mixMember.Load(); member != nil {
+		member.receive(&packet, now)
+		return
+	}
 
 	switch s.mode {
 	case ModeEcho:
@@ -442,6 +578,19 @@ func (s *Session) handlePacket(raw []byte, from *net.UDPAddr) {
 	case ModeRelay:
 		s.relay(&packet)
 	}
+}
+
+// clockRate is the RTP timestamp rate for this session's negotiated codec.
+//
+// 8000 for every codec this service carries, INCLUDING G.722 — RFC 3551 §4.5.2 records the wrong
+// clock rate in G.722's original registration as an error that shipped, and every implementation on
+// earth now depends on it. Opus is the exception at 48000, and it is a method rather than a constant
+// so that adding one does not mean auditing every arithmetic site for an assumption.
+func (s *Session) clockRate() uint32 {
+	if s.format == audio.FormatOpus {
+		return 48000
+	}
+	return audio.SampleRate
 }
 
 // accepts reports whether a payload type is one this session negotiated.
@@ -452,8 +601,17 @@ func (s *Session) accepts(pt uint8) bool {
 	return s.telephoneEventPayloadType != 0 && pt == s.telephoneEventPayloadType
 }
 
-// AudioPayloadType is the G.711 type this session negotiated.
+// AudioPayloadType is the audio payload type this session negotiated.
 func (s *Session) AudioPayloadType() uint8 { return s.audioPayloadType }
+
+// Format is the codec that payload type carries.
+func (s *Session) Format() audio.Format { return s.format }
+
+// MixMember is this session's seat in a conference, or nil.
+func (s *Session) MixMember() *Member { return s.mixMember.Load() }
+
+// Transcoder is the translation installed towards this leg, or nil when the bridge passes through.
+func (s *Session) Transcoder() *Transcoder { return s.transcode.Load() }
 
 // TelephoneEventPayloadType is the RFC 4733 type this session negotiated, or 0.
 func (s *Session) TelephoneEventPayloadType() uint8 { return s.telephoneEventPayloadType }
@@ -518,6 +676,14 @@ func (s *Session) relay(packet *pionrtp.Packet) {
 // own — which is what keeps the two directions of a bridge from sharing anything but the payload
 // bytes.
 func (s *Session) forward(packet *pionrtp.Packet, sourceTelephoneEventPT uint8) {
+	if s.transmitSuppressed() {
+		// Held, or muted outbound. Rung 5. This gate is on the PEER's audio only — a playback still
+		// reaches the leg, which is how hold music gets there at all, and how an engine that
+		// explicitly asked to play a prompt at a muted leg still gets one.
+		s.countSuppression()
+		return
+	}
+
 	if s.dtmfActive() {
 		// A digit is being generated towards this leg. It occupies a SPAN of the outbound timestamp
 		// clock rather than a point — every packet of a digit carries the timestamp it started at —
@@ -547,7 +713,9 @@ func (s *Session) forward(packet *pionrtp.Packet, sourceTelephoneEventPT uint8) 
 	}
 
 	payloadType := packet.PayloadType
-	if sourceTelephoneEventPT != 0 && payloadType == sourceTelephoneEventPT {
+	payload := packet.Payload
+	switch {
+	case sourceTelephoneEventPT != 0 && payloadType == sourceTelephoneEventPT:
 		if s.telephoneEventPayloadType == 0 {
 			// This leg never negotiated telephone-event, so there is no number to send DTMF under.
 			// Dropped rather than sent as audio: an RFC 4733 payload rendered as G.711 is a loud
@@ -556,6 +724,22 @@ func (s *Session) forward(packet *pionrtp.Packet, sourceTelephoneEventPT uint8) 
 			return
 		}
 		payloadType = s.telephoneEventPayloadType
+
+	default:
+		// Rung 7's translation, and NIL IS THE FAST PATH. Two legs that agreed on a codec relay byte
+		// for byte exactly as they have since rung 2 — no decode, no allocation, no added latency —
+		// and the transcoder is installed by Bridge only when the two answers genuinely differ. See
+		// transcode.go for why the timestamp survives the translation unchanged.
+		if coder := s.transcode.Load(); coder != nil {
+			translated, ok := coder.Translate(payload)
+			if !ok {
+				s.count(func(st *Stats) { st.UnsupportedPT++ })
+				return
+			}
+			payload = translated
+			payloadType = s.audioPayloadType
+			s.count(func(st *Stats) { st.Transcoded++ })
+		}
 	}
 
 	// The marker survives the relay, and is additionally FORCED on the first packet after a prompt
@@ -573,7 +757,7 @@ func (s *Session) forward(packet *pionrtp.Packet, sourceTelephoneEventPT uint8) 
 			SSRC:           s.SSRC,
 			Marker:         marker,
 		},
-		Payload: packet.Payload,
+		Payload: payload,
 	}
 
 	encoded, err := out.Marshal()
@@ -589,13 +773,14 @@ func (s *Session) forward(packet *pionrtp.Packet, sourceTelephoneEventPT uint8) 
 		s.log.Debug("cannot relay a packet", "error", err, "remote", to.String())
 		return
 	}
-	s.count(func(st *Stats) { st.PacketsSent++ })
+	s.countSent(uint32(len(payload)))
 
 	// The SEND half of a `both` recording: what this leg was told, which is the other party talking.
-	// Tapped after the write rather than before it, so the file holds what actually went out.
+	// Tapped after the write rather than before it, so the file holds what actually went out — which
+	// is why the TRANSLATED payload is the one recorded on a transcoded bridge.
 	// Telephone-event payloads are excluded for the same reason they are on the receive side.
 	if recorder := s.recording.Load(); recorder != nil && payloadType == s.audioPayloadType {
-		recorder.Sent(packet.Payload)
+		recorder.Sent(payload)
 	}
 }
 
@@ -674,7 +859,7 @@ func (s *Session) echo(packet *pionrtp.Packet, to *net.UDPAddr) {
 		s.log.Debug("cannot send an echo packet", "error", err, "remote", to.String())
 		return
 	}
-	s.count(func(st *Stats) { st.PacketsSent++ })
+	s.countSent(uint32(len(packet.Payload)))
 }
 
 // nextSequence advances and returns this session's outbound RTP sequence number.
@@ -729,6 +914,7 @@ func (s *Session) Summary() SessionSummary {
 		Stats:      s.Stats(),
 		Duration:   time.Since(s.createdAt),
 		RemoteAddr: remote,
+		Quality:    s.Quality(),
 	}
 }
 

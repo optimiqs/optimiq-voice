@@ -31,9 +31,22 @@ import (
 	"strings"
 
 	pionsdp "github.com/pion/sdp/v3"
+
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 )
 
-// Codec is a G.711 variant mediad can carry. v1 has no others; see the package doc.
+// Codec is an audio format mediad can carry.
+//
+// Four of them at rung 7, and they do not all cost the same. PCMU, PCMA and G.722 can be
+// TRANSCODED — bridged to each other, and mixed into a conference — because internal/audio has a
+// codec for each. Opus can only be RELAYED, because this build has no Opus codec and the reason is
+// recorded at length in internal/audio/g722.go: the only complete implementation reachable from Go
+// is a cgo binding, and a C toolchain in this build is a cost with no caller today.
+//
+// Negotiating a codec this service cannot decode is nevertheless correct rather than dishonest. A
+// two-party bridge between two Opus legs is byte-for-byte passthrough, which is the FAST path and
+// needs no codec at all; it is a strictly better outcome than answering PCMU and making both
+// endpoints transcode. Everything that would require decoding it refuses by name.
 type Codec string
 
 const (
@@ -41,14 +54,80 @@ const (
 	CodecPCMU Codec = "PCMU"
 	// CodecPCMA is G.711 A-law, RFC 3551 static payload type 8.
 	CodecPCMA Codec = "PCMA"
+	// CodecG722 is ITU-T G.722 at 64 kbit/s, RFC 3551 static payload type 9. Rung 7.
+	CodecG722 Codec = "G722"
+	// CodecOpus is RFC 6716 Opus. DYNAMIC payload type — it has no static number, so a session
+	// carries whatever the offer used and the answer echoes it.
+	CodecOpus Codec = "opus"
 )
 
+// preferenceOrder is the order mediad would rank codecs in if the offerer expressed no preference.
+//
+// It does not; offer order is preference order (RFC 3264 §5.1) and ParseOffer honours it. This list
+// exists for the one thing that order cannot decide: which codec to prefer among several a
+// deployment's own answer could pick, and it is written NARROWBAND FIRST deliberately. G.722 sounds
+// better and costs more — a wideband leg mixed into a conference is resampled twice and a wideband
+// leg bridged to a narrowband one is transcoded — so it is taken when the far end asked for it
+// first and not otherwise.
+var preferenceOrder = []Codec{CodecPCMU, CodecPCMA, CodecG722, CodecOpus}
+
 // PayloadType is the static RTP payload type for a codec (RFC 3551 Table 4).
+//
+// Zero for Opus, which has none: it is a dynamic type and the session carries the number the offer
+// chose. A caller that needs a payload type for an Opus session must read the OFFER's, which is why
+// Offer carries one.
 func (c Codec) PayloadType() uint8 {
-	if c == CodecPCMA {
+	switch c {
+	case CodecPCMA:
 		return 8
+	case CodecG722:
+		return 9
+	case CodecOpus:
+		return 0
+	default:
+		return 0
 	}
-	return 0
+}
+
+// ClockRate is the RTP timestamp rate the codec's rtpmap advertises.
+//
+// 8000 for G.722, and that is not a typo. RFC 3551 §4.5.2 records the wrong clock rate in G.722's
+// original registration as an error that was left standing because implementations had shipped, and
+// `a=rtpmap:9 G722/16000` is the single most common G.722 interop bug in the industry. The codec
+// samples at 16 kHz; its clock rate is 8000; this function returns the clock rate.
+func (c Codec) ClockRate() int {
+	if c == CodecOpus {
+		return 48000
+	}
+	return 8000
+}
+
+// Format maps a negotiated codec onto the DSP vocabulary internal/audio speaks.
+func (c Codec) Format() audio.Format {
+	switch c {
+	case CodecPCMA:
+		return audio.FormatALaw
+	case CodecG722:
+		return audio.FormatG722
+	case CodecOpus:
+		return audio.FormatOpus
+	default:
+		return audio.FormatULaw
+	}
+}
+
+// CodecForFormat is the inverse, for a caller holding a session's DSP format.
+func CodecForFormat(format audio.Format) Codec {
+	switch format {
+	case audio.FormatALaw:
+		return CodecPCMA
+	case audio.FormatG722:
+		return CodecG722
+	case audio.FormatOpus:
+		return CodecOpus
+	default:
+		return CodecPCMU
+	}
 }
 
 // Direction is an SDP media direction attribute.
@@ -85,9 +164,23 @@ type Offer struct {
 	// endpoint that lists PCMA first is usually on a network where PCMA is what its hardware
 	// encodes natively, and answering PCMU would make it transcode for no reason.
 	Codec Codec
+	// AudioPayloadType is the RTP payload type the chosen codec was offered under.
+	//
+	// Separate from `Codec.PayloadType()` because Opus has no static number: an offer that lists
+	// opus under 111 must be answered under 111, and answering under the codec's "own" type would be
+	// answering with a number the offerer never proposed. For the static codecs the two agree, which
+	// is why this field could be added without changing a single existing answer.
+	AudioPayloadType uint8
 	// TelephoneEventPayloadType is the RFC 4733 dynamic type, when the offer negotiated one.
 	// Zero means the offer carried none, and DTMF for this leg will be inband audio only.
 	TelephoneEventPayloadType uint8
+	// OpusFmtp is the offerer's `a=fmtp` line for Opus, echoed back unchanged when one was given.
+	//
+	// Echoed rather than negotiated, and that is the honest shape for a codec this build only
+	// relays: `maxplaybackrate`, `stereo`, `useinbandfec` and the rest are parameters an Opus ENCODER
+	// acts on, and there is no encoder here. Answering with parameters mediad invented would be
+	// telling the far end something about a stream it is passing through untouched.
+	OpusFmtp string
 	// Direction is the offerer's direction attribute, defaulting to sendrecv per RFC 4566.
 	Direction Direction
 	// RemoteAddress is the `c=`/`m=` address the offerer ADVERTISED.
@@ -100,8 +193,8 @@ type Offer struct {
 	RemoteAddress netip.AddrPort
 }
 
-// supportedStaticTypes maps the two G.711 static payload types to their codec.
-var supportedStaticTypes = map[uint8]Codec{0: CodecPCMU, 8: CodecPCMA}
+// supportedStaticTypes maps the static payload types to their codec (RFC 3551 Table 4).
+var supportedStaticTypes = map[uint8]Codec{0: CodecPCMU, 8: CodecPCMA, 9: CodecG722}
 
 // ParseOffer reads an offer and extracts what mediad negotiates on.
 //
@@ -114,18 +207,18 @@ func ParseOffer(raw string) (Offer, error) {
 		return Offer{}, fmt.Errorf("sdp: parsing the offer: %w", err)
 	}
 
-	audio := firstAudioMedia(&description)
-	if audio == nil {
+	media := firstAudioMedia(&description)
+	if media == nil {
 		return Offer{}, ErrNoAudio
 	}
 
-	offer := Offer{Direction: directionOf(audio, &description)}
+	offer := Offer{Direction: directionOf(media, &description)}
 
 	// Dynamic payload types are only meaningful with an `a=rtpmap`, so both loops read the same
 	// map: static ones are recognised by number, dynamic ones by encoding name.
-	rtpmap := rtpmapOf(audio)
+	rtpmap := rtpmapOf(media)
 
-	for _, format := range audio.MediaName.Formats {
+	for _, format := range media.MediaName.Formats {
 		payloadType, err := strconv.ParseUint(format, 10, 8)
 		if err != nil {
 			// A format token that is not a number is an application/* or a broken offer. Skipped
@@ -136,7 +229,12 @@ func ParseOffer(raw string) (Offer, error) {
 
 		if offer.Codec == "" {
 			if codec, ok := codecFor(pt, rtpmap); ok {
+				// FIRST WINS, which is what makes offer order preference order. An endpoint that
+				// lists G.722 ahead of PCMU is telling us it would rather be wideband, and answering
+				// PCMU because this file happens to check it first would be overriding a preference
+				// the RFC says is the offerer's to express.
 				offer.Codec = codec
+				offer.AudioPayloadType = pt
 			}
 		}
 		if offer.TelephoneEventPayloadType == 0 && isTelephoneEvent(pt, rtpmap) {
@@ -147,8 +245,11 @@ func ParseOffer(raw string) (Offer, error) {
 	if offer.Codec == "" {
 		return Offer{}, ErrNoCommonCodec
 	}
+	if offer.Codec == CodecOpus {
+		offer.OpusFmtp = fmtpFor(media, offer.AudioPayloadType)
+	}
 
-	offer.RemoteAddress = remoteAddressOf(audio, &description)
+	offer.RemoteAddress = remoteAddressOf(media, &description)
 	return offer, nil
 }
 
@@ -164,6 +265,13 @@ func codecFor(pt uint8, rtpmap map[uint8]string) (Codec, bool) {
 			return CodecPCMU, true
 		case "PCMA":
 			return CodecPCMA, true
+		case "G722":
+			return CodecG722, true
+		case "OPUS":
+			// The one codec that CANNOT appear in the static table, because it has no static number.
+			// It is reachable only through an rtpmap, which is why this branch is the whole of Opus's
+			// negotiation.
+			return CodecOpus, true
 		}
 		// An rtpmap that names something else is authoritative: it OVERRIDES the static table, so a
 		// payload type 0 remapped to another codec is not silently treated as PCMU.
@@ -171,6 +279,20 @@ func codecFor(pt uint8, rtpmap map[uint8]string) (Codec, bool) {
 	}
 	codec, ok := supportedStaticTypes[pt]
 	return codec, ok
+}
+
+// fmtpFor finds the `a=fmtp` line for one payload type, or an empty string.
+func fmtpFor(media *pionsdp.MediaDescription, pt uint8) string {
+	prefix := strconv.Itoa(int(pt)) + " "
+	for _, attribute := range media.Attributes {
+		if attribute.Key != "fmtp" {
+			continue
+		}
+		if value := strings.TrimSpace(attribute.Value); strings.HasPrefix(value, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(value, prefix))
+		}
+	}
+	return ""
 }
 
 func isTelephoneEvent(pt uint8, rtpmap map[uint8]string) bool {
@@ -261,9 +383,14 @@ type Answer struct {
 	Address netip.Addr
 	Port    int
 	Codec   Codec
+	// AudioPayloadType is the number to answer the codec under. Zero falls back to the codec's own
+	// static type, which is right for everything except Opus — see Offer.AudioPayloadType.
+	AudioPayloadType uint8
 	// TelephoneEventPayloadType echoes the offer's, when it had one. Zero omits it entirely.
 	TelephoneEventPayloadType uint8
-	Direction                 Direction
+	// OpusFmtp is echoed back when the offer carried one. Ignored for every other codec.
+	OpusFmtp  string
+	Direction Direction
 }
 
 // BuildAnswer renders the answer body.
@@ -291,7 +418,11 @@ type Answer struct {
 //	                        endpoint behind a NAT that has to guess port+1 sometimes guesses wrong.
 func BuildAnswer(answer Answer) string {
 	port := answer.Port
-	formats := strconv.Itoa(int(answer.Codec.PayloadType()))
+	payloadType := answer.AudioPayloadType
+	if payloadType == 0 && answer.Codec != CodecPCMU {
+		payloadType = answer.Codec.PayloadType()
+	}
+	formats := strconv.Itoa(int(payloadType))
 	if answer.TelephoneEventPayloadType != 0 {
 		formats += " " + strconv.Itoa(int(answer.TelephoneEventPayloadType))
 	}
@@ -304,7 +435,18 @@ func BuildAnswer(answer Answer) string {
 	fmt.Fprintf(&body, "c=IN IP4 %s\r\n", answer.Address)
 	body.WriteString("t=0 0\r\n")
 	fmt.Fprintf(&body, "m=audio %d RTP/AVP %s\r\n", port, formats)
-	fmt.Fprintf(&body, "a=rtpmap:%d %s/8000\r\n", answer.Codec.PayloadType(), answer.Codec)
+	if answer.Codec == CodecOpus {
+		// Opus is the one rtpmap with a CHANNEL COUNT, and it is always `/2` whatever the stream
+		// actually carries: RFC 7587 §7 says the parameter is fixed at two and that mono is signalled
+		// through `stereo=0` in the fmtp instead. An answer that wrote `/1` would be rejected by
+		// endpoints that check it.
+		fmt.Fprintf(&body, "a=rtpmap:%d opus/48000/2\r\n", payloadType)
+		if answer.OpusFmtp != "" {
+			fmt.Fprintf(&body, "a=fmtp:%d %s\r\n", payloadType, answer.OpusFmtp)
+		}
+	} else {
+		fmt.Fprintf(&body, "a=rtpmap:%d %s/%d\r\n", payloadType, answer.Codec, answer.Codec.ClockRate())
+	}
 	if answer.TelephoneEventPayloadType != 0 {
 		fmt.Fprintf(&body, "a=rtpmap:%d telephone-event/8000\r\n", answer.TelephoneEventPayloadType)
 		fmt.Fprintf(&body, "a=fmtp:%d 0-16\r\n", answer.TelephoneEventPayloadType)

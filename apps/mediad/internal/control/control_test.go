@@ -78,6 +78,19 @@ type stubSessions struct {
 	recordingStops  []string
 	recording       map[string]string
 	tenancy         map[string][2]string
+
+	// Rung 5's renegotiation record and rung 6's tap pair.
+	directions []directionCall
+	tapErr     error
+	taps       []rtp.TapOptions
+	untaps     []string
+	tapped     map[string]string
+}
+
+type directionCall struct {
+	sessionID string
+	muteIn    bool
+	muteOut   bool
 }
 
 type dtmfCall struct {
@@ -110,6 +123,7 @@ func newStub() *stubSessions {
 		telephoneEventFor: make(map[string]uint8),
 		recording:         make(map[string]string),
 		tenancy:           make(map[string][2]string),
+		tapped:            make(map[string]string),
 		nextPort:          30000,
 	}
 }
@@ -127,9 +141,11 @@ func (s *stubSessions) Allocate(opts rtp.AllocateOptions) (rtp.Descriptor, error
 	s.nextPort += 2
 	s.live[opts.SessionID] = true
 
-	audio := opts.AudioPayloadType
+	payloadType := opts.AudioPayloadType
+	format := opts.Format
 	if s.audioForce != 0 {
-		audio = s.audioForce
+		payloadType = s.audioForce
+		format = formatForPayloadType(payloadType)
 	}
 	mode := rtp.ModeRelay
 	if opts.Inactive {
@@ -142,9 +158,23 @@ func (s *stubSessions) Allocate(opts rtp.AllocateOptions) (rtp.Descriptor, error
 		RTCPPort:                  port + 1,
 		SSRC:                      0xfeedface,
 		Mode:                      mode,
-		AudioPayloadType:          audio,
+		AudioPayloadType:          payloadType,
+		Format:                    format,
 		TelephoneEventPayloadType: opts.TelephoneEventPayloadType,
 	}, nil
+}
+
+// formatForPayloadType is the stub's own version of what SDP negotiation would have decided, for the
+// tests that force a codec onto a leg without going near a socket.
+func formatForPayloadType(payloadType uint8) audio.Format {
+	switch payloadType {
+	case rtp.PayloadTypePCMA:
+		return audio.FormatALaw
+	case rtp.PayloadTypeG722:
+		return audio.FormatG722
+	default:
+		return audio.FormatULaw
+	}
 }
 
 func (s *stubSessions) Bridge(bridgeID, first, second string) error {
@@ -246,6 +276,47 @@ func (s *stubSessions) StopRecording(recordingRef string) (string, bool) {
 	return sessionID, true
 }
 
+// The rung 5 and rung 6 halves. `ApplyDirection` records what a renegotiation asked for so the
+// allocate tests can assert that a `sendonly` offer actually moved the gate rather than merely being
+// accepted; the tap pair stands in for the mixer the same way `Bridge` stands in for the relay.
+
+func (s *stubSessions) ApplyDirection(sessionID string, muteIn, muteOut bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.directions = append(s.directions, directionCall{sessionID, muteIn, muteOut})
+	if !s.live[sessionID] {
+		return rtp.ErrUnknownSession
+	}
+	return nil
+}
+
+func (s *stubSessions) Tap(opts rtp.TapOptions) (rtp.TapResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.taps = append(s.taps, opts)
+	if s.tapErr != nil {
+		return rtp.TapResult{}, s.tapErr
+	}
+	s.tapped[opts.TapID] = opts.TapSessionID
+	return rtp.TapResult{
+		ConferenceID: "conference-" + opts.TargetSessionID,
+		SessionIDs:   []string{opts.TargetSessionID, opts.TapSessionID},
+		Converted:    true,
+	}, nil
+}
+
+func (s *stubSessions) Untap(tapID string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.untaps = append(s.untaps, tapID)
+	sessionID, ok := s.tapped[tapID]
+	if !ok {
+		return "", false
+	}
+	delete(s.tapped, tapID)
+	return sessionID, true
+}
+
 func (s *stubSessions) TelephoneEventPayloadType(sessionID string) (uint8, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -286,6 +357,18 @@ func (s *stubSessions) playbackCalls() []playbackCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]playbackCall(nil), s.playbackStarts...)
+}
+
+func (s *stubSessions) tapCalls() []rtp.TapOptions {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]rtp.TapOptions(nil), s.taps...)
+}
+
+func (s *stubSessions) directionCalls() []directionCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]directionCall(nil), s.directions...)
 }
 
 func (s *stubSessions) allocateCalls() []rtp.AllocateOptions {
@@ -512,10 +595,13 @@ func TestAllocateAnInactiveLeg(t *testing.T) {
 }
 
 func TestAllocateRefusals(t *testing.T) {
-	noG711 := strings.NewReplacer(
-		"m=audio 41000 RTP/AVP 0 8 101", "m=audio 41000 RTP/AVP 9 111",
-		"a=rtpmap:0 PCMU/8000", "a=rtpmap:9 G722/8000",
-		"a=rtpmap:8 PCMA/8000", "a=rtpmap:111 opus/48000/2",
+	// RUNG 7 CHANGED WHAT THIS OFFER HAS TO CONTAIN. It used to be G.722 plus Opus, because those
+	// were the two codecs mediad could not carry; both are negotiable now, so the "no common codec"
+	// case needs codecs this build genuinely has no answer for.
+	noCommonCodec := strings.NewReplacer(
+		"m=audio 41000 RTP/AVP 0 8 101", "m=audio 41000 RTP/AVP 96 97",
+		"a=rtpmap:0 PCMU/8000", "a=rtpmap:96 AMR-WB/16000",
+		"a=rtpmap:8 PCMA/8000", "a=rtpmap:97 iLBC/8000",
 	).Replace(offerBody)
 
 	cases := []struct {
@@ -560,14 +646,7 @@ func TestAllocateRefusals(t *testing.T) {
 			// A perfectly valid offer this media plane cannot serve. The engine's recovery is to
 			// route the leg to Asterisk, not to fix the bytes and retry — a different reason code.
 			name:       "no common codec",
-			mutate:     func(rq *contract.MediaAllocateSessionRequest) { rq.SDPOffer = noG711 },
-			wantReason: control.ReasonNotSupported,
-		},
-		{
-			// Hold is rung 5. Answering sendrecv to a sendonly request would put a held caller back
-			// into the conversation, so it is refused by name rather than downgraded.
-			name:       "hold is not supported yet",
-			mutate:     func(rq *contract.MediaAllocateSessionRequest) { rq.Direction = "sendonly" },
+			mutate:     func(rq *contract.MediaAllocateSessionRequest) { rq.SDPOffer = noCommonCodec },
 			wantReason: control.ReasonNotSupported,
 		},
 		{

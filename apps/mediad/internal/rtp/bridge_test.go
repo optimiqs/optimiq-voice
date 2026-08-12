@@ -12,6 +12,7 @@ import (
 
 	pionrtp "github.com/pion/rtp"
 
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
 
@@ -440,15 +441,42 @@ func TestBridgeRefusals(t *testing.T) {
 		}
 	})
 
-	t.Run("codec mismatch", func(t *testing.T) {
-		// design doc §7: a mismatch is resolved by REFUSING, never by resampling in the media path.
-		// Relaying µ-law bytes to a leg expecting A-law would deliver audible noise.
+	t.Run("a codec mismatch is now TRANSLATED rather than refused", func(t *testing.T) {
+		// RUNG 7 CHANGED THIS ASSERTION, and the change is the rung. Design doc §7 said "a codec
+		// mismatch is resolved in SDP negotiation by refusing the offer, not in the media path by
+		// resampling", which was right while there was no decode path anywhere in the service. Rung 6
+		// built one for the mixer, so the premise is gone and the refusal with it: the bridge is
+		// accepted and a translation is installed on each direction.
 		rig := newBridgeRigWithTypes(t, 56200, 56219,
 			rtp.PayloadTypePCMU, 101,
 			rtp.PayloadTypePCMA, 101)
-		err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID)
-		if !errors.Is(err, rtp.ErrCodecMismatch) {
-			t.Errorf("Bridge error = %v, want ErrCodecMismatch", err)
+		if err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID); err != nil {
+			t.Fatalf("Bridge: %v", err)
+		}
+
+		a, _ := rig.manager.Get(rig.aID)
+		b, _ := rig.manager.Get(rig.bID)
+		if a.Transcoder() == nil || b.Transcoder() == nil {
+			t.Fatal("a mismatched bridge installed no translation, so one party would hear noise")
+		}
+		if got := a.Transcoder().To(); got != audio.FormatULaw {
+			t.Errorf("the A leg is fed %s, want PCMU: a transcoder is installed on its DESTINATION", got)
+		}
+		if got := b.Transcoder().To(); got != audio.FormatALaw {
+			t.Errorf("the B leg is fed %s, want PCMA", got)
+		}
+	})
+
+	t.Run("two legs that agreed keep the passthrough fast path", func(t *testing.T) {
+		// The other half of the rung, and the more important one: rung 7 must not slow rung 2 down.
+		// A nil transcoder is what makes `forward` copy the payload byte for byte.
+		rig := newBridgeRig(t, 56260, 56279)
+		if err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID); err != nil {
+			t.Fatalf("Bridge: %v", err)
+		}
+		a, _ := rig.manager.Get(rig.aID)
+		if a.Transcoder() != nil {
+			t.Error("two agreeing legs installed a transcoder; passthrough is the fast path")
 		}
 	})
 

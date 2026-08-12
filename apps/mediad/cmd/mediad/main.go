@@ -1,15 +1,15 @@
 // Command mediad is the Optimiq Voice media plane (plan §3.4, PG track).
 //
-// It serves rung 2 of plans/mediad-design.md §2 — BRIDGED CALLS. It answers `rpc.media.v1.*` with
-// SDP (G.711 passthrough plus RFC 4733), allocates RTP/RTCP port pairs from a configured range,
-// learns each far end from the packets themselves, relays between two sessions, and publishes
-// `media.evt.v1.*` when a session ends or its audio stops. Which mediad instance holds which session
-// is recorded in the `media-sessions` KV directory, so the commands after an allocate reach the one
-// instance that can serve them.
+// It serves rungs 1 through 7 of plans/mediad-design.md §2. It answers `rpc.media.v1.*` with SDP
+// (G.711 and G.722 with transcoding, Opus negotiated and relayed, RFC 4733 alongside), allocates
+// RTP/RTCP port pairs from a configured range, learns each far end from the packets themselves,
+// relays between two sessions or MIXES N of them with mix-minus, reads RTCP for per-leg loss and
+// round-trip time, and publishes `media.evt.v1.*` when a session ends or its audio stops. Which
+// mediad instance holds which session is recorded in the `media-sessions` KV directory, so the
+// commands after an allocate reach the one instance that can serve them.
 //
-// The rungs above this one (recording → MOH/park → conference mix-minus → Opus/G.722 → T.38) are
-// still Asterisk's, and Asterisk keeps serving every real call until each is proven. The engine
-// chooses per deployment with ENGINE_MEDIA_DRIVER.
+// Rung 8 (T.38 fax) is still Asterisk's, and Asterisk keeps serving every real call until each rung
+// is proven. The engine chooses per deployment with ENGINE_MEDIA_DRIVER.
 //
 // Configuration is entirely environmental; run with no arguments.
 package main
@@ -198,6 +198,8 @@ func run() error {
 			control.SubjectSendDtmf,
 			control.SubjectStartRecording,
 			control.SubjectStopRecording,
+			control.SubjectTapSession,
+			control.SubjectUntapSession,
 		},
 		"soundsDir", cfg.SoundsDir,
 		"recordingsDir", cfg.RecordingsDir,
@@ -211,10 +213,11 @@ func run() error {
 		log.Warn("MEDIAD_ECHO_DIAGNOSTIC is on: every session ECHOES and no call will connect. " +
 			"This is a diagnostic mode; turn it off to serve traffic.")
 	}
-	log.Info("mediad serves rungs 1-4 (playback, bridged calls, DTMF generation and recording): " +
-		"G.711 passthrough, RFC 4733 DTMF both ways, two-party relay, WAV prompts and WAV " +
-		"recordings. DTMF DETECTION, MOH, conferencing and T.38 are still Asterisk's — see " +
-		"plans/mediad-design.md")
+	log.Info("mediad serves rungs 1-7: two-party relay, WAV prompts and generated tones, RFC 4733 " +
+		"DTMF both ways, WAV recording with beep and digit termination, hold/mute and music on " +
+		"hold, N-way conference mixing with mix-minus and supervision taps, and G.711/G.722 with " +
+		"transcoding at the bridge and mix boundaries. Opus is negotiated and RELAYED but never " +
+		"transcoded, and T.38 (rung 8) is still Asterisk's — see plans/mediad-design.md")
 
 	var group sync.WaitGroup
 	group.Add(1)

@@ -8,6 +8,8 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 )
 
 // ErrClosed is returned by Allocate after the manager has begun draining.
@@ -25,13 +27,18 @@ var ErrClosed = errors.New("rtp: the session manager is shutting down")
 // lets the engine tell that from "the session is on my neighbour".
 var ErrUnknownSession = errors.New("rtp: no such session on this instance")
 
-// ErrCodecMismatch is returned when two sessions cannot be bridged because their answers settled
-// on different G.711 variants.
+// ErrCodecMismatch WAS returned when two sessions could not be bridged because their answers settled
+// on different G.711 variants. Rung 7 removed the refusal it named.
 //
-// This is the design doc §7 rule enforced at the one place it becomes visible: v1 is PASSTHROUGH,
-// so relaying µ-law bytes to a leg expecting A-law would deliver audible noise. Refusing is the
-// correct answer and Asterisk keeps serving that call — resampling here is what rung 7 is for.
-var ErrCodecMismatch = errors.New("rtp: the two sessions negotiated different codecs, and v1 does not transcode")
+// Kept as a name with a comment rather than deleted silently, because it is the clearest possible
+// record of what changed: design doc §7 said "a codec mismatch is resolved in SDP negotiation by
+// refusing the offer, not in the media path by resampling", and that was the right trade for as long
+// as there was no decode path in the service. Rung 6 built one. A mismatch is now TRANSLATED, and
+// the only bridge still refused is one whose codec this build cannot decode at all — see
+// ErrCannotTranscode in transcode.go.
+//
+// Deprecated: rung 7 transcodes. Branch on ErrCannotTranscode.
+var ErrCodecMismatch = ErrCannotTranscode
 
 // Descriptor is what a caller needs to tell a far end where to send its media. It is the reply
 // body of an allocate, expressed in the packet path's own vocabulary so the control package can
@@ -44,6 +51,7 @@ type Descriptor struct {
 	SSRC                      uint32
 	Mode                      Mode
 	AudioPayloadType          uint8
+	Format                    audio.Format
 	TelephoneEventPayloadType uint8
 }
 
@@ -60,12 +68,23 @@ type AllocateOptions struct {
 	OrgID  string
 	CallID string
 	LegID  string
-	// AudioPayloadType is the G.711 type the SDP answer settled on.
+	// AudioPayloadType is the audio payload type the SDP answer settled on.
 	AudioPayloadType uint8
+	// Format is the codec that payload type carries. Rung 7 made these two different questions: G.722
+	// is static type 9, Opus is dynamic, and a number alone stopped naming a codec.
+	Format audio.Format
 	// TelephoneEventPayloadType is the RFC 4733 type the answer settled on, or 0 for none.
 	TelephoneEventPayloadType uint8
 	// Inactive puts the session in ModeInactive — a leg that is ringing but not yet talking.
 	Inactive bool
+	// MuteIn and MuteOut are the media-plane half of a non-sendrecv answer direction. Rung 5.
+	//
+	// They arrive on the ALLOCATE rather than as a separate command because that is where the
+	// direction is decided: a re-INVITE carrying `a=sendonly` is answered by this service, and a leg
+	// whose answer said `recvonly` must not be sending. Setting them here means the gate is up before
+	// the first packet after the renegotiation, rather than one round trip later.
+	MuteIn  bool
+	MuteOut bool
 }
 
 // EndReason is why a session stopped existing. The values match the wire contract's
@@ -130,6 +149,14 @@ type SessionSummary struct {
 	Stats      Stats
 	Duration   time.Duration
 	RemoteAddr string
+	// Quality is the RTCP view of the leg: jitter measured here, and loss, jitter and round-trip
+	// time as the far end reported them.
+	//
+	// It is on the SUMMARY and NOT on the wire, and that is a contract gap rather than a decision:
+	// `media.evt.v1.….session.ended` has no field for any of it, so a `mediad` that measures call
+	// quality has nowhere to say so. Carrying it here means the computation is done, tested and
+	// available the moment `packages/events` grows the fields — see this wave's report.
+	Quality QualityStats
 }
 
 // Manager owns every live session: it allocates ports, runs each session's read loop, reaps idle
@@ -173,7 +200,18 @@ type Manager struct {
 	// recordings maps a recording reference to the session being recorded, for the same reason
 	// `playbacks` exists: `rpc.media.v1.stop-recording` carries a reference and nothing else.
 	recordings map[string]string
-	closed     bool
+	// conferences maps a room id to the mix running under it. Rung 6.
+	//
+	// A separate index from `bridges` rather than a generalisation of it, and that is the decision:
+	// a bridge and a conference are different objects on the wire (`bridge-sessions` takes exactly
+	// two session ids and refuses three), they have different costs, and a two-party call must keep
+	// being a relay unless something asks for a mix. Collapsing them would put a jitter buffer and a
+	// codec round trip on every call in the deployment to serve the conferences.
+	conferences map[string]*Conference
+	// taps maps a tap id to the room it joined, because `untap-session` carries a tap id and nothing
+	// else — the same reason the playback and recording indexes exist.
+	taps   map[string]tapRecord
+	closed bool
 
 	// running tracks each session's read goroutine so Drain can wait for the packet path to stop
 	// before the process exits, rather than exiting with sockets still being read.
@@ -230,6 +268,8 @@ func NewManager(opts ManagerOptions) (*Manager, error) {
 		bridges:        make(map[string][2]string),
 		playbacks:      make(map[string]string),
 		recordings:     make(map[string]string),
+		conferences:    make(map[string]*Conference),
+		taps:           make(map[string]tapRecord),
 	}
 	if manager.rtpTimeout <= 0 {
 		manager.rtpTimeout = opts.IdleAfter
@@ -292,12 +332,15 @@ func (m *Manager) Allocate(opts AllocateOptions) (Descriptor, error) {
 
 	session, err := NewSession(Options{
 		ID:                        sessionID,
+		MuteIn:                    opts.MuteIn,
+		MuteOut:                   opts.MuteOut,
 		Ports:                     ports,
 		Mode:                      mode,
 		OrgID:                     opts.OrgID,
 		CallID:                    opts.CallID,
 		LegID:                     opts.LegID,
 		AudioPayloadType:          audioPT,
+		Format:                    opts.Format,
 		TelephoneEventPayloadType: opts.TelephoneEventPayloadType,
 		Logger:                    m.log,
 		Ticker:                    m.ticker,
@@ -334,6 +377,17 @@ func (m *Manager) Allocate(opts AllocateOptions) (Descriptor, error) {
 		}
 	}()
 
+	// The RTCP loop, which reads the odd port design doc §6.3 has had bound and unread since rung 0.
+	// A second goroutine per session and the same argument as the first: parked on a read, costing a
+	// few kilobytes, and it is what makes per-leg loss and round-trip time knowable at all.
+	m.running.Add(1)
+	go func() {
+		defer m.running.Done()
+		if err := session.RunRTCP(context.Background()); err != nil {
+			m.log.Debug("session RTCP loop stopped", "sessionId", sessionID, "error", err)
+		}
+	}()
+
 	m.log.Info("session allocated",
 		"sessionId", sessionID,
 		"callId", opts.CallID,
@@ -344,12 +398,37 @@ func (m *Manager) Allocate(opts AllocateOptions) (Descriptor, error) {
 	return m.describe(session), nil
 }
 
+// ApplyDirection re-points a live session's suppression gates after a renegotiation. Rung 5.
+//
+// Idempotent by construction, because it SETS both flags rather than toggling them: a retried
+// allocate carries the same direction and writes the same two values, and only a genuinely changed
+// direction changes anything. That is what lets `allocate-session` stay "a retry must not mutate a
+// live call" while still being the subject a re-INVITE arrives on.
+//
+// It does NOT touch the HOLD flag, which is a different state with a different owner: hold is
+// mediad's own bookkeeping for a leg taken out of a conversation with music, and a renegotiation
+// that happened to answer `sendrecv` must not quietly take a held caller off hold.
+func (m *Manager) ApplyDirection(sessionID string, muteIn, muteOut bool) error {
+	session, err := m.liveSession(sessionID)
+	if err != nil {
+		return err
+	}
+	session.mutedIn.Store(muteIn)
+	if session.mutedOut.Swap(muteOut) && !muteOut {
+		// The leg is about to start hearing the conversation again from a clock it has not been
+		// following. Same flag, same reason, as the end of a prompt.
+		session.markNextForward.Store(true)
+	}
+	return nil
+}
+
 // Release tears a session down. It reports whether there was one to tear down, so the caller can
 // tell "released" from "already gone" — the engine retries a release, and a retry answering
 // "released: false" is the honest answer rather than an error.
 func (m *Manager) Release(sessionID string) bool {
 	m.mu.Lock()
 	session, ok := m.sessions[sessionID]
+	var leftConference string
 	if ok {
 		delete(m.sessions, sessionID)
 		// Releasing one half of a bridge tears the whole relay down. The other leg stays ALIVE and
@@ -357,8 +436,16 @@ func (m *Manager) Release(sessionID string) bool {
 		// survivor is still allocated, and the engine decides whether it hears a prompt, gets
 		// re-bridged somewhere else, or is released in turn.
 		m.unbridgeSessionLocked(sessionID)
+		// A participant leaving a conference is the same shape one leg further out: the ROOM survives
+		// and the others keep talking. What must not survive is a seat pointing at a closed socket,
+		// because the mixer would go on encoding a frame for it fifty times a second.
+		leftConference, _ = m.leaveConferenceLocked(sessionID)
 	}
 	m.mu.Unlock()
+
+	if leftConference != "" {
+		m.destroyConferenceIfEmpty(leftConference)
+	}
 
 	if !ok {
 		return false
@@ -499,16 +586,27 @@ func (m *Manager) Bridge(bridgeID string, first, second string) error {
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrUnknownSession, second)
 	}
-	if a.AudioPayloadType() != b.AudioPayloadType() {
-		return fmt.Errorf("%w: %s answered %d, %s answered %d",
-			ErrCodecMismatch, first, a.AudioPayloadType(), second, b.AudioPayloadType())
+
+	// RUNG 7 CHANGED THIS LINE. Until now a bridge between two legs that answered different codecs
+	// was refused — design doc §7's "a codec mismatch is resolved in SDP negotiation by refusing the
+	// offer, not in the media path by resampling", which was the right trade while there was no
+	// decode path anywhere in the service. Rung 6 built one, so the premise is gone: the two legs are
+	// bridged and a translation is installed on each direction. What survives is the FAST PATH — two
+	// legs that agreed still relay byte for byte, with no codec touched — and the refusal, now
+	// narrowed to a codec this build genuinely cannot decode. See transcode.go.
+	transcoders, err := prepareTranscoders(a, b)
+	if err != nil {
+		return err
 	}
 
 	// Detach both from whatever they were in, so a re-bridge cannot leave a stale pointer behind
 	// pushing audio at a party that is no longer in the conversation.
 	m.unbridgeSessionLocked(first)
 	m.unbridgeSessionLocked(second)
+	m.leaveConferenceLocked(first)
+	m.leaveConferenceLocked(second)
 
+	transcoders.install(a, b)
 	a.SetPeer(b)
 	b.SetPeer(a)
 	m.bridges[bridgeID] = [2]string{first, second}
@@ -550,6 +648,11 @@ func (m *Manager) detachLocked(bridgeID string, pair [2]string) {
 	for _, id := range pair {
 		if session, ok := m.sessions[id]; ok {
 			session.SetPeer(nil)
+			// The translation goes with the bridge it belonged to. Leaving it installed would mean a
+			// leg re-bridged to a peer that DOES agree with it still paying for a decode and an
+			// encode, and — worse — a leg that ended up with no peer holding codec state that a later
+			// bridge would resume mid-stream.
+			clearTranscoders(session)
 		}
 	}
 	delete(m.bridges, bridgeID)
@@ -834,6 +937,16 @@ func (m *Manager) Len() int {
 // Capacity is how many sessions the port range can hold.
 func (m *Manager) Capacity() int { return m.allocator.Capacity() }
 
+// newTicker builds a pacing clock for anything this Manager owns that runs on one — today the
+// conference mixer. It is the Manager's ticker rather than time.NewTicker so a test can step a
+// conference frame by frame, exactly as it steps a playback.
+func (m *Manager) newTicker(interval time.Duration) (<-chan time.Time, func()) {
+	if m.ticker != nil {
+		return m.ticker(interval)
+	}
+	return systemTicker(interval)
+}
+
 func (m *Manager) describe(session *Session) Descriptor {
 	return Descriptor{
 		SessionID:                 session.ID,
@@ -843,6 +956,7 @@ func (m *Manager) describe(session *Session) Descriptor {
 		SSRC:                      session.SSRC,
 		Mode:                      session.Mode(),
 		AudioPayloadType:          session.AudioPayloadType(),
+		Format:                    session.Format(),
 		TelephoneEventPayloadType: session.TelephoneEventPayloadType(),
 	}
 }
@@ -895,6 +1009,7 @@ func (m *Manager) ReapIdle() int {
 		}
 		delete(m.sessions, id)
 		m.unbridgeSessionLocked(id)
+		m.leaveConferenceLocked(id)
 	}
 	m.mu.Unlock()
 
@@ -974,7 +1089,20 @@ func (m *Manager) Drain(ctx context.Context) error {
 		delete(m.sessions, id)
 	}
 	m.bridges = make(map[string][2]string)
+	rooms := make([]*Conference, 0, len(m.conferences))
+	for id, conference := range m.conferences {
+		rooms = append(rooms, conference)
+		delete(m.conferences, id)
+	}
+	m.taps = make(map[string]tapRecord)
 	m.mu.Unlock()
+
+	// The mix loops stop BEFORE the sessions close, so no tick can find a member whose socket has
+	// already gone. They are goroutines this Manager started, so they are also what `running` is
+	// waiting on below.
+	for _, conference := range rooms {
+		conference.Stop()
+	}
 
 	if len(live) > 0 {
 		m.log.Warn("draining live sessions; media on these calls stops now", "count", len(live))

@@ -63,6 +63,11 @@ const (
 	SubjectSendDtmf         = contract.SubjectMediaSendDtmfRPC
 	SubjectStartRecording   = contract.SubjectMediaStartRecordingRPC
 	SubjectStopRecording    = contract.SubjectMediaStopRecordingRPC
+	// Rung 6's pair. They were promoted into `packages/events` and granted in `config/nats.conf`
+	// ahead of any implementation — deliberately, per design doc §10 question 4's W6 addendum, so
+	// that "the rung-6 mixer serves this contract by ARRIVING, not by being extended". It arrived.
+	SubjectTapSession   = contract.SubjectMediaTapSessionRPC
+	SubjectUntapSession = contract.SubjectMediaUntapSessionRPC
 )
 
 // Refusal codes. Values come from the contract; these names exist so a handler reads as prose.
@@ -106,6 +111,19 @@ type Sessions interface {
 	// `<root>/<orgId>/<callId>/<recordingRef>.wav`, which is the engine's own object key, and both
 	// tokens arrived on the allocate rather than on the recording command.
 	SessionTenancy(sessionID string) (orgID, callID string, ok bool)
+
+	// ApplyDirection re-points a live session's media direction after a re-negotiation. Rung 5.
+	//
+	// This is the SIGNALLING half of hold arriving where design doc §5 says it must: sipd sees the
+	// re-INVITE, the engine decides, and mediad gets a command. The command is a repeat
+	// `allocate-session` carrying the new `direction`, because that is the subject the offer travels
+	// on and the one mediad answers — a separate hold subject would mean one re-INVITE producing two
+	// commands that could disagree about the same call.
+	ApplyDirection(sessionID string, muteIn, muteOut bool) error
+
+	// Tap joins a supervisor to a conversation on asymmetric terms, and Untap takes it down. Rung 6.
+	Tap(opts rtp.TapOptions) (rtp.TapResult, error)
+	Untap(tapID string) (string, bool)
 }
 
 // Server answers the v1 command subjects.
@@ -198,6 +216,8 @@ func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscrip
 		{SubjectSendDtmf, s.HandleSendDtmf},
 		{SubjectStartRecording, s.HandleStartRecording},
 		{SubjectStopRecording, s.HandleStopRecording},
+		{SubjectTapSession, s.HandleTapSession},
+		{SubjectUntapSession, s.HandleUntapSession},
 	}
 
 	subscriptions := make([]*nats.Subscription, 0, len(handlers))
