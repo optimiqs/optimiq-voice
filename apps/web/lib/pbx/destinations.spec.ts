@@ -64,6 +64,23 @@ describe("destinationFieldNames", () => {
 			data: "fallbackDestinationData",
 		});
 	});
+
+	/**
+	 * A queue's exit key, which is the second OPTIONAL trio on one row.
+	 *
+	 * Asserted on its own because `queue` is now the only entity carrying two of these — `timeout`
+	 * and `exit` — and the whole reason the picker takes a prefix is that a form holding two trios
+	 * must address them separately. A dialog that wrote both under `timeout` would silently make the
+	 * exit key point wherever the wait cap does, which is a caller who pressed 2 being sent to the
+	 * overflow they were trying to escape.
+	 */
+	it("names the queue's exit trio, the second optional one on a single row", () => {
+		expect(destinationFieldNames("exit")).toEqual({
+			type: "exitDestinationType",
+			ref: "exitDestinationRef",
+			data: "exitDestinationData",
+		});
+	});
 });
 
 describe("readDestination", () => {

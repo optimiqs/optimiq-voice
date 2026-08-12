@@ -90,6 +90,33 @@ export const routes = {
 	callBlock: "/call-block",
 	recordings: "/recordings",
 	cdr: "/cdr",
+	/**
+	 * The wallboard — every queue's line and service level, on one screen.
+	 *
+	 * Under "Insight" beside `/cdr` and `/recordings` rather than as a tab of `/queues`, and the
+	 * split is by AUDIENCE rather than by subject. `/queues` is configuration gated by `queues.read`
+	 * and `queues.write`: what a queue does, who staffs it, where it overflows. This is gated by
+	 * `queues.monitor` alone — "watch live queue and agent state" — which the `agent` template holds
+	 * and which grants nothing about the dial plan. A tab of `/queues` would have needed a
+	 * `PAGE_PERMISSIONS` entry naming one of the two and hiding the other, the rule this file has
+	 * applied six times now.
+	 *
+	 * "Insight" is also where the shape belongs: like `/cdr`, it is a windowed read-only surface over
+	 * the call ledger with no row anybody can edit. What it adds is a live half, which is why it is
+	 * not simply another ledger screen.
+	 */
+	wallboard: "/wallboard",
+	/**
+	 * One queue's operator panel: the line as callers stand in it, and the agents who could take
+	 * them.
+	 *
+	 * Nested under the wallboard so it inherits `queues.monitor` by ancestry, and NOT under
+	 * `/queues/<id>`, which is the queue's configuration page and is gated by `queues.read`. The two
+	 * pages are about the same queue and answer different questions — "how is this queue set up" and
+	 * "what is happening in it right now" — and the second is the one somebody opens with a customer
+	 * on hold.
+	 */
+	wallboardQueue: (id: string) => `/wallboard/${id}`,
 	mediaLibrary: "/media",
 	/**
 	 * The change ledger.

@@ -209,6 +209,22 @@ export const queryKeys = {
 	/** One call's legs, keyed by call id — what an expanded row reads. */
 	cdrCall: (organizationId: string, callId: string) =>
 		["organizations", organizationId, "cdr", "call", callId] as const,
+	/**
+	 * Queue service level over a window.
+	 *
+	 * Under `cdr` because that is the endpoint it reads (`GET /cdr/queue-stats`) and because an org
+	 * switch must take it, even though it is gated by `queues.monitor` rather than by `cdr.read`.
+	 * NOT under `pbx/queues`: a queue EDIT cannot change what the ledger recorded last Tuesday, and
+	 * the coarse sweep every PBX mutation fires would otherwise refetch a wallboard's numbers each
+	 * time somebody renamed something.
+	 *
+	 * The whole query — window, target and optional queue — is the last segment, because a different
+	 * target is a different answer to a different question and must never share an entry. Entries
+	 * under it are POLLED (see `useQueueStats`), which is the second exception to `staleTime:
+	 * Infinity` in this app: a service level moves because calls ended, and no live topic says so.
+	 */
+	queueStats: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
+		["organizations", organizationId, "cdr", "queue-stats", query] as const,
 	recordings: (organizationId: string) =>
 		["organizations", organizationId, "cdr", "recordings"] as const,
 	recordingList: (organizationId: string, query: Readonly<Record<string, unknown>>) =>

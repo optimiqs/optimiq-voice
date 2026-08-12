@@ -23,6 +23,7 @@ import {
 	TrunkIcon,
 	UsersIcon,
 	VoicemailIcon,
+	WallboardIcon,
 	WebhookIcon,
 } from "~/components/ui/icons";
 import { routes } from "~/lib/routes";
@@ -146,6 +147,18 @@ export const NAV_SECTIONS: readonly NavSection[] = [
 	{
 		label: "Insight",
 		items: [
+			/**
+			 * The wallboard, FIRST in this section and the only entry in it that is about now rather
+			 * than about what already happened.
+			 *
+			 * Under "Insight" beside call history rather than under "Routing" beside Queues, because
+			 * these sections are a claim about what somebody is DOING: "Routing" is where an
+			 * administrator configures a queue, and this is where a supervisor watches one. It is also
+			 * the only entry here reachable on `queues.monitor` — which the `agent` template holds and
+			 * which opens nothing else in the app — so for an agent this section has exactly one item
+			 * in it, and it is the right one.
+			 */
+			{ title: "Wallboard", url: routes.wallboard, icon: WallboardIcon },
 			{ title: "Recordings", url: routes.recordings, icon: RecordIcon },
 			{ title: "Call history", url: routes.cdr, icon: HistoryIcon },
 			/**

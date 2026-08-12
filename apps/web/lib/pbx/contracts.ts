@@ -257,6 +257,28 @@ export type QueueAgentStatus = (typeof QUEUE_AGENT_STATUSES)[number];
 export const QUEUE_AGENT_CONTACT_KINDS = ["extension", "external"] as const;
 export type QueueAgentContactKind = (typeof QUEUE_AGENT_CONTACT_KINDS)[number];
 
+/**
+ * The caller-priority scale, mirroring `QUEUE_PRIORITY_MIN` / `QUEUE_PRIORITY_MAX` in
+ * `packages/pbx-db`.
+ *
+ * Higher dequeues first, and 0 means unprioritised — the direction every `mod_callcenter`
+ * deployment already assumes, which is why the mirror carries the bounds rather than the form
+ * inventing its own. The same range is what `queue.caller.joined` publishes on, so a wallboard
+ * never has to rescale between the configured default and the live entry.
+ */
+export const QUEUE_PRIORITY_MIN = 0;
+export const QUEUE_PRIORITY_MAX = 1000;
+
+/**
+ * The DTMF digits a phone can actually send, as one character.
+ *
+ * Mirrors the `queue_exit_key_shape_check` constraint and the DTO's regex. It is a CHARACTER SET
+ * rather than a free string because the engine compares the stored key against a `DtmfEvent.digit`
+ * with `===`: a row holding `"1 "` or a lower-case `d` is a queue whose exit key silently never
+ * fires, and the operator would have configured a feature that does nothing.
+ */
+export const QUEUE_EXIT_KEY_PATTERN = /^[0-9*#A-D]$/u;
+
 export const VOICEMAIL_EMAIL_MODES = ["none", "notify", "attach"] as const;
 export type VoicemailEmailMode = (typeof VOICEMAIL_EMAIL_MODES)[number];
 
@@ -936,7 +958,33 @@ export interface QueueRow extends EntityRow {
 	readonly tierRulesApply: boolean;
 	readonly tierRuleWaitSeconds: number;
 	readonly tierRuleNoAgentNoWait: boolean;
-	readonly recordEnabled: boolean;
+	/**
+	 * When the engine records what this queue distributes — the same vocabulary an extension and a
+	 * trunk carry, which REPLACED a `recordEnabled` boolean no runtime honoured.
+	 *
+	 * A queued call is inbound from the queue's point of view whichever direction the leg that
+	 * reached the queue was travelling, so `inbound` and `all` both record here and `outbound` never
+	 * does. The recording begins at the ANSWER rather than at the join: hold music is not evidence of
+	 * anything, and recording it would put every abandoned call in the retention bucket.
+	 */
+	readonly recordPolicy: RecordPolicy;
+	/**
+	 * The single DTMF digit a WAITING caller may press to leave the line. `null` disables it.
+	 *
+	 * One character, because that is the whole feature: a caller four minutes into a hold is not
+	 * going to type a string, and a multi-digit code would need an inter-digit timeout running under
+	 * the music for the entire wait. Where they go is the `exit` trio below.
+	 */
+	readonly exitKey: string | null;
+	readonly exitDestinationType: DestinationType | null;
+	readonly exitDestinationRef: string | null;
+	readonly exitDestinationData: DestinationData | null;
+	/**
+	 * The priority every caller entering this queue starts with, unless the destination that sent
+	 * them overrode it — an IVR option saying "press 2 if you are a platinum customer" is exactly
+	 * that override. Higher dequeues first; see {@link QUEUE_PRIORITY_MIN}.
+	 */
+	readonly defaultPriority: number;
 	readonly timeoutDestinationType: DestinationType | null;
 	readonly timeoutDestinationRef: string | null;
 	readonly timeoutDestinationData: DestinationData | null;
@@ -971,6 +1019,16 @@ export interface QueueTierRow extends EntityRow {
 	readonly level: number;
 	/** Order within the level. */
 	readonly position: number;
+	/**
+	 * Played to the AGENT alone when a call distributed by THIS tier reaches them, in place of the
+	 * queue's `agentWhisperPromptId`. `null` clears it and the queue's whisper takes over again.
+	 *
+	 * On the tier rather than on the queue because it is a fact about the MEMBERSHIP: an escalation
+	 * cue for a level that is only reached after the one below it could not take the call. It is
+	 * therefore behind `queues.manage-agents` like everything else on a tier — whoever staffs the
+	 * levels is whoever knows what each level should be told.
+	 */
+	readonly announcePromptId: string | null;
 }
 
 /**

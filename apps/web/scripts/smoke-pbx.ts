@@ -684,6 +684,21 @@ async function main(): Promise<void> {
 			// DTOs they mirror.
 			"/audit-log",
 			"/webhooks",
+			/**
+			 * The wallboard and one queue's operator panel.
+			 *
+			 * Both are gated by `queues.monitor` alone — the panel inherits it by ancestry — which is
+			 * neither `queues.read` nor `cdr.read`, and a 200 here is what proves the route map agrees
+			 * with `live-topics.ts` and the cdr controller about that. The owner used here holds all
+			 * three, so this asserts the ROUTE rather than the narrowest role; the permission split
+			 * itself is asserted in `lib/page-permissions.spec.ts`.
+			 *
+			 * The panel is included with a real id rather than left to the list: it is the only screen
+			 * in the app that mounts a live topic AND a cdr aggregate on first paint, and a crash in
+			 * either would be invisible to a route list that stopped at the index.
+			 */
+			"/wallboard",
+			`/wallboard/${seededQueueId}`,
 		];
 		const routeFailures: string[] = [];
 		for (const route of routes) {
@@ -1018,16 +1033,77 @@ async function main(): Promise<void> {
 			announceFrequencySeconds: 30,
 			tierRulesApply: true,
 			tierRuleWaitSeconds: 10,
-			recordEnabled: false,
+			/**
+			 * A record POLICY, not the `recordEnabled` boolean this body used to carry.
+			 *
+			 * The column was replaced and `createQueueDto` is a `strictObject`, so the old key is now a
+			 * 400 naming it rather than a field quietly ignored — which is exactly what the queue form
+			 * was sending until this wave. Sending the new spelling here is what keeps the smoke and the
+			 * dialog telling the same story.
+			 */
+			recordPolicy: "none",
+			/** Upper-cased by the DTO before validation, so this is also the normalisation's smoke. */
+			exitKey: "2",
+			defaultPriority: 0,
 			enabled: true,
-			// The queue form's own trio writer, so the smoke exercises the code the dialog runs.
+			// The queue form's own trio writer, so the smoke exercises the code the dialog runs — now
+			// for BOTH of the queue's trios, which is the only row in the schema carrying two optional
+			// ones.
 			...writeDestination({ type: "extension", ref: agentExtensionId, data: null }, "timeout"),
+			...writeDestination({ type: "hangup", ref: null, data: null }, "exit"),
 		});
 		const queueId = rowId(queue);
 		check(
 			"create queue -> 201 with the settings the dialog sends",
-			queue.status === 201 && data(queue).strategy === "longest-idle",
-			`status ${queue.status}`,
+			queue.status === 201 &&
+				data(queue).strategy === "longest-idle" &&
+				data(queue).recordPolicy === "none" &&
+				data(queue).exitKey === "2" &&
+				data(queue).exitDestinationType === "hangup",
+			`status ${queue.status}, ${JSON.stringify({
+				recordPolicy: data(queue).recordPolicy,
+				exitKey: data(queue).exitKey,
+				exitDestinationType: data(queue).exitDestinationType,
+			})}`,
+		);
+
+		/**
+		 * The boolean the column no longer has. A strict object answers it with a 400 rather than
+		 * dropping it, which is the whole reason the mirror had to change rather than being left to
+		 * "the server will ignore what it does not know".
+		 */
+		const staleBoolean = await client("PATCH", `/api/v1/queues/${queueId}`, {
+			recordEnabled: true,
+		});
+		check(
+			"the recordEnabled boolean is refused outright, not silently ignored",
+			staleBoolean.status === 400,
+			`status ${staleBoolean.status}`,
+		);
+
+		/** One character, and one a phone can send. The engine compares it with `===`. */
+		const badExitKey = await client("PATCH", `/api/v1/queues/${queueId}`, { exitKey: "22" });
+		check(
+			"a multi-digit exit key is refused, as the form refuses it",
+			badExitKey.status === 400,
+			`status ${badExitKey.status}`,
+		);
+
+		const lowerExitKey = await client("PATCH", `/api/v1/queues/${queueId}`, { exitKey: "d" });
+		check(
+			"a lower-case DTMF letter is upper-cased rather than rejected",
+			lowerExitKey.status === 200 && data(lowerExitKey).exitKey === "D",
+			`status ${lowerExitKey.status}, exitKey ${JSON.stringify(data(lowerExitKey).exitKey)}`,
+		);
+
+		/** Higher dequeues first, on the 0-1000 scale `queue.caller.joined` already publishes on. */
+		const outOfRangePriority = await client("PATCH", `/api/v1/queues/${queueId}`, {
+			defaultPriority: 1001,
+		});
+		check(
+			"the caller-priority scale stops at 1000, as the mirror says",
+			outOfRangePriority.status === 400,
+			`status ${outOfRangePriority.status}`,
 		);
 
 		/**

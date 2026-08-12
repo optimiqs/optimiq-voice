@@ -12,6 +12,7 @@ import {
 	createCdrExport,
 	deleteCdrExport,
 	deleteRecording,
+	fetchQueueStats,
 	getCall,
 	isSettledExportStatus,
 	listCallLegs,
@@ -19,20 +20,24 @@ import {
 	listRecordings,
 	mintCdrExportDownloadUrl,
 	mintRecordingDownloadUrl,
+	queueStatsParams,
 	type CdrExportFilters,
 	type CdrExportListQuery,
 	type CdrListQuery,
+	type QueueStatsQuery,
 	type RecordingListQuery,
 } from "~/lib/cdr/client";
 import { pbxToastMessage } from "~/lib/pbx/errors";
 import { queryKeys } from "~/lib/query-keys";
-import { useActiveOrganization } from "../_context/session-context";
+import { useActiveOrganization, usePermission } from "../_context/session-context";
 import type {
 	CallDetail,
 	CallLegRow,
 	CdrExportDownloadLink,
 	CdrExportRow,
 	CursorEnvelope,
+	QueueStatsEnvelope,
+	QueueStatsRow,
 	RecordingDownloadLink,
 	RecordingRow,
 } from "~/lib/cdr/contracts";
@@ -58,12 +63,16 @@ import type {
  * the export lifecycle (whose jobs this app creates and removes). Each invalidates its own subtree
  * and nothing else: queuing an export must not evict the page of history somebody is reading.
  *
- * ## The one polled query in the app
+ * ## The two polled queries in the app, and why they poll differently
  *
- * `useCdrExportList` is the single exception to `lib/query-client.ts`'s `staleTime: Infinity`, and
- * the reason is that an export finishes in another process with no live topic to say so. The
- * interval is a FUNCTION of the data and returns `false` once every job is terminal, so the poll is
- * bounded by the work rather than by the page being open.
+ * Both exceptions to `lib/query-client.ts`'s `staleTime: Infinity` are here, and neither could be
+ * a live topic: an export finishes in another process with no event to say so, and a service level
+ * is an aggregate over a window that moves on its own.
+ *
+ * `useCdrExportList`'s interval is a FUNCTION of the data and returns `false` once every job is
+ * terminal, so its poll is bounded by the WORK. `useQueueStats` polls at a fixed interval for as
+ * long as the page is open, because a wallboard is never "done" — it is bounded by the SCREEN, and
+ * that is exactly the trade a wallboard is asking for.
  */
 
 function useOrganizationId(): string {
@@ -113,6 +122,69 @@ export function useCdrCall(
 		queryFn: () => getCall(callId as string, range),
 		enabled: organizationId.length > 0 && Boolean(callId),
 	});
+}
+
+/**
+ * How often the wallboard's service level is re-asked.
+ *
+ * Thirty seconds, and the choice is a compromise between two real costs. The query is a grouped
+ * aggregate over a partitioned ledger — cheap on a partial index, not free — and the number it
+ * produces moves only when calls END, so a five-second poll would run it six times to show the same
+ * percentage. Half a minute is also about as long as a supervisor will watch a stale SLA tile
+ * before distrusting the whole screen.
+ *
+ * It is a POLL rather than a live topic because there is no event for "the service level changed":
+ * it is an aggregate over a window, and the window itself moves.
+ */
+export const QUEUE_STATS_REFETCH_MS = 30_000;
+
+export interface QueueStatsResult {
+	readonly query: UseQueryResult<QueueStatsEnvelope>;
+	readonly rows: readonly QueueStatsRow[];
+	/** Keyed by queue id, so a per-queue tile is a lookup rather than a scan per render. */
+	readonly byQueueId: ReadonlyMap<string, QueueStatsRow>;
+	/** The window and the target the SERVER applied, which is what the page should say it shows. */
+	readonly range: { readonly from: string; readonly to: string } | undefined;
+	readonly slaSeconds: number | undefined;
+}
+
+/**
+ * Queue service level over a window.
+ *
+ * `enabled` on `queues.monitor` rather than on `cdr.read`: that is what the endpoint is guarded
+ * with, and asking without it would put a red line on every agent console for a request that can
+ * only 403. An agent HOLDS `queues.monitor`, which is the intended shape — seeing how their own
+ * queue is doing is the point of a wallboard, and it is strictly less than the `queues.read` they
+ * already have.
+ *
+ * `placeholderData: previous` for the reason the list has it: changing the target or the window is
+ * a new cache entry, and a wallboard that blanked its numbers every time somebody moved the SLA
+ * control would flash on a screen people are watching from across a room.
+ */
+export function useQueueStats(
+	query: QueueStatsQuery,
+	options: { readonly enabled?: boolean } = {},
+): QueueStatsResult {
+	const organizationId = useOrganizationId();
+	const permitted = usePermission("queues.monitor");
+	const params = queueStatsParams(query);
+
+	const result = useQuery({
+		queryKey: queryKeys.queueStats(organizationId, params),
+		queryFn: () => fetchQueueStats(query),
+		enabled: organizationId.length > 0 && permitted && (options.enabled ?? true),
+		placeholderData: (previous) => previous,
+		refetchInterval: QUEUE_STATS_REFETCH_MS,
+	});
+
+	const rows = result.data?.data ?? [];
+	return {
+		query: result,
+		rows,
+		byQueueId: new Map(rows.map((row) => [row.queueId, row])),
+		range: result.data?.range,
+		slaSeconds: result.data?.slaSeconds,
+	};
 }
 
 export interface RecordingListResult {

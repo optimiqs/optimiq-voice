@@ -302,3 +302,54 @@ describe("the T2 admin block", () => {
 		expect(owner.includes("org-limits.write")).toBe(true);
 	});
 });
+
+/**
+ * The wallboard and, by ancestry, each queue's operator panel.
+ *
+ * The placement decision this map records: a monitoring surface is gated by `queues.monitor`, which
+ * is neither the grant that reads a queue's configuration nor the one that reads the call ledger.
+ * Both other candidates are asserted against, because both are plausible and both are wrong in a
+ * direction that costs somebody something — `queues.read` would shut out nobody today but would tie
+ * the page to configuration access, and `cdr.read` would hand a supervisor's SLA row the right to
+ * read every call the tenant ever made.
+ */
+describe("the wallboard", () => {
+	it("is gated on queues.monitor alone", () => {
+		expect(getPagePermissions(routes.wallboard)?.permissions).toEqual(["queues.monitor"]);
+		expect(canAccessPage(routes.wallboard, ["queues.monitor"])).toBe(true);
+		expect(canAccessPage(routes.wallboard, ["queues.read", "queues.write"])).toBe(false);
+		expect(canAccessPage(routes.wallboard, ["cdr.read"])).toBe(false);
+	});
+
+	/**
+	 * The operator panel has no entry of its own and must not need one: it is nested under the
+	 * wallboard precisely so it inherits the same grant, and a nested view that was reachable with
+	 * LESS than its parent is the failure an exact-match lookup quietly allows.
+	 */
+	it("carries its permission down to one queue's operator panel", () => {
+		const panel = routes.wallboardQueue("019fd5fb-de54-700b-8826-8cf8ab5199af");
+
+		expect(getPagePermissions(panel)?.permissions).toEqual(["queues.monitor"]);
+		expect(canAccessPage(panel, ["queues.monitor"])).toBe(true);
+		expect(canAccessPage(panel, [])).toBe(false);
+	});
+
+	/**
+	 * The role this placement is FOR. An agent holds `queues.monitor` and it opens nothing else in
+	 * the app — watching their own queue is the point of a wallboard — while acting on what they see
+	 * needs `queues.manage-agents`, which the template does not grant and which the page gates
+	 * internally rather than at the door.
+	 */
+	it("opens for an agent, who may watch the floor and not staff it", () => {
+		const agent = resolveRolePermissions("agent");
+
+		expect(canAccessPage(routes.wallboard, agent)).toBe(true);
+		expect(agent.includes("queues.monitor")).toBe(true);
+		expect(agent.includes("queues.manage-agents")).toBe(false);
+	});
+
+	/** A plain user has no queue grant at all, so the nav entry is not shown to them either. */
+	it("is closed to a plain user", () => {
+		expect(canAccessPage(routes.wallboard, resolveRolePermissions("user"))).toBe(false);
+	});
+});

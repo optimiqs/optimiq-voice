@@ -42,6 +42,26 @@ export function GaugeIcon(props: IconProps) {
 	);
 }
 
+/**
+ * The wallboard: a screen on a stand, with a line of bars on it.
+ *
+ * Deliberately not the gauge the dashboard uses and not the queue glyph: the wallboard is neither
+ * the overview nor the queue list, and a sidebar in which two entries carry one glyph is a sidebar
+ * where somebody clicks the wrong one on the way to a customer who is on hold.
+ */
+export function WallboardIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<rect x="3" y="4" width="18" height="12" rx="2" />
+			<path d="M8 20h8" />
+			<path d="M12 16v4" />
+			<path d="M8 12v-2" />
+			<path d="M12 12V8" />
+			<path d="M16 12v-3" />
+		</Glyph>
+	);
+}
+
 export function PhoneIcon(props: IconProps) {
 	return (
 		<Glyph {...props}>

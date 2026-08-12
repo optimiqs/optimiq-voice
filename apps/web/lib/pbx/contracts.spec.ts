@@ -16,6 +16,8 @@ import {
 	PROMPT_KINDS as SERVER_PROMPT_KINDS,
 	QUEUE_AGENT_CONTACT_KINDS as SERVER_QUEUE_AGENT_CONTACT_KINDS,
 	QUEUE_AGENT_STATUSES as SERVER_QUEUE_AGENT_STATUSES,
+	QUEUE_PRIORITY_MAX as SERVER_QUEUE_PRIORITY_MAX,
+	QUEUE_PRIORITY_MIN as SERVER_QUEUE_PRIORITY_MIN,
 	QUEUE_STRATEGIES as SERVER_QUEUE_STRATEGIES,
 	RECORD_POLICIES as SERVER_RECORD_POLICIES,
 	RING_GROUP_STRATEGIES as SERVER_RING_GROUP_STRATEGIES,
@@ -50,6 +52,9 @@ import {
 	PROMPT_KINDS,
 	QUEUE_AGENT_CONTACT_KINDS,
 	QUEUE_AGENT_STATUSES,
+	QUEUE_EXIT_KEY_PATTERN,
+	QUEUE_PRIORITY_MAX,
+	QUEUE_PRIORITY_MIN,
 	QUEUE_STRATEGIES,
 	RECORD_POLICIES,
 	RING_GROUP_STRATEGIES,
@@ -159,6 +164,35 @@ describe("closed sets mirrored from @optimiq-voice/pbx-db", () => {
 	it("queue agent statuses and contact kinds match", () => {
 		expect(QUEUE_AGENT_STATUSES).toEqual([...SERVER_QUEUE_AGENT_STATUSES]);
 		expect(QUEUE_AGENT_CONTACT_KINDS).toEqual([...SERVER_QUEUE_AGENT_CONTACT_KINDS]);
+	});
+
+	/**
+	 * The priority scale, which is a RANGE rather than a set and drifts differently: nothing here
+	 * would fail to render if the ceiling moved, the form would simply refuse a value the column
+	 * accepts — or accept one the check constraint refuses, which is a 400 on a control that looked
+	 * valid. The same 0-1000 is what `queue.caller.joined` publishes on, so the wallboard's live
+	 * priority and the queue's configured default are the same number on the same scale.
+	 */
+	it("the caller-priority scale matches the column's own bounds", () => {
+		expect(QUEUE_PRIORITY_MIN).toBe(SERVER_QUEUE_PRIORITY_MIN);
+		expect(QUEUE_PRIORITY_MAX).toBe(SERVER_QUEUE_PRIORITY_MAX);
+	});
+
+	/**
+	 * The exit key's shape, mirrored from `queue_exit_key_shape_check`.
+	 *
+	 * A regex mirror rather than an imported one, so what is asserted is that the two AGREE on the
+	 * sixteen characters a phone can send. The engine compares the stored key against a digit with
+	 * `===`: a browser that accepted a lower-case `d` or a two-character code would produce a queue
+	 * whose exit key silently never fires.
+	 */
+	it("accepts exactly the sixteen DTMF digits, one at a time", () => {
+		for (const digit of "0123456789*#ABCD") {
+			expect(QUEUE_EXIT_KEY_PATTERN.test(digit)).toBe(true);
+		}
+		for (const refused of ["", "d", "E", "22", "*#", " 2", "2 "]) {
+			expect(QUEUE_EXIT_KEY_PATTERN.test(refused)).toBe(false);
+		}
 	});
 
 	it("voicemail email modes match", () => {

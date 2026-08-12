@@ -6,12 +6,17 @@ import {
 	emptyKvState,
 	isChannelLive,
 	isRegistrationLive,
+	longestWaitMs,
 	parseAgentState,
 	parseChannel,
 	parseRegistration,
 	parseTrunkStatusEvent,
+	parseWaitingRecord,
+	rankWaiting,
 	type LiveChannel,
 	type LiveRegistration,
+	type LiveWaitingEntry,
+	type LiveWaitingRecord,
 } from "./store";
 
 /**
@@ -295,5 +300,139 @@ describe("parseTrunkStatusEvent", () => {
 		expect(parsed).toEqual({ trunkId: TRUNK, status: "up", at: "2026-08-06T09:00:00.000Z" });
 		expect(parsed && "reason" in parsed).toBe(false);
 		expect(parsed && "latencyMs" in parsed).toBe(false);
+	});
+});
+
+// ---------------------------------------------------------------------------------------------
+// the waiting line
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The line a wallboard draws, which is the one place in this app where getting an ORDER wrong is
+ * worse than showing nothing: a supervisor watching positions move is deciding who to help, and a
+ * client that ranked differently from the engine would show them a queue answering out of turn.
+ */
+describe("the waiting line", () => {
+	const NOW = 1_760_000_000_000;
+	const QUEUE = "019fd3c2-2222-76be-a6b3-b0f1914e39b6";
+
+	function entry(overrides: Partial<LiveWaitingEntry> = {}): LiveWaitingEntry {
+		return {
+			callId: "019fd3c2-aaaa-76be-a6b3-b0f1914e39b6",
+			legId: "019fd3c2-bbbb-76be-a6b3-b0f1914e39b6",
+			priority: 0,
+			joinedAt: NOW - 30_000,
+			expiresAt: NOW + 60_000,
+			...overrides,
+		};
+	}
+
+	function record(entries: readonly LiveWaitingEntry[]): LiveWaitingRecord {
+		return { orgId: ORG, queueId: QUEUE, entries, updatedAt: NOW };
+	}
+
+	it("parses the bucket's value and drops an entry with no lease on it", () => {
+		const parsed = parseWaitingRecord({
+			orgId: ORG,
+			queueId: QUEUE,
+			entries: [entry(), { callId: "no-lease", joinedAt: NOW, priority: 0 }],
+			tombstones: [],
+			updatedAt: NOW,
+		});
+
+		expect(parsed?.queueId).toBe(QUEUE);
+		expect(parsed?.entries).toHaveLength(1);
+	});
+
+	it("refuses anything that is not a line", () => {
+		expect(parseWaitingRecord(null)).toBe(undefined);
+		expect(parseWaitingRecord({ queueId: QUEUE })).toBe(undefined);
+		expect(parseWaitingRecord({ entries: [] })).toBe(undefined);
+	});
+
+	/** `(priority DESC, joinedAt ASC, callId ASC)` — the engine's comparator, restated. */
+	it("ranks by priority first, then by arrival", () => {
+		const ranked = rankWaiting(
+			record([
+				entry({ callId: "a", joinedAt: NOW - 120_000, priority: 0 }),
+				entry({ callId: "b", joinedAt: NOW - 10_000, priority: 900 }),
+				entry({ callId: "c", joinedAt: NOW - 60_000, priority: 0 }),
+			]),
+			NOW,
+		);
+
+		expect(ranked.map((caller) => caller.callId)).toEqual(["b", "a", "c"]);
+		expect(ranked.map((caller) => caller.position)).toEqual([1, 2, 3]);
+	});
+
+	/**
+	 * Two callers can join in the same millisecond — two engine instances writing in one CAS round
+	 * is the normal case at the top of the hour — and without the id tie-break each reader's rank
+	 * would depend on the array order the record happened to be written in.
+	 */
+	it("breaks a same-millisecond tie by call id, so every reader agrees", () => {
+		const entries = [
+			entry({ callId: "b", joinedAt: NOW - 5_000 }),
+			entry({ callId: "a", joinedAt: NOW - 5_000 }),
+		];
+
+		expect(rankWaiting(record(entries), NOW).map((caller) => caller.callId)).toEqual(["a", "b"]);
+		expect(rankWaiting(record([...entries].reverse()), NOW).map((caller) => caller.callId)).toEqual(
+			["a", "b"],
+		);
+	});
+
+	/**
+	 * A lapsed lease is a caller who is no longer on the phone. The engine prunes on its way past,
+	 * so between two writes the value still holds them — and a wallboard rendering one is showing a
+	 * call that is not happening, which is the single thing it must not do.
+	 */
+	it("drops a caller whose lease has lapsed rather than waiting for the next write", () => {
+		const ranked = rankWaiting(
+			record([
+				entry({ callId: "live", expiresAt: NOW + 1 }),
+				entry({ callId: "lapsed", expiresAt: NOW - 1 }),
+			]),
+			NOW,
+		);
+
+		expect(ranked.map((caller) => caller.callId)).toEqual(["live"]);
+	});
+
+	it("counts the wait from the place a resumed caller was restored to, and never negatively", () => {
+		const ranked = rankWaiting(
+			record([
+				entry({ callId: "restored", joinedAt: NOW - 240_000 }),
+				entry({ callId: "skewed", joinedAt: NOW + 5_000 }),
+			]),
+			NOW,
+			new Set(["restored"]),
+		);
+
+		expect(ranked[0]?.callId).toBe("restored");
+		expect(ranked[0]?.waitedMs).toBe(240_000);
+		expect(ranked[0]?.resumed).toBe(true);
+		// A caller whose join is in this browser's future is clock skew between the engine and the
+		// laptop watching it, not a negative wait.
+		expect(ranked[1]?.waitedMs).toBe(0);
+		expect(ranked[1]?.resumed).toBe(false);
+	});
+
+	it("reports the longest wait, which an average would hide", () => {
+		const ranked = rankWaiting(
+			record([
+				entry({ callId: "a", joinedAt: NOW - 10_000 }),
+				entry({ callId: "b", joinedAt: NOW - 660_000 }),
+				entry({ callId: "c", joinedAt: NOW - 10_000 }),
+			]),
+			NOW,
+		);
+
+		expect(longestWaitMs(ranked)).toBe(660_000);
+		expect(longestWaitMs([])).toBe(0);
+	});
+
+	it("treats an absent record as an empty line rather than as unknown", () => {
+		expect(rankWaiting(null, NOW)).toEqual([]);
 	});
 });

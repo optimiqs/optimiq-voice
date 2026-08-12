@@ -202,3 +202,78 @@ export interface RecordingDownloadLink {
 	readonly expiresAt: string;
 	readonly expiresInSeconds: number;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Queue service level
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One queue's numbers over a window, mirroring `QueueStatsRow` in
+ * `apps/api/src/cdr/query/queue-stats.ts`.
+ *
+ * ## The queue is a UUID and stays one
+ *
+ * `queueId` is `call_legs.queue_ref` and this database holds no queue NAMES — the endpoint does not
+ * join `pbx-db` to label the rows, because that is a cross-database join this architecture does not
+ * have. So the caller labels them from `GET /queues`, which every screen rendering these has
+ * already fetched. A queue deleted since the window will appear here as an id with no name, and
+ * that is the honest answer rather than a row silently dropped.
+ *
+ * ## Why `offered` is not `answered + abandoned`
+ *
+ * There are six endings and only one of them is being served. A caller the queue timed out into a
+ * voicemail box has a leg that ended `answered` in call terms, and counting them as served is how a
+ * queue nobody staffs reports perfectly — which is exactly the failure `queue_outcome` exists to
+ * stop being invisible.
+ */
+export interface QueueStatsRow {
+	readonly queueId: string;
+	/** Every call the queue was asked to serve: answered plus every way of not being. */
+	readonly offered: number;
+	readonly answered: number;
+	/** The caller hung up while holding. The number a supervisor reacts to. */
+	readonly abandoned: number;
+	/** A wait deadline expired and the queue took its timeout branch. */
+	readonly timedOut: number;
+	/** Nobody was logged in at all. Distinct from `timedOut`, because the fix is different. */
+	readonly noAgents: number;
+	/** The caller pressed the exit key. A CHOICE, which is why it is not folded into `abandoned`. */
+	readonly exited: number;
+	/**
+	 * Mean wait across ANSWERED calls only.
+	 *
+	 * Answered only, deliberately, and worth repeating on this side because a chart that mixed them
+	 * would be the classic contact-centre metric that reports the opposite of what happened: an
+	 * average including abandonments falls when callers give up sooner, so a queue getting worse
+	 * shows a shrinking hold time.
+	 */
+	readonly averageAnswerWaitMs: number;
+	readonly averageAbandonWaitMs: number;
+	/** The worst wait any answered caller had. An average hides exactly this. */
+	readonly longestAnswerWaitMs: number;
+	/**
+	 * Answered inside the target as a percentage of OFFERED, to one decimal — and `null` when
+	 * nothing was offered.
+	 *
+	 * The null is not a missing value to be coalesced away: a queue with no traffic has no service
+	 * level, and rendering it as 0% would put an idle queue and a failing one in the same colour on
+	 * a wallboard. Every renderer of this field has to say "no traffic", not "0%".
+	 */
+	readonly serviceLevelPct: number | null;
+	/** How many offered calls beat the target — the numerator, exposed so the maths is checkable. */
+	readonly withinTarget: number;
+}
+
+/**
+ * `GET /cdr/queue-stats`.
+ *
+ * Carries the resolved window and the target it was computed against, both of which are rendered:
+ * the server DEFAULTS an absent range and the SLA seconds are a question rather than a stored
+ * setting, so a page that showed neither would be reporting a percentage against a target the
+ * reader cannot see.
+ */
+export interface QueueStatsEnvelope {
+	readonly data: readonly QueueStatsRow[];
+	readonly slaSeconds: number;
+	readonly range: { readonly from: string; readonly to: string };
+}

@@ -8,7 +8,7 @@ import { PromptSelect, ResourceSelect } from "~/components/pbx/resource-select";
 import { SelectField, SwitchField, TextField } from "~/components/ui/form-fields";
 import { useServerFieldErrors } from "~/lib/forms/server-errors";
 import { PBX_RESOURCES } from "~/lib/pbx/client";
-import { QUEUE_STRATEGIES } from "~/lib/pbx/contracts";
+import { QUEUE_STRATEGIES, RECORD_POLICIES } from "~/lib/pbx/contracts";
 import {
 	EMPTY_DESTINATION,
 	readDestination,
@@ -18,7 +18,7 @@ import {
 } from "~/lib/pbx/destinations";
 import { queueFormSchema, type QueueFormValues } from "~/lib/pbx/schemas";
 import { usePbxCreate, usePbxUpdate } from "../../_hooks/use-pbx-queries";
-import type { QueueRow, QueueStrategy } from "~/lib/pbx/contracts";
+import type { QueueRow, QueueStrategy, RecordPolicy } from "~/lib/pbx/contracts";
 
 /**
  * A queue's settings: how it distributes calls, how long it holds them, and where they go when it
@@ -39,8 +39,28 @@ const STRATEGY_LABELS: Readonly<Record<QueueStrategy, string>> = {
 	random: "Pick an available agent at random",
 };
 
+/**
+ * The recording vocabulary, said in the QUEUE's terms rather than the extension's.
+ *
+ * The set is the same five `extension` and `trunk` carry — one policy, one spelling, which is why
+ * the boolean this replaced had to go — but the labels are not the extension dialog's, because
+ * `outbound` means something different here and saying "Outbound calls" would offer an operator a
+ * setting that does nothing. A queued call is INBOUND from the queue's point of view whichever
+ * direction the leg that reached it was travelling, so `outbound` never records anything a queue
+ * distributed, and the label says so rather than letting somebody discover it from an empty
+ * recordings list.
+ */
+const RECORD_POLICY_LABELS: Readonly<Record<RecordPolicy, string>> = {
+	none: "Never record",
+	inbound: "Record the calls this queue answers",
+	outbound: "Outbound only — which records nothing here",
+	all: "Record everything, which here is the same as inbound",
+	"on-demand": "Only when the agent starts it by hand",
+};
+
 function defaultsFor(queue: QueueRow | null): QueueFormValues {
-	const seconds = (value: number | undefined): string => (value === undefined ? "" : String(value));
+	/** Every numeric knob renders as text, because an emptied one has to reach the server as `null`. */
+	const numeric = (value: number | undefined): string => (value === undefined ? "" : String(value));
 	return {
 		name: queue?.name ?? "",
 		extensionNumber: queue?.extensionNumber ?? "",
@@ -49,17 +69,19 @@ function defaultsFor(queue: QueueRow | null): QueueFormValues {
 		greetingPromptId: queue?.greetingPromptId ?? "",
 		announcePromptId: queue?.announcePromptId ?? "",
 		agentWhisperPromptId: queue?.agentWhisperPromptId ?? "",
-		maxWaitSeconds: seconds(queue?.maxWaitSeconds),
-		maxWaitNoAgentSeconds: seconds(queue?.maxWaitNoAgentSeconds),
-		wrapUpSeconds: seconds(queue?.wrapUpSeconds),
+		maxWaitSeconds: numeric(queue?.maxWaitSeconds),
+		maxWaitNoAgentSeconds: numeric(queue?.maxWaitNoAgentSeconds),
+		wrapUpSeconds: numeric(queue?.wrapUpSeconds),
 		announcePositionEnabled: queue?.announcePositionEnabled ?? false,
-		announceFrequencySeconds: seconds(queue?.announceFrequencySeconds),
+		announceFrequencySeconds: numeric(queue?.announceFrequencySeconds),
 		abandonedResumeAllowed: queue?.abandonedResumeAllowed ?? false,
-		discardAbandonedAfterSeconds: seconds(queue?.discardAbandonedAfterSeconds),
+		discardAbandonedAfterSeconds: numeric(queue?.discardAbandonedAfterSeconds),
 		tierRulesApply: queue?.tierRulesApply ?? true,
-		tierRuleWaitSeconds: seconds(queue?.tierRuleWaitSeconds),
+		tierRuleWaitSeconds: numeric(queue?.tierRuleWaitSeconds),
 		tierRuleNoAgentNoWait: queue?.tierRuleNoAgentNoWait ?? false,
-		recordEnabled: queue?.recordEnabled ?? false,
+		recordPolicy: queue?.recordPolicy ?? "none",
+		exitKey: queue?.exitKey ?? "",
+		defaultPriority: numeric(queue?.defaultPriority),
 		enabled: queue?.enabled ?? true,
 	};
 }
@@ -81,7 +103,11 @@ export function QueueDialog({
 	const initialTimeout = queue
 		? readDestination(queue as unknown as Record<string, unknown>, "timeout")
 		: EMPTY_DESTINATION;
+	const initialExit = queue
+		? readDestination(queue as unknown as Record<string, unknown>, "exit")
+		: EMPTY_DESTINATION;
 	const [timeoutDestination, setTimeoutDestination] = useState<DestinationValue>(initialTimeout);
+	const [exitDestination, setExitDestination] = useState<DestinationValue>(initialExit);
 	const [localErrors, setLocalErrors] = useState<Readonly<Record<string, string>>>({});
 
 	const form = useForm({
@@ -91,12 +117,29 @@ export function QueueDialog({
 			const parsed = queueFormSchema.parse(value);
 			server.clear();
 
-			const problem = validateDestinationValue(timeoutDestination, { required: false });
-			if (problem) {
-				setLocalErrors({
-					[`timeoutDestination${problem.field.charAt(0).toUpperCase()}${problem.field.slice(1)}`]:
-						problem.message,
-				});
+			/**
+			 * Both optional trios, checked in one pass so the first incomplete one is the one named.
+			 *
+			 * The exit destination is checked even when there is no exit key: a destination chosen and
+			 * then left half-filled is a 422 either way, and refusing it here puts the message on the
+			 * control rather than on the round trip. The reverse pairing — a key with nowhere to go —
+			 * is a WARNING rather than an error, and it is said beside the key itself, because the
+			 * server accepts it and the engine simply drops the caller.
+			 */
+			const issues: Record<string, string> = {};
+			for (const [prefix, value] of [
+				["timeout", timeoutDestination],
+				["exit", exitDestination],
+			] as const) {
+				const problem = validateDestinationValue(value, { required: false });
+				if (problem) {
+					issues[
+						`${prefix}Destination${problem.field.charAt(0).toUpperCase()}${problem.field.slice(1)}`
+					] = problem.message;
+				}
+			}
+			if (Object.keys(issues).length > 0) {
+				setLocalErrors(issues);
 				return;
 			}
 			setLocalErrors({});
@@ -129,9 +172,12 @@ export function QueueDialog({
 				tierRulesApply: parsed.tierRulesApply,
 				tierRuleWaitSeconds: parsed.tierRuleWaitSeconds,
 				tierRuleNoAgentNoWait: parsed.tierRuleNoAgentNoWait,
-				recordEnabled: parsed.recordEnabled,
+				recordPolicy: parsed.recordPolicy,
+				exitKey: parsed.exitKey,
+				defaultPriority: parsed.defaultPriority,
 				enabled: parsed.enabled,
 				...writeDestination(timeoutDestination, "timeout"),
+				...writeDestination(exitDestination, "exit"),
 			};
 
 			try {
@@ -159,6 +205,7 @@ export function QueueDialog({
 					mutation.reset();
 					setLocalErrors({});
 					setTimeoutDestination(initialTimeout);
+					setExitDestination(initialExit);
 					form.reset();
 				}
 				onOpenChange(next);
@@ -219,6 +266,19 @@ export function QueueDialog({
 								</option>
 							))}
 						</SelectField>
+					)}
+				</form.Field>
+				<form.Field name="defaultPriority">
+					{(field) => (
+						<TextField
+							field={field}
+							label="Starting priority"
+							placeholder="0"
+							description="0–1000, and higher is answered first. Whatever sends the call here can override it — an IVR option for platinum customers is exactly that."
+							disabled={mutation.isPending}
+							submitError={errors.defaultPriority}
+							className="sm:col-span-2"
+						/>
 					)}
 				</form.Field>
 			</FormSection>
@@ -284,6 +344,61 @@ export function QueueDialog({
 				value={timeoutDestination}
 				onChange={(next) => {
 					setTimeoutDestination(next);
+					setLocalErrors({});
+				}}
+				disabled={mutation.isPending}
+				errors={errors}
+			/>
+
+			{/*
+			 * The exit key: the one control on this form that gives the CALLER a decision.
+			 *
+			 * Its own section rather than a field in "Waiting", because the key and where it leads are
+			 * one setting in two halves — a key with nowhere to go drops the caller, and a destination
+			 * with no key is unreachable. The pairing warning below says which half is missing rather
+			 * than letting an operator find out from a queue that swallows callers who press 2.
+			 */}
+			<FormSection
+				title="Letting a caller out"
+				description="A waiting caller can press one key to stop holding. Leave the key empty and the queue has no exit at all, which is how every queue behaved before this existed."
+				columns={1}
+			>
+				<form.Field name="exitKey">
+					{(field) => (
+						<TextField
+							field={field}
+							label="Exit key"
+							placeholder="2"
+							description="One digit: 0–9, *, # or A–D. A caller four minutes into a hold will not type a string, so there is no longer code."
+							disabled={mutation.isPending}
+							submitError={errors.exitKey}
+						/>
+					)}
+				</form.Field>
+				<form.Subscribe selector={(state) => state.values.exitKey}>
+					{(exitKey) =>
+						exitKey.trim().length > 0 && exitDestination.type === null ? (
+							<p className="text-xs text-warning">
+								This key has nowhere to send the caller yet. Until a destination is chosen below,
+								pressing it takes them out of the line and hangs up on them.
+							</p>
+						) : exitKey.trim().length === 0 && exitDestination.type !== null ? (
+							<p className="text-xs text-warning">
+								Nothing can reach this destination without a key above, so it is configuration that
+								never runs.
+							</p>
+						) : null
+					}
+				</form.Subscribe>
+			</FormSection>
+
+			<DestinationPicker
+				prefix="exit"
+				label="Where the exit key sends them"
+				description="Usually the queue's own voicemail box, so a caller who cannot wait can still leave a message. An overflow queue, the operator or a callback IVR are the other common answers."
+				value={exitDestination}
+				onChange={(next) => {
+					setExitDestination(next);
 					setLocalErrors({});
 				}}
 				disabled={mutation.isPending}
@@ -441,13 +556,21 @@ export function QueueDialog({
 						/>
 					)}
 				</form.Field>
-				<form.Field name="recordEnabled">
+				<form.Field name="recordPolicy">
 					{(field) => (
-						<SwitchField
+						<SelectField
 							field={field}
-							label="Record calls answered from this queue"
+							label="Recording"
+							description="Recording starts when an agent ANSWERS, never at the join — hold music is not evidence of anything, and recording it would put every abandoned call in the retention bucket."
 							disabled={mutation.isPending}
-						/>
+							submitError={errors.recordPolicy}
+						>
+							{RECORD_POLICIES.map((value) => (
+								<option key={value} value={value}>
+									{RECORD_POLICY_LABELS[value]}
+								</option>
+							))}
+						</SelectField>
 					)}
 				</form.Field>
 				<form.Field name="enabled">

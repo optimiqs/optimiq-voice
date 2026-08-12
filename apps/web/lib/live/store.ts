@@ -270,6 +270,153 @@ export function parseTrunkStatusEvent(
 	};
 }
 
+// ---------------------------------------------------------------------------------------------
+// the waiting line
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One caller standing in one queue's line, as the `queue-waiting` bucket holds them.
+ *
+ * Mirrors `queueWaitingEntrySchema` in `packages/events`, epoch millis and all. Those timestamps
+ * are the exception that package makes to its own ISO rule and the reason is the same one that
+ * applies here: they are COMPARED against a clock rather than read, once a second per waiting
+ * caller, and this screen re-ranks the line on the same tick.
+ */
+export interface LiveWaitingEntry {
+	readonly callId: string;
+	readonly legId: string;
+	/** Higher dequeues first. The same 0-1000 scale the queue's `defaultPriority` is on. */
+	readonly priority: number;
+	/** Epoch millis. The order within a priority, and what an abandoned-resume restores. */
+	readonly joinedAt: number;
+	/** Epoch millis. Past this with no renewal, any writer may prune the entry — and so does this. */
+	readonly expiresAt: number;
+	readonly callerNumber?: string;
+}
+
+/**
+ * One queue's whole line, which is ONE key in the bucket rather than one key per caller.
+ *
+ * That shape is the reason `useLiveQueue` can hold a single record instead of a keyed map: the
+ * value IS the line, complete by construction, so any frame carrying one replaces everything this
+ * client knew. The tombstones are carried but not rendered — a promise held for somebody who has
+ * hung up is not a caller on a wallboard, and showing it as one would inflate every waiting count.
+ */
+export interface LiveWaitingRecord {
+	readonly orgId: string;
+	readonly queueId: string;
+	readonly entries: readonly LiveWaitingEntry[];
+	readonly updatedAt: number;
+}
+
+export function parseWaitingRecord(value: unknown): LiveWaitingRecord | undefined {
+	if (!isRecord(value) || typeof value.queueId !== "string" || !Array.isArray(value.entries)) {
+		return undefined;
+	}
+	const entries: LiveWaitingEntry[] = [];
+	for (const candidate of value.entries) {
+		// `expiresAt` is required rather than tolerated: it is the lease, and an entry without one
+		// could never be pruned by a reader — a caller who hung up would stay on the wallboard until
+		// the engine's next write, which on a quiet queue is exactly when nobody is writing.
+		if (
+			isRecord(candidate) &&
+			typeof candidate.callId === "string" &&
+			typeof candidate.joinedAt === "number" &&
+			typeof candidate.priority === "number" &&
+			typeof candidate.expiresAt === "number"
+		) {
+			entries.push(candidate as unknown as LiveWaitingEntry);
+		}
+	}
+	return {
+		orgId: typeof value.orgId === "string" ? value.orgId : "",
+		queueId: value.queueId,
+		entries,
+		updatedAt: typeof value.updatedAt === "number" ? value.updatedAt : 0,
+	};
+}
+
+/** A caller in the line, with the two things the record does not store: their place and their wait. */
+export interface WaitingCaller extends LiveWaitingEntry {
+	/** 1-based, computed from the whole line — the record stores no position and never should. */
+	readonly position: number;
+	/** `now - joinedAt`. For a resumed caller this counts from the place they were RESTORED to. */
+	readonly waitedMs: number;
+	/**
+	 * Whether this caller rang back inside the discard window and was put back where they were.
+	 *
+	 * Not a field on the entry, because it is a property of the JOIN rather than of the place: the
+	 * engine reports it on `queue.caller.joined` and the KV record only carries the restored
+	 * `joinedAt`. So a page opened AFTER a resumed caller joined cannot know, and does not claim to
+	 * — the badge appears for joins this tab observed. Worth showing at all because without it a
+	 * supervisor sees somebody arrive at position 2 ahead of a caller who has been holding a minute
+	 * and has no way to tell a restored place from a bug.
+	 */
+	readonly resumed: boolean;
+}
+
+/**
+ * The line in served order, with the lapsed entries dropped and a position on each.
+ *
+ * ## The comparator is the engine's, restated
+ *
+ * `(priority DESC, joinedAt ASC, callId ASC)` — `apps/engine/src/queue/queue-waiting.ts` argues
+ * each key at length. The `callId` tie-break is the one that looks like decoration and is not: two
+ * callers can join in the same millisecond, and without a total order the rank of each would depend
+ * on the array order the record happened to be written in. A wallboard that ordered differently
+ * from the engine would show a supervisor a queue that answers out of order.
+ *
+ * ## Expired entries are dropped HERE too
+ *
+ * A record is one key, so per-caller server-side expiry does not exist and the engine prunes on its
+ * way past. Between two writes a lapsed entry is still in the value this client holds, and
+ * rendering it is a wallboard showing a caller who hung up — which is the one thing a wallboard
+ * must not do. Dropping it costs nothing: the next write agrees.
+ */
+export function rankWaiting(
+	record: LiveWaitingRecord | null,
+	now: number,
+	resumedCallIds: ReadonlySet<string> = new Set(),
+): readonly WaitingCaller[] {
+	if (record === null) {
+		return [];
+	}
+	return record.entries
+		.filter((entry) => entry.expiresAt > now)
+		.sort(
+			(left, right) =>
+				right.priority - left.priority ||
+				left.joinedAt - right.joinedAt ||
+				left.callId.localeCompare(right.callId),
+		)
+		.map((entry, index) => ({
+			...entry,
+			position: index + 1,
+			// Clamped at zero: a caller whose `joinedAt` is in this browser's future is a clock skew
+			// between the engine and the viewer, and a negative wait on a wallboard reads as a bug in
+			// the queue rather than in the laptop it is being watched from.
+			waitedMs: Math.max(0, now - entry.joinedAt),
+			resumed: resumedCallIds.has(entry.callId),
+		}));
+}
+
+/**
+ * The longest wait in the line, in milliseconds. `0` for an empty line.
+ *
+ * The number a supervisor actually reacts to, and deliberately not an average: a queue holding
+ * nineteen callers for ten seconds and one for eleven minutes has an unremarkable mean and one
+ * customer who is about to hang up.
+ */
+export function longestWaitMs(callers: readonly WaitingCaller[]): number {
+	let longest = 0;
+	for (const caller of callers) {
+		if (caller.waitedMs > longest) {
+			longest = caller.waitedMs;
+		}
+	}
+	return longest;
+}
+
 /** The agent statuses that count as staffing a queue. Mirrors the engine's `isStaffing`. */
 export function isStaffing(status: string): boolean {
 	return status !== "logged-out";

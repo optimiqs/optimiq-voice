@@ -1,7 +1,7 @@
 "use client";
 
 import { useQueryClient } from "@tanstack/react-query";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { queueTopic } from "~/lib/live/protocol";
 import {
 	applySnapshot,
@@ -14,11 +14,15 @@ import {
 	parseChannel,
 	parseRegistration,
 	parseTrunkStatusEvent,
+	parseWaitingRecord,
+	rankWaiting,
 	type LiveAgentState,
 	type LiveChannel,
 	type LiveKvState,
 	type LiveRegistration,
 	type LiveTrunkStatus,
+	type LiveWaitingRecord,
+	type WaitingCaller,
 } from "~/lib/live/store";
 import { PBX_RESOURCES } from "~/lib/pbx/client";
 import { queryKeys } from "~/lib/query-keys";
@@ -226,75 +230,132 @@ export function useLiveAgentStates(): LiveAgentStatesResult {
 // ---------------------------------------------------------------------------------------------
 
 export interface LiveQueueResult {
-	/** Callers currently waiting, keyed by call id, oldest first. */
-	readonly waiting: readonly {
-		readonly callId: string;
-		readonly since: string;
-		readonly callerNumber?: string;
-	}[];
+	/** The line, in served order, with a position and a wait on each. Empty until a frame arrives. */
+	readonly waiting: readonly WaitingCaller[];
+	/** The record as the bucket holds it, for a caller that wants `updatedAt` or the raw entries. */
+	readonly record: LiveWaitingRecord | null;
 	readonly loaded: boolean;
 	readonly permitted: boolean;
 }
 
 /**
- * Callers waiting in one queue, derived from the queue event stream.
+ * Callers waiting in one queue, from the `queue-waiting` bucket.
  *
- * There is no KV bucket of waiting callers — the engine holds that in memory — so this is built by
- * following `caller.joined` / `caller.answered` / `caller.abandoned`. That has a real consequence
- * and it is stated rather than hidden: a page opened while callers are ALREADY waiting starts at
- * zero and becomes correct as the queue turns over, because there is no snapshot to ask for. A
- * count that claimed otherwise would be worse than one that is honestly incomplete, so the caller
- * gets `loaded` and can label it.
+ * ## Why this is a single RECORD and not a keyed map
+ *
+ * Every other live topic here is a KV projection with one key per thing, so `useKvTopic`'s map is
+ * the right shape and a snapshot replaces it wholesale. This bucket is keyed `<orgId>.<queueId>`
+ * and the VALUE is the entire line — `packages/events` argues why (a position is a rank over the
+ * whole line, so a per-caller key would turn every announcement into a range read and would let a
+ * half-applied write produce an order nobody ever held). So there is exactly one row to hold, and
+ * any frame carrying one replaces everything this client knew.
+ *
+ * That also solves a problem the generic hook cannot: the `queue:<id>` topic multiplexes THREE
+ * sources — the waiting bucket, the agent-state bucket and the queue event stream — and a snapshot
+ * frame does not say which source it came from. A keyed map would have the agent-state snapshot
+ * clobber the waiting snapshot or the reverse, depending on which arrived last. Holding one record
+ * and only replacing it when a frame actually parses as a line makes the order between the two
+ * frames irrelevant.
+ *
+ * The consequence is stated rather than hidden: the absence of a frame is NOT evidence of an empty
+ * line, so a record is never cleared by silence. What converges the display instead is the lease —
+ * `rankWaiting` drops entries whose `expiresAt` has passed, so a queue that empties and stops being
+ * written about drains on screen within one lease rather than staying frozen.
+ *
+ * ## `resumed` comes from the EVENT, not from the entry
+ *
+ * `queue.caller.joined` carries it and the bucket entry does not: what the entry holds is the
+ * restored `joinedAt`, which is the effect rather than the fact. So joins observed while this tab
+ * is open are remembered by call id and the badge is rendered for those; a caller who was already
+ * waiting when the page opened is shown without one rather than with a guess.
  */
 export function useLiveQueue(queueId: string | null): LiveQueueResult {
 	const permitted = usePermission("queues.monitor");
-	const [waiting, setWaiting] = useState<
-		readonly { callId: string; since: string; callerNumber?: string }[]
-	>([]);
+	const [record, setRecord] = useState<LiveWaitingRecord | null>(null);
+	const [resumedCallIds, setResumedCallIds] = useState<ReadonlySet<string>>(() => new Set());
 	const [loaded, setLoaded] = useState(false);
+	const [tick, setTick] = useState(() => Date.now());
+
+	const onSnapshot = useCallback((event: LiveSnapshotEvent) => {
+		for (const row of event.rows) {
+			const parsed = parseWaitingRecord(row.value);
+			if (parsed !== undefined) {
+				setRecord(parsed);
+			}
+		}
+		// True even for the agent-state frame that carries no line: the topic answered, and a queue
+		// with nobody waiting produces exactly this — a subscriber that waited for a line before
+		// admitting it was connected would show "not loaded" for every quiet queue.
+		setLoaded(true);
+	}, []);
 
 	const onUpdate = useCallback((event: LiveUpdateEvent) => {
-		const envelope = event.data as { type?: string; at?: string; data?: Record<string, unknown> };
-		const payload = envelope?.data;
-		if (payload === undefined || typeof payload.callId !== "string") {
+		if (event.kind === "put") {
+			const parsed = parseWaitingRecord(event.data);
+			if (parsed !== undefined) {
+				setRecord(parsed);
+				setLoaded(true);
+			}
+			return;
+		}
+		if (event.kind !== "caller.joined") {
+			return;
+		}
+		const payload = (event.data as { data?: Record<string, unknown> } | undefined)?.data;
+		if (payload?.resumed !== true || typeof payload.callId !== "string") {
 			return;
 		}
 		const callId = payload.callId;
-		setLoaded(true);
-		if (event.kind === "caller.joined") {
-			setWaiting((previous) =>
-				previous.some((entry) => entry.callId === callId)
-					? previous
-					: [
-							...previous,
-							{
-								callId,
-								since: envelope.at ?? event.at,
-								...(typeof payload.callerNumber === "string"
-									? { callerNumber: payload.callerNumber }
-									: {}),
-							},
-						],
-			);
-			return;
-		}
-		if (event.kind === "caller.answered" || event.kind === "caller.abandoned") {
-			setWaiting((previous) => {
-				const next = previous.filter((entry) => entry.callId !== callId);
-				return next.length === previous.length ? previous : next;
-			});
-		}
+		setResumedCallIds((previous) => {
+			if (previous.has(callId)) {
+				return previous;
+			}
+			const next = new Set(previous);
+			next.add(callId);
+			return next;
+		});
 	}, []);
 
 	useLiveTopic(
 		queueId === null ? null : queueTopic(queueId),
-		{ onUpdate },
+		{ onSnapshot, onUpdate },
 		{
 			enabled: permitted,
 		},
 	);
 
-	return { waiting, loaded, permitted };
+	/**
+	 * The clock the ranking is computed against.
+	 *
+	 * A caller's wait grows without anything arriving on the socket, so a line rendered only when a
+	 * frame lands would freeze at whatever the last write said — "waiting 12s" for four minutes.
+	 * One second is the resolution the numbers are displayed at; anything faster would re-render for
+	 * digits nobody can read.
+	 *
+	 * It does not run for an EMPTY line, which matters on a wallboard: a tenant with a dozen queues
+	 * mounts a dozen of these, and ticking each one once a second to re-derive an empty array is a
+	 * background tab burning a core to display nothing. An empty record cannot become non-empty
+	 * without a frame, and a frame re-runs this effect.
+	 */
+	const pending = record?.entries.length ?? 0;
+	useEffect(() => {
+		if (queueId === null || !permitted || pending === 0) {
+			return;
+		}
+		const handle = setInterval(() => {
+			setTick(Date.now());
+		}, 1_000);
+		return () => {
+			clearInterval(handle);
+		};
+	}, [queueId, permitted, pending]);
+
+	const waiting = useMemo(
+		() => rankWaiting(record, tick, resumedCallIds),
+		[record, tick, resumedCallIds],
+	);
+
+	return { waiting, record, loaded, permitted };
 }
 
 // ---------------------------------------------------------------------------------------------

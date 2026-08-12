@@ -34,7 +34,17 @@ export type DestinationPrefix =
 	| "invalid"
 	| "nomatch"
 	| "night"
-	| "fallback";
+	| "fallback"
+	/**
+	 * A queue's exit key: where a WAITING caller goes when they press the digit that lets them stop
+	 * waiting.
+	 *
+	 * Optional like `timeout` and unlike `night`/`fallback` — a queue with no exit key has no exit
+	 * destination, which is what every queue looked like before the column existed. It is a full
+	 * trio rather than a hard-wired "voicemail" because the useful answer differs per tenant: an
+	 * overflow queue, the operator, a callback IVR, and — most often — the queue's own mailbox.
+	 */
+	| "exit";
 
 export interface DestinationFieldNames {
 	readonly type: string;

@@ -107,6 +107,24 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, PageRequirement>> = {
 	[routes.mediaLibrary]: { permissions: ["settings.read"] },
 	[routes.cdr]: { permissions: ["cdr.read", "cdr.read.own"] },
 	/**
+	 * The wallboard and, by ancestry, each queue's operator panel.
+	 *
+	 * `queues.monitor` alone, which is what BOTH halves of the screen are guarded with on the server:
+	 * `live-topics.ts` gates the `queue:<id>` and `agent-state` topics on it, and the cdr controller
+	 * gates `GET /cdr/queue-stats` on it too — deliberately, so a wallboard whose live tiles worked
+	 * while its service-level row said 403 cannot happen.
+	 *
+	 * NOT `queues.read`, even though the page lists queues by name. The two grants come apart in the
+	 * direction that matters: `queues.monitor` is what the `agent` template holds, and an agent
+	 * watching their own queue is the whole point. Naming `cdr.read` would be worse still — it would
+	 * hand a supervisor's SLA row the right to read every call the tenant ever made.
+	 *
+	 * Acting on what the panel shows — moving an agent in or out — is `queues.manage-agents` and is
+	 * gated INSIDE the page, because a role that may watch the floor and not change it is a real role
+	 * and is most of the people who will open this.
+	 */
+	[routes.wallboard]: { permissions: ["queues.monitor"] },
+	/**
 	 * The change ledger.
 	 *
 	 * `audit.read` alone, and that single entry is the whole reason the permission exists:

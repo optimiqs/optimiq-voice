@@ -13,10 +13,20 @@ import { EmptyState } from "~/components/ui/empty-state";
 import { PageHeader } from "~/components/ui/page-header";
 import { LoadingPanel } from "~/components/ui/spinner";
 import { ApiError } from "~/lib/api-client";
+import { DEFAULT_SLA_SECONDS } from "~/lib/cdr/client";
+import { formatDuration } from "~/lib/cdr/format";
+import {
+	describeShortfalls,
+	emptyQueueStats,
+	formatServiceLevel,
+	serviceLevelTone,
+} from "~/lib/cdr/queue-stats";
+import { longestWaitMs } from "~/lib/live/store";
 import { PBX_CHILDREN, PBX_RESOURCES } from "~/lib/pbx/client";
 import { describeDestination, readDestination } from "~/lib/pbx/destinations";
 import { queueTabHref, routes } from "~/lib/routes";
 import { usePermission } from "../../_context/session-context";
+import { useQueueStats } from "../../_hooks/use-cdr-queries";
 import { useLiveAgentStates, useLiveQueue } from "../../_hooks/use-live-queries";
 import {
 	usePbxChildDelete,
@@ -27,8 +37,8 @@ import {
 import { AgentSessionControls, LiveIndicator } from "./agent-console";
 import { QueueDialog } from "./queue-dialog";
 import { AgentStatusBadge } from "./queue-shared";
-import type { QueueAgentStatus } from "~/lib/pbx/contracts";
 import { QueueTierDialog } from "./queue-tier-dialog";
+import type { QueueAgentStatus } from "~/lib/pbx/contracts";
 import type { QueueAgentRow, QueueRow, QueueTierRow } from "~/lib/pbx/contracts";
 
 /**
@@ -57,10 +67,12 @@ import type { QueueAgentRow, QueueRow, QueueTierRow } from "~/lib/pbx/contracts"
  * never ahead. The table therefore prefers the socket's answer and falls back to the row, which is
  * what makes the first paint say something true instead of nothing.
  *
- * The waiting-caller count is derived from the queue event stream and has no snapshot behind it:
- * the engine holds the waiting list in memory, so a page opened while callers are already queued
- * starts at zero and becomes correct as the queue turns over. That is labelled rather than hidden —
- * a count that claimed to be complete would be worse than one that says it is watching.
+ * The waiting-caller count now comes from the `queue-waiting` bucket rather than from a replay of
+ * join events, so a page opened mid-shift is correct on its first frame instead of counting from
+ * zero. What is still deliberately absent is any way to ACT on a waiting caller: this is the
+ * configuration page, and the floor — the line in order, the priorities, the agents and the
+ * controls that move them — is `/wallboard/<id>`, which is gated by `queues.monitor` rather than by
+ * `queues.read`.
  */
 export function QueueDetail({ queueId }: { queueId: string }) {
 	const queue = usePbxItem(PBX_RESOURCES.queues, queueId);
@@ -153,8 +165,10 @@ export function QueueDetail({ queueId }: { queueId: string }) {
 						value={String(liveQueue.waiting.length)}
 						hint={
 							liveQueue.loaded
-								? "Callers who joined while this page was open."
-								: "Counting from the moment this page opened — the engine holds the waiting list, so earlier callers are not included."
+								? liveQueue.waiting.length === 0
+									? "Nobody is holding."
+									: `Longest has waited ${formatDuration(longestWaitMs(liveQueue.waiting))}.`
+								: "Waiting for the queue's first frame."
 						}
 					/>
 					<LiveTile
@@ -178,6 +192,8 @@ export function QueueDetail({ queueId }: { queueId: string }) {
 					/>
 				</div>
 			) : null}
+
+			{canMonitor ? <QueueStatsCard queueId={queueId} queueName={row.name} /> : null}
 
 			{!tiers.isPending && staffed.length === 0 ? (
 				<NoticeBanner
@@ -359,11 +375,103 @@ export function QueueDetail({ queueId }: { queueId: string }) {
 }
 
 /**
+ * How this queue has actually been doing, over the endpoint's own default window.
+ *
+ * A small card and not the wallboard's table, on purpose. This page is where somebody CONFIGURES a
+ * queue, and the question it has to answer here is narrow: are the settings above working? So it
+ * shows one queue's numbers over one window with no controls at all — no preset, no SLA target, no
+ * comparison against the other queues — and links to the wallboard for the version that has them.
+ * Putting a window control here would have made the configuration page a second reporting screen
+ * that agreed with the first only by accident.
+ *
+ * The window is the SERVER's default (the last 24 hours) and the card says so from the echoed
+ * `range`, rather than this component deciding: a defaulted filter the reader cannot see is how
+ * "why do these numbers look wrong" starts.
+ */
+function QueueStatsCard({ queueId, queueName }: { queueId: string; queueName: string }) {
+	const stats = useQueueStats({ queueId });
+	const row = stats.byQueueId.get(queueId) ?? emptyQueueStats(queueId);
+	const shortfalls = describeShortfalls(row);
+
+	return (
+		<div className="flex flex-col gap-3 rounded-panel border border-border bg-surface px-4 py-3">
+			<div className="flex flex-wrap items-center justify-between gap-3">
+				<div>
+					<p className="text-sm font-medium text-foreground">Service level</p>
+					<p className="text-xs text-muted-foreground">
+						{stats.range
+							? `${new Date(stats.range.from).toLocaleString()} to ${new Date(stats.range.to).toLocaleString()}, answered within ${String(stats.slaSeconds ?? DEFAULT_SLA_SECONDS)} seconds.`
+							: "Answered within the target, as a share of every call this queue was asked to serve."}
+					</p>
+				</div>
+				<Link
+					href={routes.wallboardQueue(queueId)}
+					className="text-xs text-primary underline-offset-4 hover:underline"
+				>
+					Watch {queueName} live
+				</Link>
+			</div>
+
+			<div className="flex flex-wrap items-center gap-x-6 gap-y-2">
+				<StatFigure
+					label="Service level"
+					value={formatServiceLevel(row.serviceLevelPct)}
+					tone={serviceLevelTone(row.serviceLevelPct)}
+				/>
+				<StatFigure label="Offered" value={String(row.offered)} />
+				<StatFigure label="Answered" value={String(row.answered)} />
+				<StatFigure
+					label="Average wait"
+					value={row.answered === 0 ? "—" : formatDuration(row.averageAnswerWaitMs)}
+				/>
+				<StatFigure
+					label="Longest wait"
+					value={row.answered === 0 ? "—" : formatDuration(row.longestAnswerWaitMs)}
+				/>
+			</div>
+
+			{shortfalls.length > 0 ? (
+				<p className="text-xs text-muted-foreground">
+					Not served —{" "}
+					{shortfalls.map((entry) => `${entry.label}: ${String(entry.value)}`).join(" · ")}
+				</p>
+			) : null}
+		</div>
+	);
+}
+
+function StatFigure({
+	label,
+	value,
+	tone,
+}: {
+	label: string;
+	value: string;
+	tone?: "neutral" | "accent" | "success" | "warning" | "danger";
+}) {
+	return (
+		<div className="flex flex-col">
+			<span className="text-xs text-muted-foreground">{label}</span>
+			{tone === undefined ? (
+				<span className="text-lg font-semibold text-foreground" data-tabular>
+					{value}
+				</span>
+			) : (
+				<Badge tone={tone} data-tabular>
+					{value}
+				</Badge>
+			)}
+		</div>
+	);
+}
+
+/**
  * One live number.
  *
- * A plain card rather than a chart: the useful question on a queue page is "how many, right now",
- * and a sparkline would be inventing a history the client does not have (there is no snapshot
- * behind the waiting count — see the class header).
+ * A plain card rather than a chart: the useful question on a CONFIGURATION page is "how many, right
+ * now", and a sparkline would be inventing a history this client does not have — the bucket holds
+ * the current line and nothing about what it was ten minutes ago. The wallboard is where that
+ * question belongs, and it answers it from the ledger rather than by keeping a chart in a tab.
  */
 function LiveTile({ label, value, hint }: { label: string; value: string; hint: string }) {
 	return (

@@ -7,6 +7,7 @@ import type {
 	CdrExportRow,
 	CdrExportStatus,
 	CursorEnvelope,
+	QueueStatsEnvelope,
 	RecordingDownloadLink,
 	RecordingRow,
 } from "./contracts";
@@ -90,6 +91,62 @@ export async function getCall(
 		`/cdr/calls/${callId}?${cdrSearchParams({ ...options })}`,
 	);
 	return data;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Queue service level
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * `DEFAULT_SLA_SECONDS` and `MAX_SLA_SECONDS`, mirrored from `apps/api/src/cdr/query/queue-stats.ts`.
+ *
+ * Twenty seconds is the industry's default target and the server's, so a wallboard that opened on
+ * anything else would report a number nobody asked for against a target they cannot see.
+ */
+export const DEFAULT_SLA_SECONDS = 20;
+export const MAX_SLA_SECONDS = 3_600;
+
+export interface QueueStatsQuery {
+	readonly from?: string | undefined;
+	readonly to?: string | undefined;
+	/** One queue, or every queue with traffic in the window. */
+	readonly queueId?: string | undefined;
+	readonly slaSeconds?: number | undefined;
+}
+
+/**
+ * The parameters as the endpoint takes them, with the ones the caller did not set omitted.
+ *
+ * Pure and exported so a spec can pin two decisions that would otherwise only be visible as a 400
+ * or as a duplicated cache entry. Omitting rather than sending empty matters for the same two
+ * reasons {@link cdrSearchParams} states — the server DEFAULTS an absent range, and this object IS
+ * the React Query cache key — and the SLA target is CLAMPED here rather than sent and refused,
+ * because a supervisor dragging a control past an hour meant "the maximum", not "an error".
+ */
+export function queueStatsParams(query: QueueStatsQuery): Record<string, unknown> {
+	const slaSeconds = query.slaSeconds ?? DEFAULT_SLA_SECONDS;
+	return {
+		...(query.from === undefined ? {} : { from: query.from }),
+		...(query.to === undefined ? {} : { to: query.to }),
+		...(query.queueId === undefined ? {} : { queueId: query.queueId }),
+		slaSeconds: Math.min(MAX_SLA_SECONDS, Math.max(1, Math.round(slaSeconds))),
+	};
+}
+
+/**
+ * Queue service level over a window.
+ *
+ * Gated by `queues.monitor` rather than by `cdr.read`, unlike everything else in this file, and the
+ * controller argues why: what comes back is counts and averages per queue — no caller number, no
+ * leg, nothing that names a call — and a wallboard whose live tiles worked while its service-level
+ * tile said 403 would be a wallboard with a hole in it. It lives HERE all the same, because the
+ * route does: it is `/api/v1/cdr/queue-stats`, and putting the fetch beside the PBX CRUD client
+ * would hide that this reads the ledger.
+ */
+export async function fetchQueueStats(query: QueueStatsQuery = {}): Promise<QueueStatsEnvelope> {
+	return await apiFetch<QueueStatsEnvelope>(
+		`/cdr/queue-stats?${cdrSearchParams(queueStatsParams(query))}`,
+	);
 }
 
 export async function listRecordings(

@@ -3,10 +3,13 @@ import {
 	CDR_EXPORT_MAX_RANGE_DAYS,
 	CDR_EXPORT_MAX_ROWS,
 	cdrSearchParams,
+	DEFAULT_SLA_SECONDS,
 	describeExportFilters,
 	isSettledExportStatus,
 	MAX_CDR_LIMIT,
 	MAX_RANGE_DAYS,
+	MAX_SLA_SECONDS,
+	queueStatsParams,
 } from "./client";
 import { CDR_EXPORT_FAILURES, CDR_EXPORT_STATUSES } from "./contracts";
 
@@ -139,5 +142,57 @@ describe("describeExportFilters", () => {
 		expect(describeExportFilters({ recorded: false })).toEqual([
 			{ label: "Recorded only", value: "false" },
 		]);
+	});
+});
+
+/**
+ * The SLA question, as parameters.
+ *
+ * Two decisions live here and neither is visible from the screen that uses them: what a wallboard
+ * asks when nobody has chosen a window, and what happens to a target somebody pushes past the
+ * server's ceiling.
+ */
+describe("queueStatsParams", () => {
+	it("always sends a target, because the number is meaningless without one", () => {
+		expect(queueStatsParams({})).toEqual({ slaSeconds: DEFAULT_SLA_SECONDS });
+	});
+
+	/**
+	 * The window is omitted rather than resolved here so the SERVER's default applies and comes back
+	 * echoed in `range` — a client that guessed at a default would render a window the response then
+	 * disagreed with.
+	 */
+	it("omits the window and the queue when neither was chosen", () => {
+		const params = queueStatsParams({ from: undefined, to: undefined, queueId: undefined });
+
+		expect(Object.keys(params).sort()).toEqual(["slaSeconds"]);
+	});
+
+	it("passes a chosen window and a single queue straight through", () => {
+		expect(
+			queueStatsParams({
+				from: "2026-08-01T00:00:00.000Z",
+				to: "2026-08-02T00:00:00.000Z",
+				queueId: "019fd5fb-de54-700b-8826-8cf8ab5199af",
+				slaSeconds: 60,
+			}),
+		).toEqual({
+			from: "2026-08-01T00:00:00.000Z",
+			to: "2026-08-02T00:00:00.000Z",
+			queueId: "019fd5fb-de54-700b-8826-8cf8ab5199af",
+			slaSeconds: 60,
+		});
+	});
+
+	/**
+	 * Clamped rather than sent and refused: a supervisor dragging the control to its end meant "the
+	 * maximum", and a 400 in place of a number is the wrong answer to that. The floor is 1 for the
+	 * same reason — a zero-second target is not a question anybody is asking.
+	 */
+	it("clamps the target to the range the server accepts, and rounds a fractional one", () => {
+		expect(queueStatsParams({ slaSeconds: MAX_SLA_SECONDS + 1 }).slaSeconds).toBe(MAX_SLA_SECONDS);
+		expect(queueStatsParams({ slaSeconds: 0 }).slaSeconds).toBe(1);
+		expect(queueStatsParams({ slaSeconds: -30 }).slaSeconds).toBe(1);
+		expect(queueStatsParams({ slaSeconds: 20.4 }).slaSeconds).toBe(20);
 	});
 });

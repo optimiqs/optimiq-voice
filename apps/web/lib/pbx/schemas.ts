@@ -25,6 +25,9 @@ import {
 	IVR_OPTION_MATCH_KINDS,
 	QUEUE_AGENT_CONTACT_KINDS,
 	QUEUE_AGENT_STATUSES,
+	QUEUE_EXIT_KEY_PATTERN,
+	QUEUE_PRIORITY_MAX,
+	QUEUE_PRIORITY_MIN,
 	QUEUE_STRATEGIES,
 	RECORD_POLICIES,
 	RING_GROUP_STRATEGIES,
@@ -635,7 +638,31 @@ export const queueFormSchema = z.strictObject({
 	tierRulesApply: z.boolean(),
 	tierRuleWaitSeconds: optionalInt(0, 3600),
 	tierRuleNoAgentNoWait: z.boolean(),
-	recordEnabled: z.boolean(),
+	/**
+	 * NOT `optionalInt`'s enum cousin and deliberately not resettable: `none` is a real member of
+	 * the set rather than a server default somebody might want back, so a form's "do not record" is
+	 * a value the column can say for itself. It replaced a `recordEnabled` boolean the API no longer
+	 * accepts at all — a strict object answers the old key with a 400.
+	 */
+	recordPolicy: z.enum(RECORD_POLICIES),
+	/**
+	 * The single DTMF digit a waiting caller may press to leave. Blank removes it.
+	 *
+	 * Upper-cased before the check, exactly as the server's DTO does it, so a tenant who types `d`
+	 * gets the DTMF `D` rather than a rejected form. The two spellings are not equivalent anywhere
+	 * below this line — the engine compares this against a digit with `===` — so normalising in the
+	 * browser is what makes the control and the column agree rather than what makes the form lenient.
+	 */
+	exitKey: z
+		.string()
+		.trim()
+		.toUpperCase()
+		.refine((value) => value === "" || QUEUE_EXIT_KEY_PATTERN.test(value), {
+			message: "A single DTMF digit: 0-9, *, #, or A-D",
+		})
+		.transform((value) => (value.length === 0 ? null : value)),
+	/** Higher dequeues first. Empty restores the server's default, like every other knob here. */
+	defaultPriority: optionalInt(QUEUE_PRIORITY_MIN, QUEUE_PRIORITY_MAX),
 	enabled: z.boolean(),
 });
 export type QueueFormValues = z.input<typeof queueFormSchema>;
@@ -697,6 +724,15 @@ export const queueTierFormSchema = z.strictObject({
 	level: optionalInt(1, 100),
 	/** Order within the level, which `top-down` and `round-robin` walk in. */
 	position: optionalInt(1, 1000),
+	/**
+	 * The whisper played to the agent when a call distributed by THIS tier reaches them, in place of
+	 * the queue's own. Blank clears it and the queue's whisper takes over again.
+	 *
+	 * {@link optionalReference} rather than a required one, and the emptied case means "clear it"
+	 * rather than "use the default" — the column is nullable, and falling back to the queue IS the
+	 * cleared behaviour rather than a stored default being restored.
+	 */
+	announcePromptId: optionalReference(),
 });
 export type QueueTierFormValues = z.input<typeof queueTierFormSchema>;
 

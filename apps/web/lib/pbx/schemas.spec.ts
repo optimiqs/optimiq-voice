@@ -437,7 +437,9 @@ describe("queueFormSchema", () => {
 		tierRulesApply: true,
 		tierRuleWaitSeconds: "",
 		tierRuleNoAgentNoWait: false,
-		recordEnabled: false,
+		recordPolicy: "none" as const,
+		exitKey: "",
+		defaultPriority: "",
 		enabled: true,
 	};
 
@@ -470,6 +472,43 @@ describe("queueFormSchema", () => {
 		expect(queueFormSchema.safeParse({ ...base, maxWaitSeconds: "86401" }).success).toBe(false);
 		expect(queueFormSchema.safeParse({ ...base, extensionNumber: "70a0" }).success).toBe(false);
 		expect(queueFormSchema.parse({ ...base, extensionNumber: "" }).extensionNumber).toBeNull();
+	});
+
+	/**
+	 * The boolean this replaced is not accepted by the server at all — `createQueueDto` is a
+	 * `strictObject`, so a body still carrying `recordEnabled` is a 400 naming the key rather than a
+	 * field being ignored. The strict object HERE is what stops a copied block from reintroducing it.
+	 */
+	it("carries a record POLICY and refuses the boolean it replaced", () => {
+		expect(queueFormSchema.parse({ ...base, recordPolicy: "all" }).recordPolicy).toBe("all");
+		expect(
+			queueFormSchema.safeParse({ ...base, recordEnabled: false, recordPolicy: undefined }).success,
+		).toBe(false);
+	});
+
+	/**
+	 * Upper-cased before validation, exactly as the server's DTO does it. The engine compares this
+	 * against a `DtmfEvent.digit` with `===`, so `d` and `D` are not equivalent anywhere below this
+	 * line — normalising here is what makes the control and the column agree rather than what makes
+	 * the form lenient.
+	 */
+	it("normalises the exit key the server's way and refuses anything a phone cannot send", () => {
+		expect(queueFormSchema.parse({ ...base, exitKey: "d" }).exitKey).toBe("D");
+		expect(queueFormSchema.parse({ ...base, exitKey: " 2 " }).exitKey).toBe("2");
+		expect(queueFormSchema.parse({ ...base, exitKey: "#" }).exitKey).toBe("#");
+		// Blank is how the column spells "no exit key at all", and it is `null` on the wire.
+		expect(queueFormSchema.parse({ ...base, exitKey: "" }).exitKey).toBeNull();
+		// Two digits is not an exit key: there is no inter-digit timeout running under hold music.
+		expect(queueFormSchema.safeParse({ ...base, exitKey: "22" }).success).toBe(false);
+		expect(queueFormSchema.safeParse({ ...base, exitKey: "E" }).success).toBe(false);
+	});
+
+	it("bounds the starting priority to the 0-1000 scale the events already publish on", () => {
+		expect(queueFormSchema.parse({ ...base, defaultPriority: "0" }).defaultPriority).toBe(0);
+		expect(queueFormSchema.parse({ ...base, defaultPriority: "1000" }).defaultPriority).toBe(1000);
+		expect(queueFormSchema.safeParse({ ...base, defaultPriority: "1001" }).success).toBe(false);
+		expect(queueFormSchema.safeParse({ ...base, defaultPriority: "-1" }).success).toBe(false);
+		expect(queueFormSchema.parse(base).defaultPriority).toBeNull();
 	});
 });
 
@@ -529,6 +568,7 @@ describe("queueTierFormSchema", () => {
 		queueAgentId: "0193f2aa-0000-7000-8000-000000000003",
 		level: "",
 		position: "",
+		announcePromptId: "",
 	};
 
 	/**
@@ -551,6 +591,24 @@ describe("queueTierFormSchema", () => {
 		const parsed = queueTierFormSchema.parse(base);
 		expect(parsed.level).toBeNull();
 		expect(parsed.position).toBeNull();
+	});
+
+	/**
+	 * The tier's whisper is a NULLABLE column, so its emptied `null` means "clear it" rather than
+	 * "restore the default" — the opposite reading from the two knobs above, on the same wire value.
+	 * Clearing it is what hands the call back to the queue's own whisper.
+	 */
+	it("clears the tier whisper on empty and refuses anything that is not an id from the list", () => {
+		expect(queueTierFormSchema.parse(base).announcePromptId).toBeNull();
+		expect(
+			queueTierFormSchema.parse({
+				...base,
+				announcePromptId: "0193f2aa-0000-7000-8000-000000000004",
+			}).announcePromptId,
+		).toBe("0193f2aa-0000-7000-8000-000000000004");
+		expect(queueTierFormSchema.safeParse({ ...base, announcePromptId: "escalation" }).success).toBe(
+			false,
+		);
 	});
 });
 
@@ -1116,7 +1174,9 @@ const AUDIO_REFERENCE_FORMS = [
 			tierRulesApply: true,
 			tierRuleWaitSeconds: "",
 			tierRuleNoAgentNoWait: false,
-			recordEnabled: false,
+			recordPolicy: "none",
+			exitKey: "",
+			defaultPriority: "",
 			enabled: true,
 		},
 		/**
@@ -1124,6 +1184,23 @@ const AUDIO_REFERENCE_FORMS = [
 		 * bridge — the answering agent alone, never the caller. Same helper, same null-on-blank rule.
 		 */
 		columns: ["mohClassId", "greetingPromptId", "announcePromptId", "agentWhisperPromptId"],
+	},
+	{
+		/**
+		 * The fifth prompt on the queues surface, and the only one that is not on the queue: a tier's
+		 * whisper replaces the queue's for calls THIS membership distributed. Same helper and the same
+		 * null-on-blank rule, which here means "hand the call back to the queue's whisper".
+		 */
+		label: "queueTierFormSchema",
+		schema: queueTierFormSchema,
+		base: {
+			queueId: "0193f2aa-0000-7000-8000-000000000002",
+			queueAgentId: "0193f2aa-0000-7000-8000-000000000003",
+			level: "",
+			position: "",
+			announcePromptId: "",
+		},
+		columns: ["announcePromptId"],
 	},
 	{
 		label: "ringGroupFormSchema",
