@@ -24,6 +24,8 @@ import {
 	parkLotFormSchema,
 	parseDialPatterns,
 	phoneNumberFormSchema,
+	phraseFormSchema,
+	phraseStepFormSchema,
 	pinSchema,
 	pinSetEntryFormSchema,
 	pinSetFormSchema,
@@ -34,9 +36,11 @@ import {
 	ringGroupFormSchema,
 	shortCode,
 	speedDialFormSchema,
+	timeConditionOverrideCodeFormSchema,
 	timeRuleFormSchema,
 	timezoneName,
 	translationRuleFormSchema,
+	trunkFormSchema,
 	voicemailBoxFormSchema,
 } from "./schemas";
 
@@ -271,6 +275,8 @@ describe("outboundRouteFormSchema", () => {
 		trunkIds: [],
 		timeConditionId: "",
 		callerIdNumberOverride: "",
+		translationRulesetId: "",
+		pinSetId: "",
 		recordEnabled: false,
 		enabled: true,
 	};
@@ -294,6 +300,85 @@ describe("outboundRouteFormSchema", () => {
 		expect(outboundRouteFormSchema.safeParse({ ...base, trunkIds: ["not-a-uuid"] }).success).toBe(
 			false,
 		);
+	});
+
+	/**
+	 * The two attachments that became writable when the DTO declared them.
+	 *
+	 * Both were rendered as read-only facts while `updateOutboundRouteDto` did not accept them — a
+	 * select wired to a strict DTO produces a 400 naming a field the user had just chosen from a list
+	 * this app rendered. The DTO declares both now, so the form sends them, and the shape it sends is
+	 * what these assertions pin.
+	 */
+	it("clears the PIN set and the ruleset to null rather than to an empty string", () => {
+		const parsed = outboundRouteFormSchema.parse(base);
+		expect(parsed.pinSetId).toBeNull();
+		expect(parsed.translationRulesetId).toBeNull();
+	});
+
+	/**
+	 * `null` and not "leave it alone", which is the whole reason the transform exists. `PATCH` leaves
+	 * an ABSENT key alone, so a form that dropped an emptied selector would let an operator detach a
+	 * PIN set, press Save, and still be challenged on the next call — with the dialog showing no
+	 * challenge. The column is a uuid, so `""` is not the alternative either: Postgres answers it with
+	 * a `22P02` nobody can act on.
+	 */
+	it("keeps a chosen id and refuses anything that is not one", () => {
+		const id = "0193f2aa-0000-7000-8000-000000000001";
+		expect(outboundRouteFormSchema.parse({ ...base, pinSetId: id }).pinSetId).toBe(id);
+		expect(
+			outboundRouteFormSchema.parse({ ...base, translationRulesetId: id }).translationRulesetId,
+		).toBe(id);
+		expect(outboundRouteFormSchema.safeParse({ ...base, pinSetId: "not-a-uuid" }).success).toBe(
+			false,
+		);
+		expect(
+			outboundRouteFormSchema.safeParse({ ...base, translationRulesetId: "nope" }).success,
+		).toBe(false);
+	});
+});
+
+/**
+ * The trunk's inbound ruleset — the third of the three columns the W8 web wave had to render
+ * read-only, and the one whose composition order is different from the other two.
+ *
+ * Nothing composes with it: a trunk has no inline strip or prepend, so the ruleset runs first and
+ * alone, before the screening list, the inbound routes or the call record read the caller's number.
+ * On an outbound route the shared ruleset runs AFTER the route's own digits. The schemas cannot
+ * express either ordering; the forms' copy does, and these tests exist so the field itself cannot
+ * quietly go missing from the body.
+ */
+describe("trunkFormSchema", () => {
+	const base = {
+		name: "Carrier A",
+		kind: "register" as const,
+		sipDomain: "sip.example.net",
+		sipProxy: "sip.example.net",
+		outboundProxy: "",
+		authUser: "",
+		sipSecretRef: "",
+		transport: "udp" as const,
+		registerExpiresSeconds: "",
+		maxChannels: "",
+		codecPrefs: "",
+		callerIdNumberOverride: "",
+		inboundTranslationRulesetId: "",
+		enabled: true,
+	};
+
+	it("clears the inbound ruleset to null rather than to an empty string", () => {
+		expect(trunkFormSchema.parse(base).inboundTranslationRulesetId).toBeNull();
+	});
+
+	it("keeps a chosen ruleset and refuses anything that is not an id", () => {
+		const id = "0193f2aa-0000-7000-8000-000000000002";
+		expect(
+			trunkFormSchema.parse({ ...base, inboundTranslationRulesetId: id })
+				.inboundTranslationRulesetId,
+		).toBe(id);
+		expect(
+			trunkFormSchema.safeParse({ ...base, inboundTranslationRulesetId: "not-a-uuid" }).success,
+		).toBe(false);
 	});
 });
 
@@ -1660,5 +1745,111 @@ describe("orgLimitsFormSchema", () => {
 			false,
 		);
 		expect(orgLimitsFormSchema.safeParse({ ...base, maxExtensions: "-1" }).success).toBe(false);
+	});
+});
+
+/**
+ * A phrase: one field, and the absences are the contract.
+ *
+ * `createPhraseDto` is `{ name }` and stays that way. `kind` and `objectKey` are what MAKE the row a
+ * phrase rather than fields on it — the service stamps `kind: "phrase"` and leaves the key null,
+ * which is the exact pair `prompt_object_key_kind_check` permits — and a client that could send
+ * either could produce a library entry with no file behind it. `language` is absent because a
+ * phrase's language is its steps' audio, and `mohClassId` because a sequence is not a file.
+ *
+ * The strict object is what holds all of that: each of these keys is a 400 naming a field, so the
+ * refusal happens here rather than after a round trip.
+ */
+describe("phraseFormSchema", () => {
+	it("takes a name and nothing else", () => {
+		expect(phraseFormSchema.safeParse({ name: "Queue position" }).success).toBe(true);
+		expect(phraseFormSchema.safeParse({ name: "" }).success).toBe(false);
+	});
+
+	it("refuses the three fields the server would refuse", () => {
+		const base = { name: "Queue position" };
+		expect(phraseFormSchema.safeParse({ ...base, kind: "phrase" }).success).toBe(false);
+		expect(phraseFormSchema.safeParse({ ...base, objectKey: null }).success).toBe(false);
+		expect(phraseFormSchema.safeParse({ ...base, language: "en-US" }).success).toBe(false);
+	});
+});
+
+/**
+ * One step of a phrase.
+ *
+ * The rule this schema CANNOT state is the interesting one: a step may not name another phrase.
+ * Nesting is refused by `phrases.service.ts` with a `PBX_VALIDATION_FAILED` addressed at `promptId`,
+ * and by the compiler a second time for rows arriving any other way — neither of which a schema
+ * seeing a uuid can reproduce. The form does it with the data it has (the picker offers
+ * `kind: "prompt"` only, and the dialog checks the chosen id against the phrase list), and these
+ * tests hold the half that IS expressible.
+ */
+describe("phraseStepFormSchema", () => {
+	const base = {
+		promptId: "0193f2aa-0000-7000-8000-000000000001",
+		ordinal: "0",
+		enabled: true,
+	};
+
+	it("requires a recording", () => {
+		expect(phraseStepFormSchema.safeParse(base).success).toBe(true);
+		expect(phraseStepFormSchema.safeParse({ ...base, promptId: "" }).success).toBe(false);
+	});
+
+	/**
+	 * Position zero is the FIRST step, not an absent one — the first word of the sentence. A schema
+	 * that folded it into "unset" would make the opening step unaddressable.
+	 */
+	it("keeps position zero as a position", () => {
+		expect(phraseStepFormSchema.parse(base).ordinal).toBe(0);
+	});
+
+	/** Blank means "append", which the dialog turns into the next free slot before it sends. */
+	it("turns a blank position into null rather than into zero", () => {
+		expect(phraseStepFormSchema.parse({ ...base, ordinal: "" }).ordinal).toBeNull();
+	});
+
+	it("bounds the position at the server's own range", () => {
+		expect(phraseStepFormSchema.safeParse({ ...base, ordinal: "1001" }).success).toBe(false);
+		expect(phraseStepFormSchema.safeParse({ ...base, ordinal: "-1" }).success).toBe(false);
+		expect(phraseStepFormSchema.safeParse({ ...base, ordinal: "1000" }).success).toBe(true);
+	});
+});
+
+/**
+ * The star code that cycles a time condition's override.
+ *
+ * Writable now — `createTimeConditionDto`/`updateTimeConditionDto` declare
+ * `overrideFeatureCode: shortCode.nullish()` — where it used to be rendered as a fact because no
+ * endpoint accepted it in either direction. It rides `time-conditions.write` rather than the
+ * `call-flows.toggle` that PRESSES the override, which is why it is a schema of its own rather than
+ * a field of `timeConditionFormSchema`: the two controls live on different sides of a permission.
+ *
+ * Nothing here checks for a collision with the feature-code catalogue. That is a fact about the whole
+ * tenant, and the compiler raises it inside the write transaction.
+ */
+describe("timeConditionOverrideCodeFormSchema", () => {
+	it("takes the shapes a phone can dial", () => {
+		for (const code of ["*281", "*01", "8001", "#72"]) {
+			expect(
+				timeConditionOverrideCodeFormSchema.parse({ overrideFeatureCode: code })
+					.overrideFeatureCode,
+			).toBe(code);
+		}
+	});
+
+	/** Blank CLEARS the column. `null` is a real state: no code answers for this condition. */
+	it("turns a blank box into null rather than into an empty string", () => {
+		expect(
+			timeConditionOverrideCodeFormSchema.parse({ overrideFeatureCode: "  " }).overrideFeatureCode,
+		).toBeNull();
+	});
+
+	it("refuses anything a handset could not send", () => {
+		for (const code of ["12a4", "*2 8", "*2819999999"]) {
+			expect(
+				timeConditionOverrideCodeFormSchema.safeParse({ overrideFeatureCode: code }).success,
+			).toBe(false);
+		}
 	});
 });

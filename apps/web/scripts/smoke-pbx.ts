@@ -631,10 +631,13 @@ async function main(): Promise<void> {
 			// live topic answers, which is exactly the shape of failure a smoke run should catch.
 			"/conferences?tab=live",
 			"/park-lots",
-			// The media library, and its second tab. Both are `?tab=` views of one page, so a tab
-			// that 404s or crashes would otherwise be invisible to a route list.
+			// The media library and its two other tabs. All three are `?tab=` views of one page, so a
+			// tab that 404s or crashes would otherwise be invisible to a route list — and `phrases` is
+			// the one whose grant is NOT the page's (`recordings.*` against `settings.*`), so a 200
+			// here proves the tab renders for a caller who holds both. The owner used here does.
 			"/media",
 			"/media?tab=prompts",
+			"/media?tab=phrases",
 			"/routing",
 			"/routing?tab=outbound",
 			"/routing?tab=time-conditions",
@@ -2059,6 +2062,10 @@ async function main(): Promise<void> {
 		// --- 20. the T2 admin block: the verbs that are not a PATCH ----------------------------------
 		console.log("\n20. the admin block: call flows, PIN sets, translations, the dial plan, limits");
 		await runAdminBlockChecks(client);
+
+		// --- 21. phrases: the ordered half of the media library -------------------------------------
+		console.log("\n21. phrases and their ordered steps");
+		await runPhraseChecks(client, upload);
 	} finally {
 		next?.kill("SIGTERM");
 		apiProcess.kill("SIGTERM");
@@ -2789,7 +2796,13 @@ async function runAdminBlockChecks(client: Client): Promise<void> {
 
 	const usage = await client("GET", "/api/v1/org-limits/usage");
 	const usageEntries =
-		(data(usage).entries as { limit: string; used: number; ceiling: number | null }[]) ?? [];
+		(data(usage).entries as {
+			limit: string;
+			used: number;
+			ceiling: number | null;
+			ratio: number | null;
+			measured: boolean;
+		}[]) ?? [];
 	const concurrent = usageEntries.find((row) => row.limit === "maxConcurrentCalls");
 	check(
 		"the usage report answers one line per limit, in the order the page renders them",
@@ -2798,10 +2811,27 @@ async function runAdminBlockChecks(client: Client): Promise<void> {
 				"maxExtensions,maxTrunks,maxConcurrentCalls,maxStorageMb",
 		usageEntries.map((row) => row.limit).join(","),
 	);
+	/**
+	 * The line the page must NOT draw a bar for, and it is the response that says so rather than a
+	 * hard-coded limit name in the browser.
+	 *
+	 * `measured: false` is what stops a zero being read as "nobody is on a call right now" — a much
+	 * more confident statement than "this is not counted here" — and `ratio: null` is what stops a
+	 * bar being drawn from that zero at all. It used to be `0`, which drew an empty bar beside a real
+	 * ceiling. The other three lines are counted and must keep saying so.
+	 */
 	check(
-		"simultaneous calls report a ceiling and zero usage, which is why the page draws no bar for them",
-		concurrent?.ceiling === 25 && concurrent.used === 0,
+		"simultaneous calls report a real ceiling, no usage, and no ratio to draw a bar from",
+		concurrent?.ceiling === 25 &&
+			concurrent.used === 0 &&
+			concurrent.measured === false &&
+			concurrent.ratio === null,
 		JSON.stringify(concurrent),
+	);
+	check(
+		"and the other three lines are measured, so the page keeps drawing their bars",
+		usageEntries.filter((row) => row.limit !== "maxConcurrentCalls").every((row) => row.measured),
+		usageEntries.map((row) => `${row.limit}:${String(row.measured)}`).join(", "),
 	);
 	check(
 		"and the exact byte total is carried beside the rounded megabytes",
@@ -2829,5 +2859,201 @@ async function runAdminBlockChecks(client: Client): Promise<void> {
 		"and the ruleset deletes with its rules",
 		rulesetDeleted.status === 200,
 		`status ${rulesetDeleted.status}`,
+	);
+}
+
+/**
+ * The phrases surface, exercised with the exact bodies the media screens build.
+ *
+ * ## Why this needs a live server rather than a unit test
+ *
+ * Every claim below is about a rule that lives on the SERVER and cannot be reproduced in a schema,
+ * because each one needs to read a row rather than a field:
+ *
+ * 1. **A phrase is a `prompt` row and `/phrases` is the only way to make one.** `POST /prompts` does
+ *    not exist — a library entry is born through a multipart upload — so this is the one create in
+ *    the media area that is ordinary JSON. The response has to carry `kind: "phrase"` and a null
+ *    object key, which is the pair the table's check constraint permits and the pair `PhraseRow`
+ *    narrows to.
+ * 2. **Nesting is refused, as a field error.** A step whose `promptId` names another phrase is a 400
+ *    addressed at `promptId`, which is what lets the step dialog attach the message to the picker
+ *    the user just used. A schema cannot state this: it sees a uuid, not the row behind it.
+ * 3. **A prompt a phrase plays cannot be deleted.** `phrase_step.prompt_id` is the only
+ *    `on delete restrict` column in the schema, and the site is declared with `idColumn: "phrase_id"`
+ *    so the 409 names the PHRASE. This is the assertion `referenceHref`'s new `phrase` case exists
+ *    for — until a phrase exists, "every referrer resolves somewhere fixable" is vacuously true of
+ *    that kind.
+ * 4. **The reorder is a whole-list write.** The endpoint refuses anything that is not an exact
+ *    permutation, which is what makes a stale editor's reorder a recoverable 400 rather than a
+ *    silent scramble.
+ *
+ * The uploader is threaded in rather than a prompt id, because a phrase needs library entries that
+ * outlive it for exactly as long as the step does — and creating them here keeps the fixture's
+ * teardown in one place.
+ */
+async function runPhraseChecks(client: Client, upload: Uploader): Promise<void> {
+	const wav = makeWav();
+
+	const first = await upload(
+		"/api/v1/prompts",
+		{ bytes: wav, name: "your-call-is-number.wav", type: "audio/wav" },
+		{ name: `smoke-phrase-a-${RUN_ID}` },
+	);
+	const second = await upload(
+		"/api/v1/prompts",
+		{ bytes: wav, name: "in-the-queue.wav", type: "audio/wav" },
+		{ name: `smoke-phrase-b-${RUN_ID}` },
+	);
+	const firstPromptId = rowId(first);
+	const secondPromptId = rowId(second);
+	check(
+		"two library entries upload, which is what a phrase is assembled out of",
+		first.status === 201 && second.status === 201,
+		`status ${first.status}/${second.status}`,
+	);
+
+	// --- the phrase itself ------------------------------------------------------------------------
+
+	const phrase = await client("POST", "/api/v1/phrases", { name: `Smoke phrase ${RUN_ID}` });
+	const phraseId = rowId(phrase);
+	check(
+		"a phrase is created by an ordinary JSON POST, with no file anywhere near it",
+		phrase.status === 201 && data(phrase).kind === "phrase" && data(phrase).objectKey === null,
+		`status ${phrase.status}, kind ${String(data(phrase).kind)}, objectKey ${JSON.stringify(
+			data(phrase).objectKey,
+		)}`,
+	);
+
+	/**
+	 * `kind` and `objectKey` are not fields, they are what MAKES the row a phrase — so the strict DTO
+	 * refuses them, and the create dialog therefore has no control for either. A client that could
+	 * send them could produce a library entry with no file behind it.
+	 */
+	const stamped = await client("POST", "/api/v1/phrases", {
+		name: `Smoke stamped ${RUN_ID}`,
+		kind: "prompt",
+	});
+	check(
+		"and the row's discriminator cannot be sent by a client",
+		stamped.status === 400,
+		`status ${stamped.status}`,
+	);
+
+	/**
+	 * The two surfaces share one table, and the URL's noun is load-bearing on purpose: reading a
+	 * library entry through `/phrases/:id` is a 404 rather than a row, so a caller who holds one id
+	 * does not effectively hold all of them.
+	 */
+	const wrongNoun = await client("GET", `/api/v1/phrases/${firstPromptId}`);
+	check(
+		"a library entry's id is a 404 on the phrases surface, not a redirect",
+		wrongNoun.status === 404,
+		`status ${wrongNoun.status}`,
+	);
+
+	// --- steps ------------------------------------------------------------------------------------
+
+	const stepOne = await client("POST", `/api/v1/phrases/${phraseId}/steps`, {
+		promptId: firstPromptId,
+		ordinal: 0,
+		enabled: true,
+	});
+	const stepTwo = await client("POST", `/api/v1/phrases/${phraseId}/steps`, {
+		promptId: secondPromptId,
+		ordinal: 1,
+		enabled: true,
+	});
+	const stepOneId = rowId(stepOne);
+	const stepTwoId = rowId(stepTwo);
+	check(
+		"the create body the step dialog builds is accepted, ordinal and all",
+		stepOne.status === 201 && stepTwo.status === 201,
+		`status ${stepOne.status}/${stepTwo.status}`,
+	);
+
+	/** The rule the form restates and cannot prove: a step plays a recording, never another phrase. */
+	const nested = await client("POST", `/api/v1/phrases/${phraseId}/steps`, {
+		promptId: phraseId,
+		ordinal: 2,
+	});
+	const nestedFields = pbxFieldErrors(asApiError(nested));
+	check(
+		"a step naming another phrase is refused, with the message on the promptId field",
+		nested.status === 400 && nestedFields.promptId !== undefined,
+		`status ${nested.status}, fields ${Object.keys(nestedFields).join(",")}`,
+	);
+
+	// --- the order is the sentence ----------------------------------------------------------------
+
+	const reordered = await client("PUT", `/api/v1/phrases/${phraseId}/steps/reorder`, {
+		ids: [stepTwoId, stepOneId],
+	});
+	// The reorder envelope's `data` is an ARRAY — the collection as stored — rather than the single
+	// row every other mutation carries, so it is read off the body directly.
+	const reorderedRows = (reordered.body.data ?? []) as { id: string; ordinal: number }[];
+	check(
+		"the whole order is rewritten in one request, and the reply carries what was stored",
+		reordered.status === 200 && reorderedRows[0]?.id === stepTwoId,
+		`status ${reordered.status}, ${reorderedRows.map((row) => row.id.slice(0, 8)).join(",")}`,
+	);
+
+	/**
+	 * Anything that is not an exact permutation is refused. That is what makes a stale editor's Move
+	 * up a recoverable 400 rather than a silently scrambled sentence — and it is why the detail page
+	 * does no optimistic swap.
+	 */
+	const partial = await client("PUT", `/api/v1/phrases/${phraseId}/steps/reorder`, {
+		ids: [stepTwoId],
+	});
+	check(
+		"a reorder that is not an exact permutation is refused rather than half-applied",
+		partial.status >= 400,
+		`status ${partial.status}`,
+	);
+
+	// --- the delete that must be refused, and the link out of it -----------------------------------
+
+	const refusedPrompt = await client("DELETE", `/api/v1/prompts/${firstPromptId}`);
+	const phraseReferences: readonly EntityReference[] = pbxReferences(asApiError(refusedPrompt));
+	check(
+		"deleting a recording a phrase plays is refused, naming the phrase rather than the step",
+		refusedPrompt.status === 409 &&
+			phraseReferences.some((reference) => reference.kind === "phrase"),
+		`status ${refusedPrompt.status}, ${phraseReferences.map((r) => r.kind).join(", ")}`,
+	);
+	/**
+	 * The reason `referenceHref` needed a `phrase` case at all. The site is declared with
+	 * `nameColumn: null`, so there is no name to prefill a search box with — a list fallback would
+	 * have landed the user on a page of phrases with no indication which one is holding the delete.
+	 */
+	check(
+		"and that referrer resolves to the phrase's own page, by id",
+		phraseReferences.length > 0 &&
+			phraseReferences.every((reference) => referenceHref(reference) !== undefined) &&
+			phraseReferences.some((reference) =>
+				(referenceHref(reference) ?? "").startsWith("/media/phrases/"),
+			),
+		phraseReferences.map((reference) => referenceHref(reference) ?? "—").join(", "),
+	);
+
+	// --- tear down, in dependency order -----------------------------------------------------------
+
+	await client("DELETE", `/api/v1/phrases/${phraseId}/steps/${stepOneId}`);
+	await client("DELETE", `/api/v1/phrases/${phraseId}/steps/${stepTwoId}`);
+
+	/** With no step pointing at it, the recording deletes — which is the other half of the restrict. */
+	const promptDeleted = await client("DELETE", `/api/v1/prompts/${firstPromptId}`);
+	check(
+		"the recording deletes once no step plays it any more",
+		promptDeleted.status === 200,
+		`status ${promptDeleted.status}`,
+	);
+	await client("DELETE", `/api/v1/prompts/${secondPromptId}`);
+
+	const phraseDeleted = await client("DELETE", `/api/v1/phrases/${phraseId}`);
+	check(
+		"and the phrase deletes through its own surface",
+		phraseDeleted.status === 200,
+		`status ${phraseDeleted.status}`,
 	);
 }

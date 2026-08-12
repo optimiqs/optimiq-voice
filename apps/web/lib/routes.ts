@@ -222,6 +222,21 @@ export const routes = {
 	 * own endpoint — a dialog over a list would be a dialog that opens a dialog to type a secret into.
 	 */
 	pinSet: (id: string) => `/pin-sets/${id}`,
+	/**
+	 * One phrase and its ordered steps.
+	 *
+	 * The seventh entity with a child collection, and it earns a page for the reason the other six do:
+	 * the steps are an ordered sequence with a reorder endpoint, which a dialog inside a dialog cannot
+	 * hold. Nested under `/media` so the phrase's editor is where the audio it names lives.
+	 *
+	 * It is the one detail route in this file that does NOT simply inherit its parent's requirement,
+	 * and `page-permissions.ts` declares it explicitly for that reason: `/media` is gated by
+	 * `settings.read` because that is what the prompt and hold-music endpoints ask for, and the
+	 * phrases endpoints ask for `recordings.read` instead. Inheriting would have shown this page to
+	 * every self-service role — they all hold `settings.read` so a preferences screen renders — and
+	 * then 403'd them.
+	 */
+	phrase: (id: string) => `/media/phrases/${id}`,
 
 	/**
 	 * A trunk's detail page, which the four above do not have a reason to exist for.
@@ -331,18 +346,34 @@ export function securityTabHref(tab: SecurityTab): string {
 }
 
 /**
- * The Media page's two sections.
+ * The Media page's three sections.
  *
- * Hold music and the prompt library are two views of ONE subject — the tenant's stored audio — and
- * both are gated by the same `settings.*` grants, because both are organization-wide configuration
- * every call feature draws on. Two sidebar entries would be two ways to say "audio"; the tab lives
+ * Hold music, the prompt library and phrases are three views of ONE subject — the tenant's stored
+ * audio — so two or three sidebar entries would be two or three ways to say "audio"; the tab lives
  * in `?tab=` so "here is the class I mean" is a link, the same as every other list's filter state.
  *
- * They are nevertheless different SHAPES rather than two lists of the same thing: a hold-music
- * class is a container with files under it, and a prompt is a file an IVR can be pointed at. The
- * split is the API's (`moh_class` is a routing input; `prompt` is not), not a display choice.
+ * They are nevertheless different SHAPES rather than three lists of the same thing: a hold-music
+ * class is a container with files under it, a prompt is a file an IVR can be pointed at, and a
+ * phrase is an ordered sequence of those files with no audio of its own. The split is the API's,
+ * not a display choice.
+ *
+ * ## The phrases tab does NOT share the other two's permission, and that is why it gates itself
+ *
+ * Hold music and prompts are `settings.*`, which is what `PAGE_PERMISSIONS` names for this route.
+ * Phrases are `recordings.*` — the server's decision, argued in `phrases.controller.ts`: a phrase is
+ * a media-library row, so it rides the library's grants rather than minting a `phrases.*` trio.
+ *
+ * Everywhere else in this file that difference has forced a route of its own, and here it does not,
+ * because the two grants come apart in the harmless direction. `recordings.read` is an
+ * administrator's grant and `settings.read` is held by every self-service role, so the tab is
+ * visible to people the phrases API refuses — and `phrases-panel.tsx` answers with an explanation
+ * rather than a list, exactly as `/numbers`' order tab does for `numbers.order`. Nobody who holds
+ * `recordings.read` is shut out, which is the failure a shared page can actually cause.
+ *
+ * A phrase's own page is the other half of that and is NOT allowed to inherit — see
+ * {@link routes.phrase} and its `PAGE_PERMISSIONS` entry.
  */
-export const MEDIA_TABS = ["hold-music", "prompts"] as const;
+export const MEDIA_TABS = ["hold-music", "prompts", "phrases"] as const;
 
 export type MediaTab = (typeof MEDIA_TABS)[number];
 

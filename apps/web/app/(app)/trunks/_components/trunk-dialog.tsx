@@ -1,8 +1,8 @@
 "use client";
 
 import { useForm } from "@tanstack/react-form";
-import { AttachedReference } from "~/components/pbx/attached-reference";
 import { EntityFormDialog, FormSection } from "~/components/pbx/entity-form-dialog";
+import { ResourceSelect } from "~/components/pbx/resource-select";
 import { SelectField, SwitchField, TextField } from "~/components/ui/form-fields";
 import { useServerFieldErrors } from "~/lib/forms/server-errors";
 import { PBX_RESOURCES } from "~/lib/pbx/client";
@@ -50,6 +50,7 @@ function defaultsFor(trunk: TrunkRow | null): TrunkFormValues {
 		maxChannels: trunk?.maxChannels == null ? "" : String(trunk.maxChannels),
 		codecPrefs: trunk?.codecPrefs ?? "",
 		callerIdNumberOverride: trunk?.callerIdNumberOverride ?? "",
+		inboundTranslationRulesetId: trunk?.inboundTranslationRulesetId ?? "",
 		enabled: trunk?.enabled ?? true,
 	};
 }
@@ -90,6 +91,12 @@ export function TrunkDialog({
 				maxChannels: parsed.maxChannels,
 				codecPrefs: parsed.codecPrefs,
 				callerIdNumberOverride: parsed.callerIdNumberOverride,
+				/*
+				 * `null` when cleared rather than omitted — the same reason `sipSecretRef` goes the other
+				 * way. An absent key leaves the stored ruleset attached, so detaching one has to SAY null
+				 * or the trunk keeps rewriting numbers a form has just claimed it does not touch.
+				 */
+				inboundTranslationRulesetId: parsed.inboundTranslationRulesetId,
 				enabled: parsed.enabled,
 			};
 
@@ -291,20 +298,28 @@ export function TrunkDialog({
 
 			<FormSection title="Arriving calls" columns={1}>
 				{/*
-				 * The clearest case for the shared translation layer, which is why it is worth naming even
-				 * while it is read-only: one carrier presents `0044…` and the next presents `+44…`, and
-				 * without a rewrite the screening list, the inbound routes and the call records all have to
-				 * know which trunk a call came in on. Nothing composes with this — a trunk has no inline
-				 * digit manipulation — so it runs first and alone, before anything reads the caller.
+				 * The clearest case for the shared translation layer: one carrier presents `0044…` and the
+				 * next presents `+44…`, and without a rewrite the screening list, the inbound routes and the
+				 * call records all have to know which trunk a call came in on. Nothing composes with this —
+				 * a trunk has no inline digit manipulation — so it runs first and ALONE, before anything
+				 * reads the caller. That is why it has a section to itself rather than sitting under a pair
+				 * of digit fields, which is where an outbound route's ruleset belongs.
 				 */}
-				<AttachedReference
-					label="Rewrite the caller's number on arrival"
-					resource={PBX_RESOURCES.translationRulesets}
-					value={trunk?.inboundTranslationRulesetId ?? null}
-					emptyLabel="No rewrite — the caller's number reaches routing exactly as the carrier presented it."
-					description="Applied before the screening list, the inbound routes or the call record read the number, and before anything else on this trunk."
-					note="Attaching a ruleset is not editable from this application yet: the column exists and the compiler reads it, but no endpoint accepts it in a request body."
-				/>
+				<form.Field name="inboundTranslationRulesetId">
+					{(field) => (
+						<ResourceSelect
+							id="inboundTranslationRulesetId"
+							label="Rewrite the caller's number on arrival"
+							resource={PBX_RESOURCES.translationRulesets}
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="No rewrite — the caller's number reaches routing exactly as the carrier presented it"
+							description="Applied before the screening list, the inbound routes or the call record read the number, and before anything else on this trunk. Changing it changes what every rule downstream is matching against."
+							disabled={mutation.isPending}
+							error={server.errors.inboundTranslationRulesetId}
+						/>
+					)}
+				</form.Field>
 			</FormSection>
 
 			<FormSection title="State" columns={1}>

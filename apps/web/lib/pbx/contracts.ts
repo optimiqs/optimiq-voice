@@ -626,10 +626,17 @@ export interface TimeConditionRow extends EntityRow, DestinationTrio {
 	 */
 	readonly override: TimeConditionOverride;
 	/**
-	 * The star code that cycles the override, and the key a BLF lamp watches. Read-only HERE in a
-	 * stronger sense than `override` is: no endpoint accepts it in either direction today, so it is
-	 * rendered and never edited. `time_condition.override_feature_code` is set by a seed or by SQL
-	 * until a DTO declares it.
+	 * The star code that cycles the override, and the key a BLF lamp watches.
+	 *
+	 * WRITABLE, and by the ordinary `PATCH` rather than by the override endpoint beside it — which is
+	 * the split worth reading twice, because the two look like one subject.
+	 * `createTimeConditionDto`/`updateTimeConditionDto` declare it (`overrideFeatureCode:
+	 * shortCode.nullish()`), so it rides `time-conditions.write`: choosing which digits a phone dials
+	 * is dial-plan configuration and is compiled — the code is screened against the feature-code
+	 * catalogue at compile time. PRESSING it is {@link setTimeConditionOverride}, guarded by
+	 * `call-flows.toggle`, which is the receptionist's grant.
+	 *
+	 * `null` clears it; blank is not a value the column takes.
 	 */
 	readonly overrideFeatureCode: string | null;
 	readonly enabled: boolean;
@@ -823,8 +830,32 @@ export interface OrgUsageEntry {
 	readonly used: number;
 	/** `null` means no ceiling — the tenant is unlimited on this axis. */
 	readonly ceiling: number | null;
-	/** `null` when there is no ceiling. A fraction rather than a percentage, so a UI decides. */
+	/**
+	 * `null` when there is no ceiling to divide by, AND when {@link measured} is false.
+	 *
+	 * The second case is newer and is the one a renderer gets wrong: `maxConcurrentCalls` used to
+	 * report `ratio: 0` beside a real ceiling, which drew a 0% bar — a confident statement that
+	 * nobody is on a call, made by a process that cannot see calls. It is `null` now, so a bar drawn
+	 * from it draws nothing.
+	 *
+	 * A fraction rather than a percentage, so a UI decides how to say it.
+	 */
 	readonly ratio: number | null;
+	/**
+	 * Whether `used` is a MEASUREMENT or a placeholder.
+	 *
+	 * Three of the four limits are a `select count(*)` in the API process and are true at the instant
+	 * they were read. `maxConcurrentCalls` is not: simultaneous calls are live state the engines hold,
+	 * and the control plane has no way to ask that does not enumerate every live leg on the platform
+	 * on every page load. Its `used` is therefore zero, and this flag is what stops a screen rendering
+	 * that zero as "nobody is on a call right now".
+	 *
+	 * This app branches on the FLAG rather than on `limit === "maxConcurrentCalls"`, which is what it
+	 * used to do: the server owns which lines it can count, and a hard-coded name here would be a
+	 * second copy of that decision that goes stale in the direction of claiming a number it does not
+	 * have.
+	 */
+	readonly measured: boolean;
 }
 
 /**
@@ -833,9 +864,10 @@ export interface OrgUsageEntry {
  * Two of the four numbers are honest about being incomplete, and the screen has to say so rather
  * than round them off:
  *
- * - `maxConcurrentCalls` always reports `used: 0`. Simultaneous calls are live state the engine
- *   holds; a number this endpoint invented would be wrong the moment it was read. The ceiling is
- *   still reported, because that is the fact an administrator came for.
+ * - `maxConcurrentCalls` always reports `used: 0`, `ratio: null` and `measured: false`. Simultaneous
+ *   calls are live state the engine holds; a number this endpoint invented would be wrong the moment
+ *   it was read. The ceiling is still reported, because that is the fact an administrator came for —
+ *   and it is now genuinely enforced, at admission, by the engine rather than by a form.
  * - `maxStorageMb` counts `prompt` and `voicemail_message` rows only. RECORDINGS are excluded —
  *   they live in the CDR database, a different connection and a different bounded context — so the
  *   total is smaller than the tenant's real storage. Named as a gap rather than half-counted.
@@ -1275,9 +1307,9 @@ export type MohSource = (typeof MOH_SOURCES)[number];
  * `packages/pbx-db/src/schema/media-schema.ts`.
  *
  * The consequence for this app is {@link PromptRow.objectKey} being nullable, and the consequence
- * for the media screen is that there is nothing to build yet: `PromptsController` creates a row
- * only through a multipart UPLOAD, and no endpoint exists that creates a phrase or edits
- * `phrase_step`. See the note on {@link PromptRow}.
+ * for the media screen is a second surface rather than a second column: `PromptsController` still
+ * creates a library row only through a multipart UPLOAD, and `/api/v1/phrases` creates the sequence
+ * with an ordinary JSON body because a phrase owns no file. See {@link PhraseRow}.
  */
 export const PROMPT_KINDS = ["prompt", "moh", "greeting", "phrase"] as const;
 export type PromptKind = (typeof PROMPT_KINDS)[number];
@@ -1333,6 +1365,73 @@ export interface PromptRow extends EntityRow {
 	readonly sizeBytes: number | null;
 	readonly checksum: string | null;
 	readonly language: string;
+}
+
+/**
+ * A phrase — an ordered sequence of prompts, played as one.
+ *
+ * ## It IS a {@link PromptRow}, and this interface says so rather than restating it
+ *
+ * `/api/v1/phrases` reads and writes the SAME `prompt` table with `kind = 'phrase'` and a null
+ * `object_key`; `PHRASE_RESOURCE` in `apps/api/src/pbx/phrases/phrases.resource.ts` is a second
+ * descriptor over one table, differing only in the discriminator the descriptor cannot express. So
+ * this extends `PromptRow` instead of copying eleven fields, and NARROWS the two that the
+ * discriminator decides: `kind` is always `"phrase"` and `objectKey` is always `null`.
+ *
+ * The narrowing is what makes it useful rather than an alias. A screen holding a `PhraseRow` never
+ * has to check the kind before deciding there is no audio to play — `POST /prompts/:id/play-url`
+ * answers a phrase with an invalid-link error, and that is not an error a phrase screen should be
+ * able to provoke by accident.
+ *
+ * ## What is NOT on it
+ *
+ * No `language` control and no `mohClassId` picker, matching the DTO: a phrase's language is
+ * whatever its steps' audio is, and an MOH file is a member of a class while a sequence is not a
+ * file. The columns are inherited because the row carries them; nothing in this app writes them.
+ *
+ * The STEPS are not here either — they are a child collection under `/phrases/:id/steps`, exactly as
+ * a ruleset's rules are, because the order is the sentence. See {@link PhraseStepRow}.
+ */
+export interface PhraseRow extends PromptRow {
+	readonly kind: "phrase";
+	readonly objectKey: null;
+}
+
+/**
+ * One step of a phrase: the audio it plays, and where in the sentence it plays.
+ *
+ * ## `promptId` may not name another phrase
+ *
+ * Nesting is refused — `phrases.service.ts` answers a step whose `promptId` is a `kind = 'phrase'`
+ * row with a `PBX_VALIDATION_FAILED` naming `promptId`, so the message lands on the picker the user
+ * just used, and the compiler refuses the same shape a second time for rows that arrive by any other
+ * route. The form therefore offers library prompts only; the server's refusal is the backstop, not
+ * the user interface.
+ *
+ * ## The reference into `prompt` is `on delete restrict`
+ *
+ * The only such column in the PBX schema. Deleting a prompt a phrase plays is a 409 whose referrers
+ * are `kind: "phrase"` and whose `id` is the PHRASE's — `idColumn: "phrase_id"` on
+ * `PROMPT_RESOURCE`, because a step has no screen and the phrase does. `referenceHref` in
+ * `./references.ts` is what turns that into a link, and `nameColumn` is `null` there, so the
+ * reference arrives with no name and renders as a short id.
+ *
+ * Cascading would have silently SHORTENED a phrase, which is the failure the restrict exists to
+ * prevent: "your call is number seven in the queue" quietly becoming "your call is number in the
+ * queue" is worse than a refused delete.
+ */
+export interface PhraseStepRow extends EntityRow {
+	readonly phraseId: string;
+	readonly promptId: string;
+	readonly ordinal: number;
+	/**
+	 * A step that is skipped rather than removed.
+	 *
+	 * `prompt` has no `enabled` column and a phrase therefore has no disabled state — it is the STEPS
+	 * that carry one, because half-building a sequence is a real state and half-deleting a file is
+	 * not. See the note on `PHRASE_RESOURCE`.
+	 */
+	readonly enabled: boolean;
 }
 
 export interface VoicemailGreetingRow extends EntityRow {

@@ -1,11 +1,20 @@
 "use client";
 
+import { useForm } from "@tanstack/react-form";
 import { Badge } from "~/components/ui/badge";
+import { Button } from "~/components/ui/button";
 import { Card, CardBody, CardDescription, CardHeader, CardTitle } from "~/components/ui/card";
 import { FormField, Select } from "~/components/ui/field";
+import { TextField } from "~/components/ui/form-fields";
+import { useServerFieldErrors } from "~/lib/forms/server-errors";
+import { PBX_RESOURCES } from "~/lib/pbx/client";
 import { TIME_CONDITION_OVERRIDES } from "~/lib/pbx/contracts";
+import {
+	timeConditionOverrideCodeFormSchema,
+	type TimeConditionOverrideCodeFormValues,
+} from "~/lib/pbx/schemas";
 import { usePermission } from "../../_context/session-context";
-import { useTimeConditionOverride } from "../../_hooks/use-pbx-queries";
+import { usePbxUpdate, useTimeConditionOverride } from "../../_hooks/use-pbx-queries";
 import type { TimeConditionOverride, TimeConditionRow } from "~/lib/pbx/contracts";
 
 /**
@@ -28,12 +37,24 @@ import type { TimeConditionOverride, TimeConditionRow } from "~/lib/pbx/contract
  * endpoint agrees: it is `POST /call-flows/time-conditions/:id/override`, and `PATCH
  * /time-conditions/:id` does not accept the column.
  *
- * ## The star code is shown and not edited
+ * ## The star code is edited HERE, and it is the one control on this card with a different grant
  *
- * `override_feature_code` is a real column the compiler screens against the feature-code catalogue,
- * and NO endpoint accepts it in either direction today — `createTimeConditionDto` does not declare
- * it, and it is a `z.strictObject`. So it is rendered as a fact when a tenant has one and the card
- * says where it comes from, rather than offering a control whose save would be a 400.
+ * `override_feature_code` is declared by `createTimeConditionDto`/`updateTimeConditionDto` now
+ * (`overrideFeatureCode: shortCode.nullish()`), so it is an ordinary `PATCH /time-conditions/:id`
+ * and rides `time-conditions.write` — not the `call-flows.toggle` above it. That split is the
+ * feature rather than an inconsistency: choosing which digits a phone dials is dial-plan
+ * configuration and is compiled, while PRESSING the code is the five-o'clock act a receptionist
+ * performs. So the card renders each half only for whoever holds its grant, and somebody may
+ * legitimately see one and not the other.
+ *
+ * It is on this card rather than in "Condition settings" because this is where the question is
+ * asked. A person reading "how do I force this open from a handset" is looking at the override
+ * control, and the dialog is not reachable at all with the grant that presses it. `PATCH` leaves an
+ * absent key alone, so this form and that dialog cannot clobber each other's column.
+ *
+ * Nothing here checks the code for a COLLISION with the feature-code catalogue: that is a fact about
+ * the whole tenant rather than about this row, and the compiler's diagnostic — raised inside the
+ * write transaction — is what says "`*281` already answers to something".
  */
 const OVERRIDE_LABELS: Readonly<Record<TimeConditionOverride, string>> = {
 	auto: "Follow the schedule",
@@ -99,22 +120,116 @@ export function TimeConditionOverrideCard({ condition }: { condition: TimeCondit
 					</p>
 				)}
 
+				<OverrideFeatureCodeField condition={condition} />
+
 				<p className="text-xs text-muted-foreground">
 					An override is stored, compiled into the routing model and survives a restart — so setting
 					one republishes the dial plan, exactly as editing a rule does, and clearing it republishes
 					again. It is not a timer: nothing puts it back.
-					{condition.overrideFeatureCode ? (
-						<>
-							{" "}
-							Handsets can cycle it by dialling{" "}
-							<span className="font-mono text-foreground">{condition.overrideFeatureCode}</span>,
-							which steps through the three states in the order above and wraps around. That code is
-							set outside this app today.
-						</>
-					) : null}
 				</p>
 			</CardBody>
 		</Card>
+	);
+}
+
+/**
+ * The star code that cycles the override from a handset.
+ *
+ * Its own component because it has its own grant, its own mutation and its own form state, and
+ * folding all three into the card above would have made the permission check on the select apply to
+ * the input too. Somebody holding `call-flows.toggle` and not `time-conditions.write` sees the
+ * select and a sentence here; somebody holding the reverse sees the code and not the select.
+ *
+ * The save button appears only once the value differs from what is stored. A code is a
+ * once-a-deployment decision, so a permanently live Save on a card whose main control saves on
+ * change would read as though the whole card were unsaved.
+ */
+function OverrideFeatureCodeField({ condition }: { condition: TimeConditionRow }) {
+	const canWrite = usePermission(PBX_RESOURCES.timeConditions.permissions.write);
+	const update = usePbxUpdate(PBX_RESOURCES.timeConditions);
+	const server = useServerFieldErrors();
+
+	const form = useForm({
+		defaultValues: {
+			overrideFeatureCode: condition.overrideFeatureCode ?? "",
+		} satisfies TimeConditionOverrideCodeFormValues,
+		validators: { onSubmit: timeConditionOverrideCodeFormSchema },
+		onSubmit: async ({ value }) => {
+			const parsed = timeConditionOverrideCodeFormSchema.parse(value);
+			server.clear();
+			try {
+				// A blank box is `null`, which CLEARS the column. Omitting the key would leave the old code
+				// answering on every handset in the building while this form showed nothing.
+				await update.mutateAsync({
+					id: condition.id,
+					values: { overrideFeatureCode: parsed.overrideFeatureCode },
+				});
+			} catch (error) {
+				server.capture(error);
+			}
+		},
+	});
+
+	if (!canWrite) {
+		return (
+			<p className="text-xs text-muted-foreground">
+				{condition.overrideFeatureCode ? (
+					<>
+						Handsets can cycle this by dialling{" "}
+						<span className="font-mono text-foreground">{condition.overrideFeatureCode}</span>,
+						which steps through the three states in the order above and wraps around. Changing that
+						code needs the grant that edits the condition itself.
+					</>
+				) : (
+					"No star code cycles this condition from a handset. Setting one needs the grant that edits the condition itself."
+				)}
+			</p>
+		);
+	}
+
+	return (
+		<form
+			noValidate
+			className="flex flex-col gap-3"
+			onSubmit={(event) => {
+				event.preventDefault();
+				void form.handleSubmit();
+			}}
+		>
+			<form.Field name="overrideFeatureCode">
+				{(field) => (
+					<>
+						<TextField
+							field={field}
+							label="Star code"
+							placeholder="*281"
+							description="Dialling this from a handset steps through the three states above in order and wraps around — the same cycle the select performs, without a browser. Leave it blank for no code. It is screened against the feature-code catalogue when the dial plan compiles, so a collision comes back as a diagnostic rather than a silent second owner."
+							disabled={update.isPending}
+							submitError={server.errors.overrideFeatureCode}
+						/>
+						{field.state.value.trim() !== (condition.overrideFeatureCode ?? "") ? (
+							<div className="flex items-center gap-2">
+								<Button type="submit" size="sm" variant="secondary" loading={update.isPending}>
+									Save code
+								</Button>
+								<Button
+									type="button"
+									size="sm"
+									variant="ghost"
+									disabled={update.isPending}
+									onClick={() => {
+										server.clear();
+										form.reset();
+									}}
+								>
+									Cancel
+								</Button>
+							</div>
+						) : null}
+					</>
+				)}
+			</form.Field>
+		</form>
 	);
 }
 

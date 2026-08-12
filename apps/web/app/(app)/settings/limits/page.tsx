@@ -33,10 +33,12 @@ import type { OrgLimitName, OrgUsageEntry } from "~/lib/pbx/contracts";
  * administrator reads "12 of 50 MB" and concludes they have room, when the largest category is not
  * in the total at all. So both gaps are stated beside the bar they affect rather than in a footnote:
  *
- * - **Simultaneous calls** always report zero used. They are live state the engine holds; the
- *   control plane cannot see them, and a number this page invented would be wrong the moment it was
- *   read. The CEILING is real and is enforced by the engine at admission, which is the fact somebody
- *   came here for.
+ * - **Simultaneous calls** report no usage at all. They are live state the engine holds; the control
+ *   plane cannot see them, and a number this page invented would be wrong the moment it was read.
+ *   The report says so in the data rather than leaving it to a label — `measured: false`, and a
+ *   `ratio` of `null` rather than the `0` it used to send — so the bar is not drawn and the line
+ *   says which fact is missing. The CEILING is real and is enforced by the engine at admission,
+ *   which is what somebody came here for.
  * - **Storage** counts prompts and voicemail only. Recordings live in the call-detail database — a
  *   different connection and a different bounded context — so reaching across for a number would make
  *   this page fail whenever that database is slow.
@@ -240,12 +242,27 @@ export default function OrgLimitsPage() {
  * One usage line.
  *
  * Three states, and each is a different sentence rather than a different number: no ceiling (a bar
- * would imply a boundary that does not exist), a ceiling that cannot be measured against
- * (`maxConcurrentCalls`, whose `used` is always zero and would draw an empty bar that reads as "no
- * calls"), and a real ratio.
+ * would imply a boundary that does not exist), a ceiling with nothing measured against it, and a
+ * real ratio.
+ *
+ * ## The second state is the SERVER's claim now, not this file's
+ *
+ * `unmeasurable` used to be `limit === "maxConcurrentCalls"` — a second copy of a decision the usage
+ * endpoint already makes, kept in a browser. `OrgUsageEntry.measured` is that decision, so the
+ * branch reads it. The difference is not tidiness: the day a fifth limit arrives, or the day the
+ * engine starts reporting live channel counts, the hard-coded name is wrong in the direction that
+ * claims a number nobody counted.
+ *
+ * `ratio` moved with it. It used to be `0` beside a real ceiling for this limit, which drew a 0% bar
+ * — a confident "nobody is on a call" from a process that cannot see calls. It is `null` now, so
+ * there is nothing to draw from even if the guard below were removed.
+ *
+ * An entry the report did not carry at all falls back to `measured: true` with no ceiling, which
+ * renders as "No limit" — the same thing an absent quota means, and the honest reading of a line the
+ * server declined to send.
  */
 function UsageBar({ limit, entry }: { limit: OrgLimitName; entry: OrgUsageEntry | undefined }) {
-	const unmeasurable = limit === "maxConcurrentCalls";
+	const unmeasurable = entry !== undefined && !entry.measured;
 	const ceiling = entry?.ceiling ?? null;
 	const used = entry?.used ?? 0;
 	const ratio = entry?.ratio;
@@ -298,9 +315,11 @@ function UsageBar({ limit, entry }: { limit: OrgLimitName; entry: OrgUsageEntry 
 					`No ceiling is set. ${LIMIT_DESCRIPTIONS[limit]}`
 				) : unmeasurable ? (
 					<>
-						<Badge tone="neutral">Not measurable here</Badge> Simultaneous calls are live state the
-						engine holds — the control plane cannot count them, so this reports the ceiling and not
-						the usage. The ceiling itself is real and refuses the call at admission.
+						<Badge tone="neutral">Enforced by the engine, not counted here</Badge> This is live
+						state the engine holds — the control plane cannot count it without enumerating every leg
+						on the platform on every page load, so the report says so rather than sending a zero
+						that reads as &ldquo;none in use&rdquo;. The ceiling is real and is applied when a call
+						is admitted; what is missing is the current figure, not the limit.
 					</>
 				) : (
 					LIMIT_DESCRIPTIONS[limit]

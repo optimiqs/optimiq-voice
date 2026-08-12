@@ -105,6 +105,24 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, PageRequirement>> = {
 	 * exists to prevent: a visible nav entry and a page that 403s.
 	 */
 	[routes.mediaLibrary]: { permissions: ["settings.read"] },
+	/**
+	 * One phrase and its steps.
+	 *
+	 * Declared rather than inherited, and it is the only detail route in this map that needs a line.
+	 * `/media` is `settings.read` because the hold-music and prompt endpoints ask for it; the phrases
+	 * endpoints ask for `recordings.read`, on the server's argument that a phrase is a media-library
+	 * row and rides the library's grants. Inheriting `/media` by ancestry would open this page for
+	 * every self-service role — all of them hold `settings.read` — and 403 them on the first read.
+	 *
+	 * Writing a phrase is `recordings.configure` and deleting one is `recordings.delete`; both are
+	 * gated inside the page, because a role that may see which sequence a queue announces without
+	 * being able to rewrite it is exactly the person diagnosing what a caller heard.
+	 *
+	 * The `[id]` wildcard is `matchesPathPattern`'s, and this is its first use in this map: every
+	 * other detail view is nested under a list whose requirement is the right one, which is what makes
+	 * inheriting the rule and this the exception.
+	 */
+	[routes.phrase("[id]")]: { permissions: ["recordings.read"] },
 	[routes.cdr]: { permissions: ["cdr.read", "cdr.read.own"] },
 	/**
 	 * The wallboard and, by ancestry, each queue's operator panel.

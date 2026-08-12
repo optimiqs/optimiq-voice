@@ -60,6 +60,33 @@ export interface CallLegRow {
 	readonly disposition: CallDisposition;
 	readonly recordingKey: string | null;
 	readonly transcriptionStatus: TranscriptionStatus;
+	/**
+	 * Which authorisation code let this leg dial out, when one was demanded.
+	 *
+	 * A PIN set attached to an outbound route challenges the caller before any trunk is offered the
+	 * call, and the engine records WHICH code answered — `call_legs.auth_pin_ordinal` is the entry's
+	 * position in the set and `auth_pin_label` is the human name beside it ("Night desk"). The digits
+	 * are never here: they are stored as a digest and the label is what a bill is read against.
+	 *
+	 * All-or-nothing, and the writer enforces it (`cdr-leg-mapping.ts` nulls the label when the
+	 * ordinal is absent), so a label without an ordinal is not a state this app has to render. The
+	 * ordinal is legitimately `0` — the first code in a set — which is why nothing here may test it
+	 * for truthiness.
+	 *
+	 * ## Both are OPTIONAL, and that is the honest mirror rather than a hedge
+	 *
+	 * The columns exist and the writer fills them, but `LEG_LIST_COLUMNS` and `LEG_DETAIL_COLUMNS` in
+	 * `apps/api/src/cdr/query/cdr.repository.ts` do not select them yet — and `raw` cannot stand in,
+	 * because both keys are in `MAPPED_KEYS` and are therefore stripped out of the passthrough blob.
+	 * So a leg read today arrives with the keys ABSENT rather than null, and typing them as
+	 * `number | null` would be this app asserting a projection the server does not have.
+	 *
+	 * `?` rather than `| null` alone is what makes the renderer's `== null` test correct for both the
+	 * "not selected" and the "no code was demanded" cases, and what makes widening the projection a
+	 * change with no diff on this side.
+	 */
+	readonly authPinOrdinal?: number | null;
+	readonly authPinLabel?: string | null;
 }
 
 /** The detail view adds the media-quality block and the passthrough jsonb. */

@@ -341,6 +341,20 @@ export const trunkFormSchema = z.strictObject({
 	maxChannels: optionalInt(1, 10_000),
 	codecPrefs: optionalText(128),
 	callerIdNumberOverride: optionalText(32),
+	/**
+	 * The ruleset that rewrites an arriving caller's number, and the first thing that touches a call
+	 * on this trunk.
+	 *
+	 * Writable since `updateTrunkDto` declared it (`inboundTranslationRulesetId: z.uuid().nullish()`);
+	 * it was rendered as a read-only fact before that, because a select wired to a strict DTO that did
+	 * not declare the field produced a 400 naming a column the user had just chosen from a list.
+	 *
+	 * Nothing composes with it — a trunk has no inline strip or prepend — so it runs first and ALONE,
+	 * before the screening list, the inbound routes or the call record read the caller's number. That
+	 * is the opposite of the outbound side, where a ruleset runs after the route's own digits; see
+	 * {@link outboundRouteFormSchema}.
+	 */
+	inboundTranslationRulesetId: optionalReference(),
 	enabled: z.boolean(),
 });
 export type TrunkFormValues = z.input<typeof trunkFormSchema>;
@@ -391,6 +405,31 @@ export const outboundRouteFormSchema = z.strictObject({
 	trunkIds: z.array(z.uuid()).max(20, "At most 20 trunks"),
 	timeConditionId: z.string().trim(),
 	callerIdNumberOverride: optionalText(32),
+	/**
+	 * The shared ruleset, applied AFTER this route's own `stripDigits` and `prependDigits`.
+	 *
+	 * The order is the reason both live in one section on the form: strip and prepend turn what
+	 * somebody's fingers did into the number they meant — dropping the 9 for an outside line — and the
+	 * ruleset then normalises that number for the wire. A ruleset that ran first would have to know
+	 * about every route's outside-line prefix, which is the coupling the shared layer exists to
+	 * remove.
+	 *
+	 * Writable since `updateOutboundRouteDto` declared it; it was a read-only fact before that.
+	 */
+	translationRulesetId: optionalReference(),
+	/**
+	 * The codes a caller must enter before any trunk is offered the call.
+	 *
+	 * The blast radius is money, which is why a PIN set is a resource of its own on the server rather
+	 * than a ride on `routes.*` — but ATTACHING one is an edit to the route, so it is `routes.write`
+	 * like every other field here, and this schema does not gate it separately.
+	 *
+	 * Clearing it is `null` rather than an absent key, which is what {@link optionalReference} is for
+	 * and is unusually load-bearing on this column: an omitted key leaves the stored id alone, so a
+	 * form that dropped an emptied selector would let an operator remove the challenge, press Save,
+	 * and still be asked for a code on the next call with nothing on screen disagreeing.
+	 */
+	pinSetId: optionalReference(),
 	recordEnabled: z.boolean(),
 	enabled: z.boolean(),
 });
@@ -402,6 +441,36 @@ export const timeConditionFormSchema = z.strictObject({
 	enabled: z.boolean(),
 });
 export type TimeConditionFormValues = z.input<typeof timeConditionFormSchema>;
+
+/**
+ * The star code that cycles a condition's override, edited on its own.
+ *
+ * ## Why it is not a field of {@link timeConditionFormSchema}
+ *
+ * Both reach the same `PATCH /time-conditions/:id` and both need `time-conditions.write`, so a
+ * second schema buys nothing at the endpoint. It buys something on screen: the code belongs beside
+ * the override control, which is where somebody reading "how do I force this open from a handset"
+ * is looking, and that control lives on the condition's page rather than in its settings dialog
+ * because pressing the override is `call-flows.toggle` — the receptionist's grant — and the dialog
+ * is not reachable with it.
+ *
+ * Two controls writing one column from two places would be worse than one control in the wrong
+ * place. `PATCH` leaves an absent key alone, so this form's save cannot clobber a name the dialog is
+ * holding, and the dialog's save cannot clobber this code.
+ *
+ * Blank clears it: `null` is a real state (no code answers for this condition) and the column takes
+ * no empty string. The digits themselves are checked against {@link shortCode}, mirroring the DTO's
+ * `overrideFeatureCode: shortCode.nullish()` — and nothing here checks for a COLLISION with the
+ * feature-code catalogue, because that is a fact about the whole tenant rather than about this row.
+ * The compiler's diagnostic is what says "`*281` already answers to something", inside the write
+ * transaction.
+ */
+export const timeConditionOverrideCodeFormSchema = z.strictObject({
+	overrideFeatureCode: optionalShortCode,
+});
+export type TimeConditionOverrideCodeFormValues = z.input<
+	typeof timeConditionOverrideCodeFormSchema
+>;
 
 const wallClock = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/u, "Must be HH:MM, 24-hour");
 const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, "Must be YYYY-MM-DD");
@@ -1147,6 +1216,52 @@ export const promptUploadFormSchema = z.strictObject({
 		.regex(/^$|^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/u, "Must be a language tag, e.g. en-US"),
 });
 export type PromptUploadFormValues = z.input<typeof promptUploadFormSchema>;
+
+/**
+ * A phrase: a name, and nothing else.
+ *
+ * One field is not a placeholder for a fuller form — it is the whole of `createPhraseDto`, and the
+ * absences are decisions the server states rather than fields nobody got to:
+ *
+ * - `kind` and `objectKey` are absent from the DTO and always will be. They are not fields, they are
+ *   what MAKES the row a phrase: the service stamps `kind: "phrase"` and leaves the object key null,
+ *   which is the exact pair `prompt_object_key_kind_check` permits. A client that could send either
+ *   could turn a phrase into a library entry with no file behind it.
+ * - `language` is absent because a phrase's language is whatever its steps' audio is, and a tag on
+ *   the sequence that disagreed with the recordings would be a tag that lies.
+ * - `mohClassId` is absent because an MOH file is a member of a class and a sequence is not a file.
+ *
+ * The SEQUENCE is a child collection and is not in this schema at all — see
+ * {@link phraseStepFormSchema}.
+ */
+export const phraseFormSchema = z.strictObject({
+	name: displayName,
+});
+export type PhraseFormValues = z.input<typeof phraseFormSchema>;
+
+/**
+ * One step of a phrase.
+ *
+ * ## `promptId` is required, and the form may not offer another phrase
+ *
+ * Nesting is refused by the server — `phrases.service.ts` answers a step whose `promptId` names a
+ * `kind = 'phrase'` row with a `PBX_VALIDATION_FAILED` addressed at `promptId`, and the compiler
+ * refuses the same shape a second time for rows that arrive by any other route. This schema cannot
+ * express that: it sees a uuid, not the row behind it, exactly as the DTO does. The refusal lives
+ * where the row is visible — the step dialog offers `kind: "prompt"` only, and checks the chosen id
+ * against the phrase list before it sends, so the message lands on the picker rather than arriving
+ * as a 400 after a round trip.
+ *
+ * `ordinal` is optional and bounded to the server's 0…1000. Blank means "append", which the dialog
+ * turns into the next free position: `(phrase, ordinal)` is unique, so an omitted key would be a
+ * collision rather than a default.
+ */
+export const phraseStepFormSchema = z.strictObject({
+	promptId: requiredReference,
+	ordinal: optionalInt(0, 1000),
+	enabled: z.boolean(),
+});
+export type PhraseStepFormValues = z.input<typeof phraseStepFormSchema>;
 
 /** A voicemail greeting upload: which slot it fills, what to call it, whether to use it now. */
 export const greetingUploadFormSchema = z.strictObject({

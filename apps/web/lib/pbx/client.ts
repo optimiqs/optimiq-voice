@@ -46,6 +46,8 @@ import type {
 	PagingGroupRow,
 	ParkLotRow,
 	PhoneNumberRow,
+	PhraseRow,
+	PhraseStepRow,
 	PinSetEntryRow,
 	PinSetRow,
 	PromptKind,
@@ -481,6 +483,48 @@ export const PBX_RESOURCES = {
 		displayName: (row) => row.name,
 	}),
 	/**
+	 * Phrases — the ordered-sequence half of the media library.
+	 *
+	 * ## The same table as {@link PBX_RESOURCES.prompts}, and a second descriptor over it
+	 *
+	 * A phrase IS a `prompt` row with `kind = "phrase"` and no object key, so `RESOURCE_TABLES` in
+	 * `contracts.spec.ts` maps this key to `prompt` exactly as it maps `prompts` — two keys, one
+	 * table, and `affectsRouting: true` for both because the routing package has no way to tell them
+	 * apart either. The server draws the line in the same place: `PHRASE_RESOURCE` and
+	 * `PROMPT_RESOURCE` are two descriptors over `prompt`, differing in a discriminator neither
+	 * descriptor can express.
+	 *
+	 * ## `recordings.*`, and there is deliberately no `phrases.*`
+	 *
+	 * The permission registry's decision, restated here so a create button and its endpoint cannot
+	 * disagree: a phrase is a media-library row, so it rides the grants the rest of the library does.
+	 * There is no role that curates the audio and not the sequences assembled out of it, and the
+	 * server's own test asserts that `phrases.read` was never minted.
+	 *
+	 * Note that this is NOT the pair `PBX_RESOURCES.prompts` asks for. The prompt library is
+	 * `settings.*` — the page it lives on is gated that way — and the phrases surface is
+	 * `recordings.*`, which is the API's split and not a choice this file could make. It is why the
+	 * phrases tab gates its own contents rather than relying on `/media`'s route requirement; see
+	 * `app/(app)/media/_components/phrases-panel.tsx`.
+	 *
+	 * `configure` for writes rather than a `recordings.write` that does not exist: the registry has
+	 * `read`, `read.own`, `download`, `delete` and `configure`, and `configure` is the one that means
+	 * "change how recordings work" rather than "look at one".
+	 */
+	phrases: descriptor<PhraseRow>({
+		key: "phrases",
+		affectsRouting: true,
+		path: "/phrases",
+		label: "phrase",
+		labelPlural: "Phrases",
+		permissions: {
+			read: "recordings.read",
+			write: "recordings.configure",
+			delete: "recordings.delete",
+		},
+		displayName: (row) => row.name,
+	}),
+	/**
 	 * Dispatchable locations for E911.
 	 *
 	 * `affectsRouting: false` — `emergency_address` is not in `ROUTING_TABLE_TO_ENTITY` and nothing
@@ -676,6 +720,31 @@ export const PBX_CHILDREN = {
 		label: "rule",
 		parentPath: "/translation-rulesets",
 		displayName: (row) => row.label ?? row.matchPattern,
+		affectsRouting: true,
+	}),
+	/**
+	 * The prompts a phrase plays, in the order it plays them.
+	 *
+	 * `affectsRouting: true` — `phrase_step` is in `ROUTING_TABLE_TO_ENTITY`, which puts it with
+	 * `paging_group_member` and `translation_rule` rather than with `queue_tier`: the sequence is
+	 * compiled into the artifact's own `phrases` table, so adding a step or reordering one changes
+	 * what a caller hears on the next call rather than being live state read at play time.
+	 *
+	 * `key` matches `segment` because nothing else in {@link PBX_CHILDREN} is called `steps`. The two
+	 * children that differ (`pin-set-entries`, `translation-rules`) do so because `CHILD_TABLES` in
+	 * `contracts.spec.ts` is keyed by `key`, and two collections spelled the same would collapse into
+	 * one entry there and leave the loser unchecked.
+	 *
+	 * The reorder is a whole-list `PUT`, and the reason is sharper here than anywhere else it is used:
+	 * "your call is number", "seven", "in the queue" played in another order is not a slower
+	 * announcement, it is a different sentence.
+	 */
+	phraseSteps: child<PhraseStepRow>({
+		key: "steps",
+		segment: "steps",
+		label: "step",
+		parentPath: "/phrases",
+		displayName: (row) => `Step ${String(row.ordinal + 1)}`,
 		affectsRouting: true,
 	}),
 } as const;

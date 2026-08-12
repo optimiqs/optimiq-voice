@@ -434,6 +434,19 @@ const RESOURCE_TABLES: Readonly<Record<string, string>> = {
 	 * The loop below is what noticed, and the descriptor was wrong until it did.
 	 */
 	prompts: "prompt",
+	/**
+	 * The SAME table as `prompts` above, and the only duplicate value in this map.
+	 *
+	 * A phrase IS a `prompt` row with `kind = 'phrase'`, so `/phrases` and `/prompts` are two
+	 * endpoints over one table — the server draws it the same way, with `PHRASE_RESOURCE` and
+	 * `PROMPT_RESOURCE` as two descriptors differing in a discriminator neither can express.
+	 * `ROUTING_TABLE_TO_ENTITY` cannot tell them apart either, which is why both descriptors say
+	 * `affectsRouting: true` and why the loop below is satisfied by one entry in the routing map.
+	 *
+	 * This map is keyed by the RESOURCE key rather than by the table for exactly this reason: a
+	 * table-keyed map would have had to choose which of the two endpoints it was describing.
+	 */
+	phrases: "prompt",
 	"emergency-addresses": "emergency_address",
 	/**
 	 * Neither of these is a routing input, and both are absent from `ROUTING_TABLE_TO_ENTITY` for
@@ -495,6 +508,11 @@ const CHILD_TABLES: Readonly<Record<string, string>> = {
 	 * staffing a queue does not. The loop below is what holds the descriptor to that.
 	 */
 	members: "paging_group_member",
+	/**
+	 * A phrase's ordered steps. `key` matches `segment` because nothing else here is called `steps` —
+	 * the two exceptions above exist only because two collections were both spelled `rules`.
+	 */
+	steps: "phrase_step",
 };
 
 describe("affectsRouting, mirrored from @optimiq-voice/routing", () => {
@@ -547,6 +565,50 @@ describe("affectsRouting, mirrored from @optimiq-voice/routing", () => {
 		expect(PBX_RESOURCES.mohClasses.affectsRouting).toBe(true);
 		expect(PBX_RESOURCES.prompts.affectsRouting).toBe(true);
 		expect(SERVER_ROUTING_TABLES.prompt).toBe("prompts");
+	});
+
+	/**
+	 * Phrases, which are the reason the line above says what it says.
+	 *
+	 * Two descriptors over one table is the unusual shape here, and it is the SERVER's — the
+	 * discriminator that separates a sequence from a file has no place in a `PbxResource`, so
+	 * `PHRASE_RESOURCE` and `PROMPT_RESOURCE` both name `prompt` and the predicate lives in the
+	 * service. Asserted rather than left to the loop because "two keys, one table" is exactly the
+	 * duplication somebody tidies away, and collapsing them would take a `recordings.*` surface and
+	 * put it behind `settings.*`.
+	 *
+	 * The steps are a routing input in their own right (`phrase_step`), unlike `queue_tier`: which
+	 * recordings play and in what order is compiled into the artifact's phrase table, not read as
+	 * live state when the announcement starts.
+	 */
+	it("gives phrases a second descriptor over the prompt table, and compiles both halves", () => {
+		expect(PBX_RESOURCES.phrases.affectsRouting).toBe(true);
+		expect(PBX_CHILDREN.phraseSteps.affectsRouting).toBe(true);
+		expect(SERVER_ROUTING_TABLES.phrase_step).toBe("phraseSteps");
+		// One table, two endpoints — the claim `RESOURCE_TABLES` above encodes.
+		expect(RESOURCE_TABLES.phrases).toBe(RESOURCE_TABLES.prompts);
+		expect(PBX_RESOURCES.phrases.path).not.toBe(PBX_RESOURCES.prompts.path);
+	});
+
+	/**
+	 * The permission split between the two halves of the media library, which is the API's and is
+	 * easy to read as an oversight from either side.
+	 *
+	 * Hold music and the prompt library are `settings.*` because there is no `media.*` pair in the
+	 * registry and the registry is at its documented ceiling. Phrases are `recordings.*` because a
+	 * phrase is a media-library row and `phrases.controller.ts` declines to mint a `phrases.*` trio
+	 * for it — the server's own admin-block test asserts `phrases.read` was never declared.
+	 *
+	 * The consequence is a page whose three tabs do not share one grant, which is normally what forces
+	 * a route of its own in this app. It does not here because the wider grant is the one on the
+	 * route, so nobody is shut out — and the assertion is what will notice if that stops being true.
+	 */
+	it("puts the phrases surface on the recordings grants, not the media page's settings ones", () => {
+		expect(PBX_RESOURCES.phrases.permissions.read).toBe("recordings.read");
+		expect(PBX_RESOURCES.phrases.permissions.write).toBe("recordings.configure");
+		expect(PBX_RESOURCES.phrases.permissions.delete).toBe("recordings.delete");
+		expect(PBX_RESOURCES.prompts.permissions.read).toBe("settings.read");
+		expect(PBX_RESOURCES.phrases.permissions.read).not.toBe(PBX_RESOURCES.prompts.permissions.read);
 	});
 
 	/**

@@ -5,6 +5,8 @@ import {
 	DIAL_PLAN_TABS,
 	dialPlanTabHref,
 	isPublicRoute,
+	MEDIA_TABS,
+	mediaTabHref,
 	queueTabHref,
 	routes,
 	ROUTING_TABS,
@@ -222,5 +224,39 @@ describe("the T2 admin block's placement", () => {
 	it("nests the limits under the settings area", () => {
 		expect(routes.limits).toBe("/settings/limits");
 		expect(routes.limits.startsWith(`${routes.settings}/`)).toBe(true);
+	});
+});
+
+/**
+ * Phrases — the one placement in this file that breaks the rule the rest of it applies.
+ *
+ * The rule: a page may only be a tab of another page when the two are gated by the SAME grant,
+ * because a tab inherits its parent's requirement by ancestry. Hold music and prompts are
+ * `settings.*` and phrases are `recordings.*`, so by that rule phrases should be a route of their
+ * own — and they are not, because the rule's PURPOSE is to stop a `PAGE_PERMISSIONS` entry naming
+ * one grant and hiding a surface behind it. Here the route's grant is the wider of the two, so
+ * nothing is hidden from anyone: `settings.read` is held by every self-service role and
+ * `recordings.read` is an administrator's, so every holder of the narrower grant reaches the page.
+ * The panel refuses the reverse case in words rather than with an empty table.
+ *
+ * The DETAIL page cannot make that trade, and does not: it has no other tabs to justify the looser
+ * requirement, so `PAGE_PERMISSIONS` names it explicitly. That is asserted in
+ * `page-permissions.spec.ts`; what is asserted here is the path shape that makes it addressable.
+ */
+describe("phrases", () => {
+	it("is a third tab of the media page rather than a route of its own", () => {
+		expect(MEDIA_TABS).toEqual(["hold-music", "prompts", "phrases"]);
+		expect(mediaTabHref("hold-music")).toBe(routes.mediaLibrary);
+		expect(mediaTabHref("phrases")).toBe(`${routes.mediaLibrary}?tab=phrases`);
+	});
+
+	/**
+	 * Nested under `/media`, so the sequence lives beside the recordings it names — and under a
+	 * `phrases/` segment rather than directly under `/media/<id>`, which is what lets
+	 * `PAGE_PERMISSIONS` match it with a `[id]` wildcard without also matching a future `/media/<x>`.
+	 */
+	it("nests one phrase's page under the media area", () => {
+		expect(routes.phrase("0193f2aa")).toBe("/media/phrases/0193f2aa");
+		expect(routes.phrase("0193f2aa").startsWith(`${routes.mediaLibrary}/`)).toBe(true);
 	});
 });

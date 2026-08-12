@@ -2,7 +2,6 @@
 
 import { useForm } from "@tanstack/react-form";
 import { useState } from "react";
-import { AttachedReference } from "~/components/pbx/attached-reference";
 import { DestinationPicker } from "~/components/pbx/destination-picker";
 import { EntityFormDialog, FormSection } from "~/components/pbx/entity-form-dialog";
 import { ResourceOrderedList, ResourceSelect } from "~/components/pbx/resource-select";
@@ -63,6 +62,8 @@ interface OutboundFormState {
 	tollClass: TollClass | "";
 	timeConditionId: string;
 	callerIdNumberOverride: string;
+	translationRulesetId: string;
+	pinSetId: string;
 	recordEnabled: boolean;
 	enabled: boolean;
 }
@@ -78,6 +79,8 @@ function defaultsFor(route: OutboundRouteRow | null): OutboundFormState {
 		tollClass: route?.tollClass ?? "",
 		timeConditionId: route?.timeConditionId ?? "",
 		callerIdNumberOverride: route?.callerIdNumberOverride ?? "",
+		translationRulesetId: route?.translationRulesetId ?? "",
+		pinSetId: route?.pinSetId ?? "",
 		recordEnabled: route?.recordEnabled ?? false,
 		enabled: route?.enabled ?? true,
 	};
@@ -124,6 +127,8 @@ export function OutboundRouteDialog({
 				trunkIds: [...trunkIds],
 				timeConditionId: value.timeConditionId,
 				callerIdNumberOverride: value.callerIdNumberOverride,
+				translationRulesetId: value.translationRulesetId,
+				pinSetId: value.pinSetId,
 				recordEnabled: value.recordEnabled,
 				enabled: value.enabled,
 			});
@@ -160,6 +165,13 @@ export function OutboundRouteDialog({
 				trunkPriority: parsed.data.trunkIds.map((trunkId, index) => ({ trunkId, order: index })),
 				timeConditionId: parsed.data.timeConditionId === "" ? null : parsed.data.timeConditionId,
 				callerIdNumberOverride: parsed.data.callerIdNumberOverride,
+				/*
+				 * Both are `null` when cleared rather than omitted. `PATCH` leaves an absent key alone, so
+				 * an omitted selector would let an operator detach the PIN set, press Save, and still be
+				 * challenged on the next call — with the form showing "no challenge".
+				 */
+				translationRulesetId: parsed.data.translationRulesetId,
+				pinSetId: parsed.data.pinSetId,
 				recordEnabled: parsed.data.recordEnabled,
 				enabled: parsed.data.enabled,
 				...writeDestination(failover, "failover"),
@@ -346,25 +358,40 @@ export function OutboundRouteDialog({
 				 * have to know about every route's outside-line prefix, which is the coupling the shared
 				 * layer exists to remove.
 				 */}
-				<AttachedReference
-					label="Then apply the shared ruleset"
-					resource={PBX_RESOURCES.translationRulesets}
-					value={route?.translationRulesetId ?? null}
-					emptyLabel="No shared ruleset — the number goes to the carrier as the two fields above left it."
-					description="Runs after the strip and prepend above, on the number they produced."
-					note="Attaching a ruleset is not editable from this application yet: the column exists and the compiler reads it, but no endpoint accepts it in a request body."
-				/>
+				<form.Field name="translationRulesetId">
+					{(field) => (
+						<ResourceSelect
+							id="translationRulesetId"
+							label="Then apply the shared ruleset"
+							resource={PBX_RESOURCES.translationRulesets}
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="No shared ruleset — the number goes to the carrier as the two fields above left it"
+							description="Runs after the strip and prepend above, on the number they produced. A trunk's inbound ruleset is the other way round: nothing composes with it, so it runs first and alone."
+							disabled={mutation.isPending}
+							error={errors.translationRulesetId}
+							className="sm:col-span-2"
+						/>
+					)}
+				</form.Field>
 			</FormSection>
 
 			<FormSection title="Authorisation" columns={1}>
-				<AttachedReference
-					label="Codes demanded before dialling"
-					resource={PBX_RESOURCES.pinSets}
-					value={route?.pinSetId ?? null}
-					emptyLabel="No challenge — anyone whose toll class covers this route may dial it."
-					description="A caller is asked for a code before any trunk is offered the call, and the code that answered is recorded against the call."
-					note="Attaching a PIN set is not editable from this application yet: the column exists and the compiler reads it, but no endpoint accepts it in a request body."
-				/>
+				<form.Field name="pinSetId">
+					{(field) => (
+						<ResourceSelect
+							id="pinSetId"
+							label="Codes demanded before dialling"
+							resource={PBX_RESOURCES.pinSets}
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="No challenge — anyone whose toll class covers this route may dial it"
+							description="A caller is asked for a code before any trunk is offered the call, and the code that answered is recorded against the call record. The toll class above still applies: a code does not let somebody take a route their extension's class does not cover."
+							disabled={mutation.isPending}
+							error={errors.pinSetId}
+						/>
+					)}
+				</form.Field>
 			</FormSection>
 
 			<FormSection title="Carriers" columns={1}>

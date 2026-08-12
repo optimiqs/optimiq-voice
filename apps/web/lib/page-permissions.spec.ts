@@ -304,6 +304,50 @@ describe("the T2 admin block", () => {
 });
 
 /**
+ * The media area, whose three tabs do NOT share one grant.
+ *
+ * Hold music and the prompt library are `settings.*`, which is what the API guards them with and
+ * what this map names for `/media`. Phrases are `recordings.*` — `phrases.controller.ts` argues that
+ * a phrase is a media-library row and declines to mint a `phrases.*` trio for it.
+ *
+ * Everywhere else in this app that split has forced a route of its own, and the assertions below are
+ * why it does not here: the grant on the ROUTE is the wider of the two, so nobody who can use the
+ * phrases API is shut out of the page it lives on, and the panel explains itself to the people the
+ * API refuses. A phrase's own page cannot make the same trade — it has no other tabs to justify the
+ * looser requirement — so it is the one detail route in this map with a line of its own.
+ */
+describe("the media area", () => {
+	it("gates the page on settings.read, which is what two of its three tabs need", () => {
+		expect(getPagePermissions(routes.mediaLibrary)?.permissions).toEqual(["settings.read"]);
+	});
+
+	/**
+	 * The failure this entry exists to prevent, stated as the role that would have hit it: a plain
+	 * user holds `settings.read` so their preferences screen renders, and holds no recordings grant at
+	 * all. Inheriting `/media` by ancestry would have opened a phrase's page for them and 403'd on the
+	 * first read.
+	 */
+	it("does not let a phrase's page inherit the media page's requirement", () => {
+		const phrase = routes.phrase("0193f2aa-0000-7000-8000-000000000003");
+
+		expect(getPagePermissions(phrase)?.permissions).toEqual(["recordings.read"]);
+		expect(getPagePermissions(phrase)).not.toEqual(getPagePermissions(routes.mediaLibrary));
+
+		const user = resolveRolePermissions("user");
+		expect(user.includes("settings.read")).toBe(true);
+		expect(canAccessPage(routes.mediaLibrary, user)).toBe(true);
+		expect(canAccessPage(phrase, user)).toBe(false);
+	});
+
+	/** The role the placement is FOR: a manager curates the library and opens the sequences in it. */
+	it("opens a phrase for a manager, who holds the recordings read", () => {
+		const manager = resolveRolePermissions("manager");
+		expect(manager.includes("recordings.read")).toBe(true);
+		expect(canAccessPage(routes.phrase("0193f2aa"), manager)).toBe(true);
+	});
+});
+
+/**
  * The wallboard and, by ancestry, each queue's operator panel.
  *
  * The placement decision this map records: a monitoring surface is gated by `queues.monitor`, which
