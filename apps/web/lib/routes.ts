@@ -41,6 +41,17 @@ export const routes = {
 	 */
 	pagingGroups: "/paging-groups",
 	/**
+	 * Shared line appearances — one line on several handsets, seized as one.
+	 *
+	 * Its own route beside paging and ring groups rather than a tab of one, on the precedent
+	 * {@link routes.pagingGroups} sets: the three are gated by different permissions
+	 * (`shared-lines.*` against `paging-groups.*` against `ring-groups.*`), and a shared page would
+	 * need a `PAGE_PERMISSIONS` entry that named one of them and hid the others. A shared line is also
+	 * a different SHAPE — a named line with an ordered list of appearances, each a button on a
+	 * handset — even though it lives next to the two group screens it resembles.
+	 */
+	sharedLines: "/shared-lines",
+	/**
 	 * Call flows — the day/night switch.
 	 *
 	 * Its own route rather than a tab of `/routing`, on the precedent {@link routes.pagingGroups} and
@@ -223,6 +234,13 @@ export const routes = {
 	ivrMenu: (id: string) => `/ivr/${id}`,
 	ringGroup: (id: string) => `/ring-groups/${id}`,
 	pagingGroup: (id: string) => `/paging-groups/${id}`,
+	/**
+	 * A shared line's appearances — another entity with a child collection, and it earns a page for
+	 * the reason the others do: the appearances are an ORDERED list with a reorder handle, and the
+	 * ordinal is the button index a phone lights, which a dialog inside a dialog cannot hold. Nested
+	 * under the list's path so it inherits `shared-lines.read` by ancestry.
+	 */
+	sharedLine: (id: string) => `/shared-lines/${id}`,
 	queue: (id: string) => `/queues/${id}`,
 	timeCondition: (id: string) => `/routing/time-conditions/${id}`,
 	/**

@@ -114,6 +114,16 @@ export const NAV_SECTIONS: readonly NavSection[] = [
 			 * glyph ring groups use.
 			 */
 			{ title: "Paging groups", url: routes.pagingGroups, icon: MegaphoneIcon },
+			/**
+			 * Beside the two group screens it resembles, because an administrator building a shared line
+			 * has usually just looked at a ring group — both are "this set of handsets".
+			 *
+			 * It is nevertheless a separate entry rather than a tab, and for a sharper reason than the
+			 * others: a ring group REACHES people and is done at the answer, a paging group SPEAKS at
+			 * them, and a shared line is a shared RESOURCE whose whole point is the state it keeps after
+			 * the answer. Three different things wearing a similar list, gated by three different grants.
+			 */
+			{ title: "Shared lines", url: routes.sharedLines, icon: PhoneIcon },
 			{ title: "Queues", url: routes.queues, icon: QueueIcon },
 		],
 	},

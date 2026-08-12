@@ -73,6 +73,16 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, PageRequirement>> = {
 	 * the list's path.
 	 */
 	[routes.pagingGroups]: { permissions: ["paging-groups.read"] },
+	/**
+	 * `shared-lines.read`, which is what `SharedLinesController` guards both the line list and its
+	 * nested `/appearances` with. NOT `paging-groups.read` or `ring-groups.read`, even though the
+	 * three screens are siblings: a role granted one and not the others would otherwise see a nav
+	 * entry the API refuses.
+	 *
+	 * A line's detail view inherits this by ancestry, because `/shared-lines/<id>` is nested under
+	 * the list's path.
+	 */
+	[routes.sharedLines]: { permissions: ["shared-lines.read"] },
 	[routes.queues]: { permissions: ["queues.read"] },
 	/**
 	 * Caller screening.

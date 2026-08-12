@@ -34,6 +34,8 @@ import {
 	queueFormSchema,
 	queueTierFormSchema,
 	ringGroupFormSchema,
+	sharedLineAppearanceFormSchema,
+	sharedLineFormSchema,
 	shortCode,
 	speedDialFormSchema,
 	timeConditionOverrideCodeFormSchema,
@@ -802,6 +804,151 @@ describe("pagingGroupMemberFormSchema", () => {
 		expect(pagingGroupMemberFormSchema.safeParse({ ...base, timeoutSeconds: "10" }).success).toBe(
 			false,
 		);
+	});
+});
+
+/**
+ * Shared lines, mirroring `shared-lines.dto.ts`.
+ *
+ * Three facts are asserted rather than left to a round trip, because each is a place a shared line
+ * looks like a ring group or a paging group and is not.
+ *
+ * The NUMBER is genuinely optional: a line that is only a shared key across a boss and an assistant
+ * is reached through its member buttons, not a dialable number.
+ *
+ * The RECALL timeout's floor is 0, and 0 is a REAL value — it disables recall and the line holds
+ * indefinitely — where the ring timeout's floor is 5. Copying one bound onto the other would either
+ * forbid "hold forever" or admit a two-second ring nobody can answer.
+ *
+ * There is NO destination trio, and a strict object is what keeps a copied block from adding one — a
+ * shared line never routes a call out, its state lives in a KV claim.
+ */
+describe("sharedLineFormSchema", () => {
+	const base = {
+		name: "Front desk",
+		extensionNumber: "",
+		strategy: "simultaneous" as const,
+		ringTimeoutSeconds: "",
+		holdRecallTimeoutSeconds: "",
+		bargeInEnabled: false,
+		enabled: true,
+	};
+
+	it("sends a blank number as null, because a shared key needs no number of its own", () => {
+		expect(sharedLineFormSchema.parse(base).extensionNumber).toBeNull();
+		expect(sharedLineFormSchema.parse({ ...base, extensionNumber: "8500" }).extensionNumber).toBe(
+			"8500",
+		);
+	});
+
+	it("refuses a number with letters in it", () => {
+		expect(sharedLineFormSchema.safeParse({ ...base, extensionNumber: "85a0" }).success).toBe(
+			false,
+		);
+	});
+
+	/** `resettable` on the server: an emptied ring timeout means "put the default back", so `null`. */
+	it("turns an emptied ring timeout into null and holds it to 5 and 600", () => {
+		expect(sharedLineFormSchema.parse(base).ringTimeoutSeconds).toBeNull();
+		expect(sharedLineFormSchema.safeParse({ ...base, ringTimeoutSeconds: "4" }).success).toBe(
+			false,
+		);
+		expect(sharedLineFormSchema.safeParse({ ...base, ringTimeoutSeconds: "5" }).success).toBe(true);
+		expect(sharedLineFormSchema.safeParse({ ...base, ringTimeoutSeconds: "600" }).success).toBe(
+			true,
+		);
+		expect(sharedLineFormSchema.safeParse({ ...base, ringTimeoutSeconds: "601" }).success).toBe(
+			false,
+		);
+	});
+
+	/**
+	 * The recall timeout, where 0 is a value the column keeps rather than a blank. Its floor is 0 for
+	 * that reason, and an emptied box is `null` — the ordinary "restore the default".
+	 */
+	it("keeps a zero recall timeout, which disables recall, and nulls an emptied one", () => {
+		expect(
+			sharedLineFormSchema.parse({ ...base, holdRecallTimeoutSeconds: "0" })
+				.holdRecallTimeoutSeconds,
+		).toBe(0);
+		expect(sharedLineFormSchema.parse(base).holdRecallTimeoutSeconds).toBeNull();
+		expect(
+			sharedLineFormSchema.safeParse({ ...base, holdRecallTimeoutSeconds: "3600" }).success,
+		).toBe(true);
+		expect(
+			sharedLineFormSchema.safeParse({ ...base, holdRecallTimeoutSeconds: "3601" }).success,
+		).toBe(false);
+	});
+
+	it("offers only the two strategies the server has, and no more", () => {
+		expect(sharedLineFormSchema.safeParse({ ...base, strategy: "sequential" }).success).toBe(true);
+		expect(sharedLineFormSchema.safeParse({ ...base, strategy: "round-robin" }).success).toBe(
+			false,
+		);
+	});
+
+	/**
+	 * No destination trio, and it must not be one. A shared line never routes a call out — its state
+	 * lives in a KV claim — and a strict object is what stops a copied block from adding one silently.
+	 */
+	it("refuses a destination, because a shared line does not route a call out", () => {
+		expect(
+			sharedLineFormSchema.safeParse({ ...base, timeoutDestinationType: "voicemail" }).success,
+		).toBe(false);
+	});
+});
+
+/**
+ * An appearance, where the difference from a ring-group member is the whole design.
+ *
+ * An appearance carries an `extension_id` and may not be anything else, because the engine
+ * originates a leg to a registered endpoint and the credential path tells that device which button
+ * to light. So the reference is REQUIRED here where every other selector on a PBX form treats blank
+ * as "clear it" — a blank appearance lights nobody's button.
+ */
+describe("sharedLineAppearanceFormSchema", () => {
+	const id = "019fd5fb-de54-700b-8826-8cf8ab5199af";
+	const base = { extensionId: id, ordinal: "0", enabled: true };
+
+	it("requires an extension, because an appearance with none lights nobody's button", () => {
+		expect(sharedLineAppearanceFormSchema.safeParse({ ...base, extensionId: "" }).success).toBe(
+			false,
+		);
+		expect(sharedLineAppearanceFormSchema.safeParse({ ...base, extensionId: "  " }).success).toBe(
+			false,
+		);
+	});
+
+	it("refuses anything that is not a uuid, since the options ARE ids", () => {
+		expect(sharedLineAppearanceFormSchema.safeParse({ ...base, extensionId: "1001" }).success).toBe(
+			false,
+		);
+		expect(
+			sharedLineAppearanceFormSchema.parse({ ...base, extensionId: ` ${id} ` }).extensionId,
+		).toBe(id);
+	});
+
+	it("holds the ordinal to the server's 0 and 1000, and keeps a zero", () => {
+		expect(sharedLineAppearanceFormSchema.parse(base).ordinal).toBe(0);
+		expect(sharedLineAppearanceFormSchema.safeParse({ ...base, ordinal: "1000" }).success).toBe(
+			true,
+		);
+		expect(sharedLineAppearanceFormSchema.safeParse({ ...base, ordinal: "1001" }).success).toBe(
+			false,
+		);
+		expect(sharedLineAppearanceFormSchema.safeParse({ ...base, ordinal: "-1" }).success).toBe(
+			false,
+		);
+	});
+
+	/** An appearance carries no destination and no timing of its own — both live on the line. */
+	it("refuses a destination and a per-appearance timeout", () => {
+		expect(
+			sharedLineAppearanceFormSchema.safeParse({ ...base, destinationType: "extension" }).success,
+		).toBe(false);
+		expect(
+			sharedLineAppearanceFormSchema.safeParse({ ...base, ringTimeoutSeconds: "10" }).success,
+		).toBe(false);
 	});
 });
 

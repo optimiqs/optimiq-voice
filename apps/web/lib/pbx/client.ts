@@ -58,6 +58,8 @@ import type {
 	RingGroupMemberRow,
 	RingGroupRow,
 	RoutingContext,
+	SharedLineAppearanceRow,
+	SharedLineRow,
 	SimulateResult,
 	SipAclEntryRow,
 	SipAuthEventQueryParams,
@@ -373,6 +375,31 @@ export const PBX_RESOURCES = {
 		},
 		displayName: (row) => row.name,
 	}),
+	/**
+	 * Shared line appearances (SLA / BLA) — one line on several handsets, behaving as one seizable
+	 * thing.
+	 *
+	 * `affectsRouting: true` — `shared_line` IS in `ROUTING_TABLE_TO_ENTITY` (it maps to
+	 * `sharedLines`), because the line's number and the per-appearance button layout are compiled
+	 * into the artifact rather than read as live state. The seizure the appearances arbitrate is the
+	 * live half and lives in a KV claim, but who has a button and where is a compiled fact, so a save
+	 * here recompiles. `contracts.spec.ts` holds this against the routing package.
+	 *
+	 * Its own `shared-lines.*` family, mirrored from `SharedLinesController`.
+	 */
+	sharedLines: descriptor<SharedLineRow>({
+		key: "shared-lines",
+		affectsRouting: true,
+		path: "/shared-lines",
+		label: "shared line",
+		labelPlural: "Shared lines",
+		permissions: {
+			read: "shared-lines.read",
+			write: "shared-lines.write",
+			delete: "shared-lines.delete",
+		},
+		displayName: (row) => row.name,
+	}),
 	queues: descriptor<QueueRow>({
 		key: "queues",
 		affectsRouting: true,
@@ -661,6 +688,27 @@ export const PBX_CHILDREN = {
 		label: "member",
 		parentPath: "/paging-groups",
 		displayName: (row) => `Member ${row.ordinal + 1}`,
+		affectsRouting: true,
+	}),
+	/**
+	 * The appearances on a shared line — one extension's button each.
+	 *
+	 * `segment: "appearances"`, per `SharedLinesController`'s nested route, and NOT `"members"`: an
+	 * appearance is an `extension_id` foreign key like a paging member, but the ordinal it carries is
+	 * the button INDEX the phone lights, not a mere fan-out order. `key` matches `segment` because
+	 * nothing else in {@link PBX_CHILDREN} is called `appearances`.
+	 *
+	 * `affectsRouting: true` — `shared_line_appearance` IS in `ROUTING_TABLE_TO_ENTITY` (mapped to
+	 * `sharedLines`): the per-extension appearance projection is compiled into the artifact so a
+	 * phone lights the right key, so adding or reordering an appearance republishes it. That puts it
+	 * with `paging_group_member` rather than with `queue_tier`.
+	 */
+	sharedLineAppearances: child<SharedLineAppearanceRow>({
+		key: "appearances",
+		segment: "appearances",
+		label: "appearance",
+		parentPath: "/shared-lines",
+		displayName: (row) => `Appearance ${row.ordinal + 1}`,
 		affectsRouting: true,
 	}),
 	timeConditionRules: child<TimeConditionRuleRow>({

@@ -22,6 +22,7 @@ import {
 	RECORD_POLICIES as SERVER_RECORD_POLICIES,
 	RING_GROUP_STRATEGIES as SERVER_RING_GROUP_STRATEGIES,
 	ROUTE_MATCH_KINDS as SERVER_ROUTE_MATCH_KINDS,
+	SHARED_LINE_STRATEGIES as SERVER_SHARED_LINE_STRATEGIES,
 	SIP_TRANSPORTS as SERVER_SIP_TRANSPORTS,
 	TOLL_CLASSES as SERVER_TOLL_CLASSES,
 	TRUNK_KINDS as SERVER_TRUNK_KINDS,
@@ -60,6 +61,7 @@ import {
 	RING_GROUP_STRATEGIES,
 	ROUTE_MATCH_KINDS,
 	ROUTING_CONTEXTS,
+	SHARED_LINE_STRATEGIES,
 	SIP_TRANSPORTS,
 	TOLL_CLASSES,
 	TRUNK_KINDS,
@@ -150,6 +152,19 @@ describe("closed sets mirrored from @optimiq-voice/pbx-db", () => {
 
 	it("ring group strategies match", () => {
 		expect(RING_GROUP_STRATEGIES).toEqual([...SERVER_RING_GROUP_STRATEGIES]);
+	});
+
+	/**
+	 * Shared line strategies, mirrored on their own tuple rather than borrowing the ring group's.
+	 *
+	 * The two lists carry the same two words today, and that is exactly the coincidence a reviewer
+	 * would "tidy" into one shared constant. A shared line is not a ring group — it is a shared
+	 * resource whose state outlives the answer — so the sets are separate on the server and separate
+	 * here, and comparing this against its OWN server tuple is what keeps a future third strategy on
+	 * one of them from silently appearing on the other.
+	 */
+	it("shared line strategies match, in order", () => {
+		expect(SHARED_LINE_STRATEGIES).toEqual([...SERVER_SHARED_LINE_STRATEGIES]);
 	});
 
 	/** Six of them, and the order is the order the strategy select reads. */
@@ -461,6 +476,13 @@ const RESOURCE_TABLES: Readonly<Record<string, string>> = {
 	 */
 	"sip-acl-entries": "sip_acl_entry",
 	"paging-groups": "paging_group",
+	/**
+	 * A shared line IS a routing input — `shared_line` is in `ROUTING_TABLE_TO_ENTITY` (→ `sharedLines`)
+	 * because the line's number and each appearance's button index are compiled into the artifact, even
+	 * though the seizure the appearances arbitrate is live KV state. So a save here republishes and the
+	 * compile panel has to say so; the loop below holds the descriptor to that.
+	 */
+	"shared-lines": "shared_line",
 	webhooks: "webhook_subscription",
 	/**
 	 * A screening rule IS a routing input — the compiler builds `checkCallBlock`'s tables from it and
@@ -508,6 +530,13 @@ const CHILD_TABLES: Readonly<Record<string, string>> = {
 	 * staffing a queue does not. The loop below is what holds the descriptor to that.
 	 */
 	members: "paging_group_member",
+	/**
+	 * A shared line's appearances. Like `paging_group_member`, `shared_line_appearance` is in
+	 * `ROUTING_TABLE_TO_ENTITY` (→ `sharedLines`) rather than being live state, because which
+	 * extension holds which button is compiled into the per-extension appearance projection. `key`
+	 * matches `segment` because nothing else here is called `appearances`.
+	 */
+	appearances: "shared_line_appearance",
 	/**
 	 * A phrase's ordered steps. `key` matches `segment` because nothing else here is called `steps` —
 	 * the two exceptions above exist only because two collections were both spelled `rules`.

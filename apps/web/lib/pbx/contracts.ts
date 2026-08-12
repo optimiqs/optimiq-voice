@@ -233,6 +233,18 @@ export type IvrOptionMatchKind = (typeof IVR_OPTION_MATCH_KINDS)[number];
 export const RING_GROUP_STRATEGIES = ["simultaneous", "sequential"] as const;
 export type RingGroupStrategy = (typeof RING_GROUP_STRATEGIES)[number];
 
+/**
+ * How a shared line offers a call to its appearances. Mirrors `SHARED_LINE_STRATEGIES`.
+ *
+ * `simultaneous` lights and rings every appearance at once (the receptionist case); `sequential`
+ * walks them in ordinal order (the boss-then-assistant case). The same two words a ring group's
+ * strategy uses, and deliberately its OWN set: a shared line is not a ring group, and folding the
+ * two lists together is exactly the tidy-up the drift gate refuses — `contracts.spec.ts` compares
+ * each against its own server tuple.
+ */
+export const SHARED_LINE_STRATEGIES = ["simultaneous", "sequential"] as const;
+export type SharedLineStrategy = (typeof SHARED_LINE_STRATEGIES)[number];
+
 export const QUEUE_STRATEGIES = [
 	"longest-idle",
 	"ring-all",
@@ -951,6 +963,52 @@ export interface PagingGroupRow extends EntityRow {
 
 export interface PagingGroupMemberRow extends EntityRow {
 	readonly pagingGroupId: string;
+	readonly extensionId: string;
+	readonly ordinal: number;
+	readonly enabled: boolean;
+}
+
+/**
+ * A shared line (SLA / BLA) — one line that appears on several handsets and behaves as ONE seizable
+ * thing. No destination trio, and the absence is the design: a shared line never routes a call out.
+ * Its whole point is the state it keeps AFTER the answer — who holds it, whether it is on hold, when
+ * it recalls — which lives in a KV claim the engine arbitrates, not in a branch. `extensionNumber`
+ * is nullable for the reason a paging group's is: a line that is only a shared KEY across a boss and
+ * an assistant has no dialable number of its own.
+ */
+export interface SharedLineRow extends EntityRow {
+	readonly name: string;
+	readonly extensionNumber: string | null;
+	readonly strategy: SharedLineStrategy;
+	readonly ringTimeoutSeconds: number;
+	/**
+	 * How long a call held on the line may sit before it recalls every appearance. `0` disables
+	 * recall — the line holds indefinitely — which is a real value the column takes rather than
+	 * "unset", so the detail copy says "0 disables recall" rather than rendering a blank.
+	 */
+	readonly holdRecallTimeoutSeconds: number;
+	/**
+	 * Whether an idle appearance may join a call already up on the line (the boss/admin "barge").
+	 *
+	 * The flag is stored and COMPILED, but the live barge-in MEDIA join awaits the media plane — a
+	 * deferred seam named in the backend report — so the switch records intent rather than an effect
+	 * a call would observe today. The dialog says so instead of implying a behaviour that has not
+	 * landed.
+	 */
+	readonly bargeInEnabled: boolean;
+	readonly enabled: boolean;
+}
+
+/**
+ * One appearance — one extension's button on a shared line.
+ *
+ * `ordinal` is the APPEARANCE INDEX: the button position the phone lights and the number sipd stamps
+ * into the `Call-Info` header, not a loader's display order — which is why the collection has a
+ * reorder endpoint. `extensionId` is a plain foreign key rather than a destination, because only a
+ * registered endpoint can be given a button on the line; an external number cannot light a lamp.
+ */
+export interface SharedLineAppearanceRow extends EntityRow {
+	readonly sharedLineId: string;
 	readonly extensionId: string;
 	readonly ordinal: number;
 	readonly enabled: boolean;

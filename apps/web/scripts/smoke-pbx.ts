@@ -622,6 +622,10 @@ async function main(): Promise<void> {
 			// Paging groups, gated by `paging-groups.read` — which the owner used here holds. Only the
 			// list is asserted: a group's detail view needs an id, and the seed does not create one.
 			"/paging-groups",
+			// Shared line appearances, gated by `shared-lines.read` — which the owner used here holds.
+			// Only the list is asserted: a line's detail view needs an id, and the seed does not create
+			// one.
+			"/shared-lines",
 			"/queues",
 			"/queues?tab=agents",
 			"/conferences",

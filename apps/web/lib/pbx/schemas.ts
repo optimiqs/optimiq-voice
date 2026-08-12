@@ -33,6 +33,7 @@ import {
 	RING_GROUP_STRATEGIES,
 	ROUTE_MATCH_KINDS,
 	ROUTING_CONTEXTS,
+	SHARED_LINE_STRATEGIES,
 	SIP_ACL_ACTIONS,
 	SIP_ACL_SCOPES,
 	SIP_TRANSPORTS,
@@ -636,6 +637,74 @@ export const pagingGroupMemberFormSchema = z.strictObject({
 	enabled: z.boolean(),
 });
 export type PagingGroupMemberFormValues = z.input<typeof pagingGroupMemberFormSchema>;
+
+/**
+ * A shared line, mirroring `apps/api/src/pbx/shared-lines/shared-lines.dto.ts`.
+ *
+ * Structurally a paging group with a strategy and two timeouts, and NO destination trio for the same
+ * reason: a shared line never routes a call out. Its whole point is the state it keeps after the
+ * answer, which lives in a KV claim the engine arbitrates. A `z.strictObject` is what keeps a trio
+ * out — the server would answer a body carrying one with a 400 naming the field.
+ *
+ * `ringTimeoutSeconds` and `holdRecallTimeoutSeconds` are both `resettable` on the server
+ * (`notNull().default(30)` and `notNull().default(60)`), so an emptied box sends `null` meaning "put
+ * the server default back". The one that reads differently is the RECALL timeout: `0` is a REAL
+ * value the column takes — it disables recall and the line holds indefinitely — so it is kept rather
+ * than treated as blank, and only an empty control becomes `null`. That is why its floor is 0 and
+ * the ring timeout's is 5.
+ */
+export const sharedLineFormSchema = z.strictObject({
+	name: displayName,
+	/**
+	 * Blank is legal and means "no number": a line that is only a shared KEY across a boss and an
+	 * assistant is reached through its member buttons, not a dialable number, and forcing one would
+	 * make an operator invent digits that then collide with an extension. {@link optionalDigits} sends
+	 * the blank as `null`, which the nullable partial-unique column takes as "clear it".
+	 */
+	extensionNumber: optionalDigits(16),
+	strategy: z.enum(SHARED_LINE_STRATEGIES),
+	/** How long each appearance is rung before the offer moves on. Bounds match a ring group's. */
+	ringTimeoutSeconds: optionalInt(5, 600),
+	/**
+	 * How long a held call may sit before it recalls every appearance. `0` disables recall — the line
+	 * holds indefinitely — which the floor of 0 admits as a real value rather than a blank. Blank
+	 * itself restores the server default, the ordinary `resettable` reading.
+	 */
+	holdRecallTimeoutSeconds: optionalInt(0, 3600),
+	/**
+	 * Whether an idle appearance may join a call already up on the line (the boss/admin "barge"). The
+	 * flag is stored and compiled; the live barge-in media join is a deferred seam awaiting the media
+	 * plane, so this records intent. Off by default, because a line any appearance can silently join
+	 * is a privacy surprise rather than a default.
+	 */
+	bargeInEnabled: z.boolean(),
+	enabled: z.boolean(),
+});
+export type SharedLineFormValues = z.input<typeof sharedLineFormSchema>;
+
+/**
+ * One appearance in a shared line.
+ *
+ * `extensionId` is REQUIRED and a plain reference rather than a destination, which is the whole
+ * difference from a ring-group member and the same shape a paging member has: the engine originates
+ * a leg to a registered endpoint and the credential path tells that device which button to light, so
+ * only a real extension can be an appearance. Not {@link optionalReference}: blank is not "clear it"
+ * here, it is an appearance that lights nobody's button.
+ *
+ * `ordinal` is the APPEARANCE INDEX — the button position and the `Call-Info` appearance-index — not
+ * a display order, which is why the collection has a reorder endpoint and why `(line, ordinal)` is
+ * unique.
+ */
+export const sharedLineAppearanceFormSchema = z.strictObject({
+	extensionId: z
+		.string()
+		.trim()
+		.min(1, "Required")
+		.refine((value) => z.uuid().safeParse(value).success, "Pick one from the list"),
+	ordinal: optionalInt(0, 1000),
+	enabled: z.boolean(),
+});
+export type SharedLineAppearanceFormValues = z.input<typeof sharedLineAppearanceFormSchema>;
 
 /**
  * A caller-screening rule, mirroring `apps/api/src/pbx/call-block/call-block.dto.ts`.
