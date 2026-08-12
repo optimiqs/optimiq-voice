@@ -748,8 +748,12 @@ export const conferenceFormSchema = z.strictObject({
 	roomNumber: internalNumber,
 	maxMembers: optionalInt(2, 1000),
 	mohClassId: optionalReference(),
-	recordEnabled: z.boolean(),
+	/** The vocabulary extensions, trunks and queues use — it replaced a conference-only boolean. */
+	recordPolicy: z.enum(RECORD_POLICIES),
 	announceJoinLeave: z.boolean(),
+	/** Join/leave beeps, distinct from the recorded-name playback above. */
+	entryToneEnabled: z.boolean(),
+	exitToneEnabled: z.boolean(),
 	waitForModerator: z.boolean(),
 	enabled: z.boolean(),
 });

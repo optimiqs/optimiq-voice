@@ -2383,7 +2383,20 @@ class Compiler {
 				requiresPin: room.requiresPin,
 				maxMembers: room.maxMembers,
 				waitForModerator: room.waitForModerator,
-				recordEnabled: room.recordEnabled,
+				// `?? "none"` and not `?? undefined`, unlike everything else in this object: the walker
+				// branches on the policy, and a missing field would make "the tenant asked for no
+				// recording" and "this artifact predates the column" the same value at the one place
+				// the difference is a compliance question. Same treatment as `queue`'s.
+				recordPolicy: room.recordPolicy ?? "none",
+				// Emitted only when switched OFF. The default is TRUE at every layer — a beep is what
+				// tells a room a third party has arrived — so `compact()` dropping a `true` and the
+				// reader defaulting an absent field to `true` are the same statement made twice.
+				entryToneEnabled: room.entryToneEnabled === false ? false : undefined,
+				exitToneEnabled: room.exitToneEnabled === false ? false : undefined,
+				// Until this was compiled, `conference.announce_join_leave` was a column a tenant could
+				// set, an API could write and NOTHING could read: the loader carried it nowhere and the
+				// artifact had no field for it.
+				announceJoinLeave: room.announceJoinLeave === false ? false : undefined,
 				mohClassId: room.mohClassId ?? undefined,
 				mohClass: this.mohClassName(room.mohClassId, subject, "mohClassId"),
 				pinHash: this.conferencePinHash(room, room.pinHash, "pinHash", subject),

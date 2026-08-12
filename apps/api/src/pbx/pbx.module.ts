@@ -22,6 +22,9 @@ import { CarrierWebhookController } from "./carrier/carrier-webhook.controller";
 import { CarrierController, CarrierTrunkController } from "./carrier/carrier.controller";
 import { carrierProviders } from "./carrier/carrier.providers";
 import { CarrierService } from "./carrier/carrier.service";
+import { ConferenceControlClient } from "./conferences/conference-control.client";
+import { ConferenceModerationController } from "./conferences/conference-moderation.controller";
+import { ConferenceModerationService } from "./conferences/conference-moderation.service";
 import { ConferencePinService } from "./conferences/conference-pin.service";
 import { ConferencesController } from "./conferences/conferences.controller";
 import { ConferencesService } from "./conferences/conferences.service";
@@ -226,6 +229,7 @@ const logger = getLogger("api.pbx");
 		QueueAgentsController,
 		QueueAgentSessionController,
 		ConferencesController,
+		ConferenceModerationController,
 		ParkLotsController,
 		// The T2 admin block. `CallFlowsController` also owns the time-condition override, because
 		// that endpoint is guarded by `call-flows.toggle` — see the controller's own note.
@@ -629,6 +633,8 @@ const logger = getLogger("api.pbx");
 		QueueAgentSessionService,
 		ConferencesService,
 		ConferencePinService,
+		ConferenceControlClient,
+		ConferenceModerationService,
 		ParkLotsService,
 		CallFlowPresencePublisher,
 		CallFlowsService,

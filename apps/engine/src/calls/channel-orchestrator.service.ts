@@ -12,6 +12,7 @@ import {
 	CHANNEL_OWNER_INSTANCE_VARIABLE,
 	CHANNEL_OWNERSHIP_LEASE_MS,
 } from "../nats/channel-ownership";
+import { ConferenceControlService } from "../nats/conference-control.service";
 import { JetStreamService } from "../nats/jetstream.service";
 import { CALLS_EFFECT_RUNTIME, ENGINE_ENV, MEDIA_PORT } from "../nats/nats.tokens";
 import { OriginateService } from "../nats/originate.service";
@@ -59,8 +60,10 @@ import { MidCallFeatureRuntime } from "./mid-call-features";
 import { planOriginate } from "./originate-plan";
 import type { EngineEnv } from "../config/engine-env";
 import type { MediaChannelSnapshot, MediaEvent } from "../media/media-event";
-import type { MediaPort } from "../media/media-port";
+import type { MediaDirection, MediaPort } from "../media/media-port";
+import type { ConferenceControlOutcome } from "../nats/conference-control.service";
 import type { OriginatePlacement } from "../nats/originate.service";
+import type { ConferenceMember } from "../routing/conference-registry";
 import type { PlanDestination } from "../routing/plan-destination";
 import type {
 	OriginatedLeg,
@@ -82,7 +85,13 @@ import type {
 	RouteRequest,
 	SupervisionTarget,
 } from "./call-control";
-import type { CallDirection, CallEvent, LegSide, OriginateRequest } from "@optimiq-voice/events";
+import type {
+	CallDirection,
+	CallEvent,
+	ConferenceControlRequest,
+	LegSide,
+	OriginateRequest,
+} from "@optimiq-voice/events";
 import type {
 	ExecutionPlan,
 	ParkPlanNode,
@@ -264,6 +273,13 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		 */
 		@Optional() private readonly sessionAnnounce?: SessionAnnounceService,
 		@Optional() private readonly sessionVerbs?: SessionVerbService,
+		/**
+		 * In-conference moderation, arriving from `apps/api`. Optional and last, for the reason the two
+		 * above it are: the spec harnesses construct this class positionally and none of them moderates
+		 * a room. Absent is an engine whose conferences run and cannot be moderated over HTTP, which is
+		 * exactly what every engine did before this wave.
+		 */
+		@Optional() private readonly conferenceControl?: ConferenceControlService,
 	) {
 		this.control = new CallControl({
 			media: this.media,
@@ -374,6 +390,12 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 							error: "this instance is draining",
 						}
 					: await this.sessions.execute(request),
+		});
+		// In-conference moderation, from `apps/api`. Pushed here for the reason the park handler is:
+		// this class holds the registry AND the media port, and the responder is constructed by the
+		// NATS module long before it — a provider that reached back for both would be a Nest cycle.
+		this.conferenceControl?.attach({
+			moderate: async (request) => await this.moderateConference(request),
 		});
 	}
 
@@ -1151,6 +1173,298 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	 * lookup, because that variable is the one thing written on both legs at bridge time and it is
 	 * what survives into the KV snapshot a failover reads.
 	 */
+	/**
+	 * One moderation command on one live room. The engine half of `conferences.moderate`.
+	 *
+	 * ## The order is state-second, and that is the opposite of the join path
+	 *
+	 * The MEDIA command runs first and the room's record is written only if it succeeded. A record
+	 * that says muted while the mixer disagrees is the expensive direction to be wrong in: it is what
+	 * a moderation panel renders, and a moderator looking at a muted row does not press mute again.
+	 * The join path is the other way round — PIN, registry, bridge — because there the risk is a
+	 * caller appearing in a room they failed to enter.
+	 *
+	 * ## What each action costs on the media plane, and the one that costs nothing
+	 *
+	 * `mute`/`unmute` and `deaf`/`undeaf` are the SAME media command in two directions:
+	 * `MediaPort.mute(channelId, "in")` stops the room hearing them, `"out"` stops them hearing the
+	 * room. Both drivers serve it — ARI natively, `mediad` through `rpc.media.v1.mute-session`.
+	 *
+	 * `kick` removes the member from the bridge and does NOT hang the call up, which is the whole
+	 * distinction worth preserving: a kicked participant is out of the meeting and still on a call
+	 * the engine could route somewhere. What happens to them next is a routing decision, and this
+	 * release ends the leg with `NORMAL_CLEARING` rather than inventing a goodbye destination.
+	 *
+	 * `volume` is REFUSED on both drivers, and the refusal is typed rather than silent. Asterisk has
+	 * no per-participant gain on a mixing bridge at all; `apps/mediad`'s mixer has `Member.SetGain`,
+	 * atomic and applied on every frame, and no subject that reaches it. So the capability exists on
+	 * one plane and is unreachable, which is a WIRE gap and not a missing feature — the seam is named
+	 * on `MediadMediaPort`'s coverage map. Answering `ok` and doing nothing would give a moderator a
+	 * slider that moves and changes nothing anybody can hear.
+	 *
+	 * `lock`/`unlock` touch no media at all: they are a flag in the shared claim, read by every
+	 * instance's join path.
+	 */
+	private async moderateConference(
+		request: ConferenceControlRequest,
+	): Promise<ConferenceControlOutcome> {
+		const organizationId = request.orgId;
+		if (request.action === "lock" || request.action === "unlock") {
+			return await this.setConferenceLock(request, organizationId);
+		}
+
+		if (request.memberRef === undefined) {
+			return {
+				ok: false,
+				action: request.action,
+				memberCount: 0,
+				reason: "bad-request",
+				error: `${request.action} names a participant and no memberRef was given`,
+			};
+		}
+		const member = this.conferences.memberByLeg(
+			request.conferenceId,
+			request.memberRef,
+			organizationId,
+		);
+		if (member === undefined) {
+			// Two different refusals so the caller can tell "try the next contributor" from "this
+			// participant is gone from a room I can see". Both mean "try the next one" to an api that
+			// has more contributors left; only the second is worth logging when they are exhausted.
+			const room = this.conferences.room(request.conferenceId, organizationId);
+			return {
+				ok: false,
+				action: request.action,
+				memberCount: room?.memberCount ?? 0,
+				...(room === undefined ? {} : { locked: room.locked }),
+				reason: room === undefined ? "unknown-conference" : "unknown-member",
+				error:
+					room === undefined
+						? "no such conference on this instance"
+						: "the room is on this instance and that member is not",
+			};
+		}
+
+		if (request.action === "volume") {
+			// Typed, and named, rather than a silent no-op. See the method doc: the mixer's per-member
+			// gain exists on one media plane and has no subject to reach it, and the other has no
+			// per-participant gain at all.
+			return {
+				ok: false,
+				action: "volume",
+				memberRef: request.memberRef,
+				memberCount: this.conferences.room(request.conferenceId, organizationId)?.memberCount ?? 0,
+				muted: member.muted,
+				deafened: member.deafened,
+				moderator: member.moderator,
+				talkGainPercent: member.talkGainPercent,
+				listenGainPercent: member.listenGainPercent,
+				reason: "not-servable",
+				error:
+					"no media plane on this platform can re-level one conference participant: Asterisk " +
+					"has no per-participant gain on a mixing bridge, and mediad's mixer has one with no " +
+					"command that reaches it",
+			};
+		}
+
+		if (request.action === "kick") {
+			return await this.kickConferenceMember(request, member, organizationId);
+		}
+
+		// `mute`/`deaf` are one media command in two directions. `in` is audio arriving FROM the leg —
+		// the room stops hearing them; `out` is audio sent TO it — they stop hearing the room.
+		const direction: MediaDirection =
+			request.action === "mute" || request.action === "unmute" ? "in" : "out";
+		const lifting = request.action === "unmute" || request.action === "undeaf";
+		try {
+			await (lifting
+				? this.media.unmute(member.mediaChannelId, direction)
+				: this.media.mute(member.mediaChannelId, direction));
+		} catch (error) {
+			return {
+				ok: false,
+				action: request.action,
+				memberRef: request.memberRef,
+				memberCount: this.conferences.room(request.conferenceId, organizationId)?.memberCount ?? 0,
+				reason: "media-refused",
+				error: String(error),
+			};
+		}
+
+		const updated =
+			this.conferences.setMemberState(
+				request.conferenceId,
+				request.memberRef,
+				direction === "in" ? { muted: !lifting } : { deafened: !lifting },
+				organizationId,
+			) ?? member;
+		await this.publishConferenceMemberState(request, updated);
+		return this.memberOutcome(request, updated, organizationId);
+	}
+
+	/**
+	 * Removes a member from the room without hanging up their call — and then hangs it up.
+	 *
+	 * The two steps are separate on purpose even though this release always does both. Leaving the
+	 * bridge is the MEETING ending for them; ending the leg is a routing decision about a caller who
+	 * is now in no destination, and a release that had a "kicked participants go here" setting would
+	 * change only the second half. `NORMAL_CLEARING` rather than `CALL_REJECTED`: the call was
+	 * accepted and completed, and a CDR that said rejected would misreport every meeting somebody was
+	 * removed from.
+	 */
+	private async kickConferenceMember(
+		request: ConferenceControlRequest,
+		member: ConferenceMember,
+		organizationId: string,
+	): Promise<ConferenceControlOutcome> {
+		const room = this.conferences.room(request.conferenceId, organizationId);
+		try {
+			if (room !== undefined) {
+				await this.media.removeFromBridge(room.bridgeId, [member.mediaChannelId]);
+			}
+		} catch (error) {
+			return {
+				ok: false,
+				action: "kick",
+				memberRef: request.memberRef ?? member.legId,
+				memberCount: room?.memberCount ?? 0,
+				reason: "media-refused",
+				error: String(error),
+			};
+		}
+
+		const departure = await this.conferences.leave(
+			request.conferenceId,
+			member.mediaChannelId,
+			organizationId,
+		);
+		// The reason and the moderator who chose it, which is the whole point of the field: a report
+		// that could not tell a kick from a hangup would show a meeting four people left early and no
+		// evidence anybody removed them.
+		await this.events.publish("conference.left", {
+			orgId: organizationId,
+			callId: member.legId,
+			data: {
+				legId: member.legId,
+				conferenceId: request.conferenceId,
+				roomNumber: room?.conferenceId ?? request.conferenceId,
+				bridgeId: room?.bridgeId ?? request.conferenceId,
+				moderator: member.moderator,
+				memberCount: departure.memberCount,
+				reason: "kicked",
+				...(request.byUserId === undefined ? {} : { byUserId: request.byUserId }),
+			},
+		});
+		await this.hangupQuietly(member.mediaChannelId, "NORMAL_CLEARING");
+
+		return {
+			ok: true,
+			action: "kick",
+			memberRef: request.memberRef ?? member.legId,
+			memberCount: departure.memberCount,
+			...(room === undefined ? {} : { locked: room.locked }),
+		};
+	}
+
+	private async setConferenceLock(
+		request: ConferenceControlRequest,
+		organizationId: string,
+	): Promise<ConferenceControlOutcome> {
+		const locked = request.action === "lock";
+		const result = await this.conferences.setLocked(request.conferenceId, locked, {
+			organizationId,
+			...(request.byUserId === undefined ? {} : { byUserId: request.byUserId }),
+		});
+		if (result.kind === "unknown-conference") {
+			return {
+				ok: false,
+				action: request.action,
+				memberCount: 0,
+				reason: "unknown-conference",
+				error: "no such conference on this instance",
+			};
+		}
+		if (result.kind === "claims-unavailable") {
+			return {
+				ok: false,
+				action: request.action,
+				memberCount: 0,
+				reason: "internal",
+				error: result.reason,
+			};
+		}
+
+		const room = this.conferences.room(request.conferenceId, organizationId);
+		await this.events.publish(locked ? "conference.locked" : "conference.unlocked", {
+			orgId: organizationId,
+			// The ROOM's id as the call token, because a lock has no leg. See the event's own note on
+			// why carrying one would invite a consumer to attribute the lock to a participant.
+			callId: request.conferenceId,
+			data: {
+				conferenceId: request.conferenceId,
+				roomNumber: request.conferenceId,
+				memberCount: result.memberCount,
+				...(request.byUserId === undefined ? {} : { byUserId: request.byUserId }),
+			},
+		});
+
+		return {
+			ok: true,
+			action: request.action,
+			memberCount: result.memberCount,
+			locked: result.locked,
+			...(room === undefined ? {} : {}),
+		};
+	}
+
+	private memberOutcome(
+		request: ConferenceControlRequest,
+		member: ConferenceMember,
+		organizationId: string,
+	): ConferenceControlOutcome {
+		const room = this.conferences.room(request.conferenceId, organizationId);
+		return {
+			ok: true,
+			action: request.action,
+			memberRef: member.legId,
+			memberCount: room?.memberCount ?? 0,
+			...(room === undefined ? {} : { locked: room.locked }),
+			muted: member.muted,
+			deafened: member.deafened,
+			moderator: member.moderator,
+			talkGainPercent: member.talkGainPercent,
+			listenGainPercent: member.listenGainPercent,
+		};
+	}
+
+	/**
+	 * Announces a member's WHOLE state after a change.
+	 *
+	 * Whole and not a delta, for the reason the event says: a participant list is rebuilt from these,
+	 * and a consumer that applied a delta to a row drawn from a frame it missed would show a mute
+	 * button that disagrees with the mixer.
+	 */
+	private async publishConferenceMemberState(
+		request: ConferenceControlRequest,
+		member: ConferenceMember,
+	): Promise<void> {
+		await this.events.publish("conference.participant.updated", {
+			orgId: request.orgId,
+			callId: member.legId,
+			data: {
+				legId: member.legId,
+				conferenceId: request.conferenceId,
+				roomNumber: request.conferenceId,
+				muted: member.muted,
+				deafened: member.deafened,
+				moderator: member.moderator,
+				talkGainPercent: member.talkGainPercent,
+				listenGainPercent: member.listenGainPercent,
+				...(request.byUserId === undefined ? {} : { byUserId: request.byUserId }),
+			},
+		});
+	}
+
 	private controlledLegFor(mediaChannelId: string): ControlledLeg | undefined {
 		const aggregate = this.registry.byAriChannelId(mediaChannelId);
 		return aggregate === undefined ? undefined : this.controlledLeg(aggregate);

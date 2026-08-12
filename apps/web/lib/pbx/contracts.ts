@@ -1042,9 +1042,12 @@ export interface ConferenceRow extends EntityRow {
 	readonly name: string;
 	readonly roomNumber: string;
 	readonly maxMembers: number;
-	readonly recordEnabled: boolean;
+	readonly recordPolicy: RecordPolicy;
 	readonly mohClassId: string | null;
 	readonly announceJoinLeave: boolean;
+	/** Join/leave beeps — distinct from `announceJoinLeave`, which plays recorded names. */
+	readonly entryToneEnabled: boolean;
+	readonly exitToneEnabled: boolean;
 	readonly waitForModerator: boolean;
 	readonly enabled: boolean;
 }

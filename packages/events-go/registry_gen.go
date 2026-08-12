@@ -34,6 +34,9 @@ var EventTypes = []EventTypeInfo{
 	{Family: FamilyCall, Type: EventTypeChannelDestroyed, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.channel.destroyed"},
 	{Family: FamilyCall, Type: EventTypeConferenceJoined, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.conference.joined"},
 	{Family: FamilyCall, Type: EventTypeConferenceLeft, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.conference.left"},
+	{Family: FamilyCall, Type: EventTypeConferenceParticipantUpdated, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.conference.participant.updated"},
+	{Family: FamilyCall, Type: EventTypeConferenceLocked, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.conference.locked"},
+	{Family: FamilyCall, Type: EventTypeConferenceUnlocked, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.conference.unlocked"},
 	{Family: FamilyCall, Type: EventTypeCallParked, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.call.parked"},
 	{Family: FamilyCall, Type: EventTypeCallUnparked, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.call.unparked"},
 	{Family: FamilyCall, Type: EventTypeCallTransferred, SubjectTemplate: "calls.evt.v1.<orgId>.<callId>.call.transferred"},
@@ -102,6 +105,12 @@ func NewDataFor(eventType string) any {
 		return new(ConferenceJoinedData)
 	case EventTypeConferenceLeft:
 		return new(ConferenceLeftData)
+	case EventTypeConferenceParticipantUpdated:
+		return new(ConferenceParticipantUpdatedData)
+	case EventTypeConferenceLocked:
+		return new(ConferenceLockedData)
+	case EventTypeConferenceUnlocked:
+		return new(ConferenceUnlockedData)
 	case EventTypeCallParked:
 		return new(CallParkedData)
 	case EventTypeCallUnparked:

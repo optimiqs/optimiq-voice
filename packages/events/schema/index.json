@@ -122,6 +122,27 @@
 		},
 		{
 			"family": "call",
+			"type": "conference.participant.updated",
+			"subject": "calls.evt.v1.<orgId>.<callId>.conference.participant.updated",
+			"dataSchema": "events/call.conference.participant.updated.schema.json",
+			"goType": "ConferenceParticipantUpdatedData"
+		},
+		{
+			"family": "call",
+			"type": "conference.locked",
+			"subject": "calls.evt.v1.<orgId>.<callId>.conference.locked",
+			"dataSchema": "events/call.conference.locked.schema.json",
+			"goType": "ConferenceLockedData"
+		},
+		{
+			"family": "call",
+			"type": "conference.unlocked",
+			"subject": "calls.evt.v1.<orgId>.<callId>.conference.unlocked",
+			"dataSchema": "events/call.conference.unlocked.schema.json",
+			"goType": "ConferenceUnlockedData"
+		},
+		{
+			"family": "call",
 			"type": "call.parked",
 			"subject": "calls.evt.v1.<orgId>.<callId>.call.parked",
 			"dataSchema": "events/call.call.parked.schema.json",
@@ -478,6 +499,22 @@
 			"goResponseType": "MediaUntapSessionResponse"
 		},
 		{
+			"subject": "rpc.media.v1.mute-session",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.media.v1.mute-session.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.mute-session.response.schema.json",
+			"goRequestType": "MediaMuteSessionRequest",
+			"goResponseType": "MediaMuteSessionResponse"
+		},
+		{
+			"subject": "rpc.media.v1.hold-session",
+			"timeoutMs": 1000,
+			"requestSchema": "rpc/rpc.media.v1.hold-session.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.hold-session.response.schema.json",
+			"goRequestType": "MediaHoldSessionRequest",
+			"goResponseType": "MediaHoldSessionResponse"
+		},
+		{
 			"subject": "rpc.engine.v1.originate",
 			"timeoutMs": 5000,
 			"requestSchema": "rpc/rpc.engine.v1.originate.request.schema.json",
@@ -500,6 +537,14 @@
 			"responseSchema": "rpc/rpc.engine.v1.session-verb.response.schema.json",
 			"goRequestType": "SessionVerbRequest",
 			"goResponseType": "SessionVerbResponse"
+		},
+		{
+			"subject": "rpc.engine.v1.conference-control",
+			"timeoutMs": 2000,
+			"requestSchema": "rpc/rpc.engine.v1.conference-control.request.schema.json",
+			"responseSchema": "rpc/rpc.engine.v1.conference-control.response.schema.json",
+			"goRequestType": "ConferenceControlRequest",
+			"goResponseType": "ConferenceControlResponse"
 		},
 		{
 			"subject": "rpc.session.v1.announce",

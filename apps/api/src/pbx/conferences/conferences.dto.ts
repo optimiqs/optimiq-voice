@@ -1,4 +1,5 @@
 import { z } from "zod/v4";
+import { RECORD_POLICIES } from "@optimiq-voice/pbx-db";
 import { displayName, internalNumber, patchOf, resettable } from "../shared/dto";
 import { voicemailPinIssue } from "../voicemail-boxes/voicemail-boxes.dto";
 
@@ -15,9 +16,32 @@ export const createConferenceDto = z.strictObject({
 	/** The number dialed to enter the room. Unique per organization. */
 	roomNumber: internalNumber,
 	maxMembers: resettable(z.int().min(2).max(1000)),
-	recordEnabled: z.boolean().optional(),
+	/**
+	 * How much of the room is captured — the same vocabulary `extension`, `trunk` and `queue` carry,
+	 * which replaced a `recordEnabled` boolean the engine read by nothing.
+	 *
+	 * `inbound` and `outbound` are accepted and behave as `all` here: every leg in a conference is
+	 * inbound TO the room, so there is no outbound half to leave out. They are not refused because
+	 * the vocabulary is SHARED, and a DTO that allowed three of five values would be a second,
+	 * narrower vocabulary wearing the same name.
+	 */
+	recordPolicy: z.enum(RECORD_POLICIES).optional(),
 	mohClassId: z.uuid().nullish(),
+	/**
+	 * Play each arrival's and departure's name to the room.
+	 *
+	 * Distinct from the two tone flags below, which is a distinction a tenant can feel: a name
+	 * announcement costs everybody in the meeting three seconds of somebody's voice, and a beep costs
+	 * a quarter of a second. A large room usually wants the second and not the first.
+	 */
 	announceJoinLeave: z.boolean().optional(),
+	/**
+	 * Beep the room on a join and on a leave. Both default ON in the database, and the default is a
+	 * privacy position rather than a taste: a participant who cannot tell a third party has arrived
+	 * does not know the conversation stopped being private.
+	 */
+	entryToneEnabled: z.boolean().optional(),
+	exitToneEnabled: z.boolean().optional(),
 	/** Hold participants in music-on-hold until a moderator PIN is entered. */
 	waitForModerator: z.boolean().optional(),
 	enabled: z.boolean().optional(),

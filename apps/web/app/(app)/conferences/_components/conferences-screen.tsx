@@ -120,9 +120,11 @@ export function ConferencesScreen() {
 						cell: (row) => (
 							<div className="flex flex-wrap gap-1">
 								{row.waitForModerator ? <Badge tone="warning">Waits for moderator</Badge> : null}
-								{row.recordEnabled ? <Badge tone="accent">Recorded</Badge> : null}
+								{row.recordPolicy !== "none" ? <Badge tone="accent">Recorded</Badge> : null}
 								{row.announceJoinLeave ? <Badge tone="neutral">Announces</Badge> : null}
-								{!row.waitForModerator && !row.recordEnabled && !row.announceJoinLeave ? "—" : null}
+								{!row.waitForModerator && row.recordPolicy === "none" && !row.announceJoinLeave
+									? "—"
+									: null}
 							</div>
 						),
 					},

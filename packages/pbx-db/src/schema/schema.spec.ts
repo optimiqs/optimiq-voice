@@ -1011,3 +1011,42 @@ describe("tier announcements", () => {
 		expect(foreignKey?.onDelete).toBe("set null");
 	});
 });
+
+/**
+ * The conference-depth block on `conference`.
+ *
+ * Three columns, and the two BEEP flags are the ones worth pinning here rather than only in a DTO:
+ * a room whose entry tone silently defaulted off is a room where a third party can join a
+ * conversation and nobody in it is told. That is a privacy property, and a privacy property that
+ * lives only in a form is one an insert bypasses.
+ */
+describe("conference depth", () => {
+	const config = getTableConfig(pbxTables.conference);
+	const columns = new Map(config.columns.map((column) => [column.name, column]));
+
+	it("replaced the boolean nobody honoured with the record policy everything else uses", () => {
+		// The same swap `queue` made, one wave earlier, and for the same reason: `record_enabled` was
+		// read by nothing, and a tenant who can say `on-demand` for an extension and only yes/no for
+		// a room is looking at an inconsistency rather than a decision.
+		expect(columns.get("record_policy")?.notNull).toBe(true);
+		expect(columns.get("record_policy")?.default).toBe("none");
+		expect(columns.has("record_enabled")).toBe(false);
+	});
+
+	it("defaults both tones ON, because a silent arrival is an untold third party", () => {
+		for (const name of ["entry_tone_enabled", "exit_tone_enabled"]) {
+			expect(columns.get(name)?.notNull, name).toBe(true);
+			expect(columns.get(name)?.default, name).toBe(true);
+		}
+	});
+
+	/**
+	 * A beep and a name announcement are different costs and different features. A large room usually
+	 * wants the tone and not three seconds of somebody's recorded voice per arrival, which is not a
+	 * preference one flag could express.
+	 */
+	it("keeps the tones separate from the name announcement", () => {
+		expect(columns.get("announce_join_leave")?.notNull).toBe(true);
+		expect(columns.get("announce_join_leave")?.default).toBe(true);
+	});
+});

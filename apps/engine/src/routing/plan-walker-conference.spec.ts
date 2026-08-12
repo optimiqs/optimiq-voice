@@ -10,7 +10,7 @@ import { CallSignalBus, legSignalKey } from "./call-signals";
 import { ConferenceRegistry } from "./conference-registry";
 import { conferenceNode, planOf } from "./plan-fixtures.fake";
 import { PlanWalker } from "./plan-walker";
-import type { WalkerChannel } from "./plan-walker";
+import type { PlanWalkerDependencies, WalkerChannel } from "./plan-walker";
 import type { CallEvent } from "@optimiq-voice/events";
 import type { ConferencePlanNode } from "@optimiq-voice/routing";
 import type { ChannelState, DtmfCollection, Verb, VerbResult } from "@optimiq-voice/telephony";
@@ -75,6 +75,8 @@ interface CallerOptions {
 	readonly registry: ConferenceRegistry;
 	readonly signals: CallSignalBus;
 	readonly idPrefix: string;
+	/** Counts what the room's record policy asked for, and whether the media plane could serve it. */
+	readonly recording?: { starts: number; canRecord: boolean };
 }
 
 /** One caller: a walker, its channel, and everything the fakes recorded for it. */
@@ -139,12 +141,28 @@ function caller(options: CallerOptions) {
 		}
 	};
 
+	const recording = options.recording;
 	let counter = 0;
 	const walker = new PlanWalker({
 		media,
 		signals: options.signals,
 		channel,
 		execute,
+		// The same seam a queue's record policy reaches, so a conference recording is
+		// indistinguishable downstream from a queue one or an on-demand one.
+		...(recording === undefined
+			? {}
+			: {
+					control: {
+						startRecording: async () => {
+							recording.starts += 1;
+							await Promise.resolve();
+							return recording.canRecord
+								? { ok: true }
+								: { ok: false, reason: "this media plane cannot record a mix" };
+						},
+					} as PlanWalkerDependencies["control"],
+				}),
 		publish: async (type, data) => {
 			published.push({ type, data });
 		},
@@ -184,13 +202,18 @@ function room(node: ConferencePlanNode) {
 }
 
 /** A registry, a bus, and a factory for callers into the same room. */
-function conference() {
+function conference(options: { readonly canRecord?: boolean } = {}) {
 	const registry = new ConferenceRegistry();
 	const signals = new CallSignalBus();
+	const recording = { starts: 0, canRecord: options.canRecord ?? true };
 	let seq = 0;
 	return {
 		registry,
 		signals,
+		/** How many times the room's record policy reached the call-control port. */
+		get recordingStarts(): number {
+			return recording.starts;
+		},
 		caller: (gathers?: readonly string[]) => {
 			seq += 1;
 			return caller({
@@ -198,6 +221,7 @@ function conference() {
 				legId: `0195c0f0-1c2f-7000-8000-00000000000${String(seq)}`,
 				registry,
 				signals,
+				recording,
 				idPrefix: `c${String(seq)}`,
 				...(gathers === undefined ? {} : { gathers }),
 			});
@@ -265,11 +289,40 @@ describe("a conference with no PIN", () => {
 		expect(c.registry.room("conf-conf")?.members).toHaveLength(1);
 	});
 
-	it("says out loud that a room configured to record is not being recorded", async () => {
+	/**
+	 * A ROOM is recorded once, by whoever opened it — not once per participant, which would produce N
+	 * files of one meeting, N retention clocks and N copies of everybody's voice.
+	 */
+	it("records the room when its policy says so, and only for the member who opened it", async () => {
 		const c = conference();
-		const a = c.caller();
-		const outcome = await a.walker.walk(room(conferenceNode("conf", { recordEnabled: true })));
-		expect(outcome.notes.join(" ")).toContain("does not implement");
+		const node = conferenceNode("conf", { recordPolicy: "all" });
+
+		await c.caller().walker.walk(room(node));
+		await c.caller().walker.walk(room(node));
+
+		expect(c.recordingStarts).toBe(1);
+	});
+
+	/**
+	 * `on-demand` means "somebody presses the record key", which is a mid-call feature that already
+	 * works. Starting one here would record every meeting for a tenant who asked for the opposite.
+	 */
+	it("does not record an on-demand room", async () => {
+		const c = conference();
+		await c.caller().walker.walk(room(conferenceNode("conf", { recordPolicy: "on-demand" })));
+		expect(c.recordingStarts).toBe(0);
+	});
+
+	/**
+	 * A tenant who ticked "record this room" and finds no recording has a compliance problem, and a
+	 * note in the call log is the difference between finding out now and finding out at the hearing.
+	 */
+	it("says out loud when a recorded room could not be recorded", async () => {
+		const c = conference({ canRecord: false });
+		const outcome = await c
+			.caller()
+			.walker.walk(room(conferenceNode("conf", { recordPolicy: "all" })));
+		expect(outcome.notes.join(" ")).toContain("record policy");
 	});
 
 	it("announces and hangs up when the walk was given no registry", async () => {
@@ -501,5 +554,122 @@ describe("leaving a conference", () => {
 		expect(a.published.find((event) => event.type === "conference.left")?.data.memberCount).toBe(1);
 		expect(a.media.methods()).not.toContain("destroyBridge");
 		expect(c.registry.room("conf-conf")?.members).toHaveLength(1);
+	});
+});
+
+// =================================================================================================
+// Locking, and the beeps
+// =================================================================================================
+
+describe("a locked room", () => {
+	/**
+	 * A caller told the room is FULL redials in a minute; a caller told it is LOCKED does not. That
+	 * is the whole reason the registry answers two different results, and the walker has to say two
+	 * different things or the distinction never reaches anybody.
+	 */
+	it("announces and refuses with a different prompt from a full one", async () => {
+		const c = conference();
+		const node = conferenceNode("conf");
+		await c.caller().walker.walk(room(node));
+		await c.registry.setLocked("conf-conf", true);
+
+		const b = c.caller();
+		const outcome = await b.walker.walk(room(node));
+
+		expect(outcome.status).toBe("hangup");
+		// Through the VERB executor, which is how every announcement on a refusal path is played:
+		// the caller is not in a bridge, so there is nothing to play into.
+		const announced = b.verbs
+			.filter((verb) => verb.verb === "play")
+			.map((verb) => (verb as { media: string }).media)
+			.join(" ");
+		expect(announced).toContain("conf-locked");
+		expect(announced).not.toContain("conf-full");
+	});
+
+	it("never touches the bridge for a caller it refused", async () => {
+		const c = conference();
+		const node = conferenceNode("conf");
+		await c.caller().walker.walk(room(node));
+		await c.registry.setLocked("conf-conf", true);
+
+		const b = c.caller();
+		await b.walker.walk(room(node));
+
+		expect(b.media.methods()).not.toContain("addToBridge");
+		expect(c.registry.room("conf-conf")?.members).toHaveLength(1);
+	});
+});
+
+describe("entry and exit tones", () => {
+	/** Played into the BRIDGE, not at the caller: the room is the audience. */
+	function tonesPlayedInto(caller: ReturnType<ReturnType<typeof conference>["caller"]>): string[] {
+		return caller.media.calls
+			.filter((call) => call.method === "play")
+			.flatMap((call) => (call.args[1] as { media: readonly string[] }).media);
+	}
+
+	it("beeps the room on arrival, into the bridge", async () => {
+		const c = conference();
+		const a = c.caller();
+		await a.walker.walk(room(conferenceNode("conf")));
+
+		const played = a.media.calls.filter((call) => call.method === "play");
+		expect(played).toHaveLength(1);
+		expect(played[0]?.args[0]).toBe(a.state.bridgeId as string);
+		expect(tonesPlayedInto(a)).toContain("tone:beep");
+	});
+
+	/**
+	 * `tone:` and not `sound:`, which is what makes the default possible at all: a tone is GENERATED,
+	 * so a deployment with no prompt pack mounted still beeps.
+	 */
+	it("uses a generated tone rather than a file, so a stock install beeps", async () => {
+		const c = conference();
+		const a = c.caller();
+		await a.walker.walk(room(conferenceNode("conf")));
+		expect(tonesPlayedInto(a).some((media) => media.startsWith("tone:"))).toBe(true);
+	});
+
+	it("plays the name announcement beside the tone when the room asks for one", async () => {
+		const c = conference();
+		const a = c.caller();
+		await a.walker.walk(room(conferenceNode("conf", { announceJoinLeave: true })));
+		// Both, in one playback: the beep first, then the clause.
+		expect(tonesPlayedInto(a)).toEqual(["tone:beep", "sound:conf-hasjoin"]);
+	});
+
+	/**
+	 * The flags default ON at every layer and the compiler emits them only when a tenant switched
+	 * them OFF, so an artifact from before the columns existed must still beep.
+	 */
+	it("stays silent only when both are switched off", async () => {
+		const c = conference();
+		const a = c.caller();
+		await a.walker.walk(
+			room(
+				conferenceNode("conf", {
+					entryToneEnabled: false,
+					announceJoinLeave: false,
+				}),
+			),
+		);
+		expect(a.media.methods()).not.toContain("play");
+	});
+
+	/**
+	 * A beep into an empty bridge is a playback nobody hears and a media command racing the teardown.
+	 */
+	it("does not beep a room it is about to destroy", async () => {
+		const c = conference();
+		const a = c.caller();
+		await a.walker.walk(room(conferenceNode("conf")));
+		const before = a.media.calls.filter((call) => call.method === "play").length;
+
+		a.hangUp();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		expect(a.media.calls.filter((call) => call.method === "play")).toHaveLength(before);
+		expect(a.media.methods()).toContain("destroyBridge");
 	});
 });

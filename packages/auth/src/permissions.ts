@@ -133,6 +133,21 @@ export const PERMISSIONS = [
 	"conferences.read",
 	"conferences.write",
 	"conferences.delete",
+	/**
+	 * Mid-call control of a LIVE room: mute, deafen, kick, re-level, lock.
+	 *
+	 * Retired once and back with its endpoints, which is the bar the header at the top of this file
+	 * sets and the bar `RETIRED_PERMISSIONS` restates. The reason it was retired — "mid-call control
+	 * is not exposed over HTTP at all on this platform" — stopped being true when
+	 * `POST /conferences/:id/participants/:ref/mute` landed, and it returns in the same change.
+	 *
+	 * Deliberately NOT a guard on the CRUD routes, which is what `conferences.controller.ts` has said
+	 * in its header since it was written: muting a participant and re-pointing a room's recording
+	 * policy are different powers, and a supervisor who may do the first must not thereby be able to
+	 * do the second. It is also not what the PIN endpoints ride on, for the sharper version of the
+	 * same argument — a stored credential decides who may ENTER the room.
+	 */
+	"conferences.moderate",
 
 	"park-lots.read",
 	"park-lots.write",
@@ -515,10 +530,16 @@ export type Permission = (typeof PERMISSIONS)[number];
  * trigger. (Trunk health does now arrive, but it arrives from Asterisk's qualify pinger on its own
  * schedule, which is a fact that is reported rather than an action anybody performs.)
  *
- * **The surface is deliberately not HTTP.** `conferences.moderate` — mute, kick, lock — governs a
- * LIVE room, and `apps/api/src/pbx/conferences/conferences.controller.ts` says in its header that
- * this is why the grant is unused there. Mid-call control is not exposed over HTTP at all on this
- * platform; when it is, the grant comes back with it.
+ * **The surface is deliberately not HTTP.** This reason had exactly one entry —
+ * `conferences.moderate` — and it is the one entry that has since come BACK, which is the record
+ * this list exists to keep. It described mid-call control of a live room, was retired because no
+ * such surface existed, and returned in the change that built one
+ * (`conference-moderation.controller.ts`) with a `@RequirePermissions` on every route. That is the
+ * bar the header states, met: the endpoint lands in the same commit as the permission.
+ *
+ * It is left described here rather than deleted because the ARGUMENT is what has value — a
+ * permission with no endpoint is a promise the UI can render and the server cannot keep — and a
+ * reason with no current members is evidence the rule works rather than a section to tidy away.
  *
  * **The thing it guards is code, not data.** `provisioning.templates` promised template CRUD.
  * Templates are compiled-in TypeScript modules (`apps/api/src/provisioning/catalog/templates/`),
@@ -530,7 +551,6 @@ export const RETIRED_PERMISSIONS = [
 	"applications.write",
 	"applications.delete",
 	"applications.deploy",
-	"conferences.moderate",
 	"devices.reboot",
 	"provisioning.templates",
 	"secrets.read",
@@ -967,6 +987,12 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 				permission: "conferences.delete",
 				label: "Delete conferences",
 				description: "Remove a conference room.",
+			},
+			{
+				permission: "conferences.moderate",
+				label: "Moderate live conferences",
+				description:
+					"Mute, deafen, remove or re-level a participant in a running meeting, and lock the room.",
 			},
 		],
 	},
@@ -1514,6 +1540,16 @@ const MANAGER_PERMISSIONS = [
 	"voicemail.write",
 	"voicemail.listen",
 	"conferences.write",
+	/**
+	 * A manager runs the meeting, which is why moderation sits beside `conferences.write` rather than
+	 * with the admin block.
+	 *
+	 * It is a strictly SMALLER power than the write grant next to it — muting somebody for a minute
+	 * against changing who may enter the room forever — so a role that may configure a room and not
+	 * moderate one would be an odd shape. The AGENT role gets neither, for the reason it gets
+	 * `conferences.read` and nothing else: an agent joins meetings and does not run them.
+	 */
+	"conferences.moderate",
 	"park-lots.write",
 	"recordings.read",
 	"recordings.download",

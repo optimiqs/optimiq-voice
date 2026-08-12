@@ -2,6 +2,7 @@ package rtp_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
@@ -328,5 +329,94 @@ func TestParseSide(t *testing.T) {
 				t.Errorf("ParseSide(%q) = %q, want %q", testCase.raw, got, testCase.want)
 			}
 		})
+	}
+}
+
+func TestTargetSideDecidesWhichLetterIsWhichParty(t *testing.T) {
+	// Until `rpc.media.v1.tap-session` grew `targetSide`, this file fixed the only convention it
+	// could defend from the ids in a request — `a` is the target — and the ENGINE had to pass, as
+	// `targetSessionId`, the leg it would have called side `a`. That obligation has moved onto the
+	// wire, and this is the test that proves it: the SAME target session, the SAME `speakTo: "a"`,
+	// and two different parties coached depending on which side the caller declared the target to be.
+	//
+	// `rig.agent` is member 0 and `rig.customer` is member 1; the supervisor is member 2.
+	cases := []struct {
+		name       string
+		targetSide rtp.Side
+		// Which members hear the supervisor's 4000, on top of what they already heard.
+		coached int
+	}{
+		// Declared A, so `speakTo: "a"` is the target — the agent.
+		{"the target is side a", rtp.SideA, 0},
+		// Declared B, so `speakTo: "a"` is the OTHER party — the customer.
+		{"the target is side b", rtp.SideB, 1},
+		// Not declared at all, which is what a caller compiled before the field sends. Read as A.
+		{"the target side is absent", "", 0},
+	}
+
+	for index, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			base := 60300 + index*60
+			rig := newTapRig(t, base, base+49)
+
+			if _, err := rig.manager.Tap(rtp.TapOptions{
+				TapID:           "tap-1",
+				TapSessionID:    rig.supervisor,
+				TargetSessionID: rig.agent,
+				TargetSide:      testCase.targetSide,
+				Hear:            rtp.SideBoth,
+				SpeakTo:         rtp.SideA,
+				Mode:            "whisper",
+			}); err != nil {
+				t.Fatalf("Tap: %v", err)
+			}
+
+			levels := []int16{1000, 2000, 4000}
+			exact := make([]int16, 3)
+			for member, level := range levels {
+				exact[member] = rig.speak(t, member, level, 4)
+			}
+			rig.tick(t)
+
+			// Party 0 always hears party 1 and vice versa; the supervisor is added to exactly one.
+			for member, others := range [][]int{{1}, {0}} {
+				want := int16(0)
+				for _, contributor := range others {
+					want += exact[contributor]
+				}
+				if member == testCase.coached {
+					want += exact[2]
+				}
+				got, ok := rig.heard(t, member)
+				if !ok {
+					t.Fatalf("party %d heard nothing", member)
+				}
+				if !closeEnough(got, want) {
+					t.Errorf("party %d heard %d, want %d", member, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestATargetSideThatIsNotALetterIsRefused(t *testing.T) {
+	// `both` and `none` are answers to "which parties", not to "which one is this leg". A caller
+	// sending one has confused the two fields, and guessing which they meant is how a whisper ends up
+	// coaching the customer.
+	rig := newTapRig(t, 60200, 60249)
+
+	_, err := rig.manager.Tap(rtp.TapOptions{
+		TapID:           "tap-1",
+		TapSessionID:    rig.supervisor,
+		TargetSessionID: rig.agent,
+		TargetSide:      rtp.SideBoth,
+		Hear:            rtp.SideBoth,
+		SpeakTo:         rtp.SideNone,
+	})
+	if err == nil {
+		t.Fatal("a targetSide of \"both\" was accepted")
+	}
+	if !strings.Contains(err.Error(), "targetSide") {
+		t.Errorf("the refusal does not name the field: %v", err)
 	}
 }

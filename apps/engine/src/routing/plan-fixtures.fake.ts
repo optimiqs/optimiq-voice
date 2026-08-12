@@ -163,7 +163,7 @@ export function conferenceNode(
 		// about the PIN gate does not have to remember to raise a cap it never mentioned.
 		maxMembers: 0,
 		waitForModerator: false,
-		recordEnabled: false,
+		recordPolicy: "none",
 		...overrides,
 	};
 }

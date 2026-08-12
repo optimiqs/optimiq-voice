@@ -1293,7 +1293,7 @@ async function main(): Promise<void> {
 			name: `Smoke room ${RUN_ID}`,
 			roomNumber: `9${RUN_DIGITS}`,
 			maxMembers: 25,
-			recordEnabled: false,
+			recordPolicy: "none",
 			announceJoinLeave: true,
 			waitForModerator: false,
 			enabled: true,

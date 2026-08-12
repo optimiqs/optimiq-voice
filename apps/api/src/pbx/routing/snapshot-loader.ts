@@ -434,7 +434,14 @@ export async function loadOrgRoutingSnapshot(
 			maxMembers: row.maxMembers,
 			mohClassId: row.mohClassId,
 			waitForModerator: row.waitForModerator,
-			recordEnabled: row.recordEnabled,
+			recordPolicy: row.recordPolicy,
+			// The three flags that decide what a room SOUNDS like when somebody arrives. Until they
+			// were loaded, `announce_join_leave` was a column a tenant could set, an API could write
+			// and nothing could read — the snapshotHash was identical with it on or off, so the
+			// artifact never changed and the engine never learned.
+			entryToneEnabled: row.entryToneEnabled,
+			exitToneEnabled: row.exitToneEnabled,
+			announceJoinLeave: row.announceJoinLeave,
 			// Both digests, for the same reason `voicemail_box.pin_hash` is loaded: the gate is
 			// applied on the call path by a process with no database handle. `packages/routing`
 			// parses them and refuses to embed one it cannot read — and, unlike a mailbox, a room

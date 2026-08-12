@@ -52,6 +52,12 @@ type TapOptions struct {
 	TapSessionID string
 	// TargetSessionID names any leg in the conversation being joined.
 	TargetSessionID string
+	// TargetSide is which side of the conversation TargetSessionID IS — SideA or SideB.
+	//
+	// EMPTY means "not declared", and that is a supported state rather than a defect: it is what a
+	// caller compiled before `rpc.media.v1.tap-session` grew the field sends, and it is read as
+	// SideA — the target-first convention this file used to enforce by join order. See resolveAudiences.
+	TargetSide Side
 	// Hear is which parties reach the supervisor; SpeakTo is which parties the supervisor reaches.
 	Hear    Side
 	SpeakTo Side
@@ -268,18 +274,26 @@ type tapRecord struct {
 
 // Tap joins a supervisor to a conversation on asymmetric terms. Rung 6.
 //
-// # How `a` and `b` are resolved, and what the contract still owes this
+// # How `a` and `b` are resolved, and the obligation that has now moved
 //
-// `MediaPort.TapRequest` carries a `targetSide` saying which side of the call the target leg IS,
-// because on ARI a tap is a direction on one channel and "speak to the agent" is only implementable
-// once you know whether this channel is the agent. `rpc.media.v1.tap-session` does NOT carry it.
+// `MediaPort.TapRequest` has always carried a `targetSide` saying which side of the call the target
+// leg IS, because on ARI a tap is a direction on one channel and "speak to the agent" is only
+// implementable once you know whether this channel is the agent. `rpc.media.v1.tap-session` did not
+// carry it, so this implementation fixed the only convention it could defend from the ids in the
+// request — `a` is the TARGET and `b` is the other party — and enforced it by joining the two legs
+// TARGET-FIRST when it converted a relay into a mix. That worked and it put the obligation in the
+// wrong place: the engine had to pass, as `targetSessionId`, the leg it would have called side `a`,
+// which is a rule living in prose on both sides of a language border.
 //
-// So this implementation fixes the convention it can defend: **`a` is the TARGET session and `b` is
-// the other party in its conversation.** That is unambiguous, it is checkable from the ids in the
-// request, and it makes the three features work — but it means the ENGINE must pass, as
-// `targetSessionId`, the leg it would have called side `a`. A `targetSide` field on the wire would
-// remove the obligation, and it is named in this wave's report as the contract addition the next one
-// should make.
+// The field is on the wire now. {@link TapOptions.TargetSide} says which side the target is, the
+// letters are resolved through it, and an engine that knows its supervisor is monitoring the B-leg
+// of an inbound call says so instead of reordering its arguments. An EMPTY TargetSide is read as
+// SideA, which is exactly the old convention — so a caller that has not been taught to send it
+// behaves as it always did.
+//
+// Join order is consequently cosmetic. It is still deterministic (see conversationFor) because a
+// deterministic member order makes a log line and a test readable, and no longer because anything
+// depends on it.
 //
 // On a room with more than two members the letters have no meaning at all, and `a`/`b` are refused
 // by name rather than resolved to whoever happens to be second in the join order.
@@ -403,8 +417,9 @@ func (m *Manager) conversationFor(targetSessionID string) (string, bool, []strin
 		return "", false, nil, fmt.Errorf("%w: %s", ErrNotInConversation, targetSessionID)
 	}
 
-	// The conversion. Both legs join the room in TARGET-FIRST order, which is what makes `a` the
-	// target and `b` the other party without a side field on the wire.
+	// The conversion. Both legs join TARGET-FIRST, which used to be what made `a` the target and `b`
+	// the other party. It no longer carries that meaning — TapOptions.TargetSide does — and the order
+	// is kept because a deterministic member list is what makes a log line and a test readable.
 	ordered := [2]string{targetSessionID, pair[0]}
 	if pair[0] == targetSessionID {
 		ordered[1] = pair[1]
@@ -424,16 +439,34 @@ func (m *Manager) conversationFor(targetSessionID string) (string, bool, []strin
 }
 
 // resolveAudiences turns the tap's two sides into the two member sets the mixer routes on.
+//
+// The letters are resolved THROUGH TapOptions.TargetSide, which is the whole of what that field
+// bought: the target is whichever side the caller said it is, and the other party is the other
+// letter. An empty TargetSide means the caller has not been taught to send one and is read as SideA
+// — the target-first convention this file enforced by join order before the field existed.
 func resolveAudiences(opts TapOptions, peers []string) (hear, speakTo Audience, err error) {
+	targetSide := opts.TargetSide
+	if targetSide == "" {
+		targetSide = SideA
+	}
+	if targetSide != SideA && targetSide != SideB {
+		// `both` and `none` are answers to "which parties", not to "which one is this leg". A caller
+		// sending one has confused the two fields, and guessing which they meant is how a whisper
+		// ends up coaching the customer.
+		return Audience{}, Audience{}, fmt.Errorf(
+			"rtp: targetSide must be %q or %q, got %q", SideA, SideB, targetSide)
+	}
+
 	sideOf := func(side Side) (Audience, error) {
 		switch side {
 		case SideBoth:
 			return Everyone(), nil
 		case SideNone:
 			return Nobody(), nil
-		case SideA:
-			return Only(opts.TargetSessionID), nil
-		case SideB:
+		case SideA, SideB:
+			if side == targetSide {
+				return Only(opts.TargetSessionID), nil
+			}
 			other, ok := otherParty(peers, opts.TargetSessionID, opts.TapSessionID)
 			if !ok {
 				return Audience{}, fmt.Errorf(

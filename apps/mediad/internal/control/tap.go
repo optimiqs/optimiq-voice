@@ -19,12 +19,13 @@ import (
 // calls the same `join` a plain conference participant calls. There is no tap-specific code in the
 // mixer at all — eavesdrop, whisper and barge are three `Audience` pairs.
 //
-// What the contract still owes this, and it is the one gap worth naming loudly: `MediaPort.TapRequest`
-// carries a `targetSide` saying which side of the conversation the target leg IS, and
-// `mediaTapSessionRequestSchema` does not. So this implementation fixes the only convention it can
-// defend from the ids in the request — **`a` is the TARGET session and `b` is the other party** — and
-// the engine must pass, as `targetSessionId`, the leg it would have called side `a`. See
-// `Manager.Tap`, and this wave's report for the field the next wave should add.
+// The gap the first version of this file named loudly is closed. `MediaPort.TapRequest` has always
+// carried a `targetSide` saying which side of the conversation the target leg IS, and
+// `mediaTapSessionRequestSchema` did not — so this implementation fixed the only convention it could
+// defend from the ids in the request (`a` is the target, `b` is the other party) and the engine had
+// to pass, as `targetSessionId`, the leg it would have called side `a`. The field is on the wire
+// now, OPTIONAL, and absent still means that convention: an engine that has not been taught to send
+// it behaves exactly as it did. See `Manager.Tap` and `resolveAudiences`.
 
 // HandleTapSession joins a supervisor to a conversation on asymmetric terms. Rung 6.
 //
@@ -57,11 +58,22 @@ func (s *Server) HandleTapSession(data []byte) []byte {
 	if err != nil {
 		return s.refuseTap(request.TapID, ReasonBadRequest, err.Error())
 	}
+	// ABSENT is legal and means SideA — the target-first convention that predates the field. It is
+	// left empty here rather than defaulted, so `resolveAudiences` is the single place that decision
+	// is written down instead of two places that could drift.
+	var targetSide rtp.Side
+	if request.TargetSide != nil {
+		targetSide, err = rtp.ParseSide(string(*request.TargetSide))
+		if err != nil {
+			return s.refuseTap(request.TapID, ReasonBadRequest, err.Error())
+		}
+	}
 
 	result, err := s.sessions.Tap(rtp.TapOptions{
 		TapID:           request.TapID,
 		TapSessionID:    request.TapSessionID,
 		TargetSessionID: request.TargetSessionID,
+		TargetSide:      targetSide,
 		Hear:            hear,
 		SpeakTo:         speakTo,
 		Mode:            derefString((*string)(request.Mode)),

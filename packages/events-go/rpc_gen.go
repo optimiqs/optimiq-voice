@@ -41,9 +41,12 @@ const (
 	SubjectMediaStopRecordingRPC    = "rpc.media.v1.stop-recording"
 	SubjectMediaTapSessionRPC       = "rpc.media.v1.tap-session"
 	SubjectMediaUntapSessionRPC     = "rpc.media.v1.untap-session"
+	SubjectMediaMuteSessionRPC      = "rpc.media.v1.mute-session"
+	SubjectMediaHoldSessionRPC      = "rpc.media.v1.hold-session"
 	SubjectOriginateRPC             = "rpc.engine.v1.originate"
 	SubjectParkHandoffRPC           = "rpc.engine.v1.park-handoff"
 	SubjectSessionVerbRPC           = "rpc.engine.v1.session-verb"
+	SubjectConferenceControlRPC     = "rpc.engine.v1.conference-control"
 	SubjectSessionAnnounceRPC       = "rpc.session.v1.announce"
 )
 
@@ -67,9 +70,12 @@ const (
 	TimeoutMediaStopRecordingRPC    = 500 * time.Millisecond
 	TimeoutMediaTapSessionRPC       = 500 * time.Millisecond
 	TimeoutMediaUntapSessionRPC     = 500 * time.Millisecond
+	TimeoutMediaMuteSessionRPC      = 500 * time.Millisecond
+	TimeoutMediaHoldSessionRPC      = 1000 * time.Millisecond
 	TimeoutOriginateRPC             = 5000 * time.Millisecond
 	TimeoutParkHandoffRPC           = 3000 * time.Millisecond
 	TimeoutSessionVerbRPC           = 30000 * time.Millisecond
+	TimeoutConferenceControlRPC     = 2000 * time.Millisecond
 	TimeoutSessionAnnounceRPC       = 2000 * time.Millisecond
 )
 
@@ -695,6 +701,7 @@ type MediaBridgeSessionsResponse struct {
 	Ok         bool                               `json:"ok"`
 	BridgeID   string                             `json:"bridgeId"`
 	SessionIDs []string                           `json:"sessionIds"`
+	Mixed      bool                               `json:"mixed"`
 	InstanceID *string                            `json:"instanceId,omitempty"`
 	Reason     *MediaBridgeSessionsResponseReason `json:"reason,omitempty"`
 	Error      *string                            `json:"error,omitempty"`
@@ -1167,6 +1174,7 @@ type MediaTapSessionRequest struct {
 	TapID           string                        `json:"tapId"`
 	TapSessionID    string                        `json:"tapSessionId"`
 	TargetSessionID string                        `json:"targetSessionId"`
+	TargetSide      *LegSide                      `json:"targetSide,omitempty"`
 	Hear            MediaTapSessionRequestHear    `json:"hear"`
 	SpeakTo         MediaTapSessionRequestSpeakTo `json:"speakTo"`
 	Mode            *TapMode                      `json:"mode,omitempty"`
@@ -1329,6 +1337,143 @@ func (v MediaUntapSessionResponseReason) Valid() bool {
 }
 
 func (v MediaUntapSessionResponseReason) String() string { return string(v) }
+
+// MediaMuteSessionRequest is the request body of rpc.media.v1.mute-session.
+type MediaMuteSessionRequest struct {
+	SessionID string                           `json:"sessionId"`
+	Direction MediaMuteSessionRequestDirection `json:"direction"`
+	Unmute    bool                             `json:"unmute"`
+}
+
+// MediaMuteSessionRequestDirection is the closed vocabulary of MediaMuteSessionRequest.direction.
+type MediaMuteSessionRequestDirection string
+
+const (
+	MediaMuteSessionRequestDirectionIn   MediaMuteSessionRequestDirection = "in"
+	MediaMuteSessionRequestDirectionOut  MediaMuteSessionRequestDirection = "out"
+	MediaMuteSessionRequestDirectionBoth MediaMuteSessionRequestDirection = "both"
+)
+
+// MediaMuteSessionRequestDirectionValues lists every member of the vocabulary, in contract order.
+var MediaMuteSessionRequestDirectionValues = []MediaMuteSessionRequestDirection{
+	MediaMuteSessionRequestDirectionIn,
+	MediaMuteSessionRequestDirectionOut,
+	MediaMuteSessionRequestDirectionBoth,
+}
+
+// Valid reports whether v is a member of the MediaMuteSessionRequestDirection vocabulary.
+func (v MediaMuteSessionRequestDirection) Valid() bool {
+	for _, candidate := range MediaMuteSessionRequestDirectionValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaMuteSessionRequestDirection) String() string { return string(v) }
+
+// MediaMuteSessionResponse is the reply body of rpc.media.v1.mute-session.
+type MediaMuteSessionResponse struct {
+	Ok         bool                            `json:"ok"`
+	SessionID  string                          `json:"sessionId"`
+	MutedIn    bool                            `json:"mutedIn"`
+	MutedOut   bool                            `json:"mutedOut"`
+	InstanceID *string                         `json:"instanceId,omitempty"`
+	Reason     *MediaMuteSessionResponseReason `json:"reason,omitempty"`
+	Error      *string                         `json:"error,omitempty"`
+}
+
+// MediaMuteSessionResponseReason is the closed vocabulary of MediaMuteSessionResponse.reason.
+type MediaMuteSessionResponseReason string
+
+const (
+	MediaMuteSessionResponseReasonBadRequest     MediaMuteSessionResponseReason = "bad_request"
+	MediaMuteSessionResponseReasonCapacity       MediaMuteSessionResponseReason = "capacity"
+	MediaMuteSessionResponseReasonShuttingDown   MediaMuteSessionResponseReason = "shutting_down"
+	MediaMuteSessionResponseReasonUnknownSession MediaMuteSessionResponseReason = "unknown_session"
+	MediaMuteSessionResponseReasonWrongInstance  MediaMuteSessionResponseReason = "wrong_instance"
+	MediaMuteSessionResponseReasonNotSupported   MediaMuteSessionResponseReason = "not_supported"
+	MediaMuteSessionResponseReasonInternal       MediaMuteSessionResponseReason = "internal"
+)
+
+// MediaMuteSessionResponseReasonValues lists every member of the vocabulary, in contract order.
+var MediaMuteSessionResponseReasonValues = []MediaMuteSessionResponseReason{
+	MediaMuteSessionResponseReasonBadRequest,
+	MediaMuteSessionResponseReasonCapacity,
+	MediaMuteSessionResponseReasonShuttingDown,
+	MediaMuteSessionResponseReasonUnknownSession,
+	MediaMuteSessionResponseReasonWrongInstance,
+	MediaMuteSessionResponseReasonNotSupported,
+	MediaMuteSessionResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the MediaMuteSessionResponseReason vocabulary.
+func (v MediaMuteSessionResponseReason) Valid() bool {
+	for _, candidate := range MediaMuteSessionResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaMuteSessionResponseReason) String() string { return string(v) }
+
+// MediaHoldSessionRequest is the request body of rpc.media.v1.hold-session.
+type MediaHoldSessionRequest struct {
+	SessionID string  `json:"sessionId"`
+	Unhold    bool    `json:"unhold"`
+	Music     *string `json:"music,omitempty"`
+	MusicRef  *string `json:"musicRef,omitempty"`
+}
+
+// MediaHoldSessionResponse is the reply body of rpc.media.v1.hold-session.
+type MediaHoldSessionResponse struct {
+	Ok         bool                            `json:"ok"`
+	SessionID  string                          `json:"sessionId"`
+	Held       bool                            `json:"held"`
+	MusicRef   *string                         `json:"musicRef,omitempty"`
+	InstanceID *string                         `json:"instanceId,omitempty"`
+	Reason     *MediaHoldSessionResponseReason `json:"reason,omitempty"`
+	Error      *string                         `json:"error,omitempty"`
+}
+
+// MediaHoldSessionResponseReason is the closed vocabulary of MediaHoldSessionResponse.reason.
+type MediaHoldSessionResponseReason string
+
+const (
+	MediaHoldSessionResponseReasonBadRequest     MediaHoldSessionResponseReason = "bad_request"
+	MediaHoldSessionResponseReasonCapacity       MediaHoldSessionResponseReason = "capacity"
+	MediaHoldSessionResponseReasonShuttingDown   MediaHoldSessionResponseReason = "shutting_down"
+	MediaHoldSessionResponseReasonUnknownSession MediaHoldSessionResponseReason = "unknown_session"
+	MediaHoldSessionResponseReasonWrongInstance  MediaHoldSessionResponseReason = "wrong_instance"
+	MediaHoldSessionResponseReasonNotSupported   MediaHoldSessionResponseReason = "not_supported"
+	MediaHoldSessionResponseReasonInternal       MediaHoldSessionResponseReason = "internal"
+)
+
+// MediaHoldSessionResponseReasonValues lists every member of the vocabulary, in contract order.
+var MediaHoldSessionResponseReasonValues = []MediaHoldSessionResponseReason{
+	MediaHoldSessionResponseReasonBadRequest,
+	MediaHoldSessionResponseReasonCapacity,
+	MediaHoldSessionResponseReasonShuttingDown,
+	MediaHoldSessionResponseReasonUnknownSession,
+	MediaHoldSessionResponseReasonWrongInstance,
+	MediaHoldSessionResponseReasonNotSupported,
+	MediaHoldSessionResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the MediaHoldSessionResponseReason vocabulary.
+func (v MediaHoldSessionResponseReason) Valid() bool {
+	for _, candidate := range MediaHoldSessionResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaHoldSessionResponseReason) String() string { return string(v) }
 
 // OriginateRequest is the request body of rpc.engine.v1.originate.
 type OriginateRequest struct {
@@ -1885,6 +2030,174 @@ func (v SessionVerbResponseReason) Valid() bool {
 }
 
 func (v SessionVerbResponseReason) String() string { return string(v) }
+
+// ConferenceControlRequest is the request body of rpc.engine.v1.conference-control.
+type ConferenceControlRequest struct {
+	OrgID        string                             `json:"orgId"`
+	ConferenceID string                             `json:"conferenceId"`
+	Action       ConferenceControlRequestAction     `json:"action"`
+	MemberRef    *string                            `json:"memberRef,omitempty"`
+	GainPercent  *int                               `json:"gainPercent,omitempty"`
+	GainScope    *ConferenceControlRequestGainScope `json:"gainScope,omitempty"`
+	ByUserID     *string                            `json:"byUserId,omitempty"`
+}
+
+// ConferenceControlRequestAction is the closed vocabulary of ConferenceControlRequest.action.
+type ConferenceControlRequestAction string
+
+const (
+	ConferenceControlRequestActionMute   ConferenceControlRequestAction = "mute"
+	ConferenceControlRequestActionUnmute ConferenceControlRequestAction = "unmute"
+	ConferenceControlRequestActionDeaf   ConferenceControlRequestAction = "deaf"
+	ConferenceControlRequestActionUndeaf ConferenceControlRequestAction = "undeaf"
+	ConferenceControlRequestActionKick   ConferenceControlRequestAction = "kick"
+	ConferenceControlRequestActionVolume ConferenceControlRequestAction = "volume"
+	ConferenceControlRequestActionLock   ConferenceControlRequestAction = "lock"
+	ConferenceControlRequestActionUnlock ConferenceControlRequestAction = "unlock"
+)
+
+// ConferenceControlRequestActionValues lists every member of the vocabulary, in contract order.
+var ConferenceControlRequestActionValues = []ConferenceControlRequestAction{
+	ConferenceControlRequestActionMute,
+	ConferenceControlRequestActionUnmute,
+	ConferenceControlRequestActionDeaf,
+	ConferenceControlRequestActionUndeaf,
+	ConferenceControlRequestActionKick,
+	ConferenceControlRequestActionVolume,
+	ConferenceControlRequestActionLock,
+	ConferenceControlRequestActionUnlock,
+}
+
+// Valid reports whether v is a member of the ConferenceControlRequestAction vocabulary.
+func (v ConferenceControlRequestAction) Valid() bool {
+	for _, candidate := range ConferenceControlRequestActionValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v ConferenceControlRequestAction) String() string { return string(v) }
+
+// ConferenceControlRequestGainScope is the closed vocabulary of ConferenceControlRequest.gainScope.
+type ConferenceControlRequestGainScope string
+
+const (
+	ConferenceControlRequestGainScopeTalk   ConferenceControlRequestGainScope = "talk"
+	ConferenceControlRequestGainScopeListen ConferenceControlRequestGainScope = "listen"
+	ConferenceControlRequestGainScopeBoth   ConferenceControlRequestGainScope = "both"
+)
+
+// ConferenceControlRequestGainScopeValues lists every member of the vocabulary, in contract order.
+var ConferenceControlRequestGainScopeValues = []ConferenceControlRequestGainScope{
+	ConferenceControlRequestGainScopeTalk,
+	ConferenceControlRequestGainScopeListen,
+	ConferenceControlRequestGainScopeBoth,
+}
+
+// Valid reports whether v is a member of the ConferenceControlRequestGainScope vocabulary.
+func (v ConferenceControlRequestGainScope) Valid() bool {
+	for _, candidate := range ConferenceControlRequestGainScopeValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v ConferenceControlRequestGainScope) String() string { return string(v) }
+
+// ConferenceControlResponse is the reply body of rpc.engine.v1.conference-control.
+type ConferenceControlResponse struct {
+	Ok                bool                             `json:"ok"`
+	Action            ConferenceControlResponseAction  `json:"action"`
+	InstanceID        string                           `json:"instanceId"`
+	MemberCount       int                              `json:"memberCount"`
+	Locked            *bool                            `json:"locked,omitempty"`
+	MemberRef         *string                          `json:"memberRef,omitempty"`
+	Muted             *bool                            `json:"muted,omitempty"`
+	Deafened          *bool                            `json:"deafened,omitempty"`
+	Moderator         *bool                            `json:"moderator,omitempty"`
+	TalkGainPercent   *int                             `json:"talkGainPercent,omitempty"`
+	ListenGainPercent *int                             `json:"listenGainPercent,omitempty"`
+	Reason            *ConferenceControlResponseReason `json:"reason,omitempty"`
+	Error             *string                          `json:"error,omitempty"`
+}
+
+// ConferenceControlResponseAction is the closed vocabulary of ConferenceControlResponse.action.
+type ConferenceControlResponseAction string
+
+const (
+	ConferenceControlResponseActionMute   ConferenceControlResponseAction = "mute"
+	ConferenceControlResponseActionUnmute ConferenceControlResponseAction = "unmute"
+	ConferenceControlResponseActionDeaf   ConferenceControlResponseAction = "deaf"
+	ConferenceControlResponseActionUndeaf ConferenceControlResponseAction = "undeaf"
+	ConferenceControlResponseActionKick   ConferenceControlResponseAction = "kick"
+	ConferenceControlResponseActionVolume ConferenceControlResponseAction = "volume"
+	ConferenceControlResponseActionLock   ConferenceControlResponseAction = "lock"
+	ConferenceControlResponseActionUnlock ConferenceControlResponseAction = "unlock"
+)
+
+// ConferenceControlResponseActionValues lists every member of the vocabulary, in contract order.
+var ConferenceControlResponseActionValues = []ConferenceControlResponseAction{
+	ConferenceControlResponseActionMute,
+	ConferenceControlResponseActionUnmute,
+	ConferenceControlResponseActionDeaf,
+	ConferenceControlResponseActionUndeaf,
+	ConferenceControlResponseActionKick,
+	ConferenceControlResponseActionVolume,
+	ConferenceControlResponseActionLock,
+	ConferenceControlResponseActionUnlock,
+}
+
+// Valid reports whether v is a member of the ConferenceControlResponseAction vocabulary.
+func (v ConferenceControlResponseAction) Valid() bool {
+	for _, candidate := range ConferenceControlResponseActionValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v ConferenceControlResponseAction) String() string { return string(v) }
+
+// ConferenceControlResponseReason is the closed vocabulary of ConferenceControlResponse.reason.
+type ConferenceControlResponseReason string
+
+const (
+	ConferenceControlResponseReasonBadRequest        ConferenceControlResponseReason = "bad-request"
+	ConferenceControlResponseReasonUnknownConference ConferenceControlResponseReason = "unknown-conference"
+	ConferenceControlResponseReasonUnknownMember     ConferenceControlResponseReason = "unknown-member"
+	ConferenceControlResponseReasonNotServable       ConferenceControlResponseReason = "not-servable"
+	ConferenceControlResponseReasonMediaRefused      ConferenceControlResponseReason = "media-refused"
+	ConferenceControlResponseReasonShuttingDown      ConferenceControlResponseReason = "shutting-down"
+	ConferenceControlResponseReasonInternal          ConferenceControlResponseReason = "internal"
+)
+
+// ConferenceControlResponseReasonValues lists every member of the vocabulary, in contract order.
+var ConferenceControlResponseReasonValues = []ConferenceControlResponseReason{
+	ConferenceControlResponseReasonBadRequest,
+	ConferenceControlResponseReasonUnknownConference,
+	ConferenceControlResponseReasonUnknownMember,
+	ConferenceControlResponseReasonNotServable,
+	ConferenceControlResponseReasonMediaRefused,
+	ConferenceControlResponseReasonShuttingDown,
+	ConferenceControlResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the ConferenceControlResponseReason vocabulary.
+func (v ConferenceControlResponseReason) Valid() bool {
+	for _, candidate := range ConferenceControlResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v ConferenceControlResponseReason) String() string { return string(v) }
 
 // SessionAnnounceRequest is the request body of rpc.session.v1.announce.
 type SessionAnnounceRequest struct {

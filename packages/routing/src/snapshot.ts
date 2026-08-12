@@ -637,7 +637,31 @@ export interface ConferenceInput extends RoutingEntityInput {
 	readonly maxMembers: number;
 	readonly mohClassId?: string | null;
 	readonly waitForModerator: boolean;
-	readonly recordEnabled: boolean;
+	/**
+	 * `conference.record_policy` — the same vocabulary `extension`, `trunk` and `queue` carry, which
+	 * replaced a `recordEnabled` boolean the walker read by nothing.
+	 *
+	 * Optional and null-tolerant for the reason every other converted column is: a loader that
+	 * predates the swap is a supported rollout state rather than a type error, and absent compiles
+	 * to `none` — which is what a room whose boolean was false always did.
+	 */
+	readonly recordPolicy?: RecordPolicy | null;
+	/**
+	 * Beep the room on a join and on a leave. Optional and absent is read as TRUE, which is the
+	 * column's own default and is a privacy position: a participant who cannot tell that a third
+	 * party has arrived is one who does not know the conversation stopped being private. An artifact
+	 * compiled before these existed must not silently turn the beeps off.
+	 */
+	readonly entryToneEnabled?: boolean | null;
+	readonly exitToneEnabled?: boolean | null;
+	/**
+	 * Play each arrival's and departure's recorded name to the room.
+	 *
+	 * Optional and absent is TRUE, matching the column's default and the two flags above. Distinct
+	 * from them: a name announcement costs everybody three seconds of somebody's voice and needs a
+	 * recording, where a tone costs a quarter of a second and needs nothing.
+	 */
+	readonly announceJoinLeave?: boolean | null;
 	/**
 	 * The participant PIN, as a digest in the format `voicemail-pin.ts` defines. Never a PIN.
 	 *

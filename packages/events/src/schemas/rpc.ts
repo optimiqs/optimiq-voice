@@ -1080,27 +1080,69 @@ export const MEDIA_ALLOCATE_SESSION_RPC = defineRpc(
 );
 
 /**
- * `rpc.media.v1.bridge-sessions` — start relaying RTP between two allocated sessions.
+ * `rpc.media.v1.bridge-sessions` — put two or more allocated sessions in one conversation.
  *
- * Exactly two, and the schema says so. Two-party audio is a RELAY: each session forwards its
- * payload to the other, no decode, no mix, no jitter buffer. N-way is mixing, which needs all three
- * of those, and is rung 6 of `plans/mediad-design.md` §2 — a three-element array here would be a
- * contract promising something the media plane cannot do.
+ * ## Two is a relay, three is a room, and the caller does not have to know which
+ *
+ * This schema said `.length(2)` for four rungs, and the JSDoc above it promised that the limit
+ * would lift when rung 6 arrived: "N-way is mixing, which needs a decode, a jitter buffer and a
+ * mix-minus per participant, and a three-element array here would be a contract promising something
+ * the media plane cannot do." Rung 6 arrived — `apps/mediad/internal/rtp/conference.go` is the
+ * mixer, and `tap-session` has been converting two-party bridges into rooms since it landed — so
+ * the promise is kept here rather than by growing a second subject.
+ *
+ * Which mechanism serves a request is the responder's business and deliberately not the caller's:
+ * two sessions become a RELAY (each forwards its payload to the other; no decode, no buffer, no
+ * added delay) and three or more become a ROOM (a jitter buffer, a decode and a mix-minus per
+ * member). An engine asking for a conference bridge writes the same command it writes for a
+ * two-party call, and the sixty milliseconds of playout delay a mix costs are a property of the
+ * arrangement rather than of the request.
+ *
+ * ## Why the ceiling is eight rather than unbounded
+ *
+ * The mixer sums every member's decoded audio once per member per frame, fifty times a second, so
+ * the cost is quadratic in the room and the number where that stops being free is a capacity
+ * decision one process gets to make. Eight is where this platform's mixer is measured, it is above
+ * every room a small business actually holds, and — the reason it is a SCHEMA bound and not a
+ * runtime one — a caller that asks for nine gets a validation error naming the field instead of a
+ * refusal three hops later with half a room already mixing.
+ *
+ * A larger room is a real feature and it is not this: it needs a mixer that maintains one sum and
+ * subtracts each member from it, which is a different algorithm rather than a bigger constant.
+ * Raising this number without writing that is how a conference of thirty makes every other call on
+ * the instance stutter.
  *
  * `bridgeId` is caller-assigned for the same reason `sessionId` is, and because the engine's
- * `MediaPort` already mints one in `createBridge` before any leg joins.
+ * `MediaPort` already mints one in `createBridge` before any leg joins. A room keeps the BRIDGE's
+ * id — the engine tears down what it created, under the name it created it with.
  */
+export const MEDIA_BRIDGE_MAX_SESSIONS = 8;
+
 export const mediaBridgeSessionsRequestSchema = z.object({
 	bridgeId: z.string().min(1).max(128),
-	/** The two sessions to relay between. Order is not significant; the relay is bidirectional. */
-	sessionIds: z.array(z.string().min(1).max(128)).length(2),
+	/**
+	 * The sessions to put in one conversation. Order is not significant — a relay is bidirectional
+	 * and a mix is symmetric — with one exception the caller should know about: on a request that
+	 * CONVERTS an existing two-party call into a room, the media plane resolves the `a`/`b` letters
+	 * of {@link mediaTapSessionRequestSchema} from join order unless a `targetSide` says otherwise.
+	 */
+	sessionIds: z.array(z.string().min(1).max(128)).min(2).max(MEDIA_BRIDGE_MAX_SESSIONS),
 });
 
 export const mediaBridgeSessionsResponseSchema = z.object({
 	ok: z.boolean(),
 	bridgeId: z.string().min(1).max(128),
-	/** The sessions actually relaying. Empty on a refusal. */
-	sessionIds: z.array(z.string().max(128)).max(2).default([]),
+	/** The sessions actually in the conversation. Empty on a refusal. */
+	sessionIds: z.array(z.string().max(128)).max(MEDIA_BRIDGE_MAX_SESSIONS).default([]),
+	/**
+	 * Whether this arrangement is a MIX rather than a relay — three or more members, or two that
+	 * were already in a room.
+	 *
+	 * On the reply because it is the one fact an operator needs to explain "the call developed
+	 * sixty milliseconds of delay the moment the third person joined", and because it is not
+	 * derivable from `sessionIds.length` alone: a two-party call that a tap converted stays mixed.
+	 */
+	mixed: z.boolean().default(false),
 	instanceId: z.string().min(1).max(128).optional(),
 	reason: mediaRefusalReasonSchema.optional(),
 	error: z.string().max(512).optional(),
@@ -1135,7 +1177,13 @@ export const mediaUnbridgeSessionsResponseSchema = z.object({
 	bridgeId: z.string().min(1).max(128),
 	/** False when there was no such relay. A SUCCESS, not a failure — see the note above. */
 	unbridged: z.boolean().default(false),
-	sessionIds: z.array(z.string().max(128)).max(2).default([]),
+	/**
+	 * Everybody who was in the conversation. Bounded by
+	 * {@link MEDIA_BRIDGE_MAX_SESSIONS} rather than by two, because since rung 6 a `bridgeId` may
+	 * name a ROOM: tearing one down returns every member, and a cap of two would have truncated the
+	 * list of legs the engine still has to account for.
+	 */
+	sessionIds: z.array(z.string().max(128)).max(MEDIA_BRIDGE_MAX_SESSIONS).default([]),
 	instanceId: z.string().min(1).max(128).optional(),
 	reason: mediaRefusalReasonSchema.optional(),
 	error: z.string().max(512).optional(),
@@ -1649,6 +1697,35 @@ export const mediaTapSessionRequestSchema = z.object({
 	/** Any session in the conversation being joined; the bridge is resolved from it. */
 	targetSessionId: z.string().min(1).max(128),
 	/**
+	 * Which side of the conversation {@link targetSessionId} IS — `a` or `b`.
+	 *
+	 * ## The convention this replaces, and why it needed replacing
+	 *
+	 * `hear` and `speakTo` name a SIDE of a two-party call, so serving them requires knowing which
+	 * side each session is on. Until this field existed the media plane fixed the only convention it
+	 * could defend from the ids in the request — **`a` is the target session and `b` is the other
+	 * party** — and enforced it by joining the two legs to the room in TARGET-FIRST order when it
+	 * converted a relay into a mix. That works, and it puts the obligation in the wrong place: the
+	 * engine has to pass, as `targetSessionId`, the leg it would have called side `a`, which is a
+	 * rule living in prose on both sides of a language border.
+	 *
+	 * `MediaPort.TapRequest` has carried `targetSide` since supervision was specified, because on
+	 * ARI a tap is a direction on one channel and "speak to the agent" is only implementable once
+	 * you know whether this channel is the agent. This is that field reaching the wire, so the
+	 * engine states the fact it already holds instead of encoding it in an argument's position.
+	 *
+	 * ## Absent keeps the old convention, on purpose
+	 *
+	 * Optional rather than required, and absent means exactly what it meant before: the target is
+	 * side `a` and the other party is side `b`. An engine that has not been taught to send it
+	 * behaves as it always did, which is what lets the two ends roll independently — the rule this
+	 * package's README states for every additive change.
+	 *
+	 * Meaningless in a room of more than two, where `a`/`b` are refused by name rather than
+	 * resolved to whoever happens to be second in the join order.
+	 */
+	targetSide: z.enum(["a", "b"]).optional(),
+	/**
 	 * Which peers the supervisor hears. `none` is accepted by the enum and refused by the
 	 * responder: a participant that hears nothing and (for an eavesdrop) says nothing is a port
 	 * pair burning for no reason, and answering `ok` to it would hide a caller's bug.
@@ -1726,6 +1803,161 @@ export const MEDIA_UNTAP_SESSION_RPC = defineRpc(
 	mediaUntapSessionRequestSchema,
 	mediaUntapSessionResponseSchema,
 	500,
+);
+
+// ---------------------------------------------------------------------------------------------
+// rpc.media.v1.mute-session / hold-session — engine → mediad, rung 5's two state commands
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Which half of a leg's audio path a mute applies to.
+ *
+ * The same three values `MediaPort.mute(channelId, direction)` uses and the same meanings ARI gives
+ * them, so the two drivers cannot disagree about what a mute did. `in` is audio arriving FROM the
+ * leg — the party cannot be heard; `out` is audio sent TO it — the party cannot hear.
+ *
+ * The default is `both`, which is ARI's own default for a mute with no direction. Matching it
+ * matters more than picking the direction this platform would have chosen on its own.
+ */
+export const MEDIA_DIRECTIONS = ["in", "out", "both"] as const;
+export const mediaDirectionSchema = z.enum(MEDIA_DIRECTIONS);
+export type MediaDirection = (typeof MEDIA_DIRECTIONS)[number];
+
+/**
+ * `rpc.media.v1.mute-session` — stop audio flowing in one or both directions of one leg.
+ *
+ * ## Additive, and that is the contract rather than an implementation detail
+ *
+ * Muting `in` on a leg already muted `out` leaves BOTH muted. The alternative — a direction field
+ * that replaces whatever was there — would make `mute(in)` on a leg that already could not hear
+ * into an unmute of the direction nobody mentioned, which is how a conference participant gets
+ * their audio back because somebody muted their microphone.
+ *
+ * `unmute: true` is what lifts one. One subject rather than a `mute-session`/`unmute-session` pair
+ * because the two carry identical fields and differ in one bit — the same reasoning
+ * {@link mediaHoldSessionRequestSchema} follows, and the opposite of the playback and recording
+ * pairs, whose stop halves carry a reference and no other field at all.
+ *
+ * ## What it deliberately does NOT do
+ *
+ * It is not visible in SIP. A muted leg's far end is told nothing, its hold key does not light, and
+ * it keeps sending. That is the whole difference from `hold-session` below, and it is why a
+ * conference `*6` is this subject and an agent pressing hold is that one.
+ *
+ * It also does not gate DTMF DETECTION. A muted participant pressing `*6` to unmute themselves is
+ * the single most common thing a muted participant does, and a media plane that suppressed the
+ * keypress with the audio would make the unmute unreachable by exactly the people who need it.
+ */
+export const mediaMuteSessionRequestSchema = z.object({
+	...mediaCommandShape,
+	/** Which half of the path. `both` when omitted, which is ARI's default. */
+	direction: mediaDirectionSchema.default("both"),
+	/** `true` lifts the mute on {@link direction} instead of applying it. */
+	unmute: z.boolean().default(false),
+});
+
+export const mediaMuteSessionResponseSchema = z.object({
+	ok: z.boolean(),
+	sessionId: z.string().min(1).max(128),
+	/** The state AFTER the command: whether audio from the leg is suppressed. */
+	mutedIn: z.boolean().default(false),
+	/** The state AFTER the command: whether audio to the leg is suppressed. */
+	mutedOut: z.boolean().default(false),
+	instanceId: z.string().min(1).max(128).optional(),
+	reason: mediaRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type MediaMuteSessionRequest = z.infer<typeof mediaMuteSessionRequestSchema>;
+export type MediaMuteSessionResponse = z.infer<typeof mediaMuteSessionResponseSchema>;
+
+export const MEDIA_MUTE_SESSION_RPC = defineRpc(
+	RPC_SUBJECTS.mediaMuteSession,
+	mediaMuteSessionRequestSchema,
+	mediaMuteSessionResponseSchema,
+	// The family's 500 ms. Two atomic flags and a log line — there is no I/O on this path at all,
+	// which is exactly what separates it from `hold-session` below.
+	500,
+);
+
+/**
+ * `rpc.media.v1.hold-session` — take a leg out of the conversation, optionally with music.
+ *
+ * ## Hold is a statement about the CONVERSATION, and mute is one about a direction
+ *
+ * `MediaPort` keeps them apart deliberately (`hold` is "SIGNALLING only, and deliberately separate
+ * from startMusicOnHold") and so does this pair of subjects. A held party does not hear the other
+ * side and the other side does not hear them; a muted party is one direction of one leg. A leg that
+ * was muted before it was held stays muted when it is unheld, which is only expressible because
+ * these are two commands over two pieces of state.
+ *
+ * The SIGNALLING half — the re-INVITE that lights the far end's hold key — is `apps/sipd`'s and
+ * reaches the media plane as a repeat `allocate-session` carrying the new `direction`. This subject
+ * is the media plane's own half, and an engine uses both, together or separately: a call held
+ * mid-attended-transfer wants the music without the re-INVITE, because renegotiating twice in three
+ * seconds is how phones drop audio.
+ *
+ * ## `music` is a media reference and the responder resolves it
+ *
+ * `moh:<class>` for a hold-music class, `sound:<name>` for a specific clip, `tone:silence` for a
+ * deliberately silent hold — the same vocabulary `start-playback` takes, resolved through the same
+ * library. Absent is a legal hold with NO music, which is what an instance with no music mounted
+ * does: the caller hears silence, the conversation is still suppressed, and nothing pretends a file
+ * existed.
+ *
+ * The hold STANDS even when the music cannot start. Failing a hold over its soundtrack would be
+ * putting music ahead of privacy, and the party who pressed hold still expects the other side to
+ * stop hearing them.
+ *
+ * ## Idempotent, in the shape every stop on this family uses
+ *
+ * `unhold: true` on a leg that was not held answers `ok: true, held: false` — a SUCCESS. The engine
+ * retries an unhold after a lost reply, and a retry that answered "failed" would make a working
+ * recovery look like a broken one. Holding a held leg re-points its music and answers `ok`.
+ */
+export const mediaHoldSessionRequestSchema = z.object({
+	...mediaCommandShape,
+	/** `true` returns the leg to the conversation and stops the music this hold started. */
+	unhold: z.boolean().default(false),
+	/**
+	 * What the held party hears. `moh:<class>`, `sound:<name>`, `tone:silence`, or absent for a
+	 * silent hold. Ignored when {@link unhold} is set.
+	 */
+	music: z.string().min(1).max(512).optional(),
+	/**
+	 * Caller-assigned reference for the music loop, so a `stop-playback` can name it.
+	 *
+	 * Optional because a hold with no music has no loop to name, and the responder mints one from
+	 * the session id when music was asked for without a reference — an engine that only wants the
+	 * suppression should not have to invent an id for a playback it will never stop by hand.
+	 */
+	musicRef: z.string().min(1).max(128).optional(),
+});
+
+export const mediaHoldSessionResponseSchema = z.object({
+	ok: z.boolean(),
+	sessionId: z.string().min(1).max(128),
+	/** The state AFTER the command. `false` on an unhold of a leg that was not held — see above. */
+	held: z.boolean().default(false),
+	/** The reference the music loop is playing under, when there is one. */
+	musicRef: z.string().max(128).optional(),
+	instanceId: z.string().min(1).max(128).optional(),
+	reason: mediaRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type MediaHoldSessionRequest = z.infer<typeof mediaHoldSessionRequestSchema>;
+export type MediaHoldSessionResponse = z.infer<typeof mediaHoldSessionResponseSchema>;
+
+export const MEDIA_HOLD_SESSION_RPC = defineRpc(
+	RPC_SUBJECTS.mediaHoldSession,
+	mediaHoldSessionRequestSchema,
+	mediaHoldSessionResponseSchema,
+	// One second, not the family's 500 ms, and `start-playback` is the precedent: a hold that names
+	// music READS AND DECODES A FILE before it answers, so the reply means the loop is in memory
+	// rather than that the request was accepted for consideration. That disk read is the whole
+	// difference, and it is why `mute-session` above keeps the shorter budget.
+	1_000,
 );
 
 // ---------------------------------------------------------------------------------------------
@@ -2380,6 +2612,189 @@ export const SESSION_VERB_RPC = defineRpc(
 	30_000,
 );
 
+// ---------------------------------------------------------------------------------------------
+// rpc.engine.v1.conference-control.<instanceToken> — api → engine, moderating a live room
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * What a moderator can do to a live conference.
+ *
+ * A CLOSED list, and the split down the middle of it is the important part: the first five act on
+ * ONE MEMBER and the last two act on the ROOM. That difference decides who can serve the command —
+ * a member lives on exactly one engine instance's media channel, a room's lock is cluster state
+ * held in the `conference-claims` value — and it is why {@link conferenceControlRequestSchema}
+ * makes `memberRef` conditionally required rather than always.
+ *
+ * `deaf` is `mute` in the other direction and is a separate verb rather than a direction argument
+ * on `mute`, because they are different acts with different consequences: muting somebody stops the
+ * room hearing them, deafening them stops them hearing the room, and a moderation UI that offered
+ * one control with a direction dropdown would be describing a mixer rather than a meeting.
+ *
+ * `volume` is here and is REFUSED by one of the two media drivers, which is stated on the response
+ * rather than hidden: see {@link CONFERENCE_CONTROL_REFUSAL_REASONS}.
+ */
+export const CONFERENCE_CONTROL_ACTIONS = [
+	/** The room stops hearing this member. `*6` from the handset does the same thing. */
+	"mute",
+	"unmute",
+	/** This member stops hearing the room. Their own audio still reaches it unless also muted. */
+	"deaf",
+	"undeaf",
+	/**
+	 * Remove this member from the room.
+	 *
+	 * It does NOT hang the call up, and the difference matters to whoever is holding the phone: a
+	 * kicked participant is out of the meeting and still on a call the engine can route somewhere
+	 * — today, to a goodbye announcement and a hangup, which is a routing decision and therefore
+	 * the engine's rather than the media plane's.
+	 */
+	"kick",
+	/**
+	 * Re-level one member's contribution to the mix, or what they hear of it.
+	 *
+	 * Servable only on a media plane that MIXES. See the `not-servable` refusal.
+	 */
+	"volume",
+	/** The room stops admitting new participants. Acts on the room; carries no `memberRef`. */
+	"lock",
+	"unlock",
+] as const;
+
+export const conferenceControlActionSchema = z.enum(CONFERENCE_CONTROL_ACTIONS);
+export type ConferenceControlAction = (typeof CONFERENCE_CONTROL_ACTIONS)[number];
+
+/** The two verbs that act on the room rather than on one member. */
+export const CONFERENCE_ROOM_ACTIONS = ["lock", "unlock"] as const;
+
+/**
+ * `rpc.engine.v1.conference-control.<instanceToken>` — one moderation command on one live room.
+ *
+ * ## Instance-addressed, and the address is read out of the claim
+ *
+ * See {@link RPC_SUBJECTS.engineConferenceControl}. The short version: a room is jointly held, so
+ * there is no single instance that owns it, but every MEMBER is on exactly one instance's media
+ * channel and only that instance can mute it. The control plane reads the room's
+ * `conference-claims` value, which already names every instance with unexpired members in it, and
+ * addresses each in turn until one answers something other than `unknown-member`.
+ *
+ * ## `memberRef` is the LEG id, not a media channel id
+ *
+ * The control plane never sees a media channel id and must not: it is the engine's own handle onto
+ * a media server, it changes when the media driver changes, and a REST path segment carrying one
+ * would be an Asterisk-ism in a URL. The leg id is what `conference.joined` publishes, which is the
+ * only place the control plane learns a participant exists at all, so it is the only identifier
+ * both ends already share.
+ *
+ * ## Room verbs go to any contributor, and the lock lands in the CLAIM
+ *
+ * `lock` is not a fact about one instance's copy of the room — a join landing on a neighbour has to
+ * be refused too, or the lock is a suggestion. So the instance that serves it writes the flag into
+ * the shared claim under compare-and-set, and every joiner reads it on the join path it already
+ * reads the member cap on. Which contributor serves the command is therefore irrelevant, and a
+ * deployment with no claim bucket configured is single-instance by choice and locks locally.
+ */
+export const conferenceControlRequestSchema = z.object({
+	orgId: z.uuid(),
+	/** The room, as `conference.id`. The same id `conference.joined` carries. */
+	conferenceId: z.uuid(),
+	action: conferenceControlActionSchema,
+	/**
+	 * The member to act on — a LEG id. Required for every action except `lock` and `unlock`, and
+	 * refused as `bad-request` when it is missing.
+	 */
+	memberRef: z.string().min(1).max(128).optional(),
+	/**
+	 * Gain for `volume`, in PERCENT of unity, 0–400.
+	 *
+	 * Percent rather than decibels because the only caller is a slider in a moderation panel and a
+	 * dB scale would need a curve at both ends to be usable; percent rather than the mixer's own
+	 * Q8 fixed point because that is an implementation's unit and this is a contract. 100 is
+	 * unchanged, 0 is silent, and the ceiling is 400 because a member amplified past four times
+	 * unity is clipping rather than louder.
+	 */
+	gainPercent: z.int().min(0).max(400).optional(),
+	/**
+	 * Which half of `volume` to set. `talk` is the member's contribution TO the room, `listen` is
+	 * what they hear OF it. `both` when omitted.
+	 */
+	gainScope: z.enum(["talk", "listen", "both"]).optional(),
+	/** Who asked, for the audit trail and the log line. The control plane's user id. */
+	byUserId: z.uuid().optional(),
+});
+
+/**
+ * Why a moderation command did not run.
+ *
+ * `not-servable` is the one worth reading twice. It is not "this engine is broken" and not "this
+ * release has not built it" — it is **the media plane under this call cannot express the request**,
+ * and the caller's recovery is to stop offering the control rather than to retry. Today it is
+ * produced by exactly one combination: `volume` on the ARI driver, which can mute a channel and has
+ * no per-participant gain on a mixing bridge at all. `error` names the driver so an operator can
+ * see why the same button worked on a different call.
+ */
+export const CONFERENCE_CONTROL_REFUSAL_REASONS = [
+	/** Malformed payload, a missing `memberRef`, or a `gainPercent` on something that is not `volume`. */
+	"bad-request",
+	/** No room with that id on this instance. The caller should try the next contributor. */
+	"unknown-conference",
+	/** The room is here and that member is not. The caller should try the next contributor. */
+	"unknown-member",
+	/**
+	 * The media plane under this call cannot serve the action. NOT a rung and NOT a retry — see
+	 * the note above.
+	 */
+	"not-servable",
+	/** The media plane accepted the idea and refused the command. `error` carries its reason. */
+	"media-refused",
+	"shutting-down",
+	"internal",
+] as const;
+
+export const conferenceControlRefusalReasonSchema = z.enum(CONFERENCE_CONTROL_REFUSAL_REASONS);
+export type ConferenceControlRefusalReason = (typeof CONFERENCE_CONTROL_REFUSAL_REASONS)[number];
+
+/**
+ * What one moderation command did.
+ *
+ * It answers with the member's WHOLE state afterwards rather than an acknowledgement, for the
+ * reason `conference.participant.updated` carries the whole state: a moderation panel that applied
+ * a delta to a row it had drawn from a missed frame would show a mute button that disagrees with
+ * the mixer.
+ */
+export const conferenceControlResponseSchema = z.object({
+	ok: z.boolean(),
+	action: conferenceControlActionSchema,
+	/** The instance that answered. Always present, including on a refusal, for the caller's log. */
+	instanceId: z.string().min(1).max(128),
+	/** Members in the room, cluster-wide, after the command. */
+	memberCount: z.int().min(0).default(0),
+	/** Whether the room is admitting new participants. Present on every reply that found the room. */
+	locked: z.boolean().optional(),
+	/** The member acted on, echoed back, when the action named one. */
+	memberRef: z.string().max(128).optional(),
+	/** The member's state AFTER the command. Absent on a `kick` and on the room verbs. */
+	muted: z.boolean().optional(),
+	deafened: z.boolean().optional(),
+	moderator: z.boolean().optional(),
+	talkGainPercent: z.int().min(0).max(400).optional(),
+	listenGainPercent: z.int().min(0).max(400).optional(),
+	reason: conferenceControlRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type ConferenceControlRequest = z.infer<typeof conferenceControlRequestSchema>;
+export type ConferenceControlResponse = z.infer<typeof conferenceControlResponseSchema>;
+
+export const CONFERENCE_CONTROL_RPC = defineRpc(
+	RPC_SUBJECTS.engineConferenceControl,
+	conferenceControlRequestSchema,
+	conferenceControlResponseSchema,
+	// Two seconds. Everything on the far side is in memory except one media command, whose own
+	// budget is 500 ms — so this is that plus a claim write plus room to be wrong about the network,
+	// and past it the instance is not thinking, it is gone. The api tries the next contributor.
+	2_000,
+);
+
 /** Every request-reply contract, keyed by subject. */
 export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.routingResolve]: ROUTING_RESOLVE_RPC,
@@ -2401,8 +2816,11 @@ export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.mediaStopRecording]: MEDIA_STOP_RECORDING_RPC,
 	[RPC_SUBJECTS.mediaTapSession]: MEDIA_TAP_SESSION_RPC,
 	[RPC_SUBJECTS.mediaUntapSession]: MEDIA_UNTAP_SESSION_RPC,
+	[RPC_SUBJECTS.mediaMuteSession]: MEDIA_MUTE_SESSION_RPC,
+	[RPC_SUBJECTS.mediaHoldSession]: MEDIA_HOLD_SESSION_RPC,
 	[RPC_SUBJECTS.engineOriginate]: ORIGINATE_RPC,
 	[RPC_SUBJECTS.engineParkHandoff]: PARK_HANDOFF_RPC,
 	[RPC_SUBJECTS.engineSessionVerb]: SESSION_VERB_RPC,
+	[RPC_SUBJECTS.engineConferenceControl]: CONFERENCE_CONTROL_RPC,
 	[RPC_SUBJECTS.sessionAnnounce]: SESSION_ANNOUNCE_RPC,
 } as const;

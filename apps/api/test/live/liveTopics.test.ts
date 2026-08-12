@@ -128,7 +128,15 @@ describe("the permission mapping", () => {
 		expect(mayReadTopic(agent, { kind: "agent-state" })).to.equal(true);
 		expect(mayReadTopic(agent, { kind: "registrations" })).to.equal(false);
 		expect(mayReadTopic(agent, { kind: "active-calls" })).to.equal(false);
-		expect([...allowedTopicKinds(agent)].sort()).to.deep.equal(["agent-state", "queue"]);
+		// `conferences` joins the list, and that is the intended shape rather than a widening: an
+		// agent already holds `conferences.read` and can list the tenant's rooms over HTTP, so a live
+		// feed of which of them are running is the same page one field wider and sooner. Moderating
+		// one is a different grant they do not hold.
+		expect([...allowedTopicKinds(agent)].sort()).to.deep.equal([
+			"agent-state",
+			"conferences",
+			"queue",
+		]);
 	});
 
 	it("gives a manager everything, which is what a supervisor's wallboard needs", () => {

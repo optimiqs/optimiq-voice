@@ -247,6 +247,9 @@ export const EVENT_ENTRIES: readonly EventEntry[] = [
 	callEntry("channel.destroyed", "ChannelDestroyed"),
 	callEntry("conference.joined", "ConferenceJoined"),
 	callEntry("conference.left", "ConferenceLeft"),
+	callEntry("conference.participant.updated", "ConferenceParticipantUpdated"),
+	callEntry("conference.locked", "ConferenceLocked"),
+	callEntry("conference.unlocked", "ConferenceUnlocked"),
 	callEntry("call.parked", "CallParked"),
 	callEntry("call.unparked", "CallUnparked"),
 	callEntry("call.transferred", "CallTransferred"),
@@ -458,6 +461,23 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		request: RPC_CONTRACTS["rpc.media.v1.untap-session"].request,
 		response: RPC_CONTRACTS["rpc.media.v1.untap-session"].response,
 	},
+	// Rung 5's two state commands. Their Manager halves have existed and been tested since rung 5
+	// landed; what they had no way of reaching was the wire, so `MediadMediaPort` refused hold,
+	// unhold, mute, unmute and music-on-hold by name. These are the subjects that let it stop.
+	{
+		subject: "rpc.media.v1.mute-session",
+		goName: "MediaMuteSession",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.mute-session"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.mute-session"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.mute-session"].response,
+	},
+	{
+		subject: "rpc.media.v1.hold-session",
+		goName: "MediaHoldSession",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.hold-session"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.hold-session"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.hold-session"].response,
+	},
 	// Control plane to engine: click-to-call. No Go participant today either, and emitted for the
 	// same reason the entry below it is — the Go side reads the same taxonomy, and a subject the
 	// generated package does not name reads as a subject that does not exist.
@@ -488,6 +508,17 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		timeoutMs: RPC_CONTRACTS["rpc.engine.v1.session-verb"].timeoutMs,
 		request: RPC_CONTRACTS["rpc.engine.v1.session-verb"].request,
 		response: RPC_CONTRACTS["rpc.engine.v1.session-verb"].response,
+	},
+	// In-conference moderation, api to engine. A PREFIX like the two above it — the wire subject
+	// appends the token of an instance that has members in the room — and emitted for the same
+	// reason: the Go side reads the same taxonomy, and a subject the generated package does not
+	// name reads as a subject that does not exist.
+	{
+		subject: "rpc.engine.v1.conference-control",
+		goName: "ConferenceControl",
+		timeoutMs: RPC_CONTRACTS["rpc.engine.v1.conference-control"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.engine.v1.conference-control"].request,
+		response: RPC_CONTRACTS["rpc.engine.v1.conference-control"].response,
 	},
 	{
 		subject: "rpc.session.v1.announce",

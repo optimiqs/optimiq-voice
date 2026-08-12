@@ -38,9 +38,12 @@ import { createHash } from "node:crypto";
  * rpc.media.v1.stop-recording
  * rpc.media.v1.tap-session               engine -> mediad; supervision, as an asymmetric member
  * rpc.media.v1.untap-session
+ * rpc.media.v1.mute-session              engine -> mediad; one direction of one leg, gated
+ * rpc.media.v1.hold-session              engine -> mediad; out of the conversation, with music
  * rpc.engine.v1.originate                   api -> engine; ANY instance answers (queue group)
  * rpc.engine.v1.park-handoff.<instanceTok>   engine -> engine; the OWNING instance answers
  * rpc.engine.v1.session-verb.<instanceTok>   api -> engine; the instance that OWNS the leg answers
+ * rpc.engine.v1.conference-control.<instTok> api -> engine; the instance holding the MEMBER answers
  * rpc.session.v1.announce.<org>.<appTok>     engine -> api; the replica holding the app's socket
  * ```
  *
@@ -171,6 +174,21 @@ export const RPC_SUBJECTS = {
 	mediaTapSession: `rpc.media.${SUBJECT_VERSION}.tap-session`,
 	mediaUntapSession: `rpc.media.${SUBJECT_VERSION}.untap-session`,
 	/**
+	 * Rung 5's two state commands, and they are two rather than one on purpose.
+	 *
+	 * MUTE is a statement about ONE DIRECTION of one leg and is invisible in signalling — a
+	 * conference attendee who pressed `*6`, a paging group's members. HOLD is a statement about the
+	 * CONVERSATION: the held party is out of it in both directions and usually hears music. A leg
+	 * that was muted before it was held must still be muted when it is unheld, which is only
+	 * expressible if the two are independent commands over independent state.
+	 *
+	 * Both are keyed by `sessionId` alone rather than by a reference, unlike the playback and
+	 * recording pairs: there is exactly one hold state and one mute state per leg, so there is
+	 * nothing to disambiguate and nothing for the caller to remember.
+	 */
+	mediaMuteSession: `rpc.media.${SUBJECT_VERSION}.mute-session`,
+	mediaHoldSession: `rpc.media.${SUBJECT_VERSION}.hold-session`,
+	/**
 	 * Click-to-call: the control plane asking the call engine to place a call.
 	 *
 	 * FLAT, and served on a queue group — the opposite of the entry below it, which is the only
@@ -207,6 +225,26 @@ export const RPC_SUBJECTS = {
 	 * of truth for a fact the session was opened with.
 	 */
 	engineSessionVerb: `rpc.engine.${SUBJECT_VERSION}.session-verb`,
+	/**
+	 * In-conference moderation: the control plane muting, deafening, kicking or re-levelling ONE
+	 * member of a live room, or locking the room itself. A PREFIX, like the two above it.
+	 *
+	 * The reason it is instance-addressed is the same one the park handoff gives and is worth
+	 * restating in the conference's own terms: a room is JOINTLY held — `conference-claims` records
+	 * one contribution per engine instance with members in it — so "the conference" is not on any
+	 * one instance, but every MEMBER is, and only the instance holding a member's media channel can
+	 * mute it. There is no instance that could serve a command about somebody else's member.
+	 *
+	 * Where the address comes from is the one thing that differs from `session-verb`, which was told
+	 * the owning instance by the announcement that opened the session. Nothing announces a
+	 * conference to the control plane, so the api reads the room's `conference-claims` value and
+	 * addresses each unexpired CONTRIBUTOR in turn until one answers something other than
+	 * `unknown-member`. That is a fan-out bounded by the number of engine instances with members in
+	 * ONE room — one, in every deployment that is not mid-scale-out — on a path driven by an
+	 * operator clicking a button. Cheaper than the alternative, which is a second directory of
+	 * per-member ownership that would have to be written on every join and reaped on every crash.
+	 */
+	engineConferenceControl: `rpc.engine.${SUBJECT_VERSION}.conference-control`,
 	/**
 	 * The session protocol's other half: a call has reached an `application` destination, and the
 	 * engine is asking whoever holds that application's socket to take it.
@@ -255,6 +293,33 @@ export const CALL_EVENTS = [
 	"conference.joined",
 	/** A conference participant left. The pair bounds a participant's time in the room. */
 	"conference.left",
+	/**
+	 * A member's state inside the room changed — muted, deafened, re-levelled, or promoted.
+	 *
+	 * One event for four facts rather than four events, because they are all the same sentence with
+	 * a different field in it ("this member is now X") and a consumer renders them into one row.
+	 * The alternative — `conference.member.muted` and three siblings — would put four subjects on
+	 * the wire whose only consumer is a participant list that has to merge them back together.
+	 *
+	 * It carries the WHOLE state after the change, not the delta, for the reason every live
+	 * projection on this backbone carries whole values: a browser that missed one frame must not
+	 * end up with a row that says muted and a mixer that says otherwise.
+	 *
+	 * Not published for a member LEAVING, even though leaving changes their state: that is
+	 * `conference.left`, and publishing both would double-count a departure in every report.
+	 */
+	"conference.participant.updated",
+	/**
+	 * The room stopped admitting new participants. A moderator's decision, not a capacity limit.
+	 *
+	 * Distinct from a room at `maxMembers`, which is the same user-visible outcome for a completely
+	 * different reason: a full room admits the next caller the moment somebody leaves, and a locked
+	 * one does not admit anybody until it is unlocked. A consumer that could not tell them apart
+	 * would tell a caller to try again in a minute when the answer is "the meeting has started".
+	 */
+	"conference.locked",
+	/** The room is admitting participants again. Pairs with `conference.locked`. */
+	"conference.unlocked",
 	/**
 	 * A call was placed in a park lot's orbit slot.
 	 *
@@ -703,6 +768,14 @@ export const subjectFor = {
 		return `${RPC_SUBJECTS.engineSessionVerb}.${instanceSubjectToken(instanceId)}`;
 	},
 	/**
+	 * `rpc.engine.v1.conference-control.<instanceToken>` — addressed at an engine instance that has
+	 * members in the room. See {@link RPC_SUBJECTS.engineConferenceControl} for where the caller
+	 * learns which instances those are.
+	 */
+	engineConferenceControlRpc(instanceId: string): string {
+		return `${RPC_SUBJECTS.engineConferenceControl}.${instanceSubjectToken(instanceId)}`;
+	},
+	/**
 	 * `rpc.session.v1.announce.<orgId>.<applicationToken>` — the subject that IS the registration.
 	 *
 	 * Two variable tokens rather than one, and the ORGANIZATION comes first: an application name is
@@ -741,6 +814,20 @@ export const subjectFilterFor = {
 	/** One event name across every call of every org. */
 	callEvent(event: CallEvent | (string & {})): string {
 		return `${SUBJECT_ROOTS.call}.*.*.${assertEvent(event)}`;
+	},
+	/**
+	 * Every `conference.*` event of one org — the conference live topic's upstream.
+	 *
+	 * A PREFIX filter rather than one subject per event name, because the family is open at the
+	 * tail: `conference.participant.updated` is three tokens where `conference.joined` is two, and
+	 * `>` matches one or more. It is deliberately NOT `callsInOrg`, even though these are call
+	 * events and that filter would deliver them: a subscriber holding `conferences.read` and not
+	 * `cdr.read` must not be handed every channel transition in the tenant because the two families
+	 * share a root. Filtering at the SUBJECT means those bytes never leave the broker — the same
+	 * argument `voicemailEventInOrg` makes for keeping `message.left` off the MWI topic.
+	 */
+	conferenceEventsInOrg(orgId: string): string {
+		return `${SUBJECT_ROOTS.call}.${assertToken("orgId", orgId)}.*.conference.>`;
 	},
 
 	allRegistrations(): string {

@@ -227,7 +227,7 @@ function seedArtifact(): RoutingArtifact {
 			requiresPin: false,
 			maxMembers: 0,
 			waitForModerator: false,
-			recordEnabled: false,
+			recordPolicy: "none",
 		} as PlanNode,
 		{
 			id: `queue:${EMPTY_QUEUE_ID}`,

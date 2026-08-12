@@ -65,6 +65,7 @@ export const LIVE_TOPIC_KINDS = [
 	"agent-state",
 	"voicemail",
 	"trunks",
+	"conferences",
 ] as const;
 export type LiveTopicKind = (typeof LIVE_TOPIC_KINDS)[number];
 
@@ -75,6 +76,7 @@ export type LiveTopic =
 	| { readonly kind: "agent-state" }
 	| { readonly kind: "voicemail" }
 	| { readonly kind: "trunks" }
+	| { readonly kind: "conferences" }
 	| { readonly kind: "queue"; readonly queueId: string };
 
 export const LIVE_TOPIC_PERMISSIONS = {
@@ -84,6 +86,7 @@ export const LIVE_TOPIC_PERMISSIONS = {
 	"agent-state": "queues.monitor",
 	voicemail: "voicemail.read",
 	trunks: "trunks.read",
+	conferences: "conferences.read",
 } as const satisfies Record<LiveTopicKind, Permission>;
 
 /**
@@ -103,6 +106,8 @@ export const LIVE_SOURCES = [
 	"queue-events",
 	"voicemail-events",
 	"trunk-events",
+	"conference-claims-kv",
+	"conference-events",
 ] as const;
 export type LiveSource = (typeof LIVE_SOURCES)[number];
 
@@ -137,6 +142,26 @@ export const LIVE_TOPIC_SOURCES = {
 	 * was looking at it.
 	 */
 	trunks: ["trunk-events"],
+	/**
+	 * Two sources, on exactly the `active-calls` argument: a BUCKET says what IS and a STREAM says
+	 * what CHANGED, and a panel that had only the second would be blank until somebody moved.
+	 *
+	 * `conference-claims-kv` is the ROOMS. It is the value the engines already maintain to agree on a
+	 * room's bridge, and it happens to be a complete answer to "which meetings are running, how many
+	 * people are in each, has a moderator arrived, is it locked" — cluster-wide, because that is what
+	 * a claim is for. So a console opening mid-meeting gets a snapshot with no new writer anywhere.
+	 *
+	 * `conference-events` is the PARTICIPANTS. The claim deliberately does not name them (it is an
+	 * ownership record, and a member list in it would be written on every mute), so who is in the
+	 * room is assembled from `conference.joined` / `conference.left` and kept honest by
+	 * `conference.participant.updated`, which carries a member's whole state after every change.
+	 *
+	 * The cost is named rather than hidden: a console that connects mid-meeting sees the room and its
+	 * COUNT immediately and learns the participants as they move. Fixing that means a per-member
+	 * projection somebody has to write on every join and reap after every crash — see
+	 * `conference-control.client.ts` for why that price was not paid here either.
+	 */
+	conferences: ["conference-claims-kv", "conference-events"],
 } as const satisfies Record<LiveTopicKind, readonly LiveSource[]>;
 
 /** A UUID, which is what every queue id on this platform is (`packages/identifiers`). */
@@ -156,7 +181,8 @@ export function parseLiveTopic(value: string): LiveTopic | undefined {
 		value === "active-calls" ||
 		value === "agent-state" ||
 		value === "voicemail" ||
-		value === "trunks"
+		value === "trunks" ||
+		value === "conferences"
 	) {
 		return { kind: value };
 	}

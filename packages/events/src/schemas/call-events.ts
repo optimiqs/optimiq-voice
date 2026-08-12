@@ -148,6 +148,19 @@ export const conferenceJoinedDataSchema = z.object({
 	memberCount: z.int().min(1),
 });
 
+/**
+ * Why a participant left a room.
+ *
+ * `hung-up` is the ordinary end and covers every departure the participant chose. `kicked` is a
+ * moderator's decision and is the whole reason this field exists: a report that could not tell the
+ * two apart would show a meeting where four people left early and no evidence that somebody removed
+ * them. `room-ended` is the room going away underneath a member — the last moderator left a room
+ * that requires one, or the bridge was torn down.
+ */
+export const CONFERENCE_LEAVE_REASONS = ["hung-up", "kicked", "room-ended"] as const;
+export const conferenceLeaveReasonSchema = z.enum(CONFERENCE_LEAVE_REASONS);
+export type ConferenceLeaveReason = (typeof CONFERENCE_LEAVE_REASONS)[number];
+
 /** `conference.left` — the leg is out of the room. Paired with a `conference.joined`. */
 export const conferenceLeftDataSchema = z.object({
 	legId: z.uuid(),
@@ -158,6 +171,73 @@ export const conferenceLeftDataSchema = z.object({
 	/** Members remaining AFTER this one left. Zero means the bridge was torn down. */
 	memberCount: z.int().min(0),
 	durationMs: z.int().min(0).optional(),
+	/**
+	 * Why they left. OPTIONAL, and absent is read as `hung-up`: an artifact of a release that
+	 * predates moderation is not a room where everybody was kicked. See
+	 * {@link conferenceLeaveReasonSchema}.
+	 */
+	reason: conferenceLeaveReasonSchema.optional(),
+	/** The control-plane user who kicked them. Present only with `reason: "kicked"`. */
+	byUserId: z.uuid().optional(),
+});
+
+/**
+ * `conference.participant.updated` — a member's state inside the room changed.
+ *
+ * ## The whole state, every time
+ *
+ * Every mutable field is REQUIRED and carries the value AFTER the change, rather than the schema
+ * modelling a delta with one optional field set. A participant list is rebuilt from these, and a
+ * consumer that applied a delta to a row it had drawn from a frame it missed would show a mute
+ * button that disagrees with the mixer — which is the one failure a moderation panel cannot
+ * tolerate, because the operator's next action is based on what it says.
+ *
+ * ## Not published on join or leave
+ *
+ * Those are `conference.joined` and `conference.left`, which already carry the member. Publishing
+ * this alongside them would make every arrival two events and every departure two, and a consumer
+ * counting participants would have to know which of the pair to ignore.
+ */
+export const conferenceParticipantUpdatedDataSchema = z.object({
+	legId: z.uuid(),
+	conferenceId: z.uuid(),
+	roomNumber: dialStringSchema,
+	/** Whether the ROOM hears this member. */
+	muted: z.boolean(),
+	/** Whether this member hears the room. Independent of {@link muted}; both can be true. */
+	deafened: z.boolean(),
+	moderator: z.boolean(),
+	/**
+	 * The member's gain, in percent of unity, as the mixer is applying it.
+	 *
+	 * Percent for the reason `conferenceControlRequestSchema.gainPercent` gives, and REQUIRED
+	 * rather than optional-when-unchanged: 100 is a real, renderable answer ("this member is at
+	 * normal volume") and an absent field is not.
+	 *
+	 * On a media plane with no per-participant gain both stay at 100 forever, which is honest — the
+	 * mixer is applying unity because it can apply nothing else — and the refusal the operator sees
+	 * when they move the slider comes from the command, not from this event.
+	 */
+	talkGainPercent: z.int().min(0).max(400),
+	listenGainPercent: z.int().min(0).max(400),
+	/** The control-plane user who made the change. Absent when the member did it themselves (`*6`). */
+	byUserId: z.uuid().optional(),
+});
+
+/**
+ * `conference.locked` / `conference.unlocked` — the room stopped, or resumed, admitting people.
+ *
+ * `legId` is deliberately absent, unlike every other event on this root: a lock is a fact about the
+ * ROOM and the leg that happens to be publishing it is an implementation detail of which instance
+ * served the command. Carrying one would invite a consumer to attribute the lock to a participant.
+ */
+export const conferenceLockChangedDataSchema = z.object({
+	conferenceId: z.uuid(),
+	roomNumber: dialStringSchema,
+	/** Members in the room, cluster-wide, when the lock changed. */
+	memberCount: z.int().min(0),
+	/** The control-plane user who locked or unlocked it. */
+	byUserId: z.uuid().optional(),
 });
 
 /**
@@ -378,6 +458,17 @@ export const CALL_EVENT_DEFINITIONS = {
 	"channel.destroyed": defineEvent("call", "channel.destroyed", channelDestroyedDataSchema),
 	"conference.joined": defineEvent("call", "conference.joined", conferenceJoinedDataSchema),
 	"conference.left": defineEvent("call", "conference.left", conferenceLeftDataSchema),
+	"conference.participant.updated": defineEvent(
+		"call",
+		"conference.participant.updated",
+		conferenceParticipantUpdatedDataSchema,
+	),
+	"conference.locked": defineEvent("call", "conference.locked", conferenceLockChangedDataSchema),
+	"conference.unlocked": defineEvent(
+		"call",
+		"conference.unlocked",
+		conferenceLockChangedDataSchema,
+	),
 	"call.parked": defineEvent("call", "call.parked", callParkedDataSchema),
 	"call.unparked": defineEvent("call", "call.unparked", callUnparkedDataSchema),
 	"call.transferred": defineEvent("call", "call.transferred", callTransferredDataSchema),
@@ -421,6 +512,9 @@ export const callEventSchema = z.discriminatedUnion("type", [
 	CALL_EVENT_DEFINITIONS["channel.destroyed"].envelope,
 	CALL_EVENT_DEFINITIONS["conference.joined"].envelope,
 	CALL_EVENT_DEFINITIONS["conference.left"].envelope,
+	CALL_EVENT_DEFINITIONS["conference.participant.updated"].envelope,
+	CALL_EVENT_DEFINITIONS["conference.locked"].envelope,
+	CALL_EVENT_DEFINITIONS["conference.unlocked"].envelope,
 	CALL_EVENT_DEFINITIONS["call.parked"].envelope,
 	CALL_EVENT_DEFINITIONS["call.unparked"].envelope,
 	CALL_EVENT_DEFINITIONS["call.transferred"].envelope,

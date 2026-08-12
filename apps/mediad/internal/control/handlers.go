@@ -201,7 +201,36 @@ func (s *Server) refuseAllocate(sessionID, reason, message string) []byte {
 	})
 }
 
-// HandleBridgeSessions starts a bidirectional relay between two sessions.
+// maxBridgeSessions mirrors `MEDIA_BRIDGE_MAX_SESSIONS` in packages/events.
+//
+// Restated rather than imported because the emitter turns a `.max(n)` into a validation rule and not
+// into a Go constant, so this is the one number on this surface that has to be kept honest by hand.
+// It is a CAPACITY decision, not a protocol one: the mixer sums every member's decoded audio once
+// per member per frame, fifty times a second, so the cost is quadratic in the room. See the contract
+// for why raising it needs a different algorithm rather than a bigger constant.
+const maxBridgeSessions = 8
+
+// HandleBridgeSessions puts two or more sessions in one conversation.
+//
+// # Two is a relay, three is a room, and the caller does not say which
+//
+// This handler refused anything but a pair for four rungs, and the refusal named rung 6 by name.
+// Rung 6 arrived: `internal/rtp/conference.go` is the mixer, and `tap-session` has been converting
+// two-party bridges into rooms since it landed. What was missing was any way for the ENGINE to ask
+// for a room directly — a conference bridge went through this subject, got the rung-6 refusal, and
+// the whole feature routed to Asterisk while a working mixer sat one function call away.
+//
+// So the arrangement is decided here, from the count, and the reason that is the media plane's
+// decision rather than the caller's is the same reason `createBridge` needs no round trip: which
+// mechanism carries two parties' audio is a property of this process, and an engine that had to name
+// it would be holding an opinion about a mixer it cannot see.
+//
+// # Why a room is built with everybody or nobody
+//
+// A half-converted room is the one state that must not survive: some members mixing and some
+// relaying is a call where one party can hear and another cannot, which reads as a network fault and
+// is not one. So a join that fails takes the whole room down and the command is refused — exactly
+// what `conversationFor` does when it converts a relay for a tap.
 func (s *Server) HandleBridgeSessions(data []byte) []byte {
 	var request contract.MediaBridgeSessionsRequest
 	if err := json.Unmarshal(data, &request); err != nil {
@@ -210,14 +239,24 @@ func (s *Server) HandleBridgeSessions(data []byte) []byte {
 	if request.BridgeID == "" {
 		return s.refuseBridge("", ReasonBadRequest, "bridgeId is required")
 	}
-	if len(request.SessionIDs) != 2 {
-		// The contract already says `.length(2)`, so this only fires for a caller that bypassed it.
-		// Refused by name rather than truncated, because a three-session bridge is a CONFERENCE and
-		// silently relaying the first two would put the third participant in a room they cannot
-		// hear — the exact failure the ladder's rung 6 exists to do properly.
+	switch {
+	case len(request.SessionIDs) < 2:
+		// A conversation of one is not a conversation. The contract says `.min(2)`, so this fires
+		// only for a caller that bypassed it.
+		return s.refuseBridge(request.BridgeID, ReasonBadRequest,
+			fmt.Sprintf("a conversation needs at least two sessions, got %d", len(request.SessionIDs)))
+	case len(request.SessionIDs) > maxBridgeSessions:
+		// `not_supported` and not `bad_request`, because the engine's recovery is the one every
+		// capability gap gets: route this room to Asterisk, whose mixing bridge has no such ceiling.
+		// A retry of the same bytes here fails the same way.
 		return s.refuseBridge(request.BridgeID, ReasonNotSupported,
-			fmt.Sprintf("a bridge relays exactly two sessions, got %d; N-way mixing is rung 6 of the mediad capability ladder",
-				len(request.SessionIDs)))
+			fmt.Sprintf("this mixer holds %d members and %d were asked for; a larger room needs a "+
+				"running-sum mixer rather than a larger constant",
+				maxBridgeSessions, len(request.SessionIDs)))
+	}
+
+	if len(request.SessionIDs) > 2 {
+		return s.bridgeAsConference(request)
 	}
 
 	err := s.sessions.Bridge(request.BridgeID, request.SessionIDs[0], request.SessionIDs[1])
@@ -243,6 +282,62 @@ func (s *Server) HandleBridgeSessions(data []byte) []byte {
 		Ok:         true,
 		BridgeID:   request.BridgeID,
 		SessionIDs: request.SessionIDs,
+		InstanceID: stringPtr(s.instanceID),
+	})
+}
+
+// bridgeAsConference seats three or more sessions in one room under the bridge's own id.
+//
+// The room takes the BRIDGE's id for the reason a tap-converted one does: the engine tears down what
+// it created, under the name it created it with, and a room that renamed itself on the way in would
+// leave an `unbridge-sessions` naming nothing.
+//
+// Every member is a plain participant — hears everyone, is heard by everyone — because that is what
+// a bridge means. Asymmetric membership is what `tap-session` is for, and a bridge that could
+// express it would be two ways to say one thing that could disagree.
+func (s *Server) bridgeAsConference(request contract.MediaBridgeSessionsRequest) []byte {
+	joined := make([]string, 0, len(request.SessionIDs))
+	for _, sessionID := range request.SessionIDs {
+		err := s.sessions.JoinConference(request.BridgeID, sessionID, rtp.JoinOptions{
+			Hear:    rtp.Everyone(),
+			SpeakTo: rtp.Everyone(),
+		})
+		if err == nil {
+			joined = append(joined, sessionID)
+			continue
+		}
+
+		// Everything goes back. See the note on the handler above: a partially built room is worse
+		// than no room, because it sounds like a network fault to the members who did make it in.
+		s.sessions.DestroyConference(request.BridgeID)
+
+		reason := ReasonBadRequest
+		switch {
+		case errors.Is(err, rtp.ErrUnknownSession):
+			reason = s.locateRefusal(request.SessionIDs)
+		case errors.Is(err, rtp.ErrConferenceCodec), errors.Is(err, rtp.ErrCannotTranscode):
+			// A leg whose codec cannot be decoded cannot be in a mix. `not_supported` with the codec
+			// named, which the engine answers by routing this room to Asterisk.
+			reason = ReasonNotSupported
+		case errors.Is(err, rtp.ErrClosed):
+			reason = ReasonShuttingDown
+		}
+		s.log.Warn("refusing a conference bridge",
+			"bridgeId", request.BridgeID, "sessionIds", request.SessionIDs,
+			"seated", len(joined), "reason", reason, "error", err)
+		return s.refuseBridge(request.BridgeID, reason, err.Error())
+	}
+
+	// The room is stamped onto every member's directory entry, reusing the BRIDGE field exactly as a
+	// tap-converted room does: a conference keeps the bridge's id, and a second field for "the room
+	// this is in" would be two names for one fact that could disagree.
+	s.noteBridge(request.BridgeID, request.SessionIDs)
+
+	return encode(s.log, contract.MediaBridgeSessionsResponse{
+		Ok:         true,
+		BridgeID:   request.BridgeID,
+		SessionIDs: joined,
+		Mixed:      true,
 		InstanceID: stringPtr(s.instanceID),
 	})
 }

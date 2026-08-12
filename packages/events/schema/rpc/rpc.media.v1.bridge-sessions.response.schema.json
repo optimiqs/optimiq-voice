@@ -12,12 +12,16 @@
 		},
 		"sessionIds": {
 			"default": [],
-			"maxItems": 2,
+			"maxItems": 8,
 			"type": "array",
 			"items": {
 				"type": "string",
 				"maxLength": 128
 			}
+		},
+		"mixed": {
+			"default": false,
+			"type": "boolean"
 		},
 		"instanceId": {
 			"type": "string",
@@ -41,6 +45,6 @@
 			"maxLength": 512
 		}
 	},
-	"required": ["ok", "bridgeId", "sessionIds"],
+	"required": ["ok", "bridgeId", "sessionIds", "mixed"],
 	"additionalProperties": false
 }

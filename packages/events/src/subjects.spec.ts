@@ -69,9 +69,12 @@ describe("subject roots", () => {
 			mediaStopRecording: "rpc.media.v1.stop-recording",
 			mediaTapSession: "rpc.media.v1.tap-session",
 			mediaUntapSession: "rpc.media.v1.untap-session",
+			mediaMuteSession: "rpc.media.v1.mute-session",
+			mediaHoldSession: "rpc.media.v1.hold-session",
 			engineOriginate: "rpc.engine.v1.originate",
 			engineParkHandoff: "rpc.engine.v1.park-handoff",
 			engineSessionVerb: "rpc.engine.v1.session-verb",
+			engineConferenceControl: "rpc.engine.v1.conference-control",
 			sessionAnnounce: "rpc.session.v1.announce",
 		});
 	});
@@ -227,6 +230,51 @@ describe("subjectFor.engineSessionVerbRpc", () => {
 		expect(
 			matchesSubject(`${RPC_SUBJECTS.engineSessionVerb}.*`, subjectFor.engineSessionVerbRpc(id)),
 		).toBe(true);
+	});
+});
+
+describe("subjectFor.engineConferenceControlRpc", () => {
+	it("addresses an instance that holds members of the room", () => {
+		expect(subjectFor.engineConferenceControlRpc("engine-2")).toBe(
+			"rpc.engine.v1.conference-control.engine-2",
+		);
+	});
+
+	it("uses the SAME token the other two instance-addressed subjects do", () => {
+		const id = "engine.eu-west.internal";
+		expect(subjectFor.engineConferenceControlRpc(id)).toBe(
+			`${RPC_SUBJECTS.engineConferenceControl}.${instanceSubjectToken(id)}`,
+		);
+		expect(
+			matchesSubject(
+				`${RPC_SUBJECTS.engineConferenceControl}.*`,
+				subjectFor.engineConferenceControlRpc(id),
+			),
+		).toBe(true);
+	});
+});
+
+describe("subjectFilterFor.conferenceEventsInOrg", () => {
+	it("matches every conference event, whatever its token depth", () => {
+		const filter = subjectFilterFor.conferenceEventsInOrg(ORG);
+		expect(filter).toBe(`calls.evt.v1.${ORG}.*.conference.>`);
+		for (const event of ["conference.joined", "conference.participant.updated"] as const) {
+			expect(matchesSubject(filter, subjectFor.call(ORG, CALL, event))).toBe(true);
+		}
+	});
+
+	it("does NOT match the channel events on the same root", () => {
+		// The whole reason it is a narrower filter than `callsInOrg`: a subscriber holding
+		// `conferences.read` and not `cdr.read` must not be handed every channel transition.
+		const filter = subjectFilterFor.conferenceEventsInOrg(ORG);
+		for (const event of ["channel.answered", "call.parked"] as const) {
+			expect(matchesSubject(filter, subjectFor.call(ORG, CALL, event))).toBe(false);
+		}
+	});
+
+	it("does not cross tenants", () => {
+		const filter = subjectFilterFor.conferenceEventsInOrg(ORG);
+		expect(matchesSubject(filter, subjectFor.call(QUEUE, CALL, "conference.joined"))).toBe(false);
 	});
 });
 
@@ -532,6 +580,9 @@ describe("event-name guards", () => {
 			// sees them. See README's evolution rules.
 			"conference.joined",
 			"conference.left",
+			"conference.participant.updated",
+			"conference.locked",
+			"conference.unlocked",
 			"call.parked",
 			"call.unparked",
 			"call.transferred",

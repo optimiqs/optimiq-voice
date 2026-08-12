@@ -297,7 +297,7 @@ export function aConference(overrides: Partial<ConferenceInput> = {}): Conferenc
 		requiresPin: false,
 		maxMembers: 50,
 		waitForModerator: false,
-		recordEnabled: false,
+		recordPolicy: "none",
 		...overrides,
 	};
 }

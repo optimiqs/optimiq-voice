@@ -380,3 +380,61 @@ func TestDtmfReceivedSkipsASessionWithNoOrg(t *testing.T) {
 		t.Error("an event was published on a subject with no org token")
 	}
 }
+
+func TestSessionEndedCarriesWhatRTCPKnew(t *testing.T) {
+	// `SessionSummary.Quality` recorded a CONTRACT GAP rather than a decision: the numbers have been
+	// measured, tested and available since rung 7, and `session.ended` had no field for any of them,
+	// so a mediad that knew exactly why a call sounded bad had nowhere to say so.
+	announcer, publisher, _ := newAnnouncer(t)
+	ended := summary()
+	ended.Quality = rtp.QualityStats{
+		InboundJitterMs:      12.5,
+		ReportedLossFraction: 0.25,
+		ReportedLossTotal:    340,
+		ReportedJitterMs:     31,
+		RoundTripMs:          88,
+		ReportsReceived:      7,
+		ReportsSent:          8,
+		Malformed:            2,
+		LastReportUnixMs:     1_700_000_000_000,
+	}
+
+	announcer.SessionEnded(ended, rtp.EndReasonReleased)
+	waitFor(t, "the session.ended event", func() bool {
+		return len(publisher.EndedEvents()) == 1
+	})
+
+	quality := publisher.EndedEvents()[0].Data.Quality
+	if quality == nil {
+		t.Fatal("session.ended carried no quality block")
+	}
+	// The two halves must not be confused: inbound jitter is measured HERE and describes the network
+	// on the way in; everything else is what the FAR END reported about the stream we sent it. A leg
+	// with clean inbound jitter and 25% reported loss is one whose user can hear us and cannot be
+	// heard, which is a different fault from the reverse.
+	if quality.InboundJitterMs != 12.5 || quality.ReportedLossFraction != 0.25 {
+		t.Errorf("quality = %+v", *quality)
+	}
+	if quality.ReportsReceived != 7 || quality.RoundTripMs != 88 {
+		t.Errorf("quality = %+v", *quality)
+	}
+}
+
+func TestSessionEndedSendsQualityEvenWhenTheEndpointSentNoRTCP(t *testing.T) {
+	// All-zeroes is a fact about the ENDPOINT — it sends no RTCP — and is different from the field
+	// being absent, which is what a media plane with no RTCP at all produces. Eliding the object on
+	// zeroes would collapse those two into one and leave a reader unable to tell them apart.
+	announcer, publisher, _ := newAnnouncer(t)
+	announcer.SessionEnded(summary(), rtp.EndReasonReleased)
+	waitFor(t, "the session.ended event", func() bool {
+		return len(publisher.EndedEvents()) == 1
+	})
+
+	quality := publisher.EndedEvents()[0].Data.Quality
+	if quality == nil {
+		t.Fatal("session.ended elided the quality block on an endpoint that sent no RTCP")
+	}
+	if quality.ReportsReceived != 0 {
+		t.Errorf("reportsReceived = %d, want 0", quality.ReportsReceived)
+	}
+}

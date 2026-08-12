@@ -88,6 +88,78 @@ export const mediaSessionEndReasonSchema = z.enum(MEDIA_SESSION_END_REASONS);
 export type MediaSessionEndReason = (typeof MEDIA_SESSION_END_REASONS)[number];
 
 /**
+ * What RTCP knew about a leg when it ended.
+ *
+ * ## Two halves, and confusing them is the mistake this shape exists to prevent
+ *
+ * {@link inboundJitterMs} is measured HERE, from the packets that arrived, and describes the
+ * network on the way IN. Everything else is what the FAR END reported about the stream we sent IT,
+ * and describes the network on the way OUT. A leg with clean inbound jitter and twenty percent
+ * reported loss is a leg whose user can hear us and cannot be heard — a completely different fault
+ * from the reverse, and indistinguishable without both numbers. A single "quality score" would
+ * average the two into a value that identifies neither.
+ *
+ * ## Optional, whole, and only on `session.ended`
+ *
+ * OPTIONAL because a media plane that does not speak RTCP has nothing to say and must not be made
+ * to say zero: `reportsReceived: 0` is a fact about the endpoint (it sends no RTCP) rather than
+ * about the call, and it is carried inside the object so a reader can tell "nobody reported" from
+ * "the field is absent because this driver has no RTCP at all". The ARI driver is the second case.
+ *
+ * WHOLE — one nested object rather than nine sibling fields — because the whole point is that the
+ * nine numbers are only meaningful together, and because a reader branches on the object's presence
+ * once instead of on nine optionals.
+ *
+ * On `session.ended` and not on `rtp-timeout`, even though a timeout is exactly when somebody wants
+ * these: the timeout event is followed immediately by an `ended` carrying the same session id, so
+ * putting them on both would be two copies of one measurement that a lost publish could make
+ * disagree.
+ *
+ * The computation has existed and been tested in `apps/mediad/internal/rtp/rtcp.go` since rung 7;
+ * what it did not have was anywhere to say so, which `SessionSummary.Quality` records as "a
+ * contract gap rather than a decision". This is the gap closing.
+ */
+export const mediaQualityStatsSchema = z.object({
+	/** Interarrival jitter of the stream we RECEIVE — RFC 3550 §6.4.1's J, in milliseconds. */
+	inboundJitterMs: z.number().min(0),
+	/**
+	 * The fraction of OUR packets the far end lost since its last report, 0.0–1.0.
+	 *
+	 * A fraction and not a percentage because that is what the protocol carries: an eight-bit field
+	 * divided by 256, which is the whole resolution there is. Multiplying by a hundred here would
+	 * imply a precision the wire does not have.
+	 */
+	reportedLossFraction: z.number().min(0).max(1),
+	/** Cumulative count of our packets the far end has ever reported losing. */
+	reportedLossTotal: z.int().min(0),
+	/** The far end's own jitter measurement of the stream we sent it. */
+	reportedJitterMs: z.number().min(0),
+	/**
+	 * Round trip, from the receiver report's LSR and DLSR.
+	 *
+	 * Zero means "not yet computable" rather than "zero milliseconds": it needs a receiver report
+	 * that quotes a sender report we actually sent, which takes one report interval after the first
+	 * packet. A call shorter than that interval legitimately has none.
+	 */
+	roundTripMs: z.number().min(0),
+	/**
+	 * How many receiver reports were parsed — the number that says whether anything above means
+	 * anything at all. Zero with a long duration is an endpoint that sends no RTCP.
+	 */
+	reportsReceived: z.int().min(0),
+	reportsSent: z.int().min(0),
+	/**
+	 * RTCP datagrams that could not be parsed. An open UDP port on the internet receives anything,
+	 * so this is counted rather than logged — exactly as RTP's malformed counter is.
+	 */
+	malformed: z.int().min(0),
+	/** When the last receiver report arrived. Epoch milliseconds; zero when none ever did. */
+	lastReportUnixMs: z.int().min(0),
+});
+
+export type MediaQualityStats = z.infer<typeof mediaQualityStatsSchema>;
+
+/**
  * `session.ended` — the RTP session is gone and its port is back in the pool.
  *
  * The engine treats a non-`released` reason as a media failure on a leg it still believes is up,
@@ -102,6 +174,11 @@ export const mediaSessionEndedDataSchema = z.object({
 	durationMs: z.int().min(0),
 	/** Free text for the `error` reason, and for anything an operator would want in a log line. */
 	detail: z.string().max(512).optional(),
+	/**
+	 * What RTCP knew about the leg. Absent on a media plane with no RTCP — see
+	 * {@link mediaQualityStatsSchema} for why absent and all-zero are different answers.
+	 */
+	quality: mediaQualityStatsSchema.optional(),
 });
 
 /**

@@ -68,6 +68,14 @@ const (
 	// that "the rung-6 mixer serves this contract by ARRIVING, not by being extended". It arrived.
 	SubjectTapSession   = contract.SubjectMediaTapSessionRPC
 	SubjectUntapSession = contract.SubjectMediaUntapSessionRPC
+	// Rung 5's state pair, arriving on the wire two rungs after the packet path learned to serve
+	// them. `internal/rtp/hold.go` has held the gates and the music loop since rung 5 and had no
+	// subject to be reached through, so `MediadMediaPort` refused hold, unhold, mute, unmute and
+	// music-on-hold by NAME — five capabilities that existed and were unreachable. These are the
+	// two subjects that close that, and there are two rather than four because a mute and an unmute
+	// differ in one bit of one payload where a bridge and an unbridge differ in their whole shape.
+	SubjectMuteSession = contract.SubjectMediaMuteSessionRPC
+	SubjectHoldSession = contract.SubjectMediaHoldSessionRPC
 )
 
 // Refusal codes. Values come from the contract; these names exist so a handler reads as prose.
@@ -124,6 +132,28 @@ type Sessions interface {
 	// Tap joins a supervisor to a conversation on asymmetric terms, and Untap takes it down. Rung 6.
 	Tap(opts rtp.TapOptions) (rtp.TapResult, error)
 	Untap(tapID string) (string, bool)
+
+	// Rung 5's state pair. Mute gates one direction of one leg; Hold takes a leg out of the
+	// conversation in both directions and, usually, gives it something to listen to.
+	//
+	// The two READERS beside them are not decoration. A mute is ADDITIVE, so the state after a
+	// command is not derivable from the command, and a hold STANDS even when its music could not
+	// start — so both replies have to be read back rather than inferred. See rtp.Manager.MuteState.
+	Mute(sessionID string, direction rtp.MediaDirection) error
+	Unmute(sessionID string, direction rtp.MediaDirection) error
+	MuteState(sessionID string) (in, out, ok bool)
+	Hold(sessionID string, opts rtp.HoldOptions) error
+	Unhold(sessionID string) (bool, error)
+	HoldState(sessionID string) (held bool, musicRef string, ok bool)
+
+	// Rung 6's room, reached DIRECTLY rather than as a side effect of a tap.
+	//
+	// `bridge-sessions` used to mean "relay two legs" and now means "put these legs in one
+	// conversation", which is a mix once there are three. Until this the only wire path into a
+	// Conference was `tap-session` converting a two-party bridge, so a conference bridge the engine
+	// asked for was refused by name — the capability existed and only supervision could reach it.
+	JoinConference(conferenceID, sessionID string, opts rtp.JoinOptions) error
+	DestroyConference(conferenceID string) ([]string, bool)
 }
 
 // Server answers the v1 command subjects.
@@ -218,6 +248,8 @@ func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscrip
 		{SubjectStopRecording, s.HandleStopRecording},
 		{SubjectTapSession, s.HandleTapSession},
 		{SubjectUntapSession, s.HandleUntapSession},
+		{SubjectMuteSession, s.HandleMuteSession},
+		{SubjectHoldSession, s.HandleHoldSession},
 	}
 
 	subscriptions := make([]*nats.Subscription, 0, len(handlers))

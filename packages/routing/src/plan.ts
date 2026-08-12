@@ -417,7 +417,24 @@ export interface ConferencePlanNode extends PlanNodeBase {
 	readonly requiresPin: boolean;
 	readonly maxMembers: number;
 	readonly waitForModerator: boolean;
-	readonly recordEnabled: boolean;
+	/**
+	 * How much of the room is captured. `none` when the tenant asked for nothing, which is what the
+	 * `recordEnabled: false` this replaced always meant.
+	 *
+	 * Required and defaulted at compile time rather than optional, because the walker BRANCHES on it
+	 * and an absent field would make "the tenant asked for no recording" and "this artifact predates
+	 * the column" the same value at the one place the difference is a compliance question.
+	 */
+	readonly recordPolicy: RecordPolicy;
+	/**
+	 * Beep the room on a join and on a leave. Absent means TRUE — see the note on
+	 * `ConferenceInput.entryToneEnabled` for why the default is a privacy position — so the compiler
+	 * emits these only when they are switched OFF, which is what `compact()` produces anyway.
+	 */
+	readonly entryToneEnabled?: boolean;
+	readonly exitToneEnabled?: boolean;
+	/** Play each arrival's recorded name. Absent means TRUE, exactly like the two tones above. */
+	readonly announceJoinLeave?: boolean;
 	readonly mohClassId?: string;
 	/** The class's NAME, resolved from `mohClassId`. Absent means "the media server's default". */
 	readonly mohClass?: string;

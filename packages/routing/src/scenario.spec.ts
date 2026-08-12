@@ -272,7 +272,7 @@ const ACME: OrgRoutingSnapshot = {
 			requiresPin: true,
 			maxMembers: 20,
 			waitForModerator: true,
-			recordEnabled: false,
+			recordPolicy: "none",
 		},
 	],
 	parkLots: [

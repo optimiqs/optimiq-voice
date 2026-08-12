@@ -17,6 +17,10 @@
 			"minLength": 1,
 			"maxLength": 128
 		},
+		"targetSide": {
+			"type": "string",
+			"enum": ["a", "b"]
+		},
 		"hear": {
 			"default": "both",
 			"type": "string",

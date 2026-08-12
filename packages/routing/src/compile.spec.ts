@@ -35,6 +35,7 @@ import { planNodeReferences } from "./plan";
 import { emptySnapshot } from "./snapshot";
 import type { RoutingArtifact } from "./artifact";
 import type {
+	ConferencePlanNode,
 	ExtensionPlanNode,
 	IvrMenuPlanNode,
 	PagingPlanNode,
@@ -1681,5 +1682,72 @@ describe("compile — queue contact-centre settings", () => {
 		);
 		expect(queueOf(artifact).abandonedResumeAllowed).toBe(true);
 		expect(queueOf(artifact).discardAbandonedAfterSeconds).toBe(120);
+	});
+});
+
+/**
+ * The conference-depth block.
+ *
+ * Every assertion here is about a field REACHING the node, because the failure this whole layer has
+ * is silent: a column the loader does not map produces an identical `snapshotHash`, so the artifact
+ * never changes and the engine never learns the tenant configured anything.
+ */
+describe("compile — conference depth", () => {
+	function conferenceOf(artifact: RoutingArtifact, id = "conference:conf-1"): ConferencePlanNode {
+		return artifact.nodes[id] as ConferencePlanNode;
+	}
+
+	it("carries the record policy, replacing the boolean the walker read by nothing", () => {
+		const artifact = compiled(aSnapshot({ conferences: [aConference({ recordPolicy: "all" })] }));
+		expect(conferenceOf(artifact).recordPolicy).toBe("all");
+		expect(artifact.nodes["conference:conf-1"]).not.toHaveProperty("recordEnabled");
+	});
+
+	it("defaults a room whose loader has not been taught the column to recording nothing", () => {
+		const artifact = compiled(
+			aSnapshot({ conferences: [aConference({ recordPolicy: undefined })] }),
+		);
+		// `none` and not absent: the walker branches on this, and "the tenant asked for no recording"
+		// must not be the same value as "this artifact predates the column".
+		expect(conferenceOf(artifact).recordPolicy).toBe("none");
+	});
+
+	/**
+	 * The tones default ON at every layer, so the artifact carries them only when they are OFF. That
+	 * is `compact()` dropping a `true` and the reader defaulting an absent field to `true` — the same
+	 * statement made twice, which is what makes an old artifact safe.
+	 */
+	it("emits the tone flags only when a tenant switched them off", () => {
+		const on = compiled(aSnapshot({ conferences: [aConference()] }));
+		expect(on.nodes["conference:conf-1"]).not.toHaveProperty("entryToneEnabled");
+		expect(on.nodes["conference:conf-1"]).not.toHaveProperty("exitToneEnabled");
+
+		const off = compiled(
+			aSnapshot({
+				conferences: [aConference({ entryToneEnabled: false, exitToneEnabled: false })],
+			}),
+		);
+		expect(conferenceOf(off).entryToneEnabled).toBe(false);
+		expect(conferenceOf(off).exitToneEnabled).toBe(false);
+	});
+
+	it("compiles the name announcement, which until now was written by an API and read by nothing", () => {
+		const artifact = compiled(
+			aSnapshot({ conferences: [aConference({ announceJoinLeave: false })] }),
+		);
+		expect(conferenceOf(artifact).announceJoinLeave).toBe(false);
+	});
+
+	/**
+	 * The point of the whole layer, stated as a test: two rooms that differ only in a field the
+	 * loader carries must compile to different artifacts. Before these columns were mapped, toggling
+	 * `announce_join_leave` produced a byte-identical artifact and the engine was never told.
+	 */
+	it("changes the artifact when a depth flag changes", () => {
+		const on = canonicalJson(compiled(aSnapshot({ conferences: [aConference()] })));
+		const off = canonicalJson(
+			compiled(aSnapshot({ conferences: [aConference({ entryToneEnabled: false })] })),
+		);
+		expect(on).not.toBe(off);
 	});
 });

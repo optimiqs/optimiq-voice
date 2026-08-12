@@ -310,6 +310,39 @@ func (m *Manager) Unmute(sessionID string, direction MediaDirection) error {
 	return nil
 }
 
+// MuteState reports a live session's two suppression gates.
+//
+// A VALUE and not the *Session it came from, exactly as AudioPayloadType is and for the reason
+// control.Sessions gives: the control surface needs one fact in order to answer, and handing a NATS
+// callback a live session would put the packet path's internals inside it.
+//
+// It exists because the reply to `mute-session` carries the state AFTER the command and a mute is
+// ADDITIVE — muting `in` on a leg already muted `out` leaves both set — so the handler cannot derive
+// the answer from the request it was given. Deriving it anyway is how a moderation panel ends up
+// showing a microphone that is on and a mixer that disagrees.
+func (m *Manager) MuteState(sessionID string) (in, out, ok bool) {
+	session, err := m.liveSession(sessionID)
+	if err != nil {
+		return false, false, false
+	}
+	mutedIn, mutedOut := session.Muted()
+	return mutedIn, mutedOut, true
+}
+
+// HoldState reports whether a live session is held and what its music, if any, is playing under.
+//
+// The music reference is the honest half. A hold STANDS even when its music could not start (see
+// Session.Hold), so "held with a ref" and "held in silence because the leg had not sent a packet
+// yet" are two different outcomes of one accepted command, and the reply is the only place the
+// engine can learn which one it got.
+func (m *Manager) HoldState(sessionID string) (held bool, musicRef string, ok bool) {
+	session, err := m.liveSession(sessionID)
+	if err != nil {
+		return false, "", false
+	}
+	return session.Held(), session.HoldMusicRef(), true
+}
+
 // StartMusicOnHold plays a loop at a session WITHOUT taking it out of the conversation.
 //
 // Separate from Hold, and the separation is `MediaPort`'s rather than this file's invention:

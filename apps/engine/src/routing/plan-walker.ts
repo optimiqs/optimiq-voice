@@ -416,6 +416,37 @@ export interface PlanWalkerSettings {
 	readonly conferencePinInterDigitTimeoutMs: number;
 	/** Played when a room is at `maxMembers`. */
 	readonly conferenceFullAnnouncement: string;
+	/**
+	 * Played when a moderator has LOCKED the room.
+	 *
+	 * A different prompt from {@link conferenceFullAnnouncement}, and a different sound file, because
+	 * they ask the caller to do opposite things: a full room admits them the moment somebody leaves,
+	 * and a locked one does not admit them until the meeting is over. `conf-locked` is Asterisk's own
+	 * word for exactly this state, which is why the FULL announcement is the one that had to move —
+	 * it was borrowing this prompt while there was nothing to lock.
+	 */
+	readonly conferenceLockedAnnouncement: string;
+	/**
+	 * Beeped INTO the room when a participant joins, and its partner when one leaves.
+	 *
+	 * `tone:` and not `sound:`, and that is the whole reason these can be defaulted at all: a tone is
+	 * GENERATED, so a stock deployment with no prompt pack still beeps. `mediad` synthesises it and
+	 * Asterisk has a tone zone; neither needs a file mounted.
+	 */
+	readonly conferenceEntryTone: string;
+	readonly conferenceExitTone: string;
+	/**
+	 * Played to the room around a name announcement, when `announceJoinLeave` is on.
+	 *
+	 * The NAME itself is not here, and its absence is the honest half of this feature: announcing who
+	 * joined needs a recording of the participant saying their name, which needs a record-and-hold
+	 * step at the gate and a place to keep the clip for the life of the room. This release plays the
+	 * generic form — "someone has joined the conference" — which is what every stock prompt package
+	 * ships and what an operator can act on. The per-participant recording is named as the seam in
+	 * `conferenceNode`.
+	 */
+	readonly conferenceJoinAnnouncement: string;
+	readonly conferenceLeaveAnnouncement: string;
 	/** How long a participant holds for a moderator before the call is given up on. */
 	readonly conferenceModeratorWaitMs: number;
 	/**
@@ -527,7 +558,19 @@ export const DEFAULT_PLAN_WALKER_SETTINGS: PlanWalkerSettings = {
 	conferencePinMaxDigits: 10,
 	conferencePinTimeoutMs: 10_000,
 	conferencePinInterDigitTimeoutMs: 3_000,
-	conferenceFullAnnouncement: "sound:conf-locked",
+	// `conf-full` and `conf-locked` are both in Asterisk's core sound package, and they were one
+	// prompt until there was something to lock: the FULL announcement used to borrow `conf-locked`,
+	// which told a caller the meeting was closed when it was merely busy.
+	conferenceFullAnnouncement: "sound:conf-full",
+	conferenceLockedAnnouncement: "sound:conf-locked",
+	// GENERATED, not files. See the fields: a tone needs no prompt pack, so the beeps work on a
+	// stock install of either media plane.
+	conferenceEntryTone: "tone:beep",
+	conferenceExitTone: "tone:beep",
+	// `conf-hasjoin` and `conf-hasleft` are the stock generic forms. See the fields for why the
+	// per-participant recording is not in this release.
+	conferenceJoinAnnouncement: "sound:conf-hasjoin",
+	conferenceLeaveAnnouncement: "sound:conf-hasleft",
 	// Ten minutes. Long enough that a moderator who is late still finds their meeting, short
 	// enough that a forgotten leg does not hold a channel until the process restarts.
 	conferenceModeratorWaitMs: 600_000,
@@ -3629,6 +3672,19 @@ export class PlanWalker {
 			);
 			return await this.announceAndHangup(this.settings.conferenceFullAnnouncement, "USER_BUSY");
 		}
+		if (joined.kind === "locked") {
+			// A DIFFERENT announcement from the full one, and that is the whole reason the lock is a
+			// separate result: a full room admits this caller the moment somebody leaves, and a locked
+			// one does not admit them until the meeting is over. Telling them the same thing would have
+			// them redialling for an hour.
+			this.note(
+				`conference room ${node.roomNumber} is locked; the caller was refused with ${String(joined.memberCount)} in the room`,
+			);
+			return await this.announceAndHangup(
+				this.settings.conferenceLockedAnnouncement,
+				"CALL_REJECTED",
+			);
+		}
 		if (joined.kind === "claims-unavailable") {
 			// The room's claim could not be taken. Joining anyway would put this caller in a bridge no
 			// other instance agrees on, which is the split the claim exists to prevent — and a caller
@@ -3692,14 +3748,12 @@ export class PlanWalker {
 			memberCount: room?.memberCount ?? joined.room.memberCount,
 		});
 
-		if (node.recordEnabled) {
-			// Said out loud rather than silently ignored: a tenant who ticked "record this room" and
-			// finds no recording has a compliance problem, and a note in the call log is the
-			// difference between finding out now and finding out at the hearing.
-			this.note(
-				`conference room ${node.roomNumber} is configured to record, which this release does not implement`,
-			);
-		}
+		// The arrival, HEARD. Ordered after the media join and after the event, so a room hears the
+		// beep for somebody who is actually in it — a tone played before the bridge join would announce
+		// a participant whose media add then failed.
+		await this.announceConferenceArrival(node, bridgeId, "join");
+
+		await this.recordConference(node, joined.created);
 
 		// The leg's own death is what removes it from the room. Nothing else is watching it: the
 		// walk returns `bridged` and the orchestrator takes over from here.
@@ -3715,6 +3769,138 @@ export class PlanWalker {
 		);
 
 		return { kind: "bridged" };
+	}
+
+	/**
+	 * Beeps the room, and says somebody came or went.
+	 *
+	 * ## Into the ROOM, not at the caller
+	 *
+	 * The media reference is played at the BRIDGE, not at this leg, which is what makes it an
+	 * announcement rather than a private noise: everybody already in the meeting is the audience, and
+	 * the arriving participant hearing their own beep is a side effect of being in the bridge by then.
+	 * The ARI driver plays into a bridge directly; `mediad` mixes a playback into the room the same
+	 * way. Both are `MediaPort.play` addressed at the bridge id.
+	 *
+	 * ## The tone and the announcement are two settings and two costs
+	 *
+	 * `entryToneEnabled` is a quarter of a second of generated audio and needs nothing mounted.
+	 * `announceJoinLeave` is a spoken clause and needs a prompt package. A large room usually wants
+	 * the first and not the second — which is a preference `conference.announce_join_leave` alone
+	 * could not express, and is why the columns are separate.
+	 *
+	 * ## What is NOT announced, and the seam for it
+	 *
+	 * The participant's NAME. Announcing "Priya has joined" needs a recording of Priya saying so,
+	 * captured at the gate before the room is entered and kept for the life of the meeting — a record
+	 * step in `challengeConferencePin`, a per-member media ref on `ConferenceMember`, and a decision
+	 * about where the clip lives. This release plays the stock generic form instead, which is what
+	 * `conf-hasjoin` says, and says so here rather than shipping a flag that does less than its name.
+	 *
+	 * Never throws. A beep that could not be played is a meeting that carries on; failing the join
+	 * over its sound effect would drop a participant to protect an announcement.
+	 */
+	private async announceConferenceArrival(
+		node: ConferencePlanNode,
+		bridgeId: string,
+		event: "join" | "leave",
+	): Promise<void> {
+		const joining = event === "join";
+		const media: string[] = [];
+		// `!== false` and not `=== true`: the flags default ON at every layer, and the compiler emits
+		// them only when a tenant switched them off. An artifact from before the columns existed must
+		// beep — a participant who cannot tell a third party arrived is one who does not know the
+		// conversation stopped being private.
+		if ((joining ? node.entryToneEnabled : node.exitToneEnabled) !== false) {
+			media.push(joining ? this.settings.conferenceEntryTone : this.settings.conferenceExitTone);
+		}
+		if (node.announceJoinLeave !== false) {
+			media.push(
+				joining
+					? this.settings.conferenceJoinAnnouncement
+					: this.settings.conferenceLeaveAnnouncement,
+			);
+		}
+		if (media.length === 0) {
+			return;
+		}
+
+		try {
+			await this.deps.media.play(bridgeId, { media, playbackRef: this.newId() });
+		} catch (error) {
+			// Noted rather than swallowed, because "the beeps stopped working" is a question somebody
+			// asks about a room and a silent catch is not an answer to it.
+			this.note(
+				`conference room ${node.roomNumber} could not play its ${event} announcement: ${String(error)}`,
+			);
+		}
+	}
+
+	/**
+	 * Starts the room's recording, when the tenant asked for one and this is the member who opens it.
+	 *
+	 * ## Once per ROOM, not once per participant
+	 *
+	 * `created` is the gate, and it is the registry's answer to "is this instance now responsible for
+	 * a bridge?". A recording per participant would produce N files of one meeting, N retention
+	 * clocks and N signed URLs for the same audio — and, worse, N copies of every other participant's
+	 * voice, since each one records the whole mix.
+	 *
+	 * The consequence is stated rather than hidden: on a room split across instances, EACH instance's
+	 * first joiner opens a recording, so a cluster produces one file per participating instance. That
+	 * is a real limitation of recording a jointly-held room from its members, and the fix is a
+	 * recorder that is a member of the room in its own right — the seam is `ConferenceClaim` growing
+	 * a `recorderInstanceId` the first writer takes and every other instance defers to.
+	 *
+	 * ## Which policies record, and why three of five behave alike
+	 *
+	 * `all`, `inbound` and `outbound` all record. Every leg in a conference is inbound TO the room,
+	 * so there is no outbound half to leave out — the values are accepted because the vocabulary is
+	 * shared with `extension` and `queue`, and refusing three of five on one table would be a second,
+	 * narrower vocabulary wearing the same name. `on-demand` deliberately does NOT start one: it
+	 * means "somebody presses the record key", and the key is a mid-call feature that already works.
+	 *
+	 * BEST-EFFORT, exactly as a queue's is, and for the same reason with the same caveat: a media
+	 * plane that cannot record is not worth dropping a meeting over, and a tenant with a legal
+	 * obligation to record needs the call REFUSED instead — which is a different setting and a
+	 * different conversation with the operator.
+	 */
+	private async recordConference(node: ConferencePlanNode, created: boolean): Promise<void> {
+		const policy = node.recordPolicy;
+		if (policy === "none" || policy === "on-demand") {
+			return;
+		}
+		if (!created) {
+			// Somebody already opened it. Not a failure and not worth a note: this is every participant
+			// after the first, on every recorded room.
+			return;
+		}
+
+		const control = this.deps.control;
+		if (control?.startRecording === undefined) {
+			// A tenant who ticked "record this room" and finds no recording has a compliance problem,
+			// and a note in the call log is the difference between finding out now and finding out at
+			// the hearing.
+			this.note(
+				`conference room ${node.roomNumber} has a record policy of "${policy}" and this walk has no call-control port; the room was opened without a recording`,
+			);
+			return;
+		}
+
+		try {
+			const outcome = await control.startRecording();
+			if (!outcome.ok) {
+				this.note(
+					`conference room ${node.roomNumber} has a record policy of "${policy}" and the recording was refused${
+						outcome.reason === undefined ? "" : `: ${outcome.reason}`
+					}; the room was opened without it`,
+				);
+			}
+		} catch (error) {
+			this.note(
+				`conference room ${node.roomNumber} recording could not be started (${String(error)}); the room was opened without it`,
+			);
+		}
 	}
 
 	/**
@@ -3934,8 +4120,17 @@ export class PlanWalker {
 				moderator,
 				memberCount: departure.memberCount,
 				durationMs: Math.max(0, (this.deps.now ?? Date.now)() - joinedAtMs),
+				// `hung-up` and not `kicked`: this path is the leg's own death. A moderator's removal
+				// publishes its own `conference.left` from the control responder, with the reason and
+				// the user who did it, because that is the fact a report has to be able to tell apart.
+				reason: "hung-up",
 			});
 			this.deps.channel.setBridge(undefined);
+			// Only into a room that still exists. Beeping an empty bridge on the way to destroying it
+			// is a playback nobody hears and a media command that races the teardown.
+			if (!departure.emptied) {
+				await this.announceConferenceArrival(node, bridgeId, "leave");
+			}
 			if (departure.emptied) {
 				await this.deps.media.destroyBridge(bridgeId);
 			}

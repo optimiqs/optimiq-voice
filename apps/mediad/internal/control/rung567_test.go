@@ -8,6 +8,7 @@ import (
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/control"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
 
@@ -530,3 +531,394 @@ func decodeUntap(t *testing.T, payload []byte) contract.MediaUntapSessionRespons
 	}
 	return response
 }
+
+// --- Rung 5's state pair, reaching the wire ---------------------------------------------------
+//
+// `internal/rtp/hold.go` has held both suppression gates and the music loop since rung 5. What it
+// never had was a subject, so `MediadMediaPort` refused hold, unhold, mute, unmute and
+// music-on-hold BY NAME. These are the tests for the two commands that close that.
+
+func decodeMute(t *testing.T, payload []byte) contract.MediaMuteSessionResponse {
+	t.Helper()
+	var response contract.MediaMuteSessionResponse
+	if err := json.Unmarshal(payload, &response); err != nil {
+		t.Fatalf("decoding a mute reply: %v\n%s", err, payload)
+	}
+	return response
+}
+
+func decodeHold(t *testing.T, payload []byte) contract.MediaHoldSessionResponse {
+	t.Helper()
+	var response contract.MediaHoldSessionResponse
+	if err := json.Unmarshal(payload, &response); err != nil {
+		t.Fatalf("decoding a hold reply: %v\n%s", err, payload)
+	}
+	return response
+}
+
+func TestMuteGatesTheDirectionItWasAskedFor(t *testing.T) {
+	cases := []struct {
+		name      string
+		direction contract.MediaMuteSessionRequestDirection
+		wantIn    bool
+		wantOut   bool
+	}{
+		// `in` is audio arriving FROM the leg: the party cannot be HEARD. A conference `*6`.
+		{"a participant nobody can hear", "in", true, false},
+		// `out` is audio sent TO the leg: the party cannot HEAR.
+		{"a participant who cannot hear", "out", false, true},
+		{"both", "both", true, true},
+		// ARI's own default, matched deliberately: a mute with no direction mutes everything, and
+		// matching Asterisk matters more than picking the direction this service would have chosen.
+		{"no direction at all", "", true, true},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			rig := newRig(t)
+			allocateSession(t, rig)
+
+			response := decodeMute(t, rig.server.HandleMuteSession(mustJSON(t,
+				contract.MediaMuteSessionRequest{
+					SessionID: testSession,
+					Direction: testCase.direction,
+				})))
+			if !response.Ok {
+				t.Fatalf("the mute was refused: %+v", response)
+			}
+			if response.MutedIn != testCase.wantIn || response.MutedOut != testCase.wantOut {
+				t.Errorf("state = in %v out %v, want in %v out %v",
+					response.MutedIn, response.MutedOut, testCase.wantIn, testCase.wantOut)
+			}
+		})
+	}
+}
+
+func TestMuteIsAdditiveAndTheReplyProvesIt(t *testing.T) {
+	// The whole reason the handler READS the state back instead of deriving it from the request.
+	// Muting `in` on a leg already muted `out` must leave both set — the alternative, a direction
+	// field that replaces whatever was there, is how a conference participant gets their audio back
+	// because somebody muted their microphone.
+	rig := newRig(t)
+	allocateSession(t, rig)
+
+	rig.server.HandleMuteSession(mustJSON(t, contract.MediaMuteSessionRequest{
+		SessionID: testSession, Direction: "out",
+	}))
+	response := decodeMute(t, rig.server.HandleMuteSession(mustJSON(t,
+		contract.MediaMuteSessionRequest{SessionID: testSession, Direction: "in"})))
+
+	if !response.MutedIn || !response.MutedOut {
+		t.Errorf("state = in %v out %v; the second mute replaced the first instead of adding to it",
+			response.MutedIn, response.MutedOut)
+	}
+
+	// And the unmute lifts only what it names.
+	response = decodeMute(t, rig.server.HandleMuteSession(mustJSON(t,
+		contract.MediaMuteSessionRequest{SessionID: testSession, Direction: "in", Unmute: true})))
+	if response.MutedIn || !response.MutedOut {
+		t.Errorf("state = in %v out %v, want in false out true", response.MutedIn, response.MutedOut)
+	}
+}
+
+func TestMuteSessionRefusals(t *testing.T) {
+	cases := []struct {
+		name    string
+		request contract.MediaMuteSessionRequest
+		reason  string
+	}{
+		{
+			name:    "no session id",
+			request: contract.MediaMuteSessionRequest{Direction: "both"},
+			reason:  control.ReasonBadRequest,
+		},
+		{
+			// Validated before the session is looked up, exactly as a tap's side letters are: a
+			// direction of "left" is a caller bug and should read the same whether or not the call it
+			// names is up.
+			name:    "a direction that does not exist",
+			request: contract.MediaMuteSessionRequest{SessionID: testSession, Direction: "left"},
+			reason:  control.ReasonBadRequest,
+		},
+		{
+			name:    "a session this instance does not have",
+			request: contract.MediaMuteSessionRequest{SessionID: "somebody-elses-leg", Direction: "both"},
+			reason:  control.ReasonUnknown,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			rig := newRig(t)
+			allocateSession(t, rig)
+			before := len(rig.sessions.muteCalls())
+
+			response := decodeMute(t, rig.server.HandleMuteSession(mustJSON(t, testCase.request)))
+			if response.Ok {
+				t.Fatal("the mute was accepted")
+			}
+			if response.Reason == nil || string(*response.Reason) != testCase.reason {
+				t.Errorf("reason = %v, want %q", response.Reason, testCase.reason)
+			}
+			if testCase.reason == control.ReasonBadRequest &&
+				len(rig.sessions.muteCalls()) != before {
+				t.Error("a refused mute still reached the packet path")
+			}
+		})
+	}
+}
+
+func TestHoldResolvesItsMusicBeforeItAnswers(t *testing.T) {
+	// The reason this subject's deadline is a second where the rest of the family's is 500 ms: a
+	// hold that names music READS AND DECODES A FILE first, exactly as `start-playback` does, so an
+	// `ok` means the loop is in memory rather than that the request was accepted for consideration.
+	rig := newRig(t)
+	allocateSession(t, rig)
+	writeULawPrompt(t, rig, "moh/default.wav", 4)
+
+	response := decodeHold(t, rig.server.HandleHoldSession(mustJSON(t,
+		contract.MediaHoldSessionRequest{
+			SessionID: testSession,
+			Music:     stringOf("moh:default"),
+			MusicRef:  stringOf("hold-1"),
+		})))
+	if !response.Ok {
+		t.Fatalf("the hold was refused: %+v", response)
+	}
+	if !response.Held {
+		t.Error("the reply does not say the leg is held")
+	}
+	if response.MusicRef == nil || *response.MusicRef != "hold-1" {
+		t.Errorf("musicRef = %v, want hold-1", response.MusicRef)
+	}
+
+	holds := rig.sessions.holdCalls()
+	if len(holds) != 1 {
+		t.Fatalf("%d holds reached the packet path, want 1", len(holds))
+	}
+	if len(holds[0].opts.MusicFrames) == 0 {
+		// PRE-DECODED, so the packet path does no I/O: a disk read between "the agent pressed hold"
+		// and "the caller stopped hearing them" is exactly what this ordering exists to prevent.
+		t.Error("the hold reached the packet path with no decoded frames")
+	}
+	if holds[0].opts.MusicDescription != "moh:default" {
+		t.Errorf("description = %q, want moh:default", holds[0].opts.MusicDescription)
+	}
+}
+
+func TestAHoldWithNoMusicIsALegalSilentHold(t *testing.T) {
+	// An instance with no music mounted still has to be able to take a party out of a conversation.
+	// The caller hears silence, the suppression stands, and nothing pretends a file existed.
+	rig := newRigWithLibrary(t, "")
+	allocateSession(t, rig)
+
+	response := decodeHold(t, rig.server.HandleHoldSession(mustJSON(t,
+		contract.MediaHoldSessionRequest{SessionID: testSession})))
+	if !response.Ok || !response.Held {
+		t.Fatalf("a silent hold was refused: %+v", response)
+	}
+	if response.MusicRef != nil && *response.MusicRef != "" {
+		t.Errorf("musicRef = %v; a hold with no music has no loop to name", response.MusicRef)
+	}
+}
+
+func TestUnholdOfAnUnheldLegIsASuccess(t *testing.T) {
+	// The engine retries an unhold, and a retry after a lost reply must not look like a failure —
+	// the same shape `unbridge`, `stop-playback` and `untap` use.
+	rig := newRig(t)
+	allocateSession(t, rig)
+
+	response := decodeHold(t, rig.server.HandleHoldSession(mustJSON(t,
+		contract.MediaHoldSessionRequest{SessionID: testSession, Unhold: true})))
+	if !response.Ok {
+		t.Fatalf("unholding an unheld leg was an error: %+v", response)
+	}
+	if response.Held {
+		t.Error("the reply says the leg is still held")
+	}
+}
+
+func TestHoldSessionRefusals(t *testing.T) {
+	t.Run("no session id", func(t *testing.T) {
+		rig := newRig(t)
+		response := decodeHold(t, rig.server.HandleHoldSession(mustJSON(t,
+			contract.MediaHoldSessionRequest{})))
+		if response.Ok || response.Reason == nil ||
+			string(*response.Reason) != control.ReasonBadRequest {
+			t.Errorf("a hold with no session was not refused as bad_request: %+v", response)
+		}
+		if len(rig.sessions.holdCalls()) != 0 {
+			t.Error("a refused hold still reached the packet path")
+		}
+	})
+
+	t.Run("music this instance cannot resolve", func(t *testing.T) {
+		// The music is resolved BEFORE the flags go up, so a hold that cannot find its file has not
+		// half-happened: the party is still in the conversation and the engine is told why.
+		rig := newRig(t)
+		allocateSession(t, rig)
+
+		response := decodeHold(t, rig.server.HandleHoldSession(mustJSON(t,
+			contract.MediaHoldSessionRequest{
+				SessionID: testSession,
+				Music:     stringOf("moh:nothing-here"),
+			})))
+		if response.Ok {
+			t.Fatal("a hold naming an absent clip was accepted")
+		}
+		if len(rig.sessions.holdCalls()) != 0 {
+			t.Error("a refused hold still reached the packet path")
+		}
+	})
+
+	t.Run("a session this instance does not have", func(t *testing.T) {
+		rig := newRig(t)
+		response := decodeHold(t, rig.server.HandleHoldSession(mustJSON(t,
+			contract.MediaHoldSessionRequest{
+				SessionID: "somebody-elses-leg",
+				Music:     stringOf("moh:default"),
+			})))
+		if response.Ok || response.Reason == nil ||
+			string(*response.Reason) != control.ReasonUnknown {
+			t.Errorf("reason = %v, want unknown_session", response.Reason)
+		}
+	})
+}
+
+// --- Rung 6's room, reached through bridge-sessions --------------------------------------------
+
+func TestBridgeSeatsThreeSessionsInARoom(t *testing.T) {
+	// THIS CASE USED TO ASSERT A REFUSAL naming rung 6. Until now the only wire path into a
+	// Conference was `tap-session` converting a two-party bridge, so a conference bridge the engine
+	// asked for was refused by name while a working mixer sat one function call away.
+	rig := newRig(t)
+	for _, id := range []string{"leg-a", "leg-b", "leg-c"} {
+		request := validAllocate()
+		request.SessionID = id
+		if response := decodeAllocate(t, rig.server.HandleAllocateSession(mustJSON(t, request))); !response.Ok {
+			t.Fatalf("allocating %s: %+v", id, response)
+		}
+	}
+
+	response := decodeBridge(t, rig.server.HandleBridgeSessions(mustJSON(t,
+		contract.MediaBridgeSessionsRequest{
+			BridgeID:   "room-1",
+			SessionIDs: []string{"leg-a", "leg-b", "leg-c"},
+		})))
+	if !response.Ok {
+		t.Fatalf("a three-way bridge was refused: %+v", response)
+	}
+	if !response.Mixed {
+		// The one fact an operator needs to explain "the call developed sixty milliseconds of delay
+		// the moment the third person joined".
+		t.Error("the reply does not say the arrangement is a mix")
+	}
+	if len(response.SessionIDs) != 3 {
+		t.Errorf("SessionIDs = %v, want all three", response.SessionIDs)
+	}
+
+	joins := rig.sessions.joinCalls()
+	if len(joins) != 3 {
+		t.Fatalf("%d joins reached the packet path, want 3", len(joins))
+	}
+	for _, join := range joins {
+		if join.conferenceID != "room-1" {
+			// A room that renamed itself on the way in would leave an `unbridge-sessions` naming
+			// nothing: the engine tears down what it created, under the name it created it with.
+			t.Errorf("conferenceId = %q, want the bridge's own id", join.conferenceID)
+		}
+		if !join.opts.Hear.All() || !join.opts.SpeakTo.All() {
+			// A bridge means everybody hears everybody. Asymmetric membership is what tap-session is
+			// for, and a bridge that could express it would be two ways to say one thing.
+			t.Error("a bridge member was seated with asymmetric routing")
+		}
+	}
+
+	// Two members is still a RELAY — no buffer, no decode, no added delay — which is the whole
+	// reason the arrangement is chosen here rather than named by the caller.
+	if len(rig.sessions.bridgeCallsMade()) != 0 {
+		t.Error("a three-way bridge went down the two-party relay path")
+	}
+}
+
+func TestAHalfBuiltRoomIsTornDownRatherThanLeftRunning(t *testing.T) {
+	// The one state that must not survive: some members mixing and some relaying is a call where
+	// one party can hear and another cannot, which reads as a network fault and is not one.
+	rig := newRig(t)
+	rig.sessions.joinErr = rtp.ErrConferenceCodec
+
+	response := decodeBridge(t, rig.server.HandleBridgeSessions(mustJSON(t,
+		contract.MediaBridgeSessionsRequest{
+			BridgeID:   "room-1",
+			SessionIDs: []string{"leg-a", "leg-b", "leg-c"},
+		})))
+	if response.Ok {
+		t.Fatal("a room whose first join failed was accepted")
+	}
+	if response.Reason == nil || string(*response.Reason) != control.ReasonNotSupported {
+		// A leg whose codec cannot be decoded cannot be in a mix. The engine's recovery is to route
+		// this room to Asterisk.
+		t.Errorf("reason = %v, want not_supported", response.Reason)
+	}
+	if len(rig.sessions.destroyedConferences()) == 0 {
+		t.Error("the half-built room was left running")
+	}
+}
+
+// --- targetSide: the letters stop depending on argument order ----------------------------------
+
+func TestTapCarriesTheDeclaredTargetSide(t *testing.T) {
+	// `MediaPort.TapRequest` has always carried this; the wire did not, so the media plane fixed the
+	// only convention it could defend (`a` is the target) and the ENGINE had to pass, as
+	// `targetSessionId`, the leg it would have called side `a`. That obligation has moved.
+	rig := newRig(t)
+	allocateSession(t, rig)
+
+	side := contract.LegSideB
+	response := decodeTap(t, rig.server.HandleTapSession(mustJSON(t,
+		contract.MediaTapSessionRequest{
+			TapID:           "tap-1",
+			TapSessionID:    "supervisor-leg",
+			TargetSessionID: testSession,
+			TargetSide:      &side,
+			Hear:            "both",
+			SpeakTo:         "b",
+		})))
+	if !response.Ok {
+		t.Fatalf("the tap was refused: %+v", response)
+	}
+
+	taps := rig.sessions.tapCalls()
+	if len(taps) != 1 {
+		t.Fatalf("%d taps reached the packet path, want 1", len(taps))
+	}
+	if taps[0].TargetSide != rtp.SideB {
+		t.Errorf("TargetSide = %q, want %q", taps[0].TargetSide, rtp.SideB)
+	}
+}
+
+func TestATapWithNoTargetSideKeepsTheOldConvention(t *testing.T) {
+	// ABSENT is a supported state, not a defect: it is what a caller compiled before the field
+	// existed sends, and it must behave exactly as it did — target-first, `a` is the target. The
+	// handler leaves it EMPTY rather than defaulting, so `resolveAudiences` is the single place that
+	// decision is written down instead of two places that could drift.
+	rig := newRig(t)
+	allocateSession(t, rig)
+
+	response := decodeTap(t, rig.server.HandleTapSession(mustJSON(t,
+		contract.MediaTapSessionRequest{
+			TapID:           "tap-1",
+			TapSessionID:    "supervisor-leg",
+			TargetSessionID: testSession,
+			Hear:            "both",
+			SpeakTo:         "none",
+		})))
+	if !response.Ok {
+		t.Fatalf("the tap was refused: %+v", response)
+	}
+	if got := rig.sessions.tapCalls()[0].TargetSide; got != "" {
+		t.Errorf("TargetSide = %q, want it left empty for resolveAudiences to decide", got)
+	}
+}
+
+func stringOf(value string) *string { return &value }
