@@ -57,6 +57,36 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, PageRequirement>> = {
 	 */
 	[routes.mediaLibrary]: { permissions: ["settings.read"] },
 	[routes.cdr]: { permissions: ["cdr.read", "cdr.read.own"] },
+	/**
+	 * The change ledger.
+	 *
+	 * `audit.read` alone, and that single entry is the whole reason the permission exists:
+	 * `AuditLogController` argues that guarding the change history of every resource with
+	 * `settings.read` would have put it behind the narrowest role in the registry — every
+	 * self-service role holds `settings.read` so a preferences screen renders. There is no `.own`
+	 * variant to fall back to, because "the changes I made" is not a question the ledger is indexed
+	 * to answer cheaply; the `actorUserId` filter is how somebody asks it.
+	 */
+	[routes.auditLog]: { permissions: ["audit.read"] },
+	/**
+	 * SIP security — the network allowlist and the refusals it produced.
+	 *
+	 * `security.read`, which is what both `SipAclEntriesController` and `SipAuthEventController`
+	 * guard their reads with. Writing is `security.write` and is gated inside the page with
+	 * `usePermission`, not here: a role that can see which networks are allowed but not change them
+	 * should SEE them — an operator reading the attack log needs the rule list next to it to make
+	 * sense of an `acl-denied` row.
+	 */
+	[routes.security]: { permissions: ["security.read"] },
+	/**
+	 * Outbound webhook subscriptions.
+	 *
+	 * `webhooks.read`, which is what `WebhooksController` guards `GET` with. Creating, editing and
+	 * DELETING all ride `webhooks.write` — there is no `webhooks.delete` in the registry, on the
+	 * controller's own argument that deleting a subscription and disabling it stop the same
+	 * deliveries.
+	 */
+	[routes.webhooks]: { permissions: ["webhooks.read"] },
 	[routes.settings]: { permissions: ["settings.read"] },
 	[routes.members]: { permissions: ["members.read"] },
 	[routes.apiKeys]: { permissions: ["api-keys.read", "api-keys.read.own"] },

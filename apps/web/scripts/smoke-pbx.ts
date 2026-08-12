@@ -638,6 +638,18 @@ async function main(): Promise<void> {
 			`/routing/time-conditions/${timeConditionId}`,
 			// A settings sub-screen, which is a real route rather than a tab.
 			"/settings/emergency-addresses",
+			// The SIP security area and its second tab. The auth-failure ledger is only reachable —
+			// and only renderable — through the query state, so a tab that 404s or crashes would
+			// otherwise be invisible to a route list. Both are gated by `security.read`, which the
+			// owner used here holds.
+			"/security",
+			"/security?tab=auth-failures",
+			// The change ledger (`audit.read`) and the webhook subscriptions (`webhooks.read`). Both
+			// render before their first request resolves, so a 200 here proves the route and the shell,
+			// not the endpoint — the endpoint contracts are asserted by `lib/pbx/*.spec.ts` against the
+			// DTOs they mirror.
+			"/audit-log",
+			"/webhooks",
 		];
 		const routeFailures: string[] = [];
 		for (const route of routes) {

@@ -295,6 +295,19 @@ const RESOURCE_TABLES: Readonly<Record<string, string>> = {
 	 */
 	prompts: "prompt",
 	"emergency-addresses": "emergency_address",
+	/**
+	 * Neither of these is a routing input, and both are absent from `ROUTING_TABLE_TO_ENTITY` for
+	 * the same reason: the compiler has no ACL input and no webhook input, so an artifact eviction
+	 * per edit would evict a panel that did not change. The loop below is what holds that.
+	 *
+	 * `sip_acl_entry` is the one worth stating explicitly, because "not a routing input" is easy to
+	 * misread as "has no effect on calls". It has a large one — it decides whether a phone may
+	 * register or a carrier may deliver — but it reaches the media server through a generated
+	 * configuration file rather than through the compiled artifact, which is why the screen says so
+	 * and this map does not.
+	 */
+	"sip-acl-entries": "sip_acl_entry",
+	webhooks: "webhook_subscription",
 };
 
 const CHILD_TABLES: Readonly<Record<string, string>> = {

@@ -181,6 +181,32 @@ export const queryKeys = {
 		["organizations", organizationId, "cdr", "recordings", "list", query] as const,
 
 	/**
+	 * The two append-only ledgers.
+	 *
+	 * Organization-scoped like everything else, and for the sharpest version of the reason: a cached
+	 * page of another tenant's change history or attack log is the single worst thing an org switch
+	 * could leave behind.
+	 *
+	 * NOT under `pbx`, even though `sipAuthEvents` sits next to the ACL screen that IS a PBX
+	 * resource. The coarse `pbxResource` sweep every mutation fires would otherwise evict these on
+	 * every unrelated write, and there is nothing to evict: no mutation in this app can change a row
+	 * in either table — both are append-only by DATABASE PRIVILEGE, not by convention. Writing an
+	 * ACL rule does append an audit entry, and the screen does not pretend otherwise; the ledger is
+	 * refetched when somebody asks it to be, which is what a ledger with no total and a moving window
+	 * can honestly offer.
+	 *
+	 * The whole query — window, filters, limit and cursor — is the last segment, because two windows
+	 * are two answers and must never share an entry.
+	 */
+	auditLog: (organizationId: string) => ["organizations", organizationId, "audit-log"] as const,
+	auditLogList: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
+		["organizations", organizationId, "audit-log", "list", query] as const,
+	sipAuthEvents: (organizationId: string) =>
+		["organizations", organizationId, "sip-auth-events"] as const,
+	sipAuthEventList: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
+		["organizations", organizationId, "sip-auth-events", "list", query] as const,
+
+	/**
 	 * Agent availability.
 	 *
 	 * Availability itself is LIVE state and is not in this cache — it arrives over the socket and

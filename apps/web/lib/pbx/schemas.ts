@@ -14,6 +14,7 @@
  */
 
 import { z } from "zod";
+import { networkIssue, normalizeNetwork } from "./cidr";
 import {
 	FEATURE_CODE_ACTIONS,
 	MOH_SOURCES,
@@ -25,6 +26,8 @@ import {
 	RING_GROUP_STRATEGIES,
 	ROUTE_MATCH_KINDS,
 	ROUTING_CONTEXTS,
+	SIP_ACL_ACTIONS,
+	SIP_ACL_SCOPES,
 	SIP_TRANSPORTS,
 	TOLL_CLASSES,
 	TRUNK_KINDS,
@@ -843,3 +846,103 @@ function isStraightRun(pin: string): boolean {
 	}
 	return ascending || descending;
 }
+
+// ---------------------------------------------------------------------------------------------
+// SIP security
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One CIDR access rule.
+ *
+ * The network is checked with {@link networkIssue}, which is `sip-acl.dto.ts`'s pre-filter restated
+ * — including the host-bits rule, which is the one that catches the mistake an administrator
+ * actually makes. It is then NORMALISED, so a bare address and its `/32` are one row rather than
+ * two that collide on the server's unique index only after PostgreSQL has widened them.
+ *
+ * `scope` has no default here even though the column defaults to `registration`, for the reason the
+ * server's DTO gives: a caller who omitted the scope almost certainly did not mean "the one that
+ * governs whether phones can register". The form therefore makes it an explicit choice.
+ */
+export const sipAclEntryFormSchema = z.strictObject({
+	name: optionalText(128),
+	network: z
+		.string()
+		.trim()
+		.superRefine((value, context) => {
+			const issue = networkIssue(value);
+			if (issue !== undefined) {
+				context.addIssue({ code: "custom", message: issue });
+			}
+		})
+		.transform((value) => normalizeNetwork(value)),
+	action: z.enum(SIP_ACL_ACTIONS),
+	scope: z.enum(SIP_ACL_SCOPES),
+	priority: optionalInt(0, 10_000),
+	description: optionalText(512),
+	enabled: z.boolean(),
+});
+export type SipAclEntryFormValues = z.input<typeof sipAclEntryFormSchema>;
+
+// ---------------------------------------------------------------------------------------------
+// Webhooks
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A webhook subscription's scalar fields. The event selectors are not here — see below.
+ *
+ * ## `url` is checked for SHAPE only, and http is deliberately not refused
+ *
+ * The server's DTO checks the same two things this does: that it parses as an absolute http(s) URL,
+ * and that it carries no embedded credentials. The `https`-ONLY rule lives one layer up, in
+ * `WebhooksService`, because it depends on `PBX_WEBHOOK_ALLOW_INSECURE_URLS` — an environment
+ * variable this bundle cannot read. Refusing http here would break the development deployments that
+ * variable exists for; the deployments that enforce it answer with a 400 addressed at `url`, which
+ * lands on this control through `pbxFieldErrors`. The form says so beside the field rather than
+ * guessing.
+ *
+ * Nothing checks that the host resolves or that it is not a private address. The second is the
+ * interesting omission and it is the server's reasoning: DNS is not stable between a write-time
+ * check and the delivery, so the control that works belongs in the dispatcher — a fixed method, no
+ * redirects, a short timeout — and it is implemented there rather than pretended at here.
+ *
+ * ## `secret` blank means two different things, and both are correct
+ *
+ * On CREATE, blank means "generate one" — the server mints 256 bits and returns it exactly once, in
+ * the create response and nowhere else. On EDIT, blank means "leave the existing key alone": the
+ * secret is never returned by a read, so the field cannot be pre-filled, and a form that sent an
+ * empty string would rotate a working signature to nothing. The dialog omits the key entirely when
+ * this is `null`, which is what `PATCH` semantics turn into "unchanged".
+ *
+ * ## `eventSelectors` is validated separately
+ *
+ * The control that produces it is four checkboxes and a textarea rather than one input, so its
+ * message is attached by the dialog through `selectorListIssue` — the same division the destination
+ * picker uses. Putting it in this schema would key the message to a field name no control has.
+ */
+export const webhookFormSchema = z.strictObject({
+	description: optionalText(256),
+	url: z
+		.string()
+		.trim()
+		.min(1, "Required")
+		.max(2048, "At most 2048 characters")
+		.refine((value) => /^https?:\/\//iu.test(value), "Must be an http(s) URL")
+		.refine((value) => {
+			try {
+				const parsed = new URL(value);
+				return parsed.username === "" && parsed.password === "";
+			} catch {
+				return false;
+			}
+		}, "Must be a valid absolute URL, and must not carry a username or password"),
+	secret: z
+		.string()
+		.trim()
+		.refine(
+			(value) => value.length === 0 || (value.length >= 16 && value.length <= 256),
+			"A signing key is between 16 and 256 characters. Leave it blank to have one generated.",
+		)
+		.transform((value) => (value.length === 0 ? null : value)),
+	enabled: z.boolean(),
+});
+export type WebhookFormValues = z.input<typeof webhookFormSchema>;

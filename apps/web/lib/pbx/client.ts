@@ -12,8 +12,12 @@
  */
 
 import { apiFetch, apiUpload } from "../api-client";
+import { ledgerSearchParams } from "./ledger";
 import type { Permission } from "../permissions";
 import type {
+	AuditCursorEnvelope,
+	AuditLogEntryRow,
+	AuditLogQueryParams,
 	CompileResult,
 	ConferencePinState,
 	ConferenceRow,
@@ -41,6 +45,9 @@ import type {
 	RingGroupRow,
 	RoutingContext,
 	SimulateResult,
+	SipAclEntryRow,
+	SipAuthEventQueryParams,
+	SipAuthEventRow,
 	TimeConditionRow,
 	TimeConditionRuleRow,
 	TrunkRow,
@@ -53,6 +60,7 @@ import type {
 	VoicemailMessageResult,
 	VoicemailPinState,
 	VoicemailPlaybackLink,
+	WebhookRow,
 } from "./contracts";
 
 /** The API's own cap. Asking for more is a 400, so the control that offers page sizes stops here. */
@@ -323,6 +331,50 @@ export const PBX_RESOURCES = {
 			delete: "numbers.emergency",
 		},
 		displayName: (row) => `${row.label} — ${row.streetLine1}, ${row.locality}`,
+	}),
+	/**
+	 * The CIDR allowlist — the toll-fraud gate.
+	 *
+	 * `security.*` and not `settings.*`, which is the API's own division and worth restating: every
+	 * self-service role holds `settings.read` so a user's preferences screen renders, and the list of
+	 * networks that may register phones or terminate calls is not a preference. Writing one is the
+	 * ability to open the platform to an arbitrary network, which is the same privilege class as
+	 * issuing credentials — and `security.delete` deliberately does not exist, because deleting a
+	 * rule and disabling it have the same effect and leave nothing behind.
+	 *
+	 * `affectsRouting: false`: `sip_acl_entry` is absent from `ROUTING_TABLE_TO_ENTITY`, the compiler
+	 * has no ACL input, and evicting the compile view on every ACL edit would be cache churn with no
+	 * consumer. The consequence an administrator IS surprised by is a different one, and the screen
+	 * says it rather than this comment: an edit here does not reach the media server by itself.
+	 */
+	sipAclEntries: descriptor<SipAclEntryRow>({
+		key: "sip-acl-entries",
+		affectsRouting: false,
+		path: "/sip-acl-entries",
+		label: "access rule",
+		labelPlural: "Access rules",
+		permissions: { read: "security.read", write: "security.write", delete: "security.write" },
+		displayName: (row) => (row.name ? `${row.network} · ${row.name}` : row.network),
+	}),
+	/**
+	 * Outbound webhook subscriptions.
+	 *
+	 * DELETE rides `webhooks.write` rather than a `webhooks.delete` that does not exist — the
+	 * controller makes the same choice, on the argument `security.delete` lost: deleting a
+	 * subscription and disabling it stop the same deliveries.
+	 *
+	 * `affectsRouting: false` — `webhook_subscription` is not in `ROUTING_TABLE_TO_ENTITY`, the
+	 * compiler has no webhook input, and an artifact eviction per endpoint edit would evict a panel
+	 * that did not change.
+	 */
+	webhooks: descriptor<WebhookRow>({
+		key: "webhooks",
+		affectsRouting: false,
+		path: "/webhooks",
+		label: "webhook",
+		labelPlural: "Webhooks",
+		permissions: { read: "webhooks.read", write: "webhooks.write", delete: "webhooks.write" },
+		displayName: (row) => row.description ?? row.url,
 	}),
 } as const;
 
@@ -919,4 +971,38 @@ export async function mintGreetingPlaybackUrl(
 		{ method: "POST", body: JSON.stringify({}) },
 	);
 	return data;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The two ledgers
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One page of the change ledger, newest first.
+ *
+ * Not `listPbx`, and the difference is the envelope rather than a preference: these endpoints
+ * answer `{ data, nextCursor, limit, range }` with no `total` and no `page`, because a `count(*)`
+ * over a table that takes a row for every mutation forever is the exact cost keyset pagination
+ * exists to avoid — and `offset` over a ledger being appended to while somebody reads it silently
+ * skips rows. So there is no resource descriptor for either of these: the generic CRUD machinery
+ * would be five verbs that do not exist behind a page control that cannot work.
+ *
+ * There is deliberately no `getAuditLogEntry`. A ledger entry IS its detail — the diff, the actor
+ * and the request id are all on the list row — so the server offers no `GET /:id` to call.
+ */
+export async function listAuditLog(
+	query: AuditLogQueryParams,
+): Promise<AuditCursorEnvelope<AuditLogEntryRow>> {
+	return await apiFetch<AuditCursorEnvelope<AuditLogEntryRow>>(
+		`/audit-log?${ledgerSearchParams({ ...query })}`,
+	);
+}
+
+/** One page of the authentication-failure ledger, newest first. The same envelope, deliberately. */
+export async function listSipAuthEvents(
+	query: SipAuthEventQueryParams,
+): Promise<AuditCursorEnvelope<SipAuthEventRow>> {
+	return await apiFetch<AuditCursorEnvelope<SipAuthEventRow>>(
+		`/sip-auth-events?${ledgerSearchParams({ ...query })}`,
+	);
 }

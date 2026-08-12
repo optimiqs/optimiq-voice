@@ -5,6 +5,7 @@ import {
 	HashIcon,
 	HistoryIcon,
 	KeyIcon,
+	LedgerIcon,
 	MenuIcon,
 	MusicIcon,
 	ParkIcon,
@@ -13,9 +14,11 @@ import {
 	RecordIcon,
 	RouteIcon,
 	SettingsIcon,
+	ShieldIcon,
 	TrunkIcon,
 	UsersIcon,
 	VoicemailIcon,
+	WebhookIcon,
 } from "~/components/ui/icons";
 import { routes } from "~/lib/routes";
 import type { ComponentType, SVGProps } from "react";
@@ -92,6 +95,17 @@ export const NAV_SECTIONS: readonly NavSection[] = [
 		items: [
 			{ title: "Recordings", url: routes.recordings, icon: RecordIcon },
 			{ title: "Call history", url: routes.cdr, icon: HistoryIcon },
+			/**
+			 * The change ledger, alongside the other two read-only ledgers rather than in the settings
+			 * area.
+			 *
+			 * "Insight" is where this app puts the append-only tables — a defaulted window, exact
+			 * filters, a keyset cursor and no total — and the audit log is that surface exactly. It is
+			 * gated by `audit.read` all the same, which no other entry in this section asks for; see
+			 * `page-permissions.ts` for why the permission and the section disagree, and why the
+			 * permission is the one that matters.
+			 */
+			{ title: "Audit log", url: routes.auditLog, icon: LedgerIcon },
 		],
 	},
 	{
@@ -100,6 +114,17 @@ export const NAV_SECTIONS: readonly NavSection[] = [
 			{ title: "Settings", url: routes.settings, icon: SettingsIcon },
 			{ title: "Members", url: routes.members, icon: UsersIcon },
 			{ title: "API keys", url: routes.apiKeys, icon: KeyIcon },
+			/**
+			 * SIP security and webhooks sit beside members and API keys, and the grouping is a claim
+			 * about privilege rather than about subject matter: all four decide who or what may reach
+			 * this tenant. An access rule opens the platform to a network, an API key issues a
+			 * credential, and a webhook sends the tenant's call metadata somewhere else.
+			 *
+			 * Both are last because they are the least-used entries in the section, and neither is
+			 * something an administrator sets out to do daily.
+			 */
+			{ title: "Security", url: routes.security, icon: ShieldIcon },
+			{ title: "Webhooks", url: routes.webhooks, icon: WebhookIcon },
 		],
 	},
 ];

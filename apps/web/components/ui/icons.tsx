@@ -176,6 +176,50 @@ export function MusicIcon(props: IconProps) {
 	);
 }
 
+/**
+ * The change ledger: a page with ruled lines.
+ *
+ * Deliberately not a clock, which is `HistoryIcon` and already means "call history" in this
+ * sidebar. The two surfaces are the same SHAPE — a windowed, cursor-paged, append-only table — and
+ * a second clock two rows below the first would read as a second view of the same records.
+ */
+export function LedgerIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<path d="M5.5 3.5h13a1 1 0 0 1 1 1v15a1 1 0 0 1-1 1h-13a1 1 0 0 1-1-1v-15a1 1 0 0 1 1-1Z" />
+			<path d="M8.5 8h7M8.5 12h7M8.5 16h4" />
+		</Glyph>
+	);
+}
+
+/** SIP security: a shield. The allowlist is the toll-fraud gate, and the log is what it refused. */
+export function ShieldIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<path d="M12 2.75 4.5 5.5v6c0 4.4 3.1 8.4 7.5 9.75 4.4-1.35 7.5-5.35 7.5-9.75v-6L12 2.75Z" />
+			<path d="m9 12 2.2 2.2L15.5 10" />
+		</Glyph>
+	);
+}
+
+/**
+ * Webhooks: a signal leaving a node.
+ *
+ * An outward arc rather than a plug or a link glyph — what a subscription does is push an event out
+ * of this platform to somewhere else, which is the one thing a reader has to understand before
+ * they configure one.
+ */
+export function WebhookIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<circle cx="7" cy="17" r="2.5" />
+			<circle cx="17" cy="17" r="2.5" />
+			<circle cx="12" cy="5.5" r="2.5" />
+			<path d="M10.6 7.6 8 13M13.4 7.6 16 13M9.5 17h5" />
+		</Glyph>
+	);
+}
+
 /** A dispatchable location: a map pin. */
 export function LocationIcon(props: IconProps) {
 	return (

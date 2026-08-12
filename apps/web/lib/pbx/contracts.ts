@@ -198,6 +198,41 @@ export type RoutingContext = (typeof ROUTING_CONTEXTS)[number];
 export const AUDIT_ACTOR_TYPES = ["user", "api-key", "service", "system"] as const;
 export type AuditActorType = (typeof AUDIT_ACTOR_TYPES)[number];
 
+/** What a matching ACL entry does. Mirrors `SIP_ACL_ACTIONS` in `@optimiq-voice/pbx-db`. */
+export const SIP_ACL_ACTIONS = ["allow", "deny"] as const;
+export type SipAclAction = (typeof SIP_ACL_ACTIONS)[number];
+
+/**
+ * Which surface an ACL entry guards, and the same four an auth-failure event is filed under.
+ *
+ * Not one list with a "everywhere" option: the server's unique index is
+ * `(organization_id, scope, network)`, so the same network in two scopes is two rows and a form
+ * that offered "all scopes" would be offering to write four rows behind one button. Keeping them
+ * apart is what the server calls the anti-toll-fraud boundary — `provisioning` is already read by
+ * the device provisioner, and widening a rule from it to `trunk` is a decision, not a checkbox.
+ */
+export const SIP_ACL_SCOPES = ["registration", "trunk", "provisioning", "api"] as const;
+export type SipAclScope = (typeof SIP_ACL_SCOPES)[number];
+
+/**
+ * Why an attempt was refused — the REASON, never the surface. The surface is the scope.
+ *
+ * `unknown-account` and `disabled-account` are deliberately separate and mean opposite things to
+ * whoever is reading the log: the first is somebody guessing, the second is a credential that
+ * outlived its authorisation. A screen that folded them together would hide the one an
+ * administrator can act on today.
+ */
+export const SIP_AUTH_EVENT_TYPES = [
+	"acl-denied",
+	"rate-limited",
+	"unknown-account",
+	"bad-credentials",
+	"token-invalid",
+	"token-expired",
+	"disabled-account",
+] as const;
+export type SipAuthEventType = (typeof SIP_AUTH_EVENT_TYPES)[number];
+
 // ---------------------------------------------------------------------------------------------
 // Rows
 // ---------------------------------------------------------------------------------------------
@@ -873,6 +908,154 @@ export interface AuditLogQueryParams {
 	readonly resourceRef?: string;
 	readonly limit?: number;
 	readonly cursor?: string;
+}
+
+// ---------------------------------------------------------------------------------------------
+// SIP security: the network allowlist, and the attack log
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One CIDR access-control entry.
+ *
+ * `network` arrives NORMALISED by PostgreSQL's own `cidr` type, so a row that was written as
+ * `203.0.113.0/24` comes back as `203.0.113.0/24` and one written as a bare `198.51.100.7` comes
+ * back as `198.51.100.7/32`. That is why the form normalises before sending — see
+ * `lib/pbx/cidr.ts` — rather than letting the two spellings become two rows that collide on the
+ * unique index only after the database has widened them.
+ *
+ * There is no destination trio and nothing points at one of these, so a delete is never refused
+ * for a reference. It is also not a routing input: saving one recompiles nothing, and reaching the
+ * media server takes a generator run and a transport rebuild that this app does not perform.
+ */
+export interface SipAclEntryRow extends EntityRow {
+	readonly name: string | null;
+	readonly network: string;
+	readonly action: SipAclAction;
+	readonly scope: SipAclScope;
+	/** Lower wins. Ties are broken by the longer prefix. */
+	readonly priority: number;
+	readonly description: string | null;
+	readonly enabled: boolean;
+}
+
+/**
+ * One refused authentication attempt.
+ *
+ * Not an `EntityRow`: `sip_auth_event` is append-only in the database — the tenant role holds
+ * `SELECT, INSERT` and nothing else — so there is no `updatedAt` for it to carry and no create,
+ * update or delete call for this shape anywhere in this app.
+ *
+ * `organizationId` is `NOT NULL` on the server, which bounds what this table can hold and is worth
+ * knowing before reading it as "every attack": an attempt against an account that matches no
+ * tenant has nowhere to be filed and is deliberately absent. Those are refused at the media server
+ * and appear in its security log, not here.
+ */
+export interface SipAuthEventRow {
+	readonly id: string;
+	readonly organizationId: string;
+	readonly eventType: SipAuthEventType;
+	readonly scope: SipAclScope;
+	/** The source address. Null when the surface that refused did not know it. */
+	readonly sourceIp: string | null;
+	/** The account, extension number or MAC that was attempted. Never a credential. */
+	readonly accountRef: string | null;
+	readonly transport: string | null;
+	readonly userAgent: string | null;
+	/** Whatever names the refusal: the matched ACL entry, the rate-limit window, the device id. */
+	readonly detail: Readonly<Record<string, unknown>> | null;
+	readonly requestId: string | null;
+	readonly occurredAt: string;
+	readonly createdAt: string;
+}
+
+/**
+ * The query string `GET /api/v1/sip-auth-events` accepts.
+ *
+ * The same shape as {@link AuditLogQueryParams} — a defaulted, echoed window, a keyset cursor and
+ * exact filters — because the server deliberately made the two ledgers page identically. The one
+ * divergence is the default window: SEVEN days here rather than thirty, because an attack log is
+ * read operationally ("what is happening now") and a change ledger historically.
+ *
+ * `sourceIp` is an ADDRESS and not a network: the server refuses a prefix, because the question an
+ * operator asks of this table is "what has this address been doing", which is the address they are
+ * about to block.
+ */
+export interface SipAuthEventQueryParams {
+	readonly from?: string;
+	readonly to?: string;
+	readonly eventType?: SipAuthEventType;
+	readonly scope?: SipAclScope;
+	readonly sourceIp?: string;
+	readonly accountRef?: string;
+	readonly limit?: number;
+	readonly cursor?: string;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Webhooks
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The four event families a subscription may select, and the subject root each is written as.
+ *
+ * Mirrored from `apps/api/src/pbx/webhooks/webhook-selectors.ts`, which builds them from
+ * `@optimiq-voice/events`' `SUBJECT_ROOTS`. That package is not a dependency of this app — it
+ * would drag the broker's codecs into the browser bundle — so the four roots are restated and
+ * `webhook-selectors.spec.ts` pins the grammar rather than the import.
+ *
+ * `cdr` is `cdr.leg.v1`, not `cdr.evt.v1`. The other four families the platform publishes —
+ * `media`, `registration`, `audit`, `provision` — are deliberately not deliverable: they are
+ * engine plumbing, a per-REGISTER firehose, a loop over the ledger that records webhook edits, and
+ * credential-adjacent provisioning detail respectively.
+ */
+export const WEBHOOK_FAMILIES = ["call", "queue", "voicemail", "cdr"] as const;
+export type WebhookFamily = (typeof WEBHOOK_FAMILIES)[number];
+
+export const WEBHOOK_FAMILY_ROOTS: Readonly<Record<WebhookFamily, string>> = {
+	call: "calls.evt.v1",
+	queue: "queue.evt.v1",
+	voicemail: "voicemail.evt.v1",
+	cdr: "cdr.leg.v1",
+};
+
+/**
+ * One outbound webhook subscription.
+ *
+ * ## `secret` is present on exactly one response and nowhere else
+ *
+ * `secret` is in `secretColumns` on the server's resource, so the generic redaction strips it from
+ * every list, get and update body. The single exception is the CREATE response, which re-attaches
+ * the key — generated or supplied — precisely once, because a signing key nobody can read is a
+ * subscription nobody can verify.
+ *
+ * It is declared optional here rather than in a separate row type so that the one screen which
+ * legitimately receives it does not need a cast, and so this comment sits on the field. A screen
+ * must never render it from a list row: it is not there, and `undefined` in a "Secret" column
+ * would read as "this endpoint has no secret" when every endpoint has one.
+ *
+ * ## The failure fields are read-only and are the whole answer to "why did it stop?"
+ *
+ * `consecutiveFailures` counts CONSECUTIVE failures and is zeroed by the first success.
+ * `autoDisabledAt` is set when the platform switched the subscription off on the tenant's behalf,
+ * and is deliberately separate from `enabled`: an administrator who disabled an endpoint knows
+ * why, and one who finds it disabled needs to be told that we did it and when. Re-enabling through
+ * `PATCH { enabled: true }` clears both, which is what makes "fix the endpoint, turn it back on" a
+ * complete recovery rather than one that re-disables on the next bad delivery.
+ */
+export interface WebhookRow extends EntityRow {
+	readonly description: string | null;
+	readonly url: string;
+	/** Present ONLY on the create response. See the note above; never render it from a list row. */
+	readonly secret?: string;
+	readonly eventSelectors: readonly string[];
+	readonly enabled: boolean;
+	readonly consecutiveFailures: number;
+	readonly lastFailureAt: string | null;
+	/** One line: a status code, a timeout, a DNS error. Never a response body. */
+	readonly lastFailureReason: string | null;
+	readonly lastSuccessAt: string | null;
+	/** When the platform disabled this endpoint itself, after consecutive failures. */
+	readonly autoDisabledAt: string | null;
 }
 
 // ---------------------------------------------------------------------------------------------

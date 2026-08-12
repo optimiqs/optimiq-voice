@@ -30,6 +30,29 @@ export const routes = {
 	recordings: "/recordings",
 	cdr: "/cdr",
 	mediaLibrary: "/media",
+	/**
+	 * The change ledger.
+	 *
+	 * A top-level route under "Insight" rather than a tab of `/settings`, and the shape is what
+	 * decides it: `/settings` is a stack of FORMS gated by `settings.read`, and this is a windowed,
+	 * cursor-paged, read-only table gated by `audit.read` — the same surface as `/cdr` and
+	 * `/recordings`, which is exactly where the app already puts append-only ledgers. Filing it as a
+	 * settings tab would have put a table nobody can edit behind a nav label that means "things you
+	 * change", and given it a `PAGE_PERMISSIONS` entry that disagreed with every one of its siblings.
+	 */
+	auditLog: "/audit-log",
+	/**
+	 * SIP security: the network allowlist, and the log of what it refused.
+	 *
+	 * Its own route rather than a settings tab, for the reason `sip-acl.controller.ts` gives for its
+	 * own permission: `settings.read` is held by every self-service role so a user's preferences
+	 * screen renders, and the list of networks that may register phones or terminate calls is not a
+	 * preference. A tab in the settings bar would have been visible to everyone who can see their
+	 * own notification preferences.
+	 */
+	security: "/security",
+	/** Outbound webhook subscriptions — the integrator surface, gated by `webhooks.*`. */
+	webhooks: "/webhooks",
 	settings: "/settings",
 	members: "/settings/members",
 	apiKeys: "/settings/api-keys",
@@ -149,6 +172,25 @@ export type NumberTab = (typeof NUMBER_TABS)[number];
 
 export function numberTabHref(tab: NumberTab): string {
 	return tab === "numbers" ? routes.numbers : `${routes.numbers}?tab=${tab}`;
+}
+
+/**
+ * The Security page's two sections.
+ *
+ * The rules and the refusals are two views of ONE subject — who may reach the SIP edge — and both
+ * are gated by `security.read`. Two sidebar entries would be two ways to say "SIP security", and
+ * the second one would need a `PAGE_PERMISSIONS` line repeating the first one's permission.
+ *
+ * They belong together for a stronger reason than shared permissions, though: the attack log is how
+ * an administrator finds out a rule is wrong, and the rule list is where they fix it. Splitting them
+ * across two routes would put the question and the answer one navigation apart.
+ */
+export const SECURITY_TABS = ["access-rules", "auth-failures"] as const;
+
+export type SecurityTab = (typeof SECURITY_TABS)[number];
+
+export function securityTabHref(tab: SecurityTab): string {
+	return tab === "access-rules" ? routes.security : `${routes.security}?tab=${tab}`;
 }
 
 /**
