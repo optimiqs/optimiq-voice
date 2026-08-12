@@ -5,6 +5,7 @@ import { device, deviceKey, deviceLine, deviceProfile, deviceProfileKey } from "
 import { dialByNameDirectory } from "./directory-schema";
 import { emergencyAddress } from "./emergency-schema";
 import { extension, extensionUser } from "./extensions-schema";
+import { faxMessage, faxServer } from "./fax-schema";
 import { callBlockRule, featureCode } from "./features-schema";
 import { ivrMenu, ivrMenuOption } from "./ivr-schema";
 import { orgLimit } from "./limits-schema";
@@ -55,6 +56,8 @@ export const pbxTables = {
 	emergencyAddress,
 	extension,
 	extensionUser,
+	faxMessage,
+	faxServer,
 	featureCode,
 	inboundRoute,
 	ivrMenu,

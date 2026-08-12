@@ -4,6 +4,8 @@ import { TelnyxApiError, TelnyxResponseShapeError, TelnyxTransportError } from "
 import { type FakeTelnyxServer, startFakeTelnyxServer } from "./fake";
 import { availableNumbersQuery } from "./resources/available-numbers";
 import { assertTelnyxPassword, assertTelnyxUserName } from "./resources/credential-connections";
+import { isTelnyxFaxEvent, TelnyxFaxRequestError } from "./resources/faxes";
+import { asFaxWebhook, parseTelnyxWebhookEvent } from "./webhooks/events";
 
 /**
  * The client, exercised end to end against the in-package fake.
@@ -376,6 +378,174 @@ describe("outboundVoiceProfiles", () => {
 		).toBe(false);
 		await client.outboundVoiceProfiles.remove(created.id);
 		expect(await client.outboundVoiceProfiles.list()).toHaveLength(0);
+	});
+});
+
+describe("faxes", () => {
+	it("queues a send and returns the fax with its carrier id, echoing our client_state", async () => {
+		const client = makeClient();
+		const fax = await client.faxes.send({
+			connectionId: "conn-1",
+			to: "+13125551111",
+			from: "+13125550000",
+			mediaUrl: "https://media.example/doc.pdf",
+			clientState: "fax-message-row-1",
+		});
+		expect(fax.direction).toBe("outbound");
+		expect(fax.status).toBe("queued");
+		expect(fax.client_state).toBe("fax-message-row-1");
+		expect(fax.id).toBeString();
+	});
+
+	it("answers 202 Accepted on send, not 200", async () => {
+		const client = makeClient();
+		server.state.requests.length = 0;
+		await client.faxes.send({
+			connectionId: "conn-1",
+			to: "+13125551111",
+			from: "+13125550000",
+			mediaUrl: "https://media.example/doc.pdf",
+			clientState: "row-2",
+		});
+		// One request only: a queued send must never auto-retry (a second attempt is a second fax).
+		expect(server.state.requests).toHaveLength(1);
+		expect(server.state.requests[0]?.method).toBe("POST");
+		expect(server.state.requests[0]?.path).toBe("/faxes");
+	});
+
+	it("reads a fax back by id after sending it", async () => {
+		const client = makeClient();
+		const sent = await client.faxes.send({
+			connectionId: "conn-1",
+			to: "+13125551111",
+			from: "+13125550000",
+			mediaName: "stored-doc",
+			clientState: "row-3",
+		});
+		const read = await client.faxes.get(sent.id);
+		expect(read.id).toBe(sent.id);
+		expect(read.media_name).toBe("stored-doc");
+	});
+
+	it("refuses a send with neither media_url nor media_name before any round trip", async () => {
+		const client = makeClient();
+		server.state.requests.length = 0;
+		await expect(
+			client.faxes.send({
+				connectionId: "conn-1",
+				to: "+13125551111",
+				from: "+13125550000",
+				clientState: "row-4",
+			}),
+		).rejects.toThrow(TelnyxFaxRequestError);
+		expect(server.state.requests).toHaveLength(0);
+	});
+
+	it("refuses a send with both media_url and media_name before any round trip", async () => {
+		const client = makeClient();
+		server.state.requests.length = 0;
+		await expect(
+			client.faxes.send({
+				connectionId: "conn-1",
+				to: "+13125551111",
+				from: "+13125550000",
+				mediaUrl: "https://media.example/doc.pdf",
+				mediaName: "stored-doc",
+				clientState: "row-5",
+			}),
+		).rejects.toThrow(TelnyxFaxRequestError);
+		expect(server.state.requests).toHaveLength(0);
+	});
+
+	it("does not retry a send that fails, because a repeat could send a second fax", async () => {
+		const client = makeClient();
+		server.state.failNext(500);
+		server.state.requests.length = 0;
+		await expect(
+			client.faxes.send({
+				connectionId: "conn-1",
+				to: "+13125551111",
+				from: "+13125550000",
+				mediaUrl: "https://media.example/doc.pdf",
+				clientState: "row-6",
+			}),
+		).rejects.toThrow(TelnyxApiError);
+		expect(server.state.requests).toHaveLength(1);
+	});
+});
+
+describe("fax webhooks", () => {
+	function faxEnvelope(eventType: string, payload: Record<string, unknown>) {
+		return {
+			data: {
+				record_type: "event",
+				event_type: eventType,
+				id: "evt-1",
+				occurred_at: "2026-08-12T00:00:00.000Z",
+				payload,
+			},
+			meta: { attempt: 1, delivered_to: "https://example/webhooks/telnyx" },
+		};
+	}
+
+	it("recognizes every modelled fax event type and rejects an unmodelled one", () => {
+		expect(isTelnyxFaxEvent("fax.delivered")).toBe(true);
+		expect(isTelnyxFaxEvent("fax.received")).toBe(true);
+		expect(isTelnyxFaxEvent("fax.queued")).toBe(true);
+		expect(isTelnyxFaxEvent("fax.bogus")).toBe(false);
+		expect(isTelnyxFaxEvent("number_order.complete")).toBe(false);
+	});
+
+	it("narrows an outbound fax.delivered to the fax payload", () => {
+		const event = parseTelnyxWebhookEvent(
+			faxEnvelope("fax.delivered", {
+				fax_id: "fax-1",
+				direction: "outbound",
+				status: "delivered",
+				from: "+13125550000",
+				to: "+13125551111",
+				client_state: "row-7",
+				page_count: 2,
+			}),
+		);
+		expect(event).toBeDefined();
+		const fax = asFaxWebhook(event as never);
+		expect(fax?.eventType).toBe("fax.delivered");
+		expect(fax?.fax.fax_id).toBe("fax-1");
+		expect(fax?.fax.page_count).toBe(2);
+		expect(fax?.fax.client_state).toBe("row-7");
+	});
+
+	it("narrows an inbound fax.received carrying the rendered document url", () => {
+		const event = parseTelnyxWebhookEvent(
+			faxEnvelope("fax.received", {
+				fax_id: "fax-2",
+				direction: "inbound",
+				status: "received",
+				from: "+13125559999",
+				to: "+13125550000",
+				media_url: "https://media.telnyx/received.tiff",
+				page_count: 1,
+			}),
+		);
+		const fax = asFaxWebhook(event as never);
+		expect(fax?.eventType).toBe("fax.received");
+		expect(fax?.fax.direction).toBe("inbound");
+		expect(fax?.fax.media_url).toBe("https://media.telnyx/received.tiff");
+	});
+
+	it("returns undefined for a non-fax event, leaving it for another narrower", () => {
+		const event = parseTelnyxWebhookEvent(
+			faxEnvelope("number_order.complete", { id: "order-1", status: "success" }),
+		);
+		expect(asFaxWebhook(event as never)).toBeUndefined();
+	});
+
+	it("returns undefined for a fax event whose payload is missing fax_id", () => {
+		const event = parseTelnyxWebhookEvent(
+			faxEnvelope("fax.failed", { direction: "outbound", status: "failed" }),
+		);
+		expect(asFaxWebhook(event as never)).toBeUndefined();
 	});
 });
 

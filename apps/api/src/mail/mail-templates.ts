@@ -310,6 +310,85 @@ export function voicemailMail(input: VoicemailMailInput): RenderedMail {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Fax-to-email
+
+export interface FaxReceivedMailInput {
+	readonly appName: string;
+	readonly fromName?: string | undefined;
+	/** The DID the fax arrived on. */
+	readonly toNumber: string;
+	/** The sending fax number. */
+	readonly fromNumber: string;
+	readonly pages?: number | undefined;
+	readonly receivedAt: Date;
+	/**
+	 * A signed, expiring link to the document, when one could be minted. Absent when
+	 * `FAX_MEDIA_URL_SECRET` is not configured — the notification still goes out with the metadata
+	 * and the inbox link, because "a fax arrived from +1…" is the time-critical part.
+	 */
+	readonly documentUrl?: string | undefined;
+	/** The fax inbox in the web UI. Absent when no app URL is configured. */
+	readonly inboxUrl?: string | undefined;
+}
+
+/**
+ * The fax-to-email notification.
+ *
+ * A signed, expiring LINK rather than an attachment, deliberately — the same choice
+ * `voicemail-email.service.ts` defends for voicemail audio: an attachment is a copy of a customer's
+ * document sitting in an arbitrary mail store forever with no revocation, and rotating the URL secret
+ * kills every outstanding link while nothing kills an attachment. The document is the fax; the mail
+ * is how you learn it arrived and where to open it.
+ */
+export function faxReceivedMail(input: FaxReceivedMailInput): RenderedMail {
+	const received = input.receivedAt.toISOString().replace("T", " ").slice(0, 19) + " UTC";
+	const pages =
+		input.pages === undefined ? undefined : `${input.pages} page${input.pages === 1 ? "" : "s"}`;
+
+	const textLines = [
+		`New fax received on ${input.toNumber}.`,
+		"",
+		`From:     ${input.fromNumber}`,
+		`Received: ${received}`,
+	];
+	if (pages !== undefined) {
+		textLines.push(`Pages:    ${pages}`);
+	}
+	if (input.documentUrl !== undefined) {
+		textLines.push("", "Open the fax (this link expires shortly):", input.documentUrl);
+	}
+	if (input.inboxUrl !== undefined) {
+		textLines.push("", "Open the fax inbox:", input.inboxUrl);
+	}
+
+	const htmlParts: string[] = [
+		escapeHtml(`New fax received on ${input.toNumber}.`),
+		[
+			`<span style="color:#666">From</span> ${escapeHtml(input.fromNumber)}<br/>`,
+			`<span style="color:#666">Received</span> ${escapeHtml(received)}`,
+			pages === undefined ? "" : `<br/><span style="color:#666">Pages</span> ${escapeHtml(pages)}`,
+		].join("\n"),
+	];
+	if (input.documentUrl !== undefined) {
+		htmlParts.push(
+			actionLink("Open the fax", input.documentUrl),
+			`<span style="color:#666;font-size:13px">This link expires shortly.</span>`,
+		);
+	}
+	if (input.inboxUrl !== undefined) {
+		htmlParts.push(
+			`<a href="${escapeHtml(input.inboxUrl)}" style="color:#111">Open the fax inbox</a>`,
+		);
+	}
+
+	return {
+		subject: `New fax from ${input.fromNumber}${pages === undefined ? "" : ` (${pages})`}`,
+		text: textLines.join("\n"),
+		html: shell(input.fromName ?? input.appName, htmlParts),
+	};
+}
+
+// ---------------------------------------------------------------------------------------------
 // Kari's Law
 // ---------------------------------------------------------------------------------------------
 

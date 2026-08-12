@@ -14,6 +14,7 @@ export * from "./devices-schema";
 export * from "./directory-schema";
 export * from "./emergency-schema";
 export * from "./extensions-schema";
+export * from "./fax-schema";
 export * from "./features-schema";
 export * from "./ivr-schema";
 export * from "./limits-schema";

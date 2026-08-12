@@ -1,6 +1,7 @@
 import { createServer, type Server } from "node:http";
 import {
 	type FakeConnection,
+	type FakeFax,
 	type FakeNumberInventoryEntry,
 	type FakeOrder,
 	type FakeProfile,
@@ -244,6 +245,36 @@ function profileBody(profile: FakeProfile) {
 		billing_group_id: null,
 		created_at: profile.createdAt,
 		updated_at: profile.createdAt,
+	};
+}
+
+function faxBody(fax: FakeFax) {
+	return {
+		id: fax.id,
+		record_type: "fax",
+		direction: fax.direction,
+		status: fax.status,
+		connection_id: fax.connectionId,
+		from: fax.from,
+		to: fax.to,
+		from_display_name: null,
+		quality: "normal",
+		media_url: fax.mediaUrl ?? null,
+		media_name: fax.mediaName ?? null,
+		// Telnyx echoes the source document back under original_media_url; store_media is off by
+		// default, so stored_media_url stays null until a delivered webhook fills it.
+		original_media_url: fax.mediaUrl ?? null,
+		stored_media_url: null,
+		page_count: null,
+		store_media: false,
+		t38_enabled: true,
+		monochrome: false,
+		webhook_url: null,
+		client_state: fax.clientState ?? null,
+		failure_reason: null,
+		call_duration_secs: null,
+		created_at: fax.createdAt,
+		updated_at: fax.createdAt,
 	};
 }
 
@@ -599,6 +630,57 @@ function route(request: ParsedRequest, state: FakeTelnyxState): Reply {
 			state.profiles.delete(profileId);
 			return { status: 200, body: { data: profileBody(profile) } };
 		}
+	}
+
+	// ---- programmable fax ------------------------------------------------------------------
+	if (method === "POST" && path === "/faxes") {
+		const connectionId = typeof body.connection_id === "string" ? body.connection_id : "";
+		const to = typeof body.to === "string" ? body.to : "";
+		const from = typeof body.from === "string" ? body.from : "";
+		if (connectionId.length === 0) {
+			return { status: 422, body: errorBody("10027", "Unprocessable Entity", "connection_id") };
+		}
+		if (to.length === 0) {
+			return { status: 422, body: errorBody("10027", "Unprocessable Entity", "to") };
+		}
+		if (from.length === 0) {
+			return { status: 422, body: errorBody("10027", "Unprocessable Entity", "from") };
+		}
+		const mediaUrl = typeof body.media_url === "string" ? body.media_url : undefined;
+		const mediaName = typeof body.media_name === "string" ? body.media_name : undefined;
+		// Exactly one of the two, same rule the client enforces before the round trip.
+		if ((mediaUrl === undefined) === (mediaName === undefined)) {
+			return {
+				status: 422,
+				body: errorBody("10027", "Unprocessable Entity", "exactly one of media_url or media_name"),
+			};
+		}
+		const fax: FakeFax = {
+			id: state.newId(),
+			direction: "outbound",
+			// Queued, not sent — the delivery is asynchronous and reported over webhooks.
+			status: "queued",
+			connectionId,
+			to,
+			from,
+			...(mediaUrl === undefined ? {} : { mediaUrl }),
+			...(mediaName === undefined ? {} : { mediaName }),
+			...(typeof body.client_state === "string" ? { clientState: body.client_state } : {}),
+			createdAt: state.now(),
+		};
+		state.faxes.set(fax.id, fax);
+		// 202 Accepted — the one endpoint in this surface that answers 202. A client asserting 200
+		// would break here, which is the point.
+		return { status: 202, body: { data: faxBody(fax) } };
+	}
+
+	const faxMatch = /^\/faxes\/([^/]+)$/u.exec(path);
+	if (method === "GET" && faxMatch) {
+		const fax = state.faxes.get(decodeURIComponent(faxMatch[1] ?? ""));
+		if (fax === undefined) {
+			return { status: 404, body: errorBody("10005", "Resource not found") };
+		}
+		return { status: 200, body: { data: faxBody(fax) } };
 	}
 
 	return { status: 404, body: errorBody("10005", "Resource not found", `${method} ${path}`) };

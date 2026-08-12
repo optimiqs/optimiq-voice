@@ -50,6 +50,26 @@ export {
 	type UpdateCredentialConnectionInput,
 } from "./resources/credential-connections";
 export {
+	assertFaxMedia,
+	type FaxesResource,
+	isTelnyxFaxEvent,
+	type SendFaxInput,
+	TELNYX_FAX_DIRECTIONS,
+	TELNYX_FAX_EVENT_TYPES,
+	TELNYX_FAX_EVENTS,
+	TELNYX_FAX_QUALITIES,
+	TELNYX_FAX_STATUSES,
+	type TelnyxFax,
+	type TelnyxFaxDirection,
+	type TelnyxFaxEventType,
+	TelnyxFaxRequestError,
+	type TelnyxFaxQuality,
+	type TelnyxFaxStatus,
+	type TelnyxFaxWebhookPayload,
+	telnyxFaxSchema,
+	telnyxFaxWebhookPayloadSchema,
+} from "./resources/faxes";
+export {
 	type CreateNumberOrderInput,
 	numberOrderSchema,
 	TELNYX_ORDER_STATUSES,
@@ -123,9 +143,11 @@ export {
 	verifyTelnyxWebhook,
 } from "./webhooks/signature";
 export {
+	asFaxWebhook,
 	asNumberOrderWebhook,
 	parseTelnyxWebhookEvent,
 	TELNYX_NUMBER_ORDER_EVENT,
+	type TelnyxFaxWebhook,
 	type TelnyxNumberOrderWebhook,
 	type TelnyxWebhookEvent,
 } from "./webhooks/events";

@@ -89,6 +89,31 @@ export const pbxRelations = defineRelations(pbxTables, (r) => ({
 			from: r.phoneNumber.id,
 			to: r.inboundRoute.phoneNumberId,
 		}),
+		faxServers: r.many.faxServer({
+			from: r.phoneNumber.id,
+			to: r.faxServer.phoneNumberId,
+		}),
+	},
+
+	// --- Fax ---------------------------------------------------------------------------------
+	faxServer: {
+		// Optional: the DID reference is nullable and `set null`, so a server can exist unbound.
+		phoneNumber: r.one.phoneNumber({
+			from: r.faxServer.phoneNumberId,
+			to: r.phoneNumber.id,
+		}),
+		messages: r.many.faxMessage({
+			from: r.faxServer.id,
+			to: r.faxMessage.faxServerId,
+		}),
+	},
+	faxMessage: {
+		// Not optional: a message row whose server is gone cannot exist — the foreign key cascades.
+		faxServer: r.one.faxServer({
+			from: r.faxMessage.faxServerId,
+			to: r.faxServer.id,
+			optional: false,
+		}),
 	},
 
 	// --- Routing -----------------------------------------------------------------------------

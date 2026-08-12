@@ -48,6 +48,14 @@ import { ExtensionFeatureRpcController } from "./extensions/extension-feature-rp
 import { ExtensionFeatureService } from "./extensions/extension-feature.service";
 import { ExtensionsController } from "./extensions/extensions.controller";
 import { ExtensionsService } from "./extensions/extensions.service";
+import { FaxEmailService } from "./fax/fax-email.service";
+import { loadFaxEnv } from "./fax/fax-env";
+import { FaxInboundService } from "./fax/fax-inbound.service";
+import { createFaxMediaFetch } from "./fax/fax-media";
+import { FaxSendWorker } from "./fax/fax-send-worker.service";
+import { FaxController } from "./fax/fax.controller";
+import { FaxService } from "./fax/fax.service";
+import { FAX_ENV, FAX_MEDIA_FETCH, FAX_STORE } from "./fax/fax.tokens";
 import { FeatureCodesController } from "./feature-codes/feature-codes.controller";
 import { FeatureCodesService } from "./feature-codes/feature-codes.service";
 import { InboundRoutesController } from "./inbound-routes/inbound-routes.controller";
@@ -150,6 +158,7 @@ import { WebhooksController } from "./webhooks/webhooks.controller";
 import { WebhooksService } from "./webhooks/webhooks.service";
 import type { ObjectStore } from "../storage";
 import type { TranscriptionEnv, TranscriptionProvider } from "../transcription";
+import type { FaxEnv } from "./fax/fax-env";
 import type { PbxEnv } from "./shared/pbx-env";
 import type { ProjectionName } from "./shared/projection-outbox";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
@@ -375,6 +384,7 @@ const logger = getLogger("api.pbx");
 		CarrierController,
 		CarrierTrunkController,
 		CarrierWebhookController,
+		FaxController,
 	],
 	providers: [
 		/**
@@ -384,6 +394,34 @@ const logger = getLogger("api.pbx");
 		AuthzService,
 		...carrierProviders,
 		CarrierService,
+		/**
+		 * The fax slice: carrier-edge fax servers, inbox/outbox, the send worker and fax-to-email.
+		 *
+		 * Its own env, store and media fetcher, kept beside the services that use them. The store is a
+		 * fifth object class rooted at `FAX_OBJECT_ROOT` — unlike prompts, greetings and voicemail it
+		 * is never read by Asterisk off the shared mount, so it is the one class an operator can place
+		 * anywhere. The media fetcher is the one seam in this API that downloads a remote URL into the
+		 * store, injected so a test drives it without a network.
+		 */
+		{ provide: FAX_ENV, useFactory: (): FaxEnv => loadFaxEnv() },
+		{
+			provide: FAX_STORE,
+			useFactory: (env: FaxEnv): ObjectStore => {
+				const storage = loadStorageEnv();
+				const store = createObjectStore(storage, { root: env.FAX_OBJECT_ROOT });
+				logger.info(
+					{ root: env.FAX_OBJECT_ROOT, driver: store.driver },
+					`fax documents: ${describeObjectStore(store, storage)}`,
+				);
+				return store;
+			},
+			inject: [FAX_ENV],
+		},
+		{ provide: FAX_MEDIA_FETCH, useFactory: () => createFaxMediaFetch() },
+		FaxService,
+		FaxEmailService,
+		FaxInboundService,
+		FaxSendWorker,
 		SipCredentialsService,
 		SipCredentialsResponder,
 		{ provide: PBX_ENV, useFactory: (): PbxEnv => loadPbxEnv() },

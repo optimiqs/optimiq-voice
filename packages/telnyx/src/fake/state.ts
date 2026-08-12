@@ -56,6 +56,19 @@ export interface FakeConnection {
 	readonly createdAt: string;
 }
 
+export interface FakeFax {
+	readonly id: string;
+	readonly direction: "inbound" | "outbound";
+	status: string;
+	readonly connectionId: string;
+	readonly to: string;
+	readonly from: string;
+	readonly mediaUrl?: string;
+	readonly mediaName?: string;
+	readonly clientState?: string;
+	readonly createdAt: string;
+}
+
 export interface FakeProfile {
 	readonly id: string;
 	name: string;
@@ -103,6 +116,7 @@ export class FakeTelnyxState {
 	readonly orders = new Map<string, FakeOrder>();
 	readonly connections = new Map<string, FakeConnection>();
 	readonly profiles = new Map<string, FakeProfile>();
+	readonly faxes = new Map<string, FakeFax>();
 	/** Every request the fake saw, so a spec can assert headers and bodies after the fact. */
 	readonly requests: {
 		method: string;
@@ -156,6 +170,7 @@ export class FakeTelnyxState {
 		this.orders.clear();
 		this.connections.clear();
 		this.profiles.clear();
+		this.faxes.clear();
 		this.requests.length = 0;
 		this.failureQueue.length = 0;
 		for (const entry of this.inventory) {

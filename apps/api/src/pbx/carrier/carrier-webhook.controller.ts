@@ -1,6 +1,7 @@
 import { Controller, Headers, HttpCode, HttpStatus, Inject, Post, Req } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
 import {
+	asFaxWebhook,
 	asNumberOrderWebhook,
 	parseTelnyxWebhookEvent,
 	TELNYX_SIGNATURE_HEADER,
@@ -9,6 +10,7 @@ import {
 	verifyTelnyxWebhook,
 } from "@optimiq-voice/telnyx";
 import { PublicRoute } from "../../auth/public-route.decorator";
+import { FaxInboundService } from "../fax/fax-inbound.service";
 import {
 	CarrierSignatureInvalidException,
 	CarrierWebhookNotConfiguredException,
@@ -54,7 +56,10 @@ const logger = getLogger("api.pbx");
  */
 @Controller("api/v1/carrier/webhooks")
 export class CarrierWebhookController {
-	constructor(@Inject(CARRIER_ENV) private readonly env: CarrierEnv) {}
+	constructor(
+		@Inject(CARRIER_ENV) private readonly env: CarrierEnv,
+		@Inject(FaxInboundService) private readonly fax: FaxInboundService,
+	) {}
 
 	/**
 	 * `@PublicRoute()` — the deny-by-default guard has to be opted out of explicitly, and this is
@@ -65,10 +70,10 @@ export class CarrierWebhookController {
 	@Post("telnyx")
 	@PublicRoute()
 	@HttpCode(HttpStatus.OK)
-	handle(
+	async handle(
 		@Req() request: RawBodyRequest<FastifyRequest>,
 		@Headers() headers: Record<string, string | undefined>,
-	): { readonly received: true } {
+	): Promise<{ readonly received: true }> {
 		const publicKey = this.env.TELNYX_PUBLIC_KEY;
 		if (publicKey === undefined) {
 			throw new CarrierWebhookNotConfiguredException();
@@ -108,6 +113,19 @@ export class CarrierWebhookController {
 			// never make it parse, and a permanently-failing endpoint is one Telnyx eventually
 			// disables — taking the events we DO care about with it.
 			logger.info("received an unrecognized telnyx webhook envelope");
+			return { received: true };
+		}
+
+		// Programmable Fax: file inbound faxes and advance outbound rows through their lifecycle. The
+		// service never throws — a webhook must be answered 200 or Telnyx eventually disables the
+		// endpoint — so a fax we cannot handle is logged there and still 200s here.
+		const fax = asFaxWebhook(event);
+		if (fax !== undefined) {
+			const outcome = await this.fax.handle(fax);
+			logger.info(
+				{ eventId: event.id, eventType: event.eventType, outcome },
+				"telnyx fax webhook handled",
+			);
 			return { received: true };
 		}
 

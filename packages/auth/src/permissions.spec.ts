@@ -168,11 +168,17 @@ describe("PERMISSIONS", () => {
 	 * has not been budgeted, it has been rounded to. Four spare is what the previous ceiling left and
 	 * is what this one leaves.
 	 *
+	 * W13 — Fax — then spent four: `faxes.*` is a read/write/delete trio plus a `send`, the same
+	 * shape `queues` takes with `join`. A fax server is a real CRUD resource with its own table and
+	 * inbox/outbox, and `send` is the one act that spends carrier money, so it earns its own grant the
+	 * way `numbers.order` does. That lands the model on 113, so the ceiling moves to 117 to keep the
+	 * same four spare it has always left.
+	 *
 	 * The instruction stands unchanged for whatever comes next.
 	 */
 	it("stays within the size the collapsed FusionPBX model targets", () => {
 		expect(PERMISSIONS.length).toBeGreaterThanOrEqual(60);
-		expect(PERMISSIONS.length).toBeLessThanOrEqual(112);
+		expect(PERMISSIONS.length).toBeLessThanOrEqual(117);
 	});
 
 	it("contains no duplicates", () => {
@@ -225,6 +231,7 @@ describe("PERMISSIONS", () => {
 			"voicemail",
 			"conferences",
 			"park-lots",
+			"faxes",
 			"recordings",
 			"cdr",
 			"audit",
@@ -288,6 +295,7 @@ describe("PERMISSIONS", () => {
 			"queues",
 			"conferences",
 			"park-lots",
+			"faxes",
 			// The T2 admin block's three CRUD resources. `org-limits` is absent on purpose: there is
 			// no delete, because a limit is cleared by nulling the column rather than by removing the
 			// one row an organization has.

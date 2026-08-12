@@ -8,6 +8,7 @@ import { CARRIER_PROVIDERS } from "./carrier-schema";
 import { destinationCheck, namedDestinationColumns } from "./columns";
 import { DIRECTORY_SEARCH_FIELDS } from "./directory-schema";
 import { EXTENSION_USER_ROLES, RECORD_POLICIES, TOLL_CLASSES } from "./extensions-schema";
+import { FAX_DIRECTIONS, FAX_MESSAGE_STATUSES } from "./fax-schema";
 import { FEATURE_CODE_ACTIONS } from "./features-schema";
 import { PROMPT_KINDS } from "./media-schema";
 import {
@@ -30,6 +31,8 @@ const CONST_TUPLES = {
 	DESTINATION_TYPES,
 	DIRECTORY_SEARCH_FIELDS,
 	EXTENSION_USER_ROLES,
+	FAX_DIRECTIONS,
+	FAX_MESSAGE_STATUSES,
 	FEATURE_CODE_ACTIONS,
 	PROMPT_KINDS,
 	QUEUE_AGENT_STATUSES,
@@ -192,6 +195,10 @@ describe("tenant tables", () => {
 		// `organization_id`; this one is partial over the two working statuses and is the size of the
 		// backlog rather than of the table.
 		"voicemail_message_transcription_sweep_idx",
+		// The outbound fax send queue, and the same argument once more: the send worker asks "which
+		// outbound faxes ANYWHERE still owe a send?" on the untenanted handle with no session
+		// organization. Partial over the two working statuses, the size of the backlog, not the table.
+		"fax_message_send_queue_idx",
 	]);
 
 	it("leads every composite index with organization_id so the tenant predicate is usable", () => {
@@ -1048,5 +1055,78 @@ describe("conference depth", () => {
 	it("keeps the tones separate from the name announcement", () => {
 		expect(columns.get("announce_join_leave")?.notNull).toBe(true);
 		expect(columns.get("announce_join_leave")?.default).toBe(true);
+	});
+});
+
+describe("fax servers and messages", () => {
+	const serverConfig = getTableConfig(pbxTables.faxServer);
+	const messageConfig = getTableConfig(pbxTables.faxMessage);
+	const serverColumns = new Map(serverConfig.columns.map((column) => [column.name, column]));
+	const messageColumns = new Map(messageConfig.columns.map((column) => [column.name, column]));
+
+	it("binds a fax server to its DID nullably, so a server can exist before a number is bound", () => {
+		const column = serverColumns.get("phone_number_id");
+		expect(column?.getSQLType()).toBe("uuid");
+		expect(column?.notNull).toBe(false);
+		const fk = serverConfig.foreignKeys.find(
+			(candidate) => candidate.reference().columns[0]?.name === "phone_number_id",
+		);
+		expect(fk?.reference().foreignTable && getTableName(fk.reference().foreignTable)).toBe(
+			"phone_number",
+		);
+		// Releasing the number must not delete the server or cascade through its message history.
+		expect(fk?.onDelete).toBe("set null");
+	});
+
+	it("names the internal number nullable, like a paging group's, so DID-only servers stay valid", () => {
+		const column = serverColumns.get("extension_number");
+		expect(column?.getSQLType()).toBe("text");
+		expect(column?.notNull).toBe(false);
+		expect(column?.hasDefault).toBe(false);
+	});
+
+	it("carries the retry policy on the server with safe defaults", () => {
+		expect(serverColumns.get("retry_attempts")?.default).toBe(3);
+		expect(serverColumns.get("retry_backoff_seconds")?.default).toBe(60);
+		expect(serverColumns.get("enabled")?.default).toBe(true);
+	});
+
+	it("keeps both the fax-to-email and the email-to-fax seams as nullable addresses", () => {
+		expect(serverColumns.get("email_to_address")?.notNull).toBe(false);
+		expect(serverColumns.get("email_from_address")?.notNull).toBe(false);
+	});
+
+	it("files a message off its server, cascading, with the queue's safe off-state default", () => {
+		expect(messageColumns.get("status")?.default).toBe("queued");
+		expect(messageColumns.get("direction")?.notNull).toBe(true);
+		const fk = messageConfig.foreignKeys.find(
+			(candidate) => candidate.reference().columns[0]?.name === "fax_server_id",
+		);
+		expect(fk?.reference().foreignTable && getTableName(fk.reference().foreignTable)).toBe(
+			"fax_server",
+		);
+		expect(fk?.onDelete).toBe("cascade");
+	});
+
+	it("carries the object key nullable, filled after inbound download / before outbound store", () => {
+		expect(messageColumns.get("object_key")?.notNull).toBe(false);
+	});
+
+	it("dedupes an inbound redelivery on a per-tenant unique carrier fax id", () => {
+		const unique = messageConfig.indexes.find(
+			(candidate) => candidate.config.name === "fax_message_organization_telnyx_fax_id_key",
+		);
+		expect(unique?.config.unique).toBe(true);
+	});
+
+	it("isolates both tables by tenant under the harness naming convention", () => {
+		expect(serverConfig.policies.map((policy) => policy.name)).toEqual([
+			"fax_server_tenant_isolation",
+		]);
+		expect(messageConfig.policies.map((policy) => policy.name)).toEqual([
+			"fax_message_tenant_isolation",
+		]);
+		expect(serverConfig.enableRLS).toBe(true);
+		expect(messageConfig.enableRLS).toBe(true);
 	});
 });

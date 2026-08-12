@@ -154,6 +154,22 @@ export const PERMISSIONS = [
 	"park-lots.delete",
 
 	/**
+	 * Fax servers, their inbox/outbox, and the send action.
+	 *
+	 * A trio plus a `send`, the same shape `queues` takes with `join`: the read/write/delete run the
+	 * fax-server configuration (which DID sends and receives, the header, the fax-to-email address,
+	 * the retry policy), and `send` is the distinct act of pushing a document out through the carrier.
+	 * `send` is split from `write` for the reason `numbers.order` is split from `numbers.write`: one
+	 * changes configuration and the other spends money on the PSTN, and a role may reasonably hold one
+	 * without the other. There is no `.own` scope — a fax line is org-level infrastructure, not a
+	 * per-user mailbox, so this is an admin/manager feature and never reaches the self-service roles.
+	 */
+	"faxes.read",
+	"faxes.write",
+	"faxes.delete",
+	"faxes.send",
+
+	/**
 	 * The day/night switch, and the one grant in this registry that a receptionist holds.
 	 *
 	 * `toggle` is separate from `write` because the two are different jobs done by different people.
@@ -1019,6 +1035,36 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 		],
 	},
 	{
+		resource: "faxes",
+		label: "Fax",
+		description:
+			"Fax servers bound to a DID, their inbox and outbox, and the act of sending a fax out " +
+			"through the carrier.",
+		permissions: [
+			{
+				permission: "faxes.read",
+				label: "View faxes",
+				description: "List fax servers and the received/sent faxes in their inbox and outbox.",
+			},
+			{
+				permission: "faxes.write",
+				label: "Manage fax servers",
+				description:
+					"Create and edit fax servers: the DID they use, the header, fax-to-email and the retry policy.",
+			},
+			{
+				permission: "faxes.delete",
+				label: "Delete faxes",
+				description: "Remove a fax server, or delete a fax from its inbox or outbox.",
+			},
+			{
+				permission: "faxes.send",
+				label: "Send faxes",
+				description: "Queue an outbound fax for delivery through the carrier.",
+			},
+		],
+	},
+	{
 		resource: "call-flows",
 		label: "Call flows",
 		description:
@@ -1551,6 +1597,16 @@ const MANAGER_PERMISSIONS = [
 	 */
 	"conferences.moderate",
 	"park-lots.write",
+	/**
+	 * A manager runs the fax line day to day — configures it and sends from it — while the delete
+	 * stays with an administrator, like every other telephony delete on this list. `faxes.read` and
+	 * `faxes.write` are the configuration; `faxes.send` is the act of pushing a document out, which a
+	 * manager does and an agent does not (there is no `own`-scoped fax, so it never reaches the
+	 * self-service roles at all).
+	 */
+	"faxes.read",
+	"faxes.write",
+	"faxes.send",
 	"recordings.read",
 	"recordings.download",
 	"cdr.read",

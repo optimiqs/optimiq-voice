@@ -3,6 +3,7 @@ import {
 	type CredentialConnectionsResource,
 	makeCredentialConnections,
 } from "./resources/credential-connections";
+import { type FaxesResource, makeFaxes } from "./resources/faxes";
 import { makeNumberOrders, type NumberOrdersResource } from "./resources/number-orders";
 import {
 	makeOutboundVoiceProfiles,
@@ -32,6 +33,8 @@ export interface TelnyxClient {
 	readonly phoneNumbers: PhoneNumbersResource;
 	readonly credentialConnections: CredentialConnectionsResource;
 	readonly outboundVoiceProfiles: OutboundVoiceProfilesResource;
+	/** Programmable Fax: send a fax, read one back. Inbound arrives over the `fax.*` webhooks. */
+	readonly faxes: FaxesResource;
 	/** Exposed for logging and for the verification script's "which server am I talking to". */
 	readonly baseUrl: string;
 }
@@ -44,6 +47,7 @@ export function createTelnyxClient(options: TelnyxClientOptions): TelnyxClient {
 		phoneNumbers: makePhoneNumbers(transport),
 		credentialConnections: makeCredentialConnections(transport),
 		outboundVoiceProfiles: makeOutboundVoiceProfiles(transport),
+		faxes: makeFaxes(transport),
 		baseUrl: transport.baseUrl,
 	};
 }
