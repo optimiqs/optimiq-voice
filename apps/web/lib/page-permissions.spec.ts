@@ -218,3 +218,87 @@ describe("call blocking", () => {
 		expect(canAccessPage(routes.callBlock, resolveRolePermissions("user"))).toBe(false);
 	});
 });
+
+/**
+ * The T2 admin block's four surfaces, whose permissions diverge more than any other group in this
+ * map — which is exactly why each one is asserted rather than left to the owner loop.
+ */
+describe("the T2 admin block", () => {
+	/**
+	 * Call flows open for `call-flows.read` and nothing else, and the split that matters is INSIDE
+	 * the page: the receptionist template holds `read` and `toggle` and neither `write` nor
+	 * `delete`, so this page has to be reachable by somebody who can move the switch and cannot
+	 * re-point either branch. Gating it on `call-flows.write` would hide the feature from the only
+	 * person who uses it daily.
+	 */
+	it("opens call flows for a role that may toggle but not edit", () => {
+		expect(getPagePermissions(routes.callFlows)?.permissions).toEqual(["call-flows.read"]);
+		expect(canAccessPage(routes.callFlows, ["call-flows.read", "call-flows.toggle"])).toBe(true);
+		expect(canAccessPage(routes.callFlows, ["routes.read"])).toBe(false);
+	});
+
+	/**
+	 * The authorisation codes, and their nested detail view.
+	 *
+	 * `pin-sets.read` is a real grant despite there being no secret to read — what a reader sees is
+	 * which routes are gated and by whose codes. The detail view carries no entry of its own and
+	 * inherits by ancestry, which is what makes nesting it under the list a decision rather than a
+	 * convention.
+	 */
+	it("gates the PIN sets and inherits that for one set's codes", () => {
+		expect(getPagePermissions(routes.pinSets)?.permissions).toEqual(["pin-sets.read"]);
+		expect(getPagePermissions(routes.pinSet("0193f2aa"))?.permissions).toEqual(["pin-sets.read"]);
+		expect(canAccessPage(routes.pinSet("0193f2aa"), ["pin-sets.read"])).toBe(true);
+		expect(canAccessPage(routes.pinSet("0193f2aa"), ["routes.read", "dial-plan.read"])).toBe(false);
+	});
+
+	/**
+	 * One entry for four tabs, which is only legal because the API guards all four collections with
+	 * the same grant. Number translations are deliberately not on this page — they ride `routes.*` —
+	 * so a caller holding `dial-plan.read` and nothing else opens this page and NOT the routing one.
+	 */
+	it("gates the four dial-plan tables on one grant, which translations do not share", () => {
+		expect(getPagePermissions(routes.dialPlan)?.permissions).toEqual(["dial-plan.read"]);
+		expect(canAccessPage(routes.dialPlan, ["dial-plan.read"])).toBe(true);
+		expect(canAccessPage(routes.routing, ["dial-plan.read"])).toBe(false);
+		expect(canAccessPage(routes.dialPlan, ["routes.read"])).toBe(false);
+	});
+
+	/**
+	 * A ruleset's rules live under `/routing`, so they inherit `routes.read` by ancestry — which is
+	 * the correct requirement here rather than a convenient one: the server guards a ruleset with
+	 * `routes.*` precisely because it is only meaningful attached to a route or a trunk.
+	 */
+	it("inherits the routing page's requirement for a ruleset's rules", () => {
+		expect(getPagePermissions(routes.translationRuleset("0193f2aa"))?.permissions).toEqual([
+			"routes.read",
+			"time-conditions.read",
+			"feature-codes.read",
+		]);
+	});
+
+	/**
+	 * The quotas, and the widest divergence between a permission and its neighbours in the settings
+	 * area — which is the API's, not this map's.
+	 *
+	 * `org-limits.read` is deliberately wide because the usage screen is a SUPPORT tool: "you are at
+	 * 48 of 50 extensions" is the answer to a ticket. Naming `settings.read` here would show the tab
+	 * to every self-service role — all of them hold it so a preferences screen renders — and 403
+	 * them. The write is `owner`-only and is gated inside the page, so a manager sees the ceilings
+	 * read-only rather than being told the page does not exist.
+	 */
+	it("gates the limits on their own read grant, not on settings.read", () => {
+		expect(getPagePermissions(routes.limits)?.permissions).toEqual(["org-limits.read"]);
+
+		const user = resolveRolePermissions("user");
+		expect(user.includes("settings.read")).toBe(true);
+		expect(canAccessPage(routes.limits, user)).toBe(false);
+
+		const manager = resolveRolePermissions("manager");
+		expect(canAccessPage(routes.limits, manager)).toBe(true);
+		expect(manager.includes("org-limits.write")).toBe(false);
+
+		const owner = resolveRolePermissions("owner");
+		expect(owner.includes("org-limits.write")).toBe(true);
+	});
+});

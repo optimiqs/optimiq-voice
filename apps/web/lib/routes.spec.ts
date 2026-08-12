@@ -1,9 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import {
+	DIAL_PLAN_TABS,
+	dialPlanTabHref,
 	isPublicRoute,
 	queueTabHref,
 	routes,
 	ROUTING_TABS,
+	routingTabHref,
 	safeRedirectTarget,
 	signInWithRedirect,
 } from "./routes";
@@ -141,5 +144,66 @@ describe("detail routes", () => {
 	it("nests a queue's detail view under the queue list", () => {
 		expect(routes.queue("0193f2aa")).toBe(`${routes.queues}/0193f2aa`);
 		expect(routes.queue("0193f2aa").startsWith(`${routes.queues}/`)).toBe(true);
+	});
+});
+
+/**
+ * Where the T2 admin block landed, and why each choice is not the other one.
+ *
+ * Four surfaces arrived at once with four different permissions between them, and the rule this
+ * file has applied five times decided each: a page may only be a tab of another page when the two
+ * are gated by the SAME grant, because a tab inherits its parent's requirement by ancestry and
+ * `PAGE_PERMISSIONS` cannot name one permission and mean two.
+ */
+describe("the T2 admin block's placement", () => {
+	/**
+	 * Translations became a Routing TAB because a ruleset rides `routes.*` — it is only meaningful
+	 * attached to an outbound route or a trunk, so its power is the power `routes.write` already
+	 * grants. Filing it with the dial-plan tables under `dial-plan.*` would have hidden it from the
+	 * people who own the routes that carry it.
+	 */
+	it("makes number translations a routing tab and gives its rules a nested detail route", () => {
+		expect(ROUTING_TABS).toContain("translations");
+		expect(routingTabHref("translations")).toBe(`${routes.routing}?tab=translations`);
+		expect(routes.translationRuleset("0193f2aa").startsWith(`${routes.routing}/`)).toBe(true);
+	});
+
+	/**
+	 * Call flows went the other way, for the one reason that outranks tidiness here:
+	 * `call-flows.toggle` is the receptionist's grant, and the whole feature is that somebody who
+	 * owns no part of the dial plan can find this page at five o'clock. As the sixth tab of a page
+	 * called "Routing" it would not be findable by that person, and the route requirement could not
+	 * let them in without opening the other five tabs.
+	 */
+	it("gives call flows a route of their own rather than a sixth routing tab", () => {
+		expect(routes.callFlows).toBe("/call-flows");
+		expect(routes.callFlows.startsWith(`${routes.routing}/`)).toBe(false);
+		expect(ROUTING_TABS).not.toContain("call-flows" as never);
+	});
+
+	/** A PIN set gates money and has a resource of its own, so it cannot inherit anything else's. */
+	it("gives authorisation codes a route of their own, with the codes nested under it", () => {
+		expect(routes.pinSets).toBe("/pin-sets");
+		expect(routes.pinSet("0193f2aa")).toBe(`${routes.pinSets}/0193f2aa`);
+		expect(routes.pinSets.startsWith(`${routes.dialPlan}/`)).toBe(false);
+	});
+
+	/**
+	 * The four dial-plan tables share one permission family, which is the only thing that makes one
+	 * page over four tabs legal here. The default tab is the bare path for the reason every tab
+	 * strip in this file is: `nuqs` clears the default, so a link carrying it is rewritten on load.
+	 */
+	it("puts the four dial-plan tables on one page with the section in the query", () => {
+		expect(DIAL_PLAN_TABS).toEqual(["aliases", "streams", "directories", "speed-dials"]);
+		expect(dialPlanTabHref("aliases")).toBe(routes.dialPlan);
+		expect(dialPlanTabHref("streams")).toBe(`${routes.dialPlan}?tab=streams`);
+		// Translations are NOT a fifth tab — different permission, different page.
+		expect(DIAL_PLAN_TABS).not.toContain("translations" as never);
+	});
+
+	/** The quotas are a settings tab, so they inherit nothing from the PBX area's routes. */
+	it("nests the limits under the settings area", () => {
+		expect(routes.limits).toBe("/settings/limits");
+		expect(routes.limits.startsWith(`${routes.settings}/`)).toBe(true);
 	});
 });

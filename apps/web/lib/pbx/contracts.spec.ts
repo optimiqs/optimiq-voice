@@ -4,7 +4,10 @@ import {
 	CALL_BLOCK_ACTIONS as SERVER_CALL_BLOCK_ACTIONS,
 	CALL_BLOCK_DIRECTIONS as SERVER_CALL_BLOCK_DIRECTIONS,
 	CALL_BLOCK_MATCH_KINDS as SERVER_CALL_BLOCK_MATCH_KINDS,
+	CALL_FLOW_MODES as SERVER_CALL_FLOW_MODES,
 	DESTINATION_TARGET_TABLES as SERVER_TARGET_TABLES,
+	DIRECTORY_SEARCH_FIELDS as SERVER_DIRECTORY_SEARCH_FIELDS,
+	TIME_CONDITION_OVERRIDES as SERVER_TIME_CONDITION_OVERRIDES,
 	DESTINATION_TYPE_KINDS as SERVER_TYPE_KINDS,
 	DESTINATION_TYPES as SERVER_DESTINATION_TYPES,
 	FEATURE_CODE_ACTIONS as SERVER_FEATURE_CODE_ACTIONS,
@@ -35,9 +38,13 @@ import {
 	CALL_BLOCK_ACTIONS,
 	CALL_BLOCK_DIRECTIONS,
 	CALL_BLOCK_MATCH_KINDS,
+	CALL_FLOW_MODES,
 	DESTINATION_TYPE_KINDS,
 	DESTINATION_TYPES,
+	DIRECTORY_SEARCH_FIELDS,
 	FEATURE_CODE_ACTIONS,
+	ORG_LIMIT_NAMES,
+	TIME_CONDITION_OVERRIDES,
 	IVR_OPTION_MATCH_KINDS,
 	MOH_SOURCES,
 	PROMPT_KINDS,
@@ -180,6 +187,64 @@ describe("closed sets mirrored from @optimiq-voice/pbx-db", () => {
 	});
 
 	/**
+	 * `phrase` stated on its own, because it is the member that changed a COLUMN's nullability.
+	 *
+	 * A phrase is a `prompt` row with no audio of its own, so `prompt.object_key` became nullable and
+	 * `PromptRow.objectKey` is `string | null` in this app's mirror. Anything that renders or plays a
+	 * key has to check the kind first. If this member ever leaves the set, that type narrows back and
+	 * the check becomes dead code — which is a thing worth being told about rather than discovering.
+	 */
+	it("keeps the phrase kind, which is why a prompt's object key is nullable", () => {
+		expect([...PROMPT_KINDS]).toContain("phrase");
+	});
+
+	/** The two positions of a call flow's switch. Order is the order the toggle button offers. */
+	it("call flow modes match, in order", () => {
+		expect(CALL_FLOW_MODES).toEqual([...SERVER_CALL_FLOW_MODES]);
+	});
+
+	/**
+	 * The three override states.
+	 *
+	 * Order is load-bearing beyond reading order: the server's `nextTimeConditionOverride` walks this
+	 * list as a RING when the endpoint is called with no target state, which is what a handset
+	 * pressing the star code does. A reordered list here would leave the select's options in a
+	 * different order from the cycle a phone walks, and the page tells the user they are the same.
+	 */
+	it("time condition overrides match, in order", () => {
+		expect(TIME_CONDITION_OVERRIDES).toEqual([...SERVER_TIME_CONDITION_OVERRIDES]);
+	});
+
+	/** Which part of a name a dial-by-name directory matches keypad digits against. */
+	it("directory search fields match, in order", () => {
+		expect(DIRECTORY_SEARCH_FIELDS).toEqual([...SERVER_DIRECTORY_SEARCH_FIELDS]);
+	});
+
+	/**
+	 * The four quota names, which are the one closed set in this file with NOTHING to pin against.
+	 *
+	 * `ORG_LIMIT_NAMES` lives in `apps/api/src/pbx/org-limits/org-limits.ts` — a Nest application, not
+	 * a package — and `apps/api` is deliberately not a dependency of this app even for tests. So the
+	 * assertion is a literal, restated here so that a reviewer comparing the two files can see the
+	 * whole list on one screen, and so that adding a fifth quota to the mirror without a screen for it
+	 * fails loudly.
+	 *
+	 * The value of a literal is real but bounded: it catches an edit to `contracts.ts`, and it cannot
+	 * catch a fifth limit added on the server. The usage endpoint is what would notice that — it
+	 * returns one entry per limit, and the page renders `ORG_LIMIT_NAMES` rather than the response, so
+	 * an unknown entry is simply not shown. That trade is deliberate: rendering an entry this app has
+	 * no label for would put a raw camelCase column name on a settings screen.
+	 */
+	it("organization limit names match the server's, restated", () => {
+		expect([...ORG_LIMIT_NAMES]).toEqual([
+			"maxExtensions",
+			"maxTrunks",
+			"maxConcurrentCalls",
+			"maxStorageMb",
+		]);
+	});
+
+	/**
 	 * The four greeting slots.
 	 *
 	 * Order matters here for a reason beyond reading order: `temporary` WINS over `unavailable` at
@@ -268,6 +333,13 @@ describe("the destination picker's own tables", () => {
 			park: "/park-lots",
 			"paging-group": "/paging-groups",
 			"time-condition": "/time-conditions",
+			// The T2 admin block's four. `alias` points at `/destination-aliases` and NOT at anything
+			// under `/dial-plan` — the page is a tab strip over four collections, and the endpoint is
+			// per collection.
+			"call-flow": "/call-flows",
+			stream: "/audio-streams",
+			"dial-by-name": "/directories",
+			alias: "/destination-aliases",
 		};
 		for (const type of SERVER_DESTINATION_TYPES) {
 			const target = destinationTarget(type);
@@ -316,13 +388,16 @@ const RESOURCE_TABLES: Readonly<Record<string, string>> = {
 	"voicemail-boxes": "voicemail_box",
 	"moh-classes": "moh_class",
 	/**
-	 * `prompt` is deliberately absent from `ROUTING_TABLE_TO_ENTITY`, and the loop below asserts
-	 * that the descriptor agrees. The reason it is absent is worth knowing before anyone "fixes" it:
-	 * the compiler copies a `promptId` into a plan node VERBATIM and never resolves it, so renaming a
-	 * prompt or re-uploading its audio changes nothing the artifact contains. The day the compiler
-	 * starts resolving prompt ids to `object://` media refs — as it already does for `mohClassId` →
-	 * class name — `prompt` has to be added to that map in the same commit, and this test is what
-	 * will notice.
+	 * `prompt` USED to be absent from `ROUTING_TABLE_TO_ENTITY`, and this comment used to explain
+	 * why. It is worth keeping the history, because this is the test that caught the change.
+	 *
+	 * The old reason was sound: the compiler copies a `promptId` into a plan node verbatim and never
+	 * resolves it, so renaming a prompt or re-uploading its audio changed nothing the artifact
+	 * contained. What broke it is `phrase` — a phrase IS a `prompt` row, and which prompt ids are
+	 * SEQUENCES is a compiled fact the artifact carries in its own table. The row cannot be told
+	 * apart from an ordinary one without reading `kind`, so every write to this table now recompiles.
+	 *
+	 * The loop below is what noticed, and the descriptor was wrong until it did.
 	 */
 	prompts: "prompt",
 	"emergency-addresses": "emergency_address",
@@ -348,6 +423,20 @@ const RESOURCE_TABLES: Readonly<Record<string, string>> = {
 	 * are answered in different places on purpose, and this map only answers the second.
 	 */
 	"call-block-rules": "call_block_rule",
+
+	// --- The T2 admin block ---------------------------------------------------------------------
+	//
+	// Every one of these is a routing input, which is the unusual part and is worth stating: seven
+	// resources landed in one wave and not one of them is a `queue_agent` — nothing here is live
+	// state the engine reads at dial time. The loop below holds each of them against
+	// `ROUTING_TABLE_TO_ENTITY` rather than trusting this comment.
+	"call-flows": "call_flow",
+	"pin-sets": "pin_set",
+	"translation-rulesets": "translation_ruleset",
+	"destination-aliases": "destination_alias",
+	"audio-streams": "audio_stream",
+	directories: "dial_by_name_directory",
+	"speed-dials": "speed_dial",
 };
 
 const CHILD_TABLES: Readonly<Record<string, string>> = {
@@ -355,6 +444,17 @@ const CHILD_TABLES: Readonly<Record<string, string>> = {
 	destinations: "ring_group_destination",
 	rules: "time_condition_rule",
 	tiers: "queue_tier",
+	/**
+	 * The two children whose `key` deliberately differs from their URL `segment`.
+	 *
+	 * A translation ruleset's collection is `/rules` on the wire, exactly as a time condition's is —
+	 * and this map is keyed by `key`, so two children spelled `rules` would silently collapse into
+	 * one entry and leave whichever descriptor lost unchecked. The descriptors carry
+	 * `key: "translation-rules"` and `key: "pin-set-entries"` for that reason; the segments are
+	 * untouched.
+	 */
+	"pin-set-entries": "pin_set_entry",
+	"translation-rules": "translation_rule",
 	/**
 	 * The one ordered child that is NOT a `queue_tier` in disguise: `paging_group_member` is in
 	 * `ROUTING_TABLE_TO_ENTITY`, so adding or reordering a handset republishes the artifact, while
@@ -399,16 +499,20 @@ describe("affectsRouting, mirrored from @optimiq-voice/routing", () => {
 	 * ever starts compiling membership, the detail page's copy and its invalidation are both wrong.
 	 */
 	/**
-	 * The media library's two halves, stated on their own for the same reason the queue claim is.
+	 * The media library's two halves, stated on their own for the same reason the queue claim is —
+	 * and now saying the OPPOSITE of what they said one wave ago, which is the whole value of the
+	 * assertion.
 	 *
-	 * A hold-music class IS a routing input: five node kinds carry its resolved NAME, so a rename has
-	 * to reach the engine and the compile banner has to say so. A prompt is NOT, for the reason
-	 * recorded beside `prompts` in `RESOURCE_TABLES` — and the difference is invisible in the UI, so
-	 * it is asserted rather than left to a loop over fifteen resources.
+	 * A hold-music class has always been a routing input: five node kinds carry its resolved NAME, so
+	 * a rename has to reach the engine. The prompt library was not, because the compiler copied a
+	 * `promptId` into a plan node verbatim — and it became one the day a PHRASE became a prompt row,
+	 * because which ids are sequences is a compiled fact. Neither difference is visible in the UI,
+	 * which is why both are asserted rather than left to a loop over twenty resources.
 	 */
-	it("says hold music recompiles and the prompt library does not", () => {
+	it("says hold music and the prompt library both recompile", () => {
 		expect(PBX_RESOURCES.mohClasses.affectsRouting).toBe(true);
-		expect(PBX_RESOURCES.prompts.affectsRouting).toBe(false);
+		expect(PBX_RESOURCES.prompts.affectsRouting).toBe(true);
+		expect(SERVER_ROUTING_TABLES.prompt).toBe("prompts");
 	});
 
 	/**
@@ -433,6 +537,71 @@ describe("affectsRouting, mirrored from @optimiq-voice/routing", () => {
 		expect(PBX_RESOURCES.callBlockRules.affectsRouting).toBe(true);
 		expect(SERVER_ROUTING_TABLES.call_block_rule).toBeTruthy();
 		expect(PBX_RESOURCES.callBlockRules.permissions.read).toBe("call-block.read");
+	});
+
+	/**
+	 * The permission claims the T2 screens are built on, stated on their own rather than left to a
+	 * loop, because each of the four is easy to get wrong in a way no type check would catch.
+	 *
+	 * A ruleset on `routes.*` looks like an oversight next to six siblings on their own resources,
+	 * and it is the server's decision: a ruleset is only meaningful attached to a route or a trunk,
+	 * so its power IS `routes.write`'s. It is also the fact that decided which page it lives on.
+	 *
+	 * The four dial-plan tables sharing one family is the collapse the registry asks every wave to
+	 * justify, and it is what makes `/dial-plan` a single `PAGE_PERMISSIONS` entry over four tabs.
+	 */
+	it("says a translation ruleset rides the routes grants, which is why it is a Routing tab", () => {
+		expect(PBX_RESOURCES.translationRulesets.permissions.read).toBe("routes.read");
+		expect(PBX_RESOURCES.translationRulesets.permissions.write).toBe("routes.write");
+		expect(PBX_RESOURCES.translationRulesets.permissions.delete).toBe("routes.delete");
+	});
+
+	it("puts all four dial-plan tables on one permission family", () => {
+		for (const resource of [
+			PBX_RESOURCES.destinationAliases,
+			PBX_RESOURCES.audioStreams,
+			PBX_RESOURCES.directories,
+			PBX_RESOURCES.speedDials,
+		]) {
+			expect(resource.permissions.read).toBe("dial-plan.read");
+			expect(resource.permissions.write).toBe("dial-plan.write");
+			expect(resource.permissions.delete).toBe("dial-plan.delete");
+		}
+	});
+
+	/**
+	 * `call-flows.toggle` is NOT on the descriptor, and its absence is the contract.
+	 *
+	 * The descriptor describes CRUD. Toggling is a fourth verb on a route of its own, guarded by the
+	 * one grant in this area a receptionist holds — so it is named by `toggleCallFlow` and by the
+	 * screen's own `usePermission` call, never by `permissions.write`. Collapsing it here would make
+	 * the mode button appear only for administrators, which is precisely the person who does not
+	 * press it.
+	 */
+	it("keeps the call-flow toggle out of the CRUD grants", () => {
+		expect(PBX_RESOURCES.callFlows.permissions.write).toBe("call-flows.write");
+		expect(Object.values(PBX_RESOURCES.callFlows.permissions)).not.toContain("call-flows.toggle");
+	});
+
+	/** A PIN set gates money, which is why it is not a ride on `routes.*` like the ruleset is. */
+	it("gives authorisation codes a resource of their own", () => {
+		expect(PBX_RESOURCES.pinSets.permissions.read).toBe("pin-sets.read");
+		expect(PBX_RESOURCES.pinSets.permissions.write).toBe("pin-sets.write");
+		expect(PBX_RESOURCES.pinSets.permissions.delete).toBe("pin-sets.delete");
+	});
+
+	/**
+	 * The one child in this app whose `segment` and `key` differ for a reason other than history.
+	 *
+	 * `CHILD_TABLES` above is keyed by `key`, and both `/time-conditions/:id/rules` and
+	 * `/translation-rulesets/:id/rules` are spelled `rules` on the wire — so equal keys would have
+	 * left one of the two unchecked by the loop that follows. Asserted rather than commented, because
+	 * "make the key match the segment" is exactly the tidy-up somebody will attempt.
+	 */
+	it("keeps the two `rules` collections on distinct query keys", () => {
+		expect(PBX_CHILDREN.translationRules.segment).toBe("rules");
+		expect(PBX_CHILDREN.timeConditionRules.segment).toBe("rules");
+		expect(PBX_CHILDREN.translationRules.key).not.toBe(PBX_CHILDREN.timeConditionRules.key);
 	});
 
 	it("says a queue recompiles and its agents and tiers do not", () => {

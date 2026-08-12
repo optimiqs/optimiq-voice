@@ -1,6 +1,7 @@
 "use client";
 
 import { useForm } from "@tanstack/react-form";
+import { AttachedReference } from "~/components/pbx/attached-reference";
 import { EntityFormDialog, FormSection } from "~/components/pbx/entity-form-dialog";
 import { SelectField, SwitchField, TextField } from "~/components/ui/form-fields";
 import { useServerFieldErrors } from "~/lib/forms/server-errors";
@@ -286,6 +287,24 @@ export function TrunkDialog({
 						/>
 					)}
 				</form.Field>
+			</FormSection>
+
+			<FormSection title="Arriving calls" columns={1}>
+				{/*
+				 * The clearest case for the shared translation layer, which is why it is worth naming even
+				 * while it is read-only: one carrier presents `0044…` and the next presents `+44…`, and
+				 * without a rewrite the screening list, the inbound routes and the call records all have to
+				 * know which trunk a call came in on. Nothing composes with this — a trunk has no inline
+				 * digit manipulation — so it runs first and alone, before anything reads the caller.
+				 */}
+				<AttachedReference
+					label="Rewrite the caller's number on arrival"
+					resource={PBX_RESOURCES.translationRulesets}
+					value={trunk?.inboundTranslationRulesetId ?? null}
+					emptyLabel="No rewrite — the caller's number reaches routing exactly as the carrier presented it."
+					description="Applied before the screening list, the inbound routes or the call record read the number, and before anything else on this trunk."
+					note="Attaching a ruleset is not editable from this application yet: the column exists and the compiler reads it, but no endpoint accepts it in a request body."
+				/>
 			</FormSection>
 
 			<FormSection title="State" columns={1}>

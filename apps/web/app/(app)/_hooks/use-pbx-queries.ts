@@ -14,12 +14,19 @@ import {
 	deletePbx,
 	deletePbxChild,
 	fetchFeatureCodeParamFields,
+	fetchOrgLimits,
+	fetchOrgUsage,
 	getPbx,
 	listPbx,
 	listPbxChildren,
+	PBX_RESOURCES,
 	reorderPbxChildren,
+	setPinSetEntryPin,
+	setTimeConditionOverride,
+	toggleCallFlow,
 	updatePbx,
 	updatePbxChild,
+	writeOrgLimits,
 	type PbxChildDescriptor,
 	type PbxListQuery,
 	type PbxResourceDescriptor,
@@ -28,9 +35,16 @@ import { pbxErrorCode, pbxToastMessage } from "~/lib/pbx/errors";
 import { queryKeys } from "~/lib/query-keys";
 import { useActiveOrganization } from "../_context/session-context";
 import type {
+	CallFlowMode,
+	CallFlowRow,
 	FeatureCodeParamFields,
 	MutationEnvelope,
+	OrgLimits,
+	OrgUsageReport,
 	PagedEnvelope,
+	PinSetEntryRow,
+	TimeConditionOverride,
+	TimeConditionRow,
 	WireDiagnostic,
 } from "~/lib/pbx/contracts";
 
@@ -322,6 +336,168 @@ export function usePbxChildDelete<TRow>(
 		},
 		onError: (error) => {
 			toast.error(pbxToastMessage(error, `Could not remove the ${child.label}`));
+		},
+	});
+}
+
+// ---------------------------------------------------------------------------------------------
+// The T2 admin block's verbs — the writes that are not a PATCH
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Moves a call flow's switch.
+ *
+ * Invalidated exactly as an ordinary write is, through the SAME handle: a toggle is a routing write
+ * — `call_flow` is in `ROUTING_TABLE_TO_ENTITY` — so the compile view has to be evicted with the
+ * list, and the phones in the building have already been told (the server publishes the busy-lamp
+ * presence entry after the commit, never before).
+ *
+ * The toast says which way it went rather than "saved", because that is the entire content of the
+ * action and it is the thing somebody will want to confirm from across the room.
+ */
+export function useCallFlowToggle(): UseMutationResult<
+	MutationEnvelope<CallFlowRow>,
+	Error,
+	{ readonly id: string; readonly mode: CallFlowMode }
+> {
+	const resource = PBX_RESOURCES.callFlows;
+	const invalidate = useInvalidatePbx(resource.key, resource.affectsRouting);
+
+	return useMutation({
+		mutationFn: ({ id, mode }: { id: string; mode: CallFlowMode }) => toggleCallFlow(id, mode),
+		onSuccess: async (result) => {
+			await invalidate();
+			announceSave(result.warnings, `${result.data.name} is now in ${result.data.mode} mode`);
+		},
+		onError: (error) => {
+			toast.error(pbxToastMessage(error, "Could not move the switch"));
+		},
+	});
+}
+
+/**
+ * Forces a time condition open or closed, or hands it back to the clock.
+ *
+ * Invalidates the TIME-CONDITIONS resource even though the endpoint lives under `/call-flows`: the
+ * row that changed is a time condition, and the screen showing it is the one that has to refetch.
+ * The path is a fact about which grant guards the write, not about which cache holds the row.
+ */
+export function useTimeConditionOverride(): UseMutationResult<
+	MutationEnvelope<TimeConditionRow>,
+	Error,
+	{ readonly id: string; readonly override: TimeConditionOverride }
+> {
+	const resource = PBX_RESOURCES.timeConditions;
+	const invalidate = useInvalidatePbx(resource.key, resource.affectsRouting);
+
+	return useMutation({
+		mutationFn: ({ id, override }: { id: string; override: TimeConditionOverride }) =>
+			setTimeConditionOverride(id, override),
+		onSuccess: async (result) => {
+			await invalidate();
+			announceSave(
+				result.warnings,
+				result.data.override === "auto"
+					? `${result.data.name} is following its schedule again`
+					: `${result.data.name} is overridden`,
+			);
+		},
+		onError: (error) => {
+			toast.error(pbxToastMessage(error, "Could not change the override"));
+		},
+	});
+}
+
+/**
+ * Replaces one authorisation code's digits.
+ *
+ * The success message deliberately does not echo anything: the value was hashed on the way in and
+ * the reply carries the row without it, so there is nothing to confirm except that it happened.
+ */
+export function useSetPinSetEntryPin(
+	pinSetId: string | undefined,
+): UseMutationResult<
+	MutationEnvelope<PinSetEntryRow>,
+	Error,
+	{ readonly entryId: string; readonly pin: string }
+> {
+	const resource = PBX_RESOURCES.pinSets;
+	const invalidate = useInvalidatePbx(resource.key, resource.affectsRouting);
+
+	return useMutation({
+		mutationFn: ({ entryId, pin }: { entryId: string; pin: string }) =>
+			setPinSetEntryPin(pinSetId as string, entryId, pin),
+		onSuccess: async (result) => {
+			await invalidate();
+			announceSave(result.warnings, "Code set");
+		},
+		onError: (error) => {
+			if (!isFieldAddressable(error)) {
+				toast.error(pbxToastMessage(error, "Could not set the code"));
+			}
+		},
+	});
+}
+
+// ---------------------------------------------------------------------------------------------
+// Organization limits
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The organization's quotas, and what it is using against them.
+ *
+ * The usage query is the ONE read in this module that is not held indefinitely: the counts move
+ * whenever anybody anywhere creates an extension or uploads audio, and no mutation in this app can
+ * be relied on to have been the one that did it (another admin, an API key, a voicemail left five
+ * minutes ago). So it refetches on mount, which is the whole lifetime of the page it serves.
+ *
+ * A caller without `org-limits.read` gets a 403 — the page is gated on that grant, so this is only
+ * reachable by somebody who holds it, and a failure here is a real failure worth showing.
+ */
+export function useOrgLimits(): UseQueryResult<OrgLimits> {
+	const organizationId = useOrganizationId();
+	return useQuery({
+		queryKey: queryKeys.orgLimits(organizationId),
+		queryFn: fetchOrgLimits,
+		enabled: organizationId.length > 0,
+	});
+}
+
+export function useOrgUsage(): UseQueryResult<OrgUsageReport> {
+	const organizationId = useOrganizationId();
+	return useQuery({
+		queryKey: queryKeys.orgUsage(organizationId),
+		queryFn: fetchOrgUsage,
+		enabled: organizationId.length > 0,
+		refetchOnMount: "always",
+	});
+}
+
+/**
+ * Sets them.
+ *
+ * Invalidates `orgLimits`, which takes the usage report with it by key hierarchy — raising a ceiling
+ * changes every ratio on screen, and a bar still reading "48 of 50" beside a limit somebody has just
+ * moved to 100 is the exact confusion this page exists to remove.
+ *
+ * No routing invalidation: `org_limit` is not in `ROUTING_TABLE_TO_ENTITY` and the compiler has no
+ * quota input. `maxConcurrentCalls` IS enforced by the engine at admission, but through the org
+ * settings the artifact already carries rather than through this table.
+ */
+export function useOrgLimitsSave(): UseMutationResult<OrgLimits, Error, OrgLimits> {
+	const queryClient = useQueryClient();
+	const organizationId = useOrganizationId();
+
+	return useMutation({
+		mutationFn: (limits: OrgLimits) => writeOrgLimits(limits),
+		onSuccess: async () => {
+			await queryClient.invalidateQueries({ queryKey: queryKeys.orgLimits(organizationId) });
+			toast.success("Limits saved");
+		},
+		onError: (error) => {
+			if (!isFieldAddressable(error)) {
+				toast.error(pbxToastMessage(error, "Could not save the limits"));
+			}
 		},
 	});
 }

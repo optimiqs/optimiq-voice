@@ -15,13 +15,18 @@ import { apiFetch, apiUpload } from "../api-client";
 import { ledgerSearchParams } from "./ledger";
 import type { Permission } from "../permissions";
 import type {
+	AudioStreamRow,
 	AuditCursorEnvelope,
 	AuditLogEntryRow,
 	AuditLogQueryParams,
 	CallBlockRuleRow,
+	CallFlowMode,
+	CallFlowRow,
 	CompileResult,
 	ConferencePinState,
 	ConferenceRow,
+	DestinationAliasRow,
+	DialByNameDirectoryRow,
 	EmergencyAddressRow,
 	ExtensionRow,
 	FeatureCodeParamFields,
@@ -33,12 +38,16 @@ import type {
 	MediaPlaybackLink,
 	MohClassRow,
 	MutationEnvelope,
+	OrgLimits,
+	OrgUsageReport,
 	OutboundRouteRow,
 	PagedEnvelope,
 	PagingGroupMemberRow,
 	PagingGroupRow,
 	ParkLotRow,
 	PhoneNumberRow,
+	PinSetEntryRow,
+	PinSetRow,
 	PromptKind,
 	PromptRow,
 	QueueAgentRow,
@@ -51,8 +60,12 @@ import type {
 	SipAclEntryRow,
 	SipAuthEventQueryParams,
 	SipAuthEventRow,
+	SpeedDialRow,
+	TimeConditionOverride,
 	TimeConditionRow,
 	TimeConditionRuleRow,
+	TranslationRulesetRow,
+	TranslationRuleRow,
 	TrunkRow,
 	VoicemailBoxRow,
 	VoicemailFolder,
@@ -174,6 +187,106 @@ export const PBX_RESOURCES = {
 			delete: "time-conditions.delete",
 		},
 		displayName: (row) => row.name,
+	}),
+	/**
+	 * The day/night switch.
+	 *
+	 * Four grants on the server and only three here, because the descriptor describes CRUD:
+	 * `call-flows.toggle` is a fourth verb on a route of its own and is named by {@link toggleCallFlow}
+	 * rather than by this table. That split is the whole feature — `write` decides where the two
+	 * branches go, `toggle` moves the switch — and collapsing it into `write` here would make the
+	 * mode button appear only for administrators, which is precisely the person who does not press it.
+	 *
+	 * `affectsRouting: true`: `call_flow` is in `ROUTING_TABLE_TO_ENTITY`, so a save — and a toggle,
+	 * which is a save — recompiles the tenant's artifact and relights the busy lamps.
+	 */
+	callFlows: descriptor<CallFlowRow>({
+		key: "call-flows",
+		affectsRouting: true,
+		path: "/call-flows",
+		label: "call flow",
+		labelPlural: "Call flows",
+		permissions: {
+			read: "call-flows.read",
+			write: "call-flows.write",
+			delete: "call-flows.delete",
+		},
+		displayName: (row) => row.name,
+	}),
+	/**
+	 * Outbound authorisation codes.
+	 *
+	 * `pin-sets.*` rather than a ride on `routes.*`, and the argument is the one `numbers.order` and
+	 * `calls.originate` both made: the blast radius is money. The same grant that adds a code removes
+	 * one, so a holder can make an international route dialable by everybody in the building.
+	 */
+	pinSets: descriptor<PinSetRow>({
+		key: "pin-sets",
+		affectsRouting: true,
+		path: "/pin-sets",
+		label: "PIN set",
+		labelPlural: "Authorisation codes",
+		permissions: { read: "pin-sets.read", write: "pin-sets.write", delete: "pin-sets.delete" },
+		displayName: (row) => row.name,
+	}),
+	/**
+	 * Number-translation rulesets, riding `routes.*`.
+	 *
+	 * NOT a resource of its own and NOT part of `dial-plan.*`, which is the server's division and
+	 * worth restating: a ruleset is only meaningful attached to an outbound route or a trunk, and its
+	 * power — deciding what digits reach which carrier — is the power `routes.write` already grants. A
+	 * `translations.*` trio would be three more names for one decision.
+	 */
+	translationRulesets: descriptor<TranslationRulesetRow>({
+		key: "translation-rulesets",
+		affectsRouting: true,
+		path: "/translation-rulesets",
+		label: "translation ruleset",
+		labelPlural: "Number translations",
+		permissions: { read: "routes.read", write: "routes.write", delete: "routes.delete" },
+		displayName: (row) => row.name,
+	}),
+	/**
+	 * The four dial-plan building blocks below share ONE permission family, which is the collapse the
+	 * permission registry asks every wave to justify: none of the four has a power profile of its
+	 * own, none reaches a trunk except through the outbound tables every other destination goes
+	 * through, and there is no role that plausibly edits one and not the others.
+	 */
+	destinationAliases: descriptor<DestinationAliasRow>({
+		key: "destination-aliases",
+		affectsRouting: true,
+		path: "/destination-aliases",
+		label: "named destination",
+		labelPlural: "Named destinations",
+		permissions: { read: "dial-plan.read", write: "dial-plan.write", delete: "dial-plan.delete" },
+		displayName: (row) => row.name,
+	}),
+	audioStreams: descriptor<AudioStreamRow>({
+		key: "audio-streams",
+		affectsRouting: true,
+		path: "/audio-streams",
+		label: "audio stream",
+		labelPlural: "Audio streams",
+		permissions: { read: "dial-plan.read", write: "dial-plan.write", delete: "dial-plan.delete" },
+		displayName: (row) => row.name,
+	}),
+	directories: descriptor<DialByNameDirectoryRow>({
+		key: "directories",
+		affectsRouting: true,
+		path: "/directories",
+		label: "directory",
+		labelPlural: "Dial-by-name directories",
+		permissions: { read: "dial-plan.read", write: "dial-plan.write", delete: "dial-plan.delete" },
+		displayName: (row) => (row.extensionNumber ? `${row.extensionNumber} · ${row.name}` : row.name),
+	}),
+	speedDials: descriptor<SpeedDialRow>({
+		key: "speed-dials",
+		affectsRouting: true,
+		path: "/speed-dials",
+		label: "speed dial",
+		labelPlural: "Speed dials",
+		permissions: { read: "dial-plan.read", write: "dial-plan.write", delete: "dial-plan.delete" },
+		displayName: (row) => `${row.code} · ${row.label}`,
 	}),
 	featureCodes: descriptor<FeatureCodeRow>({
 		key: "feature-codes",
@@ -339,18 +452,28 @@ export const PBX_RESOURCES = {
 	/**
 	 * The prompt library.
 	 *
-	 * `affectsRouting: false`, and the reason is worth knowing before changing it: the compiler
-	 * copies a `promptId` into a plan node VERBATIM and never resolves it, so renaming a prompt or
-	 * replacing its audio changes nothing the artifact contains. If that ever changes, `prompt` has
-	 * to be added to `ROUTING_TABLE_TO_ENTITY` in the same commit.
+	 * ## `affectsRouting` flipped to `true` the day a phrase became a prompt row
 	 *
-	 * There is no generic `createPbx` for this resource — a prompt is created by an upload, because
-	 * `prompt.object_key` is `notNull` and a library entry with no audio is an entry an IVR can be
-	 * pointed at that plays nothing. See {@link uploadPrompt}.
+	 * It was `false` for good reasons, and they are still true of most of this table: the compiler
+	 * copies a `promptId` into a plan node VERBATIM and never resolves it, so renaming a prompt or
+	 * replacing its audio changes nothing the artifact contains. What changed is that `prompt.kind`
+	 * now decides whether an id is a single piece of audio or a SEQUENCE — a phrase is a prompt row —
+	 * and which ids are sequences is a compiled fact the artifact carries in its own `phrases` table.
+	 *
+	 * The table cannot tell the two apart, so every write to it recompiles. That is more eviction
+	 * than the feature strictly needs and the cost is bounded on the server side: `isArtifactFresh`
+	 * compares content hashes and skips the KV round trip when nothing routing reads has moved.
+	 * `ROUTING_TABLE_TO_ENTITY.prompt` is the authority and `contracts.spec.ts` holds this against it
+	 * — which is exactly how this line was found to be stale.
+	 *
+	 * There is no generic `createPbx` for this resource — a prompt is created by an upload. Note that
+	 * `prompt.object_key` is now NULLABLE, but only for `phrase`: there is still no way to make a
+	 * library entry with no audio, and no endpoint that creates a phrase at all. See
+	 * {@link uploadPrompt} and the note on `PromptRow` in `contracts.ts`.
 	 */
 	prompts: descriptor<PromptRow>({
 		key: "prompts",
-		affectsRouting: false,
+		affectsRouting: true,
 		path: "/prompts",
 		label: "prompt",
 		labelPlural: "Prompts",
@@ -517,6 +640,44 @@ export const PBX_CHILDREN = {
 		displayName: (row) => `Level ${row.level}, position ${row.position}`,
 		affectsRouting: false,
 	}),
+	/**
+	 * The codes in a PIN set.
+	 *
+	 * `key` and `segment` differ here and on the ruleset's rules below, which is new in this file and
+	 * is not cosmetic: `key` is the query-key segment AND the key `contracts.spec.ts` maps to a
+	 * physical table, and a second child called `rules` would collide with `timeConditionRules` in
+	 * that map. The URL segment is the server's and stays `entries` / `rules`.
+	 *
+	 * CREATE carries the code itself. The controller merges `setPinDto` into the create body on
+	 * purpose — a code with no digest is a row the compiler drops with a warning, so a two-step
+	 * create-then-set would leave a window in which the set looks configured on screen and gates
+	 * nothing on the wire. The generic {@link createPbxChild} is what sends it; replacing an existing
+	 * code is {@link setPinSetEntryPin}, which is a `PUT` of its own because the value is hashed on
+	 * the way in and never comes back.
+	 */
+	pinSetEntries: child<PinSetEntryRow>({
+		key: "pin-set-entries",
+		segment: "entries",
+		label: "code",
+		parentPath: "/pin-sets",
+		displayName: (row) => row.label ?? `Code ${row.ordinal}`,
+		affectsRouting: true,
+	}),
+	/**
+	 * The rewrites in a ruleset.
+	 *
+	 * `affectsRouting: true` — `translation_rule` is in `ROUTING_TABLE_TO_ENTITY`, and it has to be:
+	 * the rules are compiled into the artifact as an ordered pipeline, so adding one changes what
+	 * digits reach the carrier on the next call.
+	 */
+	translationRules: child<TranslationRuleRow>({
+		key: "translation-rules",
+		segment: "rules",
+		label: "rule",
+		parentPath: "/translation-rulesets",
+		displayName: (row) => row.label ?? row.matchPattern,
+		affectsRouting: true,
+	}),
 } as const;
 
 // ---------------------------------------------------------------------------------------------
@@ -664,6 +825,116 @@ export async function reorderPbxChildren<TRow>(
 		`${child.parentPath}/${parentId}/${child.segment}/reorder`,
 		{ method: "PUT", body: JSON.stringify({ ids }) },
 	);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The T2 admin block's verbs — the writes that are not a PATCH
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Moves a call flow's switch.
+ *
+ * `POST` and a route of its own rather than a field on the `PATCH`, because it is a different
+ * GRANT: `call-flows.toggle` is what a receptionist holds and `call-flows.write` is what re-points
+ * the branches. It also writes the busy-lamp presence entry, which a `PATCH` would skip — leaving
+ * every phone in the building showing the old position.
+ *
+ * `mode` is optional on the wire and absent means "the other one". This client always sends it,
+ * which is what makes the button idempotent for a UI that has just rendered the current state: two
+ * fast clicks on "Switch to night" leave the flow in night rather than back where it started.
+ */
+export async function toggleCallFlow(
+	callFlowId: string,
+	mode: CallFlowMode,
+): Promise<MutationEnvelope<CallFlowRow>> {
+	return await apiFetch<MutationEnvelope<CallFlowRow>>(`/call-flows/${callFlowId}/toggle`, {
+		method: "POST",
+		body: JSON.stringify({ mode }),
+	});
+}
+
+/**
+ * Overrules a time condition's clock, or hands it back.
+ *
+ * Under `/call-flows` rather than under `/time-conditions`, which is the server's routing decision
+ * and the one this call is most likely to be argued with about. The reason is the grant: it is
+ * guarded by `call-flows.toggle`, because forcing a condition open and flipping a flow to night are
+ * one act on two tables. Editing the condition's RULES stays on `PATCH /time-conditions/:id` behind
+ * `time-conditions.write`.
+ *
+ * The state is sent explicitly. Omitting it advances one step around the ring
+ * (`auto → forced-match → forced-no-match → auto`), which is what a handset pressing the star code
+ * does and is exactly wrong for a select that has just shown the user three named choices.
+ */
+export async function setTimeConditionOverride(
+	timeConditionId: string,
+	override: TimeConditionOverride,
+): Promise<MutationEnvelope<TimeConditionRow>> {
+	return await apiFetch<MutationEnvelope<TimeConditionRow>>(
+		`/call-flows/time-conditions/${timeConditionId}/override`,
+		{ method: "POST", body: JSON.stringify({ override }) },
+	);
+}
+
+/**
+ * Replaces one authorisation code's digits.
+ *
+ * `PUT` and a route of its own, exactly as a mailbox PIN is set: the value is hashed on the way in
+ * (scrypt, the same digest format the engine already verifies) and never comes back, so a field on
+ * the `PATCH` would make "did that save?" a question the response cannot answer. The ordinal and the
+ * label are untouched, which is what keeps every historical "authorised by code 3" in the call
+ * detail records pointing at the same code.
+ */
+export async function setPinSetEntryPin(
+	pinSetId: string,
+	entryId: string,
+	pin: string,
+): Promise<MutationEnvelope<PinSetEntryRow>> {
+	return await apiFetch<MutationEnvelope<PinSetEntryRow>>(
+		`/pin-sets/${pinSetId}/entries/${entryId}/pin`,
+		{ method: "PUT", body: JSON.stringify({ pin }) },
+	);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Organization limits — a singleton, not a resource
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The organization's quotas.
+ *
+ * No descriptor and no `PbxResourceDescriptor`, because there is no collection: one row per
+ * organization, reached without an id, and an absent row answers `{}` rather than a 404. The generic
+ * CRUD machinery would be five verbs that do not exist behind a page control that cannot work.
+ */
+export async function fetchOrgLimits(): Promise<OrgLimits> {
+	const { data } = await apiFetch<ItemEnvelope<OrgLimits>>("/org-limits");
+	return data;
+}
+
+/**
+ * Sets them.
+ *
+ * `PUT` because the body is the COMPLETE set of ceilings: a `PATCH` would make "remove this limit"
+ * and "leave this limit alone" the same request. `null` clears a ceiling, which is how a limit is
+ * removed — there is no default to reset to, because unlimited IS the default.
+ *
+ * `org-limits.write` is held by `owner` ALONE and is excluded from the admin template, on the
+ * server's own argument: a quota an administrator can raise is not a quota. That is not a real
+ * control-plane boundary and the screen says so rather than implying one.
+ */
+export async function writeOrgLimits(limits: OrgLimits): Promise<OrgLimits> {
+	const { data } = await apiFetch<ItemEnvelope<OrgLimits>>("/org-limits", {
+		method: "PUT",
+		body: JSON.stringify(limits),
+	});
+	return data;
+}
+
+/** What the organization is using, against what it may. Guarded by `org-limits.read`, not `write`. */
+export async function fetchOrgUsage(): Promise<OrgUsageReport> {
+	const { data } = await apiFetch<ItemEnvelope<OrgUsageReport>>("/org-limits/usage");
+	return data;
 }
 
 /** What each feature-code action's `params` accepts. Static per deployment; safe to cache hard. */

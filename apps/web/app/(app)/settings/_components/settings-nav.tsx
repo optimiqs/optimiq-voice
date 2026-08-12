@@ -23,6 +23,12 @@ const TABS = [
 	{ title: "Notifications", url: routes.notifications },
 	{ title: "Routing", url: routes.routingSettings },
 	{ title: "Recordings", url: routes.recordingSettings },
+	/**
+	 * The quotas. Gated by `org-limits.read` rather than `settings.read`, which is the only tab here
+	 * whose permission is not a settings grant — see `page-permissions.ts` for why the API made it
+	 * wide, and why naming `settings.read` would have shown it to every self-service role.
+	 */
+	{ title: "Limits", url: routes.limits },
 	{ title: "Emergency", url: routes.emergencyAddresses },
 	{ title: "My preferences", url: routes.mySettings },
 ] as const;

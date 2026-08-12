@@ -20,6 +20,7 @@ import { routingTabHref } from "~/lib/routes";
 import { usePermission } from "../../_context/session-context";
 import { usePbxChildDelete, usePbxChildren, usePbxItem } from "../../_hooks/use-pbx-queries";
 import { TimeConditionDialog } from "./time-condition-dialog";
+import { TimeConditionOverrideCard } from "./time-condition-override";
 import { describePredicate, TimeRuleDialog } from "./time-rule-dialog";
 import type { TimeConditionRow, TimeConditionRuleRow } from "~/lib/pbx/contracts";
 
@@ -98,6 +99,21 @@ export function TimeConditionDetail({ conditionId }: { conditionId: string }) {
 					</div>
 				}
 			/>
+
+			{/*
+			 * Above the branches and above the "never matches" warning, and rendered even when nothing
+			 * is overridden. Both halves of that are deliberate.
+			 *
+			 * Above, because an override OUTRANKS everything below it: a condition with no rules still
+			 * routes every call somewhere useful while it is forced, and a reader who met the warning
+			 * first would be told the condition is broken when somebody has deliberately taken the clock
+			 * out of the loop.
+			 *
+			 * Always, because this card IS the control. Showing it only once an override exists would
+			 * leave the one action on this page a receptionist can perform reachable only after somebody
+			 * else had already performed it.
+			 */}
+			<TimeConditionOverrideCard condition={row} />
 
 			{!rules.isPending && activeRules.length === 0 ? (
 				<WarningsBanner

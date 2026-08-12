@@ -19,8 +19,22 @@ import { DESTINATION_TYPE_KINDS, DESTINATION_TYPES } from "./contracts";
 import type { PbxResourceDescriptor } from "./client";
 import type { DestinationData, DestinationKind, DestinationType } from "./contracts";
 
-/** Which slot of a row a trio occupies. `""` is the row's primary destination. */
-export type DestinationPrefix = "" | "failover" | "timeout" | "invalid" | "nomatch";
+/**
+ * Which slot of a row a trio occupies. `""` is the row's primary destination.
+ *
+ * `night` and `fallback` are the T2 admin block's two, and both are REQUIRED trios rather than the
+ * optional branches the other four are: a call flow with one position is not a switch, and a stream
+ * with nowhere to go is a call dropped in silence on a driver that cannot play it. The requirement
+ * is the caller's to pass to {@link validateDestinationValue}; the prefix only names the columns.
+ */
+export type DestinationPrefix =
+	| ""
+	| "failover"
+	| "timeout"
+	| "invalid"
+	| "nomatch"
+	| "night"
+	| "fallback";
 
 export interface DestinationFieldNames {
 	readonly type: string;
@@ -55,6 +69,16 @@ export const DESTINATION_TYPE_LABELS: Readonly<Record<DestinationType, string>> 
 	park: "Park lot",
 	"paging-group": "Paging group",
 	"time-condition": "Time condition",
+	"call-flow": "Call flow",
+	stream: "Audio stream",
+	"dial-by-name": "Dial-by-name directory",
+	/**
+	 * Named for what it DOES rather than for the table it lives in. "Destination alias" is the row's
+	 * name and would read, in a select of places a call can go, as a synonym for the word above it.
+	 * "Named destination" says the one thing a person choosing it needs to know: it is a pointer
+	 * somebody else maintains, and re-pointing it moves every route that names it.
+	 */
+	alias: "Named destination",
 	external: "External number",
 	application: "Engine application",
 	hangup: "Hang up",
@@ -101,6 +125,19 @@ const DESTINATION_TARGETS: Partial<Record<DestinationType, DestinationTargetReso
 	park: target(PBX_RESOURCES.parkLots),
 	"paging-group": target(PBX_RESOURCES.pagingGroups),
 	"time-condition": target(PBX_RESOURCES.timeConditions),
+	/**
+	 * The T2 admin block's four. Every one of them is entity-backed on the server and every one has a
+	 * CRUD list, so all four are offerable from the day they land — unlike `queue`, `conference` and
+	 * `park`, which spent a wave in this file's other state.
+	 *
+	 * `speed-dial` is deliberately NOT here and never will be: `SPEED_DIAL_RESOURCE` declares
+	 * `destinationType: null`, because nothing points AT a speed dial — a speed dial points at other
+	 * things.
+	 */
+	"call-flow": target(PBX_RESOURCES.callFlows),
+	stream: target(PBX_RESOURCES.audioStreams),
+	"dial-by-name": target(PBX_RESOURCES.directories),
+	alias: target(PBX_RESOURCES.destinationAliases),
 };
 
 export function destinationTarget(type: DestinationType): DestinationTargetResource | undefined {

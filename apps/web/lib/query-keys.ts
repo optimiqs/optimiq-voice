@@ -148,6 +148,24 @@ export const queryKeys = {
 		["organizations", organizationId, "pbx", "routing", "compile"] as const,
 
 	/**
+	 * The organization's quotas, and what it is using against them.
+	 *
+	 * `orgLimits` is the invalidation handle a save reaches for and it takes the usage report with it,
+	 * which is the only reason they are nested: raising a ceiling changes every ratio on screen, and a
+	 * screen that showed "48 of 50" beside a limit somebody had just moved to 100 would be the one
+	 * thing this page exists to prevent.
+	 *
+	 * Under `pbx` so an org switch takes both, but deliberately NOT under a resource key: `org_limit`
+	 * is not in `ROUTING_TABLE_TO_ENTITY` and is not a routing input, so no mutation elsewhere in the
+	 * PBX area sweeps it — and none should. Creating an extension does change the usage COUNT, which
+	 * is why the usage query is the one thing on that page refetched on mount rather than trusted.
+	 */
+	orgLimits: (organizationId: string) =>
+		["organizations", organizationId, "pbx", "org-limits"] as const,
+	orgUsage: (organizationId: string) =>
+		["organizations", organizationId, "pbx", "org-limits", "usage"] as const,
+
+	/**
 	 * Which vendors this deployment can provision, and whether it is configured to provision at all.
 	 *
 	 * Organization-scoped even though the answer is deployment-wide, for the reason `carrierStatus`

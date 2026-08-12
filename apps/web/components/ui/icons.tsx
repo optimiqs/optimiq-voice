@@ -255,6 +255,58 @@ export function MegaphoneIcon(props: IconProps) {
 	);
 }
 
+/**
+ * A call flow: a toggle switch, thrown to one side.
+ *
+ * Not a clock and not a sun/moon pair, which are the two obvious drafts and are both wrong in the
+ * same way: a call flow does NOT read the clock — that is a time condition, which already carries
+ * `RouteIcon`'s section — and it is not "night", it is a switch somebody moved. The knob sitting
+ * off-centre is the whole meaning: this thing has a position, and a person put it there.
+ */
+export function SwitchIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<rect x="2.5" y="7.5" width="19" height="9" rx="4.5" />
+			<path d="M16.5 14.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z" />
+		</Glyph>
+	);
+}
+
+/**
+ * Authorisation codes: a keypad.
+ *
+ * A keypad rather than `KeyIcon` (already the API-key glyph) or a padlock: what a PIN set gates is
+ * reached by TYPING DIGITS ON A HANDSET, and the keypad is the only glyph here that says the
+ * credential is nine keys long and entered by a person standing at a phone.
+ */
+export function KeypadIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<rect x="3.5" y="2.5" width="17" height="19" rx="2.5" />
+			<path d="M8 7h.01M12 7h.01M16 7h.01M8 11.5h.01M12 11.5h.01M16 11.5h.01M8 16h.01M12 16h.01M16 16h.01" />
+		</Glyph>
+	);
+}
+
+/**
+ * The dial plan's building blocks: three named things, wired to one point.
+ *
+ * `RouteIcon` is the dial plan's own section and means "a call takes a path". These are the NAMED
+ * pieces that path is assembled from — an alias, a stream, a directory, a speed dial — so the glyph
+ * is nodes rather than a road.
+ */
+export function BlocksIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<rect x="3" y="3" width="6" height="6" rx="1.5" />
+			<rect x="15" y="3" width="6" height="6" rx="1.5" />
+			<rect x="9" y="15" width="6" height="6" rx="1.5" />
+			<path d="M6 9v3h12V9" />
+			<path d="M12 12v3" />
+		</Glyph>
+	);
+}
+
 /** A dispatchable location: a map pin. */
 export function LocationIcon(props: IconProps) {
 	return (

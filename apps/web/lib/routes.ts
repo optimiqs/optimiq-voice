@@ -31,6 +31,43 @@ export const routes = {
 	 * a `PAGE_PERMISSIONS` entry that named one of them and hid the other.
 	 */
 	pagingGroups: "/paging-groups",
+	/**
+	 * Call flows — the day/night switch.
+	 *
+	 * Its own route rather than a tab of `/routing`, on the precedent {@link routes.pagingGroups} and
+	 * {@link routes.callBlock} both set: the two are gated by different permissions
+	 * (`call-flows.*` against `routes.*`), and `/routing`'s entry is already `mode: "any"` over three
+	 * grants — adding a fourth would make the page reachable for somebody holding only
+	 * `call-flows.read` and then show them four tabs the API refuses.
+	 *
+	 * The permission split is what makes the separate route load-bearing rather than tidy:
+	 * `call-flows.toggle` is the receptionist's grant, and the whole point of the feature is that
+	 * somebody who owns no part of the dial plan can reach this page at five o'clock.
+	 */
+	callFlows: "/call-flows",
+	/**
+	 * Outbound authorisation codes.
+	 *
+	 * `pin-sets.*` is a resource of its own — the server's argument is that the blast radius is money,
+	 * and the same grant that adds a code removes one — so it cannot be a tab of `/routing` (gated by
+	 * `routes.*`) or of `/dial-plan` (gated by `dial-plan.*`) without a `PAGE_PERMISSIONS` entry that
+	 * named one permission and hid the other. The rule this file has applied five times now.
+	 */
+	pinSets: "/pin-sets",
+	/**
+	 * The four named dial-plan building blocks, on one page with the section in `?tab=`.
+	 *
+	 * Named destinations, audio streams, speed dials and dial-by-name directories are four tables
+	 * under ONE permission family, and the permission registry argues at length why: none of the four
+	 * has a power profile of its own, and there is no role that plausibly edits one and not the
+	 * others. Four sidebar entries would be four ways to say "the things routing points at".
+	 *
+	 * Number translations are deliberately NOT here. They ride `routes.*` rather than `dial-plan.*`,
+	 * because a ruleset is only meaningful attached to an outbound route or a trunk — so they are a
+	 * tab of `/routing`, beside the routes that carry them, and not a fifth tab of this page under a
+	 * permission that would hide them from the people who own them.
+	 */
+	dialPlan: "/dial-plan",
 	queues: "/queues",
 	voicemail: "/voicemail",
 	conferences: "/conferences",
@@ -104,6 +141,16 @@ export const routes = {
 	 */
 	recordingSettings: "/settings/recordings",
 	/**
+	 * The organization's quotas.
+	 *
+	 * A settings tab and not a route of its own, because it is organization-wide policy of exactly
+	 * the shape every other tab here holds — and because `org-limits.read` is deliberately WIDE (a
+	 * manager fielding "why did creating an extension fail" needs the answer) while
+	 * `org-limits.write` is held by `owner` alone. That asymmetry is gated inside the page rather
+	 * than by this route: a role that can see the ceilings and not move them should see them.
+	 */
+	limits: "/settings/limits",
+	/**
 	 * The caller's own preferences — the user level of the settings cascade.
 	 *
 	 * A settings tab and not a route of its own, because it IS the settings area seen from one
@@ -131,6 +178,23 @@ export const routes = {
 	pagingGroup: (id: string) => `/paging-groups/${id}`,
 	queue: (id: string) => `/queues/${id}`,
 	timeCondition: (id: string) => `/routing/time-conditions/${id}`,
+	/**
+	 * A ruleset's rules, nested under `/routing` exactly as a time condition's are.
+	 *
+	 * The sixth entity with a child collection, and it earns a page for the reason the other five do:
+	 * the rules are an ORDERED pipeline with a drag handle, which a dialog inside a dialog cannot
+	 * hold. Nested under `/routing` so it inherits that page's requirement by ancestry, which is the
+	 * right answer here — a ruleset is gated by `routes.read`, and `/routing`'s entry lists it.
+	 */
+	translationRuleset: (id: string) => `/routing/translation-rulesets/${id}`,
+	/**
+	 * A PIN set's codes.
+	 *
+	 * Under `/pin-sets/<id>` so it inherits `pin-sets.read` by ancestry. A page rather than a dialog
+	 * because the codes are an ordered collection AND because setting one is a second verb with its
+	 * own endpoint — a dialog over a list would be a dialog that opens a dialog to type a secret into.
+	 */
+	pinSet: (id: string) => `/pin-sets/${id}`,
 
 	/**
 	 * A trunk's detail page, which the four above do not have a reason to exist for.
@@ -172,6 +236,7 @@ export const ROUTING_TABS = [
 	"inbound",
 	"outbound",
 	"time-conditions",
+	"translations",
 	"feature-codes",
 	"tools",
 ] as const;
@@ -256,6 +321,21 @@ export type MediaTab = (typeof MEDIA_TABS)[number];
 
 export function mediaTabHref(tab: MediaTab): string {
 	return tab === "hold-music" ? routes.mediaLibrary : `${routes.mediaLibrary}?tab=${tab}`;
+}
+
+/**
+ * The Dial plan page's four sections.
+ *
+ * Four tables, one permission family, one page. The order is the order somebody meets them while
+ * building routing: a named destination is the thing they point routes at, a stream and a directory
+ * are places a call can land, and a speed dial is a shortcut they add last.
+ */
+export const DIAL_PLAN_TABS = ["aliases", "streams", "directories", "speed-dials"] as const;
+
+export type DialPlanTab = (typeof DIAL_PLAN_TABS)[number];
+
+export function dialPlanTabHref(tab: DialPlanTab): string {
+	return tab === "aliases" ? routes.dialPlan : `${routes.dialPlan}?tab=${tab}`;
 }
 
 /**

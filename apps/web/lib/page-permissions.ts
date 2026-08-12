@@ -35,6 +35,33 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, PageRequirement>> = {
 	[routes.routing]: {
 		permissions: ["routes.read", "time-conditions.read", "feature-codes.read"],
 	},
+	/**
+	 * Call flows — the day/night switch.
+	 *
+	 * `call-flows.read` alone, which is what `CallFlowsController` guards its list and its get with.
+	 * Toggling is `call-flows.toggle` and is gated INSIDE the page with `usePermission` rather than
+	 * here, and that split is the feature rather than the usual read/write hedge: the receptionist
+	 * template holds `read` and `toggle` and neither `write` nor `delete`, so this page has to open
+	 * for somebody who can move the switch and cannot re-point either branch.
+	 */
+	[routes.callFlows]: { permissions: ["call-flows.read"] },
+	/**
+	 * Outbound authorisation codes.
+	 *
+	 * `pin-sets.read` is a real grant despite there being no secret to read: the digests never leave
+	 * the server process, so what a reader sees is which routes are gated and by whose codes — which
+	 * is exactly what somebody diagnosing "why is this phone asking me for a number" needs. A code's
+	 * detail page inherits this by ancestry.
+	 */
+	[routes.pinSets]: { permissions: ["pin-sets.read"] },
+	/**
+	 * The four dial-plan building blocks.
+	 *
+	 * One entry for four tabs, because the API guards all four collections with the same
+	 * `dial-plan.read`. Number translations are NOT on this page — they ride `routes.*` and live on
+	 * `/routing` — precisely so this entry can name one permission and mean it.
+	 */
+	[routes.dialPlan]: { permissions: ["dial-plan.read"] },
 	[routes.ivr]: { permissions: ["ivr.read"] },
 	[routes.ringGroups]: { permissions: ["ring-groups.read"] },
 	/**
@@ -157,6 +184,21 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, PageRequirement>> = {
 	 * settings and renders read-only without the narrower grant.
 	 */
 	[routes.recordingSettings]: { permissions: ["settings.read"] },
+	/**
+	 * The organization's quotas and what it is using against them.
+	 *
+	 * `org-limits.read` and NOT `settings.read`, which is the widest divergence between a permission
+	 * and its neighbours anywhere in the settings area — and it is the API's. `OrgLimitsController`
+	 * makes the read deliberately wide because the usage screen is a SUPPORT tool ("you are at 48 of
+	 * 50 extensions" is the answer to a ticket), and makes the write `owner`-only because a quota an
+	 * administrator can raise is not a quota.
+	 *
+	 * Naming `settings.read` here would show the tab to every self-service role — all of them hold it
+	 * so a preferences screen renders — and 403 them. The write grant is gated inside the page, so a
+	 * manager who can read the ceilings sees them read-only rather than being told the page does not
+	 * exist.
+	 */
+	[routes.limits]: { permissions: ["org-limits.read"] },
 	/**
 	 * The caller's own preferences.
 	 *

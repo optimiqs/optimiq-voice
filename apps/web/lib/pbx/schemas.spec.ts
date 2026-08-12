@@ -1,8 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import {
+	audioStreamFormSchema,
 	callBlockRuleFormSchema,
+	callFlowFormSchema,
 	conferenceFormSchema,
 	dialableString,
+	dialByNameDirectoryFormSchema,
 	e164,
 	emergencyAddressFormSchema,
 	extensionFormSchema,
@@ -14,19 +17,26 @@ import {
 	keypadPinIssue,
 	mohClassFormSchema,
 	mohClassName,
+	orgLimitsFormSchema,
 	outboundRouteFormSchema,
 	pagingGroupFormSchema,
 	pagingGroupMemberFormSchema,
 	parkLotFormSchema,
 	parseDialPatterns,
 	phoneNumberFormSchema,
+	pinSchema,
+	pinSetEntryFormSchema,
+	pinSetFormSchema,
 	promptFormSchema,
 	queueAgentFormSchema,
 	queueFormSchema,
 	queueTierFormSchema,
 	ringGroupFormSchema,
+	shortCode,
+	speedDialFormSchema,
 	timeRuleFormSchema,
 	timezoneName,
+	translationRuleFormSchema,
 	voicemailBoxFormSchema,
 } from "./schemas";
 
@@ -1267,5 +1277,307 @@ describe("keypadPinIssue, mirrored from voicemail-boxes.dto.ts", () => {
 	/** Two adjacent digits are not a run. The rule is about the WHOLE PIN counting. */
 	it("does not refuse a PIN that merely contains consecutive digits", () => {
 		expect(keypadPinIssue("1245")).toBeUndefined();
+	});
+});
+
+// ---------------------------------------------------------------------------------------------
+// The T2 admin block
+// ---------------------------------------------------------------------------------------------
+
+describe("shortCode, mirrored from shared/dto.ts", () => {
+	/**
+	 * Separate from `internalNumber` because a code MAY begin with `*`, and separate from
+	 * `dialableString` because a toggle code is not a destination — ten characters at most and no
+	 * letters. Both distinctions are the server's, and both are the sort of thing a consolidation
+	 * pass would collapse.
+	 */
+	it("accepts both a star code and a plain short code", () => {
+		expect(shortCode.safeParse("*281").success).toBe(true);
+		expect(shortCode.safeParse("#01").success).toBe(true);
+		expect(shortCode.safeParse("8001").success).toBe(true);
+	});
+
+	it("refuses letters, an empty code and anything over ten characters", () => {
+		expect(shortCode.safeParse("*28a").success).toBe(false);
+		expect(shortCode.safeParse("").success).toBe(false);
+		expect(shortCode.safeParse("*1234567890").success).toBe(false);
+	});
+
+	/**
+	 * A bare `*` is ACCEPTED, and the mirror keeps it that way on purpose.
+	 *
+	 * The server's regex is `^[*#]?[0-9*#]+$`, whose optional leading `[*#]` matches nothing and whose
+	 * body accepts `*` — so `"*"` is a legal code as far as the DTO is concerned. It is almost
+	 * certainly a mistake in a form, and refusing it here would still be wrong: this schema exists to
+	 * spare a round trip, not to hold an opinion the server does not. Whether a lone star can actually
+	 * be dialled is the compiler's screen against the feature-code catalogue, which is where a real
+	 * answer lives.
+	 */
+	it("accepts a bare star, because the server's own pattern does", () => {
+		expect(shortCode.safeParse("*").success).toBe(true);
+	});
+
+	/**
+	 * Nothing here screens a code against the feature-code catalogue or the internal numbers, and
+	 * that omission is deliberate: a collision is a fact about the whole ORGANIZATION, so the
+	 * compiler answers it inside the write transaction. A check here would be a second opinion that
+	 * refuses codes the tenant can legitimately use.
+	 */
+	it("does not pretend to know whether a code is already taken", () => {
+		expect(shortCode.safeParse("*97").success).toBe(true);
+	});
+});
+
+describe("callFlowFormSchema", () => {
+	const base = { name: "Main line", extensionNumber: "", featureCode: "", enabled: true };
+
+	it("accepts a flow reachable only by its toggle code", () => {
+		const parsed = callFlowFormSchema.parse(base);
+		expect(parsed.extensionNumber).toBeNull();
+		expect(parsed.featureCode).toBeNull();
+	});
+
+	it("clears a blank code to null rather than to an empty string", () => {
+		expect(callFlowFormSchema.parse({ ...base, featureCode: "  " }).featureCode).toBeNull();
+	});
+
+	it("keeps a real toggle code", () => {
+		expect(callFlowFormSchema.parse({ ...base, featureCode: "*281" }).featureCode).toBe("*281");
+	});
+
+	/**
+	 * `mode` is absent from the server's write DTOs — moving the switch is a different endpoint and a
+	 * different grant — and `z.strictObject` here is what stops a copied block from adding it. A body
+	 * carrying `mode` would be a 400 naming the field.
+	 */
+	it("refuses a mode, because the switch is not moved by a PATCH", () => {
+		expect(callFlowFormSchema.safeParse({ ...base, mode: "night" }).success).toBe(false);
+	});
+});
+
+describe("pinSetFormSchema and its entries", () => {
+	it("bounds the attempts at the server's one and ten", () => {
+		const base = {
+			name: "International",
+			description: "",
+			promptId: "",
+			failurePromptId: "",
+			maxAttempts: "3",
+			digitTimeoutMs: "8000",
+			enabled: true,
+		};
+		expect(pinSetFormSchema.safeParse(base).success).toBe(true);
+		expect(pinSetFormSchema.safeParse({ ...base, maxAttempts: "0" }).success).toBe(false);
+		expect(pinSetFormSchema.safeParse({ ...base, maxAttempts: "11" }).success).toBe(false);
+		// Blank means "use the server default", which is what every optional integer here means.
+		expect(pinSetFormSchema.parse({ ...base, maxAttempts: "" }).maxAttempts).toBeNull();
+	});
+
+	/**
+	 * The ordinal is REQUIRED, unlike almost every other integer on a PBX form, because it is the
+	 * identity a call detail record names — "authorised by code 3". A blank box is not "put it at the
+	 * end"; it is a code whose CDR label the server would have to invent.
+	 */
+	it("requires an ordinal on an entry", () => {
+		const base = { label: "Night desk", ordinal: "1", enabled: true };
+		expect(pinSetEntryFormSchema.safeParse(base).success).toBe(true);
+		expect(pinSetEntryFormSchema.safeParse({ ...base, ordinal: "" }).success).toBe(false);
+		expect(pinSetEntryFormSchema.safeParse({ ...base, ordinal: "1001" }).success).toBe(false);
+	});
+
+	/**
+	 * The code is NOT part of the entry schema. It is not a column on the row — it is a value the
+	 * endpoint hashes and discards — and a `strictObject` that declared it would invite the EDIT form
+	 * to send it too, which is how a blank box comes to mean "erase the credential".
+	 */
+	it("keeps the digits out of the entry's own shape", () => {
+		expect(
+			pinSetEntryFormSchema.safeParse({ label: "x", ordinal: "1", enabled: true, pin: "4821" })
+				.success,
+		).toBe(false);
+	});
+
+	/**
+	 * `pinSchema` mirrors `setPinDto` — four to sixteen digits — and deliberately does NOT reuse
+	 * `keypadPinIssue`, whose weak-PIN blocklist is the mailbox rule. Importing it here would refuse
+	 * a code the API accepts, leaving the user a message no round trip could have produced.
+	 */
+	it("mirrors the server's PIN rule rather than the mailbox's", () => {
+		expect(pinSchema.safeParse("4821").success).toBe(true);
+		expect(pinSchema.safeParse("1234567890123456").success).toBe(true);
+		expect(pinSchema.safeParse("482").success).toBe(false);
+		expect(pinSchema.safeParse("12345678901234567").success).toBe(false);
+		expect(pinSchema.safeParse("48a1").success).toBe(false);
+		// The mailbox rule would refuse both of these; this one does not, because the server does not.
+		expect(pinSchema.safeParse("1234").success).toBe(true);
+		expect(pinSchema.safeParse("0000").success).toBe(true);
+		expect(keypadPinIssue("1234")).toBeDefined();
+	});
+});
+
+describe("translationRuleFormSchema", () => {
+	const base = {
+		label: "",
+		matchPattern: "^00(\\d+)$",
+		replacement: "+$1",
+		ordinal: "0",
+		enabled: true,
+	};
+
+	/**
+	 * An EMPTY replacement is how a strip rule is written, so the field is a plain bounded string
+	 * rather than the blank-to-null helper every other optional text field uses. `null` would be a
+	 * 400: the column is `z.string().max(256)` on the server.
+	 */
+	it("accepts an empty replacement and keeps it a string", () => {
+		const parsed = translationRuleFormSchema.parse({ ...base, replacement: "" });
+		expect(parsed.replacement).toBe("");
+	});
+
+	it("requires a pattern and bounds both halves", () => {
+		expect(translationRuleFormSchema.safeParse({ ...base, matchPattern: "" }).success).toBe(false);
+		expect(
+			translationRuleFormSchema.safeParse({ ...base, matchPattern: "a".repeat(257) }).success,
+		).toBe(false);
+		expect(
+			translationRuleFormSchema.safeParse({ ...base, replacement: "0".repeat(257) }).success,
+		).toBe(false);
+	});
+
+	/**
+	 * Nothing here compiles the regex or screens the replacement, and that is the point:
+	 * `validateTranslationRule` in `@optimiq-voice/routing` runs inside the write transaction, and the
+	 * replacement allow-list is a SECURITY boundary — a replacement that can emit `@` could put a
+	 * second host into a request URI. A browser-side copy would disagree with it on the first
+	 * interesting input and would be the copy an attacker controls.
+	 */
+	it("leaves an unusable regex and an unsafe replacement to the compiler", () => {
+		expect(translationRuleFormSchema.safeParse({ ...base, matchPattern: "([" }).success).toBe(true);
+		expect(
+			translationRuleFormSchema.safeParse({ ...base, replacement: "$1@evil.example" }).success,
+		).toBe(true);
+	});
+});
+
+describe("audioStreamFormSchema", () => {
+	const base = {
+		name: "Traffic",
+		description: "",
+		url: "https://stream.example.com/traffic.mp3",
+		answerFirst: true,
+		maxSeconds: "0",
+		enabled: true,
+	};
+
+	it("accepts an http or https source", () => {
+		expect(audioStreamFormSchema.safeParse(base).success).toBe(true);
+		expect(
+			audioStreamFormSchema.safeParse({ ...base, url: "http://stream.example.com/x.mp3" }).success,
+		).toBe(true);
+	});
+
+	/**
+	 * The scheme rule is a SECURITY check, not formatting: the set of things a tenant may cause the
+	 * media server to open is a decision about what the media server will read, and
+	 * `file:///etc/passwd` is a URL. Refused at the edge, again by the compiler from the snapshot,
+	 * and here so the message lands on the field.
+	 */
+	it("refuses every scheme that is not http", () => {
+		for (const url of [
+			"file:///etc/passwd",
+			"ftp://x.example/a",
+			"gs://bucket/o",
+			"/relative.mp3",
+		]) {
+			expect(audioStreamFormSchema.safeParse({ ...base, url }).success).toBe(false);
+		}
+	});
+
+	/** Zero is "until the caller hangs up", which is what an always-on feed wants — not "no limit". */
+	it("accepts zero seconds and bounds the day", () => {
+		expect(audioStreamFormSchema.parse({ ...base, maxSeconds: "0" }).maxSeconds).toBe(0);
+		expect(audioStreamFormSchema.safeParse({ ...base, maxSeconds: "86401" }).success).toBe(false);
+	});
+});
+
+describe("dialByNameDirectoryFormSchema", () => {
+	const base = {
+		name: "Company directory",
+		extensionNumber: "411",
+		searchField: "last-name",
+		minDigits: "3",
+		greetingPromptId: "",
+		invalidPromptId: "",
+		maxFailures: "3",
+		enabled: true,
+	};
+
+	it("accepts the three search fields and refuses anything else", () => {
+		for (const searchField of ["last-name", "first-name", "full-name"]) {
+			expect(dialByNameDirectoryFormSchema.safeParse({ ...base, searchField }).success).toBe(true);
+		}
+		expect(
+			dialByNameDirectoryFormSchema.safeParse({ ...base, searchField: "surname" }).success,
+		).toBe(false);
+	});
+
+	/**
+	 * Two at the bottom because a two-letter surname exists; six at the top because past that the
+	 * caller is spelling the whole name, which is the interaction a directory exists to avoid.
+	 */
+	it("bounds the digits before matching at the server's two and six", () => {
+		expect(dialByNameDirectoryFormSchema.safeParse({ ...base, minDigits: "1" }).success).toBe(
+			false,
+		);
+		expect(dialByNameDirectoryFormSchema.safeParse({ ...base, minDigits: "7" }).success).toBe(
+			false,
+		);
+		expect(dialByNameDirectoryFormSchema.safeParse({ ...base, minDigits: "2" }).success).toBe(true);
+	});
+});
+
+describe("speedDialFormSchema", () => {
+	it("takes both code shapes, and requires a label", () => {
+		const base = { code: "*01", label: "Head office", enabled: true };
+		expect(speedDialFormSchema.safeParse(base).success).toBe(true);
+		expect(speedDialFormSchema.safeParse({ ...base, code: "8001" }).success).toBe(true);
+		expect(speedDialFormSchema.safeParse({ ...base, label: "" }).success).toBe(false);
+	});
+});
+
+describe("orgLimitsFormSchema", () => {
+	const base = {
+		maxExtensions: "50",
+		maxTrunks: "",
+		maxConcurrentCalls: "",
+		maxStorageMb: "1024",
+	};
+
+	/**
+	 * The one form in this module where a blank box does NOT mean "put the default back". Every
+	 * column is nullable and `null` means NO CEILING — unlimited is the default and always has been,
+	 * because the table arrived after tenants existed. So the same helper is doing a different job
+	 * here, and clearing a box removes the limit rather than restoring one.
+	 */
+	it("turns a blank ceiling into null, which the server reads as no limit", () => {
+		const parsed = orgLimitsFormSchema.parse(base);
+		expect(parsed.maxExtensions).toBe(50);
+		expect(parsed.maxTrunks).toBeNull();
+		expect(parsed.maxConcurrentCalls).toBeNull();
+		expect(parsed.maxStorageMb).toBe(1024);
+	});
+
+	/** Zero is a real ceiling: "this organization may hold no trunks" is expressible. */
+	it("accepts zero as a ceiling rather than treating it as absent", () => {
+		expect(orgLimitsFormSchema.parse({ ...base, maxTrunks: "0" }).maxTrunks).toBe(0);
+	});
+
+	it("bounds each axis at the server's ceiling", () => {
+		expect(orgLimitsFormSchema.safeParse({ ...base, maxExtensions: "100001" }).success).toBe(false);
+		expect(orgLimitsFormSchema.safeParse({ ...base, maxTrunks: "10001" }).success).toBe(false);
+		expect(orgLimitsFormSchema.safeParse({ ...base, maxStorageMb: "10000001" }).success).toBe(
+			false,
+		);
+		expect(orgLimitsFormSchema.safeParse({ ...base, maxExtensions: "-1" }).success).toBe(false);
 	});
 });

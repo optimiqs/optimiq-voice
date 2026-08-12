@@ -2,6 +2,7 @@
 
 import { useForm } from "@tanstack/react-form";
 import { useState } from "react";
+import { AttachedReference } from "~/components/pbx/attached-reference";
 import { DestinationPicker } from "~/components/pbx/destination-picker";
 import { EntityFormDialog, FormSection } from "~/components/pbx/entity-form-dialog";
 import { ResourceOrderedList, ResourceSelect } from "~/components/pbx/resource-select";
@@ -338,6 +339,32 @@ export function OutboundRouteDialog({
 						/>
 					)}
 				</form.Field>
+				{/*
+				 * The shared ruleset, shown where the inline pair is so the ORDER is visible: strip and
+				 * prepend run first — turning what somebody's fingers did into the number they meant — and
+				 * the ruleset second, normalising that number for the wire. A ruleset that ran first would
+				 * have to know about every route's outside-line prefix, which is the coupling the shared
+				 * layer exists to remove.
+				 */}
+				<AttachedReference
+					label="Then apply the shared ruleset"
+					resource={PBX_RESOURCES.translationRulesets}
+					value={route?.translationRulesetId ?? null}
+					emptyLabel="No shared ruleset — the number goes to the carrier as the two fields above left it."
+					description="Runs after the strip and prepend above, on the number they produced."
+					note="Attaching a ruleset is not editable from this application yet: the column exists and the compiler reads it, but no endpoint accepts it in a request body."
+				/>
+			</FormSection>
+
+			<FormSection title="Authorisation" columns={1}>
+				<AttachedReference
+					label="Codes demanded before dialling"
+					resource={PBX_RESOURCES.pinSets}
+					value={route?.pinSetId ?? null}
+					emptyLabel="No challenge — anyone whose toll class covers this route may dial it."
+					description="A caller is asked for a code before any trunk is offered the call, and the code that answered is recorded against the call."
+					note="Attaching a PIN set is not editable from this application yet: the column exists and the compiler reads it, but no endpoint accepts it in a request body."
+				/>
 			</FormSection>
 
 			<FormSection title="Carriers" columns={1}>

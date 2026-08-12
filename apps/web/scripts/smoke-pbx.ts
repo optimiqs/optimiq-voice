@@ -633,18 +633,37 @@ async function main(): Promise<void> {
 			"/routing",
 			"/routing?tab=outbound",
 			"/routing?tab=time-conditions",
+			// Number translations, the sixth Routing tab. It rides `routes.*` rather than
+			// `dial-plan.*` — a ruleset is only meaningful attached to a route or a trunk — which is
+			// why it is here and not on `/dial-plan`.
+			"/routing?tab=translations",
 			"/routing?tab=feature-codes",
 			"/routing?tab=tools",
 			`/ivr/${ivrMenuId}`,
 			`/ring-groups/${ringGroupId}`,
 			`/queues/${seededQueueId}`,
 			`/routing/time-conditions/${timeConditionId}`,
+			// The T2 admin block. Call flows and the authorisation codes are routes of their own
+			// because they are gated by resources of their own (`call-flows.*`, `pin-sets.*`); the
+			// four dial-plan tables share `dial-plan.*` and are therefore tabs of one page, so a tab
+			// that 404s or crashes would otherwise be invisible to a route list. The owner used here
+			// holds all three families.
+			"/call-flows",
+			"/pin-sets",
+			"/dial-plan",
+			"/dial-plan?tab=streams",
+			"/dial-plan?tab=directories",
+			"/dial-plan?tab=speed-dials",
 			// Caller screening, gated by `call-block.read` — a route of its own rather than a fifth
 			// tab of `/routing`, because the two are gated by different resources. The owner used
 			// here holds it.
 			"/call-block",
 			// The settings sub-screens, which are real routes rather than tabs.
 			"/settings/emergency-addresses",
+			// The organization quotas. Gated by `org-limits.read`, which is the only tab in the
+			// settings area whose permission is not a settings grant — a 200 here proves the route
+			// map agrees with `OrgLimitsController` about that.
+			"/settings/limits",
 			// The `recordings` category of the settings cascade. Reads on `settings.read` and saves
 			// on `recordings.configure` — the only category with a per-category permission override,
 			// so a 200 here proves the read side of that split as well as the route.
@@ -1955,6 +1974,10 @@ async function main(): Promise<void> {
 		// --- 19. the settings cascade's two new surfaces --------------------------------------------
 		console.log("\n19. recording retention and the user cascade");
 		await runSettingsCascadeChecks(client);
+
+		// --- 20. the T2 admin block: the verbs that are not a PATCH ----------------------------------
+		console.log("\n20. the admin block: call flows, PIN sets, translations, the dial plan, limits");
+		await runAdminBlockChecks(client);
 	} finally {
 		next?.kill("SIGTERM");
 		apiProcess.kill("SIGTERM");
@@ -2302,4 +2325,374 @@ async function runSettingsCascadeChecks(client: Client): Promise<void> {
 		voicemailToEmailIncludeLink: true,
 		voicemailToEmailIncludeTranscription: true,
 	});
+}
+
+/**
+ * The T2 admin block, end to end.
+ *
+ * Four of the six things this exercises are verbs that are NOT a `PATCH`, and every one of them is
+ * a place a screen could be wrong in a way no unit test reaches: a toggle guarded by a different
+ * grant from the edit form beside it, an override that lives under `/call-flows` and writes a time
+ * condition, a PIN that goes in and never comes back, and a singleton reached without an id.
+ *
+ * What it deliberately does NOT try is attaching a PIN set to an outbound route or a ruleset to a
+ * trunk. Those columns exist and the compiler reads them, and no write DTO declares them — the
+ * refusal below is asserted rather than worked around, because it is the reason the two forms render
+ * those fields read-only.
+ */
+async function runAdminBlockChecks(client: Client): Promise<void> {
+	// --- named destinations, streams, directories and speed dials ---------------------------------
+	const alias = await client("POST", "/api/v1/destination-aliases", {
+		name: `Smoke alias ${RUN_ID}`,
+		description: "Front desk",
+		enabled: true,
+		...writeDestination({ type: "hangup", ref: null, data: null }, ""),
+	});
+	const aliasId = rowId(alias);
+	check(
+		"the create body the named-destination dialog builds is accepted",
+		alias.status === 201 && data(alias).destinationType === "hangup",
+		`status ${alias.status}`,
+	);
+
+	/**
+	 * The security check the stream form restates, proved against the server rather than trusted:
+	 * the set of things a tenant may cause the media server to OPEN is a decision about what the
+	 * media server will read, and `file://` is a URL.
+	 */
+	const badStream = await client("POST", "/api/v1/audio-streams", {
+		name: `Bad stream ${RUN_ID}`,
+		url: "file:///etc/passwd",
+		...writeDestination({ type: "hangup", ref: null, data: null }, "fallback"),
+	});
+	const badStreamFields = pbxFieldErrors(asApiError(badStream));
+	check(
+		"a non-http stream URL is refused and the message lands on the url field",
+		badStream.status === 400 && badStreamFields.url !== undefined,
+		`status ${badStream.status}, fields ${Object.keys(badStreamFields).join(",")}`,
+	);
+
+	const stream = await client("POST", "/api/v1/audio-streams", {
+		name: `Smoke stream ${RUN_ID}`,
+		url: "https://stream.example.com/smoke.mp3",
+		answerFirst: true,
+		maxSeconds: 0,
+		enabled: true,
+		...writeDestination({ type: "hangup", ref: null, data: null }, "fallback"),
+	});
+	const streamId = rowId(stream);
+	check(
+		"a stream's REQUIRED fallback trio round-trips under the prefix the picker writes",
+		stream.status === 201 && data(stream).fallbackDestinationType === "hangup",
+		`status ${stream.status}`,
+	);
+
+	/** The trio is not optional here, unlike every other secondary trio in the area. */
+	const noFallback = await client("POST", "/api/v1/audio-streams", {
+		name: `No fallback ${RUN_ID}`,
+		url: "https://stream.example.com/none.mp3",
+	});
+	check(
+		"a stream with no fallback is refused, which is why the form marks it required",
+		noFallback.status === 400 || noFallback.status === 422,
+		`status ${noFallback.status}`,
+	);
+
+	const directory = await client("POST", "/api/v1/directories", {
+		name: `Smoke directory ${RUN_ID}`,
+		searchField: "last-name",
+		minDigits: 3,
+		maxFailures: 3,
+		enabled: true,
+	});
+	const directoryId = rowId(directory);
+	check(
+		"a directory saves with no member list, because its entries are derived from the extensions",
+		directory.status === 201 && data(directory).searchField === "last-name",
+		`status ${directory.status}`,
+	);
+
+	const speedDial = await client("POST", "/api/v1/speed-dials", {
+		code: `*8${RUN_DIGITS.slice(0, 2)}`,
+		label: `Smoke speed dial ${RUN_ID}`,
+		enabled: true,
+		...writeDestination({ type: "alias", ref: aliasId, data: null }, ""),
+	});
+	const speedDialId = rowId(speedDial);
+	check(
+		"a speed dial points at a destination trio rather than a dial string, alias included",
+		speedDial.status === 201 && data(speedDial).destinationRef === aliasId,
+		`status ${speedDial.status}`,
+	);
+
+	// --- call flows, and the toggle that is a different grant --------------------------------------
+	const flow = await client("POST", "/api/v1/call-flows", {
+		name: `Smoke flow ${RUN_ID}`,
+		featureCode: `*28${RUN_DIGITS.slice(0, 1)}`,
+		enabled: true,
+		...writeDestination({ type: "alias", ref: aliasId, data: null }, ""),
+		...writeDestination({ type: "hangup", ref: null, data: null }, "night"),
+	});
+	const flowId = rowId(flow);
+	check(
+		"a call flow saves with BOTH trios and starts in day mode",
+		flow.status === 201 &&
+			data(flow).destinationType === "alias" &&
+			data(flow).nightDestinationType === "hangup" &&
+			data(flow).mode === "day",
+		`status ${flow.status}, mode ${String(data(flow).mode)}`,
+	);
+
+	/**
+	 * The switch is not a field. A `PATCH` carrying `mode` is a 400 naming it, which is what makes
+	 * the dialog's missing mode control a contract rather than an omission.
+	 */
+	const patchedMode = await client("PATCH", `/api/v1/call-flows/${flowId}`, { mode: "night" });
+	check(
+		"a PATCH cannot move the switch, which is why the edit dialog has no mode control",
+		patchedMode.status === 400,
+		`status ${patchedMode.status}`,
+	);
+
+	const toggled = await client("POST", `/api/v1/call-flows/${flowId}/toggle`, { mode: "night" });
+	check(
+		"the toggle endpoint moves it and answers with the row the list re-renders",
+		toggled.status === 201 && data(toggled).mode === "night",
+		`status ${toggled.status}, mode ${String(data(toggled).mode)}`,
+	);
+
+	/** Sending the target state explicitly is what makes the button idempotent under a double click. */
+	const toggledAgain = await client("POST", `/api/v1/call-flows/${flowId}/toggle`, {
+		mode: "night",
+	});
+	check(
+		"sending the mode explicitly is idempotent, so two fast clicks do not cancel out",
+		toggledAgain.status === 201 && data(toggledAgain).mode === "night",
+		`mode ${String(data(toggledAgain).mode)}`,
+	);
+
+	// --- the time-condition override, which lives under /call-flows -------------------------------
+	const conditions = await client("GET", "/api/v1/time-conditions?page=1&limit=1");
+	const conditionId = firstId(conditions);
+	check(
+		"a time condition row carries the override columns the list and detail page render",
+		Object.hasOwn((conditions.body.data as Record<string, unknown>[])[0] ?? {}, "override"),
+		Object.keys((conditions.body.data as Record<string, unknown>[])[0] ?? {}).join(","),
+	);
+
+	const forced = await client(
+		"POST",
+		`/api/v1/call-flows/time-conditions/${conditionId}/override`,
+		{
+			override: "forced-no-match",
+		},
+	);
+	check(
+		"the override endpoint writes a TIME CONDITION from under /call-flows, and answers with it",
+		forced.status === 201 && data(forced).override === "forced-no-match",
+		`status ${forced.status}, override ${String(data(forced).override)}`,
+	);
+
+	const released = await client(
+		"POST",
+		`/api/v1/call-flows/time-conditions/${conditionId}/override`,
+		{ override: "auto" },
+	);
+	check(
+		"and hands the clock back, which is the state the select's first option means",
+		released.status === 201 && data(released).override === "auto",
+		`override ${String(data(released).override)}`,
+	);
+
+	/** The column exists, the compiler screens it, and no DTO accepts it — so no form offers it. */
+	const overrideCode = await client("PATCH", `/api/v1/time-conditions/${conditionId}`, {
+		overrideFeatureCode: "*291",
+	});
+	check(
+		"the override star code is not writable, which is why the card renders it read-only",
+		overrideCode.status === 400,
+		`status ${overrideCode.status}`,
+	);
+
+	// --- translation rulesets and their ordered rules ----------------------------------------------
+	const ruleset = await client("POST", "/api/v1/translation-rulesets", {
+		name: `Smoke ruleset ${RUN_ID}`,
+		description: "E.164 normalisation",
+		enabled: true,
+	});
+	const rulesetId = rowId(ruleset);
+	check(
+		"a ruleset is created through routes.write rather than a resource of its own",
+		ruleset.status === 201,
+		`status ${ruleset.status}`,
+	);
+
+	const strip = await client("POST", `/api/v1/translation-rulesets/${rulesetId}/rules`, {
+		label: "Strip the international prefix",
+		matchPattern: "^00(\\d+)$",
+		replacement: "$1",
+		ordinal: 0,
+		enabled: true,
+	});
+	const plus = await client("POST", `/api/v1/translation-rulesets/${rulesetId}/rules`, {
+		label: "Add the plus",
+		matchPattern: "^(\\d+)$",
+		replacement: "+$1",
+		ordinal: 1,
+		enabled: true,
+	});
+	check(
+		"both halves of a pipeline save, including an EMPTY-capable replacement",
+		strip.status === 201 && plus.status === 201,
+		`status ${strip.status}/${plus.status}`,
+	);
+
+	/**
+	 * The security boundary the form deliberately does not duplicate: a replacement that can emit
+	 * `@` could put a second host into a request URI. It is refused by the compiler inside the write
+	 * transaction, so it has to surface as a rollback the dialog can render — not as a stored rule.
+	 */
+	const unsafe = await client("POST", `/api/v1/translation-rulesets/${rulesetId}/rules`, {
+		matchPattern: "^(\\d+)$",
+		replacement: "$1@evil.example",
+		ordinal: 2,
+	});
+	check(
+		"an unsafe replacement is refused by the compiler rather than accepted by the edge",
+		unsafe.status >= 400,
+		`status ${unsafe.status}`,
+	);
+
+	/** The order IS the semantics here, so it is rewritten in one transaction. */
+	const reordered = await client("PUT", `/api/v1/translation-rulesets/${rulesetId}/rules/reorder`, {
+		ids: [rowId(plus), rowId(strip)],
+	});
+	check(
+		"the whole pipeline is reordered in one request, as the detail page sends it",
+		reordered.status === 200,
+		`status ${reordered.status}`,
+	);
+
+	// --- PIN sets, and the code that goes in and never comes back ----------------------------------
+	const pinSet = await client("POST", "/api/v1/pin-sets", {
+		name: `Smoke codes ${RUN_ID}`,
+		description: "International calling",
+		maxAttempts: 3,
+		digitTimeoutMs: 8000,
+		enabled: true,
+	});
+	const pinSetId = rowId(pinSet);
+	check("a PIN set is created", pinSet.status === 201, `status ${pinSet.status}`);
+
+	const entry = await client("POST", `/api/v1/pin-sets/${pinSetId}/entries`, {
+		label: "Night desk",
+		ordinal: 0,
+		enabled: true,
+		pin: "48213",
+	});
+	const entryId = rowId(entry);
+	check(
+		"a code and its digest are created in ONE request, so there is no ungated window",
+		entry.status === 201 && !Object.hasOwn(data(entry), "pinHash"),
+		`status ${entry.status}, keys ${Object.keys(data(entry)).join(",")}`,
+	);
+
+	const reset = await client("PUT", `/api/v1/pin-sets/${pinSetId}/entries/${entryId}/pin`, {
+		pin: "90517",
+	});
+	check(
+		"replacing a code leaves the label and the ordinal — the identity a call record names",
+		reset.status === 200 &&
+			data(reset).label === "Night desk" &&
+			data(reset).ordinal === 0 &&
+			!Object.hasOwn(data(reset), "pinHash"),
+		`status ${reset.status}`,
+	);
+
+	const entryList = await client("GET", `/api/v1/pin-sets/${pinSetId}/entries`);
+	const entryRows = (entryList.body.data as Record<string, unknown>[]) ?? [];
+	check(
+		"and no digest is ever on a row the codes table renders",
+		entryRows.every((row) => !Object.hasOwn(row, "pinHash")),
+		Object.keys(entryRows[0] ?? {}).join(","),
+	);
+
+	// --- the three attachments no request body may carry ------------------------------------------
+	/**
+	 * The reason the outbound-route and trunk dialogs render these read-only. If any of the three
+	 * ever starts succeeding, those forms should become pickers in the same commit — and this check
+	 * is what will say so, by failing.
+	 */
+	const routes = await client("GET", "/api/v1/outbound-routes?page=1&limit=1");
+	const outboundRouteId = firstId(routes);
+	const gated = await client("PATCH", `/api/v1/outbound-routes/${outboundRouteId}`, { pinSetId });
+	const rewritten = await client("PATCH", `/api/v1/outbound-routes/${outboundRouteId}`, {
+		translationRulesetId: rulesetId,
+	});
+	const trunks = await client("GET", "/api/v1/trunks?page=1&limit=1");
+	const inbound = await client("PATCH", `/api/v1/trunks/${firstId(trunks)}`, {
+		inboundTranslationRulesetId: rulesetId,
+	});
+	check(
+		"none of the three new attachments is writable, which is what the two forms say on screen",
+		gated.status === 400 && rewritten.status === 400 && inbound.status === 400,
+		`pinSet ${gated.status}, ruleset ${rewritten.status}, trunk ${inbound.status}`,
+	);
+
+	// --- organization limits: a singleton, and a usage report with two honest gaps -----------------
+	const limits = await client("PUT", "/api/v1/org-limits", {
+		maxExtensions: 50,
+		maxTrunks: null,
+		maxConcurrentCalls: 25,
+		maxStorageMb: 1024,
+	});
+	check(
+		"the limits are a PUT of the COMPLETE set, and null removes a ceiling",
+		limits.status === 200 && data(limits).maxExtensions === 50 && data(limits).maxTrunks === null,
+		`status ${limits.status}`,
+	);
+
+	const usage = await client("GET", "/api/v1/org-limits/usage");
+	const usageEntries =
+		(data(usage).entries as { limit: string; used: number; ceiling: number | null }[]) ?? [];
+	const concurrent = usageEntries.find((row) => row.limit === "maxConcurrentCalls");
+	check(
+		"the usage report answers one line per limit, in the order the page renders them",
+		usage.status === 200 &&
+			usageEntries.map((row) => row.limit).join(",") ===
+				"maxExtensions,maxTrunks,maxConcurrentCalls,maxStorageMb",
+		usageEntries.map((row) => row.limit).join(","),
+	);
+	check(
+		"simultaneous calls report a ceiling and zero usage, which is why the page draws no bar for them",
+		concurrent?.ceiling === 25 && concurrent.used === 0,
+		JSON.stringify(concurrent),
+	);
+	check(
+		"and the exact byte total is carried beside the rounded megabytes",
+		typeof data(usage).storageBytes === "number",
+		String(data(usage).storageBytes),
+	);
+
+	// --- tear down, in dependency order -----------------------------------------------------------
+	await client("DELETE", `/api/v1/speed-dials/${speedDialId}`);
+	await client("DELETE", `/api/v1/call-flows/${flowId}`);
+
+	/** A named destination cannot be deleted while a speed dial or a flow still names it. */
+	const aliasDeleted = await client("DELETE", `/api/v1/destination-aliases/${aliasId}`);
+	check(
+		"the named destination deletes once nothing points at it any more",
+		aliasDeleted.status === 200,
+		`status ${aliasDeleted.status}`,
+	);
+
+	await client("DELETE", `/api/v1/directories/${directoryId}`);
+	await client("DELETE", `/api/v1/audio-streams/${streamId}`);
+	await client("DELETE", `/api/v1/pin-sets/${pinSetId}`);
+	const rulesetDeleted = await client("DELETE", `/api/v1/translation-rulesets/${rulesetId}`);
+	check(
+		"and the ruleset deletes with its rules",
+		rulesetDeleted.status === 200,
+		`status ${rulesetDeleted.status}`,
+	);
 }

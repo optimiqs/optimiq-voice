@@ -1,11 +1,13 @@
 import {
 	BlockIcon,
+	BlocksIcon,
 	ConferenceIcon,
 	DeviceIcon,
 	GaugeIcon,
 	HashIcon,
 	HistoryIcon,
 	KeyIcon,
+	KeypadIcon,
 	LedgerIcon,
 	MegaphoneIcon,
 	MenuIcon,
@@ -17,6 +19,7 @@ import {
 	RouteIcon,
 	SettingsIcon,
 	ShieldIcon,
+	SwitchIcon,
 	TrunkIcon,
 	UsersIcon,
 	VoicemailIcon,
@@ -70,6 +73,31 @@ export const NAV_SECTIONS: readonly NavSection[] = [
 		label: "Routing",
 		items: [
 			{ title: "Routing", url: routes.routing, icon: RouteIcon },
+			/**
+			 * Immediately after Routing, because a call flow is the thing an administrator reaches for
+			 * the moment after they have built a time condition and discovered it cannot be overruled.
+			 *
+			 * It is nevertheless a separate entry rather than a Routing tab, and the reason is who opens
+			 * it: `call-flows.toggle` is the receptionist's grant, and the whole feature is that
+			 * somebody who owns no part of the dial plan can find this page at five o'clock. Buried as
+			 * the sixth tab of a page called "Routing" it would not be findable by that person, and
+			 * `PAGE_PERMISSIONS` could not let them in without opening the other five tabs too.
+			 */
+			{ title: "Call flows", url: routes.callFlows, icon: SwitchIcon },
+			/**
+			 * The four named building blocks routing points at, on one page.
+			 *
+			 * Under "Routing" rather than "Call features" because that is what somebody is doing when
+			 * they reach for one: they are wiring a DID or an IVR option and they need a target that
+			 * outlives the row pointing at it.
+			 */
+			{ title: "Dial plan", url: routes.dialPlan, icon: BlocksIcon },
+			/**
+			 * Outbound authorisation codes, last in this section because they are the least-visited and
+			 * because they belong beside the outbound routes they gate rather than beside the features
+			 * a front desk uses. Whoever manages these is whoever is named when the bill arrives.
+			 */
+			{ title: "Authorisation codes", url: routes.pinSets, icon: KeypadIcon },
 			{ title: "IVR menus", url: routes.ivr, icon: MenuIcon },
 			{ title: "Ring groups", url: routes.ringGroups, icon: UsersIcon },
 			/**

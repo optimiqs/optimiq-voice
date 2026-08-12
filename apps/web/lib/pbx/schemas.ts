@@ -19,6 +19,7 @@ import {
 	CALL_BLOCK_ACTIONS,
 	CALL_BLOCK_DIRECTIONS,
 	CALL_BLOCK_MATCH_KINDS,
+	DIRECTORY_SEARCH_FIELDS,
 	FEATURE_CODE_ACTIONS,
 	MOH_SOURCES,
 	IVR_OPTION_MATCH_KINDS,
@@ -67,6 +68,32 @@ export const dialableString = z
 	.regex(/^[+*#0-9A-Za-z._-]+$/u, "Must be a dialable string");
 
 export const displayName = z.string().trim().min(1, "Required").max(128, "At most 128 characters");
+
+/**
+ * A star code or short code a phone can dial: `*281`, `*01`, `8001`.
+ *
+ * Mirrors `shortCode` in `apps/api/src/pbx/shared/dto.ts`, and it is deliberately NOT
+ * {@link internalNumber}: a code MAY begin with `*` and an extension may not — that space belongs to
+ * the feature codes, and a code that lives in it has to be screened against them, which the COMPILER
+ * does. Nothing here checks for a collision, because a collision is a fact about the whole tenant
+ * rather than about this row: the compiler's diagnostic is what says "`*281` already answers to
+ * something", and it runs inside the write transaction.
+ */
+export const shortCode = z
+	.string()
+	.trim()
+	.min(1, "Required")
+	.max(10, "At most 10 characters")
+	.regex(/^[*#]?[0-9*#]+$/u, "Digits, optionally led by * or #");
+
+/** An optional short code: blank clears it, anything else must be a dialable code. */
+const optionalShortCode = z
+	.string()
+	.trim()
+	.refine((value) => value === "" || shortCode.safeParse(value).success, {
+		message: "Digits, optionally led by * or #",
+	})
+	.transform((value) => (value.length === 0 ? null : value));
 
 /**
  * A text control that may be left blank.
@@ -776,6 +803,231 @@ export function parseDialPatterns(text: string): string[] {
 		.map((entry) => entry.trim())
 		.filter((entry) => entry.length > 0);
 }
+
+// ---------------------------------------------------------------------------------------------
+// The T2 admin block
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A call flow — the day/night switch.
+ *
+ * `mode` is absent and its absence is the contract: `createCallFlowDto` and `updateCallFlowDto` both
+ * omit it, because moving the switch is `POST /call-flows/:id/toggle` behind `call-flows.toggle`
+ * rather than a field behind `call-flows.write`. `z.strictObject` here is what stops a copied block
+ * from adding it — the server would answer a body carrying `mode` with a 400 naming the field.
+ *
+ * The two destination trios are not here either, for the reason every trio is held beside its form
+ * rather than inside it: they are three columns each and the picker owns them. BOTH are required,
+ * which is unusual — a flow with one position is not a switch — and the dialog passes
+ * `{ required: true }` to `validateDestinationValue` for each.
+ */
+export const callFlowFormSchema = z.strictObject({
+	name: displayName,
+	/** Blank is legal: a flow reached only by its toggle code has no number of its own. */
+	extensionNumber: optionalDigits(16),
+	/**
+	 * The star code that toggles the flow, and the key a BLF lamp is provisioned with.
+	 *
+	 * Upstream numbers these `*28` plus a per-flow suffix, and nothing here enforces that shape — the
+	 * suffix is the tenant's. The check that matters is the compile-time screen against the
+	 * feature-code catalogue, because two mechanisms answering the same digits is a collision with no
+	 * runtime symptom beyond the wrong one winning.
+	 */
+	featureCode: optionalShortCode,
+	enabled: z.boolean(),
+});
+export type CallFlowFormValues = z.input<typeof callFlowFormSchema>;
+
+/**
+ * A PIN set — the list, never a code.
+ *
+ * Nothing on this form reaches a secret, and there is no field that could: the codes live on the
+ * entries and are set through an endpoint that hashes them. See {@link pinSchema}.
+ */
+export const pinSetFormSchema = z.strictObject({
+	name: displayName,
+	description: optionalText(512),
+	/** What the caller hears when they are asked for a code, and when they get it wrong. */
+	promptId: optionalReference(),
+	failurePromptId: optionalReference(),
+	/**
+	 * Three is the universal telephone answer and the bound below it is the reason: a four-digit PIN
+	 * behind unbounded retries is a keypad away from being brute forced during one long call.
+	 */
+	maxAttempts: optionalInt(1, 10),
+	digitTimeoutMs: optionalInt(1000, 60_000),
+	enabled: z.boolean(),
+});
+export type PinSetFormValues = z.input<typeof pinSetFormSchema>;
+
+/**
+ * One code's metadata — and deliberately not the code.
+ *
+ * `ordinal` is {@link requiredInt} rather than {@link optionalInt}, which is the second time that
+ * helper has been needed and for a different reason from the first: `park_lot.slot_start` is
+ * required because the column has no default, and this is required because the ordinal is the
+ * IDENTITY a call detail record names ("code 3, the night desk"). A blank box is not "put it at the
+ * end", it is a code whose CDR label the server would have to invent. The dialog pre-fills the next
+ * free ordinal so the requirement is only ever met by somebody who cleared the box on purpose.
+ */
+export const pinSetEntryFormSchema = z.strictObject({
+	label: optionalText(128),
+	ordinal: requiredInt(0, 1000),
+	enabled: z.boolean(),
+});
+export type PinSetEntryFormValues = z.input<typeof pinSetEntryFormSchema>;
+
+/**
+ * The digits themselves.
+ *
+ * Four at the bottom because that is the shortest anybody actually uses; sixteen at the top is the
+ * server's. `keypadPinIssue` — the mailbox and conference rule — is deliberately NOT reused, and the
+ * difference is the server's rather than a lapse: `setPinDto` checks the length and the alphabet and
+ * nothing else, so importing the weak-PIN blocklist here would refuse a code the API would accept
+ * and leave the user with a message no round trip could have produced. The dialog says "avoid a
+ * repeated or counting code" as ADVICE beside the field instead, which is the honest shape for a
+ * rule this app does not get to enforce.
+ */
+export const pinSchema = z
+	.string()
+	.trim()
+	.min(4, "At least 4 digits")
+	.max(16, "At most 16 digits")
+	.regex(/^[0-9]+$/u, "Digits only — it is entered on a telephone keypad");
+
+/** A ruleset: a name for a pipeline. Everything that does anything is in its rules. */
+export const translationRulesetFormSchema = z.strictObject({
+	name: displayName,
+	description: optionalText(512),
+	enabled: z.boolean(),
+});
+export type TranslationRulesetFormValues = z.input<typeof translationRulesetFormSchema>;
+
+/**
+ * One rewrite.
+ *
+ * ## Neither half is validated beyond its length, and that is the server's decision restated
+ *
+ * `validateTranslationRule` in `@optimiq-voice/routing` is the function whose opinion decides
+ * whether a rule can be APPLIED — it compiles the regex, and it checks that the replacement can only
+ * ever emit dialable output — and it runs inside the write transaction. A `new RegExp(...)` here
+ * would be a second opinion that agrees today and disagrees the first time somebody writes a
+ * lookbehind, and the replacement allow-list is a SECURITY boundary (a replacement that can emit `@`
+ * is a rule that could put a second host into a request URI), which is not a check to duplicate in
+ * the half of the system an attacker controls.
+ *
+ * `replacement` may be EMPTY — that is how a strip rule is written — so it is a plain bounded string
+ * rather than {@link optionalText}, whose blank-means-null transform would send `null` for a column
+ * the server declares `z.string().max(256)`.
+ */
+export const translationRuleFormSchema = z.strictObject({
+	label: optionalText(128),
+	matchPattern: z.string().trim().min(1, "Required").max(256, "At most 256 characters"),
+	replacement: z.string().trim().max(256, "At most 256 characters"),
+	ordinal: requiredInt(0, 1000),
+	enabled: z.boolean(),
+});
+export type TranslationRuleFormValues = z.input<typeof translationRuleFormSchema>;
+
+/** A named destination: a name, a note, and the trio the picker holds beside this. */
+export const destinationAliasFormSchema = z.strictObject({
+	name: displayName,
+	description: optionalText(512),
+	enabled: z.boolean(),
+});
+export type DestinationAliasFormValues = z.input<typeof destinationAliasFormSchema>;
+
+/**
+ * A remote audio source.
+ *
+ * The `http(s)` rule is the one check on this form that is a SECURITY check rather than formatting,
+ * and it is why it is restated rather than left to the round trip: the set of things a tenant may
+ * cause the media server to open is a decision about what the media server will READ, and
+ * `file:///etc/passwd` is a URL. The server refuses it at the edge and the compiler refuses it again
+ * from the snapshot; this is the third copy and the least authoritative, which is the correct order.
+ */
+export const audioStreamFormSchema = z.strictObject({
+	name: displayName,
+	description: optionalText(512),
+	url: z
+		.string()
+		.trim()
+		.min(1, "Required")
+		.max(1024, "At most 1024 characters")
+		.refine((value) => /^https?:\/\//iu.test(value), "Must be an http or https URL")
+		.refine((value) => {
+			try {
+				void new URL(value);
+				return true;
+			} catch {
+				return false;
+			}
+		}, "Must be a valid absolute URL"),
+	answerFirst: z.boolean(),
+	/** Zero means "until the caller hangs up", which is what an always-on radio feed wants. */
+	maxSeconds: optionalInt(0, 86_400),
+	enabled: z.boolean(),
+});
+export type AudioStreamFormValues = z.input<typeof audioStreamFormSchema>;
+
+/**
+ * A dial-by-name directory.
+ *
+ * There is no member list to edit: the entries are DERIVED from the organization's extensions at
+ * compile time, keyed on the mailbox's recorded NAME greeting. That is why the form has a note
+ * rather than a picker — an extension with no recorded name is skipped with a compile warning, and
+ * the fix is on the mailbox rather than here.
+ */
+export const dialByNameDirectoryFormSchema = z.strictObject({
+	name: displayName,
+	extensionNumber: optionalDigits(16),
+	searchField: z.enum(DIRECTORY_SEARCH_FIELDS),
+	/**
+	 * Two at the bottom because a two-letter surname exists; six at the top because past that the
+	 * caller is spelling the whole name, which is the interaction a directory exists to avoid.
+	 */
+	minDigits: optionalInt(2, 6),
+	greetingPromptId: optionalReference(),
+	invalidPromptId: optionalReference(),
+	maxFailures: optionalInt(1, 10),
+	enabled: z.boolean(),
+});
+export type DialByNameDirectoryFormValues = z.input<typeof dialByNameDirectoryFormSchema>;
+
+/**
+ * An organization speed dial.
+ *
+ * `code` accepts both `*01` and `8001`, and neither shape is screened here: whether a code collides
+ * with a feature code or with an internal number is a fact about the whole tenant, so the compiler
+ * answers it inside the write transaction and the diagnostic rides out in the mutation envelope.
+ */
+export const speedDialFormSchema = z.strictObject({
+	code: shortCode,
+	label: displayName,
+	enabled: z.boolean(),
+});
+export type SpeedDialFormValues = z.input<typeof speedDialFormSchema>;
+
+/**
+ * The organization's four quotas.
+ *
+ * The one form in this file where a blank box means something other than "put the default back".
+ * Every column is nullable and `null` means NO CEILING — unlimited is the default and always has
+ * been, because this table arrived after tenants existed — so {@link optionalInt}'s blank-to-null
+ * transform is doing a different job here from the one it does on every other numeric field in this
+ * module. Clearing a box removes the limit; it does not restore one.
+ *
+ * The upper bounds are the server's and are not policy: they are the largest values that are not
+ * obviously a typo. A hundred thousand extensions is larger than any single tenant this platform
+ * will hold, and a ceiling that high is indistinguishable from none.
+ */
+export const orgLimitsFormSchema = z.strictObject({
+	maxExtensions: optionalInt(0, 100_000),
+	maxTrunks: optionalInt(0, 10_000),
+	maxConcurrentCalls: optionalInt(0, 100_000),
+	maxStorageMb: optionalInt(0, 10_000_000),
+});
+export type OrgLimitsFormValues = z.input<typeof orgLimitsFormSchema>;
 
 // ---------------------------------------------------------------------------------------------
 // The media library
