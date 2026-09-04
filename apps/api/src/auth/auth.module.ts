@@ -54,8 +54,11 @@ import { SsoService } from "./sso/sso.service";
 		MailTemplateService,
 		{
 			provide: AUTH_PLATFORM,
-			useFactory: (mailer: Mailer): AuthPlatform =>
-				createAuthPlatform(createMailerEmailDelivery(mailer)),
+			// Async: the platform now reads the enabled SSO providers at boot so `genericOAuth` can be
+			// registered with them. Nest awaits an async `useFactory`, so `AUTH_PLATFORM` resolves to the
+			// composed runtime exactly as before — only the construction is asynchronous now.
+			useFactory: async (mailer: Mailer): Promise<AuthPlatform> =>
+				await createAuthPlatform(createMailerEmailDelivery(mailer)),
 			inject: [Mailer],
 		},
 		{
@@ -68,7 +71,22 @@ import { SsoService } from "./sso/sso.service";
 		RequirePermissionsGuard,
 		{ provide: APP_GUARD, useExisting: RequirePermissionsGuard },
 	],
-	exports: [AUTH_PLATFORM, AUTH_REPOSITORY, AuthService, CallTokenService, RequirePermissionsGuard],
+	exports: [
+		AUTH_PLATFORM,
+		AUTH_REPOSITORY,
+		AuthService,
+		CallTokenService,
+		RequirePermissionsGuard,
+		// Exported so the PBX mail consumers (voicemail-to-email, and the fax/emergency senders when
+		// they are wired the same way) can resolve the per-org mail-template cascade + branding product
+		// name. `PbxModule` imports `AuthModule`, so this is the seam that lets a consumer in that
+		// module reach `resolveComposition` without a second copy of the branding read.
+		MailTemplateService,
+		// Exported for the same reason: the logo-byte route lives in `PbxModule` (that is where the
+		// media object store is) and resolves the effective branding — and therefore the logo's object
+		// key — through this service.
+		BrandingService,
+	],
 })
 export class AuthModule implements OnApplicationShutdown {
 	constructor(@Inject(AUTH_PLATFORM) private readonly platform: AuthPlatform) {

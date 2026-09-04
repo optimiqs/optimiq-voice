@@ -42,8 +42,28 @@ function sessionFor(organizationId: string | null): AppSession {
 			activeOrganizationId: organizationId,
 		},
 		user: { id: "u", email: "u@test", name: "U", emailVerified: true },
+		// The UNSCOPED extension grants, so `ExtensionsService`'s `.own` overrides take the
+		// pass-through (manager/admin) path these plumbing specs are about. The `.own` narrowing is
+		// exercised by `selfServiceScope.test.ts`.
+		permissions: ["extensions.read", "extensions.write"],
 	};
 }
+
+/**
+ * A database whose ownership queries return nothing.
+ *
+ * The `ExtensionsService` constructor now takes a `PbxDatabaseClient` for the `.own` row lookups.
+ * These specs stay on the unscoped path (see `sessionFor`), so the handle is never actually read;
+ * it is here to satisfy the constructor.
+ */
+const FAKE_DB = {
+	withTenantScope: async <T>(_organizationId: string, work: (tx: never) => Promise<T>) =>
+		await work({
+			select: () => ({
+				from: () => ({ where: async () => [] }),
+			}),
+		} as never),
+} as unknown as import("@optimiq-voice/pbx-db").PbxDatabaseClient;
 
 interface Recorded {
 	readonly method: string;
@@ -104,7 +124,7 @@ const NO_LIMITS = {
 describe("PbxResourceService", () => {
 	it("passes the session's organization as the repository's first argument", async () => {
 		const { runtime, calls } = fakeRuntime({});
-		const service = new ExtensionsService(runtime, NO_LIMITS);
+		const service = new ExtensionsService(runtime, NO_LIMITS, FAKE_DB);
 		await service.list(sessionFor(ORGANIZATION_ID), { page: 1, limit: 20 } as never);
 		expect(calls[0]?.method).to.equal("list");
 		expect(calls[0]?.args[0]).to.equal(ORGANIZATION_ID);
@@ -112,7 +132,10 @@ describe("PbxResourceService", () => {
 
 	it("passes its own resource descriptor, not one the caller chose", async () => {
 		const { runtime, calls } = fakeRuntime({});
-		await new ExtensionsService(runtime, NO_LIMITS).get(sessionFor(ORGANIZATION_ID), "abc");
+		await new ExtensionsService(runtime, NO_LIMITS, FAKE_DB).get(
+			sessionFor(ORGANIZATION_ID),
+			"abc",
+		);
 		const resource = calls[0]?.args[1] as { kind: string; tableName: string };
 		expect(resource.kind).to.equal("extension");
 		expect(resource.tableName).to.equal("extension");
@@ -120,7 +143,7 @@ describe("PbxResourceService", () => {
 
 	it("refuses to act on a session with no active organization", async () => {
 		const { runtime, calls } = fakeRuntime({});
-		const service = new ExtensionsService(runtime, NO_LIMITS);
+		const service = new ExtensionsService(runtime, NO_LIMITS, FAKE_DB);
 		let thrown: unknown;
 		try {
 			await service.list(sessionFor(null), { page: 1, limit: 20 } as never);
@@ -142,7 +165,7 @@ describe("PbxResourceService", () => {
 					totalPages: 3,
 				})) as never,
 		});
-		const result = await new ExtensionsService(runtime, NO_LIMITS).list(
+		const result = await new ExtensionsService(runtime, NO_LIMITS, FAKE_DB).list(
 			sessionFor(ORGANIZATION_ID),
 			{
 				page: 2,
@@ -160,7 +183,7 @@ describe("PbxResourceService", () => {
 
 	it("wraps a single row as { data }", async () => {
 		const { runtime } = fakeRuntime({});
-		const result = await new ExtensionsService(runtime, NO_LIMITS).get(
+		const result = await new ExtensionsService(runtime, NO_LIMITS, FAKE_DB).get(
 			sessionFor(ORGANIZATION_ID),
 			"abc",
 		);
@@ -183,7 +206,7 @@ describe("PbxResourceService", () => {
 					],
 				})) as never,
 		});
-		const result = await new ExtensionsService(runtime, NO_LIMITS).create(
+		const result = await new ExtensionsService(runtime, NO_LIMITS, FAKE_DB).create(
 			sessionFor(ORGANIZATION_ID),
 			{},
 		);
@@ -194,7 +217,7 @@ describe("PbxResourceService", () => {
 
 	it("always returns a warnings array, even when there is nothing to say", async () => {
 		const { runtime } = fakeRuntime({});
-		const result = await new ExtensionsService(runtime, NO_LIMITS).update(
+		const result = await new ExtensionsService(runtime, NO_LIMITS, FAKE_DB).update(
 			sessionFor(ORGANIZATION_ID),
 			"id",
 			{},
@@ -209,7 +232,10 @@ describe("PbxResourceService", () => {
 		});
 		let thrown: unknown;
 		try {
-			await new ExtensionsService(runtime, NO_LIMITS).get(sessionFor(ORGANIZATION_ID), "x");
+			await new ExtensionsService(runtime, NO_LIMITS, FAKE_DB).get(
+				sessionFor(ORGANIZATION_ID),
+				"x",
+			);
 		} catch (error) {
 			thrown = error;
 		}
@@ -235,7 +261,10 @@ describe("PbxResourceService", () => {
 		});
 		let thrown: HttpException | undefined;
 		try {
-			await new ExtensionsService(runtime, NO_LIMITS).create(sessionFor(ORGANIZATION_ID), {});
+			await new ExtensionsService(runtime, NO_LIMITS, FAKE_DB).create(
+				sessionFor(ORGANIZATION_ID),
+				{},
+			);
 		} catch (error) {
 			thrown = error as HttpException;
 		}
@@ -259,7 +288,10 @@ describe("PbxResourceService", () => {
 		});
 		let thrown: HttpException | undefined;
 		try {
-			await new ExtensionsService(runtime, NO_LIMITS).remove(sessionFor(ORGANIZATION_ID), "rg");
+			await new ExtensionsService(runtime, NO_LIMITS, FAKE_DB).remove(
+				sessionFor(ORGANIZATION_ID),
+				"rg",
+			);
 		} catch (error) {
 			thrown = error as HttpException;
 		}
@@ -272,7 +304,10 @@ describe("PbxResourceService", () => {
 		});
 		let thrown: HttpException | undefined;
 		try {
-			await new ExtensionsService(runtime, NO_LIMITS).get(sessionFor(ORGANIZATION_ID), "x");
+			await new ExtensionsService(runtime, NO_LIMITS, FAKE_DB).get(
+				sessionFor(ORGANIZATION_ID),
+				"x",
+			);
 		} catch (error) {
 			thrown = error as HttpException;
 		}

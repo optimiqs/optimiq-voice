@@ -111,30 +111,31 @@ const DOCUMENTED_UNENFORCED: Readonly<Record<string, string>> = {
 	"numbers.assign": "no dedicated route; re-pointing is a field on the resource's PATCH",
 
 	/**
-	 * The scoped self-service grants, and the one honest defect in this table.
+	 * The two scoped self-service grants that STILL cannot be enforced, and why they are honest.
 	 *
-	 * Only `queues.join.own` and the settings pair are actually consumed —
-	 * `queue-agent-session.service.ts` for the first, the user-settings surface for the second. The other
-	 * nine appear in `apps/web/lib/page-permissions.ts` and nowhere on the server, which has a
-	 * consequence worth stating plainly: `hasPermission` lets an unscoped grant satisfy a scoped
-	 * requirement and NEVER the reverse, every guard on the corresponding endpoints is unscoped, and
-	 * the `user` role holds only scoped grants — so a `user` can reach six pages whose data calls
-	 * all answer 403.
+	 * This table used to carry the whole `.own` set as one defect: `hasPermission` lets an unscoped
+	 * grant satisfy a scoped requirement and NEVER the reverse, every read guard named the unscoped
+	 * grant, and the `user` role holds only scoped grants — so a `user` cleared the page and met a
+	 * 403 on its data call. The fix is the row check `queue-agent-session.service.ts` set the
+	 * precedent for: lower the endpoint's floor to the `.own` grant (which an unscoped holder still
+	 * satisfies) and narrow the ROW in the service. Six of the eight are now enforced that way —
+	 * `extensions.read.own`/`write.own`, `devices.read.own`, `voicemail.read.own`/`delete.own`/
+	 * `listen.own` — through `apps/api/src/pbx/shared/self-ownership.ts`, so they have LEFT this table
+	 * (the "no stale entry" test below asserts they had to).
 	 *
-	 * That is a real bug and it is not a permission-registry bug: the fix is a row check per
-	 * resource, and `queue-agent-session.service.ts`'s `assertMayAct` is the exact shape it takes
-	 * (an OR over a row, in the service, with the decorator declaring only the floor). Six resources
-	 * need one each. Listed here rather than fixed here because that is a wave of its own, and
-	 * listed at all so it is a known gap rather than an unknown one.
+	 * The two below cannot follow, because the fix has a prerequisite they lack: a user↔row link.
+	 * Extensions, devices and voicemail boxes all reach a user through `extension_user` (directly, or
+	 * one hop out via `device_line` / `voicemail_box.extension_id`). Recordings and CDR do not —
+	 * `cdr-db` stores numbers and entity refs and NO user id at all (`cdr.controller.ts`'s header says
+	 * so, and `call-leg-schema.ts` bears it out), so "recordings of calls I took part in" has no
+	 * column to resolve against without a new cross-context number→user path that does not exist yet.
+	 * Enforcing them would mean widening the grant beyond ownership or inventing a fuzzy phone-number
+	 * match, and both are worse than an honest gap. Listed here so it stays a KNOWN gap: when the
+	 * user↔call resolution lands, these two get the same treatment and leave this table with the rest.
 	 */
-	"extensions.read.own": "scoped self-service: no row check yet — see this file's note",
-	"extensions.write.own": "scoped self-service: no row check yet — see this file's note",
-	"devices.read.own": "scoped self-service: no row check yet — see this file's note",
-	"voicemail.read.own": "scoped self-service: no row check yet — see this file's note",
-	"voicemail.delete.own": "scoped self-service: no row check yet — see this file's note",
-	"voicemail.listen.own": "scoped self-service: no row check yet — see this file's note",
-	"recordings.read.own": "scoped self-service: no row check yet — see this file's note",
-	"cdr.read.own": "scoped self-service: no row check yet — see this file's note",
+	"recordings.read.own":
+		"no user↔call link in cdr-db yet — cannot resolve ownership; see this note",
+	"cdr.read.own": "no user↔call link in cdr-db yet — cannot resolve ownership; see this note",
 };
 
 /** Every `.ts` file under a directory, recursively. Test files are excluded by the caller. */

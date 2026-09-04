@@ -89,6 +89,7 @@ export {
 	readHierarchy,
 	setChildSuspended,
 	upsertHierarchy,
+	userExists,
 } from "./platform-hierarchy";
 export {
 	listMailTemplates,

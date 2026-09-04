@@ -1,6 +1,7 @@
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { runEffect } from "@optimiq-voice/effect-runtime";
 import { actorFromSession } from "./audit-log";
+import { normalizePagination, paged } from "./pagination";
 import { toWireDiagnostic } from "./pbx.errors";
 import type { AuditActor } from "./audit-log";
 import type { PagedResult } from "./pagination";
@@ -107,6 +108,30 @@ export abstract class PbxResourceService {
 		const organizationId = this.organizationId(session);
 		const page = await runEffect(this.runtime, (repository) =>
 			repository.list(organizationId, this.resource, query),
+		);
+		return { ...page, data: page.data.map((row) => this.redact(row)) };
+	}
+
+	/**
+	 * `list`, narrowed to the ids the caller may see — the `.own` path.
+	 *
+	 * The overriding service resolves `restrictToIds` from the row-ownership link (see
+	 * `shared/self-ownership.ts`) when the caller holds only the scoped grant, and calls this instead
+	 * of {@link list}. An EMPTY set is answered with an empty page and no query: the caller owns
+	 * nothing, so there is nothing to scope to, and `inArray(column, [])` is a per-driver hazard not
+	 * worth relying on.
+	 */
+	protected async listRestricted(
+		session: AppSession,
+		query: ListQuery,
+		restrictToIds: readonly string[],
+	): Promise<PagedResult<Record<string, unknown>>> {
+		if (restrictToIds.length === 0) {
+			return paged([], 0, normalizePagination(query));
+		}
+		const organizationId = this.organizationId(session);
+		const page = await runEffect(this.runtime, (repository) =>
+			repository.list(organizationId, this.resource, query, restrictToIds),
 		);
 		return { ...page, data: page.data.map((row) => this.redact(row)) };
 	}

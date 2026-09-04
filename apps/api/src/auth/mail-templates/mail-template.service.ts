@@ -51,15 +51,15 @@ function toView(row: MailTemplateRow): MailTemplateView {
  * override is presentation configuration, not a credential — and the resolution half
  * ({@link resolveComposition}) is the sessionless entry a mail consumer calls when composing.
  *
- * ## The one remaining integration seam
+ * ## The consumer wiring
  *
- * The four mail consumers (voicemail-, fax-, emergency-notification-email and the auth delivery)
- * still pass the hardcoded `DEFAULT_MAIL_APP_NAME` and send the code-rendered message directly. The
- * wiring is mechanical and named in the W14 report: resolve `{ productName, override }` here, pass
- * `productName` as the template's `appName`, and run the rendered result through `applyMailOverride`
- * before `sendRendered`. The consumers are not rewired in this change because they live in the PBX
- * slice with their own DB-fake test harnesses, and the swap is deferred to keep those green; the
- * mechanism, its storage and its management surface are complete and covered here.
+ * The voicemail-to-email consumer (`voicemail-email.service.ts`) is wired: it resolves
+ * `{ productName, override }` here, feeds `productName` as the code template's `appName`, and runs
+ * the result through `applyMailOverride` before `sendRendered`. That is the reference for the
+ * remaining three — the auth delivery (`auth-email.delivery.ts`, whose senders lack an active-org id
+ * at verification time) and the fax/emergency-notification consumers — which still pass
+ * `DEFAULT_MAIL_APP_NAME`. Each follows the voicemail pattern once it threads an organization id and
+ * a template key to this service; the mechanism, its storage and its management surface are complete.
  */
 @Injectable()
 export class MailTemplateService {

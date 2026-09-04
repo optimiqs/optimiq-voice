@@ -23,6 +23,7 @@ export {
 	ORGANIZATION_MEMBERSHIP_ROLES,
 	type OrganizationMembershipRole,
 	SESSION_COOKIE_CACHE_VERSION,
+	type SsoProviderConfig,
 } from "./auth";
 export {
 	CALL_TOKEN_AUDIENCE,

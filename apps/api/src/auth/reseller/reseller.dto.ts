@@ -12,6 +12,12 @@ export const createChildDto = z.strictObject({
 	name: z.string().trim().min(1).max(100),
 	/** Optional; derived from the name when omitted. Lower-kebab, globally unique across orgs. */
 	slug: z.string().trim().min(1).max(60).regex(slugPattern).optional(),
+	/**
+	 * The user to seat as the child's owner. Optional; the acting reseller user is seated when it is
+	 * omitted, so a freshly provisioned child is never ownerless. When present it must be an existing
+	 * user id — the service proves that before the seating insert, so an unknown id is a clean 422.
+	 */
+	ownerUserId: z.uuid().optional(),
 });
 export type CreateChildInput = z.output<typeof createChildDto>;
 

@@ -15,6 +15,7 @@ import { openMediaResponse } from "../../media/media-response";
 import { ObjectKeyOutsideRootError } from "../../storage";
 import { normalizePagination, paged } from "../shared/pagination";
 import { PBX_DATABASE, PBX_ENV, PBX_VOICEMAIL_STORE } from "../shared/pbx.tokens";
+import { assertOwnsRow, holdsUnscoped, ownedVoicemailBoxIds } from "../shared/self-ownership";
 import {
 	mintVoicemailMediaToken,
 	verifyVoicemailMediaToken,
@@ -35,7 +36,7 @@ import type { PagedResult } from "../shared/pagination";
 import type { PbxEnv } from "../shared/pbx-env";
 import type { UpdateVoicemailMessage, VoicemailMessageListQuery } from "./voicemail-messages.dto";
 import type { MailboxCounts, MwiReason } from "./voicemail-mwi.publisher";
-import type { AppSession } from "@optimiq-voice/auth";
+import type { AppSession, Permission } from "@optimiq-voice/auth";
 import type {
 	PbxDatabaseClient,
 	PbxDatabaseTransaction,
@@ -112,6 +113,7 @@ export class VoicemailMessagesService {
 		query: VoicemailMessageListQuery,
 	): Promise<VoicemailMessageListEnvelope> {
 		const organizationId = requireActiveOrganizationId(session);
+		await this.assertMayReachBox(session, organizationId, boxId, "voicemail.read");
 		const pagination = normalizePagination(query);
 
 		return await this.database.withTenantScope(organizationId, async (transaction) => {
@@ -197,12 +199,15 @@ export class VoicemailMessagesService {
 		messageId: string,
 		purge: boolean,
 	): Promise<VoicemailMessageDeletion> {
+		const scopeOrganizationId = requireActiveOrganizationId(session);
+		await this.assertMayReachBox(session, scopeOrganizationId, boxId, "voicemail.delete");
+
 		if (!purge) {
 			const moved = await this.move(session, boxId, messageId, "deleted", "message-deleted");
 			return { data: { id: moved.data.id, purged: false }, mailbox: moved.mailbox };
 		}
 
-		const organizationId = requireActiveOrganizationId(session);
+		const organizationId = scopeOrganizationId;
 		const result = await this.database.withTenantScope(organizationId, async (transaction) => {
 			const box = await requireBox(transaction, boxId);
 			await requireMessage(transaction, boxId, messageId);
@@ -234,6 +239,7 @@ export class VoicemailMessagesService {
 		messageId: string,
 	): Promise<{ readonly data: VoicemailPlaybackLink }> {
 		const organizationId = requireActiveOrganizationId(session);
+		await this.assertMayReachBox(session, organizationId, boxId, "voicemail.listen");
 		const secret = this.env.PBX_VOICEMAIL_URL_SECRET;
 		if (secret === undefined) {
 			throw new VoicemailSigningUnavailableException();
@@ -438,6 +444,33 @@ export class VoicemailMessagesService {
 	// -------------------------------------------------------------------------------------------
 	// Internals
 	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * The `.own` narrowing for the message surface — the same seam the box list takes, one level in.
+	 *
+	 * A `user` holds `voicemail.read.own` / `voicemail.delete.own` / `voicemail.listen.own` and no
+	 * unscoped grant, so the route's guard now names the scoped variant (which an unscoped holder
+	 * still satisfies). This is the row half: a `.own` holder may only touch messages in a box whose
+	 * extension is linked to them. An unscoped holder returns immediately and reaches every box, as
+	 * before. The box is proved again inside the tenant scope by `requireBox`, so this adds a reach
+	 * check, never replaces the tenancy one.
+	 */
+	private async assertMayReachBox(
+		session: AppSession,
+		organizationId: string,
+		boxId: string,
+		unscoped: Permission,
+	): Promise<void> {
+		if (holdsUnscoped(session, unscoped)) {
+			return;
+		}
+		const owned = await ownedVoicemailBoxIds(this.database, organizationId, session.user.id);
+		assertOwnsRow(
+			owned,
+			boxId,
+			"You hold access to your own voicemail only, and this mailbox is not linked to your account.",
+		);
+	}
 
 	private async move(
 		session: AppSession,

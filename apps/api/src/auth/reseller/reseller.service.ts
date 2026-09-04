@@ -7,10 +7,15 @@ import {
 	listChildOrganizations,
 	readHierarchy,
 	setChildSuspended,
+	userExists,
 } from "@optimiq-voice/db";
 import { AUTH_PLATFORM } from "../auth.tokens";
 import { type CreateChildInput, deriveSlug } from "./reseller.dto";
-import { NotAResellerException, NotYourChildException } from "./reseller.errors";
+import {
+	NotAResellerException,
+	NotYourChildException,
+	UnknownOwnerException,
+} from "./reseller.errors";
 import type { AuthPlatform } from "../auth.platform";
 import type { AppSession } from "@optimiq-voice/auth";
 
@@ -101,12 +106,29 @@ export class ResellerService {
 		};
 	}
 
+	/**
+	 * Provision a child and seat its first owner atomically.
+	 *
+	 * The owner seated is the acting reseller user unless the request names another (`ownerUserId`).
+	 * Seating the reseller by default closes the "briefly ownerless tenant" seam
+	 * (`packages/db/src/platform-hierarchy.ts`) with a user that is guaranteed to exist — the caller
+	 * themselves — so a freshly provisioned child is administrable the moment it is created rather
+	 * than only cross-tenant. A named `ownerUserId` must be an existing user, which
+	 * {@link assertUserExists} proves before the insert so an unknown id is a clean 422 rather than a
+	 * foreign-key violation surfaced as a 500. The whole thing is one transaction: org, hierarchy link
+	 * and owner member commit together or not at all.
+	 */
 	async createChild(session: AppSession, input: CreateChildInput): Promise<ChildOrganizationView> {
 		const organizationId = await this.requireResellerOrganizationId(session);
+		const ownerUserId = input.ownerUserId ?? session.user.id;
+		if (input.ownerUserId !== undefined && input.ownerUserId !== session.user.id) {
+			await this.assertUserExists(input.ownerUserId);
+		}
 		const created = await createChildOrganization(this.adminDb, {
 			parentOrganizationId: organizationId,
 			name: input.name,
 			slug: input.slug ?? deriveSlug(input.name),
+			ownerUserId,
 		});
 		return {
 			organizationId: created.id,
@@ -115,8 +137,15 @@ export class ResellerService {
 			createdAt: created.createdAt,
 			suspended: false,
 			isReseller: false,
-			memberCount: 0,
+			memberCount: created.ownerSeated ? 1 : 0,
 		};
+	}
+
+	/** A named owner must be a real user, or the seating is refused before it reaches the FK. */
+	private async assertUserExists(userId: string): Promise<void> {
+		if (!(await userExists(this.adminDb, userId))) {
+			throw new UnknownOwnerException(userId);
+		}
 	}
 
 	async setSuspended(

@@ -49,10 +49,16 @@ function toView(row: SsoProviderRow): SsoProviderView {
 /**
  * Per-organization SSO (OIDC) identity-provider configuration.
  *
- * The storage, the guard (`sso.configure`) and the CRUD are complete here. Turning a stored
- * provider into a live sign-in path is the documented seam: the installed better-auth ships
- * `genericOAuth` (a boot-time static provider list) but not the per-org DB-backed `sso` plugin, and
- * no SAML. `listEnabledSsoProviders` exists as the boot-time feed a `genericOAuth` wiring would read.
+ * The storage, the guard (`sso.configure`) and the CRUD are here; the LIVE sign-in path is now
+ * wired. `apps/api/src/auth/auth.platform.ts` reads the enabled rows through
+ * `listEnabledSsoProviders` at boot and hands them to `createAuth`, which registers the in-tree
+ * `better-auth/plugins/generic-oauth` plugin — so `/api/auth/sign-in/oauth2` starts a login against a
+ * configured provider and `/api/auth/oauth2/callback/:providerId` completes it and issues a session
+ * (the same catch-all and the same tenant-claim session hook as email/password). Two honest limits
+ * remain, both `genericOAuth`'s and not this code's: the provider set is a boot-time snapshot (a row
+ * added here takes effect on the next process start — better-auth's DB-backed dynamic `sso` plugin,
+ * which would refresh live, is a separate package that is not installed), and SAML is not supported
+ * (OIDC only, which is what the `protocol` column already constrains).
  */
 @Injectable()
 export class SsoService {

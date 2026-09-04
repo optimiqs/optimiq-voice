@@ -7,6 +7,7 @@ import {
 	asc,
 	eq,
 	ilike,
+	inArray,
 	or,
 	type PbxDatabaseClient,
 	type PbxDatabaseTransaction,
@@ -97,6 +98,13 @@ export interface PbxRepositoryInterface {
 		organizationId: string,
 		resource: PbxResource,
 		query: ListQuery,
+		/**
+		 * Restricts the page to these row ids — the `.own` scope's narrowing, resolved by the service
+		 * from the row-ownership link. `undefined` is the ordinary org-wide list; a non-empty set adds
+		 * an `id IN (…)` to the same scan (the service never passes an empty set — it answers that with
+		 * an empty page and no query).
+		 */
+		restrictToIds?: readonly string[],
 	) => Effect.Effect<PagedResult<Record<string, unknown>>, PbxFailure>;
 
 	readonly get: (
@@ -195,6 +203,15 @@ function searchPredicate(resource: PbxResource, search: string | undefined): SQL
 	const escaped = term.replace(/[\\%_]/gu, (match) => `\\${match}`);
 	const clauses = resource.searchColumns.map((column) => ilike(column, `%${escaped}%`));
 	return clauses.length === 1 ? clauses[0] : or(...clauses);
+}
+
+/** `and` over the clauses that are actually present, collapsing 0 → undefined and 1 → itself. */
+function combinePredicates(...clauses: (SQL | undefined)[]): SQL | undefined {
+	const present = clauses.filter((clause): clause is SQL => clause !== undefined);
+	if (present.length === 0) {
+		return undefined;
+	}
+	return present.length === 1 ? present[0] : and(...present);
 }
 
 function listPredicate(resource: PbxResource, query: ListQuery): SQL | undefined {
@@ -594,6 +611,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 		organizationId: string,
 		resource: PbxResource,
 		query: ListQuery,
+		restrictToIds?: readonly string[],
 	) {
 		const pagination: Pagination = normalizePagination(query);
 		const rows = yield* scoped(
@@ -602,7 +620,13 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 			organizationId,
 			resource.table,
 			async (transaction) => {
-				const predicate = listPredicate(resource, query);
+				// The `.own` narrowing rides the same predicate as search/enabled, so the `count(*)
+				// over ()` total counts the owned rows and pagination stays honest.
+				const ownership =
+					restrictToIds === undefined || restrictToIds.length === 0
+						? undefined
+						: inArray(rowId(resource), [...restrictToIds]);
+				const predicate = combinePredicates(listPredicate(resource, query), ownership);
 				const base = transaction
 					.select({ row: resource.table, total: windowTotal })
 					.from(resource.table);

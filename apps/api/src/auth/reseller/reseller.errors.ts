@@ -1,4 +1,8 @@
-import { ForbiddenException, NotFoundException } from "@nestjs/common";
+import {
+	ForbiddenException,
+	NotFoundException,
+	UnprocessableEntityException,
+} from "@nestjs/common";
 
 /**
  * Raised when the acting session holds `reseller.*` but its own organization is not flagged as a
@@ -18,5 +22,22 @@ export class NotAResellerException extends ForbiddenException {
 export class NotYourChildException extends NotFoundException {
 	constructor() {
 		super("No such child organization under this reseller.");
+	}
+}
+
+/**
+ * Raised when a create names an `ownerUserId` that is not a real user.
+ *
+ * 422 rather than 404: the request is well-formed but names a resource that must exist for the
+ * seating to be possible, and reporting it before the insert turns a foreign-key violation (a 500
+ * the caller cannot act on) into a field-level answer they can.
+ */
+export class UnknownOwnerException extends UnprocessableEntityException {
+	constructor(userId: string) {
+		super({
+			statusCode: 422,
+			code: "RESELLER_UNKNOWN_OWNER",
+			message: `No user with id ${userId} to seat as the child's owner.`,
+		});
 	}
 }

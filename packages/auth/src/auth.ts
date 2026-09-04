@@ -2,6 +2,7 @@ import { apiKey } from "@better-auth/api-key";
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { admin, bearer, jwt, openAPI, organization, twoFactor } from "better-auth/plugins";
+import { genericOAuth } from "better-auth/plugins/generic-oauth";
 import { createEntityId } from "@optimiq-voice/identifiers";
 import {
 	buildOrganizationAccessControl,
@@ -131,6 +132,58 @@ export interface CreateAuthOptions {
 	 * three built-in roles and nothing else.
 	 */
 	readonly organizationRoles?: boolean | { readonly creatorRole?: SystemRoleId };
+	/**
+	 * The OIDC identity providers to register for federated sign-in, read from the enabled rows in
+	 * `organization_sso_provider` at boot.
+	 *
+	 * These become `genericOAuth` provider configs, which is what makes the SSO surface LIVE rather
+	 * than merely stored: with them registered, `/api/auth/sign-in/oauth2` starts a login against a
+	 * provider and `/api/auth/oauth2/callback/:providerId` completes it — the same catch-all that
+	 * serves email/password forwards both, and the same `databaseHooks.session.create.before` stamps
+	 * the tenant claim on the session it issues. Empty (or omitted) registers no `genericOAuth` plugin
+	 * at all, which is the pre-wiring behaviour.
+	 *
+	 * The set is a boot-time snapshot: `genericOAuth`'s config is fixed at `betterAuth()` construction,
+	 * so a provider added through the CRUD API takes effect on the next process start. That is the
+	 * `genericOAuth` model (better-auth's DB-backed dynamic `sso` plugin is a separate, not-installed
+	 * package); the CRUD surface and this feed together make configured-at-boot providers work
+	 * end-to-end, which is the honest scope.
+	 */
+	readonly ssoProviders?: readonly SsoProviderConfig[];
+}
+
+/** One OIDC provider, as the auth boot hands it to `genericOAuth`. */
+export interface SsoProviderConfig {
+	/** The slug in the callback URL: `/api/auth/oauth2/callback/<providerId>`. */
+	readonly providerId: string;
+	readonly clientId: string;
+	readonly clientSecret: string;
+	/** The issuer; the discovery document is derived from it when `discoveryUrl` is absent. */
+	readonly issuer: string;
+	readonly discoveryUrl?: string;
+	/** Defaults to `openid email profile` when the provider row named none. */
+	readonly scopes?: readonly string[];
+}
+
+const DEFAULT_SSO_SCOPES = ["openid", "email", "profile"] as const;
+
+/** Map the stored provider set to `genericOAuth`'s config, filling the OIDC defaults. */
+function buildGenericOAuthConfig(providers: readonly SsoProviderConfig[]) {
+	return providers.map((provider) => ({
+		providerId: provider.providerId,
+		clientId: provider.clientId,
+		clientSecret: provider.clientSecret,
+		issuer: provider.issuer,
+		discoveryUrl:
+			provider.discoveryUrl ??
+			`${provider.issuer.replace(/\/+$/u, "")}/.well-known/openid-configuration`,
+		scopes: [
+			...(provider.scopes && provider.scopes.length > 0 ? provider.scopes : DEFAULT_SSO_SCOPES),
+		],
+		// PKCE for every provider: it is a strict security improvement and every modern OIDC IdP
+		// supports it, so there is no reason to make it a per-provider toggle.
+		pkce: true,
+	}));
 }
 
 function resolveKeyPairConfig(algorithm: NonNullable<AuthJwtOptions["algorithm"]>) {
@@ -348,6 +401,16 @@ export function createAuth(options: CreateAuthOptions) {
 			}),
 			jwt(buildJwtPluginOptions(options.jwt)),
 			bearer(),
+			/**
+			 * SSO, registered only when there is at least one enabled provider.
+			 *
+			 * `genericOAuth` adds the initiate and callback routes that turn the stored provider rows
+			 * into a working sign-in; with no providers the plugin is omitted so the routes do not exist
+			 * rather than existing and answering "no such provider".
+			 */
+			...(options.ssoProviders && options.ssoProviders.length > 0
+				? [genericOAuth({ config: buildGenericOAuthConfig(options.ssoProviders) })]
+				: []),
 			...((options.openApiEnabled ?? true) ? [openAPI()] : []),
 		],
 	});

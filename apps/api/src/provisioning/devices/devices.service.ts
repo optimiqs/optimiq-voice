@@ -1,6 +1,8 @@
 import { Inject, Injectable } from "@nestjs/common";
+import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { PbxChildResourceService, PbxResourceService } from "../../pbx/shared/pbx-resource.service";
-import { PBX_EFFECT_RUNTIME } from "../../pbx/shared/pbx.tokens";
+import { PBX_DATABASE, PBX_EFFECT_RUNTIME } from "../../pbx/shared/pbx.tokens";
+import { assertOwnsRow, holdsUnscoped, ownedDeviceIds } from "../../pbx/shared/self-ownership";
 import { PROVISIONING_ENV } from "../provisioning.tokens";
 import { mintProvisioningToken, provisioningConfigUrl } from "../render/provision-token";
 import { ProvisioningNotConfiguredException } from "../render/provision.errors";
@@ -11,10 +13,23 @@ import {
 	DEVICE_PROFILE_RESOURCE,
 	DEVICE_RESOURCE,
 } from "./devices.resource";
-import type { MutationEnvelope } from "../../pbx/shared/pbx-resource.service";
+import type { ListQuery, PagedResult } from "../../pbx/shared/pagination";
+import type { ItemEnvelope, MutationEnvelope } from "../../pbx/shared/pbx-resource.service";
 import type { PbxRepositoryRuntime } from "../../pbx/shared/pbx-runtime";
 import type { ProvisioningEnv } from "../provisioning-env";
 import type { AppSession } from "@optimiq-voice/auth";
+import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
+
+/**
+ * A device is owned when it carries a line bound to one of the caller's extensions.
+ *
+ * The `user` role holds `devices.read.own` and no unscoped device grant, so the read endpoints name
+ * the scoped floor and the services narrow the rows here — the same `.own` seam extensions and
+ * voicemail take. A device with no owned line is not the caller's, and the child line/key lists are
+ * gated on the same fact so a `.own` holder cannot read another device's lines by id.
+ */
+const NOT_YOURS =
+	"You hold access to your own devices only, and this device is not linked to any of your extensions.";
 
 @Injectable()
 export class DeviceProfilesService extends PbxResourceService {
@@ -32,16 +47,59 @@ export class DeviceProfileKeysService extends PbxChildResourceService {
 
 @Injectable()
 export class DeviceLinesService extends PbxChildResourceService {
-	constructor(@Inject(PBX_EFFECT_RUNTIME) runtime: PbxRepositoryRuntime) {
+	constructor(
+		@Inject(PBX_EFFECT_RUNTIME) runtime: PbxRepositoryRuntime,
+		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
+	) {
 		super(runtime, DEVICE_LINE_RESOURCE);
+	}
+
+	override async list(
+		session: AppSession,
+		parentId: string,
+	): Promise<{ readonly data: readonly Record<string, unknown>[] }> {
+		await assertOwnsDevice(this.database, session, parentId);
+		return await super.list(session, parentId);
 	}
 }
 
 @Injectable()
 export class DeviceKeysService extends PbxChildResourceService {
-	constructor(@Inject(PBX_EFFECT_RUNTIME) runtime: PbxRepositoryRuntime) {
+	constructor(
+		@Inject(PBX_EFFECT_RUNTIME) runtime: PbxRepositoryRuntime,
+		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
+	) {
 		super(runtime, DEVICE_KEY_RESOURCE);
 	}
+
+	override async list(
+		session: AppSession,
+		parentId: string,
+	): Promise<{ readonly data: readonly Record<string, unknown>[] }> {
+		await assertOwnsDevice(this.database, session, parentId);
+		return await super.list(session, parentId);
+	}
+}
+
+/**
+ * The device-ownership assert the read endpoints share.
+ *
+ * A no-op for an unscoped `devices.read` holder (the manager/admin path); for a `.own`-only holder
+ * it refuses unless the device carries a line bound to one of their extensions. `requireActiveOrgan…`
+ * is reached through the base service's `organizationId`, so this free function takes the resolved
+ * id from the caller instead.
+ */
+async function assertOwnsDevice(
+	database: PbxDatabaseClient,
+	session: AppSession,
+	deviceId: string,
+): Promise<void> {
+	if (holdsUnscoped(session, "devices.read")) {
+		return;
+	}
+	const organizationId = requireActiveOrganizationId(session);
+	const owned = await ownedDeviceIds(database, organizationId, session.user.id);
+	assertOwnsRow(owned, deviceId, NOT_YOURS);
 }
 
 /** A device row plus the token that was just minted for it. The token appears here and nowhere else. */
@@ -63,8 +121,34 @@ export class DevicesService extends PbxResourceService {
 	constructor(
 		@Inject(PBX_EFFECT_RUNTIME) runtime: PbxRepositoryRuntime,
 		@Inject(PROVISIONING_ENV) private readonly env: ProvisioningEnv,
+		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
 	) {
 		super(runtime, DEVICE_RESOURCE);
+	}
+
+	override async list(
+		session: AppSession,
+		query: ListQuery,
+	): Promise<PagedResult<Record<string, unknown>>> {
+		if (holdsUnscoped(session, "devices.read")) {
+			return await super.list(session, query);
+		}
+		return await this.listRestricted(session, query, await this.ownedIds(session));
+	}
+
+	override async get(
+		session: AppSession,
+		id: string,
+	): Promise<ItemEnvelope<Record<string, unknown>>> {
+		const result = await super.get(session, id);
+		if (!holdsUnscoped(session, "devices.read")) {
+			assertOwnsRow(await this.ownedIds(session), id, NOT_YOURS);
+		}
+		return result;
+	}
+
+	private async ownedIds(session: AppSession): Promise<readonly string[]> {
+		return await ownedDeviceIds(this.database, this.organizationId(session), session.user.id);
 	}
 
 	/**

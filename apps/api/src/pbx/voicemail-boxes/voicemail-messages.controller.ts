@@ -88,7 +88,7 @@ export class VoicemailMessagesController {
 	}
 
 	@Get(":id/messages")
-	@RequirePermissions("voicemail.read")
+	@RequirePermissions("voicemail.read.own")
 	async list(
 		@Session() session: AppSession,
 		@Param("id", ParseUUIDPipe) id: string,
@@ -118,7 +118,7 @@ export class VoicemailMessagesController {
 	}
 
 	@Delete(":id/messages/:messageId")
-	@RequirePermissions("voicemail.delete")
+	@RequirePermissions("voicemail.delete.own")
 	async remove(
 		@Session() session: AppSession,
 		@Param("id", ParseUUIDPipe) id: string,
@@ -136,7 +136,7 @@ export class VoicemailMessagesController {
 	 * `voicemail-messages.service.ts`, and `recordings.controller.ts` before it.
 	 */
 	@Post(":id/messages/:messageId/play-url")
-	@RequirePermissions("voicemail.listen")
+	@RequirePermissions("voicemail.listen.own")
 	async playUrl(
 		@Session() session: AppSession,
 		@Param("id", ParseUUIDPipe) id: string,

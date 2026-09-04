@@ -69,6 +69,26 @@ export const provisioningEnvSchema = z.object({
 	PROVISION_BASE_URL: httpUrl.optional(),
 
 	/**
+	 * The `wss://` URL a BROWSER softphone opens against `apps/sipd`'s WSS listener (RFC 7118).
+	 *
+	 * Its own variable and not derived from `PROVISION_SIP_SERVER`, for the reason that server holds a
+	 * SIP host:port (`sip.example.com`, port 5060/5061) while sipd's browser transport is an HTTPS
+	 * upgrade on a different port (`wss://sip.example.com:8089` by default) — the two are related on a
+	 * single-box deployment and unrelated on a split one. Optional: when it is unset the
+	 * `GET /me/softphone` response carries `transport.wssUrl: null`, and the web shell derives a
+	 * co-located `wss://<page-host>:8089` from its own HTTPS origin (`lib/softphone/credentials.ts`).
+	 * A deployment whose sipd is not co-located with the web app sets this so the browser reaches the
+	 * right host.
+	 */
+	PROVISION_SIP_WSS_URL: z
+		.string()
+		.min(1)
+		.max(255)
+		.regex(/^wss:\/\//iu, "must be a wss:// URL")
+		.transform((value) => value.replace(/\/+$/u, ""))
+		.optional(),
+
+	/**
 	 * The root key the per-line SIP password is derived from.
 	 *
 	 * `extension.sip_secret_ref` is a HANDLE into a secret manager — the plaintext password is

@@ -1,4 +1,5 @@
 import { and, eq, inArray, isNotNull } from "drizzle-orm";
+import { user } from "./schema/auth/identity-schema";
 import { member } from "./schema/auth/organization-schema";
 import { organization } from "./schema/auth/organization-schema";
 import { organizationHierarchy } from "./schema/platform/organization-platform-schema";
@@ -183,22 +184,35 @@ export async function setChildSuspended(
 }
 
 /**
- * Create a child organization and link it under a reseller in one step.
+ * Create a child organization and link it under a reseller in one step, optionally seating an owner.
  *
- * The `organization` row is inserted directly rather than through better-auth's create-org flow:
- * a reseller-provisioned tenant has no human creator to seat as its owner, so there is no member
- * to create and none of better-auth's create hooks apply. Seating an initial owner (an invitation
- * to the tenant's first admin) is a deliberate follow-up seam — the reseller administers the child
- * cross-tenant until then.
+ * The `organization` row is inserted directly rather than through better-auth's create-org flow,
+ * because a reseller-provisioned tenant has no human creator that better-auth's hooks would seat.
+ * `ownerUserId` closes the seam this comment used to declare open: when supplied, an `owner` `member`
+ * row is written in the SAME transaction, so the child is never briefly ownerless — it is created,
+ * linked and seated atomically, or none of it commits. The id must be an existing `user`
+ * (`member.user_id` references `user.id`), which is why the caller resolves and validates it before
+ * this runs. When it is omitted the child is still created and linked, and the reseller administers
+ * it cross-tenant until an owner is seated later — the pre-seating behaviour, preserved.
+ *
+ * `owner` is written as the role rather than `admin` because it is better-auth's own top membership
+ * role and the one its organization plugin refuses to let other members remove — the correct floor
+ * for a tenant's first human.
  */
 export async function createChildOrganization(
 	db: AdminDatabase,
-	input: { readonly parentOrganizationId: string; readonly name: string; readonly slug: string },
+	input: {
+		readonly parentOrganizationId: string;
+		readonly name: string;
+		readonly slug: string;
+		readonly ownerUserId?: string | null;
+	},
 ): Promise<{
 	readonly id: string;
 	readonly name: string;
 	readonly slug: string;
 	readonly createdAt: Date;
+	readonly ownerSeated: boolean;
 }> {
 	return await db.transaction(async (tx) => {
 		const inserted = await tx
@@ -217,8 +231,29 @@ export async function createChildOrganization(
 			isReseller: false,
 			suspendedAt: null,
 		});
-		return created;
+		const ownerUserId = input.ownerUserId ?? null;
+		if (ownerUserId !== null) {
+			await tx.insert(member).values({
+				organizationId: created.id,
+				userId: ownerUserId,
+				role: "owner",
+			});
+		}
+		return { ...created, ownerSeated: ownerUserId !== null };
 	});
+}
+
+/**
+ * True when a `user` row with this id exists.
+ *
+ * The seating query the reseller runs to prove a named owner is real before it inserts a `member`
+ * that references it — built here, with this package's Drizzle, for the same reason every other
+ * query in this file is (`apps/api` pins an older Drizzle whose operators would be wrong against
+ * these table objects).
+ */
+export async function userExists(db: AdminDatabase, userId: string): Promise<boolean> {
+	const rows = await db.select({ id: user.id }).from(user).where(eq(user.id, userId)).limit(1);
+	return rows.length > 0;
 }
 
 /** True when the organization has at least one reseller child (used to guard deletion elsewhere). */

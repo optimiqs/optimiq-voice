@@ -29,14 +29,24 @@ import type { AppSession } from "@optimiq-voice/auth";
 export class ExtensionsController {
 	constructor(@Inject(ExtensionsService) private readonly extensions: ExtensionsService) {}
 
+	/**
+	 * `extensions.read.own` and not `extensions.read`, which is the `.own` fix, not a downgrade.
+	 *
+	 * The floor is the SCOPED grant because an unscoped `extensions.read` holder satisfies it anyway
+	 * (a grant covers its own scopes — `hasPermission`), while a `user` who holds ONLY
+	 * `extensions.read.own` now clears the guard instead of meeting a 403 on the page's own data call.
+	 * The service then narrows the rows: an unscoped holder sees the organization, a `.own` holder
+	 * sees the extensions linked to them. Same pattern the write below takes and
+	 * `queue-agent-session.service.ts` set.
+	 */
 	@Get()
-	@RequirePermissions("extensions.read")
+	@RequirePermissions("extensions.read.own")
 	async list(@Session() session: AppSession, @Query() query: unknown) {
 		return await this.extensions.list(session, parseDto(listQuerySchema, query ?? {}));
 	}
 
 	@Get(":id")
-	@RequirePermissions("extensions.read")
+	@RequirePermissions("extensions.read.own")
 	async get(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
 		return await this.extensions.get(session, id);
 	}
@@ -48,7 +58,7 @@ export class ExtensionsController {
 	}
 
 	@Patch(":id")
-	@RequirePermissions("extensions.write")
+	@RequirePermissions("extensions.write.own")
 	async update(
 		@Session() session: AppSession,
 		@Param("id", ParseUUIDPipe) id: string,

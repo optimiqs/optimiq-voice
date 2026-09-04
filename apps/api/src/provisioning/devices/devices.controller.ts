@@ -73,8 +73,15 @@ export class DevicesController {
 		@Inject(DeviceKeysService) private readonly keys: DeviceKeysService,
 	) {}
 
+	/**
+	 * `devices.read.own` and not `devices.read` — the `.own` fix, not a downgrade.
+	 *
+	 * An unscoped `devices.read` holder satisfies the scoped floor anyway; a `user` holding only
+	 * `devices.read.own` now clears the guard, and the service narrows the list to the devices that
+	 * carry a line bound to one of their extensions. Same pattern as extensions and voicemail.
+	 */
 	@Get()
-	@RequirePermissions("devices.read")
+	@RequirePermissions("devices.read.own")
 	async list(@Session() session: AppSession, @Query() query: unknown) {
 		return await this.devices.list(
 			session,
@@ -83,7 +90,7 @@ export class DevicesController {
 	}
 
 	@Get(":id")
-	@RequirePermissions("devices.read")
+	@RequirePermissions("devices.read.own")
 	async get(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
 		return await this.devices.get(session, id);
 	}
@@ -164,7 +171,7 @@ export class DevicesController {
 	// --- lines -----------------------------------------------------------------------------------
 
 	@Get(":id/lines")
-	@RequirePermissions("devices.read")
+	@RequirePermissions("devices.read.own")
 	async listLines(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
 		return await this.lines.list(session, id);
 	}
@@ -203,7 +210,7 @@ export class DevicesController {
 	// --- keys ------------------------------------------------------------------------------------
 
 	@Get(":id/keys")
-	@RequirePermissions("devices.read")
+	@RequirePermissions("devices.read.own")
 	async listKeys(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
 		return await this.keys.list(session, id);
 	}

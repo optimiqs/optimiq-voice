@@ -8,10 +8,13 @@ import {
 	voicemailBox,
 	voicemailMessage,
 } from "@optimiq-voice/pbx-db";
+import { MailTemplateService } from "../../auth/mail-templates/mail-template.service";
 import { DEFAULT_MAIL_APP_NAME, Mailer, voicemailMail } from "../../mail";
+import { applyMailOverride } from "../../mail/mail-template-resolution";
 import { OrgSettingsService } from "../org-settings/org-settings.service";
 import { PBX_DATABASE, PBX_ENV } from "../shared/pbx.tokens";
 import { mintVoicemailMediaToken, voicemailMediaPath } from "./voicemail-media-token";
+import type { MailComposition } from "../../auth/mail-templates/mail-template.service";
 import type { PbxEnv } from "../shared/pbx-env";
 import type {
 	PbxDatabaseClient,
@@ -112,6 +115,7 @@ export class VoicemailEmailService {
 		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
 		@Inject(Mailer) private readonly mailer: Mailer,
 		@Inject(OrgSettingsService) private readonly settings: OrgSettingsService,
+		@Inject(MailTemplateService) private readonly templates: MailTemplateService,
 	) {}
 
 	get stats(): { readonly sent: number; readonly skipped: number; readonly failed: number } {
@@ -212,19 +216,28 @@ export class VoicemailEmailService {
 			return { outcome: "skipped", reason: "already-sent" };
 		}
 
-		const rendered = voicemailMail({
-			appName: DEFAULT_MAIL_APP_NAME,
-			fromName: policy.fromName,
-			mailboxNumber: context.mailboxNumber,
-			mailboxLabel: context.label ?? undefined,
-			callerIdName: context.callerIdName ?? undefined,
-			callerIdNumber: context.callerIdNumber ?? undefined,
-			receivedAt: context.receivedAt,
-			durationMs: context.durationMs,
-			playUrl,
-			inboxUrl,
-			transcription,
-		});
+		// The mail-template cascade: the org's (or its reseller's) branding product name feeds the code
+		// template as its `appName`, and the resolved subject/intro override is applied to the result.
+		// This is the wire the mail-template feature was built for — `resolveComposition` +
+		// `applyMailOverride`, the two halves `MailTemplateService`'s header names — reached from the
+		// consumer that has an organization id and a template key in hand.
+		const composition = await this.compose(organizationId);
+		const rendered = applyMailOverride(
+			voicemailMail({
+				appName: composition.productName,
+				fromName: policy.fromName,
+				mailboxNumber: context.mailboxNumber,
+				mailboxLabel: context.label ?? undefined,
+				callerIdName: context.callerIdName ?? undefined,
+				callerIdNumber: context.callerIdNumber ?? undefined,
+				receivedAt: context.receivedAt,
+				durationMs: context.durationMs,
+				playUrl,
+				inboxUrl,
+				transcription,
+			}),
+			composition.override,
+		);
 
 		const result = await this.mailer.sendRendered(to, rendered, {
 			...(policy.replyTo === undefined ? {} : { replyTo: policy.replyTo }),
@@ -246,6 +259,28 @@ export class VoicemailEmailService {
 		}
 		this.sent += 1;
 		return { outcome: "sent", to, linked: playUrl !== undefined };
+	}
+
+	/**
+	 * The branding product name and the resolved template override for this organization's voicemail
+	 * mail.
+	 *
+	 * Best-effort, like everything else past the ack: a template-cascade read that fails must not
+	 * suppress a notification whose audio is already durable, so a failure falls back to the code
+	 * default (`DEFAULT_MAIL_APP_NAME`, no override) — the exact message this consumer sent before the
+	 * cascade was wired. Language is `en`: voicemail mail carries no per-recipient locale yet, and the
+	 * override table keys on `(org, template, language)` with `en` as its own default.
+	 */
+	private async compose(organizationId: string): Promise<MailComposition> {
+		try {
+			return await this.templates.resolveComposition(organizationId, "voicemail", "en");
+		} catch (error) {
+			logger.warn(
+				{ organizationId, err: error },
+				"could not resolve the voicemail mail template; sending with the default branding",
+			);
+			return { productName: DEFAULT_MAIL_APP_NAME, override: null };
+		}
 	}
 
 	/**

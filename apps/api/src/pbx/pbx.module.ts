@@ -11,6 +11,7 @@ import {
 } from "../transcription";
 import { AuditLogQueryService } from "./audit-log/audit-log-query.service";
 import { AuditLogController } from "./audit-log/audit-log.controller";
+import { BrandingLogoController } from "./branding-logo/branding-logo.controller";
 import { CallBlockController } from "./call-block/call-block.controller";
 import { CallBlockService } from "./call-block/call-block.service";
 import { CallFlowPresencePublisher } from "./call-flows/call-flow-presence.publisher";
@@ -94,6 +95,8 @@ import {
 } from "./queues/queue-membership.publisher";
 import { QueueAgentsController, QueuesController } from "./queues/queues.controller";
 import { QueueAgentsService, QueueTiersService, QueuesService } from "./queues/queues.service";
+import { ResellerTelephonyUsageController } from "./reseller-usage/reseller-telephony-usage.controller";
+import { ResellerTelephonyUsageService } from "./reseller-usage/reseller-telephony-usage.service";
 import { RingGroupsController } from "./ring-groups/ring-groups.controller";
 import { RingGroupDestinationsService, RingGroupsService } from "./ring-groups/ring-groups.service";
 import { DidIndexPublisher } from "./routing/did-index.publisher";
@@ -265,6 +268,24 @@ const logger = getLogger("api.pbx");
 		PhrasesController,
 		OrgLimitsController,
 		/**
+		 * `GET /api/v1/reseller/telephony-usage` — the reseller's cross-child telephony roll-up.
+		 *
+		 * In this module rather than the auth slice's reseller controller because it sums PBX tables
+		 * (`extension`, `trunk`, `phone_number`) and therefore needs `PBX_DATABASE`; the auth slice
+		 * cannot take that handle without importing `PbxModule`, which imports it back. It injects
+		 * `AUTH_PLATFORM` (exported by the `AuthModule` this module already imports) for the base-db
+		 * hierarchy. See its service header.
+		 */
+		ResellerTelephonyUsageController,
+		/**
+		 * `GET /api/v1/branding/logo` — the white-label logo bytes, keyed by host and public.
+		 *
+		 * In this module because the logo lives in the media object store (`PBX_MEDIA_STORE`); it
+		 * reaches the branding cascade through the `BrandingService` the `AuthModule` exports. See its
+		 * header, including the note that this is `@PublicRoute()`.
+		 */
+		BrandingLogoController,
+		/**
 		 * Click-to-call, and the integrator surface beside it.
 		 *
 		 * `CallsController` is in the PBX area rather than beside the CDR reader because origination
@@ -398,6 +419,7 @@ const logger = getLogger("api.pbx");
 		 * for why `extension_user.userId` cannot be joined and must be looked up twice.
 		 */
 		AuthzService,
+		ResellerTelephonyUsageService,
 		...carrierProviders,
 		CarrierService,
 		/**
