@@ -37,6 +37,8 @@ import { createHash } from "node:crypto";
  * rpc.sip.v1.reinvite.<sipdInstanceTok>
  * rpc.sip.v1.originate                       engine -> sipd; ANY instance answers (queue group)
  * rpc.media.v1.allocate-session              engine -> mediad; RAW NATS both ends (see rpc.ts)
+ * rpc.media.v1.create-offer                  engine -> mediad; a B-leg offer mediad writes
+ * rpc.media.v1.accept-answer                 engine -> mediad; settle the B-leg codec
  * rpc.media.v1.bridge-sessions
  * rpc.media.v1.unbridge-sessions
  * rpc.media.v1.release-session
@@ -196,6 +198,18 @@ export const RPC_SUBJECTS = {
 	 * "raw NATS on both ends" note at the head of `schemas/rpc.ts`.
 	 */
 	mediaAllocateSession: `rpc.media.${SUBJECT_VERSION}.allocate-session`,
+	/**
+	 * The B-leg offer/answer pair, added when `mediad` learned to WRITE an offer.
+	 *
+	 * `allocate-session` ANSWERS an inbound offer — the A-leg path, where `apps/sipd` already holds
+	 * one. A leg the engine ORIGINATES has no offer yet, because we are the one calling, so `mediad`
+	 * generates one (`create-offer`) and later settles the codec from the callee's answer
+	 * (`accept-answer`). This keeps codec knowledge in `mediad` in BOTH directions — `apps/sipd`
+	 * forwards an offer it did not write exactly as it forwards one it did not parse. See
+	 * `plans/sipd-invite-design.md` §5.2 (decision A) and the raw-NATS note at the head of `rpc.ts`.
+	 */
+	mediaCreateOffer: `rpc.media.${SUBJECT_VERSION}.create-offer`,
+	mediaAcceptAnswer: `rpc.media.${SUBJECT_VERSION}.accept-answer`,
 	mediaBridgeSessions: `rpc.media.${SUBJECT_VERSION}.bridge-sessions`,
 	mediaUnbridgeSessions: `rpc.media.${SUBJECT_VERSION}.unbridge-sessions`,
 	mediaReleaseSession: `rpc.media.${SUBJECT_VERSION}.release-session`,

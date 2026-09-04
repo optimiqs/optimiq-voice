@@ -177,9 +177,9 @@ func (s *Session) StartPlayback(opts PlaybackOptions) (*Playback, error) {
 	case len(opts.Frames) == 0:
 		return nil, errors.New("rtp: a playback needs at least one frame")
 	}
-	if encodingOf(s.audioPayloadType) != opts.Encoding {
+	if encodingOf(s.AudioPayloadType()) != opts.Encoding {
 		return nil, fmt.Errorf("%w: the clip is %s and the session answered %s",
-			ErrPlaybackPayloadType, opts.Encoding, encodingOf(s.audioPayloadType))
+			ErrPlaybackPayloadType, opts.Encoding, encodingOf(s.AudioPayloadType()))
 	}
 	if s.Remote() == nil {
 		return nil, ErrNoRemote
@@ -341,7 +341,7 @@ func (s *Session) sendPlaybackFrame(payload []byte, marker bool) (bool, error) {
 	out := pionrtp.Packet{
 		Header: pionrtp.Header{
 			Version:        2,
-			PayloadType:    s.audioPayloadType,
+			PayloadType:    s.AudioPayloadType(),
 			SequenceNumber: s.nextSequence(),
 			Timestamp:      s.nextPlaybackTimestamp(),
 			SSRC:           s.SSRC,

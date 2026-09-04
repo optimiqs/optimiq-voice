@@ -1,6 +1,8 @@
 import {
+	mediaAcceptAnswerResponseSchema,
 	mediaAllocateSessionResponseSchema,
 	mediaBridgeSessionsResponseSchema,
+	mediaCreateOfferResponseSchema,
 	mediaHoldSessionResponseSchema,
 	mediaMuteSessionResponseSchema,
 	mediaReleaseSessionResponseSchema,
@@ -36,7 +38,11 @@ import type {
 	TapRequest,
 } from "./media-port";
 import type { MediadTransport } from "./mediad-transport";
-import type { MediaAllocateSessionResponse } from "@optimiq-voice/events";
+import type {
+	MediaAcceptAnswerResponse,
+	MediaAllocateSessionResponse,
+	MediaCreateOfferResponse,
+} from "@optimiq-voice/events";
 import type { BridgeMode, HangupCause } from "@optimiq-voice/telephony";
 
 /**
@@ -215,6 +221,63 @@ export class MediadMediaPort implements MediaPort {
 		);
 		this.sessions.add(request.sessionId);
 		return response;
+	}
+
+	/**
+	 * Reserves an RTP port pair and asks `mediad` to WRITE an SDP offer for a leg the engine is
+	 * originating. Rung of `plans/sipd-invite-design.md` §5.2 (decision A).
+	 *
+	 * NOT a `MediaPort` method, and above it for exactly the reason {@link allocateSession} is: a B-leg
+	 * has no offer because we are the one calling, and the shared interface has no verb for "write me
+	 * one". `mediad` offers only what `mediad` can serve, and the callee's choice is committed later at
+	 * {@link acceptAnswer}.
+	 *
+	 * Unlike {@link allocateSession}, this returns the parsed reply WITHOUT throwing on `ok: false`: the
+	 * composite that owns the origination has to branch on the refusal (there is no offer to send), so
+	 * the reason travels back as data. The session is recorded only when the offer was actually written.
+	 */
+	async createOffer(request: {
+		readonly sessionId: string;
+		readonly orgId: string;
+		readonly callId: string;
+		readonly legId?: string;
+		readonly direction?: "sendrecv" | "sendonly" | "recvonly" | "inactive";
+	}): Promise<MediaCreateOfferResponse> {
+		const response = await this.callRaw(
+			RPC_SUBJECTS.mediaCreateOffer,
+			{
+				sessionId: request.sessionId,
+				orgId: request.orgId,
+				callId: request.callId,
+				...(request.legId === undefined ? {} : { legId: request.legId }),
+				direction: request.direction ?? "sendrecv",
+			},
+			mediaCreateOfferResponseSchema,
+		);
+		if (response.ok) {
+			this.sessions.add(request.sessionId);
+		}
+		return response;
+	}
+
+	/**
+	 * Feeds the callee's SDP answer back and SETTLES the codec on a session {@link createOffer} opened.
+	 *
+	 * The other half of {@link createOffer}. Returns the parsed reply WITHOUT throwing on `ok: false`,
+	 * and that is the whole reason it does not use {@link call}: a callee that answered with a codec
+	 * `mediad` cannot serve is refused `not_supported`, which is a NORMAL branch the composite must
+	 * read (hang the B-leg up with `INCOMPATIBLE_DESTINATION`) rather than an exception on the call
+	 * path. `apps/sipd` forwards the answer it did not parse.
+	 */
+	async acceptAnswer(request: {
+		readonly sessionId: string;
+		readonly sdpAnswer: string;
+	}): Promise<MediaAcceptAnswerResponse> {
+		return await this.callRaw(
+			RPC_SUBJECTS.mediaAcceptAnswer,
+			{ sessionId: request.sessionId, sdpAnswer: request.sdpAnswer },
+			mediaAcceptAnswerResponseSchema,
+		);
 	}
 
 	/**
@@ -865,26 +928,44 @@ export class MediadMediaPort implements MediaPort {
 		payload: unknown,
 		schema: TSchema,
 	): Promise<ReturnType<TSchema["parse"]> extends infer T ? T : never> {
-		const raw = await this.transport.request(subject, payload, this.timeoutMs);
-		const reply = schema.parse(raw) as {
+		const reply = await this.callRaw(subject, payload, schema);
+		const envelope = reply as {
 			ok: boolean;
 			reason?: string;
 			error?: string;
 			instanceId?: string;
 		};
 
-		if (!reply.ok) {
+		if (!envelope.ok) {
 			this.logger.warn(
-				{ subject, reason: reply.reason, instanceId: reply.instanceId },
+				{ subject, reason: envelope.reason, instanceId: envelope.instanceId },
 				"mediad refused a media command",
 			);
 			throw new MediaCommandRefusedError(
 				subject,
-				reply.reason ?? "internal",
-				reply.error ?? "no detail",
-				reply.instanceId,
+				envelope.reason ?? "internal",
+				envelope.error ?? "no detail",
+				envelope.instanceId,
 			);
 		}
-		return reply as never;
+		return reply;
+	}
+
+	/**
+	 * Issues one command and validates the reply, but returns it WHATEVER `ok` says.
+	 *
+	 * The half of {@link call} without the throw, for the two commands whose refusal is a documented
+	 * outcome the caller branches on rather than an error — {@link createOffer} and {@link acceptAnswer}
+	 * (see their notes). Every throwing method keeps {@link call}, which is a thin wrapper over this.
+	 * Validating the reply still catches the one failure nothing else can: a Go struct compiled from
+	 * the same schema that has drifted from it.
+	 */
+	private async callRaw<TSchema extends { parse(value: unknown): unknown }>(
+		subject: string,
+		payload: unknown,
+		schema: TSchema,
+	): Promise<ReturnType<TSchema["parse"]> extends infer T ? T : never> {
+		const raw = await this.transport.request(subject, payload, this.timeoutMs);
+		return schema.parse(raw) as never;
 	}
 }

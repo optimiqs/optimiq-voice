@@ -13,7 +13,7 @@ import {
 import { planDestinationOf, sameDestination } from "./plan-destination";
 import { orderTrunkAttempts } from "./trunk-selection";
 import { verifyPinDigest, verifyVoicemailPin } from "./voicemail-pin";
-import type { MediaPort } from "../media/media-port";
+import type { DialTarget, MediaPort } from "../media/media-port";
 import type {
 	QueueCallPort,
 	QueueDialAttempt,
@@ -366,6 +366,14 @@ export interface PlanWalkerSettings {
 	readonly extensionDialTemplate: string;
 	/** How a trunk attempt becomes an endpoint. `{number}` and `{trunk}` are substituted. */
 	readonly trunkDialTemplate: string;
+	/**
+	 * The tenant's SIP realm, used to build an extension `{kind:"aor"}` {@link DialTarget} — `apps/sipd`
+	 * resolves `sip:{number}@{realm}` against the `registrations` it owns. Absent on the Asterisk plane
+	 * (`endpoint` alone dials there) and — until a per-org realm is threaded from the tenant's `sip`
+	 * settings — absent on the `sipd` plane too, in which case an extension B-leg carries no `target` and
+	 * the composite refuses `originate` by name rather than dialling a URI it cannot resolve.
+	 */
+	readonly sipRealm?: string;
 	/** Ring time when neither the node nor the member specifies one. */
 	readonly defaultRingTimeoutSeconds: number;
 	/**
@@ -1170,6 +1178,15 @@ interface DialAttempt {
 	readonly label: string;
 	/** The number being reached, for the B-leg's `toNumber`. */
 	readonly destinationNumber: string;
+	/**
+	 * Where this leg is going, in the SIP edge's structured vocabulary — `plans/sipd-invite-design.md`
+	 * §5.1. Additive alongside {@link endpoint}, which stays exactly as it is for the ARI adapter: the
+	 * `apps/sipd` composite reads `target` and refuses `bad_request` when it is absent, `AriMediaAdapter`
+	 * and `MediadMediaPort` ignore it. A `{kind:"trunk"}` is set at the trunk sites where the trunk id is
+	 * in hand; an extension `{kind:"aor"}` is derived in {@link PlanWalker.originate} from
+	 * {@link PlanWalkerSettings.sipRealm} when it is configured.
+	 */
+	readonly target?: DialTarget;
 	readonly timeoutSeconds: number;
 	readonly delaySeconds: number;
 	readonly callerId?: string;
@@ -3538,6 +3555,10 @@ export class PlanWalker {
 					endpoint: this.settings.trunkDialTemplate
 						.replaceAll("{number}", number)
 						.replaceAll("{trunk}", attempt.name),
+					// The structured target for the SIP edge (§5.1): the trunk row's id, which the edge
+					// resolves against its own trunk directory, plus the E.164 being dialled. The Asterisk
+					// plane ignores it and dials `endpoint`.
+					target: { kind: "trunk", trunkId: attempt.trunkId, number },
 					label: `trunk ${attempt.name}`,
 					destinationNumber: number,
 					timeoutSeconds: this.settings.defaultRingTimeoutSeconds,
@@ -6101,6 +6122,11 @@ export class PlanWalker {
 					: { destinationRef: this.destination.destinationRef }),
 				...(attempt.callerId === undefined ? {} : { callerId: attempt.callerId }),
 			});
+			// Structured for the SIP edge (§5.1). An explicit `attempt.target` (a trunk, set where the
+			// trunk id is in hand) wins; otherwise an extension is dialled `sip:{number}@{realm}` when a
+			// realm is configured. `undefined` is passed through untouched — the ARI adapter ignores it and
+			// the composite refuses `originate` by name, which the walker already reads as "not reachable".
+			const target = attempt.target ?? this.aorTargetFor(attempt.destinationNumber);
 			await this.deps.media.originate({
 				endpoint: attempt.endpoint,
 				application: this.settings.application,
@@ -6108,6 +6134,7 @@ export class PlanWalker {
 				callerId: attempt.callerId,
 				timeoutSeconds: attempt.timeoutSeconds,
 				originatorChannelId: this.deps.channel.mediaChannelId,
+				...(target === undefined ? {} : { target }),
 				variables: {
 					OPTIMIQ_ORG_ID: this.deps.channel.organizationId,
 					OPTIMIQ_LEG: "b",
@@ -6299,6 +6326,22 @@ export class PlanWalker {
 
 	private endpointForExtension(number: string): string {
 		return this.settings.extensionDialTemplate.replaceAll("{number}", number);
+	}
+
+	/**
+	 * The structured {@link DialTarget} for an extension B-leg on the SIP edge, or `undefined`.
+	 *
+	 * `apps/sipd` resolves `{kind:"aor"}` against the `registrations` bucket it owns, so the AOR must be
+	 * the one the phone registered under — `sip:{number}@{realm}`. The realm is a per-tenant fact
+	 * (`plans/sipd-invite-design.md` §5.1); until it is threaded from the org's `sip` settings into
+	 * {@link PlanWalkerSettings.sipRealm}, this returns `undefined` and the composite refuses `originate`
+	 * by name rather than dialling an unresolvable URI — the honest failure, not a fabricated target.
+	 */
+	private aorTargetFor(number: string): DialTarget | undefined {
+		if (this.settings.sipRealm === undefined || this.settings.sipRealm === "") {
+			return undefined;
+		}
+		return { kind: "aor", aor: `sip:${number}@${this.settings.sipRealm}` };
 	}
 
 	/**

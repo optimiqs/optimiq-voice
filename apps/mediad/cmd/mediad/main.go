@@ -200,6 +200,8 @@ func run() error {
 			control.SubjectStopRecording,
 			control.SubjectTapSession,
 			control.SubjectUntapSession,
+			control.SubjectCreateOffer,
+			control.SubjectAcceptAnswer,
 		},
 		"soundsDir", cfg.SoundsDir,
 		"recordingsDir", cfg.RecordingsDir,

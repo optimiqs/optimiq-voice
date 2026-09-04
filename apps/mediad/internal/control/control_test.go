@@ -82,6 +82,11 @@ type stubSessions struct {
 
 	// Rung 5's renegotiation record and rung 6's tap pair.
 	directions []directionCall
+	// The B-leg's accept-answer settle record. `settleErr` forces a failure; `settlePort` fixes the
+	// descriptor's port so a create-offer→accept-answer flow can assert on a stable value.
+	settles    []settleCall
+	settleErr  error
+	settlePort int
 	tapErr     error
 	taps       []rtp.TapOptions
 	untaps     []string
@@ -127,6 +132,13 @@ type directionCall struct {
 	sessionID string
 	muteIn    bool
 	muteOut   bool
+}
+
+type settleCall struct {
+	sessionID        string
+	format           audio.Format
+	audioPT          uint8
+	telephoneEventPT uint8
 }
 
 type dtmfCall struct {
@@ -328,6 +340,46 @@ func (s *stubSessions) ApplyDirection(sessionID string, muteIn, muteOut bool) er
 		return rtp.ErrUnknownSession
 	}
 	return nil
+}
+
+// SettleAnswer stands in for the packet path's `accept-answer` half: it records the settle and,
+// like the real one, refuses an unknown session and otherwise reports the codec back through the
+// descriptor so a handler that failed to read the settled value would fail these tests.
+func (s *stubSessions) SettleAnswer(
+	sessionID string,
+	format audio.Format,
+	audioPT, telephoneEventPT uint8,
+) (rtp.Descriptor, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.settles = append(s.settles, settleCall{sessionID, format, audioPT, telephoneEventPT})
+	if s.settleErr != nil {
+		return rtp.Descriptor{}, s.settleErr
+	}
+	if !s.live[sessionID] {
+		return rtp.Descriptor{}, fmt.Errorf("%w: %s", rtp.ErrUnknownSession, sessionID)
+	}
+	port := s.settlePort
+	if port == 0 {
+		port = 30000
+	}
+	return rtp.Descriptor{
+		SessionID:                 sessionID,
+		Address:                   netip.MustParseAddr("203.0.113.10"),
+		RTPPort:                   port,
+		RTCPPort:                  port + 1,
+		SSRC:                      0xfeedface,
+		Mode:                      rtp.ModeRelay,
+		AudioPayloadType:          audioPT,
+		Format:                    format,
+		TelephoneEventPayloadType: telephoneEventPT,
+	}, nil
+}
+
+func (s *stubSessions) settleCalls() []settleCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]settleCall(nil), s.settles...)
 }
 
 func (s *stubSessions) Tap(opts rtp.TapOptions) (rtp.TapResult, error) {

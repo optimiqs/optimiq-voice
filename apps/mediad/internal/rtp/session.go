@@ -188,13 +188,19 @@ type Session struct {
 	// audioPayloadType is the ONE audio type this session negotiated. Per-session rather than a
 	// package constant, because negotiation is per leg: one call can have a PCMU A-leg and a PCMA
 	// B-leg, and a session must drop what its own answer did not agree to.
-	audioPayloadType uint8
+	//
+	// ATOMIC because a B-leg's codec is not known at allocation. `create-offer` binds the port before
+	// the callee has answered, so the session starts on the offer's default and `accept-answer`
+	// settles the real one later — a write on a control goroutine while the read goroutine is already
+	// looping. See SettleAnswer. The three codec fields move together and are stored uint8-in-uint32
+	// because Go has no atomic uint8.
+	audioPayloadType atomic.Uint32
 	// format is what that payload type MEANS. Separate from the number because rung 7 introduced two
 	// codecs the number alone does not identify: G.722 is static type 9 but Opus is dynamic, so a
 	// payload type is a wire label and this is the codec.
-	format audio.Format
+	format atomic.Uint32
 	// telephoneEventPayloadType is the RFC 4733 type this session negotiated, or 0 for none.
-	telephoneEventPayloadType uint8
+	telephoneEventPayloadType atomic.Uint32
 
 	// peer is the session this one forwards to, set by Bridge and cleared by Unbridge.
 	//
@@ -380,26 +386,41 @@ func NewSession(opts Options) (*Session, error) {
 	}
 
 	session := &Session{
-		ID:                        opts.ID,
-		SSRC:                      ssrc,
-		newTicker:                 ticker,
-		OrgID:                     opts.OrgID,
-		CallID:                    opts.CallID,
-		LegID:                     opts.LegID,
-		mode:                      mode,
-		ports:                     opts.Ports,
-		audioPayloadType:          opts.AudioPayloadType,
-		format:                    format,
-		telephoneEventPayloadType: opts.TelephoneEventPayloadType,
-		dtmfIn:                    newDtmfDetector(opts.DtmfMaxDigitDuration),
-		onDtmf:                    opts.OnDtmf,
-		log:                       logger.With("sessionId", opts.ID, "rtpPort", opts.Ports.Port, "ssrc", ssrc),
-		done:                      make(chan struct{}),
-		createdAt:                 time.Now(),
+		ID:        opts.ID,
+		SSRC:      ssrc,
+		newTicker: ticker,
+		OrgID:     opts.OrgID,
+		CallID:    opts.CallID,
+		LegID:     opts.LegID,
+		mode:      mode,
+		ports:     opts.Ports,
+		dtmfIn:    newDtmfDetector(opts.DtmfMaxDigitDuration),
+		onDtmf:    opts.OnDtmf,
+		log:       logger.With("sessionId", opts.ID, "rtpPort", opts.Ports.Port, "ssrc", ssrc),
+		done:      make(chan struct{}),
+		createdAt: time.Now(),
 	}
 	session.mutedIn.Store(opts.MuteIn)
 	session.mutedOut.Store(opts.MuteOut)
+	session.audioPayloadType.Store(uint32(opts.AudioPayloadType))
+	session.format.Store(uint32(format))
+	session.telephoneEventPayloadType.Store(uint32(opts.TelephoneEventPayloadType))
 	return session, nil
+}
+
+// settleCodec re-points this session's negotiated codec, audio payload type and telephone-event
+// type. It is the packet path's half of `accept-answer`: a B-leg allocated by `create-offer`
+// started on the offer's default, and this is where the callee's real choice lands so the relay
+// forwards under the number the far end actually agreed to.
+//
+// The three fields are atomic and written together, so a read on the packet path sees either the
+// pre-answer default or the settled codec and never a torn mixture of the two. It runs before the
+// leg is bridged — a bridge, and the transcoder it may install, is decided after both legs settle —
+// so there is no live relay whose codec it changes underneath.
+func (s *Session) settleCodec(format audio.Format, audioPT, telephoneEventPT uint8) {
+	s.format.Store(uint32(format))
+	s.audioPayloadType.Store(uint32(audioPT))
+	s.telephoneEventPayloadType.Store(uint32(telephoneEventPT))
 }
 
 // formatForStaticPayloadType resolves RFC 3551's static assignments. See NewSession.
@@ -560,7 +581,7 @@ func (s *Session) handlePacket(raw []byte, from *net.UDPAddr) {
 	// into the forwarding path would produce an empty file for exactly the case recording exists for.
 	// Telephone-event packets are excluded — a digit is not audio, and decoding one as G.711 writes
 	// four bytes of noise into the file.
-	if recorder := s.recording.Load(); recorder != nil && packet.PayloadType == s.audioPayloadType {
+	if recorder := s.recording.Load(); recorder != nil && packet.PayloadType == s.AudioPayloadType() {
 		recorder.Received(packet.Payload)
 	}
 
@@ -587,7 +608,7 @@ func (s *Session) handlePacket(raw []byte, from *net.UDPAddr) {
 // earth now depends on it. Opus is the exception at 48000, and it is a method rather than a constant
 // so that adding one does not mean auditing every arithmetic site for an assumption.
 func (s *Session) clockRate() uint32 {
-	if s.format == audio.FormatOpus {
+	if s.Format() == audio.FormatOpus {
 		return 48000
 	}
 	return audio.SampleRate
@@ -595,17 +616,18 @@ func (s *Session) clockRate() uint32 {
 
 // accepts reports whether a payload type is one this session negotiated.
 func (s *Session) accepts(pt uint8) bool {
-	if pt == s.audioPayloadType {
+	if pt == s.AudioPayloadType() {
 		return true
 	}
-	return s.telephoneEventPayloadType != 0 && pt == s.telephoneEventPayloadType
+	tePT := s.TelephoneEventPayloadType()
+	return tePT != 0 && pt == tePT
 }
 
 // AudioPayloadType is the audio payload type this session negotiated.
-func (s *Session) AudioPayloadType() uint8 { return s.audioPayloadType }
+func (s *Session) AudioPayloadType() uint8 { return uint8(s.audioPayloadType.Load()) }
 
 // Format is the codec that payload type carries.
-func (s *Session) Format() audio.Format { return s.format }
+func (s *Session) Format() audio.Format { return audio.Format(s.format.Load()) }
 
 // MixMember is this session's seat in a conference, or nil.
 func (s *Session) MixMember() *Member { return s.mixMember.Load() }
@@ -614,7 +636,7 @@ func (s *Session) MixMember() *Member { return s.mixMember.Load() }
 func (s *Session) Transcoder() *Transcoder { return s.transcode.Load() }
 
 // TelephoneEventPayloadType is the RFC 4733 type this session negotiated, or 0.
-func (s *Session) TelephoneEventPayloadType() uint8 { return s.telephoneEventPayloadType }
+func (s *Session) TelephoneEventPayloadType() uint8 { return uint8(s.telephoneEventPayloadType.Load()) }
 
 // SetPeer points this session's forwarding at another. Bridge calls it on BOTH sessions.
 func (s *Session) SetPeer(peer *Session) {
@@ -667,7 +689,7 @@ func (s *Session) relay(packet *pionrtp.Packet) {
 		// a leg that has answered and is listening to ringback.
 		return
 	}
-	peer.forward(packet, s.telephoneEventPayloadType)
+	peer.forward(packet, s.TelephoneEventPayloadType())
 }
 
 // forward writes a packet out of THIS session's socket, to THIS session's latched far end.
@@ -716,14 +738,15 @@ func (s *Session) forward(packet *pionrtp.Packet, sourceTelephoneEventPT uint8) 
 	payload := packet.Payload
 	switch {
 	case sourceTelephoneEventPT != 0 && payloadType == sourceTelephoneEventPT:
-		if s.telephoneEventPayloadType == 0 {
+		localTelephoneEventPT := s.TelephoneEventPayloadType()
+		if localTelephoneEventPT == 0 {
 			// This leg never negotiated telephone-event, so there is no number to send DTMF under.
 			// Dropped rather than sent as audio: an RFC 4733 payload rendered as G.711 is a loud
 			// click, which is worse than a missing digit.
 			s.count(func(st *Stats) { st.UnsupportedPT++ })
 			return
 		}
-		payloadType = s.telephoneEventPayloadType
+		payloadType = localTelephoneEventPT
 
 	default:
 		// Rung 7's translation, and NIL IS THE FAST PATH. Two legs that agreed on a codec relay byte
@@ -737,7 +760,7 @@ func (s *Session) forward(packet *pionrtp.Packet, sourceTelephoneEventPT uint8) 
 				return
 			}
 			payload = translated
-			payloadType = s.audioPayloadType
+			payloadType = s.AudioPayloadType()
 			s.count(func(st *Stats) { st.Transcoded++ })
 		}
 	}
@@ -779,7 +802,7 @@ func (s *Session) forward(packet *pionrtp.Packet, sourceTelephoneEventPT uint8) 
 	// Tapped after the write rather than before it, so the file holds what actually went out — which
 	// is why the TRANSLATED payload is the one recorded on a transcoded bridge.
 	// Telephone-event payloads are excluded for the same reason they are on the receive side.
-	if recorder := s.recording.Load(); recorder != nil && payloadType == s.audioPayloadType {
+	if recorder := s.recording.Load(); recorder != nil && payloadType == s.AudioPayloadType() {
 		recorder.Sent(payload)
 	}
 }

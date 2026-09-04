@@ -6,6 +6,7 @@ import { createEntityId } from "@optimiq-voice/identifiers";
 import { getLogger } from "@optimiq-voice/logging";
 import { resolveInbound, resolveInternal, resolveOutbound } from "@optimiq-voice/routing";
 import { isDtmfDigit } from "@optimiq-voice/telephony";
+import { SplitPlaneMediaPort } from "../media/split-plane.port";
 import { CallEventPublisher } from "../nats/call-event-publisher.service";
 import {
 	CHANNEL_OWNER_EXPIRES_AT_VARIABLE,
@@ -2592,6 +2593,14 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		this.trunkCapacity.releaseLeg(mediaChannelId);
 		this.disarmCallDurationCeiling(mediaChannelId);
 
+		// Drop the composite's per-leg signalling state (the offer, the owning instance, the variables).
+		// Unconditional and before the aggregate check, for the same reason `releaseLeg` is: a leg that
+		// ended without ever being filed still registered its offer at admission, and a map that outlives
+		// its leg is a slow leak on the one process every call passes through. Idempotent by contract.
+		if (this.media instanceof SplitPlaneMediaPort) {
+			this.media.forget(mediaChannelId);
+		}
+
 		const aggregate = this.registry.byAriChannelId(mediaChannelId);
 		if (aggregate === undefined) {
 			return;
@@ -3712,6 +3721,22 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				reason: "internal",
 				error: "this engine could not take exclusive ownership of the leg",
 			};
+		}
+
+		// Hand the composite everything `answer` needs that is NOT on the wire afterwards: the A-leg's
+		// SDP offer (which `mediad` must answer to produce the 200 OK's body) and the `sipd` instance
+		// that holds the dialog (which every signalling command must be addressed at). This is the one
+		// place both facts are known at once — the admission request carried them. Guarded on the
+		// composite because only it has the two planes to compose; every other driver refused an invited
+		// call above. An INVITE with no offer (a late-offer negotiation, not supported at slice 1) is left
+		// unregistered, so `answer` fails loudly by name rather than answering into the void.
+		if (this.media instanceof SplitPlaneMediaPort && request.sdpOffer !== undefined) {
+			this.media.registerInboundLeg(aggregate.channelId, {
+				orgId: aggregate.organizationId,
+				callId: aggregate.callId,
+				sipdInstanceId: request.sipdInstanceId,
+				sdpOffer: request.sdpOffer,
+			});
 		}
 
 		return {

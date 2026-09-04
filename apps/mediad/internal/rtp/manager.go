@@ -422,6 +422,36 @@ func (m *Manager) ApplyDirection(sessionID string, muteIn, muteOut bool) error {
 	return nil
 }
 
+// SettleAnswer re-points a live session's negotiated codec after its callee's SDP answer arrives.
+//
+// It is the packet-path half of `accept-answer`, and it exists because a B-leg is originated without
+// an offer: `create-offer` binds the port and starts the read loop on the offer's default codec, and
+// the codec the two ends will actually speak is not known until the callee answers. This settles
+// that choice onto the live session so the relay forwards under the payload type the far end agreed
+// to — the same fact `AudioPayloadType`/`Format`/`TelephoneEventPayloadType` report, brought up to
+// the answer.
+//
+// It returns the session's descriptor so the control surface can report the settled codec back, and
+// `ErrUnknownSession` (via liveSession) when the id names nothing here — which the handler turns into
+// the `unknown_session` refusal, since a settle for a session this instance does not hold is the
+// engine's picture being stale rather than a fault.
+func (m *Manager) SettleAnswer(
+	sessionID string,
+	format audio.Format,
+	audioPT, telephoneEventPT uint8,
+) (Descriptor, error) {
+	session, err := m.liveSession(sessionID)
+	if err != nil {
+		return Descriptor{}, err
+	}
+	session.settleCodec(format, audioPT, telephoneEventPT)
+	m.log.Info("session codec settled",
+		"sessionId", sessionID,
+		"audioPayloadType", audioPT,
+		"telephoneEventPayloadType", telephoneEventPT)
+	return m.describe(session), nil
+}
+
 // Release tears a session down. It reports whether there was one to tear down, so the caller can
 // tell "released" from "already gone" — the engine retries a release, and a retry answering
 // "released: false" is the honest answer rather than an error.

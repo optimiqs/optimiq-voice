@@ -1760,6 +1760,111 @@ export const MEDIA_ALLOCATE_SESSION_RPC = defineRpc(
 );
 
 /**
+ * `rpc.media.v1.create-offer` — reserve an RTP port pair and WRITE an SDP offer for a B-leg.
+ *
+ * ## Why this is a separate command from allocate-session
+ *
+ * {@link mediaAllocateSessionRequestSchema} REQUIRES an `sdpOffer` because v1 answers offers: the
+ * A-leg arrives with one `apps/sipd` already holds. A leg the engine ORIGINATES has none — we are the
+ * caller — so `mediad` writes one. `plans/sipd-invite-design.md` §5.2 chose this (decision A) over the
+ * two alternatives it rejected by name: `apps/sipd` synthesising the offer (it would pick codecs,
+ * which §5 forbids) and a body-less late-offer INVITE (refused or mishandled by a meaningful share of
+ * carriers, with "the phone rang and there was no audio" as the invisible failure).
+ *
+ * So `mediad` offers exactly what `mediad` can serve — PCMU, PCMA and RFC 4733 telephone-event — and
+ * the callee's choice is fed back at {@link mediaAcceptAnswerRequestSchema}. `apps/sipd` holds no
+ * codec knowledge in either direction, which is the whole point.
+ *
+ * RAW NATS ON BOTH ENDS, idempotent on `sessionId`, and `sessionId` caller-assigned — every argument
+ * on {@link mediaAllocateSessionRequestSchema} applies here unchanged.
+ */
+export const mediaCreateOfferRequestSchema = z.object({
+	...mediaCommandShape,
+	/** The tenant, for the org-scoped lifecycle-event subject. See allocate-session. */
+	orgId: z.uuid(),
+	/** The call this B-leg belongs to. Lands on the lifecycle events and in the session directory. */
+	callId: z.string().min(1).max(128),
+	/** The engine's leg id, when it differs from the session id. Logging and correlation only. */
+	legId: z.string().min(1).max(128).optional(),
+	/**
+	 * The direction to OFFER. `sendrecv` for a normal outbound leg; `inactive`/`sendonly`/`recvonly`
+	 * for the re-negotiation cases that arrive with slice 5. Defaulted, never assumed.
+	 */
+	direction: z.enum(["sendrecv", "sendonly", "recvonly", "inactive"]).default("sendrecv"),
+});
+
+export const mediaCreateOfferResponseSchema = z.object({
+	ok: z.boolean(),
+	sessionId: z.string().min(1).max(128),
+	/** The offer to put into the outbound INVITE. Present exactly when `ok`. See {@link sdpSchema}. */
+	sdpOffer: sdpSchema.optional(),
+	/** The `mediad` holding the session, and the value written to `media-sessions`. See allocate. */
+	instanceId: z.string().min(1).max(128).optional(),
+	/** Where the far end should send RTP — `MEDIAD_PUBLIC_IP`, never the bind address. */
+	address: z.string().max(64).optional(),
+	rtpPort: z.int().min(1).max(65_534).optional(),
+	/** Always `rtpPort + 1` (RFC 3550 §11). */
+	rtcpPort: z.int().min(1).max(65_535).optional(),
+	ssrc: z.int().min(0).max(4_294_967_295).optional(),
+	/** The RFC 4733 telephone-event payload type the offer proposes. */
+	telephoneEventPayloadType: z.int().min(0).max(127).optional(),
+	reason: mediaRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type MediaCreateOfferRequest = z.infer<typeof mediaCreateOfferRequestSchema>;
+export type MediaCreateOfferResponse = z.infer<typeof mediaCreateOfferResponseSchema>;
+
+export const MEDIA_CREATE_OFFER_RPC = defineRpc(
+	RPC_SUBJECTS.mediaCreateOffer,
+	mediaCreateOfferRequestSchema,
+	mediaCreateOfferResponseSchema,
+	// Binds two sockets and writes twelve lines of SDP. It sits inside the engine's origination of a
+	// B-leg, on the same call path as allocate-session, so it earns the same 500 ms headroom.
+	500,
+);
+
+/**
+ * `rpc.media.v1.accept-answer` — feed the callee's SDP answer back and SETTLE the codec.
+ *
+ * The other half of {@link mediaCreateOfferRequestSchema}. `mediad` offered PCMU/PCMA/telephone-event;
+ * the callee's `200 OK` chose one, and this is where that choice is committed onto the live session so
+ * the relay speaks the right payload type. A callee that answered with something `mediad` cannot serve
+ * — G.729, say — is refused `not_supported`, and the engine hangs that B-leg up with a cause the plan
+ * walker can act on (`INCOMPATIBLE_DESTINATION`, Q.850 88). `apps/sipd` forwards the answer it did not
+ * parse.
+ */
+export const mediaAcceptAnswerRequestSchema = z.object({
+	...mediaCommandShape,
+	/** The callee's answer, verbatim. See {@link sdpSchema}. */
+	sdpAnswer: sdpSchema,
+});
+
+export const mediaAcceptAnswerResponseSchema = z.object({
+	ok: z.boolean(),
+	sessionId: z.string().min(1).max(128),
+	/** The codec the answer settled on. Present exactly when `ok`. */
+	codec: mediaCodecSchema.optional(),
+	/** The negotiated RFC 4733 telephone-event payload type, when the answer carried one. */
+	telephoneEventPayloadType: z.int().min(0).max(127).optional(),
+	instanceId: z.string().min(1).max(128).optional(),
+	reason: mediaRefusalReasonSchema.optional(),
+	error: z.string().max(512).optional(),
+});
+
+export type MediaAcceptAnswerRequest = z.infer<typeof mediaAcceptAnswerRequestSchema>;
+export type MediaAcceptAnswerResponse = z.infer<typeof mediaAcceptAnswerResponseSchema>;
+
+export const MEDIA_ACCEPT_ANSWER_RPC = defineRpc(
+	RPC_SUBJECTS.mediaAcceptAnswer,
+	mediaAcceptAnswerRequestSchema,
+	mediaAcceptAnswerResponseSchema,
+	// Parses one answer and re-points a live session's codec — no socket bind. Still on the call path
+	// (it sits inside the B-leg's answer), so 500 ms, the same bound its sibling carries.
+	500,
+);
+
+/**
  * `rpc.media.v1.bridge-sessions` — put two or more allocated sessions in one conversation.
  *
  * ## Two is a relay, three is a room, and the caller does not have to know which
@@ -3492,6 +3597,8 @@ export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.sipReinvite]: SIP_REINVITE_RPC,
 	[RPC_SUBJECTS.sipOriginate]: SIP_ORIGINATE_RPC,
 	[RPC_SUBJECTS.mediaAllocateSession]: MEDIA_ALLOCATE_SESSION_RPC,
+	[RPC_SUBJECTS.mediaCreateOffer]: MEDIA_CREATE_OFFER_RPC,
+	[RPC_SUBJECTS.mediaAcceptAnswer]: MEDIA_ACCEPT_ANSWER_RPC,
 	[RPC_SUBJECTS.mediaBridgeSessions]: MEDIA_BRIDGE_SESSIONS_RPC,
 	[RPC_SUBJECTS.mediaUnbridgeSessions]: MEDIA_UNBRIDGE_SESSIONS_RPC,
 	[RPC_SUBJECTS.mediaReleaseSession]: MEDIA_RELEASE_SESSION_RPC,

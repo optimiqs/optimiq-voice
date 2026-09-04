@@ -457,6 +457,83 @@ func BuildAnswer(answer Answer) string {
 	return body.String()
 }
 
+// OfferParams is everything needed to render mediad's OWN offer for a leg it is originating.
+//
+// A distinct type from the inbound Offer, which is the parse of somebody else's SDP: this is what
+// mediad WRITES. plans/sipd-invite-design.md §5.2 is the whole reason it exists — a B-leg the engine
+// originates has no offer to answer, so mediad must generate one, and "mediad offers exactly what
+// mediad can serve" is the codec bound the design draws around this.
+type OfferParams struct {
+	// SessionID and SessionVersion go in the `o=` line, derived from the session so a re-offer of the
+	// same session is recognisable as one — the same rule BuildAnswer follows.
+	SessionID      uint64
+	SessionVersion uint64
+	// Address is the PUBLIC address (MEDIAD_PUBLIC_IP), never the bind address, for the same reason
+	// the answer's is: getting it wrong fails as one-way audio rather than as an error.
+	Address netip.Addr
+	Port    int
+	// Codecs are the audio codecs to propose, IN PREFERENCE ORDER — each becomes one m=audio format
+	// and one a=rtpmap line, so unlike an answer (which names one) an offer lists what mediad serves
+	// and lets the callee pick. Empty is a programming error the builder does not paper over; the
+	// control surface passes PCMU then PCMA.
+	Codecs []Codec
+	// TelephoneEventPayloadType is the RFC 4733 type to propose, or 0 to omit telephone-event
+	// entirely. mediad proposes 101, the de-facto value.
+	TelephoneEventPayloadType uint8
+	// Direction is the media direction to offer, defaulting to sendrecv.
+	Direction Direction
+}
+
+// BuildOffer renders an offer body for a leg mediad is originating.
+//
+// It is BuildAnswer's mirror, and the one structural difference is the whole point: an offer LISTS
+// the codecs mediad can serve where an answer names the single one negotiated. Every audio codec in
+// `Codecs` gets an m=audio format and an a=rtpmap line, in the order given, which is the preference
+// order the callee is asked to honour (RFC 3264 §5.1). Telephone-event rides alongside exactly as it
+// does in an answer.
+//
+// Written with a string builder rather than pion's marshaller for the same reason BuildAnswer is:
+// every line here is a decision this file has to be able to justify, and a golden test should assert
+// this service's offer rather than a library's formatting.
+func BuildOffer(offer OfferParams) string {
+	direction := offer.Direction
+	if direction == "" {
+		direction = DirectionSendRecv
+	}
+
+	// The m= format list is every audio codec's payload type, then telephone-event when proposed.
+	formats := make([]string, 0, len(offer.Codecs)+1)
+	for _, codec := range offer.Codecs {
+		formats = append(formats, strconv.Itoa(int(codec.PayloadType())))
+	}
+	if offer.TelephoneEventPayloadType != 0 {
+		formats = append(formats, strconv.Itoa(int(offer.TelephoneEventPayloadType)))
+	}
+
+	var body strings.Builder
+	body.WriteString("v=0\r\n")
+	fmt.Fprintf(&body, "o=- %d %d IN IP4 %s\r\n",
+		offer.SessionID, offer.SessionVersion, offer.Address)
+	body.WriteString("s=-\r\n")
+	fmt.Fprintf(&body, "c=IN IP4 %s\r\n", offer.Address)
+	body.WriteString("t=0 0\r\n")
+	fmt.Fprintf(&body, "m=audio %d RTP/AVP %s\r\n", offer.Port, strings.Join(formats, " "))
+	// One rtpmap per audio codec, spelled out even for the static types: an endpoint that reads
+	// rtpmap first and the static table never is a real endpoint. Opus is not offered here — mediad
+	// only originates G.711 — so there is no channel-count special case to make.
+	for _, codec := range offer.Codecs {
+		fmt.Fprintf(&body, "a=rtpmap:%d %s/%d\r\n", codec.PayloadType(), codec, codec.ClockRate())
+	}
+	if offer.TelephoneEventPayloadType != 0 {
+		fmt.Fprintf(&body, "a=rtpmap:%d telephone-event/8000\r\n", offer.TelephoneEventPayloadType)
+		fmt.Fprintf(&body, "a=fmtp:%d 0-16\r\n", offer.TelephoneEventPayloadType)
+	}
+	body.WriteString("a=ptime:20\r\n")
+	fmt.Fprintf(&body, "a=%s\r\n", direction)
+	fmt.Fprintf(&body, "a=rtcp:%d\r\n", offer.Port+1)
+	return body.String()
+}
+
 // AnswerDirection is the direction to answer an offer with, given what the engine asked for.
 //
 // RFC 3264 §6.1: an answer's direction is the MIRROR of the offer's, intersected with what the

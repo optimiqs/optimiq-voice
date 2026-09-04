@@ -510,6 +510,22 @@
 			"goResponseType": "MediaAllocateSessionResponse"
 		},
 		{
+			"subject": "rpc.media.v1.create-offer",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.media.v1.create-offer.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.create-offer.response.schema.json",
+			"goRequestType": "MediaCreateOfferRequest",
+			"goResponseType": "MediaCreateOfferResponse"
+		},
+		{
+			"subject": "rpc.media.v1.accept-answer",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.media.v1.accept-answer.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.accept-answer.response.schema.json",
+			"goRequestType": "MediaAcceptAnswerRequest",
+			"goResponseType": "MediaAcceptAnswerResponse"
+		},
+		{
 			"subject": "rpc.media.v1.bridge-sessions",
 			"timeoutMs": 500,
 			"requestSchema": "rpc/rpc.media.v1.bridge-sessions.request.schema.json",

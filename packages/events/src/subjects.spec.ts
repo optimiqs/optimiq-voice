@@ -67,6 +67,8 @@ describe("subject roots", () => {
 			sipReinvite: "rpc.sip.v1.reinvite",
 			sipOriginate: "rpc.sip.v1.originate",
 			mediaAllocateSession: "rpc.media.v1.allocate-session",
+			mediaCreateOffer: "rpc.media.v1.create-offer",
+			mediaAcceptAnswer: "rpc.media.v1.accept-answer",
 			mediaBridgeSessions: "rpc.media.v1.bridge-sessions",
 			mediaUnbridgeSessions: "rpc.media.v1.unbridge-sessions",
 			mediaReleaseSession: "rpc.media.v1.release-session",

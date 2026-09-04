@@ -455,6 +455,20 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		response: RPC_CONTRACTS["rpc.media.v1.allocate-session"].response,
 	},
 	{
+		subject: "rpc.media.v1.create-offer",
+		goName: "MediaCreateOffer",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.create-offer"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.create-offer"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.create-offer"].response,
+	},
+	{
+		subject: "rpc.media.v1.accept-answer",
+		goName: "MediaAcceptAnswer",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.accept-answer"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.accept-answer"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.accept-answer"].response,
+	},
+	{
 		subject: "rpc.media.v1.bridge-sessions",
 		goName: "MediaBridgeSessions",
 		timeoutMs: RPC_CONTRACTS["rpc.media.v1.bridge-sessions"].timeoutMs,

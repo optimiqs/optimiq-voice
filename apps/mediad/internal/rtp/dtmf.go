@@ -212,7 +212,7 @@ func (s *Session) SendDtmf(opts DtmfOptions) (*DtmfInjection, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s.telephoneEventPayloadType == 0 {
+	if s.TelephoneEventPayloadType() == 0 {
 		return nil, ErrNoTelephoneEvent
 	}
 	if s.Remote() == nil {
@@ -357,7 +357,7 @@ func (s *Session) sendDtmfPacket(event byte, end bool, duration, timestamp uint3
 	out := pionrtp.Packet{
 		Header: pionrtp.Header{
 			Version:     2,
-			PayloadType: s.telephoneEventPayloadType,
+			PayloadType: s.TelephoneEventPayloadType(),
 			// The marker bit on the first packet of a digit is RFC 4733 §2.5.1.2's start-of-event
 			// flag, and it is the one an IVR keys on: dropping it turns every keypress into one the
 			// far end cannot detect, which is the same reason the relay preserves it.

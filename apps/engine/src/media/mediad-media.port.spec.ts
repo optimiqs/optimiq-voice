@@ -1,7 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import {
+	mediaAcceptAnswerRequestSchema,
 	mediaAllocateSessionRequestSchema,
 	mediaBridgeSessionsRequestSchema,
+	mediaCreateOfferRequestSchema,
 	mediaHoldSessionRequestSchema,
 	mediaMuteSessionRequestSchema,
 	mediaReleaseSessionRequestSchema,
@@ -36,6 +38,10 @@ const SESSION = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53";
 const OFFER =
 	"v=0\r\no=- 12345 1 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\nt=0 0\r\n" +
 	"m=audio 41000 RTP/AVP 0 8 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n";
+
+const ANSWER =
+	"v=0\r\no=- 54321 1 IN IP4 203.0.113.20\r\ns=-\r\nc=IN IP4 203.0.113.20\r\nt=0 0\r\n" +
+	"m=audio 42000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n";
 
 function newPort(): { port: MediadMediaPort; transport: FakeMediadTransport } {
 	const transport = new FakeMediadTransport();
@@ -194,6 +200,99 @@ describe("allocateSession", () => {
 			port.allocateSession({ sessionId: SESSION, orgId: ORG, callId: CALL, sdpOffer: OFFER }),
 		).rejects.toThrow("no reply within 500ms");
 		expect(await port.channelExists(SESSION)).toBe(false);
+	});
+});
+
+describe("create-offer / accept-answer (the B-leg codec bound, §5.2)", () => {
+	it("writes an offer and makes the session visible to channelExists", async () => {
+		const { port, transport } = newPort();
+		transport.reply(RPC_SUBJECTS.mediaCreateOffer, {
+			ok: true,
+			sessionId: SESSION,
+			sdpOffer: OFFER,
+			instanceId: "mediad-fake",
+			address: "203.0.113.10",
+			rtpPort: 30_000,
+			rtcpPort: 30_001,
+			telephoneEventPayloadType: 101,
+		});
+
+		const response = await port.createOffer({
+			sessionId: SESSION,
+			orgId: ORG,
+			callId: CALL,
+			legId: "leg-1",
+		});
+
+		expect(response.ok).toBe(true);
+		expect(response.sdpOffer).toContain("v=0");
+		// On `ok`, the session is recorded so a later release and channelExists can find it.
+		expect(await port.channelExists(SESSION)).toBe(true);
+
+		const [request] = transport.on(RPC_SUBJECTS.mediaCreateOffer);
+		expect(() => mediaCreateOfferRequestSchema.parse(request?.payload)).not.toThrow();
+		const payload = request?.payload as Record<string, unknown>;
+		// The default is stated rather than left to the responder, exactly as allocate-session does.
+		expect(payload["direction"]).toBe("sendrecv");
+		expect(payload["legId"]).toBe("leg-1");
+	});
+
+	it("returns a refusal as DATA and does not record the session", async () => {
+		const { port, transport } = newPort();
+		transport.reply(RPC_SUBJECTS.mediaCreateOffer, {
+			ok: false,
+			sessionId: SESSION,
+			reason: "capacity",
+			error: "every port pair is in use",
+			instanceId: "mediad-7c9f",
+		});
+
+		const response = await port.createOffer({ sessionId: SESSION, orgId: ORG, callId: CALL });
+
+		// No throw — the composite has to branch on this, there is no offer to send.
+		expect(response.ok).toBe(false);
+		expect(response.reason).toBe("capacity");
+		expect(await port.channelExists(SESSION)).toBe(false);
+	});
+
+	it("settles a codec on an accept-answer", async () => {
+		const { port, transport } = newPort();
+		transport.reply(RPC_SUBJECTS.mediaAcceptAnswer, {
+			ok: true,
+			sessionId: SESSION,
+			codec: "PCMU",
+			telephoneEventPayloadType: 101,
+			instanceId: "mediad-fake",
+		});
+
+		const response = await port.acceptAnswer({ sessionId: SESSION, sdpAnswer: ANSWER });
+
+		expect(response.ok).toBe(true);
+		expect(response.codec).toBe("PCMU");
+
+		const [request] = transport.on(RPC_SUBJECTS.mediaAcceptAnswer);
+		expect(() => mediaAcceptAnswerRequestSchema.parse(request?.payload)).not.toThrow();
+		const payload = request?.payload as Record<string, unknown>;
+		expect(payload["sdpAnswer"]).toBe(ANSWER);
+	});
+
+	it("returns a not_supported codec refusal as a normal branch, not a throw", async () => {
+		// A callee that answered with G.729 is a documented outcome (§5.2): the composite hangs that
+		// B-leg up with INCOMPATIBLE_DESTINATION, so the reason must arrive as data rather than as an
+		// exception on the call path.
+		const { port, transport } = newPort();
+		transport.reply(RPC_SUBJECTS.mediaAcceptAnswer, {
+			ok: false,
+			sessionId: SESSION,
+			reason: "not_supported",
+			error: "the callee answered with G.729, which mediad cannot serve",
+			instanceId: "mediad-7c9f",
+		});
+
+		const response = await port.acceptAnswer({ sessionId: SESSION, sdpAnswer: ANSWER });
+
+		expect(response.ok).toBe(false);
+		expect(response.reason).toBe("not_supported");
 	});
 });
 

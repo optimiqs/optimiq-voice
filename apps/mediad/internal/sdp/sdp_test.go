@@ -279,6 +279,81 @@ func TestAnswerIsItselfParseable(t *testing.T) {
 	}
 }
 
+func TestBuildOffer(t *testing.T) {
+	address := netip.MustParseAddr("203.0.113.10")
+
+	body := sdp.BuildOffer(sdp.OfferParams{
+		SessionID:                 30002,
+		SessionVersion:            1,
+		Address:                   address,
+		Port:                      30002,
+		Codecs:                    []sdp.Codec{sdp.CodecPCMU, sdp.CodecPCMA},
+		TelephoneEventPayloadType: 101,
+		Direction:                 sdp.DirectionSendRecv,
+	})
+
+	// An offer LISTS every codec mediad serves — PCMU then PCMA — plus telephone-event, and gives
+	// each an rtpmap. That "lists more than one format" is the whole difference from an answer.
+	wantLines := []string{
+		"v=0",
+		"o=- 30002 1 IN IP4 203.0.113.10",
+		"s=-",
+		"c=IN IP4 203.0.113.10",
+		"t=0 0",
+		"m=audio 30002 RTP/AVP 0 8 101",
+		"a=rtpmap:0 PCMU/8000",
+		"a=rtpmap:8 PCMA/8000",
+		"a=rtpmap:101 telephone-event/8000",
+		"a=fmtp:101 0-16",
+		"a=ptime:20",
+		"a=sendrecv",
+		"a=rtcp:30003",
+	}
+	for _, line := range wantLines {
+		if !strings.Contains(body, line+"\r\n") {
+			t.Errorf("offer is missing %q\n---\n%s", line, body)
+		}
+	}
+	if !strings.HasPrefix(body, "v=0\r\n") {
+		t.Errorf("offer does not start with v=0\n---\n%s", body)
+	}
+
+	// The far end parses our offer with the same kind of parser we use, so round-tripping it is the
+	// cheapest proof it is well-formed. First preference is PCMU, and the telephone-event survives.
+	parsed, err := sdp.ParseOffer(body)
+	if err != nil {
+		t.Fatalf("the offer we generate does not parse: %v\n---\n%s", err, body)
+	}
+	if parsed.Codec != sdp.CodecPCMU {
+		t.Errorf("round-tripped first codec = %q, want PCMU", parsed.Codec)
+	}
+	if parsed.TelephoneEventPayloadType != 101 {
+		t.Errorf("round-tripped telephone-event = %d, want 101", parsed.TelephoneEventPayloadType)
+	}
+}
+
+// An offer with no telephone-event omits it entirely, and honours a non-sendrecv direction.
+func TestBuildOfferWithoutTelephoneEvent(t *testing.T) {
+	body := sdp.BuildOffer(sdp.OfferParams{
+		SessionID:      30010,
+		SessionVersion: 1,
+		Address:        netip.MustParseAddr("203.0.113.10"),
+		Port:           30010,
+		Codecs:         []sdp.Codec{sdp.CodecPCMU, sdp.CodecPCMA},
+		Direction:      sdp.DirectionRecvOnly,
+	})
+	for _, line := range []string{"m=audio 30010 RTP/AVP 0 8", "a=recvonly"} {
+		if !strings.Contains(body, line+"\r\n") {
+			t.Errorf("offer is missing %q\n---\n%s", line, body)
+		}
+	}
+	for _, absent := range []string{"telephone-event", "a=fmtp:"} {
+		if strings.Contains(body, absent) {
+			t.Errorf("offer unexpectedly contains %q\n---\n%s", absent, body)
+		}
+	}
+}
+
 func TestAnswerDirection(t *testing.T) {
 	cases := []struct {
 		offered   sdp.Direction

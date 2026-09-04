@@ -332,7 +332,7 @@ func (d *dtmfDetector) closeLocked(endedBy DtmfEndedBy) DtmfDigit {
 // the non-event branch is a lock-free atomic read: most packets on most calls are audio, and asking
 // "is a digit open" must cost nothing when the answer has been no for the last four minutes.
 func (s *Session) tapDtmf(packet *pionrtp.Packet, now time.Time) {
-	if s.telephoneEventPayloadType == 0 || packet.PayloadType != s.telephoneEventPayloadType {
+	if tePT := s.TelephoneEventPayloadType(); tePT == 0 || packet.PayloadType != tePT {
 		// Audio, which is also the signal that a tone is over: the far end went back to sending
 		// speech. It does not close the digit by itself — some endpoints do send both — but it is the
 		// arrival that lets the max-duration cutoff be evaluated. See dtmfDetector.expire.

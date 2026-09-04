@@ -136,14 +136,15 @@ type transcoderPair struct {
 // The nil case is the common one: two legs that agreed get a pair of nils, and `install` clears both
 // sessions so a re-bridge onto an agreeing peer cannot inherit the previous peer's translation.
 func prepareTranscoders(a, b *Session) (transcoderPair, error) {
-	if a.format == b.format {
+	aFormat, bFormat := a.Format(), b.Format()
+	if aFormat == bFormat {
 		return transcoderPair{}, nil
 	}
-	toB, err := NewTranscoder(a.format, b.format)
+	toB, err := NewTranscoder(aFormat, bFormat)
 	if err != nil {
 		return transcoderPair{}, err
 	}
-	toA, err := NewTranscoder(b.format, a.format)
+	toA, err := NewTranscoder(bFormat, aFormat)
 	if err != nil {
 		return transcoderPair{}, err
 	}

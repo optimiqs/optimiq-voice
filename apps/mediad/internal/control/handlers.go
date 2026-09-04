@@ -169,15 +169,22 @@ func (s *Server) recordSession(
 	request contract.MediaAllocateSessionRequest,
 	descriptor rtp.Descriptor,
 ) {
+	s.recordSessionEntry(request.OrgID, request.CallID, derefString(request.LegID), descriptor)
+}
+
+// recordSessionEntry is the directory write both allocate and create-offer make, taking the tenancy
+// as primitives so the two commands — which carry it in differently shaped requests — share one
+// entry shape and one best-effort failure rule.
+func (s *Server) recordSessionEntry(orgID, callID, legID string, descriptor rtp.Descriptor) {
 	ctx, cancel := dirContext()
 	defer cancel()
 
 	entry := directory.Entry{
 		SessionID:   descriptor.SessionID,
 		InstanceID:  s.instanceID,
-		OrgID:       request.OrgID,
-		CallID:      request.CallID,
-		LegID:       derefString(request.LegID),
+		OrgID:       orgID,
+		CallID:      callID,
+		LegID:       legID,
 		Address:     descriptor.Address.String(),
 		RTPPort:     descriptor.RTPPort,
 		RTCPPort:    descriptor.RTCPPort,
@@ -193,6 +200,204 @@ func (s *Server) recordSession(
 func (s *Server) refuseAllocate(sessionID, reason, message string) []byte {
 	code := contract.MediaAllocateSessionResponseReason(reason)
 	return encode(s.log, contract.MediaAllocateSessionResponse{
+		Ok:         false,
+		SessionID:  sessionID,
+		InstanceID: stringPtr(s.instanceID),
+		Reason:     &code,
+		Error:      stringPtr(message),
+	})
+}
+
+// offeredCodecs is what create-offer proposes, in preference order. Exactly what mediad can serve —
+// PCMU then PCMA — which is the codec bound plans/sipd-invite-design.md §5.2 draws around the B-leg:
+// "mediad offers exactly what mediad can serve". Narrowband first, matching the answer path's
+// preference and the passthrough argument in plans/mediad-design.md §7.
+var offeredCodecs = []sdp.Codec{sdp.CodecPCMU, sdp.CodecPCMA}
+
+// HandleCreateOffer allocates a port pair for a B-leg that has NO inbound offer and writes the offer.
+//
+// This is the leg the engine ORIGINATES: there is no far-end SDP to answer, so mediad must generate
+// one, and plans/sipd-invite-design.md §5.2 settled that mediad — the only process that knows its own
+// ports, codecs and reachable address — is the one that writes it. The order mirrors allocate's, and
+// for the same reason: everything refusable is decided before a port is bound.
+//
+//  1. Validate the payload. sessionId, orgId and callId are the same three allocate requires, and for
+//     the same reasons — orgId is the subject token this session's lifecycle events publish under.
+//  2. Parse the direction to offer. Unlike an answer there is nothing to mirror; the request's
+//     direction IS the offer's, defaulting to sendrecv.
+//  3. Allocate on mediad's DEFAULT codec — PCMU, telephone-event 101 — because the real codec is the
+//     callee's to pick and is not known until accept-answer. Idempotent on sessionId exactly as
+//     allocate: a retry after a timeout returns the same session and opens no second port.
+//  4. Build the offer LISTING what mediad serves (PCMU + PCMA + telephone-event) so the callee
+//     chooses, and record the directory entry last and non-fatally.
+func (s *Server) HandleCreateOffer(data []byte) []byte {
+	var request contract.MediaCreateOfferRequest
+	if err := json.Unmarshal(data, &request); err != nil {
+		return s.refuseCreateOffer("", ReasonBadRequest,
+			fmt.Sprintf("malformed create-offer request: %v", err))
+	}
+	switch {
+	case request.SessionID == "":
+		return s.refuseCreateOffer("", ReasonBadRequest,
+			"sessionId is required and must be assigned by the caller")
+	case request.CallID == "":
+		return s.refuseCreateOffer(request.SessionID, ReasonBadRequest, "callId is required")
+	case request.OrgID == "":
+		return s.refuseCreateOffer(request.SessionID, ReasonBadRequest,
+			"orgId is required: it is the subject token this session's lifecycle events are published under")
+	}
+
+	direction, err := sdp.ParseDirection(string(request.Direction))
+	if err != nil {
+		return s.refuseCreateOffer(request.SessionID, ReasonBadRequest, err.Error())
+	}
+	muteIn, muteOut := directionToMutes(direction)
+
+	descriptor, err := s.sessions.Allocate(rtp.AllocateOptions{
+		SessionID: request.SessionID,
+		OrgID:     request.OrgID,
+		CallID:    request.CallID,
+		LegID:     derefString(request.LegID),
+		// The DEFAULT codec, not the negotiated one: a B-leg's callee has not answered yet, so the
+		// session starts on PCMU with telephone-event 101 and accept-answer settles the real choice.
+		AudioPayloadType:          rtp.PayloadTypePCMU,
+		Format:                    audio.FormatULaw,
+		TelephoneEventPayloadType: rtp.PayloadTypeTelephoneEvent,
+		Inactive:                  direction == sdp.DirectionInactive,
+		MuteIn:                    muteIn,
+		MuteOut:                   muteOut,
+	})
+	if err != nil {
+		reason := ReasonInternal
+		switch {
+		case errors.Is(err, rtp.ErrPortsExhausted):
+			reason = ReasonCapacity
+		case errors.Is(err, rtp.ErrClosed):
+			reason = ReasonShuttingDown
+		}
+		s.log.Warn("refusing a create-offer",
+			"sessionId", request.SessionID, "callId", request.CallID,
+			"reason", reason, "error", err)
+		return s.refuseCreateOffer(request.SessionID, reason, err.Error())
+	}
+
+	sessionID, sessionVersion := sdpSessionIDs(descriptor.RTPPort)
+	offer := sdp.BuildOffer(sdp.OfferParams{
+		SessionID:                 sessionID,
+		SessionVersion:            sessionVersion,
+		Address:                   s.publicAddr,
+		Port:                      descriptor.RTPPort,
+		Codecs:                    offeredCodecs,
+		TelephoneEventPayloadType: descriptor.TelephoneEventPayloadType,
+		Direction:                 direction,
+	})
+
+	s.recordSessionEntry(request.OrgID, request.CallID, derefString(request.LegID), descriptor)
+
+	response := contract.MediaCreateOfferResponse{
+		Ok:         true,
+		SessionID:  descriptor.SessionID,
+		SDPOffer:   stringPtr(offer),
+		InstanceID: stringPtr(s.instanceID),
+		Address:    stringPtr(descriptor.Address.String()),
+		RtpPort:    intPtr(descriptor.RTPPort),
+		RtcpPort:   intPtr(descriptor.RTCPPort),
+		Ssrc:       intPtr(int(descriptor.SSRC)),
+	}
+	if descriptor.TelephoneEventPayloadType != 0 {
+		response.TelephoneEventPayloadType = intPtr(int(descriptor.TelephoneEventPayloadType))
+	}
+	return encode(s.log, response)
+}
+
+func (s *Server) refuseCreateOffer(sessionID, reason, message string) []byte {
+	code := contract.MediaCreateOfferResponseReason(reason)
+	return encode(s.log, contract.MediaCreateOfferResponse{
+		Ok:         false,
+		SessionID:  sessionID,
+		InstanceID: stringPtr(s.instanceID),
+		Reason:     &code,
+		Error:      stringPtr(message),
+	})
+}
+
+// HandleAcceptAnswer settles the callee's negotiated codec onto a B-leg created by create-offer.
+//
+// The other half of the originated-leg pair. create-offer wrote an offer of PCMU + PCMA +
+// telephone-event; the callee's 200 OK answers with ONE of them, and this pins that choice onto the
+// live session so the relay forwards under the payload type both ends agreed to.
+//
+// The two refusals that matter, from plans/sipd-invite-design.md §5.2:
+//
+//   - A codec mediad cannot serve is `not_supported`. mediad offered only G.711, so an answer naming
+//     anything else — G.729, G.722, Opus — is a callee mediad cannot bridge, and the engine's
+//     recovery is to hang the B-leg up with an incompatible-destination cause rather than to retry.
+//   - An unknown sessionId is `unknown_session`: the answer arrived for a leg this instance does not
+//     hold, which is the engine's picture being stale rather than a fault here.
+func (s *Server) HandleAcceptAnswer(data []byte) []byte {
+	var request contract.MediaAcceptAnswerRequest
+	if err := json.Unmarshal(data, &request); err != nil {
+		return s.refuseAcceptAnswer("", ReasonBadRequest,
+			fmt.Sprintf("malformed accept-answer request: %v", err))
+	}
+	switch {
+	case request.SessionID == "":
+		return s.refuseAcceptAnswer("", ReasonBadRequest, "sessionId is required")
+	case request.SDPAnswer == "":
+		return s.refuseAcceptAnswer(request.SessionID, ReasonBadRequest, "sdpAnswer is required")
+	}
+
+	// The answer is a session description, so the offer parser reads it: an answer names one codec,
+	// and ParseOffer returns the first (here, only) one it recognises plus any telephone-event type.
+	answer, err := sdp.ParseOffer(request.SDPAnswer)
+	if err != nil {
+		reason := ReasonBadRequest
+		if errors.Is(err, sdp.ErrNoCommonCodec) {
+			// A valid answer naming a codec mediad does not carry at all. `not_supported`, so the
+			// engine hangs the B-leg up rather than retrying the same bytes.
+			reason = ReasonNotSupported
+		}
+		return s.refuseAcceptAnswer(request.SessionID, reason, err.Error())
+	}
+	// mediad offered ONLY G.711, so an answer must land on PCMU or PCMA. A parser that recognises a
+	// wider set (G.722, Opus) can return one mediad never offered; refusing it here keeps the answer
+	// bounded to what create-offer actually proposed.
+	if answer.Codec != sdp.CodecPCMU && answer.Codec != sdp.CodecPCMA {
+		return s.refuseAcceptAnswer(request.SessionID, ReasonNotSupported,
+			fmt.Sprintf("the answer settled on %s, and create-offer proposed only PCMU and PCMA", answer.Codec))
+	}
+
+	descriptor, err := s.sessions.SettleAnswer(
+		request.SessionID, answer.Codec.Format(), answer.AudioPayloadType, answer.TelephoneEventPayloadType)
+	if err != nil {
+		reason := ReasonInternal
+		switch {
+		case errors.Is(err, rtp.ErrUnknownSession):
+			reason = s.locateRefusal([]string{request.SessionID})
+		case errors.Is(err, rtp.ErrClosed):
+			reason = ReasonShuttingDown
+		}
+		s.log.Warn("refusing an accept-answer",
+			"sessionId", request.SessionID, "reason", reason, "error", err)
+		return s.refuseAcceptAnswer(request.SessionID, reason, err.Error())
+	}
+
+	settled := string(sdp.CodecForFormat(descriptor.Format))
+	response := contract.MediaAcceptAnswerResponse{
+		Ok:         true,
+		SessionID:  descriptor.SessionID,
+		Codec:      (*contract.MediaAcceptAnswerResponseCodec)(&settled),
+		InstanceID: stringPtr(s.instanceID),
+	}
+	if descriptor.TelephoneEventPayloadType != 0 {
+		response.TelephoneEventPayloadType = intPtr(int(descriptor.TelephoneEventPayloadType))
+	}
+	return encode(s.log, response)
+}
+
+func (s *Server) refuseAcceptAnswer(sessionID, reason, message string) []byte {
+	code := contract.MediaAcceptAnswerResponseReason(reason)
+	return encode(s.log, contract.MediaAcceptAnswerResponse{
 		Ok:         false,
 		SessionID:  sessionID,
 		InstanceID: stringPtr(s.instanceID),

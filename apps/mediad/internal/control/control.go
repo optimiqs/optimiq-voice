@@ -76,6 +76,14 @@ const (
 	// differ in one bit of one payload where a bridge and an unbridge differ in their whole shape.
 	SubjectMuteSession = contract.SubjectMediaMuteSessionRPC
 	SubjectHoldSession = contract.SubjectMediaHoldSessionRPC
+	// The B-leg pair. A leg the engine ORIGINATES has no inbound offer to answer, so these are the two
+	// subjects that let mediad write one and then settle the callee's reply onto it — plans/
+	// sipd-invite-design.md §5.2. create-offer allocates the port pair and emits an offer of exactly
+	// what mediad can serve; accept-answer feeds the callee's answer back and pins the negotiated
+	// codec onto the live session. The rung plans/mediad-design.md §5 deferred with "v1 ANSWERS
+	// offers" arrived here.
+	SubjectCreateOffer  = contract.SubjectMediaCreateOfferRPC
+	SubjectAcceptAnswer = contract.SubjectMediaAcceptAnswerRPC
 )
 
 // Refusal codes. Values come from the contract; these names exist so a handler reads as prose.
@@ -128,6 +136,14 @@ type Sessions interface {
 	// on and the one mediad answers — a separate hold subject would mean one re-INVITE producing two
 	// commands that could disagree about the same call.
 	ApplyDirection(sessionID string, muteIn, muteOut bool) error
+
+	// SettleAnswer re-points a live session's negotiated codec once its callee's SDP answer arrives.
+	//
+	// The packet-path half of `accept-answer`. A B-leg is originated with no offer, so `create-offer`
+	// binds the port on a default codec and this pins the real one — the codec and telephone-event
+	// type the callee actually chose — onto the live session, returning the settled descriptor. An
+	// unknown id is `ErrUnknownSession`, which the handler turns into `unknown_session`.
+	SettleAnswer(sessionID string, format audio.Format, audioPT, telephoneEventPT uint8) (rtp.Descriptor, error)
 
 	// Tap joins a supervisor to a conversation on asymmetric terms, and Untap takes it down. Rung 6.
 	Tap(opts rtp.TapOptions) (rtp.TapResult, error)
@@ -250,6 +266,8 @@ func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscrip
 		{SubjectUntapSession, s.HandleUntapSession},
 		{SubjectMuteSession, s.HandleMuteSession},
 		{SubjectHoldSession, s.HandleHoldSession},
+		{SubjectCreateOffer, s.HandleCreateOffer},
+		{SubjectAcceptAnswer, s.HandleAcceptAnswer},
 	}
 
 	subscriptions := make([]*nats.Subscription, 0, len(handlers))

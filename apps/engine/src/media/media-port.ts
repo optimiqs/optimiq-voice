@@ -46,6 +46,20 @@ export interface PlayRequest {
 }
 
 /**
+ * Where a `sipd`-driven originate should place its INVITE, in the domain's own vocabulary.
+ *
+ * Mirrors `sipDialTargetSchema` in `@optimiq-voice/events` exactly — a tagged object rather than a
+ * discriminated union so it survives the Go border, the same shape the wire carries. It exists
+ * because a template like `PJSIP/{trunk}` hides everything that makes a trunk dialable (its proxy,
+ * credentials and transport), per `plans/sipd-invite-design.md` §5.1: `endpoint` stays for the ARI
+ * adapter, and this rides alongside it for the composite.
+ */
+export type DialTarget =
+	| { readonly kind: "aor"; readonly aor: string }
+	| { readonly kind: "trunk"; readonly trunkId: string; readonly number: string }
+	| { readonly kind: "uri"; readonly uri: string };
+
+/**
  * A leg the engine asks the media server to create.
  *
  * `channelId` is CLIENT-assigned and required, not optional: the plan walker has to be able to
@@ -67,6 +81,15 @@ export interface OriginateRequest {
 	readonly originatorChannelId?: string;
 	/** Variables set BEFORE the leg is dialled — the export seam onto the B-leg. */
 	readonly variables?: Readonly<Record<string, string>>;
+	/**
+	 * Where to dial, in the domain's vocabulary — the `sipd` composite's input.
+	 *
+	 * ADDITIVE and optional, per `plans/sipd-invite-design.md` §5.1. The composite reads it and
+	 * refuses `bad_request` when it is absent; `AriMediaAdapter` and `MediadMediaPort` ignore it and
+	 * dial {@link endpoint}, so adding it breaks neither. `endpoint` is a media-server template string
+	 * that hides a trunk's proxy and credentials; this carries them structurally instead.
+	 */
+	readonly target?: DialTarget;
 }
 
 export interface OriginatedChannel {

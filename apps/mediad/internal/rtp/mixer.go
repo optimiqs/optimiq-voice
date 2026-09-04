@@ -210,8 +210,8 @@ func (m *Member) JitterStats() JitterStats { return m.jitter.Stats() }
 // they cross a bridge — see Conference.forwardEvent — so a participant pressing a feature code in a
 // room is still heard by the room, and by the engine's own detector, which ran before this.
 func (m *Member) receive(packet *pionrtp.Packet, now time.Time) {
-	if m.session.telephoneEventPayloadType != 0 &&
-		packet.PayloadType == m.session.telephoneEventPayloadType {
+	if tePT := m.session.TelephoneEventPayloadType(); tePT != 0 &&
+		packet.PayloadType == tePT {
 		m.conference.forwardEvent(m, packet)
 		return
 	}
@@ -272,15 +272,16 @@ func (c *Conference) join(session *Session, opts JoinOptions) (*Member, error) {
 	// The codecs are built BEFORE the lock and before anything is mutated, because this is the one
 	// step that can refuse: a leg whose codec cannot be decoded cannot be in a mix at all, and
 	// discovering that after seating it would mean a member in the room contributing nothing.
-	decoder, err := audio.NewFrameDecoder(session.format)
+	format := session.Format()
+	decoder, err := audio.NewFrameDecoder(format)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s cannot be decoded for a mix: %w",
-			ErrConferenceCodec, session.format, err)
+			ErrConferenceCodec, format, err)
 	}
-	encoder, err := audio.NewFrameEncoder(session.format)
+	encoder, err := audio.NewFrameEncoder(format)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s cannot be encoded from a mix: %w",
-			ErrConferenceCodec, session.format, err)
+			ErrConferenceCodec, format, err)
 	}
 
 	member := &Member{
@@ -375,7 +376,7 @@ func (c *Conference) forwardEvent(from *Member, packet *pionrtp.Packet) {
 	c.mu.Unlock()
 
 	for _, target := range targets {
-		target.session.forward(packet, from.session.telephoneEventPayloadType)
+		target.session.forward(packet, from.session.TelephoneEventPayloadType())
 	}
 }
 
@@ -559,7 +560,7 @@ func (s *Session) sendMixFrame(payload []byte, marker bool) {
 	out := pionrtp.Packet{
 		Header: pionrtp.Header{
 			Version:        2,
-			PayloadType:    s.audioPayloadType,
+			PayloadType:    s.AudioPayloadType(),
 			SequenceNumber: s.nextSequence(),
 			Timestamp:      s.nextPlaybackTimestamp(),
 			SSRC:           s.SSRC,

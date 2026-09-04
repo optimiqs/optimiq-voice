@@ -37,6 +37,8 @@ const (
 	SubjectSipReinviteRPC           = "rpc.sip.v1.reinvite"
 	SubjectSipOriginateRPC          = "rpc.sip.v1.originate"
 	SubjectMediaAllocateSessionRPC  = "rpc.media.v1.allocate-session"
+	SubjectMediaCreateOfferRPC      = "rpc.media.v1.create-offer"
+	SubjectMediaAcceptAnswerRPC     = "rpc.media.v1.accept-answer"
 	SubjectMediaBridgeSessionsRPC   = "rpc.media.v1.bridge-sessions"
 	SubjectMediaUnbridgeSessionsRPC = "rpc.media.v1.unbridge-sessions"
 	SubjectMediaReleaseSessionRPC   = "rpc.media.v1.release-session"
@@ -72,6 +74,8 @@ const (
 	TimeoutSipReinviteRPC           = 1000 * time.Millisecond
 	TimeoutSipOriginateRPC          = 1000 * time.Millisecond
 	TimeoutMediaAllocateSessionRPC  = 500 * time.Millisecond
+	TimeoutMediaCreateOfferRPC      = 500 * time.Millisecond
+	TimeoutMediaAcceptAnswerRPC     = 500 * time.Millisecond
 	TimeoutMediaBridgeSessionsRPC   = 500 * time.Millisecond
 	TimeoutMediaUnbridgeSessionsRPC = 500 * time.Millisecond
 	TimeoutMediaReleaseSessionRPC   = 500 * time.Millisecond
@@ -1252,6 +1256,175 @@ func (v MediaAllocateSessionResponseReason) Valid() bool {
 }
 
 func (v MediaAllocateSessionResponseReason) String() string { return string(v) }
+
+// MediaCreateOfferRequest is the request body of rpc.media.v1.create-offer.
+type MediaCreateOfferRequest struct {
+	SessionID string                           `json:"sessionId"`
+	OrgID     string                           `json:"orgId"`
+	CallID    string                           `json:"callId"`
+	LegID     *string                          `json:"legId,omitempty"`
+	Direction MediaCreateOfferRequestDirection `json:"direction"`
+}
+
+// MediaCreateOfferRequestDirection is the closed vocabulary of MediaCreateOfferRequest.direction.
+type MediaCreateOfferRequestDirection string
+
+const (
+	MediaCreateOfferRequestDirectionSendrecv MediaCreateOfferRequestDirection = "sendrecv"
+	MediaCreateOfferRequestDirectionSendonly MediaCreateOfferRequestDirection = "sendonly"
+	MediaCreateOfferRequestDirectionRecvonly MediaCreateOfferRequestDirection = "recvonly"
+	MediaCreateOfferRequestDirectionInactive MediaCreateOfferRequestDirection = "inactive"
+)
+
+// MediaCreateOfferRequestDirectionValues lists every member of the vocabulary, in contract order.
+var MediaCreateOfferRequestDirectionValues = []MediaCreateOfferRequestDirection{
+	MediaCreateOfferRequestDirectionSendrecv,
+	MediaCreateOfferRequestDirectionSendonly,
+	MediaCreateOfferRequestDirectionRecvonly,
+	MediaCreateOfferRequestDirectionInactive,
+}
+
+// Valid reports whether v is a member of the MediaCreateOfferRequestDirection vocabulary.
+func (v MediaCreateOfferRequestDirection) Valid() bool {
+	for _, candidate := range MediaCreateOfferRequestDirectionValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaCreateOfferRequestDirection) String() string { return string(v) }
+
+// MediaCreateOfferResponse is the reply body of rpc.media.v1.create-offer.
+type MediaCreateOfferResponse struct {
+	Ok                        bool                            `json:"ok"`
+	SessionID                 string                          `json:"sessionId"`
+	SDPOffer                  *string                         `json:"sdpOffer,omitempty"`
+	InstanceID                *string                         `json:"instanceId,omitempty"`
+	Address                   *string                         `json:"address,omitempty"`
+	RtpPort                   *int                            `json:"rtpPort,omitempty"`
+	RtcpPort                  *int                            `json:"rtcpPort,omitempty"`
+	Ssrc                      *int                            `json:"ssrc,omitempty"`
+	TelephoneEventPayloadType *int                            `json:"telephoneEventPayloadType,omitempty"`
+	Reason                    *MediaCreateOfferResponseReason `json:"reason,omitempty"`
+	Error                     *string                         `json:"error,omitempty"`
+}
+
+// MediaCreateOfferResponseReason is the closed vocabulary of MediaCreateOfferResponse.reason.
+type MediaCreateOfferResponseReason string
+
+const (
+	MediaCreateOfferResponseReasonBadRequest     MediaCreateOfferResponseReason = "bad_request"
+	MediaCreateOfferResponseReasonCapacity       MediaCreateOfferResponseReason = "capacity"
+	MediaCreateOfferResponseReasonShuttingDown   MediaCreateOfferResponseReason = "shutting_down"
+	MediaCreateOfferResponseReasonUnknownSession MediaCreateOfferResponseReason = "unknown_session"
+	MediaCreateOfferResponseReasonWrongInstance  MediaCreateOfferResponseReason = "wrong_instance"
+	MediaCreateOfferResponseReasonNotSupported   MediaCreateOfferResponseReason = "not_supported"
+	MediaCreateOfferResponseReasonInternal       MediaCreateOfferResponseReason = "internal"
+)
+
+// MediaCreateOfferResponseReasonValues lists every member of the vocabulary, in contract order.
+var MediaCreateOfferResponseReasonValues = []MediaCreateOfferResponseReason{
+	MediaCreateOfferResponseReasonBadRequest,
+	MediaCreateOfferResponseReasonCapacity,
+	MediaCreateOfferResponseReasonShuttingDown,
+	MediaCreateOfferResponseReasonUnknownSession,
+	MediaCreateOfferResponseReasonWrongInstance,
+	MediaCreateOfferResponseReasonNotSupported,
+	MediaCreateOfferResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the MediaCreateOfferResponseReason vocabulary.
+func (v MediaCreateOfferResponseReason) Valid() bool {
+	for _, candidate := range MediaCreateOfferResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaCreateOfferResponseReason) String() string { return string(v) }
+
+// MediaAcceptAnswerRequest is the request body of rpc.media.v1.accept-answer.
+type MediaAcceptAnswerRequest struct {
+	SessionID string `json:"sessionId"`
+	SDPAnswer string `json:"sdpAnswer"`
+}
+
+// MediaAcceptAnswerResponse is the reply body of rpc.media.v1.accept-answer.
+type MediaAcceptAnswerResponse struct {
+	Ok                        bool                             `json:"ok"`
+	SessionID                 string                           `json:"sessionId"`
+	Codec                     *MediaAcceptAnswerResponseCodec  `json:"codec,omitempty"`
+	TelephoneEventPayloadType *int                             `json:"telephoneEventPayloadType,omitempty"`
+	InstanceID                *string                          `json:"instanceId,omitempty"`
+	Reason                    *MediaAcceptAnswerResponseReason `json:"reason,omitempty"`
+	Error                     *string                          `json:"error,omitempty"`
+}
+
+// MediaAcceptAnswerResponseCodec is the closed vocabulary of MediaAcceptAnswerResponse.codec.
+type MediaAcceptAnswerResponseCodec string
+
+const (
+	MediaAcceptAnswerResponseCodecPcmu MediaAcceptAnswerResponseCodec = "PCMU"
+	MediaAcceptAnswerResponseCodecPcma MediaAcceptAnswerResponseCodec = "PCMA"
+)
+
+// MediaAcceptAnswerResponseCodecValues lists every member of the vocabulary, in contract order.
+var MediaAcceptAnswerResponseCodecValues = []MediaAcceptAnswerResponseCodec{
+	MediaAcceptAnswerResponseCodecPcmu,
+	MediaAcceptAnswerResponseCodecPcma,
+}
+
+// Valid reports whether v is a member of the MediaAcceptAnswerResponseCodec vocabulary.
+func (v MediaAcceptAnswerResponseCodec) Valid() bool {
+	for _, candidate := range MediaAcceptAnswerResponseCodecValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaAcceptAnswerResponseCodec) String() string { return string(v) }
+
+// MediaAcceptAnswerResponseReason is the closed vocabulary of MediaAcceptAnswerResponse.reason.
+type MediaAcceptAnswerResponseReason string
+
+const (
+	MediaAcceptAnswerResponseReasonBadRequest     MediaAcceptAnswerResponseReason = "bad_request"
+	MediaAcceptAnswerResponseReasonCapacity       MediaAcceptAnswerResponseReason = "capacity"
+	MediaAcceptAnswerResponseReasonShuttingDown   MediaAcceptAnswerResponseReason = "shutting_down"
+	MediaAcceptAnswerResponseReasonUnknownSession MediaAcceptAnswerResponseReason = "unknown_session"
+	MediaAcceptAnswerResponseReasonWrongInstance  MediaAcceptAnswerResponseReason = "wrong_instance"
+	MediaAcceptAnswerResponseReasonNotSupported   MediaAcceptAnswerResponseReason = "not_supported"
+	MediaAcceptAnswerResponseReasonInternal       MediaAcceptAnswerResponseReason = "internal"
+)
+
+// MediaAcceptAnswerResponseReasonValues lists every member of the vocabulary, in contract order.
+var MediaAcceptAnswerResponseReasonValues = []MediaAcceptAnswerResponseReason{
+	MediaAcceptAnswerResponseReasonBadRequest,
+	MediaAcceptAnswerResponseReasonCapacity,
+	MediaAcceptAnswerResponseReasonShuttingDown,
+	MediaAcceptAnswerResponseReasonUnknownSession,
+	MediaAcceptAnswerResponseReasonWrongInstance,
+	MediaAcceptAnswerResponseReasonNotSupported,
+	MediaAcceptAnswerResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the MediaAcceptAnswerResponseReason vocabulary.
+func (v MediaAcceptAnswerResponseReason) Valid() bool {
+	for _, candidate := range MediaAcceptAnswerResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaAcceptAnswerResponseReason) String() string { return string(v) }
 
 // MediaBridgeSessionsRequest is the request body of rpc.media.v1.bridge-sessions.
 type MediaBridgeSessionsRequest struct {

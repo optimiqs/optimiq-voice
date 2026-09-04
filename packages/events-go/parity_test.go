@@ -197,6 +197,8 @@ func TestParityConstants(t *testing.T) {
 		"sipReinvite":             SubjectSipReinviteRPC,
 		"sipOriginate":            SubjectSipOriginateRPC,
 		"mediaAllocateSession":    SubjectMediaAllocateSessionRPC,
+		"mediaCreateOffer":        SubjectMediaCreateOfferRPC,
+		"mediaAcceptAnswer":       SubjectMediaAcceptAnswerRPC,
 		"mediaBridgeSessions":     SubjectMediaBridgeSessionsRPC,
 		"mediaUnbridgeSessions":   SubjectMediaUnbridgeSessionsRPC,
 		"mediaReleaseSession":     SubjectMediaReleaseSessionRPC,
