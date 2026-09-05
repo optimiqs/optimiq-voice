@@ -976,6 +976,19 @@ export interface RoutingSettingsInput {
 	/** Fallback IANA zone for a time condition that does not carry one. */
 	readonly defaultTimezone?: string;
 	/**
+	 * The organization's SIP realm — the domain its handsets register under and the one an extension
+	 * B-leg is dialled at on the `apps/sipd` plane (`sip:{number}@{realm}`, design §5.1).
+	 *
+	 * It rides `settings` for the same mechanical reason `maxConcurrentCalls` does: it is a per-org
+	 * fact the engine reads out of the compiled artifact, and the artifact is the ONLY per-org surface
+	 * the engine reads — it holds no database handle. Absent (or `null`) means the tenant has set no
+	 * realm, in which case the engine falls back to its fleet-wide `ENGINE_SIP_REALM` and, failing
+	 * that, the extension B-leg carries no target and the composite refuses `originate` by name. It
+	 * lives in `org_setting` under `category='sip'`, `name='realm'` — the same row the provisioning
+	 * softphone path and sipd's realm→org mapping already read — not under the `routing` category.
+	 */
+	readonly realm?: string | null;
+	/**
 	 * Dial prefix that sends a call straight to a mailbox's greeting, e.g. `*99` + extension.
 	 * Set to `null` to disable the internal voicemail-prefix table entirely.
 	 */

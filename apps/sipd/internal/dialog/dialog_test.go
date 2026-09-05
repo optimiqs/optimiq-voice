@@ -1,6 +1,7 @@
 package dialog
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 	"time"
@@ -195,6 +196,27 @@ func TestUACHangupThatLosesToTheTwoHundredBecomesAckThenBye(t *testing.T) {
 	assertKinds(t, outcome, EffectSendAck, EffectPublish, EffectSendBye)
 	if outcome.Effects[1].Event != EventAnswered {
 		t.Errorf("published %q, want %q", outcome.Effects[1].Event, EventAnswered)
+	}
+}
+
+// A UAC 2xx carries the callee's negotiated answer to the offer mediad wrote, and the answered
+// event MUST carry it too: the engine feeds it to `rpc.media.v1.accept-answer` so mediad settles the
+// B-leg codec before the walk bridges the legs. An answered event with an empty body is a call that
+// says "up" and then bridges a leg whose codec mediad never committed — audio to nowhere.
+func TestUACAnsweredEventCarriesTheNegotiatedSDP(t *testing.T) {
+	d := newTestDialog(t, RoleUAC)
+	apply(t, d, Input{Trigger: TriggerRemoteProvisional})
+
+	answer := []byte("v=0\r\no=- 1 1 IN IP4 203.0.113.9\r\nm=audio 40000 RTP/AVP 0\r\n")
+	outcome := apply(t, d, Input{Trigger: TriggerRemoteAnswer, RemoteTag: "far", Body: answer})
+
+	assertKinds(t, outcome, EffectSendAck, EffectPublish)
+	published := outcome.Effects[1]
+	if published.Event != EventAnswered {
+		t.Fatalf("published %q, want %q", published.Event, EventAnswered)
+	}
+	if !bytes.Equal(published.Body, answer) {
+		t.Errorf("answered body = %q, want the 2xx's answer %q", published.Body, answer)
 	}
 }
 

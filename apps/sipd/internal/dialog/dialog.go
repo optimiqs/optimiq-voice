@@ -553,7 +553,14 @@ func (d *Dialog) remoteAnswerEffects(in Input, from State, at time.Time) []Effec
 		{Kind: EffectSendAck, Body: d.offer.ackBody()},
 		// For a UAC the call is up at the 2xx, not at the ACK (design §3.3): the far end has
 		// committed and the media is already flowing towards us.
-		{Kind: EffectPublish, Event: EventAnswered},
+		//
+		// The 2xx's answer rides the event as its Body. It is the negotiated SDP the far end chose from
+		// the offer mediad wrote, and the engine must feed it to `rpc.media.v1.accept-answer` so mediad
+		// settles the B-leg codec — without it the answered event says "up" but mediad never learns
+		// which codec won and the B-leg cannot be bridged. `committedAnswer` is the same bytes line 550
+		// committed, so the ACK's answer and the published one cannot disagree. Empty on a UAS leg,
+		// where the answered event is the ACK and carries no body — `optional()` drops it there.
+		{Kind: EffectPublish, Event: EventAnswered, Body: d.offer.committedAnswer()},
 	}
 	if d.timer.Negotiated() {
 		effects = append(effects, Effect{Kind: EffectStartSessionTimer})

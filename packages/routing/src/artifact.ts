@@ -393,6 +393,18 @@ export interface CompiledRoutingSettings {
 	readonly outboundCallerIdNumber?: string;
 	readonly outboundCallerIdName?: string;
 	/**
+	 * The organization's SIP realm, baked in so the engine can build an extension `{kind:"aor"}`
+	 * dial target (`sip:{number}@{realm}`) on the `apps/sipd` plane without a database handle it does
+	 * not have.
+	 *
+	 * Absent means the tenant configured no realm — every artifact compiled before this field existed
+	 * carries it absent, so an old reader ignores it and behaves exactly as it did, which is why this
+	 * is NOT an artifact-version bump (the same argument {@link maxConcurrentCalls} makes). The engine
+	 * falls back to its fleet-wide `ENGINE_SIP_REALM` when it is absent, and refuses the B-leg
+	 * `originate` by name when neither is set, rather than dialling a URI it cannot resolve.
+	 */
+	readonly realm?: string;
+	/**
 	 * The organization's simultaneous-call ceiling, enforced by the engine at ADMISSION.
 	 *
 	 * Absent means unlimited, and absent is what every artifact compiled before this field existed

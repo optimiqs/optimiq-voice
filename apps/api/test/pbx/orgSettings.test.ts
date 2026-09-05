@@ -24,7 +24,11 @@ import {
 	updateOrgSettingDto,
 } from "../../src/pbx/org-settings/org-settings.dto";
 import { ORG_SETTING_RESOURCE } from "../../src/pbx/org-settings/org-settings.resource";
-import { ROUTING_SETTINGS_CATEGORY } from "../../src/pbx/routing/snapshot-loader";
+import {
+	readRoutingSettings,
+	resolveSipRealm,
+	ROUTING_SETTINGS_CATEGORY,
+} from "../../src/pbx/routing/snapshot-loader";
 import { parseDto } from "../../src/pbx/shared/dto";
 
 /**
@@ -472,5 +476,41 @@ describe("the org-setting resource declaration", () => {
 
 	it("declares no secret columns, because a setting has none", () => {
 		expect(ORG_SETTING_RESOURCE.secretColumns).to.equal(undefined);
+	});
+});
+
+/**
+ * The SIP realm projection into the compiled snapshot.
+ *
+ * The realm lives under `category='sip'`, `name='realm'` — not the `routing` category the other
+ * settings read — and it is fetched on its own statement so a `sip` row and a `routing` row cannot
+ * collide in one map. It rides `settings` so the engine can dial `sip:{number}@{realm}` off the
+ * artifact without a database handle it does not have.
+ */
+describe("the SIP realm in the routing snapshot", () => {
+	it("resolves the first enabled non-blank realm row", () => {
+		expect(resolveSipRealm([{ value: "pbx.acme.example", enabled: true }])).to.equal(
+			"pbx.acme.example",
+		);
+	});
+
+	it("trims the realm, since it becomes the host half of a dial URI", () => {
+		expect(resolveSipRealm([{ value: "  pbx.acme.example  ", enabled: true }])).to.equal(
+			"pbx.acme.example",
+		);
+	});
+
+	it("treats a disabled, blank, or non-string row as absent", () => {
+		expect(resolveSipRealm([{ value: "pbx.acme.example", enabled: false }])).to.equal(undefined);
+		expect(resolveSipRealm([{ value: "   ", enabled: true }])).to.equal(undefined);
+		expect(resolveSipRealm([{ value: 42, enabled: true }])).to.equal(undefined);
+		expect(resolveSipRealm([])).to.equal(undefined);
+	});
+
+	it("projects a resolved realm onto RoutingSettingsInput, and omits the key when absent", () => {
+		expect(readRoutingSettings([], undefined, "pbx.acme.example").realm).to.equal(
+			"pbx.acme.example",
+		);
+		expect(Object.hasOwn(readRoutingSettings([], undefined, undefined), "realm")).to.equal(false);
 	});
 });

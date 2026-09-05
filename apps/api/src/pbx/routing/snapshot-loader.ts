@@ -1,4 +1,5 @@
 import {
+	and,
 	audioStream,
 	callBlockRule,
 	callFlow,
@@ -143,6 +144,7 @@ export async function loadOrgRoutingSnapshot(
 		directories,
 		speedDials,
 		limitRows,
+		sipRealmRows,
 	] = await Promise.all([
 		transaction.select().from(extension),
 		transaction.select().from(phoneNumber),
@@ -188,11 +190,20 @@ export async function loadOrgRoutingSnapshot(
 		// `RoutingSettingsInput.maxConcurrentCalls` gives: `canonicalizeSnapshot` hashes `settings`
 		// on an explicit line and a new top-level field would be silently outside the hash.
 		transaction.select().from(orgLimit),
+		// The SIP realm lives under `category='sip'`, `name='realm'` — NOT the `routing` category the
+		// row above reads — so it is fetched on its own statement rather than folded into that filter,
+		// where a `sip` row and a `routing` row sharing a name would collide in one `byName` map. It is
+		// the same row `sip-credentials.service.ts` maps a realm back to an org with, read here so the
+		// engine can dial `sip:{number}@{realm}` off the artifact without a database handle it lacks.
+		transaction
+			.select({ value: orgSetting.value, enabled: orgSetting.enabled })
+			.from(orgSetting)
+			.where(and(eq(orgSetting.category, "sip"), eq(orgSetting.name, "realm"))),
 	]);
 
 	return {
 		organizationId,
-		settings: readRoutingSettings(settingRows, limitRows[0]),
+		settings: readRoutingSettings(settingRows, limitRows[0], resolveSipRealm(sipRealmRows)),
 		extensions: extensions.map((row) => ({
 			id: row.id,
 			enabled: row.enabled,
@@ -750,9 +761,31 @@ interface LimitRow {
  * person to tell. Compiling them would put a number in the artifact that nothing reads, which is
  * the trap running in the other direction.
  */
+/**
+ * The organization's SIP realm from its `category='sip'`, `name='realm'` setting, or `undefined`.
+ *
+ * A disabled row is treated as absent, exactly as the settings cascade means `enabled`, and the same
+ * reading `resolveRealm` in `softphone.service.ts` gives the same row. A blank string is `undefined`
+ * too: an empty realm would compile `sip:{number}@`, a hostless URI the edge cannot dial.
+ */
+export function resolveSipRealm(
+	rows: readonly { value: unknown; enabled: boolean }[],
+): string | undefined {
+	for (const row of rows) {
+		if (!row.enabled) {
+			continue;
+		}
+		if (typeof row.value === "string" && row.value.trim().length > 0) {
+			return row.value.trim();
+		}
+	}
+	return undefined;
+}
+
 export function readRoutingSettings(
 	rows: readonly SettingRow[],
 	limits?: LimitRow,
+	realm?: string,
 ): RoutingSettingsInput {
 	const byName = new Map(rows.filter((row) => row.enabled).map((row) => [row.name, row.value]));
 
@@ -812,5 +845,8 @@ export function readRoutingSettings(
 		...(limits?.maxConcurrentCalls === undefined || limits.maxConcurrentCalls === null
 			? {}
 			: { maxConcurrentCalls: limits.maxConcurrentCalls }),
+		// Absent when the tenant set no realm, which keeps the canonical snapshot byte-identical to what
+		// it was before this row was loaded — the same no-op property `maxConcurrentCalls` relies on.
+		...(realm === undefined ? {} : { realm }),
 	};
 }

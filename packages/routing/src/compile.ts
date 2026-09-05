@@ -510,6 +510,10 @@ class Compiler {
 			outboundEnabled: input.outboundEnabled ?? true,
 			outboundCallerIdNumber: input.outboundCallerIdNumber ?? undefined,
 			outboundCallerIdName: input.outboundCallerIdName ?? undefined,
+			// A per-org fact the engine cannot read any other way — it has no database handle, so the
+			// artifact is where the realm has to be. Empty/whitespace collapses to absent, and absent is
+			// what every tenant with no realm set carries, keeping their snapshot byte-identical.
+			realm: normaliseRealm(input.realm),
 			maxConcurrentCalls: this.concurrentCallCeiling(input.maxConcurrentCalls),
 		}) as CompiledRoutingSettings;
 	}
@@ -4206,6 +4210,23 @@ function wholeSeconds(value: number | undefined): number {
 
 function greetingKey(voicemailBoxId: string, kind: VoicemailGreetingKind): string {
 	return `${voicemailBoxId}:${kind}`;
+}
+
+/**
+ * The organization's SIP realm as the artifact carries it, or `undefined` when it has none.
+ *
+ * Trimmed, and a blank or `null` becomes ABSENT rather than a realm named `""`. The distinction is
+ * load-bearing: absent means "this tenant set no realm, use the fleet default", and a realm of `""`
+ * would compile `sip:{number}@` — a URI with no host, which the edge cannot resolve and which is a
+ * worse failure than dialling nothing. Not lower-cased: a realm is a host and the administrator who
+ * typed it chose its case. `compact` drops the key when this returns `undefined`.
+ */
+function normaliseRealm(value: string | null | undefined): string | undefined {
+	if (value === null || value === undefined) {
+		return undefined;
+	}
+	const trimmed = value.trim();
+	return trimmed.length === 0 ? undefined : trimmed;
 }
 
 /**

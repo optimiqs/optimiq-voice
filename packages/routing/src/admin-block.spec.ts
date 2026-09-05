@@ -825,3 +825,45 @@ describe("the concurrent-call ceiling", () => {
 		expect(withCeiling(10).snapshotHash).not.toBe(withCeiling(20).snapshotHash);
 	});
 });
+
+/**
+ * The SIP realm, baked into the artifact because it is the ONLY per-org surface the engine reads —
+ * the engine holds no database handle, so `sip:{number}@{realm}` for an extension B-leg on the
+ * `apps/sipd` plane has to travel here. An absent realm is byte-identical to what a tenant compiled
+ * before this field existed, which is why adding it was not an artifact-version bump.
+ */
+describe("the SIP realm", () => {
+	function withRealm(realm: string | null | undefined) {
+		return compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				...(realm === undefined ? {} : { settings: { realm } }),
+			}),
+		);
+	}
+
+	it("compiles a realm onto the artifact's settings", () => {
+		expect(withRealm("pbx.acme.example").settings.realm).toBe("pbx.acme.example");
+	});
+
+	it("trims a realm, since it becomes the host half of a dial URI", () => {
+		expect(withRealm("  pbx.acme.example  ").settings.realm).toBe("pbx.acme.example");
+	});
+
+	/**
+	 * Absent, null and blank all collapse to an absent KEY — never a realm of `""`, which would compile
+	 * `sip:{number}@`, a hostless URI the edge cannot dial. Absent is what a tenant with no realm set
+	 * carries, and it keeps their snapshot byte-identical to what it was before this field existed.
+	 */
+	it("omits the key for a tenant with no realm", () => {
+		for (const value of [undefined, null, "", "   "] as const) {
+			const settings = withRealm(value).settings;
+			expect(Object.hasOwn(settings, "realm"), String(value)).toBe(false);
+		}
+	});
+
+	/** It rides `settings`, so a changed realm moves the snapshot hash and reaches a running engine. */
+	it("moves the snapshot hash when the realm changes", () => {
+		expect(withRealm("a.example").snapshotHash).not.toBe(withRealm("b.example").snapshotHash);
+	});
+});

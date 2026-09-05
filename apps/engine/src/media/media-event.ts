@@ -105,6 +105,19 @@ export interface MediaCallStateChangedEvent {
 	readonly type: "call-state-changed";
 	readonly channelId: string;
 	readonly callState: CallState;
+	/**
+	 * The negotiated SDP answer, present ONLY on the moment a leg the engine ORIGINATED went `active`
+	 * on the `apps/sipd` plane — a callee's `200 OK` carrying its answer to the offer `mediad` wrote.
+	 *
+	 * It is an optional field on an existing member rather than a union member of its own, deliberately:
+	 * `sipd-event-mapping.ts` says the union is not extended for this plane, and a whole new member
+	 * nobody but the outbound-answer settle would branch on is exactly the shape that file refuses. The
+	 * orchestrator feeds it to `SplitPlaneMediaPort.settleOutboundAnswer` so `mediad` commits the B-leg
+	 * codec before the walk bridges the two legs (`plans/sipd-invite-design.md` §7.4 step 5). Absent
+	 * everywhere else — an A-leg's `active` (the ACK carries nothing new), a `ringing`, and every ARI
+	 * or `mediad`-mapped state change — where there is no B-leg answer to settle.
+	 */
+	readonly sdpAnswer?: string;
 }
 
 /** One digit the party pressed. `durationMs` is how long the tone lasted. */

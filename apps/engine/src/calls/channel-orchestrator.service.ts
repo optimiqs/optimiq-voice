@@ -635,7 +635,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				await this.onLegArrived(event.channel);
 				return;
 			case "call-state-changed":
-				await this.onCallStateChanged(event.channelId, event.callState);
+				await this.onCallStateChanged(event.channelId, event.callState, event.sdpAnswer);
 				return;
 			case "dtmf-received":
 				await this.onDtmf(event.channelId, event.digit, event.durationMs);
@@ -1049,7 +1049,10 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			"resolved a route",
 		);
 
-		const walker = this.walkerFor(aggregate);
+		const walker = this.walkerFor(
+			aggregate,
+			artifact.settings.realm === undefined ? {} : { realm: artifact.settings.realm },
+		);
 
 		const outcome = await walker.walk({
 			plan: route.plan,
@@ -1098,7 +1101,17 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	 */
 	private walkerFor(
 		aggregate: ChannelAggregate,
-		extra: { readonly beforeBridge?: (bridgeId: string) => Promise<void> } = {},
+		extra: {
+			readonly beforeBridge?: (bridgeId: string) => Promise<void>;
+			/**
+			 * The tenant's SIP realm from the compiled artifact (`CompiledRoutingSettings.realm`), when
+			 * the caller has the artifact in hand. Both callers do — a routing walk and a re-route each
+			 * read the org's artifact one line above — so the realm is passed rather than re-fetched. The
+			 * fleet-wide `ENGINE_SIP_REALM` is the fallback, applied here so the walker sees one resolved
+			 * value.
+			 */
+			readonly realm?: string;
+		} = {},
 	): PlanWalker {
 		return new PlanWalker({
 			media: this.media,
@@ -1106,7 +1119,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			channel: walkerChannelFor(aggregate),
 			execute: (verb) => this.execute(aggregate, verb),
 			publish: (type, data) => this.publishCallEvent(aggregate, type, data),
-			settings: this.walkerSettings(),
+			settings: this.walkerSettings(extra.realm ?? this.env.ENGINE_SIP_REALM),
 			peerLegId: legIdForAriChannel,
 			legs: this.legHooksFor(aggregate),
 			voicemail: this.voicemailPortFor(aggregate),
@@ -1732,10 +1745,10 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		// The walker's hook takes a bridge id it has no use for; the caller's takes none. Adapted here
 		// rather than widening the caller's contract with an argument no call-control operation reads.
 		const beforeBridge = request.beforeBridge;
-		const outcome = await this.walkerFor(
-			aggregate,
-			beforeBridge === undefined ? {} : { beforeBridge: async () => await beforeBridge() },
-		).walk({
+		const outcome = await this.walkerFor(aggregate, {
+			...(beforeBridge === undefined ? {} : { beforeBridge: async () => await beforeBridge() }),
+			...(artifact.settings.realm === undefined ? {} : { realm: artifact.settings.realm }),
+		}).walk({
 			plan: resolved.plan as ExecutionPlan,
 			timeConditions: artifact.timeConditions,
 			now,
@@ -2182,11 +2195,19 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	}
 
 	/** The walker's deployment knobs, assembled from the engine's environment. */
-	private walkerSettings(): Partial<PlanWalkerSettings> {
+	/**
+	 * @param realm the tenant's SIP realm — the per-org value from the compiled artifact, already
+	 *   resolved by {@link walkerFor} against the fleet-wide `ENGINE_SIP_REALM` fallback. Absent leaves
+	 *   {@link PlanWalkerSettings.sipRealm} undefined, which is exactly right on the Asterisk plane and
+	 *   makes the composite refuse an extension B-leg's `originate` by name on the `sipd` plane rather
+	 *   than dialling a hostless URI.
+	 */
+	private walkerSettings(realm?: string): Partial<PlanWalkerSettings> {
 		return {
 			application: this.env.ARI_APP,
 			extensionDialTemplate: this.env.ENGINE_EXTENSION_DIAL_TEMPLATE,
 			trunkDialTemplate: this.env.ENGINE_TRUNK_DIAL_TEMPLATE,
+			...(realm === undefined || realm === "" ? {} : { sipRealm: realm }),
 			defaultRingTimeoutSeconds: this.env.ENGINE_DEFAULT_RING_TIMEOUT_SECONDS,
 			progressTimeoutSeconds: this.env.ENGINE_PROGRESS_TIMEOUT_SECONDS,
 			recordingFormat: this.env.ENGINE_RECORDING_FORMAT,
@@ -2341,12 +2362,30 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	private async onCallStateChanged(
 		mediaChannelId: string,
 		nextCallState: CallState,
+		sdpAnswer?: string,
 	): Promise<void> {
 		const aggregate = this.registry.byAriChannelId(mediaChannelId);
 
 		if (aggregate === undefined) {
 			// Not one of this instance's A-legs. If a walk is waiting on it, it is a leg that walk
 			// originated and this is the answer it is waiting for.
+			//
+			// On the split plane a callee's `200 OK` carries the negotiated answer to the offer `mediad`
+			// wrote for this B-leg. It MUST be settled onto the media session before the walk is told the
+			// leg answered — the walk answers the A-leg and bridges the two the instant it hears this, and
+			// a bridge of a B-leg whose codec `mediad` never committed is a call that connects to silence.
+			// A refusal (the callee chose a codec `mediad` cannot serve) hangs the B-leg up by name and
+			// withholds the answer, so the walk fails it over rather than bridging a dead leg.
+			if (
+				nextCallState === "active" &&
+				sdpAnswer !== undefined &&
+				this.media instanceof SplitPlaneMediaPort
+			) {
+				const settled = await this.settleOutboundAnswer(mediaChannelId, sdpAnswer);
+				if (!settled) {
+					return;
+				}
+			}
 			this.emitLegProgress(mediaChannelId, nextCallState);
 			return;
 		}
@@ -2391,6 +2430,37 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		if (justAnswered && legSideOf(aggregate) === "a") {
 			await this.runAnsweredProgram(aggregate);
 		}
+	}
+
+	/**
+	 * Settles a B-leg's negotiated codec on `mediad` from the callee's answer, §5.2.
+	 *
+	 * The composite exposes `settleOutboundAnswer` for exactly this call — it is not a `MediaPort`
+	 * method, because the answer is not known when `originate` returns; it arrives later, on the
+	 * `dialog.answered` this handler is processing. The result is data, not a throw: an `ok` reply has
+	 * committed the codec, and a refusal is the callee answering with something `mediad` cannot serve
+	 * (G.729, say), which is a real destination failure and not an engine fault. That B-leg is hung up
+	 * with `INCOMPATIBLE_DESTINATION` (Q.850 88) — the cause the plan walker reads as a dial failure —
+	 * so the walk fails it over rather than bridging a leg whose media will never flow.
+	 *
+	 * @returns `true` when the codec settled and the leg may be reported answered; `false` when it was
+	 *   refused and the leg has been torn down.
+	 */
+	private async settleOutboundAnswer(channelId: string, sdpAnswer: string): Promise<boolean> {
+		const port = this.media;
+		if (!(port instanceof SplitPlaneMediaPort)) {
+			return true;
+		}
+		const reply = await port.settleOutboundAnswer(channelId, sdpAnswer);
+		if (reply.ok) {
+			return true;
+		}
+		this.logger.warn(
+			{ channelId, reason: reply.reason, detail: reply.error },
+			"mediad refused the B-leg answer (the callee chose a codec it cannot serve); hanging the leg up",
+		);
+		await port.hangup(channelId, "INCOMPATIBLE_DESTINATION");
+		return false;
 	}
 
 	private async onDtmf(mediaChannelId: string, digit: string, durationMs: number): Promise<void> {

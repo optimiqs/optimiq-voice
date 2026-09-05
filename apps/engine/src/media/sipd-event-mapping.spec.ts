@@ -36,11 +36,16 @@ function progressed(overrides: { status?: number; hasEarlyMedia?: boolean } = {}
 	} as SipDialogEventInput<"dialog.progressed">);
 }
 
-function answered() {
+function answered(overrides: { sdpAnswer?: string } = {}) {
 	return makeSipDialogEvent("dialog.answered", {
 		orgId: ORG,
 		source: "sipd",
-		data: { ...base(), identity: IDENTITY, setupMs: 4_200 },
+		data: {
+			...base(),
+			identity: IDENTITY,
+			setupMs: 4_200,
+			...(overrides.sdpAnswer === undefined ? {} : { sdpAnswer: overrides.sdpAnswer }),
+		},
 	} as SipDialogEventInput<"dialog.answered">);
 }
 
@@ -118,6 +123,19 @@ describe("translating a dialog event", () => {
 			type: "call-state-changed",
 			channelId: LEG,
 			callState: "active",
+		});
+	});
+
+	it("carries a UAC answer's SDP through so the orchestrator can settle the B-leg codec", () => {
+		// A UAC (originated B) leg's `2xx` carries the negotiated answer to the offer mediad wrote. It
+		// rides the `call-state-changed` event so the orchestrator can feed it to `settleOutboundAnswer`;
+		// without it the leg reports "active" and bridges to a codec mediad never committed.
+		const sdpAnswer = "v=0\r\no=- 1 1 IN IP4 203.0.113.9\r\nm=audio 40000 RTP/AVP 0\r\n";
+		expect(toMediaEventFromSipd(answered({ sdpAnswer }))).toEqual({
+			type: "call-state-changed",
+			channelId: LEG,
+			callState: "active",
+			sdpAnswer,
 		});
 	});
 

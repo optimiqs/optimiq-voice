@@ -185,6 +185,18 @@ const engineEnvObjectSchema = z.object({
 	/** How a trunk attempt becomes an endpoint. `{number}` and `{trunk}` are substituted. */
 	ENGINE_TRUNK_DIAL_TEMPLATE: z.string().min(1).default("PJSIP/{number}@{trunk}"),
 
+	/**
+	 * The FLEET-WIDE fallback SIP realm for an extension B-leg on the `apps/sipd` plane.
+	 *
+	 * The per-organization realm is the authority and reaches the engine through the compiled routing
+	 * artifact (`CompiledRoutingSettings.realm`); this is the default a tenant that set none falls back
+	 * to, the same role `PROVISION_SIP_SERVER` plays in the provisioning softphone path. When neither
+	 * is set, the extension `{kind:"aor"}` target is `undefined` and the composite refuses `originate`
+	 * by name rather than dialling `sip:{number}@` — a hostless URI. Empty on the Asterisk plane, where
+	 * `endpoint` alone dials and no realm is consulted.
+	 */
+	ENGINE_SIP_REALM: z.string().optional(),
+
 	/** Ring time used when neither the plan node nor the ring-group member specifies one. */
 	ENGINE_DEFAULT_RING_TIMEOUT_SECONDS: z.coerce.number().int().min(1).max(600).default(30),
 

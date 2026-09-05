@@ -141,7 +141,19 @@ export function toMediaEventFromSipd(envelope: SipDialogEventEnvelope): MediaEve
 		// Published on the ACK for a UAS leg and on the `2xx` for a UAC leg — the two moments the call
 		// is genuinely established in each direction. It is emphatically NOT the moment the `answer`
 		// command replied, which only means the 2xx reached the socket, and `billsec` counts from here.
-		return { type: "call-state-changed", channelId: envelope.data.legId, callState: "active" };
+		//
+		// The `sdpAnswer` is carried through when present — only a UAC (originated B) leg has one, from
+		// the `2xx` that answered the offer `mediad` wrote. The orchestrator feeds it to
+		// `settleOutboundAnswer` so `mediad` commits the negotiated codec on the B-leg before it is
+		// bridged; a UAS leg's ACK carries no body, so the field is absent and nothing is settled. This
+		// is the only value dropped by leaving it off, and dropping it is exactly the "answered but no
+		// audio" hole this wire closes.
+		return {
+			type: "call-state-changed",
+			channelId: envelope.data.legId,
+			callState: "active",
+			...(envelope.data.sdpAnswer === undefined ? {} : { sdpAnswer: envelope.data.sdpAnswer }),
+		};
 	}
 	if (envelope.type === "dialog.held") {
 		// The direction the far end asserted (`sendonly` vs `inactive`) is carried on the payload and
