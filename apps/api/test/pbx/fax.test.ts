@@ -431,6 +431,87 @@ describe("fax inbound consumer", () => {
 	});
 });
 
+// --------------------------------------------------------------------------------------------
+// Fax-to-email branding cascade
+// --------------------------------------------------------------------------------------------
+
+interface SentFaxMail {
+	readonly to: string;
+	readonly subject: string;
+	readonly text: string;
+	readonly html: string;
+}
+
+function makeFaxEmail(template: {
+	readonly productName?: string;
+	readonly subject?: string | null;
+	readonly bodyIntro?: string | null;
+	readonly throws?: boolean;
+}): { service: FaxEmailService; sent: SentFaxMail[] } {
+	const sent: SentFaxMail[] = [];
+	const mailer = {
+		appUrl: undefined,
+		sendRendered: async (to: string, rendered: { subject: string; text: string; html: string }) => {
+			sent.push({ to, subject: rendered.subject, text: rendered.text, html: rendered.html });
+			return { delivered: true, transport: "log" as const };
+		},
+	};
+	const templates = {
+		resolveComposition: async () => {
+			if (template.throws) {
+				throw new Error("cascade read failed");
+			}
+			return {
+				productName: template.productName ?? "Optimiq Voice",
+				override:
+					template.subject === undefined && template.bodyIntro === undefined
+						? null
+						: { subject: template.subject ?? null, bodyIntro: template.bodyIntro ?? null },
+			};
+		},
+	};
+	return {
+		service: new FaxEmailService(env(), mailer as never, templates as never),
+		sent,
+	};
+}
+
+const FAX_INPUT = {
+	organizationId: ORG,
+	messageId: FAX,
+	toAddress: "fax@acme.test",
+	fromNumber: "+13125559999",
+	toNumber: "+13125550000",
+	pages: 2,
+	receivedAt: new Date("2026-08-06T14:03:00.000Z"),
+	hasDocument: false,
+};
+
+describe("fax-to-email branding cascade", () => {
+	it("brands the message HTML with the resolved product name", async () => {
+		const { service, sent } = makeFaxEmail({ productName: "Acme Telecom" });
+		expect(await service.notify(FAX_INPUT)).to.equal(true);
+		expect(sent[0]?.html ?? "").to.contain("Acme Telecom");
+	});
+
+	it("applies a per-tenant subject and intro override", async () => {
+		const { service, sent } = makeFaxEmail({
+			productName: "Acme Telecom",
+			subject: "A fax arrived",
+			bodyIntro: "Your Acme fax is ready.",
+		});
+		await service.notify(FAX_INPUT);
+		expect(sent[0]?.subject).to.equal("A fax arrived");
+		expect(sent[0]?.text.startsWith("Your Acme fax is ready.")).to.equal(true);
+	});
+
+	it("falls back to the default branding when the cascade read fails, and still sends", async () => {
+		const { service, sent } = makeFaxEmail({ throws: true });
+		expect(await service.notify(FAX_INPUT)).to.equal(true);
+		expect(sent[0]?.html ?? "").to.contain("Optimiq Voice");
+	});
+});
+
 /** The SQL text of a drizzle `sql` statement, from its literal chunks — same reader the CDR tests use. */
 function renderSql(query: unknown): string {
 	const chunks = (query as { queryChunks?: readonly unknown[] }).queryChunks;

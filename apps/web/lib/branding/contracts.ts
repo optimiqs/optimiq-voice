@@ -10,10 +10,11 @@
  *   - Endpoints: `GET /api/v1/branding`, public `GET /api/v1/branding/by-host?host=`, `PATCH …`.
  *
  * Two things the backend's read shape decides, and this honours:
- *   - The logo is a `logoObjectKey` (object-storage key), NOT a URL. Resolving a key to a servable
- *     URL is a media concern the backend has not wired yet, so {@link brandLogoSrc} only renders a
- *     key that is already a usable `https:`/`data:` string and otherwise falls back to the initial.
- *     That is the one remaining seam on this surface.
+ *   - The logo is a `logoObjectKey` (object-storage key), NOT a URL. The backend serves the bytes
+ *     behind that key at the public, host-keyed `GET /api/v1/branding/logo?host=`, so {@link brandLogoSrc}
+ *     turns a bare key into that route (given the host it was resolved for). A value that is already a
+ *     usable `https:`/`data:` string is passed through unchanged, and an absent key falls back to the
+ *     initial.
  *   - `customDomain` is deliberately NOT in the resolved read (a host maps to exactly one org and is
  *     never inherited), so it is write-only here — see `schemas.ts`.
  *
@@ -92,15 +93,30 @@ export function toBranding(data: unknown): Branding {
 /**
  * The logo source a component can render, or `null` to fall back to the initial.
  *
- * The backend stores a `logoObjectKey`; turning an object key into a servable URL is a media-layer
- * concern that is not wired yet. So this renders a value that is ALREADY a usable `https:` URL or a
- * `data:` URI and returns `null` for a bare key — the honest behaviour until the object-key → URL
- * resolver exists, rather than rendering a broken image from a key no `<img>` can load.
+ * The backend stores a `logoObjectKey` and serves its bytes at the public, host-keyed
+ * `GET /api/v1/branding/logo?host=` route. So:
+ *   - a value that is ALREADY a usable `https:` URL or a `data:` URI is returned unchanged;
+ *   - a bare object key becomes the logo route for the `host` it was resolved by — the same host the
+ *     pre-auth `by-host` branding read used, threaded in so the route resolves the SAME tenant's row
+ *     server-side (a public caller never names an object, only its host);
+ *   - an absent key, or a bare key with no host to resolve it, returns `null` and the caller shows
+ *     the product initial.
+ *
+ * The route is same-origin — `next.config.mjs` rewrites `/api/*` to the API server — so a relative
+ * path is correct and needs no origin. A bare key with no host is not turned into a route, because
+ * the route would then have no tenant to resolve and would 404; the initial is the honest fallback.
  */
-export function brandLogoSrc(brand: Branding): string | null {
+export function brandLogoSrc(brand: Branding, host?: string | null): string | null {
 	const key = brand.logoObjectKey;
 	if (!key) {
 		return null;
 	}
-	return key.startsWith("https:") || key.startsWith("data:") ? key : null;
+	if (key.startsWith("https:") || key.startsWith("data:")) {
+		return key;
+	}
+	const trimmedHost = host?.trim();
+	if (!trimmedHost) {
+		return null;
+	}
+	return `/api/v1/branding/logo?host=${encodeURIComponent(trimmedHost)}`;
 }

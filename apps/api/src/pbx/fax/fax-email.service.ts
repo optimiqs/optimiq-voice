@@ -1,8 +1,11 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
+import { MailTemplateService } from "../../auth/mail-templates/mail-template.service";
 import { DEFAULT_MAIL_APP_NAME, faxReceivedMail, Mailer } from "../../mail";
+import { applyMailOverride } from "../../mail/mail-template-resolution";
 import { faxMediaPath, mintFaxMediaToken } from "./fax-media-token";
 import { FAX_ENV } from "./fax.tokens";
+import type { MailComposition } from "../../auth/mail-templates/mail-template.service";
 import type { FaxEnv } from "./fax-env";
 
 const logger = getLogger("api.pbx");
@@ -37,6 +40,7 @@ export class FaxEmailService {
 	constructor(
 		@Inject(FAX_ENV) private readonly env: FaxEnv,
 		@Inject(Mailer) private readonly mailer: Mailer,
+		@Inject(MailTemplateService) private readonly templates: MailTemplateService,
 	) {}
 
 	get stats(): { readonly sent: number; readonly skipped: number; readonly failed: number } {
@@ -55,15 +59,23 @@ export class FaxEmailService {
 				? this.mintDocumentUrl(input.organizationId, input.messageId)
 				: undefined;
 			const inboxUrl = this.mailer.appUrl === undefined ? undefined : `${this.mailer.appUrl}/faxes`;
-			const rendered = faxReceivedMail({
-				appName: DEFAULT_MAIL_APP_NAME,
-				toNumber: input.toNumber,
-				fromNumber: input.fromNumber,
-				pages: input.pages ?? undefined,
-				receivedAt: input.receivedAt,
-				documentUrl,
-				inboxUrl,
-			});
+			// The mail-template cascade, the same wire the voicemail consumer uses: the org's (or its
+			// reseller's) branding product name feeds the code template as its `appName`, and the
+			// resolved subject/intro override is applied to the result. Keyed by `fax-received` and the
+			// organization id this notification already holds.
+			const composition = await this.compose(input.organizationId);
+			const rendered = applyMailOverride(
+				faxReceivedMail({
+					appName: composition.productName,
+					toNumber: input.toNumber,
+					fromNumber: input.fromNumber,
+					pages: input.pages ?? undefined,
+					receivedAt: input.receivedAt,
+					documentUrl,
+					inboxUrl,
+				}),
+				composition.override,
+			);
 			const result = await this.mailer.sendRendered(to, rendered, {
 				// A stable per-message header, so a redelivery-driven duplicate can be threaded or
 				// suppressed rather than shown twice.
@@ -82,6 +94,27 @@ export class FaxEmailService {
 				"failed to send a fax-to-email notification",
 			);
 			return false;
+		}
+	}
+
+	/**
+	 * The branding product name and resolved template override for this organization's fax mail.
+	 *
+	 * Best-effort, exactly like the voicemail consumer's `compose`: a cascade read that fails must not
+	 * suppress a notification whose document is already durable, so a failure falls back to the code
+	 * default (`DEFAULT_MAIL_APP_NAME`, no override) — the message this consumer sent before the
+	 * cascade was wired. Language is `en`: fax mail carries no per-recipient locale, and the override
+	 * table keys on `(org, template, language)` with `en` as its own default.
+	 */
+	private async compose(organizationId: string): Promise<MailComposition> {
+		try {
+			return await this.templates.resolveComposition(organizationId, "fax-received", "en");
+		} catch (error) {
+			logger.warn(
+				{ organizationId, err: error },
+				"could not resolve the fax mail template; sending with the default branding",
+			);
+			return { productName: DEFAULT_MAIL_APP_NAME, override: null };
 		}
 	}
 

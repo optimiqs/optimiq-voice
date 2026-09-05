@@ -1,14 +1,17 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
 import { emergencyAddress, eq, extension } from "@optimiq-voice/pbx-db";
+import { MailTemplateService } from "../../auth/mail-templates/mail-template.service";
 import {
 	DEFAULT_MAIL_APP_NAME,
 	emergencyDialedMail,
 	formatDispatchableLocation,
 	Mailer,
 } from "../../mail";
+import { applyMailOverride } from "../../mail/mail-template-resolution";
 import { OrgSettingsService } from "../org-settings/org-settings.service";
 import { PBX_DATABASE } from "../shared/pbx.tokens";
+import type { MailComposition } from "../../auth/mail-templates/mail-template.service";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
 const logger = getLogger("api.pbx");
@@ -89,6 +92,7 @@ export class EmergencyNotificationService {
 		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
 		@Inject(Mailer) private readonly mailer: Mailer,
 		@Inject(OrgSettingsService) private readonly settings: OrgSettingsService,
+		@Inject(MailTemplateService) private readonly templates: MailTemplateService,
 	) {}
 
 	get stats(): { readonly sent: number; readonly skipped: number; readonly failed: number } {
@@ -139,22 +143,29 @@ export class EmergencyNotificationService {
 		}
 
 		const context = await this.readContext(organizationId, notice);
-		const rendered = emergencyDialedMail({
-			appName: DEFAULT_MAIL_APP_NAME,
-			...(policy.fromName === undefined ? {} : { fromName: policy.fromName }),
-			dialed: notice.dialed,
-			number: notice.number,
-			...(notice.callerNumber === undefined ? {} : { callerNumber: notice.callerNumber }),
-			...(notice.callerName === undefined ? {} : { callerName: notice.callerName }),
-			...(context.callerExtension === undefined
-				? {}
-				: { callerExtension: context.callerExtension }),
-			...(notice.elin === undefined ? {} : { elin: notice.elin }),
-			...(context.location === undefined ? {} : { location: context.location }),
-			...(context.locationUnknown ? { locationUnknown: true } : {}),
-			...(notice.trunkName === undefined ? {} : { trunkName: notice.trunkName }),
-			dialedAt: notice.dialedAt,
-		});
+		// The mail-template cascade, the same wire the voicemail consumer uses: the org's (or its
+		// reseller's) branding product name feeds the code template as its `appName`, and the resolved
+		// subject/intro override is applied. Keyed by `emergency-dialed` and the organization id.
+		const composition = await this.compose(organizationId);
+		const rendered = applyMailOverride(
+			emergencyDialedMail({
+				appName: composition.productName,
+				...(policy.fromName === undefined ? {} : { fromName: policy.fromName }),
+				dialed: notice.dialed,
+				number: notice.number,
+				...(notice.callerNumber === undefined ? {} : { callerNumber: notice.callerNumber }),
+				...(notice.callerName === undefined ? {} : { callerName: notice.callerName }),
+				...(context.callerExtension === undefined
+					? {}
+					: { callerExtension: context.callerExtension }),
+				...(notice.elin === undefined ? {} : { elin: notice.elin }),
+				...(context.location === undefined ? {} : { location: context.location }),
+				...(context.locationUnknown ? { locationUnknown: true } : {}),
+				...(notice.trunkName === undefined ? {} : { trunkName: notice.trunkName }),
+				dialedAt: notice.dialedAt,
+			}),
+			composition.override,
+		);
 
 		const delivered: string[] = [];
 		const failed: string[] = [];
@@ -191,6 +202,26 @@ export class EmergencyNotificationService {
 			return { outcome: "partial", to: delivered, failed };
 		}
 		return { outcome: "sent", to: delivered };
+	}
+
+	/**
+	 * The branding product name and resolved template override for this organization's Kari's Law mail.
+	 *
+	 * Best-effort, like the send itself: this notification is a life-safety obligation and a
+	 * template-cascade read that fails must never suppress it, so a failure falls back to the code
+	 * default (`DEFAULT_MAIL_APP_NAME`, no override) — the message this consumer sent before the
+	 * cascade was wired. Language is `en`; the override table keys on `(org, template, language)`.
+	 */
+	private async compose(organizationId: string): Promise<MailComposition> {
+		try {
+			return await this.templates.resolveComposition(organizationId, "emergency-dialed", "en");
+		} catch (error) {
+			logger.warn(
+				{ organizationId, err: error },
+				"could not resolve the emergency mail template; sending with the default branding",
+			);
+			return { productName: DEFAULT_MAIL_APP_NAME, override: null };
+		}
 	}
 
 	/**

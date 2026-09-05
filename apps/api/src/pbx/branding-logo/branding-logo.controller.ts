@@ -2,8 +2,11 @@ import {
 	Controller,
 	Get,
 	Header,
+	HttpCode,
+	HttpStatus,
 	Inject,
 	NotFoundException,
+	Post,
 	Query,
 	Req,
 	Res,
@@ -11,6 +14,8 @@ import {
 import { z } from "zod/v4";
 import { BrandingService } from "../../auth/branding/branding.service";
 import { PublicRoute } from "../../auth/public-route.decorator";
+import { RequirePermissions } from "../../auth/require-permissions.decorator";
+import { Session } from "../../auth/session.decorator";
 import {
 	applyMediaResponse,
 	type MediaReply,
@@ -20,7 +25,10 @@ import {
 import { openMediaResponse } from "../../media/media-response";
 import { parseDto } from "../shared/dto";
 import { PBX_MEDIA_STORE } from "../shared/pbx.tokens";
+import { BrandingLogoUploadService } from "./branding-logo-upload.service";
 import type { ObjectStore } from "../../storage";
+import type { MultipartRequest } from "../media/media-upload";
+import type { AppSession } from "@optimiq-voice/auth";
 
 const logoQuery = z.object({ host: z.string().trim().min(1).max(253) });
 
@@ -57,7 +65,23 @@ export class BrandingLogoController {
 	constructor(
 		@Inject(BrandingService) private readonly branding: BrandingService,
 		@Inject(PBX_MEDIA_STORE) private readonly store: ObjectStore,
+		@Inject(BrandingLogoUploadService) private readonly uploads: BrandingLogoUploadService,
 	) {}
+
+	/**
+	 * `POST /api/v1/branding/logo` — stores an uploaded logo and points the tenant's brand at it.
+	 *
+	 * `branding.write` gated (a logo is presentation configuration, the same permission the branding
+	 * PATCH takes), multipart, and it returns the re-resolved effective branding so the caller sees
+	 * the key it now holds. The bytes are sniffed by magic bytes and namespaced under `branding/`;
+	 * see `branding-image.ts` and `branding-logo-upload.service.ts`.
+	 */
+	@Post("logo")
+	@HttpCode(HttpStatus.OK)
+	@RequirePermissions("branding.write")
+	async upload(@Session() session: AppSession, @Req() request: MultipartRequest) {
+		return await this.uploads.upload(session, request);
+	}
 
 	@Get("logo")
 	@PublicRoute()

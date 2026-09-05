@@ -79,4 +79,24 @@ export class BrandingService {
 		await upsertBranding(this.adminDb, organizationId, input);
 		return await this.resolveFor(organizationId);
 	}
+
+	/**
+	 * Point the acting organization's logo at a freshly-uploaded object key.
+	 *
+	 * The logo UPLOAD path (`branding-logo` in `PbxModule`) stores the bytes and mints the key; this
+	 * writes that key onto the org's OWN branding row and returns the re-resolved brand. The previous
+	 * OWN key is returned too so the caller can reap the object it replaced — only the org's own key,
+	 * never the resolved (possibly reseller-inherited) one, because reaping a parent's logo from a
+	 * child's upload would blank the reseller's brand for every sibling.
+	 */
+	async setLogoObjectKey(
+		session: AppSession,
+		objectKey: string,
+	): Promise<{ readonly effective: EffectiveBranding; readonly previousObjectKey: string | null }> {
+		const organizationId = requireActiveOrganizationId(session);
+		const existing = await readBranding(this.adminDb, organizationId);
+		const previousObjectKey = existing?.logoObjectKey ?? null;
+		await upsertBranding(this.adminDb, organizationId, { logoObjectKey: objectKey });
+		return { effective: await this.resolveFor(organizationId), previousObjectKey };
+	}
 }

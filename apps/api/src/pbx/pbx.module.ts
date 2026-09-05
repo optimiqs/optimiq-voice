@@ -11,6 +11,7 @@ import {
 } from "../transcription";
 import { AuditLogQueryService } from "./audit-log/audit-log-query.service";
 import { AuditLogController } from "./audit-log/audit-log.controller";
+import { BrandingLogoUploadService } from "./branding-logo/branding-logo-upload.service";
 import { BrandingLogoController } from "./branding-logo/branding-logo.controller";
 import { CallBlockController } from "./call-block/call-block.controller";
 import { CallBlockService } from "./call-block/call-block.service";
@@ -446,6 +447,7 @@ const logger = getLogger("api.pbx");
 			inject: [FAX_ENV],
 		},
 		{ provide: FAX_MEDIA_FETCH, useFactory: () => createFaxMediaFetch() },
+		BrandingLogoUploadService,
 		FaxService,
 		FaxEmailService,
 		FaxInboundService,

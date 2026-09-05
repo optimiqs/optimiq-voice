@@ -39,6 +39,7 @@ interface SentMail {
 	readonly to: string;
 	readonly subject: string;
 	readonly text: string;
+	readonly html: string;
 	readonly headers: Record<string, string> | undefined;
 }
 
@@ -54,10 +55,18 @@ function fakeTransaction(answers: readonly (readonly Record<string, unknown>[])[
 	return chain;
 }
 
+interface TemplateScript {
+	readonly productName?: string;
+	readonly subject?: string | null;
+	readonly bodyIntro?: string | null;
+	readonly throws?: boolean;
+}
+
 function makeService(
 	settings: Partial<NotificationSettings>,
 	answers: readonly (readonly Record<string, unknown>[])[] = [[], []],
 	delivered = true,
+	template: TemplateScript = {},
 ): { service: EmergencyNotificationService; sent: SentMail[] } {
 	const sent: SentMail[] = [];
 	const database = {
@@ -68,10 +77,16 @@ function makeService(
 		appUrl: undefined,
 		sendRendered: async (
 			to: string,
-			rendered: { subject: string; text: string },
+			rendered: { subject: string; text: string; html: string },
 			options?: { headers?: Record<string, string> },
 		) => {
-			sent.push({ to, subject: rendered.subject, text: rendered.text, headers: options?.headers });
+			sent.push({
+				to,
+				subject: rendered.subject,
+				text: rendered.text,
+				html: rendered.html,
+				headers: options?.headers,
+			});
 			return { delivered, transport: "log" as const };
 		},
 	};
@@ -86,11 +101,26 @@ function makeService(
 			...settings,
 		}),
 	};
+	const templates = {
+		resolveComposition: async (_org: string, _key: string, _lang: string) => {
+			if (template.throws) {
+				throw new Error("cascade read failed");
+			}
+			return {
+				productName: template.productName ?? "Optimiq Voice",
+				override:
+					template.subject === undefined && template.bodyIntro === undefined
+						? null
+						: { subject: template.subject ?? null, bodyIntro: template.bodyIntro ?? null },
+			};
+		},
+	};
 	return {
 		service: new EmergencyNotificationService(
 			database as never,
 			mailer as never,
 			orgSettings as never,
+			templates as never,
 		),
 		sent,
 	};
@@ -175,6 +205,41 @@ describe("emergency notification gating", () => {
 		expect(body).to.contain("Floor 3, Room 314");
 		expect(body).to.contain("+12125550100");
 		expect(body).to.contain("Reception");
+	});
+
+	it("brands the message with the resolved product name from the mail-template cascade", async () => {
+		const { service, sent } = makeService(
+			{ emergencyNotificationEmails: ["desk@example.com"] },
+			[[], []],
+			true,
+			{ productName: "Acme Telecom" },
+		);
+		await service.notify(ORGANIZATION_ID, NOTICE);
+		// The HTML shell is titled with the appName; the cascade's product name feeds it.
+		expect(sent[0]?.html ?? "").to.contain("Acme Telecom");
+	});
+
+	it("applies a per-tenant subject override to the emergency mail", async () => {
+		const { service, sent } = makeService(
+			{ emergencyNotificationEmails: ["desk@example.com"] },
+			[[], []],
+			true,
+			{ productName: "Acme Telecom", subject: "URGENT: 911 dialed on Acme" },
+		);
+		await service.notify(ORGANIZATION_ID, NOTICE);
+		expect(sent[0]?.subject).to.equal("URGENT: 911 dialed on Acme");
+	});
+
+	it("falls back to the default branding when the cascade read fails, and still sends", async () => {
+		const { service, sent } = makeService(
+			{ emergencyNotificationEmails: ["desk@example.com"] },
+			[[], []],
+			true,
+			{ throws: true },
+		);
+		const outcome = await service.notify(ORGANIZATION_ID, NOTICE);
+		expect(outcome.outcome).to.equal("sent");
+		expect(sent[0]?.html ?? "").to.contain("Optimiq Voice");
 	});
 
 	it("says the location is unreadable rather than omitting the line", async () => {

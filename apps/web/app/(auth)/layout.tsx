@@ -21,23 +21,27 @@ import type { ReactNode } from "react";
  * backend that has not shipped the endpoint, simply shows "Optimiq Voice". The default is the
  * honest fallback, never a blank page.
  */
-async function resolveLoginBranding(): Promise<Branding> {
+async function resolveLoginBranding(): Promise<{ brand: Branding; host: string | null }> {
 	try {
 		const headerList = await headers();
 		const host = headerList.get("host");
 		if (!host) {
-			return DEFAULT_BRANDING;
+			return { brand: DEFAULT_BRANDING, host: null };
 		}
 		const proto = headerList.get("x-forwarded-proto") ?? "http";
-		return await fetchBrandingByHost(host, `${proto}://${host}`);
+		return { brand: await fetchBrandingByHost(host, `${proto}://${host}`), host };
 	} catch {
-		return DEFAULT_BRANDING;
+		return { brand: DEFAULT_BRANDING, host: null };
 	}
 }
 
 export default async function AuthLayout({ children }: { children: ReactNode }) {
-	const brand = await resolveLoginBranding();
-	const logoSrc = brandLogoSrc(brand);
+	const { brand, host } = await resolveLoginBranding();
+	// The host the brand was resolved by is threaded through so a bare `logoObjectKey` becomes the
+	// public, host-keyed `GET /api/v1/branding/logo` route — the SAME host the by-host read used, so
+	// the served logo and the theme belong to one tenant. An absent host or key falls back to the
+	// product initial (see `brandLogoSrc`), so there is no broken image.
+	const logoSrc = brandLogoSrc(brand, host);
 
 	return (
 		<main
