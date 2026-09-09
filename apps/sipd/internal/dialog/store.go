@@ -1,9 +1,11 @@
 package dialog
 
 import (
+	"cmp"
 	"context"
 	"errors"
-	"sort"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -21,27 +23,13 @@ var (
 	ErrUnknownDialog = errors.New("dialog: no such dialog")
 )
 
-// Store is this instance's dialog table.
+// Store is this instance's dialog table, and the in-memory truth: a dialog's transaction state,
+// timers and socket are all local, so there is nothing to distribute (design §6.1). What IS
+// distributed is a CLAIM per dialog in the `sip-dialogs` bucket, whose only job is reaping — a
+// survivor publishes the terminations a dead owner never got to (design §6.2). It is not failover.
 //
-// # What it is, and what it deliberately is not
-//
-// It is the in-memory truth. Dialogs live in memory and there is no other option: a dialog's
-// transaction state, its retransmission timers and its socket are all local, and its Contact tells
-// the far end which host to send mid-dialog requests to (design §6.1). A second process cannot
-// receive the BYE and cannot retransmit the 2xx, so there is nothing to distribute.
-//
-// What IS distributed is a CLAIM — one record per dialog in the `sip-dialogs` KV bucket, carrying a
-// lease its owner heartbeats (design §6.2). The claim exists for exactly one job: reaping. When an
-// instance dies, a survivor finds the expired claims and publishes the terminations their owner
-// never got to, so the engine writes CDR rows for calls that ended when a pod was rescheduled.
-// It is NOT failover; nothing can fail a dialog over. See ClaimStore below, and internal/reaper for
-// the sweep that reads it.
-//
-// # Ownership
-//
-// The store is safe for concurrent use. A *Dialog it hands out is NOT — one goroutine owns one
-// dialog (see the package comment). The store therefore lends pointers and never mutates a dialog
-// itself; the one exception is Rebind, which touches the index and not the dialog.
+// The store is safe for concurrent use; a *Dialog it hands out is NOT (see the package comment). It
+// therefore lends pointers and never mutates a dialog, except Rebind, which touches the index.
 type Store struct {
 	mu sync.RWMutex
 	// byLeg is the authority. Everything else is an index into it.
@@ -51,13 +39,9 @@ type Store struct {
 	// byEarly maps a Call-ID plus our own tag to a legId, for the window before the far end's tag
 	// is known. A UAC's CANCEL, its Timer B and its 100 all land in that window.
 	byEarly map[string]string
-	// claims is the rendered Claim per legId, kept as a VALUE under this lock.
-	//
-	// It exists because the heartbeat sweep runs on the reaper's goroutine and a *Dialog is owned
-	// by its session's. Rendering a claim off the dialog there would read `state`, `OrgID`,
-	// `CallID` and `Identity` while the owner is writing them — an actual data race, and a torn
-	// `state` is what the reaper's CDR-of-last-resort would then be built from. So the claim is
-	// rendered by the OWNER (Insert, Rebind, Touch) and the sweep only ever copies values out.
+	// claims is the rendered Claim per legId, kept as a VALUE under this lock. The heartbeat sweep
+	// runs on the reaper's goroutine, so rendering a claim off the dialog there would race the
+	// owner: the claim is rendered by the OWNER (Insert, Rebind, Touch) and the sweep copies values.
 	claims map[string]Claim
 
 	instanceID string
@@ -67,8 +51,8 @@ type Store struct {
 
 // StoreOptions configures a Store. Every field a test needs is here.
 type StoreOptions struct {
-	// InstanceID stamps every claim, and is what an engine command's subject token addresses
-	// (design §10.2). A dialog lives on one process, so the command for it must too.
+	// InstanceID stamps every claim and is what an engine command's subject token addresses (design
+	// §10.2), because a dialog lives on exactly one process.
 	InstanceID string
 	// Lease is how long a claim is valid without a heartbeat. It bounds how long a dead instance's
 	// calls stay unreaped, and therefore how late a CDR can be.
@@ -92,9 +76,8 @@ func NewStore(opts StoreOptions) *Store {
 		store.now = time.Now
 	}
 	if store.lease <= 0 {
-		// Ninety seconds: long enough that a heartbeat every thirty has two chances to land through
-		// a broker blip, short enough that a rescheduled pod's calls are reaped inside a support
-		// call rather than inside a billing cycle.
+		// Ninety seconds: long enough for a thirty-second heartbeat to survive a broker blip, short
+		// enough that a rescheduled pod's calls are reaped well inside a billing cycle.
 		store.lease = 90 * time.Second
 	}
 	return store
@@ -129,11 +112,9 @@ func (s *Store) index(dialog *Dialog) {
 	}
 }
 
-// Rebind re-indexes a dialog whose remote tag has just been learned.
-//
-// It exists because a UAC dialog's identity is INCOMPLETE until the far end answers with a tag
-// (RFC 3261 §12.1.2), and the BYE that arrives ten minutes later is matched on the complete triple.
-// A store that never re-indexed would answer 481 to every mid-dialog request on every outbound call.
+// Rebind re-indexes a dialog whose remote tag has just been learned. A UAC dialog's identity is
+// incomplete until the far end answers with a tag (RFC 3261 §12.1.2), while the BYE arriving ten
+// minutes later is matched on the complete triple.
 func (s *Store) Rebind(legID string, identity Identity) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -148,12 +129,9 @@ func (s *Store) Rebind(legID string, identity Identity) error {
 	return nil
 }
 
-// Touch re-renders a dialog's cached claim.
-//
-// It MUST be called from the goroutine that owns the dialog — that is the whole point of it: the
-// read of the dialog's fields happens on the owner, and only the resulting value crosses the lock.
-// The session calls it after every task, and the INVITE handler calls it whenever it writes the
-// claim out to the bucket.
+// Touch re-renders a dialog's cached claim. It MUST be called from the goroutine that owns the
+// dialog: the read of the dialog's fields happens there and only the resulting value crosses the
+// lock.
 func (s *Store) Touch(dialog *Dialog) {
 	if dialog == nil {
 		return
@@ -175,11 +153,9 @@ func (s *Store) Get(legID string) (*Dialog, bool) {
 	return dialog, found
 }
 
-// MatchRequest finds the dialog a mid-dialog request belongs to.
-//
-// The full triple first, then the early index. The order matters: a re-INVITE on a confirmed dialog
-// and a CANCEL for one that is still early both arrive as requests, and matching the early index
-// first would let a stranger who guessed a Call-ID and our tag reach a confirmed call.
+// MatchRequest finds the dialog a mid-dialog request belongs to: the full triple first, then the
+// early index. The order matters — matching early first would let someone who guessed a Call-ID and
+// our tag reach a confirmed call.
 func (s *Store) MatchRequest(req *sip.Request) (*Dialog, bool) {
 	identity, err := identityOfIncoming(req)
 	if err != nil {
@@ -198,11 +174,9 @@ func (s *Store) MatchRequest(req *sip.Request) (*Dialog, bool) {
 	return nil, false
 }
 
-// MatchResponse finds the dialog a response to one of OUR requests belongs to.
-//
-// A response is matched on the early key, because the whole point of the first response with a tag
-// is that we did not know the tag before it. Once the tag is known, Rebind moves the dialog into
-// the full index and later responses match there too — hence both lookups.
+// MatchResponse finds the dialog a response to one of OUR requests belongs to. The first response
+// with a tag can only match on the early key; once Rebind has run, later responses match the full
+// index — hence both lookups.
 func (s *Store) MatchResponse(res *sip.Response) (*Dialog, bool) {
 	identity, err := identityOfResponse(res)
 	if err != nil {
@@ -223,17 +197,10 @@ func (s *Store) MatchResponse(res *sip.Response) (*Dialog, bool) {
 
 // FindReplaced resolves an RFC 3891 Replaces triple against this instance's dialogs.
 //
-// # The tag mapping, which is the whole of RFC 3891 §3 and is easy to get backwards
-//
-// The tags in a Replaces are written from the point of view of the UA that SENDS it. So the
-// `to-tag` is compared against OUR local tag and the `from-tag` against the remote one — the same
-// orientation an incoming request has, which is why this is a plain identity lookup and not a
-// second index.
-//
-// `early-only` narrows the match to a dialog that has not been answered, and is refused rather than
-// ignored when the dialog is confirmed: it exists so a transfer target can decline to replace a
-// call that has already been picked up by somebody else, and ignoring it would complete a transfer
-// into a live conversation.
+// Per RFC 3891 §3 the tags are written from the sender's point of view, so `to-tag` compares against
+// OUR local tag and `from-tag` against the remote one — the same orientation as an incoming request,
+// which is why this is a plain identity lookup. `earlyOnly` is REFUSED rather than ignored on a
+// confirmed dialog, so a transfer cannot complete into a call somebody else already picked up.
 func (s *Store) FindReplaced(callID, toTag, fromTag string, earlyOnly bool) (*Dialog, error) {
 	identity := Identity{SIPCallID: callID, LocalTag: toTag, RemoteTag: fromTag}
 	if !identity.Established() {
@@ -272,8 +239,8 @@ func (s *Store) Remove(legID string) {
 	delete(s.byEarly, dialog.Identity.EarlyKey())
 }
 
-// Len reports how many dialogs this instance holds. It is the number that decides whether a drain
-// may finish, and the one a readiness probe should refuse to shut down under.
+// Len reports how many dialogs this instance holds, which is what decides whether a drain may
+// finish.
 func (s *Store) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -285,26 +252,14 @@ func (s *Store) Len() int {
 func (s *Store) LegIDs() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	ids := make([]string, 0, len(s.byLeg))
-	for id := range s.byLeg {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	return ids
+	return slices.Sorted(maps.Keys(s.byLeg))
 }
-
-// ---------------------------------------------------------------------------------------------
-// claims
-// ---------------------------------------------------------------------------------------------
 
 // Claim is the `sip-dialogs` record: what a SECOND process can truthfully say about a dialog it
 // does not hold (design §6.2).
 //
-// The field set and the JSON spellings mirror the design document's example record. It is NOT
-// organisation-scoped as a key — the third exception after `did-index` and `media-sessions`, for
-// the identical reason: the reader does not know the tenant. An engine reconciling a `legId` from a
-// `leg-ended`, or a surviving sipd reaping a dead peer, has no org to prefix with. The org travels
-// in the value.
+// It is NOT organisation-scoped as a key: an engine reconciling a `legId`, or a sipd reaping a dead
+// peer, has no org to prefix with. The org travels in the value.
 type Claim struct {
 	LegID      string `json:"legId"`
 	InstanceID string `json:"instanceId"`
@@ -312,8 +267,7 @@ type Claim struct {
 	CallID     string `json:"callId,omitempty"`
 	// Role is "uas" when we answered and "uac" when we called.
 	Role string `json:"role"`
-	// SIPCallID, LocalTag and RemoteTag are the dialog triple. A LOOKUP KEY and never an
-	// authorisation — the rule `sipTransferRequestSchema.sipCallId` already states.
+	// SIPCallID, LocalTag and RemoteTag are the dialog triple: a lookup key, never an authorisation.
 	SIPCallID string `json:"sipCallId"`
 	LocalTag  string `json:"localTag,omitempty"`
 	RemoteTag string `json:"remoteTag,omitempty"`
@@ -329,9 +283,8 @@ type Claim struct {
 	ExpiresAt int64 `json:"expiresAt"`
 }
 
-// Expired reports whether the claim's lease has lapsed at the given instant. A lapsed claim is one
-// whose owner has stopped heartbeating, which means either the process died or it cannot reach the
-// broker — and both of those are calls nobody will ever write a CDR for unless somebody reaps them.
+// Expired reports whether the claim's lease has lapsed at the given instant, meaning its owner has
+// stopped heartbeating.
 func (c Claim) Expired(now time.Time) bool {
 	return now.UnixMilli() >= c.ExpiresAt
 }
@@ -361,11 +314,9 @@ func (s *Store) claimFor(dialog *Dialog) Claim {
 	}
 }
 
-// Claims returns a copy of every live dialog's claim, for the heartbeat sweep.
-//
-// It copies VALUES the owning goroutines rendered rather than reading the dialogs themselves; see
-// the `claims` field. The lease deadline is stamped fresh here, because the heartbeat's job is to
-// extend it and the cached one is as old as the last state change.
+// Claims returns a copy of every live dialog's claim, for the heartbeat sweep. It copies the values
+// the owning goroutines rendered rather than reading the dialogs (see the `claims` field), and
+// stamps a fresh lease deadline, which is what the heartbeat is for.
 func (s *Store) Claims() []Claim {
 	expires := s.now().Add(s.lease).UnixMilli()
 	s.mu.RLock()
@@ -376,25 +327,12 @@ func (s *Store) Claims() []Claim {
 	}
 	s.mu.RUnlock()
 
-	sort.Slice(claims, func(i, j int) bool { return claims[i].LegID < claims[j].LegID })
+	slices.SortFunc(claims, func(a, b Claim) int { return cmp.Compare(a.LegID, b.LegID) })
 	return claims
 }
 
-// ClaimStore is the `sip-dialogs` bucket, as an interface.
-//
-// # Why this is an interface now that the bucket exists
-//
-// The bucket DEFINITION — its name, TTL, storage and limits — belongs in packages/events-go
-// alongside every other one, so sipd cannot disagree with the TypeScript services about what it is
-// talking to (the rule internal/kv states). It has LANDED, as `contract.SIPDialogsKV` plus
-// `contract.SIPDialogKVKey`, and NATSClaimStore in claims.go is the implementation.
-//
-// The seam stays for the reason internal/kv's own MemoryStore stays: the unit suite runs with no
-// broker and no socket, and a claim store that could only be a bucket would make every dialog test
-// an integration test. MemoryClaimStore is therefore still here and still NOT a deployment option
-// for more than one instance — a claim only one process can see reaps nothing, which is the one
-// thing the bucket exists for.
-//
+// ClaimStore is the `sip-dialogs` bucket, as an interface. NATSClaimStore (claims.go) is the
+// production implementation; the seam exists so the unit suite runs with no broker and no socket.
 // Every method takes a context because the real one is network I/O on a shutdown path.
 type ClaimStore interface {
 	Put(ctx context.Context, claim Claim) error
@@ -443,17 +381,14 @@ func (m *MemoryClaimStore) All(_ context.Context) ([]Claim, error) {
 	for _, claim := range m.claims {
 		claims = append(claims, claim)
 	}
-	sort.Slice(claims, func(i, j int) bool { return claims[i].LegID < claims[j].LegID })
+	slices.SortFunc(claims, func(a, b Claim) int { return cmp.Compare(a.LegID, b.LegID) })
 	return claims, nil
 }
 
 // Orphans returns the claims that belong to some OTHER instance and whose lease has lapsed.
 //
-// It is deliberately not "every expired claim": our own expired claim means our own heartbeat is
-// late, and reaping our own live calls because the broker was slow would turn a network blip into
-// dropped calls. A claim we still hold is refreshed by the next heartbeat; a claim we do not hold
-// and that nobody has refreshed is a dead instance's, and publishing its termination is the only
-// way the engine ever writes those CDR rows.
+// Deliberately not "every expired claim": one of our own that has expired means our own heartbeat is
+// late, and reaping it would turn a broker blip into dropped calls.
 func Orphans(claims []Claim, instanceID string, now time.Time) []Claim {
 	orphans := make([]Claim, 0)
 	for _, claim := range claims {
@@ -462,6 +397,6 @@ func Orphans(claims []Claim, instanceID string, now time.Time) []Claim {
 		}
 		orphans = append(orphans, claim)
 	}
-	sort.Slice(orphans, func(i, j int) bool { return orphans[i].LegID < orphans[j].LegID })
+	slices.SortFunc(orphans, func(a, b Claim) int { return cmp.Compare(a.LegID, b.LegID) })
 	return orphans
 }

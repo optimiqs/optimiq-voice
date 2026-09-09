@@ -29,10 +29,7 @@ func (e fakeEntry) Operation() jetstream.KeyValueOp { return e.operation }
 
 const jetstreamDelete = jetstream.KeyValueDelete
 
-// The key parser is the whole surface of this package that is not a NATS call, and it is the one
-// place where a mistake would be invisible: a key that split wrongly would attribute one tenant's
-// presence to another's extension, and the symptom is a lamp that lights for a call that is not
-// there.
+// A key that split wrongly would attribute one tenant's presence to another's extension.
 func TestSplitKeyIsExactAndRejectsAnythingElse(t *testing.T) {
 	const org = "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
 
@@ -54,8 +51,8 @@ func TestSplitKeyIsExactAndRejectsAnythingElse(t *testing.T) {
 	}
 }
 
-// A value that will not decode is DROPPED, not reported as `down`: the alternative is one malformed
-// write from a future engine release clearing every lamp in a tenant.
+// A value that will not decode is DROPPED, not reported as `down`: one malformed write must not
+// clear every lamp in a tenant.
 func TestChangeForDropsAnUndecodableValue(t *testing.T) {
 	entry := fakeEntry{key: "org.1001", value: []byte("{not json")}
 	if _, ok := changeFor(entry); ok {

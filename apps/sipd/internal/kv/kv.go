@@ -1,11 +1,8 @@
 // Package kv is sipd's view of the `registrations` NATS KV bucket: the location service.
 //
-// The bucket is the AUTHORITY for "who is registered right now" (plan §3.5). The REGISTRATIONS
-// JetStream stream is the transition log behind it, not the truth — a consumer that needs to route
-// a call to a device reads here.
-//
-// The bucket definition (name, TTL, storage, limits) comes from packages/events-go so sipd cannot
-// disagree with the TypeScript services about what it is talking to.
+// The bucket is the authority for who is registered right now; the REGISTRATIONS JetStream stream
+// is the transition log behind it, not the truth. The bucket definition comes from
+// packages/events-go so sipd cannot disagree with the TypeScript services about it.
 package kv
 
 import (
@@ -22,11 +19,9 @@ import (
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 )
 
-// Binding is one AOR → contact binding, as stored in the bucket.
-//
-// The value is deliberately richer than the registration EVENT payload: an event describes a
-// transition and is consumed once, whereas this record has to answer "where do I send an INVITE
-// for this AOR, and until when" long after the REGISTER is forgotten.
+// Binding is one AOR to contact binding, as stored in the bucket. It is richer than the
+// registration event payload, which describes a transition; this record has to answer where to send
+// an INVITE for the AOR, and until when.
 type Binding struct {
 	Revision       uint64 `json:"-"`
 	SIPDInstanceID string `json:"sipdInstanceId,omitempty"`
@@ -38,16 +33,14 @@ type Binding struct {
 	Contact   string                `json:"contact"`
 	Transport contract.SIPTransport `json:"transport"`
 	UserAgent string                `json:"userAgent,omitempty"`
-	// SourceAddress is the signalling peer, host:port, as observed. For a device behind NAT this is
-	// the only address that works, and it is why a binding is worth more than the Contact alone.
+	// SourceAddress is the signalling peer, host:port, as observed. For a device behind NAT it is
+	// the only address that works.
 	SourceAddress string `json:"sourceAddress,omitempty"`
 	DeviceID      string `json:"deviceId,omitempty"`
 	ExtensionID   string `json:"extensionId,omitempty"`
-	// SharedLineNumber and AppearanceIndex place this AOR on a shared line appearance (SLA), when it
-	// has one. They ride onto the binding from the credential so the INVITE path can stamp a
-	// `Call-Info` appearance-index header on the outbound request to this phone. Nil for an ordinary
-	// extension. Carried beside DeviceID because they answer the same question — which inventory row
-	// is this — for the SLA case.
+	// SharedLineNumber and AppearanceIndex place this AOR on a shared line appearance, when it has
+	// one, so the INVITE path can stamp a `Call-Info` appearance-index header on the outbound
+	// request. Nil for an ordinary extension.
 	SharedLineNumber *string `json:"sharedLineNumber,omitempty"`
 	AppearanceIndex  *int    `json:"appearanceIndex,omitempty"`
 	// CallID and CSeq identify the registration dialog, so a retransmission or an out-of-order
@@ -59,66 +52,44 @@ type Binding struct {
 
 	RegisteredAt contract.EventTime `json:"registeredAt"`
 	ExpiresAt    contract.EventTime `json:"expiresAt"`
-	// ExpiresInSeconds is the interval GRANTED, which is not always the one requested.
+	// ExpiresInSeconds is the interval granted, which is not always the one requested.
 	ExpiresInSeconds int `json:"expiresInSeconds"`
 
-	// Contacts is EVERY live contact for this AOR, when there is more than one device.
+	// Contacts is every live contact for this AOR, when there is more than one device.
 	//
-	// # Additive, and the flat fields above stay
-	//
-	// One AOR routinely has several devices — a desk phone and a softphone registered as the same
-	// extension is the normal case — and until this field existed the second REGISTER simply
-	// overwrote the first, so a call rang whichever handset had refreshed most recently and the
-	// other was invisible.
-	//
-	// Adding them could have been done by REPLACING Contact / Transport / SourceAddress with this
-	// slice, and that would have been the tidier shape and the wrong change. Three readers across
-	// two languages already consume the flat fields, and a value shape that arrives before every
-	// reader has been taught about it is a registration that reads as UNREGISTERED — a phone that
-	// cannot be called, produced by a deploy ordering detail. So the flat fields REMAIN and
-	// describe the PRIMARY contact, this slice is optional, and a reader that has never heard of it
-	// behaves exactly as it did before. `registrationBindingSchema` is `.loose()` for the same
-	// reason and carries the identical argument.
-	//
-	// The registrar keeps the two in step BY CONSTRUCTION: aor.ApplyToBinding writes both from one
-	// Set, the primary is Contacts[0], and its fields are copied outward on the same call. A value
-	// where they disagree is a bug in this writer, and a reader should trust the flat fields —
-	// they are the ones every reader has always used.
+	// It is additive: the flat Contact/Transport/SourceAddress fields above remain and describe the
+	// primary contact, so a reader that does not know this field still sees a registered device.
+	// aor.ApplyToBinding writes both from one Set with the primary at Contacts[0], so they cannot
+	// disagree; readers should trust the flat fields.
 	Contacts []Contact `json:"contacts,omitempty"`
 }
 
 // Contact is one device bound to an address of record, as the bucket holds it.
 //
-// The JSON tags match `registrationBindingSchema.contacts`' element exactly for the six fields that
-// schema names, and carry four more — q, regId, callId, cseq — that it does not. That is legal and
-// deliberate: the element schema is `.loose()`, and those four are what make a stored contact
-// round-trip back into an aor.Contact without losing the RFC 3261 §16.6 preference or the RFC 3261
-// §10.3 step 6 ordering check. A TypeScript reader ignores them; this process needs them.
+// The JSON tags match `registrationBindingSchema.contacts`' element for the six fields that schema
+// names and carry four more (q, regId, callId, cseq) that the loose element schema permits; those
+// four preserve the RFC 3261 §16.6 preference and the §10.3 step 6 ordering check on round-trip.
 //
-// It is declared HERE rather than in internal/aor, even though internal/aor is where the model
-// lives, because internal/aor imports this package and the reverse would be a cycle. The bucket's
-// value shape belongs to the package that owns the bucket.
+// It lives here rather than in internal/aor because internal/aor imports this package.
 type Contact struct {
 	SIPDInstanceID string `json:"sipdInstanceId,omitempty"`
-	// URI is the contact exactly as the device offered it, parameters included. Never routable on
-	// its own from outside this process: a device behind NAT advertises a private address here,
-	// which is what SourceAddress exists for.
+	// URI is the contact exactly as the device offered it, parameters included. Not routable on its
+	// own: a device behind NAT advertises a private address here, which is what SourceAddress is for.
 	URI       string                `json:"contact"`
 	Transport contract.SIPTransport `json:"transport"`
 	UserAgent string                `json:"userAgent,omitempty"`
 	// SourceAddress is the observed signalling peer, host:port. The address that actually works.
 	SourceAddress string `json:"sourceAddress,omitempty"`
 	DeviceID      string `json:"deviceId,omitempty"`
-	// SharedLineNumber and AppearanceIndex place this contact on a shared line appearance (SLA), when
-	// it has one — carried per-contact beside DeviceID so the primary contact's appearance survives
-	// the round-trip through the bucket into the INVITE path. Nil for an ordinary contact.
+	// SharedLineNumber and AppearanceIndex place this contact on a shared line appearance, when it
+	// has one. Nil for an ordinary contact.
 	SharedLineNumber *string `json:"sharedLineNumber,omitempty"`
 	AppearanceIndex  *int    `json:"appearanceIndex,omitempty"`
-	// Instance is the device's `+sip.instance` (RFC 5626) — the only identity a device has that
-	// survives a changed port, and therefore the one a `{kind:"aor"}` originate should name.
+	// Instance is the device's `+sip.instance` (RFC 5626): the only device identity that survives a
+	// changed port, and therefore the one a `{kind:"aor"}` originate should name.
 	Instance string `json:"instance,omitempty"`
-	// RegID is the RFC 5626 `reg-id`: one device with two flows (wifi and cellular) registers twice
-	// with the same instance and different reg-ids, and both are legitimately live.
+	// RegID is the RFC 5626 `reg-id`: one device with two flows registers twice with the same
+	// instance and different reg-ids, and both are legitimately live.
 	RegID int `json:"regId,omitempty"`
 	// Q is the RFC 3261 §20.10 preference, higher first.
 	Q float64 `json:"q,omitempty"`
@@ -153,38 +124,67 @@ func (b Binding) RegisteredFor(now time.Time) time.Duration {
 //
 // Implementations must be safe for concurrent use.
 type Store interface {
-	// Update atomically changes one AOR. The callback may run repeatedly on CAS conflicts and
-	// must have no side effects. Returning nil deletes the binding. Results are the committed
+	// Update atomically changes one AOR. The callback may run repeatedly on CAS conflicts and must
+	// have no side effects. Returning nil deletes the binding. Results are the committed
 	// before/after values; nil denotes absence.
 	Update(ctx context.Context, orgID, aorHash string, change func(*Binding) (*Binding, error)) (*Binding, *Binding, error)
 	Put(ctx context.Context, binding Binding) error
 	Get(ctx context.Context, orgID, aorHash string) (Binding, bool, error)
 	Delete(ctx context.Context, orgID, aorHash string) error
-	// All returns every binding in the bucket. Used once at boot to adopt bindings a previous
-	// instance granted; it is not on any request path.
+	// All returns every binding in the bucket. Used once at boot; not on any request path.
 	All(ctx context.Context) ([]Binding, error)
 }
 
 var ErrConcurrentUpdate = errors.New("kv: registration changed too often to update")
+
+// Hint supplies a caller's last-known value for an AOR, so Update can skip its read. A re-REGISTER
+// is the commonest write, and without this each one spends two broker round trips inside the SIP
+// transaction to read back a value this process wrote itself.
+//
+// It is only ever a hint: a stale revision is rejected by the server exactly as a lost race would
+// be, and the retry reads the real value. Absent or wrong costs a round trip, never correctness.
+type Hint interface {
+	// LastKnown returns the caller's copy of the binding under this key, if it has one. The
+	// returned Binding's Revision must be the revision that copy was read or written at.
+	LastKnown(orgID, aorHash string) (Binding, bool)
+}
+
+// SetHint attaches a Hint. Not safe for concurrent use with Update; call it once at wiring time.
+func (s *NATSStore) SetHint(hint Hint) { s.hint = hint }
 
 func (s *NATSStore) Update(ctx context.Context, orgID, aorHash string, change func(*Binding) (*Binding, error)) (*Binding, *Binding, error) {
 	key, err := contract.RegistrationKVKey(orgID, aorHash)
 	if err != nil {
 		return nil, nil, err
 	}
-	for attempt := 0; attempt < 16; attempt++ {
+	// hinted is the guess for the first attempt only. Every retry reads, so a wrong hint costs one
+	// wasted CAS and never a loop.
+	var hinted *Binding
+	if s.hint != nil {
+		if binding, found := s.hint.LastKnown(orgID, aorHash); found && binding.Revision > 0 {
+			hinted = &binding
+		}
+	}
+	for attempt := range 16 {
 		var previous *Binding
 		var revision uint64
-		entry, err := s.bucket.Get(ctx, key)
-		if err == nil {
-			previous = &Binding{}
-			if err := json.Unmarshal(entry.Value(), previous); err != nil {
+		var stored []byte
+		switch {
+		case attempt == 0 && hinted != nil:
+			previous, revision = hinted, hinted.Revision
+		default:
+			entry, err := s.bucket.Get(ctx, key)
+			if err == nil {
+				previous = &Binding{}
+				if err := json.Unmarshal(entry.Value(), previous); err != nil {
+					return nil, nil, err
+				}
+				revision = entry.Revision()
+				previous.Revision = revision
+				stored = entry.Value()
+			} else if !errors.Is(err, jetstream.ErrKeyNotFound) && !errors.Is(err, jetstream.ErrKeyDeleted) {
 				return nil, nil, err
 			}
-			revision = entry.Revision()
-			previous.Revision = revision
-		} else if !errors.Is(err, jetstream.ErrKeyNotFound) && !errors.Is(err, jetstream.ErrKeyDeleted) {
-			return nil, nil, err
 		}
 		next, err := change(previous)
 		if err != nil {
@@ -203,7 +203,10 @@ func (s *NATSStore) Update(ctx context.Context, orgID, aorHash string, change fu
 			if marshalErr != nil {
 				return nil, nil, marshalErr
 			}
-			if previous != nil && bytes.Equal(value, entry.Value()) {
+			// The no-op short circuit needs the bytes actually in the bucket, so it applies only when
+			// this attempt read them; a hint is a local copy and equal bytes do not prove the server
+			// agrees.
+			if stored != nil && bytes.Equal(value, stored) {
 				return previous, next, nil
 			}
 			if revision == 0 {
@@ -215,7 +218,8 @@ func (s *NATSStore) Update(ctx context.Context, orgID, aorHash string, change fu
 		if err == nil {
 			return previous, next, nil
 		}
-		if !errors.Is(err, jetstream.ErrKeyExists) && !errors.Is(err, jetstream.ErrKeyNotFound) {
+		if !errors.Is(err, jetstream.ErrKeyExists) && !errors.Is(err, jetstream.ErrKeyNotFound) &&
+			!isWrongLastSequence(err) {
 			return nil, nil, err
 		}
 		if err := ctx.Err(); err != nil {
@@ -225,17 +229,25 @@ func (s *NATSStore) Update(ctx context.Context, orgID, aorHash string, change fu
 	return nil, nil, ErrConcurrentUpdate
 }
 
+// isWrongLastSequence reports a rejected CAS: the revision the write named is not the current one.
+// It is the retryable case, and jetstream surfaces it as an APIError with
+// ErrCodeStreamWrongLastSequence, which neither ErrKeyExists nor ErrKeyNotFound matches.
+func isWrongLastSequence(err error) bool {
+	apiError, ok := errors.AsType[*jetstream.APIError](err)
+	return ok && apiError.ErrorCode == jetstream.JSErrCodeStreamWrongLastSequence
+}
+
 // NATSStore is the production Store, backed by the registrations KV bucket.
 type NATSStore struct {
 	bucket jetstream.KeyValue
+	// hint is the optional last-known-value source; see Hint. Nil means every Update reads first.
+	hint Hint
 }
 
 var _ Store = (*NATSStore)(nil)
 
-// Open binds to (creating if absent) the registrations bucket described by packages/events-go.
-//
-// CreateOrUpdateKeyValue is idempotent, so every sipd instance can call it at boot: the first one
-// creates the bucket, the rest bind to it.
+// Open binds to (creating if absent) the registrations bucket described by packages/events-go. It is
+// idempotent, so every sipd instance can call it at boot.
 func Open(ctx context.Context, js jetstream.JetStream) (*NATSStore, error) {
 	definition := contract.RegistrationsKV
 	bucket, err := js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
@@ -277,8 +289,8 @@ func (s *NATSStore) Put(ctx context.Context, binding Binding) error {
 	return nil
 }
 
-// Get reads a binding. The second result is false when the key is absent, which is a normal
-// answer ("that device is not registered"), not an error.
+// Get reads a binding. The second result is false when the key is absent, which is a normal answer
+// rather than an error.
 func (s *NATSStore) Get(ctx context.Context, orgID, aorHash string) (Binding, bool, error) {
 	key, err := contract.RegistrationKVKey(orgID, aorHash)
 	if err != nil {
@@ -299,8 +311,7 @@ func (s *NATSStore) Get(ctx context.Context, orgID, aorHash string) (Binding, bo
 	return binding, true, nil
 }
 
-// Delete removes a binding. Deleting an absent key is not an error: de-registration is idempotent
-// and a device may send Expires: 0 twice.
+// Delete removes a binding. Deleting an absent key is not an error; de-registration is idempotent.
 func (s *NATSStore) Delete(ctx context.Context, orgID, aorHash string) error {
 	key, err := contract.RegistrationKVKey(orgID, aorHash)
 	if err != nil {
@@ -342,15 +353,14 @@ func (s *NATSStore) All(ctx context.Context) ([]Binding, error) {
 	return bindings, nil
 }
 
-// MemoryStore is an in-process Store. It backs the unit tests and lets sipd run without a broker
-// during development; it is NOT a deployment option, because a binding only one instance knows
-// about is a call the rest of the fleet cannot deliver.
+// MemoryStore is an in-process Store for tests and broker-less development. It is not a deployment
+// option: a binding only one instance knows about is a call the rest of the fleet cannot deliver.
 type MemoryStore struct {
 	revision uint64
 	mu       sync.RWMutex
 	bindings map[string]Binding
-	// updates counts Update calls, so a test can assert that a sweep did not spend a round trip on
-	// a binding that is nowhere near its deadline.
+	// updates counts Update calls, so a test can assert a sweep spent no round trip on a binding
+	// nowhere near its deadline.
 	updates int
 }
 

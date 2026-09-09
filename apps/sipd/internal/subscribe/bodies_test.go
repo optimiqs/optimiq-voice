@@ -10,10 +10,8 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/mwi"
 )
 
-// The notification bodies are the only part of this package a handset actually parses, and a phone
-// that dislikes one does not complain — it leaves the lamp where it was. So the tests PARSE what the
-// builders produce rather than string-matching it: an assertion that survives a whitespace change
-// but fails on a wrong element is the one worth having.
+// The tests PARSE what the builders produce rather than string-matching it, so an assertion
+// survives a whitespace change but fails on a wrong element.
 
 // parsedDialogInfo is the reader's view of the document, deliberately declared apart from the
 // writer's struct so a rename on one side fails here instead of passing vacuously.
@@ -97,9 +95,8 @@ func TestDialogInfoBodyRendersEveryDeviceState(t *testing.T) {
 	}
 }
 
-// A state this build does not know must read as "no dialogs", never as a lit lamp: a dark key on a
-// busy extension is a smaller lie than a lit key on a free one, because the second makes a
-// receptionist not transfer a call.
+// A state this build does not know must read as "no dialogs", never as a lit lamp: a lit key on a
+// free extension stops a receptionist transferring a call.
 func TestDialogInfoBodyTreatsAnUnknownStateAsIdle(t *testing.T) {
 	body, err := dialogInfoBody("sip:1001@acme.example.com", "1001", "teleported", 3)
 	if err != nil {
@@ -120,8 +117,8 @@ func TestDialogInfoBodyCarriesTheVersionAWatcherOrdersOn(t *testing.T) {
 	}
 }
 
-// The entity and the dialog id come off the wire. Concatenating them into XML is how a Request-URI
-// containing a quote produces a malformed body — or, on a permissive parser, an injected element.
+// The entity and the dialog id come off the wire: concatenating them into XML is how a quote in a
+// Request-URI becomes an injected element.
 func TestDialogInfoBodyEscapesWireSuppliedText(t *testing.T) {
 	body, err := dialogInfoBody(`sip:a"<b@acme.example.com`, `1<0"1`, contract.PresenceDeviceStateActive, 0)
 	if err != nil {

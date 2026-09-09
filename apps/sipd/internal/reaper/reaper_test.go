@@ -3,6 +3,7 @@ package reaper
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -77,13 +78,13 @@ func (f *fakeClaims) All(_ context.Context) ([]dialog.Claim, error) {
 func (f *fakeClaims) deletedLegs() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]string(nil), f.deleted...)
+	return slices.Clone(f.deleted)
 }
 
 func (f *fakeClaims) written() []dialog.Claim {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]dialog.Claim(nil), f.puts...)
+	return slices.Clone(f.puts)
 }
 
 type fakeLive struct{ claims []dialog.Claim }
@@ -127,7 +128,7 @@ func newTestReaper(t *testing.T, store Claims, live Live, events sipevents.Publi
 func TestAnOrphanedClaimIsPublishedAndDeleted(t *testing.T) {
 	store := newFakeClaims(claim("leg-dead", "sipd-gone", testNow.Add(-time.Minute)))
 	events := sipevents.NewRecordingPublisher()
-	newTestReaper(t, store, fakeLive{}, events).Sweep(context.Background())
+	newTestReaper(t, store, fakeLive{}, events).Sweep(t.Context())
 
 	terminated := events.TerminatedEvents()
 	if len(terminated) != 1 {
@@ -153,7 +154,7 @@ func TestAnOrphanedClaimIsPublishedAndDeleted(t *testing.T) {
 func TestTheTerminationNamesTheDeadOwnerNotTheReaper(t *testing.T) {
 	store := newFakeClaims(claim("leg-dead", "sipd-gone", testNow.Add(-time.Minute)))
 	events := sipevents.NewRecordingPublisher()
-	newTestReaper(t, store, fakeLive{}, events).Sweep(context.Background())
+	newTestReaper(t, store, fakeLive{}, events).Sweep(t.Context())
 
 	data := events.TerminatedEvents()[0].Data
 	if data.InstanceID != "sipd-gone" {
@@ -167,7 +168,7 @@ func TestTheTerminationNamesTheDeadOwnerNotTheReaper(t *testing.T) {
 func TestTheTerminationIsAttributedToATimerAndNotToAReasonHeader(t *testing.T) {
 	store := newFakeClaims(claim("leg-dead", "sipd-gone", testNow.Add(-time.Minute)))
 	events := sipevents.NewRecordingPublisher()
-	newTestReaper(t, store, fakeLive{}, events).Sweep(context.Background())
+	newTestReaper(t, store, fakeLive{}, events).Sweep(t.Context())
 
 	data := events.TerminatedEvents()[0].Data
 	if data.Initiator != contract.SIPDialogTerminatedInitiatorTimer {
@@ -187,7 +188,7 @@ func TestTheTerminationIsAttributedToATimerAndNotToAReasonHeader(t *testing.T) {
 func TestOurOwnExpiredClaimsAreNeverReaped(t *testing.T) {
 	store := newFakeClaims(claim("leg-mine", "sipd-alive", testNow.Add(-time.Hour)))
 	events := sipevents.NewRecordingPublisher()
-	newTestReaper(t, store, fakeLive{}, events).Sweep(context.Background())
+	newTestReaper(t, store, fakeLive{}, events).Sweep(t.Context())
 
 	if events.Len() != 0 {
 		t.Fatalf("published %d events for our own expired claim, want 0", events.Len())
@@ -201,7 +202,7 @@ func TestOurOwnExpiredClaimsAreNeverReaped(t *testing.T) {
 func TestAnUnexpiredClaimFromAnotherInstanceIsLeftAlone(t *testing.T) {
 	store := newFakeClaims(claim("leg-theirs", "sipd-other", testNow.Add(time.Minute)))
 	events := sipevents.NewRecordingPublisher()
-	newTestReaper(t, store, fakeLive{}, events).Sweep(context.Background())
+	newTestReaper(t, store, fakeLive{}, events).Sweep(t.Context())
 
 	if events.Len() != 0 {
 		t.Fatalf("published %d events for a live claim, want 0", events.Len())
@@ -214,7 +215,7 @@ func TestAnUnexpiredClaimFromAnotherInstanceIsLeftAlone(t *testing.T) {
 func TestAFailedPublishLeavesTheClaimForTheNextSweep(t *testing.T) {
 	store := newFakeClaims(claim("leg-dead", "sipd-gone", testNow.Add(-time.Minute)))
 	events := &failingPublisher{err: errors.New("stream unavailable")}
-	newTestReaper(t, store, fakeLive{}, events).Sweep(context.Background())
+	newTestReaper(t, store, fakeLive{}, events).Sweep(t.Context())
 
 	if deleted := store.deletedLegs(); len(deleted) != 0 {
 		t.Fatalf("deleted %v after a failed publish; the evidence is gone for ever", deleted)
@@ -228,7 +229,7 @@ func TestAFailedDeleteStillPublished(t *testing.T) {
 	store := newFakeClaims(claim("leg-dead", "sipd-gone", testNow.Add(-time.Minute)))
 	store.delErr = errors.New("bucket unavailable")
 	events := sipevents.NewRecordingPublisher()
-	newTestReaper(t, store, fakeLive{}, events).Sweep(context.Background())
+	newTestReaper(t, store, fakeLive{}, events).Sweep(t.Context())
 
 	if len(events.TerminatedEvents()) != 1 {
 		t.Fatalf("published %d terminations, want 1", len(events.TerminatedEvents()))
@@ -243,7 +244,7 @@ func TestTheSweepRefreshesEveryLiveClaim(t *testing.T) {
 		claim("leg-b", "sipd-alive", testNow.Add(90*time.Second)),
 	}}
 	store := newFakeClaims()
-	newTestReaper(t, store, live, sipevents.NewRecordingPublisher()).Sweep(context.Background())
+	newTestReaper(t, store, live, sipevents.NewRecordingPublisher()).Sweep(t.Context())
 
 	written := store.written()
 	if len(written) != 2 {
@@ -259,7 +260,7 @@ func TestAFailedHeartbeatDoesNotStopTheReap(t *testing.T) {
 	live := fakeLive{claims: []dialog.Claim{claim("leg-a", "sipd-alive", testNow.Add(90*time.Second))}}
 	events := sipevents.NewRecordingPublisher()
 
-	newTestReaper(t, store, live, events).Sweep(context.Background())
+	newTestReaper(t, store, live, events).Sweep(t.Context())
 
 	if len(events.TerminatedEvents()) != 1 {
 		t.Fatal("a failed heartbeat stopped the reap; a dead peer's calls would never be reaped")
@@ -326,13 +327,13 @@ func TestTheReapListingDoesNotRunOnEverySweep(t *testing.T) {
 
 	// The first sweep reaps immediately: a restarted pod's neighbours may be holding claims that
 	// lapsed while it was down.
-	reaper.Sweep(context.Background())
+	reaper.Sweep(t.Context())
 	if store.lists != 1 {
 		t.Fatalf("the first sweep listed %d times, want 1", store.lists)
 	}
 
 	now = now.Add(30 * time.Second)
-	reaper.Sweep(context.Background())
+	reaper.Sweep(t.Context())
 	if store.lists != 1 {
 		t.Errorf("the next sweep listed the bucket again; the reap interval is not honoured")
 	}
@@ -342,7 +343,7 @@ func TestTheReapListingDoesNotRunOnEverySweep(t *testing.T) {
 
 	// Past the reap interval — 2x the sweep interval by default, minus the jitter window.
 	now = now.Add(2 * time.Minute)
-	reaper.Sweep(context.Background())
+	reaper.Sweep(t.Context())
 	if store.lists != 2 {
 		t.Errorf("listed %d times, want the reap to have run again", store.lists)
 	}

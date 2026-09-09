@@ -1,7 +1,6 @@
 package dialog
 
 import (
-	"context"
 	"errors"
 	"strings"
 	"sync"
@@ -50,7 +49,6 @@ func storeWithDialog(t *testing.T, role Role, identity Identity) (*Store, *Dialo
 }
 
 // A mid-dialog request arriving here addresses US in To and ITSELF in From, whichever role we are.
-// One parser therefore serves both, and this is the assertion that keeps it honest.
 func TestMatchRequestUsesTheIncomingOrientation(t *testing.T) {
 	identity := Identity{SIPCallID: "call-1", LocalTag: "ours", RemoteTag: "theirs"}
 	store, created := storeWithDialog(t, RoleUAS, identity)
@@ -85,8 +83,7 @@ Content-Length: 0
 	}
 }
 
-// A UAC dialog is incomplete until the far end answers with a tag. Without Rebind, every BYE on
-// every outbound call would be answered 481.
+// Without Rebind, every BYE on every outbound call would be answered 481.
 func TestRebindIndexesADialogOnceTheRemoteTagIsKnown(t *testing.T) {
 	identity := Identity{SIPCallID: "call-2", LocalTag: "ours"}
 	store, created := storeWithDialog(t, RoleUAC, identity)
@@ -120,8 +117,7 @@ Content-Length: 0
 }
 
 // RFC 3891 §3: the Replaces tags are written from the SENDER's point of view, so `to-tag` is our
-// local tag and `from-tag` is the remote one. Getting it backwards is a transfer that never
-// completes.
+// local tag and `from-tag` is the remote one.
 func TestFindReplaced(t *testing.T) {
 	identity := Identity{SIPCallID: "consult-1", LocalTag: "ours", RemoteTag: "theirs"}
 	store, created := storeWithDialog(t, RoleUAS, identity)
@@ -229,7 +225,7 @@ func TestOrphansIgnoresOurOwnAndLiveClaims(t *testing.T) {
 }
 
 func TestMemoryClaimStoreRoundTrips(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := NewMemoryClaimStore()
 
 	if err := store.Put(ctx, Claim{LegID: "b", InstanceID: "x"}); err != nil {
@@ -297,9 +293,7 @@ func TestIdentityKeysAreInjectionProof(t *testing.T) {
 }
 
 // The reaper's heartbeat runs on its own goroutine and a *Dialog is owned by its session's, so
-// Claims must never read a live dialog. Before the store cached rendered claims it did exactly
-// that, and `state`, `OrgID` and `CallID` were read while the owner was writing them — an actual
-// data race, and a torn claim is what the reaper's CDR of last resort is built from.
+// Claims must never read a live dialog: a torn claim is what the CDR of last resort is built from.
 func TestClaimsDoNotRaceWithTheOwningGoroutine(t *testing.T) {
 	store := NewStore(StoreOptions{InstanceID: "sipd-test", Now: func() time.Time { return testClock }})
 	sessions := make([]*Session, 0, 8)
@@ -328,27 +322,23 @@ func TestClaimsDoNotRaceWithTheOwningGoroutine(t *testing.T) {
 	var work sync.WaitGroup
 	// The owners mutate exactly the fields a claim is rendered from, through their own mailbox.
 	for index, session := range sessions {
-		work.Add(1)
-		go func() {
-			defer work.Done()
+		work.Go(func() {
 			for round := 0; ; round++ {
 				select {
 				case <-stop:
 					return
 				default:
 				}
-				_ = session.Inspect(context.Background(), func(d *Dialog) {
+				_ = session.Inspect(t.Context(), func(d *Dialog) {
 					d.OrgID = "org-" + string(rune('a'+index))
 					d.CallID = "call-" + string(rune('a'+round%26))
 				})
-				_, _ = session.Apply(context.Background(), Input{Trigger: TriggerLocalTrying})
+				_, _ = session.Apply(t.Context(), Input{Trigger: TriggerLocalTrying})
 			}
-		}()
+		})
 	}
 	// And the sweep reads them, the way the reaper does.
-	work.Add(1)
-	go func() {
-		defer work.Done()
+	work.Go(func() {
 		for {
 			select {
 			case <-stop:
@@ -362,7 +352,7 @@ func TestClaimsDoNotRaceWithTheOwningGoroutine(t *testing.T) {
 				}
 			}
 		}
-	}()
+	})
 
 	time.Sleep(50 * time.Millisecond)
 	close(stop)

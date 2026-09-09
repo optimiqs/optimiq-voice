@@ -1,26 +1,13 @@
-// Package nat is sipd's answer to "the far end is not where it says it is".
+// Package nat decides where a far end really is when it is not where it says it is.
 //
-// # The problem, stated once
+// A SIP message carries three addresses a NAT breaks differently: the top Via (fixed by RFC 3581
+// rport/received, which sipgo's transport already applies), the Contact that addresses mid-dialog
+// requests (RFC 3261 §12.1.1, which nothing else fixes), and the SDP `c=` line for media (which
+// mediad latches per RFC 4961, but only if told to expect a mismatch). This package decides the
+// second and third and records why. It is a pure function of observed and advertised addresses: no
+// sockets, no state, no probes.
 //
-// A SIP message carries three addresses that a NAT breaks differently. The top Via says where to
-// send RESPONSES; RFC 3581's `rport` and `received` parameters fix it, and sipgo's transport layer
-// already applies them to responses it sends. The Contact says where to send mid-dialog REQUESTS
-// (RFC 3261 §12.1.1); nothing fixes that, and a phone behind NAT routinely puts `192.168.1.42` in
-// it — so the BYE for a call, or the NOTIFY for a lamp, is addressed to an unroutable host and the
-// call never ends. The SDP `c=` line says where to send MEDIA; mediad latches on the source of the
-// first packet (RFC 4961) and therefore fixes that one itself, but only if it is told to expect the
-// mismatch.
-//
-// This package decides which address wins for the second and third of those, and records why. It
-// is a pure function of what was observed and what was advertised: no sockets, no state, no probes.
-//
-// # Explicitly out of scope
-//
-// STUN, TURN and ICE. There is no STUN client here and there is not going to be one in this wave —
-// the parity audit's row 1.13 records the gap across the whole platform, and closing it is a media
-// plane question first (ICE candidate gathering belongs where the RTP sockets are) and a WebRTC
-// question second. What this package does instead is the thing a server-side B2BUA can do without
-// the far end's cooperation: prefer the address the packets actually came from.
+// STUN, TURN and ICE are out of scope — they are a media-plane concern where the RTP sockets are.
 package nat
 
 import (
@@ -36,18 +23,15 @@ import (
 type Mode string
 
 const (
-	// ModeAuto rewrites only when the advertised address and the observed one disagree in a way
-	// that means NAT. It is the right default: a phone on the same LAN that advertises a reachable
-	// Contact keeps it, which matters because a Contact carries parameters (`+sip.instance`, `gr`,
-	// `ob`) that a rewrite would have to preserve and that some devices route on.
+	// ModeAuto rewrites only when the advertised and observed addresses disagree. The default: a
+	// phone advertising a reachable Contact keeps it, along with parameters (`+sip.instance`, `gr`,
+	// `ob`) some devices route on.
 	ModeAuto Mode = "auto"
-	// ModeAlways sends every mid-dialog request to the observed source regardless. It is what a
-	// carrier-facing profile wants when the carrier is behind an SBC that never updates its
-	// Contact, and it is a hammer: a far end with a legitimately different signalling and media
-	// path is broken by it.
+	// ModeAlways sends every mid-dialog request to the observed source regardless — what a
+	// carrier-facing profile wants behind an SBC that never updates its Contact. It breaks a far end
+	// with a legitimately different signalling path.
 	ModeAlways Mode = "always"
-	// ModeNever trusts the Contact absolutely. It exists so a lab can prove a bug is not this
-	// package's, and for a profile whose peers are all on-net.
+	// ModeNever trusts the Contact absolutely, for a profile whose peers are all on-net.
 	ModeNever Mode = "never"
 )
 
@@ -65,19 +49,14 @@ func (m Mode) Valid() bool {
 type KeepaliveMethod string
 
 const (
-	// KeepaliveNone leaves it to the device's own registration refresh. Correct on a LAN and wrong
-	// behind anything with a UDP timeout shorter than the registration interval — which is most
-	// consumer routers, at 30 to 60 seconds against a typical 300-second REGISTER.
+	// KeepaliveNone leaves it to the device's own registration refresh: wrong behind any router
+	// whose UDP timeout (typically 30-60s) is shorter than the registration interval.
 	KeepaliveNone KeepaliveMethod = "none"
-	// KeepaliveCRLF is RFC 5626 §3.5.1's double-CRLF ping. It is two bytes, it is what a device
-	// implementing SIP outbound expects, and it costs nothing — but it only works when the DEVICE
-	// sends it, so choosing it here means advertising a short enough registration interval that the
-	// device's own timer does the work.
+	// KeepaliveCRLF is RFC 5626 §3.5.1's double-CRLF ping. It only works when the DEVICE sends it,
+	// so choosing it means advertising a registration interval short enough for the device's timer.
 	KeepaliveCRLF KeepaliveMethod = "crlf"
-	// KeepaliveOptions sends an OPTIONS to each binding on an interval. This edge already ANSWERS
-	// OPTIONS (`registrar.HandleOptions`) and has a SIP client that originates NOTIFY, so
-	// originating OPTIONS is the same machinery pointed at the location service — and unlike CRLF
-	// it also tells us the device has gone, which is the qualify half of parity-audit row 1.7.
+	// KeepaliveOptions sends an OPTIONS to each binding on an interval. Unlike CRLF it also tells us
+	// when the device has gone.
 	KeepaliveOptions KeepaliveMethod = "options"
 )
 
@@ -91,32 +70,26 @@ func (m KeepaliveMethod) Valid() bool {
 	}
 }
 
-// Policy is one profile's NAT position. It is data, and the two profiles a deployment has
-// (internal and external) hold different instances of it — which is exactly the structural
-// separation parity-audit row 1.26 says is missing today.
+// Policy is one profile's NAT position. It is data: the internal and external profiles hold
+// different instances of it.
 type Policy struct {
 	// ContactRewrite decides mid-dialog request addressing.
 	ContactRewrite Mode
-	// TrustRPort applies RFC 3581 to responses. Off means "reply to the Via's stated host and
-	// port", which is correct on a trusted LAN and is a response that never arrives from anywhere
-	// else. It is a separate knob from ContactRewrite because responses and requests fail
-	// differently: without rport the far end never sees the 200, without the Contact rewrite it
+	// TrustRPort applies RFC 3581 to responses. A separate knob from ContactRewrite because the two
+	// fail differently: without rport the far end never sees the 200; without the Contact rewrite it
 	// sees the 200 and then cannot be reached again.
 	TrustRPort bool
 	// KeepaliveMethod and KeepaliveInterval keep a pinhole open.
 	KeepaliveMethod   KeepaliveMethod
 	KeepaliveInterval time.Duration
-	// MaxRegistrationInterval clamps what the registrar may grant on this profile, so a device
-	// behind NAT cannot talk itself into a 3600-second registration that its router forgets after
-	// sixty. Zero means "do not clamp", which is the internal profile's answer.
+	// MaxRegistrationInterval clamps what the registrar may grant, so a device behind NAT cannot
+	// talk itself into a 3600-second registration its router forgets after sixty. Zero means no clamp.
 	MaxRegistrationInterval time.Duration
 }
 
-// DefaultInternalPolicy is what a profile serving registered desk phones wants.
-//
-// Rewrite on evidence, trust rport, and clamp the registration interval to five minutes so a
-// device behind a home router refreshes often enough to keep its pinhole open even if it asked for
-// an hour.
+// DefaultInternalPolicy is what a profile serving registered desk phones wants: rewrite on
+// evidence, trust rport, and clamp registrations to five minutes so a device behind a home router
+// refreshes often enough to keep its pinhole open.
 func DefaultInternalPolicy() Policy {
 	return Policy{
 		ContactRewrite:          ModeAuto,
@@ -127,19 +100,16 @@ func DefaultInternalPolicy() Policy {
 	}
 }
 
-// DefaultExternalPolicy is what a profile serving carriers wants.
-//
-// Always rewrite: a carrier's Contact is frequently an internal SBC address that is meaningless to
-// us, and there is no registration to clamp because a trunk either registers to US (a different
-// path) or authenticates by source IP.
+// DefaultExternalPolicy is what a profile serving carriers wants: always rewrite, because a
+// carrier's Contact is frequently an internal SBC address meaningless to us, and no registration
+// clamp, because a trunk authenticates by source IP or registers to us on a different path.
 func DefaultExternalPolicy() Policy {
 	return Policy{
 		ContactRewrite:  ModeAlways,
 		TrustRPort:      true,
 		KeepaliveMethod: KeepaliveOptions,
 		// A minute rather than thirty seconds: a carrier is not behind a consumer NAT, so this is a
-		// reachability probe rather than a pinhole ping, and it feeds trunk.status* (design's
-		// S-trunk rung) rather than keeping a hole open.
+		// reachability probe feeding trunk.status* rather than a pinhole ping.
 		KeepaliveInterval: 60 * time.Second,
 	}
 }
@@ -149,9 +119,8 @@ type Decision struct {
 	// Target is the URI to put in the Request-URI.
 	Target sip.Uri
 	// Destination is the transport-level address to SEND to, host:port, when it differs from the
-	// target's own host and port. It is the same split `transfer/handler.go` already draws for
-	// NOTIFY: the Contact stays the address, the observed source becomes the destination, so the
-	// far end still recognises the URI it gave us while the packet goes somewhere that works.
+	// target's own. The Contact stays the address so the far end still recognises the URI it gave
+	// us, while the packet goes somewhere that works.
 	Destination string
 	// Rewritten reports whether the observed address won.
 	Rewritten bool
@@ -160,13 +129,9 @@ type Decision struct {
 	Reason string
 }
 
-// TargetFor decides where a mid-dialog request for one far end goes.
-//
-// The Contact is ALWAYS kept as the Request-URI, in every mode. That is not a compromise, it is the
-// correct reading of RFC 3261 §12.2.1.1: the remote target URI is what the far end asked to be
-// addressed as, and rewriting it changes the identity of the resource rather than the route to it.
-// What the policy changes is the DESTINATION — the socket we write to — which is a transport
-// concern and is exactly where a NAT lives.
+// TargetFor decides where a mid-dialog request for one far end goes. The Contact is always kept as
+// the Request-URI in every mode, per RFC 3261 §12.2.1.1: rewriting the remote target changes the
+// identity of the resource rather than the route to it. Only the DESTINATION changes.
 func (p Policy) TargetFor(contact sip.Uri, observed string) Decision {
 	decision := Decision{Target: contact}
 
@@ -199,12 +164,9 @@ func (p Policy) TargetFor(contact sip.Uri, observed string) Decision {
 	return decision
 }
 
-// SameEndpoint reports whether a Contact URI and an observed `host:port` name the same place.
-//
-// Host and port both, because a NAT that preserves the address and changes the port is the common
-// case on a symmetric NAT, and comparing hosts alone would call it "same" and then send a BYE to a
-// port nobody is listening on. A Contact with no port compares against the default 5060, which is
-// what the absence of a port means.
+// SameEndpoint reports whether a Contact URI and an observed `host:port` name the same place. Host
+// and port both: a symmetric NAT commonly preserves the address and changes the port, and comparing
+// hosts alone would send a BYE to a port nobody is listening on. A missing Contact port means 5060.
 func SameEndpoint(contact sip.Uri, observed string) bool {
 	observedHost, observedPort, err := net.SplitHostPort(observed)
 	if err != nil {
@@ -218,18 +180,13 @@ func SameEndpoint(contact sip.Uri, observed string) bool {
 }
 
 // NeedsRewrite reports whether the advertised and observed addresses disagree — the "is this far
-// end behind a NAT" question on its own, for the log line and for the registrar's decision about
-// what to echo in a 200's Contact.
+// end behind a NAT" question on its own.
 func NeedsRewrite(contact sip.Uri, observed string) bool {
 	if observed == "" {
 		return false
 	}
 	return !SameEndpoint(contact, observed)
 }
-
-// ---------------------------------------------------------------------------------------------
-// RFC 3581: rport and received
-// ---------------------------------------------------------------------------------------------
 
 // ViaFix is what RFC 3581 says to add to a top Via before responding.
 type ViaFix struct {
@@ -243,17 +200,14 @@ type ViaFix struct {
 	// Applied reports whether anything changed.
 	Applied bool
 	// SymmetricDestination is where the response must be SENT when rport was requested: the source
-	// address verbatim, port included. That is the whole point of rport — "reply to the port I sent
-	// from, not the one I claim to listen on" — and it is what makes SIP work through a symmetric
-	// NAT at all.
+	// address verbatim, port included. That is the point of rport, and what makes SIP work through a
+	// symmetric NAT.
 	SymmetricDestination string
 }
 
-// FixVia computes the received/rport parameters for a top Via against an observed source.
-//
-// It does not mutate the Via. sipgo's transport layer performs the mutation on the responses it
-// sends; this function is here so the same rule can be applied to the requests this edge
-// ORIGINATES within a dialog, and so it can be tested as a table rather than through a socket.
+// FixVia computes the received/rport parameters for a top Via against an observed source. It does
+// not mutate the Via: sipgo's transport does that for responses it sends, and this exists so the
+// same rule applies to the requests this edge originates within a dialog.
 func (p Policy) FixVia(via *sip.ViaHeader, observed string) ViaFix {
 	fix := ViaFix{}
 	if via == nil || observed == "" {
@@ -276,8 +230,6 @@ func (p Policy) FixVia(via *sip.ViaHeader, observed string) ViaFix {
 		return fix
 	}
 	if !p.TrustRPort {
-		// The sender asked and this profile declines. Recorded rather than silently skipped, so a
-		// "responses never arrive" report has something in the log to find.
 		return fix
 	}
 	_ = value // a valueless rport is the request; a valued one is a response we are not reading
@@ -289,24 +241,13 @@ func (p Policy) FixVia(via *sip.ViaHeader, observed string) ViaFix {
 	return fix
 }
 
-// ---------------------------------------------------------------------------------------------
-// media
-// ---------------------------------------------------------------------------------------------
-
-// MediaHint is what the signalling plane can tell the media plane about a far end that is not
-// where its SDP says it is.
+// MediaHint is what the signalling plane can tell the media plane about a far end that is not where
+// its SDP says it is.
 //
-// # Why this is a hint and not a rewrite
-//
-// sipd does not rewrite SDP. It forwards an offer it does not parse (design §5.2), and a process
-// that edited a `c=` line would be making a media decision in the signalling plane — the exact
-// coupling both design documents refuse. What it CAN do is state the discrepancy: mediad already
-// latches onto the source of the first RTP packet (`apps/mediad/internal/rtp/session.go`, RFC 4961
-// latch-once), and a latch is far more reliable when the session was told to expect one.
-//
-// So the hint travels with the offer on the admission RPC, the engine passes it to mediad's
-// allocate, and mediad decides. Nothing here touches an SDP body except to read the connection
-// ADDRESS — not a codec, not a payload type, not a format list.
+// A hint and not a rewrite: sipd forwards an offer it does not parse, and editing a `c=` line would
+// make a media decision in the signalling plane. mediad latches onto the first RTP packet's source
+// (RFC 4961 latch-once) and latches far more reliably when told to expect one. Nothing here reads an
+// SDP body except the connection address.
 type MediaHint struct {
 	// SignallingSource is where the far end's SIP packets came from, host:port.
 	SignallingSource string
@@ -335,11 +276,8 @@ func HintFor(sdp []byte, signallingSource string) MediaHint {
 	return hint
 }
 
-// ConnectionAddress reads the address out of an SDP `c=` line and NOTHING else.
-//
-// `c=IN IP4 192.168.1.42` — three tokens, and only the third is read. The media-level line wins
-// over the session-level one, per RFC 4566 §5.7, because that is the address the media stream
-// actually uses.
+// ConnectionAddress reads the address out of an SDP `c=` line and nothing else. The media-level
+// line wins over the session-level one, per RFC 4566 §5.7.
 func ConnectionAddress(sdp []byte) string {
 	if len(sdp) == 0 {
 		return ""
@@ -347,7 +285,7 @@ func ConnectionAddress(sdp []byte) string {
 	sessionLevel := ""
 	mediaLevel := ""
 	sawMedia := false
-	for _, raw := range strings.Split(string(sdp), "\n") {
+	for raw := range strings.SplitSeq(string(sdp), "\n") {
 		line := strings.TrimRight(raw, "\r")
 		switch {
 		case strings.HasPrefix(line, "m="):
@@ -357,8 +295,8 @@ func ConnectionAddress(sdp []byte) string {
 			if len(fields) < 3 {
 				continue
 			}
-			// A multicast address carries a TTL suffix (`224.2.1.1/127`). Nothing in this PBX uses
-			// multicast media, and keeping the suffix would make every comparison below fail.
+			// A multicast address carries a TTL suffix (`224.2.1.1/127`) that would make every
+			// comparison below fail.
 			address, _, _ := strings.Cut(fields[2], "/")
 			if sawMedia {
 				if mediaLevel == "" {
@@ -375,11 +313,9 @@ func ConnectionAddress(sdp []byte) string {
 	return sessionLevel
 }
 
-// IsPrivate reports whether an address is one that cannot have reached us across the internet:
-// RFC 1918 v4, RFC 4193 v6 unique-local, link-local, and loopback.
-//
-// A name that is not an IP address answers false. A hostname in a `c=` line is legal and rare, and
-// resolving it here would put a DNS lookup on the INVITE path for a guess.
+// IsPrivate reports whether an address cannot have reached us across the internet: RFC 1918 v4,
+// RFC 4193 v6 unique-local, link-local, and loopback. A name that is not an IP address answers
+// false, because resolving it would put a DNS lookup on the INVITE path for a guess.
 func IsPrivate(address string) bool {
 	ip := net.ParseIP(address)
 	if ip == nil {
@@ -388,21 +324,14 @@ func IsPrivate(address string) bool {
 	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast()
 }
 
-// ---------------------------------------------------------------------------------------------
-// keepalive
-// ---------------------------------------------------------------------------------------------
-
 // RegistrationInterval clamps a granted registration interval to what this profile's NAT position
-// can survive.
-//
-// A device behind a consumer router that is granted an hour will lose its pinhole in a minute and
-// be unreachable for fifty-nine, while both ends believe it is registered. Clamping is the one
-// mitigation that needs no cooperation from the device: it refreshes on the interval we grant.
+// can survive. A device granted an hour loses its pinhole in a minute and is unreachable for
+// fifty-nine while both ends believe it is registered; clamping needs no cooperation from it.
 func (p Policy) RegistrationInterval(granted time.Duration) time.Duration {
-	if p.MaxRegistrationInterval <= 0 || granted <= p.MaxRegistrationInterval {
+	if p.MaxRegistrationInterval <= 0 {
 		return granted
 	}
-	return p.MaxRegistrationInterval
+	return min(granted, p.MaxRegistrationInterval)
 }
 
 // KeepaliveDue reports whether a binding last touched at `last` is due for a keepalive at `now`.
@@ -415,13 +344,8 @@ func (p Policy) KeepaliveDue(last, now time.Time) bool {
 	return !now.Before(last.Add(p.KeepaliveInterval))
 }
 
-// ---------------------------------------------------------------------------------------------
-// small helpers
-// ---------------------------------------------------------------------------------------------
-
 func itoa(value int) string { return strconv.Itoa(value) }
 
-// parsePort reads a numeric port and refuses everything else. strconv rather than net.LookupPort
-// on purpose: LookupPort accepts service NAMES and would consult the resolver, which is a syscall
-// on the response path for a string that came off the wire.
+// parsePort reads a numeric port and refuses everything else. strconv rather than net.LookupPort:
+// LookupPort accepts service names and would consult the resolver on the response path.
 func parsePort(raw string) (int, error) { return strconv.Atoi(raw) }

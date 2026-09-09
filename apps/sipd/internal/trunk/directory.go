@@ -1,12 +1,14 @@
 package trunk
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 
@@ -14,9 +16,11 @@ import (
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 )
 
-// Record uses the API's generated wire contract. Gateway configuration is derived here
-// so carrier passwords never enter the shared directory.
+// Record is the API's generated wire contract for one directory entry. Gateway configuration is
+// derived from it here so carrier passwords never enter the shared directory.
 type Record contract.TrunkDirectoryEntry
+
+// Config derives the registration configuration this record describes.
 
 func (r Record) Config() Config {
 	config := Config{
@@ -51,25 +55,17 @@ func (r Record) Config() Config {
 	return config
 }
 
-// Directory is the in-process trunk table, filled from the bucket and swapped on every update.
+// Directory is the in-process trunk table, filled from the `trunks` bucket at boot and kept filled
+// by a watch. It is read rather than fetched per call because a KV get on the originate path would
+// put a broker round trip inside the one-second budget of `rpc.sip.v1.originate`.
 //
-// # Read at boot and WATCHED, never a get per call
-//
-// `TrunksKV`'s own note says why: a trunk edited in the admin UI must reach the registration state
-// machine without a restart, and that is what replaces SIPD_TRUNK_ACL. The originate path reads this
-// map, and a KV get there would put a broker round trip inside the one-second budget of
-// `rpc.sip.v1.originate`.
-//
-// Safe for concurrent use. The map is replaced wholesale under a write lock rather than mutated,
-// because a reader mid-originate must see a consistent directory and not a half-applied edit.
+// Safe for concurrent use: every read and every mutation takes d.mu.
 type Directory struct {
 	mu      sync.RWMutex
 	entries map[string]Config
 	log     *slog.Logger
-	// onChange is called after every applied update, with the lock RELEASED. It is how the watcher
-	// reaches the registration supervisor without internal/trunk's read model depending on its own
-	// state machine's lifecycle — and it is called after the swap rather than during it so a callback
-	// that reads Configs sees the new world rather than deadlocking on the old one.
+	// onChange is called after every applied update with the lock RELEASED, so a callback that
+	// reads Configs sees the new world instead of deadlocking.
 	onChange func()
 }
 
@@ -83,9 +79,8 @@ func (d *Directory) changed() {
 	}
 }
 
-// NewDirectory returns an empty directory. Empty is a legitimate state and not an error: a
-// deployment with no trunks configured is a deployment that serves only registered devices, and
-// every originate to `{kind:"trunk"}` is refused `unknown_trunk` — which is the truth.
+// NewDirectory returns an empty directory. Empty is legitimate: a deployment with no trunks serves
+// only registered devices and refuses every trunk originate with `unknown_trunk`.
 func NewDirectory(log *slog.Logger) *Directory {
 	if log == nil {
 		log = slog.Default()
@@ -94,8 +89,8 @@ func NewDirectory(log *slog.Logger) *Directory {
 }
 
 // Trunk resolves one trunk. The second result is false when this instance holds no configuration
-// for it, which is `unknown_trunk` on the wire and means "the directory has not reached me" rather
-// than "no such trunk".
+// for it — `unknown_trunk` on the wire, meaning "the directory has not reached me" rather than "no
+// such trunk".
 func (d *Directory) Trunk(orgID, trunkID string) (Config, bool) {
 	key, err := contract.TrunkKVKey(orgID, trunkID)
 	if err != nil {
@@ -107,7 +102,7 @@ func (d *Directory) Trunk(orgID, trunkID string) (Config, bool) {
 	return config, found
 }
 
-// Len reports how many trunks the directory holds. Diagnostics and the boot log.
+// Len reports how many trunks the directory holds.
 func (d *Directory) Len() int {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -119,19 +114,13 @@ func (d *Directory) Len() int {
 func (d *Directory) Configs() []Config {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	configs := make([]Config, 0, len(d.entries))
-	for _, config := range d.entries {
-		configs = append(configs, config)
-	}
-	sort.Slice(configs, func(i, j int) bool { return configs[i].TrunkID < configs[j].TrunkID })
-	return configs
+	return slices.SortedFunc(maps.Values(d.entries), func(a, b Config) int {
+		return cmp.Compare(a.TrunkID, b.TrunkID)
+	})
 }
 
-// Put installs or replaces one trunk. Exported so a test and a watch update take the same path.
-//
-// A record that fails Validate is REFUSED and the previous one is kept. That is the important half:
-// an operator who saves a half-filled trunk form must not take a working carrier offline, and the
-// log line is what tells them the edit did not apply.
+// Put installs or replaces one trunk. A record that fails Validate is REFUSED and the previous one
+// kept, so an operator saving a half-filled form cannot take a working carrier offline.
 func (d *Directory) Put(key string, config Config) error {
 	if err := config.Validate(); err != nil {
 		return err
@@ -153,13 +142,10 @@ func (d *Directory) Remove(key string) {
 	delete(d.entries, key)
 }
 
-// OpenDirectoryBucket binds to the `trunks` bucket described by packages/events-go.
-//
-// It does NOT create it. The bucket is a derived read model written by apps/api from the trunk
-// table, and a data-plane edge that created its own would bring one up empty — so every outbound
-// call would be refused `unknown_trunk` while the control plane wrote into a bucket with the same
-// name and different limits. A missing bucket is therefore an error the boot log names, and the
-// caller decides whether that is fatal.
+// OpenDirectoryBucket binds to the `trunks` bucket described by packages/events-go. It does NOT
+// create it: the bucket is a read model written by apps/api, and an edge that created its own would
+// bring up an empty one alongside the real one. A missing bucket is an error for the caller to
+// judge.
 func OpenDirectoryBucket(ctx context.Context, js jetstream.JetStream) (jetstream.KeyValue, error) {
 	if js == nil {
 		return nil, errors.New("trunk: a JetStream context is required for the trunks bucket")
@@ -173,15 +159,11 @@ func OpenDirectoryBucket(ctx context.Context, js jetstream.JetStream) (jetstream
 
 // Watch fills the directory from the bucket and keeps it filled until the context is cancelled.
 //
-// # One watch, not a load followed by a watch
-//
-// `WatchAll` replays every existing key before it starts delivering updates and marks the boundary
-// with a nil entry. So one call does the boot load and the live updates, and there is no window
-// between them in which an edit could be missed — which a load-then-watch has, and which would leave
-// a trunk permanently stale for however long the process ran.
+// One WatchAll rather than a load followed by a watch: it replays every existing key and marks the
+// boundary with a nil entry, so there is no window between the two in which an edit is missed.
 //
 // The returned channel is closed once the initial replay is complete, so a caller can wait for the
-// directory to be populated before it starts a registration sweep without polling Len.
+// directory to be populated before starting a registration sweep.
 func Watch(ctx context.Context, bucket jetstream.KeyValue, directory *Directory) (<-chan struct{}, error) {
 	if bucket == nil {
 		return nil, errors.New("trunk: a trunks bucket is required to watch it")
@@ -215,8 +197,7 @@ func Watch(ctx context.Context, bucket jetstream.KeyValue, directory *Directory)
 					// The end of the initial replay. Everything after this is a live edit.
 					directory.log.Info("trunk directory loaded",
 						"bucket", contract.TrunksKV.Name, "trunks", directory.Len())
-					// One reconcile for the whole replay rather than one per key, so a boot with two
-					// hundred trunks starts two hundred gateways once instead of two hundred times.
+					// One reconcile for the whole replay rather than one per key.
 					directory.changed()
 					closeReady()
 					continue
@@ -228,12 +209,9 @@ func Watch(ctx context.Context, bucket jetstream.KeyValue, directory *Directory)
 	return ready, nil
 }
 
-// applyTrunkUpdate turns one KV update into a directory change.
-//
-// A DELETE or a PURGE removes the trunk. A poisoned value is skipped and the previous configuration
-// is kept, for the same reason Directory.Put refuses an invalid one: a malformed write must not take
-// a working carrier offline, and the operator needs a log line naming the key rather than an
-// outbound outage with no cause.
+// applyTrunkUpdate turns one KV update into a directory change. A DELETE or PURGE removes the
+// trunk; a poisoned value is logged and skipped with the previous configuration left standing, so a
+// malformed write cannot take a working carrier offline.
 func applyTrunkUpdate(directory *Directory, entry jetstream.KeyValueEntry) {
 	switch entry.Operation() {
 	case jetstream.KeyValueDelete, jetstream.KeyValuePurge:

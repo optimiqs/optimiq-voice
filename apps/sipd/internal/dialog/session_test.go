@@ -8,30 +8,22 @@ import (
 	"time"
 )
 
-// The whole reason a session exists: a CANCEL and an `answer` that arrive at the same instant must
-// have exactly ONE winner, decided by the order they reach one goroutine rather than by a scheduler.
-//
-// This test runs both concurrently, many times, and asserts the invariant that holds whichever
-// wins: either the answer won and the CANCEL was refused too-late, or the CANCEL won and the answer
-// was refused dialog_gone. What must NEVER happen is both succeeding — that is a call that was
-// answered and cancelled, which produces two CDR rows and a phone left off-hook.
+// Whichever of the two wins, the other must be refused by name — the answer with ErrCancelTooLate,
+// the CANCEL with ErrDialogGone. Both succeeding is a call that was answered and cancelled.
 func TestCancelAndAnswerRaceHasExactlyOneWinner(t *testing.T) {
-	for attempt := 0; attempt < 200; attempt++ {
+	for attempt := range 200 {
 		d := newTestDialog(t, RoleUAS)
 		session := NewSession(d, SessionOptions{Handler: &RecordingHandler{}})
 
 		var wait sync.WaitGroup
 		var answerErr, cancelErr error
-		wait.Add(2)
-		go func() {
-			defer wait.Done()
-			_, answerErr = session.Apply(context.Background(),
+		wait.Go(func() {
+			_, answerErr = session.Apply(t.Context(),
 				Input{Trigger: TriggerLocalAnswer, Body: []byte("v=0\r\n")})
-		}()
-		go func() {
-			defer wait.Done()
-			_, cancelErr = session.Apply(context.Background(), Input{Trigger: TriggerRemoteCancel})
-		}()
+		})
+		wait.Go(func() {
+			_, cancelErr = session.Apply(t.Context(), Input{Trigger: TriggerRemoteCancel})
+		})
 		wait.Wait()
 		session.Close()
 
@@ -54,15 +46,15 @@ func TestCancelAndAnswerRaceHasExactlyOneWinner(t *testing.T) {
 	}
 }
 
-// Effects run on the owning goroutine, in order, BEFORE the caller is answered. That ordering is
-// what puts the 200 on the socket before `answer` replies.
+// Effects run on the owning goroutine, in order, BEFORE the caller is answered: the ordering that
+// puts the 200 on the socket before `answer` replies.
 func TestEffectsRunInOrderBeforeTheCallerIsAnswered(t *testing.T) {
 	d := newTestDialog(t, RoleUAS)
 	handler := &RecordingHandler{}
 	session := NewSession(d, SessionOptions{Handler: handler})
 	defer session.Close()
 
-	if _, err := session.Apply(context.Background(), Input{Trigger: TriggerLocalAnswer}); err != nil {
+	if _, err := session.Apply(t.Context(), Input{Trigger: TriggerLocalAnswer}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	// The caller has been answered, so every effect for that command has already run.
@@ -71,7 +63,7 @@ func TestEffectsRunInOrderBeforeTheCallerIsAnswered(t *testing.T) {
 		t.Fatalf("effects = %v, want a single respond", kinds)
 	}
 
-	if _, err := session.Apply(context.Background(), Input{Trigger: TriggerRemoteBye}); err != nil {
+	if _, err := session.Apply(t.Context(), Input{Trigger: TriggerRemoteBye}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	kinds = handler.Kinds()
@@ -86,8 +78,8 @@ func TestEffectsRunInOrderBeforeTheCallerIsAnswered(t *testing.T) {
 	}
 }
 
-// A failing effect must not stop the ones behind it: abandoning the list would skip the terminal
-// publish, and a call that ends with no event is a call with no CDR.
+// A failing effect must not stop the ones behind it, or a teardown skips the terminal publish and
+// the call gets no CDR.
 func TestAFailingEffectDoesNotStopTheRest(t *testing.T) {
 	d := newTestDialog(t, RoleUAS)
 	handler := &RecordingHandler{Err: errors.New("the socket is gone")}
@@ -95,7 +87,7 @@ func TestAFailingEffectDoesNotStopTheRest(t *testing.T) {
 	defer session.Close()
 
 	apply := func(in Input) {
-		if _, err := session.Apply(context.Background(), in); err != nil {
+		if _, err := session.Apply(t.Context(), in); err != nil {
 			t.Fatalf("Apply(%s): %v", in.Trigger, err)
 		}
 	}
@@ -121,12 +113,12 @@ func TestEffectsRunEvenWhenTheTaskRefuses(t *testing.T) {
 	session := NewSession(d, SessionOptions{Handler: handler})
 	defer session.Close()
 
-	if _, err := session.Apply(context.Background(), Input{Trigger: TriggerLocalAnswer}); err != nil {
+	if _, err := session.Apply(t.Context(), Input{Trigger: TriggerLocalAnswer}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	handler.Reset()
 
-	_, err := session.Apply(context.Background(), Input{Trigger: TriggerRemoteCancel})
+	_, err := session.Apply(t.Context(), Input{Trigger: TriggerRemoteCancel})
 	if !errors.Is(err, ErrCancelTooLate) {
 		t.Fatalf("err = %v, want ErrCancelTooLate", err)
 	}
@@ -136,8 +128,7 @@ func TestEffectsRunEvenWhenTheTaskRefuses(t *testing.T) {
 	}
 }
 
-// A closed session refuses commands by name rather than hanging, and Close is idempotent because
-// both a teardown and a shutdown sweep may reach it.
+// A closed session refuses commands by name rather than hanging, and Close is idempotent.
 func TestClosedSessionRefusesAndCloseIsIdempotent(t *testing.T) {
 	d := newTestDialog(t, RoleUAS)
 	session := NewSession(d, SessionOptions{})
@@ -152,8 +143,8 @@ func TestClosedSessionRefusesAndCloseIsIdempotent(t *testing.T) {
 	}
 }
 
-// A caller whose context expires learns that its command did not get an answer in time — which is
-// what a timed-out RPC means, and why commands are idempotent on legId.
+// A caller whose context expires learns its command got no answer in time, which is why commands
+// are idempotent on legId.
 func TestApplyRespectsTheCallersDeadline(t *testing.T) {
 	d := newTestDialog(t, RoleUAS)
 	release := make(chan struct{})
@@ -179,29 +170,24 @@ func TestApplyRespectsTheCallersDeadline(t *testing.T) {
 	}
 }
 
-// Inspect reads a dialog on its owner's goroutine, which is the only way to read one without a
-// data race — and `go test -race` is what proves it.
+// Inspect reads a dialog on its owner's goroutine, which is the only race-free way to read one.
 func TestInspectReadsOnTheOwningGoroutine(t *testing.T) {
 	d := newTestDialog(t, RoleUAS)
 	session := NewSession(d, SessionOptions{})
 	defer session.Close()
 
 	var wait sync.WaitGroup
-	for worker := 0; worker < 8; worker++ {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
+	for range 8 {
+		wait.Go(func() {
 			var state State
-			if err := session.Inspect(context.Background(), func(d *Dialog) { state = d.State() }); err != nil {
+			if err := session.Inspect(t.Context(), func(d *Dialog) { state = d.State() }); err != nil {
 				t.Errorf("Inspect: %v", err)
 			}
 			_ = state
-		}()
+		})
 	}
-	wait.Add(1)
-	go func() {
-		defer wait.Done()
-		_, _ = session.Apply(context.Background(), Input{Trigger: TriggerLocalRing})
-	}()
+	wait.Go(func() {
+		_, _ = session.Apply(t.Context(), Input{Trigger: TriggerLocalRing})
+	})
 	wait.Wait()
 }

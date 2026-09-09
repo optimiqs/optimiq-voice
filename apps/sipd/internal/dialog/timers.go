@@ -12,10 +12,8 @@ import (
 type Refresher int
 
 const (
-	// RefresherNone means session timers are not in use on this dialog. It is the honest state for
-	// a peer that never offered `Supported: timer`, and it must not be confused with "we are the
-	// refresher and have not started yet": a one-sided timer is worse than none, because the side
-	// that thinks there is a timer tears down a call the other side considers healthy.
+	// RefresherNone means session timers are not in use on this dialog. A one-sided timer is worse
+	// than none: the side that believes in it tears down a call the other considers healthy.
 	RefresherNone Refresher = iota
 	// RefresherLocal means this edge refreshes. We send a re-INVITE or UPDATE at the mid-point.
 	RefresherLocal
@@ -73,11 +71,8 @@ func (t SessionTimer) Negotiated() bool {
 }
 
 // RefreshAfter is when this side must send its refresh, and is zero when this side does not owe
-// one.
-//
-// Half the interval, which is RFC 4028 §10's rule and is generous on purpose: a refresh that is
-// lost still leaves a whole half-interval for a retransmission to succeed before the far end starts
-// tearing the call down.
+// one. Half the interval, per RFC 4028 §10, so a lost refresh still leaves a half-interval for a
+// retransmission before the far end tears the call down.
 func (t SessionTimer) RefreshAfter() time.Duration {
 	if !t.Negotiated() || t.Refresher != RefresherLocal {
 		return 0
@@ -85,12 +80,9 @@ func (t SessionTimer) RefreshAfter() time.Duration {
 	return t.Interval / 2
 }
 
-// ExpiresAfter is when this side gives up on a call that has not been refreshed.
-//
-// The full interval, and never earlier. RFC 4028 §10 lets the non-refresher act at the expiry; both
-// ends acting at once is harmless (a BYE crossing a BYE is the ordinary simultaneous-hangup case
-// this dialog layer already handles), whereas acting EARLY tears down a call whose refresh is on
-// the wire.
+// ExpiresAfter is when this side gives up on a call that has not been refreshed: the full interval
+// and never earlier (RFC 4028 §10). Both ends acting at once is harmless — a BYE crossing a BYE —
+// whereas acting early tears down a call whose refresh is still on the wire.
 func (t SessionTimer) ExpiresAfter() time.Duration {
 	if !t.Negotiated() {
 		return 0
@@ -100,9 +92,8 @@ func (t SessionTimer) ExpiresAfter() time.Duration {
 
 // TimerPolicy is this edge's own position, from configuration.
 type TimerPolicy struct {
-	// Enabled turns session timers on at all. Off is a legitimate deployment: two extensions on one
-	// LAN do not need a keepalive, and mediad's RTP timeout already reaps a far end that vanished
-	// (design §4.5). It becomes mandatory in front of carriers.
+	// Enabled turns session timers on at all. Off is legitimate on a LAN, where mediad's RTP timeout
+	// already reaps a vanished far end (design §4.5).
 	Enabled bool
 	// MinSE is the shortest interval we will accept. RFC 4028 §4 sets the floor at 90 seconds and
 	// says so for a reason: a shorter one turns every call into a re-INVITE storm.
@@ -114,8 +105,7 @@ type TimerPolicy struct {
 	// effectively disabled the timer.
 	MaxSE time.Duration
 	// PreferLocalRefresh makes this edge volunteer as the refresher when the peer expresses no
-	// preference. Preferring to refresh is the safer default for a B2BUA: we are the one process
-	// that certainly knows whether the call is still up, because we hold both dialogs.
+	// preference — the safer default for a B2BUA, which holds both dialogs and so knows the truth.
 	PreferLocalRefresh bool
 }
 
@@ -134,15 +124,9 @@ func DefaultTimerPolicy() TimerPolicy {
 // normalised fills in the RFC's floors for a policy that was configured loosely, so every caller
 // below can assume the invariants rather than re-check them.
 func (p TimerPolicy) normalised() TimerPolicy {
-	if p.MinSE < 90*time.Second {
-		p.MinSE = 90 * time.Second
-	}
-	if p.DefaultSE < p.MinSE {
-		p.DefaultSE = p.MinSE
-	}
-	if p.MaxSE < p.DefaultSE {
-		p.MaxSE = p.DefaultSE
-	}
+	p.MinSE = max(p.MinSE, 90*time.Second)
+	p.DefaultSE = max(p.DefaultSE, p.MinSE)
+	p.MaxSE = max(p.MaxSE, p.DefaultSE)
 	return p
 }
 
@@ -177,18 +161,10 @@ type Negotiation struct {
 // Refused reports whether the request must be answered with a failure rather than accepted.
 func (n Negotiation) Refused() bool { return n.RefuseStatus != 0 }
 
-// NegotiateUAS decides what to do with an INVITE (or re-INVITE) that arrived here.
-//
-// # The three answers, and why each is what it is
-//
-//  1. 422 Session Interval Too Small, when the peer asked for less than our floor. RFC 4028 §6
-//     requires the Min-SE header on it, and a peer that gets one retries at that value — so a 422
-//     is a negotiation step and not a failure.
-//  2. 420 Bad Extension, when the peer wrote `Require: timer` and this deployment has session
-//     timers off. Refusing loudly is the only honest answer: accepting would leave the peer
-//     expecting refreshes that will never come, and it would tear the call down mid-conversation.
-//  3. An agreement, otherwise. A peer that says nothing at all gets no timer, because imposing one
-//     on a UA that never advertised support produces refreshes it answers 501 to.
+// NegotiateUAS decides what to do with an INVITE (or re-INVITE) that arrived here: 422 with a
+// Min-SE when the peer asked below our floor (RFC 4028 §6 — a negotiation step, not a failure), 420
+// when it wrote `Require: timer` and this deployment has timers off, otherwise an agreement. A peer
+// that said nothing gets no timer, since imposing one produces refreshes it answers 501 to.
 func NegotiateUAS(policy TimerPolicy, request TimerRequest) Negotiation {
 	policy = policy.normalised()
 
@@ -203,11 +179,8 @@ func NegotiateUAS(policy TimerPolicy, request TimerRequest) Negotiation {
 		return Negotiation{}
 	}
 
-	floor := policy.MinSE
-	if request.MinSE > floor {
-		// The peer's floor is higher than ours. It is a floor and not a preference, so it wins.
-		floor = request.MinSE
-	}
+	// The peer's Min-SE is a floor and not a preference, so the higher of the two wins.
+	floor := max(policy.MinSE, request.MinSE)
 	if request.SessionExpires > 0 && request.SessionExpires < policy.MinSE {
 		return Negotiation{RefuseStatus: 422, MinSEHeader: policy.MinSE}
 	}
@@ -216,14 +189,9 @@ func NegotiateUAS(policy TimerPolicy, request TimerRequest) Negotiation {
 	if interval == 0 {
 		interval = policy.DefaultSE
 	}
-	if interval > policy.MaxSE {
-		interval = policy.MaxSE
-	}
-	if interval < floor {
-		// Clamping down below an agreed floor would be proposing something we just said was too
-		// small. The floor wins even when it exceeds our own maximum: it is the peer's hard limit.
-		interval = floor
-	}
+	// The floor wins even over our own maximum: clamping below it would propose an interval one of
+	// the two ends has already called too small.
+	interval = max(min(interval, policy.MaxSE), floor)
 
 	return Negotiation{Timer: SessionTimer{
 		Interval:  interval,
@@ -232,27 +200,16 @@ func NegotiateUAS(policy TimerPolicy, request TimerRequest) Negotiation {
 	}}
 }
 
-// AcceptUACResponse reads the timer headers off a 2xx to an INVITE we sent.
-//
-// A far end that answers with no Session-Expires has declined the timer, and we must forget ours —
-// keeping it would make this edge tear down a call the far end has every intention of continuing,
-// which is the exact one-sided failure NegotiateUAS refuses to create in the other direction.
+// AcceptUACResponse reads the timer headers off a 2xx to an INVITE we sent. A far end that answers
+// with no Session-Expires has declined the timer and ours must be forgotten, or this edge tears
+// down a call the far end intends to continue.
 func AcceptUACResponse(policy TimerPolicy, response TimerRequest) SessionTimer {
 	policy = policy.normalised()
 	if !policy.Enabled || response.SessionExpires == 0 {
 		return SessionTimer{}
 	}
-	interval := response.SessionExpires
-	if interval > policy.MaxSE {
-		interval = policy.MaxSE
-	}
-	floor := policy.MinSE
-	if response.MinSE > floor {
-		floor = response.MinSE
-	}
-	if interval < floor {
-		interval = floor
-	}
+	floor := max(policy.MinSE, response.MinSE)
+	interval := max(min(response.SessionExpires, policy.MaxSE), floor)
 	return SessionTimer{
 		Interval:  interval,
 		MinSE:     floor,
@@ -261,11 +218,8 @@ func AcceptUACResponse(policy TimerPolicy, response TimerRequest) SessionTimer {
 }
 
 // RetryAfter422 is what a UAC does with a `422 Session Interval Too Small`: ask again for the value
-// the far end named, bounded by our own ceiling.
-//
-// Bounded, because the Min-SE on a 422 is attacker-influenced on a trunk: a peer that answers 422
-// with `Min-SE: 86400` would otherwise talk us into a session timer that never fires. The second
-// result reports whether a retry is worth making at all.
+// the far end named, bounded by our own ceiling because that Min-SE is attacker-influenced on a
+// trunk. The second result reports whether a retry is worth making at all.
 func RetryAfter422(policy TimerPolicy, minSE time.Duration) (time.Duration, bool) {
 	policy = policy.normalised()
 	switch {
@@ -299,21 +253,15 @@ func refresherFor(policy TimerPolicy, request TimerRequest, role Role) Refresher
 	return RefresherRemote
 }
 
-// SetTimer records a negotiated timer on the dialog. It is a method rather than an exported field
-// so the invariant — a timer is either fully negotiated or absent — has one place to hold.
+// SetTimer records a negotiated timer on the dialog, keeping the invariant that a timer is either
+// fully negotiated or absent in one place.
 func (d *Dialog) SetTimer(timer SessionTimer) { d.timer = timer }
 
 // Timer reports the dialog's negotiated session timer.
 func (d *Dialog) Timer() SessionTimer { return d.timer }
 
-// ---------------------------------------------------------------------------------------------
-// header reading
-// ---------------------------------------------------------------------------------------------
-
-// ReadTimerHeaders extracts the RFC 4028 request from a message's headers.
-//
-// It takes the accessors rather than a *sip.Request so one function serves requests and responses,
-// which carry the same four headers and are two unrelated types in sipgo.
+// ReadTimerHeaders extracts the RFC 4028 request from a message's headers. It takes the accessor
+// rather than a *sip.Request so one function serves both, which are unrelated types in sipgo.
 func ReadTimerHeaders(headers func(name string) []sip.Header) TimerRequest {
 	request := TimerRequest{}
 
@@ -363,14 +311,11 @@ func splitHeaderParams(raw string) (string, map[string]string) {
 	return parts[0], params
 }
 
-// optionTagPresent reports whether an option tag appears in any of the given headers.
-//
-// Comma-separated within one header AND repeated across several is legal (RFC 3261 §7.3.1), and
-// handsets do both, so a reader that handles only one of the two finds `timer` on some phones and
-// not on others — which would be a session timer that silently does not exist.
+// optionTagPresent reports whether an option tag appears in any of the given headers. Both the
+// comma-separated and the repeated-header forms are legal (RFC 3261 §7.3.1) and handsets use both.
 func optionTagPresent(headers []sip.Header, tag string) bool {
 	for _, header := range headers {
-		for _, candidate := range strings.Split(header.Value(), ",") {
+		for candidate := range strings.SplitSeq(header.Value(), ",") {
 			if strings.EqualFold(strings.TrimSpace(candidate), tag) {
 				return true
 			}

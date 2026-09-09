@@ -1,23 +1,14 @@
 // Package invite is sipd's INVITE surface: the half of a call that happens before there is a call.
 //
-// # Where this stops, and why
+// It parses an INVITE into a CallIntent, decides whether the sender may send it at all, and hands
+// the intent to a Port. It does not route, attribute a tenant for a trunk call, pick a codec or
+// touch media: sipd owns "is this sender allowed to send me an INVITE", the engine owns "whose call
+// is it". Port's production implementation is client.go, a raw NATS request against
+// `rpc.sip.v1.invite`; RefusingPort is the honest behaviour for a deployment with no broker.
 //
-// It parses an INVITE into a CALL INTENT, decides whether the sender may send it at all, and hands
-// the intent to a Port. It does not route, does not attribute a tenant for a trunk call, does not
-// pick a codec and does not touch media. Those are the engine's and mediad's, and the split is
-// design §4.2's: sipd owns "is this sender allowed to send me an INVITE", the engine owns "whose
-// call is it".
-//
-// The Port is the seam, and its production implementation now EXISTS: client.go is a raw NATS
-// request against `rpc.sip.v1.invite`, whose schemas are in packages/events and whose responder is
-// in apps/engine. RefusingPort survives beside it and is not a stub — it is the honest production
-// behaviour for a deployment with no broker, answering every INVITE 503 with a Retry-After and
-// logging why, rather than pretending a call could have been placed.
-//
-// This package also owns the OUTBOUND half now (originate.go): the engine's `rpc.sip.v1.originate`
-// resolves an AOR against this edge's own location service or a trunk against the watched directory,
-// and places a UAC INVITE. It still picks no codec in either direction — inbound it forwards an
-// offer it does not parse, outbound one it did not write.
+// The package also owns the outbound half (originate.go), resolving an AOR against this edge's own
+// location service or a trunk against the watched directory before placing a UAC INVITE. It picks
+// no codec in either direction.
 package invite
 
 import (
@@ -30,8 +21,8 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/profile"
 )
 
-// Authentication says HOW the sender proved it may send this INVITE. It is the field that decides
-// which routing context the engine may resolve in, so it is not a log annotation.
+// Authentication says how the sender proved it may send this INVITE. It decides which routing
+// context the engine may resolve in, so it is not a log annotation.
 type Authentication string
 
 const (
@@ -39,8 +30,7 @@ const (
 	// tenant is known from the credential and travels on the request.
 	AuthenticationDigest Authentication = "digest"
 	// AuthenticationTrunkACL means the source address matched an allow entry. No tenant is known;
-	// the engine resolves it from the did-index, which is exactly why `orgId` is optional on the
-	// admission request (design §4.2).
+	// the engine resolves it from the did-index, which is why `orgId` is optional on the request.
 	AuthenticationTrunkACL Authentication = "trunk-acl"
 )
 
@@ -52,25 +42,18 @@ type Party struct {
 	// Name is the display name when the far end supplied one. PII-adjacent and purely for
 	// presentation.
 	Name string
-	// AOR is the canonical address of record. For the caller on a digest-authenticated INVITE it is
-	// rebuilt FROM THE CREDENTIAL and never copied from the From header — the rule
-	// `transfer/handler.go` states as "mixing those two up is how an authorisation check becomes
-	// decorative". For a trunk call there is no credential, so it is absent rather than guessed.
+	// AOR is the canonical address of record. On a digest-authenticated INVITE it is rebuilt from
+	// the credential and never copied from the From header; absent for a trunk call, never guessed.
 	AOR string
-	// URI is the address verbatim, for the log and for the day a call to a foreign domain has to be
-	// refused explicitly rather than quietly dialled as a local extension.
+	// URI is the address verbatim.
 	URI string
 }
 
-// CallIntent is everything this edge can truthfully say about an arriving INVITE.
-//
-// The field set is design §10.3's `rpc.sip.v1.invite` request, plus two things that document
-// records as needed and does not name: the profile the call arrived on (so a refusal record says
-// which boundary admitted it) and the media hint (so mediad can be told to expect a NAT latch).
+// CallIntent is everything this edge can truthfully say about an arriving INVITE: the
+// `rpc.sip.v1.invite` request, plus the profile the call arrived on and the media hint.
 type CallIntent struct {
-	// LegID is minted here for an inbound call. One string names the leg, the mediad session and
-	// the dialog (design §3.1), and minting it BEFORE the RPC is what lets the engine hang up a leg
-	// whose admission reply it never saw.
+	// LegID is minted here for an inbound call, before the RPC, so the engine can hang up a leg
+	// whose admission reply it never saw. One string names the leg, the mediad session and dialog.
 	LegID string
 	// InstanceID is this sipd's token. Every subsequent command for this leg is addressed at it,
 	// because a dialog lives on one process.
@@ -81,10 +64,9 @@ type CallIntent struct {
 	Authentication Authentication
 	// Profile names the trust boundary this arrived on.
 	Profile string
-	// RoutingContext is the boundary the engine may resolve in. `internal` for a digest,
-	// `inbound-untrusted` for a trunk ACL match — and the engine must refuse an admission whose
-	// context is trunk-capable and whose authentication was an ACL match (design §8.3). Sending it
-	// from here does not make it true; it makes it CHECKABLE on the side that can enforce it.
+	// RoutingContext is the boundary the engine may resolve in: `internal` for a digest,
+	// `inbound-untrusted` for a trunk ACL match. The engine must refuse an admission whose context
+	// is trunk-capable and whose authentication was an ACL match.
 	RoutingContext profile.RoutingContext
 	// From and To are the two parties.
 	From Party
@@ -101,22 +83,17 @@ type CallIntent struct {
 	Transport string
 	// HasOffer reports whether the INVITE carried an SDP body.
 	HasOffer bool
-	// SDPOffer is the body verbatim. It is on the request rather than fetched later because the
-	// engine is the courier for it and a second round trip would sit in the middle of an INVITE for
-	// no gain (design §10.3, which flags this as the one field argued both ways).
+	// SDPOffer is the body verbatim, carried on the request because the engine is its courier and a
+	// second round trip would sit in the middle of an INVITE.
 	SDPOffer string
 	// MediaHint tells the media plane that the far end's advertised media address disagrees with
 	// where its signalling came from, so a latch is expected rather than a surprise.
 	MediaHint nat.MediaHint
-	// UserAgent is the far end's User-Agent, for the log and for interop workarounds that have not
-	// been needed yet.
+	// UserAgent is the far end's User-Agent.
 	UserAgent string
 	// Replaces is the RFC 3891 header when this INVITE completes an attended transfer, and
-	// ReplacesLegID is the leg it correlated to on THIS instance.
-	//
-	// Both travel to the engine because the engine has to do the other half: the dialog is replaced
-	// here, and the CALL the replaced leg belonged to has to be re-bridged there. Sending only the
-	// SIP identifiers would make the engine re-derive a leg id this edge already holds.
+	// ReplacesLegID is the leg it correlated to on this instance. Both travel to the engine, which
+	// re-bridges the call the replaced leg belonged to.
 	Replaces      *Replaces
 	ReplacesLegID string
 }
@@ -129,18 +106,15 @@ var (
 	// ErrNoFrom means it named nobody calling.
 	ErrNoFrom = errors.New("invite: the INVITE carries no usable From address")
 	// ErrNoContact means the far end gave no Contact, so no mid-dialog request could ever reach it.
-	// RFC 3261 §8.1.1.8 makes it mandatory on an INVITE, and sipgo's ReadInvite refuses one without
-	// it too — this error exists so the refusal is OURS, with a status we chose.
+	// RFC 3261 §8.1.1.8 makes it mandatory on an INVITE; this error exists so the refusal is ours,
+	// with a status we chose.
 	ErrNoContact = errors.New("invite: the INVITE carries no Contact header")
 	// ErrNoCallID means there is no dialog identifier at all.
 	ErrNoCallID = errors.New("invite: the INVITE carries no Call-ID")
 )
 
-// Parse turns an INVITE into a call intent.
-//
-// It is a pure function of the message plus the decisions the caller has already made — which
-// profile owns it, which credential (if any) authenticated it — and it reads no state and performs
-// no I/O. That is what makes every branch below testable from wire text.
+// Parse turns an INVITE into a call intent. It is a pure function of the message plus the decisions
+// the caller has already made, and performs no I/O.
 func Parse(req *sip.Request, opts ParseOptions) (CallIntent, error) {
 	callID := req.CallID()
 	if callID == nil || strings.TrimSpace(callID.Value()) == "" {
@@ -194,12 +168,8 @@ func Parse(req *sip.Request, opts ParseOptions) (CallIntent, error) {
 	return intent, nil
 }
 
-// ParseOptions carries what the caller already decided and Parse must not re-derive.
-//
-// Every field here is a decision made by a check the parser cannot perform: the profile came from
-// the listener, the credential from a digest exchange, the trunk from an ACL match. Passing them in
-// rather than looking them up is what keeps Parse a pure function and keeps the authorisation
-// decisions in the one place that made them.
+// ParseOptions carries what the caller already decided and Parse must not re-derive: the profile
+// from the listener, the credential from a digest exchange, the trunk from an ACL match.
 type ParseOptions struct {
 	LegID          string
 	InstanceID     string
@@ -214,9 +184,8 @@ type ParseOptions struct {
 }
 
 // canonicalURI renders an address in the one spelling this platform stores: scheme, user, and a
-// LOWER-CASED host (RFC 3261 §19.1.4 makes the host case-insensitive). Anything else hashes to a
-// different key and would report a registered phone as unregistered — the same rule the registrar
-// and the REFER handler already apply.
+// lower-cased host (RFC 3261 §19.1.4 makes the host case-insensitive). Any other spelling hashes to
+// a different key and would report a registered phone as unregistered.
 func canonicalURI(uri sip.Uri) string {
 	scheme := uri.Scheme
 	if scheme == "" {

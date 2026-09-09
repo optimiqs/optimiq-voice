@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -152,13 +154,10 @@ func TestOutboundCarrierCallAuthenticatesAcknowledgesAndReleases(t *testing.T) {
 	})
 	defer func() {
 		h.mu.Lock()
-		left := make([]*leg, 0, len(h.legs))
-		for _, item := range h.legs {
-			left = append(left, item)
-		}
+		left := slices.Collect(maps.Values(h.legs))
 		h.mu.Unlock()
 		for _, item := range left {
-			_, _ = item.session.Do(context.Background(), func(*dialog.Dialog) (dialog.Outcome, error) {
+			_, _ = item.session.Do(t.Context(), func(*dialog.Dialog) (dialog.Outcome, error) {
 				if item.state.ringTimer != nil {
 					item.state.ringTimer.Stop()
 				}

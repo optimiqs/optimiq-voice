@@ -3,17 +3,14 @@ package dialog
 // DialogEvent is one member of the `sip.evt.v1` family (design §10.2).
 //
 // The values are the dotted event token that goes in the subject —
-// `sip.evt.v1.<orgId>.<legId>.dialog.answered` — so the string here is the string on the wire and
-// there is no second spelling to keep in step. The subject BUILDER belongs in packages/events-go
-// alongside every other family's; until it lands, this is the vocabulary and nothing publishes.
+// `sip.evt.v1.<orgId>.<legId>.dialog.answered` — so the string here is the string on the wire.
 type DialogEvent string
 
 const (
 	// EventProgressed is a 18x: ringing, or early when the response carried SDP.
 	EventProgressed DialogEvent = "dialog.progressed"
-	// EventAnswered is the ACK for a UAS leg and the 2xx for a UAC leg (design §3.3). The
-	// asymmetry is not sloppiness — it is the moment the call is genuinely up in each direction,
-	// and `billsec` counts from it.
+	// EventAnswered is the ACK for a UAS leg and the 2xx for a UAC leg (design §3.3): the moment
+	// the call is genuinely up in each direction, and where `billsec` counts from.
 	EventAnswered DialogEvent = "dialog.answered"
 	// EventHeld is a re-INVITE or UPDATE that moved the far end to sendonly or inactive.
 	EventHeld DialogEvent = "dialog.held"
@@ -26,11 +23,9 @@ const (
 	EventDTMF DialogEvent = "dialog.dtmf"
 )
 
-// TerminationReason says WHICH way a dialog ended, alongside the Q.850 cause that says why.
-//
-// Two fields rather than one because they answer different questions and a consumer needs both: a
-// `cancelled` and a `rejected` can both carry cause 16, and a CDR that cannot tell them apart
-// cannot tell a caller who hung up from a callee who declined.
+// TerminationReason says WHICH way a dialog ended, alongside the Q.850 cause that says why. Both
+// are needed: a `cancelled` and a `rejected` can carry the same cause 16, and a CDR that folds them
+// together cannot tell a caller who hung up from a callee who declined.
 type TerminationReason string
 
 const (
@@ -46,24 +41,17 @@ const (
 	// another one took its place (design's S-replaces rung).
 	ReasonReplaced TerminationReason = "replaced"
 	// ReasonInstanceLost is design §6.2's reaping path: a surviving instance found an expired claim
-	// and published the termination its owner never got to. The engine writes a CDR from a
-	// `leg-ended` it would otherwise never have received.
+	// and published the termination its owner never got to.
 	ReasonInstanceLost TerminationReason = "instance-lost"
 	// ReasonShuttingDown is a drain that ran out of patience.
 	ReasonShuttingDown TerminationReason = "shutting-down"
 )
 
 // Initiator says WHO ended a dialog, alongside the reason that says how and the cause that says
-// why.
+// why. It is independent of the reason: a `rejected` is local when this edge refused admission and
+// remote when the far end answered `486 Busy Here`, and both carry Q.850 17.
 //
-// A third field rather than a refinement of the second, because the reason and the initiator are
-// genuinely independent: a `rejected` is LOCAL when this edge refused admission and REMOTE when the
-// far end answered `486 Busy Here`, and both carry Q.850 17. A CDR that folded them together could
-// not tell a call the platform blocked from a call the callee declined — which is the first question
-// asked about every disputed minute.
-//
-// The values are the contract's verbatim (`SIPDialogTerminatedInitiator`), so the string here is the
-// string on the wire and there is no second spelling to keep in step.
+// The values are the contract's verbatim (`SIPDialogTerminatedInitiator`).
 type Initiator string
 
 const (
@@ -72,8 +60,7 @@ const (
 	// InitiatorRemote is the far end: a BYE, a CANCEL, a final failure response to our INVITE.
 	InitiatorRemote Initiator = "remote"
 	// InitiatorTimer is nobody: Timer B, an unACKed 2xx, an RFC 4028 expiry, a ring timeout, or a
-	// reaper finding an expired claim. It is separate from `local` because "our timer fired" and "we
-	// decided" are the same actor and completely different incidents.
+	// reaper finding an expired claim — separate from `local`, which means we decided.
 	InitiatorTimer Initiator = "timer"
 )
 
@@ -84,13 +71,9 @@ func (i Initiator) Valid() bool {
 
 // EffectKind is one thing the owner of a dialog must DO as a result of a trigger.
 //
-// # Why effects rather than method calls
-//
-// The state machine returns a description of what should happen and touches no socket. That is what
-// makes a CANCEL racing an answer testable as a table: the race is decided by the ORDER two
-// triggers reach one goroutine, and the proof is which effects come back, not what a mock saw. It
-// also keeps the sipgo API surface — which changes between minor versions — out of the part of this
-// package that encodes the RFC, which does not.
+// The state machine returns effects and touches no socket, which makes a race like a CANCEL against
+// an answer testable as a table and keeps the sipgo API surface out of the part of this package that
+// encodes the RFC.
 type EffectKind int
 
 const (
@@ -182,19 +165,16 @@ func (k EffectKind) String() string {
 	}
 }
 
-// Effect is one instruction from the machine to whoever owns the socket.
-//
-// It is a struct with a kind rather than an interface because the set is closed and small, and
-// because a test that asserts on `[]Effect` reads as a list of what happened rather than as a
-// sequence of type switches.
+// Effect is one instruction from the machine to whoever owns the socket. A struct with a kind
+// rather than an interface, because the set is closed and small and a test asserting on `[]Effect`
+// reads as a list of what happened.
 type Effect struct {
 	Kind EffectKind
 	// Status and Reason fill a response's start line.
 	Status int
 	Reason string
 	// Body is the SDP to attach, when there is one. This package never parses it beyond the
-	// direction attributes hold needs (see offer.go): sipd holds no codec knowledge in either
-	// direction, which is design §5.2's rule and the whole reason mediad exists.
+	// direction attributes hold needs (see offer.go); sipd holds no codec knowledge (design §5.2).
 	Body []byte
 	// Event, Cause and Termination fill an EffectPublish.
 	Event       DialogEvent
@@ -204,7 +184,7 @@ type Effect struct {
 	Detail string
 }
 
-// publish is the constructor for a non-terminal event, so the call sites stay one line.
+// publish is the constructor for a non-terminal event.
 func publish(event DialogEvent) Effect {
 	return Effect{Kind: EffectPublish, Event: event}
 }

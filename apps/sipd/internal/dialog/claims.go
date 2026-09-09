@@ -1,40 +1,24 @@
 package dialog
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 
 	"github.com/nats-io/nats.go/jetstream"
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 )
 
-// NATSClaimStore is the production ClaimStore, backed by the `sip-dialogs` KV bucket.
+// NATSClaimStore is the production ClaimStore, backed by the `sip-dialogs` KV bucket. It exists so
+// a SURVIVING sipd can publish terminations on behalf of a dead owner (design §6.2), not for
+// failover: sockets, timers and CSeq are local to one process.
 //
-// # What it is for, restated where the I/O is
-//
-// Not failover. A dialog's sockets, timers and CSeq are local to one process, so when a sipd dies
-// its calls die with it and nothing can move them. What must not also die is the ENGINE's knowledge
-// that they ended: without it the engine holds channels for calls that ended when a pod was
-// rescheduled, and no CDR is ever written for any of them. This bucket is how a SURVIVOR learns
-// enough to publish those terminations on the dead owner's behalf (design §6.2).
-//
-// # Why the record's own expiresAt and not the bucket's TTL
-//
-// `contract.SIPDialogsKV` has a six-hour TTL and that is a BACKSTOP, not the lease. Server-side
-// expiry cannot tell "the owner stopped heartbeating" from "this was written a long time ago and is
-// still correct" — a six-hour conference call is a real thing — so the lease is a field in the
-// value, refreshed by the owner, and the reaper reads it. The TTL exists so a claim whose owner
-// died and whose reaper also died does not sit in the bucket for ever.
-//
-// # Not organization-scoped
-//
-// The key is the leg id and nothing else: the reader that matters most is a surviving sipd sweeping
-// a dead peer's claims, and it has neither the org nor any way to guess it. The org travels in the
-// value. That is the same exception `did-index` and `media-sessions` take, and `SIPDialogKVKey`
-// states the argument once so no call site has to.
+// The lease is the record's own expiresAt, refreshed by the owner, not the bucket TTL: server-side
+// expiry cannot tell a stalled owner from a long-lived call. Keys are the leg id alone and carry no
+// org, because a sweeper of a dead peer's claims has no way to guess one.
 type NATSClaimStore struct {
 	bucket jetstream.KeyValue
 }
@@ -42,11 +26,8 @@ type NATSClaimStore struct {
 var _ ClaimStore = (*NATSClaimStore)(nil)
 
 // OpenClaims binds to (creating if absent) the `sip-dialogs` bucket described by packages/events-go.
-//
-// CreateOrUpdateKeyValue is idempotent, so every sipd instance can call it at boot: the first one
-// creates the bucket, the rest bind to it. The configuration comes from the contract rather than
-// from this file, for the reason internal/kv states — a bucket two services disagree about is a
-// bucket one of them silently mis-reads.
+// It is idempotent, so every sipd instance may call it at boot; the configuration comes from the
+// contract so two services cannot disagree about the bucket's shape.
 func OpenClaims(ctx context.Context, js jetstream.JetStream) (*NATSClaimStore, error) {
 	if js == nil {
 		return nil, errors.New("dialog: a JetStream context is required for the sip-dialogs bucket")
@@ -76,8 +57,7 @@ func claimStorage(storage contract.StorageType) jetstream.StorageType {
 }
 
 // Put implements ClaimStore. It is the heartbeat as well as the create: one unconditional write,
-// because the value carries a fresh expiresAt every time and a compare-and-set would buy nothing
-// against a bucket with exactly one writer per key.
+// since the value carries a fresh expiresAt and each key has exactly one writer.
 func (s *NATSClaimStore) Put(ctx context.Context, claim Claim) error {
 	key, err := contract.SIPDialogKVKey(claim.LegID)
 	if err != nil {
@@ -108,11 +88,9 @@ func (s *NATSClaimStore) Delete(ctx context.Context, legID string) error {
 
 // All implements ClaimStore.
 //
-// Keys-then-get rather than a watch, and that is deliberate: this is the REAPER's input, it runs on
-// a sweep interval measured in tens of seconds, and it is on no request path at all. A watch would
-// hold a consumer open for a read that happens twice a minute, and the per-key get is what lets one
-// unparseable value be skipped instead of poisoning the whole sweep — which is the difference
-// between one call missing a CDR and every call on a dead instance missing one.
+// Keys-then-get rather than a watch: this is the reaper's input on a sweep measured in tens of
+// seconds, and the per-key get lets one unparseable value be skipped instead of poisoning the
+// whole sweep.
 func (s *NATSClaimStore) All(ctx context.Context) ([]Claim, error) {
 	keys, err := s.bucket.Keys(ctx)
 	if errors.Is(err, jetstream.ErrNoKeysFound) {
@@ -145,6 +123,6 @@ func (s *NATSClaimStore) All(ctx context.Context) ([]Claim, error) {
 		}
 		claims = append(claims, claim)
 	}
-	sort.Slice(claims, func(i, j int) bool { return claims[i].LegID < claims[j].LegID })
+	slices.SortFunc(claims, func(a, b Claim) int { return cmp.Compare(a.LegID, b.LegID) })
 	return claims, nil
 }

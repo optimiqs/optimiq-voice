@@ -8,17 +8,12 @@ import (
 	"github.com/emiago/sipgo/sip"
 )
 
-// Request-header helpers. Every one of them is total over a hostile input: a SUBSCRIBE arrives from
-// the internet, and the parsers below are the first thing it touches.
-
 // parseEvent splits an `Event` header into its package and its `id` parameter.
 //
 //	Event: dialog;id=1234
 //
-// The id is not decoration: RFC 6665 §8.2.1 makes it part of the subscription's identity, so two
-// line keys on one phone can watch two extensions over ONE dialog, and every notification has to
-// echo the id it belongs to. Dropping it silently is how a sixteen-key expansion module ends up with
-// every lamp showing the same extension.
+// RFC 6665 §8.2.1 makes the id part of the subscription's identity, so one phone can watch two
+// extensions over one dialog and every notification must echo the id it belongs to.
 func parseEvent(value string) (EventPackage, string, bool) {
 	raw := strings.TrimSpace(value)
 	if raw == "" {
@@ -40,17 +35,16 @@ func parseEvent(value string) (EventPackage, string, bool) {
 		id = strings.Trim(strings.TrimSpace(rest), `"`)
 		break
 	}
-	// The id becomes a header value on the way back out, so anything that could break the header —
-	// or forge one — is dropped rather than echoed. That is the CRLF-injection case sipgo's SECURITY
-	// note is about, and this is the only device-controlled string this package puts in a header.
+	// The id is echoed into a header, so anything that could break or forge one is dropped rather
+	// than echoed (CRLF injection); it is the only device-controlled string this package emits there.
 	if !safeEventID(id) {
 		id = ""
 	}
 	return EventPackage(name), id, true
 }
 
-// safeEventID reports whether an Event `id` may be echoed into a header. RFC 3261's `token`
-// production, which is what the grammar allows there anyway.
+// safeEventID reports whether an Event `id` may be echoed into a header: RFC 3261's `token`
+// production, which is all the grammar allows there anyway.
 func safeEventID(value string) bool {
 	if value == "" {
 		return true
@@ -73,9 +67,8 @@ func safeEventID(value string) bool {
 
 // acceptable reports whether a subscriber will take the body type we would send.
 //
-// An ABSENT Accept header means yes: RFC 6665 §4.2.1 says the notifier assumes the event package's
-// default body type, which is exactly the one we send. Several handsets omit it, so treating absence
-// as a refusal would answer 406 to phones that work.
+// An absent Accept header means yes: RFC 6665 §4.2.1 has the notifier assume the event package's
+// default body type, which is the one we send, and several handsets omit the header.
 func acceptable(accept, contentType string) bool {
 	raw := strings.TrimSpace(accept)
 	if raw == "" {
@@ -124,8 +117,8 @@ func headerValue(req *sip.Request, name string) string {
 // expiresHeader reads the request-level Expires header. sipgo's default parser leaves it generic, so
 // it arrives as a string.
 //
-// A SUBSCRIBE states its interval THERE and not on a Contact parameter, unlike a REGISTER: there is
-// one subscription per request, so there is nothing for a per-contact interval to disambiguate.
+// Unlike REGISTER, a SUBSCRIBE states its interval there and not on a Contact parameter: there is
+// one subscription per request.
 func expiresHeader(req *sip.Request) (time.Duration, bool) {
 	raw := strings.TrimSpace(headerValue(req, "Expires"))
 	if raw == "" {
@@ -149,9 +142,8 @@ func fromTag(from *sip.FromHeader) string {
 
 // toTag returns the To header's tag parameter, or "".
 //
-// Its ABSENCE is what distinguishes an initial SUBSCRIBE from a refresh: a request with no To tag is
-// establishing the dialog, so this edge mints the tag; one that carries a tag is already inside a
-// dialog and must keep the one it was given.
+// Its absence distinguishes an initial SUBSCRIBE from a refresh: no To tag means this edge mints
+// one; a request carrying a tag is already in a dialog and must keep the tag it was given.
 func toTag(to *sip.ToHeader) string {
 	if to == nil {
 		return ""

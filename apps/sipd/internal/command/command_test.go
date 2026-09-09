@@ -13,9 +13,8 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/dialog"
 )
 
-// stubDialogs is the whole of what these handlers need. Every method answers from a script and
-// records what it was asked, which is what lets the refusal vocabulary be asserted as a table with
-// no broker, no socket and no dialog machine anywhere.
+// stubDialogs answers from a script and records what it was asked, so the refusal vocabulary can be
+// asserted as a table with no broker, no socket and no dialog machine.
 type stubDialogs struct {
 	ringErr      error
 	answerErr    error
@@ -71,10 +70,8 @@ func decode[T any](t *testing.T, payload []byte) T {
 	return value
 }
 
-// A refusal is always a REPLY and never a silence. Every handler is driven with bytes that cannot
-// possibly be a valid request, and every one of them must still answer — because a responder that
-// stays quiet is indistinguishable from a crashed one and the caller pays the whole timeout to
-// learn nothing.
+// A refusal is always a REPLY and never a silence: a responder that stays quiet is
+// indistinguishable from a crashed one, and the caller pays the whole timeout to learn nothing.
 func TestEveryHandlerAnswersMalformedBytes(t *testing.T) {
 	server := newTestServer(t, &stubDialogs{})
 	garbage := []byte("{not json")
@@ -128,10 +125,9 @@ func TestEveryReplyCarriesTheInstanceID(t *testing.T) {
 	}
 }
 
-// The dialog layer's errors must reach the wire as the contract's reasons, THROUGH a wrap. The wrap
-// is what puts the leg id in the operator's log line, and a mapping that used a type switch instead
-// of errors.Is would collapse every wrapped refusal to `internal` — which tells the engine to give
-// up on a call it should have retried elsewhere.
+// The dialog layer's errors must reach the wire as the contract's reasons THROUGH a wrap. A type
+// switch would collapse every wrapped refusal to `internal`, telling the engine to give up on a call
+// it should have retried elsewhere.
 func TestWrappedDialogErrorsMapOntoTheRefusalVocabulary(t *testing.T) {
 	for _, row := range []struct {
 		err  error
@@ -164,9 +160,8 @@ func TestWrappedDialogErrorsMapOntoTheRefusalVocabulary(t *testing.T) {
 	}
 }
 
-// `answer` replies when the 2xx is on the socket, and the reply carries WHEN. That instant is the
-// anchor for a post-dial-delay plot, and a reply that omitted it would make the whole measurement
-// impossible from outside this process.
+// `answer` replies when the 2xx is on the socket, and carries WHEN: the anchor for a post-dial-delay
+// plot, unmeasurable from outside this process without it.
 func TestAnswerReportsWhenTheResponseWentOut(t *testing.T) {
 	sent := time.Date(2026, 8, 12, 10, 30, 0, 0, time.UTC)
 	server := newTestServer(t, &stubDialogs{answerAt: sent})
@@ -240,9 +235,8 @@ func TestRingDefaultsAnOmittedStatusTo180(t *testing.T) {
 	}
 }
 
-// `reinvite` refuses `not_supported` and names sipgo and the missing piece, because the operator
-// reading that log line needs to know whether to wait for a release or to file a bug. A MALFORMED
-// one is still `bad_request` — the two are different instructions to the caller.
+// `reinvite` refuses `not_supported` and names the missing piece, so an operator knows whether to
+// wait for a release or file a bug. A malformed one is still `bad_request`.
 func TestReinviteRefusesNotSupportedButStillValidatesFirst(t *testing.T) {
 	server := newTestServer(t, &stubDialogs{})
 
@@ -345,8 +339,7 @@ func TestOriginateAppliesTheDialTargetRefinement(t *testing.T) {
 }
 
 // The offer is mediad's and this edge never synthesises one. A body-less INVITE is refused or
-// mishandled by a meaningful share of carriers, and the failure mode is "the phone rang and there
-// was no audio".
+// mishandled by many carriers, and the failure mode is silent audio.
 func TestOriginateRefusesAMissingOffer(t *testing.T) {
 	aorTarget := "sip:1001@acme.example.com"
 	server := newTestServer(t, &stubDialogs{})
@@ -370,8 +363,7 @@ func TestOriginateRefusesAMissingOffer(t *testing.T) {
 }
 
 // The reply carries the request URI and the Call-ID so a capture can be lined up before any event
-// has been published — which is the only way to debug an outbound call that fails inside the first
-// hundred milliseconds.
+// has been published.
 func TestOriginateReportsTheDiagnostics(t *testing.T) {
 	aorTarget := "sip:1001@acme.example.com"
 	dialogs := &stubDialogs{
@@ -402,9 +394,8 @@ func TestOriginateReportsTheDiagnostics(t *testing.T) {
 	}
 }
 
-// The four dialog commands are addressed AT ONE INSTANCE and originate is flat. Getting this wrong
-// is not a cosmetic subject error: a queue-grouped `answer` is delivered to one member the server
-// chooses, and seven times out of eight that member is not the one holding the call.
+// The four dialog commands are addressed AT ONE INSTANCE and originate is flat: a queue-grouped
+// `answer` would be delivered to a member the server chooses, rarely the one holding the call.
 func TestSubjectsAddressDialogsAndRegisteredFlowsToTheirOwner(t *testing.T) {
 	server := newTestServer(t, &stubDialogs{})
 	subjects := server.Subjects()

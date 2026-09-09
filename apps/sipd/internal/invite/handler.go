@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -34,40 +35,22 @@ const (
 
 // Responder writes a response OUTSIDE a transaction.
 //
-// It exists for exactly one job, and the job is RFC 6026: a 2xx to an INVITE is retransmitted by
-// the TU — not by the transaction layer, which has already terminated — until the ACK arrives or
-// 64×T1 elapses. sipgo's *Server satisfies this, and having it as an interface is what lets the
-// retransmission loop be tested with a fake clock and no socket.
+// RFC 6026: a 2xx to an INVITE is retransmitted by the TU — not by the transaction layer, which has
+// already terminated — until the ACK arrives or 64×T1 elapses. sipgo's *Server satisfies this.
 type Responder interface {
 	WriteResponse(res *sip.Response) error
 }
 
-// EventSink publishes one `sip.evt.v1` event.
-//
-// # Why this is still an interface now that the contract exists
-//
-// It was a seam because the subject family did not exist. It stays a seam for a different and more
-// durable reason: a deployment with no broker — the SIPp rig, an integration test, a laptop — must
-// still be able to run the INVITE path, and the honest behaviour there is a log line carrying every
-// field the event would have had rather than a publish that fails on every call. LogEventSink is
-// that; PublishingSink (publisher.go) is the production one, and it builds the contract's own
-// envelopes so the subject and the payload cannot disagree with the TypeScript consumer.
+// EventSink publishes one `sip.evt.v1` event. A deployment with no broker must still run the INVITE
+// path, so LogEventSink is the default and PublishingSink (publisher.go) is the production one.
 type EventSink interface {
 	Publish(ctx context.Context, event Event) error
 }
 
 // Event is one dialog event, in this package's vocabulary rather than the contract's.
 //
-// # Why a struct of our own and not the generated payload
-//
-// Six generated payloads with no common interface cannot be produced by one effect handler, and a
-// handler that switched on the event kind to build six different structs would put the contract's
-// shape inside the executor — where a schema change becomes an edit to the code that writes 200 OK
-// to a socket. So the executor fills ONE struct from the dialog, and the mapping onto six envelopes
-// lives in one file next door (publisher.go) that touches no transaction and no timer.
-//
-// Every field is either on the dialog or on the effect that produced the event. Nothing here is
-// inferred.
+// The executor fills this one struct from the dialog; the mapping onto the contract's six envelopes
+// lives in publisher.go, so a schema change never reaches the code that writes 200 OK to a socket.
 type Event struct {
 	Kind      dialog.DialogEvent
 	LegID     string
@@ -75,13 +58,11 @@ type Event struct {
 	CallID    string
 	SIPCallID string
 	// LocalTag and RemoteTag complete the dialog triple the contract carries as `identity`. It is a
-	// LOOKUP KEY on the far side and never an authorisation — the rule
-	// `sipTransferRequestSchema.sipCallId` states — and it travels so a packet capture can be lined
-	// up against a leg id nothing on the wire contains.
+	// lookup key on the far side and never an authorisation.
 	LocalTag  string
 	RemoteTag string
-	// Role is which end of the INVITE we are, and it is what makes `dialog.answered` mean two
-	// different moments without ambiguity: the ACK for a UAS leg, the 2xx for a UAC one.
+	// Role is which end of the INVITE we are: `dialog.answered` is the ACK for a UAS leg, the 2xx
+	// for a UAC one.
 	Role dialog.Role
 	// Status is the SIP status that produced the event, for `progressed` and `terminated`.
 	Status int
@@ -96,11 +77,9 @@ type Event struct {
 	Termination           dialog.TerminationReason
 	Initiator             dialog.Initiator
 	CauseFromReasonHeader bool
-	// SetupMs is the time from the INVITE to the answer — the post-dial-delay number, measured on
-	// the only plane that can see both ends of it.
+	// SetupMs is the time from the INVITE to the answer: post-dial delay.
 	SetupMs int
-	// AnsweredForSeconds is billsec, counted from the moment the call was genuinely up in this
-	// role rather than from when a bridge happened to be built.
+	// AnsweredForSeconds is billsec, counted from the moment the call was up in this role.
 	AnsweredForSeconds int
 	// Digit and DurationMs carry a SIP INFO keypress. RFC 4733 in-band digits are the media plane's.
 	Digit      string
@@ -138,13 +117,12 @@ func (s LogEventSink) Publish(_ context.Context, event Event) error {
 }
 
 // Options configures a Handler. Every dependency is an interface so the tests run without a broker
-// or a socket, which is the shape every other package in this service already has.
+// or a socket.
 type Options struct {
 	// Realm is the digest realm. It must match the Authenticator's.
 	Realm string
-	// Auth runs the digest exchange. The SAME authenticator the registrar and the REFER handler
-	// use, deliberately: a second one with its own secret would mint nonces the others reject, and
-	// the symptom would be a phone that can register but not call.
+	// Auth runs the digest exchange. It must be the same authenticator the registrar and the REFER
+	// handler use: a second one with its own secret mints nonces the others reject.
 	Auth *registrar.Authenticator
 	// Credentials resolves the account behind the caller's AOR.
 	Credentials credentials.Store
@@ -160,15 +138,12 @@ type Options struct {
 	// Requester sends the BYEs, ACKs and CANCELs this edge originates.
 	Requester Requester
 	// Caller places the INVITEs this edge originates. Optional: without it `rpc.sip.v1.originate` is
-	// refused `not_supported` by name, which is the honest answer for a deployment wired without a
-	// SIP client — and a better one than a nil dereference on the first outbound call.
+	// refused `not_supported`.
 	Caller Caller
-	// Bindings is the location service, read to resolve a `{kind:"aor"}` originate. Optional, and
-	// its absence refuses those originates rather than failing the whole handler: an inbound-only
-	// deployment is a real configuration.
+	// Bindings is the location service, read to resolve a `{kind:"aor"}` originate. Optional: its
+	// absence refuses those originates rather than failing the whole handler.
 	Bindings kv.Store
-	// Trunks is the carrier directory, read to resolve a `{kind:"trunk"}` originate. Optional on the
-	// same argument.
+	// Trunks is the carrier directory, read to resolve a `{kind:"trunk"}` originate. Optional.
 	Trunks    TrunkDirectory
 	TrunkAuth trunk.Authorizer
 	// Responder retransmits a 2xx until it is ACKed.
@@ -188,12 +163,10 @@ type Options struct {
 	BaseContext context.Context
 	// AuthTimeout bounds the credential lookup that gates admission.
 	AuthTimeout time.Duration
-	// AdmitTimeout bounds the admission RPC. Design §10.2 sets it at 1000 ms: `100 Trying` is
-	// already out and nothing is retransmitting behind it, and a person is holding a handset.
+	// AdmitTimeout bounds the admission RPC. Defaults to 1000 ms.
 	AdmitTimeout time.Duration
 	// RingTimeout is how long an admitted call may sit with no command before this edge ends it
-	// itself. It is belt and braces for an engine that stopped answering mid-walk; the engine's own
-	// ring timeout is shorter and is the one that normally fires.
+	// itself. Backstop for a silent engine; the engine's own shorter timeout normally fires first.
 	RingTimeout time.Duration
 	// RetransmitInterval is T1 for the RFC 6026 2xx loop, and RetransmitCap is T2.
 	RetransmitInterval time.Duration
@@ -210,21 +183,11 @@ type Options struct {
 
 // Handler answers INVITE and every request inside the dialogs it creates.
 //
-// # What it checks before anything reaches the broker
+// Before anything reaches the broker: a profile must claim the request (there is no default
+// profile), the profile's authentication must pass (digest, or a source in the trunk ACL), and the
+// authenticated account must be the one in the From — closing the third-party-INVITE hole.
 //
-//  1. A profile claims the request. There is no default profile: a packet nobody owns is a packet
-//     no policy applies to (see internal/profile).
-//  2. The profile's authentication passes — a digest this fleet minted, or a source address in the
-//     trunk ACL. An unauthenticated INVITE on an internal profile is challenged, not refused, so a
-//     phone retries by itself.
-//  3. The caller is who it says it is: the authenticated account must be the one in the From. This
-//     is the third-party-INVITE hole, the same shape as the third-party-registration hole the
-//     registrar closes and the third-party-REFER hole the transfer handler closes.
-//
-// # What it deliberately does not decide
-//
-// Whose call it is. A digest resolves a tenant; a trunk match does not, and this edge does not read
-// the did-index (design §4.2). The engine attributes, and this edge sends it the evidence.
+// It does not decide whose call it is: the engine attributes, and this edge sends it the evidence.
 type Handler struct {
 	realm     string
 	auth      *registrar.Authenticator
@@ -420,10 +383,6 @@ func (h *Handler) Len() int {
 	return len(h.legs)
 }
 
-// ---------------------------------------------------------------------------------------------
-// INVITE
-// ---------------------------------------------------------------------------------------------
-
 // ServeInvite keeps sipgo's server transaction alive while asynchronous engine commands
 // ring or answer the call. sipgo terminates a transaction when its callback returns.
 func (h *Handler) ServeInvite(req *sip.Request, tx sip.ServerTransaction) {
@@ -459,8 +418,8 @@ func (h *Handler) handleInitialInvite(req *sip.Request, tx sip.ServerTransaction
 
 	owner, err := h.profiles.For(req)
 	if err != nil {
-		// No profile claims it. 403 and not 401: a challenge would invite a stranger to guess a
-		// password on a socket no policy owns.
+		// 403 and not 401: a challenge would invite a stranger to guess a password on a socket no
+		// policy owns.
 		log.Warn("refusing an INVITE that no profile claims")
 		h.respond(tx, req, statusForbidden, "Forbidden")
 		return
@@ -480,15 +439,13 @@ func (h *Handler) handleInitialInvite(req *sip.Request, tx sip.ServerTransaction
 		}
 		parseOpts.Authentication = AuthenticationDigest
 		parseOpts.OrgID = credential.OrgID
-		// Rebuilt from the CREDENTIAL rather than copied from the From header, even though the two
-		// were just checked to agree: the check is on the user part alone, and taking the whole
-		// string from the message would let a phone choose the domain spelling the engine sees.
+		// Rebuilt from the credential, not the From header: the equality check covers the user part
+		// alone, so the message could otherwise choose the domain spelling the engine sees.
 		parseOpts.CallerAOR = "sip:" + credential.Username + "@" + strings.ToLower(credential.Realm)
 	case profile.AuthTrunkACL:
 		entry, allowed := owner.ACL.Match(req.Source())
 		if !allowed {
-			// 403 and never a challenge: there is no credential a carrier could offer here, so a
-			// 401 would be an instruction the far end cannot follow.
+			// 403 and never a challenge: there is no credential a carrier could offer here.
 			log.Warn("refusing an INVITE from a source outside the trunk ACL")
 			h.respond(tx, req, statusForbidden, "Forbidden")
 			return
@@ -507,9 +464,8 @@ func (h *Handler) handleInitialInvite(req *sip.Request, tx sip.ServerTransaction
 	}
 	log = log.With("legId", intent.LegID, "from", intent.From.Number, "to", intent.To.Number)
 
-	// An attended transfer's completing INVITE. Correlated BEFORE anything is created, because a
-	// Replaces that names no dialog we hold must be refused without minting a leg id, writing a
-	// claim or spending a broker round trip on a call that cannot complete.
+	// An attended transfer's completing INVITE, correlated before anything is created so a Replaces
+	// naming no dialog we hold is refused without minting a leg id or writing a claim.
 	replacedLegID := ""
 	if replaces, present, err := replacesOf(req); present {
 		if err != nil {
@@ -530,19 +486,16 @@ func (h *Handler) handleInitialInvite(req *sip.Request, tx sip.ServerTransaction
 		log = log.With("replacesLegId", replacedLegID)
 	}
 
-	// Session timers are negotiated BEFORE admission, because a 422 is a negotiation step the far
-	// end will retry and there is no point spending a broker round trip on a call that is about to
-	// be re-sent with a different interval.
+	// Session timers are negotiated before admission: a 422 is a negotiation step the far end
+	// retries, so the call is about to be re-sent with a different interval.
 	negotiation := dialog.NegotiateUAS(h.timers, dialog.ReadTimerHeaders(req.GetHeaders))
 	if negotiation.Refused() {
 		h.refuseTimers(req, tx, negotiation, log)
 		return
 	}
 
-	// intent.ReplacesLegID carries the replaced leg into createLeg, which sets it on the legState
-	// BEFORE the leg is published and before tx.OnCancel is installed. Assigning it here instead
-	// would write a legState field from the request goroutine while a CANCEL that arrived in that
-	// window is already reading it on the session's.
+	// createLeg sets the replaced leg on the legState before the leg is published and before
+	// tx.OnCancel is installed; assigning it here would race a CANCEL on the session goroutine.
 	session, state, err := h.createLeg(req, tx, owner, intent, negotiation.Timer, log)
 	if err != nil {
 		log.Error("cannot create the dialog", "error", err)
@@ -550,9 +503,8 @@ func (h *Handler) handleInitialInvite(req *sip.Request, tx sip.ServerTransaction
 		return
 	}
 
-	// The 100 goes out BEFORE the admission request, always. A silent engine must cost the caller a
-	// bounded wait and not a Timer B — the same argument the REFER handler makes for its 202
-	// (design §4.2).
+	// The 100 goes out before the admission request, always: a silent engine must cost the caller a
+	// bounded wait and not a Timer B.
 	if _, err := session.Apply(ctx, dialog.Input{Trigger: dialog.TriggerLocalTrying}); err != nil {
 		log.Error("cannot send 100 Trying", "error", err)
 	}
@@ -563,8 +515,8 @@ func (h *Handler) handleInitialInvite(req *sip.Request, tx sip.ServerTransaction
 
 	switch {
 	case admitErr != nil:
-		// No answer at all. Answered on this edge's own authority, with a Retry-After, and logged
-		// as distinct from a refusal — the same distinction `transfer/client.go` draws.
+		// No answer at all: answered on this edge's own authority, with a Retry-After, and logged
+		// as distinct from a refusal.
 		log.Error("the admission request failed", "error", admitErr)
 		h.refuse(session, state, TimeoutRefusal(), log)
 	case !admission.OK:
@@ -647,10 +599,9 @@ func (h *Handler) createLeg(
 	h.mu.Unlock()
 	h.writeClaim(created)
 
-	// A CANCEL that arrives before we have answered anything is handled by sipgo's transaction
-	// layer (200 to the CANCEL, then 487 on the INVITE). What it does NOT do is tell anybody, so
-	// the hook is here and it posts the trigger onto the dialog's own mailbox — which is what makes
-	// the CANCEL/answer race decidable rather than lucky.
+	// sipgo's transaction layer answers an early CANCEL itself (200, then 487 on the INVITE) but
+	// tells nobody. Posting the trigger onto the dialog's mailbox makes the CANCEL/answer race
+	// decidable rather than lucky.
 	tx.OnCancel(func(*sip.Request) {
 		ctx, cancel := context.WithTimeout(h.baseCtx, 2*time.Second)
 		defer cancel()
@@ -676,8 +627,8 @@ func (h *Handler) admitted(
 		d.OrgID = admission.OrgID
 		d.CallID = admission.CallID
 		h.writeClaim(d)
-		// The ring timeout is armed INSIDE the session, so the timer's own goroutine and the
-		// dialog's cannot disagree about whether the call was already answered.
+		// Armed inside the session so the timer's goroutine and the dialog's cannot disagree about
+		// whether the call was already answered.
 		state.ringTimer = time.AfterFunc(h.ringTimeout, func() {
 			timeoutCtx, cancelTimeout := context.WithTimeout(h.baseCtx, 5*time.Second)
 			defer cancelTimeout()
@@ -737,10 +688,6 @@ func (h *Handler) refuseTimers(
 	}
 }
 
-// ---------------------------------------------------------------------------------------------
-// mid-dialog requests
-// ---------------------------------------------------------------------------------------------
-
 // HandleAck feeds the ACK for our 2xx to the dialog it confirms.
 //
 // An ACK for a 2xx is its own transaction (RFC 3261 §17.1.1.3), so it arrives here rather than on
@@ -772,10 +719,8 @@ func (h *Handler) HandleAck(req *sip.Request, _ sip.ServerTransaction) {
 func (h *Handler) HandleBye(req *sip.Request, tx sip.ServerTransaction) {
 	target, found := h.dialogs.MatchRequest(req)
 	if !found {
-		// 481 is the correct answer and it is also the honest one: this instance does not hold that
-		// dialog. Under a dialog-affine load balancer that means the call is over; under a
-		// misconfigured one it means the BYE reached the wrong replica, and the log says which
-		// Call-ID so the difference is diagnosable (design §6.4).
+		// 481: this instance does not hold that dialog — either the call is over, or the BYE
+		// reached the wrong replica.
 		h.respond(tx, req, statusCallDoesNotExist, "Call/Transaction Does Not Exist")
 		return
 	}
@@ -798,12 +743,9 @@ func (h *Handler) HandleBye(req *sip.Request, tx sip.ServerTransaction) {
 	})
 }
 
-// HandleCancel answers a CANCEL that sipgo's transaction layer did not match.
-//
-// A CANCEL that DOES match a live INVITE transaction never reaches here — the transaction layer
-// answers it 200 and drives the INVITE to 487, and the hook installed in createLeg is what tells
-// the dialog. One that reaches here matched nothing, which almost always means the final response
-// has already gone out: RFC 3261 §9.2's "no effect", answered 481.
+// HandleCancel answers a CANCEL that sipgo's transaction layer did not match — one whose final
+// response has usually already gone out. RFC 3261 §9.2's "no effect", answered 481. A CANCEL that
+// does match a live INVITE transaction is handled by the hook createLeg installs instead.
 func (h *Handler) HandleCancel(req *sip.Request, tx sip.ServerTransaction) {
 	target, found := h.dialogs.MatchRequest(req)
 	if !found {
@@ -899,7 +841,7 @@ func (h *Handler) handleMidDialogOffer(
 				if status == 0 {
 					status, reason = statusServerError, "Server Internal Error"
 				}
-				effects := append([]dialog.Effect(nil), outcome.Effects...)
+				effects := slices.Clone(outcome.Effects)
 				effects = append(effects, dialog.Effect{
 					Kind: dialog.EffectRespondToRequest, Status: status, Reason: reason,
 					Detail: retryAfterDetail(outcome.RetryAfter),
@@ -916,7 +858,7 @@ func (h *Handler) handleMidDialogOffer(
 				log.Info("the far end changed the media direction",
 					"direction", string(outcome.Direction), "held", outcome.Held)
 			}
-			effects := append([]dialog.Effect(nil), outcome.Effects...)
+			effects := slices.Clone(outcome.Effects)
 			effects = append(effects, d.AnswerMidDialog(answer)...)
 			return dialog.Outcome{Effects: effects}, nil
 		})
@@ -935,9 +877,8 @@ func (h *Handler) HandleInfo(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	digit, duration, ok := parseDTMF(req)
 	if !ok {
-		// An INFO body this edge does not understand is answered 200 rather than refused: INFO is
-		// an extension point and refusing an unknown one has broken interop with more handsets than
-		// it has ever protected.
+		// An unknown INFO body is answered 200 rather than refused: INFO is an extension point and
+		// refusing one breaks interop with handsets.
 		h.respond(tx, req, statusOK, "OK")
 		return
 	}
@@ -958,10 +899,6 @@ func (h *Handler) HandleInfo(req *sip.Request, tx sip.ServerTransaction) {
 	})
 	h.respond(tx, req, statusOK, "OK")
 }
-
-// ---------------------------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------------------------
 
 // post feeds one trigger to a dialog's session, with a bounded wait.
 func (h *Handler) post(legID string, in dialog.Input) {
@@ -1004,14 +941,9 @@ func (h *Handler) forget(legID string) {
 			h.log.Warn("cannot release the dialog claim", "legId", legID, "error", err)
 		}
 	}
-	// Closing from inside the session's own goroutine would deadlock, so it happens on a goroutine
-	// of its own. Close waits for the loop to drain, which is what makes a command already in the
-	// mailbox get an answer rather than vanish.
-	h.backgroundWork.Add(1)
-	go func() {
-		defer h.backgroundWork.Done()
-		found.session.Close()
-	}()
+	// Closing from inside the session's own goroutine would deadlock. Close waits for the loop to
+	// drain, so a command already in the mailbox gets an answer rather than vanishing.
+	h.backgroundWork.Go(found.session.Close)
 }
 
 // writeClaim publishes the dialog's `sip-dialogs` record.
@@ -1019,15 +951,14 @@ func (h *Handler) writeClaim(d *dialog.Dialog) {
 	if h.claims == nil {
 		return
 	}
-	// Rendered here, on the dialog's own goroutine, and cached for the heartbeat sweep in the same
-	// breath — the sweep must never read a live dialog itself.
+	// Rendered on the dialog's own goroutine and cached for the heartbeat sweep, which must never
+	// read a live dialog itself.
 	claim := h.dialogs.ClaimFor(d)
 	h.dialogs.Touch(d)
 	ctx, cancel := context.WithTimeout(h.baseCtx, 3*time.Second)
 	defer cancel()
 	if err := h.claims.Put(ctx, claim); err != nil {
-		// A claim that cannot be written costs reaping, not the call. Failing the INVITE here would
-		// drop a working call because a bucket was full.
+		// A claim that cannot be written costs reaping, not the call.
 		h.log.Warn("cannot write the dialog claim", "legId", d.LegID, "error", err)
 	}
 }
@@ -1040,11 +971,9 @@ func (h *Handler) publish(event Event) {
 	}
 }
 
-// authorize runs the digest exchange for an INVITE.
-//
-// The status choices mirror the registrar's and the REFER handler's, for the same reasons: 401 for
-// "no credentials" and "stale nonce" because the device can retry, 403 for everything else because
-// re-challenging a wrong password produces a loop some handsets run forever.
+// authorize runs the digest exchange for an INVITE. 401 for "no credentials" and "stale nonce"
+// because the device can retry; 403 for everything else, since re-challenging a wrong password
+// makes some handsets loop forever.
 func (h *Handler) authorize(
 	ctx context.Context,
 	req *sip.Request,
@@ -1078,9 +1007,8 @@ func (h *Handler) authorize(
 		h.challenge(req, tx, errors.Is(err, registrar.ErrNonceStale), log)
 		return credentials.Credential{}, false
 	}
-	// An account may only CALL AS ITSELF. Without this any valid account on the realm could place a
-	// call carrying somebody else's From and have the engine attribute it to them — which is a
-	// billing problem before it is an impersonation one.
+	// An account may only call as itself: otherwise any valid account on the realm could place a
+	// call carrying somebody else's From and have the engine attribute it to them.
 	if auth.Username != from.Address.User {
 		log.Warn("refusing an INVITE sent as somebody else", "authenticatedAs", auth.Username)
 		h.respond(tx, req, statusForbidden, "Forbidden")
@@ -1100,8 +1028,7 @@ func (h *Handler) authorize(
 		h.respond(tx, req, statusForbidden, "Forbidden")
 		return credentials.Credential{}, false
 	}
-	// INVITE, not REGISTER: HA2 is MD5(method:uri), so verifying with the wrong method name accepts
-	// nothing and would make every call fail with a password error nobody could explain.
+	// INVITE, not REGISTER: HA2 is MD5(method:uri), so the wrong method name accepts nothing.
 	if err := accountAuth.VerifyRequest(req, auth, credential.HA1); err != nil {
 		if errors.Is(err, registrar.ErrNonceStale) {
 			h.challenge(req, tx, true, log)
@@ -1139,14 +1066,9 @@ func (h *Handler) send(tx sip.ServerTransaction, res *sip.Response) {
 	}
 }
 
-// causeOfBye reads the RFC 3326 Reason header off a BYE, which is the only way to learn WHY the
-// far end hung up. Absent means normal clearing, because that is what a BYE means when nobody says
-// otherwise.
-//
-// The second result says the cause was STATED rather than assumed, and it travels all the way to
-// `dialog.terminated.causeFromReasonHeader`. It is not bookkeeping: a stated cause is better
-// evidence than a derived one, and when two CDRs for one call disagree, the one whose cause the far
-// end put on the wire is the one to believe.
+// causeOfBye reads the RFC 3326 Reason header off a BYE. Absent means normal clearing. The second
+// result reports that the cause was stated rather than assumed, and reaches
+// `dialog.terminated.causeFromReasonHeader`.
 func causeOfBye(req *sip.Request) (cause int, stated bool) {
 	for _, header := range req.GetHeaders("Reason") {
 		if cause, found := dialog.CauseFromReason(header.Value()); found {
@@ -1163,13 +1085,8 @@ func retryAfterDetail(after time.Duration) string {
 	return "retry-after:" + fmt.Sprintf("%d", int(after/time.Second))
 }
 
-// parseDTMF reads an `application/dtmf-relay` INFO body, which is the de facto format every handset
-// that sends DTMF over INFO uses:
-//
-//	Signal=5
-//	Duration=160
-//
-// `application/dtmf` (a bare digit) is accepted too, because several older phones send that.
+// parseDTMF reads an `application/dtmf-relay` INFO body (Signal=5 / Duration=160 lines).
+// `application/dtmf`, a bare digit, is accepted too because several older phones send that.
 func parseDTMF(req *sip.Request) (digit string, durationMs int, ok bool) {
 	contentType := strings.ToLower(headerValue(req, "Content-Type"))
 	body := strings.TrimSpace(string(req.Body()))
@@ -1178,7 +1095,7 @@ func parseDTMF(req *sip.Request) (digit string, durationMs int, ok bool) {
 	}
 	switch {
 	case strings.Contains(contentType, "dtmf-relay"):
-		for _, line := range strings.Split(body, "\n") {
+		for line := range strings.SplitSeq(body, "\n") {
 			name, value, found := strings.Cut(strings.TrimSpace(line), "=")
 			if !found {
 				continue

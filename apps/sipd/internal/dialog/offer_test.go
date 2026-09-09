@@ -5,8 +5,7 @@ import (
 	"time"
 )
 
-// The media-level attribute wins over the session-level one (RFC 4566 §6.7). A reader that took the
-// session-level value would report a held call as active and leave the caller listening to silence.
+// The media-level attribute wins over the session-level one (RFC 4566 §6.7).
 func TestDirectionOf(t *testing.T) {
 	cases := []struct {
 		name string
@@ -63,8 +62,7 @@ func TestDirectionOf(t *testing.T) {
 	}
 }
 
-// `sendonly` and `inactive` are hold; `recvonly` is a muted microphone and is not. The asymmetry
-// catches people out, so it is asserted rather than assumed.
+// `sendonly` and `inactive` are hold; `recvonly` is a muted microphone and is not.
 func TestDirectionHolds(t *testing.T) {
 	cases := map[Direction]bool{
 		DirectionSendRecv: false,
@@ -87,8 +85,7 @@ func TestDirectionHolds(t *testing.T) {
 	}
 }
 
-// RFC 3261 §14.1: the higher Call-ID waits 2.1–4.0 seconds and the lower waits 0–2.0, so two ends
-// that collide do not collide again.
+// RFC 3261 §14.1: the higher Call-ID waits 2.1–4.0 seconds and the lower waits 0–2.0.
 func TestGlareBackoffRanges(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -138,7 +135,7 @@ func TestHasHigherCallID(t *testing.T) {
 		{"a", "a", false},
 		{"abc", "ab", true},
 		// Byte comparison, not case-folded: both ends must reach the same answer from the same two
-		// strings, and case folding is a rule the RFC does not state.
+		// strings.
 		{"A", "a", false},
 	}
 	for _, tc := range cases {

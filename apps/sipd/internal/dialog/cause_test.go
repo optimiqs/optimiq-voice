@@ -35,8 +35,8 @@ func TestCauseForStatus(t *testing.T) {
 	}
 }
 
-// RFC 3326: the far end's own switch telling us what it decided beats re-deriving it from a status
-// line. Every rejection below is a value that would put an unbillable cause on a CDR.
+// RFC 3326: a stated cause beats one re-derived from the status line. Every rejection below would
+// otherwise put an unbillable cause on a CDR.
 func TestCauseFromReason(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -71,8 +71,7 @@ func TestCauseFromReason(t *testing.T) {
 	}
 }
 
-// The reverse direction: `rpc.sip.v1.hangup` hands this edge a cause for an unanswered leg, and an
-// unanswered leg ends with a status rather than a BYE.
+// An unanswered leg ends with a SIP status rather than a BYE.
 func TestStatusForCause(t *testing.T) {
 	cases := []struct {
 		cause  int
@@ -90,8 +89,7 @@ func TestStatusForCause(t *testing.T) {
 		{CauseSwitchCongestion, 503},
 		{CauseIncompatibleDestination, 488},
 		{CauseRecoveryOnTimerExpire, 408},
-		// Anything without a defensible status becomes 480 — an answer the caller can act on —
-		// rather than 500, which would blame us for a decision somebody else made.
+		// Anything without a defensible status becomes 480, which the caller can act on.
 		{99, 480},
 		{0, 480},
 	}

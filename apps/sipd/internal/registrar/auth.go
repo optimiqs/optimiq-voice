@@ -20,38 +20,24 @@ import (
 
 // HTTP digest authentication (RFC 2617 / RFC 3261 §22) for REGISTER.
 //
-// # Why the nonce is stateless
-//
-// sipd is horizontally scalable and sits behind a load balancer that will happily send a device's
-// challenge to instance A and its answer to instance B. A nonce held in a map on one instance
-// therefore breaks every deployment with more than one replica — the classic registrar bug, and the
-// exact shape of sipgo's own example ("NOTE: This server only supports 1 REGISTRATION/Challenge").
-//
-// So the nonce CARRIES its own validity: expiry + randomness + an HMAC over both, keyed by a secret
-// every instance shares. Verification is a recomputation, needs no shared state, and a nonce cannot
-// be forged without the secret or used after its deadline.
+// The nonce is stateless because a load balancer may send a device's challenge to one instance and
+// its answer to another. It carries its own validity — expiry, randomness, and an HMAC over both
+// under a fleet-wide secret — so verification is a recomputation needing no shared state, and a
+// nonce cannot be forged without the secret or used past its deadline.
 //
 //	nonce = <expiryUnixHex> "." <random16Hex> "." <hmacSHA256(secret, expiry "." random)[:16]Hex>
 //
-// # Replay, and why there is per-instance nonce-count state after all
-//
-// The digest covers the method, the request URI and the nonce. It does NOT cover the Contact. So a
-// replayed Authorization header is not "the same device re-binding the same contact": within the
-// nonce TTL an observer on an unencrypted transport can resend the identical credentials in a
-// REGISTER carrying THEIR contact, and inbound calls for the victim fork to the attacker. The
-// stale-CSeq guard in contacts.go does not catch it, because it only fires for the same contact URI.
-//
-// The fix is the RFC 2617 §3.2.1 nonce count: a nonce may be answered with a given nc exactly once,
-// and a legitimate re-REGISTER increments it. That is per-instance, best-effort state — an answer
-// load-balanced to an instance that has not seen the nonce is accepted on its first use there — so
-// it narrows the replay window rather than closing it, and TLS remains the real boundary on an
-// untrusted network. It costs one bounded map and it removes the trivial single-instance attack.
-//
-// Still NOT here: rate limiting and credential-stuffing detection, which are the anti-fraud
-// consumer's job on the REGISTRATIONS stream (plan §5 T1), not a registrar one.
+// The digest covers the method, request URI and nonce, but NOT the Contact. So within the nonce TTL
+// an observer on an unencrypted transport can resend identical credentials in a REGISTER carrying
+// THEIR contact and fork the victim's inbound calls; contacts.go's stale-CSeq guard misses it,
+// because that only fires for the same contact URI. The RFC 2617 §3.2.1 nonce count answers this: a
+// nonce may be answered with a given nc exactly once. It is per-instance best-effort state — an
+// answer load-balanced to an instance that has not seen the nonce is accepted on first use there —
+// so it narrows the replay window rather than closing it, and TLS remains the real boundary on an
+// untrusted network.
 
-// Digest failure modes. The registrar maps these to SIP statuses; they are distinct types so the
-// mapping lives in one place and so tests can assert the reason, not the status.
+// Digest failure modes. The registrar maps these to SIP statuses in one place, and tests assert the
+// reason rather than the status.
 var (
 	// ErrNoAuthorization means the request carried no credentials at all: challenge it.
 	ErrNoAuthorization = errors.New("registrar: no Authorization header")
@@ -86,7 +72,7 @@ type Authenticator struct {
 	secret []byte
 	ttl    time.Duration
 	now    func() time.Time
-	// nonces is the replay guard, SHARED with every per-realm authenticator ForRequest derives, so
+	// nonces is the replay guard, shared with every per-realm authenticator ForRequest derives, so
 	// a fleet of domains does not become a fleet of empty guards.
 	nonces *nonceGuard
 }
@@ -144,8 +130,8 @@ func (a *Authenticator) VerifyRequest(req *sip.Request, auth Authorization, ha1 
 
 // Challenge returns a WWW-Authenticate header value.
 //
-// stale=true tells the device its credentials were right but its nonce had expired, so it may retry
-// without asking a human. Getting that flag wrong is why phones pop password prompts at 3am.
+// stale=true tells the device its credentials were right but its nonce had expired, so it retries
+// without prompting a human.
 func (a *Authenticator) Challenge(stale bool) (string, error) {
 	nonce, err := a.mintNonce()
 	if err != nil {
@@ -244,8 +230,8 @@ func (a *Authenticator) Verify(method string, auth Authorization, ha1 string) er
 	switch strings.ToUpper(auth.Algorithm) {
 	case "", "MD5":
 	default:
-		// MD5-sess and the SHA-256 variants are absent from essentially every deskphone in the
-		// top-5 vendor catalogue; accepting them silently as MD5 would be worse than refusing.
+		// MD5-sess and the SHA-256 variants are absent from essentially every deskphone;
+		// accepting them silently as MD5 would be worse than refusing.
 		return fmt.Errorf("%w: %s", ErrUnsupportedAlgorithm, auth.Algorithm)
 	}
 	// The challenge offers qop="auth" and nothing else, so anything else is a downgrade: RFC 2617
@@ -269,10 +255,9 @@ func (a *Authenticator) Verify(method string, auth Authorization, ha1 string) er
 
 // nonceGuard records the highest nonce count accepted for each live nonce.
 //
-// It is bounded and best-effort by construction: entries are dropped once their nonce cannot be
-// valid any more, and a guard that has filled up is emptied rather than grown, because a full guard
-// means somebody is minting nonces faster than they expire and the alternative is an attacker
-// choosing this process's memory ceiling.
+// Bounded and best-effort by construction: entries are dropped once their nonce cannot be valid,
+// and a full guard is emptied rather than grown — otherwise an attacker minting nonces faster than
+// they expire would choose this process's memory ceiling.
 type nonceGuard struct {
 	mu   sync.Mutex
 	seen map[string]nonceUse
@@ -317,7 +302,7 @@ func (g *nonceGuard) sweepLocked() {
 		}
 	}
 	if len(g.seen) >= g.max {
-		g.seen = make(map[string]nonceUse)
+		clear(g.seen)
 	}
 }
 

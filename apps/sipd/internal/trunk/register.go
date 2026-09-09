@@ -11,26 +11,18 @@ import (
 	"github.com/emiago/sipgo/sip"
 )
 
-// ClientRegistrar is the production Registrar: one REGISTER over sipgo's client, classified.
-//
-// # What it does and, more importantly, what it refuses to decide
-//
-// It builds the request, sends it, waits for a final response and turns that into one of the
-// machine's four triggers. It makes no policy decision at all — not whether to retry, not whether to
-// fail over, not what status to report — because every one of those is the gateway machine's, and a
-// classifier that also decided would be a second state machine nobody wrote down.
+// ClientRegistrar is the production Registrar: one REGISTER over sipgo's client, classified into
+// one of the machine's four triggers. It makes no policy decision — retry, failover and status are
+// all the gateway machine's, and a classifier that also decided would be a second state machine.
 type ClientRegistrar struct {
 	client *sipgo.Client
-	// contact is what this edge asks the carrier to send calls to. A registration whose Contact the
-	// carrier cannot reach is a trunk that reports `up` and delivers nothing, which is the worst
-	// available combination.
+	// contact is what this edge asks the carrier to send calls to. A Contact the carrier cannot
+	// reach is a trunk that reports `up` and delivers nothing.
 	contact sip.Uri
 	// userAgent goes in the User-Agent header. Several carriers key interop workarounds off it.
 	userAgent string
-	// timeout bounds one REGISTER. Timer F is 64×T1 ≈ 32 s and that is the SIP answer; this is
-	// shorter because a carrier that has not answered in eight seconds is one the backoff should
-	// already be working on, and holding a goroutine for half a minute per trunk per attempt during
-	// an outage is how a fleet runs out of them.
+	// timeout bounds one REGISTER. Deliberately shorter than Timer F (64xT1 ~ 32 s): holding a
+	// goroutine for half a minute per trunk per attempt during an outage exhausts the fleet.
 	timeout time.Duration
 	auth    Authorizer
 }
@@ -75,9 +67,9 @@ func (r *ClientRegistrar) Register(
 ) Result {
 	target, err := registrarURI(registrarHost, config)
 	if err != nil {
-		// Nothing was sent and nothing will be. It is reported as a TIMEOUT rather than a rejection
-		// because a rejection carries a status the carrier chose, and inventing one would put a
-		// number in a `trunk.statusReason` column that no carrier ever said.
+		// Nothing was sent. Reported as a TIMEOUT rather than a rejection because a rejection
+		// carries a status the carrier chose, and inventing one would write a number into
+		// `trunk.statusReason` that no carrier ever said.
 		return Result{Trigger: TriggerTimeout, Err: err}
 	}
 
@@ -101,8 +93,7 @@ func (r *ClientRegistrar) Register(
 	req.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
 	req.AppendHeader(sip.NewHeader("User-Agent", r.userAgent))
 	if config.OutboundProxy != "" {
-		// The Request-URI still names the registrar and the packet goes to the SBC. Same split the
-		// INVITE path draws, and for the same reason.
+		// The Request-URI still names the registrar; the packet goes to the SBC.
 		req.SetDestination(config.OutboundProxy)
 	}
 	if config.Transport != "" {
@@ -128,9 +119,8 @@ func (r *ClientRegistrar) Register(
 		res, err = r.client.Do(ctx, req)
 	}
 	if err != nil {
-		// No final response inside the deadline. Timer F's own expiry looks identical from here and
-		// so does a transport failure, and the machine treats them the same: a reachability problem,
-		// which is what a secondary registrar exists for.
+		// No final response inside the deadline. Timer F expiry and a transport failure look
+		// identical here, and the machine treats both as a reachability problem.
 		return Result{Trigger: TriggerTimeout, Err: err}
 	}
 
@@ -149,8 +139,7 @@ func (r *ClientRegistrar) Register(
 // registrarURI turns the configured host into the REGISTER's Request-URI.
 //
 // A REGISTER's Request-URI names the DOMAIN and carries no user part (RFC 3261 §10.2) — the user is
-// in the To and From. Putting the auth user in it produces a request most registrars answer 404,
-// and the symptom is a trunk that authenticates perfectly and never registers.
+// in the To and From. An auth user in it is answered 404 by most registrars.
 func registrarURI(host string, config Config) (sip.Uri, error) {
 	trimmed := strings.TrimSpace(host)
 	if trimmed == "" {
@@ -177,16 +166,12 @@ func registrarURI(host string, config Config) (sip.Uri, error) {
 	return target, nil
 }
 
-// grantedExpires reads what the registrar actually gave us.
+// grantedExpires reads the interval the registrar actually GRANTED, not the one requested: a
+// carrier that shortens 3600 to 120, refreshed on our own number, is a trunk unregistered for most
+// of every hour while reporting `up`.
 //
-// The GRANTED interval and not the requested one, and this is the single most common way an
-// outbound registration silently lapses: a carrier that shortens 3600 to 120 and a client that
-// refreshes on its own number is a trunk that is unregistered for fifty-eight minutes out of every
-// hour, reporting `up` throughout.
-//
-// The Contact's own `expires` parameter wins over the Expires header when both are present, which is
-// RFC 3261 §10.2.4's ordering: the parameter is per-binding and the header is a default for the
-// bindings that do not carry one.
+// The Contact's own `expires` parameter wins over the Expires header (RFC 3261 §10.2.4): the
+// parameter is per-binding, the header only a default for bindings without one.
 func grantedExpires(res *sip.Response, requested time.Duration) time.Duration {
 	if contact := res.Contact(); contact != nil && contact.Params != nil {
 		if raw, found := contact.Params.Get("expires"); found {

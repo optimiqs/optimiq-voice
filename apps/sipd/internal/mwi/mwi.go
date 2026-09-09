@@ -1,16 +1,9 @@
 // Package mwi turns the control plane's `voicemail.evt.v1.<orgId>.<mailboxId>.mwi.updated` events
 // into the message counts an RFC 3842 NOTIFY carries.
 //
-// # Why a core subscription and not a durable consumer
-//
-// The same reason apps/engine takes `media.evt.v1.>` as a core subscription: a lamp is a statement
-// about NOW. An MWI event replayed after a restart tells a phone about a count that has since moved,
-// and a durable consumer would deliver exactly that backlog at the worst possible moment — every
-// phone lighting up on a deploy. Missing an event costs a lamp that is stale until the next change
-// or the next `resync`; replaying one costs a lamp that is confidently wrong.
-//
-// It also means sipd needs no JetStream grant here at all, which keeps the SIP edge's broker
-// identity as narrow as it already is: one subscribe on one subject family.
+// It uses a core subscription, not a durable consumer: a lamp is a statement about now, so a
+// replayed backlog would light every phone on a deploy with counts that have since moved. It also
+// means sipd needs no JetStream grant — one subscribe on one subject family.
 package mwi
 
 import (
@@ -25,9 +18,8 @@ import (
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 )
 
-// Counts is one mailbox's message counts. Both are absolute, never deltas — see the contract's own
-// note: a lamp driven by deltas is one dropped message away from being wrong until somebody reboots
-// a phone.
+// Counts is one mailbox's message counts. Both are absolute, never deltas: a lamp driven by deltas
+// is one dropped message away from being wrong until somebody reboots a phone.
 type Counts struct {
 	New   int
 	Saved int
@@ -49,11 +41,8 @@ type Update struct {
 
 // MatchesAccount reports whether this update is about the SIP account named by `user`.
 //
-// The `extensionNumber` field wins when present. It is absent in practice today — apps/api's
-// `VoicemailMwiPublisher` never sets it — so the fallback is the mailbox NUMBER, which in every
-// deployment this platform models equals the extension number. That fallback is a deliberate,
-// documented approximation rather than an accident: the alternative is an MWI spine that never
-// matches anything, and the correct fix is one line in a file this wave does not own.
+// The optional `extensionNumber` wins when present; otherwise the mailbox NUMBER is matched, which
+// in every deployment this platform models equals the extension number.
 func (u Update) MatchesAccount(orgID, user string) bool {
 	if u.OrgID != orgID {
 		return false
@@ -66,15 +55,11 @@ func (u Update) MatchesAccount(orgID, user string) bool {
 
 // Source delivers MWI updates and remembers the last one per mailbox.
 //
-// The memory matters: a subscription accepted at 09:00 has to be told the current counts
-// immediately (RFC 6665 §4.1.3 — a NOTIFY carrying full state is mandatory on acceptance), and the
-// event that established them may have been published at 08:00. Without a cache the immediate
-// NOTIFY would say "no messages" to a phone with nine, which is a lamp that goes DARK on
-// subscription refresh.
+// The cache is required by RFC 6665 §4.1.3: acceptance must be followed by a NOTIFY carrying full
+// state, and the event establishing the counts may be hours old.
 //
-// It is instance-local and starts empty, so a restarted sipd reports "no messages" until the next
-// event or `resync` for a mailbox it has not seen. That is the known gap of this rung; the fix is a
-// count query at subscribe time, which needs a grant and an RPC sipd does not have.
+// TODO: the cache is instance-local and starts empty, so a restarted sipd reports "no messages"
+// for a mailbox it has not seen; query counts at subscribe time once sipd has that RPC grant.
 type Source interface {
 	// Updates delivers every observed update until ctx is cancelled.
 	Updates(ctx context.Context) (<-chan Update, error)
@@ -106,7 +91,7 @@ func NewNATSSource(conn *nats.Conn, log *slog.Logger) (*NATSSource, error) {
 
 // Subject is the filter this source subscribes to: every org, every mailbox, one event name.
 //
-// `mwi.updated` is a DOTTED event name, so the subject has six tokens and the `*` for the mailbox
+// `mwi.updated` is a DOTTED event name, so the subject has seven tokens and the `*` for the mailbox
 // cannot be a `>` — `voicemail.evt.v1.*.>` would also match `message.left`, which is the engine's
 // event about a recording and says nothing about a count.
 const Subject = "voicemail.evt.v1.*.*.mwi.updated"
@@ -124,10 +109,8 @@ func (s *NATSSource) Updates(ctx context.Context) (<-chan Update, error) {
 		select {
 		case updates <- update:
 		default:
-			// A full channel means the NOTIFY fan-out is behind. Dropping the OLDEST would be wrong
-			// (the newest count is the true one) and blocking here would stall the NATS delivery
-			// goroutine for every subject, so the drop is logged and the cache above still holds the
-			// current value for the next subscribe or refresh.
+			// The NOTIFY fan-out is behind. Blocking here would stall the NATS delivery goroutine for
+			// every subject, and the cache above still holds the current value for the next subscribe.
 			s.log.Warn("dropping an MWI update; the notifier is behind",
 				"orgId", update.OrgID, "mailbox", update.Mailbox)
 		}
@@ -141,12 +124,11 @@ func (s *NATSSource) Updates(ctx context.Context) (<-chan Update, error) {
 		return nil, fmt.Errorf("mwi: confirming subscription: %w", err)
 	}
 
-	go func() {
-		<-ctx.Done()
+	context.AfterFunc(ctx, func() {
 		if err := subscription.Unsubscribe(); err != nil {
 			s.log.Debug("unsubscribing from MWI updates", "error", err)
 		}
-	}()
+	})
 	return updates, nil
 }
 
@@ -156,9 +138,8 @@ func (s *NATSSource) decode(msg *nats.Msg) (Update, bool) {
 		s.log.Warn("dropping an unparsable MWI event", "subject", msg.Subject, "error", err)
 		return Update{}, false
 	}
-	// The same check the publisher side runs before it publishes: an envelope whose orgId is not the
-	// org in its subject would let this edge attribute a tenant's message counts to another tenant's
-	// phones, which is the one mistake in this file that is not merely a wrong lamp.
+	// An envelope whose orgId disagrees with the org in its subject would let this edge attribute one
+	// tenant's message counts to another tenant's phones.
 	if err := contract.CheckSubject(msg.Subject, envelope); err != nil {
 		s.log.Warn("dropping an inconsistent MWI event", "subject", msg.Subject, "error", err)
 		return Update{}, false

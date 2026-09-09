@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -11,33 +12,12 @@ import (
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 )
 
-// Publisher emits `trunk.status.changed`.
+// Publisher emits `trunk.status.changed` onto the TRUNKS stream, which the pbx writer that owns the
+// `trunk.status*` columns consumes.
 //
-// # Both halves now exist
-//
-// The EVENT was always there: `TrunkStatusChangedData` is generated in packages/events-go, the
-// subject builder is `TrunkSubject`, and the TRUNKS stream carries it to the pbx writer that owns
-// the `trunk.status*` columns. What was missing was a GRANT — the `sipd` user could publish
-// `sip.reg.v1.>` and two RPC subjects and nothing else, so a publish onto `trunk.evt.v1.>` from this
-// process was an authorization violation. That grant is part of this wave, and JetStreamPublisher
-// is now the DEFAULT wherever a broker is present (see cmd/sipd).
-//
-// LogPublisher stays, and not as a vestige. A deployment without a broker — the SIPp rig, an
-// integration run, a laptop — still has a registration state machine that changes state, and the
-// honest behaviour there is one line per transition carrying every field the event would have had.
-// So a deployment either publishes or says loudly that it cannot; it never silently drops a carrier
-// outage.
-//
-// # The subject is derived, not hand-composed
-//
-// Every family this edge publishes has a named constructor in packages/events-go that derives the
-// subject from the payload — `NewRegistrationRegisteredEnvelope`, `NewSIPDialogTerminatedEnvelope` —
-// and the trunk family now has `NewTrunkStatusChangedEnvelope` too. statusEnvelope below builds its
-// payload and hands it to that constructor rather than composing `TrunkSubject` and `NewEnvelope` by
-// hand, so the subject and the payload cannot name different trunks: the constructor is the single
-// place that pairs them. The trunk id is a PARAMETER there rather than a payload field, because the
-// facts that changed (status, reason, endpoint) are the payload and the identity is the subject's
-// job — see the constructor's own note.
+// Implementations must derive the subject through `NewTrunkStatusChangedEnvelope` rather than
+// composing `TrunkSubject` and `NewEnvelope` by hand, so a subject and a payload cannot name
+// different trunks.
 type Publisher interface {
 	StatusChanged(ctx context.Context, trunk Config, status Status, reason string) error
 }
@@ -50,8 +30,8 @@ type JetStreamPublisher struct {
 
 var _ Publisher = (*JetStreamPublisher)(nil)
 
-// NewJetStreamPublisher wraps an established JetStream context. It does NOT create the stream:
-// provisioning is the control plane's job, for the reason internal/events already states.
+// NewJetStreamPublisher wraps an established JetStream context. It does NOT create the stream;
+// provisioning is the control plane's job.
 func NewJetStreamPublisher(js jetstream.JetStream, source string) *JetStreamPublisher {
 	if source == "" {
 		source = "sipd"
@@ -86,9 +66,8 @@ func (p *JetStreamPublisher) StatusChanged(
 	return nil
 }
 
-// statusEnvelope builds the contract envelope. It is separate so a test can assert the exact
-// subject and payload without a broker, which is the only way to prove the subject is right before
-// the grant exists to try it.
+// statusEnvelope builds the contract envelope, separately so a test can assert the exact subject
+// and payload without a broker.
 func statusEnvelope(
 	trunk Config,
 	status Status,
@@ -103,12 +82,10 @@ func statusEnvelope(
 	}
 	data := contract.TrunkStatusChangedData{Status: value}
 	if reason != "" {
-		copied := reason
-		data.Reason = &copied
+		data.Reason = new(reason)
 	}
 	if endpoint := trunk.Registrar; endpoint != "" {
-		copied := endpoint
-		data.Endpoint = &copied
+		data.Endpoint = new(endpoint)
 	}
 	// The constructor derives trunk.evt.v1.<orgId>.<trunkId>.status.changed from OrgID + trunkID and
 	// pairs it with this payload, so a subject and a body about different trunks cannot be built.
@@ -121,12 +98,8 @@ func statusEnvelope(
 		})
 }
 
-// LogPublisher prints what it would have published.
-//
-// It is the fallback for a deployment with no broker, not the default any more. Everything the
-// JetStream publisher would have put on the wire is in the log line, including the subject, so a
-// developer running without NATS can still see that a trunk went down and can still check the
-// subject is the one they expect.
+// LogPublisher prints what it would have published, subject included. It is the fallback for a
+// deployment with no broker, so a transition is never silently dropped.
 type LogPublisher struct{ Log *slog.Logger }
 
 var _ Publisher = LogPublisher{}
@@ -152,8 +125,7 @@ func (p LogPublisher) StatusChanged(_ context.Context, trunk Config, status Stat
 	return nil
 }
 
-// RecordingPublisher captures transitions in memory instead of publishing them. It backs the unit
-// tests.
+// RecordingPublisher captures transitions in memory instead of publishing them.
 type RecordingPublisher struct {
 	mu       sync.Mutex
 	recorded []Transition
@@ -183,5 +155,5 @@ func (p *RecordingPublisher) StatusChanged(_ context.Context, trunk Config, stat
 func (p *RecordingPublisher) Transitions() []Transition {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]Transition(nil), p.recorded...)
+	return slices.Clone(p.recorded)
 }

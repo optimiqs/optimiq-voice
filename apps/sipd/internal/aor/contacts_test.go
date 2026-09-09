@@ -185,7 +185,7 @@ func TestAnEmptySetClearsBothHalves(t *testing.T) {
 // that wrote eleven would take an AOR offline rather than lose one device.
 func TestTheStoredArrayIsCappedAtTheSchemaBound(t *testing.T) {
 	contacts := make([]Contact, 0, MaxStoredContacts+3)
-	for index := 0; index < MaxStoredContacts+3; index++ {
+	for index := range MaxStoredContacts + 3 {
 		contacts = append(contacts,
 			testContact("sip:1001@10.0.0."+string(rune('a'+index)), 1.0, contactNow))
 	}

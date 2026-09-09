@@ -1,15 +1,10 @@
-// Command sipd is the Optimiq Voice SIP edge (plan §3.2, §3.4 option E).
+// Command sipd is the Optimiq Voice SIP edge.
 //
-// Today it is a REGISTRAR: it authenticates REGISTER with digest, writes AOR → contact bindings
-// into the `registrations` NATS KV bucket, publishes sip.reg.v1 transitions onto the REGISTRATIONS
-// stream, and answers OPTIONS. It also answers REFER — a desk phone's TRANSFER key — by asking the
-// engine over `rpc.sip.v1.transfer` and reporting the outcome back per RFC 3515; see
-// internal/transfer.
-//
-// And it is the fleet's NOTIFIER: SUBSCRIBE for RFC 4235 `dialog` (busy-lamp keys, read from the
-// `presence` KV bucket apps/engine writes) and RFC 3842 `message-summary` (the voicemail lamp, from
-// `voicemail.evt.v1.*.*.mwi.updated`); see internal/subscribe. The proxy/INVITE path — the half that
-// lets it retire Routr — is the next PG wave; see the README.
+// It is the registrar: it authenticates REGISTER with digest, writes AOR to contact bindings into
+// the `registrations` NATS KV bucket, publishes sip.reg.v1 transitions onto the REGISTRATIONS
+// stream, and answers OPTIONS. It answers REFER by asking the engine over `rpc.sip.v1.transfer` and
+// reporting the outcome per RFC 3515 (internal/transfer), and it is the fleet's notifier for
+// RFC 4235 `dialog` and RFC 3842 `message-summary` subscriptions (internal/subscribe).
 //
 // Configuration is entirely environmental; run with no arguments.
 package main
@@ -23,6 +18,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +32,8 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 	"github.com/optimiqs/optimiq-voice/packages/runtime-go/health"
+	"github.com/optimiqs/optimiq-voice/packages/runtime-go/netbuf"
+	"github.com/optimiqs/optimiq-voice/packages/runtime-go/proclimit"
 
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/acl"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/command"
@@ -81,6 +79,13 @@ func run() error {
 	slog.SetDefault(log)
 	log = log.With("service", config.EventSource)
 
+	// A soft heap limit derived from the container's, so memory pressure becomes GC pressure rather
+	// than an OOM kill that drops every dialog this instance holds.
+	if applied := proclimit.ApplyMemoryLimit(os.Getenv, proclimit.DefaultHeadroomPercent); applied > 0 {
+		log.Info("applied a soft memory limit from the container's",
+			"goMemLimitBytes", applied, "gomaxprocs", runtime.GOMAXPROCS(0))
+	}
+
 	// SIGINT/SIGTERM cancel this context; every listener, the sweeper and every in-flight KV write
 	// hang off it, so shutdown is one cancel rather than a chain of Close calls that race.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -101,17 +106,13 @@ func run() error {
 		}),
 	}
 	// Only when configured: an empty pair means a broker with no authentication, which is what the
-	// SIPp rig and the integration tests run. config.Load has already refused a half-set pair, and
-	// has already preferred NATS_SIPD_USER/PASS over the shared pair — so this is the `sipd` user,
-	// whose permissions in config/nats.conf are sip.reg.v1.>, the two rpc.sip.v1 requests, the
-	// registrations bucket, READ-ONLY access to the presence bucket and the MWI event family, and
-	// nothing else.
+	// SIPp rig and the integration tests run. config.Load has already refused a half-set pair and
+	// preferred NATS_SIPD_USER/PASS, so this is the least-privilege `sipd` user of config/nats.conf.
 	if cfg.NATSUser != "" {
 		natsOpts = append(natsOpts, nats.UserInfo(cfg.NATSUser, cfg.NATSPass))
 	}
-	// Transport security, off unless configured. RootCAs both enables TLS and pins the bundle, so
-	// it covers the private-CA case on its own; Secure is the system-trust-store case. Neither set
-	// leaves the connection plaintext, which is what the broker in compose.yaml serves.
+	// Transport security, off unless configured. RootCAs both enables TLS and pins the bundle (the
+	// private-CA case); Secure is the system-trust-store case. Neither set leaves it plaintext.
 	switch {
 	case cfg.NATSTLSCA != "":
 		natsOpts = append(natsOpts, nats.RootCAs(cfg.NATSTLSCA))
@@ -122,8 +123,8 @@ func run() error {
 	conn, err := nats.Connect(cfg.NATSURL, natsOpts...)
 	if err != nil {
 		// A rejected credential lands here as "nats: Authorization Violation" and takes the process
-		// down with it. That is deliberate: a SIP edge that cannot reach the credential RPC cannot
-		// authenticate a REGISTER, so a "degraded" sipd is one that answers every phone with 500.
+		// down. An edge that cannot reach the credential RPC cannot authenticate a REGISTER, so a
+		// degraded sipd would answer every phone with 500.
 		return fmt.Errorf("connecting to NATS at %s: %w", cfg.NATSURL, err)
 	}
 	defer func() {
@@ -132,19 +133,32 @@ func run() error {
 		}
 	}()
 
-	js, err := jetstream.New(conn)
+	// Events leave asynchronously so the PubAck does not sit inside a SIP transaction. A failed ack
+	// is reported here rather than at the call site, the pending window bounds what a broker stall
+	// can buffer, and the timeout stops a lost ack pinning a slot for ever.
+	js, err := jetstream.New(conn,
+		jetstream.WithPublishAsyncErrHandler(func(_ jetstream.JetStream, msg *nats.Msg, err error) {
+			log.Error("a JetStream publish was not acknowledged",
+				"subject", msg.Subject, "msgId", msg.Header.Get(jetstream.MsgIDHeader), "error", err)
+		}),
+		jetstream.WithPublishAsyncMaxPending(cfg.PublishAsyncMaxPending),
+		jetstream.WithPublishAsyncTimeout(cfg.PublishAsyncTimeout),
+	)
 	if err != nil {
 		return fmt.Errorf("opening JetStream: %w", err)
 	}
+	// Outstanding acks are drained before the connection is, so a shutdown does not discard events a
+	// synchronous publish would have delivered.
+	defer flushPublishes(js, log, cfg.ShutdownTimeout)
 
 	bindings, err := kv.Open(ctx, js)
 	if err != nil {
 		return err
 	}
 
-	// The presence bucket: apps/engine writes it, this edge only ever reads and watches it. Opened
-	// at boot rather than lazily so a broker that will not serve it fails the process here, with the
-	// bucket named, instead of on the first BLF key a receptionist presses.
+	// The presence bucket: apps/engine writes it, this edge only reads and watches it. Opened at
+	// boot so a broker that will not serve it fails the process here, with the bucket named, rather
+	// than on the first BLF key pressed.
 	presenceStore, err := presence.Open(ctx, js)
 	if err != nil {
 		return err
@@ -186,6 +200,10 @@ func run() error {
 		return err
 	}
 
+	// The registrar's expiry table doubles as the store's last-known-value hint, so a re-REGISTER
+	// CASes against the revision this process committed instead of reading it back first.
+	bindings.SetHint(reg)
+
 	// Adopt whatever a previous instance left behind before accepting traffic, so a restart does
 	// not leave devices expiring on the bucket's one-hour backstop.
 	adopted, err := reg.Rehydrate(ctx)
@@ -207,10 +225,8 @@ func run() error {
 	}
 	defer server.Close()
 
-	// The client half. It exists to originate NOTIFY, and nothing else: the RFC 3515 report that
-	// tells a phone how its transfer went, and the RFC 6665 notifications that move its lamps. A
-	// registrar otherwise never originates a request, which is why sipd had no client at all until
-	// REFER arrived.
+	// The client half exists to originate NOTIFY and nothing else: the RFC 3515 transfer report and
+	// the RFC 6665 lamp notifications.
 	sipClient, err := sipgo.NewClient(userAgent, sipgo.WithClientLogger(log))
 	if err != nil {
 		return fmt.Errorf("creating the SIP client: %w", err)
@@ -238,19 +254,14 @@ func run() error {
 
 	// The two watched read models, and the state they feed.
 	//
-	// Both are opened BEFORE the INVITE surface and both are non-fatal when absent, and the two
-	// halves of that are deliberate. Opened first, because the ACL is a security boundary and an
-	// INVITE listener that started accepting traffic before its ACL had loaded would be admitting
-	// carriers on an empty policy — which fails closed, but fails closed at the cost of a carrier
-	// outage nobody asked for. Non-fatal, because these buckets are written by apps/api: a control
-	// plane that has not deployed yet must not stop this edge from serving REGISTER, which has
-	// nothing to do with either of them.
+	// Opened before the INVITE surface because the ACL is a security boundary: a listener accepting
+	// traffic before its ACL loaded fails closed, at the cost of a carrier outage. Non-fatal when
+	// absent because apps/api writes these buckets, and a control plane that has not deployed yet
+	// must not stop this edge serving REGISTER.
 	trunkDirectory := trunk.NewDirectory(log)
 	if cfg.EnableInvite {
-		// There is always a broker by this point — nats.Connect above either returned a connection or
-		// the process exited — so the publisher is always the JetStream one. trunk.LogPublisher
-		// stays for the tests and for a future explicit no-broker mode; it is not reachable from a
-		// nil check that can never be true.
+		// There is always a broker by this point, so the publisher is always the JetStream one;
+		// trunk.LogPublisher stays for the tests.
 		var statusPublisher trunk.Publisher = trunk.NewJetStreamPublisher(js, config.EventSource)
 
 		registrarClient, err := trunk.NewClientRegistrar(sipClient, trunk.RegistrarOptions{
@@ -271,10 +282,7 @@ func run() error {
 		}
 		defer supervisor.Stop()
 
-		// The directory drives the supervisor. This is the wire internal/trunk's package comment has
-		// been describing as missing: "nothing delivers trunk configuration to sipd today… this
-		// package defines the struct it NEEDS, takes it from a caller, and names the ingestion seam".
-		// The seam is the `trunks` bucket, and this is the caller.
+		// The directory drives the supervisor; the `trunks` bucket is internal/trunk's ingestion seam.
 		trunkDirectory.OnChange(func() { supervisor.Apply(ctx, trunkDirectory.Configs()) })
 
 		watchWhenAvailable(ctx, log, contract.TrunksKV.Name, time.Second, func() error {
@@ -289,10 +297,9 @@ func run() error {
 
 	// The dialog table and its claim bucket.
 	//
-	// The claim store is the NATS one whenever the bucket can be opened. The memory one is not a
-	// fallback in the ordinary sense — it lets a single instance work and reaps NOTHING, because a
-	// claim only one process can see is a claim no survivor can act on — so a deployment that lands
-	// on it gets a warning naming the consequence rather than a silent downgrade.
+	// The claim store is the NATS one whenever the bucket can be opened. The memory one lets a
+	// single instance work but reaps nothing — a claim only one process can see is one no survivor
+	// can act on — so landing on it warns rather than downgrading silently.
 	dialogs := dialog.NewStore(dialog.StoreOptions{InstanceID: cfg.InstanceID})
 	var claimStore dialog.ClaimStore
 	var claims dialog.ClaimStore = dialog.NewMemoryClaimStore()
@@ -307,18 +314,13 @@ func run() error {
 		}
 	}
 
-	// The dialog event publisher. JetStream when there is a broker, which there always is by this
-	// point — the process refuses to start without one — so the seam exists for the tests rather
-	// than for a degraded production mode.
+	// The dialog event publisher. There is always a broker by this point, so the seam exists for the
+	// tests rather than for a degraded production mode.
 	dialogEvents := sipevents.NewJetStreamPublisher(js)
 
-	// The INVITE surface, off unless SIPD_INVITE says otherwise.
-	//
-	// Off is still the default, and the reason has CHANGED rather than gone away. It is no longer
-	// "no engine serves rpc.sip.v1.invite" — one does now — it is that turning this on makes a
-	// registrar into a call-processing element, which is a deployment decision with a blast radius
-	// (dialog affinity at the load balancer, a trunk directory, an ACL bucket) that nobody should
-	// acquire by upgrading a binary.
+	// The INVITE surface, off unless SIPD_INVITE says otherwise: turning it on makes a registrar
+	// into a call-processing element, which needs dialog affinity at the load balancer, a trunk
+	// directory and an ACL bucket already in place.
 	if cfg.EnableInvite {
 		invites, err := newInviteHandler(inviteDeps{
 			cfg:         cfg,
@@ -345,9 +347,8 @@ func run() error {
 		server.OnUpdate(invites.HandleUpdate)
 		server.OnInfo(invites.HandleInfo)
 
-		// The engine's command surface. Attached AFTER the SIP handlers are registered, so a command
-		// can never arrive for a dialog whose handler is not yet installed — which would be a 200 OK
-		// this process could not write.
+		// Attached after the SIP handlers are registered, so a command cannot arrive for a dialog
+		// whose handler is not yet installed.
 		commands, err := command.NewServer(command.Options{
 			Dialogs:    invites,
 			InstanceID: cfg.InstanceID,
@@ -373,9 +374,9 @@ func run() error {
 			"subjects", commands.Subjects(),
 			"originateQueueGroup", command.OriginateQueueGroup)
 
-		// The claim reaper. It is what turns a dead instance's calls into CDR rows the engine would
-		// otherwise never receive (design §6.2), and it is wired only when there is a bucket to sweep
-		// — with the memory claim store there is nothing another instance could ever see.
+		// The claim reaper turns a dead instance's calls into CDR rows the engine would otherwise
+		// never receive. Wired only with a real bucket; the memory claim store is invisible to
+		// other instances.
 		if claimStore != nil && dialogEvents != nil {
 			sweeper, err := reaper.New(reaper.Options{
 				Store:      claimStore,
@@ -387,13 +388,11 @@ func run() error {
 			if err != nil {
 				return err
 			}
-			group.Add(1)
-			go func() {
-				defer group.Done()
+			group.Go(func() {
 				if err := sweeper.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 					errs <- err
 				}
-			}()
+			})
 		}
 
 		defer func() {
@@ -403,30 +402,24 @@ func run() error {
 		}()
 	}
 
-	// Everything else — MESSAGE, PUBLISH, … — is honestly refused rather than half-answered.
+	// Everything else (MESSAGE, PUBLISH, …) is refused rather than half-answered.
 	server.OnNoRoute(reg.HandleUnsupported)
 
-	group.Add(1)
-	go func() {
-		defer group.Done()
+	group.Go(func() {
 		if err := reg.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			errs <- err
 		}
-	}()
+	})
 
-	group.Add(1)
-	go func() {
-		defer group.Done()
+	group.Go(func() {
 		if err := subscriptions.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			errs <- err
 		}
-	}()
+	})
 
-	// The TLS material, loaded ONCE at boot rather than per listener.
-	//
-	// Once, because a certificate that cannot be read must fail the process here — with the path in
-	// the message — rather than inside a goroutine whose error nobody is watching, leaving a
-	// deployment that believes it serves TLS and serves nothing on 5061.
+	// The TLS material, loaded once at boot rather than per listener, so a certificate that cannot
+	// be read fails the process here with the path in the message rather than inside a goroutine
+	// whose error nobody is watching.
 	var tlsConfig *tls.Config
 	if cfg.EnableTLS || cfg.EnableWSS {
 		certificate, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
@@ -436,10 +429,8 @@ func run() error {
 		}
 		tlsConfig = &tls.Config{
 			Certificates: []tls.Certificate{certificate},
-			// TLS 1.2 is the floor. RFC 5630 §3.1.3 requires TLS for `sips:` and says nothing about
-			// versions; 1.2 is the lowest version with no known practical break and the highest
-			// floor every SIP handset in the field can actually reach — several vendors still ship
-			// stacks that cannot do 1.3.
+			// TLS 1.2 is the floor: RFC 5630 §3.1.3 requires TLS for `sips:` but names no version,
+			// and several handset vendors still ship stacks that cannot do 1.3.
 			MinVersion: tls.VersionTLS12,
 		}
 	}
@@ -448,25 +439,26 @@ func run() error {
 	var expectedListeners int32
 	listen := func(network, addr string) {
 		expectedListeners++
-		group.Add(1)
-		go func() {
-			defer group.Done()
+		group.Go(func() {
 			listenCtx := context.WithValue(ctx, sipgo.ListenReadyCtxKey, sipgo.ListenReadyFuncCtxValue(func(network, addr string) {
 				readyListeners.Add(1)
 				log.Info("listening", "network", network, "addr", addr, "realm", cfg.Realm)
 			}))
 			var err error
-			if strings.HasSuffix(network, "s") && tlsConfig != nil {
-				// ListenAndServeTLS closes its listener when ctx is done and returns; a
-				// post-shutdown error is the close itself, not a failure.
+			switch {
+			case strings.HasSuffix(network, "s") && tlsConfig != nil:
+				// ListenAndServeTLS closes its listener when ctx is done; a post-shutdown error is
+				// the close itself, not a failure.
 				err = server.ListenAndServeTLS(listenCtx, network, addr, tlsConfig)
-			} else {
+			case network == "udp":
+				err = serveUDP(listenCtx, server, addr, cfg.SocketBufferBytes, log)
+			default:
 				err = server.ListenAndServe(listenCtx, network, addr)
 			}
 			if err != nil && ctx.Err() == nil {
 				errs <- fmt.Errorf("%s listener: %w", network, err)
 			}
-		}()
+		})
 	}
 	if cfg.EnableUDP {
 		listen("udp", cfg.ListenAddr)
@@ -478,10 +470,9 @@ func run() error {
 		listen("tls", cfg.TLSListenAddr)
 	}
 	if cfg.EnableWS {
-		// SIP over WebSocket (RFC 7118). It is the only transport a browser has, and it delivers
-		// SIGNALLING only: a WebRTC endpoint needs DTLS-SRTP and apps/mediad has no SRTP, so a
-		// softphone can register and be rung and will hear nothing. Plaintext `ws` is for a
-		// development origin; anything a browser will actually load needs `wss`.
+		// SIP over WebSocket (RFC 7118), the only transport a browser has. Signalling only: a WebRTC
+		// endpoint needs DTLS-SRTP, so a softphone can register and be rung and hear nothing.
+		// Plaintext `ws` is for a development origin; a browser-loaded page needs `wss`.
 		listen("ws", cfg.WSListenAddr)
 	}
 	if cfg.EnableWSS {
@@ -496,9 +487,12 @@ func run() error {
 	}
 	healthServer, err := health.Start(ctx, cfg.HealthAddr, func() bool {
 		return conn.IsConnected() && expectedListeners > 0 && readyListeners.Load() == expectedListeners
-	})
+	}, health.WithPprof(cfg.PProfEnabled))
 	if err != nil {
 		return err
+	}
+	if cfg.PProfEnabled {
+		log.Warn("pprof is enabled on the private health listener", "addr", healthServer.Addr)
 	}
 	log.Info("sipd is up", "healthAddr", healthServer.Addr, "listeners", expectedListeners)
 
@@ -516,15 +510,14 @@ func run() error {
 	}
 
 	// Outcome reports first: a phone left holding a 202 with no final NOTIFY keeps its transfer
-	// indicator lit until the dialog dies, and these finish in well under a second.
+	// indicator lit until the dialog dies.
 	if !transfers.Wait(cfg.ShutdownTimeout) {
 		log.Warn("some transfer outcomes were not reported before shutdown")
 	}
 
 	// Then the subscriptions. `terminated;reason=deactivated` is RFC 6665's "re-subscribe now", so
-	// every lamp this instance was serving moves to a surviving one within a round trip instead of
-	// freezing until its subscription lapses. The context is fresh and short: ctx is already
-	// cancelled by this point, and a cancelled context would drop every one of these.
+	// lamps move to a surviving instance within a round trip. The context is fresh and short
+	// because ctx is already cancelled here and would drop every one of these.
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	if deactivated := subscriptions.Shutdown(shutdownCtx); deactivated > 0 {
 		log.Info("told subscribers to re-subscribe", "count", deactivated)
@@ -541,13 +534,9 @@ func run() error {
 }
 
 // newTransferHandler wires REFER: digest against the same authenticator the registrar uses, the
-// location service as the "is this phone actually here" check, `rpc.sip.v1.transfer` at the engine,
-// and NOTIFY back to the phone.
-//
-// It is always wired. There is no toggle, because the failure mode without the engine responder is
-// already correct and visible: the phone is accepted, the request times out, and the final NOTIFY
-// carries `503`. A toggle would replace that with a `501` that looks like the feature was never
-// built, which is the same message with less information in it.
+// location service as the presence check, `rpc.sip.v1.transfer` at the engine, and NOTIFY back to
+// the phone. It is always wired: without the engine responder the phone is accepted, the request
+// times out and the final NOTIFY carries 503, which is more informative than a 501.
 func newTransferHandler(
 	cfg config.Config,
 	conn *nats.Conn,
@@ -593,13 +582,10 @@ func newTransferHandler(
 }
 
 // newSubscribeHandler wires SUBSCRIBE/NOTIFY: digest against the same authenticator the registrar
-// uses, the location service as the "is this phone actually here" check, the `presence` KV bucket
-// for the busy-lamp state and `voicemail.evt.v1.*.*.mwi.updated` for the message-waiting one.
-//
-// Like REFER it is always wired, and for the same reason: there is no useful degraded mode. A
-// deployment where apps/engine is not yet publishing presence gets subscriptions that are accepted
-// and notified `down`, which is exactly what a fleet of idle phones looks like and exactly what the
-// lamps should show.
+// uses, the location service as the presence check, the `presence` KV bucket for the busy-lamp state
+// and `voicemail.evt.v1.*.*.mwi.updated` for the message-waiting one. Always wired: without
+// apps/engine publishing presence, subscriptions are accepted and notified `down`, which is what
+// idle phones should show anyway.
 func newSubscribeHandler(
 	cfg config.Config,
 	conn *nats.Conn,
@@ -652,13 +638,9 @@ func newSubscribeHandler(
 	return handler, nil
 }
 
-// inviteDeps is everything the INVITE surface needs, as one struct.
-//
-// A struct rather than thirteen positional parameters, and the reason is not cosmetic: the previous
-// signature had six, four of which were pointers to different services, and this wave adds seven
-// more. A call site with thirteen positional arguments is one transposition away from handing the
-// dialog store to the claim store's slot — which compiles, and which would produce a process that
-// heartbeats an empty table while its real dialogs go unclaimed.
+// inviteDeps is everything the INVITE surface needs, as one struct rather than thirteen positional
+// parameters, several of which are interchangeable pointer types that a transposition would swap
+// silently.
 type inviteDeps struct {
 	cfg         config.Config
 	server      *sipgo.Server
@@ -678,20 +660,12 @@ type inviteDeps struct {
 // newInviteHandler wires the INVITE surface: two listener profiles, the dialog table, the same
 // digest authenticator every other handler uses, the engine seam, and the outbound half.
 //
-// # The two profiles, and why they are structure rather than a comment
+// The internal/external trust boundary is two `profile.Profile` values with different
+// authentication, NAT policy and — the load-bearing one — routing contexts: a digest-authenticated
+// call resolves in the tenant's internal context and a trunk-matched one in the untrusted context,
+// which stops an inbound PSTN call dialling back out through a trunk.
 //
-// parity-audit row 1.26 records that the internal/external trust boundary is enforced today by
-// convention in a config file. Here it is two `profile.Profile` values with different
-// authentication, different NAT policy and — the load-bearing one — different ROUTING CONTEXTS: a
-// digest-authenticated call resolves in the tenant's internal context and a trunk-matched one in
-// the untrusted context, which is what stops an inbound PSTN call from dialling back out through a
-// trunk.
-//
-// # The engine seam is real now
-//
-// `rpc.sip.v1.invite` exists and is served, so the Port is the NATS one. RefusingPort survives for
-// the deployment that genuinely has no broker, and it is the honest production behaviour for that
-// state rather than a stub: every INVITE is answered 503 with a Retry-After and the log says why.
+// RefusingPort is used when there is no broker; it answers every INVITE 503 with a Retry-After.
 func newInviteHandler(deps inviteDeps) (*invite.Handler, error) {
 	cfg, log := deps.cfg, deps.log
 
@@ -699,11 +673,9 @@ func newInviteHandler(deps inviteDeps) (*invite.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The ACL is a security boundary and buildProfiles STARTS the watch rather than finishing it, so
-	// this is where "opened before the INVITE surface" becomes "loaded before it". The wait is short
-	// and bounded: an empty ACL fails closed, so the cost of giving up is a carrier refused for a
-	// moment, and the cost of waiting for ever would be a SIP edge that never serves REGISTER
-	// because a bucket the control plane has not created yet.
+	// buildProfiles starts the ACL watch rather than finishing it, so this is where the security
+	// boundary becomes loaded rather than merely opened. The wait is bounded: an empty ACL fails
+	// closed, and waiting for ever would stop REGISTER over a bucket that may not exist yet.
 	aclLoaded := waitForACL(deps.ctx, aclReady, aclReadyTimeout)
 	if !aclLoaded {
 		log.Warn("the sip-acl replay has not landed; carrier INVITEs are refused until it does",
@@ -775,16 +747,9 @@ func newInviteHandler(deps inviteDeps) (*invite.Handler, error) {
 }
 
 // buildProfiles turns the configuration and the `sip-acl` bucket into the trust boundaries the
-// INVITE handler enforces.
-//
-// # The external profile now exists whenever a bucket does
-//
-// It used to exist only when SIPD_TRUNK_ACL named a network, because that was the only source of
-// entries. Now the source is the watched bucket, and the profile is built whenever either the
-// bucket can be opened or the override names something. An external profile whose ACL is empty
-// refuses every carrier — `Match` has no default allow and there is no constructor that could give
-// it one — so building it early costs nothing and saves a restart the first time a tenant adds a
-// trunk.
+// INVITE handler enforces. The external profile is built whenever the bucket can be opened or the
+// override names something: an empty ACL refuses every carrier (`Match` has no default allow), so
+// building it early costs nothing and saves a restart when a tenant adds its first trunk.
 // aclReadyTimeout is how long boot waits for the sip-acl initial replay before serving INVITEs
 // anyway. Long enough for a broker round trip and a replay of a realistic ACL, short enough that a
 // missing bucket does not hold up REGISTER, which has nothing to do with this boundary.
@@ -882,8 +847,7 @@ func buildProfiles(
 
 	internal := profile.Internal("internal", listeners...)
 	if !watchConfigured && len(overrides) == 0 {
-		// No bucket and no overrides: there is no external profile and therefore nothing to wait
-		// for.
+		// No bucket and no overrides: no external profile, so nothing to wait for.
 		readyOnce.Do(func() { close(ready) })
 		set, err := profile.NewSet(internal)
 		return set, watcher, ready, err
@@ -893,9 +857,8 @@ func buildProfiles(
 
 	external := profile.External("external", carrierACL)
 	if cfg.ExternalListenAddr != "" {
-		// A socket of its own, which is the stronger separation: the profile is then chosen by the
-		// address the packet ARRIVED ON, which no sender can influence, rather than by the address
-		// it claims to come from.
+		// A socket of its own is the stronger separation: the profile is then chosen by the address
+		// the packet arrived on, which no sender can influence.
 		external.Listeners = []profile.Listener{
 			{Network: "udp", Addr: cfg.ExternalListenAddr},
 			{Network: "tcp", Addr: cfg.ExternalListenAddr},
@@ -907,17 +870,12 @@ func buildProfiles(
 
 // parseTrunkACL reads `cidr[=trunkId]` entries separated by commas.
 //
-// # It is an OVERRIDE now, not the source
+// It is an override on the `sip-acl` bucket, for a deployment whose control plane cannot write the
+// bucket and for an operator admitting one address during an incident. Entries from here are
+// recompiled alongside every bucket update and never removed by one.
 //
-// The source is the `sip-acl` bucket. This variable survives as an escape hatch and is deliberately
-// not removed, for two situations that are both real: a deployment whose control plane cannot yet
-// write the bucket, and an operator who needs one address admitted RIGHT NOW during an incident and
-// cannot wait for a database write to propagate. Entries from here are recompiled alongside every
-// bucket update and are never removed by one, which is what makes the second case trustworthy.
-//
-// Empty is now legal and is the expected state, where it used to build no external profile at all.
-// A value that is set and names nothing usable is still an error: it is a typo, and a typo in an
-// anti-toll-fraud boundary that silently did nothing is exactly the failure this check exists for.
+// Empty is legal and expected. A value that is set and names nothing usable is an error: a typo in
+// an anti-toll-fraud boundary must not silently do nothing.
 func parseTrunkACL(raw string) ([]profile.Entry, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -931,10 +889,8 @@ func parseTrunkACL(raw string) ([]profile.Entry, error) {
 			continue
 		}
 		network, trunkID, _ := strings.Cut(field, "=")
-		// Priority zero, which OUTRANKS every bucket entry: acl.priorityOf negates the column, whose
-		// values are positive, so a bucket entry compiles to a negative priority and an override to
-		// zero. That is the intent — an override exists to win — and it is stated here because the
-		// arithmetic is not obvious at either end on its own.
+		// Priority zero outranks every bucket entry: acl.priorityOf negates the positive column, so
+		// bucket entries compile to negative priorities and an override wins.
 		entry, err := profile.ParseEntry(network, profile.ActionAllow, 0, strings.TrimSpace(trunkID), "SIPD_TRUNK_ACL")
 		if err != nil {
 			return nil, fmt.Errorf("SIPD_TRUNK_ACL: %w", err)
@@ -949,11 +905,8 @@ func parseTrunkACL(raw string) ([]profile.Entry, error) {
 
 // contactURI is what this edge puts in the Contact header of its 202 and its notifications.
 //
-// The host comes from the listen address, EXCEPT when that address is a wildcard — `0.0.0.0:5060` is
-// the default and is not an address any phone can send to. In that case the realm is used, which is
-// the name the handsets were provisioned with and therefore the one that resolves. Neither is
-// clever; the alternative is a Contact the phone silently cannot reach, and a NOTIFY that never
-// arrives is indistinguishable from a transfer that never happened.
+// The host comes from the listen address, except when that address is a wildcard, which no phone can
+// send to; the realm is used instead, being the name the handsets were provisioned with.
 func contactURI(cfg config.Config) sip.Uri {
 	host, port := cfg.Realm, 0
 	if listenHost, listenPort, err := net.SplitHostPort(cfg.ListenAddr); err == nil {
@@ -967,6 +920,51 @@ func contactURI(cfg config.Config) sip.Uri {
 		}
 	}
 	return sip.Uri{Scheme: "sip", User: cfg.UserAgent, Host: host, Port: port}
+}
+
+// serveUDP binds the UDP socket with an explicit receive and send buffer, then hands it to sipgo.
+//
+// sipgo's own ListenAndServe takes the kernel default (~200 KiB on Linux). One goroutine drains the
+// socket, and a fleet re-registering after a network blip arrives faster than it can be parsed; the
+// overflow is silently dropped datagrams. A kernel that refuses the size is logged, not fatal.
+func serveUDP(ctx context.Context, server *sipgo.Server, addr string, bufferBytes int, log *slog.Logger) error {
+	laddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return fmt.Errorf("resolving %s: %w", addr, err)
+	}
+	conn, err := net.ListenUDP("udp", laddr)
+	if err != nil {
+		return fmt.Errorf("listening on %s: %w", addr, err)
+	}
+	sizes, err := netbuf.Tune(conn, bufferBytes, bufferBytes)
+	if err != nil {
+		log.Warn("cannot size the UDP socket buffers; the kernel default applies",
+			"addr", addr, "bytes", bufferBytes, "error", err)
+	} else if bufferBytes > 0 {
+		log.Info("sized the UDP socket buffers",
+			"addr", addr, "receiveBytes", sizes.Receive, "sendBytes", sizes.Send)
+	}
+	context.AfterFunc(ctx, func() { _ = conn.Close() })
+	if ready, ok := ctx.Value(sipgo.ListenReadyCtxKey).(sipgo.ListenReadyFuncCtxValue); ok {
+		ready("udp", conn.LocalAddr().String())
+	}
+	return server.ServeUDP(conn)
+}
+
+// flushPublishes waits for the outstanding asynchronous JetStream acks, bounded by timeout.
+func flushPublishes(js jetstream.JetStream, log *slog.Logger, timeout time.Duration) {
+	pending := js.PublishAsyncPending()
+	if pending == 0 {
+		return
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-timer.C:
+		log.Warn("some events were still unacknowledged at shutdown",
+			"pending", js.PublishAsyncPending(), "timeout", timeout)
+	}
 }
 
 // waitFor blocks until the group finishes or the timeout elapses. It reports whether the group
@@ -1009,10 +1007,9 @@ func openCredentialStore(cfg config.Config, conn *nats.Conn, log *slog.Logger) (
 		if err != nil {
 			return nil, err
 		}
-		// No probe request at boot. A registrar that refused to start because the control plane
-		// was briefly down would turn an API deploy into a SIP outage, and the failure mode
-		// without a probe is already correct: every REGISTER is refused with a logged reason
-		// until the responder answers, and recovers on its own the moment it does.
+		// No probe request at boot: refusing to start because the control plane is briefly down
+		// would turn an API deploy into a SIP outage. Until the responder answers, every REGISTER
+		// is refused with a logged reason, and it recovers on its own.
 		log.Info("credential store ready",
 			"source", "nats",
 			"subject", contract.SubjectSipCredentialRPC,

@@ -13,13 +13,10 @@ import (
 
 // executor turns the dialog machine's effects into wire actions.
 //
-// # Where it runs, and why that matters
-//
-// On the dialog's own goroutine, in order, before the command that produced the effects is
-// answered (see dialog.Session). That is the whole guarantee: a 200 is on the socket before
-// `answer` replies, and a CANCEL that arrives meanwhile queues behind it. Nothing in this type
-// takes a lock, and nothing in it may block for long — a handler that waited for a far end's
-// response would stall every subsequent command for that call.
+// It runs on the dialog's own goroutine, in order, before the command that produced the effects is
+// answered (see dialog.Session): a 200 is on the socket before `answer` replies, and a CANCEL that
+// arrives meanwhile queues behind it. Nothing here takes a lock or may block for long — blocking
+// stalls every subsequent command for that call.
 type executor struct {
 	handler *Handler
 	state   *legState
@@ -58,9 +55,9 @@ func (e *executor) Handle(ctx context.Context, d *dialog.Dialog, effect dialog.E
 		}
 		return e.sendBye(ctx, d, effect)
 	case dialog.EffectDeferBye, dialog.EffectDeferCancel:
-		// Nothing to do now, by construction: the machine holds the obligation and releases it as
-		// EffectSendBye or EffectSendCancel when the ACK or the first provisional arrives. Named
-		// here rather than defaulted so a reader sees the wait is deliberate.
+		// The machine holds the obligation and releases it as EffectSendBye or EffectSendCancel when
+		// the ACK or the first provisional arrives. Named rather than defaulted so the wait reads as
+		// deliberate.
 		e.handler.log.Debug("teardown deferred",
 			"legId", d.LegID, "reason", effect.Detail)
 		return nil
@@ -75,9 +72,8 @@ func (e *executor) Handle(ctx context.Context, d *dialog.Dialog, effect dialog.E
 		return nil
 	case dialog.EffectSendSessionRefresh:
 		// The refresh is a re-INVITE whose offer comes from mediad by way of the engine, so it
-		// cannot be built here. Logged rather than silently skipped: a deployment where this fires
-		// is one where session timers were turned on before the command surface existed, and the
-		// log is what tells the operator which of the two to fix.
+		// cannot be built here. Logged rather than silently skipped: session timers were turned on
+		// before a command surface existed to build one.
 		e.handler.log.Warn("a session refresh is due and there is no command surface to build it",
 			"legId", d.LegID)
 		return nil
@@ -92,20 +88,9 @@ func (e *executor) Handle(ctx context.Context, d *dialog.Dialog, effect dialog.E
 	}
 }
 
-// eventFor reads one publishable event off the dialog and the effect that produced it.
-//
-// # Why it reads the DIALOG rather than carrying everything on the effect
-//
-// The state machine's Effect is deliberately narrow: a kind, a status line, a body, and the three
-// terminal facts. Widening it to carry the dialog triple, the role, the setup time and the billsec
-// would put a wire payload's field set inside a pure state machine that has no business knowing one
-// exists — and it would be redundant, because this runs ON the dialog's own goroutine, immediately
-// after Apply mutated it, so the dialog is the freshest and the only consistent source for all of
-// them.
-//
-// The one thing it does NOT do is decide anything. Every field is read; nothing is derived, defaulted
-// or repaired here, so a payload that is wrong is a state machine that was wrong, and there is one
-// place to look.
+// eventFor reads one publishable event off the dialog and the effect that produced it. It runs on
+// the dialog's goroutine immediately after Apply mutated it, so the dialog is the only consistent
+// source. Nothing is derived, defaulted or repaired here: a wrong payload is a wrong state machine.
 func (e *executor) eventFor(d *dialog.Dialog, effect dialog.Effect) Event {
 	now := e.handler.now()
 	event := Event{
@@ -124,34 +109,30 @@ func (e *executor) eventFor(d *dialog.Dialog, effect dialog.Effect) Event {
 
 	switch effect.Event {
 	case dialog.EventProgressed:
-		// A 18x with a body committed an answer, and that is exactly what "early media" means on this
-		// event — not "the far end is ringing", which every 180 also is.
+		// "Early media" is a 18x that committed an answer, not merely a far end that is ringing.
 		if len(effect.Body) > 0 {
 			event.HasEarlyMedia = true
 			event.SDPAnswer = string(effect.Body)
 		}
 		if event.Status == 0 {
-			// A UAC leg's `progressed` comes from a response we RECEIVED, so the effect carries no
-			// status line of its own. 180 is the honest default: the trigger that produced it is
-			// TriggerRemoteEarly, which by definition is an 18x that created an early dialog.
+			// A UAC leg's `progressed` comes from a response we received, so the effect carries no
+			// status line. TriggerRemoteEarly is by definition an 18x, so 180 is the default.
 			event.Status = 180
 		}
 
 	case dialog.EventAnswered:
 		event.SDPAnswer = string(effect.Body)
 		if answered := d.AnsweredAt(); !answered.IsZero() {
-			// Post-dial delay, measured on the only plane that sees both the INVITE and the answer.
-			// Negative is impossible by construction and is clamped rather than sent, because a
-			// negative setup time on a percentile plot is worse than a missing one.
+			// Post-dial delay. A negative value is impossible by construction and is dropped rather
+			// than sent.
 			if setup := answered.Sub(d.CreatedAt()); setup > 0 {
 				event.SetupMs = int(setup / time.Millisecond)
 			}
 		}
 
 	case dialog.EventHeld, dialog.EventResumed:
-		// The far end's DECLARED direction, read back off the dialog rather than re-parsed from the
-		// body: internal/dialog already committed it, and parsing the same bytes twice is two chances
-		// to disagree about whether a call is on hold.
+		// Read back off the dialog rather than re-parsed from the body: internal/dialog already
+		// committed it, and parsing the same bytes twice is two chances to disagree.
 		event.Direction = d.RemoteDirection()
 
 	case dialog.EventTerminated:
@@ -172,19 +153,16 @@ func (e *executor) eventFor(d *dialog.Dialog, effect dialog.Effect) Event {
 	return event
 }
 
-// respondToInvite writes a response on the INVITE server transaction.
-//
-// It also owns the two things that go with a 2xx: the RFC 6026 retransmission loop, and the ring
-// timer's cancellation. Both belong here because both are consequences of the response being
-// written and neither is knowable before it is.
+// respondToInvite writes a response on the INVITE server transaction. It also owns the two
+// consequences of writing a 2xx: the RFC 6026 retransmission loop and the ring timer's cancellation.
 func (e *executor) respondToInvite(d *dialog.Dialog, effect dialog.Effect) error {
 	if e.state.inviteTx == nil || e.state.invite == nil {
 		return errors.New("invite: no INVITE transaction to respond on")
 	}
 	res := sip.NewResponseFromRequest(e.state.invite, effect.Status, effect.Reason, effect.Body)
-	// Our To tag, on every response above 100. sipgo mints one of its own when the request carried
-	// none and does not tell us which — and the tag on the 180 must be the SAME string as on the
-	// 200, or the far end sees two early dialogs and one of them never ends.
+	// Our To tag, on every response above 100: sipgo would otherwise mint one of its own without
+	// telling us, and the 180 and the 200 must carry the same tag or the far end sees two early
+	// dialogs, one of which never ends.
 	if effect.Status > 100 {
 		if to := res.To(); to != nil {
 			to.Params.Remove("tag")
@@ -217,18 +195,13 @@ func (e *executor) respondToInvite(d *dialog.Dialog, effect dialog.Effect) error
 	}
 	if effect.Status >= 200 && effect.Status < 300 {
 		e.startRetransmit(d, res)
-		// RFC 3891 §3: the replaced dialog is ended when the replacement is ACCEPTED, which is now
-		// and not when the INVITE arrived. Tearing down on arrival and then failing to answer would
-		// leave the user with no call at all, having hung up a conversation that was working.
+		// RFC 3891 §3: the replaced dialog ends when the replacement is accepted, not when its
+		// INVITE arrived — tearing down on arrival and then failing to answer leaves no call at all.
 		if e.state.replacesLegID != "" {
 			replaced := e.state.replacesLegID
 			e.state.replacesLegID = ""
 			handler := e.handler
-			handler.backgroundWork.Add(1)
-			go func() {
-				defer handler.backgroundWork.Done()
-				handler.completeReplaces(replaced)
-			}()
+			handler.backgroundWork.Go(func() { handler.completeReplaces(replaced) })
 		}
 	}
 	return nil
@@ -258,15 +231,9 @@ func (e *executor) respondToPending(d *dialog.Dialog, effect dialog.Effect) erro
 
 // startRetransmit runs RFC 6026's 2xx-until-ACK loop.
 //
-// # Why the TU owns this and not the transaction layer
-//
-// An INVITE server transaction TERMINATES when a 2xx is sent (RFC 3261 §17.2.1), precisely so that
-// the transaction layer stops absorbing retransmissions and the ACK can be a new transaction. The
-// consequence is that nobody but the TU retransmits the 2xx, and a 2xx that is lost on a UDP path
-// with no retransmission is a call that rang, was answered, and then failed silently.
-//
-// The interval doubles from T1 to T2 and the loop gives up at 64×T1, at which point RFC 3261
-// §13.3.1.4 says to send a BYE — which is what the TimeoutAck trigger produces.
+// An INVITE server transaction terminates when a 2xx is sent (RFC 3261 §17.2.1), so nobody but the
+// TU retransmits it. The interval doubles from T1 to T2 and the loop gives up at 64×T1, where RFC
+// 3261 §13.3.1.4 calls for a BYE — the TimeoutAck trigger.
 func (e *executor) startRetransmit(d *dialog.Dialog, res *sip.Response) {
 	if e.handler.responder == nil {
 		return
@@ -282,9 +249,7 @@ func (e *executor) startRetransmit(d *dialog.Dialog, res *sip.Response) {
 	interval := handler.retransmitT1
 	deadline := time.Now().Add(handler.retransmitFor)
 
-	handler.backgroundWork.Add(1)
-	go func() {
-		defer handler.backgroundWork.Done()
+	handler.backgroundWork.Go(func() {
 		defer cancel()
 		timer := time.NewTimer(interval)
 		defer timer.Stop()
@@ -305,14 +270,11 @@ func (e *executor) startRetransmit(d *dialog.Dialog, res *sip.Response) {
 				handler.log.Warn("cannot retransmit the 200", "legId", legID, "error", err)
 			}
 			if interval < handler.retransmitCap {
-				interval *= 2
-				if interval > handler.retransmitCap {
-					interval = handler.retransmitCap
-				}
+				interval = min(interval*2, handler.retransmitCap)
 			}
 			timer.Reset(interval)
 		}
-	}()
+	})
 }
 
 func (e *executor) stopRetransmit() {
@@ -330,11 +292,8 @@ func (e *executor) stopRingTimer() {
 	}
 }
 
-// armSessionTimer sets the RFC 4028 deadline for this side.
-//
-// The refresher arms the REFRESH point (half the interval) and the other side arms the EXPIRY. Both
-// end up here because both are one timer with two meanings, and conflating them would either
-// refresh a session we do not own or tear down one whose refresh is on the wire.
+// armSessionTimer sets the RFC 4028 deadline for this side: the refresher arms the refresh point
+// (half the interval), the other side arms the expiry.
 func (e *executor) armSessionTimer(d *dialog.Dialog) {
 	e.stopSessionTimer()
 	timer := d.Timer()
@@ -382,16 +341,14 @@ func (e *executor) sendBye(ctx context.Context, d *dialog.Dialog, effect dialog.
 		SendAndWait(context.Context, *sip.Request) error
 	}); ok {
 		legID := d.LegID
-		e.handler.backgroundWork.Add(1)
-		go func() {
-			defer e.handler.backgroundWork.Done()
+		e.handler.backgroundWork.Go(func() {
 			waitCtx, cancel := context.WithTimeout(e.handler.baseCtx, 32*time.Second)
 			defer cancel()
 			if err := requester.SendAndWait(waitCtx, req); err != nil {
 				e.handler.log.Warn("SIP teardown did not receive a final response", "legId", legID)
 			}
 			e.handler.post(legID, dialog.Input{Trigger: dialog.TriggerTeardownComplete})
-		}()
+		})
 		return nil
 	}
 	return e.handler.requester.Send(ctx, req)
@@ -405,8 +362,7 @@ func (e *executor) sendCancel(ctx context.Context) error {
 }
 
 func (e *executor) sendAck(ctx context.Context, d *dialog.Dialog, effect dialog.Effect) error {
-	// An ACK carries the INVITE's OWN CSeq number, not a new one (RFC 3261 §13.2.2.4). Incrementing
-	// it would make the far end treat the ACK as belonging to a transaction that does not exist.
+	// An ACK carries the INVITE's own CSeq number, not a new one (RFC 3261 §13.2.2.4).
 	req := buildAck(d, e.state.local, e.state.remote, e.state.localCSeq,
 		effect.Body, e.state.profile.NAT, e.handler.contact)
 	return e.handler.requester.Send(ctx, req)

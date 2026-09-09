@@ -1,39 +1,22 @@
-// Package reaper keeps the `sip-dialogs` claims honest, in both directions.
-//
-// # The two halves, and why one package owns both
-//
-// A claim is a lease. It is only useful if somebody REFRESHES the ones that are still true and
-// somebody ACTS on the ones that have stopped being refreshed — and those are the same sweep seen
-// from two sides. Splitting them across two goroutines with two intervals would let a deployment
-// end up heartbeating faster than it reaps or the reverse, and the failure mode of the second is a
-// process that reaps its OWN calls.
-//
-// So: one ticker, two steps.
+// Package reaper keeps the `sip-dialogs` claims honest in both directions, from one ticker:
 //
 //  1. HEARTBEAT. Every live dialog on this instance gets its claim re-written with a fresh
-//     expiresAt. This is what keeps a busy instance's calls from looking dead to its neighbours.
+//     expiresAt, so a busy instance's calls do not look dead to its neighbours.
 //  2. REAP. Every claim belonging to some OTHER instance whose lease has lapsed produces a
 //     `dialog.terminated{reason: "instance-lost", cause: 41}` published on the dead owner's behalf,
 //     and the claim is deleted.
 //
-// # Why step 2 is the point of the whole bucket
+// One package owns both because they are the same sweep seen from two sides; splitting them across
+// two intervals could let a deployment reap faster than it heartbeats, and a process that reaps its
+// own calls is the worst failure available here. dialog.Orphans encodes the rule that prevents it.
 //
-// A sipd that dies takes its dialogs with it — there is no re-INVITE that can be sent from a process
-// that does not hold the CSeq, and the far end's BYE is addressed to a Contact that is gone (design
-// §6.4). What must not die with it is the ENGINE's knowledge that those calls ended. Without this
-// sweep the engine holds channels for calls that ended when a pod was rescheduled and writes no CDR
-// row for any of them: not a wrong bill, an ABSENT one. That is design §6.2's whole point, and
-// `dialog.Orphans` already encodes the one rule that makes it safe — it never reaps this instance's
-// own expired claims, because our own late heartbeat is a broker blip and reaping it would turn a
-// network hiccup into dropped calls.
+// Step 2 is why the bucket exists: a sipd that dies takes its dialogs with it (design §6.4), and
+// without this sweep the engine holds channels for calls that ended when a pod was rescheduled and
+// writes no CDR row for any of them — not a wrong bill, an absent one.
 //
-// # Q.850 41, and not 16 or 31
-//
-// "Temporary failure". The call did not end normally, nobody rejected it and no timer inside the
-// call expired — the machine holding it went away. 16 (normal clearing) would file a crash as a
-// hang-up and make an availability incident invisible in the CDR; 31 (normal, unspecified) is the
-// shrug that means nothing. 41 is the one code that says "infrastructure", which is what a customer
-// asking why forty calls dropped at 03:14 is entitled to see.
+// The cause is Q.850 41, "temporary failure": the machine holding the call went away. 16 (normal
+// clearing) would file a crash as a hang-up and make an availability incident invisible in the CDR;
+// 31 (normal, unspecified) says nothing.
 package reaper
 
 import (
@@ -50,10 +33,8 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/sipevents"
 )
 
-// CauseInstanceLost is Q.850 41, "temporary failure". See the package comment for why not 16.
-//
-// Taken from internal/dialog rather than written as a literal, so this file cannot drift from the
-// generated taxonomy the rest of the platform bills against.
+// CauseInstanceLost is Q.850 41, "temporary failure". See the package comment for why not 16. Taken
+// from internal/dialog so this file cannot drift from the taxonomy the platform bills against.
 const CauseInstanceLost = dialog.CauseTemporaryFailure
 
 // Claims is the subset of dialog.ClaimStore this package needs. It is restated rather than reused
@@ -78,16 +59,14 @@ type Options struct {
 	Store Claims
 	// Dialogs is this instance's live dialog table, for the heartbeat half. Required.
 	Dialogs Live
-	// Events publishes the terminations reaped on a dead owner's behalf. Required: a reaper that
-	// deleted claims without publishing would be a reaper that DESTROYS the evidence it exists to
-	// deliver, which is strictly worse than not running at all.
+	// Events publishes the terminations reaped on a dead owner's behalf. Required: deleting claims
+	// without publishing would destroy the evidence this reaper exists to deliver.
 	Events sipevents.Publisher
-	// InstanceID is this process's token. Required, and load-bearing rather than cosmetic: it is
-	// what dialog.Orphans compares against to decide which claims are somebody else's.
+	// InstanceID is this process's token. Required: it is what dialog.Orphans compares against to
+	// decide which claims are somebody else's.
 	InstanceID string
-	// Interval is how often the sweep runs. It must be comfortably shorter than the claim lease —
-	// half of it or less — so a heartbeat has more than one chance to land through a broker blip
-	// before a neighbour declares this instance dead and reaps its live calls.
+	// Interval is how often the sweep runs. It must be half the claim lease or less, so a heartbeat
+	// has more than one chance to land before a neighbour declares this instance dead.
 	Interval time.Duration
 	// ReapInterval is how often the REAP half runs, which is deliberately not every sweep. Zero
 	// means twice the heartbeat interval. See Reaper.Sweep.
@@ -159,12 +138,9 @@ func New(opts Options) (*Reaper, error) {
 	return reaper, nil
 }
 
-// Run sweeps until the context is cancelled.
-//
-// The first sweep is IMMEDIATE rather than one interval in. A restarted pod's neighbours may be
-// holding claims that lapsed while it was down, and making the fleet wait thirty seconds to notice
-// would add that delay to every CDR written after a rolling deploy — which is precisely the window
-// this whole mechanism exists to close.
+// Run sweeps until the context is cancelled. The first sweep is immediate: a restarted pod's
+// neighbours may hold claims that lapsed while it was down, and waiting one interval would add that
+// delay to every CDR written after a rolling deploy.
 func (r *Reaper) Run(ctx context.Context) error {
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
@@ -180,20 +156,14 @@ func (r *Reaper) Run(ctx context.Context) error {
 	}
 }
 
-// Sweep runs one heartbeat-and-reap pass. It is exported so a test can drive it without a ticker,
-// and so a shutdown path can run one final pass.
-// # Why the reap half does not run on every sweep
+// Sweep runs one heartbeat-and-reap pass, exported so a test can drive it without a ticker and a
+// shutdown path can run one final pass.
 //
-// The heartbeat is O(this instance's dialogs) and is a write per live call, which is what the
-// interval is sized for. The reap is O(the WHOLE FLEET's dialogs) — `All` reads every claim in the
-// bucket — and every instance pays it, so the cost is instances × fleet-wide dialogs per interval
-// and it grows quadratically with cluster size. Ten instances holding five thousand calls between
-// them is fifty thousand KV Gets every interval, all but a handful discarded.
-//
-// So the listing runs on its own, longer interval, with a random phase so a fleet's reap sweeps do
-// not align. What it costs is latency on a CDR of last resort — a claim whose owner died is
-// published one reap interval later than it would have been — and that is the right thing to trade,
-// because the claim's own lease is what decides whether it is an orphan, not when we look.
+// The reap half does not run every sweep. The heartbeat is O(this instance's dialogs); the reap is
+// O(the whole fleet's dialogs) and every instance pays it, so it grows quadratically with cluster
+// size. It therefore runs on its own longer interval with a random phase. The cost is latency on a
+// CDR of last resort, which is safe because the claim's own lease decides whether it is an orphan,
+// not when we look.
 func (r *Reaper) Sweep(ctx context.Context) {
 	sweepCtx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
@@ -203,24 +173,19 @@ func (r *Reaper) Sweep(ctx context.Context) {
 	if now.Before(r.nextReap) {
 		return
 	}
-	// Jittered so N instances that started together do not list the bucket in the same millisecond
-	// for ever after, which is the thundering herd the interval alone would leave in place.
+	// Jittered so instances that started together do not list the bucket in the same millisecond
+	// for ever after.
 	jitter := time.Duration(rand.Int64N(int64(r.reapInterval) / 4))
 	r.nextReap = now.Add(r.reapInterval - r.reapInterval/8 + jitter)
 	r.reap(sweepCtx)
 }
 
-// heartbeat re-writes every live dialog's claim.
+// heartbeat re-writes every live dialog's claim, unconditionally rather than only those close to
+// expiry: tracking per-claim deadlines here would be a second copy of the lease that could disagree
+// with the bucket's.
 //
-// One write per dialog per interval, unconditionally, and not "only the ones close to expiry". The
-// arithmetic is what makes that fine: at a thirty-second interval an instance holding a thousand
-// calls writes thirty-three keys a second, which is nothing to a KV bucket; and the alternative —
-// tracking per-claim deadlines here — would be a second copy of the lease that could disagree with
-// the one in the bucket.
-//
-// A failure is logged and the sweep continues. A claim that could not be refreshed costs REAPING
-// for that one leg, not the call, and abandoning the pass would leave every subsequent dialog's
-// claim stale as well.
+// A failure is logged and the sweep continues; abandoning the pass would leave every subsequent
+// dialog's claim stale as well.
 func (r *Reaper) heartbeat(ctx context.Context) {
 	claims := r.dialogs.Claims()
 	written, failed := 0, 0
@@ -242,16 +207,10 @@ func (r *Reaper) heartbeat(ctx context.Context) {
 	}
 }
 
-// reap publishes a termination for every orphaned claim and then deletes it.
-//
-// # The order is publish-then-delete, and it is not interchangeable
-//
-// Deleting first would open a window in which the claim is gone and the engine has not been told
-// the leg ended — and if this process died in that window the call would be unreapable by anybody,
-// for ever. Publishing first risks the opposite: a publish that succeeds and a delete that fails,
-// so the next sweep publishes the same termination again. That duplicate is HARMLESS, because the
-// envelope carries a stable id as `Nats-Msg-Id` and the stream's duplicate window collapses it. One
-// failure mode is bounded and idempotent; the other is a call that is never billed.
+// reap publishes a termination for every orphaned claim and then deletes it. The order is not
+// interchangeable: deleting first would open a window in which a crash leaves the leg unreapable by
+// anybody, for ever. Publishing first risks only a republish on the next sweep, which the stream's
+// duplicate window collapses via the envelope's stable `Nats-Msg-Id`.
 func (r *Reaper) reap(ctx context.Context) {
 	claims, err := r.store.All(ctx)
 	if err != nil {
@@ -268,9 +227,8 @@ func (r *Reaper) reap(ctx context.Context) {
 
 	for _, orphan := range orphans {
 		if err := r.publishTermination(ctx, orphan); err != nil {
-			// NOT deleted. The claim stays so the next sweep tries again; the bucket's own TTL is the
-			// backstop if it never succeeds. Deleting a claim whose termination was never published
-			// would silently discard the only evidence that call ever ended.
+			// NOT deleted: the claim stays so the next sweep tries again, with the bucket's TTL as the
+			// backstop. Deleting it would discard the only evidence that call ever ended.
 			r.log.Error("cannot publish an orphaned dialog's termination; leaving the claim for the next sweep",
 				"legId", orphan.LegID, "ownerInstanceId", orphan.InstanceID, "error", err)
 			continue
@@ -292,23 +250,15 @@ func (r *Reaper) reap(ctx context.Context) {
 
 // publishTermination builds and publishes one orphan's `dialog.terminated`.
 //
-// # What it can and cannot say
-//
-// It reports the DEAD OWNER's instance id, not this one. The event describes a leg that lived on
-// that process, and stamping the reaper's id would make the engine address a follow-up command at a
-// process that never held the call.
-//
-// `answeredForSeconds` is deliberately absent even for a claim in state `confirmed`. The claim
-// records when the dialog was CREATED and when its lease expires, and neither of those is when the
-// call was answered; deriving a billsec from them would be inventing a number that looks
-// authoritative. An absent field says "this leg's duration is not known", which is the truth, and
-// the engine has the `dialog.answered` it received earlier to reconcile against.
+// It reports the DEAD OWNER's instance id, not this one, or the engine would address a follow-up
+// command at a process that never held the call. `answeredForSeconds` is deliberately absent even
+// for a confirmed claim: the claim records creation and lease expiry, neither of which is when the
+// call was answered, and an absent field is the truth rather than an invented billsec.
 func (r *Reaper) publishTermination(ctx context.Context, orphan dialog.Claim) error {
 	role := contract.SIPDialogTerminatedRole(orphan.Role)
 	if !role.Valid() {
-		// A claim whose role is unreadable still names a leg that ended, and refusing to publish it
-		// would withhold a CDR over a cosmetic field. `uas` is the conservative reading: it is what
-		// an inbound call is, and inbound is what the overwhelming majority of legs on this edge are.
+		// A claim whose role is unreadable still names a leg that ended; refusing to publish would
+		// withhold a CDR over a cosmetic field. `uas` is the conservative reading.
 		role = contract.SIPDialogTerminatedRoleUas
 	}
 	envelope, err := contract.NewSIPDialogTerminatedEnvelope(
@@ -346,6 +296,5 @@ func optional(value string) *string {
 	if value == "" {
 		return nil
 	}
-	copied := value
-	return &copied
+	return new(value)
 }

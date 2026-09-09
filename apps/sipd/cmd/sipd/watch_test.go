@@ -12,7 +12,7 @@ import (
 )
 
 func TestWatchAttachesWhenControlPlaneStartsLater(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	var attempts atomic.Int32
 	attached := make(chan struct{})
@@ -35,7 +35,7 @@ func TestWatchAttachesWhenControlPlaneStartsLater(t *testing.T) {
 }
 
 func TestWatchStopsRetryingOnShutdown(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	var attempts atomic.Int32
 	watchWhenAvailable(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)), "sip-acl", time.Millisecond, func() error {
 		attempts.Add(1)
@@ -48,10 +48,8 @@ func TestWatchStopsRetryingOnShutdown(t *testing.T) {
 	}
 }
 
-// No backoff meant one JetStream lookup per second, per watched bucket, for the life of a process
-// whose control plane never creates the bucket — and every failure after the first was silent.
 func TestWatchBacksOffBetweenAttempts(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	var mu sync.Mutex

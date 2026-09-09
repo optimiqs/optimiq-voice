@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,13 +22,11 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/transfer"
 )
 
-// The REFER vertical end to end inside one process: real digest (answered by github.com/icholy/digest,
-// the CLIENT side of the same RFC), a real location service, a real parser, and fakes only at the two
-// edges that are genuinely elsewhere — the broker and the socket.
+// The REFER vertical end to end inside one process: real digest, a real location service, a real
+// parser, and fakes only at the broker and the socket.
 //
-// Two properties are worth the harness. That an unauthenticated or unregistered phone never reaches
-// the broker at all. And that EVERY path after the 202 produces a final NOTIFY, because a handset
-// that is accepted and then told nothing holds its transfer indicator until the dialog dies.
+// Two properties are worth the harness: an unauthenticated or unregistered phone never reaches the
+// broker at all, and EVERY path after the 202 produces a final NOTIFY.
 
 const (
 	testRealm = "acme.example.com"
@@ -37,10 +36,6 @@ const (
 	testAOR   = "sip:1001@acme.example.com"
 	testCall  = "3c26700c1adf-6qgy0fkn7cvb"
 )
-
-// ---------------------------------------------------------------------------------------------
-// fakes
-// ---------------------------------------------------------------------------------------------
 
 type fakeRequester struct {
 	mu       sync.Mutex
@@ -69,7 +64,7 @@ func (f *fakeRequester) Transfer(
 func (f *fakeRequester) seen() []contract.SipTransferRequest {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]contract.SipTransferRequest(nil), f.requests...)
+	return slices.Clone(f.requests)
 }
 
 type recordingNotifier struct {
@@ -105,10 +100,6 @@ func (s staticCredentials) Lookup(context.Context, string, string) (credentials.
 	}
 	return s.credential, nil
 }
-
-// ---------------------------------------------------------------------------------------------
-// harness
-// ---------------------------------------------------------------------------------------------
 
 type harness struct {
 	t         *testing.T
@@ -181,7 +172,7 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 			RegisteredAt: contract.NewEventTime(h.now.Add(-time.Minute)),
 			ExpiresAt:    contract.NewEventTime(expires),
 		}
-		if err := h.bindings.Put(context.Background(), binding); err != nil {
+		if err := h.bindings.Put(t.Context(), binding); err != nil {
 			t.Fatalf("seeding the binding: %v", err)
 		}
 	}
@@ -280,8 +271,7 @@ func (h *harness) send(req *sip.Request) *sip.Response {
 	h.t.Helper()
 	tx := siptest.NewServerTxRecorder(req)
 	h.handler.HandleRefer(req, tx)
-	// The outcome report runs on its own goroutine so the 202 is not held behind the RPC; drain it
-	// before asserting, exactly as the shutdown path does.
+	// The outcome report runs on its own goroutine, so drain it before asserting.
 	if !h.handler.Wait(5 * time.Second) {
 		h.t.Fatal("the outcome report did not finish")
 	}
@@ -291,10 +281,6 @@ func (h *harness) send(req *sip.Request) *sip.Response {
 	}
 	return results[len(results)-1]
 }
-
-// ---------------------------------------------------------------------------------------------
-// the accepted path
-// ---------------------------------------------------------------------------------------------
 
 func TestReferIsAcceptedAndReported(t *testing.T) {
 	h := newHarness(t, harnessOptions{response: contract.SipTransferResponse{Ok: true}})
@@ -368,10 +354,6 @@ func TestReferCarriesAParsedReplacesForAnAttendedTransfer(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------------------------
-// the refusal paths — nothing here may reach the broker
-// ---------------------------------------------------------------------------------------------
-
 func TestReferWithoutCredentialsIsChallenged(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 
@@ -416,8 +398,8 @@ func TestReferWithAWrongPasswordIsRefusedOutright(t *testing.T) {
 }
 
 func TestReferAuthenticatedAsSomebodyElseIsRefused(t *testing.T) {
-	// The third-party-REFER hole: a valid account on the realm sending a REFER whose From names
-	// another extension, so the engine would attribute the transfer to that extension.
+	// The third-party-REFER hole: a valid account sending a REFER whose From names another
+	// extension, which the engine would then attribute to that extension.
 	h := newHarness(t, harnessOptions{})
 	challenge := h.send(h.newRefer("", "Refer-To: <sip:1002@"+testRealm+">"))
 	authorization := h.answerChallenge(challenge, "REFER")
@@ -452,8 +434,7 @@ func TestReferFromAnAccountWithNoLiveRegistrationIsRefused(t *testing.T) {
 }
 
 func TestReferFromALapsedRegistrationIsRefused(t *testing.T) {
-	// The sweeper has not reached it yet. Treating it as live would accept a REFER from a phone that
-	// stopped refreshing minutes ago.
+	// Treating a lapsed binding as live would accept a REFER from a phone that stopped refreshing.
 	h := newHarness(t, harnessOptions{expired: true})
 
 	if res := h.refer(); res.StatusCode != 403 {
@@ -478,8 +459,7 @@ func TestReferForADisabledAccountIsRefused(t *testing.T) {
 func TestReferWithNoTargetIsABadRequest(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 
-	// An authenticated REFER with no Refer-To at all. `Contact` stands in for the header so the
-	// helper does not substitute its default.
+	// `Contact` stands in for the header so the helper does not substitute its default.
 	if res := h.refer("Allow: INVITE"); res.StatusCode != 400 {
 		t.Fatalf("status = %d, want 400", res.StatusCode)
 	}
@@ -499,10 +479,6 @@ func TestReferToASchemeThisEdgeWillNotDialIsNotImplemented(t *testing.T) {
 		t.Error("an undialable target must never reach the broker")
 	}
 }
-
-// ---------------------------------------------------------------------------------------------
-// the reporting paths — every one of these must still notify
-// ---------------------------------------------------------------------------------------------
 
 func TestAnEngineRefusalIsReportedAs503(t *testing.T) {
 	reason := contract.SipTransferResponseReasonCorrelationUnavailable
@@ -538,7 +514,7 @@ func TestTheNotificationsCarryTheSubscriptionTheReferCreated(t *testing.T) {
 	h.refer()
 
 	h.notifier.mu.Lock()
-	sent := append([]*sip.Request(nil), h.notifier.sent...)
+	sent := slices.Clone(h.notifier.sent)
 	h.notifier.mu.Unlock()
 
 	if len(sent) != 2 {
@@ -577,7 +553,7 @@ func TestTheNotificationsCarryTheSubscriptionTheReferCreated(t *testing.T) {
 		t.Errorf("Call-ID = %v, want the dialog's own", last.CallID())
 	}
 	// Within one subscription the CSeq must increase, or the phone reads the second notification as
-	// a retransmission of the first and never learns the outcome.
+	// a retransmission and never learns the outcome.
 	if first.CSeq().SeqNo >= last.CSeq().SeqNo {
 		t.Errorf("CSeq did not advance: %d then %d", first.CSeq().SeqNo, last.CSeq().SeqNo)
 	}
@@ -592,8 +568,7 @@ func TestTheNotificationsCarryTheSubscriptionTheReferCreated(t *testing.T) {
 }
 
 func TestBuildNotifyMintsATagWhenTheReferHadNoToTag(t *testing.T) {
-	// A REFER outside a dialog carries no To tag, so the 202 is what establishes one — and it has to
-	// be OURS, because we are the side answering.
+	// A REFER outside a dialog carries no To tag, so the 202 establishes one and it must be OURS.
 	h := newHarness(t, harnessOptions{response: contract.SipTransferResponse{Ok: true}})
 
 	challenge := h.send(h.newRefer("", "Refer-To: <sip:1002@"+testRealm+">"))
@@ -615,7 +590,7 @@ func TestBuildNotifyMintsATagWhenTheReferHadNoToTag(t *testing.T) {
 
 func TestDiscardNotifierIsAValidChoice(t *testing.T) {
 	// The deployment with no SIP client: transfers still work, phones simply never learn the outcome.
-	if err := (transfer.DiscardNotifier{}).Notify(context.Background(), nil); err != nil {
+	if err := (transfer.DiscardNotifier{}).Notify(t.Context(), nil); err != nil {
 		t.Errorf("DiscardNotifier.Notify: %v", err)
 	}
 }

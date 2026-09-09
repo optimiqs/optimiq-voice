@@ -16,8 +16,7 @@ func confirmed(t *testing.T) *Dialog {
 	return d
 }
 
-// The three RFC-mandated refusals, each meaning something different to the phone that sent the
-// offer.
+// The three RFC-mandated refusals, each meaning something different to the phone that sent the offer.
 func TestApplyMidDialogRefusals(t *testing.T) {
 	t.Run("a re-INVITE before the initial INVITE is answered is 500 with a Retry-After", func(t *testing.T) {
 		d := newTestDialog(t, RoleUAS)
@@ -73,8 +72,7 @@ func TestApplyMidDialogRefusals(t *testing.T) {
 	})
 }
 
-// Only a CHANGE across the hold boundary is worth an event. Publishing `held` for a codec change or
-// a NAT re-latch would start music-on-hold over a live conversation.
+// Only a CHANGE across the hold boundary is worth an event, or a codec change starts music-on-hold.
 func TestHoldAndResumePublishOnlyOnChange(t *testing.T) {
 	d := confirmed(t)
 
@@ -118,9 +116,8 @@ func TestHoldAndResumePublishOnlyOnChange(t *testing.T) {
 	}
 }
 
-// RFC 3261 §12.2.1.1: a mid-dialog request with a Contact refreshes the remote target, and the
-// observed source refreshes with it. A dialog that did not refresh sends its BYE to where the far
-// end used to be.
+// RFC 3261 §12.2.1.1: a Contact on a mid-dialog request refreshes the remote target, and the
+// observed source refreshes with it.
 func TestMidDialogRefreshesTheTarget(t *testing.T) {
 	d := confirmed(t)
 	moved := sip.Uri{Scheme: "sip", User: "1001", Host: "198.51.100.9", Port: 5062}
@@ -166,8 +163,7 @@ func TestMidDialogRefreshReArmsTheSessionTimer(t *testing.T) {
 	}
 }
 
-// Two of our own offers in flight is not glare; it is this process having lost track, and it is
-// refused so an answer nobody can match to an offer never happens.
+// Two of our own offers in flight is not glare but lost track, and is refused.
 func TestBeginReOfferRefusesASecondOutstandingOffer(t *testing.T) {
 	d := confirmed(t)
 	if err := d.BeginReOffer(); err != nil {
@@ -185,8 +181,8 @@ func TestBeginReOfferRefusesASecondOutstandingOffer(t *testing.T) {
 		t.Error("a completed offer is no longer outstanding")
 	}
 
-	// And a failed offer clears the flag too: without it, one failed re-INVITE would make every
-	// subsequent offer from the far end look like glare for the life of the call.
+	// A failed offer clears the flag too, or one failed re-INVITE makes every later offer look like
+	// glare for the life of the call.
 	if err := d.BeginReOffer(); err != nil {
 		t.Fatalf("BeginReOffer after completion: %v", err)
 	}
@@ -204,8 +200,7 @@ func TestBeginReOfferRefusesAnUnansweredDialog(t *testing.T) {
 	}
 }
 
-// The glare retry range is chosen by comparing Call-IDs, which is the only tie-break both ends can
-// compute identically without another round trip.
+// The glare retry range is chosen by comparing Call-IDs, the only tie-break both ends compute alike.
 func TestGlareRetryAfterUsesTheCallIDComparison(t *testing.T) {
 	d := confirmed(t) // its Call-ID is "a84b4c76e66710@pc33"
 
@@ -219,8 +214,7 @@ func TestGlareRetryAfterUsesTheCallIDComparison(t *testing.T) {
 	}
 }
 
-// The answer to a mid-dialog offer is committed before it goes out, so anything that must repeat it
-// repeats it byte for byte.
+// The answer to a mid-dialog offer is committed before it goes out, so a repeat is byte-identical.
 func TestAnswerMidDialogCommitsAndResponds(t *testing.T) {
 	d := confirmed(t)
 	body := []byte("v=0\r\nm=audio 40002 RTP/AVP 0\r\n")

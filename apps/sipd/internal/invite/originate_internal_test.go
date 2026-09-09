@@ -10,8 +10,7 @@ import (
 )
 
 // originateTestHandler is the minimum a buildOriginateInvite call touches: an identity to present
-// as, a server string, a logger and a tag minter. Everything else buildOriginateInvite reads comes
-// off the request and the target it is handed.
+// as, a server string, a logger and a tag minter.
 func originateTestHandler() *Handler {
 	return &Handler{
 		contact: sip.Uri{Scheme: "sip", User: "sipd", Host: "edge.example"},
@@ -21,9 +20,8 @@ func originateTestHandler() *Handler {
 	}
 }
 
-// A target that is one appearance of a shared line gets a Call-Info header naming which appearance,
-// so the phone lights the right line key. The number is the SHARED LINE's number and the URI host
-// is the request-URI's, matching the header format the INVITE path commits to.
+// The Call-Info header names the appearance so the phone lights the right line key: the shared
+// line's number, and the request-URI's host.
 func TestBuildOriginateInviteStampsCallInfoForAnAppearance(t *testing.T) {
 	h := originateTestHandler()
 	number := "2000"
@@ -51,9 +49,7 @@ func TestBuildOriginateInviteStampsCallInfoForAnAppearance(t *testing.T) {
 	}
 }
 
-// With no shared-line number the appearance-index still goes out, addressed to the target user —
-// the credential named an appearance but no distinct line number, and the phone still needs to know
-// which key to light.
+// With no shared-line number the appearance-index still goes out, addressed to the target user.
 func TestBuildOriginateInviteCallInfoFallsBackToTheTargetUser(t *testing.T) {
 	h := originateTestHandler()
 	index := 1
@@ -75,8 +71,7 @@ func TestBuildOriginateInviteCallInfoFallsBackToTheTargetUser(t *testing.T) {
 	}
 }
 
-// An ordinary extension — no appearance index — gets NO Call-Info header. The header is an SLA
-// signal and only an SLA target may carry it.
+// An ordinary extension gets no Call-Info header: it is an SLA-only signal.
 func TestBuildOriginateInviteOmitsCallInfoWithoutAnAppearance(t *testing.T) {
 	h := originateTestHandler()
 	target := dialTarget{

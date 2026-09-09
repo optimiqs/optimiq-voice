@@ -1,45 +1,23 @@
-// Package trunk is the outbound gateway registration state machine.
+// Package trunk is the outbound gateway registration state machine: when to register, where, how
+// long to wait after a failure, when to fail over, and what status to publish.
 //
-// # What is missing today, and what this replaces
-//
-// The parity audit's row 1.27 records the state of trunk registration on the production plane: the
-// only `type = registration` blocks in the repository live in an EXAMPLE file with placeholders
-// that nothing includes, `pjsip_wizard.conf` still registers to the deleted Routr proxy's
-// placeholder host, no code turns a `trunk` row into any of it, and there is no gateway state
-// machine anywhere. Row 1.7 adds the other half: nothing reads registration state back into
-// `trunk.status*`.
-//
-// This package is that state machine. It decides WHEN to register, WHERE to register, how long to
-// wait after a failure, when to fail over to a secondary registrar, and what status transition to
-// publish — and it decides all of it as a pure function of inputs and a clock, so every one of
-// those decisions is a table test rather than a stopwatch.
-//
-// # Where the configuration comes from, and what is missing
-//
-// Nothing delivers trunk configuration to sipd today. There is no provisioning path, no watched
-// read model and no RPC: the `trunk` table lives in packages/pbx-db and is read by apps/api, and
-// the SIP edge holds no handle on either. So this package defines the struct it NEEDS (Config
-// below), takes it from a caller, and names the ingestion seam explicitly: a `trunks` KV read model
-// written by apps/api from the table and watched here, on the exact pattern design §8.1 prescribes
-// for the ACL read model and `did-index.publisher.ts` already implements for DIDs. Until that
-// exists a deployment configures trunks in process, which is honest and is not a deployment story.
+// Every decision is a pure function of its inputs and a clock, so it is table-testable. Trunk
+// configuration is supplied by the caller; the intended ingestion seam is a `trunks` KV read model
+// written by apps/api and watched here.
 package trunk
 
 import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"time"
 )
 
-// State is where one gateway registration is.
-//
-// Four states and not three: `failing` is separate from `unregistered` because they differ in the
-// only way that matters operationally — an unregistered trunk is one nobody has tried yet, and a
-// failing one is a trunk that is being retried on a backoff and whose status should already be
-// visible as degraded. Collapsing them produces a dashboard that shows a carrier as "not
-// configured" during an outage.
+// State is where one gateway registration is. `failing` is deliberately distinct from
+// `unregistered`: a failing trunk is being retried on a backoff and must report as degraded, not as
+// unconfigured.
 type State int
 
 const (
@@ -51,9 +29,8 @@ const (
 	StateRegistered
 	// StateFailing means the last attempt failed and the next one is waiting out a backoff.
 	StateFailing
-	// StateDisabled means the trunk is administratively off. It is a state rather than an absence
-	// so a disabled trunk still reports `disabled` rather than falling silent, which is the
-	// difference between "we turned it off" and "we lost it".
+	// StateDisabled means the trunk is administratively off. A state rather than an absence so a
+	// disabled trunk reports `disabled` instead of falling silent.
 	StateDisabled
 )
 
@@ -75,15 +52,12 @@ func (s State) String() string {
 	}
 }
 
-// Config is one trunk's registration configuration.
-//
-// The field names mirror `packages/pbx-db/src/schema/trunks-schema.ts` where they overlap
-// (`sipProxy`, `outboundProxy`, `authUser`, `registerExpiresSeconds`), deliberately, so the
-// ingestion seam is a rename-free mapping when it arrives.
+// Config is one trunk's registration configuration. Field names mirror
+// `packages/pbx-db/src/schema/trunks-schema.ts` where they overlap, so ingestion is a rename-free
+// mapping.
 type Config struct {
-	// TrunkID is the trunk ROW id — the subject token for its status events. Not the name: a tenant
-	// may rename a trunk while it is down, and a subject that moved under a rename would strand a
-	// durable consumer mid-outage (the argument already written on TrunkSubject).
+	// TrunkID is the trunk ROW id, the subject token for its status events. Not the name: a rename
+	// would move the subject and strand a durable consumer mid-outage.
 	TrunkID string
 	// OrgID is the tenant. Required, because every status event's subject carries it.
 	OrgID string
@@ -91,24 +65,17 @@ type Config struct {
 	Name string
 	// Enabled is the administrative switch.
 	Enabled bool
-	// Register says whether this trunk registers OUTWARD at all. A great many carrier trunks do
-	// not: they authenticate our source IP and expect INVITEs with no registration behind them
-	// (`kind: "ip-auth"` in the schema). For those this machine stays at StateUnregistered
-	// forever, and that is the correct state rather than a failure.
+	// Register says whether this trunk registers OUTWARD at all. `ip-auth` trunks do not; for those
+	// the machine stays at StateUnregistered, which is correct rather than a failure.
 	Register bool
-	// Kind is the carrier's authentication shape: `register` (we send REGISTER with a digest
-	// credential) or `ip-auth` (the carrier authenticates our source IP). It mirrors the column, and
-	// it is what Register below is derived from at ingestion.
+	// Kind is the carrier's authentication shape: `register` or `ip-auth`. Register is derived from
+	// it at ingestion.
 	Kind string
-	// SIPDomain is the domain presented in From and To — usually the carrier's realm. It is NOT our
-	// own: a carrier that does not recognise the domain in a From refuses the INVITE, usually with a
-	// bare 403 and no explanation.
+	// SIPDomain is the domain presented in From and To — the carrier's realm, not our own. A
+	// carrier that does not recognise it refuses the INVITE, usually with a bare 403.
 	SIPDomain string
-	// SIPProxy is where INVITEs go, as a host or host:port.
-	//
-	// Distinct from Registrar, and the two are separated because the columns are: a carrier may take
-	// registrations at one address and calls at another, and collapsing them works right up until the
-	// first carrier that does not.
+	// SIPProxy is where INVITEs go, as a host or host:port. Distinct from Registrar: a carrier may
+	// take registrations at one address and calls at another.
 	SIPProxy string
 	// Transport is the transport to use, lower-cased. Empty means "let the stack decide", which in
 	// practice is UDP.
@@ -119,12 +86,10 @@ type Config struct {
 	// simply retries the primary.
 	SecondaryRegistrar string
 	// OutboundProxy is where the REGISTER is SENT when the carrier is fronted by an SBC, while the
-	// Request-URI still names the registrar. Same split as everywhere else in this service:
-	// the address stays the address and the destination is where the packet goes.
+	// Request-URI still names the registrar.
 	OutboundProxy string
-	// AuthUser and AuthRealm are the digest identity. The secret itself never appears here: it is
-	// resolved through the credential store, on the same argument that keeps the provisioning key
-	// off this process.
+	// AuthUser and AuthRealm are the digest identity. The secret never appears here; it is resolved
+	// through the credential store.
 	AuthUser  string
 	AuthRealm string
 	// SecretRef identifies the carrier credential; the password is resolved only when needed.
@@ -133,8 +98,7 @@ type Config struct {
 	Contact string
 	// ExpiresSeconds is the registration interval to request.
 	ExpiresSeconds int
-	// MaxChannels is the concurrency cap. It is not this machine's business and is carried so a
-	// capacity refusal has somewhere to read it from.
+	// MaxChannels is the concurrency cap, carried here for whoever enforces it.
 	MaxChannels int
 }
 
@@ -173,24 +137,15 @@ func orName(c Config) string {
 	return c.TrunkID
 }
 
-// Backoff is the retry policy for a failing registration.
-//
-// # Why exponential with a cap and jitter, and not a fixed interval
-//
-// A carrier that is down is down for every one of our instances at once. A fixed retry interval
-// turns a carrier outage into a synchronised REGISTER storm from the whole fleet, arriving at the
-// same instant every N seconds — which is a denial of service we aim at our own supplier's
-// recovery. Exponential backoff spreads the load out over the outage; the cap stops a long outage
-// from turning into an hour-long blind spot after the carrier comes back; and the jitter is what
-// actually de-synchronises the replicas, because without it exponential backoff is still perfectly
-// aligned.
+// Backoff is the retry policy for a failing registration. Exponential with a cap and jitter: a
+// carrier is down for every replica at once, and without jitter the fleet retries in lockstep and
+// storms the registrar during its recovery.
 type Backoff struct {
 	// Initial is the first wait after a failure.
 	Initial time.Duration
 	// Max caps it.
 	Max time.Duration
-	// Factor multiplies each attempt. Two is the conventional choice and is what the comments
-	// assume.
+	// Factor multiplies each attempt.
 	Factor float64
 	// Jitter is the fraction of the computed interval that is randomised, in [0,1]. 0.2 means the
 	// wait lands anywhere in ±20% of the nominal value.
@@ -198,24 +153,16 @@ type Backoff struct {
 }
 
 // DefaultBackoff is what a trunk gets when nothing is configured: two seconds, doubling, capped at
-// two minutes, with 20% jitter.
-//
-// Two minutes rather than an hour because a carrier outage is usually short and the cost of a
-// too-long cap is a trunk that stays down for minutes after the carrier is back. Two seconds rather
-// than instant because the first failure is very often a transient DNS or TLS error, and an instant
-// retry into one of those is two failures instead of one.
+// two minutes, with 20% jitter. The cap is short because a trunk must not stay dark for long after
+// the carrier returns; the initial wait is non-zero because a first failure is usually transient.
 func DefaultBackoff() Backoff {
 	return Backoff{Initial: 2 * time.Second, Max: 2 * time.Minute, Factor: 2, Jitter: 0.2}
 }
 
 // After computes the wait before attempt number `attempt`, counting the first failure as 1.
-//
-// `fraction` is a value in [0,1) — rand.Float64() in production, a constant in a test, which is how
-// the jitter stays testable without a fake random source.
+// `fraction` is the jitter draw in [0,1) — rand.Float64() in production, a constant in tests.
 func (b Backoff) After(attempt int, fraction float64) time.Duration {
-	if attempt < 1 {
-		attempt = 1
-	}
+	attempt = max(attempt, 1)
 	initial := b.Initial
 	if initial <= 0 {
 		initial = time.Second
@@ -229,10 +176,7 @@ func (b Backoff) After(attempt int, fraction float64) time.Duration {
 		maximum = time.Minute
 	}
 
-	nominal := float64(initial) * math.Pow(factor, float64(attempt-1))
-	if nominal > float64(maximum) {
-		nominal = float64(maximum)
-	}
+	nominal := min(float64(initial)*math.Pow(factor, float64(attempt-1)), float64(maximum))
 	jitter := b.Jitter
 	switch {
 	case jitter <= 0:
@@ -240,15 +184,12 @@ func (b Backoff) After(attempt int, fraction float64) time.Duration {
 	case jitter > 1:
 		jitter = 1
 	}
-	if fraction < 0 {
-		fraction = 0
-	}
+	fraction = max(fraction, 0)
 	if fraction >= 1 {
 		fraction = 0.999999
 	}
-	// Centred on the nominal value: (1-jitter) to (1+jitter). A one-sided jitter that only ever
-	// shortens the wait would make a fleet retry faster than configured under load, which is the
-	// opposite of what backoff is for.
+	// Centred on the nominal value: (1-jitter) to (1+jitter). A one-sided jitter would make the
+	// fleet retry faster than configured under load.
 	scale := 1 - jitter + 2*jitter*fraction
 	return time.Duration(nominal * scale)
 }
@@ -259,16 +200,14 @@ type Trigger int
 const (
 	// TriggerStart begins registration, or resumes it after a stop.
 	TriggerStart Trigger = iota
-	// TriggerAccepted is a 200 to our REGISTER. It carries the GRANTED expiry, which is frequently
-	// shorter than the one we asked for and is the one the refresh must be based on.
+	// TriggerAccepted is a 200 to our REGISTER, carrying the GRANTED expiry — often shorter than
+	// the one requested, and the one the refresh must be based on.
 	TriggerAccepted
-	// TriggerRejected is a final failure response. The status decides whether a failover is worth
-	// trying — a 403 means the credential is wrong everywhere, and moving to the secondary
-	// registrar with the same wrong credential is a second rejection for free.
+	// TriggerRejected is a final failure response; its status decides whether failover is worth
+	// trying (see shouldFailover).
 	TriggerRejected
-	// TriggerChallenged is a 401 or 407. It is NOT a failure: sipgo answers a digest challenge
-	// inside the same transaction, so this exists for the case where the challenge could not be
-	// answered — no credential, or a realm we hold nothing for.
+	// TriggerChallenged is a 401 or 407 that we could NOT answer — no credential, or an unknown
+	// realm. sipgo answers answerable challenges inside the same transaction.
 	TriggerChallenged
 	// TriggerTimeout is Timer F on the REGISTER: no answer at all.
 	TriggerTimeout
@@ -276,8 +215,8 @@ const (
 	TriggerRefreshDue
 	// TriggerRetryDue is the end of a backoff.
 	TriggerRetryDue
-	// TriggerDisable turns the trunk administratively off, and TriggerStop unregisters without
-	// disabling — the difference between "this tenant switched it off" and "this pod is draining".
+	// TriggerDisable turns the trunk administratively off; TriggerStop unregisters without
+	// disabling (a draining pod).
 	TriggerDisable
 	TriggerStop
 )
@@ -327,9 +266,8 @@ type ActionKind int
 const (
 	// ActionSendRegister sends a REGISTER to the named registrar with the named expiry.
 	ActionSendRegister ActionKind = iota
-	// ActionSendUnregister sends a REGISTER with Expires: 0. It is what a clean shutdown owes the
-	// carrier: without it the carrier keeps routing calls at a node that has gone, for the whole
-	// remaining registration interval.
+	// ActionSendUnregister sends a REGISTER with Expires: 0. Without it the carrier keeps routing
+	// calls to a departed node for the rest of the registration interval.
 	ActionSendUnregister
 	// ActionScheduleRefresh arms the refresh timer.
 	ActionScheduleRefresh
@@ -376,8 +314,8 @@ type Action struct {
 	Reason string
 }
 
-// Status is the vocabulary of `trunk.status.changed`, mirrored here so this package does not depend
-// on the contract module for a pure state machine. The values are the contract's verbatim.
+// Status is the vocabulary of `trunk.status.changed`, mirrored verbatim here so this pure state
+// machine does not depend on the contract module.
 type Status string
 
 const (
@@ -387,9 +325,8 @@ const (
 	StatusUp Status = "up"
 	// StatusDown is a trunk that has failed past the degraded threshold.
 	StatusDown Status = "down"
-	// StatusDegraded is a trunk that has failed and is being retried. It is the honest state for
-	// the first few failures: a single lost REGISTER is not an outage, and reporting `down` for one
-	// would page somebody every time a packet is dropped.
+	// StatusDegraded is a trunk that has failed and is being retried. A single lost REGISTER is not
+	// an outage and must not page anyone.
 	StatusDegraded Status = "degraded"
 	// StatusDisabled is administratively off.
 	StatusDisabled Status = "disabled"
@@ -404,35 +341,23 @@ type Outcome struct {
 
 // Has reports whether the outcome contains an action of the given kind.
 func (o Outcome) Has(kind ActionKind) bool {
-	for _, action := range o.Actions {
-		if action.Kind == kind {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(o.Actions, func(action Action) bool { return action.Kind == kind })
 }
 
-// Gateway is one trunk's registration machine.
-//
-// Not safe for concurrent use: one goroutine drives one gateway, the same discipline the dialog
-// layer uses and for the same reason — a refresh racing a rejection has to have exactly one winner.
+// Gateway is one trunk's registration machine. Not safe for concurrent use: one goroutine drives
+// one gateway, so a refresh racing a rejection has exactly one winner.
 type Gateway struct {
 	config  Config
 	backoff Backoff
-	// degradedFor is how many consecutive failures are reported as `degraded` before `down`. Three
-	// is the default: at the default backoff that is roughly fourteen seconds of trouble before
-	// anybody is told the trunk is out, which is longer than any transient and shorter than any
-	// human notices.
+	// degradedFor is how many consecutive failures are reported as `degraded` before `down`.
 	degradedFor int
 
 	state State
-	// attempt counts consecutive failures. It resets on every success, which is what makes the
-	// backoff recover fully rather than staying long after a brief outage.
+	// attempt counts consecutive failures; it resets on every success so the backoff recovers fully.
 	attempt int
 	// onSecondary records which registrar the next attempt uses.
 	onSecondary bool
-	// status is the last status published, so a transition is published once rather than on every
-	// retry of an outage.
+	// status is the last status published, so a transition is published once per change.
 	status Status
 	// expires is the granted interval of the live registration.
 	expires    time.Duration
@@ -539,9 +464,8 @@ func (g *Gateway) Step(in Input) Outcome {
 			return Outcome{From: from, To: from}
 		}
 		if !g.config.Register {
-			// A trunk that does not register is UP as soon as it is configured: there is nothing to
-			// establish, and reporting `unknown` forever would make every ip-auth carrier look
-			// broken on the dashboard.
+			// A trunk that does not register is UP as soon as it is configured: there is nothing
+			// to establish, and `unknown` forever would make every ip-auth carrier look broken.
 			g.state = StateUnregistered
 			return Outcome{From: from, To: g.state,
 				Actions: g.statusActions(StatusUp, "ip-auth trunk; no registration to establish")}
@@ -567,9 +491,8 @@ func (g *Gateway) Step(in Input) Outcome {
 
 	case TriggerRefreshDue:
 		if from != StateRegistered {
-			// A refresh timer that fires after the registration already failed. Ignored rather than
-			// acted on: acting would put a REGISTER on the wire outside the backoff, which is the
-			// one thing the backoff exists to prevent.
+			// A refresh timer that fired after the registration already failed. Acting on it would
+			// put a REGISTER on the wire outside the backoff.
 			return Outcome{From: from, To: from}
 		}
 		g.state = StateTrying
@@ -624,16 +547,9 @@ func (g *Gateway) fail(in Input, from State) Outcome {
 		Actions: append(actions, g.statusActions(status, failureReason(in))...)}
 }
 
-// shouldFailover decides whether the OTHER registrar is worth trying.
-//
-// # The rule, and the one it replaces
-//
-// Failover is for a registrar that is unreachable or broken, not for a credential that is wrong. A
-// 403 or a 404 means the carrier considered our identity and declined it, and the secondary
-// registrar is the same carrier with the same identity — so moving to it produces a second refusal,
-// twice the log noise and a trunk that flaps between two addresses while an operator looks for a
-// network problem that does not exist. A timeout, a 5xx or a 6xx is the reachability case, and that
-// is what a secondary is for.
+// shouldFailover decides whether the OTHER registrar is worth trying. Failover is for a registrar
+// that is unreachable or broken (timeout, 5xx, 6xx), never for a credential that is wrong: the
+// secondary is the same carrier with the same identity, so a 4xx would just be refused twice.
 func (g *Gateway) shouldFailover(in Input) bool {
 	if g.config.SecondaryRegistrar == "" {
 		return false
@@ -651,11 +567,8 @@ func (g *Gateway) shouldFailover(in Input) bool {
 	}
 }
 
-// statusActions publishes a status only when it CHANGED.
-//
-// Publishing on every retry of a long outage would put one event per backoff interval per trunk on
-// a stream a durable consumer writes to the database from, and the column would be rewritten with
-// the same value hundreds of times for one incident.
+// statusActions publishes a status only when it CHANGED: a long outage must not emit one event per
+// backoff interval onto the stream a durable consumer writes to the database from.
 func (g *Gateway) statusActions(status Status, reason string) []Action {
 	if g.status == status {
 		return nil
@@ -664,12 +577,9 @@ func (g *Gateway) statusActions(status Status, reason string) []Action {
 	return []Action{{Kind: ActionPublishStatus, Status: status, Reason: reason}}
 }
 
-// RefreshAfter is when a live registration must be refreshed.
-//
-// Half the granted interval, floored at ten seconds and with a hard floor of the interval minus
-// five seconds for very short grants. Half rather than "expiry minus thirty" because a carrier that
-// grants sixty seconds would then be refreshed at thirty either way, while one that grants twenty
-// would be refreshed at minus ten — which is a registration that lapses every time.
+// RefreshAfter is when a live registration must be refreshed: half the granted interval, falling
+// back to expiry-minus-five when half would be under ten seconds. A fixed "expiry minus thirty"
+// would go negative on short grants and lapse the registration every time.
 func RefreshAfter(expires time.Duration) time.Duration {
 	if expires <= 0 {
 		return 0

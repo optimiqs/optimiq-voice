@@ -3,7 +3,6 @@ package registrar
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"strconv"
 	"time"
 
@@ -18,7 +17,7 @@ var errStaleRegistration = errors.New("REGISTER CSeq did not increase")
 var errContactLimit = errors.New("registration contact limit exceeded")
 
 func (r *Registrar) updateRegistration(ctx context.Context, req *sip.Request, tx sip.ServerTransaction,
-	credential credentials.Credential, aor, hash string, headers []sip.Header, log *slog.Logger) {
+	credential credentials.Credential, aor, hash string, headers []sip.Header, log *requestLog) {
 	now := r.now()
 	contactLimit := r.maxContacts
 	if credential.MaxRegistrations > 0 {

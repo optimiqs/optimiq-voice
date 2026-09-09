@@ -210,7 +210,7 @@ func TestBind(t *testing.T) {
 
 	t.Run("zero means uncapped", func(t *testing.T) {
 		set := Set{}
-		for index := 0; index < 20; index++ {
+		for index := range 20 {
 			outcome := set.Bind(contact("sip:x"+string(rune('a'+index))+"@10.0.0.1", 1.0, 0, time.Hour), 0, now)
 			if outcome.Refused {
 				t.Fatalf("bind %d was refused with no cap", index)

@@ -1,7 +1,6 @@
 package trunk
 
 import (
-	"context"
 	"strings"
 	"testing"
 	"time"
@@ -49,7 +48,6 @@ func actionsOf(outcome Outcome) []ActionKind {
 	return kinds
 }
 
-// The whole ladder: unregistered → trying → registered, and the refresh that keeps it there.
 func TestRegistrationLifecycle(t *testing.T) {
 	gateway := newGateway(t, registeringConfig())
 
@@ -77,16 +75,15 @@ func TestRegistrationLifecycle(t *testing.T) {
 		t.Errorf("refresh = %v / %s, want another REGISTER", actionsOf(refresh), gateway.State())
 	}
 
-	// A second acceptance publishes NOTHING: the status did not change, and one event per refresh
-	// would rewrite the same database column every few minutes for the life of the trunk.
+	// A second acceptance publishes NOTHING: one event per refresh would rewrite the same database
+	// column every few minutes for the life of the trunk.
 	again := gateway.Step(Input{Trigger: TriggerAccepted, GrantedExpires: 300 * time.Second})
 	if again.Has(ActionPublishStatus) {
 		t.Error("an unchanged status must not be republished")
 	}
 }
 
-// A failure counts, backs off, and reports `degraded` before `down`: a single lost REGISTER is not
-// an outage, and paging on one is how an alert becomes noise.
+// A single lost REGISTER is not an outage, and paging on one is how an alert becomes noise.
 func TestFailuresDegradeBeforeTheyGoDown(t *testing.T) {
 	gateway := newGateway(t, registeringConfig())
 	gateway.Step(Input{Trigger: TriggerStart})
@@ -124,8 +121,7 @@ func TestFailuresDegradeBeforeTheyGoDown(t *testing.T) {
 		t.Errorf("attempt = %d, want 3", gateway.Attempt())
 	}
 
-	// And a success resets the counter completely, so a brief outage does not leave a long backoff
-	// behind it.
+	// A success resets the counter, so a brief outage leaves no long backoff behind it.
 	gateway.Step(Input{Trigger: TriggerRetryDue})
 	gateway.Step(Input{Trigger: TriggerAccepted, GrantedExpires: 300 * time.Second})
 	if gateway.Attempt() != 0 || gateway.Status() != StatusUp {
@@ -144,8 +140,7 @@ func retryWait(t *testing.T, outcome Outcome) time.Duration {
 	return 0
 }
 
-// Failover is for a registrar that is unreachable, not for a credential that is wrong. Moving to
-// the secondary with the same rejected identity is a second refusal for free.
+// Moving to the secondary with the same rejected identity would just be a second refusal.
 func TestFailoverOnlyForReachabilityFailures(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -193,8 +188,7 @@ func TestNoSecondaryMeansNoFailover(t *testing.T) {
 	}
 }
 
-// A trunk that does not register is UP as soon as it is configured. Reporting `unknown` forever
-// would make every ip-auth carrier look broken on the dashboard.
+// `unknown` for ever would make every ip-auth carrier look broken on the dashboard.
 func TestIPAuthTrunkIsUpWithNothingToEstablish(t *testing.T) {
 	config := registeringConfig()
 	config.Register = false
@@ -249,8 +243,7 @@ func TestDisableAndStop(t *testing.T) {
 	})
 }
 
-// A timer that fires after the state moved on must not put a REGISTER on the wire outside the
-// backoff — which is the one thing the backoff exists to prevent.
+// A timer firing after the state moved on must not put a REGISTER on the wire outside the backoff.
 func TestStaleTimersAreIgnored(t *testing.T) {
 	gateway := newGateway(t, registeringConfig())
 	gateway.Step(Input{Trigger: TriggerStart})
@@ -266,8 +259,7 @@ func TestStaleTimersAreIgnored(t *testing.T) {
 	}
 }
 
-// Exponential, capped, and jittered — because a fixed interval turns a carrier outage into a
-// synchronised REGISTER storm from the whole fleet.
+// Jittered because a fixed interval turns a carrier outage into a fleet-wide REGISTER storm.
 func TestBackoffAfter(t *testing.T) {
 	backoff := Backoff{Initial: time.Second, Max: 30 * time.Second, Factor: 2, Jitter: 0}
 
@@ -304,8 +296,7 @@ func TestBackoffAfter(t *testing.T) {
 		t.Errorf("the middle of the jitter range = %s, want the nominal 10s", middle)
 	}
 
-	// The jitter is CENTRED. A one-sided one would make a fleet retry faster than configured under
-	// load, which is the opposite of what backoff is for.
+	// The jitter is CENTRED: a one-sided one would make a fleet retry faster than configured.
 	if jittered.After(1, 0) >= 10*time.Second {
 		t.Error("the jitter must be able to shorten as well as lengthen")
 	}
@@ -318,8 +309,7 @@ func TestBackoffAfter(t *testing.T) {
 	}
 }
 
-// The refresh point is half the granted interval, with a floor that keeps a very short grant from
-// being refreshed after it has already lapsed.
+// The floor keeps a very short grant from being refreshed after it has already lapsed.
 func TestRefreshAfter(t *testing.T) {
 	cases := []struct {
 		expires time.Duration
@@ -381,8 +371,6 @@ func TestConfigValidate(t *testing.T) {
 	}
 }
 
-// The envelope has to be right before the grant exists to try it, which is why it is asserted
-// without a broker.
 func TestStatusEnvelope(t *testing.T) {
 	envelope, err := statusEnvelope(registeringConfig(), StatusUp, "registered", "sipd",
 		time.Date(2026, 8, 12, 9, 0, 0, 0, time.UTC))
@@ -408,8 +396,7 @@ func TestStatusEnvelope(t *testing.T) {
 	if envelope.Data.Endpoint == nil || *envelope.Data.Endpoint != "sip.telnyx.com" {
 		t.Error("the endpoint must travel on the payload")
 	}
-	// And the envelope must agree with its own subject, which is the tenancy check every consumer
-	// on this backbone relies on.
+	// The envelope must agree with its own subject: the tenancy check every consumer relies on.
 	if err := contract.CheckSubject(envelope.Subject, envelope); err != nil {
 		t.Errorf("CheckSubject: %v", err)
 	}
@@ -421,7 +408,7 @@ func TestStatusEnvelope(t *testing.T) {
 
 func TestRecordingPublisher(t *testing.T) {
 	publisher := NewRecordingPublisher()
-	if err := publisher.StatusChanged(context.Background(), registeringConfig(), StatusDown, "gone"); err != nil {
+	if err := publisher.StatusChanged(t.Context(), registeringConfig(), StatusDown, "gone"); err != nil {
 		t.Fatalf("StatusChanged: %v", err)
 	}
 	transitions := publisher.Transitions()

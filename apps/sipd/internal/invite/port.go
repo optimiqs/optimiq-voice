@@ -1,28 +1,21 @@
 package invite
 
 import (
+	"cmp"
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"time"
 )
 
-// ErrNoAnswer marks "the engine did not answer at all", as distinct from "the engine refused".
-//
-// The distinction matters to the log and barely to the phone: both become a 503 on the wire,
-// because a caller has one behaviour for a call that did not happen. It matters a great deal to an
-// operator, where a timeout is an engine that is down and a refusal is a call that was considered
-// and declined — the same distinction `transfer/client.go` already draws for REFER.
+// ErrNoAnswer marks "the engine did not answer at all", as distinct from "the engine refused". Both
+// become a 503 on the wire; only the log tells an engine that is down from a call that was declined.
 var ErrNoAnswer = errors.New("invite: the admission request was not answered")
 
-// RefusalReason is the engine's vocabulary for declining a call.
-//
-// # Why this list is small, and why the mapping lives here
-//
-// Every entry must become a SIP status a STRANGER sees. Choosing that mapping in the engine would
-// put SIP vocabulary in the engine; choosing it here from a free-text string would put guesswork on
-// the edge. So the list is closed, the table is in this file, and every entry is justified by what
-// the caller should do next (design §10.4).
+// RefusalReason is the engine's vocabulary for declining a call. The list is closed and the mapping
+// onto SIP status lives here: choosing it in the engine would put SIP vocabulary there, and choosing
+// it here from free text would put guesswork on the edge.
 type RefusalReason string
 
 const (
@@ -50,14 +43,12 @@ type Refusal struct {
 	RetryAfter time.Duration
 }
 
-// refusals is the table. Every row's justification is in the design document's §10.4 and is
-// reproduced in one line here, because the next person to add a row needs the rule and not the
-// precedent.
+// refusals maps each reason onto the response a stranger sees.
 var refusals = map[RefusalReason]Refusal{
-	// Today's INVALID_PROFILE hangup, on the wire: nobody owns the number, so it does not exist.
+	// Nobody owns the number, so as far as the caller is concerned it does not exist.
 	ReasonUnattributed:  {Status: 404, Reason: "Not Found"},
 	ReasonUnknownTarget: {Status: 404, Reason: "Not Found"},
-	// Authenticated and not allowed here. 403 rather than 404 because the caller IS known, and a
+	// Authenticated and not allowed here. 403 rather than 404 because the caller is known, and a
 	// 404 would tell them to try a different number when the problem is the context.
 	ReasonNotPermitted: {Status: 403, Reason: "Forbidden"},
 	ReasonCongestion:   {Status: 503, Reason: "Service Unavailable"},
@@ -67,11 +58,8 @@ var refusals = map[RefusalReason]Refusal{
 	ReasonInternal:     {Status: 500, Reason: "Server Internal Error"},
 }
 
-// StatusFor maps a refusal reason onto the response a stranger sees.
-//
-// An unrecognised reason becomes 500. Not 503 and not 403: a reason this edge does not know is a
-// contract drift, and answering "try again later" or "you may not" would both be claims we cannot
-// support. 500 is the honest "this is our fault".
+// StatusFor maps a refusal reason onto the response a stranger sees. An unrecognised reason becomes
+// 500 rather than 503 or 403: contract drift is not a claim about the caller or about retrying.
 func StatusFor(reason RefusalReason) Refusal {
 	if refusal, found := refusals[reason]; found {
 		return refusal
@@ -80,26 +68,16 @@ func StatusFor(reason RefusalReason) Refusal {
 }
 
 // TimeoutRefusal is what a sipd whose admission request went unanswered answers on its own
-// authority.
-//
-// A refusal is always a reply and never a silence — the rule stated on MEDIA_REFUSAL_REASONS. Here
-// it has teeth beyond good manners: a silent engine leaves this edge holding an INVITE transaction
-// until the caller's Timer B, and the caller hears thirty-two seconds of nothing.
+// authority. A refusal is always a reply and never a silence: staying quiet leaves the caller
+// holding an INVITE transaction until Timer B.
 func TimeoutRefusal() Refusal {
 	return Refusal{Status: 503, Reason: "Service Unavailable", RetryAfter: 5 * time.Second}
 }
 
-// Admission is the engine's answer.
-//
-// # The contract the engine must serve, stated once
-//
-// Request: CallIntent, marshalled as the `rpc.sip.v1.invite` payload of design §10.3. Reply: this,
-// on a queue-grouped flat subject with a 1000 ms deadline. The engine ATTRIBUTES the tenant — from
-// the credential org when one is present, from the did-index otherwise — and answers with the org
-// it resolved, the call id it minted, its own instance id, the routing context it will resolve in
-// and the direction it filed the call under. It does not answer "did the call connect": a routing
-// walk rings for thirty seconds and a request-reply with a sixty-second deadline is a subscription
-// wearing one's clothes (design §4.2).
+// Admission is the engine's answer to a CallIntent, on a queue-grouped flat subject with a 1000 ms
+// deadline. The engine attributes the tenant — from the credential org when one is present, from the
+// did-index otherwise — and answers with the ids and context it resolved. It does not answer "did
+// the call connect": that arrives later as an event.
 type Admission struct {
 	// OK is whether the call is admitted at all.
 	OK bool
@@ -110,7 +88,7 @@ type Admission struct {
 	OrgID string
 	// CallID is the engine's call id.
 	CallID string
-	// InstanceID is the ENGINE's instance, for the paths that need to address it back.
+	// InstanceID is the engine's instance, for the paths that need to address it back.
 	InstanceID string
 	// RoutingContext is what the engine actually resolved in, which may be narrower than what was
 	// asked for and must never be wider.
@@ -122,21 +100,15 @@ type Admission struct {
 	Detail string
 }
 
-// Port is the engine seam.
-//
-// One method, synchronous, bounded. Everything AFTER admission is asynchronous — commands arrive on
-// per-instance subjects and events leave on JetStream — and that asymmetry is the design's central
-// decision (§4.2): exactly one step is synchronous and it decides admission only, not the outcome.
+// Port is the engine seam: one method, synchronous, bounded. Everything after admission is
+// asynchronous, and this one synchronous step decides admission only, never the outcome.
 type Port interface {
 	Admit(ctx context.Context, intent CallIntent) (Admission, error)
 }
 
-// RefusingPort is the Port a deployment gets when no engine responder exists.
-//
-// It is not a stub and not a mock: it is the honest production behaviour for the state this
-// repository is in. Every INVITE is answered 503 with a Retry-After, the log says why, and nothing
-// pretends a call could have been placed. The alternative — wiring a fake that admits — would make
-// a broken deployment look like a working one until the first person picked up a handset.
+// RefusingPort is the Port a deployment gets when no engine responder exists. Not a stub: every
+// INVITE is answered 503 with a Retry-After rather than a fake admission that would make a broken
+// deployment look like a working one.
 type RefusingPort struct {
 	// Reason is what to report. Defaults to `internal`, which becomes a 500; a deployment that is
 	// deliberately without an engine should set `shutting_down` so carriers fail over.
@@ -158,11 +130,8 @@ func (p RefusingPort) Admit(_ context.Context, intent CallIntent) (Admission, er
 	}, nil
 }
 
-// FakePort is the test double. It answers from a script and records what it was asked.
-//
-// It is exported because the handler's tests are not the only ones that need it: a future
-// integration test that runs the SIP path with no broker wants the same thing, and two copies of a
-// fake are two chances to disagree about the contract.
+// FakePort is the test double: it answers from a script and records what it was asked. Exported so
+// integration tests share one fake rather than keeping a second that can disagree with it.
 type FakePort struct {
 	mu sync.Mutex
 	// Answer is consulted for every request. A nil Answer admits everything with generated ids,
@@ -185,7 +154,7 @@ func (f *FakePort) Admit(_ context.Context, intent CallIntent) (Admission, error
 		return Admission{
 			OK:             true,
 			LegID:          intent.LegID,
-			OrgID:          orDefault(intent.OrgID, "018f0000-0000-7000-8000-000000000000"),
+			OrgID:          cmp.Or(intent.OrgID, "018f0000-0000-7000-8000-000000000000"),
 			CallID:         "018f0000-0000-7000-8000-00000000ca11",
 			InstanceID:     "engine-test",
 			RoutingContext: string(intent.RoutingContext),
@@ -199,7 +168,7 @@ func (f *FakePort) Admit(_ context.Context, intent CallIntent) (Admission, error
 func (f *FakePort) Requests() []CallIntent {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]CallIntent(nil), f.requests...)
+	return slices.Clone(f.requests)
 }
 
 // Last returns the most recent request, and whether there was one.
@@ -210,11 +179,4 @@ func (f *FakePort) Last() (CallIntent, bool) {
 		return CallIntent{}, false
 	}
 	return f.requests[len(f.requests)-1], true
-}
-
-func orDefault(value, fallback string) string {
-	if value == "" {
-		return fallback
-	}
-	return value
 }

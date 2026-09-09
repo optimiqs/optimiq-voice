@@ -58,8 +58,7 @@ func assertKinds(t *testing.T, outcome Outcome, want ...EffectKind) {
 	}
 }
 
-// The happy path, and the one thing about it that is easy to get wrong: `answered` is published on
-// the ACK for a UAS leg, not on the 200. `billsec` counts from it.
+// `answered` is published on the ACK for a UAS leg, not on the 200; `billsec` counts from it.
 func TestUASAnswerPublishesOnTheAckAndNotTheTwoHundred(t *testing.T) {
 	d := newTestDialog(t, RoleUAS)
 
@@ -104,8 +103,7 @@ func TestCancelAfterTwoHundredIsAnsweredFourEightyOneAndTheCallSurvives(t *testi
 	}
 }
 
-// The other side of the same race: an `answer` command that arrives after a CANCEL is refused
-// `dialog_gone`, which is what the engine acts on.
+// The other side of the same race: an `answer` after a CANCEL is refused `dialog_gone`.
 func TestAnswerAfterCancelIsDialogGone(t *testing.T) {
 	d := newTestDialog(t, RoleUAS)
 	apply(t, d, Input{Trigger: TriggerLocalRing})
@@ -136,8 +134,7 @@ func TestByeBeforeAckIsHonouredAndStopsTheRetransmission(t *testing.T) {
 	}
 }
 
-// RFC 3261 §15: a UAS MUST NOT send a BYE before the ACK for its own 2xx. The obligation is held
-// and released by the ACK, which is the edge a mutex-based implementation would get wrong.
+// RFC 3261 §15: a UAS MUST NOT send a BYE before the ACK for its own 2xx.
 func TestHangupBeforeTheAckDefersTheByeUntilItArrives(t *testing.T) {
 	d := newTestDialog(t, RoleUAS)
 	apply(t, d, Input{Trigger: TriggerLocalAnswer, Body: []byte("v=0\r\n")})
@@ -180,9 +177,8 @@ func TestUACHangupBeforeAnyProvisionalDefersTheCancel(t *testing.T) {
 	assertKinds(t, provisional, EffectSendCancel)
 }
 
-// The UAC race: a hangup issued while the INVITE was ringing, and a 200 that lands first. The
-// answer wins, and the teardown must be ACK-then-BYE — never a CANCEL, which the far end would
-// ignore, and never a bare BYE, which it would answer 481.
+// A hangup issued while the INVITE was ringing, with a 200 landing first: the answer wins and the
+// teardown must be ACK-then-BYE, never a CANCEL and never a bare BYE.
 func TestUACHangupThatLosesToTheTwoHundredBecomesAckThenBye(t *testing.T) {
 	d := newTestDialog(t, RoleUAC)
 	apply(t, d, Input{Trigger: TriggerRemoteProvisional})
@@ -199,10 +195,8 @@ func TestUACHangupThatLosesToTheTwoHundredBecomesAckThenBye(t *testing.T) {
 	}
 }
 
-// A UAC 2xx carries the callee's negotiated answer to the offer mediad wrote, and the answered
-// event MUST carry it too: the engine feeds it to `rpc.media.v1.accept-answer` so mediad settles the
-// B-leg codec before the walk bridges the legs. An answered event with an empty body is a call that
-// says "up" and then bridges a leg whose codec mediad never committed — audio to nowhere.
+// The answered event must carry the 2xx's negotiated answer: the engine feeds it to
+// `rpc.media.v1.accept-answer`, and without it mediad never commits the B-leg codec.
 func TestUACAnsweredEventCarriesTheNegotiatedSDP(t *testing.T) {
 	d := newTestDialog(t, RoleUAC)
 	apply(t, d, Input{Trigger: TriggerRemoteProvisional})
@@ -220,8 +214,7 @@ func TestUACAnsweredEventCarriesTheNegotiatedSDP(t *testing.T) {
 	}
 }
 
-// RFC 3261 §13.2.2.4 and design §9.7: a second 2xx from a branch we did not take must be ACKed and
-// then BYEd. Silence leaks a dialog at the far end and, on some carriers, bills for it.
+// RFC 3261 §13.2.2.4 and design §9.7: a second 2xx from a branch we did not take is ACKed then BYEd.
 func TestASecondTwoHundredFromAForkedBranchIsAckedAndByed(t *testing.T) {
 	d := newTestDialog(t, RoleUAC)
 	apply(t, d, Input{Trigger: TriggerRemoteAnswer, RemoteTag: "branch-a"})
@@ -234,8 +227,7 @@ func TestASecondTwoHundredFromAForkedBranchIsAckedAndByed(t *testing.T) {
 	assertKinds(t, repeat, EffectSendAck)
 }
 
-// A BYE crossing our own BYE is the ordinary simultaneous-hangup case. It must terminate the dialog
-// once: two terminal events for one leg is two CDR rows for one call.
+// A BYE crossing our own BYE must terminate the dialog once: two terminal events is two CDR rows.
 func TestSimultaneousHangupTerminatesExactlyOnce(t *testing.T) {
 	d := newTestDialog(t, RoleUAS)
 	apply(t, d, Input{Trigger: TriggerLocalAnswer})
@@ -315,8 +307,8 @@ func TestHangupChoosesTheMethodFromTheState(t *testing.T) {
 	}
 }
 
-// A hangup with an explicit Q.850 cause on an unanswered UAS leg becomes the SIP status that cause
-// maps to. That is how a busy extension produces a 486 and not a generic 480.
+// An explicit Q.850 cause on an unanswered UAS leg becomes the SIP status it maps to, so a busy
+// extension produces 486 and not a generic 480.
 func TestHangupCauseChoosesTheFailureStatus(t *testing.T) {
 	cases := []struct {
 		cause  int
@@ -359,8 +351,7 @@ func itoa(value int) string {
 	return string(digits)
 }
 
-// A 183 with an answer commits the offer/answer exchange, and the 200 that follows must repeat THAT
-// answer byte for byte (RFC 3261 §13.2.1). Getting it wrong is a call that connects with no audio.
+// RFC 3261 §13.2.1: the 200 must repeat the answer a 183 committed, byte for byte.
 func TestTheTwoHundredRepeatsTheAnswerCommittedByAnEarlyMediaResponse(t *testing.T) {
 	d := newTestDialog(t, RoleUAS)
 	body := []byte("v=0\r\no=- 1 1 IN IP4 198.51.100.1\r\nm=audio 40000 RTP/AVP 0\r\n")
@@ -373,8 +364,7 @@ func TestTheTwoHundredRepeatsTheAnswerCommittedByAnEarlyMediaResponse(t *testing
 	}
 }
 
-// A ring timeout on an unanswered UAS leg ends the call with "no answer" and a status the caller
-// can act on; on an unanswered UAC leg it cancels.
+// A ring timeout ends an unanswered UAS leg with a status and an unanswered UAC leg with a CANCEL.
 func TestRingTimeoutEndsTheCallByRole(t *testing.T) {
 	uas := newTestDialog(t, RoleUAS)
 	apply(t, uas, Input{Trigger: TriggerLocalRing})

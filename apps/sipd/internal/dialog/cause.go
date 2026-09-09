@@ -8,24 +8,10 @@ import (
 	events "github.com/optimiqs/optimiq-voice/packages/events-go"
 )
 
-// The Q.850 causes this edge names. Bare integers at a call site are how a 16 becomes a 17 in
-// review, and every one of these ends up on a CDR row that somebody bills from.
-//
-// # One table, and this is the copy that is no longer one
-//
-// The VALUES come from packages/events-go/hangup_causes_gen.go, which is generated from
-// packages/telephony/src/hangup-causes.ts — the taxonomy's canonical home, pinned by its own spec
-// against the frozen reference §6. Until that generator landed this file held a second hand-written
-// copy of the same numbers, which is precisely the drift the rest of this repository spends a
-// codegen step avoiding: a re-coded cause silently changes outbound failover on the TypeScript side
-// and silently changes what this edge reports on the Go side, and nothing would have caught the
-// disagreement.
-//
-// The NAMES stay local, and that is not laziness. `CauseUserBusy` reads correctly beside a 486 in
-// the table below, where `events.HangupCodeUserBusy` would read as an import; and the SIP -> Q.850
-// mapping itself IS the edge's own knowledge (RFC 3398), which nothing outside the SIP stack has an
-// opinion about. What moved is the answer to "what number is USER_BUSY", which two languages were
-// answering separately.
+// The Q.850 causes this edge names. The VALUES come from packages/events-go (generated from
+// packages/telephony/src/hangup-causes.ts, the taxonomy's canonical home) so the two languages
+// cannot disagree; the NAMES stay local because the SIP -> Q.850 mapping is the SIP stack's own
+// knowledge (RFC 3398).
 const (
 	// CauseUnallocatedNumber is Q.850 1. SIP 404.
 	CauseUnallocatedNumber = events.HangupCodeUnallocatedNumber
@@ -77,13 +63,8 @@ const (
 )
 
 // causeForStatus is the RFC 3398 §7.2.4.1 table, plus the handful of points that table leaves to
-// the gateway.
-//
-// It is a table and not a switch because the design says so and because the reason is real: the
-// engine has to agree with it byte for byte or one plane's CDR disposition disagrees with the
-// other's for the same call. Design §3.3 puts the canonical copy in packages/events-go so both
-// languages read one source; until that lands this is the copy, and moving it is a mechanical
-// change with a parity test on the far side.
+// the gateway. A table rather than a switch: the engine must agree with it entry for entry or the
+// two planes report different CDR dispositions for the same call.
 var causeForStatus = map[int]int{
 	400: CauseInterworking,
 	401: CauseCallRejected,
@@ -154,16 +135,10 @@ func CauseForStatus(status int) int {
 
 // CauseFromReason reads an RFC 3326 `Reason` header value and returns the Q.850 cause it carries.
 //
-// # Why this wins over the status code
-//
-// A Reason header is the far end's own switch telling us what it decided. Re-deriving a cause from
-// the status code when the far end has already stated one is discarding better evidence for worse
-// (design §3.3) — a carrier that sends `503` with `Reason: Q.850;cause=34` is saying "no circuit",
-// not "I am broken", and those bill differently.
-//
-// Only the `Q.850` protocol is honoured. `Reason: SIP;cause=487` restates the status line and
-// re-mapping it would be the same derivation with an extra parse in front; anything else is a
-// protocol we hold no table for, and guessing would be worse than the status code we already have.
+// A Reason header is the far end's own verdict and beats re-deriving one from the status line: a
+// carrier sending `503` with `Reason: Q.850;cause=34` means "no circuit", not "I am broken", and
+// those bill differently. Only the `Q.850` protocol is honoured; every other one is either a
+// restatement of the status line or a table we do not hold.
 func CauseFromReason(value string) (int, bool) {
 	for _, entry := range splitReasonEntries(value) {
 		protocol, params, _ := strings.Cut(entry, ";")
@@ -224,14 +199,12 @@ func causeOfRequest(req *sip.Request) int {
 	return CauseNormalClearing
 }
 
-// StatusForCause is the reverse direction, for the one place that needs it: `rpc.sip.v1.hangup`
-// hands this edge a Q.850 cause for a leg that has NOT been answered, and an unanswered leg is
-// ended with a SIP failure response rather than a BYE (design §10.3).
+// StatusForCause maps a Q.850 cause onto the SIP failure status used to end a leg that has not yet
+// been answered (`rpc.sip.v1.hangup`).
 //
-// It is deliberately not the inverse of the table above — Q.850 is finer than SIP in some places
-// and coarser in others — and it is deliberately conservative: anything without a defensible
-// status becomes 480, which is the status a caller can act on ("try again or try elsewhere")
-// rather than 500, which tells them we are broken.
+// It is deliberately not the inverse of causeForStatus — Q.850 is finer than SIP in places and
+// coarser in others — and anything without a defensible status becomes 480, which a caller can act
+// on, rather than 500, which claims we are broken.
 func StatusForCause(cause int) (int, string) {
 	switch cause {
 	case CauseUnallocatedNumber, CauseNumberChanged:
@@ -264,11 +237,8 @@ func StatusForCause(cause int) (int, string) {
 	}
 }
 
-// ReasonHeader renders the RFC 3326 header this edge puts on its own BYEs and CANCELs.
-//
-// We send one for the same reason we read one: the far end's CDR is as entitled to the real cause
-// as ours is, and a BYE with no Reason forces the other switch to guess "normal clearing" for a
-// call that was actually torn down by a session-timer expiry.
+// ReasonHeader renders the RFC 3326 header this edge puts on its own BYEs and CANCELs, so the far
+// end's CDR sees the real cause instead of guessing "normal clearing".
 func ReasonHeader(cause int) string {
 	return "Q.850;cause=" + strconv.Itoa(cause)
 }

@@ -457,3 +457,30 @@ func TestLoadFailuresWrapErrInvalid(t *testing.T) {
 		t.Fatalf("err = %v, want it to wrap config.ErrInvalid", err)
 	}
 }
+
+// pprof rides the private health listener, so the loopback gate that used to guard its own address
+// now guards the health address.
+func TestPprofRequiresALoopbackHealthListener(t *testing.T) {
+	for name, pairs := range map[string]map[string]string{
+		"no health listener": {"SIPD_PPROF": "true"},
+		"wildcard health":    {"SIPD_PPROF": "true", "SIPD_HEALTH_ADDR": "0.0.0.0:8080"},
+		"external health":    {"SIPD_PPROF": "true", "SIPD_HEALTH_ADDR": "10.0.0.4:8080"},
+		"retired pprof addr": {"SIPD_PPROF_ADDR": "127.0.0.1:6060"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := config.Load(env(minimal(pairs))); err == nil {
+				t.Fatal("Load accepted a configuration that exposes pprof")
+			}
+		})
+	}
+
+	cfg, err := config.Load(env(minimal(map[string]string{
+		"SIPD_PPROF": "true", "SIPD_HEALTH_ADDR": "127.0.0.1:8080",
+	})))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.PProfEnabled {
+		t.Error("SIPD_PPROF=true left pprof disabled")
+	}
+}

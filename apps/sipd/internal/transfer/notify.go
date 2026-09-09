@@ -10,11 +10,9 @@ import (
 	"github.com/emiago/sipgo/sip"
 )
 
-// RFC 3515 §2.4.4: a REFER creates an implicit subscription, and the referee reports progress on it
-// with NOTIFY messages whose body is a `message/sipfrag` status line. This is the half that makes a
-// transfer key on a handset light up, go out, or turn red — without it a phone has been told 202
-// ("I will try") and never told anything else, so it holds the transfer indicator until the dialog
-// dies.
+// RFC 3515 §2.4.4: a REFER creates an implicit subscription, and progress is reported on it with
+// NOTIFYs whose body is a `message/sipfrag` status line. Without them a phone is told 202 and
+// nothing else, and holds its transfer indicator until the dialog dies.
 const (
 	// sipfragContentType is the body type. The `version` parameter is not optional in practice:
 	// several handsets discard a sipfrag body that does not carry it.
@@ -46,38 +44,30 @@ func (s SubscriptionState) String() string {
 	return value
 }
 
-// The two states a transfer passes through here. A blind transfer has no intermediate progress this
-// edge can observe — the engine either moved the call or did not — so there is exactly one `active`
-// notification (100 Trying, sent immediately after the 202) and one `terminated`.
+// The two states a transfer passes through here: this edge can observe no intermediate progress, so
+// there is exactly one `active` notification and one `terminated`.
 var (
-	// StateActive is sent with the 100 Trying frag. 60 seconds because the RPC deadline is two, and
-	// a subscription that expires before its own final notification would make a correct transfer
-	// look abandoned.
+	// StateActive is sent with the 100 Trying frag. Its expiry comfortably outlives the RPC
+	// deadline: a subscription expiring before its final notification looks like an abandoned
+	// transfer.
 	StateActive = SubscriptionState{State: "active", Expires: 60}
-	// StateTerminated is sent with the final frag. `noresource` rather than `timeout` or `deactivated`:
-	// the subscription ended because the thing it was watching reached a conclusion.
+	// StateTerminated is sent with the final frag. `noresource` rather than `timeout` or
+	// `deactivated`: what it was watching reached a conclusion.
 	StateTerminated = SubscriptionState{State: "terminated", Reason: "noresource"}
 )
 
-// The three sipfrag status lines this edge sends, and the only three.
-//
-// 503 covers EVERY refusal the engine can return. That is deliberate: the codes in
-// `SIP_TRANSFER_REFUSAL_REASONS` exist so a log and an operator can tell an ended call from a
-// forbidden one, but a handset has exactly one behaviour for a failed transfer, and mapping eleven
-// reasons onto eleven statuses would produce phones that react differently to the same user-visible
-// outcome. The reason travels in the log; the phone gets one honest failure.
+// The three sipfrag status lines this edge sends, and the only three. 503 covers EVERY refusal the
+// engine can return: a handset has one behaviour for a failed transfer, so mapping every refusal
+// reason onto its own status would make phones react differently to the same outcome. The reason
+// travels in the log.
 const (
 	FragTrying = "SIP/2.0 100 Trying"
 	FragOK     = "SIP/2.0 200 OK"
 	FragFailed = "SIP/2.0 503 Service Unavailable"
 )
 
-// Dialog is what this edge kept of the REFER so it can address notifications back at the phone.
-//
-// It is NOT a dialog in the RFC 3261 sense and does not pretend to be: there is no route set, no
-// local CSeq history before this REFER, and nothing here survives a restart. It is the minimum
-// needed to put a NOTIFY on the wire that the phone will accept as belonging to the subscription it
-// just created.
+// Dialog is what this edge kept of the REFER so it can address notifications back at the phone. NOT
+// a dialog in the RFC 3261 sense: no route set, no CSeq history, and nothing survives a restart.
 type Dialog struct {
 	// Recipient is the request-URI: the referrer's Contact, or its observed source address when the
 	// REFER carried no Contact.
@@ -105,19 +95,15 @@ type Dialog struct {
 // of the first and never sees the outcome.
 func (d *Dialog) NextCSeq() uint32 { return d.cseq.Add(1) }
 
-// BuildNotify assembles one NOTIFY carrying a sipfrag body.
+// BuildNotify assembles one NOTIFY carrying a sipfrag body. A pure function of its arguments.
 //
-// A pure function of the dialog and the two strings, so every header this edge puts on the wire is
-// asserted in a unit test rather than observed on a capture. Note what it does NOT do: it never
-// interpolates a device-supplied string into a header value it has not round-tripped through a
-// parser — the Call-ID is the one echo, and it is placed as a typed header rather than concatenated,
-// which is the CRLF-injection case sipgo's SECURITY note is about.
+// It never interpolates a device-supplied string into a header value: the Call-ID is the one echo,
+// and it is placed as a TYPED header rather than concatenated, which is the CRLF-injection case.
 func BuildNotify(dialog *Dialog, frag string, state SubscriptionState, contact sip.Uri, server string) *sip.Request {
 	req := sip.NewRequest(sip.NOTIFY, dialog.Recipient)
 
-	// The notification travels from us to the phone, so the REFER's To becomes our From and its
-	// From becomes our To — tags and all. A phone that cannot match the tags drops the NOTIFY, and
-	// the symptom is a transfer that works while the handset says it failed.
+	// The notification travels the other way, so the REFER's To becomes our From and its From our
+	// To, tags and all. A phone that cannot match the tags drops the NOTIFY silently.
 	from := &sip.FromHeader{Address: dialog.Local, Params: sip.NewParams()}
 	if dialog.LocalTag != "" {
 		from.Params.Add("tag", dialog.LocalTag)
@@ -156,26 +142,23 @@ func BuildNotify(dialog *Dialog, frag string, state SubscriptionState, contact s
 }
 
 // Notifier sends one NOTIFY. An interface so the handler's reporting path is unit-testable without
-// a socket, and so a deployment that cannot send them at all (see ClientNotifier) is a construction
-// choice rather than a branch inside the handler.
+// a socket, and so a deployment that cannot send them is a construction choice rather than a branch
+// inside the handler.
 type Notifier interface {
 	Notify(ctx context.Context, req *sip.Request) error
 }
 
-// ClientNotifier sends notifications through a sipgo client transaction.
-//
-// A transaction rather than a bare write, because NOTIFY is a non-INVITE request: the transaction
-// layer owns the T1 retransmission timer, and a notification lost on UDP is exactly the case that
-// leaves a handset waiting. The response is drained and discarded — a phone that answers 481 has
-// already forgotten the subscription, which changes nothing this edge can do about it.
+// ClientNotifier sends notifications through a sipgo client transaction rather than a bare write,
+// so the transaction layer owns the T1 retransmission timer for a NOTIFY lost on UDP. The response
+// is drained and discarded: a phone that answers 481 has already forgotten the subscription.
 type ClientNotifier struct {
 	client *sipgo.Client
 }
 
 var _ Notifier = (*ClientNotifier)(nil)
 
-// NewClientNotifier wraps a sipgo client. A nil client is a programming error rather than a runtime
-// state, so it is refused here instead of on the first transfer.
+// NewClientNotifier wraps a sipgo client. A nil client is refused here rather than on the first
+// transfer.
 func NewClientNotifier(client *sipgo.Client) (*ClientNotifier, error) {
 	if client == nil {
 		return nil, fmt.Errorf("transfer: a SIP client is required to send REFER notifications")
@@ -201,11 +184,8 @@ func (n *ClientNotifier) Notify(ctx context.Context, req *sip.Request) error {
 	}
 }
 
-// DiscardNotifier drops every notification.
-//
-// It is what a deployment with no SIP client wired gets, and what the unit tests that are not about
-// notification use. Named rather than a nil check inside the handler so the consequence — phones are
-// told 202 and never told the outcome — is a visible construction choice.
+// DiscardNotifier drops every notification. Named rather than a nil check inside the handler so the
+// consequence — phones are told 202 and never told the outcome — is a visible construction choice.
 type DiscardNotifier struct{}
 
 var _ Notifier = DiscardNotifier{}

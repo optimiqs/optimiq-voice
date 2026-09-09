@@ -10,14 +10,6 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/mwi"
 )
 
-// The two notification bodies this edge composes.
-//
-// Both are built by pure functions of (resource, state, version), so every byte that reaches a
-// handset is asserted in a unit test rather than observed on a capture. That matters more here than
-// it did for the REFER sipfrag: a phone that dislikes a `dialog-info+xml` body does not complain, it
-// simply leaves the lamp where it was, and the symptom is indistinguishable from "presence is not
-// wired up".
-
 // Content types, per RFC 4235 §4 and RFC 3842 §5.
 const (
 	dialogInfoContentType     = "application/dialog-info+xml"
@@ -28,12 +20,9 @@ const (
 // no namespace is dropped by several of them.
 const dialogInfoNamespace = "urn:ietf:params:xml:ns:dialog-info"
 
-// The RFC 4235 §3.7.1 dialog states this edge emits, and the only ones.
-//
-// `trying` and `proceeding` are deliberately absent. They describe a dialog that has been requested
-// but not yet reached the far end, which is a distinction the presence bucket does not carry — the
-// engine aggregates a device's channels, not one dialog's INVITE progress — and a BLF key renders
-// them identically to `early` anyway.
+// The RFC 4235 §3.7.1 dialog states this edge emits, and the only ones. `trying` and `proceeding`
+// are absent: the presence bucket aggregates a device's channels rather than one INVITE's progress,
+// and a BLF key renders them identically to `early`.
 const (
 	dialogStateEarly      = "early"
 	dialogStateConfirmed  = "confirmed"
@@ -42,15 +31,12 @@ const (
 
 // dialogStateFor maps a device state onto the dialog state a busy-lamp key renders.
 //
-// The mapping is deliberately lossy in one place: `held` becomes `confirmed`, the same as `active`.
-// RFC 4235 can express hold — it is a `<local>` element carrying a `sendonly` media direction — but
-// a BLF key has three renderings (dark, blinking, solid) and every mainstream handset renders a held
-// call the same as an active one. Emitting the richer form would add a body element that changes no
-// lamp and that several phones parse badly.
+// The mapping is lossy in one place: `held` becomes `confirmed`, like `active`. A BLF key has three
+// renderings, so RFC 4235's richer `<local>`/`sendonly` form would change no lamp and is parsed
+// badly by several phones.
 //
-// The second result reports whether a `<dialog>` element should be emitted at all. `down` has no
-// dialog, and that absence — not a state value — is what clears a lamp (RFC 4235 §3.7: an entity
-// with no dialogs is reported by a `dialog-info` element with no children).
+// The second result reports whether a `<dialog>` element should be emitted at all: its ABSENCE, not
+// a state value, is what clears a lamp (RFC 4235 §3.7).
 func dialogStateFor(state contract.PresenceDeviceState) (string, bool) {
 	switch state {
 	case contract.PresenceDeviceStateRinging:
@@ -63,20 +49,16 @@ func dialogStateFor(state contract.PresenceDeviceState) (string, bool) {
 	case contract.PresenceDeviceStateHangup:
 		return dialogStateTerminated, true
 	default:
-		// `down`, and anything a future engine writes that this build does not know. Reporting an
-		// unknown state as "no dialogs" is the safe direction: a lamp that goes dark when it should
-		// be lit is a smaller lie than a lamp that stays lit on a free extension, because the second
-		// one makes a receptionist not transfer a call.
+		// `down`, and anything a future engine writes that this build does not know. Dark is the safe
+		// direction: a lamp stuck lit on a free extension stops a receptionist transferring a call.
 		return "", false
 	}
 }
 
 // dialogInfoDocument is the marshalled shape of RFC 4235's `<dialog-info>`.
 //
-// Marshalled with encoding/xml rather than assembled with fmt, because `entity` and the dialog `id`
-// carry an extension number and an AOR that arrived from the wire. String concatenation here is how
-// a Request-URI containing `"` or `<` becomes a malformed body — or, on a phone with a permissive
-// parser, an injected element.
+// Marshalled with encoding/xml rather than assembled with fmt: `entity` and the dialog `id` carry
+// wire-supplied values, and concatenation there is how `"` or `<` becomes an injected element.
 type dialogInfoDocument struct {
 	XMLName xml.Name `xml:"dialog-info"`
 	Xmlns   string   `xml:"xmlns,attr"`
@@ -84,18 +66,16 @@ type dialogInfoDocument struct {
 	// notification whose version is not greater than the last one it processed, which is what makes
 	// two NOTIFYs reordered on UDP settle on the newer state rather than the later-arriving one.
 	Version int `xml:"version,attr"`
-	// State is `full` on every notification this edge sends. Partial updates exist to save bytes on
-	// a resource with many dialogs; this edge reports one aggregate, so a partial would be the same
-	// size as a full one and would oblige the phone to hold a merge buffer.
+	// State is `full` on every notification: this edge reports one aggregate dialog, so a partial
+	// would be no smaller and would oblige the phone to hold a merge buffer.
 	State  string            `xml:"state,attr"`
 	Entity string            `xml:"entity,attr"`
 	Dialog *dialogInfoDialog `xml:"dialog,omitempty"`
 }
 
 type dialogInfoDialog struct {
-	// ID identifies the dialog within the resource. This edge reports an AGGREGATE rather than
-	// per-dialog state, so there is exactly one and its id is the extension number — stable across
-	// notifications, which is what stops a phone treating each update as a new call.
+	// ID identifies the dialog within the resource. This edge reports an aggregate, so there is
+	// exactly one and its id is the extension number — stable, so updates are not read as new calls.
 	ID    string `xml:"id,attr"`
 	State string `xml:"state"`
 }
@@ -135,9 +115,8 @@ func dialogInfoBody(entity, extensionNumber string, state contract.PresenceDevic
 //	Message-Account: sip:1001@acme.example.com
 //	Voice-Message: 2/8 (0/0)
 //
-// The parenthesised pair is the urgent counts. It is emitted as `(0/0)` rather than omitted because
-// the contract has no notion of an urgent voicemail and several handsets treat the whole
-// `Voice-Message` line as malformed without it — a lamp that never lights, from an omitted zero.
+// The parenthesised pair is the urgent counts, emitted as `(0/0)` rather than omitted: the contract
+// has no urgent voicemail, and several handsets reject the whole line without the pair.
 func messageSummaryBody(account string, counts mwi.Counts) []byte {
 	waiting := "no"
 	if counts.Waiting() {

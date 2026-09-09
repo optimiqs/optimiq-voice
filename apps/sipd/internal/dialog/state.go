@@ -1,45 +1,22 @@
-// Package dialog is sipd's SIP dialog layer: the state machine behind INVITE.
+// Package dialog is sipd's SIP dialog layer: the state machine behind INVITE. sipgo supplies
+// sockets, transactions and retransmission timers but no application semantics — no Early state, no
+// CANCEL-after-200 rule, no deferred BYE, no glare, no session timers — so those live here as a pure
+// state machine, which is what makes the RFC 3261 §13 and §15 races table-testable without a socket,
+// a broker or a clock.
 //
-// # Why this exists when sipgo already has one
-//
-// sipgo v1.4.3 gives transactions and a dialog CACHE, and gives no SIP application semantics
-// (plans/sipd-invite-design.md §9.11). Concretely, `sip.DialogState` has three values —
-// Established, Confirmed, Ended (`sip/dialog.go:5-12`) — with no Early state, no CANCEL-after-200
-// rule, no deferred-BYE rule, no glare, no session timers and no re-INVITE. Every one of those is
-// a decision this edge has to make correctly on a call path where the failure mode is silent: the
-// phone rang and there was no audio, or the call ended and no CDR was written.
-//
-// So the semantics live here, as a PURE state machine, and sipgo stays what it is good at: sockets,
-// transactions and retransmission timers. The split is deliberate and is what makes the races in
-// RFC 3261 §13 and §15 table-testable without a socket, a broker or a clock.
-//
-// # The identity discipline
-//
-// One string names the leg, the mediad session and this dialog (design §3.1). The SIP dialog
-// identifier — Call-ID plus the two tags — is DATA on the record and never the key; it is a lookup
-// index, exactly as `sipTransferRequestSchema.sipCallId` is documented to be. See identity.go.
-//
-// # Concurrency
-//
-// A Dialog is NOT safe for concurrent use, on purpose. One goroutine owns one dialog and every
-// input — a command from the engine, a CANCEL from the wire, a timer — is a message on its mailbox
-// (design §4.4, and the same shape mediad chose for a session). Exactly one of a racing CANCEL and
-// a racing `answer` wins BY CONSTRUCTION, and the loser is refused by name rather than by luck.
-// The Store below is the only shared thing, and it is locked.
+// Two invariants hold throughout. One string (`legId`) names the leg, the mediad session and this
+// dialog (design §3.1); the SIP triple is only an index onto it (identity.go). And a Dialog is NOT
+// safe for concurrent use: one goroutine owns one dialog and every input reaches it as a mailbox
+// message (design §4.4), so a racing CANCEL and answer have exactly one winner by construction.
+// Store is the only shared thing here, and it is locked.
 package dialog
 
 import "errors"
 
-// State is where one dialog is in its life.
-//
-// It is deliberately finer than sipgo's three values in two places, and both are load-bearing:
-//
-//   - Early exists because an 18x carrying a To tag CREATES a dialog (RFC 3261 §12.1), and a
-//     dialog that exists is one a CANCEL can end, a session timer can be negotiated on, and an
-//     UPDATE can retarget. sipgo models none of that because it models no Early state (design §9.3).
-//   - Terminating exists because teardown is not instantaneous and the rules for what may be sent
-//     during it are the sharpest edges in RFC 3261 — a BYE owed but not yet sendable (§15), an ACK
-//     owed before a BYE may go out (§13.2.2.4), a CANCEL that has already lost (§9.2).
+// State is where one dialog is in its life. It is finer than sipgo's three values in two
+// load-bearing places: Early, because an 18x with a To tag CREATES a dialog a CANCEL can end and an
+// UPDATE can retarget (RFC 3261 §12.1); and Terminating, because teardown is not instantaneous and
+// what may be sent during it is the sharpest edge in the RFC (§15, §13.2.2.4, §9.2).
 type State int32
 
 const (
@@ -53,8 +30,7 @@ const (
 	// StateEarly is an early dialog: an 18x WITH a To tag has been sent or received.
 	StateEarly
 	// StateEstablished is "a 2xx has been sent (UAS) or received (UAC)" and the ACK has not been
-	// seen. It is the most dangerous state in SIP and the reason it is named separately: a CANCEL
-	// arriving here has already lost, a BYE arriving here is legal and must be honoured, and a
+	// seen. A CANCEL arriving here has already lost, a BYE arriving here must be honoured, and a
 	// hangup issued here may not send a BYE yet.
 	StateEstablished
 	// StateConfirmed is "the ACK has been seen". Billing starts here — `billsec` counts from the
@@ -91,21 +67,16 @@ func (s State) String() string {
 	}
 }
 
-// Alive reports whether the dialog can still carry a command. It is the check every command handler
-// makes before doing anything, so "the call ended while the RPC was in flight" is one branch in one
-// place instead of a status comparison at every call site.
+// Alive reports whether the dialog can still carry a command: the check every command handler makes
+// before doing anything.
 func (s State) Alive() bool { return s != StateTerminated }
 
-// Answered reports whether a 2xx has been committed on this dialog. It is the predicate that
-// decides the METHOD of a teardown — BYE if answered, CANCEL or a failure response if not — which
-// is the whole of what `rpc.sip.v1.hangup` means when it says "end this leg with this cause"
-// (design §10.3).
+// Answered reports whether a 2xx has been committed on this dialog. It decides the METHOD of a
+// teardown — BYE if answered, CANCEL or a failure response if not (design §10.3).
 func (s State) Answered() bool { return s == StateEstablished || s == StateConfirmed }
 
-// Role is which end of the INVITE this process is.
-//
-// It is not cosmetic: half of the trigger vocabulary is legal for exactly one role, and mixing them
-// is how a UAS ends up trying to send a CANCEL for an INVITE it received.
+// Role is which end of the INVITE this process is. Half the trigger vocabulary is legal for exactly
+// one role (roleAllows).
 type Role int
 
 const (
@@ -123,11 +94,8 @@ func (r Role) String() string {
 	return "uas"
 }
 
-// Trigger is one input to the machine.
-//
-// The names say WHO did the thing, because that is the distinction the RFC's races turn on: a
-// CANCEL we receive and a CANCEL we send are different events with different legal windows, and a
-// vocabulary that called both "cancel" would make the table unwritable.
+// Trigger is one input to the machine. The names say WHO did the thing, because that is what the
+// RFC's races turn on: a CANCEL we receive and a CANCEL we send have different legal windows.
 type Trigger int
 
 const (
@@ -136,9 +104,8 @@ const (
 	TriggerLocalTrying Trigger = iota
 	// TriggerLocalRing is `rpc.sip.v1.ring` — a 180 with our To tag, which creates the early dialog.
 	TriggerLocalRing
-	// TriggerLocalEarlyMedia is a 183 carrying an SDP answer. Deferred at slice 1 (design §4.3) and
-	// in the vocabulary now because the offer/answer commitment it makes is a state change, not a
-	// header.
+	// TriggerLocalEarlyMedia is a 183 carrying an SDP answer. It is a state change and not a header,
+	// because of the offer/answer commitment it makes (design §4.3).
 	TriggerLocalEarlyMedia
 	// TriggerLocalAnswer is `rpc.sip.v1.answer` — the 200 with the SDP the engine couriered from
 	// mediad.
@@ -163,9 +130,8 @@ const (
 	TriggerRemoteAck
 	// TriggerRemoteBye is a BYE from the far end, in any state a BYE can reach.
 	TriggerRemoteBye
-	// TriggerRemoteCancel is a CANCEL from the far end. UAS only — a UAC receives no CANCEL for its
-	// own INVITE, and treating one as valid would let a stranger who guessed a Call-ID end a call we
-	// placed.
+	// TriggerRemoteCancel is a CANCEL from the far end. UAS only: a UAC receives no CANCEL for its
+	// own INVITE, and honouring one would let a guessed Call-ID end a call we placed.
 	TriggerRemoteCancel
 	// TriggerTeardownComplete is the final response to the BYE we sent, or the 487 for a CANCEL we
 	// sent. It is what turns Terminating into Terminated.
@@ -216,46 +182,31 @@ func (t Trigger) String() string {
 	}
 }
 
-// The refusal vocabulary, as errors.
-//
-// These are the Go half of SIP_DIALOG_REFUSAL_REASONS (design §10.4). They are errors rather than
-// a string because every one of them is a branch a caller takes, and because `errors.Is` at the
-// command boundary is how the reason reaches the wire without a switch on a string in three files.
+// The refusal vocabulary, as errors: the Go half of SIP_DIALOG_REFUSAL_REASONS (design §10.4).
+// `errors.Is` at the command boundary turns any of them into a wire reason without a string
+// comparison anywhere else.
 var (
-	// ErrDialogGone is a command against a dialog that has already ended — the CANCEL/answer race
-	// of design §4.4, seen from the losing side. The engine treats it as it already treats
-	// `channel_gone` in the transfer responder.
+	// ErrDialogGone is a command against a dialog that has already ended — the CANCEL/answer race of
+	// design §4.4, seen from the losing side.
 	ErrDialogGone = errors.New("dialog: the dialog has already ended")
 	// ErrInvalidState is a command that is legal in general and wrong here: an `answer` on an
 	// already-answered dialog, an ACK for a 2xx nobody sent.
 	ErrInvalidState = errors.New("dialog: the dialog is not in a state that allows this")
-	// ErrWrongRole is a UAS trigger on a UAC dialog or the reverse. It is a programming error, not a
-	// wire condition, and it is an error rather than a panic because the wire can produce it: a
-	// CANCEL that matched a UAC dialog by Call-ID is a stranger's guess, and the answer is 481.
+	// ErrWrongRole is a UAS trigger on a UAC dialog or the reverse. It is an error rather than a
+	// panic because the wire can produce it: a CANCEL matching a UAC dialog by Call-ID is a
+	// stranger's guess, and the answer is 481.
 	ErrWrongRole = errors.New("dialog: that trigger belongs to the other role")
-	// ErrCancelTooLate is RFC 3261 §9.2 exactly: a CANCEL for an INVITE whose final response has
-	// already gone out has no effect, and the correct answer is 481. The correct TEARDOWN is a BYE,
-	// which is why this is distinct from ErrDialogGone — the dialog is very much alive.
+	// ErrCancelTooLate is RFC 3261 §9.2: a CANCEL for an INVITE whose final response has already
+	// gone out has no effect and is answered 481. Distinct from ErrDialogGone because the dialog is
+	// alive and the correct teardown is a BYE.
 	ErrCancelTooLate = errors.New("dialog: the CANCEL arrived after the final response")
 )
 
-// The rest of SIP_DIALOG_REFUSAL_REASONS, as errors.
-//
-// # Why they live here and not next to the NATS responder that reports them
-//
-// The four above were declared when only the dialog machine could raise them. These five are raised
-// by the ORIGINATE path — a lookup that found no registration, a trunk this edge holds no
-// configuration for, a target that will not resolve — which is a different file in a different
-// package. Putting them there would split one closed vocabulary across two packages and give the
-// responder two switches to keep in step.
-//
-// So the whole of SIP_DIALOG_REFUSAL_REASONS is here, which is what the paragraph above already
-// claims this block is, and `errors.Is` at the command boundary turns any of the nine into a wire
-// reason without a single string comparison anywhere else.
+// The rest of SIP_DIALOG_REFUSAL_REASONS, as errors. These five are raised by the ORIGINATE path in
+// another package, and they live here so one closed vocabulary is not split across two.
 var (
-	// ErrUnregisteredTarget is an originate to an AOR with no live binding. The engine's
-	// `USER_NOT_REGISTERED`, and NOT an error: a phone that is unplugged is the ordinary case, which
-	// is why it is a named refusal rather than an internal failure.
+	// ErrUnregisteredTarget is an originate to an AOR with no live binding: the engine's
+	// `USER_NOT_REGISTERED`, a named refusal rather than an internal failure.
 	ErrUnregisteredTarget = errors.New("dialog: the target address of record has no live registration")
 	// ErrUnknownTrunk is an originate naming a trunk this edge holds no configuration for. It means
 	// the trunk directory has not reached this instance — not that the trunk does not exist — so the
@@ -267,30 +218,27 @@ var (
 	// ErrCapacity is a trunk's maxChannels or this instance's own dialog cap. A LOAD signal, and the
 	// one refusal here whose correct handling is to try a different instance rather than to give up.
 	ErrCapacity = errors.New("dialog: the capacity limit for that target is reached")
-	// ErrNotSupported is a command this build understands and cannot serve. `reinvite` answers it
-	// until sipgo has a re-INVITE at all (design §9.2), and answering it is strictly better than the
-	// alternative: a hold that silently no-opped is a call whose media direction is whatever the last
-	// answer happened to say, and nobody finds that until a customer is overheard.
+	// ErrNotSupported is a command this build understands and cannot serve. Answering it beats
+	// no-opping: a hold that silently did nothing leaves the media direction at whatever the last
+	// answer said, and nobody notices until a customer is overheard.
 	ErrNotSupported = errors.New("dialog: this build cannot serve that command")
 )
 
-// transition is the whole machine: a pure function of role, state and trigger.
-//
-// Every "no" is one of the four errors above, so a caller never has to infer a reason from a state
-// comparison. Every "yes" returns the next state and nothing else — the effects that go with it are
-// Dialog.Apply's job, because they need the data on the input and this table deliberately has none.
+// transition is the whole machine: a pure function of role, state and trigger. Every refusal is one
+// of the four errors above; every acceptance returns only the next state, since the effects need
+// data from the input that this table deliberately does not see (Dialog.Apply).
 func transition(role Role, state State, trigger Trigger) (State, error) {
 	if state == StateTerminated {
-		// One rule, before anything else, because it is the one that keeps a hung-up call from being
-		// answered by a command that was already in flight when it ended.
+		// Checked before anything else: it is what keeps a hung-up call from being answered by a
+		// command that was already in flight when it ended.
 		return StateTerminated, ErrDialogGone
 	}
 	if err := roleAllows(role, trigger); err != nil {
 		return state, err
 	}
 
+	// Teardown is legal from almost everywhere, so it is decided first.
 	switch trigger {
-	// -- teardown, which is legal from almost everywhere and therefore comes first ----------------
 	case TriggerRemoteBye:
 		// A BYE is legal from Established onwards, INCLUDING before the ACK. RFC 3261 §15 forbids
 		// the UAS from sending one before the ACK; it says nothing about receiving one, and a far
@@ -339,7 +287,6 @@ func transition(role Role, state State, trigger Trigger) (State, error) {
 		// out with it, and both of those live on the input rather than in this table.
 		return StateTerminated, nil
 
-	// -- UAS forward progress ---------------------------------------------------------------------
 	case TriggerLocalTrying:
 		if state == StateInit {
 			return StateProceeding, nil
@@ -389,7 +336,6 @@ func transition(role Role, state State, trigger Trigger) (State, error) {
 			return state, ErrInvalidState
 		}
 
-	// -- UAC forward progress ---------------------------------------------------------------------
 	case TriggerRemoteProvisional:
 		switch state {
 		case StateInit:
@@ -426,10 +372,9 @@ func transition(role Role, state State, trigger Trigger) (State, error) {
 			// exactly what makes the far end agree the call is over (RFC 3261 §13.2.2.4 and §15).
 			return StateTerminating, nil
 		case StateEstablished, StateConfirmed:
-			// A second 2xx: either a retransmission of the one we already ACKed, or a fork we did
-			// not ask for. Apply tells them apart by the To tag and answers the fork with ACK+BYE
-			// (design §9.7) — a fork answered with silence leaks a dialog at the far end and, on
-			// some carriers, bills for it.
+			// A second 2xx: a retransmission of the one we ACKed, or a fork we did not ask for. Apply
+			// tells them apart by the To tag and answers a fork with ACK+BYE (design §9.7), because a
+			// fork answered with silence leaks a dialog at the far end.
 			return state, nil
 		default:
 			return state, ErrInvalidState
@@ -460,10 +405,8 @@ func transition(role Role, state State, trigger Trigger) (State, error) {
 	return state, ErrInvalidState
 }
 
-// roleAllows refuses the triggers that belong to the other end of the INVITE.
-//
-// The two lists are exhaustive rather than defaulted: a trigger added later without a decision here
-// is a compile-time-invisible bug, and this way it is refused loudly on its first test.
+// roleAllows refuses the triggers that belong to the other end of the INVITE. A trigger in neither
+// list — the teardown and timeout inputs — is legal for both roles.
 func roleAllows(role Role, trigger Trigger) error {
 	switch trigger {
 	case TriggerLocalTrying, TriggerLocalRing, TriggerLocalEarlyMedia, TriggerLocalAnswer,

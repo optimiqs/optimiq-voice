@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -30,13 +32,30 @@ const (
 type Config struct {
 	// HealthAddr is an optional private HTTP listener for /healthz and /readyz.
 	HealthAddr string
+	// PProfEnabled serves net/http/pprof on the health listener. SIPD_PPROF, off by default.
+	//
+	// On the health listener and not one of its own, so there is a single private port to reason
+	// about. The loopback gate moves with it: turning this on requires HealthAddr to name a loopback
+	// host, because these handlers expose process memory and goroutine stacks and a SIP edge's heap
+	// holds credentials in flight.
+	PProfEnabled bool
+	// SocketBufferBytes sizes SO_RCVBUF/SO_SNDBUF on the UDP listeners. SIPD_SOCKET_BUFFER_BYTES,
+	// default 4 MiB, 0 to leave the kernel default. A REGISTER storm arrives faster than one
+	// reader goroutine drains it, and a datagram dropped in the socket buffer is a phone that
+	// retransmits a second later.
+	SocketBufferBytes int
+	// PublishAsyncMaxPending bounds unacknowledged JetStream publishes.
+	// SIPD_PUBLISH_ASYNC_MAX_PENDING, default 4096. Reaching it blocks the publishing goroutine,
+	// which is the backpressure that stops a stalled broker becoming unbounded memory.
+	PublishAsyncMaxPending int
+	// PublishAsyncTimeout is how long one unacknowledged publish is held before it is reported as
+	// failed. SIPD_PUBLISH_ASYNC_TIMEOUT, default 30s.
+	PublishAsyncTimeout time.Duration
 	// ListenAddr is the host:port both transports bind. SIPD_LISTEN_ADDR, default 0.0.0.0:5060.
 	ListenAddr string
 	// EnableUDP and EnableTCP toggle the two listeners. SIPD_UDP / SIPD_TCP, both default true.
-	//
-	// TCP is not optional in practice: a REGISTER carrying a long Contact and several Via headers
-	// exceeds the safe UDP MTU, and RFC 3261 §18.1.1 requires the UA to switch. It is a toggle only
-	// so a test rig can isolate one transport.
+	// TCP is not optional in practice: RFC 3261 §18.1.1 requires the UA to switch once a request
+	// exceeds the safe UDP MTU. The toggle exists so a test rig can isolate one transport.
 	EnableUDP bool
 	EnableTCP bool
 
@@ -44,16 +63,9 @@ type Config struct {
 	// own bind address so a deployment can put the secure transports on their conventional ports
 	// (5061 for TLS, 8089 for WSS) without moving the plaintext ones.
 	//
-	// # Why WS and WSS are here at all
-	//
-	// A browser cannot open a UDP or TCP socket. SIP over WebSocket (RFC 7118) is the ONLY transport
-	// a WebRTC softphone has, and parity-audit row 1.28 records that neither plane serves one today
-	// — which blocks the T3 softphone entirely. sipgo serves both (`Server.ServeWS`/`ServeWSS`, and
-	// `ListenAndServe` accepts "ws" and "wss" as network names), so this is wiring rather than
-	// implementation.
-	//
-	// WSS carries SIP signalling. Browser audio is terminated separately by mediad's
-	// optional WebRTC transport; both must be enabled in a browser calling deployment.
+	// SIP over WebSocket (RFC 7118) is the only transport available to a browser softphone. WSS
+	// carries signalling only; browser audio is terminated by mediad's WebRTC transport, so both
+	// must be enabled in a browser-calling deployment.
 	EnableTLS bool
 	EnableWS  bool
 	EnableWSS bool
@@ -62,72 +74,50 @@ type Config struct {
 	WSListenAddr  string
 	WSSListenAddr string
 	// TLSCertFile and TLSKeyFile are the PEM certificate and key both TLS and WSS present. One pair
-	// for both: a deployment that needs different certificates for 5061 and 8089 needs two
-	// processes, and pretending otherwise would put certificate selection into a config file that
-	// cannot express SNI.
+	// serves both; a deployment needing different certificates per port needs two processes.
 	TLSCertFile string
 	TLSKeyFile  string
 
 	// EnableInvite turns on the INVITE surface: the dialog layer, the admission RPC, the engine's
 	// five-subject command surface, the trunk directory, the `sip-acl` watch and the claim reaper.
-	// SIPD_INVITE, default FALSE.
+	// SIPD_INVITE, default false.
 	//
-	// Still off by default, and the REASON has changed rather than gone away. It is no longer "no
-	// engine serves `rpc.sip.v1.invite`" — one does. It is that turning this on converts a registrar
-	// into a call-processing element, and that has a blast radius nobody should acquire by upgrading
-	// a binary: the front end must become dialog-affine (a mid-dialog request that lands on the wrong
-	// instance is answered 481, design §6.4), the `trunks` and `sip-acl` buckets must be written by
-	// apps/api, and this process starts subscribing to business subjects for the first time. Turning
-	// it on is a deliberate act by a deployment that has all of that.
+	// It is off by default because it converts a registrar into a call-processing element with
+	// prerequisites the deployment must already meet: the front end must be dialog-affine (a
+	// mid-dialog request landing on the wrong instance is answered 481), and the `trunks` and
+	// `sip-acl` buckets must be written by apps/api.
 	EnableInvite bool
 	// InstanceID is this process's identity on the backbone: it stamps every `sip-dialogs` claim and
 	// is the token engine commands for these dialogs are addressed at. SIPD_INSTANCE_ID, defaulting
-	// to the hostname, because a dialog lives on one process and a command for it must reach that
-	// one.
+	// to the hostname.
 	InstanceID string
 
 	// Session timers (RFC 4028). SIPD_SESSION_TIMERS (default false), SIPD_SESSION_EXPIRES (1800)
-	// and SIPD_MIN_SE (90, the RFC's own floor).
-	//
-	// Off by default because a one-sided timer is worse than none and because mediad's RTP timeout
-	// already reaps a far end that vanished without a BYE. They become mandatory in front of a
-	// carrier that offers `Supported: timer`, which will tear the call down itself if it never sees
-	// a refresh.
+	// and SIPD_MIN_SE (90, the RFC's own floor). Off by default because mediad's RTP timeout already
+	// reaps a far end that vanished without a BYE; required in front of a carrier that offers
+	// `Supported: timer`.
 	EnableSessionTimers bool
 	SessionExpires      time.Duration
 	MinSE               time.Duration
 
-	// MaxContactsPerAOR caps simultaneous registrations for one address of record.
-	// SIPD_MAX_CONTACTS, default 5.
-	//
-	// It is the `extension.maxRegistrations` column's enforcement point. Five rather than one
-	// because a desk phone plus a softphone plus a mobile client is an ordinary user, and rather
-	// than unlimited because an unbounded contact set is a fork that rings twenty stale bindings.
+	// MaxContactsPerAOR caps simultaneous registrations for one address of record and is the
+	// enforcement point for the `extension.maxRegistrations` column. SIPD_MAX_CONTACTS, default 5;
+	// an unbounded contact set is a fork that rings every stale binding.
 	MaxContactsPerAOR int
 
-	// TrunkACL is an OVERRIDE on the carrier-facing source-address allow list, as `cidr[=trunkId]`
-	// entries separated by commas. SIPD_TRUNK_ACL, empty by default and expected to stay empty.
+	// TrunkACL is an override on the carrier-facing source-address allow list, as `cidr[=trunkId]`
+	// entries separated by commas. SIPD_TRUNK_ACL, normally empty.
 	//
-	// # It is no longer the source, and it was deliberately not removed
+	// The source of truth is the `sip-acl` KV bucket, watched by internal/acl rather than read per
+	// INVITE: a KV get per INVITE is a broker round trip inside a SIP transaction, on the one code
+	// path whose rate an attacker controls. This override is merged on top of every bucket update
+	// and never removed by one, so it still admits a carrier when the control plane cannot write the
+	// bucket.
 	//
-	// The source is the `sip-acl` KV bucket (design §8.1): organization-scoped in PostgreSQL, written
-	// non-org-scoped by apps/api because the reader does not know the tenant, and WATCHED here rather
-	// than read per INVITE — a KV get per INVITE is a broker round trip inside a SIP transaction on
-	// the one code path an attacker controls the rate of. internal/acl is the ingestion.
-	//
-	// Deleting this variable outright was the tidier change and it loses on two situations that are
-	// both real. A deployment whose control plane cannot yet write the bucket has no other way to
-	// admit a carrier; and an operator who needs one address admitted RIGHT NOW during an incident
-	// cannot wait for a database write to propagate through apps/api. So it survives as an override
-	// that is recompiled alongside every bucket update and is never removed by one — which is what
-	// makes the second case trustworthy rather than a race.
-	//
-	// Empty is now the NORMAL state and no longer means "no external profile". The profile is built
-	// whenever the bucket is reachable, because an external profile whose ACL is empty refuses every
-	// carrier — Match has no default allow and no constructor can give it one — so building it early
-	// costs nothing and saves a restart the first time a tenant adds a trunk. A value that is SET and
-	// names nothing usable is still a boot failure: that is a typo, and a typo in an anti-toll-fraud
-	// boundary that silently did nothing is exactly what this check exists for.
+	// Empty is the normal state and does not disable the external profile, which is built whenever
+	// the bucket is reachable (Match has no default allow, so an empty ACL still refuses everyone).
+	// A value that is set and names nothing usable is a boot failure: a typo in an anti-toll-fraud
+	// boundary must not silently do nothing.
 	TrunkACL string
 	// ExternalListenAddr is where the carrier-facing profile listens, when a TrunkACL is configured.
 	// SIPD_EXTERNAL_LISTEN_ADDR, default empty, meaning the external profile shares the main
@@ -137,8 +127,8 @@ type Config struct {
 	// Realm is the digest authentication realm presented in every challenge. SIPD_REALM.
 	//
 	// It is part of HA1 = MD5(username:realm:password), so changing it invalidates every stored
-	// credential. There is no default: guessing one would make every deployment share a realm and
-	// therefore make a credential from one deployment replayable against another.
+	// credential. There is no default: a shared realm would make a credential from one deployment
+	// replayable against another.
 	Realm string
 
 	// NATSURL is the backbone. NATS_URL, default nats://127.0.0.1:4222.
@@ -147,30 +137,18 @@ type Config struct {
 	// NATSUser and NATSPass authenticate to it. NATS_SIPD_USER / NATS_SIPD_PASS, falling back to
 	// the unprefixed NATS_USER / NATS_PASS.
 	//
-	// The broker requires authentication (config/nats.conf), and the prefixed pair is this
-	// process's OWN identity there. The `sipd` user may publish `sip.reg.v1.>`, request
-	// `rpc.sip.v1.credential` and use the `registrations` KV bucket; it subscribes to no business
-	// subject at all, because sipd's request surface is SIP rather than NATS. It cannot write a
-	// CDR leg, cannot read the dial plan and cannot see another plane's events — which is the
-	// point, for the process that terminates SIP from the internet.
+	// The prefixed pair is this process's least-privilege identity in config/nats.conf: the `sipd`
+	// user may publish `sip.reg.v1.>`, request `rpc.sip.v1.credential` and use the `registrations`
+	// bucket, and nothing else. Both empty means a broker with no authentication, which is legal;
+	// one of a pair set without the other is not, and is refused rather than silently falling back.
 	//
-	// The unprefixed fallback is what keeps a deployment that has not split its credentials
-	// working unchanged.
-	//
-	// Both empty is legal and means "a broker with no authentication configured" — the SIPp rig and
-	// the integration tests start one of those per run. One set without the other is NOT legal,
-	// PER PAIR: it is a rename applied to half a pair, and the broker would answer every connect
-	// with an authorization violation that this process would spend its life retrying.
-	//
-	// They are options rather than userinfo in NATSURL because the URL is logged: the boot line,
-	// every reconnect and the connect error itself all carry it.
+	// They are options rather than userinfo in NATSURL because the URL is logged.
 	NATSUser string
 	NATSPass string
 
 	// NATSTLSCA is the path to a PEM bundle the broker's certificate must chain to. NATS_TLS_CA.
-	// Empty is PLAINTEXT unless NATSTLSEnabled says otherwise — the shipped broker listens without
-	// TLS and its `tls` block lives in the `compose.tls.yaml` overlay, so a client that demanded
-	// TLS by default would fail to connect on every checkout that has not generated certificates.
+	// Empty is plaintext unless NATSTLSEnabled says otherwise: the shipped broker listens without
+	// TLS, so demanding it by default would break every checkout without generated certificates.
 	NATSTLSCA string
 
 	// NATSTLSEnabled turns on TLS against the SYSTEM trust store. NATS_TLS_ENABLED. Setting
@@ -187,18 +165,15 @@ type Config struct {
 	DefaultExpires time.Duration
 
 	// Subscription expiry policy, in seconds on the wire. It governs SUBSCRIBE (BLF and MWI), not
-	// REGISTER, and the numbers are deliberately different from the registration ones.
+	// REGISTER.
 	//
 	//   SIPD_SUBSCRIBE_MIN_EXPIRES     default 60  — below this a SUBSCRIBE gets 423
 	//   SIPD_SUBSCRIBE_MAX_EXPIRES     default 600 — above this the grant is silently clamped down
 	//   SIPD_SUBSCRIBE_DEFAULT_EXPIRES default 600 — used when the SUBSCRIBE states no interval
 	//
-	// Ten minutes rather than an hour, and that ceiling is the load-bearing one. The subscription
-	// table is instance-local (see internal/subscribe), so if an instance dies its subscribers'
-	// lamps freeze until they re-subscribe — and this is what bounds that window. RFC 6665 §4.2.1
-	// lets the notifier shorten what a phone asked for, so a handset requesting 3600 is simply
-	// granted 600 and refreshes six times as often. The cost is one SUBSCRIBE per phone per ten
-	// minutes; the alternative is a BLF wall that can be an hour stale after a pod is rescheduled.
+	// The ten-minute ceiling bounds how long a dead instance's subscribers keep stale lamps: the
+	// subscription table is instance-local (see internal/subscribe). RFC 6665 §4.2.1 lets the
+	// notifier shorten what a phone asked for, so a handset requesting 3600 is granted 600.
 	SubscribeMinExpires     time.Duration
 	SubscribeMaxExpires     time.Duration
 	SubscribeDefaultExpires time.Duration
@@ -207,15 +182,13 @@ type Config struct {
 	NonceTTL time.Duration
 	// NonceSecret keys the nonce MAC. SIPD_NONCE_SECRET.
 	//
-	// Empty means "generate a random one at boot", which is correct for a single instance and
-	// WRONG for a fleet: a device challenged by instance A would be rejected by instance B. Set it
-	// (32+ random bytes, same value fleet-wide) in any deployment with more than one replica.
+	// Empty generates a random one at boot, which is correct for a single instance and wrong for a
+	// fleet: a device challenged by instance A would be rejected by instance B. Set it (32+ random
+	// bytes, same value fleet-wide) in any deployment with more than one replica.
 	NonceSecret string
 
-	// SweepInterval is how often the expiry sweeper runs. SIPD_SWEEP_INTERVAL, default 5s.
-	//
-	// It bounds how late an `expired` event can be, not how long a binding lives: the binding's own
-	// deadline is exact, the sweeper is just when we notice.
+	// SweepInterval is how often the expiry sweeper runs. SIPD_SWEEP_INTERVAL, default 5s. It bounds
+	// how late an `expired` event can be, not how long a binding lives.
 	SweepInterval time.Duration
 
 	// CredentialSource and CredentialsFile pick and configure the credential store.
@@ -226,39 +199,33 @@ type Config struct {
 	// CredentialTimeout bounds one `rpc.sip.v1.credential` request.
 	// SIPD_CREDENTIAL_TIMEOUT, default 500ms — the contract's own deadline.
 	//
-	// It sits inside a REGISTER transaction, and a phone's retransmission timer starts at 500 ms,
-	// so a reply slower than that is already competing with the retry it caused. Raising it does
-	// not make a slow control plane work; it makes the edge queue behind one.
+	// It sits inside a REGISTER transaction, and a phone's retransmission timer starts at 500ms, so
+	// a slower reply is already competing with the retry it caused.
 	CredentialTimeout time.Duration
 
 	// CredentialCacheTTL and CredentialNegativeCacheTTL are how long a resolved credential and a
 	// definite refusal are reused. SIPD_CREDENTIAL_CACHE_TTL (default 30s),
 	// SIPD_CREDENTIAL_NEGATIVE_CACHE_TTL (default 10s).
 	//
-	// Short on purpose: the alternative to staleness is an account disabled minutes ago that can
-	// still register. The negative one is what stops a username scanner turning into a query per
-	// guess. Failures are never cached at any TTL.
+	// Both are short: a longer positive TTL lets an account disabled minutes ago still register. The
+	// negative one stops a username scanner becoming a query per guess. Failures are never cached.
 	CredentialCacheTTL         time.Duration
 	CredentialNegativeCacheTTL time.Duration
 
 	// CredentialCacheMaxEntries bounds the credential cache.
-	// SIPD_CREDENTIAL_CACHE_MAX_ENTRIES, default 10000.
-	//
-	// An unbounded negative cache keyed on an attacker-supplied username is a memory amplifier:
-	// one map entry per guess, for free.
+	// SIPD_CREDENTIAL_CACHE_MAX_ENTRIES, default 10000. An unbounded negative cache keyed on an
+	// attacker-supplied username is one map entry per guess.
 	CredentialCacheMaxEntries int
 
-	// ProvisionSecretKey is the provisioning root key, and is normally EMPTY.
+	// ProvisionSecretKey is the provisioning root key, and is normally empty.
 	// SIPD_PROVISION_SECRET_KEY.
 	//
-	// Production sipd never derives a password: `rpc.sip.v1.credential` returns a ready-made HA1
-	// the API derived, precisely so this key stays on the control plane rather than on the most
-	// internet-exposed process in the system. It derives every tenant's password, so an edge that
-	// holds it turns an edge compromise into a total credential compromise.
+	// Production sipd never derives a password — `rpc.sip.v1.credential` returns a ready-made HA1 —
+	// so this key stays on the control plane. It derives every tenant's password, so holding it on
+	// the internet-exposed process turns an edge compromise into a total credential compromise.
 	//
-	// It exists for the file store's derived form: a development or SIPp-rig fixture can name an
-	// (orgId, secretRef) pair and get exactly the password apps/api would render, instead of a
-	// copied literal that drifts. See internal/credentials/derive.go.
+	// It exists for the file store's derived form, so a development or SIPp-rig fixture can name an
+	// (orgId, secretRef) pair instead of a copied literal. See internal/credentials/derive.go.
 	ProvisionSecretKey string
 
 	// UserAgent is the Server/User-Agent header value. SIPD_USER_AGENT, default "optimiq-sipd".
@@ -308,9 +275,8 @@ func Load(getenv Getenv) (Config, error) {
 		ExternalListenAddr: strings.TrimSpace(getenv("SIPD_EXTERNAL_LISTEN_ADDR")),
 	}
 	if cfg.InstanceID == "" {
-		// The hostname, because in every deployment this repository targets that is the pod name,
-		// which is exactly the granularity a per-instance command subject needs. A random id would
-		// work too and would make a restarted pod unaddressable by anything that cached the old one.
+		// The hostname is the pod name in the deployments this repository targets, which is the
+		// granularity a per-instance command subject needs.
 		if hostname, err := os.Hostname(); err == nil {
 			cfg.InstanceID = hostname
 		} else {
@@ -319,7 +285,7 @@ func Load(getenv Getenv) (Config, error) {
 	}
 
 	// The per-service pair first, the shared pair as the fallback. Collected into `problems` so a
-	// half-set pair is reported alongside every other configuration error rather than on its own.
+	// half-set pair is reported alongside every other configuration error.
 	cfg.NATSUser, cfg.NATSPass, problems = resolveNATSCredentials(getenv, "SIPD", problems)
 
 	var err error
@@ -352,6 +318,39 @@ func Load(getenv Getenv) (Config, error) {
 	}
 	if cfg.MinSE, err = secondsOr(getenv, "SIPD_MIN_SE", 90); err != nil {
 		fail("%v", err)
+	}
+	if cfg.PublishAsyncMaxPending, err = intOr(getenv, "SIPD_PUBLISH_ASYNC_MAX_PENDING", 4096); err != nil {
+		fail("%v", err)
+	}
+	if cfg.PublishAsyncMaxPending < 1 {
+		fail("SIPD_PUBLISH_ASYNC_MAX_PENDING must be at least 1")
+	}
+	if cfg.PublishAsyncTimeout, err = durationOr(getenv, "SIPD_PUBLISH_ASYNC_TIMEOUT", 30*time.Second); err != nil {
+		fail("%v", err)
+	}
+	if cfg.PublishAsyncTimeout <= 0 {
+		fail("SIPD_PUBLISH_ASYNC_TIMEOUT must be positive")
+	}
+	if cfg.SocketBufferBytes, err = intOr(getenv, "SIPD_SOCKET_BUFFER_BYTES", 4<<20); err != nil {
+		fail("%v", err)
+	}
+	if cfg.SocketBufferBytes < 0 {
+		fail("SIPD_SOCKET_BUFFER_BYTES must not be negative")
+	}
+	if cfg.PProfEnabled, err = boolOr(getenv, "SIPD_PPROF", false); err != nil {
+		fail("%v", err)
+	}
+	if strings.TrimSpace(getenv("SIPD_PPROF_ADDR")) != "" {
+		// Refused rather than ignored: pprof moved onto the health listener, and silently dropping
+		// the old variable would leave an operator profiling a port nothing is listening on.
+		fail("SIPD_PPROF_ADDR is no longer used; set SIPD_PPROF=1 and point SIPD_HEALTH_ADDR at a loopback address")
+	}
+	if cfg.PProfEnabled {
+		if cfg.HealthAddr == "" {
+			fail("SIPD_PPROF needs SIPD_HEALTH_ADDR: pprof is served on the health listener")
+		} else if err := requireLoopback(cfg.HealthAddr); err != nil {
+			fail("SIPD_PPROF requires a loopback SIPD_HEALTH_ADDR: %v", err)
+		}
 	}
 	if cfg.MaxContactsPerAOR, err = intOr(getenv, "SIPD_MAX_CONTACTS", 5); err != nil {
 		fail("%v", err)
@@ -417,8 +416,8 @@ func Load(getenv Getenv) (Config, error) {
 		fail("every listener is disabled: sipd would accept no traffic at all")
 	}
 	// A certificate is required for exactly the transports that terminate TLS, and refused for the
-	// ones that do not — a deployment that set a cert and forgot to enable TLS is one that believes
-	// it is encrypted and is not, which is the failure worth failing the boot for.
+	// ones that do not: a deployment that set a cert and forgot to enable TLS believes it is
+	// encrypted and is not.
 	if (cfg.EnableTLS || cfg.EnableWSS) && (cfg.TLSCertFile == "" || cfg.TLSKeyFile == "") {
 		fail("SIPD_TLS_CERT_FILE and SIPD_TLS_KEY_FILE are both required when SIPD_TLS or SIPD_WSS is on")
 	}
@@ -496,15 +495,12 @@ func Load(getenv Getenv) (Config, error) {
 
 // duplicateListener reports the first bind address claimed by two enabled transports.
 //
-// It is a boot check rather than a runtime one because the runtime symptom is miserable: one
-// listener binds, the other fails, the error is logged by a goroutine nobody is watching, and half
-// the fleet's phones cannot reach the transport they were provisioned for.
-// The collision is between sockets of the same FAMILY, not between transports. UDP and TCP
-// legitimately share one address — different protocols, different sockets, which is why they have
-// one SIPD_LISTEN_ADDR between them — but TCP, TLS, WS and WSS all bind a stream socket and two of
-// them on one address is the failure this check exists for. Skipping TCP outright, as this used to,
-// meant `SIPD_UDP=false SIPD_TCP=true` with SIPD_WS_LISTEN_ADDR equal to SIPD_LISTEN_ADDR passed
-// validation and then produced exactly that failure.
+// It is a boot check because the runtime symptom is one listener binding, the other failing in a
+// goroutine nobody watches, and phones unable to reach the transport they were provisioned for.
+//
+// The collision is between sockets of the same family, not between transports: UDP and TCP
+// legitimately share one address, which is why they have one SIPD_LISTEN_ADDR between them, but
+// TCP, TLS, WS and WSS all bind a stream socket.
 func duplicateListener(cfg Config) (string, bool) {
 	claimed := make(map[string]string, 5)
 	for _, listener := range [5]struct {
@@ -536,16 +532,12 @@ var ErrInvalid = errors.New("invalid sipd configuration")
 
 // resolveNATSCredentials reads the broker identity, preferring this service's own.
 //
-// `NATS_<SERVICE>_USER` / `NATS_<SERVICE>_PASS` win when BOTH are set — that is the least-privilege
-// user `config/nats.conf` defines for this process. Otherwise the shared `NATS_USER` / `NATS_PASS`
-// are used, which is what a deployment that has not split its credentials, the SIPp rig and the
-// integration tests still supply. Both absent is a broker with no authentication, which is legal.
+// `NATS_<SERVICE>_USER` / `NATS_<SERVICE>_PASS` win when both are set; otherwise the shared
+// `NATS_USER` / `NATS_PASS` are used. Both absent is a broker with no authentication, which is legal.
 //
-// A HALF-SET pair is refused PER PAIR, and refused rather than ignored: falling back from a
-// half-set `NATS_SIPD_*` to the shared pair would hand this process the operator identity and hide
-// the typo behind a working connection, which is the failure this check exists to prevent. It is
-// collected into `problems` rather than returned so one startup message carries every
-// configuration error at once.
+// A half-set pair is refused per pair rather than ignored: falling back from a half-set
+// `NATS_SIPD_*` to the shared pair would hand this process the operator identity and hide the typo
+// behind a working connection. Problems are collected so one startup message carries them all.
 func resolveNATSCredentials(getenv Getenv, service string, problems []string) (string, string, []string) {
 	scopedUserKey, scopedPassKey := "NATS_"+service+"_USER", "NATS_"+service+"_PASS"
 
@@ -591,8 +583,7 @@ func boolOr(getenv Getenv, key string, fallback bool) (bool, error) {
 }
 
 // secondsOr reads a bare integer count of seconds. SIP states intervals in seconds, so the
-// environment does too — "300" rather than "5m" — and the wire value is what an operator reads in a
-// packet capture.
+// environment does too ("300" rather than "5m"), matching what a packet capture shows.
 func secondsOr(getenv Getenv, key string, fallback int) (time.Duration, error) {
 	raw := strings.TrimSpace(getenv(key))
 	if raw == "" {
@@ -603,6 +594,27 @@ func secondsOr(getenv Getenv, key string, fallback int) (time.Duration, error) {
 		return 0, fmt.Errorf("%s must be a non-negative whole number of seconds, got %q", key, raw)
 	}
 	return time.Duration(value) * time.Second, nil
+}
+
+// requireLoopback refuses an address that is not explicitly on a loopback host. The pprof handlers
+// dump heap and goroutine stacks, which on a SIP edge includes credentials in flight, so a wildcard
+// or external address is a configuration error rather than an operator's choice.
+func requireLoopback(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%q is not a host:port address: %w", addr, err)
+	}
+	if host == "" {
+		return fmt.Errorf("%q binds every interface; name 127.0.0.1 or ::1", addr)
+	}
+	address, err := netip.ParseAddr(strings.Trim(host, "[]"))
+	if err != nil {
+		return fmt.Errorf("%q is not an IP address; name 127.0.0.1 or ::1", host)
+	}
+	if !address.IsLoopback() {
+		return fmt.Errorf("%q is not a loopback address; pprof must not be reachable off-host", host)
+	}
+	return nil
 }
 
 func intOr(getenv Getenv, key string, fallback int) (int, error) {

@@ -1,22 +1,15 @@
-// Package aor is the multi-contact location model: one address of record, several devices.
+// Package aor is the multi-contact location model: one address of record, several devices, stored
+// atomically with independent expiry and a configured cap.
 //
-// The registrar stores all contacts atomically, with independent expiry and a configured cap.
-//
-// # What it deliberately does not do: fork
-//
-// The engine forks, and it forks better than a SIP UAC could (design §5.3): `dialSimultaneous`
-// mints one channel id per attempt, installs a watcher on each BEFORE any originate is issued,
-// settles on the first answer, gives the loser `LOSE_RACE`, and produces one CDR row per attempt.
-// A sipd that forked would have to reproduce the race, the per-attempt accounting and the
-// confirmation flow in a process that has no CDR and no plan.
-//
-// So this package's job is to REPORT the contacts, in the order RFC 3261 §16.6 says to try them,
-// and the engine originates one dialog per contact. Selection is a pure function; nothing here
-// dials anything.
+// It deliberately does not fork. The engine does that better than a SIP UAC could (design §5.3),
+// with per-attempt channel ids, watchers installed before any originate, and one CDR row per
+// attempt. This package's job is to REPORT the contacts in the order RFC 3261 §16.6 says to try
+// them; selection is a pure function and nothing here dials anything.
 package aor
 
 import (
-	"sort"
+	"cmp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -27,27 +20,15 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/kv"
 )
 
-// DefaultQ is the q-value of a contact that states none.
-//
-// RFC 3261 §20.10 says an absent `q` means the contact has no stated preference, and §16.6 orders
-// by DECREASING q. One is the top of the range, so an unqualified contact outranks any contact that
-// explicitly lowered itself — which is the right reading: a device that said `q=0.5` asked to be
-// second, and a device that said nothing did not.
+// DefaultQ is the q-value of a contact that states none. RFC 3261 §16.6 orders by decreasing q and
+// §20.10 tops the range at one, so an unqualified contact outranks any that explicitly lowered
+// itself: a device that said `q=0.5` asked to be second, and one that said nothing did not.
 const DefaultQ = 1.0
 
-// Contact is one device bound to an address of record.
-//
-// It is a superset of what internal/kv.Binding carries for a single contact, and the JSON tags are
-// chosen to match it field for field, so a list-valued binding is the same shape repeated rather
-// than a second vocabulary. The value the registrar writes stays backward compatible: the
-// highest-priority contact continues to populate the flat `contact`/`transport`/`sourceAddress`
-// fields that `registrationBindingSchema` defines, and the set travels alongside in `contacts`.
-//
-// `registrationBindingSchema.contacts` now EXISTS — an optional, `.loose()`, bounded array — so
-// this is no longer a shape waiting for a contract. The two halves are written together by
-// ApplyToBinding and read together by FromBinding, and the wire type they meet at is kv.Contact.
-// The schema being `.loose()` is still what lets this struct carry `q`, `regId`, `callId` and
-// `cseq`, which the array's element does not name and this process needs to round-trip.
+// Contact is one device bound to an address of record. It is a superset of what kv.Binding carries
+// for a single contact, and the JSON tags match it field for field so a list-valued binding is the
+// same shape repeated rather than a second vocabulary. `registrationBindingSchema.contacts` is
+// `.loose()`, which is what lets this struct round-trip `q`, `regId`, `callId` and `cseq`.
 type Contact struct {
 	DeviceID       string `json:"deviceId,omitempty"`
 	SIPDInstanceID string `json:"sipdInstanceId,omitempty"`
@@ -59,18 +40,15 @@ type Contact struct {
 	SourceAddress string `json:"sourceAddress,omitempty"`
 	// UserAgent is the device's own description of itself.
 	UserAgent string `json:"userAgent,omitempty"`
-	// SharedLineNumber and AppearanceIndex place this contact on a shared line appearance (SLA), when
-	// it has one. They ride from the binding through here so the INVITE path — which reads the PRIMARY
-	// contact — can stamp a `Call-Info` appearance-index header on the request to this phone. Nil for
-	// an ordinary contact.
+	// SharedLineNumber and AppearanceIndex place this contact on a shared line appearance, so the
+	// INVITE path can stamp a `Call-Info` appearance-index header. Nil for an ordinary contact.
 	SharedLineNumber *string `json:"sharedLineNumber,omitempty"`
 	AppearanceIndex  *int    `json:"appearanceIndex,omitempty"`
-	// Instance is the device's `+sip.instance` (RFC 5626). It is the ONLY stable identity a device
-	// has across a changed IP address or a changed port, which is what makes it the right key for
-	// "is this the same phone re-registering, or a second one".
+	// Instance is the device's `+sip.instance` (RFC 5626) — the only stable identity a device has
+	// across a changed address or port, and so the right key for "same phone, or a second one".
 	Instance string `json:"instance,omitempty"`
 	// RegID is the RFC 5626 `reg-id` parameter: one device with two flows (wifi and cellular)
-	// registers twice with the same instance and different reg-ids, and both are legitimately live.
+	// registers twice with the same instance and different reg-ids, and both are live.
 	RegID int `json:"regId,omitempty"`
 	// Q is the preference, higher first.
 	Q float64 `json:"q,omitempty"`
@@ -86,19 +64,10 @@ type Contact struct {
 // Expired reports whether this contact's granted interval has lapsed.
 func (c Contact) Expired(now time.Time) bool { return !now.Before(c.ExpiresAt) }
 
-// Key is the identity a re-registration matches on.
-//
-// # The rule, and why it is not simply the URI
-//
-// RFC 3261 §10.3 step 6 says a contact matches an existing binding when the URIs match. RFC 5626
-// §5.4 refines it for the case that actually happens: a device behind NAT gets a new source port on
-// every reboot, so its Contact URI changes while the DEVICE has not. Matching on the URI alone
-// leaves the old binding in place until it expires, and the AOR accumulates dead contacts for one
-// phone until the cap evicts a live one.
-//
-// So: instance plus reg-id when the device supplies them, and the URI otherwise. That is exactly
-// what RFC 5626 prescribes, and it is what makes the cap below a cap on DEVICES rather than on
-// reboots.
+// Key is the identity a re-registration matches on: instance plus reg-id when the device supplies
+// them (RFC 5626 §5.4), and the URI otherwise (RFC 3261 §10.3 step 6). A device behind NAT gets a
+// new source port on every reboot, so URI matching alone would accumulate dead contacts for one
+// phone until the cap evicted a live one.
 func (c Contact) Key() string {
 	if c.Instance != "" {
 		return c.Instance + "\x00" + strconv.Itoa(c.RegID)
@@ -106,11 +75,9 @@ func (c Contact) Key() string {
 	return c.URI
 }
 
-// Set is every live contact for one address of record.
-//
-// It is a value type with methods that return new sets rather than mutating in place, so the
-// registrar can compute the result of a REGISTER, decide whether to accept it, and only then write
-// — which is what stops a rejected registration from having already evicted somebody.
+// Set is every live contact for one address of record. A value type whose methods return new sets
+// rather than mutating, so the registrar can compute the result of a REGISTER, decide whether to
+// accept it, and only then write — a rejected registration must not have already evicted somebody.
 type Set struct {
 	contacts []Contact
 }
@@ -131,14 +98,13 @@ func (s Set) Len() int { return len(s.contacts) }
 
 // Contacts returns the set in preference order.
 func (s Set) Contacts() []Contact {
-	ordered := append([]Contact(nil), s.contacts...)
+	ordered := slices.Clone(s.contacts)
 	sortByPreference(ordered)
 	return ordered
 }
 
-// Primary returns the contact an INVITE goes to when only one may be tried, and whether there is
-// one. It is the highest-q, most-recently-registered contact — the same head of the list Contacts
-// returns, named separately because that is what the flat KV fields carry.
+// Primary returns the contact an INVITE goes to when only one may be tried: the head of Contacts,
+// named separately because that is what the flat KV fields carry.
 func (s Set) Primary() (Contact, bool) {
 	ordered := s.Contacts()
 	if len(ordered) == 0 {
@@ -147,17 +113,9 @@ func (s Set) Primary() (Contact, bool) {
 	return ordered[0], true
 }
 
-// Groups partitions the set into equal-preference groups, in decreasing q order.
-//
-// # Why groups and not a flat list
-//
-// RFC 3261 §16.6 is specific: contacts of EQUAL q may be tried in parallel, and contacts of
-// different q must be tried in sequence. A flat list loses that distinction, and the engine's
-// forking would either ring a `q=0.2` backup phone at the same time as the `q=1.0` desk phone — so
-// the backup rings on every call, which is the whole thing q exists to prevent — or ring them one
-// at a time and take four times as long to reach a user with four devices.
-//
-// So the engine receives groups: fork within a group, fall through between them.
+// Groups partitions the set into equal-preference groups, in decreasing q order. RFC 3261 §16.6:
+// contacts of equal q may be tried in parallel, contacts of different q must be tried in sequence.
+// The engine forks within a group and falls through between them.
 func (s Set) Groups() [][]Contact {
 	ordered := s.Contacts()
 	groups := make([][]Contact, 0, len(ordered))
@@ -185,33 +143,22 @@ type Outcome struct {
 
 // Bind adds or refreshes one contact, enforcing a maximum.
 //
-// # The eviction rule, and why it is not "refuse the newcomer"
+// RFC 3261 §10.3 step 8 permits either refusing the newcomer or evicting; this evicts the LEAST
+// PREFERRED, ties broken by the oldest registration. Refusing would let a phone unplugged three
+// weeks ago hold a slot against one somebody just plugged in; evicting is visible and
+// self-correcting, since the evicted device's next refresh puts it back.
 //
-// A cap can be enforced two ways when a new device registers into a full AOR: refuse the new one,
-// or evict the oldest. RFC 3261 §10.3 step 8 permits either. This implementation evicts the
-// LEAST PREFERRED, breaking ties by the OLDEST registration, and the reason is what each failure
-// mode looks like to a person:
-//
-//   - Refusing the newcomer means the phone somebody just plugged in does not work, with no
-//     indication of why, while a phone that was unplugged three weeks ago and is still inside its
-//     registration interval holds the slot. That is the failure an administrator gets a ticket for.
-//   - Evicting the least preferred means a device stops receiving calls and its next refresh —
-//     which is at most one registration interval away — puts it back, evicting somebody else. That
-//     is visible, self-correcting, and it is what a cap set too low actually looks like.
-//
-// A REFRESH of a contact that is already bound never evicts anything, whatever the cap: the device
-// already has its slot, and refusing a refresh would drop a working phone because the cap was
-// lowered.
+// A refresh of an already-bound contact never evicts anything, whatever the cap: refusing one would
+// drop a working phone because the cap was lowered.
 func (s Set) Bind(contact Contact, max int, now time.Time) Outcome {
 	live := NewSet(s.contacts, now)
 	key := contact.Key()
 
 	for index, existing := range live.contacts {
 		if existing.Key() == key {
-			// A refresh extends a binding, it does not create one. Keeping the original instant is
-			// what makes any "registered for" figure mean anything.
+			// A refresh extends a binding rather than creating one, so the original instant stands.
 			contact.RegisteredAt = existing.RegisteredAt
-			updated := append([]Contact(nil), live.contacts...)
+			updated := slices.Clone(live.contacts)
 			updated[index] = contact
 			return Outcome{Set: Set{contacts: updated}, Replaced: true}
 		}
@@ -221,9 +168,8 @@ func (s Set) Bind(contact Contact, max int, now time.Time) Outcome {
 		ordered := live.Contacts()
 		victim := ordered[len(ordered)-1]
 		if qOf(victim) > qOf(contact) {
-			// Every existing contact outranks the newcomer. Evicting one would take a slot from a
-			// device the tenant explicitly preferred and give it to one that explicitly asked to be
-			// last, which inverts the whole point of a q-value.
+			// Every existing contact outranks the newcomer; evicting one would give a preferred
+			// device's slot to one that explicitly asked to be last.
 			return Outcome{Set: live, Refused: true}
 		}
 		remaining := make([]Contact, 0, len(live.contacts))
@@ -238,7 +184,7 @@ func (s Set) Bind(contact Contact, max int, now time.Time) Outcome {
 			Evicted: &evicted,
 		}
 	}
-	return Outcome{Set: Set{contacts: append(append([]Contact(nil), live.contacts...), contact)}}
+	return Outcome{Set: Set{contacts: append(slices.Clone(live.contacts), contact)}}
 }
 
 // Unbind removes one contact by key and reports whether it was there.
@@ -275,24 +221,20 @@ func (s Set) Expire(now time.Time) (Set, []Contact) {
 	return Set{contacts: live}, lapsed
 }
 
-// sortByPreference orders contacts the way RFC 3261 §16.6 requires, with two documented tie-breaks.
+// sortByPreference orders contacts the way RFC 3261 §16.6 requires, with two tie-breaks:
 //
-//  1. Decreasing q. The RFC's rule and the only one it states.
-//  2. Most recently registered first. A device that just registered is the one a user just picked
-//     up; a device that registered an hour ago is more likely to be the one on the desk they left.
-//  3. The contact URI, lexicographically, so the order is DETERMINISTIC. Without a final tie-break
-//     two contacts registered in the same millisecond would swap places between reads, and a test
-//     asserting the fork order would be flaky for reasons nobody would find.
+//  1. Decreasing q — the RFC's rule and the only one it states.
+//  2. Most recently registered first: that is the device a user just picked up.
+//  3. The contact URI, so the order is deterministic when two registered in the same millisecond.
 func sortByPreference(contacts []Contact) {
-	sort.SliceStable(contacts, func(i, j int) bool {
-		left, right := contacts[i], contacts[j]
-		if qOf(left) != qOf(right) {
-			return qOf(left) > qOf(right)
+	slices.SortStableFunc(contacts, func(left, right Contact) int {
+		if order := cmp.Compare(qOf(right), qOf(left)); order != 0 {
+			return order
 		}
 		if !left.RegisteredAt.Equal(right.RegisteredAt) {
-			return left.RegisteredAt.After(right.RegisteredAt)
+			return right.RegisteredAt.Compare(left.RegisteredAt)
 		}
-		return left.URI < right.URI
+		return cmp.Compare(left.URI, right.URI)
 	})
 }
 
@@ -303,12 +245,9 @@ func qOf(contact Contact) float64 {
 	return contact.Q
 }
 
-// ParseQ reads the `q` parameter off a Contact header.
-//
-// RFC 3261 §20.10 restricts it to 0 through 1 with at most three decimal places. A value outside
-// that range is treated as ABSENT rather than clamped: a device that sent `q=5` is a device whose
-// parameter we do not understand, and clamping it to 1 would silently promote it above every
-// correctly-behaved contact.
+// ParseQ reads the `q` parameter off a Contact header. RFC 3261 §20.10 restricts it to 0 through 1;
+// a value outside that range is treated as ABSENT rather than clamped, because clamping `q=5` to 1
+// would silently promote it above every correctly-behaved contact.
 func ParseQ(header *sip.ContactHeader) float64 {
 	if header == nil || header.Params == nil {
 		return DefaultQ
@@ -322,9 +261,9 @@ func ParseQ(header *sip.ContactHeader) float64 {
 		return DefaultQ
 	}
 	if value == 0 {
-		// `q=0` is legal and means "never use this unless there is nothing else". Zero would be
-		// indistinguishable from "absent" in the struct, so it is stored as the smallest value the
-		// three-decimal grammar allows and ordered accordingly.
+		// `q=0` is legal and means "never use this unless there is nothing else", but zero is
+		// indistinguishable from absent in the struct, so it becomes the smallest value the
+		// three-decimal grammar allows.
 		return 0.001
 	}
 	return value
@@ -361,19 +300,12 @@ func ParseInstance(header *sip.ContactHeader) string {
 	return strings.Trim(strings.Trim(strings.TrimSpace(raw), `"`), "<>")
 }
 
-// FromBinding lifts a stored binding into a set.
+// FromBinding lifts a stored binding into a set, and is the single place that asks whether a binding
+// carries the `contacts` array or only the older flat contact.
 //
-// # Two shapes, one reader
-//
-// A binding written before `contacts` existed carries one flat contact and no array; one written
-// since carries both. This function is the single place that asks which, so no caller has to — the
-// same job `contactsOf` does on the TypeScript side, and for the same reason: "does this binding
-// have a contacts array" asked at four call sites is four chances to answer it differently.
-//
-// The ARRAY wins when it is present, and the flat fields are not merged in on top of it. They are
-// a COPY of the array's head by construction (see ApplyToBinding), so merging them would either
-// change nothing or, on a binding some other writer had corrupted, silently duplicate the primary
-// contact into the fork set — and a duplicated contact is a phone that rings twice.
+// The array wins when present and the flat fields are not merged on top: they are a copy of the
+// array's head by construction (see ApplyToBinding), so merging could only duplicate the primary
+// contact into the fork set, and a duplicated contact is a phone that rings twice.
 func FromBinding(binding kv.Binding) Set {
 	if len(binding.Contacts) > 0 {
 		contacts := make([]Contact, 0, len(binding.Contacts))
@@ -420,20 +352,12 @@ func FromBinding(binding kv.Binding) Set {
 }
 
 // ApplyToBinding writes a set back onto a binding: the whole set into `contacts`, and the flat
-// fields pointed at the primary.
+// fields pointed at the primary. One function rather than two, so the two halves cannot drift — an
+// older reader sees the same flat `contact`/`transport`/`sourceAddress` describing the preferred
+// device.
 //
-// That is the whole backward-compatibility contract in one function, and the reason it is ONE
-// function rather than two. An existing reader — the engine's location lookup, an admin UI's device
-// list — sees the same `contact`, `transport` and `sourceAddress` it always saw, now describing the
-// preferred device rather than the only one; a reader that knows about the set reads the set; and
-// the two cannot drift, because there is no code path that writes one without writing the other.
-//
-// The order written is PREFERENCE order, so `contacts[0]` is the primary and the flat fields are a
-// copy of it. A reader that wants the fork order gets it without sorting, which matters because the
-// engine's `dialSimultaneous` forks in the order it is handed and RFC 3261 §16.6's ordering is not
-// something two processes should each re-derive.
-//
-// The output is capped at the same limit as the TypeScript registration contract.
+// The order written is PREFERENCE order, so `contacts[0]` is the primary and a reader gets the fork
+// order without re-deriving RFC 3261 §16.6. The output is capped at MaxStoredContacts.
 func ApplyToBinding(binding kv.Binding, set Set) kv.Binding {
 	ordered := set.Contacts()
 	if len(ordered) == 0 {
@@ -449,9 +373,8 @@ func ApplyToBinding(binding kv.Binding, set Set) kv.Binding {
 	for _, contact := range ordered {
 		transport := contract.SIPTransport(contact.Transport)
 		if transport == "" {
-			// The element schema requires a transport and closes the vocabulary. A contact recorded
-			// without one is a bug upstream; inheriting the binding's is the honest repair, because
-			// every contact on one AOR that this registrar wrote arrived over some transport it knew.
+			// The element schema requires a transport and closes the vocabulary, so a contact recorded
+			// without one inherits the binding's.
 			transport = binding.Transport
 		}
 		stored = append(stored, kv.Contact{

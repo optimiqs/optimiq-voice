@@ -14,50 +14,25 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// NATSStore resolves credentials over NATS request-reply against apps/api.
+// NATSStore resolves credentials over NATS core request-reply against apps/api on
+// `rpc.sip.v1.credential` (packages/events `src/schemas/rpc.ts`, generated into packages/events-go
+// as SipCredentialRequest / SipCredentialResponse). Core, never JetStream: it is a synchronous
+// question inside a REGISTER transaction whose answer is worthless a second later. It is the only
+// rpc.* subject whose request carries no orgId — resolving the tenant is the entire question.
 //
-// # The contract
+// The reply is an HA1, not a password: deriving edge-side would put the provisioning root key —
+// which derives EVERY tenant's password — on the most internet-exposed process in the system.
+// apps/api derives and ships MD5(username:realm:password), which is what RFC 2617 consumes.
 //
-// `rpc.sip.v1.credential`, defined in packages/events (`src/schemas/rpc.ts`) and generated into
-// packages/events-go as SipCredentialRequest / SipCredentialResponse. NATS core request-reply,
-// never JetStream: this is a synchronous question inside a REGISTER transaction, and a persisted
-// stream would be storage for a message whose answer is worthless a second later.
+// Both cache halves have short TTLs, so an account disabled minutes ago cannot still register. The
+// negative half is what protects the API: a username scan generates a miss per guess, and each
+// uncached miss is a database query. The cache is bounded because an unbounded negative cache keyed
+// on an attacker-chosen username is a memory amplifier.
 //
-// This is the ONLY rpc.* subject whose request carries no orgId. Every other one is called by a
-// process that already knows its tenant; here, resolving the tenant is the entire question. sipd
-// holds no database handle and must not grow one — extension rows are pbx-db, which apps/api owns
-// — so all it can send is what the phone put on the wire.
-//
-// # Why the reply is an HA1 and not a password
-//
-// The password a provisioned phone holds is derived: hmac-sha256(rootKey, "<orgId>:<secretRef>").
-// sipd could run that derivation itself — derive.go is a byte-exact port and proves it — but that
-// would require the root key on the SIP edge. The edge is the process most exposed to the
-// internet, and the root key derives EVERY tenant's password, so its compromise would be a total
-// credential compromise rather than the loss of whatever is registered here. The API derives, and
-// ships MD5(username:realm:password), which is what RFC 2617 verification actually consumes.
-//
-// # Caching, and why the negative half matters more than the positive half
-//
-// Every device re-REGISTERs on its expiry interval — 300 s by default, and a thousand phones is
-// then a steady three requests a second that all have the same answer. That is the positive
-// cache's job.
-//
-// The negative cache is the one that protects the API. A scanner walking usernames against an open
-// SIP port generates a miss per attempt, and without a negative cache each miss is a database
-// query. Both TTLs are short (seconds), because the alternative to staleness here is an account
-// that was disabled minutes ago still registering.
-//
-// The cache is bounded. An unbounded negative cache keyed on an attacker-chosen username is a
-// memory amplifier: the scanner above would otherwise cost the registrar one map entry per guess.
-//
-// # Fail-closed
-//
-// A timeout, a transport error, a malformed reply, a reply whose realm or username does not match
-// what was asked, or a reply that claims `found` without a usable HA1 — all return an error, and
-// the registrar turns any error into 403. There is deliberately no "allow on failure" mode and no
-// stale-while-revalidate: a registrar that authenticates when it cannot check is worse than one
-// that is briefly unavailable. Failures are NOT cached, so recovery is immediate.
+// Fail-closed: a timeout, transport error, malformed reply, a reply whose realm or username does
+// not match what was asked, or a `found` reply with no usable HA1 all return an error, and the
+// registrar turns any error into 403. There is no allow-on-failure and no stale-while-revalidate.
+// Failures are NOT cached, so recovery is immediate.
 type NATSStore struct {
 	conn    *nats.Conn
 	subject string
@@ -69,17 +44,16 @@ type NATSStore struct {
 
 	// now is swapped in tests so TTL behaviour is asserted without sleeping.
 	now func() time.Time
-	// rpc is the credential request. It is a field only so a test can assert the caching and
-	// collapsing behaviour without a broker; nothing but NewNATSStore ever sets it.
+	// rpc is the credential request, a field only so tests can assert caching and collapsing
+	// without a broker. Nothing but NewNATSStore sets it.
 	rpc func(ctx context.Context, realm, username string) (Credential, error)
 
 	mu    sync.Mutex
 	cache map[string]cacheEntry
 	// lastEvict is when the full expiry sweep last ran. See evictLocked.
 	lastEvict time.Time
-	// inflight collapses concurrent lookups for one account into one RPC. The cache collapses the
-	// STEADY rate; without this, a fleet restart or a TTL boundary sends one request per concurrent
-	// REGISTER at a control plane that is already the slowest link in the path.
+	// inflight collapses concurrent lookups for one account into one RPC. The cache handles the
+	// steady rate; this handles a fleet restart or a TTL boundary.
 	inflight singleflight.Group
 }
 
@@ -114,12 +88,11 @@ const (
 )
 
 // ErrLookupFailed wraps every transport-level failure so a caller can distinguish "the answer is
-// no" (ErrNotFound / ErrDisabled) from "there was no answer". The registrar refuses either way;
-// the distinction is what the logs and any future health signal need.
+// no" (ErrNotFound / ErrDisabled) from "there was no answer". The registrar refuses either way.
 var ErrLookupFailed = errors.New("credentials: credential lookup failed")
 
-// NewNATSStore builds the store. A nil connection is a programming error rather than a runtime
-// state, so it is refused here instead of on the first REGISTER.
+// NewNATSStore builds the store. A nil connection is refused here rather than on the first
+// REGISTER.
 func NewNATSStore(conn *nats.Conn, opts NATSOptions) (*NATSStore, error) {
 	if conn == nil {
 		return nil, errors.New("credentials: a NATS connection is required for the credential RPC")
@@ -165,14 +138,11 @@ func (s *NATSStore) Lookup(ctx context.Context, realm, username string) (Credent
 		return entry.credential, entry.err
 	}
 
-	// One RPC per account per burst. The waiters share the leader's answer, INCLUDING its refusal:
-	// a leader whose own context expired reports that to everybody, which is the same thing each of
-	// them would have discovered a moment later and is not cached either way.
+	// One RPC per account per burst; waiters share the leader's answer, including its refusal.
 	//
 	// The cache is written INSIDE the flight, before the group entry is released. Writing it after
-	// Do returned would leave a window in which the leader has finished, the key is free again and
-	// the cache is still empty — so a caller arriving in it becomes a second leader and issues the
-	// duplicate request this exists to remove.
+	// Do returned would leave a window where the leader has finished, the key is free and the cache
+	// is still empty, so an arriving caller becomes a second leader.
 	result, err, _ := s.inflight.Do(key, func() (any, error) {
 		// The leader re-reads the cache: a caller that queued behind a request which has since
 		// landed must not send a second one.
@@ -184,11 +154,9 @@ func (s *NATSStore) Lookup(ctx context.Context, realm, username string) (Credent
 		case err == nil:
 			s.store(key, cacheEntry{credential: credential, expires: s.now().Add(s.positiveTTL)})
 		case errors.Is(err, ErrNotFound), errors.Is(err, ErrDisabled):
-			// A definite "no" is cacheable; that is the whole point of the negative half.
 			s.store(key, cacheEntry{err: err, expires: s.now().Add(s.negativeTTL)})
 		default:
-			// Transport failures are never cached: caching them would extend an outage past its
-			// cause.
+			// Transport failures are never cached: that would extend an outage past its cause.
 		}
 		return credential, err
 	})
@@ -228,11 +196,9 @@ func (s *NATSStore) request(ctx context.Context, realm, username string) (Creden
 
 // credentialFromReply turns a well-formed reply into a Credential, or into the refusal it encodes.
 //
-// It re-checks the realm and username the responder echoed. Not because the responder is expected
-// to lie, but because HA1 is computed over exactly those two strings plus the password: an answer
-// for a different account would verify against a digest response the phone never computed, and the
-// symptom would be an authentication failure nobody could explain. Comparing here makes a
-// responder bug a loud refusal instead.
+// It re-checks the realm and username the responder echoed, because HA1 is computed over exactly
+// those two strings plus the password: an answer for a different account would verify against a
+// digest the phone never computed. Comparing here makes a responder bug a loud refusal.
 func credentialFromReply(realm, username string, reply contract.SipCredentialResponse) (Credential, error) {
 	if !reply.Found {
 		return Credential{}, ErrNotFound
@@ -309,16 +275,11 @@ func (s *NATSStore) store(key string, entry cacheEntry) {
 
 // evictLocked frees a slot, sweeping expired entries at most once per negative TTL.
 //
-// Not an LRU. An LRU's bookkeeping would be a second data structure protected by the same mutex on
-// the REGISTER path, and the cache is a load shedder rather than a correctness mechanism — an
-// eviction costs one extra request, which is exactly what the entry would have cost anyway once
-// its short TTL ran out. What matters is only that the map cannot grow without bound.
-//
-// The sweep is RATE LIMITED, and that is the load-bearing part. A full cache is exactly what the
-// negative half is designed to produce under a username scan, and sweeping on every miss would turn
-// each of a scanner's guesses into a walk of all ten thousand entries while holding the mutex that
-// serialises every REGISTER and every INVITE digest lookup in the process — the scanner setting the
-// pace. Between sweeps a single arbitrary entry goes, which is O(1) and costs one extra request.
+// Deliberately not an LRU: the cache is a load shedder, not a correctness mechanism, so all that
+// matters is that the map cannot grow without bound. The sweep is rate limited because a full cache
+// is what a username scan produces, and sweeping on every miss would walk all entries under the
+// mutex that serialises every REGISTER, at a pace the scanner sets. Between sweeps a single
+// arbitrary entry goes, which is O(1).
 func (s *NATSStore) evictLocked() {
 	now := s.now()
 	if now.Sub(s.lastEvict) >= s.negativeTTL {
@@ -338,18 +299,15 @@ func (s *NATSStore) evictLocked() {
 	}
 }
 
-// Len reports how many entries the cache holds. Tests and diagnostics only.
+// Len reports how many entries the cache holds.
 func (s *NATSStore) Len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.cache)
 }
 
-// Forget drops a cached answer, so a provisioning change can take effect before its TTL.
-//
-// Nothing calls it yet. The invalidation signal is a JetStream consumer on the provisioning
-// stream, which belongs with the provisioning wave rather than here; this is the seam it will
-// attach to, and it exists now so that wave does not have to reach into the cache internals.
+// Forget drops a cached answer, so a provisioning change can take effect before its TTL. It is the
+// seam a future JetStream invalidation consumer attaches to without reaching into cache internals.
 func (s *NATSStore) Forget(realm, username string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -10,11 +10,8 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/transfer"
 )
 
-// REFER parsing, driven from wire text rather than from hand-built structs.
-//
-// The point is that these are the bytes a Yealink, a Polycom or a Linphone actually puts on the
-// socket — including the ones that spell things differently — so a parser that only works against
-// the shapes this repository invented is caught here rather than in a support ticket.
+// REFER parsing, driven from wire text rather than hand-built structs: these are the bytes real
+// handsets put on the socket, spelling differences included.
 
 func parseRefer(t *testing.T, lines ...string) (transfer.Refer, error) {
 	t.Helper()
@@ -141,8 +138,8 @@ func TestParseReferAttended(t *testing.T) {
 }
 
 func TestParseReferAttendedIsFoundWhateverTheCase(t *testing.T) {
-	// Handsets are not consistent about this, and a missed Replaces silently downgrades an attended
-	// transfer to a blind one — which drops the consultation leg the user is talking to.
+	// Handsets are inconsistent here, and a missed Replaces silently downgrades an attended transfer
+	// to a blind one, dropping the consultation leg.
 	refer, err := parseRefer(t,
 		"Refer-To: <sip:1002@acme.example.com?replaces=aa11%3Bto-tag%3Db2%3Bfrom-tag%3Dc3%3Bearly-only>")
 	if err != nil {
@@ -197,9 +194,9 @@ func TestParseReferRejections(t *testing.T) {
 }
 
 func TestParseReferRejectsAnUnparsableTarget(t *testing.T) {
-	// sipgo's message parser rejects most malformed Refer-To values before a handler ever sees them,
-	// so this one is injected as a generic header. The branch still has to exist: the parser's
-	// tolerance is not a contract, and a value it starts accepting must not reach the engine unread.
+	// sipgo rejects most malformed Refer-To values before a handler sees them, so this one is
+	// injected as a generic header. The branch must still exist: the parser's tolerance is not a
+	// contract.
 	req := buildRefer(t)
 	req.AppendHeader(sip.NewHeader("Refer-To", "not an address at all"))
 

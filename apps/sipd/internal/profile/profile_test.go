@@ -18,8 +18,8 @@ func mustEntry(t *testing.T, cidr string, action Action, priority int, trunkID s
 	return entry
 }
 
-// Most specific first, then priority, then deny wins — because when a configuration is ambiguous
-// the safe reading of an anti-toll-fraud boundary is the closed one.
+// Most specific first, then priority, then deny wins: the closed reading of an ambiguous
+// configuration.
 func TestACLMatch(t *testing.T) {
 	acl := NewACL([]Entry{
 		mustEntry(t, "203.0.113.0/24", ActionAllow, 0, "trunk-telnyx"),
@@ -101,8 +101,6 @@ func TestParseEntry(t *testing.T) {
 	})
 }
 
-// Every refusal below has been a real breach or a real outage somewhere, which is why each is a
-// boot failure rather than a warning.
 func TestProfileValidateRefusesTheDangerousCombinations(t *testing.T) {
 	acl := NewACL([]Entry{mustEntry(t, "203.0.113.0/24", ActionAllow, 0, "t")})
 
@@ -198,8 +196,6 @@ func TestTheStandardProfilesValidate(t *testing.T) {
 	}
 }
 
-// One socket cannot have two policies, and "add the carrier to the existing port" is exactly the
-// mistake that produces it.
 func TestNewSetRefusesTwoProfilesOnOneListener(t *testing.T) {
 	acl := NewACL([]Entry{mustEntry(t, "203.0.113.0/24", ActionAllow, 0, "t")})
 	internal := Internal("internal", Listener{Network: "udp", Addr: "0.0.0.0:5060"})
@@ -228,8 +224,7 @@ func request(t *testing.T, transport, source, destination string) *sip.Request {
 	return req
 }
 
-// The selection order, and its most important property: the local address wins, because it is the
-// only selector a sender cannot influence.
+// The local address wins, because it is the only selector a sender cannot influence.
 func TestSetFor(t *testing.T) {
 	acl := NewACL([]Entry{mustEntry(t, "203.0.113.0/24", ActionAllow, 0, "trunk-telnyx")})
 	internal := Internal("internal",
@@ -332,10 +327,8 @@ func TestListenerClassification(t *testing.T) {
 	}
 }
 
-// The DEFAULT configuration: SIPD_EXTERNAL_LISTEN_ADDR is empty, so the external profile has no
-// listener of its own, shares the main socket and is selected by source address alone. Before this
-// was handled the transport step saw exactly one transport-serving profile — the internal one — and
-// every carrier INVITE was answered 401 with a digest challenge no carrier can answer.
+// The default configuration: SIPD_EXTERNAL_LISTEN_ADDR is empty, so the external profile has no
+// listener of its own, shares the main socket and is selected by source address alone.
 func TestSetForSelectsAListenerlessExternalProfileBySource(t *testing.T) {
 	acl := NewACL([]Entry{mustEntry(t, "203.0.113.0/24", ActionAllow, 0, "trunk-telnyx")})
 	internal := Internal("internal", Listener{Network: "udp", Addr: "0.0.0.0:5060"})
@@ -361,8 +354,7 @@ func TestSetForSelectsAListenerlessExternalProfileBySource(t *testing.T) {
 		t.Fatalf("For = %q / %v, want the internal profile", got.Name, err)
 	}
 
-	// And a stranger the ACL does not claim still falls to the internal profile, where it is
-	// challenged rather than refused.
+	// A stranger the ACL does not claim falls to the internal profile, where it is challenged.
 	got, err = set.For(request(t, "UDP", "8.8.8.8:5060", ""))
 	if err != nil || got.Name != "internal" {
 		t.Fatalf("For = %q / %v, want the internal profile", got.Name, err)

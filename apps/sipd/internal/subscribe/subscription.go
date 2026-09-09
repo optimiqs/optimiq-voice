@@ -1,7 +1,9 @@
 package subscribe
 
 import (
-	"sort"
+	"cmp"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,34 +15,10 @@ import (
 
 // Package-level vocabulary and the in-memory subscription table.
 //
-// # Why the table is instance-local, and not a KV directory
-//
-// Every other piece of live state on this platform is in a NATS KV bucket, so the absence of one
-// here is a decision rather than an omission. Three reasons, in order of weight:
-//
-//  1. A subscription is not a fact about a tenant, it is HALF OF A SIP DIALOG. Sending a valid
-//     in-dialog NOTIFY needs the Call-ID, both tags, the local CSeq counter, the dialog-info version
-//     counter, and the observed source address the phone is actually reachable at behind its NAT.
-//     Replicating all of that would let another instance compose a NOTIFY — and it still could not
-//     SEND one, because the phone's NAT pinhole was opened toward the socket the SUBSCRIBE arrived
-//     on and no other instance is behind it. A directory of subscriptions nobody else can serve is a
-//     directory that only tells you what you have lost.
-//
-//  2. The failure it would mitigate is bounded by a knob we already have. If an instance dies, its
-//     subscribers' lamps freeze until they re-subscribe. RFC 6665 §4.2.1 lets the notifier GRANT a
-//     shorter interval than the phone asked for, so the grant is clamped (default 600 seconds), and
-//     the worst case is ten minutes of stale lamp at a cost of one SUBSCRIBE per phone per ten
-//     minutes. A graceful shutdown does better still: every subscription is terminated with
-//     `reason=deactivated`, which RFC 6665 §4.1.2.4 defines as "re-subscribe immediately", so a
-//     rolling deploy moves the fleet rather than stalling it.
-//
-//  3. It costs a bucket, a permission set and a reconciliation loop to hold state whose natural
-//     lifetime is one process. The registrations bucket earns its keep because a binding is read by
-//     something that is not sipd; nothing outside this process has any use for the fact that phone X
-//     is watching extension Y.
-//
-// What WOULD change this: shared line appearance, where a seizure has to be arbitrated across
-// instances, and a park-slot BLF whose resource is not an extension. Both are named as deferred.
+// The table is deliberately instance-local rather than a KV directory: a subscription is half of a
+// SIP dialog, and only the instance whose socket the SUBSCRIBE arrived on can reach the phone
+// through its NAT pinhole. Staleness is bounded by the granted interval (RFC 6665 §4.2.1 lets the
+// notifier clamp it) and by terminating every subscription `reason=deactivated` on shutdown.
 
 // EventPackage is a SIP event package this edge serves (RFC 6665 §4.4).
 type EventPackage string
@@ -55,8 +33,7 @@ const (
 // AllowEvents is the `Allow-Events` header value: every package this edge serves.
 //
 // `refer` is on it because internal/transfer answers REFER, whose implicit subscription is an event
-// package too (RFC 3515 §2.1). Advertising the honest list is what lets a phone decide it can use a
-// BLF key at all — several vendors probe it before subscribing rather than trying and handling 489.
+// package too (RFC 3515 §2.1). Several handsets probe this header before subscribing at all.
 const AllowEvents = "dialog, message-summary, refer"
 
 var supportedEvents = map[EventPackage]struct{}{
@@ -80,9 +57,8 @@ func contentTypeFor(event EventPackage) string {
 
 // Subscription is one accepted subscription and the dialog state needed to notify it.
 //
-// It is NOT a full RFC 3261 dialog: there is no route set, and nothing here survives a restart. It
-// is the minimum that puts a NOTIFY on the wire which the phone will accept as belonging to the
-// subscription it created — the same shape, and the same reasoning, as transfer.Dialog.
+// It is not a full RFC 3261 dialog: there is no route set, and nothing here survives a restart. It
+// is the minimum a phone will accept as belonging to the subscription it created.
 type Subscription struct {
 	// Event is the package. Resource is what is being watched: an extension number for `dialog`, the
 	// subscriber's own SIP user for `message-summary`.
@@ -172,11 +148,10 @@ type resourceKey struct {
 }
 
 // Table holds this instance's subscriptions, indexed both ways: by dialog for refresh and
-// termination, and by watched resource for the fan-out.
+// termination, and by watched resource for the fan-out, which runs on every presence change in the
+// deployment and must not degrade to a linear scan.
 //
-// Two indexes rather than one map plus a scan, because the fan-out runs on every presence change in
-// the whole deployment and a linear scan there is the difference between a lamp that keeps up and
-// one that lags behind a busy queue.
+// Safe for concurrent use.
 type Table struct {
 	mu        sync.RWMutex
 	byDialog  map[string]*Subscription
@@ -276,7 +251,7 @@ func (t *Table) TakeExpired(now time.Time) []*Subscription {
 			t.removeLocked(key, subscription)
 		}
 	}
-	sort.Slice(lapsed, func(i, j int) bool { return lapsed[i].Key() < lapsed[j].Key() })
+	slices.SortFunc(lapsed, func(a, b *Subscription) int { return cmp.Compare(a.Key(), b.Key()) })
 	return lapsed
 }
 
@@ -299,11 +274,7 @@ func (t *Table) Len() int {
 }
 
 func sorted(subscriptions map[string]*Subscription) []*Subscription {
-	keys := make([]string, 0, len(subscriptions))
-	for key := range subscriptions {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(subscriptions))
 	ordered := make([]*Subscription, 0, len(keys))
 	for _, key := range keys {
 		ordered = append(ordered, subscriptions[key])
@@ -317,9 +288,8 @@ type SubscriptionState struct {
 	State string
 	// Expires is the remaining lifetime in seconds. Only meaningful while active.
 	Expires int
-	// Reason accompanies `terminated`, and it is not decoration: RFC 6665 §4.1.2.4 makes it the
-	// instruction. `timeout` means "re-subscribe on your own schedule", `deactivated` means
-	// "re-subscribe NOW", `noresource` means "stop asking".
+	// Reason accompanies `terminated` and is an instruction (RFC 6665 §4.1.2.4): `timeout` means
+	// "re-subscribe on your own schedule", `deactivated` "re-subscribe now", `noresource` "stop".
 	Reason string
 }
 
@@ -340,8 +310,7 @@ var (
 	// schedule.
 	StateTerminatedTimeout = SubscriptionState{State: "terminated", Reason: "timeout"}
 	// StateTerminatedDeactivated is this instance going away. RFC 6665 §4.1.2.4: the subscriber
-	// SHOULD re-subscribe immediately, which is what turns a rolling deploy into a blip rather than
-	// an outage of every lamp in the fleet.
+	// SHOULD re-subscribe immediately, which turns a rolling deploy into a blip.
 	StateTerminatedDeactivated = SubscriptionState{State: "terminated", Reason: "deactivated"}
 	// StateTerminatedClient is the answer to an unsubscribe (`Expires: 0`). `noresource` rather than
 	// `timeout`, because the subscriber asked to stop and telling it to come back would produce a

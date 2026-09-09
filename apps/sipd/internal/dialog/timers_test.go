@@ -120,8 +120,8 @@ func TestNegotiateUAS(t *testing.T) {
 	}
 }
 
-// A far end that answers with no Session-Expires has DECLINED. Keeping our timer would tear down a
-// call the far end has every intention of continuing.
+// A far end answering with no Session-Expires has DECLINED, and keeping our timer would tear down a
+// call it intends to continue.
 func TestAcceptUACResponse(t *testing.T) {
 	policy := DefaultTimerPolicy()
 
@@ -162,8 +162,8 @@ func TestRetryAfter422IsBounded(t *testing.T) {
 	}
 }
 
-// The refresher refreshes at half the interval; the other side waits the whole interval before
-// acting. Acting early tears down a call whose refresh is on the wire.
+// The refresher acts at half the interval and the other side at the whole one; acting early tears
+// down a call whose refresh is still on the wire.
 func TestRefreshAndExpiryDeadlines(t *testing.T) {
 	local := SessionTimer{Interval: seconds(600), Refresher: RefresherLocal}
 	if local.RefreshAfter() != seconds(300) {
@@ -219,8 +219,8 @@ func TestSessionExpiresHeader(t *testing.T) {
 	}
 }
 
-// Header reading has to survive the two spellings phones actually send: the compact `x` form and
-// option tags split across several Supported headers.
+// The two spellings phones actually send: the compact `x` form, and option tags split across
+// several Supported headers.
 func TestReadTimerHeaders(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -300,8 +300,7 @@ func TestSessionTimerArmsOnTheAckAndStopsOnTeardown(t *testing.T) {
 	}
 }
 
-// RFC 4028 §10: an expiry sends a BYE with the timer named as the cause, so the far end's CDR
-// agrees with ours about why the call ended.
+// RFC 4028 §10: an expiry sends a BYE naming the timer as the cause, so both CDRs agree.
 func TestSessionExpiryTearsTheCallDownWithATimerCause(t *testing.T) {
 	d := newTestDialog(t, RoleUAS)
 	d.SetTimer(SessionTimer{Interval: seconds(600), Refresher: RefresherRemote})

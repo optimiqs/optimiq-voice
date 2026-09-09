@@ -22,11 +22,10 @@ import (
 
 // Binding-lifecycle tests, driven through the real SIP handler with real digest credentials.
 //
-// The requests are parsed from wire text and the responses are produced by sipgo's own transaction
-// recorder, so these exercise header parsing and response assembly rather than a Go-level mock of
-// them. The digest answer is computed by github.com/icholy/digest — the CLIENT side of the same
-// RFC — which means the server side here is checked against an independent implementation, not
-// against itself.
+// Requests are parsed from wire text and responses come from sipgo's own transaction recorder, so
+// header parsing and response assembly are exercised rather than mocked. The digest answer is
+// computed by github.com/icholy/digest — the client side of the same RFC — so the server side is
+// checked against an independent implementation.
 
 const (
 	testRealm = "acme.example.com"
@@ -100,7 +99,7 @@ func TestTwoOrganizationsRegisterTheSameExtensionOnOneEdge(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		binding, found, err := h.store.Get(t.Context(), account.OrgID, key)
+		binding, found, err := h.store.Get(h.t.Context(), account.OrgID, key)
 		if err != nil || !found || binding.OrgID != account.OrgID {
 			t.Fatalf("registration crossed organization boundaries: %+v, %v", binding, err)
 		}
@@ -155,7 +154,7 @@ func newHarness(t *testing.T, lookup credentials.Store) *harness {
 		Publisher:   h.publisher,
 		Logger:      slog.New(slog.DiscardHandler),
 		Source:      "sipd",
-		BaseContext: context.Background(),
+		BaseContext: t.Context(),
 		Now:         func() time.Time { return h.now },
 	})
 	if err != nil {
@@ -264,14 +263,12 @@ func contactHeader(uri string, params ...string) string {
 
 func (h *harness) binding() (kv.Binding, bool) {
 	h.t.Helper()
-	binding, found, err := h.store.Get(context.Background(), testOrg, h.aorHash)
+	binding, found, err := h.store.Get(h.t.Context(), testOrg, h.aorHash)
 	if err != nil {
 		h.t.Fatalf("reading the binding: %v", err)
 	}
 	return binding, found
 }
-
-// ---------------------------------------------------------------------------------------------
 
 func TestRegisterChallengesThenBinds(t *testing.T) {
 	h := newHarness(t, nil)
@@ -404,8 +401,8 @@ func TestStaleRegisterCannotOverwriteOrRemoveCurrentContact(t *testing.T) {
 	if res := h.send(req); res.StatusCode != 200 {
 		t.Fatalf("REGISTER = %d", res.StatusCode)
 	}
-	// A byte-identical replay never reaches the binding at all: the nonce count has been used, so
-	// the digest layer re-challenges. See the replay note in auth.go.
+	// A byte-identical replay never reaches the binding: the nonce count has been used, so the
+	// digest layer re-challenges. See the replay note in auth.go.
 	if res := h.send(req.Clone()); res.StatusCode != 401 {
 		t.Fatalf("replayed REGISTER = %d, want a fresh challenge", res.StatusCode)
 	}
@@ -455,7 +452,7 @@ func TestSweeperPreservesARefreshFromAnotherRegistrar(t *testing.T) {
 func TestConcurrentRegistrarsPreserveEachDevice(t *testing.T) {
 	h := newHarness(t, nil)
 	var workers sync.WaitGroup
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		other := newHarness(t, nil)
 		other.store = h.store
 		other = rebuild(t, other)
@@ -489,9 +486,8 @@ func TestExpiryRemovesOnlyLapsedContact(t *testing.T) {
 	}
 }
 
-// A credential that names a shared line appearance must carry that appearance onto the binding, so
-// the INVITE path can stamp a Call-Info appearance-index header on the call to this phone. Same
-// reply→Credential→Binding thread the deviceId travels, one field further along.
+// A credential naming a shared line appearance must carry it onto the binding, so the INVITE path
+// can stamp a Call-Info appearance-index header on the call to this phone.
 func TestSharedLineAppearanceFlowsFromCredentialToBinding(t *testing.T) {
 	sharedLine := "2000"
 	appearance := 2
@@ -683,7 +679,7 @@ func TestSweeperExpiresLapsedBindings(t *testing.T) {
 	// exact deadline — nothing may cost a KV round trip either.
 	h.now = h.now.Add(59 * time.Second)
 	updates := h.store.Updates()
-	if swept := h.registrar.Sweep(context.Background()); swept != 0 {
+	if swept := h.registrar.Sweep(t.Context()); swept != 0 {
 		t.Fatalf("swept %d bindings before the deadline", swept)
 	}
 	if spent := h.store.Updates() - updates; spent != 0 {
@@ -691,7 +687,7 @@ func TestSweeperExpiresLapsedBindings(t *testing.T) {
 	}
 
 	h.now = h.now.Add(2 * time.Second)
-	if swept := h.registrar.Sweep(context.Background()); swept != 1 {
+	if swept := h.registrar.Sweep(t.Context()); swept != 1 {
 		t.Fatalf("swept %d bindings after the deadline, want 1", swept)
 	}
 	if _, found := h.binding(); found {
@@ -713,7 +709,7 @@ func TestSweeperExpiresLapsedBindings(t *testing.T) {
 	}
 
 	// A second sweep must be a no-op: an `expired` event per tick would poison presence counting.
-	if swept := h.registrar.Sweep(context.Background()); swept != 0 {
+	if swept := h.registrar.Sweep(t.Context()); swept != 0 {
 		t.Errorf("a repeat sweep expired %d bindings", swept)
 	}
 }
@@ -729,7 +725,7 @@ func TestRehydrateAdoptsExistingBindings(t *testing.T) {
 	second.store = first.store
 	second = rebuild(t, second)
 
-	adopted, err := second.registrar.Rehydrate(context.Background())
+	adopted, err := second.registrar.Rehydrate(t.Context())
 	if err != nil {
 		t.Fatalf("Rehydrate: %v", err)
 	}
@@ -738,7 +734,7 @@ func TestRehydrateAdoptsExistingBindings(t *testing.T) {
 	}
 
 	second.now = second.now.Add(61 * time.Second)
-	if swept := second.registrar.Sweep(context.Background()); swept != 1 {
+	if swept := second.registrar.Sweep(t.Context()); swept != 1 {
 		t.Fatalf("the adopting instance swept %d bindings, want 1", swept)
 	}
 	if len(second.publisher.ExpiredEvents()) != 1 {
@@ -765,7 +761,7 @@ func rebuild(t *testing.T, h *harness) *harness {
 		Publisher:   h.publisher,
 		Logger:      slog.New(slog.DiscardHandler),
 		Source:      "sipd",
-		BaseContext: context.Background(),
+		BaseContext: t.Context(),
 		Now:         func() time.Time { return h.now },
 	})
 	if err != nil {
@@ -908,16 +904,13 @@ func TestOptionsAndUnsupportedMethods(t *testing.T) {
 	}, "\r\n"))
 	tx = siptest.NewServerTxRecorder(invite)
 	h.registrar.HandleUnsupported(invite, tx)
-	// Terminated BEFORE the recorder is read, and only on the INVITE transaction.
+	// Terminate BEFORE reading the recorder, and only on the INVITE transaction.
 	//
-	// A final response to an INVITE puts sipgo's server transaction into Completed, which arms
-	// RFC 3261 §17.2.1's Timer G and retransmits that response from a timer goroutine until the ACK
-	// or Timer H. `siptest.ServerTxRecorder` takes no lock, so that goroutine writes the same slice
-	// this test reads — a data race `go test -race` finds, in sipgo's recorder rather than in
-	// anything this package wrote, and one that survives the test function by half a second.
-	//
-	// Terminating first stops the FSM while the response we care about is already recorded. It is
-	// what a real transport does when the ACK arrives, so nothing about the assertion changes.
+	// A final response to an INVITE puts sipgo's server transaction into Completed, arming
+	// RFC 3261 §17.2.1's Timer G, which retransmits from a timer goroutine until the ACK or Timer H.
+	// siptest.ServerTxRecorder takes no lock, so that goroutine writes the slice this test reads.
+	// Terminating first stops the FSM with the response already recorded, which is what a real
+	// transport does when the ACK arrives.
 	tx.Terminate()
 	res = lastResponse(t, tx)
 	if res.StatusCode != 501 {
@@ -968,9 +961,9 @@ func TestNewRejectsInconsistentOptions(t *testing.T) {
 }
 
 // The attack the nonce count exists to stop: the digest covers the method, the request URI and the
-// nonce, and NOT the Contact. An observer who captures one REGISTER on an unencrypted transport
-// used to be able to resend the identical Authorization header in a REGISTER carrying their own
-// contact, and inbound calls for the victim would fork to them.
+// nonce, but NOT the Contact, so an observer who captures one REGISTER on an unencrypted transport
+// could otherwise resend its Authorization header in a REGISTER carrying their own contact and fork
+// the victim's inbound calls.
 func TestAReplayedAuthorizationCannotBindAnAttackersContact(t *testing.T) {
 	h := newHarness(t, nil)
 	victim := contactHeader("sip:1001@203.0.113.9:5060", "expires=300")

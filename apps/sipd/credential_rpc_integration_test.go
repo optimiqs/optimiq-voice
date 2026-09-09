@@ -31,25 +31,15 @@ import (
 //	    ↓
 //	sipd verifies the digest and writes a binding
 //
-// The password the client authenticates with is NOT computed by this test. It is read from
-// internal/credentials/testdata/derive_parity.json, which is emitted by the TypeScript
-// implementation in apps/api. So a Go-side regression cannot be hidden by a Go-side expectation:
-// the byte the phone would really have been given is the byte this test sends.
+// The password the client authenticates with is NOT computed here: it is read from
+// internal/credentials/testdata/derive_parity.json, emitted by the TypeScript implementation in
+// apps/api, so the byte the phone would really have been given is the byte this test sends.
 //
-// # What is faked, and what that costs
-//
-// The RESPONDER is in-process: a NATS subscriber that runs the Go derivation and answers the
-// contract shape. Booting apps/api instead would need PostgreSQL, a provisioned tenant, an
-// org_setting realm mapping and a device row — a fixture an order of magnitude larger than the
-// thing under test, and one that would make this suite fail for reasons that have nothing to do
-// with SIP.
-//
-// Stated plainly, therefore: this proves the WIRE and the DERIVATION — subject, JSON shape,
-// timeout, cache, digest verification, and that a TypeScript-derived password authenticates
-// against a Go-derived HA1. It does NOT prove apps/api's SQL resolves the right secretRef. That
-// half is covered by `pnpm --filter @optimiq-voice/api verify:provisioning` and by the service's
-// own unit tests, and the seam between them — that both sides speak the same contract types — is
-// held by codegen rather than by either test.
+// The responder is in-process (a NATS subscriber running the Go derivation), so this proves the
+// wire and the derivation — subject, JSON shape, timeout, cache, digest verification, and that a
+// TypeScript-derived password authenticates against a Go-derived HA1. It does NOT prove apps/api's
+// SQL resolves the right secretRef; that is covered by
+// `pnpm --filter @optimiq-voice/api verify:provisioning`.
 
 // credentialResponder answers rpc.sip.v1.credential in-process.
 type credentialResponder struct {
@@ -117,9 +107,8 @@ func startCredentialResponder(t *testing.T, conn *nats.Conn, rootKey string, acc
 }
 
 // parityVectorForTest mirrors one entry of internal/credentials/testdata/derive_parity.json.
-// Declared here rather than shared with the credentials package's own test because that one is an
-// in-package test file and exporting the type just to reach it would widen the package's API for
-// a test's convenience.
+// Redeclared rather than shared, because exporting the credentials package's in-package test type
+// would widen its API for a test's convenience.
 type parityVectorForTest struct {
 	Name           string `json:"name"`
 	RootKey        string `json:"rootKey"`
@@ -176,7 +165,7 @@ func theOrdinaryVector(t *testing.T) parityVectorForTest {
 func TestRegisterAuthenticatesAgainstACredentialDerivedByTheAPI(t *testing.T) {
 	requireIntegration(t)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	url := startNATS(t)
@@ -208,8 +197,8 @@ func TestRegisterAuthenticatesAgainstACredentialDerivedByTheAPI(t *testing.T) {
 	})
 
 	store, err := credentials.NewNATSStore(conn, credentials.NATSOptions{
-		// The contract's own deadline, unmodified: if 500 ms is not enough against a container on
-		// the same host, the number in the contract is wrong and this suite should say so.
+		// The contract's own deadline, unmodified: if it is not enough against a container on the
+		// same host, the number in the contract is wrong and this suite should say so.
 		Timeout: contract.TimeoutSipCredentialRPC,
 		// Short enough that the cache assertions below do not need a sleep, long enough that the
 		// second REGISTER of a pair is genuinely served from it.
@@ -222,8 +211,6 @@ func TestRegisterAuthenticatesAgainstACredentialDerivedByTheAPI(t *testing.T) {
 
 	edge := startEdgeWithStore(t, ctx, js, store)
 	client := dialSIP(t, edge.addr)
-
-	// --- the provisioned phone registers ------------------------------------------------------
 
 	challenge := client.register("", ";expires=30")
 	if challenge.StatusCode != 401 {
@@ -252,8 +239,6 @@ func TestRegisterAuthenticatesAgainstACredentialDerivedByTheAPI(t *testing.T) {
 			binding.OrgID, vector.OrganizationID)
 	}
 
-	// --- the second REGISTER is served from the cache -----------------------------------------
-
 	second := client.register(client.authenticateAs(client.register("", ";expires=30"), itUser, vector.Password), ";expires=30")
 	if second.StatusCode != 200 {
 		t.Fatalf("the re-REGISTER = %d %s, want 200", second.StatusCode, second.Reason)
@@ -263,16 +248,12 @@ func TestRegisterAuthenticatesAgainstACredentialDerivedByTheAPI(t *testing.T) {
 			"working, and a thousand phones would be a thousand round trips per expiry cycle", got)
 	}
 
-	// --- a wrong password is refused ----------------------------------------------------------
-
 	wrong := client.register(
 		client.authenticateAs(client.register("", ";expires=30"), itUser, "not-the-derived-password"),
 		";expires=30")
 	if wrong.StatusCode != 403 {
 		t.Fatalf("REGISTER with a wrong password = %d %s, want 403", wrong.StatusCode, wrong.Reason)
 	}
-
-	// --- an unknown account is refused indistinguishably --------------------------------------
 
 	// Same status, and the reason phrase must not differ either: a caller that can tell "no such
 	// user" from "wrong password" has an extension enumerator.
@@ -291,8 +272,6 @@ func TestRegisterAuthenticatesAgainstACredentialDerivedByTheAPI(t *testing.T) {
 			"an enumeration oracle", unknown.Reason, wrong.Reason)
 	}
 
-	// --- a disabled account is refused the same way -------------------------------------------
-
 	disabledClient := dialSIPAs(t, edge.addr, "1099")
 	disabledChallenge := disabledClient.register("", ";expires=30")
 	disabled := disabledClient.register(
@@ -310,7 +289,7 @@ func TestRegisterAuthenticatesAgainstACredentialDerivedByTheAPI(t *testing.T) {
 func TestRegisterFailsClosedWhenNobodyAnswersTheCredentialRPC(t *testing.T) {
 	requireIntegration(t)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	url := startNATS(t)

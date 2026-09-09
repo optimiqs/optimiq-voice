@@ -3,6 +3,7 @@ package invite_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,10 +21,9 @@ import (
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 )
 
-// The INVITE path, driven through the real handler with real digest credentials and sipgo's own
-// transaction recorder. The requests are parsed from wire text and the responses are produced by
-// sipgo, so these exercise header parsing and response assembly rather than a Go-level mock of
-// them — the same shape the registrar's tests already have.
+// The INVITE path, driven through the real handler with real digest credentials. Requests are
+// parsed from wire text and responses produced by sipgo, so these exercise header parsing and
+// response assembly rather than a Go-level mock of them.
 
 const (
 	testRealm = "acme.example.com"
@@ -31,9 +31,7 @@ const (
 	testUser  = "1001"
 	testPass  = "s3cret"
 	// Written with bare LF and converted to CRLF alongside the headers, so the Content-Length below
-	// counts what actually goes on the wire. A body written with CRLF and then converted would grow
-	// a second CR per line and be truncated by the parser — which is a bug this test would then be
-	// asserting rather than catching.
+	// counts what goes on the wire. Pre-written CRLF would grow a second CR per line.
 	testSDP = "v=0\no=- 1 1 IN IP4 192.168.1.42\ns=-\nc=IN IP4 192.168.1.42\n" +
 		"t=0 0\nm=audio 40000 RTP/AVP 0\n"
 )
@@ -65,7 +63,7 @@ func (s staticCredentials) Lookup(context.Context, string, string) (credentials.
 }
 
 // recordingRequester captures the requests this edge originates, so a BYE can be asserted without a
-// socket — and so the fake is forced to speak sip.Request rather than a summary of one.
+// socket and the fake speaks sip.Request rather than a summary of one.
 type recordingRequester struct {
 	sent []*sip.Request
 }
@@ -202,9 +200,8 @@ func (h *harness) invite(challenge *digest.Challenge, extra ...string) *sip.Requ
 			URI:      req.Recipient.String(),
 			Username: testUser,
 			Password: testPass,
-			// The nonce count must strictly increase for a nonce this harness reuses across
-			// requests, or the registrar's replay guard refuses the second one. cseq is already
-			// monotonic per request, so it doubles as the count.
+			// The nonce count must strictly increase for a nonce this harness reuses, or the
+			// registrar's replay guard refuses the second request. cseq is already monotonic.
 			Count:  h.cseq,
 			Cnonce: "0a4f113b",
 		})
@@ -225,16 +222,9 @@ func (h *harness) send(handle func(*sip.Request, sip.ServerTransaction), req *si
 
 // recordingTx is a sip.ServerTransaction that records what was written to it.
 //
-// # Why not sipgo's own siptest.ServerTxRecorder
-//
-// That recorder drives a real transaction FSM whose retransmission timer writes into an
-// unsynchronised slice, so reading its result while the timer is armed is a data race that
-// `go test -race` reports inside sipgo rather than inside anything this repository owns. It is a
-// pre-existing condition — the registrar's suite has it too — and it is not worth inheriting here.
-//
-// This fake records instead of retransmitting, which is also more honest about what these tests
-// assert: they are about which responses the HANDLER decided to write, not about the transaction
-// layer's timers, which sipgo already tests.
+// Not sipgo's siptest.ServerTxRecorder: that drives a real transaction FSM whose retransmission
+// timer writes into an unsynchronised slice, which `go test -race` reports inside sipgo. These tests
+// assert which responses the handler decided to write, not the transaction layer's timers.
 type recordingTx struct {
 	mu       sync.Mutex
 	written  []*sip.Response
@@ -260,15 +250,14 @@ func (tx *recordingTx) Respond(res *sip.Response) error {
 func (tx *recordingTx) responses() []*sip.Response {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
-	return append([]*sip.Response(nil), tx.written...)
+	return slices.Clone(tx.written)
 }
 
 // cancel fires the OnCancel hook the handler installed, which is how a test drives the CANCEL that
 // sipgo's transaction layer would otherwise deliver.
 func (tx *recordingTx) cancel(req *sip.Request) {
 	tx.mu.Lock()
-	hooks := make([]func(*sip.Request), len(tx.cancels))
-	copy(hooks, tx.cancels)
+	hooks := slices.Clone(tx.cancels)
 	tx.mu.Unlock()
 	for _, hook := range hooks {
 		hook(req)
@@ -365,8 +354,7 @@ func TestInviteIsChallengedThenAdmitted(t *testing.T) {
 		t.Errorf("profile = %q", intent.Profile)
 	}
 
-	// The far end advertises a private media address from a public source, which is the evidence
-	// mediad needs to expect a latch rather than be surprised by one.
+	// A private media address from a public source is the evidence mediad needs to expect a latch.
 	if !intent.MediaHint.Mismatch || !intent.MediaHint.Private {
 		t.Errorf("mediaHint = %+v, want a mismatch on a private address", intent.MediaHint)
 	}
@@ -375,7 +363,7 @@ func TestInviteIsChallengedThenAdmitted(t *testing.T) {
 	if h.dialogs.Len() != 1 {
 		t.Fatalf("dialogs = %d, want 1", h.dialogs.Len())
 	}
-	claims, _ := h.claims.All(context.Background())
+	claims, _ := h.claims.All(t.Context())
 	if len(claims) != 1 || claims[0].LegID != "leg-1" || claims[0].Role != "uas" {
 		t.Fatalf("claims = %+v", claims)
 	}
@@ -445,7 +433,7 @@ func TestEngineRefusalsMapToStatuses(t *testing.T) {
 			if h.dialogs.Len() != 0 {
 				t.Error("a refused call must leave no dialog behind")
 			}
-			claims, _ := h.claims.All(context.Background())
+			claims, _ := h.claims.All(t.Context())
 			if len(claims) != 0 {
 				t.Errorf("a refused call must leave no claim behind, got %+v", claims)
 			}
@@ -453,9 +441,8 @@ func TestEngineRefusalsMapToStatuses(t *testing.T) {
 	}
 }
 
-// A silent engine leaves this edge holding an INVITE transaction until the caller's Timer B, and the
-// caller hears thirty-two seconds of nothing. So the edge answers on its own authority — with a
-// Retry-After, which is what makes a carrier fail over instead of retrying here.
+// A silent engine would leave this edge holding an INVITE transaction until the caller's Timer B, so
+// the edge answers on its own authority — with a Retry-After, so a carrier fails over.
 func TestASilentEngineIsAnsweredOnOurOwnAuthority(t *testing.T) {
 	port := &invite.FakePort{Answer: func(invite.CallIntent) (invite.Admission, error) {
 		return invite.Admission{}, errors.New("no responders")
@@ -474,11 +461,10 @@ func TestASilentEngineIsAnsweredOnOurOwnAuthority(t *testing.T) {
 	}
 }
 
-// The RefusingPort is the honest production behaviour of a deployment with no engine: every call is
-// refused, loudly, and nothing pretends a call could have been placed.
+// The RefusingPort is the behaviour of a deployment with no engine: every call is refused, loudly.
 func TestRefusingPortRefusesEverything(t *testing.T) {
 	admission, err := invite.RefusingPort{Reason: invite.ReasonShuttingDown}.
-		Admit(context.Background(), invite.CallIntent{LegID: "leg-1"})
+		Admit(t.Context(), invite.CallIntent{LegID: "leg-1"})
 	if err != nil {
 		t.Fatalf("Admit: %v", err)
 	}
@@ -488,7 +474,7 @@ func TestRefusingPortRefusesEverything(t *testing.T) {
 	if got := invite.StatusFor(admission.Reason); got.Status != 503 || got.RetryAfter <= 0 {
 		t.Errorf("refusal = %+v, want a 503 with a Retry-After", got)
 	}
-	fallback, _ := invite.RefusingPort{}.Admit(context.Background(), invite.CallIntent{})
+	fallback, _ := invite.RefusingPort{}.Admit(t.Context(), invite.CallIntent{})
 	if fallback.Reason != invite.ReasonInternal {
 		t.Errorf("the default reason = %q, want internal", fallback.Reason)
 	}
@@ -539,8 +525,7 @@ func TestASourceOutsideTheTrunkACLIsForbidden(t *testing.T) {
 	}
 	h := newHarness(t, harnessOptions{profiles: set})
 
-	// 403 and never a challenge: there is no credential a carrier could offer here, so a 401 would
-	// be an instruction the far end cannot follow.
+	// 403 and never a challenge: there is no credential a carrier could offer here.
 	if got := lastStatus(t, h.send(h.handler.HandleInvite, h.invite(nil))); got != 403 {
 		t.Errorf("status = %d, want 403", got)
 	}
@@ -565,9 +550,8 @@ Reason: Q.850;cause=16
 Content-Length: 0
 
 `)
-	// The dialog was never answered, so a BYE against it is refused 481: RFC 3261 has no confirmed
-	// dialog to end and the far end wanted CANCEL. It is still ANSWERED — a refusal is always a
-	// reply, never a silence, or the far end retransmits its BYE for thirty-two seconds.
+	// Never answered, so a BYE is refused 481: there is no confirmed dialog to end and the far end
+	// wanted CANCEL. Still answered, because a refusal is a reply and never a silence.
 	if got := lastStatus(t, h.send(h.handler.HandleBye, bye)); got != 481 {
 		t.Errorf("status = %d, want 481", got)
 	}
@@ -577,8 +561,7 @@ Content-Length: 0
 	}
 }
 
-// A BYE for a dialog this instance does not hold is 481 — the correct answer, and under a
-// misconfigured balancer the log's Call-ID is what makes it diagnosable.
+// A BYE for a dialog this instance does not hold is 481.
 func TestByeForAnUnknownDialogIsFourEightyOne(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 	bye := h.parse(`BYE sip:optimiq-sipd@` + testRealm + ` SIP/2.0
@@ -595,8 +578,8 @@ Content-Length: 0
 	}
 }
 
-// RFC 3891: a Replaces that names no dialog we hold is 481 — the ordinary race when somebody hangs
-// up mid-transfer — and it is refused before a leg id is minted or a claim written.
+// RFC 3891: a Replaces that names no dialog we hold is 481, refused before a leg id is minted or a
+// claim written.
 func TestInviteWithAnUnmatchedReplacesIsFourEightyOne(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 	first := h.send(h.handler.HandleInvite, h.invite(nil))
@@ -619,16 +602,16 @@ func TestInviteWithAMalformedReplacesIsBadRequest(t *testing.T) {
 	first := h.send(h.handler.HandleInvite, h.invite(nil))
 	challenge := challengeFrom(t, first[len(first)-1])
 
-	// No from-tag: RFC 3891 §3 requires both, and a half-matching Replaces would ask this edge to
-	// guess which of two dialogs to tear down.
+	// No from-tag: RFC 3891 §3 requires both tags, or this edge would have to guess which dialog to
+	// tear down.
 	req := h.invite(challenge, `Replaces: call-1@pc33;to-tag=a`)
 	if got := lastStatus(t, h.send(h.handler.HandleInvite, req)); got != 400 {
 		t.Errorf("status = %d, want 400", got)
 	}
 }
 
-// A Replaces that DOES name one of our dialogs is admitted, and the leg it replaces travels to the
-// engine — which has to re-bridge the call the replaced leg belonged to.
+// A Replaces naming one of our dialogs is admitted, and the replaced leg travels to the engine,
+// which re-bridges the call it belonged to.
 func TestInviteWithAMatchingReplacesCarriesTheReplacedLeg(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 	first := h.send(h.handler.HandleInvite, h.invite(nil))
@@ -656,7 +639,7 @@ func TestInviteWithAMatchingReplacesCarriesTheReplacedLeg(t *testing.T) {
 	}
 }
 
-// RFC 4028: an interval below our floor is a NEGOTIATION step — a 422 carrying the Min-SE the peer
+// RFC 4028: an interval below our floor is a negotiation step — a 422 carrying the Min-SE the peer
 // should retry at — and not a failure.
 func TestSessionIntervalBelowTheFloorIsFourTwentyTwo(t *testing.T) {
 	h := newHarness(t, harnessOptions{timers: dialog.DefaultTimerPolicy()})
@@ -678,8 +661,8 @@ func TestSessionIntervalBelowTheFloorIsFourTwentyTwo(t *testing.T) {
 	}
 }
 
-// Turning session timers off and being sent `Require: timer` must be refused loudly: accepting
-// would leave the peer expecting refreshes that never come.
+// With session timers off, `Require: timer` must be refused: accepting would leave the peer
+// expecting refreshes that never come.
 func TestRequireTimerWithTimersOffIsFourTwenty(t *testing.T) {
 	h := newHarness(t, harnessOptions{timers: dialog.TimerPolicy{Enabled: false}})
 	first := h.send(h.handler.HandleInvite, h.invite(nil))
@@ -697,16 +680,15 @@ func TestRequireTimerWithTimersOffIsFourTwenty(t *testing.T) {
 	}
 }
 
-// A malformed INVITE is refused before anything is created — and every branch of the parser is
-// reachable from wire text.
+// A malformed INVITE is refused before anything is created.
 func TestMalformedInvitesAreRefused(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 	first := h.send(h.handler.HandleInvite, h.invite(nil))
 	challenge := challengeFrom(t, first[len(first)-1])
 
 	req := h.invite(challenge)
-	// Strip the Contact: RFC 3261 §8.1.1.8 makes it mandatory, and without one no mid-dialog request
-	// could ever reach the far end.
+	// RFC 3261 §8.1.1.8 makes Contact mandatory: without one no mid-dialog request could reach the
+	// far end.
 	req.RemoveHeader("Contact")
 
 	if got := lastStatus(t, h.send(h.handler.HandleInvite, req)); got != 400 {
@@ -717,9 +699,8 @@ func TestMalformedInvitesAreRefused(t *testing.T) {
 	}
 }
 
-// An INFO carrying DTMF is answered 200 and reported; one carrying something else is answered 200
-// too, because INFO is an extension point and refusing an unknown one has broken interop with more
-// handsets than it has ever protected.
+// An INFO carrying DTMF is answered 200 and reported; one carrying anything else is answered 200
+// too, because INFO is an extension point and refusing an unknown one breaks interop.
 func TestInfoCarriesDTMF(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 	first := h.send(h.handler.HandleInvite, h.invite(nil))
@@ -772,7 +753,7 @@ Content-Length: 0
 }
 
 // A re-INVITE before the initial INVITE has been answered is RFC 3261 §14.2's 500 with a
-// Retry-After — a peer running ahead of the dialog's own state, not a glare.
+// Retry-After.
 func TestReInviteBeforeTheCallIsAnsweredIsFiveHundred(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 	first := h.send(h.handler.HandleInvite, h.invite(nil))
@@ -795,8 +776,8 @@ Content-Length: 0
 	}
 }
 
-// An UPDATE on a dialog we do not hold is 481, and one on a dialog we do hold is accepted — RFC
-// 3311 exists precisely so an early dialog can be renegotiated.
+// RFC 3311 exists so an early dialog can be renegotiated: an UPDATE on a dialog we hold is
+// accepted, one on a dialog we do not is 481.
 func TestUpdate(t *testing.T) {
 	answered := false
 	refuseMedia := true
@@ -876,8 +857,8 @@ Content-Length: 0
 	}
 }
 
-// A CANCEL that reaches this handler matched no live transaction, which almost always means the
-// final response has already gone out: RFC 3261 §9.2's "no effect", answered 481.
+// A CANCEL reaching this handler matched no live transaction, which usually means the final
+// response has already gone out: RFC 3261 §9.2's "no effect", answered 481.
 func TestCancelForAnUnknownDialogIsFourEightyOne(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 	cancel := h.parse(`CANCEL sip:1002@` + testRealm + ` SIP/2.0
@@ -894,8 +875,7 @@ Content-Length: 0
 	}
 }
 
-// An ACK is never answered — it has no response — and one for a dialog we do not hold is dropped
-// rather than turned into an error.
+// An ACK has no response, and one for a dialog we do not hold is dropped rather than an error.
 func TestAckIsNeverAnswered(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 	ack := h.parse(`ACK sip:optimiq-sipd@` + testRealm + ` SIP/2.0
@@ -975,9 +955,8 @@ func TestNewValidatesItsWiring(t *testing.T) {
 	}
 }
 
-// The CANCEL sipgo's transaction layer handles for us: it answers the CANCEL 200 and drives the
-// INVITE to 487 by itself, and it tells NOBODY. The hook installed on the transaction is what turns
-// that into a dialog termination, and this is the test that it does.
+// sipgo's transaction layer answers an early CANCEL 200 and drives the INVITE to 487 itself, but
+// tells nobody. The hook installed on the transaction is what turns that into a dialog termination.
 func TestCancelEndsTheDialogAndReleasesTheClaim(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 	first := h.send(h.handler.HandleInvite, h.invite(nil))
@@ -996,7 +975,7 @@ func TestCancelEndsTheDialogAndReleasesTheClaim(t *testing.T) {
 	if h.dialogs.Len() != 0 {
 		t.Errorf("dialogs = %d, want the cancelled call gone", h.dialogs.Len())
 	}
-	claims, _ := h.claims.All(context.Background())
+	claims, _ := h.claims.All(t.Context())
 	if len(claims) != 0 {
 		t.Errorf("claims = %+v, want the claim released", claims)
 	}

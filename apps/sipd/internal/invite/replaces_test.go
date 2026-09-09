@@ -7,9 +7,7 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/invite"
 )
 
-// Same grammar as the Refer-To's URI header, arriving in a different encoding. A parser that
-// assumed one of them would silently fail on the other — and for an attended transfer that means
-// the consultation call stays up while the target is dialled as a fresh call.
+// Same grammar as the Refer-To's URI header, arriving in a different encoding.
 func TestParseReplacesHeader(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -57,8 +55,7 @@ func TestParseReplacesHeader(t *testing.T) {
 			fromTag: "def",
 		},
 		{
-			// A phone that copied the value out of a Refer-To without unescaping it is a real bug in
-			// the field, and unescaping something that needs none is a no-op.
+			// Phones that copy the value out of a Refer-To without unescaping it exist.
 			name:    "a percent-encoded value from a copied Refer-To still parses",
 			value:   "call-1%3Bto-tag%3Dabc%3Bfrom-tag%3Ddef",
 			callID:  "call-1",

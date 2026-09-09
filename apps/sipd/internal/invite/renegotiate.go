@@ -8,6 +8,8 @@ import (
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 )
 
+// RenegotiationPort asks the engine for an SDP answer to a mid-dialog offer. Optional: a Port that
+// does not implement it refuses re-INVITEs and UPDATEs carrying a body with 488.
 type RenegotiationPort interface {
 	Renegotiate(context.Context, string, contract.EngineRenegotiateRequest) (string, error)
 }

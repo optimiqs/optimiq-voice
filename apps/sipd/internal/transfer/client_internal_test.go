@@ -9,9 +9,8 @@ import (
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 )
 
-// The requester's wiring, which is the half a broker test cannot reach: a subject and a deadline
-// taken from the generated contract rather than retyped here, and a nil connection refused at
-// construction rather than on the first REFER.
+// The requester's wiring, which a broker test cannot reach: subject and deadline taken from the
+// generated contract, and a nil connection refused at construction.
 
 func TestNewNATSRequesterRefusesANilConnection(t *testing.T) {
 	if _, err := NewNATSRequester(nil, NATSOptions{}); err == nil {
@@ -46,8 +45,7 @@ func TestNewNATSRequesterHonoursOverrides(t *testing.T) {
 }
 
 func TestErrRequestFailedWrapsEveryTransportFailure(t *testing.T) {
-	// The caller distinguishes "there was no answer" from "the engine said no", and does it with
-	// errors.Is rather than by string matching.
+	// The caller distinguishes "no answer" from "the engine said no" with errors.Is.
 	err := errors.New("boom")
 	if errors.Is(err, ErrRequestFailed) {
 		t.Fatal("an unrelated error must not look like a transport failure")

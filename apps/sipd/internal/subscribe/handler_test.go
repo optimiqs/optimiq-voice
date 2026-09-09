@@ -24,14 +24,8 @@ import (
 )
 
 // The SUBSCRIBE/NOTIFY vertical end to end inside one process: real digest (answered by
-// github.com/icholy/digest, the CLIENT side of the same RFC), a real location service, a real
-// parser, and fakes only at the two edges that are genuinely elsewhere — the broker and the socket.
-//
-// Three properties are worth the harness. That an unauthenticated, unregistered, or wrong-realm
-// phone never reaches the presence bucket at all. That accepting a subscription ALWAYS produces an
-// immediate full-state notification, because a phone that is accepted and told nothing shows a lamp
-// that is dark until the extension next moves. And that a state change reaches every watcher with a
-// body they can parse.
+// github.com/icholy/digest, the client side of the same RFC), a real location service and parser,
+// with fakes only at the broker and the socket.
 
 const (
 	testRealm  = "acme.example.com"
@@ -42,10 +36,6 @@ const (
 	testCall   = "3c26700c1adf-blfkey01"
 	watchedExt = "1002"
 )
-
-// ---------------------------------------------------------------------------------------------
-// fakes
-// ---------------------------------------------------------------------------------------------
 
 type recordingNotifier struct {
 	mu   sync.Mutex
@@ -103,10 +93,6 @@ func (s staticCredentials) Lookup(context.Context, string, string) (credentials.
 	return s.credential, nil
 }
 
-// ---------------------------------------------------------------------------------------------
-// harness
-// ---------------------------------------------------------------------------------------------
-
 type harness struct {
 	t        *testing.T
 	handler  *subscribe.Handler
@@ -124,6 +110,8 @@ type harnessOptions struct {
 	unregistered bool
 	expired      bool
 	expiry       subscribe.ExpiryPolicy
+	// concurrency overrides the fan-out bound. Zero takes the handler's default.
+	concurrency int
 }
 
 func newHarness(t *testing.T, opts harnessOptions) *harness {
@@ -173,7 +161,7 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 			RegisteredAt: contract.NewEventTime(h.now.Add(-time.Minute)),
 			ExpiresAt:    contract.NewEventTime(expires),
 		}
-		if err := h.bindings.Put(context.Background(), binding); err != nil {
+		if err := h.bindings.Put(t.Context(), binding); err != nil {
 			t.Fatalf("seeding the binding: %v", err)
 		}
 	}
@@ -201,6 +189,8 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 		ServerHeader: "optimiq-sipd",
 		Now:          func() time.Time { return h.now },
 		NewTag:       func() string { return "sipdtag" },
+
+		NotifyConcurrency: opts.concurrency,
 	})
 	if err != nil {
 		t.Fatalf("subscribe.New: %v", err)
@@ -320,8 +310,7 @@ func (h *harness) send(req *sip.Request) *sip.Response {
 	h.t.Helper()
 	tx := siptest.NewServerTxRecorder(req)
 	h.handler.HandleSubscribe(req, tx)
-	// The immediate notification runs on its own goroutine so the 200 is not held behind a KV read;
-	// drain it before asserting, exactly as the shutdown path does.
+	// The immediate notification runs on its own goroutine so the 200 is not held behind a KV read.
 	if !h.handler.Wait(5 * time.Second) {
 		h.t.Fatal("the immediate notification did not finish")
 	}
@@ -332,9 +321,8 @@ func (h *harness) send(req *sip.Request) *sip.Response {
 	return results[len(results)-1]
 }
 
-// drain waits for the dispatched notifications to land. The fan-out sends them off the caller's
-// goroutine on purpose — one unplugged desk phone must not stall every other lamp — so a test that
-// asserted immediately would be racing the very design it is checking.
+// drain waits for the dispatched notifications to land: the fan-out sends them off the caller's
+// goroutine, so a test that asserted immediately would race it.
 func (h *harness) drain() {
 	h.t.Helper()
 	if !h.handler.Wait(5 * time.Second) {
@@ -369,10 +357,6 @@ func parseNotifiedDialog(t *testing.T, req *sip.Request) notifiedDialog {
 	}
 	return document
 }
-
-// ---------------------------------------------------------------------------------------------
-// acceptance and the immediate notification
-// ---------------------------------------------------------------------------------------------
 
 func TestSubscribeIsAcceptedAndNotifiedImmediately(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
@@ -466,10 +450,6 @@ func TestSubscribeToAnExtensionWithNoPresenceNotifiesIdle(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------------------------
-// refusals
-// ---------------------------------------------------------------------------------------------
-
 func TestUnauthenticatedSubscribeIsChallengedAndNeverReadsPresence(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 
@@ -489,9 +469,8 @@ func TestUnauthenticatedSubscribeIsChallengedAndNeverReadsPresence(t *testing.T)
 	}
 }
 
-// 489 rather than 501, and BEFORE the digest. `Allow-Events` is a constant this edge already
-// advertises on OPTIONS, so answering an anonymous SUBSCRIBE leaks nothing — and challenging a phone
-// for a package we will never serve produces a loop some handsets run forever.
+// 489 rather than 501, and BEFORE the digest: `Allow-Events` is already advertised on OPTIONS so
+// nothing leaks, and challenging for a package we never serve loops some handsets forever.
 func TestUnsupportedEventPackageIsRefusedWithTheHonestList(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 
@@ -571,9 +550,8 @@ func TestTooBriefSubscriptionIsRefusedWithMinExpires(t *testing.T) {
 	}
 }
 
-// RFC 6665 §4.2.1 lets the notifier shorten what a phone asked for. This is the knob that bounds how
-// long a lamp can be stale after an instance dies, so a handset asking for an hour gets ten minutes
-// and refreshes more often rather than being refused.
+// RFC 6665 §4.2.1 lets the notifier shorten what a phone asked for: the knob that bounds how long a
+// lamp can be stale after an instance dies.
 func TestAnOverlongSubscriptionIsClampedRatherThanRefused(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 
@@ -612,13 +590,8 @@ func TestAcceptHeadersThatDoAllowOurBodyType(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------------------------
-// refresh, unsubscribe, expiry
-// ---------------------------------------------------------------------------------------------
-
-// A refresh EXTENDS a subscription; it does not create one. Reusing the record is what keeps the
-// dialog-info version counter monotonic — a phone that saw version 7 and then a version 0 discards
-// the newer body as stale (RFC 4235 §3.3).
+// A refresh EXTENDS a subscription; it does not create one. Reusing the record keeps the
+// dialog-info version counter monotonic (RFC 4235 §3.3).
 func TestRefreshExtendsTheSameSubscriptionAndKeepsVersionsMonotonic(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 
@@ -681,9 +654,8 @@ func TestUnsubscribeRemovesTheSubscriptionAndSendsATerminalNotification(t *testi
 	}
 }
 
-// RFC 6665 §4.1.2.4: the notifier SHOULD send a terminal notification when a subscription expires.
-// Without it a phone that missed its own refresh window sits believing it is still subscribed, and
-// the lamp stops moving with nothing to tell it why.
+// RFC 6665 §4.1.2.4: the notifier SHOULD send a terminal notification when a subscription expires,
+// or a phone that missed its refresh window sits believing it is still subscribed.
 func TestALapsedSubscriptionIsSweptAndTheSubscriberToldWhy(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 
@@ -692,12 +664,12 @@ func TestALapsedSubscriptionIsSweptAndTheSubscriberToldWhy(t *testing.T) {
 	}
 	h.notifier.reset()
 
-	if swept := h.handler.Sweep(context.Background()); swept != 0 {
+	if swept := h.handler.Sweep(t.Context()); swept != 0 {
 		t.Fatalf("a live subscription was swept (%d)", swept)
 	}
 
 	h.now = h.now.Add(61 * time.Second)
-	if swept := h.handler.Sweep(context.Background()); swept != 1 {
+	if swept := h.handler.Sweep(t.Context()); swept != 1 {
 		t.Fatalf("swept %d subscriptions, want 1", swept)
 	}
 	h.drain()
@@ -715,13 +687,13 @@ func TestALapsedSubscriptionIsSweptAndTheSubscriberToldWhy(t *testing.T) {
 
 	// A second sweep must be a no-op: a terminal NOTIFY per tick would have a phone re-subscribing
 	// in a loop.
-	if swept := h.handler.Sweep(context.Background()); swept != 0 {
+	if swept := h.handler.Sweep(t.Context()); swept != 0 {
 		t.Errorf("the second sweep removed %d subscriptions, want 0", swept)
 	}
 }
 
-// `terminated;reason=deactivated` is RFC 6665's "re-subscribe immediately", which is what turns a
-// rolling deploy into a blip rather than an outage of every lamp this instance was serving.
+// `terminated;reason=deactivated` is RFC 6665's "re-subscribe immediately", which turns a rolling
+// deploy into a blip rather than a fleet-wide lamp outage.
 func TestShutdownTellsEverySubscriberToComeBack(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 
@@ -730,7 +702,7 @@ func TestShutdownTellsEverySubscriberToComeBack(t *testing.T) {
 	}
 	h.notifier.reset()
 
-	if deactivated := h.handler.Shutdown(context.Background()); deactivated != 1 {
+	if deactivated := h.handler.Shutdown(t.Context()); deactivated != 1 {
 		t.Fatalf("deactivated %d subscriptions, want 1", deactivated)
 	}
 	sent := h.notifier.all()
@@ -745,9 +717,8 @@ func TestShutdownTellsEverySubscriberToComeBack(t *testing.T) {
 	}
 }
 
-// One unplugged handset must not hold the shutdown deadline hostage. Notify blocks until its client
-// transaction settles, so a sequential loop deactivates the first few and lets every other lamp in
-// the fleet freeze for the rest of SIPD_SUBSCRIBE_MAX_EXPIRES.
+// One unplugged handset must not hold the shutdown deadline hostage: Notify blocks until its client
+// transaction settles, so a sequential loop would freeze every other lamp in the fleet.
 func TestShutdownDeactivatesInParallel(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 
@@ -764,7 +735,8 @@ func TestShutdownDeactivatesInParallel(t *testing.T) {
 
 	started, release := h.notifier.hold(subscribers)
 	done := make(chan int, 1)
-	go func() { done <- h.handler.Shutdown(context.Background()) }()
+	ctx := t.Context()
+	go func() { done <- h.handler.Shutdown(ctx) }()
 
 	// Every deactivation must be in flight at once. A sequential loop delivers one and then waits
 	// for the release that this test only sends after all four have arrived — so it would time out.
@@ -789,10 +761,6 @@ func TestShutdownDeactivatesInParallel(t *testing.T) {
 		t.Fatalf("shutdown produced %d notifications, want %d", len(sent), subscribers)
 	}
 }
-
-// ---------------------------------------------------------------------------------------------
-// the fan-out
-// ---------------------------------------------------------------------------------------------
 
 func TestAPresenceChangeReachesEveryWatcher(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
@@ -832,9 +800,8 @@ func TestAPresenceChangeReachesEveryWatcher(t *testing.T) {
 	}
 }
 
-// A deleted key is the bucket's five-minute TTL reaping an extension nobody is writing any more.
-// Treating it as "no news" would leave a lamp lit after the last engine that knew about the call
-// stopped.
+// A deleted key is the bucket's TTL reaping an extension nobody is writing any more; treating it as
+// "no news" would leave a lamp lit.
 func TestADeletedPresenceKeyClearsTheLamp(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 	h.presence.Set(presence.State{

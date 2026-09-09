@@ -36,11 +36,9 @@ func TestAccountRealmNoncesAndDigestURIsAreIsolated(t *testing.T) {
 	}
 }
 
-// Digest authentication unit tests.
-//
-// The answers under test are computed by github.com/icholy/digest — an independent CLIENT-side
-// implementation of RFC 2617 — so a bug in the verifier below cannot cancel out against a matching
-// bug in a hand-written expectation.
+// Digest authentication unit tests. The answers are computed by github.com/icholy/digest — an
+// independent client-side implementation of RFC 2617 — so a bug in the verifier cannot cancel out
+// against a matching bug in a hand-written expectation.
 
 const (
 	authRealm    = "acme.example.com"
@@ -218,7 +216,7 @@ func TestVerifyRejectsTheThingsThatMatter(t *testing.T) {
 }
 
 func TestNoncesFromAnotherFleetAreRejected(t *testing.T) {
-	// The stateless nonce is only trustworthy because the MAC is keyed. A nonce minted with a
+	// The stateless nonce is trustworthy only because the MAC is keyed: a nonce minted with a
 	// different secret must not verify, or any host could challenge on our behalf.
 	ours := newTestAuthenticator(t, time.Minute)
 	theirs, err := NewAuthenticator(authRealm, []byte("a-different-secret"), time.Minute)
@@ -366,12 +364,11 @@ func TestAnAnswerCannotBeUsedTwiceWithTheSameNonceCount(t *testing.T) {
 	if err := authenticator.Verify("REGISTER", first, ha1()); !errors.Is(err, ErrNonceReplayed) {
 		t.Fatalf("err = %v, want ErrNonceReplayed", err)
 	}
-	// It re-challenges with stale=true, so the honest device retries without prompting a human.
+	// stale=true, so the honest device retries without prompting a human.
 	if err := authenticator.Verify("REGISTER", first, ha1()); !errors.Is(err, ErrNonceStale) {
 		t.Errorf("a replay must present as stale, not as a bad password: %v", err)
 	}
-	// The legitimate re-REGISTER — same nonce, next count — still works, which is the whole point
-	// of counting rather than burning the nonce outright.
+	// The legitimate re-REGISTER — same nonce, next count — still works: counting, not burning.
 	next := answerCount(t, challenge, "REGISTER", "sip:"+authRealm, authPassword, 2)
 	if err := authenticator.Verify("REGISTER", next, ha1()); err != nil {
 		t.Fatalf("an incremented nonce count must be accepted: %v", err)
@@ -401,8 +398,8 @@ func TestAFailedAnswerDoesNotConsumeTheNonceCount(t *testing.T) {
 }
 
 // The challenge offers qop="auth" and only that. Falling back to the RFC 2069 form for an answer
-// that names no qop is a downgrade the CLIENT chooses, and it carries neither cnonce nor nonce
-// count — so it cannot be replay-guarded at all.
+// naming no qop is a client-chosen downgrade carrying neither cnonce nor nonce count, so it cannot
+// be replay-guarded.
 func TestAQOPlessAnswerIsRefusedAgainstAQOPChallenge(t *testing.T) {
 	authenticator := newTestAuthenticator(t, time.Minute)
 	value, err := authenticator.Challenge(false)

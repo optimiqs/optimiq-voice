@@ -6,12 +6,9 @@ import (
 	"github.com/emiago/sipgo/sip"
 )
 
-// MidDialogKind distinguishes the two ways a far end renegotiates an established session.
-//
-// They are not interchangeable and the difference is the whole reason UPDATE exists: an INVITE may
-// only be re-sent on a CONFIRMED dialog, whereas an UPDATE (RFC 3311) is legal on an EARLY one
-// too. A phone that puts a ringing call on hold sends UPDATE; one that puts a live call on hold
-// sends a re-INVITE. Treating them as one method means one of those two cases is answered wrongly.
+// MidDialogKind distinguishes the two ways a far end renegotiates an established session. They are
+// not interchangeable: an INVITE may only be re-sent on a CONFIRMED dialog, whereas an UPDATE
+// (RFC 3311) is legal on an EARLY one too.
 type MidDialogKind int
 
 const (
@@ -35,9 +32,7 @@ type MidDialogInput struct {
 	// Body is the SDP offer, opaque except for its direction attribute.
 	Body []byte
 	// Contact is the far end's Contact header when it sent one, for the RFC 3261 §12.2.1.1 target
-	// refresh. A dialog whose far end moved — a phone that re-registered from a different port, a
-	// carrier that failed over to a second SBC — sends mid-dialog requests from the new place and
-	// expects ours to arrive there.
+	// refresh: a far end that moved expects our mid-dialog requests at the new place.
 	Contact *sip.Uri
 	// Observed is the transport-level source of this request, which is what a phone behind NAT is
 	// actually reachable at even when its Contact says otherwise.
@@ -60,8 +55,7 @@ type MidDialogOutcome struct {
 	Reason     string
 	RetryAfter time.Duration
 	// HoldChanged reports whether the far end's direction moved across the hold boundary, and Held
-	// says which way. Only a CHANGE is worth an event: publishing `dialog.held` for a codec change
-	// or a NAT re-latch would start music-on-hold over a live conversation.
+	// says which way. Only a change is worth an event.
 	HoldChanged bool
 	Held        bool
 	// Direction is the far end's declared direction, for the log.
@@ -70,29 +64,20 @@ type MidDialogOutcome struct {
 	Effects []Effect
 }
 
-// ApplyMidDialog decides what happens to a re-INVITE or UPDATE from the far end.
+// ApplyMidDialog decides what happens to a re-INVITE or UPDATE from the far end. Three refusals are
+// possible, each RFC-mandated: 491 when an offer of ours is outstanding (RFC 3261 §14.2), 500 with
+// Retry-After for a re-INVITE arriving before the initial INVITE was finally answered (same
+// section), and 481 once the dialog is over.
 //
-// # The three refusals, each RFC-mandated and each with a different meaning
-//
-//  1. 491 Request Pending, when an offer of OURS is outstanding. RFC 3261 §14.2: two dialogs each
-//     believing they own an offer is a call whose media direction is decided by whichever answer
-//     lands last. The far end retries after a randomised interval (GlareBackoff), and so do we.
-//  2. 500 Server Internal Error with Retry-After, when a re-INVITE arrives before the INITIAL
-//     INVITE has been finally answered. RFC 3261 §14.2 names this case exactly; it is not a glare
-//     because there is no competing offer, it is a peer running ahead of the dialog's own state.
-//  3. 481, when the dialog is over. The transaction layer would say the same thing; saying it here
-//     means the log records which dialog it was.
-//
-// An UPDATE is exempt from (2): RFC 3311 §5.1 exists precisely so a party can change a session
-// before it is answered, and refusing one on an early dialog would break hold-while-ringing on
-// every handset that implements it properly.
+// An UPDATE is exempt from the 500: RFC 3311 §5.1 exists so a party can change a session before it
+// is answered, and refusing one would break hold-while-ringing.
 func (d *Dialog) ApplyMidDialog(in MidDialogInput) (MidDialogOutcome, error) {
 	if refusal, err := d.CheckMidDialog(in.Kind); err != nil || !refusal.Accepted {
 		return refusal, err
 	}
 
-	// The target refresh happens on ACCEPTANCE and not on the answer, because the far end has
-	// already moved: its next request comes from the new place whether or not we answer this one.
+	// The target refresh happens on ACCEPTANCE, not on the answer: the far end has already moved and
+	// its next request comes from the new place whether or not we answer this one.
 	if in.Contact != nil {
 		d.Target.Contact = *in.Contact
 	}
@@ -149,23 +134,17 @@ func (d *Dialog) CheckMidDialog(kind MidDialogKind) (MidDialogOutcome, error) {
 	return MidDialogOutcome{Accepted: true}, nil
 }
 
-// AnswerMidDialog commits the answer the engine couriered back and produces the 200.
-//
-// The body is committed before the response goes out, for the same reason the initial answer is:
-// a later message that must repeat this answer (a 200 following a 183, a refresh that changes
-// nothing) has to repeat it byte for byte, and the only reliable source of those bytes is our own
-// record of what we sent.
+// AnswerMidDialog commits the answer the engine couriered back and produces the 200. The body is
+// recorded before the response goes out, because a later message that must repeat this answer byte
+// for byte has no other source for it.
 func (d *Dialog) AnswerMidDialog(body []byte) []Effect {
 	d.offer.commitAnswer(body)
 	return []Effect{{Kind: EffectRespondToRequest, Status: 200, Reason: "OK", Body: body}}
 }
 
 // BeginReOffer marks an offer of OURS as outstanding, so a colliding offer from the far end is
-// answered 491 rather than accepted (RFC 3261 §14.2).
-//
-// It refuses when one is already outstanding: two of our own offers in flight is not glare, it is
-// this process having lost track, and issuing the second would produce an answer nobody can match
-// to an offer.
+// answered 491 rather than accepted (RFC 3261 §14.2). It refuses when one is already outstanding:
+// two of our own offers in flight is not glare but lost track.
 func (d *Dialog) BeginReOffer() error {
 	if !d.state.Answered() {
 		return ErrInvalidState

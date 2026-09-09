@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 )
 
@@ -12,11 +13,9 @@ import (
 // session was torn down, which happens on every shutdown and is not an error worth alarming on.
 var ErrSessionClosed = errors.New("dialog: the session is closed")
 
-// Task is one unit of work against a dialog, run on the dialog's own goroutine.
-//
-// It returns an Outcome so the caller learns where the dialog moved, and an error so a refusal
-// reaches the command layer as one of the package's four errors rather than as a state comparison
-// somewhere else.
+// Task is one unit of work against a dialog, run on the dialog's own goroutine. It returns an
+// Outcome saying where the dialog moved and an error carrying any refusal as one of the package's
+// named errors.
 type Task func(*Dialog) (Outcome, error)
 
 // EffectHandler performs the side effects a task produced.
@@ -43,16 +42,9 @@ func (f EffectHandlerFunc) Handle(ctx context.Context, dialog *Dialog, effect Ef
 
 // Session is one dialog plus the goroutine that owns it.
 //
-// # Why a goroutine and a channel rather than a mutex
-//
-// A mutex would make concurrent access SAFE and would leave the races UNDECIDED: two callers
-// holding a mutex in turn still both run, and "the CANCEL wins" versus "the answer wins" would
-// depend on scheduler order at two different call sites. A mailbox makes the order the only thing
-// that matters, and there is exactly one of it. The loser is then refused BY NAME — `dialog_gone`
-// for an answer that lost to a CANCEL — which is a thing the engine can act on.
-//
-// It is the same shape mediad chose for a media session, for the same reason: one goroutine per
-// session, and the kernel does the multiplexing.
+// A mailbox rather than a mutex: a mutex would make concurrent access safe while leaving the races
+// undecided, whereas one ordered queue makes "the CANCEL wins" a fact and lets the loser be refused
+// by name (`dialog_gone`), which the engine can act on.
 type Session struct {
 	dialog   *Dialog
 	handler  EffectHandler
@@ -85,8 +77,7 @@ type SessionOptions struct {
 	// a dialog whose effects are blocking on a socket, and the back-pressure is information.
 	Depth int
 	// OnUpdate is called after every task and its effects, ON THIS GOROUTINE. It is how the Store's
-	// cached claim stays current without the reaper's sweep ever reading a live dialog — see
-	// Store.Touch, which is the only implementation.
+	// cached claim stays current without the reaper's sweep ever reading a live dialog (Store.Touch).
 	OnUpdate func(*Dialog)
 }
 
@@ -107,8 +98,7 @@ func NewSession(dialog *Dialog, opts SessionOptions) *Session {
 	if session.log == nil {
 		session.log = slog.Default()
 	}
-	session.wait.Add(1)
-	go session.run()
+	session.wait.Go(session.run)
 	return session
 }
 
@@ -120,7 +110,6 @@ func (s *Session) LegID() string { return s.dialog.LegID }
 func (s *Session) Done() <-chan struct{} { return s.closed }
 
 func (s *Session) run() {
-	defer s.wait.Done()
 	for {
 		select {
 		case <-s.closed:
@@ -166,10 +155,9 @@ func (s *Session) dispatch(ctx context.Context, effects []Effect) {
 
 // Do runs a task on the dialog's goroutine and waits for it.
 //
-// The context bounds the WAIT and not the task: a task that has started runs to completion on the
-// owning goroutine, because abandoning it half way would leave the dialog in a state nobody chose.
-// A caller whose context expires learns that its command did not get an answer in time, which is
-// exactly what a timed-out RPC means and is why commands are idempotent on legId.
+// The context bounds the WAIT and not the task: a started task runs to completion on the owning
+// goroutine, since abandoning it half way would leave the dialog in a state nobody chose. Commands
+// are idempotent on legId precisely so a caller whose context expired can retry.
 func (s *Session) Do(ctx context.Context, task Task) (Outcome, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -215,11 +203,9 @@ func (s *Session) Apply(ctx context.Context, in Input) (Outcome, error) {
 	return s.Do(ctx, func(dialog *Dialog) (Outcome, error) { return dialog.Apply(in) })
 }
 
-// Inspect runs a read-only function on the dialog's goroutine and returns what it read.
-//
-// It exists so a caller can look at a dialog without racing its owner. Reading a field directly off
-// the *Dialog would be a data race the moment a command is in flight, and `go test -race` would
-// find it — which is the point of having exactly one owner.
+// Inspect runs a read-only function on the dialog's goroutine, so a caller can look at a dialog
+// without racing its owner. Reading a field off the *Dialog directly is a data race the moment a
+// command is in flight.
 func (s *Session) Inspect(ctx context.Context, read func(*Dialog)) error {
 	_, err := s.Do(ctx, func(dialog *Dialog) (Outcome, error) {
 		read(dialog)
@@ -258,7 +244,7 @@ func (r *RecordingHandler) Handle(_ context.Context, _ *Dialog, effect Effect) e
 func (r *RecordingHandler) Effects() []Effect {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]Effect(nil), r.effects...)
+	return slices.Clone(r.effects)
 }
 
 // Kinds returns just the kinds, in order, which is what most assertions actually compare.

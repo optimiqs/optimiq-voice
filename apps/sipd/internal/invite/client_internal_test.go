@@ -30,9 +30,8 @@ func trunkIntent() CallIntent {
 	}
 }
 
-// A trunk INVITE has NO tenant, and the field must be OMITTED rather than sent empty. The
-// responder's `z.uuid()` rejects "" — so an empty string would turn every carrier call into a
-// `bad_request`, which is the failure this one branch exists to prevent.
+// A trunk INVITE has no tenant, and the field must be omitted rather than sent empty: the
+// responder's `z.uuid()` rejects "", turning every carrier call into a `bad_request`.
 func TestATrunkIntentOmitsTheTenantEntirely(t *testing.T) {
 	request := admissionRequest(trunkIntent())
 
@@ -47,7 +46,7 @@ func TestATrunkIntentOmitsTheTenantEntirely(t *testing.T) {
 	}
 }
 
-// A digest INVITE carries the tenant the credential resolved, and the AOR rebuilt FROM the
+// A digest INVITE carries the tenant the credential resolved, and the AOR rebuilt from the
 // credential rather than copied from the From header.
 func TestADigestIntentCarriesTheTenantAndTheCredentialAOR(t *testing.T) {
 	intent := trunkIntent()
@@ -73,10 +72,8 @@ func TestADigestIntentCarriesTheTenantAndTheCredentialAOR(t *testing.T) {
 	}
 }
 
-// The offer travels on the admission request. It is the one field on this contract whose placement
-// was argued both ways: it is here because the engine is the courier for SDP and will hand these
-// bytes to allocate-session within milliseconds, and the alternative is a broker round trip back to
-// this edge in the middle of an INVITE.
+// The offer travels on the admission request because the engine is the courier for SDP and hands
+// these bytes to allocate-session within milliseconds.
 func TestTheOfferTravelsWithTheAdmissionRequest(t *testing.T) {
 	request := admissionRequest(trunkIntent())
 
@@ -88,8 +85,7 @@ func TestTheOfferTravelsWithTheAdmissionRequest(t *testing.T) {
 	}
 }
 
-// A delayed-offer INVITE is legal and rare. It must not send an empty sdpOffer, which would be a
-// zero-length body the engine would hand to mediad and mediad would refuse.
+// A delayed-offer INVITE must not send an empty sdpOffer: mediad refuses a zero-length body.
 func TestADelayedOfferInviteOmitsTheBody(t *testing.T) {
 	intent := trunkIntent()
 	intent.HasOffer = false
@@ -105,8 +101,8 @@ func TestADelayedOfferInviteOmitsTheBody(t *testing.T) {
 	}
 }
 
-// The media hint is sent only when there is something to say. An always-present hint whose every
-// field is empty would make `mismatch: false` indistinguishable from "nobody looked".
+// The media hint is sent only when there is something to say: an always-present empty hint would
+// make `mismatch: false` indistinguishable from "nobody looked".
 func TestTheMediaHintTravelsOnlyWhenItSaysSomething(t *testing.T) {
 	silent := admissionRequest(trunkIntent())
 	if silent.MediaHint != nil {
@@ -129,8 +125,7 @@ func TestTheMediaHintTravelsOnlyWhenItSaysSomething(t *testing.T) {
 	}
 }
 
-// A reply for a DIFFERENT leg is a responder bug, and acting on it would admit one call with
-// another call's tenant — a billing attribution error before it is a routing one.
+// A reply for a different leg would admit one call with another call's tenant.
 func TestAReplyForAnotherLegIsRefused(t *testing.T) {
 	_, err := admissionFrom(contract.SipInviteResponse{Ok: true, LegID: "leg-2"}, "leg-1")
 	if !errors.Is(err, ErrNoAnswer) {
@@ -160,8 +155,7 @@ func TestAnAdmissionWithNoTenantIsRefusedInternally(t *testing.T) {
 	}
 }
 
-// A refusal with no reason is unusable in the log. Naming it `internal` makes the line say what
-// happened rather than leaving a blank field somebody has to interpret.
+// A refusal with no reason is unusable in the log; `internal` makes the line say what happened.
 func TestARefusalWithNoReasonBecomesInternal(t *testing.T) {
 	admission, err := admissionFrom(contract.SipInviteResponse{Ok: false, LegID: "leg-1"}, "leg-1")
 	if err != nil {
@@ -175,8 +169,8 @@ func TestARefusalWithNoReasonBecomesInternal(t *testing.T) {
 	}
 }
 
-// Every reason the contract knows must map to a status a stranger can act on, and the whole table is
-// asserted rather than spot-checked — because each row is a different instruction to the caller.
+// Every reason the contract knows must map to a status a stranger can act on; each row is a
+// different instruction to the caller, so the whole table is asserted.
 func TestEveryContractRefusalReasonMapsToItsStatus(t *testing.T) {
 	for _, row := range []struct {
 		reason contract.SipInviteResponseReason
@@ -204,8 +198,7 @@ func TestEveryContractRefusalReasonMapsToItsStatus(t *testing.T) {
 	}
 }
 
-// A drain's 503 carries a Retry-After, and that header is the entire point: without it a carrier
-// retries HERE instead of failing over to another node.
+// A drain's 503 carries a Retry-After: without it a carrier retries here instead of failing over.
 func TestTheDrainRefusalCarriesARetryAfter(t *testing.T) {
 	if refusal := StatusFor(ReasonShuttingDown); refusal.RetryAfter <= 0 {
 		t.Fatal("shutting_down has no Retry-After; a carrier would retry at a node that is going away")
@@ -215,8 +208,7 @@ func TestTheDrainRefusalCarriesARetryAfter(t *testing.T) {
 	}
 }
 
-// A nil connection is a wiring mistake and not a runtime state, refused at construction rather than
-// on the first call from a carrier.
+// A nil connection is a wiring mistake, refused at construction rather than on the first call.
 func TestTheNATSPortRefusesANilConnection(t *testing.T) {
 	if _, err := NewNATSPort(nil, NATSOptions{}); err == nil {
 		t.Fatal("NewNATSPort accepted a nil connection")

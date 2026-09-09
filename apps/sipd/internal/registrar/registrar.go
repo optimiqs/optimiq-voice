@@ -1,9 +1,8 @@
-// Package registrar implements sipd's SIP REGISTRAR: the first vertical of the Go SIP edge.
+// Package registrar implements sipd's SIP REGISTRAR.
 //
-// It owns exactly one job — turning an authenticated REGISTER into an AOR → contact binding in the
-// `registrations` KV bucket, plus the transition events on the REGISTRATIONS stream — and it
-// deliberately owns nothing else. Call routing, INVITE proxying and NAT traversal are the next PG
-// wave; everything outside REGISTER and OPTIONS answers 501 rather than half-working.
+// It turns an authenticated REGISTER into an AOR to contact binding in the `registrations` KV
+// bucket and emits the transition events on the REGISTRATIONS stream. Everything outside REGISTER
+// and OPTIONS answers 501.
 package registrar
 
 import (
@@ -25,8 +24,7 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/kv"
 )
 
-// SIP statuses this registrar emits. sipgo has no constants for them and bare integers at a call
-// site are how a 403 becomes a 423 in review.
+// SIP statuses this registrar emits; sipgo has no constants for them.
 const (
 	statusOK               = 200
 	statusBadRequest       = 400
@@ -37,17 +35,12 @@ const (
 	statusIntervalTooBrief = 423
 )
 
-// allowedMethods is the Allow header. It is the honest list, not an aspirational one: advertising
-// INVITE before the proxy exists would make a phone try to place a call through a registrar.
-//
-// REFER is on it because `internal/transfer` answers it — a desk phone that does not see REFER
-// advertised may grey out its own TRANSFER key rather than trying. SUBSCRIBE joined it for the same
-// reason when `internal/subscribe` shipped: several vendors probe the Allow set before arming a BLF
-// key, and a key that is never armed is indistinguishable from presence that does not work.
+// allowedMethods is the Allow header. It lists only methods this edge actually answers: a phone
+// that sees an unhandled method advertised will try to use it, and one that does not see REFER or
+// SUBSCRIBE may disable its transfer or BLF keys outright.
 const allowedMethods = "REGISTER, OPTIONS, REFER, SUBSCRIBE"
 
-// Options configures a Registrar. Every dependency is an interface so the unit tests run without a
-// broker, a socket or a clock.
+// Options configures a Registrar. Every dependency is an interface so tests need no broker or socket.
 type Options struct {
 	InstanceID  string
 	MaxContacts int
@@ -68,15 +61,13 @@ type Options struct {
 	Source string
 	// ServerHeader is the Server: header value.
 	ServerHeader string
-	// AllowEvents is the `Allow-Events` value advertised on OPTIONS — `internal/subscribe`'s list,
-	// passed in rather than imported because that package depends on THIS one for the digest
-	// authenticator and the import cannot go both ways. Empty omits the header, which is the honest
-	// answer for a build with no subscription handler wired.
+	// AllowEvents is the `Allow-Events` value advertised on OPTIONS. It is passed in rather than
+	// imported from internal/subscribe, which depends on this package. Empty omits the header.
 	AllowEvents string
 	// SweepInterval is how often Run looks for lapsed bindings.
 	SweepInterval time.Duration
 	// BaseContext parents every store and publish operation, so a shutdown cancels work in flight.
-	// Modelled on net/http.Server.BaseContext: sipgo's handler signature carries no context.
+	// sipgo's handler signature carries no context.
 	BaseContext context.Context
 	// OperationTimeout bounds one KV write or one publish.
 	OperationTimeout time.Duration
@@ -84,11 +75,8 @@ type Options struct {
 	Now func() time.Time
 }
 
-// Registrar handles REGISTER and OPTIONS and sweeps lapsed bindings.
-//
-// It holds no package-level state: everything is on this struct, so a test can run several
-// independent registrars in one process and a future multi-realm edge is a matter of constructing
-// more of them.
+// Registrar handles REGISTER and OPTIONS and sweeps lapsed bindings. It holds no package-level
+// state, so several independent registrars can run in one process.
 type Registrar struct {
 	instanceID  string
 	maxContacts int
@@ -108,8 +96,8 @@ type Registrar struct {
 	opTimeout     time.Duration
 	now           func() time.Time
 
-	// mu guards tracked. Bindings granted by THIS instance are tracked locally so their exact
-	// deadline is known; see the Sweep doc comment for why that is not the KV bucket's TTL.
+	// mu guards tracked. Bindings granted by this instance are tracked locally so their exact
+	// deadline is known; see Run for why the KV bucket's TTL is not that deadline.
 	mu      sync.Mutex
 	tracked map[string]kv.Binding
 }
@@ -185,21 +173,12 @@ func New(opts Options) (*Registrar, error) {
 	return registrar, nil
 }
 
-// ---------------------------------------------------------------------------------------------
-// SIP handlers
-// ---------------------------------------------------------------------------------------------
-
 // HandleRegister authenticates and atomically updates every Contact in one REGISTER.
 func (r *Registrar) HandleRegister(req *sip.Request, tx sip.ServerTransaction) {
 	ctx, cancel := context.WithTimeout(r.baseCtx, r.opTimeout)
 	defer cancel()
 
-	log := r.log.With(
-		"method", "REGISTER",
-		"peer", req.Source(),
-		"transport", req.Transport(),
-		"sipCallId", headerValue(req, "Call-ID"),
-	)
+	log := &requestLog{base: r.log, req: req}
 
 	aor, user, ok := addressOfRecord(req)
 	if !ok {
@@ -207,7 +186,7 @@ func (r *Registrar) HandleRegister(req *sip.Request, tx sip.ServerTransaction) {
 		r.respond(tx, req, statusBadRequest, "Bad Request")
 		return
 	}
-	log = log.With("aor", aor)
+	log.aor = aor
 
 	credential, authorized := r.authorize(ctx, req, tx, user, log)
 	if !authorized {
@@ -231,9 +210,8 @@ func (r *Registrar) HandleRegister(req *sip.Request, tx sip.ServerTransaction) {
 	r.updateRegistration(ctx, req, tx, credential, aor, aorHash, contacts, log)
 }
 
-// HandleOptions answers the keepalive every SIP element on the planet uses to decide whether we are
-// alive. It must be cheap and unconditional: an OPTIONS that authenticates is an OPTIONS that
-// reports "down" whenever the credential store is slow.
+// HandleOptions answers the liveness keepalive. It is unconditional and unauthenticated, so a slow
+// credential store cannot make this element look down.
 func (r *Registrar) HandleOptions(req *sip.Request, tx sip.ServerTransaction) {
 	res := sip.NewResponseFromRequest(req, statusOK, "OK", nil)
 	res.AppendHeader(sip.NewHeader("Allow", allowedMethods))
@@ -244,11 +222,8 @@ func (r *Registrar) HandleOptions(req *sip.Request, tx sip.ServerTransaction) {
 	r.send(tx, res)
 }
 
-// HandleUnsupported answers everything this edge does not implement yet.
-//
-// 501 rather than 405: the method is a legitimate SIP method that this element does not implement,
-// which is exactly what 501 means. 405 would claim the method is not allowed on this resource and
-// would oblige us to advertise an Allow set the caller could act on.
+// HandleUnsupported answers everything this edge does not implement, with 501 rather than 405:
+// the method is legitimate SIP, it is this element that does not implement it.
 func (r *Registrar) HandleUnsupported(req *sip.Request, tx sip.ServerTransaction) {
 	r.log.Debug("rejecting an unimplemented method",
 		"method", req.Method.String(), "peer", req.Source())
@@ -257,27 +232,19 @@ func (r *Registrar) HandleUnsupported(req *sip.Request, tx sip.ServerTransaction
 	r.send(tx, res)
 }
 
-// ---------------------------------------------------------------------------------------------
-// authorization
-// ---------------------------------------------------------------------------------------------
-
 // authorize runs the digest exchange. It answers the transaction itself on every failure path and
 // reports whether the caller should continue.
 //
-// # Status choices
-//
-//   - 401 + challenge for "no credentials" and "stale/forged nonce": the device can and should
-//     retry, and with stale=true it does so without prompting a human.
-//   - 403 for "wrong password", "unknown account", "disabled account" and "authenticated as
-//     somebody else". Re-challenging a wrong password produces a challenge/retry loop that some
-//     phones run forever; a final answer stops it. The three account outcomes are deliberately
-//     indistinguishable so the response cannot be used to enumerate extensions.
+// Missing credentials and a stale or forged nonce get 401 plus a challenge, since the device can
+// retry. Everything else gets a final 403: re-challenging a wrong password loops some phones for
+// ever, and wrong password, unknown account and disabled account are answered identically so the
+// response cannot be used to enumerate extensions.
 func (r *Registrar) authorize(
 	ctx context.Context,
 	req *sip.Request,
 	tx sip.ServerTransaction,
 	aorUser string,
-	log *slog.Logger,
+	log *requestLog,
 ) (credentials.Credential, bool) {
 	accountAuth := r.auth.ForRequest(req)
 	auth, err := ParseAuthorization(headerValue(req, "Authorization"))
@@ -301,9 +268,8 @@ func (r *Registrar) authorize(
 		return credentials.Credential{}, false
 	}
 
-	// An authenticated account may only bind ITS OWN address of record. Without this check any
-	// valid account on the realm could register a contact for any extension and silently steal its
-	// calls — the classic third-party-registration hole.
+	// An authenticated account may only bind its own address of record; otherwise any valid account
+	// on the realm could register a contact for any extension and steal its calls.
 	if auth.Username != aorUser {
 		log.Warn("rejecting a registration for somebody else's AOR", "authenticatedAs", auth.Username)
 		r.respond(tx, req, statusForbidden, "Forbidden")
@@ -338,16 +304,12 @@ func (r *Registrar) authorize(
 	return credential, true
 }
 
-// ---------------------------------------------------------------------------------------------
-// binding lifecycle
-// ---------------------------------------------------------------------------------------------
-
 func (r *Registrar) respondWithCurrentBinding(
 	ctx context.Context,
 	req *sip.Request,
 	tx sip.ServerTransaction,
 	orgID, aorHash string,
-	log *slog.Logger,
+	log *requestLog,
 ) {
 	binding, found, err := r.bindings.Get(ctx, orgID, aorHash)
 	if err != nil {
@@ -364,29 +326,12 @@ func (r *Registrar) respondWithCurrentBinding(
 	r.send(tx, r.okWithBinding(req, binding))
 }
 
-// ---------------------------------------------------------------------------------------------
-// expiry sweeping
-// ---------------------------------------------------------------------------------------------
-
 // Run sweeps lapsed bindings until the context is cancelled.
 //
-// # Why a ticker over locally-owned bindings, and not a KV watch
-//
-// The obvious alternative is to watch the registrations bucket and emit `expired` when the server
-// drops a key. It does not work here, for two reasons:
-//
-//  1. The bucket TTL is one hour (packages/events-go: RegistrationsKV) because it is a BACKSTOP for
-//     a crashed registrar, not the expiry mechanism. Granted intervals are 60–3600 seconds. Waiting
-//     for the bucket TTL would report a phone as registered up to an hour after it stopped
-//     refreshing — which is precisely the "calls ring into nowhere" failure the binding exists to
-//     prevent.
-//  2. A watch fires on every instance. Three replicas watching one bucket would publish three
-//     `expired` events for one lapse, and the anti-fraud and presence consumers would count them.
-//
-// So the instance that GRANTED a binding owns its deadline: it holds the exact expiry locally,
-// notices within one sweep interval, deletes the key and publishes once. Rehydrate re-establishes
-// that ownership after a restart, and the bucket TTL still cleans up after an instance that dies
-// without ever coming back.
+// The instance that granted a binding owns its deadline and publishes `expired` exactly once, rather
+// than every instance watching the bucket and publishing one event per replica. The bucket's
+// one-hour TTL is only a backstop for a crashed registrar; granted intervals are 60-3600 seconds, so
+// waiting for it would report a phone as registered long after it stopped refreshing.
 func (r *Registrar) Run(ctx context.Context) error {
 	ticker := time.NewTicker(r.sweepInterval)
 	defer ticker.Stop()
@@ -405,17 +350,12 @@ func (r *Registrar) Run(ctx context.Context) error {
 	}
 }
 
-// Sweep removes only contacts that are still expired at the atomic write, so a refresh on
-// another SIP server cannot be deleted by this server's stale deadline.
+// Sweep removes only contacts that are still expired at the atomic write, so a refresh on another
+// SIP server cannot be deleted by this server's stale deadline.
 //
-// # Only bindings this instance already believes have lapsed are visited
-//
-// The hint carries the exact deadline this instance granted, so the filter is free — and without it
-// every sweep spends one KV round trip per TRACKED binding rather than per EXPIRED one. At the
-// default five-second interval a fleet of five thousand phones is then a thousand no-op Gets a
-// second against the broker, per instance, for ever. The contract is unchanged: the CAS callback
-// below still re-checks, so a refresh that landed on another server between the filter and the
-// write is still not deleted.
+// Only bindings this instance already believes have lapsed are visited, which costs one KV round
+// trip per expired binding rather than per tracked one. The CAS callback still re-checks, so a
+// refresh that landed elsewhere between the filter and the write is not deleted.
 func (r *Registrar) Sweep(ctx context.Context) int {
 	now := r.now()
 	r.mu.Lock()
@@ -456,9 +396,9 @@ func (r *Registrar) Sweep(ctx context.Context) int {
 	return expired
 }
 
-// lapsed reports whether anything in a tracked binding is due to be removed. The per-contact
-// deadlines are the authority when there are contacts, because a binding whose own ExpiresAt is the
-// LONGEST-lived contact's would keep a lapsed second device bound until the first one went too.
+// lapsed reports whether anything in a tracked binding is due to be removed. Per-contact deadlines
+// are the authority when there are contacts, since the binding's own ExpiresAt is the longest-lived
+// contact's and would keep a lapsed second device bound.
 func lapsed(binding kv.Binding, now time.Time) bool {
 	if len(binding.Contacts) == 0 {
 		return binding.Expired(now)
@@ -472,10 +412,8 @@ func lapsed(binding kv.Binding, now time.Time) bool {
 }
 
 // Rehydrate adopts the bindings already in the bucket, so a restarted instance keeps expiring the
-// devices a previous one registered instead of leaving them to the one-hour bucket TTL.
-//
-// Bindings that have ALREADY lapsed are adopted too: the very next Sweep removes them and emits the
-// `expired` event whoever crashed never got to publish.
+// devices a previous one registered. Already-lapsed bindings are adopted too, so the next Sweep
+// emits the `expired` event the crashed instance never published.
 func (r *Registrar) Rehydrate(ctx context.Context) (int, error) {
 	bindings, err := r.bindings.All(ctx)
 	if err != nil {
@@ -496,6 +434,22 @@ func (r *Registrar) Rehydrate(ctx context.Context) (int, error) {
 	return adopted, nil
 }
 
+// LastKnown implements kv.Hint: the binding this instance last wrote or adopted for that AOR.
+//
+// It lets a re-REGISTER CAS straight against the known revision instead of reading back a value this
+// process wrote, halving the broker round trips inside the SIP transaction. A stale revision is
+// refused by the server and the store re-reads, so a lost race cannot look like a won one.
+func (r *Registrar) LastKnown(orgID, aorHash string) (kv.Binding, bool) {
+	key, err := contract.RegistrationKVKey(orgID, aorHash)
+	if err != nil {
+		return kv.Binding{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	binding, found := r.tracked[key]
+	return binding, found
+}
+
 // TrackedBindings returns how many bindings this instance is responsible for expiring.
 func (r *Registrar) TrackedBindings() int {
 	r.mu.Lock()
@@ -503,11 +457,7 @@ func (r *Registrar) TrackedBindings() int {
 	return len(r.tracked)
 }
 
-// ---------------------------------------------------------------------------------------------
-// responses
-// ---------------------------------------------------------------------------------------------
-
-func (r *Registrar) challenge(req *sip.Request, tx sip.ServerTransaction, stale bool, log *slog.Logger) {
+func (r *Registrar) challenge(req *sip.Request, tx sip.ServerTransaction, stale bool, log *requestLog) {
 	value, err := r.auth.ForRequest(req).Challenge(stale)
 	if err != nil {
 		log.Error("cannot mint a digest challenge", "error", err)
@@ -526,9 +476,8 @@ func (r *Registrar) respond(tx sip.ServerTransaction, req *sip.Request, status i
 	r.send(tx, res)
 }
 
-// okWithBinding builds the 200 that tells the device what it actually got, which is not always what
-// it asked for: the Contact carries the GRANTED interval, and a phone that asked for 30 seconds and
-// received 60 refreshes on 60.
+// okWithBinding builds the 200. Each Contact carries the granted interval, not the requested one,
+// so the device refreshes on what it actually got.
 func (r *Registrar) okWithBinding(req *sip.Request, binding kv.Binding) *sip.Response {
 	res := sip.NewResponseFromRequest(req, statusOK, "OK", nil)
 
@@ -558,27 +507,20 @@ func (r *Registrar) okWithBinding(req *sip.Request, binding kv.Binding) *sip.Res
 	return res
 }
 
-// send writes a response and logs a transport failure rather than propagating it: by the time a
-// response cannot be written the transaction is already lost, and there is nobody left to tell.
+// send writes a response and logs a transport failure rather than propagating it; the transaction is
+// already lost by then.
 //
-// Every header value this registrar adds is either a constant, a number, a digest challenge it
-// minted itself, or a Contact that has been round-tripped through sip.ParseUri — so no
-// device-controlled string reaches the wire unparsed, which is the CRLF-injection case sipgo's
-// SECURITY note is about. Keep that property when adding headers here.
+// Every header value added here must be a constant, a number, a challenge minted by this process, or
+// a value round-tripped through sip.ParseUri, so no device-controlled string reaches the wire
+// unparsed (the CRLF-injection case in sipgo's SECURITY note).
 func (r *Registrar) send(tx sip.ServerTransaction, res *sip.Response) {
 	if err := tx.Respond(res); err != nil {
 		r.log.Error("cannot send a response", "error", err, "status", res.StatusCode)
 	}
 }
 
-// ---------------------------------------------------------------------------------------------
-// request helpers
-// ---------------------------------------------------------------------------------------------
-
-// addressOfRecord extracts the AOR being registered from the To header, plus its user part.
-//
-// It is the To header and not the From: a third party MAY register on behalf of another AOR, and
-// RFC 3261 §10.2 makes To the address of record in every case.
+// addressOfRecord extracts the AOR being registered from the To header, plus its user part. To and
+// not From: RFC 3261 §10.2 makes To the address of record even for third-party registration.
 func addressOfRecord(req *sip.Request) (aor string, user string, ok bool) {
 	to := req.To()
 	if to == nil {
@@ -592,10 +534,40 @@ func addressOfRecord(req *sip.Request) (aor string, user string, ok bool) {
 	if scheme == "" {
 		scheme = "sip"
 	}
-	// Host is lower-cased (case-insensitive per RFC 3261 §19.1.4) so the AOR — and therefore the
-	// subject token and the KV key — is stable no matter how the device spelled the domain.
+	// Host is lower-cased (case-insensitive per RFC 3261 §19.1.4) so the AOR, and therefore the
+	// subject token and the KV key, is stable however the device spelled the domain.
 	return scheme + ":" + uri.User + "@" + strings.ToLower(uri.Host), uri.User, true
 }
+
+// requestLog carries the fields every line about one request should name, materialising the child
+// logger only when a line is actually emitted: the REGISTER success path logs nothing, and building
+// one up front cost ~5% of all allocations under a registration storm.
+//
+// Owned by the goroutine handling the request; not safe for concurrent use.
+type requestLog struct {
+	base  *slog.Logger
+	req   *sip.Request
+	aor   string
+	built *slog.Logger
+}
+
+func (l *requestLog) logger() *slog.Logger {
+	if l.built == nil {
+		l.built = l.base.With(
+			"method", l.req.Method.String(),
+			"peer", l.req.Source(),
+			"transport", l.req.Transport(),
+			"sipCallId", headerValue(l.req, "Call-ID"),
+			"aor", l.aor,
+		)
+	}
+	return l.built
+}
+
+func (l *requestLog) Debug(msg string, args ...any) { l.logger().Debug(msg, args...) }
+func (l *requestLog) Info(msg string, args ...any)  { l.logger().Info(msg, args...) }
+func (l *requestLog) Warn(msg string, args ...any)  { l.logger().Warn(msg, args...) }
+func (l *requestLog) Error(msg string, args ...any) { l.logger().Error(msg, args...) }
 
 func headerValue(req *sip.Request, name string) string {
 	header := req.GetHeader(name)
@@ -605,8 +577,7 @@ func headerValue(req *sip.Request, name string) string {
 	return header.Value()
 }
 
-// expiresHeader reads the request-level Expires header. sipgo's default parser leaves it generic,
-// so it arrives as a string.
+// expiresHeader reads the request-level Expires header, which sipgo's parser leaves as a string.
 func expiresHeader(req *sip.Request) (time.Duration, bool) {
 	raw := strings.TrimSpace(headerValue(req, "Expires"))
 	if raw == "" {
@@ -619,9 +590,8 @@ func expiresHeader(req *sip.Request) (time.Duration, bool) {
 	return time.Duration(seconds) * time.Second, true
 }
 
-// contactExpires resolves the interval for one contact. A `expires` parameter on the Contact wins
-// over the request-level Expires header (RFC 3261 §10.2.1.1), because a device with several
-// contacts may want different lifetimes for each.
+// contactExpires resolves the interval for one contact. An `expires` parameter on the Contact wins
+// over the request-level Expires header (RFC 3261 §10.2.1.1).
 func contactExpires(
 	contact *sip.ContactHeader,
 	headerValue time.Duration,
@@ -647,8 +617,8 @@ func cseqOf(req *sip.Request) uint32 {
 	return 0
 }
 
-// transportOf maps sipgo's transport name onto the contract vocabulary, defaulting to udp for
-// anything unrecognised rather than writing a value the TypeScript schema would reject.
+// transportOf maps sipgo's transport name onto the contract vocabulary, defaulting to udp rather
+// than writing a value the schema would reject.
 func transportOf(req *sip.Request) contract.SIPTransport {
 	transport := contract.SIPTransport(strings.ToLower(req.Transport()))
 	if !transport.Valid() {
@@ -657,8 +627,7 @@ func transportOf(req *sip.Request) contract.SIPTransport {
 	return transport
 }
 
-// optional turns "" into a nil *string, so an unknown value is ABSENT on the wire rather than an
-// empty string the consumer has to special-case.
+// optional turns "" into a nil *string, so an unknown value is absent on the wire.
 func optional(value string) *string {
 	if value == "" {
 		return nil

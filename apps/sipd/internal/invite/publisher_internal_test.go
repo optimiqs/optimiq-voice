@@ -1,7 +1,6 @@
 package invite
 
 import (
-	"context"
 	"strings"
 	"testing"
 	"time"
@@ -42,11 +41,11 @@ func newTestSink(t *testing.T) (*PublishingSink, *sipevents.RecordingPublisher) 
 }
 
 // The subject is derived from the payload's leg id by the contract's own constructor, so a payload
-// whose leg disagrees with its subject cannot be built. This asserts the shape a consumer filters
-// on — an engine subscribing `sip.evt.v1.>` needs the org and the leg exactly here.
+// whose leg disagrees with its subject cannot be built. An engine subscribing `sip.evt.v1.>` filters
+// on the org and the leg being exactly here.
 func TestEverySubjectCarriesTheTenantAndTheLeg(t *testing.T) {
 	sink, publisher := newTestSink(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	for _, kind := range []dialog.DialogEvent{
 		dialog.EventProgressed,
@@ -81,7 +80,7 @@ func TestEverySubjectCarriesTheTenantAndTheLeg(t *testing.T) {
 	}
 }
 
-// Every payload names the instance the engine must address its commands at. A dialog lives on one
+// Every payload names the instance the engine must address its commands at: a dialog lives on one
 // process, so an event without it is a leg nothing can ring, answer or hang up.
 func TestEveryPayloadNamesTheOwningInstance(t *testing.T) {
 	sink, publisher := newTestSink(t)
@@ -89,7 +88,7 @@ func TestEveryPayloadNamesTheOwningInstance(t *testing.T) {
 	event.Termination = dialog.ReasonBye
 	event.Initiator = dialog.InitiatorLocal
 
-	if err := sink.Publish(context.Background(), event); err != nil {
+	if err := sink.Publish(t.Context(), event); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	if got := publisher.TerminatedEvents()[0].Data.InstanceID; got != "sipd-7c9f" {
@@ -97,15 +96,14 @@ func TestEveryPayloadNamesTheOwningInstance(t *testing.T) {
 	}
 }
 
-// An event with no tenant cannot be published at all — the subject has no `_unknown` token — and it
-// must not be an error the effect handler has to cope with mid-teardown. It is logged and dropped,
-// and this asserts the drop rather than a panic or a malformed subject.
+// An event with no tenant cannot be published — the subject has no `_unknown` token — and must not
+// be an error the effect handler copes with mid-teardown. It is logged and dropped.
 func TestAnEventWithNoTenantIsDroppedRatherThanPublished(t *testing.T) {
 	sink, publisher := newTestSink(t)
 	event := testEvent(dialog.EventProgressed)
 	event.OrgID = ""
 
-	if err := sink.Publish(context.Background(), event); err != nil {
+	if err := sink.Publish(t.Context(), event); err != nil {
 		t.Fatalf("Publish returned %v; a tenantless event must not fail the teardown path", err)
 	}
 	if publisher.Len() != 0 {
@@ -114,8 +112,7 @@ func TestAnEventWithNoTenantIsDroppedRatherThanPublished(t *testing.T) {
 }
 
 // The terminal event's four independent facts: why (cause), how (reason), who (initiator), and
-// whether the why was STATED or derived. A consumer that could not tell the last one apart cannot
-// know which of two disagreeing CDRs to believe.
+// whether the why was stated or derived.
 func TestTheTerminalPayloadCarriesAllFourFacts(t *testing.T) {
 	sink, publisher := newTestSink(t)
 	event := testEvent(dialog.EventTerminated)
@@ -126,7 +123,7 @@ func TestTheTerminalPayloadCarriesAllFourFacts(t *testing.T) {
 	event.CauseFromReasonHeader = true
 	event.AnsweredForSeconds = 42
 
-	if err := sink.Publish(context.Background(), event); err != nil {
+	if err := sink.Publish(t.Context(), event); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	data := publisher.TerminatedEvents()[0].Data
@@ -147,15 +144,14 @@ func TestTheTerminalPayloadCarriesAllFourFacts(t *testing.T) {
 	}
 }
 
-// An unrecorded initiator becomes `timer`, not `local`. A teardown no code path claimed is what a
-// deadline looks like, and attributing it to the platform is the direction of error that loses an
-// argument with a customer.
+// An unrecorded initiator becomes `timer`, not `local`: a teardown no code path claimed is what a
+// deadline looks like.
 func TestAnUnrecordedInitiatorBecomesTimer(t *testing.T) {
 	sink, publisher := newTestSink(t)
 	event := testEvent(dialog.EventTerminated)
 	event.Termination = dialog.ReasonTimeout
 
-	if err := sink.Publish(context.Background(), event); err != nil {
+	if err := sink.Publish(t.Context(), event); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	if got := publisher.TerminatedEvents()[0].Data.Initiator; got != contract.SIPDialogTerminatedInitiatorTimer {
@@ -163,15 +159,14 @@ func TestAnUnrecordedInitiatorBecomesTimer(t *testing.T) {
 	}
 }
 
-// `held` carries a two-member vocabulary because those are the only two directions that constitute
-// hold. A direction outside it means the state machine published a hold for a call that is not held,
-// and inventing a value would hide that.
+// `held` carries a two-member vocabulary: anything outside it means the state machine published a
+// hold for a call that is not held.
 func TestHoldRefusesADirectionThatIsNotHold(t *testing.T) {
 	sink, publisher := newTestSink(t)
 	event := testEvent(dialog.EventHeld)
 	event.Direction = dialog.DirectionSendRecv
 
-	err := sink.Publish(context.Background(), event)
+	err := sink.Publish(t.Context(), event)
 	if err == nil {
 		t.Fatal("a dialog.held with direction sendrecv was published")
 	}
@@ -183,7 +178,7 @@ func TestHoldRefusesADirectionThatIsNotHold(t *testing.T) {
 	}
 
 	event.Direction = dialog.DirectionSendOnly
-	if err := sink.Publish(context.Background(), event); err != nil {
+	if err := sink.Publish(t.Context(), event); err != nil {
 		t.Fatalf("a legitimate hold was refused: %v", err)
 	}
 	if got := publisher.HeldEvents()[0].Data.Direction; got != contract.SIPDialogHeldDirectionSendonly {
@@ -191,16 +186,15 @@ func TestHoldRefusesADirectionThatIsNotHold(t *testing.T) {
 	}
 }
 
-// `answered` means two different moments and the role is what disambiguates them: the ACK for a UAS
-// leg and the 2xx for a UAC one. Losing the role would make billsec start in the wrong place for
-// half the legs on the platform.
+// `answered` means two different moments and the role disambiguates them: the ACK for a UAS leg and
+// the 2xx for a UAC one. Losing it starts billsec in the wrong place.
 func TestTheRoleTravelsOnEveryPayload(t *testing.T) {
 	sink, publisher := newTestSink(t)
 	event := testEvent(dialog.EventAnswered)
 	event.Role = dialog.RoleUAC
 	event.SetupMs = 1234
 
-	if err := sink.Publish(context.Background(), event); err != nil {
+	if err := sink.Publish(t.Context(), event); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	data := publisher.AnsweredEvents()[0].Data
@@ -212,19 +206,18 @@ func TestTheRoleTravelsOnEveryPayload(t *testing.T) {
 	}
 }
 
-// An event kind this mapping does not know is contract drift, and it must be loud: the alternative
-// is an event nobody sees and a leg the engine never hears about.
+// An event kind this mapping does not know is contract drift, and must be loud.
 func TestAnUnknownEventKindIsLoud(t *testing.T) {
 	sink, _ := newTestSink(t)
 	event := testEvent("dialog.invented")
 
-	if err := sink.Publish(context.Background(), event); err == nil {
+	if err := sink.Publish(t.Context(), event); err == nil {
 		t.Fatal("an unknown event kind was silently accepted")
 	}
 }
 
-// An empty instance id would produce payloads no engine could address a command back at, which on
-// this family means a call that rings and can never be answered.
+// An empty instance id would produce payloads no engine could address a command back at: a call
+// that rings and can never be answered.
 func TestTheSinkRefusesAnEmptyInstanceID(t *testing.T) {
 	if _, err := NewPublishingSink(sipevents.NewRecordingPublisher(), "  ", nil); err == nil {
 		t.Fatal("NewPublishingSink accepted an empty instance id")

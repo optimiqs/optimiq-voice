@@ -1,24 +1,12 @@
-// Package profile is the internal/external trust boundary, as a structure rather than a comment.
+// Package profile is the internal/external trust boundary as a structure: a listener, an
+// authentication policy, a NAT policy and a routing context, bound together and validated at boot.
 //
-// # What is wrong today, and why a struct fixes it
+// The load-bearing rule is design §8.3 — a digest-authenticated INVITE admits with the tenant's
+// INTERNAL context and a trunk-matched INVITE with the UNTRUSTED one, because unauthenticated
+// traffic must never resolve in a trunk-capable context.
 //
-// The parity audit's row 1.26 records that the boundary between "a registered device on our
-// network" and "a stranger on the internet" is enforced today BY CONVENTION IN A CONFIG FILE —
-// Asterisk dialplan contexts named `optimiq-internal` and `optimiq-inbound-untrusted`, with the
-// right comments and no structure behind them. sipd has had no profile concept at all.
-//
-// A profile is that boundary made explicit: a listener, an authentication policy, a NAT policy and
-// a routing context, bound together and validated at boot. The load-bearing consequence is design
-// §8.3's rule — a digest-authenticated INVITE admits with the tenant's INTERNAL context, and a
-// trunk-matched INVITE admits with the UNTRUSTED one — because `routingContext` is documented as
-// "the toll-fraud boundary: unauthenticated traffic never resolves in a trunk-capable context",
-// and until now nothing in this process could tell the engine which one a call arrived under.
-//
-// # What it is not
-//
-// It is not a virtual host and not a multi-realm mechanism. One realm per process still holds
-// (`SIPD_REALM`); a profile changes the POLICY applied to traffic, not the identity space it
-// authenticates against.
+// A profile is not a virtual host and not a multi-realm mechanism: one realm per process still holds
+// (`SIPD_REALM`), and a profile changes the policy applied to traffic, not the identity space.
 package profile
 
 import (
@@ -64,8 +52,7 @@ const (
 func (m AuthMode) Valid() bool { return m == AuthDigest || m == AuthTrunkACL }
 
 // RoutingContext is the token that travels on the admission request and gates what the engine will
-// resolve. The spellings are the two Asterisk contexts this replaces, so a reader of either plane
-// recognises them.
+// resolve. The spellings are the two Asterisk contexts this replaces.
 type RoutingContext string
 
 const (
@@ -154,11 +141,9 @@ func External(name string, acl *ACL, listeners ...Listener) Profile {
 	}
 }
 
-// Validate refuses the combinations that are a security problem rather than a preference.
-//
-// Each of these has been a real outage or a real breach somewhere, which is why they are boot
-// failures and not warnings: a misconfigured edge that starts is one that is discovered by an
-// attacker rather than by an operator.
+// Validate refuses the combinations that are a security problem rather than a preference. They are
+// boot failures and not warnings: a misconfigured edge that starts is one an attacker discovers
+// before an operator does.
 func (p Profile) Validate() error {
 	var problems []string
 	if strings.TrimSpace(p.Name) == "" {
@@ -186,18 +171,10 @@ func (p Profile) Validate() error {
 			problems = append(problems,
 				"an external profile with an empty ACL accepts INVITEs from the whole internet")
 		}
-		// A WATCHED ACL may be empty at boot, and that is a narrowing rather than a loosening.
-		//
-		// The sentence above is about `defaultAllow`, which no constructor in this package sets and
-		// which is therefore always false — so an empty ACL matches NOTHING and refuses every carrier
-		// (design §8.1: "an address matching nothing is REFUSED"). The check exists because a
-		// STATICALLY configured empty ACL means an operator misconfigured SIPD_TRUNK_ACL and would
-		// rather be told at boot than discover it when a carrier is refused.
-		//
-		// A watched one is different in kind: it is empty for the milliseconds between the profile
-		// being built and the `sip-acl` bucket's initial replay landing, and refusing to boot for that
-		// would mean a broker that is briefly slow takes the whole SIP edge down — including REGISTER,
-		// which has nothing to do with this ACL. So the empty window is allowed and it fails CLOSED.
+		// A watched ACL may be empty at boot: it is empty only for the window between the profile
+		// being built and the `sip-acl` replay landing, and failing boot there would let a briefly
+		// slow broker take the whole SIP edge down. It fails closed meanwhile. A statically empty one
+		// is a misconfigured SIPD_TRUNK_ACL and is better reported at boot.
 		if p.Context != ContextUntrusted {
 			problems = append(problems,
 				"an external profile must resolve in the untrusted context, or an inbound PSTN call can dial back out through a trunk")
@@ -249,9 +226,8 @@ func (l Listener) validate() error {
 	return nil
 }
 
-// ErrNoProfile means no profile claims a request. It is a refusal and not a fallback: a packet
-// nobody owns is a packet no policy applies to, and applying the friendliest available policy to
-// it is how an internal profile ends up serving the internet.
+// ErrNoProfile means no profile claims a request. A refusal and not a fallback: applying the
+// friendliest available policy to an unowned packet is how an internal profile serves the internet.
 var ErrNoProfile = errors.New("profile: no profile claims that request")
 
 // Set is the collection of profiles this process serves.
@@ -262,11 +238,8 @@ type Set struct {
 	byListener map[string]int
 }
 
-// NewSet validates every profile and indexes the listeners.
-//
-// Two profiles on one listener is refused. It is the one configuration that cannot be resolved at
-// runtime — a packet arriving on a shared socket would have two policies and no way to choose —
-// and it is exactly the mistake "add a carrier to the existing port" produces.
+// NewSet validates every profile and indexes the listeners. Two profiles on one listener is refused:
+// a packet arriving on a shared socket would have two policies and no way to choose.
 func NewSet(profiles ...Profile) (*Set, error) {
 	set := &Set{byListener: make(map[string]int)}
 	var problems []string
@@ -326,18 +299,12 @@ func (s *Set) ByName(name string) (Profile, bool) {
 	return Profile{}, false
 }
 
-// For decides which profile owns a request.
+// For decides which profile owns a request, in this order:
 //
-// # The selection order, and why the ACL is last
-//
-//  1. The LOCAL address the message arrived on, when the transport recorded one. This is the only
-//     selector that cannot be influenced by the sender, so it is first and it is authoritative.
-//  2. The transport, when exactly one profile serves it. A deployment with carriers on TLS and
-//     devices on UDP is resolved here without any address matching at all.
-//  3. The SOURCE address against each external profile's ACL — including an external profile with
-//     no listeners of its own, which is the documented default: it shares the main sockets and is
-//     selected by source address alone. This is a fallback for a deployment that shares one socket,
-//     and it is last precisely because it is the only step where the sender's own address
+//  1. The LOCAL address the message arrived on — the only selector the sender cannot influence.
+//  2. The transport, when exactly one profile serves it.
+//  3. The SOURCE address against each external profile's ACL, including an external profile with no
+//     listeners of its own. Last, because it is the only step where the sender's own address
 //     participates in choosing the policy applied to it.
 //
 // Nothing matching is ErrNoProfile, and the caller answers 403. There is no default profile.
@@ -362,19 +329,12 @@ func (s *Set) For(req *sip.Request) (Profile, error) {
 			}
 		}
 	}
-	// An external profile with NO listeners of its own shares whatever sockets the process serves
-	// and is selected by source address alone — the documented default when
-	// SIPD_EXTERNAL_LISTEN_ADDR is empty. It never appears in `matches`, so the transport step
-	// would otherwise see a single transport-serving profile (the internal one) and answer every
-	// carrier INVITE with a digest challenge no carrier can answer. When such a profile exists the
-	// transport step cannot resolve on its own and the source step has to run first.
-	shared := false
-	for _, candidate := range s.profiles {
-		if candidate.Kind == KindExternal && len(candidate.Listeners) == 0 {
-			shared = true
-			break
-		}
-	}
+	// An external profile with no listeners of its own never appears in `matches`, so the transport
+	// step would otherwise see only the internal profile and answer every carrier INVITE with a
+	// digest challenge no carrier can answer. The source step has to run first when one exists.
+	shared := slices.ContainsFunc(s.profiles, func(candidate Profile) bool {
+		return candidate.Kind == KindExternal && len(candidate.Listeners) == 0
+	})
 	if !shared && len(matches) == 1 {
 		return s.profiles[matches[0]], nil
 	}
@@ -394,10 +354,8 @@ func (s *Set) For(req *sip.Request) (Profile, error) {
 	if len(matches) == 1 {
 		return s.profiles[matches[0]], nil
 	}
-	// A source that no external ACL claims falls to the single internal profile serving this
-	// transport, if there is exactly one — where it will be challenged for a digest it does not
-	// have. That is the correct destination for an unknown stranger: a 401, not a 403, and
-	// certainly not a call.
+	// A source no external ACL claims falls to the single internal profile serving this transport,
+	// where it is challenged for a digest it does not have: a 401 rather than a 403, and not a call.
 	internal := make([]int, 0, len(matches))
 	for _, index := range matches {
 		if s.profiles[index].Kind == KindInternal {

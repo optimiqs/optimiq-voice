@@ -21,19 +21,17 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/trunk"
 )
 
-// W12.5's NATS surfaces, against a real broker.
+// sipd's NATS surfaces, against a real broker.
 //
-// Everything below is proved in the unit suite against interfaces. What is proved HERE is the half
-// no interface can stand in for: that the subjects a caller publishes on are the subjects this edge
-// subscribes to, that a KV watch actually delivers, and that a claim written by one instance is
-// visible to another. Every one of those has exactly one failure mode — silence — and silence is
-// what a fake cannot reproduce.
+// What is proved here is the half no interface can stand in for: that the subjects a caller
+// publishes on are the ones this edge subscribes to, that a KV watch actually delivers, and that a
+// claim written by one instance is visible to another. Each has one failure mode — silence — which
+// a fake cannot reproduce.
 //
 //	RUN_SIPD_INTEGRATION=1 go test -tags integration -v -timeout 5m ./apps/sipd/...
 
-// commandDialogs answers every command successfully and records the leg it was asked about, which
-// is all this test needs: the question is whether the REQUEST arrived, not what the dialog layer
-// does with it.
+// commandDialogs answers every command successfully and records the leg it was asked about: the
+// question is whether the request arrived, not what the dialog layer does with it.
 type commandDialogs struct{ legs chan string }
 
 func (c commandDialogs) Ring(_ context.Context, legID string, _ int, _ string) error {
@@ -60,13 +58,10 @@ func (c commandDialogs) Originate(
 	return "sip:1001@192.0.2.10:5060", "call-id@pc33", nil
 }
 
-// The instance-addressed subjects are the whole of design §10.2, and getting them wrong is not a
-// cosmetic error: a command published on a subject nobody subscribes to produces no reply, no log
-// line and no failed assertion anywhere — just a call that rings for ever.
-//
-// So this publishes on the subject an ENGINE would build (root plus the instance token) and asserts
-// a reply comes back, which is the only test that can catch a token mismatch between the two
-// languages.
+// A command published on a subject nobody subscribes to produces no reply, no log line and no
+// failed assertion — just a call that rings for ever. So this publishes on the subject an engine
+// would build (root plus the instance token) and asserts a reply, which is the only way to catch a
+// token mismatch between the two languages.
 func TestCommandSubjectsAreReachableOnTheirInstanceToken(t *testing.T) {
 	requireIntegration(t)
 	url := startNATS(t)
@@ -124,9 +119,8 @@ func TestCommandSubjectsAreReachableOnTheirInstanceToken(t *testing.T) {
 			if err != nil {
 				t.Fatalf("encoding: %v", err)
 			}
-			// RAW request-reply, exactly as apps/engine must issue it. A NestJS ClientProxy would wrap
-			// this in `{"pattern":…,"data":…}` and the handler would refuse it as malformed — which is
-			// the obligation the contract records and this asserts.
+			// Raw request-reply, as apps/engine must issue it: a NestJS ClientProxy would wrap this
+			// in `{"pattern":…,"data":…}` and the handler would refuse it as malformed.
 			msg, err := conn.Request(row.subject, payload, 2*time.Second)
 			if err != nil {
 				t.Fatalf("no reply on %s: %v", row.subject, err)
@@ -216,9 +210,9 @@ func TestOriginateIsReachableOnTheFlatSubject(t *testing.T) {
 	}
 }
 
-// A claim written by one instance must be VISIBLE to another, and an expired one must be reaped
-// into a `dialog.terminated` the engine can write a CDR from. That crossing is the entire reason the
-// bucket exists and it cannot be tested in one process with a memory store.
+// A claim written by one instance must be visible to another, and an expired one must be reaped
+// into a `dialog.terminated` the engine can write a CDR from. That crossing cannot be tested in one
+// process with a memory store.
 func TestAnOrphanedClaimIsReapedAcrossInstances(t *testing.T) {
 	requireIntegration(t)
 	url := startNATS(t)
@@ -233,7 +227,7 @@ func TestAnOrphanedClaimIsReapedAcrossInstances(t *testing.T) {
 		t.Fatalf("opening JetStream: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	claims, err := dialog.OpenClaims(ctx, js)
@@ -303,9 +297,8 @@ type emptyDialogs struct{}
 
 func (emptyDialogs) Claims() []dialog.Claim { return nil }
 
-// The ACL is WATCHED, not read per INVITE, and a watch that does not deliver is a security boundary
-// that never updates. This writes an entry into a real bucket and waits for the in-process
-// evaluator to admit an address it refused a moment earlier.
+// The ACL is watched, not read per INVITE, and a watch that does not deliver is a security boundary
+// that never updates.
 func TestTheSIPACLWatchDeliversAnEntry(t *testing.T) {
 	requireIntegration(t)
 	url := startNATS(t)
@@ -320,7 +313,7 @@ func TestTheSIPACLWatchDeliversAnEntry(t *testing.T) {
 		t.Fatalf("opening JetStream: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	// The control plane owns this bucket; the test stands in for apps/api.
@@ -411,7 +404,7 @@ func TestTheTrunkDirectoryWatchDeliversARecord(t *testing.T) {
 		t.Fatalf("opening JetStream: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	definition := contract.TrunksKV

@@ -32,9 +32,8 @@ const (
 type Options struct {
 	// Realm is the digest realm. It must match the Authenticator's.
 	Realm string
-	// Auth runs the digest exchange. The SAME authenticator the registrar uses, deliberately: a
-	// second one with its own secret would mint nonces the registrar rejects and vice versa, and the
-	// symptom would be a phone that can register but not transfer.
+	// Auth runs the digest exchange. It must be the SAME authenticator the registrar uses: a second
+	// one with its own secret would mint nonces the registrar rejects.
 	Auth *registrar.Authenticator
 	// Credentials resolves the account behind the referrer's AOR.
 	Credentials credentials.Store
@@ -43,8 +42,7 @@ type Options struct {
 	Bindings kv.Store
 	// Transfers issues the RPC at the engine.
 	Transfers Requester
-	// Notifier delivers the RFC 3515 progress reports. DiscardNotifier is a valid choice; see its
-	// doc comment for what it costs.
+	// Notifier delivers the RFC 3515 progress reports. DiscardNotifier is a valid choice.
 	Notifier Notifier
 	// Contact is the URI this edge puts in the Contact header of its notifications.
 	Contact sip.Uri
@@ -65,39 +63,23 @@ type Options struct {
 	NewTag func() string
 }
 
-// Handler answers REFER.
+// Handler answers REFER. This is the security boundary for transfers; before anything reaches the
+// broker it establishes that:
 //
-// # What it checks, and why that is a real boundary
-//
-// This edge is a registrar. It is not in the media path and holds no call state, so it cannot verify
-// that the `Call-ID` on a REFER names a dialog it is part of — it is part of none. What it CAN
-// establish, and does, before anything reaches the broker:
-//
-//  1. The REFER answers a digest challenge this fleet minted, with a password only the account
-//     holder has. Unauthenticated REFERs are challenged, wrong ones are refused 403.
+//  1. The REFER answers a digest challenge this fleet minted. Unauthenticated REFERs are
+//     challenged, wrong ones refused 403.
 //  2. The authenticated account is the one in the `From` header. Without this any valid account on
-//     the realm could transfer as somebody else — the third-party-REFER hole, the exact shape of
-//     the third-party-registration hole the registrar closes.
-//  3. That account has a LIVE binding in this deployment's location service. A credential that
-//     verifies but has no registration is a phone that is not on this network right now, and a
-//     REFER from it is either a replay or a call it cannot possibly be in.
+//     the realm could transfer as somebody else.
+//  3. That account has a LIVE binding in this deployment's location service.
 //  4. The `Refer-To` is a dialable SIP URI, and a `Replaces` — if present — parses.
 //
-// What it deliberately does NOT do is decide whether the referrer is on the call it named. That is
-// unanswerable here and answerable in the engine, which holds the legs; the request carries the
-// authenticated identity precisely so the engine can check it and refuse `not_permitted`. Stating it
-// this way round means the boundary exists in ONE place that can actually enforce it, rather than in
-// two places that each enforce half.
+// It deliberately does NOT decide whether the referrer is on the call it named: that is unanswerable
+// here and answerable in the engine, which holds the legs and refuses `not_permitted`. The request
+// carries the authenticated identity for exactly that.
 //
-// # RFC 3515 coverage
-//
-// Implemented: `202 Accepted`, the implicit subscription, `Event: refer;id=<cseq>`, an `active`
-// NOTIFY with `SIP/2.0 100 Trying`, and a `terminated;reason=noresource` NOTIFY with the outcome.
-// NOT implemented: an actual subscription state machine — no SUBSCRIBE refresh is honoured, no
-// `Refer-Sub: false` negotiation (RFC 4488), and the notifications are fire-and-forget rather than
-// retried past the transaction layer's own timers. Those matter for a referee that reports progress
-// over minutes; a blind transfer here reaches its final state in under two seconds, and the two
-// notifications above are what a handset actually consumes.
+// RFC 3515 coverage is partial: 202 Accepted, the implicit subscription, `Event: refer;id=<cseq>`,
+// an `active` 100 Trying NOTIFY and a `terminated;reason=noresource` NOTIFY. There is no
+// subscription state machine, no SUBSCRIBE refresh and no RFC 4488 `Refer-Sub` negotiation.
 type Handler struct {
 	realm     string
 	auth      *registrar.Authenticator
@@ -115,8 +97,7 @@ type Handler struct {
 	now           func() time.Time
 	newTag        func() string
 
-	// reports tracks the goroutines reporting outcomes, so Wait can drain them at shutdown rather
-	// than leaving a phone mid-transfer when the process exits.
+	// reports tracks the goroutines reporting outcomes, so Wait can drain them at shutdown.
 	reports sync.WaitGroup
 }
 
@@ -218,7 +199,7 @@ func (h *Handler) HandleRefer(req *sip.Request, tx sip.ServerTransaction) {
 		return
 	}
 	// The referrer is the From: a REFER is sent BY the party asking for the transfer, unlike a
-	// REGISTER where the To is the address of record being bound.
+	// REGISTER whose To is the address of record being bound.
 	aor, user, ok := addressOfRecord(from.Address)
 	if !ok {
 		log.Info("rejecting a REFER with no usable From address")
@@ -232,8 +213,8 @@ func (h *Handler) HandleRefer(req *sip.Request, tx sip.ServerTransaction) {
 		return
 	}
 
-	// Parsed AFTER authentication on purpose: an unauthenticated caller learns nothing about which
-	// Refer-To spellings this edge accepts, and the parser is not run on an anonymous packet.
+	// Parsed AFTER authentication on purpose: the parser is not run on an anonymous packet, and an
+	// unauthenticated caller learns nothing about which Refer-To spellings this edge accepts.
 	refer, err := ParseRefer(req)
 	if err != nil {
 		switch {
@@ -257,18 +238,14 @@ func (h *Handler) HandleRefer(req *sip.Request, tx sip.ServerTransaction) {
 	}
 
 	// The 202 goes out BEFORE the RPC. RFC 3515 §2.4.2: accepting a REFER means "I will try and I
-	// will tell you", not "I have done it" — and a phone's non-INVITE retransmission timer would
-	// fire long before a transfer completes if the transaction were held open across it.
+	// will tell you", and a phone's non-INVITE retransmission timer would fire long before a
+	// transfer completed if the transaction were held open across it.
 	dialog := h.accept(req, tx, refer, log)
 	if dialog == nil {
 		return
 	}
 
-	h.reports.Add(1)
-	go func() {
-		defer h.reports.Done()
-		h.report(dialog, refer, credential, req, log)
-	}()
+	h.reports.Go(func() { h.report(dialog, refer, credential, req, log) })
 }
 
 // accept answers 202 and captures what the outcome report needs. It returns nil when the response
@@ -288,10 +265,9 @@ func (h *Handler) accept(
 
 	res := sip.NewResponseFromRequest(req, statusAccepted, "Accepted", nil)
 	if refer.ToTag == "" {
-		// sipgo mints a tag of its own when the request carried none, and it does not tell us which.
-		// Overwriting it is not pedantry: the NOTIFY's From tag must be the SAME string the phone saw
-		// on the 202, and a phone that cannot match the tags silently drops every notification — so
-		// the transfer works while the handset reports that it failed.
+		// sipgo mints a tag of its own when the request carried none and does not tell us which.
+		// The NOTIFY's From tag must be the SAME string the phone saw on the 202, or the phone
+		// silently drops every notification.
 		if to := res.To(); to != nil {
 			to.Params.Remove("tag")
 			to.Params.Add("tag", tag)
@@ -338,8 +314,7 @@ func (h *Handler) report(
 	response, err := h.transfers.Transfer(ctx, h.requestFor(refer, credential, req))
 	switch {
 	case err != nil:
-		// No answer at all. Distinct from a refusal in the log and identical on the wire, because a
-		// handset has one behaviour for a transfer that did not happen.
+		// No answer at all. Distinct from a refusal in the log, identical on the wire.
 		log.Error("the transfer request failed", "error", err)
 		h.notify(ctx, dialog, FragFailed, StateTerminated, log)
 	case !response.Ok:
@@ -361,17 +336,15 @@ func (h *Handler) notify(
 	log *slog.Logger,
 ) {
 	if err := h.notifier.Notify(ctx, BuildNotify(dialog, frag, state, h.contact, h.server)); err != nil {
-		// A lost notification does not undo a transfer that happened; it leaves a handset's
-		// indicator wrong. Logged rather than retried here — the transaction layer owns the retries.
+		// A lost notification leaves a handset's indicator wrong but undoes nothing. Not retried
+		// here: the transaction layer owns the retries.
 		log.Warn("cannot notify the referrer of the transfer outcome", "frag", frag, "error", err)
 	}
 }
 
-// requestFor builds the contract request from everything established above.
-//
-// Note what it takes from where. `orgId` and the referrer come from the CREDENTIAL, which the digest
-// exchange resolved; the dialog identifiers and the target come from the MESSAGE, which the phone
-// wrote. Mixing those two up is how an authorisation check becomes decorative.
+// requestFor builds the contract request. `orgId` and the referrer come from the CREDENTIAL the
+// digest exchange resolved; the dialog identifiers and target come from the MESSAGE the phone wrote.
+// Mixing the two is how an authorisation check becomes decorative.
 func (h *Handler) requestFor(
 	refer Refer,
 	credential credentials.Credential,
@@ -381,9 +354,8 @@ func (h *Handler) requestFor(
 		OrgID:     credential.OrgID,
 		SIPCallID: refer.CallID,
 		ReferredBy: contract.SipTransferRequestReferredBy{
-			// Rebuilt from the CREDENTIAL rather than copied from the From header, even though the
-			// two are checked to agree above. The check is on the user part alone; taking the whole
-			// string from the message would let a phone choose the domain spelling the engine sees.
+			// Rebuilt from the CREDENTIAL, not copied from the From header: the check above is on
+			// the user part alone, so the message could still choose the domain spelling.
 			AOR:      "sip:" + credential.Username + "@" + strings.ToLower(credential.Realm),
 			Username: credential.Username,
 		},
@@ -417,16 +389,12 @@ func (h *Handler) requestFor(
 	return request
 }
 
-// ---------------------------------------------------------------------------------------------
-// authorization
-// ---------------------------------------------------------------------------------------------
-
 // authorize runs the digest exchange for a REFER. It answers the transaction itself on every failure
 // path and reports whether the caller should continue.
 //
-// The status choices mirror the registrar's, for the same reasons: 401 for "no credentials" and
-// "stale nonce" because the device can retry, 403 for everything else because re-challenging a wrong
-// password produces a loop some handsets run forever.
+// The status choices mirror the registrar's: 401 for "no credentials" and "stale nonce" because the
+// device can retry, 403 for everything else because re-challenging a wrong password produces a loop
+// some handsets run forever.
 func (h *Handler) authorize(
 	ctx context.Context,
 	req *sip.Request,
@@ -456,8 +424,8 @@ func (h *Handler) authorize(
 		return credentials.Credential{}, false
 	}
 
-	// An account may only transfer AS ITSELF. Without this any valid account on the realm could send
-	// a REFER carrying somebody else's From and have the engine attribute it to them.
+	// An account may only transfer AS ITSELF: otherwise any valid account on the realm could send a
+	// REFER carrying somebody else's From and have the engine attribute it to them.
 	if auth.Username != fromUser {
 		log.Warn("rejecting a REFER sent as somebody else", "authenticatedAs", auth.Username)
 		h.respond(tx, req, statusForbidden, "Forbidden")
@@ -478,8 +446,7 @@ func (h *Handler) authorize(
 		return credentials.Credential{}, false
 	}
 
-	// REFER, not REGISTER: HA2 is MD5(method:uri), so verifying with the wrong method name accepts
-	// nothing and would make every transfer fail with a password error nobody could explain.
+	// REFER, not REGISTER: HA2 is hash(method:uri), so the wrong method name fails every digest.
 	if err := accountAuth.VerifyRequest(req, auth, credential.HA1); err != nil {
 		if errors.Is(err, registrar.ErrNonceStale) {
 			h.challenge(req, tx, true, log)
@@ -493,10 +460,9 @@ func (h *Handler) authorize(
 	return credential, true
 }
 
-// isRegistered reports whether the referrer has a live binding in this deployment.
-//
-// A read failure answers FALSE. Fail-closed, exactly as the credential store is: a location service
-// that cannot be consulted is not evidence that a phone is on the network.
+// isRegistered reports whether the referrer has a live binding in this deployment. A read failure
+// answers FALSE: a location service that cannot be consulted is not evidence a phone is on the
+// network.
 func (h *Handler) isRegistered(ctx context.Context, orgID, aor string, log *slog.Logger) bool {
 	aorHash, err := contract.AORSubjectToken(aor)
 	if err != nil {
@@ -511,14 +477,10 @@ func (h *Handler) isRegistered(ctx context.Context, orgID, aor string, log *slog
 	if !found {
 		return false
 	}
-	// A binding whose granted interval has already lapsed is one the sweeper has not reached yet.
-	// Treating it as live would accept a REFER from a phone that stopped refreshing minutes ago.
+	// A lapsed binding is one the sweeper has not reached yet; treating it as live would accept a
+	// REFER from a phone that stopped refreshing minutes ago.
 	return !binding.Expired(h.now())
 }
-
-// ---------------------------------------------------------------------------------------------
-// responses
-// ---------------------------------------------------------------------------------------------
 
 func (h *Handler) challenge(req *sip.Request, tx sip.ServerTransaction, stale bool, log *slog.Logger) {
 	value, err := h.auth.ForRequest(req).Challenge(stale)
@@ -558,19 +520,13 @@ func (h *Handler) recipientFor(req *sip.Request) sip.Uri {
 	return h.contact
 }
 
-// ---------------------------------------------------------------------------------------------
-// small helpers
-// ---------------------------------------------------------------------------------------------
-
 // setOptional writes a *string field only when the value is non-empty, so an unknown value is ABSENT
-// on the wire rather than an empty string the responder has to special-case — and, for the fields
-// with a `min(1)` in the schema, so an empty one is not sent as a value that fails validation.
+// on the wire rather than an empty string that fails the schema's `min(1)`.
 func setOptional(field **string, value string) {
 	if value == "" {
 		return
 	}
-	copied := value
-	*field = &copied
+	*field = new(value)
 }
 
 func optionalString(value *string) string {

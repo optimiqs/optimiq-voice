@@ -1,8 +1,8 @@
 // Package credentials resolves the SIP account behind a REGISTER.
 //
 // The registrar never sees a plaintext password: RFC 2617 digest only needs
-// HA1 = MD5(username:realm:password), so that is what a Credential carries and what apps/api will
-// eventually return. A store that is handed plaintext computes HA1 immediately and discards it.
+// HA1 = MD5(username:realm:password), so that is what a Credential carries. A store handed
+// plaintext computes HA1 immediately and discards it.
 package credentials
 
 import (
@@ -39,10 +39,9 @@ type Credential struct {
 	// the registration event so the admin UI can join a live binding to inventory.
 	DeviceID    string
 	ExtensionID string
-	// SharedLineNumber and AppearanceIndex describe this account's place in a shared line appearance
-	// (SLA), when it has one. They come from the credential reply, travel onto the binding, and are
-	// what the INVITE path stamps as a `Call-Info` appearance-index header so the phone lights the
-	// right line key. Nil for an ordinary extension that is not part of a shared line.
+	// SharedLineNumber and AppearanceIndex place this account in a shared line appearance (SLA).
+	// They travel onto the binding and become the INVITE path's `Call-Info` appearance-index header,
+	// so the phone lights the right line key. Nil for an extension outside any shared line.
 	SharedLineNumber *string
 	AppearanceIndex  *int
 }
@@ -56,16 +55,16 @@ type Store interface {
 
 // HA1 computes MD5(username:realm:password).
 //
-// MD5 is not a choice: RFC 2617 digest specifies it, every SIP phone implements it, and the digest
-// exchange never transmits it. It is a legacy construction protected by the transport (use TLS on
-// any untrusted network), not a password hash — never reuse an HA1 as a stored password digest.
+// MD5 is mandated by RFC 2617 digest, not chosen. It is a legacy construction protected by the
+// transport (use TLS on any untrusted network), not a password hash — never reuse an HA1 as a
+// stored password digest.
 func HA1(username, realm, password string) string {
 	sum := md5.Sum([]byte(username + ":" + realm + ":" + password))
 	return hex.EncodeToString(sum[:])
 }
 
-// Validate checks a credential is usable before it reaches the digest verifier: a record missing
-// its org or carrying a malformed HA1 must fail loudly at load time, not silently authenticate.
+// Validate rejects a credential before it reaches the digest verifier: a record missing its org or
+// carrying a malformed HA1 must fail loudly at load time rather than silently authenticate.
 func (c Credential) Validate() error {
 	switch {
 	case strings.TrimSpace(c.OrgID) == "":

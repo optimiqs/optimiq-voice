@@ -10,11 +10,11 @@ import (
 // be one JetStream lookup per second, per watched bucket, for the life of the process.
 const maxWatchBackoff = 30 * time.Second
 
-// The control plane owns directory buckets and may start after the SIP edge.
-// Retry attachment without granting access or requiring an edge restart.
+// watchWhenAvailable attaches a directory watcher, retrying in the background if the bucket is not
+// there yet: the control plane owns directory buckets and may start after the SIP edge.
 //
-// The interval doubles up to maxWatchBackoff, and every failure is logged: silently retrying for
-// ever leaves an operator with a trunk directory that never attached and nothing saying why.
+// The interval doubles up to maxWatchBackoff, and every failure is logged, so an operator can see a
+// directory that never attached.
 func watchWhenAvailable(ctx context.Context, log *slog.Logger, bucket string, interval time.Duration, attach func() error) {
 	if ctx.Err() != nil {
 		return
@@ -44,8 +44,8 @@ func watchWhenAvailable(ctx context.Context, log *slog.Logger, bucket string, in
 					return
 				}
 				attempts++
-				// Debug on every attempt, Warn every tenth, so a persistent failure is visible in
-				// ordinary logs without one line per retry for ever.
+				// Warn every tenth attempt, so a persistent failure is visible in ordinary logs
+				// without one line per retry.
 				log.Debug("directory still unavailable", "bucket", bucket,
 					"attempts", attempts, "retryIn", delay, "error", err)
 				if attempts%10 == 0 {

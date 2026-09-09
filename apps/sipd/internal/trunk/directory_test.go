@@ -30,9 +30,8 @@ func testRecord() Record {
 	}
 }
 
-// `register` registers and `ip-auth` does not, derived from the column rather than carried as a
-// second boolean. A trunk whose kind said ip-auth and whose flag said true would send REGISTER at a
-// carrier that has no account for us and be refused 403 for ever on a backoff.
+// Derived from the column rather than carried as a second boolean: a kind and a flag that disagreed
+// would REGISTER at a carrier with no account for us and be refused 403 for ever on a backoff.
 func TestTheKindColumnDecidesWhetherATrunkRegisters(t *testing.T) {
 	registering := testRecord().Config()
 	if !registering.Register {
@@ -46,8 +45,6 @@ func TestTheKindColumnDecidesWhetherATrunkRegisters(t *testing.T) {
 	}
 }
 
-// The column set has only `sipProxy`. A carrier that takes registrations at its call address is the
-// common case, so the inheritance is the normal path rather than a fallback.
 func TestTheRegistrarInheritsTheProxyWhenUnset(t *testing.T) {
 	config := testRecord().Config()
 	if config.Registrar != "sip.telnyx.example:5060" {
@@ -56,8 +53,7 @@ func TestTheRegistrarInheritsTheProxyWhenUnset(t *testing.T) {
 
 }
 
-// A record written by an older writer may omit the interval, and a registering trunk with a zero
-// expiry fails Validate rather than defaulting quietly somewhere further in.
+// A writer may omit the interval, and a registering trunk with a zero expiry fails Validate.
 func TestAnOmittedExpiryTakesTheColumnDefault(t *testing.T) {
 	record := testRecord()
 	record.RegisterExpiresSeconds = 0
@@ -71,16 +67,14 @@ func TestAnOmittedExpiryTakesTheColumnDefault(t *testing.T) {
 	}
 }
 
-// The auth realm falls back to the SIP domain, which is what a carrier challenges with when it does
-// not state a separate one.
+// The SIP domain is what a carrier challenges with when it states no separate realm.
 func TestTheAuthRealmFallsBackToTheSIPDomain(t *testing.T) {
 	if got := testRecord().Config().AuthRealm; got != "sip.telnyx.example" {
 		t.Fatalf("authRealm = %q, want the sip domain", got)
 	}
 }
 
-// The directory is keyed by the contract's own builder, so this reader and the control-plane writer
-// cannot disagree about where a trunk lives.
+// Keyed by the contract's builder so this reader and the control-plane writer cannot disagree.
 func TestTheDirectoryIsKeyedByTheContractKeyBuilder(t *testing.T) {
 	directory := NewDirectory(nil)
 	key, err := contract.TrunkKVKey(directoryOrg, directoryTrunk)
@@ -103,8 +97,7 @@ func TestTheDirectoryIsKeyedByTheContractKeyBuilder(t *testing.T) {
 	}
 }
 
-// A record that fails Validate is REFUSED and the previous one stands. An operator who saves a
-// half-filled trunk form must not take a working carrier offline.
+// An operator saving a half-filled trunk form must not take a working carrier offline.
 func TestAnInvalidRecordDoesNotReplaceAWorkingOne(t *testing.T) {
 	directory := NewDirectory(nil)
 	key, _ := contract.TrunkKVKey(directoryOrg, directoryTrunk)
@@ -124,7 +117,6 @@ func TestAnInvalidRecordDoesNotReplaceAWorkingOne(t *testing.T) {
 	}
 }
 
-// Removal takes effect immediately, which is the path a decommissioned trunk takes.
 func TestRemovingATrunkTakesEffectImmediately(t *testing.T) {
 	directory := NewDirectory(nil)
 	key, _ := contract.TrunkKVKey(directoryOrg, directoryTrunk)
@@ -139,8 +131,7 @@ func TestRemovingATrunkTakesEffectImmediately(t *testing.T) {
 	}
 }
 
-// sameConfig compares what the machine reads, so a rename or a capacity edit does not
-// restart a gateway and put a REGISTER on the wire for nothing.
+// sameConfig compares only what the machine reads, so a rename puts no REGISTER on the wire.
 func TestARenameDoesNotRestartAGateway(t *testing.T) {
 	left := testRecord().Config()
 	renamed := testRecord()
@@ -188,8 +179,6 @@ func TestAPIPublishedTrunkReachesDirectory(t *testing.T) {
 	}
 }
 
-// The supervisor reconciles: a trunk that leaves the directory stops, one that arrives starts, and
-// one that is unchanged is left alone.
 func TestTheSupervisorReconcilesAgainstTheDirectory(t *testing.T) {
 	supervisor, err := NewSupervisor(SupervisorOptions{
 		Registrar: stubRegistrar{},
@@ -222,8 +211,7 @@ func TestTheSupervisorReconcilesAgainstTheDirectory(t *testing.T) {
 	}
 }
 
-// An ip-auth trunk is UP as soon as it is configured. There is nothing to establish, and reporting
-// `unknown` for ever would make every ip-auth carrier look broken on a dashboard.
+// Nothing to establish, and `unknown` for ever would make every ip-auth carrier look broken.
 func TestAnIPAuthTrunkReportsUpWithoutRegistering(t *testing.T) {
 	publisher := NewRecordingPublisher()
 	supervisor, err := NewSupervisor(SupervisorOptions{
@@ -251,8 +239,7 @@ func TestAnIPAuthTrunkReportsUpWithoutRegistering(t *testing.T) {
 	t.Fatalf("no `up` was published for an ip-auth trunk; transitions = %v", publisher.Transitions())
 }
 
-// A supervisor that tracked carrier state and told nobody would be a dashboard that is always
-// green, so it is refused at construction by name.
+// A supervisor that tracked carrier state and told nobody would be a dashboard that is always green.
 func TestTheSupervisorRefusesToRunWithoutAPublisher(t *testing.T) {
 	if _, err := NewSupervisor(SupervisorOptions{Registrar: stubRegistrar{}}); err == nil {
 		t.Fatal("NewSupervisor accepted a nil publisher")

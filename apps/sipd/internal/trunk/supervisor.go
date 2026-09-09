@@ -9,19 +9,11 @@ import (
 	"time"
 )
 
-// Registrar sends one REGISTER and reports what came back.
+// Registrar sends one REGISTER and reports the outcome in the machine's own vocabulary — accepted,
+// rejected, challenged or timed out — rather than as an error. Returning an error would force the
+// supervisor to classify it, which is a second opinion about what a 403 means.
 //
-// # Why the seam is "send and tell me the outcome" and not "send"
-//
-// The gateway machine is a pure function of triggers and a clock, and it stays that way only if the
-// thing that touches a socket hands back a TRIGGER rather than an error. So this returns the
-// outcome in the machine's own vocabulary — accepted with a granted expiry, rejected with a status,
-// challenged, or timed out — and the supervisor feeds it straight in. An implementation that
-// returned `error` would force the supervisor to classify a transport failure as one of four
-// triggers, which is a second opinion about what a 403 means.
-//
-// It is an interface so the supervisor is testable with no socket at all, which is the only way the
-// backoff, the failover and the status-publication rules can be table-tested.
+// It is an interface so the supervisor is testable with no socket.
 type Registrar interface {
 	Register(ctx context.Context, config Config, registrar string, expires time.Duration) Result
 }
@@ -32,29 +24,17 @@ type Result struct {
 	Trigger Trigger
 	// Status is the SIP status for a rejection.
 	Status int
-	// GrantedExpires is what the registrar actually gave us, which is frequently shorter than what
-	// was asked for and is the one the refresh must be based on.
+	// GrantedExpires is what the registrar actually gave us — often shorter than what was asked
+	// for, and the one the refresh must be based on.
 	GrantedExpires time.Duration
 	// Err is for the log only. The machine never sees it.
 	Err error
 }
 
-// Supervisor owns one gateway per registering trunk and drives it.
+// Supervisor owns one gateway per trunk from the directory and drives each on its own goroutine,
+// because a Gateway is not safe for concurrent use. The supervisor's map is the only shared state.
 //
-// # One goroutine per trunk, and the reason is the same one everywhere else in this service
-//
-// A Gateway is explicitly not safe for concurrent use, because a refresh racing a rejection has to
-// have exactly one winner. So each gets a goroutine, its timers are that goroutine's own, and the
-// supervisor's map is the only shared thing.
-//
-// # What it does with the directory
-//
-// It takes the trunk rows the `trunks` bucket delivered and starts a gateway for each. That is the
-// sentence internal/trunk's package comment has been waiting for: the machine "decides WHEN to
-// register, WHERE to register, how long to wait after a failure, when to fail over" and until now
-// nothing delivered it any trunks to decide about. A trunk whose row says `ip-auth` gets a gateway
-// too — it just never registers, and reports `up` as soon as it is configured, because reporting
-// `unknown` for ever would make every ip-auth carrier look broken on a dashboard.
+// An `ip-auth` trunk gets a gateway too; it never registers and reports `up` once configured.
 type Supervisor struct {
 	registrar Registrar
 	publisher Publisher
@@ -70,8 +50,8 @@ type Supervisor struct {
 type SupervisorOptions struct {
 	// Registrar sends the REGISTERs. Required.
 	Registrar Registrar
-	// Publisher emits `trunk.status.changed`. Required — a supervisor that tracked carrier state and
-	// told nobody would be a dashboard that is always green.
+	// Publisher emits `trunk.status.changed`. Required: a supervisor that told nobody would be a
+	// dashboard that is always green.
 	Publisher Publisher
 	// Backoff is the retry policy. Zero means DefaultBackoff.
 	Backoff Backoff
@@ -103,21 +83,12 @@ func NewSupervisor(opts SupervisorOptions) (*Supervisor, error) {
 	return supervisor, nil
 }
 
-// Apply reconciles the running gateways against a set of configurations.
+// Apply reconciles the running gateways against a set of configurations, so a boot and a watch
+// update take the same path.
 //
-// # Reconcile rather than "start", so a watch update is the same call as a boot
-//
-// The directory is watched, so a trunk can be added, edited or deleted at any moment. Modelling
-// that as three operations would mean three code paths that could disagree about what an edit is;
-// modelling it as "make the world look like this list" means the boot and the hundredth edit take
-// the same path, and the only thing that varies is how much of it is a no-op.
-//
-// An EDITED trunk is stopped and restarted rather than mutated in place. That is the blunt choice
-// and it is the right one: a Gateway's state — which registrar it is on, how many failures it has
-// seen, when its refresh is due — is only meaningful relative to the configuration it was built
-// from, and carrying it across a change of proxy or credential would mean a trunk that fails over
-// to an address that no longer exists. The cost is one REGISTER, which is what a configuration
-// change deserves anyway.
+// An EDITED trunk is stopped and restarted rather than mutated: a Gateway's state (which registrar
+// it is on, its failure count, when its refresh is due) is only meaningful relative to the
+// configuration it was built from.
 func (s *Supervisor) Apply(ctx context.Context, configs []Config) {
 	desired := make(map[string]Config, len(configs))
 	for _, config := range configs {
@@ -162,13 +133,11 @@ func (s *Supervisor) Len() int {
 	return len(s.running)
 }
 
-// Stop stops every gateway and waits for them.
+// Stop stops every gateway and waits for them. It does NOT unregister: that needs a bounded
+// context Stop does not have, so registrations lapse on their granted interval.
 //
-// It does NOT unregister. A drain that unregistered would be the right thing and it needs a bounded
-// context to do it in, which Stop does not have; the gateway machine already produces
-// ActionSendUnregister on TriggerStop, and wiring a shutdown that uses it is the follow-up. Until
-// then a stopped instance's registrations lapse on their granted interval, which is what a crash
-// would do anyway.
+// TODO: wire a drain that feeds TriggerStop and sends the resulting ActionSendUnregister, once Stop
+// takes a context.
 func (s *Supervisor) Stop() {
 	s.mu.Lock()
 	for id, runner := range s.running {
@@ -192,18 +161,10 @@ func (s *Supervisor) start(ctx context.Context, config Config) (*gatewayRunner, 
 		cancel:  cancel,
 		log:     s.log,
 	}
-	s.wait.Add(1)
-	go func() {
-		defer s.wait.Done()
-		s.run(runnerCtx, runner)
-	}()
-	// Jittered, not immediate. Backoff jitters RETRIES with the stated rationale that a carrier
-	// that is down is down for every one of our instances at once — and the first registration after
-	// a fleet restart or a directory replay is the same storm aimed at a carrier that is UP: N
-	// trunks x M instances all REGISTERing in the same millisecond.
-	//
-	// The spread is a fraction of the backoff's own initial interval, so it is measured in the same
-	// units as everything else here and stays well under a second by default.
+	s.wait.Go(func() { s.run(runnerCtx, runner) })
+	// Jittered, not immediate: the first registration after a fleet restart or a directory replay is
+	// N trunks x M instances REGISTERing in the same millisecond at a carrier that is UP. The spread
+	// is a fraction of the backoff's own initial interval.
 	delay := time.Duration(rand.Float64() * float64(s.backoff.Initial)) //nolint:gosec // de-synchronising registrations, not a secret
 	runner.arm(&runner.retry, delay, func() { runner.post(Input{Trigger: TriggerStart}) })
 	return runner, nil
@@ -234,12 +195,10 @@ func (s *Supervisor) run(ctx context.Context, runner *gatewayRunner) {
 func (s *Supervisor) perform(ctx context.Context, runner *gatewayRunner, action Action) {
 	switch action.Kind {
 	case ActionSendRegister:
-		// On a goroutine of its own, so a carrier that does not answer for thirty-two seconds does not
-		// stop this gateway from processing a Stop or a configuration change in the meantime. The
-		// RESULT comes back through the mailbox, which is what keeps the machine single-threaded.
-		s.wait.Add(1)
-		go func() {
-			defer s.wait.Done()
+		// On its own goroutine, so a carrier that does not answer cannot stop this gateway from
+		// processing a Stop or a configuration change. The RESULT comes back through the mailbox,
+		// which is what keeps the machine single-threaded.
+		s.wait.Go(func() {
 			result := s.registrar.Register(ctx, runner.config, action.Registrar, action.Expires)
 			if result.Err != nil {
 				s.log.Warn("a trunk REGISTER failed",
@@ -250,17 +209,14 @@ func (s *Supervisor) perform(ctx context.Context, runner *gatewayRunner, action 
 				Status:         result.Status,
 				GrantedExpires: result.GrantedExpires,
 			})
-		}()
+		})
 
 	case ActionSendUnregister:
-		s.wait.Add(1)
-		go func() {
-			defer s.wait.Done()
+		s.wait.Go(func() {
 			// Expires zero is the unregister. Its outcome is not fed back: the machine has already
-			// moved to its new state and a failure changes nothing it would do differently — the
-			// binding lapses on its own interval either way.
+			// moved on and the binding lapses on its own interval either way.
 			_ = s.registrar.Register(ctx, runner.config, action.Registrar, 0)
-		}()
+		})
 
 	case ActionScheduleRefresh:
 		runner.arm(&runner.refresh, action.After, func() {
@@ -280,8 +236,7 @@ func (s *Supervisor) perform(ctx context.Context, runner *gatewayRunner, action 
 		publishCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		if err := s.publisher.StatusChanged(publishCtx, runner.config, action.Status, action.Reason); err != nil {
-			// A status that cannot be published costs a stale column, not a call. Failing the gateway
-			// here would take a working carrier down because a stream was slow.
+			// A status that cannot be published costs a stale column, not a call.
 			s.log.Warn("cannot publish a trunk status change",
 				"trunkId", runner.config.TrunkID, "status", string(action.Status), "error", err)
 		}
@@ -302,16 +257,11 @@ type gatewayRunner struct {
 	stopped bool
 }
 
-// post enqueues an input, dropping it if the runner has stopped.
+// post enqueues an input, dropping it only if the runner has STOPPED — a response arriving after
+// the trunk was deleted has nowhere to go, and a blocking send would leak its goroutine.
 //
-// Dropping rather than blocking, and it matters on exactly one path: a REGISTER whose response
-// arrives after the trunk was deleted has nowhere to go, and a blocking send would leak the
-// goroutine that is holding it. That is the `stopped` check above, and it is the ONLY case dropping
-// is correct for. A RUNNING runner whose four-slot mailbox is momentarily full must not lose an
-// input: a TriggerAccepted dropped behind three timer ticks leaves the gateway in Registering and
-// reporting `degraded` for a trunk that is up, until its retry timer happens to fire. So the send is
-// bounded rather than non-blocking, and a send that really cannot land is logged with its trigger
-// instead of vanishing.
+// A running runner's send is bounded rather than non-blocking: a TriggerAccepted dropped behind
+// three timer ticks would leave the gateway reporting `degraded` for a trunk that is up.
 func (r *gatewayRunner) post(in Input) {
 	r.mu.Lock()
 	stopped := r.stopped
@@ -370,12 +320,9 @@ func (r *gatewayRunner) stopTimers() {
 	}
 }
 
-// sameConfig reports whether two configurations would produce the same registration behaviour.
-//
-// It compares the fields the machine READS and not the whole struct, deliberately: a trunk renamed
-// in the admin UI, or one whose codec preferences changed, must not produce a REGISTER — and a
-// struct comparison would restart the gateway for both. MaxChannels is likewise excluded; it is
-// carried so a capacity refusal has somewhere to read it from and the machine never looks at it.
+// sameConfig reports whether two configurations would produce the same registration behaviour. It
+// compares only the fields the machine READS, so a rename (or any other field the machine ignores,
+// MaxChannels included) does not restart a gateway and put a REGISTER on the wire.
 func sameConfig(left, right Config) bool {
 	return left.Enabled == right.Enabled &&
 		left.Register == right.Register &&

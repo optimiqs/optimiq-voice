@@ -11,15 +11,14 @@ import (
 func record(network, action string, priority int, trunkID string) Record {
 	var trunk *string
 	if trunkID != "" {
-		trunk = &trunkID
+		trunk = new(trunkID)
 	}
 	return Record{
 		OrgID:   "org-test",
 		Network: network,
 		Action:  contract.SIPACLEntryAction(action),
 		Scope:   ScopeTrunk,
-		// Priority is the COLUMN's, "lower first". The inversion into the evaluator's "higher wins"
-		// is this package's job and is exactly what these tests are checking.
+		// Priority is the COLUMN's, "lower first"; this package inverts it.
 		Priority: priority,
 		TrunkID:  trunk,
 		Enabled:  true,
@@ -36,8 +35,7 @@ func newTestWatcher(t *testing.T, overrides []profile.Entry) (*profile.ACL, *Wat
 	return acl, watcher
 }
 
-// The whole boundary in one test: an address matching NOTHING is REFUSED. There is no default allow
-// anywhere in this package or in internal/profile, and there is no constructor that could give one.
+// There is no default allow anywhere in this package or in internal/profile.
 func TestAnAddressMatchingNothingIsRefused(t *testing.T) {
 	acl, watcher := newTestWatcher(t, nil)
 	watcher.Put("203-0-113-0-24", record("203.0.113.0/24", "allow", 100, "trunk-a"))
@@ -50,9 +48,8 @@ func TestAnAddressMatchingNothingIsRefused(t *testing.T) {
 	}
 }
 
-// An EMPTY ACL refuses everything, which is what makes it safe to build the external profile before
-// the bucket has replayed. The alternative — refusing to boot until the ACL loads — would let a
-// briefly slow broker take REGISTER down with it.
+// An empty ACL refusing everything is what makes it safe to build the external profile before the
+// bucket has replayed, rather than refusing to boot until the ACL loads.
 func TestAnEmptyACLRefusesEveryAddress(t *testing.T) {
 	acl, _ := newTestWatcher(t, nil)
 	if acl.Len() != 0 {
@@ -63,8 +60,6 @@ func TestAnEmptyACLRefusesEveryAddress(t *testing.T) {
 	}
 }
 
-// Lowest column priority first, and the evaluator sees it as highest. A deny written at priority 10
-// must beat an allow at 100 for the same network, or an operator's "block this range" does nothing.
 func TestLowerColumnPriorityWins(t *testing.T) {
 	acl, watcher := newTestWatcher(t, nil)
 	watcher.Put("allow", record("203.0.113.0/24", "allow", 100, "trunk-a"))
@@ -75,8 +70,8 @@ func TestLowerColumnPriorityWins(t *testing.T) {
 	}
 }
 
-// Ties are broken by the MOST SPECIFIC prefix. An operator denies a range and then allows one
-// customer inside it, and the /32 has to win or the exception is unreachable.
+// An operator denies a range then allows one customer inside it; the /32 must win or the exception
+// is unreachable.
 func TestTheMostSpecificPrefixWinsAtEqualPriority(t *testing.T) {
 	acl, watcher := newTestWatcher(t, nil)
 	watcher.Put("deny-range", record("203.0.113.0/24", "deny", 100, ""))
@@ -94,8 +89,8 @@ func TestTheMostSpecificPrefixWinsAtEqualPriority(t *testing.T) {
 	}
 }
 
-// The scope filter IS the anti-toll-fraud boundary, in the column's own words. An entry written to
-// let an office reach the provisioning endpoint must not also let it send unauthenticated INVITEs.
+// The scope filter is the anti-toll-fraud boundary: an entry admitting an office to the provisioning
+// endpoint must not also let it send unauthenticated INVITEs.
 func TestOnlyTheTrunkScopeGovernsINVITEAdmission(t *testing.T) {
 	acl, watcher := newTestWatcher(t, nil)
 	for _, scope := range []contract.SIPACLEntryScope{
@@ -116,8 +111,7 @@ func TestOnlyTheTrunkScopeGovernsINVITEAdmission(t *testing.T) {
 	}
 }
 
-// A disabled entry is one an operator switched off. Treating it as an allow is how a decommissioned
-// carrier keeps sending calls.
+// Treating a disabled entry as an allow is how a decommissioned carrier keeps sending calls.
 func TestADisabledEntryDoesNotApply(t *testing.T) {
 	acl, watcher := newTestWatcher(t, nil)
 	entry := record("203.0.113.0/24", "allow", 100, "trunk-a")
@@ -129,8 +123,7 @@ func TestADisabledEntryDoesNotApply(t *testing.T) {
 	}
 }
 
-// One unusable row must not take every carrier offline. The control plane writes this bucket and
-// this process does not control it, so a single malformed network is skipped and the rest apply.
+// The control plane writes this bucket, so one malformed row must not take every carrier offline.
 func TestOneUnusableRecordDoesNotDiscardTheRest(t *testing.T) {
 	acl, watcher := newTestWatcher(t, nil)
 	watcher.Put("good", record("203.0.113.0/24", "allow", 100, "trunk-a"))
@@ -145,8 +138,7 @@ func TestOneUnusableRecordDoesNotDiscardTheRest(t *testing.T) {
 	}
 }
 
-// A withdrawn entry stops admitting immediately. This is the path a revoked carrier takes, and a
-// deny that took effect only on restart would be a boundary that is advisory.
+// The revoked-carrier path: a deny taking effect only on restart would make the boundary advisory.
 func TestRemovingAnEntryRevokesItImmediately(t *testing.T) {
 	acl, watcher := newTestWatcher(t, nil)
 	watcher.Put("allow", record("203.0.113.0/24", "allow", 100, "trunk-a"))
@@ -160,9 +152,8 @@ func TestRemovingAnEntryRevokesItImmediately(t *testing.T) {
 	}
 }
 
-// SIPD_TRUNK_ACL is an OVERRIDE now. It survives every bucket update, which is what makes it
-// trustworthy for the case it exists for: an operator admitting one address during an incident who
-// cannot wait for a database write to propagate.
+// SIPD_TRUNK_ACL survives every bucket update, for the operator admitting one address during an
+// incident who cannot wait for a database write to propagate.
 func TestConfiguredOverridesSurviveBucketUpdates(t *testing.T) {
 	override, err := profile.ParseEntry("198.51.100.9", profile.ActionAllow, 0, "trunk-override", "SIPD_TRUNK_ACL")
 	if err != nil {
@@ -183,9 +174,7 @@ func TestConfiguredOverridesSurviveBucketUpdates(t *testing.T) {
 	}
 }
 
-// An override outranks a bucket entry for the same network, because overrides exist to win. The
-// arithmetic is not obvious at either end alone — the column is negated and an override is zero — so
-// it is asserted rather than assumed.
+// The arithmetic is not obvious at either end alone: the column is negated and an override is zero.
 func TestAnOverrideOutranksABucketDeny(t *testing.T) {
 	override, err := profile.ParseEntry("203.0.113.0/24", profile.ActionAllow, 0, "trunk-override", "SIPD_TRUNK_ACL")
 	if err != nil {
@@ -199,8 +188,7 @@ func TestAnOverrideOutranksABucketDeny(t *testing.T) {
 	}
 }
 
-// The record's action decides, and the trunk id is what turns "this packet may enter" into "this
-// packet is Telnyx" — the attribution the engine needs before it can be asked whose call it is.
+// The trunk id is the attribution the engine needs before it can be asked whose call it is.
 func TestAMatchedAllowCarriesItsTrunkAttribution(t *testing.T) {
 	acl, watcher := newTestWatcher(t, nil)
 	watcher.Put("allow", record("203.0.113.0/24", "allow", 100, "018f-telnyx"))
@@ -214,9 +202,8 @@ func TestAMatchedAllowCarriesItsTrunkAttribution(t *testing.T) {
 	}
 }
 
-// The initial replay arrives as one update per key, so recompiling per key makes loading N entries
-// N recompilations of N entries — quadratic prefix parsing and sorting before the boundary is
-// usable, which is the window in which every carrier is refused.
+// The initial replay arrives as one update per key; recompiling per key would be quadratic, and
+// every carrier is refused until it finishes.
 func TestSuspendDefersRecompilationUntilResume(t *testing.T) {
 	acl, watcher := newTestWatcher(t, nil)
 
@@ -227,8 +214,7 @@ func TestSuspendDefersRecompilationUntilResume(t *testing.T) {
 	if watcher.Len() != 3 {
 		t.Fatalf("the watcher holds %d records, want 3", watcher.Len())
 	}
-	// Suspended means the ACL is untouched, which is EMPTY rather than half-applied — the safe
-	// direction on this boundary and what it already does before a replay starts.
+	// Suspended leaves the ACL empty rather than half-applied.
 	if acl.Len() != 0 {
 		t.Fatalf("the ACL compiled %d entries while suspended", acl.Len())
 	}
@@ -244,7 +230,6 @@ func TestSuspendDefersRecompilationUntilResume(t *testing.T) {
 		t.Fatal("the replayed entries never applied")
 	}
 
-	// After the replay, each update recompiles on its own again.
 	watcher.Remove("203.0.113.0/24")
 	if _, allowed := acl.Match("203.0.113.7:5060"); allowed {
 		t.Fatal("a withdrawn entry still admits after a resume")
