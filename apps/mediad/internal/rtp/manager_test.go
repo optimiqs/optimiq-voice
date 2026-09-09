@@ -16,9 +16,7 @@ import (
 
 var publicAddr = netipMustParseStatic("203.0.113.10")
 
-// Every allocate in this file carries the same tenant and call. mediad does not route on either —
-// they exist so a lifecycle event and a directory entry can be attributed — so one value is enough
-// for everything except the tests that are specifically about them.
+// Every allocate in this file carries the same tenant and call; mediad routes on neither.
 const (
 	testOrg  = "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
 	testCall = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c"
@@ -94,9 +92,8 @@ func TestAllocateDescribesTheSession(t *testing.T) {
 	}
 }
 
-// Idempotency is the whole reason the session id is caller-assigned. The control surface is NATS
-// request-reply, so a retry after a timeout is indistinguishable here from a fresh request; without
-// this, every timed-out allocate would leak a port.
+// Idempotency is why the session id is caller-assigned: on NATS request-reply a retry after a
+// timeout is indistinguishable from a fresh request, and would otherwise leak a port.
 func TestAllocateIsIdempotentBySessionID(t *testing.T) {
 	manager := newManager(t, 55200, 55219, 0, nil)
 
@@ -146,10 +143,8 @@ func TestConcurrentAllocateForOneIDYieldsOneSession(t *testing.T) {
 		mu    sync.Mutex
 		ports = map[int]bool{}
 	)
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 8 {
+		wg.Go(func() {
 			descriptor, err := manager.Allocate(rtp.AllocateOptions{SessionID: "racing-id", OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU, Inactive: false})
 			if err != nil {
 				return
@@ -157,7 +152,7 @@ func TestConcurrentAllocateForOneIDYieldsOneSession(t *testing.T) {
 			mu.Lock()
 			defer mu.Unlock()
 			ports[descriptor.RTPPort] = true
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -275,10 +270,8 @@ func TestReapIdleClosesSessionsWithNoTraffic(t *testing.T) {
 }
 
 func TestReapIdleCollectsARingingLegThatNeverHeardAnything(t *testing.T) {
-	// A leg that is ringing is answered `inactive`, so the allocate sets BOTH mute gates — and the
-	// reaper used to skip every gated session unconditionally, which meant an engine that crashed
-	// between the allocate and the release leaked that port pair for the life of the process. The
-	// gates say "silence is expected here"; they do not say "this was never a session at all".
+	// A ringing leg is answered `inactive`, so the allocate sets both mute gates. The gates say
+	// "silence is expected here", not "never reap this", or a crashed engine leaks the port pair.
 	now := time.Now()
 	manager := newManager(t, 55940, 55959, 30*time.Second, func() time.Time { return now })
 
@@ -389,7 +382,7 @@ func TestDrainClosesEverythingAndRefusesNewAllocations(t *testing.T) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
+	ctx, cancel := context.WithTimeout(t.Context(), readTimeout)
 	defer cancel()
 	if err := manager.Drain(ctx); err != nil {
 		t.Fatalf("Drain: %v", err)
@@ -411,10 +404,8 @@ func TestDrainClosesEverythingAndRefusesNewAllocations(t *testing.T) {
 }
 
 func TestDrainReleasesEveryPortEvenPastItsDeadline(t *testing.T) {
-	// The close loop used to be serial AND unable to see the drain context, so a box whose recorders
-	// were finalising onto a wedged mount spent five seconds per session in a loop nothing could
-	// interrupt — well past MEDIAD_SHUTDOWN_TIMEOUT, which exists to bound exactly this. Whatever
-	// the deadline does, no socket may be left open behind it.
+	// Recorders finalising onto a wedged mount must not hold the drain past its deadline, and no
+	// socket may be left open behind it.
 	allocator, err := rtp.NewAllocator(loopback, 56340, 56379)
 	if err != nil {
 		t.Fatalf("NewAllocator: %v", err)

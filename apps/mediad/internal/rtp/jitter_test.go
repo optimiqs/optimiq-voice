@@ -8,22 +8,19 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
 
-// The jitter buffer suite drives Push and Pop directly, with no sockets and no clock.
-//
-// That is the whole reason the buffer takes an arrival TIME rather than reading one: every property
-// worth asserting here — reordering, loss, lateness, depth adaptation, sequence wrap — is a function
-// of the order things arrive in, and a test that had to produce those orders by racing real packets
-// would assert them by luck.
+// The jitter buffer suite drives Push and Pop directly, with no sockets and no clock — which is why
+// the buffer takes an arrival time rather than reading one: reordering, loss, lateness, depth
+// adaptation and sequence wrap are all functions of arrival order.
 
-// jitterFrame builds a payload whose first byte identifies the sequence it belongs to, so an
-// out-of-order delivery is visible in the DATA rather than only in a counter.
+// jitterFrame builds a payload whose first byte identifies its sequence, so an out-of-order
+// delivery is visible in the data rather than only in a counter.
 func jitterFrame(sequence uint16) []byte {
 	return []byte{byte(sequence), 0x55, 0x55}
 }
 
 // pushRun feeds a contiguous run of frames.
 func pushRun(buffer *rtp.JitterBuffer, from uint16, count int, at time.Time) time.Time {
-	for index := 0; index < count; index++ {
+	for index := range count {
 		sequence := from + uint16(index)
 		buffer.Push(sequence, uint32(sequence)*audio.FrameTimestampStep, jitterFrame(sequence), at)
 		at = at.Add(audio.FrameDurationMs * time.Millisecond)
@@ -34,10 +31,8 @@ func pushRun(buffer *rtp.JitterBuffer, from uint16, count int, at time.Time) tim
 func TestJitterBufferPrimesBeforeItPlays(t *testing.T) {
 	t.Parallel()
 
-	// A buffer that played its first frame the instant one arrived would have no depth at all, which
-	// is the state it exists to leave. Until it has primed, a Pop is SILENCE and is not counted as
-	// loss: nobody has been promised audio yet, which is the difference between a participant who has
-	// just joined and one whose network fell over.
+	// Until the buffer has primed, a Pop is silence and is not counted as loss: nobody has been
+	// promised audio yet.
 	buffer := rtp.NewJitterBuffer(audio.SampleRate)
 	now := time.Now()
 
@@ -67,8 +62,7 @@ func TestJitterBufferPrimesBeforeItPlays(t *testing.T) {
 func TestJitterBufferPlaysReorderedPacketsInOrder(t *testing.T) {
 	t.Parallel()
 
-	// The buffer's whole reason for existing. Three frames arrive as 3, 1, 2 — which is what a
-	// network with two paths produces routinely — and all three must play as 1, 2, 3.
+	// Three frames arriving as 3, 1, 2 must play as 1, 2, 3.
 	buffer := rtp.NewJitterBuffer(audio.SampleRate)
 	now := time.Now()
 
@@ -95,9 +89,8 @@ func TestJitterBufferPlaysReorderedPacketsInOrder(t *testing.T) {
 func TestJitterBufferReportsAHoleAsLossRatherThanSkippingIt(t *testing.T) {
 	t.Parallel()
 
-	// A missing frame is SILENCE at its own slot and the following frames keep their places. The
-	// alternative — playing the next arrival early — shortens everybody's audio by 20 ms per lost
-	// packet, which is a mixer that drifts steadily ahead of the conversation.
+	// A missing frame is silence at its own slot; playing the next arrival early would shorten the
+	// audio by 20 ms per lost packet and drift the mixer ahead of the conversation.
 	buffer := rtp.NewJitterBuffer(audio.SampleRate)
 	now := time.Now()
 
@@ -107,7 +100,7 @@ func TestJitterBufferReportsAHoleAsLossRatherThanSkippingIt(t *testing.T) {
 	}
 
 	got := []int{}
-	for tick := 0; tick < 5; tick++ {
+	for range 5 {
 		if frame, ok := buffer.Pop(); ok {
 			got = append(got, int(frame[0]))
 		} else {
@@ -129,15 +122,14 @@ func TestJitterBufferReportsAHoleAsLossRatherThanSkippingIt(t *testing.T) {
 func TestJitterBufferCountsAndDiscardsLatePackets(t *testing.T) {
 	t.Parallel()
 
-	// A packet whose slot has already been played cannot be used: inserting it would either play it
-	// out of order or require rewinding a mix that has already been sent. `Late` and `Lost` are the
-	// same event seen from two ends, and the RATIO is what says whether the buffer is too shallow or
-	// the network is genuinely dropping packets — which need opposite responses.
+	// A packet whose slot has already been played cannot be used. `Late` and `Lost` are the same
+	// event from two ends, and their ratio says whether the buffer is too shallow or the network is
+	// genuinely dropping — which need opposite responses.
 	buffer := rtp.NewJitterBuffer(audio.SampleRate)
 	now := time.Now()
 
 	pushRun(buffer, 1, 4, now)
-	for tick := 0; tick < 4; tick++ {
+	for range 4 {
 		buffer.Pop()
 	}
 
@@ -154,25 +146,23 @@ func TestJitterBufferCountsAndDiscardsLatePackets(t *testing.T) {
 func TestJitterBufferDeepensOnLossAndReleasesSlowly(t *testing.T) {
 	t.Parallel()
 
-	// The asymmetry IS the policy: depth is added immediately on an underrun and released only after
-	// two seconds of not needing it. Being one frame too shallow is an audible gap right now; being
-	// one frame too deep is 20 ms nobody can perceive. A symmetric controller would oscillate around
-	// the threshold and produce a gap every time it guessed low.
+	// The asymmetry is the policy: depth is added immediately on an underrun and released only after
+	// two seconds of not needing it. Too shallow is an audible gap; too deep is 20 ms nobody hears.
 	buffer := rtp.NewJitterBuffer(audio.SampleRate)
 	now := time.Now()
 
 	start := buffer.Target()
 	pushRun(buffer, 1, 3, now)
-	for tick := 0; tick < 4; tick++ {
+	for range 4 {
 		buffer.Pop() // the fourth Pop underruns
 	}
 	if deepened := buffer.Target(); deepened <= start {
 		t.Fatalf("target = %d after an underrun, want deeper than %d", deepened, start)
 	}
 
-	// It does NOT give the frame back on the next comfortable tick.
+	// It does not give the frame back on the next comfortable tick.
 	next := pushRun(buffer, 100, 6, now.Add(time.Second))
-	for tick := 0; tick < 3; tick++ {
+	for range 3 {
 		buffer.Pop()
 	}
 	if released := buffer.Target(); released < start+1 {
@@ -184,16 +174,15 @@ func TestJitterBufferDeepensOnLossAndReleasesSlowly(t *testing.T) {
 func TestJitterBufferNeverExceedsItsBounds(t *testing.T) {
 	t.Parallel()
 
-	// The ceiling is a HUMAN constraint rather than a network one: ITU-T G.114 puts comfortable
-	// interactive conversation at about 150 ms of one-way delay, and the mixer's buffer is only one
-	// contributor alongside two endpoint buffers. Past the bound, more depth buys silence instead of
-	// intelligibility — so the gaps are counted and the depth stops.
+	// The ceiling is a human constraint: ITU-T G.114 puts comfortable interactive conversation at
+	// about 150 ms one-way, and this buffer is only one contributor. Past the bound the gaps are
+	// counted and the depth stops.
 	buffer := rtp.NewJitterBuffer(audio.SampleRate)
 	now := time.Now()
 
 	// Fifty consecutive underruns, which is a leg that has stopped sending entirely.
 	pushRun(buffer, 1, 3, now)
-	for tick := 0; tick < 60; tick++ {
+	for range 60 {
 		buffer.Pop()
 	}
 
@@ -209,10 +198,8 @@ func TestJitterBufferNeverExceedsItsBounds(t *testing.T) {
 func TestJitterBufferDiscardsAFloodRatherThanGrowing(t *testing.T) {
 	t.Parallel()
 
-	// A sender genuinely faster than the mixer's clock — a broken endpoint, or clock drift over a
-	// long call — would otherwise grow the pending map until the process died. Bounded, and counted,
-	// because a conference with one participant missing frames is a support ticket and a media plane
-	// that ran out of memory is an outage.
+	// A sender faster than the mixer's clock would otherwise grow the pending map until the process
+	// died. Bounded and counted: one participant missing frames beats an out-of-memory outage.
 	buffer := rtp.NewJitterBuffer(audio.SampleRate)
 	now := time.Now()
 
@@ -228,9 +215,8 @@ func TestJitterBufferDiscardsAFloodRatherThanGrowing(t *testing.T) {
 func TestJitterBufferSurvivesTheSequenceWrap(t *testing.T) {
 	t.Parallel()
 
-	// A call lasting twenty-two minutes at fifty packets a second wraps the 16-bit sequence space. A
-	// naive `a >= b` would declare every packet after the wrap ancient and discard the rest of the
-	// conference — which is a conference that works perfectly for twenty-two minutes and then dies.
+	// Twenty-two minutes at fifty packets a second wraps the 16-bit sequence space; a naive `a >= b`
+	// would declare every packet after the wrap ancient.
 	buffer := rtp.NewJitterBuffer(audio.SampleRate)
 	now := time.Now()
 
@@ -254,9 +240,7 @@ func TestJitterBufferSurvivesTheSequenceWrap(t *testing.T) {
 func TestJitterBufferDropsDuplicatesSilently(t *testing.T) {
 	t.Parallel()
 
-	// A retransmission or a duplicated datagram. Nothing is missing and nothing is late, so it counts
-	// as neither — a buffer that filed duplicates as loss would report a network fault on a network
-	// that was merely being generous.
+	// A duplicate is neither missing nor late, so it counts as neither.
 	buffer := rtp.NewJitterBuffer(audio.SampleRate)
 	now := time.Now()
 
@@ -275,16 +259,14 @@ func TestJitterBufferDropsDuplicatesSilently(t *testing.T) {
 func TestJitterBufferResyncsAcrossALargeSequenceJump(t *testing.T) {
 	t.Parallel()
 
-	// A sender whose sequence jumps forward — a re-INVITE that restarts the stream, an endpoint bug —
-	// used to cost the room one tick of silence PER SKIPPED SEQUENCE, because playout only ever
-	// stepped forward by one and the "everything drained, re-prime" escape hatch never fired: the new
-	// packets kept the buffer non-empty while `next` walked towards them at 20 ms a frame. A jump of
-	// a thousand was twenty seconds of silence heard by everybody.
+	// A sender whose sequence jumps forward — a re-INVITE that restarts the stream, or an endpoint
+	// bug — must resync rather than walk to the new sequence at 20 ms a frame, which would be one
+	// tick of silence per skipped sequence.
 	buffer := rtp.NewJitterBuffer(audio.SampleRate)
 	now := time.Now()
 
 	now = pushRun(buffer, 100, 6, now)
-	for index := 0; index < 6; index++ {
+	for index := range 6 {
 		if _, ok := buffer.Pop(); !ok {
 			t.Fatalf("Pop %d before the jump played nothing", index)
 		}

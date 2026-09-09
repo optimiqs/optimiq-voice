@@ -11,16 +11,11 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
 
-// `terminateOn`, which design doc §10 question 10 has been carrying as "a WIRING gap rather than a
-// missing capability" since rung 3's receive half landed.
-//
-// The wiring is one line in `announceDigit`: the recorder is asked whether the digit it just
-// detected is one of its terminators. It is checked THERE rather than in the recorder's own tick
-// loop because that loop sees decoded audio frames, and a `#` is not in them.
+// `terminateOn`: `announceDigit` asks the recorder whether the digit just detected is one of its
+// terminators — checked there rather than in the recorder's tick loop, which sees only audio.
 
-// sendDigit puts one complete RFC 4733 keypress on the wire: a few update packets and the END copy,
-// all sharing the timestamp the digit started at, which is what makes them one keypress rather than
-// several.
+// sendDigit puts one complete RFC 4733 keypress on the wire: update packets and the END copy, all
+// sharing the timestamp the digit started at.
 func sendDigit(t *testing.T, from *phone, event byte, timestamp uint32, firstSequence uint16) {
 	t.Helper()
 	for step := 1; step <= 3; step++ {
@@ -48,8 +43,7 @@ func sendDigit(t *testing.T, from *phone, event byte, timestamp uint32, firstSeq
 }
 
 func TestRecordingStopsOnATerminatorDigit(t *testing.T) {
-	// Voicemail's `#`. Without this the recording runs to `maxDurationMs` on every message, which is
-	// why the argument was refused rather than accepted-and-ignored for two waves.
+	// Voicemail's `#`. Without it the recording runs to `maxDurationMs` on every message.
 	rig := newRecordingRig(t, 64000, 64019)
 	rig.latch(t)
 	rig.start(t, "rec-1", rtp.RecordReceive, rtp.RecordingOptions{TerminateOn: "#"})
@@ -64,17 +58,14 @@ func TestRecordingStopsOnATerminatorDigit(t *testing.T) {
 	if summary.Reason != rtp.RecordingStopped {
 		t.Errorf("reason = %q, want stopped", summary.Reason)
 	}
-	// WHICH digit ended it goes in `detail`, which the contract already carries and which is the only
-	// part a person investigating a truncated voicemail actually wants. A sixth `reason` value would
-	// be two media planes agreeing on a vocabulary the engine does not branch on.
+	// Which digit ended it goes in `detail`; there is no sixth `reason` value for it.
 	if !strings.Contains(summary.Detail, "#") {
 		t.Errorf("detail = %q, want it to name the digit that ended the recording", summary.Detail)
 	}
 }
 
 func TestARecordingIgnoresDigitsOutsideItsTerminatorSet(t *testing.T) {
-	// A caller who presses 5 while leaving a message has not finished leaving it. A recorder that
-	// stopped on any digit would truncate every message from anybody with a phone in their pocket.
+	// A caller who presses 5 while leaving a message has not finished leaving it.
 	rig := newRecordingRig(t, 64020, 64039)
 	rig.latch(t)
 	rig.start(t, "rec-1", rtp.RecordReceive, rtp.RecordingOptions{TerminateOn: "#"})
@@ -96,9 +87,7 @@ func TestARecordingIgnoresDigitsOutsideItsTerminatorSet(t *testing.T) {
 }
 
 func TestATerminatorSetAcceptsSeveralDigits(t *testing.T) {
-	// `#*` is what a caller sends when the dialplan offers two ways out of a prompt. The set is a
-	// STRING because that is the shape the contract carries, and membership is the whole of the
-	// matching rule.
+	// The set is a string because that is the shape the contract carries; membership is the rule.
 	rig := newRecordingRig(t, 64040, 64059)
 	rig.latch(t)
 	rig.start(t, "rec-1", rtp.RecordReceive, rtp.RecordingOptions{TerminateOn: "#*"})
@@ -119,9 +108,8 @@ func TestATerminatorSetAcceptsSeveralDigits(t *testing.T) {
 }
 
 func TestNoTerminatorSetMeansNoDigitEndsARecording(t *testing.T) {
-	// The default, and the behaviour every recording had before this. A recorder that stopped on a
-	// digit nobody asked it to watch for would truncate an on-demand call recording the moment
-	// somebody navigated an IVR on the other end.
+	// The default: a recorder that stopped on an unrequested digit would truncate a call recording
+	// the moment somebody navigated an IVR at the other end.
 	rig := newRecordingRig(t, 64060, 64079)
 	rig.latch(t)
 	rig.start(t, "rec-1", rtp.RecordReceive, rtp.RecordingOptions{})

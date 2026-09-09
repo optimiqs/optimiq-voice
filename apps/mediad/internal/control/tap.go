@@ -10,29 +10,22 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
 
-// `rpc.media.v1.tap-session` and its partner, served — which is the last of design doc §10 question
-// 4's W6 addendum coming true.
+// `rpc.media.v1.tap-session` and its partner, served.
 //
-// The addendum's claim was that shaping the contract as an ASYMMETRIC BRIDGE PARTICIPANT rather than
-// as a snoop channel would let rung 6 serve it "by arriving, not by being extended". It arrived: the
-// handler below validates two enum fields and calls `Manager.Tap`, which builds a `JoinOptions` and
-// calls the same `join` a plain conference participant calls. There is no tap-specific code in the
-// mixer at all — eavesdrop, whisper and barge are three `Audience` pairs.
+// A tap is shaped as an ASYMMETRIC BRIDGE PARTICIPANT rather than as a snoop channel: the handler
+// below validates two enum fields and calls `Manager.Tap`, which builds a `JoinOptions` and calls
+// the same `join` a plain conference participant calls. There is no tap-specific code in the mixer —
+// eavesdrop, whisper and barge are three `Audience` pairs.
 //
-// The gap the first version of this file named loudly is closed. `MediaPort.TapRequest` has always
-// carried a `targetSide` saying which side of the conversation the target leg IS, and
-// `mediaTapSessionRequestSchema` did not — so this implementation fixed the only convention it could
-// defend from the ids in the request (`a` is the target, `b` is the other party) and the engine had
-// to pass, as `targetSessionId`, the leg it would have called side `a`. The field is on the wire
-// now, OPTIONAL, and absent still means that convention: an engine that has not been taught to send
-// it behaves exactly as it did. See `Manager.Tap` and `resolveAudiences`.
+// `targetSide` says which side of the conversation the target leg is, and is OPTIONAL: absent means
+// the target-first convention (`a` is the target, `b` is the other party). See `Manager.Tap` and
+// `resolveAudiences`.
 
-// HandleTapSession joins a supervisor to a conversation on asymmetric terms. Rung 6.
+// HandleTapSession joins a supervisor to a conversation on asymmetric terms.
 //
-// The order of operations is the family's — everything REFUSABLE is decided before anything changes
-// — with one addition specific to this command: the two SIDE fields are validated before the target
-// is looked up, because `hear: "left"` is a caller bug that should read the same whether or not the
-// call it names still exists.
+// Everything REFUSABLE is decided before anything changes, with one addition specific to this
+// command: the two SIDE fields are validated before the target is looked up, because `hear: "left"`
+// is a caller bug that should read the same whether or not the call it names still exists.
 func (s *Server) HandleTapSession(data []byte) []byte {
 	var request contract.MediaTapSessionRequest
 	if err := json.Unmarshal(data, &request); err != nil {
@@ -83,8 +76,7 @@ func (s *Server) HandleTapSession(data []byte) []byte {
 		if reason == ReasonUnknown {
 			// The directory turns "I do not have this session" into the more useful "somebody else
 			// does", exactly as it does for a bridge — and it matters more here, because a supervisor
-			// told "no such call" about a call that is live on a neighbour will try again and get the
-			// same answer forever.
+			// told "no such call" about a call live on a neighbour will get the same answer forever.
 			reason = s.locateRefusal([]string{request.TargetSessionID, request.TapSessionID})
 		}
 		s.log.Warn("refusing a tap",
@@ -95,9 +87,8 @@ func (s *Server) HandleTapSession(data []byte) []byte {
 	}
 
 	// The room is stamped onto every member's directory entry, so a neighbour asked about any leg in
-	// a supervised call can see there is one. It reuses the BRIDGE field deliberately: a conference
-	// converted from a bridge keeps the bridge's id, and a second field for "the room this is in"
-	// would be two names for one fact that could disagree.
+	// a supervised call can see there is one. It reuses the BRIDGE field deliberately: a second field
+	// for "the room this is in" would be two names for one fact that could disagree.
 	s.noteBridge(result.ConferenceID, result.SessionIDs)
 
 	return encode(s.log, contract.MediaTapSessionResponse{
@@ -123,8 +114,7 @@ func tapRefusalFor(err error) string {
 		return ReasonBadRequest
 	case errors.Is(err, rtp.ErrConferenceCodec), errors.Is(err, rtp.ErrCannotTranscode):
 		// A leg whose codec cannot be decoded cannot be in a mix, and a tap is a mix. `not_supported`
-		// with the codec named, which the engine answers by routing supervision for that call to
-		// Asterisk — the per-capability cutover working exactly as designed.
+		// with the codec named, which the engine answers by routing supervision for that call to Asterisk.
 		return ReasonNotSupported
 	default:
 		return ReasonBadRequest
@@ -145,14 +135,12 @@ func (s *Server) refuseTap(tapID, reason, message string) []byte {
 
 // HandleUntapSession takes a tap down, leaving the monitored conversation running.
 //
-// An unknown tap is `ok:true, untapped:false` — a SUCCESS, and the same shape `unbridge` and
-// `stop-playback` use for the same reason: the engine retries, and a retry after a lost reply must
-// not look like a failure.
+// An unknown tap is `ok:true, untapped:false` — a SUCCESS, the shape every teardown on this surface
+// uses, because the engine retries and a retry after a lost reply must not look like a failure.
 //
-// Note what this deliberately does NOT do: it does not put the two remaining parties back on a
-// relay. Switching a live conversation from mix to relay means dropping the buffered frames and
-// resetting both codecs mid-sentence to give back sixty milliseconds the call has already had. See
-// the package note on internal/rtp/conference.go.
+// It deliberately does NOT put the two remaining parties back on a relay: switching a live
+// conversation from mix to relay means dropping the buffered frames and resetting both codecs
+// mid-sentence to give back sixty milliseconds the call has already had.
 func (s *Server) HandleUntapSession(data []byte) []byte {
 	var request contract.MediaUntapSessionRequest
 	if err := json.Unmarshal(data, &request); err != nil {

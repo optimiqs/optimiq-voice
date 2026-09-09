@@ -5,11 +5,8 @@ import (
 	"sync"
 )
 
-// FakeStore is an in-memory Store for the unit suite.
-//
-// In the package rather than in a _test.go file because the control package's tests need it too,
-// and a fake that only one package can see is a fake that gets written twice. It mirrors sipd's
-// in-memory credentials store for the same reason.
+// FakeStore is an in-memory Store for the unit suite. In the package rather than in a _test.go file
+// because the control package's tests need it too.
 type FakeStore struct {
 	mu      sync.Mutex
 	entries map[string]Entry

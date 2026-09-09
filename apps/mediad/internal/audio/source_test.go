@@ -30,16 +30,14 @@ func TestLoadSourceResolvesEveryScheme(t *testing.T) {
 			describes: "sound:welcome",
 		},
 		{
-			// ARI plays a list in sequence and concatenating is the same audio with none of the
-			// scheduling gap a queue would put between the clauses of one sentence.
+			// ARI plays a list in sequence; concatenating is the same audio with no scheduling gap.
 			name:      "several prompts concatenate",
 			refs:      []string{"sound:welcome", "sound:menu"},
 			wantMs:    100,
 			describes: "sound:welcome+sound:menu",
 		},
 		{
-			// Hold music repeats, and it repeats because it is hold music — not because a caller
-			// asked for a loop. That is the whole reason the flag is derived from the scheme.
+			// The loop flag is derived from the scheme, not asked for by the caller.
 			name:      "music on hold loops",
 			refs:      []string{"moh:default"},
 			wantLoop:  true,
@@ -54,8 +52,7 @@ func TestLoadSourceResolvesEveryScheme(t *testing.T) {
 			describes: "moh:sales",
 		},
 		{
-			// The class Asterisk's own `channels.startMoh()` uses when the engine names none, so one
-			// engine-side setting serves both planes during the cutover.
+			// The class Asterisk's own `channels.startMoh()` uses when the engine names none.
 			name:      "moh with no class is the default class",
 			refs:      []string{"moh:"},
 			wantLoop:  true,
@@ -63,8 +60,7 @@ func TestLoadSourceResolvesEveryScheme(t *testing.T) {
 			describes: "moh:default",
 		},
 		{
-			// A cadence describes a state that persists. A ringback that played once and stopped
-			// would tell a caller the far end had given up.
+			// A cadence describes a state that persists, so it loops.
 			name:      "a cadenced tone loops",
 			refs:      []string{"tone:busy"},
 			wantLoop:  true,
@@ -72,7 +68,7 @@ func TestLoadSourceResolvesEveryScheme(t *testing.T) {
 			describes: "tone:busy",
 		},
 		{
-			// A beep is a MARKER. Repeating it would talk over the message it exists to introduce.
+			// A beep is a marker; repeating it would talk over the message it introduces.
 			name:      "a one-shot tone does not loop",
 			refs:      []string{"tone:beep"},
 			wantMs:    260,
@@ -147,8 +143,7 @@ func TestLoadSourceRefusals(t *testing.T) {
 			want: audio.ErrNotFound,
 		},
 		{
-			// The class becomes a filename, so a separator in it is a traversal — the same rule a
-			// recording reference follows for the same reason.
+			// The class becomes a filename, so a separator in it is a traversal.
 			name: "a music class with a path separator",
 			refs: []string{"moh:../../etc/passwd"},
 			want: audio.ErrOutsideLibrary,
@@ -178,9 +173,7 @@ func TestLoadSourceRefusals(t *testing.T) {
 func TestToneNeedsNoPromptLibrary(t *testing.T) {
 	t.Parallel()
 
-	// The point of generating tones rather than shipping them: an instance that has not mounted a
-	// prompt store can still tell a caller the far end is ringing. Making ringback depend on a mount
-	// would mean an instance that can bridge a call cannot report on it.
+	// Tones are generated, so an instance with no prompt store mounted can still play ringback.
 	library := audio.NewLibrary("")
 	if library.Configured() {
 		t.Fatal("Configured() is true with no root")

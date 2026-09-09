@@ -21,18 +21,15 @@ const (
 	// PlaybackCompleted means the last frame was sent. The far end heard the whole prompt.
 	PlaybackCompleted PlaybackEndReason = "completed"
 	// PlaybackStopped means `rpc.media.v1.stop-playback`, a superseding playback, or the session
-	// ending underneath it. The COMMON outcome: every `gather` stops its own prompt on barge-in.
+	// ending underneath it.
 	PlaybackStopped PlaybackEndReason = "stopped"
 	// PlaybackError means a frame could not be put on the wire.
 	PlaybackError PlaybackEndReason = "error"
 )
 
 // ErrNoRemote is returned by StartPlayback when the session has not learned a far end yet.
-//
-// A refusal rather than a silent start. Symmetric RTP means the address is LEARNED from the first
-// inbound packet (see Session.latch), so a leg that has not sent has taught us nowhere to send. A
-// playback that "started" into that would report success, send nothing, and end `completed` — a
-// caller in silence and an event stream that says the prompt played.
+// Symmetric RTP learns the address from the first inbound packet (see Session.latch), so until then
+// a playback would report success and send nothing.
 var ErrNoRemote = errors.New("rtp: the session has not learned a far end, so there is nowhere to play")
 
 // ErrPlaybackPayloadType is returned when a clip's law does not match the session's.
@@ -44,9 +41,7 @@ type PlaybackSummary struct {
 	Reason   PlaybackEndReason
 	PlayedMs int
 	Detail   string
-	// Kind is what the audio was. Diagnostic; see PlaybackKind. It is NOT on the wire, because the
-	// engine branches on the reference and a vocabulary two media planes would have to agree on for
-	// nobody's benefit is what design doc §3.2 exists to prevent.
+	// Kind is what the audio was. Diagnostic and not on the wire; see PlaybackKind.
 	Kind PlaybackKind
 }
 
@@ -57,19 +52,12 @@ type PlaybackOptions struct {
 	Ref string
 	// Frames are 20 ms G.711 payloads in the session's negotiated law. See internal/audio.
 	Frames [][]byte
-	// Encoding is the law Frames are in. Checked against the session's, because a µ-law prompt on
-	// an A-law leg is a loud rasp rather than a wrong-sounding voice.
+	// Encoding is the law Frames are in. Checked against the session's: a µ-law prompt on an A-law
+	// leg is a loud rasp.
 	Encoding audio.Encoding
-	// Loop makes the frames repeat until something stops the playback. Rung 5.
-	//
-	// This one field is the whole of "a session sourcing from a LOOP instead of a peer" — the ladder's
-	// description of rung 5 — and it is one field because rung 1 already built everything underneath
-	// it. Music on hold is a looping clip, a ringback cadence is a looping clip, and the only thing
-	// that made them a separate rung was that nothing had asked the frame source to wrap yet.
-	//
-	// A looping playback never ends `completed`, because it has no end. It ends `stopped` — by
-	// `stop-playback`, by an unhold, by a superseding prompt, or by the session going away — which is
-	// why `playedMs` is the only honest measure of how long a caller heard it.
+	// Loop makes the frames repeat until something stops the playback: music on hold, a ringback
+	// cadence. A looping playback never ends `completed`, only `stopped`, so PlayedMs is the only
+	// measure of how long a caller heard it.
 	Loop bool
 	// Kind labels what the audio IS, for the log line and for the summary. See PlaybackKind.
 	Kind PlaybackKind
@@ -77,15 +65,11 @@ type PlaybackOptions struct {
 
 // PlaybackKind is what a playback is for. Diagnostic only: the packet path treats all three
 // identically, and the wire contract carries a reference rather than a kind.
-//
-// It exists because "playback ref 018f… finished" is a line nobody can act on, while "the hold music
-// on session 018f… stopped" is one an operator reads as an explanation for a complaint about a held
-// caller hearing silence.
 type PlaybackKind string
 
 // The three things a playback can be.
 const (
-	// PlaybackPrompt is a file the engine asked for. The rung-1 case.
+	// PlaybackPrompt is a file the engine asked for.
 	PlaybackPrompt PlaybackKind = "prompt"
 	// PlaybackMusicOnHold is a hold loop, started by a hold or by a music command.
 	PlaybackMusicOnHold PlaybackKind = "moh"
@@ -95,32 +79,10 @@ const (
 
 // Playback is one prompt in flight on one session.
 //
-// # Why playback REPLACES the peer's audio rather than mixing with it
-//
-// A session has ONE outbound RTP stream: one SSRC, one sequence space, one socket. While a prompt
-// is playing, the peer's relayed frames are dropped towards this leg rather than interleaved into
-// that stream, and the relay resumes untouched the moment the prompt ends.
-//
-// Interleaving is not the "mixing" alternative it looks like — mixing means summing two decoded
-// signals, which needs a decode, a jitter buffer to align them and an encode, i.e. rung 6 and the
-// reason rung 6 is late in the ladder. What interleaving would actually produce is two audio
-// sources sharing one SSRC with two unrelated timestamp clocks, which is precisely the input a
-// jitter buffer cannot untangle: the receiver would hear both, badly, with concealment noise
-// between them.
-//
-// # What replace does NOT interrupt, and why that is the point
-//
-// The direction that carries DTMF out of the played-to leg. A caller pressing 1 while the menu is
-// still talking sends RFC 4733 INTO this session, and that path — handlePacket → relay → the peer's
-// forward — is not touched by playback at all. Barge-in works because the digits keep flowing while
-// the prompt plays; it is the entire reason `gather` calls `play` and `stopPlayback` around one
-// collection. Suppression applies only to what is written OUT of this session's socket.
-//
-// A peer's own telephone-event packets are dropped along with its audio for the duration, and that
-// is a deliberate narrowing rather than an oversight: the party being played a prompt is by
-// construction not the party a digit from the far side is aimed at, and admitting one packet from
-// the peer's timestamp clock into the prompt's stream would reintroduce exactly the problem the
-// paragraph above rejects.
+// A playback REPLACES the peer's audio rather than interleaving with it: a session has one SSRC and
+// one sequence space, and two sources with unrelated timestamp clocks sharing them is exactly what
+// a receiver's jitter buffer cannot untangle. Suppression applies only to what is written OUT of
+// this socket, so DTMF arriving INTO the session still relays — which is what makes barge-in work.
 type Playback struct {
 	ref     string
 	frames  [][]byte
@@ -128,8 +90,8 @@ type Playback struct {
 	kind    PlaybackKind
 	session *Session
 
-	// sent counts frames actually written, which is what `playedMs` is derived from. It is NOT the
-	// clip length: a barge-in one second into a ten-second menu played one second.
+	// sent counts frames actually written, which is what PlayedMs is derived from — not the clip
+	// length.
 	sent atomic.Int64
 
 	stopOnce sync.Once
@@ -159,17 +121,9 @@ func (p *Playback) Stop() {
 	p.stopOnce.Do(func() { close(p.stop) })
 }
 
-// StartPlayback begins sourcing frames from a clip instead of from the peer.
-//
-// It returns as soon as the playback is RUNNING, never when it has finished. That is the contract
-// the seam above requires: `MediaPort.play` hands back a handle the moment audio begins, because a
-// caller who barges in must be able to interrupt without the engine holding a fiber open for the
-// length of the prompt.
-//
-// A second playback on a session SUPERSEDES the first, which finishes `stopped`. The alternative —
-// refusing, or queueing — is worse in both directions: refusing turns a re-prompt into a failed
-// call, and queueing would make a caller who pressed a digit listen to the rest of the old menu
-// before the new one started.
+// StartPlayback begins sourcing frames from a clip instead of from the peer. It returns as soon as
+// the playback is running, never when it has finished. A second playback on a session supersedes
+// the first, which finishes `stopped`.
 func (s *Session) StartPlayback(opts PlaybackOptions) (*Playback, error) {
 	switch {
 	case opts.Ref == "":
@@ -210,11 +164,8 @@ func (s *Session) StartPlayback(opts PlaybackOptions) (*Playback, error) {
 	return playback, nil
 }
 
-// StopPlayback interrupts the session's active playback when it matches ref.
-//
-// Matching on the reference rather than stopping whatever is playing is fencing, and it is the same
-// argument `park-handoff` makes about `mediaChannelId`: a stop that arrived late, after the prompt
-// it names finished and a second one started, must not silence the new prompt.
+// StopPlayback interrupts the session's active playback when it matches ref. Matching on the
+// reference fences a late stop off from a prompt that started after the one it names.
 func (s *Session) StopPlayback(ref string) bool {
 	playback := s.ActivePlayback()
 	if playback == nil || playback.ref != ref {
@@ -239,13 +190,8 @@ func (s *Session) clearPlayback(playback *Playback) {
 
 // run paces the clip onto the wire, one frame every 20 ms, until it runs out or is stopped.
 //
-// # Why a ticker rather than a sleep
-//
-// A sleep of 20 ms per frame accumulates every frame's send cost as drift: at 50 frames a second a
-// 200 µs write makes a ten-second prompt play eleven seconds, and the far end's jitter buffer
-// absorbs the difference by discarding audio. A ticker keeps the schedule absolute. If a tick is
-// missed entirely — a heavily loaded box — the frame after it is sent immediately, which is what a
-// receiver's buffer is designed to smooth over.
+// A ticker rather than a sleep: a per-frame sleep accumulates each write's cost as drift, which the
+// far end's jitter buffer absorbs by discarding audio. A ticker keeps the schedule absolute.
 func (p *Playback) run() {
 	defer close(p.done)
 	defer p.session.clearPlayback(p)
@@ -253,30 +199,25 @@ func (p *Playback) run() {
 	ticks, stopTicker := p.session.newTicker(audio.FrameDurationMs * time.Millisecond)
 	defer stopTicker()
 
-	// `first` and not `index == 0`: a looping source comes back round to index 0 on every wrap, and
-	// re-asserting the marker there would tell the receiver a new talkspurt begins every time the
-	// hold music repeats. The marker belongs to the moment the STREAM changed clocks, which happens
-	// once, at the start.
+	// `first` and not `index == 0`: a loop returns to index 0 on every wrap, and the marker belongs
+	// to the one moment the stream changed clocks.
 	first := true
+	// Not range-over-int: the wrap below rewinds index, which a range loop would ignore.
 	for index := 0; index < len(p.frames); index++ {
 		select {
 		case <-p.stop:
 			p.finish(PlaybackStopped, "")
 			return
 		case <-p.session.done:
-			// The session was released or reaped under a live prompt. `stopped` rather than `error`:
-			// nothing failed, the leg went away, and the `session.ended` event carries the real story.
+			// The leg went away; nothing failed, so `stopped` rather than `error`.
 			p.finish(PlaybackStopped, "the session ended")
 			return
 		case <-ticks:
 		}
 
-		// The marker bit on the FIRST frame is RFC 3550's start-of-talkspurt flag, and it is
-		// load-bearing here rather than decorative: the outbound stream's timestamps come from the
-		// peer's clock while relaying and from ours while playing, so a prompt starting mid-call is
-		// a timestamp discontinuity inside one SSRC. Marker is exactly how a sender tells a receiver
-		// "reset your expectation, a new talkspurt begins here" instead of letting the jitter buffer
-		// read the jump as catastrophic loss.
+		// RFC 3550's start-of-talkspurt marker on the first frame. The outbound timestamps switch from
+		// the peer's clock to ours here, and without the marker a receiver reads that discontinuity
+		// inside one SSRC as catastrophic loss.
 		sent, err := p.session.sendPlaybackFrame(p.frames[index], first)
 		if err != nil {
 			p.finish(PlaybackError, err.Error())
@@ -288,12 +229,8 @@ func (p *Playback) run() {
 		}
 
 		if p.loop && index == len(p.frames)-1 {
-			// The wrap. Nothing else changes: the same socket, the same SSRC, the same sequence
-			// counter, and a timestamp that keeps advancing by one frame — so the far end cannot tell
-			// the wrap from any other frame boundary, which is exactly the property a hold loop needs.
-			// The clip's own edges have to meet cleanly for it to sound seamless, and that is a
-			// property of the FILE rather than of this loop; see internal/audio on why the generated
-			// cadences contain whole numbers of cycles.
+			// The wrap. Same SSRC, sequence counter and timestamp step, so the far end cannot tell it
+			// from any other frame boundary; whether it SOUNDS seamless is a property of the clip.
 			index = -1
 		}
 	}
@@ -309,24 +246,17 @@ func (p *Playback) finish(reason PlaybackEndReason, detail string) {
 			Detail:   detail,
 			Kind:     p.kind,
 		}
-		// The next relayed packet carries a marker for the same reason the first played one did:
-		// the stream is about to switch back to the peer's timestamp clock.
+		// The next relayed packet carries a marker: the stream switches back to the peer's clock.
 		p.session.markNextForward.Store(true)
 	})
 }
 
-// sendPlaybackFrame writes one prompt frame out of this session's socket.
+// sendPlaybackFrame writes one prompt frame out of this session's socket, sharing the session's
+// SSRC and sequence counter with the relay so the endpoint sees one continuous sender.
 //
-// It shares the session's SSRC and sequence counter with the relay deliberately. A prompt is not a
-// second stream — it is the same leg's audio, sourced from a file for a while — and giving it its
-// own SSRC would make the endpoint see a new sender start and stop around every prompt, which is
-// the audible click the relay's header rewrite exists to avoid.
-//
-// It reports whether the frame reached the socket, because there is one case where it does not and
-// nothing has gone wrong: a digit string is being generated towards this leg, and a digit owns the
-// outbound clock for its span (see DtmfInjection). The prompt keeps its SCHEDULE across that — the
-// ticker is not paused — so a prompt overlapped by digits is clipped by exactly the length of the
-// digits rather than stretched, and `playedMs` reports the audio the far end actually received.
+// It reports whether the frame reached the socket: a DTMF injection owns the outbound clock for its
+// span (see DtmfInjection), and the playback's schedule is not paused across it, so an overlapped
+// prompt is clipped rather than stretched.
 func (s *Session) sendPlaybackFrame(payload []byte, marker bool) (bool, error) {
 	if s.dtmfActive() {
 		s.count(func(st *Stats) { st.SuppressedByDtmf++ })
@@ -350,34 +280,28 @@ func (s *Session) sendPlaybackFrame(payload []byte, marker bool) (bool, error) {
 		Payload: payload,
 	}
 
-	encoded, err := out.Marshal()
+	encoded, scratch, err := marshalOutbound(&out)
 	if err != nil {
 		return false, fmt.Errorf("rtp: marshalling a playback frame: %w", err)
 	}
-	if _, err := s.writeRTP(encoded, to); err != nil {
-		// Unlike a relayed frame, a failed playback write is NOT swallowed. A relay drops one frame
-		// of a conversation that is still going; a playback that cannot reach the socket will not
-		// reach it for the next frame either, and reporting `error` is what turns "the caller heard
-		// nothing" into an event with a reason on it.
+	_, err = s.writeRTP(encoded, to)
+	releaseOutbound(scratch)
+	if err != nil {
+		// Unlike a relayed frame, a failed playback write is not swallowed: it will fail for the next
+		// frame too, and the caller needs a reason on the finished event.
 		return false, fmt.Errorf("rtp: sending a playback frame to %s: %w", to, err)
 	}
 	s.countSent(uint32(len(payload)))
 
-	// The SEND half of a `both` recording. A prompt played AT the recorded party is part of what
-	// happened on that leg, so a recording of both directions holds it — which is exactly what an
-	// on-demand call recording is expected to contain.
+	// The send half of a `both` recording: a prompt played AT the recorded party belongs in it.
 	if recorder := s.recording.Load(); recorder != nil {
 		recorder.Sent(payload)
 	}
 	return true, nil
 }
 
-// nextPlaybackTimestamp advances the outbound clock by one frame.
-//
-// It continues from the last timestamp this session put on the wire rather than starting at zero,
-// so a prompt in the middle of a call does not send the stream's timestamp BACKWARDS — which some
-// endpoints treat as a stream restart and answer by flushing their buffer, clipping the first
-// syllable of every prompt.
+// nextPlaybackTimestamp advances the outbound clock by one frame, continuing from the last
+// timestamp sent: a backwards jump makes some endpoints flush their buffer and clip the prompt.
 func (s *Session) nextPlaybackTimestamp() uint32 {
 	return s.lastTimestamp.Add(audio.FrameTimestampStep)
 }
@@ -390,6 +314,5 @@ func encodingOf(payloadType uint8) audio.Encoding {
 	return audio.EncodingULaw
 }
 
-// EncodingFor is encodingOf, exported for the control surface, which has to decode a clip into the
-// law a session already answered before it can hand the frames over.
+// EncodingFor is encodingOf, exported so callers can decode a clip into the law a session answered.
 func EncodingFor(payloadType uint8) audio.Encoding { return encodingOf(payloadType) }

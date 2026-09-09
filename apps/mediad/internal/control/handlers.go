@@ -16,26 +16,10 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/sdp"
 )
 
-// Every handler is `[]byte -> []byte`, with no *nats.Msg anywhere.
-//
-// That is the whole reason the unit suite needs no broker: a handler is a pure function of its
-// payload, so it can be driven as a table. sipd draws the same line — `credentialFromReply` is
-// tested in-package while the transport is left to the gated integration suite. None of them
-// returns an error, because there is no caller that could do anything with one: a refusal IS the
-// reply.
-
 // HandleAllocateSession reserves a port pair and answers an SDP offer.
 //
-// The order of operations matters and is not the obvious one:
-//
-//  1. Parse the offer FIRST. Binding a port for an offer we are going to refuse would take capacity
-//     out of the pool for the duration of a round trip, and under a codec-mismatch storm (one badly
-//     configured trunk) that is a self-inflicted outage.
-//  2. Allocate, which is idempotent on session id — a retry after a timeout returns the same
-//     session rather than opening a second port.
-//  3. Build the answer from the session's REAL port.
-//  4. Record the directory entry. Last, and non-fatally: a session that works but is invisible to
-//     its neighbours is strictly better than a call that fails because a KV write was slow.
+// The offer is parsed before any port is bound, so a refusal costs no capacity. Allocate is
+// idempotent on session id, and the directory entry is written last and non-fatally.
 func (s *Server) HandleAllocateSession(data []byte) []byte {
 	var request contract.MediaAllocateSessionRequest
 	if err := json.Unmarshal(data, &request); err != nil {
@@ -49,8 +33,8 @@ func (s *Server) HandleAllocateSession(data []byte) []byte {
 		return s.refuseAllocate(request.SessionID, ReasonBadRequest, "callId is required")
 	}
 	if request.OrgID == "" {
-		// Not pedantry: without it there is no org token for the lifecycle subject, so a session
-		// allocated without one would end silently and the engine would never learn why.
+		// Without an org token there is no subject for this session's lifecycle events, so the session
+		// would end silently and the engine would never learn why.
 		return s.refuseAllocate(request.SessionID, ReasonBadRequest,
 			"orgId is required: it is the subject token this session's lifecycle events are published under")
 	}
@@ -60,9 +44,16 @@ func (s *Server) HandleAllocateSession(data []byte) []byte {
 	if request.SDPOffer == "" {
 		return s.refuseAllocate(request.SessionID, ReasonBadRequest, "sdpOffer is required")
 	}
-	protocol, err := sdp.AudioProtocol(request.SDPOffer)
-	if err != nil {
-		return s.refuseAllocate(request.SessionID, ReasonBadRequest, err.Error())
+	// One parse for the whole handler: Offer carries the transport as well as the codecs, so the
+	// transport-only reader is needed only when the offer did not parse far enough to report it —
+	// a SAVPF offer whose codecs are WebRTC's, or a malformed one whose refusal is decided below.
+	offer, offerErr := sdp.ParseOffer(request.SDPOffer)
+	protocol := offer.AudioProtocol
+	if offerErr != nil {
+		var err error
+		if protocol, err = sdp.AudioProtocol(request.SDPOffer); err != nil {
+			return s.refuseAllocate(request.SessionID, ReasonBadRequest, err.Error())
+		}
 	}
 	if protocol == "UDP/TLS/RTP/SAVPF" {
 		return s.allocateWebRTC(request)
@@ -75,25 +66,17 @@ func (s *Server) HandleAllocateSession(data []byte) []byte {
 	if err != nil {
 		return s.refuseAllocate(request.SessionID, ReasonBadRequest, err.Error())
 	}
-	// RUNG 5 CHANGED THIS. `sendonly` and `recvonly` were refused by name — "hold is signalling plus
-	// music, and mediad has neither yet" — and refusing was right, because answering `sendrecv` to a
-	// `sendonly` offer would put a held caller back into a conversation they had been taken out of,
-	// which is a privacy incident rather than a degraded feature.
-	//
-	// mediad now has both halves, and this is where hold ARRIVES: a re-INVITE is seen by sipd,
-	// decided by the engine, and delivered here as a repeat allocate carrying the new direction. See
+	// A repeat allocate carrying a NEW direction is a re-INVITE, which is how hold arrives here. See
 	// directionToMutes for how RFC 3264's four directions become the media plane's two gates.
 
-	offer, err := sdp.ParseOffer(request.SDPOffer)
-	if err != nil {
+	if offerErr != nil {
 		reason := ReasonBadRequest
-		if errors.Is(err, sdp.ErrNoCommonCodec) {
-			// A perfectly valid offer this media plane cannot serve. `not_supported` rather than
-			// `bad_request`, because the engine's recovery is to route the leg to Asterisk, not to
-			// fix the bytes and retry.
+		if errors.Is(offerErr, sdp.ErrNoCommonCodec) {
+			// A valid offer this media plane cannot serve. `not_supported` rather than `bad_request`,
+			// because the engine's recovery is to route the leg to Asterisk, not to fix the bytes and retry.
 			reason = ReasonNotSupported
 		}
-		return s.refuseAllocate(request.SessionID, reason, err.Error())
+		return s.refuseAllocate(request.SessionID, reason, offerErr.Error())
 	}
 
 	answerDirection := sdp.AnswerDirection(offer.Direction, requested)
@@ -127,11 +110,8 @@ func (s *Server) HandleAllocateSession(data []byte) []byte {
 		return s.refuseAllocate(request.SessionID, reason, err.Error())
 	}
 
-	// A REPEAT allocate for a live session is either a retry or a re-negotiation, and this is the one
-	// line that tells them apart: a retry carries the same direction, so applying it changes nothing,
-	// and a re-INVITE carries a different one, so applying it is the whole point. `Allocate` itself
-	// stays idempotent — it does not open a second port and it does not change the MODE — which is
-	// what keeps "a retry must not mutate a live call" true while letting a renegotiation through.
+	// A repeat allocate for a live session is a retry when the direction is unchanged and a
+	// re-negotiation when it differs. Allocate itself stays idempotent: no second port, no mode change.
 	if err := s.sessions.ApplyDirection(request.SessionID, muteIn, muteOut); err != nil {
 		s.log.Warn("could not apply a renegotiated direction",
 			"sessionId", request.SessionID, "direction", answerDirection, "error", err)
@@ -139,7 +119,7 @@ func (s *Server) HandleAllocateSession(data []byte) []byte {
 
 	sessionID, sessionVersion := sdpSessionIDs(descriptor.RTPPort)
 	negotiated := sdp.CodecForFormat(descriptor.Format)
-	answer := sdp.BuildAnswer(sdp.Answer{
+	toAnswer := sdp.Answer{
 		SessionID:                 sessionID,
 		SessionVersion:            sessionVersion,
 		Address:                   s.publicAddr,
@@ -149,7 +129,17 @@ func (s *Server) HandleAllocateSession(data []byte) []byte {
 		TelephoneEventPayloadType: descriptor.TelephoneEventPayloadType,
 		OpusFmtp:                  offer.OpusFmtp,
 		Direction:                 answerDirection,
-	})
+	}
+	if err := toAnswer.Validate(); err != nil {
+		// A dynamic codec that reached here without its payload type would render under PT 0, which
+		// the far end reads as PCMU: a call with audio that is noise. Refuse instead.
+		s.log.Error("cannot render an answer for a negotiated session",
+			"sessionId", request.SessionID, "codec", negotiated, "error", err)
+		// The port pair is already held; releasing it keeps a rendering failure from leaking capacity.
+		s.sessions.Release(request.SessionID)
+		return s.refuseAllocate(request.SessionID, ReasonInternal, err.Error())
+	}
+	answer := sdp.BuildAnswer(toAnswer)
 
 	s.recordSession(request, descriptor)
 
@@ -173,11 +163,9 @@ func (s *Server) HandleAllocateSession(data []byte) []byte {
 
 // recordSession writes the directory entry, and does NOT fail the allocate when it cannot.
 //
-// The session is already bound and answerable at this point. Failing the command would hand the
-// engine an error for a session that exists and is about to receive audio, which is the worst of
-// both outcomes: the call fails AND the port stays held until the reaper. Logged at WARN because
-// the consequence is real but bounded — the neighbours cannot route to this session, so a bridge
-// issued to another instance will answer `unknown_session` instead of `wrong_instance`.
+// The session is already bound and answerable, so failing the command would fail a call that works
+// AND hold the port until the reaper. The bounded consequence of the missed write is that
+// neighbours cannot route to this session.
 func (s *Server) recordSession(
 	request contract.MediaAllocateSessionRequest,
 	descriptor rtp.Descriptor,
@@ -186,8 +174,7 @@ func (s *Server) recordSession(
 }
 
 // recordSessionEntry is the directory write both allocate and create-offer make, taking the tenancy
-// as primitives so the two commands — which carry it in differently shaped requests — share one
-// entry shape and one best-effort failure rule.
+// as primitives so the two commands share one entry shape and one best-effort failure rule.
 func (s *Server) recordSessionEntry(orgID, callID, legID string, descriptor rtp.Descriptor) {
 	ctx, cancel := dirContext()
 	defer cancel()
@@ -221,28 +208,16 @@ func (s *Server) refuseAllocate(sessionID, reason, message string) []byte {
 	})
 }
 
-// offeredCodecs is what create-offer proposes, in preference order. Exactly what mediad can serve —
-// PCMU then PCMA — which is the codec bound plans/sipd-invite-design.md §5.2 draws around the B-leg:
-// "mediad offers exactly what mediad can serve". Narrowband first, matching the answer path's
-// preference and the passthrough argument in plans/mediad-design.md §7.
+// offeredCodecs is what create-offer proposes, in preference order: exactly what mediad can serve,
+// narrowband first, matching the answer path's preference.
 var offeredCodecs = []sdp.Codec{sdp.CodecPCMU, sdp.CodecPCMA}
 
 // HandleCreateOffer allocates a port pair for a B-leg that has NO inbound offer and writes the offer.
 //
-// This is the leg the engine ORIGINATES: there is no far-end SDP to answer, so mediad must generate
-// one, and plans/sipd-invite-design.md §5.2 settled that mediad — the only process that knows its own
-// ports, codecs and reachable address — is the one that writes it. The order mirrors allocate's, and
-// for the same reason: everything refusable is decided before a port is bound.
-//
-//  1. Validate the payload. sessionId, orgId and callId are the same three allocate requires, and for
-//     the same reasons — orgId is the subject token this session's lifecycle events publish under.
-//  2. Parse the direction to offer. Unlike an answer there is nothing to mirror; the request's
-//     direction IS the offer's, defaulting to sendrecv.
-//  3. Allocate on mediad's DEFAULT codec — PCMU, telephone-event 101 — because the real codec is the
-//     callee's to pick and is not known until accept-answer. Idempotent on sessionId exactly as
-//     allocate: a retry after a timeout returns the same session and opens no second port.
-//  4. Build the offer LISTING what mediad serves (PCMU + PCMA + telephone-event) so the callee
-//     chooses, and record the directory entry last and non-fatally.
+// mediad is the only process that knows its own ports, codecs and reachable address, so it writes
+// the offer for an originated leg. As in allocate, everything refusable is decided before a port is
+// bound, and the allocation is idempotent on sessionId. The session starts on mediad's default codec
+// because the real codec is the callee's to pick and is not known until accept-answer.
 func (s *Server) HandleCreateOffer(data []byte) []byte {
 	var request contract.MediaCreateOfferRequest
 	if err := json.Unmarshal(data, &request); err != nil {
@@ -280,8 +255,8 @@ func (s *Server) HandleCreateOffer(data []byte) []byte {
 		OrgID:     request.OrgID,
 		CallID:    request.CallID,
 		LegID:     derefString(request.LegID),
-		// The DEFAULT codec, not the negotiated one: a B-leg's callee has not answered yet, so the
-		// session starts on PCMU with telephone-event 101 and accept-answer settles the real choice.
+		// The DEFAULT codec, not the negotiated one: the callee has not answered yet, so the session starts
+		// on PCMU with telephone-event 101 and accept-answer settles the real choice.
 		AudioPayloadType:          rtp.PayloadTypePCMU,
 		Format:                    audio.FormatULaw,
 		TelephoneEventPayloadType: rtp.PayloadTypeTelephoneEvent,
@@ -345,17 +320,9 @@ func (s *Server) refuseCreateOffer(sessionID, reason, message string) []byte {
 
 // HandleAcceptAnswer settles the callee's negotiated codec onto a B-leg created by create-offer.
 //
-// The other half of the originated-leg pair. create-offer wrote an offer of PCMU + PCMA +
-// telephone-event; the callee's 200 OK answers with ONE of them, and this pins that choice onto the
-// live session so the relay forwards under the payload type both ends agreed to.
-//
-// The two refusals that matter, from plans/sipd-invite-design.md §5.2:
-//
-//   - A codec mediad cannot serve is `not_supported`. mediad offered only G.711, so an answer naming
-//     anything else — G.729, G.722, Opus — is a callee mediad cannot bridge, and the engine's
-//     recovery is to hang the B-leg up with an incompatible-destination cause rather than to retry.
-//   - An unknown sessionId is `unknown_session`: the answer arrived for a leg this instance does not
-//     hold, which is the engine's picture being stale rather than a fault here.
+// A codec mediad cannot serve is `not_supported`, and the engine's recovery is to hang the B-leg up
+// with an incompatible-destination cause. An unknown sessionId is `unknown_session`: the answer
+// arrived for a leg this instance does not hold.
 func (s *Server) HandleAcceptAnswer(data []byte) []byte {
 	var request contract.MediaAcceptAnswerRequest
 	if err := json.Unmarshal(data, &request); err != nil {
@@ -368,9 +335,17 @@ func (s *Server) HandleAcceptAnswer(data []byte) []byte {
 	case request.SDPAnswer == "":
 		return s.refuseAcceptAnswer(request.SessionID, ReasonBadRequest, "sdpAnswer is required")
 	}
-	protocol, err := sdp.AudioProtocol(request.SDPAnswer)
-	if err != nil {
-		return s.refuseAcceptAnswer(request.SessionID, ReasonBadRequest, err.Error())
+	// The answer is a session description, so the offer parser reads it: an answer names one codec,
+	// and ParseOffer returns the first (here, only) one it recognises plus any telephone-event type.
+	// It also reports the transport, so this is the only parse of the answer; the transport-only
+	// reader runs only when that parse failed, to keep a transport refusal ahead of a codec one.
+	answer, answerErr := sdp.ParseOffer(request.SDPAnswer)
+	protocol := answer.AudioProtocol
+	if answerErr != nil {
+		var err error
+		if protocol, err = sdp.AudioProtocol(request.SDPAnswer); err != nil {
+			return s.refuseAcceptAnswer(request.SessionID, ReasonBadRequest, err.Error())
+		}
 	}
 	if value, ok := s.webRTCSessions.Load(request.SessionID); ok {
 		if protocol != "UDP/TLS/RTP/SAVPF" {
@@ -390,21 +365,18 @@ func (s *Server) HandleAcceptAnswer(data []byte) []byte {
 		return s.refuseAcceptAnswer(request.SessionID, ReasonNotSupported, "answer changed the media transport")
 	}
 
-	// The answer is a session description, so the offer parser reads it: an answer names one codec,
-	// and ParseOffer returns the first (here, only) one it recognises plus any telephone-event type.
-	answer, err := sdp.ParseOffer(request.SDPAnswer)
-	if err != nil {
+	if answerErr != nil {
 		reason := ReasonBadRequest
-		if errors.Is(err, sdp.ErrNoCommonCodec) {
+		if errors.Is(answerErr, sdp.ErrNoCommonCodec) {
 			// A valid answer naming a codec mediad does not carry at all. `not_supported`, so the
 			// engine hangs the B-leg up rather than retrying the same bytes.
 			reason = ReasonNotSupported
 		}
-		return s.refuseAcceptAnswer(request.SessionID, reason, err.Error())
+		return s.refuseAcceptAnswer(request.SessionID, reason, answerErr.Error())
 	}
 	// mediad offered ONLY G.711, so an answer must land on PCMU or PCMA. A parser that recognises a
-	// wider set (G.722, Opus) can return one mediad never offered; refusing it here keeps the answer
-	// bounded to what create-offer actually proposed.
+	// wider set can return one mediad never offered; refusing it here keeps the answer bounded to what
+	// create-offer actually proposed.
 	if answer.Codec != sdp.CodecPCMU && answer.Codec != sdp.CodecPCMA {
 		return s.refuseAcceptAnswer(request.SessionID, ReasonNotSupported,
 			fmt.Sprintf("the answer settled on %s, and create-offer proposed only PCMU and PCMA", answer.Codec))
@@ -449,36 +421,21 @@ func (s *Server) refuseAcceptAnswer(sessionID, reason, message string) []byte {
 	})
 }
 
-// maxBridgeSessions mirrors `MEDIA_BRIDGE_MAX_SESSIONS` in packages/events.
-//
-// Restated rather than imported because the emitter turns a `.max(n)` into a validation rule and not
-// into a Go constant, so this is the one number on this surface that has to be kept honest by hand.
-// It is a CAPACITY decision, not a protocol one: the mixer sums every member's decoded audio once
-// per member per frame, fifty times a second, so the cost is quadratic in the room. See the contract
-// for why raising it needs a different algorithm rather than a bigger constant.
+// maxBridgeSessions mirrors `MEDIA_BRIDGE_MAX_SESSIONS` in packages/events, restated rather than
+// imported because the emitter turns a `.max(n)` into a validation rule and not into a Go constant.
+// It is a CAPACITY decision: the mixer sums every member's audio once per member per frame, so the
+// cost is quadratic in the room.
 const maxBridgeSessions = 8
 
 // HandleBridgeSessions puts two or more sessions in one conversation.
 //
-// # Two is a relay, three is a room, and the caller does not say which
+// Two sessions are relayed and three or more are mixed in a room. Which mechanism carries the audio
+// is this process's decision rather than the caller's, because it is a property of a mixer the
+// engine cannot see.
 //
-// This handler refused anything but a pair for four rungs, and the refusal named rung 6 by name.
-// Rung 6 arrived: `internal/rtp/conference.go` is the mixer, and `tap-session` has been converting
-// two-party bridges into rooms since it landed. What was missing was any way for the ENGINE to ask
-// for a room directly — a conference bridge went through this subject, got the rung-6 refusal, and
-// the whole feature routed to Asterisk while a working mixer sat one function call away.
-//
-// So the arrangement is decided here, from the count, and the reason that is the media plane's
-// decision rather than the caller's is the same reason `createBridge` needs no round trip: which
-// mechanism carries two parties' audio is a property of this process, and an engine that had to name
-// it would be holding an opinion about a mixer it cannot see.
-//
-// # Why a room is built with everybody or nobody
-//
-// A half-converted room is the one state that must not survive: some members mixing and some
-// relaying is a call where one party can hear and another cannot, which reads as a network fault and
-// is not one. So a join that fails takes the whole room down and the command is refused — exactly
-// what `conversationFor` does when it converts a relay for a tap.
+// A join that fails takes the whole room down and refuses the command: a half-converted room, some
+// members mixing and some relaying, is a call where one party can hear and another cannot, which
+// reads as a network fault and is not one.
 func (s *Server) HandleBridgeSessions(data []byte) []byte {
 	var request contract.MediaBridgeSessionsRequest
 	if err := json.Unmarshal(data, &request); err != nil {
@@ -494,9 +451,8 @@ func (s *Server) HandleBridgeSessions(data []byte) []byte {
 		return s.refuseBridge(request.BridgeID, ReasonBadRequest,
 			fmt.Sprintf("a conversation needs at least two sessions, got %d", len(request.SessionIDs)))
 	case len(request.SessionIDs) > maxBridgeSessions:
-		// `not_supported` and not `bad_request`, because the engine's recovery is the one every
-		// capability gap gets: route this room to Asterisk, whose mixing bridge has no such ceiling.
-		// A retry of the same bytes here fails the same way.
+		// `not_supported` and not `bad_request`, because the engine's recovery is to route this room to
+		// Asterisk, whose mixing bridge has no such ceiling. A retry of the same bytes fails the same way.
 		return s.refuseBridge(request.BridgeID, ReasonNotSupported,
 			fmt.Sprintf("this mixer holds %d members and %d were asked for; a larger room needs a "+
 				"running-sum mixer rather than a larger constant",
@@ -534,15 +490,11 @@ func (s *Server) HandleBridgeSessions(data []byte) []byte {
 	})
 }
 
-// bridgeAsConference seats three or more sessions in one room under the bridge's own id.
-//
-// The room takes the BRIDGE's id for the reason a tap-converted one does: the engine tears down what
-// it created, under the name it created it with, and a room that renamed itself on the way in would
-// leave an `unbridge-sessions` naming nothing.
+// bridgeAsConference seats three or more sessions in one room under the BRIDGE's id, so that the
+// engine's `unbridge-sessions` still names something.
 //
 // Every member is a plain participant — hears everyone, is heard by everyone — because that is what
-// a bridge means. Asymmetric membership is what `tap-session` is for, and a bridge that could
-// express it would be two ways to say one thing that could disagree.
+// a bridge means. Asymmetric membership is what `tap-session` is for.
 func (s *Server) bridgeAsConference(request contract.MediaBridgeSessionsRequest) []byte {
 	joined := make([]string, 0, len(request.SessionIDs))
 	for _, sessionID := range request.SessionIDs {
@@ -555,8 +507,8 @@ func (s *Server) bridgeAsConference(request contract.MediaBridgeSessionsRequest)
 			continue
 		}
 
-		// Everything goes back. See the note on the handler above: a partially built room is worse
-		// than no room, because it sounds like a network fault to the members who did make it in.
+		// Everything goes back: a partially built room is worse than no room, because it sounds like a
+		// network fault to the members who did make it in.
 		s.sessions.DestroyConference(request.BridgeID)
 
 		reason := ReasonBadRequest
@@ -577,8 +529,8 @@ func (s *Server) bridgeAsConference(request contract.MediaBridgeSessionsRequest)
 	}
 
 	// The room is stamped onto every member's directory entry, reusing the BRIDGE field exactly as a
-	// tap-converted room does: a conference keeps the bridge's id, and a second field for "the room
-	// this is in" would be two names for one fact that could disagree.
+	// tap-converted room does: a second field for "the room this is in" would be two names for one
+	// fact that could disagree.
 	s.noteBridge(request.BridgeID, request.SessionIDs)
 
 	return encode(s.log, contract.MediaBridgeSessionsResponse{
@@ -592,10 +544,8 @@ func (s *Server) bridgeAsConference(request contract.MediaBridgeSessionsRequest)
 
 // locateRefusal turns "I do not have this session" into the more useful "somebody else does".
 //
-// THE reason the directory exists. `unknown_session` tells the engine its picture is stale;
-// `wrong_instance` tells it the session is alive on a named neighbour, and those need opposite
-// recoveries. Answering the first when the second is true is how a perfectly healthy call gets torn
-// down during a scale-out.
+// `unknown_session` tells the engine its picture is stale; `wrong_instance` tells it the session is
+// alive on a named neighbour. Those need opposite recoveries.
 func (s *Server) locateRefusal(sessionIDs []string) string {
 	ctx, cancel := dirContext()
 	defer cancel()
@@ -615,12 +565,9 @@ func (s *Server) locateRefusal(sessionIDs []string) string {
 	return ReasonUnknown
 }
 
-// noteBridge stamps the bridge id onto both directory entries.
-//
-// Best-effort for the same reason recordSession is: the relay is already running, and failing the
-// command over a KV write would tear down audio that works. The consequence of a missed write is
-// that a bridge is invisible to anything that is not this instance, which matters for a future
-// drain and for an operator's "who is this call talking to" — not for the call itself.
+// noteBridge stamps the bridge id onto both directory entries. Best-effort for the same reason
+// recordSession is: the relay is already running, and failing the command over a KV write would tear
+// down audio that works.
 func (s *Server) noteBridge(bridgeID string, sessionIDs []string) {
 	ctx, cancel := dirContext()
 	defer cancel()
@@ -650,11 +597,8 @@ func (s *Server) refuseBridge(bridgeID, reason, message string) []byte {
 	})
 }
 
-// HandleUnbridgeSessions stops a relay and leaves both sessions alive.
-//
-// Separating legs is not hanging them up: an attended transfer takes a leg out of one bridge and
-// puts it in another, and a media plane that tore the session down in between would drop the call it
-// was in the middle of moving.
+// HandleUnbridgeSessions stops a relay and leaves both sessions alive: an attended transfer moves a
+// leg from one bridge to another, and tearing the session down in between would drop the call.
 func (s *Server) HandleUnbridgeSessions(data []byte) []byte {
 	var request contract.MediaUnbridgeSessionsRequest
 	if err := json.Unmarshal(data, &request); err != nil {
@@ -697,11 +641,9 @@ func (s *Server) HandleUnbridgeSessions(data []byte) []byte {
 	})
 }
 
-// HandleReleaseSession frees a session's ports and removes its directory entry.
-//
-// The directory delete is part of the CONTRACT, not an implementation detail: an entry that
-// outlives its session is an instance name the engine keeps routing commands to, and every one of
-// them answers `unknown_session` until an operator notices.
+// HandleReleaseSession frees a session's ports and removes its directory entry. The delete is part
+// of the CONTRACT: an entry that outlives its session is an instance name the engine keeps routing
+// commands to, and every one of them answers `unknown_session`.
 func (s *Server) HandleReleaseSession(data []byte) []byte {
 	var request contract.MediaReleaseSessionRequest
 	if err := json.Unmarshal(data, &request); err != nil {
@@ -714,10 +656,9 @@ func (s *Server) HandleReleaseSession(data []byte) []byte {
 
 	released := s.sessions.Release(request.SessionID)
 
-	// The delete runs whether or not there was a live session. A release for a session this
-	// instance does not hold is exactly the shape of a retry that landed on the wrong node after a
-	// failover, and leaving the stale entry behind would be leaving the problem the delete exists
-	// to prevent.
+	// The delete runs whether or not there was a live session. A release for a session this instance
+	// does not hold is the shape of a retry that landed on the wrong node after a failover, and leaving
+	// the stale entry behind would leave the problem the delete exists to prevent.
 	ctx, cancel := dirContext()
 	defer cancel()
 	if err := s.dir.Delete(ctx, request.SessionID); err != nil {
@@ -744,19 +685,12 @@ func (s *Server) refuseRelease(sessionID, reason, message string) []byte {
 	})
 }
 
-// HandleStartPlayback plays a prompt towards a session's far end. Rung 1 of the ladder.
+// HandleStartPlayback plays a prompt towards a session's far end.
 //
-// The order of operations is the same shape as allocate's, and for the same reason: everything that
-// can be REFUSED is done before anything that changes state.
-//
-//  1. Validate the payload.
-//  2. Find the session, because the clip has to be decoded into the law THAT LEG answered. Decoding
-//     first and discovering the leg is A-law afterwards would mean throwing the work away — or,
-//     worse, sending it.
-//  3. Read and decode the files. This is the slow step (a disk read and an encode) and it happens
-//     BEFORE a single frame is scheduled, so a playback that reports `ok` is one whose audio is
-//     already in memory. It is also why this subject's deadline is 1 s where the rest are 500 ms.
-//  4. Start it, which returns as soon as the prompt is running.
+// Everything that can be REFUSED happens before anything changes state. The session is found first
+// because the clip has to be decoded into the law THAT LEG answered, and the files are read and
+// decoded before a single frame is scheduled, so a playback that reports `ok` is one whose audio is
+// already in memory. That decode is also why this subject's deadline is 1 s where the rest are 500 ms.
 func (s *Server) HandleStartPlayback(data []byte) []byte {
 	var request contract.MediaStartPlaybackRequest
 	if err := json.Unmarshal(data, &request); err != nil {
@@ -783,10 +717,8 @@ func (s *Server) HandleStartPlayback(data []byte) []byte {
 			fmt.Sprintf("no session %s on this instance", request.SessionID))
 	}
 
-	// RUNG 5 CHANGED THIS CHECK. It used to gate every playback on a configured prompt library. Two
-	// of the three schemes still need one — `sound:` and `moh:` are files — but `tone:` is
-	// GENERATED, and making ringback depend on a mount would mean an instance that can bridge a call
-	// cannot tell the caller the far end is ringing.
+	// `sound:` and `moh:` are files and need a configured prompt library; `tone:` is GENERATED, so
+	// gating it on a mount would mean an instance that can bridge a call cannot signal ringback.
 	if !s.library.Configured() && !isGeneratedRef(request.Media) {
 		return s.refusePlayback(request.SessionID, request.PlaybackRef, ReasonNotSupported,
 			"this instance has no prompt library: set MEDIAD_SOUNDS_DIR to the directory prompts are mounted at")
@@ -820,9 +752,8 @@ func (s *Server) HandleStartPlayback(data []byte) []byte {
 			reason = ReasonShuttingDown
 		case errors.Is(startErr, rtp.ErrNoRemote):
 			// The leg has not sent a packet yet, so symmetric RTP has taught us nowhere to send.
-			// `bad_request` rather than `internal`: the engine asked for a prompt on a leg that is
-			// not carrying media, which is a sequencing bug in the call flow rather than a fault
-			// here, and retrying the same request will fail the same way.
+			// `bad_request` rather than `internal`: the engine asked for a prompt on a leg that is not
+			// carrying media, and retrying the same request will fail the same way.
 			reason = ReasonBadRequest
 		case errors.Is(startErr, rtp.ErrPlaybackPayloadType):
 			reason = ReasonNotSupported
@@ -843,11 +774,9 @@ func (s *Server) HandleStartPlayback(data []byte) []byte {
 
 // playbackRefusalFor classifies a library failure onto the wire's refusal vocabulary.
 //
-// The split that matters is `bad_request` — a file that is broken, so retrying these bytes fails
-// the same way and somebody has to fix the prompt — against `not_supported`, which is a capability
-// this rung does not have and which the engine answers by routing the leg to Asterisk. A 44.1 kHz
-// prompt is the second: Asterisk plays it happily, mediad does not resample, and that is exactly
-// the per-capability cutover working as designed rather than a failed call.
+// `bad_request` is a prompt that is broken, so retrying these bytes fails the same way and somebody
+// has to fix the file. `not_supported` is a capability this build does not have — a 44.1 kHz prompt,
+// since mediad does not resample — which the engine answers by routing the leg to Asterisk.
 func playbackRefusalFor(err error) string {
 	switch {
 	case errors.Is(err, audio.ErrNoLibrary),
@@ -855,10 +784,9 @@ func playbackRefusalFor(err error) string {
 		errors.Is(err, audio.ErrUnsupportedRate),
 		errors.Is(err, audio.ErrUnsupportedChannels),
 		errors.Is(err, audio.ErrUnsupportedFormat),
-		// A tone name this build does not define. `not_supported` and not `bad_request`, because the
-		// engine's recovery is the same one every capability gap gets: Asterisk ships a full tone
-		// ZONE for every country and mediad defines eight signals, so a leg that needs one of the
-		// others is a leg Asterisk can serve.
+		// A tone name this build does not define. `not_supported` and not `bad_request`: Asterisk ships a
+		// full tone zone for every country and mediad defines eight signals, so the engine's recovery is
+		// the one every capability gap gets.
 		errors.Is(err, audio.ErrUnknownTone):
 		return ReasonNotSupported
 	case errors.Is(err, audio.ErrNotFound),
@@ -867,11 +795,9 @@ func playbackRefusalFor(err error) string {
 		errors.Is(err, audio.ErrTruncated),
 		errors.Is(err, audio.ErrTooLarge),
 		errors.Is(err, audio.ErrEmpty),
-		// Rung 5's two new ways to ask for something that cannot mean anything: a cadence that does
-		// not parse, and a looping reference concatenated with a prompt nobody would ever reach.
-		// Both are `bad_request` rather than `not_supported`, and the distinction is the usual one —
-		// the capability EXISTS and the request is malformed, so routing the leg to Asterisk would
-		// produce the same refusal one hop later.
+		// A cadence that does not parse and a looping reference concatenated with a prompt are both
+		// `bad_request` rather than `not_supported`: the capability EXISTS and the request is malformed, so
+		// routing the leg to Asterisk would produce the same refusal one hop later.
 		errors.Is(err, audio.ErrBadToneSpec),
 		errors.Is(err, audio.ErrMixedSources):
 		return ReasonBadRequest
@@ -904,18 +830,15 @@ func playbackKindOf(description string) rtp.PlaybackKind {
 
 // directionToMutes turns an RFC 3264 answer direction into the media plane's two suppression gates.
 //
-// The mapping is a statement about what an ANSWER means, and each half is one sentence:
-//
 //	sendrecv   both ways flow. The ordinary call.
 //	sendonly   we send and do not receive, so what ARRIVES on this leg goes nowhere. mute(in).
 //	recvonly   we receive and do not send, so the peer's audio is not written out. mute(out).
 //	inactive   neither. Both gates up, and the session is additionally put in ModeInactive.
 //
-// It is the media plane's whole share of hold. Which PARTY hears music is the engine's decision and
-// arrives as a separate `start-playback` of a `moh:` reference — deliberately, because "the held
-// caller hears the queue's music" and "the holding agent hears nothing" are two different commands
-// about two different legs, and a media plane that inferred the second from the first would be
-// making a routing decision on the far side of the seam.
+// Which PARTY hears music is the engine's decision and arrives as a separate `start-playback` of a
+// `moh:` reference: "the held caller hears the queue's music" and "the holding agent hears nothing"
+// are two commands about two legs, and inferring the second from the first would be a routing
+// decision on the far side of the seam.
 func directionToMutes(direction sdp.Direction) (muteIn, muteOut bool) {
 	switch direction {
 	case sdp.DirectionSendOnly:
@@ -944,10 +867,7 @@ func (s *Server) refusePlayback(sessionID, playbackRef, reason, message string) 
 // HandleStopPlayback interrupts a prompt by reference.
 //
 // A stop for a reference nothing is playing is `ok:true, stopped:false` — a SUCCESS, and the COMMON
-// case rather than an edge one. Every `gather` stops its own prompt the moment collection ends,
-// whatever ended it, so a caller who listens to the whole menu and then presses a digit produces
-// exactly this on every single call. `MediaPort` states the rule directly: stopping an
-// already-finished playback is a no-op.
+// case: every `gather` stops its own prompt the moment collection ends, whatever ended it.
 func (s *Server) HandleStopPlayback(data []byte) []byte {
 	var request contract.MediaStopPlaybackRequest
 	if err := json.Unmarshal(data, &request); err != nil {
@@ -980,20 +900,15 @@ func (s *Server) refuseStopPlayback(playbackRef, reason, message string) []byte 
 	})
 }
 
-// HandleSendDtmf generates RFC 4733 digits towards a session's far end. Rung 3.
+// HandleSendDtmf generates RFC 4733 digits towards a session's far end.
 //
-// The order of operations is the family's: everything REFUSABLE is decided before anything is put
-// on the wire, so an `ok` reply means the digits are going out rather than that they were accepted
-// for consideration. The two refusals that matter are worth naming separately:
+// Everything REFUSABLE is decided before anything is put on the wire. Two refusals matter:
 //
 //   - A leg that negotiated NO telephone-event payload type is `not_supported`, never an inband
-//     tone. The far end said it does not expect RFC 4733, and sending under a type it never agreed
-//     to produces digits it drops — an IVR that "randomly" ignores keypresses. Synthesising audio
-//     instead means a tone generator, which is the same deferral `tone://` carries at
-//     `start-playback`, and the engine's answer to either is to route the leg to Asterisk.
+//     tone: digits sent under a type the far end never agreed to are dropped, which reads as an IVR
+//     that "randomly" ignores keypresses.
 //   - A character with no event code is `bad_request` naming the character, decided over the WHOLE
-//     string first. Failing halfway would leave a far-end IVR holding a prefix of what was asked
-//     for, under a reply that said the request succeeded.
+//     string first, so a far-end IVR is never left holding a prefix of what was asked for.
 func (s *Server) HandleSendDtmf(data []byte) []byte {
 	var request contract.MediaSendDtmfRequest
 	if err := json.Unmarshal(data, &request); err != nil {
@@ -1035,8 +950,7 @@ func (s *Server) HandleSendDtmf(data []byte) []byte {
 			reason = ReasonShuttingDown
 		case errors.Is(err, rtp.ErrNoRemote):
 			// The leg has not sent a packet yet, so symmetric RTP has taught us nowhere to send.
-			// `bad_request` rather than `internal`, exactly as playback treats it: the engine asked
-			// for digits on a leg that is not carrying media, and a retry fails the same way.
+			// `bad_request` rather than `internal`, exactly as playback treats it: a retry fails the same way.
 			reason = ReasonBadRequest
 		}
 		s.log.Warn("refusing a send-dtmf",
@@ -1068,19 +982,15 @@ func (s *Server) refuseDtmf(sessionID, reason, message string) []byte {
 	})
 }
 
-// HandleStartRecording writes a session's audio to a file. Rung 4.
+// HandleStartRecording writes a session's audio to a file.
 //
-// The path is DERIVED, never accepted: `<MEDIAD_RECORDINGS_DIR>/<orgId>/<callId>/<ref>.wav`, where
-// the org and the call came in on the allocate and live on the session. That is exactly the object
-// key `apps/engine` computes for the same recording and exactly what `apps/api`'s archiver stats
-// under `CDR_RECORDING_ROOT`, so one mount serves both planes and the archive pipeline reads what
-// mediad wrote with no change at all. A caller-supplied directory would let a malformed request
-// write anywhere this process can, and the engine has nothing to say about a layout mediad can work
-// out for itself.
+// The path is DERIVED, never accepted: `<MEDIAD_RECORDINGS_DIR>/<orgId>/<callId>/<ref>.wav`, which
+// is exactly the object key `apps/engine` computes and exactly what `apps/api`'s archiver stats
+// under `CDR_RECORDING_ROOT`, so one mount serves both planes. A caller-supplied directory would let
+// a malformed request write anywhere this process can.
 //
-// The reply comes back once the FILE EXISTS and its header is written — not when the recording
-// ends, which is `recording.finished`, and not before the file is open, which would let the opening
-// moments be dropped on the floor and reported as success.
+// The reply comes back once the FILE EXISTS and its header is written — not when the recording ends,
+// which is `recording.finished`.
 func (s *Server) HandleStartRecording(data []byte) []byte {
 	var request contract.MediaStartRecordingRequest
 	if err := json.Unmarshal(data, &request); err != nil {
@@ -1108,11 +1018,6 @@ func (s *Server) HandleStartRecording(data []byte) []byte {
 			fmt.Sprintf("mediad writes WAV and nothing else; %q would download from apps/api as "+
 				"audio/wav and fail to play", request.Format))
 	}
-	// BOTH of rung 4's remaining refusals are gone, and they had to go together. design doc §10
-	// questions 10 and 11 recorded exactly why: `terminateOn` needed DTMF detection, `beep` needed a
-	// tone generator, voicemail — the only caller — sends both, and "implementing one without the
-	// other moves no call off Asterisk". Detection landed in the wave before this one and the tone
-	// generator landed in this one, so the pair closes here.
 	terminateOn := derefString(request.TerminateOn)
 	if terminateOn == "none" {
 		// ARI's own spelling of "no terminator". Normalised rather than treated as a digit set, or a
@@ -1122,7 +1027,7 @@ func (s *Server) HandleStartRecording(data []byte) []byte {
 	if terminateOn != "" {
 		if _, err := rtp.ValidateDigits(terminateOn); err != nil {
 			// A terminator no keypad can produce would never fire, so the recording would run to its
-			// duration limit on every message — which is the silent failure the refusal replaced.
+			// duration limit on every message.
 			return s.refuseRecording(request.SessionID, request.RecordingRef, ReasonBadRequest,
 				fmt.Sprintf("terminateOn %q is not a set of DTMF digits: %v", terminateOn, err))
 		}
@@ -1144,8 +1049,8 @@ func (s *Server) HandleStartRecording(data []byte) []byte {
 	if tenancyRefusal(orgID, callID) != "" {
 		// Unreachable through the control surface, which holds both tokens to the same rule at
 		// allocate. Checked again here because this is the call site that turns them into a path:
-		// an empty one gives a file at `//<ref>.wav` that joins to no object key any consumer will
-		// look for, and a dot-segment one writes outside the recordings root altogether.
+		// an empty one gives a file at `//<ref>.wav` that joins to no object key, and a dot-segment one
+		// writes outside the recordings root altogether.
 		return s.refuseRecording(request.SessionID, request.RecordingRef, ReasonInternal,
 			"this session carries no usable org or call, so no object key can be derived for it")
 	}
@@ -1156,8 +1061,8 @@ func (s *Server) HandleStartRecording(data []byte) []byte {
 		direction = rtp.RecordBoth
 	case rtp.RecordReceive, rtp.RecordBoth:
 	default:
-		// Anything else used to behave as `receive`, so a typo produced HALF a recording reported as
-		// a success. Every other enum on this surface is parsed and refused; this one now is too.
+		// Parsed and refused rather than defaulting to `receive`, which turned a typo into HALF a recording
+		// reported as a success.
 		return s.refuseRecording(request.SessionID, request.RecordingRef, ReasonBadRequest,
 			fmt.Sprintf("direction %q is not a recording direction: it is %q, %q or absent",
 				request.Direction, rtp.RecordReceive, rtp.RecordBoth))
@@ -1205,16 +1110,12 @@ func (s *Server) HandleStartRecording(data []byte) []byte {
 
 // playBeep sounds the record tone at a leg whose recording has just started.
 //
-// AFTER the recorder is running rather than before it, and that is the ordering decision. A beep
-// played first would need the command to block for its length — a quarter of a second of a caller
-// waiting inside a 1 s deadline — and any word spoken during it would be lost, because the file does
-// not exist yet. Playing it into a live recorder costs the beep appearing at the head of a `both`
-// recording, which is what actually happened on that leg and is what a person listening back expects
-// to hear.
+// AFTER the recorder is running rather than before it: a beep played first would block the command
+// for its length and any word spoken during it would be lost, because the file does not exist yet.
+// Playing it into a live recorder costs the beep appearing at the head of a `both` recording, which
+// is what actually happened on that leg.
 //
-// A beep that cannot be played does NOT fail the recording. The refusal it replaced existed because
-// a voicemail whose beep never sounds clips the first words of every message; a recording that is
-// already running and merely started quietly is a smaller problem than one that did not start.
+// A beep that cannot be played does NOT fail the recording.
 func (s *Server) playBeep(sessionID, recordingRef string, payloadType uint8) {
 	tone, ok := audio.LookupTone(recordBeepTone)
 	if !ok {
@@ -1226,9 +1127,9 @@ func (s *Server) playBeep(sessionID, recordingRef string, payloadType uint8) {
 		s.log.Warn("could not generate the record beep", "sessionId", sessionID, "error", err)
 		return
 	}
-	// The playback reference is derived from the recording's, so `stop-playback` could interrupt it
-	// and a log line ties the two together — and so it can never collide with a reference the engine
-	// assigned, which is a UUID and never carries this suffix.
+	// The playback reference is derived from the recording's, so `stop-playback` can interrupt it and a
+	// log line ties the two together — and so it can never collide with a reference the engine assigned,
+	// which is a UUID and never carries this suffix.
 	err = s.sessions.StartPlayback(sessionID, rtp.PlaybackOptions{
 		Ref:      recordingRef + beepRefSuffix,
 		Frames:   clip.Frames,
@@ -1262,13 +1163,11 @@ func (s *Server) refuseRecording(sessionID, recordingRef, reason, message string
 
 // HandleStopRecording finalises a recording by reference.
 //
-// A stop for a reference nothing is recording is `ok:true, stopped:false` — a SUCCESS, and the
-// common case rather than an edge one: a recording that hit its duration limit, or whose leg hung
-// up, has already finalised itself by the time the engine's teardown gets around to stopping it.
+// A stop for a reference nothing is recording is `ok:true, stopped:false` — a SUCCESS and the common
+// case: a recording that hit its duration limit, or whose leg hung up, has already finalised itself.
 //
 // The reply says the recorder was TOLD to stop. `recording.finished` says the header has been
-// patched, the bytes fsynced and the file renamed into place, and that is the event a consumer must
-// wait for before reading the file.
+// patched, the bytes fsynced and the file renamed into place.
 func (s *Server) HandleStopRecording(data []byte) []byte {
 	var request contract.MediaStopRecordingRequest
 	if err := json.Unmarshal(data, &request); err != nil {
@@ -1301,11 +1200,9 @@ func (s *Server) refuseStopRecording(recordingRef, reason, message string) []byt
 	})
 }
 
-// recordingObjectKey builds the key a recording lands under, relative to the recordings root.
-//
-// `<orgId>/<callId>/<recordingRef>.wav`, with FORWARD slashes whatever the host filesystem uses:
-// this is an object key that travels on the wire and into a database column, not a path. The
-// absolute path is derived from it once, at the one place that knows the root.
+// recordingObjectKey builds the key a recording lands under, relative to the recordings root:
+// `<orgId>/<callId>/<recordingRef>.wav`, with FORWARD slashes whatever the host filesystem uses.
+// This is an object key that travels on the wire and into a database column, not a path.
 func recordingObjectKey(orgID, callID, ref string) string {
 	return orgID + "/" + callID + "/" + ref + recordingExtension
 }
@@ -1314,9 +1211,8 @@ func recordingObjectKey(orgID, callID, ref string) string {
 const recordingExtension = ".wav"
 
 // tenancyRefusal names the first of org and call that cannot be part of a path, or "" when both
-// can. Both tokens become DIRECTORIES under the recordings root (see recordingObjectKey), so they
-// are held to the same rule as the reference that becomes the filename: `filepath.Join` cleans
-// `../` rather than rejecting it, so an unchecked token escapes the root entirely.
+// can. Both tokens become DIRECTORIES under the recordings root, and `filepath.Join` cleans `../`
+// rather than rejecting it, so an unchecked token escapes the root entirely.
 func tenancyRefusal(orgID, callID string) string {
 	switch {
 	case !isSafeRefToken(orgID):
@@ -1330,8 +1226,8 @@ func tenancyRefusal(orgID, callID string) string {
 }
 
 // isSafeRefToken reports whether a reference can be part of a filename without escaping its
-// directory. Deliberately narrower than the subject-token rule: a dot is allowed, because
-// references are UUIDs today and could reasonably carry one, but `..` and every separator are not.
+// directory. Deliberately narrow: a dot is allowed, because references are UUIDs today, but `..`
+// and every separator are not.
 func isSafeRefToken(value string) bool {
 	if value == "" || value == "." || value == ".." {
 		return false
@@ -1348,7 +1244,7 @@ func isSafeRefToken(value string) bool {
 }
 
 // millis turns an optional millisecond count on the wire into a duration. Absent is zero, which
-// every consumer of it reads as "no limit" or "use the default" rather than as "immediately".
+// every consumer reads as "no limit" or "use the default" rather than as "immediately".
 func millis(value *int) time.Duration {
 	if value == nil || *value <= 0 {
 		return 0

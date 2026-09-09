@@ -2,6 +2,7 @@
 package webrtc
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -17,6 +18,9 @@ import (
 	"github.com/pion/rtp"
 	pion "github.com/pion/webrtc/v4"
 )
+
+// packetBufferSize holds one SRTP or SRTCP datagram, sized against a jumbo MTU.
+const packetBufferSize = 8192
 
 type Options struct {
 	BindIP           netip.Addr
@@ -71,9 +75,7 @@ type Transport struct {
 	lastOffer, lastAnswer  string
 
 	// droppedRTP and droppedRTCP count packets discarded because the buffer to the media pipeline
-	// was full. Counted rather than silent for exactly the reason every other drop on this path is
-	// (see rtp.Stats): a stalled Session.Run fills 128 packets in under three seconds and the audio
-	// goes with it, and "the browser leg was choppy" is unanswerable without a number.
+	// was full; a stalled Session.Run fills it in seconds and takes the audio with it.
 	droppedRTP  atomic.Uint64
 	droppedRTCP atomic.Uint64
 }
@@ -99,17 +101,17 @@ func (f *Factory) New(id string) (*Transport, error) {
 	})
 	pc.OnTrack(func(track *pion.TrackRemote, receiver *pion.RTPReceiver) {
 		go t.readReports(func(buf []byte) (int, error) { n, _, err := receiver.Read(buf); return n, err })
+		// Read, not ReadRTP: the pipeline wants wire bytes, and ReadRTP parses a packet and asks the
+		// interceptor chain for header attributes only for this loop to re-serialise it. Decryption
+		// and SRTP replay protection sit below Read either way.
+		buf := make([]byte, packetBufferSize)
 		for {
-			packet, _, err := track.ReadRTP()
+			n, _, err := track.Read(buf)
 			if err != nil {
 				return
 			}
-			raw, err := packet.Marshal()
-			if err != nil {
-				continue
-			}
 			select {
-			case t.rtp <- raw:
+			case t.rtp <- bytes.Clone(buf[:n]):
 			case <-t.done:
 				return
 			default:
@@ -133,14 +135,14 @@ func (f *Factory) New(id string) (*Transport, error) {
 }
 
 func (t *Transport) readReports(read func([]byte) (int, error)) {
-	buf := make([]byte, 8192)
+	buf := make([]byte, packetBufferSize)
 	for {
 		n, err := read(buf)
 		if err != nil {
 			return
 		}
 		select {
-		case t.rtcp <- append([]byte(nil), buf[:n]...):
+		case t.rtcp <- bytes.Clone(buf[:n]):
 		case <-t.done:
 			return
 		default:
@@ -162,11 +164,11 @@ func (t *Transport) Answer(ctx context.Context, offer string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// SIP hold is reversible. Keep the Pion transceiver alive; the media session applies
-	// the negotiated receive/send gates. Pion stops an inactive transceiver permanently.
+	// SIP hold is reversible, so keep the transceiver alive and let the media session apply the
+	// negotiated gates: Pion stops an inactive transceiver permanently.
 	internalOffer := replaceDirection(offer, "sendrecv")
-	// RFC 5763 retains the established DTLS roles when the next offer says actpass.
-	// Pion's answer defaults to active, including when this peer originally offered.
+	// RFC 5763: the established DTLS roles survive a later actpass offer, which Pion's answer
+	// would otherwise reset to active.
 	if remote := t.pc.RemoteDescription(); remote != nil {
 		role := setupRole(remote.SDP)
 		if role == "actpass" {
@@ -202,7 +204,7 @@ func (t *Transport) Answer(ctx context.Context, offer string) (string, error) {
 }
 
 func setupRole(description string) string {
-	for _, line := range strings.Split(description, "\n") {
+	for line := range strings.SplitSeq(description, "\n") {
 		if strings.HasPrefix(line, "a=setup:") {
 			return strings.TrimSpace(strings.TrimPrefix(line, "a=setup:"))
 		}
@@ -274,8 +276,8 @@ func (t *Transport) WriteRTP(buf []byte) (int, error) {
 	case <-t.done:
 		return 0, net.ErrClosed
 	default:
-		// This is called on the peer's packet loop. Waiting for ICE here stalls that loop,
-		// accumulates stale audio in its socket, and bursts it into recordings on connection.
+		// Called on the peer's packet loop: waiting for ICE here stalls it and bursts stale audio
+		// into the conversation on connection.
 		return 0, errors.New("WebRTC media is not connected")
 	}
 	return t.track.write(buf)
@@ -296,8 +298,8 @@ func (t *Transport) Close() error {
 	return err
 }
 
-// packetTrack preserves negotiated telephone-event payloads alongside the audio stream.
-// TrackLocalStaticRTP rewrites every payload as audio, which would corrupt RFC 4733 digits.
+// packetTrack preserves negotiated telephone-event payloads alongside the audio stream;
+// TrackLocalStaticRTP rewrites every payload as audio, corrupting RFC 4733 digits.
 type packetTrack struct {
 	id       string
 	mu       sync.RWMutex

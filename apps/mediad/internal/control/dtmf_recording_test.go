@@ -46,8 +46,6 @@ func decodeStopRecording(t *testing.T, raw []byte) contract.MediaStopRecordingRe
 
 func intPtrOf(value int) *int { return &value }
 
-// --- rung 3: send-dtmf -------------------------------------------------------------------------
-
 func TestSendDtmfStartsAnInjectionAndReportsHowLongItWillTake(t *testing.T) {
 	rig := newRig(t)
 	allocateSession(t, rig)
@@ -195,8 +193,6 @@ func TestSendDtmfAnswersAMalformedRequestRatherThanTimingOut(t *testing.T) {
 	}
 }
 
-// --- rung 4: start-recording / stop-recording ---------------------------------------------------
-
 func TestStartRecordingDerivesTheEnginesOwnObjectKey(t *testing.T) {
 	// `<orgId>/<callId>/<recordingRef>.wav` is exactly what apps/engine computes for the same
 	// recording and exactly what apps/api's archiver stats under CDR_RECORDING_ROOT, so one mount
@@ -290,14 +286,8 @@ func TestStartRecordingRefusesWhatItCannotDoRatherThanDroppingIt(t *testing.T) {
 		reason string
 	}{
 		{
-			// RUNG 5 CLOSED THE OTHER TWO CASES THAT USED TO BE HERE. `beep` was refused because there
-			// was no tone generator and `terminateOn` because there was no DTMF detector; design doc
-			// §10 questions 10 and 11 recorded that both had to land together or no call would move
-			// off Asterisk, and they did. Both are asserted as SERVED in the tests below this one.
-			//
-			// What is still refused is a terminator no keypad can produce, and it is `bad_request`
-			// rather than `not_supported` for the usual reason: the capability exists and the request
-			// is wrong, so routing the leg to Asterisk would not help.
+			// A terminator no keypad can produce is `bad_request` rather than `not_supported`: the capability
+			// exists and the request is wrong, so routing the leg to Asterisk would not help.
 			name: "a terminator that is not a DTMF digit",
 			mutate: func(rq *contract.MediaStartRecordingRequest) {
 				bad := "z"
@@ -313,8 +303,8 @@ func TestStartRecordingRefusesWhatItCannotDoRatherThanDroppingIt(t *testing.T) {
 			contains: "WAV",
 		},
 		{
-			// Anything but `receive` or `both` used to behave as `receive`, so a typo produced HALF a
-			// recording and reported it as a success.
+			// Parsed and refused rather than defaulting to `receive`, which turned a typo into HALF a
+			// recording reported as a success.
 			name:     "a direction that is not one",
 			mutate:   func(rq *contract.MediaStartRecordingRequest) { rq.Direction = "transmit" },
 			contains: "recording direction",

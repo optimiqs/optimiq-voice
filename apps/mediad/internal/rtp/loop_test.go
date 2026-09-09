@@ -7,12 +7,8 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
 
-// Rung 5's frame source: "a session sourcing from a LOOP instead of a peer".
-//
-// The wrap is the whole of it, and the assertions are about what a receiver cannot tell: the far end
-// must not be able to distinguish the moment the clip came back round from any other frame boundary,
-// because a hold loop that announced itself every four seconds is a hold loop somebody complains
-// about.
+// A session sourcing from a loop instead of a peer. The assertions are about what a receiver cannot
+// tell: the wrap must be indistinguishable from any other frame boundary.
 
 func TestALoopingSourceWrapsSeamlessly(t *testing.T) {
 	rig := newPlaybackRig(t, 63000, 63019)
@@ -31,7 +27,7 @@ func TestALoopingSourceWrapsSeamlessly(t *testing.T) {
 
 	var previousSeq uint16
 	var previousTimestamp uint32
-	for index := 0; index < 5; index++ {
+	for index := range 5 {
 		rig.tick(t)
 		packet, ok := rig.aPhone.receive(t)
 		if !ok {
@@ -49,9 +45,8 @@ func TestALoopingSourceWrapsSeamlessly(t *testing.T) {
 				t.Error("the first looped frame has no marker; the stream just changed clocks")
 			}
 		} else {
-			// THE WRAP ASSERTION. Re-asserting the marker at index 2 — the first frame of the second
-			// time round — would tell the receiver a new talkspurt begins every time the music
-			// repeats, which flushes its buffer and clips the first syllable of the loop forever.
+			// The wrap assertion: re-asserting the marker at the start of each repeat would tell
+			// the receiver a new talkspurt began, flushing its buffer and clipping the loop.
 			if packet.Marker {
 				t.Errorf("frame %d has a marker bit; a wrap is not a new talkspurt", index)
 			}
@@ -69,8 +64,7 @@ func TestALoopingSourceWrapsSeamlessly(t *testing.T) {
 }
 
 func TestALoopingSourceEndsStoppedRatherThanCompleted(t *testing.T) {
-	// A loop has no end to complete at. Reporting `completed` would tell a consumer the hold music
-	// finished, which is the one thing hold music never does.
+	// A loop has no end to complete at, so it never reports `completed`.
 	rig := newPlaybackRig(t, 63020, 63039)
 	rig.latch(t)
 
@@ -102,18 +96,15 @@ func TestALoopingSourceEndsStoppedRatherThanCompleted(t *testing.T) {
 	if summary.Reason != rtp.PlaybackStopped {
 		t.Errorf("reason = %q, want stopped", summary.Reason)
 	}
-	// `playedMs` is the only honest measure of how long the caller heard it, which is why it is
-	// counted from frames SENT rather than from the clip's length.
+	// `playedMs` counts frames sent, not the clip's length.
 	if summary.PlayedMs != audio.FrameDurationMs {
 		t.Errorf("playedMs = %d, want %d", summary.PlayedMs, audio.FrameDurationMs)
 	}
 }
 
 func TestAPromptSupersedesAHoldLoop(t *testing.T) {
-	// The rung-1 supersede rule, unchanged: a second playback replaces the first, whatever either of
-	// them is. That is what lets an engine play "your call is important to us" over hold music
-	// without a queue, and it is why the hold's own reference is remembered — an unhold must stop the
-	// loop IT started, not whatever happens to be playing by then.
+	// A second playback replaces the first, whatever either is — which is why the hold remembers its
+	// own reference: an unhold must stop the loop it started, not whatever is playing by then.
 	rig := newPlaybackRig(t, 63040, 63059)
 	rig.latch(t)
 
@@ -146,10 +137,8 @@ func TestAPromptSupersedesAHoldLoop(t *testing.T) {
 }
 
 func TestMusicOnHoldWithoutAHoldKeepsTheConversation(t *testing.T) {
-	// `MediaPort` keeps `startMusicOnHold` and `hold` apart — "separate from hold, which is
-	// signalling" — and this is why: a queue playing music to a caller who is very much still in a
-	// conversation with the queue is the case that needs it. A hold would make that caller inaudible
-	// to the agent who then answered to silence.
+	// Music on hold is separate from hold: a queue plays music to a caller who must still be audible
+	// when an agent answers.
 	rig := newPlaybackRig(t, 63060, 63079)
 	rig.latch(t)
 
@@ -174,7 +163,7 @@ func TestMusicOnHoldWithoutAHoldKeepsTheConversation(t *testing.T) {
 	rig.tick(t)
 	rig.tick(t)
 	rig.tick(t)
-	for index := 0; index < 3; index++ {
+	for index := range 3 {
 		packet, ok := rig.aPhone.receive(t)
 		if !ok {
 			t.Fatalf("music frame %d never arrived", index)

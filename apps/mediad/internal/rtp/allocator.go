@@ -6,27 +6,22 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+
+	"github.com/optimiqs/optimiq-voice/packages/runtime-go/netbuf"
 )
 
-// ErrPortsExhausted is returned when every pair in the range is in use.
-//
-// It is a distinct error because it is the one allocation failure that is a CAPACITY signal rather
-// than a fault: the control handler turns it into a refusal the engine can route around (try
-// another mediad, or fail the call with "congestion"), which is a different answer from "this
-// media server is broken".
+// ErrPortsExhausted is returned when every pair in the range is in use. It is distinct because it
+// is a capacity signal, not a fault: callers turn it into a routable refusal.
 var ErrPortsExhausted = errors.New("rtp: every port pair in the configured range is in use")
 
-// PortPair is a bound RTP socket and its RTCP companion, held together because they are allocated,
-// released and leaked as a unit.
+// PortPair is a bound RTP socket and its RTCP companion, allocated and released as a unit.
 //
-// RFC 3550 §11: RTP on an even port, RTCP on the odd port above it. mediad does not speak RTCP yet
-// (v0 receives and discards), but the port is bound anyway rather than left free — an unbound RTCP
-// port is one an unrelated process can take, and the day RTCP is implemented the pairing would be
-// broken on exactly the hosts that had been running longest.
+// RFC 3550 §11: RTP on an even port, RTCP on the odd port above it. The RTCP port is bound even
+// when unused, so no unrelated process can take it and break the pairing.
 type PortPair struct {
 	// Port is the even RTP port. RTCP is Port+1.
 	Port int
-	// RTP and RTCP are the bound sockets. RTCP is bound but not read from in v0.
+	// RTP and RTCP are the bound sockets.
 	RTP  *net.UDPConn
 	RTCP *net.UDPConn
 
@@ -34,9 +29,8 @@ type PortPair struct {
 	release   func()
 }
 
-// Close shuts both sockets and returns the pair to its allocator. It is idempotent: a session that
-// is closed by its own idle reaper and then again by an explicit release must not hand the same
-// port to two callers, and "released twice" is the normal shape of that race rather than a bug.
+// Close shuts both sockets and returns the pair to its allocator. Idempotent: a double release
+// (idle reaper plus explicit close) must not hand the same port to two callers.
 func (p *PortPair) Close() error {
 	var err error
 	p.closeOnce.Do(func() {
@@ -50,12 +44,15 @@ func (p *PortPair) Close() error {
 
 // Allocator hands out RTP/RTCP port pairs from a fixed range on a fixed bind address.
 //
-// It binds rather than merely bookkeeping. A range is a promise about what mediad may use, not
-// about what is free: a host running Asterisk during the cutover, a stray process, or a previous
-// mediad whose sockets are still in TIME_WAIT can all hold a port inside the range. An allocator
-// that only counted would hand out a port that cannot be bound, and the failure would surface one
-// layer up as a call that never gets audio. Binding at allocation time turns that into a skip.
+// It binds rather than merely bookkeeping: another process may hold a port inside the range, and a
+// counting-only allocator would hand out an unbindable port as a call with no audio.
 type Allocator struct {
+	// SocketBufferBytes is the SO_RCVBUF/SO_SNDBUF every allocated socket asks for. Zero leaves the
+	// kernel default. Set it before the first Allocate; it is read without synchronisation.
+	// The default buffer holds only a few hundred G.711 frames, so a descheduled read loop loses
+	// the overflow silently inside the kernel.
+	SocketBufferBytes int
+
 	bindIP netip.Addr
 	low    int
 	high   int
@@ -67,8 +64,7 @@ type Allocator struct {
 }
 
 // NewAllocator builds an allocator over [low, high]. low must be even and the range must hold at
-// least one pair; config.Load already enforces both, and this repeats the check because an
-// allocator constructed with a bad range would fail per-call instead of at boot.
+// least one pair, so a bad range fails at boot rather than per call.
 func NewAllocator(bindIP netip.Addr, low, high int) (*Allocator, error) {
 	switch {
 	case low%2 != 0:
@@ -99,40 +95,20 @@ func (a *Allocator) InUse() int {
 	return len(a.inUse)
 }
 
-// Allocate binds and returns the next free pair.
+// Allocate binds and returns the next free pair, or ErrPortsExhausted if a full pass finds none.
 //
-// # Why round-robin and not lowest-free
+// Round-robin, not lowest-free: a just-ended call's far end keeps sending for a few hundred
+// milliseconds, and immediate reuse would deliver those packets onto a live session's socket.
+// Cycling the whole range makes the reuse interval the range length in calls rather than zero.
 //
-// Lowest-free is the obvious allocator and the wrong one for RTP. A call that has just ended
-// leaves the far end still sending for a few hundred milliseconds — retransmits, a last few frames
-// queued behind a jitter buffer, or an endpoint that simply has not processed the BYE yet. Handing
-// the port it just freed to the very next call means those packets arrive on a live session's
-// socket, and the symptom is a fragment of a stranger's audio. Cycling the whole range first makes
-// the reuse interval the range's own length in calls rather than zero, which on the default
-// 500-pair range is minutes of traffic rather than microseconds.
-//
-// Sessions also latch to one source address (see Session), so a stray packet is dropped rather
-// than mixed; the cursor makes it not arrive in the first place. Two independent defences, because
-// this is the failure mode that is impossible to reproduce from a bug report.
-//
-// A port that cannot be bound — held by Asterisk during the cutover, or by anything else on the
-// host — is skipped, not fatal. Only a full pass over the range with nothing bindable is
-// ErrPortsExhausted.
-//
-// # Why the bind happens outside the lock
-//
-// The reservation is what needs the mutex; the two ListenUDP calls do not. Holding it across them
-// meant that on a near-full range one allocate did up to Capacity()×2 failing syscalls while every
-// other call setup on the instance queued behind it — which is precisely the range shape the
-// Asterisk cutover produces, since the two services are documented as running side by side. The
-// port is marked in-use before the bind and unmarked if it fails, so no two callers can be binding
-// the same port at once and a lost bind costs one skipped port rather than a leaked one.
+// The bind happens outside the mutex — only the reservation needs it — so a near-full range does
+// not serialise every other call setup behind up to Capacity()x2 failing syscalls. The port is
+// marked in-use before the bind and unmarked on failure, so a lost bind skips rather than leaks.
 func (a *Allocator) Allocate() (*PortPair, error) {
-	for attempt := 0; attempt < a.Capacity(); attempt++ {
+	capacity := a.Capacity()
+	for range capacity {
 		a.mu.Lock()
 		if len(a.inUse) == a.Capacity() {
-			// Every pair is ours already. Walking the range to rediscover that would be Capacity()
-			// map lookups for an answer we have in one.
 			err := fmt.Errorf("%w: %d/%d pairs allocated from %d-%d",
 				ErrPortsExhausted, len(a.inUse), a.Capacity(), a.low, a.high)
 			a.mu.Unlock()
@@ -151,8 +127,7 @@ func (a *Allocator) Allocate() (*PortPair, error) {
 
 		rtpConn, rtcpConn, err := a.bindPair(port)
 		if err != nil {
-			// Someone outside this process holds the port. Skipping is the whole reason Allocate
-			// binds rather than counts.
+			// Someone outside this process holds the port; skip it.
 			a.mu.Lock()
 			delete(a.inUse, port)
 			a.mu.Unlock()
@@ -179,7 +154,6 @@ func (a *Allocator) Allocate() (*PortPair, error) {
 // advanceLocked steps the cursor to the next even port, wrapping at the top of the range.
 func (a *Allocator) advanceLocked() {
 	a.cursor += 2
-	// The last usable RTP port is the highest even port whose odd companion is still in range.
 	if a.cursor+1 > a.high {
 		a.cursor = a.low
 	}
@@ -196,6 +170,11 @@ func (a *Allocator) bindPair(port int) (*net.UDPConn, *net.UDPConn, error) {
 	if err != nil {
 		_ = rtpConn.Close()
 		return nil, nil, err
+	}
+	if a.SocketBufferBytes > 0 {
+		// A refusal is not fatal: the socket still works at the kernel default.
+		_, _ = netbuf.Tune(rtpConn, a.SocketBufferBytes, a.SocketBufferBytes)
+		_, _ = netbuf.Tune(rtcpConn, a.SocketBufferBytes, a.SocketBufferBytes)
 	}
 	return rtpConn, rtcpConn, nil
 }

@@ -19,8 +19,8 @@ func TestFormatFacts(t *testing.T) {
 	}{
 		{"PCMU", audio.FormatULaw, "PCMU", 8000, true},
 		{"PCMA", audio.FormatALaw, "PCMA", 8000, true},
-		// G.722 is the one format whose SAMPLE rate and RTP CLOCK rate differ, and the clock rate is
-		// deliberately not on this type — SDP owns it, so the two can never be confused here.
+		// G.722 is the one format whose sample rate and RTP clock rate differ; SDP owns the clock
+		// rate, so the two cannot be confused here.
 		{"G722", audio.FormatG722, "G722", 16000, true},
 		// Opus is negotiable and relayable but not decodable in this build. See NewFrameDecoder.
 		{"opus", audio.FormatOpus, "opus", 48000, false},
@@ -46,9 +46,7 @@ func TestFormatFacts(t *testing.T) {
 func TestFrameCodecsAnswerExactlyOneFrame(t *testing.T) {
 	t.Parallel()
 
-	// The mixer runs on a clock and takes a frame per participant per tick. A decoder that answered
-	// a short frame for a short payload would put a gap in EVERYBODY's audio rather than in one
-	// participant's, so the length is a contract rather than a convenience.
+	// A short frame from one participant would gap everybody's audio, so the length is a contract.
 	cases := []struct {
 		name    string
 		format  audio.Format
@@ -89,10 +87,8 @@ func TestFrameCodecsAnswerExactlyOneFrame(t *testing.T) {
 func TestFrameCodecRoundTripThroughTheMixBus(t *testing.T) {
 	t.Parallel()
 
-	// This is the path rung 6 actually uses: a participant's payload decoded to 8 kHz linear, mixed,
-	// and re-encoded into whatever the destination leg negotiated. The assertion is that a tone
-	// survives it at the same level, for every format that can be decoded at all — including the
-	// wideband one, whose round trip additionally crosses the resampler twice.
+	// The mix path: decode to 8 kHz linear, mix, re-encode into the destination leg's format. A
+	// tone must survive it at the same level, G.722 included (which crosses the resampler twice).
 	cases := []struct {
 		name   string
 		format audio.Format
@@ -134,10 +130,8 @@ func TestFrameCodecRoundTripThroughTheMixBus(t *testing.T) {
 func TestOpusIsRefusedRatherThanApproximated(t *testing.T) {
 	t.Parallel()
 
-	// The decision recorded in g722.go: the only complete Opus implementation reachable from Go is a
-	// cgo binding, and taking a C toolchain into this build to serve a codec nothing negotiates yet
-	// is a cost with no caller. Opus is relayed, never decoded, and anything that would have to
-	// decode it says so by name rather than producing noise.
+	// Opus is relayed, never decoded; anything that would have to decode it refuses by name rather
+	// than producing noise.
 	if _, err := audio.NewFrameDecoder(audio.FormatOpus); !errors.Is(err, audio.ErrNotTranscodable) {
 		t.Errorf("NewFrameDecoder(opus) = %v, want ErrNotTranscodable", err)
 	}

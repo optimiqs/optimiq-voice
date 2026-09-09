@@ -10,29 +10,18 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 )
 
-// Rung 4 of plans/mediad-design.md §2: writing a session's audio to a file.
+// Writing a session's audio to a file.
 //
-// # Why there is no snoop channel here
-//
-// On Asterisk, recording a conversation means creating a SNOOP channel that spies on `both`
-// directions of a leg and recording that. The snoop exists because ARI addresses everything by
-// channel id, so a tap needs to be a channel in order to be a thing a command can name.
-//
-// mediad has no such constraint: a session already IS both directions — what it receives is the far
-// party, and what it sends is everything the far party was told — so the choice is an argument on
-// the command rather than a second object with its own lifecycle, its own port and its own
-// `leg-arrived` event for a leg that does not exist. That is why `MediaPort.snoop` stays refused on
-// this driver while `record` does not: the primitive is not missing, it is unnecessary.
+// There is no snoop channel: a session already is both directions, so the direction is an argument
+// on the command rather than a second object with its own lifecycle and port.
 
 // RecordingDirection is which side of a session a recording captures.
 type RecordingDirection string
 
 // The two directions, matching the wire contract's `MEDIA_RECORDING_DIRECTIONS` exactly.
 const (
-	// RecordReceive captures only what the session RECEIVES: the far party speaking.
-	//
-	// What a voicemail wants. A mailbox message should hold the caller, not the greeting that was
-	// played at them, and it is the faithful mirror of ARI's `channels.record` on a plain channel.
+	// RecordReceive captures only what the session receives: the far party speaking. What a
+	// voicemail wants, and the mirror of ARI's `channels.record` on a plain channel.
 	RecordReceive RecordingDirection = "receive"
 	// RecordBoth captures both directions, summed. What an on-demand call recording means.
 	RecordBoth RecordingDirection = "both"
@@ -48,38 +37,28 @@ const (
 	RecordingStopped RecordingEndReason = "stopped"
 	// RecordingMaxDuration is the hard length limit. A complete file of exactly that length.
 	RecordingMaxDuration RecordingEndReason = "max-duration"
-	// RecordingMaxSilence is the caller having stopped talking. The NORMAL end of a voicemail.
+	// RecordingMaxSilence is the caller having stopped talking. The normal end of a voicemail.
 	RecordingMaxSilence RecordingEndReason = "max-silence"
 	// RecordingSessionEnded is the leg going away underneath it — released, reaped or drained.
 	// Still a complete file: the recorder finalises on the way down.
 	RecordingSessionEnded RecordingEndReason = "session-ended"
-	// RecordingError is a file that could not be written or finalised. There is NO usable audio.
+	// RecordingError is a file that could not be written or finalised. There is no usable audio.
 	RecordingError RecordingEndReason = "error"
 )
 
-// ErrAlreadyRecording is returned when a session already has a recording in flight.
-//
-// A refusal rather than a supersede, which is the opposite of the playback rule and is the right
-// way round for the same reason: superseding a prompt loses audio nobody will miss, while
-// superseding a recording throws away a file somebody asked for and is waiting on. Two recordings
-// of one leg is also a genuinely different feature (a compliance copy alongside an on-demand one)
-// and it should arrive as one, not as a side effect of a race.
+// ErrAlreadyRecording is returned when a session already has a recording in flight. A refusal rather
+// than a supersede — unlike playback — because superseding would throw away a file somebody is
+// waiting on.
 var ErrAlreadyRecording = errors.New("rtp: this session is already being recorded")
 
-// recordingQueueFrames is how much jitter each direction's queue absorbs before it drops.
-//
-// Half a second. The recorder consumes on a 20 ms tick and the network delivers in bursts, so a
-// queue is what stops a burst from being truncated to one frame. It is bounded rather than
-// unbounded because an unbounded queue turns a stalled writer — a full disk — into memory growth
-// that takes the whole media plane down instead of one recording.
+// recordingQueueFrames is how much jitter each direction's queue absorbs before it drops: half a
+// second, since the recorder consumes on a 20 ms tick and the network delivers in bursts. Bounded,
+// so a stalled writer costs one recording rather than the whole media plane's memory.
 const recordingQueueFrames = 25
 
-// silenceThreshold is the mean absolute sample below which a frame counts as quiet.
-//
-// ~1% of full scale. It has to be above zero because G.711 silence is not zero — the encoding has
-// no exact representation of it, line noise exists, and a comfort-noise generator at the far end is
-// deliberately not silent — and low enough that a person speaking quietly is never mistaken for one
-// who has hung up and left the line open, which is the failure that truncates a voicemail mid-word.
+// silenceThreshold is the mean absolute sample below which a frame counts as quiet: ~1% of full
+// scale. Above zero because G.711 silence is not zero, and low enough that a person speaking quietly
+// is never mistaken for an open line.
 const silenceThreshold = 300
 
 // RecordingOptions is one recording, already resolved to a path by the control surface.
@@ -100,18 +79,9 @@ type RecordingOptions struct {
 	MaxDuration time.Duration
 	// MaxSilence stops it after this much continuous quiet. Zero means no limit.
 	MaxSilence time.Duration
-	// TerminateOn is the set of DTMF digits that end the recording, or empty for none.
-	//
-	// plans/mediad-design.md §10 question 10: this was refused `not_supported` while rung 3's RECEIVE
-	// half did not exist, and stayed refused for one more wave after it did because "closing it is a
-	// recorder that stops on a detected digit plus one field threaded through the handler" and
-	// voicemail — the only caller that sends it — also needed the tone generator for `beep`. Both
-	// arrive together in this wave, which is what makes the pair worth closing: implementing either
-	// alone would have moved no call off Asterisk.
-	//
-	// The digits are matched against the DETECTOR's output, so a `#` typed by a caller ends their
-	// message with the same de-duplication every other consumer of a keypress gets — one event per
-	// press, however many packets carried it.
+	// TerminateOn is the set of DTMF digits that end the recording, or empty for none. The digits
+	// are matched against the detector's output, so one keypress ends the message once however many
+	// packets carried it.
 	TerminateOn string
 }
 
@@ -128,20 +98,11 @@ type RecordingSummary struct {
 
 // Recording is one file being written from one session.
 //
-// # Why it runs on its own 20 ms tick rather than writing on arrival
-//
-// Writing each frame as it arrives is simpler and produces a file whose length is the number of
-// PACKETS that turned up rather than the time that passed. That difference is not academic: an
-// endpoint doing silence suppression sends nothing while nobody speaks, so a write-on-arrival
-// recording of a 30-second voicemail with two pauses in it is 22 seconds long and every word after
-// the first pause is early. A ticking recorder writes silence into the gaps, so the file's duration
-// is wall-clock duration — which is also what makes `maxSilenceMs` mean anything at all, since a
-// direction that has stopped sending is exactly the case it has to detect.
-//
-// The tick is also what makes `both` affordable. Two directions arriving on two goroutines are
-// sampled onto one clock, decoded, summed and written once; the alignment error is bounded by one
-// frame, which is inaudible in a recording and would be a defect in a live conference. That is the
-// difference between this and rung 6's mixer, and it is why one is here and the other is not.
+// It runs on its own 20 ms tick rather than writing on arrival, so the file's duration is wall-clock
+// duration: an endpoint doing silence suppression sends nothing during a pause, and a write-on-
+// arrival file would be short with every word after the pause early. It is also what makes
+// `maxSilenceMs` mean anything, and what lets `both` sample two directions onto one clock with an
+// alignment error bounded by one frame.
 type Recording struct {
 	opts    RecordingOptions
 	session *Session
@@ -152,8 +113,7 @@ type Recording struct {
 	received chan []byte
 	sent     chan []byte
 
-	// dropped counts frames that arrived with the queue full. Counted rather than silent: a
-	// recording with a hole in it must be explicable afterwards.
+	// dropped counts frames that arrived with the queue full, so a hole in the file is explicable.
 	dropped atomic.Int64
 
 	stopOnce sync.Once
@@ -166,8 +126,7 @@ type Recording struct {
 	finishOnce sync.Once
 	summary    RecordingSummary
 	// announceOnce makes the lifecycle announcement idempotent across the two paths that reach a
-	// finished recording — the Manager's watcher, and a session teardown that waited for it. See
-	// Manager.announceRecording.
+	// finished recording: the Manager's watcher, and a session teardown that waited for it.
 	announceOnce sync.Once
 }
 
@@ -191,12 +150,8 @@ func (r *Recording) Stop() { r.stopFor(RecordingStopped) }
 
 // terminateOn ends the recording when a detected digit is in its terminator set.
 //
-// It reports whether it matched, so the caller can log the difference between "a digit arrived" and
-// "a digit ended a message". The reason on the wire is `stopped` rather than a new vocabulary member:
-// `MediaRecordingFinishedReason` has five values and the engine branches on `error` alone, so adding
-// a sixth would be two media planes agreeing on a shape nobody reads. WHICH digit ended it goes in
-// `detail`, which the contract already carries — and which is the only part a person investigating a
-// truncated voicemail actually wants.
+// It reports whether it matched. The reason on the wire is `stopped` rather than a sixth
+// `MediaRecordingFinishedReason`; which digit ended it goes in `detail`.
 func (r *Recording) terminateOn(digit string) bool {
 	if r.opts.TerminateOn == "" || !strings.Contains(r.opts.TerminateOn, digit) {
 		return false
@@ -215,9 +170,8 @@ func (r *Recording) stopFor(reason RecordingEndReason) {
 
 // Received queues one frame from the far end. Called on the session's read goroutine.
 //
-// The payload is COPIED, and that is not defensive: the read loop reuses one buffer for every
-// packet, so a queued slice would be overwritten by the next arrival before the recorder woke up.
-// The same holds for the send side, whose payload aliases the PEER's read buffer.
+// The payload is copied because the read loop reuses one buffer per packet, so a queued slice would
+// be overwritten before the recorder woke up. The same holds for the send side.
 func (r *Recording) Received(payload []byte) { r.enqueue(r.received, payload) }
 
 // Sent queues one frame written towards the far end. Ignored unless the direction is `both`.
@@ -237,18 +191,16 @@ func (r *Recording) enqueue(queue chan []byte, payload []byte) {
 	select {
 	case queue <- frame:
 	default:
-		// NON-BLOCKING, always. This runs on the packet path, and a recorder stalled on a full disk
-		// must cost a hole in one file rather than back-pressure into the read loop of a live call.
+		// Never blocking: this runs on the packet path, and a recorder stalled on a full disk must
+		// cost a hole in one file rather than back-pressure into a live call's read loop.
 		r.dropped.Add(1)
 	}
 }
 
 // StartRecording begins writing this session's audio to a file.
 //
-// It returns once the file EXISTS and its header is written, never when the recording has finished.
-// That ordering is what makes the command's reply meaningful: an `ok` means the first frame has
-// somewhere to go, where a reply sent before the file was opened would let the opening moments of a
-// recording be dropped on the floor and reported as success.
+// It returns once the file exists and its header is written, not when the recording has finished, so
+// a successful reply means the first frame has somewhere to go.
 func (s *Session) StartRecording(opts RecordingOptions) (*Recording, error) {
 	switch {
 	case opts.Ref == "":
@@ -272,8 +224,7 @@ func (s *Session) StartRecording(opts RecordingOptions) (*Recording, error) {
 		done:     make(chan struct{}),
 	}
 
-	// Claimed BEFORE the file is opened, so two racing starts cannot both create a partial and one
-	// of them silently lose its audio to the other's rename.
+	// Claimed before the file is opened, so two racing starts cannot both create a partial.
 	if !s.recording.CompareAndSwap(nil, recording) {
 		return nil, ErrAlreadyRecording
 	}
@@ -291,9 +242,8 @@ func (s *Session) StartRecording(opts RecordingOptions) (*Recording, error) {
 
 // StopRecording finalises the session's recording when it matches ref.
 //
-// Matching on the reference rather than stopping whatever is recording is the same fencing
-// `StopPlayback` does: a stop that arrived late, after the recording it names finished and another
-// started, must not truncate the new one.
+// Matching on the reference fences a late stop: one that arrives after the recording it names
+// finished and another started must not truncate the new one.
 func (s *Session) StopRecording(ref string) bool {
 	recording := s.ActiveRecording()
 	if recording == nil || recording.opts.Ref != ref {
@@ -328,9 +278,8 @@ func (r *Recording) run() {
 			r.finish(reason)
 			return
 		case <-r.session.done:
-			// The leg was released, reaped or drained under a live recording. The file is finalised
-			// on the way down rather than abandoned, so a caller who hangs up mid-message leaves a
-			// playable message instead of a partial nobody can open.
+			// The leg went away under a live recording. The file is finalised on the way down, so a
+			// caller who hangs up mid-message leaves a playable message.
 			r.finish(RecordingSessionEnded)
 			return
 		case <-ticks:
@@ -360,11 +309,9 @@ func (r *Recording) run() {
 	}
 }
 
-// mixOneFrame takes at most one frame from each direction and returns their sum.
-//
-// A direction with nothing waiting contributes SILENCE rather than being skipped, which is the
-// whole reason the recorder ticks: a party who is not speaking is a party the recording has to
-// represent with the right amount of nothing, or every word after their pause arrives early.
+// mixOneFrame takes at most one frame from each direction and returns their sum. A direction with
+// nothing waiting contributes silence rather than being skipped, or every word after a pause would
+// arrive early.
 func (r *Recording) mixOneFrame() []int16 {
 	mixed := make([]int16, audio.FrameSamples)
 
@@ -390,10 +337,8 @@ func (r *Recording) finish(reason RecordingEndReason) {
 		durationMs := r.writer.DurationMs()
 		bytes, err := r.writer.Close()
 		if err != nil {
-			// A recording that cannot be finalised has NO usable file — Close removes the partial
-			// rather than leaving one the archive pipeline would copy — so the reason becomes
-			// `error` whatever asked for the stop. Reporting `stopped` here would tell the engine a
-			// file exists that does not.
+			// A recording that cannot be finalised has no usable file — Close removes the partial —
+			// so the reason becomes `error` whatever asked for the stop.
 			r.summary = RecordingSummary{
 				Ref:       r.opts.Ref,
 				ObjectKey: r.opts.ObjectKey,
@@ -408,13 +353,11 @@ func (r *Recording) finish(reason RecordingEndReason) {
 			detail = "terminated on " + *digit
 		}
 		if dropped := r.Dropped(); dropped > 0 {
-			// Surfaced rather than buried in a counter nobody reads: a recording with gaps in it is
-			// a recording somebody will play back and complain about, and this is the only place
-			// that can say the gaps were the writer falling behind rather than the network.
+			// Surfaced in `detail`: this is the only place that can say the gaps were the writer
+			// falling behind rather than the network.
 			if detail != "" {
-				// APPENDED, not replaced. A voicemail ended by `#` on a busy box used to report only
-				// the drops, and the fact that the caller pressed a key — which this is the one
-				// field carrying — was lost.
+				// Appended, not replaced: a recording both terminated by a digit and short of
+				// frames has to report both.
 				detail += "; "
 			}
 			detail += "frames were dropped while a direction's queue was full"
@@ -456,18 +399,11 @@ func framesIn(window time.Duration) int {
 		return 0
 	}
 	frames := int((window.Milliseconds() + audio.FrameDurationMs - 1) / audio.FrameDurationMs)
-	if frames < 1 {
-		return 1
-	}
-	return frames
+	return max(frames, 1)
 }
 
-// quiet reports whether a frame's mean absolute amplitude is below the silence threshold.
-//
-// Mean absolute rather than peak, because a single click in an otherwise dead line would reset a
-// silence timer that exists to notice a caller who has stopped speaking. It is a threshold on a
-// buffer that has already been decoded for writing, not a signal-processing stage: the samples are
-// in hand either way.
+// quiet reports whether a frame's mean absolute amplitude is below the silence threshold. Mean
+// absolute rather than peak, so a single click in an otherwise dead line does not reset the timer.
 func quiet(samples []int16) bool {
 	if len(samples) == 0 {
 		return true

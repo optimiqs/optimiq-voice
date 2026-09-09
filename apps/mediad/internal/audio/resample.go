@@ -2,40 +2,21 @@ package audio
 
 import "math"
 
-// The 8 kHz ↔ 16 kHz boundary, which is the only rate conversion this service performs.
+// The 8 kHz ↔ 16 kHz boundary, the only rate conversion this service performs.
 //
-// # Why the mix rate is 8 kHz and not 16
+// The mix bus is 8 kHz linear PCM and G.722 is resampled at its own edge, so the cost falls on the
+// wideband leg rather than on every G.711 participant. The price is that a G.722 leg in a
+// conference is band-limited to 4 kHz; a two-party passthrough bridge never decodes and keeps full
+// bandwidth.
 //
-// Everything above rung 0 is built on `SampleRate = 8000`: the recorder writes it, the WAV parser
-// refuses anything else, the frame geometry is derived from it, and both G.711 laws are native to
-// it. Moving the internal rate to 16 kHz to suit one codec would mean resampling every G.711
-// participant in every conference — which is every participant on every deployment today — to
-// benefit a wideband leg that may not exist. So the MIX BUS is 8 kHz linear PCM and G.722 is
-// resampled at its own edge, which puts the cost on the leg that asked for it.
-//
-// The price is stated plainly: a G.722 leg in a conference is band-limited to 4 kHz by the mix. It
-// still gets wideband quality on a two-party PASSTHROUGH bridge, which is where a wideband leg
-// actually is almost all of the time, because passthrough never decodes at all. When there is a
-// deployment whose conferences are mostly wideband, the answer is a second 16 kHz mix bus for those
-// rooms rather than a resample on every narrowband leg — and the seam for it is `Mixer.rate`, which
-// is why the mixer takes its frame size from a constant rather than assuming one.
-//
-// # Why a windowed-sinc half-band rather than linear interpolation
-//
-// Linear interpolation upsampling leaves the 4-8 kHz image of the original signal in the output at
-// only ~13 dB down, which on a wideband leg is heard as a metallic edge on sibilants — the classic
-// "narrowband audio played through a wideband codec" sound. Decimating without a filter is worse:
-// energy above 4 kHz folds back into the audible band as aliasing, and speech has plenty of it. A
-// 31-tap Hamming-windowed sinc is about 40 dB of stopband rejection, costs 31 multiply-accumulates
-// per output sample, and is computed once at init rather than carried as a table nobody can check.
+// A 31-tap Hamming-windowed sinc rather than linear interpolation: linear upsampling leaves the
+// 4-8 kHz image only ~13 dB down (audible as a metallic edge on sibilants) and unfiltered
+// decimation aliases speech energy above 4 kHz back into band. This gives ~40 dB of stopband
+// rejection for 31 multiply-accumulates per output sample.
 
-// resampleTaps is the FIR length, and it is odd so the filter has an exact integer group delay of
-// (taps-1)/2 samples — which is what lets the delay be compensated by priming the history rather
-// than by a fractional-delay correction nobody would get right.
-//
-// 31 taps at 16 kHz is ~1.9 ms of delay on the wideband side, under a tenth of a frame, and it buys
-// a transition band narrow enough to leave speech alone. Longer would be better filtering for
-// latency that starts to be measurable in a conference; shorter starts to let the image through.
+// resampleTaps is the FIR length. Odd, so the group delay is an exact integer (taps-1)/2 samples
+// and can be compensated by priming the history rather than by a fractional-delay correction.
+// 31 taps at 16 kHz is ~1.9 ms, under a tenth of a frame.
 const resampleTaps = 31
 
 // resampleKernel is a Hamming-windowed sinc lowpass at a quarter of the 16 kHz rate — 4 kHz, which
@@ -50,7 +31,7 @@ func buildResampleKernel() [resampleTaps]float64 {
 	const cutoff = 0.25
 
 	var sum float64
-	for i := 0; i < resampleTaps; i++ {
+	for i := range resampleTaps {
 		offset := float64(i) - center
 		var sinc float64
 		if offset == 0 {
@@ -62,20 +43,16 @@ func buildResampleKernel() [resampleTaps]float64 {
 		kernel[i] = sinc * window
 		sum += kernel[i]
 	}
-	// Normalised to unity DC gain, so a resample changes the band and never the LEVEL. A filter that
-	// quietly attenuated by a decibel would show up as "the wideband phones are quieter", which is
-	// the kind of defect that gets blamed on the handset.
+	// Normalised to unity DC gain, so a resample changes the band and never the level.
 	for i := range kernel {
 		kernel[i] /= sum
 	}
 	return kernel
 }
 
-// Resampler8to16 upsamples narrowband audio to the wideband rate, keeping filter state across calls.
-//
-// STATEFUL for the same reason the codec is: a filter restarted per frame discards the tail of the
-// previous one, which is a discontinuity every 20 ms — an 50 Hz buzz under the speech, exactly the
-// artefact a naive per-packet resampler produces.
+// Resampler8to16 upsamples narrowband audio to the wideband rate. Stateful: a filter restarted per
+// frame discards the previous tail, giving a discontinuity every 20 ms — a 50 Hz buzz under the
+// speech.
 type Resampler8to16 struct {
 	history [resampleTaps]float64
 }
@@ -85,17 +62,13 @@ func (r *Resampler8to16) Resample(in []int16) []int16 {
 	return r.resampleInto(make([]int16, 0, len(in)*2), in)
 }
 
-// resampleInto is Resample writing into a caller-supplied buffer, for the packet path.
-//
-// The transcoder and the mixer run this fifty times a second per leg, and a fresh output slice each
-// time is one of the allocations rung 7's bridge pays for with nothing to show. `dst` is expected
-// zero-length with capacity; it is appended to and returned, so an undersized one still works.
+// resampleInto is Resample writing into a caller-supplied buffer, for the packet path. `dst` is
+// expected zero-length with capacity; it is appended to and returned, so an undersized one works.
 func (r *Resampler8to16) resampleInto(dst, in []int16) []int16 {
 	out := dst[:0]
 	for _, sample := range in {
-		// Zero-stuffing: one input sample followed by one zero doubles the rate and puts a mirror
-		// image of the signal above 4 kHz, which the kernel below then removes. The factor of two
-		// restores the level the stuffed zeros halved.
+		// Zero-stuffing doubles the rate and mirrors the signal above 4 kHz, which the kernel then
+		// removes. The factor of two restores the level the stuffed zeros halved.
 		for _, stuffed := range [2]float64{float64(sample), 0} {
 			copy(r.history[:resampleTaps-1], r.history[1:])
 			r.history[resampleTaps-1] = stuffed
@@ -108,9 +81,8 @@ func (r *Resampler8to16) resampleInto(dst, in []int16) []int16 {
 // Resampler16to8 downsamples wideband audio to the mix rate. Stateful; see Resampler8to16.
 type Resampler16to8 struct {
 	history [resampleTaps]float64
-	// phase alternates so exactly every second filtered sample is kept. Held across calls because a
-	// frame of 16 kHz audio is an even number of samples today and need not be tomorrow, and a phase
-	// that reset per frame would drop or duplicate a sample whenever it was not.
+	// phase alternates so exactly every second filtered sample is kept. Held across calls so an
+	// odd-length frame does not drop or duplicate a sample.
 	phase int
 }
 
@@ -119,7 +91,7 @@ func (r *Resampler16to8) Resample(in []int16) []int16 {
 	return r.resampleInto(make([]int16, 0, (len(in)+1)/2), in)
 }
 
-// resampleInto is Resample writing into a caller-supplied buffer. See Resampler8to16.resampleInto.
+// resampleInto is Resample writing into a caller-supplied buffer.
 func (r *Resampler16to8) resampleInto(dst, in []int16) []int16 {
 	out := dst[:0]
 	for _, sample := range in {
@@ -136,7 +108,7 @@ func (r *Resampler16to8) resampleInto(dst, in []int16) []int16 {
 
 func convolve(history *[resampleTaps]float64) float64 {
 	var sum float64
-	for i := 0; i < resampleTaps; i++ {
+	for i := range resampleTaps {
 		sum += history[i] * resampleKernel[i]
 	}
 	return sum

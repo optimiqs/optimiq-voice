@@ -1,53 +1,24 @@
 package audio
 
-// ITU-T G.722: 7 kHz wideband speech in 64 kbit/s, sub-band ADPCM. Rung 7 of
-// plans/mediad-design.md §2, and the FIRST real DSP in this service.
+// ITU-T G.722: 7 kHz wideband speech at 64 kbit/s (mode 1), sub-band ADPCM.
 //
-// # Why G.722 is written here rather than pulled in
+// A QMF splits 16 kHz input into two 8 kHz sub-bands; the lower band is ADPCM-coded at 6 bits and
+// the upper at 2, packing into one octet per input sample PAIR. So 20 ms is 320 input samples and
+// 160 octets, the same payload size a 20 ms G.711 frame carries.
 //
-// The repo's Go dependencies are `pion/rtp`, `pion/sdp`, `nats.go` and `x/crypto`, and every one of
-// them is a WIRE FORMAT or a protocol — a thing whose definition lives outside this repo and whose
-// implementation must match everybody else's byte for byte. A codec is arithmetic. G.722 is two
-// hundred lines of integer operations over tables printed in the standard, it has no security
-// surface, no network behaviour and no version drift, and the same argument already applied to
-// G.711: `g711.go` implements the companding tables in-repo rather than importing them.
+// Modes 2 and 3 (56 and 48 kbit/s) are not implemented: RFC 3551 defines the RTP payload as the
+// 64 kbit/s stream.
 //
-// The alternative that was considered and rejected is `hraban/opus`, which is the only complete Opus
-// binding for Go and is **cgo**. That would put a C toolchain and libopus into every build of this
-// service — including the static, scratch-based container image the rest of the data plane produces
-// — to serve a codec no endpoint in this deployment negotiates yet. Opus's own position is recorded
-// in `codec.go`: it is NEGOTIATED and PASSED THROUGH, which needs no codec at all, and transcoding
-// it is refused by name. That refusal is honest and reversible; a cgo dependency is neither.
-//
-// # What this implementation is
-//
-// The 64 kbit/s mode (mode 1): a QMF splits 16 kHz input into two 8 kHz sub-bands, the lower band is
-// ADPCM-coded at 6 bits and the upper at 2, and the two pack into one octet per input SAMPLE PAIR.
-// So 20 ms of G.722 is 320 input samples and 160 octets — the same 160-byte payload a 20 ms G.711
-// frame carries, which is why the framing above this file needed no change at all.
-//
-// Modes 2 and 3 (56 and 48 kbit/s) are NOT implemented. They exist to steal bandwidth from the
-// lower band for an auxiliary data channel that no VoIP endpoint has ever used, RFC 3551 says the
-// RTP payload is the 64 kbit/s stream, and an endpoint that offered one would be doing something
-// this deployment has no way to have asked for.
-//
-// # The clock-rate trap, stated where it can be seen
-//
-// G.722 samples at 16 kHz and its RTP clock rate is 8000. That is not a mistake here: RFC 3551 §4.5.2
-// records it as an error in the original specification that was left standing because implementations
-// had already shipped, and an `a=rtpmap:9 G722/16000` is the single most common G.722 interop bug in
-// the industry. `internal/sdp` writes 8000 and this file works in samples; the two must not be
-// confused, so neither one converts.
+// Clock-rate trap: G.722 samples at 16 kHz but its RTP clock rate is 8000. RFC 3551 §4.5.2 records
+// this as a specification error left standing because implementations had shipped. internal/sdp
+// writes 8000 and this file works in samples; neither converts.
 
 // g722QMFCoeffs is the 24-tap quadrature mirror filter, expressed as its 12 distinct coefficients.
-//
-// From the standard. The filter is what splits the band, and its symmetry is what lets the analysis
-// and synthesis halves share one table.
+// Its symmetry lets the analysis and synthesis halves share one table.
 var g722QMFCoeffs = [12]int32{3, -11, 12, 32, -210, 951, 3876, -805, 362, -156, 53, -11}
 
-// The quantiser and scale-factor tables from ITU-T G.722, verbatim. They are normative data in
-// exactly the way the G.711 segment tables next door are: a value changed here does not produce
-// slightly different audio, it produces a decoder somewhere else that cannot follow this encoder.
+// Quantiser and scale-factor tables from ITU-T G.722, verbatim. Normative data: a changed value
+// does not shift the audio slightly, it makes every other decoder unable to follow this encoder.
 var (
 	g722Q6 = [32]int32{
 		0, 35, 72, 110, 150, 190, 233, 276, 323, 370, 422, 473, 530, 587, 650, 714,
@@ -90,12 +61,9 @@ var (
 	g722RH2 = [4]int32{2, 1, 2, 1}
 )
 
-// g722Band is one sub-band's adaptive predictor state.
-//
-// Six zeros and two poles, which is the ADPCM predictor G.721 established and G.722 reuses per band.
-// The whole reason a codec state object exists — and the reason a G.722 stream cannot be cut into
-// pieces and reassembled — is that these coefficients are ADAPTED from the signal, so an encoder and
-// a decoder stay in step only by seeing the same octets in the same order from the same start.
+// g722Band is one sub-band's adaptive predictor state: six zeros and two poles. The coefficients
+// adapt to the signal, so encoder and decoder stay in step only by seeing the same octets in the
+// same order from the same start; a stream cannot be cut up and reassembled.
 type g722Band struct {
 	s, sp, sz int32
 	r         [3]int32
@@ -126,11 +94,9 @@ func g722Saturate(value int32) int32 {
 	}
 }
 
-// block4 is the standard's adaptive-predictor update, run once per sub-band per sample pair.
-//
-// Named for the block number in the specification's own diagram rather than for what it does,
-// deliberately: every published G.722 implementation uses these names, and a reader checking this
-// against the standard needs the labels to line up.
+// block4 is the standard's adaptive-predictor update, run once per sub-band per sample pair. It and
+// the labels inside it are named for the specification's own diagram so the code can be checked
+// against it.
 func (b *g722Band) block4(d int32) {
 	// RECONS / PARREC.
 	b.d[0] = d
@@ -138,7 +104,7 @@ func (b *g722Band) block4(d int32) {
 	b.p[0] = g722Saturate(b.sz + d)
 
 	// UPPOL2 — the second-order pole coefficient.
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		b.sg[i] = b.p[i] >> 15
 	}
 	wd1 := g722Saturate(b.a[1] << 2)
@@ -225,12 +191,9 @@ func (b *g722Band) block4(d int32) {
 	b.s = g722Saturate(b.sp + b.sz)
 }
 
-// G722Encoder turns 16 kHz linear samples into G.722 octets.
-//
-// STATEFUL, and that is the property every caller has to respect: one encoder per outbound stream,
-// for the life of the stream. Encoding two legs' audio through one encoder produces two streams of
-// plausible octets that neither decoder can follow, because the predictor has been adapting to the
-// interleaving of both.
+// G722Encoder turns 16 kHz linear samples into G.722 octets. Stateful: one encoder per outbound
+// stream, for the life of the stream. Interleaving two streams through one encoder produces octets
+// no decoder can follow.
 type G722Encoder struct {
 	bands [2]g722Band
 	x     [24]int32
@@ -250,17 +213,14 @@ func (e *G722Encoder) Reset() {
 	e.x = [24]int32{}
 }
 
-// Encode converts 16 kHz samples to octets, one octet per PAIR of samples.
-//
-// An odd-length input drops its final sample rather than padding: a half sample pair is half a QMF
-// step, and inventing a companion for it would put a sample the caller never supplied into the
-// stream and leave the two sides one sample apart for the rest of the call.
+// Encode converts 16 kHz samples to octets, one octet per PAIR of samples. An odd-length input
+// drops its final sample rather than padding, which would leave the two sides one sample apart for
+// the rest of the call.
 func (e *G722Encoder) Encode(samples []int16) []byte {
 	return e.encodeInto(make([]byte, 0, len(samples)/2), samples)
 }
 
-// encodeInto is Encode writing into a caller-supplied buffer, for the packet path. See
-// Resampler8to16.resampleInto.
+// encodeInto is Encode writing into a caller-supplied buffer, for the packet path.
 func (e *G722Encoder) encodeInto(dst []byte, samples []int16) []byte {
 	out := dst[:0]
 	for index := 0; index+1 < len(samples); index += 2 {
@@ -269,7 +229,7 @@ func (e *G722Encoder) encodeInto(dst []byte, samples []int16) []byte {
 		e.x[23] = int32(samples[index+1])
 
 		var sumOdd, sumEven int32
-		for i := 0; i < 12; i++ {
+		for i := range 12 {
 			sumOdd += e.x[2*i] * g722QMFCoeffs[i]
 			sumEven += e.x[2*i+1] * g722QMFCoeffs[11-i]
 		}
@@ -302,8 +262,8 @@ func (e *G722Encoder) encodeLow(low int32) int32 {
 		code = g722ILN[index]
 	}
 
-	// INVQAL — the encoder decodes its own choice, because the predictor must adapt to what the
-	// DECODER will see rather than to what came in. This is what keeps the two ends in step.
+	// INVQAL — the encoder decodes its own choice: the predictor must adapt to what the decoder
+	// will see, not to what came in.
 	ril := code >> 2
 	d := (band.det * g722QM4[ril]) >> 15
 
@@ -379,7 +339,7 @@ func (d *G722Decoder) Decode(payload []byte) []int16 {
 	return d.decodeInto(make([]int16, 0, len(payload)*2), payload)
 }
 
-// decodeInto is Decode writing into a caller-supplied buffer. See Resampler8to16.resampleInto.
+// decodeInto is Decode writing into a caller-supplied buffer.
 func (d *G722Decoder) decodeInto(dst []int16, payload []byte) []int16 {
 	out := dst[:0]
 	for _, octet := range payload {
@@ -391,7 +351,7 @@ func (d *G722Decoder) decodeInto(dst []int16, payload []byte) []int16 {
 		d.x[23] = low - high
 
 		var sumOdd, sumEven int32
-		for i := 0; i < 12; i++ {
+		for i := range 12 {
 			sumOdd += d.x[2*i] * g722QMFCoeffs[i]
 			sumEven += d.x[2*i+1] * g722QMFCoeffs[11-i]
 		}
@@ -405,8 +365,7 @@ func (d *G722Decoder) decodeInto(dst []int16, payload []byte) []int16 {
 func (d *G722Decoder) decodeLow(code int32) int32 {
 	band := &d.bands[0]
 
-	// The 6-bit code reconstructs the sample; its top four bits drive the scale factor, which is why
-	// a decoder that only used the wide table would drift out of step with the encoder.
+	// The 6-bit code reconstructs the sample; its top four bits drive the scale factor.
 	wide := (band.det * g722QM6[code]) >> 15
 	reconstructed := band.s + wide
 	switch {
@@ -457,8 +416,8 @@ func (d *G722Decoder) decodeHigh(code int32) int32 {
 	return reconstructed
 }
 
-// g722Scale is the standard's SCALEL/SCALEH step: a log-domain scale factor turned into a linear
-// one through the ILB table and a shift. The two bands differ only by that shift's offset.
+// g722Scale is the standard's SCALEL/SCALEH step: a log-domain scale factor turned linear through
+// the ILB table and a shift. The two bands differ only by that shift's offset.
 func g722Scale(nb, offset int32) int32 {
 	index := (nb >> 6) & 31
 	shift := offset - (nb >> 11)

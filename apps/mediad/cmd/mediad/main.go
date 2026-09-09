@@ -1,15 +1,8 @@
-// Command mediad is the Optimiq Voice media plane (plan §3.4, PG track).
+// Command mediad is the Optimiq Voice media plane.
 //
-// It serves rungs 1 through 7 of plans/mediad-design.md §2. It answers `rpc.media.v1.*` with SDP
-// (G.711 and G.722 with transcoding, Opus negotiated and relayed, RFC 4733 alongside), allocates
-// RTP/RTCP port pairs from a configured range, learns each far end from the packets themselves,
-// relays between two sessions or MIXES N of them with mix-minus, reads RTCP for per-leg loss and
-// round-trip time, and publishes `media.evt.v1.*` when a session ends or its audio stops. Which
-// mediad instance holds which session is recorded in the `media-sessions` KV directory, so the
-// commands after an allocate reach the one instance that can serve them.
-//
-// Rung 8 (T.38 fax) is still Asterisk's, and Asterisk keeps serving every real call until each rung
-// is proven. The engine chooses per deployment with ENGINE_MEDIA_DRIVER.
+// It answers `rpc.media.v1.*` with SDP, allocates RTP/RTCP port pairs, relays between two sessions
+// or mixes N of them with mix-minus, reads RTCP, and publishes `media.evt.v1.*`. The `media-sessions`
+// KV directory records which instance holds which session, so later commands reach that instance.
 //
 // Configuration is entirely environmental; run with no arguments.
 package main
@@ -21,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -28,6 +22,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/optimiqs/optimiq-voice/packages/runtime-go/health"
+	"github.com/optimiqs/optimiq-voice/packages/runtime-go/proclimit"
 
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/config"
@@ -50,8 +45,7 @@ func main() {
 		err = run()
 	}
 	if err != nil && !errors.Is(err, context.Canceled) {
-		// The logger may not exist yet when configuration fails, so this one line goes to stderr
-		// directly. Everything after boot is structured JSON.
+		// The logger may not exist yet when configuration fails; everything after boot is JSON.
 		fmt.Fprintf(os.Stderr, "mediad: %v\n", err)
 		os.Exit(1)
 	}
@@ -72,16 +66,20 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if soft := proclimit.ApplyMemoryLimit(os.Getenv, proclimit.DefaultHeadroomPercent); soft > 0 {
+		log.Info("GOMEMLIMIT derived from the container memory limit", "softLimitBytes", soft)
+	}
+
 	allocator, err := rtp.NewAllocator(cfg.BindIP, cfg.RTPPortMin, cfg.RTPPortMax)
 	if err != nil {
 		return err
 	}
+	allocator.SocketBufferBytes = cfg.RTPSocketBufferBytes
 
 	natsOpts := []nats.Option{
 		nats.Name(config.EventSource),
-		// A media plane must survive a broker restart without dropping calls in progress: RTP does
-		// not go through NATS, so a session already up keeps working while the control surface
-		// reconnects. Giving up would kill live audio to fix a control-plane problem.
+		// RTP does not go through NATS, so a live session survives a broker restart; giving up
+		// reconnecting would kill live audio over a control-plane problem.
 		nats.MaxReconnects(-1),
 		nats.CustomInboxPrefix("_INBOX.mediad"),
 		nats.ReconnectWait(time.Second),
@@ -92,18 +90,14 @@ func run() error {
 			log.Info("nats reconnected", "url", c.ConnectedUrl())
 		}),
 	}
-	// Only when configured: an empty pair means a broker with no authentication, which is what the
-	// integration rig runs. config.Load has already refused a half-set pair, and has already
-	// preferred NATS_MEDIAD_USER/PASS over the shared pair — so this is the `mediad` user, whose
-	// permissions in config/nats.conf are the six rpc.media.v1 subjects, media.evt.v1.> and the
-	// media-sessions bucket. A subject outside that set fails as an authorization violation on the
-	// publish, not at connect.
+	// An empty pair means a broker with no authentication; config.Load has already refused a
+	// half-set pair. The `mediad` user's permissions are scoped in config/nats.conf, so a subject
+	// outside that set fails as an authorization violation on the publish, not at connect.
 	if cfg.NATSUser != "" {
 		natsOpts = append(natsOpts, nats.UserInfo(cfg.NATSUser, cfg.NATSPass))
 	}
-	// Transport security, off unless configured. RootCAs both enables TLS and pins the bundle, so
-	// it covers the private-CA case on its own; Secure is the system-trust-store case. Neither set
-	// leaves the connection plaintext, which is what the broker in compose.yaml serves.
+	// Transport security, off unless configured. RootCAs both enables TLS and pins the bundle
+	// (private CA); Secure is the system-trust-store case. Neither set leaves the connection plaintext.
 	switch {
 	case cfg.NATSTLSCA != "":
 		natsOpts = append(natsOpts, nats.RootCAs(cfg.NATSTLSCA))
@@ -113,9 +107,8 @@ func run() error {
 
 	conn, err := nats.Connect(cfg.NATSURL, natsOpts...)
 	if err != nil {
-		// A rejected credential lands here as "nats: Authorization Violation" and takes the process
-		// down with it. Deliberate: a media plane that cannot be commanded is not degraded, it is
-		// a pool of ports nobody can allocate.
+		// A rejected credential takes the process down deliberately: a media plane that cannot be
+		// commanded is a pool of ports nobody can allocate.
 		return fmt.Errorf("connecting to NATS at %s: %w", cfg.NATSURL, err)
 	}
 	defer func() {
@@ -124,9 +117,8 @@ func run() error {
 		}
 	}()
 
-	// JetStream is needed for two things and neither is optional at this rung: the `media-sessions`
-	// KV directory, without which a second instance cannot route a command, and the lifecycle
-	// publisher, without which a call that loses audio ends silently.
+	// JetStream backs the `media-sessions` KV directory, without which a second instance cannot
+	// route a command, and the lifecycle publisher, without which a call that loses audio ends silently.
 	js, err := jetstream.New(conn)
 	if err != nil {
 		return fmt.Errorf("opening JetStream: %w", err)
@@ -161,18 +153,16 @@ func run() error {
 
 	library := audio.NewLibrary(cfg.SoundsDir)
 	if !library.Configured() {
-		// WARN and carry on rather than refuse to boot: every rung below playback still works, and
-		// a deployment cutting over bridged calls first has no prompt store yet by design. The
-		// refusal happens per command, by name, which is where an operator can act on it.
+		// Warn rather than refuse to boot: everything but playback still works, and the refusal
+		// happens per command by name, which is where an operator can act on it.
 		log.Warn("no prompt library is configured; every playback will be refused as not_supported",
 			"hint", "set MEDIAD_SOUNDS_DIR to the directory prompts are mounted at")
 	}
 
 	if cfg.RecordingsDir == "" {
-		// WARN and carry on, exactly as with the prompt library above: every rung below recording
-		// still works, and the refusal happens per command by name, which is where an operator can
-		// act on it. A default pointing at a directory that probably does not exist would turn one
-		// clear refusal into a per-call "cannot create file".
+		// Warn rather than refuse to boot, as with the prompt library: a default pointing at a
+		// directory that probably does not exist would turn one clear refusal into a per-call
+		// "cannot create file".
 		log.Warn("no recordings directory is configured; every recording will be refused as not_supported",
 			"hint", "set MEDIAD_RECORDINGS_DIR to the same mount apps/api reads as CDR_RECORDING_ROOT")
 	}
@@ -209,13 +199,18 @@ func run() error {
 	if err := conn.FlushTimeout(3 * time.Second); err != nil {
 		return fmt.Errorf("flushing media subscriptions: %w", err)
 	}
-	healthServer, err := health.Start(ctx, cfg.HealthAddr, func() bool { return conn.IsConnected() && !cfg.EchoDiagnostic })
+	healthServer, err := health.Start(ctx, cfg.HealthAddr,
+		func() bool { return conn.IsConnected() && !cfg.EchoDiagnostic },
+		health.WithPprof(cfg.EnablePprof))
 	if err != nil {
 		return err
 	}
 
 	log.Info("mediad is up",
 		"healthAddr", healthServer.Addr,
+		"pprof", cfg.EnablePprof,
+		"rtpSocketBufferBytes", allocator.SocketBufferBytes,
+		"gomaxprocs", runtime.GOMAXPROCS(0),
 		"nats", cfg.NATSURL,
 		"bindIp", cfg.BindIP.String(),
 		"publicIp", cfg.PublicIP.String(),
@@ -243,9 +238,8 @@ func run() error {
 		"rtpTimeout", cfg.RTPTimeout.String(),
 		"idleTimeout", cfg.SessionIdleTimeout.String())
 	if cfg.EchoDiagnostic {
-		// Refused as a state rather than as a value: a deployment with this on serves NO working
-		// calls, because every leg hears itself instead of the other party. It is a smoke-test mode
-		// and an operator who left it on needs to see that on every boot, not once in a changelog.
+		// A deployment with this on serves NO working calls — every leg hears itself — so an
+		// operator who left it on must see it on every boot.
 		log.Warn("MEDIAD_ECHO_DIAGNOSTIC is on: every session ECHOES and no call will connect. " +
 			"This is a diagnostic mode; turn it off to serve traffic.")
 	}
@@ -256,13 +250,11 @@ func run() error {
 		"transcoded, and T.38 (rung 8) is still Asterisk's — see plans/mediad-design.md")
 
 	var group sync.WaitGroup
-	group.Add(1)
-	go func() {
-		defer group.Done()
+	group.Go(func() {
 		if err := manager.RunReaper(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Error("the idle-session reaper stopped", "error", err)
 		}
-	}()
+	})
 
 	select {
 	case <-ctx.Done():
@@ -272,7 +264,7 @@ func run() error {
 	}
 	log.Info("shutting down", "timeoutSeconds", int(cfg.ShutdownTimeout/time.Second), "live", manager.Len())
 
-	// Stop accepting commands BEFORE draining sessions. The other order would let an allocate
+	// Stop accepting commands BEFORE draining sessions: the other order would let an allocate
 	// arriving mid-drain create a session nothing will ever release.
 	for _, subscription := range subscriptions {
 		if err := subscription.Unsubscribe(); err != nil {
@@ -285,9 +277,8 @@ func run() error {
 	if err := manager.Drain(drainCtx); err != nil {
 		log.Warn("draining sessions timed out; exiting anyway", "error", err)
 	}
-	// The events the drain just produced are handed off, not sent. Returning here would run the
-	// deferred conn.Drain() and then exit under them, losing the `session.ended` for every call this
-	// instance was carrying — the one event the engine cannot reconstruct from anywhere else.
+	// The events the drain just produced are handed off, not yet sent; returning here would run the
+	// deferred conn.Drain() and exit under them, losing the `session.ended` for every live call.
 	if !announcer.Wait(drainCtx) {
 		log.Warn("lifecycle events were still in flight at the shutdown deadline; some may be lost")
 	}

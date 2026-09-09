@@ -9,8 +9,7 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/sdp"
 )
 
-// offer builds an SDP offer body from its media line and attributes, so a table case reads as the
-// one thing it is about rather than as twelve lines of boilerplate.
+// offer builds an SDP offer body from its media line and attributes.
 func offer(mediaLine string, attributes ...string) string {
 	var body strings.Builder
 	body.WriteString("v=0\r\n")
@@ -47,8 +46,7 @@ func TestParseOffer(t *testing.T) {
 			wantDirection: sdp.DirectionSendRecv,
 		},
 		{
-			// Order is preference (RFC 3264 §5.1). An endpoint that lists PCMA first usually
-			// encodes PCMA natively, and answering PCMU would make it transcode for nothing.
+			// Order is preference (RFC 3264 §5.1).
 			name: "honours PCMA-first preference",
 			body: offer("m=audio 41000 RTP/AVP 8 0 101",
 				"a=rtpmap:8 PCMA/8000",
@@ -59,8 +57,7 @@ func TestParseOffer(t *testing.T) {
 			wantDirection: sdp.DirectionSendRecv,
 		},
 		{
-			// 101 is the de-facto value, not the rule. An offer on 96 must negotiate 96, or DTMF
-			// arrives under a payload type the far end never agreed to and is dropped.
+			// 101 is the de-facto value, not the rule: an offer on 96 must negotiate 96.
 			name: "negotiates a non-default telephone-event type",
 			body: offer("m=audio 41000 RTP/AVP 0 96",
 				"a=rtpmap:0 PCMU/8000",
@@ -77,7 +74,7 @@ func TestParseOffer(t *testing.T) {
 			wantDirection: sdp.DirectionSendRecv,
 		},
 		{
-			// An rtpmap OVERRIDES the static table, so a remapped 0 is not silently taken as PCMU.
+			// An rtpmap overrides the static table, so a remapped 0 is not taken as PCMU.
 			name: "lets an rtpmap override the static table",
 			body: offer("m=audio 41000 RTP/AVP 0 8",
 				"a=rtpmap:0 G729/8000",
@@ -94,10 +91,6 @@ func TestParseOffer(t *testing.T) {
 			wantDirection: sdp.DirectionSendOnly,
 		},
 		{
-			// RUNG 7 CHANGED THIS CASE. It used to assert that an offer of G.722 and Opus was refused
-			// because rung 2 had no codec but G.711 — "the whole point of refusing rather than
-			// transcoding". Both are negotiable now, so the offer is ACCEPTED at the offerer's own
-			// first preference, which is G.722.
 			name: "accepts a wideband offer at the offerer's preference",
 			body: offer("m=audio 41000 RTP/AVP 9 111",
 				"a=rtpmap:9 G722/8000",
@@ -106,7 +99,6 @@ func TestParseOffer(t *testing.T) {
 			wantDirection: sdp.DirectionSendRecv,
 		},
 		{
-			// The refusal still exists; it just needs an offer with nothing mediad speaks in it.
 			name: "refuses an offer with no codec mediad carries",
 			body: offer("m=audio 41000 RTP/AVP 96 97",
 				"a=rtpmap:96 AMR-WB/16000",
@@ -157,8 +149,8 @@ func TestParseOfferReadsTheAdvertisedAddress(t *testing.T) {
 	}
 }
 
-// A hostname in `c=` and the classic 0.0.0.0 hold offer are both legal and neither is an error
-// here: the address is advisory, because the session latches to where packets actually come FROM.
+// A hostname in `c=` and the classic 0.0.0.0 hold offer are both legal: the address is advisory
+// because the session latches to where packets actually come from.
 func TestParseOfferToleratesAnUnusableConnectionAddress(t *testing.T) {
 	body := strings.Replace(
 		offer("m=audio 41000 RTP/AVP 0", "a=rtpmap:0 PCMU/8000"),
@@ -211,8 +203,7 @@ func TestBuildAnswer(t *testing.T) {
 			},
 		},
 		{
-			// An offer with no telephone-event gets an answer with none: offering one back would be
-			// answering with a codec the offerer never proposed.
+			// An offer with no telephone-event gets an answer with none.
 			name: "PCMA without DTMF",
 			answer: sdp.Answer{
 				SessionID:      30010,
@@ -251,8 +242,7 @@ func TestBuildAnswer(t *testing.T) {
 	}
 }
 
-// The answer must be parseable as an offer, because the far end parses it with the same kind of
-// parser we do. Round-tripping it through ParseOffer is the cheapest possible proof.
+// The answer must be parseable as an offer, since the far end uses the same kind of parser.
 func TestAnswerIsItselfParseable(t *testing.T) {
 	body := sdp.BuildAnswer(sdp.Answer{
 		SessionID:                 30002,
@@ -292,8 +282,8 @@ func TestBuildOffer(t *testing.T) {
 		Direction:                 sdp.DirectionSendRecv,
 	})
 
-	// An offer LISTS every codec mediad serves — PCMU then PCMA — plus telephone-event, and gives
-	// each an rtpmap. That "lists more than one format" is the whole difference from an answer.
+	// An offer lists every codec mediad serves plus telephone-event, each with an rtpmap. Listing
+	// more than one format is the difference from an answer.
 	wantLines := []string{
 		"v=0",
 		"o=- 30002 1 IN IP4 203.0.113.10",
@@ -318,8 +308,7 @@ func TestBuildOffer(t *testing.T) {
 		t.Errorf("offer does not start with v=0\n---\n%s", body)
 	}
 
-	// The far end parses our offer with the same kind of parser we use, so round-tripping it is the
-	// cheapest proof it is well-formed. First preference is PCMU, and the telephone-event survives.
+	// First preference is PCMU, and the telephone-event survives the round trip.
 	parsed, err := sdp.ParseOffer(body)
 	if err != nil {
 		t.Fatalf("the offer we generate does not parse: %v\n---\n%s", err, body)
@@ -362,14 +351,12 @@ func TestAnswerDirection(t *testing.T) {
 	}{
 		// The ordinary case.
 		{sdp.DirectionSendRecv, sdp.DirectionSendRecv, sdp.DirectionSendRecv},
-		// RFC 3264 §6.1: an answer mirrors the offer. An offerer that is not listening must not be
-		// sent audio.
+		// RFC 3264 §6.1: an answer mirrors the offer.
 		{sdp.DirectionSendOnly, sdp.DirectionSendRecv, sdp.DirectionRecvOnly},
 		{sdp.DirectionRecvOnly, sdp.DirectionSendRecv, sdp.DirectionSendOnly},
-		// The engine knows things the SDP does not — a leg that is ringing rather than answered —
-		// so a narrower request wins.
+		// The engine knows things the SDP does not, so a narrower request wins.
 		{sdp.DirectionSendRecv, sdp.DirectionInactive, sdp.DirectionInactive},
-		// Inactive on either side is inactive. There is nothing to intersect.
+		// Inactive on either side is inactive.
 		{sdp.DirectionInactive, sdp.DirectionSendRecv, sdp.DirectionInactive},
 	}
 	for _, tc := range cases {
@@ -392,7 +379,7 @@ func TestParseDirection(t *testing.T) {
 		{"inactive", sdp.DirectionInactive, false},
 		// An absent direction means sendrecv (RFC 4566 §6), which is also the contract's default.
 		{"", sdp.DirectionSendRecv, false},
-		// A typo must be a visible error, never a session that silently does the wrong thing.
+		// A typo must be a visible error, not a silently wrong session.
 		{"SendRecv", "", true},
 		{"duplex", "", true},
 	}
@@ -416,9 +403,8 @@ func TestParseDirection(t *testing.T) {
 }
 
 func TestBuildersNameTheAddressTypeTheyActuallyEmit(t *testing.T) {
-	// `IN IP4` was hard-coded in both builders while config.Load accepts any IP for
-	// MEDIAD_PUBLIC_IP, so an IPv6-only deployment emitted an IPv6 address under an IPv4 addrtype —
-	// malformed SDP that fails one hop away rather than at boot.
+	// config.Load accepts any IP for MEDIAD_PUBLIC_IP, so the addrtype must follow the address: an
+	// IPv6 address under `IN IP4` is malformed SDP that fails one hop away rather than at boot.
 	v6 := netip.MustParseAddr("2001:db8::10")
 	answer := sdp.BuildAnswer(sdp.Answer{
 		SessionID: 1, SessionVersion: 1, Address: v6, Port: 30002,

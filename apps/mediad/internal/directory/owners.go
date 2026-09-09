@@ -57,7 +57,7 @@ func (s *KVOwners) Claim(ctx context.Context, key, instance string) (string, err
 	if instance == "" {
 		return "", errors.New("cannot claim media with an empty owner")
 	}
-	for attempt := 0; attempt < 3; attempt++ {
+	for range 3 {
 		if _, err := s.kv.Create(ctx, key, []byte(instance)); err == nil {
 			return instance, nil
 		} else if !errors.Is(err, jetstream.ErrKeyExists) {

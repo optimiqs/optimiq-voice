@@ -14,8 +14,8 @@ func env(pairs map[string]string) config.Getenv {
 	return func(key string) string { return pairs[key] }
 }
 
-// minimal is the smallest environment that boots. It is one variable, and that is the point: every
-// other knob has a default that is right for a single-host development run.
+// minimal is the smallest environment that boots: one variable, because every other knob has a
+// default that is right for a single-host development run.
 func minimal(extra map[string]string) map[string]string {
 	pairs := map[string]string{
 		"MEDIAD_PUBLIC_IP": "203.0.113.10",
@@ -44,8 +44,7 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.PublicIP.String() != "203.0.113.10" {
 		t.Errorf("PublicIP = %q", cfg.PublicIP)
 	}
-	// The default range must not overlap Asterisk's 10000-20000, because both run on the same host
-	// for the whole cutover.
+	// The default range must not overlap Asterisk's 10000-20000: both run on the same host.
 	if cfg.RTPPortMin != 30000 || cfg.RTPPortMax != 30999 {
 		t.Errorf("RTP range = %d-%d, want 30000-30999", cfg.RTPPortMin, cfg.RTPPortMax)
 	}
@@ -62,6 +61,39 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("LogLevel = %v", cfg.LogLevel)
 	}
+	if cfg.RTPSocketBufferBytes != 1<<19 {
+		t.Errorf("RTPSocketBufferBytes = %d, want %d", cfg.RTPSocketBufferBytes, 1<<19)
+	}
+	if cfg.EnablePprof {
+		t.Error("EnablePprof must default off; profiling is opt-in")
+	}
+}
+
+func TestSocketBufferAndPprofAreConfigured(t *testing.T) {
+	cfg, err := config.Load(env(minimal(map[string]string{
+		"MEDIAD_RTP_SOCKET_BUFFER_BYTES": "262144",
+		"MEDIAD_PPROF":                   "true",
+	})))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RTPSocketBufferBytes != 262144 {
+		t.Errorf("RTPSocketBufferBytes = %d, want 262144", cfg.RTPSocketBufferBytes)
+	}
+	if !cfg.EnablePprof {
+		t.Error("EnablePprof = false, want true")
+	}
+}
+
+// Zero is legal and means "leave the kernel default alone"; negative is not a size.
+func TestZeroSocketBufferLeavesTheKernelDefault(t *testing.T) {
+	cfg, err := config.Load(env(minimal(map[string]string{"MEDIAD_RTP_SOCKET_BUFFER_BYTES": "0"})))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RTPSocketBufferBytes != 0 {
+		t.Errorf("RTPSocketBufferBytes = %d, want 0", cfg.RTPSocketBufferBytes)
+	}
 }
 
 func TestCapacityCountsPairsNotPorts(t *testing.T) {
@@ -69,7 +101,6 @@ func TestCapacityCountsPairsNotPorts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	// 1000 ports is 500 sessions: each takes an even RTP port and the odd RTCP port above it.
 	if got := cfg.Capacity(); got != 500 {
 		t.Errorf("Capacity() = %d, want 500 (1000 ports = 500 RTP/RTCP pairs)", got)
 	}
@@ -109,8 +140,7 @@ func TestLoadReadsEveryKnob(t *testing.T) {
 	}
 }
 
-// The broker URL is deliberately UNPREFIXED, matching apps/api, apps/engine and apps/sipd: where
-// the broker lives is a property of the deployment, not of this process. The CREDENTIAL is the
+// The broker URL is unprefixed, matching apps/api, apps/engine and apps/sipd; the credential is the
 // opposite — see TestNATSCredentialsPreferTheServicePair.
 func TestNATSVariablesAreUnprefixed(t *testing.T) {
 	cfg, err := config.Load(env(minimal(map[string]string{
@@ -126,8 +156,6 @@ func TestNATSVariablesAreUnprefixed(t *testing.T) {
 	}
 }
 
-// NATS_MEDIAD_USER/PASS is this process's own least-privilege identity in config/nats.conf; the
-// unprefixed pair is the shared operator credential and only the fallback.
 func TestNATSCredentialsPreferTheServicePair(t *testing.T) {
 	cfg, err := config.Load(env(minimal(map[string]string{
 		"NATS_USER":        "optimiq",
@@ -143,7 +171,6 @@ func TestNATSCredentialsPreferTheServicePair(t *testing.T) {
 	}
 }
 
-// A deployment that has not split its credentials keeps working unchanged.
 func TestNATSCredentialsFallBackToTheSharedPair(t *testing.T) {
 	cfg, err := config.Load(env(minimal(map[string]string{
 		"NATS_USER": "optimiq",
@@ -157,8 +184,8 @@ func TestNATSCredentialsFallBackToTheSharedPair(t *testing.T) {
 	}
 }
 
-// Falling back from a half-set service pair would silently hand this process the OPERATOR identity
-// and hide the typo behind a working connection. It is refused instead.
+// Falling back from a half-set service pair would hand this process the operator identity and hide
+// the typo behind a working connection.
 func TestHalfAServiceCredentialIsRefusedEvenWithASharedPair(t *testing.T) {
 	_, err := config.Load(env(minimal(map[string]string{
 		"NATS_USER":        "optimiq",
@@ -173,8 +200,8 @@ func TestHalfAServiceCredentialIsRefusedEvenWithASharedPair(t *testing.T) {
 	}
 }
 
-// TLS is OFF unless configured: the shipped broker serves plaintext and its tls block lives in the
-// compose.tls.yaml overlay, so a client that demanded TLS by default could never connect to it.
+// The shipped broker serves plaintext and its tls block lives in the compose.tls.yaml overlay, so a
+// client that demanded TLS by default could never connect to it.
 func TestTLSIsOffUnlessConfigured(t *testing.T) {
 	cfg, err := config.Load(env(minimal(nil)))
 	if err != nil {
@@ -213,8 +240,6 @@ func TestLoadRejectsBadConfiguration(t *testing.T) {
 		want string
 	}{
 		{
-			// The whole reason it has no default: a wrong advertised address fails as one-way
-			// audio, which is silent, rather than as an error.
 			name: "no public ip",
 			env:  map[string]string{},
 			want: "MEDIAD_PUBLIC_IP is required",
@@ -225,7 +250,7 @@ func TestLoadRejectsBadConfiguration(t *testing.T) {
 			want: "must be an IP address",
 		},
 		{
-			// The one wrong value an operator is most likely to copy from MEDIAD_BIND_IP.
+			// The value most likely to be copied from MEDIAD_BIND_IP.
 			name: "public ip is the bind address",
 			env:  map[string]string{"MEDIAD_PUBLIC_IP": "0.0.0.0"},
 			want: "bind address and not a reachable one",
@@ -263,7 +288,6 @@ func TestLoadRejectsBadConfiguration(t *testing.T) {
 			want: "must be at most 65534",
 		},
 		{
-			// One port cannot hold a pair.
 			name: "range too small for one pair",
 			env: minimal(map[string]string{
 				"MEDIAD_RTP_PORT_MIN": "30000", "MEDIAD_RTP_PORT_MAX": "30000",
@@ -301,6 +325,21 @@ func TestLoadRejectsBadConfiguration(t *testing.T) {
 			want: "must be a Go duration",
 		},
 		{
+			name: "negative socket buffer",
+			env:  minimal(map[string]string{"MEDIAD_RTP_SOCKET_BUFFER_BYTES": "-1"}),
+			want: "MEDIAD_RTP_SOCKET_BUFFER_BYTES must not be negative",
+		},
+		{
+			name: "unparseable socket buffer",
+			env:  minimal(map[string]string{"MEDIAD_RTP_SOCKET_BUFFER_BYTES": "512k"}),
+			want: "must be a whole number",
+		},
+		{
+			name: "unparseable pprof switch",
+			env:  minimal(map[string]string{"MEDIAD_PPROF": "yes please"}),
+			want: "MEDIAD_PPROF must be true or false",
+		},
+		{
 			name: "unknown log level",
 			env:  minimal(map[string]string{"MEDIAD_LOG_LEVEL": "verbose"}),
 			want: "must be one of debug/info/warn/error",
@@ -323,8 +362,6 @@ func TestLoadRejectsBadConfiguration(t *testing.T) {
 	}
 }
 
-// Every problem is reported at once, so bringing up a new deployment is one round trip rather than
-// one restart per missing variable.
 func TestLoadReportsEveryProblemAtOnce(t *testing.T) {
 	_, err := config.Load(env(map[string]string{
 		"MEDIAD_RTP_PORT_MIN": "30001",
@@ -340,7 +377,6 @@ func TestLoadReportsEveryProblemAtOnce(t *testing.T) {
 	}
 }
 
-// A 4-in-6 address is the same address; it must not print as a different-looking string.
 func TestAddressesAreUnmapped(t *testing.T) {
 	cfg, err := config.Load(env(map[string]string{
 		"MEDIAD_PUBLIC_IP": "::ffff:203.0.113.10",
@@ -357,7 +393,6 @@ func TestAddressesAreUnmapped(t *testing.T) {
 	}
 }
 
-// IPv6 is a legitimate media address and must survive Load intact.
 func TestIPv6PublicAddress(t *testing.T) {
 	cfg, err := config.Load(env(map[string]string{"MEDIAD_PUBLIC_IP": "2001:db8::1"}))
 	if err != nil {
@@ -368,18 +403,14 @@ func TestIPv6PublicAddress(t *testing.T) {
 	}
 }
 
-// Load must not read process-global state; passing nil falls back to os.Getenv, which in a test
-// process has no MEDIAD_PUBLIC_IP and therefore fails rather than picking something up.
 func TestLoadWithNilGetenvFallsBackToTheProcessEnvironment(t *testing.T) {
 	if _, err := config.Load(nil); err == nil {
 		t.Fatal("Load(nil) succeeded; the test process has no MEDIAD_PUBLIC_IP set")
 	}
 }
 
-// MEDIAD_SOUNDS_DIR has no default, and that is the decision rather than an omission: an instance
-// with no prompt library REFUSES every playback by name, and the engine routes those legs to
-// Asterisk. Defaulting it to a directory that probably does not exist would turn a clear refusal
-// into a per-call "no such file".
+// An instance with no prompt library refuses every playback by name, and the engine routes those
+// legs to Asterisk; a default pointing at a missing directory would turn that into a per-call error.
 func TestSoundsDirDefaultsToUnset(t *testing.T) {
 	cfg, err := config.Load(env(minimal(nil)))
 	if err != nil {
@@ -402,11 +433,8 @@ func TestSoundsDirIsTrimmed(t *testing.T) {
 	}
 }
 
-// MEDIAD_RECORDINGS_DIR has no default for the same reason MEDIAD_SOUNDS_DIR has none: an instance
-// with nowhere to write REFUSES every recording by name, and the engine routes those legs to
-// Asterisk. The variable also has to be the SAME mount apps/api reads as CDR_RECORDING_ROOT, since
-// the layout under it is the engine's own object key — getting that wrong is not a broken recording
-// but a missing one, with the archiver logging that the object was not on the shared volume.
+// Undefaulted for the same reason as MEDIAD_SOUNDS_DIR, and it must be the same mount apps/api
+// reads as CDR_RECORDING_ROOT: the layout under it is the engine's own object key.
 func TestRecordingsDirDefaultsToUnset(t *testing.T) {
 	cfg, err := config.Load(env(minimal(nil)))
 	if err != nil {

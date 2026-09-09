@@ -11,67 +11,36 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 )
 
-// Rung 3's RECEIVE half of plans/mediad-design.md §2: decoding RFC 4733 digits out of what a leg
-// SENDS us, so that an IVR, a voicemail PIN and a feature code work on this media plane.
+// Decoding RFC 4733 digits out of what a leg sends us.
 //
-// # A digit is many packets and exactly one event
+// One keypress is many packets and exactly one event: RFC 4733 spreads a digit over an update every
+// 20 ms plus three back-to-back END copies (§2.5.1.4), so the de-duplication lives here and the
+// published event is the DIGIT.
 //
-// This is the whole difficulty, and it is the shape decision generation did not have. RFC 4733
-// spreads ONE keypress over a stream of packets: an update every 20 ms while the tone lasts, each
-// carrying the timestamp the digit STARTED at and a duration field that grows, and then a final
-// packet with the END bit which §2.5.1.4 requires the sender to transmit THREE TIMES back to back.
-// A detector that raised an event per packet would turn a 100 ms keypress into eight of them, and a
-// `gather` collecting a four-digit PIN would fill on the first press. So the de-duplication lives
-// here, below the wire contract, and `media.evt.v1.….dtmf.received` is the DIGIT.
+// A digit's identity is its timestamp, not its marker bit: every packet of one digit shares the
+// timestamp it began at. Keying on the marker would lose a whole keypress to one lost datagram, or
+// to a sender that never sets it, so the marker is not read at all.
 //
-// # The identity of a digit is its timestamp, not its marker bit
-//
-// Every packet of one digit shares the timestamp the digit began at; the next digit gets a new one.
-// That makes the timestamp a per-digit identity that survives everything the network does to the
-// packets, and it is why this detector never requires the marker bit to see a digit start. The
-// marker is one bit on ONE packet — the first — so a detector keyed on it loses an entire keypress
-// to a single lost datagram, and loses every keypress from a sender that forgets to set it (which
-// is a real and common bug). The marker is therefore read for nothing at all here; the timestamp
-// does the work.
-//
-// # Detection is a TAP
-//
-// The packet is still relayed to the peer, byte for byte, with the same header rewrite rung 2 built.
-// A digit crossing a bridge is rung 2's DTMF-is-free property and it must survive this file: the far
-// end of an attended transfer is entitled to hear the key the caller pressed. Detection ADDS an
-// event; it consumes nothing. The event also fires whether or not the session is bridged, exactly as
-// ARI's `ChannelDtmfReceived` fires on a channel that is in no bridge at all.
+// Detection is a tap: the packet is still relayed to the peer byte for byte, and the event fires
+// whether or not the session is bridged.
 
-// DefaultDtmfMaxDigitDuration bounds one detected digit.
-//
-// It exists for the degenerate case: a sender that begins a digit and never ends it, because all
-// three END copies were lost, or because it stopped sending altogether mid-tone. Without a bound
-// that digit would sit in the detector forever and the keypress would never surface — the silent
-// failure this design keeps rejecting.
-//
-// Five seconds is chosen from two constraints. It is far longer than any keypress a person makes
-// (Asterisk's own inband detector calls anything past ~3 s a stuck tone), so a legitimate digit is
-// never truncated by it; and it is comfortably inside the 8.19 s at which the 16-bit duration field
-// wraps at 8 kHz, so a cut-off digit still carries a duration that means what it says.
+// DefaultDtmfMaxDigitDuration bounds one detected digit, for a sender that begins a digit and never
+// ends it. Five seconds is longer than any human keypress and inside the 8.19 s at which the 16-bit
+// duration field wraps at 8 kHz, so a cut-off digit still carries a meaningful duration.
 const DefaultDtmfMaxDigitDuration = 5 * time.Second
 
-// DtmfEndedBy records what closed a detected digit. It is diagnostic and does NOT travel on the
-// wire: the contract carries the digit and its duration, which is what a consumer branches on, and
-// adding a vocabulary the engine ignores would be two media planes agreeing on a shape for no
-// reason. It is on the Go type because it is exactly what a log line and a test need.
+// DtmfEndedBy records what closed a detected digit. Diagnostic only; it does not travel on the wire.
 type DtmfEndedBy string
 
 const (
 	// DtmfEndedByEndBit is the normal close: the packet carrying RFC 4733's E bit arrived.
 	DtmfEndedByEndBit DtmfEndedBy = "end-bit"
-	// DtmfEndedByNextDigit is a digit whose END never arrived, surfaced by the arrival of the NEXT
-	// digit. This is the important recovery: a caller typing a PIN presses the next key within a few
-	// hundred milliseconds, so the lost digit surfaces then rather than at the max-duration cutoff.
+	// DtmfEndedByNextDigit is a digit whose END never arrived, surfaced by the arrival of the next
+	// digit — which is far sooner than the max-duration cutoff.
 	DtmfEndedByNextDigit DtmfEndedBy = "next-digit"
 	// DtmfEndedByMaxDuration is the cutoff. See DefaultDtmfMaxDigitDuration.
 	DtmfEndedByMaxDuration DtmfEndedBy = "max-duration"
 	// DtmfEndedBySessionEnded is a digit still open when the leg was released, reaped or drained.
-	// The backstop for a far end that went silent mid-tone and never spoke again.
 	DtmfEndedBySessionEnded DtmfEndedBy = "session-ended"
 )
 
@@ -79,30 +48,22 @@ const (
 type DtmfDigit struct {
 	// Digit is the key: "0"-"9", "*", "#" or "A"-"D".
 	Digit string
-	// DurationMs is how long the tone lasted as the SENDER measured it, converted from the
-	// telephone-event duration field at the 8 kHz RTP clock.
-	//
-	// The sender's number and never a wall clock here, for the same reason the relay keeps the
-	// timestamp it was handed: the duration is a property of somebody's finger on a key, and timing
-	// it at this end would fold in the jitter of whatever network the packets crossed.
+	// DurationMs is how long the tone lasted as the sender measured it, converted from the
+	// telephone-event duration field at the 8 kHz RTP clock. Never a local wall clock: that would
+	// fold in the jitter of whatever network the packets crossed.
 	DurationMs int
 	// EndedBy is how the digit was closed. Diagnostic; see DtmfEndedBy.
 	EndedBy DtmfEndedBy
 }
 
-// dtmfEventFlash is RFC 4733 §3.2's hook-flash event, and the first code above the keypad.
-//
-// Codes 0-15 are the sixteen DTMF keys; 16 is flash, and everything above it belongs to the tone
-// tables in §4 which are a different vocabulary altogether. mediad drops them rather than inventing
-// a character for them — a `gather` matching on the string would otherwise be handed something no
-// dialplan can contain.
+// dtmfEventFlash is RFC 4733 §3.2's hook-flash event, the first code above the keypad. Codes 0-15
+// are the sixteen DTMF keys; 16 and above are dropped rather than given an invented character.
 const dtmfEventFlash = 16
 
 // DtmfDigitForEvent maps an RFC 4733 §3.2 event code back to its keypad character.
 //
-// The inverse of DtmfEventCode, and deliberately narrower: generation accepts lower-case a-d for a
-// caller's convenience, detection emits upper case only, because the emitted value is compared
-// against dialplan digits and two spellings of one key is a bug waiting for a lower-case phone.
+// The inverse of DtmfEventCode, and deliberately narrower: it emits upper case only, because the
+// value is compared against dialplan digits and two spellings of one key is a bug.
 func DtmfDigitForEvent(code byte) (string, bool) {
 	switch {
 	case code <= 9:
@@ -127,11 +88,9 @@ type telephoneEventPayload struct {
 
 // parseTelephoneEvent unpacks a telephone-event payload, reporting whether it is one at all.
 //
-// Length is checked rather than assumed: the payload type says what a packet CLAIMS to be, and this
-// socket is open to the internet. A short payload is a malformed packet, not a digit.
-//
-// Longer than four bytes is accepted, because RFC 4733 §2.5.2.2 allows several events in one packet
-// and some senders pad; only the first event is read, which is the one a DTMF keypad ever sends.
+// Length is checked rather than assumed: this socket is open to the internet, and a short payload is
+// a malformed packet. Longer than four bytes is accepted — RFC 4733 §2.5.2.2 allows several events
+// in one packet and some senders pad — and only the first event is read.
 func parseTelephoneEvent(payload []byte) (telephoneEventPayload, bool) {
 	if len(payload) < dtmfPayloadBytes {
 		return telephoneEventPayload{}, false
@@ -147,10 +106,8 @@ func parseTelephoneEvent(payload []byte) (telephoneEventPayload, bool) {
 type inflightDigit struct {
 	digit     string
 	timestamp uint32
-	// duration is the LARGEST duration field seen for this digit, not the latest.
-	//
-	// Largest, because RTP reorders: an update packet that overtakes another would otherwise make a
-	// digit's reported length go backwards, and the duration field only ever grows at the sender.
+	// duration is the largest duration field seen for this digit, not the latest: RTP reorders, and
+	// the field only ever grows at the sender.
 	duration  uint32
 	startedAt time.Time
 	surfaced  bool
@@ -158,29 +115,20 @@ type inflightDigit struct {
 
 // dtmfDetector is one session's receive-side digit state machine.
 //
-// # What it remembers, and the reordering tolerance that buys
-//
-// Two timestamps: the digit currently arriving, and the one before it. That is the whole state, and
-// it fixes the tolerance precisely — a packet reordered ANYWHERE inside its own digit is recognised
-// and dropped, and so is one that arrives after the next digit has already started. A packet
-// delayed past TWO digit boundaries is not, and would be read as a third digit.
-//
-// That is the right place to stop. Two digits apart is at minimum a tone plus an interdigit gap,
-// which is on the order of 150-200 ms even from a fast typist, and no path that a call is still
-// usable on reorders by that much — RTP reordering in the wild is a handful of packets, tens of
-// milliseconds. Remembering more would mean a history whose size is a guess, to defend against a
-// network on which the audio has already failed.
+// It remembers two timestamps — the digit currently arriving and the one before it — which fixes the
+// reordering tolerance: a packet reordered anywhere inside its own digit, or arriving after the next
+// digit started, is recognised and dropped. One delayed past two digit boundaries (150-200 ms, far
+// beyond real-world RTP reordering) would be read as a third digit.
 type dtmfDetector struct {
 	maxDuration time.Duration
 
-	// open is a lock-free gate for the packet path. Every received packet asks "is a digit open?"
-	// so that the max-duration cutoff can be evaluated, and taking a mutex 50 times a second per
-	// call to answer "no" for the whole life of most calls is the one cost worth avoiding here.
+	// open is a lock-free gate for the packet path: every received packet asks "is a digit open?",
+	// and that must not take a mutex 50 times a second per call to answer "no".
 	open atomic.Bool
 
 	mu sync.Mutex
-	// current is the digit whose packets are arriving. It STAYS here after being surfaced, which is
-	// what makes the second and third END copies recognisable rather than a new digit.
+	// current is the digit whose packets are arriving. It stays here after being surfaced, which
+	// makes the second and third END copies recognisable rather than a new digit.
 	current    inflightDigit
 	hasCurrent bool
 	// previous is the timestamp of the digit before `current`. See the type doc.
@@ -195,10 +143,9 @@ func newDtmfDetector(maxDuration time.Duration) *dtmfDetector {
 	return &dtmfDetector{maxDuration: maxDuration}
 }
 
-// observe feeds one telephone-event packet in and returns the digits it completed.
-//
-// Up to TWO, and the pair is real rather than defensive: a packet that both starts a new digit and
-// carries the END bit closes the previous digit (whose own END was lost) and itself in one call.
+// observe feeds one telephone-event packet in and returns the digits it completed. Up to two: a
+// packet that both starts a new digit and carries the END bit closes the previous digit (whose own
+// END was lost) and itself in one call.
 func (d *dtmfDetector) observe(payload []byte, timestamp uint32, now time.Time) ([2]DtmfDigit, int) {
 	var out [2]DtmfDigit
 	count := 0
@@ -216,28 +163,25 @@ func (d *dtmfDetector) observe(payload []byte, timestamp uint32, now time.Time) 
 	defer d.mu.Unlock()
 
 	if d.hasPrevious && timestamp == d.previous {
-		// A straggler from the digit before this one, delayed past a whole digit boundary. Its digit
-		// has already been surfaced, so admitting it would publish a keypress twice.
+		// A straggler from the digit before this one, already surfaced; admitting it would publish
+		// a keypress twice.
 		return out, 0
 	}
 
 	if d.hasCurrent && timestamp == d.current.timestamp {
 		if d.current.surfaced {
-			// THE DE-DUPLICATION. The second and third copies of the END packet land here, and so
-			// does any update packet that was reordered behind the END. One keypress, one event.
+			// The de-duplication: the second and third END copies land here, as does any update
+			// packet reordered behind the END. One keypress, one event.
 			return out, 0
 		}
-		if event.duration > d.current.duration {
-			d.current.duration = event.duration
-		}
+		d.current.duration = max(d.current.duration, event.duration)
 		switch {
 		case event.end:
 			out[count] = d.closeLocked(DtmfEndedByEndBit)
 			count++
 		case d.expiredLocked(now):
-			// A sender still holding the tone open past the cutoff — a stuck key, or an endpoint
-			// that has lost track of its own state machine. Surfaced now; every further packet of
-			// it lands on the `surfaced` branch above and is dropped.
+			// A sender still holding the tone open past the cutoff. Surfaced now; every further
+			// packet of it lands on the `surfaced` branch above and is dropped.
 			out[count] = d.closeLocked(DtmfEndedByMaxDuration)
 			count++
 		}
@@ -247,9 +191,8 @@ func (d *dtmfDetector) observe(payload []byte, timestamp uint32, now time.Time) 
 	// A new timestamp is a new digit, which is the interdigit boundary: this is how "11" is two
 	// presses rather than one long one, and it needs no marker bit to see it.
 	if d.hasCurrent && !d.current.surfaced {
-		// The previous digit's END never arrived. Surfacing it HERE — rather than leaving it for the
-		// cutoff — is what makes a PIN typed at human speed arrive as digits instead of pausing for
-		// seconds on whichever one lost its END.
+		// The previous digit's END never arrived. Surfacing it here rather than at the cutoff is
+		// what makes a PIN typed at human speed arrive as digits instead of stalling for seconds.
 		out[count] = d.closeLocked(DtmfEndedByNextDigit)
 		count++
 	}
@@ -264,9 +207,8 @@ func (d *dtmfDetector) observe(payload []byte, timestamp uint32, now time.Time) 
 	d.open.Store(true)
 
 	if event.end {
-		// The END arrived before the updates it belongs to — reordering, or a sender whose whole
-		// digit was one packet. Surfaced immediately, so the updates that follow it share this
-		// timestamp, find it surfaced, and are dropped.
+		// The END arrived before the updates it belongs to. Surfaced immediately, so the updates
+		// that follow share this timestamp, find it surfaced, and are dropped.
 		out[count] = d.closeLocked(DtmfEndedByEndBit)
 		count++
 	}
@@ -276,13 +218,9 @@ func (d *dtmfDetector) observe(payload []byte, timestamp uint32, now time.Time) 
 // expire surfaces an open digit that has run past the cutoff, and is what a non-telephone-event
 // packet asks on its way through.
 //
-// Driven by ARRIVING packets rather than by a timer, deliberately. A timer per digit is a goroutine
-// and a clock to inject for a case that resolves itself: while the leg is still sending anything at
-// all — the audio that resumes the moment a tone ends is the common case — the cutoff is evaluated
-// within one frame of the deadline. A leg that has stopped sending ENTIRELY has bigger problems than
-// an unreported digit, is torn down by the RTP timeout, and surfaces the digit on that path through
-// Flush. Neither case needs a timer, and a timer in the packet path would be a real cost on every
-// call to serve a case that only happens on a call already failing.
+// Driven by arriving packets rather than a timer: while the leg is still sending anything the cutoff
+// is evaluated within one frame of the deadline, and a leg that stopped sending entirely is torn
+// down by the RTP timeout, which surfaces the digit through Flush.
 func (d *dtmfDetector) expire(now time.Time) (DtmfDigit, bool) {
 	if !d.open.Load() {
 		return DtmfDigit{}, false
@@ -313,9 +251,8 @@ func (d *dtmfDetector) expiredLocked(now time.Time) bool {
 	return now.Sub(d.current.startedAt) >= d.maxDuration
 }
 
-// closeLocked marks the current digit surfaced and renders it. Everything that publishes a digit
-// goes through here, which is what makes "exactly once" a property of one line rather than of four
-// call sites agreeing.
+// closeLocked marks the current digit surfaced and renders it. Every path that publishes a digit
+// goes through here, which is what makes "exactly once" a property of one place.
 func (d *dtmfDetector) closeLocked(endedBy DtmfEndedBy) DtmfDigit {
 	d.current.surfaced = true
 	d.open.Store(false)
@@ -326,16 +263,13 @@ func (d *dtmfDetector) closeLocked(endedBy DtmfEndedBy) DtmfDigit {
 	}
 }
 
-// tapDtmf feeds one received packet to the detector and announces whatever it completed.
-//
-// Called on the session's own read goroutine, for every packet the session accepted, which is why
-// the non-event branch is a lock-free atomic read: most packets on most calls are audio, and asking
-// "is a digit open" must cost nothing when the answer has been no for the last four minutes.
+// tapDtmf feeds one received packet to the detector and announces whatever it completed. Called on
+// the session's read goroutine for every accepted packet, which is why the non-event branch is a
+// lock-free atomic read.
 func (s *Session) tapDtmf(packet *pionrtp.Packet, now time.Time) {
 	if tePT := s.TelephoneEventPayloadType(); tePT == 0 || packet.PayloadType != tePT {
-		// Audio, which is also the signal that a tone is over: the far end went back to sending
-		// speech. It does not close the digit by itself — some endpoints do send both — but it is the
-		// arrival that lets the max-duration cutoff be evaluated. See dtmfDetector.expire.
+		// Audio does not close a digit by itself — some endpoints send both — but its arrival is
+		// what lets the max-duration cutoff be evaluated. See dtmfDetector.expire.
 		if digit, ok := s.dtmfIn.expire(now); ok {
 			s.announceDigit(digit)
 		}
@@ -344,17 +278,15 @@ func (s *Session) tapDtmf(packet *pionrtp.Packet, now time.Time) {
 
 	s.count(func(st *Stats) { st.DtmfPacketsReceived++ })
 	digits, n := s.dtmfIn.observe(packet.Payload, packet.Timestamp, now)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		s.announceDigit(digits[i])
 	}
 }
 
 // FlushDtmf surfaces a digit that was still open when the session went away, exactly once.
 //
-// Called by the Manager on the teardown path, BEFORE the session-ended announcement, so a consumer
-// that reacts to the leg ending has already been told about the keypress that was in flight when it
-// did. A digit already surfaced by any other path is not re-announced — `closeLocked` is the single
-// gate all four paths share.
+// Called by the Manager on the teardown path, before the session-ended announcement, so a consumer
+// reacting to the leg ending has already heard about the keypress in flight when it happened.
 func (s *Session) FlushDtmf() {
 	if digit, ok := s.dtmfIn.Flush(); ok {
 		s.announceDigit(digit)
@@ -363,26 +295,19 @@ func (s *Session) FlushDtmf() {
 
 // announceDigit counts a completed keypress and hands it to the observer.
 //
-// Synchronous, on whichever goroutine detected the digit — the read loop, or a teardown. That is
-// safe because the observer is an announcement whose publish is asynchronous, exactly as
-// `session.ended` is: a JetStream round trip on the packet path would let a sick broker add latency
-// to a live call, and a digit is the one media event with a person waiting on the other end of it.
+// Synchronous, on whichever goroutine detected the digit; safe because the observer's publish is
+// itself asynchronous. A broker round trip on the packet path would add latency to a live call.
 func (s *Session) announceDigit(digit DtmfDigit) {
 	s.count(func(st *Stats) { st.DtmfDigitsReceived++ })
 	if digit.EndedBy != DtmfEndedByEndBit {
-		// Every close that is not the END bit means packets were lost or a sender misbehaved, and
-		// the digit still surfaced. Worth a line, because it is the only evidence that an IVR's
-		// occasional slow response is the network rather than the IVR.
+		// A close that is not the END bit means packets were lost or a sender misbehaved.
 		s.log.Debug("a DTMF digit was closed without its END packet",
 			"digit", digit.Digit, "durationMs", digit.DurationMs, "endedBy", string(digit.EndedBy))
 	}
 
-	// The recorder's terminator, checked HERE rather than in the recorder's own tick loop because
-	// this is the one place a keypress exists as a keypress: the tick loop sees decoded audio frames,
-	// and a `#` is not in them. It runs before the announcement so that a voicemail whose `#` both
-	// ends the recording and reaches the orchestrator does those two things in the order a consumer
-	// expects — the file is closing before the engine is told the caller pressed the key that closed
-	// it.
+	// The recorder's terminator, checked here because this is the one place a keypress exists as a
+	// keypress — the recorder's tick loop only sees decoded audio. It runs before the announcement
+	// so the file is closing before the engine is told which key closed it.
 	if recorder := s.recording.Load(); recorder != nil && recorder.terminateOn(digit.Digit) {
 		s.log.Debug("a recording was terminated by a digit",
 			"digit", digit.Digit, "recordingRef", recorder.Ref())

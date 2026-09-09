@@ -13,14 +13,9 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
 
-// Rung 6, asserted on the wire and on the SAMPLES.
-//
-// The mixer is the first thing in this service whose output is not a copy of its input, so the
-// assertions have to be arithmetic: every participant is fed a constant tone at a distinct level and
-// the test checks that what each of them receives is the SUM OF THE OTHERS, exactly. A test that
-// only checked "a packet arrived" would pass on a mixer that sent everybody the same thing, which is
-// precisely the bug mix-minus exists to prevent and the one a participant hears as an echo of
-// themselves.
+// The mixer, asserted on the wire and on the samples. Its output is not a copy of its input, so the
+// assertions are arithmetic: every participant is fed a constant tone at a distinct level and must
+// receive exactly the sum of the others.
 
 // confRig is N sessions in one room, each with a far end, on a ticker the test drives by hand.
 type confRig struct {
@@ -30,12 +25,8 @@ type confRig struct {
 	phones  []*phone
 }
 
-// newConfRig allocates `count` sessions on one manager and gives the test the mixer's clock.
-//
-// The clock is the point. A conference mixes on a 20 ms tick, and a suite that waited for real ticks
-// would spend its life sleeping and would still assert on whatever the scheduler happened to
-// deliver. Stepping it by hand makes "one tick, one frame per member" a property the test can check
-// rather than a race it can lose.
+// newConfRig allocates `count` sessions on one manager and gives the test the mixer's clock, so
+// "one tick, one frame per member" is a property the test checks rather than a race it can lose.
 func newConfRig(t *testing.T, low, high, count int) *confRig {
 	t.Helper()
 
@@ -64,7 +55,7 @@ func newConfRig(t *testing.T, low, high, count int) *confRig {
 	})
 
 	rig := &confRig{manager: manager, ticks: ticks}
-	for index := 0; index < count; index++ {
+	for index := range count {
 		id := string(rune('a' + index))
 		descriptor, err := manager.Allocate(rtp.AllocateOptions{
 			SessionID: "leg-" + id, OrgID: testOrg, CallID: testCall,
@@ -91,12 +82,8 @@ func (r *confRig) join(t *testing.T, conferenceID string) {
 	}
 }
 
-// speak feeds one member a run of frames at a constant level, and waits for them to reach the
-// jitter buffer.
-//
-// The level is a µ-law-representable one, taken through the codec so the expected sums below are
-// exact rather than approximate: encoding is lossy and the test must not be asserting against a
-// number the encoder could never produce.
+// speak feeds one member a run of frames at a constant level and waits for them to reach the jitter
+// buffer. The level is taken through the codec, so the expected sums below are exact.
 func (r *confRig) speak(t *testing.T, index int, level int16, count int) int16 {
 	t.Helper()
 
@@ -151,12 +138,8 @@ func (r *confRig) heard(t *testing.T, index int) (int16, bool) {
 	return audio.ULawToLinear(packet.Payload[0]), true
 }
 
-// mixTolerance is one µ-law quantisation step near the levels these tests use.
-//
-// The mix itself is exact integer arithmetic; the only lossy step is re-encoding the sum for each
-// participant, and µ-law's step size near 6000 is a little over 250. A tolerance is therefore
-// asserting "the arithmetic is right and the codec is doing what a codec does" rather than papering
-// over a mixer that is approximately correct.
+// mixTolerance is one µ-law quantisation step near the levels these tests use. The mix is exact
+// integer arithmetic; the only lossy step is re-encoding the sum per participant.
 const mixTolerance = 400
 
 func closeEnough(got, want int16) bool {
@@ -168,10 +151,8 @@ func closeEnough(got, want int16) bool {
 }
 
 func TestMixMinusGivesEachParticipantTheSumOfTheOthers(t *testing.T) {
-	// THE rung-6 property. Three participants at three distinct levels; each must receive the sum of
-	// the other two and never their own contribution. A participant hearing themselves is a delayed
-	// copy of their own voice at roughly a hundred milliseconds, which is the single most disruptive
-	// artefact in telephony — the effect used deliberately in experiments to stop people speaking.
+	// Mix-minus: three participants at distinct levels, each receiving the sum of the other two and
+	// never their own contribution, which they would hear as a delayed echo of their own voice.
 	rig := newConfRig(t, 58000, 58039, 3)
 	rig.join(t, "room-1")
 
@@ -202,10 +183,8 @@ func TestMixMinusGivesEachParticipantTheSumOfTheOthers(t *testing.T) {
 }
 
 func TestMixScalesWithTheNumberOfParticipants(t *testing.T) {
-	// Five participants, which is the size §2's gate names ("MOS at 3/5/10 participants"). The
-	// minus-self property has to hold at every size, and the interesting failure it catches is a
-	// mixer that computes one total and forgets to subtract — which is invisible with two
-	// participants and obvious with five.
+	// The minus-self property must hold at every size: a mixer that computes one total and forgets
+	// to subtract is invisible with two participants and obvious with five.
 	rig := newConfRig(t, 58040, 58099, 5)
 	rig.join(t, "room-1")
 
@@ -235,18 +214,17 @@ func TestMixScalesWithTheNumberOfParticipants(t *testing.T) {
 }
 
 func TestMixSaturatesRatherThanWrapping(t *testing.T) {
-	// Three participants at close to full scale sum well past what an int16 holds. A wrap turns a
-	// loud moment into a full-amplitude sign flip — a bang, not distortion — so the sum is clamped
-	// once, after the subtraction, and the result is a loud frame rather than an inverted one.
+	// Three participants near full scale sum past what an int16 holds. A wrap would be a
+	// full-amplitude sign flip — a bang — so the sum is clamped once, after the subtraction.
 	rig := newConfRig(t, 58100, 58139, 3)
 	rig.join(t, "room-1")
 
-	for index := 0; index < 3; index++ {
+	for index := range 3 {
 		rig.speak(t, index, 30000, 4)
 	}
 	rig.tick(t)
 
-	for index := 0; index < 3; index++ {
+	for index := range 3 {
 		got, ok := rig.heard(t, index)
 		if !ok {
 			t.Fatalf("participant %d heard nothing", index)
@@ -259,10 +237,8 @@ func TestMixSaturatesRatherThanWrapping(t *testing.T) {
 }
 
 func TestPerParticipantGainScalesContributionAndReception(t *testing.T) {
-	// The seam W10's volume controls need, and the reason there are TWO knobs: `gainRx` turns a
-	// participant down FOR EVERYBODY and `gainTx` turns everybody down FOR ONE PARTICIPANT. A single
-	// knob would make the first indistinguishable from the second on a two-party call and impossible
-	// on a larger one.
+	// Two knobs: `gainRx` turns a participant down for everybody, `gainTx` turns everybody down for
+	// one participant.
 	rig := newConfRig(t, 58140, 58179, 3)
 	rig.join(t, "room-1")
 
@@ -312,7 +288,7 @@ func TestPerParticipantGainScalesContributionAndReception(t *testing.T) {
 		t.Errorf("participant 0 heard %d, want %d: gainTx did not scale what it receives", got, want)
 	}
 
-	// And unity is the default, which is what makes the seam free until somebody uses it.
+	// And unity is the default.
 	plain, _ := room.Member(rig.ids[1])
 	if rx, tx := plain.Gain(); rx != 256 || tx != 256 {
 		t.Errorf("an untouched member's gain = %d/%d, want unity (256/256)", rx, tx)
@@ -320,8 +296,8 @@ func TestPerParticipantGainScalesContributionAndReception(t *testing.T) {
 }
 
 func TestAMutedParticipantContributesNothingButStillHears(t *testing.T) {
-	// Paging is this shape — design doc §10 question 19: "N auto-answered legs joined to one bridge
-	// with every member muted inbound". The muted member must still HEAR, or a page is silence.
+	// Paging is N auto-answered legs in one bridge with every member muted inbound: a muted member
+	// must still hear, or a page is silence.
 	rig := newConfRig(t, 58180, 58219, 3)
 	rig.join(t, "room-1")
 
@@ -334,8 +310,8 @@ func TestAMutedParticipantContributesNothingButStillHears(t *testing.T) {
 	if err := rig.manager.Mute(rig.ids[2], rtp.DirectionIn); err != nil {
 		t.Fatalf("Mute: %v", err)
 	}
-	// The mute gates the RECEIVE path, so the frames already in the buffer would still be mixed. A
-	// second run of frames arriving after the mute is what the assertion needs.
+	// The mute gates the receive path, so frames already buffered are still mixed; the assertion
+	// needs a second run arriving after the mute.
 	rig.speak(t, 0, levels[0], 4)
 	rig.speak(t, 1, levels[1], 4)
 	rig.speak(t, 2, levels[2], 4)
@@ -346,8 +322,8 @@ func TestAMutedParticipantContributesNothingButStillHears(t *testing.T) {
 	if !ok {
 		t.Fatal("participant 0 heard nothing")
 	}
-	// It may still be draining the pre-mute frames on this tick, so the assertion is the one that
-	// cannot be true if the mute did nothing: participant 0 never hears MORE than the whole room.
+	// Pre-mute frames may still be draining, so the assertion is the one that cannot hold if the
+	// mute did nothing: participant 0 never hears more than the whole room.
 	if !closeEnough(got, exact[1]+exact[2]) && !closeEnough(got, exact[1]) {
 		t.Errorf("participant 0 heard %d, want either %d (pre-mute frames draining) or %d (muted)",
 			got, exact[1]+exact[2], exact[1])
@@ -364,9 +340,8 @@ func TestAMutedParticipantContributesNothingButStillHears(t *testing.T) {
 }
 
 func TestJoiningAConferenceReplacesABridge(t *testing.T) {
-	// A session is in exactly ONE conversation. A leg left in a bridge and a room at once would
-	// deliver every frame twice under one SSRC, which is the thing a receiver's jitter buffer cannot
-	// untangle.
+	// A session is in exactly one conversation: in a bridge and a room at once, every frame would
+	// arrive twice under one SSRC.
 	rig := newConfRig(t, 58220, 58259, 3)
 	if err := rig.manager.Bridge("bridge-1", rig.ids[0], rig.ids[1]); err != nil {
 		t.Fatalf("Bridge: %v", err)
@@ -388,8 +363,7 @@ func TestJoiningAConferenceReplacesABridge(t *testing.T) {
 }
 
 func TestAnEmptyConferenceIsReaped(t *testing.T) {
-	// Rooms are implicit — created by the first join — so they have to be reaped by the last leave,
-	// or every conference that ever happened leaves a mix loop ticking fifty times a second forever.
+	// Rooms are implicit, created by the first join, so the last leave must reap them.
 	rig := newConfRig(t, 58260, 58299, 2)
 	rig.join(t, "room-1")
 
@@ -407,9 +381,8 @@ func TestAnEmptyConferenceIsReaped(t *testing.T) {
 }
 
 func TestReleasingAParticipantLeavesTheRoomRunning(t *testing.T) {
-	// A participant hanging up is not a conference ending, exactly as one leg hanging up is not a
-	// bridge's other leg ending. What must not survive is a SEAT pointing at a closed socket, because
-	// the mixer would go on encoding a frame for it fifty times a second.
+	// A participant hanging up is not a conference ending; what must not survive is a seat pointing
+	// at a closed socket, which the mixer would go on encoding frames for.
 	rig := newConfRig(t, 58300, 58339, 3)
 	rig.join(t, "room-1")
 
@@ -431,9 +404,8 @@ func TestReleasingAParticipantLeavesTheRoomRunning(t *testing.T) {
 }
 
 func TestDestroyingAConferenceLeavesItsSessionsAlive(t *testing.T) {
-	// Destroying a room is not hanging up the calls in it, exactly as unbridging is not hanging up
-	// two legs: the engine decides what happens to a participant whose conference ended, and a media
-	// plane that released them would be making that decision on the far side of the seam.
+	// Destroying a room is not hanging up the calls in it: the engine decides what happens to a
+	// participant whose conference ended.
 	rig := newConfRig(t, 58340, 58379, 3)
 	rig.join(t, "room-1")
 

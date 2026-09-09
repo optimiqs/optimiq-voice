@@ -11,8 +11,8 @@ import (
 )
 
 func TestLibraryRefusesWithoutARoot(t *testing.T) {
-	// An instance with no MEDIAD_SOUNDS_DIR must REFUSE every play rather than answer ok and send
-	// nothing. The engine turns this into `not_supported` and routes the leg to Asterisk.
+	// An instance with no MEDIAD_SOUNDS_DIR must refuse every play rather than answer ok and send
+	// nothing; the engine turns this into `not_supported`.
 	library := audio.NewLibrary("")
 	if library.Configured() {
 		t.Fatal("Configured() is true with no root")
@@ -33,8 +33,7 @@ func TestLibraryResolve(t *testing.T) {
 		err  error
 	}{
 		{
-			// The engine strips the extension on the way out (media-refs.ts), so this is the shape
-			// nearly every real reference arrives in.
+			// The engine strips the extension on the way out, so this is the usual shape.
 			name: "a bare name gets .wav appended",
 			ref:  "sound:welcome",
 			want: filepath.Join(root, "welcome.wav"),
@@ -132,8 +131,7 @@ func TestLibraryLoadAndConcatenate(t *testing.T) {
 }
 
 func TestLibraryLoadAllFailsWholeRequestOnOneBadRef(t *testing.T) {
-	// Half a sentence is worse than no sentence: a prompt list that dropped its middle clause would
-	// play "your call is important" and then stop.
+	// One unresolvable element must fail the whole list rather than play half a sentence.
 	root := t.TempDir()
 	writePrompt(t, root, "one.wav", 1)
 	library := audio.NewLibrary(root)
@@ -162,8 +160,7 @@ func TestLibraryLoadReportsADecodeFailureWithTheReference(t *testing.T) {
 	if !errors.Is(err, audio.ErrNotRIFF) {
 		t.Fatalf("Load error = %v, want ErrNotRIFF", err)
 	}
-	// The reference has to be in the message: an operator reading a failed call needs to know WHICH
-	// prompt, and the path is an implementation detail of this instance's mount.
+	// The reference, not the resolved path, has to be in the message.
 	if got := err.Error(); !strings.Contains(got, "sound:broken") {
 		t.Errorf("error %q does not name the reference", got)
 	}

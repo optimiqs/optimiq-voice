@@ -3,13 +3,13 @@ package audio_test
 import (
 	"bytes"
 	"math"
+	"slices"
 	"testing"
 
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 )
 
-// wideRate is G.722's own sample rate. Not its RTP clock rate, which is 8000 — see the note in
-// g722.go about the specification's most famous erratum.
+// wideRate is G.722's own sample rate, not its RTP clock rate of 8000. See g722.go.
 const wideRate = 16000
 
 // sine builds a test signal at a rate and an amplitude.
@@ -24,10 +24,8 @@ func sine(samples int, hertz float64, amplitude float64, rate int) []int16 {
 func TestG722RoundTripPreservesToneAndLevel(t *testing.T) {
 	t.Parallel()
 
-	// The two bands are coded by two completely different quantisers — six bits below 4 kHz and two
-	// above it — so a codec can be right in one and wrong in the other. Both are asserted, and each
-	// case also asserts that the energy did NOT appear in the other band, which is what catches a
-	// QMF wired up backwards.
+	// The two bands use different quantisers, so each case also asserts the energy did NOT appear
+	// in the other band — which is what catches a QMF wired up backwards.
 	cases := []struct {
 		name      string
 		hertz     float64
@@ -52,10 +50,8 @@ func TestG722RoundTripPreservesToneAndLevel(t *testing.T) {
 				t.Fatalf("round trip produced %d samples from %d", len(out), len(in))
 			}
 
-			// The first 400 samples are skipped everywhere in this file: the QMF has a 24-tap history
-			// and both predictors start from a reset state, so the opening of any stream is a
-			// transient. That is a property of sub-band ADPCM, not a defect, and measuring across it
-			// would be measuring the codec's start-up rather than its steady state.
+			// The first 400 samples are skipped everywhere in this file: the QMF history and both
+			// predictors start from reset, so the opening of any stream is a transient.
 			want := goertzel(in[400:], testCase.hertz, wideRate)
 			got := goertzel(out[400:], testCase.hertz, wideRate)
 			if ratio := got / want; ratio < 0.9 || ratio > 1.1 {
@@ -73,9 +69,8 @@ func TestG722RoundTripPreservesToneAndLevel(t *testing.T) {
 func TestG722PacksOneOctetPerSamplePair(t *testing.T) {
 	t.Parallel()
 
-	// The framing above this codec assumes it: 20 ms of G.722 is 320 input samples and 160 octets,
-	// which is byte-for-byte the same payload length a 20 ms G.711 frame carries. That is why nothing
-	// in the packet path needed a per-codec frame size.
+	// 20 ms of G.722 is 320 input samples and 160 octets — the same payload length a 20 ms G.711
+	// frame carries, which is why the packet path needs no per-codec frame size.
 	cases := []struct {
 		name       string
 		samples    int
@@ -84,8 +79,7 @@ func TestG722PacksOneOctetPerSamplePair(t *testing.T) {
 		{"one 20 ms frame", 320, 160},
 		{"two frames", 640, 320},
 		{"a single pair", 2, 1},
-		// An odd count drops its last sample rather than inventing a companion for it, which would
-		// leave the encoder and every decoder one sample apart for the rest of the call.
+		// An odd count drops its last sample rather than inventing a companion for it.
 		{"an odd count drops the orphan", 321, 160},
 		{"nothing", 0, 0},
 	}
@@ -111,9 +105,8 @@ func TestG722PacksOneOctetPerSamplePair(t *testing.T) {
 func TestG722IsDeterministicFromAResetState(t *testing.T) {
 	t.Parallel()
 
-	// The predictors adapt, so the same input has to produce the same octets only from the same
-	// start. This is what a Reset has to guarantee, and it is what lets a stream be restarted after
-	// a re-negotiation without the far end hearing garbage while the two ends re-converge.
+	// The predictors adapt, so the same input produces the same octets only from the same start.
+	// That is what Reset has to guarantee.
 	in := sine(1600, 800, 6000, wideRate)
 
 	first := audio.NewG722Encoder()
@@ -135,17 +128,15 @@ func TestG722IsDeterministicFromAResetState(t *testing.T) {
 func TestG722StateIsPerStream(t *testing.T) {
 	t.Parallel()
 
-	// Encoding two streams through one encoder is the mistake this asserts against: the predictor
-	// adapts to the INTERLEAVING, so both streams come out as plausible octets that neither decoder
-	// can follow. The assertion is that splitting one signal across two encoders does NOT reproduce
-	// what one encoder makes of the whole thing — which is the same statement from the other side.
+	// Splitting one signal across two encoders must NOT reproduce what one encoder makes of the
+	// whole, which is the other side of "never interleave two streams through one encoder".
 	in := sine(1600, 800, 6000, wideRate)
 
 	whole := audio.NewG722Encoder().Encode(in)
 	firstHalf := audio.NewG722Encoder().Encode(in[:800])
 	secondHalf := audio.NewG722Encoder().Encode(in[800:])
 
-	if bytes.Equal(whole, append(append([]byte{}, firstHalf...), secondHalf...)) {
+	if bytes.Equal(whole, append(slices.Clone(firstHalf), secondHalf...)) {
 		t.Error("two encoders reproduced one encoder's output; the codec is not carrying state, " +
 			"which means an endpoint would drift out of step with it")
 	}
@@ -154,8 +145,8 @@ func TestG722StateIsPerStream(t *testing.T) {
 func TestG722SilenceStaysSilent(t *testing.T) {
 	t.Parallel()
 
-	// An ADPCM predictor fed silence must converge to silence rather than to a low-level hum, which
-	// is what a scale-factor adaptation with a sign error produces — audible on every held line.
+	// An ADPCM predictor fed silence must converge to silence, not to the low-level hum a
+	// scale-factor sign error produces.
 	silence := make([]int16, 3200)
 	out := audio.NewG722Decoder().Decode(audio.NewG722Encoder().Encode(silence))
 

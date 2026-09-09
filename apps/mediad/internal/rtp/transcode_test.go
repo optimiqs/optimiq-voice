@@ -11,17 +11,14 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
 
-// Rung 7, at the bridge boundary. The two properties that matter are opposites of each other:
-// a MISMATCHED bridge must translate, and a MATCHED one must not — because passthrough is what makes
-// rung 2's numbers what they are and rung 7 must not spend them.
+// Transcoding at the bridge boundary. Two opposite properties: a mismatched bridge must translate,
+// and a matched one must not, because passthrough is the fast path.
 
 func TestTranscoderRefusesTheIdentityTranslation(t *testing.T) {
 	t.Parallel()
 
-	// A transcoder installed for two legs that agreed would decode and re-encode every frame of every
-	// call for no change in the bytes, turning the fast path into the slow one invisibly. A caller
-	// that reaches here with two equal formats has a bug, and it is better to see it than to hear it
-	// as CPU.
+	// A transcoder for two legs that agreed would decode and re-encode every frame for no change in
+	// the bytes, turning the fast path into the slow one invisibly.
 	if _, err := rtp.NewTranscoder(audio.FormatULaw, audio.FormatULaw); err == nil {
 		t.Error("NewTranscoder accepted a translation from a codec to itself")
 	}
@@ -30,9 +27,8 @@ func TestTranscoderRefusesTheIdentityTranslation(t *testing.T) {
 func TestTranscoderTranslatesBetweenEveryPairItCanDecode(t *testing.T) {
 	t.Parallel()
 
-	// Nine ordered pairs over three codecs, minus the three identities. Each is asserted on the LEVEL
-	// rather than on the bytes: a translation that produced the right number of bytes at the wrong
-	// amplitude is one party sounding faint, which is the failure a byte-count assertion misses.
+	// Nine ordered pairs over three codecs, minus the identities. Asserted on level rather than
+	// bytes: the right byte count at the wrong amplitude is one party sounding faint.
 	formats := []audio.Format{audio.FormatULaw, audio.FormatALaw, audio.FormatG722}
 
 	for _, from := range formats {
@@ -85,9 +81,7 @@ func TestTranscoderTranslatesBetweenEveryPairItCanDecode(t *testing.T) {
 func TestTranscoderRefusesACodecItCannotDecode(t *testing.T) {
 	t.Parallel()
 
-	// Opus. The refusal is by NAME and it is what routes a call the engine cannot serve here to
-	// Asterisk — the per-capability cutover working as designed rather than a failed call. See
-	// internal/audio/g722.go for the cgo decision behind it.
+	// Opus: the refusal is by name, which is what routes such a call to Asterisk.
 	_, err := rtp.NewTranscoder(audio.FormatOpus, audio.FormatULaw)
 	if !errors.Is(err, rtp.ErrCannotTranscode) {
 		t.Errorf("NewTranscoder(opus, PCMU) = %v, want ErrCannotTranscode", err)
@@ -99,9 +93,8 @@ func TestTranscoderRefusesACodecItCannotDecode(t *testing.T) {
 }
 
 func TestABridgedMismatchIsTranslatedOnTheWire(t *testing.T) {
-	// End to end: a µ-law leg bridged to an A-law one, with a real socket at each end. The assertion
-	// is that the bytes CHANGED and the sound did not — which is the whole of transcoding, and is
-	// two assertions a passthrough relay would fail in opposite directions.
+	// End to end over real sockets: the bytes changed and the sound did not, which a passthrough
+	// relay would fail in opposite directions.
 	rig := newBridgeRigWithTypes(t, 60000, 60039,
 		rtp.PayloadTypePCMU, rtp.PayloadTypeTelephoneEvent,
 		rtp.PayloadTypePCMA, rtp.PayloadTypeTelephoneEvent)
@@ -139,9 +132,8 @@ func TestABridgedMismatchIsTranslatedOnTheWire(t *testing.T) {
 	if decoded := audio.ALawToLinear(got.Payload[0]); !closeEnough(decoded, audio.ULawToLinear(encoded)) {
 		t.Errorf("the translated level is %d, want about %d", decoded, audio.ULawToLinear(encoded))
 	}
-	// The timestamp survives, because every codec here shares an 8 kHz RTP clock — including G.722,
-	// whose 16 kHz sampling and 8000 clock rate are RFC 3551 §4.5.2's erratum. Rewriting it would be
-	// inventing a clock, which §6 refuses.
+	// The timestamp survives because every codec here shares an 8 kHz RTP clock — including G.722,
+	// whose 16 kHz sampling and 8000 clock rate are RFC 3551 §4.5.2's erratum.
 	if got.Timestamp != 160 {
 		t.Errorf("Timestamp = %d, want the original 160", got.Timestamp)
 	}
@@ -152,10 +144,8 @@ func TestABridgedMismatchIsTranslatedOnTheWire(t *testing.T) {
 }
 
 func TestDtmfStillCrossesATranscodedBridgeUntouched(t *testing.T) {
-	// A telephone-event payload is BYTES, whatever the audio codec is, so it must take the renumber
-	// path rather than the translate path. Sending a digit through a codec would produce four bytes
-	// of noise and no digit — an IVR that stops working the moment two phones negotiate differently,
-	// which is the exact failure rung 2's renumbering was built to avoid.
+	// A telephone-event payload is bytes whatever the audio codec is, so it takes the renumber path:
+	// through a codec it would become four bytes of noise and no digit.
 	rig := newBridgeRigWithTypes(t, 60040, 60079,
 		rtp.PayloadTypePCMU, 96,
 		rtp.PayloadTypeG722, 101)
@@ -189,9 +179,8 @@ func TestDtmfStillCrossesATranscodedBridgeUntouched(t *testing.T) {
 }
 
 func TestUnbridgingClearsTheTranslation(t *testing.T) {
-	// A translation belongs to the bridge it was built for. Leaving it installed would make a leg
-	// re-bridged to a peer that DOES agree with it still pay for a decode and an encode — and, worse,
-	// would leave codec state that a later bridge would resume mid-stream.
+	// A translation belongs to the bridge it was built for: left installed, it would leave codec
+	// state a later bridge resumes mid-stream.
 	rig := newBridgeRigWithTypes(t, 60080, 60119,
 		rtp.PayloadTypePCMU, rtp.PayloadTypeTelephoneEvent,
 		rtp.PayloadTypePCMA, rtp.PayloadTypeTelephoneEvent)
@@ -212,9 +201,8 @@ func TestUnbridgingClearsTheTranslation(t *testing.T) {
 	}
 }
 
-// sine and goertzel are the same two helpers internal/audio's suite uses, restated here because a
-// test package cannot import another test package. A Goertzel filter answers "how much 1 kHz is in
-// this?" in one pass with no library — and is, not coincidentally, how a real DTMF detector works.
+// sine and goertzel are restated from internal/audio's suite, since a test package cannot import
+// another. A Goertzel filter answers "how much 1 kHz is in this?" in one pass.
 func sine(samples int, hertz, amplitude float64, rate int) []int16 {
 	out := make([]int16, samples)
 	for i := range out {

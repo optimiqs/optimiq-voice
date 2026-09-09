@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,74 +14,42 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 )
 
-// Rung 6 of plans/mediad-design.md §2: N-way mixing with mix-minus per participant. The ladder calls
-// it "the hard one — this is where jambonz/LiveKit spent years", and the reason is that every
-// simplification available at rungs 2-5 stops being available here at once.
+// N-way mixing with mix-minus per participant: every member is decoded, aligned on one clock,
+// summed, and re-encoded, because the audio each receives differs from every other's.
 //
-// A two-party bridge is two pointers and a header rewrite: no decode, no clock, no buffer, no
-// arithmetic on the samples. A conference is all four. Every participant must be DECODED (they may
-// have negotiated different codecs), ALIGNED (their packets arrive on N unrelated networks and the
-// mix needs one frame from each on one clock), SUMMED, and RE-ENCODED per participant — because the
-// audio each of them receives is different from the audio every other one receives.
+// A participant must not hear themselves — delayed self-audio is the most disruptive artefact in
+// telephony — so each member receives the room total MINUS their own contribution. Subtracting keeps
+// the room O(N) rather than O(N²), and it is only valid because the total is accumulated WITHOUT
+// clamping, in int32, and clamped once per member after the subtraction. Saturating into the total
+// would make total-minus-self stop being the sum of the others.
 //
-// # Mix-minus, and why it is not optional
-//
-// A participant must not hear themselves. Not because it is untidy: the loop from their microphone
-// to their own earpiece is a delayed copy of their own voice at roughly a hundred milliseconds,
-// which is the single most disruptive artefact in telephony — it is the effect used deliberately in
-// psychology experiments to make people unable to speak. So each participant's own contribution is
-// subtracted from the sum they receive, and it is a SUBTRACTION rather than N separate sums, which
-// is what keeps an N-party conference O(N) in mixing work rather than O(N²).
-//
-// That subtraction is only valid because the sum is accumulated WITHOUT clamping, in int32, and
-// clamped once per participant after the subtraction. A mixer that saturated into the total would
-// find that total-minus-self is not the sum of the others, and the error would appear as a burst of
-// distortion in everybody's audio at exactly the moment two people talked loudly at once.
-//
-// # The seam the volume controls will need
-//
-// Two gain hooks per member, both unity today: `gainRx` scales what a participant CONTRIBUTES and
-// `gainTx` scales what they RECEIVE. Two rather than one because they are different features — "turn
-// that participant down for everybody" and "turn everything down for that participant" — and a
-// single knob would make the first indistinguishable from the second on a two-party call and
-// impossible on a larger one.
+// gainRx scales what a member CONTRIBUTES and gainTx what they RECEIVE; they are separate knobs
+// because "turn that participant down for everybody" and "turn everything down for them" differ.
 
 // ErrNotInConversation is returned when there is nothing to tap or nothing to leave.
 var ErrNotInConversation = errors.New("rtp: the session is not in a bridge or a conference")
 
-// ErrConferenceCodec is returned when a member's codec cannot be decoded for the mix.
-//
-// The one refusal a conference makes that is not about the request: an Opus leg cannot join a mix
-// because this build has no Opus codec (see internal/audio/g722.go for the cgo decision), and a mix
-// is the one operation that cannot be served by passing bytes through.
+// ErrConferenceCodec is returned when a member's codec cannot be decoded for the mix. A mix is the
+// one operation that cannot be served by passing bytes through.
 var ErrConferenceCodec = errors.New("rtp: this codec cannot be mixed")
 
-// unityGain is 1.0 in the mixer's Q8 fixed point: 256 units to the whole.
-//
-// Fixed point rather than float64 because the mix is integer arithmetic from end to end and one
-// float in the middle of it would mean a conversion per sample per member per tick for a precision
-// nobody can hear. Eight fractional bits is a resolution of about 0.03 dB near unity, which is finer
-// than any volume control a person will ever be given.
+// unityGain is 1.0 in the mixer's Q8 fixed point: 256 units to the whole. Fixed point keeps the mix
+// integer arithmetic end to end; eight fractional bits is about 0.03 dB near unity.
 const unityGain int32 = 256
 
-// Side names one half of a two-party conversation.
-//
-// The vocabulary `rpc.media.v1.tap-session` carries, and the same one `MediaPort.TapSide` defines:
-// a SIDE is a party in a conversation, where a DIRECTION is a property of one channel. The
-// distinction is the whole reason the tap contract is not a snoop — see design doc §10 question 4's
-// W6 addendum.
+// Side names one half of a two-party conversation. A SIDE is a party in a conversation, where a
+// DIRECTION is a property of one channel.
 type Side string
 
 // The four sides.
 const (
-	// SideA is the TARGET session — the leg the tap names. See the note on TapOptions about why this
-	// convention exists and what the contract still owes it.
+	// SideA is the TARGET session — the leg the tap names.
 	SideA Side = "a"
 	// SideB is the other party in the target's conversation.
 	SideB Side = "b"
 	// SideBoth is everybody in the conversation.
 	SideBoth Side = "both"
-	// SideNone is nobody. Only ever meaningful on `speakTo`, where it is the silent supervisor.
+	// SideNone is nobody. Only meaningful on `speakTo`, where it is the silent supervisor.
 	SideNone Side = "none"
 )
 
@@ -94,13 +63,8 @@ func ParseSide(raw string) (Side, error) {
 	}
 }
 
-// Audience is the set of members one routing decision applies to.
-//
-// `all` rather than an enumerated set for the common case, and that is a performance decision with a
-// correctness consequence: a plain conference is every member with `all` on both sides, which is
-// exactly the shape the total-minus-self subtraction is valid for. An enumerated audience takes the
-// explicit path, which is O(N) per member — right for a tap, which is one member out of three, and
-// wrong as the general case.
+// Audience is the set of members one routing decision applies to. The `all` case is the shape the
+// total-minus-self subtraction is valid for; an enumerated audience takes an O(N)-per-member path.
 type Audience struct {
 	all bool
 	ids map[string]struct{}
@@ -140,11 +104,10 @@ type JoinOptions struct {
 	Hear Audience
 	// SpeakTo is which members this one's audio reaches. Everyone, for a plain participant.
 	SpeakTo Audience
-	// GainRx and GainTx are Q8 fixed-point scalings; zero means unity. See the package note.
+	// GainRx and GainTx are Q8 fixed-point scalings; zero means unity.
 	GainRx int32
 	GainTx int32
-	// TapID marks this member as a TAP rather than a participant, for the diagnostics and for
-	// Untap. Empty for a real party to the call.
+	// TapID marks this member as a tap rather than a participant. Empty for a party to the call.
 	TapID string
 }
 
@@ -160,18 +123,16 @@ type Member struct {
 	speakTo Audience
 	tapID   string
 
-	// gainRx and gainTx are read on the mixer goroutine and written by a control command, which is
-	// what makes them atomics rather than fields under the conference lock: a volume change must not
-	// have to wait for a tick, and a tick must not have to take a lock per member per frame.
+	// gainRx and gainTx are read on the mixer goroutine and written by control commands, so they are
+	// atomics rather than fields under the conference lock.
 	gainRx atomic.Int32
 	gainTx atomic.Int32
 
 	// contribution is this member's decoded, gained frame for the tick in progress. Owned by the
-	// mixer goroutine alone, and reused across ticks so a conference does not allocate N frames fifty
-	// times a second.
+	// mixer goroutine alone and reused across ticks.
 	contribution []int32
-	// marked is false until this member's first mixed frame has gone out, which is the frame that
-	// carries the marker bit — the stream is switching to the mixer's clock exactly once.
+	// marked is false until this member's first mixed frame has gone out; that frame carries the
+	// marker bit, since the stream switches to the mixer's clock exactly once.
 	marked bool
 }
 
@@ -182,10 +143,6 @@ func (m *Member) SessionID() string { return m.session.ID }
 func (m *Member) TapID() string { return m.tapID }
 
 // SetGain adjusts one member's contribution and reception scaling. Zero means unity.
-//
-// The seam W10's volume controls need, exposed now rather than later because the alternative is
-// discovering at the point of use that the mixer has nowhere to put a gain and adding one to a
-// shipped mix loop.
 func (m *Member) SetGain(rx, tx int32) {
 	if rx <= 0 {
 		rx = unityGain
@@ -203,12 +160,8 @@ func (m *Member) Gain() (rx, tx int32) { return m.gainRx.Load(), m.gainTx.Load()
 // JitterStats is this member's buffer's counters.
 func (m *Member) JitterStats() JitterStats { return m.jitter.Stats() }
 
-// receive hands one arrived packet to this member's jitter buffer.
-//
-// Telephone-event packets are NOT buffered: a digit is not audio, and putting one through a decoder
-// writes four bytes of noise into everybody's mix. They are relayed to the conference exactly as
-// they cross a bridge — see Conference.forwardEvent — so a participant pressing a feature code in a
-// room is still heard by the room, and by the engine's own detector, which ran before this.
+// receive hands one arrived packet to this member's jitter buffer. Telephone-event packets are NOT
+// buffered — decoding one writes noise into the mix — and are relayed instead; see forwardEvent.
 func (m *Member) receive(packet *pionrtp.Packet, now time.Time) {
 	if tePT := m.session.TelephoneEventPayloadType(); tePT != 0 &&
 		packet.PayloadType == tePT {
@@ -220,9 +173,8 @@ func (m *Member) receive(packet *pionrtp.Packet, now time.Time) {
 
 // Conference is N sessions hearing the sum of each other.
 type Conference struct {
-	// ID is the caller-assigned identifier. A bridge id when a two-party call was converted into
-	// one by a tap, which is deliberate: the engine must be able to tear down what it created under
-	// the name it created it with, whether or not somebody supervised it in between.
+	// ID is the caller-assigned identifier, and stays the bridge id when a tap converted a two-party
+	// call into a room, so the engine can tear down what it created under the name it used.
 	ID string
 
 	manager *Manager
@@ -230,31 +182,23 @@ type Conference struct {
 
 	mu      sync.Mutex
 	members map[string]*Member
-	// order is the members in join order, so a mix is deterministic and a test can assert on it.
-	// Map iteration order would make the saturation behaviour of a loud conference unreproducible.
+	// order is the members in join order, so the mix — and its saturation behaviour — is deterministic.
 	order []string
 
 	stopOnce sync.Once
 	stop     chan struct{}
 	done     chan struct{}
 
-	// total, mixed, out and pending belong to the mix loop and nothing else touches them. Reused
-	// across ticks for the same reason Member.contribution is: a room that allocated four buffers
-	// fifty times a second was the one loop in this service with a hard 20 ms deadline paying for
-	// steady GC pressure it did not need.
+	// total, mixed, out and pending belong to the mix loop and nothing else touches them; they are
+	// reused across ticks to keep the 20 ms deadline free of GC pressure.
 	total   []int32
 	mixed   []int32
 	out     []int16
 	pending []mixFrame
 }
 
-// mixFrame is one member's finished frame, waiting to be written OUTSIDE the room lock.
-//
-// The writes used to happen inline, under c.mu, and each one is a marshal plus a WriteToUDP — or a
-// Pion SRTP write taking its own locks for a WebRTC leg. At eight members and fifty ticks a second
-// that is four hundred syscalls a second holding the mutex that every join, leave and Members()
-// waits on, several of which are called with Manager.mu held: one slow socket stalled the whole
-// room and could block a Release behind the global session map.
+// mixFrame is one member's finished frame, waiting to be written OUTSIDE the room lock: a socket
+// write under c.mu would stall every join, leave and Members(), some of which hold Manager.mu.
 type mixFrame struct {
 	session *Session
 	payload []byte
@@ -265,7 +209,7 @@ type mixFrame struct {
 func (c *Conference) Members() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return append([]string(nil), c.order...)
+	return slices.Clone(c.order)
 }
 
 // Member finds a seat by session id.
@@ -291,9 +235,8 @@ func (c *Conference) Stop() { c.stopOnce.Do(func() { close(c.stop) }) }
 
 // join seats a session. Caller holds nothing; the conference takes its own lock.
 func (c *Conference) join(session *Session, opts JoinOptions) (*Member, error) {
-	// The codecs are built BEFORE the lock and before anything is mutated, because this is the one
-	// step that can refuse: a leg whose codec cannot be decoded cannot be in a mix at all, and
-	// discovering that after seating it would mean a member in the room contributing nothing.
+	// The codecs are built before the lock and before anything is mutated: this is the one step that
+	// can refuse, and a refusal after seating would leave a member contributing nothing.
 	format := session.Format()
 	decoder, err := audio.NewFrameDecoder(format)
 	if err != nil {
@@ -321,9 +264,8 @@ func (c *Conference) join(session *Session, opts JoinOptions) (*Member, error) {
 
 	c.mu.Lock()
 	if existing, ok := c.members[session.ID]; ok {
-		// Re-joining is a re-POINT rather than a second seat: a supervisor escalating from whisper to
-		// barge is exactly this, and taking the member out and putting them back would drop their
-		// jitter buffer and reset their codec mid-sentence.
+		// Re-joining re-points an existing seat (a supervisor escalating whisper to barge); reseating
+		// would drop the jitter buffer and reset the codec mid-sentence.
 		existing.hear, existing.speakTo = opts.Hear, opts.SpeakTo
 		existing.SetGain(opts.GainRx, opts.GainTx)
 		c.mu.Unlock()
@@ -333,9 +275,8 @@ func (c *Conference) join(session *Session, opts JoinOptions) (*Member, error) {
 	c.order = append(c.order, session.ID)
 	c.mu.Unlock()
 
-	// A session in a conference has no peer: the mix replaces the relay entirely. Clearing the
-	// pointer here rather than leaving it is what stops a leg being in a bridge and a room at once,
-	// which would deliver every frame twice under one SSRC.
+	// A session in a conference has no peer: the mix replaces the relay. Leaving the pointer would
+	// put a leg in a bridge and a room at once, delivering every frame twice under one SSRC.
 	session.SetPeer(nil)
 	session.transcode.Store(nil)
 	session.mixMember.Store(member)
@@ -361,14 +302,10 @@ func (c *Conference) leave(sessionID string) bool {
 		return false
 	}
 	member.session.mixMember.CompareAndSwap(member, nil)
-	// The leg is about to start hearing something else — a relay, a prompt, or nothing — from a
-	// different timestamp clock. Same flag, same reason, as the end of a prompt.
+	// The leg is about to hear a different timestamp clock, as at the end of a prompt.
 	member.session.markNextForward.Store(true)
 
-	// The buffer's counters are logged HERE and nowhere else, because this is the only moment they
-	// are final and still attached to a participant. "Which participant had the bad network" is a
-	// question somebody asks after a conference rather than during one, and it is unanswerable from
-	// anywhere else.
+	// The only moment the buffer's counters are both final and still attached to a participant.
 	stats := member.jitter.Stats()
 	c.log.Info("a member left the mix",
 		"sessionId", sessionID, "tapId", member.tapID,
@@ -377,12 +314,8 @@ func (c *Conference) leave(sessionID string) bool {
 	return true
 }
 
-// forwardEvent relays one telephone-event packet to everybody the sender speaks to.
-//
-// Digits cross a conference for the same reason they cross a bridge: the payload is bytes, the
-// format is identical whatever the audio codec is, and only the payload TYPE needs renumbering
-// between two legs that negotiated differently. Putting them through the mix instead would decode a
-// digit as audio, which is a click in everybody's ears and no digit at the far end.
+// forwardEvent relays one telephone-event packet to everybody the sender speaks to. Only the
+// payload type needs renumbering; mixing a digit would be a click and no digit at the far end.
 func (c *Conference) forwardEvent(from *Member, packet *pionrtp.Packet) {
 	c.mu.Lock()
 	targets := make([]*Member, 0, len(c.order))
@@ -419,22 +352,15 @@ func (c *Conference) run() {
 	}
 }
 
-// mixOnce produces and sends one frame of audio to every member.
+// mixOnce produces and sends one frame of audio to every member:
 //
-// # The shape of the arithmetic, in order
-//
-//  1. Every member's next frame is popped from their jitter buffer, decoded, and scaled by their own
-//     receive gain into an int32 contribution. A member with nothing to play contributes SILENCE
-//     rather than being skipped, which is what keeps the mix on a clock.
-//  2. The contributions of everybody who speaks to everybody are summed into one unclamped total.
-//  3. Each member's mix is that total minus their own contribution, plus the contributions of any
-//     member whose audience is restricted and includes them.
-//  4. The result is scaled by the member's transmit gain, clamped ONCE, encoded in their own codec,
-//     and written out of their own socket.
-//
-// Step 3 is where mix-minus lives and step 2 is why it is affordable: the total is computed once for
-// the whole room, so adding a participant costs one decode and one encode rather than one more sum
-// per existing participant.
+//  1. Each member's next frame is popped, decoded, and scaled by their receive gain into an int32
+//     contribution. A member with nothing to play contributes SILENCE rather than being skipped,
+//     which is what keeps the mix on a clock.
+//  2. Everybody whose audience is everybody is summed into one UNCLAMPED total.
+//  3. Each member's mix is that total minus their own contribution, plus any restricted-audience
+//     member who speaks to them.
+//  4. The result is scaled by transmit gain, clamped ONCE, encoded, and written out.
 func (c *Conference) mixOnce() {
 	c.mu.Lock()
 
@@ -450,13 +376,14 @@ func (c *Conference) mixOnce() {
 
 		frame, ok := member.jitter.Pop()
 		if !ok {
-			for index := range member.contribution {
-				member.contribution[index] = 0
-			}
+			clear(member.contribution)
 			continue
 		}
 		samples := member.decoder.DecodeFrame(frame)
-		for index := 0; index < audio.FrameSamples; index++ {
+		// DecodeFrame copies into the decoder's own scratch, so the frame is dead here and can go back
+		// to the buffer. See JitterBuffer.Recycle.
+		member.jitter.Recycle(frame)
+		for index := range audio.FrameSamples {
 			member.contribution[index] = int32(samples[index]) * gain / unityGain
 		}
 
@@ -475,18 +402,15 @@ func (c *Conference) mixOnce() {
 		if member.hear.All() {
 			copy(mixed, total)
 			if member.speakTo.All() {
-				// MINUS SELF. The one line the whole rung is named after.
+				// Mix-minus.
 				for index := range mixed {
 					mixed[index] -= member.contribution[index]
 				}
 			}
-			// A member with a restricted audience is not in `total`, so their contribution has to be
-			// added explicitly to whoever they do speak to.
+			// A restricted-audience member is not in `total`, so add them explicitly.
 			c.addRestrictedLocked(mixed, member)
 		} else {
-			for index := range mixed {
-				mixed[index] = 0
-			}
+			clear(mixed)
 			for _, otherID := range c.order {
 				if otherID == id {
 					continue
@@ -502,15 +426,13 @@ func (c *Conference) mixOnce() {
 
 		gain := member.gainTx.Load()
 		for index := range mixed {
-			// One clamp, at the end. See the package note on why saturating into the running total
-			// would break the subtraction above.
+			// One clamp, at the end: saturating into the running total would break the subtraction.
 			out[index] = clampSample(mixed[index] * gain / unityGain)
 		}
 
 		marker := !member.marked
 		member.marked = true
-		// EncodeFrame's output is the one buffer here that is NOT reused: it outlives the lock and
-		// each member's is written separately, so they cannot share one.
+		// EncodeFrame's output is the one buffer here that is NOT reused: it outlives the lock.
 		c.pending = append(c.pending, mixFrame{
 			session: member.session,
 			payload: member.encoder.EncodeFrame(out),
@@ -532,9 +454,7 @@ func (c *Conference) scratchTotal() []int32 {
 		c.mixed = make([]int32, audio.FrameSamples)
 		c.out = make([]int16, audio.FrameSamples)
 	}
-	for index := range c.total {
-		c.total[index] = 0
-	}
+	clear(c.total)
 	return c.total
 }
 
@@ -557,10 +477,8 @@ func (c *Conference) addRestrictedLocked(mixed []int32, to *Member) {
 	}
 }
 
-// clampSample saturates one summed sample into the 16-bit range.
-//
-// Saturation and not a wrap, for the reason audio.MixInto states: a wrap turns a loud moment into a
-// full-amplitude sign flip, which is a bang rather than distortion.
+// clampSample saturates one summed sample into the 16-bit range. A wrap would turn a loud moment
+// into a full-amplitude sign flip.
 func clampSample(value int32) int16 {
 	switch {
 	case value > 32767:
@@ -572,25 +490,16 @@ func clampSample(value int32) int16 {
 	}
 }
 
-// sendMixFrame writes one mixed frame out of this session's socket.
-//
-// It shares the session's SSRC, sequence counter and timestamp clock with the relay and with
-// playback, for the third time and for the same reason: a mix is not a second stream, it is this
-// leg's outbound audio sourced from a room rather than from a peer.
-//
-// Every suppression the other sources obey applies here too, and in the same order — a digit being
-// generated at this leg owns the stream, a prompt playing at this leg replaces the room, and a held
-// or muted-out leg hears neither. That last one is what makes muting a conference participant
-// outbound work at all.
+// sendMixFrame writes one mixed frame out of this session's socket, sharing the session's SSRC,
+// sequence counter and timestamp clock with the relay and with playback. Every suppression the
+// other sources obey applies here in the same order: DTMF, then playback, then transmit suppression.
 func (s *Session) sendMixFrame(payload []byte, marker bool) {
 	if s.dtmfActive() {
 		s.count(func(st *Stats) { st.SuppressedByDtmf++ })
 		return
 	}
 	if s.playback.Load() != nil {
-		// A prompt played AT a conference member replaces the room for its duration, exactly as it
-		// replaces a peer. "You are the only participant" is that prompt, and a caller hearing it
-		// mixed under the room would be hearing the thing it says is not there.
+		// A prompt played AT a member replaces the room for its duration, as it replaces a peer.
 		s.count(func(st *Stats) { st.SuppressedByPlayback++ })
 		return
 	}
@@ -616,22 +525,22 @@ func (s *Session) sendMixFrame(payload []byte, marker bool) {
 		Payload: payload,
 	}
 
-	encoded, err := out.Marshal()
+	encoded, scratch, err := marshalOutbound(&out)
 	if err != nil {
 		s.log.Debug("cannot marshal a mixed frame", "error", err)
 		return
 	}
-	if _, err := s.writeRTP(encoded, to); err != nil {
-		// Per-packet and self-correcting, exactly as a relayed frame is. A conference is not torn
-		// down because one participant's frame did not make it out.
+	_, err = s.writeRTP(encoded, to)
+	releaseOutbound(scratch)
+	if err != nil {
+		// Per-packet and self-correcting: a room is not torn down over one undelivered frame.
 		s.log.Debug("cannot send a mixed frame", "error", err, "remote", to.String())
 		return
 	}
 	s.countSent(uint32(len(payload)))
 	s.count(func(st *Stats) { st.MixedFramesSent++ })
 
-	// The SEND half of a `both` recording, for a member being recorded: what this leg was told, which
-	// is the rest of the room.
+	// The send half of a `both` recording: what this leg was told, which is the rest of the room.
 	if recorder := s.recording.Load(); recorder != nil {
 		recorder.Sent(payload)
 	}

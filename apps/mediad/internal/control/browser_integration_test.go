@@ -41,7 +41,7 @@ func TestChromiumWebRTCAudioAndRecording(t *testing.T) {
 }
 
 func testChromium(t *testing.T, mode string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 40*time.Second)
 	defer cancel()
 	loopback := netip.MustParseAddr("127.0.0.1")
 	allocator, err := rtp.NewAllocator(loopback, 37400, 37599)
@@ -164,7 +164,7 @@ try{const page=await browser.newPage(); await page.goto(process.argv[1]); await 
 		t.Fatalf("recording lost audio: dropped=%d summary=%+v", active.Dropped(), active.Summary())
 	}
 	recordingPath := filepath.Join(recordings, testOrg, testCall, "browser-record.wav")
-	for attempt := 0; attempt < 30; attempt++ {
+	for range 30 {
 		if info, err := os.Stat(recordingPath); err == nil && info.Size() > 8044 {
 			return
 		}

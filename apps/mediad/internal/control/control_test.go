@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -21,8 +22,7 @@ import (
 )
 
 // The handlers are pure functions of the payload, so this whole suite runs with no broker and no
-// sockets. sipd draws the same line: the wire is left to the gated integration suite and the logic
-// is tested where it lives.
+// sockets.
 
 const (
 	testOrg     = "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
@@ -59,7 +59,7 @@ type stubSessions struct {
 	nextPort   int
 	audioForce uint8
 
-	// The playback half of the packet path, stubbed the same way the rest of it is.
+	// The playback half of the packet path.
 	playbackErr    error
 	playbackStarts []playbackCall
 	playbackStops  []string
@@ -68,8 +68,8 @@ type stubSessions struct {
 	// an A-law leg without going anywhere near a socket.
 	codecFor map[string]uint8
 
-	// The rung 3 and rung 4 halves, stubbed the same way. `telephoneEventFor` defaults to 101 for a
-	// live session; a test sets it to 0 to stand in for a leg that negotiated no RFC 4733 type.
+	// `telephoneEventFor` defaults to 101 for a live session; a test sets it to 0 to stand in for a
+	// leg that negotiated no RFC 4733 type.
 	dtmfErr           error
 	dtmfSends         []dtmfCall
 	telephoneEventFor map[string]uint8
@@ -80,7 +80,7 @@ type stubSessions struct {
 	recording       map[string]string
 	tenancy         map[string][2]string
 
-	// Rung 5's renegotiation record and rung 6's tap pair.
+	// The renegotiation record and the tap pair.
 	directions []directionCall
 	// The B-leg's accept-answer settle record. `settleErr` forces a failure; `settlePort` fixes the
 	// descriptor's port so a create-offer→accept-answer flow can assert on a stable value.
@@ -92,9 +92,8 @@ type stubSessions struct {
 	untaps     []string
 	tapped     map[string]string
 
-	// Rung 5's state pair, reaching the wire. `muted` is a pair of flags per session because a mute
-	// is ADDITIVE and a stub that replaced them would let a handler bug pass: the whole reason the
-	// handler reads the state back is that it cannot derive it from the request.
+	// `muted` is a pair of flags per session because a mute is ADDITIVE and a stub that replaced them
+	// would let a handler bug pass: the handler reads the state back because it cannot derive it.
 	muteErr    error
 	mutes      []muteCall
 	muted      map[string][2]bool
@@ -104,7 +103,7 @@ type stubSessions struct {
 	held       map[string]string
 	holdActive map[string]bool
 
-	// Rung 6's room, reached through `bridge-sessions` rather than only through a tap.
+	// The room, reached through `bridge-sessions` rather than only through a tap.
 	joinErr     error
 	joins       []joinCall
 	conferences map[string][]string
@@ -328,9 +327,8 @@ func (s *stubSessions) StopRecording(recordingRef string) (string, bool) {
 	return sessionID, true
 }
 
-// The rung 5 and rung 6 halves. `ApplyDirection` records what a renegotiation asked for so the
-// allocate tests can assert that a `sendonly` offer actually moved the gate rather than merely being
-// accepted; the tap pair stands in for the mixer the same way `Bridge` stands in for the relay.
+// `ApplyDirection` records what a renegotiation asked for, so the allocate tests can assert that a
+// `sendonly` offer actually moved the gate rather than merely being accepted.
 
 func (s *stubSessions) ApplyDirection(sessionID string, muteIn, muteOut bool) error {
 	s.mu.Lock()
@@ -379,7 +377,7 @@ func (s *stubSessions) SettleAnswer(
 func (s *stubSessions) settleCalls() []settleCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]settleCall(nil), s.settles...)
+	return slices.Clone(s.settles)
 }
 
 func (s *stubSessions) Tap(opts rtp.TapOptions) (rtp.TapResult, error) {
@@ -397,8 +395,8 @@ func (s *stubSessions) Tap(opts rtp.TapOptions) (rtp.TapResult, error) {
 	}, nil
 }
 
-// The rung-5 state pair. `Mute` is ADDITIVE here exactly as the real one is, so a handler that
-// derived its reply from the request instead of reading the state back would fail these tests.
+// `Mute` is ADDITIVE here exactly as the real one is, so a handler that derived its reply from the
+// request instead of reading the state back would fail these tests.
 func (s *stubSessions) Mute(sessionID string, direction rtp.MediaDirection) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -571,49 +569,47 @@ func (s *stubSessions) SessionTenancy(sessionID string) (string, string, bool) {
 func (s *stubSessions) dtmfCalls() []dtmfCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]dtmfCall(nil), s.dtmfSends...)
+	return slices.Clone(s.dtmfSends)
 }
 
 func (s *stubSessions) recordingCalls() []recordingCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]recordingCall(nil), s.recordingStarts...)
+	return slices.Clone(s.recordingStarts)
 }
 
 func (s *stubSessions) playbackCalls() []playbackCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]playbackCall(nil), s.playbackStarts...)
+	return slices.Clone(s.playbackStarts)
 }
 
 func (s *stubSessions) tapCalls() []rtp.TapOptions {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]rtp.TapOptions(nil), s.taps...)
+	return slices.Clone(s.taps)
 }
 
 func (s *stubSessions) directionCalls() []directionCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]directionCall(nil), s.directions...)
+	return slices.Clone(s.directions)
 }
 
 func (s *stubSessions) allocateCalls() []rtp.AllocateOptions {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]rtp.AllocateOptions(nil), s.allocated...)
+	return slices.Clone(s.allocated)
 }
 
 type rig struct {
 	server   *control.Server
 	sessions *stubSessions
 	dir      *directory.FakeStore
-	// prompts is the directory MEDIAD_SOUNDS_DIR points at for this rig, so a playback test can
-	// write a fixture into it.
+	// prompts is the directory MEDIAD_SOUNDS_DIR points at, so a playback test can write a fixture.
 	prompts string
-	// recordings is the directory MEDIAD_RECORDINGS_DIR points at, so a recording test can assert
-	// on the object key the handler derived without a real file ever being written — the stub
-	// packet path never opens one.
+	// recordings is the directory MEDIAD_RECORDINGS_DIR points at; the stub packet path never opens a
+	// file, so a recording test asserts on the object key the handler derived.
 	recordings string
 }
 
@@ -821,10 +817,56 @@ func TestAllocateAnInactiveLeg(t *testing.T) {
 	}
 }
 
+// The handler parses the offer once and reads the transport off the parse. An offer that is BOTH on
+// an unsupported transport and free of any codec mediad carries must still be refused for the
+// transport: the engine's recovery differs, and the transport is the cheaper thing to fix.
+func TestAnUnsupportedTransportIsRefusedAheadOfTheCodecs(t *testing.T) {
+	offer := strings.NewReplacer(
+		"m=audio 41000 RTP/AVP 0 8 101", "m=audio 41000 SCTP/DTLS 96",
+		"a=rtpmap:0 PCMU/8000", "a=rtpmap:96 AMR-WB/16000",
+		"a=rtpmap:8 PCMA/8000", "a=rtpmap:97 iLBC/8000",
+	).Replace(offerBody)
+
+	r := newRig(t)
+	request := validAllocate()
+	request.SDPOffer = offer
+	response := decodeAllocate(t, r.server.HandleAllocateSession(mustJSON(t, request)))
+
+	if response.Ok {
+		t.Fatal("allocate accepted an offer on an unsupported transport")
+	}
+	if response.Reason == nil || string(*response.Reason) != control.ReasonNotSupported {
+		t.Errorf("reason = %v, want %q", response.Reason, control.ReasonNotSupported)
+	}
+	if response.Error == nil || !strings.Contains(*response.Error, "unsupported audio transport") {
+		t.Errorf("error = %v; it should name the transport, not the codecs", response.Error)
+	}
+}
+
+// A malformed direction is refused before the offer's codecs are judged, unchanged by the single
+// parse: the two errors reach the engine through different reason codes.
+func TestABadDirectionIsRefusedAheadOfTheCodecs(t *testing.T) {
+	offer := strings.NewReplacer(
+		"a=rtpmap:0 PCMU/8000", "a=rtpmap:96 AMR-WB/16000",
+		"a=rtpmap:8 PCMA/8000", "a=rtpmap:97 iLBC/8000",
+		"m=audio 41000 RTP/AVP 0 8 101", "m=audio 41000 RTP/AVP 96 97",
+	).Replace(offerBody)
+
+	r := newRig(t)
+	request := validAllocate()
+	request.SDPOffer = offer
+	request.Direction = "duplex"
+	response := decodeAllocate(t, r.server.HandleAllocateSession(mustJSON(t, request)))
+
+	if response.Ok {
+		t.Fatal("allocate accepted an unknown direction")
+	}
+	if response.Reason == nil || string(*response.Reason) != control.ReasonBadRequest {
+		t.Errorf("reason = %v, want %q", response.Reason, control.ReasonBadRequest)
+	}
+}
+
 func TestAllocateRefusals(t *testing.T) {
-	// RUNG 7 CHANGED WHAT THIS OFFER HAS TO CONTAIN. It used to be G.722 plus Opus, because those
-	// were the two codecs mediad could not carry; both are negotiable now, so the "no common codec"
-	// case needs codecs this build genuinely has no answer for.
 	noCommonCodec := strings.NewReplacer(
 		"m=audio 41000 RTP/AVP 0 8 101", "m=audio 41000 RTP/AVP 96 97",
 		"a=rtpmap:0 PCMU/8000", "a=rtpmap:96 AMR-WB/16000",
@@ -1021,11 +1063,8 @@ func TestBridgeRelaysTwoSessionsAndNotesItInTheDirectory(t *testing.T) {
 }
 
 func TestBridgeRefusals(t *testing.T) {
-	// THREE SESSIONS USED TO BE REFUSED HERE, naming rung 6. Rung 6 arrived, and the case that
-	// asserted the refusal now asserts the capability — see TestBridgeSeatsThreeSessionsInARoom in
-	// rung567_test.go. What survives is the CEILING: a room this mixer cannot hold is still a
-	// not-supported refusal that names the reason, because the engine's recovery for it is the one
-	// every capability gap gets.
+	// The CEILING: a room this mixer cannot hold is a not-supported refusal that names the reason,
+	// because the engine's recovery for it is the one every capability gap gets.
 	t.Run("a room larger than the mixer holds", func(t *testing.T) {
 		r := newRig(t)
 		ids := make([]string, 9)
@@ -1277,25 +1316,25 @@ func TestSubscribeRequiresAConnection(t *testing.T) {
 func (s *stubSessions) muteCalls() []muteCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]muteCall(nil), s.mutes...)
+	return slices.Clone(s.mutes)
 }
 
 func (s *stubSessions) holdCalls() []holdCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]holdCall(nil), s.holds...)
+	return slices.Clone(s.holds)
 }
 
 func (s *stubSessions) joinCalls() []joinCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]joinCall(nil), s.joins...)
+	return slices.Clone(s.joins)
 }
 
 func (s *stubSessions) destroyedConferences() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]string(nil), s.destroyed...)
+	return slices.Clone(s.destroyed)
 }
 
 // bridgeCallsMade is the two-party RELAY path's record. A room must not go down it: two members
@@ -1303,5 +1342,5 @@ func (s *stubSessions) destroyedConferences() []string {
 func (s *stubSessions) bridgeCallsMade() []bridgeCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]bridgeCall(nil), s.bridged...)
+	return slices.Clone(s.bridged)
 }

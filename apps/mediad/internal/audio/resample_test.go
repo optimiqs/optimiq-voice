@@ -9,9 +9,7 @@ import (
 func TestUpsampleDoublesTheRateAndKeepsTheLevel(t *testing.T) {
 	t.Parallel()
 
-	// A resample changes the band, never the level. A filter that quietly attenuated by a decibel
-	// shows up as "the wideband phones are quieter than the others", which gets blamed on the
-	// handset and never on the media server.
+	// A resample changes the band, never the level.
 	cases := []float64{300, 1000, 2000, 3000}
 
 	for _, hertz := range cases {
@@ -37,10 +35,7 @@ func TestUpsampleDoublesTheRateAndKeepsTheLevel(t *testing.T) {
 func TestUpsampleRejectsTheImageItCreates(t *testing.T) {
 	t.Parallel()
 
-	// Zero-stuffing puts a mirror image of the signal above 4 kHz. Leaving it there — which is what
-	// linear interpolation does, at only ~13 dB down — is heard as a metallic edge on sibilants: the
-	// classic "narrowband audio played through a wideband codec" sound. The kernel exists to remove
-	// it, and this is the assertion that says it does.
+	// Zero-stuffing puts a mirror image of the signal above 4 kHz; the kernel must remove it.
 	const hertz = 1000
 	in := sine(1600, hertz, 8000, audio.SampleRate)
 	var up audio.Resampler8to16
@@ -75,10 +70,7 @@ func TestDownsampleHalvesTheRateAndKeepsTheLevel(t *testing.T) {
 func TestDownsampleFiltersBeforeItDecimates(t *testing.T) {
 	t.Parallel()
 
-	// Energy above 4 kHz has nowhere to go at 8 kHz: decimating without filtering FOLDS it back into
-	// the audible band as a tone at a completely different pitch. Speech has plenty of energy up
-	// there, so this is the difference between a wideband leg sounding narrowband and sounding
-	// broken.
+	// Decimating without filtering folds energy above 4 kHz back into the audible band.
 	in := sine(3200, 6000, 8000, wideRate)
 	var down audio.Resampler16to8
 	out := down.Resample(in)
@@ -93,10 +85,8 @@ func TestDownsampleFiltersBeforeItDecimates(t *testing.T) {
 func TestResamplersCarryStateAcrossFrames(t *testing.T) {
 	t.Parallel()
 
-	// A filter restarted per frame discards the tail of the previous one, which is a discontinuity
-	// every 20 ms — a buzz under the speech at the frame rate. The assertion is that resampling in
-	// frames matches resampling the whole run, which is only true if the history survives the call
-	// boundary.
+	// Resampling in frames must match resampling the whole run, which holds only if the filter
+	// history survives the call boundary.
 	in := sine(1600, 1000, 8000, audio.SampleRate)
 
 	var whole audio.Resampler8to16

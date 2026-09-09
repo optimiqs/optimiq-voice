@@ -1,33 +1,10 @@
 // Package control is mediad's NATS command surface: the Go responder for `rpc.media.v1.*`.
 //
-// # The contract now lives in packages/events, and this is the promotion
-//
-// v0 defined its subjects and its structs here, deliberately, because the command set bridged-call
-// parity actually needs was not knowable until a real capability had been built against it, and
-// promoting a guess into the shared contract would have frozen the guess. All four promotion
-// criteria in plans/mediad-design.md §4.3 are now met — rung 2 works, SDP is in the payloads, and
-// the engine has a real `MediadMediaPort` — so the shapes below are `packages/events-go` types
-// generated from the Zod source of truth, and the drift gate keeps the two languages honest.
-//
-// # Raw NATS, not a Nest @MessagePattern — and the same rule in reverse
-//
-// The responder here is a raw `conn.Subscribe` + `msg.Respond`, so the bytes on the wire are exactly
-// the generated structs. That is mandatory for a subject with a non-TypeScript participant, and
-// this family is that case in its purest form: a Go responder answering a NestJS caller.
-//
-// NestJS's NATS transport frames request-reply as `{"pattern":…,"data":…,"id":…}` /
-// `{"response":…,"isDisposed":true,"id":…}`, and a request carrying the bare contract payload is not
-// answered at all — it times out. The obligation runs the other way here: the ENGINE's client must
-// be a raw `NatsConnection.request()`, NOT a `ClientProxy.send`, because a ClientProxy would wrap
-// the payload in that framing and this handler would reject it as malformed. The rule is recorded
-// on `mediaAllocateSessionRequestSchema` in packages/events for whoever writes the next client.
-//
-// # A refusal is a REPLY, never a silence
-//
-// Every handler answers. A responder that simply does not reply to a request it dislikes is
-// indistinguishable from a crashed one, and the caller pays the whole timeout to learn nothing.
-// `ok:false` with a machine-readable `reason` costs one round trip and tells the engine whether to
-// retry, try another instance, or route the leg to Asterisk.
+// Two invariants hold across every handler. The wire carries the bare packages/events-go structs on
+// a raw conn.Subscribe/msg.Respond, so a caller must use a raw NatsConnection.request(), NOT a
+// NestJS ClientProxy, whose {"pattern",...,"data"} framing this responder rejects as malformed. And
+// every request gets a reply: a refusal is `ok:false` with a machine-readable `reason`, never
+// silence, which a caller cannot tell from a crash until its own timeout expires.
 package control
 
 import (
@@ -50,11 +27,8 @@ import (
 	secure "github.com/optimiqs/optimiq-voice/apps/mediad/internal/webrtc"
 )
 
-// The v1 command subjects, taken from the contract package rather than restated.
-//
-// Re-declared as local names purely so the subscription table below reads as a list of this
-// service's own surface; the VALUES come from packages/events-go, so a subject rename in the Zod
-// source is a compile error here rather than a silent mismatch at runtime.
+// The v1 command subjects. Local names over contract values, so a rename in the Zod source is a
+// compile error here rather than a runtime mismatch.
 const (
 	SubjectAllocateSession  = contract.SubjectMediaAllocateSessionRPC
 	SubjectBridgeSessions   = contract.SubjectMediaBridgeSessionsRPC
@@ -65,25 +39,14 @@ const (
 	SubjectSendDtmf         = contract.SubjectMediaSendDtmfRPC
 	SubjectStartRecording   = contract.SubjectMediaStartRecordingRPC
 	SubjectStopRecording    = contract.SubjectMediaStopRecordingRPC
-	// Rung 6's pair. They were promoted into `packages/events` and granted in `config/nats.conf`
-	// ahead of any implementation — deliberately, per design doc §10 question 4's W6 addendum, so
-	// that "the rung-6 mixer serves this contract by ARRIVING, not by being extended". It arrived.
-	SubjectTapSession   = contract.SubjectMediaTapSessionRPC
-	SubjectUntapSession = contract.SubjectMediaUntapSessionRPC
-	// Rung 5's state pair, arriving on the wire two rungs after the packet path learned to serve
-	// them. `internal/rtp/hold.go` has held the gates and the music loop since rung 5 and had no
-	// subject to be reached through, so `MediadMediaPort` refused hold, unhold, mute, unmute and
-	// music-on-hold by NAME — five capabilities that existed and were unreachable. These are the
-	// two subjects that close that, and there are two rather than four because a mute and an unmute
-	// differ in one bit of one payload where a bridge and an unbridge differ in their whole shape.
+	SubjectTapSession       = contract.SubjectMediaTapSessionRPC
+	SubjectUntapSession     = contract.SubjectMediaUntapSessionRPC
+	// Two subjects, not four: mute and unmute differ in one bit of one payload, where a bridge and
+	// an unbridge differ in their whole shape.
 	SubjectMuteSession = contract.SubjectMediaMuteSessionRPC
 	SubjectHoldSession = contract.SubjectMediaHoldSessionRPC
-	// The B-leg pair. A leg the engine ORIGINATES has no inbound offer to answer, so these are the two
-	// subjects that let mediad write one and then settle the callee's reply onto it — plans/
-	// sipd-invite-design.md §5.2. create-offer allocates the port pair and emits an offer of exactly
-	// what mediad can serve; accept-answer feeds the callee's answer back and pins the negotiated
-	// codec onto the live session. The rung plans/mediad-design.md §5 deferred with "v1 ANSWERS
-	// offers" arrived here.
+	// The B-leg pair: a leg the engine originates has no inbound offer, so create-offer writes one
+	// and accept-answer settles the callee's reply onto the live session.
 	SubjectCreateOffer  = contract.SubjectMediaCreateOfferRPC
 	SubjectAcceptAnswer = contract.SubjectMediaAcceptAnswerRPC
 )
@@ -99,10 +62,8 @@ const (
 	ReasonInternal     = "internal"
 )
 
-// Sessions is what the control surface needs from the packet path.
-//
-// An interface rather than the concrete *rtp.Manager so the handlers are table-testable against a
-// stub with no sockets in it — the same line sipd's registrar draws with credentials.Store.
+// Sessions is what the control surface needs from the packet path. An interface rather than
+// *rtp.Manager so the handlers are testable against a stub with no sockets in it.
 type Sessions interface {
 	Allocate(opts rtp.AllocateOptions) (rtp.Descriptor, error)
 	Bridge(bridgeID, first, second string) error
@@ -114,49 +75,30 @@ type Sessions interface {
 	StartRecording(sessionID string, opts rtp.RecordingOptions) error
 	StopRecording(recordingRef string) (string, bool)
 	// AudioPayloadType reports the G.711 type a live session answered with, and whether it exists.
-	//
-	// A VALUE and not the *rtp.Session it came from, deliberately: the control surface needs
-	// exactly one fact about the leg — which companding law to decode the clip into, because a
-	// µ-law prompt on an A-law leg is a rasp rather than a wrong-sounding voice — and handing it a
-	// live session would put the packet path's internals inside a NATS callback.
+	// A value rather than the session, so the packet path's internals stay out of a NATS callback.
 	AudioPayloadType(sessionID string) (uint8, bool)
 	// TelephoneEventPayloadType reports the RFC 4733 type a live session answered with. Zero means
 	// the leg negotiated none, which is what `send-dtmf` refuses on rather than synthesising a tone.
 	TelephoneEventPayloadType(sessionID string) (uint8, bool)
-	// SessionTenancy reports the org and call a session was allocated for.
-	//
-	// Values for the same reason as the two above, and needed for one thing: a recording's path is
-	// `<root>/<orgId>/<callId>/<recordingRef>.wav`, which is the engine's own object key, and both
-	// tokens arrived on the allocate rather than on the recording command.
+	// SessionTenancy reports the org and call a session was allocated for; both are needed for a
+	// recording's `<root>/<orgId>/<callId>/<recordingRef>.wav` key.
 	SessionTenancy(sessionID string) (orgID, callID string, ok bool)
 
-	// ApplyDirection re-points a live session's media direction after a re-negotiation. Rung 5.
-	//
-	// This is the SIGNALLING half of hold arriving where design doc §5 says it must: sipd sees the
-	// re-INVITE, the engine decides, and mediad gets a command. The command is a repeat
-	// `allocate-session` carrying the new `direction`, because that is the subject the offer travels
-	// on and the one mediad answers — a separate hold subject would mean one re-INVITE producing two
-	// commands that could disagree about the same call.
+	// ApplyDirection re-points a live session's media direction after a re-negotiation. It arrives
+	// as a repeat allocate-session carrying the new direction, so one re-INVITE produces one command.
 	ApplyDirection(sessionID string, muteIn, muteOut bool) error
 
-	// SettleAnswer re-points a live session's negotiated codec once its callee's SDP answer arrives.
-	//
-	// The packet-path half of `accept-answer`. A B-leg is originated with no offer, so `create-offer`
-	// binds the port on a default codec and this pins the real one — the codec and telephone-event
-	// type the callee actually chose — onto the live session, returning the settled descriptor. An
-	// unknown id is `ErrUnknownSession`, which the handler turns into `unknown_session`.
+	// SettleAnswer pins the codec and telephone-event type a callee chose onto a live B-leg that
+	// create-offer bound on a default. An unknown id is rtp.ErrUnknownSession.
 	SettleAnswer(sessionID string, format audio.Format, audioPT, telephoneEventPT uint8) (rtp.Descriptor, error)
 
-	// Tap joins a supervisor to a conversation on asymmetric terms, and Untap takes it down. Rung 6.
+	// Tap joins a supervisor to a conversation on asymmetric terms; Untap takes it down.
 	Tap(opts rtp.TapOptions) (rtp.TapResult, error)
 	Untap(tapID string) (string, bool)
 
-	// Rung 5's state pair. Mute gates one direction of one leg; Hold takes a leg out of the
-	// conversation in both directions and, usually, gives it something to listen to.
-	//
-	// The two READERS beside them are not decoration. A mute is ADDITIVE, so the state after a
-	// command is not derivable from the command, and a hold STANDS even when its music could not
-	// start — so both replies have to be read back rather than inferred. See rtp.Manager.MuteState.
+	// Mute gates one direction of one leg; Hold takes a leg out of the conversation both ways. The
+	// readers beside them are load-bearing: a mute is additive and a hold stands even when its
+	// music could not start, so neither reply is derivable from the command.
 	Mute(sessionID string, direction rtp.MediaDirection) error
 	Unmute(sessionID string, direction rtp.MediaDirection) error
 	MuteState(sessionID string) (in, out, ok bool)
@@ -164,12 +106,7 @@ type Sessions interface {
 	Unhold(sessionID string) (bool, error)
 	HoldState(sessionID string) (held bool, musicRef string, ok bool)
 
-	// Rung 6's room, reached DIRECTLY rather than as a side effect of a tap.
-	//
-	// `bridge-sessions` used to mean "relay two legs" and now means "put these legs in one
-	// conversation", which is a mix once there are three. Until this the only wire path into a
-	// Conference was `tap-session` converting a two-party bridge, so a conference bridge the engine
-	// asked for was refused by name — the capability existed and only supervision could reach it.
+	// A conference reached directly rather than as a side effect of a tap.
 	JoinConference(conferenceID, sessionID string, opts rtp.JoinOptions) error
 	DestroyConference(conferenceID string) ([]string, bool)
 }
@@ -233,7 +170,11 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	}
 	var ownership *ownershipRouter
 	if opts.Owners != nil {
-		ownership = &ownershipRouter{store: opts.Owners, tracked: make(map[string]map[string]struct{})}
+		ownership = &ownershipRouter{
+			store:    opts.Owners,
+			tracked:  make(map[string]map[string]struct{}),
+			forwards: make(chan struct{}, maxConcurrentForwards),
+		}
 	}
 	return &Server{
 		webRTC:        opts.WebRTC,
@@ -253,11 +194,8 @@ func (s *Server) InstanceID() string { return s.instanceID }
 
 // Subscribe attaches every handler to a connection and returns the subscriptions.
 //
-// Raw `conn.Subscribe`, and a queue group so several mediad instances can share the subjects and
-// NATS picks one — which is what makes the media plane horizontally scalable without a load
-// balancer or a discovery step. Per-instance addressing, which the three commands AFTER allocate
-// need, is the `media-sessions` KV directory rather than a per-instance subject; see
-// internal/directory.
+// The queue group lets several mediad instances share the subjects without a load balancer;
+// per-instance addressing after allocate comes from the media-sessions KV directory.
 func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscription, error) {
 	if conn == nil {
 		return nil, errors.New("control: a NATS connection is required")
@@ -290,17 +228,24 @@ func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscrip
 		subject := handler.subject
 
 		respond := func(msg *nats.Msg) {
-			// A request with no reply subject is a fire-and-forget publish onto an RPC subject.
-			// Answering it is impossible and it is almost always a client bug, so it is logged
-			// rather than silently dropped.
+			// Unanswerable, and almost always a client bug, so log rather than drop silently.
 			if msg.Reply == "" {
 				s.log.Warn("ignoring a request with no reply subject", "subject", subject)
 				return
 			}
 			addressed := msg.Subject != subject
-			if err := msg.Respond(s.routeRequest(conn, subject, msg.Data, handle, addressed)); err != nil {
-				s.log.Error("cannot reply", "subject", subject, "error", err)
+			answer := func(reply []byte) {
+				if err := msg.Respond(reply); err != nil {
+					s.log.Error("cannot reply", "subject", subject, "error", err)
+				}
 			}
+			reply, forward := s.routeRequest(conn, subject, msg.Data, handle, addressed)
+			if forward == nil {
+				answer(reply)
+				return
+			}
+			// Off the dispatcher: see routeRequest.
+			go func() { answer(forward()) }()
 		}
 
 		var (
@@ -313,8 +258,7 @@ func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscrip
 			subscription, err = conn.Subscribe(subject, respond)
 		}
 		if err != nil {
-			// Unwind the ones already attached, so a partial failure does not leave mediad
-			// answering half its command surface — which would look healthy and half-work.
+			// Unwind, so a partial failure cannot leave mediad answering half its command surface.
 			for _, attached := range subscriptions {
 				_ = attached.Unsubscribe()
 			}
@@ -353,19 +297,16 @@ func stringPtr(value string) *string {
 
 func intPtr(value int) *int { return &value }
 
-// dirContext bounds a directory operation. See directory.Timeout for why it is short.
+// dirContext bounds a directory operation.
 func dirContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), directory.Timeout)
 }
 
-// nowMillis is the clock every timestamp on the wire uses. Epoch milliseconds, matching every other
-// KV value on this backbone.
+// nowMillis is epoch milliseconds, the clock every timestamp on this backbone uses.
 func nowMillis() int64 { return time.Now().UnixMilli() }
 
-// sdpSessionIDs derives the `o=` line's session id and version from a session id and a port.
-//
-// Deterministic rather than random so that a re-answer of the same session produces the same origin
-// — some endpoints treat a changed `o=` session id as a whole new session and renegotiate.
+// sdpSessionIDs derives the `o=` line's session id and version. Deterministic, so a re-answer keeps
+// the same origin: some endpoints renegotiate when the `o=` session id changes.
 func sdpSessionIDs(port int) (uint64, uint64) {
 	return uint64(port), 1
 }

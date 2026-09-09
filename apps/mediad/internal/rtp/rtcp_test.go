@@ -12,12 +12,9 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
 
-// RTCP, which design doc §10 question 14 has been carrying as "still bound and unread".
-//
 // The suite drives real RTCP datagrams at the odd port, because a receiver report is a byte layout
-// and the interesting failures are all in the layout: a cumulative loss field read as unsigned
-// reports sixteen million lost packets on a slightly duplicated stream, and an NTP timestamp built
-// without the epoch offset produces a round-trip time seventy years long.
+// and the interesting failures are all in the layout: cumulative loss read as unsigned reports
+// sixteen million lost packets, and an NTP timestamp missing the epoch offset a 70-year RTT.
 
 // rtcpSocket is a far end's RTCP port: it sends receiver reports to a session and reads what the
 // session sends back.
@@ -28,8 +25,7 @@ type rtcpSocket struct {
 
 func newRTCPSocket(t *testing.T, rtpPort int, from *phone) *rtcpSocket {
 	t.Helper()
-	// The far end's RTCP port is its RTP port plus one, which is the pairing RFC 3550 §11 defines and
-	// the one this service sends its own reports to.
+	// RFC 3550 §11 pairing: the RTCP port is the RTP port plus one.
 	local := from.conn.LocalAddr().(*net.UDPAddr)
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: local.Port + 1})
 	if err != nil {
@@ -61,15 +57,12 @@ func receiverReport(aboutSSRC uint32, lossFraction byte, cumulative int32, jitte
 }
 
 func TestArrivalJitterIsMeasuredFromTheRTPStream(t *testing.T) {
-	// The one number that describes the network on the way IN, and it is measured here rather than
-	// reported by anybody: RFC 3550 §6.4.1's J, a smoothed mean deviation between packet spacing at
-	// the sender and at the receiver. A leg whose audio is suppressed still has a network under it,
-	// so it is folded in for every accepted packet whether or not the leg is bridged.
+	// RFC 3550 §6.4.1's J, measured here rather than reported: a smoothed mean deviation between
+	// sender and receiver packet spacing, folded in for every accepted packet.
 	rig := newBridgeRig(t, 61000, 61019)
 
 	session, _ := rig.manager.Get(rig.aID)
-	// Packets whose sender spacing is 20 ms but whose arrival spacing is not: the definition of
-	// jitter, produced deliberately.
+	// Sender spacing of 20 ms with a different arrival spacing: jitter, produced deliberately.
 	for sequence := 1; sequence <= 12; sequence++ {
 		rig.aPhone.send(t, pionrtp.Packet{
 			Header: pionrtp.Header{
@@ -88,10 +81,8 @@ func TestArrivalJitterIsMeasuredFromTheRTPStream(t *testing.T) {
 }
 
 func TestReceiverReportsAreFoldedIntoTheLegsQuality(t *testing.T) {
-	// What the far end thinks of the stream we send IT, which is the other half of the picture and is
-	// unobtainable from RTP alone. A leg with clean inbound jitter and 20% reported loss is a leg
-	// whose user can hear us and cannot be heard — a completely different fault from the reverse, and
-	// indistinguishable without both numbers.
+	// What the far end thinks of the stream we send it, which RTP alone cannot say: clean inbound
+	// jitter with 20% reported loss is a user who can hear us and cannot be heard.
 	rig := newBridgeRig(t, 61040, 61059)
 	rig.latch(t)
 
@@ -121,9 +112,8 @@ func TestReceiverReportsAreFoldedIntoTheLegsQuality(t *testing.T) {
 }
 
 func TestNegativeCumulativeLossIsSignExtended(t *testing.T) {
-	// The cumulative loss field is 24-bit SIGNED, and it really does go negative on a network with a
-	// retransmitting middlebox where duplicates outnumber losses. Read as unsigned it reports sixteen
-	// million lost packets, which is the sort of number that gets a working call declared broken.
+	// The cumulative loss field is 24-bit signed and really does go negative where duplicates
+	// outnumber losses; read as unsigned it reports sixteen million lost packets.
 	rig := newBridgeRig(t, 61080, 61099)
 	rig.latch(t)
 
@@ -144,9 +134,8 @@ func TestNegativeCumulativeLossIsSignExtended(t *testing.T) {
 }
 
 func TestReportBlocksAboutAnotherStreamAreIgnored(t *testing.T) {
-	// A report block names the SSRC it is about. Folding in a block about somebody else's stream would
-	// attribute a stranger's loss to this call — which really happens, because an RTCP port on the
-	// internet receives whatever is sent to it.
+	// A report block names the SSRC it is about; an RTCP port on the internet receives whatever is
+	// sent to it, and a stranger's loss must not be attributed to this call.
 	rig := newBridgeRig(t, 61120, 61139)
 	rig.latch(t)
 
@@ -157,8 +146,7 @@ func TestReportBlocksAboutAnotherStreamAreIgnored(t *testing.T) {
 		receiverReport(session.SSRC^0xFFFF, 128, 9999, 8000, 0, 0), socket.session); err != nil {
 		t.Fatalf("sending a receiver report: %v", err)
 	}
-	// Then one that IS about us, so the test has something to wait for that proves the first was seen
-	// and discarded rather than merely not yet arrived.
+	// Then one that is about us, proving the first was seen and discarded rather than not arrived.
 	if _, err := socket.conn.WriteToUDP(
 		receiverReport(session.SSRC, 0, 1, 0, 0, 0), socket.session); err != nil {
 		t.Fatalf("sending a receiver report: %v", err)
@@ -173,9 +161,7 @@ func TestReportBlocksAboutAnotherStreamAreIgnored(t *testing.T) {
 }
 
 func TestMalformedRTCPIsCountedRatherThanLogged(t *testing.T) {
-	// An RTCP port is an open UDP socket on the internet and anything at all can be sent to it.
-	// Logging per datagram would turn a trivial flood into a disk-fill, which is the same argument
-	// the RTP path's `Malformed` counter makes.
+	// An RTCP port is an open UDP socket: logging per datagram would turn a flood into a disk-fill.
 	rig := newBridgeRig(t, 61160, 61179)
 	rig.latch(t)
 
@@ -200,9 +186,8 @@ func TestMalformedRTCPIsCountedRatherThanLogged(t *testing.T) {
 }
 
 func TestSendCountersMoveWithEveryOutboundPath(t *testing.T) {
-	// A sender report's octet count has to agree with the stream, or every far end's loss estimate is
-	// wrong. That is why one function owns the counters and every send path calls it — relay,
-	// playback, digit generation and the mixer — rather than each incrementing a field.
+	// A sender report's octet count must agree with the stream, which is why one function owns the
+	// counters and every send path — relay, playback, digits, mixer — calls it.
 	rig := newBridgeRig(t, 61200, 61219)
 	rig.latch(t)
 	if err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID); err != nil {

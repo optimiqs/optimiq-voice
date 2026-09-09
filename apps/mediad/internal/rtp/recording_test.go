@@ -14,9 +14,8 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
 
-// The recording suite drives real sockets and a hand-driven clock, and asserts on the FILE. A
-// recording is only ever judged by somebody playing it back, so a test that stopped at "the
-// recorder was told about a frame" would stay green with the header unpatched or the mix silent.
+// The recording suite drives real sockets and a hand-driven clock, and asserts on the file: a test
+// that stopped at "the recorder was told about a frame" would stay green with the header unpatched.
 
 // recordingRig is a playback rig plus a temporary recordings root.
 type recordingRig struct {
@@ -84,8 +83,7 @@ func readSamples(t *testing.T, path string) []int16 {
 }
 
 func TestRecordingWritesTheReceivedDirectionAsAPlayableWAV(t *testing.T) {
-	// `receive` is what a voicemail wants: the message should hold the caller, not the greeting that
-	// was played at them.
+	// `receive` is what a voicemail wants: the caller, not the greeting played at them.
 	rig := newRecordingRig(t, 57600, 57619)
 	rig.latch(t)
 	rig.start(t, "rec-1", rtp.RecordReceive, rtp.RecordingOptions{})
@@ -112,8 +110,7 @@ func TestRecordingWritesTheReceivedDirectionAsAPlayableWAV(t *testing.T) {
 	if summary.DurationMs <= 0 {
 		t.Errorf("durationMs = %d, want the wall-clock length of what was written", summary.DurationMs)
 	}
-	// The byte count is the whole reason this event exists next to `channel.record.stopped`, which
-	// the engine has never been able to fill: it does not hold the file.
+	// The byte count is what the engine cannot fill itself: it does not hold the file.
 	if want := int64(summary.DurationMs*audio.SampleRate/1000*2 + 44); summary.Bytes != want {
 		t.Errorf("bytes = %d, want %d (header plus PCM16 at 8 kHz)", summary.Bytes, want)
 	}
@@ -129,13 +126,12 @@ func TestRecordingWritesTheReceivedDirectionAsAPlayableWAV(t *testing.T) {
 }
 
 func TestRecordingWritesSilenceForADirectionThatSaysNothing(t *testing.T) {
-	// The recorder ticks rather than writing on arrival, so a party who is not speaking is
-	// represented by the right amount of nothing. Otherwise every word after a pause arrives early.
+	// The recorder ticks rather than writing on arrival, or every word after a pause arrives early.
 	rig := newRecordingRig(t, 57620, 57639)
 	rig.latch(t)
 	rig.start(t, "rec-2", rtp.RecordReceive, rtp.RecordingOptions{})
 
-	for index := 0; index < 5; index++ {
+	for range 5 {
 		rig.tick(t)
 	}
 	rig.manager.StopRecording("rec-2")
@@ -155,8 +151,7 @@ func TestRecordingWritesSilenceForADirectionThatSaysNothing(t *testing.T) {
 }
 
 func TestRecordingBothDirectionsSumsThemIntoOneStream(t *testing.T) {
-	// The snoop replacement. A session already IS both directions — what it receives is the far
-	// party, what it sends is everything the far party was told — so a tap needs no second channel.
+	// A session already is both directions, so recording needs no snoop channel.
 	rig := newRecordingRig(t, 57640, 57659)
 	rig.latch(t)
 	if err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID); err != nil {
@@ -164,7 +159,7 @@ func TestRecordingBothDirectionsSumsThemIntoOneStream(t *testing.T) {
 	}
 	rig.start(t, "rec-3", rtp.RecordBoth, rtp.RecordingOptions{})
 
-	// Leg A speaks (the receive half) and leg B speaks (which the relay writes OUT of leg A, the
+	// Leg A speaks (the receive half) and leg B speaks, which the relay writes out of leg A (the
 	// send half). Both must land in one file.
 	rig.speak(t, 0x10)
 	peerFrame := make([]byte, audio.FrameSamples)
@@ -204,13 +199,12 @@ func TestRecordingBothDirectionsSumsThemIntoOneStream(t *testing.T) {
 }
 
 func TestRecordingStopsItselfOnContinuousSilence(t *testing.T) {
-	// The NORMAL end of a voicemail: the caller stopped talking. Without it a message runs to the
-	// duration limit on every call.
+	// The normal end of a voicemail: without it a message runs to the duration limit every call.
 	rig := newRecordingRig(t, 57660, 57679)
 	rig.latch(t)
 	rig.start(t, "rec-4", rtp.RecordReceive, rtp.RecordingOptions{MaxSilence: 60 * time.Millisecond})
 
-	for index := 0; index < 3; index++ {
+	for range 3 {
 		rig.tick(t)
 	}
 	summary := rig.finishedSummary(t)
@@ -237,8 +231,8 @@ func TestRecordingStopsItselfAtTheDurationLimit(t *testing.T) {
 }
 
 func TestRecordingFinalisesWhenTheSessionEndsUnderIt(t *testing.T) {
-	// A caller who hangs up mid-message must leave a PLAYABLE message, not a partial nobody can
-	// open. And the announcement has to arrive before the leg is torn down, or nothing archives it.
+	// A caller who hangs up mid-message must leave a playable file, and the announcement must arrive
+	// before the leg is torn down or nothing archives it.
 	rig := newRecordingRig(t, 57700, 57719)
 	rig.latch(t)
 	rig.start(t, "rec-6", rtp.RecordReceive, rtp.RecordingOptions{})
@@ -266,16 +260,15 @@ func TestRecordingFinalisesWhenTheSessionEndsUnderIt(t *testing.T) {
 		t.Error("a partial file survived the teardown")
 	}
 
-	// The ordering is the contract: the engine tears the leg down on `session.ended`, so a
-	// `recording.finished` published after it would arrive to a consumer that has already moved on.
+	// The engine tears the leg down on `session.ended`, so a `recording.finished` published after it
+	// would reach a consumer that has already moved on.
 	if got := len(rig.lifecycle.endedReasons()); got != 1 {
 		t.Fatalf("session.ended announcements = %d, want 1", got)
 	}
 }
 
 func TestRecordingIsAnnouncedExactlyOnce(t *testing.T) {
-	// Two paths reach a finished recording — the manager's watcher and a session teardown that had
-	// to wait for it — and two announcements would file two rows for one file.
+	// Two paths reach a finished recording, and two announcements would file two rows for one file.
 	rig := newRecordingRig(t, 57720, 57739)
 	rig.latch(t)
 	rig.start(t, "rec-7", rtp.RecordReceive, rtp.RecordingOptions{})
@@ -292,9 +285,8 @@ func TestRecordingIsAnnouncedExactlyOnce(t *testing.T) {
 }
 
 func TestRecordingRefusesASecondRecordingOnOneSession(t *testing.T) {
-	// The opposite of the playback rule, and for the opposite reason: superseding a prompt loses
-	// audio nobody will miss, while superseding a recording throws away a file somebody is waiting
-	// on.
+	// The opposite of the playback rule: superseding a recording throws away a file somebody is
+	// waiting on.
 	rig := newRecordingRig(t, 57740, 57759)
 	rig.latch(t)
 	rig.start(t, "rec-8", rtp.RecordReceive, rtp.RecordingOptions{})
@@ -327,8 +319,8 @@ func TestStopRecordingIsFencedByReference(t *testing.T) {
 }
 
 func TestStopRecordingOfAFinishedRecordingIsASuccess(t *testing.T) {
-	// The common case rather than an edge one: a recording that hit its duration limit has already
-	// finalised itself by the time the engine's teardown gets around to stopping it.
+	// The common case: a recording that hit its duration limit has already finalised itself by the
+	// time the teardown stops it.
 	rig := newRecordingRig(t, 57780, 57799)
 	rig.latch(t)
 
@@ -350,8 +342,7 @@ func TestRecordingRefusesAnUnknownSession(t *testing.T) {
 }
 
 func TestRecordingExcludesTelephoneEventPacketsFromTheAudio(t *testing.T) {
-	// A digit is not audio, and decoding a four-byte telephone-event payload as G.711 writes four
-	// samples of noise into the middle of a recording.
+	// Decoding a four-byte telephone-event payload as G.711 would write noise into the recording.
 	rig := newRecordingRig(t, 57820, 57839)
 	rig.latch(t)
 	rig.start(t, "rec-11", rtp.RecordReceive, rtp.RecordingOptions{})

@@ -1,10 +1,13 @@
 package control
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -14,13 +17,26 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/directory"
 )
 
-// ownershipRouter keeps raw media RPCs on the node that owns their sockets. Only initial call
-// placement uses a queue group. Subsequent requests are forwarded once to an addressed node.
+// RoutingTimeout bounds one ownership lookup plus, when the resource lives elsewhere, the forwarded
+// request. Matched to the engine's ENGINE_MEDIAD_RPC_TIMEOUT_MS default so mediad never waits for a
+// reply its caller has already abandoned.
+const RoutingTimeout = 500 * time.Millisecond
+
+// ownershipRouter keeps media RPCs on the node that owns their sockets. Only initial call placement
+// uses the queue group; later requests are forwarded once to an addressed node.
 type ownershipRouter struct {
 	store   directory.Owners
 	mu      sync.Mutex
 	tracked map[string]map[string]struct{}
+	// forwards bounds the requests being relayed to other instances at once. A forward waits on a
+	// neighbour for up to RoutingTimeout, and it runs off the subscription's dispatcher goroutine
+	// so that one wedged neighbour cannot hold up every other request on the same subject.
+	forwards chan struct{}
 }
+
+// maxConcurrentForwards is the ceiling on relayed requests. Past it a request is refused as
+// wrong_instance rather than queued: the engine's own deadline is one RoutingTimeout away.
+const maxConcurrentForwards = 64
 
 type resourceRequest struct {
 	SessionID       string   `json:"sessionId"`
@@ -41,7 +57,7 @@ func mediaInstanceSubject(subject, instance string) string {
 }
 
 func (r resourceRequest) sessions() []string {
-	ids := append([]string{}, r.SessionIDs...)
+	ids := slices.Clone(r.SessionIDs)
 	for _, id := range []string{r.SessionID, r.TargetSessionID, r.TapSessionID} {
 		if id != "" {
 			ids = append(ids, id)
@@ -62,36 +78,54 @@ func (r resourceRequest) resourceKey() string {
 	return ""
 }
 
-func (s *Server) routeRequest(conn *nats.Conn, subject string, data []byte, handle func([]byte) []byte, addressed bool) []byte {
+// routeRequest answers a request, or returns a forward to be run off the caller's goroutine.
+//
+// Exactly one of the two results is set. A forward blocks on a neighbour for up to RoutingTimeout,
+// and the caller is a NATS subscription dispatcher that serialises every other request on the same
+// subject behind it, so relaying inline made one unreachable neighbour stall a whole subject.
+func (s *Server) routeRequest(conn *nats.Conn, subject string, data []byte, handle func([]byte) []byte, addressed bool) (reply []byte, forward func() []byte) {
 	if s.ownership == nil {
-		return handle(data)
+		return handle(data), nil
 	}
 	var request resourceRequest
 	if json.Unmarshal(data, &request) != nil {
-		return handle(data)
+		return handle(data), nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+	// Bounded by the engine's own RPC budget: past it the reply lands on a caller that has given
+	// up, while the NATS callback goroutine issuing it stays parked.
+	ctx, cancel := context.WithTimeout(context.Background(), RoutingTimeout)
 	owner, keys, err := s.requestOwner(ctx, subject, request)
 	if err != nil {
-		// A KV failure, which really is this node's problem. Kept as `internal`.
-		return s.routingFailure(request, ReasonInternal, err)
+		cancel()
+		return s.routingFailure(request, ReasonInternal, err), nil
 	}
 	if owner != "" && owner != s.instanceID {
 		if addressed {
+			cancel()
 			return s.routingFailure(request, ReasonWrongNode,
-				errors.New("addressed media owner no longer owns the resource"))
+				errors.New("addressed media owner no longer owns the resource")), nil
 		}
-		reply, err := conn.RequestWithContext(ctx, mediaInstanceSubject(subject, owner), data)
-		if err != nil {
-			// `wrong_instance`, not `internal`: the session is alive on a NAMED neighbour, and that is
-			// the code the engine branches on to address it there. `internal` invited a retry on this
-			// node that would fail identically.
+		select {
+		case s.ownership.forwards <- struct{}{}:
+		default:
+			cancel()
 			return s.routingFailure(request, ReasonWrongNode,
-				errors.New("owning media instance is unavailable"))
+				errors.New("too many media requests are already being relayed")), nil
 		}
-		return reply.Data
+		return nil, func() []byte {
+			defer cancel()
+			defer func() { <-s.ownership.forwards }()
+			relayed, err := conn.RequestWithContext(ctx, mediaInstanceSubject(subject, owner), data)
+			if err != nil {
+				// wrong_instance, not internal: the session is alive on a named neighbour, which is
+				// the code the engine branches on to re-address it there.
+				return s.routingFailure(request, ReasonWrongNode,
+					errors.New("owning media instance is unavailable"))
+			}
+			return relayed.Data
+		}
 	}
+	defer cancel()
 	result := handle(data)
 	var response struct {
 		Ok bool `json:"ok"`
@@ -108,7 +142,7 @@ func (s *Server) routeRequest(conn *nats.Conn, subject string, data []byte, hand
 		}
 		s.ownership.mu.Unlock()
 	}
-	return result
+	return result, nil
 }
 
 func (s *Server) requestOwner(ctx context.Context, subject string, request resourceRequest) (string, []string, error) {
@@ -128,10 +162,6 @@ func (s *Server) requestOwner(ctx context.Context, subject string, request resou
 	for _, id := range request.sessions() {
 		key := directory.OwnerKey("session", id)
 		if s.ownsLocally(key, id) {
-			// Answered from memory. Ownership is immutable once claimed, so a key this instance has
-			// already claimed FOR A SESSION IT STILL HAS is a broker round trip with a known answer
-			// — and this runs on `bridge-sessions` and `start-playback`, which have a 500 ms budget
-			// that two or three of those round trips were eating into.
 			keys = append(keys, key)
 			if err := setOwner(s.instanceID); err != nil {
 				return "", nil, err
@@ -143,7 +173,7 @@ func (s *Server) requestOwner(ctx context.Context, subject string, request resou
 			return "", nil, err
 		}
 		if found == "" {
-			// Existing sessions from before ownership routing was enabled remain addressable.
+			// Sessions predating ownership routing have no owner key; the directory still locates them.
 			entry, exists, err := s.dir.Get(ctx, id)
 			if err != nil {
 				return "", nil, err
@@ -160,11 +190,7 @@ func (s *Server) requestOwner(ctx context.Context, subject string, request resou
 	allocate := subject == SubjectAllocateSession || subject == SubjectCreateOffer
 	if allocate && request.OrgID != "" && request.CallID != "" && request.SessionID != "" {
 		key := directory.OwnerKey("call", request.OrgID+"\x00"+request.CallID)
-		candidate := owner
-		if candidate == "" {
-			candidate = s.instanceID
-		}
-		found, err := store.Claim(ctx, key, candidate)
+		found, err := store.Claim(ctx, key, cmp.Or(owner, s.instanceID))
 		if err != nil {
 			return "", nil, err
 		}
@@ -202,12 +228,9 @@ func (s *Server) requestOwner(ctx context.Context, subject string, request resou
 	return owner, keys, nil
 }
 
-// owns reports whether this instance has already claimed key for a session it still holds.
-//
-// BOTH halves are load-bearing. The tracked map alone goes stale — it is pruned once a minute — and
-// answering from it for a session that has since been released would route the command here to be
-// refused as unknown rather than to the instance that has it. The live-session check alone is not
-// enough either: a session can be live here without this instance having won the claim.
+// ownsLocally reports whether this instance has claimed key AND still holds sessionID. Both halves
+// are required: the tracked map is only pruned once a minute, and a session can be live here
+// without this instance having won the claim.
 func (s *Server) ownsLocally(key, sessionID string) bool {
 	if sessionID == "" {
 		return false
@@ -222,8 +245,10 @@ func (s *Server) ownsLocally(key, sessionID string) bool {
 	return live
 }
 
+// routingFailure carries every media response's identity fields so callers parse it as a normal refusal.
+// The sessionIds copy stays an append onto an empty slice, not slices.Clone: a nil clone would
+// marshal as null where every other refusal sends [].
 func (s *Server) routingFailure(request resourceRequest, reason string, err error) []byte {
-	// Match every media response's identity fields; callers retain their normal refusal parsing.
 	return encode(s.log, map[string]any{
 		"ok": false, "reason": reason, "error": fmt.Sprint(err), "instanceId": s.instanceID,
 		"sessionId": request.SessionID, "sessionIds": append([]string{}, request.SessionIDs...), "bridgeId": request.BridgeID,
@@ -232,8 +257,8 @@ func (s *Server) routingFailure(request resourceRequest, reason string, err erro
 	})
 }
 
-// RenewOwnership keeps long calls addressable. Only keys attached to a live local RTP session
-// are renewed; completed and failed operations age out, including after an instance crash.
+// RenewOwnership keeps long calls addressable, renewing only keys attached to a live local RTP
+// session so completed operations and crashed instances age out. Runs until ctx is done.
 func (s *Server) RenewOwnership(ctx context.Context) {
 	if s.ownership == nil {
 		return
@@ -248,11 +273,10 @@ func (s *Server) RenewOwnership(ctx context.Context) {
 			s.ownership.mu.Lock()
 			keys := make([]string, 0, len(s.ownership.tracked))
 			for key, sessions := range s.ownership.tracked {
-				for id := range sessions {
-					if _, _, exists := s.sessions.SessionTenancy(id); !exists {
-						delete(sessions, id)
-					}
-				}
+				maps.DeleteFunc(sessions, func(id string, _ struct{}) bool {
+					_, _, exists := s.sessions.SessionTenancy(id)
+					return !exists
+				})
 				if len(sessions) == 0 {
 					delete(s.ownership.tracked, key)
 				} else {

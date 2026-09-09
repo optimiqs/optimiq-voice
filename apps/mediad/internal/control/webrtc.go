@@ -66,10 +66,9 @@ func (s *Server) allocateWebRTC(request contract.MediaAllocateSessionRequest) []
 	if err != nil {
 		return s.refuseAllocate(request.SessionID, ReasonInternal, err.Error())
 	}
-	// One release for EVERY failure below, not just the first. Answer's path released and the three
-	// after it did not, so a WebRTC allocate that failed late left the port pair, its two goroutines
-	// and a Pion PeerConnection behind on each attempt — and a leg answered `inactive` or `recvonly`
-	// is not something the idle reaper can be relied on to collect quickly.
+	// One release for EVERY failure below, not just the first: a WebRTC allocate that failed late
+	// otherwise leaks the port pair, its two goroutines and a Pion PeerConnection on each attempt, and
+	// a leg answered `inactive` or `recvonly` is not one the idle reaper collects quickly.
 	failed := true
 	defer func() {
 		if failed && created {

@@ -9,19 +9,18 @@ import (
 
 	pionrtp "github.com/pion/rtp"
 
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
 
-// readTimeout bounds every socket read in this suite. Generous, because it only ever elapses on a
-// genuine failure — on loopback a packet takes microseconds.
+// readTimeout bounds every socket read in this suite; on loopback it elapses only on a real failure.
 const readTimeout = 2 * time.Second
 
 // newRunningSession allocates a pair, starts a session over it, and tears both down at test end.
 func newRunningSession(t *testing.T, mode rtp.Mode) *rtp.Session {
 	t.Helper()
 
-	// A per-test range keeps parallel packages from fighting over ports; the allocator skips what
-	// it cannot bind, so an overlap costs a retry rather than a failure.
+	// A per-test port range keeps parallel packages from fighting over ports.
 	allocator, err := rtp.NewAllocator(loopback, 53000, 53099)
 	if err != nil {
 		t.Fatalf("NewAllocator: %v", err)
@@ -35,8 +34,7 @@ func newRunningSession(t *testing.T, mode rtp.Mode) *rtp.Session {
 		ID:    "session-under-test",
 		Ports: pair,
 		Mode:  mode,
-		// PCMU plus the de-facto RFC 4733 type: what a real answer to a real phone settles on, and
-		// what the packets these tests send are stamped with.
+		// PCMU plus the de-facto RFC 4733 type, which is what the packets below are stamped with.
 		AudioPayloadType:          rtp.PayloadTypePCMU,
 		TelephoneEventPayloadType: rtp.PayloadTypeTelephoneEvent,
 	})
@@ -64,8 +62,7 @@ func newRunningSession(t *testing.T, mode rtp.Mode) *rtp.Session {
 	return session
 }
 
-// newFarEnd is a UDP socket standing in for a phone: it sends to the session and reads what comes
-// back.
+// newFarEnd is a UDP socket standing in for a phone: it sends to the session and reads the reply.
 func newFarEnd(t *testing.T, session *rtp.Session) *net.UDPConn {
 	t.Helper()
 	conn, err := net.DialUDP("udp",
@@ -123,12 +120,8 @@ func readPacket(t *testing.T, conn *net.UDPConn) (*pionrtp.Packet, bool) {
 	return &packet, true
 }
 
-// expectNoPacket asserts nothing comes back, with a SHORT deadline.
-//
-// Short is correct here rather than merely fast: every caller first waits on the counter that
-// proves the packet was processed, so an echo — if the session were going to send one — has
-// already been written by the time this runs. Reusing readTimeout would add two seconds per
-// negative assertion to prove something that is already decided.
+// expectNoPacket asserts nothing comes back. The short deadline is sound because every caller first
+// waits on the counter proving the packet was processed, so any echo would already be written.
 func expectNoPacket(t *testing.T, conn *net.UDPConn, why string) {
 	t.Helper()
 	if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
@@ -154,7 +147,6 @@ func waitFor(t *testing.T, what string, probe func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-// The core proof of the packet path: RTP goes in, RTP comes back.
 func TestSessionEchoesG711(t *testing.T) {
 	session := newRunningSession(t, rtp.ModeEcho)
 	farEnd := newFarEnd(t, session)
@@ -174,7 +166,7 @@ func TestSessionEchoesG711(t *testing.T) {
 		t.Fatal("no packet came back; the echo path is broken")
 	}
 
-	// The payload is passed through byte for byte — v1 is G.711 passthrough with no transcoding.
+	// G.711 is passed through byte for byte.
 	original := sent[12:]
 	if string(echoed.Payload) != string(original) {
 		t.Errorf("the echoed payload differs from the one sent (%d vs %d bytes)",
@@ -183,24 +175,25 @@ func TestSessionEchoesG711(t *testing.T) {
 	if echoed.PayloadType != rtp.PayloadTypePCMU {
 		t.Errorf("echoed payload type = %d, want %d", echoed.PayloadType, rtp.PayloadTypePCMU)
 	}
-	// Our own SSRC, not the sender's: a stream carrying the far end's own SSRC back to it is what
-	// endpoint loop detection discards.
+	// Our own SSRC: endpoint loop detection discards a stream carrying the far end's own SSRC back.
 	if echoed.SSRC == farSSRC {
 		t.Error("the echo reused the sender's SSRC; endpoints discard that as their own loop")
 	}
 	if echoed.SSRC != session.SSRC {
 		t.Errorf("echoed SSRC = %#x, want the session's %#x", echoed.SSRC, session.SSRC)
 	}
-	// Our own sequence space, for the same reason.
 	if echoed.SequenceNumber == seq {
 		t.Error("the echo reused the sender's sequence number; two streams must not share one " +
 			"sequence space or a jitter buffer cannot untangle them")
 	}
-	// The timestamp is the frame's sampling instant and genuinely is the one it arrived with.
 	if echoed.Timestamp != timestamp {
 		t.Errorf("echoed timestamp = %d, want the original %d", echoed.Timestamp, timestamp)
 	}
 
+	// The send counter moves after the socket write returns, so wait rather than race the read above.
+	waitFor(t, "the send counter to catch up with the echoed packet", func() bool {
+		return session.Stats().PacketsSent == 1
+	})
 	stats := session.Stats()
 	if stats.PacketsReceived != 1 || stats.PacketsSent != 1 {
 		t.Errorf("stats = %+v, want 1 received and 1 sent", stats)
@@ -210,14 +203,13 @@ func TestSessionEchoesG711(t *testing.T) {
 	}
 }
 
-// Sequence numbers must advance monotonically across a stream, not repeat the sender's.
 func TestSessionUsesItsOwnMonotonicSequenceNumbers(t *testing.T) {
 	session := newRunningSession(t, rtp.ModeEcho)
 	farEnd := newFarEnd(t, session)
 
 	var previous uint16
-	for i := 0; i < 5; i++ {
-		// The far end's own numbers deliberately jump around; ours must not follow.
+	for i := range 5 {
+		// The far end's numbers deliberately jump around; ours must not follow.
 		if _, err := farEnd.Write(g711Packet(uint16(9000-i*7), uint32(i*160), 0x55667788)); err != nil {
 			t.Fatalf("sending RTP #%d: %v", i, err)
 		}
@@ -232,8 +224,7 @@ func TestSessionUsesItsOwnMonotonicSequenceNumbers(t *testing.T) {
 	}
 }
 
-// RFC 4733 DTMF must survive with its marker bit, which is the start-of-digit flag: dropping it
-// makes every keypress undetectable.
+// The RFC 4733 marker bit is the start-of-digit flag; dropping it makes keypresses undetectable.
 func TestSessionEchoesTelephoneEventsWithTheMarkerBit(t *testing.T) {
 	session := newRunningSession(t, rtp.ModeEcho)
 	farEnd := newFarEnd(t, session)
@@ -270,13 +261,11 @@ func TestSessionEchoesTelephoneEventsWithTheMarkerBit(t *testing.T) {
 	}
 }
 
-// v1 is G.711 passthrough. A payload type SDP should never have negotiated is counted and dropped,
-// not reflected.
 func TestSessionDropsUnsupportedPayloadTypes(t *testing.T) {
 	session := newRunningSession(t, rtp.ModeEcho)
 	farEnd := newFarEnd(t, session)
 
-	// PT 9 is G.722 — a real codec, and one v1 deliberately does not handle.
+	// PT 9 is G.722: a real codec this session was not negotiated for.
 	if _, err := farEnd.Write(packetWithPayload(9, 1, 160, 0xdeadbeef, make([]byte, 160))); err != nil {
 		t.Fatalf("sending: %v", err)
 	}
@@ -285,7 +274,7 @@ func TestSessionDropsUnsupportedPayloadTypes(t *testing.T) {
 		return session.Stats().UnsupportedPT == 1
 	})
 	expectNoPacket(t, farEnd, "an unsupported payload type was echoed; it must be dropped")
-	// It still counts as received: it arrived, it was parsed, and the session is not idle.
+	// It still counts as received: it arrived and parsed, so the session is not idle.
 	if got := session.Stats().PacketsReceived; got != 1 {
 		t.Errorf("PacketsReceived = %d, want 1", got)
 	}
@@ -294,8 +283,7 @@ func TestSessionDropsUnsupportedPayloadTypes(t *testing.T) {
 	}
 }
 
-// A media port is an open UDP socket; anything at all can be sent to it. Garbage must be counted,
-// never logged per packet and never crash the read loop.
+// A media port is an open UDP socket, so anything can be sent to it; garbage must not stop the loop.
 func TestSessionCountsMalformedPacketsAndKeepsRunning(t *testing.T) {
 	session := newRunningSession(t, rtp.ModeEcho)
 	farEnd := newFarEnd(t, session)
@@ -307,7 +295,6 @@ func TestSessionCountsMalformedPacketsAndKeepsRunning(t *testing.T) {
 		return session.Stats().Malformed == 1
 	})
 
-	// The loop must still be alive.
 	if _, err := farEnd.Write(g711Packet(1, 160, 0x01020304)); err != nil {
 		t.Fatalf("sending RTP after garbage: %v", err)
 	}
@@ -319,8 +306,8 @@ func TestSessionCountsMalformedPacketsAndKeepsRunning(t *testing.T) {
 	}
 }
 
-// Symmetric RTP (RFC 4961): the far end is LEARNED from the packets, because behind NAT the
-// address that works is the one the NAT rewrote, not the one in the SDP.
+// Symmetric RTP (RFC 4961): the far end is learned from the packets, because behind NAT the address
+// that works is the NAT-rewritten one rather than the one in the SDP.
 func TestSessionLatchesToTheFirstSource(t *testing.T) {
 	session := newRunningSession(t, rtp.ModeEcho)
 
@@ -346,8 +333,7 @@ func TestSessionLatchesToTheFirstSource(t *testing.T) {
 	}
 }
 
-// The latch is frozen after the first packet. Otherwise anyone who can guess a port takes over the
-// call by spraying a single packet at it.
+// The latch freezes after the first packet; otherwise guessing a port hijacks the call.
 func TestSessionRefusesPacketsFromAnotherSourceOnceLatched(t *testing.T) {
 	session := newRunningSession(t, rtp.ModeEcho)
 
@@ -369,7 +355,6 @@ func TestSessionRefusesPacketsFromAnotherSourceOnceLatched(t *testing.T) {
 	})
 	expectNoPacket(t, attacker,
 		"the session answered a second source; that is call hijacking by one UDP packet")
-	// The latch must be unchanged and the legitimate stream unaffected.
 	if session.Remote().Port != legitimate.LocalAddr().(*net.UDPAddr).Port {
 		t.Error("the attacker's packet moved the latch")
 	}
@@ -381,7 +366,6 @@ func TestSessionRefusesPacketsFromAnotherSourceOnceLatched(t *testing.T) {
 	}
 }
 
-// An inactive session receives and discards. It is what a ringing-but-unanswered leg should be in.
 func TestInactiveSessionReceivesButNeverSends(t *testing.T) {
 	session := newRunningSession(t, rtp.ModeInactive)
 	farEnd := newFarEnd(t, session)
@@ -398,12 +382,8 @@ func TestInactiveSessionReceivesButNeverSends(t *testing.T) {
 	}
 }
 
-// The wire no longer carries a mode at all.
-//
-// v0 let a caller ask for "echo" or "inactive" by name. v1 does not: the mode is DERIVED from the
-// SDP direction the engine asked for and from whether the diagnostic flag is on, because a media
-// mode is an outcome of negotiation rather than an input to it. This test pins the default so that
-// a session created without one relays rather than doing something surprising.
+// The mode is derived from the negotiated SDP direction, never requested over the wire; a session
+// created without one must relay.
 func TestSessionDefaultsToRelay(t *testing.T) {
 	allocator, err := rtp.NewAllocator(loopback, 54100, 54109)
 	if err != nil {
@@ -422,10 +402,59 @@ func TestSessionDefaultsToRelay(t *testing.T) {
 	if session.Mode() != rtp.ModeRelay {
 		t.Errorf("Mode = %q, want %q", session.Mode(), rtp.ModeRelay)
 	}
-	// A relay with no peer is silent, which is what a leg that has answered but is not yet talking
-	// to anybody must be.
+	// A relay with no peer is silent: an answered leg not yet bridged to anybody.
 	if session.Peer() != nil {
 		t.Error("a fresh session already has a peer")
+	}
+}
+
+// FormatDefault is audio.FormatULaw, so NewSession cannot tell "Format unset" from "Format
+// explicitly µ-law". For the static payload types the NUMBER decides, which is the documented rule
+// on FormatDefault: the payload type is what goes on the wire.
+func TestTheStaticPayloadTypeDecidesTheFormat(t *testing.T) {
+	allocator, err := rtp.NewAllocator(loopback, 54200, 54219)
+	if err != nil {
+		t.Fatalf("NewAllocator: %v", err)
+	}
+
+	cases := []struct {
+		name        string
+		format      audio.Format
+		payloadType uint8
+		want        audio.Format
+	}{
+		{"unset format, PCMU", rtp.FormatDefault, rtp.PayloadTypePCMU, audio.FormatULaw},
+		{"unset format, PCMA", rtp.FormatDefault, rtp.PayloadTypePCMA, audio.FormatALaw},
+		{"unset format, G722", rtp.FormatDefault, rtp.PayloadTypeG722, audio.FormatG722},
+		// An explicit µ-law is the zero value, so the number still wins.
+		{"explicit u-law loses to PCMA", audio.FormatULaw, rtp.PayloadTypePCMA, audio.FormatALaw},
+		// A format the zero value can express is honoured whatever the number says.
+		{"explicit G722 survives PCMU", audio.FormatG722, rtp.PayloadTypePCMU, audio.FormatG722},
+		// Opus is dynamic: no number resolves to it, so it must be named and is kept.
+		{"opus is named, not numbered", audio.FormatOpus, 111, audio.FormatOpus},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pair, err := allocator.Allocate()
+			if err != nil {
+				t.Fatalf("Allocate: %v", err)
+			}
+			t.Cleanup(func() { _ = pair.Close() })
+
+			session, err := rtp.NewSession(rtp.Options{
+				ID:               tc.name,
+				Ports:            pair,
+				Format:           tc.format,
+				AudioPayloadType: tc.payloadType,
+			})
+			if err != nil {
+				t.Fatalf("NewSession: %v", err)
+			}
+			if got := session.Format(); got != tc.want {
+				t.Errorf("Format() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -448,8 +477,7 @@ func TestNewSessionRequiresAnIDAndPorts(t *testing.T) {
 	}
 }
 
-// The SSRC is drawn from crypto/rand: one an outsider can predict is the handle for injecting
-// audio into a call.
+// The SSRC is drawn from crypto/rand: a predictable one is a handle for injecting audio into a call.
 func TestSessionsGetDistinctSSRCs(t *testing.T) {
 	allocator, err := rtp.NewAllocator(loopback, 54100, 54139)
 	if err != nil {
@@ -457,7 +485,7 @@ func TestSessionsGetDistinctSSRCs(t *testing.T) {
 	}
 
 	seen := make(map[uint32]bool)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		pair, err := allocator.Allocate()
 		if err != nil {
 			t.Fatalf("Allocate #%d: %v", i, err)
@@ -477,7 +505,7 @@ func TestSessionsGetDistinctSSRCs(t *testing.T) {
 	}
 }
 
-// Closing a session returns its ports; a leaked port is capacity lost until restart.
+// A leaked port is capacity lost until restart.
 func TestClosingASessionReleasesItsPorts(t *testing.T) {
 	allocator, err := rtp.NewAllocator(loopback, 54200, 54203) // two pairs
 	if err != nil {
@@ -501,7 +529,7 @@ func TestClosingASessionReleasesItsPorts(t *testing.T) {
 	if allocator.InUse() != 0 {
 		t.Errorf("InUse() = %d after Close, want 0", allocator.InUse())
 	}
-	// Idempotent, for the same reason PortPair.Close is.
+	// Idempotent, as PortPair.Close is.
 	if err := session.Close(); err != nil {
 		t.Errorf("second Close returned %v; it must be a no-op", err)
 	}
@@ -510,8 +538,7 @@ func TestClosingASessionReleasesItsPorts(t *testing.T) {
 	}
 }
 
-// Idle is measured from creation before the first packet, so a session that never receives
-// anything is still reaped.
+// Measured from creation so a session that never receives anything is still reaped.
 func TestIdleIsMeasuredFromCreationUntilTheFirstPacket(t *testing.T) {
 	session := newRunningSession(t, rtp.ModeEcho)
 
@@ -532,7 +559,6 @@ func TestIdleIsMeasuredFromCreationUntilTheFirstPacket(t *testing.T) {
 	}
 }
 
-// Run must return nil when its context is cancelled — shutdown is not a failure.
 func TestRunReturnsNilOnCancel(t *testing.T) {
 	allocator, err := rtp.NewAllocator(loopback, 54300, 54309)
 	if err != nil {
@@ -563,8 +589,8 @@ func TestRunReturnsNilOnCancel(t *testing.T) {
 	}
 }
 
-// LocalAddrPort pairs the session's own port with the CONFIGURED public address, because the socket
-// may be bound to 0.0.0.0 or to a private address behind NAT.
+// The socket may be bound to 0.0.0.0 or a private address behind NAT, so the configured public
+// address is what belongs in SDP.
 func TestLocalAddrPortUsesThePublicAddress(t *testing.T) {
 	session := newRunningSession(t, rtp.ModeEcho)
 

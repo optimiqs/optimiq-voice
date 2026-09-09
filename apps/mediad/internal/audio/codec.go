@@ -5,23 +5,9 @@ import (
 	"fmt"
 )
 
-// The codec layer: one vocabulary for "what is in this payload", and the two operations anything
-// that MIXES needs from it.
-//
-// # Why this exists only now
-//
-// Rungs 0-4 never needed it. A relay forwards bytes and a recorder decodes G.711 with a table
-// lookup, so `Encoding` — the companding law, µ-law or A-law — was the whole vocabulary. Rung 6
-// changes that: a mixer must decode every participant to a common linear representation, sum, and
-// re-encode per participant. Once that path exists, rung 7's transcoding is the same path with the
-// input and output formats differing, which is exactly why the ladder puts codecs AFTER mixing.
-//
-// # The linear bus is 8 kHz, and every format converts to it
-//
-// A FrameDecoder always answers FrameSamples samples of 8 kHz linear PCM, whatever the codec's own
-// sample rate is, and a FrameEncoder always takes them. That is the seam: everything above it — the
-// mixer, the recorder, the gain hooks — works in one representation and never branches on a codec.
-// See resample.go for why 8 kHz is the bus rate and what a wideband leg pays for it.
+// The linear bus is 8 kHz: a FrameDecoder always answers FrameSamples samples of 8 kHz linear PCM
+// whatever the codec's own sample rate is, and a FrameEncoder always takes them, so the mixer and
+// recorder never branch on a codec.
 
 // Format is a payload format mediad can put on the wire.
 type Format uint8
@@ -35,11 +21,11 @@ const (
 	FormatG722
 	// FormatOpus is RFC 6716 Opus, always a DYNAMIC payload type.
 	//
-	// Negotiable and relayable; NOT transcodable. See the note on NewFrameDecoder.
+	// Negotiable and relayable; NOT transcodable. See Transcodable.
 	FormatOpus
 )
 
-// String names a format the way SDP does, which is also how a refusal message should read.
+// String names a format the way SDP does.
 func (f Format) String() string {
 	switch f {
 	case FormatALaw:
@@ -55,15 +41,13 @@ func (f Format) String() string {
 
 // SampleRate is the rate the codec itself works at, in hertz.
 //
-// NOT the RTP clock rate, and the two differ for G.722: RFC 3551 §4.5.2 records the 8000 clock rate
-// as an error in the original specification that shipped anyway. Anything that needs the clock rate
-// must ask SDP for it; this number is for DSP.
+// NOT the RTP clock rate: they differ for G.722, where RFC 3551 §4.5.2 keeps the erroneous 8000
+// clock rate. Anything needing the clock rate must ask SDP for it.
 func (f Format) SampleRate() int {
 	switch f {
 	case FormatG722:
 		return 16000
 	case FormatOpus:
-		// Opus is internally 48 kHz. Stated for completeness — nothing decodes it here.
 		return 48000
 	default:
 		return SampleRate
@@ -72,11 +56,8 @@ func (f Format) SampleRate() int {
 
 // Transcodable reports whether this build can convert the format to and from linear samples.
 //
-// The one `false` is Opus, and the reason is written down rather than discovered: the only complete
-// Opus implementation reachable from Go is a cgo binding to libopus, and taking a C toolchain into
-// this service's build to serve a codec no endpoint here negotiates yet is a cost with no caller.
-// Opus is therefore NEGOTIATED and PASSED THROUGH — two Opus legs bridge with no codec at all,
-// which is the fast path anyway — and a request that would require decoding it is refused by name.
+// Opus is the one false: decoding it would require a cgo binding to libopus, so Opus is negotiated
+// and passed through, and any request needing it decoded is refused by name.
 func (f Format) Transcodable() bool { return f != FormatOpus }
 
 // Encoding maps the two G.711 formats onto the companding law the rest of this package speaks.
@@ -91,7 +72,7 @@ func (f Format) Encoding() (Encoding, bool) {
 	}
 }
 
-// FormatOf is the inverse: the format a companding law is.
+// FormatOf returns the format a companding law corresponds to.
 func FormatOf(encoding Encoding) Format {
 	if encoding == EncodingALaw {
 		return FormatALaw
@@ -104,13 +85,12 @@ var ErrNotTranscodable = errors.New("audio: this build cannot decode or encode t
 
 // FrameDecoder turns one payload into 20 ms of 8 kHz linear PCM.
 //
-// STATEFUL by contract, because two of the three implementations are: G.722's predictor and the
-// resampler's filter history both make a frame's output depend on every frame before it. One
-// decoder per inbound stream, for the life of the stream.
+// Stateful by contract (G.722's predictor, the resampler's filter history): use one decoder per
+// inbound stream, for the life of that stream.
 type FrameDecoder interface {
-	// DecodeFrame answers exactly FrameSamples samples. A payload that is short, long or corrupt
-	// still answers a full frame — padded with silence — because the caller is a mixer on a clock
-	// and a short frame there is a gap in everybody's audio rather than in one participant's.
+	// DecodeFrame answers exactly FrameSamples samples; a short, long or corrupt payload is still
+	// padded to a full frame, because a short frame at a mixer on a clock is a gap in everyone's
+	// audio rather than in one participant's.
 	DecodeFrame(payload []byte) []int16
 	// Reset returns the decoder to its start state, for a stream that has restarted.
 	Reset()
@@ -118,6 +98,9 @@ type FrameDecoder interface {
 
 // FrameEncoder turns 20 ms of 8 kHz linear PCM into one payload. Stateful; see FrameDecoder.
 type FrameEncoder interface {
+	// EncodeFrame answers this instance's OWN buffer, valid only until the next EncodeFrame on the
+	// same encoder; a caller that keeps the bytes must copy them. One encoder belongs to one
+	// direction of one bridge or one seat in one room, so there is no second consumer to race.
 	EncodeFrame(samples []int16) []byte
 	Reset()
 }
@@ -148,15 +131,15 @@ func NewFrameEncoder(format Format) (FrameEncoder, error) {
 	}
 }
 
-// g711FrameCodec is both halves for a companding law, which is stateless — the whole point of G.711.
+// g711FrameCodec is both halves for a companding law, which is stateless.
 //
-// The scratch buffers are not state, they are the absence of an allocation: a codec instance belongs
-// to exactly one direction of one bridge or one seat in one room, and both callers consume the
-// decoded frame before they call again, so one buffer per instance does what a sync.Pool would.
+// The scratch buffers avoid a per-frame allocation: an instance belongs to one direction of one
+// bridge or one seat in one room, and callers consume a frame before calling again.
 type g711FrameCodec struct {
 	encoding Encoding
 	decoded  []int16
 	padded   []int16
+	encoded  []byte
 }
 
 func (c *g711FrameCodec) DecodeFrame(payload []byte) []int16 {
@@ -167,14 +150,15 @@ func (c *g711FrameCodec) DecodeFrame(payload []byte) []int16 {
 	return padFrameInto(c.padded, decodeLinearInto(c.decoded, payload, c.encoding))
 }
 
-// EncodeFrame's OUTPUT is the one buffer here that is freshly allocated every time: it leaves for a
-// socket write the caller may still be holding when the next frame is encoded.
+// EncodeFrame reuses this instance's output buffer; see the FrameEncoder contract for the lifetime
+// that makes that safe.
 func (c *g711FrameCodec) EncodeFrame(samples []int16) []byte {
 	if c.padded == nil {
 		c.decoded = make([]int16, FrameSamples)
 		c.padded = make([]int16, FrameSamples)
+		c.encoded = make([]byte, FrameSamples)
 	}
-	return encodeLinear(padFrameInto(c.padded, samples), c.encoding)
+	return encodeLinearInto(c.encoded, padFrameInto(c.padded, samples), c.encoding)
 }
 
 func (c *g711FrameCodec) Reset() {}
@@ -184,7 +168,6 @@ type g722FrameDecoder struct {
 	decoder *G722Decoder
 	down    Resampler16to8
 
-	// Scratch, for the same reason as g711FrameCodec's. See the note there.
 	wide   []int16
 	narrow []int16
 	padded []int16
@@ -211,19 +194,21 @@ type g722FrameEncoder struct {
 	encoder *G722Encoder
 	up      Resampler8to16
 
-	// Scratch for the two INTERMEDIATE steps only; the encoded octets are allocated fresh, because
-	// they leave for a socket. See g711FrameCodec.
-	padded []int16
-	wide   []int16
+	// Scratch; see the FrameEncoder contract for the lifetime that makes reusing the output safe.
+	padded  []int16
+	wide    []int16
+	encoded []byte
 }
 
 func (e *g722FrameEncoder) EncodeFrame(samples []int16) []byte {
 	if e.padded == nil {
 		e.padded = make([]int16, FrameSamples)
 		e.wide = make([]int16, 0, FrameSamples*2)
+		e.encoded = make([]byte, 0, FrameSamples)
 	}
 	e.wide = e.up.resampleInto(e.wide, padFrameInto(e.padded, samples))
-	return e.encoder.Encode(e.wide)
+	e.encoded = e.encoder.encodeInto(e.encoded, e.wide)
+	return e.encoded
 }
 
 func (e *g722FrameEncoder) Reset() {
@@ -231,15 +216,14 @@ func (e *g722FrameEncoder) Reset() {
 	e.up = Resampler8to16{}
 }
 
-// padFrame makes a slice exactly one frame long: truncating what is too long, and padding what is
-// too short with LINEAR silence, which really is zero (unlike a companded byte — see Encoding.Silence).
+// padFrame makes a slice exactly one frame long, truncating what is too long and padding what is
+// too short with LINEAR silence, which is zero (unlike a companded byte — see Encoding.Silence).
 func padFrame(samples []int16) []int16 {
 	return padFrameInto(nil, samples)
 }
 
-// padFrameInto is padFrame writing into a caller-supplied FrameSamples-long buffer. A short input is
-// copied and the tail zeroed; an exact or long one needs no buffer at all and is returned as a view,
-// exactly as padFrame does.
+// padFrameInto is padFrame writing into a caller-supplied FrameSamples-long buffer. An exact or
+// over-long input needs no buffer and is returned as a view.
 func padFrameInto(dst, samples []int16) []int16 {
 	if len(samples) >= FrameSamples || len(dst) != FrameSamples {
 		return padFrameAlloc(samples)

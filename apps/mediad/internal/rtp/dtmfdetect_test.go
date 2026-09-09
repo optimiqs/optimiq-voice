@@ -13,11 +13,8 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
 
-// The DTMF DETECTION suite drives real sockets, like every other packet-path suite here, because
-// the thing under test is a property of the bytes: RFC 4733 spreads one keypress over many packets
-// and the whole job is to answer with exactly one digit. A test against a mocked decoder would
-// assert that a method was called, which is precisely the assertion that stays green when a
-// retransmitted END packet publishes a second keypress.
+// The detection suite drives real sockets because the property under test is one of the bytes: RFC
+// 4733 spreads one keypress over many packets and the job is to answer with exactly one digit.
 
 // detectRig is one session with a far end, plus the lifecycle the packet path announces into.
 type detectRig struct {
@@ -28,8 +25,8 @@ type detectRig struct {
 }
 
 const (
-	// The payload type this suite's far end sends digits under. Distinct from the de-facto 101 in
-	// the relay test below, so a renumbering bug cannot pass by coincidence.
+	// Distinct from the de-facto 101 in the relay test below, so a renumbering bug cannot pass by
+	// coincidence.
 	detectTelephonePT = uint8(96)
 	// detectSSRC is the far end's own synchronisation source. mediad never reflects it.
 	detectSSRC = uint32(0x0BADCAFE)
@@ -79,10 +76,9 @@ func newDetectRig(t *testing.T, low, high int, maxDigit time.Duration) *detectRi
 	}
 }
 
-// bridgedDetectRig is two bridged legs that negotiated DIFFERENT telephone-event types, plus the
-// lifecycle both announce into. The type difference is deliberate: 96 and 101 are both common, and
-// the relay's renumbering is the reason a digit survives a bridge between two phones that chose
-// differently — which detection must not disturb.
+// bridgedDetectRig is two bridged legs that negotiated different telephone-event types, plus the
+// lifecycle both announce into. The difference is deliberate: the relay's renumbering is why a digit
+// survives a bridge between two phones that chose differently, and detection must not disturb it.
 type bridgedDetectRig struct {
 	manager   *rtp.Manager
 	lifecycle *recordingLifecycle
@@ -142,8 +138,8 @@ func newBridgedDetectRig(t *testing.T, low, high int) *bridgedDetectRig {
 		bID:       bID,
 	}
 
-	// Both legs must latch before there is anywhere to relay to. These packets arrive before the
-	// bridge exists, so neither is forwarded and nothing is left in flight for the digit assertions.
+	// Both legs must latch before there is anywhere to relay to. These arrive before the bridge
+	// exists, so neither is forwarded.
 	rig.aPhone.send(t, audioPacket(1000, 1))
 	rig.bPhone.send(t, audioPacket(2000, 1))
 	waitFor(t, "both legs to latch onto their far ends", func() bool {
@@ -209,7 +205,7 @@ func pressDigit(t *testing.T, p *phone, event byte, timestamp uint32, sequence u
 		p.send(t, telephoneEventPacket(detectTelephonePT, event, false,
 			uint16(frame*160), timestamp, sequence+uint16(frame)-1, frame == 1))
 	}
-	for copyIndex := 0; copyIndex < 3; copyIndex++ {
+	for copyIndex := range 3 {
 		p.send(t, telephoneEventPacket(detectTelephonePT, event, true,
 			uint16(frames*160), timestamp, sequence+uint16(frames+copyIndex), false))
 	}
@@ -220,18 +216,14 @@ func waitForDigits(t *testing.T, rig *detectRig, want int) []rtp.DtmfDigit {
 	waitFor(t, "the packet path to surface a digit", func() bool {
 		return len(rig.lifecycle.detectedDigits()) >= want
 	})
-	// A moment past the last expected digit, so a suite asserting "exactly one" fails on a
-	// duplicate rather than racing it.
+	// A moment past the last expected digit, so "exactly one" fails on a duplicate rather than
+	// racing it.
 	time.Sleep(50 * time.Millisecond)
 	return rig.lifecycle.detectedDigits()
 }
 
-// The de-duplication, and the reason this rung has a shape decision attached at all.
-//
-// RFC 4733 §2.5.1.4 makes the sender transmit the END packet THREE times back to back, because
-// losing the only packet that says a digit is over leaves the far end holding a tone open until its
-// own timeout. A detector that published per packet would turn this single keypress into eight
-// events, and a `gather` collecting a four-digit PIN would fill on the first press.
+// The de-duplication. RFC 4733 §2.5.1.4 makes the sender transmit the END packet three times back to
+// back, so a detector publishing per packet would turn one keypress into eight events.
 func TestDtmfDetectionSurfacesOneDigitUnderEndRetransmission(t *testing.T) {
 	rig := newDetectRig(t, 58000, 58019, 0)
 
@@ -244,8 +236,8 @@ func TestDtmfDetectionSurfacesOneDigitUnderEndRetransmission(t *testing.T) {
 	if digits[0].Digit != "5" {
 		t.Errorf("digit = %q, want 5", digits[0].Digit)
 	}
-	// Three 20 ms frames, as the sender's own duration field claimed. Never a wall clock at this
-	// end, which would fold the network's jitter into a number describing somebody's finger.
+	// Three 20 ms frames, as the sender's own duration field claimed — never a local wall clock,
+	// which would fold the network's jitter into it.
 	if digits[0].DurationMs != 60 {
 		t.Errorf("durationMs = %d, want 60", digits[0].DurationMs)
 	}
@@ -253,9 +245,7 @@ func TestDtmfDetectionSurfacesOneDigitUnderEndRetransmission(t *testing.T) {
 		t.Errorf("endedBy = %q, want end-bit", digits[0].EndedBy)
 	}
 
-	// The ratio is the diagnostic: six packets in, one keypress out. Equal numbers would mean the
-	// de-duplication is not running, which is otherwise only visible as an IVR that answers a menu
-	// before the caller has finished pressing.
+	// Six packets in, one keypress out; equal numbers would mean the de-duplication is not running.
 	session, ok := rig.manager.Get(rig.sessionID)
 	if !ok {
 		t.Fatal("the session went away")
@@ -267,9 +257,8 @@ func TestDtmfDetectionSurfacesOneDigitUnderEndRetransmission(t *testing.T) {
 	}
 }
 
-// Two presses of the SAME key, which is the case a detector keyed on anything but the timestamp
-// gets wrong: "11" is two digits, and the only thing on the wire that says so is that the second
-// press carries a new start timestamp.
+// Two presses of the same key: "11" is two digits, and the only thing on the wire that says so is
+// the second press's new start timestamp.
 func TestDtmfDetectionSeparatesTwoDigitsByTimestamp(t *testing.T) {
 	rig := newDetectRig(t, 58020, 58039, 0)
 
@@ -289,11 +278,8 @@ func TestDtmfDetectionSeparatesTwoDigitsByTimestamp(t *testing.T) {
 	}
 }
 
-// A digit whose END never arrives, closed by the arrival of the NEXT one.
-//
-// This is the recovery that matters in practice, and it is why the cutoff is a backstop rather than
-// the mechanism: somebody typing a PIN presses the next key within a few hundred milliseconds, so a
-// lost END costs nothing at all rather than costing the max-duration wait.
+// A digit whose END never arrives, closed by the arrival of the next one — which is why the cutoff
+// is a backstop rather than the mechanism.
 func TestDtmfDetectionClosesADigitWhoseEndWasLostOnTheNextDigit(t *testing.T) {
 	rig := newDetectRig(t, 58040, 58059, 0)
 
@@ -318,11 +304,9 @@ func TestDtmfDetectionClosesADigitWhoseEndWasLostOnTheNextDigit(t *testing.T) {
 	}
 }
 
-// The degenerate case: a tone that begins and never ends, with the leg still sending audio.
-//
-// Without the cutoff that keypress would sit in the detector for the life of the call and the
-// caller would be told nothing — the silent failure this design keeps rejecting. It surfaces ONCE,
-// and every further packet of that digit lands on the already-surfaced branch.
+// A tone that begins and never ends, with the leg still sending audio. Without the cutoff the
+// keypress would sit in the detector for the life of the call. It surfaces once, and every further
+// packet of that digit lands on the already-surfaced branch.
 func TestDtmfDetectionSurfacesADigitWithNoEndAtTheCutoff(t *testing.T) {
 	const maxDigit = 40 * time.Millisecond
 	rig := newDetectRig(t, 58060, 58079, maxDigit)
@@ -330,9 +314,8 @@ func TestDtmfDetectionSurfacesADigitWithNoEndAtTheCutoff(t *testing.T) {
 	rig.phone.send(t, telephoneEventPacket(detectTelephonePT, 9, false, 160, 160_000, 100, true))
 	rig.phone.send(t, telephoneEventPacket(detectTelephonePT, 9, false, 320, 160_000, 101, false))
 
-	// The cutoff is evaluated on ARRIVING packets rather than by a timer per digit: the audio a leg
-	// resumes the moment a tone ends is what carries the evaluation, so it lands within one frame of
-	// the deadline without a goroutine per keypress.
+	// The cutoff is evaluated on arriving packets rather than a timer per digit, so it lands within
+	// one frame of the deadline without a goroutine per keypress.
 	time.Sleep(2 * maxDigit)
 	rig.phone.send(t, audioPacket(161_000, 102))
 
@@ -344,8 +327,7 @@ func TestDtmfDetectionSurfacesADigitWithNoEndAtTheCutoff(t *testing.T) {
 		t.Errorf("digit = %q ended by %q, want 9 ended by max-duration",
 			digits[0].Digit, digits[0].EndedBy)
 	}
-	// The duration the SENDER last claimed, not the wall clock the cutoff used. Saying 40 ms because
-	// that is how long we waited would be reporting our own timer as somebody's keypress.
+	// The duration the sender last claimed, not the wall clock the cutoff used.
 	if digits[0].DurationMs != 40 {
 		t.Errorf("durationMs = %d, want 40", digits[0].DurationMs)
 	}
@@ -358,11 +340,9 @@ func TestDtmfDetectionSurfacesADigitWithNoEndAtTheCutoff(t *testing.T) {
 	}
 }
 
-// The END packet overtaking the updates it belongs to, which is ordinary RTP reordering.
-//
-// The digit is surfaced on the END, and the updates that arrive after it share its timestamp, find
-// it surfaced and are dropped — the same branch the two END retransmissions land on. A detector
-// that required the updates first would publish the digit twice.
+// The END packet overtaking the updates it belongs to, which is ordinary RTP reordering. The digit
+// is surfaced on the END and the later updates share its timestamp, find it surfaced and are dropped
+// — the same branch the END retransmissions land on.
 func TestDtmfDetectionToleratesAnEndReorderedAheadOfItsUpdates(t *testing.T) {
 	rig := newDetectRig(t, 58080, 58099, 0)
 
@@ -380,14 +360,14 @@ func TestDtmfDetectionToleratesAnEndReorderedAheadOfItsUpdates(t *testing.T) {
 	}
 }
 
-// A packet delayed past a whole digit boundary. The detector remembers one digit back, which is
-// what stops a straggler from being read as a third press of the same key.
+// A packet delayed past a whole digit boundary: the detector remembers one digit back, which stops
+// a straggler being read as a third press.
 func TestDtmfDetectionDropsAStragglerFromThePreviousDigit(t *testing.T) {
 	rig := newDetectRig(t, 58100, 58119, 0)
 
 	pressDigit(t, rig.phone, 4, 160_000, 100, 3)
 	pressDigit(t, rig.phone, 6, 161_600, 200, 3)
-	// An update packet from the FIRST digit, arriving after the second has been and gone.
+	// An update packet from the first digit, arriving after the second has been and gone.
 	rig.phone.send(t, telephoneEventPacket(detectTelephonePT, 4, false, 320, 160_000, 101, false))
 
 	digits := waitForDigits(t, rig, 2)
@@ -399,10 +379,8 @@ func TestDtmfDetectionDropsAStragglerFromThePreviousDigit(t *testing.T) {
 	}
 }
 
-// The marker bit is not required, and losing it must not cost a keypress.
-//
-// It is one bit on ONE packet, so a detector keyed on it loses a whole digit to a single lost
-// datagram and every digit from a sender that forgets to set it. The timestamp is the identity.
+// The marker bit is not required: it is one bit on one packet, so a detector keyed on it loses a
+// whole digit to a single lost datagram. The timestamp is the identity.
 func TestDtmfDetectionDoesNotNeedTheMarkerBit(t *testing.T) {
 	rig := newDetectRig(t, 58120, 58139, 0)
 
@@ -416,14 +394,13 @@ func TestDtmfDetectionDoesNotNeedTheMarkerBit(t *testing.T) {
 	}
 }
 
-// Events above the keypad are not digits, and inventing a character for them would hand a `gather`
-// something no dialplan can contain. 16 is RFC 4733's hook flash.
+// Events above the keypad are not digits; 16 is RFC 4733's hook flash.
 func TestDtmfDetectionIgnoresNonKeypadEvents(t *testing.T) {
 	rig := newDetectRig(t, 58140, 58159, 0)
 
 	rig.phone.send(t, telephoneEventPacket(detectTelephonePT, 16, true, 320, 160_000, 100, true))
-	// A payload too short to be a telephone-event at all. The payload type says what a packet
-	// CLAIMS to be, and this socket is open to the internet.
+	// A payload too short to be a telephone-event: the payload type says only what a packet claims
+	// to be, and this socket is open to the internet.
 	rig.phone.send(t, pionrtp.Packet{
 		Header: pionrtp.Header{
 			Version: 2, PayloadType: detectTelephonePT,
@@ -432,7 +409,7 @@ func TestDtmfDetectionIgnoresNonKeypadEvents(t *testing.T) {
 		Payload: []byte{0x01, 0x02},
 	})
 	// A real digit behind them, so the assertion is "those two produced nothing" rather than
-	// "nothing had happened yet".
+	// "nothing has happened yet".
 	pressDigit(t, rig.phone, 0, 161_600, 200, 2)
 
 	digits := waitForDigits(t, rig, 1)
@@ -441,9 +418,8 @@ func TestDtmfDetectionIgnoresNonKeypadEvents(t *testing.T) {
 	}
 }
 
-// A leg that begins a tone and stops sending entirely. The arrival-driven cutoff never fires
-// because nothing arrives, so the teardown is the backstop — and it surfaces the keypress BEFORE
-// the session-ended the engine tears the leg down on.
+// A leg that begins a tone and stops sending entirely: nothing arrives, so the teardown is the
+// backstop, and it surfaces the keypress before the session-ended event.
 func TestDtmfDetectionFlushesAnOpenDigitWhenTheSessionEnds(t *testing.T) {
 	rig := newDetectRig(t, 58160, 58179, 0)
 
@@ -465,14 +441,9 @@ func TestDtmfDetectionFlushesAnOpenDigitWhenTheSessionEnds(t *testing.T) {
 	}
 }
 
-// DETECTION IS A TAP, AND THIS IS THE ASSERTION THAT SAYS SO.
-//
-// Rung 2 made DTMF free across a bridge: a telephone-event payload is just bytes to a relay, and
-// the header rewrite renumbers the payload type between two legs that negotiated differently.
-// Rung 3's receive half must not take that away — the far end of an attended transfer is entitled
-// to hear the key the caller pressed — so the packets keep flowing to the peer byte for byte WHILE
-// the engine is told a digit was pressed. Both halves are asserted here, in one test, because
-// either one alone would stay green if the tap became a consumption.
+// Detection is a tap: the packets keep flowing to the peer byte for byte, renumbered, while the
+// engine is told a digit was pressed. Both halves are asserted in one test, because either alone
+// would stay green if the tap became a consumption.
 func TestDtmfDetectionTapsWithoutConsumingTheRelayedPackets(t *testing.T) {
 	rig := newBridgedDetectRig(t, 58180, 58199)
 
@@ -481,7 +452,7 @@ func TestDtmfDetectionTapsWithoutConsumingTheRelayedPackets(t *testing.T) {
 		rig.aPhone.send(t, telephoneEventPacket(96, 7, false,
 			uint16(frame*160), 160_000, uint16(100+frame), frame == 1))
 	}
-	for copyIndex := 0; copyIndex < 3; copyIndex++ {
+	for copyIndex := range 3 {
 		rig.aPhone.send(t, telephoneEventPacket(96, 7, true,
 			uint16(frames*160), 160_000, uint16(104+copyIndex), false))
 	}
@@ -535,8 +506,7 @@ func TestDtmfDetectionTapsWithoutConsumingTheRelayedPackets(t *testing.T) {
 	}
 }
 
-// The event codes are RFC 4733 §3.2 and they are not arbitrary: the sender looks the key up in the
-// same table, so an off-by-one is a caller who pressed 8 and an IVR that heard 9.
+// RFC 4733 §3.2 event codes: an off-by-one is a caller who pressed 8 and an IVR that heard 9.
 func TestDtmfDigitForEventCoversTheKeypadAndNothingElse(t *testing.T) {
 	for code, want := range map[byte]string{
 		0: "0", 5: "5", 9: "9", 10: "*", 11: "#", 12: "A", 15: "D",

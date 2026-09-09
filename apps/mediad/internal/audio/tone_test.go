@@ -9,12 +9,8 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 )
 
-// goertzel measures the energy at one frequency in a block of samples.
-//
-// A Goertzel filter rather than an FFT because it answers exactly the question the assertions need —
-// "how much 440 Hz is in this?" — for one bin, in one pass, with no library. It is also, not
-// coincidentally, how a telephony DTMF detector works, so it is the same measurement a real handset
-// would make of these tones.
+// goertzel measures the energy at one frequency in a block of samples: one bin, one pass, no
+// library — the same measurement a telephony DTMF detector makes.
 func goertzel(samples []int16, hertz float64, rate int) float64 {
 	omega := 2 * math.Pi * hertz / float64(rate)
 	coefficient := 2 * math.Cos(omega)
@@ -32,8 +28,7 @@ func goertzel(samples []int16, hertz float64, rate int) float64 {
 	return math.Sqrt(power) / float64(len(samples))
 }
 
-// linearise decodes a run of frames back to linear samples, which is what the measurements above
-// need: the generator's output is companded, and µ-law is not linear enough to measure directly.
+// linearise decodes a run of frames back to linear samples, which the measurements above need.
 func linearise(t *testing.T, frames [][]byte, encoding audio.Encoding) []int16 {
 	t.Helper()
 	var samples []int16
@@ -46,9 +41,8 @@ func linearise(t *testing.T, frames [][]byte, encoding audio.Encoding) []int16 {
 func TestGenerateProducesTheAdvertisedFrequencies(t *testing.T) {
 	t.Parallel()
 
-	// Each case names the frequencies the tone plan specifies and one that is NOT in it, because a
-	// generator that produced broadband noise would pass an "is there energy at 440 Hz" assertion on
-	// its own. The absent frequency is what makes the present ones mean something.
+	// Each case names the frequencies the tone plan specifies and one that is not in it, so
+	// broadband noise cannot pass.
 	cases := []struct {
 		name    string
 		tone    string
@@ -75,8 +69,8 @@ func TestGenerateProducesTheAdvertisedFrequencies(t *testing.T) {
 				t.Fatalf("Generate: %v", err)
 			}
 
-			// The FIRST segment is the sounding one for every tone here, and measuring the whole clip
-			// would average the silence of a cadence into the answer.
+			// The first segment is the sounding one; measuring the whole clip would average in the
+			// cadence's silence.
 			sounding := linearise(t, clip.Frames[:framesOfFirstSegment(tone)], audio.EncodingULaw)
 
 			for _, hertz := range testCase.present {
@@ -129,10 +123,8 @@ func TestCadenceAlternatesToneAndSilence(t *testing.T) {
 func TestCadenceSegmentsAreWholeCyclesSoTheLoopDoesNotClick(t *testing.T) {
 	t.Parallel()
 
-	// The property this asserts is the reason the standard cadences are what they are, and it is
-	// what makes a looping tone click-free: every segment starts its oscillators at phase zero, so a
-	// segment that did NOT contain a whole number of cycles would step from a non-zero sample to
-	// silence at its own end and to a fresh zero at the next repetition. Both are audible.
+	// Every segment starts at phase zero, so a segment not containing a whole number of cycles
+	// would step from a non-zero sample to silence — an audible click on every repetition.
 	cases := []struct {
 		name  string
 		tone  string
@@ -166,9 +158,8 @@ func TestCadenceSegmentsAreWholeCyclesSoTheLoopDoesNotClick(t *testing.T) {
 func TestGeneratedTonesNeverClip(t *testing.T) {
 	t.Parallel()
 
-	// Two summed sinusoids at full scale would overflow; the amplitude constant exists to stop that.
-	// A clipped call-progress tone is a buzz that a handset's own detector does not recognise, so
-	// this is a correctness assertion rather than a quality one.
+	// Two summed sinusoids at full scale would overflow, and a clipped tone is a buzz a handset's
+	// detector does not recognise.
 	for _, name := range audio.StandardToneNames() {
 		tone, ok := audio.LookupTone(name)
 		if !ok {
@@ -206,8 +197,7 @@ func TestParseTone(t *testing.T) {
 		{name: "no duration", ref: "440+480", wantErr: audio.ErrUnknownTone},
 		{name: "a zero duration", ref: "440/0", wantErr: audio.ErrBadToneSpec},
 		{name: "a negative duration", ref: "440/-20", wantErr: audio.ErrBadToneSpec},
-		// Above the Nyquist frequency a sinusoid aliases to a different tone entirely, which is
-		// worse than a refusal because nobody would look for it in a tone table.
+		// Above the Nyquist frequency a sinusoid aliases to a different tone entirely.
 		{name: "a frequency above Nyquist", ref: "5000/100", wantErr: audio.ErrBadToneSpec},
 		{name: "a non-numeric frequency", ref: "middle-c/100", wantErr: audio.ErrBadToneSpec},
 		{name: "longer than the cap", ref: "440/120000", wantErr: audio.ErrBadToneSpec},
@@ -240,8 +230,7 @@ func TestParseTone(t *testing.T) {
 func TestUnknownToneNamesTheAlternatives(t *testing.T) {
 	t.Parallel()
 
-	// A refusal that names what IS available is the difference between a fixable message and a
-	// support ticket, and it is the same rule the media-scheme refusals follow.
+	// A refusal must name what is available.
 	_, err := audio.ParseTone("trombone")
 	if err == nil {
 		t.Fatal("ParseTone accepted a tone that does not exist")
@@ -256,8 +245,7 @@ func TestUnknownToneNamesTheAlternatives(t *testing.T) {
 func TestGenerateHonoursTheLegsCompandingLaw(t *testing.T) {
 	t.Parallel()
 
-	// A µ-law tone on an A-law leg is a rasp, exactly as a µ-law prompt is. The generator has to
-	// produce the leg's own law for the same reason the WAV decoder does.
+	// A µ-law tone on an A-law leg is a rasp; the generator has to produce the leg's own law.
 	tone, _ := audio.LookupTone("beep")
 	for _, encoding := range []audio.Encoding{audio.EncodingULaw, audio.EncodingALaw} {
 		clip, err := tone.Generate(encoding)
@@ -277,8 +265,7 @@ func TestGenerateHonoursTheLegsCompandingLaw(t *testing.T) {
 func TestSilenceToneIsActuallySilent(t *testing.T) {
 	t.Parallel()
 
-	// The MOH fallback for an instance with no music mounted. It must be the companding law's own
-	// silence byte rather than 0x00, which is a loud value in both laws.
+	// Silence must be the companding law's own silence byte, not 0x00, which is loud in both laws.
 	tone, _ := audio.LookupTone("silence")
 	for _, encoding := range []audio.Encoding{audio.EncodingULaw, audio.EncodingALaw} {
 		clip, err := tone.Generate(encoding)

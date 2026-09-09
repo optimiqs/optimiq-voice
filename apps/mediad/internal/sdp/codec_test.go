@@ -9,10 +9,9 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/sdp"
 )
 
-// Rung 7's negotiation. Two codecs join the vocabulary and they do not cost the same: G.722 can be
-// transcoded and mixed, Opus can only be relayed. That difference is deliberately invisible in the
-// ANSWER — an offer is answered on what the two ends can carry rather than on what a conference
-// might one day need — so it is tested here as a property of the codec rather than of the answer.
+// G.722 can be transcoded and mixed, Opus can only be relayed. That difference is invisible in the
+// answer — an offer is answered on what the two ends can carry — so it is asserted here as a
+// property of the codec.
 
 func TestCodecFacts(t *testing.T) {
 	t.Parallel()
@@ -27,14 +26,13 @@ func TestCodecFacts(t *testing.T) {
 		{"PCMU", sdp.CodecPCMU, 0, 8000, audio.FormatULaw},
 		{"PCMA", sdp.CodecPCMA, 8, 8000, audio.FormatALaw},
 		{
-			// The clock rate is 8000 and the codec samples at 16 kHz. RFC 3551 §4.5.2 records the
-			// mismatch as an error in G.722's original registration that shipped anyway, and
-			// `a=rtpmap:9 G722/16000` is the commonest G.722 interop bug there is.
+			// Clock rate 8000, sample rate 16 kHz: RFC 3551 §4.5.2's erratum. `a=rtpmap:9
+			// G722/16000` is the commonest G.722 interop bug there is.
 			"G722", sdp.CodecG722, 9, 8000, audio.FormatG722,
 		},
 		{
-			// Opus has NO static payload type. Zero here means "there isn't one", which is why an
-			// answer carries the offer's own number instead.
+			// Opus has no static payload type; zero means "there isn't one", so an answer carries
+			// the offer's own number.
 			"opus", sdp.CodecOpus, 0, 48000, audio.FormatOpus,
 		},
 	}
@@ -62,10 +60,8 @@ func TestCodecFacts(t *testing.T) {
 func TestParseOfferHonoursPreferenceAcrossFourCodecs(t *testing.T) {
 	t.Parallel()
 
-	// Offer order is preference order (RFC 3264 §5.1), and honouring it is not politeness: an
-	// endpoint that lists G.722 first is telling us it would rather be wideband, and answering PCMU
-	// because this parser happened to check it first would override a preference the RFC says is the
-	// offerer's to express.
+	// Offer order is preference order (RFC 3264 §5.1): the choice must follow the offer's order,
+	// not the parser's.
 	cases := []struct {
 		name            string
 		formats         string
@@ -99,15 +95,15 @@ func TestParseOfferHonoursPreferenceAcrossFourCodecs(t *testing.T) {
 			wantCodec: sdp.CodecOpus, wantPayloadType: 111,
 		},
 		{
-			// A different endpoint, a different dynamic number for the same codec. Opus is reachable
-			// ONLY through an rtpmap, which is why that branch is the whole of its negotiation.
+			// A different dynamic number for the same codec. Opus is reachable only through an
+			// rtpmap.
 			name:      "Opus under a different dynamic number",
 			formats:   "96",
 			rtpmap:    []string{"a=rtpmap:96 opus/48000/2"},
 			wantCodec: sdp.CodecOpus, wantPayloadType: 96,
 		},
 		{
-			// G.722 by its STATIC number with no rtpmap, which older endpoints really do send.
+			// G.722 by its static number with no rtpmap, which older endpoints do send.
 			name:      "G.722 with no rtpmap",
 			formats:   "9",
 			rtpmap:    nil,
@@ -182,8 +178,7 @@ func TestBuildAnswerRendersEachCodecCorrectly(t *testing.T) {
 				OpusFmtp: "minptime=10", Direction: sdp.DirectionSendRecv,
 			},
 			// RFC 7587 §7 fixes the channel count at two whatever the stream carries; mono is
-			// signalled through `stereo=0` in the fmtp instead, and an answer that wrote `/1` is
-			// rejected by endpoints that check it.
+			// signalled through `stereo=0` in the fmtp.
 			contains: []string{
 				"m=audio 30000 RTP/AVP 111\r\n",
 				"a=rtpmap:111 opus/48000/2\r\n",

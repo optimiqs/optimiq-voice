@@ -25,7 +25,7 @@ func TestWebRTCBridgesBothDirectionsWithoutPlaintextIngress(t *testing.T) {
 }
 
 func testBridge(t *testing.T, serverOffers bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	loopback := netip.MustParseAddr("127.0.0.1")
 	factory, err := secure.NewFactory(secure.Options{BindIP: loopback, PublicIP: loopback})

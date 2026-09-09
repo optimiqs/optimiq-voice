@@ -382,9 +382,6 @@ func TestDtmfReceivedSkipsASessionWithNoOrg(t *testing.T) {
 }
 
 func TestSessionEndedCarriesWhatRTCPKnew(t *testing.T) {
-	// `SessionSummary.Quality` recorded a CONTRACT GAP rather than a decision: the numbers have been
-	// measured, tested and available since rung 7, and `session.ended` had no field for any of them,
-	// so a mediad that knew exactly why a call sounded bad had nowhere to say so.
 	announcer, publisher, _ := newAnnouncer(t)
 	ended := summary()
 	ended.Quality = rtp.QualityStats{
@@ -440,18 +437,18 @@ func TestSessionEndedSendsQualityEvenWhenTheEndpointSentNoRTCP(t *testing.T) {
 }
 
 func TestWaitFlushesTheEventsAShutdownHandedOff(t *testing.T) {
-	// `main` used to return from Drain straight into the NATS connection's own drain, and every
-	// publish still in flight died with the process — losing the `session.ended` for exactly the
-	// calls a drain ends, which is the one event the engine cannot reconstruct from anywhere else.
+	// Without the flush, a drain returns straight into the NATS connection's own drain and every
+	// publish still in flight dies with the process — losing the `session.ended` for exactly the calls
+	// a drain ends.
 	announcer, publisher, _ := newAnnouncer(t)
 
-	for index := 0; index < 32; index++ {
+	for index := range 32 {
 		ended := summary()
 		ended.SessionID = testSession + string(rune('a'+index%26))
 		announcer.SessionEnded(ended, rtp.EndReasonDrained)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	if !announcer.Wait(ctx) {
 		t.Fatal("Wait gave up on publishes that had not finished")
