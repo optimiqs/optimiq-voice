@@ -20,8 +20,10 @@ import type { HangupCause } from "@optimiq-voice/telephony";
  *
  * The poll interval is the price. It is set to a second by default, which is well inside the
  * granularity anything here is specified in (`announce_frequency_seconds`, `max_wait_seconds` and
- * the penalty delays are all seconds) and is not a busy-wait: each pass is two cached reads and a
- * comparator over a roster that is almost always under twenty entries.
+ * the penalty delays are all seconds) and is not a busy-wait: the roster comes from a watched cache,
+ * the agent states from a snapshot shared by every caller polling the same roster inside a quarter
+ * of a second, and the line is one point get — a comparator over a roster that is almost always
+ * under twenty entries does the rest.
  *
  * ## Everything is a port
  *
@@ -79,6 +81,13 @@ export interface QueueDialAttempt {
 	readonly label: string;
 	/** What the B-leg's CDR records as the number reached. */
 	readonly destinationNumber: string;
+	/**
+	 * Whether {@link destinationNumber} is one of this tenant's extension numbers.
+	 *
+	 * False for an agent whose roster contact is a raw dial string: the walker must not build an AOR
+	 * out of it and resolve it against the registration bucket.
+	 */
+	readonly onNet: boolean;
 	readonly timeoutSeconds: number;
 }
 
@@ -420,6 +429,16 @@ export type QueueOutcome =
 const MILLIS_PER_SECOND = 1_000;
 const RELEASE_RETRY_INITIAL_MS = 250;
 const RELEASE_RETRY_MAX_MS = 5_000;
+/**
+ * How many times a release is retried before it is given up on.
+ *
+ * `tryOwnedTransition` answers `retry` for ANY unreadable agent-state bucket, so a deployment with
+ * the view missing would otherwise schedule one timer per agent per session forever, each holding
+ * the session, the candidate and an unresolved promise. Giving up is safe: the agent's `availableAt`
+ * deadline makes them eligible for distribution again on its own. Roughly two minutes at the backoff
+ * above.
+ */
+const RELEASE_RETRY_MAX_ATTEMPTS = 30;
 
 interface AgentRelease {
 	readonly candidate: QueueCandidate;
@@ -842,6 +861,7 @@ export class QueueSession {
 					endpoint: candidate.agent.contact,
 					label: `queue agent ${candidate.agent.name}`,
 					destinationNumber: candidate.agent.extensionNumber ?? candidate.agent.contact,
+					onNet: candidate.agent.extensionNumber !== undefined,
 					timeoutSeconds: this.settings.agentRingTimeoutSeconds,
 				})),
 				candidates.length > 1 || this.node.strategy === "ring-all" ? "all" : "one",
@@ -857,7 +877,7 @@ export class QueueSession {
 					return await this.abandon("caller-hangup");
 				}
 				case "failed": {
-					await this.releaseAll(pending, outcome.cause);
+					await this.releaseAll(pending, outcome.cause, outcome.agentId);
 					break;
 				}
 				default: {
@@ -934,7 +954,7 @@ export class QueueSession {
 		await this.whisperToAgent(mediaChannelId, membership, agentId);
 
 		const bridged = await this.call.bridge(mediaChannelId, () => {
-			void this.startWrapUp(membership, agentId);
+			this.detach(this.startWrapUp(membership, agentId), `wrap-up for agent ${agentId}`);
 		});
 
 		// AFTER the bridge, and only after a successful one. Recording is a tap on a bridged
@@ -949,7 +969,7 @@ export class QueueSession {
 			// The answer was real and the bridge was not. The agent is on a leg that is about to be
 			// torn down, so they go straight into wrap-up rather than back into distribution — ringing
 			// somebody whose handset just went dead is how a caller gets three seconds of silence.
-			void this.startWrapUp(membership, agentId);
+			this.detach(this.startWrapUp(membership, agentId), `wrap-up for agent ${agentId}`);
 			return { kind: "failed", reason: "the queue call could not be bridged" };
 		}
 
@@ -1075,15 +1095,27 @@ export class QueueSession {
 	 * request (and therefore the original penalty deadline) until the write succeeds or a fresh read
 	 * proves another call owns the entry.
 	 */
+	/**
+	 * Releases every reserved agent.
+	 *
+	 * `causeAgentId` names the ONE agent the cause actually belongs to, when it belongs to one. A
+	 * ring-all's `failed` carries a single leg's cause, and applying that cause — with its penalty
+	 * delay and its `noAnswerCount` increment — to every phone in the fan-out is how one agent
+	 * pressing decline benches a whole tier. Everybody else is released with no penalty.
+	 */
 	private async releaseAll(
 		reserved: Map<string, QueueCandidate>,
 		cause: HangupCause | undefined,
+		causeAgentId?: string,
 	): Promise<void> {
 		for (const [agentId, candidate] of reserved) {
 			if (this.transitionRetries.has(agentId)) {
 				continue;
 			}
-			const release = this.releaseFor(candidate, cause);
+			const release = this.releaseFor(
+				candidate,
+				causeAgentId === undefined || causeAgentId === agentId ? cause : undefined,
+			);
 			if (await this.release(release)) {
 				reserved.delete(agentId);
 			} else {
@@ -1164,11 +1196,26 @@ export class QueueSession {
 		if (this.transitionRetries.has(agentId)) {
 			return;
 		}
-		void this.retryOwnedTransition(release.request, release.candidate.agent.name, delayMs).then(
-			() => {
+		this.detach(
+			this.retryOwnedTransition(release.request, release.candidate.agent.name, delayMs).then(() => {
 				reserved.delete(agentId);
-			},
+			}),
+			`release of agent ${release.candidate.agent.name}`,
 		);
+	}
+
+	/**
+	 * Background work nothing awaits, with its rejection kept off the event loop.
+	 *
+	 * Both callers are reached from a media callback — `bridge`'s `onEnded` fires on the ARI event
+	 * socket — where an unhandled rejection takes the process down with every live call on it. The
+	 * failure is worth a note and nothing more: the agent's `availableAt` deadline makes them
+	 * eligible again regardless.
+	 */
+	private detach(work: Promise<unknown>, what: string): void {
+		work.catch((error: unknown) => {
+			this.call.note(`${what} failed: ${String(error)}`);
+		});
 	}
 
 	/**
@@ -1264,9 +1311,11 @@ export class QueueSession {
 		const retry = { request, promise, resolve: resolveRetry };
 		this.transitionRetries.set(request.agentId, retry);
 
+		let attempts = 0;
 		const schedule = (nextDelayMs: number): void => {
 			this.settings.scheduleReleaseRetry(async () => {
 				let result: OwnedTransitionResult = "retry";
+				attempts += 1;
 				try {
 					result = await this.tryOwnedTransition(request);
 				} catch (error) {
@@ -1276,6 +1325,14 @@ export class QueueSession {
 				if (result !== "retry") {
 					this.transitionRetries.delete(request.agentId);
 					retry.resolve(result === "succeeded");
+					return;
+				}
+				if (attempts >= RELEASE_RETRY_MAX_ATTEMPTS) {
+					this.transitionRetries.delete(request.agentId);
+					this.call.note(
+						`queue agent ${agentLabel} could not be transitioned to ${request.to} after ${attempts} attempts; giving up`,
+					);
+					retry.resolve(false);
 					return;
 				}
 				schedule(Math.min(nextDelayMs * 2, RELEASE_RETRY_MAX_MS));
@@ -1398,7 +1455,10 @@ export class QueueSession {
 			callId: this.call.callId,
 			legId: this.call.callerLegId,
 			waitMs,
-			position: Math.max(1, this.position),
+			// Omitted rather than floored to 1 when the line was never readable, the same spelling
+			// `exitKeyPressed` uses: a report full of abandonments "at position 1" that are really KV
+			// read failures is the confusion `position: 0` exists to remove.
+			...(this.position > 0 ? { position: this.position } : {}),
 			reason,
 		});
 		return reason === "caller-hangup"

@@ -64,6 +64,8 @@ export class QueueWaitingStore implements QueueWaitingPort {
 	private readonly logger = getLogger("engine.queue-waiting");
 	/** The line when no bucket is configured. Keyed exactly as the bucket is. */
 	private readonly local = new Map<string, QueueWaitingRecord>();
+	/** `key -> entries in the line as this process last wrote it`. Feeds {@link waitingCount}. */
+	private readonly lastCounts = new Map<string, number>();
 	private writes = 0;
 	private conflicts = 0;
 	private failures = 0;
@@ -78,11 +80,18 @@ export class QueueWaitingStore implements QueueWaitingPort {
 		return { writes: this.writes, conflicts: this.conflicts, failures: this.failures };
 	}
 
-	/** Waiting callers across every queue this process can see. `/healthz` reads it. */
+	/**
+	 * Waiting callers across every queue this process can see. `/healthz` reads it.
+	 *
+	 * Taken from the last line each queue was WRITTEN with, not from `local` — `local` is only ever
+	 * populated on the no-bucket fallback, so reading it reported zero on every deployment that has
+	 * JetStream, which is all of them. The lines are shared, so this counts callers held by every
+	 * instance of a queue this one is also serving; it is a queue-depth signal, not a per-process one.
+	 */
 	get waitingCount(): number {
 		let total = 0;
-		for (const record of this.local.values()) {
-			total += record.entries.length;
+		for (const count of this.lastCounts.values()) {
+			total += count;
 		}
 		return total;
 	}
@@ -215,6 +224,7 @@ export class QueueWaitingStore implements QueueWaitingPort {
 			);
 			const applied = apply(current);
 			this.local.set(key, applied.next);
+			this.lastCounts.set(key, applied.next.entries.length);
 			this.writes += 1;
 			return viewOf(applied.next, callId, now, applied.extra);
 		}
@@ -238,6 +248,7 @@ export class QueueWaitingStore implements QueueWaitingPort {
 					await bucket.update(key, value, read.revision);
 				}
 				this.writes += 1;
+				this.lastCounts.set(key, applied.next.entries.length);
 				return viewOf(applied.next, callId, now, applied.extra);
 			} catch (error) {
 				if (!isConflict(error)) {

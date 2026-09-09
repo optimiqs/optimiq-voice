@@ -141,9 +141,20 @@ export function orderedWaiting(
  * served than a caller told "you are next" four times in a row.
  */
 export function rankOf(record: QueueWaitingRecord, callId: string, now: number): number {
-	const ordered = orderedWaiting(record, now);
-	const index = ordered.findIndex((entry) => entry.callId === callId);
-	return index < 0 ? 0 : index + 1;
+	// Counted rather than sorted. `compareWaiting` is a total order (it tie-breaks on `callId`), so
+	// "how many callers sort ahead of me" is the same number the sorted array's index is — and this
+	// is one linear pass with no copy, on a path every waiting caller runs once a second.
+	const self = record.entries.find((entry) => entry.callId === callId);
+	if (self === undefined) {
+		return 0;
+	}
+	let ahead = 0;
+	for (const entry of record.entries) {
+		if (entry.callId !== callId && compareWaiting(entry, self, now) < 0) {
+			ahead += 1;
+		}
+	}
+	return ahead + 1;
 }
 
 /** Adds or replaces a caller's entry. Replacing is how a lease renewal is expressed. */
@@ -153,7 +164,11 @@ export function upsertWaiting(
 	now: number,
 ): QueueWaitingRecord {
 	const others = record.entries.filter((candidate) => candidate.callId !== entry.callId);
-	if (others.length >= QUEUE_WAITING_MAX_ENTRIES) {
+	// A RENEWAL of a caller already in the line is never subject to the cap: dropping somebody who
+	// legitimately holds a place would collapse their position to unknown permanently and move
+	// everybody behind them one place forward on paper. The cap only refuses a genuine insertion.
+	const renewal = others.length < record.entries.length;
+	if (!renewal && others.length >= QUEUE_WAITING_MAX_ENTRIES) {
 		// The line is full. The caller is still SERVED — they simply have no shared position, and
 		// the session reports that as unknown rather than as first. Refusing the call over a
 		// bookkeeping cap would be the wrong way round by a very long way.

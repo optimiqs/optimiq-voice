@@ -149,6 +149,24 @@ describe("allocateSession", () => {
 	});
 
 	/**
+	 * `mediad` unreachable during a teardown storm used to mean every leg torn down in that window
+	 * stayed in the session set permanently: `channelExists` answering `true` for legs that are
+	 * gone, and a set that only grows. Release is idempotent, so forgetting locally is safe.
+	 */
+	it("forgets the session even when the release itself fails", async () => {
+		const { port, transport } = newPort();
+
+		await port.allocateSession({ sessionId: SESSION, orgId: ORG, callId: CALL, sdpOffer: OFFER });
+		expect(await port.channelExists(SESSION)).toBe(true);
+
+		transport.failure = new Error("no reply within 500ms");
+		await expect(port.releaseSession(SESSION)).rejects.toThrow("no reply within 500ms");
+
+		transport.failure = undefined;
+		expect(await port.channelExists(SESSION)).toBe(false);
+	});
+
+	/**
 	 * A refusal is a REPLY, and the engine branches on the code. Surfacing it as a typed error with
 	 * the code intact is what lets a caller tell "try another instance" from "route this to
 	 * Asterisk".

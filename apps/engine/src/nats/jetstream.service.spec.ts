@@ -95,6 +95,32 @@ function serviceWith(
 }
 
 describe("JetStreamService channel ownership", () => {
+	/**
+	 * A key deleted between the losing `create` and the read that follows it means "nobody owns
+	 * it", not "somebody does". Answering "owned" left the arriving channel up in Stasis with no
+	 * aggregate and no teardown path, because `onLegArrived` deliberately never hangs up on a lost
+	 * claim — a leg that rings forever, with no CDR.
+	 */
+	it("retakes a claim whose key vanished between the losing create and the read", async () => {
+		const kv = new FakeChannelsKv();
+		// The key exists when the first `create` runs and is gone by the time `get` looks for it.
+		let creates = 0;
+		const racing = Object.assign(Object.create(FakeChannelsKv.prototype) as FakeChannelsKv, kv, {
+			create: async (key: string, value: Uint8Array) => {
+				creates += 1;
+				return creates === 1 ? Promise.reject(conflict()) : await kv.create(key, value);
+			},
+			get: async (key: string) => await kv.get(key),
+			update: async (key: string, value: Uint8Array, previousSeq: number) =>
+				await kv.update(key, value, previousSeq),
+		});
+		const service = serviceWith(racing);
+
+		await expect(service.claimChannel(snapshot(), 1_000)).resolves.toBe("claimed");
+		expect(creates).toBe(2);
+		expect(kv.read(KEY)?.variables[CHANNEL_OWNER_INSTANCE_VARIABLE]).toBe("engine-1");
+	});
+
 	it("claims the canonical key with a renewable ownership lease", async () => {
 		const kv = new FakeChannelsKv();
 		const service = serviceWith(kv);

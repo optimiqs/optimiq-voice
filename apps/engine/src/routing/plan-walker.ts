@@ -1183,10 +1183,20 @@ interface DialAttempt {
 	 * §5.1. Additive alongside {@link endpoint}, which stays exactly as it is for the ARI adapter: the
 	 * `apps/sipd` composite reads `target` and refuses `bad_request` when it is absent, `AriMediaAdapter`
 	 * and `MediadMediaPort` ignore it. A `{kind:"trunk"}` is set at the trunk sites where the trunk id is
-	 * in hand; an extension `{kind:"aor"}` is derived in {@link PlanWalker.originate} from
-	 * {@link PlanWalkerSettings.sipRealm} when it is configured.
+	 * in hand; an extension `{kind:"aor"}` is derived in {@link PlanWalker.targetFor} from
+	 * {@link PlanWalkerSettings.sipRealm} when it is configured AND {@link onNet} says this leg is one.
 	 */
 	readonly target?: DialTarget;
+	/**
+	 * Whether this leg reaches a registered handset of THIS tenant, i.e. whether
+	 * `sip:{destinationNumber}@{realm}` is a meaningful AOR for it.
+	 *
+	 * Set only where an extension NUMBER is being dialled. An off-net follow-me hop, an `external`
+	 * node and a queue agent whose roster contact is a raw dial string are not AORs: deriving one for
+	 * them would send the INVITE at the tenant's registration bucket instead of the trunk the
+	 * compiler chose, so they leave this unset and carry an explicit {@link target} or none at all.
+	 */
+	readonly onNet?: boolean;
 	readonly timeoutSeconds: number;
 	readonly delaySeconds: number;
 	readonly callerId?: string;
@@ -1305,6 +1315,11 @@ export class PlanWalker {
 	private destination: PlanDestination | undefined;
 	/** Closes the queued caller's DTMF watch. Set for the life of one queue node, and only then. */
 	private queueDigitUnwatch: (() => void) | undefined;
+	/** `number -> extension node`, built lazily per node table. See {@link extensionNodeFor}. */
+	private readonly extensionsByNumber = new WeakMap<
+		WalkInput["plan"]["nodes"],
+		Map<string, ExtensionPlanNode>
+	>();
 
 	constructor(private readonly deps: PlanWalkerDependencies) {
 		this.settings = { ...DEFAULT_PLAN_WALKER_SETTINGS, ...deps.settings };
@@ -1829,6 +1844,7 @@ export class PlanWalker {
 				endpoint: this.endpointForExtension(extension.number),
 				label: `intercom to extension ${extension.number}`,
 				destinationNumber: extension.number,
+				onNet: true,
 				timeoutSeconds: this.settings.intercomTimeoutSeconds,
 				delaySeconds: 0,
 				callerId: this.callerIdFor(input),
@@ -2062,14 +2078,25 @@ export class PlanWalker {
 		return node.followMe !== undefined;
 	}
 
-	/** The caller's own `extension` node, found by number in the artifact's table. */
+	/**
+	 * The caller's own `extension` node, found by number in the artifact's table.
+	 *
+	 * Indexed once per node table rather than scanned per call: screening asks for this on every
+	 * extension dial, and a large tenant's table is thousands of entries. A duplicate number keeps
+	 * the first node, exactly as the scan did.
+	 */
 	private extensionNodeFor(callerNumber: string, input: WalkInput): ExtensionPlanNode | undefined {
-		for (const candidate of Object.values(input.plan.nodes)) {
-			if (candidate.kind === "extension" && candidate.number === callerNumber) {
-				return candidate;
+		let index = this.extensionsByNumber.get(input.plan.nodes);
+		if (index === undefined) {
+			index = new Map<string, ExtensionPlanNode>();
+			for (const candidate of Object.values(input.plan.nodes)) {
+				if (candidate.kind === "extension" && !index.has(candidate.number)) {
+					index.set(candidate.number, candidate);
+				}
 			}
+			this.extensionsByNumber.set(input.plan.nodes, index);
 		}
-		return undefined;
+		return index.get(callerNumber);
 	}
 
 	/**
@@ -2741,6 +2768,7 @@ export class PlanWalker {
 						endpoint: this.endpointForExtension(number),
 						label: `extension ${number}`,
 						destinationNumber: number,
+						onNet: true,
 						timeoutSeconds: node.timeoutSeconds || this.settings.defaultRingTimeoutSeconds,
 						delaySeconds: 0,
 						callerId: this.callerIdFor(input),
@@ -3000,6 +3028,7 @@ export class PlanWalker {
 					endpoint: this.endpointForExtension(node.number),
 					label: `extension ${node.number}`,
 					destinationNumber: node.number,
+					onNet: true,
 					timeoutSeconds: node.timeoutSeconds || this.settings.defaultRingTimeoutSeconds,
 					delaySeconds: 0,
 					callerId: this.callerIdFor(input),
@@ -3118,6 +3147,7 @@ export class PlanWalker {
 					endpoint: this.endpointForExtension(node.number),
 					label: `extension ${node.number}`,
 					destinationNumber: node.number,
+					onNet: true,
 					timeoutSeconds: node.timeoutSeconds || this.settings.defaultRingTimeoutSeconds,
 					delaySeconds: 0,
 					callerId: this.callerIdFor(input),
@@ -3282,6 +3312,7 @@ export class PlanWalker {
 				endpoint: this.endpointForExtension(target.number),
 				label: `extension ${target.number}`,
 				destinationNumber: target.number,
+				onNet: true,
 				timeoutSeconds,
 				delaySeconds: hop.delaySeconds,
 				callerId: this.callerIdFor(input),
@@ -3313,6 +3344,10 @@ export class PlanWalker {
 			endpoint: this.settings.trunkDialTemplate
 				.replaceAll("{number}", number)
 				.replaceAll("{trunk}", trunk.name),
+			// The structured target for the SIP edge (§5.1), exactly as `trunkDialNode` sets it. Without
+			// it an off-net hop would fall through to an AOR built from the mobile number and be
+			// resolved against the tenant's registrations instead of the carrier the compiler chose.
+			target: { kind: "trunk", trunkId: trunk.trunkId, number },
 			label: `follow-me ${hop.destination}`,
 			destinationNumber: number,
 			timeoutSeconds,
@@ -3382,6 +3417,7 @@ export class PlanWalker {
 				endpoint: this.endpointForExtension(target.number),
 				label: `extension ${target.number}`,
 				destinationNumber: target.number,
+				onNet: true,
 				timeoutSeconds:
 					member.timeoutSeconds ||
 					node.ringTimeoutSeconds ||
@@ -3887,6 +3923,11 @@ export class PlanWalker {
 				this.deps.channel.mediaChannelId,
 				this.deps.channel.organizationId,
 			);
+			// Only for the member that opened the room. Everyone else's failed add leaves a bridge the
+			// rest of the meeting is still talking in, and destroying that would end it for them.
+			if (joined.created) {
+				await this.destroyBridgeQuietly(bridgeId);
+			}
 			this.log("failed to join a conference bridge", { bridgeId, err: String(error) });
 			this.note(`joining conference room ${node.roomNumber} failed: ${String(error)}`);
 			return { kind: "hangup", cause: "NORMAL_TEMPORARY_FAILURE" };
@@ -4601,7 +4642,9 @@ export class PlanWalker {
 				}
 			}
 		};
-		void poll();
+		void poll().catch((error: unknown) => {
+			this.log("the moderator claim poll failed", { err: String(error) });
+		});
 		const unwatch = this.deps.signals.watch(
 			legSignalKey(this.deps.channel.mediaChannelId),
 			(signal) => {
@@ -4611,11 +4654,22 @@ export class PlanWalker {
 				}
 			},
 		);
-		const expiry = this.delay(this.settings.conferenceModeratorWaitMs).then(() => {
-			waiter.cancel();
+		// A clearable timer rather than `this.delay`, which has none: a moderator who joins in the
+		// first second would otherwise leave the ten-minute wait — and the closure holding `waiter`,
+		// and through it this walker — alive for the whole of it.
+		let expiryTimer: ReturnType<typeof setTimeout> | undefined;
+		const expiry = new Promise<void>((resolve) => {
+			expiryTimer = setTimeout(() => {
+				waiter.cancel();
+				resolve();
+			}, this.settings.conferenceModeratorWaitMs);
+			expiryTimer.unref?.();
 		});
 
 		await Promise.race([waiter.arrived, expiry]);
+		if (expiryTimer !== undefined) {
+			clearTimeout(expiryTimer);
+		}
 		polling = false;
 		unwatch();
 		waiter.cancel();
@@ -5471,6 +5525,7 @@ export class PlanWalker {
 			endpoint: attempt.endpoint,
 			label: attempt.label,
 			destinationNumber: attempt.destinationNumber,
+			onNet: attempt.onNet,
 			timeoutSeconds: attempt.timeoutSeconds || ringTimeoutSeconds,
 			delaySeconds: 0,
 			...(this.callerIdForQueue() === undefined ? {} : { callerId: this.callerIdForQueue() }),
@@ -5575,7 +5630,7 @@ export class PlanWalker {
 		const routes = (
 			await Promise.all(
 				originalAttempts.map(async (attempt, originalIndex) => {
-					const target = attempt.target ?? this.aorTargetFor(attempt.destinationNumber);
+					const target = this.targetFor(attempt);
 					let groups: readonly (readonly DialTarget[])[] | undefined;
 					let unavailable = false;
 					if (
@@ -5587,6 +5642,7 @@ export class PlanWalker {
 							groups = await this.deps.media.resolveTargets(
 								this.deps.channel.organizationId,
 								target,
+								this.deps.channel.channelId,
 							);
 						} catch (error) {
 							unavailable = true;
@@ -5617,6 +5673,12 @@ export class PlanWalker {
 		if (routes.length === 0) return { kind: "failed", cause: "USER_NOT_REGISTERED", index: 0 };
 		const attempts = routes.map((route) => route.attempt);
 		const started = new Set<number>();
+		/**
+		 * The legs an INVITE was actually asked for. A delayed ring-group member whose delay is still
+		 * running when somebody else answers is `started` but has no channel; hanging it up would file
+		 * a `LOSE_RACE` cause against a media channel that was never originated.
+		 */
+		const originated = new Set<number>();
 		const closing = new Set<number>();
 		const groupDeadlines = new Map<string, ReturnType<typeof setTimeout>>();
 		const inFlight = new Set<Promise<void>>();
@@ -5805,6 +5867,7 @@ export class PlanWalker {
 					});
 					progressByIndex.set(index, progress);
 					progressTimers.push(progress);
+					originated.add(index);
 					await this.originate(attempt, channelIds[index]!, route.originalIndex, (cause) =>
 						legIsOut(index, cause),
 					);
@@ -5837,7 +5900,7 @@ export class PlanWalker {
 
 		const winner = outcome.kind === "answered" ? outcome.mediaChannelId : undefined;
 		for (const [index, channelId] of channelIds.entries()) {
-			if (!started.has(index) || channelId === winner || ended.has(index)) {
+			if (!originated.has(index) || channelId === winner || ended.has(index)) {
 				continue;
 			}
 			await this.hangupQuietly(channelId, winner === undefined ? "ORIGINATOR_CANCEL" : "LOSE_RACE");
@@ -5890,7 +5953,7 @@ export class PlanWalker {
 		index: number,
 		abortOnCallerHangup = false,
 	): Promise<DialOutcome> {
-		const target = attempt.target ?? this.aorTargetFor(attempt.destinationNumber);
+		const target = this.targetFor(attempt);
 		if (
 			target?.kind === "aor" &&
 			target.contactUri === undefined &&
@@ -6265,7 +6328,7 @@ export class PlanWalker {
 			// trunk id is in hand) wins; otherwise an extension is dialled `sip:{number}@{realm}` when a
 			// realm is configured. `undefined` is passed through untouched — the ARI adapter ignores it and
 			// the composite refuses `originate` by name, which the walker already reads as "not reachable".
-			const target = attempt.target ?? this.aorTargetFor(attempt.destinationNumber);
+			const target = this.targetFor(attempt);
 			await this.deps.media.originate({
 				endpoint: attempt.endpoint,
 				application: this.settings.application,
@@ -6326,6 +6389,10 @@ export class PlanWalker {
 				peerMediaChannelId,
 			]);
 		} catch (error) {
+			// `createBridge` may well have succeeded and the add failed on a leg that died in between,
+			// which leaves a mixing bridge nobody is in and nothing downstream to clean it up:
+			// `setBridge` has not been called yet.
+			await this.destroyBridgeQuietly(bridgeId);
 			this.log("failed to bridge the call", { bridgeId, err: String(error) });
 			this.note(`bridging failed: ${String(error)}`);
 			await this.hangupQuietly(peerMediaChannelId, "NORMAL_TEMPORARY_FAILURE");
@@ -6468,13 +6535,29 @@ export class PlanWalker {
 	}
 
 	/**
-	 * The structured {@link DialTarget} for an extension B-leg on the SIP edge, or `undefined`.
+	 * The structured {@link DialTarget} one attempt is originated with, or `undefined`.
+	 *
+	 * An explicit {@link DialAttempt.target} — a trunk, set wherever the trunk id is in hand — wins.
+	 * Otherwise an AOR is derived ONLY for a leg the site marked {@link DialAttempt.onNet}; anything
+	 * else is originated with no structured target, which the ARI adapter ignores and the composite
+	 * refuses `originate` for by name. That refusal is the honest failure; an AOR built out of an
+	 * off-net number would instead be resolved against the tenant's registrations.
+	 */
+	private targetFor(attempt: DialAttempt): DialTarget | undefined {
+		if (attempt.target !== undefined) {
+			return attempt.target;
+		}
+		return attempt.onNet === true ? this.aorTargetFor(attempt.destinationNumber) : undefined;
+	}
+
+	/**
+	 * The `{kind:"aor"}` {@link DialTarget} for an on-net extension number, or `undefined`.
 	 *
 	 * `apps/sipd` resolves `{kind:"aor"}` against the `registrations` bucket it owns, so the AOR must be
 	 * the one the phone registered under — `sip:{number}@{realm}`. The realm is a per-tenant fact
 	 * (`plans/sipd-invite-design.md` §5.1); until it is threaded from the org's `sip` settings into
-	 * {@link PlanWalkerSettings.sipRealm}, this returns `undefined` and the composite refuses `originate`
-	 * by name rather than dialling an unresolvable URI — the honest failure, not a fabricated target.
+	 * {@link PlanWalkerSettings.sipRealm}, this returns `undefined`. Only ever reached for an attempt
+	 * that {@link DialAttempt.onNet} marks as one — see {@link PlanWalker.targetFor}.
 	 */
 	private aorTargetFor(number: string): DialTarget | undefined {
 		if (this.settings.sipRealm === undefined || this.settings.sipRealm === "") {

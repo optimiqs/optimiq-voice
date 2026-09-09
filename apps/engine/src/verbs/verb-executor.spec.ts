@@ -38,9 +38,12 @@ const ANSWERED: VerbChannelContext = {
 	channelId: "0195c0f0-1c2f-7000-8000-0000000000e1",
 	isTearingDown: false,
 	hasMediaPath: true,
+	isAnswered: true,
 };
 
-const UNANSWERED: VerbChannelContext = { ...ANSWERED, hasMediaPath: false };
+const UNANSWERED: VerbChannelContext = { ...ANSWERED, hasMediaPath: false, isAnswered: false };
+/** 183 with SDP: audio reaches the caller, but nothing answered. */
+const EARLY_MEDIA: VerbChannelContext = { ...ANSWERED, isAnswered: false };
 const TEARING_DOWN: VerbChannelContext = { ...ANSWERED, isTearingDown: true };
 
 const COLLECTION: DtmfCollection = { digits: ["1", "2"], endReason: "max-digits" };
@@ -223,6 +226,23 @@ describe("guards", () => {
 		expect(Exit.isSuccess(await run(media.port, UNANSWERED, { verb: "answer" }))).toBe(true);
 		expect(Exit.isSuccess(await run(media.port, UNANSWERED, { verb: "ringing" }))).toBe(true);
 		expect(Exit.isSuccess(await run(media.port, UNANSWERED, { verb: "hangup" }))).toBe(true);
+	});
+
+	it("refuses hold and park on an early-media leg rather than breaking the state machine", async () => {
+		for (const verb of ["hold", "unhold", "park", "unpark"] as const) {
+			const media = fakeMedia();
+			const failure = failureValue(await run(media.port, EARLY_MEDIA, { verb }));
+			expect(failure).toBeInstanceOf(VerbNotPermittedFailure);
+			expect((failure as VerbNotPermittedFailure).reason).toContain("early media");
+			expect(media.calls).toEqual([]);
+		}
+	});
+
+	it("still allows a plain media verb on an early-media leg", async () => {
+		const media = fakeMedia();
+		expect(
+			Exit.isSuccess(await run(media.port, EARLY_MEDIA, { verb: "play", media: "sound:hello" })),
+		).toBe(true);
 	});
 });
 

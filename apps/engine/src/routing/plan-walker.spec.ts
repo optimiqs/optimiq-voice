@@ -844,6 +844,20 @@ describe("extension nodes", () => {
 		expect(h.media.hungUp().map((call) => call.cause)).toContain("NORMAL_TEMPORARY_FAILURE");
 	});
 
+	it("destroys the bridge it created when the media add fails", async () => {
+		// `createBridge` succeeding and `addToBridge` failing is the ordinary case — a leg that died in
+		// between. Nothing downstream cleans up after it: `setBridge` has not been called yet, so the
+		// mixing bridge would sit on the media server for the life of the process.
+		const h = harness({ reactions: { "PJSIP/1001": { kind: "answer" } } });
+		h.media.addToBridge = async () => {
+			throw new Error("channel is gone");
+		};
+		const outcome = await h.walker.walk(walkInput(plan()));
+
+		expect(outcome.status).toBe("hangup");
+		expect(h.media.methods()).toContain("destroyBridge");
+	});
+
 	it("hangs the A-leg up once the bridged peer goes away", async () => {
 		const h = harness({ reactions: { "PJSIP/1001": { kind: "answer" } } });
 		await h.walker.walk(walkInput(plan()));
@@ -2205,6 +2219,28 @@ describe("external numbers", () => {
 
 		expect(outcome.status).toBe("bridged");
 		expect(h.media.originated()[0]?.endpoint).toBe("PJSIP/+15557654321@external");
+	});
+
+	it("does not turn the destination into an AOR when a SIP realm is configured", async () => {
+		// A realm makes an EXTENSION dialable as `sip:{number}@{realm}`. An external number is not an
+		// extension: an AOR built from it would be resolved against the tenant's registrations rather
+		// than sent out a trunk. No structured target is the honest answer — the composite refuses.
+		const h = harness({
+			reactions: { external: { kind: "answer" } },
+			settings: { sipRealm: "acme.example.com" },
+		});
+		await h.walker.walk(
+			walkInput([
+				{
+					id: "x",
+					kind: "external",
+					destination: "+15557654321",
+					viaOutboundRouting: false,
+				} as PlanNode,
+			]),
+		);
+
+		expect(h.media.originated()[0]?.target).toBeUndefined();
 	});
 
 	it("REFUSES a forward that requires outbound routing rather than dialling direct", async () => {

@@ -585,6 +585,28 @@ describe("distributing to agents", () => {
 		expect(h.services.agents.statusOf("a")).toBe("available");
 	});
 
+	it("gives up rather than retrying a permanently unreadable bucket forever", async () => {
+		// `retry` is what an unreadable bucket answers, so an unconfigured view would otherwise leave
+		// one unref'd timer per agent per session alive for the life of the process, each holding the
+		// session graph. The agent's own `availableAt` deadline makes them eligible again anyway.
+		const h = harness({
+			agents: [fakeAgent("a")],
+			dials: [{ kind: "caller-gone" }],
+			releaseFailures: 1_000,
+		});
+
+		await h.session.run();
+		let scheduled = 0;
+		while (h.scheduledReleaseRetries.length > 0) {
+			scheduled += 1;
+			expect(scheduled).toBeLessThan(100);
+			await h.runNextReleaseRetry();
+		}
+
+		expect(scheduled).toBe(30);
+		expect(h.notes.join(" ")).toContain("giving up");
+	});
+
 	it("stops retrying without overwriting a reservation now owned by another call", async () => {
 		const h = harness({
 			agents: [fakeAgent("a")],
@@ -694,6 +716,27 @@ describe("penalties", () => {
 		);
 		// 45 s from the moment the ring ENDED (a 20 s ring-out), not from when the caller joined.
 		expect(released?.availableAt).toBe(START + 20_000 + 45_000);
+	});
+
+	it("penalises only the agent the cause belongs to on a ring-all", async () => {
+		// A fanned-out `failed` carries ONE leg's cause. Charging it to every reserved agent lets one
+		// person pressing decline bench the whole tier with a reject delay.
+		const h = harness({
+			node: { strategy: "ring-all" },
+			agents: [
+				fakeAgent("a", { rejectDelaySeconds: 90 }),
+				fakeAgent("b", { rejectDelaySeconds: 90 }),
+			],
+			dials: [{ kind: "reject" }],
+			budget: 2,
+		});
+		await h.session.run();
+		const releaseOf = (agentId: string) =>
+			h.services.agents.transitions.find(
+				(transition) => transition.agentId === agentId && transition.to === "available",
+			);
+		expect(releaseOf("a")?.availableAt).toBe(START + 20_000 + 90_000);
+		expect(releaseOf("b")?.availableAt).toBeUndefined();
 	});
 
 	it("does NOT count a busy phone towards the no-answer budget", async () => {
@@ -1085,6 +1128,17 @@ describe("the caller hangs up", () => {
 			position: 1,
 			legId: LEG_ID,
 		});
+	});
+
+	it("omits the position entirely when the line was never readable", async () => {
+		// A floor of 1 here would fill the SLA report with abandonments "at position 1" that are
+		// really KV read failures — the exact confusion `position: 0` was introduced to remove.
+		const h = harness({ seed: { a: "on-call", b: "on-call" }, budget: 2 });
+		const unknown = { position: 0, waiting: 0, longestWaitMs: 0, resumed: false, joinedAt: 0 };
+		h.services.waiting.join = async () => unknown;
+		h.services.waiting.refresh = async () => unknown;
+		await h.session.run();
+		expect(eventData(h, "caller.abandoned")).not.toHaveProperty("position");
 	});
 
 	it("abandons when the caller goes while an agent's phone is ringing", async () => {

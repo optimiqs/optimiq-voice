@@ -243,6 +243,20 @@ describe("without a bucket configured", () => {
 		expect(store.waitingCount).toBe(2);
 	});
 
+	it("counts the callers in the SHARED line, not only the no-bucket fallback's", async () => {
+		// `local` is only ever populated when no bucket is configured, so reading it reported zero on
+		// every deployment that has JetStream — a health signal that is silently and permanently wrong.
+		const bucket = fakeBucket();
+		const store = storeOver(bucket);
+		await store.join(joinOf({ callId: OTHER_CALL, now: NOW }));
+		await store.join(joinOf({ now: NOW + 1_000 }));
+
+		expect(store.waitingCount).toBe(2);
+
+		await store.leave({ orgId: ORG, queueId: QUEUE, callId: CALL, now: NOW + 2_000 });
+		expect(store.waitingCount).toBe(1);
+	});
+
 	it("gives a caller's place back when they leave", async () => {
 		const store = storeOver(undefined);
 		await store.join(joinOf());

@@ -436,20 +436,32 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		return await this.serializeChannelOperation(key, async () => {
 			const expiresAt = now + CHANNEL_OWNERSHIP_LEASE_MS;
 			const owned = withChannelOwnership(snapshot, this.env.ENGINE_INSTANCE_ID, expiresAt);
-			try {
-				const revision = await kv.create(key, encodeChannel(owned));
-				this.rememberChannelOwnership(key, revision, expiresAt);
-				return "claimed";
-			} catch (error) {
-				if (isConflict(error)) {
-					return await this.adoptChannelAt(kv, key, now, false);
+			const create = async (): Promise<ChannelClaimResult | "vanished"> => {
+				try {
+					const revision = await kv.create(key, encodeChannel(owned));
+					this.rememberChannelOwnership(key, revision, expiresAt);
+					return "claimed";
+				} catch (error) {
+					if (isConflict(error)) {
+						return await this.adoptChannelAt(kv, key, now, false);
+					}
+					this.logger.warn(
+						{ key, err: String(error) },
+						"failed to claim a channel; admission is closed to prevent duplicate ownership",
+					);
+					return "unavailable";
 				}
-				this.logger.warn(
-					{ key, err: String(error) },
-					"failed to claim a channel; admission is closed to prevent duplicate ownership",
-				);
-				return "unavailable";
+			};
+			const first = await create();
+			if (first !== "vanished") {
+				return first;
 			}
+			// The key was deleted between the losing `create` and the read that followed it — a leg
+			// that ended, not one somebody else owns. Answering "owned" here would leave the arriving
+			// channel up in Stasis with no aggregate, no duration ceiling and no teardown path, since
+			// `onLegArrived` deliberately never hangs up on a lost claim. One retry, then give up.
+			const second = await create();
+			return second === "vanished" ? "unavailable" : second;
 		});
 	}
 
@@ -460,10 +472,11 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 			return "unavailable";
 		}
 		const key = kvKeyFor.channel(snapshot.organizationId, snapshot.callId, snapshot.channelId);
-		return await this.serializeChannelOperation(
-			key,
-			async () => await this.adoptChannelAt(kv, key, now, true),
-		);
+		return await this.serializeChannelOperation(key, async () => {
+			const result = await this.adoptChannelAt(kv, key, now, true);
+			// Nothing left to adopt: the snapshot this pass read is already gone from the bucket.
+			return result === "vanished" ? "owned" : result;
+		});
 	}
 
 	/** Extends one locally-owned lease while preserving its latest aggregate snapshot. */
@@ -568,12 +581,13 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		key: string,
 		now: number,
 		allowSameOwner: boolean,
-	): Promise<ChannelClaimResult> {
+	): Promise<ChannelClaimResult | "vanished"> {
 		let current: { readonly snapshot: ChannelSnapshot; readonly revision: number } | undefined;
 		try {
 			const entry = await kv.get(key);
 			if (entry === null || entry.value.length === 0) {
-				return "owned";
+				// "nobody owns it", which is NOT "somebody does" — the caller decides what to do.
+				return "vanished";
 			}
 			const snapshot = JSON.parse(new TextDecoder().decode(entry.value)) as ChannelSnapshot;
 			const expectedKey = kvKeyFor.channel(

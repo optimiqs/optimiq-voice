@@ -284,8 +284,17 @@ export interface TapHandle {
  * decisions on the far side of this seam.
  */
 export interface MediaPort {
-	/** Live contacts grouped by decreasing SIP preference; used before creating outbound legs. */
-	resolveTargets?(orgId: string, target: DialTarget): Promise<readonly (readonly DialTarget[])[]>;
+	/**
+	 * Live contacts grouped by decreasing SIP preference; used before creating outbound legs.
+	 *
+	 * `legId` is the leg the resolution is being done FOR — the A-leg the walker is planning — so a
+	 * refusal is attributed to a real leg rather than to the lookup itself.
+	 */
+	resolveTargets?(
+		orgId: string,
+		target: DialTarget,
+		legId: string,
+	): Promise<readonly (readonly DialTarget[])[]>;
 	/**
 	 * The mode this driver's bridges actually run in.
 	 *

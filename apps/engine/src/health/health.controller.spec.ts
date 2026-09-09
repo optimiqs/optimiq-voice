@@ -3,6 +3,7 @@ import { HealthController } from "./health.controller";
 import type { ChannelOrchestrator } from "../calls/channel-orchestrator.service";
 import type { AriConnectionService } from "../media/ari-connection.service";
 import type { MediadService } from "../media/mediad.service";
+import type { SipdService, SipdSubscriptionState } from "../media/sipd.service";
 import type { JetStreamService } from "../nats/jetstream.service";
 import type { ParkHandoffService } from "../nats/park-handoff.service";
 import type { FastifyReply } from "fastify";
@@ -22,6 +23,7 @@ interface Parts {
 	readonly mediaDriver?: "ari" | "mediad";
 	readonly mediadReady?: boolean;
 	readonly mediadReachable?: boolean;
+	readonly sipdSubscription?: SipdSubscriptionState;
 	readonly natsReady?: boolean;
 	readonly draining?: boolean;
 	readonly parkListening?: boolean;
@@ -43,6 +45,12 @@ function harness(parts: Parts = {}) {
 		subscriptionState: (parts.mediadReady ?? true) ? "subscribed" : "idle",
 		eventCount: 12,
 	} as unknown as MediadService;
+
+	const sipd = {
+		isSelected: parts.mediaDriver === "mediad",
+		subscriptionState: parts.sipdSubscription ?? "subscribed",
+		eventCount: 5,
+	} as unknown as SipdService;
 
 	const jetstream = {
 		isReady: parts.natsReady ?? true,
@@ -67,7 +75,7 @@ function harness(parts: Parts = {}) {
 		},
 	} as unknown as FastifyReply;
 
-	const controller = new HealthController(ari, mediad, jetstream, orchestrator, parkHandoff);
+	const controller = new HealthController(ari, mediad, sipd, jetstream, orchestrator, parkHandoff);
 	return { controller, reply, statuses };
 }
 
@@ -100,6 +108,25 @@ describe("/healthz", () => {
 			subscription: "subscribed",
 			eventsReceived: 12,
 		});
+		expect(h.statuses).toEqual([]);
+	});
+
+	it("reports degraded when the selected sipd dialog feed has ended", () => {
+		// The state the section exists for: media is fine, NATS is fine, and no call can ever end.
+		const h = harness({ mediaDriver: "mediad", sipdSubscription: "closed" });
+		const report = h.controller.health(h.reply);
+
+		expect(report.status).toBe("degraded");
+		expect(report.sipd).toEqual({ selected: true, subscription: "closed", eventsReceived: 5 });
+		expect(h.statuses).toEqual([503]);
+	});
+
+	it("ignores the intentionally idle sipd feed under the ARI driver", () => {
+		const h = harness({ mediaDriver: "ari", sipdSubscription: "idle" });
+		const report = h.controller.health(h.reply);
+
+		expect(report.status).toBe("ok");
+		expect(report.sipd.selected).toBe(false);
 		expect(h.statuses).toEqual([]);
 	});
 

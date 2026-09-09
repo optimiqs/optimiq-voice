@@ -322,16 +322,30 @@ export class MediadMediaPort implements MediaPort {
 		return response.objectKey;
 	}
 
-	/** Frees a session and its directory entry. Idempotent — a repeat is `released: false`. */
+	/**
+	 * Frees a session and its directory entry. Idempotent — a repeat is `released: false`.
+	 *
+	 * The local forget happens in a `finally` because release is idempotent and the failure it has
+	 * to survive is `mediad` being briefly unreachable during a teardown storm: keeping the session
+	 * on that path would make `channelExists` answer `true` for legs that are gone, forever, and
+	 * grow both maps without bound. The throw still propagates — the caller's release genuinely did
+	 * not happen — but this adapter no longer remembers a session it has stopped tracking.
+	 */
 	async releaseSession(sessionId: string): Promise<boolean> {
-		const response = await this.call(
-			RPC_SUBJECTS.mediaReleaseSession,
-			{ sessionId },
-			mediaReleaseSessionResponseSchema,
-		);
-		this.sessions.delete(sessionId);
-		this.forgetMember(sessionId);
-		return response.released;
+		try {
+			const response = await this.call(
+				RPC_SUBJECTS.mediaReleaseSession,
+				{ sessionId },
+				mediaReleaseSessionResponseSchema,
+			);
+			return response.released;
+		} finally {
+			this.sessions.delete(sessionId);
+			// Hold music is only ever stopped by `stopMusicOnHold`, which a caller who hangs up while
+			// on hold never reaches. Releasing the session is the one moment that is guaranteed.
+			this.music.delete(sessionId);
+			this.forgetMember(sessionId);
+		}
 	}
 
 	// --- MediaPort: supported --------------------------------------------------------------------

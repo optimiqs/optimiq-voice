@@ -292,7 +292,10 @@ function orderFor(
 			return rotateAfter([...candidates].sort(compareByTier), input.roundRobinAfterAgentId);
 		}
 		case "random": {
-			return shuffled([...candidates].sort(compareByTier), input.random ?? Math.random);
+			// No sort first: a Fisher-Yates over an already-ordered array has exactly the distribution
+			// of one over the unordered array, so `random` deliberately discards the tier order. Tiers
+			// are still honoured where they decide anything — eligibility is applied before this.
+			return shuffled(candidates, input.random ?? Math.random);
 		}
 		default: {
 			// `ring-all`, `top-down` and `sequential` all present the tier order. The difference

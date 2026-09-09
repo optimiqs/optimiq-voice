@@ -2,7 +2,11 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { ModuleEffectRuntime } from "@optimiq-voice/effect-runtime";
-import { isTerminalVerb, verbRequiresMediaPath } from "@optimiq-voice/telephony";
+import {
+	isTerminalVerb,
+	verbRequiresAnswer,
+	verbRequiresMediaPath,
+} from "@optimiq-voice/telephony";
 import {
 	MediaCommandFailure,
 	UnsupportedVerbFailure,
@@ -84,6 +88,8 @@ export interface VerbChannelContext {
 	readonly isTearingDown: boolean;
 	/** Whether audio can reach the caller: answered, or early media is open. */
 	readonly hasMediaPath: boolean;
+	/** Whether the leg is ANSWERED, as opposed to merely carrying early media. */
+	readonly isAnswered: boolean;
 }
 
 /** Collects DTMF for a `gather`. Supplied by the orchestrator, which owns the digit queue. */
@@ -182,6 +188,18 @@ export function makeVerbExecutor(deps: VerbExecutorDependencies): VerbExecutorIn
 					verb,
 					channelId: context.channelId,
 					reason: "the leg has neither answered nor opened early media",
+				}),
+			);
+		}
+		// A media path is not enough for hold/unhold/park/unpark: the call-state machine has no edge
+		// from `early` to `held`, so letting one through the guard raises an invariant error mid-call
+		// instead of a clean refusal. See ANSWERED_VERBS in @optimiq-voice/telephony.
+		if (verbRequiresAnswer(verb) && !context.isAnswered) {
+			return Effect.fail(
+				new VerbNotPermittedFailure({
+					verb,
+					channelId: context.channelId,
+					reason: "the leg is in early media and has not answered",
 				}),
 			);
 		}

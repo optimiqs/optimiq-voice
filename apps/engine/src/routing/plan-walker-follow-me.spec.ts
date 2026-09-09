@@ -460,6 +460,27 @@ describe("an off-net follow-me hop", () => {
 		expect(endpointsOf(h)).toEqual(["PJSIP/01115559998888@carrier-b"]);
 	});
 
+	it("carries the trunk target even when a SIP realm is configured", async () => {
+		// The realm turns an EXTENSION into an AOR the sipd plane resolves against its registration
+		// bucket. An off-net hop is not one: falling through to `sip:+1...@realm` would look the
+		// caller's mobile up in the tenant's registrations instead of dialling the carrier.
+		const h = harness({ settings: { sipRealm: "acme.example.com" } });
+		await h.walker.walk(
+			walkInput([
+				extensionNode("ext", {
+					number: "1001",
+					followMe: ladder([mobileHop({ ordinal: 0 })]),
+				}),
+				trunkDialNode("route", { attempts: [trunkAttempt("carrier-b", 5)] }),
+			]),
+		);
+		expect(h.media.originated()[0]?.target).toEqual({
+			kind: "trunk",
+			trunkId: "trunk-carrier-b",
+			number: "+15559998888",
+		});
+	});
+
 	it("takes the lowest-order trunk of the route's chain", async () => {
 		const h = harness();
 		await h.walker.walk(

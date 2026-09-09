@@ -27,6 +27,7 @@ class FakeAgentStateBucket {
 	readonly writes: WriteCall[] = [];
 	beforeNextWrite: (() => void) | undefined;
 	readFailures = 0;
+	reads = 0;
 
 	private readonly entries = new Map<string, StoredEntry>();
 	private nextRevision = 1;
@@ -47,6 +48,7 @@ class FakeAgentStateBucket {
 	}
 
 	async get(key: string): Promise<StoredEntry | null> {
+		this.reads += 1;
 		if (this.readFailures > 0) {
 			this.readFailures -= 1;
 			throw new Error("broker unavailable");
@@ -312,5 +314,47 @@ describe("absent and logged-out agents", () => {
 		expect(await reserve(store, CALL_A)).toBeUndefined();
 		expect(bucket.current()).toEqual(loggedOut());
 		expect(bucket.writes).toEqual([]);
+	});
+});
+
+describe("reading a whole roster", () => {
+	it("serves concurrent and immediately repeated passes from one fan-out", async () => {
+		// Every waiting caller polls the same roster once a second, so an uncached read is
+		// `callers x agents` bucket gets per second from one process — worst exactly when the queue
+		// is busiest.
+		const bucket = new FakeAgentStateBucket();
+		bucket.seed(available());
+		const { store } = storeOver(bucket);
+
+		const [first, second] = await Promise.all([
+			store.readStates(ORG, [AGENT]),
+			store.readStates(ORG, [AGENT]),
+		]);
+		await store.readStates(ORG, [AGENT]);
+
+		expect(first?.get(AGENT)?.status).toBe("available");
+		expect(second?.get(AGENT)?.status).toBe("available");
+		expect(bucket.reads).toBe(1);
+	});
+
+	it("re-reads after a write, so a reservation is never read stale", async () => {
+		const bucket = new FakeAgentStateBucket();
+		bucket.seed(available());
+		const { store } = storeOver(bucket);
+
+		await store.readStates(ORG, [AGENT]);
+		const readsBefore = bucket.reads;
+		await store.reserve({
+			orgId: ORG,
+			agentId: AGENT,
+			to: "ringing",
+			queueId: QUEUE,
+			callId: CALL_A,
+			now: Date.parse(SINCE),
+		});
+		const after = await store.readStates(ORG, [AGENT]);
+
+		expect(bucket.reads).toBeGreaterThan(readsBefore + 1);
+		expect(after.get(AGENT)?.status).toBe("ringing");
 	});
 });

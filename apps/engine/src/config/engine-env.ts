@@ -59,6 +59,9 @@ const port = (fallback: number) => z.coerce.number().int().min(1).max(65_535).de
 const durationMs = (fallback: number, max: number) =>
 	z.coerce.number().int().min(0).max(max).default(fallback);
 
+/** The single-instance placeholder identity. Named so the production refusal can point at it. */
+const DEFAULT_ENGINE_INSTANCE_ID = "engine";
+
 const engineEnvObjectSchema = z.object({
 	NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
 
@@ -313,8 +316,12 @@ const engineEnvObjectSchema = z.object({
 	 * Defaulted rather than required because an operator who does not set it should still get a
 	 * working single-instance deployment. `main.ts` fills it from the container's hostname when the
 	 * variable is unset, which is unique per replica under every orchestrator worth the name.
+	 *
+	 * The default is refused in production by the `superRefine` below: outside a container runtime
+	 * nothing fills it in, and the literal `"engine"` on two replicas is not a degraded state but
+	 * the one this variable exists to prevent — each of them adopting the other's channel leases.
 	 */
-	ENGINE_INSTANCE_ID: z.string().min(1).max(128).default("engine"),
+	ENGINE_INSTANCE_ID: z.string().min(1).max(128).default(DEFAULT_ENGINE_INSTANCE_ID),
 
 	/**
 	 * How often this process pushes its claims' expiry forward.
@@ -366,6 +373,16 @@ export const engineEnvSchema = engineEnvObjectSchema.superRefine((env, context) 
 			code: "custom",
 			path: ["ARI_PASSWORD"],
 			message: "is required when ENGINE_MEDIA_DRIVER=ari",
+		});
+	}
+	if (env.NODE_ENV === "production" && env.ENGINE_INSTANCE_ID === DEFAULT_ENGINE_INSTANCE_ID) {
+		context.addIssue({
+			code: "custom",
+			path: ["ENGINE_INSTANCE_ID"],
+			message:
+				`must not be the default "${DEFAULT_ENGINE_INSTANCE_ID}" in production: two replicas ` +
+				"sharing an instance id each adopt the other's channel leases. Set ENGINE_INSTANCE_ID, " +
+				"or HOSTNAME, to something unique per process",
 		});
 	}
 });

@@ -167,9 +167,17 @@ export function isEligibleForDistribution(
  * IS staffing the queue, and ejecting a caller because everyone happens to be busy right now is the
  * opposite of what that setting is for. Only `logged-out` — and an agent the bucket has never heard
  * of — means "nobody is working this queue".
+ *
+ * The one `unavailable` that does NOT count is the engine's own `max-no-answer` bench: that is a
+ * handset the distributor has decided is unreachable, not a human on a break, and counting it is how
+ * a queue whose whole team's phones are dead holds callers for the full `maxWaitSeconds` instead of
+ * ejecting them after `maxWaitNoAgentSeconds`. A manually-set `unavailable` is still a person.
  */
 export function isStaffing(entry: AgentStateEntry | undefined): boolean {
-	return entry !== undefined && entry.status !== "logged-out";
+	if (entry === undefined || entry.status === "logged-out") {
+		return false;
+	}
+	return !(entry.status === "unavailable" && entry.reason === "max-no-answer");
 }
 
 /** The entry an unseen agent is treated as having, so callers never branch on `undefined`. */

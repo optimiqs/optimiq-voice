@@ -12,6 +12,7 @@ import {
 	CHANNEL_OWNER_EXPIRES_AT_VARIABLE,
 	CHANNEL_OWNER_INSTANCE_VARIABLE,
 	CHANNEL_OWNERSHIP_LEASE_MS,
+	channelOwnershipOf,
 } from "../nats/channel-ownership";
 import { ConferenceControlService } from "../nats/conference-control.service";
 import { JetStreamService } from "../nats/jetstream.service";
@@ -28,7 +29,6 @@ import { QueueMembershipSource } from "../queue/queue-membership.source";
 import { QueueCursors } from "../queue/queue-registry";
 import { QueueWaitingStore } from "../queue/queue-waiting.store";
 import { CallSignalBus, legSignalKey, recordingSignalKey } from "../routing/call-signals";
-import { CLAIM_HEARTBEAT_INTERVAL_MS } from "../routing/claim-timing";
 import { ConferenceRegistry } from "../routing/conference-registry";
 import { DidIndexSource } from "../routing/did-index.source";
 import { ExtensionFeatureRpcPort } from "../routing/extension-feature.source";
@@ -115,6 +115,15 @@ import type {
 } from "@optimiq-voice/telephony";
 
 /** Channel variables the routing walk writes back, so the KV mirror carries the decision too. */
+/**
+ * How many channel-lease renewals are in flight at once during ownership maintenance.
+ *
+ * Bounded rather than a bare `Promise.all` over every owned leg: a replica holding hundreds of
+ * calls would otherwise open hundreds of concurrent KV updates on the same connection each tick,
+ * which is a different way of being slow.
+ */
+const OWNERSHIP_RENEWAL_BATCH = 16;
+
 const DESTINATION_TYPE_VARIABLE = "OPTIMIQ_DESTINATION_TYPE";
 const DESTINATION_REF_VARIABLE = "OPTIMIQ_DESTINATION_REF";
 /**
@@ -486,30 +495,60 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		}
 	}
 
+	/**
+	 * One pass: renew what this replica owns, then adopt what nobody does.
+	 *
+	 * Both halves used to be strictly sequential, which put `L + 2·N` KV round trips — N being the
+	 * CLUSTER-wide live-channel count, not this replica's — inside every tick on every replica. A
+	 * pass slower than the heartbeat is not a latency problem but a correctness one: a lease is
+	 * three intervals wide, so a slow pass fences live calls. Hence the two changes here — renewals
+	 * run in bounded-concurrency batches, and a snapshot carrying another instance's UNEXPIRED
+	 * lease is skipped outright, since adoption has nothing to do for one.
+	 */
 	private async runChannelOwnershipMaintenance(now: number): Promise<void> {
 		const fenced = new Set<string>();
-		for (const aggregate of this.registry.all) {
-			const renewed = await this.jetstream.renewChannel(aggregate.snapshot, now);
-			if (renewed === "lost") {
-				await this.fenceChannel(aggregate, "the channels KV revision changed");
-				fenced.add(aggregate.ariChannelId);
-				continue;
-			}
-			if (renewed === "unavailable") {
-				const expiresAt = this.jetstream.ownedChannelLeaseExpiresAt(aggregate.snapshot);
-				if (expiresAt === undefined || now >= expiresAt) {
-					await this.fenceChannel(
-						aggregate,
-						expiresAt === undefined
-							? "no acknowledged lease expiry is available"
-							: `the last acknowledged lease expired at ${String(expiresAt)}`,
-					);
+		const aggregates = [...this.registry.all];
+		for (let index = 0; index < aggregates.length; index += OWNERSHIP_RENEWAL_BATCH) {
+			const batch = aggregates.slice(index, index + OWNERSHIP_RENEWAL_BATCH);
+			const renewals = await Promise.all(
+				batch.map(async (aggregate) => await this.jetstream.renewChannel(aggregate.snapshot, now)),
+			);
+			for (const [offset, renewed] of renewals.entries()) {
+				const aggregate = batch[offset];
+				if (aggregate === undefined) {
+					continue;
+				}
+				if (renewed === "lost") {
+					await this.fenceChannel(aggregate, "the channels KV revision changed");
 					fenced.add(aggregate.ariChannelId);
+					continue;
+				}
+				if (renewed === "unavailable") {
+					const expiresAt = this.jetstream.ownedChannelLeaseExpiresAt(aggregate.snapshot);
+					if (expiresAt === undefined || now >= expiresAt) {
+						await this.fenceChannel(
+							aggregate,
+							expiresAt === undefined
+								? "no acknowledged lease expiry is available"
+								: `the last acknowledged lease expired at ${String(expiresAt)}`,
+						);
+						fenced.add(aggregate.ariChannelId);
+					}
 				}
 			}
 		}
 
 		for await (const snapshot of this.jetstream.channelSnapshots()) {
+			const ownership = channelOwnershipOf(snapshot);
+			if (
+				ownership !== undefined &&
+				ownership.expiresAt > now &&
+				ownership.instanceId !== this.env.ENGINE_INSTANCE_ID
+			) {
+				// Another live replica holds this one. `adoptChannel` would refuse it anyway, after a
+				// second KV read per snapshot — which is the bulk of the pass on a busy cluster.
+				continue;
+			}
 			try {
 				if (fenced.has(ChannelAggregate.hydrate(snapshot).ariChannelId)) {
 					continue;
@@ -591,11 +630,14 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		if (this.draining || this.ownershipMaintenanceTimer !== undefined) {
 			return;
 		}
+		// The SAME knob the park and conference claims renew on, rather than the hard-coded constant
+		// behind its default. One variable, one behaviour: an operator lowering it for a slow or
+		// contended KV means channel leases too, which are the ones whose expiry fences a live call.
 		this.ownershipMaintenanceTimer = setInterval(() => {
 			void this.maintainChannelOwnership().catch((error: unknown) => {
 				this.logger.error({ err: String(error) }, "channel ownership maintenance failed");
 			});
-		}, CLAIM_HEARTBEAT_INTERVAL_MS);
+		}, this.env.ENGINE_CLAIM_HEARTBEAT_MS);
 		this.ownershipMaintenanceTimer.unref?.();
 	}
 
@@ -1468,7 +1510,6 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			};
 		}
 
-		const room = this.conferences.room(request.conferenceId, organizationId);
 		await this.events.publish(locked ? "conference.locked" : "conference.unlocked", {
 			orgId: organizationId,
 			// The ROOM's id as the call token, because a lock has no leg. See the event's own note on
@@ -1487,7 +1528,6 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			action: request.action,
 			memberCount: result.memberCount,
 			locked: result.locked,
-			...(room === undefined ? {} : {}),
 		};
 	}
 
@@ -2308,6 +2348,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			channelId: aggregate.channelId,
 			isTearingDown: aggregate.isTearingDown,
 			hasMediaPath: aggregate.isAnswered,
+			isAnswered: aggregate.isAnswered,
 		};
 
 		const exit = await this.runtime.runPromiseExit((executor) => executor.dispatch(context, verb));
@@ -2353,6 +2394,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			channelId: aggregate.channelId,
 			isTearingDown: aggregate.isTearingDown,
 			hasMediaPath: aggregate.isAnswered,
+			isAnswered: aggregate.isAnswered,
 		};
 		const exit = await this.runtime.runPromiseExit((executor) => executor.dispatch(context, verb));
 		if (Exit.isSuccess(exit)) {
@@ -2782,13 +2824,22 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			return;
 		}
 
-		const variables = aggregate.snapshot.variables;
+		// Read ONCE, and copied, so every check below is against the same view. Mixing this binding
+		// with fresh `aggregate.snapshot.variables` reads part-way through a run of `setVariable`
+		// calls is two views of one map in one function, and only the disjointness of the keys made
+		// it correct.
+		const variables = { ...aggregate.snapshot.variables };
 		const hasTerminalEventIds =
 			variables[TERMINAL_HANGUP_EVENT_ID_VARIABLE] !== undefined ||
 			variables[TERMINAL_DESTROYED_EVENT_ID_VARIABLE] !== undefined;
 		// Reporting snapshots written before terminal event recovery was introduced can only have
 		// reached this state after publishing both events. Preserve that shipped behavior rather than
 		// replaying them once with newly invented IDs during an upgrade.
+		//
+		// TODO(2026-03): a migration shim, not a rule. No snapshot predating terminal-event recovery
+		// can survive a call's lifetime, so once every deployment has been through one restart on a
+		// build that carries the IDs, delete this branch — it marks the terminal events published
+		// without ever publishing them, which is a lie a future reader cannot detect from here.
 		if (!enteringReporting && !hasTerminalEventIds) {
 			aggregate.setVariable(TERMINAL_EVENTS_PUBLISHED_VARIABLE, "true");
 		} else {
@@ -2799,13 +2850,13 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				aggregate.setVariable(TERMINAL_DESTROYED_EVENT_ID_VARIABLE, createEntityId());
 			}
 		}
-		if (aggregate.snapshot.variables[CDR_ID_VARIABLE] === undefined) {
+		if (variables[CDR_ID_VARIABLE] === undefined) {
 			aggregate.setVariable(CDR_ID_VARIABLE, aggregate.channelId);
 		}
-		if (aggregate.snapshot.variables[CDR_EVENT_ID_VARIABLE] === undefined) {
+		if (variables[CDR_EVENT_ID_VARIABLE] === undefined) {
 			aggregate.setVariable(CDR_EVENT_ID_VARIABLE, createEntityId());
 		}
-		if (aggregate.snapshot.variables[CDR_HANGUP_CAUSE_CODE_VARIABLE] === undefined) {
+		if (variables[CDR_HANGUP_CAUSE_CODE_VARIABLE] === undefined) {
 			aggregate.setVariable(CDR_HANGUP_CAUSE_CODE_VARIABLE, String(fallbackCauseCode));
 		}
 		// A real barrier, not the best-effort live mirror. Publishing without this acknowledgement

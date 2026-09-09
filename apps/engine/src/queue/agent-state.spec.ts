@@ -181,6 +181,14 @@ describe("staffing", () => {
 		expect(isStaffing(entry({ status: "logged-out" }))).toBe(false);
 		expect(isStaffing(undefined)).toBe(false);
 	});
+
+	it("does not count a handset the engine benched for repeated no-answers", () => {
+		// `max-no-answer` is the distributor's own verdict that a phone is unreachable, not a human
+		// on a break. Counting it is how a queue whose whole team is unplugged holds callers for the
+		// full maxWait instead of ejecting them on the no-agent deadline.
+		expect(isStaffing(entry({ status: "unavailable", reason: "max-no-answer" }))).toBe(false);
+		expect(isStaffing(entry({ status: "unavailable", reason: "lunch" }))).toBe(true);
+	});
 });
 
 describe("idle time", () => {

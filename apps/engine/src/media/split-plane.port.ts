@@ -243,6 +243,7 @@ export class SplitPlaneMediaPort implements MediaPort {
 	async resolveTargets(
 		orgId: string,
 		target: DialTarget,
+		legId: string,
 	): Promise<readonly (readonly DialTarget[])[]> {
 		if (
 			target.kind !== "aor" ||
@@ -250,11 +251,11 @@ export class SplitPlaneMediaPort implements MediaPort {
 			this.signalling.resolveTarget === undefined
 		)
 			return [[target]];
-		const reply = await this.signalling.resolveTarget({ orgId, legId: "resolve-contacts", target });
+		const reply = await this.signalling.resolveTarget({ orgId, legId, target });
 		if (!reply.ok)
 			throw new SplitPlaneSignallingRefusedError(
-				"originate",
-				"resolve-contacts",
+				"resolve-targets",
+				legId,
 				reply.reason,
 				reply.error ?? "destination resolution failed",
 			);
@@ -326,33 +327,51 @@ export class SplitPlaneMediaPort implements MediaPort {
 			throw new SplitPlaneLegStateError("answer", channelId, "no owning sipd instance is known");
 		}
 
-		const allocation = await this.media.allocateSession({
-			sessionId: channelId,
-			orgId: leg.orgId,
-			callId: leg.callId,
-			legId: channelId,
-			sdpOffer: leg.sdpOffer,
-			direction: "sendrecv",
-		});
-		if (allocation.sdpAnswer === undefined) {
-			throw new SplitPlaneLegStateError(
-				"answer",
-				channelId,
-				"mediad allocated the session but produced no SDP answer",
-			);
-		}
+		// Same shape as `originate`'s cleanup, and for a sharper reason: a `sipd` refusal here is a
+		// DOCUMENTED normal outcome (§4.4, the CANCEL that raced the answer). In exactly that race the
+		// `dialog.terminated` has usually already torn the aggregate down, so nothing downstream will
+		// ever release the session just allocated — the RTP port pair and the `media-sessions` entry
+		// would sit there until mediad's idle reaper collects them, which under a CANCEL storm is a
+		// sustained drain on the port pool.
+		try {
+			const allocation = await this.media.allocateSession({
+				sessionId: channelId,
+				orgId: leg.orgId,
+				callId: leg.callId,
+				legId: channelId,
+				sdpOffer: leg.sdpOffer,
+				direction: "sendrecv",
+			});
+			if (allocation.sdpAnswer === undefined) {
+				throw new SplitPlaneLegStateError(
+					"answer",
+					channelId,
+					"mediad allocated the session but produced no SDP answer",
+				);
+			}
 
-		const reply = await this.signalling.answer(leg.instanceId, {
-			legId: channelId,
-			sdpAnswer: allocation.sdpAnswer,
-		});
-		if (!reply.ok) {
-			throw new SplitPlaneSignallingRefusedError(
-				"answer",
-				channelId,
-				reply.reason,
-				reply.error ?? "no detail",
-			);
+			const reply = await this.signalling.answer(leg.instanceId, {
+				legId: channelId,
+				sdpAnswer: allocation.sdpAnswer,
+			});
+			if (!reply.ok) {
+				throw new SplitPlaneSignallingRefusedError(
+					"answer",
+					channelId,
+					reply.reason,
+					reply.error ?? "no detail",
+				);
+			}
+		} catch (error) {
+			try {
+				await this.media.releaseSession(channelId);
+			} catch (cleanupError) {
+				this.logger.error(
+					{ channelId, err: cleanupError },
+					"failed to release the media session of a refused answer",
+				);
+			}
+			throw error;
 		}
 	}
 

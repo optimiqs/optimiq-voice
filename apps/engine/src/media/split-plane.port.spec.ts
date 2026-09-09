@@ -146,6 +146,27 @@ describe("answer", () => {
 
 		await expect(port.answer(CH)).rejects.toThrow(/refused by the sip edge/);
 	});
+
+	/**
+	 * The refusal above is a NORMAL outcome, and in the race that causes it the `dialog.terminated`
+	 * has usually already torn the aggregate down — so nothing downstream would ever release the
+	 * session just allocated. Same shape as `originate`'s cleanup, for the same reason.
+	 */
+	it("releases the session it allocated when signalling refuses the answer", async () => {
+		const { port, transport, sipd, media } = newComposite();
+		sipd.refuseAnswer = true;
+		port.registerInboundLeg(CH, {
+			orgId: ORG,
+			callId: CALL,
+			sipdInstanceId: INSTANCE,
+			sdpOffer: OFFER,
+		});
+
+		await expect(port.answer(CH)).rejects.toThrow(/refused by the sip edge/);
+
+		expect(transport.on(RPC_SUBJECTS.mediaReleaseSession)).toHaveLength(1);
+		expect(await media.channelExists(CH)).toBe(false);
+	});
 });
 
 describe("ring", () => {
@@ -483,5 +504,37 @@ describe("remote hangup cleanup", () => {
 		).toBe(true);
 		expect(sipd.hangupCalls).toHaveLength(0);
 		await expect(port.ring(CH)).rejects.toThrow(SplitPlaneLegStateError);
+	});
+});
+
+describe("resolveTargets", () => {
+	it("asks the sip edge on behalf of the leg being planned, not a fabricated id", async () => {
+		const { port, sipd } = newComposite();
+		const asked: string[] = [];
+		sipd.resolveTarget = async (request) => {
+			asked.push(request.legId);
+			return {
+				ok: true,
+				legId: request.legId,
+				contacts: [
+					{ requestUri: "sip:a@one", transport: "udp" as const, instanceId: INSTANCE, q: 1 },
+					{ requestUri: "sip:b@two", transport: "udp" as const, instanceId: INSTANCE, q: 0.5 },
+				],
+			};
+		};
+		const groups = await port.resolveTargets(ORG, { kind: "aor", aor: "sip:1002@realm" }, CH);
+		expect(asked).toEqual([CH]);
+		expect(groups).toEqual([
+			[{ kind: "aor", aor: "sip:1002@realm", contactUri: "sip:a@one" }],
+			[{ kind: "aor", aor: "sip:1002@realm", contactUri: "sip:b@two" }],
+		]);
+	});
+
+	it("attributes a refusal to the real leg", async () => {
+		const { port, sipd } = newComposite();
+		sipd.resolveTarget = async () => ({ ok: false, legId: CH, reason: "unregistered_target" });
+		await expect(
+			port.resolveTargets(ORG, { kind: "aor", aor: "sip:1002@realm" }, CH),
+		).rejects.toThrow(new RegExp(`resolve-targets ${CH} refused by the sip edge`));
 	});
 });

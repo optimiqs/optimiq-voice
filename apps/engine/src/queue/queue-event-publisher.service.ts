@@ -63,6 +63,7 @@ export class QueueEventPublisher implements QueueEventPort {
 		readonly position: number;
 		readonly priority: number;
 		readonly callerNumber?: string;
+		readonly resumed?: boolean;
 	}): Promise<void> {
 		await this.publish("caller.joined", input.orgId, input.queueId, {
 			callId: input.callId,
@@ -70,6 +71,7 @@ export class QueueEventPublisher implements QueueEventPort {
 			position: input.position,
 			priority: input.priority,
 			...(input.callerNumber === undefined ? {} : { callerNumber: input.callerNumber }),
+			...(input.resumed === undefined ? {} : { resumed: input.resumed }),
 		});
 	}
 
@@ -101,7 +103,8 @@ export class QueueEventPublisher implements QueueEventPort {
 		readonly legId: string;
 		readonly waitMs: number;
 		readonly position?: number;
-		readonly reason: "caller-hangup" | "timeout" | "overflow" | "no-agents";
+		readonly reason: "caller-hangup" | "timeout" | "overflow" | "no-agents" | "exit-key";
+		readonly exitKey?: string;
 	}): Promise<void> {
 		await this.publish("caller.abandoned", input.orgId, input.queueId, {
 			callId: input.callId,
@@ -109,6 +112,7 @@ export class QueueEventPublisher implements QueueEventPort {
 			waitMs: input.waitMs,
 			reason: input.reason,
 			...(input.position === undefined ? {} : { position: input.position }),
+			...(input.exitKey === undefined ? {} : { exitKey: input.exitKey }),
 		});
 	}
 

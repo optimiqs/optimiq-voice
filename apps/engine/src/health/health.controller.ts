@@ -2,6 +2,7 @@ import { Controller, Get, HttpCode, HttpStatus, Res } from "@nestjs/common";
 import { ChannelOrchestrator } from "../calls/channel-orchestrator.service";
 import { AriConnectionService } from "../media/ari-connection.service";
 import { MediadService } from "../media/mediad.service";
+import { SipdService } from "../media/sipd.service";
 import { JetStreamService } from "../nats/jetstream.service";
 import { ParkHandoffService } from "../nats/park-handoff.service";
 import type { FastifyReply } from "fastify";
@@ -24,6 +25,17 @@ import type { FastifyReply } from "fastify";
  *
  * ## Why `park` is reported but never decides the status
  *
+ * ## Why the sipd dialog feed decides the status too
+ *
+ * Under the split plane `sip.evt.v1.>` is the ONLY source of `dialog.answered` and
+ * `dialog.terminated`. An engine whose media subscription is fine but whose dialog feed has ended
+ * still admits INVITEs and never ends a leg: no hangup, no CDR, and mediad ports held until the
+ * idle reaper takes them. That is the same "looks alive, loses lifecycle" state the media feed is
+ * folded in for, so it is folded in on the same terms — and only when this deployment signals on
+ * `apps/sipd`, because an unselected feed is intentionally idle.
+ *
+ * ## Why `park` is reported but never decides the status
+ *
  * A park-handoff responder is a MULTI-INSTANCE facility: an instance answers for the calls it has
  * parked so a colleague on another instance can collect them. A single-instance deployment
  * configures no shared claim bucket and therefore opens no subscription, and that is a correct
@@ -39,6 +51,7 @@ export class HealthController {
 	constructor(
 		private readonly ari: AriConnectionService,
 		private readonly mediad: MediadService,
+		private readonly sipd: SipdService,
 		private readonly jetstream: JetStreamService,
 		private readonly orchestrator: ChannelOrchestrator,
 		private readonly parkHandoff: ParkHandoffService,
@@ -69,12 +82,13 @@ export class HealthController {
 		const ariConnected = this.ari.isConnected;
 		const mediaDriver = this.mediad.isSelected ? "mediad" : "ari";
 		const mediaReady = mediaDriver === "mediad" ? this.mediad.isReady : ariConnected;
+		const signallingReady = !this.sipd.isSelected || this.sipd.subscriptionState === "subscribed";
 		const natsReady = this.jetstream.isReady;
 		const draining = this.orchestrator.isDraining;
 		const park = this.parkHandoff.stats;
 
 		return {
-			status: mediaReady && natsReady && !draining ? "ok" : "degraded",
+			status: mediaReady && signallingReady && natsReady && !draining ? "ok" : "degraded",
 			draining,
 			activeChannels: this.orchestrator.activeChannelCount,
 			media: {
@@ -92,6 +106,11 @@ export class HealthController {
 				reachable: this.mediad.isReachable,
 				subscription: this.mediad.subscriptionState,
 				eventsReceived: this.mediad.eventCount,
+			},
+			sipd: {
+				selected: this.sipd.isSelected,
+				subscription: this.sipd.subscriptionState,
+				eventsReceived: this.sipd.eventCount,
 			},
 			nats: {
 				connected: natsReady,
@@ -123,6 +142,18 @@ export interface HealthReport {
 	};
 	readonly mediad: {
 		readonly reachable: boolean;
+		readonly subscription: "idle" | "subscribed" | "closed";
+		readonly eventsReceived: number;
+	};
+	/**
+	 * The signalling plane's event feed, as this instance sees it.
+	 *
+	 * `selected: false` is the ordinary ARI answer and never degrades the status. When it is
+	 * selected, a `subscription` of anything but `"subscribed"` is the one state worth paging on:
+	 * calls still arrive and none of them can ever end.
+	 */
+	readonly sipd: {
+		readonly selected: boolean;
 		readonly subscription: "idle" | "subscribed" | "closed";
 		readonly eventsReceived: number;
 	};

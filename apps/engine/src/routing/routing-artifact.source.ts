@@ -60,6 +60,25 @@ interface CacheEntry {
 	readonly at: number;
 }
 
+/**
+ * How long a memory copy is served without going back to the bucket.
+ *
+ * The watch is still the real invalidation; this is the backstop the class note above describes, for
+ * the window where the watch is nominally alive but has stopped delivering. It mirrors the bucket's
+ * own 1 h TTL, so an entry this process would keep forever expires the same way the stored one does.
+ */
+const CACHE_TTL_MS = 3_600_000;
+
+/**
+ * How many organizations' artifacts this process holds at once.
+ *
+ * The watch `remember`s every key any API instance writes, not only the ones this engine has routed
+ * a call for, so on a large fleet an unbounded map grows to one full node table per tenant that has
+ * ever been compiled. Eviction is least-recently-remembered: `Map` keeps insertion order and
+ * {@link RoutingArtifactSource.remember} re-inserts.
+ */
+const CACHE_MAX_ENTRIES = 500;
+
 @Injectable()
 export class RoutingArtifactSource implements OnModuleInit, OnApplicationShutdown {
 	private readonly logger = getLogger("engine.routing");
@@ -123,8 +142,11 @@ export class RoutingArtifactSource implements OnModuleInit, OnApplicationShutdow
 	async get(organizationId: string): Promise<RoutingArtifact | undefined> {
 		const cached = this.cache.get(organizationId);
 		if (cached !== undefined) {
-			this.hits += 1;
-			return cached.artifact;
+			if (Date.now() - cached.at < CACHE_TTL_MS) {
+				this.hits += 1;
+				return cached.artifact;
+			}
+			this.cache.delete(organizationId);
 		}
 
 		const existing = this.inFlight.get(organizationId);
@@ -196,7 +218,15 @@ export class RoutingArtifactSource implements OnModuleInit, OnApplicationShutdow
 
 	/** Puts an artifact into the memory cache. Used by the KV watch and by the RPC path. */
 	private remember(artifact: RoutingArtifact): void {
+		this.cache.delete(artifact.organizationId);
 		this.cache.set(artifact.organizationId, { artifact, at: Date.now() });
+		while (this.cache.size > CACHE_MAX_ENTRIES) {
+			const oldest = this.cache.keys().next();
+			if (oldest.done === true) {
+				break;
+			}
+			this.cache.delete(oldest.value);
+		}
 	}
 
 	private async load(organizationId: string): Promise<RoutingArtifact | undefined> {

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { QUEUE_WAITING_MAX_ENTRIES } from "@optimiq-voice/events";
 import {
 	compareWaiting,
 	emptyWaitingRecord,
@@ -108,6 +109,26 @@ describe("the order", () => {
 		const renewed = upsertWaiting(record, entry("c1", { expiresAt: NOW + 999_999 }), NOW);
 		expect(renewed.entries).toHaveLength(2);
 		expect(rankOf(renewed, "c1", NOW)).toBe(1);
+	});
+
+	it("renews a caller who is already in a FULL line rather than evicting them", () => {
+		// The cap refuses new arrivals a shared position. It must not take one away from somebody who
+		// already holds it: that collapses their position to unknown for good and moves everybody
+		// behind them a place forward on paper.
+		const full = lineOf(
+			...Array.from({ length: QUEUE_WAITING_MAX_ENTRIES }, (_value, index) =>
+				entry(`c${String(index)}`, { joinedAt: NOW + index }),
+			),
+		);
+		expect(full.entries).toHaveLength(QUEUE_WAITING_MAX_ENTRIES);
+
+		const renewed = upsertWaiting(full, entry("c0", { expiresAt: NOW + 999_999 }), NOW);
+		expect(renewed.entries).toHaveLength(QUEUE_WAITING_MAX_ENTRIES);
+		expect(rankOf(renewed, "c0", NOW)).toBe(1);
+
+		// A genuine insertion is still refused a place.
+		const joined = upsertWaiting(full, entry("late", { joinedAt: NOW + 1_000_000 }), NOW);
+		expect(rankOf(joined, "late", NOW)).toBe(0);
 	});
 });
 

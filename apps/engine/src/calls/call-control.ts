@@ -2690,8 +2690,16 @@ export class CallControl implements CallControlPort {
 	async onLegEnded(mediaChannelId: string): Promise<void> {
 		const leg = this.deps.host.legFor(mediaChannelId);
 
-		if (this.recordings.has(mediaChannelId) && leg !== undefined) {
-			await this.stopRecording(leg);
+		if (this.recordings.has(mediaChannelId)) {
+			if (leg === undefined) {
+				// No leg means no `record.stopped` can be published — but the session and its signal
+				// watcher still have to go, or `activeOperationCount` (which `/healthz` reads) never
+				// drops and the `CallSignalBus` keeps a watcher on a channel that no longer exists.
+				this.recordings.get(mediaChannelId)?.stopWatching();
+				this.recordings.delete(mediaChannelId);
+			} else {
+				await this.stopRecording(leg);
+			}
 		}
 
 		// The SUPERVISOR hung up. The monitored conversation carries on — that is the invariant
