@@ -1,7 +1,7 @@
 import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
 import { ClientProxy } from "@nestjs/microservices";
 import { firstValueFrom } from "rxjs";
-import { makeCallEvent, validateEvent } from "@optimiq-voice/events";
+import { assertEventSubjectMatches, makeCallEvent } from "@optimiq-voice/events";
 import { getLogger } from "@optimiq-voice/logging";
 import { CALL_EVENTS_CLIENT } from "./nats.tokens";
 import type { CallEvent, CallEventDataOf, CallEventOf } from "@optimiq-voice/events";
@@ -21,11 +21,16 @@ import type { CallEvent, CallEventDataOf, CallEventOf } from "@optimiq-voice/eve
  *
  * ## Validate before publish, always
  *
- * Every event is built by `makeCallEvent` (which validates) and then re-validated by
- * `validateEvent` against the schema its SUBJECT selects. That second check is not redundant: it
- * is the cross-check that catches an envelope whose `orgId` disagrees with the org token in its
- * own subject — the tenancy bug that survives schema validation and would let a consumer scope a
- * write to the wrong tenant.
+ * Every event is built by `makeCallEvent`, which parses it against its own schema, and is then
+ * put through `assertEventSubjectMatches` — the cross-check that catches an envelope whose `orgId`
+ * disagrees with the org token in its own subject, the tenancy bug that survives schema validation
+ * and would let a consumer scope a write to the wrong tenant.
+ *
+ * That used to be a second full `validateEvent`, which re-parsed the envelope against the SAME
+ * schema `makeCallEvent` had just parsed it with. Under a 400-leg call storm zod was 7.4% of
+ * engine CPU and roughly half of it was that duplicate parse. The check that is not redundant is
+ * kept, in full, and nothing that arrives over the wire is affected — a CONSUMER still calls
+ * `safeValidateEvent`, which parses first.
  *
  * A malformed event therefore never reaches the broker. It is logged and dropped, because the
  * alternative — throwing into the ARI event handler — would end a live call over a reporting
@@ -82,7 +87,7 @@ export class CallEventPublisher implements OnModuleInit, OnApplicationShutdown {
 				at: input.at,
 				correlationId: input.correlationId,
 			});
-			validateEvent(envelope.subject, envelope);
+			assertEventSubjectMatches(envelope.subject, envelope);
 		} catch (error) {
 			this.rejected += 1;
 			this.logger.error(
