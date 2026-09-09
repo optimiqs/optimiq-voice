@@ -441,6 +441,8 @@ export function resolveInbound(
 		);
 	}
 
+	// No `enabled` check, and none is missing: the compiler skips a disabled or voice-disabled DID
+	// before it writes the entry, so every row in this table is one the tenant switched on.
 	const did = artifact.inbound.didDefaults[input.did];
 	if (did !== undefined) {
 		const walk = followGates(artifact, did.destinationNodeId, input.now);
@@ -501,7 +503,10 @@ function normaliseInboundCaller(
 		diagnostics.push({
 			severity: "warning",
 			code: "number-translated",
-			message: `Ruleset "${ruleset.name}" would have grown caller id ${caller} past the length bound; it was used as it arrived.`,
+			message:
+				outcome.undialable === true
+					? `Ruleset "${ruleset.name}" would have rewritten caller id ${caller} to something that is not dialable; it was used as it arrived.`
+					: `Ruleset "${ruleset.name}" would have grown caller id ${caller} past the length bound; it was used as it arrived.`,
 			subject: { kind: "translation-ruleset", id: ruleset.id, name: ruleset.name },
 		});
 		return input;
@@ -923,7 +928,10 @@ function applyRouteTranslation(
 		diagnostics.push({
 			severity: "warning",
 			code: "number-translated",
-			message: `Ruleset "${ruleset.name}" would have grown ${dialed} past the length bound; route "${rule.name}" dialed it unchanged.`,
+			message:
+				outcome.undialable === true
+					? `Ruleset "${ruleset.name}" would have rewritten ${dialed} to something that is not dialable; route "${rule.name}" dialed it unchanged.`
+					: `Ruleset "${ruleset.name}" would have grown ${dialed} past the length bound; route "${rule.name}" dialed it unchanged.`,
 			subject: { kind: "translation-ruleset", id: ruleset.id, name: ruleset.name },
 		});
 		return dialed;

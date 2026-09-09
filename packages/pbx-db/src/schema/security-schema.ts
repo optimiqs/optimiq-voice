@@ -16,7 +16,11 @@ import {
 	uuidEntityId,
 	uuidV7PrimaryKey,
 } from "@optimiq-voice/db";
-import { appendOnlyTenantPolicies, tenantIsolationPolicy } from "../tenant";
+import {
+	appendOnlyTenantPolicies,
+	tenantCompositeForeignKey,
+	tenantIsolationPolicy,
+} from "../tenant";
 import { trunk } from "./trunks-schema";
 
 /**
@@ -40,7 +44,11 @@ export const sipAclEntry = pgTable.withRLS(
 		network: cidr("network").notNull(),
 		action: text("action").$type<SipAclAction>().notNull().default("allow"),
 		scope: text("scope").$type<SipAclScope>().notNull().default("registration"),
-		/** Lower first. Ties are broken by the most specific prefix. */
+		/**
+		 * Lower first, but only among rules of equal prefix length: the SIP edge evaluates the most
+		 * specific prefix first (a /32 beats a /24 whatever their priorities), then this value, then
+		 * deny before allow. See apps/sipd/internal/acl.
+		 */
 		priority: integer("priority").notNull().default(100),
 		/**
 		 * The carrier this network belongs to, when the rule is about one carrier rather than the
@@ -87,7 +95,7 @@ export const sipAclEntry = pgTable.withRLS(
 		 * refuses a contested key rather than picking a winner, so widening here would manufacture
 		 * exactly the collision that publisher exists to report.
 		 */
-		trunkId: uuidEntityId("trunk_id").references(() => trunk.id, { onDelete: "cascade" }),
+		trunkId: uuidEntityId("trunk_id"),
 		description: text("description"),
 		enabled: boolean("enabled").notNull().default(true),
 		...auditTimestampColumns(),
@@ -103,6 +111,11 @@ export const sipAclEntry = pgTable.withRLS(
 			table.enabled,
 			table.priority,
 		),
+		tenantCompositeForeignKey({
+			name: "sip_acl_entry_trunk_fk",
+			columns: [table.organizationId, table.trunkId],
+			foreignColumns: [trunk.organizationId, trunk.id],
+		}),
 		tenantIsolationPolicy("sip_acl_entry"),
 	],
 );

@@ -46,6 +46,121 @@ export type PatternIssue =
 	| { readonly code: "invalid-regex"; readonly detail: string }
 	| { readonly code: "unanchored-regex" };
 
+/**
+ * Whether a regex source can backtrack catastrophically, as a rejection reason or `null`.
+ *
+ * `MAX_PATTERN_LENGTH` bounds a pattern's LENGTH, which is not the same thing: `^(a+)+$` fits in
+ * eight characters and takes exponential time on a non-matching input. These patterns are evaluated
+ * per call against carrier-supplied values (`InboundRule.callerPattern`, every call-block rule), and
+ * Node has no regex timeout, so a bad one is unrecoverable at runtime and has to be refused at
+ * write time.
+ *
+ * The test is the classic shape and deliberately nothing cleverer: a group that is itself repeated
+ * without an upper bound, whose body can also match the same text more than one way — an inner
+ * unbounded quantifier (`(a+)+`, `(a*)*`) or an alternation (`(a|a)*`). Proving non-exponentiality
+ * in general needs a different engine; this catches what a tenant actually writes by accident and
+ * never rejects a pattern with bounded repetition.
+ */
+export function unsafeRegexDetail(source: string): string | null {
+	for (let i = 0; i < source.length; i += 1) {
+		const char = source[i];
+		if (char === "\\") {
+			i += 1;
+			continue;
+		}
+		if (char === "[") {
+			i = endOfCharacterClass(source, i);
+			continue;
+		}
+		if (char !== "(") {
+			continue;
+		}
+		const close = endOfGroup(source, i);
+		if (close === -1) {
+			continue;
+		}
+		if (!isUnboundedQuantifier(source, close + 1)) {
+			continue;
+		}
+		const body = source.slice(i + 1, close);
+		if (hasUnboundedQuantifier(body) || hasAlternation(body)) {
+			return `nested unbounded repetition in ${JSON.stringify(source.slice(i, close + 2))} can backtrack catastrophically`;
+		}
+	}
+	return null;
+}
+
+function endOfCharacterClass(source: string, start: number): number {
+	for (let i = start + 1; i < source.length; i += 1) {
+		if (source[i] === "\\") {
+			i += 1;
+		} else if (source[i] === "]") {
+			return i;
+		}
+	}
+	return source.length;
+}
+
+/** Index of the `)` closing the `(` at `start`, or -1 when the group is unterminated. */
+function endOfGroup(source: string, start: number): number {
+	let depth = 0;
+	for (let i = start; i < source.length; i += 1) {
+		const char = source[i];
+		if (char === "\\") {
+			i += 1;
+		} else if (char === "[") {
+			i = endOfCharacterClass(source, i);
+		} else if (char === "(") {
+			depth += 1;
+		} else if (char === ")") {
+			depth -= 1;
+			if (depth === 0) {
+				return i;
+			}
+		}
+	}
+	return -1;
+}
+
+/** Whether the token at `index` repeats without an upper bound: `*`, `+`, or `{n,}`. */
+function isUnboundedQuantifier(source: string, index: number): boolean {
+	const char = source[index];
+	if (char === "*" || char === "+") {
+		return true;
+	}
+	if (char !== "{") {
+		return false;
+	}
+	const close = source.indexOf("}", index);
+	return close !== -1 && /^\{\d*,\}$/u.test(source.slice(index, close + 1));
+}
+
+function hasUnboundedQuantifier(body: string): boolean {
+	for (let i = 0; i < body.length; i += 1) {
+		if (body[i] === "\\") {
+			i += 1;
+		} else if (body[i] === "[") {
+			i = endOfCharacterClass(body, i);
+		} else if (isUnboundedQuantifier(body, i)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function hasAlternation(body: string): boolean {
+	for (let i = 0; i < body.length; i += 1) {
+		if (body[i] === "\\") {
+			i += 1;
+		} else if (body[i] === "[") {
+			i = endOfCharacterClass(body, i);
+		} else if (body[i] === "|") {
+			return true;
+		}
+	}
+	return false;
+}
+
 /** Raised when a pattern that failed validation is nevertheless handed to the matcher. */
 export class InvalidPatternError extends RoutingError {
 	readonly source: string;
@@ -98,10 +213,11 @@ function regexCompileError(source: string): string | null {
 	try {
 		// No flags: the stored pattern is the whole contract, including case sensitivity.
 		void new RegExp(source);
-		return null;
 	} catch (error) {
 		return error instanceof Error ? error.message : String(error);
 	}
+	// Compilability is not safety: see `unsafeRegexDetail`.
+	return unsafeRegexDetail(source);
 }
 
 /**

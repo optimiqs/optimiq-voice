@@ -244,6 +244,38 @@ describe("destination trios", () => {
 		}
 	});
 
+	/**
+	 * PostgreSQL evaluates referential integrity with row-level security bypassed and the tenant
+	 * policy only constrains a row's own `organization_id`, so a single-column reference lets one
+	 * tenant point at another tenant's row. Every intra-database key that has been converted leads
+	 * with the tenant column and lands on the parent's `<table>_organization_id_key`.
+	 */
+	it("makes every tenant-composite key land on the parent's (organization_id, id) index", () => {
+		for (const table of tables) {
+			const config = getTableConfig(table);
+			for (const foreignKey of config.foreignKeys) {
+				const reference = foreignKey.reference();
+				if (reference.columns.length === 1) {
+					continue;
+				}
+				expect(
+					reference.columns.map((column) => column.name)[0],
+					`${config.name}.${foreignKey.getName()} does not lead with the tenant column`,
+				).toBe("organization_id");
+				expect(reference.foreignColumns.map((column) => column.name)).toEqual([
+					"organization_id",
+					"id",
+				]);
+				const parent = getTableConfig(reference.foreignTable);
+				const parentKey = `${parent.name}_organization_id_key`;
+				expect(
+					parent.indexes.filter((index) => index.config.unique).map((index) => index.config.name),
+					`${parent.name} is missing ${parentKey}`,
+				).toContain(parentKey);
+			}
+		}
+	});
+
 	it("never gives destination_ref a foreign key — it is polymorphic by contract", () => {
 		for (const table of tables) {
 			const config = getTableConfig(table);
@@ -437,18 +469,23 @@ describe("paging groups", () => {
 		expect(memberColumns.get("extension_id")?.notNull).toBe(true);
 		expect(memberColumns.get("enabled")?.default).toBe(true);
 
+		// Tenant-composite: `(organization_id, <child>)` -> `(organization_id, id)`, so a
+		// cross-tenant reference is unresolvable in the database itself.
 		const targets = memberConfig.foreignKeys.map((foreignKey) => ({
-			column: foreignKey.reference().columns[0]?.name,
+			columns: foreignKey.reference().columns.map((column) => column.name),
+			foreignColumns: foreignKey.reference().foreignColumns.map((column) => column.name),
 			table: getTableName(foreignKey.reference().foreignTable),
 			onDelete: foreignKey.onDelete,
 		}));
 		expect(targets).toContainEqual({
-			column: "paging_group_id",
+			columns: ["organization_id", "paging_group_id"],
+			foreignColumns: ["organization_id", "id"],
 			table: "paging_group",
 			onDelete: "cascade",
 		});
 		expect(targets).toContainEqual({
-			column: "extension_id",
+			columns: ["organization_id", "extension_id"],
+			foreignColumns: ["organization_id", "id"],
 			table: "extension",
 			onDelete: "cascade",
 		});
@@ -528,18 +565,23 @@ describe("shared lines", () => {
 		expect(appearanceColumns.get("extension_id")?.notNull).toBe(true);
 		expect(appearanceColumns.get("enabled")?.default).toBe(true);
 
+		// Tenant-composite: `(organization_id, <child>)` -> `(organization_id, id)`, so a
+		// cross-tenant reference is unresolvable in the database itself.
 		const targets = appearanceConfig.foreignKeys.map((foreignKey) => ({
-			column: foreignKey.reference().columns[0]?.name,
+			columns: foreignKey.reference().columns.map((column) => column.name),
+			foreignColumns: foreignKey.reference().foreignColumns.map((column) => column.name),
 			table: getTableName(foreignKey.reference().foreignTable),
 			onDelete: foreignKey.onDelete,
 		}));
 		expect(targets).toContainEqual({
-			column: "shared_line_id",
+			columns: ["organization_id", "shared_line_id"],
+			foreignColumns: ["organization_id", "id"],
 			table: "shared_line",
 			onDelete: "cascade",
 		});
 		expect(targets).toContainEqual({
-			column: "extension_id",
+			columns: ["organization_id", "extension_id"],
+			foreignColumns: ["organization_id", "id"],
 			table: "extension",
 			onDelete: "cascade",
 		});

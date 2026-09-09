@@ -4,6 +4,8 @@ import {
 	anExtension,
 	anOutboundRoute,
 	aSnapshot,
+	aTranslationRule,
+	aTranslationRuleset,
 	aTrunk,
 	codesOf,
 	compileAttempt,
@@ -185,6 +187,33 @@ describe("compile — follow-me: external hops go through the outbound match tab
 			),
 		);
 		expect(plan?.destinations[0]?.dialedNumber).toBe("01115559998888");
+	});
+
+	it("applies the matched route's translation ruleset, as the keypad path does", () => {
+		const plan = followMeOf(
+			withLadder(
+				ladder({ targets: [hop({ destination: "5551234567" })] }),
+				{},
+				{
+					extensions: [
+						anExtension({ followMe: ladder({ targets: [hop({ destination: "5551234567" })] }) }),
+					],
+					trunks: [aTrunk()],
+					outboundRoutes: [
+						anOutboundRoute({
+							matchKind: "regex",
+							dialPatterns: ["^\\d{10}$"],
+							translationRulesetId: "tr-1",
+						}),
+					],
+					translationRulesets: [aTranslationRuleset()],
+					translationRules: [
+						aTranslationRule({ matchPattern: "^(\\d{10})$", replacement: "+1$1" }),
+					],
+				},
+			),
+		);
+		expect(plan?.destinations[0]?.dialedNumber).toBe("+15551234567");
 	});
 
 	it("refuses a hop whose only route needs a toll class the extension does not hold", () => {

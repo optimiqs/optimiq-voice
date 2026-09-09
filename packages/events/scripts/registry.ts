@@ -3,6 +3,13 @@ import { AUDIT_EVENT_DEFINITIONS } from "../src/schemas/audit-events";
 import { CALL_EVENT_DEFINITIONS } from "../src/schemas/call-events";
 import { CDR_EVENT_DEFINITIONS } from "../src/schemas/cdr-events";
 import { baseEventEnvelopeSchema } from "../src/schemas/envelope";
+import {
+	extensionPresenceSchema,
+	mediaSessionDirectoryEntrySchema,
+	sipAclEntrySchema,
+	sipDialogClaimSchema,
+	trunkDirectoryEntrySchema,
+} from "../src/schemas/live-state";
 import { MEDIA_EVENT_DEFINITIONS } from "../src/schemas/media-events";
 import { PROVISION_EVENT_DEFINITIONS } from "../src/schemas/provision-events";
 import { QUEUE_EVENT_DEFINITIONS } from "../src/schemas/queue-events";
@@ -631,6 +638,99 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		response: RPC_CONTRACTS["rpc.session.v1.announce"].response,
 	},
 ];
+
+/** One KV bucket VALUE contract: a live-state projection Go reads out of the bucket. */
+export interface LiveStateEntry {
+	/** The KV bucket the value lives in, and the schema file basename under `schema/live-state/`. */
+	readonly bucket: string;
+	/** Go struct name. */
+	readonly goName: string;
+	readonly doc: string;
+	readonly schema: z.ZodType;
+}
+
+/**
+ * Every KV VALUE that crosses the language border.
+ *
+ * The keys have always been generated (`kvKeyFor` + the parity golden); the values were not, and
+ * `apps/sipd`'s hand-written `acl.Record` had already drifted from `sipAclEntrySchema` — on the
+ * anti-toll-fraud boundary — before anything noticed. A value a Go reader decodes belongs here.
+ */
+export const LIVE_STATE_ENTRIES: readonly LiveStateEntry[] = [
+	{
+		bucket: "trunks",
+		goName: "TrunkDirectoryEntry",
+		doc: "the API projection stored in the trunks KV bucket.",
+		schema: trunkDirectoryEntrySchema,
+	},
+	{
+		bucket: "sip-acl",
+		goName: "SIPACLEntry",
+		doc: "one rule in the sip-acl KV bucket: the edge's admission boundary.",
+		schema: sipAclEntrySchema,
+	},
+	{
+		bucket: "sip-dialogs",
+		goName: "SIPDialogClaim",
+		doc: "the claim one sipd instance holds on a dialog, in the sip-dialogs KV bucket.",
+		schema: sipDialogClaimSchema,
+	},
+	{
+		bucket: "presence",
+		goName: "ExtensionPresenceValue",
+		doc: "the value a busy-lamp key renders, in the presence KV bucket.",
+		schema: extensionPresenceSchema,
+	},
+	{
+		bucket: "media-sessions",
+		goName: "MediaSessionDirectoryValue",
+		doc: "the mediad session directory value, in the media-sessions KV bucket.",
+		schema: mediaSessionDirectoryEntrySchema,
+	},
+];
+
+/**
+ * The gate the drift check cannot provide on its own: regenerating after a forgotten registry
+ * entry produces no new output, so `git diff` stays empty and CI reports "no drift" for an event
+ * the Go package has no struct for. Asserted at module scope so any consumer of this file fails.
+ */
+function assertRegistryComplete(): void {
+	const declaredEvents = new Set(EVENT_ENTRIES.map((entry) => `${entry.family}:${entry.type}`));
+	const definitionMaps = [
+		["call", CALL_EVENT_DEFINITIONS],
+		["registration", REGISTRATION_EVENT_DEFINITIONS],
+		["sipDialog", SIP_DIALOG_EVENT_DEFINITIONS],
+		["queue", QUEUE_EVENT_DEFINITIONS],
+		["voicemail", VOICEMAIL_EVENT_DEFINITIONS],
+		["media", MEDIA_EVENT_DEFINITIONS],
+		["trunk", TRUNK_EVENT_DEFINITIONS],
+		["cdr", CDR_EVENT_DEFINITIONS],
+		["audit", AUDIT_EVENT_DEFINITIONS],
+		["provision", PROVISION_EVENT_DEFINITIONS],
+	] as const;
+
+	for (const [family, definitions] of definitionMaps) {
+		for (const type of Object.keys(definitions)) {
+			if (!declaredEvents.has(`${family}:${type}`)) {
+				throw new Error(
+					`registry.ts is missing an EVENT_ENTRIES entry for ${family} ${JSON.stringify(type)}. ` +
+						"Add one, or the Go package has no struct and NewDataFor returns nil for it.",
+				);
+			}
+		}
+	}
+
+	const declaredRpc = new Set(RPC_ENTRIES.map((entry) => entry.subject));
+	for (const subject of Object.keys(RPC_CONTRACTS)) {
+		if (!declaredRpc.has(subject)) {
+			throw new Error(
+				`registry.ts is missing an RPC_ENTRIES entry for ${JSON.stringify(subject)}.`,
+			);
+		}
+	}
+}
+
+assertRegistryComplete();
 
 /** The base envelope, emitted as JSON Schema only — its Go form is hand-written `Envelope[T]`. */
 export const ENVELOPE_SCHEMA = baseEventEnvelopeSchema;

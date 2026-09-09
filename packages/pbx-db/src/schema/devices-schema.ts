@@ -6,7 +6,7 @@ import {
 	uuidEntityId,
 	uuidV7PrimaryKey,
 } from "@optimiq-voice/db";
-import { tenantIsolationPolicy } from "../tenant";
+import { tenantCompositeForeignKey, tenantIsolationPolicy } from "../tenant";
 import { extension } from "./extensions-schema";
 
 /**
@@ -92,6 +92,15 @@ export const deviceProfile = pgTable.withRLS(
 	(table) => [
 		uniqueIndex("device_profile_organization_name_key").on(table.organizationId, table.name),
 		index("device_profile_organization_vendor_idx").on(table.organizationId, table.vendor),
+		/**
+		 * The target of the tenant-composite foreign keys that reference this table.
+		 *
+		 * PostgreSQL evaluates referential integrity with RLS bypassed, and a policy only
+		 * constrains a row's OWN `organization_id` — so a single-column reference to `id` lets one
+		 * tenant point a row at another tenant's row and nothing in the database objects. Every
+		 * child references `(organization_id, id)` instead, which needs this unique index.
+		 */
+		uniqueIndex("device_profile_organization_id_key").on(table.organizationId, table.id),
 		tenantIsolationPolicy("device_profile"),
 	],
 );
@@ -101,9 +110,7 @@ export const deviceProfileKey = pgTable.withRLS(
 	{
 		id: uuidV7PrimaryKey(),
 		organizationId: tenantOrganizationIdColumn(),
-		deviceProfileId: uuidEntityId("device_profile_id")
-			.notNull()
-			.references(() => deviceProfile.id, { onDelete: "cascade" }),
+		deviceProfileId: uuidEntityId("device_profile_id").notNull(),
 		category: text("category").$type<DeviceKeyCategory>().notNull().default("memory"),
 		keyIndex: integer("key_index").notNull(),
 		keyType: text("key_type").$type<DeviceKeyType>().notNull().default("none"),
@@ -120,6 +127,11 @@ export const deviceProfileKey = pgTable.withRLS(
 			table.category,
 			table.keyIndex,
 		),
+		tenantCompositeForeignKey({
+			name: "device_profile_key_device_profile_fk",
+			columns: [table.organizationId, table.deviceProfileId],
+			foreignColumns: [deviceProfile.organizationId, deviceProfile.id],
+		}),
 		tenantIsolationPolicy("device_profile_key"),
 	],
 );

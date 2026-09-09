@@ -5,7 +5,7 @@ import {
 	uuidEntityId,
 	uuidV7PrimaryKey,
 } from "@optimiq-voice/db";
-import { tenantIsolationPolicy } from "../tenant";
+import { tenantCompositeForeignKey, tenantIsolationPolicy } from "../tenant";
 import { mohClass } from "./media-schema";
 
 /**
@@ -144,6 +144,15 @@ export const extension = pgTable.withRLS(
 		index("extension_organization_label_idx").on(table.organizationId, table.label),
 		index("extension_organization_toll_class_idx").on(table.organizationId, table.tollClass),
 		index("extension_organization_moh_class_idx").on(table.organizationId, table.mohClassId),
+		/**
+		 * The target of the tenant-composite foreign keys that reference this table.
+		 *
+		 * PostgreSQL evaluates referential integrity with RLS bypassed, and a policy only
+		 * constrains a row's OWN `organization_id` — so a single-column reference to `id` lets one
+		 * tenant point a row at another tenant's row and nothing in the database objects. Every
+		 * child references `(organization_id, id)` instead, which needs this unique index.
+		 */
+		uniqueIndex("extension_organization_id_key").on(table.organizationId, table.id),
 		tenantIsolationPolicy("extension"),
 	],
 );
@@ -158,9 +167,7 @@ export const extensionUser = pgTable.withRLS(
 	{
 		id: uuidV7PrimaryKey(),
 		organizationId: tenantOrganizationIdColumn(),
-		extensionId: uuidEntityId("extension_id")
-			.notNull()
-			.references(() => extension.id, { onDelete: "cascade" }),
+		extensionId: uuidEntityId("extension_id").notNull(),
 		/** `user.id` in the auth database. No FK — see the note above. */
 		userId: uuidEntityId("user_id").notNull(),
 		role: text("role").$type<ExtensionUserRole>().notNull().default("primary"),
@@ -174,6 +181,11 @@ export const extensionUser = pgTable.withRLS(
 		),
 		index("extension_user_organization_user_idx").on(table.organizationId, table.userId),
 		index("extension_user_organization_extension_idx").on(table.organizationId, table.extensionId),
+		tenantCompositeForeignKey({
+			name: "extension_user_extension_fk",
+			columns: [table.organizationId, table.extensionId],
+			foreignColumns: [extension.organizationId, extension.id],
+		}),
 		tenantIsolationPolicy("extension_user"),
 	],
 );

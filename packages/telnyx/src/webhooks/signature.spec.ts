@@ -84,6 +84,22 @@ describe("verifyTelnyxWebhook — the reject path", () => {
 		}
 	});
 
+	/**
+	 * `Buffer.from(…, "base64")` ignores characters it does not recognize, so a signature with
+	 * garbage embedded in it could still decode to 64 bytes and reach `verify` — reported as a
+	 * mismatch, which is exactly the confusion the strict decode exists to prevent.
+	 */
+	it("rejects a signature carrying characters that are not base64", () => {
+		const signed = signFakeTelnyxWebhook(keyPair, body);
+		const junk = `${signed.signature.slice(0, 10)}!! ${signed.signature.slice(10)}`;
+		try {
+			verify({ signature: junk });
+			throw new Error("should have thrown");
+		} catch (error) {
+			expect((error as TelnyxSignatureError).reason).toBe("malformed-signature");
+		}
+	});
+
 	it("rejects a public key that is not 32 decoded bytes", () => {
 		try {
 			verify({ publicKey: "AAAA" });

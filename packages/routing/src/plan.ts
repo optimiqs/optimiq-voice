@@ -893,7 +893,7 @@ export function planNodeReferences(node: PlanNode): readonly PlanNodeId[] {
 			]);
 		}
 		case "queue": {
-			return compact([node.timeoutNodeId]);
+			return compact([node.timeoutNodeId, node.exitNodeId]);
 		}
 		case "park": {
 			return compact([node.timeoutNodeId]);
@@ -921,7 +921,24 @@ export function planNodeReferences(node: PlanNode): readonly PlanNodeId[] {
 		case "time-condition": {
 			return compact([node.matchNodeId, node.noMatchNodeId]);
 		}
-		default: {
+		case "call-flow": {
+			// BOTH branches, whatever the mode currently says: the inactive one becomes the active
+			// one the moment somebody presses the toggle, so it has to stay closed and reachable.
+			return compact([node.dayNodeId, node.nightNodeId]);
+		}
+		case "stream": {
+			return compact([node.fallbackNodeId]);
+		}
+		case "dial-by-name": {
+			return compact([...node.entries.map((entry) => entry.targetNodeId), node.timeoutNodeId]);
+		}
+		case "voicemail":
+		case "conference":
+		case "external":
+		case "application":
+		case "hangup": {
+			// Terminal kinds: no branch fields. Listed rather than defaulted so the next node kind
+			// added here is a compile error instead of a silently unreported edge.
 			return [];
 		}
 	}

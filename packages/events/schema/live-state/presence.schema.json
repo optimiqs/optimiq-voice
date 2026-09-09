@@ -1,0 +1,42 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"orgId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"extensionNumber": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 64
+		},
+		"state": {
+			"type": "string",
+			"enum": ["down", "ringing", "active", "active-multi", "held", "unheld", "hangup"]
+		},
+		"channelCount": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 1024
+		},
+		"callStates": {
+			"maxItems": 64,
+			"type": "array",
+			"items": {
+				"type": "string",
+				"maxLength": 32
+			}
+		},
+		"writtenBy": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"updatedAt": {
+			"type": "number"
+		}
+	},
+	"required": ["orgId", "extensionNumber", "state", "channelCount", "updatedAt"],
+	"additionalProperties": {}
+}

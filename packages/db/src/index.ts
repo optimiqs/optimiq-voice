@@ -100,10 +100,11 @@ export {
 export {
 	createSsoProvider,
 	deleteSsoProvider,
-	listEnabledSsoProviders,
+	listEnabledSsoProvidersWithSecrets,
 	listSsoProviders,
 	readSsoProvider,
 	type SsoProviderInput,
 	type SsoProviderRow,
+	type SsoProviderSecretRow,
 	updateSsoProvider,
 } from "./platform-sso";

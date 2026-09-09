@@ -447,6 +447,25 @@ describe("parseSubject round trip", () => {
 		});
 	});
 
+	it("reverses an instance-addressed rpc subject", () => {
+		expect(parseSubjectOrThrow(subjectFor.sipRingRpc("sipd-2"))).toEqual({
+			kind: "rpc",
+			family: "rpc",
+			version: "v1",
+			service: "sip",
+			method: "ring",
+			target: "sipd-2",
+		});
+		expect(parseSubjectOrThrow(subjectFor.sessionAnnounceRpc(ORG, "app-1"))).toEqual({
+			kind: "rpc",
+			family: "rpc",
+			version: "v1",
+			service: "session",
+			method: "announce",
+			target: `${ORG}.app-1`,
+		});
+	});
+
 	it("round-trips every call event name", () => {
 		for (const event of CALL_EVENTS) {
 			const parsed = parseSubjectOrThrow(subjectFor.call(ORG, CALL, event));

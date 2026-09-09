@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test";
+import { VALID_CALL_STATE_TRANSITIONS } from "./call-state";
 import { isHangupCause } from "./hangup-causes";
 import {
+	ANSWERED_VERBS,
 	DIAL_STRATEGIES,
 	isProgressVerb,
 	isTerminalVerb,
@@ -11,6 +13,7 @@ import {
 	TERMINAL_VERBS,
 	TRANSFER_KINDS,
 	VERB_NAMES,
+	verbRequiresAnswer,
 	verbRequiresMediaPath,
 	type DialVerb,
 	type GatherVerb,
@@ -97,6 +100,30 @@ describe("answer and progress semantics", () => {
 	it("treats hangup and transfer as ending application control", () => {
 		expect(VERB_NAMES.filter(isTerminalVerb).sort()).toEqual(["hangup", "transfer"]);
 		expect(TERMINAL_VERBS).toContain("transfer");
+	});
+
+	/**
+	 * `hasMediaPath` is true for a 183 leg that was never answered, and `VALID_CALL_STATE_TRANSITIONS`
+	 * has no edge from `early` to `held`. A verb guard that admitted `hold` there let the request
+	 * past and then raised an internal invariant error mid-call instead of rejecting it cleanly.
+	 */
+	it("requires an answer, not merely media, for hold and park", () => {
+		for (const verb of ANSWERED_VERBS) {
+			expect(verbRequiresAnswer(verb)).toBe(true);
+			// Still a subset: a caller checking only the media-path rule is not made wrong by this.
+			expect(verbRequiresMediaPath(verb)).toBe(true);
+		}
+		for (const verb of ["play", "say", "gather", "record", "playDtmf"] as const) {
+			expect(verbRequiresAnswer(verb)).toBe(false);
+		}
+	});
+
+	it("admits no verb whose answered-state edge the call-state machine denies", () => {
+		for (const verb of ANSWERED_VERBS) {
+			// `held` is reachable only from `active`, which is the answered state.
+			expect(VALID_CALL_STATE_TRANSITIONS.early as readonly string[]).not.toContain("held");
+			expect(verbRequiresAnswer(verb)).toBe(true);
+		}
 	});
 
 	it("keeps the terminal and media-path sets disjoint", () => {

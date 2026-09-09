@@ -33,6 +33,7 @@ type goldenParsedSubject struct {
 	Event     string `json:"event"`
 	Service   string `json:"service"`
 	Method    string `json:"method"`
+	Target    string `json:"target"`
 }
 
 type goldenStream struct {
@@ -128,6 +129,13 @@ type golden struct {
 		GoType   string          `json:"goType"`
 		Envelope json.RawMessage `json:"envelope"`
 	} `json:"eventSamples"`
+
+	RPCSamples []struct {
+		Subject  string          `json:"subject"`
+		GoType   string          `json:"goType"`
+		Request  json.RawMessage `json:"request"`
+		Response json.RawMessage `json:"response"`
+	} `json:"rpcSamples"`
 }
 
 func loadGolden(t *testing.T) golden {
@@ -419,6 +427,7 @@ func TestParityParseSubject(t *testing.T) {
 			Event:     parsed.Event,
 			Service:   parsed.Service,
 			Method:    parsed.Method,
+			Target:    parsed.Target,
 		}
 		if got != *tc.Parsed {
 			t.Errorf("ParseSubject(%q) = %+v, golden %+v", tc.Subject, got, *tc.Parsed)
@@ -747,5 +756,58 @@ func TestEventTimeMarshalsLikeToISOString(t *testing.T) {
 	}
 	if string(encoded) != `"2026-08-05T10:00:00.000Z"` {
 		t.Errorf("EventTime = %s, want the same instant normalised to UTC", encoded)
+	}
+}
+
+// TestParityEventSampleCoverage is the gate the golden could not provide while its samples were a
+// hand-written list: a payload struct nobody sampled is a struct nothing round-trips, and an
+// emitter mistake on it ships silently.
+func TestParityEventSampleCoverage(t *testing.T) {
+	g := loadGolden(t)
+
+	sampled := make(map[string]struct{}, len(g.EventSamples))
+	for _, sample := range g.EventSamples {
+		sampled[sample.GoType] = struct{}{}
+	}
+	for _, info := range g.EventTypes {
+		if _, ok := sampled[info.GoType]; !ok {
+			t.Errorf("no parity sample for %s (%s %s)", info.GoType, info.Family, info.Type)
+		}
+	}
+}
+
+// TestParityRPCSamples is TestParityEventSamples for the request-reply half: 74 generated structs
+// that were emitted but never decoded by any test until this one.
+func TestParityRPCSamples(t *testing.T) {
+	g := loadGolden(t)
+	if len(g.RPCSamples) == 0 {
+		t.Fatal("golden carries no rpc samples")
+	}
+
+	for _, sample := range g.RPCSamples {
+		t.Run(sample.Subject, func(t *testing.T) {
+			for _, side := range []struct {
+				name  string
+				raw   json.RawMessage
+				value any
+			}{
+				{"request", sample.Request, NewRPCRequestFor(sample.Subject)},
+				{"response", sample.Response, NewRPCResponseFor(sample.Subject)},
+			} {
+				if side.value == nil {
+					t.Fatalf("%s: the registry is missing %q", side.name, sample.Subject)
+				}
+				if err := json.Unmarshal(side.raw, side.value); err != nil {
+					t.Fatalf("%s: decode into %T: %v", side.name, side.value, err)
+				}
+				reEncoded, err := json.Marshal(side.value)
+				if err != nil {
+					t.Fatalf("%s: re-encode: %v", side.name, err)
+				}
+				if got, want := canonical(t, reEncoded), canonical(t, side.raw); got != want {
+					t.Errorf("%s round-trip lost or invented fields:\n got %s\nwant %s", side.name, got, want)
+				}
+			}
+		})
 	}
 }

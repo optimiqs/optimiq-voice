@@ -93,6 +93,23 @@ describe("isSensitiveLogKey", () => {
 			expect(isSensitiveLogKey(key)).toBe(false);
 		}
 	});
+
+	it("matches ambiguous tokens only on token boundaries", () => {
+		for (const key of ["session", "Session", "session_id", "address", "ip-address", "did"]) {
+			expect(isSensitiveLogKey(key)).toBe(true);
+		}
+		// Correlation keys an incident is reconstructed from must survive redaction.
+		for (const key of [
+			"sessionId",
+			"sessionCount",
+			"applicationSessionId",
+			"ipAddress",
+			"remoteAddress",
+			"didIndex",
+		]) {
+			expect(isSensitiveLogKey(key)).toBe(false);
+		}
+	});
 });
 
 describe("redactLogValue", () => {

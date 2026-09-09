@@ -32,8 +32,31 @@ const createDestination = () => {
 	return pino.destination({ sync: false });
 };
 
-export const createPinoLogger = (options?: LoggerOptions): PinoLogger => {
-	return pino({ ...defaultOptions, ...options }, createDestination());
+/**
+ * The last gate before a transport. It runs on the pino instance itself rather than on any one
+ * wrapper, so every front door — `AppLogger`, `getLogger`, the Effect logger bridge, a raw
+ * `getPinoLogger().error(...)` on a defect path — is redacted by construction. Redaction is
+ * idempotent, so callers that already scrubbed lose nothing by passing through twice.
+ */
+const redactLogArguments = (args: unknown[]): unknown[] => args.map((arg) => redactLogValue(arg));
+
+export const createPinoLogger = (
+	options?: LoggerOptions,
+	destination?: pino.DestinationStream,
+): PinoLogger => {
+	return pino(
+		{
+			...defaultOptions,
+			...options,
+			hooks: {
+				...options?.hooks,
+				logMethod(this: PinoLogger, args: Parameters<PinoLogger["info"]>, method) {
+					method.apply(this, redactLogArguments(args) as Parameters<PinoLogger["info"]>);
+				},
+			},
+		},
+		destination ?? createDestination(),
+	);
 };
 
 /**

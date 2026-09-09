@@ -190,3 +190,169 @@ func NewDataFor(eventType string) any {
 	}
 	return nil
 }
+
+// NewRPCRequestFor returns a pointer to a zero request struct for an rpc.* subject, or nil
+// when the subject is not part of this contract version.
+//
+// Instance-addressed subjects carry a variable tail; pass the PREFIX (ParsedSubject.Method
+// without Target), which is what RPC_SUBJECTS names.
+func NewRPCRequestFor(subject string) any {
+	switch subject {
+	case SubjectRoutingResolveRPC:
+		return new(RoutingResolveRequest)
+	case SubjectAuthzCheckRPC:
+		return new(AuthzCheckRequest)
+	case SubjectVoicemailListRPC:
+		return new(VoicemailListRequest)
+	case SubjectExtensionFeatureRPC:
+		return new(ExtensionFeatureRequest)
+	case SubjectLastCallerRPC:
+		return new(LastCallerRequest)
+	case SubjectFileGreetingRPC:
+		return new(FileGreetingRequest)
+	case SubjectSipCredentialRPC:
+		return new(SipCredentialRequest)
+	case SubjectSipTrunkCredentialRPC:
+		return new(SipTrunkCredentialRequest)
+	case SubjectSipTransferRPC:
+		return new(SipTransferRequest)
+	case SubjectSipInviteRPC:
+		return new(SipInviteRequest)
+	case SubjectSipRingRPC:
+		return new(SipRingRequest)
+	case SubjectSipAnswerRPC:
+		return new(SipAnswerRequest)
+	case SubjectSipHangupRPC:
+		return new(SipHangupRequest)
+	case SubjectSipReinviteRPC:
+		return new(SipReinviteRequest)
+	case SubjectSipOriginateRPC:
+		return new(SipOriginateRequest)
+	case SubjectSipResolveTargetRPC:
+		return new(SipResolveTargetRequest)
+	case SubjectEngineRenegotiateRPC:
+		return new(EngineRenegotiateRequest)
+	case SubjectMediaAllocateSessionRPC:
+		return new(MediaAllocateSessionRequest)
+	case SubjectMediaCreateOfferRPC:
+		return new(MediaCreateOfferRequest)
+	case SubjectMediaAcceptAnswerRPC:
+		return new(MediaAcceptAnswerRequest)
+	case SubjectMediaBridgeSessionsRPC:
+		return new(MediaBridgeSessionsRequest)
+	case SubjectMediaUnbridgeSessionsRPC:
+		return new(MediaUnbridgeSessionsRequest)
+	case SubjectMediaReleaseSessionRPC:
+		return new(MediaReleaseSessionRequest)
+	case SubjectMediaStartPlaybackRPC:
+		return new(MediaStartPlaybackRequest)
+	case SubjectMediaStopPlaybackRPC:
+		return new(MediaStopPlaybackRequest)
+	case SubjectMediaSendDtmfRPC:
+		return new(MediaSendDtmfRequest)
+	case SubjectMediaStartRecordingRPC:
+		return new(MediaStartRecordingRequest)
+	case SubjectMediaStopRecordingRPC:
+		return new(MediaStopRecordingRequest)
+	case SubjectMediaTapSessionRPC:
+		return new(MediaTapSessionRequest)
+	case SubjectMediaUntapSessionRPC:
+		return new(MediaUntapSessionRequest)
+	case SubjectMediaMuteSessionRPC:
+		return new(MediaMuteSessionRequest)
+	case SubjectMediaHoldSessionRPC:
+		return new(MediaHoldSessionRequest)
+	case SubjectOriginateRPC:
+		return new(OriginateRequest)
+	case SubjectParkHandoffRPC:
+		return new(ParkHandoffRequest)
+	case SubjectSessionVerbRPC:
+		return new(SessionVerbRequest)
+	case SubjectConferenceControlRPC:
+		return new(ConferenceControlRequest)
+	case SubjectSessionAnnounceRPC:
+		return new(SessionAnnounceRequest)
+	}
+	return nil
+}
+
+// NewRPCResponseFor is NewRPCRequestFor for the reply body.
+func NewRPCResponseFor(subject string) any {
+	switch subject {
+	case SubjectRoutingResolveRPC:
+		return new(RoutingResolveResponse)
+	case SubjectAuthzCheckRPC:
+		return new(AuthzCheckResponse)
+	case SubjectVoicemailListRPC:
+		return new(VoicemailListResponse)
+	case SubjectExtensionFeatureRPC:
+		return new(ExtensionFeatureResponse)
+	case SubjectLastCallerRPC:
+		return new(LastCallerResponse)
+	case SubjectFileGreetingRPC:
+		return new(FileGreetingResponse)
+	case SubjectSipCredentialRPC:
+		return new(SipCredentialResponse)
+	case SubjectSipTrunkCredentialRPC:
+		return new(SipTrunkCredentialResponse)
+	case SubjectSipTransferRPC:
+		return new(SipTransferResponse)
+	case SubjectSipInviteRPC:
+		return new(SipInviteResponse)
+	case SubjectSipRingRPC:
+		return new(SipRingResponse)
+	case SubjectSipAnswerRPC:
+		return new(SipAnswerResponse)
+	case SubjectSipHangupRPC:
+		return new(SipHangupResponse)
+	case SubjectSipReinviteRPC:
+		return new(SipReinviteResponse)
+	case SubjectSipOriginateRPC:
+		return new(SipOriginateResponse)
+	case SubjectSipResolveTargetRPC:
+		return new(SipResolveTargetResponse)
+	case SubjectEngineRenegotiateRPC:
+		return new(EngineRenegotiateResponse)
+	case SubjectMediaAllocateSessionRPC:
+		return new(MediaAllocateSessionResponse)
+	case SubjectMediaCreateOfferRPC:
+		return new(MediaCreateOfferResponse)
+	case SubjectMediaAcceptAnswerRPC:
+		return new(MediaAcceptAnswerResponse)
+	case SubjectMediaBridgeSessionsRPC:
+		return new(MediaBridgeSessionsResponse)
+	case SubjectMediaUnbridgeSessionsRPC:
+		return new(MediaUnbridgeSessionsResponse)
+	case SubjectMediaReleaseSessionRPC:
+		return new(MediaReleaseSessionResponse)
+	case SubjectMediaStartPlaybackRPC:
+		return new(MediaStartPlaybackResponse)
+	case SubjectMediaStopPlaybackRPC:
+		return new(MediaStopPlaybackResponse)
+	case SubjectMediaSendDtmfRPC:
+		return new(MediaSendDtmfResponse)
+	case SubjectMediaStartRecordingRPC:
+		return new(MediaStartRecordingResponse)
+	case SubjectMediaStopRecordingRPC:
+		return new(MediaStopRecordingResponse)
+	case SubjectMediaTapSessionRPC:
+		return new(MediaTapSessionResponse)
+	case SubjectMediaUntapSessionRPC:
+		return new(MediaUntapSessionResponse)
+	case SubjectMediaMuteSessionRPC:
+		return new(MediaMuteSessionResponse)
+	case SubjectMediaHoldSessionRPC:
+		return new(MediaHoldSessionResponse)
+	case SubjectOriginateRPC:
+		return new(OriginateResponse)
+	case SubjectParkHandoffRPC:
+		return new(ParkHandoffResponse)
+	case SubjectSessionVerbRPC:
+		return new(SessionVerbResponse)
+	case SubjectConferenceControlRPC:
+		return new(ConferenceControlResponse)
+	case SubjectSessionAnnounceRPC:
+		return new(SessionAnnounceResponse)
+	}
+	return nil
+}

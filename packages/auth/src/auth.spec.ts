@@ -2,10 +2,14 @@ import { describe, expect, it } from "bun:test";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import {
+	assertSsoProviderOrganization,
 	type AuthEmailDelivery,
 	createAuth,
+	emailMatchesDomain,
 	ORGANIZATION_MEMBERSHIP_ROLES,
+	resolveSsoProviderOrganizationId,
 	SESSION_COOKIE_CACHE_VERSION,
+	SsoProviderConfigError,
 } from "./auth";
 import { SYSTEM_ROLE_IDS } from "./permissions";
 import { authSchema } from "./schema";
@@ -46,6 +50,12 @@ function organizationPluginOptions(auth: ReturnType<typeof createAuth>): {
 		roles?: Record<string, unknown>;
 		creatorRole?: string;
 	};
+}
+
+/** The one `genericOAuth` config entry a spec reaches into. */
+interface GenericOAuthSpecConfig {
+	readonly providerId: string;
+	readonly mapProfileToUser: (profile: Record<string, unknown>) => unknown;
 }
 
 /** The two-factor plugin's options, as composed. */
@@ -214,5 +224,79 @@ describe("createAuth", () => {
 		expect(options.ac).toBeUndefined();
 		expect(options.roles).toBeUndefined();
 		expect(options.creatorRole).toBe("owner");
+	});
+});
+
+describe("SSO providers", () => {
+	const provider = {
+		providerId: "tenant-a",
+		organizationId: "org-a",
+		clientId: "client",
+		clientSecret: "secret",
+		issuer: "https://idp.example",
+		emailDomain: "tenant-a.example",
+	} as const;
+
+	function genericOAuthConfig(auth: ReturnType<typeof createAuth>) {
+		const plugins = auth.options.plugins as { id: string; options?: unknown }[];
+		const plugin = plugins.find((candidate) => candidate.id === "generic-oauth");
+		return (plugin?.options as { config?: GenericOAuthSpecConfig[] } | undefined)?.config ?? [];
+	}
+
+	it("refuses to register a provider with no email domain", () => {
+		expect(() => buildAuth({ ssoProviders: [{ ...provider, emailDomain: "  " }] })).toThrow(
+			SsoProviderConfigError,
+		);
+	});
+
+	it("rejects a profile whose email is outside the registered domain", () => {
+		const [config] = genericOAuthConfig(buildAuth({ ssoProviders: [provider] }));
+		expect(() => config?.mapProfileToUser({ email: "cfo@tenant-b.example" })).toThrow(
+			SsoProviderConfigError,
+		);
+		expect(config?.mapProfileToUser({ email: "cfo@TENANT-A.example" })).toEqual({});
+	});
+
+	it("never links a federated identity to a pre-existing local user", () => {
+		expect(buildAuth().options.account?.accountLinking?.enabled).toBe(false);
+	});
+
+	it("resolves the tenant that owns a provider slug", () => {
+		expect(resolveSsoProviderOrganizationId([provider], "tenant-a")).toBe("org-a");
+		expect(resolveSsoProviderOrganizationId([provider], "tenant-b")).toBeUndefined();
+	});
+
+	it("refuses a session resolved into another organization than the provider's", () => {
+		expect(() =>
+			assertSsoProviderOrganization({
+				providers: [provider],
+				providerId: "tenant-a",
+				organizationId: "org-b",
+			}),
+		).toThrow(SsoProviderConfigError);
+		assertSsoProviderOrganization({
+			providers: [provider],
+			providerId: "tenant-a",
+			organizationId: "org-a",
+		});
+	});
+
+	it("matches an email against its domain and not against a subdomain of it", () => {
+		expect(emailMatchesDomain("a@tenant-a.example", "tenant-a.example")).toBe(true);
+		expect(emailMatchesDomain("a@evil.tenant-a.example", "tenant-a.example")).toBe(false);
+		expect(emailMatchesDomain("a@tenant-a.example", "@Tenant-A.Example")).toBe(true);
+		expect(emailMatchesDomain("not-an-email", "tenant-a.example")).toBe(false);
+	});
+});
+
+describe("rate limiting", () => {
+	it("counts in the shared database table, not in this process's memory", () => {
+		expect(buildAuth().options.rateLimit?.storage).toBe("database");
+	});
+
+	it("throttles the credential paths harder than the default", () => {
+		const rules = buildAuth().options.rateLimit?.customRules ?? {};
+		expect(rules["/sign-in/email"]).toEqual({ window: 60, max: 10 });
+		expect(rules["/two-factor/verify-otp"]).toEqual({ window: 60, max: 5 });
 	});
 });

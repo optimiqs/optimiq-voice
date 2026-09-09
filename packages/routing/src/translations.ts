@@ -36,6 +36,7 @@
  */
 
 import { RoutingError } from "./errors";
+import { unsafeRegexDetail } from "./patterns";
 
 /** Upper bound on a translated number. Far past any dial string; here to bound the work. */
 export const MAX_TRANSLATED_LENGTH = 128;
@@ -96,6 +97,12 @@ export function validateTranslationRule(rule: {
 			// No flags, exactly as `compilePattern` does it: the stored source is the whole contract,
 			// including case sensitivity.
 			void new RegExp(rule.matchPattern);
+			// Compilability is not safety: a ruleset runs per call, and an inbound one runs over a
+			// carrier-supplied caller id. See `unsafeRegexDetail`.
+			const unsafe = unsafeRegexDetail(rule.matchPattern);
+			if (unsafe !== null) {
+				issues.push({ code: "invalid-regex", detail: unsafe });
+			}
 		} catch (error) {
 			issues.push({
 				code: "invalid-regex",
@@ -158,6 +165,13 @@ export interface TranslationOutcome {
 	readonly applied: readonly string[];
 	/** True when the pipeline was abandoned because the result exceeded the length cap. */
 	readonly overflowed: boolean;
+	/**
+	 * True when the pipeline was abandoned because a rule produced something undialable.
+	 *
+	 * Set alongside `overflowed` rather than instead of it, so every existing caller — all of which
+	 * already fall back to the input on `overflowed` — is safe without being changed.
+	 */
+	readonly undialable?: boolean;
 }
 
 /**
@@ -186,6 +200,14 @@ export function applyTranslationRuleset(
 		}
 		if (next.length > MAX_TRANSLATED_LENGTH) {
 			return { value: input, applied: [], overflowed: true };
+		}
+		// The OUTPUT is checked, not only the replacement literal. `isSafeReplacement` bounds what
+		// this string can contribute, but it argues that a back-reference is bounded by the input —
+		// which holds for a dial string the caller pressed and does NOT hold for a carrier-supplied
+		// caller id, where `^(.*)$` → `$1` would carry `@host;transport=tcp` straight through. It
+		// also catches `$$1`, which survives the back-reference strip and renders as a literal `$`.
+		if (!REPLACEMENT_LITERAL_PATTERN.test(next)) {
+			return { value: input, applied: [], overflowed: true, undialable: true };
 		}
 		value = next;
 		applied.push(rule.id);

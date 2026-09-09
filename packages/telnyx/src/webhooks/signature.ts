@@ -54,16 +54,22 @@ const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 const ED25519_PUBLIC_KEY_BYTES = 32;
 const ED25519_SIGNATURE_BYTES = 64;
 
+/** Standard base64 with optional padding. Telnyx sends this alphabet; nothing else is accepted. */
+const BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/u;
+
 /**
  * Decodes strict base64, rejecting anything that is not.
  *
  * `Buffer.from(value, "base64")` is famously lenient — it ignores characters it does not
- * recognize and returns a short buffer rather than failing — so a truncated or garbage signature
- * would otherwise reach `verify` as a valid-looking short buffer and be reported as a mismatch
- * rather than as the malformed input it is. The length check afterwards is what makes the
- * distinction observable.
+ * recognize and returns a short buffer rather than failing — so a garbage signature would
+ * otherwise reach `verify` as a valid-looking buffer and be reported as a mismatch rather than as
+ * the malformed input it is. The alphabet check is what makes "not base64" distinguishable from
+ * "wrong key"; the length check is what makes "right alphabet, wrong size" distinguishable too.
  */
 function decodeBase64(value: string, expectedBytes: number): Buffer | undefined {
+	if (!BASE64_PATTERN.test(value)) {
+		return undefined;
+	}
 	const decoded = Buffer.from(value, "base64");
 	if (decoded.length !== expectedBytes) {
 		return undefined;

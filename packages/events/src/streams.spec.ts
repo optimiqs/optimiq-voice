@@ -263,6 +263,11 @@ describe("stream reconciliation helpers", () => {
 		["api err_code", { api_error: { err_code: 10059 } }, true],
 		["api 404", { api_error: { code: 404 } }, true],
 		["connection", { message: "connection refused" }, false],
+		// A missing consumer or an unresolvable host must not read as "the stream is absent":
+		// ensureStreams would re-add a live stream and ensureKvBuckets would claim it created a
+		// bucket that was already there.
+		["consumer not found", { message: "consumer not found" }, false],
+		["dns", { message: "getaddrinfo ENOTFOUND nats: not found" }, false],
 		["not an object", "boom", false],
 	])("classifies a %s error", (_label, error, expected) => {
 		expect(isStreamNotFoundError(error)).toBe(expected);

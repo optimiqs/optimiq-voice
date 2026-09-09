@@ -529,14 +529,29 @@ export const MEDIA_PATH_VERBS = [
 	"playDtmf",
 	"stream",
 	"streamGather",
+	// `hold`/`unhold`/`park`/`unpark` are here because they need a media path like the rest — and in
+	// {@link ANSWERED_VERBS} as well, because a media path is not enough for them. See there.
 	"hold",
 	"unhold",
-	// Parking a leg that has not answered would put a ringing caller in an orbit slot with music
-	// nobody can hear and a timeout nobody is waiting on; retrieving onto one would join a live
-	// caller to a phone that has not picked up. Both are the media-path invariant, not a new rule.
 	"park",
 	"unpark",
 ] as const satisfies readonly VerbName[];
+
+/**
+ * Verbs that need the leg ANSWERED, not merely carrying media.
+ *
+ * `hasMediaPath` is true for a 183 early-media leg that was never answered, and these four are not
+ * safe on one: the call-state machine has no edge from `early` to `held`
+ * (`VALID_CALL_STATE_TRANSITIONS`), so accepting `hold` during a pre-answer announcement gets the
+ * verb past the guard and then raises `InvalidCallStateTransitionError` mid-call — an error whose
+ * own doc says it is always an engine bug and must never become a 4xx. Parking is the same shape:
+ * a ringing caller in an orbit slot hears music nobody sent and waits on a timeout nobody armed.
+ *
+ * A subset of {@link MEDIA_PATH_VERBS}, so a caller that checks both gets the stricter answer.
+ */
+export const ANSWERED_VERBS = ["hold", "unhold", "park", "unpark"] as const satisfies readonly [
+	...VerbName[],
+];
 
 /**
  * Verbs that end the application's control of the leg. Nothing may follow them on the stream; the
@@ -555,6 +570,7 @@ export const PROGRESS_VERBS = [
 ] as const satisfies readonly VerbName[];
 
 const MEDIA_PATH_VERB_SET = new Set<string>(MEDIA_PATH_VERBS);
+const ANSWERED_VERB_SET = new Set<string>(ANSWERED_VERBS);
 const TERMINAL_VERB_SET = new Set<string>(TERMINAL_VERBS);
 const PROGRESS_VERB_SET = new Set<string>(PROGRESS_VERBS);
 
@@ -566,6 +582,11 @@ export function isVerbName(value: string): value is VerbName {
 /** Whether the verb needs an answered or early-media leg. See {@link MEDIA_PATH_VERBS}. */
 export function verbRequiresMediaPath(verb: VerbName): boolean {
 	return MEDIA_PATH_VERB_SET.has(verb);
+}
+
+/** Whether the verb needs the leg ANSWERED, not merely in early media. See {@link ANSWERED_VERBS}. */
+export function verbRequiresAnswer(verb: VerbName): boolean {
+	return ANSWERED_VERB_SET.has(verb);
 }
 
 /** Whether the verb ends the application's control of the leg. See {@link TERMINAL_VERBS}. */

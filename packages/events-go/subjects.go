@@ -742,6 +742,10 @@ type ParsedSubject struct {
 	// Service and Method are set for KindRPC.
 	Service string
 	Method  string
+	// Target is the variable tail an instance-addressed RPC subject carries — the <instanceToken>
+	// of rpc.sip.v1.ring.<tok>, or the <orgId>.<appToken> of rpc.session.v1.announce. Empty on the
+	// flat, queue-grouped subjects.
+	Target string
 }
 
 // UnknownSubjectError is returned by ParseSubjectOrError for a subject outside the taxonomy.
@@ -817,9 +821,10 @@ func ParseSubject(subject string) (ParsedSubject, bool) {
 		return ParsedSubject{
 			Kind: KindProvision, Family: string(FamilyProvision), Version: version, OrgID: rest[0],
 		}, true
-	case first == "rpc" && len(rest) == 1:
+	case first == "rpc" && len(rest) >= 1:
 		return ParsedSubject{
 			Kind: KindRPC, Family: "rpc", Version: version, Service: second, Method: rest[0],
+			Target: strings.Join(rest[1:], "."),
 		}, true
 	}
 	return ParsedSubject{}, false

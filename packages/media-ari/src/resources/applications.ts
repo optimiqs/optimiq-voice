@@ -1,4 +1,5 @@
 import { ariApplicationSchema, ariAsteriskInfoSchema } from "../models";
+import { encodeSegment } from "../url";
 import type { AriHttpClient } from "../http-client";
 import type { AriApplication, AriAsteriskInfo } from "../models";
 
@@ -25,7 +26,7 @@ export class AriApplications {
 	/** `GET /applications/{name}` — `undefined` when the application is not registered. */
 	async get(applicationName: string): Promise<AriApplication | undefined> {
 		return await this.http.requestParsedOptional(
-			{ method: "GET", path: `/applications/${encodeURIComponent(applicationName)}` },
+			{ method: "GET", path: `/applications/${encodeSegment(applicationName)}` },
 			ariApplicationSchema,
 		);
 	}
@@ -46,7 +47,7 @@ export class AriApplications {
 		return await this.http.requestParsed(
 			{
 				method: "POST",
-				path: `/applications/${encodeURIComponent(applicationName)}/subscription`,
+				path: `/applications/${encodeSegment(applicationName)}/subscription`,
 				query: { eventSource: eventSources.join(",") },
 			},
 			ariApplicationSchema,
@@ -61,7 +62,7 @@ export class AriApplications {
 		return await this.http.requestParsed(
 			{
 				method: "DELETE",
-				path: `/applications/${encodeURIComponent(applicationName)}/subscription`,
+				path: `/applications/${encodeSegment(applicationName)}/subscription`,
 				query: { eventSource: eventSources.join(",") },
 			},
 			ariApplicationSchema,

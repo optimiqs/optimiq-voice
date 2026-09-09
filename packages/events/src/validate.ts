@@ -141,7 +141,14 @@ export function safeValidateEvent(
 				error: validationErrorFrom(
 					"Event",
 					new z.ZodError([
-						{ code: "custom", path: [mismatch.path], message: mismatch.message, input: payload },
+						// `input` is deliberately the two subjects and not the payload: `issues` is public,
+						// and the envelope here carries caller/callee numbers and SIP headers.
+						{
+							code: "custom",
+							path: [mismatch.path],
+							message: mismatch.message,
+							input: { subject, orgId: envelope.orgId },
+						},
 					]),
 					{ subject, eventType: envelope.type },
 				),

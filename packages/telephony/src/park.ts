@@ -77,12 +77,17 @@ export const PARK_TERMINAL_STATES = [
  *    while somebody is walking towards the phone to collect them.
  * 4. `retrieving` can fall back to `parked`. A retrieval that fails must put the call back in its
  *    slot rather than strand it, which is the difference between a busy extension and a lost call.
- * 5. No state lists itself, and every state is reachable from `parking`.
+ * 5. `timed-out` is reachable from `retrieving` as well as from `parked`. The lot timer is armed
+ *    while the call is `parked` and does not stop because somebody started collecting: a retrieval
+ *    that races the timeout is an ordinary event, and the alternative is either throwing on a legal
+ *    race or swallowing the timer — which leaves a call sitting in the orbit, after the fallback to
+ *    `parked`, with no timeout armed and nobody coming back for it.
+ * 6. No state lists itself, and every state is reachable from `parking`.
  */
 export const VALID_PARK_TRANSITIONS = {
 	parking: ["parked", "abandoned", "failed"],
 	parked: ["retrieving", "timed-out", "abandoned"],
-	retrieving: ["retrieved", "parked", "abandoned", "failed"],
+	retrieving: ["retrieved", "parked", "timed-out", "abandoned", "failed"],
 	retrieved: [],
 	"timed-out": [],
 	abandoned: [],

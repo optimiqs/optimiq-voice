@@ -284,9 +284,3 @@ export const getEnvVar = (key: string): string | undefined => {
 	const value = envSource[key];
 	return typeof value === "string" ? value : undefined;
 };
-
-export const getEnvEntries = (): [string, string][] => {
-	return Object.entries(envSource).filter(
-		(entry): entry is [string, string] => typeof entry[1] === "string",
-	);
-};

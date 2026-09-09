@@ -225,6 +225,7 @@ export {
 	type TransferState,
 } from "./transfer";
 export {
+	ANSWERED_VERBS,
 	DIAL_STRATEGIES,
 	DIAL_TARGET_KINDS,
 	GATHER_SOURCES,
@@ -241,6 +242,7 @@ export {
 	TRANSFER_KINDS,
 	VERB_END_REASONS,
 	VERB_NAMES,
+	verbRequiresAnswer,
 	verbRequiresMediaPath,
 	type AcknowledgedResult,
 	type AnswerVerb,

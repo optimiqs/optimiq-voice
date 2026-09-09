@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { dataEnvelope, listEnvelope, telnyxTimestamp } from "../schemas";
+import type { ListMeta } from "../schemas";
 import type { TelnyxTransport } from "../transport";
 
 /**
@@ -170,7 +171,23 @@ export interface UpdateVoiceSettingsInput {
 }
 
 export interface PhoneNumbersResource {
+	/**
+	 * One page of numbers. Truncation is silent unless the caller looks: without `page[size]` Telnyx
+	 * answers with its own default page and nothing in the array says there are more.
+	 */
 	readonly list: (query?: ListPhoneNumbersQuery) => Promise<readonly TelnyxPhoneNumber[]>;
+	/**
+	 * The same call, with the page metadata Telnyx sent.
+	 *
+	 * `list` throws `meta` away, which is right for `resolveCarrierNumberId` (one E.164, one match)
+	 * and wrong for anything admin-facing: a "list our DIDs" caller needs `total_pages` to know its
+	 * answer is short. Kept beside `list` rather than replacing it so the common single-number
+	 * lookup stays a one-liner.
+	 */
+	readonly listPage: (query?: ListPhoneNumbersQuery) => Promise<{
+		readonly data: readonly TelnyxPhoneNumber[];
+		readonly meta: ListMeta;
+	}>;
 	readonly get: (numberId: string) => Promise<TelnyxPhoneNumber>;
 	readonly update: (numberId: string, input: UpdatePhoneNumberInput) => Promise<TelnyxPhoneNumber>;
 	readonly getVoiceSettings: (numberId: string) => Promise<TelnyxVoiceSettings>;
@@ -183,23 +200,27 @@ export interface PhoneNumbersResource {
 }
 
 export function makePhoneNumbers(transport: TelnyxTransport): PhoneNumbersResource {
+	const listPage = async (query: ListPhoneNumbersQuery = {}) => {
+		const response = await transport.request({
+			method: "GET",
+			path: "/phone_numbers",
+			query: {
+				"filter[phone_number]": query.phoneNumber,
+				"filter[status]": query.status,
+				"filter[connection_id]": query.connectionId,
+				"filter[customer_reference]": query.customerReference,
+				"page[size]": query.pageSize,
+				"page[number]": query.pageNumber,
+			},
+			schema: numberListResponse,
+		});
+		return { data: response.data, meta: response.meta };
+	};
+
 	return {
-		list: async (query = {}) => {
-			const response = await transport.request({
-				method: "GET",
-				path: "/phone_numbers",
-				query: {
-					"filter[phone_number]": query.phoneNumber,
-					"filter[status]": query.status,
-					"filter[connection_id]": query.connectionId,
-					"filter[customer_reference]": query.customerReference,
-					"page[size]": query.pageSize,
-					"page[number]": query.pageNumber,
-				},
-				schema: numberListResponse,
-			});
-			return response.data;
-		},
+		listPage,
+
+		list: async (query = {}) => (await listPage(query)).data,
 
 		get: async (numberId) => {
 			const response = await transport.request({

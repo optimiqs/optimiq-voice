@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNotNull } from "drizzle-orm";
+import { count, eq, inArray } from "drizzle-orm";
 import { user } from "./schema/auth/identity-schema";
 import { member } from "./schema/auth/organization-schema";
 import { organization } from "./schema/auth/organization-schema";
@@ -92,18 +92,18 @@ export async function listChildOrganizations(
 	}
 
 	const counts = await db
-		.select({ organizationId: member.organizationId, userId: member.userId })
+		.select({ organizationId: member.organizationId, memberCount: count() })
 		.from(member)
 		.where(
 			inArray(
 				member.organizationId,
 				rows.map((row) => row.organizationId),
 			),
-		);
-	const countByOrg = new Map<string, number>();
-	for (const row of counts) {
-		countByOrg.set(row.organizationId, (countByOrg.get(row.organizationId) ?? 0) + 1);
-	}
+		)
+		.groupBy(member.organizationId);
+	const countByOrg = new Map<string, number>(
+		counts.map((row) => [row.organizationId, row.memberCount]),
+	);
 
 	return rows.map((row) => ({
 		organizationId: row.organizationId,
@@ -264,12 +264,7 @@ export async function hasChildren(
 	const rows = await db
 		.select({ organizationId: organizationHierarchy.organizationId })
 		.from(organizationHierarchy)
-		.where(
-			and(
-				eq(organizationHierarchy.parentOrganizationId, parentOrganizationId),
-				isNotNull(organizationHierarchy.organizationId),
-			),
-		)
+		.where(eq(organizationHierarchy.parentOrganizationId, parentOrganizationId))
 		.limit(1);
 	return rows.length > 0;
 }

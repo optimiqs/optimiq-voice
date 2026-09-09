@@ -233,6 +233,16 @@ export interface MidCallFeatureSettings {
 	 * without limit means a capture that never resolves and a far end that never hears a digit again.
 	 */
 	readonly maxArgumentDigits: number;
+	/**
+	 * How long `executing` may last before the machine returns itself to `idle`.
+	 *
+	 * A watchdog, not a policy. `executing` is otherwise left only via `settle` or `cancel`, so a
+	 * blind transfer whose routing walk throws — or an engine fiber killed between `execute` and
+	 * `settle` — parks the machine there for the rest of the call, swallowing every subsequent
+	 * digit that party presses and cutting them off from the far end's IVR with no error anywhere.
+	 * Generous, because a real transfer is slow and firing this is always a bug being contained.
+	 */
+	readonly executionTimeoutMs: number;
 }
 
 export const DEFAULT_MID_CALL_FEATURE_SETTINGS: MidCallFeatureSettings = {
@@ -240,6 +250,7 @@ export const DEFAULT_MID_CALL_FEATURE_SETTINGS: MidCallFeatureSettings = {
 	interDigitTimeoutMs: 4_000,
 	terminator: "#",
 	maxArgumentDigits: 16,
+	executionTimeoutMs: 30_000,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -277,6 +288,14 @@ export interface MidCallFeatureStep {
 	readonly execution?: MidCallFeatureExecution;
 	/** Set when `kind` is `abandoned`: everything that was swallowed, in order. */
 	readonly swallowed?: string;
+	/**
+	 * Digits that were swallowed but turned out not to belong to the machine, on an `execute` step.
+	 *
+	 * Set when a complete code fired because the digit after it could not extend it: the code is
+	 * the machine's, the trailing digit is the far end's, and the engine must forward it as if it
+	 * had been `pass-through` all along.
+	 */
+	readonly passThrough?: string;
 	/**
 	 * When the machine wants {@link MidCallFeatureMachine.expire} called, as an absolute instant.
 	 *
@@ -341,6 +360,11 @@ export function orderMidCallFeatureCodes(
  * Case 1's second clause is what makes `*1` and `*12` coexist. Without it, `*12` is unreachable.
  * With it, `*1` fires on the code timeout rather than instantly, which is the honest trade and the
  * reason {@link MidCallFeatureSettings.codeTimeoutMs} is short.
+ *
+ * Case 3 has one exception, and it is the case that used to lose a keypress: if an EARLIER exact
+ * match was latched on the way here — `*1` while `*12` was still live — the digit that killed the
+ * longer row also settles the shorter one. The latched code fires and the trailing digits come back
+ * as {@link MidCallFeatureStep.passThrough}, because they were always the far end's.
  */
 export class MidCallFeatureMachine {
 	private readonly table: readonly MidCallFeatureCode[];
@@ -352,6 +376,16 @@ export class MidCallFeatureMachine {
 	private argument = "";
 	private matched: MidCallFeatureCode | undefined;
 	private deadlineMs: number | undefined;
+	/**
+	 * The longest COMPLETE code seen so far, while a longer row could still extend it.
+	 *
+	 * Without it, a table holding `*1` and `*12` loses `*1` entirely: `*13` resolves to neither, and
+	 * abandoning threw away a code that had already matched. Only argument-less codes are latched —
+	 * for a code that takes an argument the trailing digits are genuinely ambiguous between "the
+	 * argument" and "the far end's", and guessing wrong dials somewhere.
+	 */
+	private latched: MidCallFeatureCode | undefined;
+	private latchedLength = 0;
 
 	constructor(
 		table: readonly MidCallFeatureCode[],
@@ -428,6 +462,11 @@ export class MidCallFeatureMachine {
 			}
 			return this.beginExecuting(entry, this.argument, nowMs);
 		}
+		if (this.current === "executing") {
+			// The watchdog. The engine lost the `settle()` — abandon, so the party gets their digits
+			// back and the next one reaches the far end instead of vanishing for the rest of the call.
+			return this.abandon();
+		}
 		return this.step(this.current === "idle" ? "pass-through" : "captured");
 	}
 
@@ -496,7 +535,20 @@ export class MidCallFeatureMachine {
 		if (exact !== undefined || extendable) {
 			// Either a complete code that a longer one could still extend, or an honest prefix. Both
 			// keep swallowing, and both are resolved by the code timeout.
+			if (exact !== undefined && argumentModeOf(exact) === "none") {
+				this.latched = exact;
+				this.latchedLength = this.code.length;
+			}
 			return this.arm("captured", nowMs + this.settings.codeTimeoutMs);
+		}
+
+		const latched = this.latched;
+		if (latched !== undefined) {
+			// The digit that just arrived ends the ambiguity in the other direction: `*12` is out,
+			// `*1` was always a match, and the trailing digits were meant for the far end.
+			const passThrough = this.code.slice(this.latchedLength);
+			const step = this.beginExecuting(latched, "", nowMs);
+			return passThrough.length === 0 ? step : { ...step, passThrough };
 		}
 
 		return this.abandon();
@@ -524,11 +576,14 @@ export class MidCallFeatureMachine {
 	private beginExecuting(
 		entry: MidCallFeatureCode,
 		argument: string,
-		_nowMs: number,
+		nowMs: number,
 	): MidCallFeatureStep {
 		assertMidCallFeatureTransition(this.current as "armed" | "collecting", "executing");
 		this.current = "executing";
-		this.deadlineMs = undefined;
+		// A deadline, and therefore a `wakeAtMs`, exactly as the `MidCallFeatureStep` contract says:
+		// `executing` leaves the machine mid-capture, and an engine that cancelled its timer here had
+		// nothing left to rescue a `settle()` that never came.
+		this.deadlineMs = nowMs + this.settings.executionTimeoutMs;
 		const execution: MidCallFeatureExecution = {
 			action: entry.action,
 			code: entry.code,
@@ -537,7 +592,9 @@ export class MidCallFeatureMachine {
 		this.matched = undefined;
 		this.code = "";
 		this.argument = "";
-		return { kind: "execute", state: "executing", execution };
+		this.latched = undefined;
+		this.latchedLength = 0;
+		return { kind: "execute", state: "executing", execution, wakeAtMs: this.deadlineMs };
 	}
 
 	private abandon(): MidCallFeatureStep {
@@ -555,6 +612,8 @@ export class MidCallFeatureMachine {
 		this.argument = "";
 		this.matched = undefined;
 		this.deadlineMs = undefined;
+		this.latched = undefined;
+		this.latchedLength = 0;
 		return { kind: "captured", state: "idle" };
 	}
 

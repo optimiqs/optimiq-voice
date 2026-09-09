@@ -302,7 +302,15 @@ export type AriEvent =
 /** Narrows the union by event name. */
 export type AriEventOf<TType extends AriEvent["type"]> = Extract<AriEvent, { type: TType }>;
 
-/** The channel an event is about, or `undefined` for the events that are not channel-scoped. */
+/**
+ * The channel an event is about, or `undefined` for the events that are not channel-scoped.
+ *
+ * `Dial` is the one case where "about" needs saying out loud: it carries both legs, and this
+ * returns the `peer` — the B-leg being dialled, the channel the event describes the progress of.
+ * A consumer keying a per-call state machine on the A-leg must read `event.caller` itself, or the
+ * `dialstatus` that outbound failover turns on (`BUSY`, `NOANSWER`, `CHANUNAVAIL`) is filed under
+ * a channel that machine has never heard of.
+ */
 export function channelOfEvent(event: AriEvent): AriChannel | undefined {
 	switch (event.type) {
 		case "StasisStart":

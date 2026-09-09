@@ -13,7 +13,7 @@ import {
 import { makeAuditEvent } from "../src/schemas/audit-events";
 import { makeCallEvent } from "../src/schemas/call-events";
 import { makeCdrLegWriteEvent } from "../src/schemas/cdr-events";
-import { trunkDirectoryEntrySchema } from "../src/schemas/live-state";
+import { defineEvent, makeEvent } from "../src/schemas/envelope";
 import { makeMediaEvent } from "../src/schemas/media-events";
 import { makeProvisionEvent } from "../src/schemas/provision-events";
 import { makeQueueEvent } from "../src/schemas/queue-events";
@@ -52,6 +52,7 @@ import {
 	EVENT_ENTRIES,
 	FAMILY_FILE,
 	FAMILY_ORDER,
+	LIVE_STATE_ENTRIES,
 	NAMED_ENUMS,
 	RPC_ENTRIES,
 	type EventEntry,
@@ -223,13 +224,11 @@ function emitJsonSchemas(): {
 		subjectRoots: SUBJECT_ROOTS,
 		events,
 		rpc,
-		liveState: [
-			{
-				bucket: "trunks",
-				schema: "live-state/trunks.schema.json",
-				goType: "TrunkDirectoryEntry",
-			},
-		],
+		liveState: LIVE_STATE_ENTRIES.map((entry) => ({
+			bucket: entry.bucket,
+			schema: `live-state/${entry.bucket}.schema.json`,
+			goType: entry.goName,
+		})),
 	});
 
 	return { eventSchemas, rpcSchemas };
@@ -456,17 +455,25 @@ function emitGo(
 
 	emitHangupCauses();
 
-	const trunkSchema = toJsonSchema(trunkDirectoryEntrySchema);
-	writeJson(join(SCHEMA_DIR, "live-state/trunks.schema.json"), trunkSchema);
-	const trunkEmitter = new GoFileEmitter({ namedEnums: NAMED_ENUMS });
-	trunkEmitter.declareStruct(
-		"TrunkDirectoryEntry",
-		["the API projection stored in the trunks KV bucket."],
-		withoutDialect(trunkSchema),
-	);
+	// -- live-state KV values ---------------------------------------------------------------------
+	const liveStateEmitter = new GoFileEmitter({ namedEnums: NAMED_ENUMS });
+	for (const entry of LIVE_STATE_ENTRIES) {
+		const schema = toJsonSchema(entry.schema);
+		writeJson(join(SCHEMA_DIR, `live-state/${entry.bucket}.schema.json`), schema);
+		liveStateEmitter.declareStruct(entry.goName, [entry.doc], withoutDialect(schema));
+	}
 	writeText(
-		join(GO_DIR, "trunk_directory_gen.go"),
-		trunkEmitter.render(["Trunk directory contract from schemas/live-state.ts."], "events"),
+		join(GO_DIR, "live_state_gen.go"),
+		liveStateEmitter.render(
+			[
+				"KV bucket VALUE contracts from schemas/live-state.ts.",
+				"",
+				"The keys are built by subjects.go; these are what the buckets hold. A Go reader that",
+				"hand-writes one of these structs is a drift the parity golden cannot see, which is how",
+				"the sip-acl reader ended up expecting `organizationId` for a writer emitting `orgId`.",
+			],
+			"events",
+		),
 	);
 
 	// -- one file per family ----------------------------------------------------------------------
@@ -592,6 +599,34 @@ function emitGo(
 	for (const entry of EVENT_ENTRIES) {
 		registry.push(`\tcase ${entry.goConst}:`);
 		registry.push(`\t\treturn new(${entry.goName})`);
+	}
+	registry.push("\t}");
+	registry.push("\treturn nil");
+	registry.push("}", "");
+	registry.push(
+		"// NewRPCRequestFor returns a pointer to a zero request struct for an rpc.* subject, or nil",
+	);
+	registry.push("// when the subject is not part of this contract version.");
+	registry.push("//");
+	registry.push(
+		"// Instance-addressed subjects carry a variable tail; pass the PREFIX (ParsedSubject.Method",
+	);
+	registry.push("// without Target), which is what RPC_SUBJECTS names.");
+	registry.push("func NewRPCRequestFor(subject string) any {");
+	registry.push("\tswitch subject {");
+	for (const entry of RPC_ENTRIES) {
+		registry.push(`\tcase Subject${entry.goName}RPC:`);
+		registry.push(`\t\treturn new(${entry.goName}Request)`);
+	}
+	registry.push("\t}");
+	registry.push("\treturn nil");
+	registry.push("}", "");
+	registry.push("// NewRPCResponseFor is NewRPCRequestFor for the reply body.");
+	registry.push("func NewRPCResponseFor(subject string) any {");
+	registry.push("\tswitch subject {");
+	for (const entry of RPC_ENTRIES) {
+		registry.push(`\tcase Subject${entry.goName}RPC:`);
+		registry.push(`\t\treturn new(${entry.goName}Response)`);
 	}
 	registry.push("\t}");
 	registry.push("\treturn nil");
@@ -1069,7 +1104,195 @@ function eventSamples(): readonly {
 	return samples;
 }
 
-function parityGolden(): unknown {
+/**
+ * Deterministic sample values, derived from the JSON Schema the emitter itself consumed.
+ *
+ * The hand-written samples above are realistic; these are EXHAUSTIVE, which is the property the
+ * parity proof needs. Every event type and every RPC request/response gets one, so an emitter
+ * mistake on a payload nobody thought to sample — a missing json tag, a value type where a pointer
+ * was needed, a dropped passthrough key — fails the Go round-trip instead of shipping.
+ *
+ * Values are chosen to SATISFY the schema, not to mean anything: the first enum member, the lower
+ * bound of a numeric range, the first candidate string matching the pattern. Optional fields are
+ * populated too — an absent field proves nothing about its Go type.
+ */
+const SAMPLE_UUID = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00";
+
+/** Strings tried in order against `pattern`/`minLength`/`maxLength`; the first fit wins. */
+const SAMPLE_STRINGS: readonly string[] = [
+	"1001",
+	"sipd",
+	SAMPLE_UUID,
+	AT,
+	"+441632960111",
+	"203.0.113.9",
+	"203.0.113.0/24",
+	"sip:1001@acme.example.com",
+	"3c26700c1adf6qgy0fkn7cvb",
+	"0192c7a14b8e7f218b3c9d0e1f2a3c00",
+	"a",
+	"NORMAL_CLEARING",
+	"acme.example.com",
+	"805ec0000044",
+	"1",
+	"0",
+	"#",
+	"",
+];
+
+function sampleString(schema: JsonSchema): string {
+	if (schema.format === "uuid") {
+		return SAMPLE_UUID;
+	}
+	if (schema.format === "date-time") {
+		return AT;
+	}
+	if (schema.format === "email") {
+		return "agent@example.com";
+	}
+	const pattern = schema.pattern === undefined ? undefined : new RegExp(schema.pattern);
+	for (const candidate of SAMPLE_STRINGS) {
+		if (pattern !== undefined && !pattern.test(candidate)) {
+			continue;
+		}
+		if (schema.minLength !== undefined && candidate.length < schema.minLength) {
+			continue;
+		}
+		if (schema.maxLength !== undefined && candidate.length > schema.maxLength) {
+			continue;
+		}
+		return candidate;
+	}
+	throw new Error(`No sample string satisfies ${JSON.stringify(schema)}.`);
+}
+
+function sampleNumber(schema: JsonSchema): number {
+	const lower = schema.minimum ?? 1;
+	return schema.maximum !== undefined && lower > schema.maximum ? schema.maximum : lower;
+}
+
+function sampleFor(schema: JsonSchema): unknown {
+	if (schema.const !== undefined) {
+		return schema.const;
+	}
+	if (schema.enum !== undefined && schema.enum.length > 0) {
+		return schema.enum[0];
+	}
+	const branches = schema.anyOf ?? schema.oneOf;
+	if (branches !== undefined) {
+		const branch = branches.find((candidate) => candidate.type !== "null");
+		if (branch === undefined) {
+			throw new Error(`No non-null branch in ${JSON.stringify(schema)}.`);
+		}
+		return sampleFor(branch);
+	}
+	switch (schema.type) {
+		case "object": {
+			const value: Record<string, unknown> = {};
+			for (const [key, property] of Object.entries(schema.properties ?? {})) {
+				value[key] = sampleFor(property);
+			}
+			if (
+				schema.properties === undefined &&
+				typeof schema.additionalProperties === "object" &&
+				schema.additionalProperties !== null
+			) {
+				value.sample = sampleFor(schema.additionalProperties);
+			}
+			return value;
+		}
+		case "array": {
+			if (schema.maxItems === 0 || schema.items === undefined) {
+				return [];
+			}
+			const count = Math.max(schema.minItems ?? 1, 1);
+			const item = sampleFor(schema.items);
+			return Array.from({ length: count }, () => item);
+		}
+		case "boolean":
+			return true;
+		case "integer":
+		case "number":
+			return sampleNumber(schema);
+		case "string":
+			return sampleString(schema);
+		case "null":
+			return null;
+		default:
+			// `z.unknown()` and friends: any JSON value is in contract, so the simplest one is.
+			return {};
+	}
+}
+
+/** The concrete ids each `<…>` placeholder in a subject template stands for, in the golden. */
+const SUBJECT_TOKENS: Readonly<Record<string, string>> = {
+	orgId: ORG_A,
+	callId: CALL_A,
+	legId: LEG_A,
+	aorHash: aorSubjectToken(AOR_CASES[0] as string),
+	queueId: QUEUE_A,
+	mailboxId: MAILBOX_A,
+	sessionId: SESSION_A,
+	trunkId: TRUNK_A,
+};
+
+function subjectFromTemplate(template: string): string {
+	return template.replace(/<([a-zA-Z]+)>/g, (_match, token: string) => {
+		const value = SUBJECT_TOKENS[token];
+		if (value === undefined) {
+			throw new Error(`No golden id for subject token <${token}> in ${template}.`);
+		}
+		return value;
+	});
+}
+
+/** One synthesized sample per event type, so every generated payload struct is round-tripped. */
+function synthesizedEventSamples(
+	eventSchemas: Map<string, JsonSchema>,
+): readonly { name: string; goType: string; envelope: unknown }[] {
+	return EVENT_ENTRIES.map((entry, index) => {
+		const schema = eventSchemas.get(`${entry.family}.${entry.type}`);
+		if (schema === undefined) {
+			throw new Error(`Missing schema for ${entry.family}.${entry.type}.`);
+		}
+		return {
+			name: `synthetic.${entry.family}.${entry.type}`,
+			goType: entry.goName,
+			envelope: makeEvent(defineEvent(entry.family, entry.type, entry.data), {
+				id: eventId(0x1000 + index),
+				at: AT,
+				orgId: ORG_A,
+				subject: subjectFromTemplate(entry.subjectTemplate),
+				source: "codegen",
+				data: sampleFor(withoutDialect(schema)),
+			}),
+		};
+	});
+}
+
+/** One synthesized request and response per RPC subject — the half the golden carried none of. */
+function rpcSamples(
+	rpcSchemas: Map<string, { request: JsonSchema; response: JsonSchema }>,
+): readonly { subject: string; goType: string; request: unknown; response: unknown }[] {
+	return RPC_ENTRIES.map((entry) => {
+		const pair = rpcSchemas.get(entry.subject);
+		if (pair === undefined) {
+			throw new Error(`Missing RPC schemas for ${entry.subject}.`);
+		}
+		const request = sampleFor(withoutDialect(pair.request));
+		const response = sampleFor(withoutDialect(pair.response));
+		// Parsed back through the contract itself, so a sample the emitter would round-trip but the
+		// schema would reject never reaches the golden.
+		entry.request.parse(request);
+		entry.response.parse(response);
+		return { subject: entry.subject, goType: entry.goName, request, response };
+	});
+}
+
+function parityGolden(
+	eventSchemas: Map<string, JsonSchema>,
+	rpcSchemas: Map<string, { request: JsonSchema; response: JsonSchema }>,
+): unknown {
 	const subjectBuilders = [
 		{
 			builder: "call",
@@ -1247,6 +1470,10 @@ function parityGolden(): unknown {
 		subjectFor.provision(ORG_A),
 		RPC_SUBJECTS.routingResolve,
 		RPC_SUBJECTS.authzCheck,
+		// Instance-addressed RPC: a subject this package builds and, until the `target` arm existed,
+		// refused to parse.
+		subjectFor.sipRingRpc(INSTANCE_ID_CASES[0] as string),
+		subjectFor.sessionAnnounceRpc(ORG_A, "app-1"),
 		"calls.evt.v2.org.call.channel.created",
 		"calls.evt.v1.org.call",
 		"nonsense",
@@ -1368,7 +1595,8 @@ function parityGolden(): unknown {
 			type: entry.type,
 			goType: entry.goName,
 		})),
-		eventSamples: eventSamples(),
+		eventSamples: [...eventSamples(), ...synthesizedEventSamples(eventSchemas)],
+		rpcSamples: rpcSamples(rpcSchemas),
 	};
 }
 
@@ -1415,7 +1643,7 @@ function oxfmtJson(): void {
 function main(): void {
 	const { eventSchemas, rpcSchemas } = emitJsonSchemas();
 	emitGo(eventSchemas, rpcSchemas);
-	writeJson(join(GO_DIR, "testdata", "parity.json"), parityGolden());
+	writeJson(join(GO_DIR, "testdata", "parity.json"), parityGolden(eventSchemas, rpcSchemas));
 	gofmt();
 	oxfmtJson();
 

@@ -423,7 +423,10 @@ export function isStreamNotFoundError(error: unknown): boolean {
 	if (apiError?.err_code === 10059 || apiError?.code === 404) {
 		return true;
 	}
-	return /not found/i.test(String((error as { message?: unknown }).message ?? ""));
+	// Narrow on purpose: a bare `not found` also describes a DNS failure, a missing consumer and a
+	// mistyped bucket name, and treating any of those as "the stream is absent" makes `ensureStreams`
+	// re-add a live stream and `ensureKvBuckets` report `created: true` for a bucket that was there.
+	return /stream not found/i.test(String((error as { message?: unknown }).message ?? ""));
 }
 
 function sameSubjects(live: readonly string[] | undefined, desired: readonly string[]): boolean {

@@ -208,12 +208,16 @@ function assertProductionNatsCredentials(config: EnvInvariantConfig): void {
 	// credentials passes only the pair its own service needs, so demanding `NATS_USER` here would
 	// refuse to boot exactly the configuration this check wants people to reach.
 	//
-	// Any WHOLE pair satisfies it. A half-set pair does not, and is left to `natsCredentials` to
-	// name precisely at the connection site.
-	const hasServicePair = PER_SERVICE_NATS_PASSWORDS.some(
-		([passKey, userKey]) => isSet(config[passKey]) && isSet(config[userKey]),
-	);
-	if (hasServicePair) {
+	// Only THIS process's own pair satisfies it. Some other service's pair being present in the
+	// environment — a shared secret bundle, a copy-pasted compose block — proves nothing: this
+	// container would still fall back to `NATS_USER`/`NATS_PASS`, and if those are unset it
+	// connects unauthenticated. A half-set pair does not satisfy it either, and is left to
+	// `natsCredentials` to name precisely at the connection site.
+	const ownPair =
+		config.OPTIMIQ_SERVICE === "engine"
+			? (["NATS_ENGINE_PASS", "NATS_ENGINE_USER"] as const)
+			: (["NATS_API_PASS", "NATS_API_USER"] as const);
+	if (isSet(config[ownPair[0]]) && isSet(config[ownPair[1]])) {
 		return;
 	}
 

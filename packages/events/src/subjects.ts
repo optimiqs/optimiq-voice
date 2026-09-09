@@ -887,11 +887,15 @@ export const subjectFor = {
 	sipTransferRpc(): string {
 		return RPC_SUBJECTS.sipTransfer;
 	},
-	/** `rpc.sip.v1.invite` — flat, queue-grouped. See {@link RPC_SUBJECTS.sipInvite}. */
+	/**
+	 * `rpc.engine.v1.renegotiate.<instanceToken>` — addressed at the ONE engine instance holding
+	 * the session, never queue-grouped.
+	 */
 	engineRenegotiateRpc(instanceId: string): string {
 		return `${RPC_SUBJECTS.engineRenegotiate}.${instanceSubjectToken(instanceId)}`;
 	},
 
+	/** `rpc.sip.v1.invite` — flat, queue-grouped. See {@link RPC_SUBJECTS.sipInvite}. */
 	sipInviteRpc(): string {
 		return RPC_SUBJECTS.sipInvite;
 	},
@@ -1211,6 +1215,12 @@ export type ParsedSubject =
 			readonly version: string;
 			readonly service: string;
 			readonly method: string;
+			/**
+			 * The tail an instance-addressed subject carries — the `<instanceToken>` of
+			 * `rpc.sip.v1.ring.<tok>`, or the `<orgId>.<appToken>` of `rpc.session.v1.announce`.
+			 * Absent on the flat, queue-grouped subjects.
+			 */
+			readonly target?: string;
 	  };
 
 /** Raised by {@link parseSubjectOrThrow} when a subject is outside the taxonomy. */
@@ -1305,8 +1315,18 @@ export function parseSubject(subject: string): ParsedSubject | undefined {
 	if (prefix === "provision.evt" && rest.length === 1) {
 		return { kind: "provision", family: "provision", version, orgId: rest[0] as string };
 	}
-	if (first === "rpc" && rest.length === 1) {
-		return { kind: "rpc", family: "rpc", version, service: second, method: rest[0] as string };
+	if (first === "rpc" && rest.length >= 1) {
+		// Eight subjects carry a variable tail (`subjectFor.sipRingRpc` and friends). Parsing only
+		// the flat ones would make this function refuse subjects the same file builds.
+		const target = rest.slice(1).join(".");
+		return {
+			kind: "rpc",
+			family: "rpc",
+			version,
+			service: second,
+			method: rest[0] as string,
+			...(target === "" ? {} : { target }),
+		};
 	}
 	return undefined;
 }

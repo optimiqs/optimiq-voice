@@ -81,21 +81,12 @@ function readString(payload: JWTPayload, key: string): string | undefined {
 /**
  * Narrows a verified payload to the claims a consumer acts on.
  *
- * Pure, so the claim contract is testable without a key pair. `accessKeyId` and `access[]` are
- * still accepted as fallbacks for `organizationId` because the minted payload is a superset of
- * them; they carry the organization id, not a workspace key, and cost one property read each.
+ * Pure, so the claim contract is testable without a key pair. `organizationId` is the ONLY tenant
+ * claim accepted: `definePayload` mints nothing else, and re-admitting the legacy `accessKeyId` /
+ * `access[]` shapes would let any JWT signed by this JWKS for another purpose carry a tenant scope.
  */
 export function toCallTokenClaims(payload: JWTPayload): CallTokenClaims {
-	const legacyAccess = Array.isArray(payload.access)
-		? (payload.access as { accessKeyId?: unknown }[])[0]
-		: undefined;
-	const legacyAccessKeyId =
-		typeof legacyAccess?.accessKeyId === "string" ? legacyAccess.accessKeyId.trim() : undefined;
-
-	const organizationId =
-		readString(payload, "organizationId") ??
-		readString(payload, "accessKeyId") ??
-		legacyAccessKeyId;
+	const organizationId = readString(payload, "organizationId");
 	if (!organizationId) {
 		throw new CallTokenVerificationError("the token carries no tenant claim");
 	}

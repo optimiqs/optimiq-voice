@@ -664,3 +664,106 @@ describe("transport behaviour", () => {
 		expect(server.state.requests[0]?.headers["idempotency-key"]).toBeUndefined();
 	});
 });
+
+/**
+ * The failure modes that used to escape the package's own error types.
+ *
+ * `fetch` resolves on HEADERS; the body streams afterwards under the same abort signal. A body that
+ * never finishes rejected outside the retry `try`, so it left `request()` as a raw `TypeError` —
+ * past `TelnyxTransportError`, unretried, and unreported to `onAttempt`.
+ */
+describe("transport — a body that fails mid-stream", () => {
+	function stallingBody(): Response {
+		return new Response(
+			new ReadableStream({
+				start(controller) {
+					controller.error(new TypeError("socket reset"));
+				},
+			}),
+			{ status: 200, headers: { "content-type": "application/json" } },
+		);
+	}
+
+	it("is a TelnyxTransportError, not a raw stream error", async () => {
+		const client = createTelnyxClient({
+			apiKey: "KEY",
+			baseUrl: server.baseUrl,
+			sleep: async () => {},
+			random: () => 0,
+			fetch: async () => stallingBody(),
+		});
+		await expect(client.availableNumbers.search({ countryCode: "US" })).rejects.toThrow(
+			TelnyxTransportError,
+		);
+	});
+
+	it("is retried and reported like any other transport failure", async () => {
+		const attempts: number[] = [];
+		const client = createTelnyxClient({
+			apiKey: "KEY",
+			baseUrl: server.baseUrl,
+			sleep: async () => {},
+			random: () => 0,
+			fetch: async () => stallingBody(),
+			onAttempt: (attempt) => attempts.push(attempt.attempt),
+		});
+		await expect(client.availableNumbers.search({ countryCode: "US" })).rejects.toThrow(
+			TelnyxTransportError,
+		);
+		expect(attempts).toEqual([0, 1, 2, 3]);
+	});
+});
+
+/**
+ * Creating a connection or a profile is not idempotent and Telnyx honours no `Idempotency-Key`
+ * here, so a 5xx raised AFTER the record was created must not become a retry: the retry gets a
+ * non-retryable 422 while a real record exists at the carrier.
+ */
+describe("creation calls are never auto-retried", () => {
+	function failOnce() {
+		let calls = 0;
+		return async () => {
+			calls += 1;
+			return new Response(JSON.stringify({ errors: [{ code: "10009" }] }), {
+				status: 500,
+				headers: { "content-type": "application/json" },
+			});
+		};
+	}
+
+	it("makes exactly one attempt at POST /credential_connections", async () => {
+		const attempts: number[] = [];
+		const client = createTelnyxClient({
+			apiKey: "KEY",
+			baseUrl: server.baseUrl,
+			sleep: async () => {},
+			random: () => 0,
+			fetch: failOnce(),
+			onAttempt: (attempt) => attempts.push(attempt.attempt),
+		});
+		await expect(
+			client.credentialConnections.create({
+				connectionName: "org",
+				userName: "orgabcd1234",
+				password: "correct-horse",
+			}),
+		).rejects.toThrow(TelnyxApiError);
+		expect(attempts).toEqual([0]);
+	});
+
+	it("makes exactly one attempt at POST /outbound_voice_profiles", async () => {
+		const attempts: number[] = [];
+		const client = createTelnyxClient({
+			apiKey: "KEY",
+			baseUrl: server.baseUrl,
+			sleep: async () => {},
+			random: () => 0,
+			fetch: failOnce(),
+			onAttempt: (attempt) => attempts.push(attempt.attempt),
+		});
+		await expect(client.outboundVoiceProfiles.create({ name: "org-0001" })).rejects.toThrow(
+			TelnyxApiError,
+		);
+		expect(attempts).toEqual([0]);
+	});
+});

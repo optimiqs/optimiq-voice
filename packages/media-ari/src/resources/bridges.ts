@@ -1,4 +1,5 @@
 import { ariBridgeSchema } from "../models";
+import { encodeSegment } from "../url";
 import type { AriHttpClient } from "../http-client";
 import type { AriBridge } from "../models";
 
@@ -35,7 +36,7 @@ export class AriBridges {
 	/** `GET /bridges/{id}` — `undefined` when the bridge is already gone. */
 	async get(bridgeId: string): Promise<AriBridge | undefined> {
 		return await this.http.requestParsedOptional(
-			{ method: "GET", path: `/bridges/${encodeURIComponent(bridgeId)}` },
+			{ method: "GET", path: `/bridges/${encodeSegment(bridgeId)}` },
 			ariBridgeSchema,
 		);
 	}
@@ -76,7 +77,7 @@ export class AriBridges {
 	): Promise<void> {
 		await this.http.requestVoid({
 			method: "POST",
-			path: `/bridges/${encodeURIComponent(bridgeId)}/addChannel`,
+			path: `/bridges/${encodeSegment(bridgeId)}/addChannel`,
 			query: {
 				channel: channelIds,
 				role: options.role,
@@ -90,7 +91,7 @@ export class AriBridges {
 	async removeChannels(bridgeId: string, channelIds: readonly string[]): Promise<void> {
 		await this.http.requestVoid({
 			method: "POST",
-			path: `/bridges/${encodeURIComponent(bridgeId)}/removeChannel`,
+			path: `/bridges/${encodeSegment(bridgeId)}/removeChannel`,
 			query: { channel: channelIds },
 			tolerateNotFound: true,
 		});
@@ -105,7 +106,7 @@ export class AriBridges {
 	async destroy(bridgeId: string): Promise<void> {
 		await this.http.requestVoid({
 			method: "DELETE",
-			path: `/bridges/${encodeURIComponent(bridgeId)}`,
+			path: `/bridges/${encodeSegment(bridgeId)}`,
 			tolerateNotFound: true,
 		});
 	}
@@ -114,7 +115,7 @@ export class AriBridges {
 	async startMoh(bridgeId: string, mohClass?: string): Promise<void> {
 		await this.http.requestVoid({
 			method: "POST",
-			path: `/bridges/${encodeURIComponent(bridgeId)}/moh`,
+			path: `/bridges/${encodeSegment(bridgeId)}/moh`,
 			query: { mohClass },
 		});
 	}
@@ -123,7 +124,7 @@ export class AriBridges {
 	async stopMoh(bridgeId: string): Promise<void> {
 		await this.http.requestVoid({
 			method: "DELETE",
-			path: `/bridges/${encodeURIComponent(bridgeId)}/moh`,
+			path: `/bridges/${encodeSegment(bridgeId)}/moh`,
 		});
 	}
 }

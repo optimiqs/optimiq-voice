@@ -6,7 +6,7 @@ import {
 	uuidEntityId,
 	uuidV7PrimaryKey,
 } from "@optimiq-voice/db";
-import { tenantIsolationPolicy } from "../tenant";
+import { tenantCompositeForeignKey, tenantIsolationPolicy } from "../tenant";
 import { extension } from "./extensions-schema";
 
 /**
@@ -84,6 +84,15 @@ export const sharedLine = pgTable.withRLS(
 			.on(table.organizationId, table.extensionNumber)
 			.where(sql`extension_number is not null`),
 		index("shared_line_organization_enabled_idx").on(table.organizationId, table.enabled),
+		/**
+		 * The target of the tenant-composite foreign keys that reference this table.
+		 *
+		 * PostgreSQL evaluates referential integrity with RLS bypassed, and a policy only
+		 * constrains a row's OWN `organization_id` — so a single-column reference to `id` lets one
+		 * tenant point a row at another tenant's row and nothing in the database objects. Every
+		 * child references `(organization_id, id)` instead, which needs this unique index.
+		 */
+		uniqueIndex("shared_line_organization_id_key").on(table.organizationId, table.id),
 		tenantIsolationPolicy("shared_line"),
 	],
 );
@@ -102,12 +111,8 @@ export const sharedLineAppearance = pgTable.withRLS(
 	{
 		id: uuidV7PrimaryKey(),
 		organizationId: tenantOrganizationIdColumn(),
-		sharedLineId: uuidEntityId("shared_line_id")
-			.notNull()
-			.references(() => sharedLine.id, { onDelete: "cascade" }),
-		extensionId: uuidEntityId("extension_id")
-			.notNull()
-			.references(() => extension.id, { onDelete: "cascade" }),
+		sharedLineId: uuidEntityId("shared_line_id").notNull(),
+		extensionId: uuidEntityId("extension_id").notNull(),
 		/** The appearance index: the phone's button position and the `Call-Info` appearance-index. */
 		ordinal: integer("ordinal").notNull(),
 		enabled: boolean("enabled").notNull().default(true),
@@ -128,6 +133,16 @@ export const sharedLineAppearance = pgTable.withRLS(
 			table.organizationId,
 			table.sharedLineId,
 		),
+		tenantCompositeForeignKey({
+			name: "shared_line_appearance_shared_line_fk",
+			columns: [table.organizationId, table.sharedLineId],
+			foreignColumns: [sharedLine.organizationId, sharedLine.id],
+		}),
+		tenantCompositeForeignKey({
+			name: "shared_line_appearance_extension_fk",
+			columns: [table.organizationId, table.extensionId],
+			foreignColumns: [extension.organizationId, extension.id],
+		}),
 		tenantIsolationPolicy("shared_line_appearance"),
 	],
 );

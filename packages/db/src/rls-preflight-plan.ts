@@ -19,6 +19,12 @@ import type { TenantRlsPreflightPlan } from "./rls-preflight";
  * If Step 5 ever puts an org-scoped table in this database, add it here and the runner starts
  * enforcing it; until then the script reports `planEmpty: true` so an empty plan can never be
  * mistaken for a passing gate.
+ *
+ * `roleName` is a PLACEHOLDER: no migration creates `optimiq_tenant_tls`, because this database
+ * has no tenant role. Whoever adds the first table here must replace it with the role that
+ * migration actually creates — the introspector now degrades a non-existent role to "lacks
+ * privileges" rather than raising `undefined_object`, so the failure is a diagnosis, but it is
+ * still a failure.
  */
 export const BASE_TENANT_RLS_PLAN: TenantRlsPreflightPlan = {
 	roleName: "optimiq_tenant_tls",

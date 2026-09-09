@@ -52,6 +52,5 @@ describe("config env module", () => {
 
 		expect(mod.getEnvVar("API_NATS_URL")).toBe("nats://nats:4222");
 		expect(mod.getEnvVar("DEFINITELY_NOT_SET_ANYWHERE")).toBeUndefined();
-		expect(mod.getEnvEntries().some(([key]) => key === "NODE_ENV")).toBe(true);
 	});
 });

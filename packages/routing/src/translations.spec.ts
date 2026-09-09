@@ -135,3 +135,56 @@ describe("applyTranslationRuleset", () => {
 		expect(applyTranslationRuleset(rules, "0044123").value).toBe(first);
 	});
 });
+
+/**
+ * The output guarantee, not just the replacement literal.
+ *
+ * `isSafeReplacement` argues that a back-reference is bounded by the input, and that argument holds
+ * for a dial string the caller pressed. It does not hold for a carrier-supplied caller id, which is
+ * what `normaliseInboundCaller` runs a ruleset over — so the result itself has to be checked.
+ */
+describe("applyTranslationRuleset — the output is always dialable", () => {
+	it("refuses a rewrite that carries SIP syntax through a back-reference", () => {
+		const outcome = applyTranslationRuleset(
+			ruleset([{ id: "strip-plus", source: "^\\+(.*)$", replacement: "$1" }]),
+			"+1234@attacker.example;transport=tcp",
+		);
+		expect(outcome.undialable).toBe(true);
+		expect(outcome.overflowed).toBe(true);
+		expect(outcome.value).toBe("+1234@attacker.example;transport=tcp");
+		expect(outcome.applied).toEqual([]);
+	});
+
+	it("refuses a `$$` replacement, which renders as a literal dollar", () => {
+		expect(isSafeReplacement("$$1")).toBe(true);
+		const outcome = applyTranslationRuleset(
+			ruleset([{ id: "dollar", source: "^(\\d+)$", replacement: "$$1" }]),
+			"5551212",
+		);
+		expect(outcome.undialable).toBe(true);
+		expect(outcome.value).toBe("5551212");
+	});
+
+	it("leaves a rewrite that stays dialable alone", () => {
+		const outcome = applyTranslationRuleset(
+			ruleset([{ id: "e164", source: "^(\\d{10})$", replacement: "+1$1" }]),
+			"5551234567",
+		);
+		expect(outcome.undialable).toBeUndefined();
+		expect(outcome.value).toBe("+15551234567");
+	});
+});
+
+describe("validateTranslationRule — patterns that could backtrack catastrophically", () => {
+	it("rejects a nested unbounded quantifier", () => {
+		expect(validateTranslationRule({ matchPattern: "^(\\d+)+$", replacement: "$1" })).toEqual([
+			{ code: "invalid-regex", detail: expect.stringContaining("backtrack") },
+		]);
+	});
+
+	it("accepts a pattern whose repetition is bounded", () => {
+		expect(validateTranslationRule({ matchPattern: "^(\\d{3}){2}$", replacement: "$1" })).toEqual(
+			[],
+		);
+	});
+});

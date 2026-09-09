@@ -5,7 +5,7 @@ import {
 	uuidEntityId,
 	uuidV7PrimaryKey,
 } from "@optimiq-voice/db";
-import { tenantIsolationPolicy } from "../tenant";
+import { tenantCompositeForeignKey, tenantIsolationPolicy } from "../tenant";
 
 /**
  * PIN numbers — outbound authorisation codes.
@@ -76,6 +76,15 @@ export const pinSet = pgTable.withRLS(
 	(table) => [
 		uniqueIndex("pin_set_organization_name_key").on(table.organizationId, table.name),
 		index("pin_set_organization_enabled_idx").on(table.organizationId, table.enabled),
+		/**
+		 * The target of the tenant-composite foreign keys that reference this table.
+		 *
+		 * PostgreSQL evaluates referential integrity with RLS bypassed, and a policy only
+		 * constrains a row's OWN `organization_id` — so a single-column reference to `id` lets one
+		 * tenant point a row at another tenant's row and nothing in the database objects. Every
+		 * child references `(organization_id, id)` instead, which needs this unique index.
+		 */
+		uniqueIndex("pin_set_organization_id_key").on(table.organizationId, table.id),
 		tenantIsolationPolicy("pin_set"),
 	],
 );
@@ -98,9 +107,7 @@ export const pinSetEntry = pgTable.withRLS(
 	{
 		id: uuidV7PrimaryKey(),
 		organizationId: tenantOrganizationIdColumn(),
-		pinSetId: uuidEntityId("pin_set_id")
-			.notNull()
-			.references(() => pinSet.id, { onDelete: "cascade" }),
+		pinSetId: uuidEntityId("pin_set_id").notNull(),
 		ordinal: integer("ordinal").notNull(),
 		/** Who the code belongs to, for the CDR and the admin list. Never the code itself. */
 		label: text("label"),
@@ -121,6 +128,11 @@ export const pinSetEntry = pgTable.withRLS(
 			table.ordinal,
 		),
 		index("pin_set_entry_organization_set_idx").on(table.organizationId, table.pinSetId),
+		tenantCompositeForeignKey({
+			name: "pin_set_entry_pin_set_fk",
+			columns: [table.organizationId, table.pinSetId],
+			foreignColumns: [pinSet.organizationId, pinSet.id],
+		}),
 		tenantIsolationPolicy("pin_set_entry"),
 	],
 );

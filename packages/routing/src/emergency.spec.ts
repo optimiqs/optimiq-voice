@@ -1,10 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import {
+	cappedEmergencyNumbers,
 	DEFAULT_EMERGENCY_NUMBERS,
 	EMERGENCY_CONTINUE_ON_CAUSES,
 	EMERGENCY_NODE_ID,
 	emergencyNumbers,
 	invalidEmergencyNumbers,
+	MAX_EMERGENCY_NUMBERS,
 	isEmergencyDialString,
 } from "./emergency";
 import {
@@ -340,5 +342,33 @@ describe("the caller id an emergency call presents", () => {
 		expect(
 			resolveOutbound(artifact, { from: "1001", dialed: "911", now: NOW }).callerIdNumber,
 		).toBeUndefined();
+	});
+});
+
+/**
+ * The cap counts numbers this release can dial, not rows the tenant typed.
+ *
+ * Capping the raw list first spends the budget on malformed entries and drops dialable ones behind
+ * them — and `invalidEmergencyNumbers` scans the whole list, so those malformed entries were being
+ * warned about while valid ones vanished without a word.
+ */
+describe("emergencyNumbers — the entry cap", () => {
+	const many = Array.from({ length: MAX_EMERGENCY_NUMBERS + 2 }, (_, index) => `*${String(index)}`);
+
+	it("keeps a valid entry that sits behind a malformed one", () => {
+		const dialed = emergencyNumbers(["not a number", "112"]).map((seed) => seed.dialed);
+		expect(dialed).toContain("112");
+	});
+
+	it("still stops at the cap", () => {
+		const configured = emergencyNumbers(many).filter(
+			(seed) => !DEFAULT_EMERGENCY_NUMBERS.some((seeded) => seeded.dialed === seed.dialed),
+		);
+		expect(configured).toHaveLength(MAX_EMERGENCY_NUMBERS);
+	});
+
+	it("names the valid entries the cap discarded", () => {
+		expect(cappedEmergencyNumbers(many)).toEqual(many.slice(MAX_EMERGENCY_NUMBERS));
+		expect(cappedEmergencyNumbers(["112"])).toEqual([]);
 	});
 });

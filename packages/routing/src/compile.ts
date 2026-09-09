@@ -36,13 +36,16 @@ import {
 	EMERGENCY_CONTINUE_ON_CAUSES,
 	EMERGENCY_NODE_ID,
 	EMERGENCY_ROUTE_ID,
+	cappedEmergencyNumbers,
 	emergencyNumbers,
 	invalidEmergencyNumbers,
+	MAX_EMERGENCY_NUMBERS,
 } from "./emergency";
 import { RoutingCompileError, RoutingSnapshotError } from "./errors";
 import {
 	FEATURE_CODE_ARGUMENT_MODE,
 	featureCodeIssues,
+	featureCodeWouldConsume,
 	isWellFormedFeatureCode,
 } from "./feature-codes";
 import {
@@ -65,7 +68,7 @@ import {
 	VOICEMAIL_LEAVE_GREETING_PRECEDENCE,
 } from "./snapshot";
 import { compileTimePredicate, isKnownTimezone, validateTimePredicate } from "./time-conditions";
-import { validateTranslationRule } from "./translations";
+import { applyTranslationRuleset, validateTranslationRule } from "./translations";
 import { voicemailPinHashIssue } from "./voicemail-pin";
 import type {
 	CompiledCallBlockRule,
@@ -126,6 +129,7 @@ import type {
 	SharedLineInput,
 	TimeConditionRuleInput,
 	TranslationRuleInput,
+	TranslationRulesetInput,
 	VoicemailGreetingInput,
 	VoicemailGreetingKind,
 } from "./snapshot";
@@ -332,6 +336,12 @@ class Compiler {
 	private readonly pinSetsById = new Map<string, PinSetInput>();
 	private readonly pinEntriesBySet = new Map<string, PinSetEntryInput[]>();
 	private readonly translationRulesetsById = new Map<string, CompiledTranslationRuleset>();
+	/**
+	 * The raw rows, beside the compiled ones, exactly as `timeConditionInputsById` sits beside
+	 * `timeConditionsById`: the compiled form carries no `enabled` flag, and a scan of the raw
+	 * collection per reference is O(routes x rulesets).
+	 */
+	private readonly translationRulesetInputsById = new Map<string, TranslationRulesetInput>();
 	private readonly translationRulesByRuleset = new Map<string, TranslationRuleInput[]>();
 	/**
 	 * Aliases currently being expanded, innermost last.
@@ -1187,8 +1197,10 @@ class Compiler {
 	 * which includes the emergency table and time gates, and neither belongs here. A follow-me hop
 	 * is never an emergency call, and a time gate is a fact about when the call arrives that a
 	 * compiler must not read a clock to evaluate. What is shared is everything that decides whether
-	 * the hop may be dialled at all — the rule order, the toll-class gate, the digit manipulation
-	 * and the call-block screen — because those are the fraud boundary.
+	 * the hop may be dialled at all — the rule order, the toll-class gate, the digit manipulation,
+	 * the route's translation ruleset and the call-block screen — because those are the fraud
+	 * boundary, and because a number the ruleset would normalise for the wire has to be normalised
+	 * here too or the carrier rejects the ladder's INVITE and nobody else's.
 	 */
 	private followMeTrunkTarget(
 		extension: ExtensionInput,
@@ -1235,7 +1247,19 @@ class Compiler {
 			if (dialedNumber === null) {
 				continue;
 			}
-			return { nodeId: rule.destinationNodeId, dialedNumber };
+			// The route's shared ruleset runs second, exactly as `resolveOutbound` runs it, so the
+			// same digits reach the trunk the same way whether a finger or the ladder dialled them.
+			// `applyTranslationRuleset` is pure and clock-free, so it is safe at compile time; an
+			// overflow keeps the untranslated number, which is what the resolver does too.
+			const ruleset = rule.translation;
+			const outcome =
+				ruleset === undefined || ruleset.rules.length === 0
+					? undefined
+					: applyTranslationRuleset(ruleset, dialedNumber);
+			return {
+				nodeId: rule.destinationNodeId,
+				dialedNumber: outcome === undefined || outcome.overflowed ? dialedNumber : outcome.value,
+			};
 		}
 
 		this.bag.warning(
@@ -1550,6 +1574,15 @@ class Compiler {
 		const subject: DiagnosticSubject = { kind: "queue", id: entry.id, name: entry.name };
 		const exitNodeId = this.namedDestinationNode(entry, "exit", subject) ?? undefined;
 		const exitKey = normalizeExitKey(entry.exitKey);
+		const rawExitKey = entry.exitKey?.trim() ?? "";
+		if (exitKey === undefined && rawExitKey.length > 0) {
+			this.bag.warning(
+				"queue-exit-key-without-destination",
+				`Queue "${entry.name}" has exit key ${JSON.stringify(rawExitKey)}, which is not a DTMF digit (${QUEUE_EXIT_KEYS.join(", ")}); the queue compiled with no exit key at all.`,
+				subject,
+				"exitKey",
+			);
+		}
 		if (exitKey !== undefined && exitNodeId === undefined) {
 			this.bag.warning(
 				"queue-exit-key-without-destination",
@@ -1709,6 +1742,7 @@ class Compiler {
 	 */
 	private compileTranslationRulesets(): void {
 		for (const ruleset of sortById(this.snapshot.translationRulesets ?? [])) {
+			this.translationRulesetInputsById.set(ruleset.id, ruleset);
 			const rules: CompiledTranslationRule[] = [];
 			for (const rule of this.translationRulesByRuleset.get(ruleset.id) ?? []) {
 				if (!rule.enabled) {
@@ -1769,7 +1803,7 @@ class Compiler {
 			return undefined;
 		}
 		const compiled = this.translationRulesetsById.get(id);
-		const input = (this.snapshot.translationRulesets ?? []).find((entry) => entry.id === id);
+		const input = this.translationRulesetInputsById.get(id);
 		if (compiled === undefined || input === undefined) {
 			this.bag.warning(
 				"dangling-translation-ruleset",
@@ -2272,11 +2306,7 @@ class Compiler {
 				);
 				continue;
 			}
-			const clash = featureCodes.find(
-				(code) =>
-					code.code === dial.code ||
-					(code.argumentMode !== "none" && dial.code.startsWith(code.code)),
-			);
+			const clash = featureCodeWouldConsume(featureCodes, dial.code);
 			if (clash !== undefined) {
 				this.bag.error(
 					"conflicting-speed-dial",
@@ -2994,9 +3024,7 @@ class Compiler {
 			configured.push({ prefix: settings.voicemailCheckPrefix, mode: "check" });
 		}
 		for (const entry of configured) {
-			const clash = featureCodes.find(
-				(code) => code.code === entry.prefix || entry.prefix.startsWith(code.code),
-			);
+			const clash = featureCodeWouldConsume(featureCodes, entry.prefix);
 			if (clash !== undefined) {
 				this.bag.warning(
 					"conflicting-feature-code",
@@ -3142,10 +3170,7 @@ class Compiler {
 			if (value.length === 0) {
 				return;
 			}
-			const clash = featureCodes.find(
-				(entry) =>
-					entry.code === value || (entry.argumentMode !== "none" && value.startsWith(entry.code)),
-			);
+			const clash = featureCodeWouldConsume(featureCodes, value);
 			if (clash !== undefined) {
 				this.bag.error(
 					"conflicting-feature-code",
@@ -3433,7 +3458,8 @@ class Compiler {
 	 */
 	private reportInboundShadowing(rules: readonly InboundRule[]): void {
 		for (const [index, rule] of rules.entries()) {
-			for (const earlier of rules.slice(0, index)) {
+			for (let i = 0; i < index; i += 1) {
+				const earlier = rules[i] as InboundRule;
 				if (earlier.callerPattern !== undefined || earlier.timeGate !== undefined) {
 					continue;
 				}
@@ -3790,6 +3816,14 @@ class Compiler {
 	}
 
 	private reportInvalidEmergencyNumbers(): void {
+		for (const raw of cappedEmergencyNumbers(this.snapshot.settings?.emergencyNumbers)) {
+			this.bag.warning(
+				"invalid-emergency-number",
+				`Emergency number ${JSON.stringify(raw)} is past the ${String(MAX_EMERGENCY_NUMBERS)}-entry limit on settings.emergencyNumbers and was not compiled. The compiled-in emergency numbers are unaffected.`,
+				undefined,
+				"settings.emergencyNumbers",
+			);
+		}
 		for (const raw of invalidEmergencyNumbers(this.snapshot.settings?.emergencyNumbers)) {
 			this.bag.warning(
 				"invalid-emergency-number",
@@ -4310,7 +4344,9 @@ function sortRecordKeys<T>(record: Readonly<Record<string, T>>): Readonly<Record
  * constraint would have refused can still arrive here — from a fixture, from a loader that has not
  * been taught the column, or from a snapshot built by hand for a diagnostic — and the engine
  * compares this against a `DtmfEvent.digit` with `===`, so anything that would never match must not
- * reach it wearing the costume of a configured feature.
+ * reach it wearing the costume of a configured feature. A rejected value is not silently gone:
+ * `queueNode` compares the raw column against this answer and warns, because a configured digit
+ * that does nothing is a thing nobody can debug.
  */
 function normalizeExitKey(value: string | null | undefined): string | undefined {
 	const trimmed = value?.trim().toUpperCase();

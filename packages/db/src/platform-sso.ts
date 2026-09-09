@@ -8,6 +8,13 @@ import type { AdminDatabase } from "./client";
  * other platform repositories state.
  */
 
+/**
+ * A provider as every read surface sees it — WITHOUT `client_secret`.
+ *
+ * The secret is a credential the platform presents to the IdP; one careless controller returning
+ * a row is enough to leak it, so it is not in the shared projection at all. The single reader
+ * that needs it is the auth boot, through {@link listEnabledSsoProvidersWithSecrets}.
+ */
 export interface SsoProviderRow {
 	readonly id: string;
 	readonly organizationId: string;
@@ -15,11 +22,15 @@ export interface SsoProviderRow {
 	readonly protocol: "oidc";
 	readonly issuer: string;
 	readonly clientId: string;
-	readonly clientSecret: string;
 	readonly discoveryUrl: string | null;
 	readonly scopes: string | null;
 	readonly emailDomain: string | null;
 	readonly enabled: boolean;
+}
+
+/** {@link SsoProviderRow} plus the secret. Only the platform bootstrap may hold one. */
+export interface SsoProviderSecretRow extends SsoProviderRow {
+	readonly clientSecret: string;
 }
 
 export interface SsoProviderInput {
@@ -41,11 +52,16 @@ const COLUMNS = {
 	protocol: organizationSsoProvider.protocol,
 	issuer: organizationSsoProvider.issuer,
 	clientId: organizationSsoProvider.clientId,
-	clientSecret: organizationSsoProvider.clientSecret,
 	discoveryUrl: organizationSsoProvider.discoveryUrl,
 	scopes: organizationSsoProvider.scopes,
 	emailDomain: organizationSsoProvider.emailDomain,
 	enabled: organizationSsoProvider.enabled,
+} as const;
+
+/** The projection above plus the secret — used by exactly one function, deliberately. */
+const SECRET_COLUMNS = {
+	...COLUMNS,
+	clientSecret: organizationSsoProvider.clientSecret,
 } as const;
 
 export async function listSsoProviders(
@@ -76,12 +92,19 @@ export async function readSsoProvider(
 	return rows[0] ?? null;
 }
 
-/** Every enabled provider across all organizations — what the auth boot feeds to `genericOAuth`. */
-export async function listEnabledSsoProviders(
+/**
+ * Every enabled provider across all organizations — what the auth boot feeds to `genericOAuth`.
+ *
+ * The ONLY accessor that returns `client_secret`, and the only one that should: `genericOAuth`'s
+ * config is platform-wide, so the boot needs each row's `organizationId` and `emailDomain` too —
+ * they are what ties an identity asserted by one tenant's IdP back to that tenant. Never reachable
+ * from a request handler.
+ */
+export async function listEnabledSsoProvidersWithSecrets(
 	db: AdminDatabase,
-): Promise<readonly SsoProviderRow[]> {
+): Promise<readonly SsoProviderSecretRow[]> {
 	return await db
-		.select(COLUMNS)
+		.select(SECRET_COLUMNS)
 		.from(organizationSsoProvider)
 		.where(eq(organizationSsoProvider.enabled, true));
 }

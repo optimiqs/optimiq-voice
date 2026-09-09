@@ -233,6 +233,20 @@ describe("subject cross-check", () => {
 		expect(result.error.message).toContain("does not match the subject's org token");
 	});
 
+	it("does not carry the payload in the issue it raises", () => {
+		// `issues` is public and a consumer may log the error object rather than `.summary`; the
+		// envelope here is a whole call event.
+		const moved = {
+			...overTheWire(callEvent),
+			subject: subjectFor.call(ORG, CALL, "channel.held"),
+		};
+		const result = safeValidateEvent(subjectFor.call(ORG, CALL, "channel.answered"), moved);
+		if (result.success) throw new Error("unreachable");
+		const error = result.error;
+		if (!(error instanceof EventValidationError)) throw new Error("unreachable");
+		expect(JSON.stringify(error.issues)).not.toContain(LEG);
+	});
+
 	it("can be disabled for a replay from a file", () => {
 		const crossTenant = { ...overTheWire(samples.audit), orgId: OTHER_ORG };
 		expect(

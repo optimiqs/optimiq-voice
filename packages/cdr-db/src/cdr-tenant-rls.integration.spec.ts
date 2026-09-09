@@ -53,6 +53,7 @@ describe.skipIf(!CDR_INTEGRATION_TESTS_ENABLED)("cdr tenant row-level security",
 		expect(preflight.tables.map((table) => table.table)).toEqual([
 			"call_events",
 			"call_legs",
+			"cdr_export_job",
 			"recordings",
 		]);
 	});

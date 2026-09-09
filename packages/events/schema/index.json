@@ -691,6 +691,26 @@
 			"bucket": "trunks",
 			"schema": "live-state/trunks.schema.json",
 			"goType": "TrunkDirectoryEntry"
+		},
+		{
+			"bucket": "sip-acl",
+			"schema": "live-state/sip-acl.schema.json",
+			"goType": "SIPACLEntry"
+		},
+		{
+			"bucket": "sip-dialogs",
+			"schema": "live-state/sip-dialogs.schema.json",
+			"goType": "SIPDialogClaim"
+		},
+		{
+			"bucket": "presence",
+			"schema": "live-state/presence.schema.json",
+			"goType": "ExtensionPresenceValue"
+		},
+		{
+			"bucket": "media-sessions",
+			"schema": "live-state/media-sessions.schema.json",
+			"goType": "MediaSessionDirectoryValue"
 		}
 	]
 }

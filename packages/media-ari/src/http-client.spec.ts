@@ -125,6 +125,60 @@ describe("AriHttpClient", () => {
 		expect(error.path).toBe("/asterisk/info");
 	});
 
+	/**
+	 * `fetch` resolves on HEADERS. The timeout used to be cleared there, so the body read ran with
+	 * no timeout and no signal: Asterisk sending `200 OK` and then stalling wedged a call leg
+	 * forever inside `channels.answer`, which is exactly what the budget exists to prevent.
+	 */
+	it("maps a body that fails mid-stream to AriTransportError", async () => {
+		const stalled = new Response(
+			new ReadableStream({
+				start(controller) {
+					controller.error(new TypeError("socket reset"));
+				},
+			}),
+			{ status: 200 },
+		);
+		const { http } = client([stalled]);
+		const error = (await http
+			.requestVoid({ method: "GET", path: "/channels" })
+			.catch((caught: unknown) => caught)) as AriTransportError;
+
+		expect(error).toBeInstanceOf(AriTransportError);
+		expect(error.path).toBe("/channels");
+	});
+
+	/**
+	 * "Never connected" is safe to retry an originate on; "timed out mid-request" may already have
+	 * placed the call. Collapsing both into "could not reach Asterisk" left the retry policy above
+	 * this seam nothing to decide on.
+	 */
+	it("distinguishes our own timeout from an unreachable server", async () => {
+		const { http } = client([new TypeError("fetch failed")]);
+		const unreachable = (await http
+			.requestVoid({ method: "GET", path: "/asterisk/info" })
+			.catch((caught: unknown) => caught)) as AriTransportError;
+		expect(unreachable.timedOut).toBe(false);
+		expect(unreachable.message).toContain("could not reach Asterisk");
+
+		const timing = new AriHttpClient({
+			baseUrl: "http://asterisk:8088/ari",
+			credentials: { username: "ari", password: "secret" },
+			timeoutMs: 1,
+			fetch: async (_input, init) =>
+				await new Promise<Response>((_resolve, reject) => {
+					init.signal?.addEventListener("abort", () => {
+						reject(new DOMException("aborted", "AbortError"));
+					});
+				}),
+		});
+		const timedOut = (await timing
+			.requestVoid({ method: "GET", path: "/channels" })
+			.catch((caught: unknown) => caught)) as AriTransportError;
+		expect(timedOut.timedOut).toBe(true);
+		expect(timedOut.message).toContain("timed out");
+	});
+
 	it("rejects a 2xx body the schema does not accept", async () => {
 		const { http } = client([new Response(JSON.stringify({ name: "no id" }), { status: 200 })]);
 		await expect(

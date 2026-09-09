@@ -81,11 +81,17 @@ describe("the park machine", () => {
 		expect(isValidParkTransition("retrieving", "parked")).toBe(true);
 	});
 
-	it("times out only from parked — a call being collected is no longer waiting", () => {
+	/**
+	 * The timer is armed while `parked` and does not stop because somebody started collecting, so
+	 * `retrieving → timed-out` is a legal race and not a bug. Denying it left the engine with two
+	 * bad options: throw on an ordinary timeout, or swallow it and leave a call in the orbit — after
+	 * the `retrieving → parked` fallback — with no timeout armed and nobody coming back for it.
+	 */
+	it("times out from a waiting call and from one whose retrieval lost the race", () => {
 		const predecessors = PARK_STATES.filter((state) =>
 			(parkTransitionsFrom(state) as readonly string[]).includes("timed-out"),
 		);
-		expect(predecessors).toEqual(["parked"]);
+		expect(predecessors).toEqual(["parked", "retrieving"]);
 	});
 
 	it("never lists a state as its own successor, and reaches every state from parking", () => {

@@ -1,4 +1,4 @@
-import { pgPolicy, type PgPolicy } from "drizzle-orm/pg-core";
+import { type AnyPgColumn, foreignKey, pgPolicy, type PgPolicy } from "drizzle-orm/pg-core";
 import {
 	createTenantDatabaseContext,
 	type TenantDatabaseContext,
@@ -61,4 +61,29 @@ export function appendOnlyTenantPolicies(tableName: string): readonly [PgPolicy,
 			withCheck: pbxTenantScope,
 		}),
 	];
+}
+
+/**
+ * A foreign key whose first column is the tenant, so a cross-tenant reference is illegal in the
+ * DATABASE and not merely in whichever repository happens to scope its lookup.
+ *
+ * PostgreSQL checks referential integrity with row-level security bypassed, and a tenant policy
+ * only constrains a row's own `organization_id` — so `references(() => parent.id)` alone lets
+ * organization A bind a row to a row owned by organization B. Referencing
+ * `(organization_id, id)` makes that reference unresolvable. The parent therefore carries a
+ * `<table>_organization_id_key` unique index, which is what this points at.
+ *
+ * `onDelete` is always `cascade`: `set null` would null the tenant column too (PostgreSQL nulls
+ * every referencing column), and `organization_id` is NOT NULL.
+ */
+export function tenantCompositeForeignKey(config: {
+	readonly name: string;
+	readonly columns: [AnyPgColumn, ...AnyPgColumn[]];
+	readonly foreignColumns: [AnyPgColumn, ...AnyPgColumn[]];
+}) {
+	return foreignKey({
+		name: config.name,
+		columns: config.columns,
+		foreignColumns: config.foreignColumns,
+	}).onDelete("cascade");
 }

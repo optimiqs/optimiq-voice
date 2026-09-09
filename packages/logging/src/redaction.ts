@@ -12,7 +12,14 @@
 
 /** Field names whose value is never safe to emit, regardless of shape. */
 const SENSITIVE_LOG_PATTERN =
-	/(authorization|proxy-authorization|cookie|set-cookie|token|secret|password|passwd|credential|api[-_]?key|apikey|session|private[-_]?key|signature|email|phone|caller[-_]?id|callerid|from[-_]?number|to[-_]?number|\bdid\b|did[-_]?number|msisdn|sip[-_]?password|ari[-_]?secret|first[-_]?name|last[-_]?name|full[-_]?name|address|dtmf|digits)/i;
+	/(authorization|proxy-authorization|cookie|set-cookie|token|secret|password|passwd|credential|api[-_]?key|apikey|private[-_]?key|signature|email|phone|caller[-_]?id|callerid|from[-_]?number|to[-_]?number|did[-_]?number|msisdn|sip[-_]?password|ari[-_]?secret|first[-_]?name|last[-_]?name|full[-_]?name|dtmf|digits)/i;
+
+/**
+ * Tokens that are sensitive as a whole field name but harmless as part of a longer one. Matched
+ * on token boundaries only, so `session`/`ip_address` are blanked while `sessionId`, `ipAddress`
+ * and `didIndex` — the correlation keys an incident is reconstructed from — survive.
+ */
+const AMBIGUOUS_SENSITIVE_KEY_PATTERN = /(^|[_-])(session|address|did)([_-]|$)/i;
 
 const REDACTED_LOG_VALUE = "[REDACTED]";
 
@@ -157,7 +164,7 @@ export const redactLogValue = (
 
 		const redacted: Record<string, unknown> = {};
 		for (const [key, nestedValue] of Object.entries(value)) {
-			redacted[key] = SENSITIVE_LOG_PATTERN.test(key)
+			redacted[key] = isSensitiveLogKey(key)
 				? REDACTED_LOG_VALUE
 				: redactLogValue(nestedValue, depth + 1, seen);
 		}
@@ -167,4 +174,5 @@ export const redactLogValue = (
 	}
 };
 
-export const isSensitiveLogKey = (key: string): boolean => SENSITIVE_LOG_PATTERN.test(key);
+export const isSensitiveLogKey = (key: string): boolean =>
+	SENSITIVE_LOG_PATTERN.test(key) || AMBIGUOUS_SENSITIVE_KEY_PATTERN.test(key);

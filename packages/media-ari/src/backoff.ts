@@ -18,6 +18,15 @@ export interface BackoffOptions {
 	 * the herd across half the window.
 	 */
 	readonly jitter: number;
+	/**
+	 * How many reconnect attempts before the stream gives up, or `undefined` for "never".
+	 *
+	 * `undefined` is the default and is a deliberate choice rather than an omission: for telephony,
+	 * a media server that comes back after an hour should find the engine still trying. A caller
+	 * that would rather fail its health check than retry a permanently-wrong credential forever
+	 * sets this, and gets a terminal error and a `closed` status when it is reached.
+	 */
+	readonly maxAttempts?: number;
 }
 
 /** The policy the ARI event stream uses unless a caller overrides it. */

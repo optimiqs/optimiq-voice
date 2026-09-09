@@ -1,0 +1,45 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"network": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 64
+		},
+		"orgId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"action": {
+			"type": "string",
+			"enum": ["allow", "deny"]
+		},
+		"scope": {
+			"type": "string",
+			"enum": ["registration", "trunk", "provisioning", "api"]
+		},
+		"priority": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 65535
+		},
+		"trunkId": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"name": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"enabled": {
+			"type": "boolean"
+		},
+		"updatedAt": {
+			"type": "number"
+		}
+	},
+	"required": ["network", "orgId", "action", "scope", "priority", "enabled", "updatedAt"],
+	"additionalProperties": {}
+}

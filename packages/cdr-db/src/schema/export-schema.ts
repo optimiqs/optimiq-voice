@@ -159,6 +159,18 @@ export const cdrExportJob = pgTable.withRLS(
 		),
 		check("cdr_export_job_range_check", sql`"range_to" > "range_from"`),
 		check("cdr_export_job_size_check", sql`"row_count" >= 0 and "size_bytes" >= 0`),
+		/**
+		 * The download pointer is DERIVED, and this is what makes that a database fact.
+		 *
+		 * The tenant role holds UPDATE on this table for the lifecycle columns, and RLS only checks
+		 * a row's own `organization_id` — so without the constraint any reachable update path could
+		 * repoint a job at `exports/<other-org>/<id>.csv` and read another tenant's export.
+		 * `apps/api`'s `exportObjectKey()` writes exactly this shape.
+		 */
+		check(
+			"cdr_export_job_object_key_check",
+			sql`"object_key" is null or "object_key" = 'exports/' || "organization_id" || '/' || "id" || '.csv'`,
+		),
 
 		pgPolicy("cdr_export_job_tenant_isolation", {
 			for: "all",

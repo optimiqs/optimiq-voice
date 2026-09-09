@@ -132,7 +132,7 @@ describe("env invariants in production", () => {
 		);
 	});
 
-	it("accepts a per-service pair instead, which is what a split deployment ships", () => {
+	it("accepts its OWN per-service pair instead, which is what a split deployment ships", () => {
 		// A container given only its own least-privilege identity must boot. Demanding the shared
 		// pair here would refuse exactly the configuration `config/nats.conf` exists to reach.
 		expect(() =>
@@ -140,8 +140,8 @@ describe("env invariants in production", () => {
 				withProduction({
 					NATS_USER: undefined,
 					NATS_PASS: undefined,
-					NATS_ENGINE_USER: "optimiq-engine",
-					NATS_ENGINE_PASS: "a-real-engine-password",
+					NATS_API_USER: "optimiq-api",
+					NATS_API_PASS: "a-real-api-password",
 				}),
 			),
 		).not.toThrow();
@@ -237,5 +237,37 @@ describe("production engine configuration", () => {
 		expect(() => assertEnvInvariants({ ...config, OPTIMIQ_SERVICE: "api" })).toThrow(
 			"DATABASE_URL",
 		);
+	});
+});
+
+describe("production NATS credentials", () => {
+	const apiConfig: EnvInvariantConfig = {
+		NODE_ENV: "production",
+		OPTIMIQ_SERVICE: "api",
+		NATS_URL: "nats://nats:4222",
+		DATABASE_URL: "postgres://app@db:5432/app",
+		AUTH_SECRET: "a-production-auth-secret-long-enough",
+		AUTH_URL: "https://app.example.com",
+	};
+
+	it("refuses another service's pair standing in for its own", () => {
+		// A shared secret bundle ships every name; the api would still connect unauthenticated.
+		expect(() =>
+			assertEnvInvariants({
+				...apiConfig,
+				NATS_SIPD_USER: "sipd",
+				NATS_SIPD_PASS: "test-sipd-broker-credential",
+			}),
+		).toThrow("NATS_USER");
+	});
+
+	it("falls back to the shared pair when no per-service pair is set", () => {
+		expect(() =>
+			assertEnvInvariants({
+				...apiConfig,
+				NATS_USER: "optimiq",
+				NATS_PASS: "test-shared-broker-credential",
+			}),
+		).not.toThrow();
 	});
 });

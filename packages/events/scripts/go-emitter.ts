@@ -115,7 +115,10 @@ function sameValues(left: readonly string[], right: readonly string[]): boolean 
 }
 
 /** Unwraps `anyOf: [X, {type: "null"}]` — zod's shape for `.nullable()` / `.nullish()`. */
-function unwrapNullable(schema: JsonSchema): { readonly inner: JsonSchema; readonly nullable: boolean } {
+function unwrapNullable(schema: JsonSchema): {
+	readonly inner: JsonSchema;
+	readonly nullable: boolean;
+} {
 	const branches = schema.anyOf;
 	if (branches === undefined || branches.length !== 2) {
 		return { inner: schema, nullable: false };
@@ -134,11 +137,7 @@ function isUnconstrained(schema: JsonSchema): boolean {
 
 /** Go's zero value is indistinguishable from "absent" for these, so absence needs a pointer. */
 function needsPointer(goType: string): boolean {
-	return !(
-		goType.startsWith("[]") ||
-		goType.startsWith("map[") ||
-		goType === "json.RawMessage"
-	);
+	return !(goType.startsWith("[]") || goType.startsWith("map[") || goType === "json.RawMessage");
 }
 
 /** One emitted Go declaration, in file order. */
@@ -177,7 +176,11 @@ export class GoFileEmitter {
 
 	/** Emits a named enum type shared across files (idempotent for the same value set). */
 	declareNamedEnum(entry: NamedEnum): void {
-		this.pushEnum(entry.goName, [entry.doc, "", `Source: packages/events/src/schemas/${entry.source}.`], entry.values);
+		this.pushEnum(
+			entry.goName,
+			[entry.doc, "", `Source: packages/events/src/schemas/${entry.source}.`],
+			entry.values,
+		);
 	}
 
 	/** Emits a free-standing const block, verbatim. */
@@ -272,7 +275,11 @@ export class GoFileEmitter {
 	private goTypeFor(
 		owner: string,
 		schema: JsonSchema,
-		context: { readonly topLevelName?: string; readonly doc?: readonly string[]; readonly field?: string },
+		context: {
+			readonly topLevelName?: string;
+			readonly doc?: readonly string[];
+			readonly field?: string;
+		},
 	): string {
 		if (isUnconstrained(schema)) {
 			this.imports.add("encoding/json");
@@ -287,7 +294,8 @@ export class GoFileEmitter {
 			if (named !== undefined) {
 				return named.goName;
 			}
-			const name = context.topLevelName ?? `${nestedBase(owner)}${pascal(context.field ?? "value")}`;
+			const name =
+				context.topLevelName ?? `${nestedBase(owner)}${pascal(context.field ?? "value")}`;
 			this.pushEnum(
 				name,
 				context.doc ?? [`the closed vocabulary of ${owner}.${context.field ?? ""}.`],
@@ -351,24 +359,34 @@ export class GoFileEmitter {
 			const goType = this.goTypeFor(name, inner, { field: jsonName });
 			const pointer = optional && needsPointer(goType);
 			const tag = optional ? `${jsonName},omitempty` : jsonName;
-			lines.push(`\t${pascal(jsonName)} ${pointer ? "*" : ""}${goType} \`json:${JSON.stringify(tag)}\``);
+			lines.push(
+				`\t${pascal(jsonName)} ${pointer ? "*" : ""}${goType} \`json:${JSON.stringify(tag)}\``,
+			);
 		}
 
 		if (loose) {
 			this.imports.add("encoding/json");
 			lines.push("");
-			lines.push("\t// Extra carries every key outside the pinned contract, verbatim. The TS schema is a");
-			lines.push("\t// z.looseObject (see cdr-events.ts) precisely so a producer running ahead of the");
-			lines.push("\t// consumer is not silently truncated; dropping these on the Go side would reintroduce");
+			lines.push(
+				"\t// Extra carries every key outside the pinned contract, verbatim. The TS schema is a",
+			);
+			lines.push(
+				"\t// z.looseObject (see cdr-events.ts) precisely so a producer running ahead of the",
+			);
+			lines.push(
+				"\t// consumer is not silently truncated; dropping these on the Go side would reintroduce",
+			);
 			lines.push("\t// the loss the loose schema exists to prevent.");
-			lines.push("\tExtra map[string]json.RawMessage `json:\"-\"`");
+			lines.push('\tExtra map[string]json.RawMessage `json:"-"`');
 		}
 
 		lines.push("}", "");
 
 		if (loose) {
 			const keysVar = `knownKeys${name}`;
-			lines.push(`// MarshalJSON merges Extra back into the object, pinned fields winning on conflict.`);
+			lines.push(
+				`// MarshalJSON merges Extra back into the object, pinned fields winning on conflict.`,
+			);
 			lines.push(`func (v ${name}) MarshalJSON() ([]byte, error) {`);
 			lines.push(`\ttype alias ${name}`);
 			lines.push("\treturn marshalWithExtras(alias(v), v.Extra)");

@@ -7,7 +7,9 @@ import { callBlockHangupCause, compileRoutingArtifact, tryCompileRoutingArtifact
 import { RoutingCompileError, RoutingSnapshotError } from "./errors";
 import {
 	aCallBlockRule,
+	aCallFlow,
 	aConference,
+	aDirectory,
 	aFeatureCode,
 	anExtension,
 	anInboundRoute,
@@ -22,10 +24,12 @@ import {
 	aRingGroupMember,
 	aSharedLine,
 	aSnapshot,
+	aStream,
 	aTimeCondition,
 	aTimeRule,
 	aTrunk,
 	aVoicemailBox,
+	aVoicemailGreeting,
 	codesOf,
 	compileAttempt,
 	compiled,
@@ -172,6 +176,93 @@ describe("compile — the node graph is closed", () => {
 
 	it("resolves every reference in every node", () => {
 		const artifact = compiled(snapshot);
+		for (const node of Object.values(artifact.nodes)) {
+			for (const reference of planNodeReferences(node)) {
+				expect(artifact.nodes[reference]).toBeDefined();
+			}
+		}
+	});
+
+	// Every branch field the compiler can emit, in one snapshot: the property below walks the node
+	// objects rather than a hand-written list of kinds, so a branch field that `planNodeReferences`
+	// forgets fails here whether or not anybody remembered to name it.
+	const branchy = aSnapshot({
+		extensions: [
+			anExtension({ label: "Ada Lovelace", voicemailEnabled: true }),
+			anExtension({ id: "ext-2", number: "1002", label: "Grace Hopper" }),
+			anExtension({ id: "ext-3", number: "1003", label: "Alan Turing" }),
+		],
+		voicemailBoxes: [aVoicemailBox()],
+		voicemailGreetings: [
+			aVoicemailGreeting({ kind: "name", objectKey: "org-0001/voicemail/vm-1/name.wav" }),
+		],
+		queues: [
+			aQueue({
+				timeoutDestinationType: "extension",
+				timeoutDestinationRef: "ext-1",
+				exitKey: "9",
+				exitDestinationType: "extension",
+				exitDestinationRef: "ext-2",
+			}),
+		],
+		callFlows: [
+			aCallFlow({
+				destinationType: "extension",
+				destinationRef: "ext-1",
+				nightDestinationType: "extension",
+				nightDestinationRef: "ext-2",
+			}),
+		],
+		audioStreams: [
+			aStream({ fallbackDestinationType: "extension", fallbackDestinationRef: "ext-1" }),
+		],
+		directories: [
+			aDirectory({ timeoutDestinationType: "extension", timeoutDestinationRef: "ext-3" }),
+		],
+	});
+
+	/** Every `*NodeId` a node carries, at any depth, found by shape rather than by kind. */
+	function branchFieldsOf(value: unknown): string[] {
+		if (Array.isArray(value)) {
+			return value.flatMap((item) => branchFieldsOf(item));
+		}
+		if (typeof value !== "object" || value === null) {
+			return [];
+		}
+		const found: string[] = [];
+		for (const [key, field] of Object.entries(value)) {
+			if (key.endsWith("NodeId") && typeof field === "string") {
+				found.push(field);
+			} else {
+				found.push(...branchFieldsOf(field));
+			}
+		}
+		return found;
+	}
+
+	it("reports every branch field every node carries", () => {
+		const artifact = compiled(branchy);
+		const kinds = new Set<string>();
+		for (const node of Object.values(artifact.nodes)) {
+			kinds.add(node.kind);
+			const reported = new Set(planNodeReferences(node));
+			for (const reference of branchFieldsOf(node)) {
+				expect([node.kind, reference, reported.has(reference)]).toEqual([
+					node.kind,
+					reference,
+					true,
+				]);
+			}
+		}
+		// The snapshot has to actually produce the kinds whose branches were being missed, or the
+		// property above passes vacuously.
+		for (const kind of ["queue", "call-flow", "stream", "dial-by-name"]) {
+			expect(kinds.has(kind)).toBe(true);
+		}
+	});
+
+	it("closes and reaches every branch of the branchy snapshot", () => {
+		const artifact = compiled(branchy);
 		for (const node of Object.values(artifact.nodes)) {
 			for (const reference of planNodeReferences(node)) {
 				expect(artifact.nodes[reference]).toBeDefined();
@@ -566,6 +657,20 @@ describe("compile — feature codes", () => {
 			}),
 		);
 		expect(codesOf(result)).toContain("conflicting-feature-code");
+	});
+
+	/**
+	 * `*9` takes no argument, so `matchFeatureCode` only ever matches it whole — `*99200` reaches
+	 * voicemail. A warning about a collision that cannot happen teaches tenants to ignore warnings.
+	 */
+	it("does not warn when the feature code takes no argument and cannot consume the prefix", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				settings: { voicemailPrefix: "*99" },
+				featureCodes: [aFeatureCode({ code: "*9", action: "voicemail-check" })],
+			}),
+		);
+		expect(codesOf(result)).not.toContain("conflicting-feature-code");
 	});
 });
 
@@ -1659,6 +1764,14 @@ describe("compile — queue contact-centre settings", () => {
 	it("drops a key no phone could send, so the engine never compares against it", () => {
 		const artifact = compiled(aSnapshot({ queues: [aQueue({ exitKey: "99" })] }));
 		expect(artifact.nodes["queue:q-1"]).not.toHaveProperty("exitKey");
+	});
+
+	it("says so when it drops one, rather than dropping it silently", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue({ exitKey: "Z" })] }));
+		const warning = artifact.diagnostics.find(
+			(entry) => entry.code === "queue-exit-key-without-destination",
+		);
+		expect(warning?.message).toContain('"Z"');
 	});
 
 	it("warns when a key has nowhere to send the caller", () => {

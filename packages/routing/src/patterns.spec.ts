@@ -9,6 +9,7 @@ import {
 	patternSpecificity,
 	patternsOverlap,
 	patternSubsumes,
+	unsafeRegexDetail,
 	validateDigitManipulation,
 } from "./patterns";
 
@@ -310,5 +311,29 @@ describe("applyDigitManipulation", () => {
 
 	it("keeps a prepend-only result when the strip empties the number", () => {
 		expect(applyDigitManipulation({ stripDigits: 3, prependDigits: "911" }, "123")).toBe("911");
+	});
+});
+
+/**
+ * A pattern's length is bounded; its backtracking is not, and these run per call against values the
+ * carrier supplies. Node has no regex timeout, so the refusal has to happen at write time.
+ */
+describe("compilePattern — catastrophic backtracking", () => {
+	it("rejects a group repeated around an inner unbounded quantifier", () => {
+		expect(compilePattern("regex", "^(a+)+$").issues).toEqual([
+			{ code: "invalid-regex", detail: expect.stringContaining("backtrack") },
+		]);
+	});
+
+	it("rejects a repeated alternation", () => {
+		expect(unsafeRegexDetail("^(a|a)*$")).toContain("backtrack");
+	});
+
+	it("accepts the ordinary dial-plan shapes", () => {
+		expect(unsafeRegexDetail("^\\+1(\\d{10})$")).toBeNull();
+		expect(unsafeRegexDetail("^0[1-9]\\d+$")).toBeNull();
+		expect(unsafeRegexDetail("^(\\d+)$")).toBeNull();
+		// A character class holding `|` or `+` is literal, not structure.
+		expect(unsafeRegexDetail("^[+|]*$")).toBeNull();
 	});
 });

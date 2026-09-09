@@ -129,6 +129,7 @@ export const PERMISSIONS = [
 	"voicemail.read",
 	"voicemail.read.own",
 	"voicemail.write",
+	"voicemail.write.own",
 	"voicemail.delete",
 	"voicemail.delete.own",
 	"voicemail.listen",
@@ -1050,6 +1051,11 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 				description: "Create and edit mailboxes, greetings and delivery options.",
 			},
 			{
+				permission: "voicemail.write.own",
+				label: "Manage own mailbox",
+				description: "Edit greetings, the PIN and delivery options on own mailboxes only.",
+			},
+			{
 				permission: "voicemail.delete",
 				label: "Delete messages",
 				description: "Delete messages from any mailbox in the organization.",
@@ -1584,6 +1590,7 @@ const SELF_SERVICE_PERMISSIONS = [
 	"extensions.write.own",
 	"devices.read.own",
 	"voicemail.read.own",
+	"voicemail.write.own",
 	"voicemail.delete.own",
 	"voicemail.listen.own",
 	"recordings.read.own",

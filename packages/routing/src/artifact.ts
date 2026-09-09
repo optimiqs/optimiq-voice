@@ -145,6 +145,7 @@ export interface InboundMatchTable {
 export interface InboundDidDefault {
 	readonly phoneNumberId: string;
 	readonly e164: string;
+	/** Always `true`: the compiler drops a disabled number rather than writing a row for it. */
 	readonly enabled: boolean;
 	readonly recordEnabled: boolean;
 	readonly callerIdNamePrefix?: string;
@@ -338,6 +339,7 @@ export interface ExtensionIndexEntry {
 	readonly extensionId: string;
 	readonly number: string;
 	readonly tollClass: TollClass;
+	/** Always `true`: the compiler drops a disabled extension rather than writing a row for it. */
 	readonly enabled: boolean;
 	readonly outboundCallerIdNumber?: string;
 	readonly outboundCallerIdName?: string;

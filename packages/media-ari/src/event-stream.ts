@@ -132,7 +132,16 @@ export class AriEventStream {
 		}
 		this.stopped = false;
 		this.attempts = 0;
-		await this.connect();
+		try {
+			await this.connect();
+		} catch (error) {
+			// A failed `start()` must not leave a live retry loop the caller cannot stop. `onclose`
+			// and the open timer have already scheduled one by the time `connect` rejects, and
+			// `stopped` is still false — so a second `start()` would return immediately without ever
+			// connecting while a socket kept opening behind a half-constructed caller.
+			this.close();
+			throw error;
+		}
 	}
 
 	/** Closes the socket and cancels any pending reconnect. Idempotent. */
@@ -143,11 +152,7 @@ export class AriEventStream {
 		this.socket = undefined;
 		if (socket !== undefined) {
 			this.detach(socket);
-			try {
-				socket.close(NORMAL_CLOSURE, "engine shutdown");
-			} catch (error) {
-				this.reportError(error);
-			}
+			this.closeSocket(socket, "engine shutdown");
 		}
 		this.setStatus("closed");
 	}
@@ -181,6 +186,11 @@ export class AriEventStream {
 
 			this.openTimer = setTimeout(() => {
 				settleErr(new AriSocketError("ARI event socket did not open before the timeout"));
+				// Closed, not merely detached. On the `onclose` path the socket is already dead; here
+				// it is still CONNECTING or OPEN, and abandoning it leaves an fd and a half-open TCP
+				// connection behind on every attempt — against a media server that is already
+				// struggling, which is the only way this timer fires.
+				this.closeSocket(socket, "open timeout");
 				this.teardownAndScheduleReconnect(socket);
 			}, this.options.openTimeoutMs ?? DEFAULT_OPEN_TIMEOUT_MS);
 
@@ -281,6 +291,19 @@ export class AriEventStream {
 		if (this.reconnectTimer !== undefined) {
 			return;
 		}
+		const maxAttempts = this.backoff.maxAttempts;
+		if (maxAttempts !== undefined && this.attempts >= maxAttempts) {
+			// Exhausted. Reported AND parked as `closed`, so a health check has something to fail on
+			// rather than a stream that says `reconnecting` forever.
+			this.stopped = true;
+			this.setStatus("closed");
+			this.reportError(
+				new AriSocketError(
+					`ARI event socket gave up after ${String(maxAttempts)} reconnect attempts`,
+				),
+			);
+			return;
+		}
 		this.attempts += 1;
 		const delay = computeBackoffDelayMs(this.attempts, this.backoff, this.random);
 		this.reconnectTimer = setTimeout(() => {
@@ -312,6 +335,15 @@ export class AriEventStream {
 			eventsBeforeGap: this.eventsThisSession,
 			attempts: this.attempts,
 		});
+	}
+
+	/** `close()` on a socket that may already be gone. Never throws out of a teardown path. */
+	private closeSocket(socket: WebSocket, reason: string): void {
+		try {
+			socket.close(NORMAL_CLOSURE, reason);
+		} catch (error) {
+			this.reportError(error);
+		}
 	}
 
 	private detach(socket: WebSocket): void {

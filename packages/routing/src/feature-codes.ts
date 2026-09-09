@@ -184,6 +184,25 @@ export interface FeatureCodeMatch {
 }
 
 /**
+ * The feature code that would swallow `value`, if any.
+ *
+ * Exactly `matchFeatureCode`'s consumption rule, minus the argument: a code with no argument matches
+ * only the whole string, so `*9` does NOT consume `*99`. Written once because it is asked in three
+ * places — speed dials, toggle codes and voicemail prefixes — and a copy that drifts from the
+ * matcher produces a warning about a collision that cannot happen, which teaches tenants to ignore
+ * warnings.
+ */
+export function featureCodeWouldConsume(
+	table: readonly CompiledFeatureCode[],
+	value: string,
+): CompiledFeatureCode | undefined {
+	return table.find(
+		(entry) =>
+			entry.code === value || (entry.argumentMode !== "none" && value.startsWith(entry.code)),
+	);
+}
+
+/**
  * Matches dialed digits against a code table, longest code first.
  *
  * The table must already be sorted by descending code length — `compile.ts` guarantees that — so

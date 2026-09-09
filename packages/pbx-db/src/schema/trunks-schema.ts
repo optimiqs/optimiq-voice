@@ -98,6 +98,15 @@ export const trunk = pgTable.withRLS(
 			table.carrierRef,
 		),
 		carrierCheck("trunk"),
+		/**
+		 * The target of the tenant-composite foreign keys that reference this table.
+		 *
+		 * PostgreSQL evaluates referential integrity with RLS bypassed, and a policy only
+		 * constrains a row's OWN `organization_id` — so a single-column reference to `id` lets one
+		 * tenant point a row at another tenant's row and nothing in the database objects. Every
+		 * child references `(organization_id, id)` instead, which needs this unique index.
+		 */
+		uniqueIndex("trunk_organization_id_key").on(table.organizationId, table.id),
 		tenantIsolationPolicy("trunk"),
 	],
 );

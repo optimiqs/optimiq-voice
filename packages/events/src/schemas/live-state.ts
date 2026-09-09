@@ -524,14 +524,25 @@ export const sipAclEntrySchema = z
 		orgId: z.string().min(1).max(128),
 		action: z.enum(["allow", "deny"]),
 		scope: z.enum(SIP_ACL_SCOPES),
-		/** Lowest first. See the evaluation-order note above. */
-		priority: z.int().min(0).max(65_535).default(100),
+		/**
+		 * Lowest first. See the evaluation-order note above.
+		 *
+		 * Required rather than defaulted: this value crosses to Go, whose decoder has no notion of a
+		 * Zod default and would read an absent field as `0` — the HIGHEST precedence. Every writer
+		 * emits it explicitly, so an entry without it is corrupt and is rewritten, not guessed at.
+		 */
+		priority: z.int().min(0).max(65_535),
 		/** The carrier this network belongs to, when the entry attributes one. */
 		trunkId: z.string().max(128).optional(),
 		/** The admin's own label, so a refusal log names the rule a human wrote. */
 		name: z.string().max(128).optional(),
-		/** A disabled entry stays in the bucket and does not match. Removal is a DELETE. */
-		enabled: z.boolean().default(true),
+		/**
+		 * A disabled entry stays in the bucket and does not match. Removal is a DELETE.
+		 *
+		 * Required for the same reason as {@link priority}: absent decodes to `false` in Go, which
+		 * would silently disable a rule TypeScript believes is active.
+		 */
+		enabled: z.boolean(),
 		updatedAt: z.number(),
 	})
 	.loose();

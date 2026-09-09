@@ -6,7 +6,7 @@ import {
 	uuidEntityId,
 	uuidV7PrimaryKey,
 } from "@optimiq-voice/db";
-import { tenantIsolationPolicy } from "../tenant";
+import { tenantCompositeForeignKey, tenantIsolationPolicy } from "../tenant";
 import { extension } from "./extensions-schema";
 
 /**
@@ -68,6 +68,15 @@ export const pagingGroup = pgTable.withRLS(
 			.on(table.organizationId, table.extensionNumber)
 			.where(sql`extension_number is not null`),
 		index("paging_group_organization_enabled_idx").on(table.organizationId, table.enabled),
+		/**
+		 * The target of the tenant-composite foreign keys that reference this table.
+		 *
+		 * PostgreSQL evaluates referential integrity with RLS bypassed, and a policy only
+		 * constrains a row's OWN `organization_id` — so a single-column reference to `id` lets one
+		 * tenant point a row at another tenant's row and nothing in the database objects. Every
+		 * child references `(organization_id, id)` instead, which needs this unique index.
+		 */
+		uniqueIndex("paging_group_organization_id_key").on(table.organizationId, table.id),
 		tenantIsolationPolicy("paging_group"),
 	],
 );
@@ -85,12 +94,8 @@ export const pagingGroupMember = pgTable.withRLS(
 	{
 		id: uuidV7PrimaryKey(),
 		organizationId: tenantOrganizationIdColumn(),
-		pagingGroupId: uuidEntityId("paging_group_id")
-			.notNull()
-			.references(() => pagingGroup.id, { onDelete: "cascade" }),
-		extensionId: uuidEntityId("extension_id")
-			.notNull()
-			.references(() => extension.id, { onDelete: "cascade" }),
+		pagingGroupId: uuidEntityId("paging_group_id").notNull(),
+		extensionId: uuidEntityId("extension_id").notNull(),
 		ordinal: integer("ordinal").notNull(),
 		enabled: boolean("enabled").notNull().default(true),
 		...auditTimestampColumns(),
@@ -110,6 +115,16 @@ export const pagingGroupMember = pgTable.withRLS(
 			table.organizationId,
 			table.pagingGroupId,
 		),
+		tenantCompositeForeignKey({
+			name: "paging_group_member_paging_group_fk",
+			columns: [table.organizationId, table.pagingGroupId],
+			foreignColumns: [pagingGroup.organizationId, pagingGroup.id],
+		}),
+		tenantCompositeForeignKey({
+			name: "paging_group_member_extension_fk",
+			columns: [table.organizationId, table.extensionId],
+			foreignColumns: [extension.organizationId, extension.id],
+		}),
 		tenantIsolationPolicy("paging_group_member"),
 	],
 );
