@@ -80,6 +80,28 @@ export const LIVE_MAX_TOPICS_PER_CONNECTION = 20;
 /** Frames larger than this are a client that is not speaking this protocol. */
 export const LIVE_MAX_FRAME_BYTES = 16 * 1024;
 
+/**
+ * How many bytes may sit unwritten in one connection's kernel/`ws` send queue before the server
+ * gives up on it.
+ *
+ * A WebSocket `send` never blocks: it appends to an in-process queue and returns. So a client that
+ * stops reading — a suspended laptop, a tab the browser has throttled, a phone on a dying uplink —
+ * costs the SERVER unbounded memory while looking perfectly healthy to every other check, including
+ * the heartbeat (the pings queue up behind the backlog and the pongs stop, but only after
+ * {@link LIVE_HEARTBEAT_TIMEOUT_MS}, by which time a busy tenant has queued tens of megabytes). At
+ * 500 tabs on one organization that is the difference between a bounded process and an OOM.
+ *
+ * Four megabytes is roughly forty seconds of a busy tenant's event stream, so a client that hits it
+ * is not slow, it is gone.
+ *
+ * The reaction is to CLOSE, not to drop frames. A client maintains its tables incrementally from
+ * `event` frames, so a silently dropped frame is a row that is wrong until something else touches
+ * it — whereas a close makes the client reconnect and re-`subscribe`, and the snapshot half of the
+ * protocol makes that a complete resynchronization. Bounded memory bought with a reconnect rather
+ * than with a lie.
+ */
+export const LIVE_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
+
 const topicName = z.string().min(1).max(64);
 
 export const liveSubscribeFrameSchema = z.strictObject({
@@ -183,6 +205,8 @@ export type LiveErrorCode = (typeof LIVE_ERROR_CODES)[number];
 export const LIVE_CLOSE_POLICY = 1008;
 export const LIVE_CLOSE_SESSION_EXPIRED = 4001;
 export const LIVE_CLOSE_ORGANIZATION_CHANGED = 4002;
+/** The connection fell {@link LIVE_MAX_BUFFERED_BYTES} behind. Reconnecting is the recovery. */
+export const LIVE_CLOSE_TOO_SLOW = 4003;
 export const LIVE_CLOSE_SERVER_SHUTDOWN = 1001;
 
 /**

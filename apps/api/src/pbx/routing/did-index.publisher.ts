@@ -292,10 +292,21 @@ export class DidIndexPublisher implements OnModuleInit, OnApplicationShutdown {
 			return [];
 		}
 		const all: StoredDidIndexEntry[] = [];
+		// Drain the key listing before reading: awaiting a get inside the `keys()` iteration
+		// suspends its ordered consumer, which then ends the listing early and silently.
+		const keys: string[] = [];
 		for await (const key of await bucket.keys()) {
-			const entry = await this.readEntry(bucket, key);
-			if (entry !== undefined) {
-				all.push(entry);
+			keys.push(key);
+		}
+		for (let start = 0; start < keys.length; start += READ_CONCURRENCY) {
+			const batch = keys.slice(start, start + READ_CONCURRENCY);
+			const entries = await Promise.all(
+				batch.map(async (key) => await this.readEntry(bucket, key)),
+			);
+			for (const entry of entries) {
+				if (entry !== undefined) {
+					all.push(entry);
+				}
 			}
 		}
 		return all;

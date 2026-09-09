@@ -1,5 +1,5 @@
 import { Inject, Injectable, OnApplicationShutdown, OnModuleInit } from "@nestjs/common";
-import { connect, type NatsConnection, type Subscription } from "nats";
+import { connect, type Msg, type NatsConnection, type Subscription } from "nats";
 import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import { sipCredentialRequestSchema } from "@optimiq-voice/events/schemas";
 import {
@@ -13,6 +13,9 @@ import { SipCredentialsService } from "./sip-credentials.service";
 import { TrunkCredentialsService } from "./trunk-credentials.service";
 import type { PbxEnv } from "../shared/pbx-env";
 import type { SipCredentialResponse } from "@optimiq-voice/events/schemas";
+
+/** Concurrent credential answers per replica; each is one bounded database lookup. */
+const MAX_IN_FLIGHT = 32;
 
 const logger = getLogger("api.pbx");
 
@@ -73,6 +76,7 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 	private subscription: Subscription | undefined;
 	private trunkSubscription: Subscription | undefined;
 	private handled = 0;
+	private readonly inFlight = new Set<Promise<void>>();
 	private stopped = false;
 
 	constructor(
@@ -191,32 +195,54 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 		}
 	}
 
+	/**
+	 * Answers are database lookups, so they run concurrently up to `MAX_IN_FLIGHT`; past that the
+	 * loop waits for one to settle before taking the next message. Serial answering made a fleet
+	 * cold-start (a thousand REGISTERs at once) queue behind one query at a time against the
+	 * registrar's 500 ms deadline. `drain()` on shutdown ends the iterator, and the tail waits for
+	 * whatever is still in flight so no accepted request goes unanswered.
+	 */
 	private async consume(subscription: Subscription): Promise<void> {
 		const decoder = new TextDecoder();
 		const encoder = new TextEncoder();
 
 		for await (const message of subscription) {
 			this.handled += 1;
-			const isTrunk = message.subject === RPC_SUBJECTS.sipTrunkCredential;
-			let reply: SipCredentialResponse | SipTrunkCredentialResponse;
-			try {
-				reply = isTrunk
-					? await this.answerTrunk(decoder.decode(message.data))
-					: await this.answer(decoder.decode(message.data));
-			} catch (error) {
-				// Unreachable in principle — `answer` catches — but a throw here would end the
-				// iterator and silently stop serving the subject for the life of the process.
-				logger.error({ err: error }, `${RPC_SUBJECTS.sipCredential} handler threw`);
-				reply = isTrunk
-					? { ok: false, reason: "credential lookup failed" }
-					: refuse("credential lookup failed");
+			if (this.inFlight.size >= MAX_IN_FLIGHT) {
+				await Promise.race(this.inFlight);
 			}
+			const work: Promise<void> = this.answerMessage(message, decoder, encoder).finally(() => {
+				this.inFlight.delete(work);
+			});
+			this.inFlight.add(work);
+		}
+		await Promise.all(this.inFlight);
+	}
 
-			try {
-				message.respond(encoder.encode(JSON.stringify(reply)));
-			} catch (error) {
-				logger.error({ err: error }, `could not reply on ${RPC_SUBJECTS.sipCredential}`);
-			}
+	private async answerMessage(
+		message: Msg,
+		decoder: TextDecoder,
+		encoder: TextEncoder,
+	): Promise<void> {
+		const isTrunk = message.subject === RPC_SUBJECTS.sipTrunkCredential;
+		let reply: SipCredentialResponse | SipTrunkCredentialResponse;
+		try {
+			reply = isTrunk
+				? await this.answerTrunk(decoder.decode(message.data))
+				: await this.answer(decoder.decode(message.data));
+		} catch (error) {
+			// Unreachable in principle — `answer` catches — but a throw here would end the
+			// iterator and silently stop serving the subject for the life of the process.
+			logger.error({ err: error }, `${RPC_SUBJECTS.sipCredential} handler threw`);
+			reply = isTrunk
+				? { ok: false, reason: "credential lookup failed" }
+				: refuse("credential lookup failed");
+		}
+
+		try {
+			message.respond(encoder.encode(JSON.stringify(reply)));
+		} catch (error) {
+			logger.error({ err: error }, `could not reply on ${RPC_SUBJECTS.sipCredential}`);
 		}
 	}
 

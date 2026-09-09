@@ -29,6 +29,16 @@ import type { LiveSource } from "./live-topics";
 const logger = getLogger("api.live");
 
 /**
+ * How many KV values a snapshot reads at once. See {@link LiveHub.snapshot}.
+ *
+ * Sized against the round-trip count rather than the connection: 64 in flight turns a 300-key
+ * snapshot from 300 sequential round trips into 5, which is the whole of the win, while staying
+ * far below the point where one page load's reads would delay another tenant's on the shared
+ * connection.
+ */
+const SNAPSHOT_READ_BATCH = 64;
+
+/**
  * The upstream side of the live channel: one set of NATS watches and subscriptions per
  * organization, opened on the first subscriber and closed on the last.
  *
@@ -208,14 +218,36 @@ export class LiveHub implements OnModuleInit, OnApplicationShutdown {
 		}
 		const values: LiveKvRow[] = [];
 		try {
+			// The key list is DRAINED before a single value is read, and the two halves are not
+			// interleaved. `bucket.keys()` is an ordered JetStream consumer, and the previous shape of
+			// this loop `await bucket.get(key)` INSIDE the `for await` over it — so every value read
+			// suspended the iteration while a request-reply went out and came back on the same
+			// connection. The ordered consumer does not survive that: it saw a gap, reset, and the
+			// iterator ended early. A 300-key bucket measured 46 and then 214 rows on two consecutive
+			// runs of `scripts/bench-live-snapshot.ts`, with no error anywhere — a wallboard opened on
+			// a partial table and had no way to know. Draining first is what makes the snapshot whole.
+			const keys: string[] = [];
 			for await (const key of await bucket.keys(`${organizationId}.>`)) {
-				const entry = await bucket.get(key);
-				if (entry === null || entry.value.length === 0) {
-					continue;
-				}
-				const parsed = this.parseKvValue(organizationId, source, key, entry.value);
-				if (parsed !== undefined) {
-					values.push({ key, value: parsed });
+				keys.push(key);
+			}
+			// Read in bounded batches rather than one at a time. The reads are independent, so issuing
+			// them serially made the snapshot cost one full round trip per key — 300 sequential round
+			// trips before a wallboard's first paint. The batch is bounded rather than a single
+			// `Promise.all` over the whole bucket because a large tenant would otherwise put thousands
+			// of simultaneous requests on one connection, which trades a slow snapshot for a stalled
+			// one.
+			for (let offset = 0; offset < keys.length; offset += SNAPSHOT_READ_BATCH) {
+				const batch = keys.slice(offset, offset + SNAPSHOT_READ_BATCH);
+				const entries = await Promise.all(batch.map(async (key) => await bucket.get(key)));
+				for (const [index, entry] of entries.entries()) {
+					const key = batch[index]!;
+					if (entry === null || entry.value.length === 0) {
+						continue;
+					}
+					const parsed = this.parseKvValue(organizationId, source, key, entry.value);
+					if (parsed !== undefined) {
+						values.push({ key, value: parsed });
+					}
 				}
 			}
 		} catch (error) {

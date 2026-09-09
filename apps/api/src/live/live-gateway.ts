@@ -9,9 +9,11 @@ import { LiveHub } from "./live-hub.service";
 import {
 	LIVE_CLOSE_POLICY,
 	LIVE_CLOSE_SERVER_SHUTDOWN,
+	LIVE_CLOSE_TOO_SLOW,
 	LIVE_HEARTBEAT_MS,
 	LIVE_HEARTBEAT_TIMEOUT_MS,
 	LIVE_REVALIDATE_MS,
+	LIVE_MAX_BUFFERED_BYTES,
 	LIVE_MAX_FRAME_BYTES,
 	LIVE_MAX_TOPICS_PER_CONNECTION,
 	LIVE_PATH,
@@ -393,6 +395,16 @@ export class LiveGateway implements OnApplicationShutdown {
 	 * per connection.
 	 */
 	private fanOut(message: LiveHubMessage): void {
+		// One encode per TOPIC NAME, not per socket.
+		//
+		// Every connection watching `registrations` receives byte-identical bytes — the frame is a
+		// function of the message and the topic name, and nothing else. Re-running `JSON.stringify`
+		// once per subscriber made the serializer the dominant cost of the whole feature: with 300
+		// tabs on one organization it was 300 encodes of the same object per upstream event, and a
+		// CPU profile of the fan-out loop was 13% `send` self time before this. The cache is scoped
+		// to ONE message so nothing stale can be served, and the topic name is the key because it is
+		// the only part of the frame that varies between connections.
+		let encoded: Map<string, string> | undefined;
 		for (const connection of this.connections) {
 			if (connection.organizationId !== message.organizationId) {
 				continue;
@@ -404,15 +416,21 @@ export class LiveGateway implements OnApplicationShutdown {
 				if (held.topic.kind === "queue" && !isForQueue(message, held.topic.queueId)) {
 					continue;
 				}
+				encoded ??= new Map();
+				let payload = encoded.get(name);
+				if (payload === undefined) {
+					payload = JSON.stringify({
+						op: "event",
+						topic: name,
+						kind: message.kind,
+						at: message.at,
+						data: message.data,
+						...(message.key === undefined ? {} : { key: message.key }),
+					} satisfies LiveServerFrame);
+					encoded.set(name, payload);
+				}
 				this.delivered += 1;
-				this.send(connection, {
-					op: "event",
-					topic: name,
-					kind: message.kind,
-					at: message.at,
-					data: message.data,
-					...(message.key === undefined ? {} : { key: message.key }),
-				});
+				this.write(connection, payload, "event");
 			}
 		}
 	}
@@ -538,16 +556,47 @@ export class LiveGateway implements OnApplicationShutdown {
 	}
 
 	private send(connection: LiveConnection, frame: LiveServerFrame): void {
+		this.write(connection, JSON.stringify(frame), frame.op);
+	}
+
+	/**
+	 * Writes one already-serialized frame, refusing a connection that has fallen too far behind.
+	 *
+	 * Split out of {@link send} so {@link fanOut} can encode once and write many times. The
+	 * backpressure check is here rather than there because it must apply to EVERY write — a socket
+	 * that cannot drain its event backlog cannot drain a snapshot either, and the snapshot is the
+	 * larger frame.
+	 *
+	 * `bufferedAmount` is the honest measure: `ws` reports what it has accepted and not yet handed to
+	 * the kernel, so a client that stopped reading shows a number that only grows. See
+	 * {@link LIVE_MAX_BUFFERED_BYTES} for why the reaction is a close and not a drop.
+	 */
+	private write(connection: LiveConnection, payload: string, op: string): void {
 		if (connection.socket.readyState !== WebSocket.OPEN) {
 			return;
 		}
+		if (connection.socket.bufferedAmount > LIVE_MAX_BUFFERED_BYTES) {
+			logger.warn(
+				{
+					organizationId: connection.organizationId,
+					bufferedAmount: connection.socket.bufferedAmount,
+				},
+				"closing a live socket that fell too far behind",
+			);
+			this.close(
+				connection,
+				LIVE_CLOSE_TOO_SLOW,
+				"This connection could not keep up; reconnect and resubscribe.",
+			);
+			return;
+		}
 		try {
-			connection.socket.send(JSON.stringify(frame));
+			connection.socket.send(payload);
 		} catch (error) {
 			logger.warn(
 				{
 					organizationId: connection.organizationId,
-					op: frame.op,
+					op,
 					error,
 				},
 				"could not write a live frame",

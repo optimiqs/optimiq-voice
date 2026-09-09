@@ -229,7 +229,10 @@ async function bootstrap() {
 	 */
 	const app = await NestFactory.create<NestFastifyApplication>(
 		rootModule,
-		new FastifyAdapter({ logger: httpLoggerOptions() }),
+		// A header that never arrives held its socket forever (Fastify's default is no timeout);
+		// 30 s bounds that without touching long-lived streaming responses, which are governed by
+		// requestTimeout (left unbounded on purpose for media ranges and exports).
+		new FastifyAdapter({ logger: httpLoggerOptions(), connectionTimeout: 30_000 }),
 		{ rawBody: true },
 	);
 	started = app;

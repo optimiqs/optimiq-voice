@@ -77,6 +77,6 @@ export function resolveAuthSliceConfig(): AuthSliceConfig {
 		sessionExpiresInSeconds: env.AUTH_SESSION_TTL_SECONDS,
 		requireEmailVerification: isProduction,
 		rateLimitEnabled: isProduction,
-		maxConnections: 10,
+		maxConnections: env.AUTH_DATABASE_MAX_CONNECTIONS,
 	};
 }
