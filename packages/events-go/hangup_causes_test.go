@@ -6,20 +6,15 @@ import (
 	events "github.com/optimiqs/optimiq-voice/packages/events-go"
 )
 
-// The generated Q.850 table is a COPY, so these tests guard the two things a generator cannot:
-// that the copy is internally coherent, and that the handful of codes the rest of the platform
-// hard-depends on are the numbers everyone thinks they are.
-//
-// Cross-language equality with packages/telephony is guarded elsewhere and differently — by
-// `codegen:check`, which regenerates and fails on any diff. Re-asserting it here would be asserting
-// that a pure function is pure.
+// The generated Q.850 table is a copy, so these tests guard what a generator cannot: that the copy
+// is internally coherent, and that the codes the rest of the platform hard-depends on are the
+// numbers everyone thinks they are. Cross-language equality with packages/telephony is guarded by
+// `codegen:check` instead.
 
-// Pinned spot values.
-//
-// Every one of these is load-bearing somewhere outside this package: 16 and 17 decide a CDR
-// disposition, 19 versus 18 is "it rang" versus "nothing answered", 41 is what a reaped dialog
-// carries when its owning sipd died (design §6.2), and 487 is the first FreeSWITCH extension —
-// the boundary where the Q.850 range stops and a re-code would be silent.
+// Pinned spot values, each load-bearing outside this package: 16 and 17 decide a CDR disposition,
+// 19 versus 18 is "it rang" versus "nothing answered", 41 is what a reaped dialog carries when its
+// owning sipd died, and 487 is the first FreeSWITCH extension — the boundary where the Q.850 range
+// stops and a re-code would be silent.
 func TestHangupCauseCodesArePinned(t *testing.T) {
 	t.Parallel()
 
@@ -47,11 +42,8 @@ func TestHangupCauseCodesArePinned(t *testing.T) {
 	}
 }
 
-// Every named cause has a code, and every code maps back to the name it came from.
-//
-// The reverse map is built by iterating the forward one, so a DUPLICATE code would silently make
-// one name unreachable rather than failing to compile — which is exactly the mistake a hand-edited
-// table makes and a generated one inherits from its source.
+// The reverse map is built by iterating the forward one, so a duplicate code would silently make one
+// name unreachable rather than failing to compile.
 func TestHangupCauseTableIsBijective(t *testing.T) {
 	t.Parallel()
 
@@ -80,10 +72,8 @@ func TestHangupCauseTableIsBijective(t *testing.T) {
 	}
 }
 
-// Q.850 members stay inside 0-127 and the extensions stay outside it.
-//
-// The split is not cosmetic: a cause code above 127 cannot have come from a carrier, so anything
-// reading a CDR row can tell "the far end said this" from "we decided this" by the number alone.
+// The 0-127 split is load-bearing: a cause code above 127 cannot have come from a carrier, so a CDR
+// reader can tell "the far end said this" from "we decided this" by the number alone.
 func TestHangupCauseRangesSplitAtQ850(t *testing.T) {
 	t.Parallel()
 
@@ -101,11 +91,8 @@ func TestHangupCauseRangesSplitAtQ850(t *testing.T) {
 	}
 }
 
-// An unknown name is absent rather than 0-with-no-signal, and an unnamed Q.850 point is absent
-// rather than invented.
-//
 // Both directions matter to the CDR writer, which stores an unrecognised carrier cause as its raw
-// code with NORMAL_UNSPECIFIED. A lookup that quietly answered NONE would turn "the carrier said
+// code with NORMAL_UNSPECIFIED: a lookup that quietly answered NONE would turn "the carrier said
 // something we do not name" into "no cause recorded", and those bill differently.
 func TestHangupCauseLookupsReportAbsence(t *testing.T) {
 	t.Parallel()

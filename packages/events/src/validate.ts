@@ -81,6 +81,49 @@ export interface ValidateEventOptions {
 	readonly crossCheckSubject?: boolean;
 }
 
+/**
+ * The cross-check on its own, for a caller that already holds a VALIDATED envelope.
+ *
+ * `makeEvent` parses the envelope against the very schema `validateEvent` would select, so a
+ * producer that builds with `makeCallEvent` and then calls `validateEvent` pays for the identical
+ * parse twice — measured at 7.4% of engine CPU under a 400-leg call storm, of which roughly half
+ * is the second parse. The half that is NOT redundant is this: the two mistakes a schema cannot
+ * see, an event published on the wrong subject and — the tenancy one — an envelope whose `orgId`
+ * is not the org in its subject.
+ *
+ * Use it only on an envelope this process just built and validated. Anything that arrived over the
+ * wire must still go through {@link safeValidateEvent}, which parses first.
+ *
+ * @throws {EventValidationError} when the envelope and the subject disagree.
+ */
+export function assertEventSubjectMatches(subject: string, envelope: AnyEventEnvelope): void {
+	const mismatch = crossCheck(subject, envelope);
+	if (mismatch !== undefined) {
+		throw mismatchError(subject, envelope, mismatch);
+	}
+}
+
+function mismatchError(
+	subject: string,
+	envelope: AnyEventEnvelope,
+	mismatch: { readonly path: string; readonly message: string },
+): EventValidationError {
+	return validationErrorFrom(
+		"Event",
+		new z.ZodError([
+			// `input` is deliberately the two subjects and not the payload: `issues` is public,
+			// and the envelope here carries caller/callee numbers and SIP headers.
+			{
+				code: "custom",
+				path: [mismatch.path],
+				message: mismatch.message,
+				input: { subject, orgId: envelope.orgId },
+			},
+		]),
+		{ subject, eventType: envelope.type },
+	);
+}
+
 function crossCheck(
 	subject: string,
 	envelope: AnyEventEnvelope,
@@ -136,23 +179,7 @@ export function safeValidateEvent(
 	if (options.crossCheckSubject !== false) {
 		const mismatch = crossCheck(subject, envelope);
 		if (mismatch !== undefined) {
-			return {
-				success: false,
-				error: validationErrorFrom(
-					"Event",
-					new z.ZodError([
-						// `input` is deliberately the two subjects and not the payload: `issues` is public,
-						// and the envelope here carries caller/callee numbers and SIP headers.
-						{
-							code: "custom",
-							path: [mismatch.path],
-							message: mismatch.message,
-							input: { subject, orgId: envelope.orgId },
-						},
-					]),
-					{ subject, eventType: envelope.type },
-				),
-			};
+			return { success: false, error: mismatchError(subject, envelope, mismatch) };
 		}
 	}
 

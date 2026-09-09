@@ -33,8 +33,6 @@ func TestNewTrunkStatusChangedEnvelopeDerivesItsSubject(t *testing.T) {
 	if envelope.OrgID != trunkTestOrg {
 		t.Errorf("OrgID = %q; want %q", envelope.OrgID, trunkTestOrg)
 	}
-	// A caller that supplied neither gets both, which is what makes this constructor usable from a
-	// FSM transition that has no opinion about ids or clocks.
 	if envelope.ID == "" {
 		t.Error("ID is empty; the constructor should default it to a UUID v7")
 	}
@@ -43,11 +41,8 @@ func TestNewTrunkStatusChangedEnvelopeDerivesItsSubject(t *testing.T) {
 	}
 }
 
-// A bad org or trunk id is an ERROR and never a subject with a mangled token in it.
-//
-// The publish path is a trunk FSM transition, so the alternative to failing here is a message on a
-// subject no consumer filters for — a trunk that silently stops reporting its health, which is the
-// one thing this event exists to prevent.
+// A bad org or trunk id must be an error, never a subject with a mangled token: the alternative is a
+// message on a subject no consumer filters for — a trunk that silently stops reporting its health.
 func TestNewTrunkStatusChangedEnvelopeRejectsBadTokens(t *testing.T) {
 	t.Parallel()
 

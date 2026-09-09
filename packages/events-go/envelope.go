@@ -8,40 +8,19 @@ import (
 	"github.com/google/uuid"
 )
 
-// The base event envelope every subject on the backbone carries — the Go mirror of
-// packages/events/src/schemas/envelope.ts.
-//
-//	{
-//	  "id":      "0192…",                      // uuid v7, also the Nats-Msg-Id dedupe key
-//	  "at":      "2026-08-05T10:00:00.000Z",   // when it HAPPENED, never when it was ingested
-//	  "orgId":   "…",                          // tenant; always equals the subject's org token
-//	  "subject": "calls.evt.v1.…",             // self-describing: survives a replay to a file
-//	  "type":    "channel.answered",           // unique WITHIN its family (the subject picks one)
-//	  "source":  "sipd",                       // publishing service
-//	  "data":    { … }                         // per-type payload
-//	}
-//
-// # Evolution / versioning policy
-//
-// The subject carries the MAJOR version. A breaking payload change — removing a field, narrowing a
-// type, changing a field's meaning — ships as a NEW subject version, and the two run side by side
-// until every consumer moves. v1 is never broken in place.
-//
-// Within a major version, change is ADDITIVE ONLY: new optional fields, new event types, new
-// vocabulary members. Consumers are therefore built to tolerate the unknown — encoding/json ignores
-// keys it has no field for, which is the Go equivalent of the TypeScript schemas being z.object
-// rather than z.strictObject. cdr.leg.write goes further and passes unknown keys THROUGH (see the
-// Extra field on CDRLegWriteData).
+// The subject carries the major version: a breaking payload change ships as a new subject version
+// and v1 is never broken in place. Within a major version change is ADDITIVE ONLY, so consumers
+// tolerate unknown keys; cdr.leg.write goes further and passes them THROUGH (see the Extra field on
+// CDRLegWriteData).
 
 // EnvelopeMajor mirrors the v1 token in every subject.
 const EnvelopeMajor = 1
 
 // EventTime is an ISO-8601 UTC instant with millisecond precision.
 //
-// It marshals to exactly the shape JavaScript's Date.prototype.toISOString() produces, so a Go
-// producer and a TypeScript producer emit byte-identical timestamps for the same instant. A plain
-// time.Time would marshal as RFC 3339 with variable fractional digits, which validates against the
-// schema but makes the two languages' output differ for no reason.
+// It marshals to exactly the shape JavaScript's Date.prototype.toISOString() produces, so a Go and
+// a TypeScript producer emit byte-identical timestamps for the same instant; plain time.Time would
+// marshal with variable fractional digits.
 type EventTime struct {
 	time.Time
 }
@@ -170,9 +149,9 @@ func UnmarshalRaw(data []byte) (Envelope[json.RawMessage], error) {
 
 // CheckSubject asserts that an envelope agrees with the subject it was delivered on.
 //
-// This catches the two mistakes that survive schema validation and are miserable to debug: an event
-// published on the wrong subject, and — the tenancy one — an envelope whose orgId is not the org in
-// its subject, which would let a consumer scope a write to the wrong tenant.
+// It catches the two mistakes that survive schema validation: an event published on the wrong
+// subject, and an envelope whose orgId is not the org in its subject — which would let a consumer
+// scope a write to the wrong tenant.
 func CheckSubject[T any](subject string, envelope Envelope[T]) error {
 	if envelope.Subject != subject {
 		return fmt.Errorf(

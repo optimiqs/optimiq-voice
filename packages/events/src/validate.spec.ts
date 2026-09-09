@@ -14,6 +14,7 @@ import { makeVoicemailEvent } from "./schemas/voicemail-events";
 import { EVENT_FAMILIES, RPC_SUBJECTS, subjectFor } from "./subjects";
 import {
 	anyEventSchema,
+	assertEventSubjectMatches,
 	EVENT_SCHEMAS_BY_FAMILY,
 	eventSchemaForSubject,
 	safeValidateEvent,
@@ -245,6 +246,25 @@ describe("subject cross-check", () => {
 		const error = result.error;
 		if (!(error instanceof EventValidationError)) throw new Error("unreachable");
 		expect(JSON.stringify(error.issues)).not.toContain(LEG);
+	});
+
+	it("is available on its own for a producer that just built the envelope", () => {
+		// The publisher's path: `makeCallEvent` has already parsed the envelope against this very
+		// schema, so re-parsing it is the half of `validateEvent` that buys nothing. This is the
+		// half that does — and it must still catch both mistakes.
+		expect(() => {
+			assertEventSubjectMatches(callEvent.subject, callEvent);
+		}).not.toThrow();
+
+		const moved = { ...callEvent, subject: subjectFor.call(ORG, CALL, "channel.held") };
+		expect(() => {
+			assertEventSubjectMatches(subjectFor.call(ORG, CALL, "channel.answered"), moved);
+		}).toThrow(/does not match the delivery subject/);
+
+		const crossTenant = { ...callEvent, orgId: OTHER_ORG };
+		expect(() => {
+			assertEventSubjectMatches(callEvent.subject, crossTenant);
+		}).toThrow(/does not match the subject's org token/);
 	});
 
 	it("can be disabled for a replay from a file", () => {

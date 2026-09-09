@@ -8,7 +8,7 @@ import (
 )
 
 func TestReadinessTracksDependencies(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	var ready atomic.Bool
 	server, err := Start(ctx, "127.0.0.1:0", ready.Load)
@@ -34,4 +34,37 @@ func TestReadinessTracksDependencies(t *testing.T) {
 	if err := Probe(server.Addr); err == nil {
 		t.Fatal("dependency loss left readiness healthy")
 	}
+}
+
+func TestPprofIsOffUnlessAsked(t *testing.T) {
+	addr := startProbeServer(t)
+	if status := probeStatus(t, addr, "/debug/pprof/"); status != http.StatusNotFound {
+		t.Errorf("pprof answered %d on a listener that did not enable it", status)
+	}
+}
+
+func TestPprofServesWhenEnabled(t *testing.T) {
+	addr := startProbeServer(t, WithPprof(true))
+	if status := probeStatus(t, addr, "/debug/pprof/"); status != http.StatusOK {
+		t.Errorf("pprof answered %d with WithPprof(true)", status)
+	}
+}
+
+func startProbeServer(t *testing.T, opts ...Option) string {
+	t.Helper()
+	server, err := Start(t.Context(), "127.0.0.1:0", func() bool { return true }, opts...)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	return server.Addr
+}
+
+func probeStatus(t *testing.T, addr, path string) int {
+	t.Helper()
+	response, err := http.Get("http://" + addr + path)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	defer response.Body.Close()
+	return response.StatusCode
 }

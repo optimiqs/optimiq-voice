@@ -7,17 +7,36 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"strings"
 	"time"
 )
 
+// Option configures the health listener.
+type Option func(*options)
+
+type options struct{ pprof bool }
+
+// WithPprof serves net/http/pprof under /debug/pprof/ on this listener.
+//
+// It belongs here and NOWHERE else, because this listener is the private one: a profiling endpoint
+// reachable from outside is a denial of service and a memory disclosure.
+func WithPprof(enabled bool) Option {
+	return func(o *options) { o.pprof = enabled }
+}
+
+// Server is a started health listener; Errors reports a serve failure.
 type Server struct {
 	Addr   string
 	Errors <-chan error
 }
 
 // Start binds synchronously. An empty address disables the optional HTTP listener.
-func Start(ctx context.Context, addr string, ready func() bool) (*Server, error) {
+func Start(ctx context.Context, addr string, ready func() bool, opts ...Option) (*Server, error) {
+	var settings options
+	for _, opt := range opts {
+		opt(&settings)
+	}
 	errs := make(chan error, 1)
 	result := &Server{Errors: errs}
 	if addr == "" {
@@ -43,7 +62,16 @@ func Start(ctx context.Context, addr string, ready func() bool) (*Server, error)
 		}
 		_, _ = w.Write([]byte(`{"status":"ready"}`))
 	})
-	server := &http.Server{Handler: mux, ReadHeaderTimeout: 3 * time.Second, WriteTimeout: 3 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 4096}
+	if settings.pprof {
+		// Registered by hand rather than via the package init's http.DefaultServeMux, which would
+		// put these handlers on every other listener in the process that uses that mux.
+		mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+		mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+	}
+	server := &http.Server{Handler: mux, ReadHeaderTimeout: 3 * time.Second, WriteTimeout: writeTimeout(settings), IdleTimeout: 30 * time.Second, MaxHeaderBytes: 4096}
 	go func() {
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errs <- err
@@ -81,4 +109,13 @@ func Probe(addr string) error {
 		return fmt.Errorf("service is not ready: %s", strings.TrimSpace(response.Status))
 	}
 	return nil
+}
+
+// writeTimeout is generous when pprof is on: `go tool pprof -seconds=30` holds one response open
+// for the whole sample, and the probe timeout would truncate it.
+func writeTimeout(settings options) time.Duration {
+	if settings.pprof {
+		return 2 * time.Minute
+	}
+	return 3 * time.Second
 }

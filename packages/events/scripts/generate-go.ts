@@ -291,12 +291,8 @@ function emitHangupCauses(): void {
 	emitter.declareRaw(
 		"type:HangupCause",
 		[
-			"// HangupCause is a hangup-cause NAME — the value stored on `call_legs.hangup_cause` and",
-			"// carried by `cdr.leg.v1` and the `dialog.terminated` event.",
-			"//",
-			"// A plain string type rather than a closed enum, deliberately: a cause this build does not",
-			"// know must still reach the CDR writer, which stores the numeric code verbatim and falls back",
-			"// to NORMAL_UNSPECIFIED.",
+			"// HangupCause is a hangup-cause NAME, as stored on `call_legs.hangup_cause`. Open rather than",
+			"// a closed enum: a cause this build does not know must still reach the CDR writer.",
 			"type HangupCause string",
 		].join("\n"),
 	);
@@ -317,11 +313,8 @@ function emitHangupCauses(): void {
 	emitter.declareRaw(
 		"consts:HangupCode",
 		[
-			"// The numeric code for each named cause, as untyped constants.",
-			"//",
-			"// Constants rather than only the map below, because a Go caller that wants a compile-time",
-			"// constant cannot get one out of a map — `apps/sipd/internal/dialog/cause.go` defines its",
-			"// whole Cause* set in terms of these.",
+			"// The numeric code for each named cause, as untyped constants so callers can use them where",
+			"// a compile-time constant is required.",
 			"const (",
 			...all.map(
 				(cause) => `\tHangupCode${goCauseIdentifier(cause)} = ${HANGUP_CAUSE_CODES[cause]}`,
@@ -360,10 +353,8 @@ function emitHangupCauses(): void {
 			),
 			"}",
 			"",
-			"// HangupCauseNames maps a numeric code back onto its name.",
-			"//",
-			"// Built from the same generated pairs as HangupCauseCodes, so the two cannot diverge — the",
-			"// property HANGUP_CAUSE_NAMES gets in TypeScript by construction.",
+			"// HangupCauseNames maps a numeric code back onto its name. Inverted from HangupCauseCodes, so",
+			"// the two cannot diverge.",
 			"var HangupCauseNames = func() map[int]HangupCause {",
 			"\tnames := make(map[int]HangupCause, len(HangupCauseCodes))",
 			"\tfor cause, code := range HangupCauseCodes {",
@@ -377,19 +368,15 @@ function emitHangupCauses(): void {
 	emitter.declareRaw(
 		"func:HangupCauseHelpers",
 		[
-			"// HangupCauseCodeOf returns the numeric code for a cause name, and whether it is a name this",
-			'// contract knows. An unknown name yields 0, which is NONE — the "no cause recorded" sentinel',
-			"// and never a real outcome, so a caller that ignores the boolean cannot bill from it.",
+			"// HangupCauseCodeOf returns the numeric code for a cause name, and whether the contract knows",
+			"// it. An unknown name yields 0 (NONE), never a real outcome, so ignoring the bool cannot bill.",
 			"func HangupCauseCodeOf(cause HangupCause) (int, bool) {",
 			"\tcode, found := HangupCauseCodes[cause]",
 			"\treturn code, found",
 			"}",
 			"",
-			"// HangupCauseFromCode returns the name for a numeric code.",
-			"//",
-			"// Only the ~65 points a softswitch actually emits are named; anything else a carrier sends is",
-			"// stored as its raw code with NORMAL_UNSPECIFIED, which is why this reports absence rather",
-			"// than inventing a name.",
+			"// HangupCauseFromCode returns the name for a numeric code. Only the codes a softswitch emits",
+			"// are named; anything else is reported absent rather than given an invented name.",
 			"func HangupCauseFromCode(code int) (HangupCause, bool) {",
 			"\tcause, found := HangupCauseNames[code]",
 			"\treturn cause, found",
@@ -409,14 +396,9 @@ function emitHangupCauses(): void {
 			[
 				"The Q.850 hangup-cause taxonomy, plus the FreeSWITCH extensions.",
 				"",
-				"Authority: packages/telephony/src/hangup-causes.ts, itself pinned against the frozen",
-				"reference §6 by its own spec. This is a GENERATED COPY so that Go and TypeScript read one",
-				"table: renaming a member is a breaking change for every stored CDR row, and re-coding one",
-				"silently changes outbound failover, so neither may be decided twice.",
-				"",
-				"apps/sipd/internal/dialog/cause.go defines its Cause* constants in terms of the HangupCode*",
-				"constants here. The SIP status -> Q.850 mapping stays in sipd: that one IS the edge's own",
-				"knowledge (RFC 3398), and nothing outside the SIP stack has an opinion about it.",
+				"Authority: packages/telephony/src/hangup-causes.ts. Generated so Go and TypeScript read one",
+				"table — renaming a member breaks stored CDR rows and re-coding one changes outbound failover.",
+				"The SIP status -> Q.850 mapping (RFC 3398) stays in apps/sipd.",
 			],
 			"events",
 		),
@@ -445,9 +427,8 @@ function emitGo(
 			[
 				"Closed telephony vocabularies shared by every event family.",
 				"",
-				"Authority: packages/events/src/schemas/telephony.ts. Large, still-growing domains",
-				"(hangup causes, destination types, dispositions) are deliberately plain strings there",
-				"and here — see that file's header for why.",
+				"Authority: packages/events/src/schemas/telephony.ts, where the still-growing domains",
+				"(hangup causes, destination types, dispositions) are plain strings rather than enums.",
 			],
 			"events",
 		),
@@ -468,9 +449,8 @@ function emitGo(
 			[
 				"KV bucket VALUE contracts from schemas/live-state.ts.",
 				"",
-				"The keys are built by subjects.go; these are what the buckets hold. A Go reader that",
-				"hand-writes one of these structs is a drift the parity golden cannot see, which is how",
-				"the sip-acl reader ended up expecting `organizationId` for a writer emitting `orgId`.",
+				"The keys are built by subjects.go; these are what the buckets hold. Hand-writing one of",
+				"these structs in Go is drift the parity golden cannot see — always use these.",
 			],
 			"events",
 		),
@@ -517,8 +497,8 @@ function emitGo(
 	// -- rpc --------------------------------------------------------------------------------------
 	const rpcEmitter = new GoFileEmitter({ namedEnums: NAMED_ENUMS });
 	const rpcConsts: string[] = [
-		"// Request-reply subjects and their suggested client deadlines. These are on the call path,",
-		"// so a slow reply is the same as a broken one.",
+		"// Request-reply subjects and their suggested client deadlines. On the call path: a slow reply",
+		"// is the same as a broken one.",
 		"const (",
 	];
 	for (const entry of RPC_ENTRIES) {
@@ -553,14 +533,11 @@ function emitGo(
 		join(GO_DIR, "rpc_gen.go"),
 		rpcEmitter.render(
 			[
-				"Request-reply contracts for the rpc.* subjects (plan §3.5).",
+				"Request-reply contracts for the rpc.* subjects. Contracts only: transport is the",
+				"application's business.",
 				"",
-				"Contracts only: transport is the application's business.",
-				"",
-				"rpc.media.v1.* is the exception that proves the rule: apps/mediad is the RESPONDER for",
-				"those four, so the request/response structs below are the wire, not documentation. Both",
-				"ends must be raw NATS — a NestJS ClientProxy would wrap the payload in its own framing",
-				"and mediad would reject it. See packages/events/src/schemas/rpc.ts.",
+				"For rpc.media.v1.* these structs ARE the wire — apps/mediad is the responder, so both ends",
+				"must speak raw NATS; a NestJS ClientProxy frame would be rejected.",
 			],
 			"events",
 		),

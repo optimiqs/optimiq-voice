@@ -4,13 +4,11 @@ import "encoding/json"
 
 // Passthrough support for the loose payloads in the contract.
 //
-// cdr.leg.write is a z.looseObject on the TypeScript side (see cdr-events.ts): the schema pins the
-// columns billing, reporting and retention key off, and passes everything else THROUGH to the CDR
-// writer, which owns the column list. Go's encoding/json would silently drop those keys, so the
+// cdr.leg.write is a z.looseObject on the TypeScript side (see cdr-events.ts): unpinned keys pass
+// THROUGH to the CDR writer, which owns the column list. Go's encoding/json would drop them, so the
 // generated struct carries an Extra map and the two helpers below reunite it with the wire form.
-//
-// Pinned fields always win on marshal: a producer that puts a value in Extra under a pinned key has
-// a bug, and letting it override the typed field would make the struct lie.
+// Pinned fields win on marshal, so a value in Extra under a pinned key can never make the struct
+// lie about its own typed field.
 
 func marshalWithExtras(value any, extras map[string]json.RawMessage) ([]byte, error) {
 	base, err := json.Marshal(value)

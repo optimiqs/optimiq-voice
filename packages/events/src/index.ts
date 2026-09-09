@@ -109,6 +109,7 @@ export {
 } from "./subjects";
 export {
 	anyEventSchema,
+	assertEventSubjectMatches,
 	EVENT_SCHEMAS_BY_FAMILY,
 	eventSchemaForSubject,
 	safeValidateEvent,

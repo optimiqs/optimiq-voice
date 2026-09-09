@@ -26,9 +26,6 @@ import (
 //	rpc.routing.v1.resolve                     request-reply, not JetStream (see rpc_gen.go)
 //	rpc.authz.v1.check
 //
-// The version token is a MAJOR version and is part of the subject, not the payload: a breaking
-// payload change ships as v2 subjects alongside v1. Additive changes never bump it.
-//
 // Event names are hierarchical and may contain dots (channel.record.started), so the event occupies
 // the subject's TAIL rather than a single token. Every filter that spans events therefore ends in
 // ">", and ParseSubject rejoins the trailing tokens.
@@ -177,20 +174,14 @@ func eventName(value string) (string, error) {
 // InstanceSubjectToken returns the stable subject token for a service instance id.
 //
 // The Go mirror of instanceSubjectToken in packages/events/src/subjects.ts, and it MUST agree with
-// it byte for byte: the engine (TypeScript) builds rpc.sip.v1.{ring,answer,hangup,reinvite}.<tok>
-// from its side and apps/sipd (Go) subscribes with its own configured id through this function, so a
-// disagreement is a command that is published to a subject nobody is listening on — a call that
-// rings and can never be answered.
+// it byte for byte: the engine builds rpc.sip.v1.{ring,answer,hangup,reinvite}.<tok> from its side
+// while apps/sipd subscribes through this function, so a disagreement is a command published where
+// nobody is listening.
 //
-// An instance id is whatever the operator or the container runtime called the process — usually
-// already one subject token (sipd, sipd-2, sipd-7d9f4c-xk2lp), which is returned VERBATIM so that an
-// operator can `nats sub` the exact subject a stuck call is addressed at. When it is not a token —
-// an FQDN hostname carries dots, and a dot is a separator — it is the first 32 hex characters of its
-// SHA-256, the same escape hatch AORSubjectToken uses and for the same reason.
-//
-// Both ends compute it from the same string (the owner from its own configured id, the caller from
-// the instanceId it was told on admission or originate), so the two always land on one subject
-// whichever branch runs. The parity harness pins the two implementations against shared vectors.
+// An id that is already a single token (sipd, sipd-7d9f4c-xk2lp) is returned verbatim, so an
+// operator can `nats sub` the exact subject a stuck call is addressed at. Otherwise — an FQDN
+// hostname carries dots, and a dot is a separator — it is the first 32 hex characters of its
+// SHA-256, the same escape hatch AORSubjectToken uses.
 func InstanceSubjectToken(instanceID string) (string, error) {
 	normalized := strings.TrimSpace(instanceID)
 	if normalized == "" {
@@ -207,15 +198,11 @@ func InstanceSubjectToken(instanceID string) (string, error) {
 //
 // An AOR (sip:1001@acme.example.com) contains "@", ":" and dots, none of which survive as a single
 // subject token, and it is PII-adjacent. The token is the first 32 hex characters of the SHA-256 of
-// the lower-cased AOR — 128 bits, collision-free at any registrar scale, and stable across
-// processes and languages so sip.reg.v1.<org>.<aorHash>.> is a usable per-device filter.
+// the trimmed, lower-cased AOR, stable across processes and languages so sip.reg.v1.<org>.<hash>.>
+// is a usable per-device filter. The full AOR travels in the payload; the hash is addressing only.
 //
-// The full AOR always travels in the event payload; the hash is addressing only.
-//
-// Normalisation is trim + lower-case, matching String.prototype.trim/toLowerCase for every input a
-// SIP AOR can contain (ASCII plus the Latin-1/Unicode letters a domain or user part may carry). The
-// few code points where JavaScript's and Go's case folding disagree (dotted/dotless I, final sigma)
-// are not valid in a SIP user or host part.
+// The few code points where JavaScript's and Go's case folding disagree (dotted/dotless I, final
+// sigma) are not valid in a SIP user or host part, so the two sides always agree.
 func AORSubjectToken(aor string) (string, error) {
 	normalized := strings.ToLower(strings.TrimSpace(aor))
 	if normalized == "" {
@@ -227,15 +214,13 @@ func AORSubjectToken(aor string) (string, error) {
 
 // DIDIndexToken returns the stable key token for a DID, for the did-index KV bucket.
 //
-// An E.164 number is stored as "+441632960111" and dialled as "441632960111", "+441632960111" or
-// (from a carrier that strips it) with punctuation. None of "+", spaces, dashes or parentheses
-// survive as a KV key token, and none of them carry meaning, so the token is the DIGITS and nothing
-// else. Both writers and readers go through this one function, which is what makes "the DID the
-// tenant configured" and "the DID the carrier delivered" the same key.
+// None of "+", spaces, dashes or parentheses survive as a KV key token, and none carry meaning, so
+// the token is the digits and nothing else. Both writers and readers go through this function,
+// which is what makes "the DID the tenant configured" and "the DID the carrier delivered" one key.
 //
-// What it deliberately does NOT do is guess a dial plan: "0044…" and "+44…" are the same number to a
-// human and different tokens here, because turning a national prefix into a country code needs to
-// know which country the trunk is in. That belongs to the SIP edge, not to the contract package.
+// It deliberately does not guess a dial plan: "0044…" and "+44…" are the same number to a human and
+// different tokens here, because a national prefix needs the trunk's country. That belongs to the
+// SIP edge, not to the contract package.
 func DIDIndexToken(did string) (string, error) {
 	digits := make([]byte, 0, len(did))
 	for i := 0; i < len(did); i++ {
@@ -248,10 +233,6 @@ func DIDIndexToken(did string) (string, error) {
 	}
 	return string(digits), nil
 }
-
-// ---------------------------------------------------------------------------------------------
-// publish subjects
-// ---------------------------------------------------------------------------------------------
 
 // CallSubject builds calls.evt.v1.<orgId>.<callId>.<event>.
 func CallSubject(orgID, callID, event string) (string, error) {
@@ -290,10 +271,9 @@ func RegistrationSubject(orgID, aorHash, event string) (string, error) {
 
 // SIPDialogSubject builds sip.evt.v1.<orgId>.<legId>.<event>.
 //
-// The middle token is the LEG id, which is the whole of the invite design's §3.1: one string names
-// the leg, the mediad session and this process's dialog. The SIP dialog identifier — Call-ID plus
-// tags — is data on the payload and never the key, because a Call-ID is phone-chosen and full of
-// characters `token` rejects.
+// The middle token is the leg id: one string names the leg, the mediad session and sipd's dialog.
+// The SIP dialog identifier (Call-ID plus tags) stays on the payload, because a Call-ID is
+// phone-chosen and full of characters IsSubjectToken rejects.
 func SIPDialogSubject(orgID, legID, event string) (string, error) {
 	org, err := token("orgId", orgID)
 	if err != nil {
@@ -348,8 +328,8 @@ func VoicemailSubject(orgID, mailboxID, event string) (string, error) {
 
 // MediaSubject builds media.evt.v1.<orgId>.<sessionId>.<event>.
 //
-// Keyed by SESSION and not by call: a call has one id and several media sessions (one per leg), and
-// the thing that ends, times out or is reaped is the session. The call travels in the payload.
+// Keyed by session and not by call: a call has several media sessions (one per leg), and the thing
+// that ends, times out or is reaped is the session. The call id travels in the payload.
 func MediaSubject(orgID, sessionID, event string) (string, error) {
 	org, err := token("orgId", orgID)
 	if err != nil {
@@ -368,10 +348,9 @@ func MediaSubject(orgID, sessionID, event string) (string, error) {
 
 // TrunkSubject builds trunk.evt.v1.<orgId>.<trunkId>.<event>.
 //
-// trunkID is the trunk ROW id, not the trunk's name: the name is what the media server addresses
-// (it is the PJSIP endpoint), but a tenant may rename a trunk while it is down, and a subject that
-// moved under a rename would strand a durable consumer's ordering mid-outage. The name travels in
-// the payload.
+// trunkID is the trunk row id, not its name: a tenant may rename a trunk while it is down, and a
+// subject that moved under a rename would strand a durable consumer's ordering mid-outage. The name
+// travels in the payload.
 func TrunkSubject(orgID, trunkID, event string) (string, error) {
 	org, err := token("orgId", orgID)
 	if err != nil {
@@ -414,10 +393,6 @@ func ProvisionSubject(orgID string) (string, error) {
 	}
 	return SubjectRootProvision + "." + org, nil
 }
-
-// ---------------------------------------------------------------------------------------------
-// subscription filters
-// ---------------------------------------------------------------------------------------------
 
 // AllCallsFilter matches every call event of every org — the CALLS stream's own subject list.
 func AllCallsFilter() string { return SubjectRootCall + ".>" }
@@ -686,10 +661,6 @@ func AllProvisionFilter() string { return SubjectRootProvision + ".*" }
 // ProvisionInOrgFilter matches one org's provisioning subject.
 func ProvisionInOrgFilter(orgID string) (string, error) { return ProvisionSubject(orgID) }
 
-// ---------------------------------------------------------------------------------------------
-// parsing
-// ---------------------------------------------------------------------------------------------
-
 // SubjectKind names the shape a parsed subject has, including the non-event rpc shape.
 type SubjectKind string
 
@@ -734,10 +705,9 @@ type ParsedSubject struct {
 	TrunkID string
 	// Event is the (possibly dotted) event name, for the four per-entity families.
 	//
-	// It is returned as a plain string, not a checked vocabulary member: a v1.n producer may emit
-	// an event name a v1.0 consumer has never heard of, and dropping that message at parse time
-	// would break the additive-evolution guarantee. Narrow with IsEventTypeOfFamily when the code
-	// actually needs to branch.
+	// A plain string, not a checked vocabulary member: a v1.n producer may emit an event name a
+	// v1.0 consumer has never heard of, and rejecting it at parse time would break additive
+	// evolution. Narrow with IsEventTypeOfFamily when the code needs to branch.
 	Event string
 	// Service and Method are set for KindRPC.
 	Service string
@@ -852,8 +822,8 @@ func EventFamilyForSubject(subject string) (EventFamily, bool) {
 // MatchesSubject implements NATS subject matching: "*" matches exactly one token, ">" matches one
 // or more trailing tokens and is only meaningful as the final token.
 //
-// Reimplemented here rather than taken from a client so filters can be unit-tested without a
-// broker, and so a fake in-process bus routes exactly like the server does.
+// Reimplemented rather than taken from a client so filters can be unit-tested without a broker, and
+// so a fake in-process bus routes exactly like the server does.
 func MatchesSubject(filter, subject string) bool {
 	filterTokens := strings.Split(filter, ".")
 	subjectTokens := strings.Split(subject, ".")

@@ -8,16 +8,11 @@ import (
 	"time"
 )
 
-// Cross-language parity.
-//
-// testdata/parity.json is produced BY the TypeScript implementation (packages/events/src) during
-// `pnpm --filter @optimiq-voice/events codegen`. Every assertion below therefore compares this
-// package against the behaviour of the real contract, not against a second hand-written copy of it.
-//
-// If a TypeScript change is not mirrored here, one of these fails. If a Go change diverges, the
-// same. That is the entire point: the generated structs cover SHAPE, and this file covers the
-// BEHAVIOUR that cannot be generated — subject assembly, AOR hashing, subject matching, KV keys and
-// the stream/bucket definitions.
+// Cross-language parity. testdata/parity.json is produced by the TypeScript implementation during
+// `pnpm --filter @optimiq-voice/events codegen`, so these assertions compare this package against
+// the real contract rather than a second hand-written copy. The generated structs cover shape; this
+// file covers the behaviour that cannot be generated — subject assembly, AOR hashing, subject
+// matching, KV keys and the stream/bucket definitions.
 
 type goldenParsedSubject struct {
 	Kind      string `json:"kind"`
@@ -598,14 +593,9 @@ func TestParityEventTypeRegistry(t *testing.T) {
 	}
 }
 
-// canonical re-encodes JSON through a generic value so key order stops mattering: Go marshals
-// struct fields in declaration order and map keys in sorted order, TypeScript in insertion order.
-//
-// It also drops explicit nulls. Every nullable field in the contract is `.nullish()` — null and
-// absent are the same statement ("there is no originating leg"), the TypeScript schema accepts
-// both, and the cdr-db column they land in is nullable either way. Go models that as *T with
-// omitempty, which necessarily writes "absent"; treating the two as distinct here would fail the
-// comparison over a difference the contract says does not exist.
+// canonical re-encodes JSON through a generic value so key order stops mattering, and drops
+// explicit nulls: every nullable field in the contract is `.nullish()`, so null and absent are the
+// same statement, while Go's *T with omitempty can only write "absent".
 func canonical(t *testing.T, raw []byte) string {
 	t.Helper()
 	var value any
@@ -642,9 +632,9 @@ func dropNulls(value any) any {
 }
 
 // TestParityEventSamples is the shape half of the parity proof: every sample envelope built by the
-// TypeScript makers is decoded into the generated Go structs and re-encoded. A field the emitter
-// got wrong — a missing json tag, a value type where a pointer was needed, a dropped passthrough
-// key — changes the bytes and fails here.
+// TypeScript makers is decoded into the generated Go structs and re-encoded, so an emitter mistake
+// (a missing json tag, a value where a pointer was needed, a dropped passthrough key) changes the
+// bytes and fails here.
 func TestParityEventSamples(t *testing.T) {
 	g := loadGolden(t)
 	if len(g.EventSamples) == 0 {
@@ -676,7 +666,6 @@ func TestParityEventSamples(t *testing.T) {
 				t.Errorf("payload round-trip lost or invented fields:\n got %s\nwant %s", got, want)
 			}
 
-			// Whole-envelope round trip, which additionally pins the EventTime formatting.
 			reEncodedEnvelope, err := Marshal(raw)
 			if err != nil {
 				t.Fatalf("re-encode envelope: %v", err)
@@ -759,9 +748,8 @@ func TestEventTimeMarshalsLikeToISOString(t *testing.T) {
 	}
 }
 
-// TestParityEventSampleCoverage is the gate the golden could not provide while its samples were a
-// hand-written list: a payload struct nobody sampled is a struct nothing round-trips, and an
-// emitter mistake on it ships silently.
+// TestParityEventSampleCoverage fails if a generated payload struct has no sample: an unsampled
+// struct is one nothing round-trips, so an emitter mistake on it would ship silently.
 func TestParityEventSampleCoverage(t *testing.T) {
 	g := loadGolden(t)
 
@@ -776,8 +764,7 @@ func TestParityEventSampleCoverage(t *testing.T) {
 	}
 }
 
-// TestParityRPCSamples is TestParityEventSamples for the request-reply half: 74 generated structs
-// that were emitted but never decoded by any test until this one.
+// TestParityRPCSamples is TestParityEventSamples for the request-reply half.
 func TestParityRPCSamples(t *testing.T) {
 	g := loadGolden(t)
 	if len(g.RPCSamples) == 0 {
