@@ -29,7 +29,7 @@ function response(
 			voicemailNumber: "*97",
 		},
 		transport: { wssUrl: "wss://sip.example.com:8089" },
-		media: { webrtcSupported: false, note: "mediad has no DTLS-SRTP yet." },
+		media: { webrtcSupported: false, note: "Browser audio is disabled on this deployment." },
 		...overrides,
 	};
 }
@@ -78,6 +78,20 @@ describe("sipUriFor", () => {
 });
 
 describe("shapeSoftphoneCredentials", () => {
+	it("preserves expiring TURN credentials for the peer connection", () => {
+		const ice = {
+			urls: ["turn:turn.example.test:3478"],
+			username: "12345:org:user",
+			credential: "expiring-hmac",
+		};
+		const shaped = shapeSoftphoneCredentials(
+			response({ media: { webrtcSupported: true, note: "Enabled", iceServers: [ice] } }),
+		);
+		expect(shaped.iceServers).toEqual([ice]);
+		expect(shaped.iceServers?.[0]?.urls).not.toBe(ice.urls);
+		expect(shaped.webrtcSupported).toBe(true);
+	});
+
 	it("maps the wire response onto a UA config", () => {
 		const shaped = shapeSoftphoneCredentials(response());
 		expect(shaped.wssUrl).toBe("wss://sip.example.com:8089");

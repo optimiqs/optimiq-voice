@@ -6,6 +6,7 @@ import { SipdCommandClient } from "../nats/sipd-command.client";
 import { AriConnectionService } from "./ari-connection.service";
 import { AriMediaAdapter } from "./ari-media.adapter";
 import { MediadService } from "./mediad.service";
+import { SipRenegotiateService } from "./sip-renegotiate.service";
 import { SipdService } from "./sipd.service";
 import { SplitPlaneMediaPort } from "./split-plane.port";
 import type { EngineEnv } from "../config/engine-env";
@@ -40,6 +41,7 @@ import type { MediaPort } from "./media-port";
 		// is constructed unconditionally for the reason the other two are — the factory below stays a
 		// one-line choice — and starts only on a deployment that signals on `apps/sipd`.
 		SipdService,
+		SipRenegotiateService,
 		{
 			provide: MEDIA_PORT,
 			useFactory: (
@@ -70,6 +72,8 @@ import type { MediaPort } from "./media-port";
 					return new SplitPlaneMediaPort(
 						mediad.port,
 						new SipdCommandClient(() => jetstream.rawConnection),
+						undefined,
+						env.ENGINE_INSTANCE_ID,
 					);
 				}
 				return new AriMediaAdapter(ari.client, ari.applicationName);

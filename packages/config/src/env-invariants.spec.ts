@@ -174,7 +174,7 @@ describe("env invariants in production", () => {
 
 		expect(() =>
 			assertEnvInvariants(withProduction({ ASTERISK_SIPPROXY_HOST: undefined })),
-		).toThrow("ASTERISK_SIPPROXY_HOST must be a reachable address in production.");
+		).not.toThrow();
 	});
 });
 
@@ -218,5 +218,24 @@ describe("assertResolvedSecret", () => {
 		expect(() =>
 			assertResolvedSecret("API_OWNER_PASSWORD", "   ", { nodeEnv: "production" }),
 		).toThrow("API_OWNER_PASSWORD must be set.");
+	});
+});
+
+describe("production engine configuration", () => {
+	it("requires its broker identity without browser auth or database credentials", () => {
+		const config: EnvInvariantConfig = {
+			NODE_ENV: "production",
+			OPTIMIQ_SERVICE: "engine",
+			NATS_URL: "nats://nats:4222",
+			NATS_ENGINE_USER: "engine",
+			NATS_ENGINE_PASS: "test-engine-broker-credential",
+		};
+		expect(() => assertEnvInvariants(config)).not.toThrow();
+		expect(() => assertEnvInvariants({ ...config, NATS_ENGINE_PASS: undefined })).toThrow(
+			"NATS_ENGINE_PASS",
+		);
+		expect(() => assertEnvInvariants({ ...config, OPTIMIQ_SERVICE: "api" })).toThrow(
+			"DATABASE_URL",
+		);
 	});
 });

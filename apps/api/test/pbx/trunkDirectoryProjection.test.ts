@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { expect } from "chai";
 import { kvKeyFor } from "@optimiq-voice/events/streams";
 import {
@@ -126,6 +127,15 @@ describe("kvKeyFor.trunk", () => {
 });
 
 describe("projectTrunkDirectoryEntry", () => {
+	it("matches the payload consumed by the Go SIP directory", () => {
+		const fixture = JSON.parse(
+			readFileSync(
+				new URL("../../../sipd/internal/trunk/testdata/api_projection.json", import.meta.url),
+				"utf8",
+			),
+		);
+		expect(projectTrunkDirectoryEntry(ORG, row())).to.deep.equal(fixture);
+	});
 	/**
 	 * The assertion this file exists for. Stated as "no property whose value is the secret" AND as
 	 * "no key named for one", because the two ways this regresses are a renamed field carrying the

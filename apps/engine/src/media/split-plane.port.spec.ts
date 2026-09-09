@@ -4,6 +4,7 @@ import { hangupCauseCode } from "@optimiq-voice/telephony";
 import { MediaOperationNotSupportedError } from "./media-not-supported.error";
 import { MediadMediaPort } from "./mediad-media.port";
 import { FakeMediadTransport } from "./mediad-transport.fake";
+import { SipRenegotiateService } from "./sip-renegotiate.service";
 import {
 	SplitPlaneBadRequestError,
 	SplitPlaneLegStateError,
@@ -21,6 +22,8 @@ import type {
 	SipReinviteResponse,
 	SipRingRequest,
 	SipRingResponse,
+	SipResolveTargetRequest,
+	SipResolveTargetResponse,
 } from "@optimiq-voice/events";
 
 const TIMEOUT_MS = 500;
@@ -44,9 +47,12 @@ class FakeSipdCommandPort implements SipdCommandPort {
 	readonly answerCalls: { instanceId: string; request: SipAnswerRequest }[] = [];
 	readonly hangupCalls: { instanceId: string; request: SipHangupRequest }[] = [];
 	readonly originateCalls: SipOriginateRequest[] = [];
+	readonly originateOwners: (string | undefined)[] = [];
+	resolveTarget?: (request: SipResolveTargetRequest) => Promise<SipResolveTargetResponse>;
 
 	/** When set, `answer` refuses — the CANCEL-lost-the-race branch (§4.4). */
 	refuseAnswer = false;
+	refuseOriginate = false;
 	/** The instance the originate reply names, which the composite must record for later commands. */
 	originateInstanceId: string | undefined = "sipd-out-1";
 
@@ -72,8 +78,14 @@ class FakeSipdCommandPort implements SipdCommandPort {
 		return { ok: true, legId: request.legId, instanceId };
 	}
 
-	async originate(request: SipOriginateRequest): Promise<SipOriginateResponse> {
+	async originate(
+		request: SipOriginateRequest,
+		instanceId?: string,
+	): Promise<SipOriginateResponse> {
 		this.originateCalls.push(request);
+		this.originateOwners.push(instanceId);
+		if (this.refuseOriginate)
+			return { ok: false, legId: request.legId, reason: "internal", error: "timeout" };
 		return { ok: true, legId: request.legId, instanceId: this.originateInstanceId };
 	}
 }
@@ -156,6 +168,74 @@ describe("ring", () => {
 });
 
 describe("originate", () => {
+	it("cleans up media and the resolved SIP owner when an originate reply is lost", async () => {
+		const { port, transport, sipd } = newComposite();
+		sipd.resolveTarget = async () => ({
+			ok: true,
+			legId: CH,
+			instanceId: INSTANCE,
+			transport: "udp",
+			requestUri: "sip:phone@device",
+		});
+		sipd.refuseOriginate = true;
+		transport.reply(RPC_SUBJECTS.mediaCreateOffer, { ok: true, sessionId: CH, sdpOffer: OFFER });
+		port.registerOutboundLeg(CH, { orgId: ORG, callId: CALL });
+		await expect(
+			port.originate({
+				endpoint: "PJSIP/1002",
+				application: "engine",
+				channelId: CH,
+				target: { kind: "aor", aor: "sip:1002@realm" },
+			}),
+		).rejects.toThrow(/timeout/);
+		expect(sipd.hangupCalls[0]?.instanceId).toBe(INSTANCE);
+		expect(transport.on(RPC_SUBJECTS.mediaReleaseSession)).toHaveLength(1);
+	});
+
+	it("selects WebRTC and pins origination to the registered browser's contact and SIP owner", async () => {
+		const { port, transport, sipd } = newComposite();
+		sipd.resolveTarget = async () => ({
+			ok: true,
+			legId: CH,
+			instanceId: INSTANCE,
+			transport: "wss",
+			requestUri: "sip:browser@random.invalid;transport=ws",
+		});
+		transport.reply(RPC_SUBJECTS.mediaCreateOffer, { ok: true, sessionId: CH, sdpOffer: OFFER });
+		port.registerOutboundLeg(CH, { orgId: ORG, callId: CALL });
+		await port.originate({
+			endpoint: "PJSIP/1002",
+			application: "engine",
+			channelId: CH,
+			target: { kind: "aor", aor: "sip:1002@realm" },
+		});
+		expect(transport.on(RPC_SUBJECTS.mediaCreateOffer)[0]?.payload).toMatchObject({
+			transport: "webrtc",
+		});
+		expect(sipd.originateCalls[0]?.target).toEqual({
+			kind: "aor",
+			aor: "sip:1002@realm",
+			contactUri: "sip:browser@random.invalid;transport=ws",
+		});
+		expect(sipd.originateOwners).toEqual([INSTANCE]);
+	});
+
+	it("does not allocate media when the destination is unregistered", async () => {
+		const { port, transport, sipd } = newComposite();
+		sipd.resolveTarget = async () => ({ ok: false, legId: CH, reason: "unregistered_target" });
+		port.registerOutboundLeg(CH, { orgId: ORG, callId: CALL });
+		await expect(
+			port.originate({
+				endpoint: "PJSIP/1002",
+				application: "engine",
+				channelId: CH,
+				target: { kind: "aor", aor: "sip:1002@realm" },
+			}),
+		).rejects.toThrow(/refused by the sip edge/);
+		expect(transport.requests).toHaveLength(0);
+		expect(sipd.originateCalls).toHaveLength(0);
+	});
+
 	it("creates an offer, sends sipd.originate with target and offer, and records the instance", async () => {
 		const { port, transport, sipd } = newComposite();
 		transport.reply(RPC_SUBJECTS.mediaCreateOffer, {
@@ -174,6 +254,11 @@ describe("originate", () => {
 			endpoint: "PJSIP/1002",
 			application: "engine",
 			channelId: CH,
+			variables: {
+				"PJSIP_HEADER(add,Alert-Info)": "<sip:localhost>;info=alert-autoanswer",
+				"PJSIP_HEADER(add,Call-Info)": "<sip:localhost>;answer-after=0",
+				"PJSIP_HEADER(add,Authorization)": "must-not-forward",
+			},
 			target: { kind: "aor", aor: "sip:1002@realm" },
 		});
 
@@ -182,6 +267,11 @@ describe("originate", () => {
 		expect(sipd.originateCalls).toHaveLength(1);
 		expect(sipd.originateCalls[0]?.target).toEqual({ kind: "aor", aor: "sip:1002@realm" });
 		expect(sipd.originateCalls[0]?.sdpOffer).toBe(OFFER);
+
+		expect(sipd.originateCalls[0]?.headers).toEqual({
+			"Alert-Info": "<sip:localhost>;info=alert-autoanswer",
+			"Call-Info": "<sip:localhost>;answer-after=0",
+		});
 
 		// The reply's instance was recorded: a later hangup is addressed at it and not at nothing.
 		await port.hangup(CH, "NORMAL_CLEARING");
@@ -283,5 +373,115 @@ describe("delegation and refusals", () => {
 			expect((error as MediaOperationNotSupportedError).operation).toBe("echo");
 			expect((error as MediaOperationNotSupportedError).driver).toBe("split-plane");
 		}
+	});
+});
+
+describe("remote SDP renegotiation", () => {
+	it("refuses another tenant, call, SIP owner and an ended leg before media allocation", async () => {
+		const { port, transport } = newComposite();
+		port.registerInboundLeg(CH, {
+			orgId: ORG,
+			callId: CALL,
+			sipdInstanceId: INSTANCE,
+			sdpOffer: OFFER,
+		});
+		const request = {
+			legId: CH,
+			orgId: ORG,
+			callId: CALL,
+			sipdInstanceId: INSTANCE,
+			sdpOffer: OFFER,
+		};
+		for (const invalid of [
+			{ ...request, orgId: "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b50" },
+			{ ...request, callId: "other" },
+			{ ...request, sipdInstanceId: "another-edge" },
+		]) {
+			expect(await port.renegotiate(invalid)).toEqual({
+				ok: false,
+				legId: CH,
+				reason: "unknown_leg",
+			});
+		}
+		port.forget(CH);
+		expect((await port.renegotiate(request)).reason).toBe("unknown_leg");
+		expect(transport.requests).toHaveLength(0);
+	});
+
+	it("returns the media answer for the existing session and surfaces a refused offer", async () => {
+		const { port, transport } = newComposite();
+		port.registerInboundLeg(CH, {
+			orgId: ORG,
+			callId: CALL,
+			sipdInstanceId: INSTANCE,
+			sdpOffer: OFFER,
+		});
+		const answer = OFFER + "a=recvonly\r\n";
+		transport.reply(RPC_SUBJECTS.mediaAllocateSession, {
+			ok: true,
+			sessionId: CH,
+			sdpAnswer: answer,
+		});
+		const request = {
+			legId: CH,
+			orgId: ORG,
+			callId: CALL,
+			sipdInstanceId: INSTANCE,
+			sdpOffer: OFFER + "a=sendonly\r\n",
+		};
+		expect(await port.renegotiate(request)).toEqual({ ok: true, legId: CH, sdpAnswer: answer });
+		expect(transport.on(RPC_SUBJECTS.mediaAllocateSession)[0]?.payload).toMatchObject({
+			sessionId: CH,
+			sdpOffer: request.sdpOffer,
+		});
+		transport.reply(RPC_SUBJECTS.mediaAllocateSession, {
+			ok: false,
+			sessionId: CH,
+			reason: "not_supported",
+		});
+		expect((await port.renegotiate(request)).reason).toBe("not_supported");
+	});
+
+	it("bounds the RPC input and refuses renegotiation during shutdown", async () => {
+		const { port, transport } = newComposite();
+		const service = new SipRenegotiateService(
+			{ ENGINE_INSTANCE_ID: "engine-test" } as never,
+			{} as never,
+			port,
+		);
+		expect((await service.answer(new TextEncoder().encode("{"))).reason).toBe("bad_request");
+		service.onApplicationShutdown();
+		const request = {
+			legId: CH,
+			orgId: ORG,
+			callId: CALL,
+			sipdInstanceId: INSTANCE,
+			sdpOffer: OFFER,
+		};
+		expect((await service.answer(new TextEncoder().encode(JSON.stringify(request)))).reason).toBe(
+			"shutting_down",
+		);
+		expect(transport.requests).toHaveLength(0);
+	});
+});
+
+describe("remote hangup cleanup", () => {
+	it("releases the media session without sending another SIP hangup", async () => {
+		const { port, transport, sipd } = newComposite();
+		port.registerInboundLeg(CH, {
+			orgId: ORG,
+			callId: CALL,
+			sipdInstanceId: INSTANCE,
+			sdpOffer: OFFER,
+		});
+		await port.answer(CH);
+		await port.releaseEndedLeg(CH);
+		expect(
+			transport.requests.some((request) =>
+				request.subject.startsWith(RPC_SUBJECTS.mediaReleaseSession),
+			),
+		).toBe(true);
+		expect(sipd.hangupCalls).toHaveLength(0);
+		await expect(port.ring(CH)).rejects.toThrow(SplitPlaneLegStateError);
 	});
 });

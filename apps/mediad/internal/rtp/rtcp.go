@@ -179,7 +179,7 @@ func (s *Session) RunRTCP(ctx context.Context) error {
 
 	buf := make([]byte, maxPacketSize)
 	for {
-		n, from, err := s.ports.RTCP.ReadFromUDP(buf)
+		n, from, err := s.readRTCP(buf)
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) || s.isClosed() {
 				return nil
@@ -316,7 +316,7 @@ func (s *Session) sendSenderReport(now time.Time) {
 	binary.BigEndian.PutUint32(report[24:28], octets)
 
 	rtcpAddr := &net.UDPAddr{IP: remote.IP, Port: remote.Port + 1, Zone: remote.Zone}
-	if _, err := s.ports.RTCP.WriteToUDP(report, rtcpAddr); err != nil {
+	if _, err := s.writeRTCP(report, rtcpAddr); err != nil {
 		s.log.Debug("cannot send an RTCP sender report", "error", err, "remote", rtcpAddr.String())
 		return
 	}

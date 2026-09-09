@@ -1,4 +1,5 @@
-import { boolean, index, jsonb, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { boolean, check, index, jsonb, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
 import {
 	auditTimestampColumns,
 	tenantOrganizationIdColumn,
@@ -75,6 +76,18 @@ export const orgSetting = pgTable.withRLS(
 			table.name,
 		),
 		index("org_setting_organization_category_idx").on(table.organizationId, table.category),
+		uniqueIndex("org_setting_sip_realm_global_key")
+			.on(sql`lower(btrim(${table.value} #>> '{}'))`)
+			.where(sql`${table.category} = 'sip' AND ${table.name} = 'realm' AND ${table.enabled}`),
+		check(
+			"org_setting_sip_realm_value_check",
+			sql`
+			${table.category} <> 'sip' OR ${table.name} <> 'realm'
+			OR ${table.value} IS NULL OR ${table.value} = 'null'::jsonb OR (
+				jsonb_typeof(${table.value}) = 'string'
+				AND length(btrim(${table.value} #>> '{}')) BETWEEN 1 AND 253
+			)`,
+		),
 		tenantIsolationPolicy("org_setting"),
 	],
 );

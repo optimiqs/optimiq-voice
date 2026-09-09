@@ -107,5 +107,6 @@ export function shapeSoftphoneCredentials(
 		voicemailNumber: account.voicemailNumber,
 		webrtcSupported: media.webrtcSupported,
 		mediaNote: media.note,
+		iceServers: media.iceServers?.map((server) => ({ ...server, urls: [...server.urls] })) ?? [],
 	};
 }

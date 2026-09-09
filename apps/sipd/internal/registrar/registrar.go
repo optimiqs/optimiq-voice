@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/emiago/sipgo/sip"
+	location "github.com/optimiqs/optimiq-voice/apps/sipd/internal/aor"
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/credentials"
@@ -48,6 +49,8 @@ const allowedMethods = "REGISTER, OPTIONS, REFER, SUBSCRIBE"
 // Options configures a Registrar. Every dependency is an interface so the unit tests run without a
 // broker, a socket or a clock.
 type Options struct {
+	InstanceID  string
+	MaxContacts int
 	// Realm is the digest realm. It must match the Authenticator's.
 	Realm string
 	Auth  *Authenticator
@@ -87,12 +90,14 @@ type Options struct {
 // independent registrars in one process and a future multi-realm edge is a matter of constructing
 // more of them.
 type Registrar struct {
-	realm     string
-	auth      *Authenticator
-	expiry    ExpiryPolicy
-	creds     credentials.Store
-	bindings  kv.Store
-	publisher events.Publisher
+	instanceID  string
+	maxContacts int
+	realm       string
+	auth        *Authenticator
+	expiry      ExpiryPolicy
+	creds       credentials.Store
+	bindings    kv.Store
+	publisher   events.Publisher
 
 	log           *slog.Logger
 	source        string
@@ -132,6 +137,8 @@ func New(opts Options) (*Registrar, error) {
 	}
 
 	registrar := &Registrar{
+		instanceID:    opts.InstanceID,
+		maxContacts:   opts.MaxContacts,
 		realm:         opts.Realm,
 		auth:          opts.Auth,
 		expiry:        opts.Expiry,
@@ -150,6 +157,12 @@ func New(opts Options) (*Registrar, error) {
 	}
 	if registrar.log == nil {
 		registrar.log = slog.Default()
+	}
+	if registrar.maxContacts == 0 {
+		registrar.maxContacts = 5
+	}
+	if registrar.maxContacts < 1 || registrar.maxContacts > location.MaxStoredContacts {
+		return nil, fmt.Errorf("registrar: MaxContacts must be between 1 and %d", location.MaxStoredContacts)
 	}
 	if registrar.source == "" {
 		registrar.source = "sipd"
@@ -176,12 +189,7 @@ func New(opts Options) (*Registrar, error) {
 // SIP handlers
 // ---------------------------------------------------------------------------------------------
 
-// HandleRegister implements RFC 3261 §10.3 for a single binding per AOR.
-//
-// Multiple simultaneous contacts per AOR (one desk phone plus one softphone, which is what makes
-// forking useful) are NOT supported yet: the location model is one binding per AOR, and adding the
-// second is a change to the KV value shape as well as to this handler. It is the first thing the
-// proxy wave will need.
+// HandleRegister authenticates and atomically updates every Contact in one REGISTER.
 func (r *Registrar) HandleRegister(req *sip.Request, tx sip.ServerTransaction) {
 	ctx, cancel := context.WithTimeout(r.baseCtx, r.opTimeout)
 	defer cancel()
@@ -220,46 +228,7 @@ func (r *Registrar) HandleRegister(req *sip.Request, tx sip.ServerTransaction) {
 		return
 	}
 
-	contact, ok := contacts[0].(*sip.ContactHeader)
-	if !ok {
-		log.Info("rejecting a REGISTER with an unparsable Contact")
-		r.respond(tx, req, statusBadRequest, "Bad Request")
-		return
-	}
-
-	headerExpires, headerStated := expiresHeader(req)
-
-	if contact.Address.Wildcard {
-		// `Contact: *` is only legal with Expires: 0, and means "drop everything for this AOR".
-		if !headerStated || headerExpires != 0 {
-			log.Info("rejecting a wildcard Contact without Expires: 0")
-			r.respond(tx, req, statusBadRequest, "Bad Request")
-			return
-		}
-		r.unbind(ctx, req, tx, credential, aor, aorHash, log)
-		return
-	}
-
-	requested, stated := contactExpires(contact, headerExpires, headerStated)
-	granted, err := r.expiry.Grant(requested, stated)
-	if errors.Is(err, ErrIntervalTooBrief) {
-		log.Info("rejecting a too-brief registration", "requestedSeconds", int(requested/time.Second))
-		res := sip.NewResponseFromRequest(req, statusIntervalTooBrief, "Interval Too Brief", nil)
-		res.AppendHeader(sip.NewHeader("Min-Expires", strconv.Itoa(r.expiry.MinSeconds())))
-		r.send(tx, res)
-		return
-	}
-	if err != nil {
-		log.Error("cannot resolve the registration interval", "error", err)
-		r.respond(tx, req, statusServerError, "Server Internal Error")
-		return
-	}
-
-	if granted == 0 {
-		r.unbind(ctx, req, tx, credential, aor, aorHash, log)
-		return
-	}
-	r.bind(ctx, req, tx, credential, aor, aorHash, contact, granted, log)
+	r.updateRegistration(ctx, req, tx, credential, aor, aorHash, contacts, log)
 }
 
 // HandleOptions answers the keepalive every SIP element on the planet uses to decide whether we are
@@ -310,6 +279,7 @@ func (r *Registrar) authorize(
 	aorUser string,
 	log *slog.Logger,
 ) (credentials.Credential, bool) {
+	accountAuth := r.auth.ForRequest(req)
 	auth, err := ParseAuthorization(headerValue(req, "Authorization"))
 	if err != nil {
 		if errors.Is(err, ErrNoAuthorization) {
@@ -321,12 +291,12 @@ func (r *Registrar) authorize(
 		return credentials.Credential{}, false
 	}
 
-	if auth.Realm != r.realm {
+	if auth.Realm != accountAuth.Realm() {
 		log.Info("re-challenging a credential for another realm", "offeredRealm", auth.Realm)
 		r.challenge(req, tx, false, log)
 		return credentials.Credential{}, false
 	}
-	if err := r.auth.CheckNonce(auth.Nonce); err != nil {
+	if err := accountAuth.CheckNonce(auth.Nonce); err != nil {
 		r.challenge(req, tx, errors.Is(err, ErrNonceStale), log)
 		return credentials.Credential{}, false
 	}
@@ -340,7 +310,7 @@ func (r *Registrar) authorize(
 		return credentials.Credential{}, false
 	}
 
-	credential, err := r.creds.Lookup(ctx, r.realm, auth.Username)
+	credential, err := r.creds.Lookup(ctx, accountAuth.Realm(), auth.Username)
 	if err != nil {
 		// Unknown and disabled are logged apart and answered the same.
 		switch {
@@ -355,7 +325,7 @@ func (r *Registrar) authorize(
 		return credentials.Credential{}, false
 	}
 
-	if err := r.auth.Verify(req.Method.String(), auth, credential.HA1); err != nil {
+	if err := accountAuth.VerifyRequest(req, auth, credential.HA1); err != nil {
 		if errors.Is(err, ErrNonceStale) {
 			r.challenge(req, tx, true, log)
 			return credentials.Credential{}, false
@@ -371,163 +341,6 @@ func (r *Registrar) authorize(
 // ---------------------------------------------------------------------------------------------
 // binding lifecycle
 // ---------------------------------------------------------------------------------------------
-
-func (r *Registrar) bind(
-	ctx context.Context,
-	req *sip.Request,
-	tx sip.ServerTransaction,
-	credential credentials.Credential,
-	aor, aorHash string,
-	contact *sip.ContactHeader,
-	granted time.Duration,
-	log *slog.Logger,
-) {
-	now := r.now()
-
-	previous, existed, err := r.bindings.Get(ctx, credential.OrgID, aorHash)
-	if err != nil {
-		log.Error("cannot read the existing binding", "error", err)
-		r.respond(tx, req, statusServerError, "Server Internal Error")
-		return
-	}
-
-	registeredAt := now
-	if existed {
-		// A refresh extends a binding, it does not create one. Keeping the original instant is what
-		// makes `registeredForSeconds` on the eventual `expired` event mean anything.
-		registeredAt = previous.RegisteredAt.Time
-	}
-
-	binding := kv.Binding{
-		OrgID:            credential.OrgID,
-		AOR:              aor,
-		AORHash:          aorHash,
-		Contact:          contact.Address.String(),
-		Transport:        transportOf(req),
-		UserAgent:        headerValue(req, "User-Agent"),
-		SourceAddress:    req.Source(),
-		DeviceID:         credential.DeviceID,
-		ExtensionID:      credential.ExtensionID,
-		SharedLineNumber: credential.SharedLineNumber,
-		AppearanceIndex:  credential.AppearanceIndex,
-		CallID:           headerValue(req, "Call-ID"),
-		CSeq:             cseqOf(req),
-		Instance:         paramOr(contact, "+sip.instance"),
-		RegisteredAt:     contract.NewEventTime(registeredAt),
-		ExpiresAt:        contract.NewEventTime(now.Add(granted)),
-		ExpiresInSeconds: int(granted / time.Second),
-	}
-
-	// KV first, event second, response last. The location service is the truth a call is routed
-	// against; telling a phone it is registered before the binding is durable would make the next
-	// INVITE ring into nothing.
-	if err := r.bindings.Put(ctx, binding); err != nil {
-		log.Error("cannot store the binding", "error", err)
-		r.respond(tx, req, statusServerError, "Server Internal Error")
-		return
-	}
-
-	key, err := binding.Key()
-	if err == nil {
-		r.mu.Lock()
-		r.tracked[key] = binding
-		r.mu.Unlock()
-	}
-
-	refreshed := existed
-	envelope, err := contract.NewRegistrationRegisteredEnvelope(
-		contract.EnvelopeInput[contract.RegistrationRegisteredData]{
-			OrgID:  binding.OrgID,
-			Source: r.source,
-			At:     now,
-			Data: contract.RegistrationRegisteredData{
-				AOR:              binding.AOR,
-				Contact:          binding.Contact,
-				Transport:        binding.Transport,
-				UserAgent:        optional(binding.UserAgent),
-				SourceAddress:    optional(binding.SourceAddress),
-				DeviceID:         optional(binding.DeviceID),
-				ExtensionID:      optional(binding.ExtensionID),
-				ExpiresInSeconds: binding.ExpiresInSeconds,
-				Refreshed:        &refreshed,
-			},
-		})
-	if err != nil {
-		log.Error("cannot build the registered event", "error", err)
-	} else if err := r.publisher.Registered(ctx, envelope); err != nil {
-		// The binding is durable; the event is observability and presence. Failing the REGISTER now
-		// would drop a working device off the network because a stream was full.
-		log.Error("cannot publish the registered event", "error", err)
-	}
-
-	log.Info("registered",
-		"orgId", binding.OrgID,
-		"contact", binding.Contact,
-		"expiresSeconds", binding.ExpiresInSeconds,
-		"refreshed", refreshed,
-	)
-	r.send(tx, r.okWithBinding(req, binding))
-}
-
-func (r *Registrar) unbind(
-	ctx context.Context,
-	req *sip.Request,
-	tx sip.ServerTransaction,
-	credential credentials.Credential,
-	aor, aorHash string,
-	log *slog.Logger,
-) {
-	previous, existed, err := r.bindings.Get(ctx, credential.OrgID, aorHash)
-	if err != nil {
-		log.Error("cannot read the existing binding", "error", err)
-		r.respond(tx, req, statusServerError, "Server Internal Error")
-		return
-	}
-	if err := r.bindings.Delete(ctx, credential.OrgID, aorHash); err != nil {
-		log.Error("cannot delete the binding", "error", err)
-		r.respond(tx, req, statusServerError, "Server Internal Error")
-		return
-	}
-	if key, keyErr := contract.RegistrationKVKey(credential.OrgID, aorHash); keyErr == nil {
-		r.mu.Lock()
-		delete(r.tracked, key)
-		r.mu.Unlock()
-	}
-
-	// De-registration is idempotent: a device that sends Expires: 0 twice gets two 200s and one
-	// event. Publishing a second `unregistered` for a binding that was already gone would make the
-	// stream lie about how many devices dropped.
-	if existed {
-		reason := contract.RegistrationUnregisteredReasonClient
-		envelope, err := contract.NewRegistrationUnregisteredEnvelope(
-			contract.EnvelopeInput[contract.RegistrationUnregisteredData]{
-				OrgID:  credential.OrgID,
-				Source: r.source,
-				At:     r.now(),
-				Data: contract.RegistrationUnregisteredData{
-					AOR:           previous.AOR,
-					Contact:       previous.Contact,
-					Transport:     previous.Transport,
-					UserAgent:     optional(previous.UserAgent),
-					SourceAddress: optional(previous.SourceAddress),
-					DeviceID:      optional(previous.DeviceID),
-					ExtensionID:   optional(previous.ExtensionID),
-					Reason:        &reason,
-				},
-			})
-		if err != nil {
-			log.Error("cannot build the unregistered event", "error", err)
-		} else if err := r.publisher.Unregistered(ctx, envelope); err != nil {
-			log.Error("cannot publish the unregistered event", "error", err)
-		}
-	}
-
-	log.Info("unregistered", "orgId", credential.OrgID, "existed", existed)
-	_ = aor
-	res := sip.NewResponseFromRequest(req, statusOK, "OK", nil)
-	res.AppendHeader(sip.NewHeader("Server", r.server))
-	r.send(tx, res)
-}
 
 func (r *Registrar) respondWithCurrentBinding(
 	ctx context.Context,
@@ -592,57 +405,42 @@ func (r *Registrar) Run(ctx context.Context) error {
 	}
 }
 
-// Sweep expires every tracked binding whose deadline has passed and returns how many it removed.
-// Exported so tests can drive it directly instead of waiting for a tick.
+// Sweep removes only contacts that are still expired at the atomic write, so a refresh on
+// another SIP server cannot be deleted by this server's stale deadline.
 func (r *Registrar) Sweep(ctx context.Context) int {
-	now := r.now()
-
 	r.mu.Lock()
-	var lapsed []kv.Binding
-	for key, binding := range r.tracked {
-		if binding.Expired(now) {
-			lapsed = append(lapsed, binding)
-			delete(r.tracked, key)
-		}
+	tracked := make([]kv.Binding, 0, len(r.tracked))
+	for _, binding := range r.tracked {
+		tracked = append(tracked, binding)
 	}
 	r.mu.Unlock()
-
-	// The store and publish calls happen outside the lock: they are network I/O, and holding the
-	// registrar's mutex across them would stall every REGISTER on the box behind a slow broker.
-	for _, binding := range lapsed {
-		log := r.log.With("aor", binding.AOR, "orgId", binding.OrgID)
-
-		if err := r.bindings.Delete(ctx, binding.OrgID, binding.AORHash); err != nil {
-			log.Error("cannot delete a lapsed binding", "error", err)
-		}
-
-		registeredFor := int(binding.RegisteredFor(now) / time.Second)
-		envelope, err := contract.NewRegistrationExpiredEnvelope(
-			contract.EnvelopeInput[contract.RegistrationExpiredData]{
-				OrgID:  binding.OrgID,
-				Source: r.source,
-				At:     now,
-				Data: contract.RegistrationExpiredData{
-					AOR:                  binding.AOR,
-					Contact:              binding.Contact,
-					Transport:            binding.Transport,
-					UserAgent:            optional(binding.UserAgent),
-					SourceAddress:        optional(binding.SourceAddress),
-					DeviceID:             optional(binding.DeviceID),
-					ExtensionID:          optional(binding.ExtensionID),
-					RegisteredForSeconds: &registeredFor,
-				},
-			})
+	expired := 0
+	for _, hint := range tracked {
+		before, after, err := r.bindings.Update(ctx, hint.OrgID, hint.AORHash, func(previous *kv.Binding) (*kv.Binding, error) {
+			if previous == nil {
+				return nil, nil
+			}
+			live, removed := location.FromBinding(*previous).Expire(r.now())
+			if len(removed) == 0 {
+				return previous, nil
+			}
+			return bindingForSet(*previous, live, r.now()), nil
+		})
 		if err != nil {
-			log.Error("cannot build the expired event", "error", err)
+			r.log.Error("cannot sweep registration", "error", err)
 			continue
 		}
-		if err := r.publisher.Expired(ctx, envelope); err != nil {
-			log.Error("cannot publish the expired event", "error", err)
+		trackedBefore := before
+		if trackedBefore == nil {
+			trackedBefore = &hint
 		}
-		log.Info("expired", "registeredForSeconds", registeredFor)
+		r.trackChange(hint.OrgID, hint.AORHash, trackedBefore, after)
+		for _, contact := range removedContacts(before, after) {
+			r.publishRemoved(ctx, hint, contact, true)
+			expired++
+		}
 	}
-	return len(lapsed)
+	return expired
 }
 
 // Rehydrate adopts the bindings already in the bucket, so a restarted instance keeps expiring the
@@ -682,7 +480,7 @@ func (r *Registrar) TrackedBindings() int {
 // ---------------------------------------------------------------------------------------------
 
 func (r *Registrar) challenge(req *sip.Request, tx sip.ServerTransaction, stale bool, log *slog.Logger) {
-	value, err := r.auth.Challenge(stale)
+	value, err := r.auth.ForRequest(req).Challenge(stale)
 	if err != nil {
 		log.Error("cannot mint a digest challenge", "error", err)
 		r.respond(tx, req, statusServerError, "Server Internal Error")
@@ -706,10 +504,25 @@ func (r *Registrar) respond(tx sip.ServerTransaction, req *sip.Request, status i
 func (r *Registrar) okWithBinding(req *sip.Request, binding kv.Binding) *sip.Response {
 	res := sip.NewResponseFromRequest(req, statusOK, "OK", nil)
 
-	var uri sip.Uri
-	if err := sip.ParseUri(binding.Contact, &uri); err == nil {
+	now := r.now()
+	for _, contact := range location.FromBinding(binding).Contacts() {
+		if contact.Expired(now) {
+			continue
+		}
+		var uri sip.Uri
+		if err := sip.ParseUri(contact.URI, &uri); err != nil {
+			continue
+		}
 		params := sip.NewParams()
-		params.Add("expires", strconv.Itoa(binding.ExpiresInSeconds))
+		remaining := int((contact.ExpiresAt.Sub(now) + time.Second - 1) / time.Second)
+		params.Add("expires", strconv.Itoa(remaining))
+		params.Add("q", strconv.FormatFloat(contact.Q, 'f', 3, 64))
+		if contact.Instance != "" {
+			params.Add("+sip.instance", `"<`+contact.Instance+`>"`)
+		}
+		if contact.RegID > 0 {
+			params.Add("reg-id", strconv.Itoa(contact.RegID))
+		}
 		res.AppendHeader(&sip.ContactHeader{Address: uri, Params: params})
 	}
 	res.AppendHeader(sip.NewHeader("Expires", strconv.Itoa(binding.ExpiresInSeconds)))
@@ -771,8 +584,8 @@ func expiresHeader(req *sip.Request) (time.Duration, bool) {
 	if raw == "" {
 		return 0, false
 	}
-	seconds, err := strconv.Atoi(raw)
-	if err != nil || seconds < 0 {
+	seconds, err := strconv.ParseUint(raw, 10, 32)
+	if err != nil {
 		return 0, false
 	}
 	return time.Duration(seconds) * time.Second, true

@@ -29,6 +29,7 @@ const (
 	SubjectLastCallerRPC            = "rpc.pbx.v1.last-caller"
 	SubjectFileGreetingRPC          = "rpc.pbx.v1.file-greeting"
 	SubjectSipCredentialRPC         = "rpc.sip.v1.credential"
+	SubjectSipTrunkCredentialRPC    = "rpc.sip.v1.trunk-credential"
 	SubjectSipTransferRPC           = "rpc.sip.v1.transfer"
 	SubjectSipInviteRPC             = "rpc.sip.v1.invite"
 	SubjectSipRingRPC               = "rpc.sip.v1.ring"
@@ -36,6 +37,8 @@ const (
 	SubjectSipHangupRPC             = "rpc.sip.v1.hangup"
 	SubjectSipReinviteRPC           = "rpc.sip.v1.reinvite"
 	SubjectSipOriginateRPC          = "rpc.sip.v1.originate"
+	SubjectSipResolveTargetRPC      = "rpc.sip.v1.resolve-target"
+	SubjectEngineRenegotiateRPC     = "rpc.engine.v1.renegotiate"
 	SubjectMediaAllocateSessionRPC  = "rpc.media.v1.allocate-session"
 	SubjectMediaCreateOfferRPC      = "rpc.media.v1.create-offer"
 	SubjectMediaAcceptAnswerRPC     = "rpc.media.v1.accept-answer"
@@ -66,6 +69,7 @@ const (
 	TimeoutLastCallerRPC            = 3000 * time.Millisecond
 	TimeoutFileGreetingRPC          = 5000 * time.Millisecond
 	TimeoutSipCredentialRPC         = 500 * time.Millisecond
+	TimeoutSipTrunkCredentialRPC    = 5000 * time.Millisecond
 	TimeoutSipTransferRPC           = 2000 * time.Millisecond
 	TimeoutSipInviteRPC             = 1000 * time.Millisecond
 	TimeoutSipRingRPC               = 500 * time.Millisecond
@@ -73,6 +77,8 @@ const (
 	TimeoutSipHangupRPC             = 500 * time.Millisecond
 	TimeoutSipReinviteRPC           = 1000 * time.Millisecond
 	TimeoutSipOriginateRPC          = 1000 * time.Millisecond
+	TimeoutSipResolveTargetRPC      = 2000 * time.Millisecond
+	TimeoutEngineRenegotiateRPC     = 4000 * time.Millisecond
 	TimeoutMediaAllocateSessionRPC  = 500 * time.Millisecond
 	TimeoutMediaCreateOfferRPC      = 500 * time.Millisecond
 	TimeoutMediaAcceptAnswerRPC     = 500 * time.Millisecond
@@ -465,10 +471,89 @@ type SipCredentialResponse struct {
 	Ha1              *string `json:"ha1,omitempty"`
 	DeviceID         *string `json:"deviceId,omitempty"`
 	ExtensionID      *string `json:"extensionId,omitempty"`
+	MaxRegistrations *int    `json:"maxRegistrations,omitempty"`
 	SharedLineNumber *string `json:"sharedLineNumber,omitempty"`
 	AppearanceIndex  *int    `json:"appearanceIndex,omitempty"`
 	Reason           *string `json:"reason,omitempty"`
 }
+
+// SipTrunkCredentialRequest is the request body of rpc.sip.v1.trunk-credential.
+type SipTrunkCredentialRequest struct {
+	OrgID     string                             `json:"orgId"`
+	TrunkID   string                             `json:"trunkId"`
+	SecretRef string                             `json:"secretRef"`
+	Username  string                             `json:"username"`
+	Realm     string                             `json:"realm"`
+	Algorithm SipTrunkCredentialRequestAlgorithm `json:"algorithm"`
+}
+
+// SipTrunkCredentialRequestAlgorithm is the closed vocabulary of SipTrunkCredentialRequest.algorithm.
+type SipTrunkCredentialRequestAlgorithm string
+
+const (
+	SipTrunkCredentialRequestAlgorithmMd5       SipTrunkCredentialRequestAlgorithm = "MD5"
+	SipTrunkCredentialRequestAlgorithmSha256    SipTrunkCredentialRequestAlgorithm = "SHA-256"
+	SipTrunkCredentialRequestAlgorithmSha512256 SipTrunkCredentialRequestAlgorithm = "SHA-512-256"
+)
+
+// SipTrunkCredentialRequestAlgorithmValues lists every member of the vocabulary, in contract order.
+var SipTrunkCredentialRequestAlgorithmValues = []SipTrunkCredentialRequestAlgorithm{
+	SipTrunkCredentialRequestAlgorithmMd5,
+	SipTrunkCredentialRequestAlgorithmSha256,
+	SipTrunkCredentialRequestAlgorithmSha512256,
+}
+
+// Valid reports whether v is a member of the SipTrunkCredentialRequestAlgorithm vocabulary.
+func (v SipTrunkCredentialRequestAlgorithm) Valid() bool {
+	for _, candidate := range SipTrunkCredentialRequestAlgorithmValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SipTrunkCredentialRequestAlgorithm) String() string { return string(v) }
+
+// SipTrunkCredentialResponse is the reply body of rpc.sip.v1.trunk-credential.
+type SipTrunkCredentialResponse struct {
+	Ok        bool                                 `json:"ok"`
+	OrgID     *string                              `json:"orgId,omitempty"`
+	TrunkID   *string                              `json:"trunkId,omitempty"`
+	Username  *string                              `json:"username,omitempty"`
+	Realm     *string                              `json:"realm,omitempty"`
+	Algorithm *SipTrunkCredentialResponseAlgorithm `json:"algorithm,omitempty"`
+	Ha1       *string                              `json:"ha1,omitempty"`
+	Reason    *string                              `json:"reason,omitempty"`
+}
+
+// SipTrunkCredentialResponseAlgorithm is the closed vocabulary of SipTrunkCredentialResponse.algorithm.
+type SipTrunkCredentialResponseAlgorithm string
+
+const (
+	SipTrunkCredentialResponseAlgorithmMd5       SipTrunkCredentialResponseAlgorithm = "MD5"
+	SipTrunkCredentialResponseAlgorithmSha256    SipTrunkCredentialResponseAlgorithm = "SHA-256"
+	SipTrunkCredentialResponseAlgorithmSha512256 SipTrunkCredentialResponseAlgorithm = "SHA-512-256"
+)
+
+// SipTrunkCredentialResponseAlgorithmValues lists every member of the vocabulary, in contract order.
+var SipTrunkCredentialResponseAlgorithmValues = []SipTrunkCredentialResponseAlgorithm{
+	SipTrunkCredentialResponseAlgorithmMd5,
+	SipTrunkCredentialResponseAlgorithmSha256,
+	SipTrunkCredentialResponseAlgorithmSha512256,
+}
+
+// Valid reports whether v is a member of the SipTrunkCredentialResponseAlgorithm vocabulary.
+func (v SipTrunkCredentialResponseAlgorithm) Valid() bool {
+	for _, candidate := range SipTrunkCredentialResponseAlgorithmValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SipTrunkCredentialResponseAlgorithm) String() string { return string(v) }
 
 // SipTransferRequest is the request body of rpc.sip.v1.transfer.
 type SipTransferRequest struct {
@@ -1034,24 +1119,26 @@ func (v SipReinviteResponseReason) String() string { return string(v) }
 
 // SipOriginateRequest is the request body of rpc.sip.v1.originate.
 type SipOriginateRequest struct {
-	LegID          string                    `json:"legId"`
-	OrgID          string                    `json:"orgId"`
-	CallID         string                    `json:"callId"`
-	Target         SipOriginateRequestTarget `json:"target"`
-	CallerIDNumber *string                   `json:"callerIdNumber,omitempty"`
-	CallerIDName   *string                   `json:"callerIdName,omitempty"`
-	SDPOffer       string                    `json:"sdpOffer"`
-	RingTimeoutMs  *int                      `json:"ringTimeoutMs,omitempty"`
-	Headers        map[string]string         `json:"headers,omitempty"`
+	LegID            string                    `json:"legId"`
+	EngineInstanceID *string                   `json:"engineInstanceId,omitempty"`
+	OrgID            string                    `json:"orgId"`
+	CallID           string                    `json:"callId"`
+	Target           SipOriginateRequestTarget `json:"target"`
+	CallerIDNumber   *string                   `json:"callerIdNumber,omitempty"`
+	CallerIDName     *string                   `json:"callerIdName,omitempty"`
+	SDPOffer         string                    `json:"sdpOffer"`
+	RingTimeoutMs    *int                      `json:"ringTimeoutMs,omitempty"`
+	Headers          map[string]string         `json:"headers,omitempty"`
 }
 
 // SipOriginateRequestTarget is a payload fragment of the contract.
 type SipOriginateRequestTarget struct {
-	Kind    SipOriginateRequestTargetKind `json:"kind"`
-	AOR     *string                       `json:"aor,omitempty"`
-	TrunkID *string                       `json:"trunkId,omitempty"`
-	Number  *string                       `json:"number,omitempty"`
-	URI     *string                       `json:"uri,omitempty"`
+	Kind       SipOriginateRequestTargetKind `json:"kind"`
+	AOR        *string                       `json:"aor,omitempty"`
+	ContactURI *string                       `json:"contactUri,omitempty"`
+	TrunkID    *string                       `json:"trunkId,omitempty"`
+	Number     *string                       `json:"number,omitempty"`
+	URI        *string                       `json:"uri,omitempty"`
 }
 
 // SipOriginateRequestTargetKind is the closed vocabulary of SipOriginateRequestTarget.kind.
@@ -1138,6 +1225,166 @@ func (v SipOriginateResponseReason) Valid() bool {
 }
 
 func (v SipOriginateResponseReason) String() string { return string(v) }
+
+// SipResolveTargetRequest is the request body of rpc.sip.v1.resolve-target.
+type SipResolveTargetRequest struct {
+	LegID  string                        `json:"legId"`
+	OrgID  string                        `json:"orgId"`
+	Target SipResolveTargetRequestTarget `json:"target"`
+}
+
+// SipResolveTargetRequestTarget is a payload fragment of the contract.
+type SipResolveTargetRequestTarget struct {
+	Kind       SipResolveTargetRequestTargetKind `json:"kind"`
+	AOR        *string                           `json:"aor,omitempty"`
+	ContactURI *string                           `json:"contactUri,omitempty"`
+	TrunkID    *string                           `json:"trunkId,omitempty"`
+	Number     *string                           `json:"number,omitempty"`
+	URI        *string                           `json:"uri,omitempty"`
+}
+
+// SipResolveTargetRequestTargetKind is the closed vocabulary of SipResolveTargetRequestTarget.kind.
+type SipResolveTargetRequestTargetKind string
+
+const (
+	SipResolveTargetRequestTargetKindAOR   SipResolveTargetRequestTargetKind = "aor"
+	SipResolveTargetRequestTargetKindTrunk SipResolveTargetRequestTargetKind = "trunk"
+	SipResolveTargetRequestTargetKindURI   SipResolveTargetRequestTargetKind = "uri"
+)
+
+// SipResolveTargetRequestTargetKindValues lists every member of the vocabulary, in contract order.
+var SipResolveTargetRequestTargetKindValues = []SipResolveTargetRequestTargetKind{
+	SipResolveTargetRequestTargetKindAOR,
+	SipResolveTargetRequestTargetKindTrunk,
+	SipResolveTargetRequestTargetKindURI,
+}
+
+// Valid reports whether v is a member of the SipResolveTargetRequestTargetKind vocabulary.
+func (v SipResolveTargetRequestTargetKind) Valid() bool {
+	for _, candidate := range SipResolveTargetRequestTargetKindValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SipResolveTargetRequestTargetKind) String() string { return string(v) }
+
+// SipResolveTargetResponse is the reply body of rpc.sip.v1.resolve-target.
+type SipResolveTargetResponse struct {
+	Contacts   []SipResolveTargetResponseContacts `json:"contacts,omitempty"`
+	Ok         bool                               `json:"ok"`
+	LegID      string                             `json:"legId"`
+	InstanceID *string                            `json:"instanceId,omitempty"`
+	Reason     *SipResolveTargetResponseReason    `json:"reason,omitempty"`
+	Error      *string                            `json:"error,omitempty"`
+	RequestURI *string                            `json:"requestUri,omitempty"`
+	Transport  *SIPTransport                      `json:"transport,omitempty"`
+}
+
+// SipResolveTargetResponseContacts is a payload fragment of the contract.
+type SipResolveTargetResponseContacts struct {
+	RequestURI string       `json:"requestUri"`
+	Transport  SIPTransport `json:"transport"`
+	InstanceID string       `json:"instanceId"`
+	Q          float64      `json:"q"`
+}
+
+// SipResolveTargetResponseReason is the closed vocabulary of SipResolveTargetResponse.reason.
+type SipResolveTargetResponseReason string
+
+const (
+	SipResolveTargetResponseReasonBadRequest         SipResolveTargetResponseReason = "bad_request"
+	SipResolveTargetResponseReasonUnknownDialog      SipResolveTargetResponseReason = "unknown_dialog"
+	SipResolveTargetResponseReasonWrongInstance      SipResolveTargetResponseReason = "wrong_instance"
+	SipResolveTargetResponseReasonDialogGone         SipResolveTargetResponseReason = "dialog_gone"
+	SipResolveTargetResponseReasonInvalidState       SipResolveTargetResponseReason = "invalid_state"
+	SipResolveTargetResponseReasonUnregisteredTarget SipResolveTargetResponseReason = "unregistered_target"
+	SipResolveTargetResponseReasonUnknownTrunk       SipResolveTargetResponseReason = "unknown_trunk"
+	SipResolveTargetResponseReasonNoRoute            SipResolveTargetResponseReason = "no_route"
+	SipResolveTargetResponseReasonCapacity           SipResolveTargetResponseReason = "capacity"
+	SipResolveTargetResponseReasonShuttingDown       SipResolveTargetResponseReason = "shutting_down"
+	SipResolveTargetResponseReasonNotSupported       SipResolveTargetResponseReason = "not_supported"
+	SipResolveTargetResponseReasonInternal           SipResolveTargetResponseReason = "internal"
+)
+
+// SipResolveTargetResponseReasonValues lists every member of the vocabulary, in contract order.
+var SipResolveTargetResponseReasonValues = []SipResolveTargetResponseReason{
+	SipResolveTargetResponseReasonBadRequest,
+	SipResolveTargetResponseReasonUnknownDialog,
+	SipResolveTargetResponseReasonWrongInstance,
+	SipResolveTargetResponseReasonDialogGone,
+	SipResolveTargetResponseReasonInvalidState,
+	SipResolveTargetResponseReasonUnregisteredTarget,
+	SipResolveTargetResponseReasonUnknownTrunk,
+	SipResolveTargetResponseReasonNoRoute,
+	SipResolveTargetResponseReasonCapacity,
+	SipResolveTargetResponseReasonShuttingDown,
+	SipResolveTargetResponseReasonNotSupported,
+	SipResolveTargetResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the SipResolveTargetResponseReason vocabulary.
+func (v SipResolveTargetResponseReason) Valid() bool {
+	for _, candidate := range SipResolveTargetResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v SipResolveTargetResponseReason) String() string { return string(v) }
+
+// EngineRenegotiateRequest is the request body of rpc.engine.v1.renegotiate.
+type EngineRenegotiateRequest struct {
+	LegID          string `json:"legId"`
+	OrgID          string `json:"orgId"`
+	CallID         string `json:"callId"`
+	SipdInstanceID string `json:"sipdInstanceId"`
+	SDPOffer       string `json:"sdpOffer"`
+}
+
+// EngineRenegotiateResponse is the reply body of rpc.engine.v1.renegotiate.
+type EngineRenegotiateResponse struct {
+	Ok        bool                             `json:"ok"`
+	LegID     string                           `json:"legId"`
+	SDPAnswer *string                          `json:"sdpAnswer,omitempty"`
+	Reason    *EngineRenegotiateResponseReason `json:"reason,omitempty"`
+}
+
+// EngineRenegotiateResponseReason is the closed vocabulary of EngineRenegotiateResponse.reason.
+type EngineRenegotiateResponseReason string
+
+const (
+	EngineRenegotiateResponseReasonBadRequest   EngineRenegotiateResponseReason = "bad_request"
+	EngineRenegotiateResponseReasonUnknownLeg   EngineRenegotiateResponseReason = "unknown_leg"
+	EngineRenegotiateResponseReasonNotSupported EngineRenegotiateResponseReason = "not_supported"
+	EngineRenegotiateResponseReasonShuttingDown EngineRenegotiateResponseReason = "shutting_down"
+	EngineRenegotiateResponseReasonInternal     EngineRenegotiateResponseReason = "internal"
+)
+
+// EngineRenegotiateResponseReasonValues lists every member of the vocabulary, in contract order.
+var EngineRenegotiateResponseReasonValues = []EngineRenegotiateResponseReason{
+	EngineRenegotiateResponseReasonBadRequest,
+	EngineRenegotiateResponseReasonUnknownLeg,
+	EngineRenegotiateResponseReasonNotSupported,
+	EngineRenegotiateResponseReasonShuttingDown,
+	EngineRenegotiateResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the EngineRenegotiateResponseReason vocabulary.
+func (v EngineRenegotiateResponseReason) Valid() bool {
+	for _, candidate := range EngineRenegotiateResponseReasonValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v EngineRenegotiateResponseReason) String() string { return string(v) }
 
 // MediaAllocateSessionRequest is the request body of rpc.media.v1.allocate-session.
 type MediaAllocateSessionRequest struct {
@@ -1259,12 +1506,39 @@ func (v MediaAllocateSessionResponseReason) String() string { return string(v) }
 
 // MediaCreateOfferRequest is the request body of rpc.media.v1.create-offer.
 type MediaCreateOfferRequest struct {
-	SessionID string                           `json:"sessionId"`
-	OrgID     string                           `json:"orgId"`
-	CallID    string                           `json:"callId"`
-	LegID     *string                          `json:"legId,omitempty"`
-	Direction MediaCreateOfferRequestDirection `json:"direction"`
+	SessionID string                            `json:"sessionId"`
+	Transport *MediaCreateOfferRequestTransport `json:"transport,omitempty"`
+	OrgID     string                            `json:"orgId"`
+	CallID    string                            `json:"callId"`
+	LegID     *string                           `json:"legId,omitempty"`
+	Direction MediaCreateOfferRequestDirection  `json:"direction"`
 }
+
+// MediaCreateOfferRequestTransport is the closed vocabulary of MediaCreateOfferRequest.transport.
+type MediaCreateOfferRequestTransport string
+
+const (
+	MediaCreateOfferRequestTransportRtp    MediaCreateOfferRequestTransport = "rtp"
+	MediaCreateOfferRequestTransportWebrtc MediaCreateOfferRequestTransport = "webrtc"
+)
+
+// MediaCreateOfferRequestTransportValues lists every member of the vocabulary, in contract order.
+var MediaCreateOfferRequestTransportValues = []MediaCreateOfferRequestTransport{
+	MediaCreateOfferRequestTransportRtp,
+	MediaCreateOfferRequestTransportWebrtc,
+}
+
+// Valid reports whether v is a member of the MediaCreateOfferRequestTransport vocabulary.
+func (v MediaCreateOfferRequestTransport) Valid() bool {
+	for _, candidate := range MediaCreateOfferRequestTransportValues {
+		if v == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (v MediaCreateOfferRequestTransport) String() string { return string(v) }
 
 // MediaCreateOfferRequestDirection is the closed vocabulary of MediaCreateOfferRequest.direction.
 type MediaCreateOfferRequestDirection string

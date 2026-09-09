@@ -693,6 +693,21 @@ describe("recording (rung 4)", () => {
 		expect(objectKey).toBe("org/call/rec-1.wav");
 	});
 
+	it("records both directions through the call-control conversation operation", async () => {
+		const { port, transport } = newPort();
+		await port.recordConversation(SESSION, {
+			name: "conversation",
+			format: "wav",
+			maxDurationSeconds: 30,
+		});
+		expect(transport.on(RPC_SUBJECTS.mediaStartRecording)[0]?.payload).toMatchObject({
+			sessionId: SESSION,
+			recordingRef: "conversation",
+			direction: "both",
+			maxDurationMs: 30_000,
+		});
+	});
+
 	it("stops a recording by reference alone", async () => {
 		const { port, transport } = newPort();
 		await port.stopRecording("rec-1");

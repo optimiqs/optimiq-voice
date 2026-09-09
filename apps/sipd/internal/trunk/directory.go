@@ -14,103 +14,38 @@ import (
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 )
 
-// Record is one trunk as the `trunks` KV bucket holds it.
-//
-// # Why this struct is declared here and what that costs
-//
-// `contract.TrunksKV` defines the BUCKET — its name, TTL, storage and limits — and
-// `contract.TrunkKVKey` defines the key. Neither packages/events nor packages/events-go defines the
-// VALUE: there is no `trunkDirectoryEntrySchema` beside `registrationBindingSchema` and
-// `mediaSessionDirectoryEntrySchema`, and no generated Go struct to unmarshal into. So this is a
-// hand-written mirror of the columns in `packages/pbx-db/src/schema/trunks-schema.ts`, and it is the
-// one shape on this edge that is NOT pinned by the codegen.
-//
-// That is a real gap and it is recorded rather than papered over: the writer is
-// `apps/api`, the reader is this file, and until a schema exists in packages/events the agreement
-// between them is a convention rather than a contract. The field names below are the column names
-// verbatim for exactly that reason — a mirror that renames is a mirror nobody can check by eye.
-//
-// # What is NOT here
-//
-// The secret. `sipSecretRef` is a HANDLE into the secret manager, exactly as the column is, and the
-// password never lands in this bucket — the same argument that keeps the provisioning key off this
-// process. The credential is resolved through the credential store at REGISTER time.
-type Record struct {
-	ID             string `json:"id"`
-	OrganizationID string `json:"organizationId"`
-	Name           string `json:"name"`
-	// Kind is `register` or `ip-auth`. It decides whether this trunk registers outward at all, and a
-	// great many carrier trunks do not: they authenticate our source IP and expect INVITEs with no
-	// registration behind them.
-	Kind      string `json:"kind"`
-	SIPDomain string `json:"sipDomain"`
-	SIPProxy  string `json:"sipProxy"`
-	// OutboundProxy is where the packet GOES when the carrier is fronted by an SBC, while the
-	// Request-URI still names the carrier. The address stays the address and the destination is where
-	// the packet goes — the same split this service draws everywhere else.
-	OutboundProxy string `json:"outboundProxy,omitempty"`
-	// Registrar is where REGISTER goes when it goes anywhere. Absent in the column set, which has
-	// only `sipProxy`; a trunk that registers to a different host than it calls sets it, and
-	// everything else inherits SIPProxy.
-	Registrar          string `json:"registrar,omitempty"`
-	SecondaryRegistrar string `json:"secondaryRegistrar,omitempty"`
-	AuthUser           string `json:"authUser,omitempty"`
-	AuthRealm          string `json:"authRealm,omitempty"`
-	// SIPSecretRef is the handle, carried so a boot log can say which secret a trunk expects without
-	// this process ever holding one.
-	SIPSecretRef           string `json:"sipSecretRef,omitempty"`
-	RegisterExpiresSeconds int    `json:"registerExpiresSeconds,omitempty"`
-	Transport              string `json:"transport,omitempty"`
-	MaxChannels            int    `json:"maxChannels,omitempty"`
-	// CodecPrefs is ADVISORY and is carried only so a boot log can say a trunk asked for something
-	// this platform cannot serve. mediad offers exactly what mediad can serve, and this edge holds no
-	// codec knowledge in either direction (design §5.2) — so a trunk configured for Opus gets a G.711
-	// offer and the ROW is wrong rather than the call.
-	CodecPrefs string `json:"codecPrefs,omitempty"`
-	Enabled    bool   `json:"enabled"`
-}
+// Record uses the API's generated wire contract. Gateway configuration is derived here
+// so carrier passwords never enter the shared directory.
+type Record contract.TrunkDirectoryEntry
 
-// Config renders the record as the gateway machine's configuration.
-//
-// The two vocabularies are kept apart on purpose. Record is what the control plane WROTE, field for
-// field with the column set, so a mismatch is visible by eye. Config is what the state machine
-// NEEDS, and it has been stable since before this bucket existed. Mapping between them in one
-// function is what lets either change without dragging the other with it.
 func (r Record) Config() Config {
 	config := Config{
-		TrunkID:            strings.TrimSpace(r.ID),
-		OrgID:              strings.TrimSpace(r.OrganizationID),
-		Name:               strings.TrimSpace(r.Name),
-		Kind:               strings.ToLower(strings.TrimSpace(r.Kind)),
-		Enabled:            r.Enabled,
-		SIPDomain:          strings.TrimSpace(r.SIPDomain),
-		SIPProxy:           strings.TrimSpace(r.SIPProxy),
-		OutboundProxy:      strings.TrimSpace(r.OutboundProxy),
-		Registrar:          strings.TrimSpace(r.Registrar),
-		SecondaryRegistrar: strings.TrimSpace(r.SecondaryRegistrar),
-		AuthUser:           strings.TrimSpace(r.AuthUser),
-		AuthRealm:          strings.TrimSpace(r.AuthRealm),
-		ExpiresSeconds:     r.RegisterExpiresSeconds,
-		Transport:          strings.ToLower(strings.TrimSpace(r.Transport)),
-		MaxChannels:        r.MaxChannels,
+		TrunkID:        strings.TrimSpace(r.TrunkID),
+		OrgID:          strings.TrimSpace(r.OrgID),
+		Name:           strings.TrimSpace(r.Name),
+		Kind:           string(r.Kind),
+		Enabled:        r.Enabled,
+		SIPDomain:      strings.TrimSpace(r.SIPDomain),
+		SIPProxy:       strings.TrimSpace(r.SIPProxy),
+		ExpiresSeconds: r.RegisterExpiresSeconds,
+		Transport:      strings.ToLower(string(r.Transport)),
 	}
-	// `register` registers and `ip-auth` does not. Deriving it from the column rather than carrying a
-	// second boolean is what stops the two disagreeing: a trunk whose kind said ip-auth and whose
-	// register flag said true would send REGISTER at a carrier that has no account for us, and be
-	// refused 403 for ever on a backoff.
+	if r.OutboundProxy != nil {
+		config.OutboundProxy = strings.TrimSpace(*r.OutboundProxy)
+	}
+	if r.AuthUser != nil {
+		config.AuthUser = strings.TrimSpace(*r.AuthUser)
+	}
+	if r.SecretRef != nil {
+		config.SecretRef = strings.TrimSpace(*r.SecretRef)
+	}
+	if r.MaxChannels != nil {
+		config.MaxChannels = *r.MaxChannels
+	}
 	config.Register = config.Kind == "register"
-	if config.Registrar == "" {
-		// A carrier that takes registrations at its call address is the common case, and the column
-		// set has only `sipProxy` — so this is not a fallback, it is the normal path.
-		config.Registrar = config.SIPProxy
-	}
-	if config.AuthRealm == "" {
-		config.AuthRealm = config.SIPDomain
-	}
+	config.Registrar = config.SIPProxy
+	config.AuthRealm = config.SIPDomain
 	if config.ExpiresSeconds <= 0 {
-		// The column's own default. Restated because a record written by an older writer may omit it,
-		// and a registering trunk with a zero expiry fails Validate rather than defaulting quietly
-		// somewhere further in.
 		config.ExpiresSeconds = 300
 	}
 	return config
@@ -200,6 +135,10 @@ func (d *Directory) Configs() []Config {
 func (d *Directory) Put(key string, config Config) error {
 	if err := config.Validate(); err != nil {
 		return err
+	}
+	expectedKey, err := contract.TrunkKVKey(config.OrgID, config.TrunkID)
+	if err != nil || key != expectedKey {
+		return errors.New("trunk directory key does not match its organization and trunk")
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()

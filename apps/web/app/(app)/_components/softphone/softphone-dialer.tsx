@@ -207,7 +207,7 @@ export function SoftphoneDialer() {
 							</p>
 						</div>
 					</div>
-					<MediaBoundaryNote note={phone.mediaNote} />
+					{!phone.webrtcSupported ? <MediaBoundaryNote note={phone.mediaNote} /> : null}
 					<div className="flex gap-2">
 						<Button
 							variant={call.muted ? "primary" : "secondary"}

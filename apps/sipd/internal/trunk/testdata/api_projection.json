@@ -1,0 +1,14 @@
+{
+	"trunkId": "019fd3c2-3333-76be-a6b3-b0f1914e39b6",
+	"orgId": "019fd3c2-1111-76be-a6b3-b0f1914e39b6",
+	"name": "Telnyx",
+	"kind": "register",
+	"sipDomain": "sip.telnyx.example",
+	"sipProxy": "sip.telnyx.example:5060",
+	"authUser": "optimiq-outbound",
+	"secretRef": "secret://pbx/trunk/telnyx",
+	"transport": "udp",
+	"registerExpiresSeconds": 300,
+	"enabled": true,
+	"updatedAt": 1786525200000
+}

@@ -169,6 +169,7 @@ describe("toMediaEventFromMediad", () => {
 			// `stopRecording(name)` and every waiter key on the same string.
 			recordingName: "rec-1",
 			durationMs: 4_000,
+			bytes: 64_044,
 		});
 	});
 

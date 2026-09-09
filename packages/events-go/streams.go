@@ -527,6 +527,13 @@ var SharedLineStateKV = KVBucketDefinition{
 // commands to.
 //
 // This is the one bucket written from Go and read from both languages.
+var MediaOwnersKV = KVBucketDefinition{
+	Name:        "media-owners",
+	Description: "Call placement and media resource ownership, with atomic first-owner claims.",
+	TTL:         6 * time.Hour, History: 1, Storage: StorageFile,
+	MaxValueSize: 1024, MaxBytes: 128 * mib, NumReplicas: 1,
+}
+
 var MediaSessionsKV = KVBucketDefinition{
 	Name:         "media-sessions",
 	Description:  "RTP session -> owning mediad instance, for per-instance command routing.",
@@ -656,6 +663,7 @@ var KVBuckets = []KVBucketDefinition{
 	ConferenceClaimsKV,
 	SharedLineStateKV,
 	MediaSessionsKV,
+	MediaOwnersKV,
 	QueueWaitingKV,
 	SIPDialogsKV,
 	TrunksKV,

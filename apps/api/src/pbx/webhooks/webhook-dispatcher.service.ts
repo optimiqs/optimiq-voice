@@ -1,4 +1,10 @@
-import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
+import {
+	Inject,
+	Injectable,
+	Optional,
+	type OnApplicationShutdown,
+	type OnModuleInit,
+} from "@nestjs/common";
 import { AckPolicy, connect, DeliverPolicy, type NatsConnection } from "nats";
 import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import { getLogger } from "@optimiq-voice/logging";
@@ -143,6 +149,7 @@ export class WebhookDispatcher implements OnModuleInit, OnApplicationShutdown {
 		 * The transport. Injected rather than closed over so a spec drives every delivery path without
 		 * a socket, and so a deployment that needs a proxy has one seam to change.
 		 */
+		@Optional()
 		private readonly fetchImpl: WebhookFetch = globalThis.fetch as unknown as WebhookFetch,
 	) {}
 

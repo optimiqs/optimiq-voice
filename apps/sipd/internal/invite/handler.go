@@ -16,6 +16,8 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/kv"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/profile"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/registrar"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/trunk"
+	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 )
 
 // SIP statuses this handler emits. Bare integers at a call site are how a 403 becomes a 423.
@@ -167,7 +169,8 @@ type Options struct {
 	Bindings kv.Store
 	// Trunks is the carrier directory, read to resolve a `{kind:"trunk"}` originate. Optional on the
 	// same argument.
-	Trunks TrunkDirectory
+	Trunks    TrunkDirectory
+	TrunkAuth trunk.Authorizer
 	// Responder retransmits a 2xx until it is ACKed.
 	Responder Responder
 	// Events publishes the dialog family.
@@ -234,6 +237,7 @@ type Handler struct {
 	caller    Caller
 	bindings  kv.Store
 	trunks    TrunkDirectory
+	trunkAuth trunk.Authorizer
 	responder Responder
 	events    EventSink
 	contact   sip.Uri
@@ -275,12 +279,15 @@ type legState struct {
 	answer *sip.Response
 	// stopRetransmit cancels the RFC 6026 loop.
 	stopRetransmit context.CancelFunc
+	// authCancel stops a carrier credential lookup when teardown begins.
+	authCancel context.CancelFunc
 	// ringTimer ends a call the engine never acted on.
 	ringTimer *time.Timer
 	// sessionTimer is the RFC 4028 deadline.
 	sessionTimer *time.Timer
 	// localCSeq numbers the requests this edge originates inside the dialog.
-	localCSeq uint32
+	localCSeq        uint32
+	engineInstanceID string
 	// local and remote are the two addresses mid-dialog requests are built from.
 	local  sip.Uri
 	remote sip.Uri
@@ -326,6 +333,7 @@ func New(opts Options) (*Handler, error) {
 		caller:        opts.Caller,
 		bindings:      opts.Bindings,
 		trunks:        opts.Trunks,
+		trunkAuth:     opts.TrunkAuth,
 		responder:     opts.Responder,
 		events:        opts.Events,
 		contact:       opts.Contact,
@@ -415,6 +423,19 @@ func (h *Handler) Len() int {
 // ---------------------------------------------------------------------------------------------
 // INVITE
 // ---------------------------------------------------------------------------------------------
+
+// ServeInvite keeps sipgo's server transaction alive while asynchronous engine commands
+// ring or answer the call. sipgo terminates a transaction when its callback returns.
+func (h *Handler) ServeInvite(req *sip.Request, tx sip.ServerTransaction) {
+	h.HandleInvite(req, tx)
+	if tx == nil {
+		return
+	}
+	select {
+	case <-tx.Done():
+	case <-h.baseCtx.Done():
+	}
+}
 
 // HandleInvite answers an INVITE: a new call, or a re-INVITE inside one we already hold.
 func (h *Handler) HandleInvite(req *sip.Request, tx sip.ServerTransaction) {
@@ -648,6 +669,7 @@ func (h *Handler) admitted(
 	defer cancel()
 
 	_ = session.Inspect(ctx, func(d *dialog.Dialog) {
+		state.engineInstanceID = admission.InstanceID
 		d.OrgID = admission.OrgID
 		d.CallID = admission.CallID
 		h.writeClaim(d)
@@ -726,7 +748,21 @@ func (h *Handler) HandleAck(req *sip.Request, _ sip.ServerTransaction) {
 		h.log.Debug("an ACK arrived for no dialog we hold", "sipCallId", headerValue(req, "Call-ID"))
 		return
 	}
-	h.post(target.LegID, dialog.Input{Trigger: dialog.TriggerRemoteAck})
+	h.withLeg(target.LegID, func(session *dialog.Session, state *legState) {
+		ctx, cancel := context.WithTimeout(h.baseCtx, 2*time.Second)
+		defer cancel()
+		_, _ = session.Do(ctx, func(d *dialog.Dialog) (dialog.Outcome, error) {
+			if state.answer != nil && state.answer.CSeq() != nil && req.CSeq() != nil && state.answer.CSeq().SeqNo != req.CSeq().SeqNo {
+				return dialog.Outcome{}, nil
+			}
+			if d.Role == dialog.RoleUAC {
+				return dialog.Outcome{Effects: []dialog.Effect{{Kind: dialog.EffectStopRetransmit}}}, nil
+			}
+			outcome, err := d.Apply(dialog.Input{Trigger: dialog.TriggerRemoteAck})
+			outcome.Effects = append(outcome.Effects, dialog.Effect{Kind: dialog.EffectStopRetransmit})
+			return outcome, err
+		})
+	})
 }
 
 // HandleBye ends a dialog at the far end's request.
@@ -796,20 +832,19 @@ func (h *Handler) HandleUpdate(req *sip.Request, tx sip.ServerTransaction) {
 	h.handleMidDialogOffer(target.LegID, dialog.KindUpdate, req, tx)
 }
 
-// handleMidDialogOffer is the shared body of re-INVITE and UPDATE.
-//
-// It ACCEPTS or REFUSES; it does not answer. The answer body comes from mediad by way of the
-// engine, so acceptance means "hold the transaction open and expect an answer command" — and the
-// command surface that would deliver it is the boundary this wave stops at. Until it exists an
-// accepted offer is answered with the answer we already committed, which is correct for the two
-// cases that do not change the media (a target refresh and a session-timer refresh) and is the
-// honest best available for the ones that do.
+// handleMidDialogOffer commits SDP and hold state only after the owning media session answers.
 func (h *Handler) handleMidDialogOffer(
 	legID string,
 	kind dialog.MidDialogKind,
 	req *sip.Request,
 	tx sip.ServerTransaction,
 ) {
+	negotiation := dialog.NegotiateUAS(h.timers, dialog.ReadTimerHeaders(req.GetHeaders))
+	if negotiation.Refused() {
+		h.refuseTimers(req, tx, negotiation, h.log.With("legId", legID))
+		return
+	}
+
 	h.withLeg(legID, func(session *dialog.Session, state *legState) {
 		ctx, cancel := context.WithTimeout(h.baseCtx, 5*time.Second)
 		defer cancel()
@@ -824,6 +859,31 @@ func (h *Handler) handleMidDialogOffer(
 		_, err := session.Do(ctx, func(d *dialog.Dialog) (dialog.Outcome, error) {
 			state.pending, state.pendingTx = req, tx
 
+			refuse := func(status int, reason string) (dialog.Outcome, error) {
+				return dialog.Outcome{Effects: []dialog.Effect{{Kind: dialog.EffectRespondToRequest, Status: status, Reason: reason}}}, nil
+			}
+			checked, checkErr := d.CheckMidDialog(kind)
+			if checkErr != nil || !checked.Accepted {
+				return refuse(checked.Status, checked.Reason)
+			}
+			var answer []byte
+			if len(req.Body()) > 0 {
+				port, supported := h.port.(RenegotiationPort)
+				if !supported || state.engineInstanceID == "" {
+					return refuse(488, "Not Acceptable Here")
+				}
+				body, err := port.Renegotiate(ctx, state.engineInstanceID, contract.EngineRenegotiateRequest{
+					LegID: d.LegID, OrgID: d.OrgID, CallID: d.CallID, SipdInstanceID: h.instance, SDPOffer: string(req.Body()),
+				})
+				if err != nil {
+					log.Warn("media renegotiation refused", "error", err)
+					return refuse(488, "Not Acceptable Here")
+				}
+				answer = []byte(body)
+			} else if kind == dialog.KindReInvite {
+				// Delayed offers require answering the offer in ACK; do not reuse stale SDP.
+				return refuse(488, "Not Acceptable Here")
+			}
 			outcome, err := d.ApplyMidDialog(dialog.MidDialogInput{
 				Kind:     kind,
 				Body:     req.Body(),
@@ -846,8 +906,7 @@ func (h *Handler) handleMidDialogOffer(
 			}
 
 			// A refresh renegotiates the interval rather than silently keeping the old one.
-			negotiation := dialog.NegotiateUAS(h.timers, dialog.ReadTimerHeaders(req.GetHeaders))
-			if !negotiation.Refused() && negotiation.Timer.Negotiated() {
+			if negotiation.Timer.Negotiated() {
 				d.RefreshTimer(negotiation.Timer)
 			}
 			if outcome.HoldChanged {
@@ -855,7 +914,7 @@ func (h *Handler) handleMidDialogOffer(
 					"direction", string(outcome.Direction), "held", outcome.Held)
 			}
 			effects := append([]dialog.Effect(nil), outcome.Effects...)
-			effects = append(effects, d.AnswerMidDialog(nil)...)
+			effects = append(effects, d.AnswerMidDialog(answer)...)
 			return dialog.Outcome{Effects: effects}, nil
 		})
 		if err != nil && !errors.Is(err, dialog.ErrInvalidState) && !errors.Is(err, dialog.ErrDialogGone) {
@@ -992,6 +1051,7 @@ func (h *Handler) authorize(
 		return credentials.Credential{}, false
 	}
 
+	accountAuth := h.auth.ForRequest(req)
 	auth, err := registrar.ParseAuthorization(headerValue(req, "Authorization"))
 	if err != nil {
 		if errors.Is(err, registrar.ErrNoAuthorization) {
@@ -1002,12 +1062,12 @@ func (h *Handler) authorize(
 		h.respond(tx, req, statusBadRequest, "Bad Request")
 		return credentials.Credential{}, false
 	}
-	if auth.Realm != h.realm {
+	if auth.Realm != accountAuth.Realm() {
 		log.Info("re-challenging a credential for another realm", "offeredRealm", auth.Realm)
 		h.challenge(req, tx, false, log)
 		return credentials.Credential{}, false
 	}
-	if err := h.auth.CheckNonce(auth.Nonce); err != nil {
+	if err := accountAuth.CheckNonce(auth.Nonce); err != nil {
 		h.challenge(req, tx, errors.Is(err, registrar.ErrNonceStale), log)
 		return credentials.Credential{}, false
 	}
@@ -1020,7 +1080,7 @@ func (h *Handler) authorize(
 		return credentials.Credential{}, false
 	}
 
-	credential, err := h.creds.Lookup(ctx, h.realm, auth.Username)
+	credential, err := h.creds.Lookup(ctx, accountAuth.Realm(), auth.Username)
 	if err != nil {
 		switch {
 		case errors.Is(err, credentials.ErrNotFound):
@@ -1035,7 +1095,7 @@ func (h *Handler) authorize(
 	}
 	// INVITE, not REGISTER: HA2 is MD5(method:uri), so verifying with the wrong method name accepts
 	// nothing and would make every call fail with a password error nobody could explain.
-	if err := h.auth.Verify(req.Method.String(), auth, credential.HA1); err != nil {
+	if err := accountAuth.VerifyRequest(req, auth, credential.HA1); err != nil {
 		if errors.Is(err, registrar.ErrNonceStale) {
 			h.challenge(req, tx, true, log)
 			return credentials.Credential{}, false
@@ -1048,7 +1108,7 @@ func (h *Handler) authorize(
 }
 
 func (h *Handler) challenge(req *sip.Request, tx sip.ServerTransaction, stale bool, log *slog.Logger) {
-	value, err := h.auth.Challenge(stale)
+	value, err := h.auth.ForRequest(req).Challenge(stale)
 	if err != nil {
 		log.Error("cannot mint a digest challenge", "error", err)
 		h.respond(tx, req, statusServerError, "Server Internal Error")

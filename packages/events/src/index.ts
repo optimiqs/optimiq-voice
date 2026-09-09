@@ -29,6 +29,7 @@ export {
 	KV_BUCKETS,
 	kvKeyFor,
 	MEDIA_SESSIONS_KV,
+	MEDIA_OWNERS_KV,
 	MEDIA_STREAM,
 	kvOptionsFor,
 	millisToNanos,

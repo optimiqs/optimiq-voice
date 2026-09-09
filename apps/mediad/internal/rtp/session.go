@@ -181,9 +181,10 @@ type Session struct {
 	CallID string
 	LegID  string
 
-	mode  Mode
-	ports *PortPair
-	log   *slog.Logger
+	mode      Mode
+	ports     *PortPair
+	transport PacketTransport
+	log       *slog.Logger
 
 	// audioPayloadType is the ONE audio type this session negotiated. Per-session rather than a
 	// package constant, because negotiation is per leg: one call can have a PCMU A-leg and a PCMA
@@ -267,9 +268,11 @@ type Session struct {
 	// held, mutedIn and mutedOut are rung 5's state. Atomics because the packet path reads all three
 	// per frame; see internal/rtp/hold.go for why hold and mute are separate flags rather than one
 	// mode, and for where each one gates.
-	held     atomic.Bool
-	mutedIn  atomic.Bool
-	mutedOut atomic.Bool
+	// RTP silence is expected while held; resumption starts a fresh watchdog window.
+	rtpGraceUntil atomic.Int64
+	held          atomic.Bool
+	mutedIn       atomic.Bool
+	mutedOut      atomic.Bool
 	// hold serialises the compound hold change — two flags plus a music loop — so an unhold racing a
 	// hold cannot leave the two disagreeing.
 	hold holdState
@@ -303,6 +306,7 @@ type Session struct {
 
 // Options configures a Session.
 type Options struct {
+	Transport PacketTransport
 	// ID is required.
 	ID string
 	// Ports is the allocated pair the session takes ownership of. Closing the session closes it.
@@ -365,6 +369,9 @@ func NewSession(opts Options) (*Session, error) {
 	}
 
 	ssrc := opts.SSRC
+	if opts.Transport != nil {
+		ssrc = opts.Transport.LocalSSRC()
+	}
 	if ssrc == 0 {
 		var err error
 		if ssrc, err = randomSSRC(); err != nil {
@@ -394,6 +401,7 @@ func NewSession(opts Options) (*Session, error) {
 		LegID:     opts.LegID,
 		mode:      mode,
 		ports:     opts.Ports,
+		transport: opts.Transport,
 		dtmfIn:    newDtmfDetector(opts.DtmfMaxDigitDuration),
 		onDtmf:    opts.OnDtmf,
 		log:       logger.With("sessionId", opts.ID, "rtpPort", opts.Ports.Port, "ssrc", ssrc),
@@ -405,6 +413,9 @@ func NewSession(opts Options) (*Session, error) {
 	session.audioPayloadType.Store(uint32(opts.AudioPayloadType))
 	session.format.Store(uint32(format))
 	session.telephoneEventPayloadType.Store(uint32(opts.TelephoneEventPayloadType))
+	if opts.Transport != nil {
+		session.remote = securePacketSource
+	}
 	return session, nil
 }
 
@@ -503,12 +514,17 @@ func (s *Session) Run(ctx context.Context) error {
 	// Unblock the read when the caller gives up. Closing the socket is the only way to interrupt
 	// a blocked ReadFromUDP; a read deadline would work too, but at 50 packets a second per call
 	// it would mean resetting a timer 50 times a second per call for no benefit.
-	stop := context.AfterFunc(ctx, func() { _ = s.ports.RTP.Close() })
+	stop := context.AfterFunc(ctx, func() {
+		if s.transport != nil {
+			_ = s.transport.Close()
+		}
+		_ = s.ports.RTP.Close()
+	})
 	defer stop()
 
 	buf := make([]byte, maxPacketSize)
 	for {
-		n, from, err := s.ports.RTP.ReadFromUDP(buf)
+		n, from, err := s.readRTP(buf)
 		if err != nil {
 			// A closed socket is how both shutdown paths end. Neither is a failure.
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) || s.isClosed() {
@@ -789,7 +805,7 @@ func (s *Session) forward(packet *pionrtp.Packet, sourceTelephoneEventPT uint8) 
 		return
 	}
 	s.lastTimestamp.Store(packet.Timestamp)
-	if _, err := s.ports.RTP.WriteToUDP(encoded, to); err != nil {
+	if _, err := s.writeRTP(encoded, to); err != nil {
 		// Per-packet and self-correcting. A call is not torn down because one frame did not make it
 		// out, and logging every send failure on a congested link is how a media server fills a
 		// disk while it is already struggling.
@@ -876,7 +892,7 @@ func (s *Session) echo(packet *pionrtp.Packet, to *net.UDPAddr) {
 		s.log.Debug("cannot marshal an echo packet", "error", err)
 		return
 	}
-	if _, err := s.ports.RTP.WriteToUDP(encoded, to); err != nil {
+	if _, err := s.writeRTP(encoded, to); err != nil {
 		// Send failures are per-packet and self-correcting; a call is not torn down because one
 		// frame did not make it out.
 		s.log.Debug("cannot send an echo packet", "error", err, "remote", to.String())
@@ -910,7 +926,10 @@ func (s *Session) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
 		close(s.done)
-		err = s.ports.Close()
+		if s.transport != nil {
+			err = s.transport.Close()
+		}
+		err = errors.Join(err, s.ports.Close())
 		stats := s.Stats()
 		s.log.Debug("session closed",
 			"packetsReceived", stats.PacketsReceived,

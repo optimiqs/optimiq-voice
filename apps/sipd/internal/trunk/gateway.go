@@ -127,6 +127,8 @@ type Config struct {
 	// off this process.
 	AuthUser  string
 	AuthRealm string
+	// SecretRef identifies the carrier credential; the password is resolved only when needed.
+	SecretRef string
 	// Contact is the address of record we bind. Usually this edge's own contact.
 	Contact string
 	// ExpiresSeconds is the registration interval to request.

@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -50,6 +51,60 @@ type harness struct {
 type staticCredentials struct {
 	credential credentials.Credential
 	err        error
+}
+
+type realmCredentials map[string]credentials.Credential
+
+func (s realmCredentials) Lookup(_ context.Context, realm, username string) (credentials.Credential, error) {
+	if credential, ok := s[realm]; ok && credential.Username == username {
+		return credential, nil
+	}
+	return credentials.Credential{}, credentials.ErrNotFound
+}
+
+func TestTwoOrganizationsRegisterTheSameExtensionOnOneEdge(t *testing.T) {
+	accounts := realmCredentials{}
+	for i, realm := range []string{testRealm, "tenant-b.example"} {
+		accounts[realm] = credentials.Credential{OrgID: "organization-" + strconv.Itoa(i), Realm: realm,
+			Username: testUser, HA1: credentials.HA1(testUser, realm, testPass)}
+	}
+	h := newHarness(t, accounts)
+	for realm, account := range accounts {
+		makeRequest := func(authorization string) *sip.Request {
+			request := h.newRegister(authorization, contactHeader("sip:1001@203.0.113.9:5060"))
+			request.Recipient.Host = realm
+			request.From().Address.Host = realm
+			request.To().Address.Host = realm
+			return request
+		}
+		challenge := h.send(makeRequest(""))
+		if challenge.StatusCode != 401 {
+			t.Fatalf("%s challenge = %d", realm, challenge.StatusCode)
+		}
+		parsed, err := digest.ParseChallenge(challenge.GetHeader("WWW-Authenticate").Value())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if parsed.Realm != realm {
+			t.Fatalf("wrong realm: %s", parsed.Realm)
+		}
+		answer, err := digest.Digest(parsed, digest.Options{Username: testUser, Password: testPass,
+			Method: "REGISTER", URI: "sip:" + realm, Count: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response := h.send(makeRequest(answer.String())); response.StatusCode != 200 {
+			t.Fatalf("%s registration = %d", realm, response.StatusCode)
+		}
+		key, err := contract.AORSubjectToken("sip:" + testUser + "@" + realm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		binding, found, err := h.store.Get(t.Context(), account.OrgID, key)
+		if err != nil || !found || binding.OrgID != account.OrgID {
+			t.Fatalf("registration crossed organization boundaries: %+v, %v", binding, err)
+		}
+	}
 }
 
 func (s staticCredentials) Lookup(_ context.Context, _, _ string) (credentials.Credential, error) {
@@ -290,6 +345,126 @@ func TestRegisterChallengesThenBinds(t *testing.T) {
 	}
 	if err := contract.CheckSubject(event.Subject, event); err != nil {
 		t.Errorf("the published envelope is inconsistent with its subject: %v", err)
+	}
+}
+
+func TestMultipleDevicesRegisterQueryAndRemoveIndependently(t *testing.T) {
+	h := newHarness(t, nil)
+	desk, browser := "sip:1001@203.0.113.9:5060", "sip:browser@device.invalid;transport=ws"
+	res := h.register(contactHeader(desk, "expires=120", "q=1"), contactHeader(browser, "expires=300", "q=0.5"))
+	if res.StatusCode != 200 || len(res.GetHeaders("Contact")) != 2 {
+		t.Fatalf("multi-contact REGISTER: %s", res.String())
+	}
+	binding, _ := h.binding()
+	if len(binding.Contacts) != 2 || binding.Contact != desk {
+		t.Fatalf("contacts not preserved in preference order: %+v", binding)
+	}
+	h.now = h.now.Add(30 * time.Second)
+	query := h.register()
+	if got, _ := query.GetHeaders("Contact")[0].(*sip.ContactHeader).Params.Get("expires"); got != "90" {
+		t.Fatalf("query expiry = %s, want remaining 90 seconds", got)
+	}
+	res = h.register(contactHeader(browser, "expires=0"))
+	if res.StatusCode != 200 || len(res.GetHeaders("Contact")) != 1 {
+		t.Fatalf("individual removal: %s", res.String())
+	}
+	binding, _ = h.binding()
+	if len(binding.Contacts) != 1 || binding.Contact != desk {
+		t.Fatal("removing the browser also removed the desk phone")
+	}
+}
+
+func TestMultiContactRegistrationRejectsWholeInvalidUpdate(t *testing.T) {
+	h := newHarness(t, nil)
+	res := h.register(contactHeader("sip:desk@203.0.113.9", "expires=300"), contactHeader("sip:browser@203.0.113.10", "expires=20"))
+	if res.StatusCode != 423 {
+		t.Fatalf("status = %d, want 423", res.StatusCode)
+	}
+	if _, found := h.binding(); found {
+		t.Fatal("part of a rejected REGISTER was persisted")
+	}
+	res = h.register(contactHeader("sip:desk@203.0.113.9", "expires=-1"))
+	if res.StatusCode != 400 {
+		t.Fatalf("negative expiry status = %d", res.StatusCode)
+	}
+}
+
+func TestStaleRegisterCannotOverwriteOrRemoveCurrentContact(t *testing.T) {
+	h := newHarness(t, nil)
+	contact := contactHeader("sip:1001@203.0.113.9:5060", "expires=300")
+	challenge := h.send(h.newRegister("", contact))
+	req := h.newRegister(h.answerChallenge(challenge), contact)
+	if res := h.send(req); res.StatusCode != 200 {
+		t.Fatalf("REGISTER = %d", res.StatusCode)
+	}
+	if res := h.send(req.Clone()); res.StatusCode != 500 {
+		t.Fatalf("stale REGISTER = %d", res.StatusCode)
+	}
+	req.Contact().Params.Add("expires", "0")
+	if res := h.send(req); res.StatusCode != 500 {
+		t.Fatalf("stale removal = %d", res.StatusCode)
+	}
+	if _, found := h.binding(); !found {
+		t.Fatal("out-of-order removal deleted a current contact")
+	}
+}
+
+func TestSweeperPreservesARefreshFromAnotherRegistrar(t *testing.T) {
+	h := newHarness(t, nil)
+	if res := h.register(contactHeader("sip:desk@203.0.113.9", "expires=60")); res.StatusCode != 200 {
+		t.Fatal(res.StatusCode)
+	}
+	other := newHarness(t, nil)
+	other.store = h.store
+	other = rebuild(t, other)
+	other.now = h.now.Add(40 * time.Second)
+	other.cseq = h.cseq + 10
+	if res := other.register(contactHeader("sip:desk@203.0.113.9", "expires=300")); res.StatusCode != 200 {
+		t.Fatal(res.StatusCode)
+	}
+	h.now = h.now.Add(70 * time.Second)
+	if got := h.registrar.Sweep(t.Context()); got != 0 {
+		t.Fatalf("expired a refreshed contact: %d", got)
+	}
+	if _, found := h.binding(); !found {
+		t.Fatal("stale sweeper removed another registrar's refresh")
+	}
+}
+
+func TestConcurrentRegistrarsPreserveEachDevice(t *testing.T) {
+	h := newHarness(t, nil)
+	var workers sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		other := newHarness(t, nil)
+		other.store = h.store
+		other = rebuild(t, other)
+		workers.Go(func() {
+			res := other.register(contactHeader("sip:device"+strconv.Itoa(i)+"@203.0.113.9", "expires=300"))
+			if res.StatusCode != 200 {
+				t.Errorf("concurrent REGISTER = %d", res.StatusCode)
+			}
+		})
+	}
+	workers.Wait()
+	binding, _ := h.binding()
+	if len(binding.Contacts) != 5 {
+		t.Fatalf("lost registrations: contacts=%d", len(binding.Contacts))
+	}
+}
+
+func TestExpiryRemovesOnlyLapsedContact(t *testing.T) {
+	h := newHarness(t, nil)
+	h.register(contactHeader("sip:desk@203.0.113.9", "expires=60", "q=1"), contactHeader("sip:browser@203.0.113.10", "expires=300", "q=0.5"))
+	h.now = h.now.Add(70 * time.Second)
+	if got := h.registrar.Sweep(t.Context()); got != 1 {
+		t.Fatalf("expired %d contacts, want 1", got)
+	}
+	binding, _ := h.binding()
+	if len(binding.Contacts) != 1 || binding.Contact != "sip:browser@203.0.113.10" {
+		t.Fatalf("surviving browser lost: %+v", binding)
+	}
+	if len(h.publisher.ExpiredEvents()) != 1 {
+		t.Fatal("expiry event was missing or duplicated")
 	}
 }
 

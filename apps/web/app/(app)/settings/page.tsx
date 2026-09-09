@@ -21,6 +21,7 @@ import { RequirePermission } from "../_components/require-permission";
 import { useAppSession } from "../_context/session-context";
 import { useRenameOrganization } from "../_hooks/use-organization-queries";
 import { SettingsNav } from "./_components/settings-nav";
+import { SipDomainSettings } from "./_components/sip-domain-settings";
 
 /**
  * Organization settings.
@@ -111,6 +112,7 @@ export default function OrganizationSettingsPage() {
 					</form>
 				</Card>
 			</RequirePermission>
+			<SipDomainSettings key={organization?.id} />
 		</>
 	);
 }

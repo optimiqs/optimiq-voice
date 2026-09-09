@@ -253,6 +253,19 @@ func ParseOffer(raw string) (Offer, error) {
 	return offer, nil
 }
 
+// AudioProtocol is the transport of the first audio media section, before codec negotiation.
+func AudioProtocol(raw string) (string, error) {
+	var description pionsdp.SessionDescription
+	if err := description.UnmarshalString(raw); err != nil {
+		return "", err
+	}
+	media := firstAudioMedia(&description)
+	if media == nil {
+		return "", ErrNoAudio
+	}
+	return strings.ToUpper(strings.Join(media.MediaName.Protos, "/")), nil
+}
+
 // codecFor resolves one payload type to a codec, by static number or by rtpmap encoding name.
 //
 // The rtpmap branch matters for a real reason: an endpoint may offer PCMU under a DYNAMIC payload

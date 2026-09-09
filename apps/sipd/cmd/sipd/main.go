@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -34,6 +35,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
+	"github.com/optimiqs/optimiq-voice/packages/runtime-go/health"
 
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/acl"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/command"
@@ -55,7 +57,13 @@ import (
 )
 
 func main() {
-	if err := run(); err != nil && !errors.Is(err, context.Canceled) {
+	var err error
+	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
+		err = health.Probe(os.Getenv("SIPD_HEALTH_ADDR"))
+	} else {
+		err = run()
+	}
+	if err != nil && !errors.Is(err, context.Canceled) {
 		// The logger may not exist yet when configuration fails, so this one line goes to stderr
 		// directly. Everything after boot is structured JSON.
 		fmt.Fprintf(os.Stderr, "sipd: %v\n", err)
@@ -83,6 +91,7 @@ func run() error {
 		// A SIP edge must survive a broker restart without dropping registrations: it keeps
 		// answering REGISTER from the credential store and catches up on events afterwards.
 		nats.MaxReconnects(-1),
+		nats.CustomInboxPrefix("_INBOX.sipd"),
 		nats.ReconnectWait(time.Second),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			log.Warn("nats disconnected", "error", err)
@@ -157,6 +166,8 @@ func run() error {
 	}
 
 	reg, err := registrar.New(registrar.Options{
+		InstanceID:       cfg.InstanceID,
+		MaxContacts:      cfg.MaxContactsPerAOR,
 		Realm:            cfg.Realm,
 		Auth:             authenticator,
 		Expiry:           registrar.ExpiryPolicy{Min: cfg.MinExpires, Max: cfg.MaxExpires, Default: cfg.DefaultExpires},
@@ -248,6 +259,7 @@ func run() error {
 		registrarClient, err := trunk.NewClientRegistrar(sipClient, trunk.RegistrarOptions{
 			Contact:   contactURI(cfg),
 			UserAgent: cfg.UserAgent,
+			Auth:      trunk.NewNATSAuthorizer(conn),
 		})
 		if err != nil {
 			return err
@@ -268,13 +280,14 @@ func run() error {
 		// The seam is the `trunks` bucket, and this is the caller.
 		trunkDirectory.OnChange(func() { supervisor.Apply(ctx, trunkDirectory.Configs()) })
 
-		if bucket, err := trunk.OpenDirectoryBucket(ctx, js); err != nil {
-			log.Warn("no trunk directory is available; every originate to a trunk will be refused "+
-				"unknown_trunk and no carrier registration will be attempted",
-				"bucket", contract.TrunksKV.Name, "error", err)
-		} else if _, err := trunk.Watch(ctx, bucket, trunkDirectory); err != nil {
-			log.Warn("cannot watch the trunk directory", "error", err)
-		}
+		watchWhenAvailable(ctx, log, contract.TrunksKV.Name, time.Second, func() error {
+			bucket, err := trunk.OpenDirectoryBucket(ctx, js)
+			if err != nil {
+				return err
+			}
+			_, err = trunk.Watch(ctx, bucket, trunkDirectory)
+			return err
+		})
 	}
 
 	// The dialog table and its claim bucket.
@@ -328,7 +341,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		server.OnInvite(invites.HandleInvite)
+		server.OnInvite(invites.ServeInvite)
 		server.OnAck(invites.HandleAck)
 		server.OnBye(invites.HandleBye)
 		server.OnCancel(invites.HandleCancel)
@@ -434,18 +447,24 @@ func run() error {
 		}
 	}
 
+	var readyListeners atomic.Int32
+	var expectedListeners int32
 	listen := func(network, addr string) {
+		expectedListeners++
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			log.Info("listening", "network", network, "addr", addr, "realm", cfg.Realm)
+			listenCtx := context.WithValue(ctx, sipgo.ListenReadyCtxKey, sipgo.ListenReadyFuncCtxValue(func(network, addr string) {
+				readyListeners.Add(1)
+				log.Info("listening", "network", network, "addr", addr, "realm", cfg.Realm)
+			}))
 			var err error
 			if strings.HasSuffix(network, "s") && tlsConfig != nil {
 				// ListenAndServeTLS closes its listener when ctx is done and returns; a
 				// post-shutdown error is the close itself, not a failure.
-				err = server.ListenAndServeTLS(ctx, network, addr, tlsConfig)
+				err = server.ListenAndServeTLS(listenCtx, network, addr, tlsConfig)
 			} else {
-				err = server.ListenAndServe(ctx, network, addr)
+				err = server.ListenAndServe(listenCtx, network, addr)
 			}
 			if err != nil && ctx.Err() == nil {
 				errs <- fmt.Errorf("%s listener: %w", network, err)
@@ -471,10 +490,27 @@ func run() error {
 	if cfg.EnableWSS {
 		listen("wss", cfg.WSSListenAddr)
 	}
+	if cfg.ExternalListenAddr != "" && cfg.ExternalListenAddr != cfg.ListenAddr {
+		listen("udp", cfg.ExternalListenAddr)
+		listen("tcp", cfg.ExternalListenAddr)
+	}
+	if err := conn.FlushTimeout(3 * time.Second); err != nil {
+		return fmt.Errorf("flushing SIP subscriptions: %w", err)
+	}
+	healthServer, err := health.Start(ctx, cfg.HealthAddr, func() bool {
+		return conn.IsConnected() && expectedListeners > 0 && readyListeners.Load() == expectedListeners
+	})
+	if err != nil {
+		return err
+	}
+	log.Info("sipd is up", "healthAddr", healthServer.Addr, "listeners", expectedListeners)
 
 	select {
 	case <-ctx.Done():
 		log.Info("shutting down", "timeoutSeconds", int(cfg.ShutdownTimeout/time.Second))
+	case err := <-healthServer.Errors:
+		log.Error("health listener failed", "error", err)
+		stop()
 	case err := <-errs:
 		log.Error("stopping after a fatal error", "error", err)
 		stop()
@@ -703,6 +739,7 @@ func newInviteHandler(deps inviteDeps) (*invite.Handler, error) {
 		Caller:       caller,
 		Bindings:     deps.bindings,
 		Trunks:       deps.trunks,
+		TrunkAuth:    trunk.NewNATSAuthorizer(deps.conn),
 		Responder:    deps.server,
 		Events:       sink,
 		Contact:      contactURI(cfg),
@@ -780,29 +817,30 @@ func buildProfiles(
 		return nil, nil, err
 	}
 
-	bucketAvailable := false
+	watchConfigured := false
 	if conn != nil {
-		if js, err := jetstream.New(conn); err == nil {
-			if bucket, err := acl.OpenBucket(ctx, js); err != nil {
-				log.Warn("no sip-acl bucket is available; unauthenticated INVITEs are refused unless "+
-					"SIPD_TRUNK_ACL names their source",
-					"bucket", contract.SIPACLKV.Name, "error", err)
-			} else if _, err := acl.Watch(ctx, bucket, watcher); err != nil {
-				log.Warn("cannot watch the sip-acl bucket", "error", err)
-			} else {
-				bucketAvailable = true
-			}
+		js, err := jetstream.New(conn)
+		if err != nil {
+			return nil, nil, err
 		}
+		watchConfigured = true
+		watchWhenAvailable(ctx, log, contract.SIPACLKV.Name, time.Second, func() error {
+			bucket, err := acl.OpenBucket(ctx, js)
+			if err != nil {
+				return err
+			}
+			_, err = acl.Watch(ctx, bucket, watcher)
+			return err
+		})
 	}
 
 	internal := profile.Internal("internal", listeners...)
-	if !bucketAvailable && len(overrides) == 0 {
-		// Nothing can ever admit an unauthenticated INVITE, so there is no external boundary to
-		// declare. That is the safe state and it is the one this process has always had by default:
-		// every INVITE is challenged for a digest.
+	if !watchConfigured && len(overrides) == 0 {
 		set, err := profile.NewSet(internal)
 		return set, watcher, err
 	}
+	// Keep the dynamic ACL attached while the control plane creates its bucket.
+	// An empty ACL refuses carrier traffic until the initial replay succeeds.
 
 	external := profile.External("external", carrierACL)
 	if cfg.ExternalListenAddr != "" {

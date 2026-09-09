@@ -131,6 +131,8 @@ export const RPC_SUBJECTS = {
 	 */
 	pbxFileGreeting: `rpc.pbx.${SUBJECT_VERSION}.file-greeting`,
 	sipCredential: `rpc.sip.${SUBJECT_VERSION}.credential`,
+	/** Carrier digest derivation. Only sipd may request it; the API retains the carrier password. */
+	sipTrunkCredential: `rpc.sip.${SUBJECT_VERSION}.trunk-credential`,
 	/**
 	 * The SIP edge asking the call engine to execute a phone's REFER: `apps/sipd` (Go) → the
 	 * NestJS engine.
@@ -190,6 +192,8 @@ export const RPC_SUBJECTS = {
 	 * already uses for a media session.
 	 */
 	sipOriginate: `rpc.sip.${SUBJECT_VERSION}.originate`,
+	sipResolveTarget: `rpc.sip.${SUBJECT_VERSION}.resolve-target`,
+	engineRenegotiate: `rpc.engine.${SUBJECT_VERSION}.renegotiate`,
 	/**
 	 * The media-plane command surface: `apps/engine` (TypeScript) → `apps/mediad` (Go).
 	 *
@@ -884,6 +888,10 @@ export const subjectFor = {
 		return RPC_SUBJECTS.sipTransfer;
 	},
 	/** `rpc.sip.v1.invite` — flat, queue-grouped. See {@link RPC_SUBJECTS.sipInvite}. */
+	engineRenegotiateRpc(instanceId: string): string {
+		return `${RPC_SUBJECTS.engineRenegotiate}.${instanceSubjectToken(instanceId)}`;
+	},
+
 	sipInviteRpc(): string {
 		return RPC_SUBJECTS.sipInvite;
 	},
@@ -911,8 +919,10 @@ export const subjectFor = {
 		return `${RPC_SUBJECTS.sipReinvite}.${instanceSubjectToken(instanceId)}`;
 	},
 	/** `rpc.sip.v1.originate` — flat, queue-grouped. See {@link RPC_SUBJECTS.sipOriginate}. */
-	sipOriginateRpc(): string {
-		return RPC_SUBJECTS.sipOriginate;
+	sipOriginateRpc(instanceId?: string): string {
+		return instanceId === undefined
+			? RPC_SUBJECTS.sipOriginate
+			: `${RPC_SUBJECTS.sipOriginate}.${instanceSubjectToken(instanceId)}`;
 	},
 	/** `rpc.engine.v1.originate` — flat, queue-grouped. See {@link RPC_SUBJECTS.engineOriginate}. */
 	engineOriginateRpc(): string {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+	RPC_SUBJECTS,
 	SIP_ANSWER_RPC,
 	SIP_HANGUP_RPC,
 	SIP_ORIGINATE_RPC,
@@ -83,6 +84,35 @@ function client(fake: ReturnType<typeof fakeConnection>): SipdCommandClient {
 }
 
 describe("addressing the sip edge", () => {
+	it("resolves a contact before addressing the edge that owns its WebSocket", async () => {
+		const fake = fakeConnection();
+		const sipd = client(fake);
+		fake.reply(RPC_SUBJECTS.sipResolveTarget, {
+			ok: true,
+			legId: "leg-b",
+			instanceId: EDGE,
+			transport: "wss",
+			requestUri: "sip:browser@device.invalid",
+		});
+		const target = { kind: "aor" as const, aor: "sip:1002@acme.example.com" };
+		const resolved = await sipd.resolveTarget({ legId: "leg-b", orgId: ORG, target });
+		await sipd.originate(
+			{
+				legId: "leg-b",
+				orgId: ORG,
+				callId: "call-1",
+				target: { ...target, contactUri: resolved.requestUri },
+				sdpOffer: "v=0\r\n",
+			},
+			resolved.instanceId,
+		);
+		expect(fake.requests.map((request) => request.subject)).toEqual([
+			"rpc.sip.v1.resolve-target",
+			"rpc.sip.v1.originate.sipd-7c9f",
+		]);
+		expect(resolved.transport).toBe("wss");
+	});
+
 	it("sends ring, answer, hangup and reinvite at the instance HOLDING the dialog", async () => {
 		const fake = fakeConnection();
 		const sipd = client(fake);

@@ -110,6 +110,7 @@ describe("org settings catalogue", () => {
 			"provision",
 			"recordings",
 			"routing",
+			"sip",
 		]);
 	});
 

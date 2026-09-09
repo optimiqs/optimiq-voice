@@ -38,6 +38,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -46,6 +47,7 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/directory"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
+	secure "github.com/optimiqs/optimiq-voice/apps/mediad/internal/webrtc"
 )
 
 // The v1 command subjects, taken from the contract package rather than restated.
@@ -174,21 +176,27 @@ type Sessions interface {
 
 // Server answers the v1 command subjects.
 type Server struct {
-	sessions      Sessions
-	dir           directory.Store
-	library       *audio.Library
-	recordingsDir string
-	log           *slog.Logger
-	instanceID    string
-	publicAddr    netip.Addr
+	webRTC         *secure.Factory
+	webRTCSessions sync.Map
+	sessions       Sessions
+	dir            directory.Store
+	library        *audio.Library
+	recordingsDir  string
+	log            *slog.Logger
+	instanceID     string
+	publicAddr     netip.Addr
+	ownership      *ownershipRouter
 }
 
 // ServerOptions configures a Server.
 type ServerOptions struct {
+	WebRTC *secure.Factory
 	// Sessions is the packet path. Required.
 	Sessions Sessions
 	// Directory records session ownership. Required — see the package doc on directory.
 	Directory directory.Store
+	// Owners enables atomic call placement and per-instance routing. Required in production.
+	Owners directory.Owners
 	// Library resolves the prompts `start-playback` names. Nil is an unconfigured library, which
 	// REFUSES every playback rather than answering ok and sending nothing.
 	Library *audio.Library
@@ -223,7 +231,13 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	if library == nil {
 		library = audio.NewLibrary("")
 	}
+	var ownership *ownershipRouter
+	if opts.Owners != nil {
+		ownership = &ownershipRouter{store: opts.Owners, tracked: make(map[string]map[string]struct{})}
+	}
 	return &Server{
+		webRTC:        opts.WebRTC,
+		ownership:     ownership,
 		sessions:      opts.Sessions,
 		dir:           opts.Directory,
 		library:       library,
@@ -283,7 +297,8 @@ func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscrip
 				s.log.Warn("ignoring a request with no reply subject", "subject", subject)
 				return
 			}
-			if err := msg.Respond(handle(msg.Data)); err != nil {
+			addressed := msg.Subject != subject
+			if err := msg.Respond(s.routeRequest(conn, subject, msg.Data, handle, addressed)); err != nil {
 				s.log.Error("cannot reply", "subject", subject, "error", err)
 			}
 		}
@@ -306,6 +321,14 @@ func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscrip
 			return nil, fmt.Errorf("control: subscribing to %s: %w", subject, err)
 		}
 		subscriptions = append(subscriptions, subscription)
+		addressed, err := conn.Subscribe(mediaInstanceSubject(subject, s.instanceID), respond)
+		if err != nil {
+			for _, attached := range subscriptions {
+				_ = attached.Unsubscribe()
+			}
+			return nil, fmt.Errorf("control: subscribing to addressed %s: %w", subject, err)
+		}
+		subscriptions = append(subscriptions, addressed)
 	}
 	return subscriptions, nil
 }

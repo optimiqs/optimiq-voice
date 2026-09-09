@@ -32,6 +32,7 @@ type ClientRegistrar struct {
 	// already be working on, and holding a goroutine for half a minute per trunk per attempt during
 	// an outage is how a fleet runs out of them.
 	timeout time.Duration
+	auth    Authorizer
 }
 
 var _ Registrar = (*ClientRegistrar)(nil)
@@ -41,6 +42,7 @@ type RegistrarOptions struct {
 	Contact   sip.Uri
 	UserAgent string
 	Timeout   time.Duration
+	Auth      Authorizer
 }
 
 // NewClientRegistrar wraps a sipgo client.
@@ -53,6 +55,7 @@ func NewClientRegistrar(client *sipgo.Client, opts RegistrarOptions) (*ClientReg
 		contact:   opts.Contact,
 		userAgent: opts.UserAgent,
 		timeout:   opts.Timeout,
+		auth:      opts.Auth,
 	}
 	if registrar.userAgent == "" {
 		registrar.userAgent = "optimiq-sipd"
@@ -86,6 +89,7 @@ func (r *ClientRegistrar) Register(
 	req.AppendHeader(&sip.ToHeader{Address: address, Params: sip.NewParams()})
 
 	contact := r.contact
+	contact.User = config.AuthUser
 	if config.Contact != "" {
 		parsed := sip.Uri{}
 		if err := sip.ParseUri(config.Contact, &parsed); err == nil {
@@ -109,6 +113,20 @@ func (r *ClientRegistrar) Register(
 	defer cancel()
 
 	res, err := r.client.Do(ctx, req)
+	seen := make(map[string]bool)
+	for err == nil && r.auth != nil && len(seen) < 3 {
+		key := ChallengeKey(res)
+		if key == "" || seen[key] {
+			break
+		}
+		seen[key] = true
+		authorized, authErr := r.auth.Authorize(ctx, config, req, res)
+		if authErr != nil {
+			return Result{Trigger: TriggerChallenged, Status: res.StatusCode, Err: authErr}
+		}
+		req = authorized
+		res, err = r.client.Do(ctx, req)
+	}
 	if err != nil {
 		// No final response inside the deadline. Timer F's own expiry looks identical from here and
 		// so does a transport failure, and the machine treats them the same: a reachability problem,
@@ -120,10 +138,8 @@ func (r *ClientRegistrar) Register(
 	case res.StatusCode >= 200 && res.StatusCode < 300:
 		return Result{Trigger: TriggerAccepted, GrantedExpires: grantedExpires(res, expires)}
 	case res.StatusCode == 401 || res.StatusCode == 407:
-		// sipgo answers a digest challenge inside the same transaction when it has a credential, so
-		// reaching here means it could not — no credential, or a realm we hold nothing for. That is
-		// OUR problem and not the carrier's address, which is exactly why the machine refuses to fail
-		// over on it: the secondary is the same carrier with the same missing credential.
+		// Authentication retries are bounded above. Do not treat a rejected credential as a
+		// transport failure: another registrar would reject the same credential.
 		return Result{Trigger: TriggerChallenged, Status: res.StatusCode}
 	default:
 		return Result{Trigger: TriggerRejected, Status: res.StatusCode}

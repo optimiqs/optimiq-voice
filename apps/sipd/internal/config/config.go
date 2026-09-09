@@ -28,6 +28,8 @@ const (
 
 // Config is sipd's fully-resolved configuration. It is immutable after Load.
 type Config struct {
+	// HealthAddr is an optional private HTTP listener for /healthz and /readyz.
+	HealthAddr string
 	// ListenAddr is the host:port both transports bind. SIPD_LISTEN_ADDR, default 0.0.0.0:5060.
 	ListenAddr string
 	// EnableUDP and EnableTCP toggle the two listeners. SIPD_UDP / SIPD_TCP, both default true.
@@ -50,13 +52,8 @@ type Config struct {
 	// `ListenAndServe` accepts "ws" and "wss" as network names), so this is wiring rather than
 	// implementation.
 	//
-	// # What a WSS listener does NOT deliver
-	//
-	// Audio. SDP stays vanilla here: a WebRTC endpoint needs DTLS-SRTP, and apps/mediad has no SRTP
-	// — plans/mediad-design.md §1 declined pion/webrtc deliberately and left "a separate ingress in
-	// front of the same session model" as an argument nobody has had yet. So WSS delivers
-	// SIGNALLING for a browser client and no media, and saying so is better than shipping half a
-	// feature quietly.
+	// WSS carries SIP signalling. Browser audio is terminated separately by mediad's
+	// optional WebRTC transport; both must be enabled in a browser calling deployment.
 	EnableTLS bool
 	EnableWS  bool
 	EnableWSS bool
@@ -292,6 +289,7 @@ func Load(getenv Getenv) (Config, error) {
 	}
 
 	cfg := Config{
+		HealthAddr:         strings.TrimSpace(getenv("SIPD_HEALTH_ADDR")),
 		ListenAddr:         stringOr(getenv, "SIPD_LISTEN_ADDR", "0.0.0.0:5060"),
 		Realm:              strings.TrimSpace(getenv("SIPD_REALM")),
 		NATSURL:            stringOr(getenv, "NATS_URL", "nats://127.0.0.1:4222"),
@@ -434,6 +432,9 @@ func Load(getenv Getenv) (Config, error) {
 	}
 	if cfg.MaxContactsPerAOR <= 0 {
 		fail("SIPD_MAX_CONTACTS must be positive: zero would refuse every registration")
+	}
+	if cfg.MaxContactsPerAOR > 20 {
+		fail("SIPD_MAX_CONTACTS must not exceed the contract limit of 20")
 	}
 	if cfg.EnableSessionTimers {
 		if cfg.MinSE < 90*time.Second {

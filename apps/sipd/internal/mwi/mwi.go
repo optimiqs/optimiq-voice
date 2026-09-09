@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nats-io/nats.go"
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
@@ -134,13 +135,17 @@ func (s *NATSSource) Updates(ctx context.Context) (<-chan Update, error) {
 	if err != nil {
 		return nil, fmt.Errorf("mwi: subscribing to %s: %w", Subject, err)
 	}
+	subscription.SetClosedHandler(func(string) { close(updates) })
+	if err := s.conn.FlushTimeout(2 * time.Second); err != nil {
+		_ = subscription.Unsubscribe()
+		return nil, fmt.Errorf("mwi: confirming subscription: %w", err)
+	}
 
 	go func() {
 		<-ctx.Done()
 		if err := subscription.Unsubscribe(); err != nil {
 			s.log.Debug("unsubscribing from MWI updates", "error", err)
 		}
-		close(updates)
 	}()
 	return updates, nil
 }

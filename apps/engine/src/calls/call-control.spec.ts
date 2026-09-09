@@ -6,6 +6,7 @@ import { CallSignalBus, legSignalKey, recordingSignalKey } from "../routing/call
 import { CLAIM_LEASE_MS, ParkRegistry } from "../routing/park-registry";
 import { CallControl, pickupGroupFilter, tapSidesFor } from "./call-control";
 import { ParkHandoffError } from "./park-handoff";
+import type { TapRequest } from "../media/media-port";
 import type { FakeMediaPortOptions } from "../media/media-port.fake";
 import type { ClaimBucket } from "../nats/claim-store";
 import type {
@@ -1226,6 +1227,23 @@ describe("the pickup group filter", () => {
 });
 
 describe("on-demand recording", () => {
+	it("records a native media conversation and stops without hanging up the active call", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg], media: { bridgeMode: "proxy-media" } });
+		Object.assign(h.media, {
+			recordConversation: h.media.record.bind(h.media),
+		});
+		const outcome = await h.control.startRecording(leg);
+		expect(outcome.result.ok).toBe(true);
+		expect(h.media.methods()).not.toContain("snoop");
+		expect(h.media.calls.find((call) => call.method === "record")?.args[0]).toBe(
+			leg.mediaChannelId,
+		);
+		const stopped = await h.control.stopRecording(leg);
+		expect(stopped.ok).toBe(true);
+		expect(h.media.methods()).not.toContain("hangup");
+		expect(h.eventsOf("channel.record.stopped")).toHaveLength(1);
+	});
 	it("taps both directions and files the object exactly the way voicemail does", async () => {
 		const leg = fakeLeg("c");
 		const h = harness({ legs: [leg] });
@@ -1309,6 +1327,25 @@ describe("on-demand recording", () => {
 
 		expect(h.eventsOf("channel.record.stopped")).toHaveLength(1);
 		expect(h.control.recordingFor("c")).toBeUndefined();
+	});
+
+	it("retains finalized media details when session release finishes before call cleanup", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+		await h.control.startRecording(leg);
+		h.signals.emit(recordingSignalKey("id-1"), {
+			kind: "recording-finished",
+			durationMs: 4200,
+			bytes: 67244,
+		});
+		await h.control.onLegEnded("c");
+		expect(h.eventsOf("channel.record.stopped")[0]?.data).toMatchObject({
+			durationMs: 4200,
+			bytes: 67244,
+			reason: "completed",
+		});
+		expect(h.media.methods()).not.toContain("stopRecording");
+		expect(h.signals.isWatched(recordingSignalKey("id-1"))).toBe(false);
 	});
 
 	it("refuses to stop a recording that is not running", async () => {
@@ -1453,6 +1490,33 @@ describe("monitor", () => {
 		expect(s.supervisor.bridgeId).toBe(tap?.bridgeId);
 		// And NOT given a bridge peer: the thing on the other side is a tap, which has no leg id.
 		expect(s.supervisor.bridgePeers).toEqual([]);
+	});
+
+	it("uses an existing native supervisor session without waiting for a virtual channel", async () => {
+		const s = supervision();
+		const h = harness({
+			...s.options,
+			tapNeverArrives: true,
+			media: { bridgeMode: "proxy-media" },
+		});
+		Object.assign(h.media, {
+			supportsSupervision: true,
+			tap: async (request: TapRequest) => ({
+				tapId: request.tapId,
+				tapChannelId: request.supervisorChannelId,
+				bridgeId: request.bridgeId,
+			}),
+		});
+		expect(
+			(
+				await h.control.monitor(s.supervisor, {
+					extension: "2002",
+					mode: "eavesdrop",
+					supervisorExtension: "1900",
+				})
+			).ok,
+		).toBe(true);
+		expect(h.media.methods()).not.toContain("hangup");
 	});
 
 	it("subscribes to the tap BEFORE creating it", async () => {

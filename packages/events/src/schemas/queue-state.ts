@@ -78,6 +78,8 @@ export const queueMembershipAgentSchema = z.object({
 	contact: z.string().min(1).max(256),
 	/** The extension row behind an `extension` agent, when there is one. For the CDR and the log. */
 	extensionId: z.uuid().optional(),
+	/** The logical extension number for native SIP routing, independent of the ARI endpoint. */
+	extensionNumber: z.string().min(1).max(32).optional(),
 	/** Ring tier. Lower rings first when tier rules apply. */
 	level: z.int().min(1).max(100),
 	/** Order within a tier. The tie-break every ordered strategy falls back to. */

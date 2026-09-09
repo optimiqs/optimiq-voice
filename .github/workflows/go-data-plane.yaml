@@ -14,6 +14,15 @@ on:
       - "apps/mediad/**"
       - "packages/events/**"
       - "packages/events-go/**"
+      - "packages/runtime-go/**"
+      - "config/nats.conf"
+      - "compose.voice.yaml"
+      - ".scripts/verify-media-cluster.mjs"
+      - ".scripts/verify-browser-calling.mts"
+      - ".scripts/fixtures/browser-softphone.ts"
+      - "apps/web/lib/softphone/**"
+      - "apps/engine/src/media/**"
+      - "apps/engine/src/nats/sipd-command.client.ts"
       - "go.work"
       - ".github/workflows/go-data-plane.yaml"
   workflow_dispatch:
@@ -35,7 +44,7 @@ jobs:
       # that changed, which is the worst shape a gate can have — green, and about the wrong code.
       - name: Verify formatting
         run: |
-          unformatted="$(gofmt -l ./apps/sipd ./apps/mediad ./packages/events-go)"
+          unformatted="$(gofmt -l ./apps/sipd ./apps/mediad ./packages/events-go ./packages/runtime-go)"
           if [ -n "$unformatted" ]; then
             echo "gofmt would rewrite these files:" >&2
             echo "$unformatted" >&2
@@ -44,7 +53,45 @@ jobs:
 
       # `./...` from the workspace root is not a module path; the modules are named explicitly.
       - name: Vet
-        run: go vet ./apps/sipd/... ./apps/mediad/... ./packages/events-go/...
+        run: go vet ./apps/sipd/... ./apps/mediad/... ./packages/events-go/... ./packages/runtime-go/...
+
+      - name: Setup Node for browser verification
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install isolated browser test runtime
+        run: |
+          npm install --prefix "$RUNNER_TEMP/voice-browser" --no-audit --no-fund playwright@1.62.1
+          node "$RUNNER_TEMP/voice-browser/node_modules/playwright/cli.js" install --with-deps chromium --only-shell
+
+      - name: Verify encrypted browser audio and recordings
+        env:
+          RUN_BROWSER_WEBRTC: "1"
+        run: PLAYWRIGHT_MODULE="$RUNNER_TEMP/voice-browser/node_modules/playwright" go test -race -run TestChromiumWebRTCAudioAndRecording -v ./apps/mediad/internal/control
+
+      - name: Setup calling test dependencies
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.20.0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.11"
+
+      - name: Build engine dependencies for real browser calls
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter @optimiq-voice/engine... run build
+
+      - name: Verify SIP browser calling and relay-only UDP and TCP
+        run: |
+          export PLAYWRIGHT_MODULE="$RUNNER_TEMP/voice-browser/node_modules/playwright"
+          pnpm exec tsx .scripts/verify-browser-calling.mts
+          export BROWSER_TURN_PUBLIC_IP="$(hostname -I | awk '{print $1}')"
+          BROWSER_TURN_TRANSPORT=udp pnpm exec tsx .scripts/verify-browser-calling.mts
+          BROWSER_TURN_TRANSPORT=tcp pnpm exec tsx .scripts/verify-browser-calling.mts
 
       # Integration suites need docker and are gated twice (build tag + env var), so they run here
       # explicitly rather than as a side effect of `go test ./...`.

@@ -283,6 +283,7 @@ describe("kv bucket definitions", () => {
 			"conference-claims",
 			"shared-line-state",
 			"media-sessions",
+			"media-owners",
 			"queue-waiting",
 			"sip-dialogs",
 			"trunks",

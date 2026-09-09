@@ -105,6 +105,11 @@ describe("natsConnectionOptions", () => {
 				{ NATS_ENGINE_USER: "optimiq-engine", NATS_ENGINE_PASS: "s3cret", NATS_TLS_CA: "/ca.pem" },
 				"engine",
 			),
-		).toEqual({ user: "optimiq-engine", pass: "s3cret", tls: { caFile: "/ca.pem" } });
+		).toEqual({
+			user: "optimiq-engine",
+			pass: "s3cret",
+			tls: { caFile: "/ca.pem" },
+			inboxPrefix: "_INBOX.engine",
+		});
 	});
 });

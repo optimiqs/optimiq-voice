@@ -38,6 +38,8 @@ FROM node:22-slim
 
 RUN groupadd -g 1001 appuser && useradd -u 1001 -g appuser -m appuser
 
+ENV NODE_ENV=production OPTIMIQ_SERVICE=engine
+
 WORKDIR /service
 
 COPY --from=builder --chown=appuser:appuser /prod/engine ./

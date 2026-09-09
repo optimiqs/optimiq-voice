@@ -198,6 +198,7 @@ export interface MediaRecordingFinishedEvent {
 	readonly type: "recording-finished";
 	readonly recordingName: string;
 	readonly durationMs: number;
+	readonly bytes?: number;
 }
 
 /** Recording failed. `reason` is whatever the media server could say about why. */

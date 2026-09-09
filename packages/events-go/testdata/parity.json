@@ -21,6 +21,7 @@
 		"pbxLastCaller": "rpc.pbx.v1.last-caller",
 		"pbxFileGreeting": "rpc.pbx.v1.file-greeting",
 		"sipCredential": "rpc.sip.v1.credential",
+		"sipTrunkCredential": "rpc.sip.v1.trunk-credential",
 		"sipTransfer": "rpc.sip.v1.transfer",
 		"sipInvite": "rpc.sip.v1.invite",
 		"sipRing": "rpc.sip.v1.ring",
@@ -28,6 +29,8 @@
 		"sipHangup": "rpc.sip.v1.hangup",
 		"sipReinvite": "rpc.sip.v1.reinvite",
 		"sipOriginate": "rpc.sip.v1.originate",
+		"sipResolveTarget": "rpc.sip.v1.resolve-target",
+		"engineRenegotiate": "rpc.engine.v1.renegotiate",
 		"mediaAllocateSession": "rpc.media.v1.allocate-session",
 		"mediaCreateOffer": "rpc.media.v1.create-offer",
 		"mediaAcceptAnswer": "rpc.media.v1.accept-answer",
@@ -958,6 +961,16 @@
 			"history": 1,
 			"storage": "file",
 			"maxValueSizeBytes": 4096,
+			"maxBytes": 134217728,
+			"numReplicas": 1
+		},
+		{
+			"name": "media-owners",
+			"description": "Call placement and media resource ownership, with atomic first-owner claims.",
+			"ttlMs": 21600000,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 1024,
 			"maxBytes": 134217728,
 			"numReplicas": 1
 		},

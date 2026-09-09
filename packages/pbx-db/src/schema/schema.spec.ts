@@ -201,6 +201,8 @@ describe("tenant tables", () => {
 		// outbound faxes ANYWHERE still owe a send?" on the untenanted handle with no session
 		// organization. Partial over the two working statuses, the size of the backlog, not the table.
 		"fax_message_send_queue_idx",
+		// SIP authentication must resolve an organization before a tenant scope can be established.
+		"org_setting_sip_realm_global_key",
 	]);
 
 	it("leads every composite index with organization_id so the tenant predicate is usable", () => {

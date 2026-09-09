@@ -7,6 +7,11 @@
 			"minLength": 1,
 			"maxLength": 128
 		},
+		"engineInstanceId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
 		"orgId": {
 			"type": "string",
 			"format": "uuid",
@@ -28,6 +33,11 @@
 					"type": "string",
 					"minLength": 3,
 					"maxLength": 512
+				},
+				"contactUri": {
+					"type": "string",
+					"minLength": 3,
+					"maxLength": 1024
 				},
 				"trunkId": {
 					"type": "string",

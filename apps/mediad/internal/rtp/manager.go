@@ -61,6 +61,7 @@ type Descriptor struct {
 // call site can tell which string is which, and because the next rung adds fields to it rather than
 // arguments to every caller.
 type AllocateOptions struct {
+	Transport PacketTransport
 	// SessionID is caller-assigned and required. See the note on Allocate.
 	SessionID string
 	// OrgID, CallID and LegID travel to the session directory and the lifecycle events. mediad
@@ -319,6 +320,9 @@ func (m *Manager) Allocate(opts AllocateOptions) (Descriptor, error) {
 	}
 	if existing, ok := m.sessions[sessionID]; ok {
 		m.mu.Unlock()
+		if (existing.transport == nil) != (opts.Transport == nil) {
+			return Descriptor{}, errors.New("rtp: a live session cannot change its transport")
+		}
 		return m.describe(existing), nil
 	}
 	m.mu.Unlock()
@@ -331,6 +335,7 @@ func (m *Manager) Allocate(opts AllocateOptions) (Descriptor, error) {
 	}
 
 	session, err := NewSession(Options{
+		Transport:                 opts.Transport,
 		ID:                        sessionID,
 		MuteIn:                    opts.MuteIn,
 		MuteOut:                   opts.MuteOut,
@@ -364,6 +369,9 @@ func (m *Manager) Allocate(opts AllocateOptions) (Descriptor, error) {
 	if existing, ok := m.sessions[sessionID]; ok {
 		m.mu.Unlock()
 		_ = session.Close()
+		if (existing.transport == nil) != (opts.Transport == nil) {
+			return Descriptor{}, errors.New("rtp: a live session cannot change its transport")
+		}
 		return m.describe(existing), nil
 	}
 	m.sessions[sessionID] = session
@@ -412,6 +420,9 @@ func (m *Manager) ApplyDirection(sessionID string, muteIn, muteOut bool) error {
 	session, err := m.liveSession(sessionID)
 	if err != nil {
 		return err
+	}
+	if (session.mutedIn.Load() || session.mutedOut.Load()) && !muteIn && !muteOut {
+		session.rtpGraceUntil.Store(m.now().Add(m.rtpTimeout).UnixMilli())
 	}
 	session.mutedIn.Store(muteIn)
 	if session.mutedOut.Swap(muteOut) && !muteOut {
@@ -1026,6 +1037,9 @@ func (m *Manager) ReapIdle() int {
 	m.mu.Lock()
 	var stale []expiry
 	for id, session := range m.sessions {
+		if session.held.Load() || session.mutedIn.Load() || session.mutedOut.Load() || now.UnixMilli() < session.rtpGraceUntil.Load() {
+			continue
+		}
 		idle := session.Idle(now)
 		heardSomething := session.Stats().LastPacketUnixMs != 0
 

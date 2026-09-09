@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+	<meta charset="utf-8" /><title>WebRTC media verification</title>
+	<body>
+		<p id="status">Testing browser audio…</p>
+		<audio id="remote" autoplay></audio>
+		<script>
+			(async () => {
+				const status = document.querySelector("#status");
+				const mode = new URL(location.href).searchParams.get("mode");
+				const call = {
+					sessionId: "browser",
+					orgId: "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+					callId: "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c",
+					direction: "sendrecv",
+				};
+				const rpc = async (path, body) => {
+					const reply = await (
+						await fetch(path, {
+							method: "POST",
+							headers: { "Content-Type": "application/json" },
+							body: JSON.stringify(body),
+						})
+					).json();
+					if (!reply.ok) throw Error(path + ": " + JSON.stringify(reply));
+					return reply;
+				};
+				const pc = new RTCPeerConnection();
+				const audio = new AudioContext();
+				const oscillator = audio.createOscillator();
+				const destination = audio.createMediaStreamDestination();
+				oscillator.frequency.value = 660;
+				oscillator.connect(destination);
+				oscillator.start();
+				await audio.resume();
+				destination.stream.getTracks().forEach((track) => pc.addTrack(track, destination.stream));
+				pc.ontrack = (event) => {
+					document.querySelector("#remote").srcObject = new MediaStream([event.track]);
+				};
+				const gather = () =>
+					pc.iceGatheringState === "complete"
+						? Promise.resolve()
+						: new Promise((resolve) => {
+								const changed = () => {
+									if (pc.iceGatheringState === "complete") {
+										pc.removeEventListener("icegatheringstatechange", changed);
+										resolve();
+									}
+								};
+								pc.addEventListener("icegatheringstatechange", changed);
+							});
+				try {
+					if (mode === "server-originated") {
+						const offer = await rpc("/offer", { ...call, transport: "webrtc" });
+						await pc.setRemoteDescription({ type: "offer", sdp: offer.sdpOffer });
+						await pc.setLocalDescription(await pc.createAnswer());
+						await gather();
+						await rpc("/answer", { sessionId: call.sessionId, sdpAnswer: pc.localDescription.sdp });
+					} else {
+						await pc.setLocalDescription(await pc.createOffer());
+						await gather();
+						const answer = await rpc("/allocate", { ...call, sdpOffer: pc.localDescription.sdp });
+						await pc.setRemoteDescription({ type: "answer", sdp: answer.sdpAnswer });
+					}
+					await rpc("/bridge", { bridgeId: "browser-bridge", sessionIds: ["browser", "phone"] });
+					await rpc("/record", {
+						sessionId: "browser",
+						recordingRef: "browser-record",
+						format: "wav",
+						direction: "both",
+					});
+					const deadline = Date.now() + 12000;
+					let evidence;
+					while (Date.now() < deadline) {
+						await new Promise((resolve) => setTimeout(resolve, 200));
+						const stats = await pc.getStats();
+						const inbound = [...stats.values()].find(
+							(report) => report.type === "inbound-rtp" && report.kind === "audio",
+						);
+						const phone = await (await fetch("/stats")).json();
+						if (
+							inbound?.packetsReceived > 30 &&
+							inbound?.totalAudioEnergy > 0 &&
+							phone.receivedAudio > 30
+						) {
+							evidence = {
+								packetsReceived: inbound.packetsReceived,
+								audioEnergy: inbound.totalAudioEnergy,
+								phoneAudioPackets: phone.receivedAudio,
+							};
+							break;
+						}
+					}
+					if (!evidence)
+						throw Error(
+							"Bidirectional browser audio did not reach the minimum packet and energy thresholds",
+						);
+					await rpc("/stop-record", { recordingRef: "browser-record" });
+					await rpc("/release", { sessionId: "browser" });
+					window.result = { ok: true, mode, ...evidence };
+					status.textContent =
+						"Passed: encrypted browser audio in both directions, recording and release.";
+				} catch (error) {
+					window.result = { ok: false, mode, error: String(error) };
+					status.textContent = String(error);
+				} finally {
+					pc.close();
+					oscillator.stop();
+					await audio.close();
+				}
+			})();
+		</script>
+	</body>
+</html>

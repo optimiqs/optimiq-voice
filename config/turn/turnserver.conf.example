@@ -1,0 +1,31 @@
+# Copy to turnserver.conf, restrict to the deployment operator, and replace every placeholder.
+# The API's PROVISION_TURN_SECRET must match static-auth-secret. Do not commit the real file.
+listening-port=3478
+tls-listening-port=5349
+min-port=32000
+max-port=32999
+fingerprint
+use-auth-secret
+static-auth-secret=REPLACE_WITH_RANDOM_SECRET_AT_LEAST_32_CHARACTERS
+realm=turn.example.com
+server-name=turn.example.com
+# With compose.voice.yaml coturn uses the Linux host network.
+# Public address routed to this host. For a private host behind NAT use public-ip/private-ip.
+external-ip=203.0.113.10
+cert=/etc/optimiq/certs/fullchain.pem
+pkey=/etc/optimiq/certs/privkey.pem
+no-tlsv1
+no-tlsv1_1
+no-dtls
+no-cli
+no-multicast-peers
+no-tcp-relay
+user-quota=12
+total-quota=1200
+log-file=stdout
+simple-log
+# Relays may reach only mediad. An explicit allow overrides this deny-all rule.
+# Replace with every media node's advertised public IPv4 address, never a whole tenant network.
+denied-peer-ip=0.0.0.0-255.255.255.255
+denied-peer-ip=::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+allowed-peer-ip=203.0.113.10

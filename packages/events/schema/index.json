@@ -446,6 +446,14 @@
 			"goResponseType": "SipCredentialResponse"
 		},
 		{
+			"subject": "rpc.sip.v1.trunk-credential",
+			"timeoutMs": 5000,
+			"requestSchema": "rpc/rpc.sip.v1.trunk-credential.request.schema.json",
+			"responseSchema": "rpc/rpc.sip.v1.trunk-credential.response.schema.json",
+			"goRequestType": "SipTrunkCredentialRequest",
+			"goResponseType": "SipTrunkCredentialResponse"
+		},
+		{
 			"subject": "rpc.sip.v1.transfer",
 			"timeoutMs": 2000,
 			"requestSchema": "rpc/rpc.sip.v1.transfer.request.schema.json",
@@ -500,6 +508,22 @@
 			"responseSchema": "rpc/rpc.sip.v1.originate.response.schema.json",
 			"goRequestType": "SipOriginateRequest",
 			"goResponseType": "SipOriginateResponse"
+		},
+		{
+			"subject": "rpc.sip.v1.resolve-target",
+			"timeoutMs": 2000,
+			"requestSchema": "rpc/rpc.sip.v1.resolve-target.request.schema.json",
+			"responseSchema": "rpc/rpc.sip.v1.resolve-target.response.schema.json",
+			"goRequestType": "SipResolveTargetRequest",
+			"goResponseType": "SipResolveTargetResponse"
+		},
+		{
+			"subject": "rpc.engine.v1.renegotiate",
+			"timeoutMs": 4000,
+			"requestSchema": "rpc/rpc.engine.v1.renegotiate.request.schema.json",
+			"responseSchema": "rpc/rpc.engine.v1.renegotiate.response.schema.json",
+			"goRequestType": "EngineRenegotiateRequest",
+			"goResponseType": "EngineRenegotiateResponse"
 		},
 		{
 			"subject": "rpc.media.v1.allocate-session",
@@ -660,6 +684,13 @@
 			"responseSchema": "rpc/rpc.session.v1.announce.response.schema.json",
 			"goRequestType": "SessionAnnounceRequest",
 			"goResponseType": "SessionAnnounceResponse"
+		}
+	],
+	"liveState": [
+		{
+			"bucket": "trunks",
+			"schema": "live-state/trunks.schema.json",
+			"goType": "TrunkDirectoryEntry"
 		}
 	]
 }

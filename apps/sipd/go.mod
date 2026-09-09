@@ -3,6 +3,7 @@ module github.com/optimiqs/optimiq-voice/apps/sipd
 go 1.26
 
 require (
+	github.com/optimiqs/optimiq-voice/packages/runtime-go v0.0.0
 	github.com/emiago/sipgo v1.4.3
 	github.com/icholy/digest v1.1.0
 	github.com/nats-io/nats.go v1.52.0
@@ -27,3 +28,5 @@ require (
 // workspace resolves it for day-to-day work and this replace keeps `go build` inside apps/sipd
 // working on its own (GOWORK=off, and any CI job that builds one module at a time).
 replace github.com/optimiqs/optimiq-voice/packages/events-go => ../../packages/events-go
+
+replace github.com/optimiqs/optimiq-voice/packages/runtime-go => ../../packages/runtime-go

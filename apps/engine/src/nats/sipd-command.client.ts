@@ -3,11 +3,14 @@ import {
 	SIP_ANSWER_RPC,
 	SIP_HANGUP_RPC,
 	SIP_ORIGINATE_RPC,
+	SIP_RESOLVE_TARGET_RPC,
+	RPC_SUBJECTS,
 	SIP_REINVITE_RPC,
 	SIP_RING_RPC,
 	sipAnswerResponseSchema,
 	sipHangupResponseSchema,
 	sipOriginateResponseSchema,
+	sipResolveTargetResponseSchema,
 	sipReinviteResponseSchema,
 	sipRingResponseSchema,
 	subjectFor,
@@ -21,6 +24,8 @@ import type {
 	SipHangupResponse,
 	SipOriginateRequest,
 	SipOriginateResponse,
+	SipResolveTargetRequest,
+	SipResolveTargetResponse,
 	SipReinviteRequest,
 	SipReinviteResponse,
 	SipRingRequest,
@@ -97,7 +102,8 @@ export interface SipdCommandPort {
 	 * Place a call. Flat and queue-grouped: whichever edge answers becomes the leg's owner, and the
 	 * reply's `instanceId` is what every later command on that leg must be addressed at.
 	 */
-	originate(request: SipOriginateRequest): Promise<SipOriginateResponse>;
+	originate(request: SipOriginateRequest, instanceId?: string): Promise<SipOriginateResponse>;
+	resolveTarget?(request: SipResolveTargetRequest): Promise<SipResolveTargetResponse>;
 }
 
 /** {@link SipdCommandPort} over a live NATS connection. */
@@ -158,9 +164,21 @@ export class SipdCommandClient implements SipdCommandPort {
 		);
 	}
 
-	async originate(request: SipOriginateRequest): Promise<SipOriginateResponse> {
+	async resolveTarget(request: SipResolveTargetRequest): Promise<SipResolveTargetResponse> {
 		return await this.command(
-			subjectFor.sipOriginateRpc(),
+			RPC_SUBJECTS.sipResolveTarget,
+			request,
+			SIP_RESOLVE_TARGET_RPC.timeoutMs,
+			sipResolveTargetResponseSchema,
+		);
+	}
+
+	async originate(
+		request: SipOriginateRequest,
+		instanceId?: string,
+	): Promise<SipOriginateResponse> {
+		return await this.command(
+			subjectFor.sipOriginateRpc(instanceId),
 			request,
 			SIP_ORIGINATE_RPC.timeoutMs,
 			sipOriginateResponseSchema,

@@ -13,6 +13,7 @@ import {
 import { makeAuditEvent } from "../src/schemas/audit-events";
 import { makeCallEvent } from "../src/schemas/call-events";
 import { makeCdrLegWriteEvent } from "../src/schemas/cdr-events";
+import { trunkDirectoryEntrySchema } from "../src/schemas/live-state";
 import { makeMediaEvent } from "../src/schemas/media-events";
 import { makeProvisionEvent } from "../src/schemas/provision-events";
 import { makeQueueEvent } from "../src/schemas/queue-events";
@@ -222,6 +223,13 @@ function emitJsonSchemas(): {
 		subjectRoots: SUBJECT_ROOTS,
 		events,
 		rpc,
+		liveState: [
+			{
+				bucket: "trunks",
+				schema: "live-state/trunks.schema.json",
+				goType: "TrunkDirectoryEntry",
+			},
+		],
 	});
 
 	return { eventSchemas, rpcSchemas };
@@ -447,6 +455,19 @@ function emitGo(
 	);
 
 	emitHangupCauses();
+
+	const trunkSchema = toJsonSchema(trunkDirectoryEntrySchema);
+	writeJson(join(SCHEMA_DIR, "live-state/trunks.schema.json"), trunkSchema);
+	const trunkEmitter = new GoFileEmitter({ namedEnums: NAMED_ENUMS });
+	trunkEmitter.declareStruct(
+		"TrunkDirectoryEntry",
+		["the API projection stored in the trunks KV bucket."],
+		withoutDialect(trunkSchema),
+	);
+	writeText(
+		join(GO_DIR, "trunk_directory_gen.go"),
+		trunkEmitter.render(["Trunk directory contract from schemas/live-state.ts."], "events"),
+	);
 
 	// -- one file per family ----------------------------------------------------------------------
 	for (const family of FAMILY_ORDER) {

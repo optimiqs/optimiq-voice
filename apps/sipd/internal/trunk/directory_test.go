@@ -2,6 +2,8 @@ package trunk
 
 import (
 	"context"
+	"encoding/json"
+	"os"
 	"testing"
 	"time"
 
@@ -15,13 +17,13 @@ const (
 
 func testRecord() Record {
 	return Record{
-		ID:                     directoryTrunk,
-		OrganizationID:         directoryOrg,
+		TrunkID:                directoryTrunk,
+		OrgID:                  directoryOrg,
 		Name:                   "Telnyx",
 		Kind:                   "register",
 		SIPDomain:              "sip.telnyx.example",
 		SIPProxy:               "sip.telnyx.example:5060",
-		AuthUser:               "acme",
+		AuthUser:               new("acme"),
 		RegisterExpiresSeconds: 600,
 		Transport:              "UDP",
 		Enabled:                true,
@@ -52,14 +54,6 @@ func TestTheRegistrarInheritsTheProxyWhenUnset(t *testing.T) {
 		t.Fatalf("registrar = %q, want the proxy", config.Registrar)
 	}
 
-	split := testRecord()
-	split.Registrar = "registrar.telnyx.example"
-	if got := split.Config().Registrar; got != "registrar.telnyx.example" {
-		t.Fatalf("registrar = %q, want the explicit one", got)
-	}
-	if got := split.Config().SIPProxy; got != "sip.telnyx.example:5060" {
-		t.Fatalf("sipProxy = %q, want it kept apart from the registrar", got)
-	}
 }
 
 // A record written by an older writer may omit the interval, and a registering trunk with a zero
@@ -120,7 +114,6 @@ func TestAnInvalidRecordDoesNotReplaceAWorkingOne(t *testing.T) {
 
 	broken := testRecord()
 	broken.SIPProxy = ""
-	broken.Registrar = ""
 	if err := directory.Put(key, broken.Config()); err == nil {
 		t.Fatal("a registering trunk with no registrar was accepted")
 	}
@@ -146,23 +139,52 @@ func TestRemovingATrunkTakesEffectImmediately(t *testing.T) {
 	}
 }
 
-// sameConfig compares what the MACHINE reads, so a rename or a codec-preference edit does not
+// sameConfig compares what the machine reads, so a rename or a capacity edit does not
 // restart a gateway and put a REGISTER on the wire for nothing.
 func TestARenameDoesNotRestartAGateway(t *testing.T) {
 	left := testRecord().Config()
 	renamed := testRecord()
 	renamed.Name = "Telnyx (EU)"
-	renamed.CodecPrefs = "PCMA,PCMU"
-	renamed.MaxChannels = 40
+	renamed.MaxChannels = new(40)
 
 	if !sameConfig(left, renamed.Config()) {
-		t.Fatal("a rename or a codec-preference edit would restart the gateway")
+		t.Fatal("a rename or a capacity edit would restart the gateway")
 	}
 
 	moved := testRecord()
 	moved.SIPProxy = "sip2.telnyx.example:5060"
 	if sameConfig(left, moved.Config()) {
 		t.Fatal("a changed proxy did not restart the gateway; it would fail over to an address that is gone")
+	}
+}
+
+func TestAPIPublishedTrunkReachesDirectory(t *testing.T) {
+	raw, err := os.ReadFile("testdata/api_projection.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record Record
+	if err := json.Unmarshal(raw, &record); err != nil {
+		t.Fatal(err)
+	}
+	config := record.Config()
+	key, err := contract.TrunkKVKey(config.OrgID, config.TrunkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := NewDirectory(nil)
+	if err := directory.Put(key, config); err != nil {
+		t.Fatalf("API projection rejected: %v", err)
+	}
+	resolved, found := directory.Trunk("019fd3c2-1111-76be-a6b3-b0f1914e39b6", "019fd3c2-3333-76be-a6b3-b0f1914e39b6")
+	if !found || !resolved.Register || resolved.AuthUser != "optimiq-outbound" ||
+		resolved.SecretRef != "secret://pbx/trunk/telnyx" ||
+		resolved.Registrar != "sip.telnyx.example:5060" {
+		t.Fatalf("API trunk lost its identity or registration configuration: %+v", resolved)
+	}
+	otherKey, _ := contract.TrunkKVKey(directoryOrg, config.TrunkID)
+	if err := directory.Put(otherKey, config); err == nil {
+		t.Fatal("a trunk was accepted under another organization's key")
 	}
 }
 
@@ -181,7 +203,7 @@ func TestTheSupervisorReconcilesAgainstTheDirectory(t *testing.T) {
 	ipAuth := testRecord()
 	ipAuth.Kind = "ip-auth"
 	second := testRecord()
-	second.ID = "018f0000-0000-7000-8000-0000000000t2"
+	second.TrunkID = "018f0000-0000-7000-8000-0000000000t2"
 	second.Kind = "ip-auth"
 
 	supervisor.Apply(t.Context(), []Config{ipAuth.Config(), second.Config()})

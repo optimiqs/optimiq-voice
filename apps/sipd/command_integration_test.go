@@ -437,7 +437,7 @@ func TestTheTrunkDirectoryWatchDeliversARecord(t *testing.T) {
 		t.Fatalf("TrunkKVKey: %v", err)
 	}
 	record, err := json.Marshal(trunk.Record{
-		ID: trunkID, OrganizationID: itOrg, Name: "Telnyx", Kind: "ip-auth",
+		TrunkID: trunkID, OrgID: itOrg, Name: "Telnyx", Kind: "ip-auth",
 		SIPDomain: "sip.telnyx.example", SIPProxy: "sip.telnyx.example:5060",
 		Transport: "udp", Enabled: true,
 	})

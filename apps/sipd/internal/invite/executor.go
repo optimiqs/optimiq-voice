@@ -29,13 +29,20 @@ var _ dialog.EffectHandler = (*executor)(nil)
 
 // Handle implements dialog.EffectHandler.
 func (e *executor) Handle(ctx context.Context, d *dialog.Dialog, effect dialog.Effect) error {
+	if d.State().Answered() {
+		e.stopRingTimer()
+	}
+	if (d.State() == dialog.StateTerminating || d.State() == dialog.StateTerminated) && e.state.authCancel != nil {
+		e.state.authCancel()
+		e.state.authCancel = nil
+	}
 	switch effect.Kind {
 	case dialog.EffectRespond:
 		return e.respondToInvite(d, effect)
 	case dialog.EffectRespondToRequest:
-		return e.respondToPending(effect)
+		return e.respondToPending(d, effect)
 	case dialog.EffectRespondToCancel:
-		return e.respondToPending(effect)
+		return e.respondToPending(d, effect)
 	case dialog.EffectStopRetransmit:
 		e.stopRetransmit()
 		return nil
@@ -228,16 +235,23 @@ func (e *executor) respondToInvite(d *dialog.Dialog, effect dialog.Effect) error
 }
 
 // respondToPending answers the mid-dialog request currently being processed.
-func (e *executor) respondToPending(effect dialog.Effect) error {
+func (e *executor) respondToPending(d *dialog.Dialog, effect dialog.Effect) error {
 	if e.state.pendingTx == nil || e.state.pending == nil {
 		return errors.New("invite: no pending request to respond to")
 	}
 	res := sip.NewResponseFromRequest(e.state.pending, effect.Status, effect.Reason, effect.Body)
+	answeredInvite := e.state.pending.Method == sip.INVITE && effect.Status >= 200 && effect.Status < 300
+	if answeredInvite {
+		res.AppendHeader(&sip.ContactHeader{Address: e.handler.contact})
+	}
 	if len(effect.Body) > 0 {
 		res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 	}
 	res.AppendHeader(sip.NewHeader("Server", e.handler.server))
 	err := e.state.pendingTx.Respond(res)
+	if err == nil && answeredInvite {
+		e.startRetransmit(d, res)
+	}
 	e.state.pending, e.state.pendingTx = nil, nil
 	return err
 }
@@ -364,6 +378,22 @@ func (e *executor) sendBye(ctx context.Context, d *dialog.Dialog, effect dialog.
 	req := buildBye(d, e.state.local, e.state.remote, e.state.localCSeq,
 		effect.Cause, e.state.profile.NAT, e.handler.contact)
 	req.AppendHeader(sip.NewHeader("User-Agent", e.handler.server))
+	if requester, ok := e.handler.requester.(interface {
+		SendAndWait(context.Context, *sip.Request) error
+	}); ok {
+		legID := d.LegID
+		e.handler.backgroundWork.Add(1)
+		go func() {
+			defer e.handler.backgroundWork.Done()
+			waitCtx, cancel := context.WithTimeout(e.handler.baseCtx, 32*time.Second)
+			defer cancel()
+			if err := requester.SendAndWait(waitCtx, req); err != nil {
+				e.handler.log.Warn("SIP teardown did not receive a final response", "legId", legID)
+			}
+			e.handler.post(legID, dialog.Input{Trigger: dialog.TriggerTeardownComplete})
+		}()
+		return nil
+	}
 	return e.handler.requester.Send(ctx, req)
 }
 

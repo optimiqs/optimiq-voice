@@ -3,6 +3,7 @@ package invite
 import (
 	"context"
 	"errors"
+	"net"
 	"strconv"
 	"strings"
 
@@ -46,14 +47,34 @@ func NewClientRequester(client *sipgo.Client) (*ClientRequester, error) {
 
 // Send implements Requester.
 func (r *ClientRequester) Send(ctx context.Context, req *sip.Request) error {
+	if req.IsAck() {
+		return r.client.WriteRequest(req)
+	}
 	tx, err := r.client.TransactionRequest(ctx, req)
 	if err != nil {
 		return err
 	}
-	// Terminating immediately abandons the response, not the retransmissions: the transaction layer
-	// owns those and keeps them until its own timer gives up.
-	tx.Terminate()
+	// Keep the transaction alive until its final response or timeout so UDP retransmissions work.
+	go func() {
+		defer tx.Terminate()
+		for {
+			select {
+			case <-tx.Done():
+				return
+			case response, ok := <-tx.Responses():
+				if !ok || response.StatusCode >= 200 {
+					return
+				}
+			}
+		}
+	}()
 	return nil
+}
+
+// SendAndWait is used for BYE so the dialog can release ownership when teardown finishes.
+func (r *ClientRequester) SendAndWait(ctx context.Context, req *sip.Request) error {
+	_, err := r.client.Do(ctx, req)
+	return err
 }
 
 // DiscardRequester drops every request. It backs the tests that assert on state rather than on the
@@ -109,18 +130,48 @@ func buildInDialog(
 	req.AppendHeader(&sip.ContactHeader{Address: contact})
 	req.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
 
+	routes := make([]sip.Uri, 0, len(dlg.Target.RouteSet))
 	for _, route := range dlg.Target.RouteSet {
-		req.AppendHeader(sip.NewHeader("Route", route))
+		var address sip.Uri
+		if _, err := sip.ParseAddressValue(route, &address, nil); err == nil {
+			routes = append(routes, address)
+		}
 	}
 	if transport := dlg.Target.Transport; transport != "" {
 		req.SetTransport(strings.ToUpper(transport))
+	}
+	if len(routes) > 0 {
+		first := routes[0]
+		_, loose := first.UriParams.Get("lr")
+		if !loose {
+			// RFC 3261 §12.2.1.1: a strict router becomes the Request-URI;
+			// the remote target moves to the end of the remaining route set.
+			req.Recipient = first
+			req.Recipient.Headers = nil
+			routes = append(routes[1:], target)
+			if transport, ok := first.UriParams.Get("transport"); ok {
+				req.SetTransport(strings.ToUpper(transport))
+			}
+			if first.IsEncrypted() {
+				req.SetTransport("TLS")
+			}
+			port := first.Port
+			if port == 0 {
+				port = int(sip.DefaultPort(req.Transport()))
+			}
+			// sipgo normally sends to the first Route header, which is the SECOND
+			// proxy after strict-route rewriting. Pin the actual first hop here.
+			req.SetDestination(net.JoinHostPort(strings.Trim(first.Host, "[]"), strconv.Itoa(port)))
+		}
+		for _, address := range routes {
+			req.AppendHeader(&sip.RouteHeader{Address: address})
+		}
+		return req
 	}
 	if decision.Destination != "" {
 		// The Contact stays the address and the observed source becomes the destination — the same
 		// split `transfer/handler.go` already draws for NOTIFY, generalised (design §9.9).
 		req.SetDestination(decision.Destination)
-	} else if dlg.Target.Observed != "" {
-		req.SetDestination(dlg.Target.Observed)
 	}
 	return req
 }
@@ -200,9 +251,7 @@ func buildAck(
 // routeSetOf extracts the Record-Route headers from a message, in the order mid-dialog requests
 // must traverse them.
 //
-// For a UAS the order is the Record-Route order reversed — the first proxy to record-route is the
-// one closest to the CALLER, and our requests travel away from us — and getting it backwards routes
-// every BYE through the proxies in the wrong order, which most of them simply drop.
+// RFC 3261 §12.1: UAS preserves request order; UAC reverses response order.
 func routeSetOf(headers []sip.Header, role dialog.Role) []string {
 	routes := make([]string, 0, len(headers))
 	for _, header := range headers {
@@ -212,7 +261,7 @@ func routeSetOf(headers []sip.Header, role dialog.Role) []string {
 			}
 		}
 	}
-	if role == dialog.RoleUAS {
+	if role == dialog.RoleUAC {
 		for left, right := 0, len(routes)-1; left < right; left, right = left+1, right-1 {
 			routes[left], routes[right] = routes[right], routes[left]
 		}

@@ -9,6 +9,7 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -27,9 +28,11 @@ import (
 // transition and is consumed once, whereas this record has to answer "where do I send an INVITE
 // for this AOR, and until when" long after the REGISTER is forgotten.
 type Binding struct {
-	OrgID   string `json:"orgId"`
-	AOR     string `json:"aor"`
-	AORHash string `json:"aorHash"`
+	Revision       uint64 `json:"-"`
+	SIPDInstanceID string `json:"sipdInstanceId,omitempty"`
+	OrgID          string `json:"orgId"`
+	AOR            string `json:"aor"`
+	AORHash        string `json:"aorHash"`
 	// Contact is the URI exactly as the device offered it, parameters included. Rewriting it is
 	// the proxy's job at INVITE time, not the registrar's at REGISTER time.
 	Contact   string                `json:"contact"`
@@ -96,6 +99,7 @@ type Binding struct {
 // lives, because internal/aor imports this package and the reverse would be a cycle. The bucket's
 // value shape belongs to the package that owns the bucket.
 type Contact struct {
+	SIPDInstanceID string `json:"sipdInstanceId,omitempty"`
 	// URI is the contact exactly as the device offered it, parameters included. Never routable on
 	// its own from outside this process: a device behind NAT advertises a private address here,
 	// which is what SourceAddress exists for.
@@ -149,12 +153,76 @@ func (b Binding) RegisteredFor(now time.Time) time.Duration {
 //
 // Implementations must be safe for concurrent use.
 type Store interface {
+	// Update atomically changes one AOR. The callback may run repeatedly on CAS conflicts and
+	// must have no side effects. Returning nil deletes the binding. Results are the committed
+	// before/after values; nil denotes absence.
+	Update(ctx context.Context, orgID, aorHash string, change func(*Binding) (*Binding, error)) (*Binding, *Binding, error)
 	Put(ctx context.Context, binding Binding) error
 	Get(ctx context.Context, orgID, aorHash string) (Binding, bool, error)
 	Delete(ctx context.Context, orgID, aorHash string) error
 	// All returns every binding in the bucket. Used once at boot to adopt bindings a previous
 	// instance granted; it is not on any request path.
 	All(ctx context.Context) ([]Binding, error)
+}
+
+var ErrConcurrentUpdate = errors.New("kv: registration changed too often to update")
+
+func (s *NATSStore) Update(ctx context.Context, orgID, aorHash string, change func(*Binding) (*Binding, error)) (*Binding, *Binding, error) {
+	key, err := contract.RegistrationKVKey(orgID, aorHash)
+	if err != nil {
+		return nil, nil, err
+	}
+	for attempt := 0; attempt < 16; attempt++ {
+		var previous *Binding
+		var revision uint64
+		entry, err := s.bucket.Get(ctx, key)
+		if err == nil {
+			previous = &Binding{}
+			if err := json.Unmarshal(entry.Value(), previous); err != nil {
+				return nil, nil, err
+			}
+			revision = entry.Revision()
+			previous.Revision = revision
+		} else if !errors.Is(err, jetstream.ErrKeyNotFound) && !errors.Is(err, jetstream.ErrKeyDeleted) {
+			return nil, nil, err
+		}
+		next, err := change(previous)
+		if err != nil {
+			return nil, nil, err
+		}
+		if previous == nil && next == nil {
+			return nil, nil, nil
+		}
+		if next == nil {
+			err = s.bucket.Delete(ctx, key, jetstream.LastRevision(revision))
+		} else {
+			if next.OrgID != orgID || next.AORHash != aorHash {
+				return nil, nil, errors.New("kv: registration update changed its key")
+			}
+			value, marshalErr := json.Marshal(next)
+			if marshalErr != nil {
+				return nil, nil, marshalErr
+			}
+			if previous != nil && bytes.Equal(value, entry.Value()) {
+				return previous, next, nil
+			}
+			if revision == 0 {
+				next.Revision, err = s.bucket.Create(ctx, key, value)
+			} else {
+				next.Revision, err = s.bucket.Update(ctx, key, value, revision)
+			}
+		}
+		if err == nil {
+			return previous, next, nil
+		}
+		if !errors.Is(err, jetstream.ErrKeyExists) && !errors.Is(err, jetstream.ErrKeyNotFound) {
+			return nil, nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+	}
+	return nil, nil, ErrConcurrentUpdate
 }
 
 // NATSStore is the production Store, backed by the registrations KV bucket.
@@ -227,6 +295,7 @@ func (s *NATSStore) Get(ctx context.Context, orgID, aorHash string) (Binding, bo
 	if err := json.Unmarshal(entry.Value(), &binding); err != nil {
 		return Binding{}, false, fmt.Errorf("kv: decoding binding %s: %w", key, err)
 	}
+	binding.Revision = entry.Revision()
 	return binding, true, nil
 }
 
@@ -267,6 +336,7 @@ func (s *NATSStore) All(ctx context.Context) ([]Binding, error) {
 			// One poisoned value must not stop a boot from adopting the rest.
 			continue
 		}
+		binding.Revision = entry.Revision()
 		bindings = append(bindings, binding)
 	}
 	return bindings, nil
@@ -276,6 +346,7 @@ func (s *NATSStore) All(ctx context.Context) ([]Binding, error) {
 // during development; it is NOT a deployment option, because a binding only one instance knows
 // about is a call the rest of the fleet cannot deliver.
 type MemoryStore struct {
+	revision uint64
 	mu       sync.RWMutex
 	bindings map[string]Binding
 }
@@ -287,6 +358,34 @@ func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{bindings: make(map[string]Binding)}
 }
 
+func (s *MemoryStore) Update(_ context.Context, orgID, aorHash string, change func(*Binding) (*Binding, error)) (*Binding, *Binding, error) {
+	key, err := contract.RegistrationKVKey(orgID, aorHash)
+	if err != nil {
+		return nil, nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var previous *Binding
+	if value, found := s.bindings[key]; found {
+		previous = &value
+	}
+	next, err := change(previous)
+	if err != nil {
+		return nil, nil, err
+	}
+	if next == nil {
+		delete(s.bindings, key)
+	} else {
+		if next.OrgID != orgID || next.AORHash != aorHash {
+			return nil, nil, errors.New("kv: registration update changed its key")
+		}
+		s.revision++
+		next.Revision = s.revision
+		s.bindings[key] = *next
+	}
+	return previous, next, nil
+}
+
 // Put implements Store.
 func (s *MemoryStore) Put(_ context.Context, binding Binding) error {
 	key, err := binding.Key()
@@ -295,6 +394,8 @@ func (s *MemoryStore) Put(_ context.Context, binding Binding) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.revision++
+	binding.Revision = s.revision
 	s.bindings[key] = binding
 	return nil
 }

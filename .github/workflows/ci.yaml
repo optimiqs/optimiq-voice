@@ -147,3 +147,7 @@ jobs:
       - name: Test packages/events-go
         working-directory: packages/events-go
         run: go test ./...
+
+      - name: Test packages/runtime-go
+        working-directory: packages/runtime-go
+        run: go test ./...

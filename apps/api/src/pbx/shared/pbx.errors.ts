@@ -303,6 +303,7 @@ const UNIQUE_VIOLATION = "23505";
  * disclose in order to be enforceable at all.
  */
 const PLATFORM_WIDE_CONSTRAINTS: Readonly<Record<string, string>> = {
+	org_setting_sip_realm_global_key: "This SIP domain is already assigned to another organization.",
 	phone_number_e164_global_key:
 		"That number is already provisioned on this platform. A DID has exactly one owner, so it " +
 		"has to be released from wherever it is configured before it can be added here.",

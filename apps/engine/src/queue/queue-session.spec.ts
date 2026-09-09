@@ -466,6 +466,16 @@ describe("joining a queue", () => {
 // =================================================================================================
 
 describe("distributing to agents", () => {
+	it("carries a logical extension number separately from the media endpoint", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { contact: "PJSIP/1002", extensionNumber: "1002" })],
+			dials: [{ kind: "answer" }],
+		});
+		await h.session.run();
+		expect(h.dialled[0]?.[0]?.endpoint).toBe("PJSIP/1002");
+		expect(h.dialled[0]?.[0]?.destinationNumber).toBe("1002");
+	});
+
 	it("rings one agent for a one-at-a-time strategy", async () => {
 		const h = harness({ node: { strategy: "top-down" }, dials: [{ kind: "answer" }] });
 		await h.session.run();

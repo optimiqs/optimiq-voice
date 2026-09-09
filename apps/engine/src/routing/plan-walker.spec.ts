@@ -554,6 +554,93 @@ describe("time-condition destination nodes", () => {
 // =================================================================================================
 
 describe("extension nodes", () => {
+	it("rings both registered devices and clears the losing leg before bridging", async () => {
+		const h = harness({ settings: { sipRealm: "acme.example.com" } });
+		h.media.resolveTargets = async (_org, target) => [
+			[
+				{ ...target, kind: "aor", aor: "sip:1001@acme.example.com", contactUri: "sip:desk@device" },
+				{ kind: "aor", aor: "sip:1001@acme.example.com", contactUri: "sip:browser@device" },
+			],
+		];
+		const originate = h.media.originate.bind(h.media);
+		h.media.originate = async (request) => {
+			const result = await originate(request);
+			if (request.target?.kind === "aor" && request.target.contactUri === "sip:browser@device")
+				h.signals.emit(legSignalKey(request.channelId), { kind: "answered" });
+			return result;
+		};
+		const outcome = await h.walker.walk(walkInput([extensionNode("e")]));
+		expect(outcome.status).toBe("bridged");
+		expect(h.media.originated()).toHaveLength(2);
+		expect(new Set(h.media.originated().map((request) => request.channelId)).size).toBe(2);
+		expect(h.media.hungUp()).toContainEqual({
+			channelId: h.media.originated()[0]!.channelId,
+			cause: "LOSE_RACE",
+		});
+		expect(h.media.methods().indexOf("hangup")).toBeLessThan(
+			h.media.methods().indexOf("addToBridge"),
+		);
+	});
+
+	it("tries a lower-preference contact only after all preferred devices fail", async () => {
+		const h = harness({ settings: { sipRealm: "acme.example.com" } });
+		const contact = (name: string) => ({
+			kind: "aor" as const,
+			aor: "sip:1001@acme.example.com",
+			contactUri: `sip:${name}@device`,
+		});
+		h.media.resolveTargets = async () => [
+			[contact("desk"), contact("browser")],
+			[contact("backup")],
+		];
+		const ended: string[] = [];
+		const originate = h.media.originate.bind(h.media);
+		h.media.originate = async (request) => {
+			const result = await originate(request);
+			if (request.target?.kind !== "aor") throw Error("expected contact target");
+			if (request.target.contactUri === "sip:backup@device") {
+				expect(ended).toHaveLength(2);
+				h.signals.emit(legSignalKey(request.channelId), { kind: "answered" });
+			} else {
+				ended.push(request.channelId);
+				h.signals.emit(legSignalKey(request.channelId), {
+					kind: "ended",
+					cause: "USER_BUSY",
+					causeCode: 17,
+				});
+			}
+			return result;
+		};
+		expect((await h.walker.walk(walkInput([extensionNode("e")]))).status).toBe("bridged");
+		expect(h.media.originated()).toHaveLength(3);
+	});
+
+	it("leaves time for a backup when the preferred contact never answers", async () => {
+		const h = harness({ settings: { sipRealm: "acme.example.com" } });
+		const contact = (name: string) => ({
+			kind: "aor" as const,
+			aor: "sip:1001@acme.example.com",
+			contactUri: `sip:${name}@device`,
+		});
+		h.media.resolveTargets = async () => [[contact("desk")], [contact("backup")]];
+		const originate = h.media.originate.bind(h.media);
+		h.media.originate = async (request) => {
+			const result = await originate(request);
+			if (request.target?.kind === "aor" && request.target.contactUri === "sip:backup@device") {
+				expect(h.media.hungUp()).toContainEqual({
+					channelId: h.media.originated()[0]!.channelId,
+					cause: "ORIGINATOR_CANCEL",
+				});
+				h.signals.emit(legSignalKey(request.channelId), { kind: "answered" });
+			}
+			return result;
+		};
+		expect(
+			(await h.walker.walk(walkInput([extensionNode("e", { timeoutSeconds: 0.2 })]))).status,
+		).toBe("bridged");
+		expect(h.media.originated()).toHaveLength(2);
+	});
+
 	const plan = (overrides = {}) => [
 		extensionNode("e", { number: "1001", ...overrides }),
 		hangupNode("busy", "USER_BUSY"),

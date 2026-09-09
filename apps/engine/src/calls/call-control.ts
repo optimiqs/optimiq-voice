@@ -547,12 +547,20 @@ interface Consultation {
 }
 
 /** A live tap writing one leg's conversation to the recording store. */
+interface RecordingCompletion {
+	readonly durationMs: number;
+	readonly bytes?: number;
+	readonly reason: "completed" | "cancelled" | "failed";
+}
+
 interface RecordingSession {
 	readonly recordingId: string;
 	readonly objectKey: string;
-	readonly snoopChannelId: string;
+	readonly snoopChannelId?: string;
 	readonly format: string;
 	readonly startedAtMs: number;
+	readonly completion: { result?: RecordingCompletion };
+	readonly stopWatching: () => void;
 }
 
 /** A parked call and the timer that will ring it back. */
@@ -1962,7 +1970,7 @@ export class CallControl implements CallControlPort {
 		if (leg.isTearingDown) {
 			return refuse("the leg is tearing down, so it cannot be used for monitoring");
 		}
-		if (!supportsMediaBug(this.deps.media.bridgeMode)) {
+		if (!this.deps.media.supportsSupervision && !supportsMediaBug(this.deps.media.bridgeMode)) {
 			return refuse(
 				`this media plane bridges in ${this.deps.media.bridgeMode} mode, which never decodes the audio, so a call on it cannot be monitored`,
 			);
@@ -2134,7 +2142,11 @@ export class CallControl implements CallControlPort {
 			};
 		}
 
-		if (!(await entered.promise)) {
+		// A native media tap uses the supervisor's existing session. Only a newly created
+		// snoop channel needs to enter the application's signaling lifecycle.
+		if (handle.tapChannelId === leg.mediaChannelId) {
+			entered.cancel();
+		} else if (!(await entered.promise)) {
 			// Quietly, and both halves: `stopTap` takes the bridge down and the hangup takes the
 			// channel with it, and neither may touch the conversation that was being listened to.
 			await this.stopTapQuietly(handle);
@@ -2294,7 +2306,8 @@ export class CallControl implements CallControlPort {
 		if (refusal !== undefined) {
 			return { result: refusal };
 		}
-		if (!supportsRecording(this.deps.media.bridgeMode)) {
+		const recordConversation = this.deps.media.recordConversation?.bind(this.deps.media);
+		if (recordConversation === undefined && !supportsRecording(this.deps.media.bridgeMode)) {
 			return {
 				result: refuse(
 					`this media plane bridges in ${this.deps.media.bridgeMode} mode, which never decodes the audio, so a call on it cannot be recorded`,
@@ -2308,28 +2321,43 @@ export class CallControl implements CallControlPort {
 		const recordingId = this.newId();
 		const format = request.format ?? this.settings.recordingFormat;
 		const objectKey = `${leg.organizationId}/${leg.callId}/${recordingId}.${format}`;
-		const snoopChannelId = this.newId();
+		let snoopChannelId: string | undefined;
 
-		const entered = this.awaitLegEntered(snoopChannelId, this.settings.snoopTimeoutMs);
-		try {
-			await this.deps.media.snoop({
-				channelId: leg.mediaChannelId,
-				snoopChannelId,
-				application: this.settings.application,
-				spy: "both",
-			});
-		} catch (error) {
-			entered.cancel();
-			return { result: refuse(`the media server refused a tap on this leg: ${String(error)}`) };
+		if (recordConversation === undefined) {
+			snoopChannelId = this.newId();
+			const entered = this.awaitLegEntered(snoopChannelId, this.settings.snoopTimeoutMs);
+			try {
+				await this.deps.media.snoop({
+					channelId: leg.mediaChannelId,
+					snoopChannelId,
+					application: this.settings.application,
+					spy: "both",
+				});
+			} catch (error) {
+				entered.cancel();
+				return { result: refuse(`the media server refused a tap on this leg: ${String(error)}`) };
+			}
+
+			if (!(await entered.promise)) {
+				await this.hangupQuietly(snoopChannelId, "NORMAL_TEMPORARY_FAILURE");
+				return { result: refuse("the tap never reached the engine's application") };
+			}
 		}
 
-		if (!(await entered.promise)) {
-			await this.hangupQuietly(snoopChannelId, "NORMAL_TEMPORARY_FAILURE");
-			return { result: refuse("the tap never reached the engine's application") };
-		}
-
+		const completion: { result?: RecordingCompletion } = {};
+		const stopWatching = this.deps.signals.watch(recordingSignalKey(recordingId), (signal) => {
+			if (signal.kind === "recording-finished") {
+				completion.result = {
+					durationMs: signal.durationMs,
+					reason: "completed",
+					...(signal.bytes === undefined ? {} : { bytes: signal.bytes }),
+				};
+			} else if (signal.kind === "recording-failed") {
+				completion.result = { durationMs: 0, reason: "failed" };
+			}
+		});
 		try {
-			await this.deps.media.record(snoopChannelId, {
+			const recordingRequest = {
 				name: recordingId,
 				format,
 				...(request.maxDurationMs === undefined
@@ -2339,14 +2367,23 @@ export class CallControl implements CallControlPort {
 					? {}
 					: { maxSilenceSeconds: Math.ceil(request.silenceStopMs / MILLIS_PER_SECOND) }),
 				...(request.beep === undefined ? {} : { beep: request.beep }),
-				terminateOn: "none",
-			});
+				terminateOn: "none" as const,
+			};
+			if (recordConversation !== undefined) {
+				await recordConversation(leg.mediaChannelId, recordingRequest);
+			} else if (snoopChannelId !== undefined) {
+				await this.deps.media.record(snoopChannelId, recordingRequest);
+			}
 		} catch (error) {
-			await this.hangupQuietly(snoopChannelId, "NORMAL_TEMPORARY_FAILURE");
+			if (snoopChannelId !== undefined)
+				await this.hangupQuietly(snoopChannelId, "NORMAL_TEMPORARY_FAILURE");
+			stopWatching();
 			return { result: refuse(`the recording could not be started: ${String(error)}`) };
 		}
 
 		this.recordings.set(leg.mediaChannelId, {
+			completion,
+			stopWatching,
 			recordingId,
 			objectKey,
 			snoopChannelId,
@@ -2379,12 +2416,13 @@ export class CallControl implements CallControlPort {
 		}
 		this.recordings.delete(leg.mediaChannelId);
 
-		const finished = this.awaitRecordingFinished(
-			session.recordingId,
-			this.settings.recordingStopTimeoutMs,
-		);
+		const finished =
+			session.completion.result === undefined
+				? this.awaitRecordingFinished(session.recordingId, this.settings.recordingStopTimeoutMs)
+				: { promise: Promise.resolve(session.completion.result), cancel: () => undefined };
 		try {
-			await this.deps.media.stopRecording(session.recordingId);
+			if (session.completion.result === undefined)
+				await this.deps.media.stopRecording(session.recordingId);
 		} catch (error) {
 			finished.cancel();
 			this.log("the media server refused to stop a recording", {
@@ -2393,12 +2431,15 @@ export class CallControl implements CallControlPort {
 			});
 		}
 		const outcome = await finished.promise;
-		await this.hangupQuietly(session.snoopChannelId, "NORMAL_CLEARING");
+		session.stopWatching();
+		if (session.snoopChannelId !== undefined)
+			await this.hangupQuietly(session.snoopChannelId, "NORMAL_CLEARING");
 
 		await this.publishQuietly(leg, "channel.record.stopped", {
 			legId: leg.legId,
 			recordingId: session.recordingId,
 			objectKey: session.objectKey,
+			...(outcome.bytes === undefined ? {} : { bytes: outcome.bytes }),
 			durationMs:
 				outcome.durationMs > 0 ? outcome.durationMs : Math.max(0, this.now() - session.startedAtMs),
 			reason: outcome.reason,
@@ -2712,6 +2753,7 @@ export class CallControl implements CallControlPort {
 		this.consultations.clear();
 		this.parkTimers.clear();
 		this.holds.clear();
+		for (const recording of this.recordings.values()) recording.stopWatching();
 		this.recordings.clear();
 		this.taps.clear();
 		this.parkStates.clear();
@@ -2879,13 +2921,10 @@ export class CallControl implements CallControlPort {
 		name: string,
 		timeoutMs: number,
 	): {
-		readonly promise: Promise<{
-			readonly durationMs: number;
-			readonly reason: "completed" | "cancelled" | "failed";
-		}>;
+		readonly promise: Promise<RecordingCompletion>;
 		readonly cancel: () => void;
 	} {
-		type Outcome = { durationMs: number; reason: "completed" | "cancelled" | "failed" };
+		type Outcome = RecordingCompletion;
 		let unwatch = (): void => undefined;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		let settle: (value: Outcome) => void = () => undefined;
@@ -2902,7 +2941,11 @@ export class CallControl implements CallControlPort {
 			settle = done;
 			unwatch = this.deps.signals.watch(recordingSignalKey(name), (signal) => {
 				if (signal.kind === "recording-finished") {
-					done({ durationMs: signal.durationMs, reason: "completed" });
+					done({
+						durationMs: signal.durationMs,
+						reason: "completed",
+						...(signal.bytes === undefined ? {} : { bytes: signal.bytes }),
+					});
 				} else if (signal.kind === "recording-failed") {
 					done({ durationMs: 0, reason: "failed" });
 				}

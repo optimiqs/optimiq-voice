@@ -841,7 +841,7 @@ export class QueueSession {
 					agentId: candidate.agent.agentId,
 					endpoint: candidate.agent.contact,
 					label: `queue agent ${candidate.agent.name}`,
-					destinationNumber: candidate.agent.contact,
+					destinationNumber: candidate.agent.extensionNumber ?? candidate.agent.contact,
 					timeoutSeconds: this.settings.agentRingTimeoutSeconds,
 				})),
 				candidates.length > 1 || this.node.strategy === "ring-all" ? "all" : "one",

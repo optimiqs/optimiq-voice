@@ -656,6 +656,7 @@ export const sipCredentialResponseSchema = z.object({
 		.optional(),
 	deviceId: z.uuid().optional(),
 	extensionId: z.uuid().optional(),
+	maxRegistrations: z.number().int().min(1).max(20).optional(),
 	/**
 	 * The shared-line appearance this account holds, when the extension appears on a shared line.
 	 *
@@ -679,6 +680,40 @@ export const sipCredentialResponseSchema = z.object({
 
 export type SipCredentialRequest = z.infer<typeof sipCredentialRequestSchema>;
 export type SipCredentialResponse = z.infer<typeof sipCredentialResponseSchema>;
+
+/** Tenant and trunk are checked against the database before deriving a carrier digest. */
+export const sipTrunkCredentialRequestSchema = z.object({
+	orgId: z.string().min(1).max(128),
+	trunkId: z.string().min(1).max(128),
+	secretRef: z.string().min(1).max(256),
+	username: z.string().min(1).max(128),
+	realm: z.string().min(1).max(255),
+	algorithm: z.enum(["MD5", "SHA-256", "SHA-512-256"]),
+});
+
+export const sipTrunkCredentialResponseSchema = z.object({
+	ok: z.boolean(),
+	orgId: z.string().max(128).optional(),
+	trunkId: z.string().max(128).optional(),
+	username: z.string().max(128).optional(),
+	realm: z.string().max(255).optional(),
+	algorithm: z.enum(["MD5", "SHA-256", "SHA-512-256"]).optional(),
+	ha1: z
+		.string()
+		.regex(/^(?:[a-f0-9]{32}|[a-f0-9]{64})$/u)
+		.optional(),
+	reason: z.string().max(256).optional(),
+});
+
+export type SipTrunkCredentialRequest = z.infer<typeof sipTrunkCredentialRequestSchema>;
+export type SipTrunkCredentialResponse = z.infer<typeof sipTrunkCredentialResponseSchema>;
+
+export const SIP_TRUNK_CREDENTIAL_RPC = defineRpc(
+	RPC_SUBJECTS.sipTrunkCredential,
+	sipTrunkCredentialRequestSchema,
+	sipTrunkCredentialResponseSchema,
+	5_000,
+);
 
 export const SIP_CREDENTIAL_RPC = defineRpc(
 	RPC_SUBJECTS.sipCredential,
@@ -1485,6 +1520,8 @@ export const sipDialTargetSchema = z
 		kind: sipDialTargetKindSchema,
 		/** `kind: "aor"` — `sip:1001@realm`. The edge reads its own `registrations` bucket. */
 		aor: z.string().min(3).max(512).optional(),
+		/** Pin a contact returned by resolve-target; the edge validates it against the AOR. */
+		contactUri: z.string().min(3).max(1024).optional(),
 		/** `kind: "trunk"` — the edge reads the trunk directory for proxy, credentials and transport. */
 		trunkId: z.uuid().optional(),
 		/** `kind: "trunk"` — the number to dial over it. */
@@ -1545,6 +1582,7 @@ export const sipOriginateRequestSchema = z.object({
 	 * Either way one string names the leg, the dialog and the media session.
 	 */
 	legId: z.string().min(1).max(128),
+	engineInstanceId: z.string().min(1).max(128).optional(),
 	orgId: z.uuid(),
 	callId: z.string().min(1).max(128),
 	target: sipDialTargetSchema,
@@ -1581,6 +1619,60 @@ export const sipOriginateResponseSchema = z.object({
 
 export type SipOriginateRequest = z.infer<typeof sipOriginateRequestSchema>;
 export type SipOriginateResponse = z.infer<typeof sipOriginateResponseSchema>;
+
+export const sipResolveTargetRequestSchema = sipOriginateRequestSchema.pick({
+	legId: true,
+	orgId: true,
+	target: true,
+});
+export const sipResolveTargetResponseSchema = z.object({
+	contacts: z
+		.array(
+			z.object({
+				requestUri: z.string().min(1).max(1024),
+				transport: sipTransportSchema,
+				instanceId: z.string().min(1).max(128),
+				q: z.number().min(0).max(1),
+			}),
+		)
+		.max(20)
+		.optional(),
+	...sipDialogResponseBase,
+	requestUri: z.string().max(1024).optional(),
+	transport: sipTransportSchema.optional(),
+});
+export type SipResolveTargetRequest = z.infer<typeof sipResolveTargetRequestSchema>;
+export type SipResolveTargetResponse = z.infer<typeof sipResolveTargetResponseSchema>;
+export const engineRenegotiateRequestSchema = z.object({
+	legId: z.string().min(1).max(128),
+	orgId: z.uuid(),
+	callId: z.string().min(1).max(128),
+	sipdInstanceId: z.string().min(1).max(128),
+	sdpOffer: sipSdpSchema.min(1),
+});
+export const engineRenegotiateResponseSchema = z.object({
+	ok: z.boolean(),
+	legId: z.string().max(128),
+	sdpAnswer: sipSdpSchema.optional(),
+	reason: z
+		.enum(["bad_request", "unknown_leg", "not_supported", "shutting_down", "internal"])
+		.optional(),
+});
+export type EngineRenegotiateRequest = z.infer<typeof engineRenegotiateRequestSchema>;
+export type EngineRenegotiateResponse = z.infer<typeof engineRenegotiateResponseSchema>;
+export const ENGINE_RENEGOTIATE_RPC = defineRpc(
+	RPC_SUBJECTS.engineRenegotiate,
+	engineRenegotiateRequestSchema,
+	engineRenegotiateResponseSchema,
+	4_000,
+);
+
+export const SIP_RESOLVE_TARGET_RPC = defineRpc(
+	RPC_SUBJECTS.sipResolveTarget,
+	sipResolveTargetRequestSchema,
+	sipResolveTargetResponseSchema,
+	2_000,
+);
 
 export const SIP_ORIGINATE_RPC = defineRpc(
 	RPC_SUBJECTS.sipOriginate,
@@ -1780,6 +1872,8 @@ export const MEDIA_ALLOCATE_SESSION_RPC = defineRpc(
  */
 export const mediaCreateOfferRequestSchema = z.object({
 	...mediaCommandShape,
+	/** A browser requires ICE and DTLS-SRTP; a SIP handset or carrier uses RTP. */
+	transport: z.enum(["rtp", "webrtc"]).optional(),
 	/** The tenant, for the org-scoped lifecycle-event subject. See allocate-session. */
 	orgId: z.uuid(),
 	/** The call this B-leg belongs to. Lands on the lifecycle events and in the session directory. */
@@ -3589,6 +3683,7 @@ export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.pbxLastCaller]: LAST_CALLER_RPC,
 	[RPC_SUBJECTS.pbxFileGreeting]: FILE_GREETING_RPC,
 	[RPC_SUBJECTS.sipCredential]: SIP_CREDENTIAL_RPC,
+	[RPC_SUBJECTS.sipTrunkCredential]: SIP_TRUNK_CREDENTIAL_RPC,
 	[RPC_SUBJECTS.sipTransfer]: SIP_TRANSFER_RPC,
 	[RPC_SUBJECTS.sipInvite]: SIP_INVITE_RPC,
 	[RPC_SUBJECTS.sipRing]: SIP_RING_RPC,
@@ -3596,6 +3691,8 @@ export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.sipHangup]: SIP_HANGUP_RPC,
 	[RPC_SUBJECTS.sipReinvite]: SIP_REINVITE_RPC,
 	[RPC_SUBJECTS.sipOriginate]: SIP_ORIGINATE_RPC,
+	[RPC_SUBJECTS.sipResolveTarget]: SIP_RESOLVE_TARGET_RPC,
+	[RPC_SUBJECTS.engineRenegotiate]: ENGINE_RENEGOTIATE_RPC,
 	[RPC_SUBJECTS.mediaAllocateSession]: MEDIA_ALLOCATE_SESSION_RPC,
 	[RPC_SUBJECTS.mediaCreateOffer]: MEDIA_CREATE_OFFER_RPC,
 	[RPC_SUBJECTS.mediaAcceptAnswer]: MEDIA_ACCEPT_ANSWER_RPC,

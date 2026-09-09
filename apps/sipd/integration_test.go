@@ -473,7 +473,7 @@ func (c *sipClient) authenticateAs(res *sip.Response, username, password string)
 //
 // HA2 is MD5(method:uri), so a SUBSCRIBE answered with a REGISTER digest verifies against nothing —
 // which is exactly the bug this helper exists to make impossible to write by accident.
-func (c *sipClient) answerFor(res *sip.Response, method string) string {
+func (c *sipClient) answerFor(res *sip.Response, method, uri string) string {
 	c.t.Helper()
 	header := res.GetHeader("WWW-Authenticate")
 	if header == nil {
@@ -484,7 +484,7 @@ func (c *sipClient) answerFor(res *sip.Response, method string) string {
 		c.t.Fatalf("parsing the challenge: %v", err)
 	}
 	answer, err := digest.Digest(challenge, digest.Options{
-		Method: method, URI: "sip:" + itRealm,
+		Method: method, URI: uri,
 		Username: c.user, Password: itPass, Count: 1, Cnonce: "0a4f113b",
 	})
 	if err != nil {
@@ -822,7 +822,7 @@ func TestBlfSubscriptionLightsFromThePresenceBucket(t *testing.T) {
 	if res.StatusCode != 401 {
 		t.Fatalf("SUBSCRIBE = %d %s, want a challenge", res.StatusCode, res.Reason)
 	}
-	res = client.subscribeDialog(client.answerFor(res, "SUBSCRIBE"), watched)
+	res = client.subscribeDialog(client.answerFor(res, "SUBSCRIBE", "sip:"+watched+"@"+itRealm), watched)
 	if res.StatusCode != 200 {
 		t.Fatalf("SUBSCRIBE = %d %s, want 200", res.StatusCode, res.Reason)
 	}
@@ -1057,7 +1057,7 @@ func startNATSWithPlatformConfig(t *testing.T) string {
 
 	deadline := time.Now().Add(60 * time.Second)
 	for {
-		conn, err := nats.Connect(url, nats.UserInfo(itSipdUser, itNATSPass))
+		conn, err := nats.Connect(url, nats.UserInfo(itSipdUser, itNATSPass), nats.CustomInboxPrefix("_INBOX.sipd"))
 		if err == nil {
 			conn.Close()
 			return url
@@ -1089,7 +1089,7 @@ func TestSipdPresenceGrantsUnderThePlatformConfig(t *testing.T) {
 
 	url := startNATSWithPlatformConfig(t)
 
-	engineConn, err := nats.Connect(url, nats.UserInfo(itEngineUser, itNATSPass))
+	engineConn, err := nats.Connect(url, nats.UserInfo(itEngineUser, itNATSPass), nats.CustomInboxPrefix("_INBOX.engine"))
 	if err != nil {
 		t.Fatalf("connecting as the engine identity: %v", err)
 	}
@@ -1099,7 +1099,7 @@ func TestSipdPresenceGrantsUnderThePlatformConfig(t *testing.T) {
 		t.Fatalf("jetstream.New (engine): %v", err)
 	}
 
-	sipdConn, err := nats.Connect(url, nats.UserInfo(itSipdUser, itNATSPass))
+	sipdConn, err := nats.Connect(url, nats.UserInfo(itSipdUser, itNATSPass), nats.CustomInboxPrefix("_INBOX.sipd"))
 	if err != nil {
 		t.Fatalf("connecting as the sipd identity: %v", err)
 	}

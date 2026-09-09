@@ -110,6 +110,9 @@ func NewSession(dialog *Dialog, opts SessionOptions) *Session {
 // trip through the mailbox.
 func (s *Session) LegID() string { return s.dialog.LegID }
 
+// Done closes when this dialog stops, allowing its network transactions to release resources.
+func (s *Session) Done() <-chan struct{} { return s.closed }
+
 func (s *Session) run() {
 	defer s.wait.Done()
 	for {

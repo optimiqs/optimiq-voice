@@ -21,6 +21,10 @@ import (
 
 // Config is mediad's fully-resolved configuration. It is immutable after Load.
 type Config struct {
+	// HealthAddr is an optional private HTTP listener for /healthz and /readyz.
+	HealthAddr                   string
+	EnableWebRTC                 bool
+	WebRTCPortMin, WebRTCPortMax int
 	// NATSURL is the backbone. NATS_URL, default nats://127.0.0.1:4222.
 	//
 	// Unprefixed, and NOT `MEDIAD_NATS_URL`. apps/api, apps/engine and apps/sipd all read this
@@ -207,8 +211,9 @@ func Load(getenv Getenv) (Config, error) {
 	}
 
 	cfg := Config{
-		NATSURL:   stringOr(getenv, "NATS_URL", "nats://127.0.0.1:4222"),
-		NATSTLSCA: strings.TrimSpace(getenv("NATS_TLS_CA")),
+		HealthAddr: strings.TrimSpace(getenv("MEDIAD_HEALTH_ADDR")),
+		NATSURL:    stringOr(getenv, "NATS_URL", "nats://127.0.0.1:4222"),
+		NATSTLSCA:  strings.TrimSpace(getenv("NATS_TLS_CA")),
 	}
 
 	// The per-service pair first, the shared pair as the fallback. `problems` collects the
@@ -217,6 +222,15 @@ func Load(getenv Getenv) (Config, error) {
 	cfg.NATSUser, cfg.NATSPass, problems = resolveNATSCredentials(getenv, "MEDIAD", problems)
 
 	var err error
+	if cfg.EnableWebRTC, err = boolOr(getenv, "MEDIAD_WEBRTC", false); err != nil {
+		fail("%v", err)
+	}
+	if cfg.WebRTCPortMin, err = intOr(getenv, "MEDIAD_WEBRTC_PORT_MIN", 31000); err != nil {
+		fail("%v", err)
+	}
+	if cfg.WebRTCPortMax, err = intOr(getenv, "MEDIAD_WEBRTC_PORT_MAX", 31999); err != nil {
+		fail("%v", err)
+	}
 	if cfg.NATSTLSEnabled, err = boolOr(getenv, "NATS_TLS_ENABLED", false); err != nil {
 		fail("%v", err)
 	}
@@ -228,6 +242,14 @@ func Load(getenv Getenv) (Config, error) {
 	}
 	if cfg.RTPPortMax, err = intOr(getenv, "MEDIAD_RTP_PORT_MAX", 30999); err != nil {
 		fail("%v", err)
+	}
+	if cfg.EnableWebRTC {
+		if cfg.WebRTCPortMin < 1024 || cfg.WebRTCPortMax > 65535 || cfg.WebRTCPortMax < cfg.WebRTCPortMin {
+			fail("WebRTC UDP range must be within 1024-65535 with min <= max")
+		}
+		if cfg.WebRTCPortMin <= cfg.RTPPortMax && cfg.WebRTCPortMax >= cfg.RTPPortMin {
+			fail("WebRTC and RTP port ranges must not overlap")
+		}
 	}
 	if cfg.SessionIdleTimeout, err = durationOr(getenv, "MEDIAD_SESSION_IDLE_TIMEOUT", time.Minute); err != nil {
 		fail("%v", err)

@@ -13,10 +13,11 @@ RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
 WORKDIR /work
 
 ENV DOCKERIZE_VERSION=v0.7.0
+ARG TARGETARCH
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json ./
 COPY apps ./apps
 COPY packages ./packages
-COPY tsconfig.json ./
+COPY tsconfig.json tsconfig.base.json ./
 COPY .scripts ./.scripts
 
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
@@ -32,9 +33,9 @@ RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
 RUN pnpm --filter @optimiq-voice/api... run build
 
 RUN PNPM_CONFIG_INJECT_WORKSPACE_PACKAGES=true pnpm --filter @optimiq-voice/api deploy --prod /prod/api \
-  && wget https://github.com/jwilder/dockerize/releases/download/"$DOCKERIZE_VERSION"/dockerize-linux-amd64-"$DOCKERIZE_VERSION".tar.gz \
-  && tar -C /usr/local/bin -xzvf dockerize-linux-amd64-"$DOCKERIZE_VERSION".tar.gz \
-  && rm dockerize-linux-amd64-"$DOCKERIZE_VERSION".tar.gz
+  && wget https://github.com/jwilder/dockerize/releases/download/"$DOCKERIZE_VERSION"/dockerize-linux-${TARGETARCH}-"$DOCKERIZE_VERSION".tar.gz \
+  && tar -C /usr/local/bin -xzvf dockerize-linux-${TARGETARCH}-"$DOCKERIZE_VERSION".tar.gz \
+  && rm dockerize-linux-${TARGETARCH}-"$DOCKERIZE_VERSION".tar.gz
 
 ##
 # Run stage
@@ -42,6 +43,8 @@ RUN PNPM_CONFIG_INJECT_WORKSPACE_PACKAGES=true pnpm --filter @optimiq-voice/api 
 FROM node:22-slim
 
 RUN groupadd -g 1001 appuser && useradd -u 1001 -g appuser -m appuser
+
+ENV NODE_ENV=production OPTIMIQ_SERVICE=api
 
 WORKDIR /service
 

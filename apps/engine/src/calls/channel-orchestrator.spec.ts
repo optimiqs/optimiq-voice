@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it } from "bun:test";
 import { parseAriEvent } from "@optimiq-voice/media-ari";
 import { makeFakeMediaPort } from "../media/media-port.fake";
+import { MediadMediaPort } from "../media/mediad-media.port";
+import { FakeMediadTransport } from "../media/mediad-transport.fake";
+import { SplitPlaneMediaPort } from "../media/split-plane.port";
 import {
 	CHANNEL_OWNER_EXPIRES_AT_VARIABLE,
 	CHANNEL_OWNERSHIP_LEASE_MS,
@@ -25,6 +28,7 @@ import type { OriginateCallPath, OriginateService } from "../nats/originate.serv
 import type { ParkHandoffService } from "../nats/park-handoff.service";
 import type { SipInviteCallPath, SipInviteService } from "../nats/sip-invite.service";
 import type { SipTransferCallPath, SipTransferService } from "../nats/sip-transfer.service";
+import type { SipdCommandPort } from "../nats/sipd-command.client";
 import type { DidIndexSource } from "../routing/did-index.source";
 import type { ExtensionFeatureRpcPort } from "../routing/extension-feature.source";
 import type { LastCallerRpcSource } from "../routing/last-caller.source";
@@ -258,6 +262,7 @@ function fakeEnv(overrides: Partial<EngineEnv> = {}): EngineEnv {
 }
 
 interface HarnessOptions {
+	readonly nativeMedia?: SplitPlaneMediaPort;
 	readonly snapshots?: readonly ChannelSnapshot[];
 	readonly cdrFailures?: number;
 	readonly persistFailures?: number;
@@ -399,7 +404,7 @@ function harness(env: EngineEnv = fakeEnv(), options: HarnessOptions = {}) {
 
 	const dtmf = new DtmfRegistry();
 	const runtime = makeVerbExecutorRuntime({
-		media,
+		media: options.nativeMedia ?? media,
 		collectDtmf: (context, verb) => dtmf.forChannel(context.channelId).collect(verb),
 	});
 
@@ -414,7 +419,7 @@ function harness(env: EngineEnv = fakeEnv(), options: HarnessOptions = {}) {
 
 	const orchestrator = new ChannelOrchestrator(
 		env,
-		media,
+		options.nativeMedia ?? media,
 		runtime,
 		dtmf,
 		events,
@@ -1300,8 +1305,9 @@ describe("teardown", () => {
 
 		expect(h.persistAttempts).toHaveLength(3);
 		expect(typesOf(h.published)).toEqual(["channel.hangup", "channel.destroyed"]);
-		expect(h.cdrs[0]?.id).toBe(stableId);
+		expect(h.cdrs[0]?.id).toBe(h.persistAttempts[0]?.variables.OPTIMIQ_CDR_EVENT_ID);
 		expect(h.cdrs[0]?.data.id).toBe(stableId);
+		expect(stableId).toBe(legIdForAriChannel(ARI_CHANNEL));
 		expect(h.kv.size).toBe(0);
 		expect(pendingCdrRetryCount(h.orchestrator)).toBe(0);
 	});
@@ -1592,6 +1598,46 @@ function sipdEnv(overrides: Partial<EngineEnv> = {}): EngineEnv {
 }
 
 describe("admitting a call from the sip edge", () => {
+	it("registers the native leg before ringing and preserves its SIP identity", async () => {
+		const transport = new FakeMediadTransport();
+		const commands: string[] = [];
+		const signalling = {
+			ring: async (_instance: string, request: { legId: string }) => {
+				commands.push(request.legId);
+				return { ok: true, legId: request.legId };
+			},
+			answer: async (_instance: string, request: { legId: string }) => {
+				commands.push(request.legId);
+				return { ok: true, legId: request.legId };
+			},
+		} as unknown as SipdCommandPort;
+		const nativeMedia = new SplitPlaneMediaPort(new MediadMediaPort(transport, 500), signalling);
+		const h = harness(sipdEnv(), { nativeMedia });
+		const admission = await h.sipInviteCallPath().admit(inviteRequest());
+		expect(admission).toMatchObject({ kind: "admitted", legId: SIPD_LEG });
+		expect(commands).toEqual([SIPD_LEG, SIPD_LEG]);
+	});
+
+	it("settles an outbound answer even when the leg already has a call aggregate", async () => {
+		const transport = new FakeMediadTransport();
+		const signalling = {
+			ring: async () => ({ ok: true, legId: SIPD_LEG }),
+			answer: async () => ({ ok: true, legId: SIPD_LEG }),
+		} as unknown as SipdCommandPort;
+		const nativeMedia = new SplitPlaneMediaPort(new MediadMediaPort(transport, 500), signalling);
+		const h = harness(sipdEnv(), { nativeMedia });
+		await h.sipInviteCallPath().admit(inviteRequest());
+		await h.orchestrator.handleEvent({
+			type: "call-state-changed",
+			channelId: SIPD_LEG,
+			callState: "active",
+			sdpAnswer: "v=0\r\n",
+		});
+		expect(transport.requests.some((request) => request.subject.includes("accept-answer"))).toBe(
+			true,
+		);
+	});
+
 	it("files it as an ordinary A-leg, with the ids every other path derives", async () => {
 		const h = harness(sipdEnv());
 

@@ -434,6 +434,7 @@ func (h *Handler) authorize(
 	fromUser string,
 	log *slog.Logger,
 ) (credentials.Credential, bool) {
+	accountAuth := h.auth.ForRequest(req)
 	auth, err := registrar.ParseAuthorization(headerValue(req, "Authorization"))
 	if err != nil {
 		if errors.Is(err, registrar.ErrNoAuthorization) {
@@ -445,12 +446,12 @@ func (h *Handler) authorize(
 		return credentials.Credential{}, false
 	}
 
-	if auth.Realm != h.realm {
+	if auth.Realm != accountAuth.Realm() {
 		log.Info("re-challenging a credential for another realm", "offeredRealm", auth.Realm)
 		h.challenge(req, tx, false, log)
 		return credentials.Credential{}, false
 	}
-	if err := h.auth.CheckNonce(auth.Nonce); err != nil {
+	if err := accountAuth.CheckNonce(auth.Nonce); err != nil {
 		h.challenge(req, tx, errors.Is(err, registrar.ErrNonceStale), log)
 		return credentials.Credential{}, false
 	}
@@ -463,7 +464,7 @@ func (h *Handler) authorize(
 		return credentials.Credential{}, false
 	}
 
-	credential, err := h.creds.Lookup(ctx, h.realm, auth.Username)
+	credential, err := h.creds.Lookup(ctx, accountAuth.Realm(), auth.Username)
 	if err != nil {
 		switch {
 		case errors.Is(err, credentials.ErrNotFound):
@@ -479,7 +480,7 @@ func (h *Handler) authorize(
 
 	// REFER, not REGISTER: HA2 is MD5(method:uri), so verifying with the wrong method name accepts
 	// nothing and would make every transfer fail with a password error nobody could explain.
-	if err := h.auth.Verify(req.Method.String(), auth, credential.HA1); err != nil {
+	if err := accountAuth.VerifyRequest(req, auth, credential.HA1); err != nil {
 		if errors.Is(err, registrar.ErrNonceStale) {
 			h.challenge(req, tx, true, log)
 			return credentials.Credential{}, false
@@ -520,7 +521,7 @@ func (h *Handler) isRegistered(ctx context.Context, orgID, aor string, log *slog
 // ---------------------------------------------------------------------------------------------
 
 func (h *Handler) challenge(req *sip.Request, tx sip.ServerTransaction, stale bool, log *slog.Logger) {
-	value, err := h.auth.Challenge(stale)
+	value, err := h.auth.ForRequest(req).Challenge(stale)
 	if err != nil {
 		log.Error("cannot mint a digest challenge", "error", err)
 		h.respond(tx, req, statusServerError, "Server Internal Error")

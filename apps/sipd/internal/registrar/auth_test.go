@@ -6,8 +6,35 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emiago/sipgo/sip"
 	"github.com/icholy/digest"
 )
+
+func TestAccountRealmNoncesAndDigestURIsAreIsolated(t *testing.T) {
+	base := newTestAuthenticator(t, time.Minute)
+	request := sip.NewRequest(sip.INVITE, sip.Uri{Scheme: "sip", User: "1002", Host: "outside.example"})
+	request.AppendHeader(&sip.FromHeader{Address: sip.Uri{Scheme: "sip", User: authUser, Host: "tenant-b.example"}})
+	account := base.ForRequest(request)
+	if account.Realm() != "tenant-b.example" || base.Realm() != authRealm {
+		t.Fatal("realm dispatch used the destination or mutated shared authentication state")
+	}
+	challenge, err := account.Challenge(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := answer(t, challenge, "INVITE", request.Recipient.String(), authPassword)
+	ha1 := md5hex(authUser + ":tenant-b.example:" + authPassword)
+	if err := account.VerifyRequest(request, auth, ha1); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.CheckNonce(auth.Nonce); !errors.Is(err, ErrNonceInvalid) {
+		t.Fatal("a nonce from another organization's realm was accepted")
+	}
+	request.Recipient.User = "expensive-destination"
+	if err := account.VerifyRequest(request, auth, ha1); !errors.Is(err, ErrBadResponse) {
+		t.Fatal("an authenticated request could be retargeted without recomputing the digest")
+	}
+}
 
 // Digest authentication unit tests.
 //

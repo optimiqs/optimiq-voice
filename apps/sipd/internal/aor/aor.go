@@ -1,12 +1,6 @@
 // Package aor is the multi-contact location model: one address of record, several devices.
 //
-// # What is wrong today
-//
-// The registrar takes `contacts[0]` and silently ignores the rest (parity-audit row 1.3), so one
-// AOR has one binding and a desk phone plus a softphone is a phone that steals the other's calls
-// every time it refreshes. `extension.maxRegistrations` exists in packages/pbx-db and reaches
-// nothing. This package is the model that fixes both: a SET of contacts per AOR, each with its own
-// expiry and q-value, with a cap enforced by a documented eviction rule.
+// The registrar stores all contacts atomically, with independent expiry and a configured cap.
 //
 // # What it deliberately does not do: fork
 //
@@ -49,12 +43,14 @@ const DefaultQ = 1.0
 // highest-priority contact continues to populate the flat `contact`/`transport`/`sourceAddress`
 // fields that `registrationBindingSchema` defines, and the set travels alongside in `contacts`.
 //
-// `registrationBindingSchema.contacts` now EXISTS — an optional, `.loose()`, ten-element array — so
+// `registrationBindingSchema.contacts` now EXISTS — an optional, `.loose()`, bounded array — so
 // this is no longer a shape waiting for a contract. The two halves are written together by
 // ApplyToBinding and read together by FromBinding, and the wire type they meet at is kv.Contact.
 // The schema being `.loose()` is still what lets this struct carry `q`, `regId`, `callId` and
 // `cseq`, which the array's element does not name and this process needs to round-trip.
 type Contact struct {
+	DeviceID       string `json:"deviceId,omitempty"`
+	SIPDInstanceID string `json:"sipdInstanceId,omitempty"`
 	// URI is the contact exactly as the device offered it, parameters included.
 	URI string `json:"contact"`
 	// Transport is the transport the binding was established over.
@@ -383,6 +379,8 @@ func FromBinding(binding kv.Binding) Set {
 		contacts := make([]Contact, 0, len(binding.Contacts))
 		for _, stored := range binding.Contacts {
 			contacts = append(contacts, Contact{
+				DeviceID:         stored.DeviceID,
+				SIPDInstanceID:   stored.SIPDInstanceID,
 				URI:              stored.URI,
 				Transport:        string(stored.Transport),
 				SourceAddress:    stored.SourceAddress,
@@ -404,6 +402,8 @@ func FromBinding(binding kv.Binding) Set {
 		return Set{}
 	}
 	return Set{contacts: []Contact{{
+		DeviceID:         binding.DeviceID,
+		SIPDInstanceID:   binding.SIPDInstanceID,
 		URI:              binding.Contact,
 		Transport:        string(binding.Transport),
 		SourceAddress:    binding.SourceAddress,
@@ -433,11 +433,7 @@ func FromBinding(binding kv.Binding) Set {
 // engine's `dialSimultaneous` forks in the order it is handed and RFC 3261 §16.6's ordering is not
 // something two processes should each re-derive.
 //
-// The set is capped at ten on the way out, matching `registrationBindingSchema.contacts.max(10)`.
-// A binding that exceeded it would be REFUSED by every TypeScript reader — the whole value, not the
-// eleventh contact — so a registrar that wrote eleven would take an AOR offline rather than lose one
-// device. The cap that normally applies is SIPD_MAX_CONTACTS and is enforced by Set.Bind long
-// before this; this is the backstop that keeps the value parseable whatever happens upstream.
+// The output is capped at the same limit as the TypeScript registration contract.
 func ApplyToBinding(binding kv.Binding, set Set) kv.Binding {
 	ordered := set.Contacts()
 	if len(ordered) == 0 {
@@ -459,11 +455,12 @@ func ApplyToBinding(binding kv.Binding, set Set) kv.Binding {
 			transport = binding.Transport
 		}
 		stored = append(stored, kv.Contact{
+			SIPDInstanceID:   contact.SIPDInstanceID,
 			URI:              contact.URI,
 			Transport:        transport,
 			UserAgent:        contact.UserAgent,
 			SourceAddress:    contact.SourceAddress,
-			DeviceID:         binding.DeviceID,
+			DeviceID:         contact.DeviceID,
 			SharedLineNumber: contact.SharedLineNumber,
 			AppearanceIndex:  contact.AppearanceIndex,
 			Instance:         contact.Instance,
@@ -478,10 +475,12 @@ func ApplyToBinding(binding kv.Binding, set Set) kv.Binding {
 
 	primary := ordered[0]
 	binding.Contact = primary.URI
+	binding.DeviceID = primary.DeviceID
 	binding.SourceAddress = primary.SourceAddress
 	binding.UserAgent = primary.UserAgent
 	binding.SharedLineNumber = primary.SharedLineNumber
 	binding.AppearanceIndex = primary.AppearanceIndex
+	binding.SIPDInstanceID = primary.SIPDInstanceID
 	binding.Instance = primary.Instance
 	binding.CallID = primary.CallID
 	binding.CSeq = primary.CSeq
@@ -492,9 +491,5 @@ func ApplyToBinding(binding kv.Binding, set Set) kv.Binding {
 	return binding
 }
 
-// MaxStoredContacts is the ceiling `registrationBindingSchema.contacts` states, restated here
-// because this is the writer and a writer that exceeds a reader's bound produces a value nobody can
-// parse. Ten: an AOR with more than ten live bindings is a misconfigured provisioning run or a
-// device in a REGISTER loop, and forking to eleven endpoints is a way to ring an entire office from
-// one call rather than a feature anybody asked for.
-const MaxStoredContacts = 10
+// MaxStoredContacts matches the extension configuration and registration wire contract.
+const MaxStoredContacts = 20

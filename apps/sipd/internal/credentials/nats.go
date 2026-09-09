@@ -236,6 +236,9 @@ func credentialFromReply(realm, username string, reply contract.SipCredentialRes
 		SharedLineNumber: reply.SharedLineNumber,
 		AppearanceIndex:  reply.AppearanceIndex,
 	}
+	if reply.MaxRegistrations != nil {
+		credential.MaxRegistrations = *reply.MaxRegistrations
+	}
 	if err := credential.Validate(); err != nil {
 		return Credential{}, fmt.Errorf("%w: %w", ErrLookupFailed, err)
 	}

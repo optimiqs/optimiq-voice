@@ -360,6 +360,7 @@ func sameConfig(left, right Config) bool {
 		left.OutboundProxy == right.OutboundProxy &&
 		left.AuthUser == right.AuthUser &&
 		left.AuthRealm == right.AuthRealm &&
+		left.SecretRef == right.SecretRef &&
 		left.Contact == right.Contact &&
 		left.Transport == right.Transport &&
 		left.ExpiresSeconds == right.ExpiresSeconds

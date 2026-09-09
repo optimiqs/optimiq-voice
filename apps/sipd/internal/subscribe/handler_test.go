@@ -220,10 +220,10 @@ func (h *harness) subscribe(opts subscribeOptions) *sip.Response {
 	if challenge.StatusCode != 401 {
 		return challenge
 	}
-	return h.send(h.newSubscribe(h.answerChallenge(challenge), opts))
+	return h.send(h.newSubscribe(h.answerChallenge(challenge, opts.to), opts))
 }
 
-func (h *harness) answerChallenge(res *sip.Response) string {
+func (h *harness) answerChallenge(res *sip.Response, requestURI string) string {
 	h.t.Helper()
 	header := res.GetHeader("WWW-Authenticate")
 	if header == nil {
@@ -237,7 +237,7 @@ func (h *harness) answerChallenge(res *sip.Response) string {
 		// SUBSCRIBE, not REGISTER: HA2 is MD5(method:uri), so a handler verifying with the wrong
 		// method name would accept nothing and every BLF key would fail with a password error.
 		Method:   "SUBSCRIBE",
-		URI:      "sip:" + testRealm,
+		URI:      requestURI,
 		Username: testUser,
 		Password: testPass,
 		Count:    1,

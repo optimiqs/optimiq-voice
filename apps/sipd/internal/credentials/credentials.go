@@ -25,6 +25,7 @@ var ErrDisabled = errors.New("credentials: disabled")
 // Credential is everything the registrar needs to authenticate an AOR and attribute its binding to
 // a tenant.
 type Credential struct {
+	MaxRegistrations int
 	// OrgID is the tenant. It comes from the credential record, never from configuration: sipd is a
 	// multi-tenant edge, and the org that owns an AOR is a property of the AOR.
 	OrgID string

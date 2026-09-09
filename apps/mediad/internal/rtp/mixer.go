@@ -574,7 +574,7 @@ func (s *Session) sendMixFrame(payload []byte, marker bool) {
 		s.log.Debug("cannot marshal a mixed frame", "error", err)
 		return
 	}
-	if _, err := s.ports.RTP.WriteToUDP(encoded, to); err != nil {
+	if _, err := s.writeRTP(encoded, to); err != nil {
 		// Per-packet and self-correcting, exactly as a relayed frame is. A conference is not torn
 		// down because one participant's frame did not make it out.
 		s.log.Debug("cannot send a mixed frame", "error", err, "remote", to.String())

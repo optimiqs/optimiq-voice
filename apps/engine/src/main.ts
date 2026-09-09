@@ -71,6 +71,8 @@ async function bootstrap(): Promise<void> {
 		startupEvents.push(event);
 	});
 
+	// NestFactory.create constructs providers; init opens NATS and runs lifecycle hooks.
+	await app.init();
 	await source.start();
 	await sipd.start();
 	await orchestrator.hydrateChannels();

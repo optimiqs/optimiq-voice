@@ -77,7 +77,7 @@ export class SipCredentialsService {
 		username: string;
 		sourceAddress?: string;
 	}): Promise<SipCredentialResponse> {
-		const realm = request.realm.trim();
+		const realm = request.realm.trim().toLowerCase();
 		const username = request.username.trim();
 
 		const rootKey = loadProvisioningEnv().PROVISION_SIP_SECRET_KEY;
@@ -141,6 +141,7 @@ export class SipCredentialsService {
 			ha1,
 			deviceId: line.deviceId ?? undefined,
 			extensionId: line.extensionId ?? undefined,
+			maxRegistrations: line.maxRegistrations,
 			...(appearance === undefined
 				? {}
 				: {
@@ -229,7 +230,7 @@ export class SipCredentialsService {
 					eq(orgSetting.category, "sip"),
 					eq(orgSetting.name, "realm"),
 					eq(orgSetting.enabled, true),
-					sql`lower(${orgSetting.value} #>> '{}') = lower(${realm})`,
+					sql`lower(btrim(${orgSetting.value} #>> '{}')) = ${realm}`,
 				),
 			)
 			.limit(2);
@@ -276,6 +277,7 @@ export class SipCredentialsService {
 				extensionEnabled: extension.enabled,
 				extensionSecretRef: extension.sipSecretRef,
 				storedHa1: extension.sipPasswordHa1,
+				maxRegistrations: extension.maxRegistrations,
 			})
 			.from(deviceLine)
 			.leftJoin(extension, eq(extension.id, deviceLine.extensionId))
@@ -308,6 +310,7 @@ export class SipCredentialsService {
 			storedHa1: row.storedHa1 ?? undefined,
 			deviceId: row.deviceId,
 			extensionId: row.extensionId,
+			maxRegistrations: row.maxRegistrations ?? undefined,
 		};
 	}
 
@@ -321,6 +324,7 @@ export class SipCredentialsService {
 				enabled: extension.enabled,
 				secretRef: extension.sipSecretRef,
 				storedHa1: extension.sipPasswordHa1,
+				maxRegistrations: extension.maxRegistrations,
 			})
 			.from(extension)
 			.where(eq(extension.number, username))
@@ -336,11 +340,13 @@ export class SipCredentialsService {
 			storedHa1: row.storedHa1 ?? undefined,
 			deviceId: null,
 			extensionId: row.id,
+			maxRegistrations: row.maxRegistrations,
 		};
 	}
 }
 
 interface LineIdentity {
+	readonly maxRegistrations: number | undefined;
 	readonly enabled: boolean;
 	readonly secretRef: string;
 	readonly storedHa1: string | undefined;

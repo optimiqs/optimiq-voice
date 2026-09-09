@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/emiago/sipgo/sip"
 	"github.com/icholy/digest"
 )
 
@@ -88,6 +89,34 @@ func NewAuthenticator(realm string, secret []byte, ttl time.Duration) (*Authenti
 
 // Realm returns the realm this authenticator challenges for.
 func (a *Authenticator) Realm() string { return a.realm }
+
+// ForRequest selects the account domain, never the called destination or an unverified digest
+// realm. The credential directory remains the authority for which organizations own domains.
+func (a *Authenticator) ForRequest(req *sip.Request) *Authenticator {
+	realm := ""
+	if req.Method == sip.REGISTER {
+		if to := req.To(); to != nil {
+			realm = to.Address.Host
+		}
+	} else if from := req.From(); from != nil {
+		realm = from.Address.Host
+	}
+	realm = strings.ToLower(strings.TrimSpace(realm))
+	if realm == "" || realm == a.realm {
+		return a
+	}
+	mac := hmac.New(sha256.New, a.secret)
+	mac.Write([]byte("sip-realm\x00" + realm))
+	return &Authenticator{realm: realm, secret: mac.Sum(nil), ttl: a.ttl, now: a.now}
+}
+
+// VerifyRequest binds the digest to the actual request URI as well as its method and realm.
+func (a *Authenticator) VerifyRequest(req *sip.Request, auth Authorization, ha1 string) error {
+	if auth.URI != req.Recipient.String() {
+		return ErrBadResponse
+	}
+	return a.Verify(req.Method.String(), auth, ha1)
+}
 
 // Challenge returns a WWW-Authenticate header value.
 //

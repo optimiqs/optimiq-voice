@@ -2,6 +2,7 @@ node_modules/
 .env*
 !.env.example
 !.env.example.dev
+!.env.voice.example
 *.log
 reporting/*
 out/*

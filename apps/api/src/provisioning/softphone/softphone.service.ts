@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { Inject, Injectable, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { and, asc, eq, extension, extensionUser, orgSetting, sql } from "@optimiq-voice/pbx-db";
@@ -29,11 +30,9 @@ import type { PbxDatabaseClient, PbxDatabaseTransaction } from "@optimiq-voice/p
  *     REGISTER back to this tenant (the reverse of `sip-credentials.service.ts`'s realm→org lookup);
  *   - the sipd **WSS URL** — the one fact no committed contract carried — from `PROVISION_SIP_WSS_URL`.
  *
- * ## The honesty boundary is on the wire
- *
- * `media.webrtcSupported` is `false` and says why: `apps/sipd`'s WSS listener is SIGNALLING ONLY
- * (`apps/mediad` has no DTLS-SRTP yet), so the softphone REGISTERs, rings and tears down but carries
- * no audio. The UI reads this field rather than pretending otherwise.
+ * Browser audio is advertised only when the deployment enables WebRTC and configures WSS.
+ * TURN credentials are short lived, scoped to this authenticated organization/user, and refreshed
+ * by the browser before each call. The TURN shared secret never leaves the API.
  */
 @Injectable()
 export class SoftphoneCredentialsService {
@@ -106,6 +105,23 @@ export class SoftphoneCredentialsService {
 		const row = resolved.extension;
 		const password = deriveSipPassword({ rootKey, organizationId, secretRef: row.sipSecretRef });
 		const displayName = row.callerIdName ?? row.label ?? row.number;
+		const enabled =
+			this.env.PROVISION_WEBRTC_ENABLED === true && this.env.PROVISION_SIP_WSS_URL !== undefined;
+		const iceServers: SoftphoneIceServer[] = [];
+		if (
+			enabled &&
+			this.env.PROVISION_TURN_SECRET !== undefined &&
+			this.env.PROVISION_TURN_URLS !== undefined
+		) {
+			const username = `${Math.floor(Date.now() / 1000) + (this.env.PROVISION_TURN_TTL_SECONDS ?? 3600)}:${organizationId}:${session.user.id}`;
+			iceServers.push({
+				urls: this.env.PROVISION_TURN_URLS,
+				username,
+				credential: createHmac("sha1", this.env.PROVISION_TURN_SECRET)
+					.update(username)
+					.digest("base64"),
+			});
+		}
 
 		return {
 			extension: { id: row.id, number: row.number, label: row.label, displayName },
@@ -118,7 +134,13 @@ export class SoftphoneCredentialsService {
 				voicemailNumber: row.voicemailEnabled ? row.number : null,
 			},
 			transport: { wssUrl: this.env.PROVISION_SIP_WSS_URL ?? null },
-			media: { webrtcSupported: false, note: MEDIA_NOTE },
+			media: {
+				webrtcSupported: enabled,
+				note: enabled
+					? "Browser audio uses encrypted WebRTC media."
+					: "Browser audio is not enabled on this deployment.",
+				iceServers,
+			},
 		};
 	}
 
@@ -149,9 +171,11 @@ export class SoftphoneCredentialsService {
  */
 const REGISTER_EXPIRES_SECONDS = 600;
 
-const MEDIA_NOTE =
-	"The media plane's WebRTC leg (DTLS-SRTP in mediad) is the remaining piece; calls signal but " +
-	"carry no audio yet.";
+export interface SoftphoneIceServer {
+	readonly urls: readonly string[];
+	readonly username: string;
+	readonly credential: string;
+}
 
 /** The wire shape of `GET /api/v1/me/softphone`. Mirrored in `apps/web/lib/softphone/contracts.ts`. */
 export interface SoftphoneCredentialsResponse {
@@ -170,5 +194,9 @@ export interface SoftphoneCredentialsResponse {
 		readonly voicemailNumber: string | null;
 	};
 	readonly transport: { readonly wssUrl: string | null };
-	readonly media: { readonly webrtcSupported: boolean; readonly note: string };
+	readonly media: {
+		readonly webrtcSupported: boolean;
+		readonly note: string;
+		readonly iceServers: readonly SoftphoneIceServer[];
+	};
 }

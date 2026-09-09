@@ -135,6 +135,7 @@ export function toMediaEventFromMediad(envelope: MediaEventEnvelope): MediaEvent
 			type: "recording-finished",
 			recordingName: envelope.data.recordingRef,
 			durationMs: envelope.data.durationMs,
+			bytes: envelope.data.bytes,
 		};
 	}
 	// `session.rtp-timeout` and `playback.finished` — see the file header. The first is the

@@ -87,26 +87,8 @@ type MidDialogOutcome struct {
 // before it is answered, and refusing one on an early dialog would break hold-while-ringing on
 // every handset that implements it properly.
 func (d *Dialog) ApplyMidDialog(in MidDialogInput) (MidDialogOutcome, error) {
-	at := in.At
-	if at.IsZero() {
-		at = d.now()
-	}
-
-	switch d.state {
-	case StateTerminating, StateTerminated:
-		return MidDialogOutcome{Status: 481, Reason: "Call/Transaction Does Not Exist"}, ErrDialogGone
-	case StateInit, StateProceeding, StateEarly:
-		if in.Kind == KindReInvite {
-			return MidDialogOutcome{
-				Status:     500,
-				Reason:     "Server Internal Error",
-				RetryAfter: 10 * time.Second,
-			}, ErrInvalidState
-		}
-	}
-
-	if d.offer.outstanding {
-		return MidDialogOutcome{Status: 491, Reason: "Request Pending"}, nil
+	if refusal, err := d.CheckMidDialog(in.Kind); err != nil || !refusal.Accepted {
+		return refusal, err
 	}
 
 	// The target refresh happens on ACCEPTANCE and not on the answer, because the far end has
@@ -118,7 +100,10 @@ func (d *Dialog) ApplyMidDialog(in MidDialogInput) (MidDialogOutcome, error) {
 		d.Target.Observed = in.Observed
 	}
 
-	direction := DirectionOf(in.Body)
+	direction := d.RemoteDirection()
+	if len(in.Body) > 0 {
+		direction = DirectionOf(in.Body)
+	}
 	changed, held := d.offer.noteRemoteDirection(direction)
 
 	outcome := MidDialogOutcome{
@@ -140,6 +125,28 @@ func (d *Dialog) ApplyMidDialog(in MidDialogInput) (MidDialogOutcome, error) {
 		outcome.Effects = append(outcome.Effects, Effect{Kind: EffectStartSessionTimer})
 	}
 	return outcome, nil
+}
+
+// CheckMidDialog validates state without committing media or target changes.
+func (d *Dialog) CheckMidDialog(kind MidDialogKind) (MidDialogOutcome, error) {
+	switch d.state {
+	case StateTerminating, StateTerminated:
+		return MidDialogOutcome{Status: 481, Reason: "Call/Transaction Does Not Exist"}, ErrDialogGone
+	case StateInit, StateProceeding, StateEarly:
+		if kind == KindReInvite {
+			return MidDialogOutcome{
+				Status:     500,
+				Reason:     "Server Internal Error",
+				RetryAfter: 10 * time.Second,
+			}, ErrInvalidState
+		}
+	}
+
+	if d.offer.outstanding {
+		return MidDialogOutcome{Status: 491, Reason: "Request Pending"}, nil
+	}
+
+	return MidDialogOutcome{Accepted: true}, nil
 }
 
 // AnswerMidDialog commits the answer the engine couriered back and produces the 200.

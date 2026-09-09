@@ -155,9 +155,14 @@ export class ProvisionRepository {
 			 * means it does not participate.
 			 */
 			const settingRows = await transaction
-				.select({ name: orgSetting.name, value: orgSetting.value })
+				.select({ category: orgSetting.category, name: orgSetting.name, value: orgSetting.value })
 				.from(orgSetting)
-				.where(and(eq(orgSetting.category, "provision"), eq(orgSetting.enabled, true)));
+				.where(
+					and(
+						sql`(${orgSetting.category} = 'provision' OR (${orgSetting.category} = 'sip' AND ${orgSetting.name} = 'realm'))`,
+						eq(orgSetting.enabled, true),
+					),
+				);
 
 			/**
 			 * Which of this device's line extensions are appearances on an enabled shared line.
@@ -197,7 +202,8 @@ export class ProvisionRepository {
 				lines: lineRows,
 				keys: keyRows,
 				profileKeys: profileKeyRows,
-				organizationSettings: toSettings(settingRows),
+				organizationSettings: toSettings(settingRows.filter((row) => row.category !== "sip")),
+				sipRealm: settingRows.find((row) => row.category === "sip" && row.name === "realm")?.value,
 				sharedLineExtensionIds: new Set(sharedLineMemberRows.map((row) => row.extensionId)),
 			} as RenderSnapshot;
 		});
@@ -319,6 +325,7 @@ export interface RenderSnapshot {
 	readonly keys: readonly (typeof deviceKey.$inferSelect)[];
 	readonly profileKeys: readonly (typeof deviceProfileKey.$inferSelect)[];
 	readonly organizationSettings: ProvisioningSettings;
+	readonly sipRealm?: unknown;
 	/**
 	 * The subset of this device's line extension ids that are appearances on an enabled shared line.
 	 *

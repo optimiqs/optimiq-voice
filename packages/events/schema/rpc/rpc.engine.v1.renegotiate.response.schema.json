@@ -1,0 +1,23 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"ok": {
+			"type": "boolean"
+		},
+		"legId": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"sdpAnswer": {
+			"type": "string",
+			"maxLength": 16384
+		},
+		"reason": {
+			"type": "string",
+			"enum": ["bad_request", "unknown_leg", "not_supported", "shutting_down", "internal"]
+		}
+	},
+	"required": ["ok", "legId"],
+	"additionalProperties": false
+}

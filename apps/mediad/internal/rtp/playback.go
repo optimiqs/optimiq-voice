@@ -354,7 +354,7 @@ func (s *Session) sendPlaybackFrame(payload []byte, marker bool) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("rtp: marshalling a playback frame: %w", err)
 	}
-	if _, err := s.ports.RTP.WriteToUDP(encoded, to); err != nil {
+	if _, err := s.writeRTP(encoded, to); err != nil {
 		// Unlike a relayed frame, a failed playback write is NOT swallowed. A relay drops one frame
 		// of a conversation that is still going; a playback that cannot reach the socket will not
 		// reach it for the next frame either, and reporting `error` is what turns "the caller heard

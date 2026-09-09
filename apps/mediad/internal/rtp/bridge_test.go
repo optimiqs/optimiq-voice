@@ -813,3 +813,32 @@ func TestSessionSummaryCarriesTheFinalCounters(t *testing.T) {
 		t.Error("RemoteAddr is empty; the latched far end is what tells one silence from another")
 	}
 }
+
+func TestReaperKeepsNegotiatedHoldAndAllowsAudioToResume(t *testing.T) {
+	clock := time.Now()
+	manager, _ := newLifecycleManager(t, 56600, 56639, time.Minute, 30*time.Second, func() time.Time { return clock })
+	descriptor, err := manager.Allocate(rtp.AllocateOptions{SessionID: "held", OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU})
+	if err != nil {
+		t.Fatal(err)
+	}
+	phone := newPhone(t, descriptor.RTPPort)
+	phone.send(t, pionrtp.Packet{Header: pionrtp.Header{Version: 2, PayloadType: rtp.PayloadTypePCMU, SSRC: 111}, Payload: []byte{0xff}})
+	waitFor(t, "first audio packet", func() bool { session, ok := manager.Get("held"); return ok && session.Stats().PacketsReceived == 1 })
+	if err := manager.ApplyDirection("held", false, true); err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(2 * time.Minute)
+	if manager.ReapIdle() != 0 {
+		t.Fatal("negotiated hold was treated as a network failure")
+	}
+	if err := manager.ApplyDirection("held", false, false); err != nil {
+		t.Fatal(err)
+	}
+	if manager.ReapIdle() != 0 {
+		t.Fatal("resumed leg was reaped before audio could restart")
+	}
+	clock = clock.Add(31 * time.Second)
+	if manager.ReapIdle() != 1 {
+		t.Fatal("resumed leg that never recovered audio was not reaped")
+	}
+}

@@ -138,10 +138,8 @@ export const registrationBindingSchema = z
 					})
 					.loose(),
 			)
-			// Ten. A single AOR with more than ten live bindings is a misconfigured provisioning run or
-			// a device in a REGISTER loop, and forking to eleven endpoints is not a feature anybody
-			// asked for — it is a way to ring an entire office from one call.
-			.max(10)
+			// Same ceiling as extension.maxRegistrations and the SIP registrar.
+			.max(20)
 			.optional(),
 	})
 	.loose();

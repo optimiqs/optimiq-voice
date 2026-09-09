@@ -129,6 +129,8 @@ func (s *Server) Subjects() []string {
 		s.subject(contract.SubjectSipHangupRPC),
 		s.subject(contract.SubjectSipReinviteRPC),
 		contract.SubjectSipOriginateRPC,
+		s.subject(contract.SubjectSipOriginateRPC),
+		contract.SubjectSipResolveTargetRPC,
 	}
 }
 
@@ -166,6 +168,8 @@ func (s *Server) Subscribe(conn *nats.Conn) ([]*nats.Subscription, error) {
 		{s.subject(contract.SubjectSipHangupRPC), "", s.HandleHangup},
 		{s.subject(contract.SubjectSipReinviteRPC), "", s.HandleReinvite},
 		{contract.SubjectSipOriginateRPC, OriginateQueueGroup, s.HandleOriginate},
+		{s.subject(contract.SubjectSipOriginateRPC), "", s.HandleOriginate},
+		{contract.SubjectSipResolveTargetRPC, OriginateQueueGroup, s.HandleResolveTarget},
 	}
 
 	subscriptions := make([]*nats.Subscription, 0, len(handlers))

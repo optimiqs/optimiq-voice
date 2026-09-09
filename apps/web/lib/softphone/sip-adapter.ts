@@ -11,14 +11,8 @@
 import type { SoftphoneEvent } from "./call-state";
 import type { ResolvedSoftphoneCredentials } from "./contracts";
 
-/** Where the remote audio would attach. Wired even though media does not flow yet — see the note. */
+/** Audio output selected by the application. */
 export interface SipMediaSinks {
-	/**
-	 * The `<audio>` element the remote track would be attached to. Present so the plumbing is real
-	 * and the day mediad ships DTLS-SRTP this adapter needs no new wiring — but on today's platform
-	 * no track ever arrives, which the UI states plainly rather than leaving a silent element to
-	 * imply otherwise.
-	 */
 	readonly remoteAudio?: HTMLAudioElement | null;
 }
 
@@ -43,6 +37,8 @@ export interface SipUserAgent {
 
 export interface SipUserAgentOptions {
 	readonly credentials: ResolvedSoftphoneCredentials;
+	/** Refresh short-lived relay credentials before establishing each media connection. */
+	readonly refreshCredentials?: () => Promise<ResolvedSoftphoneCredentials>;
 	readonly media: SipMediaSinks;
 	/** Every state transition the reducer needs, already translated out of the library's vocabulary. */
 	readonly onEvent: (event: SoftphoneEvent) => void;

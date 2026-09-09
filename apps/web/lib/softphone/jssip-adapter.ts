@@ -1,29 +1,4 @@
-/**
- * The jssip-backed {@link SipUserAgent}.
- *
- * ## Why jssip
- *
- * jssip is a maintained (v3.x), purpose-built SIP-over-WebSocket + WebRTC user agent. Of the two
- * candidates in scope, it exposes exactly the surface a register-and-call softphone needs — `UA`,
- * `WebSocketInterface`, `RTCSession` with `hold`/`unhold`/`mute`/`sendDTMF` — behind a small,
- * event-driven API, where sip.js models a lower-level transaction/dialog layer this UI would have
- * to reassemble. It also ships its own TypeScript types (`lib/JsSIP.d.ts`), so the adapter is
- * type-checked against the real library rather than a hand-written shim.
- *
- * ## The honesty boundary, in code
- *
- * jssip always negotiates media over a WebRTC `RTCPeerConnection` — which is DTLS-SRTP, always.
- * sipd's WSS listener carries the SIGNALLING (REGISTER, INVITE, BYE) and `apps/mediad` has no SRTP,
- * so the INVITE is sent and the dialog is established but no audio traverses the platform's media
- * plane. This adapter does the real thing up to that line — it opens the socket, registers, sends
- * and answers INVITEs, and drives hold/mute/DTMF on the session — and stops exactly there. It does
- * NOT claim audio: the context exposes `webrtcSupported` from the API and the UI states the media
- * plane is the remaining piece.
- *
- * This file is integration code and is deliberately NOT unit-tested — the tested surface is the
- * reducer in `call-state.ts` and the shaping in `credentials.ts`. Everything here is a thin
- * translation of jssip events into {@link SoftphoneEvent}s.
- */
+/** Browser SIP registration and calls over WSS, with fresh ICE credentials for each call. */
 
 import { UA, WebSocketInterface } from "jssip";
 import type { CallPeer, SoftphoneEvent } from "./call-state";
@@ -46,6 +21,10 @@ class JsSipUserAgent implements SipUserAgent {
 	private readonly ua: UA;
 	private readonly options: SipUserAgentOptions;
 	private session: RTCSession | null = null;
+	private stopped = false;
+	private starting = false;
+	private generation = 0;
+	private readonly attachedConnections = new WeakSet<RTCPeerConnection>();
 
 	constructor(options: SipUserAgentOptions) {
 		this.options = options;
@@ -118,14 +97,8 @@ class JsSipUserAgent implements SipUserAgent {
 
 	private wireSession(session: RTCSession): void {
 		session.on("confirmed", () => this.emit({ type: "CALL_CONFIRMED", at: Date.now() }));
-		session.on("accepted", () => {
-			// An outgoing call is confirmed on ACK; `accepted` is the earliest signal media would begin.
-			if (session.isEstablished()) {
-				this.emit({ type: "CALL_CONFIRMED", at: Date.now() });
-			}
-		});
-		session.on("ended", (event: EndEvent) => this.endSession(event.cause));
-		session.on("failed", (event: EndEvent) => this.endSession(event.cause));
+		session.on("ended", (event: EndEvent) => this.endSession(session, event.cause));
+		session.on("failed", (event: EndEvent) => this.endSession(session, event.cause));
 		session.on("hold", () => this.emit({ type: "HOLD_CHANGED", onHold: true }));
 		session.on("unhold", () => this.emit({ type: "HOLD_CHANGED", onHold: false }));
 		session.on("muted", () => this.emit({ type: "MUTE_CHANGED", muted: true }));
@@ -133,61 +106,139 @@ class JsSipUserAgent implements SipUserAgent {
 		session.on("peerconnection", (data: { peerconnection: RTCPeerConnection }) => {
 			this.attachRemoteAudio(data.peerconnection);
 		});
+		// UA.call creates the connection synchronously before returning the session.
+		if (session.connection) {
+			this.attachRemoteAudio(session.connection);
+		}
 	}
 
-	/**
-	 * Attach whatever remote track arrives to the audio sink.
-	 *
-	 * On today's platform none will — mediad has no SRTP — so this is the wiring that becomes live
-	 * the day DTLS-SRTP ships, not a claim that sound plays now.
-	 */
+	/** Attach the decrypted remote track to the configured audio element. */
 	private attachRemoteAudio(pc: RTCPeerConnection): void {
 		const audio = this.options.media.remoteAudio;
-		if (!audio) {
+		if (!audio || this.attachedConnections.has(pc)) {
 			return;
 		}
+		this.attachedConnections.add(pc);
+		const play = (stream: MediaStream) => {
+			audio.srcObject = stream;
+			void audio.play().catch(() => {
+				/* The browser may require a user gesture before playback. */
+			});
+		};
 		pc.addEventListener("track", (event) => {
-			const [stream] = event.streams;
-			if (stream) {
-				audio.srcObject = stream;
-				void audio.play().catch(() => {
-					/* autoplay may be blocked until a user gesture; the controls are that gesture. */
-				});
+			if (this.session?.connection !== pc) {
+				return;
 			}
+			play(event.streams[0] ?? new MediaStream([event.track]));
 		});
+		const tracks = pc
+			.getReceivers()
+			.map((receiver) => receiver.track)
+			.filter((track) => track.kind === "audio");
+		if (tracks.length) {
+			play(new MediaStream(tracks));
+		}
 	}
 
-	private endSession(cause: string): void {
+	private endSession(session: RTCSession, cause: string): void {
+		if (this.session !== session) {
+			return;
+		}
 		this.session = null;
+		if (this.options.media.remoteAudio) {
+			this.options.media.remoteAudio.srcObject = null;
+		}
 		this.emit({ type: "CALL_ENDED", reason: cause || "Call ended" });
 	}
 
 	start(): void {
+		this.stopped = false;
 		this.ua.start();
 	}
 
 	stop(): void {
+		this.stopped = true;
+		this.generation++;
 		this.ua.stop();
 	}
 
 	call(target: string): void {
-		if (this.session) {
+		if (this.session || this.starting || this.stopped) {
 			return;
 		}
-		const session = this.ua.call(target, {
-			mediaConstraints: AUDIO_ONLY,
-			eventHandlers: {},
-		});
-		this.session = session;
-		this.wireSession(session);
-		this.emit({ type: "OUTGOING_CALL", peer: peerFrom(session) });
+		this.starting = true;
+		const generation = ++this.generation;
+		void (async () => {
+			try {
+				const pcConfig = await this.peerConfiguration();
+				if (generation !== this.generation || this.session || this.stopped) {
+					return;
+				}
+				const session = this.ua.call(target, {
+					mediaConstraints: AUDIO_ONLY,
+					pcConfig,
+					eventHandlers: {},
+				});
+				this.session = session;
+				this.wireSession(session);
+				this.emit({ type: "OUTGOING_CALL", peer: peerFrom(session) });
+			} catch {
+				if (generation === this.generation && !this.stopped) {
+					this.emit({
+						type: "CALL_ENDED",
+						reason: "Calling could not start. Reconnect the softphone and try again.",
+					});
+				}
+			} finally {
+				this.starting = false;
+			}
+		})();
 	}
 
 	answer(): void {
-		this.session?.answer({ mediaConstraints: AUDIO_ONLY });
+		const session = this.session;
+		if (!session || this.starting || this.stopped) {
+			return;
+		}
+		this.starting = true;
+		const generation = this.generation;
+		void (async () => {
+			try {
+				const pcConfig = await this.peerConfiguration();
+				if (
+					generation !== this.generation ||
+					this.session !== session ||
+					session.isEnded() ||
+					this.stopped
+				) {
+					return;
+				}
+				session.answer({ mediaConstraints: AUDIO_ONLY, pcConfig });
+			} catch {
+				if (this.session === session && !session.isEnded()) {
+					session.terminate({ status_code: 480 });
+				}
+			} finally {
+				this.starting = false;
+			}
+		})();
+	}
+
+	private async peerConfiguration(): Promise<RTCConfiguration> {
+		const original = this.options.credentials;
+		const credentials = (await this.options.refreshCredentials?.()) ?? original;
+		if (
+			!credentials.webrtcSupported ||
+			credentials.sipUri !== original.sipUri ||
+			credentials.password !== original.password
+		) {
+			throw new Error("The calling account changed or browser audio is disabled");
+		}
+		return { iceServers: [...(credentials.iceServers ?? [])] };
 	}
 
 	hangup(): void {
+		this.generation++;
 		if (!this.session) {
 			return;
 		}

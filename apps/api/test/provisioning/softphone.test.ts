@@ -1,5 +1,7 @@
+import { createHmac } from "node:crypto";
 import { NotFoundException, ServiceUnavailableException } from "@nestjs/common";
 import { expect } from "chai";
+import { loadProvisioningEnv } from "../../src/provisioning/provisioning-env";
 import { deriveSipPassword } from "../../src/provisioning/render/provision-secret";
 import { SoftphoneCredentialsService } from "../../src/provisioning/softphone/softphone.service";
 import type { ProvisioningEnv } from "../../src/provisioning/provisioning-env";
@@ -35,6 +37,8 @@ function env(overrides: Partial<ProvisioningEnv> = {}): ProvisioningEnv {
 		PROVISION_RATE_LIMIT_PER_MINUTE: 12,
 		PROVISION_REQUIRE_IP_ALLOWLIST: false,
 		PROVISION_TOKEN_TTL_DAYS: 0,
+		PROVISION_WEBRTC_ENABLED: false,
+		PROVISION_TURN_TTL_SECONDS: 3600,
 		...overrides,
 	} as unknown as ProvisioningEnv;
 }
@@ -91,8 +95,55 @@ describe("SoftphoneCredentialsService", () => {
 			deriveSipPassword({ rootKey: ROOT_KEY, organizationId: ORG, secretRef: "secret-ref-1001" }),
 		);
 		expect(reply.transport.wssUrl).to.equal("wss://sip.example.test:8089");
-		// The honesty boundary is on the wire: signalling works, media does not, yet.
+		// Enabling WSS alone does not advertise encrypted media readiness.
 		expect(reply.media.webrtcSupported).to.equal(false);
+		expect(reply.media.iceServers).to.deep.equal([]);
+	});
+
+	it("issues expiring authenticated TURN credentials without exposing the shared secret", async () => {
+		const secret = "test-turn-shared-secret-32-characters";
+		const service = new SoftphoneCredentialsService(
+			fakeDatabase([EXTENSION_ROW], [{ value: "pbx.example.test" }]),
+			env({
+				PROVISION_WEBRTC_ENABLED: true,
+				PROVISION_SIP_WSS_URL: "wss://sip.example.test:8089",
+				PROVISION_TURN_URLS: [
+					"turn:turn.example.test:3478?transport=udp",
+					"turns:turn.example.test:5349?transport=tcp",
+				],
+				PROVISION_TURN_SECRET: secret,
+				PROVISION_TURN_TTL_SECONDS: 600,
+			}),
+		);
+		const before = Math.floor(Date.now() / 1000);
+		const reply = await service.forSelf(session());
+		const ice = reply.media.iceServers[0]!;
+		expect(reply.media.webrtcSupported).to.equal(true);
+		expect(ice.urls).to.have.length(2);
+		const [expires, organizationId, userId] = ice.username.split(":");
+		expect(Number(expires)).to.be.within(before + 600, Math.floor(Date.now() / 1000) + 600);
+		expect(organizationId).to.equal(ORG);
+		expect(userId).to.equal(USER);
+		expect(ice.credential).to.equal(
+			createHmac("sha1", secret).update(ice.username).digest("base64"),
+		);
+		expect(JSON.stringify(reply)).not.to.contain(secret);
+	});
+
+	it("rejects incomplete TURN and WebRTC deployment configuration at startup", () => {
+		expect(() => loadProvisioningEnv({ PROVISION_WEBRTC_ENABLED: "true" })).to.throw(/WSS URL/);
+		expect(() => loadProvisioningEnv({ PROVISION_TURN_URLS: "turn:turn.example.test" })).to.throw(
+			/configured together/,
+		);
+		expect(() =>
+			loadProvisioningEnv({ PROVISION_TURN_SECRET: "test-turn-secret-32-characters" }),
+		).to.throw(/configured together/);
+		expect(() =>
+			loadProvisioningEnv({
+				PROVISION_TURN_URLS: "https://turn.example.test",
+				PROVISION_TURN_SECRET: "test-turn-secret-32-characters",
+			}),
+		).to.throw(/TURN URLs/);
 	});
 
 	it("falls back to PROVISION_SIP_SERVER as the realm when no org realm setting exists", async () => {

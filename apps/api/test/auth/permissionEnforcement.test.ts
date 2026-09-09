@@ -101,13 +101,11 @@ const DOCUMENTED_UNENFORCED: Readonly<Record<string, string>> = {
 	/**
 	 * Assignment has no route of its own; it rides the resource's PATCH.
 	 *
-	 * Binding an extension to a member is a field on `PATCH /extensions/:id`, and re-pointing a DID
-	 * is a field on `PATCH /phone-numbers/:id`. Both are guarded by the resource's write grant.
+	 * Re-pointing a DID is a field on `PATCH /phone-numbers/:id`, guarded by the resource's write grant.
 	 * Enforcing these would mean either a dedicated endpoint or a per-field check inside the generic
 	 * repository — the second of which is the seam (`PbxResource` has no per-column permission
 	 * concept, deliberately).
 	 */
-	"extensions.assign": "no dedicated route; assignment is a field on the resource's PATCH",
 	"numbers.assign": "no dedicated route; re-pointing is a field on the resource's PATCH",
 
 	/**

@@ -17,6 +17,7 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/invite"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/profile"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/registrar"
+	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 )
 
 // The INVITE path, driven through the real handler with real digest credentials and sipgo's own
@@ -74,11 +75,21 @@ func (r *recordingRequester) Send(_ context.Context, req *sip.Request) error {
 	return nil
 }
 
+type answerPort struct {
+	*invite.FakePort
+	answer func(context.Context, string, contract.EngineRenegotiateRequest) (string, error)
+}
+
+func (p answerPort) Renegotiate(ctx context.Context, owner string, request contract.EngineRenegotiateRequest) (string, error) {
+	return p.answer(ctx, owner, request)
+}
+
 type harnessOptions struct {
-	port     *invite.FakePort
-	profiles *profile.Set
-	timers   dialog.TimerPolicy
-	lookup   credentials.Store
+	mediaAnswer func(context.Context, string, contract.EngineRenegotiateRequest) (string, error)
+	port        *invite.FakePort
+	profiles    *profile.Set
+	timers      dialog.TimerPolicy
+	lookup      credentials.Store
 }
 
 func newHarness(t *testing.T, opts harnessOptions) *harness {
@@ -118,6 +129,10 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 		parser:   sip.NewParser(),
 	}
 
+	var callPort invite.Port = opts.port
+	if opts.mediaAnswer != nil {
+		callPort = answerPort{opts.port, opts.mediaAnswer}
+	}
 	legs := 0
 	handler, err := invite.New(invite.Options{
 		Realm:       testRealm,
@@ -126,7 +141,7 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 		Dialogs:     h.dialogs,
 		Claims:      h.claims,
 		Profiles:    opts.profiles,
-		Port:        opts.port,
+		Port:        callPort,
 		Requester:   h.requests,
 		Contact:     sip.Uri{Scheme: "sip", User: "optimiq-sipd", Host: testRealm, Port: 5060},
 		InstanceID:  "sipd-test",
@@ -780,7 +795,18 @@ Content-Length: 0
 // An UPDATE on a dialog we do not hold is 481, and one on a dialog we do hold is accepted — RFC
 // 3311 exists precisely so an early dialog can be renegotiated.
 func TestUpdate(t *testing.T) {
-	h := newHarness(t, harnessOptions{})
+	answered := false
+	refuseMedia := true
+	h := newHarness(t, harnessOptions{timers: dialog.DefaultTimerPolicy(), mediaAnswer: func(_ context.Context, owner string, req contract.EngineRenegotiateRequest) (string, error) {
+		if owner != "engine-test" || req.OrgID != testOrg || req.LegID != "leg-1" || req.SipdInstanceID != "sipd-test" {
+			t.Fatalf("wrong renegotiation identity: %s %+v", owner, req)
+		}
+		answered = true
+		if refuseMedia {
+			return "", errors.New("media unavailable")
+		}
+		return crlf(testSDP) + "a=recvonly\r\n", nil
+	}})
 	first := h.send(h.handler.HandleInvite, h.invite(nil))
 	challenge := challengeFrom(t, first[len(first)-1])
 	h.send(h.handler.HandleInvite, h.invite(challenge))
@@ -798,8 +824,32 @@ Content-Type: application/sdp
 Content-Length: ` + strconv.Itoa(len(crlf(held))) + `
 
 ` + held)
+	shortRefresh := update.Clone()
+	shortRefresh.AppendHeader(sip.NewHeader("Supported", "timer"))
+	shortRefresh.AppendHeader(sip.NewHeader("Session-Expires", "30"))
+	responses := h.send(h.handler.HandleUpdate, shortRefresh)
+	if got := lastStatus(t, responses); got != 422 {
+		t.Fatalf("short refresh status = %d, want 422", got)
+	}
+	if answered || original.Held() || original.Target.Contact.Port == 5061 {
+		t.Fatal("refused session interval reached media or changed dialog state")
+	}
+	if responses[len(responses)-1].GetHeader("Min-SE") == nil {
+		t.Fatal("422 refresh omitted Min-SE")
+	}
+
+	if got := lastStatus(t, h.send(h.handler.HandleUpdate, update)); got != 488 {
+		t.Fatalf("failed media status = %d", got)
+	}
+	if original.Held() || original.Target.Contact.Port == 5061 {
+		t.Fatal("failed SDP changed hold or target state")
+	}
+	refuseMedia = false
 	if got := lastStatus(t, h.send(h.handler.HandleUpdate, update)); got != 200 {
 		t.Fatalf("status = %d, want 200", got)
+	}
+	if !answered {
+		t.Fatal("SDP never reached media owner")
 	}
 	if !original.Held() {
 		t.Error("hold while ringing must be recorded")
@@ -952,5 +1002,33 @@ func TestCancelEndsTheDialogAndReleasesTheClaim(t *testing.T) {
 	}
 	if h.handler.Len() != 0 {
 		t.Errorf("the handler still holds %d legs", h.handler.Len())
+	}
+}
+
+func TestServeInviteRetainsTransactionForAsyncAnswer(t *testing.T) {
+	h := newHarness(t, harnessOptions{})
+	first := h.send(h.handler.HandleInvite, h.invite(nil))
+	req := h.invite(challengeFrom(t, first[len(first)-1]))
+	tx := newRecordingTx()
+	defer tx.Terminate()
+	returned := make(chan struct{})
+	go func() { h.handler.ServeInvite(req, tx); close(returned) }()
+	deadline := time.Now().Add(time.Second)
+	for len(tx.responses()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(tx.responses()) == 0 {
+		t.Fatal("INVITE was not processed")
+	}
+	select {
+	case <-returned:
+		t.Fatal("callback returned before the asynchronous answer could use the transaction")
+	case <-time.After(10 * time.Millisecond):
+	}
+	tx.Terminate()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("callback did not release its terminated transaction")
 	}
 }

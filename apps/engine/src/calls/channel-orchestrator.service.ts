@@ -150,6 +150,7 @@ const QUEUE_AGENT_REF_VARIABLE = "OPTIMIQ_QUEUE_AGENT_REF";
 const BRIDGE_PEER_VARIABLE = "OPTIMIQ_BRIDGE_PEER_LEG_ID";
 /** Stable terminal identities and progress persisted for an acknowledged retry after failover. */
 const CDR_ID_VARIABLE = "OPTIMIQ_CDR_ID";
+const CDR_EVENT_ID_VARIABLE = "OPTIMIQ_CDR_EVENT_ID";
 const CDR_HANGUP_CAUSE_CODE_VARIABLE = "OPTIMIQ_CDR_HANGUP_CAUSE_CODE";
 const TERMINAL_HANGUP_EVENT_ID_VARIABLE = "OPTIMIQ_TERMINAL_HANGUP_EVENT_ID";
 const TERMINAL_DESTROYED_EVENT_ID_VARIABLE = "OPTIMIQ_TERMINAL_DESTROYED_EVENT_ID";
@@ -219,6 +220,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	private readonly registry = new ChannelRegistry();
 	/** Detached routing walks, so the drain and the integration suite can await settlement. */
 	private readonly walks = new Map<string, Promise<void>>();
+	private readonly originatedCallers = new Map<string, MediaChannelSnapshot>();
 	private draining = false;
 	/** Hold, transfer, park, pickup and on-demand recording, over the ports below. */
 	private readonly control: CallControl;
@@ -667,6 +669,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				this.signals.emit(recordingSignalKey(event.recordingName), {
 					kind: "recording-finished",
 					durationMs: event.durationMs,
+					...(event.bytes === undefined ? {} : { bytes: event.bytes }),
 				});
 				return;
 			case "recording-failed":
@@ -688,7 +691,11 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	// Call entry
 	// -------------------------------------------------------------------------------------------
 
-	private async onLegArrived(channel: MediaChannelSnapshot): Promise<void> {
+	private async onLegArrived(
+		channel: MediaChannelSnapshot,
+		beforeProgram?: (aggregate: ChannelAggregate) => void,
+		waitForCallerAnswer = false,
+	): Promise<void> {
 		if (this.signals.isWatched(legSignalKey(channel.id))) {
 			// A leg the plan walker originated has reached the application. It is NOT a new inbound
 			// call: filing it as one would give the callee's own leg a `channel.created`, an
@@ -763,7 +770,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		const admittedAt = Date.now();
 		const aggregate = ChannelAggregate.create({
 			ariChannelId: channel.id,
-			channelId: legIdForAriChannel(channel.id),
+			channelId: this.domainLegId(channel.id),
 			callId: callIdForAriChannel(channel.id),
 			organizationId,
 			direction,
@@ -844,7 +851,12 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		});
 		await this.jetstream.putChannel(aggregate.snapshot);
 
+		beforeProgram?.(aggregate);
 		aggregate.transitionTo("executing");
+		if (waitForCallerAnswer) {
+			this.originatedCallers.set(channel.id, channel);
+			return;
+		}
 
 		// A third program, chosen by a channel variable exactly as the two below it are chosen by
 		// configuration. An INVITE carrying an authorised RFC 3891 `Replaces` has no plan to walk: it
@@ -1099,6 +1111,12 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	 * arrived at the destination the ordinary way. Two walkers would be two behaviours, and the
 	 * second one would be discovered from a support ticket.
 	 */
+	private domainLegId(mediaChannelId: string): string {
+		return this.media instanceof SplitPlaneMediaPort
+			? mediaChannelId
+			: legIdForAriChannel(mediaChannelId);
+	}
+
 	private walkerFor(
 		aggregate: ChannelAggregate,
 		extra: {
@@ -1120,7 +1138,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			execute: (verb) => this.execute(aggregate, verb),
 			publish: (type, data) => this.publishCallEvent(aggregate, type, data),
 			settings: this.walkerSettings(extra.realm ?? this.env.ENGINE_SIP_REALM),
-			peerLegId: legIdForAriChannel,
+			peerLegId: (id) => this.domainLegId(id),
 			legs: this.legHooksFor(aggregate),
 			voicemail: this.voicemailPortFor(aggregate),
 			mailbox: this.mailbox,
@@ -1618,6 +1636,10 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	private walkerCallControlFor(aggregate: ChannelAggregate): WalkerCallControl {
 		const leg = this.controlledLeg(aggregate);
 		return {
+			startRecording: async () => {
+				const outcome = await this.control.startRecording(leg);
+				return outcome.result;
+			},
 			park: async (request) => {
 				const outcome = await this.control.park(leg, {
 					lot: request.parkLotId,
@@ -2003,7 +2025,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				const admittedAt = Date.now();
 				const bLeg = ChannelAggregate.create({
 					ariChannelId: leg.mediaChannelId,
-					channelId: legIdForAriChannel(leg.mediaChannelId),
+					channelId: this.domainLegId(leg.mediaChannelId),
 					// The A-leg's call id, so every leg of one call shares a subject and a `call_id`.
 					callId: aLeg.callId,
 					organizationId: aLeg.organizationId,
@@ -2037,6 +2059,12 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 					throw new Error(`cannot originate ${leg.mediaChannelId}: channel ownership is ${claim}`);
 				}
 				this.registry.add(bLeg);
+				if (this.media instanceof SplitPlaneMediaPort) {
+					this.media.registerOutboundLeg(leg.mediaChannelId, {
+						orgId: bLeg.organizationId,
+						callId: bLeg.callId,
+					});
+				}
 				// A B-leg is created, then immediately dialled: `initializing` is the state that says
 				// "the endpoint is known, the INVITE has not gone out yet".
 				bLeg.transitionTo("initializing");
@@ -2258,6 +2286,9 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	 * "this verb did not run".
 	 */
 	private async execute(aggregate: ChannelAggregate, verb: Verb): Promise<VerbResult | undefined> {
+		if (verb.verb === "ringing" && aggregate.isAnswered) {
+			return { verb: "ringing", endReason: "completed" };
+		}
 		if (verb.verb === "hangup") {
 			// Fix the cause BEFORE the media server is told, because the media server will not tell
 			// it back. A locally-initiated teardown comes back as a hangup request carrying the
@@ -2366,26 +2397,16 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	): Promise<void> {
 		const aggregate = this.registry.byAriChannelId(mediaChannelId);
 
+		// Settle the callee's SDP before signalling answer to the walker. Routed B-legs
+		// already have an aggregate because their ownership is claimed before origination.
+		if (
+			nextCallState === "active" &&
+			sdpAnswer !== undefined &&
+			this.media instanceof SplitPlaneMediaPort
+		) {
+			if (!(await this.settleOutboundAnswer(mediaChannelId, sdpAnswer))) return;
+		}
 		if (aggregate === undefined) {
-			// Not one of this instance's A-legs. If a walk is waiting on it, it is a leg that walk
-			// originated and this is the answer it is waiting for.
-			//
-			// On the split plane a callee's `200 OK` carries the negotiated answer to the offer `mediad`
-			// wrote for this B-leg. It MUST be settled onto the media session before the walk is told the
-			// leg answered — the walk answers the A-leg and bridges the two the instant it hears this, and
-			// a bridge of a B-leg whose codec `mediad` never committed is a call that connects to silence.
-			// A refusal (the callee chose a codec `mediad` cannot serve) hangs the B-leg up by name and
-			// withholds the answer, so the walk fails it over rather than bridging a dead leg.
-			if (
-				nextCallState === "active" &&
-				sdpAnswer !== undefined &&
-				this.media instanceof SplitPlaneMediaPort
-			) {
-				const settled = await this.settleOutboundAnswer(mediaChannelId, sdpAnswer);
-				if (!settled) {
-					return;
-				}
-			}
 			this.emitLegProgress(mediaChannelId, nextCallState);
 			return;
 		}
@@ -2423,6 +2444,13 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		}
 
 		await this.jetstream.putChannel(aggregate.snapshot);
+
+		const originatedCaller = this.originatedCallers.get(mediaChannelId);
+		if (justAnswered && originatedCaller !== undefined) {
+			this.originatedCallers.delete(mediaChannelId);
+			this.startRoutedProgram(aggregate, originatedCaller);
+			return;
+		}
 
 		// After the mirror, so a failover that happens mid-announcement sees an answered leg.
 		// A-legs only: the pre-routing announcement is for the CALLER. Playing it at a callee's leg
@@ -2648,6 +2676,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		reportedCause: HangupCause,
 		causeCode: number,
 	): Promise<void> {
+		this.originatedCallers.delete(mediaChannelId);
 		// Emitted FIRST and unconditionally: a walk waiting on this leg — whether it is one it
 		// originated or the A-leg it is answering — must be released before anything slow runs,
 		// or a dial sits on its own ring timeout for a leg that is already gone.
@@ -2663,12 +2692,17 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		this.trunkCapacity.releaseLeg(mediaChannelId);
 		this.disarmCallDurationCeiling(mediaChannelId);
 
-		// Drop the composite's per-leg signalling state (the offer, the owning instance, the variables).
-		// Unconditional and before the aggregate check, for the same reason `releaseLeg` is: a leg that
-		// ended without ever being filed still registered its offer at admission, and a map that outlives
-		// its leg is a slow leak on the one process every call passes through. Idempotent by contract.
+		// A remote BYE terminates SIP but does not release the independently owned media session.
+		// Release it even when there is no aggregate; successful release also drops local leg state.
 		if (this.media instanceof SplitPlaneMediaPort) {
-			this.media.forget(mediaChannelId);
+			try {
+				await this.media.releaseEndedLeg(mediaChannelId);
+			} catch (error) {
+				this.logger.warn(
+					{ mediaChannelId, err: String(error) },
+					"could not release media for an ended SIP leg",
+				);
+			}
 		}
 
 		const aggregate = this.registry.byAriChannelId(mediaChannelId);
@@ -2766,7 +2800,10 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			}
 		}
 		if (aggregate.snapshot.variables[CDR_ID_VARIABLE] === undefined) {
-			aggregate.setVariable(CDR_ID_VARIABLE, createEntityId());
+			aggregate.setVariable(CDR_ID_VARIABLE, aggregate.channelId);
+		}
+		if (aggregate.snapshot.variables[CDR_EVENT_ID_VARIABLE] === undefined) {
+			aggregate.setVariable(CDR_EVENT_ID_VARIABLE, createEntityId());
 		}
 		if (aggregate.snapshot.variables[CDR_HANGUP_CAUSE_CODE_VARIABLE] === undefined) {
 			aggregate.setVariable(CDR_HANGUP_CAUSE_CODE_VARIABLE, String(fallbackCauseCode));
@@ -3081,7 +3118,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				...authorizationOf(aggregate.snapshot.variables),
 			});
 			const envelope = makeCdrLegWriteEvent({
-				id: data.id,
+				id: aggregate.snapshot.variables[CDR_EVENT_ID_VARIABLE],
 				at: new Date(input.endedAt),
 				orgId: aggregate.organizationId,
 				source: "engine",
@@ -3486,6 +3523,8 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	/**
 	 * Places a click-to-call: ring the extension, and let the ordinary routing path dial the target
 	 * when it answers.
+	 * On the native plane the engine claims the A-leg before origination and starts its routing
+	 * walk only after the caller's SDP answer has settled. ARI supplies that arrival from Stasis.
 	 *
 	 * ## The seam, and why it is this one
 	 *
@@ -3541,10 +3580,8 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				error: "this engine instance is draining",
 			};
 		}
-		if (this.env.ENGINE_MEDIA_DRIVER !== "ari") {
-			// `apps/mediad` refuses origination by design — SIP signalling is `apps/sipd`'s. A named
-			// refusal beats letting `MediaPort.originate` throw and reporting every extension in the
-			// tenant as unregistered.
+		if (this.env.ENGINE_MEDIA_DRIVER !== "ari" && !(this.media instanceof SplitPlaneMediaPort)) {
+			// Native origination requires the composite that joins SIP signalling and media.
 			return {
 				kind: "refused",
 				reason: "not_supported",
@@ -3577,9 +3614,45 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		const callerId =
 			request.callerIdName ?? plan.callerIdName ?? request.callerIdNumber ?? plan.callerIdNumber;
 		const callerIdNumber = request.callerIdNumber ?? plan.callerIdNumber;
+		const native = this.media instanceof SplitPlaneMediaPort;
+		const realm = artifact.settings.realm ?? this.env.ENGINE_SIP_REALM;
+		if (native && !realm) {
+			return { kind: "refused", reason: "internal", error: "the organization has no SIP realm" };
+		}
 		try {
+			if (native) {
+				await this.onLegArrived(
+					{
+						id: request.originateId,
+						name: `sipd/${request.fromExtension}`,
+						callerNumber: request.fromExtension,
+						dialedNumber: request.to,
+						context: "internal",
+						variables: {
+							OPTIMIQ_ORG_ID: request.orgId,
+							OPTIMIQ_CALL_DIRECTION: "internal",
+							OPTIMIQ_ROUTING_CONTEXT: "internal",
+							OPTIMIQ_DIALED_NUMBER: request.to,
+							OPTIMIQ_LEG: "a",
+						},
+					},
+					(aggregate) => {
+						(this.media as SplitPlaneMediaPort).registerOutboundLeg(request.originateId, {
+							orgId: request.orgId,
+							callId: aggregate.callId,
+						});
+					},
+					true,
+				);
+				if (this.registry.byAriChannelId(request.originateId) === undefined) {
+					return { kind: "refused", reason: "internal", error: "could not claim the caller leg" };
+				}
+			}
 			await this.media.originate({
 				endpoint: plan.endpoint,
+				...(native
+					? { target: { kind: "aor" as const, aor: `sip:${request.fromExtension}@${realm}` } }
+					: {}),
 				application: this.env.ARI_APP,
 				channelId: request.originateId,
 				...(callerIdNumber === undefined
@@ -3601,6 +3674,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				},
 			});
 		} catch (error) {
+			if (native) await this.onLegEnded(request.originateId, "USER_NOT_REGISTERED", 20);
 			// What `MediaPort.originate` throws for: an endpoint that is not configured, or one with no
 			// contact to send an INVITE to. The plan walker reads exactly this as "not registered", and
 			// so does the contract's `extension_offline`.
@@ -3625,7 +3699,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		return {
 			kind: "placed",
 			callId: callIdForAriChannel(request.originateId),
-			legId: legIdForAriChannel(request.originateId),
+			legId: this.domainLegId(request.originateId),
 			endpoint: plan.endpoint,
 		};
 	}
@@ -3659,11 +3733,9 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	 * makes session ids caller-assigned: the engine must be able to hang up a leg whose admission
 	 * reply it never saw. That string becomes the engine's MEDIA CHANNEL ID — the key every registry,
 	 * signal, claim and KV entry is keyed by — exactly as `originateId` does for a click-to-call. The
-	 * domain leg id and call id are then DERIVED from it by `legIdForAriChannel` /
-	 * `callIdForAriChannel`, and that derivation is not decoration: it is what makes a leg id survive
-	 * an engine restart and a failover onto another replica, which a random id in a lost `Map` cannot
-	 * do. So one string names the dialog, the media session and the leg's channel, and the ids that
-	 * reach the CDR and the event subjects are the ones every other path produces.
+	 * native leg ID is preserved across signalling, media, events and CDRs. Only the call ID is
+	 * deterministically derived from the root leg. Asterisk channels retain their separate UUID
+	 * mapping because their channel IDs are not necessarily UUIDs.
 	 *
 	 * ## Idempotency
 	 *
@@ -3772,7 +3844,16 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		}
 
 		const snapshot = this.invitedChannelSnapshot(request, organizationId);
-		await this.onLegArrived(snapshot);
+		await this.onLegArrived(snapshot, (aggregate) => {
+			if (this.media instanceof SplitPlaneMediaPort && request.sdpOffer !== undefined) {
+				this.media.registerInboundLeg(request.legId, {
+					orgId: aggregate.organizationId,
+					callId: aggregate.callId,
+					sipdInstanceId: request.sipdInstanceId,
+					sdpOffer: request.sdpOffer,
+				});
+			}
+		});
 
 		const aggregate = this.registry.byAriChannelId(request.legId);
 		if (aggregate === undefined) {
@@ -3791,22 +3872,6 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				reason: "internal",
 				error: "this engine could not take exclusive ownership of the leg",
 			};
-		}
-
-		// Hand the composite everything `answer` needs that is NOT on the wire afterwards: the A-leg's
-		// SDP offer (which `mediad` must answer to produce the 200 OK's body) and the `sipd` instance
-		// that holds the dialog (which every signalling command must be addressed at). This is the one
-		// place both facts are known at once — the admission request carried them. Guarded on the
-		// composite because only it has the two planes to compose; every other driver refused an invited
-		// call above. An INVITE with no offer (a late-offer negotiation, not supported at slice 1) is left
-		// unregistered, so `answer` fails loudly by name rather than answering into the void.
-		if (this.media instanceof SplitPlaneMediaPort && request.sdpOffer !== undefined) {
-			this.media.registerInboundLeg(aggregate.channelId, {
-				orgId: aggregate.organizationId,
-				callId: aggregate.callId,
-				sipdInstanceId: request.sipdInstanceId,
-				sdpOffer: request.sdpOffer,
-			});
 		}
 
 		return {

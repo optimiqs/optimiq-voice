@@ -171,6 +171,7 @@ if (typeof appEnvContent === "string" && appEnvContent.trim()) {
 const envSchema = z.object({
 	// ---- Process ------------------------------------------------------------------------
 	NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+	OPTIMIQ_SERVICE: z.enum(["api", "engine"]).default("api"),
 	TZ: optionalString,
 	APP_VERSION: z.string().default("0.0.0"),
 	BUILD_ID: z.string().default("dev"),

@@ -360,6 +360,30 @@ export const PROVISION_SETTINGS: readonly SettingDescriptor[] = [
 	}),
 ];
 
+export const SIP_SETTINGS: readonly SettingDescriptor[] = [
+	descriptor({
+		category: "sip",
+		name: "realm",
+		valueType: "string",
+		label: "Organization SIP domain",
+		description:
+			"The unique domain used by this organization's SIP phones to register and authenticate.",
+		schema: z
+			.string()
+			.trim()
+			.toLowerCase()
+			.min(1)
+			.max(253)
+			.refine(
+				(value) =>
+					value.split(".").every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(label)),
+				"Enter a valid SIP domain without a scheme, port or trailing dot.",
+			)
+			.nullable(),
+		defaultValue: null,
+	}),
+];
+
 export const RECORDING_SETTINGS_CATEGORY = "recordings";
 export const RECORDING_RETENTION_SETTING = "retentionDays";
 
@@ -394,6 +418,7 @@ export const RECORDING_SETTINGS: readonly SettingDescriptor[] = [
 
 /** Every catalogued setting, in one list. */
 export const SETTING_CATALOG: readonly SettingDescriptor[] = [
+	...SIP_SETTINGS,
 	...NOTIFICATION_SETTINGS,
 	...ROUTING_SETTINGS,
 	...PROVISION_SETTINGS,

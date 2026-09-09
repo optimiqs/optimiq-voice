@@ -244,7 +244,10 @@ export class ProvisionService {
 		snapshot: RenderSnapshot,
 		token: string,
 	): RenderContext {
-		const sipServer = this.env.PROVISION_SIP_SERVER as string;
+		const sipServer =
+			typeof snapshot.sipRealm === "string" && snapshot.sipRealm.trim() !== ""
+				? snapshot.sipRealm.trim().toLowerCase()
+				: (this.env.PROVISION_SIP_SERVER as string);
 		const rootKey = this.env.PROVISION_SIP_SECRET_KEY as string;
 
 		/**

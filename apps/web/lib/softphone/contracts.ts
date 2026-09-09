@@ -66,6 +66,11 @@ export interface SoftphoneTransport {
 
 /** The platform's own statement about whether media can flow — see the file header. */
 export interface SoftphoneMedia {
+	readonly iceServers?: readonly {
+		readonly urls: readonly string[];
+		readonly username?: string;
+		readonly credential?: string;
+	}[];
 	/**
 	 * `false` until `apps/mediad` ships DTLS-SRTP. When `false`, the softphone registers and signals
 	 * but no audio traverses the platform's media plane.
@@ -89,6 +94,7 @@ export interface SoftphoneCredentialsResponse {
  * unit-tested seam between "what the API returned" and "what jssip is configured with".
  */
 export interface ResolvedSoftphoneCredentials {
+	readonly iceServers?: readonly RTCIceServer[];
 	/** The socket URL jssip opens, e.g. `wss://sip.example.com:8089`. */
 	readonly wssUrl: string;
 	/** The AOR, e.g. `sip:1001@sip.example.com`. */

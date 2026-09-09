@@ -2,6 +2,9 @@ import { describe, expect, it } from "bun:test";
 import { parseAriEvent } from "@optimiq-voice/media-ari";
 import { ROUTING_ARTIFACT_VERSION } from "@optimiq-voice/routing";
 import { makeFakeMediaPort } from "../media/media-port.fake";
+import { MediadMediaPort } from "../media/mediad-media.port";
+import { FakeMediadTransport } from "../media/mediad-transport.fake";
+import { SplitPlaneMediaPort } from "../media/split-plane.port";
 import { CHANNEL_OWNERSHIP_LEASE_MS, withChannelOwnership } from "../nats/channel-ownership";
 import { fakeQueueOrchestratorArgs } from "../queue/queue-services.fake";
 import { CallSignalBus, legSignalKey } from "../routing/call-signals";
@@ -21,6 +24,7 @@ import type { OriginateCallPath, OriginateService } from "../nats/originate.serv
 import type { ParkHandoffService } from "../nats/park-handoff.service";
 import type { SipInviteCallPath, SipInviteService } from "../nats/sip-invite.service";
 import type { SipTransferCallPath, SipTransferService } from "../nats/sip-transfer.service";
+import type { SipdCommandPort } from "../nats/sipd-command.client";
 import type { DidIndexSource } from "../routing/did-index.source";
 import type { ExtensionFeatureRpcPort } from "../routing/extension-feature.source";
 import type { LastCallerRpcSource } from "../routing/last-caller.source";
@@ -291,6 +295,7 @@ const TERMINALS: PlanNode[] = [
 ];
 
 interface HarnessOptions {
+	readonly nativeMedia?: SplitPlaneMediaPort;
 	readonly artifact?: RoutingArtifact;
 	readonly env?: Partial<EngineEnv>;
 	/** Channel variables the media fake reports. `{}` is a call the dialplan told nothing. */
@@ -386,7 +391,7 @@ function harness(options: HarnessOptions = {}) {
 
 	const dtmf = new DtmfRegistry();
 	const runtime = makeVerbExecutorRuntime({
-		media,
+		media: options.nativeMedia ?? media,
 		collectDtmf: (context, verb) => dtmf.forChannel(context.channelId).collect(verb),
 	});
 
@@ -396,7 +401,7 @@ function harness(options: HarnessOptions = {}) {
 
 	const orchestrator = new ChannelOrchestrator(
 		env,
-		media,
+		options.nativeMedia ?? media,
 		runtime,
 		dtmf,
 		events,
@@ -1246,6 +1251,41 @@ describe("placing a click-to-call", () => {
 			...overrides,
 		} as never;
 	}
+
+	it("claims a native caller before SIP origination and waits for answer before routing", async () => {
+		const transport = new FakeMediadTransport();
+		transport.reply("rpc.media.v1.create-offer", {
+			ok: true,
+			sessionId: ORIGINATE_ID,
+			sdpOffer: "v=0\r\n",
+		});
+		const originated: { legId: string; target: unknown }[] = [];
+		const signalling = {
+			resolveTarget: async () => ({ ok: true, instanceId: "sipd-test", transport: "udp" }),
+			originate: async (request: { legId: string; target: unknown }) => {
+				originated.push(request);
+				return { ok: true, legId: request.legId, instanceId: "sipd-test" };
+			},
+		} as unknown as SipdCommandPort;
+		const nativeMedia = new SplitPlaneMediaPort(new MediadMediaPort(transport, 500), signalling);
+		const h = harness({
+			artifact: clickToCallArtifact(),
+			nativeMedia,
+			env: { ENGINE_MEDIA_DRIVER: "mediad", ENGINE_SIP_REALM: "tenant.example" },
+		});
+		const placement = await h.originatePath().place(originateRequest());
+		expect(placement).toMatchObject({
+			kind: "placed",
+			legId: ORIGINATE_ID,
+			callId: callIdForAriChannel(ORIGINATE_ID),
+		});
+		expect(originated).toHaveLength(1);
+		expect(originated[0]?.target).toEqual({ kind: "aor", aor: "sip:1001@tenant.example" });
+		expect(h.orchestrator.activeChannelCount).toBe(1);
+		const retry = await h.originatePath().place(originateRequest());
+		expect(retry).toMatchObject({ kind: "placed", legId: ORIGINATE_ID });
+		expect(originated).toHaveLength(1);
+	});
 
 	it("rings the extension first, in this engine's Stasis app, as an ordinary A-leg", async () => {
 		const h = harness({ artifact: clickToCallArtifact() });

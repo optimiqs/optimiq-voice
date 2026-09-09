@@ -104,7 +104,7 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
 	});
 
 	const resolved = useMemo<ResolvedSoftphoneCredentials | null>(() => {
-		if (!credentialsQuery.data) {
+		if (!credentialsQuery.data || credentialsQuery.isError) {
 			return null;
 		}
 		try {
@@ -115,7 +115,7 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
 			// No reachable WSS URL — a deployment gap, surfaced as unavailable rather than a broken UA.
 			return null;
 		}
-	}, [credentialsQuery.data]);
+	}, [credentialsQuery.data, credentialsQuery.isError]);
 
 	const teardown = useCallback(() => {
 		uaRef.current?.stop();
@@ -137,6 +137,10 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
 			}
 			const ua = createJsSipUserAgent({
 				credentials: resolved,
+				refreshCredentials: async () =>
+					shapeSoftphoneCredentials(await fetchMySoftphoneCredentials(), {
+						pageOrigin: window.location.origin,
+					}),
 				media: { remoteAudio: audioRef.current },
 				onEvent: dispatch,
 			});

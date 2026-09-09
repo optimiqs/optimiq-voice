@@ -373,7 +373,7 @@ func (s *Session) sendDtmfPacket(event byte, end bool, duration, timestamp uint3
 	if err != nil {
 		return fmt.Errorf("rtp: marshalling a DTMF packet: %w", err)
 	}
-	if _, err := s.ports.RTP.WriteToUDP(encoded, to); err != nil {
+	if _, err := s.writeRTP(encoded, to); err != nil {
 		// Unlike a relayed frame, a failed digit is NOT swallowed. A relay drops one frame of a
 		// conversation that is still going; a digit that did not reach the socket is an IVR that
 		// will not do what the caller asked, and there is nothing later to make up for it.

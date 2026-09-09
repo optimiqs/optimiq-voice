@@ -415,6 +415,16 @@ describe("cdr.leg.write", () => {
 		expect(cdrEventSchema.parse(event)).toEqual(event);
 	});
 
+	it.each([
+		"f9b30a2a-4f17-3244-a6d4-726667409ae4",
+		"f4ed4f27-3c04-4b08-9c0e-f789dd2fca0b",
+		"0195c0f0-1c2f-7000-8000-000000000001",
+	])("preserves domain leg UUID %s independently of its event UUID", (id) => {
+		const event = makeCdrLegWriteEvent({ orgId: ORG, source: "engine", data: { ...core, id } });
+		expect(cdrEventSchema.parse(event).data.id).toBe(id);
+		expect(event.id).not.toBe(id);
+	});
+
 	it("passes unknown columns through untouched", () => {
 		const event = makeCdrLegWriteEvent({
 			orgId: ORG,
@@ -1204,7 +1214,7 @@ describe("multi-contact registration bindings", () => {
 	});
 
 	it("refuses a roster nobody asked for", () => {
-		const many = Array.from({ length: 11 }, (_unused, index) => ({
+		const many = Array.from({ length: 21 }, (_unused, index) => ({
 			contact: `sip:1001@10.0.0.${index}:5060`,
 			transport: "udp" as const,
 			registeredAt: binding.registeredAt,

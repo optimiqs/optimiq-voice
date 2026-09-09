@@ -2,10 +2,15 @@ import { Inject, Injectable, OnApplicationShutdown, OnModuleInit } from "@nestjs
 import { connect, type NatsConnection, type Subscription } from "nats";
 import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import { sipCredentialRequestSchema } from "@optimiq-voice/events/schemas";
+import {
+	sipTrunkCredentialRequestSchema,
+	type SipTrunkCredentialResponse,
+} from "@optimiq-voice/events/schemas";
 import { RPC_SUBJECTS } from "@optimiq-voice/events/subjects";
 import { getLogger } from "@optimiq-voice/logging";
 import { PBX_ENV } from "../shared/pbx.tokens";
 import { SipCredentialsService } from "./sip-credentials.service";
+import { TrunkCredentialsService } from "./trunk-credentials.service";
 import type { PbxEnv } from "../shared/pbx-env";
 import type { SipCredentialResponse } from "@optimiq-voice/events/schemas";
 
@@ -66,15 +71,21 @@ const logger = getLogger("api.pbx");
 export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutdown {
 	private connection: NatsConnection | undefined;
 	private subscription: Subscription | undefined;
+	private trunkSubscription: Subscription | undefined;
 	private handled = 0;
 
 	constructor(
 		@Inject(PBX_ENV) private readonly env: PbxEnv,
 		@Inject(SipCredentialsService) private readonly credentials: SipCredentialsService,
+		@Inject(TrunkCredentialsService) private readonly trunks: TrunkCredentialsService,
 	) {}
 
 	get isReady(): boolean {
-		return this.subscription !== undefined && this.connection?.isClosed() === false;
+		return (
+			this.subscription !== undefined &&
+			this.trunkSubscription !== undefined &&
+			this.connection?.isClosed() === false
+		);
 	}
 
 	get handledCount(): number {
@@ -112,6 +123,10 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 			queue: "optimiq-api-sip-credentials",
 		});
 		void this.consume(this.subscription);
+		this.trunkSubscription = this.connection.subscribe(RPC_SUBJECTS.sipTrunkCredential, {
+			queue: "optimiq-api-trunk-credentials",
+		});
+		void this.consume(this.trunkSubscription);
 
 		logger.info(
 			{
@@ -127,14 +142,19 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 
 		for await (const message of subscription) {
 			this.handled += 1;
-			let reply: SipCredentialResponse;
+			const isTrunk = message.subject === RPC_SUBJECTS.sipTrunkCredential;
+			let reply: SipCredentialResponse | SipTrunkCredentialResponse;
 			try {
-				reply = await this.answer(decoder.decode(message.data));
+				reply = isTrunk
+					? await this.answerTrunk(decoder.decode(message.data))
+					: await this.answer(decoder.decode(message.data));
 			} catch (error) {
 				// Unreachable in principle — `answer` catches — but a throw here would end the
 				// iterator and silently stop serving the subject for the life of the process.
 				logger.error({ err: error }, `${RPC_SUBJECTS.sipCredential} handler threw`);
-				reply = refuse("credential lookup failed");
+				reply = isTrunk
+					? { ok: false, reason: "credential lookup failed" }
+					: refuse("credential lookup failed");
 			}
 
 			try {
@@ -142,6 +162,18 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 			} catch (error) {
 				logger.error({ err: error }, `could not reply on ${RPC_SUBJECTS.sipCredential}`);
 			}
+		}
+	}
+
+	private async answerTrunk(raw: string): Promise<SipTrunkCredentialResponse> {
+		try {
+			const request = sipTrunkCredentialRequestSchema.safeParse(JSON.parse(raw));
+			if (!request.success) return { ok: false, reason: "invalid trunk credential request" };
+			return await this.trunks.resolve(request.data);
+		} catch {
+			// Carrier errors can contain response bodies. Do not log them or return them on NATS.
+			logger.warn("carrier credential lookup failed");
+			return { ok: false, reason: "carrier credential lookup failed" };
 		}
 	}
 
@@ -194,6 +226,8 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 	}
 
 	async onApplicationShutdown(): Promise<void> {
+		await this.trunkSubscription?.drain().catch(() => undefined);
+		this.trunkSubscription = undefined;
 		const subscription = this.subscription;
 		this.subscription = undefined;
 		if (subscription !== undefined) {

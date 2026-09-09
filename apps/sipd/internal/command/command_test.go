@@ -405,7 +405,7 @@ func TestOriginateReportsTheDiagnostics(t *testing.T) {
 // The four dialog commands are addressed AT ONE INSTANCE and originate is flat. Getting this wrong
 // is not a cosmetic subject error: a queue-grouped `answer` is delivered to one member the server
 // chooses, and seven times out of eight that member is not the one holding the call.
-func TestSubjectsAreFourPerInstanceAndOneFlat(t *testing.T) {
+func TestSubjectsAddressDialogsAndRegisteredFlowsToTheirOwner(t *testing.T) {
 	server := newTestServer(t, &stubDialogs{})
 	subjects := server.Subjects()
 
@@ -415,6 +415,8 @@ func TestSubjectsAreFourPerInstanceAndOneFlat(t *testing.T) {
 		"rpc.sip.v1.hangup.sipd-test",
 		"rpc.sip.v1.reinvite.sipd-test",
 		"rpc.sip.v1.originate",
+		"rpc.sip.v1.originate.sipd-test",
+		"rpc.sip.v1.resolve-target",
 	}
 	if len(subjects) != len(want) {
 		t.Fatalf("subjects = %v, want %d of them", subjects, len(want))

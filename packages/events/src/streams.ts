@@ -817,6 +817,18 @@ export const MEDIA_SESSIONS_KV: KvBucketDefinition = {
 	numReplicas: 1,
 };
 
+/** Atomic placement and resource indexes owned by mediad. Values are owning instance IDs. */
+export const MEDIA_OWNERS_KV: KvBucketDefinition = {
+	name: "media-owners",
+	description: "Call placement and media resource ownership, with atomic first-owner claims.",
+	ttlMs: 6 * HOUR_MS,
+	history: 1,
+	storage: "file",
+	maxValueSizeBytes: 1024,
+	maxBytes: 128 * MIB,
+	numReplicas: 1,
+};
+
 /**
  * `queue-waiting` — who is in one queue's line, right now, across every engine instance.
  *
@@ -1025,6 +1037,7 @@ export const KV_BUCKETS: readonly KvBucketDefinition[] = [
 	CONFERENCE_CLAIMS_KV,
 	SHARED_LINE_STATE_KV,
 	MEDIA_SESSIONS_KV,
+	MEDIA_OWNERS_KV,
 	QUEUE_WAITING_KV,
 	SIP_DIALOGS_KV,
 	TRUNKS_KV,

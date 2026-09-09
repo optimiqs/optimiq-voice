@@ -167,6 +167,9 @@ function toSeat(tier: QueueRosterTierRow, template: string): QueueMembershipAgen
 		contactKind: tier.contactKind === "external" ? "external" : "extension",
 		contact,
 		...(tier.extensionId === null ? {} : { extensionId: tier.extensionId }),
+		...(tier.contactKind !== "extension" || tier.extensionNumber === null
+			? {}
+			: { extensionNumber: tier.extensionNumber }),
 		level: tier.level,
 		position: tier.position,
 		// `?? undefined`, not `?? null`: `queueMembershipAgentSchema.announcePromptId` is OPTIONAL, and

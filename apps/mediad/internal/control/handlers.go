@@ -57,6 +57,16 @@ func (s *Server) HandleAllocateSession(data []byte) []byte {
 	if request.SDPOffer == "" {
 		return s.refuseAllocate(request.SessionID, ReasonBadRequest, "sdpOffer is required")
 	}
+	protocol, err := sdp.AudioProtocol(request.SDPOffer)
+	if err != nil {
+		return s.refuseAllocate(request.SessionID, ReasonBadRequest, err.Error())
+	}
+	if protocol == "UDP/TLS/RTP/SAVPF" {
+		return s.allocateWebRTC(request)
+	}
+	if protocol != "RTP/AVP" && protocol != "RTP/AVPF" {
+		return s.refuseAllocate(request.SessionID, ReasonNotSupported, "unsupported audio transport: "+protocol)
+	}
 
 	requested, err := sdp.ParseDirection(string(request.Direction))
 	if err != nil {
@@ -246,6 +256,12 @@ func (s *Server) HandleCreateOffer(data []byte) []byte {
 		return s.refuseCreateOffer(request.SessionID, ReasonBadRequest,
 			"orgId is required: it is the subject token this session's lifecycle events are published under")
 	}
+	if request.Transport != nil && string(*request.Transport) == "webrtc" {
+		return s.createWebRTCOffer(request)
+	}
+	if request.Transport != nil && string(*request.Transport) != "rtp" {
+		return s.refuseCreateOffer(request.SessionID, ReasonBadRequest, "unsupported media transport")
+	}
 
 	direction, err := sdp.ParseDirection(string(request.Direction))
 	if err != nil {
@@ -345,6 +361,27 @@ func (s *Server) HandleAcceptAnswer(data []byte) []byte {
 		return s.refuseAcceptAnswer("", ReasonBadRequest, "sessionId is required")
 	case request.SDPAnswer == "":
 		return s.refuseAcceptAnswer(request.SessionID, ReasonBadRequest, "sdpAnswer is required")
+	}
+	protocol, err := sdp.AudioProtocol(request.SDPAnswer)
+	if err != nil {
+		return s.refuseAcceptAnswer(request.SessionID, ReasonBadRequest, err.Error())
+	}
+	if value, ok := s.webRTCSessions.Load(request.SessionID); ok {
+		if protocol != "UDP/TLS/RTP/SAVPF" {
+			return s.refuseAcceptAnswer(request.SessionID, ReasonNotSupported, "WebRTC requires an encrypted answer")
+		}
+		entry := value.(*webRTCSession)
+		entry.mu.Lock()
+		transport := entry.transport
+		entry.mu.Unlock()
+		if transport == nil {
+			return s.refuseAcceptAnswer(request.SessionID, ReasonBadRequest, "WebRTC session has no offer")
+		}
+		if err := transport.AcceptAnswer(request.SDPAnswer); err != nil {
+			return s.refuseAcceptAnswer(request.SessionID, ReasonNotSupported, err.Error())
+		}
+	} else if protocol != "RTP/AVP" && protocol != "RTP/AVPF" {
+		return s.refuseAcceptAnswer(request.SessionID, ReasonNotSupported, "answer changed the media transport")
 	}
 
 	// The answer is a session description, so the offer parser reads it: an answer names one codec,

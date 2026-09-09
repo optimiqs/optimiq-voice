@@ -55,7 +55,7 @@ export interface PlayRequest {
  * adapter, and this rides alongside it for the composite.
  */
 export type DialTarget =
-	| { readonly kind: "aor"; readonly aor: string }
+	| { readonly kind: "aor"; readonly aor: string; readonly contactUri?: string }
 	| { readonly kind: "trunk"; readonly trunkId: string; readonly number: string }
 	| { readonly kind: "uri"; readonly uri: string };
 
@@ -284,6 +284,8 @@ export interface TapHandle {
  * decisions on the far side of this seam.
  */
 export interface MediaPort {
+	/** Live contacts grouped by decreasing SIP preference; used before creating outbound legs. */
+	resolveTargets?(orgId: string, target: DialTarget): Promise<readonly (readonly DialTarget[])[]>;
 	/**
 	 * The mode this driver's bridges actually run in.
 	 *
@@ -299,6 +301,10 @@ export interface MediaPort {
 	 * re-deriving what its media plane can do and one of them getting it wrong.
 	 */
 	readonly bridgeMode: BridgeMode;
+	/** Sample-level supervision can be supported by a relay that decodes audio on demand. */
+	readonly supportsSupervision?: boolean;
+	/** Records both parties directly when the driver does not need an auxiliary snoop channel. */
+	recordConversation?(channelId: string, request: RecordRequest): Promise<RecordingHandle>;
 
 	/** SIP 200 OK. Starts billing. */
 	answer(channelId: string): Promise<void>;

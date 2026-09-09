@@ -27,6 +27,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/optimiqs/optimiq-voice/packages/runtime-go/health"
 
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/config"
@@ -34,6 +35,7 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/directory"
 	mediaevents "github.com/optimiqs/optimiq-voice/apps/mediad/internal/events"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
+	secure "github.com/optimiqs/optimiq-voice/apps/mediad/internal/webrtc"
 )
 
 // queueGroup lets several mediad instances share the command subjects; NATS delivers each request
@@ -41,7 +43,13 @@ import (
 const queueGroup = "mediad"
 
 func main() {
-	if err := run(); err != nil && !errors.Is(err, context.Canceled) {
+	var err error
+	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
+		err = health.Probe(os.Getenv("MEDIAD_HEALTH_ADDR"))
+	} else {
+		err = run()
+	}
+	if err != nil && !errors.Is(err, context.Canceled) {
 		// The logger may not exist yet when configuration fails, so this one line goes to stderr
 		// directly. Everything after boot is structured JSON.
 		fmt.Fprintf(os.Stderr, "mediad: %v\n", err)
@@ -75,6 +83,7 @@ func run() error {
 		// not go through NATS, so a session already up keeps working while the control surface
 		// reconnects. Giving up would kill live audio to fix a control-plane problem.
 		nats.MaxReconnects(-1),
+		nats.CustomInboxPrefix("_INBOX.mediad"),
 		nats.ReconnectWait(time.Second),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			log.Warn("nats disconnected", "error", err)
@@ -125,6 +134,10 @@ func run() error {
 
 	openCtx, cancelOpen := context.WithTimeout(ctx, 10*time.Second)
 	sessionDirectory, err := directory.Open(openCtx, js, log)
+	var owners *directory.KVOwners
+	if err == nil {
+		owners, err = directory.OpenOwners(openCtx, js)
+	}
 	cancelOpen()
 	if err != nil {
 		return err
@@ -164,9 +177,21 @@ func run() error {
 			"hint", "set MEDIAD_RECORDINGS_DIR to the same mount apps/api reads as CDR_RECORDING_ROOT")
 	}
 
+	var webRTC *secure.Factory
+	if cfg.EnableWebRTC {
+		if !cfg.PublicIP.Is4() {
+			return errors.New("WebRTC currently requires an IPv4 public address")
+		}
+		webRTC, err = secure.NewFactory(secure.Options{BindIP: cfg.BindIP, PublicIP: cfg.PublicIP, PortMin: uint16(cfg.WebRTCPortMin), PortMax: uint16(cfg.WebRTCPortMax)})
+		if err != nil {
+			return fmt.Errorf("configuring WebRTC: %w", err)
+		}
+	}
 	server, err := control.NewServer(control.ServerOptions{
+		WebRTC:        webRTC,
 		Sessions:      manager,
 		Directory:     sessionDirectory,
+		Owners:        owners,
 		Library:       library,
 		RecordingsDir: cfg.RecordingsDir,
 		InstanceID:    cfg.InstanceID,
@@ -180,8 +205,17 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	go server.RenewOwnership(ctx)
+	if err := conn.FlushTimeout(3 * time.Second); err != nil {
+		return fmt.Errorf("flushing media subscriptions: %w", err)
+	}
+	healthServer, err := health.Start(ctx, cfg.HealthAddr, func() bool { return conn.IsConnected() && !cfg.EchoDiagnostic })
+	if err != nil {
+		return err
+	}
 
 	log.Info("mediad is up",
+		"healthAddr", healthServer.Addr,
 		"nats", cfg.NATSURL,
 		"bindIp", cfg.BindIP.String(),
 		"publicIp", cfg.PublicIP.String(),
@@ -230,7 +264,12 @@ func run() error {
 		}
 	}()
 
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case err := <-healthServer.Errors:
+		log.Error("health listener failed", "error", err)
+		stop()
+	}
 	log.Info("shutting down", "timeoutSeconds", int(cfg.ShutdownTimeout/time.Second), "live", manager.Len())
 
 	// Stop accepting commands BEFORE draining sessions. The other order would let an allocate

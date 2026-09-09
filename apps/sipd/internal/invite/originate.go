@@ -105,6 +105,12 @@ func (h *Handler) Originate(
 	if err != nil {
 		return "", "", err
 	}
+	if target.owner != "" && target.owner != h.instance {
+		return "", "", fmt.Errorf("invite: registered flow belongs to another SIP instance: %w", dialog.ErrNoRoute)
+	}
+	if request.Target.ContactURI != nil && target.requestURI.String() != *request.Target.ContactURI {
+		return "", "", fmt.Errorf("invite: registered contact changed after resolution: %w", dialog.ErrUnregisteredTarget)
+	}
 
 	invite, callID := h.buildOriginateInvite(request, target)
 	session, state, err := h.createOutboundLeg(request, target, invite, callID)
@@ -123,7 +129,7 @@ func (h *Handler) Originate(
 	}
 
 	h.armOriginateTimeout(session, state, request)
-	h.pumpInviteTransaction(session, request.LegID, tx)
+	h.pumpInviteTransaction(session, state, target.trunkConfig, request.LegID, tx)
 
 	h.log.Info("originated a call",
 		"legId", request.LegID,
@@ -144,6 +150,8 @@ func (h *Handler) Originate(
 // socket the packet goes to. For a registered device behind NAT they differ; for a carrier fronted
 // by an SBC they differ; conflating them is a call that is never delivered.
 type dialTarget struct {
+	contacts   []contract.SipResolveTargetResponseContacts
+	owner      string
 	requestURI sip.Uri
 	// destination is an explicit host:port to write to, empty when the Request-URI's own host is it.
 	destination string
@@ -154,8 +162,9 @@ type dialTarget struct {
 	trunkID   string
 	// authUser and authRealm are the trunk's digest identity, carried so a 401 on the INVITE can be
 	// answered. Empty for an AOR or a bare URI.
-	authUser  string
-	authRealm string
+	authUser    string
+	authRealm   string
+	trunkConfig *trunk.Config
 	// sharedLineNumber and appearanceIndex place this target on a shared line appearance (SLA), when
 	// the resolved AOR carries one. When appearanceIndex is non-nil the INVITE gets a `Call-Info`
 	// appearance-index header so the phone lights the right line key. Nil for an ordinary AOR, a
@@ -171,7 +180,7 @@ func (h *Handler) resolveTarget(
 ) (dialTarget, error) {
 	switch request.Target.Kind {
 	case contract.SipOriginateRequestTargetKindAOR:
-		return h.resolveAOR(ctx, request.OrgID, deref(request.Target.AOR))
+		return h.resolveAOR(ctx, request.OrgID, deref(request.Target.AOR), deref(request.Target.ContactURI))
 	case contract.SipOriginateRequestTargetKindTrunk:
 		return h.resolveTrunk(request.OrgID, deref(request.Target.TrunkID), deref(request.Target.Number))
 	case contract.SipOriginateRequestTargetKindURI:
@@ -194,7 +203,7 @@ func (h *Handler) resolveTarget(
 // than any sane Expires, so an entry can be present and dead — and dialling a phone that unplugged
 // fifty minutes ago produces a call that rings into a socket nobody is listening on, and a
 // `no_route` thirty seconds later instead of an `unregistered_target` now.
-func (h *Handler) resolveAOR(ctx context.Context, orgID, address string) (dialTarget, error) {
+func (h *Handler) resolveAOR(ctx context.Context, orgID, address, contactURI string) (dialTarget, error) {
 	if h.bindings == nil {
 		return dialTarget{}, fmt.Errorf("invite: no location service is wired: %w", dialog.ErrNotSupported)
 	}
@@ -214,7 +223,17 @@ func (h *Handler) resolveAOR(ctx context.Context, orgID, address string) (dialTa
 	// Through internal/aor rather than off the flat fields, so a binding written with a contacts
 	// array and one written before that field existed resolve identically — and so the PRIMARY this
 	// dials is the same contact every other reader calls the primary.
-	primary, ok := aor.FromBinding(binding).Primary()
+	live, _ := aor.FromBinding(binding).Expire(h.now())
+	primary, ok := live.Primary()
+	if contactURI != "" {
+		ok = false
+		for _, contact := range live.Contacts() {
+			if contact.URI == contactURI {
+				primary, ok = contact, true
+				break
+			}
+		}
+	}
 	if !ok || primary.URI == "" {
 		return dialTarget{}, fmt.Errorf("invite: %s has a registration with no contact: %w",
 			address, dialog.ErrUnregisteredTarget)
@@ -231,6 +250,7 @@ func (h *Handler) resolveAOR(ctx context.Context, orgID, address string) (dialTa
 	}
 	target := dialTarget{
 		requestURI: uri,
+		owner:      primary.SIPDInstanceID,
 		// The observed source, not the Contact. A device behind NAT advertises an address that does
 		// not work; the address its packets came from is the one that does. Same split internal/nat
 		// draws for every mid-dialog request, applied to the first one.
@@ -242,10 +262,37 @@ func (h *Handler) resolveAOR(ctx context.Context, orgID, address string) (dialTa
 		sharedLineNumber: primary.SharedLineNumber,
 		appearanceIndex:  primary.AppearanceIndex,
 	}
+	for _, contact := range live.Contacts() {
+		owner := contact.SIPDInstanceID
+		if owner == "" {
+			owner = h.instance
+		}
+		target.contacts = append(target.contacts, contract.SipResolveTargetResponseContacts{
+			RequestURI: contact.URI, InstanceID: owner, Transport: contract.SIPTransport(contact.Transport), Q: contact.Q,
+		})
+	}
 	if target.transport == "" {
 		target.transport = strings.ToLower(string(binding.Transport))
 	}
 	return target, nil
+}
+
+// ResolveTarget reads the location service before the engine chooses a media transport.
+func (h *Handler) ResolveTarget(ctx context.Context, orgID string, target contract.SipOriginateRequestTarget) (contract.SipResolveTargetResponse, error) {
+	resolved, err := h.resolveTarget(ctx, contract.SipOriginateRequest{OrgID: orgID, Target: target})
+	if err != nil {
+		return contract.SipResolveTargetResponse{}, err
+	}
+	owner := resolved.owner
+	if owner == "" {
+		owner = h.instance
+	}
+	transport := strings.ToLower(resolved.transport)
+	if transport == "" {
+		transport = "udp"
+	}
+	uri, wireTransport := resolved.requestURI.String(), contract.SIPTransport(transport)
+	return contract.SipResolveTargetResponse{Ok: true, RequestURI: &uri, Transport: &wireTransport, InstanceID: &owner, Contacts: resolved.contacts}, nil
 }
 
 // resolveTrunk reads the trunk directory.
@@ -285,11 +332,12 @@ func (h *Handler) resolveTrunk(orgID, trunkID, number string) (dialTarget, error
 		// The From presents the CARRIER's domain and not our realm. A carrier that does not recognise
 		// the domain in a From refuses the INVITE, and the refusal is usually a bare 403 with no
 		// explanation — which is a long afternoon for whoever is debugging it.
-		from:      sip.Uri{Scheme: "sip", Host: domain},
-		transport: config.Transport,
-		trunkID:   config.TrunkID,
-		authUser:  config.AuthUser,
-		authRealm: config.AuthRealm,
+		from:        sip.Uri{Scheme: "sip", Host: domain},
+		transport:   config.Transport,
+		trunkID:     config.TrunkID,
+		authUser:    config.AuthUser,
+		authRealm:   config.AuthRealm,
+		trunkConfig: &config,
 	}
 	if proxy := config.OutboundProxy; proxy != "" {
 		// The Request-URI still names the carrier and the packet goes to the SBC. Rewriting the URI
@@ -350,7 +398,11 @@ func (h *Handler) buildOriginateInvite(
 	callID := sip.CallIDHeader(contract.NewEventID() + "@" + h.contact.Host)
 	req.AppendHeader(&callID)
 	req.AppendHeader(&sip.CSeqHeader{SeqNo: 1, MethodName: sip.INVITE})
-	req.AppendHeader(&sip.ContactHeader{Address: h.contact})
+	contact := h.contact
+	if target.trunkID != "" && target.authUser != "" {
+		contact.User = target.authUser
+	}
+	req.AppendHeader(&sip.ContactHeader{Address: contact})
 	req.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
 	req.AppendHeader(sip.NewHeader("User-Agent", h.server))
 	req.AppendHeader(sip.NewHeader("Allow", "INVITE, ACK, CANCEL, BYE, UPDATE, INFO, OPTIONS, REFER, NOTIFY"))
@@ -411,6 +463,10 @@ func headerAllowed(name string) bool {
 	if trimmed == "" {
 		return false
 	}
+	switch strings.ToLower(trimmed) {
+	case "x-telnyx-username", "x-telnyx-token":
+		return false
+	}
 	if len(trimmed) > 2 && strings.EqualFold(trimmed[:2], "x-") {
 		return true
 	}
@@ -461,6 +517,9 @@ func (h *Handler) createOutboundLeg(
 		local:     invite.From().Address,
 		remote:    target.requestURI,
 		localCSeq: 1,
+	}
+	if request.EngineInstanceID != nil {
+		state.engineInstanceID = *request.EngineInstanceID
 	}
 	if owner, found := h.profiles.ByName(profileNameForOutbound); found {
 		state.profile = owner
@@ -514,22 +573,28 @@ func (h *Handler) armOriginateTimeout(
 	if request.RingTimeoutMs != nil && *request.RingTimeoutMs > 0 {
 		timeout = time.Duration(*request.RingTimeoutMs) * time.Millisecond
 	}
-	legID := request.LegID
 	timer := time.AfterFunc(timeout, func() {
 		ctx, cancel := context.WithTimeout(h.baseCtx, 5*time.Second)
 		defer cancel()
-		_, _ = session.Apply(ctx, dialog.Input{
-			Trigger: dialog.TriggerTimeout,
-			Timeout: dialog.TimeoutRing,
+		_, _ = session.Do(ctx, func(d *dialog.Dialog) (dialog.Outcome, error) {
+			if d.State().Answered() || d.State() == dialog.StateTerminating || d.State() == dialog.StateTerminated {
+				return dialog.Outcome{}, nil
+			}
+			return d.Apply(dialog.Input{Trigger: dialog.TriggerTimeout, Timeout: dialog.TimeoutRing})
 		})
 	})
-	// Recorded on the leg state so the release-claim effect stops it, exactly as the inbound path
-	// does. A timer left armed on a leg that answered would CANCEL a live call thirty seconds in.
-	_, _ = session.Do(h.baseCtx, func(*dialog.Dialog) (dialog.Outcome, error) {
-		state.ringTimer = timer
+	// Answer may beat timer installation; check on the same serialized dialog task.
+	_, err := session.Do(h.baseCtx, func(d *dialog.Dialog) (dialog.Outcome, error) {
+		if d.State().Answered() || d.State() == dialog.StateTerminating || d.State() == dialog.StateTerminated {
+			timer.Stop()
+		} else {
+			state.ringTimer = timer
+		}
 		return dialog.Outcome{}, nil
 	})
-	_ = legID
+	if err != nil {
+		timer.Stop()
+	}
 }
 
 // pumpInviteTransaction feeds the client transaction's responses into the dialog machine.
@@ -547,21 +612,38 @@ func (h *Handler) armOriginateTimeout(
 // the BYE that arrives ten minutes later is matched on the complete triple. Rebinding on the first
 // response that carries one is what stops this edge answering 481 to every mid-dialog request on
 // every outbound call.
-func (h *Handler) pumpInviteTransaction(session *dialog.Session, legID string, tx sip.ClientTransaction) {
+func (h *Handler) pumpInviteTransaction(session *dialog.Session, state *legState, config *trunk.Config, legID string, tx sip.ClientTransaction) {
+	retransmissions := make(chan *sip.Response, 16)
+	listenForRetransmissions := func(transaction sip.ClientTransaction) {
+		transaction.OnRetransmission(func(response *sip.Response) {
+			select {
+			case retransmissions <- response:
+			default:
+				// Bound work during a response flood; the peer will retransmit an unacknowledged 2xx.
+			}
+		})
+	}
+	listenForRetransmissions(tx)
 	h.backgroundWork.Add(1)
 	go func() {
 		defer h.backgroundWork.Done()
-		defer tx.Terminate()
+		defer func() { tx.Terminate() }()
+		seenChallenges := make(map[string]bool)
+		answered := false
 
 		for {
 			select {
 			case <-h.baseCtx.Done():
 				return
+			case <-session.Done():
+				return
+			case response := <-retransmissions:
+				h.applyInviteResponse(session, legID, response)
 			case <-tx.Done():
 				// The transaction ended without a final response we acted on — Timer B, or a
 				// transport error. Either way the call never happened, and TimeoutInvite is the
 				// trigger that says so with Q.850 18, "no user responding".
-				if err := tx.Err(); err != nil {
+				if err := tx.Err(); err != nil && !answered {
 					h.post(legID, dialog.Input{
 						Trigger: dialog.TriggerTimeout,
 						Timeout: dialog.TimeoutInvite,
@@ -572,15 +654,76 @@ func (h *Handler) pumpInviteTransaction(session *dialog.Session, legID string, t
 				if !ok {
 					return
 				}
+				if config != nil && h.trunkAuth != nil && len(seenChallenges) < 3 {
+					key := trunk.ChallengeKey(res)
+					if key != "" && !seenChallenges[key] {
+						seenChallenges[key] = true
+						next, err := h.retryOutboundAuthentication(session, state, *config, res)
+						if err == nil {
+							tx.Terminate()
+							tx = next
+							listenForRetransmissions(tx)
+							continue
+						}
+						h.log.Warn("outbound carrier authentication failed", "legId", legID)
+					}
+				}
 				h.applyInviteResponse(session, legID, res)
-				if res.StatusCode >= 200 {
-					// A final response ends the INVITE transaction. Anything after it belongs to a
-					// different transaction and reaches this edge through the server side.
+				if res.StatusCode >= 200 && res.StatusCode < 300 {
+					// Keep listening through Timer M so a retransmitted 2xx gets another ACK.
+					answered = true
+				}
+				if res.StatusCode >= 300 {
 					return
 				}
 			}
 		}
 	}()
+}
+
+func (h *Handler) retryOutboundAuthentication(session *dialog.Session, state *legState, config trunk.Config, response *sip.Response) (sip.ClientTransaction, error) {
+	ctx, cancel := context.WithTimeout(h.baseCtx, 6*time.Second)
+	defer cancel()
+	go func() {
+		select {
+		case <-session.Done():
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	var original *sip.Request
+	_, err := session.Do(ctx, func(d *dialog.Dialog) (dialog.Outcome, error) {
+		if d.State() != dialog.StateInit && d.State() != dialog.StateProceeding && d.State() != dialog.StateEarly {
+			return dialog.Outcome{}, errors.New("outbound call is no longer ringing")
+		}
+		state.authCancel = cancel
+		original = state.invite.Clone()
+		return dialog.Outcome{}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	authorized, err := h.trunkAuth.Authorize(ctx, config, original, response)
+	if err != nil {
+		return nil, err
+	}
+	var next sip.ClientTransaction
+	_, err = session.Do(ctx, func(d *dialog.Dialog) (dialog.Outcome, error) {
+		if d.State() != dialog.StateInit && d.State() != dialog.StateProceeding && d.State() != dialog.StateEarly {
+			return dialog.Outcome{}, errors.New("outbound call ended during authentication")
+		}
+		var sendErr error
+		next, sendErr = h.caller.Invite(ctx, authorized)
+		if sendErr != nil {
+			return dialog.Outcome{}, sendErr
+		}
+		// CANCEL and the final ACK must use the authenticated INVITE's CSeq and Via.
+		state.invite = authorized
+		state.localCSeq = authorized.CSeq().SeqNo
+		return dialog.Outcome{}, nil
+	})
+	return next, err
 }
 
 // applyInviteResponse turns one response into one trigger.
@@ -626,7 +769,23 @@ func (h *Handler) applyInviteResponse(session *dialog.Session, legID string, res
 		}
 	}
 
-	if _, err := session.Apply(ctx, in); err != nil {
+	if _, err := session.Do(ctx, func(d *dialog.Dialog) (dialog.Outcome, error) {
+		previous := d.Target
+		if res.StatusCode >= 180 && res.StatusCode < 300 && remoteTag != "" &&
+			(d.Identity.RemoteTag == "" || d.Identity.RemoteTag == remoteTag) {
+			if contact := res.Contact(); contact != nil {
+				d.Target.Contact = contact.Address
+			}
+			d.Target.RouteSet = routeSetOf(res.GetHeaders("Record-Route"), dialog.RoleUAC)
+			d.Target.Observed = res.Source()
+			d.Target.Transport = strings.ToLower(res.Transport())
+		}
+		outcome, err := d.Apply(in)
+		if err != nil {
+			d.Target = previous
+		}
+		return outcome, err
+	}); err != nil {
 		h.log.Debug("a response reached a dialog that would not take it",
 			"legId", legID, "status", res.StatusCode, "error", err)
 		return

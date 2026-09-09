@@ -48,6 +48,8 @@ import { EmergencyConsumer } from "./emergency-addresses/emergency-consumer.serv
 import { EmergencyNotificationService } from "./emergency-addresses/emergency-notification.service";
 import { ExtensionFeatureRpcController } from "./extensions/extension-feature-rpc.controller";
 import { ExtensionFeatureService } from "./extensions/extension-feature.service";
+import { ExtensionUsersController } from "./extensions/extension-users.controller";
+import { ExtensionUsersService } from "./extensions/extension-users.service";
 import { ExtensionsController } from "./extensions/extensions.controller";
 import { ExtensionsService } from "./extensions/extensions.service";
 import { FaxEmailService } from "./fax/fax-email.service";
@@ -133,6 +135,7 @@ import { dischargeProjection } from "./shared/projection-outbox";
 import { ProjectionOutboxSweeper } from "./shared/projection-outbox.service";
 import { SipCredentialsResponder } from "./sip-credentials/sip-credentials.responder";
 import { SipCredentialsService } from "./sip-credentials/sip-credentials.service";
+import { TrunkCredentialsService } from "./sip-credentials/trunk-credentials.service";
 import { TimeConditionsController } from "./time-conditions/time-conditions.controller";
 import {
 	TimeConditionRulesService,
@@ -240,6 +243,7 @@ const logger = getLogger("api.pbx");
 		 */
 		AuthzCheckRpcController,
 		ExtensionsController,
+		ExtensionUsersController,
 		PhoneNumbersController,
 		TrunksController,
 		InboundRoutesController,
@@ -453,6 +457,7 @@ const logger = getLogger("api.pbx");
 		FaxInboundService,
 		FaxSendWorker,
 		SipCredentialsService,
+		TrunkCredentialsService,
 		SipCredentialsResponder,
 		{ provide: PBX_ENV, useFactory: (): PbxEnv => loadPbxEnv() },
 		{
@@ -746,6 +751,7 @@ const logger = getLogger("api.pbx");
 			],
 		},
 		ExtensionsService,
+		ExtensionUsersService,
 		ExtensionFeatureService,
 		PhoneNumbersService,
 		TrunksService,

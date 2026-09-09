@@ -47,6 +47,15 @@ function service(): {
 	};
 }
 
+describe("organization SIP domain provisioning", () => {
+	it("renders the organization's domain into its device accounts", () => {
+		const source = { ...snapshot(PLAIN_EXTENSION_ID, []), sipRealm: " Tenant-B.Example " };
+		const context = service().buildContext(ORG, source, "token");
+		expect(context.sipDomain).to.equal("tenant-b.example");
+		expect(context.lines[0]?.serverAddress).to.equal("tenant-b.example");
+	});
+});
+
 /**
  * A one-line Yealink snapshot whose single line points at `extensionId`, with the manual
  * `shared_line` flag OFF, and a membership set the caller supplies.

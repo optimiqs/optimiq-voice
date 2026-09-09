@@ -5539,7 +5539,7 @@ export class PlanWalker {
 			if (attempt.delaySeconds > 0) {
 				await this.delay(attempt.delaySeconds * MILLIS_PER_SECOND);
 			}
-			const outcome = await this.dialOne(attempt, index);
+			const outcome = await this.dialOne({ ...attempt, delaySeconds: 0 }, index);
 			if (outcome.kind === "answered" || outcome.kind === "aborted") {
 				return outcome;
 			}
@@ -5568,10 +5568,64 @@ export class PlanWalker {
 	 * settled race and that leg is torn down with the rest of the losers.
 	 */
 	private async dialSimultaneous(
-		attempts: readonly DialAttempt[],
+		originalAttempts: readonly DialAttempt[],
 		overallTimeoutSeconds: number,
 		abortOnCallerHangup = false,
 	): Promise<DialOutcome> {
+		const routes = (
+			await Promise.all(
+				originalAttempts.map(async (attempt, originalIndex) => {
+					const target = attempt.target ?? this.aorTargetFor(attempt.destinationNumber);
+					let groups: readonly (readonly DialTarget[])[] | undefined;
+					let unavailable = false;
+					if (
+						target?.kind === "aor" &&
+						target.contactUri === undefined &&
+						this.deps.media.resolveTargets !== undefined
+					) {
+						try {
+							groups = await this.deps.media.resolveTargets(
+								this.deps.channel.organizationId,
+								target,
+							);
+						} catch (error) {
+							unavailable = true;
+							this.note(`${attempt.label} has no reachable registration: ${String(error)}`);
+						}
+					}
+					if (groups === undefined || groups.length === 0)
+						return [
+							{
+								attempt,
+								originalIndex,
+								group: 0,
+								unavailable: unavailable || groups?.length === 0,
+							},
+						];
+					return groups.flatMap((contacts, group) =>
+						contacts.map((target) => ({
+							attempt: { ...attempt, target },
+							originalIndex,
+							group,
+							unavailable: false,
+						})),
+					);
+				}),
+			)
+		).flat();
+		if (this.abandoned) return { kind: "aborted" };
+		if (routes.length === 0) return { kind: "failed", cause: "USER_NOT_REGISTERED", index: 0 };
+		const attempts = routes.map((route) => route.attempt);
+		const started = new Set<number>();
+		const closing = new Set<number>();
+		const groupDeadlines = new Map<string, ReturnType<typeof setTimeout>>();
+		const inFlight = new Set<Promise<void>>();
+		const progressByIndex = new Map<
+			number,
+			{ readonly sawProgress: () => void; readonly cancel: () => void }
+		>();
+		let startGroup: (originalIndex: number, group: number) => void = () => undefined;
+
 		const channelIds = attempts.map(() => this.newId());
 		const unwatchers: (() => void)[] = [];
 		const progressTimers: { readonly cancel: () => void }[] = [];
@@ -5601,10 +5655,23 @@ export class PlanWalker {
 		 * fact as everybody rejecting it.
 		 */
 		const legIsOut = (index: number, cause?: HangupCause): void => {
+			if (ended.has(index)) return;
 			if (cause !== undefined) {
 				lastCause = cause;
 			}
 			ended.add(index);
+			const route = routes[index]!;
+			if (
+				!settled &&
+				routes.every(
+					(candidate, position) =>
+						candidate.originalIndex !== route.originalIndex ||
+						candidate.group !== route.group ||
+						ended.has(position),
+				)
+			) {
+				startGroup(route.originalIndex, route.group + 1);
+			}
 			if (ended.size === attempts.length) {
 				resolveOutcome(
 					lastCause === undefined
@@ -5629,28 +5696,16 @@ export class PlanWalker {
 		for (const index of attempts.keys()) {
 			const channelId = channelIds[index] as string;
 			const attempt = attempts[index] as DialAttempt;
-			// Per leg, not per race: one black-holing trunk in a ring-all must not keep the other
-			// phones from ringing, so the silent leg drops OUT of the race and the race goes on.
-			// A race in which every leg fell silent ends as a timeout, i.e. as "nobody answered".
-			const progress = this.armProgressTimeout(attempt, () => {
-				if (settled || ended.has(index)) {
-					return;
-				}
-				this.note(`${attempt.label} showed no progress and was dropped from the race`);
-				void this.hangupQuietly(channelId, "ORIGINATOR_CANCEL").finally(() => {
-					legIsOut(index);
-				});
-			});
-			progressTimers.push(progress);
 			unwatchers.push(
 				this.deps.signals.watch(legSignalKey(channelId), (signal) => {
+					if (ended.has(index) || closing.has(index)) return;
 					const leg = signal as LegSignal;
 					if (leg.kind === "ringing" || leg.kind === "progress") {
-						progress.sawProgress();
+						progressByIndex.get(index)?.sawProgress();
 						return;
 					}
 					if (leg.kind === "answered" || leg.kind === "entered") {
-						progress.sawProgress();
+						progressByIndex.get(index)?.sawProgress();
 						const confirm = attempt.confirm;
 						if (confirm === undefined) {
 							resolveOutcome({ kind: "answered", mediaChannelId: channelId, index });
@@ -5684,22 +5739,88 @@ export class PlanWalker {
 			);
 		}
 
-		// Started after every watcher is in place, so no leg's answer can outrun its subscription.
-		await Promise.all(
-			attempts.map(async (attempt, index) => {
-				if (attempt.delaySeconds > 0) {
-					await this.delay(attempt.delaySeconds * MILLIS_PER_SECOND);
-				}
-				if (settled) {
-					return;
-				}
-				await this.originate(attempt, channelIds[index] as string, index, (cause) => {
-					legIsOut(index, cause);
+		// Install every watcher first. A lower-preference group starts only when the entire
+		// previous group failed, while other extensions keep ringing independently.
+		startGroup = (originalIndex, group) => {
+			for (const [index, route] of routes.entries()) {
+				if (
+					route.originalIndex !== originalIndex ||
+					route.group !== group ||
+					started.has(index) ||
+					settled
+				)
+					continue;
+				started.add(index);
+				const attempt = route.attempt;
+				const work = (async () => {
+					if (group === 0 && attempt.delaySeconds > 0)
+						await Promise.race([
+							this.delay(attempt.delaySeconds * MILLIS_PER_SECOND),
+							outcomePromise,
+						]);
+					if (settled || this.abandoned) return;
+					if (route.unavailable) {
+						legIsOut(index, "USER_NOT_REGISTERED");
+						return;
+					}
+					const groupKey = `${originalIndex}:${group}`;
+					if (!groupDeadlines.has(groupKey)) {
+						const groups =
+							Math.max(
+								...routes
+									.filter((candidate) => candidate.originalIndex === originalIndex)
+									.map((candidate) => candidate.group),
+							) + 1;
+						// Share this destination's ring budget across its preference groups. A silent
+						// first group must leave time for the backup device before the overall deadline.
+						const deadline = setTimeout(
+							() => {
+								if (settled) return;
+								for (const [position, candidate] of routes.entries()) {
+									if (
+										candidate.originalIndex !== originalIndex ||
+										candidate.group !== group ||
+										ended.has(position) ||
+										closing.has(position)
+									)
+										continue;
+									closing.add(position);
+									void this.hangupQuietly(channelIds[position]!, "ORIGINATOR_CANCEL").finally(() =>
+										legIsOut(position),
+									);
+								}
+							},
+							Math.max(1, (attempt.timeoutSeconds * MILLIS_PER_SECOND) / groups),
+						);
+						deadline.unref?.();
+						groupDeadlines.set(groupKey, deadline);
+					}
+					const progress = this.armProgressTimeout(attempt, () => {
+						if (settled || ended.has(index)) return;
+						this.note(`${attempt.label} showed no progress and was dropped from the race`);
+						closing.add(index);
+						void this.hangupQuietly(channelIds[index]!, "ORIGINATOR_CANCEL").finally(() =>
+							legIsOut(index),
+						);
+					});
+					progressByIndex.set(index, progress);
+					progressTimers.push(progress);
+					await this.originate(attempt, channelIds[index]!, route.originalIndex, (cause) =>
+						legIsOut(index, cause),
+					);
+				})().catch((error) => {
+					this.log("dial attempt failed", { err: String(error) });
+					legIsOut(index, "NORMAL_TEMPORARY_FAILURE");
 				});
-			}),
-		);
+				inFlight.add(work);
+				void work.finally(() => inFlight.delete(work));
+			}
+		};
+		for (const index of originalAttempts.keys()) startGroup(index, 0);
 
 		const outcome = await outcomePromise;
+		await Promise.allSettled(inFlight);
+		for (const deadline of groupDeadlines.values()) clearTimeout(deadline);
 		clearTimeout(overall);
 		for (const progress of progressTimers) {
 			progress.cancel();
@@ -5716,7 +5837,7 @@ export class PlanWalker {
 
 		const winner = outcome.kind === "answered" ? outcome.mediaChannelId : undefined;
 		for (const [index, channelId] of channelIds.entries()) {
-			if (channelId === winner || ended.has(index)) {
+			if (!started.has(index) || channelId === winner || ended.has(index)) {
 				continue;
 			}
 			await this.hangupQuietly(channelId, winner === undefined ? "ORIGINATOR_CANCEL" : "LOSE_RACE");
@@ -5725,7 +5846,9 @@ export class PlanWalker {
 		if (outcome.kind === "timeout" && lastCause !== undefined && ended.size === attempts.length) {
 			return { kind: "failed", cause: lastCause, index: 0 };
 		}
-		return outcome;
+		return outcome.kind === "answered" || outcome.kind === "failed"
+			? { ...outcome, index: routes[outcome.index]?.originalIndex ?? 0 }
+			: outcome;
 	}
 
 	/**
@@ -5767,6 +5890,22 @@ export class PlanWalker {
 		index: number,
 		abortOnCallerHangup = false,
 	): Promise<DialOutcome> {
+		const target = attempt.target ?? this.aorTargetFor(attempt.destinationNumber);
+		if (
+			target?.kind === "aor" &&
+			target.contactUri === undefined &&
+			this.deps.media.resolveTargets !== undefined
+		) {
+			const outcome = await this.dialSimultaneous(
+				[attempt],
+				attempt.timeoutSeconds,
+				abortOnCallerHangup,
+			);
+			return outcome.kind === "answered" || outcome.kind === "failed"
+				? { ...outcome, index }
+				: outcome;
+		}
+
 		const channelId = this.newId();
 		let settled = false;
 		let resolveOutcome: (outcome: DialOutcome) => void = () => undefined;

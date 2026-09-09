@@ -285,6 +285,9 @@ func (m *Manager) Unhold(sessionID string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if session.Held() {
+		session.rtpGraceUntil.Store(m.now().Add(m.rtpTimeout).UnixMilli())
+	}
 	return session.Unhold(), nil
 }
 

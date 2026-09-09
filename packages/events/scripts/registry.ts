@@ -387,6 +387,13 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		request: RPC_CONTRACTS["rpc.sip.v1.credential"].request,
 		response: RPC_CONTRACTS["rpc.sip.v1.credential"].response,
 	},
+	{
+		subject: "rpc.sip.v1.trunk-credential",
+		goName: "SipTrunkCredential",
+		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.trunk-credential"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.sip.v1.trunk-credential"].request,
+		response: RPC_CONTRACTS["rpc.sip.v1.trunk-credential"].response,
+	},
 	// The SIP edge's transfer command. The mirror image of the entry above it: same Go caller
 	// (apps/sipd), but the request is a phone's REFER and the responder is the ENGINE rather than
 	// the API. Emitted for the same reason the credential pair is — the Go side speaks the payload
@@ -443,6 +450,20 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.originate"].timeoutMs,
 		request: RPC_CONTRACTS["rpc.sip.v1.originate"].request,
 		response: RPC_CONTRACTS["rpc.sip.v1.originate"].response,
+	},
+	{
+		subject: "rpc.sip.v1.resolve-target",
+		goName: "SipResolveTarget",
+		timeoutMs: RPC_CONTRACTS["rpc.sip.v1.resolve-target"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.sip.v1.resolve-target"].request,
+		response: RPC_CONTRACTS["rpc.sip.v1.resolve-target"].response,
+	},
+	{
+		subject: "rpc.engine.v1.renegotiate",
+		goName: "EngineRenegotiate",
+		timeoutMs: RPC_CONTRACTS["rpc.engine.v1.renegotiate"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.engine.v1.renegotiate"].request,
+		response: RPC_CONTRACTS["rpc.engine.v1.renegotiate"].response,
 	},
 	// The media plane. Unlike every entry above, the RESPONDER for these is Go: apps/mediad
 	// unmarshals the generated request structs and marshals the generated response ones, which is

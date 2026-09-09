@@ -97,6 +97,7 @@ describe("projectQueueMemberships", () => {
 			extensionDialTemplate: "Local/{number}@optimiq-loopback/n",
 		});
 		expect(memberships[0]?.agents[0]?.contact).to.equal("Local/1001@optimiq-loopback/n");
+		expect(memberships[0]?.agents[0]?.extensionNumber).to.equal("1001");
 	});
 
 	it("passes an external agent's dial string through untouched", () => {

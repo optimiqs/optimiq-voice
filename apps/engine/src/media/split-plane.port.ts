@@ -1,9 +1,13 @@
 import { getLogger, type PinoLogger } from "@optimiq-voice/logging";
 import { hangupCauseCode } from "@optimiq-voice/telephony";
-import { MediaOperationNotSupportedError } from "./media-not-supported.error";
+import {
+	MediaCommandRefusedError,
+	MediaOperationNotSupportedError,
+} from "./media-not-supported.error";
 import type { SipdCommandPort } from "../nats/sipd-command.client";
 import type {
 	BridgeHandle,
+	DialTarget,
 	CreateBridgeRequest,
 	MediaDirection,
 	MediaPort,
@@ -19,7 +23,11 @@ import type {
 	TapRequest,
 } from "./media-port";
 import type { MediadMediaPort } from "./mediad-media.port";
-import type { MediaAcceptAnswerResponse } from "@optimiq-voice/events";
+import type {
+	EngineRenegotiateRequest,
+	EngineRenegotiateResponse,
+	MediaAcceptAnswerResponse,
+} from "@optimiq-voice/events";
 import type { BridgeMode, HangupCause } from "@optimiq-voice/telephony";
 
 /**
@@ -151,6 +159,7 @@ export class SplitPlaneMediaPort implements MediaPort {
 		private readonly media: MediadMediaPort,
 		private readonly signalling: SipdCommandPort,
 		private readonly logger: PinoLogger = getLogger("engine.split-plane"),
+		private readonly engineInstanceId?: string,
 	) {}
 
 	// --- registration: the lead hands the composite each leg's plane state ------------------------
@@ -227,6 +236,46 @@ export class SplitPlaneMediaPort implements MediaPort {
 		return this.media.bridgeMode;
 	}
 
+	get supportsSupervision(): boolean {
+		return this.media.supportsSupervision;
+	}
+
+	async resolveTargets(
+		orgId: string,
+		target: DialTarget,
+	): Promise<readonly (readonly DialTarget[])[]> {
+		if (
+			target.kind !== "aor" ||
+			target.contactUri !== undefined ||
+			this.signalling.resolveTarget === undefined
+		)
+			return [[target]];
+		const reply = await this.signalling.resolveTarget({ orgId, legId: "resolve-contacts", target });
+		if (!reply.ok)
+			throw new SplitPlaneSignallingRefusedError(
+				"originate",
+				"resolve-contacts",
+				reply.reason,
+				reply.error ?? "destination resolution failed",
+			);
+		if (reply.contacts === undefined || reply.contacts.length === 0) {
+			return [
+				[reply.requestUri === undefined ? target : { ...target, contactUri: reply.requestUri }],
+			];
+		}
+		const groups = new Map<number, DialTarget[]>();
+		for (const contact of [...reply.contacts].sort((a, b) => b.q - a.q)) {
+			const group = groups.get(contact.q) ?? [];
+			group.push({ ...target, contactUri: contact.requestUri });
+			groups.set(contact.q, group);
+		}
+		return [...groups.values()];
+	}
+
+	async recordConversation(channelId: string, request: RecordRequest): Promise<RecordingHandle> {
+		return await this.media.recordConversation(channelId, request);
+	}
+
 	/**
 	 * `200 OK` with the media plane's answer, §3.2.
 	 *
@@ -235,6 +284,39 @@ export class SplitPlaneMediaPort implements MediaPort {
 	 * because the answer does not exist until `mediad` writes it. A leg with no offer or no owning
 	 * instance cannot be answered, and saying so loudly is the whole contract.
 	 */
+	async renegotiate(request: EngineRenegotiateRequest): Promise<EngineRenegotiateResponse> {
+		const leg = this.legs.get(request.legId);
+		if (
+			!leg ||
+			leg.orgId !== request.orgId ||
+			leg.callId !== request.callId ||
+			leg.instanceId !== request.sipdInstanceId
+		)
+			return { ok: false, legId: request.legId, reason: "unknown_leg" };
+		let reply;
+		try {
+			reply = await this.media.allocateSession({
+				sessionId: request.legId,
+				legId: request.legId,
+				orgId: leg.orgId,
+				callId: leg.callId,
+				sdpOffer: request.sdpOffer,
+			});
+		} catch (error) {
+			if (error instanceof MediaCommandRefusedError && error.reason === "not_supported")
+				return { ok: false, legId: request.legId, reason: "not_supported" };
+			throw error;
+		}
+		if (!reply.ok || !reply.sdpAnswer)
+			return { ok: false, legId: request.legId, reason: "not_supported" };
+		if (this.legs.get(request.legId) !== leg) {
+			await this.media.hangup(request.legId, "NORMAL_CLEARING");
+			return { ok: false, legId: request.legId, reason: "unknown_leg" };
+		}
+		leg.sdpOffer = request.sdpOffer;
+		return { ok: true, legId: request.legId, sdpAnswer: reply.sdpAnswer };
+	}
+
 	async answer(channelId: string): Promise<void> {
 		const leg = this.require("answer", channelId);
 		if (leg.sdpOffer === undefined) {
@@ -311,46 +393,91 @@ export class SplitPlaneMediaPort implements MediaPort {
 			);
 		}
 		const leg = this.require("originate", request.channelId);
-
-		const offer = await this.media.createOffer({
-			sessionId: request.channelId,
-			orgId: leg.orgId,
-			callId: leg.callId,
-			legId: request.channelId,
-			direction: "sendrecv",
-		});
-		if (!offer.ok || offer.sdpOffer === undefined) {
-			throw new SplitPlaneSignallingRefusedError(
-				"originate",
-				request.channelId,
-				offer.reason,
-				offer.error ?? "mediad wrote no offer for the B-leg",
-			);
-		}
-
-		const reply = await this.signalling.originate({
+		const resolved = await this.signalling.resolveTarget?.({
 			legId: request.channelId,
 			orgId: leg.orgId,
-			callId: leg.callId,
 			target: request.target,
-			...splitCallerId(request.callerId),
-			sdpOffer: offer.sdpOffer,
-			...(request.timeoutSeconds === undefined || request.timeoutSeconds <= 0
-				? {}
-				: { ringTimeoutMs: request.timeoutSeconds * MILLIS_PER_SECOND }),
 		});
-		if (!reply.ok) {
+		if (resolved !== undefined && !resolved.ok) {
 			throw new SplitPlaneSignallingRefusedError(
 				"originate",
 				request.channelId,
-				reply.reason,
-				reply.error ?? "no detail",
+				resolved.reason,
+				resolved.error ?? "destination resolution failed",
 			);
 		}
-		if (reply.instanceId !== undefined) {
-			this.setInstance(request.channelId, reply.instanceId);
+
+		if (resolved?.instanceId !== undefined)
+			this.setInstance(request.channelId, resolved.instanceId);
+		try {
+			const offer = await this.media.createOffer({
+				...(resolved?.transport === "ws" || resolved?.transport === "wss"
+					? { transport: "webrtc" as const }
+					: {}),
+				sessionId: request.channelId,
+				orgId: leg.orgId,
+				callId: leg.callId,
+				legId: request.channelId,
+				direction: "sendrecv",
+			});
+			if (!offer.ok || offer.sdpOffer === undefined) {
+				throw new SplitPlaneSignallingRefusedError(
+					"originate",
+					request.channelId,
+					offer.reason,
+					offer.error ?? "mediad wrote no offer for the B-leg",
+				);
+			}
+
+			const reply = await this.signalling.originate(
+				{
+					legId: request.channelId,
+					engineInstanceId: this.engineInstanceId,
+					orgId: leg.orgId,
+					callId: leg.callId,
+					target:
+						request.target.kind === "aor" && resolved?.requestUri !== undefined
+							? { ...request.target, contactUri: resolved.requestUri }
+							: request.target,
+					...splitCallerId(request.callerId),
+					sdpOffer: offer.sdpOffer,
+					headers: Object.fromEntries(
+						["Alert-Info", "Call-Info"].flatMap((name) => {
+							const value = request.variables?.[`PJSIP_HEADER(add,${name})`];
+							return value === undefined ? [] : [[name, value]];
+						}),
+					),
+					...(request.timeoutSeconds === undefined || request.timeoutSeconds <= 0
+						? {}
+						: { ringTimeoutMs: request.timeoutSeconds * MILLIS_PER_SECOND }),
+				},
+				resolved?.instanceId,
+			);
+			if (!reply.ok) {
+				throw new SplitPlaneSignallingRefusedError(
+					"originate",
+					request.channelId,
+					reply.reason,
+					reply.error ?? "no detail",
+				);
+			}
+			if (reply.instanceId !== undefined) {
+				this.setInstance(request.channelId, reply.instanceId);
+			}
+			return { channelId: request.channelId };
+		} catch (error) {
+			// An RPC timeout can leave a sent INVITE or allocated media behind. The resolved edge
+			// is already recorded, so cleanup also reaches a call whose originate reply was lost.
+			try {
+				await this.hangup(request.channelId, "NORMAL_TEMPORARY_FAILURE");
+			} catch (cleanupError) {
+				this.logger.error(
+					{ channelId: request.channelId, err: cleanupError },
+					"failed to clean up refused origination",
+				);
+			}
+			throw error;
 		}
-		return { channelId: request.channelId };
 	}
 
 	/**
@@ -378,18 +505,27 @@ export class SplitPlaneMediaPort implements MediaPort {
 	 */
 	async hangup(channelId: string, cause: HangupCause): Promise<void> {
 		const instanceId = this.legs.get(channelId)?.instanceId;
-		if (instanceId !== undefined) {
-			const reply = await this.signalling.hangup(instanceId, {
-				legId: channelId,
-				cause: hangupCauseCode(cause),
-			});
-			if (!reply.ok) {
-				this.logger.warn(
-					{ channelId, instanceId, reason: reply.reason },
-					"the sip edge refused a hangup; releasing media anyway",
-				);
+		try {
+			if (instanceId !== undefined) {
+				const reply = await this.signalling.hangup(instanceId, {
+					legId: channelId,
+					cause: hangupCauseCode(cause),
+				});
+				if (!reply.ok) {
+					this.logger.warn(
+						{ channelId, instanceId, reason: reply.reason },
+						"the sip edge refused a hangup; releasing media anyway",
+					);
+				}
 			}
+		} finally {
+			await this.media.releaseSession(channelId);
+			this.forget(channelId);
 		}
+	}
+
+	/** A remote BYE has already ended signalling; release its media without sending another BYE. */
+	async releaseEndedLeg(channelId: string): Promise<void> {
 		await this.media.releaseSession(channelId);
 		this.forget(channelId);
 	}

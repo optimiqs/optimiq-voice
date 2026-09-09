@@ -12,6 +12,7 @@ import {
 import { RowActions } from "~/components/pbx/row-actions";
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
+import { MenuItem } from "~/components/ui/menu";
 import { PageHeader } from "~/components/ui/page-header";
 import { DEFAULT_PAGE_LIMIT, PBX_RESOURCES } from "~/lib/pbx/client";
 import { followMeSummary } from "~/lib/pbx/follow-me";
@@ -19,6 +20,7 @@ import { usePermission } from "../../_context/session-context";
 import { useLiveRegistrations } from "../../_hooks/use-live-queries";
 import { usePbxDelete, usePbxList } from "../../_hooks/use-pbx-queries";
 import { ExtensionDialog } from "./extension-dialog";
+import { ExtensionUsersDialog } from "./extension-users-dialog";
 import type { ExtensionRow } from "~/lib/pbx/contracts";
 
 /**
@@ -50,6 +52,8 @@ export function ExtensionsScreen() {
 	const remove = usePbxDelete(resource);
 
 	const canWrite = usePermission(resource.permissions.write);
+	const canAssign = usePermission("extensions.assign");
+	const [assigning, setAssigning] = useState<ExtensionRow | null>(null);
 	const canDelete = usePermission(resource.permissions.delete);
 	const registrations = useLiveRegistrations();
 
@@ -179,6 +183,11 @@ export function ExtensionsScreen() {
 				rowActions={(row) => (
 					<RowActions
 						label={`extension ${row.number}`}
+						extra={
+							canAssign ? (
+								<MenuItem onClick={() => setAssigning(row)}>Assign users</MenuItem>
+							) : undefined
+						}
 						onEdit={canWrite ? () => openEdit(row) : undefined}
 						onDelete={
 							canDelete
@@ -211,6 +220,14 @@ export function ExtensionsScreen() {
 				onOpenChange={setDialogOpen}
 				extension={editing}
 			/>
+
+			{assigning ? (
+				<ExtensionUsersDialog
+					key={assigning.id}
+					extension={assigning}
+					onClose={() => setAssigning(null)}
+				/>
+			) : null}
 
 			<DeleteEntityDialog
 				open={pendingDelete !== null}

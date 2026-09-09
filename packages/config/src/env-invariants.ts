@@ -7,6 +7,7 @@
 
 export interface EnvInvariantConfig {
 	NODE_ENV: string;
+	OPTIMIQ_SERVICE?: "api" | "engine";
 	DATABASE_URL?: string;
 	API_DATABASE_URL?: string;
 	NATS_URL?: string;
@@ -251,7 +252,7 @@ function assertProductionTelephonyHosts(config: EnvInvariantConfig): void {
 	const hostKeys = [["ASTERISK_SIPPROXY_HOST", config.ASTERISK_SIPPROXY_HOST]] as const;
 
 	for (const [key, value] of hostKeys) {
-		if (isUnsetHost(value)) {
+		if (value !== undefined && isUnsetHost(value)) {
 			throw new Error(`${key} must be a reachable address in production.`);
 		}
 	}
@@ -264,18 +265,19 @@ export function assertEnvInvariants(config: EnvInvariantConfig): void {
 		return;
 	}
 
-	requirePresent("DATABASE_URL", config.DATABASE_URL ?? config.API_DATABASE_URL);
 	requirePresent("NATS_URL", config.NATS_URL ?? config.API_NATS_URL);
-	requirePresent("AUTH_SECRET", config.AUTH_SECRET);
-
-	if ((config.AUTH_SECRET?.trim().length ?? 0) < MINIMUM_SECRET_LENGTH) {
-		throw new Error(`AUTH_SECRET must be at least ${MINIMUM_SECRET_LENGTH} characters.`);
-	}
-
-	requireHttpsUrl("AUTH_URL", config.AUTH_URL);
-
-	if (config.API_APP_URL?.trim()) {
-		requireHttpsUrl("API_APP_URL", config.API_APP_URL);
+	if (config.OPTIMIQ_SERVICE !== "engine") {
+		requirePresent("DATABASE_URL", config.DATABASE_URL ?? config.API_DATABASE_URL);
+		requirePresent("AUTH_SECRET", config.AUTH_SECRET);
+		if ((config.AUTH_SECRET?.trim().length ?? 0) < MINIMUM_SECRET_LENGTH) {
+			throw new Error(`AUTH_SECRET must be at least ${MINIMUM_SECRET_LENGTH} characters.`);
+		}
+		requireHttpsUrl("AUTH_URL", config.AUTH_URL);
+		if (config.API_APP_URL?.trim()) requireHttpsUrl("API_APP_URL", config.API_APP_URL);
+	} else {
+		// The engine owns no database or browser authentication. It authenticates only to NATS.
+		requirePresent("NATS_ENGINE_USER", config.NATS_ENGINE_USER);
+		requirePresent("NATS_ENGINE_PASS", config.NATS_ENGINE_PASS);
 	}
 
 	assertProductionSecrets(config);

@@ -7,6 +7,10 @@
 			"minLength": 1,
 			"maxLength": 128
 		},
+		"transport": {
+			"type": "string",
+			"enum": ["rtp", "webrtc"]
+		},
 		"orgId": {
 			"type": "string",
 			"format": "uuid",

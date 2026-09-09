@@ -358,6 +358,35 @@ func (s *Server) refuseReinvite(legID, reason, message string) []byte {
 // It replies when the INVITE has been SENT, not when it is answered. The far end's ringing is a full
 // transaction away and is not inside the contract's one-second budget; it arrives as
 // `dialog.progressed`, and the 2xx as `dialog.answered`.
+func (s *Server) HandleResolveTarget(data []byte) []byte {
+	// The resolve request is the legId/orgId/target subset of originate's contract.
+	var request contract.SipOriginateRequest
+	if err := json.Unmarshal(data, &request); err != nil {
+		return s.refuseOriginate("", ReasonBadRequest, "malformed target resolution request")
+	}
+	if request.LegID == "" || request.OrgID == "" {
+		return s.refuseOriginate(request.LegID, ReasonBadRequest, "legId and orgId are required")
+	}
+	if detail, ok := validTarget(request.Target); !ok {
+		return s.refuseOriginate(request.LegID, ReasonBadRequest, detail)
+	}
+	resolver, ok := s.dialogs.(interface {
+		ResolveTarget(context.Context, string, contract.SipOriginateRequestTarget) (contract.SipResolveTargetResponse, error)
+	})
+	if !ok {
+		return s.refuseOriginate(request.LegID, ReasonNotSupported, "target resolution is not available")
+	}
+	ctx, cancel := commandContext()
+	defer cancel()
+	reply, err := resolver.ResolveTarget(ctx, request.OrgID, request.Target)
+	if err != nil {
+		reason, detail := refusalFor(err)
+		return s.refuseOriginate(request.LegID, reason, detail)
+	}
+	reply.LegID = request.LegID
+	return encode(s.log, reply)
+}
+
 func (s *Server) HandleOriginate(data []byte) []byte {
 	var request contract.SipOriginateRequest
 	if err := json.Unmarshal(data, &request); err != nil {
