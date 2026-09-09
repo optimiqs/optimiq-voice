@@ -33,8 +33,8 @@ const logger = getLogger("api.pbx");
  * The claim increments `attempts`; the server's `retry_attempts` is the ceiling. Past it, the fax is
  * terminally `failed` with a sentence rather than retried forever — the case a document the carrier
  * keeps refusing, or a permanent misconfiguration (no fax connection, no carrier key), bounds. A
- * TRANSIENT carrier failure releases the claim (`status` back to `queued`), and the lease offers the
- * row again after the server's backoff.
+ * TRANSIENT carrier failure pushes the row's lease forward by the server's `retry_backoff_seconds`
+ * (`releaseSend`), so the next attempt happens after the backoff rather than on the next poll.
  *
  * The carrier's own T.30 delivery retries are NOT this worker's concern: once Telnyx accepts the fax
  * (a 202 and a fax id), the row is `sending` and the terminal outcome arrives over the `fax.*`
@@ -105,12 +105,15 @@ export class FaxSendWorker implements OnModuleInit, OnApplicationShutdown {
 			return 0;
 		}
 
-		// The retry ceiling is the server's, read under the tenant's scope.
-		const retryAttempts = await this.database.withTenantScope(
+		// The retry ceiling and its backoff are the server's, read under the tenant's scope.
+		const { retryAttempts, retryBackoffSeconds } = await this.database.withTenantScope(
 			fax.organizationId,
 			async (transaction) => {
 				const server = await getFaxServer(transaction, fax.faxServerId);
-				return server?.retryAttempts ?? 3;
+				return {
+					retryAttempts: server?.retryAttempts ?? 3,
+					retryBackoffSeconds: server?.retryBackoffSeconds ?? 60,
+				};
 			},
 		);
 
@@ -160,12 +163,23 @@ export class FaxSendWorker implements OnModuleInit, OnApplicationShutdown {
 				return 0;
 			}
 			logger.warn(
-				{ organizationId: fax.organizationId, faxId: fax.id, err: String(error) },
-				"an outbound fax send attempt failed; it will be retried when its lease expires",
+				{
+					organizationId: fax.organizationId,
+					faxId: fax.id,
+					retryBackoffSeconds,
+					err: String(error),
+				},
+				"an outbound fax send attempt failed; it will be retried after the server's backoff",
+			);
+			// `claimed_at` is dated so that the lease clause turns true exactly one backoff from now —
+			// see `releaseSend`. Without this the row is claimable on the next poll and a carrier blip
+			// of a minute spends every attempt in fifteen seconds.
+			const claimedAt = new Date(
+				Date.now() + retryBackoffSeconds * 1000 - this.env.FAX_SEND_LEASE_MS,
 			);
 			await this.database.withTenantScope(
 				fax.organizationId,
-				async (transaction) => await releaseSend(transaction, fax.id),
+				async (transaction) => await releaseSend(transaction, fax.id, claimedAt),
 			);
 			return 0;
 		}

@@ -12,8 +12,9 @@ import type { PbxResource } from "../shared/pbx-resource";
  *
  * `pinHash` and `moderatorPinHash` are absent from the DTO, exactly as `voicemail_box.pinHash` is:
  * a PIN is set through an endpoint that hashes it, never by an admin pasting a digest into a JSON
- * body. Until that endpoint exists, `requiresPin` in the compiled artifact stays false — recorded
- * as a follow-up rather than papered over with a plaintext column.
+ * body. That endpoint is `conference-pin.service.ts` (`POST`/`DELETE /conferences/:id/pin` and
+ * `/moderator-pin`), which hashes, writes the column and recompiles, so `requiresPin` in the
+ * compiled artifact follows it.
  */
 export const CONFERENCE_RESOURCE: PbxResource = {
 	kind: "conference",
@@ -27,8 +28,8 @@ export const CONFERENCE_RESOURCE: PbxResource = {
 	/**
 	 * Neither digest is returned either, for the reason `voicemail-boxes.resource.ts` states at
 	 * length: a hash in a response body is a hash somebody can crack offline, and a room PIN is
-	 * shorter than a password. Both columns are NULL today (no endpoint writes them yet), so this
-	 * is a rule established before there is anything to leak rather than after.
+	 * shorter than a password. `conference-pin.service.ts` writes both columns, so this is
+	 * load-bearing rather than speculative.
 	 */
 	secretColumns: ["pinHash", "moderatorPinHash"],
 };

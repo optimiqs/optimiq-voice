@@ -3,7 +3,7 @@ import { templateFor } from "../../src/provisioning/catalog/catalog";
 import { renderWith } from "../../src/provisioning/catalog/template";
 import { ProvisionService } from "../../src/provisioning/render/provision.service";
 import type { RenderContext } from "../../src/provisioning/catalog/render-context";
-import type { ProvisioningEnv } from "../../src/provisioning/provisioning-env";
+import type { ConfiguredProvisioningEnv } from "../../src/provisioning/provisioning-env";
 import type { RenderSnapshot } from "../../src/provisioning/render/provision.repository";
 
 /**
@@ -30,11 +30,16 @@ const ENV = {
 	PROVISION_SIP_SECRET_KEY: "test-root-key-0123456789abcdef",
 	PROVISION_SIP_OUTBOUND_PROXY: undefined,
 	PROVISION_BASE_URL: undefined,
-} as unknown as ProvisioningEnv;
+} as unknown as ConfiguredProvisioningEnv;
 
 /** A service with only the env wired — `buildContext` touches nothing else. */
 function service(): {
-	buildContext(organizationId: string, snapshot: RenderSnapshot, token: string): RenderContext;
+	buildContext(
+		env: ConfiguredProvisioningEnv,
+		organizationId: string,
+		snapshot: RenderSnapshot,
+		token: string,
+	): RenderContext;
 } {
 	return new ProvisionService(
 		undefined as never,
@@ -43,14 +48,19 @@ function service(): {
 		undefined as never,
 		undefined as never,
 	) as unknown as {
-		buildContext(organizationId: string, snapshot: RenderSnapshot, token: string): RenderContext;
+		buildContext(
+			env: ConfiguredProvisioningEnv,
+			organizationId: string,
+			snapshot: RenderSnapshot,
+			token: string,
+		): RenderContext;
 	};
 }
 
 describe("organization SIP domain provisioning", () => {
 	it("renders the organization's domain into its device accounts", () => {
 		const source = { ...snapshot(PLAIN_EXTENSION_ID, []), sipRealm: " Tenant-B.Example " };
-		const context = service().buildContext(ORG, source, "token");
+		const context = service().buildContext(ENV, ORG, source, "token");
 		expect(context.sipDomain).to.equal("tenant-b.example");
 		expect(context.lines[0]?.serverAddress).to.equal("tenant-b.example");
 	});
@@ -107,6 +117,7 @@ function snapshot(extensionId: string, sharedLineMembers: readonly string[]): Re
 describe("provisioning — shared line derived from appearances", () => {
 	it("renders sharedLine true when the extension is a shared-line member and the flag is off", () => {
 		const context = service().buildContext(
+			ENV,
 			ORG,
 			snapshot(MEMBER_EXTENSION_ID, [MEMBER_EXTENSION_ID]),
 			"token",
@@ -117,13 +128,14 @@ describe("provisioning — shared line derived from appearances", () => {
 	});
 
 	it("leaves sharedLine false when the extension is on no shared line", () => {
-		const context = service().buildContext(ORG, snapshot(PLAIN_EXTENSION_ID, []), "token");
+		const context = service().buildContext(ENV, ORG, snapshot(PLAIN_EXTENSION_ID, []), "token");
 
 		expect(context.lines[0]?.sharedLine).to.equal(false);
 	});
 
 	it("stamps the derived shared line into the Yealink and Poly renders", () => {
 		const context = service().buildContext(
+			ENV,
 			ORG,
 			snapshot(MEMBER_EXTENSION_ID, [MEMBER_EXTENSION_ID]),
 			"token",

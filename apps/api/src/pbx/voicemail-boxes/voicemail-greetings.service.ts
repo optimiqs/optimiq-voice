@@ -12,6 +12,7 @@ import {
 	MediaNotFoundException,
 	MediaSigningUnavailableException,
 } from "../media/media.errors";
+import { OrgLimitsService } from "../org-limits/org-limits.service";
 import { downloadFileName, openStoredObject } from "../prompts/prompts.service";
 import { compileOnWrite } from "../routing/compile-on-write";
 import { RoutingCachePublisher } from "../routing/routing-cache.publisher";
@@ -86,6 +87,7 @@ export class VoicemailGreetingsService {
 		 * always filesystem-backed; see `src/storage/object-store.factory.ts`.
 		 */
 		@Inject(PBX_MEDIA_STORE) private readonly store: ObjectStore,
+		@Inject(OrgLimitsService) private readonly limits: OrgLimitsService,
 	) {}
 
 	/** Every greeting on a box, active ones first, then by kind. */
@@ -127,6 +129,8 @@ export class VoicemailGreetingsService {
 		});
 
 		const audio = await readUploadedAudio(request, this.env.PBX_MEDIA_MAX_UPLOAD_BYTES);
+		// The tenant's storage quota, checked before the bytes are stored — see the prompt path.
+		await this.limits.assertMayStore(session, audio.sizeBytes);
 		const fields = parseDto(uploadGreetingFieldsDto, audio.fields);
 
 		const written = await this.putAndInsert({

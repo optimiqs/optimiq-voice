@@ -167,7 +167,7 @@ export class TrunkDirectoryPublisher implements OnModuleInit, OnApplicationShutd
 	 */
 	async syncOrganization(organizationId: string): Promise<TrunkDirectorySyncResult> {
 		if (this.bucket === undefined) {
-			return { published: 0, deleted: 0, unchanged: 0, skipped: true };
+			return { published: 0, deleted: 0, unchanged: 0, failed: 0, skipped: true };
 		}
 		const rows = await this.database.withTenantScope(
 			organizationId,
@@ -190,11 +190,12 @@ export class TrunkDirectoryPublisher implements OnModuleInit, OnApplicationShutd
 	): Promise<TrunkDirectorySyncResult> {
 		const bucket = this.bucket;
 		if (bucket === undefined) {
-			return { published: 0, deleted: 0, unchanged: 0, skipped: true };
+			return { published: 0, deleted: 0, unchanged: 0, failed: 0, skipped: true };
 		}
 
 		const existing = await this.readOrganization(bucket, organizationId);
 		const wanted = new Map<string, TrunkDirectoryEntry>();
+		let failed = 0;
 		let published = 0;
 		let deleted = 0;
 		let unchanged = 0;
@@ -230,6 +231,7 @@ export class TrunkDirectoryPublisher implements OnModuleInit, OnApplicationShutd
 				// Logged and swallowed: the API must not report "your change was not saved" about a change
 				// that was. The obligation stays in `pbx_projection_outbox` and the sweeper republishes.
 				this.failed += 1;
+				failed += 1;
 				logger.error({ key, organizationId, error }, "failed to write a trunks entry");
 			}
 		}
@@ -244,11 +246,12 @@ export class TrunkDirectoryPublisher implements OnModuleInit, OnApplicationShutd
 				deleted += 1;
 			} catch (error) {
 				this.failed += 1;
+				failed += 1;
 				logger.error({ key, organizationId, error }, "failed to delete a trunks entry");
 			}
 		}
 
-		return { published, deleted, unchanged, skipped: false };
+		return { published, deleted, unchanged, failed, skipped: false };
 	}
 
 	/** One trunk's published entry. Used by verification and by the rebuild script's report. */
@@ -275,8 +278,10 @@ export class TrunkDirectoryPublisher implements OnModuleInit, OnApplicationShutd
 	private async readOrganization(
 		bucket: KV,
 		organizationId: string,
-	): Promise<Map<string, TrunkDirectoryEntry>> {
-		const found = new Map<string, TrunkDirectoryEntry>();
+	): Promise<Map<string, TrunkDirectoryEntry | undefined>> {
+		// `undefined` is a key that exists in the bucket but could not be parsed. Present so the
+		// delete loop can reclaim it; never compared against as a directory entry.
+		const found = new Map<string, TrunkDirectoryEntry | undefined>();
 		let keys: string[];
 		try {
 			keys = await collect(await bucket.keys(`${organizationId}.*`));
@@ -284,12 +289,19 @@ export class TrunkDirectoryPublisher implements OnModuleInit, OnApplicationShutd
 			logger.warn({ organizationId, error }, "could not list trunks keys");
 			return found;
 		}
-		for (const key of keys) {
-			const entry = await readEntry(bucket, key);
-			// An unreadable entry is treated as absent so the next write repairs it, rather than as a
-			// carrier configuration to preserve — the alternative is a trunk pinned to a value the edge
-			// cannot parse and therefore cannot dial.
-			if (entry !== undefined && entry.orgId === organizationId) {
+		// In parallel: the reads are independent and serially each one costs a broker round trip.
+		const entries = await Promise.all(keys.map(async (key) => await readEntry(bucket, key)));
+		for (const [index, entry] of entries.entries()) {
+			const key = keys[index];
+			if (key === undefined) {
+				continue;
+			}
+			// An unreadable entry is treated as absent for the WRITE so the next write repairs it,
+			// rather than as a carrier configuration to preserve — the alternative is a trunk pinned to
+			// a value the edge cannot parse and therefore cannot dial. It is still carried into
+			// `existing` so the delete loop can reclaim it when its trunk is gone; the key is
+			// prefix-scoped to this organization, so ownership is not in doubt.
+			if (entry === undefined || entry.orgId === organizationId) {
 				found.set(key, entry);
 			}
 		}
@@ -390,6 +402,11 @@ export interface TrunkDirectorySyncResult {
 	readonly published: number;
 	readonly deleted: number;
 	readonly unchanged: number;
+	/**
+	 * KV writes and deletes that threw. Non-zero means the reconcile is incomplete, so the caller
+	 * must leave the outbox obligation owed and let the sweeper republish.
+	 */
+	readonly failed: number;
 	/** True when there is no broker and nothing was attempted. */
 	readonly skipped: boolean;
 }

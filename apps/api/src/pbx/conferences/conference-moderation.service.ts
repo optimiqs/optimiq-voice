@@ -1,7 +1,7 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { hasPermission, requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { getLogger } from "@optimiq-voice/logging";
-import { ConferenceControlClient } from "./conference-control.client";
+import { ConferenceControlClient, LOCALLY_SYNTHESISED_REFUSAL } from "./conference-control.client";
 import {
 	ConferenceActionNotServableException,
 	ConferenceControlUnavailableException,
@@ -127,6 +127,12 @@ export class ConferenceModerationService {
 	 * the instance that actually holds the member must not send the command to a neighbour that would
 	 * cheerfully say "not mine" and turn a real failure into a 404.
 	 *
+	 * A refusal the CLIENT synthesised is not an answer at all — no responders, a timeout, a reply
+	 * that is not the contract all arrive as `internal`, and treating those as authoritative would
+	 * let one restarting instance make a room that another instance can serve permanently
+	 * unmoderatable (contributors are walked in a deterministic order, so the same dead engine is
+	 * asked first every time). Those keep walking.
+	 *
 	 * The LAST refusal is what is thrown, not the first, because the interesting instance is the one
 	 * that got furthest.
 	 */
@@ -141,7 +147,11 @@ export class ConferenceModerationService {
 				return answer;
 			}
 			last = answer;
-			if (answer.reason === "unknown-conference" || answer.reason === "unknown-member") {
+			if (
+				answer.reason === "unknown-conference" ||
+				answer.reason === "unknown-member" ||
+				answer.error?.startsWith(LOCALLY_SYNTHESISED_REFUSAL) === true
+			) {
 				continue;
 			}
 			// A real refusal from the instance that owns the member. Stop.

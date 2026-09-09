@@ -228,10 +228,11 @@ export const DESTINATION_SITES: readonly DestinationSite[] = [
 /**
  * Every row that points at `id` as a destination of type `type`.
  *
- * One statement per site rather than a hand-rolled `union all`: fourteen small index-backed reads
- * inside an open transaction cost less than the readability of the alternative, and a `union` over
- * tables with different column sets needs the same per-site casting anyway. The scan runs only on
- * delete.
+ * One statement, not one per site: `DESTINATION_SITES` has grown past twenty entries and each one
+ * used to be its own awaited round trip inside the open write transaction that a delete already
+ * holds row locks in. The branches share the `(id, name, kind, field)` projection — the per-site
+ * casting a `union all` is usually accused of needing is written either way — so folding them into
+ * one `union all` collapses the whole scan to a single round trip. The scan runs only on delete.
  */
 export async function findDestinationReferences(
 	transaction: PbxDatabaseTransaction,
@@ -239,33 +240,34 @@ export async function findDestinationReferences(
 	id: string,
 	options: { readonly excludeTable?: string } = {},
 ): Promise<readonly EntityReference[]> {
-	const references: EntityReference[] = [];
-
-	for (const site of DESTINATION_SITES) {
-		if (site.table === options.excludeTable) {
-			continue;
-		}
-		const names = destinationColumnNames(site.prefix);
-		const nameExpression =
-			site.nameColumn === null ? sql`null` : sql`${sql.identifier(site.nameColumn)}::text`;
-		const rows = await transaction.execute(sql`
-			select id::text as id, ${nameExpression} as name
-			from ${sql.identifier(site.table)}
-			where ${sql.identifier(names.type)} = ${type}
-			  and ${sql.identifier(names.ref)} = ${id}::uuid
-			limit 25
-		`);
-		for (const row of readRows(rows)) {
-			references.push({
-				kind: site.kind,
-				id: String(row.id),
-				name: row.name === null || row.name === undefined ? null : String(row.name),
-				field: names.ref,
-			});
-		}
+	const branches = DESTINATION_SITES.filter((site) => site.table !== options.excludeTable).map(
+		(site) => {
+			const names = destinationColumnNames(site.prefix);
+			const nameExpression =
+				site.nameColumn === null ? sql`null` : sql`${sql.identifier(site.nameColumn)}::text`;
+			// Parenthesised so the per-branch `limit` binds to the branch and not to the union: one
+			// pathological site must not be able to crowd the other twenty out of the answer.
+			return sql`(
+				select id::text as id, ${nameExpression} as name,
+				       ${site.kind}::text as kind, ${names.ref}::text as field
+				from ${sql.identifier(site.table)}
+				where ${sql.identifier(names.type)} = ${type}
+				  and ${sql.identifier(names.ref)} = ${id}::uuid
+				limit 25
+			)`;
+		},
+	);
+	if (branches.length === 0) {
+		return [];
 	}
 
-	return references;
+	const rows = await transaction.execute(sql.join(branches, sql` union all `));
+	return readRows(rows).map((row) => ({
+		kind: String(row.kind),
+		id: String(row.id),
+		name: row.name === null || row.name === undefined ? null : String(row.name),
+		field: String(row.field),
+	}));
 }
 
 /** Non-destination foreign keys the CRUD layer also refuses to orphan. */

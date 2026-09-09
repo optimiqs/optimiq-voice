@@ -216,8 +216,15 @@ export const cdrEnvSchema = z.object({
 	 * root now is what makes moving it later a configuration change rather than a code change, and
 	 * it means an operator can put reports on a different volume from audio — different sizes,
 	 * different retention, different backup policy.
+	 *
+	 * Unset, it defaults to `<CDR_RECORDING_ROOT>/exports` rather than to a sibling of it. The
+	 * deployment pins `CDR_RECORDING_ROOT` to the mounted object volume (`compose.voice.yaml`) and
+	 * pins nothing for exports, so a literal default was a path the runtime image's uid 1001 cannot
+	 * write — an `EACCES` on the first export somebody clicks, hours after boot. Deriving it means
+	 * the writable volume is inherited by construction, and an operator who wants exports elsewhere
+	 * still just sets the variable. See `withRecordingRootFallback` below.
 	 */
-	CDR_EXPORT_ROOT: z.string().min(1).default("/opt/optimiq-voice/exports"),
+	CDR_EXPORT_ROOT: z.string().min(1).default("/opt/optimiq-voice/recordings/exports"),
 
 	/**
 	 * How often the export worker looks for a queued job. `0` disables it.
@@ -284,8 +291,27 @@ export function isCdrSliceConfigured(source: NodeJS.ProcessEnv = process.env): b
  * request can arrive. A 20-character signing secret must stop the process at boot, not surface as
  * a download URL somebody can forge.
  */
+/**
+ * Fills `CDR_EXPORT_ROOT` from `CDR_RECORDING_ROOT` when the deployment set only the latter.
+ *
+ * The same overlay-before-parse shape `pbx-env.ts` uses for its media roots, and for the same
+ * reason: an orchestrator that wants a variable off sets it to `""`, so an empty string counts as
+ * "not set" rather than as a root of length zero.
+ */
+function withRecordingRootFallback(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const own = source.CDR_EXPORT_ROOT;
+	if (typeof own === "string" && own.trim().length > 0) {
+		return source;
+	}
+	const recordings = source.CDR_RECORDING_ROOT;
+	if (typeof recordings !== "string" || recordings.trim().length === 0) {
+		return source;
+	}
+	return { ...source, CDR_EXPORT_ROOT: `${recordings.trim().replace(/\/+$/u, "")}/exports` };
+}
+
 export function loadCdrEnv(source: NodeJS.ProcessEnv = process.env): CdrEnv {
-	const parsed = cdrEnvSchema.safeParse(source);
+	const parsed = cdrEnvSchema.safeParse(withRecordingRootFallback(source));
 	if (!parsed.success) {
 		const detail = parsed.error.issues
 			.map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)

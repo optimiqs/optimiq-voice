@@ -1,6 +1,5 @@
 import {
 	and,
-	count,
 	desc,
 	eq,
 	faxMessage,
@@ -90,16 +89,22 @@ export async function listFaxServers(
 	}
 	const where = filters.length === 0 ? undefined : and(...filters);
 
+	// `count(*) over ()` on the same query rather than a second `select count(*)`, per the area's
+	// pagination contract (`shared/pagination.ts`): the inbox is the highest-churn table here — the
+	// webhook consumer inserts into it continuously — so two separate statements can and do disagree
+	// about the snapshot they describe. It is also one round trip instead of two sequential ones.
 	const rows = await transaction
-		.select(SERVER_COLUMNS)
+		.select({ ...SERVER_COLUMNS, total: sql<string>`count(*) over ()` })
 		.from(faxServer)
 		.where(where)
 		.orderBy(desc(faxServer.createdAt), desc(faxServer.id))
 		.limit(pagination.limit)
 		.offset(pagination.offset);
 
-	const totals = await transaction.select({ value: count() }).from(faxServer).where(where);
-	return { rows, total: Number(totals[0]?.value ?? 0) };
+	return {
+		rows: rows.map(({ total: _total, ...row }) => row),
+		total: Number(rows[0]?.total ?? 0),
+	};
 }
 
 export async function getFaxServer(
@@ -234,16 +239,22 @@ export async function listFaxMessages(
 	}
 	const where = filters.length === 0 ? undefined : and(...filters);
 
+	// `count(*) over ()` on the same query rather than a second `select count(*)`, per the area's
+	// pagination contract (`shared/pagination.ts`): the inbox is the highest-churn table here — the
+	// webhook consumer inserts into it continuously — so two separate statements can and do disagree
+	// about the snapshot they describe. It is also one round trip instead of two sequential ones.
 	const rows = await transaction
-		.select(MESSAGE_COLUMNS)
+		.select({ ...MESSAGE_COLUMNS, total: sql<string>`count(*) over ()` })
 		.from(faxMessage)
 		.where(where)
 		.orderBy(desc(faxMessage.createdAt), desc(faxMessage.id))
 		.limit(pagination.limit)
 		.offset(pagination.offset);
 
-	const totals = await transaction.select({ value: count() }).from(faxMessage).where(where);
-	return { rows, total: Number(totals[0]?.value ?? 0) };
+	return {
+		rows: rows.map(({ total: _total, ...row }) => row),
+		total: Number(rows[0]?.total ?? 0),
+	};
 }
 
 export async function getFaxMessage(
@@ -488,11 +499,23 @@ export async function markSent(
 		.where(eq(faxMessage.id, id));
 }
 
-/** Releases a claim so the lease offers the row again — the retry path for a transient send failure. */
-export async function releaseSend(transaction: PbxDatabaseTransaction, id: string): Promise<void> {
+/**
+ * Holds a failed attempt off until its backoff has elapsed — the retry path for a transient failure.
+ *
+ * It does NOT put the row back to `queued`: `claimNextSend` treats any `queued` row as immediately
+ * claimable, so that spelling made `fax_server.retry_backoff_seconds` a column nothing read and let a
+ * fax burn its whole retry budget inside one poll interval. Instead the row stays `sending` and its
+ * lease is pushed forward — `claimedAt` is set to `retryAt - FAX_SEND_LEASE_MS`, so the existing
+ * lease clause (`claimed_at <= now() - lease`) becomes true at exactly `retryAt` and not before.
+ */
+export async function releaseSend(
+	transaction: PbxDatabaseTransaction,
+	id: string,
+	claimedAt: Date,
+): Promise<void> {
 	await transaction
 		.update(faxMessage)
-		.set({ status: "queued", claimedAt: null, updatedAt: new Date() })
+		.set({ status: "sending", claimedAt, updatedAt: new Date() })
 		.where(eq(faxMessage.id, id));
 }
 
@@ -556,7 +579,14 @@ export async function findServerByDidE164Admin(
 	return { id: row.id, organizationId: row.organization_id, emailToAddress: row.email_to_address };
 }
 
-/** The organization owning an outbound fax row, by its id — the webhook's `client_state` correlation. */
+/**
+ * The organization owning an outbound fax row, by its id — the webhook's `client_state` correlation.
+ *
+ * Constrained to `outbound` like the `telnyx_fax_id` fallback below: the caller feeds the result
+ * straight into `applyOutboundStatus`, so a `client_state` naming a RECEIVED message would flip a
+ * successfully received fax to `failed` and stamp an error on the ledger entry for a document that
+ * is sitting in the object store.
+ */
 export async function findMessageOrgById(
 	executor: { execute(query: SQL): Promise<unknown> },
 	id: string,
@@ -565,6 +595,7 @@ export async function findMessageOrgById(
 		select ${faxMessage.id} as id, ${faxMessage.organizationId} as organization_id
 		from ${faxMessage}
 		where ${faxMessage.id} = ${id}
+		  and ${faxMessage.direction} = 'outbound'
 		limit 1
 	`;
 	const row = rowsOf<{ readonly id: string; readonly organization_id: string }>(

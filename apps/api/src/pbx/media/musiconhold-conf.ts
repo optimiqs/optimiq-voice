@@ -85,7 +85,12 @@ export interface MusicOnHoldSkip {
 	readonly id: string;
 	readonly organizationId: string;
 	readonly name: string;
-	readonly reason: "disabled" | "no-files" | "stream-without-uri" | "name-conflict";
+	readonly reason:
+		| "disabled"
+		| "no-files"
+		| "stream-without-uri"
+		| "unsafe-stream-uri"
+		| "name-conflict";
 }
 
 export interface MusicOnHoldRender {
@@ -108,6 +113,16 @@ export interface MusicOnHoldRender {
  * reported as a conflict for exactly that reason.
  */
 const RESERVED_NAMES = new Set(["default"]);
+
+/**
+ * What a stream URI has to look like before it may be interpolated into `application=`.
+ *
+ * An ALLOWLIST rather than a list of forbidden characters: the value it renders is a command line
+ * on the media server, not a string in a document, and a deny list is one omission away from an
+ * escape. The same rule `mohStreamUri` enforces on write, restated here because this renderer also
+ * reads rows that predate that constraint or were written around the API.
+ */
+const SAFE_STREAM_URI = /^https?:\/\/[A-Za-z0-9._~:/?@!$&()*+,=%-]+$/u;
 
 export function renderMusicOnHoldConf(
 	classes: readonly MohClassRow[],
@@ -161,6 +176,15 @@ export function renderMusicOnHoldConf(
 				// written around the API. Reported rather than emitted: `application=` with no URI is a
 				// section Asterisk accepts and a class that hangs the channel.
 				skipped.push({ ...pick(row), reason: "stream-without-uri" });
+				continue;
+			}
+			if (!SAFE_STREAM_URI.test(uri)) {
+				// The renderer must not depend on the DTO having run: it also reads rows written before
+				// `mohStreamUri` existed or written around the API. The URI becomes an argument to
+				// `application=`, which `res_musiconhold` executes, so a row that could break out of
+				// the line is dropped rather than escaped — there is no safe rendering of a value that
+				// was never meant to be a command.
+				skipped.push({ ...pick(row), reason: "unsafe-stream-uri" });
 				continue;
 			}
 			sections.push(streamSection(row, uri));
@@ -229,11 +253,13 @@ function streamSection(row: MohClassRow, uri: string): string {
 		`[${row.name}]`,
 		`; stream class, organization ${row.organizationId}, class ${row.id}`,
 		"mode=custom",
-		// `-quiet -` is what makes mpg123 write raw audio to stdout, which is the only shape
-		// `mode=custom` can consume. The rate is the class's, because a stream decoded at the wrong
-		// rate plays at the wrong speed rather than failing.
-		`application=/usr/bin/mpg123 -q -s --rate ${row.sampleRateHz} --mono -`,
-		`; source ${uri}`,
+		// `-s` is what makes mpg123 write raw audio to stdout, which is the only shape `mode=custom`
+		// can consume. The URI is the ARGUMENT, not a comment: a trailing `-` reads stdin, which
+		// nothing writes to, so the class used to decode an empty stream and serve silence. The rate
+		// is the class's, because a stream decoded at the wrong rate plays at the wrong speed rather
+		// than failing. `uri` is safe to interpolate only because the caller checked it against
+		// `SAFE_STREAM_URI` first.
+		`application=/usr/bin/mpg123 -q -s --rate ${row.sampleRateHz} --mono ${uri}`,
 		"",
 	].join("\n");
 }

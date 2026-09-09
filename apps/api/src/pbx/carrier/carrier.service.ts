@@ -584,7 +584,7 @@ export class CarrierService {
 								: { webhookEventUrl: this.env.TELNYX_WEBHOOK_URL }),
 						});
 
-			const updated = await this.trunks.update(session, trunkId, {
+			const localWrite = {
 				kind: "register",
 				sipDomain: telnyxSipDomain(region),
 				sipProxy: telnyxSipProxy(region),
@@ -596,7 +596,35 @@ export class CarrierService {
 				carrierProvider: "telnyx",
 				carrierRef: connection.id,
 				carrierProfileRef: profile.id,
-			});
+			} as const;
+
+			// "Carrier first, database second, and compensate if the second half fails" — the class
+			// header's rule, which this path used to state and not keep. The password above was rotated
+			// on the LIVE connection; if the local write does not land, the carrier holds a credential
+			// nobody has and the trunk stops registering. There is no undo at the carrier (the old
+			// password is unrecoverable), so the compensation is one retry and then a log an operator
+			// can act on — the same shape as `compensateRelease`, minus the ability to reverse it.
+			let updated: Awaited<ReturnType<typeof this.trunks.update>>;
+			try {
+				updated = await this.trunks.update(session, trunkId, localWrite);
+			} catch (cause) {
+				try {
+					updated = await this.trunks.update(session, trunkId, localWrite);
+				} catch {
+					logger.error(
+						{
+							organizationId,
+							trunkId,
+							connectionId: connection.id,
+							userName: connection.user_name,
+							cause,
+						},
+						"trunk credential rotated at the carrier but not recorded locally — the trunk will " +
+							"not register until it is re-provisioned",
+					);
+					throw cause;
+				}
+			}
 
 			logger.info(
 				{

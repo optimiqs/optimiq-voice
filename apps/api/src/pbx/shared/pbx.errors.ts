@@ -7,9 +7,12 @@ import {
 	ServiceUnavailableException,
 } from "@nestjs/common";
 import * as Schema from "effect/Schema";
+import { getLogger } from "@optimiq-voice/logging";
 import { getTableConfig } from "@optimiq-voice/pbx-db";
 import type { PgTable } from "@optimiq-voice/pbx-db";
 import type { Diagnostic } from "@optimiq-voice/routing";
+
+const logger = getLogger("api.pbx");
 
 /**
  * The PBX area's failure taxonomy.
@@ -244,10 +247,16 @@ export class PbxDatabaseFailure extends Schema.TaggedErrorClass<PbxDatabaseFailu
 	{ operation: Schema.String, detail: Schema.String },
 ) {
 	toHttpException(): HttpException {
+		// `detail` is the raw Postgres message and stays OUT of the body. This is the fallback arm —
+		// it fires for the SQLSTATEs nobody anticipated — and those messages routinely carry table,
+		// column and constraint names, the failing literal, and for a connection failure the host and
+		// port. Every other failure in this file is careful about disclosure (`PLATFORM_WIDE_CONSTRAINTS`
+		// exists so a cross-tenant unique violation says nothing about the other tenant); the default
+		// must not be the one that undoes it. `toPbxFailure` logs the detail with the operation.
 		return new ServiceUnavailableException({
 			statusCode: HttpStatus.SERVICE_UNAVAILABLE,
 			code: "PBX_DATABASE_UNAVAILABLE",
-			message: `The telephony database refused "${this.operation}": ${this.detail}`,
+			message: `The telephony database refused "${this.operation}".`,
 		});
 	}
 }
@@ -385,10 +394,13 @@ export function toPbxFailure(
 			detail: `The values are not a valid ${kind}: they break ${constraint}.`,
 		});
 	}
-	return new PbxDatabaseFailure({
-		operation: `${kind}.${operation}`,
-		detail: error?.message ?? String(cause),
-	});
+	const detail = error?.message ?? String(cause);
+	// Logged here because the 503 body deliberately does not carry it — see `toHttpException`.
+	logger.error(
+		{ operation: `${kind}.${operation}`, detail },
+		"the telephony database refused a statement",
+	);
+	return new PbxDatabaseFailure({ operation: `${kind}.${operation}`, detail });
 }
 
 /**

@@ -19,7 +19,15 @@ export const updateTranslationRulesetDto = patchOf(z.strictObject(translationRul
  * same transaction as this write. Duplicating the checks at the edge would mean two answers to
  * "is this rule usable" that can disagree, and the compiler's is the one that decides whether the
  * artifact is written. What the edge does is refuse the shapes the compiler would have to guess
- * about: an absent pattern, and a string long enough to be a denial of service on the regex engine.
+ * about: an absent pattern, and a string too long to be a rewrite anybody wrote on purpose.
+ *
+ * The length cap bounds SIZE and nothing else. It is NOT a denial-of-service protection, and saying
+ * that it was discouraged the next reader from adding the real one: catastrophic backtracking needs
+ * six characters (`(a+)+$`), and the only check applied today is that `new RegExp(source)` compiles.
+ * A `routes.write` holder can therefore save a pattern that compiles clean and burns CPU in the
+ * engine on every outbound call it matches. The check belongs where the compile is —
+ * `packages/routing/src/translations.ts`'s `validateTranslationRule`, as an `unsafe-pattern` issue
+ * beside the existing `invalid-regex` — and is recorded here rather than half-built at the edge.
  *
  * There is deliberately no `matchKind`. A rule REWRITES, and the only match kind that can express a
  * rewrite is a regex with capture groups — a prefix-shaped rule is a regex with a `^`, which is one

@@ -151,10 +151,11 @@ const sipAclEntryShape = {
 	 * wrong trunk could only be un-bound by deleting the row and typing the network again — and
 	 * retyping a CIDR to fix a dropdown is how the wrong network gets allowed.
 	 *
-	 * A bare `z.uuid()` with no proof the trunk is this tenant's, matching `mohClassId`, `pinSetId`
-	 * and every other scalar reference in these DTOs. The column's foreign key is what makes the id
-	 * real; RLS is what keeps the ROW this tenant's. See the schema comment for what the binding is
-	 * for and why deleting the trunk takes the entry with it.
+	 * A bare `z.uuid()` here, because a DTO has no tenant: the column's foreign key makes the id
+	 * real and RLS keeps the ROW this tenant's, but neither stops a body naming ANOTHER tenant's
+	 * trunk — an FK check runs as the system. `SipAclEntriesService` proves the trunk inside the
+	 * writer's own scope and answers 404 when it is not there. See the schema comment for what the
+	 * binding is for and why deleting the trunk takes the entry with it.
 	 */
 	trunkId: z.uuid().nullish(),
 	description: z.string().trim().max(512).nullish(),

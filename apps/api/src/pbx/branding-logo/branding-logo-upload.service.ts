@@ -3,6 +3,7 @@ import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { createEntityId } from "@optimiq-voice/identifiers";
 import { getLogger } from "@optimiq-voice/logging";
 import { BrandingService } from "../../auth/branding/branding.service";
+import { OrgLimitsService } from "../org-limits/org-limits.service";
 import { PBX_MEDIA_STORE } from "../shared/pbx.tokens";
 import { BRANDING_LOGO_MAX_UPLOAD_BYTES, readUploadedImage } from "./branding-image";
 import type { EffectiveBranding } from "../../auth/branding/branding.resolver";
@@ -15,8 +16,8 @@ const logger = getLogger("api.pbx");
 /**
  * The prefix every logo object lives under, so "what is a logo" is answerable by the key alone.
  *
- * The serving route's header (`branding-logo.controller.ts`) names this as the namespace a future
- * version can refuse a key OUTSIDE of; storing under it here is the other half of that contract. A
+ * The serving route refuses any key outside this prefix (`branding-logo.controller.ts`); storing
+ * under it here is the other half of that contract. A
  * key is `branding/<organizationId>/<uuid>.<ext>` — every segment but the extension a UUID this
  * server minted, so `ObjectStore.put`'s containment check has nothing to escape with.
  */
@@ -47,6 +48,7 @@ export class BrandingLogoUploadService {
 	constructor(
 		@Inject(PBX_MEDIA_STORE) private readonly store: ObjectStore,
 		@Inject(BrandingService) private readonly branding: BrandingService,
+		@Inject(OrgLimitsService) private readonly limits: OrgLimitsService,
 	) {}
 
 	async upload(
@@ -55,6 +57,9 @@ export class BrandingLogoUploadService {
 	): Promise<{ readonly data: EffectiveBranding }> {
 		const organizationId = requireActiveOrganizationId(session);
 		const image = await readUploadedImage(request, BRANDING_LOGO_MAX_UPLOAD_BYTES);
+		// The tenant's storage quota, which nothing consulted before this call site existed. Checked
+		// after the bytes are read (the size is not knowable before) and before they are stored.
+		await this.limits.assertMayStore(session, image.bytes.byteLength);
 
 		const objectKey = `${BRANDING_LOGO_KEY_PREFIX}/${organizationId}/${createEntityId()}.${image.format.extension}`;
 		await this.store.put(objectKey, image.bytes, { contentType: image.format.contentType });

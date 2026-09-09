@@ -40,7 +40,10 @@ import type { SipAclAction, SipAclScope } from "@optimiq-voice/pbx-db";
  *
  * A scope with at least one `allow` row is an ALLOWLIST, and an allowlist that does not deny
  * everything else is not one. So a leading `deny = 0.0.0.0/0.0.0.0` (and its IPv6 twin) is emitted
- * for any scope that has an allow row.
+ * for such a scope — but ONLY while a single organization has contributed rules to it. The file is
+ * global and the deny is global with it, so one tenant's first allow row would otherwise deny every
+ * other tenant's handsets. With rules from more than one tenant the section degrades to blocklist
+ * rendering and the asymmetry is reported in {@link AclRender.warnings}.
  *
  * A scope with only `deny` rows is a BLOCKLIST — "everyone except these" — and gets no leading
  * deny, because adding one would turn "block this abusive /24" into "block the internet", which is
@@ -56,8 +59,9 @@ import type { SipAclAction, SipAclScope } from "@optimiq-voice/pbx-db";
  * `acl.conf` is global: a named ACL is a name and a list of prefixes, with no tenant column
  * anywhere. So the rows of every tenant are UNIONED into one named ACL per scope.
  *
- * The consequence is real and is not papered over: **one tenant's allowlist does not exclude
- * another tenant's addresses**, and a deny written by one tenant applies to every tenant on the
+ * The consequence is real and is not papered over: **one tenant's allowlist cannot exclude
+ * another tenant's addresses** — the implicit deny is withheld once a second tenant has rules — and
+ * a deny written by one tenant applies to every tenant on the
  * box. That asymmetry is reported in {@link AclRender.warnings} rather than resolved, because
  * resolving it means one named ACL per tenant, which means one endpoint per tenant — the dynamic
  * endpoint generation this platform does not have on the Asterisk plane, and which `apps/sipd` is
@@ -195,7 +199,26 @@ function renderSection(
 
 	const hasAllow = scoped.some((row) => row.action === "allow");
 	const hasDeny = scoped.some((row) => row.action === "deny");
-	const mode = hasAllow ? "allowlist" : hasDeny ? "blocklist" : "open";
+	const organizations = new Set(scoped.map((row) => row.organizationId));
+
+	// The leading `deny = 0.0.0.0/0` is the whole file's one platform-wide switch, so it may only be
+	// thrown when the whole platform agrees. One tenant's single `allow` row used to flip the section
+	// to allowlist and deny every OTHER tenant's handsets — a platform-wide REGISTER outage produced
+	// by one holder of `security.write`. A section is therefore an allowlist only when exactly one
+	// organization contributed rules to it; with more than one it degrades to blocklist rendering,
+	// where the allow rows stay as exceptions to a deny (last match wins) and everything unmentioned
+	// is still permitted. Per-tenant admission is `apps/sipd`'s job — acl.conf has no tenant column.
+	const allowlistIsSafe = hasAllow && organizations.size <= 1;
+	const mode = allowlistIsSafe ? "allowlist" : hasAllow || hasDeny ? "blocklist" : "open";
+
+	if (hasAllow && !allowlistIsSafe) {
+		warnings.push(
+			`[${name}] has allow entries from ${organizations.size} organizations. acl.conf is global ` +
+				"and has no tenant column, so the implicit deny is NOT emitted — one tenant's allowlist " +
+				"would deny every other tenant's addresses. The allow entries are rendered as exceptions " +
+				"only; enforce per-tenant admission through apps/sipd.",
+		);
+	}
 
 	const lines: string[] = [`[${name}]`];
 
@@ -215,8 +238,10 @@ function renderSection(
 		);
 	} else {
 		lines.push(
-			"; Deny entries only, so this scope is a BLOCKLIST: everything not listed is permitted.",
-			"; No leading deny — adding one would turn 'block this /24' into 'block the internet'.",
+			"; This scope is a BLOCKLIST: everything not listed is permitted, and a permit line here is",
+			"; an exception to a deny above it rather than a grant.",
+			"; No leading deny — adding one would turn 'block this /24' into 'block the internet', and",
+			"; with rules from more than one tenant it would black out every tenant that wrote none.",
 		);
 	}
 
@@ -240,8 +265,7 @@ function renderSection(
 		);
 	}
 
-	const organizations = new Set(scoped.map((row) => row.organizationId));
-	if (mode === "blocklist" && organizations.size > 1) {
+	if (hasDeny && organizations.size > 1) {
 		warnings.push(
 			`[${name}] carries deny entries from ${organizations.size} organizations. acl.conf is ` +
 				"global — a deny written by one tenant applies to every tenant on this media server.",

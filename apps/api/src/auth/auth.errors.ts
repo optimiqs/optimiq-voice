@@ -20,6 +20,16 @@ export class NoActiveOrganizationException extends ForbiddenException {
 	}
 }
 
+/**
+ * The organization was suspended by its reseller. 403 rather than 402: the caller is authenticated
+ * and the credential is valid — it is the tenant that may not act.
+ */
+export class OrganizationSuspendedException extends ForbiddenException {
+	constructor() {
+		super("This organization is suspended. Contact your provider to restore access.");
+	}
+}
+
 export class MissingPermissionException extends ForbiddenException {
 	constructor(missing: readonly Permission[]) {
 		super(`Missing required permission(s): ${missing.join(", ")}.`);

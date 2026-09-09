@@ -75,6 +75,8 @@ export class ProjectionOutboxSweeper implements OnModuleInit, OnApplicationShutd
 	private timer: NodeJS.Timeout | undefined;
 	private running = false;
 	private stopped = false;
+	/** The pass `onApplicationShutdown` has to wait out. */
+	private inFlight: Promise<ProjectionSweepResult> | undefined;
 	private swept = 0;
 	private discharged = 0;
 	private failed = 0;
@@ -144,12 +146,25 @@ export class ProjectionOutboxSweeper implements OnModuleInit, OnApplicationShutd
 		);
 	}
 
-	onApplicationShutdown(): void {
+	/**
+	 * Async, and it awaits the pass that is already running.
+	 *
+	 * `stopped` is only re-read at the top of each group, so a sweep caught mid-group still has a
+	 * publish and two writes to issue. Returning here without waiting for them lets `PbxModule`'s own
+	 * shutdown close the pool underneath, which turns a clean stop into a rejected `dischargeRows`,
+	 * a rejected `recordAttempt` behind it, and a group left pending with no attempt recorded. Nest
+	 * awaits an async hook, and module teardown runs this before the pool closes.
+	 */
+	async onApplicationShutdown(): Promise<void> {
 		this.stopped = true;
 		if (this.timer !== undefined) {
 			clearInterval(this.timer);
 			this.timer = undefined;
 		}
+		// `sweep` already swallows its own failures; the catch is for the window where `inFlight` is
+		// the raw `runOnce` promise.
+		await this.inFlight?.catch(() => undefined);
+		this.inFlight = undefined;
 	}
 
 	/**
@@ -166,7 +181,8 @@ export class ProjectionOutboxSweeper implements OnModuleInit, OnApplicationShutd
 		}
 		this.running = true;
 		try {
-			return await this.runOnce();
+			this.inFlight = this.runOnce();
+			return await this.inFlight;
 		} catch (error) {
 			// A sweep that throws must not kill the interval. The next tick tries again.
 			this.failed += 1;
@@ -174,6 +190,7 @@ export class ProjectionOutboxSweeper implements OnModuleInit, OnApplicationShutd
 			return { attempted: 0, discharged: 0, failed: 1, deferred: 0, stuck: 0, pruned: 0 };
 		} finally {
 			this.running = false;
+			this.inFlight = undefined;
 		}
 	}
 

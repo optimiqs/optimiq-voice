@@ -204,6 +204,24 @@ describe("the trunk status consumer", () => {
 		expect(database.updates).to.have.length(0);
 	});
 
+	it("terminates an envelope whose orgId disagrees with the subject it was routed on", async () => {
+		// The subject is the address. `orgId` was the last field in the path still read from the
+		// BODY, so an envelope that self-consistently claims another tenant — same subject on the
+		// envelope and on delivery, only `orgId` skewed — used to scope the write to the payload's
+		// organization and mark that tenant's trunk down.
+		const database = fakeDatabase({ row: { id: TRUNK, statusChangedAt: null } });
+		const consumer = new TrunkStatusConsumer(env(), database.client);
+		const subject = trunkSubject(ORG);
+		const skewed = message(subject, envelope(subject, { orgId: OTHER_ORG }));
+
+		const outcome = await consumer.dispatch(skewed);
+
+		expect(outcome).to.equal("terminated");
+		expect(skewed.termed()).to.equal(1);
+		expect(database.scopes).to.have.length(0);
+		expect(database.updates).to.have.length(0);
+	});
+
 	it("terminates a transition for a trunk that does not exist, rather than retrying forever", async () => {
 		const database = fakeDatabase({ row: undefined });
 		const consumer = new TrunkStatusConsumer(env(), database.client);

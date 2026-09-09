@@ -1,5 +1,6 @@
 import { Logger } from "@nestjs/common";
 import { fromNodeHeaders } from "better-auth/node";
+import { assertSsoProviderOrganization } from "@optimiq-voice/auth";
 import { type RawAuthSession, setSessionOnRequest, toAppSession } from "./app-session";
 import type { AuthPlatform } from "./auth.platform";
 import type { AppSession } from "@optimiq-voice/auth";
@@ -142,6 +143,82 @@ async function writeResponse(reply: AuthHttpReply, response: Response): Promise<
 	reply.send(payload.length > 0 ? payload : null);
 }
 
+/**
+ * The provider slug a `genericOAuth` callback names, or `undefined` for any other auth route.
+ *
+ * better-auth mounts the endpoint at `/oauth2/callback/:providerId` under the auth base URL, so
+ * the slug is the last segment and nothing else on this mount has that shape.
+ */
+function ssoCallbackProviderId(pathname: string): string | undefined {
+	const prefix = `${AUTH_ROUTE_PREFIX}/oauth2/callback/`;
+	if (!pathname.startsWith(prefix)) {
+		return undefined;
+	}
+	const slug = pathname.slice(prefix.length);
+	return slug.length > 0 && !slug.includes("/") ? slug : undefined;
+}
+
+/**
+ * The `cookie` header that the session better-auth just issued would be sent back on, or
+ * `undefined` when the response set none — a failed callback, or a redirect that carries only
+ * state.
+ */
+function cookieHeaderFrom(response: Response): string | undefined {
+	const pairs = response.headers
+		.getSetCookie()
+		.map((cookie) => cookie.split(";", 1)[0]?.trim())
+		.filter((pair): pair is string => pair !== undefined && pair.includes("="));
+	return pairs.length > 0 ? pairs.join("; ") : undefined;
+}
+
+/**
+ * Refuses a callback whose session landed in a different tenant than the one that registered the
+ * IdP.
+ *
+ * `genericOAuth` links an identity by email and `activeOrganizationId` is then resolved from the
+ * matched USER's membership — so without this, tenant A's provider can mint a session in tenant B
+ * by asserting a B address. Account linking being off and the per-provider email domain are the
+ * other two layers; this is the one that survives either of them being relaxed.
+ *
+ * Checked on the way OUT rather than in a session hook because this is the only place that has
+ * both the provider slug (in the URL) and the session (in the `Set-Cookie` better-auth just
+ * wrote). A rejection drops those cookies on the floor: the browser never gets the session, so
+ * there is nothing to revoke.
+ */
+async function ssoCallbackTenantRejection(
+	platform: AuthPlatform,
+	providerId: string,
+	response: Response,
+): Promise<string | undefined> {
+	const cookie = cookieHeaderFrom(response);
+	if (cookie === undefined) {
+		return undefined;
+	}
+	let organizationId: string | null | undefined;
+	try {
+		const resolved = (await platform.auth.api.getSession({
+			headers: new Headers({ cookie }),
+		})) as RawAuthSession | null;
+		if (!resolved) {
+			return undefined;
+		}
+		organizationId = toAppSession(resolved).session.activeOrganizationId;
+	} catch {
+		// The cookies were not a session (a state cookie on an error redirect, say). Nothing to assert.
+		return undefined;
+	}
+	try {
+		assertSsoProviderOrganization({
+			providers: platform.ssoProviders,
+			providerId,
+			organizationId,
+		});
+		return undefined;
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	}
+}
+
 /** Mounts `/api/auth/*` on the Fastify instance. */
 export function registerAuthRoutes(server: AuthHttpServer, platform: AuthPlatform): void {
 	const logger = new Logger("AuthHttp");
@@ -161,6 +238,21 @@ export function registerAuthRoutes(server: AuthHttpServer, platform: AuthPlatfor
 					init.body = body;
 				}
 				const response = await platform.auth.handler(new Request(url, init));
+
+				const providerId = ssoCallbackProviderId(url.pathname);
+				if (providerId !== undefined) {
+					const rejection = await ssoCallbackTenantRejection(platform, providerId, response);
+					if (rejection !== undefined) {
+						logger.error(`refusing an SSO callback for ${providerId}: ${rejection}`);
+						reply.status(403).send({
+							statusCode: 403,
+							code: "SSO_TENANT_MISMATCH",
+							message: "This identity provider does not belong to the organization it signed into.",
+						});
+						return;
+					}
+				}
+
 				await writeResponse(reply, response);
 			} catch (error) {
 				logger.error(`better-auth handler failed for ${request.method} ${request.url}`, error);
@@ -255,6 +347,22 @@ export function createApiKeySessionResolver(
 		if (!result.valid || !result.key) {
 			logger.warn(`rejected ${API_KEY_HEADER} for ${request.method} ${pathOf(request.url)}`);
 			return null;
+		}
+
+		/**
+		 * The key's own expiry, enforced here rather than trusted.
+		 *
+		 * `expiresAt` is written onto the synthesised session below but read by nothing downstream —
+		 * `RequirePermissionsGuard` and `AuthService.resolveAccess` consult only the organization and
+		 * the role. That made freshness entirely `@better-auth/api-key`'s problem, on a path this file
+		 * already declines to trust for its session promotion.
+		 */
+		if (result.key.expiresAt !== null && result.key.expiresAt !== undefined) {
+			const expiresAt = new Date(result.key.expiresAt);
+			if (expiresAt.getTime() <= Date.now()) {
+				logger.warn(`rejected an expired ${API_KEY_HEADER} for ${pathOf(request.url)}`);
+				return null;
+			}
 		}
 
 		const organizationId = result.key.referenceId;

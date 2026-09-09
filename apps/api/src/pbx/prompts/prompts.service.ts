@@ -19,6 +19,7 @@ import {
 	MediaSigningUnavailableException,
 	MediaUploadRejectedException,
 } from "../media/media.errors";
+import { OrgLimitsService } from "../org-limits/org-limits.service";
 import { actorFromSession } from "../shared/audit-log";
 import { parseDto } from "../shared/dto";
 import { normalizePagination, paged } from "../shared/pagination";
@@ -97,6 +98,7 @@ export class PromptsService {
 		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
 		@Inject(PBX_EFFECT_RUNTIME) private readonly runtime: PbxRepositoryRuntime,
 		@Inject(PBX_MEDIA_STORE) private readonly store: ObjectStore,
+		@Inject(OrgLimitsService) private readonly limits: OrgLimitsService,
 	) {}
 
 	// -------------------------------------------------------------------------------------------
@@ -202,6 +204,9 @@ export class PromptsService {
 		// AFTER the bytes have been buffered, so the cap is what bounds the cost of a bad request,
 		// not the class check. The cap is enforced during the read, so that bound holds.
 		const audio = await readUploadedAudio(request, this.env.PBX_MEDIA_MAX_UPLOAD_BYTES);
+		// The tenant's storage quota. After the read, because the size is not knowable before it, and
+		// before the object is written — `maxStorageMb` is only as real as its call sites.
+		await this.limits.assertMayStore(session, audio.sizeBytes);
 		const fields = parseDto(uploadPromptFieldsDto, audio.fields);
 		const mohClassId = options.mohClassId ?? fields.mohClassId;
 

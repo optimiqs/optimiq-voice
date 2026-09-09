@@ -7,7 +7,7 @@ import {
 import { RPC_SUBJECTS } from "@optimiq-voice/events/subjects";
 import { getLogger } from "@optimiq-voice/logging";
 import { PublicRoute } from "../../auth/public-route.decorator";
-import { FileGreetingService } from "./file-greeting.service";
+import { FileGreetingService, refuseFileGreeting } from "./file-greeting.service";
 import type { FileGreetingResponse, VoicemailGreetingKind } from "@optimiq-voice/events/schemas";
 
 const logger = getLogger("api.pbx");
@@ -55,7 +55,7 @@ export class FileGreetingRpcController {
 				.map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
 				.join("; ");
 			logger.warn({ reason }, "rejected a malformed rpc.pbx.v1.file-greeting request");
-			return refuse(kindOf(payload), reason);
+			return refuseFileGreeting(kindOf(payload), reason);
 		}
 
 		try {
@@ -82,7 +82,7 @@ export class FileGreetingRpcController {
 				},
 				"rpc.pbx.v1.file-greeting failed",
 			);
-			return refuse(
+			return refuseFileGreeting(
 				parsed.data.kind,
 				`the greeting could not be filed: ${error instanceof Error ? error.message : String(error)}`,
 			);
@@ -105,9 +105,4 @@ function kindOf(payload: unknown): VoicemailGreetingKind {
 			: undefined;
 	const parsed = voicemailGreetingKindSchema.safeParse(claimed);
 	return parsed.success ? parsed.data : "unavailable";
-}
-
-/** Every refusal carries `applied: false` AND `active: false`: nothing was filed. */
-function refuse(kind: VoicemailGreetingKind, reason: string): FileGreetingResponse {
-	return { applied: false, kind, active: false, reason: reason.slice(0, 256) };
 }

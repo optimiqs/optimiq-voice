@@ -38,6 +38,8 @@ export interface RateLimitVerdict {
 	readonly remaining: number;
 	/** Seconds until the window resets — what a `Retry-After` header carries. */
 	readonly retryAfterSeconds: number;
+	/** True on the one request that crossed the limit, false on every refusal after it. */
+	readonly firstRefusal: boolean;
 }
 
 const WINDOW_MS = 60_000;
@@ -75,6 +77,7 @@ export class ProvisioningRateLimiter {
 			allowed: window.count <= this.limitPerMinute,
 			remaining: Math.max(0, this.limitPerMinute - window.count),
 			retryAfterSeconds,
+			firstRefusal: window.count === this.limitPerMinute + 1,
 		};
 	}
 

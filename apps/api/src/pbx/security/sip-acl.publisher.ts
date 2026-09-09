@@ -16,6 +16,18 @@ import type { PbxDatabaseClient, PbxDatabaseTransaction } from "@optimiq-voice/p
 const logger = getLogger("api.pbx");
 
 /**
+ * Reads many keys with a bounded number of requests in flight.
+ *
+ * The reconcile has to look at every key in the bucket, and doing that with `await` inside the loop
+ * made it n SEQUENTIAL broker round trips rather than a scan — minutes of wall clock at a hundred
+ * thousand keys, in a fire-and-forget continuation holding a connection. The real fix is the
+ * per-organization reverse key the class header proposes, which removes the whole-key-space walk;
+ * this bounds the cost of the walk that is still here without letting an unbounded fan-out loose on
+ * the connection.
+ */
+const READ_CONCURRENCY = 64;
+
+/**
  * The `sip-acl` KV half of the NATS backbone: **is this source address allowed to send us a
  * packet at all?**
  *
@@ -192,7 +204,7 @@ export class SipAclPublisher implements OnModuleInit, OnApplicationShutdown {
 	/** Re-projects one organization's ACL entries and reconciles the bucket against them. */
 	async syncOrganization(organizationId: string): Promise<SipAclSyncResult> {
 		if (this.bucket === undefined) {
-			return { published: 0, deleted: 0, unchanged: 0, conflicts: [], skipped: true };
+			return { published: 0, deleted: 0, unchanged: 0, conflicts: [], failed: 0, skipped: true };
 		}
 		const rows = await this.database.withTenantScope(
 			organizationId,
@@ -218,7 +230,7 @@ export class SipAclPublisher implements OnModuleInit, OnApplicationShutdown {
 	async reconcile(organizationId: string, rows: readonly SipAclRow[]): Promise<SipAclSyncResult> {
 		const bucket = this.bucket;
 		if (bucket === undefined) {
-			return { published: 0, deleted: 0, unchanged: 0, conflicts: [], skipped: true };
+			return { published: 0, deleted: 0, unchanged: 0, conflicts: [], failed: 0, skipped: true };
 		}
 
 		const conflicts: SipAclConflict[] = [];
@@ -278,13 +290,28 @@ export class SipAclPublisher implements OnModuleInit, OnApplicationShutdown {
 			wanted.set(key, projectSipAclEntry(organizationId, first));
 		}
 
+		let failed = 0;
 		let published = 0;
 		let deleted = 0;
 		let unchanged = 0;
 		const mine = new Map<string, SipAclEntry>();
 
+		const allKeys: string[] = [];
 		for await (const key of await bucket.keys()) {
-			const entry = await readEntry(bucket, key);
+			allKeys.push(key);
+		}
+		const scanned: { key: string; entry: SipAclEntry | undefined }[] = [];
+		for (let start = 0; start < allKeys.length; start += READ_CONCURRENCY) {
+			const batch = allKeys.slice(start, start + READ_CONCURRENCY);
+			const entries = await Promise.all(batch.map(async (key) => await readEntry(bucket, key)));
+			for (const [index, entry] of entries.entries()) {
+				const key = batch[index];
+				if (key !== undefined) {
+					scanned.push({ key, entry });
+				}
+			}
+		}
+		for (const { key, entry } of scanned) {
 			if (entry === undefined) {
 				continue;
 			}
@@ -329,6 +356,7 @@ export class SipAclPublisher implements OnModuleInit, OnApplicationShutdown {
 				// Logged and swallowed: the API must not report "your change was not saved" about a change
 				// that was. The obligation stays in `pbx_projection_outbox` and the sweeper republishes.
 				this.failed += 1;
+				failed += 1;
 				logger.error({ key, organizationId, error }, "failed to write a sip-acl entry");
 			}
 		}
@@ -343,11 +371,12 @@ export class SipAclPublisher implements OnModuleInit, OnApplicationShutdown {
 				deleted += 1;
 			} catch (error) {
 				this.failed += 1;
+				failed += 1;
 				logger.error({ key, organizationId, error }, "failed to delete a sip-acl entry");
 			}
 		}
 
-		return { published, deleted, unchanged, conflicts, skipped: false };
+		return { published, deleted, unchanged, conflicts, failed, skipped: false };
 	}
 
 	/** One network's published rule. Used by verification and by the rebuild script's report. */
@@ -474,6 +503,11 @@ export interface SipAclSyncResult {
 	readonly deleted: number;
 	readonly unchanged: number;
 	readonly conflicts: readonly SipAclConflict[];
+	/**
+	 * KV writes and deletes that threw. Non-zero means the reconcile is incomplete, so the caller
+	 * must leave the outbox obligation owed and let the sweeper republish.
+	 */
+	readonly failed: number;
 	/** True when there is no broker and nothing was attempted. */
 	readonly skipped: boolean;
 }

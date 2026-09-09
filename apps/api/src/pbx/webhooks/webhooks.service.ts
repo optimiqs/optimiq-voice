@@ -1,6 +1,7 @@
-import { BadRequestException, Inject, Injectable } from "@nestjs/common";
+import { BadRequestException, Inject, Injectable, Optional } from "@nestjs/common";
 import { PbxResourceService } from "../shared/pbx-resource.service";
 import { PBX_EFFECT_RUNTIME, PBX_ENV } from "../shared/pbx.tokens";
+import { WebhookDispatcher } from "./webhook-dispatcher.service";
 import { generateWebhookSecret } from "./webhook-signature";
 import { WEBHOOK_SUBSCRIPTION_RESOURCE } from "./webhooks.resource";
 import type { PbxEnv } from "../shared/pbx-env";
@@ -37,12 +38,20 @@ import type { AppSession } from "@optimiq-voice/auth";
  * Done on ENABLE only, not on every update: an administrator editing the selector list of a
  * currently-failing subscription has not fixed anything, and silently resetting the counter would
  * hide the failure they are about to make worse.
+ *
+ * ## Every mutation invalidates the dispatcher's cache
+ *
+ * The dispatcher holds a tenant's subscriptions for `PBX_WEBHOOK_CACHE_TTL_MS`. Without this call a
+ * DELETED subscription keeps receiving the tenant's call metadata at a URL an administrator just
+ * removed, and a ROTATED secret leaves every delivery in the window signed with the retired key.
+ * The dispatcher is optional so a spec can construct this service without a broker.
  */
 @Injectable()
 export class WebhooksService extends PbxResourceService {
 	constructor(
 		@Inject(PBX_EFFECT_RUNTIME) runtime: PbxRepositoryRuntime,
 		@Inject(PBX_ENV) private readonly env: PbxEnv,
+		@Optional() private readonly dispatcher?: WebhookDispatcher,
 	) {
 		super(runtime, WEBHOOK_SUBSCRIPTION_RESOURCE);
 	}
@@ -90,6 +99,7 @@ export class WebhooksService extends PbxResourceService {
 		this.assertUrlAllowed(values);
 		const secret = typeof values.secret === "string" ? values.secret : generateWebhookSecret();
 		const created = await super.create(session, { ...values, secret });
+		this.dispatcher?.invalidate(this.organizationId(session));
 		// Re-attached AFTER the generic redaction has run, so the exception is visible here rather
 		// than being a hole in `redactRow`.
 		return { ...created, data: { ...created.data, secret } };
@@ -105,6 +115,17 @@ export class WebhooksService extends PbxResourceService {
 			values.enabled === true
 				? { consecutiveFailures: 0, lastFailureReason: null, autoDisabledAt: null }
 				: {};
-		return await super.update(session, id, { ...values, ...revived });
+		const updated = await super.update(session, id, { ...values, ...revived });
+		this.dispatcher?.invalidate(this.organizationId(session));
+		return updated;
+	}
+
+	override async remove(
+		session: AppSession,
+		id: string,
+	): Promise<MutationEnvelope<{ readonly id: string }>> {
+		const removed = await super.remove(session, id);
+		this.dispatcher?.invalidate(this.organizationId(session));
+		return removed;
 	}
 }

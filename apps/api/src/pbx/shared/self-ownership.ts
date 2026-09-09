@@ -2,7 +2,7 @@ import { ForbiddenException, HttpStatus } from "@nestjs/common";
 import { hasPermission } from "@optimiq-voice/auth";
 import { deviceLine, eq, extensionUser, inArray, voicemailBox } from "@optimiq-voice/pbx-db";
 import type { AppSession, Permission } from "@optimiq-voice/auth";
-import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
+import type { PbxDatabaseClient, PbxDatabaseTransaction } from "@optimiq-voice/pbx-db";
 
 /**
  * The `.own` enforcement seam — the row check a `.own`-scoped grant needs and a decorator cannot do.
@@ -30,19 +30,28 @@ import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
  * predicate appears — the same posture as the rest of the PBX area.
  */
 
+/** The `extension_user` read, inside a scope somebody else already opened. */
+async function extensionIdsIn(
+	transaction: PbxDatabaseTransaction,
+	userId: string,
+): Promise<readonly string[]> {
+	const rows = await transaction
+		.select({ extensionId: extensionUser.extensionId })
+		.from(extensionUser)
+		.where(eq(extensionUser.userId, userId));
+	return rows.map((row) => row.extensionId);
+}
+
 /** The extension ids the user is linked to, tenant-scoped. Empty when they hold none. */
 export async function ownedExtensionIds(
 	database: PbxDatabaseClient,
 	organizationId: string,
 	userId: string,
 ): Promise<readonly string[]> {
-	return await database.withTenantScope(organizationId, async (transaction) => {
-		const rows = await transaction
-			.select({ extensionId: extensionUser.extensionId })
-			.from(extensionUser)
-			.where(eq(extensionUser.userId, userId));
-		return rows.map((row) => row.extensionId);
-	});
+	return await database.withTenantScope(
+		organizationId,
+		async (transaction) => await extensionIdsIn(transaction, userId),
+	);
 }
 
 /** The voicemail-box ids whose extension the user owns. Empty when they own no extension. */
@@ -51,11 +60,14 @@ export async function ownedVoicemailBoxIds(
 	organizationId: string,
 	userId: string,
 ): Promise<readonly string[]> {
-	const extensionIds = await ownedExtensionIds(database, organizationId, userId);
-	if (extensionIds.length === 0) {
-		return [];
-	}
+	// One scope, not two: this runs on every list and every single-row read for a self-service user,
+	// and calling `ownedExtensionIds` here would take a second connection and a second `set local
+	// role` round trip to read a set the same transaction can read itself.
 	return await database.withTenantScope(organizationId, async (transaction) => {
+		const extensionIds = await extensionIdsIn(transaction, userId);
+		if (extensionIds.length === 0) {
+			return [];
+		}
 		const rows = await transaction
 			.select({ id: voicemailBox.id })
 			.from(voicemailBox)
@@ -70,11 +82,11 @@ export async function ownedDeviceIds(
 	organizationId: string,
 	userId: string,
 ): Promise<readonly string[]> {
-	const extensionIds = await ownedExtensionIds(database, organizationId, userId);
-	if (extensionIds.length === 0) {
-		return [];
-	}
 	return await database.withTenantScope(organizationId, async (transaction) => {
+		const extensionIds = await extensionIdsIn(transaction, userId);
+		if (extensionIds.length === 0) {
+			return [];
+		}
 		const rows = await transaction
 			.selectDistinct({ deviceId: deviceLine.deviceId })
 			.from(deviceLine)

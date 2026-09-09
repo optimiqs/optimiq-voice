@@ -252,16 +252,28 @@ export class TrunkStatusConsumer implements OnModuleInit, OnApplicationShutdown 
 			this.terminated += 1;
 			return "terminated";
 		}
-		// `trunk.evt.v1.<orgId>.<trunkId>.<event>` — the trunk is the address, not the payload.
-		const trunkId = message.subject.split(".")[4];
-		if (trunkId === undefined) {
+		// `trunk.evt.v1.<orgId>.<trunkId>.<event>` — the trunk AND the tenant are the address, not
+		// the payload. `orgId` is the last field in the path still taken from the body, so it is
+		// checked against the subject the broker routed on before it scopes a write; the producer's
+		// `validateEvent` makes the same comparison, and this is the consume-side half of it.
+		const [, , , subjectOrgId, trunkId] = message.subject.split(".");
+		if (trunkId === undefined || subjectOrgId === undefined) {
+			message.term();
+			this.terminated += 1;
+			return "terminated";
+		}
+		if (subjectOrgId !== envelope.orgId) {
+			logger.error(
+				{ subject: message.subject, envelopeOrgId: envelope.orgId },
+				"terminating a trunk status event whose orgId disagrees with its subject",
+			);
 			message.term();
 			this.terminated += 1;
 			return "terminated";
 		}
 
 		try {
-			const outcome = await this.write(envelope.orgId, trunkId, envelope);
+			const outcome = await this.write(subjectOrgId, trunkId, envelope);
 			if (outcome === "unknown-trunk") {
 				// A transition for a trunk that was deleted mid-outage, or never existed here.
 				// Redelivering it forever would block the consumer on a row that is never coming

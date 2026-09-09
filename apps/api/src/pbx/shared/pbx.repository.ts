@@ -325,6 +325,17 @@ async function selectById(
 }
 
 /**
+ * The ceiling on a child collection read.
+ *
+ * Children are not paginated — an IVR menu with more than a screenful of options is a design
+ * problem, not a paging problem — but "not paginated" is not "unbounded" (oikos §4). Collections
+ * whose size is genuinely tenant-controlled (`pin_set_entry`, `paging_group_member`,
+ * `shared_line_appearance`) would otherwise serialise an arbitrarily large table into one body.
+ * The value is well above any collection a UI can drive and above `reorderDto`'s own 500.
+ */
+const MAX_CHILDREN = 1000;
+
+/**
  * The `id` column object.
  *
  * Reached through the table's column map rather than declared on every descriptor: `id` is
@@ -805,7 +816,8 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 					.select()
 					.from(resource.table)
 					.where(eq(resource.parentColumn, parentId))
-					.orderBy(...resource.orderBy.map((column) => asc(column)))) as Record<string, unknown>[];
+					.orderBy(...resource.orderBy.map((column) => asc(column)))
+					.limit(MAX_CHILDREN)) as Record<string, unknown>[];
 			},
 		);
 	});
@@ -982,7 +994,8 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 				const existing = (await transaction
 					.select()
 					.from(resource.table)
-					.where(eq(resource.parentColumn, parentId))) as Record<string, unknown>[];
+					.where(eq(resource.parentColumn, parentId))
+					.limit(MAX_CHILDREN)) as Record<string, unknown>[];
 
 				assertPermutation(
 					resource.kind,
@@ -993,6 +1006,19 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 				// Ordinals are rewritten to 0…n-1 rather than preserving whatever the rows happened to
 				// hold: the point of the endpoint is that the stored order is exactly the sent order,
 				// and reusing the old values would leave gaps that the next insert has to guess around.
+				//
+				// In two passes, because every reorderable collection but IVR options carries a
+				// non-deferrable UNIQUE (parent, ordinal) index: writing the final ordinals directly
+				// would collide with a row that still holds the value (swapping the first two rows
+				// raises 23505 on the first statement). The parking pass moves every row to a negative
+				// ordinal — no collection constrains the column to be non-negative — so the second pass
+				// lands in a range nothing occupies.
+				for (const [index, id] of ids.entries()) {
+					await transaction
+						.update(resource.table)
+						.set({ [columnKey(ordinalColumn)]: -(index + 1) } as never)
+						.where(and(eq(rowId(resource), id), eq(resource.parentColumn, parentId)));
+				}
 				for (const [index, id] of ids.entries()) {
 					await transaction
 						.update(resource.table)
@@ -1004,7 +1030,8 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 					.select()
 					.from(resource.table)
 					.where(eq(resource.parentColumn, parentId))
-					.orderBy(...resource.orderBy.map((column) => asc(column)))) as Record<string, unknown>[];
+					.orderBy(...resource.orderBy.map((column) => asc(column)))
+					.limit(MAX_CHILDREN)) as Record<string, unknown>[];
 				// The collection, not a row: a reorder's `resource_ref` is the PARENT, and the change is
 				// the ordering itself — recording N per-row ordinal diffs would say the same thing N
 				// times and still not say what the new order is. Only `after` is stored, because the

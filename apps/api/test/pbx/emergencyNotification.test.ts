@@ -3,6 +3,7 @@ import { emergencyDialedMail, formatDispatchableLocation } from "../../src/mail/
 import {
 	EMERGENCY_DURABLE,
 	EMERGENCY_SUBJECT_FILTER,
+	EmergencyConsumer,
 } from "../../src/pbx/emergency-addresses/emergency-consumer.service";
 import {
 	EMERGENCY_EVENT_ID_HEADER,
@@ -329,5 +330,84 @@ describe("emergency consumer binding", () => {
 		// so the tail is four literal tokens and the two wildcards are the tenant and the call.
 		expect(EMERGENCY_SUBJECT_FILTER).to.equal("calls.evt.v1.*.*.call.emergency.dialed");
 		expect(EMERGENCY_SUBJECT_FILTER.split(".")).to.have.length(8);
+	});
+
+	/**
+	 * The tenancy cross-check. Comparing the envelope's subject to the delivery subject says nothing
+	 * about `orgId`, which is what everything downstream is scoped by — so an envelope naming org A
+	 * delivered on org B's subject used to pass, and `notify` would read A's notification settings
+	 * and mail B's 911 event to A's front desk while telling B nothing. For a Kari's Law path both
+	 * halves are compliance failures.
+	 */
+	describe("the tenancy cross-check", () => {
+		const ORG_A = "11111111-1111-4111-8111-111111111111";
+		const ORG_B = "22222222-2222-4222-8222-222222222222";
+		const CALL = "33333333-3333-4333-8333-333333333333";
+
+		function fakeMessage(subject: string, envelope: Record<string, unknown>) {
+			const outcome = { acked: 0, termed: 0 };
+			return {
+				outcome,
+				message: {
+					subject,
+					data: new TextEncoder().encode(JSON.stringify(envelope)),
+					ack: () => {
+						outcome.acked += 1;
+					},
+					term: () => {
+						outcome.termed += 1;
+					},
+				},
+			};
+		}
+
+		function envelopeFor(orgId: string, subject: string): Record<string, unknown> {
+			return {
+				id: "019fd3c2-4444-76be-a6b3-b0f1914e39b6",
+				type: "call.emergency.dialed",
+				at: new Date().toISOString().replace(/\.\d+Z$/u, ".000Z"),
+				orgId,
+				callId: CALL,
+				subject,
+				source: "engine",
+				version: 1,
+				data: {
+					legId: "55555555-5555-4555-8555-555555555555",
+					dialed: "911",
+					number: "+12125550100",
+				},
+			};
+		}
+
+		async function run(subject: string, orgId: string) {
+			const notified: string[] = [];
+			const notifications = {
+				notify: async (organizationId: string) => {
+					notified.push(organizationId);
+					await Promise.resolve();
+					return "sent";
+				},
+			} as unknown as EmergencyNotificationService;
+			const consumer = new EmergencyConsumer({} as never, notifications);
+			const { message, outcome } = fakeMessage(subject, envelopeFor(orgId, subject));
+			await (consumer as unknown as { handle(m: unknown): Promise<void> }).handle(message);
+			return { notified, outcome };
+		}
+
+		it("terminates an event whose orgId is not the tenant it was delivered for", async () => {
+			const subject = `calls.evt.v1.${ORG_B}.${CALL}.call.emergency.dialed`;
+			const { notified, outcome } = await run(subject, ORG_A);
+			expect(outcome.termed).to.equal(1);
+			expect(outcome.acked).to.equal(0);
+			expect(notified).to.deep.equal([]);
+		});
+
+		it("lets an event through when the subject's tenant and the envelope's agree", async () => {
+			const subject = `calls.evt.v1.${ORG_A}.${CALL}.call.emergency.dialed`;
+			const { notified, outcome } = await run(subject, ORG_A);
+			expect(outcome.termed).to.equal(0);
+			expect(outcome.acked).to.equal(1);
+			expect(notified).to.deep.equal([ORG_A]);
+		});
 	});
 });

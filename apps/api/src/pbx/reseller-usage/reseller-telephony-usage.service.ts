@@ -4,6 +4,7 @@ import { listChildOrganizations, readHierarchy } from "@optimiq-voice/db";
 import { count, extension, inArray, phoneNumber, trunk } from "@optimiq-voice/pbx-db";
 import { AUTH_PLATFORM } from "../../auth/auth.tokens";
 import { NotAResellerException } from "../../auth/reseller/reseller.errors";
+import { normalizePagination } from "../shared/pagination";
 import { PBX_DATABASE } from "../shared/pbx.tokens";
 import type { AuthPlatform } from "../../auth/auth.platform";
 import type { AppSession } from "@optimiq-voice/auth";
@@ -45,7 +46,17 @@ export class ResellerTelephonyUsageService {
 		return this.platform.database.adminDb;
 	}
 
-	async usage(session: AppSession): Promise<ResellerTelephonyUsageView> {
+	/**
+	 * Paged, like every other list in the area — `shared/pagination.ts`'s "never unbounded" rule.
+	 *
+	 * `childCount` and `totals` stay over the WHOLE child set, because a roll-up that summed only the
+	 * page would be a number that changes when you turn a page. It is `children` that is bounded, and
+	 * it is the part whose size grows with the reseller's book.
+	 */
+	async usage(
+		session: AppSession,
+		query: { readonly page?: number; readonly limit?: number } = {},
+	): Promise<ResellerTelephonyUsageView> {
 		const organizationId = requireActiveOrganizationId(session);
 		const hierarchy = await readHierarchy(this.baseDb, organizationId);
 		if (!hierarchy?.isReseller) {
@@ -61,7 +72,10 @@ export class ResellerTelephonyUsageService {
 			this.countByOrganization(phoneNumber, phoneNumber.organizationId, childIds),
 		]);
 
-		const perChild = children.map((child) => ({
+		const pagination = normalizePagination(query);
+		const page = children.slice(pagination.offset, pagination.offset + pagination.limit);
+
+		const perChild = page.map((child) => ({
 			organizationId: child.organizationId,
 			name: child.name,
 			slug: child.slug,
@@ -75,12 +89,15 @@ export class ResellerTelephonyUsageService {
 		return {
 			childCount: children.length,
 			totals: {
-				extensions: sumOf(perChild, "extensions"),
-				trunks: sumOf(perChild, "trunks"),
-				numbers: sumOf(perChild, "numbers"),
-				members: perChild.reduce((total, child) => total + child.memberCount, 0),
+				extensions: sumOf(extensions),
+				trunks: sumOf(trunks),
+				numbers: sumOf(numbers),
+				members: children.reduce((total, child) => total + child.memberCount, 0),
 			},
 			children: perChild,
+			page: pagination.page,
+			limit: pagination.limit,
+			totalPages: children.length === 0 ? 0 : Math.ceil(children.length / pagination.limit),
 		};
 	}
 
@@ -124,15 +141,13 @@ type OrganizationColumn =
 	| typeof trunk.organizationId
 	| typeof phoneNumber.organizationId;
 
-function sumOf(
-	children: readonly {
-		readonly extensions: number;
-		readonly trunks: number;
-		readonly numbers: number;
-	}[],
-	key: "extensions" | "trunks" | "numbers",
-): number {
-	return children.reduce((total, child) => total + child[key], 0);
+/** The platform-wide total behind one of the grouped counts, across every child. */
+function sumOf(counts: ReadonlyMap<string, number>): number {
+	let total = 0;
+	for (const value of counts.values()) {
+		total += value;
+	}
+	return total;
 }
 
 export interface ResellerChildTelephonyUsage {
@@ -155,4 +170,7 @@ export interface ResellerTelephonyUsageView {
 		readonly members: number;
 	};
 	readonly children: readonly ResellerChildTelephonyUsage[];
+	readonly page: number;
+	readonly limit: number;
+	readonly totalPages: number;
 }

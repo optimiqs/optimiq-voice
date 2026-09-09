@@ -73,6 +73,7 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 	private subscription: Subscription | undefined;
 	private trunkSubscription: Subscription | undefined;
 	private handled = 0;
+	private stopped = false;
 
 	constructor(
 		@Inject(PBX_ENV) private readonly env: PbxEnv,
@@ -119,14 +120,8 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 		// A queue group, so N API replicas share the load and exactly one answers each REGISTER.
 		// Without it every replica would answer, and the registrar would take whichever reply
 		// arrived first while the rest became garbage on the wire.
-		this.subscription = this.connection.subscribe(RPC_SUBJECTS.sipCredential, {
-			queue: "optimiq-api-sip-credentials",
-		});
-		void this.consume(this.subscription);
-		this.trunkSubscription = this.connection.subscribe(RPC_SUBJECTS.sipTrunkCredential, {
-			queue: "optimiq-api-trunk-credentials",
-		});
-		void this.consume(this.trunkSubscription);
+		void this.serve("credential");
+		void this.serve("trunk");
 
 		logger.info(
 			{
@@ -134,6 +129,66 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 			},
 			`serving ${RPC_SUBJECTS.sipCredential} over NATS`,
 		);
+	}
+
+	/**
+	 * Subscribes, consumes, and re-subscribes for the life of the process.
+	 *
+	 * The `for await` itself can reject — a permissions violation, a connection surfaced as an error
+	 * through the iterator — and that rejection is not the per-message one the body already catches.
+	 * Left as a bare `void`ed promise it is an unhandled rejection, which under Node's default takes
+	 * the whole control plane down; survived, it silently stops serving the subject, after which NO
+	 * phone on the platform can REGISTER and the only symptom is a 403 at the registrar. So the
+	 * iterator is wrapped, the handle cleared so `isReady` stops lying, and the subject re-served
+	 * after a bounded backoff — the same shape `WebhookDispatcher.run` uses.
+	 */
+	private async serve(kind: "credential" | "trunk"): Promise<void> {
+		const subject = kind === "trunk" ? RPC_SUBJECTS.sipTrunkCredential : RPC_SUBJECTS.sipCredential;
+		// A queue group, so N API replicas share the load and exactly one answers each REGISTER.
+		// Without it every replica would answer, and the registrar would take whichever reply
+		// arrived first while the rest became garbage on the wire.
+		const queue =
+			kind === "trunk" ? "optimiq-api-trunk-credentials" : "optimiq-api-sip-credentials";
+		let backoffMs = 1_000;
+		while (!this.stopped) {
+			const connection = this.connection;
+			if (connection === undefined || connection.isClosed()) {
+				return;
+			}
+			let subscription: Subscription;
+			try {
+				subscription = connection.subscribe(subject, { queue });
+			} catch (error) {
+				logger.error({ err: error, subject }, "could not subscribe; retrying");
+				await delay(backoffMs);
+				backoffMs = Math.min(backoffMs * 2, 30_000);
+				continue;
+			}
+			if (kind === "trunk") {
+				this.trunkSubscription = subscription;
+			} else {
+				this.subscription = subscription;
+			}
+			try {
+				await this.consume(subscription);
+				backoffMs = 1_000;
+			} catch (error) {
+				if (this.stopped) {
+					return;
+				}
+				logger.error({ err: error, subject }, "the subscription errored; re-subscribing");
+			}
+			if (kind === "trunk") {
+				this.trunkSubscription = undefined;
+			} else {
+				this.subscription = undefined;
+			}
+			if (this.stopped) {
+				return;
+			}
+			await delay(backoffMs);
+			backoffMs = Math.min(backoffMs * 2, 30_000);
+		}
 	}
 
 	private async consume(subscription: Subscription): Promise<void> {
@@ -219,13 +274,15 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 				},
 				`${RPC_SUBJECTS.sipCredential} failed`,
 			);
-			return refuse(
-				`credential lookup failed: ${error instanceof Error ? error.message : String(error)}`,
-			);
+			// The detail is logged above and goes no further. A database error can carry a connection
+			// string, constraint text or driver detail, and this reply lands on the backbone and in
+			// sipd's logs — the same refusal `answerTrunk` makes about carrier response bodies.
+			return refuse("credential lookup failed");
 		}
 	}
 
 	async onApplicationShutdown(): Promise<void> {
+		this.stopped = true;
 		await this.trunkSubscription?.drain().catch(() => undefined);
 		this.trunkSubscription = undefined;
 		const subscription = this.subscription;
@@ -255,4 +312,11 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
  */
 function refuse(reason: string): SipCredentialResponse {
 	return { found: false, enabled: false, reason: reason.slice(0, 256) };
+}
+
+/** An unref'd sleep, so a pending re-subscribe backoff never holds the process open. */
+function delay(ms: number): Promise<void> {
+	return new Promise<void>((resolve) => {
+		setTimeout(resolve, ms).unref?.();
+	});
 }

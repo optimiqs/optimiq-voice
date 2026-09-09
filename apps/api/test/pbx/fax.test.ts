@@ -109,6 +109,7 @@ describe("fax media token", () => {
 interface SendScript {
 	readonly claim?: Record<string, unknown>;
 	readonly retryAttempts?: number;
+	readonly retryBackoffSeconds?: number;
 }
 
 function sendFakeDatabase(script: SendScript = {}): {
@@ -131,7 +132,12 @@ function sendFakeDatabase(script: SendScript = {}): {
 		where: () => transaction,
 		leftJoin: () => transaction,
 		innerJoin: () => transaction,
-		limit: () => [{ retryAttempts: script.retryAttempts ?? 3 }],
+		limit: () => [
+			{
+				retryAttempts: script.retryAttempts ?? 3,
+				retryBackoffSeconds: script.retryBackoffSeconds ?? 60,
+			},
+		],
 		update: () => transaction,
 		set: (values: Record<string, unknown>) => {
 			updates.push(values);
@@ -210,16 +216,33 @@ describe("fax send worker", () => {
 		expect(updates.some((u) => u.status === "failed")).to.equal(true);
 	});
 
-	it("releases the claim for a retry when the carrier call fails and attempts remain", async () => {
+	it("holds a failed attempt off for the server's backoff instead of the next poll", async () => {
 		const carrier = fakeCarrier(() => {
 			throw new Error("carrier down");
 		});
-		const { database, updates } = sendFakeDatabase({ claim: claimable(1), retryAttempts: 3 });
+		const { database, updates } = sendFakeDatabase({
+			claim: claimable(1),
+			retryAttempts: 3,
+			retryBackoffSeconds: 60,
+		});
 		const worker = new FaxSendWorker(env(), database, carrier);
+		const before = Date.now();
 		await worker.tick();
-		// Back to queued, not failed — the lease will offer it again.
-		expect(updates.some((u) => u.status === "queued")).to.equal(true);
+
+		// NOT back to `queued`: `claimNextSend` treats any queued row as immediately claimable, which
+		// is how `retry_backoff_seconds` came to be a column nothing read and how a one-minute carrier
+		// blip spent all three attempts in fifteen seconds. The row stays `sending` with its lease
+		// pushed forward, so the existing lease clause re-offers it exactly one backoff from now.
+		expect(updates.some((u) => u.status === "queued")).to.equal(false);
 		expect(updates.some((u) => u.status === "failed")).to.equal(false);
+		const released = updates.find((u) => u.status === "sending");
+		expect(released, "the claim was re-dated").to.not.equal(undefined);
+		const claimedAt = (released?.claimedAt as Date).getTime();
+		// `claimed_at = retryAt - lease`, so the lease clause (`claimed_at <= now - lease`) turns true
+		// at `retryAt` and not before.
+		const retryAt = claimedAt + env().FAX_SEND_LEASE_MS;
+		expect(retryAt - before).to.be.greaterThanOrEqual(60_000);
+		expect(retryAt - before).to.be.lessThan(65_000);
 	});
 
 	it("refuses re-entrancy so a slow pass is not raced by the next tick", async () => {
@@ -238,6 +261,8 @@ interface InboundScript {
 	readonly server?: Record<string, unknown>;
 	readonly messageOrg?: Record<string, unknown>;
 	readonly insertReturns?: Record<string, unknown>[];
+	/** The row `telnyx_fax_id` correlates to, when the `client_state` lookup is not the one that hits. */
+	readonly outboundOrg?: Record<string, unknown>;
 }
 
 function inboundFakeDatabase(script: InboundScript = {}): {
@@ -254,6 +279,19 @@ function inboundFakeDatabase(script: InboundScript = {}): {
 			return script.server === undefined ? [] : [script.server];
 		}
 		if (text.includes("organization_id")) {
+			// Postgres's own behaviour, modelled: a non-UUID bound against a `uuid` column raises
+			// `22P02` rather than returning no rows, and a rejected promise never reaches the `??`.
+			const bound = boundValues(query);
+			// The carrier fax id is a `text` column and takes anything; the `client_state` lookup binds
+			// against `fax_message.id`, a `uuid`. The fixtures spell carrier ids `telnyx-…`, which is
+			// what tells the two apart here without parsing the statement.
+			const carrierId = bound.find((value) => value.startsWith("telnyx-"));
+			if (carrierId !== undefined) {
+				return script.outboundOrg === undefined ? [] : [script.outboundOrg];
+			}
+			if (bound.some((value) => !UUID_SHAPE.test(value))) {
+				throw new Error(`invalid input syntax for type uuid: "${bound[0] ?? ""}"`);
+			}
 			return script.messageOrg === undefined ? [] : [script.messageOrg];
 		}
 		return [];
@@ -396,6 +434,46 @@ describe("fax inbound consumer", () => {
 		expect(updated.some((u) => u.status === "delivered")).to.equal(true);
 	});
 
+	it("falls back to the carrier fax id when client_state is not a UUID", async () => {
+		// Telnyx documents `client_state` as base64 and echoes it back encoded, so this is the shape
+		// every outbound fax can arrive with — and the id lookup would raise `22P02`, unwind past the
+		// fallback into the handler's catch, and leave the row in `sending` with no terminal status
+		// forever, because a 200'd webhook is never redelivered.
+		const { database, updated } = inboundFakeDatabase({
+			outboundOrg: { id: FAX, organization_id: ORG },
+		});
+		const service = new FaxInboundService(database, fakeStore(), fakeFetch, fakeEmail());
+		const outcome = await service.handle(
+			faxWebhook("fax.delivered", {
+				fax_id: "telnyx-out-3",
+				direction: "outbound",
+				status: "delivered",
+				client_state: "not-a-uuid",
+				page_count: 1,
+			}),
+		);
+		expect(outcome).to.equal("updated");
+		expect(updated.some((u) => u.status === "delivered")).to.equal(true);
+	});
+
+	it("decodes a base64 client_state back to the row id", async () => {
+		const { database, updated } = inboundFakeDatabase({
+			messageOrg: { id: FAX, organization_id: ORG },
+		});
+		const service = new FaxInboundService(database, fakeStore(), fakeFetch, fakeEmail());
+		const outcome = await service.handle(
+			faxWebhook("fax.delivered", {
+				fax_id: "telnyx-out-4",
+				direction: "outbound",
+				status: "delivered",
+				client_state: Buffer.from(FAX, "utf8").toString("base64"),
+				page_count: 1,
+			}),
+		);
+		expect(outcome).to.equal("updated");
+		expect(updated.some((u) => u.status === "delivered")).to.equal(true);
+	});
+
 	it("records an outbound failure with the carrier's reason", async () => {
 		const { database, updated } = inboundFakeDatabase({
 			messageOrg: { id: FAX, organization_id: ORG },
@@ -513,6 +591,19 @@ describe("fax-to-email branding cascade", () => {
 });
 
 /** The SQL text of a drizzle `sql` statement, from its literal chunks — same reader the CDR tests use. */
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+
+/** The string parameters bound into a Drizzle `sql` template. */
+function boundValues(query: unknown): readonly string[] {
+	const chunks = (query as { queryChunks?: readonly unknown[] }).queryChunks;
+	if (!Array.isArray(chunks)) {
+		return [];
+	}
+	// Drizzle puts bound parameters into `queryChunks` as raw values; the literal text arrives as
+	// `StringChunk` objects, so a plain string chunk is a parameter.
+	return chunks.filter((chunk): chunk is string => typeof chunk === "string");
+}
+
 function renderSql(query: unknown): string {
 	const chunks = (query as { queryChunks?: readonly unknown[] }).queryChunks;
 	if (!Array.isArray(chunks)) {

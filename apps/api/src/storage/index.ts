@@ -7,6 +7,7 @@
  * interface AND the Asterisk constraint that shapes every implementation behind it.
  */
 
+export { objectContentType } from "./object-content-type";
 export { resolveObjectPath } from "./object-path";
 export {
 	isArchivingObjectStore,

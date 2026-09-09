@@ -148,7 +148,14 @@ export class FaxInboundService {
 
 		// Correlate on our own token first (`client_state` is the fax_message id), then fall back to
 		// the carrier fax id. Both lookups are untenanted — a webhook has no session organization.
-		const clientState = fax.client_state ?? undefined;
+		//
+		// The shape check is not decoration: `client_state` is echoed back by the carrier and is
+		// documented as base64, and the id lookup puts the value straight into `where id = $1` on a
+		// `uuid` column. A non-UUID makes Postgres raise `22P02`, and a REJECTED left operand never
+		// reaches the `??` — so the fallback this comment promises would never run, the handler would
+		// answer 200, and the row would sit in `sending` forever with no terminal status. Anything
+		// that is not a UUID falls through to the carrier fax id instead.
+		const clientState = correlationId(fax.client_state ?? undefined);
 		const found =
 			(clientState === undefined
 				? undefined
@@ -197,3 +204,24 @@ function mapOutboundStatus(
 			return undefined;
 	}
 }
+
+/**
+ * The `fax_message` id inside a `client_state`, if there is one.
+ *
+ * The value we SET is the row id, but what comes back is whatever the carrier echoes, and Telnyx
+ * documents `client_state` as base64 — so the raw value is tried first and a base64 decode second.
+ * Anything that is not a UUID after that is `undefined`, which sends the caller to the carrier-fax-id
+ * fallback rather than into a `22P02` on a `uuid` column.
+ */
+function correlationId(clientState: string | undefined): string | undefined {
+	if (clientState === undefined) {
+		return undefined;
+	}
+	if (UUID_PATTERN.test(clientState)) {
+		return clientState;
+	}
+	const decoded = Buffer.from(clientState, "base64").toString("utf8").trim();
+	return UUID_PATTERN.test(decoded) ? decoded : undefined;
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;

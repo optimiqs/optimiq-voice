@@ -31,6 +31,14 @@ import {
 
 const logger = getLogger("api.bootstrap");
 
+/**
+ * The application once the container exists, so the boot-failure handler below can close it.
+ *
+ * Undefined for every failure before `NestFactory.create` — those hold nothing and already exit
+ * cleanly.
+ */
+let started: NestFastifyApplication | undefined;
+
 async function bootstrap() {
 	/**
 	 * There is no tenant-RLS preflight for the base database any more, and its absence is the
@@ -216,7 +224,7 @@ async function bootstrap() {
 	 * Fastify has nowhere to report a request that died before a controller saw it. Turning it on
 	 * means pino now serializes objects that requests hand it, which is why `httpLoggerOptions`
 	 * exists — it carries the `redact` path set that keeps `authorization`, `cookie`, `x-api-key`
-	 * and the SIP/PIN/token field names out of every line, and it reads the same `LOGS_LEVEL` the
+	 * and the SIP/PIN/token field names out of every line, and it reads the same `LOG_LEVEL` the
 	 * winston logger reads so one variable still governs logging in this process.
 	 */
 	const app = await NestFactory.create<NestFastifyApplication>(
@@ -224,6 +232,7 @@ async function bootstrap() {
 		new FastifyAdapter({ logger: httpLoggerOptions() }),
 		{ rawBody: true },
 	);
+	started = app;
 	app.enableShutdownHooks();
 
 	// Raw Fastify wiring has to exist before `listen`, which is when Nest installs its own router
@@ -242,7 +251,21 @@ async function bootstrap() {
 	logger.info(`HTTP API is running on port ${HTTP_BRIDGE_PORT}`);
 }
 
-bootstrap().catch((error) => {
+bootstrap().catch(async (error) => {
 	logger.error({ err: error }, "failed to start API");
-	process.exitCode = 1;
+	/**
+	 * `process.exitCode` alone is not enough here, and the difference matters to an orchestrator.
+	 *
+	 * It takes effect only when the event loop drains, and by the time `bootstrap()` can throw the
+	 * container may hold a Postgres pool, NATS connections and a bound socket — every one of which
+	 * keeps the loop alive forever. An `EADDRINUSE` would then log one line and sit there looking
+	 * healthy while serving nothing. So the container is closed if it exists, and the process exits
+	 * either way.
+	 */
+	try {
+		await started?.close();
+	} catch (closeError) {
+		logger.error({ err: closeError }, "failed to close the application after a boot failure");
+	}
+	process.exit(1);
 });

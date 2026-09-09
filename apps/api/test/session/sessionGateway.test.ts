@@ -278,6 +278,32 @@ describe("claiming an application", () => {
 		await h.close();
 	});
 
+	/**
+	 * The cap counts what the connection HOLDS, not what the frame mentions.
+	 *
+	 * A reconnecting integration re-sends its whole claim set. Counting the re-claims against the
+	 * cap as well as the applications already in the map double-counted every one of them, and the
+	 * client was told `too-many-applications` for names it was entitled to and already had.
+	 */
+	it("lets a client re-claim its whole set and add to it, up to the real cap", async () => {
+		const h = await harness();
+		const c = await client(h.port);
+		await c.waitFor("welcome");
+
+		c.send({ op: "claim", applications: ["a", "b", "c", "d", "e"] });
+		expect((await c.waitFor("claimed")).applications).to.have.length(5);
+
+		// `waitFor` returns the FIRST frame with that op, so the first `claimed` is dropped.
+		c.frames.length = 0;
+		c.send({ op: "claim", applications: ["a", "b", "c", "d", "e", "f", "g", "h"] });
+		const again = await c.waitFor("claimed");
+		expect(again.applications).to.have.length(8);
+		expect(again.denied).to.deep.equal([]);
+
+		c.socket.close();
+		await h.close();
+	});
+
 	it("releases a claim without touching the calls already in flight", async () => {
 		const h = await harness();
 		const c = await client(h.port);

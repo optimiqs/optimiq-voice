@@ -31,23 +31,31 @@ import type { AppSession } from "@optimiq-voice/auth";
  *
  * ## The permissions, and the compromise they represent
  *
- * | Route                       | Permission       |
- * | --------------------------- | ---------------- |
- * | `GET /prompts`, `GET /:id`  | `settings.read`  |
- * | `POST`, `PATCH`, `DELETE`   | `settings.write` |
- * | `POST /:id/play-url`        | `settings.read`  |
+ * | Route                       | Permission              |
+ * | --------------------------- | ----------------------- |
+ * | `GET /prompts`, `GET /:id`  | `recordings.read`       |
+ * | `POST`, `PATCH`             | `recordings.configure`  |
+ * | `DELETE`                    | `recordings.delete`     |
+ * | `POST /:id/play-url`        | `recordings.read`       |
  *
  * There is no `media.*` pair in `@optimiq-voice/auth`, and the registry is at its documented
  * ceiling — the same constraint `devices.controller.ts` and `voicemail-boxes.controller.ts` each
- * record when they reuse an adjacent permission rather than mint one. The library is
- * organization-wide configuration that every call feature draws on, so `settings.*` is the closest
- * existing pair and the one that does not accidentally hand a narrower role something broader.
+ * record when they reuse an adjacent permission rather than mint one. So this reuses
+ * `recordings.*`, which is what the sibling `phrases.controller.ts` already guards the same table
+ * with.
  *
- * The compromise is real and worth naming: an operator who may build an IVR (`ivr.write`) cannot
- * upload the greeting it plays unless they also hold `settings.read`/`settings.write`. That is
- * coarser than it should be. The fix is a `media.read` / `media.write` pair in the registry, and it
- * is recorded as a follow-up rather than papered over by guarding uploads with `ivr.write`, which
- * would let anyone who can edit one menu replace audio every other feature plays.
+ * It used to be `settings.*`, and that was a hole rather than a compromise: `settings.read` is in
+ * `SELF_SERVICE_PERMISSIONS`, so the `user` and `agent` roles held it. `PROMPT_KINDS` includes
+ * `phrase` and `moh` and `promptListQuerySchema.kind` accepts the whole enum, so any signed-in user
+ * of a tenant could enumerate every IVR prompt, greeting and hold-music file in the organization —
+ * including the phrase rows `phrases.controller.ts` gates behind `recordings.read` — and mint an
+ * unauthenticated playback URL for each. `recordings.*` is manager-level and closes that.
+ *
+ * The compromise that remains is real and worth naming: an operator who may build an IVR
+ * (`ivr.write`) cannot upload the greeting it plays unless they also hold `recordings.configure`.
+ * The fix is a `media.read` / `media.write` pair in the registry, and it is recorded as a follow-up
+ * rather than papered over by guarding uploads with `ivr.write`, which would let anyone who can
+ * edit one menu replace audio every other feature plays.
  *
  * ## `POST /:id/play-url` is a read guarded by a read permission, and a POST anyway
  *
@@ -87,13 +95,13 @@ export class PromptsController {
 	}
 
 	@Get()
-	@RequirePermissions("settings.read")
+	@RequirePermissions("recordings.read")
 	async list(@Session() session: AppSession, @Query() query: unknown) {
 		return await this.prompts.list(session, parseDto(promptListQuerySchema, query ?? {}));
 	}
 
 	@Get(":id")
-	@RequirePermissions("settings.read")
+	@RequirePermissions("recordings.read")
 	async get(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
 		return await this.prompts.get(session, id);
 	}
@@ -111,13 +119,13 @@ export class PromptsController {
 	 */
 	@Post()
 	@HttpCode(HttpStatus.CREATED)
-	@RequirePermissions("settings.write")
+	@RequirePermissions("recordings.configure")
 	async upload(@Session() session: AppSession, @Req() request: MultipartRequest) {
 		return await this.prompts.upload(session, request, { kind: "prompt" });
 	}
 
 	@Patch(":id")
-	@RequirePermissions("settings.write")
+	@RequirePermissions("recordings.configure")
 	async update(
 		@Session() session: AppSession,
 		@Param("id", ParseUUIDPipe) id: string,
@@ -127,13 +135,13 @@ export class PromptsController {
 	}
 
 	@Delete(":id")
-	@RequirePermissions("settings.write")
+	@RequirePermissions("recordings.delete")
 	async remove(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
 		return await this.prompts.remove(session, id);
 	}
 
 	@Post(":id/play-url")
-	@RequirePermissions("settings.read")
+	@RequirePermissions("recordings.read")
 	async playUrl(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
 		return await this.prompts.mintPlaybackLink(session, id);
 	}

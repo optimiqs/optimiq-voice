@@ -277,6 +277,11 @@ export class OrgSettingsService extends PbxResourceService {
 		const organizationId = this.organizationId(session);
 		const userId = session.user.id;
 		this.requireCatalogued(category);
+		// `settings.write.own` is the decorator's floor; a category with its own override still has to
+		// clear that override, exactly as `patchCategory`, `create`, `update` and `remove` do. Latent
+		// today (no user-scoped setting sits in an overridden category) and the one write that skipped
+		// it, which is how it would stop being latent without anybody noticing.
+		this.requireCategoryPermission(session, category, "write");
 
 		const parsed = parseCategoryPatch(category, patch, { scope: "user" });
 		if (parsed.outcome === "invalid") {

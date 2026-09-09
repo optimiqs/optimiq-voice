@@ -109,11 +109,35 @@ export const createQueueAgentDto = z.strictObject(queueAgentShape).superRefine((
 
 export const updateQueueAgentDto = patchOf(z.strictObject(queueAgentShape)).superRefine(
 	(value, context) => {
-		// Only checked when the PATCH restates the contact kind: that is the only case where the body
-		// says enough to check. A PATCH that touches neither leaves whatever the row already had.
+		// A PATCH that touches none of the three leaves whatever the row already had, so there is
+		// nothing to check. When the kind is restated the body says enough on its own.
 		const patch = value as ReachableInput;
 		if (patch.contactKind !== undefined) {
 			assertReachable(patch, context);
+			return;
+		}
+		// The kind is unstated but the patch CLEARS the field the row is reached through, and states
+		// nothing to reach it by instead. `PATCH { "extensionId": null }` used to pass here and save,
+		// after which the projection drops the agent as `no-extension` and the only symptom is a
+		// supervisor noticing one person stopped getting calls. Restating `contactKind` is the way to
+		// say "this seat is external now", and it is the case above.
+		if (patch.extensionId === null && !patch.contact) {
+			context.addIssue({
+				code: "custom",
+				path: ["extensionId"],
+				message:
+					"Clearing the extension leaves the agent unreachable. Set contactKind to external " +
+					"and give the number to dial.",
+			});
+		}
+		if (patch.contact === null && !patch.extensionId) {
+			context.addIssue({
+				code: "custom",
+				path: ["contact"],
+				message:
+					"Clearing the dial string leaves the agent unreachable. Set contactKind to extension " +
+					"and give the extension the call is offered to.",
+			});
 		}
 	},
 );

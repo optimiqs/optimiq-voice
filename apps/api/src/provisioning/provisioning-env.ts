@@ -152,14 +152,14 @@ export const provisioningEnvSchema = z
 			context.addIssue({
 				code: "custom",
 				path: ["PROVISION_TURN_URLS"],
-				message: "TURN URLs and the shared secret must be configured together",
+				message: "PROVISION_TURN_URLS and PROVISION_TURN_SECRET must be configured together",
 			});
 		}
 		if (env.PROVISION_WEBRTC_ENABLED && env.PROVISION_SIP_WSS_URL === undefined) {
 			context.addIssue({
 				code: "custom",
 				path: ["PROVISION_SIP_WSS_URL"],
-				message: "an explicit WSS URL is required when WebRTC is enabled",
+				message: "PROVISION_SIP_WSS_URL is required when PROVISION_WEBRTC_ENABLED is set",
 			});
 		}
 	});
@@ -189,6 +189,19 @@ export function missingRenderConfiguration(env: ProvisioningEnv): readonly strin
 	return missing;
 }
 
-export function isRenderConfigured(env: ProvisioningEnv): boolean {
+/**
+ * A `ProvisioningEnv` that has the two values the render path cannot work without.
+ *
+ * The pair is optional on the schema on purpose — a deployment that provisions nothing must still
+ * boot — so this is the type that says "checked". It exists so `buildContext` can read them without
+ * a cast: an `as string` there would be the compiler taking the author's word for exactly the fact
+ * `isRenderConfigured` is in a position to prove.
+ */
+export type ConfiguredProvisioningEnv = ProvisioningEnv & {
+	readonly PROVISION_SIP_SERVER: string;
+	readonly PROVISION_SIP_SECRET_KEY: string;
+};
+
+export function isRenderConfigured(env: ProvisioningEnv): env is ConfiguredProvisioningEnv {
 	return missingRenderConfiguration(env).length === 0;
 }

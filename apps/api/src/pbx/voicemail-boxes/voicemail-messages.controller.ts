@@ -38,12 +38,22 @@ import type { AppSession } from "@optimiq-voice/auth";
  *
  * ## The permissions, and why they are the ones they are
  *
- * | Route                        | Permission          | Reasoning                                  |
- * | ---------------------------- | ------------------- | ------------------------------------------ |
- * | `GET …/messages`             | `voicemail.read`    | Seeing what is in a mailbox                 |
- * | `PATCH …/messages/:id`       | `voicemail.write`   | Changing a mailbox's state                  |
- * | `DELETE …/messages/:id`      | `voicemail.delete`  | The registry already separates it from write |
- * | `POST …/messages/:id/play-url` | `voicemail.listen` | Seeing that a message exists and LISTENING to it are different decisions |
+ * | Route                          | Permission             | Reasoning                            |
+ * | ------------------------------ | ---------------------- | ------------------------------------ |
+ * | `GET …/messages`               | `voicemail.read.own`   | Seeing what is in a mailbox          |
+ * | `PATCH …/messages/:id`         | `voicemail.write.own`  | Changing a mailbox's state           |
+ * | `DELETE …/messages/:id`        | `voicemail.delete.own` | The registry already separates it from write |
+ * | `POST …/messages/:id/play-url` | `voicemail.listen.own` | Seeing that a message exists and LISTENING to it are different decisions |
+ *
+ * The `.own` variants are the FLOOR, not a narrowing: `hasPermission` lets the unscoped grant
+ * satisfy a scoped requirement, so a manager holding `voicemail.read` still passes, while a
+ * self-service `user` reaches only the boxes linked to their own extension —
+ * `VoicemailMessagesService.assertMayReachBox` is the row half of it.
+ *
+ * `PATCH` was the hole that made the rest of it decorative: it is the only route that moves a
+ * message OUT of the `new` folder, and while it required the unscoped `voicemail.write` a `user`
+ * could list their messages and delete them but got a 403 on "mark as read" — so, the MWI lamp
+ * being the NEW count, their desk phone stayed lit until they deleted the message.
  *
  * `voicemail.listen` rather than `voicemail.read` for playback is the one worth stating: the
  * registry separates them for the same reason the CDR area separates `recordings.read` from
@@ -102,7 +112,7 @@ export class VoicemailMessagesController {
 	}
 
 	@Patch(":id/messages/:messageId")
-	@RequirePermissions("voicemail.write")
+	@RequirePermissions("voicemail.write.own")
 	async update(
 		@Session() session: AppSession,
 		@Param("id", ParseUUIDPipe) id: string,

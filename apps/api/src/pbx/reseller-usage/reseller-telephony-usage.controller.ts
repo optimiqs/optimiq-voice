@@ -1,6 +1,8 @@
-import { Controller, Get, Inject } from "@nestjs/common";
+import { Controller, Get, Inject, Query } from "@nestjs/common";
 import { RequirePermissions } from "../../auth/require-permissions.decorator";
 import { Session } from "../../auth/session.decorator";
+import { parseDto } from "../shared/dto";
+import { listQuerySchema } from "../shared/pagination";
 import {
 	ResellerTelephonyUsageService,
 	type ResellerTelephonyUsageView,
@@ -27,7 +29,8 @@ export class ResellerTelephonyUsageController {
 	@RequirePermissions("reseller.read")
 	async telephonyUsage(
 		@Session() session: AppSession,
+		@Query() query: unknown,
 	): Promise<{ data: ResellerTelephonyUsageView }> {
-		return { data: await this.usage.usage(session) };
+		return { data: await this.usage.usage(session, parseDto(listQuerySchema, query ?? {})) };
 	}
 }

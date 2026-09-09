@@ -3,6 +3,7 @@ import { expect } from "chai";
 import { APP_SESSION_REQUEST_KEY } from "../../src/auth/app-session";
 import {
 	MissingPermissionException,
+	OrganizationSuspendedException,
 	NoActiveOrganizationException,
 	UnauthenticatedRequestException,
 } from "../../src/auth/auth.errors";
@@ -10,6 +11,7 @@ import { PUBLIC_ROUTE_METADATA } from "../../src/auth/public-route.decorator";
 import { REQUIRE_PERMISSIONS_METADATA } from "../../src/auth/require-permissions.decorator";
 import { RequirePermissionsGuard } from "../../src/auth/require-permissions.guard";
 import type { AuthService, ResolvedAccess } from "../../src/auth/auth.service";
+import type { OrganizationSuspensionService } from "../../src/auth/organization-suspension.service";
 import type { ExecutionContext } from "@nestjs/common";
 import type { AppSession, Permission } from "@optimiq-voice/auth";
 
@@ -67,7 +69,7 @@ describe("@auth/requirePermissionsGuard", function () {
 		const authService = {
 			resolveAccess: async () => access,
 		} as unknown as AuthService;
-		return new RequirePermissionsGuard(new Reflector(), authService);
+		return new RequirePermissionsGuard(new Reflector(), authService, notSuspended());
 	}
 
 	const noAccess: ResolvedAccess = { organizationId: null, role: null, permissions: [] };
@@ -128,6 +130,34 @@ describe("@auth/requirePermissionsGuard", function () {
 		expect(thrown).to.be.instanceOf(MissingPermissionException);
 	});
 
+	it("refuses a suspended organization before any permission is granted", async function () {
+		const { context } = buildContext({
+			metadata: { [REQUIRE_PERMISSIONS_METADATA]: ["members.read"] as Permission[] },
+			session,
+		});
+		const authService = {
+			resolveAccess: async () => ({
+				organizationId: "org-1",
+				role: "owner",
+				permissions: ["members.read"] as Permission[],
+			}),
+		} as unknown as AuthService;
+		const suspended = {
+			isSuspended: async () => true,
+		} as unknown as OrganizationSuspensionService;
+
+		let thrown: unknown;
+		try {
+			await new RequirePermissionsGuard(new Reflector(), authService, suspended).canActivate(
+				context,
+			);
+		} catch (error) {
+			thrown = error;
+		}
+		// The role grants the permission; the tenant is what may not act.
+		expect(thrown).to.be.instanceOf(OrganizationSuspendedException);
+	});
+
 	it("admits a role whose template grants the permission and stamps the resolved access", async function () {
 		const { context, request } = buildContext({
 			metadata: { [REQUIRE_PERMISSIONS_METADATA]: ["members.read"] as Permission[] },
@@ -157,3 +187,8 @@ describe("@auth/requirePermissionsGuard", function () {
 		expect(granted).to.equal(true);
 	});
 });
+
+/** A suspension service that says no organization is suspended. See `RequirePermissionsGuard`. */
+function notSuspended(): OrganizationSuspensionService {
+	return { isSuspended: async () => false } as unknown as OrganizationSuspensionService;
+}

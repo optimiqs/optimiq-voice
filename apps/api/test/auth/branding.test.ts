@@ -1,4 +1,5 @@
 import { expect } from "chai";
+import { updateBrandingDto } from "../../src/auth/branding/branding.dto";
 import {
 	DEFAULT_BRANDING,
 	resolveEffectiveBranding,
@@ -65,6 +66,16 @@ describe("branding theme cascade", () => {
 		const effective = resolveEffectiveBranding(null, null);
 		expect(effective.logoObjectKey).to.equal(null);
 		expect(effective.supportEmail).to.equal(null);
+	});
+
+	it("will not take a logo object key off the wire, only a null that clears one", () => {
+		// The key is minted server-side by the upload from the bytes it just stored. Accepting a
+		// string here let a tenant admin point their brand at any key in the shared object store.
+		expect(
+			updateBrandingDto.safeParse({ logoObjectKey: "branding/other-tenant/logo.png" }).success,
+		).to.equal(false);
+		expect(updateBrandingDto.safeParse({ logoObjectKey: null }).success).to.equal(true);
+		expect(updateBrandingDto.safeParse({ productName: "Acme" }).success).to.equal(true);
 	});
 
 	it("never emits the custom domain in the resolved shape", () => {

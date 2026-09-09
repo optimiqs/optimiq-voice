@@ -256,15 +256,26 @@ export class VoicemailConsumer implements OnModuleInit, OnApplicationShutdown {
 			return;
 		}
 		const data = envelope.data;
-		// `voicemail.evt.v1.<orgId>.<mailboxId>.<event>` — the box is the address, not the payload.
-		const mailboxId = message.subject.split(".")[4];
-		if (mailboxId === undefined) {
+		// `voicemail.evt.v1.<orgId>.<mailboxId>.<event>` — the box AND the tenant are the address, not
+		// the payload. `orgId` was the last field here still read from the body, so it is checked
+		// against the routed subject before it scopes a write; the same comparison the producer's
+		// `validateEvent` makes.
+		const [, , , subjectOrgId, mailboxId] = message.subject.split(".");
+		if (mailboxId === undefined || subjectOrgId === undefined) {
+			message.term();
+			return;
+		}
+		if (subjectOrgId !== envelope.orgId) {
+			logger.error(
+				{ subject: message.subject, envelopeOrgId: envelope.orgId },
+				"terminating a voicemail message whose orgId disagrees with its subject",
+			);
 			message.term();
 			return;
 		}
 
 		try {
-			const filed = await this.file(envelope.orgId, mailboxId, data);
+			const filed = await this.file(subjectOrgId, mailboxId, data);
 			if (filed === undefined) {
 				logger.error(
 					{

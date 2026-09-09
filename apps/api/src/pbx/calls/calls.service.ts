@@ -127,15 +127,19 @@ export class CallsService implements OnModuleInit, OnApplicationShutdown {
 	): Promise<OriginatedCall> {
 		const organizationId = requireActiveOrganizationId(session);
 
+		// Availability before the budget: what the limiter bounds is money, and a request that reached
+		// no engine spent none. With the two the other way round, sixty requests during a broker
+		// outage — none of which placed a call — exhausted the tenant's window. Authorization still
+		// precedes both.
+		const connection = this.connection;
+		if (connection === undefined || connection.isClosed()) {
+			throw originateUnavailableException("the control plane has no broker connection");
+		}
+
 		const verdict = this.limiter.consume(organizationId);
 		if (!verdict.allowed) {
 			this.refused += 1;
 			throw originateRateLimitedException(verdict.retryAfterSeconds);
-		}
-
-		const connection = this.connection;
-		if (connection === undefined || connection.isClosed()) {
-			throw originateUnavailableException("the control plane has no broker connection");
 		}
 
 		/**

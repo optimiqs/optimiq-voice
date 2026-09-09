@@ -50,6 +50,16 @@ export const faxEnvSchema = z.object({
 	 */
 	FAX_MEDIA_URL_SECRET: z.string().min(1).optional(),
 
+	/**
+	 * The secret that was `FAX_MEDIA_URL_SECRET` before the last rotation.
+	 *
+	 * `verifyFaxMediaToken` takes `{ current, previous }` precisely so a rotation does not invalidate
+	 * links already sitting in somebody's inbox — a fax link has a TTL of up to a day and the emailed
+	 * link is how people actually reach these documents. Same variable as
+	 * `PBX_VOICEMAIL_URL_SECRET_PREVIOUS`, one slice over.
+	 */
+	FAX_MEDIA_URL_SECRET_PREVIOUS: z.string().min(1).optional(),
+
 	/** Lifetime of a minted fax media link, in seconds. */
 	FAX_MEDIA_URL_TTL_SECONDS: z.coerce.number().int().min(30).max(86_400).default(3_600),
 });

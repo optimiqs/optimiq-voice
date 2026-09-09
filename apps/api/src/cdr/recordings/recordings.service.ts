@@ -3,7 +3,7 @@ import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { purgedRecordingSoftDeleteQuery } from "@optimiq-voice/cdr-db";
 import { getLogger } from "@optimiq-voice/logging";
 import { openMediaResponse } from "../../media/media-response";
-import { ObjectKeyOutsideRootError } from "../../storage";
+import { ObjectKeyOutsideRootError, objectContentType } from "../../storage";
 import { nextCursorFrom } from "../query/cdr-cursor";
 import { CdrCursorError } from "../query/cdr-cursor";
 import { MAX_RANGE_DAYS, rangeDays, resolveTimeRange } from "../query/cdr.dto";
@@ -306,23 +306,11 @@ export class RecordingsService {
 		}
 
 		return await openMediaResponse(this.store, row.objectKey, stat.sizeBytes, {
-			contentType: contentTypeFor(row.objectKey),
+			contentType: objectContentType(row.objectKey),
 			fileName: downloadFileName(row),
 			rangeHeader,
 		});
 	}
-}
-
-/** Content type from the object key's extension. WAV is what the engine writes today. */
-function contentTypeFor(objectKey: string): string {
-	const lower = objectKey.toLowerCase();
-	if (lower.endsWith(".mp3")) {
-		return "audio/mpeg";
-	}
-	if (lower.endsWith(".ogg") || lower.endsWith(".opus")) {
-		return "audio/ogg";
-	}
-	return "audio/wav";
 }
 
 /**

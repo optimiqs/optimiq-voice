@@ -139,9 +139,37 @@ export function selectorsMatch(
 	family: string,
 	type: string,
 ): boolean {
+	return parsedSelectorsMatch(parseWebhookSelectors(selectors), family, type);
+}
+
+/**
+ * The parse half of {@link selectorsMatch}, hoisted so a caller can do it once.
+ *
+ * A parse is a pure function of a string that only changes when the subscription row does, and the
+ * dispatcher's hot path would otherwise re-run it — a map walk plus a regex — for every selector of
+ * every cached subscription on every platform event. Unparseable selectors are dropped here rather
+ * than carried: they can never match, and `invalidWebhookSelectors` already refuses them at write
+ * time.
+ */
+export function parseWebhookSelectors(selectors: readonly string[]): readonly ParsedSelector[] {
+	const parsed: ParsedSelector[] = [];
 	for (const selector of selectors) {
-		const parsed = parseWebhookSelector(selector);
-		if (parsed === undefined || parsed.family !== family) {
+		const one = parseWebhookSelector(selector);
+		if (one !== undefined) {
+			parsed.push(one);
+		}
+	}
+	return parsed;
+}
+
+/** The match half, over selectors already run through {@link parseWebhookSelectors}. */
+export function parsedSelectorsMatch(
+	selectors: readonly ParsedSelector[],
+	family: string,
+	type: string,
+): boolean {
+	for (const parsed of selectors) {
+		if (parsed.family !== family) {
 			continue;
 		}
 		if (parsed.type === undefined || parsed.type === type) {

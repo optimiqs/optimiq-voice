@@ -199,6 +199,34 @@ describe("renderAclConf", () => {
 		expect(result.warnings.some((warning) => warning.includes("global"))).to.equal(true);
 	});
 
+	it("withholds the implicit deny once a second tenant has rules in the scope", () => {
+		// The outage this guards: acl.conf is global, so a leading `deny = 0.0.0.0/0` written because
+		// tenant A allowed its own office denies every handset of every OTHER tenant on the box — a
+		// platform-wide REGISTER failure caused by one holder of `security.write`. With one tenant the
+		// section is still a real allowlist; with two it degrades to exceptions-only and says so.
+		const single = render([aclRow({ organizationId: ORG_A, network: "203.0.113.0/24" })]);
+		expect(rulesOf(single.body, "optimiq-registration")).to.deep.equal([
+			"deny = 0.0.0.0/0.0.0.0",
+			"deny = ::/0",
+			"permit = 203.0.113.0/24",
+		]);
+
+		const both = render([
+			aclRow({ organizationId: ORG_A, network: "203.0.113.0/24" }),
+			aclRow({ organizationId: ORG_B, action: "deny", network: "192.0.2.0/24" }),
+		]);
+		const rules = rulesOf(both.body, "optimiq-registration");
+		expect(rules).to.not.include("deny = 0.0.0.0/0.0.0.0");
+		expect(rules).to.not.include("deny = ::/0");
+		expect(rules).to.include("permit = 203.0.113.0/24");
+		expect(rules).to.include("deny = 192.0.2.0/24");
+		const section = both.sections.find((entry) => entry.name === "optimiq-registration");
+		expect(section?.mode).to.equal("blocklist");
+		expect(
+			both.warnings.some((warning) => warning.includes("implicit deny is NOT emitted")),
+		).to.equal(true);
+	});
+
 	it("warns when an allowlist has no IPv6 entry, and does not invent one", () => {
 		const result = render([aclRow({ network: "203.0.113.0/24" })]);
 		expect(result.warnings.some((warning) => warning.includes("IPv6"))).to.equal(true);

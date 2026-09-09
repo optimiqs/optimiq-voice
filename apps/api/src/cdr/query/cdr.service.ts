@@ -165,11 +165,15 @@ export class CdrService {
 	async get(session: AppSession, id: string, query: CdrLegQuery): Promise<CdrLegEnvelope> {
 		const organizationId = this.organizationId(session);
 		const range = this.range(query);
+		// No `NaN` fallback. `cdr.dto.ts` validates `startedAt` as an ISO datetime, so an unparseable
+		// value is a 400 from the schema rather than something to recover from here — and the old
+		// recovery silently widened an exact partition-key seek into a full range scan, which is the
+		// cost the parameter exists to avoid.
 		const startedAt = query.startedAt === undefined ? undefined : new Date(query.startedAt);
 
 		const found = await this.database.withTenantScope(organizationId, async (transaction) => {
 			const leg = await getCallLeg(transaction, id, {
-				...(startedAt === undefined || Number.isNaN(startedAt.getTime()) ? {} : { startedAt }),
+				...(startedAt === undefined ? {} : { startedAt }),
 				range,
 			});
 			if (leg === undefined) {

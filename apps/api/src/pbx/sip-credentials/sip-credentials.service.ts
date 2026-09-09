@@ -79,6 +79,11 @@ export class SipCredentialsService {
 	}): Promise<SipCredentialResponse> {
 		const realm = request.realm.trim().toLowerCase();
 		const username = request.username.trim();
+		// The registering peer's address, carried by sipd. It decides nothing here — admission is
+		// `sip_acl_entry`'s job at the edge — but it is the only field that lets a refusal be
+		// correlated with a source, which is what an operator needs when a phone will not register or
+		// when credentials are being sprayed. So it is logged on every refusal path and nowhere else.
+		const sourceAddress = request.sourceAddress;
 
 		const rootKey = loadProvisioningEnv().PROVISION_SIP_SECRET_KEY;
 
@@ -87,7 +92,10 @@ export class SipCredentialsService {
 			// Not `found: false`. An unmapped realm is a DEPLOYMENT problem — nobody told this API
 			// which tenant that realm belongs to — and reporting it as "no such account" would send
 			// an operator hunting for an extension that exists.
-			logger.warn({ realm, username }, "refusing a credential lookup for an unmapped realm");
+			logger.warn(
+				{ realm, username, sourceAddress },
+				"refusing a credential lookup for an unmapped realm",
+			);
 			return refuse(
 				`no organization is mapped to realm "${realm}" ` +
 					`(set the org_setting sip/realm for the tenant that owns it)`,
@@ -96,9 +104,17 @@ export class SipCredentialsService {
 
 		const line = await this.findLine(organizationId, username);
 		if (line === undefined) {
+			logger.warn(
+				{ realm, username, organizationId, sourceAddress },
+				"refusing a credential lookup: no line for that auth user",
+			);
 			return { found: false, enabled: false };
 		}
 		if (!line.enabled) {
+			logger.warn(
+				{ realm, username, organizationId, sourceAddress },
+				"refusing a credential lookup: the line is disabled",
+			);
 			return { found: true, enabled: false, orgId: organizationId, username, realm };
 		}
 
@@ -111,6 +127,7 @@ export class SipCredentialsService {
 				{
 					realm,
 					username,
+					sourceAddress,
 				},
 				"cannot answer a credential lookup: PROVISION_SIP_SECRET_KEY is not set",
 			);

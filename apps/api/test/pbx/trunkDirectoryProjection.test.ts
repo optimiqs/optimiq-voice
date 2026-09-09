@@ -291,5 +291,39 @@ describe("TrunkDirectoryPublisher.reconcile", () => {
 
 		expect(result.skipped).to.equal(true);
 		expect(result.published).to.equal(0);
+		expect(result.failed).to.equal(0);
+	});
+
+	it("reports a failed write, so the outbox obligation is not discharged", async () => {
+		// The whole point of `failed`. A reconcile in which every put threw used to be
+		// indistinguishable from a clean one, so `pbx.module.ts` marked the obligation discharged and
+		// the sweeper never republished — the carrier directory never reached the edge and every
+		// outbound call for the tenant failed until an unrelated successful write happened.
+		const bucket = fakeBucket();
+		(bucket.kv as unknown as { put: () => Promise<number> }).put = async () => {
+			return await Promise.reject(new Error("no stream response"));
+		};
+		const publisher = publisherOn(bucket);
+
+		const result = await publisher.reconcile(ORG, [row()]);
+
+		expect(result.skipped).to.equal(false);
+		expect(result.published).to.equal(0);
+		expect(result.failed).to.equal(1);
+	});
+
+	it("reclaims a key whose value cannot be parsed once its trunk is gone", async () => {
+		// An unreadable entry is absent for the WRITE, but it still has to reach the delete loop:
+		// if its trunk has since been deleted, no future write would ever overwrite or remove it.
+		const key = kvKeyFor.trunk(ORG, OTHER_TRUNK);
+		const bucket = fakeBucket();
+		bucket.store.set(key, new TextEncoder().encode("{not json"));
+		const publisher = publisherOn(bucket);
+
+		const result = await publisher.reconcile(ORG, [row()]);
+
+		expect(bucket.deletes).to.deep.equal([key]);
+		expect(result.deleted).to.equal(1);
+		expect(result.failed).to.equal(0);
 	});
 });

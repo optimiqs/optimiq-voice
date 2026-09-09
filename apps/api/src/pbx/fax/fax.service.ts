@@ -259,7 +259,12 @@ export class FaxService {
 		if (secret === undefined) {
 			throw new FaxSigningUnavailableException();
 		}
-		const verified = verifyFaxMediaToken(token, { current: secret });
+		const verified = verifyFaxMediaToken(token, {
+			current: secret,
+			...(this.env.FAX_MEDIA_URL_SECRET_PREVIOUS === undefined
+				? {}
+				: { previous: this.env.FAX_MEDIA_URL_SECRET_PREVIOUS }),
+		});
 		const payload = verified.payload;
 		if (!verified.ok || payload === undefined) {
 			throw verified.failure === "expired"

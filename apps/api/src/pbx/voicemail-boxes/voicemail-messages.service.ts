@@ -7,7 +7,6 @@ import {
 	eq,
 	extension,
 	inArray,
-	sql,
 	voicemailBox,
 	voicemailMessage,
 } from "@optimiq-voice/pbx-db";
@@ -19,6 +18,7 @@ import { assertOwnsRow, holdsUnscoped, ownedVoicemailBoxIds } from "../shared/se
 import {
 	mintVoicemailMediaToken,
 	verifyVoicemailMediaToken,
+	voicemailContentTypeFor,
 	voicemailMediaPath,
 } from "./voicemail-media-token";
 import { isMessageRead } from "./voicemail-messages.dto";
@@ -135,10 +135,6 @@ export class VoicemailMessagesService {
 					transcriptionStatus: voicemailMessage.transcriptionStatus,
 					transcribedAt: voicemailMessage.transcribedAt,
 					callLegRef: voicemailMessage.callLegRef,
-					// `count(*) over ()` on the same query rather than a second `select count(*)`, so
-					// the count and the page cannot disagree about the snapshot they were taken from —
-					// the rule `pagination.ts` states for every list in this area.
-					total: sql<number>`count(*) over ()`.mapWith(Number),
 				})
 				.from(voicemailMessage)
 				.where(
@@ -155,7 +151,14 @@ export class VoicemailMessagesService {
 				.offset(pagination.offset);
 
 			const counts = await readMailboxCounts(transaction, boxId);
-			const total = rows[0]?.total ?? 0;
+			// The folder counts, not a `count(*) over ()` window. The window counts the RETURNED rows,
+			// so an offset past the last row returns none and the total collapses to 0 — after which
+			// `paged` reports `totalPages: 0` and the pager renders "no messages" for a mailbox
+			// holding forty, with no page count to clamp back to. `readMailboxCounts` is already in
+			// hand and runs in the same transaction, so it answers the same snapshot the window did.
+			const total =
+				(folders.includes("new") ? counts.newCount : 0) +
+				(folders.includes("saved") ? counts.savedCount : 0);
 
 			return {
 				...paged(rows.map(toWireMessage), total, pagination),
@@ -174,6 +177,12 @@ export class VoicemailMessagesService {
 	 *
 	 * See `voicemail-messages.dto.ts`: there is no `read` column and there should not be, because
 	 * the MWI lamp is defined by the NEW count. One fact, one place.
+	 *
+	 * The reach check is here rather than in {@link move}, because `remove` has already made it with
+	 * `voicemail.delete` before it moves a message to the `deleted` folder. Today `voicemail.write`
+	 * has no `.own` variant in the registry, so a `user` cannot reach this route at all and the
+	 * check is only ever satisfied by the unscoped grant — see the controller header. When
+	 * `voicemail.write.own` exists this is the row half that is already in place.
 	 */
 	async update(
 		session: AppSession,
@@ -181,6 +190,12 @@ export class VoicemailMessagesService {
 		messageId: string,
 		patch: UpdateVoicemailMessage,
 	): Promise<VoicemailMessageEnvelope> {
+		await this.assertMayReachBox(
+			session,
+			requireActiveOrganizationId(session),
+			boxId,
+			"voicemail.write",
+		);
 		const folder: VoicemailFolder = patch.folder ?? (patch.read === true ? "saved" : "new");
 		return await this.move(session, boxId, messageId, folder, reasonForFolder(folder));
 	}
@@ -327,8 +342,8 @@ export class VoicemailMessagesService {
 		}
 
 		return await openMediaResponse(this.store, row.objectKey, stat.sizeBytes, {
-			contentType: contentTypeFor(row.objectKey),
-			fileName: downloadFileName(row.receivedAt, row.id, row.objectKey),
+			contentType: voicemailContentTypeFor(row.objectKey),
+			fileName: voicemailDownloadFileName(row.receivedAt, row.id, row.objectKey),
 			rangeHeader,
 		});
 	}
@@ -409,7 +424,6 @@ export class VoicemailMessagesService {
 					receivedAt: voicemailMessage.receivedAt,
 					callerIdNumber: voicemailMessage.callerIdNumber,
 					callerIdName: voicemailMessage.callerIdName,
-					total: sql<number>`count(*) over ()`.mapWith(Number),
 				})
 				.from(voicemailMessage)
 				.where(
@@ -434,7 +448,9 @@ export class VoicemailMessagesService {
 					...(row.callerIdNumber === null ? {} : { callerIdNumber: row.callerIdNumber }),
 					...(row.callerIdName === null ? {} : { callerIdName: row.callerIdName }),
 				})),
-				total: rows[0]?.total ?? 0,
+				// The folder's real size, not the window over the returned page — the window is capped
+				// by `request.limit`, so a mailbox with forty new messages announced twenty.
+				total: request.folder === "new" ? counts.newCount : counts.savedCount,
 				newCount: counts.newCount,
 				savedCount: counts.savedCount,
 			};
@@ -748,20 +764,8 @@ function refuse(reason: string): BrokerListReply {
 	return { found: false, messages: [], total: 0, newCount: 0, savedCount: 0, reason };
 }
 
-/** Content type from the object key's extension. WAV is what the engine writes today. */
-function contentTypeFor(objectKey: string): string {
-	const lower = objectKey.toLowerCase();
-	if (lower.endsWith(".mp3")) {
-		return "audio/mpeg";
-	}
-	if (lower.endsWith(".ogg") || lower.endsWith(".opus")) {
-		return "audio/ogg";
-	}
-	return "audio/wav";
-}
-
 /** A file name a person can find again on their desktop, rather than a UUID. */
-function downloadFileName(receivedAt: Date, id: string, objectKey: string): string {
+function voicemailDownloadFileName(receivedAt: Date, id: string, objectKey: string): string {
 	const stamp = receivedAt.toISOString().slice(0, 19).replace(/[:T]/gu, "-");
 	const extension = objectKey.slice(objectKey.lastIndexOf(".") + 1) || "wav";
 	return `voicemail-${stamp}-${id.slice(0, 8)}.${extension}`;

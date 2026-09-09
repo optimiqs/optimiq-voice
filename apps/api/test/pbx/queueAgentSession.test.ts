@@ -5,15 +5,15 @@ import {
 	type AgentSessionAction,
 } from "@optimiq-voice/events/schemas";
 import {
+	emptyAgentSessionDto,
+	pauseAgentSessionDto,
+} from "../../src/pbx/queues/queue-agent-session.dto";
+import {
 	AgentStateStoreUnavailableException,
 	AgentTransitionRefusedException,
 	QueueAgentNotFoundException,
 	QueueAgentSessionForbiddenException,
 } from "../../src/pbx/queues/queue-agent-session.errors";
-import {
-	emptyAgentSessionDto,
-	pauseAgentSessionDto,
-} from "../../src/pbx/queues/queue-agent-session.dto";
 import { QueueAgentSessionService } from "../../src/pbx/queues/queue-agent-session.service";
 import type { AgentStatePublisher } from "../../src/pbx/queues/agent-state.publisher";
 import type { AppSession } from "@optimiq-voice/auth";
@@ -101,7 +101,11 @@ function fakeDatabaseWithTiers(row: AgentRow | undefined, queueIds: readonly str
 		select: (projection?: Record<string, unknown>) => ({
 			from: () => {
 				const isTierQuery = projection !== undefined && "queueId" in projection;
-				const rows = isTierQuery ? queueIds.map((queueId) => ({ queueId })) : row === undefined ? [] : [row];
+				const rows = isTierQuery
+					? queueIds.map((queueId) => ({ queueId }))
+					: row === undefined
+						? []
+						: [row];
 				const result = {
 					limit: async () => rows,
 					then: (resolve: (value: unknown) => void) => resolve(rows),
@@ -366,9 +370,8 @@ describe("QueueAgentSessionService transitions", () => {
 		const publisher = {
 			read: async () => undefined,
 			write: async () => {
-				const { AgentStateUnavailableError } = await import(
-					"../../src/pbx/queues/agent-state.publisher"
-				);
+				const { AgentStateUnavailableError } =
+					await import("../../src/pbx/queues/agent-state.publisher");
 				throw new AgentStateUnavailableError();
 			},
 		} as unknown as AgentStatePublisher;

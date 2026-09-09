@@ -31,13 +31,35 @@ export const mohClassName = displayName
 			"it becomes a class name in the media server's configuration",
 	);
 
+/**
+ * The stream URI, constrained the way {@link mohClassName} is and for the same reason.
+ *
+ * The URI lands on a line of `musiconhold.conf` right beside the section name, and it is passed to
+ * `application=`, which `res_musiconhold` runs as a COMMAND on the media server. Free text there is
+ * not a formatting problem, it is remote command execution: a newline ends the comment line and
+ * starts an attacker-chosen `application=`, a `]` forges a section, and a `;` or `#` truncates.
+ * So: an http/https URL, nothing else, spelled as an ALLOWLIST — a list of forbidden characters is
+ * one omission away from an escape, and the set a URL actually needs is small.
+ */
+const MOH_STREAM_URI = /^https?:\/\/[A-Za-z0-9._~:/?@!$&()*+,=%-]+$/u;
+
+export const mohStreamUri = z
+	.string()
+	.trim()
+	.max(512)
+	.refine(
+		(value) => MOH_STREAM_URI.test(value),
+		"must be an http:// or https:// URL with no whitespace, quotes or shell metacharacters — " +
+			"it becomes a command argument in the media server's configuration",
+	);
+
 export const createMohClassDto = z
 	.strictObject({
 		name: mohClassName,
 		description: z.string().max(512).nullish(),
 		source: z.enum(MOH_SOURCES).optional(),
 		/** Icecast/HTTP URI when `source = "stream"`. */
-		streamUri: z.string().trim().max(512).nullish(),
+		streamUri: mohStreamUri.nullish(),
 		shuffle: z.boolean().optional(),
 		/**
 		 * The rate the media server is told to expect. 8000 is what needs no conversion anywhere in
@@ -75,7 +97,7 @@ export const updateMohClassDto = z
 		name: mohClassName.optional(),
 		description: z.string().max(512).nullish(),
 		source: z.enum(MOH_SOURCES).optional(),
-		streamUri: z.string().trim().max(512).nullish(),
+		streamUri: mohStreamUri.nullish(),
 		shuffle: z.boolean().optional(),
 		sampleRateHz: resettable(z.union([z.literal(8000), z.literal(16_000), z.literal(48_000)])),
 		isDefault: z.boolean().optional(),

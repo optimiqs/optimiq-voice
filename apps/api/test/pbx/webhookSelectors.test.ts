@@ -3,6 +3,8 @@ import {
 	invalidWebhookSelectors,
 	isWebhookFamily,
 	parseWebhookSelector,
+	parsedSelectorsMatch,
+	parseWebhookSelectors,
 	selectorsMatch,
 	unservedEventFamilies,
 	WEBHOOK_FAMILIES,
@@ -97,6 +99,24 @@ describe("webhook selectors", () => {
 		// a vocabulary change. Failing open there would deliver everything to everybody.
 		expect(selectorsMatch(["nonsense"], "call", "channel.answered")).to.equal(false);
 		expect(selectorsMatch([], "call", "channel.answered")).to.equal(false);
+	});
+
+	it("gives the same answer parsed once as parsed per message", () => {
+		// The dispatcher's hot path matches against `parseWebhookSelectors` output rather than
+		// re-parsing every selector of every cached subscription on every platform event. The two
+		// halves have to stay one function.
+		const selectors = ["calls.evt.v1.>", "queues.evt.v1.caller.joined", "nonsense"];
+		const parsed = parseWebhookSelectors(selectors);
+		for (const [family, type] of [
+			["call", "channel.answered"],
+			["queue", "caller.joined"],
+			["queue", "caller.left"],
+			["cdr", "leg.written"],
+		] as const) {
+			expect(parsedSelectorsMatch(parsed, family, type)).to.equal(
+				selectorsMatch(selectors, family, type),
+			);
+		}
 	});
 
 	it("keeps the unserved families a decision rather than an omission", () => {

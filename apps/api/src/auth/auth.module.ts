@@ -12,6 +12,7 @@ import { CallTokenService } from "./call-token.service";
 import { MailTemplateController } from "./mail-templates/mail-template.controller";
 import { MailTemplateService } from "./mail-templates/mail-template.service";
 import { MeController } from "./me.controller";
+import { OrganizationSuspensionService } from "./organization-suspension.service";
 import { OrganizationsController } from "./organizations.controller";
 import { RequirePermissionsGuard } from "./require-permissions.guard";
 import { ResellerController } from "./reseller/reseller.controller";
@@ -68,6 +69,7 @@ import { SsoService } from "./sso/sso.service";
 		},
 		AuthService,
 		CallTokenService,
+		OrganizationSuspensionService,
 		RequirePermissionsGuard,
 		{ provide: APP_GUARD, useExisting: RequirePermissionsGuard },
 	],

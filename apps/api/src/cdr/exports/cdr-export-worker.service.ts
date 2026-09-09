@@ -176,13 +176,16 @@ export class CdrExportWorker implements OnModuleInit, OnApplicationShutdown {
 			return 0;
 		}
 
+		// `>` and not `>=`: `claimNextExportJob` increments `attempts` inside the claim, so this is the
+		// FOURTH claim of a job that has already had {@link MAX_ATTEMPTS} real attempts. The claim
+		// itself does no work beyond abandoning it.
 		if (job.attempts > MAX_ATTEMPTS) {
 			// The lease handed this back more times than a transient failure explains. Failing it is
 			// what stops one poisonous job from being the only thing this worker ever does.
 			await this.fail(
 				job,
 				"internal",
-				`This export was attempted ${job.attempts} times without completing and has been abandoned. Try a narrower range.`,
+				`This export was attempted ${MAX_ATTEMPTS} times without completing and has been abandoned. Try a narrower range.`,
 			);
 			return 0;
 		}
@@ -206,7 +209,8 @@ export class CdrExportWorker implements OnModuleInit, OnApplicationShutdown {
 				{ organizationId: job.organizationId, exportId: job.id, err: error },
 				"a CDR export attempt failed; it will be retried when its lease expires",
 			);
-			this.failed += 1;
+			// Not counted here. `this.failed` is the gauge of jobs that were ABANDONED, which is what
+			// `fail()` increments; counting a retryable attempt as well made the two double up.
 			return 0;
 		}
 	}

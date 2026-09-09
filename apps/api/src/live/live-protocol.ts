@@ -55,6 +55,16 @@ export const LIVE_HEARTBEAT_MS = 25_000;
 /** A socket that has not answered two heartbeats is gone, whatever TCP believes. */
 export const LIVE_HEARTBEAT_TIMEOUT_MS = LIVE_HEARTBEAT_MS * 2 + 5_000;
 
+/**
+ * How often an open connection's session is re-resolved against the auth database.
+ *
+ * Decoupled from the ping deliberately. Session EXPIRY is already enforced by the `expiresAt` on
+ * the session record, so this interval is a revocation-latency knob, not a correctness one — and
+ * running it on every 25 s ping cost two auth-pool queries per connection per tick, against a pool
+ * of ten, permanently and regardless of user activity.
+ */
+export const LIVE_REVALIDATE_MS = 5 * 60_000;
+
 /** The path the gateway is mounted on. */
 export const LIVE_PATH = "/api/v1/live";
 

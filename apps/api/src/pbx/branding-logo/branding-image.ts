@@ -17,13 +17,15 @@ import type { MultipartRequest } from "../media/media-upload";
  *
  * PNG, JPEG and WebP are raster formats a browser renders from an `<img>`/background with no
  * ceremony. SVG is included because a vector logo is exactly what a white-label customer ships, and
- * it is safe HERE for one specific reason: the logo is consumed as an IMAGE SOURCE
- * (`<img src>` / CSS `background-image`), and a browser does not execute script embedded in an SVG
- * loaded that way — script in an SVG only runs when the document is navigated to or inlined, neither
- * of which the login lockup does. Serving it with `image/svg+xml` and `Content-Disposition: inline`
- * (the serving route's default) keeps it an image. If a future surface ever inlines tenant SVG into
- * the DOM, that surface — not this upload — is where sanitisation would belong, and this note is the
- * breadcrumb for it.
+ * a browser does not execute script embedded in an SVG loaded as an IMAGE SOURCE
+ * (`<img src>` / CSS `background-image`), which is how the login lockup consumes it.
+ *
+ * That is not the whole story, and it used to be written here as though it were: the serving route
+ * is a plain public URL, and an SVG served `inline` executes its script when the URL is NAVIGATED
+ * to. So the containment lives on the response, not on the upload —
+ * `branding-logo.controller.ts` serves SVG as `attachment` with `nosniff` and a
+ * `default-src 'none'` CSP. If a future surface inlines tenant SVG into the DOM, that surface is
+ * where sanitisation would belong, and this note is the breadcrumb for it.
  *
  * GIF is deliberately NOT accepted even though the serving route can name its content type: an
  * animated brand mark is a support burden, not a feature, and the four formats above cover every

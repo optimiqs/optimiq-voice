@@ -131,7 +131,9 @@ describe("SoftphoneCredentialsService", () => {
 	});
 
 	it("rejects incomplete TURN and WebRTC deployment configuration at startup", () => {
-		expect(() => loadProvisioningEnv({ PROVISION_WEBRTC_ENABLED: "true" })).to.throw(/WSS URL/);
+		expect(() => loadProvisioningEnv({ PROVISION_WEBRTC_ENABLED: "true" })).to.throw(
+			/PROVISION_SIP_WSS_URL is required/,
+		);
 		expect(() => loadProvisioningEnv({ PROVISION_TURN_URLS: "turn:turn.example.test" })).to.throw(
 			/configured together/,
 		);

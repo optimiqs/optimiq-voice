@@ -1,5 +1,6 @@
 import { expect } from "chai";
 import { conferenceControlRequestSchema } from "@optimiq-voice/events/schemas";
+import { LOCALLY_SYNTHESISED_REFUSAL } from "../../src/pbx/conferences/conference-control.client";
 import {
 	emptyConferenceModerationDto,
 	setConferenceVolumeDto,
@@ -223,6 +224,50 @@ describe("finding the engine that holds the member", () => {
 
 		expect(asked).to.deep.equal(["engine-a"]);
 		expect(body["code"]).to.equal("CONFERENCE_CONTROL_UNAVAILABLE");
+	});
+
+	/**
+	 * The other half of that distinction, and the one that was missing. `send()` turns EVERY transport
+	 * failure — no responders, a timeout, a reply that is not the contract — into `reason: "internal"`,
+	 * so treating `internal` as authoritative read a dead engine as "the instance that owns the member
+	 * said no". Contributors are walked in a deterministic order, so one restarting instance made every
+	 * mute/kick/lock on a room permanently 503 even though a healthy engine one hop away could serve it.
+	 */
+	it("walks past an engine it could not reach, but not past one that refused", async () => {
+		const { client, asked } = fakeClient({
+			claim: claimWith({ "engine-a": NOW + 30_000, "engine-b": NOW + 30_000 }),
+			answers: {
+				"engine-a": {
+					...refusal("engine-a", "internal"),
+					error: `${LOCALLY_SYNTHESISED_REFUSAL}no responders`,
+				},
+				"engine-b": {
+					ok: true,
+					action: "mute",
+					instanceId: "engine-b",
+					memberCount: 2,
+					memberRef: LEG,
+					muted: true,
+				},
+			},
+		});
+		const service = new ConferenceModerationService(client);
+
+		await service.moderate(MODERATOR, CONFERENCE_ID, "mute", { memberRef: LEG });
+
+		expect(asked).to.deep.equal(["engine-a", "engine-b"]);
+	});
+
+	it("still stops at an engine-authored internal error", async () => {
+		const { client, asked } = fakeClient({
+			claim: claimWith({ "engine-a": NOW + 30_000, "engine-b": NOW + 30_000 }),
+			answers: { "engine-a": refusal("engine-a", "internal") },
+		});
+		const service = new ConferenceModerationService(client);
+
+		await failure(service.moderate(MODERATOR, CONFERENCE_ID, "mute", { memberRef: LEG }));
+
+		expect(asked).to.deep.equal(["engine-a"]);
 	});
 
 	/**

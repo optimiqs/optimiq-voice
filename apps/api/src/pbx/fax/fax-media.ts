@@ -43,11 +43,24 @@ export function faxExtensionFor(
 }
 
 /**
- * The default downloader: a bounded `fetch` of the carrier URL.
+ * The ceiling on a downloaded fax document.
+ *
+ * A fax is a handful of pages; fifty megabytes is far past anything a real one reaches. The cap
+ * exists because the URL comes out of a webhook body — the signature authenticates the WEBHOOK, not
+ * the arbitrary URL inside it — so a carrier-side bug or a redirect could otherwise hand this
+ * process a multi-gigabyte body and take the whole control plane down with it, every tenant, not
+ * just fax.
+ */
+const MAX_FAX_MEDIA_BYTES = 50 * 1024 * 1024;
+
+/**
+ * The default downloader: a `fetch` of the carrier URL, bounded in time AND in bytes.
  *
  * Deliberately simple — no retry, because the caller (the inbound webhook path) is itself retried by
  * Telnyx on a non-2xx, and a download that fails leaves the fax row filed without an `object_key`,
- * which is a recoverable state rather than a lost fax.
+ * which is a recoverable state rather than a lost fax. The cap is enforced twice: on the declared
+ * `content-length`, which refuses before a byte is read, and while reading, because a body can
+ * declare nothing or lie.
  */
 export function createFaxMediaFetch(fetchImpl: typeof fetch = fetch): FaxMediaFetch {
 	return async (url: string): Promise<FaxMediaDownload> => {
@@ -55,8 +68,41 @@ export function createFaxMediaFetch(fetchImpl: typeof fetch = fetch): FaxMediaFe
 		if (!response.ok) {
 			throw new Error(`fax media download failed: ${response.status}`);
 		}
-		const bytes = Buffer.from(await response.arrayBuffer());
+		const declared = Number(response.headers.get("content-length") ?? Number.NaN);
+		if (Number.isFinite(declared) && declared > MAX_FAX_MEDIA_BYTES) {
+			throw new Error(`fax media download too large: ${declared} bytes`);
+		}
+		const bytes = await readCapped(response, MAX_FAX_MEDIA_BYTES);
 		const contentType = response.headers.get("content-type") ?? undefined;
 		return { bytes, contentType };
 	};
+}
+
+/** Reads the body, giving up the moment it goes past `limit` rather than after. */
+async function readCapped(response: Response, limit: number): Promise<Buffer> {
+	const body = response.body;
+	if (body === null) {
+		return Buffer.alloc(0);
+	}
+	const reader = body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) {
+				break;
+			}
+			total += value.byteLength;
+			if (total > limit) {
+				throw new Error(`fax media download too large: over ${limit} bytes`);
+			}
+			chunks.push(value);
+		}
+	} finally {
+		// Releases the socket on the throw path as well; an abandoned reader would otherwise keep the
+		// connection and its buffers alive.
+		await reader.cancel().catch(() => undefined);
+	}
+	return Buffer.concat(chunks, total);
 }

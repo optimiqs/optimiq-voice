@@ -5,6 +5,7 @@ import { ObjectNotFoundError } from "../../storage";
 import { PBX_TRANSCRIPTION_PROVIDER, PBX_TRANSCRIPTION_SETTINGS } from "../shared/pbx.tokens";
 import { PBX_DATABASE, PBX_VOICEMAIL_STORE } from "../shared/pbx.tokens";
 import { VoicemailEmailService } from "./voicemail-email.service";
+import { voicemailContentTypeFor } from "./voicemail-media-token";
 import type { ObjectStore } from "../../storage";
 import type {
 	TranscriptionAudio,
@@ -421,7 +422,7 @@ export class VoicemailTranscriptionService implements OnApplicationShutdown {
 		return {
 			objectKey,
 			sizeBytes: sizeBytes ?? undefined,
-			contentType: contentTypeFor(objectKey),
+			contentType: voicemailContentTypeFor(objectKey),
 			languageHint: undefined,
 			async open() {
 				return await store.getStream(objectKey);
@@ -589,18 +590,6 @@ function isRetryableFailure(error: unknown): boolean {
 	}
 	const tagged = error as { _tag?: unknown; retryable?: unknown };
 	return tagged._tag === "TranscriptionFailure" && tagged.retryable === true;
-}
-
-/** Content type from the object key's extension. WAV is what the engine writes today. */
-function contentTypeFor(objectKey: string): string {
-	const lower = objectKey.toLowerCase();
-	if (lower.endsWith(".mp3")) {
-		return "audio/mpeg";
-	}
-	if (lower.endsWith(".ogg") || lower.endsWith(".opus")) {
-		return "audio/ogg";
-	}
-	return "audio/wav";
 }
 
 /** A zero-millisecond wait still yields the loop, which is what the tests rely on. */

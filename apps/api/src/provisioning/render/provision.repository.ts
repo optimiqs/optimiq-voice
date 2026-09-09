@@ -223,10 +223,17 @@ export class ProvisionRepository {
 	 */
 	async checkAllowlist(organizationId: string, sourceIp: string): Promise<AllowlistVerdict> {
 		if (isIP(sourceIp) === 0) {
-			// Not an address we can match. Treated as "no entries applied" rather than as a denial: the
-			// caller decides what an unmatched request means, and refusing here would make a deployment
-			// behind a proxy that reports a hostname unprovisionable with no diagnostic.
-			return { hasEntries: false, allowed: false, matched: undefined };
+			// Not an address we can match. `evaluable: false` says exactly that, and `hasEntries` is
+			// still answered honestly — collapsing "I could not evaluate the ACL" into "this
+			// organization has no ACL" is what let an unparsable source address silently skip a strict
+			// allowlist. The caller decides what an unmatched request means; it can only do that if the
+			// two states are distinguishable.
+			return {
+				hasEntries: await this.hasAllowlistEntries(organizationId),
+				evaluable: false,
+				allowed: false,
+				matched: undefined,
+			};
 		}
 
 		return await this.database.withTenantScope(organizationId, async (transaction) => {
@@ -266,10 +273,23 @@ export class ProvisionRepository {
 				row?.decision === undefined || row.decision === null ? undefined : String(row.decision);
 			return {
 				hasEntries: entryCount > 0,
+				evaluable: true,
 				allowed: decision === "allow",
 				matched:
 					row?.matched === null || row?.matched === undefined ? undefined : String(row.matched),
 			};
+		});
+	}
+
+	/** Whether the organization has any enabled provisioning ACL entry, independent of any address. */
+	private async hasAllowlistEntries(organizationId: string): Promise<boolean> {
+		return await this.database.withTenantScope(organizationId, async (transaction) => {
+			const result = await transaction.execute(sql`
+				select count(*) as entry_count
+				from sip_acl_entry
+				where scope = 'provisioning' and enabled
+			`);
+			return Number(readRow(result)?.entry_count ?? 0) > 0;
 		});
 	}
 
@@ -308,6 +328,12 @@ export interface TokenLookup {
 export interface AllowlistVerdict {
 	/** Whether the organization has any enabled provisioning ACL entries at all. */
 	readonly hasEntries: boolean;
+	/**
+	 * Whether the ACL could be evaluated at all. `false` means the source address was not an IP the
+	 * database can match — a unix-socket listener, a proxy reporting a hostname — and `allowed` is
+	 * then a refusal, not an answer.
+	 */
+	readonly evaluable: boolean;
 	/** Whether the winning entry was an `allow`. Meaningless when `hasEntries` is false. */
 	readonly allowed: boolean;
 	readonly matched: string | undefined;

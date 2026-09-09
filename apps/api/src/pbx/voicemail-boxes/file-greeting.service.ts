@@ -95,7 +95,7 @@ export class FileGreetingService {
 			// One refusal for "no such box", "the box is disabled" and "that box is not that number",
 			// because all three are the same fact to the person holding the handset and the differences
 			// between them are exactly what an enumeration would be built out of.
-			return refuse(
+			return refuseFileGreeting(
 				request.kind,
 				`no enabled mailbox ${request.mailboxNumber} in this organization`,
 			);
@@ -113,7 +113,7 @@ export class FileGreetingService {
 				},
 				"rpc.pbx.v1.file-greeting could not read the recording it was sent",
 			);
-			return refuse(request.kind, audio.reason);
+			return refuseFileGreeting(request.kind, audio.reason);
 		}
 
 		try {
@@ -152,7 +152,7 @@ export class FileGreetingService {
 				},
 				"rpc.pbx.v1.file-greeting could not file the greeting",
 			);
-			return refuse(
+			return refuseFileGreeting(
 				request.kind,
 				`the greeting could not be filed: ${error instanceof Error ? error.message : String(error)}`,
 			);
@@ -278,8 +278,16 @@ export class FileGreetingService {
 	}
 }
 
-/** Every refusal carries `applied: false` AND `active: false`: the mailbox still says what it said. */
-function refuse(kind: VoicemailGreetingKind, reason: string): FileGreetingResponse {
+/**
+ * Every refusal carries `applied: false` AND `active: false`: the mailbox still says what it said.
+ *
+ * Exported so the RPC controller answers with the same shape rather than its own byte-identical
+ * copy — the reason is the contract, and two copies of a contract drift.
+ */
+export function refuseFileGreeting(
+	kind: VoicemailGreetingKind,
+	reason: string,
+): FileGreetingResponse {
 	return { applied: false, kind, active: false, reason: reason.slice(0, 256) };
 }
 

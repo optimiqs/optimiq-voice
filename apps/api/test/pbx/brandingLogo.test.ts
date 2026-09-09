@@ -10,6 +10,7 @@ import {
 } from "../../src/pbx/branding-logo/branding-logo-upload.service";
 import type { BrandingService } from "../../src/auth/branding/branding.service";
 import type { MultipartRequest } from "../../src/pbx/media/media-upload";
+import type { OrgLimitsService } from "../../src/pbx/org-limits/org-limits.service";
 import type { ObjectStore } from "../../src/storage";
 import type { AppSession } from "@optimiq-voice/auth";
 
@@ -232,11 +233,28 @@ function fakeBranding(
 	} as unknown as BrandingService & { readonly setKeys: string[] };
 }
 
+/** An org-limits gate that either allows everything or refuses, recording what it was asked. */
+function fakeLimits(
+	options: { readonly refuse?: boolean } = {},
+): OrgLimitsService & { readonly asked: number[] } {
+	const asked: number[] = [];
+	return {
+		asked,
+		assertMayStore: async (_session: AppSession, incomingBytes: number) => {
+			asked.push(incomingBytes);
+			await Promise.resolve();
+			if (options.refuse === true) {
+				throw new Error("over quota");
+			}
+		},
+	} as unknown as OrgLimitsService & { readonly asked: number[] };
+}
+
 describe("branding logo upload service", () => {
 	it("namespaces the key under branding/<org>/ and writes it onto the row", async () => {
 		const store = fakeStore();
 		const branding = fakeBranding(null);
-		const service = new BrandingLogoUploadService(store, branding);
+		const service = new BrandingLogoUploadService(store, branding, fakeLimits());
 
 		const result = await service.upload(
 			sessionFor(ORG),
@@ -255,7 +273,7 @@ describe("branding logo upload service", () => {
 	it("reaps the previous own logo object, but only under this tenant's branding/ prefix", async () => {
 		const previous = `${BRANDING_LOGO_KEY_PREFIX}/${ORG}/00000000-0000-4000-8000-000000000000.png`;
 		const store = fakeStore();
-		const service = new BrandingLogoUploadService(store, fakeBranding(previous));
+		const service = new BrandingLogoUploadService(store, fakeBranding(previous), fakeLimits());
 		await service.upload(sessionFor(ORG), multipart([{ bytes: JPEG, mimetype: "image/jpeg" }]));
 		expect(store.deletes).to.deep.equal([previous]);
 	});
@@ -263,14 +281,18 @@ describe("branding logo upload service", () => {
 	it("never reaps a reseller-inherited key (outside this tenant's prefix)", async () => {
 		const inherited = `${BRANDING_LOGO_KEY_PREFIX}/99999999-9999-4999-8999-999999999999/x.png`;
 		const store = fakeStore();
-		const service = new BrandingLogoUploadService(store, fakeBranding(inherited));
+		const service = new BrandingLogoUploadService(store, fakeBranding(inherited), fakeLimits());
 		await service.upload(sessionFor(ORG), multipart([{ bytes: PNG, mimetype: "image/png" }]));
 		expect(store.deletes).to.deep.equal([]);
 	});
 
 	it("unlinks the just-stored object when the row write fails, leaving no orphan", async () => {
 		const store = fakeStore();
-		const service = new BrandingLogoUploadService(store, fakeBranding(null, { throws: true }));
+		const service = new BrandingLogoUploadService(
+			store,
+			fakeBranding(null, { throws: true }),
+			fakeLimits(),
+		);
 		let threw = false;
 		try {
 			await service.upload(sessionFor(ORG), multipart([{ bytes: PNG, mimetype: "image/png" }]));
@@ -280,5 +302,25 @@ describe("branding logo upload service", () => {
 		expect(threw).to.equal(true);
 		expect(store.puts).to.have.length(1);
 		expect(store.deletes).to.deep.equal([store.puts[0]]);
+	});
+
+	it("refuses an upload the storage quota does not allow, before anything is stored", async () => {
+		const store = fakeStore();
+		const branding = fakeBranding(null);
+		const limits = fakeLimits({ refuse: true });
+		const service = new BrandingLogoUploadService(store, branding, limits);
+
+		let threw = false;
+		try {
+			await service.upload(sessionFor(ORG), multipart([{ bytes: PNG, mimetype: "image/png" }]));
+		} catch {
+			threw = true;
+		}
+
+		expect(threw).to.equal(true);
+		expect(limits.asked).to.deep.equal([PNG.byteLength]);
+		// Nothing reached the store and nothing reached the row: the gate is in front of both.
+		expect(store.puts).to.deep.equal([]);
+		expect(branding.setKeys).to.deep.equal([]);
 	});
 });

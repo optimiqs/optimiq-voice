@@ -7,8 +7,8 @@ import {
 import {
 	createDatabaseClient,
 	type DatabaseClient,
-	listEnabledSsoProviders,
-	type SsoProviderRow,
+	listEnabledSsoProvidersWithSecrets,
+	type SsoProviderSecretRow,
 } from "@optimiq-voice/db";
 import { getLogger } from "@optimiq-voice/logging";
 import { type AuthSliceConfig, resolveAuthSliceConfig } from "./auth.config";
@@ -29,6 +29,13 @@ export interface AuthPlatform {
 	readonly config: AuthSliceConfig;
 	readonly repository: AuthRepository;
 	readonly database: DatabaseClient;
+	/**
+	 * The boot snapshot handed to `genericOAuth`, kept so the callback route can assert the tenant
+	 * the session landed in is the one that owns the provider. Same array, not a re-read: an
+	 * assertion made against a different set than the plugin was built from would be a check that
+	 * disagrees with the thing it is checking.
+	 */
+	readonly ssoProviders: readonly SsoProviderConfig[];
 	readonly close: () => Promise<void>;
 }
 
@@ -85,6 +92,7 @@ export async function createAuthPlatform(
 		config,
 		repository,
 		database,
+		ssoProviders,
 		close: async () => {
 			await database.close();
 		},
@@ -100,9 +108,9 @@ export async function createAuthPlatform(
  * the SSO feed is one optional feature and must not be the thing that stops the auth slice booting.
  */
 async function loadSsoProviders(database: DatabaseClient): Promise<readonly SsoProviderConfig[]> {
-	let rows: readonly SsoProviderRow[];
+	let rows: readonly SsoProviderSecretRow[];
 	try {
-		rows = await listEnabledSsoProviders(database.adminDb);
+		rows = await listEnabledSsoProvidersWithSecrets(database.adminDb);
 	} catch (error) {
 		logger.error(
 			{ err: error },
@@ -110,8 +118,23 @@ async function loadSsoProviders(database: DatabaseClient): Promise<readonly SsoP
 		);
 		return [];
 	}
-	return rows.map((row) => ({
+	// A row with no email domain is DROPPED rather than registered. `createAuth` refuses one outright
+	// — a provider that may assert any address is a cross-tenant takeover — and letting that throw
+	// here would make one legacy row, written before the column was required, stop the auth slice
+	// from booting at all.
+	const usable = rows.filter((row) => {
+		if (row.emailDomain === null || row.emailDomain.trim().length === 0) {
+			logger.warn(
+				{ providerId: row.providerId, organizationId: row.organizationId },
+				"an SSO provider has no email domain and was not registered; set one to re-enable it",
+			);
+			return false;
+		}
+		return true;
+	});
+	return usable.map((row) => ({
 		providerId: row.providerId,
+		organizationId: row.organizationId,
 		clientId: row.clientId,
 		clientSecret: row.clientSecret,
 		issuer: row.issuer,
@@ -119,5 +142,6 @@ async function loadSsoProviders(database: DatabaseClient): Promise<readonly SsoP
 		...(row.scopes === null || row.scopes.trim().length === 0
 			? {}
 			: { scopes: row.scopes.split(/[,\s]+/u).filter((scope) => scope.length > 0) }),
+		emailDomain: row.emailDomain ?? "",
 	}));
 }

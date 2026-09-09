@@ -4,6 +4,13 @@ import { z } from "zod/v4";
  * The white-label branding write body. Every field is nullable-optional: omitting a field leaves
  * it untouched, and sending `null` clears the override so the value falls back to the reseller
  * default and then the code default.
+ *
+ * `logoObjectKey` is the exception: it accepts `null` and nothing else. The key is server-owned —
+ * minted by `BrandingLogoUploadService` from the bytes it just stored, under this tenant's own
+ * `branding/` prefix — and accepting a STRING here let a tenant admin point their brand at any key
+ * in the shared object store. Clearing the override is still a legitimate write and is the only
+ * thing this field can now do; the read-side prefix guard in `branding-logo.controller.ts` is
+ * defence-in-depth rather than the only defence.
  */
 
 const hexColor = z
@@ -23,7 +30,7 @@ const host = z
 
 export const updateBrandingDto = z.strictObject({
 	productName: z.string().trim().min(1).max(80).nullable().optional(),
-	logoObjectKey: z.string().trim().min(1).max(512).nullable().optional(),
+	logoObjectKey: z.null().optional(),
 	primaryColor: hexColor.nullable().optional(),
 	accentColor: hexColor.nullable().optional(),
 	supportEmail: z.email().max(254).nullable().optional(),

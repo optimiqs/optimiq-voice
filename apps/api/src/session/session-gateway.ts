@@ -14,6 +14,7 @@ import {
 	SESSION_CLOSE_SERVER_SHUTDOWN,
 	SESSION_HEARTBEAT_MS,
 	SESSION_HEARTBEAT_TIMEOUT_MS,
+	SESSION_REVALIDATE_MS,
 	SESSION_MAX_APPLICATIONS,
 	SESSION_MAX_FRAME_BYTES,
 	SESSION_PATH,
@@ -147,19 +148,23 @@ export class SessionGateway implements OnApplicationShutdown {
 	 * Everything that can refuse the connection happens BEFORE `handleUpgrade`, so a refusal is an
 	 * HTTP status on a socket that was never a WebSocket — which is the only way a reconnecting
 	 * client can tell "sign in again" from "the server is down".
+	 *
+	 * Returns whether this gateway claimed the socket. `false` means the path is not ours and the
+	 * socket is untouched — the upgrade router offers it to the next claim, and destroys it if
+	 * nobody wants it.
 	 */
-	async handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
+	async handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): Promise<boolean> {
 		const url = request.url ?? "";
 		if (pathOf(url) !== SESSION_PATH) {
-			// Not ours. Left alone rather than destroyed: `live-bootstrap.ts` has a listener on the same
-			// event, and a gateway that consumed every upgrade would break it.
-			return;
+			// Not ours. Left alone rather than destroyed: the live gateway shares the upgrade router,
+			// and a gateway that consumed every upgrade would break it.
+			return false;
 		}
 
 		if (!this.isTrustedOrigin(request)) {
 			this.refused += 1;
 			this.refuse(socket, 403, "Forbidden");
-			return;
+			return true;
 		}
 
 		let session: AppSession | null = null;
@@ -174,7 +179,7 @@ export class SessionGateway implements OnApplicationShutdown {
 		if (session === null) {
 			this.refused += 1;
 			this.refuse(socket, 401, "Unauthorized");
-			return;
+			return true;
 		}
 
 		const access = await this.authService.resolveAccess(session);
@@ -187,7 +192,7 @@ export class SessionGateway implements OnApplicationShutdown {
 			// identical, from the client's side, to an integration nobody is calling.
 			this.refused += 1;
 			this.refuse(socket, 403, "Forbidden");
-			return;
+			return true;
 		}
 
 		const organizationId = access.organizationId;
@@ -202,6 +207,7 @@ export class SessionGateway implements OnApplicationShutdown {
 				applications: new Map(),
 				sessions: new Map(),
 				lastPongAt: Date.now(),
+				lastRevalidatedAt: Date.now(),
 			};
 			this.connections.add(connection);
 			this.accepted += 1;
@@ -213,6 +219,7 @@ export class SessionGateway implements OnApplicationShutdown {
 				at: new Date().toISOString(),
 			});
 		});
+		return true;
 	}
 
 	private attach(connection: SessionConnection): void {
@@ -280,7 +287,10 @@ export class SessionGateway implements OnApplicationShutdown {
 				granted.push(application);
 				continue;
 			}
-			if (connection.applications.size + granted.length >= SESSION_MAX_APPLICATIONS) {
+			// Only what the connection actually HOLDS counts against the cap. `granted` also carries
+			// the re-claims above, which are already in `applications`, so adding it double-counted
+			// them and refused a reconnecting client applications it was entitled to.
+			if (connection.applications.size >= SESSION_MAX_APPLICATIONS) {
 				denied.push({ application, reason: "too-many-applications" });
 				continue;
 			}
@@ -508,7 +518,11 @@ export class SessionGateway implements OnApplicationShutdown {
 				this.forget(connection);
 				continue;
 			}
-			void this.revalidate(connection);
+			// Not on every ping — see `SESSION_REVALIDATE_MS`.
+			if (now - connection.lastRevalidatedAt >= SESSION_REVALIDATE_MS) {
+				connection.lastRevalidatedAt = now;
+				void this.revalidate(connection);
+			}
 		}
 	}
 
@@ -640,6 +654,8 @@ interface SessionConnection {
 	readonly applications: Map<string, () => void>;
 	readonly sessions: Map<string, LiveSession>;
 	lastPongAt: number;
+	/** When `revalidate` last resolved this connection's session. See {@link SESSION_REVALIDATE_MS}. */
+	lastRevalidatedAt: number;
 }
 
 /**

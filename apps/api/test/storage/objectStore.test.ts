@@ -284,6 +284,43 @@ describe("the local object store", () => {
 		expect(past.status).to.equal(416);
 		expect(past.stream).to.equal(undefined);
 	});
+
+	it("refuses sniffing on every response, not only on the routes that remembered to", async () => {
+		await store.put("a/b.wav", Buffer.from("0123456789"));
+		for (const response of [
+			await openMediaResponse(store, "a/b.wav", 10, {
+				contentType: "audio/wav",
+				fileName: "b.wav",
+			}),
+			await openMediaResponse(store, "a/b.wav", 10, {
+				contentType: "audio/wav",
+				fileName: "b.wav",
+				rangeHeader: "bytes=2-5",
+			}),
+			await openMediaResponse(store, "a/b.wav", 10, {
+				contentType: "audio/wav",
+				fileName: "b.wav",
+				rangeHeader: "bytes=50-60",
+			}),
+		]) {
+			expect(response.headers["x-content-type-options"]).to.equal("nosniff");
+			expect(response.headers["content-security-policy"]).to.contain("default-src 'none'");
+			expect(response.headers["content-security-policy"]).to.contain("sandbox");
+		}
+	});
+
+	it("neutralises a file name that would reshape the content-disposition header", async () => {
+		await store.put("a/b.wav", Buffer.from("0123456789"));
+		const response = await openMediaResponse(store, "a/b.wav", 10, {
+			contentType: "audio/wav",
+			fileName: 'evil".wav; filename="other.exe',
+			disposition: "attachment",
+		});
+		// One quoted-string, no injected parameter: every `"` and `;` is replaced rather than escaped.
+		expect(response.headers["content-disposition"]).to.equal(
+			'attachment; filename="evil_.wav_ filename=_other.exe"',
+		);
+	});
 });
 
 // ---------------------------------------------------------------------------------------------

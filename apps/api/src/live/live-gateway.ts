@@ -11,6 +11,7 @@ import {
 	LIVE_CLOSE_SERVER_SHUTDOWN,
 	LIVE_HEARTBEAT_MS,
 	LIVE_HEARTBEAT_TIMEOUT_MS,
+	LIVE_REVALIDATE_MS,
 	LIVE_MAX_FRAME_BYTES,
 	LIVE_MAX_TOPICS_PER_CONNECTION,
 	LIVE_PATH,
@@ -150,13 +151,17 @@ export class LiveGateway implements OnApplicationShutdown {
 	 *
 	 * Everything that can refuse the connection happens BEFORE `handleUpgrade`, so a refusal is an
 	 * HTTP response on a socket that was never a WebSocket. Guard-then-execute, at the transport.
+	 *
+	 * Returns whether this gateway claimed the socket. `false` means the path is not ours and the
+	 * socket is untouched — `attachUpgradeHandler` offers it to the next claim and destroys it if
+	 * nobody wants it.
 	 */
-	async handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
+	async handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): Promise<boolean> {
 		const url = request.url ?? "";
 		if (pathOf(url) !== LIVE_PATH) {
 			// Not ours. Left alone rather than destroyed: another feature may own this path, and a
 			// gateway that closed every upgrade it did not recognise would be an outage for it.
-			return;
+			return false;
 		}
 
 		if (!this.isTrustedOrigin(request)) {
@@ -167,7 +172,7 @@ export class LiveGateway implements OnApplicationShutdown {
 				},
 				"refused a live upgrade from an untrusted origin",
 			);
-			return;
+			return true;
 		}
 
 		let session: AppSession | null = null;
@@ -183,7 +188,7 @@ export class LiveGateway implements OnApplicationShutdown {
 		if (session === null) {
 			this.refused += 1;
 			this.refuse(socket, 401, "Unauthorized");
-			return;
+			return true;
 		}
 
 		// The same resolution the HTTP guard performs, and for the same reason: the membership role
@@ -194,7 +199,7 @@ export class LiveGateway implements OnApplicationShutdown {
 		if (!access.organizationId || !access.role) {
 			this.refused += 1;
 			this.refuse(socket, 403, "Forbidden");
-			return;
+			return true;
 		}
 
 		const permissions = access.permissions;
@@ -212,8 +217,8 @@ export class LiveGateway implements OnApplicationShutdown {
 				credentials,
 				permissions,
 				topics: new Map(),
-				alive: true,
 				lastPongAt: Date.now(),
+				lastRevalidatedAt: Date.now(),
 			};
 			this.connections.add(connection);
 			this.accepted += 1;
@@ -226,11 +231,11 @@ export class LiveGateway implements OnApplicationShutdown {
 				at: new Date().toISOString(),
 			});
 		});
+		return true;
 	}
 
 	private attach(connection: LiveConnection): void {
 		connection.socket.on("pong", () => {
-			connection.alive = true;
 			connection.lastPongAt = Date.now();
 		});
 		connection.socket.on("message", (data) => {
@@ -296,7 +301,10 @@ export class LiveGateway implements OnApplicationShutdown {
 				toSnapshot.push({ name, topic: connection.topics.get(name)!.topic });
 				continue;
 			}
-			if (connection.topics.size + granted.length >= LIVE_MAX_TOPICS_PER_CONNECTION) {
+			// Only what the connection actually HOLDS counts against the cap. `granted` also carries
+			// the re-subscribes above, which are already in `topics`, so adding it double-counted them
+			// and refused a reconnecting client topics it was entitled to.
+			if (connection.topics.size >= LIVE_MAX_TOPICS_PER_CONNECTION) {
 				denied.push({ topic: name, reason: "too-many-topics" });
 				continue;
 			}
@@ -415,7 +423,8 @@ export class LiveGateway implements OnApplicationShutdown {
 	 * The session re-check is what stops a socket outliving the authorization that opened it. An
 	 * HTTP request re-resolves the session every time; a WebSocket resolves it once and could then
 	 * stream a tenant's calls for as long as the process lives — through a sign-out, a role change
-	 * or an organization switch. Re-resolving on the heartbeat bounds that to one interval.
+	 * or an organization switch. Re-resolving bounds that to {@link LIVE_REVALIDATE_MS}, which is a
+	 * slower cadence than the ping for the cost reason recorded on that constant.
 	 */
 	private sweep(): void {
 		const now = Date.now();
@@ -429,14 +438,18 @@ export class LiveGateway implements OnApplicationShutdown {
 				connection.socket.terminate();
 				continue;
 			}
-			connection.alive = false;
 			try {
 				connection.socket.ping();
 			} catch {
 				this.forget(connection);
 				continue;
 			}
-			void this.revalidate(connection);
+			// Not on every ping: the session re-check is two auth-database reads, and at ping cadence
+			// it is the dominant load on a ten-connection pool.
+			if (now - connection.lastRevalidatedAt >= LIVE_REVALIDATE_MS) {
+				connection.lastRevalidatedAt = now;
+				void this.revalidate(connection);
+			}
 		}
 	}
 
@@ -557,8 +570,9 @@ interface LiveConnection {
 	readonly credentials: Record<string, string>;
 	permissions: readonly Permission[];
 	readonly topics: Map<string, HeldTopic>;
-	alive: boolean;
 	lastPongAt: number;
+	/** When `revalidate` last resolved this connection's session. See {@link LIVE_REVALIDATE_MS}. */
+	lastRevalidatedAt: number;
 }
 
 /** The sources a `snapshot` frame can be built from. The stream sources have no current value. */

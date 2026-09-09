@@ -30,7 +30,10 @@ export const createSsoProviderDto = z.strictObject({
 	clientSecret: z.string().trim().min(1).max(512),
 	discoveryUrl: z.url().max(512).nullable().optional(),
 	scopes: z.string().trim().max(512).nullable().optional(),
-	emailDomain: emailDomain.nullable().optional(),
+	// Required on create, and not nullable: `packages/auth` refuses to register a provider without
+	// one, because a provider that may assert any address is a cross-tenant takeover. Accepting the
+	// row here and failing at the next boot would take the whole auth slice's SSO feed with it.
+	emailDomain,
 	enabled: z.boolean().optional(),
 });
 export type CreateSsoProviderInput = z.output<typeof createSsoProviderDto>;
@@ -41,7 +44,8 @@ export const updateSsoProviderDto = z.strictObject({
 	clientSecret: z.string().trim().min(1).max(512).optional(),
 	discoveryUrl: z.url().max(512).nullable().optional(),
 	scopes: z.string().trim().max(512).nullable().optional(),
-	emailDomain: emailDomain.nullable().optional(),
+	// Optional to omit, but never settable to null — see `createSsoProviderDto`.
+	emailDomain: emailDomain.optional(),
 	enabled: z.boolean().optional(),
 });
 export type UpdateSsoProviderInput = z.output<typeof updateSsoProviderDto>;

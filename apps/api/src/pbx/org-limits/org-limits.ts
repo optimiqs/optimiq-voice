@@ -6,8 +6,9 @@ import { ConflictException, HttpStatus } from "@nestjs/common";
  *
  * # What is enforced where, and why the two are different in kind
  *
- * `maxExtensions` and `maxTrunks` are enforced at CREATE, in the same transaction as the insert.
- * There is a row to refuse and a person on the other end of the refusal, so the answer is a 4xx
+ * `maxExtensions` and `maxTrunks` are enforced at CREATE, by a read-then-create gate in front of
+ * the insert rather than inside its transaction — `OrgLimitsService`'s header argues that choice and
+ * names what it costs. There is a row to refuse and a person on the other end of the refusal, so the answer is a 4xx
  * naming the limit and the current count — which is a sentence somebody can act on ("you are at 50
  * of 50; disable one or ask for more").
  *
@@ -27,7 +28,12 @@ import { ConflictException, HttpStatus } from "@nestjs/common";
  * {@link OrgUsageEntry.measured}.
  *
  * `maxStorageMb` is enforced at upload for the same reason the counts are: there is a request to
- * refuse.
+ * refuse. `OrgLimitsService.assertMayStore` is that gate, and it is only as complete as its call
+ * sites: the branding logo, the media library (prompts and MOH files) and voicemail greetings all
+ * call it, each after the multipart read (the size is not knowable before) and before the object
+ * is written. What is still NOT metered is the two paths with no session to meter against — a
+ * voicemail message filed by the NATS consumer, and a CSV written by the export worker — both of
+ * which are the platform storing bytes on a tenant's behalf rather than a tenant uploading them.
  *
  * # NULL is unlimited, and that is load-bearing
  *

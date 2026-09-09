@@ -6,6 +6,7 @@ import {
 	extension,
 	orgLimit,
 	prompt,
+	sql,
 	trunk,
 	voicemailMessage,
 } from "@optimiq-voice/pbx-db";
@@ -119,6 +120,27 @@ export class OrgLimitsService {
 		assertWithinLimit(limit, ceiling, await this.countFor(organizationId, limit));
 	}
 
+	/**
+	 * Refuses an upload that would push the tenant past `maxStorageMb`.
+	 *
+	 * The counted axes get {@link assertMayCreate}; storage cannot use it because the quantity is not
+	 * a row count but the bytes ALREADY stored plus the bytes about to be. Same read-then-write
+	 * approximation as the counts, and the same reason it is acceptable.
+	 *
+	 * The comparison divides rather than multiplying, matching the usage report: a tenant is never
+	 * refused for a fraction of a megabyte.
+	 */
+	async assertMayStore(session: AppSession, incomingBytes: number): Promise<void> {
+		const organizationId = this.organizationId(session);
+		const limits = await this.limitsFor(organizationId);
+		const ceiling = limits.maxStorageMb;
+		if (ceiling === null || ceiling === undefined) {
+			return;
+		}
+		const stored = await this.storageBytesFor(organizationId);
+		assertWithinLimit("maxStorageMb", ceiling, Math.floor((stored + incomingBytes) / 1_048_576));
+	}
+
 	/** Counts and limits together, for the usage screen. */
 	async usage(session: AppSession): Promise<OrgUsageReport> {
 		const organizationId = this.organizationId(session);
@@ -159,15 +181,25 @@ export class OrgLimitsService {
 		});
 	}
 
+	/**
+	 * The sum, in the database.
+	 *
+	 * The class header calls this "a sum over an indexed column"; it used to select every `size_bytes`
+	 * in both tables and add them up in Node, which is a full row transfer of a tenant's whole
+	 * voicemail history on the one screen somebody opens BECAUSE that history is large — and it is
+	 * now also on the upload path via {@link assertMayStore}.
+	 */
 	private async storageBytesFor(organizationId: string): Promise<number> {
 		return await this.database.withTenantScope(organizationId, async (transaction) => {
 			const [prompts, messages] = await Promise.all([
-				transaction.select({ bytes: prompt.sizeBytes }).from(prompt),
-				transaction.select({ bytes: voicemailMessage.sizeBytes }).from(voicemailMessage),
+				transaction
+					.select({ total: sql<string>`coalesce(sum(${prompt.sizeBytes}), 0)` })
+					.from(prompt),
+				transaction
+					.select({ total: sql<string>`coalesce(sum(${voicemailMessage.sizeBytes}), 0)` })
+					.from(voicemailMessage),
 			]);
-			const sum = (rows: readonly { bytes: number | null }[]) =>
-				rows.reduce((total, row) => total + (row.bytes ?? 0), 0);
-			return sum(prompts) + sum(messages);
+			return Number(prompts[0]?.total ?? 0) + Number(messages[0]?.total ?? 0);
 		});
 	}
 }

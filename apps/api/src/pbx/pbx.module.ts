@@ -638,7 +638,7 @@ const logger = getLogger("api.pbx");
 								// which `did-index.publisher.ts` says is a human decision. Leaving the row
 								// pending is what puts it in front of one: the sweeper retries, fails the same
 								// way, and eventually logs it as stuck with the rebuild script named.
-								if (!result.skipped && result.conflicts.length === 0) {
+								if (!result.skipped && result.failed === 0 && result.conflicts.length === 0) {
 									discharge(organizationId, "did-index", cutoff);
 								}
 							})
@@ -666,7 +666,7 @@ const logger = getLogger("api.pbx");
 							queueMembership
 								.syncOrganization(event.organizationId)
 								.then((result) => {
-									if (!result.skipped) {
+									if (!result.skipped && result.failed === 0) {
 										discharge(event.organizationId, "queue-membership", cutoff);
 									}
 								})
@@ -699,7 +699,7 @@ const logger = getLogger("api.pbx");
 							trunkDirectory
 								.syncOrganization(event.organizationId)
 								.then((result) => {
-									if (!result.skipped) {
+									if (!result.skipped && result.failed === 0) {
 										discharge(event.organizationId, "trunks", cutoff);
 									}
 								})
@@ -724,7 +724,7 @@ const logger = getLogger("api.pbx");
 							sipAcl
 								.syncOrganization(event.organizationId)
 								.then((result) => {
-									if (!result.skipped && result.conflicts.length === 0) {
+									if (!result.skipped && result.failed === 0 && result.conflicts.length === 0) {
 										discharge(event.organizationId, "sip-acl", cutoff);
 									}
 								})

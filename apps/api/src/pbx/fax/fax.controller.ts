@@ -58,14 +58,15 @@ export class FaxController {
 	@PublicRoute()
 	@Header("Cache-Control", "private, no-store")
 	async media(
-		@Query("token") token: string,
+		@Query("token") token: unknown,
 		@Req() request: MediaRequest,
 		@Res({ passthrough: true }) reply: MediaReply,
 	) {
-		return applyMediaResponse(
-			reply,
-			await this.faxes.openSignedFax(token ?? "", readRangeHeader(request)),
-		);
+		// Fastify parses a repeated `?token=` into an ARRAY, and this is a public route: handing that
+		// to the verifier turned a forged link into an unhandled 500 instead of the 403 the slice
+		// defines for it. Anything that is not a string is simply not a token.
+		const raw = typeof token === "string" ? token : "";
+		return applyMediaResponse(reply, await this.faxes.openSignedFax(raw, readRangeHeader(request)));
 	}
 
 	// ---- fax servers -----------------------------------------------------------------------

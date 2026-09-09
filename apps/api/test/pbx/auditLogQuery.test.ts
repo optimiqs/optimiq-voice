@@ -25,6 +25,7 @@ import {
 } from "../../src/pbx/audit-log/audit-log.dto";
 import { auditLogListQuery } from "../../src/pbx/audit-log/audit-log.repository";
 import type { AuthService, ResolvedAccess } from "../../src/auth/auth.service";
+import type { OrganizationSuspensionService } from "../../src/auth/organization-suspension.service";
 import type { AuditLogQuery } from "../../src/pbx/audit-log/audit-log.dto";
 import type { AuditLogRow } from "../../src/pbx/audit-log/audit-log.repository";
 import type { ExecutionContext } from "@nestjs/common";
@@ -593,7 +594,10 @@ describe("audit-log authorization", () => {
 			permissions: [...permissions],
 		};
 		const authService = { resolveAccess: async () => access } as unknown as AuthService;
-		return { guard: new RequirePermissionsGuard(new Reflector(), authService), context };
+		return {
+			guard: new RequirePermissionsGuard(new Reflector(), authService, notSuspended()),
+			context,
+		};
 	}
 
 	it("refuses a member whose role does not hold it", async () => {
@@ -627,3 +631,8 @@ describe("audit-log authorization", () => {
 		}
 	});
 });
+
+/** A suspension service that says no organization is suspended. See `RequirePermissionsGuard`. */
+function notSuspended(): OrganizationSuspensionService {
+	return { isSuspended: async () => false } as unknown as OrganizationSuspensionService;
+}

@@ -58,6 +58,13 @@ export const SESSION_HEARTBEAT_MS = 25_000;
 /** A socket that has not answered two heartbeats is gone, whatever TCP believes. */
 export const SESSION_HEARTBEAT_TIMEOUT_MS = SESSION_HEARTBEAT_MS * 2 + 5_000;
 
+/**
+ * How often an open connection's session is re-resolved against the auth database. The cadence
+ * `live-protocol.ts` states, for the same reason: session expiry is already enforced by the
+ * session record, so this is a revocation-latency knob and not a correctness one.
+ */
+export const SESSION_REVALIDATE_MS = 5 * 60_000;
+
 /** The path the gateway is mounted on. */
 export const SESSION_PATH = "/api/v1/session";
 

