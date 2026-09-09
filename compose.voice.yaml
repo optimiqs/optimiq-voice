@@ -18,7 +18,7 @@ services:
     build:
       context: .
       dockerfile: apps/api/Dockerfile
-      target: builder
+      target: migrations
     restart: "no"
     depends_on:
       postgres:
@@ -65,12 +65,23 @@ services:
       PROVISION_BASE_URL:
       PROVISION_SIP_TRANSPORT: ${PROVISION_SIP_TRANSPORT:-udp}
       PROVISION_SIP_PORT: ${PROVISION_SIP_PORT:-5060}
+      # Browser calling is ONE switch with three consequences, and they used to be three unrelated
+      # variables: mediad's ICE stack (`MEDIAD_WEBRTC`), the SIP edge's WSS listener (`SIPD_WSS`,
+      # below) and this schema flag — which `provisioning-env.ts` refines to REQUIRE
+      # `PROVISION_SIP_WSS_URL`. An operator who flipped `MEDIAD_WEBRTC` on an existing
+      # `.env.voice` took the API from "WebRTC off" to "does not boot", with a zod issue naming a
+      # variable they had never heard of. `SIPD_WSS` derives from the same switch now, and the URL
+      # is required-if-enabled here so the failure names the flag that caused it.
       PROVISION_WEBRTC_ENABLED: ${MEDIAD_WEBRTC:-false}
       PROVISION_SIP_WSS_URL:
       PROVISION_TURN_URLS:
       PROVISION_TURN_SECRET:
       PROVISION_TURN_TTL_SECONDS: ${PROVISION_TURN_TTL_SECONDS:-3600}
       CDR_RECORDING_ROOT: /var/lib/optimiq/objects
+      # Under the mounted volume, not the schema default (`/opt/optimiq-voice/exports`): `/opt`
+      # in the runtime image is root-owned and the process is uid 1001, so every CSV export would
+      # fail its `mkdir` with EACCES.
+      CDR_EXPORT_ROOT: /var/lib/optimiq/objects/exports
       PBX_MEDIA_OBJECT_ROOT: /var/lib/optimiq/objects
       PBX_VOICEMAIL_MEDIA_ROOT: /var/lib/optimiq/objects
     volumes:
@@ -116,7 +127,9 @@ services:
       SIPD_EXTERNAL_LISTEN_ADDR: 0.0.0.0:5088
       SIPD_TRUNK_ACL: ${SIPD_TRUNK_ACL:-}
       SIPD_TLS: ${SIPD_TLS:-false}
-      SIPD_WSS: ${SIPD_WSS:-false}
+      # Derived from the browser-calling switch — see the api service. An explicit `SIPD_WSS` still
+      # wins, for a deployment that terminates WSS somewhere else.
+      SIPD_WSS: ${SIPD_WSS:-${MEDIAD_WEBRTC:-false}}
       SIPD_WSS_LISTEN_ADDR: 0.0.0.0:8089
       SIPD_TLS_CERT_FILE: ${SIPD_TLS_CERT_FILE:-}
       SIPD_TLS_KEY_FILE: ${SIPD_TLS_KEY_FILE:-}

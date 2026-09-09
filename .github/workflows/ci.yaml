@@ -132,9 +132,13 @@ jobs:
             apps/mediad/go.sum
             packages/events-go/go.sum
 
+      # `-race` on every module, not just the browser test in go-data-plane.yaml. These are the two
+      # most concurrency-dense processes in the repo — per-dialog goroutines, RTP read loops, KV
+      # watchers, instance-ownership maps — and without the detector a data race in the media or SIP
+      # plane ships green. The cost is a few seconds on the fastest job in the matrix.
       - name: Test apps/sipd
         working-directory: apps/sipd
-        run: go test ./...
+        run: go test -race ./...
 
       # The media plane. Absent from this job until now, which meant the process with RTP sockets
       # open to the internet was the one module nothing ran on a pull request — a gap rather than a
@@ -142,12 +146,86 @@ jobs:
       # two around it: the root is not a module path, and a per-module step names which one failed.
       - name: Test apps/mediad
         working-directory: apps/mediad
-        run: go test ./...
+        run: go test -race ./...
 
       - name: Test packages/events-go
         working-directory: packages/events-go
-        run: go test ./...
+        run: go test -race ./...
 
       - name: Test packages/runtime-go
         working-directory: packages/runtime-go
-        run: go test ./...
+        run: go test -race ./...
+
+  db-integration:
+    name: tenant isolation (live postgres)
+    runs-on: ubuntu-latest
+    # The RLS and partitioning specs in packages/pbx-db and packages/cdr-db are gated behind
+    # RUN_DB_INTEGRATION_TESTS, so `turbo run test` above skips every one of them — which meant the
+    # only proof of tenant isolation in this repo ran nowhere. They are the one guarantee that
+    # cannot be asserted against a fake: policies and grants are enforced by the server.
+    services:
+      postgres:
+        image: postgres:16.10-alpine3.22
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: voice_pbx
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      NODE_ENV: test
+      DATABASE_DEPLOYMENT_STAGE: test
+      RUN_DB_INTEGRATION_TESTS: "true"
+      PBX_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/voice_pbx
+      PBX_DATABASE_MIGRATION_URL: postgresql://postgres:postgres@127.0.0.1:5432/voice_pbx
+      CDR_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/voice_cdr
+      CDR_DATABASE_MIGRATION_URL: postgresql://postgres:postgres@127.0.0.1:5432/voice_cdr
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.20.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.x"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.11"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The specs import their package from source but its workspace dependencies through
+      # `main: ./dist/index.js` — same reason the workspace job builds first.
+      - name: Build
+        run: pnpm exec turbo run build --filter=@optimiq-voice/pbx-db... --filter=@optimiq-voice/cdr-db...
+
+      # The two contexts are separate databases in production and the specs assume it; the service
+      # container creates only the first.
+      - name: Create the CDR database
+        run: psql "postgresql://postgres:postgres@127.0.0.1:5432/postgres" -c 'create database voice_cdr'
+
+      - name: Migrate
+        run: |
+          pnpm --filter @optimiq-voice/pbx-db run db:migrate:test
+          pnpm --filter @optimiq-voice/cdr-db run db:migrate:test
+
+      - name: PBX tenant isolation
+        run: pnpm --filter @optimiq-voice/pbx-db run test:integration
+
+      - name: CDR tenant isolation and partitioning
+        run: pnpm --filter @optimiq-voice/cdr-db run test:integration

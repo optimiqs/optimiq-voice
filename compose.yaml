@@ -16,7 +16,7 @@ services:
   # The image defaults it to `http://api:9876` — this service, this network. Pointing a running
   # container somewhere else means rebuilding it; see apps/web/Dockerfile.
   web:
-    image: optimiq-voice/web:0.1.0
+    image: ghcr.io/optimiqs/optimiq-voice/web:${VOICE_IMAGE_TAG:-latest}
     restart: unless-stopped
     # Published, not merely exposed: this is now the stack's ingress.
     #
@@ -29,13 +29,18 @@ services:
     # cookie domain and the CORS story to disagree.
     ports:
       - ${WEB_PORT:-3100}:3100
+    # The Next server proxies `/api/auth/*` and `/api/v1/*` to `api:9876`; starting the ingress
+    # before its only upstream is healthy means the first sign-in attempt 502s.
+    depends_on:
+      api:
+        condition: service_healthy
     environment:
       # The only genuine runtime knob. Everything else the app reads is either compiled in or
       # proxied to `api`, which owns the database, the auth secret and the mail transport.
       PORT: ${WEB_PORT:-3100}
 
   api:
-    image: optimiq-voice/api:0.17.1
+    image: ghcr.io/optimiqs/optimiq-voice/api:${VOICE_IMAGE_TAG:-latest}
     restart: unless-stopped
     # Only what the process still reads, and now ALL of it.
     #
@@ -115,7 +120,11 @@ services:
       # and it must name the same directory `apps/engine` writes into and Asterisk reads back as
       # `ENGINE_MEDIA_OBJECT_ROOT` — an upload written anywhere else is a prompt that has a row, a
       # working preview in the admin UI, and silence on the call.
-      - CDR_RECORDING_ROOT
+      - CDR_RECORDING_ROOT=${CDR_RECORDING_ROOT:-/var/lib/optimiq/objects}
+      # CSV exports of the CDR. Pinned onto the same volume rather than left to the schema
+      # default (`/opt/optimiq-voice/exports`), which the runtime image owns as root while the
+      # process runs as uid 1001 — every export would fail its `mkdir` with EACCES.
+      - CDR_EXPORT_ROOT=${CDR_EXPORT_ROOT:-/var/lib/optimiq/objects/exports}
       # Signs recording and voicemail playback URLs. Optional: without it the LISTS still work and
       # minting a playback URL fails with a named error rather than falling back to an unsigned
       # route. There is no default and there never will be one.
@@ -168,6 +177,26 @@ services:
       #   API_ROUTR_*               Routr provisioning (deleted, with Routr itself)
       #   API_SIGNALING_SERVER      src/core/testTokenConfig.ts (deleted)
       #   API_TWILIO_*              the identity service's 2FA / contact verification (deleted)
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    # The image has no HEALTHCHECK of its own (`web`, `engine`, `sipd` and `mediad` do), and without
+    # one `docker compose ps` cannot say whether the API is serving — which is what `web`'s
+    # `depends_on` above needs to know.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:9876/api/auth/ok').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     expose:
       # The HTTP bridge, and now the only listener this process has: /api/auth/* and /api/v1/*.
       # `web` rewrites to it, in-network, which is why it is `expose` and not `ports`.
@@ -178,7 +207,13 @@ services:
       # credentials. Its two callers went with it: `envoy`'s `api-cluster` (service deleted) and
       # `autopilot` (`AUTOPILOT_API_ENDPOINT`, service deleted).
       - 9876
-    # No volumes.
+    volumes:
+      # THE object store. `CDR_RECORDING_ROOT` above, `PBX_MEDIA_OBJECT_ROOT` and
+      # `PBX_VOICEMAIL_MEDIA_ROOT` (which inherit it) and `asterisk`'s `OPTIMIQ_MEDIA_OBJECT_ROOT`
+      # all name this one directory, mounted read-only on the media server. The comments in this
+      # service used to refer three times to "the volume above" and there was none: an uploaded
+      # prompt had a row, a working preview in the admin UI, and silence on the call.
+      - objects:/var/lib/optimiq/objects
     #
     # `./.keys:/opt/optimiq-voice/keys:ro` mounted the RSA keypair that `src/envs.ts` read at
     # import time to sign identity tokens. Nothing in this process signs RS256 any more — call
@@ -238,6 +273,10 @@ services:
       # Where run.sh looks for the generated `acl/acl.conf` — the CIDR ACLs rendered from
       # `sip_acl_entry`. The same object root the hold-music classes already arrive through.
       OPTIMIQ_MEDIA_OBJECT_ROOT: ${OPTIMIQ_MEDIA_OBJECT_ROOT:-/var/lib/optimiq/objects}
+    volumes:
+      # Read-only: the API writes prompts, hold music, voicemail audio and the rendered ACL here and
+      # this process only ever opens them.
+      - objects:/var/lib/optimiq/objects:ro
     expose:
       - 6060
 
@@ -250,7 +289,7 @@ services:
   # `/healthz` reports `degraded` in the meantime. Gating startup would only
   # move the failure from a log line to a deploy that never finishes.
   engine:
-    image: optimiq-voice/engine:0.1.0
+    image: ghcr.io/optimiqs/optimiq-voice/engine:${VOICE_IMAGE_TAG:-latest}
     restart: unless-stopped
     environment:
       ARI_URL: ${ENGINE_ARI_URL:-http://asterisk:8088}
@@ -289,6 +328,11 @@ services:
       TZ: UTC
     expose:
       - 5432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
     volumes:
       - db:/var/lib/postgresql/data
 
@@ -338,6 +382,15 @@ services:
     volumes:
       - ./config/nats.conf:/etc/nats/nats.conf:ro
       - nats:/data
+    # `/healthz` on the monitoring port `config/nats.conf` enables. It reports JetStream's readiness
+    # as well as the server's, which is what `api` and `engine` actually need: a broker accepting
+    # connections before JetStream has recovered its store answers every stream request with an
+    # error.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     expose:
       - 4222
 
@@ -367,3 +420,4 @@ services:
 volumes:
   db:
   nats:
+  objects:

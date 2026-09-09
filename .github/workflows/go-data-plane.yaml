@@ -9,6 +9,7 @@ on:
   pull_request:
     branches:
       - main
+      - "feat/**"
     paths:
       - "apps/sipd/**"
       - "apps/mediad/**"
@@ -26,6 +27,12 @@ on:
       - "go.work"
       - ".github/workflows/go-data-plane.yaml"
   workflow_dispatch:
+
+# This workflow installs Chromium and builds the engine. Without a group every push to an open PR
+# stacks another full run on top of the one already going.
+concurrency:
+  group: go-data-plane-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   go:

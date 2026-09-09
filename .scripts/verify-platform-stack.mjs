@@ -120,7 +120,7 @@ try {
 	const cookies = new Map();
 	async function request(method, path, body) {
 		const response = await fetch(origin + path, { method, headers: { ...(body === undefined ? {} : { "Content-Type": "application/json" }), Origin: origin,
-			Cookie: [...cookies].map(([key, value]) => `${key}=${value}`).join("; ") }, body: body === undefined ? undefined : JSON.stringify(body) });
+			Cookie: [...cookies].map(([key, value]) => `${key}=${value}`).join("; ") }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
 		for (const cookie of response.headers.getSetCookie()) { const pair = cookie.split(";")[0], index = pair.indexOf("="); cookies.set(pair.slice(0, index), pair.slice(index + 1)); }
 		const text = await response.text();
 		assert.ok(response.ok, `${method} ${path}: ${response.status} ${text.slice(0, 700)}`);
